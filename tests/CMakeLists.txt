@@ -45,6 +45,13 @@ set(ATLAS_TESTS
   test_cli
   test_terminal
   test_git_hardening
+  # --- A1 ---
+  test_lock
+  test_ipc
+  test_migrate3
+  test_unit
+  test_reconcile
+  test_daemon
 )
 
 foreach(test_name IN LISTS ATLAS_TESTS)
@@ -60,6 +67,23 @@ endforeach()
 # A repository is required for the integration suites; a missing git makes them
 # fail loudly rather than silently pass.
 set_tests_properties(test_scan test_search test_diff test_worktree test_cli test_terminal
-  test_git_hardening PROPERTIES LABELS "integration")
+  test_git_hardening test_reconcile PROPERTIES LABELS "integration")
 set_tests_properties(test_core test_safetext test_proc test_git_parse test_db test_datadir
-  PROPERTIES LABELS "unit")
+  test_lock test_ipc test_migrate3 test_unit PROPERTIES LABELS "unit")
+
+# The daemon suite forks the real binary and waits on filesystem events, so it is
+# both slower and more timing-sensitive than the rest. It is labelled separately
+# so `ctest -L daemon` and `ctest -LE daemon` are both useful.
+set_tests_properties(test_daemon PROPERTIES LABELS "daemon" TIMEOUT 900)
+# It also serialises against itself: several daemons watching several fixtures at
+# once would compete for the machine's inotify watch budget, which would make the
+# watch-limit degradation path fire for reasons that have nothing to do with the
+# code under test.
+set_tests_properties(test_daemon PROPERTIES RUN_SERIAL TRUE)
+
+# Vendored third-party source is only trustworthy if it is still what was
+# vendored, so the digest check is part of the suite rather than a manual step.
+# /bin/sh, not bash, and no language runtime.
+add_test(NAME vendor_digests
+  COMMAND /bin/sh ${CMAKE_SOURCE_DIR}/scripts/verify_third_party.sh)
+set_tests_properties(vendor_digests PROPERTIES LABELS "unit")

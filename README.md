@@ -13,12 +13,55 @@ checked against a read-only allowlist before the process is created, hooks and
 external diff drivers are disabled, and the working tree and index are only ever
 read. See [docs/git-safety.md](docs/git-safety.md).
 
-## Status: phase A0
+## Status: phase A1
+
+A1 adds a daemon. After registering a repository once and enabling the service,
+filesystem and Git changes are detected and indexed **without running `atlas
+scan` by hand**.
+
+```sh
+make
+make test
+sudo make install                      # optional; only this step needs root
+atlas repo add /path/to/dna --name dna
+atlas service install --user
+systemctl --user daemon-reload
+systemctl --user enable --now atlas
+```
+
+`sudo` there applies **only** to installing the binary system-wide. The daemon
+and everything it writes run as your normal user. To keep it running after an SSH
+logout you also need `sudo loginctl enable-linger $USER` — see
+[docs/systemd-user-service.md](docs/systemd-user-service.md).
+
+### What A1 adds
+
+- `atlas daemon run`, a foreground daemon managed by systemd (no double fork, no
+  pid file — systemd owns supervision)
+- automatic inotify watching of every registered worktree, its Git directory and
+  the shared refs, with debouncing and periodic reconciliation
+- **incremental indexing**: a pass over an unchanged repository reads no file
+  content at all, and one changed file costs one file. Measured on a 5000-file
+  fixture: 5000 examined, 0 read. See `scripts/perf.sh`.
+- incremental history ingestion (`git log HEAD --not <stored tip>`), with
+  force-push and rebase detected rather than walked past
+- per-file discovery inside new untracked directories, honouring `.gitignore`,
+  which closes the A0 limitation the roadmap made an A1 acceptance criterion
+- a bounded, versioned, length-framed local IPC protocol over a 0600 Unix socket
+  in `$XDG_RUNTIME_DIR`, with `SO_PEERCRED` checking
+- `atlas daemon status|ping`, `atlas sync`, `atlas events`, `atlas service
+  print|install --user|uninstall --user`
+- a durable, monotonic event journal for A2 consumers, with an explicit cursor
+- an honest currency model: when Atlas cannot prove it observed every change, it
+  says so, and does not describe the index as current until a full pass has run.
+  See [docs/watcher-consistency.md](docs/watcher-consistency.md).
+
+### What A0 established, and A1 keeps
 
 A0 is the read-only foundation. It is deliberately small, because everything
 later depends on trusting what it reports.
 
-### What A0 implements
+#### What A0 implements
 
 - registering Git repositories by canonical root, with a unique user-facing name;
   several worktrees of one repository can be registered independently
@@ -35,17 +78,21 @@ later depends on trusting what it reports.
 - stable JSON output for every command
 - numbered, transactional, idempotent schema migrations
 
-### What A0 deliberately does not implement
+#### What A0 and A1 deliberately do not implement
 
-None of the following exist yet, and A0 does not pretend otherwise:
+None of the following exist yet, and Atlas does not pretend otherwise:
 
 - decisions, ADRs, or recorded reasons for change. When a reason is requested,
   Atlas answers `UNKNOWN` rather than inferring one.
-- `compile_commands.json` parsing. A0 records that the file exists, whether it is
-  a regular file or a symlink, and its content hash. It does not read its
+- `compile_commands.json` parsing. Atlas records that the file exists, whether it
+  is a regular file or a symlink, and its content hash. It does not read its
   contents.
 - clangd integration, symbol extraction, call graphs, dependency graphs
 - impact analysis or stale-document gates
+- **any AI integration.** A1 contains none. The model-context trust boundary A2
+  will need is specified, not built, in
+  [docs/ai-trust-boundary.md](docs/ai-trust-boundary.md) — and note that Atlas'
+  safe-text encoding is *not* that boundary and cannot be extended into it.
 - a Claude Code skill or an MCP adapter
 - any write path into a target repository, in any form
 
@@ -311,16 +358,26 @@ copied out of Atlas output can be pasted straight back in.
 - history is read with `git log`, so a repository with an enormous history takes
   time proportional to it; `--max-commits` bounds the walk and the result is
   reported as bounded
-- Linux/POSIX only in A0
+- Linux only. The watcher is inotify; there is no kqueue or FSEvents backend.
 - `atlas diff` reports at most `--limit` entries (default 2000) and sets
   `truncated` beyond that; the per-scope counts remain exact
-- `atlas diff` reports a wholly untracked directory as one collapsed entry and does
-  not descend into it, so files inside a newly created directory have no individual
-  path, size or hash. Per-file discovery is a mandatory A1 watcher acceptance
-  criterion; see [docs/roadmap.md](docs/roadmap.md).
+- `atlas diff` still reports a wholly untracked directory as one **collapsed**
+  entry, deliberately: it is the cheap question, and it is what `git status`
+  shows a human. Per-file discovery is additive and lives in the indexer — the
+  daemon (and `atlas sync`) record every file inside a new untracked directory
+  individually, with its own path, size and hash, honouring `.gitignore`. Ask
+  `atlas file` or `atlas events` for those.
 - Atlas cannot read a repository owned by another user, or a partial (promisor)
   clone; both fail closed with a clear error. See "Repositories Atlas will refuse".
 - submodule contents are never inspected (`--ignore-submodules=all`)
+- the watcher cannot see what inotify cannot report — some bind mounts, and
+  network filesystems that do not implement it. Those repositories are covered by
+  periodic reconciliation only, and Atlas cannot detect the situation in advance.
+  It never claims currency it cannot prove; see
+  [docs/watcher-consistency.md](docs/watcher-consistency.md).
+- reconciliation is per repository, not per path: one changed file triggers one
+  `lstat` per tracked file (about 480 ms on a 5000-file fixture) even though only
+  the changed file's content is read. See [docs/backlog.md](docs/backlog.md).
 
 ## Documentation
 
@@ -328,7 +385,18 @@ copied out of Atlas output can be pasted straight back in.
 - [docs/data-model.md](docs/data-model.md) — schema and migrations
 - [docs/provenance.md](docs/provenance.md) — evidence types and the JSON contract
 - [docs/git-safety.md](docs/git-safety.md) — the read-only guarantee in detail
-- [docs/roadmap.md](docs/roadmap.md) — A1 through A6
+- [docs/daemon-and-ipc.md](docs/daemon-and-ipc.md) — the daemon, threads, the
+  single-writer model, and the wire protocol
+- [docs/watcher-consistency.md](docs/watcher-consistency.md) — what "current"
+  means, and what Atlas does when it cannot prove it
+- [docs/systemd-user-service.md](docs/systemd-user-service.md) — running it as a
+  user service
+- [docs/ai-trust-boundary.md](docs/ai-trust-boundary.md) — what safe text does
+  and does not protect against, and what A2 must build
+- [docs/backlog.md](docs/backlog.md) — known engineering and security backlog
+- [docs/roadmap.md](docs/roadmap.md) — A2 through A6
+- [third_party/yyjson/PROVENANCE.md](third_party/yyjson/PROVENANCE.md) — the one
+  vendored dependency, its exact upstream identity and its digests
 - [SECURITY.md](SECURITY.md) — threat model and reporting
 
 ## License

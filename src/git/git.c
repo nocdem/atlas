@@ -40,6 +40,13 @@
 
 #define ATLAS_GIT_SMALL_OUTPUT (4u * 1024u * 1024u)
 
+/* The `git log` pretty format, shared by the full and incremental walks so the
+ * two cannot drift into parsing differently. The sentinel byte marks a commit
+ * header so a name-status record can never be mistaken for one, and the raw
+ * message is last so a message containing the field separator cannot shift the
+ * parse. */
+#define ATLAS_LOG_FORMAT "--format=\x01%H\x1f%P\x1f%an\x1f%ae\x1f%at\x1f%ct\x1f%B"
+
 struct atlas_git {
     atlas_buf exe;
     atlas_buf root;
@@ -62,10 +69,65 @@ struct atlas_git {
 };
 
 /* Subcommands Atlas is allowed to run. Everything else is refused before the
- * process is created, including by future callers. */
+ * process is created, including by future callers.
+ *
+ * `config` is on this list but is NOT covered by it: the subcommand name alone
+ * says nothing about whether an invocation reads or writes, since `git config
+ * a.b c` writes. Every `config` invocation is instead matched against a
+ * positive allowlist of complete argument vectors below. */
 static const char *const READONLY_SUBCOMMANDS[] = {
-    "rev-parse", "ls-files", "log", "status", "diff", "symbolic-ref", "cat-file",
+    "rev-parse", "ls-files", "log", "status", "diff", "symbolic-ref", "cat-file", "config",
 };
+
+/* The only `git config` invocations Atlas may ever make.
+ *
+ * A positive allowlist of whole argument tails, not a denylist of writing
+ * options. A denylist would have to enumerate --add, --replace-all, --unset,
+ * --unset-all, --edit, --rename-section, --remove-section, plus whatever a
+ * future git adds — and the first one missed is a write to a repository Atlas
+ * promised never to modify. Matching the entire vector means a new query has to
+ * be added here deliberately, and cannot be smuggled in by a new call site.
+ *
+ * `--includes` is what makes the answer exact rather than approximate: it makes
+ * git honour include.path and includeIf exactly as it would when using the
+ * repository itself, so a promisor marker hidden in an included file is found.
+ * `--get-regexp` matches against git's own canonicalised key names, which are
+ * lowercased for section and variable, so key case variants and arbitrary
+ * remote names are covered by the pattern rather than by string matching. */
+static const char *const CONFIG_QUERY_PROMISOR[] = {
+    "config", "--includes", "--null", "--get-regexp", "^remote\\..*\\.promisor$", NULL,
+};
+static const char *const CONFIG_QUERY_PARTIAL_FILTER[] = {
+    "config", "--includes", "--null", "--get-regexp", "^remote\\..*\\.partialclonefilter$", NULL,
+};
+static const char *const CONFIG_QUERY_EXTENSIONS[] = {
+    "config", "--includes", "--null", "--get-regexp", "^extensions\\.partialclone$", NULL,
+};
+
+static const char *const *const CONFIG_ALLOWED_QUERIES[] = {
+    CONFIG_QUERY_PROMISOR,
+    CONFIG_QUERY_PARTIAL_FILTER,
+    CONFIG_QUERY_EXTENSIONS,
+};
+
+/* True when argv's tail, starting at the `config` token, is exactly one of the
+ * permitted vectors. */
+static bool config_tail_is_allowed(const char *const *argv, size_t start) {
+    for (size_t q = 0; q < sizeof(CONFIG_ALLOWED_QUERIES) / sizeof(CONFIG_ALLOWED_QUERIES[0]);
+         q++) {
+        const char *const *want = CONFIG_ALLOWED_QUERIES[q];
+        size_t i = 0;
+        for (;; i++) {
+            if (want[i] == NULL) {
+                return argv[start + i] == NULL; /* both ended together */
+            }
+            if (argv[start + i] == NULL || strcmp(argv[start + i], want[i]) != 0) {
+                break;
+            }
+        }
+    }
+    return false;
+}
 
 static bool is_config_flag(const char *s) {
     return strcmp(s, "-c") == 0 || strcmp(s, "-C") == 0 || strcmp(s, "--git-dir") == 0 ||
@@ -90,6 +152,13 @@ bool atlas_git_argv_is_readonly(const char *const *argv, const char **reason_out
         }
         if (a[0] == '-') {
             continue;
+        }
+        if (strcmp(a, "config") == 0) {
+            if (config_tail_is_allowed(argv, i)) {
+                return true;
+            }
+            reason = "git config invocation is not one of the permitted read-only queries";
+            goto deny;
         }
         for (size_t k = 0; k < sizeof(READONLY_SUBCOMMANDS) / sizeof(READONLY_SUBCOMMANDS[0]);
              k++) {
@@ -328,72 +397,189 @@ probe_done:
 /* A promisor (partial) repository can be missing objects that git would fetch on
  * demand. Atlas must never touch the network, and git 2.39 has no
  * --no-lazy-fetch, so such a repository is detected and refused before any object
- * is read. Detection is filesystem-only: it needs no extra git subcommand, so it
- * cannot itself trigger a fetch.
+ * is read.
  *
- * Two independent markers are checked, and either one is enough:
- *   - a *.promisor file beside a pack in <common-dir>/objects/pack
- *   - the strings "promisor" or "partialclone" in <common-dir>/config
- * The config scan is a deliberately blunt substring match: over-refusing a
- * repository is the safe direction. */
+ * A0 detected this by reading the first 64 KiB of <common-dir>/config and looking
+ * for the substrings "promisor" and "partialclone". That was wrong in five
+ * separate ways, each of which is a bypass rather than a false negative in the
+ * safe direction:
+ *
+ *   - a config larger than 64 KiB hid the marker behind padding, and a config can
+ *     be padded to any size with comments
+ *   - a marker straddling the 64 KiB boundary was split and matched neither half
+ *   - $GIT_DIR/config.worktree, which git reads when extensions.worktreeConfig is
+ *     set, was never opened at all
+ *   - include.path and includeIf files, which git honours as if their contents
+ *     were inline, were never opened either
+ *   - it was a substring match, so it also *over*-refused any repository with a
+ *     branch or remote whose name happened to contain "promisor"
+ *
+ * It is replaced by asking git itself, which is the only component that knows
+ * exactly which files make up this repository's configuration and how they
+ * compose. `--includes` makes git resolve include.path and includeIf; the
+ * hardened environment already pins GIT_CONFIG_GLOBAL and GIT_CONFIG_SYSTEM to
+ * /dev/null, so the answer describes this repository and nothing else.
+ *
+ * Fail-closed throughout. `git config --get-regexp` exits 0 when it matched and
+ * 1 when it did not; every other outcome — a signal, a timeout, a truncated
+ * stdout, an exit code git does not document — is treated as "cannot prove this
+ * repository is complete" and refuses. The safe direction is to refuse. */
+
+#define ATLAS_PROMISOR_MAX_PACK_ENTRIES 100000u
+
+/* Runs one allowlisted config query. `*matched` is set only when git said so. */
+static atlas_status config_query(atlas_git *g, const char *const *sub, size_t nsub,
+                                 const char *what, bool *matched, atlas_err *err) {
+    *matched = false;
+    atlas_buf out = ATLAS_BUF_INIT;
+    atlas_buf errbuf = ATLAS_BUF_INIT;
+    atlas_proc_result res;
+    memset(&res, 0, sizeof(res));
+
+    /* A configuration query's output is a handful of lines. A ceiling this small
+     * means a config crafted to produce megabytes of matches trips the truncation
+     * check below instead of being buffered. */
+    atlas_status st = git_run(g, ATLAS_GIT_CMD_PLAIN, sub, nsub, atlas_proc_sink_buf, &out, &errbuf,
+                              256u * 1024u, &res, err);
+    if (st != ATLAS_OK) {
+        atlas_buf_free(&out);
+        atlas_buf_free(&errbuf);
+        return st;
+    }
+    if (res.timed_out || res.stdout_truncated || res.term_signal != 0) {
+        st = atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                           "cannot determine whether %s is a partial repository: the %s query %s",
+                           atlas_buf_cstr(&g->root), what,
+                           res.timed_out          ? "timed out"
+                           : res.stdout_truncated ? "produced more output than Atlas will read"
+                                                  : "was killed by a signal");
+    } else if (res.exit_code == 0) {
+        *matched = (out.len > 0);
+        if (!*matched) {
+            /* git reported success with no output. That is not a documented
+             * outcome for --get-regexp, so it is ambiguity, and ambiguity
+             * refuses. */
+            st = atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                               "cannot determine whether %s is a partial repository: the %s query "
+                               "succeeded but produced no output",
+                               atlas_buf_cstr(&g->root), what);
+        }
+    } else if (res.exit_code != 1) {
+        /* 1 is "no key matched". Anything else is a failure to answer. */
+        st = atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                           "cannot determine whether %s is a partial repository: the %s query "
+                           "exited %d%s%s",
+                           atlas_buf_cstr(&g->root), what, res.exit_code,
+                           errbuf.len > 0 ? ": " : "", atlas_buf_cstr(&errbuf));
+    }
+    atlas_buf_free(&out);
+    atlas_buf_free(&errbuf);
+    return st;
+}
+
+/* Bounded scan for a *.promisor file beside a pack.
+ *
+ * A promisor pack is proof independent of configuration: it is what git writes
+ * when it has fetched with a filter, and it survives the configuration being
+ * edited away afterwards. The directory read is bounded so a repository with an
+ * absurd number of pack files cannot make this unbounded, and hitting the bound
+ * refuses rather than returning "nothing found". */
+static atlas_status detect_promisor_pack(atlas_git *g, int common_fd, bool *found, atlas_err *err) {
+    *found = false;
+    int pack_fd = openat(common_fd, "objects/pack", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (pack_fd < 0) {
+        if (errno == ENOENT) {
+            return ATLAS_OK; /* no pack directory: nothing to find */
+        }
+        return atlas_err_set_errno(err, ATLAS_ERR_INTEGRITY, errno,
+                                   "cannot read objects/pack in %s to check for promisor packs",
+                                   atlas_buf_cstr(&g->common_dir));
+    }
+    DIR *d = fdopendir(pack_fd);
+    if (d == NULL) {
+        atlas_status st = atlas_err_set_errno(err, ATLAS_ERR_INTEGRITY, errno,
+                                              "cannot enumerate objects/pack in %s",
+                                              atlas_buf_cstr(&g->common_dir));
+        (void)close(pack_fd);
+        return st;
+    }
+    atlas_status st = ATLAS_OK;
+    unsigned seen = 0;
+    struct dirent *e;
+    errno = 0;
+    while ((e = readdir(d)) != NULL) {
+        if (++seen > ATLAS_PROMISOR_MAX_PACK_ENTRIES) {
+            st = atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                               "objects/pack in %s holds more than %u entries; Atlas cannot prove "
+                               "there is no promisor pack and refuses to guess",
+                               atlas_buf_cstr(&g->common_dir), ATLAS_PROMISOR_MAX_PACK_ENTRIES);
+            break;
+        }
+        size_t nlen = strlen(e->d_name);
+        if (nlen > 9u && strcmp(e->d_name + nlen - 9u, ".promisor") == 0) {
+            *found = true;
+            break;
+        }
+    }
+    if (st == ATLAS_OK && e == NULL && errno != 0) {
+        st = atlas_err_set_errno(err, ATLAS_ERR_INTEGRITY, errno,
+                                 "cannot finish enumerating objects/pack in %s",
+                                 atlas_buf_cstr(&g->common_dir));
+    }
+    (void)closedir(d);
+    return st;
+}
+
 static atlas_status detect_partial_clone(atlas_git *g, atlas_err *err) {
     g->partial_clone = false;
     if (g->common_dir.len == 0) {
-        return ATLAS_OK;
+        /* Without a common dir there is no object store to reason about, and no
+         * way to prove the repository is complete. */
+        return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                             "cannot locate the git common directory for %s, so Atlas cannot "
+                             "verify that its object store is complete",
+                             atlas_buf_cstr(&g->root));
     }
     int common_fd = open(atlas_buf_cstr(&g->common_dir), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (common_fd < 0) {
-        /* Not being able to look is not proof of safety, but it is also not proof
-         * of a partial clone; the operation itself will fail later if the git dir
-         * is unreadable. */
-        return ATLAS_OK;
+        return atlas_err_set_errno(err, ATLAS_ERR_INTEGRITY, errno,
+                                   "cannot open the git common directory %s to verify that its "
+                                   "object store is complete",
+                                   atlas_buf_cstr(&g->common_dir));
     }
 
-    /* Marker 1: a promisor pack. */
-    int pack_fd = openat(common_fd, "objects/pack", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (pack_fd >= 0) {
-        DIR *d = fdopendir(pack_fd);
-        if (d != NULL) {
-            struct dirent *e;
-            while ((e = readdir(d)) != NULL) {
-                size_t nlen = strlen(e->d_name);
-                if (nlen > 9u && strcmp(e->d_name + nlen - 9u, ".promisor") == 0) {
-                    g->partial_clone = true;
-                    (void)atlas_buf_set_str(&g->partial_reason,
-                                            "a promisor pack file is present in objects/pack", err);
-                    break;
-                }
-            }
-            (void)closedir(d);
-        } else {
-            (void)close(pack_fd);
-        }
+    /* Marker 1: a promisor pack on disk. */
+    bool found = false;
+    atlas_status st = detect_promisor_pack(g, common_fd, &found, err);
+    if (st == ATLAS_OK && found) {
+        g->partial_clone = true;
+        st = atlas_buf_set_str(&g->partial_reason,
+                               "a promisor pack file is present in objects/pack", err);
     }
 
-    /* Marker 2: promisor or partial-clone configuration. */
-    if (!g->partial_clone) {
-        int cfg = openat(common_fd, "config", O_RDONLY | O_CLOEXEC);
-        if (cfg >= 0) {
-            /* Bounded read: a config larger than this is not something Atlas will
-             * scan, and is refused rather than trusted. */
-            char buf[64u * 1024u];
-            ssize_t got = read(cfg, buf, sizeof(buf) - 1u);
-            (void)close(cfg);
-            if (got > 0) {
-                buf[got] = '\0';
-                for (ssize_t i = 0; i < got; i++) {
-                    buf[i] = (char)tolower((unsigned char)buf[i]);
-                }
-                const char *marker = NULL;
-                if (strstr(buf, "promisor") != NULL) {
-                    marker = "the repository config mentions a promisor remote";
-                } else if (strstr(buf, "partialclone") != NULL) {
-                    marker = "the repository config mentions a partial clone filter";
-                }
-                if (marker != NULL) {
-                    g->partial_clone = true;
-                    (void)atlas_buf_set_str(&g->partial_reason, marker, err);
-                }
+    /* Markers 2 to 4: configuration, resolved by git itself including every file
+     * git would include, across the repository config and config.worktree. */
+    if (st == ATLAS_OK && !g->partial_clone) {
+        static const struct {
+            const char *const *argv;
+            size_t n;
+            const char *what;
+            const char *reason;
+        } QUERIES[] = {
+            {CONFIG_QUERY_PROMISOR, 5u, "promisor remote",
+             "a remote is configured as a promisor remote"},
+            {CONFIG_QUERY_PARTIAL_FILTER, 5u, "partial clone filter",
+             "a remote is configured with a partial clone filter"},
+            {CONFIG_QUERY_EXTENSIONS, 5u, "partialclone extension",
+             "extensions.partialclone is set"},
+        };
+        for (size_t i = 0; i < sizeof(QUERIES) / sizeof(QUERIES[0]) && st == ATLAS_OK; i++) {
+            bool matched = false;
+            st = config_query(g, QUERIES[i].argv, QUERIES[i].n, QUERIES[i].what, &matched, err);
+            if (st == ATLAS_OK && matched) {
+                g->partial_clone = true;
+                st = atlas_buf_set_str(&g->partial_reason, QUERIES[i].reason, err);
+                break;
             }
         }
     }
@@ -403,7 +589,7 @@ static atlas_status detect_partial_clone(atlas_git *g, atlas_err *err) {
     g->has_alternates = (fstatat(common_fd, "objects/info/alternates", &sb, 0) == 0);
 
     (void)close(common_fd);
-    return ATLAS_OK;
+    return st;
 }
 
 bool atlas_git_is_partial_clone(const atlas_git *g) {
@@ -797,6 +983,71 @@ atlas_status atlas_git_ls_files(atlas_git *g, atlas_git_index_cb cb, void *ud, a
     return st;
 }
 
+/* --- untracked discovery (A1) ------------------------------------------- */
+
+typedef struct path_stream {
+    atlas_nulsplit split;
+    atlas_git_path_cb cb;
+    void *ud;
+    int64_t seen;
+} path_stream;
+
+static atlas_status path_token(const char *tok, size_t len, void *ud, atlas_err *err) {
+    path_stream *s = (path_stream *)ud;
+    if (len == 0) {
+        /* git never emits an empty -z record here. An empty one means the output
+         * is not what Atlas thinks it is, and guessing would mean indexing the
+         * repository root. */
+        return atlas_err_set(err, ATLAS_ERR_GIT, "git ls-files produced an empty path record");
+    }
+    s->seen++;
+    if (s->cb == NULL) {
+        return ATLAS_OK;
+    }
+    return s->cb(tok, len, s->ud, err);
+}
+
+static atlas_status path_sink(const char *chunk, size_t n, void *ud, atlas_err *err) {
+    path_stream *s = (path_stream *)ud;
+    return atlas_nulsplit_feed(&s->split, chunk, n, err);
+}
+
+static atlas_status run_path_listing(atlas_git *g, const char *const *sub, size_t nsub,
+                                     const char *what, atlas_git_path_cb cb, void *ud,
+                                     atlas_err *err) {
+    path_stream stream;
+    memset(&stream, 0, sizeof(stream));
+    stream.cb = cb;
+    stream.ud = ud;
+    atlas_nulsplit_init(&stream.split, ATLAS_GIT_MAX_TOKEN, path_token, &stream);
+
+    atlas_status st = git_run_checked(g, ATLAS_GIT_CMD_PLAIN, sub, nsub, path_sink, &stream, 0, what,
+                                      err);
+    if (st == ATLAS_OK) {
+        st = atlas_nulsplit_finish(&stream.split, err);
+    }
+    atlas_nulsplit_free(&stream.split);
+    return st;
+}
+
+atlas_status atlas_git_ls_untracked(atlas_git *g, atlas_git_path_cb cb, void *ud, atlas_err *err) {
+    /* --others: not in the index. --exclude-standard: apply .gitignore,
+     * .git/info/exclude and the core.excludesFile git would apply. No
+     * --directory, so a wholly untracked directory is expanded into its files,
+     * which is the whole point of this call. */
+    const char *sub[] = {"ls-files", "-z", "--others", "--exclude-standard"};
+    return run_path_listing(g, sub, 4u, "git ls-files --others", cb, ud, err);
+}
+
+atlas_status atlas_git_ls_ignored(atlas_git *g, atlas_git_path_cb cb, void *ud, atlas_err *err) {
+    /* --directory here, deliberately: an ignored node_modules or build tree is
+     * reported as one path. Enumerating it file by file is exactly the unbounded
+     * work ignoring it was meant to avoid. */
+    const char *sub[] = {"ls-files", "-z", "--others", "--ignored", "--exclude-standard",
+                         "--directory"};
+    return run_path_listing(g, sub, 6u, "git ls-files --ignored", cb, ud, err);
+}
+
 /* --- history ------------------------------------------------------------ */
 
 typedef struct log_stream {
@@ -817,10 +1068,7 @@ atlas_status atlas_git_log(atlas_git *g, const void *limit_path, size_t limit_pa
     log_stream stream;
     atlas_nulsplit_init(&stream.split, ATLAS_GIT_MAX_TOKEN, atlas_log_token, &lp);
 
-    /* The sentinel byte marks a commit header so a name-status record can never
-     * be mistaken for one, and the raw message is last so a message containing
-     * the field separator cannot shift the parse. */
-    static const char format[] = "--format=\x01%H\x1f%P\x1f%an\x1f%ae\x1f%at\x1f%ct\x1f%B";
+    static const char format[] = ATLAS_LOG_FORMAT;
 
     const char *sub[10];
     size_t nsub = 0;
@@ -866,6 +1114,123 @@ out:
     atlas_nulsplit_free(&stream.split);
     atlas_log_parser_free(&lp);
     return st;
+}
+
+/* --- incremental history (A1) ------------------------------------------- */
+
+atlas_status atlas_git_log_since(atlas_git *g, const char *exclude_oid, int64_t max_commits,
+                                 atlas_git_commit_cb commit_cb, atlas_git_change_cb change_cb,
+                                 void *ud, atlas_err *err) {
+    if (exclude_oid == NULL || exclude_oid[0] == '\0') {
+        return atlas_git_log(g, NULL, 0, max_commits, commit_cb, change_cb, ud, err);
+    }
+    /* Validated before it becomes an argument: an object id is the only thing
+     * that may appear here, so a revision expression, an option-looking string
+     * or a pathspec cannot be smuggled through a stored tip. */
+    if (!atlas_git_is_hex_oid(exclude_oid, strlen(exclude_oid))) {
+        return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                             "refusing to use a stored commit tip that is not a hex object id");
+    }
+
+    atlas_log_parser lp;
+    atlas_log_parser_init(&lp, commit_cb, change_cb, ud);
+    log_stream stream;
+    atlas_nulsplit_init(&stream.split, ATLAS_GIT_MAX_TOKEN, atlas_log_token, &lp);
+
+    char maxbuf[32];
+    const char *sub[12];
+    size_t nsub = 0;
+    sub[nsub++] = "log";
+    sub[nsub++] = "-z";
+    sub[nsub++] = "--name-status";
+    sub[nsub++] = "-M";
+    sub[nsub++] = "-C";
+    sub[nsub++] = "--no-color";
+    sub[nsub++] = ATLAS_LOG_FORMAT;
+    if (max_commits > 0) {
+        (void)snprintf(maxbuf, sizeof(maxbuf), "--max-count=%lld", (long long)max_commits);
+        sub[nsub++] = maxbuf;
+    }
+    sub[nsub++] = "HEAD";
+    sub[nsub++] = "--not";
+    sub[nsub++] = exclude_oid;
+
+    atlas_status st = git_run_checked(g, ATLAS_GIT_CMD_DIFF, sub, nsub, log_sink, &stream, 0,
+                                      "git log (incremental)", err);
+    if (st == ATLAS_OK) {
+        st = atlas_nulsplit_finish(&stream.split, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_log_parser_finish(&lp, err);
+    }
+    atlas_nulsplit_free(&stream.split);
+    atlas_log_parser_free(&lp);
+    return st;
+}
+
+/* Counts nothing and parses nothing: the question is only whether git produced a
+ * commit, so the sink just records that a byte arrived. */
+static atlas_status any_output_sink(const char *chunk, size_t n, void *ud, atlas_err *err) {
+    (void)chunk;
+    (void)err;
+    if (n > 0) {
+        *(bool *)ud = true;
+    }
+    return ATLAS_OK;
+}
+
+atlas_status atlas_git_tip_is_stale(atlas_git *g, const char *oid, bool *stale_out,
+                                    bool *unknown_out, atlas_err *err) {
+    *stale_out = false;
+    *unknown_out = false;
+    if (oid == NULL || !atlas_git_is_hex_oid(oid, strlen(oid))) {
+        *unknown_out = true;
+        return ATLAS_OK;
+    }
+
+    /* Does the object still exist? A rebase that garbage-collected the old tip
+     * leaves it absent, and `log <missing>` would then fail for a reason that
+     * has nothing to do with reachability. */
+    {
+        char spec[ATLAS_OID_HEX_MAX_INCL + 8u];
+        (void)snprintf(spec, sizeof(spec), "%s^{commit}", oid);
+        const char *sub[] = {"cat-file", "-e", spec};
+        atlas_buf sink = ATLAS_BUF_INIT;
+        atlas_proc_result res;
+        memset(&res, 0, sizeof(res));
+        atlas_status st = git_run(g, ATLAS_GIT_CMD_PLAIN, sub, 3u, atlas_proc_sink_buf, &sink, NULL,
+                                  ATLAS_GIT_SMALL_OUTPUT, &res, err);
+        atlas_buf_free(&sink);
+        if (st != ATLAS_OK) {
+            return st;
+        }
+        if (res.exit_code != 0) {
+            *unknown_out = true;
+            return ATLAS_OK;
+        }
+    }
+
+    /* `log <tip> --not HEAD` lists what the old tip can reach and HEAD cannot.
+     * For an ordinary fast-forward that set is empty. Any output means history
+     * moved sideways or backwards: a force-push, a rebase, a reset, a branch
+     * switch. That is the signal to stop trusting the stored tip. */
+    bool any = false;
+    const char *sub[] = {"log", "--max-count=1", "--format=%H", oid, "--not", "HEAD"};
+    atlas_proc_result res;
+    memset(&res, 0, sizeof(res));
+    atlas_status st = git_run(g, ATLAS_GIT_CMD_DIFF, sub, 6u, any_output_sink, &any, NULL,
+                              ATLAS_GIT_SMALL_OUTPUT, &res, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (res.exit_code != 0) {
+        /* Cannot answer: treat the tip as unusable rather than assume it is
+         * still an ancestor, which would silently skip real commits. */
+        *unknown_out = true;
+        return ATLAS_OK;
+    }
+    *stale_out = any;
+    return ATLAS_OK;
 }
 
 /* --- working tree diff -------------------------------------------------- */

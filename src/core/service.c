@@ -12,6 +12,7 @@
 #include <string.h>
 
 #include "atlas/atlas.h"
+#include "atlas/lock.h"
 #include "atlas/pathrep.h"
 #include "core/service_internal.h"
 
@@ -20,6 +21,7 @@ struct atlas_ctx {
     atlas_buf db_path;
     atlas_datadir_source data_dir_source;
     atlas_db *db;
+    atlas_lock *lock; /* NULL when this context is not the writer */
 };
 
 atlas_status atlas_ctx_open(const atlas_ctx_opts *opts, atlas_ctx **out, atlas_err *err) {
@@ -32,6 +34,7 @@ atlas_status atlas_ctx_open(const atlas_ctx_opts *opts, atlas_ctx **out, atlas_e
     atlas_buf_init(&ctx->db_path);
 
     const char *override = (opts != NULL) ? opts->data_dir_override : NULL;
+    atlas_ctx_mode mode = (opts != NULL) ? opts->mode : ATLAS_CTX_AUTO;
     atlas_status st =
         atlas_datadir_resolve(override, &ctx->data_dir, &ctx->data_dir_source, err);
     if (st == ATLAS_OK) {
@@ -40,11 +43,48 @@ atlas_status atlas_ctx_open(const atlas_ctx_opts *opts, atlas_ctx **out, atlas_e
     if (st == ATLAS_OK) {
         st = atlas_datadir_db_path(atlas_buf_cstr(&ctx->data_dir), &ctx->db_path, err);
     }
-    if (st == ATLAS_OK) {
-        st = atlas_db_open(atlas_buf_cstr(&ctx->db_path), &ctx->db, err);
+    if (st != ATLAS_OK) {
+        atlas_ctx_close(ctx);
+        return st;
     }
-    if (st == ATLAS_OK) {
-        st = atlas_db_migrate(ctx->db, err);
+
+    /* Exactly one process writes at a time.
+     *
+     * ATLAS_CTX_WRITE fails outright when the lock is held, because a mutation
+     * that races the daemon would interleave generations and leave the index
+     * describing a state that never existed. ATLAS_CTX_AUTO instead degrades to
+     * a read-only handle, which is what lets every read command keep working
+     * while the daemon owns the writer. */
+    if (mode != ATLAS_CTX_READ) {
+        atlas_err lock_err;
+        atlas_err_init(&lock_err);
+        atlas_status lst =
+            atlas_lock_acquire(atlas_buf_cstr(&ctx->data_dir),
+                               mode == ATLAS_CTX_WRITE ? ATLAS_LOCK_ROLE_ONESHOT
+                                                       : ATLAS_LOCK_ROLE_ONESHOT,
+                               &ctx->lock, &lock_err);
+        if (lst != ATLAS_OK) {
+            if (mode == ATLAS_CTX_WRITE) {
+                *err = lock_err;
+                atlas_ctx_close(ctx);
+                return lst;
+            }
+            ctx->lock = NULL; /* fall through to a read-only handle */
+        }
+    }
+
+    if (ctx->lock != NULL) {
+        st = atlas_db_open(atlas_buf_cstr(&ctx->db_path), &ctx->db, err);
+        if (st == ATLAS_OK) {
+            st = atlas_db_migrate(ctx->db, err);
+        }
+    } else {
+        st = atlas_db_open_readonly(atlas_buf_cstr(&ctx->db_path), &ctx->db, err);
+        if (st == ATLAS_OK) {
+            /* Cannot migrate without the lock; verify instead, so a version skew
+             * is an explanation rather than a confusing missing-table error. */
+            st = atlas_db_migrate(ctx->db, err);
+        }
     }
     if (st != ATLAS_OK) {
         atlas_ctx_close(ctx);
@@ -59,9 +99,16 @@ void atlas_ctx_close(atlas_ctx *ctx) {
         return;
     }
     atlas_db_close(ctx->db);
+    /* Released after the database handle, so the lock still covers the last
+     * write's WAL checkpoint. */
+    atlas_lock_release(ctx->lock);
     atlas_buf_free(&ctx->data_dir);
     atlas_buf_free(&ctx->db_path);
     free(ctx);
+}
+
+bool atlas_ctx_is_writer(const atlas_ctx *ctx) {
+    return ctx != NULL && ctx->lock != NULL;
 }
 
 const char *atlas_ctx_data_dir(const atlas_ctx *ctx) {
@@ -292,6 +339,11 @@ static atlas_status derive_name(const char *root, char *out, size_t out_size, at
 
 atlas_status atlas_service_repo_add(atlas_ctx *ctx, const char *path, const char *name,
                                     atlas_repo_info *out, atlas_err *err) {
+    return atlas_service_repo_add_db(ctx->db, path, name, out, err);
+}
+
+atlas_status atlas_service_repo_add_db(atlas_db *db, const char *path, const char *name,
+                                       atlas_repo_info *out, atlas_err *err) {
     atlas_git *g = NULL;
     atlas_status st = atlas_git_open(path, &g, err);
     if (st != ATLAS_OK) {
@@ -333,14 +385,19 @@ atlas_status atlas_service_repo_add(atlas_ctx *ctx, const char *path, const char
     ident.object_format = atlas_git_object_format(g);
 
     int64_t id = 0;
-    st = atlas_db_repo_add(ctx->db, effective, &ident, &id, err);
+    st = atlas_db_repo_add(db, effective, &ident, &id, err);
     atlas_git_close(g);
     if (st != ATLAS_OK) {
         return st;
     }
+    /* A repository registered under A1 gets its index-state row immediately, so
+     * `atlas daemon status` can describe it as unwatched rather than as absent. */
+    atlas_err ignore;
+    atlas_err_init(&ignore);
+    (void)atlas_db_index_state_ensure(db, id, &ignore);
     if (out != NULL) {
         bool found = false;
-        return atlas_db_repo_get(ctx->db, effective, out, &found, err);
+        return atlas_db_repo_get(db, effective, out, &found, err);
     }
     return ATLAS_OK;
 }
@@ -372,17 +429,27 @@ atlas_status atlas_service_repo_list(atlas_ctx *ctx, atlas_repo_cb cb, void *ud,
 
 atlas_status atlas_service_repo_remove(atlas_ctx *ctx, const char *name, atlas_repo_info *removed,
                                        atlas_err *err) {
+    return atlas_service_repo_remove_db(ctx->db, name, removed, err);
+}
+
+atlas_status atlas_service_repo_remove_db(atlas_db *db, const char *name, atlas_repo_info *removed,
+                                          atlas_err *err) {
     /* Read the record first so the caller can report exactly what was forgotten.
      * Only Atlas metadata is deleted; the repository itself is never touched. */
     atlas_repo_info info;
     atlas_repo_info_init(&info);
-    atlas_status st = atlas_service_require_repo(ctx, name, &info, err);
+    bool found = false;
+    atlas_status st = atlas_db_repo_get(db, name, &info, &found, err);
+    if (st == ATLAS_OK && !found) {
+        st = atlas_err_set(err, ATLAS_ERR_REPO,
+                           "no repository named \"%s\" is registered (try: atlas repo list)", name);
+    }
     if (st != ATLAS_OK) {
         atlas_repo_info_free(&info);
         return st;
     }
     bool gone = false;
-    st = atlas_db_repo_remove(ctx->db, name, &gone, err);
+    st = atlas_db_repo_remove(db, name, &gone, err);
     if (st == ATLAS_OK && !gone) {
         st = atlas_err_set(err, ATLAS_ERR_DB, "repository \"%s\" could not be removed", name);
     }

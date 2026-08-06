@@ -65,9 +65,19 @@ atlas_status atlas_git_build_argv(const char **argv, size_t argv_cap, size_t *n,
 const char *const *atlas_git_cmd_flags(atlas_git_cmd_kind kind);
 
 /* Resolves the git executable once per process and caches it. Subsequent calls
- * copy the cached path without searching PATH again. */
+ * copy the cached path without searching PATH again. Safe to call from any
+ * thread: the cache is immutable once published and every access is serialised. */
 atlas_status atlas_git_executable(atlas_buf *out, atlas_err *err);
-/* Releases the cached path. Only for tests and orderly shutdown. */
+
+/* Forces the one-time resolution to happen now.
+ *
+ * The daemon calls this before it creates any thread, so that the git runtime
+ * state is frozen before concurrency begins and a missing git is reported once,
+ * at startup, rather than by whichever worker happened to need it first. */
+atlas_status atlas_git_runtime_init(atlas_err *err);
+
+/* Releases the cached path. Test-only, and only valid with no other thread
+ * running: it un-publishes state that is otherwise immutable. */
 void atlas_git_executable_reset(void);
 
 #endif /* ATLAS_GIT_HARDEN_H */

@@ -249,3 +249,88 @@ adds `git_dir`, `git_dir_text` and `is_linked_worktree`, plus an index on
 the git dir against the registration and refuses with exit 7 if either has moved,
 so a pruned or relocated worktree is reported rather than silently indexed as
 something else.
+
+## Migration 3 — continuous indexing state (A1)
+
+A0 answered one question: *what did the last scan see?* A1 has to answer a harder
+one: *is what Atlas holds right now current, and if not, in what way is it not
+current?* That needs state A0 never recorded.
+
+Nothing in migration 3 is destructive. Every statement is an `ALTER TABLE ... ADD
+COLUMN` with a default or a `CREATE` for a new object, so a schema-v2 database
+migrates forward with its rows intact and no table is recreated. There is a test
+that seeds a v2 database through the shipped v1 and v2 statements, populates it,
+migrates it, and asserts every row survives.
+
+### New columns on `files`
+
+| column | type | why |
+| --- | --- | --- |
+| `fs_dev`, `fs_ino`, `fs_size`, `fs_mtime_sec`, `fs_mtime_nsec`, `fs_ctime_sec`, `fs_ctime_nsec`, `fs_mode` | INTEGER, nullable | the filesystem identity last observed. A pass that finds all eight unchanged does **not** read the file. This is what makes reconciliation incremental. **ctime is not optional**: mtime is writable, so without ctime a same-length in-place edit with the mtime restored by `utimensat` compares as unchanged forever. Nothing in userspace can set ctime. |
+| `tracked` | INTEGER NOT NULL DEFAULT 1 | 0 for a file discovered inside an untracked directory. The default backfills correctly: A0 only ever recorded tracked files. |
+| `ignored` | INTEGER NOT NULL DEFAULT 0 | git's own ignore rules cover it |
+| `truncated`, `truncated_reason` | INTEGER / TEXT | the content was not fully hashed, and why. Never left implicit. |
+| `last_generation` | INTEGER NOT NULL DEFAULT 0 | the pass that last saw it |
+
+The identity columns are nullable and are read as a **unit**: any NULL among them
+means the whole identity is unknown, and an unknown identity is always rehashed —
+exactly once, after which the row has one. A partially recorded identity would
+compare unequal forever and rehash the file on every pass.
+
+### `repo_index_state` — one row per registered worktree
+
+| column | why |
+| --- | --- |
+| `generation` | the pass currently in flight |
+| `last_complete_generation` | the newest pass that finished consistently — **the only generation a reader is ever shown** |
+| `last_reconcile_at`, `last_complete_at` | when |
+| `watch_state` | `unwatched` / `watching` / `degraded` / `incomplete` / `error`, CHECKed |
+| `watch_detail`, `watched_dirs` | what the watcher is doing and how much of it |
+| `event_gap` | Atlas cannot prove it observed every change. While set, nothing may describe the index as current. |
+| `pending_full_reconcile` | a full pass is owed; persisted, so the obligation survives a restart |
+| `last_error` | the last failure, for `daemon status` |
+| `last_sync_seq` | what `atlas sync --wait` polls for |
+
+`last_complete_generation` is advanced with `max()`, never assignment, so a slow
+pass finishing after a newer one cannot move the published state backwards.
+
+### `repo_events` — the durable, monotonic cursor
+
+`id INTEGER PRIMARY KEY AUTOINCREMENT`, so the cursor is database-wide and
+strictly increasing and "everything after N" is one indexed range scan that does
+not depend on wall-clock time. AUTOINCREMENT specifically, so a deleted row's id
+is never reused — a pruned journal must not renumber into a consumer's cursor.
+
+`dedup_key` with a **partial unique index** on `(repo_id, generation, dedup_key)
+WHERE dedup_key IS NOT NULL` makes ingestion idempotent: the same observation
+replayed after a restart collides instead of appending a duplicate. Events with
+no key (a reconciliation summary) are always appended.
+
+Rows here have **bounded retention** (`ATLAS_EVENTS_RETAIN_PER_REPO`, 20000).
+Durable `SOURCE` and `GIT` evidence in `evidence` is **never** pruned with them:
+raw events are a convenience for consumers, evidence is the provenance record.
+
+### `repo_commit_tips`
+
+`(repo_id, ref_name) → tip_oid`. What each ref was at when its history was last
+ingested, so the next pass runs `git log HEAD --not <tip>` rather than replaying
+everything. A detached HEAD gets its own key (`HEAD@detached`) so checking out a
+commit does not corrupt the branch's recorded position.
+
+### `daemon_state`
+
+A single row, held to one by `CHECK(id = 1)` so a second daemon cannot append a
+second identity and make `daemon status` ambiguous. It is **diagnostic only**:
+liveness is proven by the advisory lock, not by this row. A killed daemon leaves
+the row behind, and the released lock is what disproves it.
+
+### What migration 3 creates
+
+Tables: `repo_index_state`, `repo_events`, `repo_commit_tips`, `daemon_state`.
+Indexes: `idx_files_repo_generation`, `idx_repo_events_repo`,
+`idx_repo_events_dedup` (partial, unique).
+Columns: thirteen on `files`, listed above.
+Constraints: `CHECK` on `repo_index_state.watch_state`, `CHECK` on
+`repo_events.kind`, `CHECK(id = 1)` on `daemon_state`, and `REFERENCES
+repositories(id) ON DELETE CASCADE` on all four new tables so `repo remove`
+remains a pure cascade.

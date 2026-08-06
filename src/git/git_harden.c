@@ -3,6 +3,7 @@
  */
 #include "git/git_harden.h"
 
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -233,31 +234,68 @@ atlas_status atlas_git_build_argv(const char **argv, size_t argv_cap, size_t *n,
 #undef PUSH
 }
 
-/* --- executable resolution ---------------------------------------------- */
-
-/* Resolved once per process. A0 is single-threaded; this is the only mutable
- * global in Atlas and exists so that PATH is searched exactly once. */
-static atlas_buf g_git_exe = ATLAS_BUF_INIT;
-static bool g_git_exe_resolved = false;
+/* --- executable resolution ----------------------------------------------
+ *
+ * A0 cached the resolved git path in two plain globals and read them without
+ * synchronisation. That was correct exactly as long as Atlas stayed
+ * single-threaded, and A1 makes it not single-threaded: the daemon runs a
+ * writer thread, a watcher thread and a worker pool, any of which may open a
+ * repository. Two threads racing on `g_git_exe_resolved` is a data race whether
+ * or not it ever produces a wrong answer on a given machine, and it would
+ * additionally leak the buffer whose ownership the loser transferred.
+ *
+ * The cache is now immutable after publication and every access is serialised.
+ * The mutex is held only for the pointer copy, so the fast path is a few
+ * instructions; the PATH search itself happens once.
+ *
+ * A mutex rather than pthread_once because the resolution can *fail* (git not
+ * installed), and a pthread_once initialiser that fails has no way to be
+ * retried or to report why. atlas_git_runtime_init() exists so the daemon can
+ * force the one-time resolution to happen deterministically, before it creates
+ * any thread — after which every reader observes a value that never changes. */
+static pthread_mutex_t g_git_exe_lock = PTHREAD_MUTEX_INITIALIZER;
+static atlas_buf g_git_exe = ATLAS_BUF_INIT; /* guarded by g_git_exe_lock */
+static bool g_git_exe_resolved = false;      /* guarded by g_git_exe_lock */
 
 atlas_status atlas_git_executable(atlas_buf *out, atlas_err *err) {
+    atlas_status st = ATLAS_OK;
+    if (pthread_mutex_lock(&g_git_exe_lock) != 0) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "cannot lock the git runtime cache");
+    }
     if (!g_git_exe_resolved) {
         atlas_buf resolved = ATLAS_BUF_INIT;
         /* PATH from Atlas' own environment is used here, and only here, to find
          * the real git. The child never receives it. */
-        atlas_status st = atlas_proc_which("git", getenv("PATH"), &resolved, err);
-        if (st != ATLAS_OK) {
+        st = atlas_proc_which("git", getenv("PATH"), &resolved, err);
+        if (st == ATLAS_OK) {
+            atlas_buf_free(&g_git_exe);
+            g_git_exe = resolved; /* ownership moves to the cache */
+            g_git_exe_resolved = true;
+        } else {
             atlas_buf_free(&resolved);
-            return st;
         }
-        atlas_buf_free(&g_git_exe);
-        g_git_exe = resolved; /* ownership moves to the cache */
-        g_git_exe_resolved = true;
     }
-    return atlas_buf_set(out, g_git_exe.data, g_git_exe.len, err);
+    if (st == ATLAS_OK) {
+        st = atlas_buf_set(out, g_git_exe.data, g_git_exe.len, err);
+    }
+    (void)pthread_mutex_unlock(&g_git_exe_lock);
+    return st;
+}
+
+atlas_status atlas_git_runtime_init(atlas_err *err) {
+    atlas_buf tmp = ATLAS_BUF_INIT;
+    atlas_status st = atlas_git_executable(&tmp, err);
+    atlas_buf_free(&tmp);
+    return st;
 }
 
 void atlas_git_executable_reset(void) {
+    /* Test-only. Resetting immutable-after-publication state is by definition not
+     * safe while other threads may read it; the suite calls this between cases,
+     * with no daemon threads alive. The lock is still taken so the reset itself
+     * cannot tear the buffer. */
+    (void)pthread_mutex_lock(&g_git_exe_lock);
     atlas_buf_free(&g_git_exe);
     g_git_exe_resolved = false;
+    (void)pthread_mutex_unlock(&g_git_exe_lock);
 }

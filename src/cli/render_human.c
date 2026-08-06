@@ -391,7 +391,7 @@ static atlas_status h_file(atlas_renderer *r, const atlas_file_report *f, atlas_
     /* Provenance is part of the answer, not a footnote. */
     (void)fprintf(o, LABEL "SOURCE (git index and working tree), GIT (commit history)\n",
                   "evidence");
-    (void)fprintf(o, LABEL "%s: A0 records facts only and never infers why\n", "reason",
+    (void)fprintf(o, LABEL "%s: Atlas records facts only and never infers why\n", "reason",
                   f->reason);
     return ok();
 }
@@ -509,9 +509,202 @@ static atlas_status h_diff_end(atlas_renderer *r, const atlas_diff_report *rep, 
     return ok();
 }
 
+/* --- A1: daemon, sync, events, service ---------------------------------- */
+
+static atlas_status h_daemon_status(atlas_renderer *r, const atlas_daemon_status_report *rep,
+                                    atlas_err *err) {
+    (void)err;
+    FILE *o = r->out;
+    /* Running and reachable are separate facts: a daemon that owns the writer
+     * lock but is not answering is a state worth seeing, and one boolean would
+     * hide it. */
+    (void)fprintf(o, LABEL "%s\n", "daemon",
+                  rep->running ? (rep->reachable ? "running" : "running, not answering")
+                               : (rep->reachable ? "answering, but not holding the writer lock"
+                                                 : "not running"));
+    (void)fprintf(o, LABEL "%s\n", "socket",
+                  dash_if_empty(atlas_safe(&r->safe, atlas_buf_cstr(&rep->socket_path))));
+    if (rep->lock_holder.len > 0) {
+        (void)fprintf(o, LABEL "%s\n", "writer lock",
+                      atlas_safe(&r->safe, atlas_buf_cstr(&rep->lock_holder)));
+    }
+    if (rep->record.present) {
+        (void)fprintf(o, LABEL "%lld\n", "recorded pid", (long long)rep->record.pid);
+        (void)fprintf(o, LABEL "%s\n", "started", dash_if_empty(rep->record.started_at));
+        (void)fprintf(o, LABEL "%s\n", "heartbeat", dash_if_empty(rep->record.last_heartbeat_at));
+    }
+    (void)fprintf(o, LABEL "%d\n", "protocol", rep->protocol_version);
+    (void)fprintf(o, LABEL "%" PRId64 "\n", "repositories", rep->repo_count);
+    (void)fprintf(o, LABEL "%" PRId64 "\n", "watching", rep->watched_repos);
+    (void)fprintf(o, LABEL "%" PRId64 "\n", "degraded", rep->degraded_repos);
+    (void)fprintf(o, LABEL "%" PRId64 "\n", "event gaps", rep->repos_with_gap);
+    if (rep->repos_with_gap > 0) {
+        (void)fprintf(o,
+                      "\n%" PRId64
+                      " repository/repositories are known to have missed filesystem events.\n"
+                      "Their indexes are NOT current until a full reconciliation completes.\n",
+                      rep->repos_with_gap);
+    }
+    return ok();
+}
+
+static atlas_status h_daemon_ping(atlas_renderer *r, bool reachable, const char *socket_path,
+                                  const char *detail, atlas_err *err) {
+    (void)err;
+    (void)fprintf(r->out, LABEL "%s\n", "socket",
+                  dash_if_empty(atlas_safe(&r->safe, socket_path)));
+    (void)fprintf(r->out, LABEL "%s\n", "daemon", reachable ? "responding" : "not responding");
+    if (detail != NULL && detail[0] != '\0') {
+        (void)fprintf(r->out, LABEL "%s\n", "detail", atlas_safe(&r->safe, detail));
+    }
+    return ok();
+}
+
+static atlas_status h_repo_state(atlas_renderer *r, const atlas_repo_state_report *rep,
+                                 atlas_err *err) {
+    (void)err;
+    FILE *o = r->out;
+    (void)fprintf(o, LABEL "%s\n", "repository", rep->repo.name);
+    (void)fprintf(o, LABEL "%s\n", "root", atlas_buf_cstr(&rep->repo.root_path_text));
+    (void)fprintf(o, LABEL "%s\n", "watch state", atlas_watch_state_name(rep->state.watch_state));
+    (void)fprintf(o, LABEL "%" PRId64 "\n", "watched dirs", rep->state.watched_dirs);
+    (void)fprintf(o, LABEL "%" PRId64 " (in flight %" PRId64 ")\n", "generation",
+                  rep->state.last_complete_generation, rep->state.generation);
+    (void)fprintf(o, LABEL "%s\n", "last complete", dash_if_empty(rep->state.last_complete_at));
+    (void)fprintf(o, LABEL "%" PRId64 "\n", "event cursor", rep->event_cursor);
+    /* The claim, and when it is false, why. Never "current" with a known gap. */
+    (void)fprintf(o, LABEL "%s\n", "index current", yes_no(rep->index_current));
+    if (!rep->index_current && rep->not_current_reason != NULL) {
+        (void)fprintf(o, LABEL "%s\n", "reason", rep->not_current_reason);
+    }
+    if (rep->state.watch_detail.len > 0) {
+        (void)fprintf(o, LABEL "%s\n", "watch detail",
+                      atlas_safe(&r->safe, atlas_buf_cstr(&rep->state.watch_detail)));
+    }
+    if (rep->state.last_error.len > 0) {
+        (void)fprintf(o, LABEL "%s\n", "last error",
+                      atlas_safe(&r->safe, atlas_buf_cstr(&rep->state.last_error)));
+    }
+    return ok();
+}
+
+static atlas_status h_sync(atlas_renderer *r, const char *repo, const atlas_sync_report *rep,
+                           atlas_err *err) {
+    (void)err;
+    FILE *o = r->out;
+    (void)fprintf(o, LABEL "%s\n", "repository", repo);
+    (void)fprintf(o, LABEL "%s\n", "performed by", rep->via_daemon ? "the daemon" : "this command");
+    if (rep->via_daemon) {
+        (void)fprintf(o, LABEL "%" PRId64 "\n", "sync sequence", rep->sync_seq);
+        (void)fprintf(o, LABEL "%s\n", "state",
+                      rep->completed ? "completed" : (rep->waited ? "still running" : "queued"));
+        if (rep->completed) {
+            (void)fprintf(o, LABEL "%" PRId64 "\n", "generation", rep->generation);
+        }
+        return ok();
+    }
+    const atlas_reconcile_summary *s = &rep->summary;
+    if (!s->published) {
+        (void)fprintf(o, LABEL "%s\n", "state",
+                      "abandoned: HEAD moved during the pass, so nothing was committed");
+        return ok();
+    }
+    (void)fprintf(o, LABEL "%" PRId64 "\n", "generation", s->generation);
+    (void)fprintf(o, LABEL "%" PRId64 "\n", "files examined", s->files_examined);
+    /* The number that shows the pass was incremental. */
+    (void)fprintf(o, LABEL "%" PRId64 "\n", "content read", s->files_hashed);
+    (void)fprintf(o, LABEL "%" PRId64 "\n", "unchanged by id", s->files_identity_hit);
+    (void)fprintf(o, LABEL "%s\n", "content verified", yes_no(s->content_verified));
+    if (s->files_dirty_forced > 0) {
+        (void)fprintf(o, LABEL "%" PRId64 "\n", "read on event", s->files_dirty_forced);
+    }
+    if (s->files_racy > 0) {
+        (void)fprintf(o, LABEL "%" PRId64 "\n", "read (racy stamp)", s->files_racy);
+    }
+    (void)fprintf(o, LABEL "+%" PRId64 " ~%" PRId64 " -%" PRId64 "\n", "changes", s->files_added,
+                  s->files_modified, s->files_deleted);
+    (void)fprintf(o, LABEL "%" PRId64 "\n", "untracked found", s->untracked_discovered);
+    (void)fprintf(o, LABEL "%" PRId64 "\n", "ignored paths", s->ignored_paths);
+    (void)fprintf(o, LABEL "%" PRId64 " new of %" PRId64 " walked\n", "commits",
+                  s->commits_ingested, s->commits_seen);
+    if (s->branch_rewrite) {
+        (void)fprintf(o, LABEL "%s\n", "history",
+                      "the previously ingested tip is unreachable; history was replayed in full");
+    }
+    (void)fprintf(o, LABEL "%" PRId64 "\n", "events recorded", s->events_appended);
+    (void)fprintf(o, LABEL "%" PRId64 "\n", "write batches", s->batches_written);
+    (void)fprintf(o, LABEL "%" PRId64 " ms\n", "duration", s->duration_ms);
+    if (s->truncated) {
+        (void)fprintf(o, LABEL "%s\n", "truncated", atlas_buf_cstr(&s->truncated_reason));
+    }
+    return ok();
+}
+
+static atlas_status h_event_item(atlas_renderer *r, const atlas_event_row *row, atlas_err *err) {
+    (void)err;
+    r->items++;
+    /* path_text is already in the safe encoding; detail comes from git and the
+     * kernel, so it is encoded here. */
+    (void)fprintf(r->out, "  %-10" PRId64 " %-16s %-19s %s%s%s\n", row->id, row->kind,
+                  row->created_at, dash_if_empty(row->path_text),
+                  row->detail != NULL ? "  " : "",
+                  row->detail != NULL ? atlas_safe(&r->safe, row->detail) : "");
+    return ok();
+}
+
+static atlas_status h_events_end(atlas_renderer *r, int64_t cursor, bool more, atlas_err *err) {
+    (void)err;
+    (void)fprintf(r->out, LABEL "%" PRId64 "\n", "next cursor", cursor);
+    if (more) {
+        /* Never a silent truncation: the caller is told to ask again. */
+        (void)fprintf(r->out, LABEL "%s\n", "more",
+                      "yes — re-run with --since <next cursor> for the rest");
+    }
+    return ok();
+}
+
+static atlas_status h_unit_text(atlas_renderer *r, const char *text, atlas_err *err) {
+    (void)err;
+    /* Verbatim: this is exactly the file `atlas service install` would write, so
+     * a user can review it or redirect it without any transformation. */
+    (void)fputs(text, r->out);
+    return ok();
+}
+
+static atlas_status h_unit_install(atlas_renderer *r, const atlas_unit_install_report *rep,
+                                   bool uninstall, atlas_err *err) {
+    (void)err;
+    FILE *o = r->out;
+    (void)fprintf(o, LABEL "%s\n", "unit path", atlas_buf_cstr(&rep->path));
+    if (uninstall) {
+        (void)fprintf(o, LABEL "%s\n", "result",
+                      rep->removed ? "removed" : (rep->was_absent ? "already absent" : "unchanged"));
+        (void)fprintf(o, "\nRun: systemctl --user daemon-reload\n");
+        return ok();
+    }
+    if (rep->created_dir) {
+        (void)fprintf(o, LABEL "%s\n", "created", atlas_buf_cstr(&rep->dir));
+    }
+    (void)fprintf(o, LABEL "%s\n", "result",
+                  rep->unchanged ? "already up to date"
+                                 : (rep->replaced_existing ? "replaced the previous unit"
+                                                           : "written"));
+    (void)fprintf(o, LABEL "%s\n", "mode", "0600");
+    (void)fprintf(o, LABEL "%s\n", "service", "not enabled and not started");
+    (void)fprintf(o,
+                  "\nAtlas wrote the unit and did nothing else. To start it:\n"
+                  "  systemctl --user daemon-reload\n"
+                  "  systemctl --user enable --now atlas\n"
+                  "To keep it running after you log out of SSH:\n"
+                  "  sudo loginctl enable-linger $USER\n");
+    return ok();
+}
+
 const atlas_renderer_vtbl ATLAS_RENDERER_HUMAN = {
     h_begin,      h_end,          h_note_repo,    h_note_query,   h_list_begin,
     h_list_end,   h_doctor,       h_version,      h_repo_item,    h_repo_added,
     h_repo_removed, h_scan,       h_status,       h_search_item,  h_file,
     h_history_item, h_diff_begin, h_diff_item,    h_diff_end,
+    h_daemon_status, h_daemon_ping, h_repo_state, h_sync,         h_event_item,
+    h_events_end, h_unit_text,    h_unit_install,
 };

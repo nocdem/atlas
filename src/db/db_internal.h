@@ -15,7 +15,8 @@ struct atlas_db {
     sqlite3 *h;
     atlas_db_caps caps;
     int tx_depth;
-    bool fts_ready; /* the FTS5 shadow tables exist */
+    bool fts_ready;  /* the FTS5 shadow tables exist */
+    bool read_only;  /* opened SQLITE_OPEN_READONLY; no write may be attempted */
 };
 
 /* Wraps the last sqlite error into `err` with `what` as context. */

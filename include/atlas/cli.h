@@ -20,6 +20,13 @@ typedef struct atlas_cli_opts {
     bool yes;
     bool no_history;
     bool no_untracked;
+    /* A1 */
+    bool wait;
+    bool full;
+    bool user;   /* `service install --user`: required, and the only mode */
+    bool force;
+    bool run_once; /* `daemon run --once`: test hook, undocumented in help */
+    long since;
     const char *data_dir;
     long limit;
     long max_commits;

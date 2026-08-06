@@ -268,3 +268,80 @@ whole process tree is exactly {`atlas`, `git`}, that no `AF_INET` socket or
 `connect` is attempted, that no child opens `/dev/tty`, that the decoy repository is
 never read, and that a promisor repository produces a valid structured JSON error
 with exit code 7.
+
+## A1: `git config` on the allowlist, and why the allowlist alone is not enough for it
+
+`config` was added to `READONLY_SUBCOMMANDS` so that partial-clone detection can
+ask git what its own configuration is. The subcommand name says nothing about
+whether an invocation reads or writes — `git config a.b c` writes — so the
+allowlist does not cover it.
+
+Instead, every `config` invocation is matched against a **positive allowlist of
+complete argument vectors**:
+
+```
+config --includes --null --get-regexp ^remote\..*\.promisor$
+config --includes --null --get-regexp ^remote\..*\.partialclonefilter$
+config --includes --null --get-regexp ^extensions\.partialclone$
+```
+
+Nothing else is permitted. A denylist of writing options would have to enumerate
+`--add`, `--replace-all`, `--unset`, `--unset-all`, `--edit`,
+`--rename-section`, `--remove-section`, and whatever a future git adds — and the
+first one missed is a write to a repository Atlas promised never to modify.
+Matching the whole vector means a new query has to be added deliberately, in one
+place, and cannot be smuggled in by a new call site.
+
+## A1: exact, fail-closed partial-clone detection
+
+A0 detected a partial (promisor) clone by reading the first 64 KiB of
+`<common-dir>/config` and searching for the substrings `promisor` and
+`partialclone`. That was wrong in five separate ways, each of which is a bypass
+rather than a false negative in the safe direction:
+
+1. a config larger than 64 KiB hid the marker behind padding, and a config can be
+   padded to any size with comment lines
+2. a marker straddling the 64 KiB boundary was split and matched neither half
+3. `$GIT_DIR/config.worktree`, which git reads when `extensions.worktreeConfig`
+   is set, was never opened
+4. `include.path` and `includeIf` files, which git honours as if their contents
+   were inline, were never opened either
+5. it was a substring match, so it also *over*-refused any repository whose
+   config merely mentioned the word — a branch named `promisor-experiment` was
+   enough
+
+It is replaced by asking git, which is the only component that knows exactly
+which files make up a repository's configuration and how they compose.
+`--includes` makes git resolve `include.path` and `includeIf`; the hardened
+environment already pins `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` to
+`/dev/null`, so the answer describes this repository and nothing else.
+`--get-regexp` matches git's own canonicalised key names — lowercased for section
+and variable — so key case variants and arbitrary remote names are covered by the
+pattern rather than by string matching.
+
+Plus a bounded scan for a `*.promisor` file in `objects/pack`, which is proof
+independent of configuration: it is what git writes after a filtered fetch and it
+survives the configuration being edited away.
+
+**Fail-closed throughout.** `git config --get-regexp` exits 0 when it matched and
+1 when it did not. Every other outcome — a signal, a timeout, truncated stdout,
+an undocumented exit code, success with no output, an unreadable `objects/pack`,
+more pack entries than the scan will read — is treated as *cannot prove this
+repository is complete*, and refuses.
+
+`tests/test_git_hardening.c` has a regression case for each of the five bypasses,
+including the verified ~150 KiB padding one, plus one asserting that an innocent
+mention is **not** over-refused.
+
+## A1: the git executable cache is no longer a data race
+
+A0 cached the resolved git path in two plain globals and read them without
+synchronisation. That was correct exactly as long as Atlas was single-threaded,
+and A1 is not: the daemon runs a writer thread, a watcher thread and a worker
+pool, any of which may open a repository.
+
+The cache is now immutable after publication and every access is serialised by a
+mutex. `atlas_git_runtime_init()` forces the one-time resolution before the
+daemon creates any thread, so the PATH search happens once, deterministically,
+and a missing git is reported at startup rather than by whichever worker first
+needed it. Verified under ThreadSanitizer.

@@ -18,6 +18,7 @@
 #include "atlas/json.h"
 #include "atlas/safetext.h"
 #include "atlas/service.h"
+#include "atlas/unit.h"
 
 typedef struct atlas_renderer atlas_renderer;
 
@@ -47,6 +48,20 @@ typedef struct atlas_renderer_vtbl {
     atlas_status (*diff_begin)(atlas_renderer *r, const atlas_diff_report *rep, atlas_err *err);
     atlas_status (*diff_item)(atlas_renderer *r, const atlas_diff_entry *e, atlas_err *err);
     atlas_status (*diff_end)(atlas_renderer *r, const atlas_diff_report *rep, atlas_err *err);
+    /* --- A1 --- */
+    atlas_status (*daemon_status)(atlas_renderer *r, const atlas_daemon_status_report *rep,
+                                  atlas_err *err);
+    atlas_status (*daemon_ping)(atlas_renderer *r, bool reachable, const char *socket_path,
+                                const char *detail, atlas_err *err);
+    atlas_status (*repo_state)(atlas_renderer *r, const atlas_repo_state_report *rep,
+                               atlas_err *err);
+    atlas_status (*sync)(atlas_renderer *r, const char *repo, const atlas_sync_report *rep,
+                         atlas_err *err);
+    atlas_status (*event_item)(atlas_renderer *r, const atlas_event_row *row, atlas_err *err);
+    atlas_status (*events_end)(atlas_renderer *r, int64_t cursor, bool more, atlas_err *err);
+    atlas_status (*unit_text)(atlas_renderer *r, const char *text, atlas_err *err);
+    atlas_status (*unit_install)(atlas_renderer *r, const atlas_unit_install_report *rep,
+                                 bool uninstall, atlas_err *err);
 } atlas_renderer_vtbl;
 
 struct atlas_renderer {

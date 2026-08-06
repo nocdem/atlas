@@ -3,6 +3,7 @@ build/
 build-debug/
 build-asan/
 build-ubsan/
+build-tsan/
 
 # Editor/clangd convenience symlink created by `make compiledb`.
 compile_commands.json

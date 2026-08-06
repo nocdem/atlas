@@ -136,6 +136,31 @@ typedef atlas_status (*atlas_git_index_cb)(const atlas_git_index_entry *e, void 
 
 atlas_status atlas_git_ls_files(atlas_git *g, atlas_git_index_cb cb, void *ud, atlas_err *err);
 
+/* --- untracked file discovery (A1) -------------------------------------- */
+
+/* One path with no accompanying index metadata. */
+typedef atlas_status (*atlas_git_path_cb)(const void *path, size_t path_len, void *ud,
+                                          atlas_err *err);
+
+/* Every untracked path git's own ignore rules do not cover, one per file rather
+ * than collapsed to a directory.
+ *
+ * `git status --untracked-files=normal` collapses a wholly untracked directory
+ * into a single entry, which keeps `atlas diff` bounded but means a newly
+ * created directory — exactly where new work appears — is indexed as a name and
+ * nothing else. This enumerates the files instead. Using git rather than walking
+ * the tree ourselves means .gitignore, .git/info/exclude, the global excludes
+ * file and nested ignore files are all honoured exactly as git honours them,
+ * with no second implementation to drift. */
+atlas_status atlas_git_ls_untracked(atlas_git *g, atlas_git_path_cb cb, void *ud, atlas_err *err);
+
+/* Untracked paths that git's ignore rules DO cover. Reported separately so a
+ * caller can distinguish "skipped because ignored" from "skipped because a
+ * ceiling was reached". Directories are collapsed here, because an ignored build
+ * tree is exactly the thing that should not be enumerated file by file. */
+atlas_status atlas_git_ls_ignored(atlas_git *g, atlas_git_path_cb cb, void *ud, atlas_err *err);
+
+
 /* --- history ----------------------------------------------------------- */
 
 typedef struct atlas_git_commit {
@@ -173,6 +198,24 @@ typedef atlas_status (*atlas_git_change_cb)(const atlas_git_commit *c,
 atlas_status atlas_git_log(atlas_git *g, const void *limit_path, size_t limit_path_len,
                            int64_t max_commits, atlas_git_commit_cb commit_cb,
                            atlas_git_change_cb change_cb, void *ud, atlas_err *err);
+
+/* --- incremental history (A1) ------------------------------------------- */
+
+/* Like atlas_git_log, but walks only what is reachable from HEAD and not from
+ * `exclude_oid` — the commit whose history Atlas already ingested. That turns a
+ * repeated pass over a large repository from "replay everything" into "read the
+ * new commits". `exclude_oid` may be NULL or "" for a full walk. */
+atlas_status atlas_git_log_since(atlas_git *g, const char *exclude_oid, int64_t max_commits,
+                                 atlas_git_commit_cb commit_cb, atlas_git_change_cb change_cb,
+                                 void *ud, atlas_err *err);
+
+/* True when `oid` holds commits that HEAD cannot reach — the signature of a
+ * force-push, a rebase or a reset, as opposed to an ordinary fast-forward.
+ *
+ * `*unknown_out` is set when the commit is not in the object store at all,
+ * which is the other way history gets rewritten out from under an index. */
+atlas_status atlas_git_tip_is_stale(atlas_git *g, const char *oid, bool *stale_out,
+                                    bool *unknown_out, atlas_err *err);
 
 /* --- working tree diff ------------------------------------------------- */
 

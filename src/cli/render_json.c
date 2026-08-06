@@ -530,11 +530,164 @@ static atlas_status j_diff_end(atlas_renderer *r, const atlas_diff_report *rep, 
     return atlas_json_key_str(j, "reason", ATLAS_REASON_UNKNOWN, err);
 }
 
+/* --- A1: daemon, sync, events, service ---------------------------------- */
+
+static atlas_status j_daemon_status(atlas_renderer *r, const atlas_daemon_status_report *rep,
+                                    atlas_err *err) {
+    atlas_json *j = r->j;
+    atlas_safe_pool *p = &r->safe;
+    /* Two independent facts, reported as two fields. A consumer that only wants
+     * "is it working" reads both; collapsing them here would take that choice
+     * away and hide a wedged daemon. */
+    TRY(atlas_json_key_bool(j, "running", rep->running, err));
+    TRY(atlas_json_key_bool(j, "reachable", rep->reachable, err));
+    TRY(json_safe(j, p, "socket", atlas_buf_cstr(&rep->socket_path), err));
+    TRY(json_safe(j, p, "writer_lock_holder", atlas_buf_cstr(&rep->lock_holder), err));
+    TRY(atlas_json_key_int(j, "protocol_version", (int64_t)rep->protocol_version, err));
+    TRY(atlas_json_key_str(j, "atlas_version", atlas_buf_cstr(&rep->atlas_version), err));
+    TRY(atlas_json_key_bool(j, "record_present", rep->record.present, err));
+    if (rep->record.present) {
+        TRY(atlas_json_key_int(j, "recorded_pid", rep->record.pid, err));
+        TRY(atlas_json_key_str(j, "started_at", rep->record.started_at, err));
+        TRY(atlas_json_key_str(j, "last_heartbeat_at", rep->record.last_heartbeat_at, err));
+        TRY(atlas_json_key_str(j, "stopped_at", rep->record.stopped_at, err));
+    }
+    TRY(atlas_json_key_int(j, "repositories", rep->repo_count, err));
+    TRY(atlas_json_key_int(j, "watching", rep->watched_repos, err));
+    TRY(atlas_json_key_int(j, "degraded", rep->degraded_repos, err));
+    return atlas_json_key_int(j, "repositories_with_event_gap", rep->repos_with_gap, err);
+}
+
+static atlas_status j_daemon_ping(atlas_renderer *r, bool reachable, const char *socket_path,
+                                  const char *detail, atlas_err *err) {
+    TRY(atlas_json_key_bool(r->j, "reachable", reachable, err));
+    TRY(json_safe(r->j, &r->safe, "socket", socket_path, err));
+    return json_safe(r->j, &r->safe, "detail", detail, err);
+}
+
+static atlas_status j_repo_state(atlas_renderer *r, const atlas_repo_state_report *rep,
+                                 atlas_err *err) {
+    atlas_json *j = r->j;
+    atlas_safe_pool *p = &r->safe;
+    /* name is a validated charset and root_path_text is already encoded; both
+     * are emitted as-is. watch_detail and last_error come from git and the
+     * kernel, so both are encoded. */
+    TRY(atlas_json_key_str(j, "repository", rep->repo.name, err));
+    TRY(atlas_json_key_str(j, "root", atlas_buf_cstr(&rep->repo.root_path_text), err));
+    TRY(atlas_json_key_str(j, "watch_state", atlas_watch_state_name(rep->state.watch_state), err));
+    TRY(atlas_json_key_int(j, "watched_directories", rep->state.watched_dirs, err));
+    TRY(atlas_json_key_int(j, "generation", rep->state.generation, err));
+    TRY(atlas_json_key_int(j, "last_complete_generation", rep->state.last_complete_generation,
+                           err));
+    TRY(atlas_json_key_int(j, "last_sync_seq", rep->state.last_sync_seq, err));
+    TRY(atlas_json_key_str(j, "last_reconcile_at", rep->state.last_reconcile_at, err));
+    TRY(atlas_json_key_str(j, "last_complete_at", rep->state.last_complete_at, err));
+    TRY(atlas_json_key_bool(j, "event_gap", rep->state.event_gap, err));
+    TRY(atlas_json_key_bool(j, "pending_full_reconcile", rep->state.pending_full_reconcile, err));
+    TRY(atlas_json_key_int(j, "event_cursor", rep->event_cursor, err));
+    TRY(atlas_json_key_bool(j, "index_current", rep->index_current, err));
+    TRY(atlas_json_key_str_opt(j, "not_current_reason", rep->not_current_reason, err));
+    TRY(json_safe(j, p, "watch_detail", atlas_buf_cstr(&rep->state.watch_detail), err));
+    return json_safe(j, p, "last_error", atlas_buf_cstr(&rep->state.last_error), err);
+}
+
+static atlas_status j_sync(atlas_renderer *r, const char *repo, const atlas_sync_report *rep,
+                           atlas_err *err) {
+    atlas_json *j = r->j;
+    TRY(atlas_json_key_str(j, "repository", repo, err));
+    TRY(atlas_json_key_bool(j, "via_daemon", rep->via_daemon, err));
+    TRY(atlas_json_key_bool(j, "waited", rep->waited, err));
+    TRY(atlas_json_key_bool(j, "completed", rep->completed, err));
+    TRY(atlas_json_key_int(j, "sync_seq", rep->sync_seq, err));
+    TRY(atlas_json_key_int(j, "generation", rep->generation, err));
+    if (rep->via_daemon) {
+        return ATLAS_OK;
+    }
+    const atlas_reconcile_summary *s = &rep->summary;
+    TRY(atlas_json_key_bool(j, "published", s->published, err));
+    TRY(atlas_json_key_int(j, "files_examined", s->files_examined, err));
+    TRY(atlas_json_key_int(j, "files_content_read", s->files_hashed, err));
+    TRY(atlas_json_key_int(j, "files_unchanged_by_identity", s->files_identity_hit, err));
+    /* Whether this pass read every eligible file. Only a pass with this set may
+     * clear an event gap, so a caller can check the claim rather than infer it
+     * from the flags it passed in. */
+    TRY(atlas_json_key_bool(j, "content_verified", s->content_verified, err));
+    TRY(atlas_json_key_int(j, "files_dirty_forced", s->files_dirty_forced, err));
+    TRY(atlas_json_key_int(j, "files_racy", s->files_racy, err));
+    TRY(atlas_json_key_int(j, "files_added", s->files_added, err));
+    TRY(atlas_json_key_int(j, "files_modified", s->files_modified, err));
+    TRY(atlas_json_key_int(j, "files_deleted", s->files_deleted, err));
+    TRY(atlas_json_key_int(j, "files_unchanged", s->files_unchanged, err));
+    TRY(atlas_json_key_int(j, "files_unreadable", s->files_unreadable, err));
+    TRY(atlas_json_key_int(j, "files_unsafe", s->files_unsafe, err));
+    TRY(atlas_json_key_int(j, "files_truncated", s->files_truncated, err));
+    TRY(atlas_json_key_int(j, "untracked_discovered", s->untracked_discovered, err));
+    TRY(atlas_json_key_int(j, "ignored_paths", s->ignored_paths, err));
+    TRY(atlas_json_key_int(j, "commits_ingested", s->commits_ingested, err));
+    TRY(atlas_json_key_int(j, "commits_seen", s->commits_seen, err));
+    TRY(atlas_json_key_int(j, "changes_ingested", s->changes_ingested, err));
+    TRY(atlas_json_key_bool(j, "history_full_replay", s->history_full_replay, err));
+    TRY(atlas_json_key_bool(j, "branch_rewrite", s->branch_rewrite, err));
+    TRY(atlas_json_key_int(j, "events_appended", s->events_appended, err));
+    TRY(atlas_json_key_int(j, "write_batches", s->batches_written, err));
+    TRY(atlas_json_key_int(j, "duration_ms", s->duration_ms, err));
+    TRY(atlas_json_key_bool(j, "truncated", s->truncated, err));
+    return atlas_json_key_str(j, "truncated_reason", atlas_buf_cstr(&s->truncated_reason), err);
+}
+
+static atlas_status j_event_item(atlas_renderer *r, const atlas_event_row *row, atlas_err *err) {
+    r->items++;
+    TRY(atlas_json_obj_begin(r->j, err));
+    TRY(atlas_json_key_int(r->j, "cursor", row->id, err));
+    TRY(atlas_json_key_int(r->j, "generation", row->generation, err));
+    TRY(atlas_json_key_str(r->j, "kind", row->kind, err));
+    /* Stored already encoded; re-encoding would stop it decoding back. */
+    TRY(atlas_json_key_str_opt(r->j, "path", row->path_text, err));
+    TRY(json_safe(r->j, &r->safe, "detail", row->detail, err));
+    TRY(atlas_json_key_str(r->j, "at", row->created_at, err));
+    return atlas_json_obj_end(r->j, err);
+}
+
+static atlas_status j_events_end(atlas_renderer *r, int64_t cursor, bool more, atlas_err *err) {
+    TRY(atlas_json_key_int(r->j, "cursor", cursor, err));
+    /* Explicit, so a consumer never has to infer completeness from a page size. */
+    return atlas_json_key_bool(r->j, "more", more, err);
+}
+
+static atlas_status j_unit_text(atlas_renderer *r, const char *text, atlas_err *err) {
+    /* The unit is Atlas-generated and contains only paths that passed
+     * check_unit_safe_path, so it holds no control bytes; it still goes through
+     * the JSON writer's escaping like any other string. */
+    return atlas_json_key_str(r->j, "unit", text, err);
+}
+
+static atlas_status j_unit_install(atlas_renderer *r, const atlas_unit_install_report *rep,
+                                   bool uninstall, atlas_err *err) {
+    atlas_json *j = r->j;
+    TRY(json_safe(j, &r->safe, "path", atlas_buf_cstr(&rep->path), err));
+    TRY(json_safe(j, &r->safe, "directory", atlas_buf_cstr(&rep->dir), err));
+    if (uninstall) {
+        TRY(atlas_json_key_bool(j, "removed", rep->removed, err));
+        return atlas_json_key_bool(j, "was_absent", rep->was_absent, err);
+    }
+    TRY(atlas_json_key_bool(j, "created_directory", rep->created_dir, err));
+    TRY(atlas_json_key_bool(j, "wrote_file", rep->wrote_file, err));
+    TRY(atlas_json_key_bool(j, "replaced_existing", rep->replaced_existing, err));
+    TRY(atlas_json_key_bool(j, "unchanged", rep->unchanged, err));
+    TRY(atlas_json_key_str(j, "mode", "0600", err));
+    /* Stated as a field, not only in prose: a caller must be able to check that
+     * installing did not also start anything. */
+    TRY(atlas_json_key_bool(j, "enabled", false, err));
+    return atlas_json_key_bool(j, "started", false, err);
+}
+
 const atlas_renderer_vtbl ATLAS_RENDERER_JSON = {
     j_begin,      j_end,          j_note_repo,    j_note_query,   j_list_begin,
     j_list_end,   j_doctor,       j_version,      j_repo_item,    j_repo_added,
     j_repo_removed, j_scan,       j_status,       j_search_item,  j_file,
     j_history_item, j_diff_begin, j_diff_item,    j_diff_end,
+    j_daemon_status, j_daemon_ping, j_repo_state, j_sync,         j_event_item,
+    j_events_end, j_unit_text,    j_unit_install,
 };
 
 void atlas_render_error(FILE *out, FILE *errout, bool json, const char *command,

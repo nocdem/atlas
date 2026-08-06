@@ -6,10 +6,17 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <sys/un.h>
+#include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "atlas/proc.h"
@@ -26,6 +33,36 @@
  * mid-body never reaches its fx_close(), so the harness sweeps these. */
 #define FX_MAX_LIVE 16
 static char *g_live[FX_MAX_LIVE];
+
+/* Daemons this process forked and has not yet reaped.
+ *
+ * A test that fails an assertion abandons the rest of its body, which includes
+ * whatever call would have stopped its daemon. Without this the daemon is
+ * orphaned to init and keeps running — holding a lock on a fixture directory the
+ * harness is about to delete, and, worse, outliving the whole suite on the
+ * developer's machine. The harness calls fx_cleanup_leaked() after every test,
+ * so registering the pid here closes the hole regardless of which path skipped
+ * the stop. */
+#define FX_MAX_DAEMONS 8
+static pid_t g_daemons[FX_MAX_DAEMONS];
+
+static void daemon_track(pid_t pid) {
+    for (size_t i = 0; i < FX_MAX_DAEMONS; i++) {
+        if (g_daemons[i] <= 0) {
+            g_daemons[i] = pid;
+            return;
+        }
+    }
+}
+
+static void daemon_untrack(pid_t pid) {
+    for (size_t i = 0; i < FX_MAX_DAEMONS; i++) {
+        if (g_daemons[i] == pid) {
+            g_daemons[i] = 0;
+            return;
+        }
+    }
+}
 
 static void live_add(const char *path) {
     for (size_t i = 0; i < FX_MAX_LIVE; i++) {
@@ -134,6 +171,19 @@ static void remove_tree(const char *path) {
 }
 
 void fx_cleanup_leaked(void) {
+    /* Daemons first: one still running would hold the writer lock on a directory
+     * about to be removed, and would keep writing into it while it went. */
+    for (size_t i = 0; i < FX_MAX_DAEMONS; i++) {
+        if (g_daemons[i] > 0) {
+            /* The forked child called setpgid(0, 0), so signalling the negated
+             * pid reaches the whole group and no grandchild survives. */
+            (void)kill(-g_daemons[i], SIGKILL);
+            (void)kill(g_daemons[i], SIGKILL);
+            int status = 0;
+            (void)waitpid(g_daemons[i], &status, 0);
+            g_daemons[i] = 0;
+        }
+    }
     for (size_t i = 0; i < FX_MAX_LIVE; i++) {
         if (g_live[i] != NULL) {
             remove_tree(g_live[i]);
@@ -659,6 +709,312 @@ atlas_status fx_atlas_env(const char *const *args, size_t nargs, const char *con
                           atlas_buf *stdout_out, atlas_buf *stderr_out, int *exit_code,
                           atlas_err *err) {
     return fx_atlas_impl(args, nargs, extra_env, stdout_out, stderr_out, exit_code, err);
+}
+
+/* --- A1: a live daemon under test ---------------------------------------
+ *
+ * A daemon has to outlive the call that starts it, so this cannot go through
+ * atlas_proc_run, which waits. It is the one place in the suite that forks
+ * directly, and it keeps the same discipline: an explicit argv, an explicitly
+ * constructed environment, and no shell. */
+
+void fx_daemon_init(fx_daemon *d) {
+    memset(d, 0, sizeof(*d));
+    d->pid = -1;
+    atlas_buf_init(&d->runtime_dir);
+    atlas_buf_init(&d->socket);
+    atlas_buf_init(&d->log_path);
+}
+
+void fx_daemon_free(fx_daemon *d) {
+    if (d == NULL) {
+        return;
+    }
+    atlas_buf_free(&d->runtime_dir);
+    atlas_buf_free(&d->socket);
+    atlas_buf_free(&d->log_path);
+}
+
+atlas_status fx_daemon_start(fixture *fx, fx_daemon *d, atlas_err *err) {
+    atlas_status st = atlas_buf_set(&d->runtime_dir, fx->root.data, fx->root.len, err);
+    if (st == ATLAS_OK) {
+        st = atlas_buf_append_str(&d->runtime_dir, "/run", err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_buf_set(&d->log_path, fx->root.data, fx->root.len, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_buf_append_str(&d->log_path, "/daemon.log", err);
+    }
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    /* systemd would create this with RuntimeDirectoryMode=0700; the fixture
+     * creates it the same way so the daemon's own permission checks are exercised
+     * against a realistic directory. */
+    if (mkdir(atlas_buf_cstr(&d->runtime_dir), S_IRWXU) != 0 && errno != EEXIST) {
+        return atlas_err_set_errno(err, ATLAS_ERR_CONFIG, errno, "cannot create %s",
+                                   atlas_buf_cstr(&d->runtime_dir));
+    }
+    st = atlas_buf_set(&d->socket, d->runtime_dir.data, d->runtime_dir.len, err);
+    if (st == ATLAS_OK) {
+        st = atlas_buf_append_str(&d->socket, "/atlas/atlas.sock", err);
+    }
+    if (st != ATLAS_OK) {
+        return st;
+    }
+
+    atlas_buf xdg = ATLAS_BUF_INIT;
+    atlas_buf path_env = ATLAS_BUF_INIT;
+    const char *path = getenv("PATH");
+    st = atlas_buf_appendf(&xdg, err, "XDG_RUNTIME_DIR=%s", atlas_buf_cstr(&d->runtime_dir));
+    if (st == ATLAS_OK) {
+        st = atlas_buf_appendf(&path_env, err, "PATH=%s",
+                               (path != NULL && path[0] != '\0') ? path : "/usr/bin:/bin");
+    }
+    if (st != ATLAS_OK) {
+        atlas_buf_free(&xdg);
+        atlas_buf_free(&path_env);
+        return st;
+    }
+
+    const char *argv[] = {ATLAS_BIN, "daemon", "run", "--data-dir", fx_data_dir(fx), NULL};
+    const char *envp[] = {atlas_buf_cstr(&path_env), "LC_ALL=C", "TZ=UTC",
+                          atlas_buf_cstr(&xdg), NULL};
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        st = atlas_err_set_errno(err, ATLAS_ERR_INTERNAL, errno, "cannot fork a daemon");
+        atlas_buf_free(&xdg);
+        atlas_buf_free(&path_env);
+        return st;
+    }
+    if (pid == 0) {
+        /* Only async-signal-safe calls between fork and exec. */
+        int devnull = open("/dev/null", O_RDONLY);
+        int logfd = open(atlas_buf_cstr(&d->log_path), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (devnull >= 0) {
+            (void)dup2(devnull, STDIN_FILENO);
+        }
+        if (logfd >= 0) {
+            (void)dup2(logfd, STDOUT_FILENO);
+            (void)dup2(logfd, STDERR_FILENO);
+        }
+        (void)setpgid(0, 0);
+        union {
+            const char *const *in;
+            char *const *out;
+        } a = {argv}, e = {envp};
+        (void)execve(ATLAS_BIN, a.out, e.out);
+        _exit(127);
+    }
+    d->pid = pid;
+    daemon_track(pid);
+    atlas_buf_free(&xdg);
+    atlas_buf_free(&path_env);
+    return ATLAS_OK;
+}
+
+atlas_status fx_daemon_wait_ready(fx_daemon *d, int timeout_ms, atlas_err *err) {
+    /* Polls the socket rather than sleeping a guessed interval, so the test is
+     * neither flaky on a slow machine nor artificially slow on a fast one. */
+    for (int waited = 0; waited < timeout_ms; waited += 25) {
+        int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (fd >= 0) {
+            struct sockaddr_un addr;
+            memset(&addr, 0, sizeof(addr));
+            addr.sun_family = AF_UNIX;
+            (void)snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", atlas_buf_cstr(&d->socket));
+            if (connect(fd, (const struct sockaddr *)&addr, sizeof(addr)) == 0) {
+                (void)close(fd);
+                return ATLAS_OK;
+            }
+            (void)close(fd);
+        }
+        if (fx_daemon_exited(d)) {
+            return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                                 "the daemon exited before it started listening");
+        }
+        struct timespec nap = {0, 25L * 1000000L};
+        (void)nanosleep(&nap, NULL);
+    }
+    return atlas_err_set(err, ATLAS_ERR_INTERNAL, "the daemon did not start listening in %d ms",
+                         timeout_ms);
+}
+
+bool fx_daemon_exited(fx_daemon *d) {
+    if (d->pid <= 0) {
+        return true;
+    }
+    int status = 0;
+    pid_t r = waitpid(d->pid, &status, WNOHANG);
+    if (r == d->pid) {
+        daemon_untrack(d->pid);
+        d->pid = -1;
+        return true;
+    }
+    return false;
+}
+
+void fx_daemon_stop(fx_daemon *d, bool hard) {
+    if (d->pid <= 0) {
+        return;
+    }
+    (void)kill(d->pid, hard ? SIGKILL : SIGTERM);
+    for (int waited = 0; waited < 20000; waited += 25) {
+        int status = 0;
+        pid_t r = waitpid(d->pid, &status, WNOHANG);
+        if (r == d->pid) {
+            daemon_untrack(d->pid);
+            d->pid = -1;
+            return;
+        }
+        struct timespec nap = {0, 25L * 1000000L};
+        (void)nanosleep(&nap, NULL);
+    }
+    /* Refused to leave on SIGTERM. Killing it keeps the suite from hanging, and
+     * the test that expected a clean shutdown will already have failed. */
+    (void)kill(-d->pid, SIGKILL);
+    (void)kill(d->pid, SIGKILL);
+    int status = 0;
+    (void)waitpid(d->pid, &status, 0);
+    daemon_untrack(d->pid);
+    d->pid = -1;
+}
+
+atlas_status fx_daemon_log(const fx_daemon *d, atlas_buf *out, atlas_err *err) {
+    atlas_buf_reset(out);
+    int fd = open(atlas_buf_cstr(&d->log_path), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return atlas_err_set_errno(err, ATLAS_ERR_CONFIG, errno, "cannot read the daemon log");
+    }
+    char buf[8192];
+    atlas_status st = ATLAS_OK;
+    for (;;) {
+        ssize_t n = read(fd, buf, sizeof(buf));
+        if (n <= 0) {
+            break;
+        }
+        st = atlas_buf_append(out, buf, (size_t)n, err);
+        if (st != ATLAS_OK) {
+            break;
+        }
+    }
+    (void)close(fd);
+    return st;
+}
+
+atlas_status fx_atlas_with_runtime(const fixture *fx, const fx_daemon *d, const char *const *args,
+                                   size_t nargs, atlas_buf *stdout_out, atlas_buf *stderr_out,
+                                   int *exit_code, atlas_err *err) {
+    atlas_buf xdg = ATLAS_BUF_INIT;
+    atlas_status st = atlas_buf_appendf(&xdg, err, "XDG_RUNTIME_DIR=%s",
+                                        atlas_buf_cstr(&d->runtime_dir));
+    if (st != ATLAS_OK) {
+        atlas_buf_free(&xdg);
+        return st;
+    }
+    const char *full[24];
+    size_t n = 0;
+    full[n++] = "--data-dir";
+    full[n++] = fx_data_dir(fx);
+    for (size_t i = 0; i < nargs && n + 1u < sizeof(full) / sizeof(full[0]); i++) {
+        full[n++] = args[i];
+    }
+    const char *extra[] = {atlas_buf_cstr(&xdg), NULL};
+    st = fx_atlas_env(full, n, extra, stdout_out, stderr_out, exit_code, err);
+    atlas_buf_free(&xdg);
+    return st;
+}
+
+atlas_status fx_ipc_raw(const char *socket_path, const void *frame, size_t len,
+                        atlas_buf *response_out, bool *closed_out, atlas_err *err) {
+    atlas_buf_reset(response_out);
+    *closed_out = false;
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) {
+        return atlas_err_set_errno(err, ATLAS_ERR_INTERNAL, errno, "cannot create a socket");
+    }
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    (void)snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", socket_path);
+    if (connect(fd, (const struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        atlas_status st = atlas_err_set_errno(err, ATLAS_ERR_INTERNAL, errno, "cannot connect");
+        (void)close(fd);
+        return st;
+    }
+    /* Deliberately raw: the point is to send bytes the client library would
+     * never produce, so the daemon's framing is tested rather than the client's. */
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t w = send(fd, (const char *)frame + sent, len - sent, MSG_NOSIGNAL);
+        if (w <= 0) {
+            break;
+        }
+        sent += (size_t)w;
+    }
+    struct timeval tv = {5, 0};
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    char buf[8192];
+    atlas_status st = ATLAS_OK;
+    for (;;) {
+        ssize_t n = recv(fd, buf, sizeof(buf), 0);
+        if (n < 0) {
+            break; /* timeout: treated as "nothing more came" */
+        }
+        if (n == 0) {
+            *closed_out = true;
+            break;
+        }
+        st = atlas_buf_append(response_out, buf, (size_t)n, err);
+        if (st != ATLAS_OK) {
+            break;
+        }
+        if (response_out->len >= 12u) {
+            /* Header plus a complete payload means the answer is in hand. */
+            const unsigned char *h = (const unsigned char *)response_out->data;
+            size_t plen = ((size_t)h[8] << 24) | ((size_t)h[9] << 16) | ((size_t)h[10] << 8) |
+                          (size_t)h[11];
+            if (response_out->len >= 12u + plen) {
+                break;
+            }
+        }
+    }
+    (void)close(fd);
+    /* Hand back the payload alone. The frame header contains NUL bytes, so a
+     * caller that searched the whole buffer as a C string would never see past
+     * the magic — a test that passed for that reason would be worthless. */
+    if (st == ATLAS_OK && response_out->len >= 12u) {
+        memmove(response_out->data, response_out->data + 12u, response_out->len - 12u);
+        response_out->len -= 12u;
+        response_out->data[response_out->len] = '\0';
+    }
+    return st;
+}
+
+atlas_status fx_wait_for_substring(const fixture *fx, const fx_daemon *d, const char *const *args,
+                                   size_t nargs, const char *needle, int timeout_ms, bool *found,
+                                   atlas_err *err) {
+    *found = false;
+    for (int waited = 0; waited < timeout_ms; waited += 100) {
+        atlas_buf out = ATLAS_BUF_INIT;
+        int code = 0;
+        atlas_status st = fx_atlas_with_runtime(fx, d, args, nargs, &out, NULL, &code, err);
+        if (st != ATLAS_OK) {
+            atlas_buf_free(&out);
+            return st;
+        }
+        bool hit = (strstr(atlas_buf_cstr(&out), needle) != NULL);
+        atlas_buf_free(&out);
+        if (hit) {
+            *found = true;
+            return ATLAS_OK;
+        }
+        struct timespec nap = {0, 100L * 1000000L};
+        (void)nanosleep(&nap, NULL);
+    }
+    return ATLAS_OK;
 }
 
 /* --- adversarial helpers ------------------------------------------------- */

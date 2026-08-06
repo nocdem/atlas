@@ -17,13 +17,34 @@
 #include "atlas/error.h"
 #include "atlas/git.h"
 #include "atlas/limits.h"
+#include "atlas/reconcile.h"
 #include "atlas/scan.h"
 
 typedef struct atlas_ctx atlas_ctx;
 
+/* How a context intends to use the index.
+ *
+ * Exactly one process may write at a time, enforced by the data-directory lock
+ * (see atlas/lock.h). The mode is what decides whether this process is trying to
+ * be that one. */
+typedef enum atlas_ctx_mode {
+    /* Take the writer lock if it is free; fall back to a read-only handle if
+     * something else — normally the daemon — already holds it. This is what read
+     * commands use: they work whether or not a daemon is running, and a first
+     * run still gets to create and migrate the database. */
+    ATLAS_CTX_AUTO = 0,
+    /* Never take the lock. A read-only handle, and a schema mismatch is an error
+     * rather than something to migrate away. */
+    ATLAS_CTX_READ,
+    /* Take the writer lock or fail. Mutating CLI commands use this, so that a
+     * command run by hand while the daemon owns the index is refused with an
+     * explanation instead of racing it. */
+    ATLAS_CTX_WRITE
+} atlas_ctx_mode;
+
 typedef struct atlas_ctx_opts {
     const char *data_dir_override; /* --data-dir; NULL to resolve from env */
-    bool read_only;                /* reserved; A0 always opens read-write */
+    atlas_ctx_mode mode;
 } atlas_ctx_opts;
 
 atlas_status atlas_ctx_open(const atlas_ctx_opts *opts, atlas_ctx **out, atlas_err *err);
@@ -32,6 +53,9 @@ const char *atlas_ctx_data_dir(const atlas_ctx *ctx);
 const char *atlas_ctx_db_path(const atlas_ctx *ctx);
 atlas_datadir_source atlas_ctx_data_dir_source(const atlas_ctx *ctx);
 atlas_db *atlas_ctx_db(atlas_ctx *ctx);
+/* True when this context holds the writer lock. A context that does not hold it
+ * cannot mutate the index, and says so rather than failing at the first write. */
+bool atlas_ctx_is_writer(const atlas_ctx *ctx);
 
 /* --- doctor ------------------------------------------------------------- */
 
@@ -129,6 +153,87 @@ atlas_status atlas_service_file(atlas_ctx *ctx, const char *name, const char *pa
 atlas_status atlas_service_history(atlas_ctx *ctx, const char *name, const char *path,
                                    int64_t limit, atlas_history_cb cb, void *ud,
                                    int64_t *count_out, atlas_err *err);
+
+/* --- A1: repository mutations at the database level ---------------------
+ *
+ * The daemon's writer thread owns a bare atlas_db, not an atlas_ctx: the context
+ * owns the data-directory lock, and the daemon already holds that for its whole
+ * lifetime. These are the same operations the ctx-level functions perform, with
+ * the lock ownership left to the caller. The ctx-level functions are thin
+ * wrappers over them, so there is one implementation of "register a repository"
+ * rather than two that can drift. */
+atlas_status atlas_service_repo_add_db(atlas_db *db, const char *path, const char *name,
+                                       atlas_repo_info *out, atlas_err *err);
+atlas_status atlas_service_repo_remove_db(atlas_db *db, const char *name, atlas_repo_info *removed,
+                                          atlas_err *err);
+
+/* --- A1: daemon-facing reports ------------------------------------------ */
+
+typedef struct atlas_daemon_status_report {
+    bool running;             /* something holds the writer lock right now */
+    bool reachable;           /* the socket answers */
+    atlas_buf socket_path;
+    atlas_buf lock_holder;    /* diagnostic text recorded by the lock holder */
+    atlas_daemon_record record;
+    int64_t repo_count;
+    int64_t watched_repos;
+    int64_t degraded_repos;   /* degraded, incomplete or error */
+    int64_t repos_with_gap;   /* an unresolved event gap: NOT current */
+    int protocol_version;
+    atlas_buf atlas_version;
+} atlas_daemon_status_report;
+
+void atlas_daemon_status_report_init(atlas_daemon_status_report *r);
+void atlas_daemon_status_report_free(atlas_daemon_status_report *r);
+
+/* Assembles the report from the index and the lock, without contacting the
+ * daemon. Works whether or not a daemon is running, which is what makes
+ * `atlas daemon status` useful when it is not. */
+atlas_status atlas_service_daemon_status(atlas_ctx *ctx, atlas_daemon_status_report *out,
+                                         atlas_err *err);
+
+/* One repository's continuous-index state, as `atlas events` and `atlas sync`
+ * report it. */
+typedef struct atlas_repo_state_report {
+    atlas_repo_info repo;
+    atlas_index_state state;
+    int64_t event_cursor; /* newest event id */
+    /* The honest summary: true only when a completed generation exists AND no
+     * event gap is outstanding. */
+    bool index_current;
+    const char *not_current_reason; /* NULL when index_current */
+} atlas_repo_state_report;
+
+void atlas_repo_state_report_init(atlas_repo_state_report *r);
+void atlas_repo_state_report_free(atlas_repo_state_report *r);
+
+atlas_status atlas_service_repo_state(atlas_ctx *ctx, const char *name,
+                                      atlas_repo_state_report *out, atlas_err *err);
+
+/* Streams the durable event journal from `since`, exclusive. */
+atlas_status atlas_service_events(atlas_ctx *ctx, const char *name, int64_t since, int64_t limit,
+                                 atlas_event_cb cb, void *ud, int64_t *count_out,
+                                 int64_t *next_cursor_out, bool *more_out, atlas_err *err);
+
+/* --- A1: sync ------------------------------------------------------------ */
+
+typedef struct atlas_sync_report {
+    bool via_daemon;      /* the daemon performed it, rather than this process */
+    bool waited;
+    bool completed;       /* --wait: the requested pass finished */
+    int64_t sync_seq;
+    int64_t generation;
+    atlas_reconcile_summary summary; /* only meaningful when !via_daemon */
+} atlas_sync_report;
+
+void atlas_sync_report_init(atlas_sync_report *r);
+void atlas_sync_report_free(atlas_sync_report *r);
+
+/* Requests reconciliation. When a daemon is running the request is routed to it;
+ * otherwise this process performs the pass itself, holding the writer lock.
+ * `wait` polls for completion, bounded by `timeout_ms`. */
+atlas_status atlas_service_sync(atlas_ctx *ctx, const char *name, bool full, bool wait,
+                                int timeout_ms, atlas_sync_report *out, atlas_err *err);
 
 /* --- diff ---------------------------------------------------------------- */
 

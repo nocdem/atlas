@@ -179,3 +179,85 @@ before the first entry and the summary after the last. That collection is bounde
 by `--limit` (default 2000 entries): past the ceiling the report sets `truncated`
 with a reason, while the per-scope counts still reflect reality, so the summary is
 never quietly wrong.
+
+## A1: the daemon
+
+A1 adds threads, a socket and a background process to a codebase that had none.
+The layering rules do not change; the new code sits under them.
+
+```
+src/cli      argument parsing + renderers
+src/core     service.c, service_daemon.c, reconcile.c, lock.c, unit.c,
+             scan.c, buffers, errors, paths, sha256, proc
+src/db       schema, migrations, typed operations, db_state.c
+src/git      read-only git adapter + parsers
+src/ipc      frame codec, socket policy, request parsing, serve loop
+src/daemon   writer thread, worker pool, inotify watcher, run loop
+src/output   streaming JSON writer
+```
+
+A renderer still queries nothing. The service layer still formats nothing. The
+daemon's IPC dispatch builds its responses with the same streaming JSON writer
+the CLI uses, so there is one escaping implementation rather than two.
+
+### Threads
+
+Four kinds, with a strict rule about what each may touch. The full table is in
+[daemon-and-ipc.md](daemon-and-ipc.md); the short version:
+
+- **main** — the serve loop. Read-only database handles, one per request.
+- **writer** — the only writable handle. Created on that thread, never shared.
+- **watcher** — inotify. A read-only handle to enumerate repositories, and git to
+  read ignore rules. Never writes; it hands state changes to the writer as jobs.
+- **workers** — hashing only. No database handle, no process creation.
+
+A SQLite connection is never shared between threads. That is enforced by where
+the handles are created, not by a comment.
+
+### Why the reconciliation pass has the shape it does
+
+Four stages — observe, select, hash, apply — with the transaction opened only in
+the last one, in bounded batches.
+
+The alternative, a single transaction around the whole pass, is simpler to write
+and wrong in two ways. It holds the write lock for the length of the pass, which
+on a large repository is long enough that every reader sees stale data. And it
+puts git invocations and file reads inside a transaction, so a slow git or a slow
+disk extends the lock hold indefinitely.
+
+Between hashing and applying, HEAD is read again. If it moved, the results
+describe a repository that no longer exists and the pass is **abandoned** rather
+than committed. This is not an optimisation: committing them would leave the
+index describing a mixture of two branches, which is worse than being briefly out
+of date.
+
+### Why exactly one writer
+
+SQLite's own locking would serialise the writes, but it would not stop two
+processes from both believing they own the index. A daemon reconciling in the
+background and an `atlas scan` started by hand would interleave generations and
+produce a consistent database describing an inconsistent story. The advisory lock
+makes "who owns this index" a single answer.
+
+### The one thing the daemon will not do
+
+There is no remotely callable shutdown. Anything local that can open the socket
+could otherwise disable indexing. systemd owns the lifecycle; `SIGTERM` works.
+
+### A1 resource bounds, in one place
+
+Every ceiling A1 introduces is a macro in `include/atlas/limits.h`, not a literal
+at a call site. The full table with what happens when each is reached is in
+[daemon-and-ipc.md](daemon-and-ipc.md).
+
+The rule that matters more than any individual number: **nothing is silently
+truncated.** Reaching a bound produces a structured error, or a `truncated` flag
+with a stated reason, or an explicit degraded state. A response that would exceed
+the size ceiling becomes an error about not fitting, not half a document. A
+discovery pass that hits its file ceiling says so rather than indexing a prefix.
+A full write queue refuses the submission and reports backpressure rather than
+dropping the work.
+
+The reason is the same one behind `UNKNOWN`: an answer that quietly omits part of
+itself is worse than an answer that admits it is incomplete, because only one of
+the two can be acted on.

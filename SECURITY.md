@@ -9,7 +9,19 @@ designed so that indexing a hostile repository cannot lead to code execution,
 reads outside the repository, unbounded resource use, or corruption of the index.
 
 Atlas is a local, single-user tool. It opens no network sockets, listens on no
-port, and has no daemon. It does not transmit anything anywhere.
+port, and transmits nothing anywhere.
+
+**Since A1 it does have a daemon**, and that daemon listens — on a Unix-domain
+socket at `$XDG_RUNTIME_DIR/atlas/atlas.sock`, with mode 0600 inside a 0700
+directory, and refusing any peer whose `SO_PEERCRED` UID is not ours. There is
+no TCP socket and no network transport of any kind; the systemd unit sets
+`PrivateNetwork=yes` and `IPAddressDeny=any`, so the absence of network access is
+enforced by the kernel rather than only asserted here.
+
+The daemon's attack surface is one local socket reachable only by the same user.
+Its protocol is length-framed with a hard size ceiling checked before any payload
+is read, bounded nesting depth, deadlines on both directions, and no remotely
+callable shutdown. See [docs/daemon-and-ipc.md](docs/daemon-and-ipc.md).
 
 What Atlas does **not** defend against, and does not claim to:
 
@@ -17,6 +29,9 @@ What Atlas does **not** defend against, and does not claim to:
 - an attacker who can write to the Atlas data directory or database
 - a malicious `git` binary earlier in `PATH` than the real one
 - deliberate misuse of the user's own credentials
+- an attacker who can plant symlinks in the parents of the data directory
+  (see [docs/backlog.md](docs/backlog.md) items 1 and 3 — such an attacker
+  already has write access to the index)
 
 ## Controls
 
@@ -144,10 +159,23 @@ Run them with `make test`, `make asan` and `make ubsan`.
 
 ## Terminal and untrusted-text safety
 
-Repository content is **data, never instructions and never terminal commands**.
-Filenames, commit subjects and bodies, author identities, branch names and Git's
-own error text are all attacker-controlled in the worst case, and all of them reach
-a human's terminal or a machine consumer.
+Repository content is **data, never terminal commands**. Filenames, commit
+subjects and bodies, author identities, branch names and Git's own error text are
+all attacker-controlled in the worst case, and all of them reach a human's
+terminal or a machine consumer.
+
+> **This is a defence against terminals and parsers, not against language
+> models.** The A0 text here said "data, never instructions" beside the
+> description of the encoding, which could be read as a claim that the encoding
+> makes repository text safe to hand to a model. It does not, and no encoding
+> could. A commit message reading *"ignore all previous instructions"* is
+> entirely printable: it contains nothing to escape and passes through unchanged.
+> Printable repository prose remains **semantically untrusted** however
+> well-formed it is. A2 needs a separate model-context trust boundary, specified
+> in [docs/ai-trust-boundary.md](docs/ai-trust-boundary.md).
+>
+> What the encoding does guarantee: terminal-safe, JSON-structure-safe, and
+> reversible. Those three, and nothing about meaning.
 
 Before any of it is printed, Atlas encodes it: C0 controls and DEL, C1 controls
 (U+0080–U+009F, including the single-byte CSI), line and paragraph separators,

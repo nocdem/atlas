@@ -245,6 +245,58 @@ atlas_status atlas_db_open(const char *path, atlas_db **out, atlas_err *err) {
     return ATLAS_OK;
 }
 
+/* A read-only handle for concurrent readers.
+ *
+ * WAL lets any number of readers run alongside the single writer, but only if a
+ * reader genuinely never writes. Opening SQLITE_OPEN_READONLY makes that a
+ * property of the handle rather than a promise about the code: a stray INSERT
+ * fails immediately instead of contending for the write lock, or worse,
+ * succeeding from a process that is supposed to have no write authority.
+ *
+ * The database must already exist and already be migrated: a reader must never
+ * be the thing that creates or upgrades it. */
+atlas_status atlas_db_open_readonly(const char *path, atlas_db **out, atlas_err *err) {
+    *out = NULL;
+    if (path == NULL || path[0] == '\0') {
+        return atlas_err_set(err, ATLAS_ERR_CONFIG, "empty database path");
+    }
+    atlas_db *db = calloc(1u, sizeof(*db));
+    if (db == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory opening database");
+    }
+    db->read_only = true;
+    if (sqlite3_open_v2(path, &db->h, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        atlas_status st = atlas_err_set(err, ATLAS_ERR_DB, "cannot open database %s read-only: %s",
+                                        path, db->h != NULL ? sqlite3_errmsg(db->h) : "unknown");
+        sqlite3_close(db->h);
+        free(db);
+        return st;
+    }
+    (void)sqlite3_busy_timeout(db->h, 5000);
+    /* foreign_keys is a no-op on a read-only handle but keeps the two open paths
+     * reporting the same capabilities to `atlas doctor`. */
+    (void)sqlite3_exec(db->h, "PRAGMA foreign_keys=ON;", NULL, NULL, NULL);
+    detect_caps(db);
+    /* FTS5 availability was probed on a temp table; whether the shadow tables
+     * exist in *this* database still has to be established, and a reader may not
+     * create them. */
+    int64_t have = 0;
+    atlas_err ignore;
+    atlas_err_init(&ignore);
+    if (atlas_db_query_int64(db,
+                             "SELECT count(*) FROM sqlite_schema WHERE type='table'"
+                             " AND name IN ('files_fts','commits_fts');",
+                             &have, &ignore) == ATLAS_OK) {
+        db->fts_ready = db->caps.fts5 && have == 2;
+    }
+    *out = db;
+    return ATLAS_OK;
+}
+
+bool atlas_db_is_readonly(const atlas_db *db) {
+    return db != NULL && db->read_only;
+}
+
 void atlas_db_close(atlas_db *db) {
     if (db == NULL) {
         return;

@@ -12,7 +12,15 @@
     "id, path_raw, path_text, path_is_utf8, file_type, language, git_mode, git_index_oid,"  \
     " content_hash, content_hash_algo, size_bytes, is_executable, is_symlink, unsafe_path," \
     " read_error, first_seen_scan_id, last_seen_scan_id, first_seen_at, last_seen_at,"      \
-    " deleted, deleted_at"
+    " deleted, deleted_at, tracked, ignored, truncated, truncated_reason, last_generation"
+
+void atlas_file_record_init(atlas_file_record *rec) {
+    memset(rec, 0, sizeof(*rec));
+    /* Tracked is the overwhelmingly common case and the A0-compatible default.
+     * Zeroing the struct would quietly mark every file untracked, which would
+     * corrupt the meaning of the column rather than fail loudly. */
+    rec->tracked = true;
+}
 
 static void load_file_row(sqlite3_stmt *stmt, atlas_file_row *row) {
     memset(row, 0, sizeof(*row));
@@ -40,6 +48,11 @@ static void load_file_row(sqlite3_stmt *stmt, atlas_file_row *row) {
     row->last_seen_at = atlas_db_col_text(stmt, 18);
     row->deleted = sqlite3_column_int(stmt, 19) != 0;
     row->deleted_at = atlas_db_col_text_opt(stmt, 20);
+    row->tracked = sqlite3_column_int(stmt, 21) != 0;
+    row->ignored = sqlite3_column_int(stmt, 22) != 0;
+    row->truncated = sqlite3_column_int(stmt, 23) != 0;
+    row->truncated_reason = atlas_db_col_text_opt(stmt, 24);
+    row->last_generation = sqlite3_column_int64(stmt, 25);
 }
 
 static bool str_eq_opt(const char *a, const char *b) {
@@ -87,6 +100,18 @@ static bool file_row_matches(const atlas_file_row *old, const atlas_file_record 
     if (old->size_known && old->size_bytes != rec->size_bytes) {
         return false;
     }
+    /* A1 facts are part of what "unchanged" means. A file that stops being
+     * ignored, or whose content stopped being truncated, has changed even when
+     * its hash is identical, and a caller that filtered on those fields would
+     * otherwise never be told. `last_generation` is deliberately excluded: like
+     * the scan ids, it moves on every pass. */
+    if (old->tracked != rec->tracked || old->ignored != rec->ignored ||
+        old->truncated != rec->truncated) {
+        return false;
+    }
+    if (!str_eq_opt(old->truncated_reason, rec->truncated_reason)) {
+        return false;
+    }
     return true;
 }
 
@@ -122,7 +147,41 @@ static atlas_status bind_file_fields(atlas_db *db, sqlite3_stmt *stmt, int base,
         sqlite3_bind_int(stmt, base + 9, rec->unsafe_path ? 1 : 0) != SQLITE_OK) {
         return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind file flags");
     }
-    return atlas_db_bind_text_opt(db, stmt, base + 10, rec->read_error, err);
+    st = atlas_db_bind_text_opt(db, stmt, base + 10, rec->read_error, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+
+    /* A1: discovery classification. */
+    if (sqlite3_bind_int(stmt, base + 11, rec->tracked ? 1 : 0) != SQLITE_OK ||
+        sqlite3_bind_int(stmt, base + 12, rec->ignored ? 1 : 0) != SQLITE_OK ||
+        sqlite3_bind_int(stmt, base + 13, rec->truncated ? 1 : 0) != SQLITE_OK) {
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind discovery flags");
+    }
+    st = atlas_db_bind_text_opt(db, stmt, base + 14, rec->truncated_reason, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, base + 15, rec->generation) != SQLITE_OK) {
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind generation");
+    }
+
+    /* A1: filesystem identity. Bound as a unit: a partially recorded identity
+     * would compare unequal forever and rehash the file on every pass, so an
+     * unknown identity is stored as all-NULL instead. */
+    const int64_t fs[ATLAS_FS_IDENTITY_COLUMNS] = {
+        rec->fs.dev,        rec->fs.ino,       rec->fs.size,       rec->fs.mtime_sec,
+        rec->fs.mtime_nsec, rec->fs.ctime_sec, rec->fs.ctime_nsec, rec->fs.mode,
+    };
+    for (int i = 0; i < ATLAS_FS_IDENTITY_COLUMNS; i++) {
+        int idx = base + 16 + i;
+        int rc2 = rec->fs.known ? sqlite3_bind_int64(stmt, idx, fs[i])
+                                : sqlite3_bind_null(stmt, idx);
+        if (rc2 != SQLITE_OK) {
+            return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind filesystem identity");
+        }
+    }
+    return ATLAS_OK;
 }
 
 atlas_status atlas_db_file_upsert(atlas_db *db, int64_t repo_id, int64_t scan_id,
@@ -173,10 +232,14 @@ atlas_status atlas_db_file_upsert(atlas_db *db, int64_t repo_id, int64_t scan_id
                               "INSERT INTO files(repo_id, path_raw, path_text, path_is_utf8,"
                               " file_type, language, git_mode, git_index_oid, content_hash,"
                               " content_hash_algo, size_bytes, is_executable, is_symlink,"
-                              " unsafe_path, read_error, first_seen_scan_id, last_seen_scan_id,"
-                              " first_seen_at, last_seen_at, deleted)"
+                              " unsafe_path, read_error, tracked, ignored, truncated,"
+                              " truncated_reason, last_generation, fs_dev, fs_ino, fs_size,"
+                              " fs_mtime_sec, fs_mtime_nsec, fs_ctime_sec, fs_ctime_nsec,"
+                              " fs_mode, first_seen_scan_id,"
+                              " last_seen_scan_id, first_seen_at, last_seen_at, deleted)"
                               " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,"
-                              "?16,?17,?18,?19,0);",
+                              "?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,"
+                              "?31,?32,0);",
                               &ins, err);
         if (st != ATLAS_OK) {
             return st;
@@ -196,22 +259,32 @@ atlas_status atlas_db_file_upsert(atlas_db *db, int64_t repo_id, int64_t scan_id
             st = bind_file_fields(db, ins, 5, rec, err);
         }
         if (st == ATLAS_OK) {
-            if (sqlite3_bind_int64(ins, 16, scan_id) != SQLITE_OK ||
-                sqlite3_bind_int64(ins, 17, scan_id) != SQLITE_OK) {
+            if (sqlite3_bind_int64(ins, 29, scan_id) != SQLITE_OK ||
+                sqlite3_bind_int64(ins, 30, scan_id) != SQLITE_OK) {
                 st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind scan id");
             }
         }
         if (st == ATLAS_OK) {
-            st = atlas_db_bind_text_opt(db, ins, 18, now, err);
+            st = atlas_db_bind_text_opt(db, ins, 31, now, err);
         }
         if (st == ATLAS_OK) {
-            st = atlas_db_bind_text_opt(db, ins, 19, now, err);
+            st = atlas_db_bind_text_opt(db, ins, 32, now, err);
         }
         if (st != ATLAS_OK) {
             sqlite3_finalize(ins);
             return st;
         }
         st = atlas_db_step_done(db, ins, err);
+        if (st != ATLAS_OK) {
+            return st;
+        }
+        /* Maintain the search index for exactly this row. A full rebuild here
+         * would make every single-file change cost a whole repository reindex,
+         * which is the thing A1 exists to avoid. `path_text` is a deterministic
+         * function of `path_raw`, and `path_raw` is the key, so an update can
+         * never change the indexed text: only the insert needs to touch FTS. */
+        st = atlas_db_fts_file_upsert(db, sqlite3_last_insert_rowid(db->h), NULL, rec->path_text,
+                                      err);
         if (st != ATLAS_OK) {
             return st;
         }
@@ -223,8 +296,15 @@ atlas_status atlas_db_file_upsert(atlas_db *db, int64_t repo_id, int64_t scan_id
 
     if (unchanged) {
         sqlite3_stmt *upd = NULL;
-        st = atlas_db_prepare(
-            db, "UPDATE files SET last_seen_scan_id=?1, last_seen_at=?2 WHERE id=?3;", &upd, err);
+        /* Liveness bookkeeping only. The filesystem identity is refreshed too, so
+         * that a file whose row predates A1 stops being a rehash candidate after
+         * exactly one pass instead of being read again forever. */
+        st = atlas_db_prepare(db,
+                              "UPDATE files SET last_seen_scan_id=?1, last_seen_at=?2,"
+                              " last_generation=?4, fs_dev=?5, fs_ino=?6, fs_size=?7,"
+                              " fs_mtime_sec=?8, fs_mtime_nsec=?9, fs_ctime_sec=?10,"
+                              " fs_ctime_nsec=?11, fs_mode=?12 WHERE id=?3;",
+                              &upd, err);
         if (st != ATLAS_OK) {
             return st;
         }
@@ -233,8 +313,22 @@ atlas_status atlas_db_file_upsert(atlas_db *db, int64_t repo_id, int64_t scan_id
             return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind scan id");
         }
         st = atlas_db_bind_text_opt(db, upd, 2, now, err);
-        if (st == ATLAS_OK && sqlite3_bind_int64(upd, 3, existing_id) != SQLITE_OK) {
+        if (st == ATLAS_OK && (sqlite3_bind_int64(upd, 3, existing_id) != SQLITE_OK ||
+                               sqlite3_bind_int64(upd, 4, rec->generation) != SQLITE_OK)) {
             st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind file id");
+        }
+        if (st == ATLAS_OK) {
+            const int64_t fsv[ATLAS_FS_IDENTITY_COLUMNS] = {
+                rec->fs.dev,        rec->fs.ino,       rec->fs.size,       rec->fs.mtime_sec,
+                rec->fs.mtime_nsec, rec->fs.ctime_sec, rec->fs.ctime_nsec, rec->fs.mode,
+            };
+            for (int i = 0; i < ATLAS_FS_IDENTITY_COLUMNS && st == ATLAS_OK; i++) {
+                int rc2 = rec->fs.known ? sqlite3_bind_int64(upd, 5 + i, fsv[i])
+                                        : sqlite3_bind_null(upd, 5 + i);
+                if (rc2 != SQLITE_OK) {
+                    st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind filesystem identity");
+                }
+            }
         }
         if (st != ATLAS_OK) {
             sqlite3_finalize(upd);
@@ -248,29 +342,33 @@ atlas_status atlas_db_file_upsert(atlas_db *db, int64_t repo_id, int64_t scan_id
                           "UPDATE files SET file_type=?1, language=?2, git_mode=?3,"
                           " git_index_oid=?4, content_hash=?5, content_hash_algo=?6,"
                           " size_bytes=?7, is_executable=?8, is_symlink=?9, unsafe_path=?10,"
-                          " read_error=?11, last_seen_scan_id=?12, last_seen_at=?13,"
+                          " read_error=?11, tracked=?12, ignored=?13, truncated=?14,"
+                          " truncated_reason=?15, last_generation=?16, fs_dev=?17, fs_ino=?18,"
+                          " fs_size=?19, fs_mtime_sec=?20, fs_mtime_nsec=?21, fs_ctime_sec=?22,"
+                          " fs_ctime_nsec=?23, fs_mode=?24,"
+                          " last_seen_scan_id=?25, last_seen_at=?26,"
                           " deleted=0, deleted_at=NULL, deleted_scan_id=NULL,"
-                          " path_text=?14, path_is_utf8=?15 WHERE id=?16;",
+                          " path_text=?27, path_is_utf8=?28 WHERE id=?29;",
                           &upd, err);
     if (st != ATLAS_OK) {
         return st;
     }
     st = bind_file_fields(db, upd, 1, rec, err);
     if (st == ATLAS_OK) {
-        if (sqlite3_bind_int64(upd, 12, scan_id) != SQLITE_OK) {
+        if (sqlite3_bind_int64(upd, 25, scan_id) != SQLITE_OK) {
             st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind scan id");
         }
     }
     if (st == ATLAS_OK) {
-        st = atlas_db_bind_text_opt(db, upd, 13, now, err);
+        st = atlas_db_bind_text_opt(db, upd, 26, now, err);
     }
     if (st == ATLAS_OK) {
-        st = atlas_db_bind_text_opt(db, upd, 14, rec->path_text, err);
+        st = atlas_db_bind_text_opt(db, upd, 27, rec->path_text, err);
     }
-    if (st == ATLAS_OK && sqlite3_bind_int(upd, 15, rec->path_is_utf8 ? 1 : 0) != SQLITE_OK) {
+    if (st == ATLAS_OK && sqlite3_bind_int(upd, 28, rec->path_is_utf8 ? 1 : 0) != SQLITE_OK) {
         st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind path encoding flag");
     }
-    if (st == ATLAS_OK && sqlite3_bind_int64(upd, 16, existing_id) != SQLITE_OK) {
+    if (st == ATLAS_OK && sqlite3_bind_int64(upd, 29, existing_id) != SQLITE_OK) {
         st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind file id");
     }
     if (st != ATLAS_OK) {
@@ -501,9 +599,20 @@ atlas_status atlas_db_commit_upsert(atlas_db *db, int64_t repo_id, int64_t scan_
         *inserted_out = inserted;
     }
 
+    /* Captured before any other insert runs: sqlite3_last_insert_rowid() is
+     * per-connection, and the FTS write below would otherwise overwrite it. */
+    int64_t new_id = inserted ? sqlite3_last_insert_rowid(db->h) : 0;
+    if (inserted) {
+        /* Same reasoning as for files: index this commit, do not rebuild. */
+        st = atlas_db_fts_commit_insert(db, new_id, rec->subject, rec->body, rec->body_len, err);
+        if (st != ATLAS_OK) {
+            return st;
+        }
+    }
+
     if (commit_id_out != NULL) {
         if (inserted) {
-            *commit_id_out = sqlite3_last_insert_rowid(db->h);
+            *commit_id_out = new_id;
         } else {
             sqlite3_stmt *sel = NULL;
             st = atlas_db_prepare(db, "SELECT id FROM commits WHERE repo_id=?1 AND oid=?2;", &sel,

@@ -82,6 +82,52 @@ atlas_status fx_atlas(const char *const *args, size_t nargs, atlas_buf *stdout_o
                       atlas_buf *stderr_out, int *exit_code, atlas_err *err);
 
 
+/* --- A1: a live daemon under test ---------------------------------------
+ *
+ * The suite never installs, enables or starts a real systemd service. It forks
+ * the built binary directly with an isolated data directory and an isolated
+ * XDG_RUNTIME_DIR, so the socket, the lock and the index all live inside the
+ * fixture's temporary tree and nothing touches the developer's account. */
+
+typedef struct fx_daemon {
+    pid_t pid;
+    atlas_buf runtime_dir; /* the fixture's private XDG_RUNTIME_DIR */
+    atlas_buf socket;      /* <runtime_dir>/atlas/atlas.sock */
+    atlas_buf log_path;
+} fx_daemon;
+
+void fx_daemon_init(fx_daemon *d);
+/* Forks `atlas daemon run --data-dir <fixture data>` with XDG_RUNTIME_DIR set
+ * inside the fixture. Does not wait for it to be ready. */
+atlas_status fx_daemon_start(fixture *fx, fx_daemon *d, atlas_err *err);
+/* Polls the socket until the daemon answers a ping, or the deadline passes. */
+atlas_status fx_daemon_wait_ready(fx_daemon *d, int timeout_ms, atlas_err *err);
+/* SIGTERM, then wait. `hard` sends SIGKILL instead, to exercise crash recovery. */
+void fx_daemon_stop(fx_daemon *d, bool hard);
+void fx_daemon_free(fx_daemon *d);
+/* Reads the daemon's captured log, for assertions about what it reported. */
+atlas_status fx_daemon_log(const fx_daemon *d, atlas_buf *out, atlas_err *err);
+/* True when the daemon process has exited. */
+bool fx_daemon_exited(fx_daemon *d);
+
+/* Runs the atlas binary with the fixture's data directory and the daemon's
+ * runtime directory, so a CLI invocation reaches this daemon and no other. */
+atlas_status fx_atlas_with_runtime(const fixture *fx, const fx_daemon *d, const char *const *args,
+                                   size_t nargs, atlas_buf *stdout_out, atlas_buf *stderr_out,
+                                   int *exit_code, atlas_err *err);
+
+/* One raw request/response round trip, so the framing can be driven directly
+ * with bytes the client library would never send. */
+atlas_status fx_ipc_raw(const char *socket_path, const void *frame, size_t len,
+                        atlas_buf *response_out, bool *closed_out, atlas_err *err);
+
+/* Waits until `predicate` holds over the JSON of `atlas events NAME --json`, or
+ * the deadline passes. Used so watcher tests wait for an observable outcome
+ * rather than sleeping a guessed interval. */
+atlas_status fx_wait_for_substring(const fixture *fx, const fx_daemon *d, const char *const *args,
+                                   size_t nargs, const char *needle, int timeout_ms, bool *found,
+                                   atlas_err *err);
+
 /* --- adversarial helpers ------------------------------------------------- */
 
 /* Installs the marker helper (see tests/tools/atlas_marker.c) into `dir` under

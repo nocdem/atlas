@@ -1,0 +1,232 @@
+/* Atlas - the foreground daemon.
+ * Copyright 2026 The Atlas Authors. Licensed under the Apache License 2.0.
+ *
+ * Startup order is load-bearing, so it is written out explicitly:
+ *
+ *   1. resolve and create the data directory
+ *   2. take the writer lock — before anything else, so a second daemon or a
+ *      running `atlas scan` is refused now rather than after half a startup
+ *   3. freeze the git runtime state, before any thread exists
+ *   4. resolve and prepare the runtime directory and socket
+ *   5. block the signals we want, then open a signalfd for them
+ *   6. start the worker pool, then the writer, then the watcher
+ *   7. serve
+ *
+ * Shutdown is the reverse, and every step is joined rather than abandoned: a
+ * daemon that exits with its writer thread mid-transaction is a daemon whose
+ * index recovery depends on WAL rather than on shutdown being correct.
+ */
+#define _GNU_SOURCE 1
+
+#include "atlas/daemon.h"
+
+#include <errno.h>
+#include <signal.h>
+#include <stdatomic.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/signalfd.h>
+#include <time.h>
+#include <unistd.h>
+
+#include "atlas/atlas.h"
+#include "atlas/datadir.h"
+#include "atlas/ipc.h"
+#include "atlas/lock.h"
+#include "atlas/safetext.h"
+#include "daemon/daemon_internal.h"
+#include "git/git_harden.h"
+
+void atlas_daemon_opts_init(atlas_daemon_opts *o) {
+    memset(o, 0, sizeof(*o));
+}
+
+static int64_t monotonic_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0;
+    }
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* Blocks SIGTERM, SIGINT and SIGPIPE process-wide and returns a signalfd for the
+ * first two.
+ *
+ * Blocking before any thread is created is what makes this correct: a thread
+ * inherits the signal mask of its creator, so blocking here means no worker can
+ * be the one that receives SIGTERM and dies with a transaction open. SIGPIPE is
+ * blocked and never read: writes use MSG_NOSIGNAL, and a daemon should not die
+ * because one client hung up. */
+static atlas_status install_signals(int *fd_out, atlas_err *err) {
+    *fd_out = -1;
+    sigset_t mask;
+    (void)sigemptyset(&mask);
+    (void)sigaddset(&mask, SIGTERM);
+    (void)sigaddset(&mask, SIGINT);
+    (void)sigaddset(&mask, SIGPIPE);
+    if (pthread_sigmask(SIG_BLOCK, &mask, NULL) != 0) {
+        return atlas_err_set_errno(err, ATLAS_ERR_INTERNAL, errno, "cannot block signals");
+    }
+    sigset_t wanted;
+    (void)sigemptyset(&wanted);
+    (void)sigaddset(&wanted, SIGTERM);
+    (void)sigaddset(&wanted, SIGINT);
+    int fd = signalfd(-1, &wanted, SFD_CLOEXEC | SFD_NONBLOCK);
+    if (fd < 0) {
+        return atlas_err_set_errno(err, ATLAS_ERR_INTERNAL, errno, "cannot create a signalfd");
+    }
+    *fd_out = fd;
+    return ATLAS_OK;
+}
+
+atlas_status atlas_daemon_run(const atlas_daemon_opts *opts, FILE *log, atlas_err *err) {
+    atlas_daemon_opts defaults;
+    atlas_daemon_opts_init(&defaults);
+    if (opts == NULL) {
+        opts = &defaults;
+    }
+
+    atlas_buf data_dir = ATLAS_BUF_INIT;
+    atlas_buf db_path = ATLAS_BUF_INIT;
+    atlas_buf runtime_dir = ATLAS_BUF_INIT;
+    atlas_buf socket_path = ATLAS_BUF_INIT;
+    atlas_lock *lock = NULL;
+    atlas_workers *workers = NULL;
+    atlas_writer *writer = NULL;
+    atlas_watcher *watcher = NULL;
+    int listen_fd = -1;
+    int signal_fd = -1;
+    atlas_safe_pool safe;
+    atlas_safe_pool_init(&safe);
+    atomic_bool stop;
+    atomic_init(&stop, false);
+
+    atlas_datadir_source src = ATLAS_DATADIR_OVERRIDE;
+    atlas_status st = atlas_datadir_resolve(opts->data_dir_override, &data_dir, &src, err);
+    if (st == ATLAS_OK) {
+        st = atlas_datadir_ensure(atlas_buf_cstr(&data_dir), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_datadir_db_path(atlas_buf_cstr(&data_dir), &db_path, err);
+    }
+    if (st != ATLAS_OK) {
+        goto done;
+    }
+
+    /* The lock first. Everything after this assumes sole ownership of the index,
+     * and finding out otherwise later would mean unwinding a half-started
+     * daemon. */
+    st = atlas_lock_acquire(atlas_buf_cstr(&data_dir), ATLAS_LOCK_ROLE_DAEMON, &lock, err);
+    if (st != ATLAS_OK) {
+        goto done;
+    }
+
+    /* Freeze the git runtime state while the process is still single-threaded,
+     * so the PATH search happens exactly once and every later reader observes a
+     * value that never changes. A missing git is then reported here, at startup,
+     * rather than by whichever worker first needed it. */
+    st = atlas_git_runtime_init(err);
+    if (st != ATLAS_OK) {
+        goto done;
+    }
+
+    st = atlas_ipc_runtime_dir(&runtime_dir, err);
+    if (st == ATLAS_OK) {
+        st = atlas_ipc_ensure_runtime_dir(atlas_buf_cstr(&runtime_dir), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_ipc_socket_path(&socket_path, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_ipc_listen(atlas_buf_cstr(&socket_path), &listen_fd, err);
+    }
+    if (st != ATLAS_OK) {
+        goto done;
+    }
+
+    st = install_signals(&signal_fd, err);
+    if (st != ATLAS_OK) {
+        goto done;
+    }
+
+    atlas_daemon_log(log, "info", "atlas %s starting: data %s, socket %s", ATLAS_VERSION_STRING,
+                     atlas_safe(&safe, atlas_buf_cstr(&data_dir)),
+                     atlas_safe(&safe, atlas_buf_cstr(&socket_path)));
+
+    st = atlas_workers_start(opts->worker_count, &workers, err);
+    if (st == ATLAS_OK) {
+        /* The writer records the daemon's liveness row itself, because it owns
+         * the only writable handle. That row is diagnostic only: the lock, not
+         * the row, is what proves a daemon is running, since a killed daemon
+         * leaves the row behind and the released lock is what disproves it. */
+        st = atlas_writer_start(atlas_buf_cstr(&db_path), atlas_buf_cstr(&socket_path), workers,
+                                log, &writer, err);
+    }
+    if (st != ATLAS_OK) {
+        goto done;
+    }
+
+    st = atlas_watcher_start(atlas_buf_cstr(&db_path), writer, log,
+                             opts->reconcile_interval_ms, &watcher, err);
+    if (st != ATLAS_OK) {
+        goto done;
+    }
+
+    atlas_server_ctx sctx;
+    memset(&sctx, 0, sizeof(sctx));
+    sctx.db_path = atlas_buf_cstr(&db_path);
+    sctx.data_dir = atlas_buf_cstr(&data_dir);
+    sctx.socket_path = atlas_buf_cstr(&socket_path);
+    sctx.writer = writer;
+    sctx.watcher = watcher;
+    sctx.workers = workers;
+    sctx.log = log;
+    sctx.started_at_ms = monotonic_ms();
+
+    atlas_daemon_log(log, "info", "serving on %s with %zu workers",
+                     atlas_safe(&safe, atlas_buf_cstr(&socket_path)),
+                     atlas_workers_count(workers));
+
+    if (opts->run_once) {
+        /* Test mode: wait until the watcher has submitted its initial passes and
+         * the writer has drained them, then stop. Bounded, so a hung pass fails
+         * the test rather than hanging it. */
+        int64_t deadline = monotonic_ms() + 120000;
+        while (monotonic_ms() < deadline) {
+            struct timespec nap = {0, 50L * 1000000L};
+            (void)nanosleep(&nap, NULL);
+            if (atlas_watcher_primed(watcher) && atlas_writer_queue_depth(writer) == 0) {
+                break;
+            }
+        }
+        atomic_store(&stop, true);
+    }
+
+    st = atlas_server_serve(&sctx, listen_fd, signal_fd, &stop, err);
+    atlas_daemon_log(log, "info", "shutting down");
+
+done:
+    /* Reverse order, and every thread joined. The watcher stops first so no new
+     * work is queued; the writer then drains what is already queued and closes
+     * its handle; the workers are last because the writer may still be using
+     * them as it drains. */
+    atlas_watcher_stop(watcher);
+    atlas_writer_stop(writer);
+    atlas_workers_stop(workers);
+    if (signal_fd >= 0) {
+        (void)close(signal_fd);
+    }
+    if (listen_fd >= 0) {
+        (void)close(listen_fd);
+        /* Only ours to remove, and only because we are the process that bound
+         * it and still hold the writer lock. */
+        (void)unlink(atlas_buf_cstr(&socket_path));
+    }
+    atlas_lock_release(lock);
+    atlas_safe_pool_free(&safe);
+    atlas_buf_free(&data_dir);
+    atlas_buf_free(&db_path);
+    atlas_buf_free(&runtime_dir);
+    atlas_buf_free(&socket_path);
+    return st;
+}

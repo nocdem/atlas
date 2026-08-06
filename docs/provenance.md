@@ -227,3 +227,67 @@ MCP. The same boundary applies there and for the same reason. Content that arriv
 from a repository is data being reported, not instruction being followed, whether
 the reader is a terminal, a model, or another program. Atlas encodes at the point
 of output rather than trusting each consumer to defend itself.
+
+## A1: what the daemon adds, and what it does not
+
+### Evidence is unchanged
+
+A1 writes exactly the same two evidence kinds A0 did: `SOURCE` for a working-tree
+observation and `GIT` for something read from git. The restriction is still
+enforced in `atlas_db_evidence_insert`, not by convention, and `DECISION`,
+`USER_STATEMENT` and `INFERENCE` remain refused.
+
+A reconciliation pass records `SOURCE` evidence for a file it newly indexed or
+found changed, and `GIT` evidence for a commit it newly ingested — the same rule
+`atlas scan` followed. A pass over an unchanged repository records **none**,
+which is what makes repeated passes idempotent. There is a test asserting that
+five idle passes leave the evidence count identical.
+
+### The event journal is not evidence
+
+`repo_events` is a separate thing and the distinction matters.
+
+| | `evidence` | `repo_events` |
+| --- | --- | --- |
+| what it is | the provenance record for an indexed fact | a notification stream for consumers |
+| retention | permanent | bounded (`ATLAS_EVENTS_RETAIN_PER_REPO`) |
+| pruned | never | oldest first |
+| answers | "how does Atlas know this?" | "what changed since cursor N?" |
+
+Pruning the journal never touches evidence. The prune statement addresses
+`repo_events` alone and nothing in it can reach the evidence table.
+
+An A2 consumer that resumes from a cursor and finds it has been pruned past must
+treat that as "re-read the state", not as "nothing happened" — the cursor is a
+convenience, and the durable answer is always the index itself.
+
+### The new honesty field
+
+Every per-repository result carries `index_current`, and when it is false,
+`not_current_reason`. This is the provenance question applied to the index as a
+whole: not "where did this fact come from" but "is Atlas in a position to be
+telling you this at all".
+
+`index_current` is true only when a completed generation exists, no event gap is
+outstanding, no full reconciliation is owed, and the watcher is neither in error
+nor degraded. There is no state in which Atlas reports `index_current: true`
+alongside a known gap. See [watcher-consistency.md](watcher-consistency.md).
+
+### New JSON fields
+
+`daemon status`, `repo.state`, `repo.list`, `sync` and `events` are new documents
+and are covered by the same stable-field contract as the A0 commands. The
+untrusted-text rules are unchanged and are applied field by field:
+
+- **already-safe, emitted as-is**: `root` (from `root_path_text`), an event's
+  `path` (stored in the safe encoding). Re-encoding these would stop them
+  decoding back to the original bytes.
+- **Atlas-owned, no encoding needed**: `repo` and `name` (validated to
+  `[A-Za-z0-9._-]` at registration), generation and cursor integers, ISO
+  timestamps, `watch_state`, `kind`, `not_current_reason` (a fixed string).
+- **raw, encoded on the way out**: `watch_detail` and `last_error` (from git and
+  from the kernel), an event's `detail`, an IPC error `message`, the writer-lock
+  holder text, and the socket path (partly from the environment).
+
+The IPC error document uses the same `status` numbering as the CLI exit codes, so
+a caller has one vocabulary rather than two.

@@ -342,6 +342,35 @@ atlas_status atlas_db_repo_get_by_root(atlas_db *db, const void *root_raw, size_
                         root_raw, root_len, true, out, found, err);
 }
 
+atlas_status atlas_db_repo_get_by_id(atlas_db *db, int64_t repo_id, atlas_repo_info *out,
+                                     bool *found, atlas_err *err) {
+    /* The daemon queues work by id, not by name: a repository that is renamed or
+     * removed between queueing and running must resolve to nothing rather than
+     * to whatever now holds that name. */
+    *found = false;
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(
+        db, "SELECT " REPO_COLS " FROM repositories WHERE id = ?1;", &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, repo_id) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind repository id");
+    }
+    int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        st = load_repo(stmt, out, err);
+        if (st == ATLAS_OK) {
+            *found = true;
+        }
+    } else if (rc != SQLITE_DONE) {
+        st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot read repository");
+    }
+    sqlite3_finalize(stmt);
+    return st;
+}
+
 atlas_status atlas_db_repo_list(atlas_db *db, atlas_repo_cb cb, void *ud, atlas_err *err) {
     sqlite3_stmt *stmt = NULL;
     atlas_status st = atlas_db_prepare(

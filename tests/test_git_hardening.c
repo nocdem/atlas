@@ -505,6 +505,155 @@ static void test_partial_clone_config_is_refused(void) {
     env_close(&e);
 }
 
+/* --- A1 regression: the ways the A0 prefix scan could be evaded -----------
+ *
+ * A0 read the first 64 KiB of .git/config and looked for the substrings
+ * "promisor" and "partialclone". Each case below is a way that check returned
+ * "not a partial clone" about a repository that was one. The replacement asks
+ * git itself, which is the only component that knows what its own configuration
+ * is, so all of them now fail closed.
+ */
+
+/* Pads .git/config with comment lines so a marker written after the padding
+ * lands beyond `after_bytes`. */
+static void pad_repo_config(harden_env *e, size_t after_bytes) {
+    atlas_err err;
+    atlas_err_init(&err);
+    atlas_buf path = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_appendf(&path, &err, "%s/.git/config", fx_repo(&e->fx)), &err);
+    FILE *f = fopen(atlas_buf_cstr(&path), "a");
+    T_REQUIRE(f != NULL);
+    /* Comments are valid git config and are ignored by git, so this changes
+     * nothing about the repository except the offset of what follows. */
+    static const char line[] = "# aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
+    for (size_t written = 0; written < after_bytes; written += sizeof(line) - 1u) {
+        (void)fwrite(line, 1u, sizeof(line) - 1u, f);
+    }
+    (void)fclose(f);
+    atlas_buf_free(&path);
+}
+
+static void expect_refused_as_partial(harden_env *e, const char *what) {
+    run_result r;
+    const char *add[] = {"repo", "add", fx_repo(&e->fx), "--name", REPO_NAME};
+    run_atlas_in(e, &r, add, 5u, NULL);
+    T_CHECK_MSG(r.exit_code == ATLAS_ERR_INTEGRITY,
+                "%s: expected exit %d, got %d: %s", what, ATLAS_ERR_INTEGRITY, r.exit_code,
+                atlas_buf_cstr(&r.errout));
+    result_free(&r);
+}
+
+/* The verified bypass: roughly 150 KiB of padding put the marker past the 64 KiB
+ * A0 ever read. */
+static void test_promisor_marker_after_64k(void) {
+    harden_env e;
+    env_open(&e);
+    build_repo(&e);
+    pad_repo_config(&e, 150u * 1024u);
+    set_repo_config(&e, "remote.origin.promisor", "true");
+    expect_refused_as_partial(&e, "a promisor marker 150 KiB into the config");
+    env_close(&e);
+}
+
+/* A marker straddling the old buffer boundary matched neither half. */
+static void test_promisor_marker_across_the_boundary(void) {
+    harden_env e;
+    env_open(&e);
+    build_repo(&e);
+    /* Land the key within a few bytes of where the old read stopped. */
+    pad_repo_config(&e, 64u * 1024u - 8u);
+    set_repo_config(&e, "remote.origin.promisor", "true");
+    expect_refused_as_partial(&e, "a promisor marker across the old buffer boundary");
+    env_close(&e);
+}
+
+/* An included file: git honours include.path as if its contents were inline,
+ * and A0 never opened it. */
+static void test_promisor_in_an_included_config(void) {
+    harden_env e;
+    atlas_err err;
+    atlas_err_init(&err);
+    env_open(&e);
+    build_repo(&e);
+
+    T_OK(fx_write(fx_repo(&e.fx), ".git/extra.config",
+                  "[remote \"origin\"]\n\tpromisor = true\n", &err),
+         &err);
+    set_repo_config(&e, "include.path", "extra.config");
+    expect_refused_as_partial(&e, "a promisor marker in an included config file");
+    env_close(&e);
+}
+
+/* $GIT_DIR/config.worktree, which git reads when extensions.worktreeConfig is
+ * set. A0 opened only .git/config. */
+static void test_promisor_in_config_worktree(void) {
+    harden_env e;
+    atlas_err err;
+    atlas_err_init(&err);
+    env_open(&e);
+    build_repo(&e);
+
+    set_repo_config(&e, "extensions.worktreeConfig", "true");
+    T_OK(fx_write(fx_repo(&e.fx), ".git/config.worktree",
+                  "[remote \"origin\"]\n\tpromisor = true\n", &err),
+         &err);
+    expect_refused_as_partial(&e, "a promisor marker in config.worktree");
+    env_close(&e);
+}
+
+/* git canonicalises section and variable names, so a mixed-case key is the same
+ * key. Matching on git's own output covers every spelling. */
+static void test_promisor_key_case_variants(void) {
+    harden_env e;
+    env_open(&e);
+    build_repo(&e);
+    set_repo_config(&e, "REMOTE.origin.PROMISOR", "true");
+    expect_refused_as_partial(&e, "a mixed-case promisor key");
+    env_close(&e);
+}
+
+/* An arbitrary remote name, not "origin". */
+static void test_promisor_arbitrary_remote_name(void) {
+    harden_env e;
+    env_open(&e);
+    build_repo(&e);
+    set_repo_config(&e, "remote.some-odd.name_42.promisor", "true");
+    expect_refused_as_partial(&e, "a promisor marker on an unusually named remote");
+    env_close(&e);
+}
+
+/* extensions.partialclone, which is what a filtered clone actually sets. */
+static void test_partialclone_extension(void) {
+    harden_env e;
+    env_open(&e);
+    build_repo(&e);
+    set_repo_config(&e, "extensions.partialClone", "origin");
+    expect_refused_as_partial(&e, "extensions.partialClone");
+    env_close(&e);
+}
+
+/* The other direction: over-refusal. A0's substring match refused any repository
+ * whose config merely *mentioned* the word, including a branch named
+ * "promisor-experiment". An exact query must not. */
+static void test_innocent_mention_is_not_refused(void) {
+    harden_env e;
+    atlas_err err;
+    atlas_err_init(&err);
+    env_open(&e);
+    build_repo(&e);
+    set_repo_config(&e, "branch.promisor-experiment.remote", "origin");
+    set_repo_config(&e, "remote.origin.url", "https://example.invalid/partialclone-mirror.git");
+
+    run_result r;
+    const char *add[] = {"repo", "add", fx_repo(&e.fx), "--name", REPO_NAME};
+    run_atlas_in(&e, &r, add, 5u, NULL);
+    T_CHECK_MSG(r.exit_code == 0,
+                "a repository that merely mentions the word must not be refused: %s",
+                atlas_buf_cstr(&r.errout));
+    result_free(&r);
+    env_close(&e);
+}
+
 static void test_promisor_pack_is_refused(void) {
     harden_env e;
     atlas_err err;
@@ -740,6 +889,15 @@ static const atlas_test TESTS[] = {
     {"hostile GIT_DIR and GIT_WORK_TREE are ignored", test_hostile_repository_selectors},
     {"promisor config fails closed", test_partial_clone_config_is_refused},
     {"promisor pack fails closed", test_promisor_pack_is_refused},
+    /* A1 regressions: each of these evaded the A0 64 KiB prefix scan. */
+    {"promisor marker beyond 64 KiB", test_promisor_marker_after_64k},
+    {"promisor marker across the old buffer boundary", test_promisor_marker_across_the_boundary},
+    {"promisor marker in an included config", test_promisor_in_an_included_config},
+    {"promisor marker in config.worktree", test_promisor_in_config_worktree},
+    {"promisor key case variants", test_promisor_key_case_variants},
+    {"promisor on an arbitrary remote name", test_promisor_arbitrary_remote_name},
+    {"extensions.partialClone", test_partialclone_extension},
+    {"an innocent mention is not over-refused", test_innocent_mention_is_not_refused},
     {"a repository that becomes partial fails closed", test_repository_becoming_partial_fails_closed},
     {"no prompt and no network helper runs", test_no_prompt_and_no_network},
 };

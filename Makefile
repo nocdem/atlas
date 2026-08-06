@@ -8,6 +8,8 @@
 #   make adversarial  build + hostile-repository hardening checks under strace
 #   make asan       ASan/LSan build + tests  -> build-asan
 #   make ubsan      UBSan build + tests      -> build-ubsan
+#   make tsan       ThreadSanitizer build + tests -> build-tsan
+#   make verify-vendor  re-check vendored third-party digests
 #   make install    install to $(PREFIX)/bin (default /usr/local/bin)
 #   make clean      remove all build directories
 
@@ -20,10 +22,11 @@ BUILD_RELEASE ?= build
 BUILD_DEBUG   ?= build-debug
 BUILD_ASAN    ?= build-asan
 BUILD_UBSAN   ?= build-ubsan
+BUILD_TSAN    ?= build-tsan
 
 CTEST_FLAGS ?= --output-on-failure
 
-.PHONY: all release debug test test-debug smoke adversarial asan ubsan install clean distclean doctor compiledb help
+.PHONY: all release debug test test-debug smoke adversarial asan ubsan tsan verify-vendor install clean distclean doctor compiledb help
 
 all: release
 
@@ -59,6 +62,17 @@ ubsan:
 	$(CMAKE) --build $(BUILD_UBSAN) -j $(JOBS)
 	cd $(BUILD_UBSAN) && UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 $(CTEST) $(CTEST_FLAGS) -j $(JOBS)
 
+# ThreadSanitizer, for the A1 threaded components. TSan and ASan cannot be
+# combined, so this is its own build directory.
+tsan:
+	$(CMAKE) -S . -B $(BUILD_TSAN) -DCMAKE_BUILD_TYPE=Debug -DATLAS_TSAN=ON
+	$(CMAKE) --build $(BUILD_TSAN) -j $(JOBS)
+	cd $(BUILD_TSAN) && TSAN_OPTIONS=halt_on_error=0:second_deadlock_stack=1 $(CTEST) $(CTEST_FLAGS) -j $(JOBS)
+
+# Vendored third-party source must still be what PROVENANCE.md says it is.
+verify-vendor:
+	./scripts/verify_third_party.sh
+
 install: release
 	$(CMAKE) --install $(BUILD_RELEASE) --prefix $(PREFIX)
 
@@ -70,10 +84,10 @@ compiledb: release
 	ln -sf $(BUILD_RELEASE)/compile_commands.json compile_commands.json
 
 clean:
-	rm -rf $(BUILD_RELEASE) $(BUILD_DEBUG) $(BUILD_ASAN) $(BUILD_UBSAN)
+	rm -rf $(BUILD_RELEASE) $(BUILD_DEBUG) $(BUILD_ASAN) $(BUILD_UBSAN) $(BUILD_TSAN)
 
 distclean: clean
 	rm -f compile_commands.json
 
 help:
-	@sed -n '3,12p' Makefile
+	@sed -n '3,14p' Makefile

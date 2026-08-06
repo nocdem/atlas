@@ -1,0 +1,12 @@
+# Build directories produced by the Makefile wrapper.
+build/
+build-debug/
+build-asan/
+build-ubsan/
+
+# Editor/clangd convenience symlink created by `make compiledb`.
+compile_commands.json
+
+# Local editor state.
+.cache/
+*.swp

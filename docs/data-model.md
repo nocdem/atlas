@@ -4,7 +4,7 @@ The database is a **rebuildable index**. Every row in it is derived from Git or
 from the working tree, and every row can be reconstructed by rescanning. Nothing
 in Atlas treats it as the canonical record of history.
 
-Current schema version: **2**. `atlas doctor` reports the version in force and the
+Current schema version: **4**. `atlas doctor` reports the version in force and the
 version the binary expects.
 
 ## Migrations
@@ -27,6 +27,10 @@ Applied so far:
 2. **worktree identity** — adds `git_dir`, `git_dir_text` and `is_linked_worktree`
    to `repositories`, plus an index on `git_common_dir`. See "Repository and
    worktree identity".
+3. **continuous indexing state** — filesystem identity on `files`, plus
+   `repo_index_state`, `repo_events`, `repo_commit_tips` and `daemon_state`.
+4. **AI sessions, change reasons and decisions** — the A2 tables, plus the
+   per-path working-tree change snapshot. See "Migration 4" below.
 
 FTS5 objects are deliberately **not** part of a numbered migration: whether FTS5
 exists is a property of the linked SQLite build, not of the schema. They are
@@ -334,3 +338,144 @@ Constraints: `CHECK` on `repo_index_state.watch_state`, `CHECK` on
 `repo_events.kind`, `CHECK(id = 1)` on `daemon_state`, and `REFERENCES
 repositories(id) ON DELETE CASCADE` on all four new tables so `repo remove`
 remains a pure cascade.
+
+## Migration 4 — AI sessions, change reasons and decisions (A2)
+
+A1 answered "is the index current?". A2 has to answer two more: *which AI session
+was in a position to change this, and did anybody say why?*
+
+Nothing in migration 4 is destructive. Every statement is a `CREATE` for a new
+object, so a schema-v3 database migrates forward with its rows intact and no
+existing table is recreated. `tests/test_migrate3.c` seeds a v2 database and
+migrates it all the way forward; `tests/test_ai_schema.c` asserts the v4 objects
+exist and that migrating twice changes nothing.
+
+**The A0 rule is untouched.** `evidence` still `CHECK`s its six kinds, and
+`atlas_db_evidence_insert` still refuses everything but `SOURCE` and `GIT`. AI
+records are a different kind of thing and live in different tables. Widening
+`evidence` to fit them would have made "how does Atlas know this?" and "what did
+a model claim?" the same question, which is the confusion A2 exists to avoid.
+
+### The client is not Claude
+
+`ai_clients(provider, name)` — a second adapter is another row, not another
+table. Nothing in the schema names Claude, and nothing in `src/ai` does either.
+The adapter that knows the name is `src/hook/hook.c`, in two `#define`s.
+
+### `ai_sessions`
+
+One row per client session, keyed `(client_id, session_key)` where `session_key`
+is the client's own identifier, safe-encoded and bounded on the way in.
+
+`parent_id` carries resume and fork lineage. A **subagent is a session with a
+parent and an `agent_type`**, not a flag on its parent: that makes its change
+set, its reasons and its tool records separable without a second set of tables.
+
+Opening a session key Atlas already has is a **resume**, not a replacement. The
+row keeps its change set and its records, and `resumes` is incremented. Replacing
+it would orphan all three and make a resumed session look like a new one that had
+done nothing.
+
+`state` is `open`, `closed` or `expired`. The distinction between the last two is
+kept deliberately: a session that stopped answering did not end on purpose, and
+"the client crashed" is a different fact from "the user quit". Idle sessions are
+expired opportunistically at the next session open, bounded by
+`ATLAS_AI_SESSION_IDLE_EXPIRY_MS`.
+
+### `ai_session_repos` and `ai_change_sets`
+
+A session that changes directory or gains a working directory **gains** a
+repository rather than replacing one: work it did before the change still belongs
+to it, and the earlier change set stays open.
+
+One change set per session per repository records the window over which that
+session was in a position to change that repository, with the HEAD and generation
+it started from.
+
+### `ai_changed_paths` — the honest table
+
+| `attribution` | means |
+| --- | --- |
+| `direct_edit` | this session invoked an edit tool naming this path **and** the index then observed the path change |
+| `observed` | only the second half |
+| `ambiguous` | another session had the same repository open over the same window |
+
+`concurrent_sessions` records how many, so the ambiguity is a number rather than
+an adjective.
+
+**Attribution never improves.** A row already marked ambiguous stays ambiguous
+whatever a later observation claims, because the overlap is a fact about a window
+that has already passed and a later clean observation does not retract it. A row
+may be promoted from `observed` to `direct_edit`, which is the one direction that
+adds information rather than discarding it. Enforced in the `ON CONFLICT` clause
+in `src/db/db_ai.c`, not in a caller.
+
+### `ai_reasons` and `ai_decisions`
+
+`provenance` is one of `MODEL_PROPOSAL`, `MODEL_INFERENCE`,
+`USER_APPROVED_DECISION` or `UNKNOWN`. The third is in the `CHECK` so the schema
+is stable across phases; A2 cannot write it.
+
+`approved INTEGER NOT NULL DEFAULT 0 CHECK(approved = 0)`. The column exists and
+is pinned to zero, because A2 has no way to prove a human approved anything — an
+argument asserting approval is a string a model produced. Lifting the restriction
+is a migration, which is a change somebody has to make on purpose. See
+[ai-trust-boundary.md](ai-trust-boundary.md) for the other two layers.
+
+`ai_reasons.state` distinguishes a recorded reason from a recorded *absence* of
+one. `unknown` is a first-class row: "nobody said why" and "Atlas was never
+asked" are different facts and a query has to tell them apart.
+
+`dedup_key` with a partial unique index makes a replayed write collide instead of
+duplicating, and the existing row's id is returned — so a caller that retried gets
+the identifier it would have got the first time.
+
+### `ai_session_events` — bounded, and deliberately thin
+
+What is absent is the point of the table. A row records that a named tool ran,
+whether it reported success, and at most one normalized path. There is no prompt,
+no tool input, no tool result, no error text, no command line.
+
+Rows are pruned to `ATLAS_AI_EVENTS_RETAIN_PER_SESSION`. The prune statement
+addresses `ai_session_events` alone; durable reasons and decisions are in other
+tables and nothing in it can reach them.
+
+### `ai_evidence_links`
+
+Links a model record to the newest `SOURCE` or `GIT` evidence Atlas holds for the
+same path, so a claim and the facts about the same path stay connected without
+either becoming the other. A path with no evidence links nothing, silently: that
+is the normal state of a file Atlas has not indexed yet.
+
+### `ai_checkpoints`
+
+Bounded counters only. The Atlas-owned session state is already in the tables
+above, so a checkpoint records that compaction happened and what the state was —
+never a summary of the conversation.
+
+### `repo_worktree_changes` — per-path change scope
+
+A1 recorded the dirty *counts* per repository, which answers "does this repository
+have staged changes" and not "which paths are staged". An MCP adapter has to
+answer the second from the index, because running git inside the daemon's serve
+loop would let one such question stall every other client for the git timeout.
+
+The reconciliation pass already runs one `git status --porcelain=v2` for the
+counts — `atlas_git_read_worktree_state` is literally `atlas_git_read_status` with
+a NULL callback — so it now records the entries it was already parsing. No extra
+git invocation.
+
+The table is a **snapshot replaced wholesale by each pass**, not a journal: a path
+that is no longer dirty is not a historical fact worth keeping, and history
+already lives in `file_changes`. `generation` is what makes a stale snapshot
+visible.
+
+### What migration 4 creates
+
+Tables: `ai_clients`, `ai_sessions`, `ai_session_repos`, `ai_session_events`,
+`ai_change_sets`, `ai_changed_paths`, `ai_reasons`, `ai_reason_paths`,
+`ai_decisions`, `ai_decision_paths`, `ai_evidence_links`, `ai_checkpoints`,
+`repo_worktree_changes`.
+
+Every one of them references `repositories(id)` or `ai_sessions(id)` with
+`ON DELETE CASCADE`, so `repo remove` remains a pure cascade.

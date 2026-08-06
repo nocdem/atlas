@@ -8,9 +8,10 @@
 #define ATLAS_VERSION_MINOR 1
 #define ATLAS_VERSION_PATCH 0
 #define ATLAS_VERSION_STRING "0.1.0"
-#define ATLAS_PHASE "A1"
+#define ATLAS_PHASE "A2"
 
 #include <stddef.h>
+#include <stdint.h>
 
 #include "atlas/buf.h"
 #include "atlas/datadir.h"
@@ -29,5 +30,9 @@
 const char *atlas_build_compiler(void);
 /* UTC "YYYY-MM-DDTHH:MM:SSZ" for now, written into `out` (>= ATLAS_TS_MAX). */
 void atlas_now_iso8601(char *out, size_t out_size);
+/* The same format, `ms_ago` milliseconds in the past. Used for idle-expiry
+ * cutoffs, which compare as strings because the format sorts lexicographically.
+ * A cutoff earlier than the epoch is clamped rather than wrapped. */
+void atlas_iso8601_before_now(char *out, size_t out_size, int64_t ms_ago);
 
 #endif /* ATLAS_ATLAS_H */

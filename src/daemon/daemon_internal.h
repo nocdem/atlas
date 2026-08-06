@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#include "atlas/ai.h"
 #include "atlas/buf.h"
 #include "atlas/daemon.h"
 #include "atlas/db.h"
@@ -39,7 +40,13 @@ typedef enum atlas_job_kind {
      * read-only handle, so it hands them to the writer rather than acquiring a
      * second write path into the index. */
     ATLAS_JOB_MARK_GAP,
-    ATLAS_JOB_SET_WATCH
+    ATLAS_JOB_SET_WATCH,
+    /* A2. Every AI-session mutation is one job kind carrying one typed
+     * operation, rather than a job kind per verb: the validation happens in the
+     * IPC layer before anything is queued, and the writer's switch stays a
+     * switch rather than becoming a second dispatch table that can drift from
+     * the first. */
+    ATLAS_JOB_AI
 } atlas_job_kind;
 
 typedef struct atlas_job atlas_job;
@@ -53,6 +60,10 @@ struct atlas_job {
     int64_t watched_dirs;
     atlas_buf arg1;    /* repo add: path, repo remove: name, gap/watch: detail */
     atlas_buf arg2;    /* repo add: name (may be empty) */
+    /* repo add: refuse unless `arg1` is itself the worktree root. Set by the
+     * MCP path, where the caller granted one directory and registering its
+     * parent would index what was not granted. */
+    bool exact_root;
     /* Reconcile: repository-relative paths the watcher saw an event for, NUL
      * separated. Each is hashed regardless of its metadata. */
     atlas_buf dirty_paths;
@@ -70,6 +81,12 @@ struct atlas_job {
     int64_t result_id;
     atlas_buf result_name;      /* validated [A-Za-z0-9._-] */
     atlas_buf result_root_text; /* already in the safe text encoding */
+
+    /* A2. The job owns the operation and frees it. The result is typed for the
+     * same reason the fields above are: a JSON fragment carried through here
+     * would have to be spliced into a response verbatim. */
+    atlas_ai_op *ai;
+    atlas_ai_result ai_result;
 };
 
 /* What a completed mutation reports back. */
@@ -107,6 +124,20 @@ atlas_status atlas_writer_submit_reconcile(atlas_writer *w, int64_t repo_id, boo
 atlas_status atlas_writer_call(atlas_writer *w, atlas_job_kind kind, const char *arg1,
                                const char *arg2, int timeout_ms, atlas_writer_result *result,
                                atlas_err *err);
+/* The same, for a repository registration that must not resolve upward. See
+ * `atlas_job.exact_root`. */
+atlas_status atlas_writer_call_repo_add(atlas_writer *w, const char *path, const char *name,
+                                        bool exact_root, int timeout_ms,
+                                        atlas_writer_result *result, atlas_err *err);
+
+/* Queues one AI-session operation and waits for it, bounded by `timeout_ms`.
+ *
+ * Takes ownership of `op` unconditionally — including on the failure paths —
+ * so a caller has exactly one thing to do with it. A correlate operation may ask
+ * for a reconciliation; the writer supplies that callback itself, which is what
+ * keeps src/ai free of any knowledge of the job queue. */
+atlas_status atlas_writer_ai(atlas_writer *w, atlas_ai_op *op, int timeout_ms,
+                             atlas_ai_result *result, atlas_err *err);
 
 /* Records that changes may have been missed for a repository. Fire and forget:
  * the watcher has nothing useful to do with a failure here, and the periodic

@@ -1,0 +1,35 @@
+#!/bin/sh
+# Atlas - the hook launcher.
+# Copyright 2026 The Atlas Authors. Licensed under the Apache License 2.0.
+#
+# Usage: atlas-hook EVENT   (the payload arrives on stdin)
+#
+# Fails open, deliberately and in every direction. If Atlas is not installed,
+# not on PATH, or refuses to run, this prints `{}` and exits 0 — which tells
+# Claude "nothing to add" and leaves the session working normally. A memory
+# system that can break somebody's editing session is a memory system they will
+# turn off.
+#
+# The one thing it will not do is stay silent: a failure goes to stderr, which
+# Claude shows in debug mode, so "Atlas recorded nothing" is discoverable rather
+# than merely true.
+set -u
+
+_dir=$(dirname -- "$0")
+# shellcheck source=./atlas-resolve.sh
+. "${_dir}/atlas-resolve.sh"
+
+if ! atlas_resolve; then
+    printf 'atlas-hook: no atlas executable found; run `atlas integrate claude install --user`\n' >&2
+    printf '{}\n'
+    exit 0
+fi
+
+# `exec` so there is no shell left holding the payload, and so Atlas owns stdin
+# and stdout directly. If the exec itself fails the fallback below still emits a
+# valid document.
+exec "${ATLAS_EXE}" hook "${1:-unknown}" || {
+    printf 'atlas-hook: cannot execute %s\n' "${ATLAS_EXE}" >&2
+    printf '{}\n'
+    exit 0
+}

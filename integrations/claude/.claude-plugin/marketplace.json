@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "atlas-local",
+  "description": "The Atlas engineering-memory plugin, distributed from the Atlas installation itself.",
+  "owner": {
+    "name": "The Atlas Authors"
+  },
+  "plugins": [
+    {
+      "name": "atlas",
+      "source": "./atlas",
+      "description": "Local engineering memory: keeps a git repository indexed, records why files changed, and answers repository questions without guessing.",
+      "version": "0.1.0",
+      "category": "productivity",
+      "tags": [
+        "engineering-memory",
+        "repository-intelligence",
+        "git",
+        "provenance"
+      ],
+      "author": {
+        "name": "The Atlas Authors"
+      },
+      "license": "Apache-2.0"
+    }
+  ]
+}

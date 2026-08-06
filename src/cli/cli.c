@@ -12,7 +12,10 @@
 
 #include "atlas/atlas.h"
 #include "atlas/daemon.h"
+#include "atlas/hook.h"
+#include "atlas/integrate.h"
 #include "atlas/ipc.h"
+#include "atlas/mcp.h"
 #include "atlas/unit.h"
 #include "cli/render.h"
 
@@ -58,6 +61,12 @@ void atlas_cli_print_help(FILE *out) {
         "  service print              print the systemd user unit; changes nothing\n"
         "  service install --user     write the unit; never enables or starts it\n"
         "  service uninstall --user   remove the unit Atlas wrote\n"
+        "  mcp                        serve the Model Context Protocol on stdio\n"
+        "  hook EVENT                 handle one Claude Code hook event on stdin\n"
+        "  integrate claude print     print the one-time setup commands; runs none of them\n"
+        "  integrate claude doctor    check the AI integration end to end\n"
+        "  integrate claude install --user    record where this Atlas is, for the plugin\n"
+        "  integrate claude uninstall --user  remove that record; never the index\n"
         "  version                    print the version\n"
         "  help                       print this help\n"
         "\n"
@@ -439,6 +448,82 @@ static atlas_status run_service(cli_state *st, atlas_err *err) {
     return result;
 }
 
+/* `atlas integrate claude ...`.
+ *
+ * Opens no index and contacts no daemon except to ask whether one is answering.
+ * `install` writes exactly one file, in the user's own configuration directory;
+ * `uninstall` removes that one file and nothing else. Neither ever edits a
+ * Claude-owned file or touches a systemd unit. */
+static atlas_status run_integrate(cli_state *st, atlas_err *err) {
+    if (st->operand_count < 2u || strcmp(st->operands[0], "claude") != 0) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "usage: atlas integrate claude print|doctor|install --user|"
+                             "uninstall --user");
+    }
+    const char *sub = st->operands[1];
+    if (st->operand_count != 2u) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "usage: atlas integrate claude %s", sub);
+    }
+
+    bool install = (strcmp(sub, "install") == 0);
+    bool uninstall = (strcmp(sub, "uninstall") == 0);
+    bool print = (strcmp(sub, "print") == 0);
+    bool doctor = (strcmp(sub, "doctor") == 0);
+    if (!install && !uninstall && !print && !doctor) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "unknown integrate subcommand \"%s\"", sub);
+    }
+    /* --user is required rather than assumed, for the same reason `service
+     * install` requires it: everything Atlas writes here is per-user, and a
+     * command copied from documentation that expected otherwise should fail
+     * loudly instead of quietly doing something else. */
+    if ((install || uninstall) && !st->opts.user) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "atlas integrate claude %s needs --user. Atlas writes a per-user "
+                             "record and never anything system-wide.",
+                             sub);
+    }
+
+    atlas_integrate_report rep;
+    atlas_integrate_report_init(&rep);
+    atlas_status result;
+    if (install) {
+        result = atlas_integrate_claude_install(&rep, err);
+    } else if (uninstall) {
+        result = atlas_integrate_claude_uninstall(&rep, err);
+    } else {
+        result = atlas_integrate_claude_doctor(&rep, err);
+    }
+
+    atlas_buf commands = ATLAS_BUF_INIT;
+    if (result == ATLAS_OK && print) {
+        result = atlas_integrate_claude_commands(&rep, &commands, err);
+    }
+
+    if (result == ATLAS_OK) {
+        atlas_renderer r;
+        char command[64];
+        (void)snprintf(command, sizeof(command), "integrate claude %s", sub);
+        result = renderer_open(&r, st->opts.json, st->out, command, err);
+        if (result == ATLAS_OK) {
+            result = r.v->integrate(&r, &rep, sub, print ? atlas_buf_cstr(&commands) : NULL, err);
+        }
+        if (result == ATLAS_OK) {
+            result = renderer_close(&r, err);
+        } else {
+            renderer_abort(&r);
+        }
+    }
+    /* `doctor` reports a problem through its exit code so it is usable in a
+     * shell conditional, having already written a complete document. */
+    if (result == ATLAS_OK && doctor && !rep.ok) {
+        st->rendered = true;
+        result = ATLAS_ERR_CONFIG;
+    }
+    atlas_buf_free(&commands);
+    atlas_integrate_report_free(&rep);
+    return result;
+}
+
 /* `atlas daemon ping` never opens the index: it answers one question about the
  * socket, and must work even when the index is unreadable. */
 static atlas_status run_daemon_ping(cli_state *st, atlas_err *err) {
@@ -491,6 +576,14 @@ static atlas_status run_daemon_ping(cli_state *st, atlas_err *err) {
  * every read command keep working while the daemon is running. */
 static atlas_ctx_mode mode_for(const cli_state *st) {
     const char *cmd = st->command;
+    /* `doctor` observes and creates nothing: no data directory, no database, no
+     * lock, no migration. A diagnostic that initialises what it is diagnosing
+     * can only ever answer "fine", and it cannot be run at all on a machine
+     * where Atlas has never been used — which is exactly when somebody wants
+     * to run it. */
+    if (strcmp(cmd, "doctor") == 0) {
+        return ATLAS_CTX_INSPECT;
+    }
     if (strcmp(cmd, "scan") == 0) {
         return ATLAS_CTX_WRITE;
     }
@@ -604,6 +697,30 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
     }
     if (strcmp(cmd, "service") == 0) {
         return run_service(st, err);
+    }
+    /* The two adapters own their own I/O completely: `mcp` must put nothing but
+     * protocol messages on stdout, and `hook` must put exactly one JSON object
+     * there. Neither goes through a renderer, and neither opens the index. */
+    if (strcmp(cmd, "mcp") == 0) {
+        if (st->operand_count != 0u) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE, "usage: atlas mcp");
+        }
+        atlas_mcp_opts mopts;
+        atlas_mcp_opts_init(&mopts);
+        mopts.timeout_ms = st->opts.timeout_ms;
+        return atlas_mcp_run(stdin, st->out, st->errout, &mopts, err);
+    }
+    if (strcmp(cmd, "hook") == 0) {
+        if (st->operand_count != 1u) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE, "usage: atlas hook EVENT");
+        }
+        atlas_hook_opts hopts;
+        atlas_hook_opts_init(&hopts);
+        hopts.timeout_ms = st->opts.timeout_ms;
+        return atlas_hook_run(st->operands[0], stdin, st->out, st->errout, &hopts);
+    }
+    if (strcmp(cmd, "integrate") == 0) {
+        return run_integrate(st, err);
     }
 
     /* Mutations go through the daemon when one is running, so that the single

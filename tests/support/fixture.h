@@ -81,6 +81,22 @@ atlas_status fx_tree_digest(const char *dir, char *hex_out, atlas_err *err);
 atlas_status fx_atlas(const char *const *args, size_t nargs, atlas_buf *stdout_out,
                       atlas_buf *stderr_out, int *exit_code, atlas_err *err);
 
+/* --- A2: running an adapter that reads stdin ------------------------------
+ *
+ * `atlas hook` takes its whole input on stdin, and `atlas mcp` takes a stream of
+ * messages there. Neither can go through fx_atlas: atlas_proc_run points a
+ * child's stdin at /dev/null by design, which is right for git and wrong for an
+ * adapter.
+ *
+ * So this forks directly, keeping the same discipline as everything else in the
+ * suite — an explicit argv, an explicitly constructed environment, no shell —
+ * and adds a pipe. stdout and stderr are captured separately, which is what lets
+ * a test assert that a diagnostic went to stderr *and* that stdout carried only
+ * protocol. `extra_env` is a NULL-terminated "K=V" list. */
+atlas_status fx_atlas_stdin(const char *const *args, size_t nargs, const char *const *extra_env,
+                            const void *payload, size_t payload_len, atlas_buf *stdout_out,
+                            atlas_buf *stderr_out, int *exit_code, atlas_err *err);
+
 
 /* --- A1: a live daemon under test ---------------------------------------
  *

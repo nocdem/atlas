@@ -52,6 +52,14 @@ set(ATLAS_TESTS
   test_unit
   test_reconcile
   test_daemon
+  # --- A2 ---
+  test_ai_schema
+  test_ai_trust
+  test_mcp
+  test_mcp_roots
+  test_ai_attribution
+  test_hooks
+  test_plugin
 )
 
 foreach(test_name IN LISTS ATLAS_TESTS)
@@ -70,6 +78,21 @@ set_tests_properties(test_scan test_search test_diff test_worktree test_cli test
   test_git_hardening test_reconcile PROPERTIES LABELS "integration")
 set_tests_properties(test_core test_safetext test_proc test_git_parse test_db test_datadir
   test_lock test_ipc test_migrate3 test_unit PROPERTIES LABELS "unit")
+
+# A2. test_ai_schema drives the storage layer in process; test_mcp and
+# test_plugin fork the binary but need no daemon and no repository.
+set_tests_properties(test_ai_schema test_mcp test_plugin PROPERTIES LABELS "unit")
+# test_ai_trust and test_hooks fork a live daemon and wait on filesystem events,
+# so they carry the daemon label and its serialisation for the same reason
+# test_daemon does: parallel daemons compete for the machine's inotify budget.
+set_tests_properties(test_ai_trust test_hooks test_mcp_roots test_ai_attribution
+  PROPERTIES LABELS "daemon" TIMEOUT 900 RUN_SERIAL TRUE)
+
+# The plugin fixture test reads the shipped plugin from the source tree, so it
+# has to be told where that is rather than guessing from the working directory.
+target_compile_definitions(test_plugin PRIVATE
+  ATLAS_PLUGIN_DIR="${CMAKE_SOURCE_DIR}/integrations/claude/atlas"
+  ATLAS_MARKETPLACE_DIR="${CMAKE_SOURCE_DIR}/integrations/claude")
 
 # The daemon suite forks the real binary and waits on filesystem events, so it is
 # both slower and more timing-sensitive than the rest. It is labelled separately

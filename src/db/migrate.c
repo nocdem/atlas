@@ -327,6 +327,295 @@ static const char *const M3_STATEMENTS[] = {
     M3_FILE_IDENTITY, M3_REPO_INDEX_STATE, M3_REPO_EVENTS, M3_COMMIT_TIPS, M3_DAEMON_STATE, NULL,
 };
 
+/* Migration 4: AI sessions, change sets, change reasons and decisions (A2).
+ *
+ * Nothing here is destructive. Every statement is a CREATE for a new object or
+ * an ALTER TABLE ... ADD COLUMN with a default, so a schema-v3 database migrates
+ * forward with every row intact and no existing table is recreated. There is a
+ * test that seeds a v3 database through the shipped v1..v3 statements, populates
+ * it, migrates it, and asserts every row survives.
+ *
+ * The A0 rule is untouched: `evidence` still CHECKs its six kinds and
+ * `atlas_db_evidence_insert` still refuses everything but SOURCE and GIT. AI
+ * records are a *separate* kind of thing and live in separate tables. Widening
+ * `evidence` to fit them would have made "how does Atlas know this?" and "what
+ * did a model claim?" the same question, which is exactly the confusion A2 has
+ * to avoid. */
+
+/* Provider-neutral client identity. Nothing in the schema names Claude: a
+ * second adapter is another row, not another table. */
+static const char M4_AI_CLIENTS[] =
+    "CREATE TABLE ai_clients ("
+    "  id INTEGER PRIMARY KEY,"
+    "  provider TEXT NOT NULL,"           /* e.g. 'anthropic' */
+    "  name TEXT NOT NULL,"               /* e.g. 'claude-code' */
+    "  first_seen_at TEXT NOT NULL,"
+    "  last_seen_at TEXT NOT NULL,"
+    "  UNIQUE(provider, name)"
+    ");";
+
+/* One row per client session, including resumes and forks.
+ *
+ * `session_key` is the client's own identifier, safe-encoded on the way in. It
+ * is unique per client rather than globally, because two providers may
+ * legitimately choose the same string.
+ *
+ * `parent_id` carries resume and fork lineage, and a subagent is a session with
+ * a parent and an `agent_type`. Modelling a subagent as a session rather than as
+ * a flag means its change set, its reasons and its tool records are separable
+ * from its parent's without a second set of tables. */
+static const char M4_AI_SESSIONS[] =
+    "CREATE TABLE ai_sessions ("
+    "  id INTEGER PRIMARY KEY,"
+    "  client_id INTEGER NOT NULL REFERENCES ai_clients(id) ON DELETE CASCADE,"
+    "  session_key TEXT NOT NULL,"
+    "  parent_id INTEGER REFERENCES ai_sessions(id) ON DELETE SET NULL,"
+    "  agent_id TEXT,"
+    "  agent_type TEXT,"
+    "  client_version TEXT,"
+    "  state TEXT NOT NULL DEFAULT 'open' CHECK(state IN ('open','closed','expired')),"
+    "  started_at TEXT NOT NULL,"
+    "  last_seen_at TEXT NOT NULL,"
+    "  closed_at TEXT,"
+    "  close_reason TEXT,"
+    "  resumes INTEGER NOT NULL DEFAULT 0,"
+    "  compactions INTEGER NOT NULL DEFAULT 0,"
+    "  turns INTEGER NOT NULL DEFAULT 0,"
+    "  tool_calls INTEGER NOT NULL DEFAULT 0,"
+    "  records INTEGER NOT NULL DEFAULT 0,"
+    "  UNIQUE(client_id, session_key)"
+    ");"
+    "CREATE INDEX idx_ai_sessions_state ON ai_sessions(state, last_seen_at);";
+
+/* Which repositories a session has been in. A session that changes directory or
+ * gains a working directory gains a row here rather than replacing its
+ * repository, because work done before the change still belongs to it. */
+static const char M4_AI_SESSION_REPOS[] =
+    "CREATE TABLE ai_session_repos ("
+    "  session_id INTEGER NOT NULL REFERENCES ai_sessions(id) ON DELETE CASCADE,"
+    "  repo_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,"
+    "  attached_at TEXT NOT NULL,"
+    "  source TEXT NOT NULL DEFAULT 'session_start',"
+    "  base_head TEXT,"
+    "  PRIMARY KEY(session_id, repo_id)"
+    ");"
+    "CREATE INDEX idx_ai_session_repos_repo ON ai_session_repos(repo_id);";
+
+/* Ephemeral hook observations. These exist for two reasons: idempotency, and a
+ * bounded audit trail of what a session did.
+ *
+ * What is deliberately absent is the point of the table: no prompt, no tool
+ * input, no tool result, no error text, no command line. A row records that a
+ * named tool ran, whether it reported success, and at most one normalized path.
+ * `dedup_key` makes a redelivered hook collide instead of appending.
+ *
+ * Rows here are pruned to ATLAS_AI_EVENTS_RETAIN_PER_SESSION. Durable reasons
+ * and decisions are never pruned with them. */
+static const char M4_AI_SESSION_EVENTS[] =
+    "CREATE TABLE ai_session_events ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  session_id INTEGER NOT NULL REFERENCES ai_sessions(id) ON DELETE CASCADE,"
+    "  repo_id INTEGER REFERENCES repositories(id) ON DELETE CASCADE,"
+    "  kind TEXT NOT NULL CHECK(kind IN"
+    "    ('session_open','session_resume','session_close','turn','tool_intent','tool_ok',"
+    "     'tool_failed','batch','checkpoint','root_attached','turn_close')),"
+    "  tool_name TEXT,"
+    "  tool_use_id TEXT,"
+    "  path_raw BLOB,"
+    "  path_text TEXT,"
+    "  created_at TEXT NOT NULL,"
+    "  dedup_key TEXT"
+    ");"
+    "CREATE INDEX idx_ai_session_events_session ON ai_session_events(session_id, id);"
+    "CREATE UNIQUE INDEX idx_ai_session_events_dedup ON ai_session_events(session_id, dedup_key)"
+    "  WHERE dedup_key IS NOT NULL;";
+
+/* One change set per session per repository: the window over which that session
+ * was in a position to change that repository. */
+static const char M4_AI_CHANGE_SETS[] =
+    "CREATE TABLE ai_change_sets ("
+    "  id INTEGER PRIMARY KEY,"
+    "  session_id INTEGER NOT NULL REFERENCES ai_sessions(id) ON DELETE CASCADE,"
+    "  repo_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,"
+    "  opened_at TEXT NOT NULL,"
+    "  closed_at TEXT,"
+    "  base_head TEXT,"
+    "  last_head TEXT,"
+    "  base_generation INTEGER NOT NULL DEFAULT 0,"
+    "  last_generation INTEGER NOT NULL DEFAULT 0,"
+    "  truncated INTEGER NOT NULL DEFAULT 0,"
+    "  UNIQUE(session_id, repo_id)"
+    ");"
+    "CREATE INDEX idx_ai_change_sets_repo ON ai_change_sets(repo_id);";
+
+/* Observed changed paths, with how the attribution was arrived at.
+ *
+ * `attribution` is the honest field. 'direct_edit' means this session invoked an
+ * edit tool naming this path AND the index then observed the path change.
+ * 'observed' means only the second half. 'ambiguous' means another session had
+ * the same repository open over the same window, so neither claim is supportable
+ * — and `concurrent_sessions` records how many, so the ambiguity is a number
+ * rather than an adjective.
+ *
+ * Once a row is ambiguous it stays ambiguous: a later direct edit does not
+ * retroactively make an earlier overlapping observation unambiguous. */
+static const char M4_AI_CHANGED_PATHS[] =
+    "CREATE TABLE ai_changed_paths ("
+    "  id INTEGER PRIMARY KEY,"
+    "  change_set_id INTEGER NOT NULL REFERENCES ai_change_sets(id) ON DELETE CASCADE,"
+    "  path_raw BLOB NOT NULL,"
+    "  path_text TEXT NOT NULL,"
+    "  attribution TEXT NOT NULL DEFAULT 'observed' CHECK(attribution IN"
+    "    ('direct_edit','observed','ambiguous')),"
+    "  direct_tool TEXT,"
+    "  first_at TEXT NOT NULL,"
+    "  last_at TEXT NOT NULL,"
+    "  occurrences INTEGER NOT NULL DEFAULT 1,"
+    "  concurrent_sessions INTEGER NOT NULL DEFAULT 0,"
+    "  UNIQUE(change_set_id, path_raw)"
+    ");";
+
+/* Change-reason proposals.
+ *
+ * `approved` exists and is pinned to 0 by a CHECK. That is deliberate: A2 has no
+ * way to prove a human approved anything — an argument claiming approval is a
+ * string a model produced — so rather than leaving the column out and having a
+ * later phase add it, or leaving it writable and having something set it, the
+ * schema states that this phase may not. Lifting the restriction is a migration,
+ * which is a change somebody has to make on purpose.
+ *
+ * `state` distinguishes a recorded reason from a recorded *absence* of one.
+ * 'unknown' is a first-class row, not a missing row: "nobody said why" and
+ * "Atlas was never asked" are different facts and a query has to tell them
+ * apart. */
+static const char M4_AI_REASONS[] =
+    "CREATE TABLE ai_reasons ("
+    "  id INTEGER PRIMARY KEY,"
+    "  session_id INTEGER REFERENCES ai_sessions(id) ON DELETE SET NULL,"
+    "  repo_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,"
+    "  change_set_id INTEGER REFERENCES ai_change_sets(id) ON DELETE SET NULL,"
+    "  created_at TEXT NOT NULL,"
+    "  provenance TEXT NOT NULL CHECK(provenance IN"
+    "    ('MODEL_PROPOSAL','MODEL_INFERENCE','USER_APPROVED_DECISION','UNKNOWN')),"
+    "  state TEXT NOT NULL CHECK(state IN ('proposed','unknown','superseded')),"
+    "  confidence TEXT NOT NULL DEFAULT 'none' CHECK(confidence IN"
+    "    ('none','low','medium','high')),"
+    "  summary TEXT,"
+    "  detail TEXT,"
+    "  unknown_reason TEXT,"
+    "  approved INTEGER NOT NULL DEFAULT 0 CHECK(approved = 0),"
+    "  dedup_key TEXT"
+    ");"
+    "CREATE INDEX idx_ai_reasons_repo ON ai_reasons(repo_id, id DESC);"
+    "CREATE UNIQUE INDEX idx_ai_reasons_dedup ON ai_reasons(repo_id, dedup_key)"
+    "  WHERE dedup_key IS NOT NULL;";
+
+/* The paths a reason concerns, keyed by raw bytes like every other path. */
+static const char M4_AI_REASON_PATHS[] =
+    "CREATE TABLE ai_reason_paths ("
+    "  reason_id INTEGER NOT NULL REFERENCES ai_reasons(id) ON DELETE CASCADE,"
+    "  path_raw BLOB NOT NULL,"
+    "  path_text TEXT NOT NULL,"
+    "  PRIMARY KEY(reason_id, path_raw)"
+    ");"
+    "CREATE INDEX idx_ai_reason_paths_path ON ai_reason_paths(path_raw);";
+
+/* Architectural and implementation decision proposals. Same approval rule. */
+static const char M4_AI_DECISIONS[] =
+    "CREATE TABLE ai_decisions ("
+    "  id INTEGER PRIMARY KEY,"
+    "  session_id INTEGER REFERENCES ai_sessions(id) ON DELETE SET NULL,"
+    "  repo_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,"
+    "  created_at TEXT NOT NULL,"
+    "  provenance TEXT NOT NULL CHECK(provenance IN ('MODEL_PROPOSAL','MODEL_INFERENCE')),"
+    "  state TEXT NOT NULL DEFAULT 'proposed' CHECK(state IN ('proposed','superseded')),"
+    "  title TEXT NOT NULL,"
+    "  statement TEXT NOT NULL,"
+    "  rationale TEXT,"
+    "  approved INTEGER NOT NULL DEFAULT 0 CHECK(approved = 0),"
+    "  dedup_key TEXT"
+    ");"
+    "CREATE INDEX idx_ai_decisions_repo ON ai_decisions(repo_id, id DESC);"
+    "CREATE UNIQUE INDEX idx_ai_decisions_dedup ON ai_decisions(repo_id, dedup_key)"
+    "  WHERE dedup_key IS NOT NULL;";
+
+static const char M4_AI_DECISION_PATHS[] =
+    "CREATE TABLE ai_decision_paths ("
+    "  decision_id INTEGER NOT NULL REFERENCES ai_decisions(id) ON DELETE CASCADE,"
+    "  path_raw BLOB NOT NULL,"
+    "  path_text TEXT NOT NULL,"
+    "  PRIMARY KEY(decision_id, path_raw)"
+    ");"
+    "CREATE INDEX idx_ai_decision_paths_path ON ai_decision_paths(path_raw);";
+
+/* Links a model record to the SOURCE or GIT evidence that existed for the same
+ * path, so "what did a model claim" and "what does Atlas actually know" stay
+ * connected without either becoming the other. */
+static const char M4_AI_EVIDENCE_LINKS[] =
+    "CREATE TABLE ai_evidence_links ("
+    "  id INTEGER PRIMARY KEY,"
+    "  subject_kind TEXT NOT NULL CHECK(subject_kind IN ('reason','decision')),"
+    "  subject_id INTEGER NOT NULL,"
+    "  evidence_id INTEGER NOT NULL REFERENCES evidence(id) ON DELETE CASCADE,"
+    "  UNIQUE(subject_kind, subject_id, evidence_id)"
+    ");";
+
+/* Compaction checkpoints. Bounded counters only: the Atlas-owned session state
+ * is already in the tables above, so a checkpoint records that compaction
+ * happened and what the state was, never a summary of the conversation. */
+static const char M4_AI_CHECKPOINTS[] =
+    "CREATE TABLE ai_checkpoints ("
+    "  id INTEGER PRIMARY KEY,"
+    "  session_id INTEGER NOT NULL REFERENCES ai_sessions(id) ON DELETE CASCADE,"
+    "  created_at TEXT NOT NULL,"
+    "  phase TEXT NOT NULL CHECK(phase IN ('pre_compact','post_compact')),"
+    "  repos INTEGER NOT NULL DEFAULT 0,"
+    "  changed_paths INTEGER NOT NULL DEFAULT 0,"
+    "  unresolved_paths INTEGER NOT NULL DEFAULT 0,"
+    "  reasons INTEGER NOT NULL DEFAULT 0,"
+    "  decisions INTEGER NOT NULL DEFAULT 0,"
+    "  dedup_key TEXT"
+    ");"
+    "CREATE UNIQUE INDEX idx_ai_checkpoints_dedup ON ai_checkpoints(session_id, dedup_key)"
+    "  WHERE dedup_key IS NOT NULL;";
+
+/* Per-path working-tree change scope, as the last reconciliation observed it.
+ *
+ * A1 recorded only the dirty *counts* per repository, which is enough to say
+ * "this repository has staged changes" and not enough to say which paths they
+ * are. A2's changed-files tool has to answer the second question from the index
+ * rather than by running git inside the serve loop, so the reconciliation pass
+ * — which already runs `git status --porcelain=v2` for the counts — now records
+ * the entries it was already parsing.
+ *
+ * The table is a snapshot, not a journal: each pass replaces the repository's
+ * rows wholesale, because a path that is no longer dirty is not a historical
+ * fact worth keeping. `generation` is what makes a stale snapshot visible. */
+static const char M4_WORKTREE_CHANGES[] =
+    "CREATE TABLE repo_worktree_changes ("
+    "  id INTEGER PRIMARY KEY,"
+    "  repo_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,"
+    "  generation INTEGER NOT NULL DEFAULT 0,"
+    "  scope TEXT NOT NULL CHECK(scope IN ('staged','unstaged','untracked','unmerged')),"
+    "  status TEXT NOT NULL,"
+    "  change_type TEXT NOT NULL,"
+    "  path_raw BLOB NOT NULL,"
+    "  path_text TEXT NOT NULL,"
+    "  old_path_raw BLOB,"
+    "  old_path_text TEXT,"
+    "  is_directory INTEGER NOT NULL DEFAULT 0,"
+    "  observed_at TEXT NOT NULL,"
+    "  UNIQUE(repo_id, scope, path_raw)"
+    ");"
+    "CREATE INDEX idx_worktree_changes_repo ON repo_worktree_changes(repo_id, scope);";
+
+static const char *const M4_STATEMENTS[] = {
+    M4_AI_CLIENTS,        M4_AI_SESSIONS,      M4_AI_SESSION_REPOS, M4_AI_SESSION_EVENTS,
+    M4_AI_CHANGE_SETS,    M4_AI_CHANGED_PATHS, M4_AI_REASONS,       M4_AI_REASON_PATHS,
+    M4_AI_DECISIONS,      M4_AI_DECISION_PATHS, M4_AI_EVIDENCE_LINKS, M4_AI_CHECKPOINTS,
+    M4_WORKTREE_CHANGES,  NULL,
+};
+
 static const char *const M1_STATEMENTS[] = {
     M1_BOOKKEEPING, M1_REPOSITORIES,       M1_SCANS,    M1_FILES,
     M1_COMMITS,     M1_FILE_CHANGES,       M1_COMPILE_DATABASES, M1_EVIDENCE,
@@ -337,6 +626,7 @@ static const atlas_migration MIGRATIONS[] = {
     {1, "initial schema", M1_STATEMENTS},
     {2, "worktree identity", M2_STATEMENTS},
     {3, "continuous indexing state", M3_STATEMENTS},
+    {4, "AI sessions, change reasons and decisions", M4_STATEMENTS},
 };
 
 const atlas_migration *atlas_migrations(size_t *count_out) {

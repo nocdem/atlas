@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "memory": {
+      "type": "stdio",
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/atlas-mcp",
+      "args": [],
+      "env": {}
+    }
+  }
+}

@@ -31,6 +31,7 @@
 #include "atlas/safetext.h"
 #include "atlas/service.h"
 #include "daemon/daemon_internal.h"
+#include "ipc/server_internal.h"
 
 /* --- response construction ----------------------------------------------
  *
@@ -145,13 +146,6 @@ static atlas_status build_error(const char *id, const atlas_err *err, atlas_buf 
 
 /* --- method implementations ---------------------------------------------- */
 
-typedef struct dispatch_state {
-    atlas_server_ctx *ctx;
-    atlas_db *db; /* read-only */
-    atlas_json *j;
-    atlas_safe_pool safe;
-} dispatch_state;
-
 static int64_t monotonic_ms(void) {
     struct timespec ts;
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
@@ -264,11 +258,37 @@ static atlas_status method_status(dispatch_state *ds, const atlas_ipc_request *r
     return st;
 }
 
-/* Writes one repository's index state as an object member set. Shared by
- * repo.list and repo.state so the two cannot describe the same repository
- * differently. */
-static atlas_status write_repo_state(dispatch_state *ds, const atlas_repo_info *ri,
-                                     atlas_err *err) {
+bool atlas_server_index_current(const atlas_index_state *s, const char **reason_out) {
+    /* The one claim a caller actually acts on, computed once here rather than
+     * reconstructed by every consumer from the flags. The reason strings are a
+     * fixed Atlas vocabulary: they reach a model's context, so they must not be
+     * assembled from anything a repository can influence. */
+    if (!s->present || s->last_complete_generation <= 0) {
+        *reason_out = "no reconciliation pass has completed for this repository yet";
+        return false;
+    }
+    if (s->event_gap) {
+        *reason_out = "an unresolved event gap means Atlas cannot prove it observed every change";
+        return false;
+    }
+    if (s->pending_full_reconcile) {
+        *reason_out = "a full content verification is owed and has not completed";
+        return false;
+    }
+    if (s->watch_state == ATLAS_WATCH_ERROR) {
+        *reason_out = "the filesystem watcher failed and is not observing this repository";
+        return false;
+    }
+    if (s->watch_state == ATLAS_WATCH_DEGRADED) {
+        *reason_out = "the filesystem watcher is running with a known blind spot";
+        return false;
+    }
+    *reason_out = NULL;
+    return true;
+}
+
+atlas_status atlas_server_write_repo_state(dispatch_state *ds, const atlas_repo_info *ri,
+                                           atlas_err *err) {
     atlas_index_state s;
     atlas_index_state_init(&s);
     atlas_status st = atlas_db_index_state_get(ds->db, ri->id, &s, err);
@@ -331,12 +351,16 @@ static atlas_status write_repo_state(dispatch_state *ds, const atlas_repo_info *
                                 atlas_safe(&ds->safe, atlas_buf_cstr(&s.last_error)), err);
     }
     if (st == ATLAS_OK) {
-        /* The one claim a caller actually acts on, computed once here rather
+        /* The one claim a caller actually acts on, computed in one place rather
          * than reconstructed by every consumer from the flags above. */
-        bool current = s.present && s.last_complete_generation > 0 && !s.event_gap &&
-                       !s.pending_full_reconcile && s.watch_state != ATLAS_WATCH_ERROR &&
-                       s.watch_state != ATLAS_WATCH_DEGRADED;
+        const char *reason = NULL;
+        bool current = atlas_server_index_current(&s, &reason);
         st = atlas_json_key_bool(ds->j, "index_current", current, err);
+        if (st == ATLAS_OK) {
+            /* A fixed Atlas string, never assembled from anything a repository
+             * can influence: it reaches a model's context through ai.context. */
+            st = atlas_json_key_str_opt(ds->j, "not_current_reason", reason, err);
+        }
     }
     atlas_index_state_free(&s);
     return st;
@@ -346,7 +370,7 @@ static atlas_status list_repo_item(const atlas_repo_info *ri, void *ud, atlas_er
     dispatch_state *ds = (dispatch_state *)ud;
     atlas_status st = atlas_json_obj_begin(ds->j, err);
     if (st == ATLAS_OK) {
-        st = write_repo_state(ds, ri, err);
+        st = atlas_server_write_repo_state(ds, ri, err);
     }
     if (st == ATLAS_OK) {
         st = atlas_json_obj_end(ds->j, err);
@@ -371,7 +395,7 @@ static atlas_status method_repo_list(dispatch_state *ds, const atlas_ipc_request
 }
 
 /* Resolves the `repo` parameter, with the same error text the CLI uses. */
-static atlas_status require_repo_param(dispatch_state *ds, const atlas_ipc_request *req,
+atlas_status atlas_server_require_repo(dispatch_state *ds, const atlas_ipc_request *req,
                                        atlas_repo_info *out, atlas_err *err) {
     const char *name = NULL;
     if (!atlas_ipc_param_str(req, "repo", &name)) {
@@ -395,9 +419,9 @@ static atlas_status method_repo_state(dispatch_state *ds, const atlas_ipc_reques
                                       atlas_err *err) {
     atlas_repo_info info;
     atlas_repo_info_init(&info);
-    atlas_status st = require_repo_param(ds, req, &info, err);
+    atlas_status st = atlas_server_require_repo(ds, req, &info, err);
     if (st == ATLAS_OK) {
-        st = write_repo_state(ds, &info, err);
+        st = atlas_server_write_repo_state(ds, &info, err);
     }
     atlas_repo_info_free(&info);
     return st;
@@ -407,7 +431,7 @@ static atlas_status method_repo_sync(dispatch_state *ds, const atlas_ipc_request
                                      atlas_err *err) {
     atlas_repo_info info;
     atlas_repo_info_init(&info);
-    atlas_status st = require_repo_param(ds, req, &info, err);
+    atlas_status st = atlas_server_require_repo(ds, req, &info, err);
     if (st != ATLAS_OK) {
         atlas_repo_info_free(&info);
         return st;
@@ -473,7 +497,7 @@ static atlas_status method_events_since(dispatch_state *ds, const atlas_ipc_requ
                                         atlas_err *err) {
     atlas_repo_info info;
     atlas_repo_info_init(&info);
-    atlas_status st = require_repo_param(ds, req, &info, err);
+    atlas_status st = atlas_server_require_repo(ds, req, &info, err);
     if (st != ATLAS_OK) {
         atlas_repo_info_free(&info);
         return st;
@@ -594,13 +618,7 @@ static atlas_status method_repo_remove(dispatch_state *ds, const atlas_ipc_reque
 
 /* --- dispatch ------------------------------------------------------------ */
 
-typedef atlas_status (*method_fn)(dispatch_state *ds, const atlas_ipc_request *req,
-                                  atlas_err *err);
-
-static const struct {
-    const char *name;
-    method_fn fn;
-} METHODS[] = {
+static const atlas_method_entry METHODS[] = {
     {"daemon.ping", method_ping},
     {"daemon.status", method_status},
     {"repo.list", method_repo_list},
@@ -625,11 +643,25 @@ atlas_status atlas_server_dispatch(atlas_server_ctx *ctx, const void *payload, s
         return build_error("0", &perr, response, err);
     }
 
-    method_fn fn = NULL;
+    /* One dispatch, two groups. The A2 methods live in their own translation
+     * unit so the serve loop is not buried under them, but they are looked up
+     * here rather than by a second dispatcher: two dispatchers is how a method
+     * ends up behaving differently depending on which one found it. */
+    atlas_method_fn fn = NULL;
     for (size_t i = 0; i < sizeof(METHODS) / sizeof(METHODS[0]); i++) {
         if (strcmp(atlas_ipc_request_method(req), METHODS[i].name) == 0) {
             fn = METHODS[i].fn;
             break;
+        }
+    }
+    if (fn == NULL) {
+        size_t n = 0;
+        const atlas_method_entry *ai = atlas_server_ai_methods(&n);
+        for (size_t i = 0; i < n; i++) {
+            if (strcmp(atlas_ipc_request_method(req), ai[i].name) == 0) {
+                fn = ai[i].fn;
+                break;
+            }
         }
     }
     if (fn == NULL) {

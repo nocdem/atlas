@@ -72,26 +72,44 @@ All six acceptance criteria the A0 roadmap set are met:
    ignored subtree; a symlink out of the tree; and the truncation path, in
    `tests/test_reconcile.c` and `tests/test_daemon.c`.
 
-## A2 — Claude Code integration
+## A2 — automatic AI integration (done)
 
-The phase that makes Atlas useful to an agent, and the first one where
-repository text reaches something that interprets it.
+The phase that makes Atlas useful to an agent, and the first one where repository
+text reaches something that interprets it.
 
-- a skill or adapter driving the CLI and the IPC event cursor, so an agent can
-  ask "what changed since I last looked" and get a bounded, resumable answer
-- **a model-context trust boundary**, specified in
-  [ai-trust-boundary.md](ai-trust-boundary.md) before any of it is built
+Delivered, in the same binary:
 
-The rule that governs this phase: **Atlas' safe-text encoding is not a defence
-against prompt injection and cannot be extended into one.** Encoded repository
-prose is terminal-safe and JSON-safe and still semantically untrusted. Raw
-repository text must not be injected as trusted instructions; it enters model
-context as quoted, attributed evidence with its provenance visible, and what an
-adapter is *able* to do is what constrains it, not how carefully it is prompted.
+- `atlas mcp` — a stdio Model Context Protocol server with ten tools, holding no
+  database handle of its own and reaching the index only through the A1 socket
+- `atlas hook <event>` — fifteen Claude Code lifecycle hooks, each of which fails
+  open and stores metadata rather than content
+- `atlas integrate claude print|doctor|install|uninstall` — the Atlas half of a
+  one-time setup, which writes one file and prints the rest
+- migration 4: AI clients, sessions, change sets, attributed changed paths,
+  change-reason and decision proposals, plus a per-path working-tree change
+  snapshot so an adapter never has to run git
+- a Claude Code plugin in `integrations/claude/atlas`, validated by
+  `claude plugin validate --strict`
+- **the model-context trust boundary**, now implemented rather than specified:
+  see [ai-trust-boundary.md](ai-trust-boundary.md) and
+  [claude-integration.md](claude-integration.md)
 
-`UNKNOWN` survives into this phase, and it is a safety property here as much as
-an honesty one: a model that must answer will be pushed toward whatever the
-repository text suggests.
+The rule that governed this phase held: **Atlas' safe-text encoding is not a
+defence against prompt injection and cannot be extended into one.** So automatic
+context contains no repository prose at all — not escaped prose, none — and is
+checked against a fixed character allowlist and a 4 KiB ceiling before it leaves.
+Repository prose reaches a model only through an explicit tool call, labelled
+with its provenance. What constrains the adapter is what it is *able* to do: the
+MCP server cannot open the index, start a daemon, scan a repository, write a file
+or create a process.
+
+`UNKNOWN` survived, and is now a first-class write: `atlas_record_unknown_reason`
+is a tool, and the `Stop` hook records one automatically for every changed path
+nobody explained.
+
+Two things A2 deliberately did **not** do: it records model proposals and has no
+approval workflow, because it cannot prove a human agreed to anything; and it
+does not parse decision documents from the repository, which is A3.
 
 ## A3 — decisions, ADRs and change reasons
 
@@ -133,11 +151,20 @@ that cannot say how it was derived is not reportable.
   recorded
 - an exit-code contract usable as a CI gate, so a stale document can fail a build
 
-## A7 — optional MCP adapter
+## A7 — optional MCP adapter (absorbed into A2)
 
-Only if the CLI, the IPC protocol and the A2 skill turn out to be insufficient.
-An MCP adapter would reuse the same service layer everything else uses, with no
-separate query logic. If A2 is enough, A7 does not get built.
+A7 was conditional: an MCP adapter only if a skill driving the CLI turned out to
+be insufficient. It turned out to be insufficient before it was written, for a
+reason worth recording — a skill driving a CLI cannot *participate* in a session.
+It has no way to notice that a tool ran, no way to correlate what the index
+observed with who was in a position to cause it, and no way to record an
+`UNKNOWN` for something nobody explained. All of that needs hooks, and once the
+hooks exist the query surface may as well be MCP, which the same daemon already
+supports for free.
+
+So MCP shipped in A2, and it obeys the constraint A7 set for it: it reuses the
+service layer through the existing IPC methods and contains no query logic of its
+own. Nothing is deferred here.
 
 ## Invariants that outlive every phase
 

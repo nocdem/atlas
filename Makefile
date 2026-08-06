@@ -26,7 +26,7 @@ BUILD_TSAN    ?= build-tsan
 
 CTEST_FLAGS ?= --output-on-failure
 
-.PHONY: all release debug test test-debug smoke adversarial asan ubsan tsan verify-vendor install clean distclean doctor compiledb help
+.PHONY: all release debug test test-debug smoke adversarial asan ubsan tsan verify-vendor install clean distclean doctor doctor-claude claude-install-test compiledb help
 
 all: release
 
@@ -76,8 +76,30 @@ verify-vendor:
 install: release
 	$(CMAKE) --install $(BUILD_RELEASE) --prefix $(PREFIX)
 
+# Reports the environment without touching it. `atlas doctor` observes in
+# ATLAS_CTX_INSPECT mode: it creates no data directory, no database, no lock and
+# no socket, so this is safe to run on a machine where Atlas has never been used
+# — which is exactly when somebody wants to run it.
+#
+# It deliberately does NOT pass --data-dir. The whole point is to report on the
+# data directory the user's environment resolves to, and reporting on a
+# throwaway one would answer a different question.
 doctor: release
 	./$(BUILD_RELEASE)/atlas doctor
+
+# The same, plus the AI integration. Also side-effect free.
+doctor-claude: release
+	./$(BUILD_RELEASE)/atlas integrate claude doctor
+
+# Drives the real `claude` CLI through the documented permanent installation —
+# marketplace add, install at user scope, list, uninstall — entirely inside a
+# temporary HOME and CLAUDE_CONFIG_DIR. Skips cleanly when claude is absent,
+# because Claude is not a build dependency of Atlas.
+#
+# Not part of `make test`: it needs a program the build does not require, and a
+# suite that silently skips is a suite people stop reading.
+claude-install-test: release
+	sh scripts/claude-install-test.sh $(BUILD_RELEASE)
 
 # Refresh the top-level compile_commands.json symlink for editors and clangd.
 compiledb: release

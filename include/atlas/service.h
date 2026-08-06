@@ -36,6 +36,19 @@ typedef enum atlas_ctx_mode {
     /* Never take the lock. A read-only handle, and a schema mismatch is an error
      * rather than something to migrate away. */
     ATLAS_CTX_READ,
+    /* Observe without creating anything.
+     *
+     * The data directory is not created, the database file is not created, no
+     * lock is taken and no migration runs. A missing data directory or database
+     * is reported through `atlas_ctx_index_present()` rather than being
+     * conjured into existence.
+     *
+     * This exists because a diagnostic that initialises state is not a
+     * diagnostic. `atlas doctor` used to create `~/.local/share/atlas` and an
+     * empty index as a side effect of asking whether one was healthy, which
+     * meant the answer was always yes and the question could not be asked at
+     * all on a machine where Atlas had never run. */
+    ATLAS_CTX_INSPECT,
     /* Take the writer lock or fail. Mutating CLI commands use this, so that a
      * command run by hand while the daemon owns the index is refused with an
      * explanation instead of racing it. */
@@ -56,6 +69,14 @@ atlas_db *atlas_ctx_db(atlas_ctx *ctx);
 /* True when this context holds the writer lock. A context that does not hold it
  * cannot mutate the index, and says so rather than failing at the first write. */
 bool atlas_ctx_is_writer(const atlas_ctx *ctx);
+/* False when the context was opened in ATLAS_CTX_INSPECT mode and there was no
+ * database to open. `atlas_ctx_db` returns NULL in that case, and a caller
+ * reports the absence rather than dereferencing it. */
+bool atlas_ctx_index_present(const atlas_ctx *ctx);
+/* True when the data directory itself does not exist. Distinguished from a
+ * missing database because "Atlas has never run here" and "the index was
+ * deleted" are different things to tell somebody. */
+bool atlas_ctx_data_dir_present(const atlas_ctx *ctx);
 
 /* --- doctor ------------------------------------------------------------- */
 
@@ -70,6 +91,11 @@ typedef struct atlas_doctor_report {
     atlas_buf data_dir;
     atlas_buf db_path;
     atlas_datadir_source data_dir_source;
+    /* Whether there was anything to inspect. Both false on a machine where
+     * Atlas has never run, which is a finding rather than a fault: `doctor`
+     * reports the absence instead of creating an index in order to have one. */
+    bool data_dir_present;
+    bool index_present;
     bool db_ok;
     int schema_version;
     int expected_schema_version;
@@ -162,8 +188,15 @@ atlas_status atlas_service_history(atlas_ctx *ctx, const char *name, const char 
  * the lock ownership left to the caller. The ctx-level functions are thin
  * wrappers over them, so there is one implementation of "register a repository"
  * rather than two that can drift. */
+/* `exact_root` refuses to register when `path` is not itself the worktree root.
+ *
+ * A repository path normally resolves upward: `atlas repo add src/` registers
+ * the whole worktree, which is what a person means. An MCP client granting a
+ * root means something narrower — *this* directory — so registering its parent
+ * would index files outside what was granted. The MCP adapter therefore asks for
+ * the exact form; the CLI and the session-start hook do not. */
 atlas_status atlas_service_repo_add_db(atlas_db *db, const char *path, const char *name,
-                                       atlas_repo_info *out, atlas_err *err);
+                                       bool exact_root, atlas_repo_info *out, atlas_err *err);
 atlas_status atlas_service_repo_remove_db(atlas_db *db, const char *name, atlas_repo_info *removed,
                                           atlas_err *err);
 

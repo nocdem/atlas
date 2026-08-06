@@ -23,6 +23,22 @@ Its protocol is length-framed with a hard size ceiling checked before any payloa
 is read, bounded nesting depth, deadlines on both directions, and no remotely
 callable shutdown. See [docs/daemon-and-ipc.md](docs/daemon-and-ipc.md).
 
+**Since A2 it talks to a language model**, through two adapters that are both
+clients of that same socket. Neither holds a database handle, neither creates a
+process, and neither has a write path to any filesystem. Atlas itself makes no
+LLM API call and needs no network access: Claude is the client, Atlas is the
+local service.
+
+That adds one threat the earlier phases did not have — **prompt injection through
+repository content** — and one control that is genuinely different in kind from
+everything else here. Encoding does not help: "ignore all previous instructions"
+is entirely printable and passes any escaping unchanged. The control is that
+automatic model context contains **no repository prose at all**, enforced by a
+fixed field set, a 4 KiB ceiling and a fixed ASCII character allowlist that the
+renderer checks against its own output. Repository prose reaches a model only
+through an explicit tool call, labelled with its provenance. See
+[docs/ai-trust-boundary.md](docs/ai-trust-boundary.md).
+
 What Atlas does **not** defend against, and does not claim to:
 
 - an attacker who can already run code as the user running Atlas
@@ -32,6 +48,14 @@ What Atlas does **not** defend against, and does not claim to:
 - an attacker who can plant symlinks in the parents of the data directory
   (see [docs/backlog.md](docs/backlog.md) items 1 and 3 — such an attacker
   already has write access to the index)
+- **a model that is persuaded by prose it explicitly asked Atlas for.** Atlas
+  bounds it, labels it and states its provenance; it cannot make it safe. What
+  limits the damage is capability rather than persuasion: an adapter that cannot
+  write, cannot execute and cannot read outside the index has little to be
+  persuaded into.
+- **the truthfulness of what a model records.** A recorded reason is a
+  `MODEL_PROPOSAL`, stored and reported as one. Atlas does not check whether it
+  is true, and deliberately has no way for anything to claim it was approved.
 
 ## Controls
 
@@ -132,10 +156,48 @@ The data directory is created with mode `0700` and the database file with mode
 refuses an empty or relative configured data directory rather than falling back to
 somewhere surprising.
 
+### What an AI session leaves behind
+
+A2 stores session *metadata* and nothing else. This is a privacy control as much
+as a storage one: an engineering-memory tool that quietly accumulated a
+transcript would be a liability sitting in a user's home directory.
+
+Stored: which client and session, which repositories it worked in, which tool
+ran and whether it reported success, at most one normalized repository-relative
+path per tool call, which paths the index observed changing and how they were
+attributed, and the reasons and decisions somebody explicitly asked Atlas to
+record.
+
+**Not stored, and not read:** prompts, assistant messages, transcripts, the
+contents of `transcript_path`, tool inputs, tool results, error text, shell
+commands, `compact_summary`, source snippets, environment variables and
+credentials. The hook adapter reads a fixed list of fields and reaches into
+`tool_input` for exactly one member — a file path — and only for the tools whose
+purpose is to write a named file.
+
+This is verified rather than asserted: `tests/test_hooks.c` drives every
+configured event with payloads containing a fake AWS key, a bearer token, a
+destructive shell command, a private file path and a compaction summary, then
+searches the resulting database **as raw bytes**, so a value written into a
+column nobody thought to check is still caught.
+
+Retention: ephemeral session events are pruned to
+`ATLAS_AI_EVENTS_RETAIN_PER_SESSION` (2000 per session). Durable reasons and
+decisions are never pruned — the prune statement addresses one table and cannot
+reach them. An idle session is expired after 24 hours, and `expired` is kept
+distinct from `closed` because "the client crashed" is a different fact from "the
+user quit".
+
 ### Privileges
 
 Atlas needs no elevated privileges and should not be run with any. Only
 `make install` needs write access to the installation prefix.
+
+`atlas integrate claude install --user` writes exactly one file, mode 0600, in
+the user's own configuration directory, opened `O_NOFOLLOW` because it names an
+executable a launcher will run. It never edits a Claude-owned file, never enables
+or starts a systemd unit, and never runs `claude`. `uninstall` removes that one
+file and never touches the index.
 
 ## Verification
 

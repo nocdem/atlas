@@ -135,8 +135,21 @@ static atlas_status h_doctor(atlas_renderer *r, const atlas_doctor_report *rep, 
     (void)fprintf(o, LABEL "%s (from %s)\n", "data directory",
                   atlas_safe(&r->safe, atlas_buf_cstr(&rep->data_dir)),
                   atlas_datadir_source_name(rep->data_dir_source));
-    (void)fprintf(o, LABEL "%s\n", "database",
-                  atlas_safe(&r->safe, atlas_buf_cstr(&rep->db_path)));
+    (void)fprintf(o, LABEL "%s%s\n", "database",
+                  atlas_safe(&r->safe, atlas_buf_cstr(&rep->db_path)),
+                  rep->index_present ? "" : "  (absent)");
+    if (!rep->index_present) {
+        /* Reported, not created. On a machine where Atlas has never run this is
+         * the whole answer, and it is a correct one. */
+        (void)fprintf(o, LABEL "%s\n", "data directory",
+                      rep->data_dir_present ? "present, no index yet" : "absent");
+        (void)fprintf(o, LABEL "%s\n", "schema version", "- (nothing to inspect)");
+        (void)fprintf(o, LABEL "%s\n", "note",
+                      "no index exists yet; it is created by the first repository "
+                      "registration or by the daemon");
+        (void)fprintf(o, "status: %s\n", rep->ok ? "ok" : "attention needed");
+        return ok();
+    }
     (void)fprintf(o, LABEL "%d (expected %d)\n", "schema version", rep->schema_version,
                   rep->expected_schema_version);
     (void)fprintf(o, LABEL "%s\n", "journal mode", dash_if_empty(rep->journal_mode));
@@ -700,11 +713,87 @@ static atlas_status h_unit_install(atlas_renderer *r, const atlas_unit_install_r
     return ok();
 }
 
+static void h_check(FILE *o, const char *label, bool ok) {
+    (void)fprintf(o, LABEL "%s\n", label, ok ? "yes" : "no");
+}
+
+static atlas_status h_integrate(atlas_renderer *r, const atlas_integrate_report *rep,
+                                const char *action, const char *commands, atlas_err *err) {
+    (void)err;
+    FILE *o = r->out;
+    if (commands != NULL) {
+        (void)fputs(commands, o);
+        return ok();
+    }
+    (void)fprintf(o, LABEL "%s\n", "action", action);
+    /* Paths here come from the environment and from this process's own
+     * executable, so they are encoded like every other value from outside. */
+    (void)fprintf(o, LABEL "%s\n", "executable", atlas_safe(&r->safe, atlas_buf_cstr(&rep->exe)));
+    (void)fprintf(o, LABEL "%s (%s)\n", "plugin",
+                  rep->plugin_found ? atlas_safe(&r->safe, atlas_buf_cstr(&rep->plugin_dir))
+                                    : "not found",
+                  atlas_plugin_source_name(rep->plugin_source));
+    (void)fprintf(o, LABEL "%s\n", "marketplace",
+                  rep->marketplace_dir.len > 0
+                      ? atlas_safe(&r->safe, atlas_buf_cstr(&rep->marketplace_dir))
+                      : "not found");
+    /* The state a user actually needs: installed and enabled, installed and
+     * disabled, development-only, or absent. These are fixed by different
+     * commands, so collapsing them would send somebody to the wrong one. */
+    (void)fprintf(o, LABEL "%s\n", "claude plugin", atlas_claude_state_name(rep->claude_state));
+    if (rep->installed_id.len > 0) {
+        (void)fprintf(o, LABEL "%s (scope %s)\n", "installed as",
+                      atlas_safe(&r->safe, atlas_buf_cstr(&rep->installed_id)),
+                      rep->installed_scope.len > 0 ? atlas_buf_cstr(&rep->installed_scope)
+                                                   : "unknown");
+        (void)fprintf(o, LABEL "%s\n", "plugin cache",
+                      atlas_safe(&r->safe, atlas_buf_cstr(&rep->installed_path)));
+    }
+    h_check(o, "marketplace known", rep->marketplace_registered);
+    (void)fprintf(o, LABEL "%s\n", "config",
+                  atlas_safe(&r->safe, atlas_buf_cstr(&rep->config_path)));
+    h_check(o, "config present", rep->config_present);
+    h_check(o, "manifest", rep->manifest_ok);
+    h_check(o, "hooks.json", rep->hooks_ok);
+    h_check(o, ".mcp.json", rep->mcp_ok);
+    h_check(o, "skill", rep->skill_ok);
+    h_check(o, "launchers", rep->launcher_ok);
+    (void)fprintf(o, LABEL "%lld\n", "hook events", (long long)rep->hook_events);
+    (void)fprintf(o, LABEL "%lld\n", "mcp tools", (long long)rep->mcp_tools);
+    (void)fprintf(o, LABEL "%s\n", "mcp self-test",
+                  atlas_safe(&r->safe, atlas_buf_cstr(&rep->mcp_selftest_detail)));
+    (void)fprintf(o, LABEL "%s\n", "socket",
+                  atlas_safe(&r->safe, atlas_buf_cstr(&rep->socket_path)));
+    h_check(o, "daemon", rep->daemon_reachable);
+    /* Reported, never created. */
+    (void)fprintf(o, LABEL "%s\n", "index", rep->index_present ? "present" : "absent");
+    if (rep->wrote_config) {
+        (void)fprintf(o, LABEL "%s\n", "wrote", "the integration record");
+    }
+    if (rep->removed_config) {
+        (void)fprintf(o, LABEL "%s\n", "removed",
+                      "the integration record (the Atlas index was not touched)");
+    }
+    if (rep->problems.len > 0) {
+        (void)fprintf(o, "\nproblems:\n");
+        const char *p = atlas_buf_cstr(&rep->problems);
+        while (*p != '\0') {
+            const char *nl = strchr(p, '\n');
+            size_t n = (nl != NULL) ? (size_t)(nl - p) : strlen(p);
+            (void)fprintf(o, "  - %s\n", atlas_safe_n(&r->safe, p, n));
+            p = (nl != NULL) ? nl + 1 : p + n;
+        }
+    } else {
+        (void)fprintf(o, LABEL "%s\n", "result", "ready");
+    }
+    return ok();
+}
+
 const atlas_renderer_vtbl ATLAS_RENDERER_HUMAN = {
     h_begin,      h_end,          h_note_repo,    h_note_query,   h_list_begin,
     h_list_end,   h_doctor,       h_version,      h_repo_item,    h_repo_added,
     h_repo_removed, h_scan,       h_status,       h_search_item,  h_file,
     h_history_item, h_diff_begin, h_diff_item,    h_diff_end,
     h_daemon_status, h_daemon_ping, h_repo_state, h_sync,         h_event_item,
-    h_events_end, h_unit_text,    h_unit_install,
+    h_events_end, h_unit_text,    h_unit_install, h_integrate,
 };

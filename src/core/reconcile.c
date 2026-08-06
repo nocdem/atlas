@@ -634,6 +634,148 @@ static atlas_status select_candidates(atlas_db *db, int64_t repo_id, recon_table
 
 /* --- stage 4: apply ------------------------------------------------------ */
 
+/* --- the working-tree change snapshot -----------------------------------
+ *
+ * A1 recorded the dirty *counts* the status invocation produced and threw the
+ * entries away. A2 needs the entries: an MCP adapter has to answer "which paths
+ * are staged" from the index, because running git inside the daemon's serve loop
+ * would let one such question stall every other client for the git timeout.
+ *
+ * This costs no extra git invocation. `atlas_git_read_worktree_state` is already
+ * `atlas_git_read_status` with a NULL callback, so passing one collects records
+ * the parser was producing and discarding.
+ *
+ * Collected in stage 1, alongside everything else observed there, and written in
+ * stage 4 — never inside a transaction that a git process is running under. */
+
+typedef struct wt_change {
+    char scope[16];
+    char status;
+    const char *change_type; /* a static string from atlas_git_change_type_name */
+    char *path;              /* owned */
+    size_t path_len;
+    char *old_path; /* owned; NULL unless rename/copy */
+    size_t old_path_len;
+    bool is_directory;
+} wt_change;
+
+typedef struct wt_snapshot {
+    wt_change *items;
+    size_t count;
+    size_t cap;
+    bool truncated;
+} wt_snapshot;
+
+static void wt_snapshot_free(wt_snapshot *s) {
+    for (size_t i = 0; i < s->count; i++) {
+        free(s->items[i].path);
+        free(s->items[i].old_path);
+    }
+    free(s->items);
+    memset(s, 0, sizeof(*s));
+}
+
+/* Copies raw path bytes. Paths are bytes, so this is memcpy plus a NUL for the
+ * benefit of callers that want a C string, never strdup. */
+static char *dup_bytes(const void *src, size_t n) {
+    char *p = malloc(n + 1u);
+    if (p == NULL) {
+        return NULL;
+    }
+    if (n > 0) {
+        memcpy(p, src, n);
+    }
+    p[n] = '\0';
+    return p;
+}
+
+static atlas_status on_status_change(const atlas_git_status_entry *e, void *ud, atlas_err *err) {
+    wt_snapshot *s = (wt_snapshot *)ud;
+    /* Bounded, and it says so. A repository with a hundred thousand dirty paths
+     * gets a truncated snapshot with `truncated` set, never a silent prefix. */
+    if (s->count >= (size_t)ATLAS_AI_MAX_CHANGED_PATHS) {
+        s->truncated = true;
+        return ATLAS_OK;
+    }
+    if (s->count == s->cap) {
+        size_t cap = s->cap == 0 ? 64u : s->cap * 2u;
+        wt_change *items = realloc(s->items, cap * sizeof(*items));
+        if (items == NULL) {
+            return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                                 "out of memory recording the working-tree change snapshot");
+        }
+        s->items = items;
+        s->cap = cap;
+    }
+    wt_change *w = &s->items[s->count];
+    memset(w, 0, sizeof(*w));
+    (void)snprintf(w->scope, sizeof(w->scope), "%s", atlas_change_scope_name(e->scope));
+    w->status = e->status;
+    w->change_type = atlas_git_change_type_name(e->status);
+    w->is_directory = e->is_directory;
+    w->path = dup_bytes(e->path, e->path_len);
+    if (w->path == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory copying a changed path");
+    }
+    w->path_len = e->path_len;
+    if (e->old_path != NULL && e->old_path_len > 0) {
+        w->old_path = dup_bytes(e->old_path, e->old_path_len);
+        if (w->old_path == NULL) {
+            free(w->path);
+            w->path = NULL;
+            return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory copying a renamed path");
+        }
+        w->old_path_len = e->old_path_len;
+    }
+    s->count++;
+    return ATLAS_OK;
+}
+
+/* Replaces the repository's snapshot in one bounded transaction. */
+static atlas_status apply_wt_snapshot(atlas_db *db, int64_t repo_id, int64_t generation,
+                                      const wt_snapshot *s, atlas_err *err) {
+    atlas_status st = atlas_db_begin(db, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    st = atlas_db_worktree_changes_clear(db, repo_id, err);
+    atlas_buf path_text = ATLAS_BUF_INIT;
+    atlas_buf old_text = ATLAS_BUF_INIT;
+    for (size_t i = 0; st == ATLAS_OK && i < s->count; i++) {
+        const wt_change *w = &s->items[i];
+        atlas_buf_reset(&path_text);
+        atlas_buf_reset(&old_text);
+        st = atlas_path_text_encode(w->path, w->path_len, &path_text, err);
+        if (st == ATLAS_OK && w->old_path != NULL) {
+            st = atlas_path_text_encode(w->old_path, w->old_path_len, &old_text, err);
+        }
+        if (st != ATLAS_OK) {
+            break;
+        }
+        atlas_worktree_change_record rec;
+        memset(&rec, 0, sizeof(rec));
+        rec.scope = w->scope;
+        rec.status = w->status;
+        rec.change_type = w->change_type;
+        rec.path_raw = w->path;
+        rec.path_raw_len = w->path_len;
+        rec.path_text = atlas_buf_cstr(&path_text);
+        rec.old_path_raw = w->old_path;
+        rec.old_path_raw_len = w->old_path_len;
+        rec.old_path_text = w->old_path != NULL ? atlas_buf_cstr(&old_text) : NULL;
+        rec.is_directory = w->is_directory;
+        st = atlas_db_worktree_change_insert(db, repo_id, generation, &rec, err);
+    }
+    atlas_buf_free(&path_text);
+    atlas_buf_free(&old_text);
+    if (st == ATLAS_OK) {
+        st = atlas_db_commit(db, err);
+    } else {
+        atlas_db_rollback(db);
+    }
+    return st;
+}
+
 typedef struct apply_ctx {
     atlas_db *db;
     int64_t repo_id;
@@ -1043,8 +1185,13 @@ atlas_status atlas_reconcile_run(atlas_db *db, atlas_git *g, int64_t repo_id,
         return st;
     }
     atlas_git_worktree_state wt;
-    st = atlas_git_read_worktree_state(g, &wt, err);
+    wt_snapshot wts;
+    memset(&wts, 0, sizeof(wts));
+    /* The same single `git status --porcelain=v2` A1 ran, with a callback
+     * attached so the per-path scope is kept rather than discarded. */
+    st = atlas_git_read_status(g, &wt, on_status_change, &wts, err);
     if (st != ATLAS_OK) {
+        wt_snapshot_free(&wts);
         return st;
     }
     (void)snprintf(summary->head_oid, sizeof(summary->head_oid), "%s", head.oid);
@@ -1241,6 +1388,24 @@ atlas_status atlas_reconcile_run(atlas_db *db, atlas_git *g, int64_t repo_id,
             goto done;
         }
 
+        /* The working-tree change snapshot, in its own bounded transaction. It
+         * is derived from the same observation as the dirty counts written
+         * above, so the two always describe the same instant. */
+        st = apply_wt_snapshot(db, repo_id, generation, &wts, err);
+        if (st != ATLAS_OK) {
+            goto done;
+        }
+        if (wts.truncated && !summary->truncated) {
+            summary->truncated = true;
+            st = atlas_buf_set_str(&summary->truncated_reason,
+                                   "more than the per-repository ceiling of working-tree changes "
+                                   "were observed; the change snapshot is partial",
+                                   err);
+            if (st != ATLAS_OK) {
+                goto done;
+            }
+        }
+
         if (!opts->skip_history) {
             /* History ingestion issues git commands, so it manages its own
              * bounded transaction around the writes rather than running inside
@@ -1317,6 +1482,7 @@ atlas_status atlas_reconcile_run(atlas_db *db, atlas_git *g, int64_t repo_id,
     summary->duration_ms = monotonic_ms() - started;
 
 done:
+    wt_snapshot_free(&wts);
     dirty_set_free(&dirty);
     table_free(&table);
     return st;

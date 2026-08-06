@@ -131,6 +131,10 @@ static atlas_status j_doctor(atlas_renderer *r, const atlas_doctor_report *rep, 
     TRY(atlas_json_key_str(j, "data_dir_source", atlas_datadir_source_name(rep->data_dir_source),
                            err));
     TRY(json_safe(j, p, "db_path", atlas_buf_cstr(&rep->db_path), err));
+    /* Both stated as fields, so a caller can check that `doctor` found an
+     * absent index rather than creating one to find. */
+    TRY(atlas_json_key_bool(j, "data_dir_present", rep->data_dir_present, err));
+    TRY(atlas_json_key_bool(j, "index_present", rep->index_present, err));
     TRY(atlas_json_key_int(j, "schema_version", rep->schema_version, err));
     TRY(atlas_json_key_int(j, "expected_schema_version", rep->expected_schema_version, err));
     TRY(atlas_json_key_bool(j, "schema_current", rep->db_ok, err));
@@ -681,13 +685,63 @@ static atlas_status j_unit_install(atlas_renderer *r, const atlas_unit_install_r
     return atlas_json_key_bool(j, "started", false, err);
 }
 
+static atlas_status j_integrate(atlas_renderer *r, const atlas_integrate_report *rep,
+                                const char *action, const char *commands, atlas_err *err) {
+    atlas_json *j = r->j;
+    TRY(atlas_json_key_str(j, "action", action, err));
+    if (commands != NULL) {
+        /* The commands are Atlas-owned text with one interpolated path, which
+         * `json_safe` encodes like any other value that came from outside. */
+        return json_safe(j, &r->safe, "commands", commands, err);
+    }
+    TRY(json_safe(j, &r->safe, "executable", atlas_buf_cstr(&rep->exe), err));
+    TRY(json_safe(j, &r->safe, "plugin_dir", atlas_buf_cstr(&rep->plugin_dir), err));
+    TRY(json_safe(j, &r->safe, "marketplace_dir", atlas_buf_cstr(&rep->marketplace_dir), err));
+    TRY(atlas_json_key_str(j, "plugin_source", atlas_plugin_source_name(rep->plugin_source), err));
+    TRY(atlas_json_key_bool(j, "plugin_found", rep->plugin_found, err));
+    TRY(atlas_json_key_bool(j, "marketplace_ok", rep->marketplace_ok, err));
+    TRY(atlas_json_key_bool(j, "marketplace_registered", rep->marketplace_registered, err));
+    /* The four load states, distinguished because they are fixed by four
+     * different commands. */
+    TRY(atlas_json_key_str(j, "claude_plugin_state", atlas_claude_state_name(rep->claude_state),
+                           err));
+    TRY(json_safe(j, &r->safe, "claude_config_dir", atlas_buf_cstr(&rep->claude_config_dir), err));
+    TRY(json_safe(j, &r->safe, "installed_id", atlas_buf_cstr(&rep->installed_id), err));
+    TRY(json_safe(j, &r->safe, "installed_scope", atlas_buf_cstr(&rep->installed_scope), err));
+    TRY(json_safe(j, &r->safe, "installed_path", atlas_buf_cstr(&rep->installed_path), err));
+    TRY(atlas_json_key_bool(j, "index_present", rep->index_present, err));
+    TRY(json_safe(j, &r->safe, "config_path", atlas_buf_cstr(&rep->config_path), err));
+    TRY(atlas_json_key_bool(j, "config_present", rep->config_present, err));
+    TRY(atlas_json_key_bool(j, "manifest_ok", rep->manifest_ok, err));
+    TRY(atlas_json_key_bool(j, "hooks_ok", rep->hooks_ok, err));
+    TRY(atlas_json_key_bool(j, "mcp_ok", rep->mcp_ok, err));
+    TRY(atlas_json_key_bool(j, "skill_ok", rep->skill_ok, err));
+    TRY(atlas_json_key_bool(j, "launcher_ok", rep->launcher_ok, err));
+    TRY(atlas_json_key_int(j, "hook_events", rep->hook_events, err));
+    TRY(atlas_json_key_int(j, "mcp_tools", rep->mcp_tools, err));
+    TRY(atlas_json_key_bool(j, "mcp_selftest_ok", rep->mcp_selftest_ok, err));
+    TRY(json_safe(j, &r->safe, "mcp_selftest_detail", atlas_buf_cstr(&rep->mcp_selftest_detail),
+                  err));
+    TRY(json_safe(j, &r->safe, "socket", atlas_buf_cstr(&rep->socket_path), err));
+    TRY(atlas_json_key_bool(j, "daemon_reachable", rep->daemon_reachable, err));
+    TRY(atlas_json_key_bool(j, "wrote_config", rep->wrote_config, err));
+    /* Stated as fields, not only in prose: a caller must be able to check that
+     * an uninstall removed the record and nothing else. */
+    TRY(atlas_json_key_bool(j, "removed_config", rep->removed_config, err));
+    TRY(atlas_json_key_bool(j, "removed_index", false, err));
+    TRY(atlas_json_key_bool(j, "claude_configured", false, err));
+    TRY(atlas_json_key_bool(j, "service_enabled", false, err));
+    TRY(atlas_json_key_bool(j, "ok", rep->ok, err));
+    return json_safe(j, &r->safe, "problems", atlas_buf_cstr(&rep->problems), err);
+}
+
 const atlas_renderer_vtbl ATLAS_RENDERER_JSON = {
     j_begin,      j_end,          j_note_repo,    j_note_query,   j_list_begin,
     j_list_end,   j_doctor,       j_version,      j_repo_item,    j_repo_added,
     j_repo_removed, j_scan,       j_status,       j_search_item,  j_file,
     j_history_item, j_diff_begin, j_diff_item,    j_diff_end,
     j_daemon_status, j_daemon_ping, j_repo_state, j_sync,         j_event_item,
-    j_events_end, j_unit_text,    j_unit_install,
+    j_events_end, j_unit_text,    j_unit_install, j_integrate,
 };
 
 void atlas_render_error(FILE *out, FILE *errout, bool json, const char *command,

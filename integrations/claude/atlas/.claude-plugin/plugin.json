@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "atlas",
+  "displayName": "Atlas engineering memory",
+  "version": "0.1.0",
+  "description": "Local engineering memory: keeps a git repository indexed, records why files changed, and answers repository questions without guessing.",
+  "author": {
+    "name": "The Atlas Authors"
+  },
+  "homepage": "https://github.com/atlas-eng/atlas",
+  "repository": "https://github.com/atlas-eng/atlas",
+  "license": "Apache-2.0",
+  "keywords": [
+    "engineering-memory",
+    "repository-intelligence",
+    "git",
+    "provenance"
+  ]
+}

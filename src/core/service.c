@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include "atlas/atlas.h"
 #include "atlas/lock.h"
@@ -22,6 +23,9 @@ struct atlas_ctx {
     atlas_datadir_source data_dir_source;
     atlas_db *db;
     atlas_lock *lock; /* NULL when this context is not the writer */
+    /* INSPECT mode only: what was found without creating anything. */
+    bool data_dir_present;
+    bool index_present;
 };
 
 atlas_status atlas_ctx_open(const atlas_ctx_opts *opts, atlas_ctx **out, atlas_err *err) {
@@ -37,7 +41,9 @@ atlas_status atlas_ctx_open(const atlas_ctx_opts *opts, atlas_ctx **out, atlas_e
     atlas_ctx_mode mode = (opts != NULL) ? opts->mode : ATLAS_CTX_AUTO;
     atlas_status st =
         atlas_datadir_resolve(override, &ctx->data_dir, &ctx->data_dir_source, err);
-    if (st == ATLAS_OK) {
+    /* INSPECT resolves where things would be and creates none of them. Every
+     * other mode ensures the directory, because it is about to write there. */
+    if (st == ATLAS_OK && mode != ATLAS_CTX_INSPECT) {
         st = atlas_datadir_ensure(atlas_buf_cstr(&ctx->data_dir), err);
     }
     if (st == ATLAS_OK) {
@@ -47,6 +53,33 @@ atlas_status atlas_ctx_open(const atlas_ctx_opts *opts, atlas_ctx **out, atlas_e
         atlas_ctx_close(ctx);
         return st;
     }
+
+    if (mode == ATLAS_CTX_INSPECT) {
+        /* Observe, and stop. No directory is created, no lock is taken, no
+         * database file is opened for writing and no migration runs. An absent
+         * index is a finding to report, not a condition to fix: a diagnostic
+         * that initialises what it is diagnosing can only ever answer "fine". */
+        struct stat sb;
+        ctx->data_dir_present =
+            stat(atlas_buf_cstr(&ctx->data_dir), &sb) == 0 && S_ISDIR(sb.st_mode);
+        ctx->index_present =
+            stat(atlas_buf_cstr(&ctx->db_path), &sb) == 0 && S_ISREG(sb.st_mode);
+        if (ctx->index_present) {
+            /* Read-only, so it cannot create, migrate or take the write lock.
+             * A schema skew is reported by the caller rather than repaired. */
+            atlas_err open_err;
+            atlas_err_init(&open_err);
+            if (atlas_db_open_readonly(atlas_buf_cstr(&ctx->db_path), &ctx->db, &open_err) !=
+                ATLAS_OK) {
+                ctx->db = NULL;
+                ctx->index_present = false;
+            }
+        }
+        *out = ctx;
+        return ATLAS_OK;
+    }
+    ctx->data_dir_present = true;
+    ctx->index_present = true;
 
     /* Exactly one process writes at a time.
      *
@@ -109,6 +142,14 @@ void atlas_ctx_close(atlas_ctx *ctx) {
 
 bool atlas_ctx_is_writer(const atlas_ctx *ctx) {
     return ctx != NULL && ctx->lock != NULL;
+}
+
+bool atlas_ctx_index_present(const atlas_ctx *ctx) {
+    return ctx != NULL && ctx->index_present && ctx->db != NULL;
+}
+
+bool atlas_ctx_data_dir_present(const atlas_ctx *ctx) {
+    return ctx != NULL && ctx->data_dir_present;
 }
 
 const char *atlas_ctx_data_dir(const atlas_ctx *ctx) {
@@ -250,6 +291,25 @@ atlas_status atlas_service_doctor(atlas_ctx *ctx, atlas_doctor_report *out, atla
         return st;
     }
     out->data_dir_source = ctx->data_dir_source;
+    out->data_dir_present = atlas_ctx_data_dir_present(ctx);
+    out->index_present = atlas_ctx_index_present(ctx);
+
+    if (!out->index_present) {
+        /* Nothing to inspect, and nothing is created in order to have something
+         * to inspect. An absent index on a machine where Atlas has never run is
+         * the correct state, so it is reported as a finding and not as a
+         * problem — `atlas doctor` on a fresh account exits 0 and says the
+         * index is absent. */
+        out->schema_version = 0;
+        out->expected_schema_version = ATLAS_SCHEMA_VERSION;
+        out->db_ok = false;
+        out->search_mode = ATLAS_SEARCH_DEGRADED_LIKE;
+        st = atlas_buf_set_str(&out->integrity, "not checked: no index", err);
+        if (st == ATLAS_OK) {
+            st = atlas_buf_set_str(&out->foreign_key_check, "not checked: no index", err);
+        }
+        return st;
+    }
 
     const atlas_db_caps *caps = atlas_db_caps_of(ctx->db);
     out->fts5 = caps->fts5;
@@ -339,15 +399,34 @@ static atlas_status derive_name(const char *root, char *out, size_t out_size, at
 
 atlas_status atlas_service_repo_add(atlas_ctx *ctx, const char *path, const char *name,
                                     atlas_repo_info *out, atlas_err *err) {
-    return atlas_service_repo_add_db(ctx->db, path, name, out, err);
+    return atlas_service_repo_add_db(ctx->db, path, name, false, out, err);
 }
 
 atlas_status atlas_service_repo_add_db(atlas_db *db, const char *path, const char *name,
-                                       atlas_repo_info *out, atlas_err *err) {
+                                       bool exact_root, atlas_repo_info *out, atlas_err *err) {
     atlas_git *g = NULL;
     atlas_status st = atlas_git_open(path, &g, err);
     if (st != ATLAS_OK) {
         return st;
+    }
+
+    /* Registration must not reach outside what the caller named.
+     *
+     * `atlas_git_open` canonicalises to the worktree root, which for a
+     * subdirectory is an *ancestor* of the path it was given. For a person
+     * running `atlas repo add src/` that is the helpful thing to do. For an MCP
+     * client that granted exactly one directory it is not: indexing the parent
+     * would index files the client did not grant. So the exact form refuses,
+     * before anything is inserted, and says which directory it would have
+     * registered instead. */
+    if (exact_root && strcmp(atlas_git_root(g), path) != 0) {
+        atlas_status refuse = atlas_err_set(
+            err, ATLAS_ERR_REPO,
+            "this directory is inside a git worktree rooted elsewhere, and Atlas was asked to "
+            "register only the exact directory given. Grant the worktree root instead, or "
+            "register it deliberately with `atlas repo add`.");
+        atlas_git_close(g);
+        return refuse;
     }
 
     char derived[ATLAS_NAME_MAX + 1u];

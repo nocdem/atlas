@@ -279,6 +279,59 @@ bool atlas_ipc_param_int(const atlas_ipc_request *req, const char *key, int64_t 
     return false;
 }
 
+bool atlas_ipc_param_array(const atlas_ipc_request *req, const char *key,
+                           const atlas_ipc_array **out) {
+    *out = NULL;
+    if (req->params == NULL) {
+        return false;
+    }
+    yyjson_val *v = yyjson_obj_get(req->params, key);
+    if (v == NULL || !yyjson_is_arr(v)) {
+        return false;
+    }
+    /* The handle is the yyjson value itself, borrowed from the parsed document.
+     * The opaque type is what keeps yyjson inside src/ipc; the cast is the seam
+     * and it is the only one. */
+    *out = (const atlas_ipc_array *)v;
+    return true;
+}
+
+size_t atlas_ipc_array_len(const atlas_ipc_array *arr) {
+    if (arr == NULL) {
+        return 0;
+    }
+    union {
+        const atlas_ipc_array *in;
+        yyjson_val *out;
+    } cast;
+    cast.in = arr;
+    return yyjson_arr_size(cast.out);
+}
+
+bool atlas_ipc_array_str(const atlas_ipc_array *arr, size_t index, const char **out) {
+    *out = NULL;
+    if (arr == NULL) {
+        return false;
+    }
+    union {
+        const atlas_ipc_array *in;
+        yyjson_val *out;
+    } cast;
+    cast.in = arr;
+    yyjson_val *v = yyjson_arr_get(cast.out, index);
+    if (v == NULL || !yyjson_is_str(v)) {
+        return false;
+    }
+    const char *s = yyjson_get_str(v);
+    if (s == NULL || strlen(s) != yyjson_get_len(v)) {
+        /* An embedded NUL would make the C string shorter than the JSON string,
+         * so the two halves of Atlas would disagree about the value. */
+        return false;
+    }
+    *out = s;
+    return true;
+}
+
 bool atlas_ipc_param_bool(const atlas_ipc_request *req, const char *key, bool *out) {
     *out = false;
     if (req->params == NULL) {

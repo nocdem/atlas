@@ -131,6 +131,17 @@ add_library(atlas_core STATIC
   src/daemon/watch.c
   src/daemon/daemon.c
   src/core/service_daemon.c
+  # --- A2: AI session model, MCP adapter, hook adapter, integration ------
+  src/db/db_ai.c
+  src/ai/ai.c
+  src/ai/context.c
+  src/ipc/reply.c
+  src/ipc/json_read.c
+  src/ipc/server_ai.c
+  src/hook/hook.c
+  src/mcp/mcp.c
+  src/mcp/mcp_tools.c
+  src/core/integrate.c
 )
 
 target_include_directories(atlas_core
@@ -157,6 +168,21 @@ target_compile_definitions(atlas PRIVATE _POSIX_C_SOURCE=200809L)
 atlas_set_warnings(atlas)
 
 install(TARGETS atlas RUNTIME DESTINATION bin)
+
+# The Claude Code marketplace and the plugin inside it are data, not build
+# artefacts. The whole directory is installed — catalog and plugin together —
+# because `claude plugin marketplace add` points at the catalog and the catalog
+# refers to the plugin by a relative `./atlas` source, so the two have to keep
+# their relationship on disk.
+#
+# It goes under <prefix>/share so it stays put: Claude copies an installed
+# plugin into its own cache at a path that changes on every update, and nothing
+# inside that copy can hold a stable path back to this binary. The launchers
+# keep their executable bit through both copies.
+install(DIRECTORY integrations/claude/
+  DESTINATION share/atlas/claude-marketplace
+  USE_SOURCE_PERMISSIONS
+)
 
 # --- tests ------------------------------------------------------------------
 

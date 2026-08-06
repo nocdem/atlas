@@ -20,7 +20,7 @@
 #include "atlas/error.h"
 #include "atlas/limits.h"
 
-#define ATLAS_SCHEMA_VERSION 3
+#define ATLAS_SCHEMA_VERSION 4
 
 typedef struct atlas_db atlas_db;
 
@@ -307,6 +307,19 @@ atlas_status atlas_db_repo_get(atlas_db *db, const char *name, atlas_repo_info *
                                atlas_err *err);
 atlas_status atlas_db_repo_get_by_root(atlas_db *db, const void *root_raw, size_t root_len,
                                        atlas_repo_info *out, bool *found, atlas_err *err);
+/* Finds the registered worktree that contains `path`, which may be the root
+ * itself or any directory beneath it.
+ *
+ * A2 needs this because an adapter observes a working directory, not a
+ * repository: a hook's cwd is normally a subdirectory and a tool's path always
+ * is. The search is longest-match, walking up one component at a time, so a
+ * linked worktree registered inside another repository's tree resolves to
+ * itself rather than to its container. `/` is never a match.
+ *
+ * `*found_out` is false rather than an error when nothing matches: an
+ * unregistered directory is an ordinary state, and the caller decides. */
+atlas_status atlas_db_repo_get_containing(atlas_db *db, const void *path, size_t path_len,
+                                          atlas_repo_info *out, bool *found_out, atlas_err *err);
 /* Looks a repository up by its row id. The daemon queues work by id so that a
  * rename or removal between queueing and running resolves to nothing rather than
  * to a different repository. */
@@ -582,6 +595,300 @@ atlas_status atlas_db_file_identity(atlas_db *db, int64_t repo_id, const void *p
  * like "the file has no hash now", which is a different fact entirely. */
 atlas_status atlas_db_file_touch(atlas_db *db, int64_t file_id, int64_t scan_id,
                                  int64_t generation, const atlas_fs_identity *fs, atlas_err *err);
+
+/* --- A2: per-path working-tree change scope -----------------------------
+ *
+ * A1 recorded the dirty counts per repository. That answers "does this
+ * repository have staged changes" and not "which paths are staged", and an MCP
+ * adapter must answer the second from the index rather than by running git in
+ * the daemon's serve loop.
+ *
+ * The reconciliation pass already runs one `git status --porcelain=v2` for the
+ * counts, so it now records the entries it was already parsing. The table is a
+ * snapshot replaced wholesale by each pass, not a journal: a path that is no
+ * longer dirty is not a historical fact worth keeping, and history already
+ * lives in `file_changes`. */
+typedef struct atlas_worktree_change_record {
+    const char *scope;       /* staged | unstaged | untracked | unmerged */
+    char status;             /* git's own letter */
+    const char *change_type; /* the Atlas change-type name */
+    const void *path_raw;
+    size_t path_raw_len;
+    const char *path_text;
+    const void *old_path_raw; /* NULL unless rename/copy */
+    size_t old_path_raw_len;
+    const char *old_path_text;
+    bool is_directory;
+} atlas_worktree_change_record;
+
+typedef struct atlas_worktree_change_row {
+    int64_t id;
+    int64_t generation;
+    const char *scope;
+    const char *status;
+    const char *change_type;
+    const void *path_raw;
+    size_t path_raw_len;
+    const char *path_text;
+    const char *old_path_text; /* NULL unless rename/copy */
+    bool is_directory;
+    const char *observed_at;
+} atlas_worktree_change_row;
+
+typedef atlas_status (*atlas_worktree_change_cb)(const atlas_worktree_change_row *row, void *ud,
+                                                 atlas_err *err);
+
+/* Replaces the repository's snapshot. Called inside the pass's apply stage. */
+atlas_status atlas_db_worktree_changes_clear(atlas_db *db, int64_t repo_id, atlas_err *err);
+atlas_status atlas_db_worktree_change_insert(atlas_db *db, int64_t repo_id, int64_t generation,
+                                             const atlas_worktree_change_record *rec,
+                                             atlas_err *err);
+/* Streams the snapshot. `scope` may be NULL for every scope. Requests one row
+ * more than `limit` and never delivers it, so `more` is a fact rather than an
+ * inference from a full page. `after_id` is the exclusive cursor. */
+atlas_status atlas_db_worktree_changes_list(atlas_db *db, int64_t repo_id, const char *scope,
+                                            int64_t after_id, int64_t limit,
+                                            atlas_worktree_change_cb cb, void *ud,
+                                            int64_t *count_out, int64_t *cursor_out,
+                                            bool *more_out, atlas_err *err);
+atlas_status atlas_db_worktree_changes_count(atlas_db *db, int64_t repo_id, int64_t *staged,
+                                             int64_t *unstaged, int64_t *untracked,
+                                             int64_t *unmerged, atlas_err *err);
+
+/* --- A2: AI sessions, change sets, reasons and decisions ------------------
+ *
+ * Typed operations over the migration-4 tables. sqlite3 types stay in src/db as
+ * everywhere else; the provider-neutral behaviour on top of these lives in
+ * src/ai.
+ *
+ * The A0 evidence restriction is untouched by all of this: nothing here writes
+ * to `evidence`, and `atlas_db_evidence_insert` still refuses everything but
+ * SOURCE and GIT. */
+
+/* One session as a reader sees it. Owned buffers, so `_init`/`_free` as usual. */
+typedef struct atlas_ai_session_report {
+    int64_t id;
+    atlas_buf provider;
+    atlas_buf client;
+    atlas_buf session_key;
+    atlas_buf agent_type; /* empty for a main session rather than a subagent */
+    char state[16];       /* open | closed | expired */
+    char started_at[ATLAS_TS_MAX];
+    char last_seen_at[ATLAS_TS_MAX];
+    int64_t turns;
+    int64_t tool_calls;
+    int64_t records;
+    int64_t compactions;
+    int64_t resumes;
+    int64_t repos;
+    bool present;
+} atlas_ai_session_report;
+
+void atlas_ai_session_report_init(atlas_ai_session_report *r);
+void atlas_ai_session_report_free(atlas_ai_session_report *r);
+
+/* Borrowed row pointers, valid only for the duration of the callback, exactly
+ * like every other row callback in this header. */
+typedef struct atlas_ai_reason_row {
+    int64_t id;
+    int64_t session_id;
+    const char *created_at;
+    const char *provenance;
+    const char *state; /* proposed | unknown | superseded */
+    const char *confidence;
+    const char *summary;        /* model-authored, safe-encoded, bounded */
+    const char *detail;         /* NULL when none */
+    const char *unknown_reason; /* NULL unless the state is unknown */
+    int64_t path_count;
+    bool approved; /* always false in A2; the column CHECKs it */
+} atlas_ai_reason_row;
+
+typedef struct atlas_ai_decision_row {
+    int64_t id;
+    int64_t session_id;
+    const char *created_at;
+    const char *provenance;
+    const char *state;
+    const char *title;
+    const char *statement;
+    const char *rationale; /* NULL when none */
+    int64_t path_count;
+    bool approved; /* always false in A2 */
+} atlas_ai_decision_row;
+
+typedef struct atlas_ai_changed_row {
+    const void *path_raw; /* the key; borrowed for the call only */
+    size_t path_raw_len;
+    const char *path_text; /* already in the safe encoding */
+    const char *attribution;
+    const char *direct_tool; /* NULL unless the attribution is direct_edit */
+    const char *first_at;
+    const char *last_at;
+    int64_t occurrences;
+    int64_t concurrent_sessions;
+    bool has_reason;
+} atlas_ai_changed_row;
+
+typedef atlas_status (*atlas_ai_reason_cb)(const atlas_ai_reason_row *row, void *ud,
+                                           atlas_err *err);
+typedef atlas_status (*atlas_ai_decision_cb)(const atlas_ai_decision_row *row, void *ud,
+                                             atlas_err *err);
+typedef atlas_status (*atlas_ai_changed_cb)(const atlas_ai_changed_row *row, void *ud,
+                                            atlas_err *err);
+
+atlas_status atlas_db_ai_client_upsert(atlas_db *db, const char *provider, const char *name,
+                                       int64_t *id_out, atlas_err *err);
+/* The read-only half of the pair. `*id_out` is 0 when this provider/client has
+ * never been seen. Exists because the read methods run on a read-only handle
+ * and must not create a client row merely by asking a question. */
+atlas_status atlas_db_ai_client_find(atlas_db *db, const char *provider, const char *name,
+                                     int64_t *id_out, atlas_err *err);
+
+/* Finds a session by its client-chosen key. `*id_out` is 0 when there is none,
+ * which is not an error: a hook for a session Atlas never saw is normal.
+ *
+ * The lookup is `(client_id, session_key)` and nothing else. There is
+ * deliberately no "find a session for this repository" query: a repository does
+ * not identify a session, and choosing one by recency attributes a record to
+ * whichever session happened to be touched last. */
+atlas_status atlas_db_ai_session_find(atlas_db *db, int64_t client_id, const char *session_key,
+                                      int64_t *id_out, atlas_err *err);
+/* The same lookup, also reporting whether the session is open.
+ *
+ * The state is a separate output rather than a filter because the two facts are
+ * different: "no session has this key" and "the session with this key has
+ * ended" lead to different, and differently reported, outcomes. */
+atlas_status atlas_db_ai_session_find_state(atlas_db *db, int64_t client_id,
+                                            const char *session_key, int64_t *id_out,
+                                            bool *open_out, atlas_err *err);
+/* Opens or resumes. An existing row is resumed — its `resumes` counter is
+ * incremented and its state returns to open — rather than replaced, so a resume
+ * keeps the change set the session already has. */
+atlas_status atlas_db_ai_session_open(atlas_db *db, int64_t client_id, const char *session_key,
+                                      int64_t parent_id, const char *agent_id,
+                                      const char *agent_type, const char *client_version,
+                                      int64_t *id_out, bool *created_out, atlas_err *err);
+/* Bumps `last_seen_at` and, when the counter name is given, one bounded counter
+ * of `turns`, `tool_calls`, `records` or `compactions`. */
+atlas_status atlas_db_ai_session_touch(atlas_db *db, int64_t session_id, const char *counter,
+                                       atlas_err *err);
+atlas_status atlas_db_ai_session_close(atlas_db *db, int64_t session_id, const char *reason,
+                                       atlas_err *err);
+/* Marks every open session untouched since `cutoff_iso` as expired. A client
+ * that vanished must not hold a change set open forever. */
+atlas_status atlas_db_ai_sessions_expire(atlas_db *db, const char *cutoff_iso, int64_t *count_out,
+                                         atlas_err *err);
+atlas_status atlas_db_ai_session_get(atlas_db *db, int64_t client_id, const char *session_key,
+                                     atlas_ai_session_report *out, atlas_err *err);
+
+atlas_status atlas_db_ai_session_attach_repo(atlas_db *db, int64_t session_id, int64_t repo_id,
+                                             const char *source, const char *base_head,
+                                             atlas_err *err);
+
+atlas_status atlas_db_ai_event_append(atlas_db *db, int64_t session_id, int64_t repo_id,
+                                      const char *kind, const char *tool_name,
+                                      const char *tool_use_id, const void *path_raw,
+                                      size_t path_len, const char *path_text,
+                                      const char *dedup_key, bool *inserted_out, atlas_err *err);
+atlas_status atlas_db_ai_events_prune(atlas_db *db, int64_t session_id, int64_t retain,
+                                      int64_t *removed_out, atlas_err *err);
+/* The most recent intent recorded for a path in this session, so a batch can
+ * tell a path this session edited from one that merely changed. `*found_out` is
+ * false when there is none. `tool_out` receives the tool name. */
+atlas_status atlas_db_ai_event_intent_for_path(atlas_db *db, int64_t session_id,
+                                               const void *path_raw, size_t path_len,
+                                               atlas_buf *tool_out, bool *found_out,
+                                               atlas_err *err);
+
+atlas_status atlas_db_ai_change_set_ensure(atlas_db *db, int64_t session_id, int64_t repo_id,
+                                           const char *base_head, int64_t base_generation,
+                                           int64_t *id_out, atlas_err *err);
+atlas_status atlas_db_ai_change_set_find(atlas_db *db, int64_t session_id, int64_t repo_id,
+                                         int64_t *id_out, atlas_err *err);
+/* Records or refreshes one observed changed path.
+ *
+ * Attribution never improves: a row already marked ambiguous stays ambiguous,
+ * because a later unambiguous observation does not retroactively resolve an
+ * earlier overlapping one. */
+atlas_status atlas_db_ai_changed_path_record(atlas_db *db, int64_t change_set_id,
+                                             const void *path_raw, size_t path_len,
+                                             const char *path_text, const char *attribution,
+                                             const char *direct_tool, int64_t concurrent_sessions,
+                                             atlas_err *err);
+atlas_status atlas_db_ai_changed_counts(atlas_db *db, int64_t change_set_id, int64_t *total,
+                                        int64_t *direct, int64_t *ambiguous, int64_t *unresolved,
+                                        atlas_err *err);
+atlas_status atlas_db_ai_changed_list(atlas_db *db, int64_t change_set_id, int64_t limit,
+                                      atlas_ai_changed_cb cb, void *ud, int64_t *count_out,
+                                      bool *more_out, atlas_err *err);
+/* How many *other* sessions currently have this repository open. */
+atlas_status atlas_db_ai_concurrent_sessions(atlas_db *db, int64_t repo_id, int64_t except_session,
+                                             int64_t *count_out, atlas_err *err);
+
+/* A durable record. `dedup_key` may be NULL; when it is not, replaying the same
+ * request collides on a partial unique index instead of creating a second row. */
+typedef struct atlas_ai_record_input {
+    int64_t session_id; /* 0 for none */
+    int64_t repo_id;
+    int64_t change_set_id; /* 0 for none */
+    const char *provenance;
+    const char *state;
+    const char *confidence;
+    const char *summary;
+    const char *detail;
+    const char *unknown_reason;
+    const char *title;
+    const char *statement;
+    const char *rationale;
+    const char *dedup_key;
+} atlas_ai_record_input;
+
+atlas_status atlas_db_ai_reason_insert(atlas_db *db, const atlas_ai_record_input *in,
+                                       int64_t *id_out, bool *duplicate_out, atlas_err *err);
+atlas_status atlas_db_ai_reason_path_add(atlas_db *db, int64_t reason_id, const void *path_raw,
+                                         size_t path_len, const char *path_text, atlas_err *err);
+atlas_status atlas_db_ai_decision_insert(atlas_db *db, const atlas_ai_record_input *in,
+                                         int64_t *id_out, bool *duplicate_out, atlas_err *err);
+atlas_status atlas_db_ai_decision_path_add(atlas_db *db, int64_t decision_id, const void *path_raw,
+                                           size_t path_len, const char *path_text, atlas_err *err);
+/* Links a record to the newest SOURCE or GIT evidence Atlas holds for a path,
+ * so a model claim and the facts about the same path stay connected without
+ * either becoming the other. A path with no evidence links nothing, silently:
+ * that is the normal case for a file Atlas has not indexed yet. */
+atlas_status atlas_db_ai_evidence_link(atlas_db *db, const char *subject_kind, int64_t subject_id,
+                                       int64_t repo_id, const void *path_raw, size_t path_len,
+                                       atlas_err *err);
+
+atlas_status atlas_db_ai_checkpoint_insert(atlas_db *db, int64_t session_id, const char *phase,
+                                           int64_t repos, int64_t changed_paths,
+                                           int64_t unresolved_paths, int64_t reasons,
+                                           int64_t decisions, const char *dedup_key,
+                                           bool *inserted_out, atlas_err *err);
+
+/* Reasons and decisions recorded for one repository, newest first. `path_raw`
+ * may be NULL to list every record for the repository. */
+atlas_status atlas_db_ai_reasons_list(atlas_db *db, int64_t repo_id, const void *path_raw,
+                                      size_t path_len, int64_t limit, atlas_ai_reason_cb cb,
+                                      void *ud, int64_t *count_out, bool *more_out,
+                                      atlas_err *err);
+atlas_status atlas_db_ai_decisions_list(atlas_db *db, int64_t repo_id, const void *path_raw,
+                                        size_t path_len, int64_t limit, atlas_ai_decision_cb cb,
+                                        void *ud, int64_t *count_out, bool *more_out,
+                                        atlas_err *err);
+/* A bounded substring search over recorded reasons and decisions. Deliberately
+ * not FTS5: these tables are small, the query is a model's, and a bounded LIKE
+ * has no query language a caller can be surprised by. */
+atlas_status atlas_db_ai_reasons_search(atlas_db *db, int64_t repo_id, const char *query,
+                                        int64_t limit, atlas_ai_reason_cb cb, void *ud,
+                                        int64_t *count_out, bool *more_out, atlas_err *err);
+atlas_status atlas_db_ai_decisions_search(atlas_db *db, int64_t repo_id, const char *query,
+                                          int64_t limit, atlas_ai_decision_cb cb, void *ud,
+                                          int64_t *count_out, bool *more_out, atlas_err *err);
+/* Counts for the automatic envelope: proposed decisions, approved decisions
+ * (always 0 in A2, present so it can stop being), and changed paths with no
+ * reason of any kind recorded. */
+atlas_status atlas_db_ai_repo_record_counts(atlas_db *db, int64_t repo_id, int64_t *proposed,
+                                            int64_t *approved, int64_t *reasons, atlas_err *err);
 
 /* --- transactions ------------------------------------------------------- */
 

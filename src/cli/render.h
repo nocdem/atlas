@@ -15,6 +15,7 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#include "atlas/integrate.h"
 #include "atlas/json.h"
 #include "atlas/safetext.h"
 #include "atlas/service.h"
@@ -62,6 +63,14 @@ typedef struct atlas_renderer_vtbl {
     atlas_status (*unit_text)(atlas_renderer *r, const char *text, atlas_err *err);
     atlas_status (*unit_install)(atlas_renderer *r, const atlas_unit_install_report *rep,
                                  bool uninstall, atlas_err *err);
+    /* --- A2 ---
+     *
+     * One method rather than four. `integrate claude print|install|uninstall|
+     * doctor` all report the same shape — what was found, what changed, what is
+     * wrong — and giving each its own renderer method would have been four
+     * places for the human and JSON forms to drift apart instead of one. */
+    atlas_status (*integrate)(atlas_renderer *r, const atlas_integrate_report *rep,
+                              const char *action, const char *commands, atlas_err *err);
 } atlas_renderer_vtbl;
 
 struct atlas_renderer {

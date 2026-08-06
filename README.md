@@ -13,28 +13,86 @@ checked against a read-only allowlist before the process is created, hooks and
 external diff drivers are disabled, and the working tree and index are only ever
 read. See [docs/git-safety.md](docs/git-safety.md).
 
-## Status: phase A1
+## Status: phase A2
 
-A1 adds a daemon. After registering a repository once and enabling the service,
-filesystem and Git changes are detected and indexed **without running `atlas
-scan` by hand**.
+A2 makes Atlas participate in a Claude Code session automatically. After a
+one-time setup nobody types an `atlas` command during ordinary work: hooks open a
+change session and correlate what changed with who was in a position to change
+it, and an MCP server answers repository questions and records why things
+changed — or records that nobody said why.
 
 ```sh
 make
 make test
 sudo make install                      # optional; only this step needs root
-atlas repo add /path/to/dna --name dna
+
+atlas integrate claude install --user  # tells the plugin where Atlas is
 atlas service install --user
 systemctl --user daemon-reload
 systemctl --user enable --now atlas
+claude plugin marketplace add /path/to/atlas/integrations/claude
+claude plugin install atlas@atlas-local --scope user
+
+atlas integrate claude doctor          # checks the whole chain
 ```
 
-`sudo` there applies **only** to installing the binary system-wide. The daemon
+Registering a repository by hand is no longer necessary: the first session in a
+git worktree registers it. `atlas repo add /path --name dna` still works, and
+`ATLAS_CLAUDE_NO_AUTO_REGISTER=1` turns the automatic half off.
+
+### What A2 adds
+
+- `atlas mcp` — a stdio Model Context Protocol server with ten tools: repository
+  overview, changed files by git scope, file context with recorded history,
+  bounded search, memory search, session state, and three recording tools
+- `atlas hook <event>` — fifteen Claude Code lifecycle hooks. Every one fails
+  open: a missing daemon produces a valid minimal answer and never blocks.
+- `atlas integrate claude print|doctor|install --user|uninstall --user`
+- a Claude Code plugin plus a local marketplace in `integrations/claude`,
+  installed by `make install` to `<prefix>/share/atlas/claude-marketplace`, so a
+  permanent user-scope install needs no network
+- schema v4: AI sessions, change sets, attributed changed paths, change-reason
+  and decision proposals, and a per-path working-tree change snapshot
+- an implemented model-context trust boundary — see below
+
+Full detail in [docs/claude-integration.md](docs/claude-integration.md).
+
+### The trust boundary, in one paragraph
+
+**Automatic context contains no repository prose at all.** No branch names, no
+commit subjects, no author names, no file paths — because printable prose passes
+any encoding unchanged, and "ignore all previous instructions" has nothing to
+escape. What Atlas injects is versions, fixed vocabularies, integers, a validated
+hex object id, an opaque repository id and a hash of its root — never the
+repository name or the root path themselves, because both are derived from a
+directory somebody chose to name. Bounded to 4 KiB and checked against a fixed
+ASCII allowlist before it leaves. Repository prose reaches
+a model only through an explicit tool call, labelled with its provenance and
+`untrusted_data: true`. See
+[docs/ai-trust-boundary.md](docs/ai-trust-boundary.md).
+
+### What Atlas stores about a session
+
+Metadata: which session, which repositories, which tool ran, whether it
+succeeded, at most one normalized path per tool call, which paths the index
+observed changing, and the reasons and decisions somebody asked Atlas to record.
+
+It does **not** store prompts, assistant messages, transcripts, tool inputs, tool
+outputs, error text, shell commands, source snippets, environment variables or
+credentials. The hook adapter never reads those fields; the test suite drives
+every event with payloads containing all of them and then searches the resulting
+database as raw bytes.
+
+### Phase A1: the daemon
+
+A1 added the daemon. After registering a repository once and enabling the
+service, filesystem and Git changes are detected and indexed **without running
+`atlas scan` by hand**.
+
+`sudo` above applies **only** to installing the binary system-wide. The daemon
 and everything it writes run as your normal user. To keep it running after an SSH
 logout you also need `sudo loginctl enable-linger $USER` — see
 [docs/systemd-user-service.md](docs/systemd-user-service.md).
-
-### What A1 adds
 
 - `atlas daemon run`, a foreground daemon managed by systemd (no double fork, no
   pid file — systemd owns supervision)
@@ -78,22 +136,27 @@ later depends on trusting what it reports.
 - stable JSON output for every command
 - numbered, transactional, idempotent schema migrations
 
-#### What A0 and A1 deliberately do not implement
+#### What Atlas still deliberately does not implement
 
 None of the following exist yet, and Atlas does not pretend otherwise:
 
-- decisions, ADRs, or recorded reasons for change. When a reason is requested,
-  Atlas answers `UNKNOWN` rather than inferring one.
+- **decision documents and ADRs read from the repository.** A2 records reasons
+  and decisions that a model or a person hands it; it does not discover or parse
+  any that are already written down in the tree. That is A3.
+- **a human approval workflow.** A2 records *proposals*. It has no way to prove a
+  human agreed to one — an argument asserting approval is a string a model
+  produced — so `approved` is pinned to zero by a schema `CHECK`, and lifting
+  that is a deliberate future migration rather than an accident.
+- **any inferred historical reason.** Asked why something changed with nothing
+  recorded, Atlas still answers `UNKNOWN`. A commit subject is what the author
+  wrote in the subject line, which is a different and weaker claim.
 - `compile_commands.json` parsing. Atlas records that the file exists, whether it
   is a regular file or a symlink, and its content hash. It does not read its
   contents.
 - clangd integration, symbol extraction, call graphs, dependency graphs
 - impact analysis or stale-document gates
-- **any AI integration.** A1 contains none. The model-context trust boundary A2
-  will need is specified, not built, in
-  [docs/ai-trust-boundary.md](docs/ai-trust-boundary.md) — and note that Atlas'
-  safe-text encoding is *not* that boundary and cannot be extended into it.
-- a Claude Code skill or an MCP adapter
+- any LLM API call or network access of any kind. Claude is the client; Atlas is
+  a local service and never speaks to anything but its own socket and git.
 - any write path into a target repository, in any form
 
 ## Requirements
@@ -378,6 +441,30 @@ copied out of Atlas output can be pasted straight back in.
 - reconciliation is per repository, not per path: one changed file triggers one
   `lstat` per tracked file (about 480 ms on a 5000-file fixture) even though only
   the changed file's content is read. See [docs/backlog.md](docs/backlog.md).
+- **change attribution is a claim about opportunity, not about causation.** Atlas
+  records `direct_edit` when a session's edit tool named a path *and* the index
+  then saw it change, `observed` when only the second happened, and `ambiguous`
+  when another session had the same repository open over the same window. It
+  never reports a single cause when more than one was possible, and once a path
+  is ambiguous it stays ambiguous.
+- **a change set is correlated at the end of a tool batch and again at the end of
+  a turn**, because the reconciliation a batch asks for cannot be waited on from
+  inside the writer thread. A change made and reverted between those two points
+  is not attributed to anything.
+- recorded reasons and decisions are **proposals**. Atlas has no approval
+  workflow and cannot prove a human agreed to one.
+- **a record belongs to the session whose id it carries, or to no session.** An
+  MCP write is attached by exact external session id — for Claude Code, the
+  `CLAUDE_CODE_SESSION_ID` the hooks also see — and never by repository, recency
+  or "the only one open". When Atlas cannot identify the session exactly the
+  record is still stored, with `session_unbound` and a reason saying why. A
+  client that is not Claude Code has no such id, so its records are sessionless.
+  After `/clear` a running MCP server still holds the id it was started with; its
+  writes are reported unattached rather than credited to the new conversation.
+  See [docs/claude-integration.md](docs/claude-integration.md).
+- MCP reads only indexed data. It is not a filesystem reader: it accepts no
+  absolute path, and it answers about repositories the client granted through
+  `roots/list` and no others.
 
 ## Documentation
 
@@ -391,10 +478,12 @@ copied out of Atlas output can be pasted straight back in.
   means, and what Atlas does when it cannot prove it
 - [docs/systemd-user-service.md](docs/systemd-user-service.md) — running it as a
   user service
+- [docs/claude-integration.md](docs/claude-integration.md) — the hooks, the MCP
+  tools, the plugin, and the one-time setup
 - [docs/ai-trust-boundary.md](docs/ai-trust-boundary.md) — what safe text does
-  and does not protect against, and what A2 must build
+  and does not protect against, and how A2 implements the boundary it cannot
 - [docs/backlog.md](docs/backlog.md) — known engineering and security backlog
-- [docs/roadmap.md](docs/roadmap.md) — A2 through A6
+- [docs/roadmap.md](docs/roadmap.md) — A3 through A6
 - [third_party/yyjson/PROVENANCE.md](third_party/yyjson/PROVENANCE.md) — the one
   vendored dependency, its exact upstream identity and its digests
 - [SECURITY.md](SECURITY.md) — threat model and reporting

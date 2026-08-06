@@ -41,6 +41,16 @@ static atlas_status build_request(const char *method, const char *params_json, a
 
 atlas_status atlas_ipc_call(const char *socket_path, const char *method, const char *params_json,
                             atlas_buf *response_out, atlas_err *err) {
+    return atlas_ipc_call_timeout(socket_path, method, params_json, ATLAS_IPC_READ_TIMEOUT_MS,
+                                  response_out, err);
+}
+
+atlas_status atlas_ipc_call_timeout(const char *socket_path, const char *method,
+                                    const char *params_json, int timeout_ms,
+                                    atlas_buf *response_out, atlas_err *err) {
+    if (timeout_ms <= 0) {
+        timeout_ms = ATLAS_IPC_READ_TIMEOUT_MS;
+    }
     atlas_buf req = ATLAS_BUF_INIT;
     atlas_status st = build_request(method, params_json, &req, err);
     if (st != ATLAS_OK) {
@@ -54,18 +64,18 @@ atlas_status atlas_ipc_call(const char *socket_path, const char *method, const c
     }
 
     int fd = -1;
-    st = atlas_ipc_connect(socket_path, ATLAS_IPC_READ_TIMEOUT_MS, &fd, err);
+    st = atlas_ipc_connect(socket_path, timeout_ms, &fd, err);
     if (st != ATLAS_OK) {
         atlas_buf_free(&req);
         return st;
     }
 
-    st = atlas_ipc_write_frame(fd, req.data, req.len, ATLAS_IPC_WRITE_TIMEOUT_MS, err);
+    st = atlas_ipc_write_frame(fd, req.data, req.len, timeout_ms, err);
     atlas_buf_free(&req);
     if (st == ATLAS_OK) {
         bool eof = false;
-        st = atlas_ipc_read_frame(fd, ATLAS_IPC_MAX_RESPONSE_BYTES, ATLAS_IPC_READ_TIMEOUT_MS,
-                                  response_out, &eof, err);
+        st = atlas_ipc_read_frame(fd, ATLAS_IPC_MAX_RESPONSE_BYTES, timeout_ms, response_out, &eof,
+                                  err);
         if (st == ATLAS_OK && eof) {
             st = atlas_err_set(err, ATLAS_ERR_INTERNAL,
                                "the Atlas daemon closed the connection without answering");

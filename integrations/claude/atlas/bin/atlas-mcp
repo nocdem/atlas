@@ -1,0 +1,25 @@
+#!/bin/sh
+# Atlas - the MCP server launcher.
+# Copyright 2026 The Atlas Authors. Licensed under the Apache License 2.0.
+#
+# Unlike the hook launcher this does *not* fail open, and the difference is
+# deliberate. A hook that cannot run should be invisible; an MCP server that
+# cannot run should say so, because the alternative is a server that accepts a
+# connection and answers nothing, which looks to a user like Atlas working
+# badly rather than Atlas being absent.
+#
+# Nothing is printed on stdout before the exec. Stdout is the protocol stream,
+# and a single stray byte on it ends the session rather than degrading it.
+set -u
+
+_dir=$(dirname -- "$0")
+# shellcheck source=./atlas-resolve.sh
+. "${_dir}/atlas-resolve.sh"
+
+if ! atlas_resolve; then
+    printf 'atlas-mcp: no atlas executable found. Install Atlas and run:\n' >&2
+    printf '  atlas integrate claude install --user\n' >&2
+    exit 1
+fi
+
+exec "${ATLAS_EXE}" mcp

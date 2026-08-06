@@ -52,6 +52,7 @@
 
 #include "atlas/buf.h"
 #include "atlas/error.h"
+#include "atlas/json.h"
 #include "atlas/limits.h"
 
 /* --- framing ------------------------------------------------------------- */
@@ -136,6 +137,21 @@ bool atlas_ipc_param_str(const atlas_ipc_request *req, const char *key, const ch
 bool atlas_ipc_param_int(const atlas_ipc_request *req, const char *key, int64_t *out);
 bool atlas_ipc_param_bool(const atlas_ipc_request *req, const char *key, bool *out);
 
+/* An array of strings. A2 needs one — a list of paths a reason concerns — and
+ * it is the only aggregate the protocol accepts, deliberately: every other
+ * parameter is a scalar, so the request document stays shallow and the depth
+ * limit stays comfortable.
+ *
+ * The handle borrows from the parsed request and is valid only as long as it
+ * is. Non-string entries are reported as absent rather than coerced, like every
+ * other accessor here. */
+typedef struct atlas_ipc_array atlas_ipc_array;
+
+bool atlas_ipc_param_array(const atlas_ipc_request *req, const char *key,
+                           const atlas_ipc_array **out);
+size_t atlas_ipc_array_len(const atlas_ipc_array *arr);
+bool atlas_ipc_array_str(const atlas_ipc_array *arr, size_t index, const char **out);
+
 /* --- client -------------------------------------------------------------- */
 
 /* One request/response round trip against a running daemon. `response_out`
@@ -147,10 +163,74 @@ bool atlas_ipc_param_bool(const atlas_ipc_request *req, const char *key, bool *o
 atlas_status atlas_ipc_call(const char *socket_path, const char *method, const char *params_json,
                             atlas_buf *response_out, atlas_err *err);
 
+/* Like atlas_ipc_call, with an explicit deadline. A hook has milliseconds to
+ * spare and must fail open rather than make a person wait; the default
+ * ten-second timeout is right for a CLI command and wrong for a hook. */
+atlas_status atlas_ipc_call_timeout(const char *socket_path, const char *method,
+                                    const char *params_json, int timeout_ms,
+                                    atlas_buf *response_out, atlas_err *err);
+
 /* True when a daemon is reachable at the resolved socket path right now. Any
  * configuration error (no XDG_RUNTIME_DIR, for example) reports "not running"
  * rather than failing, because every caller of this is deciding whether to take
  * the offline path. */
 bool atlas_ipc_daemon_reachable(void);
+
+/* --- A2: building requests with the typed writer -------------------------
+ *
+ * A0 and A1 built the two request documents they needed with `atlas_buf_appendf`
+ * and refused any repository path containing a quote, a backslash or a control
+ * byte rather than escaping it (docs/backlog.md item 11). A2 sends filesystem
+ * paths, session identifiers and model-authored prose over this socket, so a
+ * hand-built document is no longer defensible.
+ *
+ * This builds `params` through the same streaming writer the daemon answers
+ * with, so exactly one implementation of the escaping contract exists on both
+ * sides of the socket. The writer is handed out already positioned inside the
+ * params object: a caller emits members and never sees the braces. */
+typedef struct atlas_ipc_params atlas_ipc_params;
+
+atlas_status atlas_ipc_params_begin(atlas_ipc_params **out, atlas_json **writer_out,
+                                    atlas_err *err);
+/* Closes the object and hands over the finished document. Frees the builder. */
+atlas_status atlas_ipc_params_finish(atlas_ipc_params *p, atlas_buf *out, atlas_err *err);
+/* The failure path. Exactly one of finish and abort runs, as with atlas_json. */
+void atlas_ipc_params_abort(atlas_ipc_params *p);
+
+/* --- A2: reading responses -----------------------------------------------
+ *
+ * A1's client returned the raw payload and its one caller looked for a
+ * substring. That was honest about how little it needed; A2 needs typed access,
+ * so the response is parsed with the same bounded, hostile-input discipline the
+ * daemon applies to requests. */
+typedef struct atlas_ipc_response atlas_ipc_response;
+
+atlas_status atlas_ipc_response_parse(const void *payload, size_t len, atlas_ipc_response **out,
+                                      atlas_err *err);
+void atlas_ipc_response_free(atlas_ipc_response *r);
+
+bool atlas_ipc_response_ok(const atlas_ipc_response *r);
+/* The daemon's status code, which is the CLI's exit-code vocabulary. */
+atlas_status atlas_ipc_response_status(const atlas_ipc_response *r);
+/* The error message, already safe-encoded by the daemon. "" when there is none. */
+const char *atlas_ipc_response_message(const atlas_ipc_response *r);
+
+bool atlas_ipc_result_str(const atlas_ipc_response *r, const char *key, const char **out);
+bool atlas_ipc_result_int(const atlas_ipc_response *r, const char *key, int64_t *out);
+bool atlas_ipc_result_bool(const atlas_ipc_response *r, const char *key, bool *out);
+
+/* Re-emits the whole `result` object through `j`, member by member.
+ *
+ * Not a byte copy. Every string goes through atlas_json_str and every number
+ * through atlas_json_int, so an adapter forwarding a daemon result into its own
+ * document produces text this writer escaped rather than text it trusted. That
+ * matters because it means there is still no "write these bytes as JSON"
+ * primitive anywhere in Atlas — the one hole through which an unescaped value
+ * eventually reaches a consumer.
+ *
+ * The walk is iterative and depth-bounded for the same reason the request
+ * parser's is: recursing through a hostile document is the stack exhaustion the
+ * limit exists to prevent. */
+atlas_status atlas_ipc_result_write(const atlas_ipc_response *r, atlas_json *j, atlas_err *err);
 
 #endif /* ATLAS_IPC_H */

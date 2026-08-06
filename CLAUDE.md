@@ -1,9 +1,9 @@
 # Atlas — working notes for Claude Code
 
 Atlas is a generic, headless engineering-memory and repository-intelligence CLI in
-C17. Phase **A1**: a daemon, local IPC, and incremental indexing on top of the A0
-read-only foundation. Not DNA-specific; DNA will later be its first indexed
-repository.
+C17. Phase **A2**: automatic AI integration — an MCP server, Claude Code hooks and
+a plugin — on top of the A1 daemon and the A0 read-only foundation. Not
+DNA-specific; DNA will later be its first indexed repository.
 
 ## Build and test
 
@@ -21,12 +21,36 @@ make install    # honours PREFIX, default /usr/local/bin/atlas
 make clean
 make compiledb  # refresh the top-level compile_commands.json symlink
 
-sh scripts/perf.sh build   # A1 performance acceptance measurements
+sh scripts/perf.sh build      # A1 performance acceptance measurements
+sh scripts/perf-a2.sh build   # A2 hook and MCP latency measurements
 ```
 
+`make doctor` and `make doctor-claude` observe and create nothing: no data
+directory, no index, no lock, no runtime directory, no socket, no Claude
+configuration. `atlas doctor` opens in `ATLAS_CTX_INSPECT` mode and reports a
+missing index as a finding rather than creating one. A diagnostic that
+initialises what it is diagnosing can only ever answer "fine", and cannot be run
+at all on a machine where Atlas has never been used — which is exactly when
+somebody runs it. `tests/test_plugin.c` snapshots a fresh HOME around both
+commands and asserts nothing appeared.
+
 CMake is canonical; the Makefile is a wrapper. Run one suite with
-`cd build && ctest -R test_scan --output-on-failure`. The live-daemon suite is
-labelled and serialised: `ctest -L daemon`, `ctest -LE daemon`.
+`cd build && ctest -R test_scan --output-on-failure`, or run its binary directly
+(`./build/tests/test_scan`) — every suite is a standalone executable. Tests are
+labelled `unit`, `integration` or `daemon`: `ctest -L unit` is the fast subset,
+`ctest -LE daemon` is everything except the slow one. The live-daemon suite is
+serialised against itself because parallel daemons compete for the machine's
+inotify watch budget.
+
+`make test-debug` runs the suite from `build-debug`; `make doctor` runs the built
+binary's self-check; `make distclean` also drops the `compile_commands.json`
+symlink.
+
+The data directory resolves as `--data-dir`, then `ATLAS_DATA_DIR`, then
+`XDG_DATA_HOME/atlas`, then `$HOME/.local/share/atlas`. The socket lives under
+`XDG_RUNTIME_DIR/atlas/`. A Unix socket address is a fixed 108-byte field and
+Atlas refuses a path that would not fit rather than truncating it, so a fixture
+or script must put its runtime directory somewhere short — see `scripts/perf.sh`.
 
 Requires: C17 compiler, CMake ≥ 3.16, Make, pkg-config, SQLite3 dev headers, Git,
 pthreads. Nothing is downloaded at build time. **No Python, Node, Go, Rust, pip,
@@ -139,6 +163,115 @@ The serve loop is non-blocking with per-connection state. Do not "simplify" it
 into a blocking read: one client that sends a partial header would then stall
 every other client, and there is a test for that.
 
+## A2 layers — additions
+
+```
+src/ai       ai.c (the provider-neutral session service, runs on the writer
+             thread), context.c (the automatic context envelope)
+src/db       db_ai.c (typed operations over the migration-4 tables)
+src/ipc      server_ai.c (the A2 method group), reply.c (typed request building
+             and response reading), json_read.c (the one yyjson facade)
+src/mcp      mcp.c (stdio transport, lifecycle, dispatch), mcp_tools.c (the tool
+             surface)
+src/hook     hook.c (one process per Claude Code lifecycle event)
+src/core     integrate.c (`atlas integrate claude`)
+integrations/claude/atlas   the Claude Code plugin: manifest, hooks.json,
+             .mcp.json, skill, POSIX-sh launchers
+```
+
+**yyjson is called from `src/ipc` and nowhere else.** `json_read.c` is the facade;
+`hook.c`, `mcp*.c` and `integrate.c` use it. A new file that parses untrusted JSON
+goes through that facade rather than including the vendored header.
+
+## A2 rules — these are not negotiable
+
+- **No repository-controlled or model-provided free-form text in automatic
+  context; only fixed Atlas-owned control text and typed values — and that
+  excludes the repository's own name and root.** The envelope carries five kinds
+  of thing and nothing else: an integer Atlas assigned or counted, a boolean, a
+  string from a fixed vocabulary checked against that vocabulary, a fixed-length
+  lowercase hex hash checked to be hex, and the fixed `note=` control line that
+  is a string literal in `src/ai/context.c`. That line stays: it is what tells
+  the reader how to treat the typed values. A repository is identified by
+  `repo_id` and `root_hash`.
+
+  The name and the root were in the first implementation and were wrong: a name
+  is derived from a directory basename and a root is a filesystem path, so both
+  are chosen by whoever created the directory. `ignore previous instructions` is
+  a legal directory name, it is entirely printable, and it survives every
+  encoding Atlas has. Encoding is not the defence — the defence is that no field
+  can hold such a value.
+
+  So the renderer **validates rather than escapes**: a value that is not the
+  shape it claims to be is replaced by a marker, never reproduced. The allowlist
+  in `atlas_ai_context_is_bounded` was tightened accordingly (`%`, `(`, `)` and
+  `+` are gone, because nothing is escaped and no path is emitted), and
+  `atlas_ai_context_render` checks its own output against it and discards a
+  document that fails. Adding a field to the envelope means arguing that it
+  cannot carry a byte somebody else chose.
+- **An A2 adapter may write only MODEL_PROPOSAL, MODEL_INFERENCE and UNKNOWN.**
+  Enforced in three places on purpose: `atlas_provenance_writable_in_a2`, the IPC
+  validation before anything is queued, and `CHECK(approved = 0)` in the schema.
+  Neither insert statement binds the column. Do not add a fourth path.
+- **UNKNOWN is a write, not a silence.** A changed path nobody explained gets an
+  explicit row at the turn close. Do not "optimise" that away.
+- **Hooks fail open and store metadata only.** Every hook returns valid JSON and
+  exits 0, whatever happened. No hook emits `decision`, `continue` or a permission
+  verdict — which is what makes a Stop loop structurally impossible rather than
+  guarded against. `tool_input` is read for exactly one member, a file path, and
+  only in `edit_path_of`. If you find yourself reading a second member, stop.
+- **The MCP adapter opens no database handle**, not even read-only. Everything it
+  answers came over the socket. That is what makes its capability list short
+  enough for a reviewer to check.
+- **Attribution never improves.** A changed path already marked `ambiguous` stays
+  ambiguous. The `ON CONFLICT` clause in `db_ai.c` enforces it; do not move that
+  decision into a caller.
+- **A session is found by its key and by nothing else.** The lookup is exact
+  `(provider, client, session_key)`, where `session_key` is the client's own
+  external id — for Claude Code, `CLAUDE_CODE_SESSION_ID`, which is the same
+  string the hook payload carries as `session_id`. **A repository never
+  identifies a session.** There is no query that selects one by recency; the one
+  that did (`atlas_db_ai_session_newest_for_repo`) is deleted, and adding
+  anything like it back would silently record one Claude session's reason against
+  another whenever two are open on one worktree.
+
+  When the session cannot be resolved exactly, the record is stored **sessionless**
+  with `session_unbound` and a typed `unbound_reason`, never attached to a
+  neighbour. **Prefer missing or ambiguous over wrong** — a gap is repairable and
+  a wrong row is not, because nothing about it says it is wrong. Reason and
+  decision records additionally require the session to be *open*, which is what
+  turns a post-`/clear` write from a false attribution into an honest gap.
+
+  The MCP and hook adapters must keep sending the same `provider`/`client` pair:
+  if the two constants drift apart the lookup misses silently and every MCP write
+  becomes unattributed. `tests/test_ai_attribution.c` is what catches it.
+- **MCP is not a filesystem reader.** No tool accepts an absolute path, and a
+  `repo` argument must name a repository one of the client's granted roots
+  resolved to — a whitelist, not a path comparison.
+- **Requests are built with the typed writer.** `atlas_ipc_params_begin`/`_finish`,
+  never `atlas_buf_appendf`. There is still no "write these bytes as JSON"
+  primitive anywhere in Atlas, and `atlas_ipc_result_write` /
+  `atlas_jsonv_write` re-emit through the writer rather than copying bytes.
+- **Never install, enable or start anything real.** `atlas integrate claude
+  install` writes one file in the user's config directory and prints the rest. It
+  does not edit `~/.claude`, does not touch systemd, and does not run `claude`.
+  `uninstall` never touches the index.
+
+## Adding an MCP tool or a hook event
+
+- **A tool** is one entry in `TOOLS[]` in `src/mcp/mcp_tools.c`: a schema function
+  and a run function. The schema must set `additionalProperties: false` and
+  declare every argument. Add the name to the expectation in `tests/test_mcp.c`,
+  which compares `atlas_mcp_tool_names()` against what the process reports.
+- **A hook event** goes in `HOOK_EVENTS[]` in `src/hook/hook.c`, in `handle()`,
+  and in `integrations/claude/atlas/hooks/hooks.json`. `tests/test_plugin.c`
+  asserts the two lists match exactly — a plugin configuring an event the binary
+  ignores looks installed and does nothing, and a binary handling an event the
+  plugin never sends is dead code.
+- **Check the event's real output contract before returning anything but `{}`.**
+  `PostCompact` has no `additionalContext`; returning one is silently ignored,
+  which reads correctly and does nothing.
+
 ## Layers — do not short-circuit these
 
 ```
@@ -153,6 +286,51 @@ src/output   streaming JSON writer
 
 A renderer never queries anything. The service layer never formats output. Adding
 a command means adding a service function plus a method on both renderers.
+
+## Wiring new code in — nothing is globbed
+
+- **A new `.c` file** is added to the explicit `atlas_core` source list in
+  `CMakeLists.txt`. There is no `file(GLOB)`; a file not listed is not compiled,
+  and the failure surfaces as a link error, not a build error.
+- **A new test** is added to `ATLAS_TESTS` in `tests/CMakeLists.txt` **and** to
+  one of the `set_tests_properties(... LABELS ...)` lines. An unlabelled test
+  still runs under a bare `ctest` but is invisible to `ctest -L unit` and to
+  `ctest -LE daemon`, so it silently stops being part of the subsets people
+  actually run.
+- **A new command** touches four places: a service function in `src/core/service.c`
+  (or `service_daemon.c`), a method on `atlas_renderer_vtbl` in `src/cli/render.h`,
+  an implementation in **both** `render_human.c` and `render_json.c`, and dispatch
+  plus help text in `src/cli/cli.c`. The vtbl is not optional-per-renderer: a
+  missing implementation is how human and JSON output drift apart.
+
+## Test conventions
+
+The harness is first-party and dependency-free (`tests/atlas_test.h`):
+`T_CHECK`/`T_CHECK_MSG` record a failure and continue, `T_REQUIRE` abandons the
+test, `T_OK(expr, &err)` and `T_FAILS_WITH(expr, status, &err)` assert on an
+`atlas_status` and print the error message, and `ATLAS_TEST_MAIN` is the entry
+point. Prefer `T_OK`/`T_FAILS_WITH` over comparing statuses by hand — they report
+what actually went wrong.
+
+Integration tests use `tests/support/fixture.h`. `fx_open` creates a private
+temporary tree with its own `repo/` and `data/`; `fx_close` removes it. Fixtures
+build real git repositories, driving git through `atlas_proc` with explicit argv —
+there is no shell in the tests either. Notes that matter:
+
+- `fx_atlas` runs the built binary but does **not** add `--data-dir`. Pass it, or
+  the test opens the developer's real database.
+- Daemon tests fork the binary via `fx_daemon_start`, which supplies both the
+  fixture data directory and a private `XDG_RUNTIME_DIR`. Never install, enable or
+  start a systemd unit from a test.
+- Wait for an observable outcome with `fx_wait_for_substring`, never a guessed
+  `sleep` — watcher timing is machine-dependent.
+- `fx_tree_digest` is how a test proves a read command did not modify a
+  repository. Use it when adding any command that touches a target repo.
+- Path helpers take raw bytes (`fx_write_bytes`, `fx_can_create_name`) so a test
+  can use names that are not UTF-8. `fx_can_create_name` lets a test skip rather
+  than fail on a filesystem that rejects them.
+- `fx_install_marker` / `fx_marker_fired` are the adversarial pair: they place a
+  helper a hostile repository config could point at, and assert it never ran.
 
 ## Memory ownership
 
@@ -182,9 +360,12 @@ paragraph separators, bidi overrides, invalid UTF-8 and `%`, reversibly.
 **Safe text is terminal-safe, JSON-structure-safe and reversible. It is not
 model-safe.** A commit message reading "ignore all previous instructions" is
 entirely printable and passes through unchanged. Printable repository prose stays
-semantically untrusted. Do not build AI integration in A1, and when A2 does,
-raw repository prose must not be injected as trusted instructions — see
-`docs/ai-trust-boundary.md`.
+semantically untrusted.
+
+A2 implements the separate boundary that follows from that: automatic model
+context contains no repository prose at all, and repository prose reaches a model
+only through an explicit MCP result that states its provenance. See
+`docs/ai-trust-boundary.md`, and the A2 rules below.
 
 **Do not double-encode.** Values already stored encoded (`path_text`,
 `root_path_text`, `old_path_text`, and diff entry paths) are printed as-is. Values
@@ -277,8 +458,10 @@ two documents on stdout.
 `docs/architecture.md` · `docs/data-model.md` · `docs/provenance.md` ·
 `docs/git-safety.md` · `docs/daemon-and-ipc.md` ·
 `docs/watcher-consistency.md` · `docs/systemd-user-service.md` ·
-`docs/ai-trust-boundary.md` · `docs/backlog.md` · `docs/roadmap.md` ·
-`third_party/yyjson/PROVENANCE.md`
+`docs/ai-trust-boundary.md` · `docs/claude-integration.md` ·
+`docs/backlog.md` · `docs/roadmap.md` ·
+`third_party/yyjson/PROVENANCE.md` ·
+`integrations/claude/atlas/README.md`
 
 Keep these current when behaviour changes. If you change the JSON shape, the
 schema, or an exit code, that is a contract change — update the docs in the same

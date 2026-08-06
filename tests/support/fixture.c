@@ -711,6 +711,172 @@ atlas_status fx_atlas_env(const char *const *args, size_t nargs, const char *con
     return fx_atlas_impl(args, nargs, extra_env, stdout_out, stderr_out, exit_code, err);
 }
 
+/* --- A2: running an adapter that reads stdin ----------------------------- */
+
+/* Drains a descriptor into a buffer, bounded. */
+static atlas_status drain_fd(int fd, atlas_buf *out, atlas_err *err) {
+    char chunk[8192];
+    for (;;) {
+        ssize_t n = read(fd, chunk, sizeof(chunk));
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return atlas_err_set_errno(err, ATLAS_ERR_INTERNAL, errno, "cannot read a pipe");
+        }
+        if (n == 0) {
+            return ATLAS_OK;
+        }
+        if (out != NULL) {
+            if (out->len + (size_t)n > 16u * 1024u * 1024u) {
+                return atlas_err_set(err, ATLAS_ERR_INTERNAL, "adapter output exceeded the limit");
+            }
+            atlas_status st = atlas_buf_append(out, chunk, (size_t)n, err);
+            if (st != ATLAS_OK) {
+                return st;
+            }
+        }
+    }
+}
+
+atlas_status fx_atlas_stdin(const char *const *args, size_t nargs, const char *const *extra_env,
+                            const void *payload, size_t payload_len, atlas_buf *stdout_out,
+                            atlas_buf *stderr_out, int *exit_code, atlas_err *err) {
+    const char *argv[32];
+    size_t n = 0;
+    argv[n++] = ATLAS_BIN;
+    for (size_t i = 0; i < nargs; i++) {
+        if (n + 2u >= sizeof(argv) / sizeof(argv[0])) {
+            return atlas_err_set(err, ATLAS_ERR_INTERNAL, "atlas argv is too long");
+        }
+        argv[n++] = args[i];
+    }
+    argv[n] = NULL;
+
+    atlas_buf path_env = ATLAS_BUF_INIT;
+    const char *path = getenv("PATH");
+    atlas_status st = atlas_buf_appendf(&path_env, err, "PATH=%s",
+                                        (path != NULL && path[0] != '\0') ? path : "/usr/bin:/bin");
+    if (st != ATLAS_OK) {
+        atlas_buf_free(&path_env);
+        return st;
+    }
+    /* HOME is absent for the same reason it is absent from fx_atlas: a test that
+     * forgets to isolate itself must fail rather than touch a real directory. */
+    const char *env[24];
+    size_t envn = 0;
+    env[envn++] = atlas_buf_cstr(&path_env);
+    env[envn++] = "LC_ALL=C";
+    env[envn++] = "TZ=UTC";
+    for (size_t i = 0; extra_env != NULL && extra_env[i] != NULL; i++) {
+        if (envn + 1u >= sizeof(env) / sizeof(env[0])) {
+            atlas_buf_free(&path_env);
+            return atlas_err_set(err, ATLAS_ERR_INTERNAL, "too many extra environment entries");
+        }
+        env[envn++] = extra_env[i];
+    }
+    env[envn] = NULL;
+
+    int in_pipe[2] = {-1, -1};
+    int out_pipe[2] = {-1, -1};
+    int err_pipe[2] = {-1, -1};
+    if (pipe(in_pipe) != 0 || pipe(out_pipe) != 0 || pipe(err_pipe) != 0) {
+        st = atlas_err_set_errno(err, ATLAS_ERR_INTERNAL, errno, "cannot create a pipe");
+        goto cleanup;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        st = atlas_err_set_errno(err, ATLAS_ERR_INTERNAL, errno, "cannot fork");
+        goto cleanup;
+    }
+    if (pid == 0) {
+        (void)dup2(in_pipe[0], STDIN_FILENO);
+        (void)dup2(out_pipe[1], STDOUT_FILENO);
+        (void)dup2(err_pipe[1], STDERR_FILENO);
+        (void)close(in_pipe[0]);
+        (void)close(in_pipe[1]);
+        (void)close(out_pipe[0]);
+        (void)close(out_pipe[1]);
+        (void)close(err_pipe[0]);
+        (void)close(err_pipe[1]);
+        union {
+            const char *const *in;
+            char *const *out;
+        } av = {argv};
+        union {
+            const char *const *in;
+            char *const *out;
+        } ev = {env};
+        (void)execve(ATLAS_BIN, av.out, ev.out);
+        _exit(127);
+    }
+
+    (void)close(in_pipe[0]);
+    in_pipe[0] = -1;
+    (void)close(out_pipe[1]);
+    out_pipe[1] = -1;
+    (void)close(err_pipe[1]);
+    err_pipe[1] = -1;
+
+    /* SIGPIPE would kill the *test* when a child exits before reading it all,
+     * which is a normal outcome for an adapter given a payload it refuses. */
+    struct sigaction ignore_pipe;
+    struct sigaction previous;
+    memset(&ignore_pipe, 0, sizeof(ignore_pipe));
+    ignore_pipe.sa_handler = SIG_IGN;
+    (void)sigaction(SIGPIPE, &ignore_pipe, &previous);
+
+    const char *p = (const char *)payload;
+    size_t left = payload_len;
+    while (left > 0) {
+        ssize_t w = write(in_pipe[1], p, left);
+        if (w < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break; /* the child stopped reading; that is its right */
+        }
+        p += w;
+        left -= (size_t)w;
+    }
+    (void)close(in_pipe[1]);
+    in_pipe[1] = -1;
+
+    /* stdout first, then stderr. Both are drained to end of file, so a child
+     * that fills one pipe cannot deadlock against a reader waiting on the
+     * other — the adapters' outputs are small and bounded by their own limits. */
+    st = drain_fd(out_pipe[0], stdout_out, err);
+    atlas_status est = drain_fd(err_pipe[0], stderr_out, err);
+    if (st == ATLAS_OK) {
+        st = est;
+    }
+    (void)sigaction(SIGPIPE, &previous, NULL);
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+        /* retry */
+    }
+    if (exit_code != NULL) {
+        *exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+
+cleanup:
+    for (int i = 0; i < 2; i++) {
+        if (in_pipe[i] >= 0) {
+            (void)close(in_pipe[i]);
+        }
+        if (out_pipe[i] >= 0) {
+            (void)close(out_pipe[i]);
+        }
+        if (err_pipe[i] >= 0) {
+            (void)close(err_pipe[i]);
+        }
+    }
+    atlas_buf_free(&path_env);
+    return st;
+}
+
 /* --- A1: a live daemon under test ---------------------------------------
  *
  * A daemon has to outlive the call that starts it, so this cannot go through

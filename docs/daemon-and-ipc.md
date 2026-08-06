@@ -152,6 +152,146 @@ Every value goes through the typed writer.
 | `repo.remove` | `repo` | `repository` |
 | `events.since` | `repo`, `since?`, `limit?` | `events[]`, `count`, `cursor`, `more` |
 
+### A2 methods
+
+Added for the AI adapters. Both of them — `atlas mcp` and `atlas hook` — are
+separate processes that hold no database handle at all, so everything they can
+do is in this table. They are grouped in `src/ipc/server_ai.c` but looked up
+through the *same* dispatch as the methods above: two dispatchers is how a method
+comes to behave differently depending on which one found it.
+
+| method | params | result |
+| --- | --- | --- |
+| `repo.resolve` | `path` | `registered`, and the full index state when it is |
+| `repo.ensure` | `path`, `name?`, `exact_root?` | as above, registering the worktree when nothing matches |
+| `repo.search` | `repo`\|`root`, `query`, `limit?` | `results[]`, `count`, `search_mode`, `degraded` |
+| `ai.session.open` | identity, `source?` | session, repository, change set |
+| `ai.session.touch` | identity, `dedup_key?` | as above |
+| `ai.session.close` | identity, `source?` | as above |
+| `ai.session.attach` | identity, `source` | as above |
+| `ai.session.checkpoint` | identity, `phase` | as above, plus the counters checkpointed |
+| `ai.session.get` | identity | the caller's session and its change-set counters, plus `open_sessions` |
+| `ai.tool.record` | identity, `tool`, `phase`, `tool_use_id?`, `paths?` | as above |
+| `ai.batch.correlate` | identity, `paths?`, `sync?` | changed, direct, ambiguous and unresolved counts |
+| `ai.turn.close` | identity, `dedup_key` | as above, having recorded UNKNOWN for what is unexplained |
+| `ai.reason.record` | identity, `summary`\|`unknown`, `paths`, `confidence?` | the record id and its provenance |
+| `ai.decision.record` | identity, `title`, `statement`, `rationale?`, `paths?` | the record id, and `approved: false` |
+| `ai.context` | identity | the bounded context envelope and its size |
+| `ai.changed` | `repo`\|`root`, `scope?`, `limit?`, `cursor?` | indexed working-tree changes by git scope |
+| `ai.file.context` | `repo`\|`root`, `path`, `limit?` | indexed facts, recorded history, recorded reasons |
+| `ai.memory.search` | `repo`\|`root`, `query`, `limit?` | recorded reasons and decisions |
+
+"identity" is `provider`, `client`, `session_key`, and `root` or `repo`; a
+session key is safe-encoded and bounded on the way in.
+
+### A session is found by its key, and by nothing else
+
+Every method above resolves the session by exact `(provider, client,
+session_key)`. There is no other way to reach one — in particular, **a
+repository never identifies a session.**
+
+An earlier version of `ai.reason.record` and `ai.decision.record` accepted no
+session key and attached the record to the newest open session for the
+repository. With two Claude Code sessions on one worktree that recorded session
+A's reason against session B, and the stored row was indistinguishable from a
+correct one. The query that did it no longer exists.
+
+Reason and decision records are the two methods that may arrive without a key —
+a generic MCP client has no external session id to send, and refusing the write
+would lose the content as well as the attribution. They are stored **sessionless**
+and say so. Every other method requires a key and is refused without one.
+
+Three fields carry this, on every `ai.*` mutation result:
+
+| field | meaning |
+| --- | --- |
+| `session` | the Atlas session row id, or `0` |
+| `session_unbound` | true when no session was bound. Reported, not inferred from `session == 0` |
+| `unbound_reason` | `no_session_id`, `unknown_session`, `session_closed`, or `""` |
+
+`no_session_id` — none was sent. `unknown_session` — one was sent and Atlas has
+never opened a session with it, which is what "the hooks are not installed" looks
+like. `session_closed` — the session with that id exists and has ended; a reason
+or a decision binds only to an **open** session, because those two carry content
+about a conversation and binding them to a finished one is a claim Atlas cannot
+support. Bookkeeping methods sent by the hooks bind by key whatever the state,
+including the `ai.session.close` that does the closing.
+
+`ai.session.get` and `ai.context` resolve the same way, so a read cannot promise
+an attachment the following write would refuse. Without a key, `ai.session.get`
+reports `present: false` and `session: 0` — and `open_sessions`, the number of
+open sessions with that repository attached, which is the most that can be said
+truthfully about a repository without knowing who is asking.
+
+A session named by an exact key binds even when it never attached the repository
+the record is about. The id proves which conversation this is; it does not prove
+the conversation was working there, so `change_set` stays `0` and the repository
+is **not** silently attached to the session — an implicit attachment would change
+the concurrency accounting for every other session on that worktree.
+
+**Reads run on the serve loop; writes go to the writer.** Every `ai.*` mutation
+is validated completely — bounds, provenance, path relativity — *before* anything
+is queued, then handed to the writer thread as one typed `atlas_ai_op` with a
+four-second deadline. The caller is inside a hook or a tool call that a person is
+waiting on, so a truthful timeout beats a stall.
+
+### `exact_root`, and what `registered` means
+
+`repo.ensure` normally resolves **upward**: given a subdirectory it registers the
+worktree that contains it, which is what a person running `atlas repo add src/`
+means. `exact_root: true` refuses that, before anything is inserted, unless the
+given path is itself the worktree root.
+
+The MCP adapter always asks for the exact form. A client that granted one
+directory did not grant its parent, and registering the parent would index files
+outside what was granted. The session-start hook does not ask for it: a person
+who launched a session in a subdirectory means the worktree, and the client's own
+file access already spans it.
+
+Every `ai.*` and `repo.*` response distinguishes two facts that used to be
+conflated in one always-false field:
+
+| field | means |
+| --- | --- |
+| `registered` | the repository is in the index, however it got there |
+| `registered_now` | *this call* performed the registration |
+
+`ai.context` returns `repo_id` and `root_hash` rather than the repository name,
+for the same reason the envelope does: this response exists so an adapter can
+inject `context`, and an adapter that found a name here might inject that too.
+
+**No method here runs git**, with one exception: `repo.ensure` routes to the
+writer, which runs a handful of `git rev-parse` calls to register a worktree.
+`repo.resolve` is a pure index lookup for exactly this reason — a git process in
+the serve loop would let one question stall every other client for the git
+timeout.
+
+**Path arguments may be absolute.** An adapter observes absolute paths — a hook is
+handed one by Claude, and a model naming a file has no reason to know where Atlas
+thinks the root is — so the server relativises them against the repository's own
+root bytes from the index. A path outside the repository is dropped rather than
+refused: an agent editing a file elsewhere is ordinary, and refusing the whole
+request would lose the paths that *are* inside it.
+
+### Building requests with the typed writer
+
+A1's client built its two request documents with `atlas_buf_appendf` and refused
+any repository path containing a quote, a backslash or a control byte rather than
+escaping it — recorded as item 11 in `docs/backlog.md`. That was defensible when
+the only things crossing the socket were a validated name and a path the CLI
+could refuse.
+
+A2 sends filesystem paths it did not choose, session identifiers a client chose,
+and prose a model wrote. So `atlas_ipc_params_begin`/`_finish` build `params`
+through the same first-party streaming writer the daemon answers with, and every
+A2 caller uses it. One escaping implementation, both directions.
+
+Responses are read with `atlas_ipc_response_parse`, which applies the same
+bounded, hostile-input discipline the daemon applies to requests, and
+`atlas_ipc_result_write` re-emits a result into another document *through the
+typed writer* rather than copying bytes. There is still no "write these bytes as
+JSON" primitive anywhere in Atlas.
+
 **There is deliberately no `daemon.shutdown`.** A remotely reachable stop turns
 any local process that can open the socket into something that can disable
 indexing. systemd owns the lifecycle and `SIGTERM` already works. A test asserts
@@ -207,3 +347,47 @@ the offline path? Every failure mode (no `XDG_RUNTIME_DIR`, no socket, nothing
 listening) collapses to "not reachable", because every caller does the same thing
 with all three. There is no reconnection logic and no retry: a command that
 cannot reach the daemon decides for itself, visibly, in the calling code.
+
+## A2 resource limits
+
+Added in `include/atlas/limits.h` alongside the A1 bounds. Same rule: nothing is
+silently truncated when one is reached.
+
+| bound | value | on reach |
+| --- | --- | --- |
+| automatic context envelope | 4 KiB | the envelope is discarded rather than emitted |
+| hook payload | 1 MiB | refused whole; the hook still answers `{}` |
+| hook daemon deadline | 2 s (700 ms at session end) | the hook fails open |
+| MCP message | 1 MiB | structured error, then the stream resynchronises at the next newline |
+| MCP tool result | 128 KiB | structured error naming the ceiling, never a truncated document |
+| MCP rows per call | 200 (50 by default) | `more: true` and a cursor |
+| MCP daemon deadline | 5 s | the tool reports degraded |
+| client roots | 32 | further roots ignored |
+| repository prose per field | 512 bytes | bounded excerpt |
+| session key / agent id | 128 bytes | refused, never truncated |
+| reason summary / detail | 512 / 2048 bytes | refused |
+| paths per record | 64 | refused |
+| paths per batch | 256 | refused |
+| changed paths per change set | 4096 | the change set is marked truncated |
+| records per session | 500 | refused with a structured error |
+| session events per session | 2000 | oldest pruned; **durable records are never pruned** |
+| idle session expiry | 24 h | the session becomes `expired`, not `closed` |
+
+The MCP result ceiling is well below Claude's own 25 000-token MCP output limit,
+so an Atlas result is never the thing that fills a context window.
+
+## Why the MCP adapter holds no database handle
+
+`atlas mcp` could open a read-only handle — CLI read commands do, and it would be
+faster. It deliberately does not.
+
+The reason is that a read-only handle is a schema dependency. An adapter holding
+one has to migrate in lockstep with the daemon, has to handle a schema it does not
+recognise, and has to decide what to do when the daemon is mid-migration. Going
+through the socket means the daemon answers those questions once, for everyone,
+and the adapter's failure mode is the single one it already has to handle
+anyway: the daemon is not there.
+
+It also makes the security argument short. The MCP server cannot open the index,
+cannot start a daemon, cannot scan a repository, cannot write to a filesystem and
+cannot create a process. That is a list a reviewer can check.

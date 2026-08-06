@@ -31,9 +31,16 @@ struct atlas_writer {
     pthread_mutex_t lock;
     pthread_cond_t not_empty;
     pthread_cond_t job_done;
+    /* Signalled once the writer has opened the index and applied every pending
+     * migration, so nothing else in the daemon runs against a schema that does
+     * not exist yet. See the wait in atlas_writer_start. */
+    pthread_cond_t ready_cv;
 
     /* --- guarded by lock --- */
     bool stopping;
+    bool ready;        /* the index is open and migrated */
+    bool ready_failed; /* it could not be, and `ready_err` says why */
+    atlas_err ready_err;
     atlas_job *queue[ATLAS_WRITER_QUEUE_MAX];
     size_t head;
     size_t count;
@@ -79,6 +86,7 @@ static atlas_job *job_new(atlas_job_kind kind) {
     atlas_buf_init(&j->result_name);
     atlas_buf_init(&j->result_root_text);
     atlas_err_init(&j->result_err);
+    atlas_ai_result_init(&j->ai_result);
     return j;
 }
 
@@ -91,6 +99,11 @@ static void job_free(atlas_job *j) {
     atlas_buf_free(&j->dirty_paths);
     atlas_buf_free(&j->result_name);
     atlas_buf_free(&j->result_root_text);
+    if (j->ai != NULL) {
+        atlas_ai_op_free(j->ai);
+        free(j->ai);
+    }
+    atlas_ai_result_free(&j->ai_result);
     free(j);
 }
 
@@ -260,8 +273,8 @@ static void run_repo_add(atlas_writer *w, atlas_job *j) {
     atlas_repo_info info;
     atlas_repo_info_init(&info);
     const char *name = j->arg2.len > 0 ? atlas_buf_cstr(&j->arg2) : NULL;
-    atlas_status st = atlas_service_repo_add_db(w->db, atlas_buf_cstr(&j->arg1), name, &info,
-                                                &j->result_err);
+    atlas_status st = atlas_service_repo_add_db(w->db, atlas_buf_cstr(&j->arg1), name,
+                                                j->exact_root, &info, &j->result_err);
     if (st == ATLAS_OK) {
         atlas_err ignore;
         atlas_err_init(&ignore);
@@ -307,6 +320,31 @@ static void run_repo_remove(atlas_writer *w, atlas_job *j) {
     atlas_repo_info_free(&removed);
 }
 
+/* Runs one AI-session operation.
+ *
+ * The reconciliation callback is supplied here rather than in src/ai, so that
+ * the AI service knows nothing about the job queue and the queue's coalescing
+ * rules apply unchanged: a correlate that asks for a pass is folded into any
+ * pass already pending for the same repository, exactly like a watcher event. */
+static atlas_status ai_request_sync(void *ud, int64_t repo_id, const char *dirty_paths,
+                                    size_t dirty_len, int64_t *sync_seq_out, atlas_err *err) {
+    atlas_writer *w = (atlas_writer *)ud;
+    if (repo_id <= 0) {
+        return ATLAS_OK;
+    }
+    return atlas_writer_submit_reconcile(w, repo_id, false, dirty_paths, dirty_len, sync_seq_out,
+                                         err);
+}
+
+static void run_ai(atlas_writer *w, atlas_job *j) {
+    if (j->ai == NULL) {
+        j->result = atlas_err_set(&j->result_err, ATLAS_ERR_INTERNAL,
+                                  "an AI job arrived with no operation attached");
+        return;
+    }
+    j->result = atlas_ai_apply(w->db, j->ai, ai_request_sync, w, &j->ai_result, &j->result_err);
+}
+
 /* Marks every registered repository as having an unresolved event gap. */
 typedef struct gap_ctx {
     atlas_db *db;
@@ -344,10 +382,25 @@ static void *writer_main(void *arg) {
                          atlas_err_msg(&err));
         (void)pthread_mutex_lock(&w->lock);
         w->stopping = true;
+        w->ready_failed = true;
+        w->ready_err = err;
+        (void)pthread_cond_broadcast(&w->ready_cv);
         (void)pthread_cond_broadcast(&w->job_done);
         (void)pthread_mutex_unlock(&w->lock);
         return NULL;
     }
+    /* The index exists and is at the expected version. Publishing that here,
+     * before anything else in the daemon runs, is what stops a reader — the
+     * watcher building its watch set, or an IPC request arriving the instant the
+     * socket opens — from querying a schema that has not been created yet.
+     *
+     * Without this the window is small and real: a hook that fires while systemd
+     * is still starting the daemon gets "no such table: repositories" instead of
+     * a registration, and a session start silently records nothing. */
+    (void)pthread_mutex_lock(&w->lock);
+    w->ready = true;
+    (void)pthread_cond_broadcast(&w->ready_cv);
+    (void)pthread_mutex_unlock(&w->lock);
     /* Did the previous run shut down cleanly?
      *
      * A clean stop records `stopped_at`. A record with a start and no stop means
@@ -397,6 +450,7 @@ static void *writer_main(void *arg) {
         case ATLAS_JOB_RECONCILE: run_reconcile(w, j); break;
         case ATLAS_JOB_REPO_ADD: run_repo_add(w, j); break;
         case ATLAS_JOB_REPO_REMOVE: run_repo_remove(w, j); break;
+        case ATLAS_JOB_AI: run_ai(w, j); break;
         case ATLAS_JOB_MARK_GAP: {
             atlas_err ignore;
             atlas_err_init(&ignore);
@@ -449,8 +503,9 @@ atlas_status atlas_writer_start(const char *db_path, const char *socket_path,
     atlas_buf_init(&w->socket_path);
     w->workers = workers;
     w->log = log;
+    atlas_err_init(&w->ready_err);
     if (pthread_mutex_init(&w->lock, NULL) != 0 || pthread_cond_init(&w->not_empty, NULL) != 0 ||
-        pthread_cond_init(&w->job_done, NULL) != 0) {
+        pthread_cond_init(&w->job_done, NULL) != 0 || pthread_cond_init(&w->ready_cv, NULL) != 0) {
         free(w);
         return atlas_err_set(err, ATLAS_ERR_INTERNAL, "cannot create writer synchronisation");
     }
@@ -467,6 +522,43 @@ atlas_status atlas_writer_start(const char *db_path, const char *socket_path,
         return atlas_err_set(err, ATLAS_ERR_INTERNAL, "cannot create the writer thread");
     }
     w->thread_started = true;
+
+    /* Wait for the index to be open and migrated before returning.
+     *
+     * Starting the watcher and the serve loop against a database the writer has
+     * not created yet produces exactly the failures it should: the watcher
+     * cannot enumerate repositories, and an IPC request that arrives in the
+     * window gets a hard error rather than an answer. Both were observable
+     * before this wait existed — the daemon logged "cannot build the watch set:
+     * no such table: repositories" on a first run.
+     *
+     * The deadline is generous because it covers a first-run migration on slow
+     * storage, and exceeding it is a startup failure rather than something to
+     * proceed past: a daemon whose index never opened has nothing to serve. */
+    struct timespec deadline;
+    (void)clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += 120;
+    int rc = 0;
+    (void)pthread_mutex_lock(&w->lock);
+    while (!w->ready && !w->ready_failed && rc == 0) {
+        rc = pthread_cond_timedwait(&w->ready_cv, &w->lock, &deadline);
+    }
+    bool ready = w->ready;
+    bool failed = w->ready_failed;
+    atlas_err ready_err = w->ready_err;
+    (void)pthread_mutex_unlock(&w->lock);
+
+    if (failed) {
+        atlas_writer_stop(w);
+        *err = ready_err;
+        return err->status != ATLAS_OK ? err->status : ATLAS_ERR_DB;
+    }
+    if (!ready) {
+        atlas_writer_stop(w);
+        return atlas_err_set(err, ATLAS_ERR_DB,
+                             "the Atlas index did not open within 120 seconds; refusing to serve "
+                             "against a database that may not exist");
+    }
     *out = w;
     return ATLAS_OK;
 }
@@ -490,6 +582,7 @@ void atlas_writer_stop(atlas_writer *w) {
     }
     (void)pthread_cond_destroy(&w->not_empty);
     (void)pthread_cond_destroy(&w->job_done);
+    (void)pthread_cond_destroy(&w->ready_cv);
     (void)pthread_mutex_destroy(&w->lock);
     atlas_buf_free(&w->db_path);
     atlas_buf_free(&w->socket_path);
@@ -621,14 +714,15 @@ atlas_status atlas_writer_submit_watch_state(atlas_writer *w, int64_t repo_id, i
     return submit_note(w, ATLAS_JOB_SET_WATCH, repo_id, detail, watch_state, watched_dirs, err);
 }
 
-atlas_status atlas_writer_call(atlas_writer *w, atlas_job_kind kind, const char *arg1,
-                               const char *arg2, int timeout_ms, atlas_writer_result *result,
-                               atlas_err *err) {
+static atlas_status writer_call_impl(atlas_writer *w, atlas_job_kind kind, const char *arg1,
+                                     const char *arg2, bool exact_root, int timeout_ms,
+                                     atlas_writer_result *result, atlas_err *err) {
     atlas_job *j = job_new(kind);
     if (j == NULL) {
         return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory queueing a request");
     }
     j->wants_result = true;
+    j->exact_root = exact_root;
     atlas_status st = atlas_buf_set_str(&j->arg1, arg1 != NULL ? arg1 : "", err);
     if (st == ATLAS_OK) {
         st = atlas_buf_set_str(&j->arg2, arg2 != NULL ? arg2 : "", err);
@@ -691,6 +785,108 @@ atlas_status atlas_writer_call(atlas_writer *w, atlas_job_kind kind, const char 
     }
     job_free(j);
     return st;
+}
+
+atlas_status atlas_writer_ai(atlas_writer *w, atlas_ai_op *op, int timeout_ms,
+                             atlas_ai_result *result, atlas_err *err) {
+    atlas_job *j = job_new(ATLAS_JOB_AI);
+    if (j == NULL) {
+        /* Ownership is taken unconditionally, including here: a caller that has
+         * to free the operation on some paths and not others eventually frees it
+         * on the wrong one. */
+        atlas_ai_op_free(op);
+        free(op);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory queueing an AI request");
+    }
+    j->ai = op;
+    j->wants_result = true;
+
+    (void)pthread_mutex_lock(&w->lock);
+    if (w->stopping || !queue_push(w, j)) {
+        bool stopping = w->stopping;
+        (void)pthread_mutex_unlock(&w->lock);
+        job_free(j);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                             stopping ? "the Atlas daemon is shutting down"
+                                      : "the Atlas daemon's write queue is full");
+    }
+    (void)pthread_cond_signal(&w->not_empty);
+
+    struct timespec deadline;
+    (void)clock_gettime(CLOCK_REALTIME, &deadline);
+    int ms = timeout_ms > 0 ? timeout_ms : 5000;
+    deadline.tv_sec += ms / 1000;
+    deadline.tv_nsec += (long)(ms % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    int rc = 0;
+    while (!j->done && rc == 0) {
+        rc = pthread_cond_timedwait(&w->job_done, &w->lock, &deadline);
+    }
+    bool done = j->done;
+    (void)pthread_mutex_unlock(&w->lock);
+
+    if (!done) {
+        /* Detached rather than freed: the job is still the writer's, and the
+         * writer frees it when it finishes. */
+        (void)pthread_mutex_lock(&w->lock);
+        j->wants_result = false;
+        (void)pthread_mutex_unlock(&w->lock);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                             "the Atlas daemon did not complete the request within %d ms", ms);
+    }
+
+    atlas_status st = j->result;
+    if (st == ATLAS_OK) {
+        result->session_id = j->ai_result.session_id;
+        result->repo_id = j->ai_result.repo_id;
+        result->change_set_id = j->ai_result.change_set_id;
+        result->record_id = j->ai_result.record_id;
+        result->session_created = j->ai_result.session_created;
+        result->session_unbound = j->ai_result.session_unbound;
+        /* A pointer to one of the ATLAS_AI_UNBOUND_* string literals, so copying
+         * the pointer across the thread boundary is copying the value. Nothing
+         * else may ever be put in this field. */
+        result->unbound_reason = j->ai_result.unbound_reason;
+        result->repo_registered = j->ai_result.repo_registered;
+        result->duplicate = j->ai_result.duplicate;
+        result->degraded = j->ai_result.degraded;
+        result->changed_paths = j->ai_result.changed_paths;
+        result->direct_paths = j->ai_result.direct_paths;
+        result->ambiguous_paths = j->ai_result.ambiguous_paths;
+        result->unresolved_paths = j->ai_result.unresolved_paths;
+        result->concurrent_sessions = j->ai_result.concurrent_sessions;
+        result->sync_seq = j->ai_result.sync_seq;
+        st = atlas_buf_set(&result->repo_name, j->ai_result.repo_name.data,
+                           j->ai_result.repo_name.len, err);
+        if (st == ATLAS_OK) {
+            st = atlas_buf_set(&result->root_text, j->ai_result.root_text.data,
+                               j->ai_result.root_text.len, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_buf_set(&result->degraded_reason, j->ai_result.degraded_reason.data,
+                               j->ai_result.degraded_reason.len, err);
+        }
+    } else {
+        *err = j->result_err;
+    }
+    job_free(j);
+    return st;
+}
+
+atlas_status atlas_writer_call(atlas_writer *w, atlas_job_kind kind, const char *arg1,
+                               const char *arg2, int timeout_ms, atlas_writer_result *result,
+                               atlas_err *err) {
+    return writer_call_impl(w, kind, arg1, arg2, false, timeout_ms, result, err);
+}
+
+atlas_status atlas_writer_call_repo_add(atlas_writer *w, const char *path, const char *name,
+                                        bool exact_root, int timeout_ms,
+                                        atlas_writer_result *result, atlas_err *err) {
+    return writer_call_impl(w, ATLAS_JOB_REPO_ADD, path, name, exact_root, timeout_ms, result,
+                            err);
 }
 
 int64_t atlas_writer_queue_depth(atlas_writer *w) {

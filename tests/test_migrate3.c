@@ -79,7 +79,12 @@ static void test_v2_fixture_migrates_forward(void) {
     /* The migration under test. */
     T_OK(atlas_db_migrate(db, &err), &err);
     T_EQ_INT(atlas_db_schema_version(db, &err), ATLAS_SCHEMA_VERSION);
-    T_EQ_INT(ATLAS_SCHEMA_VERSION, 3);
+    /* A v2 database migrates all the way forward, not just to 3. Pinned to the
+     * constant rather than to a literal so adding a migration does not require
+     * editing an assertion that was never about the newest version — it is
+     * about a v2 database surviving every migration after it. A2's own schema
+     * additions are asserted in tests/test_ai_schema.c. */
+    T_CHECK(ATLAS_SCHEMA_VERSION >= 3);
 
     /* Nothing was recreated or dropped. */
     T_EQ_INT(count_of(db, "SELECT count(*) FROM files;", &err), files_before);

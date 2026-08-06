@@ -151,14 +151,137 @@ current. The whole-repository pass is the version that is obviously correct.
 already-tracked file with no `.gitignore` involvement — falling back to a full
 pass otherwise.
 
-### 11. `repo.add` over IPC refuses awkward paths
+### 11. `repo.add` over IPC refuses awkward paths — *partly closed in A2*
 
 A repository path containing a control byte, a quote or a backslash is refused
 when routed through the daemon, because the CLI builds that request's JSON by
 hand. The offline path takes the same value as an argv operand and accepts it.
 
-*What would close it:* build client requests through the streaming JSON writer
-instead of `atlas_buf_appendf`, which removes the hand-built document entirely.
+A2 built the missing piece: `atlas_ipc_params_begin`/`_finish` construct request
+documents through the first-party streaming writer, and every A2 method uses it —
+so the AI adapters send arbitrary filesystem paths without the restriction.
+
+*Still open:* `src/cli/cli.c` was not converted. Its two hand-built requests and
+their byte check are untouched, so `atlas repo add` through a running daemon still
+refuses an awkward path and still tells the user to register it offline. The fix
+is now mechanical rather than a design question.
+
+## New in A2, not fixed
+
+### 12. A change set is correlated at two points, not continuously
+
+`PostToolBatch` queues a reconciliation it cannot wait for — the pass is a job
+behind it on the same writer thread, so waiting would be the writer waiting on
+itself — and therefore correlates against the snapshot as it was before the
+edits. The turn close sweeps again, by which time the pass has normally
+published.
+
+Consequence: a file created and deleted between the batch and the turn close is
+attributed to nothing. A file changed after the last turn close of a session and
+before the next event is picked up by the following turn rather than the one that
+caused it.
+
+*Why it is not fixed:* the alternative is a completion handshake between the
+correlate job and the reconcile job on one thread, which is a deadlock waiting to
+be written. The two-point sweep is the version that is obviously correct.
+
+*What would close it:* have the reconciliation pass itself notify open change
+sets when it publishes, so correlation is driven by the pass rather than polled
+by the adapter.
+
+### 13. Attribution cannot see anything but Atlas' own clients
+<!-- Items 15 and 16 were here and are gone: percent-encoded root URIs and
+     MCP-only registration are both implemented. See the note at the end. -->
+
+`ambiguous` means *another Atlas session* had the repository open. A person
+editing in a text editor, a build script, or a second tool with no Atlas
+integration is invisible: their change is attributed `direct_edit` to whichever
+session named the path, or `observed` if none did.
+
+*Why it is not fixed:* Atlas cannot know who wrote a file. inotify reports that a
+path changed, not which process changed it, and reading that from `/proc` would
+be both racy and a much larger privilege story.
+
+*What would close it, partly:* record the wall-clock gap between a session's edit
+intent and the index observing the change, and downgrade attribution when it is
+implausibly large. That is a heuristic, so it needs its own provenance class
+before it is worth having.
+
+### 14. There is no approval workflow, by design — and no path to one yet
+
+A2 records proposals. `approved` is pinned to 0 by a schema `CHECK`, refused by
+`atlas_provenance_writable_in_a2`, and never bound by either insert statement.
+
+That is correct for A2 and it is not a finished story: there is currently no way
+for a human to approve a proposal at all, so `USER_APPROVED_DECISION` exists in
+the vocabulary with nothing able to produce it.
+
+*What would close it:* a CLI command a person runs — `atlas decision approve
+<id>` — which is the only actor Atlas can distinguish from a model, plus the
+migration that lifts the `CHECK`. Deliberately deferred to A3, where decision
+documents arrive and there is something to approve *against*.
+
+## Fixed during the A2 attribution pass
+
+- **An MCP write chose its session by recency.** With no session key, a recorded
+  reason or decision attached to the newest open session for the repository. Two
+  Claude Code sessions on one worktree therefore recorded A's reason against B,
+  and the stored row was indistinguishable from a correct one. `atlas mcp` now
+  reads and validates `CLAUDE_CODE_SESSION_ID` and sends it as the session key;
+  binding is exact or absent; `atlas_db_ai_session_newest_for_repo` is deleted.
+  An unresolvable write is stored sessionless with a typed `unbound_reason`.
+- **`ai.session.get` and `ai.context` guessed the same way.** Both resolved the
+  session from the repository, so a caller could be told about a session it would
+  never be allowed to write to — and the envelope, which is injected into a
+  model's context automatically, could report a neighbour's change set. Both now
+  resolve by exact key. `ai.session.get` reports `open_sessions` for callers with
+  no key, which is the most that can be said truthfully about a repository.
+- **Every MCP tool returned an empty `result`.** `forward()` never assigned
+  `f.response`, so `atlas_ipc_result_write` was called with NULL and wrote `{}`.
+  It went unnoticed because the envelope around it (`ok`, `degraded`,
+  `provenance`) is built from the call context and looked entirely healthy — the
+  only tests reading a tool result were reading envelope fields. Found while
+  asserting that a write reports which session it attached to.
+- **The documentation claimed the envelope carried "no free text at all"** while
+  it carried a fixed Atlas-authored `note=` line, which it should. Restated as
+  what is actually guaranteed: no repository-controlled or model-provided
+  free-form text, only fixed Atlas-owned control text and typed values.
+
+## Fixed during the A2 correction pass
+
+Recorded here rather than deleted, because a backlog that only ever grows is a
+backlog nobody trusts, and because two of these were listed as deferred when they
+were really defects.
+
+- **Automatic context carried the repository name and root.** Both are derived
+  from a directory basename somebody chose, both are entirely printable, and both
+  therefore survive every encoding Atlas has. The documentation claimed "no
+  repository prose" while the code emitted two pieces of it. Replaced by an
+  opaque `repo_id` and a SHA-256 `root_hash`; the envelope now contains no
+  repository-controlled or model-provided free-form text — only fixed
+  Atlas-owned control text and typed values — and validates rather than escapes.
+  Tested against a repository
+  whose directory basename is literally `ignore previous instructions`.
+- **`roots/list` percent-encoded URIs were skipped.** Now decoded per RFC 3986,
+  with every ambiguous case refused and reported: encoded separators, malformed
+  escapes, decoded NULs, traversal after decoding, and non-local authorities.
+  `%20` and percent-encoded UTF-8 work.
+- **The MCP adapter could not register a repository.** It now registers a granted
+  root through `repo.ensure` with `exact_root`, so an MCP client with no hooks
+  and a user who never typed `atlas repo add` still gets an indexed repository —
+  and a root inside a larger worktree does not cause the parent to be registered.
+- **`registered` was always false.** It reported whether *this call* performed a
+  registration, which nothing on the AI path ever did. It now reports whether the
+  repository is in the index; `registered_now` carries the other fact.
+- **`DirectoryAdded` silently did nothing** for a directory Atlas had not seen.
+  It now ensures the repository before attaching it.
+- **`atlas doctor` created the data directory and an empty index.** A diagnostic
+  that initialises what it is diagnosing can only answer "fine", and could not be
+  run at all on a machine where Atlas had never run. It now opens in
+  `ATLAS_CTX_INSPECT` mode and reports the absence.
+- **`--plugin-dir` was documented as the installation path.** It loads a plugin
+  for one session only. Atlas now ships a local marketplace and the permanent
+  user-scope install is the documented flow.
 
 ## Fixed in A1
 

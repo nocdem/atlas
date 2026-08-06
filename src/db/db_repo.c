@@ -342,6 +342,48 @@ atlas_status atlas_db_repo_get_by_root(atlas_db *db, const void *root_raw, size_
                         root_raw, root_len, true, out, found, err);
 }
 
+atlas_status atlas_db_repo_get_containing(atlas_db *db, const void *path, size_t path_len,
+                                          atlas_repo_info *out, bool *found_out, atlas_err *err) {
+    *found_out = false;
+    if (path == NULL || path_len == 0) {
+        return ATLAS_OK;
+    }
+
+    /* Walked here rather than expressed as a prefix query on purpose. A LIKE or
+     * a substring comparison on `root_path` would match "/srv/proj" against
+     * "/srv/project", which is a different repository; walking component by
+     * component compares whole paths and cannot. It is also longest-match, so a
+     * linked worktree registered inside another repository's tree resolves to
+     * itself. */
+    atlas_buf probe = ATLAS_BUF_INIT;
+    atlas_status st = atlas_buf_set(&probe, path, path_len, err);
+    while (st == ATLAS_OK && probe.len > 0) {
+        /* A trailing separator is not part of a canonical root. */
+        while (probe.len > 1u && probe.data[probe.len - 1u] == '/') {
+            probe.len--;
+            probe.data[probe.len] = '\0';
+        }
+        st = atlas_db_repo_get_by_root(db, probe.data, probe.len, out, found_out, err);
+        if (st != ATLAS_OK || *found_out) {
+            break;
+        }
+        size_t cut = probe.len;
+        while (cut > 0 && probe.data[cut - 1u] != '/') {
+            cut--;
+        }
+        if (cut <= 1u) {
+            /* No separator left, or only the leading one. "/" is never a
+             * repository root Atlas will resolve to: matching it would make a
+             * stray registration capture every path on the machine. */
+            break;
+        }
+        probe.len = cut - 1u;
+        probe.data[probe.len] = '\0';
+    }
+    atlas_buf_free(&probe);
+    return st;
+}
+
 atlas_status atlas_db_repo_get_by_id(atlas_db *db, int64_t repo_id, atlas_repo_info *out,
                                      bool *found, atlas_err *err) {
     /* The daemon queues work by id, not by name: a repository that is renamed or

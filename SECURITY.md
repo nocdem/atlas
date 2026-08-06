@@ -232,6 +232,14 @@ tree are `atlas` and `git`, that no `AF_INET` socket or `connect` is attempted, 
 no child opens `/dev/tty`, that a decoy repository named by an inherited `GIT_DIR`
 is never read, that the working tree and `.git` digests are unchanged, and that a
 promisor repository yields a valid structured JSON error.
+## Known findings
+
+The controls above describe what Atlas is designed to do. For what an audit actually
+found — including one verified bypass of the partial-clone refusal, the concurrency
+hazards that will block the next phase, and the verified false positives — see
+[docs/security-audit-a0.md](docs/security-audit-a0.md). Start there for any security
+sweep; do not treat this file's claims as proof on their own.
+
 ## Reporting a vulnerability
 
 Atlas has no public distribution or security contact yet. Until it does, report

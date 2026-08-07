@@ -287,3 +287,94 @@ flattened by concatenation; it does not make the text safe, and nothing could.
 
 What keeps that survivable is the paragraph above: an adapter that cannot act
 cannot be talked into acting.
+
+
+## A4: approved prose is still untrusted data
+
+This is the single most important sentence in the phase, and it is easy to lose:
+
+> **Approval changes a record's status. It does not change the nature of its
+> bytes.**
+
+An approved decision is accepted project policy expressed in prose that
+somebody — often a model — wrote. It is `UNTRUSTED_DATA` wherever it is
+reported, at every status.
+
+The failure this prevents is concrete. If approval made text authoritative, the
+attack is: propose a decision whose body contains instructions, give it a
+plausible title, get it approved on the strength of the title, and have every
+subsequent model treat the body as a directive. The approval prompt would have
+become a prompt-injection channel with a human-shaped step in the middle.
+
+So:
+
+- **No decision prose enters automatic context, at any status.** The envelope
+  gains four integers and one more integer — proposed, approved, rejected,
+  superseded, and how many approved decisions have a link needing review — and
+  nothing else. No title, no rationale, no path, no symbol name, and no decision
+  id either. The envelope's allowlist did not need widening to fit A4, and
+  `tests/test_ai_trust.c` enumerates the complete line vocabulary and fails on
+  any line Atlas did not start.
+- **Decision text reaches a model only through an explicit MCP call**, where
+  every object carrying prose is labelled `trust: UNTRUSTED_DATA` and the
+  document carries a `trust_note` saying what approval does and does not mean.
+  The label is on every element rather than once per response, because a
+  consumer that lifts one element out of an array must carry the label with the
+  text it took.
+- **The MCP surface is progressive.** `atlas_decisions` returns ids, statuses
+  and titles; bodies are fetched one at a time with `atlas_decision`. That is
+  not politeness about response size: pulling every decision body in a
+  repository into a model's context because it asked a broad question would put
+  a large amount of somebody else's text in front of the model for no reason.
+
+### Validation, not escaping, for the durable record
+
+A2 established that the safe-text encoder defends terminals and parsers and not
+meaning. A4 adds a second position for the one place where a value can be
+*required* to have a shape.
+
+Decision prose is refused outright if it contains NUL, C0 controls other than
+newline and tab, DEL, C1 controls, `U+2028`/`U+2029`, or the bidi overrides and
+isolates `U+202A`–`U+202E` / `U+2066`–`U+2069`. The bidi set is the Trojan
+Source set: it reorders displayed text without changing the bytes, so an
+approval prompt could show one decision while the record held another.
+
+They are refused rather than escaped because a decision document is durable,
+canonical and read by a person who is about to approve it. `atlas_safe()` still
+runs on every path to a terminal or a JSON document, and
+`atlas_terminal_write()` independently refuses any byte a terminal would act
+on — three layers, on the one display where an escape sequence could rewrite
+what somebody thinks they are agreeing to.
+
+### What the approval boundary is, and is not
+
+The trust boundary A2 established is about *text*: repository prose reaching a
+model. A4 adds one about *capability*, and it is narrower than it first looks.
+
+Atlas hands a model no capability that changes a lifecycle state. There is no
+approval tool, no schema accepts a capability argument, no hook can produce one,
+and no request argument asserts one. That is a property of Atlas' surface and
+every part of it is tested.
+
+Atlas does **not** claim a model is unable to approve a decision. An agent with
+shell access can allocate a pseudo-terminal and run the CLI, and Atlas cannot
+distinguish that invocation from a person's. The narrower claim is the one that
+is true, and stating the broader one would invite exactly the misplaced trust
+this document exists to prevent.
+
+The plugin skill therefore *instructs* Claude not to drive the operator channel
+on a user's behalf. That is an instruction, not a barrier, and it is described
+as one.
+
+### The approval prompt
+
+The interactive prompt shows the document id, the revision, the status, the
+content digest, and the title and body **explicitly labelled as untrusted
+project text** rather than presented as part of Atlas' own output. It then
+states, in Atlas' own words, that what will be recorded is that the channel was
+used and not that a person was identified.
+
+The operator types the first eight hex characters of the revision's content
+hash. That is not a secret; it is a value the prompt just displayed. What it
+buys is that the confirmation is about one specific revision's bytes — an
+operator cannot type "yes" and approve whatever happens to be current.

@@ -11,6 +11,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #include "atlas/code.h"
 #include "atlas/datadir.h"
@@ -458,5 +459,259 @@ typedef atlas_status (*atlas_diff_entry_cb)(const atlas_diff_entry *e, void *ud,
 atlas_status atlas_service_diff(atlas_ctx *ctx, const char *name, const atlas_diff_opts *opts,
                                 atlas_diff_entry_cb cb, void *ud, atlas_diff_report *report,
                                 atlas_err *err);
+
+/* --- A4: decision documents ------------------------------------------------
+ *
+ * All A4 command behaviour lives in src/core/service_decision.c. The CLI parses
+ * arguments and picks a renderer; the renderers format what these produce.
+ *
+ * Reads go straight to the index on the calling thread, like every other read
+ * command. **Every write is routed to the daemon's writer thread** when one is
+ * answering, and taken on this thread only when this process holds the
+ * data-directory lock — which is the same rule `atlas code sync --rebuild`
+ * follows, and for the same reason: exactly one process writes the index. */
+
+/* What a listing shows for one decision. Owned buffers.
+ *
+ * `title` is model- or operator-authored prose. It arrives already safe-encoded
+ * from the daemon, or is encoded by the renderer when it came from the local
+ * index; either way it stays UNTRUSTED_DATA, because approval changes a
+ * record's status and not the nature of its bytes. */
+typedef struct atlas_decision_summary {
+    atlas_buf uid;
+    atlas_buf status;
+    atlas_buf revision_state;
+    atlas_buf title;
+    atlas_buf content_hash;
+    atlas_buf proposed_by;
+    atlas_buf superseded_by;
+    atlas_buf created_at;
+    atlas_buf updated_at;
+    int64_t revision_no;
+    int64_t latest_revision_no;
+    int64_t link_count;
+} atlas_decision_summary;
+
+void atlas_decision_summary_init(atlas_decision_summary *s);
+void atlas_decision_summary_free(atlas_decision_summary *s);
+
+/* The counts a listing reports alongside its page. */
+typedef struct atlas_decision_counts {
+    int64_t proposed;
+    int64_t approved;
+    int64_t rejected;
+    int64_t superseded;
+} atlas_decision_counts;
+
+/* One resolved link, ready to render. */
+typedef struct atlas_decision_link_view {
+    atlas_buf kind;
+    atlas_buf value;    /* the path, commit, symbol or target id, safe-encoded */
+    atlas_buf detail;   /* the symbol's file or kind, when there is one */
+    atlas_buf currency; /* CURRENT | CHANGED | MISSING | AMBIGUOUS | UNKNOWN */
+    atlas_buf analyzer;
+    int64_t analyzer_version;
+    int64_t matches;
+} atlas_decision_link_view;
+
+void atlas_decision_link_view_init(atlas_decision_link_view *v);
+void atlas_decision_link_view_free(atlas_decision_link_view *v);
+
+/* A whole decision, for `decision show` and `decision export`. */
+typedef struct atlas_decision_document {
+    atlas_decision_summary summary;
+    atlas_buf repo;
+    atlas_buf context_text;
+    atlas_buf decision_text;
+    atlas_buf rationale_text;
+    atlas_buf consequences_text;
+    atlas_buf scope;
+    atlas_buf basis_head;
+    /* The repository identity this revision captured when it was written, or
+     * empty when none was knowable then. Immutable, hashed, and deliberately
+     * distinct from the document's current attachment identity. */
+    atlas_buf basis_repo_identity;
+    atlas_buf unbound_reason;
+    atlas_buf alternatives[ATLAS_DECISION_MAX_ALTERNATIVES];
+    size_t alternative_count;
+    atlas_decision_link_view links[ATLAS_DECISION_MAX_LINKS];
+    size_t link_count;
+    int64_t links_needing_review;
+    int64_t imported_from_a2_decision;
+    bool session_unbound;
+    /* Whether Atlas has looked. A link's currency is UNKNOWN rather than
+     * MISSING when the relevant index has never completed a pass, and a reader
+     * has to be able to tell those apart. */
+    bool file_index_known;
+    bool code_index_known;
+    /* Whether the cached status agrees with the append-only ledger. Reported,
+     * never repaired. */
+    bool ledger_agrees;
+} atlas_decision_document;
+
+void atlas_decision_document_init(atlas_decision_document *d);
+void atlas_decision_document_free(atlas_decision_document *d);
+
+/* One entry in a document's timeline. Borrowed for the callback only. */
+typedef struct atlas_decision_timeline_entry {
+    const char *event;
+    const char *actor;
+    const char *content_hash;
+    const char *superseded_by;
+    const char *detail;
+    const char *at;
+    int64_t revision_no;
+    bool operator_channel;
+} atlas_decision_timeline_entry;
+
+/* What a lifecycle write reports back. */
+typedef struct atlas_decision_outcome {
+    atlas_buf repo;
+    atlas_buf uid;
+    atlas_buf state;
+    atlas_buf replaced_by;
+    atlas_buf unbound_reason;
+    char content_hash[ATLAS_SHA256_HEX_LEN + 1u];
+    int64_t revision_no;
+    int64_t superseded_revision_no;
+    bool created;
+    bool duplicate;
+    bool session_unbound;
+    bool via_daemon;
+    /* True for a transition the operator channel authorised. It means the
+     * channel was used; it does not identify a person. */
+    bool operator_confirmed;
+} atlas_decision_outcome;
+
+void atlas_decision_outcome_init(atlas_decision_outcome *o);
+void atlas_decision_outcome_free(atlas_decision_outcome *o);
+
+/* What a proposal carries in from the command line. Every field is validated
+ * before it leaves the CLI layer. */
+typedef struct atlas_decision_input {
+    const char *title;
+    const char *context_text;
+    const char *decision_text;
+    const char *rationale_text;
+    const char *consequences_text;
+    const char *scope;
+    const char *const *alternatives;
+    size_t alternative_count;
+    const char *const *paths;
+    size_t path_count;
+    const char *const *commits;
+    size_t commit_count;
+    const char *const *symbols;
+    size_t symbol_count;
+    const char *dedup_key;
+} atlas_decision_input;
+
+typedef atlas_status (*atlas_decision_summary_cb)(const atlas_decision_summary *s, void *ud,
+                                                  atlas_err *err);
+typedef atlas_status (*atlas_decision_timeline_cb)(const atlas_decision_timeline_entry *e, void *ud,
+                                                   atlas_err *err);
+
+/* Which listing. One function rather than four, because they differ only in the
+ * predicate and four would be four places for the projection to drift. */
+typedef enum atlas_decision_list_mode {
+    ATLAS_DECISION_LIST_ALL = 0,
+    ATLAS_DECISION_LIST_STATUS,
+    ATLAS_DECISION_LIST_SEARCH,
+    ATLAS_DECISION_LIST_PATH
+} atlas_decision_list_mode;
+
+typedef struct atlas_decision_list_opts {
+    atlas_decision_list_mode mode;
+    const char *status; /* LIST_STATUS */
+    const char *query;  /* LIST_SEARCH */
+    const char *path;   /* LIST_PATH, in the safe text encoding */
+    int64_t limit;
+} atlas_decision_list_opts;
+
+atlas_status atlas_service_decision_list(atlas_ctx *ctx, const char *repo,
+                                         const atlas_decision_list_opts *opts,
+                                         atlas_decision_summary_cb cb, void *ud,
+                                         atlas_decision_counts *counts, int64_t *count_out,
+                                         bool *more_out, atlas_err *err);
+/* One whole decision. `revision_no` of 0 means the effective revision — the
+ * approved one when there is one, the newest otherwise. */
+atlas_status atlas_service_decision_show(atlas_ctx *ctx, const char *repo, const char *uid,
+                                         int64_t revision_no, atlas_decision_document *out,
+                                         atlas_err *err);
+atlas_status atlas_service_decision_history(atlas_ctx *ctx, const char *repo, const char *uid,
+                                            atlas_decision_summary_cb rev_cb,
+                                            atlas_decision_timeline_cb event_cb, void *ud,
+                                            bool *ledger_agrees_out, atlas_err *err);
+
+atlas_status atlas_service_decision_propose(atlas_ctx *ctx, const char *repo,
+                                            const atlas_decision_input *in,
+                                            atlas_decision_outcome *out, atlas_err *err);
+atlas_status atlas_service_decision_revise(atlas_ctx *ctx, const char *repo, const char *uid,
+                                           const atlas_decision_input *in,
+                                           atlas_decision_outcome *out, atlas_err *err);
+
+/* Decision documents attached to no live repository.
+ *
+ * `repo remove` detaches decisions rather than deleting them — they are the one
+ * canonical record in the index — and a detached document appears in no
+ * repository listing. Without this a user who removed a repository would
+ * conclude Atlas had destroyed their approval history, which is exactly the
+ * wrong thing to conclude. */
+atlas_status atlas_service_decision_orphans(atlas_ctx *ctx, int64_t limit,
+                                            atlas_decision_summary_cb cb, void *ud,
+                                            int64_t *count_out, bool *more_out, atlas_err *err);
+
+/* Creates an A4 document from an A2 `ai_decisions` proposal.
+ *
+ * The A2 row is read and left exactly as it was: still `approved = 0`, still
+ * present, still listed. The new document is PROPOSED and carries a pointer
+ * back to it. Promotion is an explicit act rather than something a migration
+ * did, because a migration that manufactured decision documents out of model
+ * proposals would be inventing records nobody wrote. */
+atlas_status atlas_service_decision_promote(atlas_ctx *ctx, const char *repo, int64_t legacy_id,
+                                            atlas_decision_outcome *out, atlas_err *err);
+
+/* The A2 proposals in one repository, with the A4 document each was promoted
+ * into when it was. Read-only over the A2 tables. */
+typedef struct atlas_decision_legacy_view {
+    int64_t id;
+    atlas_buf title;      /* UNTRUSTED_DATA */
+    atlas_buf statement;  /* UNTRUSTED_DATA */
+    atlas_buf provenance;
+    atlas_buf created_at;
+    atlas_buf imported_uid; /* empty when not promoted */
+    int64_t path_count;
+    bool imported;
+} atlas_decision_legacy_view;
+
+void atlas_decision_legacy_view_init(atlas_decision_legacy_view *v);
+void atlas_decision_legacy_view_free(atlas_decision_legacy_view *v);
+
+typedef atlas_status (*atlas_decision_legacy_view_cb)(const atlas_decision_legacy_view *v, void *ud,
+                                                      atlas_err *err);
+
+atlas_status atlas_service_decision_legacy(atlas_ctx *ctx, const char *repo, int64_t limit,
+                                           atlas_decision_legacy_view_cb cb, void *ud,
+                                           int64_t *count_out, bool *more_out, atlas_err *err);
+
+/* --- the operator channel ---
+ *
+ * `atlas_service_decision_confirm` is the whole of it: it obtains a
+ * capability, displays the exact values on the terminal, reads a confirmation
+ * from `/dev/tty`, and spends the capability. There is no way to reach the
+ * spending half without the displaying half, which is the point.
+ *
+ * `allow_yes` is not a parameter. `--yes` is refused by the CLI before this is
+ * called and there is nothing here that could honour it. */
+atlas_status atlas_service_decision_confirm(atlas_ctx *ctx, const char *repo, const char *uid,
+                                            atlas_decision_intent intent,
+                                            const char *replacement_uid, int64_t revision_no,
+                                            atlas_decision_outcome *out, atlas_err *err);
+
+/* Markdown or JSON, to a stream. Never written into the target repository:
+ * Atlas is read-only with respect to a registered worktree, and a decision
+ * document is Atlas' record rather than the project's file. */
+atlas_status atlas_service_decision_export_markdown(const atlas_decision_document *doc, FILE *out,
+                                                    atlas_err *err);
 
 #endif /* ATLAS_SERVICE_H */

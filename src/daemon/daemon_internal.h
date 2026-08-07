@@ -16,6 +16,7 @@
 #include "atlas/buf.h"
 #include "atlas/daemon.h"
 #include "atlas/db.h"
+#include "atlas/decision_ops.h"
 #include "atlas/error.h"
 #include "atlas/limits.h"
 #include "atlas/workers.h"
@@ -46,7 +47,16 @@ typedef enum atlas_job_kind {
      * IPC layer before anything is queued, and the writer's switch stays a
      * switch rather than becoming a second dispatch table that can drift from
      * the first. */
-    ATLAS_JOB_AI
+    ATLAS_JOB_AI,
+    /* A4. One job kind carrying one typed decision operation, for exactly the
+     * reasons ATLAS_JOB_AI is one: validation happens in the IPC layer before
+     * anything is queued, and the writer's switch stays a switch.
+     *
+     * Every lifecycle transition comes through here, including the ones the
+     * operator channel authorises — a challenge is a write, so issuing one is a
+     * writer job too. There is no path to `atlas_decision_apply` that does not
+     * run on the writer thread. */
+    ATLAS_JOB_DECISION
 } atlas_job_kind;
 
 typedef struct atlas_job atlas_job;
@@ -92,6 +102,11 @@ struct atlas_job {
      * would have to be spliced into a response verbatim. */
     atlas_ai_op *ai;
     atlas_ai_result ai_result;
+
+    /* A4. Same ownership rule as `ai`: the job owns the operation and frees it,
+     * and the result is typed rather than a JSON fragment. */
+    atlas_decision_op *decision;
+    atlas_decision_result decision_result;
 };
 
 /* What a completed mutation reports back. */
@@ -144,6 +159,16 @@ atlas_status atlas_writer_call_repo_add(atlas_writer *w, const char *path, const
  * keeps src/ai free of any knowledge of the job queue. */
 atlas_status atlas_writer_ai(atlas_writer *w, atlas_ai_op *op, int timeout_ms,
                              atlas_ai_result *result, atlas_err *err);
+
+/* Queues one decision-lifecycle operation and waits for it, bounded by
+ * `timeout_ms`.
+ *
+ * Takes ownership of `op` unconditionally, including on the failure paths, so a
+ * caller has exactly one thing to do with it — the same contract
+ * `atlas_writer_ai` has, and for the same reason: an ownership rule that
+ * depends on the outcome is one that leaks on the path nobody tests. */
+atlas_status atlas_writer_decision(atlas_writer *w, atlas_decision_op *op, int timeout_ms,
+                                   atlas_decision_result *result, atlas_err *err);
 
 /* Records that changes may have been missed for a repository. Fire and forget:
  * the watcher has nothing useful to do with a failure here, and the periodic

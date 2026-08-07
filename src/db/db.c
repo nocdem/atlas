@@ -64,26 +64,68 @@ atlas_status atlas_db_exec_sql(atlas_db *db, const char *sql, atlas_err *err) {
 
 atlas_status atlas_db_prepare(atlas_db *db, const char *sql, sqlite3_stmt **out, atlas_err *err) {
     *out = NULL;
+    bool collided = false;
     for (size_t i = 0; i < db->stmt_cache_count; i++) {
-        if (db->stmt_cache[i].sql == sql && !db->stmt_cache[i].in_use) {
-            db->stmt_cache[i].in_use = true;
-            /* Reset rather than re-prepare. The reset's return code is the
-             * previous step's error, which the previous caller already saw, so
-             * it is deliberately ignored here. */
-            (void)sqlite3_reset(db->stmt_cache[i].stmt);
-            (void)sqlite3_clear_bindings(db->stmt_cache[i].stmt);
-            *out = db->stmt_cache[i].stmt;
-            return ATLAS_OK;
+        /* Pointer first, then contents.
+         *
+         * The cache is keyed on the pointer because every call site passes a
+         * string literal, and a pointer compare is what makes a hit free. But a
+         * *constructed* string is not guaranteed to have a fresh address: a
+         * caller that formats SQL into a reused buffer gets the same pointer
+         * back on the next call, and would then be handed the statement that
+         * was prepared for the previous, different text. The header says such a
+         * caller "simply misses the cache", and without this line that is
+         * false — it hits, wrongly, and executes the wrong query with the right
+         * bindings.
+         *
+         * That is a silent-wrong-answer class of bug, so it is closed here
+         * rather than left to a contract somebody has to remember. The `strcmp`
+         * runs only when the pointer already matched — a few hundred bytes
+         * against a statement execution — and it compares against the cache's
+         * own copy, because the caller's buffer may since have been freed. */
+        if (db->stmt_cache[i].sql != sql || db->stmt_cache[i].in_use) {
+            continue;
         }
+        if (strcmp(db->stmt_cache[i].sql_owned, sql) != 0) {
+            /* Same address, different text: a reused buffer rather than a
+             * literal. Not this statement, and not cacheable either — see
+             * below. */
+            collided = true;
+            continue;
+        }
+        db->stmt_cache[i].in_use = true;
+        /* Reset rather than re-prepare. The reset's return code is the previous
+         * step's error, which the previous caller already saw, so it is
+         * deliberately ignored here. */
+        (void)sqlite3_reset(db->stmt_cache[i].stmt);
+        (void)sqlite3_clear_bindings(db->stmt_cache[i].stmt);
+        *out = db->stmt_cache[i].stmt;
+        return ATLAS_OK;
     }
     if (sqlite3_prepare_v2(db->h, sql, -1, out, NULL) != SQLITE_OK) {
         return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot prepare statement");
     }
-    if (db->stmt_cache_count < ATLAS_DB_STMT_CACHE) {
-        db->stmt_cache[db->stmt_cache_count].sql = sql;
-        db->stmt_cache[db->stmt_cache_count].stmt = *out;
-        db->stmt_cache[db->stmt_cache_count].in_use = true;
-        db->stmt_cache_count++;
+    /* Cached only when the pointer can be trusted as an identity.
+     *
+     * `collided` means some entry already holds this address with different
+     * text, which proves the caller is reusing a buffer. Caching it would add a
+     * second entry under the same key that the next call has to skip, and the
+     * call after that a third — a slow leak of cache slots for a caller that
+     * cannot benefit from them anyway. Such a caller simply prepares each time,
+     * which is what the header has always said happens. */
+    if (!collided && db->stmt_cache_count < ATLAS_DB_STMT_CACHE) {
+        char *copy = malloc(strlen(sql) + 1u);
+        if (copy != NULL) {
+            memcpy(copy, sql, strlen(sql) + 1u);
+            db->stmt_cache[db->stmt_cache_count].sql = sql;
+            db->stmt_cache[db->stmt_cache_count].sql_owned = copy;
+            db->stmt_cache[db->stmt_cache_count].stmt = *out;
+            db->stmt_cache[db->stmt_cache_count].in_use = true;
+            db->stmt_cache_count++;
+        }
+        /* A failed copy is not an error: the statement is still valid and the
+         * caller finalises it through atlas_db_finish. Caching is an
+         * optimisation and is allowed to decline. */
     }
     return ATLAS_OK;
 }
@@ -110,6 +152,8 @@ void atlas_db_finish(atlas_db *db, sqlite3_stmt *stmt) {
 void atlas_db_cache_clear(atlas_db *db) {
     for (size_t i = 0; i < db->stmt_cache_count; i++) {
         sqlite3_finalize(db->stmt_cache[i].stmt);
+        free(db->stmt_cache[i].sql_owned);
+        db->stmt_cache[i].sql_owned = NULL;
     }
     db->stmt_cache_count = 0;
 }

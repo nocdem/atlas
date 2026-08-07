@@ -253,11 +253,28 @@ atlas_status atlas_ai_context_render(const atlas_ai_context *c, atlas_buf *out, 
             st = atlas_buf_appendf(out, err, "changed_paths=%lld unresolved_reasons=%lld\n",
                                    (long long)c->changed_paths, (long long)c->unresolved_reasons);
         }
+        /* A4. Real lifecycle counts, replacing A2's placeholder zero for
+         * approvals.
+         *
+         * Integers only, and that is the whole of what the decision record
+         * contributes here. A decision's title is prose somebody else wrote and
+         * an APPROVED status does not change that — approval makes a document
+         * accepted project policy, it does not make its bytes an instruction —
+         * so no decision prose enters automatic context at any status. The
+         * envelope's rule is unchanged and did not need widening: every byte
+         * emitted below is a digit, a lowercase letter, `_` or `=`. */
         if (st == ATLAS_OK) {
             st = atlas_buf_appendf(out, err,
-                                   "decisions_proposed=%lld decisions_approved=%lld\n",
+                                   "decisions_proposed=%lld decisions_approved=%lld "
+                                   "decisions_rejected=%lld decisions_superseded=%lld\n",
                                    (long long)c->proposed_decisions,
-                                   (long long)c->approved_decisions);
+                                   (long long)c->approved_decisions,
+                                   (long long)c->rejected_decisions,
+                                   (long long)c->superseded_decisions);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_buf_appendf(out, err, "decisions_needing_review=%lld\n",
+                                   (long long)c->decisions_needing_review);
         }
         if (st == ATLAS_OK) {
             st = atlas_buf_appendf(out, err, "session=%lld change_set=%lld\n",

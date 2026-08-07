@@ -370,6 +370,49 @@ atlas_status atlas_service_doctor(atlas_ctx *ctx, atlas_doctor_report *out, atla
         }
     }
 
+    /* A4. The decision ledger is canonical and the status columns on
+     * `decision_documents` are a cache of it. `atlas_db_decision_verify_all`
+     * replays the ledger and compares.
+     *
+     * **Reported, never repaired.** Doctor observes and changes nothing — it
+     * opens in `ATLAS_CTX_INSPECT` mode and creates no data directory, no
+     * index and no lock — and a diagnostic that silently fixed what it found
+     * could not tell you whether the fault recurs. A disagreement here means
+     * the cached status is wrong and the ledger is right; the remedy is in
+     * docs/decision-lifecycle.md under Recovery. */
+    {
+        int64_t checked = 0;
+        int64_t mismatched = 0;
+        int64_t rehashed = 0;
+        int64_t corrupt = 0;
+        atlas_status vst = atlas_db_decision_verify_all(ctx->db, &checked, &mismatched, &rehashed,
+                                                        &corrupt, err);
+        if (vst != ATLAS_OK) {
+            return vst;
+        }
+        if (mismatched > 0) {
+            st = add_problem(out, err,
+                             "a decision document's cached status disagrees with its append-only "
+                             "event ledger; the ledger is canonical");
+            if (st != ATLAS_OK) {
+                return st;
+            }
+        }
+        if (corrupt > 0) {
+            /* A revision whose stored content no longer hashes to its recorded
+             * digest. Atlas never updates a content column, so this means
+             * something outside Atlas changed one — and any approval that bound
+             * to that digest now covers bytes that are not there. */
+            st = add_problem(out, err,
+                             "a decision revision's stored content no longer matches its "
+                             "canonical content hash; an approval bound to that hash no longer "
+                             "describes what is stored");
+            if (st != ATLAS_OK) {
+                return st;
+            }
+        }
+    }
+
     out->repo_count = 0;
     return atlas_db_repo_list(ctx->db, count_repos_cb, &out->repo_count, err);
 }

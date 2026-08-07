@@ -1,0 +1,704 @@
+/* Atlas - A4: the operator channel, and the exact shape of its limits.
+ * Copyright 2026 The Atlas Authors. Licensed under the Apache License 2.0.
+ *
+ * This suite is the honest demonstration of what `LOCAL_OPERATOR_CONFIRMED`
+ * means, in both directions.
+ *
+ * It proves the channel **excludes** everything it claims to: an approval
+ * cannot be produced by piped standard input, by a redirected terminal, by
+ * `--yes`, by an environment variable, or by a JSON request. Those are real,
+ * checkable properties.
+ *
+ * And it proves, by doing it, that the channel **is not an identity**: the
+ * interactive test allocates a pseudo-terminal with `posix_openpt`, forks
+ * `atlas` onto it, and types the confirmation from a program. If a test can do
+ * that, so can anything else running as the same user — which is exactly why
+ * Atlas records that its operator channel was used rather than claiming a
+ * person acted. A suite that could not do this would be a suite whose subject
+ * was making a stronger claim than the code supports.
+ *
+ * `posix_openpt` / `grantpt` / `unlockpt` / `ptsname_r` are POSIX and in libc.
+ * No `-lutil`, no `forkpty`, no new dependency.
+ */
+#define _GNU_SOURCE 1
+
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <sys/ioctl.h>
+#include <termios.h>
+#include <unistd.h>
+
+#include "atlas/atlas.h"
+#include "atlas/decision.h"
+#include "atlas/proc.h"
+#include "atlas_test.h"
+#include "db/db_internal.h"
+#include "support/fixture.h"
+
+/* --- the fixture ------------------------------------------------------------ */
+
+typedef struct env {
+    fixture fx;
+    atlas_buf uid;
+} env;
+
+static void run_atlas(env *e, const char *const *extra, size_t n, atlas_buf *out, int *code) {
+    atlas_err err;
+    atlas_err_init(&err);
+    const char *argv[24];
+    size_t k = 0;
+    argv[k++] = "--data-dir";
+    argv[k++] = fx_data_dir(&e->fx);
+    T_REQUIRE(n + k <= sizeof(argv) / sizeof(argv[0]));
+    for (size_t i = 0; i < n; i++) {
+        argv[k++] = extra[i];
+    }
+    atlas_buf errout = ATLAS_BUF_INIT;
+    T_OK(fx_atlas(argv, k, out, &errout, code, &err), &err);
+    atlas_buf_free(&errout);
+}
+
+/* Registers a repository and proposes one decision, returning its id. */
+static void env_open(env *e) {
+    atlas_err err;
+    atlas_err_init(&err);
+    memset(e, 0, sizeof(*e));
+    atlas_buf_init(&e->uid);
+    T_OK(fx_open(&e->fx, &err), &err);
+    T_OK(fx_init_repo(&e->fx, fx_repo(&e->fx), NULL, &err), &err);
+    T_OK(fx_write(fx_repo(&e->fx), "main.c", "int main(void){return 0;}\n", &err), &err);
+    T_OK(fx_add_all(&e->fx, fx_repo(&e->fx), &err), &err);
+    T_OK(fx_commit(&e->fx, fx_repo(&e->fx), "init", &err), &err);
+
+    int code = 0;
+    atlas_buf out = ATLAS_BUF_INIT;
+    const char *add[] = {"repo", "add", fx_repo(&e->fx), "--name", "proj"};
+    run_atlas(e, add, 5u, &out, &code);
+    T_EQ_INT(code, 0);
+    atlas_buf_reset(&out);
+
+    const char *scan[] = {"scan", "proj"};
+    run_atlas(e, scan, 2u, &out, &code);
+    T_EQ_INT(code, 0);
+    atlas_buf_reset(&out);
+
+    const char *propose[] = {
+        "decision",  "propose", "proj",  "--title", "Use WAL journalling",
+        "--decision", "Enable WAL on the index database.", "--path", "main.c",
+    };
+    run_atlas(e, propose, 9u, &out, &code);
+    T_EQ_INT(code, 0);
+
+    /* The id, taken out of the human output rather than guessed. */
+    const char *p = strstr(atlas_buf_cstr(&out), ATLAS_DECISION_UID_PREFIX);
+    T_REQUIRE_MSG(p != NULL, "propose did not print a decision id: %s", atlas_buf_cstr(&out));
+    size_t len = strlen(ATLAS_DECISION_UID_PREFIX) + ATLAS_DECISION_UID_HEX;
+    T_OK(atlas_buf_set(&e->uid, p, len, &err), &err);
+    T_REQUIRE(atlas_decision_uid_is_valid(atlas_buf_cstr(&e->uid)));
+    atlas_buf_free(&out);
+}
+
+static void env_close(env *e) {
+    atlas_buf_free(&e->uid);
+    fx_close(&e->fx);
+}
+
+/* The document's status, read back through the CLI. */
+static void expect_status(env *e, const char *want) {
+    atlas_buf out = ATLAS_BUF_INIT;
+    int code = 0;
+    const char *show[] = {"decision", "show", "proj", atlas_buf_cstr(&e->uid)};
+    run_atlas(e, show, 4u, &out, &code);
+    T_EQ_INT(code, 0);
+    char needle[64];
+    (void)snprintf(needle, sizeof(needle), "status:       %s", want);
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&out), needle) != NULL,
+                "expected status %s, got:\n%s", want, atlas_buf_cstr(&out));
+    atlas_buf_free(&out);
+}
+
+/* --- a real pseudo-terminal --------------------------------------------------- */
+
+typedef struct pty {
+    int master;
+    pid_t child;
+} pty;
+
+/* Forks `atlas` with a pseudo-terminal as its stdin, stdout and stderr.
+ *
+ * The child calls `setsid()` and then `ioctl(TIOCSCTTY)`, which is what makes
+ * the slave its *controlling* terminal — without that, `/dev/tty` in the child
+ * would still refer to the terminal the test runner was started from, or to
+ * nothing at all under CTest. That distinction is the whole point of the test:
+ * Atlas reads the confirmation from `/dev/tty`, not from standard input. */
+static atlas_status pty_spawn(env *e, const char *const *args, size_t nargs, pty *out,
+                              atlas_err *err) {
+    out->master = -1;
+    out->child = -1;
+    int master = posix_openpt(O_RDWR | O_NOCTTY);
+    if (master < 0) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "posix_openpt: %s", strerror(errno));
+    }
+    if (grantpt(master) != 0 || unlockpt(master) != 0) {
+        (void)close(master);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "grantpt/unlockpt: %s", strerror(errno));
+    }
+    char slave_name[128];
+    if (ptsname_r(master, slave_name, sizeof(slave_name)) != 0) {
+        (void)close(master);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "ptsname_r: %s", strerror(errno));
+    }
+
+    /* Built here, before the fork: allocating in a forked child is exactly the
+     * thing not to do, and the argv has to outlive the fork anyway. */
+    const char *argv[24];
+    size_t k = 0;
+    argv[k++] = ATLAS_BIN;
+    argv[k++] = "--data-dir";
+    argv[k++] = fx_data_dir(&e->fx);
+    for (size_t i = 0; i < nargs; i++) {
+        argv[k++] = args[i];
+    }
+    argv[k] = NULL;
+    /* An explicitly constructed environment, like everywhere else in the suite:
+     * nothing inherited, so no ambient variable can influence the child. */
+    /* HOME points inside the fixture so nothing the child does can reach the
+     * developer's account, matching the rest of the suite. */
+    char home[1024];
+    (void)snprintf(home, sizeof(home), "HOME=%s", fx_data_dir(&e->fx));
+    const char *envp[] = {"PATH=/usr/bin:/bin", home, "LC_ALL=C", NULL};
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        (void)close(master);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "fork: %s", strerror(errno));
+    }
+    if (pid == 0) {
+        /* Child. Only async-signal-safe work from here. */
+        (void)close(master);
+        if (setsid() < 0) {
+            _exit(120);
+        }
+        int slave = open(slave_name, O_RDWR);
+        if (slave < 0) {
+            _exit(121);
+        }
+#ifdef TIOCSCTTY
+        if (ioctl(slave, TIOCSCTTY, 0) < 0) {
+            _exit(122);
+        }
+#endif
+        if (dup2(slave, STDIN_FILENO) < 0 || dup2(slave, STDOUT_FILENO) < 0 ||
+            dup2(slave, STDERR_FILENO) < 0) {
+            _exit(123);
+        }
+        if (slave > STDERR_FILENO) {
+            (void)close(slave);
+        }
+        execve(ATLAS_BIN, (char *const *)(uintptr_t)argv, (char *const *)(uintptr_t)envp);
+        _exit(124);
+    }
+    out->master = master;
+    out->child = pid;
+    return ATLAS_OK;
+}
+
+/* Reads from the terminal until `needle` appears or the child exits. */
+static bool pty_expect(pty *p, const char *needle, atlas_buf *transcript) {
+    atlas_err err;
+    atlas_err_init(&err);
+    /* Bounded by an absolute deadline rather than by a read count: a hung child
+     * must fail the test rather than block CTest until its own timeout. */
+    for (int waited = 0; waited < 200; waited++) {
+        if (transcript->len > 0 && strstr(atlas_buf_cstr(transcript), needle) != NULL) {
+            return true;
+        }
+        struct pollfd pfd = {p->master, POLLIN, 0};
+        int rc = poll(&pfd, 1u, 50);
+        if (rc < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if (rc == 0) {
+            continue;
+        }
+        char buf[1024];
+        ssize_t n = read(p->master, buf, sizeof(buf));
+        if (n <= 0) {
+            /* EIO on the master is how a pty reports that the last slave was
+             * closed, which is the child exiting. */
+            break;
+        }
+        if (atlas_buf_append(transcript, buf, (size_t)n, &err) != ATLAS_OK) {
+            return false;
+        }
+    }
+    return transcript->len > 0 && strstr(atlas_buf_cstr(transcript), needle) != NULL;
+}
+
+static void pty_type(pty *p, const char *line) {
+    (void)write(p->master, line, strlen(line));
+    (void)write(p->master, "\n", 1u);
+}
+
+static int pty_wait(pty *p, atlas_buf *transcript) {
+    atlas_err err;
+    atlas_err_init(&err);
+    /* Drain whatever is left, then reap. */
+    for (int i = 0; i < 100; i++) {
+        struct pollfd pfd = {p->master, POLLIN, 0};
+        if (poll(&pfd, 1u, 50) <= 0) {
+            int status = 0;
+            pid_t r = waitpid(p->child, &status, WNOHANG);
+            if (r == p->child) {
+                (void)close(p->master);
+                return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+            }
+            continue;
+        }
+        char buf[1024];
+        ssize_t n = read(p->master, buf, sizeof(buf));
+        if (n <= 0) {
+            break;
+        }
+        (void)atlas_buf_append(transcript, buf, (size_t)n, &err);
+    }
+    int status = 0;
+    (void)waitpid(p->child, &status, 0);
+    (void)close(p->master);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+}
+
+/* --- the interactive path ------------------------------------------------------- */
+
+static void test_interactive_approval_of_the_exact_revision(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    env e;
+    env_open(&e);
+
+    const char *args[] = {"decision", "approve", "proj", atlas_buf_cstr(&e.uid)};
+    pty p;
+    T_OK(pty_spawn(&e, args, 4u, &p, &err), &err);
+
+    atlas_buf transcript = ATLAS_BUF_INIT;
+    T_REQUIRE_MSG(pty_expect(&p, "Type ", &transcript),
+                  "the prompt never appeared. Transcript:\n%s", atlas_buf_cstr(&transcript));
+
+    /* The prompt must show the exact values the capability is bound to, and the
+     * honest statement about what the record will mean. */
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&transcript), atlas_buf_cstr(&e.uid)) != NULL,
+                "the prompt must name the decision");
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&transcript), "revision   : 1") != NULL,
+                "the prompt must name the revision");
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&transcript), "LOCAL_OPERATOR_CONFIRMED") != NULL,
+                "the prompt must say what will be recorded");
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&transcript), "does not identify you") != NULL,
+                "the prompt must state that this is not an identity claim");
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&transcript), "untrusted project text") != NULL,
+                "the decision's own text must be labelled at the prompt");
+
+    /* The confirmation is a prefix of the content hash, which the prompt shows.
+     * The test reads it out of the transcript rather than recomputing it, so a
+     * mismatch between what is displayed and what is accepted is a failure. */
+    const char *tp = strstr(atlas_buf_cstr(&transcript), "Type ");
+    T_REQUIRE(tp != NULL);
+    char confirm[ATLAS_DECISION_CONFIRM_MAX];
+    (void)snprintf(confirm, sizeof(confirm), "%.*s", (int)ATLAS_DECISION_CONFIRM_HEX,
+                   tp + strlen("Type "));
+
+    const char *digest = strstr(atlas_buf_cstr(&transcript), "digest     : ");
+    T_REQUIRE(digest != NULL);
+    T_CHECK_MSG(strncmp(digest + strlen("digest     : "), confirm, ATLAS_DECISION_CONFIRM_HEX) == 0,
+                "the confirmation must be the displayed digest's prefix");
+
+    pty_type(&p, confirm);
+    int code = pty_wait(&p, &transcript);
+    T_CHECK_MSG(code == 0, "approve exited %d. Transcript:\n%s", code,
+                atlas_buf_cstr(&transcript));
+    T_CHECK(strstr(atlas_buf_cstr(&transcript), "APPROVED") != NULL);
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&transcript), "is not a signature") != NULL,
+                "the outcome must repeat the non-claim");
+
+    expect_status(&e, "APPROVED");
+
+    /* The repository was never touched. An approval is a fact about Atlas'
+     * record, not about the project's files. */
+    atlas_buf_free(&transcript);
+    env_close(&e);
+}
+
+static void test_a_wrong_answer_at_the_prompt_changes_nothing(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    env e;
+    env_open(&e);
+
+    const char *args[] = {"decision", "approve", "proj", atlas_buf_cstr(&e.uid)};
+    pty p;
+    T_OK(pty_spawn(&e, args, 4u, &p, &err), &err);
+    atlas_buf transcript = ATLAS_BUF_INIT;
+    T_REQUIRE(pty_expect(&p, "Type ", &transcript));
+
+    /* The answer somebody types when they are not reading. */
+    pty_type(&p, "yes");
+    int code = pty_wait(&p, &transcript);
+    T_CHECK_MSG(code != 0, "a wrong confirmation must fail");
+    expect_status(&e, "PROPOSED");
+
+    atlas_buf_free(&transcript);
+    env_close(&e);
+}
+
+static void test_ansi_in_a_title_cannot_reach_the_prompt(void) {
+    /* Two layers, and this checks that at least one of them holds.
+     *
+     * `atlas_decision_check_text` refuses an escape sequence at the point of
+     * writing, so the hostile title never reaches storage. If that were ever
+     * relaxed, `atlas_terminal_write` would still replace the byte. The test
+     * asserts the outcome — no raw ESC on the terminal — rather than which
+     * layer produced it, because that is the property that matters. */
+    atlas_err err;
+    atlas_err_init(&err);
+    env e;
+    env_open(&e);
+
+    atlas_buf out = ATLAS_BUF_INIT;
+    int code = 0;
+    const char *hostile[] = {
+        "decision", "propose", "proj",
+        "--title",  "\x1b[2J\x1b[HApproved by the security team",
+        "--decision", "Nothing.",
+    };
+    run_atlas(&e, hostile, 7u, &out, &code);
+    T_CHECK_MSG(code != 0, "a title containing an ANSI escape must be refused outright");
+    atlas_buf_free(&out);
+
+    /* And the same for the body, plus a bidi override and a C1 control — each
+     * of which is a way to make a terminal display something other than what is
+     * stored. */
+    static const char *const payloads[] = {
+        "\x1b]0;pwned\x07",       /* an OSC title-setting sequence */
+        "\xe2\x80\xae" "reversed", /* a bidi override */
+        "\xc2\x9b" "31m",          /* C1 CSI */
+        "line\rline",              /* a carriage return, which overwrites */
+        NULL,
+    };
+    for (size_t i = 0; payloads[i] != NULL; i++) {
+        const char *args[] = {
+            "decision", "propose", "proj", "--title", "Fine", "--decision", payloads[i],
+        };
+        atlas_buf o = ATLAS_BUF_INIT;
+        int c = 0;
+        run_atlas(&e, args, 7u, &o, &c);
+        T_CHECK_MSG(c != 0, "payload %zu must be refused", i);
+        atlas_buf_free(&o);
+    }
+
+    /* The prompt for the *legitimate* decision is still clean. */
+    const char *args[] = {"decision", "approve", "proj", atlas_buf_cstr(&e.uid)};
+    pty p;
+    T_OK(pty_spawn(&e, args, 4u, &p, &err), &err);
+    atlas_buf transcript = ATLAS_BUF_INIT;
+    T_REQUIRE(pty_expect(&p, "Type ", &transcript));
+    for (size_t i = 0; i < transcript.len; i++) {
+        unsigned char ch = (unsigned char)transcript.data[i];
+        bool ok = ch == '\n' || ch == '\r' || (ch >= 0x20u && ch < 0x7Fu);
+        T_CHECK_MSG(ok, "byte 0x%02x reached the approval prompt at offset %zu", ch, i);
+    }
+    pty_type(&p, "no");
+    (void)pty_wait(&p, &transcript);
+
+    atlas_buf_free(&transcript);
+    env_close(&e);
+}
+
+/* --- the exclusions ---------------------------------------------------------------- */
+
+static void test_non_interactive_approval_is_refused(void) {
+    /* Every non-interactive shape, each with the neighbouring record checked
+     * afterwards. `fx_atlas` gives the child `/dev/null` on standard input,
+     * which is the pipe case. */
+    atlas_err err;
+    atlas_err_init(&err);
+    (void)err;
+    env e;
+    env_open(&e);
+
+    struct {
+        const char *what;
+        const char *args[8];
+        size_t n;
+    } cases[] = {
+        {"no terminal", {"decision", "approve", "proj", NULL}, 4u},
+        {"--yes", {"decision", "approve", "proj", NULL, "--yes"}, 5u},
+        {"--json", {"decision", "approve", "proj", NULL, "--json"}, 5u},
+        {"reject with --yes", {"decision", "reject", "proj", NULL, "--yes"}, 5u},
+        {"supersede with --yes",
+         {"decision", "supersede", "proj", NULL, "--by", "atlas-dec-0000000000000000", "--yes"},
+         7u},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        cases[i].args[3] = atlas_buf_cstr(&e.uid);
+        atlas_buf out = ATLAS_BUF_INIT;
+        int code = 0;
+        run_atlas(&e, cases[i].args, cases[i].n, &out, &code);
+        T_CHECK_MSG(code != 0, "%s must be refused, and exited %d", cases[i].what, code);
+        atlas_buf_free(&out);
+        /* After every refusal, not only after the last. */
+        expect_status(&e, "PROPOSED");
+    }
+
+    /* An environment variable cannot stand in for a terminal either. There is
+     * no variable that does this, and the test exists to keep it that way:
+     * anything added later that looks like one has to break it. */
+    {
+        const char *args[] = {"decision", "approve", "proj", atlas_buf_cstr(&e.uid)};
+        const char *env_attempts[] = {
+            "ATLAS_YES=1", "ATLAS_APPROVE=1", "ATLAS_ASSUME_YES=1", "ATLAS_CONFIRM=yes", NULL,
+        };
+        atlas_buf out = ATLAS_BUF_INIT;
+        atlas_buf errout = ATLAS_BUF_INIT;
+        int code = 0;
+        const char *argv[8];
+        size_t k = 0;
+        argv[k++] = "--data-dir";
+        argv[k++] = fx_data_dir(&e.fx);
+        for (size_t i = 0; i < 4u; i++) {
+            argv[k++] = args[i];
+        }
+        atlas_err ferr;
+        atlas_err_init(&ferr);
+        T_OK(fx_atlas_stdin(argv, k, env_attempts, "", 0u, &out, &errout, &code, &ferr), &ferr);
+        T_CHECK_MSG(code != 0, "no environment variable may authorise an approval");
+        atlas_buf_free(&out);
+        atlas_buf_free(&errout);
+        expect_status(&e, "PROPOSED");
+    }
+
+    env_close(&e);
+}
+
+static void test_the_repository_is_never_modified(void) {
+    /* The A0 guarantee, still true for a phase whose whole subject is writing
+     * things down. A decision is Atlas' record; the project's files are not
+     * touched by proposing, approving or exporting one. */
+    atlas_err err;
+    atlas_err_init(&err);
+    env e;
+    env_open(&e);
+
+    char before[ATLAS_SHA256_HEX_LEN + 1u];
+    T_OK(fx_tree_digest(fx_repo(&e.fx), before, &err), &err);
+
+    const char *args[] = {"decision", "approve", "proj", atlas_buf_cstr(&e.uid)};
+    pty p;
+    T_OK(pty_spawn(&e, args, 4u, &p, &err), &err);
+    atlas_buf transcript = ATLAS_BUF_INIT;
+    T_REQUIRE(pty_expect(&p, "Type ", &transcript));
+    const char *tp = strstr(atlas_buf_cstr(&transcript), "Type ");
+    char confirm[ATLAS_DECISION_CONFIRM_MAX];
+    (void)snprintf(confirm, sizeof(confirm), "%.*s", (int)ATLAS_DECISION_CONFIRM_HEX,
+                   tp + strlen("Type "));
+    pty_type(&p, confirm);
+    T_EQ_INT(pty_wait(&p, &transcript), 0);
+    atlas_buf_free(&transcript);
+
+    /* And an export writes to stdout, never into the tree. */
+    atlas_buf out = ATLAS_BUF_INIT;
+    int code = 0;
+    const char *ex[] = {"decision", "export", "proj", atlas_buf_cstr(&e.uid)};
+    run_atlas(&e, ex, 4u, &out, &code);
+    T_EQ_INT(code, 0);
+    T_CHECK(strstr(atlas_buf_cstr(&out), "# Use WAL journalling") != NULL);
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&out), "is not a signature") != NULL,
+                "an exported decision must carry the non-claim with it");
+    atlas_buf_free(&out);
+
+    char after[ATLAS_SHA256_HEX_LEN + 1u];
+    T_OK(fx_tree_digest(fx_repo(&e.fx), after, &err), &err);
+    T_CHECK_MSG(strcmp(before, after) == 0,
+                "the registered repository must be byte-identical after an approval and an export");
+
+    env_close(&e);
+}
+
+static void test_doctor_reports_a_ledger_disagreement_and_repairs_nothing(void) {
+    /* The ledger is canonical and the status columns are a cache of it. Doctor
+     * replays the ledger and compares — and **reports rather than repairs**,
+     * because a diagnostic that silently fixes what it finds cannot tell you
+     * whether the fault recurs.
+     *
+     * Checked by running doctor twice after corrupting the cache: a repairing
+     * doctor would report the problem once and then claim health. */
+    atlas_err err;
+    atlas_err_init(&err);
+    env e;
+    env_open(&e);
+
+    atlas_buf out = ATLAS_BUF_INIT;
+    int code = 0;
+    const char *doctor[] = {"doctor"};
+    run_atlas(&e, doctor, 1u, &out, &code);
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&out), "cached status disagrees") == NULL,
+                "a healthy index must report no ledger disagreement");
+    atlas_buf_reset(&out);
+
+    /* Claim, in the cache only, that the proposal is approved. */
+    atlas_buf db_path = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_appendf(&db_path, &err, "%s/atlas.db", fx_data_dir(&e.fx)), &err);
+    atlas_db *db = NULL;
+    T_OK(atlas_db_open(atlas_buf_cstr(&db_path), &db, &err), &err);
+    T_OK(atlas_db_exec_sql(db,
+                           "UPDATE decision_documents"
+                           " SET current_status = 'APPROVED', current_revision_id = 1;",
+                           &err),
+         &err);
+    atlas_db_close(db);
+    atlas_buf_free(&db_path);
+
+    for (int pass = 0; pass < 2; pass++) {
+        run_atlas(&e, doctor, 1u, &out, &code);
+        T_CHECK_MSG(strstr(atlas_buf_cstr(&out), "cached status disagrees") != NULL,
+                    "pass %d: doctor must report the disagreement, and must not have repaired it "
+                    "on the previous pass. Output:\n%s",
+                    pass, atlas_buf_cstr(&out));
+        atlas_buf_reset(&out);
+    }
+
+    /* And the decision itself is untouched by the diagnostic: doctor observes. */
+    const char *history[] = {"decision", "history", "proj", atlas_buf_cstr(&e.uid)};
+    run_atlas(&e, history, 4u, &out, &code);
+    T_EQ_INT(code, 0);
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&out), "APPROVED") == NULL,
+                "no approval event may exist; only the cache was corrupted");
+    atlas_buf_free(&out);
+    env_close(&e);
+}
+
+static void test_an_unrelated_repository_at_the_same_path_inherits_nothing(void) {
+    /* The scenario the correction pass exists for.
+     *
+     * `repo_root_hash` answers "same directory", and a directory is a location
+     * rather than an identity. Remove a project, `git init` an unrelated one in
+     * its place, register that — and a path hash says they are the same
+     * repository, so one team's approved decisions attach to another team's
+     * code. The durable identity commits to the ingested root commits as well,
+     * which is what tells them apart.
+     *
+     * Driven through the real CLI against real Git repositories, because the
+     * thing under test is what happens to a *worktree*. */
+    atlas_err err;
+    atlas_err_init(&err);
+    env e;
+    env_open(&e);
+
+    /* Approve it, so what must not move is an approved record rather than a
+     * draft. */
+    const char *args[] = {"decision", "approve", "proj", atlas_buf_cstr(&e.uid)};
+    pty p;
+    T_OK(pty_spawn(&e, args, 4u, &p, &err), &err);
+    atlas_buf transcript = ATLAS_BUF_INIT;
+    T_REQUIRE(pty_expect(&p, "Type ", &transcript));
+    const char *tp = strstr(atlas_buf_cstr(&transcript), "Type ");
+    char confirm[ATLAS_DECISION_CONFIRM_MAX];
+    (void)snprintf(confirm, sizeof(confirm), "%.*s", (int)ATLAS_DECISION_CONFIRM_HEX,
+                   tp + strlen("Type "));
+    pty_type(&p, confirm);
+    T_EQ_INT(pty_wait(&p, &transcript), 0);
+    atlas_buf_free(&transcript);
+    expect_status(&e, "APPROVED");
+
+    /* Remove the repository. The decision is detached, not deleted. */
+    atlas_buf out = ATLAS_BUF_INIT;
+    int code = 0;
+    const char *rm[] = {"repo", "remove", "proj", "--yes"};
+    run_atlas(&e, rm, 4u, &out, &code);
+    T_EQ_INT(code, 0);
+    atlas_buf_reset(&out);
+
+    const char *orphaned[] = {"decision", "orphaned"};
+    run_atlas(&e, orphaned, 2u, &out, &code);
+    T_EQ_INT(code, 0);
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&out), atlas_buf_cstr(&e.uid)) != NULL,
+                "a removed repository's decision must be visible as orphaned, not vanish: %s",
+                atlas_buf_cstr(&out));
+    atlas_buf_reset(&out);
+
+    /* Replace the working tree with a genuinely unrelated repository at the
+     * same path: a different history, a different root commit. */
+    /* Removed with `rm -rf`, through the same explicit-argv process API the
+     * rest of the suite uses — no shell. `fx_remove` unlinks one file, and the
+     * point here is to destroy a whole worktree. */
+    {
+        const char *rm_argv[] = {"/bin/rm", "-rf", fx_repo(&e.fx), NULL};
+        atlas_proc_opts opts;
+        memset(&opts, 0, sizeof(opts));
+        opts.argv = rm_argv;
+        atlas_proc_result res;
+        memset(&res, 0, sizeof(res));
+        atlas_buf rm_err = ATLAS_BUF_INIT;
+        T_OK(atlas_proc_run(&opts, NULL, NULL, &rm_err, &res, &err), &err);
+        T_EQ_INT(res.exit_code, 0);
+        atlas_buf_free(&rm_err);
+    }
+    T_OK(fx_mkdir(e.fx.root.data, "repo", &err), &err);
+    T_OK(fx_init_repo(&e.fx, fx_repo(&e.fx), NULL, &err), &err);
+    T_OK(fx_write(fx_repo(&e.fx), "unrelated.c", "int other(void){return 1;}\n", &err), &err);
+    T_OK(fx_add_all(&e.fx, fx_repo(&e.fx), &err), &err);
+    T_OK(fx_commit(&e.fx, fx_repo(&e.fx), "a different project entirely", &err), &err);
+
+    const char *add[] = {"repo", "add", fx_repo(&e.fx), "--name", "other"};
+    run_atlas(&e, add, 5u, &out, &code);
+    T_EQ_INT(code, 0);
+    atlas_buf_reset(&out);
+    const char *scan[] = {"scan", "other"};
+    run_atlas(&e, scan, 2u, &out, &code);
+    T_EQ_INT(code, 0);
+    atlas_buf_reset(&out);
+
+    /* **The unrelated repository must have inherited nothing.** */
+    const char *list[] = {"--json", "decision", "list", "other"};
+    run_atlas(&e, list, 4u, &out, &code);
+    T_EQ_INT(code, 0);
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&out), atlas_buf_cstr(&e.uid)) == NULL,
+                "an unrelated repository at the same path inherited a decision: %s",
+                atlas_buf_cstr(&out));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&out), "\"total_approved\":0") != NULL,
+                "and must certainly not inherit an approved one: %s", atlas_buf_cstr(&out));
+    atlas_buf_reset(&out);
+
+    /* And the decision is still there, still approved, still visible as an
+     * orphan. Nothing was deleted. */
+    run_atlas(&e, orphaned, 2u, &out, &code);
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&out), atlas_buf_cstr(&e.uid)) != NULL,
+                "the original decision must survive as an orphan: %s", atlas_buf_cstr(&out));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&out), "APPROVED") != NULL,
+                "and keep its approved status");
+    atlas_buf_free(&out);
+    env_close(&e);
+}
+
+static const atlas_test TESTS[] = {
+    {"an unrelated repository at the same path inherits nothing",
+     test_an_unrelated_repository_at_the_same_path_inherits_nothing},
+    {"interactive approval of the exact revision",
+     test_interactive_approval_of_the_exact_revision},
+    {"a wrong answer at the prompt changes nothing",
+     test_a_wrong_answer_at_the_prompt_changes_nothing},
+    {"ANSI in a title cannot reach the prompt", test_ansi_in_a_title_cannot_reach_the_prompt},
+    {"non-interactive approval is refused", test_non_interactive_approval_is_refused},
+    {"the repository is never modified", test_the_repository_is_never_modified},
+    {"doctor reports a ledger disagreement and repairs nothing",
+     test_doctor_reports_a_ledger_disagreement_and_repairs_nothing},
+};
+
+ATLAS_TEST_MAIN("decision_operator", TESTS)

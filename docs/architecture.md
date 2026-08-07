@@ -337,3 +337,43 @@ so a future producer that mixes sources can add the same reference to
 - **No external analyzer.** No SCIP, no Clang, no LSP, no plugin loader. The
   analyzer identity exists so a *future* one could be told apart from this one,
   not because one is coming in A3.
+
+
+## A4: decisions
+
+```
+src/decision decision.c    the four-state vocabulary, the actor vocabulary, the
+                           canonical content hash, strict validation
+             lifecycle.c   the state machine and the operator channel; the only
+                           function in Atlas that writes a lifecycle transition
+src/db       db_decision.c typed operations over migration 6
+src/core     service_decision.c  the `decision` command behaviour, and the
+                           interactive confirm flow
+             terminal.c    the operator-only channel: /dev/tty, not stdin
+src/ipc      server_decision.c   the ten-method `decision.*` group
+```
+
+The layering rule is unchanged: the CLI parses arguments and picks a renderer,
+the service layer decides behaviour, the renderers format, and `sqlite3` types
+never leave `src/db`.
+
+Two things are new in kind.
+
+**A single write point.** `atlas_decision_apply_in_tx` is the only function
+that writes a lifecycle transition, the way `settle()` is the only one that
+writes a resolution and `atlas_db_evidence_insert` is the only one that writes
+evidence. Everything the phase claims is enforced there, once.
+
+It has two callers and no others. `atlas_decision_apply` is the public entry
+point and contributes only `BEGIN`, `COMMIT` and rollback. `op_decision_locked`
+in `src/ai/ai.c` — the A2 `atlas_record_decision` bridge — calls it directly
+because it must write the A2 row and the A4 document in one transaction, and a
+nested one would not do: `atlas_db_begin` counts depth but rollback does not, so
+a failed transition would silently discard the caller's work. Two entry points,
+one place the rules live.
+
+**The first canonical data.** Invariant 1 says SQLite is a rebuildable index and
+never the canonical record. A4 bends it, narrowly and deliberately: a decision
+document, its revisions and its approval ledger exist nowhere else and cannot be
+reconstructed from git, the filesystem or a compile database. Everything else in
+the schema remains rebuildable. See `docs/decision-lifecycle.md`.

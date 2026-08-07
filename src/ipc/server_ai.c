@@ -787,10 +787,19 @@ static atlas_status method_decision_record(dispatch_state *ds, const atlas_ipc_r
     if (st == ATLAS_OK) {
         st = atlas_json_key_bool(ds->j, "approved", false, err);
     }
+    if (st == ATLAS_OK && result.decision_uid.len > 0) {
+        /* A4. The decision document this call materialised. Additive: an A2-era
+         * client that does not read it is unaffected, and one that does no
+         * longer has to tell a user to run `atlas decision promote`. */
+        st = atlas_json_key_str(ds->j, "decision", atlas_buf_cstr(&result.decision_uid), err);
+    }
     if (st == ATLAS_OK) {
-        st = atlas_json_key_str(ds->j, "approval",
-                                "deferred: A2 records proposals and has no way to prove approval",
-                                err);
+        st = atlas_json_key_str(
+            ds->j, "approval",
+            "recorded as a proposal. Atlas exposes no approval capability through MCP, hooks or "
+            "any AI-facing method; a proposal becomes policy only through the interactive Atlas "
+            "CLI on a terminal.",
+            err);
     }
     atlas_ai_result_free(&result);
     return st;
@@ -952,9 +961,24 @@ static atlas_status method_context(dispatch_state *ds, const atlas_ipc_request *
             c.changed_paths = staged + unstaged + untracked + unmerged;
         }
         if (st == ATLAS_OK) {
-            int64_t reasons = 0;
-            st = atlas_db_ai_repo_record_counts(ds->db, info.id, &c.proposed_decisions,
-                                                &c.approved_decisions, &reasons, err);
+            /* A2's record counts are still read for the reason count. The
+             * *decision* counts now come from the A4 lifecycle, where an
+             * approval can actually exist — A2's `approved` was pinned to zero
+             * for two phases because nothing could produce one. Reading both
+             * keeps A2 proposals visible as reasons without letting them
+             * masquerade as decision documents. */
+            int64_t legacy_proposed = 0;
+            int64_t legacy_approved = 0;
+            st = atlas_db_ai_repo_record_counts(ds->db, info.id, &legacy_proposed,
+                                                &legacy_approved, &c.unresolved_reasons, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_db_decision_repo_counts(ds->db, info.id, &c.proposed_decisions,
+                                               &c.approved_decisions, &c.rejected_decisions,
+                                               &c.superseded_decisions, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_db_decision_review_count(ds->db, info.id, &c.decisions_needing_review, err);
         }
 
         /* The caller's own session, by exact key.
@@ -1009,6 +1033,18 @@ static atlas_status method_context(dispatch_state *ds, const atlas_ipc_request *
     }
     if (st == ATLAS_OK) {
         st = atlas_json_key_int(ds->j, "unresolved_reasons", c.unresolved_reasons, err);
+    }
+    /* A4, as structured fields beside the rendered envelope. Integers only,
+     * for the same reason the envelope carries only integers. */
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "decisions_proposed", c.proposed_decisions, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "decisions_approved", c.approved_decisions, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "decisions_needing_review", c.decisions_needing_review,
+                                err);
     }
     if (st == ATLAS_OK) {
         st = atlas_json_key_bool(ds->j, "code_index_current", c.code_index_current, err);

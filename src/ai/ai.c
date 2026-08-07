@@ -20,6 +20,8 @@
  */
 #include "atlas/ai.h"
 
+#include "atlas/decision_ops.h"
+
 #include <stdio.h>
 #include <string.h>
 
@@ -207,6 +209,7 @@ void atlas_ai_result_init(atlas_ai_result *r) {
     atlas_buf_init(&r->repo_name);
     atlas_buf_init(&r->root_text);
     atlas_buf_init(&r->degraded_reason);
+    atlas_buf_init(&r->decision_uid);
 }
 
 void atlas_ai_result_free(atlas_ai_result *r) {
@@ -216,6 +219,7 @@ void atlas_ai_result_free(atlas_ai_result *r) {
     atlas_buf_free(&r->repo_name);
     atlas_buf_free(&r->root_text);
     atlas_buf_free(&r->degraded_reason);
+    atlas_buf_free(&r->decision_uid);
 }
 
 /* --- helpers ------------------------------------------------------------- */
@@ -750,7 +754,7 @@ static atlas_status op_reason(atlas_db *db, const atlas_ai_op *op, session_ctx *
     return st;
 }
 
-static atlas_status op_decision(atlas_db *db, const atlas_ai_op *op, session_ctx *sc,
+static atlas_status op_decision_locked(atlas_db *db, const atlas_ai_op *op, session_ctx *sc,
                                 atlas_ai_result *out, atlas_err *err) {
     if (!sc->repo_found) {
         return atlas_err_set(err, ATLAS_ERR_REPO,
@@ -812,6 +816,82 @@ static atlas_status op_decision(atlas_db *db, const atlas_ai_op *op, session_ctx
     }
     if (st == ATLAS_OK && sc->session_id > 0) {
         st = atlas_db_ai_session_touch(db, sc->session_id, "records", err);
+    }
+
+    /* --- the A4 bridge --------------------------------------------------
+     *
+     * `atlas_record_decision` is A2's tool and keeps A2's schema and A2's
+     * response, because clients installed before A4 still call it. What it must
+     * not keep is A2's *outcome*: a record that exists only in the legacy tables
+     * and that somebody has to promote by hand later. An official client that
+     * kept producing those would make the A4 decision model something users
+     * opted into rather than something they had.
+     *
+     * So a successful call now materialises the A4 document too, through the
+     * ordinary promote path — the same single write point, the same validation,
+     * the same PROPOSED outcome, the same `imported_from_ai_decision_id` origin
+     * link. It is not a second way to create a decision; it is the one way,
+     * reached from an older door.
+     *
+     * The session comes from *this* request, resolved by exact key, so the
+     * document is attributed to the session that actually made the call — and,
+     * as everywhere in A2, to that session or to none, never to a neighbour.
+     *
+     * `duplicate` returns early above, so a retry that the A2 dedup key absorbed
+     * never reaches here and cannot produce a second document. */
+    if (st == ATLAS_OK && out->record_id > 0) {
+        atlas_decision_op promote;
+        atlas_decision_op_init(&promote, ATLAS_DECISION_OP_PROMOTE);
+        promote.legacy_id = out->record_id;
+        st = atlas_buf_set_str(&promote.repo_name, sc->repo.name, err);
+        if (st == ATLAS_OK) {
+            st = atlas_buf_set(&promote.provider, op->provider.data, op->provider.len, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_buf_set(&promote.client, op->client.data, op->client.len, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_buf_set(&promote.session_key, op->session_key.data, op->session_key.len,
+                               err);
+        }
+        atlas_decision_result dres;
+        atlas_decision_result_init(&dres);
+        if (st == ATLAS_OK) {
+            /* In the caller's transaction. The A2 row, its paths, the A4
+             * document, its revision and the origin link are one unit: a
+             * half-written pair would leave a legacy row that looks unpromoted
+             * and a document that has no origin. */
+            st = atlas_decision_apply_in_tx(db, &promote, &dres, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_buf_set(&out->decision_uid, dres.uid.data, dres.uid.len, err);
+        }
+        atlas_decision_result_free(&dres);
+        atlas_decision_op_free(&promote);
+    }
+    return st;
+}
+
+/* One transaction around the A2 row and the A4 document it maps to.
+ *
+ * This is the only A2 operation that writes into two models at once, and it is
+ * the only one that needs a transaction: a half-written pair would leave a
+ * legacy row that looks unpromoted beside a document with no origin, and
+ * nothing about either would say it had happened. */
+static atlas_status op_decision(atlas_db *db, const atlas_ai_op *op, session_ctx *sc,
+                                atlas_ai_result *out, atlas_err *err) {
+    atlas_status st = atlas_db_begin(db, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    st = op_decision_locked(db, op, sc, out, err);
+    if (st != ATLAS_OK) {
+        atlas_db_rollback(db);
+        return st;
+    }
+    st = atlas_db_commit(db, err);
+    if (st != ATLAS_OK) {
+        atlas_db_rollback(db);
     }
     return st;
 }

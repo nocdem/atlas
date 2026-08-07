@@ -152,6 +152,13 @@ add_library(atlas_core STATIC
   src/code/resolve.c
   src/code/index.c
   src/code/query.c
+  # --- A4: decision documents, revisions and operator approval -----------
+  src/db/db_decision.c
+  src/decision/decision.c
+  src/decision/lifecycle.c
+  src/core/terminal.c
+  src/core/service_decision.c
+  src/ipc/server_decision.c
 )
 
 target_include_directories(atlas_core

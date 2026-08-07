@@ -230,8 +230,34 @@ atlas_status atlas_db_repo_add(atlas_db *db, const char *name, const atlas_repo_
         goto done;
     }
     atlas_db_finish(db, stmt);
+    int64_t new_id = sqlite3_last_insert_rowid(db->h);
     if (id_out != NULL) {
-        *id_out = sqlite3_last_insert_rowid(db->h);
+        *id_out = new_id;
+    }
+
+    /* A4. Decision documents do not cascade from `repositories` — they are the
+     * one canonical, non-rebuildable record in the index — so a new repository
+     * row has to start with none of them attached.
+     *
+     * **Detach only, and unconditionally.** `repositories.id` is a rowid and
+     * rowids are reused: remove the only repository and the next `repo add`
+     * gets the same id, so without this an unrelated project would inherit the
+     * previous one's approved decisions silently, in every list and count.
+     *
+     * Attaching is a separate step and deliberately *not* here. It needs the
+     * repository's durable identity, which commits to the root commits Atlas
+     * has ingested — and at registration Atlas has ingested none. So the attach
+     * happens after a scan, where the lineage is knowable. Splitting it this
+     * way makes the failure mode fail-closed by construction: forgetting the
+     * attach can only leave decisions orphaned, which is visible and
+     * recoverable, and never attach them to the wrong repository, which is
+     * neither. */
+    {
+        int64_t detached = 0;
+        st = atlas_db_decision_detach_repo(db, new_id, &detached, err);
+        if (st != ATLAS_OK) {
+            goto done;
+        }
     }
 
 done:
@@ -449,24 +475,43 @@ atlas_status atlas_db_repo_list(atlas_db *db, atlas_repo_cb cb, void *ud, atlas_
 
 atlas_status atlas_db_repo_remove(atlas_db *db, const char *name, bool *removed, atlas_err *err) {
     *removed = false;
+    /* Two statements that must both happen or neither.
+     *
+     * The A2 rows about to be cascaded away are named by
+     * `decision_revisions.imported_from_ai_decision_id`, and A4 documents
+     * deliberately do not cascade — so those pointers would survive their
+     * targets and then be handed to somebody else when SQLite reuses the
+     * rowids. They are cleared first, while the rows still exist to be selected,
+     * and in the same transaction so a failure cannot leave valid pointers
+     * cleared beside a repository that is still registered. */
+    atlas_status st = atlas_db_begin(db, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    st = atlas_db_decision_forget_legacy_origins(db, name, NULL, err);
+
     sqlite3_stmt *stmt = NULL;
     /* ON DELETE CASCADE removes scans, files, commits, changes, compile
-     * databases and evidence. Nothing outside the Atlas database is touched. */
-    atlas_status st = atlas_db_prepare(db, "DELETE FROM repositories WHERE name = ?1;", &stmt, err);
-    if (st != ATLAS_OK) {
-        return st;
+     * databases, evidence and the A2 records. Nothing outside the Atlas database
+     * is touched, and no A4 decision record is deleted. */
+    if (st == ATLAS_OK) {
+        st = atlas_db_prepare(db, "DELETE FROM repositories WHERE name = ?1;", &stmt, err);
     }
-    st = atlas_db_bind_text_opt(db, stmt, 1, name, err);
-    if (st != ATLAS_OK) {
-        atlas_db_finish(db, stmt);
-        return st;
+    if (st == ATLAS_OK) {
+        st = atlas_db_bind_text_opt(db, stmt, 1, name, err);
+        if (st != ATLAS_OK) {
+            atlas_db_finish(db, stmt);
+        }
     }
-    st = atlas_db_step_done(db, stmt, err);
+    if (st == ATLAS_OK) {
+        st = atlas_db_step_done(db, stmt, err);
+    }
     if (st != ATLAS_OK) {
+        atlas_db_rollback(db);
         return st;
     }
     *removed = sqlite3_changes(db->h) > 0;
-    return ATLAS_OK;
+    return atlas_db_commit(db, err);
 }
 
 atlas_status atlas_db_repo_counts(atlas_db *db, int64_t repo_id, atlas_repo_counts *out,
@@ -603,7 +648,24 @@ atlas_status atlas_db_scan_finish(atlas_db *db, int64_t repo_id, int64_t scan_id
         atlas_db_finish(db, stmt);
         return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind scan id");
     }
-    return atlas_db_step_done(db, stmt, err);
+    atlas_status done = atlas_db_step_done(db, stmt, err);
+    if (done != ATLAS_OK || status == NULL || strcmp(status, "ok") != 0) {
+        return done;
+    }
+    /* A4. A completed pass is the first moment a repository's durable identity
+     * is knowable: it commits to the root commits, and those only exist in the
+     * index once history has been ingested.
+     *
+     * So this is where an orphaned decision document can be reattached — never
+     * at registration, where Atlas has read nothing and could only match on the
+     * path. Here rather than in the two callers because it is one choke point
+     * and two would eventually disagree. Only on a successful pass: a failed
+     * one has proved nothing about which repository this is.
+     *
+     * A match is exact or there is none, so the normal outcome is zero and the
+     * cost is one indexed query per completed pass. */
+    int64_t relinked = 0;
+    return atlas_db_decision_relink_after_ingest(db, repo_id, &relinked, err);
 }
 
 atlas_status atlas_db_repo_apply_scan(atlas_db *db, int64_t repo_id, int64_t scan_id,

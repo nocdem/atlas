@@ -13,7 +13,86 @@ checked against a read-only allowlist before the process is created, hooks and
 external diff drivers are disabled, and the working tree and index are only ever
 read. See [docs/git-safety.md](docs/git-safety.md).
 
-## Status: phase A3
+## Status: phase A4
+
+A4 turns model-generated proposals into durable decision documents with
+immutable revisions, an append-only lifecycle ledger, links to the code they
+concern, and an approval step that is reachable only through an interactive
+terminal.
+
+### What A4 adds
+
+- `atlas decision list|show|search|history|for-file|propose|revise|approve|reject|supersede|export|legacy|promote`
+  — mirrored by ten daemon RPCs and four MCP tools
+- **immutable revisions.** A revision is never edited; a change is a new
+  revision with the next number, and the previous one keeps its own state and
+  its own place in the ledger. Each is identified by a domain-separated,
+  length-prefixed canonical content hash, and an approval binds to that hash
+  rather than to a row.
+- **an append-only lifecycle ledger** over four states — `PROPOSED`, `APPROVED`,
+  `REJECTED`, `SUPERSEDED`. The ledger is canonical; the status columns are a
+  cache of it that `atlas doctor` checks by replay and **never repairs**.
+- **durable links** to paths, commits, change sets, symbols and other decisions.
+  A symbol link is a selector *snapshot*, never a foreign key into the
+  structural tables — so a rebuild or an analyzer upgrade preserves every
+  decision exactly. Currency is computed on read: `CURRENT`, `CHANGED`,
+  `MISSING`, `AMBIGUOUS`, `UNKNOWN`. **Atlas never re-points a renamed or
+  ambiguous anchor**, and a changed link never revokes an approval — it is
+  flagged for review.
+- **an operator approval channel**: a real terminal, a short-lived single-use
+  capability bound to one repository, document, revision and content hash, and a
+  confirmation typed against that hash. `--yes`, piped stdin, environment
+  variables, JSON input and every MCP tool are refused.
+- **A2's `atlas_record_decision` bridges into A4.** It keeps its schema and its
+  response, and a successful call now materialises a real A4 decision document
+  in the same transaction — so an official client never leaves records that
+  exist only in the legacy tables. `ai_decisions.approved` is still pinned to 0
+  by its own CHECK, and historical rows remain explicitly promotable.
+- **A repository is identified by a path-qualified lineage fingerprint.**
+  `repo_identity_hash` commits to the canonical root path, the object format and
+  the sorted set of ingested root commits, and an automatic reattachment
+  requires all three to match exactly. Two consequences follow, and both are
+  intended: an unrelated project created at the same path inherits nothing,
+  because the root commits differ; and the same repository cloned to a different
+  path is **not** reattached automatically either, because the root path differs.
+  Manual relinking is deferred, so the second case stays an orphan for now.
+  Decisions are never deleted, and `atlas decision orphaned` lists any that are
+  currently attached to no repository.
+- 128-bit decision identifiers (`atlas-dec-` and 32 hex), generated from
+  Atlas-chosen values plus kernel entropy, unique in the database, with
+  collision retry — because these ids are exported and outlive the database
+  that minted them.
+- schema v6.
+
+### What A4 does not claim
+
+`APPROVED` means an explicit action arrived through Atlas' local operator
+channel. Precisely:
+
+- Atlas exposes **no** approval, rejection or supersession capability through
+  MCP, hooks, or any AI-facing Atlas method.
+- Conversation text and model-generated RPC arguments **cannot** change a
+  lifecycle state.
+- The local operator channel requires an interactive terminal and a deliberate
+  confirmation typed against the revision's content hash.
+- **A same-UID process that can drive a pseudo-terminal may imitate that
+  channel** — and that includes an AI agent with shell access. Atlas' own test
+  suite drives it exactly that way, on purpose.
+- `LOCAL_OPERATOR_CONFIRMED` identifies the *channel*, not a person. It is not
+  cryptographic identity, does not establish that a person was present, is not
+  a signature and provides no non-repudiation.
+
+There is no cryptographic signing and no hardware-token support in A4.
+
+Approval also does not change what the text *is*. An approved decision is
+accepted project policy expressed in prose somebody wrote; it is still untrusted
+data, it is still labelled `UNTRUSTED_DATA` wherever it is reported, and no
+decision prose enters automatic model context at any status.
+
+Full detail, the state machine, and the explicit non-claims are in
+[docs/decision-lifecycle.md](docs/decision-lifecycle.md).
+
+## Phase A3
 
 A3 makes Atlas answer structural questions about C source, with the resolution
 class attached to every answer. It is a **lexical** indexer, not a compiler and
@@ -472,6 +551,14 @@ copied out of Atlas output can be pasted straight back in.
   repository and are not read
 - working-tree files above 256 MiB are recorded with size and Git object id but
   are not content-hashed
+- an approval records that Atlas' local operator channel was used, not that a
+  particular person acted; a process running as the same local user can produce
+  one, and Atlas says so rather than implying otherwise
+- removing a repository detaches its decisions rather than deleting them, and a
+  detached decision is invisible to every listing until the same canonical root
+  is registered again
+- Atlas does not parse decision records out of a repository and does not write
+  them into one; `atlas decision export` writes to stdout
 - history is read with `git log`, so a repository with an enormous history takes
   time proportional to it; `--max-commits` bounds the walk and the result is
   reported as bounded
@@ -562,7 +649,10 @@ copied out of Atlas output can be pasted straight back in.
 - [docs/backlog.md](docs/backlog.md) — known engineering and security backlog
 - [docs/code-intelligence.md](docs/code-intelligence.md) — the A3 structural
   index: resolution classes, what is claimed, and what is explicitly not
-- [docs/roadmap.md](docs/roadmap.md) — A4 through A6
+- [docs/decision-lifecycle.md](docs/decision-lifecycle.md) — the A4 decision
+  model: the state machine, the operator channel and its honest limits, code
+  links, migration and recovery
+- [docs/roadmap.md](docs/roadmap.md) — A5 and A6
 - [third_party/yyjson/PROVENANCE.md](third_party/yyjson/PROVENANCE.md) — the one
   vendored dependency, its exact upstream identity and its digests
 - [SECURITY.md](SECURITY.md) — threat model and reporting

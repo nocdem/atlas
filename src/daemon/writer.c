@@ -87,6 +87,7 @@ static atlas_job *job_new(atlas_job_kind kind) {
     atlas_buf_init(&j->result_root_text);
     atlas_err_init(&j->result_err);
     atlas_ai_result_init(&j->ai_result);
+    atlas_decision_result_init(&j->decision_result);
     return j;
 }
 
@@ -104,6 +105,11 @@ static void job_free(atlas_job *j) {
         free(j->ai);
     }
     atlas_ai_result_free(&j->ai_result);
+    if (j->decision != NULL) {
+        atlas_decision_op_free(j->decision);
+        free(j->decision);
+    }
+    atlas_decision_result_free(&j->decision_result);
     free(j);
 }
 
@@ -350,6 +356,19 @@ static void run_ai(atlas_writer *w, atlas_job *j) {
     j->result = atlas_ai_apply(w->db, j->ai, ai_request_sync, w, &j->ai_result, &j->result_err);
 }
 
+static void run_decision(atlas_writer *w, atlas_job *j) {
+    if (j->decision == NULL) {
+        j->result = atlas_err_set(&j->result_err, ATLAS_ERR_INTERNAL,
+                                  "a decision job arrived with no operation attached");
+        return;
+    }
+    /* `atlas_decision_apply` owns its own transaction, exactly like
+     * `atlas_ai_apply`, and is called with none open — so an operation is
+     * whole or nothing, and a spent challenge without the transition it
+     * authorised cannot be committed. */
+    j->result = atlas_decision_apply(w->db, j->decision, &j->decision_result, &j->result_err);
+}
+
 /* Marks every registered repository as having an unresolved event gap. */
 typedef struct gap_ctx {
     atlas_db *db;
@@ -456,6 +475,7 @@ static void *writer_main(void *arg) {
         case ATLAS_JOB_REPO_ADD: run_repo_add(w, j); break;
         case ATLAS_JOB_REPO_REMOVE: run_repo_remove(w, j); break;
         case ATLAS_JOB_AI: run_ai(w, j); break;
+        case ATLAS_JOB_DECISION: run_decision(w, j); break;
         case ATLAS_JOB_MARK_GAP: {
             atlas_err ignore;
             atlas_err_init(&ignore);
@@ -883,6 +903,12 @@ atlas_status atlas_writer_ai(atlas_writer *w, atlas_ai_op *op, int timeout_ms,
             st = atlas_buf_set(&result->degraded_reason, j->ai_result.degraded_reason.data,
                                j->ai_result.degraded_reason.len, err);
         }
+        if (st == ATLAS_OK) {
+            /* A4. The decision document `atlas_record_decision` materialised, so
+             * the caller learns its id without a second query. */
+            st = atlas_buf_set(&result->decision_uid, j->ai_result.decision_uid.data,
+                               j->ai_result.decision_uid.len, err);
+        }
     } else {
         *err = j->result_err;
     }
@@ -929,4 +955,95 @@ void atlas_writer_set_watch_dirty(atlas_writer *w) {
     (void)pthread_mutex_lock(&w->lock);
     w->watch_dirty = true;
     (void)pthread_mutex_unlock(&w->lock);
+}
+
+atlas_status atlas_writer_decision(atlas_writer *w, atlas_decision_op *op, int timeout_ms,
+                                   atlas_decision_result *result, atlas_err *err) {
+    atlas_job *j = job_new(ATLAS_JOB_DECISION);
+    if (j == NULL) {
+        /* Ownership is taken unconditionally, here as everywhere: a caller that
+         * has to free the operation on some paths and not others eventually
+         * frees it on the wrong one. */
+        atlas_decision_op_free(op);
+        free(op);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory queueing a decision request");
+    }
+    j->decision = op;
+    j->wants_result = true;
+
+    (void)pthread_mutex_lock(&w->lock);
+    if (w->stopping || !queue_push(w, j)) {
+        bool stopping = w->stopping;
+        (void)pthread_mutex_unlock(&w->lock);
+        job_free(j);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                             stopping ? "the Atlas daemon is shutting down"
+                                      : "the Atlas daemon's write queue is full");
+    }
+    (void)pthread_cond_signal(&w->not_empty);
+
+    struct timespec deadline;
+    (void)clock_gettime(CLOCK_REALTIME, &deadline);
+    int ms = timeout_ms > 0 ? timeout_ms : 5000;
+    deadline.tv_sec += ms / 1000;
+    deadline.tv_nsec += (long)(ms % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    int rc = 0;
+    while (!j->done && rc == 0) {
+        rc = pthread_cond_timedwait(&w->job_done, &w->lock, &deadline);
+    }
+    bool done = j->done;
+    (void)pthread_mutex_unlock(&w->lock);
+
+    if (!done) {
+        /* Detached rather than freed: the job is still the writer's, and the
+         * writer frees it when it finishes. */
+        (void)pthread_mutex_lock(&w->lock);
+        j->wants_result = false;
+        (void)pthread_mutex_unlock(&w->lock);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                             "the Atlas daemon did not complete the request within %d ms", ms);
+    }
+
+    atlas_status st = j->result;
+    if (st == ATLAS_OK) {
+        result->repo_id = j->decision_result.repo_id;
+        result->document_id = j->decision_result.document_id;
+        result->revision_id = j->decision_result.revision_id;
+        result->revision_no = j->decision_result.revision_no;
+        result->state = j->decision_result.state;
+        result->superseded_revision_no = j->decision_result.superseded_revision_no;
+        result->document_created = j->decision_result.document_created;
+        result->duplicate = j->decision_result.duplicate;
+        result->session_unbound = j->decision_result.session_unbound;
+        /* A pointer to one of the ATLAS_AI_UNBOUND_* string literals, so
+         * copying the pointer across the thread boundary copies the value.
+         * Nothing else may ever be put in this field. */
+        result->unbound_reason = j->decision_result.unbound_reason;
+        memcpy(result->content_hash, j->decision_result.content_hash,
+               sizeof(result->content_hash));
+        memcpy(result->confirm, j->decision_result.confirm, sizeof(result->confirm));
+        memcpy(result->expires_at, j->decision_result.expires_at, sizeof(result->expires_at));
+        struct {
+            atlas_buf *to;
+            const atlas_buf *from;
+        } copies[] = {
+            {&result->repo_name, &j->decision_result.repo_name},
+            {&result->root_text, &j->decision_result.root_text},
+            {&result->uid, &j->decision_result.uid},
+            {&result->token, &j->decision_result.token},
+            {&result->title, &j->decision_result.title},
+            {&result->replaced_by_uid, &j->decision_result.replaced_by_uid},
+        };
+        for (size_t i = 0; st == ATLAS_OK && i < sizeof(copies) / sizeof(copies[0]); i++) {
+            st = atlas_buf_set(copies[i].to, copies[i].from->data, copies[i].from->len, err);
+        }
+    } else {
+        *err = j->result_err;
+    }
+    job_free(j);
+    return st;
 }

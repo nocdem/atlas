@@ -101,6 +101,33 @@ typedef struct atlas_renderer_vtbl {
     atlas_status (*code_list_begin)(atlas_renderer *r, const char *key, atlas_err *err);
     atlas_status (*code_list_end)(atlas_renderer *r, const char *key, const char *singular,
                                   const char *plural, int64_t count, bool more, atlas_err *err);
+    /* --- A4 ---
+     *
+     * Four shapes, because there are four things to show: a document in a list,
+     * a whole document, one entry in its timeline, and the outcome of a
+     * lifecycle write. `decision export` reuses the whole-document shape rather
+     * than adding a fifth, so the export and `decision show --json` cannot
+     * describe one document differently.
+     *
+     * Every string these receive is already safe-encoded by the service layer
+     * — decision prose is untrusted whatever its status — so the renderers do
+     * not encode again, and both say so at the top of the file. */
+    atlas_status (*decision_item)(atlas_renderer *r, const atlas_decision_summary *s,
+                                  atlas_err *err);
+    atlas_status (*decision_show)(atlas_renderer *r, const atlas_decision_document *d,
+                                  atlas_err *err);
+    atlas_status (*decision_event)(atlas_renderer *r, const atlas_decision_timeline_entry *e,
+                                   atlas_err *err);
+    atlas_status (*decision_outcome)(atlas_renderer *r, const atlas_decision_outcome *o,
+                                     atlas_err *err);
+    /* The lifecycle totals a listing reports beside its page. */
+    atlas_status (*decision_counts)(atlas_renderer *r, const atlas_decision_counts *c,
+                                    atlas_err *err);
+    /* Whether the cached status agrees with the append-only ledger. Its own
+     * method rather than a field on something else, because it is a statement
+     * about the *record* rather than about any one decision, and `decision
+     * history` is where a reader would look for it. */
+    atlas_status (*decision_ledger)(atlas_renderer *r, bool agrees, atlas_err *err);
 } atlas_renderer_vtbl;
 
 struct atlas_renderer {

@@ -252,6 +252,14 @@ typedef struct atlas_ai_result {
     int64_t repo_id;
     int64_t change_set_id;
     int64_t record_id; /* the reason or decision row, when one was created */
+    /* A4. The decision document a recorded decision was materialised into.
+     *
+     * `atlas_record_decision` is A2's tool and keeps A2's schema, but a call to
+     * it now produces a real A4 decision document as well — otherwise an
+     * official client would keep writing records that only exist in the legacy
+     * tables and that a user has to promote by hand. Empty for every operation
+     * that is not a decision. */
+    atlas_buf decision_uid;
     atlas_buf repo_name;
     atlas_buf root_text; /* already in the safe encoding */
     bool session_created;
@@ -345,8 +353,23 @@ typedef struct atlas_ai_context {
     int64_t changed_paths;
     int64_t session_id;
     int64_t change_set_id;
-    int64_t approved_decisions; /* always 0 in A2; present so it can stop being */
+    /* A4. These now report the real lifecycle state of the decision documents
+     * in `decision_documents`, not the A2 placeholder — `approved_decisions`
+     * was pinned to zero for two phases because nothing could produce an
+     * approval, and something can now.
+     *
+     * Still integers, and still the only thing decisions contribute to the
+     * automatic envelope. No title, no rationale, no path, no id: every one of
+     * those is a value somebody else chose, and the envelope's rule is that no
+     * field may hold one. A consumer that wants a decision's text asks through
+     * an explicit MCP tool, where it arrives labelled UNTRUSTED_DATA. */
+    int64_t approved_decisions;
     int64_t proposed_decisions;
+    int64_t rejected_decisions;
+    int64_t superseded_decisions;
+    /* Approved decisions with at least one link that no longer matches the code
+     * it was recorded against. A count, not a list. */
+    int64_t decisions_needing_review;
     int64_t unresolved_reasons;
 
     /* A3. Typed counters only, and that is the whole of what the structural

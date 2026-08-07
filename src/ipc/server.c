@@ -675,6 +675,16 @@ atlas_status atlas_server_dispatch(atlas_server_ctx *ctx, const void *payload, s
         }
     }
     if (fn == NULL) {
+        size_t n = 0;
+        const atlas_method_entry *dec = atlas_server_decision_methods(&n);
+        for (size_t i = 0; i < n; i++) {
+            if (strcmp(atlas_ipc_request_method(req), dec[i].name) == 0) {
+                fn = dec[i].fn;
+                break;
+            }
+        }
+    }
+    if (fn == NULL) {
         atlas_err merr;
         atlas_err_init(&merr);
         /* The method name was safe-encoded during parsing, so echoing it back

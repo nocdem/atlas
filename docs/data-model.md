@@ -796,3 +796,117 @@ one of Atlas' inserts that is a plain insert with no `ON CONFLICT`, so
 hundred times per file, more than every other insert in A3 put together. Its
 neighbours keep RETURNING because an upsert may take the update branch, where
 the last inserted rowid is not the row's.
+
+
+## A4: decision documents (migration 6)
+
+Seven tables. Nothing here cascades from `repositories`, and that is the one
+structural break with everything above.
+
+| table | holds |
+| --- | --- |
+| `decision_documents` | stable identity: the public `uid`, the soft `repo_id`, the durable `repo_root_hash`, and a **cache** of the ledger (`current_status`, `current_revision_id`) |
+| `decision_revisions` | immutable revisions: content, `content_hash`, `proposed_by`, `state`, `imported_from_ai_decision_id` |
+| `decision_alternatives` | the alternatives considered, in order |
+| `decision_links` | paths, commits, change sets, symbol snapshots, and links to other documents |
+| `decision_events` | the append-only lifecycle ledger — **canonical** |
+| `decision_challenges` | short-lived single-use operator capabilities |
+| `decision_search` | the bounded searchable projection, and the content table for the optional `decisions_fts` |
+
+### `repo_id` is a soft reference, and a path hash is not an identity
+
+Every other table in the schema is a rebuildable index keyed to a registered
+worktree, so `repo remove` is a pure cascade. A decision document is not
+rebuildable from anything, and rule 10 of the phase is that no decision record
+is ever physically deleted — so a foreign key with `ON DELETE CASCADE` here
+would make `atlas repo remove --yes` silently destroy approval history.
+
+Two columns carry the repository, and only one of them is an identity.
+
+`repo_root_hash` is the SHA-256 of the canonical root's raw bytes — the same
+value the automatic context envelope reports. It answers "same directory", which
+is a **location**. It is kept for reporting and is never sufficient to decide
+that two registrations are the same repository.
+
+`repo_identity_hash` is what an automatic relink matches on. It is a
+**path-qualified lineage fingerprint**, committing to the canonical root path,
+the object format, **and the sorted set of root commits Atlas has ingested**.
+The root-commit set is the discriminating component: it is stable across clones,
+fetches, rewrites of later history and re-registration at the same path, and it
+differs between unrelated repositories. The root path is hashed alongside it, so
+the fingerprint as a whole is *not* stable across a move — see the note below.
+It is computed from the `commits` table, so it costs one indexed query and needs
+no git invocation. It is empty when no lineage is known, and an empty identity
+matches nothing.
+
+What the fingerprint does and does not do:
+
+| situation | reattached automatically? | why |
+| --- | --- | --- |
+| same path, same lineage — a `repo remove` / `repo add` cycle | yes | the whole fingerprint matches |
+| same path, unrelated history — `rm -rf` then `git init` | **no** | the root commits differ |
+| same lineage, different path — a clone or a move | **no** | the root path differs, so the fingerprint does |
+| either side has no ingested history | **no** | an empty identity matches nothing |
+
+The third row is a real limitation rather than an oversight. Moving a repository
+leaves its decisions orphaned and visible in `atlas decision orphaned`; manual
+relinking is deferred to a later phase. The alternative — matching on lineage
+alone — would reattach across every clone on the machine, including ones the
+operator never meant to associate, so the conservative direction was chosen.
+
+The attach and the detach are deliberately split:
+
+- `atlas_db_decision_detach_repo` runs unconditionally inside
+  `atlas_db_repo_add`. Every document carrying that `repo_id` is detached to
+  `repo_id = 0`, which no `repositories` row can have. It needs no git and no
+  history, so it cannot be skipped — and it closes a real hole, because
+  `repositories.id` is a rowid and **rowids are reused**.
+- `atlas_db_decision_relink_after_ingest` runs from `atlas_db_scan_finish` on a
+  successful pass, when the lineage is finally knowable, and attaches only on an
+  exact non-empty identity match. It also backfills the identity onto documents
+  already attached to this repository whose identity is empty — which is not a
+  guess, since they demonstrably belong to it — and never overwrites an existing
+  one.
+
+Splitting them makes the failure mode fail-closed by construction: forgetting
+the attach can only orphan a decision, which is visible through
+`atlas decision orphaned` and recoverable by re-registering; it can never attach
+one to the wrong repository, which is neither.
+
+### `decision_documents.uid`
+
+`atlas-dec-` and 32 lowercase hex characters — 128 bits, `TEXT NOT NULL UNIQUE`.
+Derived from the repository identity, the row id, the timestamp, a retry counter
+and 16 bytes of kernel entropy. Assignment retries on a UNIQUE collision and
+then fails loudly rather than falling back to something sequential. It is an
+identifier, not a secret.
+
+### Indexes that are load-bearing
+
+- `idx_decision_docs_status ON decision_documents(repo_id, current_status, id DESC)`
+  — the hot query is "approved decisions for this repository"; without status in
+  the index that is a seek followed by a fetch-and-discard per proposed
+  document.
+- `CREATE UNIQUE INDEX idx_decision_rev_current ON decision_revisions(document_id) WHERE state = 'APPROVED'`
+  — rule 9 as a schema constraint. A second effective revision is impossible to
+  bring into existence, so a wrong approve/supersede ordering fails loudly
+  instead of leaving two that every later read quietly picks between.
+- `idx_decision_links_path ON decision_links(path_raw) WHERE path_raw IS NOT NULL`
+  — "which decisions concern this file?" seeks from the raw path bytes.
+
+### The query shape that matters
+
+Every listing joins the document projection to a bounded inner `SELECT DISTINCT`
+of matching document ids rather than filtering with `d.id IN (…)`. The `IN`
+spelling reads correctly and is linear in the *repository*: SQLite satisfies
+`ORDER BY d.id DESC LIMIT n` by walking every document in id order, evaluating a
+correlated head-revision subquery per row. Measured at ten thousand documents
+that was 1 474 ms against a 100 ms budget. See the comment on
+`DECISION_DOC_SELECT` in `src/db/db_decision.c`.
+
+### FTS5
+
+`decisions_fts` is created in `atlas_db_ensure_fts`, not in the numbered
+migration, for the reason the top of `migrate.c` gives: FTS5 availability is a
+property of the linked SQLite build rather than of the schema. Search degrades
+to a bounded, repository-filtered scan of `decision_search` when it is absent.

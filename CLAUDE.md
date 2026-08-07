@@ -1,10 +1,10 @@
 # Atlas — working notes for Claude Code
 
 Atlas is a generic, headless engineering-memory and repository-intelligence CLI in
-C17. Phase **A3**: structural code intelligence — a first-party bounded lexical C
-indexer and a relationship graph — on top of the A2 AI integration, the A1 daemon
-and the A0 read-only foundation. Not DNA-specific; DNA will later be its first
-indexed repository.
+C17. Phase **A4**: decision documents with immutable revisions, an append-only
+lifecycle ledger and an operator approval channel — on top of the A3 structural
+code intelligence, the A2 AI integration, the A1 daemon and the A0 read-only
+foundation. Not DNA-specific; DNA will later be its first indexed repository.
 
 ## Build and test
 
@@ -25,6 +25,7 @@ make compiledb  # refresh the top-level compile_commands.json symlink
 sh scripts/perf.sh build      # A1 performance acceptance measurements
 sh scripts/perf-a2.sh build   # A2 hook and MCP latency measurements
 sh scripts/perf-a3.sh build   # A3 structural-indexing acceptance (~7 minutes)
+sh scripts/perf-a4.sh build   # A4 decision-lifecycle acceptance (~2 minutes)
 ```
 
 `perf-a3.sh` measures peak RSS from `/proc/<pid>/VmHWM` rather than from
@@ -41,6 +42,20 @@ initial passes — each against a data directory that never existed before — u
 anything is timed. Shrinking the fixture or moving the limit to make a run pass
 is the one failure mode a performance gate cannot detect about itself, so the
 script does not leave either to a reader.
+
+`perf-a4.sh` follows the same discipline and for the same reason: it builds a
+deterministic corpus of **10 000 documents, 25 000 revisions and 100 000 links
+with all four lifecycle states present**, asserts those floors, and asserts its
+own limits — every bounded read p95 required under 100 ms, the passive hook
+under 20 ms — exiting non-zero rather than printing a number nobody checks. It
+earned that on its first run by catching a 1 474 ms search.
+
+Those are the **required limits**, not the observations. Observed p95 on this
+machine is 4–15 ms for the bounded reads and 2 ms for the hook, and it moves by
+several milliseconds between runs with nothing but machine load. Report an
+observation as an observation: "7 ms observed", never "under 7 ms", which reads
+as a bound Atlas does not hold. `docs/decision-lifecycle.md` carries the table,
+and every figure in it comes from one run of the script.
 
 `make doctor` and `make doctor-claude` observe and create nothing: no data
 directory, no index, no lock, no runtime directory, no socket, no Claude
@@ -376,6 +391,210 @@ src/ipc      server_code.c (the seven-method A3 group)
   does not edit `~/.claude`, does not touch systemd, and does not run `claude`.
   `uninstall` never touches the index.
 
+## A4 layers — additions
+
+```
+src/decision decision.c (the vocabularies, the canonical content hash,
+             validation), lifecycle.c (the state machine and the operator
+             channel — the only write point)
+src/db       db_decision.c (typed operations over the migration-6 tables)
+src/core     service_decision.c (the `decision` command behaviour and the
+             interactive confirm flow), terminal.c (the operator-only channel)
+src/ipc      server_decision.c (the ten-method A4 group)
+```
+
+## A4 rules — these are not negotiable
+
+- **State the approval contract precisely, and never more than it.** The whole
+  of what Atlas may claim is:
+
+  > Atlas exposes no approval, rejection or supersession capability through MCP,
+  > hooks or any AI-facing method. Conversation text and model-generated RPC
+  > arguments cannot change a lifecycle state. The local operator channel
+  > requires an interactive terminal and a deliberate confirmation. A same-UID
+  > process that can drive a pseudo-terminal — **including an AI agent with
+  > shell access** — may imitate that channel. `LOCAL_OPERATOR_CONFIRMED`
+  > identifies the channel, not a person: it is not cryptographic identity, does
+  > not establish that a person was present, is not a signature, and provides no
+  > non-repudiation.
+
+  Anything stronger is false. The forbidden phrasings are enumerated in one
+  place — `FORBIDDEN[]` in `tests/test_decision_mcp.c` — and that test scans the
+  documentation, the headers, the skill and the source and fails on any of them.
+  The list is not repeated here on purpose: a second copy would drift, and this
+  file is one of the files the scan covers.
+
+  That tripwire exists because the overclaim was in the shipped text of this
+  very phase. Also avoid "approved by the user" and "signed off" in prose about
+  a decision; say "approved in Atlas". A2's `USER_APPROVED_DECISION` stays in
+  the vocabulary and stays **unwritten**, because it names a person.
+- **Approval changes a status, never the nature of the bytes.** Approved
+  decision prose is accepted project policy *and* still `UNTRUSTED_DATA`. It is
+  encoded wherever it reaches a terminal or a JSON document, it is labelled
+  wherever it reaches a model, and it never enters automatic context at any
+  status. Conflating the two would turn the approval prompt into a
+  prompt-injection channel.
+- **`atlas_decision_apply_in_tx` is the only function that writes a lifecycle
+  transition.** The actor restriction, the transition table, the challenge
+  consumption, the atomic approve-and-supersede, the cycle check and the cache
+  update all live behind it, and every one would be bypassable if a second path
+  reached the tables. This is the same rule `settle()` and
+  `atlas_db_evidence_insert` follow.
+
+  It has **exactly two callers**: `atlas_decision_apply`, the public entry
+  point, which adds only `BEGIN`, `COMMIT` and rollback; and
+  `op_decision_locked` in `src/ai/ai.c`, the A2 bridge, which already owns a
+  transaction because its A2 row and its A4 document must commit together. A
+  nested transaction there would not work — `atlas_db_begin` counts depth, its
+  rollback does not, and a failed transition would silently discard the caller's
+  work. Adding a third caller means arguing that it genuinely owns a wider unit
+  of work; adding a second *implementation* is what the rule forbids.
+- **`atlas_decision_actor_writable_by_adapter` refuses
+  `LOCAL_OPERATOR_CONFIRMED` and `ATLAS_AUTOMATIC`**, mirroring
+  `atlas_provenance_writable_in_a2` and
+  `atlas_code_resolution_writable_in_a3`. Checked at the IPC edge *and* at the
+  write point: the edge produces the better message, the write point is the
+  guarantee.
+- **A revision is immutable.** No `UPDATE` in `db_decision.c` names a content
+  column; the one statement that touches `decision_revisions` sets `state` and
+  nothing else. A change is a new revision. Adding an in-place edit path would
+  make every prior approval's content hash a claim about bytes that are gone.
+- **The ledger is canonical; the status columns are a cache.** They are written
+  in the same transaction as the event that justifies them, and
+  `atlas_db_decision_verify` replays the ledger to check them. It **reports,
+  never repairs** — `atlas doctor` calls it, and a diagnostic that fixes what it
+  finds cannot tell you whether the fault recurs. A transition that reasons
+  about the document's status independently will disagree with the replay; use
+  `recompute_status()`.
+- **Every transition's `UPDATE` names the state it observed.** `... WHERE id = ?
+  AND state = ?`, and the caller requires that exactly one row changed. That is
+  what makes a concurrent transition lose deterministically instead of
+  last-write-wins. Never replace it with a read followed by an unconditional
+  write.
+- **At most one approved revision per document is a schema constraint**, not
+  care: `CREATE UNIQUE INDEX ... ON decision_revisions(document_id) WHERE state
+  = 'APPROVED'`. It makes a wrong approve/supersede ordering a hard failure
+  instead of two effective revisions that every later read quietly picks
+  between. Do not remove it to "simplify" the ordering.
+- **Nothing deletes a decision record.** The only `DELETE` in `db_decision.c`
+  removes *expired, unconsumed* challenges; a consumed one is part of an
+  approval record and the event points at it. There is no `_clear` for these
+  tables and there must not be one.
+- **Decision tables do not cascade from `repositories`**, because an FK would
+  make `repo remove --yes` destroy approval history. `repo_id` is a soft
+  reference and `repo_identity_hash` is the durable identity.
+- **A path hash is not a repository identity.** `repo_identity_hash` is a
+  **path-qualified lineage fingerprint**: the canonical root path, the object
+  format **and the sorted set of ingested root commits**. Without the lineage,
+  `git init` of an unrelated project at the same path inherits the previous
+  one's approved decisions. Because the path is hashed too, the converse also
+  holds and is deliberate — the same lineage at another path does not reattach
+  automatically. Automatic reattachment requires the exact fingerprint; manual
+  relinking is deferred. Always describe it as a path-qualified lineage
+  fingerprint and name both halves: a description that credits only the lineage
+  is wrong in the second direction, and one that credits only the path is wrong
+  in the first. `tests/test_decision_mcp.c` scans for the shorter phrasings.
+- **Detach at registration, attach after ingestion, and never guess.**
+  `atlas_db_decision_detach_repo` runs unconditionally inside
+  `atlas_db_repo_add`, needs no git, and cannot be forgotten — `repositories.id`
+  is a reused rowid. `atlas_db_decision_relink_after_ingest` runs from
+  `atlas_db_scan_finish` on a successful pass and attaches only on an exact,
+  non-empty identity match. Splitting them makes the failure mode fail-closed by
+  construction: a forgotten attach orphans, and orphaning is visible and
+  recoverable. Never relink on a name, a remote, a branch or a judgement, and
+  never overwrite an existing identity.
+- **An orphan must stay visible.** `atlas decision orphaned` exists because a
+  canonical record that has become invisible looks exactly like one that was
+  deleted.
+- **No A4 column may hold a rowid that outlives the row.** A4 records do not
+  cascade and `ai_decisions` does, so a promoted revision's
+  `imported_from_ai_decision_id` survived its target — and SQLite reuses rowids,
+  so the next A2 record took an id an orphan still pointed at. That failed the
+  unique index and made `atlas_record_decision` impossible after any
+  `repo remove`; without the index it would instead have resolved silently to
+  another repository's proposal. `atlas_db_repo_remove` clears the pointers in
+  the same transaction as the delete, via
+  `atlas_db_decision_forget_legacy_origins`. Adding a cross-model reference
+  means asking what happens when the far side is deleted **and its id is handed
+  to somebody else**; "there is a foreign key" is not an answer when only one
+  side cascades.
+- **No decision link is a foreign key into a migration-5 table.** A symbol link
+  is a durable selector snapshot (name, kind, file, line, basis commit, file
+  content hash, analyzer name and version). Currency is computed on read and
+  never stored, and Atlas **never re-points a link**: a rename is `MISSING`,
+  several matches are `AMBIGUOUS` with the count, and an index that has not run
+  is `UNKNOWN` rather than `MISSING`.
+- **The canonical content hash covers everything immutable that changes what was
+  approved, and nothing database-local or recomputed.** That includes each
+  link's whole snapshot — basis commit, captured file content hash, analyzer
+  name and version — plus the revision's `basis_head`, the durable repository
+  identity and `proposed_by`. It excludes row ids, `revision_no`, `created_at`,
+  the session binding, `state`, the dedup key, the import pointer, the derived
+  `%XX` display encodings, and every live currency result. The field-by-field
+  table is in `docs/decision-lifecycle.md` and adding a field means adding a row
+  to it with a reason.
+
+  Domain-separated and **length-prefixed**, never delimited: with any
+  single-byte delimiter a title of `a|b` with a decision of `c` encodes
+  identically to a title of `a` with a decision of `b|c`. Links hash in a
+  canonical order (a set); alternatives keep theirs (a list). Changing the
+  encoding means bumping `ATLAS_DECISION_HASH_DOMAIN`.
+- **`atlas doctor` rehashes every revision.** Atlas never updates a content
+  column, so a mismatch means something outside Atlas did — and any approval
+  bound to that digest now covers bytes that are not there. Reported, never
+  repaired.
+- **A4 writes no evidence, and `INFERENCE` stays unused.** The reserved kind is
+  not used merely because it exists: A4 defines no deterministic inference with
+  its own provenance. `DECISION` and `USER_STATEMENT` stay unused too.
+- **No MCP tool may approve, reject or supersede, and no tool schema may declare
+  a `token` or a `confirmation`.** The absence is structural — every schema sets
+  `additionalProperties: false` — rather than guarded.
+  `tests/test_decision_mcp.c` asserts the whole inventory and rejects any tool
+  name containing an approval verb.
+- **Approvals are sessionless.** `atlas_decision_apply` clears the session
+  binding unconditionally for every operation that consumes a capability, even
+  when the request carried a valid open session key. Attaching one would record
+  that a conversation approved something.
+
+## Extending A4 safely
+
+- **A new lifecycle state** means editing `atlas_decision_state`, the schema
+  CHECKs on `decision_revisions.state`, `decision_documents.current_status` and
+  `decision_events.event`, `atlas_decision_transition_allowed`, the replay in
+  `atlas_db_decision_verify`, `recompute_status()`, and the enumerated table in
+  `tests/test_decision_model.c`. The transition table is a *function* precisely
+  so a test cannot pass by agreeing with a second copy of the rules.
+- **A new operation that must be atomic with something else** uses
+  `atlas_decision_apply_in_tx` and owns the transaction itself.
+  `atlas_decision_apply` is begin + that + commit; calling it from inside
+  another transaction would nest, and its rollback would discard the caller's
+  work. **Never add a second `atlas_db_begin` inside `apply_in_tx`** — a stray
+  one made `decision propose` report success and write nothing, because the
+  nested commit only decremented the depth counter.
+- **A new writer payload** goes in `atlas_decision_op`, is freed in
+  `atlas_decision_op_free`, is copied field by field in
+  `atlas_writer_decision`'s result block, and is serialised in `op_to_params`
+  for the daemon path. The service layer routes a write locally when this
+  process holds the lock and over the socket when it does not; both must carry
+  it or the two paths behave differently.
+- **A new RPC method** goes in `DECISION_METHODS[]` in `server_decision.c`.
+  Decide explicitly whether it consumes a capability, and if it does, add it to
+  `atlas_decision_op_needs_challenge` — that function is asked by
+  `atlas_decision_apply` itself, so a new kind cannot default into the
+  unauthenticated set.
+- **A new MCP tool** follows the A2 rule, plus: it must not accept a capability
+  argument, and adding it changes the pinned count in `tests/test_plugin.c`.
+- **A new renderer field** carrying decision prose is already safe-encoded by
+  the service layer — do not encode again — and both renderers say so at the
+  top. Anything copied out of a result struct must be copied, not aliased:
+  row callbacks hand out borrowed pointers.
+- **A new envelope line** must be added to the `KEYS` list in
+  `tests/test_ai_trust.c`. That list is the envelope's closed vocabulary and has
+  now caught two phases in a row.
+- **A new claim about approval** goes through the tripwire in
+  `tests/test_decision_mcp.c`: the forbidden-phrase list and the
+  required-wording list are both there, and both are the point.
+
 ## Adding an MCP tool or a hook event
 
 - **A tool** is one entry in `TOOLS[]` in `src/mcp/mcp_tools.c`: a schema function
@@ -450,6 +669,19 @@ there is no shell in the tests either. Notes that matter:
   than fail on a filesystem that rejects them.
 - `fx_install_marker` / `fx_marker_fired` are the adversarial pair: they place a
   helper a hostile repository config could point at, and assert it never ran.
+
+## The prepared-statement cache
+
+`atlas_db_prepare` caches by the SQL **pointer**, because every call site passes
+a string literal. It now also confirms the text against a copy the cache owns.
+
+That is not belt and braces: a caller that formats SQL into a reused buffer
+presents the same address with different text on the next call, and without the
+confirmation is handed the previous statement — which then executes the wrong
+query against the right bindings. A test in this repository did exactly that and
+got an answer about the wrong session. Pass a string literal and bind
+parameters; anything else prepares fresh, which is what the header has always
+said happens.
 
 ## Memory ownership
 
@@ -575,7 +807,7 @@ two documents on stdout.
 
 `README.md` (usage, limitations) · `SECURITY.md` (threat model) ·
 `docs/architecture.md` · `docs/data-model.md` · `docs/provenance.md` ·
-`docs/code-intelligence.md` ·
+`docs/code-intelligence.md` · `docs/decision-lifecycle.md` ·
 `docs/git-safety.md` · `docs/daemon-and-ipc.md` ·
 `docs/watcher-consistency.md` · `docs/systemd-user-service.md` ·
 `docs/ai-trust-boundary.md` · `docs/claude-integration.md` ·

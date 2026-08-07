@@ -46,6 +46,9 @@ const atlas_method_entry *atlas_server_ai_methods(size_t *count_out);
 /* The A3 method group: everything under `code.`. Looked up through the same
  * dispatch as the others, in server.c. */
 const atlas_method_entry *atlas_server_code_methods(size_t *count_out);
+/* The A4 method group: everything under `decision.`. Looked up through the same
+ * dispatch as the others, in server.c. */
+const atlas_method_entry *atlas_server_decision_methods(size_t *count_out);
 
 /* Resolves the `repo` parameter with the CLI's error text. Shared because two
  * groups need it and two copies would answer differently. */

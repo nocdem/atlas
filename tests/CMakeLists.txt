@@ -38,6 +38,15 @@ atlas_set_warnings(atlas-jsoncheck)
 add_executable(atlas-gen-ctree tools/atlas_gen_ctree.c)
 atlas_set_warnings(atlas-gen-ctree)
 
+# A4. The decision-scale acceptance fixture. It writes through the real
+# `atlas_decision_apply` rather than through hand-written SQL, so it links the
+# core library — a fixture built by a second write path would measure a database
+# shape the real one never produces.
+add_executable(atlas-gen-decisions tools/atlas_gen_decisions.c)
+target_link_libraries(atlas-gen-decisions PRIVATE atlas_core)
+target_compile_definitions(atlas-gen-decisions PRIVATE _POSIX_C_SOURCE=200809L)
+atlas_set_warnings(atlas-gen-decisions)
+
 set(ATLAS_TESTS
   test_core
   test_safetext
@@ -73,6 +82,13 @@ set(ATLAS_TESTS
   test_code_compdb
   test_code_trust
   test_code_analyzer
+  # --- A4 ---
+  test_decision_model
+  test_decision_lifecycle
+  test_migrate6
+  test_decision_operator
+  test_decision_mcp
+  test_decision_bridge
 )
 
 foreach(test_name IN LISTS ATLAS_TESTS)
@@ -99,14 +115,32 @@ set_tests_properties(test_ai_schema test_mcp test_plugin PROPERTIES LABELS "unit
 # A3. The extractor is pure — bytes in, a bounded object out — so its suite needs
 # no repository, no database and no daemon, and belongs in the fast subset.
 set_tests_properties(test_code_lex PROPERTIES LABELS "unit")
+
+# A4. The content hash, the transition table and validation are pure functions —
+# bytes in, a digest or a verdict out — so this suite needs no repository, no
+# database and no daemon, and belongs in the fast subset.
+set_tests_properties(test_decision_model PROPERTIES LABELS "unit")
+# The lifecycle suite drives the state machine against a real database in
+# process, like test_ai_schema: no daemon, no repository, no filesystem events.
+set_tests_properties(test_decision_lifecycle test_migrate6 PROPERTIES LABELS "unit")
+# The operator suite builds a real repository and drives the binary through a
+# pseudo-terminal, so it is an integration test rather than a unit one.
+set_tests_properties(test_decision_operator PROPERTIES LABELS "integration")
+# The MCP surface is a property of the binary: no database, no daemon, no repository.
+set_tests_properties(test_decision_mcp PROPERTIES LABELS "unit")
 # test_ai_trust and test_hooks fork a live daemon and wait on filesystem events,
 # so they carry the daemon label and its serialisation for the same reason
 # test_daemon does: parallel daemons compete for the machine's inotify budget.
 set_tests_properties(test_ai_trust test_hooks test_mcp_roots test_ai_attribution test_code_trust
+  test_decision_bridge
   PROPERTIES LABELS "daemon" TIMEOUT 900 RUN_SERIAL TRUE)
 
 # The plugin fixture test reads the shipped plugin from the source tree, so it
 # has to be told where that is rather than guessing from the working directory.
+# The claim tripwire reads Atlas' own documentation and source, so it has to be
+# told where the source tree is rather than guessing from the working directory.
+target_compile_definitions(test_decision_mcp PRIVATE ATLAS_SRC_DIR="${CMAKE_SOURCE_DIR}")
+
 target_compile_definitions(test_plugin PRIVATE
   ATLAS_PLUGIN_DIR="${CMAKE_SOURCE_DIR}/integrations/claude/atlas"
   ATLAS_MARKETPLACE_DIR="${CMAKE_SOURCE_DIR}/integrations/claude")

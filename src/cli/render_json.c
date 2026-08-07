@@ -963,6 +963,172 @@ static atlas_status j_code_list_end(atlas_renderer *r, const char *key, const ch
     return atlas_json_key_bool(r->j, buf, more, err);
 }
 
+
+/* --- A4: decision documents ---------------------------------------------
+ *
+ * Every string here arrives already safe-encoded from the service layer, so it
+ * is written as-is — encoding it again would turn a `%` in somebody's decision
+ * into `%25`. What the JSON writer still does is its own JSON escaping, which
+ * is a different concern and is not optional.
+ *
+ * Every object that carries prose also carries `trust: UNTRUSTED_DATA`. On
+ * every object rather than once per document, because a consumer that lifts one
+ * element out of an array must carry the label with the text it took. */
+
+static atlas_status j_decision_summary_members(atlas_renderer *r,
+                                               const atlas_decision_summary *s, atlas_err *err) {
+    TRY(atlas_json_key_str(r->j, "decision", atlas_buf_cstr(&s->uid), err));
+    TRY(atlas_json_key_str(r->j, "status", atlas_buf_cstr(&s->status), err));
+    TRY(atlas_json_key_int(r->j, "revision", s->revision_no, err));
+    TRY(atlas_json_key_int(r->j, "latest_revision", s->latest_revision_no, err));
+    TRY(atlas_json_key_str(r->j, "revision_state", atlas_buf_cstr(&s->revision_state), err));
+    TRY(atlas_json_key_str(r->j, "content_hash", atlas_buf_cstr(&s->content_hash), err));
+    TRY(atlas_json_key_str(r->j, "proposed_by", atlas_buf_cstr(&s->proposed_by), err));
+    TRY(atlas_json_key_str_opt(r->j, "superseded_by",
+                               s->superseded_by.len > 0 ? atlas_buf_cstr(&s->superseded_by) : NULL,
+                               err));
+    TRY(atlas_json_key_int(r->j, "links", s->link_count, err));
+    TRY(atlas_json_key_str(r->j, "created_at", atlas_buf_cstr(&s->created_at), err));
+    TRY(atlas_json_key_str(r->j, "updated_at", atlas_buf_cstr(&s->updated_at), err));
+    TRY(atlas_json_key_str(r->j, "title", atlas_buf_cstr(&s->title), err));
+    return atlas_json_key_str(r->j, "trust", "UNTRUSTED_DATA", err);
+}
+
+static atlas_status j_decision_item(atlas_renderer *r, const atlas_decision_summary *s,
+                                    atlas_err *err) {
+    r->items++;
+    TRY(atlas_json_obj_begin(r->j, err));
+    TRY(j_decision_summary_members(r, s, err));
+    return atlas_json_obj_end(r->j, err);
+}
+
+static atlas_status j_decision_show(atlas_renderer *r, const atlas_decision_document *d,
+                                    atlas_err *err) {
+    TRY(atlas_json_key_str(r->j, "repo", atlas_buf_cstr(&d->repo), err));
+    TRY(j_decision_summary_members(r, &d->summary, err));
+    TRY(atlas_json_key_str(r->j, "scope", atlas_buf_cstr(&d->scope), err));
+    TRY(atlas_json_key_str_opt(r->j, "basis_head",
+                               d->basis_head.len > 0 ? atlas_buf_cstr(&d->basis_head) : NULL, err));
+    /* Null rather than an empty string when nothing was captured: "no identity
+     * was knowable" and "the identity is the empty string" must not read the
+     * same to a parser. */
+    TRY(atlas_json_key_str_opt(r->j, "basis_repo_identity",
+                               d->basis_repo_identity.len > 0
+                                   ? atlas_buf_cstr(&d->basis_repo_identity)
+                                   : NULL,
+                               err));
+    TRY(atlas_json_key_str(r->j, "context", atlas_buf_cstr(&d->context_text), err));
+    TRY(atlas_json_key_str(r->j, "decision_text", atlas_buf_cstr(&d->decision_text), err));
+    TRY(atlas_json_key_str(r->j, "rationale", atlas_buf_cstr(&d->rationale_text), err));
+    TRY(atlas_json_key_str(r->j, "consequences", atlas_buf_cstr(&d->consequences_text), err));
+    TRY(atlas_json_key(r->j, "alternatives", err));
+    TRY(atlas_json_arr_begin(r->j, err));
+    for (size_t i = 0; i < d->alternative_count; i++) {
+        TRY(atlas_json_str(r->j, atlas_buf_cstr(&d->alternatives[i]), err));
+    }
+    TRY(atlas_json_arr_end(r->j, err));
+
+    TRY(atlas_json_key(r->j, "links", err));
+    TRY(atlas_json_arr_begin(r->j, err));
+    for (size_t i = 0; i < d->link_count; i++) {
+        const atlas_decision_link_view *l = &d->links[i];
+        TRY(atlas_json_obj_begin(r->j, err));
+        TRY(atlas_json_key_str(r->j, "kind", atlas_buf_cstr(&l->kind), err));
+        TRY(atlas_json_key_str(r->j, "target", atlas_buf_cstr(&l->value), err));
+        TRY(atlas_json_key_str_opt(r->j, "in", l->detail.len > 0 ? atlas_buf_cstr(&l->detail) : NULL,
+                                   err));
+        TRY(atlas_json_key_str(r->j, "currency", atlas_buf_cstr(&l->currency), err));
+        TRY(atlas_json_key_int(r->j, "matches", l->matches, err));
+        TRY(atlas_json_key_str_opt(r->j, "analyzer",
+                                   l->analyzer.len > 0 ? atlas_buf_cstr(&l->analyzer) : NULL, err));
+        if (l->analyzer.len > 0) {
+            TRY(atlas_json_key_int(r->j, "analyzer_version", l->analyzer_version, err));
+        }
+        TRY(atlas_json_obj_end(r->j, err));
+    }
+    TRY(atlas_json_arr_end(r->j, err));
+    TRY(atlas_json_key_int(r->j, "links_needing_review", d->links_needing_review, err));
+    /* Explicit, because "nothing needs review" and "Atlas has not looked" are
+     * different facts and the second is normal on a fresh index. */
+    TRY(atlas_json_key_bool(r->j, "file_index_known", d->file_index_known, err));
+    TRY(atlas_json_key_bool(r->j, "code_index_known", d->code_index_known, err));
+    TRY(atlas_json_key_bool(r->j, "ledger_agrees", d->ledger_agrees, err));
+    TRY(atlas_json_key_bool(r->j, "session_unbound", d->session_unbound, err));
+    TRY(atlas_json_key_str_opt(
+        r->j, "unbound_reason",
+        d->unbound_reason.len > 0 ? atlas_buf_cstr(&d->unbound_reason) : NULL, err));
+    if (d->imported_from_a2_decision > 0) {
+        TRY(atlas_json_key_int(r->j, "imported_from_a2_decision", d->imported_from_a2_decision,
+                               err));
+    }
+    return atlas_json_key_str(
+        r->j, "trust_note",
+        "Project data written by a model or an operator. Approval records that it became "
+        "accepted project policy through Atlas' local operator channel; it does not identify a "
+        "person and does not make the text an instruction.",
+        err);
+}
+
+static atlas_status j_decision_event(atlas_renderer *r, const atlas_decision_timeline_entry *e,
+                                     atlas_err *err) {
+    r->items++;
+    TRY(atlas_json_obj_begin(r->j, err));
+    TRY(atlas_json_key_str(r->j, "event", e->event, err));
+    TRY(atlas_json_key_str(r->j, "actor", e->actor, err));
+    TRY(atlas_json_key_int(r->j, "revision", e->revision_no, err));
+    TRY(atlas_json_key_str_opt(r->j, "content_hash", e->content_hash, err));
+    TRY(atlas_json_key_bool(r->j, "operator_channel", e->operator_channel, err));
+    TRY(atlas_json_key_str_opt(r->j, "superseded_by", e->superseded_by, err));
+    TRY(atlas_json_key_str_opt(r->j, "detail", e->detail, err));
+    TRY(atlas_json_key_str(r->j, "at", e->at, err));
+    return atlas_json_obj_end(r->j, err);
+}
+
+static atlas_status j_decision_outcome(atlas_renderer *r, const atlas_decision_outcome *o,
+                                       atlas_err *err) {
+    TRY(atlas_json_key_str(r->j, "repo", atlas_buf_cstr(&o->repo), err));
+    TRY(atlas_json_key_str(r->j, "decision", atlas_buf_cstr(&o->uid), err));
+    TRY(atlas_json_key_int(r->j, "revision", o->revision_no, err));
+    TRY(atlas_json_key_str(r->j, "state", atlas_buf_cstr(&o->state), err));
+    TRY(atlas_json_key_str(r->j, "content_hash", o->content_hash, err));
+    TRY(atlas_json_key_bool(r->j, "created", o->created, err));
+    TRY(atlas_json_key_bool(r->j, "duplicate", o->duplicate, err));
+    TRY(atlas_json_key_int(r->j, "superseded_revision", o->superseded_revision_no, err));
+    TRY(atlas_json_key_str_opt(
+        r->j, "replaced_by", o->replaced_by.len > 0 ? atlas_buf_cstr(&o->replaced_by) : NULL, err));
+    TRY(atlas_json_key_bool(r->j, "session_unbound", o->session_unbound, err));
+    TRY(atlas_json_key_str_opt(
+        r->j, "unbound_reason",
+        o->unbound_reason.len > 0 ? atlas_buf_cstr(&o->unbound_reason) : NULL, err));
+    TRY(atlas_json_key_bool(r->j, "via_daemon", o->via_daemon, err));
+    TRY(atlas_json_key_str(r->j, "actor",
+                           o->operator_confirmed ? "LOCAL_OPERATOR_CONFIRMED" : "MODEL_PROPOSAL",
+                           err));
+    /* The same sentence the human renderer prints, so the two cannot come to
+     * mean different things. */
+    return atlas_json_key_str(
+        r->j, "actor_means",
+        o->operator_confirmed
+            ? "an explicit action arrived through Atlas' local operator channel. This does not "
+              "identify a person, does not prove a person was present, and is not a signature."
+            : "a proposal, not an approval. Approval happens only through the interactive Atlas "
+              "CLI on a terminal.",
+        err);
+}
+
+static atlas_status j_decision_counts(atlas_renderer *r, const atlas_decision_counts *c,
+                                      atlas_err *err) {
+    TRY(atlas_json_key_int(r->j, "total_proposed", c->proposed, err));
+    TRY(atlas_json_key_int(r->j, "total_approved", c->approved, err));
+    TRY(atlas_json_key_int(r->j, "total_rejected", c->rejected, err));
+    return atlas_json_key_int(r->j, "total_superseded", c->superseded, err);
+}
+
+
+static atlas_status j_decision_ledger(atlas_renderer *r, bool agrees, atlas_err *err) {
+    return atlas_json_key_bool(r->j, "ledger_agrees", agrees, err);
+}
+
 const atlas_renderer_vtbl ATLAS_RENDERER_JSON = {
     j_begin,      j_end,          j_note_repo,    j_note_query,   j_list_begin,
     j_list_end,   j_doctor,       j_version,      j_repo_item,    j_repo_added,
@@ -973,6 +1139,9 @@ const atlas_renderer_vtbl ATLAS_RENDERER_JSON = {
     /* --- A3 --- */
     j_code_status, j_code_file,   j_code_symbol_item, j_code_edge_item,
     j_code_walk_item, j_code_walk_end, j_code_list_begin, j_code_list_end,
+    /* --- A4 --- */
+    j_decision_item, j_decision_show, j_decision_event, j_decision_outcome,
+    j_decision_counts, j_decision_ledger,
 };
 
 void atlas_render_error(FILE *out, FILE *errout, bool json, const char *command,

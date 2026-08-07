@@ -207,7 +207,7 @@ intent and the index observing the change, and downgrade attribution when it is
 implausibly large. That is a heuristic, so it needs its own provenance class
 before it is worth having.
 
-### 14. There is no approval workflow, by design — and no path to one yet
+### 14. There is no approval workflow, by design — and no path to one yet (closed in A4)
 
 A2 records proposals. `approved` is pinned to 0 by a schema `CHECK`, refused by
 `atlas_provenance_writable_in_a2`, and never bound by either insert statement.
@@ -216,11 +216,55 @@ That is correct for A2 and it is not a finished story: there is currently no way
 for a human to approve a proposal at all, so `USER_APPROVED_DECISION` exists in
 the vocabulary with nothing able to produce it.
 
-*What would close it:* a CLI command a person runs — `atlas decision approve
-<id>` — which is the only actor Atlas can distinguish from a model, plus the
-migration that lifts the `CHECK`. A3 turned out to be about structure rather
-than about decisions, so this moves to A4, which is where decision documents
-arrive and there is something to approve *against*.
+*Closed in A4*, though not the way this predicted. `atlas decision approve
+<repo> <id>` exists and requires a real terminal, a single-use capability bound
+to one revision's content hash, and a confirmation typed against that hash.
+
+The `CHECK` was **not** lifted. Doing so would have made an approval something
+that happens to a model's own row, in the table the model writes, distinguished
+from a proposal by one integer; A4 approval is a separate record about a
+separate object — an immutable revision — with its own actor vocabulary and its
+own ledger. `USER_APPROVED_DECISION` is still unwritten, and now for a sharper
+reason than "A2 cannot": it names a *person*, and Atlas cannot establish one.
+What A4 records is `LOCAL_OPERATOR_CONFIRMED`, which names a channel.
+
+*What remains open:* a same-uid process can imitate an operator. Closing that
+needs an identity Atlas does not have and A4 deliberately did not invent — see
+item 16.
+
+### 16. The operator channel is a channel, not an identity
+
+`LOCAL_OPERATOR_CONFIRMED` records that Atlas' interactive channel was used: a
+controlling terminal, a single-use capability bound to one revision's content
+hash, and a confirmation typed against that hash. It does not identify a person
+and does not prove one was present.
+
+Any process running as the same local user can allocate a pseudo-terminal, run
+the CLI against it and type the confirmation. `tests/test_decision_operator.c`
+does exactly that, deliberately: a suite that could not would be claiming more
+than the code supports.
+
+*Why it is deferred:* closing it needs a real identity — a signing key, a
+hardware token, or a platform authentication agent — and every one of those is a
+security subsystem with its own lifecycle, its own failure modes and its own
+storage. A4's scope was the lifecycle, and adding the vocabulary of attestation
+without the mechanism would have been worse than the honest current claim.
+
+*What would close it, partly:* an operator key held outside the data directory,
+with the approval event carrying a signature over `(document, revision, content
+hash)`. That is a phase, not a patch, and it changes what `APPROVED` means —
+which is exactly why it should not be smuggled in.
+
+### 17. An orphaned decision is invisible until its root is registered again
+
+`repo remove` does not delete decisions — they are the one canonical record in
+the index — but it does detach them, and a detached document appears in no
+listing. Registering the same canonical root reattaches them by root hash.
+
+*Why it is deferred:* the alternative is an `atlas decision list --orphaned`
+surface, which is a small amount of code and a real addition to the command
+vocabulary for a case that has an obvious remedy. It is documented in
+`docs/decision-lifecycle.md` under Recovery rather than left to be discovered.
 
 ## Carried out of A3
 

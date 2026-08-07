@@ -19,10 +19,22 @@
 #define ATLAS_DB_STMT_CACHE 128u
 
 typedef struct atlas_db_cached_stmt {
-    /* The SQL *pointer*, not its contents: every call site passes a string
-     * literal with static storage duration, so the pointer is a stable identity
-     * and the lookup is a pointer compare. */
+    /* The SQL *pointer*, as the fast lookup key: every call site passes a
+     * string literal with static storage duration, so the pointer is a stable
+     * identity and the common case is a pointer compare. */
     const char *sql;
+    /* A copy of the text, owned by the cache, used to confirm a pointer hit.
+     *
+     * Without it the pointer key is unsound for any caller that formats SQL
+     * into a reused buffer: the second call presents the same address with
+     * different text and is handed the previous statement, which then executes
+     * the wrong query against the right bindings. That is a silent wrong
+     * answer, and it happened during A4's correction pass.
+     *
+     * The copy is what makes the confirmation safe to perform at all — the
+     * caller's buffer may since have been freed, so the comparison must be
+     * against memory the cache owns. */
+    char *sql_owned;
     sqlite3_stmt *stmt;
     /* True while a caller holds it. A statement handed out twice would have its
      * iteration reset mid-flight by the second holder, so a re-entrant use gets

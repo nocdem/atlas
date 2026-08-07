@@ -161,24 +161,67 @@ An impact result is a set of graph paths with the path shown, never a prediction
 refuses everything but `SOURCE` and `GIT`. Full detail and the explicit
 non-claims are in [code-intelligence.md](code-intelligence.md).
 
-## A4 — decisions, ADRs, summaries and approval
+## A4 — decision documents, immutable history and operator approval (done)
 
 Give Atlas something honest to say when asked "why", now that it can say what a
 thing *is*.
 
-- discover and parse Markdown decision records and ADRs in the repository
-- link decisions to the paths, commits and **symbols** they concern, which is
-  what A3 made possible
-- introduce `DECISION` and `USER_STATEMENT` evidence, and lift the restriction in
-  `atlas_db_evidence_insert` to exactly those two additional kinds
-- `atlas why PATH` answers with linked decisions, or `UNKNOWN` when there are none
-- the approval workflow A2 deliberately did not fake: a CLI command a person
-  runs, plus the migration that lifts `CHECK(approved = 0)`
-- natural-language file and subsystem summaries, built from A3's facts and held
-  to the same rule — a summary nobody approved is a proposal
+Delivered, in the same binary:
+
+- **decision documents with immutable revisions**: bounded structured content —
+  context, decision, rationale, alternatives, consequences, scope — each
+  revision identified by a domain-separated, length-prefixed canonical content
+  hash. A revision is never edited; a change is a new revision.
+- **an append-only lifecycle ledger** over a closed four-state vocabulary:
+  `PROPOSED`, `APPROVED`, `REJECTED`, `SUPERSEDED`. The ledger is canonical and
+  the status columns are a cache of it that `atlas doctor` checks by replay and
+  never repairs.
+- **durable links** to paths, commits, change sets, symbols and other decisions,
+  with currency computed on read — `CURRENT`, `CHANGED`, `MISSING`, `AMBIGUOUS`,
+  `UNKNOWN`. No link is a foreign key into A3's tables, so a structural rebuild
+  or an analyzer upgrade preserves every decision exactly, and Atlas never
+  re-points a renamed or ambiguous anchor.
+- **the approval workflow A2 deliberately did not fake**: `atlas decision
+  approve|reject|supersede` on a real terminal, gated by a short-lived
+  single-use daemon capability bound to one repository, document, revision and
+  content hash.
+- migration 6, ten `decision.*` daemon methods, eleven CLI subcommands with
+  human and JSON output, Markdown export to stdout, and four MCP tools with
+  progressive disclosure.
+
+**What A4 deliberately did not do**, against the original sketch above:
+
+- It does **not** parse Markdown ADRs out of a repository or write documents
+  into one. Atlas is read-only with respect to a registered worktree, and a
+  decision document is Atlas' record rather than the project's file.
+- It does **not** lift `CHECK(approved = 0)` on `ai_decisions`. That would have
+  made an approval something that happens *to* a model's own row, in the table
+  the model writes, distinguished from a proposal by one integer. A4 approval is
+  a separate record about a separate object, so A2's statement stays literally
+  true. Legacy proposals are preserved and explicitly promotable.
+- It introduces **no** `DECISION` or `USER_STATEMENT` evidence and leaves
+  `INFERENCE` unused. A4 writes no evidence at all: a decision carries its own
+  actor vocabulary, and folding it into `evidence` would make "how does Atlas
+  know this?" and "what did somebody decide?" one question.
+- Natural-language subsystem summaries are not built.
+
+The rule that governed this phase: **Atlas states only what it can support.**
+`LOCAL_OPERATOR_CONFIRMED` names a channel — a terminal, a single-use
+capability, a confirmation typed against a content hash — and explicitly not a
+person, not a presence, and not a signature. A same-UID process that can drive a
+pseudo-terminal, including an AI agent with shell access, may imitate it; the
+test suite demonstrates that rather than hiding it. What Atlas does guarantee is
+about its own surface: no approval capability through MCP, hooks or any
+AI-facing method, and no lifecycle change from conversation text.
+
+Approval makes a document accepted project policy; it does not make its prose
+trustworthy, and no decision text enters automatic model context at any status.
 
 The rule that survives from A0: an unlinked commit message is still not a reason,
 and neither is a graph edge. A decision has to be recorded to be reported as one.
+
+Full detail and the explicit non-claims are in
+[decision-lifecycle.md](decision-lifecycle.md).
 
 ## A5 — clangd and toolchain truth
 

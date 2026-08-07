@@ -111,19 +111,34 @@ static void test_envelope_allowlist_holds_for_hostile_values(void) {
                     "case %zu reproduced a chat control token unescaped", i);
 
         /* Every line starts with a key Atlas chose. */
-        /* A3 added two lines, and they are listed here because that is the
-         * point of this check: the envelope's line set is a closed vocabulary,
-         * and a new line has to be added deliberately rather than appear. Both
-         * carry integers and a boolean and nothing else — no symbol name, no
-         * path, no include spelling. */
-        static const char *const KEYS[] = {"<atlas-context",      "atlas=",
-                                           "daemon=",             "repo=",
-                                           "repo_id=",            "head=",
-                                           "index_current=",      "not_current=",
-                                           "changed_paths=",      "decisions_proposed=",
-                                           "session=",            "note=",
-                                           "code_index_current=", "code_symbols=",
-                                           "</atlas-context>",    NULL};
+        /* The envelope's line set is a closed vocabulary, and a new line has to
+         * be added here deliberately rather than appear. That is the point of
+         * this check, and it has now caught two phases in a row.
+         *
+         * A3 added the two `code_` lines. A4 added `decisions_needing_review=`
+         * and widened `decisions_proposed=` to carry the rejected and
+         * superseded counts on the same line. Every one of them is an integer
+         * or a boolean: no decision title, no rationale, no path, no symbol
+         * name, and no decision id either. Approval does not change that —
+         * approved prose is accepted project policy, not system instruction,
+         * and it reaches a model only through an explicit MCP call. */
+        static const char *const KEYS[] = {"<atlas-context",
+                                           "atlas=",
+                                           "daemon=",
+                                           "repo=",
+                                           "repo_id=",
+                                           "head=",
+                                           "index_current=",
+                                           "not_current=",
+                                           "changed_paths=",
+                                           "decisions_proposed=",
+                                           "decisions_needing_review=",
+                                           "session=",
+                                           "note=",
+                                           "code_index_current=",
+                                           "code_symbols=",
+                                           "</atlas-context>",
+                                           NULL};
         for (const char *p = body; *p != '\0';) {
             const char *nl = strchr(p, '\n');
             size_t len = (nl != NULL) ? (size_t)(nl - p) : strlen(p);

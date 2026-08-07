@@ -65,6 +65,20 @@ void atlas_cli_print_help(FILE *out) {
         "  code search NAME QUERY     search indexed symbol names\n"
         "  code deps NAME PATH        what a file depends on\n"
         "  code impact NAME PATH      what may be affected if it changes (candidates, not proof)\n"
+        "  decision list NAME         recorded decisions and their lifecycle status\n"
+        "  decision show NAME ID      one decision in full, with its links' currency\n"
+        "  decision search NAME QUERY search recorded decisions\n"
+        "  decision history NAME ID   every revision and every lifecycle event\n"
+        "  decision for-file NAME PATH  decisions concerning one file\n"
+        "  decision propose NAME      record a decision as a proposal\n"
+        "  decision revise NAME ID    propose a new revision; never edits an approved one\n"
+        "  decision approve NAME ID   accept a revision. Needs an interactive terminal\n"
+        "  decision reject NAME ID    refuse a revision. Needs an interactive terminal\n"
+        "  decision supersede NAME ID --by ID2   replace one decision with another\n"
+        "  decision export NAME ID    write the decision to stdout as Markdown or JSON\n"
+        "  decision orphaned          decisions attached to no registered repository\n"
+        "  decision legacy NAME       A2 decision proposals, and which were promoted\n"
+        "  decision promote NAME ID   make an A4 document from an A2 proposal\n"
         "  service print              print the systemd user unit; changes nothing\n"
         "  service install --user     write the unit; never enables or starts it\n"
         "  service uninstall --user   remove the unit Atlas wrote\n"
@@ -92,6 +106,16 @@ void atlas_cli_print_help(FILE *out) {
         "  --depth N                  code deps/impact: traversal depth (max %d)\n"
         "  --reverse                  code deps: report what depends on this instead\n"
         "  --symbol                   code deps/impact: treat the operand as a symbol name\n"
+        "  --title T --decision D     decision propose/revise: the required content\n"
+        "  --context C --rationale R --consequences Q --scope S\n"
+        "                             decision propose/revise: the rest of the document\n"
+        "  --alternative A            decision propose/revise: repeatable, up to %d\n"
+        "  --path P --commit OID --symbol-link S\n"
+        "                             decision propose/revise: repeatable links\n"
+        "  --status S                 decision list: PROPOSED|APPROVED|REJECTED|SUPERSEDED\n"
+        "  --revision N               decision show/approve: a specific revision\n"
+        "  --by ID                    decision supersede: the replacement decision\n"
+        "  --format markdown|json     decision export: the output form\n"
         "  --user                     service: operate on the systemd *user* unit\n"
         "  --force                    service: replace or remove a unit Atlas did not write\n"
         "  --data-dir DIR             use DIR instead of the resolved data directory\n"
@@ -113,7 +137,7 @@ void atlas_cli_print_help(FILE *out) {
         "\n"
         "Atlas records facts only. It never infers why something changed: when a reason\n"
         "is requested it answers UNKNOWN.\n",
-        ATLAS_CODE_MAX_TRAVERSAL_DEPTH, ATLAS_DEFAULT_LIMIT);
+        ATLAS_CODE_MAX_TRAVERSAL_DEPTH, ATLAS_DECISION_MAX_ALTERNATIVES, ATLAS_DEFAULT_LIMIT);
 }
 
 void atlas_cli_print_version(FILE *out, bool json) {
@@ -201,6 +225,88 @@ static atlas_status parse_args(cli_state *st, int argc, char **argv, bool *want_
                 if (s != ATLAS_OK) {
                     return s;
                 }
+            } else if (strcmp(a, "--title") == 0 || strcmp(a, "--context") == 0 ||
+                       strcmp(a, "--decision") == 0 || strcmp(a, "--rationale") == 0 ||
+                       strcmp(a, "--consequences") == 0 || strcmp(a, "--scope") == 0 ||
+                       strcmp(a, "--status") == 0 || strcmp(a, "--by") == 0 ||
+                       strcmp(a, "--format") == 0 || strcmp(a, "--dedup-key") == 0) {
+                /* One arm for every A4 option that takes exactly one value, so
+                 * the "a flag at the end of the line has no value" check exists
+                 * once rather than ten times. */
+                if (i + 1 >= argc) {
+                    return atlas_err_set(err, ATLAS_ERR_USAGE, "%s needs a value", a);
+                }
+                const char *v = argv[++i];
+                if (strcmp(a, "--title") == 0) {
+                    st->opts.decision.title = v;
+                } else if (strcmp(a, "--context") == 0) {
+                    st->opts.decision.context_text = v;
+                } else if (strcmp(a, "--decision") == 0) {
+                    st->opts.decision.decision_text = v;
+                } else if (strcmp(a, "--rationale") == 0) {
+                    st->opts.decision.rationale = v;
+                } else if (strcmp(a, "--consequences") == 0) {
+                    st->opts.decision.consequences = v;
+                } else if (strcmp(a, "--scope") == 0) {
+                    st->opts.decision.scope = v;
+                } else if (strcmp(a, "--status") == 0) {
+                    st->opts.decision.status = v;
+                } else if (strcmp(a, "--by") == 0) {
+                    st->opts.decision.by = v;
+                } else if (strcmp(a, "--format") == 0) {
+                    st->opts.decision.format = v;
+                } else {
+                    st->opts.decision.dedup_key = v;
+                }
+            } else if (strcmp(a, "--alternative") == 0 || strcmp(a, "--path") == 0 ||
+                       strcmp(a, "--commit") == 0 || strcmp(a, "--symbol-link") == 0) {
+                /* The repeatable ones. Refused past the ceiling rather than
+                 * truncated: a decision that silently recorded three of five
+                 * alternatives would claim the other two were never considered,
+                 * and one that dropped a path would claim it is not about that
+                 * file. */
+                if (i + 1 >= argc) {
+                    return atlas_err_set(err, ATLAS_ERR_USAGE, "%s needs a value", a);
+                }
+                const char *v = argv[++i];
+                if (strcmp(a, "--alternative") == 0) {
+                    if (st->opts.decision.alternative_count >= ATLAS_DECISION_MAX_ALTERNATIVES) {
+                        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                             "at most %d --alternative options",
+                                             ATLAS_DECISION_MAX_ALTERNATIVES);
+                    }
+                    st->opts.decision.alternatives[st->opts.decision.alternative_count++] = v;
+                } else if (strcmp(a, "--path") == 0) {
+                    if (st->opts.decision.path_count >= ATLAS_DECISION_MAX_LINKS) {
+                        return atlas_err_set(err, ATLAS_ERR_USAGE, "at most %d --path options",
+                                             ATLAS_DECISION_MAX_LINKS);
+                    }
+                    st->opts.decision.paths[st->opts.decision.path_count++] = v;
+                } else if (strcmp(a, "--commit") == 0) {
+                    if (st->opts.decision.commit_count >= ATLAS_DECISION_MAX_LINKS) {
+                        return atlas_err_set(err, ATLAS_ERR_USAGE, "at most %d --commit options",
+                                             ATLAS_DECISION_MAX_LINKS);
+                    }
+                    st->opts.decision.commits[st->opts.decision.commit_count++] = v;
+                } else {
+                    if (st->opts.decision.symbol_count >= ATLAS_DECISION_MAX_LINKS) {
+                        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                             "at most %d --symbol-link options",
+                                             ATLAS_DECISION_MAX_LINKS);
+                    }
+                    st->opts.decision.symbols[st->opts.decision.symbol_count++] = v;
+                }
+            } else if (strcmp(a, "--revision") == 0) {
+                if (i + 1 >= argc) {
+                    return atlas_err_set(err, ATLAS_ERR_USAGE, "--revision needs a number");
+                }
+                char *endp = NULL;
+                long v = strtol(argv[++i], &endp, 10);
+                if (endp == NULL || *endp != '\0' || v < 0) {
+                    return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                         "--revision must be a non-negative number");
+                }
+                st->opts.decision.revision = v;
             } else if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) {
                 *want_help = true;
             } else if (strcmp(a, "-V") == 0 || strcmp(a, "--version") == 0) {
@@ -706,6 +812,491 @@ static atlas_status code_edge_sink(const atlas_code_edge_row *row, void *ud, atl
 static atlas_status code_walk_sink(const atlas_code_walk_row *row, void *ud, atlas_err *err) {
     list_sink *ls = (list_sink *)ud;
     return ls->r->v->code_walk_item(ls->r, row, err);
+}
+
+
+/* --- A4: decision documents ------------------------------------------------
+ *
+ * The CLI's whole job here is argument shape and renderer choice.
+ * `service_decision.c` decides everything else, including whether a write goes
+ * to the daemon's writer thread or is taken on this one.
+ *
+ * One rule is enforced here and nowhere else, because here is where the flag
+ * exists: **`--yes` cannot approve anything.** It is refused explicitly rather
+ * than ignored, because a flag that is silently ignored is a flag somebody will
+ * put in a script and believe. */
+
+typedef struct decision_render {
+    cli_state *st;
+    atlas_renderer *r;
+} decision_render;
+
+static atlas_status on_decision_item(const atlas_decision_summary *s, void *ud, atlas_err *err) {
+    decision_render *dr = (decision_render *)ud;
+    return dr->r->v->decision_item(dr->r, s, err);
+}
+
+/* `decision history` emits two differently shaped lists, and the service layer
+ * delivers all the revisions before any of the events. The list boundaries are
+ * therefore opened lazily on the first item of each: opening them up front
+ * would need the counts before they are known. */
+typedef struct decision_history_render {
+    cli_state *st;
+    atlas_renderer *r;
+    int64_t revisions;
+    int64_t events;
+    bool in_events;
+} decision_history_render;
+
+static atlas_status on_history_revision(const atlas_decision_summary *s, void *ud,
+                                        atlas_err *err) {
+    decision_history_render *dr = (decision_history_render *)ud;
+    if (dr->revisions == 0) {
+        atlas_status st = dr->r->v->code_list_begin(dr->r, "revisions", err);
+        if (st != ATLAS_OK) {
+            return st;
+        }
+    }
+    dr->revisions++;
+    return dr->r->v->decision_item(dr->r, s, err);
+}
+
+static atlas_status on_history_event(const atlas_decision_timeline_entry *e, void *ud,
+                                     atlas_err *err) {
+    decision_history_render *dr = (decision_history_render *)ud;
+    if (!dr->in_events) {
+        atlas_status st = ATLAS_OK;
+        if (dr->revisions > 0) {
+            st = dr->r->v->code_list_end(dr->r, "revisions", "revision", "revisions",
+                                         dr->revisions, false, err);
+        } else {
+            st = dr->r->v->code_list_begin(dr->r, "revisions", err);
+            if (st == ATLAS_OK) {
+                st = dr->r->v->code_list_end(dr->r, "revisions", "revision", "revisions", 0, false,
+                                             err);
+            }
+        }
+        if (st == ATLAS_OK) {
+            st = dr->r->v->code_list_begin(dr->r, "timeline", err);
+        }
+        if (st != ATLAS_OK) {
+            return st;
+        }
+        dr->in_events = true;
+    }
+    dr->events++;
+    return dr->r->v->decision_event(dr->r, e, err);
+}
+
+/* An A2 proposal, rendered through the decision-summary shape.
+ *
+ * Reusing that shape rather than adding a fifth renderer method is deliberate:
+ * a legacy proposal *is* a decision-shaped thing that has not been promoted,
+ * and giving it its own shape would be a second place for the two to describe
+ * one record differently. Its `status` says so in words. */
+static atlas_status on_legacy_item(const atlas_decision_legacy_view *v, void *ud,
+                                   atlas_err *err) {
+    decision_render *dr = (decision_render *)ud;
+    atlas_decision_summary s;
+    atlas_decision_summary_init(&s);
+    atlas_status st = atlas_buf_appendf(&s.uid, err, "a2-proposal-%lld", (long long)v->id);
+    if (st == ATLAS_OK) {
+        st = atlas_buf_set_str(&s.status, v->imported ? "PROMOTED" : "A2_PROPOSAL", err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_buf_set(&s.title, v->title.data, v->title.len, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_buf_set(&s.proposed_by, v->provenance.data, v->provenance.len, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_buf_set(&s.created_at, v->created_at.data, v->created_at.len, err);
+    }
+    if (st == ATLAS_OK) {
+        /* Where it went, when it went anywhere. */
+        st = atlas_buf_set(&s.superseded_by, v->imported_uid.data, v->imported_uid.len, err);
+    }
+    s.link_count = v->path_count;
+    if (st == ATLAS_OK) {
+        st = dr->r->v->decision_item(dr->r, &s, err);
+    }
+    atlas_decision_summary_free(&s);
+    return st;
+}
+
+static void decision_input_from(const cli_state *st, atlas_decision_input *in) {
+    memset(in, 0, sizeof(*in));
+    in->title = st->opts.decision.title;
+    in->context_text = st->opts.decision.context_text;
+    in->decision_text = st->opts.decision.decision_text;
+    in->rationale_text = st->opts.decision.rationale;
+    in->consequences_text = st->opts.decision.consequences;
+    in->scope = st->opts.decision.scope;
+    in->alternatives = st->opts.decision.alternatives;
+    in->alternative_count = st->opts.decision.alternative_count;
+    in->paths = st->opts.decision.paths;
+    in->path_count = st->opts.decision.path_count;
+    in->commits = st->opts.decision.commits;
+    in->commit_count = st->opts.decision.commit_count;
+    in->symbols = st->opts.decision.symbols;
+    in->symbol_count = st->opts.decision.symbol_count;
+    in->dedup_key = st->opts.decision.dedup_key;
+}
+
+static atlas_status render_outcome(cli_state *st, atlas_renderer *r, const char *command,
+                                   const atlas_decision_outcome *o, atlas_err *err) {
+    atlas_status result = renderer_open(r, st->opts.json, st->out, command, err);
+    if (result == ATLAS_OK) {
+        result = r->v->decision_outcome(r, o, err);
+    }
+    if (result == ATLAS_OK) {
+        result = renderer_close(r, err);
+    } else {
+        renderer_abort(r);
+    }
+    return result;
+}
+
+/* The three operator-only verbs. One function: they differ by intent and by
+ * whether a replacement is required, and three copies of the `--yes` refusal
+ * would be three chances for one of them to be missing. */
+static atlas_status run_decision_confirm(cli_state *st, atlas_ctx *ctx, atlas_renderer *r,
+                                         atlas_decision_intent intent, atlas_err *err) {
+    if (st->operand_count != 3u) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "usage: atlas decision %s NAME DECISION-ID%s",
+                             atlas_decision_intent_name(intent),
+                             intent == ATLAS_DECISION_INTENT_SUPERSEDE ? " --by DECISION-ID" : "");
+    }
+    if (st->opts.yes) {
+        /* Refused, not ignored. */
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "--yes cannot approve, reject or supersede a decision. This command "
+                             "needs an interactive terminal, and Atlas will not accept a "
+                             "confirmation from a flag, a pipe, a file or an environment "
+                             "variable.");
+    }
+    if (st->opts.json) {
+        /* The prompt goes to the terminal and the result to stdout, so --json
+         * would interleave a human prompt with a machine document. Refusing is
+         * clearer than producing either one badly. */
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "--json is not available for %s: it is an interactive command",
+                             atlas_decision_intent_name(intent));
+    }
+    const char *replacement = st->opts.decision.by;
+    if (intent == ATLAS_DECISION_INTENT_SUPERSEDE && replacement == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "atlas decision supersede needs --by DECISION-ID, the decision that "
+                             "replaces this one");
+    }
+    if (intent != ATLAS_DECISION_INTENT_SUPERSEDE && replacement != NULL) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "--by is only meaningful for supersede");
+    }
+    atlas_decision_outcome out;
+    atlas_decision_outcome_init(&out);
+    atlas_status result = atlas_service_decision_confirm(
+        ctx, st->operands[1], st->operands[2], intent, replacement, st->opts.decision.revision,
+        &out, err);
+    if (result == ATLAS_OK) {
+        result = render_outcome(st, r, "decision", &out, err);
+    }
+    atlas_decision_outcome_free(&out);
+    return result;
+}
+
+static atlas_status run_decision(cli_state *st, atlas_ctx *ctx, atlas_renderer *r, int64_t limit,
+                                 atlas_err *err) {
+    if (st->operand_count == 0) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "usage: atlas decision list|show|search|history|for-file|propose|"
+                             "revise|approve|reject|supersede|export|orphaned|legacy|"
+                             "promote ...");
+    }
+    const char *sub = st->operands[0];
+    atlas_status result;
+
+    if (strcmp(sub, "list") == 0 || strcmp(sub, "search") == 0 || strcmp(sub, "for-file") == 0) {
+        size_t want = strcmp(sub, "list") == 0 ? 2u : 3u;
+        if (st->operand_count != want) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 strcmp(sub, "list") == 0
+                                     ? "usage: atlas decision list NAME [--status STATUS]"
+                                     : (strcmp(sub, "search") == 0
+                                            ? "usage: atlas decision search NAME QUERY"
+                                            : "usage: atlas decision for-file NAME PATH"));
+        }
+        atlas_decision_list_opts opts;
+        memset(&opts, 0, sizeof(opts));
+        opts.limit = limit;
+        if (strcmp(sub, "search") == 0) {
+            opts.mode = ATLAS_DECISION_LIST_SEARCH;
+            opts.query = st->operands[2];
+        } else if (strcmp(sub, "for-file") == 0) {
+            opts.mode = ATLAS_DECISION_LIST_PATH;
+            opts.path = st->operands[2];
+        } else if (st->opts.decision.status != NULL) {
+            atlas_decision_state parsed;
+            if (!atlas_decision_state_parse(st->opts.decision.status, &parsed)) {
+                return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                     "--status is PROPOSED, APPROVED, REJECTED or SUPERSEDED");
+            }
+            opts.mode = ATLAS_DECISION_LIST_STATUS;
+            opts.status = st->opts.decision.status;
+        }
+        result = renderer_open(r, st->opts.json, st->out, "decision", err);
+        if (result != ATLAS_OK) {
+            return result;
+        }
+        decision_render dr = {st, r};
+        atlas_decision_counts counts;
+        int64_t count = 0;
+        bool more = false;
+        result = r->v->note_repo(r, st->operands[1], err);
+        if (result == ATLAS_OK) {
+            result = r->v->list_begin(r, "decisions", err);
+        }
+        if (result == ATLAS_OK) {
+            result = atlas_service_decision_list(ctx, st->operands[1], &opts, on_decision_item, &dr,
+                                                 &counts, &count, &more, err);
+        }
+        if (result == ATLAS_OK) {
+            result = r->v->list_end(r, "decision", "decisions", count, err);
+        }
+        if (result == ATLAS_OK) {
+            result = r->v->decision_counts(r, &counts, err);
+        }
+        if (result == ATLAS_OK) {
+            result = renderer_close(r, err);
+        } else {
+            renderer_abort(r);
+        }
+        return result;
+    }
+
+    if (strcmp(sub, "show") == 0 || strcmp(sub, "export") == 0) {
+        if (st->operand_count != 3u) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE, "usage: atlas decision %s NAME DECISION-ID",
+                                 sub);
+        }
+        bool markdown = strcmp(sub, "export") == 0 &&
+                        (st->opts.decision.format == NULL ||
+                         strcmp(st->opts.decision.format, "markdown") == 0);
+        if (strcmp(sub, "export") == 0 && !markdown && st->opts.decision.format != NULL &&
+            strcmp(st->opts.decision.format, "json") != 0) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE, "--format is markdown or json");
+        }
+        atlas_decision_document doc;
+        atlas_decision_document_init(&doc);
+        result = atlas_service_decision_show(ctx, st->operands[1], st->operands[2],
+                                             st->opts.decision.revision, &doc, err);
+        if (result == ATLAS_OK && markdown) {
+            /* Markdown goes to stdout as itself rather than through a renderer:
+             * it is a document, not a report, and wrapping it would make it
+             * unusable for the one thing an export is for. Never written into
+             * the target repository — Atlas is read-only there. */
+            result = atlas_service_decision_export_markdown(&doc, st->out, err);
+            st->rendered = true;
+        } else if (result == ATLAS_OK) {
+            bool as_json = st->opts.json || strcmp(sub, "export") == 0;
+            result = renderer_open(r, as_json, st->out, "decision", err);
+            if (result == ATLAS_OK) {
+                result = r->v->decision_show(r, &doc, err);
+            }
+            if (result == ATLAS_OK) {
+                result = renderer_close(r, err);
+            } else {
+                renderer_abort(r);
+            }
+        }
+        atlas_decision_document_free(&doc);
+        return result;
+    }
+
+    if (strcmp(sub, "history") == 0) {
+        if (st->operand_count != 3u) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "usage: atlas decision history NAME DECISION-ID");
+        }
+        result = renderer_open(r, st->opts.json, st->out, "decision", err);
+        if (result != ATLAS_OK) {
+            return result;
+        }
+        bool agrees = true;
+        result = r->v->note_repo(r, st->operands[1], err);
+        /* **Two lists, and they are two lists.**
+         *
+         * A revision entry and a timeline entry are different shapes, so
+         * putting both in one array would produce a document whose meaning
+         * depends on which member a parser happens to look at. The named-list
+         * pair carries its own count per list, which is exactly what it exists
+         * for — see the comment on `code_list_begin`. */
+        decision_history_render dr = {st, r, 0, 0, false};
+        if (result == ATLAS_OK) {
+            result = atlas_service_decision_history(ctx, st->operands[1], st->operands[2],
+                                                    on_history_revision, on_history_event, &dr,
+                                                    &agrees, err);
+        }
+        if (result == ATLAS_OK && dr.in_events) {
+            result = r->v->code_list_end(r, "timeline", "event", "events", dr.events, false, err);
+        } else if (result == ATLAS_OK) {
+            /* A document with revisions but no events cannot exist — a proposal
+             * writes both — so this is the "no revisions at all" case, and both
+             * empty lists are still emitted so the shape does not change. */
+            result = r->v->code_list_begin(r, "revisions", err);
+            if (result == ATLAS_OK) {
+                result = r->v->code_list_end(r, "revisions", "revision", "revisions", 0, false,
+                                             err);
+            }
+            if (result == ATLAS_OK) {
+                result = r->v->code_list_begin(r, "timeline", err);
+            }
+            if (result == ATLAS_OK) {
+                result = r->v->code_list_end(r, "timeline", "event", "events", 0, false, err);
+            }
+        }
+        if (result == ATLAS_OK) {
+            /* The ledger is canonical and the status columns cache it. Whether
+             * the two agree is reported on every timeline, because a timeline
+             * is exactly where somebody would notice. */
+            result = r->v->decision_ledger(r, agrees, err);
+        }
+        if (result == ATLAS_OK) {
+            result = renderer_close(r, err);
+        } else {
+            renderer_abort(r);
+        }
+        return result;
+    }
+
+    if (strcmp(sub, "propose") == 0 || strcmp(sub, "revise") == 0) {
+        bool revise = strcmp(sub, "revise") == 0;
+        size_t want = revise ? 3u : 2u;
+        if (st->operand_count != want) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 revise ? "usage: atlas decision revise NAME DECISION-ID --title T "
+                                          "--decision D [...]"
+                                        : "usage: atlas decision propose NAME --title T "
+                                          "--decision D [...]");
+        }
+        if (st->opts.decision.title == NULL || st->opts.decision.decision_text == NULL) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "a decision needs --title and --decision");
+        }
+        atlas_decision_input in;
+        decision_input_from(st, &in);
+        atlas_decision_outcome out;
+        atlas_decision_outcome_init(&out);
+        result = revise ? atlas_service_decision_revise(ctx, st->operands[1], st->operands[2], &in,
+                                                        &out, err)
+                        : atlas_service_decision_propose(ctx, st->operands[1], &in, &out, err);
+        if (result == ATLAS_OK) {
+            result = render_outcome(st, r, "decision", &out, err);
+        }
+        atlas_decision_outcome_free(&out);
+        return result;
+    }
+
+    if (strcmp(sub, "orphaned") == 0) {
+        /* Decisions attached to no live repository. Takes no repository name,
+         * because a repository is exactly what these do not have. */
+        if (st->operand_count != 1u) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE, "usage: atlas decision orphaned");
+        }
+        result = renderer_open(r, st->opts.json, st->out, "decision", err);
+        if (result != ATLAS_OK) {
+            return result;
+        }
+        decision_render dr = {st, r};
+        int64_t count = 0;
+        bool more = false;
+        result = r->v->list_begin(r, "orphaned", err);
+        if (result == ATLAS_OK) {
+            result = atlas_service_decision_orphans(ctx, limit, on_decision_item, &dr, &count,
+                                                    &more, err);
+        }
+        if (result == ATLAS_OK) {
+            result = r->v->list_end(r, "orphaned decision", "orphaned decisions", count, err);
+        }
+        if (result == ATLAS_OK && count > 0) {
+            /* The remedy, printed with the finding. An orphan is recoverable
+             * and a user who does not know that will assume it is not. */
+            result = r->v->note_repo(
+                r,
+                "register-the-original-repository-and-rescan-to-reattach-these", err);
+        }
+        if (result == ATLAS_OK) {
+            result = renderer_close(r, err);
+        } else {
+            renderer_abort(r);
+        }
+        return result;
+    }
+
+    if (strcmp(sub, "legacy") == 0) {
+        /* The A2 proposals this repository still holds, and which of them have
+         * been promoted. Read-only over the A2 tables, which A4 never writes. */
+        if (st->operand_count != 2u) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE, "usage: atlas decision legacy NAME");
+        }
+        result = renderer_open(r, st->opts.json, st->out, "decision", err);
+        if (result != ATLAS_OK) {
+            return result;
+        }
+        decision_render dr = {st, r};
+        int64_t count = 0;
+        bool more = false;
+        result = r->v->note_repo(r, st->operands[1], err);
+        if (result == ATLAS_OK) {
+            result = r->v->list_begin(r, "a2_proposals", err);
+        }
+        if (result == ATLAS_OK) {
+            result = atlas_service_decision_legacy(ctx, st->operands[1], limit, on_legacy_item,
+                                                   &dr, &count, &more, err);
+        }
+        if (result == ATLAS_OK) {
+            result = r->v->list_end(r, "proposal", "proposals", count, err);
+        }
+        if (result == ATLAS_OK) {
+            result = renderer_close(r, err);
+        } else {
+            renderer_abort(r);
+        }
+        return result;
+    }
+
+    if (strcmp(sub, "promote") == 0) {
+        if (st->operand_count != 3u) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "usage: atlas decision promote NAME LEGACY-ID");
+        }
+        char *endp = NULL;
+        long legacy = strtol(st->operands[2], &endp, 10);
+        if (endp == NULL || *endp != '\0' || legacy <= 0) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "the A2 proposal id is a positive number, as shown by "
+                                 "`atlas decision legacy`");
+        }
+        atlas_decision_outcome out;
+        atlas_decision_outcome_init(&out);
+        result = atlas_service_decision_promote(ctx, st->operands[1], legacy, &out, err);
+        if (result == ATLAS_OK) {
+            result = render_outcome(st, r, "decision", &out, err);
+        }
+        atlas_decision_outcome_free(&out);
+        return result;
+    }
+
+    if (strcmp(sub, "approve") == 0) {
+        return run_decision_confirm(st, ctx, r, ATLAS_DECISION_INTENT_APPROVE, err);
+    }
+    if (strcmp(sub, "reject") == 0) {
+        return run_decision_confirm(st, ctx, r, ATLAS_DECISION_INTENT_REJECT, err);
+    }
+    if (strcmp(sub, "supersede") == 0) {
+        return run_decision_confirm(st, ctx, r, ATLAS_DECISION_INTENT_SUPERSEDE, err);
+    }
+
+    return atlas_err_set(err, ATLAS_ERR_USAGE, "unknown decision subcommand \"%s\"", sub);
 }
 
 static atlas_status run_code(cli_state *st, atlas_ctx *ctx, atlas_renderer *r, int64_t limit,
@@ -1473,6 +2064,8 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
         }
     } else if (strcmp(cmd, "code") == 0) {
         result = run_code(st, ctx, &r, limit, err);
+    } else if (strcmp(cmd, "decision") == 0) {
+        result = run_decision(st, ctx, &r, limit, err);
     } else {
         result = atlas_err_set(err, ATLAS_ERR_USAGE,
                                "unknown command \"%s\" (try: atlas help)", cmd);

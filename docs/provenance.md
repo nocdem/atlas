@@ -326,3 +326,69 @@ untrusted-text rules are unchanged and are applied field by field:
 
 The IPC error document uses the same `status` numbering as the CLI exit codes, so
 a caller has one vocabulary rather than two.
+
+
+## A4: the decision actor vocabulary, and why it is separate
+
+`atlas_provenance` answers "how does Atlas know this value?". A4 needs a
+different question answered — "what kind of actor caused this lifecycle
+transition?" — and the two have different wrong answers, so they are different
+vocabularies.
+
+| actor | means | who may write it |
+| --- | --- | --- |
+| `MODEL_PROPOSAL` | a model wrote this down deliberately | any adapter |
+| `MODEL_INFERENCE` | a model derived it rather than being told it | any adapter |
+| `LOCAL_OPERATOR_CONFIRMED` | an action came through Atlas' operator-only interactive channel | the operator channel only |
+| `ATLAS_AUTOMATIC` | a transition that follows mechanically from another | Atlas itself, never a caller |
+
+`atlas_decision_actor_writable_by_adapter` refuses the last two, in the same
+shape and for the same reason as `atlas_provenance_writable_in_a2` and
+`atlas_code_resolution_writable_in_a3`. `ATLAS_AUTOMATIC` is refused as well as
+`LOCAL_OPERATOR_CONFIRMED`: it exists for the supersession an approval implies,
+and letting a caller assert it would let a caller fabricate that implication.
+
+### `LOCAL_OPERATOR_CONFIRMED` is not `USER_APPROVED_DECISION`
+
+A2 reserved `USER_APPROVED_DECISION` and never wrote it. A4 still does not write
+it, and now for a sharper reason than "this phase cannot": it names a *person*,
+and Atlas cannot establish one. What A4 can establish is that its own
+interactive channel was used, and that is what the actor name says.
+
+Read it literally. It identifies the channel, not a person. It does not
+establish that a person was present, is not a signature, and provides no
+non-repudiation. A same-UID process that can drive a pseudo-terminal — including
+an AI agent with shell access — may imitate the channel.
+
+The exclusions it does buy are real and checkable: Atlas exposes no approval,
+rejection or supersession capability through MCP, hooks or any AI-facing method;
+conversation text and model-generated RPC arguments change no lifecycle state;
+and `--yes`, piped stdin, environment variables and replayed requests are all
+refused. Those are properties of Atlas' own surface, which is the only thing
+Atlas can speak for. The full list is in
+[decision-lifecycle.md](decision-lifecycle.md).
+
+### Approval promotes nothing
+
+An approved decision does not raise the confidence of anything it mentions. An
+A3 lexical relation stays `UNIQUE_LEXICAL` however approved the decision that
+names the symbol; a `MODEL_INFERENCE` stays an inference; a commit subject stays
+`GIT` evidence of what was written. Approval is a fact about a record's status,
+and it does not propagate.
+
+### Evidence is untouched, for the third phase running
+
+A4 writes no `evidence` rows at all. `atlas_db_evidence_insert` still refuses
+everything except `SOURCE` and `GIT`.
+
+`INFERENCE` remains **unused**, and deliberately so rather than by omission: A4
+introduces no deterministic inference with a defined provenance. Link currency
+looks like a candidate and is not — it is a comparison of two recorded values,
+reported through its own closed vocabulary (`CURRENT`, `CHANGED`, `MISSING`,
+`AMBIGUOUS`, `UNKNOWN`) with the snapshot that produced it. Using `INFERENCE`
+because it happens to exist would make the kind mean "something Atlas was not
+sure how to label".
+
+`DECISION` and `USER_STATEMENT` are also still unused. A decision lives in its
+own tables with its own actor vocabulary; folding it into `evidence` would make
+"how does Atlas know this?" and "what did somebody decide?" one question.

@@ -10,9 +10,11 @@
 #define ATLAS_CLI_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdio.h>
 
 #include "atlas/error.h"
+#include "atlas/limits.h"
 
 typedef struct atlas_cli_opts {
     bool json;
@@ -38,6 +40,33 @@ typedef struct atlas_cli_opts {
     long limit;
     long max_commits;
     int timeout_ms;
+    /* A4. The decision-document fields, grouped rather than spread through the
+     * flat set above: there are a dozen of them, they are used by two
+     * subcommands, and mixing them in with `--full` and `--depth` would make
+     * the option list unreadable for every other command. */
+    struct {
+        const char *title;
+        const char *context_text;
+        const char *decision_text;
+        const char *rationale;
+        const char *consequences;
+        const char *scope;
+        const char *status;   /* `decision list --status` */
+        const char *by;       /* `decision supersede --by` */
+        const char *format;   /* `decision export --format` */
+        const char *dedup_key;
+        long revision;        /* 0 means the effective revision */
+        /* Repeatable options. Bounded by the same ceilings the storage layer
+         * enforces, and refused past them rather than truncated. */
+        const char *alternatives[ATLAS_DECISION_MAX_ALTERNATIVES];
+        size_t alternative_count;
+        const char *paths[ATLAS_DECISION_MAX_LINKS];
+        size_t path_count;
+        const char *commits[ATLAS_DECISION_MAX_LINKS];
+        size_t commit_count;
+        const char *symbols[ATLAS_DECISION_MAX_LINKS];
+        size_t symbol_count;
+    } decision;
 } atlas_cli_opts;
 
 /* Runs one command line. `argv[0]` is the program name. Returns the process

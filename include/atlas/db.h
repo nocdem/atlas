@@ -17,10 +17,11 @@
 #include <stdint.h>
 
 #include "atlas/buf.h"
+#include "atlas/decision.h"
 #include "atlas/error.h"
 #include "atlas/limits.h"
 
-#define ATLAS_SCHEMA_VERSION 5
+#define ATLAS_SCHEMA_VERSION 6
 
 typedef struct atlas_db atlas_db;
 
@@ -1457,6 +1458,434 @@ atlas_status atlas_db_code_units_for_file(atlas_db *db, int64_t repo_id, int64_t
  * what it says is inferred without listing every edge. */
 atlas_status atlas_db_code_file_unsettled(atlas_db *db, int64_t code_file_id, int64_t *ambiguous,
                                           int64_t *unresolved, atlas_err *err);
+
+/* --- A4: decision documents, revisions, links and the lifecycle ledger -----
+ *
+ * Typed operations over the migration-6 tables. sqlite3 types stay in src/db as
+ * everywhere else; the state machine and the operator channel live in
+ * src/decision.
+ *
+ * Two things distinguish this group from every other one in this header.
+ *
+ * **Nothing here deletes a decision, a revision, an event or a consumed
+ * challenge.** There is no `_clear` and no `_prune` for them, deliberately:
+ * `atlas_db_decision_challenges_prune` removes *expired, unconsumed*
+ * capabilities and nothing else, and it is the only DELETE in the group.
+ *
+ * **Nothing here cascades from `repositories`.** `repo_id` on a decision
+ * document is a soft reference and `repo_root_hash` is the durable identity, so
+ * `atlas repo remove` orphans decisions rather than destroying them and
+ * `atlas_db_decision_relink_repo` reattaches them if the same root is
+ * registered again. The A0 evidence restriction is untouched: nothing here
+ * writes to `evidence`.
+ *
+ * `atlas_db_evidence_insert` still refuses everything except SOURCE and GIT,
+ * and A4 writes no evidence at all. */
+
+/* One document as a list sees it. Borrowed pointers, valid for the call only,
+ * exactly like every other row callback in this header.
+ *
+ * `title` is model- or operator-authored prose. It is safe-encoded in the
+ * database and is still UNTRUSTED_DATA: approval changes a status, not the
+ * nature of the bytes. */
+typedef struct atlas_decision_doc_row {
+    int64_t id;
+    const char *uid;
+    int64_t repo_id;
+    const char *created_at;
+    const char *updated_at;
+    const char *status; /* PROPOSED | APPROVED | REJECTED | SUPERSEDED */
+    int64_t latest_revision_no;
+    int64_t current_revision_id; /* 0 when no revision is approved */
+    /* The revision a reader is shown: the approved one when there is one, the
+     * newest otherwise. Both numbers are reported so "approved at revision 2,
+     * revision 3 proposed" is legible without a second query. */
+    int64_t head_revision_id;
+    int64_t head_revision_no;
+    const char *head_state;
+    const char *title;        /* UNTRUSTED_DATA */
+    const char *content_hash; /* of the head revision */
+    const char *proposed_by;  /* the actor vocabulary */
+    const char *superseded_by_uid; /* NULL unless this document was superseded */
+    int64_t link_count;
+} atlas_decision_doc_row;
+
+/* One ledger event. The ledger is canonical; the status columns are a cache. */
+typedef struct atlas_decision_event_row {
+    int64_t id;
+    int64_t revision_id;
+    int64_t revision_no;
+    const char *event; /* PROPOSED | APPROVED | REJECTED | SUPERSEDED */
+    const char *actor; /* the actor vocabulary; LOCAL_OPERATOR_CONFIRMED is a
+                        * statement about a channel, never about a person */
+    const char *content_hash;
+    int64_t challenge_id; /* 0 when the transition consumed no capability */
+    int64_t superseded_by_revision_id;
+    const char *superseded_by_uid;
+    const char *detail; /* a fixed Atlas vocabulary, never caller text */
+    const char *created_at;
+} atlas_decision_event_row;
+
+/* One revision as a history listing sees it: identity and status, never prose
+ * beyond the title. Full content is loaded on request, for one revision. */
+typedef struct atlas_decision_rev_row {
+    int64_t id;
+    int64_t revision_no;
+    const char *content_hash;
+    const char *title; /* UNTRUSTED_DATA */
+    const char *state;
+    const char *proposed_by;
+    const char *created_at;
+    const char *basis_head;
+    int64_t session_id;
+    bool session_unbound;
+    const char *unbound_reason;
+    int64_t imported_from_ai_decision_id;
+} atlas_decision_rev_row;
+
+typedef atlas_status (*atlas_decision_doc_cb)(const atlas_decision_doc_row *row, void *ud,
+                                              atlas_err *err);
+typedef atlas_status (*atlas_decision_event_cb)(const atlas_decision_event_row *row, void *ud,
+                                                atlas_err *err);
+typedef atlas_status (*atlas_decision_rev_cb)(const atlas_decision_rev_row *row, void *ud,
+                                              atlas_err *err);
+
+/* --- writes (writer thread only) --- */
+
+/* Creates a document and derives its public uid.
+ *
+ * The uid is derived from the row id, so it is assigned in a second statement
+ * inside the caller's transaction. That is why this is not two functions: a
+ * document without a uid is not a document, and leaving the window open for a
+ * caller to forget is how one appears. */
+atlas_status atlas_db_decision_document_create(atlas_db *db, int64_t repo_id,
+                                               const char *root_hash, const char *created_at,
+                                               int64_t *id_out, char *uid_out, size_t uid_size,
+                                               atlas_err *err);
+/* Inserts one immutable revision. `r` supplies content, `document_id`,
+ * `revision_no` and `content_hash`; nothing about state is taken from it.
+ *
+ * When `dedup_key` is not NULL a replay collides on the partial unique index
+ * and `*duplicate_out` is set, with `*id_out` carrying the existing row — the
+ * same idempotency contract A2 uses. */
+atlas_status atlas_db_decision_revision_insert(atlas_db *db, const atlas_decision_revision *r,
+                                               const char *dedup_key, int64_t *id_out,
+                                               bool *duplicate_out, atlas_err *err);
+atlas_status atlas_db_decision_alternative_add(atlas_db *db, int64_t revision_id, int64_t ordinal,
+                                               const char *text, size_t len, atlas_err *err);
+atlas_status atlas_db_decision_link_add(atlas_db *db, int64_t revision_id,
+                                        const atlas_decision_link *link, int64_t target_document_id,
+                                        const char *created_at, atlas_err *err);
+/* Writes the searchable projection for a revision. Derived data, and the only
+ * decision row a rebuild may legitimately recreate. */
+atlas_status atlas_db_decision_search_put(atlas_db *db, int64_t revision_id, int64_t document_id,
+                                          int64_t repo_id, const char *haystack, size_t len,
+                                          atlas_err *err);
+
+/* Appends to the canonical ledger. Never updates, never deletes. */
+atlas_status atlas_db_decision_event_append(atlas_db *db, int64_t document_id, int64_t revision_id,
+                                            int64_t revision_no, const char *event,
+                                            const char *actor, const char *content_hash,
+                                            int64_t challenge_id,
+                                            int64_t superseded_by_revision_id,
+                                            int64_t superseded_by_document_id, const char *detail,
+                                            const char *dedup_key, bool *inserted_out,
+                                            atlas_err *err);
+
+/* The conditional transition. `*changed_out` is false when the revision was not
+ * in `from_state`, which is how a concurrent transition loses deterministically
+ * instead of overwriting: the UPDATE names the expected state and the caller
+ * requires that exactly one row changed. */
+atlas_status atlas_db_decision_revision_set_state(atlas_db *db, int64_t revision_id,
+                                                  const char *from_state, const char *to_state,
+                                                  bool *changed_out, atlas_err *err);
+/* Updates the cache on the document, in the same transaction as the event that
+ * justifies it. `current_revision_id` of 0 stores NULL. */
+atlas_status atlas_db_decision_document_set_state(atlas_db *db, int64_t document_id,
+                                                  int64_t current_revision_id, const char *status,
+                                                  const char *updated_at, atlas_err *err);
+atlas_status atlas_db_decision_document_note_revision(atlas_db *db, int64_t document_id,
+                                                      int64_t revision_no, const char *updated_at,
+                                                      atlas_err *err);
+atlas_status atlas_db_decision_document_set_superseded_by(atlas_db *db, int64_t document_id,
+                                                          int64_t by_document_id, const char *at,
+                                                          atlas_err *err);
+/* The durable identity of a registered repository: a SHA-256 over the canonical
+ * root path's raw bytes, the object format, **and the sorted set of root commit
+ * object ids Atlas has ingested for it**.
+ *
+ * The lineage is the part that matters. A path is a location: delete a
+ * repository, `git init` an unrelated one in the same directory, and a hash of
+ * the path alone says they are the same project. The root commits say they are
+ * not, and they are already in `commits` after any scan — so this needs no git
+ * invocation and no new plumbing.
+ *
+ * `*out` is left **empty** when no root commit is recorded: an unborn HEAD, or
+ * a repository whose history has not been ingested yet. An empty identity is
+ * not an identity and never matches, which is the fail-closed direction. */
+atlas_status atlas_db_repo_identity_hash(atlas_db *db, int64_t repo_id, atlas_buf *out,
+                                         atlas_err *err);
+
+/* Detaches every decision document currently carrying `repo_id`.
+ *
+ * Called unconditionally when a repository row is created, and it needs no git
+ * and no history: a brand-new registration must start with no decisions
+ * whatever else is true. `repositories.id` is a reused rowid, so without this a
+ * new repository would inherit a removed one's approved decisions silently, in
+ * every list and count.
+ *
+ * Detaching is not deleting. The rows keep everything except their attachment,
+ * and `atlas_db_decision_orphans_list` finds them. */
+atlas_status atlas_db_decision_detach_repo(atlas_db *db, int64_t repo_id, int64_t *count_out,
+                                           atlas_err *err);
+
+/* Clears the A2 origin pointer on every A4 revision that names an `ai_decisions`
+ * row belonging to `repo_name`, and must be called **before** that repository is
+ * deleted, while the rows it names still exist.
+ *
+ * `decision_revisions.imported_from_ai_decision_id` is an `ai_decisions` rowid.
+ * `ai_decisions` cascades from `repositories`, so `repo remove` deletes those
+ * rows — but A4 documents deliberately do not cascade, so their revisions
+ * survive still holding the ids. **SQLite reuses rowids**, so the next A2 record
+ * written anywhere takes an id an orphaned revision is already pointing at, and
+ * two things follow, both bad: the unique index on the column rejects the
+ * insert, so the next `atlas_record_decision` after a `repo remove` fails
+ * outright; and if it did not, the orphan's pointer would silently resolve to an
+ * unrelated repository's proposal, which is the false attribution A4 exists to
+ * prevent.
+ *
+ * Clearing it loses nothing real. The row it named is being deleted either way,
+ * and the revision already carries its own copy of the promoted content. A2's
+ * rule decides the rest: an honest gap beats a plausible pointer to somebody
+ * else's record. */
+atlas_status atlas_db_decision_forget_legacy_origins(atlas_db *db, const char *repo_name,
+                                                     int64_t *count_out, atlas_err *err);
+
+/* Reattaches documents to a repository whose durable identity matches theirs
+ * exactly.
+ *
+ * Matched on `repo_identity_hash` and on nothing else — never on the path
+ * alone, never on a name, never on a remote URL. An empty identity on either
+ * side matches nothing. Attaching is therefore fail-closed: an unchanged
+ * repository re-registered and rescanned reclaims its decisions, and a
+ * replaced, recloned or merely uncertain one does not.
+ *
+ * Called after history ingestion rather than at registration, because the
+ * lineage is not knowable until Atlas has read some. */
+atlas_status atlas_db_decision_relink_repo(atlas_db *db, int64_t repo_id,
+                                           const char *identity_hash, int64_t *count_out,
+                                           atlas_err *err);
+
+/* Recomputes a repository's durable identity and reattaches any orphaned
+ * decision documents whose recorded identity matches it exactly.
+ *
+ * Called after history ingestion — a scan or a reconciliation pass — because
+ * the identity commits to the ingested root commits and is not knowable before
+ * then. Safe to call when nothing matches, which is the normal case. */
+atlas_status atlas_db_decision_relink_after_ingest(atlas_db *db, int64_t repo_id,
+                                                   int64_t *count_out, atlas_err *err);
+
+/* Decision documents attached to no live repository. Bounded, and ordered
+ * newest first like every other listing.
+ *
+ * This exists because canonical records must not become silently invisible: a
+ * detached decision is in no repository listing, and without a way to see it a
+ * user who removed a repository would conclude Atlas had deleted their approval
+ * history. */
+atlas_status atlas_db_decision_orphans_list(atlas_db *db, int64_t limit,
+                                            atlas_decision_doc_cb cb, void *ud,
+                                            int64_t *count_out, bool *more_out, atlas_err *err);
+
+/* --- the operator channel --- */
+
+atlas_status atlas_db_decision_challenge_insert(atlas_db *db, const atlas_decision_challenge *c,
+                                                int64_t *id_out, atlas_err *err);
+atlas_status atlas_db_decision_challenge_find(atlas_db *db, const char *token,
+                                              atlas_decision_challenge *out, bool *found_out,
+                                              atlas_err *err);
+/* Marks a challenge spent. `*changed_out` is false when it was already
+ * consumed, which is the replay rejection: the UPDATE carries `AND consumed =
+ * 0`, so two concurrent consumers cannot both see one. */
+atlas_status atlas_db_decision_challenge_consume(atlas_db *db, int64_t challenge_id,
+                                                 const char *at, bool *changed_out,
+                                                 atlas_err *err);
+/* Removes **expired, unconsumed** capabilities only. A consumed challenge is
+ * part of the approval record and is referenced by the event; it is never
+ * removed, and no other decision row is ever deleted by anything. */
+atlas_status atlas_db_decision_challenges_prune(atlas_db *db, const char *now, int64_t retain,
+                                                int64_t *removed_out, atlas_err *err);
+
+/* --- reads --- */
+
+/* Resolves a public uid. `*found_out` is false when nothing has it. */
+atlas_status atlas_db_decision_find_uid(atlas_db *db, const char *uid, int64_t *id_out,
+                                        int64_t *repo_id_out, bool *found_out, atlas_err *err);
+atlas_status atlas_db_decision_uid_of(atlas_db *db, int64_t document_id, atlas_buf *out,
+                                      atlas_err *err);
+/* The approved, not-yet-superseded revision of a document, or 0.
+ *
+ * Read from the cached column rather than searched for, because the partial
+ * unique index guarantees at most one and a search would imply there might be
+ * several. */
+atlas_status atlas_db_decision_current_revision(atlas_db *db, int64_t document_id,
+                                                int64_t *revision_id_out, atlas_err *err);
+/* The two facts a status recomputation needs besides the current revision:
+ * which document supersedes this one (0 for none), and how many of its
+ * revisions are still merely proposed. */
+atlas_status atlas_db_decision_document_shape(atlas_db *db, int64_t document_id,
+                                              int64_t *superseded_by_out, int64_t *proposed_out,
+                                              atlas_err *err);
+/* The newest revision of a document, whatever its state. */
+atlas_status atlas_db_decision_latest_revision(atlas_db *db, int64_t document_id, int64_t *id_out,
+                                               int64_t *no_out, char *hash_out, size_t hash_size,
+                                               char *state_out, size_t state_size,
+                                               atlas_err *err);
+/* Loads one whole revision, with its alternatives and its links. */
+atlas_status atlas_db_decision_revision_load(atlas_db *db, int64_t revision_id,
+                                             atlas_decision_revision *out, bool *found_out,
+                                             atlas_err *err);
+atlas_status atlas_db_decision_revision_by_no(atlas_db *db, int64_t document_id, int64_t revision_no,
+                                              int64_t *id_out, bool *found_out, atlas_err *err);
+
+atlas_status atlas_db_decision_documents_list(atlas_db *db, int64_t repo_id, const char *status,
+                                              int64_t limit, atlas_decision_doc_cb cb, void *ud,
+                                              int64_t *count_out, bool *more_out, atlas_err *err);
+atlas_status atlas_db_decision_document_row(atlas_db *db, int64_t document_id,
+                                            atlas_decision_doc_cb cb, void *ud, bool *found_out,
+                                            atlas_err *err);
+atlas_status atlas_db_decision_revisions_list(atlas_db *db, int64_t document_id, int64_t limit,
+                                              atlas_decision_rev_cb cb, void *ud,
+                                              int64_t *count_out, bool *more_out, atlas_err *err);
+atlas_status atlas_db_decision_events_list(atlas_db *db, int64_t document_id, int64_t limit,
+                                           atlas_decision_event_cb cb, void *ud, int64_t *count_out,
+                                           bool *more_out, atlas_err *err);
+/* Documents whose head revision links to a path, by raw bytes. */
+atlas_status atlas_db_decision_for_path(atlas_db *db, int64_t repo_id, const void *path_raw,
+                                        size_t path_len, int64_t limit, atlas_decision_doc_cb cb,
+                                        void *ud, int64_t *count_out, bool *more_out,
+                                        atlas_err *err);
+/* Bounded search. Uses FTS5 over `decision_search` when the linked SQLite build
+ * has it, and a repository-filtered scan of the same narrow table when it does
+ * not. Both are bounded, and `atlas doctor` reports which is in use. */
+atlas_status atlas_db_decision_search(atlas_db *db, int64_t repo_id, const char *query,
+                                      int64_t limit, atlas_decision_doc_cb cb, void *ud,
+                                      int64_t *count_out, bool *more_out, atlas_err *err);
+/* Lifecycle counts for one repository, for the automatic context envelope and
+ * for `decision list`. These are the real state, replacing A2's placeholder
+ * zero for approvals. */
+atlas_status atlas_db_decision_repo_counts(atlas_db *db, int64_t repo_id, int64_t *proposed,
+                                           int64_t *approved, int64_t *rejected,
+                                           int64_t *superseded, atlas_err *err);
+/* Approved decisions in a repository with at least one path link whose file has
+ * changed or gone since the link was recorded.
+ *
+ * A count, for the automatic context envelope. It is a *path* check only, and
+ * deliberately: a path link's currency is one indexed lookup per link, while a
+ * symbol link's needs the structural graph, and this runs on the hook path
+ * where the budget is twenty milliseconds. A caller that wants the full picture
+ * asks `decision.get`, which resolves every link kind. */
+atlas_status atlas_db_decision_review_count(atlas_db *db, int64_t repo_id, int64_t *count_out,
+                                            atlas_err *err);
+
+/* How many approved documents link to a path, and how many of those links are
+ * no longer current. Both integers, for the automatic file context. */
+atlas_status atlas_db_decision_path_counts(atlas_db *db, int64_t repo_id, const void *path_raw,
+                                           size_t path_len, int64_t *approved_out,
+                                           int64_t *proposed_out, atlas_err *err);
+
+/* Where a symbol name is defined, when it is defined in exactly one place.
+ *
+ * `*matches_out` reports the true number of definition sites; the path and hash
+ * are filled in only when it is 1. That is what lets a decision's symbol
+ * snapshot record a file without Atlas choosing between same-named definitions
+ * — an ambiguous name gets a snapshot with no file, which resolves AMBIGUOUS
+ * later, which is the honest answer. */
+atlas_status atlas_db_code_symbol_definition_site(atlas_db *db, int64_t repo_id, const void *name,
+                                                  size_t name_len, atlas_buf *path_raw_out,
+                                                  atlas_buf *content_hash_out,
+                                                  int64_t *matches_out, atlas_err *err);
+
+/* Resolves one link's currency against the current index.
+ *
+ * Computed on read and never stored: a cached currency is wrong between the
+ * change and the recomputation, and "is this decision still about this code?"
+ * is exactly the question a stale cache must not answer. Atlas never re-points
+ * a link — a rename yields MISSING and several matches yield AMBIGUOUS with the
+ * count, because choosing would be inventing.
+ *
+ * `file_index_known` and `code_index_known` say whether the relevant index has
+ * ever completed a pass for this repository. When it has not, the answer is
+ * UNKNOWN rather than MISSING: "Atlas has not looked" and "it is not there" are
+ * different facts. */
+atlas_status atlas_db_decision_link_resolve(atlas_db *db, int64_t repo_id,
+                                            atlas_decision_link *link, bool file_index_known,
+                                            bool code_index_known, atlas_err *err);
+
+/* Would making `from` superseded by `to` create a cycle?
+ *
+ * Walks the existing supersession chain from `to`, bounded by
+ * ATLAS_DECISION_MAX_SUPERSEDE_DEPTH, and reports whether it reaches `from`. A
+ * chain longer than the bound is reported as reaching, because an unbounded
+ * walk over data a caller influences is not a check and the safe answer to
+ * "cannot tell" is "refuse". */
+atlas_status atlas_db_decision_supersede_reaches(atlas_db *db, int64_t from_document_id,
+                                                 int64_t to_document_id, bool *reaches_out,
+                                                 atlas_err *err);
+
+/* Recomputes a document's status from the ledger and compares it with the
+ * cached columns. Reports, never repairs: `atlas doctor` calls this and doctor
+ * creates and changes nothing. `detail` receives a fixed Atlas-owned
+ * description when they disagree. */
+atlas_status atlas_db_decision_verify(atlas_db *db, int64_t document_id, bool *ok_out,
+                                      atlas_buf *detail, atlas_err *err);
+/* Every document in the database whose cache disagrees with its ledger, and
+ * every revision whose stored content no longer hashes to its recorded
+ * `content_hash`.
+ *
+ * The rehash is what makes the immutability claim checkable rather than merely
+ * asserted. Every field that changes what was approved is in the canonical
+ * encoding — the prose, the scope, the alternatives, the links with their whole
+ * snapshot, the basis HEAD, the repository identity and the proposing actor —
+ * so mutating any of them, by any route, leaves a revision that no longer
+ * matches its own digest. Approval bound to that digest, so a mismatch means an
+ * approval now covers bytes that are not there.
+ *
+ * Reported, never repaired: `atlas doctor` calls this, and a diagnostic that
+ * silently fixed what it found could not tell you whether the fault recurs. */
+atlas_status atlas_db_decision_verify_all(atlas_db *db, int64_t *checked_out,
+                                          int64_t *mismatched_out, int64_t *rehashed_out,
+                                          int64_t *corrupt_out, atlas_err *err);
+
+/* --- A2 compatibility ---
+ *
+ * The A2 tables are read, never written and never altered. A legacy proposal is
+ * *representable* — every read that lists decisions can report it — and
+ * *promotable* into an A4 document, which creates a new revision carrying
+ * `imported_from_ai_decision_id` and leaves the `ai_decisions` row exactly as
+ * it was, `approved = 0` and all. Nothing rewrites history to look approved. */
+typedef struct atlas_decision_legacy_row {
+    int64_t id;
+    int64_t session_id;
+    const char *created_at;
+    const char *provenance;
+    const char *state;
+    const char *title;
+    const char *statement;
+    const char *rationale;
+    int64_t path_count;
+    bool imported;         /* an A4 revision already carries this row's id */
+    const char *imported_uid; /* which document, when it does */
+} atlas_decision_legacy_row;
+
+typedef atlas_status (*atlas_decision_legacy_cb)(const atlas_decision_legacy_row *row, void *ud,
+                                                 atlas_err *err);
+
+atlas_status atlas_db_decision_legacy_list(atlas_db *db, int64_t repo_id, bool unimported_only,
+                                           int64_t limit, atlas_decision_legacy_cb cb, void *ud,
+                                           int64_t *count_out, bool *more_out, atlas_err *err);
+atlas_status atlas_db_decision_legacy_get(atlas_db *db, int64_t repo_id, int64_t ai_decision_id,
+                                          atlas_decision_revision *out, bool *found_out,
+                                          atlas_err *err);
 
 /* --- transactions ------------------------------------------------------- */
 

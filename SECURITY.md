@@ -360,6 +360,96 @@ hazards that will block the next phase, and the verified false positives — see
 [docs/security-audit-a0.md](docs/security-audit-a0.md). Start there for any security
 sweep; do not treat this file's claims as proof on their own.
 
+## A4: the operator approval channel, and what it is worth
+
+`atlas decision approve|reject|supersede` records the actor
+`LOCAL_OPERATOR_CONFIRMED`. **Read that name literally.**
+
+### What it establishes
+
+That an explicit action arrived through Atlas' operator-only interactive
+channel:
+
+- the process has a controlling terminal on both standard input and standard
+  output, and the confirmation is read from `/dev/tty` rather than from standard
+  input;
+- a capability was issued by the writer thread, bound to one repository, one
+  document, one revision, that revision's content hash, and one intent;
+- it was valid for 120 seconds and consumable exactly once, with consumption and
+  the lifecycle transition in the same transaction;
+- the stored content was rehashed and compared against the bound hash before the
+  transition;
+- the operator typed the first eight hex characters of that hash.
+
+### What it does not establish
+
+`LOCAL_OPERATOR_CONFIRMED` **does not establish which person** acted, does not
+establish that a person acted at all, and is not a signature.
+
+- **which person acted.** Nothing here is an identity.
+- **that any person acted.** A same-UID process that can drive a pseudo-terminal
+  can run the CLI against it and type the confirmation — and that includes an AI
+  agent with shell access. `tests/test_decision_operator.c` does exactly that,
+  deliberately: a suite that could not would be claiming more than the code
+  supports.
+- **non-repudiation.** There is no signature, no key and no attestation. A4 adds
+  no cryptographic signing and no hardware-token support, and adding the
+  vocabulary without the mechanism would be worse than the current claim.
+
+The same-UID limitation is the same one the IPC socket has: Atlas' local
+boundary is the user account, and a process inside it is inside it. **An AI
+agent with shell access is inside it.** The plugin skill instructs Claude not to
+drive the operator channel on a user's behalf, and that is an instruction rather
+than a control — Atlas cannot enforce it and does not claim to.
+
+### What it does exclude, and this is the whole claim
+
+An approval cannot be produced by a model's text in any field; by a hook
+payload; by any MCP tool, since none exists and no tool schema declares a
+`token` or a `confirmation`; by a repository file; by an environment variable;
+by `--yes`, which is refused explicitly rather than ignored; by piped or
+redirected standard input; by replaying a captured request; or by a capability
+issued for a different document, revision, repository or intent.
+
+Those are checkable properties and every one of them has a test.
+
+### Repository identity
+
+A decision is reattached to a re-registered repository only when the
+repository's **path-qualified lineage fingerprint** matches: the canonical root
+path, the object format, and the sorted set of ingested root commits, all three.
+A hash of the path alone would say that an unrelated project created in the same
+directory is the same repository, and would attach one project's approved
+decisions to another's code. The lineage is the component that rules that out.
+
+The qualification is not incidental: because the root path is hashed too, the
+same repository at a **different** path does not reattach automatically either.
+That is the conservative direction — an orphan is visible and recoverable — and
+manual relinking is deferred rather than implemented.
+
+Attaching is fail-closed. Registering a repository detaches every decision
+carrying its row id unconditionally — `repositories.id` is a reused rowid — and
+attaching happens only later, on a completed scan, only on an exact non-empty
+identity match, and never on a name, a remote or a branch. Nothing is deleted,
+and `atlas decision orphaned` shows what is currently attached to nothing.
+
+### Approved prose is still untrusted
+
+Approval changes a record's status, not the nature of its bytes. An approved
+decision body is `UNTRUSTED_DATA` at every status, never enters automatic model
+context, and reaches a model only through an explicit MCP result that labels it.
+
+If approval made text authoritative, the attack would be: propose a decision
+whose body contains instructions, give it a plausible title, get it approved on
+the strength of the title. The approval prompt would have become a
+prompt-injection channel with a human-shaped step in the middle.
+
+The prompt itself shows the decision's title and body **labelled as untrusted
+project text**, and three independent layers keep a terminal escape out of it:
+the content validator refuses C0, C1, DEL, `U+2028`/`U+2029` and the bidi
+override and isolate set at the point of writing; `atlas_safe()` encodes on the
+way out; and `atlas_terminal_write` replaces any byte a terminal would act on.
+
 ## Reporting a vulnerability
 
 Atlas has no public distribution or security contact yet. Until it does, report

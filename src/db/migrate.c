@@ -1100,12 +1100,381 @@ static const char *const M5_STATEMENTS[] = {
     M5_CODE_UNIT_INCLUDES, M5_CODE_UNIT_DEFINES, M5_CODE_INDEX_ERRORS, NULL,
 };
 
+/* Migration 6: decision documents, immutable revisions and operator approval
+ * (A4).
+ *
+ * Forward-only, transactional and purely additive, like every migration before
+ * it. Every statement is a CREATE for a new object. No existing table is
+ * recreated, no existing column is altered, no existing CHECK is relaxed and no
+ * existing row is touched — which `tests/test_migrate6.c` asserts by seeding a
+ * populated schema-5 database and comparing every A0..A3 table row by row
+ * across the migration, and again across a second, no-op migration.
+ *
+ * **The A2 restriction is deliberately left in place.** `ai_decisions.approved`
+ * still CHECKs `approved = 0`, `atlas_provenance_writable_in_a2` still refuses
+ * `USER_APPROVED_DECISION`, and neither A2 insert statement binds the column.
+ * Lifting that CHECK was the obvious way to build this phase and it is the
+ * wrong one: it would make an approval something that happens *to* a model's
+ * own row, in the same table the model writes, distinguished from a proposal by
+ * one integer. A4 approval is a different record about a different object —
+ * an immutable revision — with its own actor vocabulary and its own append-only
+ * ledger, so the A2 statement "a model proposal never becomes approved by
+ * itself" stays literally true rather than becoming a historical note.
+ *
+ * **The evidence table is untouched again.** A4 writes no evidence at all.
+ * `atlas_db_evidence_insert` still refuses everything except SOURCE and GIT,
+ * and `INFERENCE` remains reserved and unused: A4 introduces no deterministic
+ * inference with a defined provenance, so using the kind would only mean "we
+ * had one spare". `tests/test_decision_lifecycle.c` asserts the table gains nothing
+ * across a full decision lifecycle, and that the reserved kinds stay unused.
+ *
+ * **Nothing here cascades from `repositories`, and that is the one structural
+ * break with every table above.** Everything else in the schema is a
+ * rebuildable index keyed to a registered worktree, so `repo remove` is a pure
+ * cascade. A decision document is not rebuildable from anything: it is the
+ * canonical record of an approval, and rule 10 of the phase is that no
+ * decision, revision, approval or rejection record is ever physically deleted.
+ * A foreign key with ON DELETE CASCADE here would make `atlas repo remove
+ * --yes` silently destroy approval history, so `repo_id` is a *soft* reference
+ * and the durable identity is `repo_root_hash`. Removing a repository orphans
+ * its decisions; registering the same root again relinks them by hash. See
+ * docs/decision-lifecycle.md, and `atlas_db_decision_relink_repo`. */
+
+/* The stable identity of one decision, across every revision of it.
+ *
+ * `uid` is the public handle: `atlas-dec-` and sixteen lowercase hex
+ * characters, derived from values Atlas chose. It is opaque on purpose — it
+ * carries no repository byte, so it is the one decision-derived value the
+ * automatic context envelope is allowed to contain.
+ *
+ * `current_status` and `current_revision_id` are a **cache** of
+ * `decision_events`, which is canonical. They exist because "what is the state
+ * of this document" is asked by every list, every file query and every hook,
+ * and replaying a ledger to answer it would put a correlated subquery on the
+ * hot path. They are written in the same transaction as the event that changes
+ * them, and `atlas_db_decision_verify` recomputes them from the ledger so the
+ * cache can be checked rather than trusted. */
+static const char M6_DECISION_DOCUMENTS[] =
+    "CREATE TABLE decision_documents ("
+    "  id INTEGER PRIMARY KEY,"
+    "  uid TEXT NOT NULL UNIQUE,"
+    /* Soft reference. No FK, no cascade: see the header comment above. */
+    "  repo_id INTEGER NOT NULL,"
+    /* SHA-256 of the canonical root path's raw bytes — the same value the
+     * automatic context envelope reports as `root_hash`. Kept for reporting,
+     * and **not** sufficient on its own to decide that two registrations are
+     * the same repository: a path is a location, not an identity. */
+    "  repo_root_hash TEXT NOT NULL,"
+    /* The durable repository identity this document was written against, and
+     * the only thing an automatic relink is allowed to match on.
+     *
+     * A **path-qualified lineage fingerprint**: the canonical root path, the
+     * object format, **and the sorted set of root commits Atlas has ingested
+     * for that repository**. `rm -rf` a repository, `git init` an unrelated one
+     * at the same path, and the root commits differ, so the identity differs
+     * and the old decisions stay orphaned. A path hash alone would have
+     * attached them. Equally, the same lineage at a different path does not
+     * match either, because the path is part of the fingerprint — automatic
+     * reattachment requires all of it, and manual relinking is deferred.
+     *
+     * Empty when the lineage was unknown at the time — an unborn HEAD, or a
+     * repository whose history had not been ingested. An empty identity never
+     * matches anything, so such a document is never auto-relinked. That is the
+     * fail-closed direction: an orphan is visible and recoverable, and a
+     * decision attached to the wrong project is neither. */
+    "  repo_identity_hash TEXT NOT NULL DEFAULT '',"
+    "  created_at TEXT NOT NULL,"
+    "  updated_at TEXT NOT NULL,"
+    "  latest_revision_no INTEGER NOT NULL DEFAULT 0,"
+    /* The approved, not-yet-superseded revision. NULL when there is none, which
+     * is the normal state of a document nobody has approved. */
+    "  current_revision_id INTEGER,"
+    "  current_status TEXT NOT NULL DEFAULT 'PROPOSED' CHECK(current_status IN"
+    "    ('PROPOSED','APPROVED','REJECTED','SUPERSEDED')),"
+    /* Document-level supersession: this document was replaced by another. A
+     * soft self reference rather than an FK, because documents are never
+     * deleted and an FK would only add an enforcement cost. */
+    "  superseded_by_document_id INTEGER,"
+    "  superseded_at TEXT"
+    ");"
+    "CREATE INDEX idx_decision_docs_repo ON decision_documents(repo_id, id DESC);"
+    /* The list and count queries filter by repository *and* status, and the hot
+     * one is "approved decisions for this repository". Without status in the
+     * index that is a seek followed by a fetch and a discard per proposed
+     * document, which at ten thousand documents is most of the query. */
+    "CREATE INDEX idx_decision_docs_status ON decision_documents(repo_id, current_status, id DESC);"
+    /* Relinking after a `repo remove` / `repo add` cycle seeks by identity. The
+     * root hash is indexed too, for the orphan listing and for reporting. */
+    "CREATE INDEX idx_decision_docs_root ON decision_documents(repo_root_hash);"
+    "CREATE INDEX idx_decision_docs_identity ON decision_documents(repo_identity_hash)"
+    "  WHERE repo_identity_hash <> '';";
+
+/* One immutable revision.
+ *
+ * **No content column of this table is ever updated.** There is no UPDATE
+ * statement in `db_decision.c` that names `title`, `context_text`,
+ * `decision_text`, `rationale_text`, `consequences_text`, `scope`,
+ * `content_hash` or `basis_head`; a change is a new row with the next
+ * `revision_no`. `state` is updated, because a state is not content — it is
+ * where the ledger has left this row — and `tests/test_decision_lifecycle.c`
+ * asserts the distinction by hashing every content column before and after
+ * every transition.
+ *
+ * `content_hash` is the domain-separated canonical digest from
+ * `atlas_decision_content_hash`. Approval binds to it, so a revision whose
+ * stored hash does not match a rehash of its stored content is a corrupt row
+ * rather than a mild inconsistency: `atlas doctor` reports it and approval
+ * refuses it. */
+static const char M6_DECISION_REVISIONS[] =
+    "CREATE TABLE decision_revisions ("
+    "  id INTEGER PRIMARY KEY,"
+    "  document_id INTEGER NOT NULL REFERENCES decision_documents(id),"
+    "  revision_no INTEGER NOT NULL,"
+    "  content_hash TEXT NOT NULL,"
+    "  title TEXT NOT NULL,"
+    "  context_text TEXT NOT NULL DEFAULT '',"
+    "  decision_text TEXT NOT NULL DEFAULT '',"
+    "  rationale_text TEXT NOT NULL DEFAULT '',"
+    "  consequences_text TEXT NOT NULL DEFAULT '',"
+    "  scope TEXT NOT NULL DEFAULT 'UNKNOWN' CHECK(scope IN"
+    "    ('UNKNOWN','REPOSITORY','SUBSYSTEM','PATHS')),"
+    /* Which kind of actor proposed it. The operator channel may also propose —
+     * a person typing `atlas decision propose` — so this is not a synonym for
+     * \"a model wrote it\". */
+    "  proposed_by TEXT NOT NULL CHECK(proposed_by IN"
+    "    ('MODEL_PROPOSAL','MODEL_INFERENCE','LOCAL_OPERATOR_CONFIRMED','ATLAS_AUTOMATIC')),"
+    /* Soft reference: A2 sessions may be expired, and a decision outlives the
+     * conversation that proposed it. A2's attribution rule is unchanged — a
+     * record that cannot be attached by exact key is stored sessionless with a
+     * typed reason, never attached to a neighbouring session. */
+    "  session_id INTEGER,"
+    "  session_unbound INTEGER NOT NULL DEFAULT 0,"
+    "  unbound_reason TEXT,"
+    "  basis_head TEXT,"
+    /* The repository identity **as captured when this revision was written**.
+     *
+     * It is on the revision rather than only on the document because it is part
+     * of the canonical content hash, and a hashed input has to be immutable.
+     * `decision_documents.repo_identity_hash` is attachment metadata: it starts
+     * empty on a repository whose history has not been ingested and is
+     * backfilled when the lineage becomes knowable. Hashing *that* meant an
+     * ordinary propose-then-scan changed the input used to verify an
+     * already-written revision, and `atlas doctor` reported a healthy record as
+     * corrupt.
+     *
+     * Empty is a real recorded value meaning "nothing was knowable then", and
+     * it stays empty. A later revision captures whatever is knowable at its own
+     * write time, so revisions of one document may legitimately differ. */
+    "  basis_repo_identity_hash TEXT NOT NULL DEFAULT '',"
+    "  created_at TEXT NOT NULL,"
+    "  state TEXT NOT NULL DEFAULT 'PROPOSED' CHECK(state IN"
+    "    ('PROPOSED','APPROVED','REJECTED','SUPERSEDED')),"
+    /* Set when this revision was created by promoting an A2 `ai_decisions` row.
+     * A soft reference to a row that is never modified and never deleted. */
+    "  imported_from_ai_decision_id INTEGER,"
+    /* Idempotency for a retried propose or revise, exactly as A2 does it. */
+    "  dedup_key TEXT,"
+    "  UNIQUE(document_id, revision_no)"
+    ");"
+    "CREATE INDEX idx_decision_rev_doc ON decision_revisions(document_id, revision_no DESC);"
+    /* **Rule 9 of the phase, as a schema constraint rather than as care.**
+     *
+     * At most one approved revision may exist for one document. A partial
+     * unique index makes a second one impossible to insert or update into
+     * existence, so the atomicity of approve-and-supersede is enforced by
+     * SQLite rather than by the ordering of two statements. A bug that got the
+     * ordering wrong would fail loudly here instead of leaving two effective
+     * revisions that every later read quietly picks between. */
+    "CREATE UNIQUE INDEX idx_decision_rev_current ON decision_revisions(document_id)"
+    "  WHERE state = 'APPROVED';"
+    /* The promote path checks whether an A2 proposal has already been imported,
+     * which must be a seek: it runs once per legacy row during a bulk promote. */
+    "CREATE UNIQUE INDEX idx_decision_rev_import ON decision_revisions(imported_from_ai_decision_id)"
+    "  WHERE imported_from_ai_decision_id IS NOT NULL;"
+    "CREATE UNIQUE INDEX idx_decision_rev_dedup ON decision_revisions(document_id, dedup_key)"
+    "  WHERE dedup_key IS NOT NULL;";
+
+/* Alternatives considered, in the order the proposer gave them.
+ *
+ * A child table rather than one blob because "three alternatives were
+ * considered" is a countable fact that a reader, an export and a test can each
+ * check, and a blob turns all three into string parsing. */
+static const char M6_DECISION_ALTERNATIVES[] =
+    "CREATE TABLE decision_alternatives ("
+    "  id INTEGER PRIMARY KEY,"
+    "  revision_id INTEGER NOT NULL REFERENCES decision_revisions(id),"
+    "  ordinal INTEGER NOT NULL,"
+    "  text TEXT NOT NULL,"
+    "  UNIQUE(revision_id, ordinal)"
+    ");";
+
+/* What a revision concerns.
+ *
+ * **Nothing here references a migration-5 table.** A `code_symbols` row is
+ * derived data: a structural rebuild deletes it and an analyzer upgrade
+ * replaces it, and both are routine. A durable decision whose subject
+ * disappears when a cache is rebuilt would be a decision about nothing, so a
+ * symbol link is a *snapshot* — the name bytes, the kind, the file it was in,
+ * the line, the basis commit, that file's content hash at the time, and the
+ * analyzer name and version that produced the fact.
+ *
+ * Resolution against that snapshot happens when the link is read, and its
+ * outcome is reported rather than stored: CURRENT, CHANGED, MISSING, AMBIGUOUS
+ * or UNKNOWN. Atlas never re-points a link. A rename produces MISSING, not a
+ * quiet new target, because "the decision now refers to a different symbol" is
+ * not something a rename can establish. */
+static const char M6_DECISION_LINKS[] =
+    "CREATE TABLE decision_links ("
+    "  id INTEGER PRIMARY KEY,"
+    "  revision_id INTEGER NOT NULL REFERENCES decision_revisions(id),"
+    "  kind TEXT NOT NULL CHECK(kind IN"
+    "    ('path','commit','change_set','symbol','supersedes','replaced_by')),"
+    /* Paths are bytes. `path_raw` is the key and `path_text` the lossless safe
+     * encoding, exactly as in `files` and `code_files`. */
+    "  path_raw BLOB,"
+    "  path_text TEXT,"
+    "  commit_oid TEXT,"
+    "  change_set_id INTEGER,"
+    /* Soft reference to another decision document, by row id. */
+    "  target_document_id INTEGER,"
+    /* The symbol snapshot, recorded whole or not at all. */
+    "  symbol_name BLOB,"
+    "  symbol_name_text TEXT,"
+    "  symbol_kind TEXT,"
+    "  symbol_line INTEGER NOT NULL DEFAULT 0,"
+    "  basis_commit TEXT,"
+    "  file_content_hash TEXT,"
+    "  analyzer_name TEXT,"
+    "  analyzer_version INTEGER NOT NULL DEFAULT 0,"
+    "  created_at TEXT NOT NULL"
+    ");"
+    "CREATE INDEX idx_decision_links_rev ON decision_links(revision_id, id);"
+    /* \"Which decisions concern this file?\" is one of the four queries the
+     * phase has to answer in bounded time, and it seeks from the path bytes. */
+    "CREATE INDEX idx_decision_links_path ON decision_links(path_raw) WHERE path_raw IS NOT NULL;"
+    "CREATE INDEX idx_decision_links_symbol ON decision_links(symbol_name)"
+    "  WHERE symbol_name IS NOT NULL;"
+    "CREATE INDEX idx_decision_links_commit ON decision_links(commit_oid)"
+    "  WHERE commit_oid IS NOT NULL;"
+    "CREATE INDEX idx_decision_links_target ON decision_links(target_document_id)"
+    "  WHERE target_document_id IS NOT NULL;";
+
+/* The append-only lifecycle ledger. **This is canonical.**
+ *
+ * Every transition is a row here, and no row is ever updated or deleted. The
+ * status columns on the document and the revision are derived from it and are
+ * written in the same transaction; `atlas_db_decision_verify` recomputes them
+ * by replay and reports a disagreement rather than repairing one, so `atlas
+ * doctor` can check the cache without becoming a thing that writes.
+ *
+ * `content_hash` is recorded on the event as well as on the revision. That is
+ * not redundancy: it is what makes an approval bind to *content* rather than to
+ * a row, so a later reader can see which bytes were approved without trusting
+ * that the revision row is the one that was there.
+ *
+ * `actor` carries the honest name. `LOCAL_OPERATOR_CONFIRMED` means the
+ * operator channel was used — a real terminal, a single-use challenge bound to
+ * this exact revision and hash, and a confirmation typed against that hash. It
+ * does not name a person and is not a signature. */
+static const char M6_DECISION_EVENTS[] =
+    "CREATE TABLE decision_events ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  document_id INTEGER NOT NULL REFERENCES decision_documents(id),"
+    /* NULL only for a document-level event that names no single revision. */
+    "  revision_id INTEGER REFERENCES decision_revisions(id),"
+    "  revision_no INTEGER NOT NULL DEFAULT 0,"
+    "  event TEXT NOT NULL CHECK(event IN"
+    "    ('PROPOSED','APPROVED','REJECTED','SUPERSEDED')),"
+    "  actor TEXT NOT NULL CHECK(actor IN"
+    "    ('MODEL_PROPOSAL','MODEL_INFERENCE','LOCAL_OPERATOR_CONFIRMED','ATLAS_AUTOMATIC')),"
+    "  content_hash TEXT,"
+    /* Which challenge was spent. Present exactly on the events an operator
+     * caused, absent on everything else, so \"was this approval channelled?\"
+     * is answerable from the ledger alone. */
+    "  challenge_id INTEGER,"
+    /* What replaced this revision, when the event is SUPERSEDED. */
+    "  superseded_by_revision_id INTEGER,"
+    "  superseded_by_document_id INTEGER,"
+    /* A fixed Atlas vocabulary, never assembled from repository or model bytes:
+     * this value is reported and may reach a model. */
+    "  detail TEXT,"
+    "  created_at TEXT NOT NULL,"
+    "  dedup_key TEXT"
+    ");"
+    "CREATE INDEX idx_decision_events_doc ON decision_events(document_id, id);"
+    "CREATE INDEX idx_decision_events_rev ON decision_events(revision_id, id);"
+    "CREATE UNIQUE INDEX idx_decision_events_dedup ON decision_events(document_id, dedup_key)"
+    "  WHERE dedup_key IS NOT NULL;";
+
+/* Short-lived, single-use operator capabilities.
+ *
+ * A challenge is bound to a repository, a document, a revision *and* the
+ * content hash of that revision. Every rejection the phase requires falls out
+ * of that tuple plus two columns: an expired challenge fails on `expires_at`, a
+ * replayed one on `consumed`, one issued for a different revision on
+ * `revision_id`, and one whose content changed underneath it on `content_hash`
+ * — which cannot happen through Atlas, since revisions are immutable, and is
+ * checked anyway because \"cannot happen\" is not a check.
+ *
+ * Consumption is `UPDATE ... WHERE id = ? AND consumed = 0` inside the same
+ * writer transaction as the transition, and the writer requires that it changed
+ * exactly one row. So two concurrent approvals of one challenge cannot both
+ * succeed, and a transition cannot happen without spending a capability.
+ *
+ * A consumed row is never deleted: it is part of the approval record, and
+ * `challenge_id` on the event points at it. Pruning removes expired, unconsumed
+ * rows only. */
+static const char M6_DECISION_CHALLENGES[] =
+    "CREATE TABLE decision_challenges ("
+    "  id INTEGER PRIMARY KEY,"
+    "  token TEXT NOT NULL UNIQUE,"
+    "  repo_id INTEGER NOT NULL,"
+    "  document_id INTEGER NOT NULL REFERENCES decision_documents(id),"
+    "  revision_id INTEGER NOT NULL REFERENCES decision_revisions(id),"
+    "  revision_no INTEGER NOT NULL,"
+    "  content_hash TEXT NOT NULL,"
+    "  intent TEXT NOT NULL CHECK(intent IN ('approve','reject','supersede')),"
+    "  supersede_document_id INTEGER,"
+    "  created_at TEXT NOT NULL,"
+    "  expires_at TEXT NOT NULL,"
+    "  consumed INTEGER NOT NULL DEFAULT 0,"
+    "  consumed_at TEXT"
+    ");"
+    "CREATE INDEX idx_decision_challenges_repo ON decision_challenges(repo_id, consumed, expires_at);";
+
+/* The searchable projection of one revision.
+ *
+ * A separate narrow table rather than a query over the prose columns, for one
+ * reason that is measurable: the degraded search path is a scan, and scanning a
+ * table whose rows are a bounded two kilobytes costs a fraction of scanning
+ * five prose columns across every revision in the database. It is also the
+ * content table for the optional FTS5 index.
+ *
+ * `haystack` is lowercased and bounded to ATLAS_DECISION_HAYSTACK_MAX. It is
+ * derived data — regenerated whenever a revision is written — and is the one
+ * decision table that a rebuild may legitimately recreate. */
+static const char M6_DECISION_SEARCH[] =
+    "CREATE TABLE decision_search ("
+    "  revision_id INTEGER PRIMARY KEY REFERENCES decision_revisions(id),"
+    "  document_id INTEGER NOT NULL,"
+    "  repo_id INTEGER NOT NULL,"
+    "  haystack TEXT NOT NULL"
+    ");"
+    "CREATE INDEX idx_decision_search_repo ON decision_search(repo_id, revision_id);";
+
+static const char *const M6_STATEMENTS[] = {
+    M6_DECISION_DOCUMENTS, M6_DECISION_REVISIONS,  M6_DECISION_ALTERNATIVES,
+    M6_DECISION_LINKS,     M6_DECISION_EVENTS,     M6_DECISION_CHALLENGES,
+    M6_DECISION_SEARCH,    NULL,
+};
+
 static const atlas_migration MIGRATIONS[] = {
     {1, "initial schema", M1_STATEMENTS},
     {2, "worktree identity", M2_STATEMENTS},
     {3, "continuous indexing state", M3_STATEMENTS},
     {4, "AI sessions, change reasons and decisions", M4_STATEMENTS},
     {5, "structural code graph", M5_STATEMENTS},
+    {6, "decision documents, revisions and operator approval", M6_STATEMENTS},
 };
 
 const atlas_migration *atlas_migrations(size_t *count_out) {
@@ -1238,6 +1607,15 @@ atlas_status atlas_db_ensure_fts(atlas_db *db, atlas_err *err) {
         "  tokenize='unicode61 remove_diacritics 0');"
         "CREATE VIRTUAL TABLE IF NOT EXISTS commits_fts USING fts5("
         "  subject, body, content='commits', content_rowid='id',"
+        "  tokenize='unicode61 remove_diacritics 0');"
+        /* A4. Here rather than in migration 6 for the reason stated at the top
+         * of this file: FTS5 availability is a property of the linked SQLite
+         * build, not of the schema, so a numbered migration that assumed it
+         * would refuse to apply on a build without it. Decision search degrades
+         * to a bounded, repository-filtered scan of `decision_search` when this
+         * is absent, and `atlas doctor` reports which one is in use. */
+        "CREATE VIRTUAL TABLE IF NOT EXISTS decisions_fts USING fts5("
+        "  haystack, content='decision_search', content_rowid='revision_id',"
         "  tokenize='unicode61 remove_diacritics 0');";
     atlas_status st = atlas_db_exec_sql(db, sql, err);
     if (st != ATLAS_OK) {
@@ -1258,7 +1636,8 @@ atlas_status atlas_db_fts_rebuild(atlas_db *db, atlas_err *err) {
     }
     return atlas_db_exec_sql(db,
                              "INSERT INTO files_fts(files_fts) VALUES('rebuild');"
-                             "INSERT INTO commits_fts(commits_fts) VALUES('rebuild');",
+                             "INSERT INTO commits_fts(commits_fts) VALUES('rebuild');"
+                             "INSERT INTO decisions_fts(decisions_fts) VALUES('rebuild');",
                              err);
 }
 

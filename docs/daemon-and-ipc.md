@@ -435,3 +435,49 @@ anyway: the daemon is not there.
 It also makes the security argument short. The MCP server cannot open the index,
 cannot start a daemon, cannot scan a repository, cannot write to a filesystem and
 cannot create a process. That is a list a reviewer can check.
+
+
+## A4: the `decision.*` method group
+
+Ten methods, in `src/ipc/server_decision.c`, looked up through the same single
+dispatch as the other groups.
+
+| method | writes | notes |
+| --- | --- | --- |
+| `decision.list` | no | also serves search and decisions-for-a-file |
+| `decision.get` | no | one whole revision, with every link's resolved currency |
+| `decision.history` | no | revisions and the timeline, plus `ledger_agrees` |
+| `decision.propose` | yes | a new document at revision 1 |
+| `decision.revise` | yes | a new **proposed** revision of an existing document |
+| `decision.promote` | yes | an A4 document from an A2 `ai_decisions` row |
+| `decision.challenge` | yes | issues a capability; changes no lifecycle state |
+| `decision.approve` | yes | consumes a capability |
+| `decision.reject` | yes | consumes a capability |
+| `decision.supersede` | yes | consumes a capability |
+
+Every write is one typed `atlas_decision_op` handed to the writer thread as an
+`ATLAS_JOB_DECISION`, exactly as A2's writes are handed over as
+`ATLAS_JOB_AI`. Issuing a capability is a write, so it goes through the writer
+too: **there is no path to `atlas_decision_apply` that does not run on the
+writer thread**, and the whole operation is one transaction, so a capability
+cannot be spent without the transition it authorised.
+
+### The parameter surface is the boundary
+
+`token` and `confirmation` are read by the three spending methods and by nothing
+else. No proposal method reads them, so "a proposal cannot carry an approval" is
+a property of the parameter surface rather than of a check somebody has to
+remember.
+
+The `decision.*` methods are reachable over the socket — the CLI is a socket
+client like everything else — but the MCP tool surface exposes no tool that
+calls the three spending ones, and no MCP tool schema declares a `token` or a
+`confirmation` at all.
+
+### The CLI's two routes
+
+The data-directory lock decides. When this process holds it, the operation runs
+on this thread through the same `atlas_decision_apply` the writer calls; when
+something else holds it, that something is the daemon and the operation goes
+over the socket. One of the two is always true, and neither branch has a copy of
+the lifecycle rules.

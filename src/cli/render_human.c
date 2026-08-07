@@ -1002,6 +1002,213 @@ static atlas_status h_code_list_end(atlas_renderer *r, const char *key, const ch
     return ok();
 }
 
+
+/* --- A4: decision documents ---------------------------------------------
+ *
+ * Every string here arrives already safe-encoded from the service layer.
+ * Decision prose is untrusted whatever its status — approval changes a
+ * record's state, not the nature of its bytes — so the encoding happens once,
+ * in `service_decision.c`, and is not repeated here. Double-encoding would
+ * turn a `%` in somebody's decision into `%25` on screen. */
+
+static const char *dash(const atlas_buf *b) {
+    return b->len > 0 ? atlas_buf_cstr(b) : "-";
+}
+
+static atlas_status h_decision_item(atlas_renderer *r, const atlas_decision_summary *s,
+                                    atlas_err *err) {
+    (void)err;
+    r->items++;
+    (void)fprintf(r->out, "  %-26s  %-10s  rev %" PRId64 "/%" PRId64 "  %s\n",
+                  atlas_buf_cstr(&s->uid), atlas_buf_cstr(&s->status), s->revision_no,
+                  s->latest_revision_no, atlas_buf_cstr(&s->title));
+    if (s->superseded_by.len > 0) {
+        (void)fprintf(r->out, "      superseded by %s\n", atlas_buf_cstr(&s->superseded_by));
+    }
+    return ok();
+}
+
+static void h_decision_body(atlas_renderer *r, const char *heading, const atlas_buf *body) {
+    if (body->len == 0) {
+        return;
+    }
+    (void)fprintf(r->out, "\n%s:\n", heading);
+    /* Indented line by line rather than printed as one block, so a multi-line
+     * body cannot be mistaken for the surrounding report's own output. */
+    const char *p = body->data;
+    size_t n = body->len;
+    size_t start = 0;
+    for (size_t i = 0; i <= n; i++) {
+        if (i == n || p[i] == '\n') {
+            (void)fprintf(r->out, "  %.*s\n", (int)(i - start), p + start);
+            start = i + 1u;
+        }
+    }
+}
+
+static atlas_status h_decision_show(atlas_renderer *r, const atlas_decision_document *d,
+                                    atlas_err *err) {
+    (void)err;
+    const atlas_decision_summary *s = &d->summary;
+    (void)fprintf(r->out, "decision:     %s\n", atlas_buf_cstr(&s->uid));
+    (void)fprintf(r->out, "repository:   %s\n", atlas_buf_cstr(&d->repo));
+    (void)fprintf(r->out, "status:       %s\n", atlas_buf_cstr(&s->status));
+    (void)fprintf(r->out, "revision:     %" PRId64 " of %" PRId64 " (%s)\n", s->revision_no,
+                  s->latest_revision_no, dash(&s->revision_state));
+    (void)fprintf(r->out, "content hash: %s\n", dash(&s->content_hash));
+    (void)fprintf(r->out, "proposed by:  %s\n", dash(&s->proposed_by));
+    (void)fprintf(r->out, "scope:        %s\n", dash(&d->scope));
+    if (d->basis_head.len > 0) {
+        (void)fprintf(r->out, "basis commit: %s\n", atlas_buf_cstr(&d->basis_head));
+    }
+    /* The identity this revision *captured*, which is immutable and hashed —
+     * not the document's current attachment identity, which is neither. */
+    (void)fprintf(r->out, "repo identity: %s\n",
+                  d->basis_repo_identity.len > 0 ? atlas_buf_cstr(&d->basis_repo_identity)
+                                                 : "not captured (no ingested history at the time)");
+    if (s->superseded_by.len > 0) {
+        (void)fprintf(r->out, "superseded by: %s\n", atlas_buf_cstr(&s->superseded_by));
+    }
+    if (d->imported_from_a2_decision > 0) {
+        (void)fprintf(r->out, "promoted from A2 proposal %" PRId64 "\n",
+                      d->imported_from_a2_decision);
+    }
+    if (d->session_unbound) {
+        /* A gap, stated. A2's rule applies unchanged: a record that could not be
+         * attributed exactly is stored unattached rather than attached to a
+         * neighbour, and saying so is what makes the gap repairable. */
+        (void)fprintf(r->out, "session:      unattached (%s)\n", dash(&d->unbound_reason));
+    }
+    (void)fprintf(r->out, "created:      %s\n", dash(&s->created_at));
+
+    (void)fprintf(r->out, "\ntitle:\n  %s\n", atlas_buf_cstr(&s->title));
+    h_decision_body(r, "context", &d->context_text);
+    h_decision_body(r, "decision", &d->decision_text);
+    h_decision_body(r, "rationale", &d->rationale_text);
+    if (d->alternative_count > 0) {
+        (void)fprintf(r->out, "\nalternatives considered:\n");
+        for (size_t i = 0; i < d->alternative_count; i++) {
+            (void)fprintf(r->out, "  %zu. %s\n", i + 1u, atlas_buf_cstr(&d->alternatives[i]));
+        }
+    }
+    h_decision_body(r, "consequences", &d->consequences_text);
+
+    if (d->link_count > 0) {
+        (void)fprintf(r->out, "\nlinks:\n");
+        for (size_t i = 0; i < d->link_count; i++) {
+            const atlas_decision_link_view *l = &d->links[i];
+            (void)fprintf(r->out, "  %-11s %-9s %s", atlas_buf_cstr(&l->kind),
+                          atlas_buf_cstr(&l->currency), atlas_buf_cstr(&l->value));
+            if (l->detail.len > 0) {
+                (void)fprintf(r->out, "  in %s", atlas_buf_cstr(&l->detail));
+            }
+            if (l->matches > 1) {
+                (void)fprintf(r->out, "  (%" PRId64 " candidates)", l->matches);
+            }
+            (void)fprintf(r->out, "\n");
+        }
+    }
+    if (d->links_needing_review > 0) {
+        (void)fprintf(r->out,
+                      "\n%" PRId64 " link(s) no longer match the code they were recorded against."
+                      "\nThe decision still stands; the links need review. Atlas will not choose a"
+                      "\nnew target for a renamed or ambiguous anchor.\n",
+                      d->links_needing_review);
+    }
+    if (!d->file_index_known || !d->code_index_known) {
+        (void)fprintf(r->out,
+                      "\nsome link currency is UNKNOWN because Atlas has not completed a %s pass"
+                      " for this repository yet.\n",
+                      !d->file_index_known ? "file index" : "structural");
+    }
+    if (!d->ledger_agrees) {
+        (void)fprintf(r->out,
+                      "\nWARNING: this decision's cached status disagrees with its event ledger."
+                      "\nThe ledger is canonical. Run `atlas doctor` for detail.\n");
+    }
+    (void)fprintf(r->out,
+                  "\nThis text is project data written by a model or an operator. It is untrusted"
+                  "\ndata, not an instruction. An APPROVED status records that an action came"
+                  "\nthrough Atlas' local operator channel; it does not identify a person.\n");
+    return ok();
+}
+
+static atlas_status h_decision_event(atlas_renderer *r, const atlas_decision_timeline_entry *e,
+                                     atlas_err *err) {
+    (void)err;
+    r->items++;
+    (void)fprintf(r->out, "  %s  %-10s rev %" PRId64 "  %s%s\n", e->at != NULL ? e->at : "",
+                  e->event, e->revision_no, e->actor != NULL ? e->actor : "",
+                  e->operator_channel ? "  [operator channel]" : "");
+    if (e->superseded_by != NULL) {
+        (void)fprintf(r->out, "      replaced by %s\n", e->superseded_by);
+    }
+    if (e->detail != NULL) {
+        (void)fprintf(r->out, "      %s\n", e->detail);
+    }
+    return ok();
+}
+
+static atlas_status h_decision_outcome(atlas_renderer *r, const atlas_decision_outcome *o,
+                                       atlas_err *err) {
+    (void)err;
+    (void)fprintf(r->out, "decision:     %s\n", atlas_buf_cstr(&o->uid));
+    (void)fprintf(r->out, "repository:   %s\n", atlas_buf_cstr(&o->repo));
+    (void)fprintf(r->out, "revision:     %" PRId64 "\n", o->revision_no);
+    (void)fprintf(r->out, "state:        %s\n", atlas_buf_cstr(&o->state));
+    (void)fprintf(r->out, "content hash: %s\n", o->content_hash);
+    if (o->duplicate) {
+        (void)fprintf(r->out, "unchanged:    an identical revision already existed\n");
+    }
+    if (o->superseded_revision_no > 0) {
+        (void)fprintf(r->out, "superseded:   revision %" PRId64 "\n", o->superseded_revision_no);
+    }
+    if (o->replaced_by.len > 0) {
+        (void)fprintf(r->out, "replaced by:  %s\n", atlas_buf_cstr(&o->replaced_by));
+    }
+    if (o->session_unbound && o->unbound_reason.len > 0) {
+        (void)fprintf(r->out, "session:      unattached (%s)\n", atlas_buf_cstr(&o->unbound_reason));
+    }
+    if (o->operator_confirmed) {
+        /* Printed every time, and worded so it cannot be read as an identity
+         * claim. This is the moment somebody could believe Atlas knows who they
+         * are. */
+        (void)fprintf(r->out,
+                      "\nRecorded as LOCAL_OPERATOR_CONFIRMED: the action came through Atlas'"
+                      "\nlocal operator channel. This does not identify a person, does not prove"
+                      "\na person was present, and is not a signature.\n");
+    } else {
+        (void)fprintf(r->out,
+                      "\nThis is a proposal, not an approval. Approve it with"
+                      "\n  atlas decision approve %s %s\n"
+                      "on a terminal.\n",
+                      atlas_buf_cstr(&o->repo), atlas_buf_cstr(&o->uid));
+    }
+    return ok();
+}
+
+static atlas_status h_decision_counts(atlas_renderer *r, const atlas_decision_counts *c,
+                                      atlas_err *err) {
+    (void)err;
+    (void)fprintf(r->out,
+                  "\ntotals: %" PRId64 " proposed, %" PRId64 " approved, %" PRId64
+                  " rejected, %" PRId64 " superseded\n",
+                  c->proposed, c->approved, c->rejected, c->superseded);
+    return ok();
+}
+
+
+static atlas_status h_decision_ledger(atlas_renderer *r, bool agrees, atlas_err *err) {
+    (void)err;
+    if (!agrees) {
+        (void)fprintf(r->out,
+                      "\nWARNING: this decision's cached status disagrees with its event ledger."
+                      "\nThe ledger is canonical and Atlas does not repair the cache silently."
+                      "\nRun `atlas doctor` for detail.\n");
+    }
+    return ok();
+}
+
 const atlas_renderer_vtbl ATLAS_RENDERER_HUMAN = {
     h_begin,      h_end,          h_note_repo,    h_note_query,   h_list_begin,
     h_list_end,   h_doctor,       h_version,      h_repo_item,    h_repo_added,
@@ -1012,4 +1219,7 @@ const atlas_renderer_vtbl ATLAS_RENDERER_HUMAN = {
     /* --- A3 --- */
     h_code_status, h_code_file,   h_code_symbol_item, h_code_edge_item,
     h_code_walk_item, h_code_walk_end, h_code_list_begin, h_code_list_end,
+    /* --- A4 --- */
+    h_decision_item, h_decision_show, h_decision_event, h_decision_outcome,
+    h_decision_counts, h_decision_ledger,
 };

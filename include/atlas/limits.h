@@ -286,4 +286,100 @@
 #define ATLAS_CODE_MAX_ROWS 200
 #define ATLAS_CODE_DEFAULT_ROWS 50
 
+/* --- A4: decision documents, revisions and operator approval --------------
+ *
+ * Every one of these is a ceiling on something a model or an operator writes,
+ * and every one of them is reported when it is reached rather than silently
+ * applied. A decision document is durable and canonical, so an unbounded field
+ * here is an unbounded row in the one part of the index that is never rebuilt
+ * from anything.
+ */
+
+/* The public identifier Atlas assigns a decision document: a fixed prefix and
+ * lowercase hex. Bounded, opaque, and composed only of bytes the automatic
+ * context envelope's allowlist already permits, which is what makes it the one
+ * decision-shaped value that may appear there.
+ *
+ * **32 hex characters — 128 bits.** These identifiers are durable, they are
+ * exported into Markdown and JSON that leaves the machine, and databases get
+ * merged, restored from backups and compared across machines. 64 bits is
+ * comfortable for one database and is not comfortable for a population of them:
+ * the birthday bound puts a fifty-percent collision at about four billion
+ * identifiers at 64 bits, and at about two hundred sixty quintillion at 128.
+ * The extra sixteen characters cost nothing anybody will notice.
+ *
+ * It is an **identifier, not a secret**. It is unguessable in practice, and
+ * nothing anywhere treats knowing one as authorisation. */
+#define ATLAS_DECISION_UID_HEX 32u
+#define ATLAS_DECISION_UID_PREFIX "atlas-dec-"
+/* strlen(prefix) + hex + NUL. */
+#define ATLAS_DECISION_UID_MAX (10u + ATLAS_DECISION_UID_HEX + 1u)
+/* How many times a create will re-derive a uid after a UNIQUE collision before
+ * giving up. A collision at 128 bits means the entropy source is broken rather
+ * than that Atlas got unlucky, so the retry exists to survive a transient fault
+ * and the ceiling exists so a broken one is reported instead of spun on. */
+#define ATLAS_DECISION_UID_MAX_ATTEMPTS 8
+
+/* Revision prose. Bounded separately because they are read differently: a title
+ * is shown in a list, the rest only when a caller asks for one document. */
+#define ATLAS_DECISION_TITLE_MAX 200u
+#define ATLAS_DECISION_TEXT_MAX 4096u
+/* Alternatives considered: a list, in the order the proposer gave. */
+#define ATLAS_DECISION_MAX_ALTERNATIVES 16
+#define ATLAS_DECISION_ALTERNATIVE_MAX 512u
+/* Links from one revision to paths, commits, change sets, symbols and other
+ * decision documents, of every kind together. */
+#define ATLAS_DECISION_MAX_LINKS 128
+/* Revisions one document may accumulate. A document that needs more than this
+ * is two documents. */
+#define ATLAS_DECISION_MAX_REVISIONS 1000
+
+/* The searchable projection of one revision. Bounded so that the degraded
+ * (non-FTS5) search is a bounded scan of a narrow table rather than of the
+ * revision prose itself. */
+#define ATLAS_DECISION_HAYSTACK_MAX 2048u
+/* Bytes of a search query Atlas will accept. */
+#define ATLAS_DECISION_QUERY_MAX 128u
+
+/* Rows one decision query may return, and the default when none is asked for. */
+#define ATLAS_DECISION_MAX_ROWS 200
+#define ATLAS_DECISION_DEFAULT_ROWS 50
+/* Timeline events returned for one document. */
+#define ATLAS_DECISION_MAX_EVENTS 500
+
+/* --- the operator channel ---
+ *
+ * A challenge is a short-lived, single-use capability bound to exactly one
+ * (repository, document, revision, content hash) tuple. */
+
+/* Random bytes in a challenge token, hex encoded. */
+#define ATLAS_DECISION_CHALLENGE_BYTES 16u
+#define ATLAS_DECISION_CHALLENGE_HEX (ATLAS_DECISION_CHALLENGE_BYTES * 2u)
+/* How long a challenge is valid. Long enough to read a confirmation prompt,
+ * short enough that one left on a terminal is not a standing capability. */
+#define ATLAS_DECISION_CHALLENGE_TTL_MS 120000
+/* Unconsumed challenges retained before the oldest expired ones are pruned.
+ *
+ * A whole-database bound rather than a per-repository one, and deliberately:
+ * an unspent capability is not a fact about a repository, it is a fixed-size
+ * cost, and a per-repository budget would let the total grow with the number of
+ * registered worktrees. Pruning removes only *expired, unconsumed* rows — a
+ * consumed challenge is part of an approval record and is never removed. */
+#define ATLAS_DECISION_CHALLENGES_RETAIN 200
+/* Hex characters of the content hash the operator must type back. Short enough
+ * to type, long enough that typing it is a deliberate act about one revision. */
+#define ATLAS_DECISION_CONFIRM_HEX 8u
+/* Bytes of the confirmation line read from the terminal. */
+#define ATLAS_DECISION_CONFIRM_MAX 64u
+
+/* Depth of the document-supersession chain Atlas will walk when checking that a
+ * supersession would not create a cycle. A chain longer than this is refused
+ * rather than followed, because an unbounded walk over attacker-influenced
+ * data is not a check. */
+#define ATLAS_DECISION_MAX_SUPERSEDE_DEPTH 64
+
+/* Decision identifiers reported in the automatic file context envelope. Opaque
+ * ids only, and never any decision prose. */
+#define ATLAS_DECISION_CONTEXT_MAX_IDS 8
+
 #endif /* ATLAS_LIMITS_H */

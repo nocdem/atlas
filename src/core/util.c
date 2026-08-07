@@ -44,3 +44,23 @@ void atlas_iso8601_before_now(char *out, size_t out_size, int64_t ms_ago) {
      * expiry sweep against a negative timestamp would match everything. */
     format_iso8601(back > now ? (time_t)0 : now - back, out, out_size);
 }
+
+void atlas_iso8601_after_now(char *out, size_t out_size, int64_t ms_ahead) {
+    if (out == NULL || out_size == 0) {
+        return;
+    }
+    time_t now = time(NULL);
+    time_t ahead = (time_t)(ms_ahead / 1000);
+    /* An expiry that would overflow is clamped to now, which makes the
+     * capability already expired.
+     *
+     * That is the safe direction and it is chosen deliberately: the alternative
+     * — wrapping to a negative or a far-future value — would produce a
+     * capability that never expires, and a never-expiring approval capability
+     * is the one failure mode the TTL exists to prevent. A clamped one simply
+     * has to be asked for again. */
+    if (ahead < 0 || (now > (time_t)0 && ahead > (time_t)INT64_MAX - now)) {
+        ahead = 0;
+    }
+    format_iso8601(now + ahead, out, out_size);
+}

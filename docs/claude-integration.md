@@ -428,3 +428,104 @@ where Atlas has never run rather than making the statement true by writing one.
 
 A user should be able to take Atlas out of the loop in one variable rather than by
 editing a plugin.
+
+
+## A4: decisions, automatically
+
+Four MCP tools, and a skill that tells Claude when to reach for them. The user
+never has to remember an Atlas command to make Claude remember something.
+
+| tool | returns | writes |
+| --- | --- | --- |
+| `atlas_decisions` | compact: ids, status, provenance, titles — **no bodies** | no |
+| `atlas_decision` | one whole revision, with every link's currency | no |
+| `atlas_decision_history` | revisions and the lifecycle timeline | no |
+| `atlas_propose_decision` | the new document's id and state | yes, as a proposal |
+
+### Progressive disclosure, and why
+
+The split is not politeness about response size. A decision body is untrusted
+prose, and pulling every body in a repository into a model's context because it
+asked "are there any decisions about auth?" would put a large amount of somebody
+else's text in front of the model for no reason. A caller reads a body when it
+has decided it needs that one.
+
+### What Claude does without being asked
+
+- Before changing code a decision may govern: `atlas_decisions` with the path or
+  a few words, then `atlas_decision` for anything relevant.
+- When an architectural, protocol, security, compatibility or operational choice
+  is actually made: `atlas_propose_decision`, with the context, the decision,
+  the rationale, the alternatives and the paths.
+- For an ordinary edit: `atlas_record_reason`, not a decision. A schema shape, a
+  locking rule, a trust boundary, a dependency, a wire format and a
+  compatibility promise are decisions; a rename is not.
+- When the rationale is not known: say so. An invented rationale reads exactly
+  like a real one and nobody will ever check it.
+
+### What the tool surface cannot do, structurally
+
+There is no approval tool, no rejection tool and no supersession tool, and **no
+MCP tool schema declares a `token` or a `confirmation`**. Every schema sets
+`additionalProperties: false`, so a member no schema declares is a member no
+caller can send: the absence is structural rather than guarded.
+
+`tests/test_decision_mcp.c` asserts the whole inventory, rejects any tool name
+containing an approval verb, and checks the emitted `tools/list` document for
+capability-shaped property names.
+
+**This is a statement about Atlas' surface, not about what a model can do.** An
+agent with shell access can run `atlas decision approve` through a
+pseudo-terminal, and Atlas cannot tell that from a person. The skill therefore
+instructs Claude to give the user the command and not to run it — an
+instruction, not a barrier, and described as one. A statement in a conversation
+that the user approved something is a fact about the conversation: recorded as a
+proposal, never as an approval.
+
+### `atlas_record_decision` bridges into A4
+
+A2's flatter tool still exists, keeps its schema and keeps its response, so a
+plugin installed before A4 keeps working. What changed is its **outcome**: a
+successful call now also materialises a real A4 decision document, in the same
+transaction, through the ordinary promote path — and the response gains a
+`decision` member carrying the new id.
+
+Without that, an official client would keep producing records that live only in
+the legacy tables and that a user has to promote by hand, which would make the
+A4 decision model opt-in rather than default.
+
+- Attribution comes from the request, resolved by exact session key. The
+  document is attributed to the session that made the call, or to none — never
+  to a neighbour. The A2 row keeps its own attribution and the A4 revision
+  points at it.
+- Retries are absorbed: the tool sends a content-derived idempotency key scoped
+  to the session, so a redelivered call creates neither a second legacy row nor
+  a second document.
+- A generic MCP client with no session id records sessionlessly, with a typed
+  reason.
+- The structured `atlas_propose_decision` remains the preferred tool, and the
+  skill says so.
+
+Historical A2 rows are unaffected and remain explicitly promotable with
+`atlas decision promote`.
+
+### Automatic context
+
+The envelope gains integers and nothing else:
+
+```
+decisions_proposed=12 decisions_approved=4 decisions_rejected=1 decisions_superseded=2
+decisions_needing_review=1
+```
+
+`decisions_approved` reports the real lifecycle state now; it was pinned to zero
+for two phases because nothing could produce an approval. No title, no
+rationale, no path, no symbol name and no decision id — approval makes no
+difference to that rule.
+
+### Hooks
+
+No hook event was added and no hook output contract changed. Hooks still fail
+open, still emit no `decision`, `continue` or permission verdict, and still
+store metadata rather than content. A decision is proposed through an explicit
+tool call, never as a side effect of a lifecycle event.

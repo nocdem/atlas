@@ -321,7 +321,18 @@ static void test_skill_states_the_contract(void) {
     T_CHECK(strstr(text, "atlas_file_context") != NULL);
     T_CHECK(strstr(text, "atlas_record_reason") != NULL);
     T_CHECK(strstr(text, "atlas_record_unknown_reason") != NULL);
-    T_CHECK(strstr(text, "atlas_record_decision") != NULL);
+    /* A4: the structured proposal tool, the read tool, and the sentence that
+     * keeps Claude from claiming it approved something. */
+    T_CHECK(strstr(text, "atlas_propose_decision") != NULL);
+    T_CHECK(strstr(text, "atlas_decisions") != NULL);
+    /* The precise contract, not the overclaim it replaced. The skill used to
+     * say "You cannot approve anything", which is false for an agent with shell
+     * access; what is true is that no Atlas tool approves and that Claude must
+     * not run the command itself. */
+    T_CHECK(strstr(text, "No Atlas tool approves anything") != NULL);
+    T_CHECK(strstr(text, "do not run it yourself") != NULL);
+    T_CHECK(strstr(text, "atlas decision approve") != NULL);
+    T_CHECK(strstr(text, "is not a signature") != NULL);
     T_CHECK(strstr(text, "UNKNOWN") != NULL);
     T_CHECK(strstr(text, "untrusted") != NULL || strstr(text, "UNTRUSTED") != NULL);
     /* And the rule that keeps it from becoming a manual tool again. */
@@ -352,9 +363,14 @@ static void test_documented_tool_names_are_plugin_scoped_correctly(void) {
         /* Nothing here should be scoped or namespaced by Atlas either. */
         T_CHECK(strncmp(names[n], "atlas_", 6u) == 0);
     }
-    /* A2 shipped ten; A3 added six structural ones. Pinned exactly rather than
-     * as a floor, so a tool appearing or vanishing is a deliberate change. */
-    T_CHECK_MSG(n == 16, "expected 16 tools, found %zu", n);
+    /* A2 shipped ten; A3 added six structural ones; A4 added four for decision
+     * documents. Pinned exactly rather than as a floor, so a tool appearing or
+     * vanishing is a deliberate change — which is how this caught A4.
+     *
+     * What A4 did *not* add is the point: there is no approval tool, and
+     * `tests/test_decision_mcp.c` asserts that no tool name contains an
+     * approval verb and no schema declares a capability argument. */
+    T_CHECK_MSG(n == 20, "expected 20 tools, found %zu", n);
 }
 
 /* --- the integration record ----------------------------------------------

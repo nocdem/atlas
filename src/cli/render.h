@@ -15,8 +15,10 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#include "atlas/backup.h"
 #include "atlas/integrate.h"
 #include "atlas/json.h"
+#include "atlas/maintenance.h"
 #include "atlas/safetext.h"
 #include "atlas/service.h"
 #include "atlas/unit.h"
@@ -128,6 +130,26 @@ typedef struct atlas_renderer_vtbl {
      * about the *record* rather than about any one decision, and `decision
      * history` is where a reader would look for it. */
     atlas_status (*decision_ledger)(atlas_renderer *r, bool agrees, atlas_err *err);
+    /* --- A5 ---
+     *
+     * Three shapes for three operations, and `backup restore` reuses the verify
+     * shape twice — once for the backup it was handed and once for the index it
+     * installed — rather than growing a fourth. The two must be described
+     * identically or an operator cannot compare them.
+     *
+     * Every string these receive is Atlas-owned: a path the operator typed
+     * (encoded here, because a path is bytes), a hex digest, a fixed
+     * vocabulary word, or a fixed reason string that is a literal in
+     * src/core/service_maintenance.c. No repository or model text reaches
+     * them. */
+    atlas_status (*backup_created)(atlas_renderer *r, const atlas_backup_report *rep,
+                                   atlas_err *err);
+    atlas_status (*backup_verified)(atlas_renderer *r, const atlas_backup_verify_report *rep,
+                                    const char *key, atlas_err *err);
+    atlas_status (*backup_restored)(atlas_renderer *r, const atlas_backup_restore_report *rep,
+                                    atlas_err *err);
+    atlas_status (*maintenance)(atlas_renderer *r, const atlas_maintenance_report *rep,
+                                atlas_err *err);
 } atlas_renderer_vtbl;
 
 struct atlas_renderer {

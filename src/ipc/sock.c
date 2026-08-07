@@ -21,19 +21,64 @@
 
 /* --- paths --------------------------------------------------------------- */
 
+/* The per-user runtime directory systemd creates, used only when
+ * $XDG_RUNTIME_DIR is absent — and only on proof.
+ *
+ * This is not a relaxation of the "no /tmp fallback" rule; it is the same rule
+ * applied to the one directory that rule already names. `/run/user/<uid>` is
+ * exactly what a login session would have put in $XDG_RUNTIME_DIR, and the
+ * variable's absence is an environment accident rather than evidence that the
+ * directory is unsafe: a non-login SSH invocation, a cron-style launch and a
+ * hook spawned by an editor all reach a machine where it exists and the
+ * variable does not.
+ *
+ * Every property the rule actually relies on is therefore *checked* rather than
+ * assumed: it must exist, not be a symbolic link, be a directory, be owned by
+ * this uid, and grant nothing to group or other. A directory failing any of
+ * those is not used, and the caller gets the same refusal as before.
+ *
+ * `lstat`, not `stat`: following a link here would let whoever could create one
+ * choose the directory, which is the whole failure mode being avoided. */
+static bool systemd_runtime_dir(char *out, size_t out_size) {
+    uid_t uid = getuid();
+    int n = snprintf(out, out_size, "/run/user/%lld", (long long)uid);
+    if (n < 0 || (size_t)n >= out_size) {
+        return false;
+    }
+    struct stat sb;
+    if (lstat(out, &sb) != 0) {
+        return false;
+    }
+    if (!S_ISDIR(sb.st_mode) || S_ISLNK(sb.st_mode)) {
+        return false;
+    }
+    if (sb.st_uid != uid) {
+        return false;
+    }
+    if ((sb.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
+        return false;
+    }
+    return true;
+}
+
 atlas_status atlas_ipc_runtime_dir(atlas_buf *out, atlas_err *err) {
     atlas_buf_reset(out);
     const char *xdg = getenv("XDG_RUNTIME_DIR");
+    char discovered[64];
+    if ((xdg == NULL || xdg[0] == '\0') && systemd_runtime_dir(discovered, sizeof discovered)) {
+        xdg = discovered;
+    }
     if (xdg == NULL || xdg[0] == '\0') {
-        /* No /tmp fallback. $XDG_RUNTIME_DIR is a per-user directory the system
-         * guarantees is 0700 and cleaned up at logout; /tmp is neither, and an
-         * endpoint that can mutate the index does not belong in a directory
-         * every local user can write to. Say what to do instead of degrading. */
+        /* Still no /tmp fallback. $XDG_RUNTIME_DIR is a per-user directory the
+         * system guarantees is 0700 and cleaned up at logout; /tmp is neither,
+         * and an endpoint that can mutate the index does not belong in a
+         * directory every local user can write to. Say what to do instead of
+         * degrading. */
         return atlas_err_set(err, ATLAS_ERR_CONFIG,
-                             "XDG_RUNTIME_DIR is not set, so there is no private per-user runtime "
-                             "directory for the Atlas socket. Atlas does not fall back to /tmp. "
-                             "On a systemd machine this is normally /run/user/%lld: log in through "
-                             "a session that creates it, or export XDG_RUNTIME_DIR to a directory "
+                             "XDG_RUNTIME_DIR is not set and /run/user/%lld is not a private "
+                             "directory owned by this user, so there is no runtime directory for "
+                             "the Atlas socket. Atlas does not fall back to /tmp. Log in through "
+                             "a session that creates one, or export XDG_RUNTIME_DIR to a directory "
                              "you own with mode 0700.",
                              (long long)getuid());
     }

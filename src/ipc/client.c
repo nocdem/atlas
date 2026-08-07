@@ -14,6 +14,8 @@
 
 #include "atlas/ipc.h"
 
+#include "atlas/safetext.h"
+
 /* Builds the request document.
  *
  * `method` is a compile-time constant from Atlas' own dispatch table and
@@ -83,6 +85,42 @@ atlas_status atlas_ipc_call_timeout(const char *socket_path, const char *method,
     }
     (void)close(fd);
     return st;
+}
+
+bool atlas_ipc_daemon_owns(const char *data_dir) {
+    if (data_dir == NULL || data_dir[0] == '\0') {
+        return false;
+    }
+    atlas_err err;
+    atlas_err_init(&err);
+    atlas_buf sock = ATLAS_BUF_INIT;
+    atlas_buf resp = ATLAS_BUF_INIT;
+    bool owns = false;
+    if (atlas_ipc_socket_path(&sock, &err) == ATLAS_OK &&
+        atlas_ipc_call(atlas_buf_cstr(&sock), "daemon.ping", "{}", &resp, &err) == ATLAS_OK) {
+        /* The comparison is on the encoded form, because that is what the
+         * daemon reports and encoding is reversible and total: two paths are
+         * the same bytes exactly when their encodings are the same bytes. */
+        atlas_safe_pool pool;
+        atlas_safe_pool_init(&pool);
+        const char *want = atlas_safe(&pool, data_dir);
+        size_t want_len = strlen(want);
+        const char *found = strstr(atlas_buf_cstr(&resp), "\"data_dir\":\"");
+        if (found != NULL) {
+            found += 12;
+            const char *end = strchr(found, '"');
+            /* Absent, empty, or from a daemon too old to say: not a match, so
+             * the caller does the work itself. Failing closed here costs a
+             * local lock acquisition; failing open costs somebody else's
+             * index. */
+            owns = end != NULL && (size_t)(end - found) == want_len &&
+                   memcmp(found, want, want_len) == 0;
+        }
+        atlas_safe_pool_free(&pool);
+    }
+    atlas_buf_free(&resp);
+    atlas_buf_free(&sock);
+    return owns;
 }
 
 bool atlas_ipc_daemon_reachable(void) {

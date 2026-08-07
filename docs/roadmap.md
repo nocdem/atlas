@@ -223,7 +223,34 @@ and neither is a graph edge. A decision has to be recorded to be reported as one
 Full detail and the explicit non-claims are in
 [decision-lifecycle.md](decision-lifecycle.md).
 
-## A5 — clangd and toolchain truth
+## A5 — operational durability (shipped)
+
+A5 was renumbered, and the reason is worth recording. The slot originally held
+"clangd and toolchain truth". By the end of A4 Atlas held something no
+repository could rebuild — decision documents, immutable revisions, a lifecycle
+ledger, AI reasons and their attribution — and had no way to back any of it up
+that was not "copy `atlas.db` and hope the daemon was idle". Making the
+structural graph more precise before making the record survivable would have
+been improving the part that was already reconstructible.
+
+What shipped:
+
+- `atlas backup create|verify|restore` — an online snapshot through SQLite's
+  backup API from a read-only connection, so a running daemon keeps writing;
+  verification that creates nothing and rehashes every decision revision; and an
+  atomic restore that keeps what it displaced and leaves the original
+  byte-identical through every failure.
+- `atlas maintenance plan|prune` — every table classified with a written reason,
+  exactly one of them prunable, no background deleter.
+- No RPC method, no MCP tool and no hook for any of it. A model cannot back up,
+  restore or prune the index, and the absence is structural.
+- No schema change. A5 stays at schema 6.
+
+Full detail and the explicit non-claims are in [operations.md](operations.md).
+
+## Future: clangd and toolchain truth
+
+Deferred from A5 rather than dropped:
 
 - integrate `clangd` as a subprocess through the existing safe process API, with
   the same argv allowlist treatment Git gets

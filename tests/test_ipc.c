@@ -273,10 +273,38 @@ static void test_runtime_dir_requires_xdg(void) {
     char *copy = (saved != NULL) ? strdup(saved) : NULL;
 
     (void)unsetenv("XDG_RUNTIME_DIR");
-    /* No /tmp fallback, and the message has to say what to do instead. */
-    T_FAILS_WITH(atlas_ipc_runtime_dir(&out, &err), ATLAS_ERR_CONFIG, &err);
-    T_CHECK(strstr(atlas_err_msg(&err), "/tmp") != NULL);
-    T_CHECK(strstr(atlas_err_msg(&err), "XDG_RUNTIME_DIR") != NULL);
+    /* With the variable absent, Atlas falls back to the one directory a login
+     * session would have named — and only after proving it is private. Which
+     * branch this machine takes is decided here rather than skipped, so the
+     * assertion is exact either way.
+     *
+     * The properties checked here are the properties the fallback checks: a
+     * directory, not a link, owned by this uid, nothing for group or other.
+     * There is still no /tmp fallback, and the refusal has to say so. */
+    char probe[64];
+    (void)snprintf(probe, sizeof probe, "/run/user/%lld", (long long)getuid());
+    struct stat rsb;
+    bool qualifies = lstat(probe, &rsb) == 0 && S_ISDIR(rsb.st_mode) && !S_ISLNK(rsb.st_mode) &&
+                     rsb.st_uid == getuid() && (rsb.st_mode & (S_IRWXG | S_IRWXO)) == 0;
+    if (qualifies) {
+        char want[80];
+        (void)snprintf(want, sizeof want, "%s/atlas", probe);
+        T_OK(atlas_ipc_runtime_dir(&out, &err), &err);
+        T_EQ_STR(atlas_buf_cstr(&out), want);
+    } else {
+        T_FAILS_WITH(atlas_ipc_runtime_dir(&out, &err), ATLAS_ERR_CONFIG, &err);
+        T_CHECK(strstr(atlas_err_msg(&err), "/tmp") != NULL);
+        T_CHECK(strstr(atlas_err_msg(&err), "XDG_RUNTIME_DIR") != NULL);
+    }
+
+    /* A directory that is not private is never used, whatever its name. The
+     * fallback only ever considers /run/user/<uid>, so this is checked by
+     * pointing the variable at a world-writable directory and confirming that
+     * the *explicit* path is still taken verbatim — the fallback is not a
+     * second opinion about a path the caller gave. */
+    (void)setenv("XDG_RUNTIME_DIR", "/tmp", 1);
+    T_OK(atlas_ipc_runtime_dir(&out, &err), &err);
+    T_EQ_STR(atlas_buf_cstr(&out), "/tmp/atlas");
 
     (void)setenv("XDG_RUNTIME_DIR", "relative/path", 1);
     T_FAILS_WITH(atlas_ipc_runtime_dir(&out, &err), ATLAS_ERR_CONFIG, &err);
@@ -396,7 +424,8 @@ static const atlas_test TESTS[] = {
     {"malformed requests are refused", test_request_malformed},
     {"request nesting depth is bounded", test_request_depth_bounded},
     {"hostile ids are encoded and bounded", test_request_hostile_strings},
-    {"the runtime directory requires XDG_RUNTIME_DIR", test_runtime_dir_requires_xdg},
+    {"the runtime directory is private, from the environment or from /run/user",
+     test_runtime_dir_requires_xdg},
     {"socket permissions and path collisions", test_listen_permissions_and_collisions},
     {"a symlinked runtime directory is refused", test_runtime_dir_rejects_symlink},
 };

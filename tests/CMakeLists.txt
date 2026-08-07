@@ -89,6 +89,10 @@ set(ATLAS_TESTS
   test_decision_operator
   test_decision_mcp
   test_decision_bridge
+  # --- A5 ---
+  test_backup
+  test_maintenance
+  test_backup_live
 )
 
 foreach(test_name IN LISTS ATLAS_TESTS)
@@ -135,11 +139,22 @@ set_tests_properties(test_ai_trust test_hooks test_mcp_roots test_ai_attribution
   test_decision_bridge
   PROPERTIES LABELS "daemon" TIMEOUT 900 RUN_SERIAL TRUE)
 
+# A5. Backup builds a real repository and drives the binary; maintenance drives
+# the storage layer and the binary. Neither forks a daemon — the live-daemon
+# cases (an online snapshot, and a restore refused while a daemon holds the
+# lock) are in test_backup_live, which carries the daemon label and its
+# serialisation.
+set_tests_properties(test_backup test_maintenance PROPERTIES LABELS "integration")
+set_tests_properties(test_backup_live PROPERTIES LABELS "daemon" TIMEOUT 900 RUN_SERIAL TRUE)
+
 # The plugin fixture test reads the shipped plugin from the source tree, so it
 # has to be told where that is rather than guessing from the working directory.
 # The claim tripwire reads Atlas' own documentation and source, so it has to be
 # told where the source tree is rather than guessing from the working directory.
 target_compile_definitions(test_decision_mcp PRIVATE ATLAS_SRC_DIR="${CMAKE_SOURCE_DIR}")
+# A5 has its own claim tripwire, over the operational documentation and the
+# backup and maintenance source, for the same reason and by the same device.
+target_compile_definitions(test_backup PRIVATE ATLAS_SRC_DIR="${CMAKE_SOURCE_DIR}")
 
 target_compile_definitions(test_plugin PRIVATE
   ATLAS_PLUGIN_DIR="${CMAKE_SOURCE_DIR}/integrations/claude/atlas"

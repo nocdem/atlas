@@ -7,6 +7,7 @@
  */
 #include <fcntl.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -43,6 +44,17 @@ static void config_pop(scoped_config *sc) {
     sc->saved = NULL;
 }
 
+/* True when `name` appears as a directive rather than inside a comment.
+ *
+ * The distinction matters because the unit *explains* the directives it leaves
+ * out, so the word appears either way. A directive starts a line; a comment
+ * starts with '#'. */
+static bool has_directive(const char *unit, const char *name) {
+    char needle[64];
+    (void)snprintf(needle, sizeof needle, "\n%s=", name);
+    return strstr(unit, needle) != NULL;
+}
+
 static void test_render_contents(void) {
     atlas_err err;
     atlas_err_init(&err);
@@ -62,6 +74,39 @@ static void test_render_contents(void) {
                 "RuntimeDirectoryMode=0700 is required");
     T_CHECK_MSG(strstr(s, "loginctl enable-linger") != NULL,
                 "the unit should document the lingering requirement");
+
+    /* Directives a *user* manager cannot apply must be absent rather than
+     * present and ineffective.
+     *
+     * `ProtectKernelModules=yes` is the one that matters: it needs
+     * CAP_SYS_MODULE dropped from the bounding set, which an unprivileged
+     * manager may not do, and it does not degrade — the unit fails outright
+     * with 218/CAPABILITIES and the daemon never starts. It was in the shipped
+     * unit until the A5 pilot tried to start it, because every test of the unit
+     * until then had been a test of the text.
+     *
+     * `PrivateNetwork=yes` and `IPAddressDeny=any` do degrade: the manager
+     * refuses them and carries on. That is worse in a different way — a
+     * protection that reads as a guarantee and is none. Atlas still performs no
+     * network access, which scripts/adversarial.sh checks from outside under
+     * strace and which does not depend on either. */
+    T_CHECK_MSG(!has_directive(s, "ProtectKernelModules"),
+                "ProtectKernelModules cannot be applied by a user manager and makes the unit "
+                "fail with 218/CAPABILITIES");
+    T_CHECK_MSG(!has_directive(s, "PrivateNetwork"),
+                "PrivateNetwork is silently ignored by a user manager; do not claim it");
+    T_CHECK_MSG(!has_directive(s, "IPAddressDeny"),
+                "IPAddressDeny is silently ignored by a user manager; do not claim it");
+    /* The unit says *why* each is absent, so an operator reading it is not left
+     * to wonder whether somebody forgot. That is also why the check above is
+     * for a directive rather than for the word: the explanation names them. */
+    T_CHECK_MSG(strstr(s, "218/CAPABILITIES") != NULL,
+                "the unit should say what ProtectKernelModules would do here");
+    /* The hardening a user manager *can* apply is still there. */
+    T_CHECK_MSG(strstr(s, "NoNewPrivileges=yes") != NULL, "NoNewPrivileges is required");
+    T_CHECK_MSG(strstr(s, "ProtectSystem=strict") != NULL, "ProtectSystem=strict is required");
+    T_CHECK_MSG(strstr(s, "SystemCallFilter=@system-service") != NULL,
+                "the system-call filter is required");
 
     /* Never root, and never a shell. */
     T_CHECK_MSG(strstr(s, "User=root") == NULL, "the unit must not name root");

@@ -174,6 +174,83 @@ else
     bad "repository state changed by read commands"
 fi
 
+echo "== A5: backup, verification, restore and maintenance"
+
+capture --json backup create "$WORK/smoke.db" \
+    && check_doc "backup create" --expect command="backup create" --expect-raw ok=true \
+                 --expect-raw encrypted=false --expect-raw contains_configuration=false \
+                 --no-control
+capture --json backup verify "$WORK/smoke.db" \
+    && check_doc "backup verify" --expect command="backup verify" --expect verdict=ok \
+                 --expect-raw usable=true --no-control
+
+# Refusing to overwrite is the default, and a refusal must still be one valid
+# document with a usage exit code.
+if $A --json backup create "$WORK/smoke.db" > "$DOC" 2> /dev/null; then
+    bad "backup create overwrote an existing file without --force"
+else
+    rc=$?
+    if [ "$rc" -eq 2 ] && "$JSONCHECK" --expect-raw ok=false < "$DOC" > /dev/null; then
+        ok "backup create refuses to overwrite (exit 2, one document)"
+    else
+        bad "backup create refusal: exit $rc"
+    fi
+fi
+$A backup create "$WORK/smoke.db" --force > /dev/null && ok "--force replaces it"
+
+# An unusable backup is an answer: a complete document, then a non-zero exit.
+printf 'not a database' > "$WORK/junk.db"
+if $A --json backup verify "$WORK/junk.db" > "$DOC" 2> /dev/null; then
+    bad "a junk file verified as usable"
+else
+    rc=$?
+    if [ "$rc" -eq 7 ] && "$JSONCHECK" --expect verdict=not_sqlite < "$DOC" > /dev/null; then
+        ok "backup verify refuses a non-database (exit 7, one document)"
+    else
+        bad "backup verify refusal: exit $rc"
+    fi
+fi
+
+# Restore only ever into an isolated directory here; the smoke fixture's own
+# index is never replaced.
+mkdir -p "$WORK/restored"
+if $ATLAS --data-dir "$WORK/restored" --json backup restore "$WORK/smoke.db" --yes > "$DOC" \
+       2> /dev/null; then
+    check_doc "backup restore (isolated)" --expect command="backup restore" \
+              --expect-raw ok=true --expect-raw published=true \
+              --expect-raw restored_runtime_state=false --no-control
+else
+    bad "backup restore into an isolated data directory failed"
+fi
+# And the restored index answers the same question the source does.
+src_repos="$($A --json repo list | tr ',' '\n' | grep -c '"name":' || true)"
+dst_repos="$($ATLAS --data-dir "$WORK/restored" --json repo list | tr ',' '\n' \
+    | grep -c '"name":' || true)"
+if [ "$src_repos" = "$dst_repos" ]; then
+    ok "the restored index lists the same repositories"
+else
+    bad "restored index lists $dst_repos repositories, source lists $src_repos"
+fi
+
+# Restore is refused without --yes, and refused for a backup that does not
+# verify. Neither may create a database.
+if $ATLAS --data-dir "$WORK/never" backup restore "$WORK/smoke.db" > /dev/null 2>&1; then
+    bad "backup restore ran without --yes"
+elif [ -e "$WORK/never/atlas.db" ]; then
+    bad "a refused restore created a database"
+else
+    ok "backup restore refuses without --yes and creates nothing"
+fi
+
+capture --json maintenance plan --older-than 30 \
+    && check_doc "maintenance plan" --expect command="maintenance plan" \
+                 --expect-raw applied=false --expect-raw prunable_tables=1 --no-control
+if $A maintenance prune --older-than 30 > /dev/null 2>&1; then
+    bad "maintenance prune ran without --apply"
+else
+    ok "maintenance prune refuses without --apply"
+fi
+
 echo "== sqlite integrity"
 if command -v sqlite3 > /dev/null 2>&1; then
     integrity="$(sqlite3 "$DATA/atlas.db" 'PRAGMA integrity_check; PRAGMA foreign_key_check;')"

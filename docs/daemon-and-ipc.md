@@ -62,6 +62,20 @@ falls back to a read-only handle when the daemon holds it. That is what lets
 $XDG_RUNTIME_DIR/atlas/atlas.sock
 ```
 
+When `$XDG_RUNTIME_DIR` is not set, Atlas looks at `/run/user/<uid>` — the
+directory a login session would have named — and uses it **only on proof**: it
+must exist, not be a symbolic link, be a directory, be owned by this uid, and
+grant nothing to group or other. `lstat` rather than `stat`, because following a
+link there would let whoever could create one choose the directory.
+
+That is not a relaxation of the rule below; it is the same rule applied to the
+one path that rule already names. The variable's absence is an environment
+accident rather than evidence the directory is unsafe: a non-login SSH
+invocation, a scheduled launch and a hook spawned by an editor all reach a
+machine where `/run/user/<uid>` exists and the variable does not, and without
+the fallback every hook on such a machine reports the daemon unreachable while
+the daemon is running perfectly.
+
 - runtime directory: created 0700, verified to be a directory we own with no
   group or other access, and refused if it is a symlink
 - socket: bound under `umask(0077)`, then `chmod` 0600, then **verified** — a
@@ -75,10 +89,10 @@ because they fail differently — a permission mistake, a bind mount, or a
 descriptor handed over by a more privileged process would each defeat exactly one
 of them.
 
-**There is no `/tmp` fallback.** A missing `XDG_RUNTIME_DIR` is an actionable
-error that names the likely path and what to do, not a downgrade to a
-world-writable directory. An endpoint that can mutate an index does not belong
-somewhere every local user can write.
+**There is still no `/tmp` fallback.** When neither `$XDG_RUNTIME_DIR` nor a
+private `/run/user/<uid>` is available, that is an actionable error naming both
+and what to do — never a downgrade to a world-writable directory. An endpoint
+that can mutate an index does not belong somewhere every local user can write.
 
 ### Removing a socket that is in the way
 

@@ -1049,11 +1049,14 @@ static atlas_status apply_op(atlas_ctx *ctx, atlas_decision_op *op, atlas_decisi
     atlas_buf resp = ATLAS_BUF_INIT;
     atlas_ipc_response *r = NULL;
     atlas_status st = atlas_ipc_socket_path(&sock, err);
-    if (st == ATLAS_OK && !atlas_ipc_daemon_reachable()) {
+    /* Owning this data directory, not merely answering: a daemon on another
+     * index cannot apply this write, and asking it to would put the record in
+     * the wrong place. */
+    if (st == ATLAS_OK && !atlas_ipc_daemon_owns(atlas_ctx_data_dir(ctx))) {
         st = atlas_err_set(err, ATLAS_ERR_INTEGRITY,
-                           "another Atlas writer owns the index and no daemon is answering on the "
-                           "IPC socket. Start the daemon (systemctl --user start atlas) or wait "
-                           "for the other command to finish.");
+                           "another Atlas writer owns this index and no daemon for it is answering "
+                           "on the IPC socket. Start the daemon (systemctl --user start atlas) or "
+                           "wait for the other command to finish.");
     }
     if (st == ATLAS_OK) {
         st = op_to_params(op, &params, err);

@@ -1209,6 +1209,143 @@ static atlas_status h_decision_ledger(atlas_renderer *r, bool agrees, atlas_err 
     return ok();
 }
 
+/* --- A5 ------------------------------------------------------------------
+ *
+ * Paths here were typed by the operator, so they are bytes and are encoded like
+ * any other path. Digests, verdict words and class names come from fixed
+ * vocabularies; the retention reasons are string literals in
+ * src/core/service_maintenance.c. Nothing from a repository or a model reaches
+ * these functions. */
+
+static void h_verify_body(atlas_renderer *r, const atlas_backup_verify_report *rep,
+                          const char *indent) {
+    FILE *o = r->out;
+    (void)fprintf(o, "%sverdict:      %s\n", indent, atlas_backup_verdict_name(rep->verdict));
+    (void)fprintf(o, "%ssize:         %" PRId64 " bytes\n", indent, rep->size_bytes);
+    (void)fprintf(o, "%ssha256:       %s\n", indent, rep->sha256);
+    (void)fprintf(o, "%sschema:       %d (this build supports %d)\n", indent, rep->schema_version,
+                  rep->expected_schema_version);
+    (void)fprintf(o, "%sintegrity:    %s\n", indent,
+                  atlas_safe(&r->safe, atlas_buf_cstr(&rep->integrity)));
+    (void)fprintf(o, "%sforeign keys: %s\n", indent,
+                  atlas_safe(&r->safe, atlas_buf_cstr(&rep->foreign_key_check)));
+    (void)fprintf(o, "%stables:       %" PRId64 " of %" PRId64 " required\n", indent,
+                  rep->tables_present, rep->tables_required);
+    (void)fprintf(o, "%srepositories: %" PRId64 "\n", indent, rep->repo_count);
+    (void)fprintf(o,
+                  "%sdecisions:    %" PRId64 " revision(s) rehashed, %" PRId64
+                  " content mismatch(es), %" PRId64 " ledger disagreement(s)\n",
+                  indent, rep->revisions_rehashed, rep->revisions_corrupt, rep->ledger_mismatched);
+    if (rep->problems.len > 0) {
+        (void)fprintf(o, "%sproblems:\n", indent);
+        const char *p = atlas_buf_cstr(&rep->problems);
+        while (*p != '\0') {
+            const char *nl = strchr(p, '\n');
+            size_t len = (nl != NULL) ? (size_t)(nl - p) : strlen(p);
+            (void)fprintf(o, "%s  - %s\n", indent, atlas_safe_n(&r->safe, p, len));
+            if (nl == NULL) {
+                break;
+            }
+            p = nl + 1;
+        }
+    }
+}
+
+static atlas_status h_backup_created(atlas_renderer *r, const atlas_backup_report *rep,
+                                     atlas_err *err) {
+    (void)err;
+    FILE *o = r->out;
+    (void)fprintf(o, "backup:  %s\n", atlas_safe(&r->safe, atlas_buf_cstr(&rep->path)));
+    (void)fprintf(o, "source:  %s%s\n", atlas_safe(&r->safe, atlas_buf_cstr(&rep->source_db_path)),
+                  rep->source_online ? "  (taken while a daemon held the writer lock)" : "");
+    (void)fprintf(o, "size:    %" PRId64 " bytes (%" PRId64 " pages of %" PRId64 ")\n",
+                  rep->size_bytes, rep->page_count, rep->page_size);
+    (void)fprintf(o, "sha256:  %s\n", rep->sha256);
+    (void)fprintf(o, "atlas:   %s, schema %d\n", rep->atlas_version, rep->schema_version);
+    (void)fprintf(o,
+                  "note:    the database only. Configuration, the runtime socket and the service "
+                  "unit are not database content and are not in this file. It is not encrypted "
+                  "and not signed.\n");
+    return ok();
+}
+
+static atlas_status h_backup_verified(atlas_renderer *r, const atlas_backup_verify_report *rep,
+                                      const char *key, atlas_err *err) {
+    (void)err;
+    (void)fprintf(r->out, "%s: %s\n", key != NULL ? key : "backup",
+                  atlas_safe(&r->safe, atlas_buf_cstr(&rep->path)));
+    h_verify_body(r, rep, "  ");
+    (void)fprintf(r->out, "status: %s\n", rep->ok ? "ok" : "NOT USABLE");
+    return ok();
+}
+
+static atlas_status h_backup_restored(atlas_renderer *r, const atlas_backup_restore_report *rep,
+                                      atlas_err *err) {
+    (void)err;
+    FILE *o = r->out;
+    (void)fprintf(o, "restored: %s\n", atlas_safe(&r->safe, atlas_buf_cstr(&rep->db_path)));
+    (void)fprintf(o, "from:     %s\n", atlas_safe(&r->safe, atlas_buf_cstr(&rep->source.path)));
+    if (rep->recovery_made) {
+        (void)fprintf(o, "replaced: kept at %s\n",
+                      atlas_safe(&r->safe, atlas_buf_cstr(&rep->recovery_path)));
+    } else {
+        (void)fprintf(o, "replaced: nothing (the data directory held no index)\n");
+    }
+    if (rep->removed_wal || rep->removed_shm) {
+        (void)fprintf(o, "sidecars: removed the previous database's%s%s\n",
+                      rep->removed_wal ? " write-ahead log" : "",
+                      rep->removed_shm ? " shared-memory index" : "");
+    }
+    (void)fprintf(o, "schema:   %d%s\n", rep->schema_after,
+                  rep->migrated ? " (migrated forward after restore)" : "");
+    (void)fprintf(o, "backup as verified before anything moved:\n");
+    h_verify_body(r, &rep->source, "  ");
+    (void)fprintf(o, "index as verified in place:\n");
+    h_verify_body(r, &rep->installed, "  ");
+    (void)fprintf(o,
+                  "note:     the runtime socket, the service unit and the Claude integration are "
+                  "not database content and were not restored. Start the daemon again yourself.\n");
+    (void)fprintf(o, "status: %s\n", rep->installed.ok ? "ok" : "attention needed");
+    return ok();
+}
+
+static atlas_status h_maintenance(atlas_renderer *r, const atlas_maintenance_report *rep,
+                                  atlas_err *err) {
+    (void)err;
+    FILE *o = r->out;
+    (void)fprintf(o, "mode:    %s\n", rep->applied ? "prune (applied)" : "plan (nothing written)");
+    (void)fprintf(o, "cutoff:  rows created before %s (%" PRId64 " days)\n", rep->cutoff,
+                  rep->older_than_days);
+    (void)fprintf(o, "floor:   the newest %" PRId64 " events per repository are always kept\n",
+                  rep->retain_per_repo);
+    (void)fprintf(o, "\n%-24s %-12s %-9s %10s %10s %10s\n", "table", "class", "prunable", "rows",
+                  "eligible", "removed");
+    for (size_t i = 0; i < rep->table_count; i++) {
+        const atlas_maintenance_row *t = &rep->tables[i];
+        if (!t->counted) {
+            (void)fprintf(o, "%-24s %-12s %-9s %10s %10s %10s\n", t->table,
+                          atlas_retention_class_name(t->cls), t->prunable ? "yes" : "no", "-", "-",
+                          "-");
+            continue;
+        }
+        (void)fprintf(o, "%-24s %-12s %-9s %10" PRId64 " %10" PRId64 " %10" PRId64 "\n", t->table,
+                      atlas_retention_class_name(t->cls), t->prunable ? "yes" : "no",
+                      t->rows_before, t->rows_eligible, t->rows_removed);
+    }
+    (void)fprintf(o, "\ntotals:  %" PRId64 " rows, %" PRId64 " eligible, %" PRId64 " removed\n",
+                  rep->total_rows, rep->total_eligible, rep->total_removed);
+    (void)fprintf(o, "         %zu table(s) prunable, %zu protected from every automatic rule\n",
+                  rep->prunable_tables, rep->protected_tables);
+    (void)fprintf(o, "\nwhy each table is classified as it is:\n");
+    for (size_t i = 0; i < rep->table_count; i++) {
+        (void)fprintf(o, "  %-24s %s\n", rep->tables[i].table, rep->tables[i].reason);
+    }
+    if (!rep->applied) {
+        (void)fprintf(o, "\nnothing was written. Re-run with --apply to remove the eligible rows.\n");
+    }
+    return ok();
+}
+
 const atlas_renderer_vtbl ATLAS_RENDERER_HUMAN = {
     h_begin,      h_end,          h_note_repo,    h_note_query,   h_list_begin,
     h_list_end,   h_doctor,       h_version,      h_repo_item,    h_repo_added,
@@ -1222,4 +1359,6 @@ const atlas_renderer_vtbl ATLAS_RENDERER_HUMAN = {
     /* --- A4 --- */
     h_decision_item, h_decision_show, h_decision_event, h_decision_outcome,
     h_decision_counts, h_decision_ledger,
+    /* --- A5 --- */
+    h_backup_created, h_backup_verified, h_backup_restored, h_maintenance,
 };

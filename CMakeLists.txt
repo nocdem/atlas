@@ -159,6 +159,15 @@ add_library(atlas_core STATIC
   src/core/terminal.c
   src/core/service_decision.c
   src/ipc/server_decision.c
+  # --- A5: operational backup, verification, restore and maintenance -----
+  #
+  # There is deliberately no src/ipc file here. Backup, restore and
+  # maintenance are local CLI operations with no RPC method, so nothing
+  # reachable from MCP or a hook can replace or prune the index.
+  src/db/db_backup.c
+  src/core/service_backup.c
+  src/db/db_maintenance.c
+  src/core/service_maintenance.c
 )
 
 target_include_directories(atlas_core

@@ -1129,6 +1129,139 @@ static atlas_status j_decision_ledger(atlas_renderer *r, bool agrees, atlas_err 
     return atlas_json_key_bool(r->j, "ledger_agrees", agrees, err);
 }
 
+/* --- A5 ------------------------------------------------------------------
+ *
+ * Paths were typed by the operator and are bytes, so they go through
+ * `json_safe` like every other path. Digests, verdicts, class names and the
+ * retention reasons are Atlas-owned fixed text. */
+
+static atlas_status j_verify_body(atlas_json *j, atlas_safe_pool *p,
+                                  const atlas_backup_verify_report *rep, atlas_err *err) {
+    TRY(json_safe(j, p, "path", atlas_buf_cstr(&rep->path), err));
+    TRY(atlas_json_key_str(j, "verdict", atlas_backup_verdict_name(rep->verdict), err));
+    TRY(atlas_json_key_bool(j, "usable", rep->ok, err));
+    TRY(atlas_json_key_int(j, "size_bytes", rep->size_bytes, err));
+    TRY(atlas_json_key_str(j, "sha256", rep->sha256, err));
+    TRY(atlas_json_key_int(j, "schema_version", rep->schema_version, err));
+    TRY(atlas_json_key_int(j, "expected_schema_version", rep->expected_schema_version, err));
+    TRY(json_safe(j, p, "integrity_check", atlas_buf_cstr(&rep->integrity), err));
+    TRY(json_safe(j, p, "foreign_key_check", atlas_buf_cstr(&rep->foreign_key_check), err));
+    TRY(atlas_json_key_int(j, "tables_required", rep->tables_required, err));
+    TRY(atlas_json_key_int(j, "tables_present", rep->tables_present, err));
+    TRY(json_safe(j, p, "missing_tables", atlas_buf_cstr(&rep->missing_tables), err));
+    TRY(atlas_json_key_int(j, "repositories", rep->repo_count, err));
+    TRY(atlas_json_key_int(j, "decision_documents_checked", rep->revisions_checked, err));
+    TRY(atlas_json_key_int(j, "decision_revisions_rehashed", rep->revisions_rehashed, err));
+    TRY(atlas_json_key_int(j, "decision_revisions_corrupt", rep->revisions_corrupt, err));
+    TRY(atlas_json_key_int(j, "decision_ledger_mismatched", rep->ledger_mismatched, err));
+    TRY(atlas_json_key(j, "problems", err));
+    TRY(atlas_json_arr_begin(j, err));
+    const char *text = atlas_buf_cstr(&rep->problems);
+    while (*text != '\0') {
+        const char *nl = strchr(text, '\n');
+        size_t len = (nl != NULL) ? (size_t)(nl - text) : strlen(text);
+        TRY(atlas_json_str(j, atlas_safe_n(p, text, len), err));
+        if (nl == NULL) {
+            break;
+        }
+        text = nl + 1;
+    }
+    return atlas_json_arr_end(j, err);
+}
+
+static atlas_status j_backup_created(atlas_renderer *r, const atlas_backup_report *rep,
+                                     atlas_err *err) {
+    atlas_json *j = r->j;
+    atlas_safe_pool *p = &r->safe;
+    TRY(atlas_json_key(j, "backup", err));
+    TRY(atlas_json_obj_begin(j, err));
+    TRY(json_safe(j, p, "path", atlas_buf_cstr(&rep->path), err));
+    TRY(json_safe(j, p, "source_db_path", atlas_buf_cstr(&rep->source_db_path), err));
+    TRY(atlas_json_key_bool(j, "source_online", rep->source_online, err));
+    TRY(atlas_json_key_int(j, "size_bytes", rep->size_bytes, err));
+    TRY(atlas_json_key_str(j, "sha256", rep->sha256, err));
+    TRY(atlas_json_key_str(j, "atlas_version", rep->atlas_version, err));
+    TRY(atlas_json_key_int(j, "schema_version", rep->schema_version, err));
+    TRY(atlas_json_key_int(j, "page_size", rep->page_size, err));
+    TRY(atlas_json_key_int(j, "page_count", rep->page_count, err));
+    /* Stated as fields rather than left to a reader's assumption. */
+    TRY(atlas_json_key_bool(j, "contains_configuration", false, err));
+    TRY(atlas_json_key_bool(j, "encrypted", false, err));
+    TRY(atlas_json_key_bool(j, "signed", false, err));
+    return atlas_json_obj_end(j, err);
+}
+
+static atlas_status j_backup_verified(atlas_renderer *r, const atlas_backup_verify_report *rep,
+                                      const char *key, atlas_err *err) {
+    atlas_json *j = r->j;
+    TRY(atlas_json_key(j, key != NULL ? key : "backup", err));
+    TRY(atlas_json_obj_begin(j, err));
+    TRY(j_verify_body(j, &r->safe, rep, err));
+    return atlas_json_obj_end(j, err);
+}
+
+static atlas_status j_backup_restored(atlas_renderer *r, const atlas_backup_restore_report *rep,
+                                      atlas_err *err) {
+    atlas_json *j = r->j;
+    atlas_safe_pool *p = &r->safe;
+    TRY(atlas_json_key(j, "restore", err));
+    TRY(atlas_json_obj_begin(j, err));
+    TRY(json_safe(j, p, "data_dir", atlas_buf_cstr(&rep->data_dir), err));
+    TRY(json_safe(j, p, "db_path", atlas_buf_cstr(&rep->db_path), err));
+    TRY(atlas_json_key_bool(j, "published", rep->published, err));
+    TRY(atlas_json_key_bool(j, "recovery_copy_made", rep->recovery_made, err));
+    TRY(json_safe(j, p, "recovery_copy_path", atlas_buf_cstr(&rep->recovery_path), err));
+    TRY(atlas_json_key_bool(j, "removed_stale_wal", rep->removed_wal, err));
+    TRY(atlas_json_key_bool(j, "removed_stale_shm", rep->removed_shm, err));
+    TRY(atlas_json_key_int(j, "schema_before", rep->schema_before, err));
+    TRY(atlas_json_key_int(j, "schema_after", rep->schema_after, err));
+    TRY(atlas_json_key_bool(j, "migrated", rep->migrated, err));
+    TRY(atlas_json_key_bool(j, "restored_runtime_state", false, err));
+    TRY(atlas_json_key(j, "source", err));
+    TRY(atlas_json_obj_begin(j, err));
+    TRY(j_verify_body(j, p, &rep->source, err));
+    TRY(atlas_json_obj_end(j, err));
+    TRY(atlas_json_key(j, "installed", err));
+    TRY(atlas_json_obj_begin(j, err));
+    TRY(j_verify_body(j, p, &rep->installed, err));
+    TRY(atlas_json_obj_end(j, err));
+    return atlas_json_obj_end(j, err);
+}
+
+static atlas_status j_maintenance(atlas_renderer *r, const atlas_maintenance_report *rep,
+                                  atlas_err *err) {
+    atlas_json *j = r->j;
+    TRY(atlas_json_key(j, "maintenance", err));
+    TRY(atlas_json_obj_begin(j, err));
+    TRY(atlas_json_key_bool(j, "applied", rep->applied, err));
+    TRY(atlas_json_key_int(j, "older_than_days", rep->older_than_days, err));
+    TRY(atlas_json_key_int(j, "retain_per_repo", rep->retain_per_repo, err));
+    TRY(atlas_json_key_str(j, "cutoff", rep->cutoff, err));
+    TRY(atlas_json_key_int(j, "total_rows", rep->total_rows, err));
+    TRY(atlas_json_key_int(j, "total_eligible", rep->total_eligible, err));
+    TRY(atlas_json_key_int(j, "total_removed", rep->total_removed, err));
+    TRY(atlas_json_key_int(j, "prunable_tables", (int64_t)rep->prunable_tables, err));
+    TRY(atlas_json_key_int(j, "protected_tables", (int64_t)rep->protected_tables, err));
+    TRY(atlas_json_key(j, "tables", err));
+    TRY(atlas_json_arr_begin(j, err));
+    for (size_t i = 0; i < rep->table_count; i++) {
+        const atlas_maintenance_row *t = &rep->tables[i];
+        TRY(atlas_json_obj_begin(j, err));
+        TRY(atlas_json_key_str(j, "table", t->table, err));
+        TRY(atlas_json_key_str(j, "retention_class", atlas_retention_class_name(t->cls), err));
+        TRY(atlas_json_key_bool(j, "prunable", t->prunable, err));
+        TRY(atlas_json_key_str(j, "reason", t->reason, err));
+        TRY(atlas_json_key_bool(j, "present", t->counted, err));
+        TRY(atlas_json_key_int(j, "rows_before", t->rows_before, err));
+        TRY(atlas_json_key_int(j, "rows_eligible", t->rows_eligible, err));
+        TRY(atlas_json_key_int(j, "rows_removed", t->rows_removed, err));
+        TRY(atlas_json_key_int(j, "rows_after", t->rows_after, err));
+        TRY(atlas_json_obj_end(j, err));
+    }
+    TRY(atlas_json_arr_end(j, err));
+    return atlas_json_obj_end(j, err);
+}
+
 const atlas_renderer_vtbl ATLAS_RENDERER_JSON = {
     j_begin,      j_end,          j_note_repo,    j_note_query,   j_list_begin,
     j_list_end,   j_doctor,       j_version,      j_repo_item,    j_repo_added,
@@ -1142,6 +1275,8 @@ const atlas_renderer_vtbl ATLAS_RENDERER_JSON = {
     /* --- A4 --- */
     j_decision_item, j_decision_show, j_decision_event, j_decision_outcome,
     j_decision_counts, j_decision_ledger,
+    /* --- A5 --- */
+    j_backup_created, j_backup_verified, j_backup_restored, j_maintenance,
 };
 
 void atlas_render_error(FILE *out, FILE *errout, bool json, const char *command,

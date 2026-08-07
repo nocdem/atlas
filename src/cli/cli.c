@@ -11,10 +11,12 @@
 #include <string.h>
 
 #include "atlas/atlas.h"
+#include "atlas/backup.h"
 #include "atlas/daemon.h"
 #include "atlas/hook.h"
 #include "atlas/integrate.h"
 #include "atlas/ipc.h"
+#include "atlas/maintenance.h"
 #include "atlas/mcp.h"
 #include "atlas/unit.h"
 #include "cli/render.h"
@@ -79,6 +81,11 @@ void atlas_cli_print_help(FILE *out) {
         "  decision orphaned          decisions attached to no registered repository\n"
         "  decision legacy NAME       A2 decision proposals, and which were promoted\n"
         "  decision promote NAME ID   make an A4 document from an A2 proposal\n"
+        "  backup create OUTPUT       online snapshot of the index; refuses to overwrite\n"
+        "  backup verify BACKUP       check one; creates nothing and repairs nothing\n"
+        "  backup restore BACKUP --yes  replace the index; keeps what it displaced\n"
+        "  maintenance plan           what a prune would remove, and why each table is kept\n"
+        "  maintenance prune --apply  remove only the rows the plan called eligible\n"
         "  service print              print the systemd user unit; changes nothing\n"
         "  service install --user     write the unit; never enables or starts it\n"
         "  service uninstall --user   remove the unit Atlas wrote\n"
@@ -118,6 +125,10 @@ void atlas_cli_print_help(FILE *out) {
         "  --format markdown|json     decision export: the output form\n"
         "  --user                     service: operate on the systemd *user* unit\n"
         "  --force                    service: replace or remove a unit Atlas did not write\n"
+        "                             backup create: replace an existing destination\n"
+        "  --apply                    maintenance: actually delete; without it nothing is written\n"
+        "  --older-than DAYS          maintenance: only rows created before this (1-36500)\n"
+        "  --retain N                 maintenance: newest events per repository always kept\n"
         "  --data-dir DIR             use DIR instead of the resolved data directory\n"
         "  --limit N                  cap results per kind (default %d)\n"
         "  --max-commits N            stop ingesting history after N commits\n"
@@ -212,6 +223,25 @@ static atlas_status parse_args(cli_state *st, int argc, char **argv, bool *want_
                 st->opts.user = true;
             } else if (strcmp(a, "--force") == 0) {
                 st->opts.force = true;
+            } else if (strcmp(a, "--apply") == 0) {
+                st->opts.apply = true;
+            } else if (strcmp(a, "--older-than") == 0) {
+                if (i + 1 >= argc) {
+                    return atlas_err_set(err, ATLAS_ERR_USAGE, "--older-than needs a number of days");
+                }
+                atlas_status os = parse_long(argv[++i], "--older-than", &st->opts.older_than_days,
+                                             err);
+                if (os != ATLAS_OK) {
+                    return os;
+                }
+            } else if (strcmp(a, "--retain") == 0) {
+                if (i + 1 >= argc) {
+                    return atlas_err_set(err, ATLAS_ERR_USAGE, "--retain needs a value");
+                }
+                atlas_status rs = parse_long(argv[++i], "--retain", &st->opts.retain, err);
+                if (rs != ATLAS_OK) {
+                    return rs;
+                }
             } else if (strcmp(a, "--once") == 0) {
                 /* A test hook for `daemon run`: reconcile everything once, then
                  * exit. Deliberately absent from the help text; it exists so the
@@ -739,7 +769,25 @@ static bool route_to_daemon(const cli_state *st) {
     if (mode_for(st) != ATLAS_CTX_WRITE) {
         return false;
     }
-    return atlas_ipc_daemon_reachable();
+    /* Reachability is not the question. There is one socket per user runtime
+     * directory, but the data directory is chosen per invocation, so a daemon
+     * that answers may well own a different index — and routing to it would
+     * apply the write there while `--data-dir` said otherwise and nothing
+     * reported the difference. The daemon has to be the one that owns *this*
+     * directory.
+     *
+     * When it is not, the command runs locally and takes that directory's own
+     * writer lock, which the daemon does not hold. That is the correct
+     * behaviour and not a degradation. */
+    atlas_err err;
+    atlas_err_init(&err);
+    atlas_buf dir = ATLAS_BUF_INIT;
+    bool owns = false;
+    if (atlas_datadir_resolve(st->opts.data_dir, &dir, NULL, &err) == ATLAS_OK) {
+        owns = atlas_ipc_daemon_owns(atlas_buf_cstr(&dir));
+    }
+    atlas_buf_free(&dir);
+    return owns;
 }
 
 /* Sends one mutation to the daemon and renders its answer. */
@@ -1699,6 +1747,143 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
             atlas_buf_free(&params);
             return vst;
         }
+    }
+
+    /* --- A5: backup and maintenance -------------------------------------
+     *
+     * Handled here, before any context exists, because neither may go through
+     * one. A context in AUTO mode takes the writer lock when it is free, and a
+     * backup must never take it — the whole point is that a running daemon
+     * keeps writing while the snapshot is taken. Restore and prune need the
+     * lock *exclusively* and acquire it themselves, which is also what makes
+     * "the daemon must be stopped" a fact the kernel enforces rather than an
+     * instruction in a manual.
+     *
+     * Neither is routed to the daemon, because neither has an RPC method to
+     * route to. That absence is the point: nothing reachable over the socket —
+     * and so nothing reachable from MCP or a hook — can replace or prune the
+     * index. */
+    if (strcmp(cmd, "backup") == 0) {
+        if (st->operand_count == 0) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "usage: atlas backup create|verify|restore ...");
+        }
+        const char *sub = st->operands[0];
+        if (strcmp(sub, "create") == 0) {
+            if (st->operand_count != 2u) {
+                return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                     "usage: atlas backup create OUTPUT [--force]");
+            }
+            atlas_backup_create_opts bo;
+            memset(&bo, 0, sizeof bo);
+            bo.output = st->operands[1];
+            bo.force = st->opts.force;
+            atlas_backup_report rep;
+            atlas_backup_report_init(&rep);
+            atlas_status bs = atlas_service_backup_create(st->opts.data_dir, &bo, &rep, err);
+            if (bs == ATLAS_OK) {
+                bs = renderer_open(&r, st->opts.json, st->out, "backup create", err);
+                if (bs == ATLAS_OK) {
+                    bs = r.v->backup_created(&r, &rep, err);
+                }
+                bs = bs == ATLAS_OK ? renderer_close(&r, err) : (renderer_abort(&r), bs);
+            }
+            atlas_backup_report_free(&rep);
+            return bs;
+        }
+        if (strcmp(sub, "verify") == 0) {
+            if (st->operand_count != 2u) {
+                return atlas_err_set(err, ATLAS_ERR_USAGE, "usage: atlas backup verify BACKUP");
+            }
+            atlas_backup_verify_report rep;
+            atlas_backup_verify_report_init(&rep);
+            atlas_status bs = atlas_service_backup_verify(st->operands[1], &rep, err);
+            if (bs == ATLAS_OK) {
+                bs = renderer_open(&r, st->opts.json, st->out, "backup verify", err);
+                if (bs == ATLAS_OK) {
+                    bs = r.v->backup_verified(&r, &rep, "backup", err);
+                }
+                bs = bs == ATLAS_OK ? renderer_close(&r, err) : (renderer_abort(&r), bs);
+                /* A complete document, and then a non-zero exit: an unusable
+                 * backup is an answer, not a failure to answer, and a script
+                 * must be able to test both. `rendered` keeps the error
+                 * document off stdout so --json emits exactly one. */
+                if (bs == ATLAS_OK && !rep.ok) {
+                    st->rendered = true;
+                    bs = ATLAS_ERR_INTEGRITY;
+                }
+            }
+            atlas_backup_verify_report_free(&rep);
+            return bs;
+        }
+        if (strcmp(sub, "restore") == 0) {
+            if (st->operand_count != 2u) {
+                return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                     "usage: atlas backup restore BACKUP --yes");
+            }
+            atlas_backup_restore_opts ro;
+            memset(&ro, 0, sizeof ro);
+            ro.input = st->operands[1];
+            ro.confirmed = st->opts.yes;
+            atlas_backup_restore_report rep;
+            atlas_backup_restore_report_init(&rep);
+            atlas_status bs = atlas_service_backup_restore(st->opts.data_dir, &ro, &rep, err);
+            if (bs == ATLAS_OK) {
+                bs = renderer_open(&r, st->opts.json, st->out, "backup restore", err);
+                if (bs == ATLAS_OK) {
+                    bs = r.v->backup_restored(&r, &rep, err);
+                }
+                bs = bs == ATLAS_OK ? renderer_close(&r, err) : (renderer_abort(&r), bs);
+            }
+            atlas_backup_restore_report_free(&rep);
+            return bs;
+        }
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "unknown backup subcommand \"%s\"", sub);
+    }
+
+    if (strcmp(cmd, "maintenance") == 0) {
+        if (st->operand_count == 0) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE, "usage: atlas maintenance plan|prune ...");
+        }
+        const char *sub = st->operands[0];
+        bool prune = strcmp(sub, "prune") == 0;
+        if (!prune && strcmp(sub, "plan") != 0) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE, "unknown maintenance subcommand \"%s\"",
+                                 sub);
+        }
+        if (st->operand_count != 1u) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE, "usage: atlas maintenance %s [--older-than "
+                                                       "DAYS] [--retain N]%s",
+                                 sub, prune ? " --apply" : "");
+        }
+        if (prune && !st->opts.apply) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "refusing to prune without --apply; `atlas maintenance plan` "
+                                 "reports what would be removed and writes nothing");
+        }
+        if (!prune && st->opts.apply) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "`maintenance plan` never deletes; use `maintenance prune "
+                                 "--apply`");
+        }
+        atlas_maintenance_opts mo;
+        memset(&mo, 0, sizeof mo);
+        mo.older_than_days = st->opts.older_than_days;
+        mo.retain_per_repo = st->opts.retain;
+        mo.apply = prune;
+        atlas_maintenance_report rep;
+        atlas_maintenance_report_init(&rep);
+        atlas_status ms = atlas_service_maintenance(st->opts.data_dir, &mo, &rep, err);
+        if (ms == ATLAS_OK) {
+            ms = renderer_open(&r, st->opts.json, st->out,
+                               prune ? "maintenance prune" : "maintenance plan", err);
+            if (ms == ATLAS_OK) {
+                ms = r.v->maintenance(&r, &rep, err);
+            }
+            ms = ms == ATLAS_OK ? renderer_close(&r, err) : (renderer_abort(&r), ms);
+        }
+        atlas_maintenance_report_free(&rep);
+        return ms;
     }
 
     atlas_ctx_opts copts;

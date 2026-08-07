@@ -462,9 +462,11 @@ atlas_status atlas_service_code_sync(atlas_ctx *ctx, const char *name, bool rebu
     atlas_err sock_err;
     atlas_err_init(&sock_err);
     bool have_socket = (atlas_ipc_socket_path(&sock, &sock_err) == ATLAS_OK);
-    if (have_socket && atlas_ipc_daemon_reachable()) {
-        /* Routed to the daemon like every other mutation, so the single writer
-         * stays single. */
+    /* Routed to the daemon like every other mutation, so the single writer
+     * stays single — but only to the daemon that owns *this* context's data
+     * directory. One socket serves a user; a data directory is chosen per
+     * invocation. */
+    if (have_socket && atlas_ipc_daemon_owns(atlas_ctx_data_dir(ctx))) {
         atlas_ipc_params *p = NULL;
         atlas_json *j = NULL;
         atlas_buf params = ATLAS_BUF_INIT;

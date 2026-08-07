@@ -187,11 +187,29 @@ else
 fi
 
 # --- assertion 3: no network was attempted --------------------------------
-if grep -qE 'socket\(AF_INET|socket\(AF_INET6|connect\(' "$TRACE"; then
+#
+# `connect(` alone is too broad to be this assertion. A CLI mutation asks
+# whether a daemon owns this data directory, which is an AF_UNIX connect to
+# Atlas' own socket — a local IPC probe, not a network operation. So the
+# network check names the address families it means, and the Unix connects get
+# their own assertion: every one must target the Atlas socket and nothing else.
+if grep -qE 'socket\(AF_INET|socket\(AF_INET6|socket\(AF_PACKET|socket\(AF_NETLINK' "$TRACE" \
+        || grep -qE 'connect\([0-9]+, \{sa_family=AF_INET' "$TRACE"; then
     bad "a network syscall was attempted"
-    grep -E 'socket\(AF_INET|connect\(' "$TRACE" | head -3 | sed 's/^/      /'
+    grep -E 'socket\(AF_INET|connect\([0-9]+, \{sa_family=AF_INET' "$TRACE" | head -3 \
+        | sed 's/^/      /'
 else
     ok "no network socket or connect attempted"
+fi
+
+stray_unix=$(grep -E 'connect\([0-9]+, \{sa_family=AF_UNIX' "$TRACE" \
+    | grep -cv 'atlas/atlas\.sock' || true)
+if [ "$stray_unix" -eq 0 ]; then
+    ok "every Unix-domain connect targeted the Atlas socket"
+else
+    bad "$stray_unix Unix-domain connect(s) to something other than the Atlas socket"
+    grep -E 'connect\([0-9]+, \{sa_family=AF_UNIX' "$TRACE" | grep -v 'atlas/atlas\.sock' \
+        | head -3 | sed 's/^/      /'
 fi
 
 # --- assertion 4: no prompt was read -------------------------------------
@@ -231,7 +249,86 @@ else
     fi
 fi
 
-# --- assertion 7: a partial clone fails closed with valid JSON -----------
+# --- assertion 7: A5 creates no process and reads no repository ----------
+#
+# Backup, verification and maintenance touch the index and nothing else. That is
+# a claim about what they do *not* do, so it is checked from outside: a fresh
+# trace of the three, asserting that the only executable in the whole tree is
+# atlas itself. No git, no shell, no helper — and in particular the hostile
+# environment above cannot reach anything, because nothing is executed at all.
+
+A5TRACE="$WORK/a5trace.log"
+: > "$A5TRACE"
+run_a5_traced() {
+    strace -f -qq -e trace=execve,socket,connect -s 200 -o "$A5TRACE.part" \
+        env \
+        GIT_EXTERNAL_DIFF="$HELPER" \
+        GIT_PAGER="$HELPER" \
+        GIT_SSH_COMMAND="$HELPER" \
+        GIT_CONFIG_COUNT=1 \
+        GIT_CONFIG_KEY_0=core.fsmonitor \
+        GIT_CONFIG_VALUE_0="$HELPER" \
+        GIT_DIR="$WORK/decoy/.git" \
+        HOME="$WORK/fakehome" \
+        "$ATLAS" --data-dir "$DATA" "$@" > "$WORK/a5out.txt" 2> "$WORK/a5err.txt"
+    rc=$?
+    cat "$A5TRACE.part" >> "$A5TRACE"
+    return $rc
+}
+
+rm -f "$FIRED"
+run_a5_traced backup create "$WORK/adv-backup.db" \
+    || bad "backup create failed: $(cat "$WORK/a5err.txt")"
+run_a5_traced backup verify "$WORK/adv-backup.db" \
+    || bad "backup verify failed: $(cat "$WORK/a5err.txt")"
+run_a5_traced maintenance plan --older-than 30 \
+    || bad "maintenance plan failed: $(cat "$WORK/a5err.txt")"
+
+sed -n 's/.*execve("\([^"]*\)".*/\1/p' "$A5TRACE" | sort -u > "$WORK/a5execs.txt"
+a5_unexpected=0
+while IFS= read -r prog; do
+    case "$prog" in
+        */atlas) : ;;
+        */env) : ;;                      # the env(1) wrapper this script uses
+        "$ATLAS") : ;;
+        *) printf '    unexpected executable: %s\n' "$prog"
+           a5_unexpected=$((a5_unexpected + 1)) ;;
+    esac
+done < "$WORK/a5execs.txt"
+if [ "$a5_unexpected" -eq 0 ]; then
+    ok "backup and maintenance created no process but atlas itself"
+else
+    bad "$a5_unexpected unexpected executable(s) during backup or maintenance"
+fi
+if [ -f "$FIRED" ]; then
+    bad "the hostile helper RAN during a backup: $(cat "$FIRED")"
+else
+    ok "no helper executed during backup or maintenance"
+fi
+# Backup and maintenance touch no socket at all — not even Atlas' own, because
+# neither is routed anywhere. So here `connect(` really is the whole assertion.
+if grep -qE 'socket\(AF_INET|socket\(AF_INET6|connect\(' "$A5TRACE"; then
+    bad "backup or maintenance attempted a socket operation"
+    grep -E 'socket\(AF_INET|connect\(' "$A5TRACE" | head -3 | sed 's/^/      /'
+else
+    ok "no socket of any kind during backup or maintenance"
+fi
+
+# The published backup must be owner-only whatever the umask was, and the
+# hostile GIT_DIR decoy must not appear in it.
+adv_mode=$(stat -c '%a' "$WORK/adv-backup.db" 2>/dev/null || echo "?")
+if [ "$adv_mode" = "600" ]; then
+    ok "the published backup is mode 0600"
+else
+    bad "the published backup is mode $adv_mode, expected 600"
+fi
+if grep -q 'DECOY-ONLY' "$WORK/adv-backup.db" 2> /dev/null; then
+    bad "the decoy repository named by GIT_DIR reached the backup"
+else
+    ok "the decoy repository is absent from the backup"
+fi
+
+# --- assertion 8: a partial clone fails closed with valid JSON -----------
 PC="$WORK/partial"
 mkdir -p "$PC"
 git -C "$PC" init -q -b main .

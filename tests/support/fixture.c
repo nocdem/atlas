@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -643,6 +644,35 @@ atlas_status fx_tree_digest(const char *dir, char *hex_out, atlas_err *err) {
 
 /* --- running the atlas binary -------------------------------------------- */
 
+/* A private, empty runtime directory shared by every CLI invocation in this
+ * process.
+ *
+ * Created once and left empty on purpose: an empty directory holds no socket,
+ * so a CLI test cannot reach any daemon through it — not the developer's, and
+ * not another fixture's. The daemon suite supplies its own through
+ * `extra_env`, which overrides this one. */
+static const char *fx_private_runtime_dir(void) {
+    static char dir[256];
+    static int state = 0; /* 0 unset, 1 ready, -1 failed */
+    if (state != 0) {
+        return state == 1 ? dir : NULL;
+    }
+    const char *tmp = getenv("TMPDIR");
+    if (tmp == NULL || tmp[0] == '\0') {
+        tmp = "/tmp";
+    }
+    /* Short, because a Unix socket address is a fixed 108-byte field and a
+     * fixture that ever does place one here must still fit. */
+    if ((size_t)snprintf(dir, sizeof dir, "%s/atlas-rt.XXXXXX", tmp) >= sizeof dir ||
+        mkdtemp(dir) == NULL) {
+        state = -1;
+        return NULL;
+    }
+    (void)chmod(dir, 0700);
+    state = 1;
+    return dir;
+}
+
 static atlas_status fx_atlas_impl(const char *const *args, size_t nargs,
                                  const char *const *extra_env, atlas_buf *stdout_out,
                                  atlas_buf *stderr_out, int *exit_code, atlas_err *err) {
@@ -669,11 +699,46 @@ static atlas_status fx_atlas_impl(const char *const *args, size_t nargs,
      * test that forgets must fail rather than touch a real user directory. The
      * extra entries let a test plant hostile GIT_* variables in Atlas' own
      * environment, which Atlas must not forward to git. */
+    /* Only when the caller has not supplied one. `getenv` returns the first
+     * match in the environment, so adding a second XDG_RUNTIME_DIR ahead of the
+     * daemon suite's would silently hide the daemon it just started from the
+     * command meant to reach it. */
+    bool caller_set_runtime = false;
+    for (size_t i = 0; extra_env != NULL && extra_env[i] != NULL; i++) {
+        if (strncmp(extra_env[i], "XDG_RUNTIME_DIR=", 16) == 0) {
+            caller_set_runtime = true;
+        }
+    }
+    const char *runtime = caller_set_runtime ? NULL : fx_private_runtime_dir();
+    atlas_buf xdg_env = ATLAS_BUF_INIT;
+    /* XDG_RUNTIME_DIR is pointed at a private empty directory rather than left
+     * unset.
+     *
+     * Unset is not neutral: Atlas falls back to /run/user/<uid> when the
+     * variable is absent, which is correct for a real invocation and wrong for
+     * a test — it would let the suite reach the developer's live daemon, ask it
+     * questions, and in a routing regression have a fixture's mutation applied
+     * to a real index. That happened while A5 was being written.
+     *
+     * The directory exists and is empty, so no socket is ever found there and
+     * every CLI test takes the offline path unless it deliberately supplies a
+     * daemon's runtime directory through `extra_env`. */
+    if (runtime != NULL) {
+        st = atlas_buf_appendf(&xdg_env, err, "XDG_RUNTIME_DIR=%s", runtime);
+        if (st != ATLAS_OK) {
+            atlas_buf_free(&xdg_env);
+            atlas_buf_free(&path_env);
+            return st;
+        }
+    }
     const char *env[24];
     size_t envn = 0;
     env[envn++] = atlas_buf_cstr(&path_env);
     env[envn++] = "LC_ALL=C";
     env[envn++] = "TZ=UTC";
+    if (runtime != NULL) {
+        env[envn++] = atlas_buf_cstr(&xdg_env);
+    }
     for (size_t i = 0; extra_env != NULL && extra_env[i] != NULL; i++) {
         if (envn + 1u >= sizeof(env) / sizeof(env[0])) {
             atlas_buf_free(&path_env);
@@ -693,6 +758,7 @@ static atlas_status fx_atlas_impl(const char *const *args, size_t nargs,
     atlas_proc_result res;
     st = atlas_proc_run(&opts, stdout_out != NULL ? atlas_proc_sink_buf : NULL, stdout_out,
                         stderr_out, &res, err);
+    atlas_buf_free(&xdg_env);
     if (st == ATLAS_OK && exit_code != NULL) {
         *exit_code = res.exit_code;
     }

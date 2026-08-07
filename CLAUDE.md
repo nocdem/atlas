@@ -1,10 +1,11 @@
 # Atlas — working notes for Claude Code
 
 Atlas is a generic, headless engineering-memory and repository-intelligence CLI in
-C17. Phase **A4**: decision documents with immutable revisions, an append-only
-lifecycle ledger and an operator approval channel — on top of the A3 structural
-code intelligence, the A2 AI integration, the A1 daemon and the A0 read-only
-foundation. Not DNA-specific; DNA will later be its first indexed repository.
+C17. Phase **A5**: verified online backups, an atomic restore and a written
+retention classification for every table — on top of the A4 decision documents,
+the A3 structural code intelligence, the A2 AI integration, the A1 daemon and the
+A0 read-only foundation. Not DNA-specific; DNA is its first real indexed
+repository.
 
 ## Build and test
 
@@ -26,6 +27,7 @@ sh scripts/perf.sh build      # A1 performance acceptance measurements
 sh scripts/perf-a2.sh build   # A2 hook and MCP latency measurements
 sh scripts/perf-a3.sh build   # A3 structural-indexing acceptance (~7 minutes)
 sh scripts/perf-a4.sh build   # A4 decision-lifecycle acceptance (~2 minutes)
+sh scripts/perf-a5.sh build   # A5 backup/verify/restore acceptance (~3 minutes)
 ```
 
 `perf-a3.sh` measures peak RSS from `/proc/<pid>/VmHWM` rather than from
@@ -57,6 +59,20 @@ observation as an observation: "7 ms observed", never "under 7 ms", which reads
 as a bound Atlas does not hold. `docs/decision-lifecycle.md` carries the table,
 and every figure in it comes from one run of the script.
 
+`perf-a5.sh` follows the same discipline again: it builds the A4 decision corpus
+*plus* a structural graph and A2 session rows, asserts its own floors — at least
+10 000 documents, 25 000 revisions, 100 000 links, all four lifecycle states, and
+a database of at least 100 MiB — and asserts its own limits: backup create,
+backup verify and an isolated restore each under 10 s, each under 256 MiB peak
+RSS read from `/proc/<pid>/VmHWM`. It exits non-zero rather than printing a
+number nobody checks, and it verifies the restored copy table by table rather
+than trusting that it finished.
+
+The limits are the required bounds, not the observations. Report an observation
+as an observation: "3 s observed", never "under 3 s", which reads as a bound
+Atlas does not hold. `docs/operations.md` carries the operational contract and
+every measured figure in it comes from one run of the script.
+
 `make doctor` and `make doctor-claude` observe and create nothing: no data
 directory, no index, no lock, no runtime directory, no socket, no Claude
 configuration. `atlas doctor` opens in `ATLAS_CTX_INSPECT` mode and reports a
@@ -80,7 +96,9 @@ symlink.
 
 The data directory resolves as `--data-dir`, then `ATLAS_DATA_DIR`, then
 `XDG_DATA_HOME/atlas`, then `$HOME/.local/share/atlas`. The socket lives under
-`XDG_RUNTIME_DIR/atlas/`. A Unix socket address is a fixed 108-byte field and
+`XDG_RUNTIME_DIR/atlas/`, or under `/run/user/<uid>/atlas/` when that variable is
+unset and that directory proves to be a private one this user owns — checked with
+`lstat`, never followed, and never `/tmp`. A Unix socket address is a fixed 108-byte field and
 Atlas refuses a path that would not fit rather than truncating it, so a fixture
 or script must put its runtime directory somewhere short — see `scripts/perf.sh`.
 
@@ -556,6 +574,133 @@ src/ipc      server_decision.c (the ten-method A4 group)
   when the request carried a valid open session key. Attaching one would record
   that a conversation approved something.
 
+## A5 layers — additions
+
+```
+src/db       db_backup.c (the SQLite online copy and every record check),
+             db_maintenance.c (counting and the one bounded delete)
+src/core     service_backup.c (path safety, atomic publication, restore),
+             service_maintenance.c (RETENTION[]: the whole retention policy)
+```
+
+There is deliberately **no `src/ipc` file here**, and no entry in any method
+table. That absence is the A5 guarantee, not an omission.
+
+## A5 rules — these are not negotiable
+
+- **Backup, restore and maintenance are local CLI operations with no RPC
+  method.** Nothing reachable over the socket — and so nothing reachable from
+  MCP or a hook — can create, read or restore a backup, or plan or apply a
+  prune. A model that can call every method Atlas exposes still cannot replace
+  or prune the index. Adding an RPC method for any of them would delete the
+  guarantee; `tests/test_backup_live.c` asks a live daemon for each name such a
+  method would plausibly have and requires every one to fail.
+
+  They are also dispatched in `cli.c` **before any `atlas_ctx` is opened**, for a
+  second reason: a context in AUTO mode takes the writer lock when it is free,
+  and a backup must never take it. Restore and prune take it themselves,
+  exclusively, which is what makes "the daemon must be stopped" a fact the
+  kernel enforces rather than an instruction in a manual.
+- **A backup is one self-contained file, never a copy of the three.**
+  `atlas.db`, `atlas.db-wal` and `atlas.db-shm` are meaningful only together and
+  only at an instant no external reader can name. The copy goes through
+  `sqlite3_backup_step(-1)` — one step, not a loop: stepping incrementally lets
+  a writer commit between steps and SQLite restarts the copy from the beginning,
+  which against a busy daemon is unbounded. The finished copy is switched to
+  rollback journalling before publication, which is what lets `backup verify`
+  open it read-only and create nothing.
+- **Nothing partial is ever published.** Every write goes to a mode-0600
+  `O_EXCL` temporary file in the destination directory, is verified *in full* by
+  the same code `backup verify` runs, is `fsync`ed, and only then renamed. The
+  mode is set explicitly because SQLite would otherwise create the file 0644 or
+  worse under a permissive umask. A backup that would not restore is never
+  written.
+- **No path is ever resolved through a symlink.** Every component is opened from
+  `/` with `O_NOFOLLOW`; a symlinked component refuses the operation rather than
+  being followed. `realpath(3)` is the wrong tool here and must not appear: it
+  resolves links, which names a directory the operator did not write down. The
+  lexical `..` collapse in `normalise_abs` is sound *only* because of that walk.
+- **A failed restore leaves the original database byte-identical.** Everything
+  before the commit fails safely, and the commit itself is reversible: the
+  previous write-ahead log is **renamed aside, not deleted**, so a failed rename
+  puts it back. It must not survive the rename — SQLite would apply it to the
+  restored file — and the consistent snapshot taken beforehand is what covers
+  the two-rename window. Do not "simplify" that into an `unlink`.
+- **`atlas_db_backup_inspect` never opens the file as an `atlas_db` for the
+  structural checks.** `atlas_db_open` migrates, and a diagnostic that upgrades
+  the artefact it was asked about has destroyed the evidence. The A4 record
+  checks use `atlas_db_open_readonly`, which cannot.
+- **Verification checks the declared length against the actual one**, before
+  anything else. `PRAGMA integrity_check` walks the pages the b-trees reach, so
+  a file truncated in unallocated space or by less than a page passes it — and a
+  backup missing its tail is exactly the failure an operator has. Removing that
+  check makes truncation verify as ok.
+- **Say what verification cannot do.** SQLite has no per-page checksum, so a
+  byte flipped inside an ordinary value leaves a structurally valid database and
+  nothing Atlas runs will find it. Decision revisions are the exception, because
+  every one is rehashed from its stored content.
+  `tests/test_backup.c` asserts all three cases *including the undetected one*,
+  so the limitation cannot quietly vanish from the documentation while remaining
+  true of the code.
+
+  The overclaims A5 forbids — about encryption, signatures, durability under
+  hardware failure, exhaustive corruption detection, differential copies and
+  portability — are enumerated in one place, `FORBIDDEN[]` in
+  `test_no_operational_claim_is_stronger_than_the_implementation`, together with
+  the wording that is *required* to stay. The list is not repeated here for the
+  same reason A4's is not: a second copy would drift, and this file is one of the
+  files the scan covers.
+- **`RETENTION[]` in `service_maintenance.c` is the whole retention policy, and
+  every table has a row with a written reason.** A table added without one is a
+  test failure, checked in both directions against `sqlite_schema`. The reason
+  is the deliverable: a classification without one is a label, and a label is
+  what lets a later phase quietly reclassify a table because deleting from it
+  would have been convenient.
+- **Exactly one table is prunable, and widening that needs an argument.**
+  `repo_events`, because it already carried a documented per-repository ceiling,
+  its `id` is `AUTOINCREMENT` so no cursor can be re-pointed by a deletion, and
+  the durable evidence lives elsewhere. `scans` is *not* prunable and the reason
+  is A4's: `files.first_seen_scan_id` and friends hold `scans.id`, a plain rowid
+  SQLite reuses. Derived tables are not prunable by age either — a half-aged
+  derived table is not a smaller index, it is a wrong one, and nothing in it
+  records that rows are missing.
+- **There is no background deleter, and A5 must not grow one.** Nothing prunes
+  on a timer, at startup, on low disk, or as a side effect of another command.
+  A row goes away when an operator runs `maintenance prune --apply`, and at no
+  other moment.
+- **Bounds are checked, never clamped.** A negative `--older-than` is a usage
+  error, not a silent default: a discarded number nobody is told about deletes
+  more than was asked for. Zero means "not given" and takes the documented
+  default.
+- **The delete is per batch, not per loop.** `atlas_db_maintenance_events_prune`
+  opens and commits one transaction per bounded batch, which is A1's rule about
+  never holding a write transaction across unbounded work. A failure rolls that
+  batch back whole and the operation is idempotent, so re-running finishes it.
+- **`ATLAS_BACKUP_FAULT` is compiled into every build on purpose.** An `#ifdef`
+  would mean the shipped binary is not the one the failure tests ran against. It
+  can only ever cause an operation to *abort*: there must never be a fault point
+  that skips a check, weakens a guarantee or publishes something.
+
+## Extending A5 safely
+
+- **A new verification check** goes in `atlas_db_backup_inspect`, before the
+  checks that read rows, and gets its own verdict only if an operator would act
+  differently on it. Add the case to `tests/test_backup.c`; if the check cannot
+  detect something a reader would assume it detects, say so in
+  `docs/operations.md` and add the assertion that it is *not* detected.
+- **A new prunable table** means a row in `RETENTION[]` with `prunable = true`,
+  an eligibility predicate whose count and delete select the same set, and an
+  argument that survives being read back: what holds a rowid into it, what
+  cursor points at it, and what is lost that cannot be rebuilt. It also fails
+  `test_exactly_one_table_is_prunable` until somebody updates it deliberately,
+  which is the point.
+- **A new backup field** is reported, never stored: A5 adds no migration and the
+  schema stays 6. Do not bump it to record a timestamp that can be observed from
+  outside the database.
+- **A new fault point** is a string in `fault()` and a case in
+  `test_every_injected_failure_leaves_the_original_untouched`. It must abort,
+  never weaken.
+
 ## Extending A4 safely
 
 - **A new lifecycle state** means editing `atlas_decision_state`, the schema
@@ -808,7 +953,7 @@ two documents on stdout.
 `README.md` (usage, limitations) · `SECURITY.md` (threat model) ·
 `docs/architecture.md` · `docs/data-model.md` · `docs/provenance.md` ·
 `docs/code-intelligence.md` · `docs/decision-lifecycle.md` ·
-`docs/git-safety.md` · `docs/daemon-and-ipc.md` ·
+`docs/operations.md` · `docs/git-safety.md` · `docs/daemon-and-ipc.md` ·
 `docs/watcher-consistency.md` · `docs/systemd-user-service.md` ·
 `docs/ai-trust-boundary.md` · `docs/claude-integration.md` ·
 `docs/backlog.md` · `docs/roadmap.md` ·

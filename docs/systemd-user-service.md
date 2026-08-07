@@ -93,8 +93,33 @@ it is not running.
 | `UMask=0077` | files Atlas creates describe private repositories |
 | `RuntimeDirectory=atlas`, `RuntimeDirectoryMode=0700` | systemd creates `$XDG_RUNTIME_DIR/atlas` at 0700 and removes it on stop |
 | `ReadWritePaths=%h/.local/share/atlas` | `ProtectHome=read-only` would otherwise block the index; this is the one place the daemon writes |
-| `PrivateNetwork=yes`, `IPAddressDeny=any` | Atlas performs no network access at all, so removing the ability to costs nothing and proves the claim |
-| `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectKernel*`, `MemoryDenyWriteExecute`, `SystemCallFilter=@system-service` | none of these is load-bearing for correctness — Atlas needs none of what they remove — so each one is free |
+| `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome=read-only`, `ProtectKernelTunables`, `ProtectControlGroups`, `RestrictSUIDSGID`, `RestrictRealtime`, `MemoryDenyWriteExecute`, `LockPersonality`, `SystemCallFilter=@system-service` | none of these is load-bearing for correctness — Atlas needs none of what they remove — so each one is free |
+
+## What the unit deliberately does not set
+
+This is a **user** unit, which is the only kind Atlas writes, and a user manager
+cannot apply every directive a system manager can. Three that a system unit
+would carry are absent rather than present and ineffective:
+
+| directive | what happens under a user manager |
+| --- | --- |
+| `ProtectKernelModules=yes` | needs `CAP_SYS_MODULE` dropped from the bounding set, which an unprivileged manager may not do. It does not degrade: the unit fails outright with `218/CAPABILITIES` and the daemon never starts. |
+| `PrivateNetwork=yes` | needs a network namespace; refused with `EPERM` and then ignored, so it reads as a guarantee and is none |
+| `IPAddressDeny=any` | needs the system firewall hooks; the manager warns that it is not root and applies nothing |
+
+Atlas still performs no network access at all. That is a property of the
+program — checked from outside by `scripts/adversarial.sh` under `strace`, which
+requires the set of executed programs to be exactly what Atlas intends and
+refuses any `AF_INET` socket — and it does not depend on any of the three.
+Listing a protection that is not in force would be the same overclaim in a unit
+file that Atlas refuses to make in its documentation.
+
+`ProtectKernelModules` was in the shipped unit until the A5 pilot tried to start
+it: `atlas service install --user` wrote a unit that could not run, and every
+test of it had been a test of the *text*. `tests/test_unit.c` now asserts the
+absence of all three, and the pilot procedure in
+[operations.md](operations.md) starts the service rather than assuming it
+would start.
 
 The executable path is written literally, and Atlas **refuses** to generate a unit
 for a path containing a space, a quote, a `%`, a `$` or a `;`. Escaping those

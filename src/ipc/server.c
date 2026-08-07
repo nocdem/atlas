@@ -166,6 +166,23 @@ static atlas_status method_ping(dispatch_state *ds, const atlas_ipc_request *req
     if (st == ATLAS_OK) {
         st = atlas_json_key_int(ds->j, "pid", (int64_t)getpid(), err);
     }
+    /* Which index this daemon owns.
+     *
+     * A CLI mutation is handed to a reachable daemon rather than performed
+     * locally, and "reachable" used to be the whole test. It is not enough:
+     * there is one socket per user runtime directory, but a data directory is
+     * chosen per invocation by `--data-dir` or `ATLAS_DATA_DIR`, so a caller
+     * naming one directory could have its write applied to whichever one the
+     * daemon happened to be started with — silently, and with `--data-dir`
+     * reported back in neither place.
+     *
+     * So the daemon says which directory it owns and the caller checks. It is a
+     * path, which is bytes, so it is safe-encoded like every other path that
+     * reaches a document. */
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "data_dir",
+                                atlas_safe(&ds->safe, ds->ctx->data_dir), err);
+    }
     return st;
 }
 

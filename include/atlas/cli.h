@@ -67,6 +67,13 @@ typedef struct atlas_cli_opts {
         const char *symbols[ATLAS_DECISION_MAX_LINKS];
         size_t symbol_count;
     } decision;
+    /* A5. `apply` is separate from `yes` on purpose: `--yes` confirms an
+     * operation the user already named, while `--apply` is what turns
+     * `maintenance` from a report into a deletion. A single flag would make
+     * "confirm this restore" and "actually delete rows" the same word. */
+    bool apply;
+    long older_than_days;
+    long retain;
 } atlas_cli_opts;
 
 /* Runs one command line. `argv[0]` is the program name. Returns the process

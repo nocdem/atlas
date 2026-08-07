@@ -176,6 +176,20 @@ atlas_status atlas_ipc_call_timeout(const char *socket_path, const char *method,
  * the offline path. */
 bool atlas_ipc_daemon_reachable(void);
 
+/* Whether a reachable daemon is the one that owns `data_dir`.
+ *
+ * `atlas_ipc_daemon_reachable` answers "is a daemon there", which is the wrong
+ * question for a mutation: there is one socket per user runtime directory, but
+ * the data directory is chosen per invocation by `--data-dir` or
+ * `ATLAS_DATA_DIR`. A caller that routed on reachability alone could have its
+ * write applied to whichever directory the daemon was started with, and nothing
+ * in either process would say so.
+ *
+ * False when nothing is listening, when the daemon owns a different directory,
+ * and when it does not say which it owns. Failing closed costs a local lock
+ * acquisition; failing open costs somebody else's index. */
+bool atlas_ipc_daemon_owns(const char *data_dir);
+
 /* --- A2: building requests with the typed writer -------------------------
  *
  * A0 and A1 built the two request documents they needed with `atlas_buf_appendf`

@@ -13,7 +13,50 @@ checked against a read-only allowlist before the process is created, hooks and
 external diff drivers are disabled, and the working tree and index are only ever
 read. See [docs/git-safety.md](docs/git-safety.md).
 
-## Status: phase A4
+## Status: phase A5
+
+A5 is the operational phase: verified backups, an atomic restore, and a written
+retention policy for every table in the schema.
+
+### What A5 adds
+
+- `atlas backup create|verify|restore` — an online snapshot taken through
+  SQLite's backup API from a read-only connection, so a running daemon keeps
+  writing while it is taken and the result is the database as of exactly one
+  commit boundary, write-ahead log included. Not a file copy of `atlas.db`,
+  `atlas.db-wal` and `atlas.db-shm`, which are meaningful only together and only
+  at an instant no reader can name.
+- **verification that creates nothing.** `backup verify` opens the file
+  read-only, needs no data directory, repairs nothing, and checks the SQLite
+  header, the declared length against the actual one, `integrity_check`,
+  `foreign_key_check`, the tables the recorded schema requires, that the schema
+  is not from a newer Atlas, **every decision revision rehashed from its stored
+  content**, and every document's status replayed from its ledger. An unusable
+  backup is an answer: a complete document, then a non-zero exit.
+- **an atomic restore that keeps what it displaced.** It takes the writer lock
+  exclusively — so a running daemon refuses it rather than racing it — verifies
+  the backup completely before touching anything, refuses every symlinked
+  component of the data directory, snapshots the existing index, stages a copy,
+  and publishes by rename. Everything that can fail, fails with the original
+  database byte-identical; the suite injects a failure at each of six points and
+  compares the file after every one.
+- `atlas maintenance plan|prune` — **every table classified**, with a written
+  reason for each, printed by `plan`. Exactly one table is prunable in A5:
+  `repo_events`, which already carried a documented ceiling. Decisions,
+  revisions, the lifecycle ledger, AI reasons and proposals, attribution and
+  evidence are protected from every automatic rule. There is no background
+  deleter, and `prune` without `--apply` is a usage error rather than a quiet
+  plan.
+- **none of it is reachable from a model.** No RPC method, no MCP tool, no hook
+  can create, read or restore a backup, or plan or apply a prune. The absence is
+  structural, and `tests/test_backup_live.c` proves it by asking a live daemon.
+
+Backups are **not encrypted and not signed**, and Atlas makes no durability
+claim against disk or kernel failure. See
+[docs/operations.md](docs/operations.md) for the whole contract, including what
+verification cannot catch.
+
+## Phase A4
 
 A4 turns model-generated proposals into durable decision documents with
 immutable revisions, an append-only lifecycle ledger, links to the code they
@@ -557,6 +600,18 @@ copied out of Atlas output can be pasted straight back in.
 - removing a repository detaches its decisions rather than deleting them, and a
   detached decision is invisible to every listing until the same canonical root
   is registered again
+- a backup is a plain, unencrypted, unsigned SQLite file; the reported SHA-256
+  detects damage and accident and is not a signature
+- SQLite has no per-page checksum, so a byte flipped inside an ordinary value
+  leaves a structurally valid database and no check Atlas can run will find it;
+  decision revisions are the exception, because each is rehashed from its stored
+  content
+- each backup is a whole copy of the index; there is no differential mode, and
+  no recovery to an instant between backups
+- `backup restore` and `maintenance prune` are writers, so both require the
+  daemon to be stopped
+- only `repo_events` is prunable; a large index is large because of `files`,
+  `commits` and the structural graph, and nothing prunes those by age
 - Atlas does not parse decision records out of a repository and does not write
   them into one; `atlas decision export` writes to stdout
 - history is read with `git log`, so a repository with an enormous history takes
@@ -652,7 +707,10 @@ copied out of Atlas output can be pasted straight back in.
 - [docs/decision-lifecycle.md](docs/decision-lifecycle.md) — the A4 decision
   model: the state machine, the operator channel and its honest limits, code
   links, migration and recovery
-- [docs/roadmap.md](docs/roadmap.md) — A5 and A6
+- [docs/operations.md](docs/operations.md) — the A5 operational contract:
+  backup, verification, atomic restore, the retention classification, and the
+  limitations of each
+- [docs/roadmap.md](docs/roadmap.md) — A6
 - [third_party/yyjson/PROVENANCE.md](third_party/yyjson/PROVENANCE.md) — the one
   vendored dependency, its exact upstream identity and its digests
 - [SECURITY.md](SECURITY.md) — threat model and reporting

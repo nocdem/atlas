@@ -335,7 +335,10 @@ atlas_status atlas_service_sync(atlas_ctx *ctx, const char *name, bool full, boo
     atlas_err_init(&sock_err);
     bool have_socket = (atlas_ipc_socket_path(&sock, &sock_err) == ATLAS_OK);
 
-    if (!have_socket || !atlas_ipc_daemon_reachable()) {
+    /* Reachability is not the question: a daemon that answers may own a
+     * different index, and routing to it would apply this sync there while
+     * `--data-dir` said otherwise. It has to own *this* context's directory. */
+    if (!have_socket || !atlas_ipc_daemon_owns(atlas_ctx_data_dir(ctx))) {
         atlas_buf_free(&sock);
         return sync_offline(ctx, name, full, out, err);
     }

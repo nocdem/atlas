@@ -240,7 +240,10 @@ static void test_tools_list_is_complete_and_strictly_schemad(void) {
     const atlas_jsonv *tools =
         atlas_jsonv_get(atlas_jsonv_get(atlas_jsondoc_root(doc), "result"), "tools");
     size_t n = atlas_jsonv_arr_len(tools);
-    T_CHECK_MSG(n >= 10, "expected at least 10 tools, got %zu", n);
+    /* A3 added six structural tools to A2's ten. The floor is asserted so a
+     * surface that silently shrinks is caught; the exact set is checked against
+     * atlas_mcp_tool_names() below. */
+    T_CHECK_MSG(n >= 16, "expected at least 16 tools, got %zu", n);
 
     /* The documented surface and the implemented one cannot drift: the header's
      * list is compared against what the process actually reported. */

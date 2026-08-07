@@ -58,6 +58,13 @@ void atlas_cli_print_help(FILE *out) {
         "  daemon ping                check whether the daemon is answering\n"
         "  sync NAME                  reconcile a repository now\n"
         "  events NAME                read the durable event journal\n"
+        "  code status NAME           report the structural index and how current it is\n"
+        "  code sync NAME [--rebuild] reindex structure now; --rebuild discards and redoes it\n"
+        "  code file NAME PATH        structural facts about one file\n"
+        "  code symbol NAME SYMBOL    every recorded site of a symbol, with callers and calls\n"
+        "  code search NAME QUERY     search indexed symbol names\n"
+        "  code deps NAME PATH        what a file depends on\n"
+        "  code impact NAME PATH      what may be affected if it changes (candidates, not proof)\n"
         "  service print              print the systemd user unit; changes nothing\n"
         "  service install --user     write the unit; never enables or starts it\n"
         "  service uninstall --user   remove the unit Atlas wrote\n"
@@ -68,13 +75,23 @@ void atlas_cli_print_help(FILE *out) {
         "  integrate claude install --user    record where this Atlas is, for the plugin\n"
         "  integrate claude uninstall --user  remove that record; never the index\n"
         "  version                    print the version\n"
-        "  help                       print this help\n"
+        "  help                       print this help\n",
+        ATLAS_VERSION_STRING, ATLAS_PHASE);
+    /* Split in two because ISO C only guarantees 4095-byte string literals, and
+     * A3's commands pushed the single literal past it. Same reason a migration
+     * is a list of statement groups rather than one string. */
+    (void)fprintf(
+        out,
         "\n"
         "options (accepted before or after the command; '--' ends option parsing):\n"
         "  --json                     emit stable JSON on stdout\n"
         "  --wait                     sync: wait for the reconciliation to complete\n"
         "  --full                     sync: re-read every file rather than only changes\n"
         "  --since CURSOR             events: start after this cursor\n"
+        "  --rebuild                  code sync: discard the structural index and rebuild it\n"
+        "  --depth N                  code deps/impact: traversal depth (max %d)\n"
+        "  --reverse                  code deps: report what depends on this instead\n"
+        "  --symbol                   code deps/impact: treat the operand as a symbol name\n"
         "  --user                     service: operate on the systemd *user* unit\n"
         "  --force                    service: replace or remove a unit Atlas did not write\n"
         "  --data-dir DIR             use DIR instead of the resolved data directory\n"
@@ -96,7 +113,7 @@ void atlas_cli_print_help(FILE *out) {
         "\n"
         "Atlas records facts only. It never infers why something changed: when a reason\n"
         "is requested it answers UNKNOWN.\n",
-        ATLAS_VERSION_STRING, ATLAS_PHASE, ATLAS_DEFAULT_LIMIT);
+        ATLAS_CODE_MAX_TRAVERSAL_DEPTH, ATLAS_DEFAULT_LIMIT);
 }
 
 void atlas_cli_print_version(FILE *out, bool json) {
@@ -153,6 +170,20 @@ static atlas_status parse_args(cli_state *st, int argc, char **argv, bool *want_
                 st->opts.wait = true;
             } else if (strcmp(a, "--full") == 0) {
                 st->opts.full = true;
+            } else if (strcmp(a, "--rebuild") == 0) {
+                st->opts.rebuild = true;
+            } else if (strcmp(a, "--reverse") == 0) {
+                st->opts.reverse = true;
+            } else if (strcmp(a, "--symbol") == 0) {
+                st->opts.symbol = true;
+            } else if (strcmp(a, "--depth") == 0) {
+                if (i + 1 >= argc) {
+                    return atlas_err_set(err, ATLAS_ERR_USAGE, "--depth needs a value");
+                }
+                atlas_status ds = parse_long(argv[++i], "--depth", &st->opts.depth, err);
+                if (ds != ATLAS_OK) {
+                    return ds;
+                }
             } else if (strcmp(a, "--user") == 0) {
                 st->opts.user = true;
             } else if (strcmp(a, "--force") == 0) {
@@ -650,6 +681,283 @@ static atlas_status call_daemon_mutation(cli_state *st, const char *method, cons
     atlas_buf_free(&sock);
     atlas_buf_free(&resp);
     return result;
+}
+
+/* --- A3: the `code` command group ----------------------------------------
+ *
+ * A diagnostic surface. Normal AI use is automatic — the daemon indexes and the
+ * MCP tools answer — and these exist so a person can see the same facts without
+ * a model in the loop, and so a failure can be inspected rather than inferred.
+ *
+ * Every subcommand goes through the service layer and hands rows to the same
+ * renderer interface both output modes implement, so the human and JSON forms
+ * cannot describe a repository differently. */
+
+static atlas_status code_symbol_sink(const atlas_code_symbol_row *row, void *ud, atlas_err *err) {
+    list_sink *ls = (list_sink *)ud;
+    return ls->r->v->code_symbol_item(ls->r, row, err);
+}
+
+static atlas_status code_edge_sink(const atlas_code_edge_row *row, void *ud, atlas_err *err) {
+    list_sink *ls = (list_sink *)ud;
+    return ls->r->v->code_edge_item(ls->r, row, err);
+}
+
+static atlas_status code_walk_sink(const atlas_code_walk_row *row, void *ud, atlas_err *err) {
+    list_sink *ls = (list_sink *)ud;
+    return ls->r->v->code_walk_item(ls->r, row, err);
+}
+
+static atlas_status run_code(cli_state *st, atlas_ctx *ctx, atlas_renderer *r, int64_t limit,
+                             atlas_err *err) {
+    if (st->operand_count == 0) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "usage: atlas code status|sync|file|symbol|search|deps|impact ...");
+    }
+    const char *sub = st->operands[0];
+    atlas_status result;
+
+    if (strcmp(sub, "status") == 0) {
+        if (st->operand_count != 2u) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE, "usage: atlas code status NAME");
+        }
+        atlas_code_status_report rep;
+        atlas_code_status_report_init(&rep);
+        result = atlas_service_code_status(ctx, st->operands[1], &rep, err);
+        if (result == ATLAS_OK) {
+            result = renderer_open(r, st->opts.json, st->out, "code status", err);
+            if (result == ATLAS_OK) {
+                result = r->v->code_status(r, &rep, err);
+            }
+            if (result == ATLAS_OK) {
+                result = renderer_close(r, err);
+            } else {
+                renderer_abort(r);
+            }
+        }
+        atlas_code_status_report_free(&rep);
+        return result;
+    }
+
+    if (strcmp(sub, "sync") == 0) {
+        if (st->operand_count != 2u) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "usage: atlas code sync NAME [--rebuild] [--wait]");
+        }
+        atlas_sync_report rep;
+        atlas_sync_report_init(&rep);
+        result = atlas_service_code_sync(ctx, st->operands[1], st->opts.rebuild, st->opts.wait,
+                                         st->opts.timeout_ms, &rep, err);
+        if (result == ATLAS_OK) {
+            result = renderer_open(r, st->opts.json, st->out, "code sync", err);
+            if (result == ATLAS_OK) {
+                result = r->v->note_repo(r, st->operands[1], err);
+            }
+            if (result == ATLAS_OK) {
+                result = r->v->sync(r, st->operands[1], &rep, err);
+            }
+            if (result == ATLAS_OK) {
+                result = renderer_close(r, err);
+            } else {
+                renderer_abort(r);
+            }
+        }
+        atlas_sync_report_free(&rep);
+        return result;
+    }
+
+    if (strcmp(sub, "file") == 0) {
+        if (st->operand_count != 3u) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE, "usage: atlas code file NAME PATH");
+        }
+        atlas_code_file_report rep;
+        atlas_code_file_report_init(&rep);
+        result = atlas_service_code_file(ctx, st->operands[1], st->operands[2], &rep, err);
+        if (result == ATLAS_OK) {
+            result = renderer_open(r, st->opts.json, st->out, "code file", err);
+        }
+        if (result == ATLAS_OK) {
+            result = r->v->note_repo(r, st->operands[1], err);
+        }
+        if (result == ATLAS_OK) {
+            result = r->v->code_file(r, &rep, err);
+        }
+        /* The lists follow the header, each with its own count, so a truncated
+         * one is visible rather than looking like an empty one. */
+        if (result == ATLAS_OK && rep.indexed) {
+            list_sink ls = {r};
+            int64_t count = 0;
+            bool more = false;
+            result = r->v->code_list_begin(r, "symbols", err);
+            if (result == ATLAS_OK) {
+                result = atlas_service_code_file_symbols(ctx, st->operands[1], st->operands[2],
+                                                         limit, code_symbol_sink, &ls, &count,
+                                                         &more, err);
+            }
+            if (result == ATLAS_OK) {
+                result = r->v->code_list_end(r, "symbols", "symbol", "symbols", count, more, err);
+            }
+            if (result == ATLAS_OK) {
+                result = r->v->code_list_begin(r, "includes", err);
+            }
+            if (result == ATLAS_OK) {
+                result = atlas_service_code_file_edges(ctx, st->operands[1], st->operands[2],
+                                                       "file_includes_file", false, limit,
+                                                       code_edge_sink, &ls, &count, &more, err);
+            }
+            if (result == ATLAS_OK) {
+                result = r->v->code_list_end(r, "includes", "include", "includes", count, more,
+                                             err);
+            }
+            if (result == ATLAS_OK) {
+                result = r->v->code_list_begin(r, "dependents", err);
+            }
+            if (result == ATLAS_OK) {
+                result = atlas_service_code_file_edges(ctx, st->operands[1], st->operands[2],
+                                                       "file_depends_on_file", true, limit,
+                                                       code_edge_sink, &ls, &count, &more, err);
+            }
+            if (result == ATLAS_OK) {
+                result = r->v->code_list_end(r, "dependents", "dependent", "dependents", count,
+                                             more, err);
+            }
+        }
+        if (result == ATLAS_OK) {
+            result = renderer_close(r, err);
+        } else {
+            renderer_abort(r);
+        }
+        atlas_code_file_report_free(&rep);
+        return result;
+    }
+
+    if (strcmp(sub, "symbol") == 0) {
+        if (st->operand_count != 3u) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE, "usage: atlas code symbol NAME SYMBOL");
+        }
+        result = renderer_open(r, st->opts.json, st->out, "code symbol", err);
+        if (result == ATLAS_OK) {
+            result = r->v->note_repo(r, st->operands[1], err);
+        }
+        list_sink ls = {r};
+        int64_t count = 0;
+        bool more = false;
+        /* Every recorded site, not one. Two files' identically named statics are
+         * two symbols, and answering with one would be choosing between things
+         * Atlas has deliberately kept distinct. */
+        if (result == ATLAS_OK) {
+            result = r->v->code_list_begin(r, "sites", err);
+        }
+        if (result == ATLAS_OK) {
+            result = atlas_service_code_symbol_sites(ctx, st->operands[1], st->operands[2], limit,
+                                                     code_symbol_sink, &ls, &count, &more, err);
+        }
+        if (result == ATLAS_OK) {
+            result = r->v->code_list_end(r, "sites", "site", "sites", count, more, err);
+        }
+        if (result == ATLAS_OK) {
+            result = r->v->code_list_begin(r, "callers", err);
+        }
+        if (result == ATLAS_OK) {
+            result = atlas_service_code_symbol_edges(ctx, st->operands[1], st->operands[2], true,
+                                                     limit, code_edge_sink, &ls, &count, &more,
+                                                     err);
+        }
+        if (result == ATLAS_OK) {
+            result = r->v->code_list_end(r, "callers", "caller", "callers", count, more, err);
+        }
+        if (result == ATLAS_OK) {
+            result = r->v->code_list_begin(r, "calls", err);
+        }
+        if (result == ATLAS_OK) {
+            result = atlas_service_code_symbol_edges(ctx, st->operands[1], st->operands[2], false,
+                                                     limit, code_edge_sink, &ls, &count, &more,
+                                                     err);
+        }
+        if (result == ATLAS_OK) {
+            result = r->v->code_list_end(r, "calls", "call", "calls", count, more, err);
+        }
+        if (result == ATLAS_OK) {
+            result = renderer_close(r, err);
+        } else {
+            renderer_abort(r);
+        }
+        return result;
+    }
+
+    if (strcmp(sub, "search") == 0) {
+        if (st->operand_count != 3u) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE, "usage: atlas code search NAME QUERY");
+        }
+        result = renderer_open(r, st->opts.json, st->out, "code search", err);
+        if (result == ATLAS_OK) {
+            result = r->v->note_repo(r, st->operands[1], err);
+        }
+        if (result == ATLAS_OK) {
+            list_sink ls = {r};
+            int64_t count = 0;
+            bool more = false;
+            result = r->v->list_begin(r, "symbols", err);
+            if (result == ATLAS_OK) {
+                result = atlas_service_code_symbol_search(ctx, st->operands[1], st->operands[2],
+                                                          NULL, limit, code_symbol_sink, &ls,
+                                                          &count, &more, err);
+            }
+            if (result == ATLAS_OK) {
+                result = r->v->list_end(r, "symbol", "symbols", count, err);
+            }
+        }
+        if (result == ATLAS_OK) {
+            result = renderer_close(r, err);
+        } else {
+            renderer_abort(r);
+        }
+        return result;
+    }
+
+    if (strcmp(sub, "deps") == 0 || strcmp(sub, "impact") == 0) {
+        if (st->operand_count != 3u) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "usage: atlas code %s NAME PATH [--depth N] [--symbol]", sub);
+        }
+        /* Impact is inbound by definition; `deps` is outbound unless asked to
+         * reverse. One traversal, two names for the two directions people
+         * actually ask in. */
+        bool inbound = (strcmp(sub, "impact") == 0) || st->opts.reverse;
+        const char *path = st->opts.symbol ? NULL : st->operands[2];
+        const char *symbol = st->opts.symbol ? st->operands[2] : NULL;
+
+        result = renderer_open(r, st->opts.json, st->out,
+                               strcmp(sub, "impact") == 0 ? "code impact" : "code deps", err);
+        if (result == ATLAS_OK) {
+            result = r->v->note_repo(r, st->operands[1], err);
+        }
+        atlas_code_walk_summary sum;
+        memset(&sum, 0, sizeof(sum));
+        if (result == ATLAS_OK) {
+            list_sink ls = {r};
+            result = r->v->list_begin(r, "candidates", err);
+            if (result == ATLAS_OK) {
+                result = atlas_service_code_walk(ctx, st->operands[1], path, symbol, inbound,
+                                                 st->opts.depth, limit, code_walk_sink, &ls, &sum,
+                                                 err);
+            }
+            if (result == ATLAS_OK) {
+                result = r->v->list_end(r, "candidate", "candidates", sum.emitted, err);
+            }
+            if (result == ATLAS_OK) {
+                result = r->v->code_walk_end(r, &sum, err);
+            }
+        }
+        if (result == ATLAS_OK) {
+            result = renderer_close(r, err);
+        } else {
+            renderer_abort(r);
+        }
+        return result;
+    }
+
+    return atlas_err_set(err, ATLAS_ERR_USAGE, "unknown code subcommand \"%s\"", sub);
 }
 
 static atlas_status run_command(cli_state *st, atlas_err *err) {
@@ -1163,6 +1471,8 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
             }
             atlas_repo_state_report_free(&state);
         }
+    } else if (strcmp(cmd, "code") == 0) {
+        result = run_code(st, ctx, &r, limit, err);
     } else {
         result = atlas_err_set(err, ATLAS_ERR_USAGE,
                                "unknown command \"%s\" (try: atlas help)", cmd);

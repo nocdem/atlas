@@ -19,9 +19,44 @@ contract; only the first two can exist in A0.
 | `UNKNOWN` | Atlas has no evidence | always |
 
 `atlas_db_evidence_insert` refuses anything other than `SOURCE` and `GIT` with
-exit code 7. This is enforced in code so that an A1 change cannot start writing
+exit code 7. This is enforced in code so that a later change cannot start writing
 inferred evidence by accident, and a test asserts no other kind can reach the
-table.
+table. **A3 did not relax it and does not write evidence at all** —
+`tests/test_code_trust.c` runs a structural pass and asserts the table gained
+nothing but `SOURCE` and `GIT`.
+
+## Structural facts have their own vocabulary
+
+A3 records what a lexical scan found in C source, and "how does Atlas know
+this?" and "what did a lexical scan guess?" are different questions. Reusing the
+evidence vocabulary would have merged them, so structural rows carry two columns
+of their own: a `provenance` saying where the fact came from, and a
+**resolution class** saying how firmly it is established.
+
+| Class | Means |
+| --- | --- |
+| `SOURCE_EXACT` | the bytes say so and nothing had to be decided — a `#include` directive is present; a header in the including file's own directory is what a quoted include names |
+| `BUILD_METADATA` | a validated `compile_commands.json` record says so |
+| `UNIQUE_LEXICAL` | exactly one lexical match in the repository. **Not compiler-proven** — one match, not one truth |
+| `AMBIGUOUS` | several matches, all recorded as candidates, none chosen |
+| `UNRESOLVED` | no match, with a typed reason: a system header, no definition found, indirect |
+| `CONDITIONAL` | found under an `#if` Atlas did not evaluate |
+| `MODEL_PROPOSAL` | a model said so. **A3 may not write it** — refused by `atlas_code_resolution_writable_in_a3`, the same shape as the rule above, one phase later |
+| `UNKNOWN` | Atlas has no basis |
+
+There is a third question neither column answers: which *algorithm* produced the
+fact. An upgrade that corrects the lexer leaves every stored resolution class
+looking exactly as trustworthy as before, on a graph that is now wrong in the way
+the upgrade fixed. `code_index_state.analyzer_id` records the producer — a pair
+of Atlas-owned constants, interned in `code_analyzers` — and a mismatch makes the
+graph stale until a pass rebuilds it. It is reported through `code status` and
+never through automatic context.
+
+The distinction the classes exist to keep is the one it would be easiest to lose:
+`identifier(` in a function body is *exactly* an identifier followed by a
+parenthesis, and that occurrence is `SOURCE_EXACT`. What it calls is a separate
+fact on a separate row, and it is a candidate. Full detail, including the
+explicit non-claims, is in [code-intelligence.md](code-intelligence.md).
 
 ## What A0 will not do
 

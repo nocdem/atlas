@@ -7,8 +7,20 @@ facts is trustworthy.
 > **Renumbering note.** The A0 roadmap listed decisions and ADRs as A1 and
 > compile-database parsing as A2. A1 was redirected to the daemon: an index that
 > has to be refreshed by hand is not one anybody keeps current, and every later
-> phase reads from it. Decisions and ADRs have moved to A3, and the phases after
-> it have shifted by one. The invariants at the bottom are unchanged.
+> phase reads from it. Decisions and ADRs moved to A3, and the phases after it
+> shifted by one.
+>
+> **Second renumbering.** A3 then became structural code intelligence — the old
+> A4 (compile databases) and A5 (symbols and the dependency graph) merged into
+> one phase — and decisions, ADRs and the approval workflow moved to A4. The
+> reason is the order of dependency rather than preference: a decision document
+> is only useful once Atlas can say what it is *about*, and "about" means files,
+> symbols and the relations between them. Linking a decision to a path Atlas
+> knows nothing structural about is a weaker link than the one A4 can now make.
+>
+> The invariants at the bottom are unchanged, and so is the rule that governs
+> both phases: an unlinked commit message is not a reason, and a graph edge is
+> not one either.
 
 ## A0 — native C foundation (done)
 
@@ -109,44 +121,76 @@ nobody explained.
 
 Two things A2 deliberately did **not** do: it records model proposals and has no
 approval workflow, because it cannot prove a human agreed to anything; and it
-does not parse decision documents from the repository, which is A3.
+does not parse decision documents from the repository, which is A4.
 
-## A3 — decisions, ADRs and change reasons
+## A3 — structural code intelligence and the relationship graph (done)
 
-Give Atlas something honest to say when asked "why".
+Make Atlas able to answer what a file is, what it is connected to, and what might
+be affected by changing it — without ever claiming to be a compiler.
+
+Delivered, in the same binary:
+
+- a first-party, bounded, dependency-free lexical C indexer: includes, macros,
+  function definitions and declarations, typedefs, tags, enum constants,
+  file-scope objects, linkage, and lexical call candidates with their enclosing
+  symbol
+- `compile_commands.json` ingested as **data**: an argument allowlist, paths
+  normalised lexically and checked against the repository, and the `command`
+  string hashed rather than stored. Nothing in it is ever executed, and there is
+  a test that plants a runnable helper in every field and asserts it never ran.
+- migration 5: the structural graph — files with typed evidence-backed roles,
+  translation units and their configurations, symbols as *sites*, call
+  candidates, one relation table with a resolution class on every edge, an
+  ambiguity candidate set, and bounded indexing errors
+- structural indexing as a **stage of the A1 pass**, selected by comparing
+  content hashes, so an unchanged pass parses zero files even when it is a full
+  content-verifying pass
+- `code.*` daemon methods, `atlas code status|sync|file|symbol|search|deps|impact`,
+  and six MCP tools
+- typed structural counters in the automatic context envelope, and not one
+  symbol name, path or include spelling
+
+The rule that governed this phase: **every fact carries how it was arrived at.**
+`SOURCE_EXACT`, `BUILD_METADATA`, `UNIQUE_LEXICAL`, `AMBIGUOUS`, `UNRESOLVED`,
+`CONDITIONAL`, `UNKNOWN` — and `MODEL_PROPOSAL`, which the indexer may not write,
+enforced the same way A2's approval restriction is. Two files' identically named
+statics stay two symbols. Two definitions of one external name stay a conflict.
+An impact result is a set of graph paths with the path shown, never a prediction.
+
+`evidence` is untouched: A3 writes none, and `atlas_db_evidence_insert` still
+refuses everything but `SOURCE` and `GIT`. Full detail and the explicit
+non-claims are in [code-intelligence.md](code-intelligence.md).
+
+## A4 — decisions, ADRs, summaries and approval
+
+Give Atlas something honest to say when asked "why", now that it can say what a
+thing *is*.
 
 - discover and parse Markdown decision records and ADRs in the repository
-- link decisions to the paths, commits and symbols they concern
+- link decisions to the paths, commits and **symbols** they concern, which is
+  what A3 made possible
 - introduce `DECISION` and `USER_STATEMENT` evidence, and lift the restriction in
   `atlas_db_evidence_insert` to exactly those two additional kinds
 - `atlas why PATH` answers with linked decisions, or `UNKNOWN` when there are none
+- the approval workflow A2 deliberately did not fake: a CLI command a person
+  runs, plus the migration that lifts `CHECK(approved = 0)`
+- natural-language file and subsystem summaries, built from A3's facts and held
+  to the same rule — a summary nobody approved is a proposal
 
-The rule that survives from A0: an unlinked commit message is still not a reason.
-A decision has to be recorded to be reported as one.
+The rule that survives from A0: an unlinked commit message is still not a reason,
+and neither is a graph edge. A decision has to be recorded to be reported as one.
 
-## A4 — compile_commands.json and clangd
+## A5 — clangd and toolchain truth
 
-- parse the compile database A0 already records, with the same bounded-memory and
-  hostile-input discipline as the Git parsers
-- resolve translation units, include paths and defines
 - integrate `clangd` as a subprocess through the existing safe process API, with
   the same argv allowlist treatment Git gets
+- upgrade the relations A3 resolves lexically to compiler-proven ones where
+  clangd can supply them, keeping the resolution class honest about which is
+  which
 - report toolchain and compile-database drift in `atlas doctor`
 
-## A5 — symbols, calls and the dependency graph
+## A6 — impact gates and stale-document detection
 
-- extract symbol definitions and references per translation unit
-- build a call graph and a file/module dependency graph
-- attach `SOURCE` evidence to every symbol fact and `INFERENCE` evidence, with the
-  derivation stated, to anything computed rather than read
-- `atlas symbol NAME`, `atlas callers NAME`, `atlas deps PATH`
-
-`INFERENCE` arrives here, and it arrives with its reasoning attached. An inference
-that cannot say how it was derived is not reportable.
-
-## A6 — impact analysis and stale-document gates
-
-- given a change, report the symbols, files, tests and decisions it touches
 - flag decision documents whose subject has changed since the decision was
   recorded
 - an exit-code contract usable as a CI gate, so a stale document can fail a build

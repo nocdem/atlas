@@ -142,7 +142,8 @@ the one thing it exists to do.
 
 ## MCP
 
-Ten tools. Seven read the index; three record what a model wants remembered.
+Sixteen tools. Thirteen read the index; three record what a model wants
+remembered. Ten came with A2 and six with A3.
 
 | tool | reads | provenance of the result |
 | --- | --- | --- |
@@ -156,6 +157,26 @@ Ten tools. Seven read the index; three record what a model wants remembered.
 | `atlas_record_reason` | — | records `MODEL_PROPOSAL` |
 | `atlas_record_unknown_reason` | — | records `UNKNOWN` |
 | `atlas_record_decision` | — | records `MODEL_PROPOSAL` |
+| `atlas_code_status` | structural currency, generation and counts | `ATLAS_OWNED` |
+| `atlas_code_symbol_search` | symbol sites matching a name fragment | `SOURCE` |
+| `atlas_code_symbol` | every recorded site of a name, with callers and callees | `SOURCE` |
+| `atlas_code_file` | roles, symbols, includes, call candidates, dependents | `SOURCE` |
+| `atlas_code_dependencies` | bounded traversal outward or inward | `INFERENCE` |
+| `atlas_code_impact` | inbound candidates, split by resolution class | `INFERENCE` |
+
+The six structural tools carry `untrusted_data: true` like every other tool that
+can return repository prose, and for the same reason: a symbol name and an
+include spelling are chosen by whoever wrote the repository. What is new is that
+each result also states the **resolution class** of every fact in it, and that
+`atlas_code_impact` says in its own description that its results are candidates
+to review rather than proof of breakage. A model that reads them as a compiler's
+answer has been told otherwise in the payload.
+
+`atlas_file_context` was **extended rather than duplicated**: it gained a
+`structure` object with the file's roles, symbol and include counts, and
+structural currency, so the tool a session already calls answers the structural
+question too. A second tool covering the same file would have been a second
+answer to maintain.
 
 Every schema sets `additionalProperties: false`. A tool that silently accepts an
 argument it does not implement lets a caller believe it asked for something.

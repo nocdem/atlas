@@ -31,6 +31,7 @@ void atlas_reconcile_opts_init(atlas_reconcile_opts *o) {
 void atlas_reconcile_summary_init(atlas_reconcile_summary *s) {
     memset(s, 0, sizeof(*s));
     atlas_buf_init(&s->truncated_reason);
+    atlas_code_pass_summary_init(&s->code);
 }
 
 void atlas_reconcile_summary_free(atlas_reconcile_summary *s) {
@@ -1422,6 +1423,45 @@ atlas_status atlas_reconcile_run(atlas_db *db, atlas_git *g, int64_t repo_id,
             }
             if (st != ATLAS_OK) {
                 goto done;
+            }
+        }
+
+        /* ---- the structural stage ----
+         *
+         * After the file index is applied, so the content hashes it compares
+         * against are this pass's. Before the published state, so a caller told
+         * the generation completed is told about a generation whose structural
+         * work also completed — there is no window in which the file index has
+         * moved on and the graph has not.
+         *
+         * It runs on this thread, which is the writer, and borrows the same
+         * worker pool the hash stage used. A failure degrades the structural
+         * index and is reported; it does not abandon the file index, which is
+         * already correct and useful on its own. */
+        if (!opts->skip_code) {
+            atlas_code_pass_opts copts;
+            atlas_code_pass_opts_init(&copts);
+            copts.workers = opts->workers;
+            copts.root_fd = atlas_git_root_fd(g);
+            copts.root_raw = atlas_git_root(g);
+            copts.root_len = copts.root_raw != NULL ? strlen((const char *)copts.root_raw) : 0;
+            copts.rebuild = opts->code_rebuild;
+
+            atlas_err cerr;
+            atlas_err_init(&cerr);
+            atlas_status cst =
+                atlas_code_pass_run(db, repo_id, generation, &copts, &summary->code, &cerr);
+            summary->code_ran = true;
+            if (cst != ATLAS_OK) {
+                /* Recorded, not propagated. The structural index says it is
+                 * degraded and `code_index_current` becomes false; the file
+                 * index this pass established is unaffected and stays
+                 * publishable. */
+                summary->code.degraded = true;
+                summary->code.degraded_reason = "the structural pass failed";
+                atlas_err ignore;
+                atlas_err_init(&ignore);
+                (void)atlas_db_code_state_set_error(db, repo_id, atlas_err_msg(&cerr), &ignore);
             }
         }
 

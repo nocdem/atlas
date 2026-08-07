@@ -622,11 +622,490 @@ static const char *const M1_STATEMENTS[] = {
     NULL,
 };
 
+/* Migration 5: the structural code graph (A3).
+ *
+ * Forward-only and purely additive. Every statement is a CREATE for a new
+ * object; no existing table is recreated, no existing column is altered, and no
+ * existing row is touched. A schema-v4 database migrates forward with everything
+ * intact, which `tests/test_migrate3.c` asserts by seeding a v2 database and
+ * driving it all the way here.
+ *
+ * The A0 rule is untouched again: `evidence` still CHECKs its six kinds and
+ * `atlas_db_evidence_insert` still refuses everything but SOURCE and GIT.
+ * Structural facts are a different kind of thing and carry their own
+ * `resolution` and `provenance` columns — the same separation A2 made for model
+ * records, and for the same reason. "How does Atlas know this?" and "what did a
+ * lexical scan guess?" must not become one question.
+ *
+ * Every table here references `repositories(id) ON DELETE CASCADE`, directly or
+ * through `code_files`, so `repo remove` remains a pure cascade.
+ *
+ * What a cascade does *not* cover is the ordinary case: `files` rows are
+ * tombstoned rather than deleted, so a foreign key from `files` would never
+ * fire on a deletion or a rename. Removing a file's graph rows is therefore
+ * explicit writer-path work, and `code_files` is keyed on `(repo_id, path_raw)`
+ * rather than on `files(id)` so that work is a single delete per path. */
+
+/* One row per repository, describing how current the structural index is.
+ *
+ * The generation pair mirrors `repo_index_state` exactly, and for the same
+ * reason: `last_complete_generation` is the only generation a reader is shown,
+ * so a crash half way through a structural pass is invisible rather than
+ * half-visible. It carries the *reconciliation* pass's generation number, so
+ * "the structural index describes the file index" is an integer comparison
+ * rather than a guess.
+ *
+ * The counters are recomputed at the end of each pass rather than incremented
+ * as rows are written. Incremented counters drift the first time a path fails
+ * part way through; recomputed ones cannot, and the cost is four indexed
+ * COUNT(*) queries per pass. */
+/* The producers Atlas has seen, interned.
+ *
+ * Both columns are Atlas-owned: `name` is a string literal in the binary and
+ * `version` is an integer the binary decides. Nothing here is derived from a
+ * repository, from a compile database or from a model, which is what makes the
+ * pair safe to report. A row is created the first time a producer indexes
+ * anything and is never updated, so an upgrade adds a row rather than rewriting
+ * the history of what built what. */
+static const char M5_CODE_ANALYZERS[] =
+    "CREATE TABLE code_analyzers ("
+    "  id INTEGER PRIMARY KEY,"
+    "  name TEXT NOT NULL,"
+    "  version INTEGER NOT NULL,"
+    "  first_seen_at TEXT,"
+    "  UNIQUE(name, version)"
+    ");";
+
+static const char M5_CODE_INDEX_STATE[] =
+    "CREATE TABLE code_index_state ("
+    "  repo_id INTEGER PRIMARY KEY REFERENCES repositories(id) ON DELETE CASCADE,"
+    "  generation INTEGER NOT NULL DEFAULT 0,"
+    "  last_complete_generation INTEGER NOT NULL DEFAULT 0,"
+    "  last_indexed_at TEXT,"
+    "  last_complete_at TEXT,"
+    /* Set when a parse failed, a ceiling was reached, or resolution had to fall
+     * back to the whole repository. While it is set, the structural index is
+     * never described as current. */
+    "  degraded INTEGER NOT NULL DEFAULT 0,"
+    "  degraded_reason TEXT,"
+    "  detail TEXT,"
+    "  last_error TEXT,"
+    "  files_indexed INTEGER NOT NULL DEFAULT 0,"
+    "  files_parsed_last INTEGER NOT NULL DEFAULT 0,"
+    "  symbols INTEGER NOT NULL DEFAULT 0,"
+    "  relations INTEGER NOT NULL DEFAULT 0,"
+    "  ambiguous INTEGER NOT NULL DEFAULT 0,"
+    "  unresolved INTEGER NOT NULL DEFAULT 0,"
+    "  compile_db_present INTEGER NOT NULL DEFAULT 0,"
+    "  compile_db_hash TEXT,"
+    "  compile_units INTEGER NOT NULL DEFAULT 0,"
+    "  compile_entries_dropped INTEGER NOT NULL DEFAULT 0,"
+    /* Which analyzer built this graph, as a reference into `code_analyzers`.
+     *
+     * Normalized on purpose. The alternative — a name and a version on every
+     * relation — would put two more columns on six hundred thousand rows to say
+     * the same thing six hundred thousand times, and a structural pass has
+     * exactly one producer. One integer per repository is the whole fact.
+     *
+     * It is a *reference* rather than the values themselves so the per-fact case
+     * stays reachable without a redesign: a future importer that mixes producers
+     * — an optional SCIP index for the files it covers and this lexical analyzer
+     * for the rest — adds `analyzer_id INTEGER REFERENCES code_analyzers(id)` to
+     * `code_relations`, and that is one integer per row rather than two strings,
+     * with the vocabulary already interned and already joined the same way. */
+    "  analyzer_id INTEGER REFERENCES code_analyzers(id),"
+    /* Whether every edge in the repository has been through resolution since
+     * the last thing that could change the answer.
+     *
+     * This is what lets a pass that parsed nothing skip resolution instead of
+     * re-attempting every unresolved edge. An UNRESOLVED edge becomes resolvable
+     * only when the candidate universe changes — a file appears or leaves, a
+     * definition is added or removed, the compile database changes — and all of
+     * those make a pass parse or remove something. Re-attempting them when
+     * nothing changed asks the same question of the same rows and gets the same
+     * answer, which at five thousand files took a minute per pass.
+     *
+     * It is durable, and cleared at the *start* of a pass rather than inferred
+     * at the end, so a crash half way through resolution leaves it 0 and the
+     * next pass resolves. A flag derived from "did the last pass complete?"
+     * would not survive that, which is the one case it exists for. */
+    "  resolve_settled INTEGER NOT NULL DEFAULT 0"
+    ");";
+
+/* One row per structurally indexed file.
+ *
+ * `content_hash` is the load-bearing column: it is the hash of the bytes these
+ * facts were extracted from, and selection for the next pass is a comparison
+ * against `files.content_hash`. That is what makes "an unchanged pass parses
+ * zero files" true even for a full content-verifying pass, which rehashes every
+ * byte and finds the same hash.
+ *
+ * Keyed on the raw path bytes like every other path in Atlas. */
+static const char M5_CODE_FILES[] =
+    "CREATE TABLE code_files ("
+    "  id INTEGER PRIMARY KEY,"
+    "  repo_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,"
+    /* A soft reference to `files(id)`, for diagnostics only. Not a foreign key:
+     * a tombstoned file keeps its row, so the FK would never fire where it is
+     * needed and would imply a cascade that does not exist. */
+    "  file_id INTEGER NOT NULL DEFAULT 0,"
+    "  path_raw BLOB NOT NULL,"
+    "  path_text TEXT NOT NULL,"
+    /* The last path component, indexed.
+     *
+     * Resolving `#include \"atlas/buf.h\"` against `include/atlas/buf.h` is a
+     * *suffix* match, and a suffix match has no index — so without this every
+     * unresolvable include (every `<stdio.h>`, every path Atlas cannot place)
+     * costs a full scan of this table. On a five-thousand-file repository that
+     * is tens of millions of row comparisons per pass, and it was the whole
+     * cost of the initial index before this column existed.
+     *
+     * A basename is derivable from `path_raw`, so this is denormalised on
+     * purpose: it turns the scan into a seek, and the suffix is still checked
+     * exactly against the handful of rows the seek returns. */
+    "  basename_raw BLOB NOT NULL DEFAULT x'',"
+    "  language TEXT NOT NULL CHECK(language IN ('c','c-header','c-fragment')),"
+    "  content_hash TEXT,"
+    "  generation INTEGER NOT NULL DEFAULT 0,"
+    "  parsed_at TEXT NOT NULL,"
+    "  parse_status TEXT NOT NULL CHECK(parse_status IN ('ok','partial','failed','skipped')),"
+    "  parse_detail TEXT,"
+    "  truncated INTEGER NOT NULL DEFAULT 0,"
+    "  truncated_reason TEXT,"
+    "  include_guard INTEGER NOT NULL DEFAULT 0,"
+    "  symbol_count INTEGER NOT NULL DEFAULT 0,"
+    "  include_count INTEGER NOT NULL DEFAULT 0,"
+    "  occurrence_count INTEGER NOT NULL DEFAULT 0,"
+    "  bytes INTEGER NOT NULL DEFAULT 0,"
+    "  lines INTEGER NOT NULL DEFAULT 0,"
+    "  UNIQUE(repo_id, path_raw)"
+    ");"
+    "CREATE INDEX idx_code_files_repo_text ON code_files(repo_id, path_text);"
+    "CREATE INDEX idx_code_files_repo_gen ON code_files(repo_id, generation);"
+    "CREATE INDEX idx_code_files_basename ON code_files(repo_id, basename_raw);";
+
+/* Typed, evidence-backed roles. A file may hold several, and each says how it
+ * was arrived at — path naming is evidence about a path, not proof about a
+ * file, and a consumer shown `role=test basis=path_naming` knows exactly how
+ * much Atlas knows. */
+static const char M5_CODE_FILE_ROLES[] =
+    "CREATE TABLE code_file_roles ("
+    "  id INTEGER PRIMARY KEY,"
+    "  code_file_id INTEGER NOT NULL REFERENCES code_files(id) ON DELETE CASCADE,"
+    "  role TEXT NOT NULL CHECK(role IN"
+    "    ('implementation','public_header','private_header','test','build_metadata',"
+    "     'documentation','vendored','generated','unknown')),"
+    "  basis TEXT NOT NULL CHECK(basis IN"
+    "    ('extension','path_naming','content_marker','build_metadata','include_graph','none')),"
+    "  resolution TEXT NOT NULL CHECK(resolution IN"
+    "    ('SOURCE_EXACT','BUILD_METADATA','UNIQUE_LEXICAL','AMBIGUOUS','UNRESOLVED',"
+    "     'CONDITIONAL','MODEL_PROPOSAL','UNKNOWN')),"
+    "  UNIQUE(code_file_id, role, basis)"
+    ");";
+
+/* A symbol is a *site*, not a global entity.
+ *
+ * Two files each defining `static void helper(void)` produce two rows and
+ * nothing merges them, because merging them would be a decision a lexical
+ * indexer has no basis for. Cross-file identity is expressed by edges in
+ * `code_relations` with a resolution class attached.
+ *
+ * `linkage` is load-bearing rather than decorative: an `internal` definition is
+ * a candidate only for occurrences in the same file. `none` is the
+ * preprocessor's answer, and `unknown` is a real outcome the extractor reports
+ * rather than guesses past. */
+static const char M5_CODE_SYMBOLS[] =
+    "CREATE TABLE code_symbols ("
+    "  id INTEGER PRIMARY KEY,"
+    "  repo_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,"
+    "  code_file_id INTEGER NOT NULL REFERENCES code_files(id) ON DELETE CASCADE,"
+    /* Raw name bytes are the lookup key; `name_text` is the safe display form,
+     * exactly as with paths. A C identifier is ASCII in practice and not
+     * guaranteed to be, and the one place that assumption is wrong is the one
+     * place it matters. */
+    "  name BLOB NOT NULL,"
+    "  name_text TEXT NOT NULL,"
+    "  kind TEXT NOT NULL CHECK(kind IN"
+    "    ('function','macro','macro_function','typedef','struct','union','enum',"
+    "     'enum_constant','variable','unknown')),"
+    "  linkage TEXT NOT NULL CHECK(linkage IN ('external','internal','none','unknown')),"
+    "  resolution TEXT NOT NULL CHECK(resolution IN"
+    "    ('SOURCE_EXACT','BUILD_METADATA','UNIQUE_LEXICAL','AMBIGUOUS','UNRESOLVED',"
+    "     'CONDITIONAL','MODEL_PROPOSAL','UNKNOWN')),"
+    "  is_definition INTEGER NOT NULL DEFAULT 0,"
+    "  is_declaration INTEGER NOT NULL DEFAULT 0,"
+    "  line INTEGER NOT NULL DEFAULT 0,"
+    "  col INTEGER NOT NULL DEFAULT 0,"
+    "  byte_offset INTEGER NOT NULL DEFAULT 0,"
+    "  end_line INTEGER NOT NULL DEFAULT 0,"
+    "  enclosing_id INTEGER REFERENCES code_symbols(id) ON DELETE SET NULL,"
+    "  generation INTEGER NOT NULL DEFAULT 0,"
+    "  UNIQUE(code_file_id, kind, name, byte_offset)"
+    ");"
+    /* Resolution looks symbols up by name and linkage across a repository, and
+     * the graph queries look them up by file. Both directions are indexed
+     * because both are on a hot path.
+     *
+     * `linkage` is in the repository-wide index deliberately, and it is the
+     * difference between linear and quadratic. Every file in a large C project
+     * has a `static` helper with the same handful of names, so a lookup of
+     * `helper` across the repository visits one index entry per file — and
+     * without linkage in the index, each of those entries costs a row fetch and
+     * a join before being discarded. With it, the filter happens inside the
+     * index and the discarded entries cost almost nothing.
+     *
+     * The by-file index carries `name` for the same reason: an internal symbol
+     * is a candidate only inside its own file, so that lookup is
+     * `(code_file_id, name)` and must be a seek rather than a scan of the file's
+     * symbols. */
+    "CREATE INDEX idx_code_symbols_name ON code_symbols(repo_id, name, linkage, is_definition);"
+    "CREATE INDEX idx_code_symbols_text ON code_symbols(repo_id, name_text);"
+    "CREATE INDEX idx_code_symbols_file ON code_symbols(code_file_id, name);"
+    /* Same reason as `idx_code_occ_enclosing`: `enclosing_id` is a self
+     * reference with ON DELETE SET NULL, and enforcing it without an index on
+     * the child column is a scan of this table per deleted symbol. */
+    "CREATE INDEX idx_code_symbols_enclosing ON code_symbols(enclosing_id);";
+
+/* A lexical call candidate inside a function body.
+ *
+ * The occurrence's *existence* is exact: those bytes really are an identifier
+ * followed by `(`. What it refers to is a separate fact, carried by the
+ * `symbol_calls_symbol` relation this row owns. */
+static const char M5_CODE_OCCURRENCES[] =
+    "CREATE TABLE code_occurrences ("
+    "  id INTEGER PRIMARY KEY,"
+    "  repo_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,"
+    "  code_file_id INTEGER NOT NULL REFERENCES code_files(id) ON DELETE CASCADE,"
+    "  enclosing_id INTEGER REFERENCES code_symbols(id) ON DELETE CASCADE,"
+    "  name BLOB NOT NULL,"
+    "  name_text TEXT NOT NULL,"
+    "  kind TEXT NOT NULL CHECK(kind IN ('call_candidate')),"
+    "  resolution TEXT NOT NULL CHECK(resolution IN"
+    "    ('SOURCE_EXACT','BUILD_METADATA','UNIQUE_LEXICAL','AMBIGUOUS','UNRESOLVED',"
+    "     'CONDITIONAL','MODEL_PROPOSAL','UNKNOWN')),"
+    "  line INTEGER NOT NULL DEFAULT 0,"
+    "  col INTEGER NOT NULL DEFAULT 0,"
+    "  byte_offset INTEGER NOT NULL DEFAULT 0,"
+    "  generation INTEGER NOT NULL DEFAULT 0,"
+    "  UNIQUE(code_file_id, byte_offset)"
+    ");"
+    "CREATE INDEX idx_code_occ_file ON code_occurrences(code_file_id);"
+    "CREATE INDEX idx_code_occ_name ON code_occurrences(repo_id, name);"
+    /* Not for a query — for the foreign key.
+     *
+     * `enclosing_id` cascades from `code_symbols`, and SQLite enforces a cascade
+     * by looking for children of the row being deleted. Without an index on the
+     * child column that lookup is a full scan of this table, once per deleted
+     * symbol; reparsing one file deletes a dozen symbols and so scanned every
+     * occurrence in the repository a dozen times. An unindexed foreign key is
+     * invisible until the table is large, and then it is most of what a
+     * one-file update costs. */
+    "CREATE INDEX idx_code_occ_enclosing ON code_occurrences(enclosing_id);";
+
+/* Every edge, in one table, with a typed endpoint on each side.
+ *
+ * One table rather than one per relation kind, and the reason is the queries
+ * rather than tidiness: inbound and outbound traversal become the same query
+ * shape over two indexes, which is what keeps reverse-dependency and impact
+ * bounded and fast at two hundred thousand edges. Ten tables would mean ten
+ * unions per traversal step.
+ *
+ * `dst_name` carries the *spelling* — the include text, the callee identifier —
+ * and is kept whether or not the edge resolved. An include Atlas cannot place is
+ * still a recorded fact; dropping it would be a silence, and "this file includes
+ * something called config.h that I cannot find" is exactly the kind of thing a
+ * reader needs to know.
+ *
+ * `owner_file_id` is what makes incremental replacement per file rather than
+ * per repository: reindexing one file is one delete by this column followed by
+ * the inserts. */
+static const char M5_CODE_RELATIONS[] =
+    "CREATE TABLE code_relations ("
+    "  id INTEGER PRIMARY KEY,"
+    "  repo_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,"
+    "  owner_file_id INTEGER NOT NULL REFERENCES code_files(id) ON DELETE CASCADE,"
+    "  kind TEXT NOT NULL CHECK(kind IN"
+    "    ('file_includes_file','file_defines_symbol','file_declares_symbol',"
+    "     'unit_compiles_file','unit_uses_header','symbol_contains_occurrence',"
+    "     'symbol_calls_symbol','symbol_declared_by','symbol_defined_by',"
+    "     'file_depends_on_file')),"
+    "  src_kind TEXT NOT NULL CHECK(src_kind IN ('file','symbol','unit','occurrence')),"
+    "  src_id INTEGER NOT NULL,"
+    "  dst_kind TEXT NOT NULL CHECK(dst_kind IN"
+    "    ('file','symbol','unit','occurrence','unresolved')),"
+    "  dst_id INTEGER NOT NULL DEFAULT 0,"
+    "  dst_name BLOB,"
+    "  dst_name_text TEXT,"
+    /* How the destination was spelled, for the one relation kind where the
+     * spelling changes what it means: a compiler searches the including file's
+     * own directory for `\"x.h\"` and does not for `<x.h>`. Without this, an
+     * angle include of a system header would resolve against a same-named file
+     * next to the includer and be recorded as exact. NULL for every other
+     * kind. */
+    "  spelling_form TEXT CHECK(spelling_form IS NULL OR spelling_form IN ('quote','angle')),"
+    "  resolution TEXT NOT NULL CHECK(resolution IN"
+    "    ('SOURCE_EXACT','BUILD_METADATA','UNIQUE_LEXICAL','AMBIGUOUS','UNRESOLVED',"
+    "     'CONDITIONAL','MODEL_PROPOSAL','UNKNOWN')),"
+    "  provenance TEXT NOT NULL CHECK(provenance IN"
+    "    ('SOURCE','BUILD_METADATA','INFERENCE','UNKNOWN')),"
+    "  candidate_count INTEGER NOT NULL DEFAULT 0,"
+    /* A fixed Atlas vocabulary (the ATLAS_CODE_WHY_* strings), never assembled
+     * from repository bytes: this value reaches a model's context. */
+    "  detail TEXT,"
+    "  line INTEGER NOT NULL DEFAULT 0,"
+    "  col INTEGER NOT NULL DEFAULT 0,"
+    "  generation INTEGER NOT NULL DEFAULT 0"
+    ");"
+    "CREATE INDEX idx_code_rel_src ON code_relations(repo_id, src_kind, src_id, kind);"
+    "CREATE INDEX idx_code_rel_dst ON code_relations(repo_id, dst_kind, dst_id, kind);"
+    "CREATE INDEX idx_code_rel_owner ON code_relations(owner_file_id);"
+    /* Re-resolution finds edges by the name they mention, which is how a header
+     * that gains a definition updates the call sites elsewhere that name it
+     * without anything being reparsed.
+     *
+     * `id` is not named because it does not have to be: `id` is the rowid, and
+     * SQLite appends the rowid to every index. So this index is really ordered
+     * by `(repo_id, kind, dst_name, id)`, and the by-name resolution sweep's
+     * `AND r.id > ?` cursor is a range constraint on it rather than a filter. */
+    "CREATE INDEX idx_code_rel_name ON code_relations(repo_id, kind, dst_name);"
+    /* The paging key for a resolution sweep that is *not* restricted to a name.
+     *
+     * Without it, `WHERE repo_id=? AND kind=? AND id > ? ORDER BY id LIMIT n`
+     * reached its rows through `idx_code_rel_name`, which orders by `dst_name`
+     * and therefore cannot satisfy the ORDER BY. SQLite compensated with a temp
+     * B-tree — so every page sorted *every* edge of that kind in the repository
+     * and then discarded all but `n` of them. Paging through the whole kind
+     * repeated that once per page, which is quadratic in the repository: at five
+     * thousand files it was, measured, the dominant cost of both the initial
+     * pass and every pass afterwards.
+     *
+     * With this index the cursor is a seek and the LIMIT stops the scan, so a
+     * sweep costs one pass over the kind however many pages it takes. */
+    "CREATE INDEX idx_code_rel_kind_id ON code_relations(repo_id, kind, id);";
+/* There is deliberately no index on `resolution` alone.
+ *
+ * It looks useful — the resolution sweeps filter on it and the state counters
+ * count by it — and it is not. The sweeps reach their rows through
+ * `idx_code_rel_kind_id` and filter resolution from the row; the counters run
+ * once per pass that wrote anything and are perfectly happy to scan. What an
+ * index on it would cost is a B-tree insertion on every one of a few hundred
+ * thousand relation inserts, and an update on every resolution — for a column
+ * whose value changes for most rows during the pass that inserts them. */
+
+/* The candidate set behind an AMBIGUOUS edge.
+ *
+ * Atlas does not choose between same-named symbols, so the alternatives are
+ * stored rather than discarded. `candidate_count` on the relation reports the
+ * true number even when more candidates existed than are kept here, so the
+ * ambiguity is never understated by the ceiling. */
+static const char M5_CODE_CANDIDATES[] =
+    "CREATE TABLE code_candidates ("
+    "  id INTEGER PRIMARY KEY,"
+    "  relation_id INTEGER NOT NULL REFERENCES code_relations(id) ON DELETE CASCADE,"
+    "  node_kind TEXT NOT NULL CHECK(node_kind IN ('file','symbol','unit')),"
+    "  node_id INTEGER NOT NULL,"
+    "  rank INTEGER NOT NULL DEFAULT 0,"
+    "  detail TEXT,"
+    "  UNIQUE(relation_id, node_kind, node_id)"
+    ");"
+    "CREATE INDEX idx_code_candidates_rel ON code_candidates(relation_id, rank);";
+
+/* One translation unit, from a validated compile-database record.
+ *
+ * `command_hash` and `command_present` are the whole of what is kept from the
+ * `command` string. The string itself is deliberately not stored: it is a shell
+ * command line, Atlas has no use for it beyond noticing that it changed, and a
+ * value nothing holds is a value nothing can accidentally run.
+ *
+ * `(source_path_raw, output)` rather than source alone: one file compiled twice
+ * with different flags is two configurations, and collapsing them would lose
+ * exactly the distinction a compile database exists to record. */
+static const char M5_CODE_UNITS[] =
+    "CREATE TABLE code_units ("
+    "  id INTEGER PRIMARY KEY,"
+    "  repo_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,"
+    "  source_path_raw BLOB NOT NULL,"
+    "  source_path_text TEXT NOT NULL,"
+    "  output_text TEXT NOT NULL DEFAULT '',"
+    "  directory_text TEXT NOT NULL DEFAULT '',"
+    "  language_standard TEXT,"
+    "  explicit_language TEXT,"
+    "  arg_count INTEGER NOT NULL DEFAULT 0,"
+    "  dropped_args INTEGER NOT NULL DEFAULT 0,"
+    "  command_present INTEGER NOT NULL DEFAULT 0,"
+    "  command_hash TEXT,"
+    "  entry_index INTEGER NOT NULL DEFAULT 0,"
+    "  generation INTEGER NOT NULL DEFAULT 0,"
+    "  UNIQUE(repo_id, source_path_raw, output_text)"
+    ");"
+    "CREATE INDEX idx_code_units_repo ON code_units(repo_id, source_path_text);";
+
+/* An include directory a unit was configured with.
+ *
+ * `external` marks a directory outside the registered repository. It is stored
+ * because it explains why an include resolved to nothing, and it is **never**
+ * opened: nothing in Atlas reads a file from an external include directory.
+ * Recording where a build looks is not the same as being allowed to look
+ * there. */
+static const char M5_CODE_UNIT_INCLUDES[] =
+    "CREATE TABLE code_unit_includes ("
+    "  id INTEGER PRIMARY KEY,"
+    "  unit_id INTEGER NOT NULL REFERENCES code_units(id) ON DELETE CASCADE,"
+    "  kind TEXT NOT NULL CHECK(kind IN ('search','quote','system','after')),"
+    "  dir_raw BLOB NOT NULL,"
+    "  dir_text TEXT NOT NULL,"
+    "  external INTEGER NOT NULL DEFAULT 0,"
+    "  rank INTEGER NOT NULL DEFAULT 0,"
+    "  UNIQUE(unit_id, kind, dir_raw)"
+    ");"
+    "CREATE INDEX idx_code_unit_inc_unit ON code_unit_includes(unit_id, rank);";
+
+static const char M5_CODE_UNIT_DEFINES[] =
+    "CREATE TABLE code_unit_defines ("
+    "  id INTEGER PRIMARY KEY,"
+    "  unit_id INTEGER NOT NULL REFERENCES code_units(id) ON DELETE CASCADE,"
+    "  name TEXT NOT NULL,"
+    "  value TEXT,"
+    "  undef INTEGER NOT NULL DEFAULT 0,"
+    "  rank INTEGER NOT NULL DEFAULT 0,"
+    "  UNIQUE(unit_id, name, undef)"
+    ");";
+
+/* Bounded indexing errors and truncation state.
+ *
+ * A ceiling that is reached silently is a ceiling that makes the index look
+ * complete when it is not, so every one of them lands here and the repository is
+ * marked degraded. Rows are pruned to ATLAS_CODE_ERRORS_RETAIN_PER_REPO; the
+ * degraded flag is not, because the flag is the durable statement and these are
+ * the detail behind it. */
+static const char M5_CODE_INDEX_ERRORS[] =
+    "CREATE TABLE code_index_errors ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  repo_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,"
+    "  path_text TEXT,"
+    "  kind TEXT NOT NULL CHECK(kind IN"
+    "    ('parse_failed','parse_partial','truncated','binary','too_large',"
+    "     'compile_db_error','resolve_fallback','pass_truncated')),"
+    "  detail TEXT,"
+    "  generation INTEGER NOT NULL DEFAULT 0,"
+    "  created_at TEXT NOT NULL"
+    ");"
+    "CREATE INDEX idx_code_errors_repo ON code_index_errors(repo_id, id);";
+
+static const char *const M5_STATEMENTS[] = {
+    /* `code_analyzers` first: `code_index_state` references it. */
+    M5_CODE_ANALYZERS,
+    M5_CODE_INDEX_STATE, M5_CODE_FILES,        M5_CODE_FILE_ROLES,   M5_CODE_SYMBOLS,
+    M5_CODE_OCCURRENCES, M5_CODE_RELATIONS,    M5_CODE_CANDIDATES,   M5_CODE_UNITS,
+    M5_CODE_UNIT_INCLUDES, M5_CODE_UNIT_DEFINES, M5_CODE_INDEX_ERRORS, NULL,
+};
+
 static const atlas_migration MIGRATIONS[] = {
     {1, "initial schema", M1_STATEMENTS},
     {2, "worktree identity", M2_STATEMENTS},
     {3, "continuous indexing state", M3_STATEMENTS},
     {4, "AI sessions, change reasons and decisions", M4_STATEMENTS},
+    {5, "structural code graph", M5_STATEMENTS},
 };
 
 const atlas_migration *atlas_migrations(size_t *count_out) {
@@ -658,7 +1137,7 @@ static atlas_status record_migration(atlas_db *db, const atlas_migration *m, atl
     char now[ATLAS_TS_MAX];
     atlas_now_iso8601(now, sizeof(now));
     if (sqlite3_bind_int(stmt, 1, m->version) != SQLITE_OK) {
-        sqlite3_finalize(stmt);
+        atlas_db_finish(db, stmt);
         return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind migration version");
     }
     st = atlas_db_bind_text_opt(db, stmt, 2, m->name, err);
@@ -666,7 +1145,7 @@ static atlas_status record_migration(atlas_db *db, const atlas_migration *m, atl
         st = atlas_db_bind_text_opt(db, stmt, 3, now, err);
     }
     if (st != ATLAS_OK) {
-        sqlite3_finalize(stmt);
+        atlas_db_finish(db, stmt);
         return st;
     }
     return atlas_db_step_done(db, stmt, err);
@@ -814,12 +1293,12 @@ atlas_status atlas_db_fts_file_delete(atlas_db *db, int64_t file_id, const char 
         return st;
     }
     if (sqlite3_bind_int64(stmt, 1, file_id) != SQLITE_OK) {
-        sqlite3_finalize(stmt);
+        atlas_db_finish(db, stmt);
         return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind file id");
     }
     st = atlas_db_bind_text_opt(db, stmt, 2, path_text != NULL ? path_text : "", err);
     if (st != ATLAS_OK) {
-        sqlite3_finalize(stmt);
+        atlas_db_finish(db, stmt);
         return st;
     }
     return atlas_db_step_done(db, stmt, err);
@@ -843,12 +1322,12 @@ atlas_status atlas_db_fts_file_upsert(atlas_db *db, int64_t file_id, const char 
         return st;
     }
     if (sqlite3_bind_int64(stmt, 1, file_id) != SQLITE_OK) {
-        sqlite3_finalize(stmt);
+        atlas_db_finish(db, stmt);
         return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind file id");
     }
     st = atlas_db_bind_text_opt(db, stmt, 2, new_path_text != NULL ? new_path_text : "", err);
     if (st != ATLAS_OK) {
-        sqlite3_finalize(stmt);
+        atlas_db_finish(db, stmt);
         return st;
     }
     return atlas_db_step_done(db, stmt, err);
@@ -866,7 +1345,7 @@ atlas_status atlas_db_fts_commit_insert(atlas_db *db, int64_t commit_id, const c
         return st;
     }
     if (sqlite3_bind_int64(stmt, 1, commit_id) != SQLITE_OK) {
-        sqlite3_finalize(stmt);
+        atlas_db_finish(db, stmt);
         return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind commit id");
     }
     st = atlas_db_bind_text_opt(db, stmt, 2, subject != NULL ? subject : "", err);
@@ -875,7 +1354,7 @@ atlas_status atlas_db_fts_commit_insert(atlas_db *db, int64_t commit_id, const c
                                   err);
     }
     if (st != ATLAS_OK) {
-        sqlite3_finalize(stmt);
+        atlas_db_finish(db, stmt);
         return st;
     }
     return atlas_db_step_done(db, stmt, err);

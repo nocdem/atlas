@@ -110,6 +110,7 @@ add_library(atlas_core STATIC
   src/db/db_index.c
   src/db/db_search.c
   src/db/db_state.c
+  src/db/db_code.c
   src/git/git.c
   src/git/git_harden.c
   src/git/git_parse.c
@@ -138,10 +139,19 @@ add_library(atlas_core STATIC
   src/ipc/reply.c
   src/ipc/json_read.c
   src/ipc/server_ai.c
+  src/ipc/server_code.c
   src/hook/hook.c
   src/mcp/mcp.c
   src/mcp/mcp_tools.c
   src/core/integrate.c
+  src/core/service_code.c
+  # --- A3: structural code intelligence ---------------------------------
+  src/code/code.c
+  src/code/extract.c
+  src/code/compdb.c
+  src/code/resolve.c
+  src/code/index.c
+  src/code/query.c
 )
 
 target_include_directories(atlas_core

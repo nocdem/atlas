@@ -26,6 +26,13 @@ typedef struct atlas_cli_opts {
     bool user;   /* `service install --user`: required, and the only mode */
     bool force;
     bool run_once; /* `daemon run --once`: test hook, undocumented in help */
+    /* A3. `rebuild` discards the structural index rather than reindexing what
+     * changed — a separate request from `full`, which re-reads file content and
+     * still parses nothing when the hashes match. */
+    bool rebuild;
+    bool reverse; /* `code deps`: report what depends on this instead */
+    bool symbol;  /* `code deps`/`code impact`: the operand is a symbol name */
+    long depth;
     long since;
     const char *data_dir;
     long limit;

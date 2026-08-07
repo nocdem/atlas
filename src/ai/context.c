@@ -263,6 +263,32 @@ atlas_status atlas_ai_context_render(const atlas_ai_context *c, atlas_buf *out, 
             st = atlas_buf_appendf(out, err, "session=%lld change_set=%lld\n",
                                    (long long)c->session_id, (long long)c->change_set_id);
         }
+        /* A3: integers and a boolean, and nothing else.
+         *
+         * The structural index knows symbol names, include spellings and file
+         * paths, and not one of them is here. Every one is chosen by whoever can
+         * commit — `ignore_previous_instructions` is a legal C identifier, and a
+         * header can be called anything — so the rule the envelope has always
+         * had applies unchanged: no field may hold a value somebody else chose.
+         * A consumer that wants a name asks for it through an explicit MCP tool,
+         * where it arrives labelled UNTRUSTED_DATA.
+         *
+         * Every byte emitted here is a digit, a lowercase letter, `_` or `=`,
+         * all of which the existing allowlist already permits — so nothing about
+         * `atlas_ai_context_is_bounded` had to be widened to fit A3, and the
+         * renderer's check of its own output still holds. */
+        if (st == ATLAS_OK) {
+            st = atlas_buf_appendf(out, err, "code_index_current=%s code_generation=%lld\n",
+                                   c->code_index_current ? "true" : "false",
+                                   (long long)c->code_generation);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_buf_appendf(out, err,
+                                   "code_symbols=%lld code_relations=%lld code_ambiguous=%lld "
+                                   "code_unresolved=%lld\n",
+                                   (long long)c->code_symbols, (long long)c->code_relations,
+                                   (long long)c->code_ambiguous, (long long)c->code_unresolved);
+        }
     }
     if (st != ATLAS_OK) {
         return st;

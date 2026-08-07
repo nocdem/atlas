@@ -11,21 +11,59 @@
 
 #include "atlas/db.h"
 
+/* Distinct SQL statements one handle keeps prepared.
+ *
+ * Comfortably above the number of statements any one pass issues, so the hot
+ * path never evicts. Past it a caller simply prepares afresh, which is exactly
+ * what every caller did before the cache existed. */
+#define ATLAS_DB_STMT_CACHE 128u
+
+typedef struct atlas_db_cached_stmt {
+    /* The SQL *pointer*, not its contents: every call site passes a string
+     * literal with static storage duration, so the pointer is a stable identity
+     * and the lookup is a pointer compare. */
+    const char *sql;
+    sqlite3_stmt *stmt;
+    /* True while a caller holds it. A statement handed out twice would have its
+     * iteration reset mid-flight by the second holder, so a re-entrant use gets
+     * a freshly prepared one instead. */
+    bool in_use;
+} atlas_db_cached_stmt;
+
 struct atlas_db {
     sqlite3 *h;
     atlas_db_caps caps;
     int tx_depth;
     bool fts_ready;  /* the FTS5 shadow tables exist */
     bool read_only;  /* opened SQLITE_OPEN_READONLY; no write may be attempted */
+    /* One cache per handle, and a handle belongs to one thread — the same rule
+     * the rest of the daemon already keeps, so there is nothing to synchronise. */
+    atlas_db_cached_stmt stmt_cache[ATLAS_DB_STMT_CACHE];
+    size_t stmt_cache_count;
 };
 
 /* Wraps the last sqlite error into `err` with `what` as context. */
 atlas_status atlas_db_fail(atlas_db *db, atlas_err *err, atlas_status st, const char *what);
 
 atlas_status atlas_db_exec_sql(atlas_db *db, const char *sql, atlas_err *err);
+/* Prepares `sql`, or returns the cached statement for it reset and unbound.
+ *
+ * `sql` must have static storage duration: the cache is keyed on the pointer.
+ * A constructed string simply misses the cache. */
 atlas_status atlas_db_prepare(atlas_db *db, const char *sql, sqlite3_stmt **out, atlas_err *err);
 
-/* Step a statement expected to yield no rows, then finalize it. */
+/* Returns a statement to the cache, or finalises it when it is not cached.
+ *
+ * **Every site in src/db calls this instead of `sqlite3_finalize`.** Finalising
+ * a cached statement would leave the cache holding a dangling pointer, so the
+ * two are not interchangeable. */
+void atlas_db_finish(atlas_db *db, sqlite3_stmt *stmt);
+
+/* Finalises everything the cache holds. Called at close, before the sqlite
+ * handle goes: an open statement would keep it from closing. */
+void atlas_db_cache_clear(atlas_db *db);
+
+/* Step a statement expected to yield no rows, then release it. */
 atlas_status atlas_db_step_done(atlas_db *db, sqlite3_stmt *stmt, atlas_err *err);
 
 /* Single-value queries. */

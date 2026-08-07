@@ -4,7 +4,7 @@ The database is a **rebuildable index**. Every row in it is derived from Git or
 from the working tree, and every row can be reconstructed by rescanning. Nothing
 in Atlas treats it as the canonical record of history.
 
-Current schema version: **4**. `atlas doctor` reports the version in force and the
+Current schema version: **5**. `atlas doctor` reports the version in force and the
 version the binary expects.
 
 ## Migrations
@@ -31,6 +31,11 @@ Applied so far:
    `repo_index_state`, `repo_events`, `repo_commit_tips` and `daemon_state`.
 4. **AI sessions, change reasons and decisions** — the A2 tables, plus the
    per-path working-tree change snapshot. See "Migration 4" below.
+5. **structural code graph** — the A3 tables: structurally indexed files with
+   typed roles, translation units and their configurations, symbols, call
+   candidates, relations with a resolution class, ambiguity candidates, the
+   interned analyzer identities that produced them, and bounded indexing errors.
+   See "Migration 5" below.
 
 FTS5 objects are deliberately **not** part of a numbered migration: whether FTS5
 exists is a property of the linked SQLite build, not of the schema. They are
@@ -157,7 +162,8 @@ contributes no `file_changes` rows.
 
 ### `compile_databases`
 
-Recorded in A0, parsed in A2. One row per `compile_commands.json` found, unique on
+Recorded in A0, parsed in A3 — the A0 note said A2 and the phase slipped. One row
+per `compile_commands.json` found, unique on
 `(repo_id, path_raw)`, holding whether it is a regular file, whether it is a
 symlink, its content hash (of the link text when it is a symlink), its size, and a
 `parsed` flag that is always 0 in A0. Atlas looks for it both among tracked files
@@ -479,3 +485,314 @@ Tables: `ai_clients`, `ai_sessions`, `ai_session_repos`, `ai_session_events`,
 
 Every one of them references `repositories(id)` or `ai_sessions(id)` with
 `ON DELETE CASCADE`, so `repo remove` remains a pure cascade.
+
+## Migration 5 — the structural code graph (A3)
+
+A2 answered "who changed this and did anybody say why". A3 answers "what is this,
+what is it connected to, and what might a change to it reach" — and it has to
+answer without ever claiming to be a compiler.
+
+Nothing in migration 5 is destructive. Every statement is a `CREATE` for a new
+object, so a schema-v4 database migrates forward with its rows intact and no
+existing table is recreated. `tests/test_migrate3.c` seeds a v2 database and
+drives it all the way here; `tests/test_ai_schema.c` asserts migrating twice
+changes nothing.
+
+**The A0 rule is untouched for the third time.** `evidence` still `CHECK`s its
+six kinds, `atlas_db_evidence_insert` still refuses everything but `SOURCE` and
+`GIT`, and A3 writes no evidence at all. `tests/test_code_trust.c` runs a
+structural pass and asserts the evidence table gained nothing but `SOURCE` and
+`GIT`. Structural facts are a different kind of thing: they carry their own
+resolution class and their own provenance column, because "how does Atlas know
+this?" and "what did a lexical scan guess?" must stay different questions.
+
+### Resolution is a column, not a convention
+
+Every symbol, occurrence, relation and role carries a `resolution` constrained to
+`SOURCE_EXACT`, `BUILD_METADATA`, `UNIQUE_LEXICAL`, `AMBIGUOUS`, `UNRESOLVED`,
+`CONDITIONAL`, `MODEL_PROPOSAL` or `UNKNOWN`. The vocabulary is complete across
+phases so the schema is stable; `MODEL_PROPOSAL` is in it and A3 may not write
+it, refused by `atlas_code_resolution_writable_in_a3` and by the one place on the
+write path that checks — the same shape as A2's approval restriction.
+
+Full detail, including the explicit non-claims, is in
+[code-intelligence.md](code-intelligence.md).
+
+### `code_analyzers` — who produced the graph
+
+Two columns and both are Atlas-owned: `name` is a string literal in the binary
+(`atlas-c-lexical`) and `version` is an integer the binary decides. Nothing here
+is derived from a repository, a compile database or a model, which is what makes
+the pair safe to report to a model.
+
+It exists because provenance and resolution answer two questions and there is a
+third. Provenance says which source a fact was read from; resolution says how
+firmly it was established; neither says which *algorithm* produced it. Upgrade
+Atlas with a corrected lexer, change not one byte of the repository, and every
+generation still lines up while the graph is now wrong in exactly the way the
+upgrade fixed — and reports itself current.
+
+`code_index_state.analyzer_id` references one row here, so the fact is stored
+once per repository rather than once per relation. It is a reference rather than
+the values themselves so the per-fact case stays reachable: a future producer
+that mixes sources adds `analyzer_id INTEGER REFERENCES code_analyzers(id)` to
+`code_relations` — one integer per row against a vocabulary already interned.
+
+Rows are never updated. An analyzer identity is a historical fact about what
+built something, not a setting, so an upgrade adds a row and leaves the record
+of what produced the previous graph intact.
+
+### `code_index_state` — one row per repository
+
+The generation pair mirrors `repo_index_state` exactly, and holds the
+*reconciliation* pass's generation, so "does the graph describe the file index?"
+is an integer comparison rather than an inference from timestamps.
+`last_complete_generation` advances with `max()` for the same reason it does
+there. `degraded` is the honesty bit: while it is set, `code_index_current` is
+false.
+
+The counters (`symbols`, `relations`, `ambiguous`, `unresolved`) are recomputed
+from the tables at the end of each pass rather than incremented as rows are
+written. An incremented counter drifts the first time a path fails part way
+through and nothing notices; five `COUNT(*)` queries cannot.
+
+They are recomputed on every pass that could have written a row and skipped on
+one that provably could not. Two of the five are full scans of the relation
+table by design — there is no index on `resolution` — so at half a million edges
+they were most of what an otherwise empty pass cost, and running them to confirm
+a number that cannot have moved is the same mistake as reparsing an unchanged
+file.
+
+`analyzer_id` is what makes an upgrade visible. A mismatch against the binary's
+own constants makes `code_index_current` false with the fixed reason *"the
+structural index was produced by a different analyzer version"*, and the next
+ordinary pass rebuilds — deleting only `code_files` and `code_units` and the
+rows that cascade from them, so sessions, reasons, decisions, evidence, commits
+and the file index come through untouched.
+
+`resolve_settled` is what makes skipping the *rest* of such a pass safe. It
+records that every edge has been through resolution since the last thing that
+could change an answer, and a pass with no file parsed, none removed and no
+compile-database change skips resolution entirely when it is set. It is cleared
+by `atlas_db_code_state_begin`, before any work, and set by
+`atlas_db_code_state_complete` — so a pass that died half way through resolution
+leaves it 0 and the next pass sweeps the repository. Inferring it from "did the
+last pass complete?" would not survive that, which is the one case it exists for.
+
+### `code_files` — and why `content_hash` is the load-bearing column
+
+One row per structurally indexed file, keyed on `(repo_id, path_raw)` like every
+other path in Atlas. `content_hash` is the hash of the bytes the facts were
+extracted from, and selection for the next pass is a comparison against
+`files.content_hash`.
+
+That comparison is the whole incremental story. It is deliberately *not* "was
+this file hashed by this pass": a full content-verifying pass rehashes every byte
+and finds the same hash, so an unchanged repository still parses nothing — and
+the five-minute periodic full pass does not reparse the world every five minutes.
+
+`basename_raw` is denormalised from `path_raw` and indexed. Resolving `#include
+"atlas/buf.h"` against `include/atlas/buf.h` is a suffix match, and a suffix
+match has no index; without a basename to seek on, every unresolvable include
+cost a full scan of the table.
+
+Keyed on the path rather than on `files(id)` because `files` rows are
+**tombstoned rather than deleted**. A foreign key from `files` would fire only on
+`repo remove`, which is the one case it is not needed for, so removing a file's
+graph rows is explicit writer-path work — see below.
+
+### `code_file_roles` — the basis travels with the role
+
+A file may hold several roles, and each row records the `basis` it was arrived
+at on: `extension`, `path_naming`, `content_marker`, `build_metadata`,
+`include_graph` or `none`. A file under `tests/` is *named* like a test; that is
+a fact about the path and not proof about the file, and the basis is what keeps
+the difference legible rather than flattened into an assertion.
+
+### `code_symbols` — a symbol is a site
+
+Two files each defining `static void helper(void)` produce two rows and nothing
+merges them. Merging them would be a decision a lexical indexer has no basis for,
+so cross-file identity is expressed by edges with a resolution class instead.
+
+`linkage` (`external`, `internal`, `none`, `unknown`) is load-bearing rather than
+descriptive: an internal-linkage definition is a candidate only for occurrences
+in its own file, and that rule lives in the SQL so no caller can forget it. It is
+also in the repository-wide index, because a lookup of a name every file defines
+must not fetch and discard one row per file.
+
+### `code_relations` — one table, two indexes, a class on every edge
+
+Every edge, with a typed endpoint on each side. One table rather than one per
+kind, and the reason is the queries rather than tidiness: inbound and outbound
+traversal become the same shape over `idx_code_rel_src` and `idx_code_rel_dst`,
+which is what keeps reverse-dependency and impact bounded and fast at hundreds of
+thousands of edges.
+
+`dst_name` carries the *spelling* — the include text, the callee identifier — and
+is kept whether or not the edge resolved, because "this file includes something
+called `config.h` that I cannot place" is a fact and dropping it would be a
+silence. `spelling_form` distinguishes `"x.h"` from `<x.h>`, which changes what
+the spelling means: a compiler searches the including file's own directory for
+the first and not for the second.
+
+`owner_file_id` is what makes replacement per file rather than per repository:
+reindexing one file is one delete by that column followed by the inserts.
+
+There is deliberately **no index on `resolution` alone**. It looks useful and is
+not: the sweeps reach their rows through `(repo_id, kind, id)` and filter
+resolution from the row, and the two per-pass counters are happy to scan. What
+such an index would cost is a B-tree insertion on every one of a few hundred
+thousand relation inserts, for a column whose value changes for most rows during
+the same pass.
+
+`idx_code_rel_kind_id(repo_id, kind, id)` is the paging key, and it exists
+because of a query plan rather than a query. A resolution sweep reads
+`WHERE repo_id=? AND kind=? AND id > ? ORDER BY id LIMIT n`; without this index
+SQLite reached those rows through `idx_code_rel_name`, which orders by
+`dst_name` and cannot satisfy the ORDER BY, so it built a temp B-tree — sorting
+*every* edge of that kind and discarding all but `n`. Paging repeated that once
+per page, which is quadratic in the repository. `idx_code_rel_name` needs no
+such companion: `id` is the rowid, SQLite appends the rowid to every index, so
+the by-name form is already ordered by `(repo_id, kind, dst_name, id)`.
+
+`idx_code_files_basename` is named explicitly by the include-resolution
+statement with `INDEXED BY`, and that is worth reading as documentation rather
+than as tuning. `code_files` has two indexes beginning with `repo_id` — this one
+and the implicit index behind `UNIQUE(repo_id, path_raw)` — and left to choose
+between them for a basename lookup SQLite took the unique one, seeking on
+`repo_id` alone and scanning every file in the repository. Measured, that was
+5 444 rows visited per unresolvable include across 6 836 of them: thirty-seven
+million row visits, and the largest single cost of a structural pass.
+
+`INDEXED BY` is the opposite of a planner hint. It is a hard constraint: drop or
+rename the index and the statement fails to prepare with a clear error, rather
+than quietly becoming a scan again. `tests/test_code_graph.c` asserts both that
+the index exists and that a query of that shape reaches its rows through it.
+
+Two more indexes exist for foreign keys rather than for queries:
+`idx_code_symbols_enclosing` and `idx_code_occ_enclosing`. `enclosing_id`
+cascades from `code_symbols`, and SQLite enforces a cascade by looking for
+children of the row being deleted; without an index on the child column that
+lookup is a full scan, once per deleted symbol. Reparsing one file deletes a
+dozen symbols, so it scanned every occurrence in the repository a dozen times.
+An unindexed foreign key is invisible until the table is large, and then it is
+most of what a one-file update costs.
+
+### One relation kind is recognised and deliberately not written
+
+`symbol_contains_occurrence` is in the vocabulary and in the `CHECK`, and the
+built-in analyzer never writes one. The containment fact is stored — as
+`code_occurrences.enclosing_id`, the column the extractor writes it to, with a
+foreign key and an index. Storing it a second time as an edge cost 235 520 rows
+on the acceptance fixture, 38 % of the whole relation table, five index
+insertions each, and no query in Atlas ever read one.
+
+The kind stays because a producer with no occurrence table of its own would need
+it, and keeping it makes that an insert rather than a migration.
+
+### `code_candidates` — the alternatives, kept
+
+Atlas does not choose between same-named symbols, so an `AMBIGUOUS` edge stores
+its candidates. `candidate_count` on the relation reports the true number even
+when more existed than the ceiling keeps, so a bound never makes an ambiguity
+look smaller than it is.
+
+### `code_units`, `code_unit_includes`, `code_unit_defines`
+
+One row per translation unit from a validated compile-database record, keyed
+`(source, output)` so one file compiled twice with different flags stays two
+configurations.
+
+`command_hash` and `command_present` are the whole of what is kept from the
+`command` string. The string itself is deliberately not stored: it is a shell
+command line, Atlas has no use for it beyond noticing that it changed, and a
+value nothing holds is a value nothing can accidentally run.
+
+An include directory outside the repository is stored with `external = 1`. It
+explains why an include resolved to nothing, and it is **never opened**:
+recording where a build looks is not the same as being allowed to look there.
+
+### `code_index_errors`
+
+Bounded, and the reason every ceiling lands here: a limit reached silently is a
+limit that makes the index look complete when it is not. Rows are pruned to
+`ATLAS_CODE_ERRORS_RETAIN_PER_REPO`; the `degraded` flag is not pruned with them,
+because the flag is the durable statement and these are the detail behind it.
+
+### Invalidation is targeted, and that is also the point
+
+An edge that resolved to a symbol of a file about to be reparsed points at an id
+that is about to stop existing. `atlas_db_code_relations_unsettle_for_file` puts
+those edges back to UNRESOLVED *before* the delete, reaching them through
+`idx_code_rel_dst` from the ids it is about to remove. Afterwards the ids are
+gone and only a left join over every relation could find the damage — which is
+what `atlas_db_code_relations_dangling` does, and why it is now reserved for the
+rebuild path, where a scan is proportionate.
+
+### Deletion is explicit, and that is the point
+
+`files` rows are tombstoned rather than removed, so `ON DELETE CASCADE` from
+`files` never fires on an ordinary deletion or rename. Every structural pass asks
+which `code_files` rows have no live `files` row and deletes them, cascading the
+symbols, occurrences, relations, candidates and roles they own — then re-resolves
+the edges that pointed at them, found by a left join rather than guessed at.
+
+A rename is a tombstone plus an addition in `files`, and therefore a removal plus
+a parse here. Nothing has to recognise a rename as such, which is what makes the
+stale-row case impossible rather than handled.
+
+### What migration 5 creates
+
+Tables: `code_analyzers`, `code_index_state`, `code_files`, `code_file_roles`,
+`code_symbols`, `code_occurrences`, `code_relations`, `code_candidates`,
+`code_units`, `code_unit_includes`, `code_unit_defines`, `code_index_errors`.
+
+`code_analyzers` is created first, because `code_index_state` references it.
+
+Every one references `repositories(id)` or `code_files(id)` with
+`ON DELETE CASCADE`, so `repo remove` remains a pure cascade.
+
+## The prepared-statement cache
+
+Not a schema change, but a property of every query above.
+
+`atlas_db_prepare` returns a cached statement when it has one, keyed on the SQL
+*pointer* — every call site passes a string literal with static storage duration,
+so the pointer is a stable identity. `atlas_db_finish` returns it rather than
+finalising it, and every site in `src/db` calls that instead of
+`sqlite3_finalize`.
+
+A0 and A1 issued one or two statements per file and never noticed the cost of
+preparing them. A3 issues a few hundred — a symbol, an occurrence and several
+relations per file, then a resolution per edge — and preparing them all afresh
+was, measured, half the cost of indexing a large repository.
+
+One cache per handle, and a handle belongs to one thread, so there is nothing to
+synchronise: that is the rule the daemon already keeps. A cached statement that
+is already stepping is marked in use and a re-entrant caller gets a fresh one,
+because handing out the same statement twice would reset an iteration mid-flight.
+
+## Two pragmas the graph made necessary
+
+`PRAGMA cache_size=-65536`. SQLite's default page cache is about two megabytes:
+ample for an index of paths and commits, nothing at all for a graph whose
+indexes are hundreds of megabytes. Negative means kibibytes rather than pages,
+so the ceiling does not move with the page size, and it is a cache — an upper
+bound, not a commitment.
+
+`PRAGMA temp_store=MEMORY`. Every `INSERT ... RETURNING id` makes SQLite
+materialise the returned row in an ephemeral table, and with the default
+`temp_store` an ephemeral table is a *file*: created, written and unlinked once
+per inserted row. Sampling the structural pass on the acceptance fixture found
+the writer inside `pwrite` on that temporary file in almost every sample — the
+single largest cost of building the graph, and none of it was the graph. What
+goes to memory instead is bounded by what Atlas asks for: one row per RETURNING,
+and sorters for queries that are all limited.
+
+The relation insert goes further and drops RETURNING altogether. It is the only
+one of Atlas' inserts that is a plain insert with no `ON CONFLICT`, so
+`last_insert_rowid()` is the id and nothing has to be read back — and it runs a
+hundred times per file, more than every other insert in A3 put together. Its
+neighbours keep RETURNING because an upsert may take the update branch, where
+the last inserted rowid is not the row's.

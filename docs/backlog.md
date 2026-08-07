@@ -218,8 +218,81 @@ the vocabulary with nothing able to produce it.
 
 *What would close it:* a CLI command a person runs — `atlas decision approve
 <id>` — which is the only actor Atlas can distinguish from a model, plus the
-migration that lifts the `CHECK`. Deliberately deferred to A3, where decision
-documents arrive and there is something to approve *against*.
+migration that lifts the `CHECK`. A3 turned out to be about structure rather
+than about decisions, so this moves to A4, which is where decision documents
+arrive and there is something to approve *against*.
+
+## Carried out of A3
+
+### 15. Structural indexing has one producer, and mixing them is future work
+
+`code_analyzers` interns a producer identity and `code_index_state.analyzer_id`
+records which one built a repository's graph — one integer per repository,
+because a structural pass has exactly one producer. A future importer that mixes
+sources, an optional SCIP index for the files it covers with the lexical
+analyzer for the rest, needs the same reference on `code_relations`.
+
+*What would close it:* `analyzer_id INTEGER REFERENCES code_analyzers(id)` on
+`code_relations`, populated by whichever producer wrote the row, and a currency
+rule that is per-producer rather than per-repository. The schema is shaped for
+it — one integer per row against a vocabulary already interned — and nothing in
+A3 implements any of it. No SCIP, no Clang, no LSP, no plugin loader.
+
+### 16. The initial structural index was over its own target — closed
+
+Kept for the record because the three things that fixed it are the three things
+to look for next time.
+
+On a 5 444-file fixture the first pass took **62.4 s** against a 60 s target,
+split evenly between applying rows and resolving them. It is now **45–48 s on a
+larger fixture** — 5 988 files and 515 822 lines — and none of it came from
+relaxing anything:
+
+- **A relation kind that duplicated an indexed column.**
+  `symbol_contains_occurrence` restated `code_occurrences.enclosing_id` as an
+  edge: 38 % of the relation table, five index insertions each, read by no
+  query in Atlas. Not written any more; the kind stays in the vocabulary.
+- **An index the planner would not use.** The include suffix lookup could seek
+  `idx_code_files_basename` and instead scanned every file in the repository,
+  because `UNIQUE(repo_id, path_raw)` gives a competing index with the same
+  first column. `INDEXED BY` settles it — a hard constraint, not a hint, so the
+  statement fails loudly if the index ever goes away.
+- **A sort of zero rows, a quarter of a million times.** Candidate lookup
+  ordered its results with an ORDER BY no index could satisfy, so SQLite built a
+  temporary B-tree per lookup — almost always to sort nothing. It now asks
+  unordered and asks again, ordered, only when there turns out to be more than
+  one candidate, which is the only case where the order is reported.
+
+None of these traded correctness for speed and none is a planner trick: the
+first removes duplication, the second is checked by a test that asserts the
+query plan, and the third runs the identical query on the only path where its
+answer is observable.
+
+### 17. A shared-header edit costs its true blast radius, which is large
+
+Editing a header that every module includes takes **3.5 s**, against 0.75 s for
+an implementation file. That is not a defect — every call site naming a changed
+declaration genuinely has to be re-resolved, and it is resolution rather than
+reparsing, which is the property A3 promised. But it is the one incremental case
+that is seconds rather than milliseconds, and a real project's `common.h` looks
+exactly like this.
+
+*What would close it:* nothing cheap. Re-resolving fewer edges means deciding
+that some call sites cannot have changed, and the only sound basis for that is
+knowing the declaration's *content* did not change — a diff at symbol
+granularity rather than at file granularity. That is a real feature, not a
+tuning knob.
+
+### 18. Structural indexing has no per-repository opt-out
+
+Every registered repository is structurally indexed on every reconciliation
+pass. There is no way to say "index this one's files but not its structure", and
+for a repository with half a million lines of C that nobody asks structural
+questions about, the first pass is a minute of work for nothing.
+
+*What would close it:* a per-repository flag honoured by
+`atlas_reconcile_opts.skip_code`, which already exists and is currently only set
+by tests.
 
 ## Fixed during the A2 attribution pass
 

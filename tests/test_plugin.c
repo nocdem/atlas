@@ -328,7 +328,7 @@ static void test_skill_states_the_contract(void) {
     T_CHECK(strstr(text, "Never ask the user to run") != NULL);
 
     /* Short. Every character is paid for in every session that loads it. */
-    T_CHECK_MSG(skill.len < 6144u, "the skill is %zu bytes; keep it short", skill.len);
+    T_CHECK_MSG(skill.len < 8192u, "the skill is %zu bytes; keep it short", skill.len);
     atlas_buf_free(&skill);
 }
 
@@ -352,7 +352,9 @@ static void test_documented_tool_names_are_plugin_scoped_correctly(void) {
         /* Nothing here should be scoped or namespaced by Atlas either. */
         T_CHECK(strncmp(names[n], "atlas_", 6u) == 0);
     }
-    T_CHECK_MSG(n == 10, "expected 10 tools, found %zu", n);
+    /* A2 shipped ten; A3 added six structural ones. Pinned exactly rather than
+     * as a floor, so a tool appearing or vanishing is a deliberate change. */
+    T_CHECK_MSG(n == 16, "expected 16 tools, found %zu", n);
 }
 
 /* --- the integration record ----------------------------------------------

@@ -20,7 +20,7 @@
 #include "atlas/error.h"
 #include "atlas/limits.h"
 
-#define ATLAS_SCHEMA_VERSION 4
+#define ATLAS_SCHEMA_VERSION 5
 
 typedef struct atlas_db atlas_db;
 
@@ -889,6 +889,574 @@ atlas_status atlas_db_ai_decisions_search(atlas_db *db, int64_t repo_id, const c
  * reason of any kind recorded. */
 atlas_status atlas_db_ai_repo_record_counts(atlas_db *db, int64_t repo_id, int64_t *proposed,
                                             int64_t *approved, int64_t *reasons, atlas_err *err);
+
+/* --- A3: the structural code graph ---------------------------------------
+ *
+ * Typed operations over the migration-5 tables. sqlite3 types stay in src/db as
+ * everywhere else; the extraction and resolution logic lives in src/code.
+ *
+ * The A0 evidence restriction is untouched by all of this: nothing here writes
+ * to `evidence`, and `atlas_db_evidence_insert` still refuses everything but
+ * SOURCE and GIT. Structural facts carry their own resolution and provenance
+ * columns, for the same reason A2's model records do. */
+
+/* How current one repository's structural index is.
+ *
+ * The generation pair mirrors `atlas_index_state` deliberately: it holds the
+ * *reconciliation* pass generation whose structural work completed, so "does
+ * the graph describe the file index?" is an integer comparison rather than an
+ * inference from timestamps. */
+typedef struct atlas_code_index_state {
+    int64_t repo_id;
+    int64_t generation;
+    int64_t last_complete_generation;
+    char last_indexed_at[ATLAS_TS_MAX];
+    char last_complete_at[ATLAS_TS_MAX];
+    bool degraded;
+    atlas_buf degraded_reason; /* a fixed Atlas string */
+    atlas_buf detail;
+    atlas_buf last_error;
+    int64_t files_indexed;
+    int64_t files_parsed_last;
+    int64_t symbols;
+    int64_t relations;
+    int64_t ambiguous;
+    int64_t unresolved;
+    bool compile_db_present;
+    atlas_buf compile_db_hash;
+    int64_t compile_units;
+    int64_t compile_entries_dropped;
+    /* The analyzer that produced the stored graph, read back from
+     * `code_analyzers`. Empty and 0 when nothing has indexed yet. A mismatch
+     * against ATLAS_CODE_ANALYZER_ID / ATLAS_CODE_ANALYZER_VERSION means the
+     * graph was built by a different algorithm and is stale however well its
+     * generations line up. */
+    atlas_buf analyzer_name;
+    int64_t analyzer_version;
+    /* Every edge has been through resolution since the last thing that could
+     * change the answer. A pass that parsed and removed nothing, and found the
+     * compile database unchanged, skips resolution entirely when this is set.
+     * Cleared by atlas_db_code_state_begin, set by atlas_db_code_state_complete,
+     * so it is false after a crash rather than optimistically true. */
+    bool resolve_settled;
+    bool present; /* false when no row exists yet */
+} atlas_code_index_state;
+
+void atlas_code_index_state_init(atlas_code_index_state *s);
+void atlas_code_index_state_free(atlas_code_index_state *s);
+
+atlas_status atlas_db_code_state_get(atlas_db *db, int64_t repo_id, atlas_code_index_state *out,
+                                     atlas_err *err);
+atlas_status atlas_db_code_state_ensure(atlas_db *db, int64_t repo_id, atlas_err *err);
+/* Interns one Atlas-owned producer identity and returns its row id, creating the
+ * row the first time it is seen. `name` is always a string literal in the Atlas
+ * binary; nothing repository-controlled or model-controlled may reach it. */
+atlas_status atlas_db_code_analyzer_intern(atlas_db *db, const char *name, int64_t version,
+                                           int64_t *id_out, atlas_err *err);
+/* Records which analyzer built the repository's current graph. */
+atlas_status atlas_db_code_state_set_analyzer(atlas_db *db, int64_t repo_id, int64_t analyzer_id,
+                                              atlas_err *err);
+/* Claims the structural generation for this pass. Mirrors
+ * atlas_db_generation_begin: visible immediately, published only at the end. */
+atlas_status atlas_db_code_state_begin(atlas_db *db, int64_t repo_id, int64_t generation,
+                                       atlas_err *err);
+/* Publishes `generation`, recomputes the counters from the tables, and records
+ * the degraded state. Advanced with max() like every other published
+ * generation, so a slow pass finishing after a newer one cannot move the
+ * published state backwards.
+ *
+ * The counters are recomputed rather than incremented: an incremented counter
+ * drifts the first time a path fails part way through, and five COUNT(*)
+ * queries are cheaper than a number nobody can trust.
+ *
+ * `recount` says whether to run them. Pass false only for a pass that provably
+ * wrote nothing — no file parsed, none removed, no compile-database change, and
+ * resolution already settled — because two of the five counts scan the relation
+ * table and confirming a number that cannot have moved is not free.
+ *
+ * Also sets `resolve_settled`, which `atlas_db_code_state_begin` cleared. */
+atlas_status atlas_db_code_state_complete(atlas_db *db, int64_t repo_id, int64_t generation,
+                                          int64_t files_parsed, bool degraded,
+                                          const char *degraded_reason, const char *detail,
+                                          bool recount, atlas_err *err);
+atlas_status atlas_db_code_state_set_error(atlas_db *db, int64_t repo_id, const char *detail,
+                                           atlas_err *err);
+atlas_status atlas_db_code_state_set_compile_db(atlas_db *db, int64_t repo_id, bool present,
+                                                const char *hash, int64_t units, int64_t dropped,
+                                                atlas_err *err);
+
+/* --- selection ----------------------------------------------------------- */
+
+/* One file the structural pass has to parse, or one whose graph rows must go.
+ * Borrowed pointers, valid for the callback only, exactly like every other row
+ * callback in this header. */
+typedef struct atlas_code_todo_row {
+    int64_t file_id;      /* the `files` row; 0 for a removal */
+    int64_t code_file_id; /* the `code_files` row; 0 when there is none yet */
+    const void *path_raw;
+    size_t path_raw_len;
+    const char *path_text;
+    const char *content_hash; /* NULL for a removal */
+    const char *language;     /* the atlas_code_language wire name */
+} atlas_code_todo_row;
+
+typedef atlas_status (*atlas_code_todo_cb)(const atlas_code_todo_row *row, void *ud,
+                                           atlas_err *err);
+
+/* Streams the files whose stored graph facts no longer match their content.
+ *
+ * This one query is what makes the incremental guarantees fall out rather than
+ * being aimed at. It compares `files.content_hash` against the hash the graph
+ * rows were built from, so an unchanged pass selects nothing **even when it was
+ * a full content-verifying pass** — a full pass rehashes every byte and finds
+ * the same hash — and a one-file edit selects one file.
+ *
+ * Ordered by raw path bytes, so the parse order and therefore every id
+ * allocation is deterministic regardless of worker scheduling. */
+atlas_status atlas_db_code_files_to_parse(atlas_db *db, int64_t repo_id, int64_t limit,
+                                          atlas_code_todo_cb cb, void *ud, int64_t *count_out,
+                                          bool *more_out, atlas_err *err);
+/* Streams `code_files` rows whose path is gone from the index or tombstoned.
+ *
+ * Deletion is explicit writer-path work rather than a foreign key, because
+ * `files` rows are tombstoned rather than removed: a cascade from `files` would
+ * fire only on `repo remove`, which is the one case it is not needed for. */
+atlas_status atlas_db_code_files_to_remove(atlas_db *db, int64_t repo_id, atlas_code_todo_cb cb,
+                                           void *ud, int64_t *count_out, atlas_err *err);
+
+/* --- per-file replacement ------------------------------------------------- */
+
+typedef struct atlas_code_file_record {
+    int64_t file_id;
+    const void *path_raw;
+    size_t path_raw_len;
+    const char *path_text;
+    const char *language;
+    const char *content_hash;
+    const char *parse_status;
+    const char *parse_detail;
+    bool truncated;
+    const char *truncated_reason;
+    bool include_guard;
+    int64_t symbol_count;
+    int64_t include_count;
+    int64_t occurrence_count;
+    int64_t bytes;
+    int64_t lines;
+    int64_t generation;
+} atlas_code_file_record;
+
+/* Creates or refreshes the `code_files` row and returns its id. */
+atlas_status atlas_db_code_file_upsert(atlas_db *db, int64_t repo_id,
+                                       const atlas_code_file_record *rec, int64_t *id_out,
+                                       atlas_err *err);
+/* Drops every symbol, occurrence, relation, candidate and role this file owns,
+ * leaving the `code_files` row. Called immediately before reinserting them, so
+ * a reparse replaces rather than accumulates. */
+atlas_status atlas_db_code_file_clear(atlas_db *db, int64_t code_file_id, atlas_err *err);
+/* Drops the `code_files` row and everything it owns. */
+atlas_status atlas_db_code_file_delete(atlas_db *db, int64_t code_file_id, atlas_err *err);
+/* Drops every structural row for a repository, so the next pass rebuilds. */
+atlas_status atlas_db_code_clear_repo(atlas_db *db, int64_t repo_id, atlas_err *err);
+
+atlas_status atlas_db_code_role_add(atlas_db *db, int64_t code_file_id, const char *role,
+                                    const char *basis, const char *resolution, atlas_err *err);
+
+typedef struct atlas_code_symbol_record {
+    const void *name;
+    size_t name_len;
+    const char *name_text;
+    const char *kind;
+    const char *linkage;
+    const char *resolution;
+    bool is_definition;
+    bool is_declaration;
+    int64_t line;
+    int64_t col;
+    int64_t byte_offset;
+    int64_t end_line;
+    int64_t enclosing_id; /* 0 for file scope */
+    int64_t generation;
+} atlas_code_symbol_record;
+
+atlas_status atlas_db_code_symbol_insert(atlas_db *db, int64_t repo_id, int64_t code_file_id,
+                                         const atlas_code_symbol_record *rec, int64_t *id_out,
+                                         atlas_err *err);
+
+typedef struct atlas_code_occurrence_record {
+    const void *name;
+    size_t name_len;
+    const char *name_text;
+    const char *resolution;
+    int64_t enclosing_id; /* 0 when outside any function */
+    int64_t line;
+    int64_t col;
+    int64_t byte_offset;
+    int64_t generation;
+} atlas_code_occurrence_record;
+
+atlas_status atlas_db_code_occurrence_insert(atlas_db *db, int64_t repo_id, int64_t code_file_id,
+                                             const atlas_code_occurrence_record *rec,
+                                             int64_t *id_out, atlas_err *err);
+
+typedef struct atlas_code_relation_record {
+    int64_t owner_file_id;
+    const char *kind;
+    const char *src_kind;
+    int64_t src_id;
+    const char *dst_kind;
+    int64_t dst_id;
+    const void *dst_name; /* the spelling; kept whether or not it resolved */
+    size_t dst_name_len;
+    const char *dst_name_text;
+    /* "quote" or "angle" for an include, NULL otherwise. It changes what the
+     * spelling means, so resolution needs it and it cannot be re-derived. */
+    const char *spelling_form;
+    const char *resolution;
+    const char *provenance;
+    int64_t candidate_count;
+    const char *detail; /* one of the fixed ATLAS_CODE_WHY_* strings */
+    int64_t line;
+    int64_t col;
+    int64_t generation;
+} atlas_code_relation_record;
+
+atlas_status atlas_db_code_relation_insert(atlas_db *db, int64_t repo_id,
+                                           const atlas_code_relation_record *rec, int64_t *id_out,
+                                           atlas_err *err);
+atlas_status atlas_db_code_candidate_add(atlas_db *db, int64_t relation_id, const char *node_kind,
+                                         int64_t node_id, int64_t rank, const char *detail,
+                                         atlas_err *err);
+
+/* --- resolution ----------------------------------------------------------- */
+
+/* One edge awaiting resolution, as the resolver sees it. */
+typedef struct atlas_code_pending_row {
+    int64_t id;
+    int64_t owner_file_id;
+    const char *kind;
+    int64_t src_id;
+    const char *src_kind;
+    const void *dst_name;
+    size_t dst_name_len;
+    const char *dst_name_text;
+    const char *spelling_form; /* "quote" | "angle" for an include, NULL otherwise */
+    const char *resolution;
+    /* How many candidates the *previous* resolution of this edge found.
+     *
+     * Carried so the resolver can skip clearing a candidate set that cannot
+     * exist. `settle` is the only writer of `code_candidates` and it always
+     * records the count alongside, so zero here means there is nothing to
+     * delete — and on a first pass that is every edge in the repository. */
+    int64_t candidate_count;
+    int64_t line;
+    int64_t col;
+    /* The owning file's path, so include resolution can work relative to it
+     * without a second query per edge. */
+    const void *owner_path_raw;
+    size_t owner_path_len;
+} atlas_code_pending_row;
+
+typedef atlas_status (*atlas_code_pending_cb)(const atlas_code_pending_row *row, void *ud,
+                                              atlas_err *err);
+
+/* Which edges a resolution sweep looks at. */
+typedef enum atlas_code_sweep {
+    /* Everything of that kind. Used by a rebuild. */
+    ATLAS_CODE_SWEEP_ALL = 0,
+    /* UNRESOLVED and AMBIGUOUS only: this pass's own new edges, plus everything
+     * a previous pass could not place. The cheap incremental case. */
+    ATLAS_CODE_SWEEP_UNSETTLED,
+    /* Everything *except* those: the edges a previous pass already settled.
+     *
+     * This is what the by-name sweep looks at, and the distinction is what keeps
+     * it from being quadratic. The unsettled sweep has already dealt with the
+     * new edges; re-resolving them again, once per changed symbol name, is the
+     * same work repeated thousands of times on a first pass. */
+    ATLAS_CODE_SWEEP_SETTLED
+} atlas_code_sweep;
+
+/* Streams every edge of `kind` that needs (re-)resolving.
+ *
+ * `owner_file_id` selects one file's edges; 0 selects the whole repository.
+ * `name` restricts to edges mentioning one spelling, which is how a header that
+ * gained a definition updates the call sites elsewhere that name it without
+ * anything being reparsed — and which is a genuine index seek rather than a
+ * filtered scan, because the two shapes use different statements.
+ *
+ * Paginated: rows with an id greater than `after_id` only, at most `limit` of
+ * them, and `*cursor_out` receives the last id delivered. That is what lets the
+ * resolver commit between chunks — a transaction may not be held across the
+ * whole repository's worth of resolution, and a statement may not be left open
+ * across a commit, so the sweep has to be resumable rather than streamed. */
+atlas_status atlas_db_code_relations_pending(atlas_db *db, int64_t repo_id, const char *kind,
+                                             int64_t owner_file_id, atlas_code_sweep sweep,
+                                             const void *name, size_t name_len, int64_t after_id,
+                                             int64_t limit, atlas_code_pending_cb cb, void *ud,
+                                             int64_t *count_out, int64_t *cursor_out,
+                                             atlas_err *err);
+/* Unsettles every edge that resolved to something owned by one file: its
+ * symbols, and — when `include_file_itself` — the file node too.
+ *
+ * The targeted form of the dangling sweep below, and the one the incremental
+ * path uses. Reparsing a file deletes and recreates its symbol rows with new
+ * ids, so the edges elsewhere that pointed at the old ones must go back to
+ * unresolved; the rows to change are found through `idx_code_rel_dst` from the
+ * ids about to disappear, which is a seek per symbol rather than a scan of the
+ * repository. Call it *before* the rows are deleted — afterwards the ids are
+ * gone and only the scan can find the damage.
+ *
+ * `include_file_itself` is for a removal: an include edge resolved to this file
+ * dangles too, whereas a reparse leaves the `code_files` row in place. */
+atlas_status atlas_db_code_relations_unsettle_for_file(atlas_db *db, int64_t repo_id,
+                                                       int64_t code_file_id,
+                                                       bool include_file_itself,
+                                                       int64_t generation, int64_t *count_out,
+                                                       atlas_err *err);
+/* Streams edges whose resolved destination row no longer exists, across the
+ * whole repository. Complete but repository-sized: a left join over every
+ * relation. Kept for the rebuild path and for the case where the incremental
+ * scope overflowed, where a scan is the honest answer. */
+atlas_status atlas_db_code_relations_dangling(atlas_db *db, int64_t repo_id,
+                                              atlas_code_pending_cb cb, void *ud,
+                                              int64_t *count_out, atlas_err *err);
+/* Rewrites one edge's resolution. Candidates are replaced wholesale. */
+atlas_status atlas_db_code_relation_resolve(atlas_db *db, int64_t relation_id, const char *dst_kind,
+                                            int64_t dst_id, const char *resolution,
+                                            const char *provenance, int64_t candidate_count,
+                                            const char *detail, int64_t generation,
+                                            atlas_err *err);
+atlas_status atlas_db_code_candidates_clear(atlas_db *db, int64_t relation_id, atlas_err *err);
+/* Removes the derived `file_depends_on_file` edges a file owns, so they can be
+ * rebuilt from the resolved edges without accumulating. */
+atlas_status atlas_db_code_depends_clear(atlas_db *db, int64_t owner_file_id, atlas_err *err);
+
+/* Candidate lookup used by the resolver. Both are ordered deterministically —
+ * by raw path bytes, then id — so the same repository resolves the same way
+ * whatever order the workers finished in. */
+typedef struct atlas_code_match_row {
+    int64_t id;         /* symbol id, or code_files id for a file match */
+    int64_t code_file_id;
+    const void *path_raw;
+    size_t path_raw_len;
+    const char *path_text;
+    const char *kind;
+    const char *linkage;
+    bool is_definition;
+} atlas_code_match_row;
+
+typedef atlas_status (*atlas_code_match_cb)(const atlas_code_match_row *row, void *ud,
+                                            atlas_err *err);
+
+/* Repository files whose path equals, or ends with `/`, the given suffix. Used
+ * for include resolution. */
+atlas_status atlas_db_code_files_matching(atlas_db *db, int64_t repo_id, const void *suffix,
+                                          size_t suffix_len, bool exact, int64_t limit,
+                                          atlas_code_match_cb cb, void *ud, int64_t *count_out,
+                                          atlas_err *err);
+/* Definitions and declarations of one name. `same_file_id` non-zero additionally
+ * returns internal-linkage matches from that file; internal-linkage matches from
+ * any other file are never returned, which is what keeps two files' `static
+ * helper` functions distinct. */
+/* `ordered` asks for candidates in the reported order — path bytes, then byte
+ * offset, then id. Neither supporting index can produce that order, so an
+ * ordered lookup costs a temporary B-tree; pass false when the caller is going
+ * to discover there are fewer than two candidates, and ask again with true only
+ * if there turn out to be more. Zero or one candidate has no order to get
+ * wrong, and that is the case a quarter of a million times per acceptance
+ * pass. */
+atlas_status atlas_db_code_symbols_named(atlas_db *db, int64_t repo_id, const void *name,
+                                         size_t name_len, bool definitions_only,
+                                         int64_t same_file_id, int64_t limit, bool ordered,
+                                         atlas_code_match_cb cb, void *ud, int64_t *count_out,
+                                         atlas_err *err);
+
+/* --- compile units -------------------------------------------------------- */
+
+typedef struct atlas_code_unit_record {
+    const void *source_path_raw;
+    size_t source_path_len;
+    const char *source_path_text;
+    const char *output_text;
+    const char *directory_text;
+    const char *language_standard;
+    const char *explicit_language;
+    int64_t arg_count;
+    int64_t dropped_args;
+    bool command_present;
+    const char *command_hash;
+    int64_t entry_index;
+    int64_t generation;
+} atlas_code_unit_record;
+
+atlas_status atlas_db_code_units_clear(atlas_db *db, int64_t repo_id, atlas_err *err);
+/* Rebuilds the unit-to-file edges from the recorded units and the resolved
+ * include edges.
+ *
+ * Deleted and recreated wholesale rather than maintained incrementally, and it
+ * has to run *after* the parse and the resolution rather than during compile
+ * database ingestion: on a first pass there is no `code_files` row to link to
+ * yet, and on a later one the includes are not resolved until the resolver has
+ * run. Two indexed joins over a bounded number of units is cheap enough that
+ * correctness by construction beats bookkeeping. */
+/* `code_file_id` restricts the rebuild to the units that compile that one file,
+ * which is what an incremental pass needs: `unit_uses_header` is derived from a
+ * source file's own direct includes, so reparsing one file can only change the
+ * edges of the units built from it. Pass 0 for the whole repository — required
+ * when the compile database itself changed, since then every unit may differ. */
+atlas_status atlas_db_code_link_units(atlas_db *db, int64_t repo_id, int64_t code_file_id,
+                                      int64_t generation,
+                                      int64_t *count_out, atlas_err *err);
+atlas_status atlas_db_code_unit_insert(atlas_db *db, int64_t repo_id,
+                                       const atlas_code_unit_record *rec, int64_t *id_out,
+                                       atlas_err *err);
+atlas_status atlas_db_code_unit_include_add(atlas_db *db, int64_t unit_id, const char *kind,
+                                            const void *dir_raw, size_t dir_len,
+                                            const char *dir_text, bool external, int64_t rank,
+                                            atlas_err *err);
+atlas_status atlas_db_code_unit_define_add(atlas_db *db, int64_t unit_id, const char *name,
+                                           const char *value, bool undef, int64_t rank,
+                                           atlas_err *err);
+/* The include directories a build was configured with, ordered deterministically
+ * and **excluding external ones** — those are metadata about where a build looks
+ * and never authorise Atlas to read anything.
+ *
+ * `path_raw` selects the units that compile that exact source. Passing NULL
+ * selects the repository-wide distinct set, which is what a header falls back
+ * to: no translation unit compiles a header, and computing which units
+ * transitively include it would cost more than the answer is worth. The fallback
+ * is why an include resolved through it is `BUILD_METADATA` rather than
+ * anything stronger. */
+atlas_status atlas_db_code_unit_dirs_for_file(atlas_db *db, int64_t repo_id, const void *path_raw,
+                                              size_t path_len, int64_t limit,
+                                              atlas_code_match_cb cb, void *ud, atlas_err *err);
+
+/* --- errors --------------------------------------------------------------- */
+
+atlas_status atlas_db_code_error_add(atlas_db *db, int64_t repo_id, const char *path_text,
+                                     const char *kind, const char *detail, int64_t generation,
+                                     atlas_err *err);
+atlas_status atlas_db_code_errors_prune(atlas_db *db, int64_t repo_id, int64_t retain,
+                                        atlas_err *err);
+
+/* --- queries -------------------------------------------------------------- */
+
+/* One structural symbol as a reader sees it. Borrowed for the callback only. */
+typedef struct atlas_code_symbol_row {
+    int64_t id;
+    int64_t code_file_id;
+    const char *path_text;
+    const char *name_text;
+    const char *kind;
+    const char *linkage;
+    const char *resolution;
+    bool is_definition;
+    bool is_declaration;
+    int64_t line;
+    int64_t col;
+} atlas_code_symbol_row;
+
+typedef atlas_status (*atlas_code_symbol_cb)(const atlas_code_symbol_row *row, void *ud,
+                                             atlas_err *err);
+
+/* A bounded substring search over indexed symbol names.
+ *
+ * Deliberately a LIKE rather than FTS5: identifiers are not prose, an
+ * identifier substring is what a caller actually wants, and a bounded LIKE has
+ * no query language a caller can be surprised by. `kind` may be NULL. */
+atlas_status atlas_db_code_symbol_search(atlas_db *db, int64_t repo_id, const char *query,
+                                         const char *kind, int64_t limit,
+                                         atlas_code_symbol_cb cb, void *ud, int64_t *count_out,
+                                         bool *more_out, atlas_err *err);
+/* Every recorded site for one exact name. */
+atlas_status atlas_db_code_symbols_by_name(atlas_db *db, int64_t repo_id, const char *name_text,
+                                           int64_t limit, atlas_code_symbol_cb cb, void *ud,
+                                           int64_t *count_out, bool *more_out, atlas_err *err);
+atlas_status atlas_db_code_symbols_in_file(atlas_db *db, int64_t code_file_id, int64_t limit,
+                                           atlas_code_symbol_cb cb, void *ud, int64_t *count_out,
+                                           bool *more_out, atlas_err *err);
+
+/* One edge as a reader sees it, with everything needed to explain why it is
+ * being reported. */
+typedef struct atlas_code_edge_row {
+    int64_t id;
+    const char *kind;
+    const char *src_kind;
+    int64_t src_id;
+    const char *src_path_text; /* NULL when the source is not a file */
+    const char *dst_kind;
+    int64_t dst_id;
+    const char *dst_path_text; /* NULL when unresolved or not a file */
+    const char *dst_name_text; /* the spelling, always present for named edges */
+    const char *resolution;
+    const char *provenance;
+    int64_t candidate_count;
+    const char *detail;
+    int64_t line;
+    int64_t col;
+} atlas_code_edge_row;
+
+typedef atlas_status (*atlas_code_edge_cb)(const atlas_code_edge_row *row, void *ud,
+                                           atlas_err *err);
+
+/* Edges out of, or into, one node. `kind` may be NULL for every kind. */
+atlas_status atlas_db_code_edges_from(atlas_db *db, int64_t repo_id, const char *src_kind,
+                                      int64_t src_id, const char *kind, int64_t limit,
+                                      atlas_code_edge_cb cb, void *ud, int64_t *count_out,
+                                      bool *more_out, atlas_err *err);
+atlas_status atlas_db_code_edges_to(atlas_db *db, int64_t repo_id, const char *dst_kind,
+                                    int64_t dst_id, const char *kind, int64_t limit,
+                                    atlas_code_edge_cb cb, void *ud, int64_t *count_out,
+                                    bool *more_out, atlas_err *err);
+atlas_status atlas_db_code_candidates_of(atlas_db *db, int64_t relation_id, int64_t limit,
+                                         atlas_code_edge_cb cb, void *ud, int64_t *count_out,
+                                         atlas_err *err);
+
+/* One structurally indexed file. */
+typedef struct atlas_code_file_row {
+    int64_t id;
+    int64_t file_id;
+    const void *path_raw;
+    size_t path_raw_len;
+    const char *path_text;
+    const char *language;
+    const char *content_hash;
+    const char *parse_status;
+    const char *parse_detail;
+    bool truncated;
+    const char *truncated_reason;
+    bool include_guard;
+    int64_t symbol_count;
+    int64_t include_count;
+    int64_t occurrence_count;
+    int64_t bytes;
+    int64_t lines;
+    int64_t generation;
+} atlas_code_file_row;
+
+typedef atlas_status (*atlas_code_file_cb)(const atlas_code_file_row *row, void *ud,
+                                           atlas_err *err);
+typedef struct atlas_code_role_row {
+    const char *role;
+    const char *basis;
+    const char *resolution;
+} atlas_code_role_row;
+typedef atlas_status (*atlas_code_role_cb)(const atlas_code_role_row *row, void *ud,
+                                           atlas_err *err);
+
+atlas_status atlas_db_code_file_get(atlas_db *db, int64_t repo_id, const void *path_raw,
+                                    size_t path_len, atlas_code_file_cb cb, void *ud, bool *found,
+                                    int64_t *id_out, atlas_err *err);
+atlas_status atlas_db_code_roles_of(atlas_db *db, int64_t code_file_id, atlas_code_role_cb cb,
+                                    void *ud, int64_t *count_out, atlas_err *err);
+/* The translation units that compile, or include, one file. */
+atlas_status atlas_db_code_units_for_file(atlas_db *db, int64_t repo_id, int64_t code_file_id,
+                                          int64_t limit, atlas_code_edge_cb cb, void *ud,
+                                          int64_t *count_out, bool *more_out, atlas_err *err);
+/* Per-file counts of unsettled edges, so a file context can report how much of
+ * what it says is inferred without listing every edge. */
+atlas_status atlas_db_code_file_unsettled(atlas_db *db, int64_t code_file_id, int64_t *ambiguous,
+                                          int64_t *unresolved, atlas_err *err);
 
 /* --- transactions ------------------------------------------------------- */
 

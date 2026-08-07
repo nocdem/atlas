@@ -180,6 +180,34 @@ renderer checks its own output against it and discards a document that fails.
 
 Neither test would have passed the first implementation.
 
+#### What A3 added to the envelope, and what it deliberately did not
+
+A3 built an index of symbol names, include spellings and file paths, and the
+envelope is exactly where none of that may go. A symbol name is chosen by
+whoever wrote the repository; so is an include spelling; so is a path. Every one
+of them is printable, and every one passes every encoding Atlas has completely
+unchanged — the same argument that removed the repository name.
+
+So the envelope gained six fields and all six are typed values Atlas computed:
+
+```
+code_index_current=<bool> code_generation=<integer>
+code_symbols=<integer> code_relations=<integer> code_ambiguous=<integer>
+code_unresolved=<integer>
+```
+
+Counts and a boolean. They let a reader know whether a structural question is
+worth asking and how much of the answer will be ambiguous, which is the entire
+useful content of a structural summary that can be delivered safely. The names
+behind those counts arrive only through an explicit MCP call, labelled
+`UNTRUSTED_DATA`, where the model can see that they came from the repository.
+
+`atlas_ai_context_is_bounded()` did not need to change: an integer and `true`
+are already inside the allowlist, which is the test that the addition was of the
+right shape. `tests/test_ai_trust.c` asserts the two new keys appear and that
+the hostile-basename repository still produces an envelope with no symbol name,
+no path and no basename in it.
+
 ### Provenance is a wider vocabulary than evidence
 
 | class | means | writable by an A2 adapter |

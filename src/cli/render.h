@@ -71,6 +71,36 @@ typedef struct atlas_renderer_vtbl {
      * places for the human and JSON forms to drift apart instead of one. */
     atlas_status (*integrate)(atlas_renderer *r, const atlas_integrate_report *rep,
                               const char *action, const char *commands, atlas_err *err);
+    /* --- A3 ---
+     *
+     * Six methods rather than one per command. `code file` is several
+     * independent lists sharing one header, and `code deps` and `code impact`
+     * are the same traversal in opposite directions — so the shapes are the
+     * report, the symbol, the edge and the traversal candidate, and the commands
+     * compose them. Fewer shapes is fewer places for the two renderers to
+     * drift. */
+    atlas_status (*code_status)(atlas_renderer *r, const atlas_code_status_report *rep,
+                                atlas_err *err);
+    atlas_status (*code_file)(atlas_renderer *r, const atlas_code_file_report *rep,
+                              atlas_err *err);
+    atlas_status (*code_symbol_item)(atlas_renderer *r, const atlas_code_symbol_row *row,
+                                     atlas_err *err);
+    atlas_status (*code_edge_item)(atlas_renderer *r, const atlas_code_edge_row *row,
+                                   atlas_err *err);
+    atlas_status (*code_walk_item)(atlas_renderer *r, const atlas_code_walk_row *row,
+                                   atlas_err *err);
+    atlas_status (*code_walk_end)(atlas_renderer *r, const atlas_code_walk_summary *sum,
+                                  atlas_err *err);
+    /* A named list, for the commands that emit several.
+     *
+     * `list_begin`/`list_end` write the count under the fixed key `count`,
+     * which is A0's contract and is right for a command with one list. A file
+     * context has three, and three `count` members in one object is a document
+     * whose meaning depends on which one a parser keeps. These write
+     * `<key>` and `<key>_count`, so every list carries its own. */
+    atlas_status (*code_list_begin)(atlas_renderer *r, const char *key, atlas_err *err);
+    atlas_status (*code_list_end)(atlas_renderer *r, const char *key, const char *singular,
+                                  const char *plural, int64_t count, bool more, atlas_err *err);
 } atlas_renderer_vtbl;
 
 struct atlas_renderer {

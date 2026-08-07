@@ -203,4 +203,87 @@
  * payload. */
 #define ATLAS_MCP_MAX_PROSE_BYTES 512u
 
+/* --- A3: structural code intelligence ------------------------------------
+ *
+ * A3 reads source bytes and builds a graph from them, so every bound here is
+ * about the same two things A2's were: keeping the work finite on a hostile or
+ * merely enormous input, and keeping the amount of repository-derived text that
+ * can reach a model small and deliberate.
+ *
+ * Same rule as everywhere else: nothing is silently truncated. Reaching a bound
+ * writes a `code_index_errors` row, sets `truncated` on the file, and is
+ * reported in every result derived from it. */
+
+/* Parsing ----------------------------------------------------------------- */
+/* Bytes of one source file the lexer will read. Beyond it the file is recorded
+ * with `truncated` and a reason; it is never parsed as a prefix pretending to be
+ * whole. */
+#define ATLAS_CODE_MAX_FILE_BYTES (4u * 1024u * 1024u)
+/* Bytes in one token. A generated file can contain a megabyte-long string
+ * literal; an identifier that long is not an identifier. */
+#define ATLAS_CODE_MAX_TOKEN_BYTES 4096u
+/* Brace, parenthesis and conditional nesting the extractor will track. */
+#define ATLAS_CODE_MAX_NESTING_DEPTH 256u
+/* Symbols recorded for one file. */
+#define ATLAS_CODE_MAX_SYMBOLS_PER_FILE 4096
+/* Relations recorded for one file, across every kind. */
+#define ATLAS_CODE_MAX_RELATIONS_PER_FILE 16384
+/* Call-candidate occurrences recorded for one file. */
+#define ATLAS_CODE_MAX_OCCURRENCES_PER_FILE 16384
+/* `#include` directives recorded for one file. */
+#define ATLAS_CODE_MAX_INCLUDES_PER_FILE 1024
+/* Bytes of a symbol name or an include spelling, after safe encoding. Refused
+ * rather than truncated: half an identifier is a different identifier. */
+#define ATLAS_CODE_MAX_NAME_BYTES 256u
+/* How far include resolution will follow a chain before reporting depth. */
+#define ATLAS_CODE_MAX_INCLUDE_DEPTH 32
+/* Files one structural pass will parse. Beyond it the pass reports truncation
+ * and the remainder is picked up by the next pass, which sees them as still
+ * differing by content hash. */
+#define ATLAS_CODE_MAX_PARSE_FILES_PER_PASS 20000
+/* Files held in memory as parse results at once.
+ *
+ * The pass selects, parses and applies in chunks of this size rather than
+ * gathering every result first. A parse result is a few kilobytes — an arena of
+ * names plus three arrays — so holding twenty thousand of them at once is
+ * hundreds of megabytes for no reason: the writer applies them one at a time
+ * anyway. Chunking makes the structural stage's memory a property of this
+ * constant rather than of the repository, which is the bound Atlas claims
+ * everywhere else. */
+#define ATLAS_CODE_PARSE_CHUNK 512
+
+/* Resolution --------------------------------------------------------------- */
+/* Candidate rows kept for one ambiguous relation. `candidate_count` still
+ * reports the true number, so the ambiguity is never understated. */
+#define ATLAS_CODE_MAX_CANDIDATES 16
+/* Symbol names one incremental resolution pass will re-resolve by name before
+ * falling back to a whole-repository resolution. The fallback is reported; it
+ * is a re-resolution, never a reparse. */
+#define ATLAS_CODE_MAX_RESOLVE_NAMES 4096
+/* Bounded error/truncation rows retained per repository. */
+#define ATLAS_CODE_ERRORS_RETAIN_PER_REPO 1000
+
+/* Compile databases -------------------------------------------------------- */
+/* Bytes of compile_commands.json read. Checked before the parser is entered. */
+#define ATLAS_CODE_MAX_COMPILE_DB_BYTES (32u * 1024u * 1024u)
+/* Translation units recorded from one compile database. */
+#define ATLAS_CODE_MAX_COMPILE_UNITS 20000
+/* Entries in one unit's `arguments` array that will be walked. */
+#define ATLAS_CODE_MAX_COMPILE_ARGS 4096
+/* Include directories and defines recorded per unit. */
+#define ATLAS_CODE_MAX_INCLUDE_DIRS_PER_UNIT 256
+#define ATLAS_CODE_MAX_DEFINES_PER_UNIT 512
+/* Bytes of one recognised argument value (a directory, a define). */
+#define ATLAS_CODE_MAX_ARG_BYTES 1024u
+
+/* Queries ------------------------------------------------------------------ */
+/* Hard ceiling on caller-selected traversal depth. */
+#define ATLAS_CODE_MAX_TRAVERSAL_DEPTH 8
+#define ATLAS_CODE_DEFAULT_TRAVERSAL_DEPTH 2
+/* Nodes one traversal will visit before reporting truncation. */
+#define ATLAS_CODE_MAX_TRAVERSAL_NODES 2000
+/* Rows one structural query may return, and the default when none is asked for. */
+#define ATLAS_CODE_MAX_ROWS 200
+#define ATLAS_CODE_DEFAULT_ROWS 50
+
 #endif /* ATLAS_LIMITS_H */

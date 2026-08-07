@@ -55,6 +55,11 @@ struct atlas_job {
     atlas_job_kind kind;
     int64_t repo_id;
     bool full;         /* reconcile: re-read every file */
+    /* A3: drop every structural row and reindex. Distinct from `full`, which is
+     * about re-reading file *content*: a full pass rehashes bytes and still
+     * parses nothing when the hashes match, so rebuilding the graph needs its
+     * own flag rather than being implied by one. */
+    bool code_rebuild;
     int64_t sync_seq;  /* echoed into the published state */
     int watch_state;   /* set watch: an atlas_watch_state */
     int64_t watched_dirs;
@@ -117,6 +122,7 @@ void atlas_writer_stop(atlas_writer *w);
  * for, NUL separated; each is hashed regardless of its metadata. Coalescing
  * merges the sets, because a pending pass has to cover both requests. */
 atlas_status atlas_writer_submit_reconcile(atlas_writer *w, int64_t repo_id, bool full,
+                                           bool code_rebuild,
                                            const char *dirty_paths, size_t dirty_len,
                                            int64_t *sync_seq_out, atlas_err *err);
 

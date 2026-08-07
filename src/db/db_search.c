@@ -99,7 +99,7 @@ static atlas_status run_file_query(atlas_db *db, const char *sql, int64_t repo_i
         }
     }
     if (st != ATLAS_OK) {
-        sqlite3_finalize(stmt);
+        atlas_db_finish(db, stmt);
         return st;
     }
     for (;;) {
@@ -130,7 +130,7 @@ static atlas_status run_file_query(atlas_db *db, const char *sql, int64_t repo_i
             }
         }
     }
-    sqlite3_finalize(stmt);
+    atlas_db_finish(db, stmt);
     return st;
 }
 
@@ -150,7 +150,7 @@ static atlas_status run_commit_query(atlas_db *db, const char *sql, int64_t repo
         }
     }
     if (st != ATLAS_OK) {
-        sqlite3_finalize(stmt);
+        atlas_db_finish(db, stmt);
         return st;
     }
     for (;;) {
@@ -178,7 +178,7 @@ static atlas_status run_commit_query(atlas_db *db, const char *sql, int64_t repo
             }
         }
     }
-    sqlite3_finalize(stmt);
+    atlas_db_finish(db, stmt);
     return st;
 }
 

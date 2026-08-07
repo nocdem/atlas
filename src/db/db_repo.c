@@ -206,7 +206,7 @@ atlas_status atlas_db_repo_add(atlas_db *db, const char *name, const atlas_repo_
         st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind worktree flag");
     }
     if (st != ATLAS_OK) {
-        sqlite3_finalize(stmt);
+        atlas_db_finish(db, stmt);
         goto done;
     }
 
@@ -226,10 +226,10 @@ atlas_status atlas_db_repo_add(atlas_db *db, const char *name, const atlas_repo_
         } else {
             st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot register repository");
         }
-        sqlite3_finalize(stmt);
+        atlas_db_finish(db, stmt);
         goto done;
     }
-    sqlite3_finalize(stmt);
+    atlas_db_finish(db, stmt);
     if (id_out != NULL) {
         *id_out = sqlite3_last_insert_rowid(db->h);
     }
@@ -263,7 +263,7 @@ atlas_status atlas_db_repo_siblings(atlas_db *db, int64_t repo_id, const void *c
         st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind repository id");
     }
     if (st != ATLAS_OK) {
-        sqlite3_finalize(stmt);
+        atlas_db_finish(db, stmt);
         return st;
     }
 
@@ -292,7 +292,7 @@ atlas_status atlas_db_repo_siblings(atlas_db *db, int64_t repo_id, const void *c
         }
     }
     atlas_repo_info_free(&ri);
-    sqlite3_finalize(stmt);
+    atlas_db_finish(db, stmt);
     if (st == ATLAS_OK && count_out != NULL) {
         *count_out = n;
     }
@@ -311,7 +311,7 @@ static atlas_status repo_get_one(atlas_db *db, const char *sql, const void *key,
     st = key_is_blob ? atlas_db_bind_blob(db, stmt, 1, key, key_len, err)
                      : atlas_db_bind_text_n(db, stmt, 1, (const char *)key, key_len, err);
     if (st != ATLAS_OK) {
-        sqlite3_finalize(stmt);
+        atlas_db_finish(db, stmt);
         return st;
     }
     int rc = sqlite3_step(stmt);
@@ -323,7 +323,7 @@ static atlas_status repo_get_one(atlas_db *db, const char *sql, const void *key,
     } else if (rc != SQLITE_DONE) {
         st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot read repository");
     }
-    sqlite3_finalize(stmt);
+    atlas_db_finish(db, stmt);
     return st;
 }
 
@@ -397,7 +397,7 @@ atlas_status atlas_db_repo_get_by_id(atlas_db *db, int64_t repo_id, atlas_repo_i
         return st;
     }
     if (sqlite3_bind_int64(stmt, 1, repo_id) != SQLITE_OK) {
-        sqlite3_finalize(stmt);
+        atlas_db_finish(db, stmt);
         return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind repository id");
     }
     int rc = sqlite3_step(stmt);
@@ -409,7 +409,7 @@ atlas_status atlas_db_repo_get_by_id(atlas_db *db, int64_t repo_id, atlas_repo_i
     } else if (rc != SQLITE_DONE) {
         st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot read repository");
     }
-    sqlite3_finalize(stmt);
+    atlas_db_finish(db, stmt);
     return st;
 }
 
@@ -443,7 +443,7 @@ atlas_status atlas_db_repo_list(atlas_db *db, atlas_repo_cb cb, void *ud, atlas_
         }
     }
     atlas_repo_info_free(&ri);
-    sqlite3_finalize(stmt);
+    atlas_db_finish(db, stmt);
     return st;
 }
 
@@ -458,7 +458,7 @@ atlas_status atlas_db_repo_remove(atlas_db *db, const char *name, bool *removed,
     }
     st = atlas_db_bind_text_opt(db, stmt, 1, name, err);
     if (st != ATLAS_OK) {
-        sqlite3_finalize(stmt);
+        atlas_db_finish(db, stmt);
         return st;
     }
     st = atlas_db_step_done(db, stmt, err);
@@ -496,7 +496,7 @@ atlas_status atlas_db_repo_counts(atlas_db *db, int64_t repo_id, atlas_repo_coun
             return st;
         }
         if (sqlite3_bind_int64(stmt, 1, repo_id) != SQLITE_OK) {
-            sqlite3_finalize(stmt);
+            atlas_db_finish(db, stmt);
             return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind repository id");
         }
         int rc = sqlite3_step(stmt);
@@ -504,10 +504,10 @@ atlas_status atlas_db_repo_counts(atlas_db *db, int64_t repo_id, atlas_repo_coun
             int64_t v = sqlite3_column_int64(stmt, 0);
             memcpy((char *)out + queries[i].offset, &v, sizeof(v));
         } else if (rc != SQLITE_DONE) {
-            sqlite3_finalize(stmt);
+            atlas_db_finish(db, stmt);
             return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot count rows");
         }
-        sqlite3_finalize(stmt);
+        atlas_db_finish(db, stmt);
     }
     return ATLAS_OK;
 }
@@ -529,7 +529,7 @@ atlas_status atlas_db_scan_begin(atlas_db *db, int64_t repo_id, const atlas_scan
     char now[ATLAS_TS_MAX];
     atlas_now_iso8601(now, sizeof(now));
     if (sqlite3_bind_int64(stmt, 1, repo_id) != SQLITE_OK) {
-        sqlite3_finalize(stmt);
+        atlas_db_finish(db, stmt);
         return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind repository id");
     }
     st = atlas_db_bind_text_opt(db, stmt, 2, now, err);
@@ -549,7 +549,7 @@ atlas_status atlas_db_scan_begin(atlas_db *db, int64_t repo_id, const atlas_scan
         st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind dirty flag");
     }
     if (st != ATLAS_OK) {
-        sqlite3_finalize(stmt);
+        atlas_db_finish(db, stmt);
         return st;
     }
     st = atlas_db_step_done(db, stmt, err);
@@ -587,20 +587,20 @@ atlas_status atlas_db_scan_finish(atlas_db *db, int64_t repo_id, int64_t scan_id
         st = atlas_db_bind_text_opt(db, stmt, 3, error_text, err);
     }
     if (st != ATLAS_OK) {
-        sqlite3_finalize(stmt);
+        atlas_db_finish(db, stmt);
         return st;
     }
     const int64_t vals[] = {files_total,     files_added,      files_modified, files_deleted,
                             files_unchanged, files_unreadable, commits_ingested};
     for (int i = 0; i < 7; i++) {
         if (sqlite3_bind_int64(stmt, 4 + i, vals[i]) != SQLITE_OK) {
-            sqlite3_finalize(stmt);
+            atlas_db_finish(db, stmt);
             return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind scan counter");
         }
     }
     if (sqlite3_bind_int64(stmt, 11, scan_id) != SQLITE_OK ||
         sqlite3_bind_int64(stmt, 12, repo_id) != SQLITE_OK) {
-        sqlite3_finalize(stmt);
+        atlas_db_finish(db, stmt);
         return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind scan id");
     }
     return atlas_db_step_done(db, stmt, err);
@@ -638,19 +638,19 @@ atlas_status atlas_db_repo_apply_scan(atlas_db *db, int64_t repo_id, int64_t sca
         st = atlas_db_bind_text_opt(db, stmt, 6, stt->object_format, err);
     }
     if (st != ATLAS_OK) {
-        sqlite3_finalize(stmt);
+        atlas_db_finish(db, stmt);
         return st;
     }
     const int flags[] = {stt->dirty ? 1 : 0, stt->dirty_staged, stt->dirty_unstaged,
                          stt->dirty_untracked, stt->dirty_unmerged};
     for (int i = 0; i < 5; i++) {
         if (sqlite3_bind_int(stmt, 7 + i, flags[i]) != SQLITE_OK) {
-            sqlite3_finalize(stmt);
+            atlas_db_finish(db, stmt);
             return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind dirty counter");
         }
     }
     if (sqlite3_bind_int64(stmt, 12, repo_id) != SQLITE_OK) {
-        sqlite3_finalize(stmt);
+        atlas_db_finish(db, stmt);
         return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind repository id");
     }
     return atlas_db_step_done(db, stmt, err);

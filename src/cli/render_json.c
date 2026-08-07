@@ -636,7 +636,31 @@ static atlas_status j_sync(atlas_renderer *r, const char *repo, const atlas_sync
     TRY(atlas_json_key_int(j, "write_batches", s->batches_written, err));
     TRY(atlas_json_key_int(j, "duration_ms", s->duration_ms, err));
     TRY(atlas_json_key_bool(j, "truncated", s->truncated, err));
-    return atlas_json_key_str(j, "truncated_reason", atlas_buf_cstr(&s->truncated_reason), err);
+    TRY(atlas_json_key_str(j, "truncated_reason", atlas_buf_cstr(&s->truncated_reason), err));
+    /* A3. Reported here rather than in a separate command, because the
+     * structural stage is part of this pass: a caller checking "did an
+     * unchanged pass parse nothing" is asking about the same pass whose file
+     * counters are above. */
+    TRY(atlas_json_key_bool(j, "code_ran", s->code_ran, err));
+    TRY(atlas_json_key_int(j, "code_files_selected", s->code.files_selected, err));
+    TRY(atlas_json_key_int(j, "code_files_parsed", s->code.files_parsed, err));
+    TRY(atlas_json_key_int(j, "code_files_removed", s->code.files_removed, err));
+    TRY(atlas_json_key_int(j, "code_files_failed", s->code.files_failed, err));
+    TRY(atlas_json_key_int(j, "code_files_partial", s->code.files_partial, err));
+    TRY(atlas_json_key_int(j, "code_symbols_written", s->code.symbols_written, err));
+    TRY(atlas_json_key_int(j, "code_relations_written", s->code.relations_written, err));
+    TRY(atlas_json_key_int(j, "code_relations_resolved", s->code.relations_resolved, err));
+    TRY(atlas_json_key_int(j, "code_compile_units", s->code.compile_units, err));
+    TRY(atlas_json_key_bool(j, "code_compile_db_present", s->code.compile_db_present, err));
+    /* Reported, never silent: a whole-repository re-resolution is still
+     * resolution and never a reparse, and a reader is entitled to know which
+     * happened. */
+    TRY(atlas_json_key_bool(j, "code_resolve_fallback", s->code.resolve_fallback, err));
+    TRY(atlas_json_key_bool(j, "code_degraded", s->code.degraded, err));
+    TRY(atlas_json_key_str_opt(j, "code_degraded_reason", s->code.degraded_reason, err));
+    TRY(atlas_json_key_bool(j, "code_truncated", s->code.truncated, err));
+    TRY(atlas_json_key_str_opt(j, "code_truncated_reason", s->code.truncated_reason, err));
+    return atlas_json_key_int(j, "code_duration_ms", s->code.duration_ms, err);
 }
 
 static atlas_status j_event_item(atlas_renderer *r, const atlas_event_row *row, atlas_err *err) {
@@ -735,6 +759,210 @@ static atlas_status j_integrate(atlas_renderer *r, const atlas_integrate_report 
     return json_safe(j, &r->safe, "problems", atlas_buf_cstr(&rep->problems), err);
 }
 
+/* --- A3: structural code intelligence ------------------------------------
+ *
+ * Paths and symbol names are already in the safe encoding when they are stored,
+ * so they are emitted as-is; re-encoding would stop them decoding back to the
+ * original bytes. Resolution classes, provenance, roles, bases and unresolved
+ * reasons are fixed vocabularies. `untrusted_data` is set on every object that
+ * carries a name or a path, because those are chosen by whoever can commit. */
+
+static atlas_status j_code_status(atlas_renderer *r, const atlas_code_status_report *rep,
+                                  atlas_err *err) {
+    TRY(atlas_json_key_str(r->j, "repo", rep->repo.name, err));
+    TRY(atlas_json_key_bool(r->j, "index_current", rep->file_index_current, err));
+    TRY(atlas_json_key_bool(r->j, "code_index_current", rep->code_index_current, err));
+    TRY(atlas_json_key_str_opt(r->j, "code_not_current_reason", rep->not_current_reason, err));
+    TRY(atlas_json_key_int(r->j, "generation", rep->file_state.last_complete_generation, err));
+    TRY(atlas_json_key_int(r->j, "code_generation", rep->code_state.last_complete_generation,
+                           err));
+    TRY(atlas_json_key_int(r->j, "files_indexed", rep->code_state.files_indexed, err));
+    TRY(atlas_json_key_int(r->j, "files_parsed_last", rep->code_state.files_parsed_last, err));
+    TRY(atlas_json_key_int(r->j, "symbols", rep->code_state.symbols, err));
+    TRY(atlas_json_key_int(r->j, "relations", rep->code_state.relations, err));
+    TRY(atlas_json_key_int(r->j, "ambiguous", rep->code_state.ambiguous, err));
+    TRY(atlas_json_key_int(r->j, "unresolved", rep->code_state.unresolved, err));
+    TRY(atlas_json_key_bool(r->j, "degraded", rep->code_state.degraded, err));
+    TRY(json_safe(r->j, &r->safe, "degraded_reason",
+                  rep->code_state.degraded ? atlas_buf_cstr(&rep->code_state.degraded_reason)
+                                           : NULL,
+                  err));
+    TRY(atlas_json_key_bool(r->j, "compile_db_present", rep->code_state.compile_db_present, err));
+    TRY(atlas_json_key_int(r->j, "compile_units", rep->code_state.compile_units, err));
+    TRY(atlas_json_key_int(r->j, "compile_entries_dropped",
+                           rep->code_state.compile_entries_dropped, err));
+    TRY(atlas_json_key_str(r->j, "last_complete_at", rep->code_state.last_complete_at, err));
+    /* Atlas-owned constants, emitted unencoded on purpose: `analyzer` is the
+     * value of ATLAS_CODE_ANALYZER_ID compiled into this binary when the pass
+     * ran, so it is a fixed vocabulary rather than a stored string a repository
+     * could have chosen. `analyzer_expected` is what this binary would produce
+     * now, and the two differ exactly when the graph is stale for that reason. */
+    TRY(atlas_json_key_str(r->j, "analyzer",
+                           atlas_buf_cstr(&rep->code_state.analyzer_name), err));
+    TRY(atlas_json_key_int(r->j, "analyzer_version", rep->code_state.analyzer_version, err));
+    TRY(atlas_json_key_str(r->j, "analyzer_expected", ATLAS_CODE_ANALYZER_ID, err));
+    TRY(atlas_json_key_int(r->j, "analyzer_version_expected",
+                           (int64_t)ATLAS_CODE_ANALYZER_VERSION, err));
+    return ATLAS_OK;
+}
+
+static atlas_status j_code_file(atlas_renderer *r, const atlas_code_file_report *rep,
+                                atlas_err *err) {
+    /* Already encoded when stored. */
+    TRY(atlas_json_key_str(r->j, "path", atlas_buf_cstr(&rep->path_text), err));
+    TRY(atlas_json_key_bool(r->j, "indexed", rep->indexed, err));
+    if (!rep->indexed) {
+        TRY(atlas_json_key_str(r->j, "reason",
+                               "Atlas extracts structure from C sources, headers and included "
+                               "fragments only",
+                               err));
+        return ATLAS_OK;
+    }
+    TRY(atlas_json_key_str(r->j, "language", rep->language, err));
+    TRY(atlas_json_key_str(r->j, "parse_status", rep->parse_status, err));
+    TRY(json_safe(r->j, &r->safe, "parse_detail",
+                  rep->parse_detail.len > 0 ? atlas_buf_cstr(&rep->parse_detail) : NULL, err));
+    TRY(atlas_json_key_bool(r->j, "truncated", rep->truncated, err));
+    TRY(json_safe(r->j, &r->safe, "truncated_reason",
+                  rep->truncated_reason.len > 0 ? atlas_buf_cstr(&rep->truncated_reason) : NULL,
+                  err));
+    TRY(atlas_json_key_bool(r->j, "include_guard", rep->include_guard, err));
+    TRY(atlas_json_key(r->j, "roles", err));
+    TRY(atlas_json_arr_begin(r->j, err));
+    for (size_t i = 0; i < rep->role_count; i++) {
+        TRY(atlas_json_obj_begin(r->j, err));
+        TRY(atlas_json_key_str(r->j, "role", rep->roles[i].role, err));
+        /* How the role was arrived at, always. Path naming is evidence about a
+         * path and not proof about a file. */
+        TRY(atlas_json_key_str(r->j, "basis", rep->roles[i].basis, err));
+        TRY(atlas_json_key_str(r->j, "resolution", rep->roles[i].resolution, err));
+        TRY(atlas_json_obj_end(r->j, err));
+    }
+    TRY(atlas_json_arr_end(r->j, err));
+    TRY(atlas_json_key_str_opt(r->j, "content_hash",
+                               rep->content_hash[0] != '\0' ? rep->content_hash : NULL, err));
+    TRY(atlas_json_key_int(r->j, "generation", rep->generation, err));
+    /* Named so they cannot collide with the lists that follow them. Three
+     * members called `symbols` in one object is a document whose meaning
+     * depends on which one a parser keeps. */
+    TRY(atlas_json_key_int(r->j, "symbol_count", rep->symbol_count, err));
+    TRY(atlas_json_key_int(r->j, "include_count", rep->include_count, err));
+    TRY(atlas_json_key_int(r->j, "call_candidate_count", rep->occurrence_count, err));
+    TRY(atlas_json_key_int(r->j, "ambiguous", rep->ambiguous, err));
+    TRY(atlas_json_key_int(r->j, "unresolved", rep->unresolved, err));
+    TRY(atlas_json_key_int(r->j, "bytes", rep->bytes, err));
+    TRY(atlas_json_key_int(r->j, "lines", rep->lines, err));
+    TRY(atlas_json_key_bool(r->j, "code_index_current", rep->code_index_current, err));
+    TRY(atlas_json_key_str_opt(r->j, "code_not_current_reason", rep->not_current_reason, err));
+    /* A0's answer, unchanged: structure is not a reason. */
+    TRY(atlas_json_key_str(r->j, "reason", ATLAS_REASON_UNKNOWN, err));
+    return ATLAS_OK;
+}
+
+static atlas_status j_code_symbol_item(atlas_renderer *r, const atlas_code_symbol_row *row,
+                                       atlas_err *err) {
+    TRY(atlas_json_obj_begin(r->j, err));
+    TRY(atlas_json_key_int(r->j, "id", row->id, err));
+    TRY(atlas_json_key_str(r->j, "name", row->name_text, err));
+    TRY(atlas_json_key_str(r->j, "kind", row->kind, err));
+    TRY(atlas_json_key_str(r->j, "linkage", row->linkage, err));
+    TRY(atlas_json_key_str(r->j, "path", row->path_text, err));
+    TRY(atlas_json_key_int(r->j, "line", row->line, err));
+    TRY(atlas_json_key_int(r->j, "col", row->col, err));
+    TRY(atlas_json_key_bool(r->j, "definition", row->is_definition, err));
+    TRY(atlas_json_key_bool(r->j, "declaration", row->is_declaration, err));
+    TRY(atlas_json_key_str(r->j, "resolution", row->resolution, err));
+    TRY(atlas_json_key_bool(r->j, "untrusted_data", true, err));
+    TRY(atlas_json_obj_end(r->j, err));
+    return ATLAS_OK;
+}
+
+static atlas_status j_code_edge_item(atlas_renderer *r, const atlas_code_edge_row *row,
+                                     atlas_err *err) {
+    TRY(atlas_json_obj_begin(r->j, err));
+    TRY(atlas_json_key_str(r->j, "kind", row->kind, err));
+    TRY(atlas_json_key_str(r->j, "from_kind", row->src_kind, err));
+    TRY(atlas_json_key_str_opt(r->j, "from_path", row->src_path_text, err));
+    TRY(atlas_json_key_str(r->j, "to_kind", row->dst_kind, err));
+    TRY(atlas_json_key_str_opt(r->j, "to_path", row->dst_path_text, err));
+    /* The spelling, kept whether or not anything resolved it. */
+    TRY(atlas_json_key_str_opt(r->j, "spelling", row->dst_name_text, err));
+    TRY(atlas_json_key_str(r->j, "resolution", row->resolution, err));
+    TRY(atlas_json_key_str(r->j, "provenance", row->provenance, err));
+    TRY(atlas_json_key_int(r->j, "candidates", row->candidate_count, err));
+    TRY(atlas_json_key_str_opt(
+        r->j, "reason",
+        row->detail == NULL ? NULL : (atlas_code_why_is_known(row->detail) ? row->detail : "other"),
+        err));
+    TRY(atlas_json_key_int(r->j, "line", row->line, err));
+    TRY(atlas_json_key_bool(r->j, "untrusted_data", true, err));
+    TRY(atlas_json_obj_end(r->j, err));
+    return ATLAS_OK;
+}
+
+static atlas_status j_code_walk_item(atlas_renderer *r, const atlas_code_walk_row *row,
+                                     atlas_err *err) {
+    TRY(atlas_json_obj_begin(r->j, err));
+    TRY(atlas_json_key_int(r->j, "depth", row->depth, err));
+    TRY(atlas_json_key_str(r->j, "node_kind", row->node_kind, err));
+    TRY(atlas_json_key_str(r->j, "node", row->label, err));
+    /* Why this candidate is here. Every impact result carries its path. */
+    TRY(atlas_json_key_str(r->j, "via", row->via_label, err));
+    TRY(atlas_json_key_str(r->j, "edge", row->edge_kind, err));
+    TRY(atlas_json_key_str(r->j, "resolution", row->resolution, err));
+    TRY(atlas_json_key_str_opt(
+        r->j, "reason",
+        row->detail == NULL ? NULL : (atlas_code_why_is_known(row->detail) ? row->detail : "other"),
+        err));
+    TRY(atlas_json_key_bool(r->j, "untrusted_data", true, err));
+    TRY(atlas_json_obj_end(r->j, err));
+    return ATLAS_OK;
+}
+
+static atlas_status j_code_walk_end(atlas_renderer *r, const atlas_code_walk_summary *sum,
+                                    atlas_err *err) {
+    TRY(atlas_json_key_int(r->j, "exact", sum->exact, err));
+    TRY(atlas_json_key_int(r->j, "unique_lexical", sum->unique_lexical, err));
+    TRY(atlas_json_key_int(r->j, "ambiguous", sum->ambiguous, err));
+    TRY(atlas_json_key_int(r->j, "unresolved", sum->unresolved, err));
+    TRY(atlas_json_key_int(r->j, "visited", sum->visited, err));
+    TRY(atlas_json_key_bool(r->j, "truncated", sum->truncated, err));
+    TRY(atlas_json_key_str_opt(r->j, "truncated_reason", sum->truncated_reason, err));
+    /* In the document rather than only in the documentation: this is the
+     * sentence that stops an impact list being read as a prediction. */
+    TRY(atlas_json_key_str(r->j, "notice",
+                           "These are graph paths, not predictions. Atlas is not a compiler: a "
+                           "candidate here shares a recorded structural relation with what you "
+                           "named, and may or may not be affected by changing it.",
+                           err));
+    return ATLAS_OK;
+}
+
+static atlas_status j_code_list_begin(atlas_renderer *r, const char *key, atlas_err *err) {
+    r->items = 0;
+    r->in_list = true;
+    TRY(atlas_json_key(r->j, key, err));
+    return atlas_json_arr_begin(r->j, err);
+}
+
+static atlas_status j_code_list_end(atlas_renderer *r, const char *key, const char *singular,
+                                    const char *plural, int64_t count, bool more,
+                                    atlas_err *err) {
+    (void)singular;
+    (void)plural;
+    r->in_list = false;
+    TRY(atlas_json_arr_end(r->j, err));
+    /* `<key>_count` rather than `count`, because a document with three lists in
+     * one object needs three counts that can be told apart. Pagination is
+     * explicit for the same reason it is everywhere else: a caller is told there
+     * is more rather than inferring it from a full page. */
+    char buf[64];
+    (void)snprintf(buf, sizeof(buf), "%s_count", key);
+    TRY(atlas_json_key_int(r->j, buf, count, err));
+    (void)snprintf(buf, sizeof(buf), "%s_more", key);
+    return atlas_json_key_bool(r->j, buf, more, err);
+}
+
 const atlas_renderer_vtbl ATLAS_RENDERER_JSON = {
     j_begin,      j_end,          j_note_repo,    j_note_query,   j_list_begin,
     j_list_end,   j_doctor,       j_version,      j_repo_item,    j_repo_added,
@@ -742,6 +970,9 @@ const atlas_renderer_vtbl ATLAS_RENDERER_JSON = {
     j_history_item, j_diff_begin, j_diff_item,    j_diff_end,
     j_daemon_status, j_daemon_ping, j_repo_state, j_sync,         j_event_item,
     j_events_end, j_unit_text,    j_unit_install, j_integrate,
+    /* --- A3 --- */
+    j_code_status, j_code_file,   j_code_symbol_item, j_code_edge_item,
+    j_code_walk_item, j_code_walk_end, j_code_list_begin, j_code_list_end,
 };
 
 void atlas_render_error(FILE *out, FILE *errout, bool json, const char *command,

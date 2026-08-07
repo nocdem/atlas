@@ -601,6 +601,39 @@ static atlas_status h_repo_state(atlas_renderer *r, const atlas_repo_state_repor
     return ok();
 }
 
+/* Appends the structural stage's counters to a sync report.
+ *
+ * Part of `sync` rather than a command of its own, because the structural stage
+ * is part of the pass: a reader asking whether an unchanged pass parsed nothing
+ * is asking about the same pass the file counters describe. */
+static void h_code_summary(atlas_renderer *r, const atlas_reconcile_summary *s) {
+    FILE *o = r->out;
+    if (!s->code_ran) {
+        (void)fprintf(o, LABEL "%s\n", "structural", "skipped");
+        return;
+    }
+    (void)fprintf(o, LABEL "%lld selected, %lld parsed, %lld removed\n", "structural",
+                  (long long)s->code.files_selected, (long long)s->code.files_parsed,
+                  (long long)s->code.files_removed);
+    (void)fprintf(o, LABEL "%lld symbols, %lld relations, %lld resolved\n", "structural facts",
+                  (long long)s->code.symbols_written, (long long)s->code.relations_written,
+                  (long long)s->code.relations_resolved);
+    if (s->code.compile_db_present) {
+        (void)fprintf(o, LABEL "%lld units\n", "compile database",
+                      (long long)s->code.compile_units);
+    }
+    if (s->code.resolve_fallback) {
+        (void)fprintf(o, LABEL "%s\n", "resolution",
+                      "re-resolved the whole repository (too many names changed)");
+    }
+    if (s->code.degraded && s->code.degraded_reason != NULL) {
+        (void)fprintf(o, LABEL "%s\n", "structural degraded", s->code.degraded_reason);
+    }
+    if (s->code.truncated && s->code.truncated_reason != NULL) {
+        (void)fprintf(o, LABEL "%s\n", "structural truncated", s->code.truncated_reason);
+    }
+}
+
 static atlas_status h_sync(atlas_renderer *r, const char *repo, const atlas_sync_report *rep,
                            atlas_err *err) {
     (void)err;
@@ -650,6 +683,7 @@ static atlas_status h_sync(atlas_renderer *r, const char *repo, const atlas_sync
     if (s->truncated) {
         (void)fprintf(o, LABEL "%s\n", "truncated", atlas_buf_cstr(&s->truncated_reason));
     }
+    h_code_summary(r, s);
     return ok();
 }
 
@@ -789,6 +823,185 @@ static atlas_status h_integrate(atlas_renderer *r, const atlas_integrate_report 
     return ok();
 }
 
+/* --- A3: structural code intelligence ------------------------------------
+ *
+ * Paths and symbol names printed here are already in the safe encoding — they
+ * were encoded when they were stored — so they are printed as-is. Everything
+ * else is a fixed vocabulary or an integer. */
+
+static atlas_status h_code_status(atlas_renderer *r, const atlas_code_status_report *rep,
+                                  atlas_err *err) {
+    (void)err;
+    FILE *o = r->out;
+    (void)fprintf(o, LABEL "%s\n", "repo", rep->repo.name);
+    (void)fprintf(o, LABEL "%s\n", "index current", yes_no(rep->file_index_current));
+    /* The claim a caller acts on, and the reason when it cannot be made. */
+    (void)fprintf(o, LABEL "%s\n", "code index current", yes_no(rep->code_index_current));
+    if (!rep->code_index_current && rep->not_current_reason != NULL) {
+        (void)fprintf(o, LABEL "%s\n", "not current", rep->not_current_reason);
+    }
+    (void)fprintf(o, LABEL "%lld (files %lld)\n", "code generation",
+                  (long long)rep->code_state.last_complete_generation,
+                  (long long)rep->file_state.last_complete_generation);
+    (void)fprintf(o, LABEL "%lld\n", "files indexed", (long long)rep->code_state.files_indexed);
+    (void)fprintf(o, LABEL "%lld\n", "parsed last pass",
+                  (long long)rep->code_state.files_parsed_last);
+    (void)fprintf(o, LABEL "%lld\n", "symbols", (long long)rep->code_state.symbols);
+    (void)fprintf(o, LABEL "%lld\n", "relations", (long long)rep->code_state.relations);
+    /* Reported next to the totals rather than buried, because how much of the
+     * graph is inferred is the first thing a reader should weigh. */
+    (void)fprintf(o, LABEL "%lld\n", "ambiguous", (long long)rep->code_state.ambiguous);
+    (void)fprintf(o, LABEL "%lld\n", "unresolved", (long long)rep->code_state.unresolved);
+    (void)fprintf(o, LABEL "%s\n", "compile database",
+                  rep->code_state.compile_db_present ? "present" : "absent");
+    if (rep->code_state.compile_db_present) {
+        (void)fprintf(o, LABEL "%lld\n", "compile units",
+                      (long long)rep->code_state.compile_units);
+        (void)fprintf(o, LABEL "%lld\n", "entries dropped",
+                      (long long)rep->code_state.compile_entries_dropped);
+    }
+    if (rep->code_state.degraded) {
+        (void)fprintf(o, LABEL "%s\n", "degraded",
+                      atlas_safe(&r->safe, atlas_buf_cstr(&rep->code_state.degraded_reason)));
+    }
+    (void)fprintf(o, LABEL "%s\n", "last complete",
+                  dash_if_empty(rep->code_state.last_complete_at));
+    /* Printed as-is: both halves are constants from an Atlas binary, not values
+     * a repository or a model could have chosen. */
+    (void)fprintf(o, LABEL "%s v%lld", "analyzer",
+                  dash_if_empty(atlas_buf_cstr(&rep->code_state.analyzer_name)),
+                  (long long)rep->code_state.analyzer_version);
+    if (!atlas_code_analyzer_matches(&rep->code_state)) {
+        (void)fprintf(o, "  (this binary produces %s v%d)", ATLAS_CODE_ANALYZER_ID,
+                      ATLAS_CODE_ANALYZER_VERSION);
+    }
+    (void)fprintf(o, "\n");
+    return ok();
+}
+
+static atlas_status h_code_file(atlas_renderer *r, const atlas_code_file_report *rep,
+                                atlas_err *err) {
+    (void)err;
+    FILE *o = r->out;
+    (void)fprintf(o, LABEL "%s\n", "path", atlas_buf_cstr(&rep->path_text));
+    if (!rep->indexed) {
+        (void)fprintf(o, LABEL "%s\n", "structural", "not indexed");
+        (void)fprintf(o, LABEL "%s\n", "reason",
+                      "Atlas extracts structure from C sources, headers and included fragments "
+                      "only");
+        return ok();
+    }
+    (void)fprintf(o, LABEL "%s\n", "language", rep->language);
+    (void)fprintf(o, LABEL "%s\n", "parse", rep->parse_status);
+    if (rep->parse_detail.len > 0) {
+        (void)fprintf(o, LABEL "%s\n", "parse detail",
+                      atlas_safe(&r->safe, atlas_buf_cstr(&rep->parse_detail)));
+    }
+    if (rep->truncated) {
+        (void)fprintf(o, LABEL "%s\n", "truncated",
+                      atlas_safe(&r->safe, atlas_buf_cstr(&rep->truncated_reason)));
+    }
+    for (size_t i = 0; i < rep->role_count; i++) {
+        /* The basis travels with the role. A file under `tests/` is *named* like
+         * a test; that is a fact about the path, not proof about the file. */
+        (void)fprintf(o, LABEL "%s (basis: %s)\n", i == 0 ? "role" : "", rep->roles[i].role,
+                      rep->roles[i].basis);
+    }
+    (void)fprintf(o, LABEL "%s\n", "content hash", dash_if_empty(rep->content_hash));
+    (void)fprintf(o, LABEL "%lld\n", "generation", (long long)rep->generation);
+    (void)fprintf(o, LABEL "%lld\n", "symbols", (long long)rep->symbol_count);
+    (void)fprintf(o, LABEL "%lld\n", "includes", (long long)rep->include_count);
+    (void)fprintf(o, LABEL "%lld\n", "call candidates", (long long)rep->occurrence_count);
+    (void)fprintf(o, LABEL "%lld\n", "ambiguous", (long long)rep->ambiguous);
+    (void)fprintf(o, LABEL "%lld\n", "unresolved", (long long)rep->unresolved);
+    (void)fprintf(o, LABEL "%lld\n", "lines", (long long)rep->lines);
+    (void)fprintf(o, LABEL "%s\n", "code index current", yes_no(rep->code_index_current));
+    if (!rep->code_index_current && rep->not_current_reason != NULL) {
+        (void)fprintf(o, LABEL "%s\n", "not current", rep->not_current_reason);
+    }
+    /* A0's answer, unchanged by A3. Structure is not a reason. */
+    (void)fprintf(o, LABEL "%s\n", "reason", "UNKNOWN: nobody recorded why");
+    return ok();
+}
+
+static atlas_status h_code_symbol_item(atlas_renderer *r, const atlas_code_symbol_row *row,
+                                       atlas_err *err) {
+    (void)err;
+    (void)fprintf(r->out, "  %-9s %-10s %s:%lld  %s%s\n", row->kind, row->linkage, row->path_text,
+                  (long long)row->line, row->name_text,
+                  row->is_definition ? "" : " (declaration)");
+    return ok();
+}
+
+static atlas_status h_code_edge_item(atlas_renderer *r, const atlas_code_edge_row *row,
+                                     atlas_err *err) {
+    (void)err;
+    const char *target = row->dst_path_text != NULL ? row->dst_path_text : row->dst_name_text;
+    if (target == NULL) {
+        target = "-";
+    }
+    const char *from = row->src_path_text != NULL ? row->src_path_text : "";
+    (void)fprintf(r->out, "  %-14s %-16s %s%s%s", row->resolution, row->kind, from,
+                  from[0] != '\0' ? " -> " : "", target);
+    if (row->candidate_count > 1) {
+        (void)fprintf(r->out, "  [%lld candidates]", (long long)row->candidate_count);
+    }
+    if (row->detail != NULL) {
+        (void)fprintf(r->out, "  (%s)", row->detail);
+    }
+    (void)fprintf(r->out, "\n");
+    return ok();
+}
+
+static atlas_status h_code_walk_item(atlas_renderer *r, const atlas_code_walk_row *row,
+                                     atlas_err *err) {
+    (void)err;
+    /* The path is printed with the candidate, always. An impact result without
+     * the chain that produced it is an assertion. */
+    (void)fprintf(r->out, "  %-14s d%-2lld %-8s %s  <- %s via %s\n", row->resolution,
+                  (long long)row->depth, row->node_kind, row->label,
+                  row->via_label[0] != '\0' ? row->via_label : "(start)", row->edge_kind);
+    return ok();
+}
+
+static atlas_status h_code_walk_end(atlas_renderer *r, const atlas_code_walk_summary *sum,
+                                    atlas_err *err) {
+    (void)err;
+    FILE *o = r->out;
+    (void)fprintf(o, LABEL "%lld exact, %lld unique-lexical, %lld ambiguous, %lld unresolved\n",
+                  "candidates", (long long)sum->exact, (long long)sum->unique_lexical,
+                  (long long)sum->ambiguous, (long long)sum->unresolved);
+    if (sum->truncated) {
+        (void)fprintf(o, LABEL "%s\n", "truncated",
+                      sum->truncated_reason != NULL ? sum->truncated_reason : "a ceiling was reached");
+    }
+    (void)fprintf(o, LABEL "%s\n", "note",
+                  "graph paths, not predictions: Atlas is not a compiler");
+    return ok();
+}
+
+static atlas_status h_code_list_begin(atlas_renderer *r, const char *key, atlas_err *err) {
+    (void)err;
+    r->items = 0;
+    r->in_list = true;
+    (void)fprintf(r->out, "\n%s:\n", key);
+    return ok();
+}
+
+static atlas_status h_code_list_end(atlas_renderer *r, const char *key, const char *singular,
+                                    const char *plural, int64_t count, bool more, atlas_err *err) {
+    (void)key;
+    (void)err;
+    r->in_list = false;
+    if (count == 0) {
+        (void)fprintf(r->out, "  no %s\n", plural);
+    } else {
+        (void)fprintf(r->out, "  %" PRId64 " %s%s\n", count, count == 1 ? singular : plural,
+                      more ? " (more available; raise --limit)" : "");
+    }
+    return ok();
+}
+
 const atlas_renderer_vtbl ATLAS_RENDERER_HUMAN = {
     h_begin,      h_end,          h_note_repo,    h_note_query,   h_list_begin,
     h_list_end,   h_doctor,       h_version,      h_repo_item,    h_repo_added,
@@ -796,4 +1009,7 @@ const atlas_renderer_vtbl ATLAS_RENDERER_HUMAN = {
     h_history_item, h_diff_begin, h_diff_item,    h_diff_end,
     h_daemon_status, h_daemon_ping, h_repo_state, h_sync,         h_event_item,
     h_events_end, h_unit_text,    h_unit_install, h_integrate,
+    /* --- A3 --- */
+    h_code_status, h_code_file,   h_code_symbol_item, h_code_edge_item,
+    h_code_walk_item, h_code_walk_end, h_code_list_begin, h_code_list_end,
 };

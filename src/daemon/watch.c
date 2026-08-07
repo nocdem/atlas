@@ -913,7 +913,7 @@ static void submit_due(atlas_watcher *w) {
         if (rw->dirty_overflow) {
             full = true;
         }
-        if (atlas_writer_submit_reconcile(w->writer, rw->repo_id, full,
+        if (atlas_writer_submit_reconcile(w->writer, rw->repo_id, full, false,
                                           rw->dirty_paths.len > 0 ? rw->dirty_paths.data : NULL,
                                           rw->dirty_paths.len, NULL, &err) != ATLAS_OK) {
             /* Backpressure. The repository stays dirty and keeps its named
@@ -950,7 +950,8 @@ static void *watcher_main(void *arg) {
     for (size_t i = 0; i < w->repo_count; i++) {
         atlas_err serr;
         atlas_err_init(&serr);
-        (void)atlas_writer_submit_reconcile(w->writer, w->repos[i].repo_id, true, NULL, 0u, NULL,
+        (void)atlas_writer_submit_reconcile(w->writer, w->repos[i].repo_id, true, false, NULL, 0u,
+                                            NULL,
                                             &serr);
         w->repos[i].last_submit_ms = now_ms();
     }

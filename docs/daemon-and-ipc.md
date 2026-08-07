@@ -184,6 +184,29 @@ comes to behave differently depending on which one found it.
 "identity" is `provider`, `client`, `session_key`, and `root` or `repo`; a
 session key is safe-encoded and bounded on the way in.
 
+### A3 methods
+
+Seven, and every one of them is a read except `code.sync`. They live in
+`src/ipc/server_code.c`, are registered in the same table as everything else,
+and are served the same way: reads on the serve loop with their own read-only
+handle, the one write submitted to the writer thread.
+
+| Method | Params | Result |
+| --- | --- | --- |
+| `code.status` | `repo`\|`root` | structural currency, generation, counts, degraded state, compile-database presence, and the analyzer identity that built the graph next to the one this binary would produce |
+| `code.sync` | `repo`, `rebuild?` | `queued`, `sync_seq` — the same job the file index uses, with a structural rebuild flag |
+| `code.file` | `repo`\|`root`, `path`, `limit?` | roles with their basis, symbols, includes, call candidates, dependents |
+| `code.symbol.search` | `repo`\|`root`, `query`, `limit?` | matching symbol sites, each with file, kind, linkage and resolution |
+| `code.symbol` | `repo`\|`root`, `symbol`, `limit?` | every recorded site of the name, with callers and callees |
+| `code.deps` | `repo`\|`root`, `path`, `depth?`, `reverse?` | bounded traversal outward or inward |
+| `code.impact` | `repo`\|`root`, `path`, `depth?` | inbound candidates, split by resolution class |
+
+Every one of them opens with the same preamble — `code_index_current`,
+`code_generation`, and a typed reason when it is not current — so no caller can
+read a structural answer without also being told how much to trust it. `deps`
+and `impact` are the same bounded walk in opposite directions, served by one
+function, because two implementations would eventually disagree.
+
 ### A session is found by its key, and by nothing else
 
 Every method above resolves the session by exact `(provider, client,
@@ -375,6 +398,27 @@ silently truncated when one is reached.
 
 The MCP result ceiling is well below Claude's own 25 000-token MCP output limit,
 so an Atlas result is never the thing that fills a context window.
+
+## A3 resource limits
+
+Same rule again, and the traversal bounds matter most: an impact query is the
+one place where an honest answer could be the size of the repository.
+
+| bound | value | on reach |
+| --- | --- | --- |
+| file size parsed | 4 MiB | the file is recorded with `parse_status = failed` and a reason |
+| token, name, nesting, symbols and relations per file | see `include/atlas/limits.h` | the file is `partial`, an error row is written, the repository is degraded |
+| files parsed per pass | 20 000, in chunks of 512 | the pass reports truncation; the remainder still differs by hash, so the next pass takes it |
+| compile database | 64 MiB, 100 000 entries | read up to the ceiling and reported as truncated |
+| candidates per ambiguous edge | bounded | `candidate_count` still reports the *true* number, so a bound never makes an ambiguity look smaller than it is |
+| traversal depth | 8 requested, hard maximum | clamped, and the clamp is reported |
+| traversal nodes and edges | bounded per query | `truncated` with the ceiling named |
+| rows per structural response | the A2 row bound | `more: true` and a cursor |
+| retained structural errors per repository | `ATLAS_CODE_ERRORS_RETAIN_PER_REPO` | oldest pruned; the `degraded` flag is not pruned with them, because the flag is the durable statement |
+
+The one that is easy to get wrong is the candidate count, and it is worth saying
+plainly: the *set* of candidates is bounded and the *count* is not. Reporting
+"3 candidates" when there were forty would be a bounded answer that lies.
 
 ## Why the MCP adapter holds no database handle
 

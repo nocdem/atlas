@@ -31,6 +31,13 @@ add_executable(atlas-jsoncheck tools/atlas_jsoncheck.c)
 target_link_libraries(atlas-jsoncheck PRIVATE atlas_test_support)
 atlas_set_warnings(atlas-jsoncheck)
 
+# A3. The DNA-scale acceptance fixture generator. In C for the same reason the
+# JSON checker is: a measurement fixture is part of the build, and the build
+# depends on no language runtime. Deterministic from a fixed seed, because a
+# performance number is only comparable when the input was identical.
+add_executable(atlas-gen-ctree tools/atlas_gen_ctree.c)
+atlas_set_warnings(atlas-gen-ctree)
+
 set(ATLAS_TESTS
   test_core
   test_safetext
@@ -60,6 +67,12 @@ set(ATLAS_TESTS
   test_ai_attribution
   test_hooks
   test_plugin
+  # --- A3 ---
+  test_code_lex
+  test_code_graph
+  test_code_compdb
+  test_code_trust
+  test_code_analyzer
 )
 
 foreach(test_name IN LISTS ATLAS_TESTS)
@@ -74,18 +87,22 @@ endforeach()
 
 # A repository is required for the integration suites; a missing git makes them
 # fail loudly rather than silently pass.
-set_tests_properties(test_scan test_search test_diff test_worktree test_cli test_terminal
-  test_git_hardening test_reconcile PROPERTIES LABELS "integration")
+set_tests_properties(test_scan test_search test_diff test_worktree test_cli test_terminal test_code_graph test_code_compdb
+  test_code_analyzer test_git_hardening test_reconcile PROPERTIES LABELS "integration")
 set_tests_properties(test_core test_safetext test_proc test_git_parse test_db test_datadir
   test_lock test_ipc test_migrate3 test_unit PROPERTIES LABELS "unit")
 
 # A2. test_ai_schema drives the storage layer in process; test_mcp and
 # test_plugin fork the binary but need no daemon and no repository.
 set_tests_properties(test_ai_schema test_mcp test_plugin PROPERTIES LABELS "unit")
+
+# A3. The extractor is pure — bytes in, a bounded object out — so its suite needs
+# no repository, no database and no daemon, and belongs in the fast subset.
+set_tests_properties(test_code_lex PROPERTIES LABELS "unit")
 # test_ai_trust and test_hooks fork a live daemon and wait on filesystem events,
 # so they carry the daemon label and its serialisation for the same reason
 # test_daemon does: parallel daemons compete for the machine's inotify budget.
-set_tests_properties(test_ai_trust test_hooks test_mcp_roots test_ai_attribution
+set_tests_properties(test_ai_trust test_hooks test_mcp_roots test_ai_attribution test_code_trust
   PROPERTIES LABELS "daemon" TIMEOUT 900 RUN_SERIAL TRUE)
 
 # The plugin fixture test reads the shipped plugin from the source tree, so it

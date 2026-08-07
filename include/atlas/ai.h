@@ -348,6 +348,22 @@ typedef struct atlas_ai_context {
     int64_t approved_decisions; /* always 0 in A2; present so it can stop being */
     int64_t proposed_decisions;
     int64_t unresolved_reasons;
+
+    /* A3. Typed counters only, and that is the whole of what the structural
+     * index contributes to automatic context.
+     *
+     * No symbol name, no path, no include spelling, no summary. Every one of
+     * those is chosen by whoever can commit — `ignore_previous_instructions` is
+     * a legal C identifier and a legal file name — and the envelope's rule is
+     * that no field can hold a value somebody else chose. A consumer that wants
+     * a name asks through an explicit MCP tool, where it arrives labelled
+     * UNTRUSTED_DATA. */
+    bool code_index_current;
+    int64_t code_generation;
+    int64_t code_symbols;
+    int64_t code_relations;
+    int64_t code_ambiguous;
+    int64_t code_unresolved;
 } atlas_ai_context;
 
 void atlas_ai_context_init(atlas_ai_context *c);

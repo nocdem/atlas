@@ -13,7 +13,47 @@ checked against a read-only allowlist before the process is created, hooks and
 external diff drivers are disabled, and the working tree and index are only ever
 read. See [docs/git-safety.md](docs/git-safety.md).
 
-## Status: phase A2
+## Status: phase A3
+
+A3 makes Atlas answer structural questions about C source, with the resolution
+class attached to every answer. It is a **lexical** indexer, not a compiler and
+not a pretend one: it reports what the bytes say, says how sure it is, and never
+picks between two definitions of a name.
+
+### What A3 adds
+
+- `atlas code status|sync|file|search|symbol|deps|impact` — the structural
+  commands, mirrored one-for-one by seven daemon RPCs and six MCP tools
+- a first-party bounded lexical C indexer for `.c`, `.h` and `.inc`: symbols,
+  includes, call candidates, translation units and file roles, with no Clang, no
+  tree-sitter, no ctags and no new dependency of any kind
+- eight resolution classes on every fact — `SOURCE_EXACT`, `BUILD_METADATA`,
+  `UNIQUE_LEXICAL`, `AMBIGUOUS`, `UNRESOLVED`, `CONDITIONAL`, `MODEL_PROPOSAL`,
+  `UNKNOWN` — so "these bytes are an identifier followed by `(`" and "this calls
+  that function" stay different claims
+- `compile_commands.json` read as **data**: an argument allowlist, paths checked
+  against the repository, the `command` string hashed and discarded rather than
+  stored, and nothing in it ever executed. There is a test that plants an
+  executable marker in four places inside a compile database and asserts it never
+  ran.
+- bounded dependency and impact traversal with cycle detection, deterministic
+  ordering, a reason per result, and separate sections for exact, unique-lexical,
+  ambiguous and unresolved
+- schema v5: structurally indexed files with typed roles, translation units,
+  symbols, occurrences, relations, ambiguity candidates, bounded errors, and the
+  interned identity of the analyzer that produced them
+- **the graph knows which analyzer built it.** Upgrade Atlas with a corrected
+  lexer and every existing structural index becomes stale, even though not one
+  repository byte changed — because none of the other staleness signals can see
+  that. The next ordinary sync rebuilds, and the rebuild touches derived rows
+  only: sessions, recorded reasons, decisions, evidence and history come through
+  untouched.
+- structural counts — and only counts — added to the automatic model context
+
+Full detail in [docs/code-intelligence.md](docs/code-intelligence.md), including
+the explicit list of things A3 does **not** claim.
+
+## Phase A2
 
 A2 makes Atlas participate in a Claude Code session automatically. After a
 one-time setup nobody types an `atlas` command during ordinary work: hooks open a
@@ -142,7 +182,8 @@ None of the following exist yet, and Atlas does not pretend otherwise:
 
 - **decision documents and ADRs read from the repository.** A2 records reasons
   and decisions that a model or a person hands it; it does not discover or parse
-  any that are already written down in the tree. That is A3.
+  any that are already written down in the tree. A3 answers the structural half
+  of that; the recorded-reason half is still what A2 built.
 - **a human approval workflow.** A2 records *proposals*. It has no way to prove a
   human agreed to one — an argument asserting approval is a string a model
   produced — so `approved` is pinned to zero by a schema `CHECK`, and lifting
@@ -213,9 +254,22 @@ atlas search NAME QUERY
 atlas file NAME PATH
 atlas history NAME PATH
 atlas diff NAME
+
+atlas code status NAME
+atlas code sync NAME [--rebuild]
+atlas code file NAME PATH
+atlas code search NAME QUERY
+atlas code symbol NAME SYMBOL
+atlas code deps NAME PATH [--depth N] [--reverse]
+atlas code impact NAME PATH [--depth N]
+
 atlas version
 atlas help
 ```
+
+Every `atlas code` result states the same four things, whatever the renderer:
+whether the structural index is current, which generation it describes, the
+resolution class of each fact, and whether the result was truncated and why.
 
 ### Grammar
 
@@ -441,6 +495,29 @@ copied out of Atlas output can be pasted straight back in.
 - reconciliation is per repository, not per path: one changed file triggers one
   `lstat` per tracked file (about 480 ms on a 5000-file fixture) even though only
   the changed file's content is read. See [docs/backlog.md](docs/backlog.md).
+- **the structural index is lexical, not compiled.** `identifier(` is a call
+  *candidate*; a name defined once is `UNIQUE_LEXICAL`, which means "one lexical
+  match", not "the compiler agrees". A call through a function pointer, a call
+  produced by a macro, and a definition inside an `#if` are all recorded as
+  candidates or as `UNKNOWN`, never as exact. Two definitions of one name stay
+  `AMBIGUOUS` with both recorded; Atlas does not choose.
+- **`#include` resolution is a separate fact from the include itself.** The
+  directive is `SOURCE_EXACT` because the bytes say so; where it leads may be
+  `SOURCE_EXACT`, `BUILD_METADATA`, `UNIQUE_LEXICAL`, `AMBIGUOUS` or
+  `UNRESOLVED`, and a system header is honestly the last of those.
+- **impact results are candidates to review, not a proof of breakage.** They are
+  bounded, deterministic, and each one carries the path and the weakest
+  resolution class along it.
+- **C only.** `.c`, `.h`, `.inc`. `.C`, `.cpp` and `.hpp` are deliberately not
+  treated as C, because A3 does not guess at C++.
+- **the structural index is rebuilt, not migrated, when the analyzer changes.**
+  A version bump costs one full structural pass over the repository. That is the
+  price of not reporting a graph as current when the algorithm behind it has
+  been corrected.
+- **no compile database is an ordinary state, not an error**, and it costs
+  precision rather than correctness: without one, an include that a `-I`
+  directory would have resolved exactly falls back to a repository-wide lexical
+  match and says so.
 - **change attribution is a claim about opportunity, not about causation.** Atlas
   records `direct_edit` when a session's edit tool named a path *and* the index
   then saw it change, `observed` when only the second happened, and `ambiguous`
@@ -483,7 +560,9 @@ copied out of Atlas output can be pasted straight back in.
 - [docs/ai-trust-boundary.md](docs/ai-trust-boundary.md) — what safe text does
   and does not protect against, and how A2 implements the boundary it cannot
 - [docs/backlog.md](docs/backlog.md) — known engineering and security backlog
-- [docs/roadmap.md](docs/roadmap.md) — A3 through A6
+- [docs/code-intelligence.md](docs/code-intelligence.md) — the A3 structural
+  index: resolution classes, what is claimed, and what is explicitly not
+- [docs/roadmap.md](docs/roadmap.md) — A4 through A6
 - [third_party/yyjson/PROVENANCE.md](third_party/yyjson/PROVENANCE.md) — the one
   vendored dependency, its exact upstream identity and its digests
 - [SECURITY.md](SECURITY.md) — threat model and reporting

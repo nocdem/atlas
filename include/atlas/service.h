@@ -12,6 +12,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "atlas/code.h"
 #include "atlas/datadir.h"
 #include "atlas/db.h"
 #include "atlas/error.h"
@@ -19,6 +20,7 @@
 #include "atlas/limits.h"
 #include "atlas/reconcile.h"
 #include "atlas/scan.h"
+#include "atlas/sha256.h"
 
 typedef struct atlas_ctx atlas_ctx;
 
@@ -267,6 +269,119 @@ void atlas_sync_report_free(atlas_sync_report *r);
  * `wait` polls for completion, bounded by `timeout_ms`. */
 atlas_status atlas_service_sync(atlas_ctx *ctx, const char *name, bool full, bool wait,
                                 int timeout_ms, atlas_sync_report *out, atlas_err *err);
+
+/* --- A3: structural code intelligence ------------------------------------
+ *
+ * The CLI orchestrates these section by section rather than one call answering
+ * everything, because a file context is several independent lists and a single
+ * function returning all of them would have to buffer the lot. Each one is a
+ * bounded query; the renderer streams what comes back.
+ *
+ * Every one of them refuses when the structural index is not current? No — they
+ * answer, and they report that it is not. Refusing would leave a caller with
+ * nothing when it has stale-but-labelled facts, which is worse. */
+
+typedef struct atlas_code_status_report {
+    atlas_repo_info repo;
+    atlas_index_state file_state;
+    atlas_code_index_state code_state;
+    bool file_index_current;
+    bool code_index_current;
+    /* One of the fixed Atlas strings, or NULL when current. */
+    const char *not_current_reason;
+} atlas_code_status_report;
+
+void atlas_code_status_report_init(atlas_code_status_report *r);
+void atlas_code_status_report_free(atlas_code_status_report *r);
+
+atlas_status atlas_service_code_status(atlas_ctx *ctx, const char *name,
+                                       atlas_code_status_report *out, atlas_err *err);
+
+/* One role, as reported. All three values come from fixed vocabularies. */
+typedef struct atlas_code_role_entry {
+    char role[24];
+    char basis[24];
+    char resolution[20];
+} atlas_code_role_entry;
+
+typedef struct atlas_code_file_report {
+    bool indexed;
+    atlas_buf path_text;
+    char language[16];
+    char content_hash[ATLAS_SHA256_HEX_LEN + 1u];
+    char parse_status[16];
+    atlas_buf parse_detail;
+    atlas_buf truncated_reason;
+    bool truncated;
+    bool include_guard;
+    int64_t code_file_id;
+    int64_t symbol_count;
+    int64_t include_count;
+    int64_t occurrence_count;
+    int64_t bytes;
+    int64_t lines;
+    int64_t generation;
+    /* How much of what this file says is inferred rather than established, so a
+     * caller can weigh the answer without listing every edge. */
+    int64_t ambiguous;
+    int64_t unresolved;
+    atlas_code_role_entry roles[ATLAS_CODE_MAX_ROLES_PER_FILE];
+    size_t role_count;
+    /* The repository's structural currency, carried here so a file context is
+     * self-describing rather than needing a second call to be trustworthy. */
+    bool code_index_current;
+    const char *not_current_reason;
+} atlas_code_file_report;
+
+void atlas_code_file_report_init(atlas_code_file_report *r);
+void atlas_code_file_report_free(atlas_code_file_report *r);
+
+atlas_status atlas_service_code_file(atlas_ctx *ctx, const char *name, const char *path,
+                                     atlas_code_file_report *out, atlas_err *err);
+/* Symbols defined or declared in one file, in source order. */
+atlas_status atlas_service_code_file_symbols(atlas_ctx *ctx, const char *name, const char *path,
+                                             int64_t limit, atlas_code_symbol_cb cb, void *ud,
+                                             int64_t *count_out, bool *more_out, atlas_err *err);
+/* Edges of one kind leaving or entering a file. `inbound` selects the
+ * destination index rather than the source one, which is the whole difference
+ * between "what does this include" and "what includes this". */
+atlas_status atlas_service_code_file_edges(atlas_ctx *ctx, const char *name, const char *path,
+                                           const char *kind, bool inbound, int64_t limit,
+                                           atlas_code_edge_cb cb, void *ud, int64_t *count_out,
+                                           bool *more_out, atlas_err *err);
+/* A bounded substring search over indexed symbol names. `kind` may be NULL. */
+atlas_status atlas_service_code_symbol_search(atlas_ctx *ctx, const char *name, const char *query,
+                                              const char *kind, int64_t limit,
+                                              atlas_code_symbol_cb cb, void *ud,
+                                              int64_t *count_out, bool *more_out, atlas_err *err);
+/* Every recorded site for one exact symbol name. Several rows is the normal
+ * answer, not an error: two files' identically named statics are two symbols. */
+atlas_status atlas_service_code_symbol_sites(atlas_ctx *ctx, const char *name, const char *symbol,
+                                             int64_t limit, atlas_code_symbol_cb cb, void *ud,
+                                             int64_t *count_out, bool *more_out, atlas_err *err);
+/* Edges into or out of every site of one symbol name — its callers and its
+ * callees. */
+atlas_status atlas_service_code_symbol_edges(atlas_ctx *ctx, const char *name, const char *symbol,
+                                             bool inbound, int64_t limit, atlas_code_edge_cb cb,
+                                             void *ud, int64_t *count_out, bool *more_out,
+                                             atlas_err *err);
+
+/* Bounded traversal from a path or a symbol.
+ *
+ * Exactly one of `path` and `symbol` is given. `inbound` answers "what may be
+ * affected if this changes"; outbound answers "what does this depend on". The
+ * result is a set of graph paths and says so; it is never a claim that anything
+ * will break. */
+atlas_status atlas_service_code_walk(atlas_ctx *ctx, const char *name, const char *path,
+                                     const char *symbol, bool inbound, int64_t depth,
+                                     int64_t limit, atlas_code_walk_cb cb, void *ud,
+                                     atlas_code_walk_summary *sum, atlas_err *err);
+
+/* Requests a structural reindex. Routed to the daemon when one is running, as
+ * every other mutation is, so the single writer stays single. `rebuild` drops
+ * every structural row first. */
+atlas_status atlas_service_code_sync(atlas_ctx *ctx, const char *name, bool rebuild, bool wait,
+                                     int timeout_ms, atlas_sync_report *out, atlas_err *err);
 
 /* --- diff ---------------------------------------------------------------- */
 

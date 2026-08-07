@@ -447,7 +447,7 @@ static atlas_status method_repo_sync(dispatch_state *ds, const atlas_ipc_request
      * about a path somebody observed. An incremental sync therefore relies on
      * the identity check, and `full` is how a caller asks for content
      * verification. */
-    st = atlas_writer_submit_reconcile(ds->ctx->writer, info.id, full, NULL, 0u, &seq, err);
+    st = atlas_writer_submit_reconcile(ds->ctx->writer, info.id, full, false, NULL, 0u, &seq, err);
     atlas_repo_info_free(&info);
     if (st != ATLAS_OK) {
         return st;
@@ -660,6 +660,16 @@ atlas_status atlas_server_dispatch(atlas_server_ctx *ctx, const void *payload, s
         for (size_t i = 0; i < n; i++) {
             if (strcmp(atlas_ipc_request_method(req), ai[i].name) == 0) {
                 fn = ai[i].fn;
+                break;
+            }
+        }
+    }
+    if (fn == NULL) {
+        size_t n = 0;
+        const atlas_method_entry *code = atlas_server_code_methods(&n);
+        for (size_t i = 0; i < n; i++) {
+            if (strcmp(atlas_ipc_request_method(req), code[i].name) == 0) {
+                fn = code[i].fn;
                 break;
             }
         }

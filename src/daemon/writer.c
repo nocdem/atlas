@@ -215,6 +215,10 @@ static void run_reconcile(atlas_writer *w, atlas_job *j) {
          * rather than having it split across two files. */
         opts.dirty_paths = j->dirty_paths.len > 0 ? j->dirty_paths.data : NULL;
         opts.dirty_paths_len = j->dirty_paths.len;
+        /* A structural rebuild is a separate request from a full pass: `full`
+         * re-reads file content, and a full pass that finds every hash unchanged
+         * still parses nothing. Discarding the graph has to be asked for. */
+        opts.code_rebuild = j->code_rebuild;
 
         atlas_reconcile_summary sum;
         atlas_reconcile_summary_init(&sum);
@@ -332,7 +336,8 @@ static atlas_status ai_request_sync(void *ud, int64_t repo_id, const char *dirty
     if (repo_id <= 0) {
         return ATLAS_OK;
     }
-    return atlas_writer_submit_reconcile(w, repo_id, false, dirty_paths, dirty_len, sync_seq_out,
+    return atlas_writer_submit_reconcile(w, repo_id, false, false, dirty_paths, dirty_len,
+                                         sync_seq_out,
                                          err);
 }
 
@@ -592,6 +597,7 @@ void atlas_writer_stop(atlas_writer *w) {
 /* --- submission ---------------------------------------------------------- */
 
 atlas_status atlas_writer_submit_reconcile(atlas_writer *w, int64_t repo_id, bool full,
+                                           bool code_rebuild,
                                            const char *dirty_paths, size_t dirty_len,
                                            int64_t *sync_seq_out, atlas_err *err) {
     atlas_job *j = job_new(ATLAS_JOB_RECONCILE);
@@ -600,6 +606,7 @@ atlas_status atlas_writer_submit_reconcile(atlas_writer *w, int64_t repo_id, boo
     }
     j->repo_id = repo_id;
     j->full = full;
+    j->code_rebuild = code_rebuild;
     if (dirty_paths != NULL && dirty_len > 0) {
         atlas_status cst = atlas_buf_set(&j->dirty_paths, dirty_paths, dirty_len, err);
         if (cst != ATLAS_OK) {
@@ -623,6 +630,13 @@ atlas_status atlas_writer_submit_reconcile(atlas_writer *w, int64_t repo_id, boo
         if (q->kind == ATLAS_JOB_RECONCILE && q->repo_id == repo_id && !q->wants_result) {
             if (full) {
                 q->full = true;
+            }
+            /* A rebuild request upgrades a pending pass rather than being
+             * dropped, exactly as a full request does. The two coalesce
+             * independently because they mean different things: `full` re-reads
+             * file content, `code_rebuild` discards the graph. */
+            if (code_rebuild) {
+                q->code_rebuild = true;
             }
             /* The pending pass must cover both requests, so the named paths are
              * merged rather than replaced. Dropping one set here would silently

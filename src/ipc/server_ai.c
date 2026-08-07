@@ -917,6 +917,27 @@ static atlas_status method_context(dispatch_state *ds, const atlas_ipc_request *
                 st = atlas_buf_set_str(&c.not_current_reason, reason, err);
             }
         }
+        /* A3: the structural index's own counters.
+         *
+         * Read here, next to everything else, and carried into the envelope as
+         * integers and a boolean. Not one symbol name, path or include spelling
+         * comes with them — see the note in `src/ai/context.c`. */
+        if (st == ATLAS_OK) {
+            atlas_code_index_state code_state;
+            atlas_code_index_state_init(&code_state);
+            st = atlas_db_code_state_get(ds->db, info.id, &code_state, err);
+            if (st == ATLAS_OK) {
+                const char *code_reason = NULL;
+                c.code_index_current =
+                    atlas_code_index_current(&state, &code_state, c.index_current, &code_reason);
+                c.code_generation = code_state.last_complete_generation;
+                c.code_symbols = code_state.symbols;
+                c.code_relations = code_state.relations;
+                c.code_ambiguous = code_state.ambiguous;
+                c.code_unresolved = code_state.unresolved;
+            }
+            atlas_code_index_state_free(&code_state);
+        }
         atlas_index_state_free(&state);
         if (st == ATLAS_OK) {
             st = atlas_db_events_head(ds->db, info.id, &c.event_cursor, err);
@@ -988,6 +1009,15 @@ static atlas_status method_context(dispatch_state *ds, const atlas_ipc_request *
     }
     if (st == ATLAS_OK) {
         st = atlas_json_key_int(ds->j, "unresolved_reasons", c.unresolved_reasons, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(ds->j, "code_index_current", c.code_index_current, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "code_symbols", c.code_symbols, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "code_relations", c.code_relations, err);
     }
     if (st == ATLAS_OK && found) {
         /* The identifiers the envelope itself carries, echoed as structured
@@ -1316,6 +1346,27 @@ static atlas_status emit_decision(const atlas_ai_decision_row *row, void *ud, at
     return st;
 }
 
+/* One typed file role, with the basis it was arrived at on. Path naming is
+ * evidence about a path and not proof about a file, and the basis is what keeps
+ * that visible to a reader. */
+static atlas_status emit_code_role(const atlas_code_role_row *row, void *ud, atlas_err *err) {
+    dispatch_state *ds = (dispatch_state *)ud;
+    atlas_status st = atlas_json_obj_begin(ds->j, err);
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "role", row->role, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "basis", row->basis, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "resolution", row->resolution, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_obj_end(ds->j, err);
+    }
+    return st;
+}
+
 /* Indexed facts about one path, plus its recorded history and any reasons.
  *
  * The history rows carry commit subjects, which are repository prose. They are
@@ -1498,9 +1549,99 @@ static atlas_status method_file_context(dispatch_state *ds, const atlas_ipc_requ
     if (st == ATLAS_OK) {
         st = atlas_json_key_int(ds->j, "decision_count", dcount, err);
     }
+    /* A3: the structural synopsis, folded into the tool that already answers
+     * "what does Atlas know about this path" rather than given a tool of its
+     * own. A model asking about a file wants one answer, and two tools returning
+     * overlapping halves of it is how they come to disagree.
+     *
+     * Deliberately counts and states rather than lists: the lists are what
+     * `atlas_code_file` is for, and a file context that carried every symbol
+     * would be the thing that fills a context window. */
+    if (st == ATLAS_OK) {
+        st = atlas_json_key(ds->j, "structure", err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_obj_begin(ds->j, err);
+    }
+    if (st == ATLAS_OK) {
+        atlas_index_state fs;
+        atlas_index_state_init(&fs);
+        atlas_code_index_state cs;
+        atlas_code_index_state_init(&cs);
+        st = atlas_db_index_state_get(ds->db, info.id, &fs, err);
+        if (st == ATLAS_OK) {
+            st = atlas_db_code_state_get(ds->db, info.id, &cs, err);
+        }
+        if (st == ATLAS_OK) {
+            const char *fr = NULL;
+            bool file_current = atlas_server_index_current(&fs, &fr);
+            const char *reason = NULL;
+            bool current = atlas_code_index_current(&fs, &cs, file_current, &reason);
+            st = atlas_json_key_bool(ds->j, "code_index_current", current, err);
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_str_opt(
+                    ds->j, "code_not_current_reason",
+                    reason == NULL
+                        ? NULL
+                        : (atlas_code_not_current_reason_is_known(reason) ? reason : "other"),
+                    err);
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_int(ds->j, "code_generation", cs.last_complete_generation, err);
+            }
+        }
+        atlas_index_state_free(&fs);
+        atlas_code_index_state_free(&cs);
+    }
+    if (st == ATLAS_OK) {
+        int64_t code_file_id = 0;
+        bool indexed = false;
+        st = atlas_db_code_file_get(ds->db, info.id, raw.data, raw.len, NULL, NULL, &indexed,
+                                    &code_file_id, err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_bool(ds->j, "indexed", indexed, err);
+        }
+        if (st == ATLAS_OK && indexed) {
+            st = atlas_json_key(ds->j, "roles", err);
+            if (st == ATLAS_OK) {
+                st = atlas_json_arr_begin(ds->j, err);
+            }
+            int64_t roles = 0;
+            if (st == ATLAS_OK) {
+                st = atlas_db_code_roles_of(ds->db, code_file_id, emit_code_role, ds, &roles, err);
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_arr_end(ds->j, err);
+            }
+            int64_t ambiguous = 0;
+            int64_t unresolved = 0;
+            if (st == ATLAS_OK) {
+                st = atlas_db_code_file_unsettled(ds->db, code_file_id, &ambiguous, &unresolved,
+                                                  err);
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_int(ds->j, "ambiguous", ambiguous, err);
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_int(ds->j, "unresolved", unresolved, err);
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_str(ds->j, "detail",
+                                        "call atlas_code_file for the symbols, includes and "
+                                        "dependents, and atlas_code_impact before changing a "
+                                        "shared header",
+                                        err);
+            }
+        }
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_obj_end(ds->j, err);
+    }
+
     if (st == ATLAS_OK && rcount == 0 && dcount == 0) {
-        /* The A0 answer, unchanged. Nobody recorded a reason, so there is not
-         * one, and Atlas says so rather than offering the commit subject as a
+        /* The A0 answer, unchanged, and A3 does not weaken it: structure is not
+         * a reason. Nobody recorded one, so there is not one, and Atlas says so
+         * rather than offering the commit subject or an include graph as a
          * substitute. */
         st = atlas_json_key_str(ds->j, "reason", "UNKNOWN", err);
     }

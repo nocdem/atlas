@@ -33,6 +33,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "atlas/code.h"
 #include "atlas/db.h"
 #include "atlas/error.h"
 #include "atlas/git.h"
@@ -80,6 +81,12 @@ typedef struct atlas_reconcile_opts {
     int timeout_ms;          /* per git invocation; 0 means the daemon default */
     int64_t sync_seq;        /* echoed into the published state for `sync --wait` */
     atlas_workers *workers;  /* NULL hashes serially on the calling thread */
+
+    /* A3. The structural pass is a stage of this one rather than a second
+     * pipeline, so it shares the pass's generation, its worker pool and its
+     * transaction discipline. */
+    bool skip_code;    /* index files and history only */
+    bool code_rebuild; /* drop every structural row first and reindex */
 } atlas_reconcile_opts;
 
 void atlas_reconcile_opts_init(atlas_reconcile_opts *o);
@@ -118,6 +125,11 @@ typedef struct atlas_reconcile_summary {
 
     int64_t events_appended;
     int64_t batches_written;
+
+    /* A3. What the structural stage did, so `sync --json` reports it next to
+     * everything else the pass established rather than in a separate command. */
+    bool code_ran;
+    atlas_code_pass_summary code;
 
     bool truncated;
     atlas_buf truncated_reason;

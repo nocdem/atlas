@@ -39,6 +39,27 @@ renderer checks against its own output. Repository prose reaches a model only
 through an explicit tool call, labelled with its provenance. See
 [docs/ai-trust-boundary.md](docs/ai-trust-boundary.md).
 
+**Since A3 it reads a build description**, and `compile_commands.json` is
+written by whoever wrote the repository. That file's `command` field is a shell
+command line, and the obvious mistake would be to interpret it. Atlas does not:
+it hashes the string to notice when it changes, discards it, and reads the rest
+through a positive allowlist of compiler arguments — include directories,
+defines, the standard, the source and the output, and nothing else. Response
+files (`@file`) and compiler plugins (`-fplugin=`) are recognised only well
+enough to be ignored. An include directory outside the repository is stored with
+`external = 1` and **never opened**: recording where a build looks is not being
+allowed to look there.
+
+The relevant test does not check that the parser is careful, which would be an
+opinion. It plants an executable marker in the `command` string, in `argv[0]`,
+in a `-fplugin=` argument and in a response file reference, runs a structural
+pass, and asserts the marker never fired.
+
+The structural indexer itself creates no process, reads only through
+`atlas_path_open_nofollow`, and is bounded in file size, token length, nesting
+depth, symbol count and relation count — every ceiling reported rather than
+silently applied.
+
 What Atlas does **not** defend against, and does not claim to:
 
 - an attacker who can already run code as the user running Atlas
@@ -56,6 +77,15 @@ What Atlas does **not** defend against, and does not claim to:
 - **the truthfulness of what a model records.** A recorded reason is a
   `MODEL_PROPOSAL`, stored and reported as one. Atlas does not check whether it
   is true, and deliberately has no way for anything to claim it was approved.
+- **a symbol name or an include spelling being persuasive prose.** They are
+  repository content and they reach a model only through an explicit structural
+  tool call, labelled `untrusted_data`. The automatic context envelope carries
+  structural *counts* and nothing else, for exactly this reason.
+- **the structural index being right about what a compiler would do.** It is
+  lexical. Every fact carries a resolution class saying how firmly it is
+  established, and `UNIQUE_LEXICAL` means one lexical match rather than one
+  truth. Acting on an impact result without reading it is a mistake Atlas labels
+  but cannot prevent.
 
 ## Controls
 

@@ -87,7 +87,7 @@ static void test_migration_creates_the_a2_tables(void) {
     env_open(&e, &err);
 
     T_EQ_INT(atlas_db_schema_version(e.db, &err), ATLAS_SCHEMA_VERSION);
-    T_EQ_INT(ATLAS_SCHEMA_VERSION, 4);
+    T_EQ_INT(ATLAS_SCHEMA_VERSION, 5);
 
     static const char *const TABLES[] = {
         "ai_clients",       "ai_sessions",       "ai_session_repos",     "ai_session_events",

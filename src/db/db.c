@@ -32,22 +32,96 @@ atlas_status atlas_db_exec_sql(atlas_db *db, const char *sql, atlas_err *err) {
     return ATLAS_OK;
 }
 
+/* --- the prepared-statement cache -----------------------------------------
+ *
+ * Every query in Atlas is a string literal, and preparing one is not free: the
+ * planner runs each time, which for the more involved statements costs a
+ * hundred microseconds or so. A0 and A1 did one or two statements per file and
+ * never noticed. A3's structural pass does a few hundred — a symbol, an
+ * occurrence and several relations per file, then a resolution per edge — and
+ * preparing them all afresh was, measured, the whole cost of indexing a large
+ * repository.
+ *
+ * The cache is keyed on the **SQL pointer**, not on its contents. Every call
+ * site passes a string literal with static storage duration, so the pointer is
+ * a stable identity and the lookup is a pointer compare rather than a hash of a
+ * kilobyte of SQL. A caller that ever passes a constructed string simply misses
+ * the cache and prepares as before; nothing breaks, it is only slower.
+ *
+ * Three properties make it safe:
+ *
+ *   - **One cache per handle, and a handle belongs to one thread.** The writer
+ *     owns the only writable handle and each reader opens its own, so there is
+ *     no sharing to synchronise. That is the same rule the rest of the daemon
+ *     already keeps, not a new one.
+ *   - **Re-entrancy falls back.** A cached statement that is already stepping —
+ *     a query issued from inside another query's row loop — is marked in use,
+ *     and the second caller gets a freshly prepared one. Handing out the same
+ *     statement twice would reset an iteration mid-flight.
+ *   - **Release is explicit.** `atlas_db_finish` returns a statement to the
+ *     cache or finalises it, and every call site in src/db calls it instead of
+ *     `sqlite3_finalize`. */
+
 atlas_status atlas_db_prepare(atlas_db *db, const char *sql, sqlite3_stmt **out, atlas_err *err) {
     *out = NULL;
+    for (size_t i = 0; i < db->stmt_cache_count; i++) {
+        if (db->stmt_cache[i].sql == sql && !db->stmt_cache[i].in_use) {
+            db->stmt_cache[i].in_use = true;
+            /* Reset rather than re-prepare. The reset's return code is the
+             * previous step's error, which the previous caller already saw, so
+             * it is deliberately ignored here. */
+            (void)sqlite3_reset(db->stmt_cache[i].stmt);
+            (void)sqlite3_clear_bindings(db->stmt_cache[i].stmt);
+            *out = db->stmt_cache[i].stmt;
+            return ATLAS_OK;
+        }
+    }
     if (sqlite3_prepare_v2(db->h, sql, -1, out, NULL) != SQLITE_OK) {
         return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot prepare statement");
     }
+    if (db->stmt_cache_count < ATLAS_DB_STMT_CACHE) {
+        db->stmt_cache[db->stmt_cache_count].sql = sql;
+        db->stmt_cache[db->stmt_cache_count].stmt = *out;
+        db->stmt_cache[db->stmt_cache_count].in_use = true;
+        db->stmt_cache_count++;
+    }
     return ATLAS_OK;
+}
+
+void atlas_db_finish(atlas_db *db, sqlite3_stmt *stmt) {
+    if (stmt == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < db->stmt_cache_count; i++) {
+        if (db->stmt_cache[i].stmt == stmt) {
+            db->stmt_cache[i].in_use = false;
+            /* Reset now rather than at the next use, so a statement sitting in
+             * the cache holds no read lock and pins nothing. */
+            (void)sqlite3_reset(stmt);
+            (void)sqlite3_clear_bindings(stmt);
+            return;
+        }
+    }
+    /* Not cached — prepared directly, or prepared while a cached copy was in
+     * use. It belongs to the caller and is destroyed here. */
+    sqlite3_finalize(stmt);
+}
+
+void atlas_db_cache_clear(atlas_db *db) {
+    for (size_t i = 0; i < db->stmt_cache_count; i++) {
+        sqlite3_finalize(db->stmt_cache[i].stmt);
+    }
+    db->stmt_cache_count = 0;
 }
 
 atlas_status atlas_db_step_done(atlas_db *db, sqlite3_stmt *stmt, atlas_err *err) {
     int rc = sqlite3_step(stmt);
     if (rc != SQLITE_DONE) {
         atlas_status st = atlas_db_fail(db, err, ATLAS_ERR_DB, "statement failed");
-        sqlite3_finalize(stmt);
+        atlas_db_finish(db, stmt);
         return st;
     }
-    sqlite3_finalize(stmt);
+    atlas_db_finish(db, stmt);
     return ATLAS_OK;
 }
 
@@ -64,7 +138,7 @@ atlas_status atlas_db_query_int64(atlas_db *db, const char *sql, int64_t *out, a
     } else if (rc != SQLITE_DONE) {
         st = atlas_db_fail(db, err, ATLAS_ERR_DB, "query failed");
     }
-    sqlite3_finalize(stmt);
+    atlas_db_finish(db, stmt);
     return st;
 }
 
@@ -163,7 +237,7 @@ static void detect_caps(atlas_db *db) {
                                (const char *)m);
             }
         }
-        sqlite3_finalize(stmt);
+        atlas_db_finish(db, stmt);
     }
     db->caps.wal = (strcmp(db->caps.journal_mode, "wal") == 0);
 
@@ -173,7 +247,7 @@ static void detect_caps(atlas_db *db) {
         if (sqlite3_step(stmt) == SQLITE_ROW) {
             db->caps.foreign_keys = sqlite3_column_int(stmt, 0) != 0;
         }
-        sqlite3_finalize(stmt);
+        atlas_db_finish(db, stmt);
     }
 }
 
@@ -230,6 +304,36 @@ atlas_status atlas_db_open(const char *path, atlas_db **out, atlas_err *err) {
         (void)sqlite3_exec(db->h, "PRAGMA journal_mode=WAL;", NULL, NULL, &emsg);
         sqlite3_free(emsg);
         st = atlas_db_exec_sql(db, "PRAGMA synchronous=NORMAL;", err);
+    }
+    if (st == ATLAS_OK) {
+        /* SQLite's default page cache is two thousand pages — about two
+         * megabytes. That is ample for an index of file paths and commits, and
+         * it is nothing at all for a structural graph: A3 writes hundreds of
+         * thousands of rows across half a dozen indexes, and at two megabytes
+         * every B-tree descent goes back to the filesystem. Measured on the
+         * five-thousand-file acceptance fixture, that alone was minutes.
+         *
+         * Negative means kibibytes rather than pages, so the ceiling does not
+         * change with the page size. Sixty-four mebibytes is a small fraction of
+         * the documented memory budget and is bounded: it is a cache, so it is
+         * an upper bound rather than a commitment. */
+        st = atlas_db_exec_sql(db, "PRAGMA cache_size=-65536;", err);
+    }
+    if (st == ATLAS_OK) {
+        /* Every `INSERT ... RETURNING id` in Atlas makes SQLite open an
+         * ephemeral table to hold the returned row, and with the default
+         * `temp_store` an ephemeral table is a file: created, written and
+         * unlinked once per inserted row. Sampling the structural pass on the
+         * acceptance fixture found the writer inside `pwrite` on that temporary
+         * file in almost every sample — it was the single largest cost of
+         * building the graph, and none of it was the graph.
+         *
+         * In memory instead. What goes there is bounded by what Atlas asks for:
+         * one row per RETURNING, and sorters for queries that are all limited.
+         * Nothing here streams an unbounded result set through a sorter, which
+         * is the one case where this pragma would trade disk for unbounded
+         * memory. */
+        st = atlas_db_exec_sql(db, "PRAGMA temp_store=MEMORY;", err);
     }
     if (st != ATLAS_OK) {
         sqlite3_close(db->h);
@@ -305,6 +409,9 @@ void atlas_db_close(atlas_db *db) {
         (void)sqlite3_exec(db->h, "ROLLBACK;", NULL, NULL, NULL);
         db->tx_depth = 0;
     }
+    /* Before the handle goes: sqlite3_close refuses to close a connection with
+     * an unfinalised statement, and every cached one is exactly that. */
+    atlas_db_cache_clear(db);
     (void)sqlite3_close(db->h);
     free(db);
 }
@@ -421,7 +528,7 @@ static atlas_status pragma_collect(atlas_db *db, const char *sql, const char *ok
         }
         rows++;
     }
-    sqlite3_finalize(stmt);
+    atlas_db_finish(db, stmt);
     if (st != ATLAS_OK) {
         return st;
     }

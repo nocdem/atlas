@@ -1,9 +1,10 @@
 # Atlas — working notes for Claude Code
 
 Atlas is a generic, headless engineering-memory and repository-intelligence CLI in
-C17. Phase **A2**: automatic AI integration — an MCP server, Claude Code hooks and
-a plugin — on top of the A1 daemon and the A0 read-only foundation. Not
-DNA-specific; DNA will later be its first indexed repository.
+C17. Phase **A3**: structural code intelligence — a first-party bounded lexical C
+indexer and a relationship graph — on top of the A2 AI integration, the A1 daemon
+and the A0 read-only foundation. Not DNA-specific; DNA will later be its first
+indexed repository.
 
 ## Build and test
 
@@ -23,7 +24,23 @@ make compiledb  # refresh the top-level compile_commands.json symlink
 
 sh scripts/perf.sh build      # A1 performance acceptance measurements
 sh scripts/perf-a2.sh build   # A2 hook and MCP latency measurements
+sh scripts/perf-a3.sh build   # A3 structural-indexing acceptance (~7 minutes)
 ```
+
+`perf-a3.sh` measures peak RSS from `/proc/<pid>/VmHWM` rather than from
+`time(1)`, because `busybox time -v` reports `ru_maxrss` multiplied by the page
+size — every RSS it prints on this machine is four times the truth. A
+measurement wrong by a constant factor is worse than none, because it still
+looks like a measurement.
+
+It also **asserts its own scale floors and its own limit**, and exits non-zero
+rather than printing a number nobody checks: at least 5 000 files, 500 000
+lines, 50 000 symbols and 200 000 relations, and every one of three independent
+initial passes — each against a data directory that never existed before — under
+60 s. Lines are newlines in every `.c` and `.h` in the tree, counted before
+anything is timed. Shrinking the fixture or moving the limit to make a run pass
+is the one failure mode a performance gate cannot detect about itself, so the
+script does not leave either to a reader.
 
 `make doctor` and `make doctor-claude` observe and create nothing: no data
 directory, no index, no lock, no runtime directory, no socket, no Claude
@@ -182,6 +199,108 @@ integrations/claude/atlas   the Claude Code plugin: manifest, hooks.json,
 **yyjson is called from `src/ipc` and nowhere else.** `json_read.c` is the facade;
 `hook.c`, `mcp*.c` and `integrate.c` use it. A new file that parses untrusted JSON
 goes through that facade rather than including the vendored header.
+
+## A3 layers — additions
+
+```
+src/code     extract.c (the bounded lexical C indexer), compdb.c (the compile
+             database, read as data), resolve.c (deterministic resolution),
+             index.c (the pass), query.c (bounded traversal), code.c (the
+             vocabularies)
+src/db       db_code.c (typed operations over the migration-5 tables)
+src/core     service_code.c (the `code` command behaviour)
+src/ipc      server_code.c (the seven-method A3 group)
+```
+
+## A3 rules — these are not negotiable
+
+- **Atlas is not a compiler and does not pretend to be one.** Every structural
+  fact carries a `resolution` from a closed vocabulary, and the distinctions the
+  vocabulary exists to keep are the ones it would be easiest to lose: a
+  `#include` directive is a source fact and *resolving* it is a separate one;
+  `identifier(` is a call **candidate**, not a proven call; `UNIQUE_LEXICAL`
+  means one lexical match, not one truth; a function pointer, a macro-produced
+  call and a definition under an unevaluated `#if` never become exact edges;
+  several definitions of a name stay `AMBIGUOUS` **with the candidate set
+  recorded**, because choosing would be inventing. A missing compile database is
+  unknown, not false. Impact results are candidates to review.
+- **The `evidence` table is untouched.** A3 writes no evidence at all;
+  `tests/test_code_trust.c` asserts the table gained nothing but `SOURCE` and
+  `GIT` after a structural pass. Structural facts carry their own `resolution`
+  and `provenance` columns, which is the same separation A2 made and for the
+  same reason.
+- **`atlas_code_resolution_writable_in_a3` refuses `MODEL_PROPOSAL`**, mirroring
+  `atlas_provenance_writable_in_a2`. `settle()` in `resolve.c` is the single
+  write point and checks it. Do not add a second.
+- **`compile_commands.json` is data, never a command.** The `command` string is
+  SHA-256'd and discarded — never executed, never passed to a shell, never
+  stored. Arguments are read through a positive allowlist (include dirs, system
+  include dirs, defines and undefines, the standard, the source, the output) and
+  nothing else; `@response-files` and `-fplugin=` are recognised only well enough
+  to be ignored. An include directory outside the repository is recorded with
+  `external = 1` and **never opened**. `tests/test_code_compdb.c` plants an
+  executable marker in four places and asserts it never ran.
+- **No new dependency, ever, for this.** No Clang, no libclang, no tree-sitter,
+  no ctags, no Python, no Node. The lexer is first-party and bounded, and every
+  ceiling it reaches is reported rather than silently applied.
+- **The structural stage inherits A1's rules unchanged.** Workers touch no
+  database handle and create no process; nothing forks off the writer thread; no
+  transaction is held across unbounded work; the select/parse/apply loop is
+  chunked by `ATLAS_CODE_PARSE_CHUNK` so the stage's memory is a property of the
+  constant rather than of the repository.
+- **Selection compares content hashes, not pass activity.** The candidate set is
+  "files whose `content_hash` differs from the hash the stored graph facts were
+  extracted from". Never "was this file hashed by this pass" — a full
+  content-verifying pass rehashes every byte and finds the same hash, and keying
+  off activity would make the periodic full pass reparse the world every five
+  minutes.
+- **Resolution runs over a described scope, and each field of
+  `atlas_code_resolve_scope` is a correctness argument.** `files` because a
+  reparsed file's edges were rewritten unresolved; `names` because a call
+  resolves by name and by nothing else; `file_set_changed` because include
+  resolution reads the *set of paths* and an edit to an existing file changes
+  none of its inputs; `full` because an overflowed scope is an unknown one, not
+  a smaller one. **Internal linkage is excluded from `names`** — a `static`
+  definition cannot change how anything outside its own file resolves, and that
+  file is swept by id. Widening the scope is always safe and always expensive;
+  narrowing it needs an argument of this shape.
+- **`code_index_state.resolve_settled` is cleared before the work and set after
+  it.** That ordering is the whole reason it is durable rather than inferred: a
+  pass that died during resolution leaves it false and the next pass sweeps the
+  repository. Do not "simplify" it into a check of whether the last pass
+  completed.
+- **Invalidation is targeted, not scanned.** Before a file's rows are replaced,
+  `atlas_db_code_relations_unsettle_for_file` unsettles the edges that resolved
+  into it, seeking from the ids about to disappear. Afterwards only a left join
+  over every relation could find the damage, and that scan costs the same
+  whether it finds one row or none — it is kept for the rebuild path only.
+- **`ATLAS_CODE_ANALYZER_ID` and `ATLAS_CODE_ANALYZER_VERSION` are the graph's
+  producer, and the version is an epoch you must bump.** Bump it whenever a pass
+  would produce different facts from identical bytes — a lexer fix, a resolution
+  rule change, a different set of materialised edges — and not for a refactor
+  that cannot change an output. A mismatch makes the graph stale and the next
+  pass rebuilds it. Stored normalized: `code_analyzers` interns the pair and
+  `code_index_state.analyzer_id` references one row, never a string per
+  relation. Both values are compiled-in constants; nothing repository-controlled
+  or model-controlled may reach that column, which is why they may be reported.
+- **A structural rebuild deletes derived rows and nothing else.**
+  `atlas_db_code_clear_repo` names `code_files` and `code_units`; sessions,
+  reasons, decisions, evidence, commits and the file index are untouched, and
+  `tests/test_code_analyzer.c` asserts it row by row. Do not widen it.
+- **`symbol_contains_occurrence` is recognised and never written.** The fact is
+  `code_occurrences.enclosing_id`. Materialising it as an edge stored the same
+  thing twice — 38 % of the relation table on the acceptance fixture, read by
+  nothing. Do not reinstate it; a producer without an occurrence table may write
+  the kind, which is why it stays in the vocabulary.
+- **The include suffix lookup says `INDEXED BY idx_code_files_basename`**, and
+  it is a hard constraint rather than a hint: `code_files` has two indexes
+  starting with `repo_id` and SQLite picks the wrong one, turning the lookup
+  into a scan of the repository. Removing the clause is a thirty-seven-million
+  row regression; `tests/test_code_graph.c` asserts the plan.
+- **Nothing is silently truncated**, including an ambiguity. `candidate_count`
+  reports the true number even when more candidates existed than the ceiling
+  keeps, because a bound that makes an ambiguity look smaller than it is is a
+  bound that lies.
 
 ## A2 rules — these are not negotiable
 
@@ -456,6 +575,7 @@ two documents on stdout.
 
 `README.md` (usage, limitations) · `SECURITY.md` (threat model) ·
 `docs/architecture.md` · `docs/data-model.md` · `docs/provenance.md` ·
+`docs/code-intelligence.md` ·
 `docs/git-safety.md` · `docs/daemon-and-ipc.md` ·
 `docs/watcher-consistency.md` · `docs/systemd-user-service.md` ·
 `docs/ai-trust-boundary.md` · `docs/claude-integration.md` ·

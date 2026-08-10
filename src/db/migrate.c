@@ -1468,6 +1468,137 @@ static const char *const M6_STATEMENTS[] = {
     M6_DECISION_SEARCH,    NULL,
 };
 
+/* --- 7: revalidation, and the capability that authorises one ---------------
+ *
+ * A6 assesses whether an approved decision is still about the code that is
+ * there now. That assessment is computed on every read and never stored, for
+ * the reason A4 gives about link currency: a cached answer to "is this still
+ * current?" is wrong for exactly as long as nobody has recomputed it.
+ *
+ * So the phase adds one table, and it is not a table of assessments. It is the
+ * record of the *human* act that a stale assessment calls for: an operator
+ * looked at the decision against an exact repository state and said it still
+ * stands. That is history rather than state, which is why it is stored, and it
+ * is the reason the phase needs a migration at all.
+ *
+ * The challenge table is rebuilt rather than extended because SQLite cannot
+ * widen a CHECK in place, and the intent vocabulary gains a member. It also
+ * gains the two values a revalidation capability must be bound to and an
+ * approval capability has no use for. Row ids are preserved exactly:
+ * `decision_events.challenge_id` points into this table without a foreign key,
+ * so a rebuild that renumbered would silently re-point every approval record at
+ * somebody else's capability. */
+static const char M7_CHALLENGES[] =
+    /* Nothing REFERENCES decision_challenges, so this rebuild cannot orphan a
+     * declared constraint; the soft reference from decision_events is what the
+     * explicit id copy below protects. */
+    "CREATE TABLE decision_challenges_new ("
+    "  id INTEGER PRIMARY KEY,"
+    "  token TEXT NOT NULL UNIQUE,"
+    "  repo_id INTEGER NOT NULL,"
+    "  document_id INTEGER NOT NULL REFERENCES decision_documents(id),"
+    "  revision_id INTEGER NOT NULL REFERENCES decision_revisions(id),"
+    "  revision_no INTEGER NOT NULL,"
+    "  content_hash TEXT NOT NULL,"
+    "  intent TEXT NOT NULL CHECK(intent IN ('approve','reject','supersede','revalidate')),"
+    "  supersede_document_id INTEGER,"
+    /* REVALIDATE only. The indexed head and the evidence digest the capability
+     * was issued against.
+     *
+     * Both are bound at issue and compared at consume, and both comparisons are
+     * pure database reads. That is deliberate: consumption happens on the
+     * writer thread inside the transaction that spends the capability, and A1
+     * forbids a git process or a file read in there. Commit drift and evidence
+     * drift are therefore detected without either. */
+    "  indexed_commit TEXT,"
+    "  evidence_digest TEXT,"
+    /* The assessment as it stood when the operator was shown it. Recorded here
+     * rather than recomputed at consume so that what is preserved in the
+     * validation record is what the human actually saw. `prior_reasons` is a
+     * space-separated list of A6 reason codes — Atlas string literals from a
+     * closed vocabulary, refused rather than reproduced if one is not in it. */
+    "  prior_freshness TEXT CHECK(prior_freshness IS NULL OR prior_freshness IN"
+    "    ('FRESH','STALE','IMPACTED','UNKNOWN')),"
+    "  prior_reasons TEXT,"
+    "  created_at TEXT NOT NULL,"
+    "  expires_at TEXT NOT NULL,"
+    "  consumed INTEGER NOT NULL DEFAULT 0,"
+    "  consumed_at TEXT"
+    ");"
+    "INSERT INTO decision_challenges_new"
+    "  (id, token, repo_id, document_id, revision_id, revision_no, content_hash, intent,"
+    "   supersede_document_id, created_at, expires_at, consumed, consumed_at)"
+    "  SELECT id, token, repo_id, document_id, revision_id, revision_no, content_hash, intent,"
+    "         supersede_document_id, created_at, expires_at, consumed, consumed_at"
+    "  FROM decision_challenges;"
+    "DROP TABLE decision_challenges;"
+    "ALTER TABLE decision_challenges_new RENAME TO decision_challenges;"
+    "CREATE INDEX idx_decision_challenges_repo ON decision_challenges(repo_id, consumed, expires_at);";
+
+/* The append-only revalidation ledger.
+ *
+ * **It does not change a lifecycle state and it is not part of the A4 ledger.**
+ * A revalidated revision is still APPROVED, was always APPROVED, and its
+ * approval event is untouched; `decision_events` keeps exactly the four
+ * transitions it had, so the replay in `atlas_db_decision_verify` is the same
+ * function over the same vocabulary as before. Revalidation is a second,
+ * parallel record of a different kind of act: not "this became policy" but
+ * "somebody checked that it still describes this code".
+ *
+ * Nothing updates a row here and nothing deletes one. `prior_freshness` and
+ * `prior_reasons` preserve the assessment that prompted the revalidation, which
+ * is the half a naive design loses: without it the ledger says a decision was
+ * revalidated and cannot say what was wrong with it, and the record of a
+ * concern that has been addressed is worth as much as the record of addressing
+ * it.
+ *
+ * `repo_id` is a soft reference for A4's reason — an FK would make `repo remove
+ * --yes` destroy validation history — and `repo_identity_hash` is the durable
+ * identity, the same path-qualified lineage fingerprint the documents carry. */
+static const char M7_VALIDATIONS[] =
+    "CREATE TABLE decision_validations ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  document_id INTEGER NOT NULL REFERENCES decision_documents(id),"
+    "  revision_id INTEGER NOT NULL REFERENCES decision_revisions(id),"
+    "  revision_no INTEGER NOT NULL,"
+    /* The digest the revalidation covered, recorded on the row for the reason
+     * decision_events records it: so a later reader can see which bytes were
+     * revalidated without trusting that the revision row is the one that was
+     * there. */
+    "  content_hash TEXT NOT NULL,"
+    "  repo_id INTEGER,"
+    "  repo_identity_hash TEXT,"
+    /* The exact state it was revalidated against. This becomes the decision's
+     * new validation point, and every later assessment measures its change
+     * range from here. */
+    "  validated_at_commit TEXT NOT NULL,"
+    "  evidence_digest TEXT NOT NULL,"
+    "  intent TEXT NOT NULL CHECK(intent IN ('revalidate')),"
+    /* The honest name, and the only actor this table accepts. It says the
+     * operator channel was used. It does not name a person, does not prove one
+     * was present, and is not a signature. */
+    "  actor TEXT NOT NULL CHECK(actor IN ('LOCAL_OPERATOR_CONFIRMED')),"
+    "  challenge_id INTEGER NOT NULL,"
+    "  prior_freshness TEXT NOT NULL CHECK(prior_freshness IN"
+    "    ('FRESH','STALE','IMPACTED','UNKNOWN')),"
+    "  prior_reasons TEXT NOT NULL,"
+    "  created_at TEXT NOT NULL"
+    ");"
+    "CREATE INDEX idx_decision_validations_rev ON decision_validations(revision_id, id);"
+    "CREATE INDEX idx_decision_validations_doc ON decision_validations(document_id, id);"
+    /* One capability, one validation. The challenge table already refuses a
+     * second consumption; this makes the same fact true of the record, so a
+     * replayed write cannot produce two rows even if the consumption check were
+     * somehow bypassed. */
+    "CREATE UNIQUE INDEX idx_decision_validations_challenge"
+    "  ON decision_validations(challenge_id);";
+
+static const char *const M7_STATEMENTS[] = {
+    M7_CHALLENGES,
+    M7_VALIDATIONS,
+    NULL,
+};
+
 static const atlas_migration MIGRATIONS[] = {
     {1, "initial schema", M1_STATEMENTS},
     {2, "worktree identity", M2_STATEMENTS},
@@ -1475,6 +1606,7 @@ static const atlas_migration MIGRATIONS[] = {
     {4, "AI sessions, change reasons and decisions", M4_STATEMENTS},
     {5, "structural code graph", M5_STATEMENTS},
     {6, "decision documents, revisions and operator approval", M6_STATEMENTS},
+    {7, "decision revalidation records", M7_STATEMENTS},
 };
 
 const atlas_migration *atlas_migrations(size_t *count_out) {

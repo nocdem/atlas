@@ -1027,8 +1027,11 @@ atlas_status atlas_db_decision_challenge_insert(atlas_db *db, const atlas_decisi
         db,
         "INSERT INTO decision_challenges"
         "(token, repo_id, document_id, revision_id, revision_no, content_hash, intent,"
-        " supersede_document_id, created_at, expires_at, consumed)"
-        " VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0);",
+        " supersede_document_id, created_at, expires_at, consumed,"
+        /* A6. NULL for every intent but revalidate, which is what makes an
+         * approval capability structurally incapable of carrying one. */
+        " indexed_commit, evidence_digest, prior_freshness, prior_reasons)"
+        " VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11, ?12, ?13, ?14);",
         &s, err);
     if (st != ATLAS_OK) {
         return st;
@@ -1061,6 +1064,24 @@ atlas_status atlas_db_decision_challenge_insert(atlas_db *db, const atlas_decisi
     if (st == ATLAS_OK) {
         st = atlas_db_bind_text_opt(db, s, 10, c->expires_at, err);
     }
+    if (st == ATLAS_OK) {
+        st = atlas_db_bind_text_opt(db, s, 11,
+                                    c->indexed_commit[0] != '\0' ? c->indexed_commit : NULL, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_db_bind_text_opt(db, s, 12,
+                                    c->evidence_digest[0] != '\0' ? c->evidence_digest : NULL,
+                                    err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_db_bind_text_opt(db, s, 13,
+                                    c->prior_freshness[0] != '\0' ? c->prior_freshness : NULL,
+                                    err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_db_bind_text_opt(db, s, 14,
+                                    c->prior_reasons[0] != '\0' ? c->prior_reasons : NULL, err);
+    }
     if (st != ATLAS_OK) {
         atlas_db_finish(db, s);
         return st;
@@ -1081,7 +1102,8 @@ atlas_status atlas_db_decision_challenge_find(atlas_db *db, const char *token,
     atlas_status st = atlas_db_prepare(
         db,
         "SELECT id, token, repo_id, document_id, revision_id, revision_no, content_hash, intent,"
-        "       supersede_document_id, created_at, expires_at, consumed"
+        "       supersede_document_id, created_at, expires_at, consumed,"
+        "       indexed_commit, evidence_digest, prior_freshness, prior_reasons"
         "  FROM decision_challenges WHERE token = ?1;",
         &s, err);
     if (st != ATLAS_OK) {
@@ -1121,6 +1143,25 @@ atlas_status atlas_db_decision_challenge_find(atlas_db *db, const char *token,
                                    err);
         }
         out->consumed = sqlite3_column_int64(s, 11) != 0;
+        /* A6. Absent on every capability but a revalidation one, and copied
+         * whole rather than reconstructed: these are what commit drift and
+         * evidence drift are detected against. */
+        if (st == ATLAS_OK) {
+            st = atlas_db_col_copy(s, 12, out->indexed_commit, sizeof(out->indexed_commit),
+                                   "challenge indexed commit", err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_db_col_copy(s, 13, out->evidence_digest, sizeof(out->evidence_digest),
+                                   "challenge evidence digest", err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_db_col_copy(s, 14, out->prior_freshness, sizeof(out->prior_freshness),
+                                   "challenge prior freshness", err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_db_col_copy(s, 15, out->prior_reasons, sizeof(out->prior_reasons),
+                                   "challenge prior reasons", err);
+        }
         *found_out = st == ATLAS_OK;
     } else if (rc != SQLITE_DONE) {
         st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot look up an approval challenge");

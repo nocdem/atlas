@@ -32,6 +32,7 @@
 
 #include "atlas/atlas.h"
 #include "atlas/decision_ops.h"
+#include "atlas/gate.h"
 #include "atlas/pathrep.h"
 #include "ipc/server_internal.h"
 
@@ -618,6 +619,22 @@ static atlas_status method_challenge(dispatch_state *ds, const atlas_ipc_request
         st = take_uid(req, "replacement", false, &op->replacement_uid, err);
     }
     if (st == ATLAS_OK) {
+        /* A6. The assessment the caller displayed, carried into the capability
+         * so the eventual record preserves what was shown rather than what a
+         * later recomputation would produce. Both are checked against their
+         * closed vocabularies at the write point: a request is not the
+         * authority on what an A6 reason code is. */
+        const char *fresh = NULL;
+        if (atlas_ipc_param_str(req, "prior_freshness", &fresh) && fresh != NULL) {
+            st = atlas_buf_set_str(&op->prior_freshness, fresh, err);
+        }
+        const char *reasons = NULL;
+        if (st == ATLAS_OK && atlas_ipc_param_str(req, "prior_reasons", &reasons) &&
+            reasons != NULL) {
+            st = atlas_buf_set_str(&op->prior_reasons, reasons, err);
+        }
+    }
+    if (st == ATLAS_OK) {
         (void)atlas_ipc_param_int(req, "revision", &op->expect_revision_no);
         const char *intent = NULL;
         op->intent = ATLAS_DECISION_INTENT_APPROVE;
@@ -626,7 +643,7 @@ static atlas_status method_challenge(dispatch_state *ds, const atlas_ipc_request
              * unrecognised intent must not become "approve". */
             if (!atlas_decision_intent_parse(intent, &op->intent)) {
                 st = atlas_err_set(err, ATLAS_ERR_USAGE,
-                                   "\"intent\" is approve, reject or supersede");
+                                   "\"intent\" is approve, reject, supersede or revalidate");
             }
         }
     }
@@ -745,6 +762,26 @@ static atlas_status method_reject(dispatch_state *ds, const atlas_ipc_request *r
 static atlas_status method_supersede(dispatch_state *ds, const atlas_ipc_request *req,
                                      atlas_err *err) {
     return spend_method(ds, req, ATLAS_DECISION_OP_SUPERSEDE, err);
+}
+
+/* A6. Spends a revalidation capability.
+ *
+ * It is here, beside approve and reject, because it is the same kind of thing:
+ * an operator action that a capability authorises, reachable over IPC and
+ * useless without one. Like them, it is **not** an AI-facing method — there is
+ * no MCP tool for it, no hook emits it, and a caller that has not been through
+ * the terminal has no token to send. Like them, the whole of what makes it safe
+ * is that `spend_challenge` refuses every request that does not carry a
+ * capability Atlas issued, to this revision, for this intent, unspent and
+ * unexpired.
+ *
+ * A6 adds two refusals on top of A4's, and both are in the write point rather
+ * than here: the indexed head must be the one the capability was issued
+ * against, and the evidence must still resolve to the digest it was issued
+ * against. */
+static atlas_status method_revalidate(dispatch_state *ds, const atlas_ipc_request *req,
+                                      atlas_err *err) {
+    return spend_method(ds, req, ATLAS_DECISION_OP_REVALIDATE, err);
 }
 
 /* --- reads ------------------------------------------------------------------------ */
@@ -1383,6 +1420,138 @@ static atlas_status method_history(dispatch_state *ds, const atlas_ipc_request *
 
 /* --- the group ------------------------------------------------------------------- */
 
+
+/* --- A6: reading a gate result ---------------------------------------------
+ *
+ * A **read**, and the only A6 method there is. It computes nothing that is
+ * stored, changes nothing, and takes no lock; a caller that can reach it can
+ * see what Atlas thinks and can do nothing about it.
+ *
+ * There is deliberately no method that clears, overrides, caches or recomputes
+ * a freshness result, because there is no such operation anywhere in Atlas. The
+ * one thing that changes what an assessment says next time is the code, or a
+ * revalidation — and a revalidation needs a capability that only the terminal
+ * channel can obtain.
+ *
+ * `decision.revalidate` sits beside `decision.approve` in this table and is
+ * equally unreachable without that capability. Neither has an MCP tool, and no
+ * hook emits either. */
+static atlas_status method_gate_check(dispatch_state *ds, const atlas_ipc_request *req,
+                                      atlas_err *err) {
+    atlas_repo_info info;
+    atlas_repo_info_init(&info);
+    atlas_status st = atlas_server_require_repo(ds, req, &info, err);
+    if (st != ATLAS_OK) {
+        atlas_repo_info_free(&info);
+        return st;
+    }
+    const char *at = NULL;
+    (void)atlas_ipc_param_str(req, "at", &at);
+    const char *uid = NULL;
+    (void)atlas_ipc_param_str(req, "decision", &uid);
+    int64_t depth = 0;
+    (void)atlas_ipc_param_int(req, "depth", &depth);
+
+    atlas_gate_report rep;
+    atlas_gate_report_init(&rep);
+    if (uid != NULL && uid[0] != '\0') {
+        st = atlas_gate_run_one(ds->db, info.name, uid, at, &rep, err);
+    } else {
+        atlas_gate_query q;
+        atlas_gate_query_init(&q);
+        q.repo_name = info.name;
+        q.at_commit = at;
+        q.depth = depth;
+        st = atlas_gate_run(ds->db, &q, &rep, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "repo", info.name, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "result", atlas_gate_result_name(rep.result), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "indexed_commit", rep.indexed_commit, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "requested_commit", rep.requested_commit, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "fresh", rep.fresh, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "stale", rep.stale, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "impacted", rep.impacted, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "unknown", rep.unknown, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(ds->j, "limit_reached", rep.limit_reached, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key(ds->j, "decisions", err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_arr_begin(ds->j, err);
+    }
+    for (size_t i = 0; st == ATLAS_OK && i < rep.item_count; i++) {
+        const atlas_gate_assessment *a = &rep.items[i];
+        st = atlas_json_obj_begin(ds->j, err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(ds->j, "decision", atlas_buf_cstr(&a->uid), err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_int(ds->j, "revision", a->revision_no, err);
+        }
+        if (st == ATLAS_OK) {
+            /* Project prose. Encoded on the way out like every untrusted value,
+             * and labelled where it reaches a model by the MCP layer. */
+            st = atlas_json_key_str(ds->j, "title",
+                                    atlas_safe(&ds->safe, atlas_buf_cstr(&a->title)), err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(ds->j, "freshness",
+                                    atlas_gate_freshness_name(a->freshness), err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(ds->j, "content_hash", a->content_hash, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(ds->j, "validated_at_commit", a->validated_at_commit, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_int(ds->j, "revalidations", a->revalidation_count, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key(ds->j, "reasons", err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_arr_begin(ds->j, err);
+        }
+        for (size_t k = 0; st == ATLAS_OK && k < a->reason_count; k++) {
+            st = atlas_json_str(ds->j, atlas_gate_reason_name(a->reasons[k]), err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_arr_end(ds->j, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_bool(ds->j, "limit_reached", a->limit_reached, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_obj_end(ds->j, err);
+        }
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_arr_end(ds->j, err);
+    }
+    atlas_gate_report_free(&rep);
+    atlas_repo_info_free(&info);
+    return st;
+}
+
 static const atlas_method_entry DECISION_METHODS[] = {
     /* Reads. */
     {"decision.list", method_list},
@@ -1401,6 +1570,9 @@ static const atlas_method_entry DECISION_METHODS[] = {
     {"decision.approve", method_approve},
     {"decision.reject", method_reject},
     {"decision.supersede", method_supersede},
+    {"decision.revalidate", method_revalidate},
+    /* A6, and a read. Nothing here can change an assessment. */
+    {"gate.check", method_gate_check},
 };
 
 const atlas_method_entry *atlas_server_decision_methods(size_t *count_out) {

@@ -17,6 +17,7 @@
 #include "atlas/datadir.h"
 #include "atlas/db.h"
 #include "atlas/error.h"
+#include "atlas/gate.h"
 #include "atlas/git.h"
 #include "atlas/limits.h"
 #include "atlas/reconcile.h"
@@ -713,5 +714,23 @@ atlas_status atlas_service_decision_confirm(atlas_ctx *ctx, const char *repo, co
  * document is Atlas' record rather than the project's file. */
 atlas_status atlas_service_decision_export_markdown(const atlas_decision_document *doc, FILE *out,
                                                     atlas_err *err);
+
+/* --- A6: impact gates ------------------------------------------------------
+ *
+ * Both are reads. Neither takes the writer lock, neither writes a row, and
+ * there is no service function anywhere that clears, overrides or caches a
+ * freshness result — the only thing that changes what an assessment will say
+ * next time is the code, or a revalidation recorded through the operator
+ * channel.
+ *
+ * The whole gate is `atlas_service_gate_check`. `atlas_service_gate_show` runs
+ * the same query and keeps one decision from it, rather than implementing a
+ * second, narrower assessment that would disagree with the first the moment
+ * either was fixed. */
+atlas_status atlas_service_gate_check(atlas_ctx *ctx, const atlas_gate_query *q,
+                                      atlas_gate_report *out, atlas_err *err);
+atlas_status atlas_service_gate_show(atlas_ctx *ctx, const char *repo, const char *uid,
+                                     const char *at_commit, atlas_gate_report *out,
+                                     atlas_err *err);
 
 #endif /* ATLAS_SERVICE_H */

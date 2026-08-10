@@ -21,7 +21,7 @@
 #include "atlas/error.h"
 #include "atlas/limits.h"
 
-#define ATLAS_SCHEMA_VERSION 6
+#define ATLAS_SCHEMA_VERSION 7
 
 typedef struct atlas_db atlas_db;
 
@@ -1886,6 +1886,125 @@ atlas_status atlas_db_decision_legacy_list(atlas_db *db, int64_t repo_id, bool u
 atlas_status atlas_db_decision_legacy_get(atlas_db *db, int64_t repo_id, int64_t ai_decision_id,
                                           atlas_decision_revision *out, bool *found_out,
                                           atlas_err *err);
+
+/* --- A6: ancestry, change ranges and the revalidation ledger -------------
+ *
+ * All three read through the caller's handle, so an assessment that opens one
+ * read transaction and asks all of these gets one coherent snapshot rather than
+ * four reads that happened to run close together. */
+
+/* Whether Atlas' ingested history reaches a commit from another.
+ *
+ * The three non-answers are kept apart on purpose. LIMIT and UNKNOWN both mean
+ * Atlas stopped before it could tell; NOT_ANCESTOR is the only value that
+ * asserts something, and it is only ever produced when the walk exhausted every
+ * reachable commit without meeting a parent it had never ingested. Collapsing
+ * them would turn "we do not hold that much history" into "your history was
+ * rewritten", which is a very different thing to tell somebody. */
+typedef enum atlas_db_gate_ancestry_verdict {
+    ATLAS_DB_GATE_ANCESTRY_UNKNOWN = 0,
+    ATLAS_DB_GATE_ANCESTRY_REACHED,
+    ATLAS_DB_GATE_ANCESTRY_NOT_ANCESTOR,
+    ATLAS_DB_GATE_ANCESTRY_LIMIT
+} atlas_db_gate_ancestry_verdict;
+
+typedef struct atlas_db_gate_ancestry_result {
+    atlas_db_gate_ancestry_verdict verdict;
+    int64_t visited;
+    /* True when the walk named a parent commit Atlas has not ingested. */
+    bool missing_parent;
+} atlas_db_gate_ancestry_result;
+
+atlas_status atlas_db_gate_ancestry(atlas_db *db, int64_t repo_id, const char *head_oid,
+                                    const char *target_oid, atlas_db_gate_ancestry_result *out,
+                                    atlas_err *err);
+
+/* A set of repository paths, by exact bytes. Sorted, so membership and
+ * "anything under this prefix" are both binary searches rather than passes. */
+typedef struct atlas_db_gate_path {
+    unsigned char *bytes;
+    size_t len;
+} atlas_db_gate_path;
+
+typedef struct atlas_db_gate_paths {
+    atlas_db_gate_path *items;
+    size_t count;
+    size_t cap;
+} atlas_db_gate_paths;
+
+void atlas_db_gate_paths_init(atlas_db_gate_paths *p);
+void atlas_db_gate_paths_free(atlas_db_gate_paths *p);
+atlas_status atlas_db_gate_paths_add(atlas_db_gate_paths *p, const void *bytes, size_t len,
+                                     atlas_err *err);
+bool atlas_db_gate_paths_has(const atlas_db_gate_paths *p, const void *bytes, size_t len);
+/* True when the set holds `prefix` itself or anything below it. A path
+ * component boundary is required, so `src` does not match `srcfoo`. */
+bool atlas_db_gate_paths_has_prefix(const atlas_db_gate_paths *p, const void *prefix,
+                                    size_t prefix_len);
+
+/* The paths touched between `stop_oid` (exclusive) and `head_oid` (inclusive).
+ *
+ * `limit_reached` is the field a caller must check before trusting a negative
+ * membership test: a set that stopped being collected is a set every lookup
+ * misses for two different reasons. */
+typedef struct atlas_db_gate_range {
+    atlas_db_gate_paths paths;
+    int64_t commits;
+    bool limit_reached;
+    /* True when the walk reached a commit Atlas has not ingested, so the range
+     * may be missing whole branches of itself. */
+    bool missing_commit;
+} atlas_db_gate_range;
+
+atlas_status atlas_db_gate_range_paths(atlas_db *db, int64_t repo_id, const char *head_oid,
+                                       const char *stop_oid, atlas_db_gate_range *out,
+                                       atlas_err *err);
+void atlas_db_gate_range_free(atlas_db_gate_range *r);
+
+/* One revalidation record. Append-only: there is no update and no delete for
+ * this table anywhere in Atlas, and there must not be one. */
+typedef struct atlas_db_gate_validation {
+    int64_t id;
+    int64_t document_id;
+    int64_t revision_id;
+    int64_t revision_no;
+    char content_hash[ATLAS_SHA256_HEX_LEN + 1u];
+    int64_t repo_id;
+    char repo_identity_hash[ATLAS_SHA256_HEX_LEN + 1u];
+    char validated_at_commit[ATLAS_OID_HEX_MAX_INCL];
+    char evidence_digest[ATLAS_SHA256_HEX_LEN + 1u];
+    int64_t challenge_id;
+    /* The assessment the operator was shown, preserved rather than recomputed.
+     * Closed Atlas vocabularies; see atlas/gate.h. */
+    char prior_freshness[16];
+    char prior_reasons[ATLAS_GATE_MAX_REASON_TEXT];
+    char created_at[ATLAS_TS_MAX];
+} atlas_db_gate_validation;
+
+typedef atlas_status (*atlas_db_gate_validation_cb)(const atlas_db_gate_validation *v, void *ud,
+                                                    atlas_err *err);
+
+atlas_status atlas_db_gate_validation_insert(atlas_db *db, const atlas_db_gate_validation *v,
+                                             int64_t *id_out, atlas_err *err);
+/* The newest revalidation of one revision *within one repository identity*. A
+ * revalidation performed against one worktree does not establish a validation
+ * point for another, because the two are at different commits by construction. */
+atlas_status atlas_db_gate_validation_newest(atlas_db *db, int64_t revision_id,
+                                             const char *repo_identity_hash,
+                                             atlas_db_gate_validation *out, bool *found_out,
+                                             atlas_err *err);
+atlas_status atlas_db_gate_validation_count(atlas_db *db, int64_t revision_id,
+                                            const char *repo_identity_hash, int64_t *count_out,
+                                            atlas_err *err);
+atlas_status atlas_db_gate_validations_for_document(atlas_db *db, int64_t document_id,
+                                                    int64_t limit,
+                                                    atlas_db_gate_validation_cb cb, void *ud,
+                                                    atlas_err *err);
+/* Structural checks over the ledger, for `atlas doctor`. Appends a description
+ * of anything wrong to `out` and leaves it untouched when nothing is. Reports,
+ * never repairs — and deliberately does not re-derive evidence digests against
+ * the live index, because those are meant to drift. */
+atlas_status atlas_db_gate_verify(atlas_db *db, atlas_buf *out, atlas_err *err);
 
 /* --- transactions ------------------------------------------------------- */
 

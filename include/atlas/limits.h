@@ -382,4 +382,52 @@
  * ids only, and never any decision prose. */
 #define ATLAS_DECISION_CONTEXT_MAX_IDS 8
 
+/* --- A6: impact gates and stale-decision detection ------------------------
+ *
+ * Every bound here decides an answer rather than trimming one. An assessment
+ * that reaches a ceiling does not report a smaller result; it reports UNKNOWN,
+ * and a gate that sees an UNKNOWN is BLOCKED. So each of these is the point at
+ * which Atlas stops being able to prove something, and the cost of setting one
+ * too low is a refusal, which is the direction a safety gate is allowed to
+ * fail in.
+ */
+
+/* Commits walked back from the indexed head while looking for a decision's
+ * validation point.
+ *
+ * Reaching this is not "the commit is not an ancestor" — it is "Atlas stopped
+ * looking", and those are different answers. The walk that hits it yields
+ * UNKNOWN. */
+#define ATLAS_GATE_MAX_ANCESTRY_COMMITS 20000
+
+/* Distinct repository paths collected from the commits in one change range.
+ *
+ * A range that touched more paths than this is one Atlas cannot enumerate, and
+ * a change set it cannot enumerate is one it must not test membership against:
+ * every miss would be indistinguishable from a path that was never there. */
+#define ATLAS_GATE_MAX_CHANGED_PATHS 50000
+
+/* Structural traversal from a decision's own anchors while looking for a
+ * changed dependency. Deliberately shallower than A3's ceiling: this walk runs
+ * once per assessed decision rather than once per user question. */
+#define ATLAS_GATE_DEFAULT_IMPACT_DEPTH 3
+#define ATLAS_GATE_MAX_IMPACT_DEPTH ATLAS_CODE_MAX_TRAVERSAL_DEPTH
+#define ATLAS_GATE_MAX_IMPACT_NODES 2000
+
+/* Reason codes carried by one assessment. The vocabulary is closed and small;
+ * this bounds how many of it one verdict may cite at once. */
+#define ATLAS_GATE_MAX_REASONS 12
+/* Bytes of the packed reason list stored on a challenge or a validation row.
+ * Reason codes are Atlas literals from a closed vocabulary, so this is a
+ * storage bound rather than a trust one. */
+#define ATLAS_GATE_MAX_REASON_TEXT 512u
+
+/* Decisions one `gate check` will assess. A repository with more approved
+ * decisions than this is reported as a limit reached, which is UNKNOWN, which
+ * is BLOCKED — never as a pass over the ones that fitted. */
+#define ATLAS_GATE_MAX_DECISIONS 2000
+
+/* Path prefixes one gate query may be scoped to. */
+#define ATLAS_GATE_MAX_SCOPE_PATHS 64
+
 #endif /* ATLAS_LIMITS_H */

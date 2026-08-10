@@ -270,8 +270,11 @@ static void test_a_populated_pre_a4_database_migrates_losslessly(void) {
 
     /* The migration under test. */
     T_OK(atlas_db_migrate(db, &err), &err);
-    T_EQ_INT(atlas_db_schema_version(db, &err), 6);
-    T_EQ_INT(ATLAS_SCHEMA_VERSION, 6);
+    /* All the way to head, not merely to six. A later migration that damaged a
+     * pre-A4 table would be exactly as bad as migration 6 doing it, and this
+     * test is the one that would notice. */
+    T_EQ_INT(atlas_db_schema_version(db, &err), ATLAS_SCHEMA_VERSION);
+    T_CHECK(ATLAS_SCHEMA_VERSION >= 6);
 
     /* Row for row, column for column, name for name. */
     for (size_t i = 0; i < PRE_A4_TABLE_COUNT; i++) {
@@ -372,7 +375,7 @@ static void test_migration_is_idempotent(void) {
 
     for (int again = 0; again < 3; again++) {
         T_OK(atlas_db_migrate(db, &err), &err);
-        T_EQ_INT(atlas_db_schema_version(db, &err), 6);
+        T_EQ_INT(atlas_db_schema_version(db, &err), ATLAS_SCHEMA_VERSION);
     }
 
     char schema_after[ATLAS_SHA256_HEX_LEN + 1u];
@@ -416,7 +419,7 @@ static void test_a_v2_database_reaches_schema_six(void) {
          &err);
 
     T_OK(atlas_db_migrate(db, &err), &err);
-    T_EQ_INT(atlas_db_schema_version(db, &err), 6);
+    T_EQ_INT(atlas_db_schema_version(db, &err), ATLAS_SCHEMA_VERSION);
     T_EQ_INT(count_of(db, "SELECT count(*) FROM repositories WHERE name='old';", &err), 1);
     T_EQ_INT(count_of(db, "SELECT count(*) FROM decision_documents;", &err), 0);
 

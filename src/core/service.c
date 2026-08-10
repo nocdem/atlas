@@ -413,6 +413,37 @@ atlas_status atlas_service_doctor(atlas_ctx *ctx, atlas_doctor_report *out, atla
         }
     }
 
+    /* A6. The revalidation ledger is append-only, so every structural claim it
+     * makes is one that cannot legitimately change: a row must name a revision
+     * and a document that exist, must be bound to the digest that revision
+     * carries, must record a repository state, and must point at a challenge
+     * that was actually issued for a revalidation and actually consumed.
+     *
+     * It deliberately does **not** re-derive the evidence digests against the
+     * live index. Those are meant to drift — that is the entire phase — and a
+     * diagnostic that reported ordinary code changes as corruption would teach
+     * everybody to ignore it. Whether the evidence has moved is
+     * `atlas gate check`'s question, and it is answered fresh every time.
+     *
+     * Reported, never repaired, for the same reason as everything else here. */
+    {
+        atlas_buf gate_problem = ATLAS_BUF_INIT;
+        atlas_status vst = atlas_db_gate_verify(ctx->db, &gate_problem, err);
+        if (vst != ATLAS_OK) {
+            atlas_buf_free(&gate_problem);
+            return vst;
+        }
+        if (gate_problem.len > 0) {
+            st = add_problem(out, err, atlas_buf_cstr(&gate_problem));
+            atlas_buf_free(&gate_problem);
+            if (st != ATLAS_OK) {
+                return st;
+            }
+        } else {
+            atlas_buf_free(&gate_problem);
+        }
+    }
+
     out->repo_count = 0;
     return atlas_db_repo_list(ctx->db, count_repos_cb, &out->repo_count, err);
 }

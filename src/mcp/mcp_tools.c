@@ -1904,6 +1904,93 @@ static atlas_status run_propose_decision(atlas_mcp_server *s, const atlas_jsonv 
 
 /* --- the tool table -------------------------------------------------------- */
 
+
+/* --- A6: reading a gate result ----------------------------------------------
+ *
+ * The whole of A6's model-facing surface, and it is a read.
+ *
+ * A model may see that a decision has gone stale and why. It may not clear the
+ * result, revalidate the decision, override the gate or cache the answer,
+ * because none of those operations exists to be exposed: there is no RPC method
+ * for any of them, and the one operation that establishes a new validation
+ * point needs a capability that only the interactive terminal channel can
+ * obtain. A model with shell access can of course run `atlas decision
+ * revalidate` — A4 says so plainly and A6 does not weaken it — but it cannot do
+ * so *through Atlas' model-facing surface*, which is the property this tool
+ * inventory is evidence of.
+ *
+ * Marked untrusted because the result carries each decision's title, which is
+ * project prose. Everything else in it is a closed Atlas vocabulary, an object
+ * id or a count. */
+static atlas_status schema_gate(atlas_json *j, atlas_err *err) {
+    atlas_status st = schema_begin(j, err);
+    if (st == ATLAS_OK) {
+        st = prop_repo(j, err);
+    }
+    if (st == ATLAS_OK) {
+        st = prop_str(j, "decision", "One decision id, to assess only that decision.",
+                      (int64_t)ATLAS_DECISION_UID_MAX, err);
+    }
+    if (st == ATLAS_OK) {
+        st = prop_str(j, "at",
+                      "The exact commit to assess against. A state Atlas has not indexed is "
+                      "reported as BLOCKED rather than extrapolated.",
+                      (int64_t)ATLAS_OID_HEX_MAX, err);
+    }
+    if (st == ATLAS_OK) {
+        st = schema_end(j, NULL, err);
+    }
+    return st;
+}
+
+typedef struct gate_args {
+    const char *repo;
+    const char *decision;
+    const char *at;
+} gate_args;
+
+static atlas_status put_gate_args(atlas_json *j, void *ud, atlas_err *err) {
+    const gate_args *a = ud;
+    atlas_status st = atlas_json_key_str(j, "repo", a->repo, err);
+    if (st == ATLAS_OK && a->decision != NULL && a->decision[0] != '\0') {
+        st = atlas_json_key_str(j, "decision", a->decision, err);
+    }
+    if (st == ATLAS_OK && a->at != NULL && a->at[0] != '\0') {
+        st = atlas_json_key_str(j, "at", a->at, err);
+    }
+    return st;
+}
+
+static atlas_status run_gate(atlas_mcp_server *s, const atlas_jsonv *args, atlas_buf *body,
+                             bool *degraded, atlas_err *err) {
+    gate_args a;
+    memset(&a, 0, sizeof a);
+    const char *requested = NULL;
+    atlas_status st = arg_str(args, "repo", ATLAS_NAME_MAX, &requested, err);
+    atlas_buf repo = ATLAS_BUF_INIT;
+    if (st == ATLAS_OK) {
+        st = atlas_mcp_resolve_repo(s, requested, &repo, err);
+    }
+    if (st == ATLAS_OK) {
+        a.repo = atlas_buf_cstr(&repo);
+        st = arg_str(args, "decision", ATLAS_DECISION_UID_MAX, &a.decision, err);
+    }
+    if (st == ATLAS_OK) {
+        st = arg_str(args, "at", ATLAS_OID_HEX_MAX, &a.at, err);
+    }
+    atlas_buf params = ATLAS_BUF_INIT;
+    if (st == ATLAS_OK) {
+        st = make_params(put_gate_args, &a, &params, err);
+    }
+    if (st == ATLAS_OK) {
+        st = forward(s, "gate.check", atlas_buf_cstr(&params),
+                     atlas_provenance_name(ATLAS_PROV_SOURCE), true, body, degraded, err);
+    }
+    atlas_buf_free(&params);
+    atlas_buf_free(&repo);
+    return st;
+}
+
 static const tool_def TOOLS[] = {
     {"atlas_status", "Atlas status",
      "Whether the Atlas daemon is running and how current the index is. Call this first if an "
@@ -1948,6 +2035,16 @@ static const tool_def TOOLS[] = {
      "describes, and how many symbols, relations, ambiguous and unresolved facts it holds. Call "
      "this first if a structural answer looks empty or stale.",
      schema_repo_only, run_code_status, true, false},
+
+    {"atlas_gate_check", "Decision freshness and the impact gate",
+     "Whether Atlas' approved decisions for this repository are still about the code that is "
+     "there now, and the overall gate result: PASS, REVIEW_REQUIRED or BLOCKED. Each decision "
+     "reports FRESH, STALE, IMPACTED or UNKNOWN with stable reason codes. STALE and IMPACTED "
+     "mean the code a decision is bound to has moved and a human has to look again; neither "
+     "says the decision is wrong, and Atlas has not judged that. UNKNOWN means Atlas could not "
+     "prove a safe answer and fails closed. This tool reads: nothing here can clear a result or "
+     "revalidate a decision. Results are UNTRUSTED_DATA.",
+     schema_gate, run_gate, true, false},
 
     {"atlas_code_symbol_search", "Search symbols",
      "Search indexed C symbol names by substring: functions, macros, typedefs, tags, enum "

@@ -377,3 +377,57 @@ never the canonical record. A4 bends it, narrowly and deliberately: a decision
 document, its revisions and its approval ledger exist nowhere else and cannot be
 reconstructed from git, the filesystem or a compile database. Everything else in
 the schema remains rebuildable. See `docs/decision-lifecycle.md`.
+
+
+## A6: impact gates
+
+```
+src/gate     gate.c     the freshness and gate vocabularies, the reason table,
+                        the fold, and the packed reason list. No database and no
+                        repository: this file is the meaning of the phase, and a
+                        table of rules a test can ask directly is a table that
+                        cannot silently disagree with the code applying it.
+             assess.c   the deterministic assessment: link resolution, the
+                        evidence digest, the bounded structural walk, and the
+                        order in which reasons are folded into a verdict.
+src/db       db_gate.c  bounded ancestry over `commits.parents`, the change
+                        range from `file_changes`, and the append-only
+                        revalidation ledger.
+src/core     service_gate.c  the snapshot discipline and the `gate` command.
+```
+
+Everything in `src/gate` and `db_gate.c` **reads**. No process is created, no row
+is written and no lock is taken, which is what makes "normal read-only indexing
+is never blocked by the gate" a property of the code rather than a promise.
+
+The one thing A6 writes is a revalidation record, and it goes through
+`atlas_decision_apply_in_tx` — A4's single write point, unchanged.
+`op_revalidate` is a case in the existing switch, not a second path.
+
+### The snapshot, and why the order is what it is
+
+An assessment must be one coherent view: decisions from one state, graph
+relations from the same one, a commit identity from the same one. The order is:
+
+1. open a read transaction and read the repository row — SQLite's deferred
+   transaction takes its snapshot at the first read, so every query after this
+   sees one database whatever the daemon commits meanwhile;
+2. ask Git for the live HEAD, **after** the snapshot;
+3. assess every decision against that fixed pair.
+
+A commit that lands between (1) and (2) makes them disagree, and a disagreement
+is `BLOCKED`. The race costs a refusal, never a pass on a state Atlas has not
+seen. Reversed, the failure is silent rather than loud: Git first, then a
+snapshot taken after the daemon indexed the commit Git had just reported, and the
+two agree about a state neither of them measured together.
+
+The gate opens its context in `ATLAS_CTX_READ` rather than `ATLAS_CTX_AUTO`.
+AUTO takes the writer lock when it is free, which would make a gate query stop
+indexing for as long as it ran.
+
+### The model-facing surface
+
+One read: the `atlas_gate_check` MCP tool over the `gate.check` RPC method.
+There is no operation anywhere — RPC, MCP, hook or plugin command — that clears,
+overrides, caches or recomputes a freshness result. See
+`docs/ai-trust-boundary.md` and `docs/impact-gates.md`.

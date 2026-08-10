@@ -88,9 +88,10 @@ static void test_migration_creates_the_a2_tables(void) {
 
     T_EQ_INT(atlas_db_schema_version(e.db, &err), ATLAS_SCHEMA_VERSION);
     /* Pinned on purpose, so that adding a migration is a change somebody has to
-     * make here as well. A4 added migration 6; the A2 tables below are asserted
-     * unchanged across it, which is the property this test is really for. */
-    T_EQ_INT(ATLAS_SCHEMA_VERSION, 6);
+     * make here as well. A4 added migration 6 and A6 added migration 7; the A2
+     * tables below are asserted unchanged across both, which is the property
+     * this test is really for. */
+    T_EQ_INT(ATLAS_SCHEMA_VERSION, 7);
 
     static const char *const TABLES[] = {
         "ai_clients",       "ai_sessions",       "ai_session_repos",     "ai_session_events",

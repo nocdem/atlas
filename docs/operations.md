@@ -297,6 +297,15 @@ because they are the ones that look prunable:
 - **`decision_challenges`** — a *consumed* challenge is part of an approval
   record and the event points at it. Expired unconsumed ones are already removed
   at the point of use, which is the only `DELETE` the decision tables have.
+  A6 widened this table (a `revalidate` intent, and the state a revalidation
+  capability is bound to) without changing its classification.
+- **`decision_validations`** (A6) — the append-only record that a human checked
+  an approved decision against an exact repository state, together with the
+  assessment and the reasons that prompted them to. It is the evidence that a
+  concern was addressed rather than ignored. An age-pruned validation history
+  would silently move every surviving decision's validation point *backwards* —
+  widening its change range — and, for decisions whose every record went, remove
+  the only proof that anybody ever looked.
 
 ### There is no background deleter
 
@@ -445,6 +454,30 @@ do is fail to take a backup, loudly.
   `files`, `commits` and the structural graph, and the way to make it smaller is
   to register fewer repositories or to rebuild the structural index — not to
   prune.
+
+## A6 and this contract
+
+A6 took the schema to 7 and changed none of the guarantees on this page.
+
+- **Verification stays read-only and still migrates nothing.** `backup verify`
+  opens the file through `atlas_db_open_readonly`, which cannot migrate, so a
+  backup taken at schema 6 verifies as a schema-6 file and is still a schema-6
+  file afterwards. `tests/test_migrate7.c` asserts exactly that, including that
+  nothing under the data directory changed while verifying.
+- **A restored older database migrates forward through the ordinary path.**
+  Restore installs the bytes it was given; the next `atlas_db_open` migrates
+  them. A schema-6 backup restored over a schema-7 index comes back at 6 and
+  goes forward to 7, with every decision record and every event-to-challenge
+  reference intact.
+- **A backup from a newer Atlas is still refused**, unchanged: the recorded
+  schema version is checked against this build's expectation before anything is
+  installed.
+- **Neither new A6 table is prunable**, and A6 adds no background deleter, no
+  timer and no cleanup side effect.
+- **A6 adds no RPC method for backup, restore or maintenance**, and
+  `tests/test_gate_trust.c` re-asserts their absence against a live daemon. The
+  cheapest way to have broken this page's central guarantee would have been for
+  a later phase to add the method it says does not exist.
 
 ## Where else this is written down
 

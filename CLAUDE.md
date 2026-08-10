@@ -1,8 +1,9 @@
 # Atlas — working notes for Claude Code
 
 Atlas is a generic, headless engineering-memory and repository-intelligence CLI in
-C17. Phase **A5**: verified online backups, an atomic restore and a written
-retention classification for every table — on top of the A4 decision documents,
+C17. Phase **A6**: deterministic impact gates and stale-decision detection — on
+top of the A5 verified online backups, atomic restore and written retention
+classification, the A4 decision documents,
 the A3 structural code intelligence, the A2 AI integration, the A1 daemon and the
 A0 read-only foundation. Not DNA-specific; DNA is its first real indexed
 repository.
@@ -28,6 +29,7 @@ sh scripts/perf-a2.sh build   # A2 hook and MCP latency measurements
 sh scripts/perf-a3.sh build   # A3 structural-indexing acceptance (~7 minutes)
 sh scripts/perf-a4.sh build   # A4 decision-lifecycle acceptance (~2 minutes)
 sh scripts/perf-a5.sh build   # A5 backup/verify/restore acceptance (~3 minutes)
+sh scripts/perf-a6.sh build   # A6 gate-latency acceptance (~4 minutes)
 ```
 
 `perf-a3.sh` measures peak RSS from `/proc/<pid>/VmHWM` rather than from
@@ -681,6 +683,141 @@ table. That absence is the A5 guarantee, not an omission.
   can only ever cause an operation to *abort*: there must never be a fault point
   that skips a check, weakens a guarantee or publishes something.
 
+## A6 layers — additions
+
+```
+src/gate     gate.c (the vocabularies, the fold, the packed reason list),
+             assess.c (the deterministic assessment and the evidence digest)
+src/db       db_gate.c (bounded ancestry, the change range, the append-only
+             revalidation ledger)
+src/core     service_gate.c (the snapshot discipline and the `gate` command)
+```
+
+The one A6 write goes through `atlas_decision_apply_in_tx`, unchanged. There is
+no second write point, and `op_revalidate` is a case in the existing switch
+rather than a new path.
+
+## A6 rules — these are not negotiable
+
+- **An assessment is an observation, never a judgement about the decision.**
+  STALE means the anchors moved and a human has to look; it does not mean the
+  decision was wrong, has been revoked or no longer applies. IMPACTED means a
+  bounded walk from the anchors reached something that moved. Both are review
+  signals. Atlas cannot know whether an architectural decision survives a change
+  to the code it concerns — that is a question about intent, and Atlas holds
+  bytes and graph edges. The overclaims A6 forbids and the wording that must
+  stay are enumerated in one place, `FORBIDDEN[]` and `REQUIRED[]` in
+  `tests/test_gate_trust.c`, which scans the documentation, the headers and the
+  source. The lists are not repeated here for the reason A4's and A5's are not:
+  a second copy would drift, and this file is one of the files the scan covers.
+- **UNKNOWN is zero and BLOCKED is zero.** A zeroed assessment is one nobody
+  filled in, and the safe reading of that is not "fresh" and not "pass". Moving
+  either zero would make a `memset` produce a permissive default.
+  `atlas_gate_report_init` sets BLOCKED, so the engine must assert PASS
+  deliberately at the point it commits to a real report — BLOCKED absorbs in
+  `atlas_gate_fold`, and a report that started at its safe default could never
+  be lifted out of it.
+- **A verdict is the weakest of its reasons, by construction.**
+  `atlas_gate_assessment_note` is the only way freshness is ever set, and it
+  folds before it records — so a reason that does not fit in the list still
+  weakens the answer, and a decision with thirteen problems cannot report a
+  better verdict than one with twelve. `atlas_gate_reason_freshness` is the
+  single authority on what each reason implies, asked by the tests rather than
+  restated in them.
+- **Nothing is cached.** Freshness is recomputed on every read, for the reason
+  A4 gives about link currency. The only stored assessment is the one a
+  revalidation captured, and it is stored because it is history rather than
+  state.
+- **A limit is never absorbed.** A truncated walk cannot report that it found
+  nothing, and a change set that stopped being collected must not be tested for
+  membership at all — every miss would be indistinguishable from a path that was
+  never in it. Hitting any bound is TRAVERSAL_LIMIT, which is UNKNOWN, which is
+  BLOCKED.
+- **The snapshot order is the consistency argument, and it is deliberate.**
+  Open a read transaction and read the repository row first, so SQLite's
+  deferred snapshot is taken; then ask Git for the live HEAD; then assess. A
+  commit that lands between the two makes them disagree and the answer is
+  BLOCKED — the race costs a refusal, never a pass on a state Atlas has not
+  seen. Reversed, the failure is silent: Git first, then a snapshot taken after
+  the daemon indexed the commit Git had just reported, and the two agree about a
+  state neither measured together.
+- **The gate takes no lock, writes no row and creates no process.** That is what
+  makes "normal read-only indexing is never blocked by the gate" a property of
+  the code rather than a promise: the gate has nothing with which to block it.
+- **Ancestry and the change range are computed from the index, never from a new
+  git call.** A6 adds no git call site and no allowlist vector. The walk over
+  `commits.parents` keeps three non-answers apart on purpose: LIMIT and UNKNOWN
+  mean Atlas stopped before it could tell, and NOT_ANCESTOR is the only value
+  that asserts anything — produced only when every reachable commit was expanded
+  without meeting a parent that was never ingested. Collapsing them would turn
+  "we do not hold that much history" into "your history was rewritten".
+- **Which baseline the direct-evidence question uses depends on whether the
+  decision has been revalidated, and this is load-bearing.** A revision is
+  immutable, so its link snapshots can never be updated; if they stayed the
+  baseline, a decision an operator had just checked would report STALE for ever.
+  Without a revalidation the baseline is each link's own snapshot; with one it
+  is the evidence digest that revalidation recorded. `EVIDENCE_UNRESOLVED` is
+  derived the same way under both, because "Atlas could not look" never
+  establishes that the evidence still resolves.
+- **The evidence digest is domain-separated and length-prefixed**, for A4's
+  reasons exactly. It covers what the anchors resolve to *now*, which is the
+  opposite of what the content hash covers, and the two must never be confused:
+  the content hash is what an approval bound and never changes; this one is
+  expected to change and the point of computing it is to notice when it has.
+- **Revalidation changes no lifecycle state.** No `decision_events` row, no
+  status change, no edit to the approved revision. The ledger replay is over
+  exactly the vocabulary it was over before. `prior_freshness` and
+  `prior_reasons` preserve the assessment the operator was shown — recorded at
+  challenge issue rather than recomputed at consume, so what is kept is what was
+  actually seen.
+- **Both A6 drift checks are database reads.** Consumption runs on the writer
+  thread inside the transaction that spends the capability, where A1 forbids
+  creating a process or reading a file. The indexed commit comes from the
+  repository row and the digest from the stored index. Do not add a git call or
+  a filesystem read there.
+- **A6's model-facing surface is one read.** `atlas_gate_check` over
+  `gate.check`. There is no RPC method, MCP tool, hook or plugin command that
+  clears, overrides, caches or recomputes a freshness result, and none that
+  revalidates. `decision.revalidate` sits beside `decision.approve` over IPC and
+  is equally useless without a capability only the terminal channel can obtain.
+  A4's honesty limits about that channel apply word for word.
+- **`decision_validations` is append-only.** `src/db/db_gate.c` contains no
+  UPDATE and no DELETE that touches it, and there is no `_clear`, no `_prune`
+  and no `_forget`. Both A6 tables are CANONICAL and not prunable in
+  `RETENTION[]`; an age-pruned validation history would silently move every
+  surviving decision's validation point backwards.
+- **`atlas doctor` checks the ledger's structure and not its evidence.** Rows
+  must reference a revision, a document and a consumed revalidation challenge
+  that exist, and must carry the digest their revision carries. It must **not**
+  re-derive evidence digests against the live index: those are meant to drift,
+  and a diagnostic that reported ordinary code changes as corruption would teach
+  everybody to ignore it.
+
+## Extending A6 safely
+
+- **A new reason code** means a member of `atlas_gate_reason`, a row in
+  `REASONS[]` in `src/gate/gate.c` carrying its name *and* the freshness it
+  implies, a row in the table in `docs/impact-gates.md`, and nothing else — the
+  verdict follows from the reason rather than being chosen beside it. A member
+  with no row falls through to the placeholder name and
+  `tests/test_gate_model.c` fails on it.
+- **A new freshness value** means editing `atlas_gate_freshness`, `strength()`
+  in `src/gate/gate.c`, `atlas_gate_fold`, the CHECK on
+  `decision_validations.prior_freshness` and the challenge's, and the enumerated
+  table in `tests/test_gate_model.c`. Keep UNKNOWN at zero.
+- **A new bound** goes in `include/atlas/limits.h` under the A6 section with a
+  written reason, is reported through `limit_reached` and `limit_detail`, and
+  notes `TRAVERSAL_LIMIT`. A bound that silently trims a result is the one thing
+  A6 must never have.
+- **A new field in the evidence digest** changes what every stored
+  `evidence_digest` means, so it invalidates every outstanding capability and
+  every revalidation baseline. Bump `ATLAS_GATE_EVIDENCE_DOMAIN` when it
+  changes.
+- **A new A6 RPC method** must be a read, and adding a mutating one deletes the
+  phase's guarantee. `tests/test_gate_trust.c` asks a live daemon for the names
+  such a method would plausibly have; add the new name there if you add a read,
+  so the negative list keeps pace.
+
 ## Extending A5 safely
 
 - **A new verification check** goes in `atlas_db_backup_inspect`, before the
@@ -953,7 +1090,7 @@ two documents on stdout.
 `README.md` (usage, limitations) · `SECURITY.md` (threat model) ·
 `docs/architecture.md` · `docs/data-model.md` · `docs/provenance.md` ·
 `docs/code-intelligence.md` · `docs/decision-lifecycle.md` ·
-`docs/operations.md` · `docs/git-safety.md` · `docs/daemon-and-ipc.md` ·
+`docs/operations.md` · `docs/impact-gates.md` · `docs/git-safety.md` · `docs/daemon-and-ipc.md` ·
 `docs/watcher-consistency.md` · `docs/systemd-user-service.md` ·
 `docs/ai-trust-boundary.md` · `docs/claude-integration.md` ·
 `docs/backlog.md` · `docs/roadmap.md` ·

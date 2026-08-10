@@ -55,7 +55,18 @@ typedef enum atlas_decision_op_kind {
     ATLAS_DECISION_OP_SUPERSEDE,
     /* Create an A4 document from an A2 `ai_decisions` proposal. The A2 row is
      * read and left exactly as it was. */
-    ATLAS_DECISION_OP_PROMOTE
+    ATLAS_DECISION_OP_PROMOTE,
+    /* A6. Record that an operator checked an already-approved revision against
+     * one exact repository state, establishing a new validation point.
+     *
+     * It consumes a capability like every other operator action, and it changes
+     * no lifecycle state: the revision was APPROVED before and is APPROVED
+     * after, no `decision_events` row is written, and the ledger replay is over
+     * exactly the vocabulary it was over before. What it appends is a
+     * `decision_validations` row, which is a different ledger recording a
+     * different kind of act — not "this became policy" but "somebody checked
+     * that it still describes this code". */
+    ATLAS_DECISION_OP_REVALIDATE
 } atlas_decision_op_kind;
 
 const char *atlas_decision_op_kind_name(atlas_decision_op_kind k);
@@ -113,6 +124,17 @@ typedef struct atlas_decision_op {
 
     /* PROMOTE: the `ai_decisions` row id. */
     int64_t legacy_id;
+
+    /* CHALLENGE with a REVALIDATE intent: the assessment the operator is being
+     * shown, so the validation record preserves what was actually seen rather
+     * than what a recomputation a moment later would have produced.
+     *
+     * Both are closed A6 vocabularies and are checked against them at the write
+     * point rather than trusted: they arrive from a caller, and a caller is not
+     * the authority on what an A6 reason code is. They are plain buffers rather
+     * than A6 types because atlas/gate.h depends on atlas/decision.h. */
+    atlas_buf prior_freshness;
+    atlas_buf prior_reasons;
 } atlas_decision_op;
 
 void atlas_decision_op_init(atlas_decision_op *op, atlas_decision_op_kind kind);
@@ -137,6 +159,14 @@ typedef struct atlas_decision_result {
     atlas_buf title;
     char confirm[ATLAS_DECISION_CONFIRM_MAX];
     char expires_at[ATLAS_TS_MAX];
+
+    /* CHALLENGE with a REVALIDATE intent, and REVALIDATE itself: the exact
+     * repository state and evidence digest the capability is bound to. Reported
+     * so the operator prompt can show what is being revalidated against. */
+    char indexed_commit[ATLAS_OID_HEX_MAX_INCL];
+    char evidence_digest[ATLAS_SHA256_HEX_LEN + 1u];
+    /* REVALIDATE only: the ledger row that was appended. */
+    int64_t validation_id;
 
     /* APPROVE only, when the approval replaced an effective revision. */
     int64_t superseded_revision_no;

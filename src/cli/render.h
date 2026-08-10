@@ -150,6 +150,21 @@ typedef struct atlas_renderer_vtbl {
                                     atlas_err *err);
     atlas_status (*maintenance)(atlas_renderer *r, const atlas_maintenance_report *rep,
                                 atlas_err *err);
+
+    /* --- A6: impact gates -------------------------------------------------
+     *
+     * One shape for both `gate check` and `gate show`, because they are one
+     * query: `show` is `check` with a single item kept, and giving them
+     * separate renderers would let the two descriptions of one assessment drift
+     * apart.
+     *
+     * Almost everything here is Atlas-owned — two closed vocabularies, object
+     * ids, digests and counts — which is what lets it be printed plainly and
+     * lets a model be shown it. The one exception is each assessment's `title`,
+     * which is project prose; it is already safe-encoded by the service layer
+     * and is labelled as untrusted wherever it appears, exactly as A4's
+     * decision renderers label theirs. */
+    atlas_status (*gate)(atlas_renderer *r, const atlas_gate_report *rep, atlas_err *err);
 } atlas_renderer_vtbl;
 
 struct atlas_renderer {

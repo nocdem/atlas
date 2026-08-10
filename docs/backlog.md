@@ -424,3 +424,32 @@ known.
   into the buffer it was appending to, so the first reallocation left it
   dangling and the walk stopped early — 6 directories watched out of 51. Found
   by the performance script; there is now a regression test.
+
+
+## After A6
+
+A6 shipped impact gates and stale-decision detection. Explicitly **not** started
+and **not** claimed, carried forward unchanged:
+
+- the full dedicated security review;
+- clangd integration and toolchain truth;
+- the Atlas orchestration / control plane;
+- the Claude dispatcher;
+- the GitHub issue / PR / review loop;
+- model routing;
+- Testnet 2 automation.
+
+A6 deliberately provides a reusable gate evaluator for a future orchestration
+layer and implements no orchestration itself.
+
+Two smaller things A6 chose not to do, recorded so the choice is visible rather
+than forgotten:
+
+- **Rename tracking.** A renamed symbol is reported `MISSING`, never followed.
+  Atlas has no deterministic identity evidence that a new name is the old object,
+  and Git rename detection is a heuristic over content similarity — which is
+  exactly the kind of guess a decision anchor must not be re-pointed by.
+- **Content-level transitive evidence.** Impact is path-level, because only
+  direct anchors carry a content snapshot. The asymmetry is documented in
+  `docs/impact-gates.md` rather than hidden: a direct anchor that changed and
+  changed back is `FRESH`, a dependency that did the same is still `IMPACTED`.

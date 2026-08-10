@@ -148,6 +148,15 @@ static const retention_entry RETENTION[] = {
      "a consumed challenge is part of an approval record and the event points at it; expired "
      "unconsumed ones are already removed at the point of use, which is the only DELETE the "
      "decision tables have"},
+    /* --- A6: revalidation --------------------------------------------------- */
+    {"decision_validations", ATLAS_RETAIN_CANONICAL, false,
+     "the record that a human checked an approved decision against an exact repository state, "
+     "together with the assessment and the reasons that prompted them to; it is the evidence "
+     "that a concern was addressed rather than ignored, and an age-pruned validation history "
+     "would silently move every surviving decision's validation point back to whatever record "
+     "happened to remain — widening its change range and, for the ones whose every record went, "
+     "removing the only proof that anybody ever looked"},
+
     {"decision_search", ATLAS_RETAIN_DERIVED, false,
      "the searchable projection of decision prose, rebuilt from the canonical rows"},
 

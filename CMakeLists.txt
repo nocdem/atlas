@@ -168,6 +168,16 @@ add_library(atlas_core STATIC
   src/core/service_backup.c
   src/db/db_maintenance.c
   src/core/service_maintenance.c
+  # --- A6: impact gates and stale-decision detection ---------------------
+  #
+  # The gate reads. It creates no process, writes no row and takes no lock,
+  # which is what makes "normal read-only indexing is never blocked by the
+  # gate" checkable rather than promised. The one thing A6 writes is a
+  # revalidation record, and it goes through A4's single write point.
+  src/db/db_gate.c
+  src/gate/gate.c
+  src/gate/assess.c
+  src/core/service_gate.c
 )
 
 target_include_directories(atlas_core

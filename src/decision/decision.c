@@ -223,6 +223,7 @@ const char *atlas_decision_intent_name(atlas_decision_intent i) {
     case ATLAS_DECISION_INTENT_APPROVE: return "approve";
     case ATLAS_DECISION_INTENT_REJECT: return "reject";
     case ATLAS_DECISION_INTENT_SUPERSEDE: return "supersede";
+    case ATLAS_DECISION_INTENT_REVALIDATE: return "revalidate";
     }
     return "approve";
 }
@@ -241,6 +242,10 @@ bool atlas_decision_intent_parse(const char *name, atlas_decision_intent *out) {
     }
     if (strcmp(name, "supersede") == 0) {
         *out = ATLAS_DECISION_INTENT_SUPERSEDE;
+        return true;
+    }
+    if (strcmp(name, "revalidate") == 0) {
+        *out = ATLAS_DECISION_INTENT_REVALIDATE;
         return true;
     }
     return false;

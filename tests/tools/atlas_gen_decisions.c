@@ -46,6 +46,14 @@ static uint64_t next_rand(void) {
     return rng_state;
 }
 
+/* Fills a path link's snapshot from the file index: the content hash the index
+ * currently records, and nothing when the path is not indexed.
+ *
+ * This is what the real propose path does, and doing it here is what makes the
+ * corpus resolvable. A link with no captured hash is UNKNOWN for ever, which is
+ * correct and makes every downstream assessment vacuous. */
+static void anchor_link(atlas_db *db, int64_t repo_id, atlas_decision_link *link);
+
 static void die(const char *what, const atlas_err *err) {
     (void)fprintf(stderr, "atlas-gen-decisions: %s: %s\n", what, atlas_err_msg(err));
     exit(1);
@@ -59,6 +67,25 @@ static const char *const TOPICS[] = {
     "migration", "hashing",   "watching",    "resolution", "transport",  "approval",
 };
 #define TOPIC_COUNT (sizeof(TOPICS) / sizeof(TOPICS[0]))
+
+static atlas_status take_hash(const atlas_file_row *row, void *ud, atlas_err *err) {
+    atlas_buf *out = ud;
+    if (row->content_hash != NULL && !row->deleted) {
+        return atlas_buf_appendf(out, err, "%s", row->content_hash);
+    }
+    return ATLAS_OK;
+}
+
+static void anchor_link(atlas_db *db, int64_t repo_id, atlas_decision_link *link) {
+    atlas_err err;
+    atlas_err_init(&err);
+    bool found = false;
+    /* Through the public read, like everything else here: a fixture that
+     * reached the tables would be building a shape the real write path cannot
+     * produce, which is the one thing a fixture must not do. */
+    (void)atlas_db_file_get(db, repo_id, link->path_raw.data, link->path_raw.len, take_hash,
+                            &link->file_content_hash, &found, &err);
+}
 
 int main(int argc, char **argv) {
     if (argc != 6) {
@@ -115,13 +142,27 @@ int main(int argc, char **argv) {
             die("repo add", &err);
         }
     }
+    /* The indexed head, if this repository has been scanned. A decision
+     * proposed before any scan legitimately has none, and an empty basis is a
+     * real recorded value — but a fixture whose every revision has one measures
+     * only that path. */
+    char head[ATLAS_OID_HEX_MAX_INCL];
+    (void)snprintf(head, sizeof head, "%s", found ? existing.scanned_head : "");
     atlas_repo_info_free(&existing);
 
     /* How many extra revisions each document gets, spread so the total lands on
      * the requested figure rather than being uniform — a uniform depth would
      * make the "newest revision" seek measure one shape. */
     long extra_total = revisions - documents;
-    long links_per_doc = links / (documents > 0 ? documents : 1);
+    /* Per *revision*, not per document: every revision carries anchors, so
+     * dividing by the document count would overshoot the requested link total
+     * by the revision-to-document ratio — which is how a 100 000-link request
+     * silently became a 250 000-link fixture and pushed A5's restore past its
+     * budget. */
+    long links_per_doc = links / (revisions > documents ? revisions : (documents > 0 ? documents : 1));
+    if (links_per_doc < 1) {
+        links_per_doc = 1;
+    }
     if (links_per_doc > ATLAS_DECISION_MAX_LINKS) {
         links_per_doc = ATLAS_DECISION_MAX_LINKS;
     }
@@ -155,6 +196,10 @@ int main(int argc, char **argv) {
             die("rationale", &err);
         }
         op.revision.scope = ATLAS_DECISION_SCOPE_PATHS;
+        if (head[0] != '\0' &&
+            atlas_buf_appendf(&op.revision.basis_head, &err, "%s", head) != ATLAS_OK) {
+            die("basis head", &err);
+        }
         for (long l = 0; l < links_per_doc; l++) {
             atlas_decision_link link;
             atlas_decision_link_init(&link, ATLAS_DECISION_LINK_PATH);
@@ -162,13 +207,29 @@ int main(int argc, char **argv) {
              * decisions share a file — which is what makes the
              * decisions-for-a-file query measure a real lookup rather than a
              * single row. */
+            /* The layout `atlas-gen-ctree` actually produces:
+             * `src/mod<M>/part_<I>.c`. It used to be `src/mod<M>/file<N>.c`,
+             * which matched nothing — so every link in every fixture built by
+             * this tool was dangling. That was invisible to A4 and A5, which
+             * measure how fast decision rows can be read, and is not invisible
+             * to A6, which asks what the links resolve to. */
             long file = (long)(next_rand() % 4000u);
-            if (atlas_buf_appendf(&link.path_raw, &err, "src/mod%ld/file%ld.c", file / 32, file) !=
-                    ATLAS_OK ||
-                atlas_buf_appendf(&link.path_text, &err, "src/mod%ld/file%ld.c", file / 32,
-                                  file) != ATLAS_OK) {
+            if (atlas_buf_appendf(&link.path_raw, &err, "src/mod%ld/part_%ld.c", file / 32,
+                                  file % 32) != ATLAS_OK ||
+                atlas_buf_appendf(&link.path_text, &err, "src/mod%ld/part_%ld.c", file / 32,
+                                  file % 32) != ATLAS_OK) {
                 die("link path", &err);
             }
+            /* The snapshot the real propose path captures: the content hash
+             * the file index currently records, and the commit it was taken
+             * against.
+             *
+             * Without it every link resolves to UNKNOWN — "the file is there
+             * and Atlas cannot say whether it is the same file" — which is
+             * correct behaviour and useless as a fixture: every A6 assessment
+             * over such a corpus is UNKNOWN before it has done any work, so a
+             * gate measurement over it would be timing the early exit. */
+            anchor_link(db, repo_id, &link);
             if (atlas_decision_revision_add_link(&op.revision, &link, &err) != ATLAS_OK) {
                 die("link", &err);
             }
@@ -208,6 +269,32 @@ int main(int argc, char **argv) {
                                   "Revision %ld: the %s subsystem now uses approach %ld instead.",
                                   r + 2, topic, (d + r + 1) % 7) != ATLAS_OK) {
                 die("revision text", &err);
+            }
+            /* A later revision carries anchors too, and it is the one an
+             * approval lands on. Without them the approved revision of every
+             * multi-revision document has nothing to be about — which made the
+             * A6 assessment SCOPE_NOT_ASSESSABLE for most of the corpus. */
+            rev.revision.scope = ATLAS_DECISION_SCOPE_PATHS;
+            if (head[0] != '\0' &&
+                atlas_buf_appendf(&rev.revision.basis_head, &err, "%s", head) != ATLAS_OK) {
+                die("basis head", &err);
+            }
+            for (long l = 0; l < links_per_doc; l++) {
+                atlas_decision_link rlink;
+                atlas_decision_link_init(&rlink, ATLAS_DECISION_LINK_PATH);
+                long rfile = (long)(next_rand() % 4000u);
+                if (atlas_buf_appendf(&rlink.path_raw, &err, "src/mod%ld/part_%ld.c", rfile / 32,
+                                      rfile % 32) != ATLAS_OK ||
+                    atlas_buf_appendf(&rlink.path_text, &err, "src/mod%ld/part_%ld.c", rfile / 32,
+                                      rfile % 32) != ATLAS_OK) {
+                    die("link path", &err);
+                }
+                anchor_link(db, repo_id, &rlink);
+                if (atlas_decision_revision_add_link(&rev.revision, &rlink, &err) != ATLAS_OK) {
+                    die("link", &err);
+                }
+                atlas_decision_link_free(&rlink);
+                made_links++;
             }
             atlas_decision_result rres;
             atlas_decision_result_init(&rres);

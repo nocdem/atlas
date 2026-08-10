@@ -459,7 +459,21 @@ atlas_status atlas_decision_uid_derive(const char *identity_hash, int64_t docume
 typedef enum atlas_decision_intent {
     ATLAS_DECISION_INTENT_APPROVE = 0,
     ATLAS_DECISION_INTENT_REJECT,
-    ATLAS_DECISION_INTENT_SUPERSEDE
+    ATLAS_DECISION_INTENT_SUPERSEDE,
+    /* A6. Establishes a new validation point for a revision that is already
+     * approved, against one exact repository state.
+     *
+     * It is an intent on the same capability rather than a second mechanism,
+     * because it needs precisely the properties approval needed and no others:
+     * an interactive terminal, one use, a short life, and a binding to this
+     * exact revision and content hash. Reusing the channel is also what keeps
+     * the claim about it true — there is still exactly one way to cause any of
+     * this, and it is still the one A4 describes.
+     *
+     * It changes no lifecycle state. An approved revision that is revalidated
+     * was approved before and is approved after; what changed is the point in
+     * history that later assessments measure from. */
+    ATLAS_DECISION_INTENT_REVALIDATE
 } atlas_decision_intent;
 
 const char *atlas_decision_intent_name(atlas_decision_intent i);
@@ -478,6 +492,32 @@ typedef struct atlas_decision_challenge {
     char created_at[ATLAS_TS_MAX];
     char expires_at[ATLAS_TS_MAX];
     bool consumed;
+
+    /* --- REVALIDATE only -------------------------------------------------
+     *
+     * The exact repository state the capability was issued against, and a
+     * digest of what the revision's anchors resolved to at that state. Both are
+     * compared again when the capability is spent, and a difference in either
+     * refuses it: a capability issued against one view of the code must not be
+     * spendable against another.
+     *
+     * Both comparisons are database reads and nothing else. Consumption happens
+     * on the writer thread inside the transaction that spends the capability,
+     * where A1 forbids creating a process or reading a file, so commit drift
+     * and evidence drift are detected without git and without the filesystem.
+     *
+     * The assessment as the operator was shown it, so the validation record
+     * preserves what was actually seen rather than what a later recomputation
+     * would have produced. `prior_freshness` is one A6 freshness name and
+     * `prior_reasons` a space-separated list of A6 reason codes; both are
+     * Atlas literals from closed vocabularies, and a value outside one is
+     * refused rather than stored or reproduced. They are plain character
+     * arrays here rather than A6 types because atlas/gate.h depends on this
+     * header, and a decision must not need to know what a gate is. */
+    char indexed_commit[ATLAS_OID_HEX_MAX_INCL];
+    char evidence_digest[ATLAS_SHA256_HEX_LEN + 1u];
+    char prior_freshness[16];
+    char prior_reasons[ATLAS_GATE_MAX_REASON_TEXT];
 } atlas_decision_challenge;
 
 void atlas_decision_challenge_init(atlas_decision_challenge *c);

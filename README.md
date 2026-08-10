@@ -13,7 +13,51 @@ checked against a read-only allowlist before the process is created, hooks and
 external diff drivers are disabled, and the working tree and index are only ever
 read. See [docs/git-safety.md](docs/git-safety.md).
 
-## Status: phase A5
+## Status: phase A6
+
+A6 turns Atlas' stored decisions into deterministic safety gates: it detects
+when code changes may have made an approved decision stale, and refuses to let
+an AI-facing surface present a stale or unverifiable decision as current
+authority.
+
+### What A6 adds
+
+- `atlas gate check NAME` and `atlas gate show NAME DECISION-ID` — every
+  approved decision assessed against one exact repository state, as `FRESH`,
+  `STALE`, `IMPACTED` or `UNKNOWN`, with stable machine-readable reason codes.
+  The query folds to `PASS`, `REVIEW_REQUIRED` or `BLOCKED`.
+- **exit codes an automation can act on.** `0` for `PASS`, **`8`** for
+  `REVIEW_REQUIRED`, **`9`** for `BLOCKED`. They are distinct because an
+  automation that treats "a human should look at this" and "Atlas could not
+  tell" identically will eventually be handed the second and behave as though it
+  got the first. `0`–`7` keep their meanings exactly.
+- **`UNKNOWN` fails closed.** Atlas never answers `FRESH` when the index is
+  behind Git, an anchor will not resolve, history does not reach the validation
+  point, a traversal bound was hit, or stored state disagrees with itself.
+- **`STALE` means a human has to look again, not that the decision is wrong.**
+  Atlas observed that the anchors moved. Whether an architectural decision
+  survives a change to the code it concerns is a question about intent, and
+  Atlas holds bytes and graph edges.
+- `atlas decision revalidate NAME DECISION-ID` — an append-only operator record
+  that a stale decision was checked against one exact repository state. It
+  reuses A4's terminal-only single-use capability unchanged and adds two
+  bindings: the indexed commit and a digest of what the anchors resolve to, so
+  commit drift and evidence drift are both refusals. It never edits the approved
+  revision, never changes its status, and preserves the assessment that prompted
+  it.
+- **nothing a model can reach may change any of it.** One read-only MCP tool,
+  `atlas_gate_check`, forwarding to one read-only RPC method. There is no
+  operation anywhere that clears, overrides or caches a freshness result.
+  `tests/test_gate_trust.c` asks a live daemon for every method name such an
+  operation would plausibly have and requires every one to fail.
+- **no orchestration.** A6 provides a reusable gate evaluator for a future
+  orchestration layer and implements none.
+
+The whole contract, including the traversal limits and what the gate cannot
+detect, is in [docs/impact-gates.md](docs/impact-gates.md). A6 adds migration 7,
+taking the schema to 7.
+
+## Phase A5
 
 A5 is the operational phase: verified backups, an atomic restore, and a written
 retention policy for every table in the schema.
@@ -509,6 +553,12 @@ false
 | 5 | database or migration error |
 | 6 | Git execution error: failure, timeout, output bound, or parse failure |
 | 7 | integrity or safety invariant violated |
+| 8 | `atlas gate`: `REVIEW_REQUIRED` — a relevant decision is stale or impacted |
+| 9 | `atlas gate`: `BLOCKED` — Atlas could not prove a safe answer |
+
+`8` and `9` are gate *outcomes* rather than errors. `atlas gate check` writes one
+complete document and no error object before exiting with either, which is the
+contract `atlas daemon ping` already follows.
 
 In `--json` mode a failing command still writes one valid JSON document to
 stdout, with `"ok": false` and an `error` object, and the message also goes to
@@ -707,6 +757,9 @@ copied out of Atlas output can be pasted straight back in.
 - [docs/decision-lifecycle.md](docs/decision-lifecycle.md) — the A4 decision
   model: the state machine, the operator channel and its honest limits, code
   links, migration and recovery
+- [docs/impact-gates.md](docs/impact-gates.md) — the A6 contract: freshness and
+  gate semantics, the reason-code vocabulary, exit codes, the human revalidation
+  workflow, the snapshot model, traversal limits and known limitations.
 - [docs/operations.md](docs/operations.md) — the A5 operational contract:
   backup, verification, atomic restore, the retention classification, and the
   limitations of each

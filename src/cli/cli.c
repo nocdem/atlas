@@ -35,6 +35,12 @@ typedef struct cli_state {
      * ping` against a daemon that is not running — must not also emit an error
      * document, because in --json mode that would put two documents on stdout. */
     bool rendered;
+    /* A6. A gate outcome is not an error, so it cannot travel back as an
+     * `atlas_status`: BLOCKED is a complete, correct, successfully produced
+     * answer that must not exit zero. This carries the process exit code
+     * separately, and `atlas_cli_main` prefers it over the status only when the
+     * command itself succeeded. */
+    int gate_exit;
 } cli_state;
 
 void atlas_cli_print_help(FILE *out) {
@@ -95,10 +101,20 @@ void atlas_cli_print_help(FILE *out) {
         "  integrate claude doctor    check the AI integration end to end\n"
         "  integrate claude install --user    record where this Atlas is, for the plugin\n"
         "  integrate claude uninstall --user  remove that record; never the index\n"
-        "  version                    print the version\n"
-        "  help                       print this help\n",
+        ,
         ATLAS_VERSION_STRING, ATLAS_PHASE);
-    /* Split in two because ISO C only guarantees 4095-byte string literals, and
+    /* A third fprintf for the same reason as the second: A6 pushed the command
+     * list past the guaranteed literal length again. */
+    (void)fprintf(
+        out,
+        "  decision revalidate NAME ID  record that an approved decision was checked\n"
+        "                             against the current indexed state; needs a terminal\n"
+        "  gate check NAME            assess every approved decision against the indexed\n"
+        "                             state; exits 8 on review required, 9 on blocked\n"
+        "  gate show NAME ID          the same assessment, for one decision\n"
+        "  version                    print the version\n"
+        "  help                       print this help\n");
+    /* Split because ISO C only guarantees 4095-byte string literals, and
      * A3's commands pushed the single literal past it. Same reason a migration
      * is a list of statement groups rather than one string. */
     (void)fprintf(
@@ -121,6 +137,7 @@ void atlas_cli_print_help(FILE *out) {
         "                             decision propose/revise: repeatable links\n"
         "  --status S                 decision list: PROPOSED|APPROVED|REJECTED|SUPERSEDED\n"
         "  --revision N               decision show/approve: a specific revision\n"
+        "  --at OID                   gate check/show: the exact state to assess\n"
         "  --by ID                    decision supersede: the replacement decision\n"
         "  --format markdown|json     decision export: the output form\n"
         "  --user                     service: operate on the systemd *user* unit\n"
@@ -259,7 +276,8 @@ static atlas_status parse_args(cli_state *st, int argc, char **argv, bool *want_
                        strcmp(a, "--decision") == 0 || strcmp(a, "--rationale") == 0 ||
                        strcmp(a, "--consequences") == 0 || strcmp(a, "--scope") == 0 ||
                        strcmp(a, "--status") == 0 || strcmp(a, "--by") == 0 ||
-                       strcmp(a, "--format") == 0 || strcmp(a, "--dedup-key") == 0) {
+                       strcmp(a, "--format") == 0 || strcmp(a, "--dedup-key") == 0 ||
+                       strcmp(a, "--at") == 0) {
                 /* One arm for every A4 option that takes exactly one value, so
                  * the "a flag at the end of the line has no value" check exists
                  * once rather than ten times. */
@@ -285,6 +303,8 @@ static atlas_status parse_args(cli_state *st, int argc, char **argv, bool *want_
                     st->opts.decision.by = v;
                 } else if (strcmp(a, "--format") == 0) {
                     st->opts.decision.format = v;
+                } else if (strcmp(a, "--at") == 0) {
+                    st->opts.decision.at_commit = v;
                 } else {
                     st->opts.decision.dedup_key = v;
                 }
@@ -754,6 +774,17 @@ static atlas_ctx_mode mode_for(const cli_state *st) {
     if (strcmp(cmd, "scan") == 0) {
         return ATLAS_CTX_WRITE;
     }
+    /* A6. The gate reads, and it must never take the writer lock even when it
+     * is free.
+     *
+     * AUTO would take it, and a gate query that held the writer lock is a gate
+     * query that stops indexing for as long as it runs — which contradicts the
+     * one operational promise the phase makes about itself. READ is not a
+     * fallback here; it is the guarantee, and `scripts/perf-a6.sh` runs a scan
+     * against a concurrent gate query to check that it holds. */
+    if (strcmp(cmd, "gate") == 0) {
+        return ATLAS_CTX_READ;
+    }
     if (strcmp(cmd, "repo") == 0 && st->operand_count > 0 &&
         (strcmp(st->operands[0], "add") == 0 || strcmp(st->operands[0], "remove") == 0)) {
         return ATLAS_CTX_WRITE;
@@ -1005,6 +1036,71 @@ static atlas_status render_outcome(cli_state *st, atlas_renderer *r, const char 
     return result;
 }
 
+
+/* --- A6: the impact gate -----------------------------------------------------
+ *
+ * A read command with an exit code that means something. `--at` names the exact
+ * repository state the caller is asking about; `--path` narrows the question;
+ * `--depth` bounds the structural walk and is refused rather than clamped,
+ * because a silently reduced depth is a silently smaller answer.
+ *
+ * The non-zero exits are the whole point of the command existing rather than
+ * `gate check | grep`. PASS is 0, REVIEW_REQUIRED is 8, BLOCKED is 9 — and they
+ * are distinct because an automation that treats "a human should look at this"
+ * and "Atlas could not tell" identically will eventually be handed the second
+ * and behave as though it got the first. */
+static atlas_status run_gate(cli_state *st, atlas_ctx *ctx, atlas_renderer *r, atlas_err *err) {
+    if (st->operand_count == 0) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "usage: atlas gate check NAME | atlas gate show NAME DECISION-ID");
+    }
+    const char *sub = st->operands[0];
+    bool one = strcmp(sub, "show") == 0;
+    if (!one && strcmp(sub, "check") != 0) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "usage: atlas gate check|show");
+    }
+    size_t want = one ? 3u : 2u;
+    if (st->operand_count != want) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "usage: atlas gate %s NAME%s", sub,
+                             one ? " DECISION-ID" : "");
+    }
+
+    atlas_gate_report rep;
+    atlas_gate_report_init(&rep);
+    atlas_status result;
+    if (one) {
+        result = atlas_service_gate_show(ctx, st->operands[1], st->operands[2],
+                                         st->opts.decision.at_commit, &rep, err);
+    } else {
+        atlas_gate_query q;
+        atlas_gate_query_init(&q);
+        q.repo_name = st->operands[1];
+        q.at_commit = st->opts.decision.at_commit;
+        q.depth = st->opts.depth;
+        for (size_t i = 0; i < st->opts.decision.path_count; i++) {
+            q.paths[q.path_count++] = st->opts.decision.paths[i];
+        }
+        result = atlas_service_gate_check(ctx, &q, &rep, err);
+    }
+    if (result == ATLAS_OK) {
+        result = renderer_open(r, st->opts.json, st->out, "gate", err);
+    }
+    if (result == ATLAS_OK) {
+        result = r->v->gate(r, &rep, err);
+    }
+    if (result == ATLAS_OK) {
+        result = renderer_close(r, err);
+        /* Only once the document is complete. A non-zero exit beside a
+         * half-written answer would tell a caller to act on something it cannot
+         * read. */
+        st->gate_exit = atlas_gate_exit_code(rep.result);
+    } else {
+        renderer_abort(r);
+    }
+    atlas_gate_report_free(&rep);
+    return result;
+}
+
 /* The three operator-only verbs. One function: they differ by intent and by
  * whether a replacement is required, and three copies of the `--yes` refusal
  * would be three chances for one of them to be missing. */
@@ -1057,7 +1153,7 @@ static atlas_status run_decision(cli_state *st, atlas_ctx *ctx, atlas_renderer *
     if (st->operand_count == 0) {
         return atlas_err_set(err, ATLAS_ERR_USAGE,
                              "usage: atlas decision list|show|search|history|for-file|propose|"
-                             "revise|approve|reject|supersede|export|orphaned|legacy|"
+                             "revise|approve|reject|supersede|revalidate|export|orphaned|legacy|"
                              "promote ...");
     }
     const char *sub = st->operands[0];
@@ -1336,6 +1432,9 @@ static atlas_status run_decision(cli_state *st, atlas_ctx *ctx, atlas_renderer *
 
     if (strcmp(sub, "approve") == 0) {
         return run_decision_confirm(st, ctx, r, ATLAS_DECISION_INTENT_APPROVE, err);
+    }
+    if (strcmp(sub, "revalidate") == 0) {
+        return run_decision_confirm(st, ctx, r, ATLAS_DECISION_INTENT_REVALIDATE, err);
     }
     if (strcmp(sub, "reject") == 0) {
         return run_decision_confirm(st, ctx, r, ATLAS_DECISION_INTENT_REJECT, err);
@@ -2249,6 +2348,8 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
         }
     } else if (strcmp(cmd, "code") == 0) {
         result = run_code(st, ctx, &r, limit, err);
+    } else if (strcmp(cmd, "gate") == 0) {
+        result = run_gate(st, ctx, &r, err);
     } else if (strcmp(cmd, "decision") == 0) {
         result = run_decision(st, ctx, &r, limit, err);
     } else {
@@ -2293,6 +2394,15 @@ int atlas_cli_main(int argc, char **argv, FILE *out, FILE *errout) {
     s = run_command(&st, &err);
     if (s != ATLAS_OK && !st.rendered) {
         atlas_render_error(out, errout, st.opts.json, st.command, &err);
+        return (int)s;
+    }
+    /* A gate result that is not PASS exits non-zero *after* a complete,
+     * successful document has been written. It is not an error and no error
+     * document is emitted; `atlas gate check --json` still puts exactly one
+     * document on stdout, which is the same contract `atlas daemon ping`
+     * follows for the same reason. */
+    if (s == ATLAS_OK && st.gate_exit != 0) {
+        return st.gate_exit;
     }
     return (int)s;
 }

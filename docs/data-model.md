@@ -910,3 +910,73 @@ that was 1 474 ms against a 100 ms budget. See the comment on
 migration, for the reason the top of `migrate.c` gives: FTS5 availability is a
 property of the linked SQLite build rather than of the schema. Search degrades
 to a bounded, repository-filtered scan of `decision_search` when it is absent.
+
+
+## A6: revalidation (migration 7)
+
+A6 assesses whether an approved decision is still about the code that is there
+now. That assessment is **computed on every read and never stored**, for the
+reason A4 gives about link currency: a cached answer to "is this still current?"
+is wrong for exactly as long as nobody has recomputed it.
+
+So the phase adds one table, and it is not a table of assessments. It records the
+*human act* that a stale assessment calls for.
+
+### `decision_challenges`, rebuilt
+
+SQLite cannot widen a CHECK in place, and the `intent` vocabulary gains
+`revalidate`. The migration therefore rebuilds the table — the first Atlas
+migration to rebuild an existing one rather than only add new ones.
+
+**Row ids are preserved exactly.** `decision_events.challenge_id` points into
+this table without a foreign key, so a rebuild that renumbered would silently
+re-point every approval record at somebody else's capability, and nothing about
+the result would look wrong. `tests/test_migrate7.c` compares the rows id for id
+across the migration and then joins every event to the challenge it names.
+
+Four columns are added, all NULL for every intent but `revalidate`:
+
+| Column | What it is |
+| --- | --- |
+| `indexed_commit` | The repository state the capability was issued against. Compared again when it is spent: a difference is **commit drift** and refuses the operation. |
+| `evidence_digest` | A digest of what the revision's anchors resolved to at issue time. A difference is **evidence drift**. |
+| `prior_freshness` | The verdict the operator was shown. A closed A6 vocabulary. |
+| `prior_reasons` | The reason codes they were shown, space-separated. Closed vocabulary; a token outside it is refused rather than stored. |
+
+Both drift checks are pure database reads. Consumption runs on the writer thread
+inside the transaction that spends the capability, where A1 forbids creating a
+process or reading a file, so drift is detected without Git and without the
+filesystem.
+
+### `decision_validations`
+
+The append-only revalidation ledger. Nothing updates a row and nothing deletes
+one; there is no `_clear`, no `_prune` and no `_forget`.
+
+**It is not part of the A4 ledger and changes no lifecycle state.** A revalidated
+revision was `APPROVED` before and is `APPROVED` after, its approval event is
+untouched, and `decision_events` keeps exactly the four transitions it had — so
+the replay in `atlas_db_decision_verify` is the same function over the same
+vocabulary as before. Revalidation records a different kind of act: not "this
+became policy" but "somebody checked that it still describes this code".
+
+| Column | Notes |
+| --- | --- |
+| `document_id`, `revision_id`, `revision_no` | What was revalidated. |
+| `content_hash` | The digest it covered, recorded on the row for the reason `decision_events` records one: a later reader can see which bytes were revalidated without trusting that the revision row is the one that was there. |
+| `repo_id` | A **soft** reference, for A4's reason — a foreign key would make `repo remove --yes` destroy validation history. |
+| `repo_identity_hash` | The durable identity: the same path-qualified lineage fingerprint the documents carry. A revalidation is looked up by revision *and* identity, so one worktree's revalidation does not establish a validation point for another — the two are at different commits by construction. |
+| `validated_at_commit` | The exact state it was checked against. This becomes the decision's new validation point, and every later assessment measures its change range from here. |
+| `evidence_digest` | What the anchors resolved to at that moment. It becomes the baseline the direct-evidence question is asked against, which is what stops a revalidated decision from reporting `STALE` for ever — a revision is immutable, so its link snapshots can never be updated. |
+| `actor` | `LOCAL_OPERATOR_CONFIRMED`, the only value the CHECK accepts. It says the operator channel was used. It does not name a person, does not prove one was present, and is not a signature. |
+| `challenge_id` | The capability that was spent. `UNIQUE`, so one capability can produce at most one record even if the consumption check were somehow bypassed. |
+| `prior_freshness`, `prior_reasons` | The assessment that prompted the revalidation, preserved rather than replaced. Without them the ledger would say a decision was revalidated and could not say what was wrong with it. |
+
+`atlas doctor` checks this ledger's **structure**: every row must name a revision
+and a document that exist, must carry the digest its revision carries, must
+record a repository state, and must point at a challenge that was issued for a
+revalidation and actually consumed. It deliberately does **not** re-derive the
+evidence digests against the live index — those are meant to drift, and that is
+`atlas gate check`'s question. Reported, never repaired.
+
+Both tables are `CANONICAL` and not prunable; see `docs/operations.md`.

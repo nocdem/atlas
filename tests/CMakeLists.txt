@@ -95,6 +95,12 @@ set(ATLAS_TESTS
   test_backup
   test_maintenance
   test_backup_live
+  # --- A6: impact gates and stale-decision detection ---
+  test_gate_model
+  test_gate
+  test_gate_operator
+  test_gate_trust
+  test_migrate7
 )
 
 foreach(test_name IN LISTS ATLAS_TESTS)
@@ -151,6 +157,26 @@ set_tests_properties(test_ai_trust test_hooks test_mcp_roots test_ai_attribution
 # serialisation.
 set_tests_properties(test_backup test_maintenance PROPERTIES LABELS "integration")
 set_tests_properties(test_backup_live PROPERTIES LABELS "daemon" TIMEOUT 900 RUN_SERIAL TRUE)
+
+# A6. The vocabularies, the fold and the digests are pure functions — inputs in,
+# a verdict or a digest out — so this suite needs no repository, no database and
+# no daemon, and belongs in the fast subset.
+set_tests_properties(test_gate_model PROPERTIES LABELS "unit")
+# The gate suite builds real repositories, indexes them through the CLI and
+# assesses them in process, so it is an integration test.
+set_tests_properties(test_gate PROPERTIES LABELS "integration")
+# The revalidation suite drives the binary through a pseudo-terminal, like A4's
+# operator suite and for the same reason: the requirement is that a terminal is
+# needed, and a stubbed one would be testing the stub.
+set_tests_properties(test_gate_operator PROPERTIES LABELS "integration")
+# The trust suite forks a live daemon to ask it for method names that must not
+# exist, so it carries the daemon label and its serialisation.
+set_tests_properties(test_gate_trust PROPERTIES LABELS "daemon" TIMEOUT 900 RUN_SERIAL TRUE)
+# It also reads Atlas' own documentation and source for the claim tripwire.
+target_compile_definitions(test_gate_trust PRIVATE ATLAS_SRC_DIR="${CMAKE_SOURCE_DIR}")
+# Migration 7 rebuilds a table, so its suite drives the storage layer and the
+# backup CLI against real databases. No daemon and no repository.
+set_tests_properties(test_migrate7 PROPERTIES LABELS "integration")
 
 # The plugin fixture test reads the shipped plugin from the source tree, so it
 # has to be told where that is rather than guessing from the working directory.

@@ -1346,6 +1346,80 @@ static atlas_status h_maintenance(atlas_renderer *r, const atlas_maintenance_rep
     return ok();
 }
 
+
+/* --- A6: impact gates -------------------------------------------------------
+ *
+ * Every value below is Atlas-owned except each item's title, which is project
+ * prose and is labelled where it is printed. The freshness and reason words are
+ * closed vocabularies, the commits are object ids out of Atlas' own index, and
+ * the rest are counts. */
+static atlas_status h_gate(atlas_renderer *r, const atlas_gate_report *rep, atlas_err *err) {
+    (void)err;
+    FILE *o = r->out;
+    (void)fprintf(o, "gate:       %s\n", atlas_gate_result_name(rep->result));
+    (void)fprintf(o, "repository: %s\n", atlas_buf_cstr(&rep->root_text));
+    (void)fprintf(o, "indexed:    %s\n",
+                  rep->indexed_commit[0] != '\0' ? rep->indexed_commit : "(never scanned)");
+    if (strcmp(rep->requested_commit, rep->indexed_commit) != 0) {
+        (void)fprintf(o, "requested:  %s\n",
+                      rep->requested_commit[0] != '\0' ? rep->requested_commit : "(none)");
+    }
+    (void)fprintf(o, "depth:      %" PRId64 "\n", rep->depth);
+    (void)fprintf(o,
+                  "decisions:  %zu assessed (%" PRId64 " fresh, %" PRId64 " stale, %" PRId64
+                  " impacted, %" PRId64 " unknown)\n",
+                  rep->item_count, rep->fresh, rep->stale, rep->impacted, rep->unknown);
+    if (rep->out_of_scope > 0) {
+        (void)fprintf(o, "            %" PRId64 " excluded by the requested scope\n",
+                      rep->out_of_scope);
+    }
+    if (rep->limit_reached) {
+        (void)fprintf(o, "limit:      reached (%s); this answer is a subset of an answer\n",
+                      rep->limit_detail != NULL ? rep->limit_detail : "unspecified");
+    }
+
+    for (size_t i = 0; i < rep->item_count; i++) {
+        const atlas_gate_assessment *a = &rep->items[i];
+        (void)fprintf(o, "\n%s  revision %" PRId64 "  %s\n", atlas_buf_cstr(&a->uid),
+                      a->revision_no, atlas_gate_freshness_name(a->freshness));
+        (void)fprintf(o, "  title (untrusted project text): %s\n", atlas_buf_cstr(&a->title));
+        (void)fprintf(o, "  digest:    %s\n", a->content_hash);
+        (void)fprintf(o, "  evidence:  %s\n", a->evidence_digest);
+        (void)fprintf(o, "  validated: %s%s\n",
+                      a->validated_at_commit[0] != '\0' ? a->validated_at_commit
+                                                        : "(no validation point)",
+                      a->validated_by_revalidation ? " (revalidated)" : " (at proposal)");
+        if (a->revalidation_count > 0) {
+            (void)fprintf(o, "  revalidations: %" PRId64 "\n", a->revalidation_count);
+        }
+        (void)fprintf(o, "  because:  ");
+        for (size_t k = 0; k < a->reason_count; k++) {
+            (void)fprintf(o, " %s", atlas_gate_reason_name(a->reasons[k]));
+        }
+        (void)fprintf(o, "\n");
+        (void)fprintf(o,
+                      "  links:     %" PRId64 " total, %" PRId64 " current, %" PRId64
+                      " changed, %" PRId64 " missing, %" PRId64 " ambiguous, %" PRId64 " unknown\n",
+                      a->links_total, a->links_current, a->links_changed, a->links_missing,
+                      a->links_ambiguous, a->links_unknown);
+        (void)fprintf(o,
+                      "  range:     %" PRId64 " commit(s), %" PRId64 " path(s); walk reached %"
+                      PRId64 " node(s), %" PRId64 " changed\n",
+                      a->range_commits, a->range_paths, a->walk_visited, a->walk_matched);
+        if (a->limit_reached) {
+            (void)fprintf(o, "  limit:     reached (%s)\n",
+                          a->limit_detail != NULL ? a->limit_detail : "unspecified");
+        }
+    }
+    if (rep->stale > 0 || rep->impacted > 0) {
+        (void)fprintf(o,
+                      "\nnote: STALE and IMPACTED mean the code a decision is bound to has moved, "
+                      "so it needs\n      a human to look again. Neither says the decision is "
+                      "wrong; Atlas has not judged that\n      and cannot.\n");
+    }
+    return ATLAS_OK;
+}
+
 const atlas_renderer_vtbl ATLAS_RENDERER_HUMAN = {
     h_begin,      h_end,          h_note_repo,    h_note_query,   h_list_begin,
     h_list_end,   h_doctor,       h_version,      h_repo_item,    h_repo_added,
@@ -1361,4 +1435,6 @@ const atlas_renderer_vtbl ATLAS_RENDERER_HUMAN = {
     h_decision_counts, h_decision_ledger,
     /* --- A5 --- */
     h_backup_created, h_backup_verified, h_backup_restored, h_maintenance,
+    /* --- A6 --- */
+    h_gate,
 };

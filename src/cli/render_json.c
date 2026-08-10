@@ -1262,6 +1262,72 @@ static atlas_status j_maintenance(atlas_renderer *r, const atlas_maintenance_rep
     return atlas_json_obj_end(j, err);
 }
 
+
+static atlas_status j_gate(atlas_renderer *r, const atlas_gate_report *rep, atlas_err *err) {
+    atlas_json *j = r->j;
+    TRY(atlas_json_key(j, "gate", err));
+    TRY(atlas_json_obj_begin(j, err));
+    TRY(atlas_json_key_str(j, "result", atlas_gate_result_name(rep->result), err));
+    TRY(atlas_json_key_int(j, "exit_code", atlas_gate_exit_code(rep->result), err));
+    TRY(atlas_json_key_str(j, "repository", atlas_buf_cstr(&rep->repo_name), err));
+    TRY(atlas_json_key_str(j, "root", atlas_buf_cstr(&rep->root_text), err));
+    TRY(atlas_json_key_str(j, "repo_identity_hash", atlas_buf_cstr(&rep->repo_identity_hash), err));
+    TRY(atlas_json_key_str(j, "indexed_commit", rep->indexed_commit, err));
+    TRY(atlas_json_key_str(j, "requested_commit", rep->requested_commit, err));
+    TRY(atlas_json_key_int(j, "depth", rep->depth, err));
+    TRY(atlas_json_key_int(j, "fresh", rep->fresh, err));
+    TRY(atlas_json_key_int(j, "stale", rep->stale, err));
+    TRY(atlas_json_key_int(j, "impacted", rep->impacted, err));
+    TRY(atlas_json_key_int(j, "unknown", rep->unknown, err));
+    TRY(atlas_json_key_int(j, "out_of_scope", rep->out_of_scope, err));
+    TRY(atlas_json_key_bool(j, "limit_reached", rep->limit_reached, err));
+    TRY(atlas_json_key_str_opt(j, "limit_detail", rep->limit_detail, err));
+    TRY(atlas_json_key(j, "decisions", err));
+    TRY(atlas_json_arr_begin(j, err));
+    for (size_t i = 0; i < rep->item_count; i++) {
+        const atlas_gate_assessment *a = &rep->items[i];
+        TRY(atlas_json_obj_begin(j, err));
+        TRY(atlas_json_key_str(j, "decision", atlas_buf_cstr(&a->uid), err));
+        TRY(atlas_json_key_int(j, "revision", a->revision_no, err));
+        /* Already safe-encoded by the service layer; not encoded again. */
+        TRY(atlas_json_key_str(j, "title", atlas_buf_cstr(&a->title), err));
+        TRY(atlas_json_key_str(j, "status", atlas_decision_state_name(a->state), err));
+        TRY(atlas_json_key_str(j, "scope", atlas_decision_scope_name(a->scope), err));
+        TRY(atlas_json_key_str(j, "content_hash", a->content_hash, err));
+        TRY(atlas_json_key_str(j, "evidence_digest", a->evidence_digest, err));
+        TRY(atlas_json_key_str(j, "freshness", atlas_gate_freshness_name(a->freshness), err));
+        TRY(atlas_json_key_str(j, "validated_at_commit", a->validated_at_commit, err));
+        TRY(atlas_json_key_bool(j, "validated_by_revalidation", a->validated_by_revalidation, err));
+        TRY(atlas_json_key_int(j, "revalidations", a->revalidation_count, err));
+        TRY(atlas_json_key_str(j, "indexed_commit", a->indexed_commit, err));
+        TRY(atlas_json_key_str(j, "requested_commit", a->requested_commit, err));
+        TRY(atlas_json_key(j, "reasons", err));
+        TRY(atlas_json_arr_begin(j, err));
+        for (size_t k = 0; k < a->reason_count; k++) {
+            TRY(atlas_json_str(j, atlas_gate_reason_name(a->reasons[k]), err));
+        }
+        TRY(atlas_json_arr_end(j, err));
+        TRY(atlas_json_key(j, "evidence", err));
+        TRY(atlas_json_obj_begin(j, err));
+        TRY(atlas_json_key_int(j, "links_total", a->links_total, err));
+        TRY(atlas_json_key_int(j, "links_current", a->links_current, err));
+        TRY(atlas_json_key_int(j, "links_changed", a->links_changed, err));
+        TRY(atlas_json_key_int(j, "links_missing", a->links_missing, err));
+        TRY(atlas_json_key_int(j, "links_ambiguous", a->links_ambiguous, err));
+        TRY(atlas_json_key_int(j, "links_unknown", a->links_unknown, err));
+        TRY(atlas_json_key_int(j, "range_commits", a->range_commits, err));
+        TRY(atlas_json_key_int(j, "range_paths", a->range_paths, err));
+        TRY(atlas_json_key_int(j, "walk_visited", a->walk_visited, err));
+        TRY(atlas_json_key_int(j, "walk_matched", a->walk_matched, err));
+        TRY(atlas_json_obj_end(j, err));
+        TRY(atlas_json_key_bool(j, "limit_reached", a->limit_reached, err));
+        TRY(atlas_json_key_str_opt(j, "limit_detail", a->limit_detail, err));
+        TRY(atlas_json_obj_end(j, err));
+    }
+    TRY(atlas_json_arr_end(j, err));
+    return atlas_json_obj_end(j, err);
+}
+
 const atlas_renderer_vtbl ATLAS_RENDERER_JSON = {
     j_begin,      j_end,          j_note_repo,    j_note_query,   j_list_begin,
     j_list_end,   j_doctor,       j_version,      j_repo_item,    j_repo_added,
@@ -1277,6 +1343,8 @@ const atlas_renderer_vtbl ATLAS_RENDERER_JSON = {
     j_decision_counts, j_decision_ledger,
     /* --- A5 --- */
     j_backup_created, j_backup_verified, j_backup_restored, j_maintenance,
+    /* --- A6 --- */
+    j_gate,
 };
 
 void atlas_render_error(FILE *out, FILE *errout, bool json, const char *command,

@@ -259,11 +259,56 @@ Deferred from A5 rather than dropped:
   which
 - report toolchain and compile-database drift in `atlas doctor`
 
-## A6 — impact gates and stale-document detection
+## A6 — impact gates and stale-decision detection (shipped)
 
-- flag decision documents whose subject has changed since the decision was
-  recorded
-- an exit-code contract usable as a CI gate, so a stale document can fail a build
+Both of the original bullets, and the parts that turned out to matter more than
+either of them.
+
+- **Freshness per approved revision**: `FRESH`, `STALE`, `IMPACTED`, `UNKNOWN`,
+  with a closed vocabulary of stable reason codes. Deterministic, from stored
+  Atlas facts and stored Git facts; no model, and nothing cached.
+- **An exit-code contract usable as a CI gate**: `0` for `PASS`, `8` for
+  `REVIEW_REQUIRED`, `9` for `BLOCKED`, extending rather than changing `0`–`7`.
+- **`UNKNOWN` fails closed.** This is the part the original two bullets did not
+  anticipate and the part the phase mostly consists of: a gate that answered
+  `PASS` on incomplete information would be worse than no gate, because the
+  answer has the same shape as a real one. Index lag, an unreachable base, a
+  rewritten history, a truncated walk and inconsistent stored state are all
+  `BLOCKED`.
+- **`STALE` means a human has to look again, not that the decision is wrong.**
+  Atlas observed that the anchors moved. Whether an architectural decision
+  survives a change to the code it concerns is a question about intent.
+- **Human revalidation**, reusing A4's terminal-only single-use capability
+  unchanged and adding two bindings — the indexed commit and an evidence digest
+  — so commit drift and evidence drift are refusals. Append-only; it edits no
+  approved revision and changes no lifecycle state.
+- **Nothing a model can reach may change any of it.** One read-only MCP tool
+  over one read-only RPC method, and no operation anywhere that clears,
+  overrides or caches a freshness result.
+- Schema 7: `decision_validations` added, `decision_challenges` rebuilt.
+
+Deliberately **not** in A6: any orchestration. A6 provides a reusable gate
+evaluator for a future control plane and implements none of it.
+
+Full contract: `docs/impact-gates.md`.
+
+## Deferred, and still deferred after A6
+
+None of these was started in A6 and none is claimed. They are listed here rather
+than only in a phase document because the roadmap is where a reader looks for
+what has not happened yet.
+
+- **A full dedicated security review.** A6 added a surface — a gate evaluator, a
+  new RPC method, a new MCP tool, a schema migration and an operator write path
+  — and reviewed each against the phase's own rules. That is not the same thing
+  as a dedicated review of the whole system, which remains outstanding.
+- **clangd and toolchain truth** (see the section above; deferred from A5,
+  unchanged by A6).
+- **The Atlas orchestration / control plane.**
+- **The Claude dispatcher.**
+- **The GitHub issue / PR / review loop.**
+- **Model routing.**
+- **Testnet 2 automation.**
 
 ## A7 — optional MCP adapter (absorbed into A2)
 

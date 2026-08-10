@@ -55,6 +55,10 @@ typedef struct atlas_cli_opts {
         const char *by;       /* `decision supersede --by` */
         const char *format;   /* `decision export --format` */
         const char *dedup_key;
+        /* A6. `gate check --at OID`: the exact repository state the caller is
+         * asking about. Naming one Atlas has not indexed is INDEX_LAG and so
+         * BLOCKED, never an extrapolation to a state Atlas has never seen. */
+        const char *at_commit;
         long revision;        /* 0 means the effective revision */
         /* Repeatable options. Bounded by the same ceilings the storage layer
          * enforces, and refused past them rather than truncated. */

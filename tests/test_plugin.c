@@ -364,13 +364,16 @@ static void test_documented_tool_names_are_plugin_scoped_correctly(void) {
         T_CHECK(strncmp(names[n], "atlas_", 6u) == 0);
     }
     /* A2 shipped ten; A3 added six structural ones; A4 added four for decision
-     * documents. Pinned exactly rather than as a floor, so a tool appearing or
-     * vanishing is a deliberate change — which is how this caught A4.
+     * documents; A6 added one, `atlas_gate_check`. Pinned exactly rather than as
+     * a floor, so a tool appearing or vanishing is a deliberate change — which
+     * is how this caught A4.
      *
-     * What A4 did *not* add is the point: there is no approval tool, and
-     * `tests/test_decision_mcp.c` asserts that no tool name contains an
-     * approval verb and no schema declares a capability argument. */
-    T_CHECK_MSG(n == 20, "expected 20 tools, found %zu", n);
+     * What A4 and A6 did *not* add is the point. There is no approval tool and
+     * no revalidation tool; `tests/test_decision_mcp.c` asserts that no tool
+     * name contains an approval or revalidation verb and that no schema
+     * declares a capability argument. A6's one addition is a read: it can say
+     * that a decision has gone stale and cannot do anything about it. */
+    T_CHECK_MSG(n == 21, "expected 21 tools, found %zu", n);
 }
 
 /* --- the integration record ----------------------------------------------

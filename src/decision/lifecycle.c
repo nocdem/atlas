@@ -60,6 +60,7 @@
 #include "atlas/ai.h"
 #include "atlas/atlas.h"
 #include "atlas/safetext.h"
+#include "gate/gate_internal.h"
 
 const char *atlas_decision_op_kind_name(atlas_decision_op_kind k) {
     switch (k) {
@@ -70,6 +71,7 @@ const char *atlas_decision_op_kind_name(atlas_decision_op_kind k) {
     case ATLAS_DECISION_OP_REJECT: return "reject";
     case ATLAS_DECISION_OP_SUPERSEDE: return "supersede";
     case ATLAS_DECISION_OP_PROMOTE: return "promote";
+    case ATLAS_DECISION_OP_REVALIDATE: return "revalidate";
     }
     return "propose";
 }
@@ -79,7 +81,7 @@ bool atlas_decision_op_needs_challenge(atlas_decision_op_kind k) {
      * so that adding an operation kind forces a decision about it here instead
      * of defaulting it into the unauthenticated set. */
     return k == ATLAS_DECISION_OP_APPROVE || k == ATLAS_DECISION_OP_REJECT ||
-           k == ATLAS_DECISION_OP_SUPERSEDE;
+           k == ATLAS_DECISION_OP_SUPERSEDE || k == ATLAS_DECISION_OP_REVALIDATE;
 }
 
 void atlas_decision_op_init(atlas_decision_op *op, atlas_decision_op_kind kind) {
@@ -96,6 +98,8 @@ void atlas_decision_op_init(atlas_decision_op *op, atlas_decision_op_kind kind) 
     atlas_buf_init(&op->dedup_key);
     atlas_buf_init(&op->token);
     atlas_buf_init(&op->confirmation);
+    atlas_buf_init(&op->prior_freshness);
+    atlas_buf_init(&op->prior_reasons);
 }
 
 void atlas_decision_op_free(atlas_decision_op *op) {
@@ -113,6 +117,8 @@ void atlas_decision_op_free(atlas_decision_op *op) {
     atlas_buf_free(&op->dedup_key);
     atlas_buf_free(&op->token);
     atlas_buf_free(&op->confirmation);
+    atlas_buf_free(&op->prior_freshness);
+    atlas_buf_free(&op->prior_reasons);
 }
 
 void atlas_decision_result_init(atlas_decision_result *r) {
@@ -803,6 +809,76 @@ static atlas_status op_challenge(apply_ctx *ac, const atlas_decision_op *op,
         (void)snprintf(c.expires_at, sizeof(c.expires_at), "%s", expires);
     }
 
+    /* --- A6: what a revalidation capability is additionally bound to --------
+     *
+     * The repository state and the evidence digest, captured here and compared
+     * again when the capability is spent. That is what makes commit drift and
+     * evidence drift refusals rather than surprises: a capability issued
+     * against one view of the code cannot be spent against another, exactly as
+     * an approval capability cannot be spent against a different revision.
+     *
+     * Both are read from the database, and deliberately so. This runs on the
+     * writer thread inside a transaction, where A1 forbids creating a process
+     * or reading a file — so the indexed head comes from the repository row
+     * rather than from Git, and the digest from the stored index rather than
+     * from the working tree.
+     *
+     * The assessment the operator will be shown is *not* computed here. It is
+     * supplied by the caller that displayed it, so what the validation record
+     * preserves is what a human actually saw rather than what a recomputation
+     * a moment later would have produced. */
+    if (c.intent == ATLAS_DECISION_INTENT_REVALIDATE) {
+        if (strcmp(state, "APPROVED") != 0) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "only an approved revision can be revalidated; revision %lld is "
+                                 "%s",
+                                 (long long)rev_no, state);
+        }
+        (void)snprintf(c.indexed_commit, sizeof(c.indexed_commit), "%s", ac->repo.scanned_head);
+        if (c.indexed_commit[0] == '\0') {
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "this repository has not been indexed, so there is no exact "
+                                 "state to revalidate against");
+        }
+        atlas_decision_revision loaded;
+        atlas_decision_revision_init(&loaded);
+        bool lfound = false;
+        st = atlas_db_decision_revision_load(ac->db, rev_id, &loaded, &lfound, err);
+        if (st == ATLAS_OK && lfound) {
+            st = atlas_gate_evidence_digest_for(ac->db, ac->repo.id, &loaded, c.evidence_digest,
+                                                err);
+        }
+        atlas_decision_revision_free(&loaded);
+        if (st != ATLAS_OK) {
+            return st;
+        }
+        /* Both are closed Atlas vocabularies, checked rather than trusted: they
+         * arrived from a caller, and a caller is not the authority on what an
+         * A6 reason code is. */
+        {
+            atlas_gate_freshness parsed;
+            const char *fresh = atlas_buf_cstr(&op->prior_freshness);
+            if (op->prior_freshness.len == 0 || !atlas_gate_freshness_parse(fresh, &parsed)) {
+                return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                     "a revalidation capability must name the assessment it is "
+                                     "being issued against");
+            }
+            (void)snprintf(c.prior_freshness, sizeof(c.prior_freshness), "%s", fresh);
+            atlas_gate_reason codes[ATLAS_GATE_MAX_REASONS];
+            size_t n = 0;
+            st = atlas_gate_reasons_unpack(atlas_buf_cstr(&op->prior_reasons), codes,
+                                           ATLAS_GATE_MAX_REASONS, &n, err);
+            if (st != ATLAS_OK) {
+                return st;
+            }
+            (void)snprintf(c.prior_reasons, sizeof(c.prior_reasons), "%s",
+                           atlas_buf_cstr(&op->prior_reasons));
+        }
+        (void)snprintf(out->indexed_commit, sizeof(out->indexed_commit), "%s", c.indexed_commit);
+        (void)snprintf(out->evidence_digest, sizeof(out->evidence_digest), "%s",
+                       c.evidence_digest);
+    }
+
     int64_t cid = 0;
     st = atlas_db_decision_challenge_insert(ac->db, &c, &cid, err);
     if (st != ATLAS_OK) {
@@ -1200,6 +1276,127 @@ static atlas_status op_supersede(apply_ctx *ac, const atlas_decision_op *op,
 
 /* --- promoting an A2 proposal ------------------------------------------------ */
 
+/* A6. Records that an operator checked an approved revision against one exact
+ * repository state.
+ *
+ * **Nothing about the decision changes.** No revision is edited, no state
+ * transitions, no `decision_events` row is written, and the previous assessment
+ * is preserved rather than replaced — the point of the record is that a concern
+ * existed and was addressed, and a record that dropped the concern would be a
+ * record of nothing. What changes is the point in history that later
+ * assessments measure their change range from.
+ *
+ * Every rejection the phase requires falls out of the capability plus two
+ * comparisons, and both comparisons are database reads:
+ *
+ *   - replay, expiry, wrong revision, wrong intent, wrong repository and a
+ *     content hash that moved: `spend_challenge`, unchanged from A4;
+ *   - **commit drift**: the indexed head is not what it was when the capability
+ *     was issued, so the operator confirmed against a repository state that is
+ *     no longer the one being recorded;
+ *   - **evidence drift**: the anchors resolve differently from when the
+ *     capability was issued, so what the operator was shown is not what would
+ *     be recorded.
+ *
+ * Neither needs Git and neither needs the filesystem, which is what lets this
+ * run where it must: on the writer thread, inside the transaction that spends
+ * the capability. */
+static atlas_status op_revalidate(apply_ctx *ac, const atlas_decision_op *op,
+                                  atlas_decision_result *out, atlas_err *err) {
+    atlas_decision_challenge c;
+    atlas_decision_challenge_init(&c);
+    atlas_status st = spend_challenge(ac, op, ATLAS_DECISION_INTENT_REVALIDATE, &c, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+
+    /* The revision must still be the effective one. A revalidation of something
+     * that was superseded while the capability was in flight would establish a
+     * validation point for a revision nothing reads. */
+    int64_t current = 0;
+    st = atlas_db_decision_current_revision(ac->db, c.document_id, &current, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (current != c.revision_id) {
+        return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                             "revision %lld is no longer this decision's approved revision; "
+                             "nothing was recorded",
+                             (long long)c.revision_no);
+    }
+
+    /* Commit drift. */
+    if (c.indexed_commit[0] == '\0') {
+        return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                             "that revalidation capability names no repository state");
+    }
+    if (strcmp(c.indexed_commit, ac->repo.scanned_head) != 0) {
+        return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                             "the index moved from %s to %s while this was being confirmed; "
+                             "nothing was recorded",
+                             c.indexed_commit,
+                             ac->repo.scanned_head[0] != '\0' ? ac->repo.scanned_head : "nothing");
+    }
+
+    /* Evidence drift. Recomputed here through the same function that produced
+     * the bound value, so the two cannot differ by being computed differently. */
+    atlas_decision_revision rev;
+    atlas_decision_revision_init(&rev);
+    bool found = false;
+    st = atlas_db_decision_revision_load(ac->db, c.revision_id, &rev, &found, err);
+    if (st == ATLAS_OK && !found) {
+        st = atlas_err_set(err, ATLAS_ERR_INTEGRITY, "that revision is no longer there");
+    }
+    char digest[ATLAS_SHA256_HEX_LEN + 1u];
+    digest[0] = '\0';
+    if (st == ATLAS_OK) {
+        st = atlas_gate_evidence_digest_for(ac->db, ac->repo.id, &rev, digest, err);
+    }
+    atlas_decision_revision_free(&rev);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (strcmp(digest, c.evidence_digest) != 0) {
+        return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                             "the evidence this decision is bound to changed while this was being "
+                             "confirmed; nothing was recorded");
+    }
+
+    atlas_db_gate_validation v;
+    memset(&v, 0, sizeof v);
+    v.document_id = c.document_id;
+    v.revision_id = c.revision_id;
+    v.revision_no = c.revision_no;
+    (void)snprintf(v.content_hash, sizeof v.content_hash, "%s", c.content_hash);
+    v.repo_id = ac->repo.id;
+    (void)snprintf(v.repo_identity_hash, sizeof v.repo_identity_hash, "%s",
+                   atlas_buf_cstr(&ac->repo_identity));
+    (void)snprintf(v.validated_at_commit, sizeof v.validated_at_commit, "%s", c.indexed_commit);
+    (void)snprintf(v.evidence_digest, sizeof v.evidence_digest, "%s", digest);
+    v.challenge_id = c.id;
+    (void)snprintf(v.prior_freshness, sizeof v.prior_freshness, "%s",
+                   c.prior_freshness[0] != '\0' ? c.prior_freshness : "UNKNOWN");
+    (void)snprintf(v.prior_reasons, sizeof v.prior_reasons, "%s", c.prior_reasons);
+    (void)snprintf(v.created_at, sizeof v.created_at, "%s", ac->now);
+
+    int64_t vid = 0;
+    st = atlas_db_gate_validation_insert(ac->db, &v, &vid, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+
+    out->document_id = c.document_id;
+    out->revision_id = c.revision_id;
+    out->revision_no = c.revision_no;
+    /* Unchanged, and said out loud: revalidation is not a transition. */
+    out->state = ATLAS_DECISION_APPROVED;
+    out->validation_id = vid;
+    (void)snprintf(out->content_hash, sizeof(out->content_hash), "%s", c.content_hash);
+    (void)snprintf(out->indexed_commit, sizeof(out->indexed_commit), "%s", c.indexed_commit);
+    (void)snprintf(out->evidence_digest, sizeof(out->evidence_digest), "%s", digest);
+    return atlas_db_decision_uid_of(ac->db, c.document_id, &out->uid, err);
+}
+
 static atlas_status op_promote(apply_ctx *ac, const atlas_decision_op *op,
                                atlas_decision_result *out, atlas_err *err) {
     atlas_decision_revision legacy;
@@ -1327,6 +1524,7 @@ atlas_status atlas_decision_apply_in_tx(atlas_db *db, const atlas_decision_op *o
         case ATLAS_DECISION_OP_REJECT: st = op_reject(&ac, op, out, err); break;
         case ATLAS_DECISION_OP_SUPERSEDE: st = op_supersede(&ac, op, out, err); break;
         case ATLAS_DECISION_OP_PROMOTE: st = op_promote(&ac, op, out, err); break;
+        case ATLAS_DECISION_OP_REVALIDATE: st = op_revalidate(&ac, op, out, err); break;
         }
     }
     atlas_repo_info_free(&ac.repo);

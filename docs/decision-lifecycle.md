@@ -983,3 +983,38 @@ on `DECISION_DOC_SELECT`.
 - Link currency describes Atlas' index, not the repository: `UNKNOWN` means
   Atlas has not looked.
 - The performance figures describe one machine and one synthetic fixture.
+
+
+## A6: revalidation, and what it does not touch
+
+A6 adds one operator action to this lifecycle's surface and **no state** to its
+machine.
+
+`atlas decision revalidate NAME DECISION-ID` records that a human checked an
+already-approved revision against one exact repository state. It reuses the
+operator channel described above without modification — an interactive terminal,
+a short-lived single-use capability bound to this revision and content hash, and
+a confirmation typed against that hash — and adds two bindings of its own: the
+indexed commit, and a digest of what the revision's anchors resolve to. A
+difference in either when the capability is spent is a refusal.
+
+What it does **not** do is the important half:
+
+- it edits no revision, because a revision is immutable and a change is a new
+  revision;
+- it changes no lifecycle status: an approved revision is approved before and
+  after;
+- it appends **no** `decision_events` row, so the ledger replay in
+  `atlas_db_decision_verify` is over exactly the four transitions it was over
+  before, and the status cache is checked the same way;
+- it withdraws nothing: the assessment that prompted it, and its reason codes,
+  are stored beside the new record.
+
+It appends a `decision_validations` row instead — a separate, parallel,
+append-only ledger of a different kind of act. `LOCAL_OPERATOR_CONFIRMED` on one
+of those rows means what it means everywhere else in Atlas: the operator channel
+was used. It does not name a person, does not prove one was present, and is not
+a signature.
+
+See `docs/impact-gates.md` for freshness, the gate, and the full revalidation
+contract, and `docs/data-model.md` for the schema-7 tables.

@@ -378,3 +378,47 @@ The operator types the first eight hex characters of the revision's content
 hash. That is not a secret; it is a value the prompt just displayed. What it
 buys is that the confirmation is about one specific revision's bytes — an
 operator cannot type "yes" and approve whatever happens to be current.
+
+
+## A6: freshness is readable and nothing more
+
+A6 assesses whether an approved decision is still about the code that is there
+now. The whole of what a model may do with that is **read it**.
+
+- One MCP tool, `atlas_gate_check`, forwarding to one RPC method, `gate.check`.
+  Both are reads.
+- There is **no** operation anywhere that clears, overrides, caches, recomputes
+  or otherwise changes a freshness result — not because one is guarded, but
+  because none exists to expose.
+- `decision.revalidate` exists over IPC beside `decision.approve`, and is equally
+  useless without a capability that only the interactive terminal channel can
+  obtain. No MCP tool wraps it and no hook emits it.
+- A6 adds **no** hook event and no automatic-context field. Freshness never
+  enters the automatic envelope: the envelope carries only integers Atlas
+  counted, booleans, closed-vocabulary strings, fixed-length hex and Atlas' own
+  control line, and A4's `decisions_needing_review` count remains the only
+  freshness-adjacent value in it. A surface that wants a verdict asks for one.
+
+`tests/test_gate_trust.c` is the evidence, and it asks the process rather than
+reading the source: it puts every method name such an operation would plausibly
+have to a live daemon and requires every one to fail, checks that no MCP tool
+name carries a mutating verb, and checks that no tool schema declares a `token`,
+a `confirmation`, a `challenge`, a `capability` or a `freshness` argument —
+which, since every schema sets `additionalProperties: false`, means no caller can
+send one.
+
+### What a stale decision looks like to a model
+
+Labelled, and labelled honestly. The result carries the verdict and its reason
+codes from closed Atlas vocabularies, the exact repository state, and the
+decision's own title as `UNTRUSTED_DATA`.
+
+The tool description says what the verdicts do **not** claim: `STALE` and
+`IMPACTED` mean the code a decision is bound to has moved and a human has to look
+again; neither says the decision is wrong, and Atlas has not judged that.
+`UNKNOWN` means Atlas could not prove a safe answer and fails closed.
+
+Approved decision prose is accepted project policy **and** still untrusted data.
+That is A4's rule and A6 does not move it in either direction: a decision that is
+`FRESH` is not thereby more trustworthy as *text*, and one that is `STALE` is not
+thereby less binding as *policy* until a human says so.

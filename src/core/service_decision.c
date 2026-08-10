@@ -855,6 +855,7 @@ static const char *method_for(atlas_decision_op_kind kind) {
     case ATLAS_DECISION_OP_REJECT: return "decision.reject";
     case ATLAS_DECISION_OP_SUPERSEDE: return "decision.supersede";
     case ATLAS_DECISION_OP_PROMOTE: return "decision.promote";
+    case ATLAS_DECISION_OP_REVALIDATE: return "decision.revalidate";
     }
     return "decision.propose";
 }
@@ -885,6 +886,8 @@ static atlas_status op_to_params(const atlas_decision_op *op, atlas_buf *out, at
         {"token", &op->token},            {"confirmation", &op->confirmation},
         {"provider", &op->provider},      {"client", &op->client},
         {"session_key", &op->session_key}, {"dedup_key", &op->dedup_key},
+        {"prior_freshness", &op->prior_freshness},
+        {"prior_reasons", &op->prior_reasons},
         {"title", &op->revision.title},   {"context", &op->revision.context_text},
         {"decision_text", &op->revision.decision_text},
         {"rationale", &op->revision.rationale_text},
@@ -1306,7 +1309,9 @@ atlas_status atlas_service_decision_legacy(atlas_ctx *ctx, const char *repo, int
  * could rewrite what the operator thinks they are agreeing to. */
 static atlas_status show_prompt(atlas_terminal *t, const char *repo, const char *uid,
                                 const atlas_decision_document *doc, atlas_decision_intent intent,
-                                const char *replacement_uid, const char *confirm, atlas_err *err) {
+                                const char *replacement_uid, const char *confirm,
+                                const atlas_gate_assessment *assessment,
+                                const atlas_decision_result *issued, atlas_err *err) {
     atlas_status st = atlas_terminal_writef(
         t, err, "\nAtlas decision %s\n  repository : %s\n  decision   : %s\n",
         atlas_decision_intent_name(intent), repo, uid);
@@ -1376,6 +1381,44 @@ static atlas_status show_prompt(atlas_terminal *t, const char *repo, const char 
             "`atlas doctor` before proceeding.\n";
         st = atlas_terminal_write(t, WARN, sizeof(WARN) - 1u, err);
     }
+    if (st == ATLAS_OK && assessment != NULL) {
+        /* --- A6: what is being revalidated, and against what -----------------
+         *
+         * Every value below is Atlas-owned: two closed vocabularies, two object
+         * ids Atlas minted or read from its own index, and integers it counted.
+         * No repository prose reaches this block, which is why it can be
+         * printed as Atlas' own statement rather than labelled untrusted the
+         * way the title and the decision text above are.
+         *
+         * The wording is careful in the direction the phase requires. A stale
+         * assessment is a statement about anchors that moved, not a finding
+         * that the decision was wrong — so the prompt says what changed and
+         * declines to say what it means. */
+        st = atlas_terminal_writef(
+            t, err,
+            "\n  freshness  : %s\n  because    : %s\n  validated  : %s\n  against    : %s\n",
+            atlas_gate_freshness_name(assessment->freshness),
+            assessment->reason_count > 0 ? atlas_gate_reason_name(assessment->reasons[0])
+                                         : "NO_RELEVANT_CHANGE",
+            assessment->validated_at_commit[0] != '\0' ? assessment->validated_at_commit
+                                                       : "no recorded validation point",
+            issued != NULL && issued->indexed_commit[0] != '\0' ? issued->indexed_commit
+                                                                : "an unindexed repository");
+        for (size_t i = 1; st == ATLAS_OK && i < assessment->reason_count; i++) {
+            st = atlas_terminal_writef(t, err, "               %s\n",
+                                       atlas_gate_reason_name(assessment->reasons[i]));
+        }
+        if (st == ATLAS_OK) {
+            static const char WHAT[] =
+                "\nRevalidating records that this decision was checked against the repository\n"
+                "state above. It does not edit the approved revision, does not change its\n"
+                "status, and does not withdraw the assessment — the assessment and its reasons\n"
+                "are kept alongside the new record. Atlas has not judged whether the decision\n"
+                "is still correct and cannot: it observed that what the decision is bound to\n"
+                "has moved, and that is the whole of what it is telling you.\n";
+            st = atlas_terminal_write(t, WHAT, sizeof(WHAT) - 1u, err);
+        }
+    }
     if (st == ATLAS_OK) {
         /* Atlas' own statement about what the operator is about to record.
          * It is here rather than only in the documentation because this is the
@@ -1411,11 +1454,47 @@ atlas_status atlas_service_decision_confirm(atlas_ctx *ctx, const char *repo, co
         return st;
     }
 
+    /* --- A6: the assessment being revalidated ------------------------------
+     *
+     * Computed before the capability is issued, and carried into it, so that
+     * what the validation record preserves is what the operator was actually
+     * shown. Recomputing it at the write point would record whatever was true a
+     * moment later, which is not what anybody confirmed.
+     *
+     * Nothing here can produce an assessment: this reads the same engine
+     * `atlas gate check` reads, through the same snapshot discipline, and its
+     * result is displayed rather than acted on. */
+    atlas_gate_report assessment;
+    atlas_gate_report_init(&assessment);
+    if (intent == ATLAS_DECISION_INTENT_REVALIDATE) {
+        st = atlas_service_gate_show(ctx, repo, uid, NULL, &assessment, err);
+        if (st != ATLAS_OK) {
+            atlas_gate_report_free(&assessment);
+            atlas_terminal_close(t);
+            return st;
+        }
+    }
+
     /* Issue the capability. */
     atlas_decision_op *op = op_new(ATLAS_DECISION_OP_CHALLENGE);
     if (op == NULL) {
+        atlas_gate_report_free(&assessment);
         atlas_terminal_close(t);
         return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory");
+    }
+    if (intent == ATLAS_DECISION_INTENT_REVALIDATE && assessment.item_count == 1) {
+        st = atlas_buf_set_str(&op->prior_freshness,
+                               atlas_gate_freshness_name(assessment.items[0].freshness), err);
+        if (st == ATLAS_OK) {
+            st = atlas_gate_reasons_pack(&assessment.items[0], &op->prior_reasons, err);
+        }
+        if (st != ATLAS_OK) {
+            atlas_decision_op_free(op);
+            free(op);
+            atlas_gate_report_free(&assessment);
+            atlas_terminal_close(t);
+            return st;
+        }
     }
     st = atlas_buf_set_str(&op->repo_name, repo, err);
     if (st == ATLAS_OK) {
@@ -1429,6 +1508,7 @@ atlas_status atlas_service_decision_confirm(atlas_ctx *ctx, const char *repo, co
     if (st != ATLAS_OK) {
         atlas_decision_op_free(op);
         free(op);
+        atlas_gate_report_free(&assessment);
         atlas_terminal_close(t);
         return st;
     }
@@ -1438,6 +1518,7 @@ atlas_status atlas_service_decision_confirm(atlas_ctx *ctx, const char *repo, co
     st = apply_op(ctx, op, &issued, &via, err);
     if (st != ATLAS_OK) {
         atlas_decision_result_free(&issued);
+        atlas_gate_report_free(&assessment);
         atlas_terminal_close(t);
         return st;
     }
@@ -1448,7 +1529,11 @@ atlas_status atlas_service_decision_confirm(atlas_ctx *ctx, const char *repo, co
     atlas_decision_document_init(&doc);
     st = atlas_service_decision_show(ctx, repo, uid, issued.revision_no, &doc, err);
     if (st == ATLAS_OK) {
-        st = show_prompt(t, repo, uid, &doc, intent, replacement_uid, issued.confirm, err);
+        st = show_prompt(t, repo, uid, &doc, intent, replacement_uid, issued.confirm,
+                         intent == ATLAS_DECISION_INTENT_REVALIDATE && assessment.item_count == 1
+                             ? &assessment.items[0]
+                             : NULL,
+                         &issued, err);
     }
 
     atlas_buf answer = ATLAS_BUF_INIT;
@@ -1461,6 +1546,7 @@ atlas_status atlas_service_decision_confirm(atlas_ctx *ctx, const char *repo, co
     atlas_terminal_close(t);
     t = NULL;
     atlas_decision_document_free(&doc);
+    atlas_gate_report_free(&assessment);
     if (st != ATLAS_OK) {
         atlas_buf_free(&answer);
         atlas_decision_result_free(&issued);
@@ -1483,6 +1569,7 @@ atlas_status atlas_service_decision_confirm(atlas_ctx *ctx, const char *repo, co
         [ATLAS_DECISION_INTENT_APPROVE] = ATLAS_DECISION_OP_APPROVE,
         [ATLAS_DECISION_INTENT_REJECT] = ATLAS_DECISION_OP_REJECT,
         [ATLAS_DECISION_INTENT_SUPERSEDE] = ATLAS_DECISION_OP_SUPERSEDE,
+        [ATLAS_DECISION_INTENT_REVALIDATE] = ATLAS_DECISION_OP_REVALIDATE,
     };
     atlas_decision_op *spend = op_new(KIND[intent]);
     if (spend == NULL) {

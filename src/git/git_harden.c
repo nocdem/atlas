@@ -179,7 +179,8 @@ const char *const *atlas_git_cmd_flags(atlas_git_cmd_kind kind) {
 }
 
 atlas_status atlas_git_build_argv(const char **argv, size_t argv_cap, size_t *n, const char *exe,
-                                  const char *root, atlas_err *err) {
+                                  const char *root, char *safedir, size_t safedir_cap,
+                                  atlas_err *err) {
 #define PUSH(v)                                                                       \
     do {                                                                              \
         if (*n + 2u >= argv_cap) {                                                     \
@@ -194,6 +195,45 @@ atlas_status atlas_git_build_argv(const char **argv, size_t argv_cap, size_t *n,
          * directory. */
         PUSH("-C");
         PUSH(root);
+
+        /* The trusted safe-directory declaration, and the one thing that lets a
+         * service account read a repository owned by somebody else.
+         *
+         * Git refuses a repository whose owner is not the calling euid unless
+         * `safe.directory` names it. A7.1 split the principals — the daemon runs
+         * as `atlasd`, the repositories are owned by the operator — and that
+         * refusal silently stopped all indexing: 1 030 warnings, and every
+         * registered repository serving a scan taken before the cutover.
+         *
+         * The declaration here is safe because of *where the value comes from*.
+         * It is the canonical root Atlas resolved from its own registry — never
+         * request text, never a worker message, never an environment variable,
+         * never a config file. It names exactly one directory, and git checks it
+         * exactly: a declaration for one path does not admit another, which
+         * `tests/test_git_hardening.c` asserts.
+         *
+         * Note for anyone who reads the older comment in `git.c`: it claimed git
+         * ignores `safe.directory` from `-c`. That is **not true of git 2.39.5**,
+         * measured directly on this host — the bare invocation refuses, the `-c`
+         * invocation succeeds, and a `-c` naming a different directory still
+         * refuses. The claim has been corrected rather than worked around.
+         *
+         * Global and system configuration remain unread: GIT_CONFIG_GLOBAL and
+         * GIT_CONFIG_SYSTEM stay /dev/null and GIT_CONFIG_NOSYSTEM stays 1, so
+         * an operator's or a repository's own `safe.directory` still cannot
+         * influence anything. This is the only declaration, and Atlas writes
+         * it. */
+        if (safedir == NULL || safedir_cap == 0) {
+            return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                                 "a repository invocation needs a safe.directory buffer");
+        }
+        int wrote = snprintf(safedir, safedir_cap, "safe.directory=%s", root);
+        if (wrote < 0 || (size_t)wrote >= safedir_cap) {
+            return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                                 "the repository path is too long to declare safely");
+        }
+        PUSH("-c");
+        PUSH(safedir);
     }
 
     /* Flags, where the git version supports them. All three are present in every

@@ -17,6 +17,7 @@
 #include <stdint.h>
 
 #include "atlas/buf.h"
+#include "atlas/proc.h"
 #include "atlas/error.h"
 #include "atlas/limits.h"
 
@@ -243,5 +244,63 @@ bool atlas_git_argv_is_readonly(const char *const *argv, const char **reason_out
 /* Maps a raw git name-status letter to the Atlas change type recorded in the
  * index: add, modify, delete, rename, copy, typechange, unmerged or unknown. */
 const char *atlas_git_change_type_name(char kind);
+
+
+/* --- A8: trusted source snapshotting -------------------------------------
+ *
+ * Three reads used only by the dispatcher, to materialise an exact commit into
+ * a worker-owned directory. All three go through the same hardened invocation
+ * path as every other git call in Atlas: constructed environment, the `-c`
+ * prefix that disables fsmonitor, hooks, external diff, pagers and transports,
+ * and the read-only subcommand allowlist.
+ *
+ * They exist so that a snapshot needs **no git metadata in the workspace at
+ * all**. There is no `.git` under a job's tree, so there is no repository
+ * configuration to be hostile, no hook to run, no alternate to point at the
+ * source's object store, no index to lock, and no submodule or LFS machinery to
+ * invoke. What the worker gets is a directory of ordinary files.
+ */
+
+/* One entry of `git ls-tree -r -z`. `mode` is the raw octal string, so a caller
+ * can refuse a symlink (120000) or a gitlink (160000) by naming it rather than
+ * by inferring it. `path` is raw bytes and may be any length; it is NOT
+ * NUL-terminated beyond `path_len`. */
+typedef struct atlas_git_tree_entry {
+    const char *mode;
+    const char *type;
+    const char *oid;
+    const void *path;
+    size_t path_len;
+} atlas_git_tree_entry;
+
+typedef atlas_status (*atlas_git_tree_cb)(const atlas_git_tree_entry *e, void *ud,
+                                          atlas_err *err);
+
+/* Lists every entry reachable from `commit`, recursively. Refuses a commit that
+ * is not an exact 40- or 64-character object id: a snapshot of a moving
+ * reference is not a snapshot. */
+atlas_status atlas_git_ls_tree(atlas_git *g, const char *commit, atlas_git_tree_cb cb, void *ud,
+                               atlas_err *err);
+
+/* Resolves a commit to its tree object id, and in doing so proves the commit
+ * exists *in this repository*. A commit that resolves elsewhere is not this
+ * project's history, and snapshotting it as though it were is the mistake this
+ * call exists to prevent. */
+atlas_status atlas_git_commit_tree(atlas_git *g, const char *commit, atlas_buf *out,
+                                   atlas_err *err);
+
+/* Streams one blob's bytes to `sink`, refusing anything larger than `max`. */
+atlas_status atlas_git_cat_blob(atlas_git *g, const char *oid, atlas_proc_sink sink,
+                                void *sink_ud, size_t max, atlas_err *err);
+
+/* `git diff --no-index` between two directories, with no repository context at
+ * all — this is how a patch is produced from a pristine snapshot and a modified
+ * worktree without ever creating a repository inside the workspace.
+ *
+ * Both paths must be absolute. A non-zero exit means "there were differences",
+ * which is the ordinary case and is not an error; `differed_out` reports it. */
+atlas_status atlas_git_diff_no_index(const char *a, const char *b, atlas_proc_sink sink,
+                                     void *sink_ud, size_t max, bool *differed_out,
+                                     atlas_err *err);
 
 #endif /* ATLAS_GIT_H */

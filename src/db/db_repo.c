@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "atlas/atlas.h"
+#include "atlas/orch_ops.h"
 #include "atlas/pathrep.h"
 
 /* Column order shared by every repository query. */
@@ -489,6 +490,23 @@ atlas_status atlas_db_repo_remove(atlas_db *db, const char *name, bool *removed,
         return st;
     }
     st = atlas_db_decision_forget_legacy_origins(db, name, NULL, err);
+
+    /* A8 job records hold `repo_id` as a soft reference and do not cascade, for
+     * the same reason A4 documents do not: an FK would make `repo remove --yes`
+     * destroy execution history. But `repositories.id` is a reused rowid, so the
+     * pointer is cleared here — while the repository still exists to be named —
+     * and in the same transaction as the delete. `repo_identity_hash` stays: it
+     * is what the history is about. */
+    if (st == ATLAS_OK) {
+        atlas_repo_info ri;
+        atlas_repo_info_init(&ri);
+        bool found = false;
+        st = atlas_db_repo_get(db, name, &ri, &found, err);
+        if (st == ATLAS_OK && found) {
+            st = atlas_db_orch_forget_repo(db, ri.id, err);
+        }
+        atlas_repo_info_free(&ri);
+    }
 
     sqlite3_stmt *stmt = NULL;
     /* ON DELETE CASCADE removes scans, files, commits, changes, compile

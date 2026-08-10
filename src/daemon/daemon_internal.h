@@ -17,6 +17,9 @@
 #include "atlas/daemon.h"
 #include "atlas/db.h"
 #include "atlas/decision_ops.h"
+#include "atlas/orch_ops.h"
+#include "atlas/orchpolicy.h"
+#include "atlas/snapshot.h"
 #include "atlas/syspolicy.h"
 #include "atlas/error.h"
 #include "atlas/limits.h"
@@ -57,7 +60,25 @@ typedef enum atlas_job_kind {
      * operator channel authorises — a challenge is a write, so issuing one is a
      * writer job too. There is no path to `atlas_decision_apply` that does not
      * run on the writer thread. */
-    ATLAS_JOB_DECISION
+    ATLAS_JOB_DECISION,
+    /* A8. One job kind carrying one typed orchestration operation, for exactly
+     * the reasons ATLAS_JOB_AI and ATLAS_JOB_DECISION are one each: validation
+     * and policy happen at the IPC edge before anything is queued, and the
+     * writer's switch stays a switch rather than becoming a second dispatch
+     * table that can drift from the first.
+     *
+     * Every orchestration write comes through here, including the recovery
+     * sweep the daemon's own timer drives — a sweep is a write, so it is a
+     * writer job too. There is no path to `atlas_orch_apply` inside the daemon
+     * that does not run on the writer thread. The sweep is pure database work,
+     * which is what makes it legal there: A1 forbids creating a process or
+     * reading a file inside a write transaction, and recovery does neither. */
+    ATLAS_JOB_ORCH,
+    /* A8. Snapshot enumeration writes the manifest, so it runs on the writer
+     * thread like every other write. It creates a git process, which A1 forbids
+     * *inside a transaction* — so `atlas_snapshot_open` opens its transaction
+     * only around the rows, after the reads it needs. */
+    ATLAS_JOB_SNAPSHOT
 } atlas_job_kind;
 
 typedef struct atlas_job atlas_job;
@@ -108,6 +129,16 @@ struct atlas_job {
      * and the result is typed rather than a JSON fragment. */
     atlas_decision_op *decision;
     atlas_decision_result decision_result;
+
+    /* A8. Same ownership rule as `ai` and `decision`: the job owns the
+     * operation and frees it, and the result is typed rather than a JSON
+     * fragment. */
+    atlas_orch_op *orch;
+    atlas_orch_result orch_result;
+
+    /* A8 snapshot enumeration. */
+    int64_t snapshot_attempt_id;
+    struct atlas_snapshot_meta *snapshot_meta;
 };
 
 /* What a completed mutation reports back. */
@@ -168,6 +199,17 @@ atlas_status atlas_writer_ai(atlas_writer *w, atlas_ai_op *op, int timeout_ms,
  * caller has exactly one thing to do with it — the same contract
  * `atlas_writer_ai` has, and for the same reason: an ownership rule that
  * depends on the outcome is one that leaks on the path nobody tests. */
+/* A8. Ownership of `op` is taken unconditionally, as everywhere else: a caller
+ * that has to free the operation on some paths and not others eventually frees
+ * it on the wrong one. */
+atlas_status atlas_writer_orch(atlas_writer *w, atlas_orch_op *op, int timeout_ms,
+                               atlas_orch_result *result, atlas_err *err);
+
+/* A8. Enumerates and persists one attempt's snapshot manifest on the writer
+ * thread. Idempotent per attempt. */
+atlas_status atlas_writer_snapshot(atlas_writer *w, int64_t attempt_id, int timeout_ms,
+                                   struct atlas_snapshot_meta *out, atlas_err *err);
+
 atlas_status atlas_writer_decision(atlas_writer *w, atlas_decision_op *op, int timeout_ms,
                                    atlas_decision_result *result, atlas_err *err);
 
@@ -222,6 +264,12 @@ typedef struct atlas_server_ctx {
      * about. Legacy per-user mode leaves this zeroed, which permits nobody
      * beyond the daemon's own uid. */
     atlas_syspolicy syspolicy;
+    /* A8. Loaded once at startup, for the reason the system policy is: the set
+     * of repositories, drivers, modes and principals orchestration runs under
+     * cannot change under a running serve loop, so a policy edit takes effect on
+     * restart and an operator can reason about when. A disabled policy — the
+     * zeroed default — leaves every orchestration method refusing. */
+    atlas_orchpolicy orchpolicy;
 } atlas_server_ctx;
 
 /* Serves until `stop` becomes true. `listen_fd` is owned by the caller. */
@@ -231,6 +279,7 @@ atlas_status atlas_server_serve(atlas_server_ctx *ctx, int listen_fd, int signal
 /* Handles one request payload and produces one response payload. Exposed so the
  * protocol can be tested without a socket. */
 atlas_status atlas_server_dispatch(atlas_server_ctx *ctx, const void *payload, size_t len,
+                                   int64_t peer_uid, int64_t peer_pid,
                                    atlas_buf *response, atlas_err *err);
 
 /* --- logging ------------------------------------------------------------- */

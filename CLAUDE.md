@@ -1,7 +1,11 @@
 # Atlas — working notes for Claude Code
 
 Atlas is a generic, headless engineering-memory and repository-intelligence CLI in
-C17. Phase **A7.1**: OS authority separation — the daemon runs as `atlasd` and
+C17. Phase **A8**: the durable orchestration control plane — a job queue, an
+explicit state machine, expiring leases, crash recovery, an unprivileged
+dispatcher running as `atlas-worker`, isolated per-attempt workspaces, bounded
+command execution and a versioned driver interface. See `docs/orchestration.md`.
+On top of A7.1: OS authority separation — the daemon runs as `atlasd` and
 solely owns the index and backups, `atlas-worker` is the untrusted account every
 persistent model process runs as, and a root-owned policy decides who may open
 the shared socket. On top of the A7 dedicated security review and trust-boundary
@@ -934,6 +938,157 @@ docs/security A7_1_THREAT_MODEL.md, A7_1_OPERATIONS.md
   `/opt/swapper` except to read.** Dry-run is the default and `--apply` is a
   second deliberate invocation.
 
+## A8 layers — additions
+
+```
+src/orch      orch.c (the vocabularies, the state machine, the canonical job
+              digest, the identifiers), policy.c (the root-owned orchestration
+              policy)
+src/db        db_orch.c (the one write point over the migration-8 tables, and
+              the bounded reads)
+src/ipc       server_orch.c (two disjoint method groups, selected by the peer's
+              uid from SO_PEERCRED)
+src/orch      workspace.c (the per-attempt tree, the snapshot, artifacts,
+              bounded removal, redaction), driver.c (the versioned driver
+              interface, the deterministic fake and the Claude Code driver),
+              dispatch.c (the loop that runs as `atlas-worker`)
+src/core      service_orch.c (the `job` and `dispatcher` commands),
+              proc.c gains an idle bound, a cancel callback and a working
+              directory — the one process-creation path, extended not duplicated
+src/git       git.c gains ls-tree, cat-file blob and diff --no-index, the three
+              reads a snapshot needs
+deploy/a8     atlas-dispatcher.service, orchestration.conf.template
+scripts       a8-deploy.sh, a8-rollback.sh
+docs          orchestration.md
+```
+
+`docs/orchestration.md` ends with a status section naming exactly what exists
+and what is deferred; keep it truthful. Applying a patch, committing, pushing,
+branching and every GitHub verb are **absent rather than refused**, and their
+absence is the deferral.
+
+## A8 rules — these are not negotiable
+
+- **A completed job is not an authority.** It approves nothing, applies nothing
+  and commits nothing. The patch is an artifact with a recorded digest, and
+  there is no code path that applies it to a registered repository. A7's
+  lifecycle authority is untouched: no orchestration method mints or spends a
+  capability. `tests/test_orch_rpc.c` asks a live daemon for every name such a
+  method would plausibly have — including `job.apply`, `job.commit`,
+  `job.push` and `job.merge` — and requires every one to answer `unknown
+  method`. Their absence is the deferral.
+- **`atlas_orch_apply_in_tx` is the only function that writes an orchestration
+  row.** The transition check, the lease check, the attempt allocation, the
+  ledger append and the status-cache update all live behind it, and every one
+  would be bypassable if a second path reached the tables. It has exactly one
+  caller. That is the rule `settle()`, `atlas_db_evidence_insert` and
+  `atlas_decision_apply_in_tx` follow.
+- **Every state change is a compare-and-swap that names the state it observed**,
+  and requires exactly one changed row — A4's rule, so a concurrent transition
+  loses deterministically instead of last-write-wins.
+- **Ordering is the ledger's AUTOINCREMENT id, never a timestamp.** Wall-clock
+  times are evidence. The single decision that is genuinely about time is
+  whether a lease has expired.
+- **UNKNOWN is zero and DISABLED is zero**, for the reason A6 keeps UNKNOWN and
+  BLOCKED there. A `memset` must not produce a runnable job or an enabled
+  policy. The schema enforces it independently: every state CHECK omits
+  `UNKNOWN`.
+- **There is no edge from CANCEL_REQUESTED to SUCCEEDED.** That is how
+  "completion and cancellation cannot both win" is decided by the machine rather
+  than by whichever message arrived first. Do not add one.
+- **At most one unreleased lease per job is a schema constraint**, a partial
+  unique index, not care — the shape A4 uses for "at most one approved revision
+  per document". It is what makes concurrent execution a hard failure.
+- **A lease token is never stored.** Only a domain-separated digest of it is,
+  and the token leaves the daemon once, at grant. A worker is identified by its
+  token and by nothing else; its claimed pid and uid are recorded as claims and
+  used for nothing, because a client describing itself is not evidence about
+  itself.
+- **The two RPC groups are selected by SO_PEERCRED and by nothing else**, and
+  they are disjoint rather than nested. A name in the group a peer is not in
+  answers `unknown method`, the same as a name that does not exist: a refusal
+  that distinguished "you may not" from "there is no such thing" would tell a
+  caller what to try next. A7.1's "the socket carries no authority" still holds
+  — the dispatcher group confers none, and membership is a root-owned fact.
+- **`ATLAS_ORCHPOLICY_PATH` is a compiled-in constant**, like
+  `ATLAS_AUTHORITY_POLICY_PATH` and `ATLAS_SYSPOLICY_PATH`, and for the same
+  reason. An unrecognised key is an error, not something skipped.
+- **Bounds refuse, never clamp.** A5's rule about `--older-than`: a discarded
+  number nobody is told about produces a job unlike the one that was asked for.
+- **A validation command is a vector of counted arguments, never a string.**
+  There is no field in the protocol that could hold a shell fragment. Shell
+  syntax in *task text* is explicitly allowed and must stay allowed — nothing
+  passes it to a shell, and refusing a dollar sign would imply the opposite.
+- **Orchestration tables are CANONICAL and none is prunable.** Nothing rebuilds
+  a job record; the repository never held it. `RETENTION[]` carries a written
+  reason for each of the eight.
+- **`orch_jobs.repo_id` is a soft reference with no foreign key**, and it is
+  cleared inside `atlas_db_repo_remove`'s transaction. `repositories.id` is a
+  reused rowid; a pointer left behind would eventually name a different
+  repository. That is the A4 defect, and it is not repeated.
+
+- **The daemon reads registered repositories; the worker never does.**
+  `atlasd` enumerates the committed tree and streams a canonical bounded
+  snapshot over the socket; the dispatcher unit sets `InaccessiblePaths=/opt`.
+  A8's first cut had the worker read the repository itself, which required the
+  untrusted account to hold a read path to `/opt` and, on a machine where the
+  repositories belong to somebody else, git refused outright. Do not reintroduce
+  worker-side repository access in any form.
+- **Every repository invocation carries `-c safe.directory=<canonical root>`,**
+  built from the path Atlas resolved from its own registry and from nothing
+  else. Global and system config stay unread, so an operator's or a
+  repository's own declaration cannot influence anything. **The older claim that
+  git ignores `safe.directory` from `-c` is wrong for git 2.39.5** — measured
+  directly — and believing it left the A7.1 daemon unable to open any registered
+  repository for the whole of its deployment.
+- **A snapshot carries no git metadata.** No `.git` under an attempt, so there
+  is no hostile configuration, no hook, no alternate, no index and no submodule
+  or LFS machinery. A tracked symlink is refused and counted, never recreated; a
+  gitlink is refused at listing time. Do not "add submodule support" by
+  initialising one — that is a new phase's argument, not a flag.
+- **A workspace path is never taken from anywhere but Atlas.** A validated
+  worker root, an Atlas-generated job id, an integer attempt. Every descent is
+  `openat` with `O_NOFOLLOW` from a descriptor validated once, never a path
+  re-resolved from a string. There is no "remove this path recursively"
+  primitive and there must not be one.
+- **`atlas_proc_run` is still the only process-creation path.** A8 extended it
+  with an idle bound, a cancel callback and a working directory rather than
+  writing a second runner. Adding a second fork/exec anywhere would break the
+  rule the whole git-safety argument rests on.
+- **Cancellation is asked for, never signalled.** The daemon has no path into
+  the worker's process tree, by design; a running child learns of a cancellation
+  through the dispatcher's heartbeat. Do not add a signal path.
+- **A zero exit is not a success claim.** A driver that exits zero having
+  produced something that is not a result document is `MALFORMED_RESULT`. The
+  check is structural and deliberately shallow: a model's output is never parsed
+  as authority.
+- **Log redaction is a mitigation and must be described as one.** It catches
+  shapes it knows. The real defence is that no credential is ever placed in a
+  workspace, an environment or a job specification. Never write "logs are
+  redacted" without that second sentence.
+- **The Claude driver uses a root-installed service credential or nothing.**
+  `/etc/atlas/claude.env`, root-owned, reached through `atlas_rootpath_open`.
+  Atlas never creates it, never prints it, and never reaches for an operator's
+  personal session — and `live_model` must be on as well, so there are two
+  independent gates.
+
+## Extending A8 safely
+
+- **A new state** means editing `atlas_orch_state`, both schema CHECKs,
+  `atlas_orch_transition_allowed`, and the enumerated table in
+  `tests/test_orch_model.c`, which checks all 144 pairs. The transition table is
+  a *function* precisely so a test cannot pass by agreeing with a second copy.
+- **A new RPC method** goes in one of the two tables in `server_orch.c`, and
+  which table is the security decision. If it is plausibly an authority or
+  mutation verb, add its name to the negative enumeration in
+  `tests/test_orch_rpc.c`.
+- **A new field in the job digest** changes what every stored `spec_digest`
+  means, so it invalidates every idempotency record. Bump
+  `ATLAS_ORCH_SPEC_DOMAIN`, and add a row to the table in
+  `docs/orchestration.md` with a reason.
+- **A new policy key** means a branch in `atlas_orchpolicy_load_at`, a field, a
+  documented line, and a malformed-matrix case. An unknown key stays an error.
+
 ## Extending A7.1 safely
 
 - **A new policy key** means a branch in `atlas_syspolicy_load_at`, a field, a
@@ -1260,7 +1415,8 @@ two documents on stdout.
 `docs/code-intelligence.md` · `docs/decision-lifecycle.md` ·
 `docs/operations.md` · `docs/impact-gates.md` ·
 `docs/security/A7_THREAT_MODEL.md` · `docs/security/A7_SECURITY_REVIEW.md` ·
-`docs/security/A7_1_THREAT_MODEL.md` · `docs/security/A7_1_OPERATIONS.md` · `docs/git-safety.md` · `docs/daemon-and-ipc.md` ·
+`docs/security/A7_1_THREAT_MODEL.md` · `docs/security/A7_1_OPERATIONS.md` ·
+`docs/orchestration.md` · `docs/git-safety.md` · `docs/daemon-and-ipc.md` ·
 `docs/watcher-consistency.md` · `docs/systemd-user-service.md` ·
 `docs/ai-trust-boundary.md` · `docs/claude-integration.md` ·
 `docs/backlog.md` · `docs/roadmap.md` ·

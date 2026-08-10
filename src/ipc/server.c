@@ -585,7 +585,8 @@ static const atlas_method_entry METHODS[] = {
 };
 
 atlas_status atlas_server_dispatch(atlas_server_ctx *ctx, const void *payload, size_t len,
-                                   atlas_buf *response, atlas_err *err) {
+                                   int64_t peer_uid, int64_t peer_pid, atlas_buf *response,
+                                   atlas_err *err) {
     atlas_ipc_request *req = NULL;
     atlas_err perr;
     atlas_err_init(&perr);
@@ -636,6 +637,25 @@ atlas_status atlas_server_dispatch(atlas_server_ctx *ctx, const void *payload, s
             }
         }
     }
+    /* A8: two groups, and which one is consulted depends on the peer's uid from
+     * SO_PEERCRED. A name in the group this peer is not in is simply not found,
+     * so an ordinary client asking for `dispatch.lease` gets `unknown method` —
+     * the same answer as for a name that does not exist at all. That is
+     * deliberate: a refusal that distinguishes "you may not" from "there is no
+     * such thing" tells a caller what to try next. */
+    if (fn == NULL) {
+        size_t n = 0;
+        const atlas_method_entry *g =
+            atlas_orchpolicy_is_dispatcher(&ctx->orchpolicy, (long long)peer_uid)
+                ? atlas_server_orch_dispatch_methods(&n)
+                : atlas_server_orch_client_methods(&n);
+        for (size_t i = 0; i < n; i++) {
+            if (strcmp(atlas_ipc_request_method(req), g[i].name) == 0) {
+                fn = g[i].fn;
+                break;
+            }
+        }
+    }
     if (fn == NULL) {
         atlas_err merr;
         atlas_err_init(&merr);
@@ -655,6 +675,8 @@ atlas_status atlas_server_dispatch(atlas_server_ctx *ctx, const void *payload, s
     dispatch_state ds;
     memset(&ds, 0, sizeof(ds));
     ds.ctx = ctx;
+    ds.peer_uid = peer_uid;
+    ds.peer_pid = peer_pid;
     atlas_safe_pool_init(&ds.safe);
     atlas_err derr;
     atlas_err_init(&derr);
@@ -733,6 +755,14 @@ atlas_status atlas_server_dispatch(atlas_server_ctx *ctx, const void *payload, s
 
 typedef struct client {
     int fd;
+    /* The kernel's answer about this peer, recorded once at accept time and
+     * never re-derived. A8 selects a method group on it — the dispatcher's
+     * orchestration methods are reachable only from the uid a root-owned policy
+     * names — so it must come from SO_PEERCRED and from nowhere else. Re-reading
+     * it from /proc, or believing a uid in a request body, would put the choice
+     * of method group in the caller's hands. */
+    int64_t peer_uid;
+    int64_t peer_pid;
     /* Read side: a frame arrives in two stages, header then payload, and either
      * can arrive one byte at a time. */
     unsigned char head[ATLAS_IPC_HEADER_BYTES];
@@ -752,9 +782,11 @@ typedef struct client {
     int64_t write_deadline_ms;
 } client;
 
-static void client_init(client *c, int fd) {
+static void client_init(client *c, int fd, int64_t peer_uid, int64_t peer_pid) {
     memset(c, 0, sizeof(*c));
     c->fd = fd;
+    c->peer_uid = peer_uid;
+    c->peer_pid = peer_pid;
     atlas_buf_init(&c->payload);
     atlas_buf_init(&c->out);
 }
@@ -913,7 +945,8 @@ static bool client_step_read(atlas_server_ctx *ctx, client *c, int64_t now, atla
         atlas_buf response = ATLAS_BUF_INIT;
         atlas_err derr;
         atlas_err_init(&derr);
-        bool ok = (atlas_server_dispatch(ctx, c->payload.data, c->payload.len, &response, &derr) ==
+        bool ok = (atlas_server_dispatch(ctx, c->payload.data, c->payload.len, c->peer_uid,
+                                         c->peer_pid, &response, &derr) ==
                    ATLAS_OK);
         if (ok && response.len > ATLAS_IPC_MAX_RESPONSE_BYTES) {
             /* Never truncated. A response that does not fit is a structured
@@ -1002,10 +1035,11 @@ atlas_status atlas_server_serve(atlas_server_ctx *ctx, int listen_fd, int signal
             for (;;) {
                 int cfd = -1;
                 int64_t peer_pid = 0;
+                int64_t peer_uid = 0;
                 atlas_err aerr;
                 atlas_err_init(&aerr);
-                atlas_status ast =
-                    atlas_ipc_accept(listen_fd, &ctx->syspolicy, &cfd, &peer_pid, &aerr);
+                atlas_status ast = atlas_ipc_accept(listen_fd, &ctx->syspolicy, &cfd, &peer_pid,
+                                                    &peer_uid, &aerr);
                 if (ast != ATLAS_OK) {
                     /* A refused peer is logged and the loop continues: one
                      * rejected connection must not stop the daemon serving. */
@@ -1025,7 +1059,7 @@ atlas_status atlas_server_serve(atlas_server_ctx *ctx, int listen_fd, int signal
                     (void)close(cfd);
                     continue;
                 }
-                client_init(&clients[nclients], cfd);
+                client_init(&clients[nclients], cfd, peer_uid, peer_pid);
                 nclients++;
             }
         }

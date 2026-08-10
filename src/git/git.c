@@ -77,6 +77,13 @@ struct atlas_git {
  * positive allowlist of complete argument vectors below. */
 static const char *const READONLY_SUBCOMMANDS[] = {
     "rev-parse", "ls-files", "log", "status", "diff", "symbolic-ref", "cat-file", "config",
+    /* A8. `ls-tree` reads a commit's tree and writes stdout; it is in the same
+     * class as `cat-file`, which was already here. It opens no new vector: it
+     * runs no helper, consults no working tree and touches no index — the
+     * fsmonitor, hook, external-diff and textconv routes are closed by the `-c`
+     * prefix and the constructed environment for every subcommand alike, and
+     * `tests/test_git_hardening.c` exercises it against a hostile repository. */
+    "ls-tree",
 };
 
 /* The only `git config` invocations Atlas may ever make.
@@ -183,9 +190,17 @@ deny:
 /* --- invocation --------------------------------------------------------- */
 
 /* Recognises the ownership refusal so it can be reported as something the user
- * can act on rather than as an opaque git failure. Atlas cannot use
- * `-c safe.directory=...` for this: git deliberately ignores safe.directory
- * unless it comes from a system or global config file, and Atlas reads neither. */
+ * can act on rather than as an opaque git failure.
+ *
+ * **Corrected in A8.** This comment used to say Atlas could not use
+ * `-c safe.directory=...` because git ignores it outside system or global
+ * config. Measured on git 2.39.5 on this host, that is false: the bare
+ * invocation refuses, the `-c` invocation succeeds, and a `-c` naming a
+ * different directory still refuses. Every repository invocation now carries a
+ * declaration for the exact canonical root Atlas resolved — see the push in
+ * `atlas_git_build_argv` — so this refusal should now only be reachable when a
+ * path outside the registry is opened. It is kept because that case is real and
+ * deserves a message a person can act on. */
 static bool stderr_is_dubious_ownership(const char *text) {
     return strstr(text, "dubious ownership") != NULL || strstr(text, "safe.directory") != NULL;
 }
@@ -196,8 +211,11 @@ static atlas_status git_run(atlas_git *g, atlas_git_cmd_kind kind, const char *c
                             atlas_err *err) {
     const char *argv[ATLAS_GIT_ARGV_MAX];
     size_t n = 0;
+    /* Lives for the whole call, because argv points into it. */
+    char safedir[ATLAS_GIT_SAFEDIR_MAX];
     atlas_status st = atlas_git_build_argv(argv, ATLAS_GIT_ARGV_MAX, &n, atlas_buf_cstr(&g->exe),
-                                           atlas_buf_cstr(&g->root), err);
+                                           atlas_buf_cstr(&g->root), safedir, sizeof(safedir),
+                                           err);
     if (st != ATLAS_OK) {
         return st;
     }
@@ -337,7 +355,8 @@ atlas_status atlas_git_probe(atlas_buf *exe_out, atlas_buf *version_out, atlas_e
      * context. */
     const char *argv[ATLAS_GIT_ARGV_MAX];
     size_t n = 0;
-    st = atlas_git_build_argv(argv, ATLAS_GIT_ARGV_MAX, &n, atlas_buf_cstr(&exe), NULL, err);
+    st = atlas_git_build_argv(argv, ATLAS_GIT_ARGV_MAX, &n, atlas_buf_cstr(&exe), NULL, NULL,
+                              0u, err);
     if (st == ATLAS_OK) {
         argv[n++] = "--version";
         argv[n] = NULL;
@@ -1272,4 +1291,247 @@ atlas_status atlas_git_diff_worktree(atlas_git *g, atlas_git_diff_cb cb, void *u
 atlas_status atlas_git_diff_staged(atlas_git *g, atlas_git_diff_cb cb, void *ud, atlas_err *err) {
     const char *sub[] = {"diff", "--cached", "--numstat", "-z", "--no-color", "-M"};
     return run_numstat(g, sub, 6u, "git diff --cached", cb, ud, err);
+}
+
+
+/* --- A8: trusted source snapshotting -------------------------------------
+ *
+ * These three reads let the dispatcher materialise an exact commit into a
+ * worker-owned directory that contains **no git metadata at all**. That absence
+ * is the security property: with no `.git` in the workspace there is no
+ * repository configuration to be hostile, no hook to run, no alternate pointing
+ * at the source's object store, no index to lock and no submodule or LFS
+ * machinery to invoke. The worker gets ordinary files.
+ */
+
+typedef struct lstree_parser {
+    atlas_git_tree_cb cb;
+    void *ud;
+    int64_t entries;
+} lstree_parser;
+
+/* One record of `git ls-tree -r -z`: "<mode> <type> <oid>\t<path>".
+ *
+ * Parsed by position rather than by splitting on whitespace, because a path may
+ * contain spaces, tabs and newlines — A0's rule about paths being bytes applies
+ * here exactly as it does everywhere else. The tab is the only delimiter, and it
+ * is the *first* one. */
+static atlas_status lstree_token(const char *tok, size_t len, void *ud, atlas_err *err) {
+    lstree_parser *lp = (lstree_parser *)ud;
+    const char *tab = memchr(tok, '\t', len);
+    if (tab == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_GIT, "malformed ls-tree record: no path separator");
+    }
+    size_t head_len = (size_t)(tab - tok);
+    /* "<mode> <type> <oid>" with single spaces. Mode is 6 octal digits, type is
+     * a short word, oid is hex. Anything else is refused rather than guessed. */
+    char head[128];
+    if (head_len == 0 || head_len >= sizeof(head)) {
+        return atlas_err_set(err, ATLAS_ERR_GIT, "malformed ls-tree record header");
+    }
+    memcpy(head, tok, head_len);
+    head[head_len] = '\0';
+    char *sp1 = strchr(head, ' ');
+    if (sp1 == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_GIT, "malformed ls-tree record header");
+    }
+    *sp1 = '\0';
+    char *sp2 = strchr(sp1 + 1, ' ');
+    if (sp2 == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_GIT, "malformed ls-tree record header");
+    }
+    *sp2 = '\0';
+
+    atlas_git_tree_entry e;
+    e.mode = head;
+    e.type = sp1 + 1;
+    e.oid = sp2 + 1;
+    e.path = tab + 1;
+    e.path_len = len - head_len - 1u;
+    lp->entries++;
+    return lp->cb != NULL ? lp->cb(&e, lp->ud, err) : ATLAS_OK;
+}
+
+typedef struct lstree_stream {
+    atlas_nulsplit split;
+} lstree_stream;
+
+static atlas_status lstree_sink(const char *chunk, size_t n, void *ud, atlas_err *err) {
+    lstree_stream *st = (lstree_stream *)ud;
+    return atlas_nulsplit_feed(&st->split, chunk, n, err);
+}
+
+/* An exact object id and nothing else. A branch name would make the snapshot
+ * depend on when it happened to run, which is precisely what pinning a commit
+ * into the job specification exists to prevent. */
+static bool is_exact_oid(const char *s) {
+    if (s == NULL) {
+        return false;
+    }
+    size_t n = strlen(s);
+    if (n != 40u && n != 64u) {
+        return false;
+    }
+    for (size_t i = 0; i < n; i++) {
+        char c = s[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+atlas_status atlas_git_ls_tree(atlas_git *g, const char *commit, atlas_git_tree_cb cb, void *ud,
+                               atlas_err *err) {
+    if (!is_exact_oid(commit)) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "a snapshot needs an exact object id, not a reference");
+    }
+    lstree_parser lp;
+    memset(&lp, 0, sizeof(lp));
+    lp.cb = cb;
+    lp.ud = ud;
+
+    lstree_stream stream;
+    atlas_nulsplit_init(&stream.split, ATLAS_GIT_MAX_TOKEN, lstree_token, &lp);
+
+    /* `--full-tree` so the listing is rooted at the commit's tree rather than at
+     * whatever directory git thinks it is in; Atlas never changes its own
+     * working directory, but saying so removes the question. */
+    const char *sub[] = {"ls-tree", "-r", "-z", "--full-tree", commit};
+    atlas_status st = git_run_checked(g, ATLAS_GIT_CMD_PLAIN, sub, 5u, lstree_sink, &stream, 0,
+                                      "git ls-tree", err);
+    if (st == ATLAS_OK) {
+        st = atlas_nulsplit_finish(&stream.split, err);
+    }
+    atlas_nulsplit_free(&stream.split);
+    return st;
+}
+
+atlas_status atlas_git_commit_tree(atlas_git *g, const char *commit, atlas_buf *out,
+                                   atlas_err *err) {
+    if (!is_exact_oid(commit)) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "a snapshot needs an exact commit id, not a reference");
+    }
+    atlas_buf_reset(out);
+    /* `<commit>^{tree}` fails when the object is not a commit in this
+     * repository, which is the check as much as the answer. */
+    char spec[80];
+    (void)snprintf(spec, sizeof(spec), "%s^{tree}", commit);
+    const char *sub[] = {"rev-parse", "--verify", "--end-of-options", spec};
+    atlas_status st = git_run_checked(g, ATLAS_GIT_CMD_PLAIN, sub, 4u, atlas_proc_sink_buf, out,
+                                      4096u, "git rev-parse", err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    while (out->len > 0 && (out->data[out->len - 1u] == '\n' || out->data[out->len - 1u] == '\r')) {
+        out->len--;
+        out->data[out->len] = '\0';
+    }
+    if (!is_exact_oid(atlas_buf_cstr(out))) {
+        return atlas_err_set(err, ATLAS_ERR_GIT, "the commit did not resolve to a tree");
+    }
+    return ATLAS_OK;
+}
+
+atlas_status atlas_git_cat_blob(atlas_git *g, const char *oid, atlas_proc_sink sink,
+                                void *sink_ud, size_t max, atlas_err *err) {
+    if (!is_exact_oid(oid)) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "a blob needs an exact object id");
+    }
+    /* `blob` rather than a bare oid: naming the expected type means a tree or a
+     * commit id cannot be materialised as though it were file content. */
+    const char *sub[] = {"cat-file", "blob", oid};
+    return git_run_checked(g, ATLAS_GIT_CMD_PLAIN, sub, 3u, sink, sink_ud, max, "git cat-file",
+                           err);
+}
+
+atlas_status atlas_git_diff_no_index(const char *a, const char *b, atlas_proc_sink sink,
+                                     void *sink_ud, size_t max, bool *differed_out,
+                                     atlas_err *err) {
+    if (differed_out != NULL) {
+        *differed_out = false;
+    }
+    if (a == NULL || b == NULL || a[0] != '/' || b[0] != '/') {
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "diff --no-index needs two absolute paths");
+    }
+    atlas_buf exe = ATLAS_BUF_INIT;
+    atlas_status st = atlas_git_executable(&exe, err);
+    if (st != ATLAS_OK) {
+        atlas_buf_free(&exe);
+        return st;
+    }
+    /* No repository context at all — the whole point. The hardening prefix is
+     * still applied, so hooks, fsmonitor, external diff, textconv, pagers and
+     * transports are off exactly as they are for every other invocation. */
+    const char *argv[ATLAS_GIT_ARGV_MAX];
+    size_t n = 0;
+    st = atlas_git_build_argv(argv, ATLAS_GIT_ARGV_MAX, &n, atlas_buf_cstr(&exe), NULL, NULL,
+                              0u, err);
+    if (st == ATLAS_OK) {
+        argv[n++] = "diff";
+        const char *const *flags = atlas_git_cmd_flags(ATLAS_GIT_CMD_DIFF);
+        for (size_t i = 0; flags[i] != NULL; i++) {
+            argv[n++] = flags[i];
+        }
+        argv[n++] = "--no-index";
+        argv[n++] = "--binary";
+        argv[n++] = "--no-color";
+        argv[n++] = "--";
+        argv[n++] = a;
+        argv[n++] = b;
+        argv[n] = NULL;
+    }
+    if (st != ATLAS_OK) {
+        atlas_buf_free(&exe);
+        return st;
+    }
+    const char *reason = NULL;
+    if (!atlas_git_argv_is_readonly(argv, &reason)) {
+        atlas_buf_free(&exe);
+        return atlas_err_set(err, ATLAS_ERR_INTEGRITY, "refusing to run git: %s",
+                             reason != NULL ? reason : "not read-only");
+    }
+
+    atlas_buf env_slots[ATLAS_GIT_ENV_MAX];
+    for (size_t i = 0; i < ATLAS_GIT_ENV_MAX; i++) {
+        atlas_buf_init(&env_slots[i]);
+    }
+    const char *env[ATLAS_GIT_ENV_MAX + 1u];
+    size_t env_count = 0;
+    st = atlas_git_build_env(env_slots, ATLAS_GIT_ENV_MAX, env, ATLAS_GIT_ENV_MAX + 1u,
+                             &env_count, err);
+    if (st == ATLAS_OK) {
+        atlas_proc_opts opts;
+        memset(&opts, 0, sizeof(opts));
+        opts.argv = argv;
+        opts.env = env;
+        opts.timeout_ms = 120000;
+        opts.max_stdout = max != 0 ? max : (16u * 1024u * 1024u);
+        opts.max_stderr = 64u * 1024u;
+        atlas_proc_result res;
+        atlas_buf errbuf = ATLAS_BUF_INIT;
+        st = atlas_proc_run(&opts, sink, sink_ud, &errbuf, &res, err);
+        if (st == ATLAS_OK) {
+            /* Exit 1 means "there were differences", which is the ordinary
+             * case for a job that changed something. Only 0 and 1 are
+             * meaningful; anything else is a real failure. */
+            if (res.exit_code == 1) {
+                if (differed_out != NULL) {
+                    *differed_out = true;
+                }
+            } else if (res.exit_code != 0) {
+                st = atlas_err_set(err, ATLAS_ERR_GIT, "git diff --no-index exited %d: %s",
+                                   res.exit_code, atlas_buf_cstr(&errbuf));
+            }
+        }
+        atlas_buf_free(&errbuf);
+    }
+    for (size_t i = 0; i < ATLAS_GIT_ENV_MAX; i++) {
+        atlas_buf_free(&env_slots[i]);
+    }
+    atlas_buf_free(&exe);
+    return st;
 }

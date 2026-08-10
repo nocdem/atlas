@@ -234,6 +234,66 @@ bool atlas_ipc_result_str(const atlas_ipc_response *r, const char *key, const ch
     return true;
 }
 
+/* One member of one object inside a result array.
+ *
+ * A8's `job.list` is the first response that carries an array of objects, so
+ * this is the first accessor that reaches inside one. It stays in the same
+ * discipline as its scalar siblings: bounded, typed, no coercion, and an
+ * embedded NUL is treated as absent because it would make the C string shorter
+ * than the JSON one. */
+static yyjson_val *arr_obj(const atlas_ipc_response *r, const char *arr_key, size_t index) {
+    if (r == NULL || r->result == NULL) {
+        return NULL;
+    }
+    yyjson_val *a = yyjson_obj_get(r->result, arr_key);
+    if (a == NULL || !yyjson_is_arr(a)) {
+        return NULL;
+    }
+    yyjson_val *o = yyjson_arr_get(a, index);
+    return (o != NULL && yyjson_is_obj(o)) ? o : NULL;
+}
+
+bool atlas_ipc_result_arr_obj_str(const atlas_ipc_response *r, const char *arr_key, size_t index,
+                                  const char *key, const char **out) {
+    *out = NULL;
+    yyjson_val *o = arr_obj(r, arr_key, index);
+    if (o == NULL) {
+        return false;
+    }
+    yyjson_val *v = yyjson_obj_get(o, key);
+    if (v == NULL || !yyjson_is_str(v)) {
+        return false;
+    }
+    const char *s = yyjson_get_str(v);
+    if (s == NULL || strlen(s) != yyjson_get_len(v)) {
+        return false;
+    }
+    *out = s;
+    return true;
+}
+
+bool atlas_ipc_result_arr_obj_int(const atlas_ipc_response *r, const char *arr_key, size_t index,
+                                  const char *key, int64_t *out) {
+    *out = 0;
+    yyjson_val *o = arr_obj(r, arr_key, index);
+    if (o == NULL) {
+        return false;
+    }
+    yyjson_val *v = yyjson_obj_get(o, key);
+    if (v == NULL) {
+        return false;
+    }
+    if (yyjson_is_sint(v)) {
+        *out = yyjson_get_sint(v);
+        return true;
+    }
+    if (yyjson_is_uint(v)) {
+        *out = (int64_t)yyjson_get_uint(v);
+        return true;
+    }
+    return false;
+}
+
 bool atlas_ipc_result_int(const atlas_ipc_response *r, const char *key, int64_t *out) {
     *out = 0;
     if (r == NULL || r->result == NULL) {

@@ -13,6 +13,12 @@ target_include_directories(atlas_test_support PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}
   ${CMAKE_SOURCE_DIR}/src
 )
+# Forks a grandchild that outlives its parent unless the whole process group is
+# signalled. The A8 process-tree termination test needs a real one.
+add_executable(atlas-spawner tools/atlas_spawner.c)
+target_compile_definitions(atlas-spawner PRIVATE _POSIX_C_SOURCE=200809L)
+atlas_set_warnings(atlas-spawner)
+
 # The marker helper stands in for a hostile git helper in the hardening tests.
 add_executable(atlas-marker tools/atlas_marker.c)
 target_compile_definitions(atlas-marker PRIVATE _POSIX_C_SOURCE=200809L)
@@ -22,6 +28,7 @@ target_compile_definitions(atlas_test_support PUBLIC
   _POSIX_C_SOURCE=200809L
   ATLAS_BIN="$<TARGET_FILE:atlas>"
   ATLAS_MARKER_BIN="$<TARGET_FILE:atlas-marker>"
+  ATLAS_SPAWNER_BIN="$<TARGET_FILE:atlas-spawner>"
 )
 target_link_libraries(atlas_test_support PUBLIC atlas_core)
 atlas_set_warnings(atlas_test_support)
@@ -104,6 +111,14 @@ set(ATLAS_TESTS
   # --- A7: security review and trust-boundary hardening ---
   test_a7_authority
   test_a71_syspolicy
+  # --- A8: the durable orchestration control plane ---
+  test_orch_model
+  test_orch_lifecycle
+  test_orch_rpc
+  test_orch_workspace
+  test_orch_driver
+  test_orch_snapshot
+  test_migrate8
 )
 
 foreach(test_name IN LISTS ATLAS_TESTS)
@@ -184,6 +199,29 @@ set_tests_properties(test_a7_authority PROPERTIES LABELS "daemon" TIMEOUT 900 RU
 # A7.1 drives a live daemon to prove a client cannot describe its own identity,
 # and checks the system-policy decision procedure against real filesystem shapes.
 set_tests_properties(test_a71_syspolicy PROPERTIES LABELS "daemon" TIMEOUT 900 RUN_SERIAL TRUE)
+
+# A8. The vocabularies, the transition table, the canonical digest and the
+# policy loader are pure functions and real filesystem shapes, so this suite
+# needs no repository, no database and no daemon: it belongs in the fast subset.
+set_tests_properties(test_orch_model PROPERTIES LABELS "unit")
+# The lifecycle suite builds a real fixture repository, registers it through the
+# CLI and drives the one write point against an isolated database, so it is an
+# integration test. It sleeps for nothing: expiry and deadlines are supplied.
+set_tests_properties(test_orch_lifecycle PROPERTIES LABELS "integration")
+# The RPC suite drives a live daemon to prove the negative enumeration still
+# holds and that a dispatcher method is unreachable from a client connection.
+set_tests_properties(test_orch_rpc PROPERTIES LABELS "daemon" TIMEOUT 900 RUN_SERIAL TRUE)
+# Migration 7 -> 8 and its rollback, against real databases built in a fixture.
+set_tests_properties(test_migrate8 PROPERTIES LABELS "integration")
+# The workspace suite builds real repositories, snapshots them and harvests the
+# result, so it is an integration test. It touches nothing outside its fixture.
+set_tests_properties(test_orch_workspace PROPERTIES LABELS "integration")
+# The driver suite runs real child processes to prove the execution boundary:
+# structured argv, a built environment, idle bounds and process-group kill.
+set_tests_properties(test_orch_driver PROPERTIES LABELS "integration" TIMEOUT 300)
+# The snapshot suite drives the daemon-side read against a fixture repository
+# and a fixture database: the worker never appears in it, which is the point.
+set_tests_properties(test_orch_snapshot PROPERTIES LABELS "integration" TIMEOUT 300)
 target_compile_definitions(test_a7_authority PRIVATE ATLAS_SRC_DIR="${CMAKE_SOURCE_DIR}")
 # Migration 7 rebuilds a table, so its suite drives the storage layer and the
 # backup CLI against real databases. No daemon and no repository.

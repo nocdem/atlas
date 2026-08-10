@@ -1599,6 +1599,315 @@ static const char *const M7_STATEMENTS[] = {
     NULL,
 };
 
+/* --- migration 8: the A8 durable orchestration control plane ---------------
+ *
+ * Eight tables, and the shape of each is an argument.
+ *
+ * These tables are **canonical**, not derived. A job record is the only account
+ * of what was asked for, what was granted, what ran and what came back; nothing
+ * rebuilds it from a repository, because the repository never held it. That is
+ * why none of them appears as prunable in `RETENTION[]` and why there is no
+ * `_clear` for any of them.
+ *
+ * `orch_jobs.repo_id` is a **soft reference with no foreign key**, exactly like
+ * `decision_documents.repo_id` and for the same reason: an FK would make
+ * `repo remove --yes` destroy execution history. `repo_identity_hash` is the
+ * durable identity. And because `repositories.id` is a reused rowid, the pointer
+ * is cleared when a repository is removed — in the same transaction as the
+ * delete, by `atlas_db_orch_forget_repo`. A column holding a rowid that outlives
+ * its row is the A4 defect, and it is not repeated here.
+ *
+ * Every CHECK on a state column deliberately omits 'UNKNOWN'. UNKNOWN is the
+ * zero of `atlas_orch_state` and means "nobody filled this in"; a persisted job
+ * may never be in it, so the schema refuses to store it rather than trusting
+ * every writer to remember.
+ */
+static const char M8_JOBS[] =
+    "CREATE TABLE orch_jobs ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    /* The external identifier. Random, unguessable and unique: a predictable
+     * job id is one another local process can name before it exists. */
+    "  job_uid TEXT NOT NULL UNIQUE,"
+    "  spec_version INTEGER NOT NULL,"
+    /* The canonical digest of everything immutable that was asked for. Two
+     * submissions that digest identically are the same request, which is what
+     * makes the idempotency key meaningful rather than decorative. */
+    "  spec_digest TEXT NOT NULL,"
+    /* From SO_PEERCRED at submission. Never from the request body — there is no
+     * code path by which a client's own claim about its uid reaches this
+     * column. */
+    "  submitter_uid INTEGER NOT NULL,"
+    "  repo_id INTEGER,"
+    "  repo_name TEXT NOT NULL,"
+    "  repo_identity_hash TEXT NOT NULL,"
+    /* Exact and resolved before the job was persisted. A branch name never
+     * reaches here: a moving reference in a stored specification is a job whose
+     * source depends on when it happens to run. */
+    "  source_commit TEXT NOT NULL,"
+    "  mode TEXT NOT NULL,"
+    "  driver TEXT NOT NULL,"
+    /* UNTRUSTED_DATA. Stored as submitted, labelled at every boundary it
+     * crosses, and never placed in automatic model context. */
+    "  task_text TEXT NOT NULL,"
+    /* Canonical netstring-encoded lists: length-prefixed, so no element can be
+     * confused with a delimiter whatever it contains. */
+    "  allowed_paths TEXT NOT NULL,"
+    "  validations TEXT NOT NULL,"
+    "  wall_timeout_ms INTEGER NOT NULL,"
+    "  idle_timeout_ms INTEGER NOT NULL,"
+    "  max_attempts INTEGER NOT NULL,"
+    "  max_output_bytes INTEGER NOT NULL,"
+    "  max_artifact_bytes INTEGER NOT NULL,"
+    "  max_artifact_count INTEGER NOT NULL,"
+    "  correlation TEXT NOT NULL DEFAULT '',"
+    "  parent_job_uid TEXT NOT NULL DEFAULT '',"
+    "  idempotency_key TEXT NOT NULL DEFAULT '',"
+    "  state TEXT NOT NULL CHECK(state IN"
+    "    ('QUEUED','LEASED','PREPARING','RUNNING','VALIDATING','SUCCEEDED','FAILED',"
+    "     'CANCEL_REQUESTED','CANCELLED','TIMED_OUT','RECOVERY_REQUIRED')),"
+    "  attempts_started INTEGER NOT NULL DEFAULT 0,"
+    "  cancel_requested INTEGER NOT NULL DEFAULT 0 CHECK(cancel_requested IN (0,1)),"
+    /* The id of the transition that produced the current state. Ordering
+     * authority is this sequence, never a timestamp: two events in the same
+     * millisecond are ordered by their ledger ids, and a clock that steps
+     * backwards cannot reorder history. Timestamps are evidence. */
+    "  state_seq INTEGER NOT NULL DEFAULT 0,"
+    "  created_at TEXT NOT NULL,"
+    "  created_ms INTEGER NOT NULL,"
+    /* Absolute wall deadline, computed once at submission. A job that never
+     * gets leased still has to end somewhere. */
+    "  deadline_ms INTEGER NOT NULL,"
+    "  terminal_at TEXT"
+    ");"
+    "CREATE INDEX idx_orch_jobs_state ON orch_jobs(state, id);"
+    "CREATE INDEX idx_orch_jobs_repo ON orch_jobs(repo_identity_hash, id);"
+    "CREATE INDEX idx_orch_jobs_submitter ON orch_jobs(submitter_uid, id);";
+
+/* One row per execution attempt. `attempt_no` is monotonic per job and unique,
+ * so a replayed or duplicated grant cannot produce two rows claiming to be the
+ * same attempt. */
+static const char M8_ATTEMPTS[] =
+    "CREATE TABLE orch_attempts ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  job_id INTEGER NOT NULL REFERENCES orch_jobs(id) ON DELETE CASCADE,"
+    "  attempt_no INTEGER NOT NULL,"
+    /* The kernel's answer about the dispatcher that took this attempt. */
+    "  dispatcher_uid INTEGER NOT NULL,"
+    "  dispatcher_id TEXT NOT NULL,"
+    /* What the worker *says* its pid is. Recorded as the worker's claim and
+     * used for nothing that matters: a worker describing itself is not evidence
+     * about itself, and every authorisation decision uses the lease instead. */
+    "  claimed_pid INTEGER NOT NULL DEFAULT 0,"
+    "  state TEXT NOT NULL CHECK(state IN"
+    "    ('LEASED','PREPARING','RUNNING','VALIDATING','SUCCEEDED','FAILED',"
+    "     'CANCEL_REQUESTED','CANCELLED','TIMED_OUT','RECOVERY_REQUIRED')),"
+    "  driver TEXT NOT NULL,"
+    "  driver_version TEXT NOT NULL DEFAULT '',"
+    "  exit_kind TEXT NOT NULL DEFAULT 'UNKNOWN',"
+    "  exit_code INTEGER NOT NULL DEFAULT -1,"
+    "  failure_reason TEXT NOT NULL DEFAULT 'UNKNOWN',"
+    "  event_count INTEGER NOT NULL DEFAULT 0,"
+    "  event_bytes INTEGER NOT NULL DEFAULT 0,"
+    "  artifact_count INTEGER NOT NULL DEFAULT 0,"
+    "  artifact_bytes INTEGER NOT NULL DEFAULT 0,"
+    "  started_at TEXT NOT NULL,"
+    "  ended_at TEXT,"
+    "  UNIQUE(job_id, attempt_no)"
+    ");"
+    "CREATE INDEX idx_orch_attempts_job ON orch_attempts(job_id, attempt_no);";
+
+/* The lease. A bearer capability, so the token itself is never stored — only a
+ * domain-separated digest of it, and the token is handed to the dispatcher once
+ * at grant and never again.
+ *
+ * The partial unique index is the whole concurrency guarantee: **at most one
+ * unreleased lease per job**, enforced by the schema rather than by care. It is
+ * what makes "no job is executed twice concurrently" a hard failure instead of
+ * two dispatchers each believing they own the work. This is the shape A4 uses
+ * for `at most one approved revision per document`, for the same reason. */
+static const char M8_LEASES[] =
+    "CREATE TABLE orch_leases ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  job_id INTEGER NOT NULL REFERENCES orch_jobs(id) ON DELETE CASCADE,"
+    "  attempt_id INTEGER NOT NULL REFERENCES orch_attempts(id) ON DELETE CASCADE,"
+    "  token_digest TEXT NOT NULL UNIQUE,"
+    "  granted_at TEXT NOT NULL,"
+    "  expires_ms INTEGER NOT NULL,"
+    "  renewals INTEGER NOT NULL DEFAULT 0,"
+    "  max_renewals INTEGER NOT NULL,"
+    "  last_heartbeat_ms INTEGER NOT NULL,"
+    "  released_at TEXT,"
+    "  release_reason TEXT NOT NULL DEFAULT ''"
+    ");"
+    "CREATE UNIQUE INDEX idx_orch_leases_attempt ON orch_leases(attempt_id);"
+    "CREATE UNIQUE INDEX idx_orch_leases_active ON orch_leases(job_id)"
+    "  WHERE released_at IS NULL;"
+    "CREATE INDEX idx_orch_leases_expiry ON orch_leases(expires_ms)"
+    "  WHERE released_at IS NULL;";
+
+/* The append-only state ledger. Nothing updates a row here and nothing deletes
+ * one; `id` is AUTOINCREMENT so a deleted row's number can never be handed to a
+ * later one, and it is the ordering authority the job row points at. */
+static const char M8_TRANSITIONS[] =
+    "CREATE TABLE orch_transitions ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  job_id INTEGER NOT NULL REFERENCES orch_jobs(id) ON DELETE CASCADE,"
+    "  attempt_id INTEGER,"
+    "  from_state TEXT NOT NULL,"
+    "  to_state TEXT NOT NULL,"
+    /* A closed vocabulary. Free-form text here would be a place for
+     * worker-chosen wording to end up reading like an Atlas statement; what the
+     * worker says goes in orch_events, labelled as the worker's. */
+    "  reason TEXT NOT NULL,"
+    "  actor TEXT NOT NULL CHECK(actor IN ('CLIENT','DISPATCHER','ATLAS')),"
+    "  actor_uid INTEGER NOT NULL DEFAULT 0,"
+    "  detail TEXT NOT NULL DEFAULT '',"
+    "  at TEXT NOT NULL"
+    ");"
+    "CREATE INDEX idx_orch_transitions_job ON orch_transitions(job_id, id);";
+
+/* Structured worker events. `seq` is the worker's own counter and the unique
+ * index over (attempt_id, seq) is what makes a duplicated delivery a refusal
+ * rather than a second row — a retrying dispatcher must not be able to inflate
+ * its own history. Counts and bytes are accumulated on the attempt so the bound
+ * can be enforced without a scan. */
+static const char M8_EVENTS[] =
+    "CREATE TABLE orch_events ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  job_id INTEGER NOT NULL REFERENCES orch_jobs(id) ON DELETE CASCADE,"
+    "  attempt_id INTEGER NOT NULL REFERENCES orch_attempts(id) ON DELETE CASCADE,"
+    "  seq INTEGER NOT NULL,"
+    "  kind TEXT NOT NULL,"
+    /* UNTRUSTED_DATA, and known to be. Safe-encoded before it reaches a
+     * terminal or a JSON document, and never treated as an instruction. */
+    "  payload TEXT NOT NULL,"
+    "  at TEXT NOT NULL,"
+    "  UNIQUE(attempt_id, seq)"
+    ");"
+    "CREATE INDEX idx_orch_events_attempt ON orch_events(attempt_id, seq);";
+
+/* The artifact manifest, and — for artifacts small enough to be worth it — the
+ * bytes.
+ *
+ * The daemon cannot read the worker's workspace: it is 0700 `atlas-worker` and
+ * `atlasd` is not that account. So an artifact is either carried inline in the
+ * completion envelope, up to a bound, and stored here, or it is described by
+ * name, size and digest and its bytes stay in the workspace. `content_stored`
+ * says which, so a reader is never left to infer that an absent blob means an
+ * empty file.
+ *
+ * There is deliberately **no path column**. An artifact is addressed by its
+ * server-assigned id, never by a filesystem path a client could supply. */
+static const char M8_ARTIFACTS[] =
+    "CREATE TABLE orch_artifacts ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  job_id INTEGER NOT NULL REFERENCES orch_jobs(id) ON DELETE CASCADE,"
+    "  attempt_id INTEGER NOT NULL REFERENCES orch_attempts(id) ON DELETE CASCADE,"
+    "  name TEXT NOT NULL,"
+    "  kind TEXT NOT NULL,"
+    "  size_bytes INTEGER NOT NULL,"
+    "  sha256 TEXT NOT NULL,"
+    "  content_stored INTEGER NOT NULL DEFAULT 0 CHECK(content_stored IN (0,1)),"
+    "  content BLOB,"
+    "  at TEXT NOT NULL,"
+    "  UNIQUE(attempt_id, name)"
+    ");"
+    "CREATE INDEX idx_orch_artifacts_job ON orch_artifacts(job_id, id);";
+
+/* Idempotent submission. The key is scoped to the submitter, because two
+ * different principals choosing the same key are not making the same request.
+ *
+ * A replay with the *same* digest returns the existing job. A replay with a
+ * *different* digest is a conflict and is refused: silently returning the older
+ * job would run something other than what was asked for, and the caller would
+ * have no way to notice. */
+static const char M8_IDEMPOTENCY[] =
+    "CREATE TABLE orch_idempotency ("
+    "  submitter_uid INTEGER NOT NULL,"
+    "  key TEXT NOT NULL,"
+    "  job_id INTEGER NOT NULL REFERENCES orch_jobs(id) ON DELETE CASCADE,"
+    "  spec_digest TEXT NOT NULL,"
+    "  created_at TEXT NOT NULL,"
+    "  PRIMARY KEY(submitter_uid, key)"
+    ");";
+/* Deliberately *not* WITHOUT ROWID. It would be a marginally tighter table and
+ * it would also be the one table in the schema with no rowid, which breaks every
+ * generic query that orders by it — `tests/test_maintenance.c` digests each
+ * retained table with `ORDER BY rowid` to prove a prune left it untouched.
+ * A storage micro-optimisation is not worth being the exception. */
+
+/* What the worker reported about itself over the life of an attempt. Written on
+ * a phase change rather than on every heartbeat, so the row count is a property
+ * of the state machine rather than of how long a job ran. Everything in it is
+ * the worker's claim and is stored as such. */
+static const char M8_OBSERVATIONS[] =
+    "CREATE TABLE orch_observations ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  job_id INTEGER NOT NULL REFERENCES orch_jobs(id) ON DELETE CASCADE,"
+    "  attempt_id INTEGER NOT NULL REFERENCES orch_attempts(id) ON DELETE CASCADE,"
+    "  at TEXT NOT NULL,"
+    "  at_ms INTEGER NOT NULL,"
+    "  claimed_pid INTEGER NOT NULL DEFAULT 0,"
+    "  phase TEXT NOT NULL,"
+    "  note TEXT NOT NULL DEFAULT ''"
+    ");"
+    "CREATE INDEX idx_orch_observations_attempt ON orch_observations(attempt_id, id);";
+
+/* The source snapshot a leased attempt is entitled to receive.
+ *
+ * The manifest is persisted rather than held in memory so that a dispatcher
+ * which restarts mid-transfer resumes against the *same* snapshot identity. A
+ * re-enumeration could legitimately differ — the repository is a live directory —
+ * and a worker that received the first half of one tree and the second half of
+ * another would hold something that never existed.
+ *
+ * **No content is stored here.** Only the manifest: path, mode, object id, size
+ * and digest. The bytes are re-read from the repository per chunk, because
+ * SQLite is Atlas' rebuildable *index* and putting repository content in it
+ * would make it something else. */
+static const char M8_SNAPSHOTS[] =
+    "CREATE TABLE orch_snapshots ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  attempt_id INTEGER NOT NULL REFERENCES orch_attempts(id) ON DELETE CASCADE,"
+    "  job_id INTEGER NOT NULL REFERENCES orch_jobs(id) ON DELETE CASCADE,"
+    "  protocol INTEGER NOT NULL,"
+    "  source_commit TEXT NOT NULL,"
+    "  tree_oid TEXT NOT NULL,"
+    "  entry_count INTEGER NOT NULL,"
+    "  total_bytes INTEGER NOT NULL,"
+    "  digest TEXT NOT NULL,"
+    "  refused_symlinks INTEGER NOT NULL DEFAULT 0,"
+    "  refused_gitlinks INTEGER NOT NULL DEFAULT 0,"
+    "  refused_other INTEGER NOT NULL DEFAULT 0,"
+    "  created_at TEXT NOT NULL,"
+    "  completed_at TEXT"
+    ");"
+    /* One snapshot per attempt. A second `open` returns the first rather than
+     * enumerating again, and this index is what makes that a hard fact. */
+    "CREATE UNIQUE INDEX idx_orch_snapshots_attempt ON orch_snapshots(attempt_id);";
+
+/* The canonical ordered manifest. `idx` is the position in the order the digest
+ * covers, so a transfer that reordered anything cannot match. */
+static const char M8_SNAPSHOT_ENTRIES[] =
+    "CREATE TABLE orch_snapshot_entries ("
+    "  snapshot_id INTEGER NOT NULL REFERENCES orch_snapshots(id) ON DELETE CASCADE,"
+    "  idx INTEGER NOT NULL,"
+    /* Raw repository bytes: a path is bytes, not text. */
+    "  path BLOB NOT NULL,"
+    "  mode TEXT NOT NULL,"
+    "  oid TEXT NOT NULL,"
+    "  size_bytes INTEGER NOT NULL,"
+    "  sha256 TEXT NOT NULL,"
+    "  PRIMARY KEY(snapshot_id, idx)"
+    ");";
+
+static const char *const M8_STATEMENTS[] = {
+    M8_JOBS,       M8_ATTEMPTS,  M8_LEASES,       M8_TRANSITIONS,
+    M8_EVENTS,     M8_ARTIFACTS, M8_IDEMPOTENCY,  M8_OBSERVATIONS,
+    M8_SNAPSHOTS,  M8_SNAPSHOT_ENTRIES,
+    NULL,
+};
+
 static const atlas_migration MIGRATIONS[] = {
     {1, "initial schema", M1_STATEMENTS},
     {2, "worktree identity", M2_STATEMENTS},
@@ -1607,6 +1916,7 @@ static const atlas_migration MIGRATIONS[] = {
     {5, "structural code graph", M5_STATEMENTS},
     {6, "decision documents, revisions and operator approval", M6_STATEMENTS},
     {7, "decision revalidation records", M7_STATEMENTS},
+    {8, "durable orchestration control plane", M8_STATEMENTS},
 };
 
 const atlas_migration *atlas_migrations(size_t *count_out) {

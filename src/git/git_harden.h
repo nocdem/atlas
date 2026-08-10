@@ -23,6 +23,8 @@
 #define ATLAS_GIT_ENV_MAX 32u
 /* Maximum tokens in a built argv, including the hardening prefix. */
 #define ATLAS_GIT_ARGV_MAX 80u
+/* Room for "safe.directory=" plus a canonical repository path. */
+#define ATLAS_GIT_SAFEDIR_MAX 4200u
 
 /* Which family a subcommand belongs to, which decides the extra flags it needs. */
 typedef enum atlas_git_cmd_kind {
@@ -56,8 +58,12 @@ atlas_status atlas_git_build_env(atlas_buf *slots, size_t slot_count, const char
  * selector, the global flags and the `-c` overrides. Everything here is valid
  * *before* the subcommand. `root` may be NULL for an invocation with no
  * repository context (such as --version). */
+/* `safedir` receives the `safe.directory=<root>` token when `root` is non-NULL,
+ * and must outlive `argv`. See the comment at the `-c safe.directory` push in
+ * git_harden.c for why this is the trusted declaration and not a bypass. */
 atlas_status atlas_git_build_argv(const char **argv, size_t argv_cap, size_t *n,
-                                  const char *exe, const char *root, atlas_err *err);
+                                  const char *exe, const char *root, char *safedir,
+                                  size_t safedir_cap, atlas_err *err);
 
 /* The flags a command of this kind needs *after* its subcommand, because they are
  * subcommand options rather than global ones. Returns a NULL-terminated array,

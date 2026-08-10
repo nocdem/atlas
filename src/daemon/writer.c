@@ -88,6 +88,7 @@ static atlas_job *job_new(atlas_job_kind kind) {
     atlas_err_init(&j->result_err);
     atlas_ai_result_init(&j->ai_result);
     atlas_decision_result_init(&j->decision_result);
+    atlas_orch_result_init(&j->orch_result);
     return j;
 }
 
@@ -110,6 +111,11 @@ static void job_free(atlas_job *j) {
         free(j->decision);
     }
     atlas_decision_result_free(&j->decision_result);
+    if (j->orch != NULL) {
+        atlas_orch_op_free(j->orch);
+        free(j->orch);
+    }
+    atlas_orch_result_free(&j->orch_result);
     free(j);
 }
 
@@ -369,6 +375,32 @@ static void run_decision(atlas_writer *w, atlas_job *j) {
     j->result = atlas_decision_apply(w->db, j->decision, &j->decision_result, &j->result_err);
 }
 
+static void run_orch(atlas_writer *w, atlas_job *j) {
+    if (j->orch == NULL) {
+        j->result = atlas_err_set(&j->result_err, ATLAS_ERR_INTERNAL,
+                                  "an orchestration job arrived with no operation attached");
+        return;
+    }
+    /* `atlas_orch_apply` owns its own transaction, exactly like
+     * `atlas_ai_apply` and `atlas_decision_apply`, and is called with none
+     * open — so an operation is whole or nothing, and a granted lease without
+     * the attempt it belongs to cannot be committed. */
+    j->result = atlas_orch_apply(w->db, j->orch, &j->orch_result, &j->result_err);
+}
+
+static void run_snapshot(atlas_writer *w, atlas_job *j) {
+    if (j->snapshot_meta == NULL) {
+        j->result = atlas_err_set(&j->result_err, ATLAS_ERR_INTERNAL,
+                                  "a snapshot job arrived with nowhere to put its manifest");
+        return;
+    }
+    /* `atlas_snapshot_open` owns its own transaction around the rows it writes,
+     * and does its git reads outside it — A1's rule that no process is created
+     * inside a write transaction. */
+    j->result = atlas_snapshot_open(w->db, j->snapshot_attempt_id, j->snapshot_meta,
+                                    &j->result_err);
+}
+
 /* Marks every registered repository as having an unresolved event gap. */
 typedef struct gap_ctx {
     atlas_db *db;
@@ -476,6 +508,8 @@ static void *writer_main(void *arg) {
         case ATLAS_JOB_REPO_REMOVE: run_repo_remove(w, j); break;
         case ATLAS_JOB_AI: run_ai(w, j); break;
         case ATLAS_JOB_DECISION: run_decision(w, j); break;
+        case ATLAS_JOB_ORCH: run_orch(w, j); break;
+        case ATLAS_JOB_SNAPSHOT: run_snapshot(w, j); break;
         case ATLAS_JOB_MARK_GAP: {
             atlas_err ignore;
             atlas_err_init(&ignore);
@@ -1042,6 +1076,166 @@ atlas_status atlas_writer_decision(atlas_writer *w, atlas_decision_op *op, int t
             st = atlas_buf_set(copies[i].to, copies[i].from->data, copies[i].from->len, err);
         }
     } else {
+        *err = j->result_err;
+    }
+    job_free(j);
+    return st;
+}
+
+/* A8. The same shape as `atlas_writer_decision`, and for the same reasons: the
+ * job owns the operation unconditionally, the wait is bounded, and a request
+ * that times out is detached rather than freed — it is still the writer's, and
+ * the writer frees it when it finishes. */
+atlas_status atlas_writer_orch(atlas_writer *w, atlas_orch_op *op, int timeout_ms,
+                               atlas_orch_result *result, atlas_err *err) {
+    atlas_job *j = job_new(ATLAS_JOB_ORCH);
+    if (j == NULL) {
+        atlas_orch_op_free(op);
+        free(op);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                             "out of memory queueing an orchestration request");
+    }
+    j->orch = op;
+    j->wants_result = true;
+
+    (void)pthread_mutex_lock(&w->lock);
+    if (w->stopping || !queue_push(w, j)) {
+        bool stopping = w->stopping;
+        (void)pthread_mutex_unlock(&w->lock);
+        job_free(j);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                             stopping ? "the Atlas daemon is shutting down"
+                                      : "the Atlas daemon's write queue is full");
+    }
+    (void)pthread_cond_signal(&w->not_empty);
+
+    struct timespec deadline;
+    (void)clock_gettime(CLOCK_REALTIME, &deadline);
+    int ms = timeout_ms > 0 ? timeout_ms : 5000;
+    deadline.tv_sec += ms / 1000;
+    deadline.tv_nsec += (long)(ms % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    int rc = 0;
+    while (!j->done && rc == 0) {
+        rc = pthread_cond_timedwait(&w->job_done, &w->lock, &deadline);
+    }
+    bool done = j->done;
+    (void)pthread_mutex_unlock(&w->lock);
+
+    if (!done) {
+        (void)pthread_mutex_lock(&w->lock);
+        j->wants_result = false;
+        (void)pthread_mutex_unlock(&w->lock);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                             "the Atlas daemon did not complete the request within %d ms", ms);
+    }
+
+    atlas_status st = j->result;
+    if (st == ATLAS_OK) {
+        result->job_id = j->orch_result.job_id;
+        result->state = j->orch_result.state;
+        result->attempt_id = j->orch_result.attempt_id;
+        result->attempt_no = j->orch_result.attempt_no;
+        result->seq = j->orch_result.seq;
+        result->duplicate = j->orch_result.duplicate;
+        result->granted = j->orch_result.granted;
+        result->cancel_requested = j->orch_result.cancel_requested;
+        result->expires_ms = j->orch_result.expires_ms;
+        result->wall_timeout_ms = j->orch_result.wall_timeout_ms;
+        result->idle_timeout_ms = j->orch_result.idle_timeout_ms;
+        result->max_output_bytes = j->orch_result.max_output_bytes;
+        result->max_artifact_bytes = j->orch_result.max_artifact_bytes;
+        result->max_artifact_count = j->orch_result.max_artifact_count;
+        result->expired = j->orch_result.expired;
+        result->retried = j->orch_result.retried;
+        result->timed_out = j->orch_result.timed_out;
+        result->recovered = j->orch_result.recovered;
+        memcpy(result->spec_digest, j->orch_result.spec_digest, sizeof(result->spec_digest));
+        struct {
+            atlas_buf *to;
+            const atlas_buf *from;
+        } copies[] = {
+            {&result->job_uid, &j->orch_result.job_uid},
+            {&result->token, &j->orch_result.token},
+            {&result->repo_name, &j->orch_result.repo_name},
+            {&result->repo_root, &j->orch_result.repo_root},
+            {&result->source_commit, &j->orch_result.source_commit},
+            {&result->mode, &j->orch_result.mode},
+            {&result->driver, &j->orch_result.driver},
+            {&result->task_text, &j->orch_result.task_text},
+            {&result->allowed_paths, &j->orch_result.allowed_paths},
+            {&result->validations, &j->orch_result.validations},
+        };
+        for (size_t i = 0; st == ATLAS_OK && i < sizeof copies / sizeof copies[0]; i++) {
+            st = atlas_buf_set(copies[i].to, copies[i].from->data, copies[i].from->len, err);
+        }
+    } else {
+        *err = j->result_err;
+    }
+    /* The writer hands ownership to whoever was waiting, so freeing it here is
+     * the contract rather than a courtesy — see the `wants_result` branch at the
+     * end of `writer_main`. The timeout path above is the other half: it clears
+     * `wants_result` and returns without freeing, because the job is still the
+     * writer's. */
+    job_free(j);
+    return st;
+}
+
+
+/* A8. Snapshot enumeration on the writer thread. The manifest is written into
+ * the caller's struct, which stays alive for the wait — the same handshake
+ * every other writer call uses. */
+atlas_status atlas_writer_snapshot(atlas_writer *w, int64_t attempt_id, int timeout_ms,
+                                   struct atlas_snapshot_meta *out, atlas_err *err) {
+    atlas_job *j = job_new(ATLAS_JOB_SNAPSHOT);
+    if (j == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory queueing a snapshot");
+    }
+    j->snapshot_attempt_id = attempt_id;
+    j->snapshot_meta = out;
+    j->wants_result = true;
+
+    (void)pthread_mutex_lock(&w->lock);
+    if (w->stopping || !queue_push(w, j)) {
+        bool stopping = w->stopping;
+        (void)pthread_mutex_unlock(&w->lock);
+        job_free(j);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                             stopping ? "the Atlas daemon is shutting down"
+                                      : "the Atlas daemon's write queue is full");
+    }
+    (void)pthread_cond_signal(&w->not_empty);
+
+    struct timespec deadline;
+    (void)clock_gettime(CLOCK_REALTIME, &deadline);
+    int ms = timeout_ms > 0 ? timeout_ms : 120000;
+    deadline.tv_sec += ms / 1000;
+    deadline.tv_nsec += (long)(ms % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    int rc = 0;
+    while (!j->done && rc == 0) {
+        rc = pthread_cond_timedwait(&w->job_done, &w->lock, &deadline);
+    }
+    bool done = j->done;
+    (void)pthread_mutex_unlock(&w->lock);
+    if (!done) {
+        /* Detached, not freed: the job is still the writer's, and it must not
+         * write into a struct the caller has stopped waiting on. */
+        (void)pthread_mutex_lock(&w->lock);
+        j->wants_result = false;
+        j->snapshot_meta = NULL;
+        (void)pthread_mutex_unlock(&w->lock);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                             "the Atlas daemon did not enumerate the snapshot within %d ms", ms);
+    }
+    atlas_status st = j->result;
+    if (st != ATLAS_OK) {
         *err = j->result_err;
     }
     job_free(j);

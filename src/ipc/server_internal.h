@@ -31,6 +31,26 @@ typedef struct dispatch_state {
     atlas_db *db; /* read-only */
     atlas_json *j;
     atlas_safe_pool safe;
+    /* A8. The kernel's answer about the peer, taken from SO_PEERCRED at accept
+     * time and carried here unchanged.
+     *
+     * A7.1 says the socket carries no *authority*, and it still does not: the
+     * lifecycle, registry, backup, restore and maintenance methods do not exist
+     * in the protocol, so there is nothing on this socket for a privileged tier
+     * to unlock. What A8 adds is a *disjoint* group of orchestration methods
+     * reachable only from the single uid a root-owned policy names as the
+     * dispatcher — leases, heartbeats, events and results for jobs an operator
+     * already created. It confers no authority over the record Atlas protects,
+     * it cannot approve a decision, change the registry or read a backup, and
+     * being on that list is itself a root-owned configuration fact rather than
+     * something a client can assert.
+     *
+     * The identity must come from here and nowhere else. A uid, gid, pid or
+     * role in the request body is a client describing itself, which is not
+     * evidence about itself; `tests/test_a71_syspolicy.c` and
+     * `tests/test_orch_rpc.c` assert that from both directions. */
+    int64_t peer_uid;
+    int64_t peer_pid;
 } dispatch_state;
 
 typedef atlas_status (*atlas_method_fn)(dispatch_state *ds, const atlas_ipc_request *req,
@@ -49,6 +69,24 @@ const atlas_method_entry *atlas_server_code_methods(size_t *count_out);
 /* The A4 method group: everything under `decision.`. Looked up through the same
  * dispatch as the others, in server.c. */
 const atlas_method_entry *atlas_server_decision_methods(size_t *count_out);
+
+/* The A8 method groups, and there are deliberately two of them.
+ *
+ * `job.` is the client surface: submit, read, list, cancel, and fetch an
+ * artifact by its server-assigned id. Reachable from a uid the orchestration
+ * policy lists as a submitter.
+ *
+ * `dispatch.` is the worker surface: lease, heartbeat, event, complete.
+ * Reachable only from the single uid the policy names as the dispatcher, and
+ * every one of them additionally requires a bearer lease token, so being the
+ * right uid is necessary and not sufficient.
+ *
+ * The two sets are disjoint and the lookup is by peer uid from SO_PEERCRED, so
+ * an ordinary client cannot forge a dispatcher message and a dispatcher cannot
+ * create its own work. Neither set can reach lifecycle authority, the registry,
+ * a backup or any table outside the eight `orch_*` ones. */
+const atlas_method_entry *atlas_server_orch_client_methods(size_t *count_out);
+const atlas_method_entry *atlas_server_orch_dispatch_methods(size_t *count_out);
 
 /* Resolves the `repo` parameter with the CLI's error text. Shared because two
  * groups need it and two copies would answer differently. */

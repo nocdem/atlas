@@ -750,4 +750,74 @@ atlas_status atlas_service_gate_show(atlas_ctx *ctx, const char *repo, const cha
                                      const char *at_commit, atlas_gate_report *out,
                                      atlas_err *err);
 
+
+/* --- A8: orchestration ------------------------------------------------------
+ *
+ * Every one of these speaks to the daemon over the socket. There is no offline
+ * path: orchestration state lives in the index, `atlasd` is the only writer of
+ * it, and a CLI that fell back to opening the database itself would be a second
+ * writer — which is the one thing A1 forbids and A7.1 makes impossible anyway.
+ */
+
+/* One job, as either renderer presents it. Strings are borrowed and every
+ * untrusted one — the task text — has already been safe-encoded by the daemon,
+ * so a renderer prints it as-is. */
+typedef struct atlas_job_render {
+    const char *job;
+    const char *state;
+    const char *repo;
+    const char *driver;
+    const char *commit;
+    const char *created_at;
+    const char *terminal_at;
+    const char *spec_digest;
+    const char *task; /* already in the safe text encoding */
+    int64_t attempts;
+    int64_t max_attempts;
+    int64_t seq;
+    bool cancel_requested;
+    bool duplicate;
+    /* True for `job get`, which prints every field; false for a list row. */
+    bool detail;
+    /* True only when this row is being emitted inside a `jobs` array. The JSON
+     * renderer needs to know: a member of an array is an anonymous object, and
+     * a single result is a set of members on the document itself. Emitting an
+     * unkeyed object at the top level is what the writer refuses, and it
+     * refused during the A8 cutover. */
+    bool in_list;
+} atlas_job_render;
+
+typedef struct atlas_job_submit_opts {
+    const char *repo;
+    const char *task;
+    const char *mode;
+    const char *driver;
+    const char *idempotency_key;
+    const char *correlation;
+    int64_t wall_timeout_ms;
+    int64_t idle_timeout_ms;
+    int64_t max_attempts;
+} atlas_job_submit_opts;
+
+/* Receives one job. A callback rather than a renderer, because the service
+ * layer never formats output and must not know that renderers exist — the
+ * layering rule this repository has kept since A0. The CLI passes a callback
+ * that calls the renderer vtbl. */
+typedef atlas_status (*atlas_job_sink)(const atlas_job_render *jr, void *ud, atlas_err *err);
+
+atlas_status atlas_service_job_submit(atlas_ctx *ctx, const atlas_job_submit_opts *o,
+                                      atlas_job_sink sink, void *ud, atlas_err *err);
+atlas_status atlas_service_job_get(atlas_ctx *ctx, const char *job, atlas_job_sink sink,
+                                   void *ud, atlas_err *err);
+atlas_status atlas_service_job_list(atlas_ctx *ctx, int64_t after, int64_t limit,
+                                    atlas_job_sink sink, void *ud, int64_t *count_out,
+                                    bool *more_out, atlas_err *err);
+atlas_status atlas_service_job_cancel(atlas_ctx *ctx, const char *job, atlas_job_sink sink,
+                                      void *ud, atlas_err *err);
+
+/* Runs the dispatcher loop. Reads the root-owned policies itself and refuses to
+ * start when orchestration is disabled — a disabled policy is a refusal to
+ * start, not a loop that idles. */
+atlas_status atlas_service_dispatcher_run(bool once, FILE *log, atlas_err *err);
+
 #endif /* ATLAS_SERVICE_H */

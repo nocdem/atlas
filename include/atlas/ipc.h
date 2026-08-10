@@ -151,8 +151,13 @@ atlas_status atlas_ipc_listen(const char *socket_path, const atlas_syspolicy *po
  * NULL `policy` the only acceptable peer is this process's own uid; with an
  * active one, that uid or a uid the root-owned policy lists. Nothing else is
  * accepted, and the check happens before a single byte is read. */
+/* `peer_uid_out` receives the kernel's answer about the peer, recorded at
+ * connect time from SO_PEERCRED. A8 carries it into dispatch, because that is
+ * the only identity a method group may be selected on: a client describing
+ * itself in the request body is describing itself to a field Atlas does not
+ * have. */
 atlas_status atlas_ipc_accept(int listen_fd, const atlas_syspolicy *policy, int *fd_out,
-                              int64_t *peer_pid_out, atlas_err *err);
+                              int64_t *peer_pid_out, int64_t *peer_uid_out, atlas_err *err);
 
 /* Connects to a listening daemon. Returns ATLAS_ERR_CONFIG when nothing is
  * listening, which callers treat as "the daemon is not running" rather than as a
@@ -278,6 +283,14 @@ const char *atlas_ipc_response_message(const atlas_ipc_response *r);
 bool atlas_ipc_result_str(const atlas_ipc_response *r, const char *key, const char **out);
 bool atlas_ipc_result_int(const atlas_ipc_response *r, const char *key, int64_t *out);
 bool atlas_ipc_result_bool(const atlas_ipc_response *r, const char *key, bool *out);
+
+/* A8. One member of one object inside a result array — `job.list` is the first
+ * response shape that needs it. Same discipline as the scalar accessors: typed,
+ * bounded, no coercion, and an embedded NUL reads as absent. */
+bool atlas_ipc_result_arr_obj_str(const atlas_ipc_response *r, const char *arr_key, size_t index,
+                                  const char *key, const char **out);
+bool atlas_ipc_result_arr_obj_int(const atlas_ipc_response *r, const char *arr_key, size_t index,
+                                  const char *key, int64_t *out);
 
 /* Re-emits the whole `result` object through `j`, member by member.
  *

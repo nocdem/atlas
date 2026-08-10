@@ -144,6 +144,22 @@ static void build_schema6(const char *path, atlas_err *err) {
              "ALTER TABLE dc6 RENAME TO decision_challenges;"
              "CREATE INDEX idx_decision_challenges_repo"
              "  ON decision_challenges(repo_id, consumed, expires_at);"
+             /* A8's tables go too. `atlas_db_migrate` above ran every
+              * migration, so this database is at the current schema and is
+              * being wound back to look like six; leaving the orchestration
+              * tables in place while rewinding the recorded version would
+              * present migration 8 with tables it is about to create. That is
+              * a property of this simulation, not of the migration. */
+             "DROP TABLE orch_snapshot_entries;"
+             "DROP TABLE orch_snapshots;"
+             "DROP TABLE orch_observations;"
+             "DROP TABLE orch_idempotency;"
+             "DROP TABLE orch_artifacts;"
+             "DROP TABLE orch_events;"
+             "DROP TABLE orch_transitions;"
+             "DROP TABLE orch_leases;"
+             "DROP TABLE orch_attempts;"
+             "DROP TABLE orch_jobs;"
              "DELETE FROM schema_migrations WHERE version >= 7;",
              err),
          err);
@@ -184,8 +200,13 @@ static void test_a_populated_schema_six_database_reaches_seven_losslessly(void) 
 
     /* The migration under test. */
     T_OK(atlas_db_migrate(db, &err), &err);
-    T_EQ_INT(atlas_db_schema_version(db, &err), 7);
-    T_EQ_INT(ATLAS_SCHEMA_VERSION, 7);
+    /* Forward to the *current* schema, not to seven: a database that stopped at
+     * the version this suite was written for would be one no shipped Atlas can
+     * open. What the suite is about — that migration seven rebuilt the challenge
+     * table without renumbering a row — is asserted below and is unaffected by
+     * later migrations running on top of it. */
+    T_EQ_INT(atlas_db_schema_version(db, &err), ATLAS_SCHEMA_VERSION);
+    T_EQ_INT(ATLAS_SCHEMA_VERSION, 8);
 
     atlas_buf after = ATLAS_BUF_INIT;
     text_of(db,
@@ -270,7 +291,7 @@ static void test_migration_seven_is_idempotent(void) {
 
     for (int again = 0; again < 3; again++) {
         T_OK(atlas_db_migrate(db, &err), &err);
-        T_EQ_INT(atlas_db_schema_version(db, &err), 7);
+        T_EQ_INT(atlas_db_schema_version(db, &err), ATLAS_SCHEMA_VERSION);
     }
     atlas_buf schema_again = ATLAS_BUF_INIT;
     text_of(db, "SELECT type || ' ' || name FROM sqlite_master ORDER BY type, name;",
@@ -426,7 +447,7 @@ static void test_a_restored_schema_six_database_migrates_forward(void) {
         atlas_db *db = NULL;
         T_OK(atlas_db_open(atlas_buf_cstr(&path), &db, &err), &err);
         T_OK(atlas_db_migrate(db, &err), &err);
-        T_EQ_INT(atlas_db_schema_version(db, &err), 7);
+        T_EQ_INT(atlas_db_schema_version(db, &err), ATLAS_SCHEMA_VERSION);
         atlas_db_close(db);
     }
     const char *restore[] = {"backup", "restore", atlas_buf_cstr(&backup), "--yes"};
@@ -437,7 +458,7 @@ static void test_a_restored_schema_six_database_migrates_forward(void) {
     atlas_db *db = NULL;
     T_OK(atlas_db_open(atlas_buf_cstr(&path), &db, &err), &err);
     T_OK(atlas_db_migrate(db, &err), &err);
-    T_EQ_INT(atlas_db_schema_version(db, &err), 7);
+    T_EQ_INT(atlas_db_schema_version(db, &err), ATLAS_SCHEMA_VERSION);
     T_EQ_INT(count_of(db, "SELECT COUNT(*) FROM decision_documents;", &err), 3);
     T_EQ_INT(count_of(db, "SELECT COUNT(*) FROM decision_validations;", &err), 0);
     T_EQ_INT(count_of(db,

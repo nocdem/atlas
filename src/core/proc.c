@@ -119,6 +119,15 @@ static char *const *drop_const(const char *const *p) {
 static void child_exec(const atlas_proc_opts *opts, int out_w, int err_w, int status_w) {
     (void)setpgid(0, 0);
 
+    /* Before anything else that could succeed. A command whose working
+     * directory does not exist must fail rather than run in whatever directory
+     * the parent happened to be in. */
+    if (opts->cwd != NULL && chdir(opts->cwd) != 0) {
+        int e = errno;
+        (void)!write(status_w, &e, sizeof(e));
+        _exit(127);
+    }
+
     int devnull = open("/dev/null", O_RDWR | O_CLOEXEC);
     if (devnull < 0) {
         int e = errno;
@@ -199,6 +208,7 @@ atlas_status atlas_proc_run(const atlas_proc_opts *opts, atlas_proc_sink sink, v
     }
 
     int timeout_ms = opts->timeout_ms > 0 ? opts->timeout_ms : ATLAS_PROC_DEFAULT_TIMEOUT_MS;
+    int grace_ms = opts->grace_ms > 0 ? opts->grace_ms : ATLAS_PROC_KILL_GRACE_MS;
     size_t max_stdout = opts->max_stdout != 0 ? opts->max_stdout : ATLAS_PROC_DEFAULT_MAX_STDOUT;
     size_t max_stderr = opts->max_stderr != 0 ? opts->max_stderr : ATLAS_PROC_DEFAULT_MAX_STDERR;
 
@@ -280,6 +290,10 @@ atlas_status atlas_proc_run(const atlas_proc_opts *opts, atlas_proc_sink sink, v
     bool err_open = (chunk != NULL);
     bool kill_requested = (chunk == NULL);
     size_t stderr_seen = 0;
+    /* Idle is measured from the last byte on *either* stream, not from the
+     * start: a child that is still talking is still alive, whatever it is
+     * saying. */
+    int64_t last_output = now_ms();
 
     while (out_open || err_open) {
         struct pollfd fds[2];
@@ -303,7 +317,35 @@ atlas_status atlas_proc_run(const atlas_proc_opts *opts, atlas_proc_sink sink, v
         if (remaining < 0) {
             remaining = 0;
         }
+        /* The idle bound is a second deadline, and the *earlier* of the two
+         * decides when poll returns. Collapsing them into one would let a
+         * long wall bound hide a short idle one. */
+        if (!kill_requested && opts->idle_timeout_ms > 0) {
+            int64_t idle_left = (last_output + opts->idle_timeout_ms) - now_ms();
+            if (idle_left < 0) {
+                idle_left = 0;
+            }
+            if (idle_left < remaining) {
+                remaining = idle_left;
+            }
+        }
         int poll_timeout = kill_requested ? 50 : (int)(remaining > 3600000 ? 3600000 : remaining);
+        /* A cancel callback has to be consulted on a schedule of its own, or a
+         * silent child with a long deadline would never be asked about. */
+        if (!kill_requested && opts->cancel != NULL &&
+            poll_timeout > ATLAS_PROC_CANCEL_POLL_MS) {
+            poll_timeout = ATLAS_PROC_CANCEL_POLL_MS;
+        }
+
+        /* Asked before poll returns as well as after, so a cancellation that
+         * arrives while the child is quiet is acted on at the next tick. */
+        if (!kill_requested && opts->cancel != NULL && opts->cancel(opts->cancel_ud)) {
+            local_res.cancelled = true;
+            kill_requested = true;
+            kill_group(pid, SIGTERM);
+            deadline = now_ms() + grace_ms;
+            continue;
+        }
         int pr = poll(fds, (nfds_t)nfds, poll_timeout);
         if (pr < 0) {
             if (errno == EINTR) {
@@ -317,16 +359,25 @@ atlas_status atlas_proc_run(const atlas_proc_opts *opts, atlas_proc_sink sink, v
                 /* Waiting only for the pipes to drain after a kill. */
                 continue;
             }
-            local_res.timed_out = true;
+            /* Which bound fired is recorded rather than inferred. A child that
+             * went quiet and a child that ran too long are different failures,
+             * and an operator acts differently on each. */
+            if (opts->idle_timeout_ms > 0 &&
+                now_ms() - last_output >= (int64_t)opts->idle_timeout_ms) {
+                local_res.idle_timed_out = true;
+            } else {
+                local_res.timed_out = true;
+            }
             kill_requested = true;
             kill_group(pid, SIGTERM);
-            deadline = now_ms() + ATLAS_PROC_KILL_GRACE_MS;
+            deadline = now_ms() + grace_ms;
             continue;
         }
 
         if (out_idx >= 0 && fds[out_idx].revents != 0) {
             ssize_t n = read(out_pipe[0], chunk, ATLAS_PROC_READ_CHUNK);
             if (n > 0) {
+                last_output = now_ms();
                 local_res.stdout_bytes += (size_t)n;
                 if (local_res.stdout_bytes > max_stdout) {
                     local_res.stdout_truncated = true;
@@ -360,6 +411,7 @@ atlas_status atlas_proc_run(const atlas_proc_opts *opts, atlas_proc_sink sink, v
         if (err_idx >= 0 && fds[err_idx].revents != 0) {
             ssize_t n = read(err_pipe[0], chunk, ATLAS_PROC_READ_CHUNK);
             if (n > 0) {
+                last_output = now_ms();
                 if (stderr_out != NULL && stderr_seen < max_stderr) {
                     size_t room = max_stderr - stderr_seen;
                     size_t take = ((size_t)n < room) ? (size_t)n : room;
@@ -400,6 +452,13 @@ atlas_status atlas_proc_run(const atlas_proc_opts *opts, atlas_proc_sink sink, v
         st = atlas_err_set(err, ATLAS_ERR_GIT, "%s timed out after %d ms", opts->argv[0],
                            timeout_ms);
     }
+    if (local_res.idle_timed_out && st == ATLAS_OK) {
+        st = atlas_err_set(err, ATLAS_ERR_GIT, "%s produced no output for %d ms", opts->argv[0],
+                           opts->idle_timeout_ms);
+    }
+    /* Cancellation is deliberately *not* an error status. A cancelled job is
+     * not a failed one, and the caller decides what it means; reporting it as a
+     * failure here would make every cancellation look like a fault. */
     if (res != NULL) {
         *res = local_res;
     }

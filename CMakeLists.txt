@@ -186,6 +186,24 @@ add_library(atlas_core STATIC
   src/core/rootpath.c
   src/core/authority.c
   src/core/syspolicy.c
+  # --- A8: the durable orchestration control plane ------------------------
+  #
+  # `atlasd` owns every orchestration row and is the only writer of one;
+  # `atlas-worker` runs the dispatcher and holds no database handle at all.
+  # The split is enforced by the filesystem first (0700 atlasd on the index)
+  # and by these files second, which is the ordering A7.1 established.
+  #
+  # Nothing here can approve a decision, change the registry or read a
+  # backup. A completed job is an artifact and a history, never an authority.
+  src/orch/orch.c
+  src/orch/policy.c
+  src/orch/workspace.c
+  src/orch/driver.c
+  src/orch/dispatch.c
+  src/orch/snapshot.c
+  src/core/service_orch.c
+  src/db/db_orch.c
+  src/ipc/server_orch.c
 )
 
 target_include_directories(atlas_core

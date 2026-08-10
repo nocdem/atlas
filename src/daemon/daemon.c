@@ -221,6 +221,30 @@ atlas_status atlas_daemon_run(const atlas_daemon_opts *opts, FILE *log, atlas_er
     sctx.workers = workers;
     sctx.log = log;
     sctx.syspolicy = syspolicy;
+    /* A8. Loaded once, here, for the reason the system policy is loaded once:
+     * the set of principals, repositories, modes and drivers orchestration runs
+     * under must not change under a running serve loop. A machine with no
+     * policy file leaves this zeroed, which is orchestration disabled — every
+     * `job.` and `dispatch.` method then refuses, and the daemon serves
+     * everything else exactly as before. */
+    /* **Only when this daemon is serving the system index.**
+     *
+     * The orchestration policy is read from a compiled-in path, so its mere
+     * presence would otherwise arm orchestration in *every* daemon on the
+     * machine — including a fixture daemon in a test tree and any ad-hoc daemon
+     * an unprivileged user starts on their own database. That daemon could not
+     * touch the live index, but it would be running the operator's orchestration
+     * configuration in a context the operator never intended, and a uid the
+     * policy lists as a submitter could hand it work.
+     *
+     * This is the same guard `serving_system_index` applies to the system
+     * policy, for the same reason, and a clean-extraction run caught its absence
+     * by finding a fixture daemon that had quietly inherited the live policy. */
+    if (serving_system_index) {
+        atlas_orchpolicy_load(&sctx.orchpolicy);
+    } else {
+        memset(&sctx.orchpolicy, 0, sizeof(sctx.orchpolicy));
+    }
     sctx.started_at_ms = monotonic_ms();
 
     atlas_daemon_log(log, "info", "serving on %s with %zu workers",

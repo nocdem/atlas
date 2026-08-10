@@ -31,6 +31,12 @@ static const atlas_backup_table REQUIRED_TABLES[] = {
     {"repo_events", 3},       {"ai_sessions", 4},         {"ai_reasons", 4},
     {"code_files", 5},        {"code_symbols", 5},        {"code_relations", 5},
     {"decision_documents", 6}, {"decision_revisions", 6}, {"decision_events", 6},
+    /* A8. Verification covers the orchestration tables for the reason it covers
+     * the decision tables: they are canonical, nothing rebuilds them, and a
+     * backup that restored without them would restore an Atlas that has
+     * forgotten every job it ever ran while reporting itself intact. */
+    {"orch_jobs", 8},          {"orch_attempts", 8},      {"orch_transitions", 8},
+    {"orch_leases", 8},
 };
 
 /* --- the online copy ----------------------------------------------------- */

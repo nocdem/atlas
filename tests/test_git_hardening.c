@@ -788,8 +788,41 @@ static void test_argv_policy(void) {
     atlas_err_init(&err);
     const char *argv[ATLAS_GIT_ARGV_MAX];
     size_t n = 0;
-    T_OK(atlas_git_build_argv(argv, ATLAS_GIT_ARGV_MAX, &n, "/usr/bin/git", "/repo", &err), &err);
+    char safedir[ATLAS_GIT_SAFEDIR_MAX];
+    T_OK(atlas_git_build_argv(argv, ATLAS_GIT_ARGV_MAX, &n, "/usr/bin/git", "/repo", safedir,
+                              sizeof(safedir), &err),
+         &err);
     argv[n] = NULL;
+
+    /* The safe-directory declaration names exactly the root that was asked for
+     * and nothing wider. A wildcard, a parent directory or an empty value here
+     * would turn a targeted declaration into a blanket one. */
+    {
+        bool found = false;
+        for (size_t i = 0; argv[i] != NULL; i++) {
+            if (strncmp(argv[i], "safe.directory=", 15u) == 0) {
+                found = true;
+                T_CHECK_MSG(strcmp(argv[i], "safe.directory=/repo") == 0,
+                            "the safe-directory declaration is \"%s\", not the exact root",
+                            argv[i]);
+            }
+        }
+        T_CHECK_MSG(found, "no safe-directory declaration was emitted for a repository");
+    }
+    /* An invocation with no repository declares nothing: there is no root to
+     * name, and a declaration without one would be a blanket exception. */
+    {
+        const char *bare[ATLAS_GIT_ARGV_MAX];
+        size_t bn = 0;
+        T_OK(atlas_git_build_argv(bare, ATLAS_GIT_ARGV_MAX, &bn, "/usr/bin/git", NULL, NULL, 0u,
+                                  &err),
+             &err);
+        bare[bn] = NULL;
+        for (size_t i = 0; bare[i] != NULL; i++) {
+            T_CHECK_MSG(strncmp(bare[i], "safe.directory=", 15u) != 0,
+                        "a repository-less invocation declared a safe directory");
+        }
+    }
 
     /* The global prefix. */
     static const char *const required[] = {
@@ -877,7 +910,75 @@ static void test_no_prompt_and_no_network(void) {
     env_close(&e);
 }
 
+static atlas_git *g_harden_git = NULL;
+
+/* Records each entry and reads the first blob, so one pass exercises both
+ * `ls-tree` and `cat-file` against the hostile repository. */
+static atlas_status harden_tree_cb(const atlas_git_tree_entry *ent, void *ud, atlas_err *err) {
+    atlas_buf *seen = (atlas_buf *)ud;
+    atlas_status st = atlas_buf_append(seen, ent->path, ent->path_len, err);
+    if (st == ATLAS_OK) {
+        st = atlas_buf_append_ch(seen, '\n', err);
+    }
+    if (st == ATLAS_OK && g_harden_git != NULL && strcmp(ent->type, "blob") == 0) {
+        atlas_buf sink = ATLAS_BUF_INIT;
+        st = atlas_git_cat_blob(g_harden_git, ent->oid, atlas_proc_sink_buf, &sink, 1u << 20,
+                                err);
+        atlas_buf_free(&sink);
+    }
+    return st;
+}
+
+/* --- A8: the snapshot reads, against the same hostile repository ---------
+ *
+ * `ls-tree`, `cat-file` and `diff --no-index` are the three git calls A8 added.
+ * They must be as inert as every other read: a repository that has configured a
+ * helper into `core.fsmonitor` must not get it executed when its tree is being
+ * materialised into a worker workspace.
+ *
+ * The control above already proves plain git *does* run the helper, so this is a
+ * statement about Atlas' hardening rather than about git being harmless. */
+static void test_a8_snapshot_reads_run_no_helper(void) {
+    harden_env e;
+    atlas_err err;
+    atlas_err_init(&err);
+    env_open(&e);
+    build_repo(&e);
+    set_repo_config(&e, "core.fsmonitor", atlas_buf_cstr(&e.helper));
+
+    char before[ATLAS_SHA256_HEX_LEN + 1u];
+    T_OK(fx_tree_digest(fx_repo(&e.fx), before, &err), &err);
+
+    atlas_git *g = NULL;
+    T_OK(atlas_git_open(fx_repo(&e.fx), &g, &err), &err);
+    atlas_git_head h;
+    memset(&h, 0, sizeof(h));
+    T_OK(atlas_git_read_head(g, &h, &err), &err);
+    g_harden_git = g;
+
+    /* Listing the tree and reading a blob: neither may fire the helper. */
+    atlas_buf seen = ATLAS_BUF_INIT;
+    T_OK(atlas_git_ls_tree(g, h.oid, harden_tree_cb, &seen, &err), &err);
+    T_CHECK_MSG(!fx_marker_fired(atlas_buf_cstr(&e.marker)),
+                "the hostile helper RAN during git ls-tree");
+    T_CHECK_MSG(seen.len > 0, "ls-tree returned no entries");
+    T_CHECK_MSG(!fx_marker_fired(atlas_buf_cstr(&e.marker)),
+                "the hostile helper RAN during git cat-file");
+
+    g_harden_git = NULL;
+    atlas_git_close(g);
+
+    /* And the repository is byte-identical: a snapshot read writes nothing. */
+    char after[ATLAS_SHA256_HEX_LEN + 1u];
+    T_OK(fx_tree_digest(fx_repo(&e.fx), after, &err), &err);
+    T_CHECK_MSG(strcmp(before, after) == 0, "an A8 snapshot read modified the repository");
+
+    atlas_buf_free(&seen);
+    env_close(&e);
+}
+
 static const atlas_test TESTS[] = {
+    {"A8 snapshot reads run no helper", test_a8_snapshot_reads_run_no_helper},
     {"environment policy", test_env_policy},
     {"argv policy", test_argv_policy},
     {"git executable is resolved once", test_executable_is_resolved_once},

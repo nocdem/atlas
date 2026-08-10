@@ -537,6 +537,39 @@ static atlas_status h_diff_end(atlas_renderer *r, const atlas_diff_report *rep, 
 
 /* --- A1: daemon, sync, events, service ---------------------------------- */
 
+/* A8. Every string here reached the CLI already safe-encoded by the daemon —
+ * the task text is UNTRUSTED_DATA and `job.get` encodes it before it leaves the
+ * socket — so it is printed as-is rather than encoded a second time. Double
+ * encoding is how `%2F` becomes `%252F` and a path stops round-tripping. */
+static atlas_status h_job_item(atlas_renderer *r, const atlas_job_render *jr, atlas_err *err) {
+    FILE *out = r->out;
+    if (!jr->detail) {
+        (void)fprintf(out, "%-34s %-17s %-10s %-8s %s\n", jr->job, jr->state, jr->repo,
+                      jr->driver, jr->created_at);
+        return ATLAS_OK;
+    }
+    (void)fprintf(out, "job           %s\n", jr->job);
+    (void)fprintf(out, "state         %s%s\n", jr->state,
+                  jr->cancel_requested ? " (cancellation requested)" : "");
+    (void)fprintf(out, "repository    %s\n", jr->repo);
+    (void)fprintf(out, "commit        %s\n", jr->commit);
+    (void)fprintf(out, "driver        %s\n", jr->driver);
+    (void)fprintf(out, "attempts      %lld of %lld\n", (long long)jr->attempts,
+                  (long long)jr->max_attempts);
+    (void)fprintf(out, "spec digest   %s\n", jr->spec_digest);
+    (void)fprintf(out, "created       %s\n", jr->created_at);
+    if (jr->terminal_at != NULL && jr->terminal_at[0] != '\0') {
+        (void)fprintf(out, "ended         %s\n", jr->terminal_at);
+    }
+    if (jr->task != NULL && jr->task[0] != '\0') {
+        /* Labelled, because it is a submitter's words and not Atlas'. */
+        (void)fprintf(out, "task (untrusted, atlas-safe-1)\n  %s\n", jr->task);
+    }
+    (void)atlas_err_init;
+    (void)err;
+    return ATLAS_OK;
+}
+
 static atlas_status h_daemon_status(atlas_renderer *r, const atlas_daemon_status_report *rep,
                                     atlas_err *err) {
     (void)err;
@@ -1438,6 +1471,7 @@ const atlas_renderer_vtbl ATLAS_RENDERER_HUMAN = {
     h_list_end,   h_doctor,       h_version,      h_repo_item,    h_repo_added,
     h_repo_removed, h_scan,       h_status,       h_search_item,  h_file,
     h_history_item, h_diff_begin, h_diff_item,    h_diff_end,
+    h_job_item,
     h_daemon_status, h_daemon_ping, h_repo_state, h_sync,         h_event_item,
     h_events_end, h_unit_text,    h_unit_install, h_integrate,
     /* --- A3 --- */

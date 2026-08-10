@@ -145,7 +145,7 @@ static void test_migration_rollback(void) {
     const atlas_migration *base = atlas_migrations(&base_count);
     T_REQUIRE(base_count >= 1u);
 
-    atlas_migration list[8];
+    atlas_migration list[16];
     T_REQUIRE(base_count + 1u <= sizeof(list) / sizeof(list[0]));
     memcpy(list, base, base_count * sizeof(list[0]));
     list[base_count].version = (int)base_count + 1;

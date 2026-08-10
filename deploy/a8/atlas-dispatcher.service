@@ -1,0 +1,117 @@
+# Atlas - the A8 job dispatcher.
+# Copyright 2026 The Atlas Authors. Licensed under the Apache License 2.0.
+#
+# The one persistent process that runs as `atlas-worker`, the untrusted account
+# every autonomous model process runs as. It asks `atlasd` for work over the
+# A7.1 socket, provisions an isolated workspace, runs a driver in it, and
+# reports back. It holds no database handle and can open no index.
+#
+# Installed to /etc/systemd/system/atlas-dispatcher.service, root-owned, 0644.
+# Machine-specific values do not appear here: the socket, the worker root, the
+# repositories, the drivers and the ceilings live in
+# /etc/atlas/orchestration.conf, which Atlas reads itself and which neither
+# `atlasd` nor `atlas-worker` can write.
+#
+# Every directive below was started on this machine before being written down.
+# A directive that is silently ignored is worse than none: it reads as a
+# guarantee in a unit file and is not one.
+
+[Unit]
+Description=Atlas job dispatcher (atlas-worker)
+Documentation=man:atlas(1)
+# The daemon owns the queue; there is nothing to dispatch without it. This is an
+# ordering and a want, not a requirement: the dispatcher's own reconnect backoff
+# handles a daemon that is restarting, and a hard Requires= would take the
+# dispatcher down every time the daemon was restarted.
+After=atlas.service
+Wants=atlas.service
+
+[Service]
+Type=simple
+User=atlas-worker
+# `atlas-clients` is the primary group so the dispatcher can open the shared
+# socket, exactly as the A7.1 unit does for the daemon. It buys nothing else:
+# the socket is the only object that group can reach.
+Group=atlas-clients
+SupplementaryGroups=atlas-worker
+
+# Absolute, root-owned, and never a build tree. A unit pointing at a worktree
+# binary is a unit whose trusted computing base is a developer's checkout —
+# and this one runs the untrusted account, which makes it worse.
+ExecStart=/usr/local/bin/atlas dispatcher run
+
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=60
+# SIGTERM, then a bounded grace period. The dispatcher finishes the operation it
+# is in and stops, so a restart does not abandon an attempt mid-report.
+KillMode=mixed
+KillSignal=SIGTERM
+
+# Nothing this process writes is readable by another account.
+UMask=0077
+
+# /var/lib/atlas-worker, 0700, owned by atlas-worker. The only writable path.
+StateDirectory=atlas-worker
+StateDirectoryMode=0700
+
+# --- sandbox ---------------------------------------------------------------
+#
+# The whole filesystem is read-only except the worker root. Note what is *not*
+# writable: the Atlas index, the backups, the installed binary, /etc/atlas, this
+# unit, the daemon's unit, and every registered repository.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @obsolete
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateDevices=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectProc=invisible
+ProcSubset=pid
+
+# The only writable path.
+ReadWritePaths=/var/lib/atlas-worker
+
+# **No repository access of any kind.** The dispatcher does not read registered
+# repositories: `atlasd` reads them and streams a canonical bounded snapshot over
+# the socket, so the worker has no reason to see /opt at all. This absence is
+# stronger than the read-only mount it replaces, and it is what makes "the
+# worker cannot open a registered repository" a property of the sandbox rather
+# than of the code.
+InaccessiblePaths=/opt
+
+# Explicitly unreachable. ProtectSystem=strict already makes them read-only;
+# these make them absent, so a bug cannot even enumerate them.
+InaccessiblePaths=/var/lib/atlas
+InaccessiblePaths=/var/backups/atlas
+
+# The dispatcher talks to one Unix socket and nothing else. No network of any
+# kind: a driver that wants to reach the internet cannot, from here.
+RestrictAddressFamilies=AF_UNIX
+
+# MemoryDenyWriteExecute is deliberately absent. The Claude Code driver executes
+# a Node.js runtime, which JIT-compiles and therefore needs writable-executable
+# mappings; setting it would make the driver fail with SIGSEGV rather than
+# refuse cleanly. The daemon, which runs no such thing, keeps it. Writing it
+# here and having it kill the one process it was meant to protect would be a
+# directive that reads as a guarantee and is not one.
+
+# ProtectHome=yes is what removes any path from the dispatcher to the operator's
+# account, their Claude session, their SSH keys and their credential agents.
+
+[Install]
+WantedBy=multi-user.target

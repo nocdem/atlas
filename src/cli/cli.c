@@ -52,6 +52,11 @@ void atlas_cli_print_help(FILE *out) {
         "usage: atlas [OPTIONS] COMMAND [OPTIONS] [ARGS]\n"
         "\n"
         "commands:\n"
+        "  job submit --repo NAME --task TEXT [--driver D] [--mode M]\n"
+        "                            [--idempotency-key K] [--attempts N]\n"
+        "  job get|cancel JOB        read or cancel one job\n"
+        "  job list                  jobs this principal submitted\n"
+        "  dispatcher run [--once]   run the job dispatcher (as atlas-worker)\n"
         "  doctor                     check the environment, database and search backend\n"
         "  repo add PATH [--name N]   register a git repository (read-only)\n"
         "  repo list                  list registered repositories\n"
@@ -273,6 +278,36 @@ static atlas_status parse_args(cli_state *st, int argc, char **argv, bool *want_
                 if (s != ATLAS_OK) {
                     return s;
                 }
+            } else if (strcmp(a, "--repo") == 0 || strcmp(a, "--task") == 0 ||
+                       strcmp(a, "--mode") == 0 || strcmp(a, "--driver") == 0 ||
+                       strcmp(a, "--idempotency-key") == 0 || strcmp(a, "--wall-timeout-ms") == 0 ||
+                       strcmp(a, "--idle-timeout-ms") == 0 || strcmp(a, "--attempts") == 0) {
+                /* A8 job options, grouped for the same reason the A4 ones are:
+                 * the "a flag at the end of the line has no value" check lives
+                 * once rather than eight times. */
+                if (i + 1 >= argc) {
+                    return atlas_err_set(err, ATLAS_ERR_USAGE, "%s needs a value", a);
+                }
+                const char *v = argv[++i];
+                if (strcmp(a, "--repo") == 0) {
+                    st->opts.job.repo = v;
+                } else if (strcmp(a, "--task") == 0) {
+                    st->opts.job.task = v;
+                } else if (strcmp(a, "--mode") == 0) {
+                    st->opts.job.mode = v;
+                } else if (strcmp(a, "--driver") == 0) {
+                    st->opts.job.driver = v;
+                } else if (strcmp(a, "--idempotency-key") == 0) {
+                    st->opts.job.key = v;
+                } else if (strcmp(a, "--wall-timeout-ms") == 0) {
+                    st->opts.job.wall_ms = strtol(v, NULL, 10);
+                } else if (strcmp(a, "--idle-timeout-ms") == 0) {
+                    st->opts.job.idle_ms = strtol(v, NULL, 10);
+                } else {
+                    st->opts.job.attempts = strtol(v, NULL, 10);
+                }
+            } else if (strcmp(a, "--once") == 0) {
+                st->opts.job.once = true;
             } else if (strcmp(a, "--title") == 0 || strcmp(a, "--context") == 0 ||
                        strcmp(a, "--decision") == 0 || strcmp(a, "--rationale") == 0 ||
                        strcmp(a, "--consequences") == 0 || strcmp(a, "--scope") == 0 ||
@@ -1709,6 +1744,87 @@ static atlas_status run_code(cli_state *st, atlas_ctx *ctx, atlas_renderer *r, i
     return atlas_err_set(err, ATLAS_ERR_USAGE, "unknown code subcommand \"%s\"", sub);
 }
 
+
+/* --- A8: `atlas job` and `atlas dispatcher` -------------------------------- */
+
+typedef struct job_render_ctx {
+    atlas_renderer *r;
+} job_render_ctx;
+
+static atlas_status emit_job(const atlas_job_render *jr, void *ud, atlas_err *err) {
+    job_render_ctx *jc = (job_render_ctx *)ud;
+    return jc->r->v->job_item(jc->r, jr, err);
+}
+
+/* No `atlas_ctx`, deliberately.
+ *
+ * A job command speaks only to the daemon: orchestration state lives in the
+ * index, `atlasd` is the only writer of it, and on a separated deployment no
+ * other account can even open the file. Opening a context here would try to
+ * prepare a data directory this uid does not own — which is exactly what it did
+ * during the A8 cutover, and the reason these commands are dispatched before any
+ * context is opened, alongside `dispatcher`, `backup` and `restore`. */
+static atlas_status run_job(cli_state *st, atlas_renderer *r, int64_t limit, atlas_err *err) {
+    const char *sub = st->operand_count > 0 ? st->operands[0] : NULL;
+    if (sub == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "atlas job <submit|get|list|cancel> (try: atlas help)");
+    }
+    job_render_ctx jc = {r};
+    atlas_status result;
+
+    if (strcmp(sub, "submit") == 0) {
+        atlas_job_submit_opts o;
+        memset(&o, 0, sizeof(o));
+        o.repo = st->opts.job.repo;
+        o.task = st->opts.job.task;
+        o.mode = st->opts.job.mode;
+        o.driver = st->opts.job.driver;
+        o.idempotency_key = st->opts.job.key;
+        o.wall_timeout_ms = st->opts.job.wall_ms;
+        o.idle_timeout_ms = st->opts.job.idle_ms;
+        o.max_attempts = st->opts.job.attempts;
+        result = renderer_open(r, st->opts.json, st->out, "job submit", err);
+        if (result == ATLAS_OK) {
+            result = atlas_service_job_submit(NULL, &o, emit_job, &jc, err);
+        }
+    } else if (strcmp(sub, "get") == 0) {
+        const char *job = st->operand_count > 1 ? st->operands[1] : NULL;
+        result = renderer_open(r, st->opts.json, st->out, "job get", err);
+        if (result == ATLAS_OK) {
+            result = atlas_service_job_get(NULL, job, emit_job, &jc, err);
+        }
+    } else if (strcmp(sub, "cancel") == 0) {
+        const char *job = st->operand_count > 1 ? st->operands[1] : NULL;
+        result = renderer_open(r, st->opts.json, st->out, "job cancel", err);
+        if (result == ATLAS_OK) {
+            result = atlas_service_job_cancel(NULL, job, emit_job, &jc, err);
+        }
+    } else if (strcmp(sub, "list") == 0) {
+        result = renderer_open(r, st->opts.json, st->out, "job list", err);
+        int64_t count = 0;
+        bool more = false;
+        if (result == ATLAS_OK) {
+            result = r->v->list_begin(r, "jobs", err);
+        }
+        if (result == ATLAS_OK) {
+            result = atlas_service_job_list(NULL, 0, limit, emit_job, &jc, &count, &more, err);
+        }
+        if (result == ATLAS_OK) {
+            result = r->v->list_end(r, "job", "jobs", count, err);
+        }
+    } else {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "unknown job subcommand \"%s\"", sub);
+    }
+
+    if (result == ATLAS_OK) {
+        result = renderer_close(r, err);
+    } else {
+        renderer_abort(r);
+    }
+    return result;
+}
+
 static atlas_status run_command(cli_state *st, atlas_err *err) {
     const char *cmd = st->command;
     atlas_renderer r;
@@ -1842,6 +1958,31 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
      * route to. That absence is the point: nothing reachable over the socket —
      * and so nothing reachable from MCP or a hook — can replace or prune the
      * index. */
+    /* A8. The dispatcher is dispatched here, before any `atlas_ctx` is opened,
+     * for the reason backup and restore are: a context in AUTO mode takes the
+     * writer lock when it is free, and the dispatcher must never take it — it
+     * runs as `atlas-worker`, which cannot open the index at all, and a code
+     * path that tried would fail confusingly instead of never existing.
+     *
+     * It also needs no data directory: everything it acts on arrives over the
+     * socket. */
+    if (strcmp(cmd, "job") == 0) {
+        atlas_renderer jr;
+        memset(&jr, 0, sizeof(jr));
+        int64_t limit = st->opts.limit > 0 ? st->opts.limit : ATLAS_DEFAULT_LIMIT;
+        return run_job(st, &jr, limit, err);
+    }
+
+    if (strcmp(cmd, "dispatcher") == 0) {
+        const char *sub = st->operand_count > 0 ? st->operands[0] : NULL;
+        if (sub == NULL || strcmp(sub, "run") != 0) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE, "usage: atlas dispatcher run [--once]");
+        }
+        /* Logs to stderr so a systemd unit captures them in the journal without
+         * the service needing a writable log path. */
+        return atlas_service_dispatcher_run(st->opts.job.once, st->errout, err);
+    }
+
     if (strcmp(cmd, "backup") == 0) {
         if (st->operand_count == 0) {
             return atlas_err_set(err, ATLAS_ERR_USAGE,

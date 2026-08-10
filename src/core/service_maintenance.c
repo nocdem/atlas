@@ -160,6 +160,57 @@ static const retention_entry RETENTION[] = {
     {"decision_search", ATLAS_RETAIN_DERIVED, false,
      "the searchable projection of decision prose, rebuilt from the canonical rows"},
 
+    /* --- A8: orchestration ---------------------------------------------------
+     *
+     * Every one of these is CANONICAL and none is prunable, and that is not
+     * caution. Nothing rebuilds an orchestration row: the repository never held
+     * what was asked for, who asked, what was granted, what ran or what came
+     * back, so a job record is the only account of it that exists. An age-pruned
+     * execution history would leave a control plane that can say a job succeeded
+     * and cannot say what it did.
+     *
+     * A retention policy that mattered here would be about the *workspaces* on
+     * disk — bytes the worker owns, bounded by the dispatcher — not about these
+     * rows, which are small and are the audit trail. */
+    {"orch_jobs", ATLAS_RETAIN_CANONICAL, false,
+     "the specification, submitter and outcome of every job Atlas accepted; it is the only record "
+     "of what was asked for, and its digest is what makes an idempotent resubmission provably the "
+     "same request rather than a similar one"},
+    {"orch_attempts", ATLAS_RETAIN_CANONICAL, false,
+     "one row per execution attempt, holding the dispatcher that took it and how it ended; "
+     "attempt numbers are monotonic per job and a missing row would make a later attempt look "
+     "like an earlier one"},
+    {"orch_leases", ATLAS_RETAIN_CANONICAL, false,
+     "which attempt held the exclusive right to execute a job, and until when; the partial unique "
+     "index over unreleased leases is what makes concurrent execution impossible, and a deleted "
+     "row is a lease nothing can prove was ever exclusive"},
+    {"orch_transitions", ATLAS_RETAIN_CANONICAL, false,
+     "the append-only state ledger, and the ordering authority every job row points at through "
+     "state_seq; its AUTOINCREMENT id must never be reissued, so nothing may delete from it"},
+    {"orch_events", ATLAS_RETAIN_CANONICAL, false,
+     "what the worker reported while it ran, recorded as the worker's claim; it is the only "
+     "narrative of a failed job and the thing an operator reads when deciding whether to retry"},
+    {"orch_artifacts", ATLAS_RETAIN_CANONICAL, false,
+     "the manifest — name, size and digest — of what an attempt produced, and for small artifacts "
+     "the bytes; the patch a job generated is evidence of what a model proposed and is never "
+     "regenerable, because the model run that produced it is gone"},
+    {"orch_idempotency", ATLAS_RETAIN_CANONICAL, false,
+     "the key-to-job mapping that makes resubmission replay-safe; removing a row by age turns a "
+     "replay into a second execution of work that already ran"},
+    {"orch_snapshots", ATLAS_RETAIN_CANONICAL, false,
+     "the identity of the exact source an attempt was given: the pinned commit, the tree, the "
+     "entry count and the domain-separated digest; it is the only record of what a job actually "
+     "ran against, and without it a produced patch describes a tree nobody can name"},
+    {"orch_snapshot_entries", ATLAS_RETAIN_CANONICAL, false,
+     "the ordered manifest the snapshot digest is computed over; the order is part of the "
+     "identity, so removing or renumbering a row would silently change what the digest means "
+     "rather than making the record smaller"},
+
+    {"orch_observations", ATLAS_RETAIN_CANONICAL, false,
+     "the worker's own account of the phase it believed it was in, written on a phase change "
+     "rather than per heartbeat so the row count is bounded by the state machine; it is what "
+     "distinguishes a worker that died silently from one that never started"},
+
     /* --- full-text indexes -------------------------------------------------- */
     {"files_fts", ATLAS_RETAIN_DERIVED, false, "FTS5 index over files; rebuilt from files"},
     {"commits_fts", ATLAS_RETAIN_DERIVED, false, "FTS5 index over commits; rebuilt from commits"},

@@ -528,10 +528,15 @@ atlas_status atlas_ipc_listen(const char *socket_path, const atlas_syspolicy *po
 /* --- accepting ----------------------------------------------------------- */
 
 atlas_status atlas_ipc_accept(int listen_fd, const atlas_syspolicy *policy, int *fd_out,
-                              int64_t *peer_pid_out, atlas_err *err) {
+                              int64_t *peer_pid_out, int64_t *peer_uid_out, atlas_err *err) {
     *fd_out = -1;
     if (peer_pid_out != NULL) {
         *peer_pid_out = 0;
+    }
+    /* Zero is not a uid any A8 method group is selected on, so a caller that
+     * forgets to look at the return value gets the refusing default. */
+    if (peer_uid_out != NULL) {
+        *peer_uid_out = 0;
     }
     int fd = accept4(listen_fd, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
     if (fd < 0) {
@@ -581,6 +586,9 @@ atlas_status atlas_ipc_accept(int listen_fd, const atlas_syspolicy *policy, int 
     }
     if (peer_pid_out != NULL) {
         *peer_pid_out = (int64_t)cred.pid;
+    }
+    if (peer_uid_out != NULL) {
+        *peer_uid_out = (int64_t)cred.uid;
     }
     *fd_out = fd;
     return ATLAS_OK;

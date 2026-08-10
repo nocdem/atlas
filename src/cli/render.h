@@ -52,6 +52,10 @@ typedef struct atlas_renderer_vtbl {
     atlas_status (*diff_item)(atlas_renderer *r, const atlas_diff_entry *e, atlas_err *err);
     atlas_status (*diff_end)(atlas_renderer *r, const atlas_diff_report *rep, atlas_err *err);
     /* --- A1 --- */
+    /* A8. One method for both a list row and a detail view: the fields are the
+     * same and only the depth differs, so two methods would be two places to
+     * forget a field. */
+    atlas_status (*job_item)(atlas_renderer *r, const atlas_job_render *jr, atlas_err *err);
     atlas_status (*daemon_status)(atlas_renderer *r, const atlas_daemon_status_report *rep,
                                   atlas_err *err);
     atlas_status (*daemon_ping)(atlas_renderer *r, bool reachable, const char *socket_path,

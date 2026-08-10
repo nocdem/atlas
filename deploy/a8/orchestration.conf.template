@@ -1,0 +1,54 @@
+# Atlas - the A8 orchestration policy.
+# Copyright 2026 The Atlas Authors. Licensed under the Apache License 2.0.
+#
+# Installed to /etc/atlas/orchestration.conf, owned by root, mode 0644, and
+# reached by Atlas through a walk from / that refuses every symlink and every
+# component not owned by root. Neither `atlasd` nor `atlas-worker` can create or
+# edit it: a policy the constrained account can write is a policy it can widen.
+#
+# Anything missing, malformed, symlinked, group-writable or owned by anybody but
+# root leaves orchestration DISABLED. An unrecognised key is an error, not a
+# line that is skipped — a policy Atlas half-understands is one whose author
+# believes they configured something Atlas never read.
+
+# The one uid that may act as the dispatcher. Compared against SO_PEERCRED and
+# nothing else. It may not also appear as a submitter: keeping the two disjoint
+# is what makes "a client cannot forge a dispatcher message, and a dispatcher
+# cannot create its own work" a property of the configuration.
+dispatcher_uid = 993
+
+# Who may create, cancel and read jobs. Still subject to the A7.1 client
+# allowlist first; this list is narrower, never wider.
+submitter_uid = 1000
+
+# Registered repository *names* that may be snapshotted — never paths. The
+# daemon resolves the name through its own registry, so an unregistered
+# directory cannot be named at all.
+#
+# Start with the minimum. Adding `dna` or `swapper` here is a deliberate act
+# that authorises autonomous work against them, and A8 does not do it for you.
+repo = atlas
+
+# The job modes and drivers a submission may name.
+mode = patch
+driver = fake
+driver = claude
+
+# Ceilings. Each may only *lower* the compiled-in absolute in atlas/orch.h; a
+# policy asking for more is refused rather than silently reduced.
+max_wall_timeout_ms = 900000
+max_idle_timeout_ms = 300000
+max_attempts = 3
+max_output_bytes = 4194304
+max_artifact_bytes = 16777216
+max_artifact_count = 64
+
+# Where the dispatcher owns its workspaces. Must be absolute, must be owned by
+# the dispatcher uid, and must not be writable by group or other.
+worker_root = /var/lib/atlas-worker
+
+# Whether a driver that calls a live model may run at all. `off` until an
+# operator has installed a worker service credential and decided to enable it;
+# enabling live model execution is a deliberate act, not a consequence of
+# installing a policy.
+live_model = off

@@ -549,6 +549,64 @@ static atlas_status j_diff_end(atlas_renderer *r, const atlas_diff_report *rep, 
 
 /* --- A1: daemon, sync, events, service ---------------------------------- */
 
+/* A8. Same note as the human renderer: these strings are already safe-encoded
+ * by the daemon and are emitted through the JSON writer, which escapes for JSON
+ * structure. Neither step is the other, and neither is applied twice. */
+static atlas_status j_job_item(atlas_renderer *r, const atlas_job_render *jr, atlas_err *err) {
+    atlas_json *j = r->j;
+    /* Inside the `jobs` array this is an anonymous object; on its own it is a
+     * set of members on the document. The writer refuses an unkeyed object at
+     * the top level, which is the correct refusal and is why this branch
+     * exists. */
+    atlas_status st = jr->in_list ? atlas_json_obj_begin(j, err) : ATLAS_OK;
+    struct {
+        const char *k;
+        const char *v;
+    } strs[] = {
+        {"job", jr->job},         {"state", jr->state},
+        {"repo", jr->repo},       {"driver", jr->driver},
+        {"created_at", jr->created_at},
+    };
+    for (size_t i = 0; st == ATLAS_OK && i < sizeof strs / sizeof strs[0]; i++) {
+        if (strs[i].v != NULL) {
+            st = atlas_json_key_str(j, strs[i].k, strs[i].v, err);
+        }
+    }
+    if (st == ATLAS_OK && jr->detail) {
+        struct {
+            const char *k;
+            const char *v;
+        } more[] = {
+            {"commit", jr->commit},           {"spec_digest", jr->spec_digest},
+            {"terminal_at", jr->terminal_at}, {"task", jr->task},
+        };
+        for (size_t i = 0; st == ATLAS_OK && i < sizeof more / sizeof more[0]; i++) {
+            if (more[i].v != NULL && more[i].v[0] != '\0') {
+                st = atlas_json_key_str(j, more[i].k, more[i].v, err);
+            }
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "task_encoding", "atlas-safe-1", err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_int(j, "max_attempts", jr->max_attempts, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_bool(j, "cancel_requested", jr->cancel_requested, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_int(j, "seq", jr->seq, err);
+        }
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(j, "attempts", jr->attempts, err);
+    }
+    if (st == ATLAS_OK && jr->in_list) {
+        st = atlas_json_obj_end(j, err);
+    }
+    return st;
+}
+
 static atlas_status j_daemon_status(atlas_renderer *r, const atlas_daemon_status_report *rep,
                                     atlas_err *err) {
     atlas_json *j = r->j;
@@ -1346,6 +1404,7 @@ const atlas_renderer_vtbl ATLAS_RENDERER_JSON = {
     j_list_end,   j_doctor,       j_version,      j_repo_item,    j_repo_added,
     j_repo_removed, j_scan,       j_status,       j_search_item,  j_file,
     j_history_item, j_diff_begin, j_diff_item,    j_diff_end,
+    j_job_item,
     j_daemon_status, j_daemon_ping, j_repo_state, j_sync,         j_event_item,
     j_events_end, j_unit_text,    j_unit_install, j_integrate,
     /* --- A3 --- */

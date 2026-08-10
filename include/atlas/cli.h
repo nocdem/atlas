@@ -78,6 +78,22 @@ typedef struct atlas_cli_opts {
     bool apply;
     long older_than_days;
     long retain;
+    /* A8. `atlas job submit` and friends. Every one of these is a *request*;
+     * the daemon resolves the repository, pins the commit and applies the
+     * policy's ceilings, so nothing here is trusted as given. */
+    struct {
+        const char *repo;
+        const char *task;
+        const char *mode;
+        const char *driver;
+        const char *key; /* idempotency key */
+        long wall_ms;
+        long idle_ms;
+        long attempts;
+        /* `atlas dispatcher run --once`: take at most one job and stop. How the
+         * live smoke drives exactly one attempt without a service. */
+        bool once;
+    } job;
 } atlas_cli_opts;
 
 /* Runs one command line. `argv[0]` is the program name. Returns the process

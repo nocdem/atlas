@@ -242,9 +242,25 @@ claude plugin install atlas@atlas-local --scope user
 atlas integrate claude doctor          # checks the whole chain
 ```
 
-Registering a repository by hand is no longer necessary: the first session in a
-git worktree registers it. `atlas repo add /path --name dna` still works, and
-`ATLAS_CLAUDE_NO_AUTO_REGISTER=1` turns the automatic half off.
+**Register each repository yourself, with the daemon stopped:**
+
+```sh
+systemctl --user stop atlas
+atlas repo add /path --name dna
+systemctl --user start atlas
+```
+
+A7 removed automatic registration. Until then, opening a Claude session in a
+directory registered it, and so did granting an MCP root — both of which are
+chosen by, or influenced by, the model, which made "a model looked here"
+sufficient for Atlas to start reading, hashing and indexing a tree nobody had
+vouched for. There is no longer any RPC method, MCP tool or hook that registers
+anything; a session in an unregistered directory is reported as unregistered and
+nothing else happens. See `docs/security/A7_SECURITY_REVIEW.md`.
+
+The daemon must be stopped because registration is a local operation under the
+data-directory write lock, which the daemon holds while it runs — the same
+contract `backup restore` and `maintenance prune` have had since A5.
 
 ### What A2 adds
 

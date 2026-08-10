@@ -532,20 +532,22 @@ atlas_status atlas_mcp_resolve_repo(atlas_mcp_server *s, const char *requested, 
                              "no repository it is authorized to read");
     }
 
-    /* Resolve every root once, lazily, and **register it if it is a git
-     * worktree Atlas has not seen**.
+    /* Resolve every root once, lazily. **A7: resolve, never register.**
      *
-     * The first version of this deliberately did not register, on the grounds
-     * that a mutation in the middle of a tool call is a surprise. That was the
-     * wrong call: it made MCP depend on a Claude `SessionStart` hook having run
-     * first, which contradicts Atlas being AI-client-neutral — another MCP
-     * client, with no hooks at all, could never index anything.
+     * A middle version of this did register, bounded to the case where the
+     * granted root was itself the worktree root, on the grounds that otherwise
+     * an MCP client with no hooks could never index anything. The bound was
+     * real and the reasoning was still wrong, because of who chooses the root:
+     * `roots/list` is answered by the client, and a model that can influence
+     * what its client grants can therefore choose what Atlas registers. That is
+     * the same authority `repo.ensure` handed the session hook, arriving by a
+     * different door.
      *
-     * What makes it safe is the bound, not the absence: `repo.ensure` is called
-     * with the granted root itself and with `exact_root`, so it registers only
-     * when the granted root *is* the worktree root. A root inside a larger
-     * repository does not cause its parent to be registered, because the parent
-     * is not what the client granted. Nothing walks the filesystem. */
+     * So the inconvenience is accepted and named instead: an MCP client working
+     * in a repository nobody registered gets a refusal that says so, and an
+     * operator fixes it with one `atlas repo add`. Being unable to index
+     * anything until a person says so is the intended shape of the boundary,
+     * not a gap in it. */
     for (size_t i = 0; i < s->root_count; i++) {
         atlas_mcp_root *r = &s->roots[i];
         if (r->resolved) {
@@ -559,11 +561,6 @@ atlas_status atlas_mcp_resolve_repo(atlas_mcp_server *s, const char *requested, 
         atlas_buf params = ATLAS_BUF_INIT;
         atlas_status st = atlas_json_key_str(j, "path", atlas_buf_cstr(&r->path), err);
         if (st == ATLAS_OK) {
-            /* Register only when the granted root is itself the worktree root.
-             * This is what keeps registration inside what the client granted. */
-            st = atlas_json_key_bool(j, "exact_root", true, err);
-        }
-        if (st == ATLAS_OK) {
             st = atlas_ipc_params_finish(p, &params, err);
         } else {
             atlas_ipc_params_abort(p);
@@ -572,7 +569,7 @@ atlas_status atlas_mcp_resolve_repo(atlas_mcp_server *s, const char *requested, 
             atlas_buf_free(&params);
             return st;
         }
-        atlas_ipc_response *resp = atlas_mcp_call(s, "repo.ensure", atlas_buf_cstr(&params));
+        atlas_ipc_response *resp = atlas_mcp_call(s, "repo.resolve", atlas_buf_cstr(&params));
         atlas_buf_free(&params);
         if (resp == NULL) {
             /* The daemon is unreachable. Not marked resolved, so a later call
@@ -588,12 +585,6 @@ atlas_status atlas_mcp_resolve_repo(atlas_mcp_server *s, const char *requested, 
             atlas_ipc_result_str(resp, "repo", &name)) {
             (void)atlas_buf_set_str(&r->repo, name, err);
             r->registered = true;
-            bool created = false;
-            (void)atlas_ipc_result_bool(resp, "created", &created);
-            if (created) {
-                atlas_mcp_log(s, "registered a granted root as repository %s",
-                              atlas_safe(&s->safe, name));
-            }
         } else {
             /* Refused, and the reason is kept so a tool call can say why rather
              * than reporting a bare "no repository". Non-destructive: nothing

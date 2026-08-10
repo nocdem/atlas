@@ -272,6 +272,22 @@ static void live_start(live *l, atlas_err *err) {
     T_OK(fx_add_all(&l->fx, fx_repo(&l->fx), err), err);
     T_OK(fx_commit(&l->fx, fx_repo(&l->fx), "initial", err), err);
 
+    /* Registered here, by the operator path, before the daemon starts.
+     *
+     * Until A7 the SessionStart hook did this itself. It no longer does and
+     * must not: opening a session is a model-triggered event, so registration
+     * from a hook made "a model looked at this directory" sufficient to decide
+     * what Atlas indexes. The hook now resolves an existing registration, which
+     * is what the tests below exercise. */
+    /* Named "repo" because that is the basename of the fixture's worktree, and
+     * so the name auto-registration used to derive. The rest of the suite names
+     * the repository in `sync` and `events` arguments. */
+    const char *add[] = {"--data-dir", fx_data_dir(&l->fx), "repo", "add", fx_repo(&l->fx),
+                         "--name", "repo"};
+    int add_code = -1;
+    T_OK(fx_atlas(add, 7u, NULL, NULL, &add_code, err), err);
+    T_EQ_INT(add_code, 0);
+
     fx_daemon_init(&l->d);
     T_OK(fx_daemon_start(&l->fx, &l->d, err), err);
     T_OK(fx_daemon_wait_ready(&l->d, 15000, err), err);
@@ -681,20 +697,28 @@ static void test_directory_added_ensures_a_new_repository(void) {
     hook_run_free(&h);
     atlas_buf_free(&payload);
 
-    /* Both are in the index. Attaching alone used to silently do nothing here,
-     * which is the common case: a directory is added precisely because somebody
-     * is about to work in something new. */
+    /* **A7 inverted this, and the inversion is the point.**
+     *
+     * `DirectoryAdded` used to *ensure* the directory, so adding a directory to
+     * a session registered it. Adding a directory is a model-visible action —
+     * a slash command in this very payload — so that made the model's choice of
+     * directory the thing that decided what Atlas indexes and reads. The hook
+     * now resolves, and a directory nobody registered stays unregistered.
+     *
+     * The registry therefore still holds exactly the one repository the
+     * operator put in it. */
     const char *list[] = {"repo", "list", "--json"};
     atlas_jsondoc *doc = live_query(&l, list, 3u, &err);
     T_REQUIRE(doc != NULL);
     int64_t count = 0;
     T_CHECK(atlas_jsonv_int(atlas_jsonv_get(atlas_jsondoc_root(doc), "count"), &count));
-    T_CHECK_MSG(count == 2, "DirectoryAdded did not register the new repository (count %lld)",
+    T_CHECK_MSG(count == 1, "DirectoryAdded registered a repository (count %lld)",
                 (long long)count);
     atlas_jsondoc_free(doc);
 
-    /* And the session is attached to it, so work there belongs to this session
-     * rather than to nothing. */
+    /* The hook still succeeded and the session still exists — failing open is
+     * A2's rule and A7 does not change it. What it cannot do is attach to a
+     * repository that is not there. */
     atlas_buf params = ATLAS_BUF_INIT;
     atlas_buf resp = ATLAS_BUF_INIT;
     T_OK(atlas_buf_appendf(&params, &err,
@@ -711,12 +735,6 @@ static void test_directory_added_ensures_a_new_repository(void) {
     bool present = false;
     T_CHECK(atlas_ipc_result_bool(r, "present", &present));
     T_CHECK_MSG(present, "the session that added the directory was not found by its own key");
-    /* Attachment is the actual claim, and it is a different fact from the
-     * session existing: `open_sessions` counts sessions with *this repository*
-     * attached, so a non-zero count is the attachment. */
-    int64_t open_sessions = 0;
-    T_CHECK(atlas_ipc_result_int(r, "open_sessions", &open_sessions));
-    T_CHECK_MSG(open_sessions == 1, "the session was not attached to the newly added repository");
     atlas_ipc_response_free(r);
 
     atlas_buf_free(&resp);
@@ -777,7 +795,7 @@ static const atlas_test TESTS[] = {
      test_concurrent_sessions_stay_distinct},
     {"Stop closes each turn with an explicit UNKNOWN and never blocks",
      test_stop_closes_the_turn_with_unknown},
-    {"DirectoryAdded ensures and attaches a repository Atlas has never seen",
+    {"DirectoryAdded does not register a repository Atlas has never seen",
      test_directory_added_ensures_a_new_repository},
     {"no hook writes to the target repository", test_hooks_never_write_to_the_repository},
 };

@@ -13,6 +13,7 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#include "atlas/authority.h"
 #include "atlas/code.h"
 #include "atlas/datadir.h"
 #include "atlas/db.h"
@@ -111,6 +112,15 @@ typedef struct atlas_doctor_report {
     atlas_buf foreign_key_check;
     int64_t repo_count;
     atlas_search_mode search_mode;
+    /* A7. Which operations this profile will let anyone perform, and why.
+     *
+     * Reported by `doctor` because a lock nobody can see is a lock nobody
+     * trusts: the first thing an operator does when `decision approve` refuses
+     * is ask what is wrong with Atlas, and this is the answer. Never a
+     * *finding* — a locked profile is the correct and expected state of an
+     * unseparated machine, not a fault — so it does not affect `ok`. */
+    atlas_authority_state authority_state;
+    atlas_authority_reason authority_reason;
     bool ok;                  /* no blocking problem found */
     atlas_buf problems;       /* newline-separated, empty when ok */
 } atlas_doctor_report;

@@ -27,6 +27,25 @@ agent with shell access.** `tests/test_decision_operator.c` does precisely
 that, on purpose: a test suite that could not demonstrate this would be a suite
 whose subject was making a stronger claim than the code supports.
 
+**A7 acted on that sentence rather than only publishing it.** A terminal is no
+longer the gate, because nothing observable from inside a process distinguishes
+a person from a program running as the same uid. Approving, rejecting,
+superseding and revalidating now require *operator authority*: a root-anchored
+policy naming an `operator_uid`, matched against the caller, with the `atlas`
+executable itself owned by root and not writable by anyone else. Where those do
+not hold, the profile is **locked** and the four verbs are refused before a
+terminal is opened, before a capability is minted and before a prompt is
+printed. `atlas doctor` reports the profile state and the reason on every run.
+
+A locked profile does not stop a same-uid process from writing
+`state='APPROVED'` into SQLite by hand — nothing in userspace could. What it
+stops is Atlas *manufacturing a coherent record* for it: a forged row no longer
+agrees with the append-only ledger, so `atlas_db_decision_verify` reports the
+disagreement and `atlas doctor` surfaces it. An undetectable forgery becomes a
+detectable one, and that is the whole of the claim. See
+`docs/security/A7_SECURITY_REVIEW.md` (ATLAS-A7-001, ATLAS-A7-004) for the
+reproduction, the scope argument, and the exact deployment that lifts the lock.
+
 So the claim Atlas makes is narrow and true: **Atlas hands a model no capability
 that approves a decision.** It deliberately does not make the broader claim that
 sounds similar — that a model is unable to approve one — because that would be a

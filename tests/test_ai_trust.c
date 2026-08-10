@@ -278,14 +278,19 @@ static void test_hostile_repository_never_reaches_session_start_context(void) {
 
     fx_daemon d;
     fx_daemon_init(&d);
+
+    /* Registered before the daemon exists. Since A7 the registry is a local
+     * operation under the write lock, which the daemon holds while it runs. */
+    const char *add[] = {"--data-dir", fx_data_dir(&fx), "repo", "add", fx_repo(&fx), "--name",
+                         "hostile"};
+    int code = 0;
+    T_OK(fx_atlas(add, 7u, NULL, NULL, &code, &err), &err);
+    T_EQ_INT(code, 0);
+
     T_OK(fx_daemon_start(&fx, &d, &err), &err);
     T_OK(fx_daemon_wait_ready(&d, 15000, &err), &err);
 
-    /* Register and index it, so the envelope has real state to describe. */
-    const char *add[] = {"repo", "add", fx_repo(&fx), "--name", "hostile"};
-    int code = 0;
-    T_OK(fx_atlas_with_runtime(&fx, &d, add, 5u, NULL, NULL, &code, &err), &err);
-    T_EQ_INT(code, 0);
+    /* Index it, so the envelope has real state to describe. */
     const char *sync[] = {"sync", "hostile", "--wait", "--full"};
     T_OK(fx_atlas_with_runtime(&fx, &d, sync, 4u, NULL, NULL, &code, &err), &err);
 
@@ -375,6 +380,20 @@ static void assert_root_never_leaks(const char *basename, const char *const *for
     T_OK(fx_write(atlas_buf_cstr(&repo), "a.c", "int main(void){return 0;}\n", &err), &err);
     T_OK(fx_add_all(&fx, atlas_buf_cstr(&repo), &err), &err);
     T_OK(fx_commit(&fx, atlas_buf_cstr(&repo), "initial", &err), &err);
+
+    /* Registered by the operator path, before the daemon exists.
+     *
+     * Until A7 the SessionStart hook registered this itself, which is exactly
+     * the authority A7 removed. The name is given explicitly because the
+     * derived one would carry the hostile basename and `repo add` validates
+     * names — and the name is not what this test is about. The *root path*
+     * still carries every hostile byte, which is the input the envelope must
+     * never reproduce. */
+    const char *add[] = {"--data-dir", fx_data_dir(&fx), "repo", "add", atlas_buf_cstr(&repo),
+                         "--name", "hostile-root"};
+    int add_code = -1;
+    T_OK(fx_atlas(add, 7u, NULL, NULL, &add_code, &err), &err);
+    T_EQ_INT(add_code, 0);
 
     fx_daemon d;
     fx_daemon_init(&d);
@@ -518,12 +537,16 @@ static void test_hostile_prose_is_labelled_when_explicitly_requested(void) {
 
     fx_daemon d;
     fx_daemon_init(&d);
+
+    const char *add[] = {"--data-dir", fx_data_dir(&fx), "repo", "add", fx_repo(&fx), "--name",
+                         "hostile"};
+    int code = 0;
+    T_OK(fx_atlas(add, 7u, NULL, NULL, &code, &err), &err);
+    T_EQ_INT(code, 0);
+
     T_OK(fx_daemon_start(&fx, &d, &err), &err);
     T_OK(fx_daemon_wait_ready(&d, 15000, &err), &err);
 
-    const char *add[] = {"repo", "add", fx_repo(&fx), "--name", "hostile"};
-    int code = 0;
-    T_OK(fx_atlas_with_runtime(&fx, &d, add, 5u, NULL, NULL, &code, &err), &err);
     const char *sync[] = {"sync", "hostile", "--wait", "--full"};
     T_OK(fx_atlas_with_runtime(&fx, &d, sync, 4u, NULL, NULL, &code, &err), &err);
 

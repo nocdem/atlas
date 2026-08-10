@@ -135,13 +135,17 @@ static void test_hostile_symbols_never_reach_automatic_context(void) {
 
     fx_daemon d;
     fx_daemon_init(&d);
+    /* Registered before the daemon starts: since A7 the registry is a local
+     * operation and the daemon holds the write lock while it runs. */
+    const char *add[] = {"--data-dir", fx_data_dir(&fx), "repo", "add", fx_repo(&fx), "--name",
+                         "hostile"};
+    int code = 0;
+    T_OK(fx_atlas(add, 7u, NULL, NULL, &code, &err), &err);
+    T_EQ_INT(code, 0);
+
     T_OK(fx_daemon_start(&fx, &d, &err), &err);
     T_OK(fx_daemon_wait_ready(&d, 15000, &err), &err);
 
-    const char *add[] = {"repo", "add", fx_repo(&fx), "--name", "hostile"};
-    int code = 0;
-    T_OK(fx_atlas_with_runtime(&fx, &d, add, 5u, NULL, NULL, &code, &err), &err);
-    T_EQ_INT(code, 0);
     const char *sync[] = {"sync", "hostile", "--wait", "--full"};
     T_OK(fx_atlas_with_runtime(&fx, &d, sync, 4u, NULL, NULL, &code, &err), &err);
 
@@ -211,11 +215,14 @@ static void test_explicit_results_label_hostile_structure(void) {
 
     fx_daemon d;
     fx_daemon_init(&d);
+    const char *add[] = {"--data-dir", fx_data_dir(&fx), "repo", "add", fx_repo(&fx), "--name",
+                         "hostile"};
+    int code = 0;
+    T_OK(fx_atlas(add, 7u, NULL, NULL, &code, &err), &err);
+    T_EQ_INT(code, 0);
+
     T_OK(fx_daemon_start(&fx, &d, &err), &err);
     T_OK(fx_daemon_wait_ready(&d, 15000, &err), &err);
-    const char *add[] = {"repo", "add", fx_repo(&fx), "--name", "hostile"};
-    int code = 0;
-    T_OK(fx_atlas_with_runtime(&fx, &d, add, 5u, NULL, NULL, &code, &err), &err);
     const char *sync[] = {"sync", "hostile", "--wait", "--full"};
     T_OK(fx_atlas_with_runtime(&fx, &d, sync, 4u, NULL, NULL, &code, &err), &err);
 
@@ -283,11 +290,14 @@ static void test_hostile_names_cannot_break_the_document(void) {
 
     fx_daemon d;
     fx_daemon_init(&d);
+    const char *add[] = {"--data-dir", fx_data_dir(&fx), "repo", "add", fx_repo(&fx), "--name",
+                         "weird"};
+    int code = 0;
+    T_OK(fx_atlas(add, 7u, NULL, NULL, &code, &err), &err);
+    T_EQ_INT(code, 0);
+
     T_OK(fx_daemon_start(&fx, &d, &err), &err);
     T_OK(fx_daemon_wait_ready(&d, 15000, &err), &err);
-    const char *add[] = {"repo", "add", fx_repo(&fx), "--name", "weird"};
-    int code = 0;
-    T_OK(fx_atlas_with_runtime(&fx, &d, add, 5u, NULL, NULL, &code, &err), &err);
     const char *sync[] = {"sync", "weird", "--wait", "--full"};
     T_OK(fx_atlas_with_runtime(&fx, &d, sync, 4u, NULL, NULL, &code, &err), &err);
 

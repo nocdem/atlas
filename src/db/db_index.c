@@ -223,6 +223,14 @@ atlas_status atlas_db_file_upsert(atlas_db *db, int64_t repo_id, int64_t scan_id
         atlas_db_finish(db, sel);
         return st;
     }
+    /* Short-circuit: `old` is filled by `load_file_row` only when `exists`, and
+     * `&&` does not evaluate the right operand otherwise. cppcheck reports this
+     * as an uninitialised read (`uninitStructMember`) because it does not model
+     * the short circuit here; the suppression is inline and narrow so that a
+     * future edit which *does* read `old` unconditionally is still reported.
+     * The alternative — zeroing a struct that is about to be overwritten from a
+     * statement row — would hide exactly that mistake. */
+    /* cppcheck-suppress uninitStructMember */
     bool was_deleted = exists && old.deleted;
     atlas_db_finish(db, sel); /* borrowed pointers in `old` die here */
 

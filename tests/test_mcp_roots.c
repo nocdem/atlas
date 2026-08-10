@@ -155,6 +155,32 @@ static void make_repo(env *e, const char *name, atlas_buf *path_out, atlas_err *
     T_OK(fx_commit(&e->fx, atlas_buf_cstr(path_out), "initial", err), err);
 }
 
+/* Registers a repository the way an operator does: `atlas repo add`, on the
+ * local path, with nothing model-facing involved.
+ *
+ * Every root-related test needs this since A7, because MCP no longer registers
+ * anything. That is the point of the change rather than an inconvenience of it:
+ * the granted-roots list is answered by the client, so a model that can
+ * influence what its client grants could otherwise choose what Atlas indexes. */
+static void register_repo(env *e, const char *path, const char *name, atlas_err *err) {
+    /* The daemon owns the write lock while it runs, and registration is a local
+     * operation, so the daemon is stopped around it. That is the operational
+     * contract A7 states rather than an awkwardness of the fixture: `atlas repo
+     * add` against a running daemon is refused, and this is what an operator
+     * does instead. */
+    fx_daemon_stop(&e->d, false);
+
+    const char *args[] = {"repo", "add", path, "--name", name};
+    atlas_buf out = ATLAS_BUF_INIT;
+    int code = -1;
+    T_OK(fx_atlas_with_runtime(&e->fx, &e->d, args, 5u, &out, NULL, &code, err), err);
+    T_CHECK_MSG(code == 0, "repo add %s failed: %s", path, atlas_buf_cstr(&out));
+    atlas_buf_free(&out);
+
+    T_OK(fx_daemon_start(&e->fx, &e->d, err), err);
+    T_OK(fx_daemon_wait_ready(&e->d, 15000, err), err);
+}
+
 /* Runs one MCP session with the given script and returns stdout. */
 static void run_mcp(env *e, const char *script, atlas_buf *out, atlas_buf *errout,
                     atlas_err *err) {
@@ -209,7 +235,14 @@ static bool last_result_flag(const atlas_buf *out, const char *key, bool *value)
     return true;
 }
 
-static void test_mcp_registers_a_granted_root_with_no_hook(void) {
+/* A7 inverted this test, and the inversion is the finding.
+ *
+ * It used to assert that MCP registered a granted root by itself, so that a
+ * non-Claude client with no hooks could still index something. What it was
+ * really asserting is that a list the client answers — and that a model can
+ * influence — decided what Atlas trusts. The convenience was real; the
+ * authority it required was not Atlas' to give. */
+static void test_mcp_does_not_register_a_granted_root(void) {
     atlas_err err;
     atlas_err_init(&err);
     env e;
@@ -236,14 +269,16 @@ static void test_mcp_registers_a_granted_root_with_no_hook(void) {
     atlas_buf errout = ATLAS_BUF_INIT;
     run_mcp(&e, atlas_buf_cstr(&script), &out, &errout, &err);
 
-    /* Registered by MCP alone. */
-    T_EQ_INT(repo_count(&e, &err), 1);
-    T_CHECK_MSG(strstr(atlas_buf_cstr(&errout), "registered a granted root") != NULL,
-                "the registration was not reported on stderr");
-    /* And the tool answered rather than reporting degraded. */
-    bool degraded = true;
-    T_CHECK(last_result_flag(&out, "degraded", &degraded));
-    T_CHECK_MSG(!degraded, "the tool call was degraded after registering");
+    /* Nothing was registered, and the registry is exactly as the operator left
+     * it: empty. */
+    T_EQ_INT(repo_count(&e, &err), 0);
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&errout), "registered a granted root") == NULL,
+                "MCP reported registering a root: %s", atlas_buf_cstr(&errout));
+    /* The tool call is refused rather than silently answering about nothing.
+     * A model must be able to tell "no repository" from "an empty one". */
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&out), "\"isError\":true") != NULL ||
+                    strstr(atlas_buf_cstr(&out), "no repository") != NULL,
+                "an unregistered root must be refused, not answered: %s", atlas_buf_cstr(&out));
 
     atlas_buf_free(&out);
     atlas_buf_free(&errout);
@@ -264,11 +299,7 @@ static void test_registered_reports_the_actual_state(void) {
     /* Register it up front, so the session below finds it already present.
      * `registered` must be true for a repository Atlas has held for a while,
      * not only for one this call created — which is what it used to report. */
-    const char *add[] = {"repo", "add", NULL, "--name", "known"};
-    add[2] = atlas_buf_cstr(&repo);
-    int code = 0;
-    T_OK(fx_atlas_with_runtime(&e.fx, &e.d, add, 5u, NULL, NULL, &code, &err), &err);
-    T_EQ_INT(code, 0);
+    register_repo(&e, atlas_buf_cstr(&repo), "known", &err);
 
     atlas_buf sock = ATLAS_BUF_INIT;
     T_OK(atlas_buf_set(&sock, e.d.socket.data, e.d.socket.len, &err), &err);
@@ -321,6 +352,13 @@ static void test_multiple_roots_and_worktrees(void) {
     const char *add_wt[] = {"worktree", "add", NULL, "-b", "side"};
     add_wt[2] = atlas_buf_cstr(&wt);
     T_OK(fx_git_ok(&e.fx, atlas_buf_cstr(&one), add_wt, 5u, &err), &err);
+
+    /* All three registered by an operator, since A7. What the MCP session below
+     * exercises is resolution of granted roots onto existing registrations,
+     * which is the half that never carried authority. */
+    register_repo(&e, atlas_buf_cstr(&one), "alpha", &err);
+    register_repo(&e, atlas_buf_cstr(&two), "beta", &err);
+    register_repo(&e, atlas_buf_cstr(&wt), "alpha-wt", &err);
 
     atlas_buf script = ATLAS_BUF_INIT;
     T_OK(atlas_buf_appendf(&script, &err,
@@ -410,9 +448,15 @@ static void test_root_changes_update_the_authorization_set(void) {
     atlas_buf two = ATLAS_BUF_INIT;
     make_repo(&e, "first", &one, &err);
     make_repo(&e, "second", &two, &err);
+    register_repo(&e, atlas_buf_cstr(&one), "first", &err);
+    register_repo(&e, atlas_buf_cstr(&two), "second", &err);
 
     /* Grant both, then send list_changed with only the second, then ask about
-     * the first by name. A revoked root must stop authorizing immediately. */
+     * the first by name. A revoked root must stop authorizing immediately.
+     *
+     * Both are registered up front now: revocation is about what a granted root
+     * *authorizes*, which is a separate question from what is registered, and
+     * since A7 the session cannot answer the second one at all. */
     atlas_buf script = ATLAS_BUF_INIT;
     T_OK(atlas_buf_appendf(
              &script, &err,
@@ -488,6 +532,7 @@ static void test_a_root_with_a_space_works_end_to_end(void) {
 
     atlas_buf repo = ATLAS_BUF_INIT;
     make_repo(&e, "my project", &repo, &err);
+    register_repo(&e, atlas_buf_cstr(&repo), "my-project", &err);
 
     /* Percent-encoded, as a conforming client encodes a space. */
     atlas_buf encoded = ATLAS_BUF_INIT;
@@ -513,7 +558,7 @@ static void test_a_root_with_a_space_works_end_to_end(void) {
     atlas_buf errout = ATLAS_BUF_INIT;
     run_mcp(&e, atlas_buf_cstr(&script), &out, &errout, &err);
 
-    T_CHECK_MSG(repo_count(&e, &err) == 1, "a root whose path contains a space was not registered");
+    T_CHECK_MSG(repo_count(&e, &err) == 1, "the registered repository is no longer in the index");
     bool degraded = true;
     T_CHECK(last_result_flag(&out, "degraded", &degraded));
     T_CHECK(!degraded);
@@ -537,8 +582,11 @@ static void test_no_roots_falls_back_to_the_project_dir(void) {
     T_OK(fx_write(fx_repo(&e.fx), "a.c", "int main(void){return 0;}\n", &err), &err);
     T_OK(fx_add_all(&e.fx, fx_repo(&e.fx), &err), &err);
     T_OK(fx_commit(&e.fx, fx_repo(&e.fx), "initial", &err), &err);
+    register_repo(&e, fx_repo(&e.fx), "proj", &err);
 
-    /* No roots capability at all, so the documented fallback applies. */
+    /* No roots capability at all, so the documented fallback applies. The
+     * fallback decides which registered repository a tool call is about; since
+     * A7 it cannot decide that a directory becomes one. */
     atlas_buf out = ATLAS_BUF_INIT;
     atlas_buf errout = ATLAS_BUF_INIT;
     run_mcp(&e,
@@ -564,11 +612,10 @@ static const atlas_test TESTS[] = {
     {"malformed percent escapes are refused", test_malformed_escapes_are_refused},
     {"encoded separators and traversal are refused",
      test_encoded_separators_and_traversal_are_refused},
-    {"MCP registers a granted root with no hook and no repo add",
-     test_mcp_registers_a_granted_root_with_no_hook},
+    {"MCP does not register a granted root", test_mcp_does_not_register_a_granted_root},
     {"registered reports the actual state, not just this call",
      test_registered_reports_the_actual_state},
-    {"multiple repositories and a linked worktree all register",
+    {"multiple registered repositories and a linked worktree all resolve",
      test_multiple_roots_and_worktrees},
     {"a subdirectory root does not register its parent worktree",
      test_a_subdirectory_root_does_not_register_its_parent},

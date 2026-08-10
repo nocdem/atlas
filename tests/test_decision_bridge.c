@@ -207,13 +207,21 @@ static void record_decision(env *e, const char *session_id, const char *title,
     atlas_buf_free(&script);
 }
 
-/* Registers and scans, so the repository has a name and a lineage. */
+/* Registers and scans, so the repository has a name and a lineage.
+ *
+ * A7: registration is local and the daemon holds the write lock while it runs,
+ * so it is stopped around the `repo add` and restarted for the scan. */
 static void register_and_scan(env *e) {
+    atlas_err rerr;
+    atlas_err_init(&rerr);
     atlas_buf out = ATLAS_BUF_INIT;
     int code = 0;
+    fx_daemon_stop(&e->d, false);
     const char *add[] = {"repo", "add", atlas_buf_cstr(&e->repo), "--name", "proj"};
     run_cli(e, add, 5u, &out, &code);
     T_EQ_INT(code, 0);
+    T_OK(fx_daemon_start(&e->fx, &e->d, &rerr), &rerr);
+    T_OK(fx_daemon_wait_ready(&e->d, 15000, &rerr), &rerr);
     atlas_buf_reset(&out);
     const char *scan[] = {"scan", "proj"};
     run_cli(e, scan, 2u, &out, &code);
@@ -236,11 +244,16 @@ static void make_second_tree(env *e, atlas_err *err) {
 }
 
 static void register_second_repo(env *e, const char *name) {
+    atlas_err rerr;
+    atlas_err_init(&rerr);
     atlas_buf out = ATLAS_BUF_INIT;
     int code = 0;
+    fx_daemon_stop(&e->d, false);
     const char *add[] = {"repo", "add", atlas_buf_cstr(&e->repo2), "--name", name};
     run_cli(e, add, 5u, &out, &code);
     T_CHECK_MSG(code == 0, "repo add %s failed: %s", name, atlas_buf_cstr(&out));
+    T_OK(fx_daemon_start(&e->fx, &e->d, &rerr), &rerr);
+    T_OK(fx_daemon_wait_ready(&e->d, 15000, &rerr), &rerr);
     atlas_buf_reset(&out);
     const char *scan[] = {"scan", name};
     run_cli(e, scan, 2u, &out, &code);
@@ -1010,10 +1023,14 @@ static void test_a_reused_repository_row_id_cannot_absorb_a_new_decision(void) {
      * makes the next key byte-identical to the first. */
     atlas_buf o = ATLAS_BUF_INIT;
     int code = 0;
+    /* A7: local operation, so the daemon steps aside for it. */
+    fx_daemon_stop(&e.d, false);
     const char *rm[] = {"repo", "remove", "proj", "--yes"};
     run_cli(&e, rm, 4u, &o, &code);
     T_CHECK_MSG(code == 0, "repo remove failed: %s", atlas_buf_cstr(&o));
     atlas_buf_free(&o);
+    T_OK(fx_daemon_start(&e.fx, &e.d, &err), &err);
+    T_OK(fx_daemon_wait_ready(&e.d, 15000, &err), &err);
     register_second_repo(&e, "proj");
 
     atlas_buf p2 = ATLAS_BUF_INIT;

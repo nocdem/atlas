@@ -11,6 +11,7 @@
 #include <string.h>
 
 #include "atlas/atlas.h"
+#include "atlas/authority.h"
 #include "atlas/backup.h"
 #include "atlas/daemon.h"
 #include "atlas/hook.h"
@@ -1106,6 +1107,16 @@ static atlas_status run_gate(cli_state *st, atlas_ctx *ctx, atlas_renderer *r, a
  * would be three chances for one of them to be missing. */
 static atlas_status run_decision_confirm(cli_state *st, atlas_ctx *ctx, atlas_renderer *r,
                                          atlas_decision_intent intent, atlas_err *err) {
+    /* **A7: authority before anything else, including argument shape.**
+     *
+     * First, so that a locked profile never reaches the terminal, never mints a
+     * capability, and never prints a confirmation prompt. A prompt in a locked
+     * profile would be a question whose answer any process with this uid can
+     * supply, which is the thing A7 exists to stop pretending about. */
+    atlas_status auth = atlas_authority_require(ATLAS_AUTHORITY_OP_DECISION_LIFECYCLE, err);
+    if (auth != ATLAS_OK) {
+        return auth;
+    }
     if (st->operand_count != 3u) {
         return atlas_err_set(err, ATLAS_ERR_USAGE, "usage: atlas decision %s NAME DECISION-ID%s",
                              atlas_decision_intent_name(intent),
@@ -1788,63 +1799,32 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
             atlas_buf_free(&params);
             return vst;
         }
-        if (strcmp(st->operands[0], "add") == 0) {
-            if (st->operand_count != 2u) {
-                return atlas_err_set(err, ATLAS_ERR_USAGE,
-                                     "usage: atlas repo add PATH [--name NAME]");
-            }
-            /* The path is user input and can contain anything, so it is not
-             * spliced into a JSON document by hand: it is refused here and the
-             * offline path (which takes it as an argv operand, not as JSON) is
-             * used instead. */
-            for (const unsigned char *p = (const unsigned char *)st->operands[1]; *p != '\0'; p++) {
-                if (*p < 0x20u || *p == '"' || *p == '\\' || *p == 0x7fu) {
-                    return atlas_err_set(err, ATLAS_ERR_USAGE,
-                                         "this path contains a byte Atlas will not send over IPC "
-                                         "(0x%02x). Stop the daemon and register it offline.",
-                                         (unsigned)*p);
-                }
-            }
-            atlas_buf params = ATLAS_BUF_INIT;
-            atlas_status vst = atlas_buf_appendf(&params, err, "{\"path\":\"%s\"",
-                                                 st->operands[1]);
-            if (vst == ATLAS_OK && repo_arg_name != NULL) {
-                vst = atlas_db_check_repo_name(repo_arg_name, err);
-                if (vst == ATLAS_OK) {
-                    vst = atlas_buf_appendf(&params, err, ",\"name\":\"%s\"", repo_arg_name);
-                }
-            }
-            if (vst == ATLAS_OK) {
-                vst = atlas_buf_append_ch(&params, '}', err);
-            }
-            if (vst == ATLAS_OK) {
-                vst = call_daemon_mutation(st, "repo.add", atlas_buf_cstr(&params), "repo add",
-                                           err);
-            }
-            atlas_buf_free(&params);
-            return vst;
-        }
-        if (strcmp(st->operands[0], "remove") == 0) {
-            if (st->operand_count != 2u) {
-                return atlas_err_set(err, ATLAS_ERR_USAGE, "usage: atlas repo remove NAME --yes");
-            }
-            if (!st->opts.yes) {
-                return atlas_err_set(err, ATLAS_ERR_USAGE,
-                                     "refusing to remove \"%s\" without --yes (this deletes "
-                                     "Atlas metadata only; the repository is never touched)",
-                                     st->operands[1]);
-            }
-            atlas_buf params = ATLAS_BUF_INIT;
-            atlas_status vst = atlas_db_check_repo_name(st->operands[1], err);
-            if (vst == ATLAS_OK) {
-                vst = atlas_buf_appendf(&params, err, "{\"repo\":\"%s\"}", st->operands[1]);
-            }
-            if (vst == ATLAS_OK) {
-                vst = call_daemon_mutation(st, "repo.remove", atlas_buf_cstr(&params),
-                                           "repo remove", err);
-            }
-            atlas_buf_free(&params);
-            return vst;
+        /* **A7: the registry is not routed, because it has nowhere to route
+         * to.**
+         *
+         * `repo.add` and `repo.remove` were RPC methods until A7, which meant
+         * anything able to open the socket could decide which directories Atlas
+         * treats as repositories it will read, index and answer about. That is
+         * an authority decision, and the socket carries no authority: every
+         * peer on it is the same uid as the daemon.
+         *
+         * They are now local operations under the data-directory write lock,
+         * which the daemon holds while it runs. So this is a refusal, and it
+         * says the actionable thing. It is A5's contract for restore and prune,
+         * applied to the registry for the same reason: "the daemon must be
+         * stopped" is then enforced by the kernel rather than promised in a
+         * manual. */
+        if (strcmp(st->operands[0], "add") == 0 || strcmp(st->operands[0], "remove") == 0) {
+            return atlas_err_set(err, ATLAS_ERR_CONFIG,
+                                 "changing the repository registry is a local operation and the "
+                                 "Atlas daemon currently owns this index. Stop it first:\n"
+                                 "    systemctl --user stop atlas\n"
+                                 "    atlas repo %s ...\n"
+                                 "    systemctl --user start atlas\n"
+                                 "Atlas exposes no RPC method for this, so that nothing reachable "
+                                 "over the socket — including MCP and hooks — can decide what "
+                                 "Atlas indexes.",
+                                 st->operands[0]);
         }
     }
 
@@ -1869,6 +1849,13 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
         }
         const char *sub = st->operands[0];
         if (strcmp(sub, "create") == 0) {
+            /* A7 considered guarding this behind operator authority and did
+             * not, for the reason set out in atlas/authority.h: the index is
+             * readable by the uid that owns it, so `cp` produces the same file
+             * with no Atlas code involved. A refusal here would relocate the
+             * verb and protect nothing, while stopping the owner of an
+             * ordinary single-user install from taking a backup. Where a real
+             * separation exists, the filesystem already refuses. */
             if (st->operand_count != 2u) {
                 return atlas_err_set(err, ATLAS_ERR_USAGE,
                                      "usage: atlas backup create OUTPUT [--force]");
@@ -1916,6 +1903,9 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
             return bs;
         }
         if (strcmp(sub, "restore") == 0) {
+            /* Unguarded for the same reason as `create`, in the other
+             * direction: the index is writable by the uid that owns it, so
+             * `mv` replaces it. */
             if (st->operand_count != 2u) {
                 return atlas_err_set(err, ATLAS_ERR_USAGE,
                                      "usage: atlas backup restore BACKUP --yes");
@@ -1950,6 +1940,10 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
             return atlas_err_set(err, ATLAS_ERR_USAGE, "unknown maintenance subcommand \"%s\"",
                                  sub);
         }
+        /* `prune` is not guarded by operator authority either: the rows it
+         * deletes are in a database the calling uid can already open and
+         * delete from. See atlas/authority.h for why a check that an adversary
+         * walks around is worse than none. */
         if (st->operand_count != 1u) {
             return atlas_err_set(err, ATLAS_ERR_USAGE, "usage: atlas maintenance %s [--older-than "
                                                        "DAYS] [--retain N]%s",
@@ -2020,6 +2014,12 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
         if (st->operand_count == 0) {
             result = atlas_err_set(err, ATLAS_ERR_USAGE,
                                    "usage: atlas repo add|list|remove ...");
+        /* A7 removed every model-reachable route into the registry — there is
+         * no `repo.add`, `repo.ensure` or `repo.remove` RPC method, no MCP
+         * tool, and no hook that registers. What is left is this local command,
+         * and it is not additionally guarded by operator authority: the
+         * registry is a table in a database the calling uid can already write.
+         * The boundary that matters was the socket, and it is closed. */
         } else if (strcmp(st->operands[0], "add") == 0) {
             if (st->operand_count != 2u) {
                 result = atlas_err_set(err, ATLAS_ERR_USAGE,

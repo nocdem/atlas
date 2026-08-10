@@ -63,6 +63,22 @@ static void env_stop(env *e) {
     fx_close(&e->fx);
 }
 
+/* Registers a repository under a known name. Neither `ai.session.open` nor an
+ * MCP root grant registers anything, so a test that wants to ask the daemon
+ * about a repository by name has to put it in the index first. */
+static void register_repo(env *e, const char *path, const char *name, atlas_err *err) {
+    /* A7: the registry is a local operation under the write lock, which the
+     * daemon holds while it runs, so the daemon is stopped around it. That is
+     * the operator's contract, not a quirk of the fixture. */
+    fx_daemon_stop(&e->d, false);
+    const char *args[] = {"repo", "add", path, "--name", name};
+    int code = 0;
+    T_OK(fx_atlas_with_runtime(&e->fx, &e->d, args, 5u, NULL, NULL, &code, err), err);
+    T_EQ_INT(code, 0);
+    T_OK(fx_daemon_start(&e->fx, &e->d, err), err);
+    T_OK(fx_daemon_wait_ready(&e->d, 15000, err), err);
+}
+
 static void make_repo(env *e, const char *name, atlas_buf *path_out, atlas_err *err) {
     T_OK(fx_mkdir(e->fx.root.data, name, err), err);
     atlas_buf_reset(path_out);
@@ -71,17 +87,16 @@ static void make_repo(env *e, const char *name, atlas_buf *path_out, atlas_err *
     T_OK(fx_write(atlas_buf_cstr(path_out), "a.c", "int main(void){return 0;}\n", err), err);
     T_OK(fx_add_all(&e->fx, atlas_buf_cstr(path_out), err), err);
     T_OK(fx_commit(&e->fx, atlas_buf_cstr(path_out), "initial", err), err);
+    /* And registered, because since A7 nothing else will.
+     *
+     * Granting a root over MCP used to register it, which is what every test
+     * below relied on. It no longer does: the granted-roots list is answered by
+     * the client, so a model that can influence it could otherwise choose what
+     * Atlas indexes. Attribution is what this suite is about, and attribution
+     * needs a registered repository to attribute to. */
+    register_repo(e, atlas_buf_cstr(path_out), name, err);
 }
 
-/* Registers a repository under a known name. `ai.session.open` deliberately
- * does not register anything, so a test that wants to ask the daemon about a
- * repository by name has to put it in the index first. */
-static void register_repo(env *e, const char *path, const char *name, atlas_err *err) {
-    const char *args[] = {"repo", "add", path, "--name", name};
-    int code = 0;
-    T_OK(fx_atlas_with_runtime(&e->fx, &e->d, args, 5u, NULL, NULL, &code, err), err);
-    T_EQ_INT(code, 0);
-}
 
 /* --- talking to the daemon directly --------------------------------------- */
 
@@ -714,7 +729,6 @@ static void test_keyless_read_reports_no_session(void) {
 
     atlas_buf repo = ATLAS_BUF_INIT;
     make_repo(&e, "solo", &repo, &err);
-    register_repo(&e, atlas_buf_cstr(&repo), "solo", &err);
     (void)hook_session_open(&e, "sess-only", atlas_buf_cstr(&repo), &err);
 
     atlas_buf params = ATLAS_BUF_INIT;

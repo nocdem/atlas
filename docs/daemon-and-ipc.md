@@ -162,8 +162,6 @@ Every value goes through the typed writer.
 | `repo.list` | — | `repositories[]`, each with its full index state |
 | `repo.state` | `repo` | one repository's index state |
 | `repo.sync` | `repo`, `full?` | `queued`, `sync_seq`, `full` |
-| `repo.add` | `path`, `name?` | `repository` |
-| `repo.remove` | `repo` | `repository` |
 | `events.since` | `repo`, `since?`, `limit?` | `events[]`, `count`, `cursor`, `more` |
 
 ### A2 methods
@@ -177,7 +175,6 @@ comes to behave differently depending on which one found it.
 | method | params | result |
 | --- | --- | --- |
 | `repo.resolve` | `path` | `registered`, and the full index state when it is |
-| `repo.ensure` | `path`, `name?`, `exact_root?` | as above, registering the worktree when nothing matches |
 | `repo.search` | `repo`\|`root`, `query`, `limit?` | `results[]`, `count`, `search_mode`, `degraded` |
 | `ai.session.open` | identity, `source?` | session, repository, change set |
 | `ai.session.touch` | identity, `dedup_key?` | as above |
@@ -272,34 +269,38 @@ is queued, then handed to the writer thread as one typed `atlas_ai_op` with a
 four-second deadline. The caller is inside a hook or a tool call that a person is
 waiting on, so a truthful timeout beats a stall.
 
-### `exact_root`, and what `registered` means
+### What `registered` means — and that nothing here sets it
 
-`repo.ensure` normally resolves **upward**: given a subdirectory it registers the
-worktree that contains it, which is what a person running `atlas repo add src/`
-means. `exact_root: true` refuses that, before anything is inserted, unless the
-given path is itself the worktree root.
+**A7 removed `repo.ensure`, `repo.add` and `repo.remove`.** No method in this
+protocol registers or deregisters a repository; `repo.resolve` reports and
+nothing more. With them went `exact_root`, which existed only to bound what
+`repo.ensure` would register.
 
-The MCP adapter always asks for the exact form. A client that granted one
-directory did not grant its parent, and registering the parent would index files
-outside what was granted. The session-start hook does not ask for it: a person
-who launched a session in a subdirectory means the worktree, and the client's own
-file access already spans it.
+The reason is who chooses the input. A session's working directory, a
+`DirectoryAdded` payload and the granted-roots list an MCP client answers are all
+chosen by, or influenced by, the model — so while those methods existed, "a model
+looked here" was sufficient for Atlas to begin opening, reading, hashing and
+running git against a tree nobody had vouched for. `docs/security/A7_SECURITY_REVIEW.md`
+(ATLAS-A7-002, ATLAS-A7-003) has the reproduction.
 
-Every `ai.*` and `repo.*` response distinguishes two facts that used to be
-conflated in one always-false field:
+Registration is now a local CLI operation under the data-directory write lock,
+which the daemon holds while it runs, so `atlas repo add` requires the daemon to
+be stopped — the contract A5 already established for `backup restore` and
+`maintenance prune`.
+
+`registered` therefore reports one fact and can no longer be conflated with a
+second:
 
 | field | means |
 | --- | --- |
-| `registered` | the repository is in the index, however it got there |
-| `registered_now` | *this call* performed the registration |
+| `registered` | the repository is in the index, put there by an operator |
 
 `ai.context` returns `repo_id` and `root_hash` rather than the repository name,
 for the same reason the envelope does: this response exists so an adapter can
 inject `context`, and an adapter that found a name here might inject that too.
 
-**No method here runs git**, with one exception: `repo.ensure` routes to the
-writer, which runs a handful of `git rev-parse` calls to register a worktree.
-`repo.resolve` is a pure index lookup for exactly this reason — a git process in
+**No method here runs git**, and since A7 there is no exception: the one method
+that did was `repo.ensure`, which is gone. `repo.resolve` is a pure index lookup — a git process in
 the serve loop would let one question stall every other client for the git
 timeout.
 
@@ -338,9 +339,9 @@ that the method does not exist.
 it inside the serve loop would stall every other client. The returned `sync_seq`
 is what `atlas sync --wait` polls `repo.state` for.
 
-`repo.add` and `repo.remove` are handed to the writer with a 30-second deadline,
-because they are fast (a few `git rev-parse` calls and one insert) and a caller
-genuinely wants the answer.
+`repo.add` and `repo.remove` are not in this protocol at all — see above. They
+are local operations that take the data-directory write lock, so a running daemon
+makes them refuse rather than route.
 
 ## Pagination
 
@@ -464,10 +465,6 @@ dispatch as the other groups.
 | `decision.propose` | yes | a new document at revision 1 |
 | `decision.revise` | yes | a new **proposed** revision of an existing document |
 | `decision.promote` | yes | an A4 document from an A2 `ai_decisions` row |
-| `decision.challenge` | yes | issues a capability; changes no lifecycle state |
-| `decision.approve` | yes | consumes a capability |
-| `decision.reject` | yes | consumes a capability |
-| `decision.supersede` | yes | consumes a capability |
 
 Every write is one typed `atlas_decision_op` handed to the writer thread as an
 `ATLAS_JOB_DECISION`, exactly as A2's writes are handed over as

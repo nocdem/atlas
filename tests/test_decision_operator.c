@@ -35,7 +35,9 @@
 #include <unistd.h>
 
 #include "atlas/atlas.h"
+#include "atlas/datadir.h"
 #include "atlas/decision.h"
+#include "atlas/decision_ops.h"
 #include "atlas/proc.h"
 #include "atlas_test.h"
 #include "db/db_internal.h"
@@ -121,6 +123,59 @@ static void expect_status(env *e, const char *want) {
     T_CHECK_MSG(strstr(atlas_buf_cstr(&out), needle) != NULL,
                 "expected status %s, got:\n%s", want, atlas_buf_cstr(&out));
     atlas_buf_free(&out);
+}
+
+/* Approves `e->uid` through the write point, without the CLI.
+ *
+ * **A7.** The interactive path this suite was built around is refused in a
+ * locked profile, and a locked profile is the only one an unprivileged test can
+ * be in — a grant needs a root-owned policy at a root-owned path, which is
+ * exactly what no test can manufacture. See `atlas/authority.h`.
+ *
+ * So the tests below that need an *approved* decision in order to check
+ * something else — that the repository is not modified, that an approval does
+ * not follow a path to an unrelated repository — seed it here instead, through
+ * `atlas_decision_apply`. That is the same write point the CLI reaches and the
+ * same one `tests/test_decision_lifecycle.c` uses; what it skips is the CLI
+ * entry point, which is where A7 put the authority check and which those tests
+ * are not about.
+ *
+ * The suite's own subject — that the operator channel excludes pipes, `--yes`,
+ * JSON and a wrong answer — is unchanged and still driven through the CLI. */
+static void approve_through_the_write_point(env *e) {
+    atlas_err err;
+    atlas_err_init(&err);
+    atlas_buf db_path = ATLAS_BUF_INIT;
+    T_OK(atlas_datadir_db_path(fx_data_dir(&e->fx), &db_path, &err), &err);
+    atlas_db *db = NULL;
+    T_OK(atlas_db_open(atlas_buf_cstr(&db_path), &db, &err), &err);
+
+    atlas_decision_op ch;
+    atlas_decision_op_init(&ch, ATLAS_DECISION_OP_CHALLENGE);
+    T_OK(atlas_buf_set_str(&ch.repo_name, "proj", &err), &err);
+    T_OK(atlas_buf_set_str(&ch.uid, atlas_buf_cstr(&e->uid), &err), &err);
+    ch.intent = ATLAS_DECISION_INTENT_APPROVE;
+    atlas_decision_result cr;
+    atlas_decision_result_init(&cr);
+    T_OK(atlas_decision_apply(db, &ch, &cr, &err), &err);
+
+    atlas_decision_op ap;
+    atlas_decision_op_init(&ap, ATLAS_DECISION_OP_APPROVE);
+    T_OK(atlas_buf_set_str(&ap.repo_name, "proj", &err), &err);
+    T_OK(atlas_buf_set_str(&ap.uid, atlas_buf_cstr(&e->uid), &err), &err);
+    T_OK(atlas_buf_set(&ap.token, cr.token.data, cr.token.len, &err), &err);
+    T_OK(atlas_buf_set_str(&ap.confirmation, cr.confirm, &err), &err);
+    atlas_decision_result ar;
+    atlas_decision_result_init(&ar);
+    T_OK(atlas_decision_apply(db, &ap, &ar, &err), &err);
+    T_CHECK(ar.state == ATLAS_DECISION_APPROVED);
+
+    atlas_decision_result_free(&ar);
+    atlas_decision_op_free(&ap);
+    atlas_decision_result_free(&cr);
+    atlas_decision_op_free(&ch);
+    atlas_db_close(db);
+    atlas_buf_free(&db_path);
 }
 
 /* --- a real pseudo-terminal --------------------------------------------------- */
@@ -279,80 +334,71 @@ static int pty_wait(pty *p, atlas_buf *transcript) {
 
 /* --- the interactive path ------------------------------------------------------- */
 
-static void test_interactive_approval_of_the_exact_revision(void) {
+/* A7 replaced two tests here, and what replaced them is the finding.
+ *
+ * They were `interactive approval of the exact revision` and `a wrong answer at
+ * the prompt changes nothing`: both drove a real pseudo-terminal, typed a
+ * confirmation, and asserted on what the approval prompt displayed. Both
+ * described a channel that A7 established cannot mean what it was taken to
+ * mean, because this suite's own `pty_spawn` is the demonstration — a program
+ * allocating a terminal and typing at it is indistinguishable, from inside
+ * Atlas, from a person at a keyboard.
+ *
+ * So the prompt is no longer reached in a profile Atlas cannot separate, and
+ * what is asserted is that it is not reached: not that the refusal happens
+ * eventually, but that it happens *before* a capability exists and before a
+ * question is asked whose answer this process could supply. */
+static void test_the_prompt_is_never_reached_in_a_locked_profile(void) {
     atlas_err err;
     atlas_err_init(&err);
     env e;
     env_open(&e);
 
     const char *args[] = {"decision", "approve", "proj", atlas_buf_cstr(&e.uid)};
-    pty p;
-    T_OK(pty_spawn(&e, args, 4u, &p, &err), &err);
+    pty p = {-1, -1};
+    T_REQUIRE(pty_spawn(&e, args, 4u, &p, &err) == ATLAS_OK);
 
+    /* Typed blind, before anything is read.
+     *
+     * An adversary does not wait to be asked. The confirmation is the first
+     * eight characters of the revision's content hash, which is printed by
+     * `atlas decision show` and so is known to anything that can run Atlas at
+     * all — it is a check against approving the wrong revision by accident, and
+     * never was a secret. Sending it up front is the strongest version of this
+     * test: nothing is waiting to receive it, and nothing must act on it. */
+    pty_type(&p, "0123456789abcdef");
+
+    /* `pty_expect` returns false on child exit, so a run that never prompts
+     * ends here rather than blocking. The transcript is kept either way. */
     atlas_buf transcript = ATLAS_BUF_INIT;
-    T_REQUIRE_MSG(pty_expect(&p, "Type ", &transcript),
-                  "the prompt never appeared. Transcript:\n%s", atlas_buf_cstr(&transcript));
-
-    /* The prompt must show the exact values the capability is bound to, and the
-     * honest statement about what the record will mean. */
-    T_CHECK_MSG(strstr(atlas_buf_cstr(&transcript), atlas_buf_cstr(&e.uid)) != NULL,
-                "the prompt must name the decision");
-    T_CHECK_MSG(strstr(atlas_buf_cstr(&transcript), "revision   : 1") != NULL,
-                "the prompt must name the revision");
-    T_CHECK_MSG(strstr(atlas_buf_cstr(&transcript), "LOCAL_OPERATOR_CONFIRMED") != NULL,
-                "the prompt must say what will be recorded");
-    T_CHECK_MSG(strstr(atlas_buf_cstr(&transcript), "does not identify you") != NULL,
-                "the prompt must state that this is not an identity claim");
-    T_CHECK_MSG(strstr(atlas_buf_cstr(&transcript), "untrusted project text") != NULL,
-                "the decision's own text must be labelled at the prompt");
-
-    /* The confirmation is a prefix of the content hash, which the prompt shows.
-     * The test reads it out of the transcript rather than recomputing it, so a
-     * mismatch between what is displayed and what is accepted is a failure. */
-    const char *tp = strstr(atlas_buf_cstr(&transcript), "Type ");
-    T_REQUIRE(tp != NULL);
-    char confirm[ATLAS_DECISION_CONFIRM_MAX];
-    (void)snprintf(confirm, sizeof(confirm), "%.*s", (int)ATLAS_DECISION_CONFIRM_HEX,
-                   tp + strlen("Type "));
-
-    const char *digest = strstr(atlas_buf_cstr(&transcript), "digest     : ");
-    T_REQUIRE(digest != NULL);
-    T_CHECK_MSG(strncmp(digest + strlen("digest     : "), confirm, ATLAS_DECISION_CONFIRM_HEX) == 0,
-                "the confirmation must be the displayed digest's prefix");
-
-    pty_type(&p, confirm);
+    bool prompted = pty_expect(&p, "Type ", &transcript);
     int code = pty_wait(&p, &transcript);
-    T_CHECK_MSG(code == 0, "approve exited %d. Transcript:\n%s", code,
-                atlas_buf_cstr(&transcript));
-    T_CHECK(strstr(atlas_buf_cstr(&transcript), "APPROVED") != NULL);
-    T_CHECK_MSG(strstr(atlas_buf_cstr(&transcript), "is not a signature") != NULL,
-                "the outcome must repeat the non-claim");
+    const char *text = atlas_buf_cstr(&transcript);
 
-    expect_status(&e, "APPROVED");
+    T_CHECK_MSG(!prompted, "a locked profile still displayed the approval prompt:\n%s", text);
+    T_CHECK_MSG(code != 0, "approval from a pseudo-terminal succeeded (exit %d):\n%s", code, text);
+    T_CHECK_MSG(strstr(text, "locked in this Atlas profile") != NULL,
+                "the refusal did not explain itself:\n%s", text);
+    /* The refusal has to say what would change it, or it will be worked around
+     * rather than acted on. */
+    T_CHECK_MSG(strstr(text, "operator_uid") != NULL,
+                "the refusal did not name the configuration that would enable it:\n%s", text);
 
-    /* The repository was never touched. An approval is a fact about Atlas'
-     * record, not about the project's files. */
-    atlas_buf_free(&transcript);
-    env_close(&e);
-}
-
-static void test_a_wrong_answer_at_the_prompt_changes_nothing(void) {
-    atlas_err err;
-    atlas_err_init(&err);
-    env e;
-    env_open(&e);
-
-    const char *args[] = {"decision", "approve", "proj", atlas_buf_cstr(&e.uid)};
-    pty p;
-    T_OK(pty_spawn(&e, args, 4u, &p, &err), &err);
-    atlas_buf transcript = ATLAS_BUF_INIT;
-    T_REQUIRE(pty_expect(&p, "Type ", &transcript));
-
-    /* The answer somebody types when they are not reading. */
-    pty_type(&p, "yes");
-    int code = pty_wait(&p, &transcript);
-    T_CHECK_MSG(code != 0, "a wrong confirmation must fail");
     expect_status(&e, "PROPOSED");
+
+    /* No capability was minted on the way to the refusal. One left behind in
+     * the database would be spendable by anything that can read it. */
+    atlas_buf db_path = ATLAS_BUF_INIT;
+    T_OK(atlas_datadir_db_path(fx_data_dir(&e.fx), &db_path, &err), &err);
+    atlas_db *db = NULL;
+    T_OK(atlas_db_open_readonly(atlas_buf_cstr(&db_path), &db, &err), &err);
+    int64_t challenges = -1;
+    T_OK(atlas_db_query_int64(db, "SELECT COUNT(*) FROM decision_challenges;", &challenges, &err),
+         &err);
+    T_CHECK_MSG(challenges == 0, "a locked profile minted %lld capabilities",
+                (long long)challenges);
+    atlas_db_close(db);
+    atlas_buf_free(&db_path);
 
     atlas_buf_free(&transcript);
     env_close(&e);
@@ -403,19 +449,22 @@ static void test_ansi_in_a_title_cannot_reach_the_prompt(void) {
         atlas_buf_free(&o);
     }
 
-    /* The prompt for the *legitimate* decision is still clean. */
+    /* What reaches the terminal on the *legitimate* decision is still checked
+     * byte by byte — it is now a refusal rather than a prompt, and a refusal is
+     * printed to a terminal by the same code and carries the same risk. Atlas
+     * quotes no repository-authored text in it, so anything outside printable
+     * ASCII arriving here would be a regression in the message itself. */
     const char *args[] = {"decision", "approve", "proj", atlas_buf_cstr(&e.uid)};
-    pty p;
-    T_OK(pty_spawn(&e, args, 4u, &p, &err), &err);
+    pty p = {-1, -1};
+    T_REQUIRE(pty_spawn(&e, args, 4u, &p, &err) == ATLAS_OK);
     atlas_buf transcript = ATLAS_BUF_INIT;
-    T_REQUIRE(pty_expect(&p, "Type ", &transcript));
+    (void)pty_expect(&p, "locked in this Atlas profile", &transcript);
+    (void)pty_wait(&p, &transcript);
     for (size_t i = 0; i < transcript.len; i++) {
         unsigned char ch = (unsigned char)transcript.data[i];
         bool ok = ch == '\n' || ch == '\r' || (ch >= 0x20u && ch < 0x7Fu);
-        T_CHECK_MSG(ok, "byte 0x%02x reached the approval prompt at offset %zu", ch, i);
+        T_CHECK_MSG(ok, "byte 0x%02x reached the terminal at offset %zu", ch, i);
     }
-    pty_type(&p, "no");
-    (void)pty_wait(&p, &transcript);
 
     atlas_buf_free(&transcript);
     env_close(&e);
@@ -499,18 +548,7 @@ static void test_the_repository_is_never_modified(void) {
     char before[ATLAS_SHA256_HEX_LEN + 1u];
     T_OK(fx_tree_digest(fx_repo(&e.fx), before, &err), &err);
 
-    const char *args[] = {"decision", "approve", "proj", atlas_buf_cstr(&e.uid)};
-    pty p;
-    T_OK(pty_spawn(&e, args, 4u, &p, &err), &err);
-    atlas_buf transcript = ATLAS_BUF_INIT;
-    T_REQUIRE(pty_expect(&p, "Type ", &transcript));
-    const char *tp = strstr(atlas_buf_cstr(&transcript), "Type ");
-    char confirm[ATLAS_DECISION_CONFIRM_MAX];
-    (void)snprintf(confirm, sizeof(confirm), "%.*s", (int)ATLAS_DECISION_CONFIRM_HEX,
-                   tp + strlen("Type "));
-    pty_type(&p, confirm);
-    T_EQ_INT(pty_wait(&p, &transcript), 0);
-    atlas_buf_free(&transcript);
+    approve_through_the_write_point(&e);
 
     /* And an export writes to stdout, never into the tree. */
     atlas_buf out = ATLAS_BUF_INIT;
@@ -602,19 +640,9 @@ static void test_an_unrelated_repository_at_the_same_path_inherits_nothing(void)
     env_open(&e);
 
     /* Approve it, so what must not move is an approved record rather than a
-     * draft. */
-    const char *args[] = {"decision", "approve", "proj", atlas_buf_cstr(&e.uid)};
-    pty p;
-    T_OK(pty_spawn(&e, args, 4u, &p, &err), &err);
-    atlas_buf transcript = ATLAS_BUF_INIT;
-    T_REQUIRE(pty_expect(&p, "Type ", &transcript));
-    const char *tp = strstr(atlas_buf_cstr(&transcript), "Type ");
-    char confirm[ATLAS_DECISION_CONFIRM_MAX];
-    (void)snprintf(confirm, sizeof(confirm), "%.*s", (int)ATLAS_DECISION_CONFIRM_HEX,
-                   tp + strlen("Type "));
-    pty_type(&p, confirm);
-    T_EQ_INT(pty_wait(&p, &transcript), 0);
-    atlas_buf_free(&transcript);
+     * draft. Seeded through the write point: the CLI route is locked here, and
+     * lineage is what this test is about. */
+    approve_through_the_write_point(&e);
     expect_status(&e, "APPROVED");
 
     /* Remove the repository. The decision is detached, not deleted. */
@@ -690,10 +718,8 @@ static void test_an_unrelated_repository_at_the_same_path_inherits_nothing(void)
 static const atlas_test TESTS[] = {
     {"an unrelated repository at the same path inherits nothing",
      test_an_unrelated_repository_at_the_same_path_inherits_nothing},
-    {"interactive approval of the exact revision",
-     test_interactive_approval_of_the_exact_revision},
-    {"a wrong answer at the prompt changes nothing",
-     test_a_wrong_answer_at_the_prompt_changes_nothing},
+    {"the prompt is never reached in a locked profile",
+     test_the_prompt_is_never_reached_in_a_locked_profile},
     {"ANSI in a title cannot reach the prompt", test_ansi_in_a_title_cannot_reach_the_prompt},
     {"non-interactive approval is refused", test_non_interactive_approval_is_refused},
     {"the repository is never modified", test_the_repository_is_never_modified},

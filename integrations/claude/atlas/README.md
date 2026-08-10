@@ -90,8 +90,12 @@ If the daemon is down, slow, or answers something malformed:
 - diagnostics go to stderr, visible with `claude --debug`
 
 To take Atlas out of the loop without reconfiguring Claude, set
-`ATLAS_CLAUDE_DISABLE=1`. To stop it registering repositories automatically, set
-`ATLAS_CLAUDE_NO_AUTO_REGISTER=1`.
+`ATLAS_CLAUDE_DISABLE=1`.
+
+Since A7 no hook registers a repository, so there is nothing to turn off: a
+session in a directory Atlas does not know is reported as unregistered and
+nothing is created. An operator registers with `atlas repo add`, with the daemon
+stopped. See `docs/security/A7_SECURITY_REVIEW.md`.
 
 ## What it deliberately does not hook
 

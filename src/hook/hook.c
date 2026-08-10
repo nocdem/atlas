@@ -438,18 +438,27 @@ static void make_key(char *dst, size_t dst_size, const char *prefix, const char 
     (void)snprintf(dst, dst_size, "%s:%s", prefix, a != NULL ? a : "0");
 }
 
-/* Registers the current working directory's repository if it is not already in
- * the index.
+/* Asks whether the current working directory is a repository Atlas already
+ * knows, and does nothing whatever about it if it is not.
  *
- * Deliberately not `exact_root`: a person who launched a session in a
- * subdirectory means the worktree, and Claude's own file access spans it
- * anyway. The MCP adapter asks for the exact form instead, because a client
- * granting one directory did not grant its parent.
+ * **A7 changed this from a registration to a question.** It used to call
+ * `repo.ensure`, which registered whatever absolute path it was handed. A
+ * session start is a model-triggered event — the model chooses the directory
+ * Claude is launched in as surely as a person does — so that made "a model
+ * opened a session here" sufficient to create a trusted Atlas registration, and
+ * with it an indexing pass over a tree nobody had vouched for. There is no
+ * longer any RPC method that could do it; see `src/ipc/server.c`.
  *
- * Registration is a row plus a queued pass, so this returns as soon as the row
- * exists. A session start must never wait for a repository to be scanned. */
-static void ensure_repository(hook_ctx *hc) {
-    if (hc->cwd == NULL || !hc->reachable || getenv("ATLAS_CLAUDE_NO_AUTO_REGISTER") != NULL) {
+ * The call is kept because attaching an already-registered repository is the
+ * useful half and carries no authority: it reports, and the envelope the hook
+ * emits then describes a repository an operator registered, or describes none.
+ *
+ * A directory Atlas does not know is a *candidate*, and the only thing Atlas
+ * does with a candidate is let `atlas repo list --candidates` show the operator
+ * that a session ran somewhere unregistered. Registration is `atlas repo add`,
+ * on the local path, under the write lock. */
+static void resolve_repository(hook_ctx *hc) {
+    if (hc->cwd == NULL || !hc->reachable) {
         return;
     }
     atlas_err err;
@@ -457,7 +466,7 @@ static void ensure_repository(hook_ctx *hc) {
     atlas_ipc_params *p = NULL;
     atlas_json *j = NULL;
     if (atlas_ipc_params_begin(&p, &j, &err) != ATLAS_OK) {
-        note(hc, "repo.ensure", atlas_err_msg(&err));
+        note(hc, "repo.resolve", atlas_err_msg(&err));
         return;
     }
     atlas_buf params = ATLAS_BUF_INIT;
@@ -469,16 +478,16 @@ static void ensure_repository(hook_ctx *hc) {
     }
     if (st == ATLAS_OK) {
         atlas_buf resp = ATLAS_BUF_INIT;
-        /* Registration runs git, so it gets a longer deadline than the rest —
-         * but still one, and still failing open. */
-        if (atlas_ipc_call_timeout(atlas_buf_cstr(&hc->socket), "repo.ensure",
-                                   atlas_buf_cstr(&params), hc->timeout_ms * 4, &resp,
+        /* A read over an index, so the ordinary deadline is enough — the long
+         * one existed because registration ran git. Still failing open. */
+        if (atlas_ipc_call_timeout(atlas_buf_cstr(&hc->socket), "repo.resolve",
+                                   atlas_buf_cstr(&params), hc->timeout_ms, &resp,
                                    &err) != ATLAS_OK) {
-            note(hc, "repo.ensure", atlas_err_msg(&err));
+            note(hc, "repo.resolve", atlas_err_msg(&err));
         }
         atlas_buf_free(&resp);
     } else {
-        note(hc, "repo.ensure", atlas_err_msg(&err));
+        note(hc, "repo.resolve", atlas_err_msg(&err));
     }
     atlas_buf_free(&params);
 }
@@ -487,9 +496,10 @@ static void handle(hook_ctx *hc, const char *event, const atlas_jsonv *root, FIL
     char key[192];
 
     if (strcmp(event, "SessionStart") == 0) {
-        /* Ensure the repository exists in the index, then open the session, then
-         * answer with the envelope. */
-        ensure_repository(hc);
+        /* Attach to the repository if an operator registered it, then open the
+         * session, then answer with the envelope. An unregistered directory
+         * stays unregistered. */
+        resolve_repository(hc);
         simple_params sp;
         memset(&sp, 0, sizeof(sp));
         sp.source = hc->source;
@@ -625,12 +635,12 @@ static void handle(hook_ctx *hc, const char *event, const atlas_jsonv *root, FIL
          * still belongs to it, and the change set for the old repository stays
          * open.
          *
-         * The newly granted directory is *ensured* first, not merely attached.
-         * Attaching alone silently did nothing whenever the directory was a
-         * repository Atlas had never seen — which is the common case, since a
-         * person adds a directory precisely because they are about to work in
-         * something new. */
-        ensure_repository(hc);
+         * A7: the newly granted directory is resolved, not ensured. Attaching
+         * to a directory Atlas has never seen does nothing, and that is now the
+         * intended outcome rather than a gap: adding a directory to a session is
+         * a model-visible action, and it must not be the thing that decides
+         * what Atlas indexes. An operator registers with `atlas repo add`. */
+        resolve_repository(hc);
         simple_params sp;
         memset(&sp, 0, sizeof(sp));
         sp.source = (strcmp(event, "CwdChanged") == 0) ? "cwd_changed" : "directory_added";

@@ -659,9 +659,6 @@ static atlas_status apply_file(apply_ctx *ac, const todo_table *t, todo_item *it
          * own — a future importer, say — and removing it from the vocabulary
          * would make that a migration rather than an insert. What is removed is
          * the duplication, not the fact and not the ability to record it. */
-        if (st != ATLAS_OK) {
-            break;
-        }
 
         atlas_code_relation_record kr;
         memset(&kr, 0, sizeof(kr));

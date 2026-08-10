@@ -272,6 +272,17 @@ atlas_status atlas_service_doctor(atlas_ctx *ctx, atlas_doctor_report *out, atla
     (void)snprintf(out->sqlite_runtime, sizeof(out->sqlite_runtime), "%s", sqlite3_libversion());
     (void)snprintf(out->sqlite_compiled, sizeof(out->sqlite_compiled), "%s", SQLITE_VERSION);
 
+    /* A7. Reads nothing of the index and creates nothing, so it belongs here
+     * with the other environment facts rather than below the index checks: it
+     * is exactly as answerable on a machine where Atlas has never run, and that
+     * is when somebody most often asks. */
+    {
+        atlas_authority a;
+        atlas_authority_probe(&a);
+        out->authority_state = a.state;
+        out->authority_reason = a.reason;
+    }
+
     atlas_err git_err;
     atlas_err_init(&git_err);
     atlas_status st = atlas_git_probe(&out->git_exe, &out->git_version, &git_err);

@@ -138,6 +138,16 @@ static atlas_status h_doctor(atlas_renderer *r, const atlas_doctor_report *rep, 
     (void)fprintf(o, LABEL "%s%s\n", "database",
                   atlas_safe(&r->safe, atlas_buf_cstr(&rep->db_path)),
                   rep->index_present ? "" : "  (absent)");
+    /* A7. Printed above the index checks, because it is a property of the
+     * machine rather than of the index and is exactly as answerable when there
+     * is no index — which is when somebody most often runs this. Both strings
+     * come from closed Atlas-owned vocabularies, so neither is encoded and
+     * neither can carry a byte somebody else chose. */
+    (void)fprintf(o, LABEL "%s (%s)\n", "operator authority",
+                  rep->authority_state == ATLAS_AUTHORITY_GRANTED ? "granted" : "locked",
+                  atlas_authority_reason_name(rep->authority_reason));
+    (void)fprintf(o, LABEL "%s\n", "",
+                  atlas_authority_reason_explain(rep->authority_reason));
     if (!rep->index_present) {
         /* Reported, not created. On a machine where Atlas has never run this is
          * the whole answer, and it is a correct one. */

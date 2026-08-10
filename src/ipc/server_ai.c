@@ -403,83 +403,6 @@ static atlas_status method_repo_resolve(dispatch_state *ds, const atlas_ipc_requ
     return st;
 }
 
-/* Resolves, and registers when nothing matches.
- *
- * Registration is a mutation of Atlas' own state and never of the repository:
- * `atlas_service_repo_add_db` opens the worktree read-only, reads three
- * identifiers out of git, and inserts a row. It also queues the first
- * reconciliation rather than performing it, so this returns as soon as the row
- * exists and the index fills in behind it. A session-start hook must not wait
- * for a repository to be scanned. */
-static atlas_status method_repo_ensure(dispatch_state *ds, const atlas_ipc_request *req,
-                                       atlas_err *err) {
-    const char *raw = NULL;
-    if (!atlas_ipc_param_str(req, "path", &raw)) {
-        return atlas_err_set(err, ATLAS_ERR_USAGE, "repo.ensure needs a \"path\" parameter");
-    }
-    if (raw[0] != '/') {
-        return atlas_err_set(err, ATLAS_ERR_USAGE, "\"path\" must be absolute");
-    }
-
-    atlas_repo_info info;
-    atlas_repo_info_init(&info);
-    bool found = false;
-    atlas_status st = atlas_db_repo_get_containing(ds->db, raw, strlen(raw), &info, &found, err);
-    if (st != ATLAS_OK) {
-        atlas_repo_info_free(&info);
-        return st;
-    }
-    if (found) {
-        st = atlas_json_key_bool(ds->j, "registered", true, err);
-        if (st == ATLAS_OK) {
-            st = atlas_json_key_bool(ds->j, "created", false, err);
-        }
-        if (st == ATLAS_OK) {
-            st = atlas_server_write_repo_state(ds, &info, err);
-        }
-        atlas_repo_info_free(&info);
-        return st;
-    }
-    atlas_repo_info_free(&info);
-
-    const char *name = NULL;
-    (void)atlas_ipc_param_str(req, "name", &name);
-    if (name != NULL) {
-        st = atlas_db_check_repo_name(name, err);
-        if (st != ATLAS_OK) {
-            return st;
-        }
-    }
-    /* `exact_root` refuses to resolve upward to a containing worktree. The MCP
-     * adapter asks for it because a client that granted one directory did not
-     * grant its parent; the session-start hook does not, because a person who
-     * launched a session in a subdirectory means the worktree. */
-    bool exact_root = false;
-    (void)atlas_ipc_param_bool(req, "exact_root", &exact_root);
-
-    atlas_writer_result wr;
-    atlas_writer_result_init(&wr);
-    st = atlas_writer_call_repo_add(ds->ctx->writer, raw, name, exact_root,
-                                    AI_REGISTER_TIMEOUT_MS, &wr, err);
-    if (st == ATLAS_OK) {
-        st = atlas_json_key_bool(ds->j, "registered", true, err);
-        if (st == ATLAS_OK) {
-            st = atlas_json_key_bool(ds->j, "created", true, err);
-        }
-        if (st == ATLAS_OK) {
-            st = atlas_json_key_int(ds->j, "id", wr.id, err);
-        }
-        if (st == ATLAS_OK) {
-            st = atlas_json_key_str(ds->j, "repo", atlas_buf_cstr(&wr.name), err);
-        }
-        if (st == ATLAS_OK) {
-            st = atlas_json_key_str(ds->j, "root", atlas_buf_cstr(&wr.root_text), err);
-        }
-    }
-    atlas_writer_result_free(&wr);
-    return st;
-}
-
 /* --- session lifecycle ---------------------------------------------------- */
 
 static atlas_status simple_op(dispatch_state *ds, const atlas_ipc_request *req,
@@ -1898,7 +1821,7 @@ static atlas_status method_repo_search(dispatch_state *ds, const atlas_ipc_reque
 
 static const atlas_method_entry AI_METHODS[] = {
     {"repo.resolve", method_repo_resolve},
-    {"repo.ensure", method_repo_ensure},
+
     {"repo.search", method_repo_search},
     {"ai.session.open", method_session_open},
     {"ai.session.touch", method_session_touch},

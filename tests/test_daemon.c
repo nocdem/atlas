@@ -514,20 +514,26 @@ static void test_linked_worktrees_are_independent(void) {
         return;
     }
 
+    /* A7: registration is a local operation under the write lock, so the daemon
+     * is stopped for it and started again afterwards. What this test is about —
+     * that two worktrees of one repository are indexed independently — is
+     * unchanged; only how the second one gets into the registry has changed. */
     const char *reg[] = {"repo", "add", atlas_buf_cstr(&wt), "--name", "second"};
     atlas_buf out = ATLAS_BUF_INIT;
     int code = -1;
+    fx_daemon_stop(&L.d, false);
     cli(&L, reg, 5u, &out, &code, &err);
     T_EQ_INT(code, 0);
+    T_OK(fx_daemon_start(&L.fx, &L.d, &err), &err);
+    T_OK(fx_daemon_wait_ready(&L.d, 15000, &err), &err);
 
-    /* Registered while the daemon was running: it must be watched without a
-     * restart. */
+    /* Registered before this daemon started: it must be watched. */
     T_OK(fx_write(atlas_buf_cstr(&wt), "only-in-second.c", "1\n", &err), &err);
     const char *ev2[] = {"events", "second", "--json", "--limit", "200"};
     bool found = false;
     T_OK(fx_wait_for_substring(&L.fx, &L.d, ev2, 5u, "only-in-second.c", WAIT_MS, &found, &err),
          &err);
-    T_CHECK_MSG(found, "a worktree registered while the daemon runs must be watched");
+    T_CHECK_MSG(found, "a worktree registered before the daemon started must be watched");
 
     /* And the first worktree's journal must not claim that file. */
     atlas_buf_reset(&out);
@@ -855,6 +861,19 @@ static void test_repo_remove_through_the_daemon(void) {
 
     atlas_buf out = ATLAS_BUF_INIT;
     int code = -1;
+
+    /* A7: refused while the daemon owns the index, because there is no RPC
+     * method to route it to any more. Asserted here as well as in
+     * `test_a7_authority.c`, because this is the suite that used to prove the
+     * opposite. */
+    const char *rm_refused[] = {"repo", "remove", "fixture", "--yes"};
+    cli(&L, rm_refused, 4u, &out, &code, &err);
+    T_CHECK_MSG(code != 0, "repo remove against a running daemon must be refused");
+    atlas_buf_reset(&out);
+
+    /* Stopped, removed locally, and the daemon is not restarted: what the rest
+     * of this test checks is the state the removal left behind. */
+    fx_daemon_stop(&L.d, false);
     const char *rm[] = {"repo", "remove", "fixture", "--yes", "--json"};
     cli(&L, rm, 5u, &out, &code, &err);
     T_EQ_INT(code, 0);

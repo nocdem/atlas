@@ -298,19 +298,51 @@ None of these was started in A6 and none is claimed. They are listed here rather
 than only in a phase document because the roadmap is where a reader looks for
 what has not happened yet.
 
-- **A full dedicated security review.** A6 added a surface — a gate evaluator, a
-  new RPC method, a new MCP tool, a schema migration and an operator write path
-  — and reviewed each against the phase's own rules. That is not the same thing
-  as a dedicated review of the whole system, which remains outstanding.
+- ~~**A full dedicated security review.**~~ **Done — see the A7 section below.**
 - **clangd and toolchain truth** (see the section above; deferred from A5,
-  unchanged by A6).
+  unchanged by A6 and by A7).
 - **The Atlas orchestration / control plane.**
 - **The Claude dispatcher.**
 - **The GitHub issue / PR / review loop.**
 - **Model routing.**
 - **Testnet 2 automation.**
 
-## A7 — optional MCP adapter (absorbed into A2)
+## A7 — dedicated security review and trust-boundary hardening (shipped)
+
+The review deferred from every previous phase, done as its own phase rather than
+as a section of one. `docs/security/A7_THREAT_MODEL.md` states who Atlas defends
+against and what it does not defend; `docs/security/A7_SECURITY_REVIEW.md`
+records every finding with its reproduction, fix, regression test and residual
+risk.
+
+What it found and fixed:
+
+- **One CRITICAL.** `decision.challenge` was an ordinary RPC method, so any
+  process able to open the socket could mint the capability that
+  `decision.approve` spends — with no terminal — and the resulting record said
+  `LOCAL_OPERATOR_CONFIRMED`. The five operator-channel methods are deleted from
+  the protocol, not left refusing.
+- **Two HIGH.** `repo.ensure` let a session hook or an MCP root grant register
+  any directory as a trusted repository, and `repo.add`/`repo.remove` were
+  ordinary RPC methods. All three are gone; registration is a local operation
+  under the write lock.
+- **One MEDIUM, resolved by design change.** Terminal presence was being treated
+  as operator authority. It is not, and A4's own test suite had been
+  demonstrating that since A4 by typing into a pseudo-terminal it allocated.
+  Authority is now a configured OS fact — a root-anchored policy naming an
+  `operator_uid`, plus a root-owned executable — and where that does not exist
+  the profile is locked and the lifecycle verbs refuse.
+
+What it deliberately did **not** do: guard backup, restore, prune and
+registration behind the same lock. Against a process running as the uid that owns
+the data directory, `cp`, `mv`, `rm` and `sqlite3` reach the same bytes, so such
+a guard reads as protection in a review and provides none — while breaking the
+ordinary single-user install. The reasoning is in `atlas/authority.h` and the
+review; a future phase that wants to widen the guard has to answer it.
+
+A7 added no orchestration, no dispatcher, no work queue and no model routing.
+
+## A7 (original plan) — optional MCP adapter (absorbed into A2)
 
 A7 was conditional: an MCP adapter only if a skill driving the CLI turned out to
 be insufficient. It turned out to be insufficient before it was written, for a

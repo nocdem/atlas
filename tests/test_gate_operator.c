@@ -723,7 +723,20 @@ static int pty_wait(pty *p, atlas_buf *transcript) {
     return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
 }
 
-static void test_the_interactive_revalidation_shows_what_it_is_recording(void) {
+/* **A7 inverted this test.**
+ *
+ * It asserted what the interactive revalidation prompt displayed, and typed the
+ * confirmation from a program to complete it. That last part is what A7 acted
+ * on: a program typing a confirmation into a pseudo-terminal it allocated is
+ * exactly the adversary, and the prompt was therefore proving nothing about who
+ * was revalidating. Revalidation now needs operator authority, which needs an
+ * OS principal separate from the caller, which no unprivileged test has.
+ *
+ * What is asserted instead is that a pseudo-terminal does not produce a
+ * revalidation, that no prompt appears, and that the stale assessment stays
+ * stale — the last part being the one that matters, because a revalidation is
+ * what would have made it look fresh again. */
+static void test_a_pseudo_terminal_does_not_revalidate(void) {
     atlas_err err;
     atlas_err_init(&err);
     env e;
@@ -732,40 +745,35 @@ static void test_the_interactive_revalidation_shows_what_it_is_recording(void) {
     db_close(&e);
 
     const char *args[] = {"decision", "revalidate", "proj", atlas_buf_cstr(&e.uid)};
-    pty p;
-    T_OK(pty_spawn(&e, args, 4u, &p, &err), &err);
+    pty p = {-1, -1};
+    T_REQUIRE(pty_spawn(&e, args, 4u, &p, &err) == ATLAS_OK);
     atlas_buf transcript = ATLAS_BUF_INIT;
-    T_REQUIRE_MSG(pty_expect(&p, "Type ", &transcript), "no prompt appeared:\n%s",
-                  atlas_buf_cstr(&transcript));
-
-    const char *t = atlas_buf_cstr(&transcript);
-    T_CHECK_MSG(strstr(t, atlas_buf_cstr(&e.uid)) != NULL, "the prompt must name the decision");
-    T_CHECK_MSG(strstr(t, "freshness  : STALE") != NULL,
-                "the prompt must show the assessment being revalidated:\n%s", t);
-    T_CHECK_MSG(strstr(t, "DIRECT_EVIDENCE_CHANGED") != NULL,
-                "the prompt must show why it is stale");
-    T_CHECK_MSG(strstr(t, "does not edit the approved revision") != NULL,
-                "the prompt must say what revalidation does not do");
-    T_CHECK_MSG(strstr(t, "has not judged whether the decision") != NULL,
-                "the prompt must decline to claim the decision is wrong");
-    T_CHECK_MSG(strstr(t, "LOCAL_OPERATOR_CONFIRMED") != NULL,
-                "the prompt must say what will be recorded");
-    T_CHECK_MSG(strstr(t, "does not identify you") != NULL,
-                "the prompt must state that this is not an identity claim");
-    T_CHECK_MSG(strstr(t, "untrusted project text") != NULL,
-                "the decision's own prose must be labelled");
-
-    const char *tp = strstr(t, "Type ");
-    char confirm[ATLAS_DECISION_CONFIRM_MAX];
-    (void)snprintf(confirm, sizeof confirm, "%.*s", (int)ATLAS_DECISION_CONFIRM_HEX,
-                   tp + strlen("Type "));
-    pty_type(&p, confirm);
+    /* Typed blind: an adversary does not wait to be asked, and the
+     * confirmation is a public prefix of the content hash rather than a
+     * secret. */
+    pty_type(&p, "0123456789abcdef");
+    bool prompted = pty_expect(&p, "Type ", &transcript);
     int code = pty_wait(&p, &transcript);
-    T_CHECK_MSG(code == 0, "revalidate exited %d:\n%s", code, atlas_buf_cstr(&transcript));
+    const char *t = atlas_buf_cstr(&transcript);
+
+    T_CHECK_MSG(!prompted, "a locked profile displayed the revalidation prompt:\n%s", t);
+    T_CHECK_MSG(code != 0, "revalidation from a pseudo-terminal succeeded:\n%s", t);
+    T_CHECK_MSG(strstr(t, "locked in this Atlas profile") != NULL,
+                "the refusal did not explain itself:\n%s", t);
 
     db_open(&e);
-    T_EQ_INT(count_of(&e, "SELECT COUNT(*) FROM decision_validations;"), 1);
-    T_CHECK(freshness_now(&e) == ATLAS_GATE_FRESH);
+    /* Nothing recorded, and — the point of the phase — the assessment is still
+     * STALE, so the operator is still told to look. */
+    T_EQ_INT(count_of(&e, "SELECT COUNT(*) FROM decision_validations;"), 0);
+    /* No *revalidation* capability was minted. The one row present is the
+     * approve-intent challenge `env_approve` spent to set the fixture up, so
+     * counting all challenges would assert the wrong thing and would keep
+     * asserting it if the refusal later started minting one. */
+    T_EQ_INT(count_of(&e,
+                      "SELECT COUNT(*) FROM decision_challenges WHERE intent = 'REVALIDATE';"),
+             0);
+    T_CHECK_MSG(freshness_now(&e) == ATLAS_GATE_STALE,
+                "a refused revalidation must leave the decision stale");
     atlas_buf_free(&transcript);
     env_close(&e);
 }
@@ -777,9 +785,16 @@ static void test_yes_cannot_revalidate_and_neither_can_a_pipe(void) {
     db_close(&e);
 
     /* `--yes` is refused rather than ignored: a confirmation that a flag can
-     * assert is not a confirmation. */
+     * assert is not a confirmation.
+     *
+     * A7 changed which refusal arrives first, and deliberately. The authority
+     * probe runs before argument shape is examined, so this now exits
+     * ATLAS_ERR_CONFIG — the profile is locked — rather than ATLAS_ERR_USAGE.
+     * Ordering it that way means a locked profile never reports on the shape of
+     * a request it was never going to perform, and never reaches the terminal
+     * to say so. */
     const char *yes[] = {"decision", "revalidate", "proj", atlas_buf_cstr(&e.uid), "--yes"};
-    run_cli(&e, yes, 5u, (int)ATLAS_ERR_USAGE);
+    run_cli(&e, yes, 5u, (int)ATLAS_ERR_CONFIG);
 
     /* And without a terminal at all — which is how every non-interactive
      * caller, including one driven by a model, arrives. `fx_atlas` points the
@@ -823,8 +838,8 @@ static const atlas_test TESTS[] = {
      test_only_an_approved_revision_can_be_revalidated},
     {"a capability must name the assessment it covers",
      test_a_capability_must_name_the_assessment_it_covers},
-    {"the interactive revalidation shows what it is recording",
-     test_the_interactive_revalidation_shows_what_it_is_recording},
+    {"a pseudo-terminal does not revalidate",
+     test_a_pseudo_terminal_does_not_revalidate},
     {"--yes cannot revalidate and neither can a pipe",
      test_yes_cannot_revalidate_and_neither_can_a_pipe},
 };

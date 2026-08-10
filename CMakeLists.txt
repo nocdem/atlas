@@ -178,6 +178,12 @@ add_library(atlas_core STATIC
   src/gate/gate.c
   src/gate/assess.c
   src/core/service_gate.c
+  # --- A7: operator authority --------------------------------------------
+  #
+  # There is deliberately no src/ipc file here either, and no MCP tool. A
+  # profile's authority state is inspected, never set, and never over a
+  # socket: a caller that could change what constrains it is not constrained.
+  src/core/authority.c
 )
 
 target_include_directories(atlas_core

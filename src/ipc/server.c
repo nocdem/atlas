@@ -559,80 +559,6 @@ static atlas_status method_events_since(dispatch_state *ds, const atlas_ipc_requ
     return st;
 }
 
-/* Mutations. These route to the writer with a deadline. */
-
-/* Emits the writer's result as a proper JSON object.
- *
- * `name` was validated as [A-Za-z0-9._-] on registration and `root_text` is
- * already in the safe encoding, so neither is re-encoded here — encoding an
- * already-encoded path would stop it decoding back to the original bytes. Both
- * still go through the streaming writer, so quoting is never hand-rolled. */
-static atlas_status write_repository_result(dispatch_state *ds, const atlas_writer_result *r,
-                                            atlas_err *err) {
-    atlas_status st = atlas_json_key(ds->j, "repository", err);
-    if (st == ATLAS_OK) {
-        st = atlas_json_obj_begin(ds->j, err);
-    }
-    if (st == ATLAS_OK) {
-        st = atlas_json_key_int(ds->j, "id", r->id, err);
-    }
-    if (st == ATLAS_OK) {
-        st = atlas_json_key_str(ds->j, "name", atlas_buf_cstr(&r->name), err);
-    }
-    if (st == ATLAS_OK) {
-        st = atlas_json_key_str(ds->j, "root", atlas_buf_cstr(&r->root_text), err);
-    }
-    if (st == ATLAS_OK) {
-        st = atlas_json_obj_end(ds->j, err);
-    }
-    return st;
-}
-
-static atlas_status method_repo_add(dispatch_state *ds, const atlas_ipc_request *req,
-                                    atlas_err *err) {
-    const char *path = NULL;
-    if (!atlas_ipc_param_str(req, "path", &path)) {
-        return atlas_err_set(err, ATLAS_ERR_USAGE, "repo.add needs a \"path\" string parameter");
-    }
-    const char *name = NULL;
-    (void)atlas_ipc_param_str(req, "name", &name);
-    if (name != NULL) {
-        atlas_status vst = atlas_db_check_repo_name(name, err);
-        if (vst != ATLAS_OK) {
-            return vst;
-        }
-    }
-    atlas_writer_result result;
-    atlas_writer_result_init(&result);
-    atlas_status st =
-        atlas_writer_call(ds->ctx->writer, ATLAS_JOB_REPO_ADD, path, name, 30000, &result, err);
-    if (st == ATLAS_OK) {
-        st = write_repository_result(ds, &result, err);
-    }
-    atlas_writer_result_free(&result);
-    return st;
-}
-
-static atlas_status method_repo_remove(dispatch_state *ds, const atlas_ipc_request *req,
-                                       atlas_err *err) {
-    const char *name = NULL;
-    if (!atlas_ipc_param_str(req, "repo", &name)) {
-        return atlas_err_set(err, ATLAS_ERR_USAGE, "repo.remove needs a \"repo\" string parameter");
-    }
-    atlas_status st = atlas_db_check_repo_name(name, err);
-    if (st != ATLAS_OK) {
-        return st;
-    }
-    atlas_writer_result result;
-    atlas_writer_result_init(&result);
-    st = atlas_writer_call(ds->ctx->writer, ATLAS_JOB_REPO_REMOVE, name, NULL, 30000, &result, err);
-    if (st == ATLAS_OK) {
-        st = write_repository_result(ds, &result, err);
-    }
-    atlas_writer_result_free(&result);
-    return st;
-}
-
 /* --- dispatch ------------------------------------------------------------ */
 
 static const atlas_method_entry METHODS[] = {
@@ -641,12 +567,21 @@ static const atlas_method_entry METHODS[] = {
     {"repo.list", method_repo_list},
     {"repo.state", method_repo_state},
     {"repo.sync", method_repo_sync},
-    {"repo.add", method_repo_add},
-    {"repo.remove", method_repo_remove},
     {"events.since", method_events_since},
     /* There is deliberately no daemon.shutdown. Anything local that can open the
      * socket could then disable indexing; systemd owns the lifecycle and SIGTERM
-     * already stops the daemon. */
+     * already stops the daemon.
+     *
+     * **A7: and deliberately no `repo.add` or `repo.remove`.** Registering a
+     * repository is what makes Atlas treat a directory as one it will read,
+     * index and answer questions about; removing one discards that. Both were
+     * ordinary RPC methods, which meant anything that could open the socket
+     * could decide what Atlas trusts. Registration is now a local CLI operation
+     * under the write lock, like backup and restore, so the daemon has to be
+     * stopped for the registry to change at all.
+     *
+     * `repo.resolve` remains, and reports. A caller may still ask whether a
+     * path is registered; it may no longer make it so. */
 };
 
 atlas_status atlas_server_dispatch(atlas_server_ctx *ctx, const void *payload, size_t len,

@@ -286,23 +286,35 @@ directory that merely resembles the right one and does so silently.
 | | an empty interior component |
 | | `/` itself, which would authorize the filesystem |
 
-### Registering from MCP alone
+### Nothing registers a repository — A7
 
-**An MCP client with no hooks registers repositories by granting roots.** The
-first version of this deliberately did not, on the grounds that a mutation
-mid-tool-call is a surprise; that made MCP depend on a Claude `SessionStart`
-having run first, which contradicts Atlas working with any AI client.
+**No hook, no MCP tool and no RPC method registers a repository.** An operator
+runs `atlas repo add` with the daemon stopped, and that is the only way a
+directory enters the index.
 
-What makes it safe is the bound rather than the absence. `repo.ensure` is called
-with the granted root itself and with `exact_root`, which **refuses to resolve
-upward**: if the granted root is a subdirectory of a larger worktree, the parent
-is *not* registered, because the client did not grant it. Nothing walks the
-filesystem, and a refusal is reported with its reason rather than appearing as a
-bare "no repository".
+Earlier phases did it automatically, from two places, and both were removed in
+A7 for the same reason. The session-start hook registered the session's working
+directory; the MCP adapter registered every granted root, bounded to the case
+where the granted root was itself the worktree root. The bound was real, and the
+reasoning was still wrong, because of *who chooses the input*: a session's cwd is
+wherever Claude was launched, `DirectoryAdded` carries a slash-command argument,
+and `roots/list` is answered by the client. A model that can influence any of
+those could choose which trees Atlas opens, reads, hashes and runs git against —
+which is the entry point for every hostile-repository defence Atlas has.
 
-The session-start hook does not ask for `exact_root`: a person who launched
-Claude in a subdirectory means the worktree, and Claude's own file access already
-spans it.
+What the adapters do now is *resolve*:
+
+- a granted root that names a registered repository is attached, and tools
+  answer about it as before;
+- a granted root that names nothing is reported as unregistered, and a tool call
+  scoped to it is refused with that reason rather than with a bare "no
+  repository";
+- the registry is unchanged either way.
+
+The cost is real and deliberate: an MCP client working in a repository nobody
+registered can do nothing until a person registers it. That is the shape of the
+boundary rather than a gap in it. `docs/security/A7_SECURITY_REVIEW.md`
+(ATLAS-A7-002) has the reproduction and the reasoning.
 
 ### Protocol versions
 
@@ -422,7 +434,6 @@ where Atlas has never run rather than making the statement true by writing one.
 | variable | effect |
 | --- | --- |
 | `ATLAS_CLAUDE_DISABLE=1` | every hook returns `{}` immediately, without even a diagnostic |
-| `ATLAS_CLAUDE_NO_AUTO_REGISTER=1` | `SessionStart` will not register an unregistered repository |
 | `ATLAS_BIN` | overrides which executable the launchers run |
 | `ATLAS_CLAUDE_PLUGIN_DIR` | overrides where `integrate` looks for the plugin |
 

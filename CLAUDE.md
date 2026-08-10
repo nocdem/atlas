@@ -1,8 +1,12 @@
 # Atlas — working notes for Claude Code
 
 Atlas is a generic, headless engineering-memory and repository-intelligence CLI in
-C17. Phase **A6**: deterministic impact gates and stale-decision detection — on
-top of the A5 verified online backups, atomic restore and written retention
+C17. Phase **A7**: a dedicated security review and the trust-boundary hardening
+that came out of it — the model-facing surface reduced to reads and proposals,
+automatic repository registration removed, and operator authority made a
+configured OS fact rather than an inference from a terminal. On top of the A6
+deterministic impact gates and stale-decision detection,
+the A5 verified online backups, atomic restore and written retention
 classification, the A4 decision documents,
 the A3 structural code intelligence, the A2 AI integration, the A1 daemon and the
 A0 read-only foundation. Not DNA-specific; DNA is its first real indexed
@@ -793,6 +797,89 @@ rather than a new path.
   and a diagnostic that reported ordinary code changes as corruption would teach
   everybody to ignore it.
 
+## A7 layers — additions
+
+```
+src/core     authority.c (the operator-authority probe and the one refusal)
+docs/security A7_THREAT_MODEL.md, A7_SECURITY_REVIEW.md
+```
+
+There is deliberately **no `src/ipc` file here and no MCP tool**. A profile's
+authority state is inspected, never set, and never over a socket.
+
+## A7 rules — these are not negotiable
+
+- **A terminal is not authority, and Atlas must never act as though it is.**
+  Nothing observable from inside a process distinguishes a human from a program
+  running as the same uid: not `isatty`, not `/dev/tty`, not pseudo-terminal
+  ownership, not environment variables, not parent-process names, not session
+  ids, not a typed confirmation, not timing. `tests/test_decision_operator.c`
+  allocates a pty and types into it, which is the demonstration rather than a
+  claim about one. Do not add a check of this shape and do not reintroduce one
+  that was removed.
+- **Authority is configured outside the reach of the principal it constrains, or
+  it does not exist.** All four conditions in `atlas/authority.h` hold or the
+  profile is LOCKED: a root-anchored policy reached without traversing a
+  symlink, root ownership with no other writer on every component, an
+  `operator_uid` matching `getuid()`, and a root-owned non-writable executable.
+  The last one is not decoration — a check running from a binary the constrained
+  uid can replace reports whatever that uid last compiled.
+- **`ATLAS_AUTHORITY_POLICY_PATH` is a compiled-in constant.** No environment
+  override, no flag, no data-directory-relative variant. A caller that can
+  choose the policy is not constrained by it, and adding one deletes the phase.
+- **LOCKED is zero**, for the reason A6 keeps UNKNOWN and BLOCKED at zero. There
+  is exactly one `state = ATLAS_AUTHORITY_GRANTED` assignment and it is the last
+  statement of the probe; every other path leaves what `memset` left.
+- **The guarded set is the decision lifecycle and nothing else, and widening it
+  needs the argument in `atlas/authority.h`.** Backup create, backup restore,
+  maintenance prune and repository registration were considered and deliberately
+  excluded: against a process running as the uid that owns the data directory,
+  `cp`, `mv`, `rm` and `sqlite3` reach the same bytes, so a check there reads as
+  protection in a review and provides none — and in a separated deployment the
+  filesystem already refuses. **A check an adversary walks around is worse than
+  no check.** The lifecycle is different because of what Atlas *produces*: it
+  mints a coherent record — consumed challenge, ledger event, status cache,
+  `LOCAL_OPERATOR_CONFIRMED` — that nothing downstream can distinguish from a
+  human's. Refusing converts an undetectable forgery into one that disagrees
+  with the ledger and fails `atlas doctor`. That is the whole claim.
+- **The authority check runs before the terminal is opened, before a capability
+  is minted and before a prompt is printed.** A prompt in a locked profile is a
+  question whose answer the caller can supply. Ordering it first also means a
+  locked profile never reports on the shape of a request it was not going to
+  perform.
+- **No RPC method, MCP tool, hook or plugin command mints or spends a lifecycle
+  capability, or changes the registry.** `decision.challenge`, `decision.approve`,
+  `decision.reject`, `decision.supersede`, `decision.revalidate`, `repo.add`,
+  `repo.ensure` and `repo.remove` were **deleted**, not left refusing — an absent
+  method is answered by the dispatcher's unknown-method case, and a refusing one
+  is a refusal a later edit can weaken. `tests/test_a7_authority.c` asks a live
+  daemon for 34 names, including case variants and aliases, and requires every
+  one to answer `unknown method` rather than merely to fail.
+- **Nothing registers a repository except an operator.** Already-registered
+  repositories are discovered and attached; an unknown directory is reported and
+  left alone. Never restore auto-registration to a hook, an MCP root grant or a
+  session event: those inputs are chosen by, or influenced by, the model.
+- **`atlas doctor` reports the profile and never treats a locked one as a
+  fault.** A locked profile is the correct state of an unseparated machine. It
+  does not affect `ok`.
+- **Do not claim A7 protects the database.** It does not. A process running as
+  the uid that owns `atlas.db` can write any row with SQLite and no Atlas code
+  path. Only a separate OS principal protects the record; the review says
+  exactly what that deployment involves.
+
+## Extending A7 safely
+
+- **A new guarded operation** means a member of `atlas_authority_op`, a case in
+  `atlas_authority_op_name`, a call at the CLI entry point, and — the part that
+  is not optional — a written argument that refusing it stops something a shell
+  builtin does not already do. Without that argument it is theatre.
+- **A new authority reason** means a member of `atlas_authority_reason`, a name,
+  a one-sentence explanation that says what would change it, and a case in
+  `test_no_unprivileged_shape_grants_authority`. Keep UNKNOWN at zero.
+- **A new RPC method** must be a read. If it is plausibly an authority verb, add
+  its name to the negative enumeration in `tests/test_a7_authority.c` so the
+  list keeps pace with the vocabulary.
+
 ## Extending A6 safely
 
 - **A new reason code** means a member of `atlas_gate_reason`, a row in
@@ -1090,7 +1177,8 @@ two documents on stdout.
 `README.md` (usage, limitations) · `SECURITY.md` (threat model) ·
 `docs/architecture.md` · `docs/data-model.md` · `docs/provenance.md` ·
 `docs/code-intelligence.md` · `docs/decision-lifecycle.md` ·
-`docs/operations.md` · `docs/impact-gates.md` · `docs/git-safety.md` · `docs/daemon-and-ipc.md` ·
+`docs/operations.md` · `docs/impact-gates.md` ·
+`docs/security/A7_THREAT_MODEL.md` · `docs/security/A7_SECURITY_REVIEW.md` · `docs/git-safety.md` · `docs/daemon-and-ipc.md` ·
 `docs/watcher-consistency.md` · `docs/systemd-user-service.md` ·
 `docs/ai-trust-boundary.md` · `docs/claude-integration.md` ·
 `docs/backlog.md` · `docs/roadmap.md` ·

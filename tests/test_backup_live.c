@@ -310,20 +310,28 @@ static void test_a_mutation_goes_to_the_data_directory_it_named(void) {
     atlas_buf_free(&so4);
     atlas_buf_free(&se4);
 
-    /* And a mutation that *does* name the daemon's directory still routes to
-     * it: the fix must not have turned routing off. */
+    /* And a registration that *does* name the daemon's own directory is now
+     * refused rather than routed.
+     *
+     * A7 inverted this assertion deliberately. It used to prove that routing
+     * still worked; what routing meant was that `repo.add` was an RPC method,
+     * and therefore that anything able to open the socket could decide which
+     * directories Atlas treats as repositories. The refusal is the guarantee,
+     * and it has to name the remedy. */
     const char *add2[] = {"repo", "add", fx_repo(&fx), "--name", "proper"};
     atlas_buf so2 = ATLAS_BUF_INIT, se2 = ATLAS_BUF_INIT;
     T_OK(fx_atlas_with_runtime(&fx, &d, add2, 5, &so2, &se2, &code, &err), &err);
-    T_CHECK_MSG(code == 0, "repo add exited %d: %s", code, atlas_buf_cstr(&se2));
+    T_CHECK_MSG(code != 0, "repo add against a running daemon must be refused, exited %d", code);
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&se2), "Stop it first") != NULL,
+                "the refusal must tell the operator what to do: %s", atlas_buf_cstr(&se2));
     atlas_buf_free(&so2);
     atlas_buf_free(&se2);
-    /* The daemon holds the writer lock, so a registration that reached the
-     * index at all can only have gone through it. */
+    /* And nothing reached the daemon's index. */
     T_OK(atlas_db_open_readonly(atlas_buf_cstr(&p), &db, &err), &err);
     n = -1;
     T_OK(atlas_db_query_int64(db, "SELECT count(*) FROM repositories;", &n, &err), &err);
-    T_CHECK_MSG(n == 1, "a mutation naming the daemon's own directory did not reach it");
+    T_CHECK_MSG(n == 0, "a refused registration still reached the daemon's index (%lld rows)",
+                (long long)n);
     atlas_db_close(db);
 
     T_CHECK(!fx_daemon_exited(&d));

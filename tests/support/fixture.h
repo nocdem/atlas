@@ -36,6 +36,20 @@ void fx_close(fixture *fx);
  * test to keep a failing suite from accumulating directories under TMPDIR. */
 void fx_cleanup_leaked(void);
 
+/* Disowns everything this process inherited from its parent across fork().
+ *
+ * A forked child shares the fixture's bookkeeping with its parent: the live
+ * temporary trees, the tracked daemon pids and the process-private runtime
+ * directory. The exit handler that releases those belongs to whichever process
+ * created them, so a child that means to create its own must first stop being a
+ * second claimant on its parent's. Nothing on disk is touched — this only
+ * forgets.
+ *
+ * A child that immediately execs does not need this: exec discards the exit
+ * handler along with the rest of the image. Only a child that keeps running
+ * fixture code does. */
+void fx_reset_after_fork(void);
+
 const char *fx_repo(const fixture *fx);
 const char *fx_data_dir(const fixture *fx);
 

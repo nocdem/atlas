@@ -47,6 +47,38 @@ static char *g_live[FX_MAX_LIVE];
 #define FX_MAX_DAEMONS 8
 static pid_t g_daemons[FX_MAX_DAEMONS];
 
+/* --- process-lifetime ownership of the fixture's temporary state -----------
+ *
+ * Everything the fixture creates under TMPDIR belongs to *this process* and must
+ * be gone when it ends. The harness sweeps between tests, which covers a test
+ * that abandoned its body, but it cannot cover state whose lifetime is the whole
+ * process — the private runtime directory below is created once and is still
+ * live when the last test returns. That directory was left behind by every test
+ * process in the suite, one per binary per run.
+ *
+ * So ownership is made explicit rather than delegated to the harness: the first
+ * thing that creates temporary state arms an exit handler, and the handler
+ * releases everything this process owns. The harness sweep stays, because it
+ * bounds accumulation *during* a run; this bounds it across one.
+ *
+ * `g_owner_pid` is the whole reason the handler is safe. fork() copies these
+ * tables into the child, and a child that exits normally runs the inherited
+ * handler — which would SIGKILL the parent's daemons and delete the parent's
+ * fixture trees. The handler therefore does nothing unless it is running in the
+ * process that armed it. A forked child that wants its own fixture state calls
+ * fx_reset_after_fork() and becomes the owner of its own. */
+static pid_t g_owner_pid;
+
+static void fx_atexit(void);
+
+static void fx_own(void) {
+    if (g_owner_pid == getpid()) {
+        return;
+    }
+    g_owner_pid = getpid();
+    (void)atexit(fx_atexit);
+}
+
 static void daemon_track(pid_t pid) {
     for (size_t i = 0; i < FX_MAX_DAEMONS; i++) {
         if (g_daemons[i] <= 0) {
@@ -120,6 +152,7 @@ atlas_status fx_open(fixture *fx, atlas_err *err) {
         return atlas_err_set_errno(err, ATLAS_ERR_INTERNAL, errno, "cannot create the data dir");
     }
     live_add(atlas_buf_cstr(&fx->root));
+    fx_own();
     return ATLAS_OK;
 }
 
@@ -651,11 +684,12 @@ atlas_status fx_tree_digest(const char *dir, char *hex_out, atlas_err *err) {
  * so a CLI test cannot reach any daemon through it — not the developer's, and
  * not another fixture's. The daemon suite supplies its own through
  * `extra_env`, which overrides this one. */
+static char g_runtime_dir[256];
+static int g_runtime_state = 0; /* 0 unset, 1 ready, -1 failed */
+
 static const char *fx_private_runtime_dir(void) {
-    static char dir[256];
-    static int state = 0; /* 0 unset, 1 ready, -1 failed */
-    if (state != 0) {
-        return state == 1 ? dir : NULL;
+    if (g_runtime_state != 0) {
+        return g_runtime_state == 1 ? g_runtime_dir : NULL;
     }
     const char *tmp = getenv("TMPDIR");
     if (tmp == NULL || tmp[0] == '\0') {
@@ -663,14 +697,75 @@ static const char *fx_private_runtime_dir(void) {
     }
     /* Short, because a Unix socket address is a fixed 108-byte field and a
      * fixture that ever does place one here must still fit. */
-    if ((size_t)snprintf(dir, sizeof dir, "%s/atlas-rt.XXXXXX", tmp) >= sizeof dir ||
-        mkdtemp(dir) == NULL) {
-        state = -1;
+    if ((size_t)snprintf(g_runtime_dir, sizeof g_runtime_dir, "%s/atlas-rt.XXXXXX", tmp) >=
+            sizeof g_runtime_dir ||
+        mkdtemp(g_runtime_dir) == NULL) {
+        g_runtime_state = -1;
         return NULL;
     }
-    (void)chmod(dir, 0700);
-    state = 1;
-    return dir;
+    (void)chmod(g_runtime_dir, 0700);
+    g_runtime_state = 1;
+    fx_own();
+    return g_runtime_dir;
+}
+
+/* Releases the private runtime directory.
+ *
+ * `rmdir` rather than a recursive delete, and that is the safety argument
+ * rather than an economy: the directory is created empty and is documented to
+ * stay empty, so removing it can only ever succeed on a directory that is still
+ * empty. A path that had somehow become something else — a populated directory,
+ * a file, a symlink to elsewhere — is refused by the kernel rather than
+ * followed and emptied. The removal cannot be talked into targeting anything
+ * broad because it has no recursion to offer.
+ *
+ * It is also done relative to an O_NOFOLLOW parent handle rather than by
+ * absolute path, so no component of the path is resolved through a link that
+ * appeared after the directory was created. */
+static void fx_private_runtime_dir_release(void) {
+    if (g_runtime_state != 1) {
+        return;
+    }
+    const char *slash = strrchr(g_runtime_dir, '/');
+    if (slash != NULL && slash != g_runtime_dir && g_runtime_dir[0] == '/') {
+        char parent[sizeof g_runtime_dir];
+        size_t plen = (size_t)(slash - g_runtime_dir);
+        memcpy(parent, g_runtime_dir, plen);
+        parent[plen] = '\0';
+        int pfd = open(parent, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (pfd >= 0) {
+            (void)unlinkat(pfd, slash + 1, AT_REMOVEDIR);
+            (void)close(pfd);
+        }
+    }
+    g_runtime_state = 0;
+    g_runtime_dir[0] = '\0';
+}
+
+static void fx_atexit(void) {
+    /* Only the process that armed this owns the state it would release. */
+    if (getpid() != g_owner_pid) {
+        return;
+    }
+    fx_cleanup_leaked();
+    fx_private_runtime_dir_release();
+}
+
+void fx_reset_after_fork(void) {
+    /* Drop everything inherited from the parent without touching it on disk:
+     * the parent still owns those trees, those daemons and that directory. The
+     * child then owns whatever it goes on to create. */
+    for (size_t i = 0; i < FX_MAX_DAEMONS; i++) {
+        g_daemons[i] = 0;
+    }
+    for (size_t i = 0; i < FX_MAX_LIVE; i++) {
+        free(g_live[i]);
+        g_live[i] = NULL;
+    }
+    g_runtime_state = 0;
+    g_runtime_dir[0] = '\0';
+    g_owner_pid = 0;
+    fx_own();
 }
 
 static atlas_status fx_atlas_impl(const char *const *args, size_t nargs,

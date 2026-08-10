@@ -48,6 +48,8 @@ target_compile_definitions(atlas-gen-decisions PRIVATE _POSIX_C_SOURCE=200809L)
 atlas_set_warnings(atlas-gen-decisions)
 
 set(ATLAS_TESTS
+  # The fixture's own hygiene, asserted from outside a process that used it.
+  test_fixture
   test_core
   test_safetext
   test_proc
@@ -111,6 +113,9 @@ set_tests_properties(test_scan test_search test_diff test_worktree test_cli test
   test_code_analyzer test_git_hardening test_reconcile PROPERTIES LABELS "integration")
 set_tests_properties(test_core test_safetext test_proc test_git_parse test_db test_datadir
   test_lock test_ipc test_migrate3 test_unit PROPERTIES LABELS "unit")
+# The fixture suite forks children that run the binary, but needs no repository,
+# no database and no daemon.
+set_tests_properties(test_fixture PROPERTIES LABELS "unit")
 
 # A2. test_ai_schema drives the storage layer in process; test_mcp and
 # test_plugin fork the binary but need no daemon and no repository.

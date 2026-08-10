@@ -282,6 +282,15 @@ atlas_status atlas_service_doctor(atlas_ctx *ctx, atlas_doctor_report *out, atla
         out->authority_state = a.state;
         out->authority_reason = a.reason;
     }
+    {
+        /* A7.1. Same placement and the same argument: a property of the machine,
+         * answerable with no index, and the first thing to check when a client
+         * cannot find the daemon it expected. */
+        atlas_syspolicy sp;
+        atlas_syspolicy_load(&sp);
+        out->deployment_state = sp.state;
+        out->deployment_reason = sp.reason;
+    }
 
     atlas_err git_err;
     atlas_err_init(&git_err);

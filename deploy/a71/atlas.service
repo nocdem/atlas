@@ -1,0 +1,118 @@
+# Atlas - the A7.1 system service.
+# Copyright 2026 The Atlas Authors. Licensed under the Apache License 2.0.
+#
+# A *system* unit, not a user unit, and that is the whole point of A7.1: the
+# daemon runs as `atlasd`, an account with no login, no password, no sudo and no
+# writable code, and it is the only non-root principal that can open the index.
+#
+# Installed to /etc/systemd/system/atlas.service, root-owned, mode 0644.
+# Machine-specific values do not appear here — the socket, the index and the
+# client list live in /etc/atlas/system.conf, which Atlas reads itself.
+#
+# Every directive below was started on a real machine before being written down.
+# Three that a reviewer might expect are deliberately absent, each with a reason,
+# because a directive that fails or is silently ignored is worse than none: it
+# reads as a guarantee in a unit file and is not one.
+
+[Unit]
+Description=Atlas repository index daemon (system)
+Documentation=man:atlas(1)
+# The index lives on local storage; nothing here needs the network, and Atlas
+# performs no network access at all.
+After=local-fs.target
+RequiresMountsFor=/var/lib/atlas /run/atlas
+
+[Service]
+Type=simple
+User=atlasd
+# `atlas-clients` is the daemon's *primary* group on purpose, so that systemd's
+# RuntimeDirectory and the socket the daemon binds are created with that group
+# already. The alternative — a supplementary group plus a `chown` at bind time —
+# does not work under this sandbox: `chown` is in systemd's `@privileged`
+# syscall set, and the filter below kills the daemon with SIGSYS before it can
+# bind. Atlas still verifies the resulting owner, group and mode and refuses to
+# serve if they are wrong, so this is the mechanism and Atlas is the guarantee.
+#
+# Nothing is weakened by it. UMask=0077 means the daemon writes no group bits,
+# /var/lib/atlas is 0700, and the only object this group can reach is the socket.
+Group=atlas-clients
+SupplementaryGroups=atlasd
+
+# Absolute, root-owned, and never a build tree. A unit pointing at a worktree
+# binary is a unit whose trusted computing base is a developer's checkout.
+ExecStart=/usr/local/bin/atlas daemon run
+
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+# Files Atlas creates describe private repositories. 0077 means nothing it
+# writes is group- or world-readable even though its supplementary group exists
+# for the socket — the socket's mode is set explicitly by Atlas afterwards.
+UMask=0077
+
+# /run/atlas, created 0750 by systemd and removed on stop. Atlas re-checks the
+# owner, group and mode itself at startup and refuses to serve if they are
+# wrong, so this is the convenience and Atlas is the guarantee.
+RuntimeDirectory=atlas
+RuntimeDirectoryMode=0750
+# /var/lib/atlas, the authoritative index.
+StateDirectory=atlas
+StateDirectoryMode=0700
+
+# --- sandbox ---------------------------------------------------------------
+#
+# ProtectSystem=strict makes the entire filesystem read-only except for what is
+# named below, so the read-only guarantee over indexed repositories is enforced
+# by the kernel and not only by Atlas' own discipline. Even a hypothetical bug
+# that tried to write into /opt/dna would fail with EROFS.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete
+CapabilityBoundingSet=
+AmbientCapabilities=
+# The daemon answers a Unix socket and nothing else.
+RestrictAddressFamilies=AF_UNIX
+PrivateDevices=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectProc=invisible
+ProcSubset=pid
+
+# The only writable paths. Note what is *not* here: /usr/local/bin/atlas,
+# /etc/atlas, this unit, /var/backups/atlas, the Claude plugin, either home
+# directory, and every indexed repository. That absence is ATLAS-A7-006's fix.
+ReadWritePaths=/var/lib/atlas
+# Read-only access to what it indexes. Listed explicitly rather than relying on
+# ProtectSystem=strict alone, so adding a repository is a deliberate edit here
+# and an unlisted directory is simply invisible.
+ReadOnlyPaths=/opt/atlas /opt/dna /opt/swapper
+# Backups are written by the operator with the daemon stopped, so the running
+# daemon needs no access to them at all and is given none.
+InaccessiblePaths=/var/backups/atlas
+
+# ProtectHome=yes hides /home entirely, which is what removes any path from the
+# daemon to the operator's account, the Claude plugin or the old per-user index.
+# The daemon's own state is under /var/lib, so it loses nothing.
+
+# ProtectKernelModules is deliberately absent: it needs CAP_SYS_MODULE dropped
+# from the bounding set, and CapabilityBoundingSet= above already empties it —
+# on a *system* unit that is effective, unlike the A7 user unit where the same
+# directive failed the whole service with 218/CAPABILITIES. The A7 fix is
+# retained by keeping the directive out and emptying the bounding set instead,
+# which achieves the same thing and starts.
+
+[Install]
+WantedBy=multi-user.target

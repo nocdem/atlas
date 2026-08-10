@@ -24,6 +24,7 @@
 #include "atlas/reconcile.h"
 #include "atlas/scan.h"
 #include "atlas/sha256.h"
+#include "atlas/syspolicy.h"
 
 typedef struct atlas_ctx atlas_ctx;
 
@@ -121,6 +122,12 @@ typedef struct atlas_doctor_report {
      * unseparated machine, not a fault — so it does not affect `ok`. */
     atlas_authority_state authority_state;
     atlas_authority_reason authority_reason;
+    /* A7.1. Which deployment this is, and why. Reported beside the authority
+     * profile because the two answer the same operator question — "what is this
+     * Atlas allowed to do, and for whom?" — and because a system deployment
+     * that silently fell back to per-user mode would otherwise look identical. */
+    atlas_syspolicy_state deployment_state;
+    atlas_syspolicy_reason deployment_reason;
     bool ok;                  /* no blocking problem found */
     atlas_buf problems;       /* newline-separated, empty when ok */
 } atlas_doctor_report;

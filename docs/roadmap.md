@@ -342,6 +342,33 @@ review; a future phase that wants to widen the guard has to answer it.
 
 A7 added no orchestration, no dispatcher, no work queue and no model routing.
 
+## A7.1 — OS authority separation (shipped)
+
+A7 ended with an honest gap: the lock it added protected the Atlas-mediated
+route and nothing else, because one uid owned the daemon, the database, the
+binary and the shell. A7.1 closes that with the operating system rather than
+with more C.
+
+- `atlasd` — a no-login system account that runs the daemon and solely owns
+  `/var/lib/atlas` (0700) and `/var/backups/atlas` (0700).
+- `atlas-worker` — the untrusted account every persistent model process runs as,
+  and the principal A7.1 defends against. It cannot read the index or the
+  backups, replace the root-owned binary or policies, or stop the service.
+- `atlas-clients` — a group whose only privilege is opening the socket.
+- A root-owned `/etc/atlas/system.conf` that decides the socket, the index and
+  the client allowlist; anything missing, malformed, symlinked or non-root-owned
+  leaves Atlas in per-user mode.
+- Cross-uid service with `SO_PEERCRED` checked against that allowlist before a
+  byte is read, and the A7 model-safe method surface unchanged behind it.
+- A copy-migrate-switch cutover to schema 7, leaving the original schema-6
+  per-user database byte-identical as a rollback target.
+
+**`nocdem` and root remain trusted by design** and are explicitly outside the
+isolation guarantee, at the operator's decision. A7.1 defends against
+`atlas-worker`; see `docs/security/A7_1_THREAT_MODEL.md`.
+
+A7.1 added no orchestration.
+
 ## A7 (original plan) — optional MCP adapter (absorbed into A2)
 
 A7 was conditional: an MCP adapter only if a skill driving the CLI turned out to

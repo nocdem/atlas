@@ -2391,6 +2391,21 @@ int atlas_cli_main(int argc, char **argv, FILE *out, FILE *errout) {
         return (int)ATLAS_ERR_USAGE;
     }
 
+    /* A7.1. Declare which index this invocation is about, before anything
+     * resolves a socket.
+     *
+     * A socket belongs to an index. With a system policy in force the shared
+     * daemon serves `/var/lib/atlas` on its own socket, but a command pointed
+     * explicitly somewhere else — an offline lifecycle operation, or the test
+     * suite isolating itself — is talking about a different index and must
+     * reach that index's own endpoint. Without this, every `--data-dir`
+     * invocation on a deployed machine would address the system socket and
+     * either be refused or, far worse, answer about the wrong database.
+     *
+     * `NULL` when no `--data-dir` was given, which is the ordinary case and
+     * leaves the policy in charge. */
+    atlas_ipc_socket_scope_set(st.opts.data_dir);
+
     s = run_command(&st, &err);
     if (s != ATLAS_OK && !st.rendered) {
         atlas_render_error(out, errout, st.opts.json, st.command, &err);

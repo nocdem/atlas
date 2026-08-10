@@ -271,6 +271,19 @@ static void test_runtime_dir_requires_xdg(void) {
     atlas_buf out = ATLAS_BUF_INIT;
     const char *saved = getenv("XDG_RUNTIME_DIR");
     char *copy = (saved != NULL) ? strdup(saved) : NULL;
+    const char *saved_dd = getenv("ATLAS_DATA_DIR");
+    char *copy_dd = (saved_dd != NULL) ? strdup(saved_dd) : NULL;
+
+    /* **A7.1: name an index that is not the system one, so this exercises the
+     * per-user resolution it is about.**
+     *
+     * A socket belongs to an index. On a machine with a system deployment, a
+     * process that names no index resolves the authoritative one and therefore
+     * the system socket — correctly, and with `$XDG_RUNTIME_DIR` ignored, which
+     * is the whole point of that rule. This test is about the *other* branch,
+     * so it says which index it means rather than depending on whether the
+     * machine happens to be deployed. */
+    (void)setenv("ATLAS_DATA_DIR", "/tmp/atlas-ipc-runtime-test", 1);
 
     (void)unsetenv("XDG_RUNTIME_DIR");
     /* With the variable absent, Atlas falls back to the one directory a login
@@ -313,6 +326,12 @@ static void test_runtime_dir_requires_xdg(void) {
     T_OK(atlas_ipc_runtime_dir(&out, &err), &err);
     T_EQ_STR(atlas_buf_cstr(&out), "/run/user/1234/atlas");
 
+    if (copy_dd != NULL) {
+        (void)setenv("ATLAS_DATA_DIR", copy_dd, 1);
+        free(copy_dd);
+    } else {
+        (void)unsetenv("ATLAS_DATA_DIR");
+    }
     if (copy != NULL) {
         (void)setenv("XDG_RUNTIME_DIR", copy, 1);
         free(copy);
@@ -331,7 +350,7 @@ static void test_listen_permissions_and_collisions(void) {
     atlas_buf dir = ATLAS_BUF_INIT;
     T_OK(atlas_buf_set(&dir, fx.root.data, fx.root.len, &err), &err);
     T_OK(atlas_buf_append_str(&dir, "/rt", &err), &err);
-    T_OK(atlas_ipc_ensure_runtime_dir(atlas_buf_cstr(&dir), &err), &err);
+    T_OK(atlas_ipc_ensure_runtime_dir(atlas_buf_cstr(&dir), NULL, &err), &err);
 
     struct stat sb;
     T_REQUIRE(lstat(atlas_buf_cstr(&dir), &sb) == 0);
@@ -343,7 +362,7 @@ static void test_listen_permissions_and_collisions(void) {
     T_OK(atlas_buf_append_str(&sock, "/atlas.sock", &err), &err);
 
     int fd = -1;
-    T_OK(atlas_ipc_listen(atlas_buf_cstr(&sock), &fd, &err), &err);
+    T_OK(atlas_ipc_listen(atlas_buf_cstr(&sock), NULL, &fd, &err), &err);
     T_REQUIRE(fd >= 0);
     T_REQUIRE(lstat(atlas_buf_cstr(&sock), &sb) == 0);
     T_CHECK_MSG((sb.st_mode & (S_IRWXG | S_IRWXO)) == 0,
@@ -354,14 +373,14 @@ static void test_listen_permissions_and_collisions(void) {
     int second = -1;
     atlas_err serr;
     atlas_err_init(&serr);
-    T_FAILS_WITH(atlas_ipc_listen(atlas_buf_cstr(&sock), &second, &serr), ATLAS_ERR_INTEGRITY,
+    T_FAILS_WITH(atlas_ipc_listen(atlas_buf_cstr(&sock), NULL, &second, &serr), ATLAS_ERR_INTEGRITY,
                  &serr);
     T_CHECK(strstr(atlas_err_msg(&serr), "already listening") != NULL);
     (void)close(fd);
 
     /* A dead socket left behind by a crash *is* removable, because nothing
      * answers on it and it is ours. */
-    T_OK(atlas_ipc_listen(atlas_buf_cstr(&sock), &fd, &err), &err);
+    T_OK(atlas_ipc_listen(atlas_buf_cstr(&sock), NULL, &fd, &err), &err);
     (void)close(fd);
     (void)unlink(atlas_buf_cstr(&sock));
 
@@ -372,7 +391,7 @@ static void test_listen_permissions_and_collisions(void) {
     (void)close(rf);
     atlas_err ferr;
     atlas_err_init(&ferr);
-    T_FAILS_WITH(atlas_ipc_listen(atlas_buf_cstr(&sock), &fd, &ferr), ATLAS_ERR_INTEGRITY, &ferr);
+    T_FAILS_WITH(atlas_ipc_listen(atlas_buf_cstr(&sock), NULL, &fd, &ferr), ATLAS_ERR_INTEGRITY, &ferr);
     T_CHECK(strstr(atlas_err_msg(&ferr), "not a socket") != NULL);
     T_CHECK_MSG(access(atlas_buf_cstr(&sock), F_OK) == 0,
                 "the refused file must still be there, not deleted");
@@ -382,7 +401,7 @@ static void test_listen_permissions_and_collisions(void) {
     T_REQUIRE(symlink("/dev/null", atlas_buf_cstr(&sock)) == 0);
     atlas_err lerr;
     atlas_err_init(&lerr);
-    T_FAILS_WITH(atlas_ipc_listen(atlas_buf_cstr(&sock), &fd, &lerr), ATLAS_ERR_INTEGRITY, &lerr);
+    T_FAILS_WITH(atlas_ipc_listen(atlas_buf_cstr(&sock), NULL, &fd, &lerr), ATLAS_ERR_INTEGRITY, &lerr);
     T_CHECK(strstr(atlas_err_msg(&lerr), "symbolic link") != NULL);
     (void)unlink(atlas_buf_cstr(&sock));
 
@@ -406,7 +425,7 @@ static void test_runtime_dir_rejects_symlink(void) {
      * is exactly what refusing a /tmp fallback was supposed to prevent. */
     atlas_err derr;
     atlas_err_init(&derr);
-    T_FAILS_WITH(atlas_ipc_ensure_runtime_dir(atlas_buf_cstr(&dir), &derr), ATLAS_ERR_INTEGRITY,
+    T_FAILS_WITH(atlas_ipc_ensure_runtime_dir(atlas_buf_cstr(&dir), NULL, &derr), ATLAS_ERR_INTEGRITY,
                  &derr);
     T_CHECK(strstr(atlas_err_msg(&derr), "symbolic link") != NULL);
 

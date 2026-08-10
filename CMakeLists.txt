@@ -183,7 +183,9 @@ add_library(atlas_core STATIC
   # There is deliberately no src/ipc file here either, and no MCP tool. A
   # profile's authority state is inspected, never set, and never over a
   # socket: a caller that could change what constrains it is not constrained.
+  src/core/rootpath.c
   src/core/authority.c
+  src/core/syspolicy.c
 )
 
 target_include_directories(atlas_core

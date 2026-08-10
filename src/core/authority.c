@@ -29,6 +29,7 @@
 #include <unistd.h>
 
 #include "atlas/atlas.h"
+#include "atlas/rootpath.h"
 
 /* A policy is a handful of `key = value` lines. This bounds the read, because a
  * file Atlas parses is a file whose size is somebody else's choice — root's,
@@ -83,7 +84,12 @@ const char *atlas_authority_reason_explain(atlas_authority_reason r) {
     return "the profile is locked";
 }
 
-/* --- the guarded walk ----------------------------------------------------- */
+/* --- the guarded walk -----------------------------------------------------
+ *
+ * A7.1 moved the walk itself to `src/core/rootpath.c`, unchanged in behaviour,
+ * because the system-deployment policy needs the same question answered about a
+ * second file. What stays here is the mapping from "this path is not
+ * root-anchored" to the authority reason an operator is shown. */
 
 static void set_reason(atlas_authority *out, atlas_authority_reason r, const char *detail) {
     out->reason = r;
@@ -92,119 +98,31 @@ static void set_reason(atlas_authority *out, atlas_authority_reason r, const cha
     }
 }
 
-/* True when this inode is root-owned and no non-root uid may write it.
- *
- * The sticky bit is not an exception. A directory like `/tmp` is world-writable
- * and sticky, which stops one user deleting another's files and does nothing
- * whatever to stop them creating their own — so a policy underneath one is a
- * policy an attacker can put a directory beside. */
-static bool root_owned_and_unwritable(const struct stat *sb) {
-    return sb->st_uid == 0u && (sb->st_mode & (S_IWGRP | S_IWOTH)) == 0;
+static atlas_authority_reason reason_for(atlas_rootpath_result r) {
+    switch (r) {
+    case ATLAS_ROOTPATH_MISSING: return ATLAS_AUTHORITY_REASON_NO_POLICY;
+    case ATLAS_ROOTPATH_SYMLINK:
+    case ATLAS_ROOTPATH_BAD_PATH: return ATLAS_AUTHORITY_REASON_POLICY_PATH_UNSAFE;
+    case ATLAS_ROOTPATH_NOT_REGULAR:
+    case ATLAS_ROOTPATH_NOT_DIRECTORY: return ATLAS_AUTHORITY_REASON_POLICY_MALFORMED;
+    case ATLAS_ROOTPATH_UNKNOWN:
+    case ATLAS_ROOTPATH_OK:
+    case ATLAS_ROOTPATH_WRITABLE: break;
+    }
+    return ATLAS_AUTHORITY_REASON_POLICY_WRITABLE;
 }
 
-/* Opens `path` by walking it from `/`, refusing every symlink and requiring
- * every component to be root-owned and not writable by anyone else.
- *
- * Returns a file descriptor for the final component on success. `*out` carries
- * the reason on failure and is otherwise untouched. */
+/* Opens `path` root-anchored, recording the authority reason on failure. */
 static int open_root_anchored(const char *path, bool want_dir_only_parents,
                               atlas_authority *out) {
     (void)want_dir_only_parents;
-    if (path == NULL || path[0] != '/') {
-        set_reason(out, ATLAS_AUTHORITY_REASON_POLICY_PATH_UNSAFE, path);
-        return -1;
+    char detail[sizeof(out->detail)];
+    atlas_rootpath_result rr = ATLAS_ROOTPATH_UNKNOWN;
+    int fd = atlas_rootpath_open(path, false, &rr, detail, sizeof(detail));
+    if (fd < 0) {
+        set_reason(out, reason_for(rr), detail);
     }
-    int dir = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (dir < 0) {
-        set_reason(out, ATLAS_AUTHORITY_REASON_POLICY_PATH_UNSAFE, "/");
-        return -1;
-    }
-    struct stat sb;
-    if (fstat(dir, &sb) != 0 || !root_owned_and_unwritable(&sb)) {
-        /* A machine whose `/` is not root-owned is not one Atlas can reason
-         * about at all. */
-        set_reason(out, ATLAS_AUTHORITY_REASON_POLICY_WRITABLE, "/");
-        (void)close(dir);
-        return -1;
-    }
-
-    const char *p = path + 1;
-    char component[256];
-    char sofar[PATH_MAX];
-    size_t sofar_len = 0;
-    sofar[0] = '\0';
-
-    while (*p != '\0') {
-        const char *slash = strchr(p, '/');
-        size_t n = (slash != NULL) ? (size_t)(slash - p) : strlen(p);
-        if (n == 0) {
-            /* An empty component: `//` or a trailing slash. Refused rather than
-             * skipped — Atlas is not in the business of guessing what a
-             * malformed absolute path meant. */
-            set_reason(out, ATLAS_AUTHORITY_REASON_POLICY_PATH_UNSAFE, path);
-            (void)close(dir);
-            return -1;
-        }
-        if (n >= sizeof(component)) {
-            set_reason(out, ATLAS_AUTHORITY_REASON_POLICY_PATH_UNSAFE, path);
-            (void)close(dir);
-            return -1;
-        }
-        memcpy(component, p, n);
-        component[n] = '\0';
-        if (strcmp(component, ".") == 0 || strcmp(component, "..") == 0) {
-            set_reason(out, ATLAS_AUTHORITY_REASON_POLICY_PATH_UNSAFE, path);
-            (void)close(dir);
-            return -1;
-        }
-        if (sofar_len + 1u + n < sizeof(sofar)) {
-            sofar[sofar_len++] = '/';
-            memcpy(sofar + sofar_len, component, n);
-            sofar_len += n;
-            sofar[sofar_len] = '\0';
-        }
-
-        bool last = (slash == NULL) || (slash[1] == '\0');
-        /* O_NOFOLLOW turns a symlink component into ELOOP rather than a
-         * traversal, which is the whole reason this loop exists. */
-        int flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW;
-        if (!last) {
-            flags |= O_DIRECTORY;
-        }
-        int next = openat(dir, component, flags);
-        int saved = errno;
-        (void)close(dir);
-        if (next < 0) {
-            if (saved == ELOOP) {
-                set_reason(out, ATLAS_AUTHORITY_REASON_POLICY_PATH_UNSAFE, sofar);
-            } else if (saved == ENOENT) {
-                set_reason(out, ATLAS_AUTHORITY_REASON_NO_POLICY, sofar);
-            } else {
-                /* EACCES, ENOTDIR and everything else. Unreadable is not
-                 * permission. */
-                set_reason(out, ATLAS_AUTHORITY_REASON_POLICY_WRITABLE, sofar);
-            }
-            return -1;
-        }
-        if (fstat(next, &sb) != 0 || !root_owned_and_unwritable(&sb)) {
-            set_reason(out, ATLAS_AUTHORITY_REASON_POLICY_WRITABLE, sofar);
-            (void)close(next);
-            return -1;
-        }
-        if (last) {
-            if (!S_ISREG(sb.st_mode)) {
-                set_reason(out, ATLAS_AUTHORITY_REASON_POLICY_MALFORMED, sofar);
-                (void)close(next);
-                return -1;
-            }
-            return next;
-        }
-        dir = next;
-        p = slash + 1;
-    }
-    set_reason(out, ATLAS_AUTHORITY_REASON_POLICY_PATH_UNSAFE, path);
-    (void)close(dir);
-    return -1;
+    return fd;
 }
 
 /* --- the policy ----------------------------------------------------------- */

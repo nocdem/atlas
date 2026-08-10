@@ -1004,7 +1004,8 @@ atlas_status atlas_server_serve(atlas_server_ctx *ctx, int listen_fd, int signal
                 int64_t peer_pid = 0;
                 atlas_err aerr;
                 atlas_err_init(&aerr);
-                atlas_status ast = atlas_ipc_accept(listen_fd, &cfd, &peer_pid, &aerr);
+                atlas_status ast =
+                    atlas_ipc_accept(listen_fd, &ctx->syspolicy, &cfd, &peer_pid, &aerr);
                 if (ast != ATLAS_OK) {
                     /* A refused peer is logged and the loop continues: one
                      * rejected connection must not stop the daemon serving. */

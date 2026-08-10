@@ -6,6 +6,7 @@
 #include <sys/stat.h>
 
 #include "atlas/atlas.h"
+#include "atlas/syspolicy.h"
 #include "atlas_test.h"
 #include "support/fixture.h"
 
@@ -48,18 +49,54 @@ static void test_resolution_order(void) {
     T_EQ_STR(atlas_buf_cstr(&out), "/env/dir");
     T_EQ_INT(src, ATLAS_DATADIR_ENV);
 
+    /* **A7.1 inserted the system policy between the explicit selectors and the
+     * implicit ones**, so the next two cases depend on whether this machine
+     * carries one. Both outcomes are asserted rather than one being skipped:
+     * the contract is different on the two kinds of machine and both are real.
+     *
+     * The rule: `--data-dir` and `ATLAS_DATA_DIR` always win, because both are
+     * somebody naming an index. `XDG_DATA_HOME` and `$HOME` lose to a system
+     * policy, because after a cutover the home directory still holds the
+     * pre-migration database and silently answering from it is the failure
+     * A7.1 exists to prevent. */
+    atlas_syspolicy sp;
+    atlas_syspolicy_load(&sp);
+    const bool deployed = (sp.state == ATLAS_SYSPOLICY_SYSTEM);
+    atlas_test_note(deployed ? "a system policy is active: it outranks XDG_DATA_HOME and HOME"
+                             : "no system policy: the pre-A7.1 precedence applies");
+
     clear_env();
     T_REQUIRE(setenv("XDG_DATA_HOME", "/xdg", 1) == 0);
     T_REQUIRE(setenv("HOME", "/home/someone", 1) == 0);
     T_OK(atlas_datadir_resolve(NULL, &out, &src, &err), &err);
-    T_EQ_STR(atlas_buf_cstr(&out), "/xdg/atlas");
-    T_EQ_INT(src, ATLAS_DATADIR_XDG);
+    if (deployed) {
+        T_EQ_STR(atlas_buf_cstr(&out), sp.data_dir);
+        T_EQ_INT(src, ATLAS_DATADIR_SYSTEM);
+    } else {
+        T_EQ_STR(atlas_buf_cstr(&out), "/xdg/atlas");
+        T_EQ_INT(src, ATLAS_DATADIR_XDG);
+    }
 
     clear_env();
     T_REQUIRE(setenv("HOME", "/home/someone", 1) == 0);
     T_OK(atlas_datadir_resolve(NULL, &out, &src, &err), &err);
-    T_EQ_STR(atlas_buf_cstr(&out), "/home/someone/.local/share/atlas");
-    T_EQ_INT(src, ATLAS_DATADIR_HOME);
+    if (deployed) {
+        T_EQ_STR(atlas_buf_cstr(&out), sp.data_dir);
+        T_EQ_INT(src, ATLAS_DATADIR_SYSTEM);
+    } else {
+        T_EQ_STR(atlas_buf_cstr(&out), "/home/someone/.local/share/atlas");
+        T_EQ_INT(src, ATLAS_DATADIR_HOME);
+    }
+
+    /* And the explicit selectors keep winning on both kinds of machine. */
+    clear_env();
+    T_REQUIRE(setenv("ATLAS_DATA_DIR", "/env/dir", 1) == 0);
+    T_OK(atlas_datadir_resolve(NULL, &out, &src, &err), &err);
+    T_EQ_STR(atlas_buf_cstr(&out), "/env/dir");
+    T_EQ_INT(src, ATLAS_DATADIR_ENV);
+    T_OK(atlas_datadir_resolve("/explicit", &out, &src, &err), &err);
+    T_EQ_STR(atlas_buf_cstr(&out), "/explicit");
+    T_EQ_INT(src, ATLAS_DATADIR_OVERRIDE);
 
     atlas_buf_free(&out);
     clear_env();
@@ -69,6 +106,9 @@ static void test_empty_and_relative_are_errors(void) {
     atlas_err err;
     atlas_err_init(&err);
     atlas_buf out = ATLAS_BUF_INIT;
+    atlas_syspolicy sp;
+    atlas_syspolicy_load(&sp);
+    const bool deployed = (sp.state == ATLAS_SYSPOLICY_SYSTEM);
 
     clear_env();
     /* An empty or relative configured path is never silently reinterpreted. */
@@ -83,14 +123,30 @@ static void test_empty_and_relative_are_errors(void) {
     T_REQUIRE(setenv("ATLAS_DATA_DIR", "not/absolute", 1) == 0);
     T_FAILS_WITH(atlas_datadir_resolve(NULL, &out, NULL, &err), ATLAS_ERR_CONFIG, &err);
 
+    /* The last two depend on the machine for the reason given above: a system
+     * policy is consulted before `XDG_DATA_HOME` and before "nothing at all",
+     * so on a deployed machine there is always an answer and these are not
+     * errors. That is the point of the policy — after a cutover, "I could not
+     * work out which index you meant" must not resolve to the operator's home
+     * directory. */
     clear_env();
     T_REQUIRE(setenv("XDG_DATA_HOME", "relative", 1) == 0);
-    T_FAILS_WITH(atlas_datadir_resolve(NULL, &out, NULL, &err), ATLAS_ERR_CONFIG, &err);
+    if (deployed) {
+        T_OK(atlas_datadir_resolve(NULL, &out, NULL, &err), &err);
+        T_EQ_STR(atlas_buf_cstr(&out), sp.data_dir);
+    } else {
+        T_FAILS_WITH(atlas_datadir_resolve(NULL, &out, NULL, &err), ATLAS_ERR_CONFIG, &err);
+    }
 
     /* With nothing at all to go on, Atlas says so instead of guessing. */
     clear_env();
-    T_FAILS_WITH(atlas_datadir_resolve(NULL, &out, NULL, &err), ATLAS_ERR_CONFIG, &err);
-    T_CHECK(strstr(atlas_err_msg(&err), "ATLAS_DATA_DIR") != NULL);
+    if (deployed) {
+        T_OK(atlas_datadir_resolve(NULL, &out, NULL, &err), &err);
+        T_EQ_STR(atlas_buf_cstr(&out), sp.data_dir);
+    } else {
+        T_FAILS_WITH(atlas_datadir_resolve(NULL, &out, NULL, &err), ATLAS_ERR_CONFIG, &err);
+        T_CHECK(strstr(atlas_err_msg(&err), "ATLAS_DATA_DIR") != NULL);
+    }
 
     atlas_buf_free(&out);
     clear_env();

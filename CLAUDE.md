@@ -1,10 +1,13 @@
 # Atlas — working notes for Claude Code
 
 Atlas is a generic, headless engineering-memory and repository-intelligence CLI in
-C17. Phase **A7**: a dedicated security review and the trust-boundary hardening
-that came out of it — the model-facing surface reduced to reads and proposals,
-automatic repository registration removed, and operator authority made a
-configured OS fact rather than an inference from a terminal. On top of the A6
+C17. Phase **A7.1**: OS authority separation — the daemon runs as `atlasd` and
+solely owns the index and backups, `atlas-worker` is the untrusted account every
+persistent model process runs as, and a root-owned policy decides who may open
+the shared socket. On top of the A7 dedicated security review and trust-boundary
+hardening — the model-facing surface reduced to reads and proposals, automatic
+repository registration removed, and operator authority made a configured OS
+fact rather than an inference from a terminal — the A6
 deterministic impact gates and stale-decision detection,
 the A5 verified online backups, atomic restore and written retention
 classification, the A4 decision documents,
@@ -867,6 +870,84 @@ authority state is inspected, never set, and never over a socket.
   path. Only a separate OS principal protects the record; the review says
   exactly what that deployment involves.
 
+## A7.1 layers — additions
+
+```
+src/core     rootpath.c (the root-anchored walk, moved out of authority.c),
+             syspolicy.c (the system-deployment policy)
+src/ipc      sock.c gains system-mode socket ownership and peer authorization
+deploy/a71   atlas.service, system.conf.template, authority.conf.template
+scripts      a71-preflight.sh, a71-deploy.sh, a71-verify.sh, a71-rollback.sh
+docs/security A7_1_THREAT_MODEL.md, A7_1_OPERATIONS.md
+```
+
+## A7.1 rules — these are not negotiable
+
+- **`nocdem` and root are trusted by design and Atlas does not defend against
+  them.** The operator holds passwordless root; any process intentionally
+  launched as that account — including an AI session — is outside Atlas' OS
+  isolation guarantee, by the operator's explicit decision. **Never write a test
+  asserting `nocdem` cannot do something**, and never claim in prose that it is
+  constrained. The adversary is `atlas-worker`.
+- **Every persistent or autonomous model process runs as `atlas-worker`, never
+  as `nocdem`.** That is the architectural commitment the separation rests on.
+  A8's dispatcher inherits it; if it is broken the guarantee is void and no code
+  change restores it.
+- **The guarantees that matter are kernel-enforced, not Atlas-enforced.**
+  `atlas-worker` cannot read the index or the backups (0700 `atlasd`), cannot
+  replace the binary or the policies (root-owned), and cannot stop the service
+  (no sudo). Atlas' own checks are the second layer, not the first. Do not
+  replace a filesystem guarantee with a check in C.
+- **The socket is the one place the two principals meet, so everything on it is
+  Atlas' problem.** Peer identity is `SO_PEERCRED` and nothing else — never a
+  uid, gid, pid or role from the request body, the environment or `/proc`. A
+  client describing itself is not evidence about itself.
+- **`ATLAS_SYSPOLICY_PATH` is a compiled-in constant**, like
+  `ATLAS_AUTHORITY_POLICY_PATH` and for the same reason. No environment
+  override, no flag, no data-directory-relative variant.
+- **LEGACY is zero.** A zeroed `atlas_syspolicy` serves the daemon's own uid and
+  nobody else. There is one `state = ATLAS_SYSPOLICY_SYSTEM` assignment and it
+  is the loader's last statement. Anything missing, malformed, symlinked,
+  group-writable or non-root-owned is legacy mode with a reason.
+- **An unrecognised policy key is an error, not something skipped.** A policy
+  Atlas half-understands is one whose author believes they configured something
+  Atlas never read — and one day that something will be a restriction.
+- **The socket's owner, group and mode are set explicitly and then read back.**
+  A mismatch unlinks the socket and refuses to start. A socket more open than
+  intended is worse than no daemon.
+- **There is no fallback from the system index to the per-user one.** With a
+  policy active, `ATLAS_DATA_DIR` and `$HOME` stop selecting an index;
+  `--data-dir` still wins because it is explicit. A client that cannot reach the
+  daemon must fail, not quietly read the pre-cutover database that A7.1 leaves
+  in place as a rollback target.
+- **The old per-user database is never modified, including to mark it
+  non-authoritative.** A rollback target that has been edited is not one.
+- **Terminal presence stays a UX confirmation and must never be described or
+  tested as the security boundary.** It protects against approving the wrong
+  revision; it proves nothing about who typed it.
+- **`operator_uid` is the `atlasd` uid**, because no other principal can open
+  the index. The human path is the documented offline ceremony in
+  `docs/security/A7_1_OPERATIONS.md`, and it is not exposed through MCP, the
+  plugin or any model-callable helper.
+- **Deployment tooling never uses `eval`, never interpolates repository text as
+  shell, never recursively deletes or chowns, and never names `/opt/dna` or
+  `/opt/swapper` except to read.** Dry-run is the default and `--apply` is a
+  second deliberate invocation.
+
+## Extending A7.1 safely
+
+- **A new policy key** means a branch in `atlas_syspolicy_load_at`, a field, a
+  line in `deploy/a71/system.conf.template` explaining it, and a case in the
+  malformed matrix in `scripts/a71-verify.sh`. An unknown key must stay an
+  error.
+- **A new client identity** is a `client_uid` line an operator adds. Never a
+  group check in C, never a name lookup at accept time, and never a role
+  supplied by the client.
+- **A new writable path for the service** means an argued edit to
+  `ReadWritePaths` in `deploy/a71/atlas.service`. The plugin, both home
+  directories, the backups, the binary, the policies and every indexed
+  repository must stay out of it — that absence is ATLAS-A7-006's fix.
+
 ## Extending A7 safely
 
 - **A new guarded operation** means a member of `atlas_authority_op`, a case in
@@ -1178,7 +1259,8 @@ two documents on stdout.
 `docs/architecture.md` · `docs/data-model.md` · `docs/provenance.md` ·
 `docs/code-intelligence.md` · `docs/decision-lifecycle.md` ·
 `docs/operations.md` · `docs/impact-gates.md` ·
-`docs/security/A7_THREAT_MODEL.md` · `docs/security/A7_SECURITY_REVIEW.md` · `docs/git-safety.md` · `docs/daemon-and-ipc.md` ·
+`docs/security/A7_THREAT_MODEL.md` · `docs/security/A7_SECURITY_REVIEW.md` ·
+`docs/security/A7_1_THREAT_MODEL.md` · `docs/security/A7_1_OPERATIONS.md` · `docs/git-safety.md` · `docs/daemon-and-ipc.md` ·
 `docs/watcher-consistency.md` · `docs/systemd-user-service.md` ·
 `docs/ai-trust-boundary.md` · `docs/claude-integration.md` ·
 `docs/backlog.md` · `docs/roadmap.md` ·

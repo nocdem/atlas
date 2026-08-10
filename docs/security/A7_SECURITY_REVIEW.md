@@ -534,3 +534,52 @@ state and the reason on every run.
   that must succeed. This is stated rather than papered over, and it is the one
   piece of A7 that a machine with real separation must verify on first use.
 - That the review found everything. It is a review, not a proof.
+
+---
+
+# A7.1 addendum — what OS separation changed
+
+A7.1 deployed the separation this review recommended. Two findings above change
+status; the rest are unaffected.
+
+## ATLAS-A7-006 — resolved
+
+The plugin was inside the daemon's `ReadWritePaths`. In the separated deployment
+the daemon runs as `atlasd` with `ProtectHome=yes` and
+`ReadWritePaths=/var/lib/atlas`, so it has no path to the Claude plugin, either
+home directory, the installed binary, the policies, the backups, or any indexed
+repository. The plugin may still be written by the untrusted model principal —
+it is not part of the trusted computing base, and modifying it cannot expand
+daemon or database authority, because the only thing it can reach is a socket
+whose whole vocabulary is reads and proposals.
+
+## ATLAS-A7-004 — residual risk narrowed, and re-scoped
+
+A7 recorded: "on a machine where one uid owns the daemon, the data directory,
+the binary and the shell, Atlas cannot protect the decision record from a
+same-uid process."
+
+That machine no longer exists for the principal that matters. `atlas-worker`
+cannot open `/var/lib/atlas/atlas.db` at all — mode 0700, owner `atlasd` — so
+the forgery A7 could only make *detectable* is now prevented by the kernel
+before Atlas is involved.
+
+The residual risk is re-scoped rather than removed, and the operator has
+explicitly accepted its shape:
+
+- **`nocdem` holds `NOPASSWD: ALL` and is trusted by design.** It can read and
+  write the index, become `atlasd`, replace the binary and approve anything.
+  A7.1 does not defend against this and no test asserts otherwise. The
+  separation is meaningful because A8's dispatcher and every persistent model
+  process run as `atlas-worker`.
+- **`atlasd` is trusted with the index.** A compromise of the daemon itself is a
+  compromise of the index. Nothing in A7.1 changes that, and the sandbox exists
+  to bound what such a compromise could reach beyond it.
+
+## The scope argument in A7-004 is unchanged, and now has a second half
+
+A7 declined to guard backup, restore, prune and registration because `cp`, `mv`,
+`rm` and `sqlite3` reached the same bytes, making a guard cosmetic. In the
+separated deployment those verbs are prevented for `atlas-worker` by the
+filesystem — which is precisely the argument A7 made for *not* adding the Atlas
+check: the right layer was the OS, and A7.1 is where it was applied.

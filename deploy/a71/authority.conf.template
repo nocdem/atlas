@@ -1,0 +1,36 @@
+# Atlas - the A7.1 operator-authority policy.
+# Copyright 2026 The Atlas Authors. Licensed under the Apache License 2.0.
+#
+# Installed to /etc/atlas/authority.conf, owned by root, mode 0644, on a
+# root-owned path. See include/atlas/authority.h for the four conditions a grant
+# requires; this file is the third of them.
+#
+# What it does: makes `atlas decision approve|reject|supersede|revalidate`
+# possible for exactly one uid, and only when the running `atlas` executable is
+# itself root-owned and unwritable by anyone else.
+#
+# What it does not do: identify a person. `operator_uid` names an OS principal.
+# A terminal, a pseudo-terminal, a typed confirmation and an environment
+# variable are all producible by any process running as that uid, and none of
+# them is treated as evidence that a human acted. `LOCAL_OPERATOR_CONFIRMED`
+# records which channel was used, never who used it.
+
+# The uid permitted to run a lifecycle transition.
+#
+# In the A7.1 deployment this is **the `atlasd` uid**, not the operator's login
+# account — because `atlasd` is the only principal that can open the database at
+# all, and an authority grant to an account that cannot reach the index would
+# authorise nothing. The human workflow is therefore deliberately offline and
+# deliberately awkward:
+#
+#   1. a separate trusted terminal, not one an AI process controls
+#   2. stop the service through root authentication
+#   3. run the root-owned binary as atlasd against the authoritative index
+#   4. perform exactly one lifecycle operation
+#   5. start the service, verify the ledger, invalidate the sudo timestamp
+#
+# `docs/security/A7_1_OPERATIONS.md` has the exact commands. That workflow is
+# not exposed through MCP, the plugin, or any model-callable helper, and must
+# not be.
+#
+#   operator_uid = <atlasd uid>

@@ -130,15 +130,54 @@ atlas_status atlas_daemon_run(const atlas_daemon_opts *opts, FILE *log, atlas_er
         goto done;
     }
 
+    /* A7.1. Loaded once, here, and carried unchanged into the serve loop.
+     *
+     * Loading it once means the set of uids this daemon will accept is fixed for
+     * the life of the process: a policy edit takes effect on restart, which an
+     * operator can reason about, rather than mid-connection. Anything other than
+     * a complete root-anchored policy leaves it zeroed, which is legacy per-user
+     * mode — the daemon then serves its own uid and nobody else, exactly as
+     * before A7.1. */
+    atlas_syspolicy syspolicy;
+    atlas_syspolicy_load(&syspolicy);
+    /* System mode applies only when this daemon is actually serving the index
+     * the policy describes.
+     *
+     * A daemon started with `--data-dir` somewhere else — an isolated fixture,
+     * or a second index an operator is inspecting — is not the shared daemon,
+     * and must not shape its socket for the client group or accept the client
+     * allowlist. It is a per-user daemon that happens to be running on a
+     * machine where a system deployment also exists, and it gets per-user
+     * rules: its own uid, its own runtime directory, mode 0600.
+     *
+     * Without this the policy's mere presence would make every fixture daemon
+     * try to hand its socket to `atlas-clients`, which is both wrong and, in a
+     * test tree, impossible. */
+    const bool serving_system_index =
+        syspolicy.state == ATLAS_SYSPOLICY_SYSTEM &&
+        strcmp(atlas_buf_cstr(&data_dir), syspolicy.data_dir) == 0;
+    const atlas_syspolicy *policy_arg = serving_system_index ? &syspolicy : NULL;
+    if (!serving_system_index) {
+        /* Carried into the serve loop as legacy, so `atlas_ipc_accept` permits
+         * this uid and nobody else. */
+        memset(&syspolicy, 0, sizeof(syspolicy));
+    }
+    if (log != NULL) {
+        (void)fprintf(log, "atlas: deployment mode %s (%s)\n",
+                      policy_arg != NULL ? "system" : "per-user",
+                      atlas_syspolicy_reason_name(syspolicy.reason));
+        (void)fflush(log);
+    }
+
     st = atlas_ipc_runtime_dir(&runtime_dir, err);
     if (st == ATLAS_OK) {
-        st = atlas_ipc_ensure_runtime_dir(atlas_buf_cstr(&runtime_dir), err);
+        st = atlas_ipc_ensure_runtime_dir(atlas_buf_cstr(&runtime_dir), policy_arg, err);
     }
     if (st == ATLAS_OK) {
         st = atlas_ipc_socket_path(&socket_path, err);
     }
     if (st == ATLAS_OK) {
-        st = atlas_ipc_listen(atlas_buf_cstr(&socket_path), &listen_fd, err);
+        st = atlas_ipc_listen(atlas_buf_cstr(&socket_path), policy_arg, &listen_fd, err);
     }
     if (st != ATLAS_OK) {
         goto done;
@@ -181,6 +220,7 @@ atlas_status atlas_daemon_run(const atlas_daemon_opts *opts, FILE *log, atlas_er
     sctx.watcher = watcher;
     sctx.workers = workers;
     sctx.log = log;
+    sctx.syspolicy = syspolicy;
     sctx.started_at_ms = monotonic_ms();
 
     atlas_daemon_log(log, "info", "serving on %s with %zu workers",

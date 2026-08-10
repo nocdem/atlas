@@ -53,6 +53,7 @@
 #include "atlas/buf.h"
 #include "atlas/error.h"
 #include "atlas/json.h"
+#include "atlas/syspolicy.h"
 #include "atlas/limits.h"
 
 /* --- framing ------------------------------------------------------------- */
@@ -84,29 +85,74 @@ atlas_status atlas_ipc_write_frame(int fd, const void *payload, size_t len, int 
 
 /* --- socket -------------------------------------------------------------- */
 
-/* Resolves $XDG_RUNTIME_DIR/atlas and the socket path inside it. Neither is
- * created. Fails with ATLAS_ERR_CONFIG and an actionable message when
- * XDG_RUNTIME_DIR is unset, empty or relative. */
+/* Resolves the runtime directory and the socket path inside it. Neither is
+ * created.
+ *
+ * **A7.1.** When a root-anchored system policy is active these return the
+ * socket that policy names, and `$XDG_RUNTIME_DIR` is not consulted at all —
+ * which is what lets a client on an SSH session with no runtime directory reach
+ * the shared daemon, and what stops a client choosing a different endpoint by
+ * setting an environment variable. Otherwise the per-user behaviour is
+ * unchanged: `$XDG_RUNTIME_DIR/atlas`, or `/run/user/<uid>/atlas` on proof, and
+ * ATLAS_ERR_CONFIG with an actionable message when neither is available. */
 atlas_status atlas_ipc_runtime_dir(atlas_buf *out, atlas_err *err);
 atlas_status atlas_ipc_socket_path(atlas_buf *out, atlas_err *err);
 
-/* Creates the runtime directory with mode 0700, verifying an existing one is a
- * directory we own with no group or other access. */
-atlas_status atlas_ipc_ensure_runtime_dir(const char *dir, atlas_err *err);
+/* Names the index this process is addressing, so socket resolution can follow
+ * it.
+ *
+ * **A socket belongs to an index.** A system policy says "the shared daemon
+ * serves /var/lib/atlas on /run/atlas/atlas.sock"; it does not say every Atlas
+ * process must use that socket. A command explicitly pointed at a *different*
+ * data directory — `atlas --data-dir /tmp/x`, which is how an operator runs an
+ * offline lifecycle command and how the suite isolates itself — is talking
+ * about another index, and must reach that index's own per-user endpoint rather
+ * than the system one. This is the same rule `route_to_daemon()` already
+ * applies when it insists the daemon must own *this* directory.
+ *
+ * Called once, early, by the CLI, with whatever `--data-dir` resolved to. When
+ * it is unset, or set to the policy's own data directory, the system socket is
+ * used — which is the normal path for the daemon, for MCP and for a hook, none
+ * of which names a directory. */
+void atlas_ipc_socket_scope_set(const char *data_dir);
+
+/* Creates the runtime directory and verifies it.
+ *
+ * `policy` may be NULL, which is per-user mode: mode 0700, owned by this uid,
+ * nothing for group or other. In system mode the directory is 0750 owned by
+ * this uid with the policy's client group, so members of that group can
+ * traverse to the socket and nobody else can. Either way the result is
+ * re-checked after being set, and a directory that cannot be brought to the
+ * required shape is refused rather than used. */
+atlas_status atlas_ipc_ensure_runtime_dir(const char *dir, const atlas_syspolicy *policy,
+                                          atlas_err *err);
 
 /* Binds and listens.
  *
  * A pre-existing path is only removed when it is a socket owned by this user
  * that nothing is listening on. A symlink, a regular file, a directory or a
  * live socket are all refused rather than unlinked: silently deleting whatever
- * happens to be at that path is how a lock file or somebody's data disappears. */
-atlas_status atlas_ipc_listen(const char *socket_path, int *fd_out, atlas_err *err);
+ * happens to be at that path is how a lock file or somebody's data disappears.
+ *
+ * `policy` may be NULL for per-user mode, where the socket is 0600. In system
+ * mode it is 0660 with the policy's client group, established explicitly and
+ * then verified by `lstat`; if the owner, group or mode cannot be brought to
+ * exactly that, the socket is unlinked and the daemon does not start. A socket
+ * that is more open than intended is worse than no daemon. */
+atlas_status atlas_ipc_listen(const char *socket_path, const atlas_syspolicy *policy, int *fd_out,
+                              atlas_err *err);
 
 /* Accepts one connection and verifies the peer's credentials. On refusal the
  * connection is already closed and ATLAS_ERR_INTEGRITY is returned. `*fd_out` is
- * -1 with ATLAS_OK when no connection was pending. */
-atlas_status atlas_ipc_accept(int listen_fd, int *fd_out, int64_t *peer_pid_out,
-                              atlas_err *err);
+ * -1 with ATLAS_OK when no connection was pending.
+ *
+ * The uid is taken from `SO_PEERCRED`, which the kernel fills in at connect
+ * time. It is never read from the request, the environment or `/proc`. With a
+ * NULL `policy` the only acceptable peer is this process's own uid; with an
+ * active one, that uid or a uid the root-owned policy lists. Nothing else is
+ * accepted, and the check happens before a single byte is read. */
+atlas_status atlas_ipc_accept(int listen_fd, const atlas_syspolicy *policy, int *fd_out,
+                              int64_t *peer_pid_out, atlas_err *err);
 
 /* Connects to a listening daemon. Returns ATLAS_ERR_CONFIG when nothing is
  * listening, which callers treat as "the daemon is not running" rather than as a

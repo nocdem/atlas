@@ -154,6 +154,11 @@ static atlas_status j_doctor(atlas_renderer *r, const atlas_doctor_report *rep, 
                            atlas_authority_reason_name(rep->authority_reason), err));
     TRY(atlas_json_key_str(j, "operator_authority_detail",
                            atlas_authority_reason_explain(rep->authority_reason), err));
+    TRY(atlas_json_key_str(j, "deployment",
+                           rep->deployment_state == ATLAS_SYSPOLICY_SYSTEM ? "system" : "per-user",
+                           err));
+    TRY(atlas_json_key_str(j, "deployment_reason",
+                           atlas_syspolicy_reason_name(rep->deployment_reason), err));
     TRY(atlas_json_key_bool(j, "healthy", rep->ok, err));
 
     TRY(atlas_json_key(j, "problems", err));

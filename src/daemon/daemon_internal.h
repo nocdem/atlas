@@ -17,6 +17,7 @@
 #include "atlas/daemon.h"
 #include "atlas/db.h"
 #include "atlas/decision_ops.h"
+#include "atlas/syspolicy.h"
 #include "atlas/error.h"
 #include "atlas/limits.h"
 #include "atlas/workers.h"
@@ -215,6 +216,12 @@ typedef struct atlas_server_ctx {
     atlas_workers *workers;
     FILE *log;
     int64_t started_at_ms;
+    /* A7.1. Loaded once at startup and never reloaded, so the set of uids the
+     * daemon will accept cannot change under a running serve loop — a policy
+     * edit takes effect on restart, which is a fact an operator can reason
+     * about. Legacy per-user mode leaves this zeroed, which permits nobody
+     * beyond the daemon's own uid. */
+    atlas_syspolicy syspolicy;
 } atlas_server_ctx;
 
 /* Serves until `stop` becomes true. `listen_fd` is owned by the caller. */

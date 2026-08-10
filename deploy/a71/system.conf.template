@@ -1,0 +1,46 @@
+# Atlas - the A7.1 system-deployment policy.
+# Copyright 2026 The Atlas Authors. Licensed under the Apache License 2.0.
+#
+# Installed to /etc/atlas/system.conf, owned by root, mode 0644, on a path whose
+# every component is root-owned and not writable by anyone else. Atlas reaches it
+# with `atlas_rootpath_open` — from `/`, refusing to traverse a single symbolic
+# link — and treats anything else as absent. A policy an unprivileged uid could
+# have written would constrain nobody, so Atlas would rather have none.
+#
+# This file turns on system mode. Without it Atlas is a per-user daemon that
+# serves its own uid and nobody else, exactly as it was through A7.
+#
+# Syntax: `key = value`, one per line, `#` comments. No quoting, no escapes, no
+# includes, no continuations. An unrecognised key is an error rather than
+# something skipped: a policy Atlas half-understands is one whose author
+# believes they configured something Atlas never read.
+
+# Where the shared daemon listens. Its directory is created 0750 owned by the
+# daemon's uid with the client group, and the socket 0660 with the same group —
+# both set by Atlas and then read back, with the daemon refusing to start if the
+# result is not exactly that.
+socket_path = /run/atlas/atlas.sock
+
+# The authoritative index. When this policy is active it is the *only* index a
+# client resolves without an explicit --data-dir: ATLAS_DATA_DIR and $HOME stop
+# selecting one, so a client that cannot reach the daemon fails instead of
+# quietly opening the stale per-user database that A7.1 left in place.
+data_dir = /var/lib/atlas
+
+# The group the socket is handed to. Membership is what lets a process connect;
+# it buys nothing else, because the protocol contains no method that approves,
+# revalidates, registers, backs up, restores or prunes anything.
+client_group = atlas-clients
+
+# Uids permitted to connect, in addition to the daemon's own. Numeric, because
+# this is compared against SO_PEERCRED, which is a number the kernel supplies —
+# never a name a client could claim.
+#
+# Fill these in for the machine; they are deliberately absent from the template
+# because a uid is machine-specific state and does not belong in the repository.
+#
+#   client_uid = <atlas-worker uid>
+#   client_uid = <operator uid>
+#
+# uid 0 is rejected: root does not need the allowlist, and listing it would
+# suggest the socket is a route to privilege.

@@ -146,6 +146,9 @@ static atlas_status h_doctor(atlas_renderer *r, const atlas_doctor_report *rep, 
     (void)fprintf(o, LABEL "%s (%s)\n", "operator authority",
                   rep->authority_state == ATLAS_AUTHORITY_GRANTED ? "granted" : "locked",
                   atlas_authority_reason_name(rep->authority_reason));
+    (void)fprintf(o, LABEL "%s (%s)\n", "deployment",
+                  rep->deployment_state == ATLAS_SYSPOLICY_SYSTEM ? "system" : "per-user",
+                  atlas_syspolicy_reason_name(rep->deployment_reason));
     (void)fprintf(o, LABEL "%s\n", "",
                   atlas_authority_reason_explain(rep->authority_reason));
     if (!rep->index_present) {

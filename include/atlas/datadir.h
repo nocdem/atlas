@@ -24,7 +24,9 @@ typedef enum atlas_datadir_source {
     ATLAS_DATADIR_OVERRIDE = 0,
     ATLAS_DATADIR_ENV,
     ATLAS_DATADIR_XDG,
-    ATLAS_DATADIR_HOME
+    ATLAS_DATADIR_HOME,
+    /* A7.1: a root-anchored system policy named it. */
+    ATLAS_DATADIR_SYSTEM
 } atlas_datadir_source;
 
 const char *atlas_datadir_source_name(atlas_datadir_source src);

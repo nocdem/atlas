@@ -686,6 +686,39 @@ atlas_status fx_tree_digest(const char *dir, char *hex_out, atlas_err *err) {
  * `extra_env`, which overrides this one. */
 static char g_runtime_dir[256];
 static int g_runtime_state = 0; /* 0 unset, 1 ready, -1 failed */
+/* A private, empty data directory exported as `ATLAS_DATA_DIR` to every child.
+ *
+ * **A7.1.** `XDG_RUNTIME_DIR` alone stopped being sufficient once a machine
+ * could carry a root-owned system-deployment policy: that policy names the
+ * authoritative index, and a child naming none of its own would resolve *that*
+ * one. On a deployed machine the suite would then have been asking the live
+ * daemon about the live database — precisely what the comment above says must
+ * never happen, arriving through a door that did not exist when it was written.
+ *
+ * `ATLAS_DATA_DIR` is an explicit selection and outranks the policy, so this
+ * isolates every child on every machine without the suite needing to know which
+ * kind it is on.
+ *
+ * It lives *inside* the private runtime directory and is deliberately not
+ * created: a data directory that already existed would make `atlas doctor`
+ * report "present, no index yet" where a fresh account reports "absent", and
+ * `tests/test_plugin.c` checks exactly that. Putting it there also means it is
+ * released by the runtime directory's own cleanup rather than by a second
+ * lifetime nobody would remember to maintain. */
+static const char *fx_private_runtime_dir(void);
+
+static const char *fx_private_data_dir(void) {
+    static char path[320];
+    const char *rt = fx_private_runtime_dir();
+    if (rt == NULL) {
+        return NULL;
+    }
+    if ((size_t)snprintf(path, sizeof path, "%s/dd", rt) >= sizeof path) {
+        return NULL;
+    }
+    return path;
+}
+
 
 static const char *fx_private_runtime_dir(void) {
     if (g_runtime_state != 0) {
@@ -826,11 +859,25 @@ static atlas_status fx_atlas_impl(const char *const *args, size_t nargs,
             return st;
         }
     }
+    /* A7.1: a private, empty index for every child unless the caller named one. */
+    bool caller_data_dir = false;
+    for (size_t i = 0; extra_env != NULL && extra_env[i] != NULL; i++) {
+        if (strncmp(extra_env[i], "ATLAS_DATA_DIR=", 15) == 0) {
+            caller_data_dir = true;
+        }
+    }
+    atlas_buf dd_env = ATLAS_BUF_INIT;
+    if (!caller_data_dir && fx_private_data_dir() != NULL) {
+        (void)atlas_buf_appendf(&dd_env, err, "ATLAS_DATA_DIR=%s", fx_private_data_dir());
+    }
     const char *env[24];
     size_t envn = 0;
     env[envn++] = atlas_buf_cstr(&path_env);
     env[envn++] = "LC_ALL=C";
     env[envn++] = "TZ=UTC";
+    if (dd_env.len > 0) {
+        env[envn++] = atlas_buf_cstr(&dd_env);
+    }
     if (runtime != NULL) {
         env[envn++] = atlas_buf_cstr(&xdg_env);
     }
@@ -854,6 +901,7 @@ static atlas_status fx_atlas_impl(const char *const *args, size_t nargs,
     st = atlas_proc_run(&opts, stdout_out != NULL ? atlas_proc_sink_buf : NULL, stdout_out,
                         stderr_out, &res, err);
     atlas_buf_free(&xdg_env);
+    atlas_buf_free(&dd_env);
     if (st == ATLAS_OK && exit_code != NULL) {
         *exit_code = res.exit_code;
     }
@@ -924,11 +972,25 @@ atlas_status fx_atlas_stdin(const char *const *args, size_t nargs, const char *c
     }
     /* HOME is absent for the same reason it is absent from fx_atlas: a test that
      * forgets to isolate itself must fail rather than touch a real directory. */
+    /* A7.1: a private, empty index for every child unless the caller named one. */
+    bool caller_data_dir = false;
+    for (size_t i = 0; extra_env != NULL && extra_env[i] != NULL; i++) {
+        if (strncmp(extra_env[i], "ATLAS_DATA_DIR=", 15) == 0) {
+            caller_data_dir = true;
+        }
+    }
+    atlas_buf dd_env = ATLAS_BUF_INIT;
+    if (!caller_data_dir && fx_private_data_dir() != NULL) {
+        (void)atlas_buf_appendf(&dd_env, err, "ATLAS_DATA_DIR=%s", fx_private_data_dir());
+    }
     const char *env[24];
     size_t envn = 0;
     env[envn++] = atlas_buf_cstr(&path_env);
     env[envn++] = "LC_ALL=C";
     env[envn++] = "TZ=UTC";
+    if (dd_env.len > 0) {
+        env[envn++] = atlas_buf_cstr(&dd_env);
+    }
     for (size_t i = 0; extra_env != NULL && extra_env[i] != NULL; i++) {
         if (envn + 1u >= sizeof(env) / sizeof(env[0])) {
             atlas_buf_free(&path_env);
@@ -1034,6 +1096,7 @@ cleanup:
             (void)close(err_pipe[i]);
         }
     }
+    atlas_buf_free(&dd_env);
     atlas_buf_free(&path_env);
     return st;
 }

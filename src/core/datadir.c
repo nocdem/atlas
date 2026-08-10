@@ -3,6 +3,8 @@
  */
 #include "atlas/datadir.h"
 
+#include "atlas/syspolicy.h"
+
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,6 +17,7 @@ const char *atlas_datadir_source_name(atlas_datadir_source src) {
     case ATLAS_DATADIR_ENV: return "ATLAS_DATA_DIR";
     case ATLAS_DATADIR_XDG: return "XDG_DATA_HOME";
     case ATLAS_DATADIR_HOME: return "HOME";
+    case ATLAS_DATADIR_SYSTEM: return ATLAS_SYSPOLICY_PATH;
     }
     return "unknown";
 }
@@ -47,6 +50,10 @@ atlas_status atlas_datadir_resolve(const char *override, atlas_buf *out,
     atlas_datadir_source src = ATLAS_DATADIR_OVERRIDE;
     atlas_status st;
 
+    atlas_syspolicy sp;
+    atlas_syspolicy_load(&sp);
+    const bool sp_active = (sp.state == ATLAS_SYSPOLICY_SYSTEM);
+
     if (override != NULL) {
         st = require_absolute(override, "--data-dir", err);
         if (st != ATLAS_OK) {
@@ -64,6 +71,36 @@ atlas_status atlas_datadir_resolve(const char *override, atlas_buf *out,
             return st;
         }
         st = append_trimmed(out, env, err);
+        goto done;
+    }
+
+    /* **A7.1: a root-anchored system policy decides the index, and there is no
+     * *silent* fallback from it.**
+     *
+     * Placed below the two explicit selectors and above the two implicit ones,
+     * and that is the whole rule: an operator who names a directory gets it; an
+     * operator who names nothing gets the authoritative index rather than
+     * whatever happens to be in their home.
+     *
+     * The failure this prevents is specific. After the cutover
+     * `~/.local/share/atlas` still holds the pre-migration schema-6 database,
+     * deliberately, as a rollback target. A client that could not reach the
+     * system daemon and quietly opened *that* would be answering from history —
+     * successfully, with no indication anything was wrong. `$HOME` and
+     * `XDG_DATA_HOME` are exactly the paths that would have done it, so they
+     * are the ones that lose.
+     *
+     * `--data-dir` and `ATLAS_DATA_DIR` still win, because neither is a
+     * fallback: both are somebody saying which index they mean. That is how an
+     * operator inspects a second index, and how the suite isolates itself from
+     * a deployed machine. */
+    if (sp_active) {
+        src = ATLAS_DATADIR_SYSTEM;
+        st = require_absolute(sp.data_dir, ATLAS_SYSPOLICY_PATH " data_dir", err);
+        if (st != ATLAS_OK) {
+            return st;
+        }
+        st = append_trimmed(out, sp.data_dir, err);
         goto done;
     }
 

@@ -103,6 +103,7 @@ set(ATLAS_TESTS
   test_migrate7
   # --- A7: security review and trust-boundary hardening ---
   test_a7_authority
+  test_a71_syspolicy
 )
 
 foreach(test_name IN LISTS ATLAS_TESTS)
@@ -180,6 +181,9 @@ target_compile_definitions(test_gate_trust PRIVATE ATLAS_SRC_DIR="${CMAKE_SOURCE
 # exist, and drives the CLI through a pseudo-terminal to prove a locked profile
 # is not opened by one. Daemon label, and serialised with the other daemon tests.
 set_tests_properties(test_a7_authority PROPERTIES LABELS "daemon" TIMEOUT 900 RUN_SERIAL TRUE)
+# A7.1 drives a live daemon to prove a client cannot describe its own identity,
+# and checks the system-policy decision procedure against real filesystem shapes.
+set_tests_properties(test_a71_syspolicy PROPERTIES LABELS "daemon" TIMEOUT 900 RUN_SERIAL TRUE)
 target_compile_definitions(test_a7_authority PRIVATE ATLAS_SRC_DIR="${CMAKE_SOURCE_DIR}")
 # Migration 7 rebuilds a table, so its suite drives the storage layer and the
 # backup CLI against real databases. No daemon and no repository.

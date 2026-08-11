@@ -196,6 +196,15 @@ typedef atlas_status (*atlas_file_report_cb)(const atlas_file_report *rep, void 
 
 atlas_status atlas_service_file(atlas_ctx *ctx, const char *name, const char *path,
                                 atlas_file_report_cb cb, void *ud, atlas_err *err);
+/* The same two reads over a bare handle, for the daemon's threads. One
+ * implementation each, called by both the CLI and the method that answers it
+ * over the socket. */
+atlas_status atlas_service_file_db(atlas_db *db, int64_t repo_id, const char *name,
+                                   const char *path, atlas_file_report_cb cb, void *ud,
+                                   atlas_err *err);
+atlas_status atlas_service_history_db(atlas_db *db, int64_t repo_id, const char *path,
+                                      int64_t limit, atlas_history_cb cb, void *ud,
+                                      int64_t *count_out, atlas_err *err);
 
 atlas_status atlas_service_history(atlas_ctx *ctx, const char *name, const char *path,
                                    int64_t limit, atlas_history_cb cb, void *ud,
@@ -492,6 +501,11 @@ typedef atlas_status (*atlas_diff_entry_cb)(const atlas_diff_entry *e, void *ud,
 atlas_status atlas_service_diff(atlas_ctx *ctx, const char *name, const atlas_diff_opts *opts,
                                 atlas_diff_entry_cb cb, void *ud, atlas_diff_report *report,
                                 atlas_err *err);
+/* The same observation given a repository row, so the daemon-served form runs
+ * one implementation rather than a second copy. */
+atlas_status atlas_service_diff_repo(const atlas_repo_info *info, const atlas_diff_opts *opts,
+                                     atlas_diff_entry_cb cb, void *ud, atlas_diff_report *report,
+                                     atlas_err *err);
 
 /* --- A4: decision documents ------------------------------------------------
  *
@@ -861,5 +875,61 @@ atlas_status atlas_service_decision_list_remote(const char *repo,
                                                 atlas_decision_counts *counts_out, atlas_err *err);
 atlas_status atlas_service_gate_check_remote(const atlas_gate_query *q, atlas_gate_report *out,
                                              atlas_err *err);
+atlas_status atlas_service_file_remote(const char *name, const char *path,
+                                       atlas_file_report_cb cb, void *ud, atlas_err *err);
+atlas_status atlas_service_history_remote(const char *name, const char *path, int64_t limit,
+                                          atlas_history_cb cb, void *ud, int64_t *count_out,
+                                          atlas_err *err);
+atlas_status atlas_service_diff_remote(const char *name, const atlas_diff_opts *opts,
+                                       atlas_diff_entry_cb cb, void *ud, atlas_diff_report *rep,
+                                       atlas_err *err);
+atlas_status atlas_service_code_file_remote(const char *name, const char *path,
+                                            atlas_code_file_report *out, atlas_err *err);
+atlas_status atlas_service_code_file_symbols_remote(const char *name, const char *path,
+                                                    int64_t limit, atlas_code_symbol_cb cb,
+                                                    void *ud, int64_t *count_out, bool *more_out,
+                                                    atlas_err *err);
+atlas_status atlas_service_code_file_edges_remote(const char *name, const char *path,
+                                                  const char *kind, bool inbound, int64_t limit,
+                                                  atlas_code_edge_cb cb, void *ud,
+                                                  int64_t *count_out, bool *more_out,
+                                                  atlas_err *err);
+atlas_status atlas_service_code_symbol_search_remote(const char *name, const char *query,
+                                                     const char *kind, int64_t limit,
+                                                     atlas_code_symbol_cb cb, void *ud,
+                                                     int64_t *count_out, bool *more_out,
+                                                     atlas_err *err);
+atlas_status atlas_service_code_symbol_sites_remote(const char *name, const char *symbol,
+                                                    int64_t limit, atlas_code_symbol_cb cb,
+                                                    void *ud, int64_t *count_out, bool *more_out,
+                                                    atlas_err *err);
+atlas_status atlas_service_code_symbol_edges_remote(const char *name, const char *symbol,
+                                                    bool inbound, int64_t limit,
+                                                    atlas_code_edge_cb cb, void *ud,
+                                                    int64_t *count_out, bool *more_out,
+                                                    atlas_err *err);
+atlas_status atlas_service_code_walk_remote(const char *name, const char *path, const char *symbol,
+                                            bool inbound, int64_t depth, int64_t limit,
+                                            atlas_code_walk_cb cb, void *ud,
+                                            atlas_code_walk_summary *sum, atlas_err *err);
+atlas_status atlas_service_decision_show_remote(const char *repo, const char *uid,
+                                                int64_t revision_no, atlas_decision_document *out,
+                                                atlas_err *err);
+atlas_status atlas_service_decision_history_remote(const char *repo, const char *uid,
+                                                   atlas_decision_summary_cb rev_cb,
+                                                   atlas_decision_timeline_cb event_cb, void *ud,
+                                                   bool *ledger_agrees_out, atlas_err *err);
+atlas_status atlas_service_decision_orphans_remote(int64_t limit, atlas_decision_summary_cb cb,
+                                                   void *ud, int64_t *count_out, bool *more_out,
+                                                   atlas_err *err);
+atlas_status atlas_service_decision_legacy_remote(const char *repo, int64_t limit,
+                                                  atlas_decision_legacy_view_cb cb, void *ud,
+                                                  int64_t *count_out, bool *more_out,
+                                                  atlas_err *err);
+atlas_status atlas_service_gate_show_remote(const char *repo, const char *uid,
+                                            atlas_gate_report *out, atlas_err *err);
+/* Narrows a single-decision assessment to the report `gate show` promises.
+ * Shared by the local and daemon-served forms. */
+atlas_status atlas_gate_narrow_to_one(atlas_gate_report *out, const char *uid, atlas_err *err);
 
 #endif /* ATLAS_SERVICE_H */

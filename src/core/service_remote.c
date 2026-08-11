@@ -75,6 +75,35 @@ static atlas_status atlas_remote_call(const char *method, const char *params, at
     return ATLAS_OK;
 }
 
+/* `{"repo":"…","path":"…"}` and optionally a limit. The path travels in the
+ * reversible `%XX` form every Atlas path input accepts — which is what the CLI
+ * was given — so nothing has to agree about raw bytes across the socket. */
+static atlas_status repo_path_params(const char *name, const char *path, int64_t limit,
+                                     atlas_buf *out, atlas_err *err) {
+    atlas_status st = atlas_db_check_repo_name(name, err);
+    atlas_ipc_params *p = NULL;
+    atlas_json *j = NULL;
+    if (st == ATLAS_OK) {
+        st = atlas_ipc_params_begin(&p, &j, err);
+    }
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    st = atlas_json_key_str(j, "repo", name, err);
+    if (st == ATLAS_OK && path != NULL) {
+        st = atlas_json_key_str(j, "path", path, err);
+    }
+    if (st == ATLAS_OK && limit > 0) {
+        st = atlas_json_key_int(j, "limit", limit, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_ipc_params_finish(p, out, err);
+    } else {
+        atlas_ipc_params_abort(p);
+    }
+    return st;
+}
+
 static void copy_str(char *dst, size_t n, const char *src) {
     if (src != NULL) {
         (void)snprintf(dst, n, "%s", src);
@@ -755,4 +784,1018 @@ atlas_status atlas_service_daemon_status_remote(atlas_daemon_status_report *out,
     atlas_ipc_response_free(r);
     atlas_buf_free(&raw);
     return st;
+}
+
+/* --- file, history and diff ------------------------------------------------- */
+
+atlas_status atlas_service_file_remote(const char *name, const char *path,
+                                       atlas_file_report_cb cb, void *ud, atlas_err *err) {
+    atlas_buf params = ATLAS_BUF_INIT;
+    atlas_status st = repo_path_params(name, path, 0, &params, err);
+    atlas_buf raw = ATLAS_BUF_INIT;
+    atlas_ipc_response *r = NULL;
+    if (st == ATLAS_OK) {
+        st = atlas_remote_call("repo.file", atlas_buf_cstr(&params), &raw, &r, err);
+    }
+    atlas_buf_free(&params);
+    if (st != ATLAS_OK) {
+        atlas_ipc_response_free(r);
+        atlas_buf_free(&raw);
+        return st;
+    }
+    atlas_file_report rep;
+    memset(&rep, 0, sizeof rep);
+    const char *v = NULL;
+    int64_t t = 0;
+    bool b = false;
+    const struct {
+        const char *k;
+        const char **dst;
+    } strs[] = {
+        {"path", &rep.row.path_text},
+        {"file_type", &rep.row.file_type},
+        {"language", &rep.row.language},
+        {"git_mode", &rep.row.git_mode},
+        {"git_index_oid", &rep.row.git_index_oid},
+        {"content_hash", &rep.row.content_hash},
+        {"content_hash_algo", &rep.row.content_hash_algo},
+        {"read_error", &rep.row.read_error},
+        {"truncated_reason", &rep.row.truncated_reason},
+        {"reason", &rep.reason},
+        {"reason_evidence", &rep.reason_evidence},
+        {"last_commit", &rep.last_commit_oid},
+        {"last_commit_subject", &rep.last_commit_subject},
+    };
+    for (size_t i = 0; i < sizeof strs / sizeof strs[0]; i++) {
+        if (atlas_ipc_result_str(r, strs[i].k, &v)) {
+            *strs[i].dst = v;
+        }
+    }
+    const struct {
+        const char *k;
+        bool *dst;
+    } bools[] = {
+        {"path_is_utf8", &rep.row.path_is_utf8},   {"size_known", &rep.row.size_known},
+        {"is_executable", &rep.row.is_executable}, {"is_symlink", &rep.row.is_symlink},
+        {"unsafe_path", &rep.row.unsafe_path},     {"deleted", &rep.row.deleted},
+        {"tracked", &rep.row.tracked},             {"ignored", &rep.row.ignored},
+        {"truncated", &rep.row.truncated},
+    };
+    for (size_t i = 0; i < sizeof bools / sizeof bools[0]; i++) {
+        if (atlas_ipc_result_bool(r, bools[i].k, &b)) {
+            *bools[i].dst = b;
+        }
+    }
+    const struct {
+        const char *k;
+        int64_t *dst;
+    } ints[] = {
+        {"size_bytes", &rep.row.size_bytes},
+        {"last_generation", &rep.row.last_generation},
+        {"first_seen_scan_id", &rep.row.first_seen_scan_id},
+        {"last_seen_scan_id", &rep.row.last_seen_scan_id},
+        {"change_count", &rep.change_count},
+        {"last_commit_time", &rep.last_commit_time},
+    };
+    for (size_t i = 0; i < sizeof ints / sizeof ints[0]; i++) {
+        if (atlas_ipc_result_int(r, ints[i].k, &t)) {
+            *ints[i].dst = t;
+        }
+    }
+    if (cb != NULL) {
+        st = cb(&rep, ud, err);
+    }
+    atlas_ipc_response_free(r);
+    atlas_buf_free(&raw);
+    return st;
+}
+
+atlas_status atlas_service_history_remote(const char *name, const char *path, int64_t limit,
+                                          atlas_history_cb cb, void *ud, int64_t *count_out,
+                                          atlas_err *err) {
+    if (count_out != NULL) {
+        *count_out = 0;
+    }
+    atlas_buf params = ATLAS_BUF_INIT;
+    atlas_status st = repo_path_params(name, path, limit, &params, err);
+    atlas_buf raw = ATLAS_BUF_INIT;
+    atlas_ipc_response *r = NULL;
+    if (st == ATLAS_OK) {
+        st = atlas_remote_call("repo.history", atlas_buf_cstr(&params), &raw, &r, err);
+    }
+    atlas_buf_free(&params);
+    if (st != ATLAS_OK) {
+        atlas_ipc_response_free(r);
+        atlas_buf_free(&raw);
+        return st;
+    }
+    size_t n = 0;
+    (void)atlas_ipc_result_arr_len(r, "changes", &n);
+    for (size_t i = 0; st == ATLAS_OK && i < n; i++) {
+        atlas_history_row row;
+        memset(&row, 0, sizeof row);
+        const char *v = NULL;
+        int64_t t = 0;
+        bool b = false;
+        const struct {
+            const char *k;
+            const char **dst;
+        } strs[] = {
+            {"commit", &row.commit_oid},   {"author", &row.author_name},
+            {"author_email", &row.author_email}, {"subject", &row.subject},
+            {"change_type", &row.change_type},   {"path", &row.path_text},
+            {"old_path", &row.old_path_text},
+        };
+        for (size_t k = 0; k < sizeof strs / sizeof strs[0]; k++) {
+            if (atlas_ipc_result_arr_obj_str(r, "changes", i, strs[k].k, &v)) {
+                *strs[k].dst = v;
+            }
+        }
+        if (atlas_ipc_result_arr_obj_int(r, "changes", i, "author_time", &t)) {
+            row.author_time = t;
+        }
+        if (atlas_ipc_result_arr_obj_int(r, "changes", i, "commit_time", &t)) {
+            row.commit_time = t;
+        }
+        if (atlas_ipc_result_arr_obj_int(r, "changes", i, "score", &t)) {
+            row.score = (int)t;
+        }
+        if (atlas_ipc_result_arr_obj_bool(r, "changes", i, "score_known", &b)) {
+            row.score_known = b;
+        }
+        st = cb(&row, ud, err);
+        if (st == ATLAS_OK && count_out != NULL) {
+            (*count_out)++;
+        }
+    }
+    atlas_ipc_response_free(r);
+    atlas_buf_free(&raw);
+    return st;
+}
+
+/* `diff` reads no index at all: it resolves the repository and then observes
+ * git. So the remote form is the repository row over the socket plus the very
+ * same observation, run here — the split `atlas_service_status_observe_live`
+ * already makes, and the reason no `repo.diff` method exists. */
+atlas_status atlas_service_diff_remote(const char *name, const atlas_diff_opts *opts,
+                                       atlas_diff_entry_cb cb, void *ud, atlas_diff_report *rep,
+                                       atlas_err *err) {
+    atlas_repo_state_report state;
+    atlas_repo_state_report_init(&state);
+    atlas_status st = atlas_service_repo_state_remote(name, &state, err);
+    if (st == ATLAS_OK) {
+        st = atlas_service_diff_repo(&state.repo, opts, cb, ud, rep, err);
+    }
+    atlas_repo_state_report_free(&state);
+    return st;
+}
+
+/* --- the structural group --------------------------------------------------- */
+
+atlas_status atlas_service_code_file_remote(const char *name, const char *path,
+                                            atlas_code_file_report *out, atlas_err *err) {
+    atlas_buf params = ATLAS_BUF_INIT;
+    atlas_status st = repo_path_params(name, path, 0, &params, err);
+    atlas_buf raw = ATLAS_BUF_INIT;
+    atlas_ipc_response *r = NULL;
+    if (st == ATLAS_OK) {
+        st = atlas_remote_call("code.file", atlas_buf_cstr(&params), &raw, &r, err);
+    }
+    atlas_buf_free(&params);
+    if (st != ATLAS_OK) {
+        atlas_ipc_response_free(r);
+        atlas_buf_free(&raw);
+        return st;
+    }
+    const char *v = NULL;
+    int64_t t = 0;
+    bool b = false;
+    if (atlas_ipc_result_bool(r, "indexed", &b)) {
+        out->indexed = b;
+    }
+    if (atlas_ipc_result_bool(r, "truncated", &b)) {
+        out->truncated = b;
+    }
+    if (atlas_ipc_result_bool(r, "include_guard", &b)) {
+        out->include_guard = b;
+    }
+    if (st == ATLAS_OK && atlas_ipc_result_str(r, "path", &v)) {
+        st = atlas_buf_set_str(&out->path_text, v, err);
+    }
+    if (st == ATLAS_OK && atlas_ipc_result_str(r, "parse_detail", &v)) {
+        st = atlas_buf_set_str(&out->parse_detail, v, err);
+    }
+    if (st == ATLAS_OK && atlas_ipc_result_str(r, "truncated_reason", &v)) {
+        st = atlas_buf_set_str(&out->truncated_reason, v, err);
+    }
+    copy_str(out->language, sizeof out->language,
+             atlas_ipc_result_str(r, "language", &v) ? v : NULL);
+    copy_str(out->content_hash, sizeof out->content_hash,
+             atlas_ipc_result_str(r, "content_hash", &v) ? v : NULL);
+    copy_str(out->parse_status, sizeof out->parse_status,
+             atlas_ipc_result_str(r, "parse_status", &v) ? v : NULL);
+    const struct {
+        const char *k;
+        int64_t *dst;
+    } ints[] = {
+        {"symbols", &out->symbol_count},    {"includes", &out->include_count},
+        {"call_candidates", &out->occurrence_count}, {"bytes", &out->bytes},
+        {"lines", &out->lines},             {"ambiguous", &out->ambiguous},
+        {"unresolved", &out->unresolved},
+    };
+    for (size_t i = 0; i < sizeof ints / sizeof ints[0]; i++) {
+        if (atlas_ipc_result_int(r, ints[i].k, &t)) {
+            *ints[i].dst = t;
+        }
+    }
+    atlas_ipc_response_free(r);
+    atlas_buf_free(&raw);
+    return st;
+}
+
+/* Symbol rows, from whichever array of whichever method holds them. One reader
+ * because the daemon emits one shape for a symbol wherever it appears. */
+static atlas_status read_symbols(const atlas_ipc_response *r, const char *arr,
+                                 atlas_code_symbol_cb cb, void *ud, int64_t *count_out,
+                                 atlas_err *err) {
+    size_t n = 0;
+    (void)atlas_ipc_result_arr_len(r, arr, &n);
+    atlas_status st = ATLAS_OK;
+    for (size_t i = 0; st == ATLAS_OK && i < n; i++) {
+        atlas_code_symbol_row row;
+        memset(&row, 0, sizeof row);
+        const char *v = NULL;
+        int64_t t = 0;
+        bool b = false;
+        const struct {
+            const char *k;
+            const char **dst;
+        } strs[] = {
+            {"name", &row.name_text}, {"kind", &row.kind},
+            {"linkage", &row.linkage}, {"resolution", &row.resolution},
+            {"path", &row.path_text},
+        };
+        for (size_t k = 0; k < sizeof strs / sizeof strs[0]; k++) {
+            if (atlas_ipc_result_arr_obj_str(r, arr, i, strs[k].k, &v)) {
+                *strs[k].dst = v;
+            }
+        }
+        if (atlas_ipc_result_arr_obj_int(r, arr, i, "id", &t)) {
+            row.id = t;
+        }
+        if (atlas_ipc_result_arr_obj_int(r, arr, i, "line", &t)) {
+            row.line = t;
+        }
+        if (atlas_ipc_result_arr_obj_int(r, arr, i, "col", &t)) {
+            row.col = t;
+        }
+        if (atlas_ipc_result_arr_obj_bool(r, arr, i, "definition", &b)) {
+            row.is_definition = b;
+        }
+        if (atlas_ipc_result_arr_obj_bool(r, arr, i, "declaration", &b)) {
+            row.is_declaration = b;
+        }
+        st = cb(&row, ud, err);
+        if (st == ATLAS_OK && count_out != NULL) {
+            (*count_out)++;
+        }
+    }
+    return st;
+}
+
+static atlas_status read_edges(const atlas_ipc_response *r, const char *arr,
+                               atlas_code_edge_cb cb, void *ud, int64_t *count_out,
+                               atlas_err *err) {
+    size_t n = 0;
+    (void)atlas_ipc_result_arr_len(r, arr, &n);
+    atlas_status st = ATLAS_OK;
+    for (size_t i = 0; st == ATLAS_OK && i < n; i++) {
+        atlas_code_edge_row row;
+        memset(&row, 0, sizeof row);
+        const char *v = NULL;
+        int64_t t = 0;
+        const struct {
+            const char *k;
+            const char **dst;
+        } strs[] = {
+            {"kind", &row.kind},          {"from_kind", &row.src_kind},
+            {"from_path", &row.src_path_text}, {"to_kind", &row.dst_kind},
+            {"to_path", &row.dst_path_text},   {"spelling", &row.dst_name_text},
+            {"resolution", &row.resolution},   {"provenance", &row.provenance},
+            {"reason", &row.detail},
+        };
+        for (size_t k = 0; k < sizeof strs / sizeof strs[0]; k++) {
+            if (atlas_ipc_result_arr_obj_str(r, arr, i, strs[k].k, &v)) {
+                *strs[k].dst = v;
+            }
+        }
+        if (atlas_ipc_result_arr_obj_int(r, arr, i, "candidates", &t)) {
+            row.candidate_count = t;
+        }
+        if (atlas_ipc_result_arr_obj_int(r, arr, i, "line", &t)) {
+            row.line = t;
+        }
+        st = cb(&row, ud, err);
+        if (st == ATLAS_OK && count_out != NULL) {
+            (*count_out)++;
+        }
+    }
+    return st;
+}
+
+atlas_status atlas_service_code_file_symbols_remote(const char *name, const char *path,
+                                                    int64_t limit, atlas_code_symbol_cb cb,
+                                                    void *ud, int64_t *count_out, bool *more_out,
+                                                    atlas_err *err) {
+    if (count_out != NULL) {
+        *count_out = 0;
+    }
+    if (more_out != NULL) {
+        *more_out = false;
+    }
+    atlas_buf params = ATLAS_BUF_INIT;
+    atlas_status st = repo_path_params(name, path, limit, &params, err);
+    atlas_buf raw = ATLAS_BUF_INIT;
+    atlas_ipc_response *r = NULL;
+    if (st == ATLAS_OK) {
+        st = atlas_remote_call("code.file", atlas_buf_cstr(&params), &raw, &r, err);
+    }
+    atlas_buf_free(&params);
+    if (st == ATLAS_OK) {
+        st = read_symbols(r, "symbols_defined", cb, ud, count_out, err);
+        bool b = false;
+        if (more_out != NULL && atlas_ipc_result_bool(r, "symbols_more", &b)) {
+            *more_out = b;
+        }
+    }
+    atlas_ipc_response_free(r);
+    atlas_buf_free(&raw);
+    return st;
+}
+
+atlas_status atlas_service_code_file_edges_remote(const char *name, const char *path,
+                                                  const char *kind, bool inbound, int64_t limit,
+                                                  atlas_code_edge_cb cb, void *ud,
+                                                  int64_t *count_out, bool *more_out,
+                                                  atlas_err *err) {
+    if (count_out != NULL) {
+        *count_out = 0;
+    }
+    if (more_out != NULL) {
+        *more_out = false;
+    }
+    atlas_buf params = ATLAS_BUF_INIT;
+    atlas_status st = repo_path_params(name, path, limit, &params, err);
+    atlas_buf raw = ATLAS_BUF_INIT;
+    atlas_ipc_response *r = NULL;
+    if (st == ATLAS_OK) {
+        st = atlas_remote_call("code.file", atlas_buf_cstr(&params), &raw, &r, err);
+    }
+    atlas_buf_free(&params);
+    if (st == ATLAS_OK) {
+        /* The daemon groups a file's edges by what they are, so the array is
+         * chosen by the same (kind, direction) pair the local read selects an
+         * index with. */
+        const char *arr = "depends_on";
+        if (kind != NULL && strcmp(kind, "file_includes_file") == 0) {
+            arr = "includes";
+        } else if (inbound) {
+            arr = "depended_on_by";
+        }
+        st = read_edges(r, arr, cb, ud, count_out, err);
+    }
+    atlas_ipc_response_free(r);
+    atlas_buf_free(&raw);
+    return st;
+}
+
+atlas_status atlas_service_code_symbol_search_remote(const char *name, const char *query,
+                                                     const char *kind, int64_t limit,
+                                                     atlas_code_symbol_cb cb, void *ud,
+                                                     int64_t *count_out, bool *more_out,
+                                                     atlas_err *err) {
+    if (count_out != NULL) {
+        *count_out = 0;
+    }
+    if (more_out != NULL) {
+        *more_out = false;
+    }
+    atlas_buf params = ATLAS_BUF_INIT;
+    atlas_ipc_params *p = NULL;
+    atlas_json *j = NULL;
+    atlas_status st = atlas_db_check_repo_name(name, err);
+    if (st == ATLAS_OK) {
+        st = atlas_ipc_params_begin(&p, &j, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(j, "repo", name, err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "query", query, err);
+        }
+        if (st == ATLAS_OK && kind != NULL && kind[0] != '\0') {
+            st = atlas_json_key_str(j, "kind", kind, err);
+        }
+        if (st == ATLAS_OK && limit > 0) {
+            st = atlas_json_key_int(j, "limit", limit, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_ipc_params_finish(p, &params, err);
+        } else {
+            atlas_ipc_params_abort(p);
+        }
+    }
+    atlas_buf raw = ATLAS_BUF_INIT;
+    atlas_ipc_response *r = NULL;
+    if (st == ATLAS_OK) {
+        st = atlas_remote_call("code.symbol.search", atlas_buf_cstr(&params), &raw, &r, err);
+    }
+    atlas_buf_free(&params);
+    if (st == ATLAS_OK) {
+        st = read_symbols(r, "symbols", cb, ud, count_out, err);
+        bool b = false;
+        if (more_out != NULL && atlas_ipc_result_bool(r, "more", &b)) {
+            *more_out = b;
+        }
+    }
+    atlas_ipc_response_free(r);
+    atlas_buf_free(&raw);
+    return st;
+}
+
+static atlas_status symbol_params(const char *name, const char *symbol, int64_t limit,
+                                  atlas_buf *out, atlas_err *err) {
+    atlas_ipc_params *p = NULL;
+    atlas_json *j = NULL;
+    atlas_status st = atlas_db_check_repo_name(name, err);
+    if (st == ATLAS_OK) {
+        st = atlas_ipc_params_begin(&p, &j, err);
+    }
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    st = atlas_json_key_str(j, "repo", name, err);
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(j, "symbol", symbol, err);
+    }
+    if (st == ATLAS_OK && limit > 0) {
+        st = atlas_json_key_int(j, "limit", limit, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_ipc_params_finish(p, out, err);
+    } else {
+        atlas_ipc_params_abort(p);
+    }
+    return st;
+}
+
+atlas_status atlas_service_code_symbol_sites_remote(const char *name, const char *symbol,
+                                                    int64_t limit, atlas_code_symbol_cb cb,
+                                                    void *ud, int64_t *count_out, bool *more_out,
+                                                    atlas_err *err) {
+    if (count_out != NULL) {
+        *count_out = 0;
+    }
+    if (more_out != NULL) {
+        *more_out = false;
+    }
+    atlas_buf params = ATLAS_BUF_INIT;
+    atlas_status st = symbol_params(name, symbol, limit, &params, err);
+    atlas_buf raw = ATLAS_BUF_INIT;
+    atlas_ipc_response *r = NULL;
+    if (st == ATLAS_OK) {
+        st = atlas_remote_call("code.symbol", atlas_buf_cstr(&params), &raw, &r, err);
+    }
+    atlas_buf_free(&params);
+    if (st == ATLAS_OK) {
+        st = read_symbols(r, "sites", cb, ud, count_out, err);
+        bool b = false;
+        if (more_out != NULL && atlas_ipc_result_bool(r, "sites_more", &b)) {
+            *more_out = b;
+        }
+    }
+    atlas_ipc_response_free(r);
+    atlas_buf_free(&raw);
+    return st;
+}
+
+atlas_status atlas_service_code_symbol_edges_remote(const char *name, const char *symbol,
+                                                    bool inbound, int64_t limit,
+                                                    atlas_code_edge_cb cb, void *ud,
+                                                    int64_t *count_out, bool *more_out,
+                                                    atlas_err *err) {
+    if (count_out != NULL) {
+        *count_out = 0;
+    }
+    if (more_out != NULL) {
+        *more_out = false;
+    }
+    atlas_buf params = ATLAS_BUF_INIT;
+    atlas_status st = symbol_params(name, symbol, limit, &params, err);
+    atlas_buf raw = ATLAS_BUF_INIT;
+    atlas_ipc_response *r = NULL;
+    if (st == ATLAS_OK) {
+        st = atlas_remote_call("code.symbol", atlas_buf_cstr(&params), &raw, &r, err);
+    }
+    atlas_buf_free(&params);
+    if (st == ATLAS_OK) {
+        st = read_edges(r, inbound ? "callers" : "calls", cb, ud, count_out, err);
+    }
+    atlas_ipc_response_free(r);
+    atlas_buf_free(&raw);
+    return st;
+}
+
+atlas_status atlas_service_code_walk_remote(const char *name, const char *path, const char *symbol,
+                                            bool inbound, int64_t depth, int64_t limit,
+                                            atlas_code_walk_cb cb, void *ud,
+                                            atlas_code_walk_summary *sum, atlas_err *err) {
+    atlas_buf params = ATLAS_BUF_INIT;
+    atlas_ipc_params *p = NULL;
+    atlas_json *j = NULL;
+    atlas_status st = atlas_db_check_repo_name(name, err);
+    if (st == ATLAS_OK) {
+        st = atlas_ipc_params_begin(&p, &j, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(j, "repo", name, err);
+        if (st == ATLAS_OK && path != NULL && path[0] != '\0') {
+            st = atlas_json_key_str(j, "path", path, err);
+        }
+        if (st == ATLAS_OK && symbol != NULL && symbol[0] != '\0') {
+            st = atlas_json_key_str(j, "symbol", symbol, err);
+        }
+        if (st == ATLAS_OK && depth > 0) {
+            st = atlas_json_key_int(j, "depth", depth, err);
+        }
+        if (st == ATLAS_OK && limit > 0) {
+            st = atlas_json_key_int(j, "limit", limit, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_ipc_params_finish(p, &params, err);
+        } else {
+            atlas_ipc_params_abort(p);
+        }
+    }
+    atlas_buf raw = ATLAS_BUF_INIT;
+    atlas_ipc_response *r = NULL;
+    if (st == ATLAS_OK) {
+        st = atlas_remote_call(inbound ? "code.impact" : "code.deps", atlas_buf_cstr(&params), &raw,
+                               &r, err);
+    }
+    atlas_buf_free(&params);
+    if (st != ATLAS_OK) {
+        atlas_ipc_response_free(r);
+        atlas_buf_free(&raw);
+        return st;
+    }
+    size_t n = 0;
+    (void)atlas_ipc_result_arr_len(r, "candidates", &n);
+    for (size_t i = 0; st == ATLAS_OK && i < n; i++) {
+        atlas_code_walk_row row;
+        memset(&row, 0, sizeof row);
+        const char *v = NULL;
+        int64_t t = 0;
+        const struct {
+            const char *k;
+            const char **dst;
+        } strs[] = {
+            {"node_kind", &row.node_kind}, {"node", &row.label},
+            {"edge", &row.edge_kind},      {"via", &row.via_label},
+            {"resolution", &row.resolution}, {"reason", &row.detail},
+        };
+        for (size_t k = 0; k < sizeof strs / sizeof strs[0]; k++) {
+            if (atlas_ipc_result_arr_obj_str(r, "candidates", i, strs[k].k, &v)) {
+                *strs[k].dst = v;
+            }
+        }
+        if (atlas_ipc_result_arr_obj_int(r, "candidates", i, "depth", &t)) {
+            row.depth = t;
+        }
+        st = cb(&row, ud, err);
+    }
+    if (sum != NULL) {
+        int64_t t = 0;
+        bool b = false;
+        const struct {
+            const char *k;
+            int64_t *dst;
+        } cs[] = {
+            {"count", &sum->emitted},         {"exact", &sum->exact},
+            {"unique_lexical", &sum->unique_lexical}, {"ambiguous", &sum->ambiguous},
+            {"unresolved", &sum->unresolved},
+        };
+        for (size_t i = 0; i < sizeof cs / sizeof cs[0]; i++) {
+            if (atlas_ipc_result_int(r, cs[i].k, &t)) {
+                *cs[i].dst = t;
+            }
+        }
+        if (atlas_ipc_result_bool(r, "truncated", &b)) {
+            sum->truncated = b;
+        }
+        /* `truncated_reason` is a `const char *` the renderer prints after this
+         * call returns, and the response it arrived in is freed below. Copied
+         * into storage that outlives both rather than aliased — and into a
+         * file-static rather than an allocation, because the summary struct has
+         * no owner for one and the CLI consumes it immediately. */
+        static char trunc[128];
+        const char *tv = NULL;
+        if (atlas_ipc_result_str(r, "truncated_reason", &tv) && tv != NULL) {
+            (void)snprintf(trunc, sizeof trunc, "%s", tv);
+            sum->truncated_reason = trunc;
+        }
+    }
+    atlas_ipc_response_free(r);
+    atlas_buf_free(&raw);
+    return st;
+}
+
+/* --- decisions -------------------------------------------------------------- */
+
+atlas_status atlas_service_decision_show_remote(const char *repo, const char *uid,
+                                                int64_t revision_no, atlas_decision_document *out,
+                                                atlas_err *err) {
+    atlas_buf params = ATLAS_BUF_INIT;
+    atlas_ipc_params *p = NULL;
+    atlas_json *j = NULL;
+    atlas_status st = atlas_db_check_repo_name(repo, err);
+    if (st == ATLAS_OK) {
+        st = atlas_ipc_params_begin(&p, &j, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(j, "repo", repo, err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "decision", uid, err);
+        }
+        if (st == ATLAS_OK && revision_no > 0) {
+            st = atlas_json_key_int(j, "revision", revision_no, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_ipc_params_finish(p, &params, err);
+        } else {
+            atlas_ipc_params_abort(p);
+        }
+    }
+    atlas_buf raw = ATLAS_BUF_INIT;
+    atlas_ipc_response *r = NULL;
+    if (st == ATLAS_OK) {
+        st = atlas_remote_call("decision.get", atlas_buf_cstr(&params), &raw, &r, err);
+    }
+    atlas_buf_free(&params);
+    if (st != ATLAS_OK) {
+        atlas_ipc_response_free(r);
+        atlas_buf_free(&raw);
+        return st;
+    }
+    const char *v = NULL;
+    int64_t t = 0;
+    bool b = false;
+    const struct {
+        const char *k;
+        atlas_buf *dst;
+    } strs[] = {
+        {"repo", &out->repo},
+        {"decision", &out->summary.uid},
+        {"status", &out->summary.status},
+        {"state", &out->summary.revision_state},
+        {"title", &out->summary.title},
+        {"content_hash", &out->summary.content_hash},
+        {"proposed_by", &out->summary.proposed_by},
+        {"created_at", &out->summary.created_at},
+        {"context", &out->context_text},
+        {"decision_text", &out->decision_text},
+        {"rationale", &out->rationale_text},
+        {"consequences", &out->consequences_text},
+        {"scope", &out->scope},
+        {"basis_head", &out->basis_head},
+        {"basis_repo_identity", &out->basis_repo_identity},
+        {"unbound_reason", &out->unbound_reason},
+    };
+    for (size_t i = 0; st == ATLAS_OK && i < sizeof strs / sizeof strs[0]; i++) {
+        if (atlas_ipc_result_str(r, strs[i].k, &v)) {
+            st = atlas_buf_set_str(strs[i].dst, v, err);
+        }
+    }
+    /* `decision` is the uid at the top level and the prose under the same name
+     * inside the document; the prose is read from its own key. */
+    if (st == ATLAS_OK && atlas_ipc_result_str(r, "decision", &v) && out->decision_text.len == 0) {
+        st = atlas_buf_set_str(&out->summary.uid, v, err);
+    }
+    if (atlas_ipc_result_int(r, "number", &t)) {
+        out->summary.revision_no = t;
+    }
+    if (atlas_ipc_result_bool(r, "session_unbound", &b)) {
+        out->session_unbound = b;
+    }
+    size_t n = 0;
+    (void)atlas_ipc_result_arr_len(r, "alternatives", &n);
+    for (size_t i = 0; st == ATLAS_OK && i < n && i < ATLAS_DECISION_MAX_ALTERNATIVES; i++) {
+        const char *a = NULL;
+        if (atlas_ipc_result_arr_str(r, "alternatives", i, &a)) {
+            st = atlas_buf_set_str(&out->alternatives[out->alternative_count], a, err);
+            if (st == ATLAS_OK) {
+                out->alternative_count++;
+            }
+        }
+    }
+    (void)atlas_ipc_result_arr_len(r, "links", &n);
+    for (size_t i = 0; st == ATLAS_OK && i < n && i < ATLAS_DECISION_MAX_LINKS; i++) {
+        atlas_decision_link_view *lv = &out->links[out->link_count];
+        atlas_decision_link_view_init(lv);
+        const char *kind = NULL;
+        if (!atlas_ipc_result_arr_obj_str(r, "links", i, "kind", &kind)) {
+            continue;
+        }
+        st = atlas_buf_set_str(&lv->kind, kind, err);
+        /* The value key depends on the kind, which is how the daemon writes it:
+         * a link carries exactly one of these and the renderer wants the one it
+         * has, under a single name. */
+        static const char *const VALUE_KEYS[] = {"path", "commit", "symbol", "target"};
+        for (size_t k = 0; st == ATLAS_OK && k < sizeof VALUE_KEYS / sizeof VALUE_KEYS[0]; k++) {
+            if (atlas_ipc_result_arr_obj_str(r, "links", i, VALUE_KEYS[k], &v)) {
+                st = atlas_buf_set_str(&lv->value, v, err);
+                break;
+            }
+        }
+        if (st == ATLAS_OK && atlas_ipc_result_arr_obj_str(r, "links", i, "symbol_kind", &v)) {
+            st = atlas_buf_set_str(&lv->detail, v, err);
+        }
+        if (st == ATLAS_OK && atlas_ipc_result_arr_obj_str(r, "links", i, "currency", &v)) {
+            st = atlas_buf_set_str(&lv->currency, v, err);
+        }
+        if (st == ATLAS_OK && atlas_ipc_result_arr_obj_str(r, "links", i, "analyzer", &v)) {
+            st = atlas_buf_set_str(&lv->analyzer, v, err);
+        }
+        if (atlas_ipc_result_arr_obj_int(r, "links", i, "analyzer_version", &t)) {
+            lv->analyzer_version = t;
+        }
+        if (atlas_ipc_result_arr_obj_int(r, "links", i, "matches", &t)) {
+            lv->matches = t;
+        }
+        if (strcmp(atlas_buf_cstr(&lv->currency), "CURRENT") != 0 &&
+            atlas_buf_cstr(&lv->currency)[0] != '\0' &&
+            strcmp(atlas_buf_cstr(&lv->currency), "UNKNOWN") != 0) {
+            out->links_needing_review++;
+        }
+        out->link_count++;
+    }
+    atlas_ipc_response_free(r);
+    atlas_buf_free(&raw);
+    return st;
+}
+
+atlas_status atlas_service_decision_history_remote(const char *repo, const char *uid,
+                                                   atlas_decision_summary_cb rev_cb,
+                                                   atlas_decision_timeline_cb event_cb, void *ud,
+                                                   bool *ledger_agrees_out, atlas_err *err) {
+    atlas_buf params = ATLAS_BUF_INIT;
+    atlas_ipc_params *p = NULL;
+    atlas_json *j = NULL;
+    atlas_status st = atlas_db_check_repo_name(repo, err);
+    if (st == ATLAS_OK) {
+        st = atlas_ipc_params_begin(&p, &j, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(j, "repo", repo, err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "decision", uid, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_ipc_params_finish(p, &params, err);
+        } else {
+            atlas_ipc_params_abort(p);
+        }
+    }
+    atlas_buf raw = ATLAS_BUF_INIT;
+    atlas_ipc_response *r = NULL;
+    if (st == ATLAS_OK) {
+        st = atlas_remote_call("decision.history", atlas_buf_cstr(&params), &raw, &r, err);
+    }
+    atlas_buf_free(&params);
+    if (st != ATLAS_OK) {
+        atlas_ipc_response_free(r);
+        atlas_buf_free(&raw);
+        return st;
+    }
+    size_t n = 0;
+    (void)atlas_ipc_result_arr_len(r, "revisions", &n);
+    for (size_t i = 0; st == ATLAS_OK && i < n; i++) {
+        atlas_decision_summary sum;
+        atlas_decision_summary_init(&sum);
+        const char *v = NULL;
+        int64_t t = 0;
+        const struct {
+            const char *k;
+            atlas_buf *dst;
+        } strs[] = {
+            {"state", &sum.revision_state}, {"content_hash", &sum.content_hash},
+            {"proposed_by", &sum.proposed_by}, {"created_at", &sum.created_at},
+            {"title", &sum.title},
+        };
+        for (size_t k = 0; st == ATLAS_OK && k < sizeof strs / sizeof strs[0]; k++) {
+            if (atlas_ipc_result_arr_obj_str(r, "revisions", i, strs[k].k, &v)) {
+                st = atlas_buf_set_str(strs[k].dst, v, err);
+            }
+        }
+        if (atlas_ipc_result_arr_obj_int(r, "revisions", i, "revision", &t)) {
+            sum.revision_no = t;
+        }
+        if (st == ATLAS_OK && rev_cb != NULL) {
+            st = rev_cb(&sum, ud, err);
+        }
+        atlas_decision_summary_free(&sum);
+    }
+    (void)atlas_ipc_result_arr_len(r, "timeline", &n);
+    for (size_t i = 0; st == ATLAS_OK && i < n; i++) {
+        atlas_decision_timeline_entry e;
+        memset(&e, 0, sizeof e);
+        const char *v = NULL;
+        int64_t t = 0;
+        bool b = false;
+        const struct {
+            const char *k;
+            const char **dst;
+        } strs[] = {
+            {"event", &e.event},           {"actor", &e.actor},
+            {"content_hash", &e.content_hash}, {"superseded_by", &e.superseded_by},
+            {"detail", &e.detail},         {"at", &e.at},
+        };
+        for (size_t k = 0; k < sizeof strs / sizeof strs[0]; k++) {
+            if (atlas_ipc_result_arr_obj_str(r, "timeline", i, strs[k].k, &v)) {
+                *strs[k].dst = v;
+            }
+        }
+        if (atlas_ipc_result_arr_obj_int(r, "timeline", i, "revision", &t)) {
+            e.revision_no = t;
+        }
+        if (atlas_ipc_result_arr_obj_bool(r, "timeline", i, "operator_channel", &b)) {
+            e.operator_channel = b;
+        }
+        if (event_cb != NULL) {
+            st = event_cb(&e, ud, err);
+        }
+    }
+    bool agrees = true;
+    if (ledger_agrees_out != NULL && atlas_ipc_result_bool(r, "ledger_agrees", &agrees)) {
+        *ledger_agrees_out = agrees;
+    }
+    atlas_ipc_response_free(r);
+    atlas_buf_free(&raw);
+    return st;
+}
+
+atlas_status atlas_service_decision_orphans_remote(int64_t limit, atlas_decision_summary_cb cb,
+                                                   void *ud, int64_t *count_out, bool *more_out,
+                                                   atlas_err *err) {
+    if (count_out != NULL) {
+        *count_out = 0;
+    }
+    if (more_out != NULL) {
+        *more_out = false;
+    }
+    atlas_buf params = ATLAS_BUF_INIT;
+    atlas_status st = ATLAS_OK;
+    if (limit > 0) {
+        st = atlas_buf_appendf(&params, err, "{\"limit\":%lld}", (long long)limit);
+    } else {
+        st = atlas_buf_set_str(&params, "{}", err);
+    }
+    atlas_buf raw = ATLAS_BUF_INIT;
+    atlas_ipc_response *r = NULL;
+    if (st == ATLAS_OK) {
+        st = atlas_remote_call("decision.orphaned", atlas_buf_cstr(&params), &raw, &r, err);
+    }
+    atlas_buf_free(&params);
+    if (st != ATLAS_OK) {
+        atlas_ipc_response_free(r);
+        atlas_buf_free(&raw);
+        return st;
+    }
+    size_t n = 0;
+    (void)atlas_ipc_result_arr_len(r, "decisions", &n);
+    for (size_t i = 0; st == ATLAS_OK && i < n; i++) {
+        atlas_decision_summary sum;
+        atlas_decision_summary_init(&sum);
+        const char *v = NULL;
+        int64_t t = 0;
+        const struct {
+            const char *k;
+            atlas_buf *dst;
+        } strs[] = {
+            {"decision", &sum.uid},          {"status", &sum.status},
+            {"revision_state", &sum.revision_state}, {"title", &sum.title},
+            {"content_hash", &sum.content_hash},  {"proposed_by", &sum.proposed_by},
+            {"superseded_by", &sum.superseded_by}, {"created_at", &sum.created_at},
+            {"updated_at", &sum.updated_at},
+        };
+        for (size_t k = 0; st == ATLAS_OK && k < sizeof strs / sizeof strs[0]; k++) {
+            if (atlas_ipc_result_arr_obj_str(r, "decisions", i, strs[k].k, &v)) {
+                st = atlas_buf_set_str(strs[k].dst, v, err);
+            }
+        }
+        if (atlas_ipc_result_arr_obj_int(r, "decisions", i, "revision", &t)) {
+            sum.revision_no = t;
+        }
+        if (atlas_ipc_result_arr_obj_int(r, "decisions", i, "latest_revision", &t)) {
+            sum.latest_revision_no = t;
+        }
+        if (atlas_ipc_result_arr_obj_int(r, "decisions", i, "links", &t)) {
+            sum.link_count = t;
+        }
+        if (st == ATLAS_OK) {
+            st = cb(&sum, ud, err);
+        }
+        atlas_decision_summary_free(&sum);
+        if (st == ATLAS_OK && count_out != NULL) {
+            (*count_out)++;
+        }
+    }
+    bool more = false;
+    if (more_out != NULL && atlas_ipc_result_bool(r, "more", &more)) {
+        *more_out = more;
+    }
+    atlas_ipc_response_free(r);
+    atlas_buf_free(&raw);
+    return st;
+}
+
+atlas_status atlas_service_decision_legacy_remote(const char *repo, int64_t limit,
+                                                  atlas_decision_legacy_view_cb cb, void *ud,
+                                                  int64_t *count_out, bool *more_out,
+                                                  atlas_err *err) {
+    if (count_out != NULL) {
+        *count_out = 0;
+    }
+    if (more_out != NULL) {
+        *more_out = false;
+    }
+    atlas_buf params = ATLAS_BUF_INIT;
+    atlas_status st = repo_path_params(repo, NULL, limit, &params, err);
+    atlas_buf raw = ATLAS_BUF_INIT;
+    atlas_ipc_response *r = NULL;
+    if (st == ATLAS_OK) {
+        st = atlas_remote_call("decision.legacy", atlas_buf_cstr(&params), &raw, &r, err);
+    }
+    atlas_buf_free(&params);
+    if (st != ATLAS_OK) {
+        atlas_ipc_response_free(r);
+        atlas_buf_free(&raw);
+        return st;
+    }
+    size_t n = 0;
+    (void)atlas_ipc_result_arr_len(r, "legacy", &n);
+    for (size_t i = 0; st == ATLAS_OK && i < n; i++) {
+        atlas_decision_legacy_view view;
+        atlas_decision_legacy_view_init(&view);
+        const char *v = NULL;
+        int64_t t = 0;
+        bool b = false;
+        const struct {
+            const char *k;
+            atlas_buf *dst;
+        } strs[] = {
+            {"title", &view.title},           {"statement", &view.statement},
+            {"provenance", &view.provenance}, {"created_at", &view.created_at},
+            {"imported_uid", &view.imported_uid},
+        };
+        for (size_t k = 0; st == ATLAS_OK && k < sizeof strs / sizeof strs[0]; k++) {
+            if (atlas_ipc_result_arr_obj_str(r, "legacy", i, strs[k].k, &v)) {
+                st = atlas_buf_set_str(strs[k].dst, v, err);
+            }
+        }
+        if (atlas_ipc_result_arr_obj_int(r, "legacy", i, "id", &t)) {
+            view.id = t;
+        }
+        if (atlas_ipc_result_arr_obj_int(r, "legacy", i, "paths", &t)) {
+            view.path_count = t;
+        }
+        if (atlas_ipc_result_arr_obj_bool(r, "legacy", i, "imported", &b)) {
+            view.imported = b;
+        }
+        if (st == ATLAS_OK) {
+            st = cb(&view, ud, err);
+        }
+        atlas_decision_legacy_view_free(&view);
+        if (st == ATLAS_OK && count_out != NULL) {
+            (*count_out)++;
+        }
+    }
+    atlas_ipc_response_free(r);
+    atlas_buf_free(&raw);
+    return st;
+}
+
+/* `gate show` is `gate.check` with a single-decision filter — the query already
+ * carries `only_uid` and the daemon now reads it, so there is one assessment
+ * path and one parser rather than a second method that would have to agree. */
+atlas_status atlas_service_gate_show_remote(const char *repo, const char *uid,
+                                            atlas_gate_report *out, atlas_err *err) {
+    atlas_gate_query q;
+    memset(&q, 0, sizeof q);
+    q.repo_name = repo;
+    q.only_uid = uid;
+    atlas_status st = atlas_service_gate_check_remote(&q, out, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    return atlas_gate_narrow_to_one(out, uid, err);
 }

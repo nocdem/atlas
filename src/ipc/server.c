@@ -428,6 +428,11 @@ static atlas_status write_repo_registration(dispatch_state *ds, const atlas_repo
         st = atlas_json_key_str(ds->j, "git_common_dir", atlas_buf_cstr(&enc), err);
     }
     if (st == ATLAS_OK) {
+        /* Reset first: the encoder appends, and this buffer just carried the
+         * common directory. Without it `git_dir` goes on the wire as the two
+         * paths concatenated, which is a value that decodes cleanly, looks like
+         * a path, and matches nothing. */
+        atlas_buf_reset(&enc);
         st = atlas_path_text_encode(ri->git_dir.data, ri->git_dir.len, &enc, err);
     }
     if (st == ATLAS_OK) {
@@ -613,6 +618,197 @@ static atlas_status emit_event(const atlas_event_row *row, void *ud, atlas_err *
     return st;
 }
 
+/* --- repo.file / repo.history ------------------------------------------------
+ *
+ * Both call the one implementation in `src/core/service.c` rather than
+ * re-deriving anything, so the answer this daemon gives and the answer a local
+ * CLI gives come from the same code. `path` arrives in the reversible `%XX`
+ * form every Atlas path input accepts and is passed through as text, exactly as
+ * the CLI passes it: the service layer is what tries the raw and decoded
+ * spellings, and doing it here as well would be a second place for that rule to
+ * live. */
+static atlas_status emit_file_report(const atlas_file_report *rep, void *ud, atlas_err *err) {
+    dispatch_state *ds = (dispatch_state *)ud;
+    const atlas_file_row *row = &rep->row;
+    /* `path_text` is stored in the safe encoding already; encoding it again
+     * would make it stop decoding back to the original bytes. A subject comes
+     * raw from git and is encoded here. */
+    atlas_status st = atlas_json_key_str(ds->j, "path", row->path_text, err);
+    const struct {
+        const char *k;
+        const char *v;
+    } strs[] = {
+        {"file_type", row->file_type},
+        {"language", row->language},
+        {"git_mode", row->git_mode},
+        {"git_index_oid", row->git_index_oid},
+        {"content_hash", row->content_hash},
+        {"content_hash_algo", row->content_hash_algo},
+        {"read_error", row->read_error},
+        {"truncated_reason", row->truncated_reason},
+        {"reason", rep->reason},
+        {"reason_evidence", rep->reason_evidence},
+    };
+    for (size_t i = 0; st == ATLAS_OK && i < sizeof strs / sizeof strs[0]; i++) {
+        st = atlas_json_key_str_opt(ds->j, strs[i].k, strs[i].v, err);
+    }
+    const struct {
+        const char *k;
+        bool v;
+    } bools[] = {
+        {"path_is_utf8", row->path_is_utf8},   {"size_known", row->size_known},
+        {"is_executable", row->is_executable}, {"is_symlink", row->is_symlink},
+        {"unsafe_path", row->unsafe_path},     {"deleted", row->deleted},
+        {"tracked", row->tracked},             {"ignored", row->ignored},
+        {"truncated", row->truncated},
+    };
+    for (size_t i = 0; st == ATLAS_OK && i < sizeof bools / sizeof bools[0]; i++) {
+        st = atlas_json_key_bool(ds->j, bools[i].k, bools[i].v, err);
+    }
+    const struct {
+        const char *k;
+        int64_t v;
+    } ints[] = {
+        {"size_bytes", row->size_bytes},
+        {"last_generation", row->last_generation},
+        {"first_seen_scan_id", row->first_seen_scan_id},
+        {"last_seen_scan_id", row->last_seen_scan_id},
+        {"change_count", rep->change_count},
+        {"last_commit_time", rep->last_commit_time},
+    };
+    for (size_t i = 0; st == ATLAS_OK && i < sizeof ints / sizeof ints[0]; i++) {
+        st = atlas_json_key_int(ds->j, ints[i].k, ints[i].v, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str_opt(ds->j, "last_commit", rep->last_commit_oid, err);
+    }
+    if (st == ATLAS_OK && rep->last_commit_subject != NULL) {
+        st = atlas_json_key_str(ds->j, "last_commit_subject",
+                                atlas_safe(&ds->safe, rep->last_commit_subject), err);
+    }
+    return st;
+}
+
+static atlas_status method_repo_file(dispatch_state *ds, const atlas_ipc_request *req,
+                                     atlas_err *err) {
+    atlas_repo_info info;
+    atlas_repo_info_init(&info);
+    atlas_status st = atlas_server_require_repo(ds, req, &info, err);
+    const char *path = NULL;
+    if (st == ATLAS_OK && !atlas_ipc_param_str(req, "path", &path)) {
+        st = atlas_err_set(err, ATLAS_ERR_USAGE, "repo.file needs a \"path\" parameter");
+    }
+    if (st == ATLAS_OK && info.last_scan_id == 0) {
+        st = atlas_err_set(err, ATLAS_ERR_REPO,
+                           "repository \"%s\" has not been scanned yet (run: atlas scan %s)",
+                           info.name, info.name);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "repo", info.name, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_service_file_db(ds->db, info.id, info.name, path, emit_file_report, ds, err);
+    }
+    atlas_repo_info_free(&info);
+    return st;
+}
+
+static atlas_status emit_history_row(const atlas_history_row *row, void *ud, atlas_err *err) {
+    dispatch_state *ds = (dispatch_state *)ud;
+    atlas_status st = atlas_json_obj_begin(ds->j, err);
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "commit", row->commit_oid, err);
+    }
+    /* Author identity and subject come raw from git and are encoded here; both
+     * path forms are stored encoded and are emitted as they are. */
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str_opt(
+            ds->j, "author", row->author_name != NULL ? atlas_safe(&ds->safe, row->author_name) : NULL,
+            err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str_opt(
+            ds->j, "author_email",
+            row->author_email != NULL ? atlas_safe(&ds->safe, row->author_email) : NULL, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str_opt(
+            ds->j, "subject", row->subject != NULL ? atlas_safe(&ds->safe, row->subject) : NULL,
+            err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str_opt(ds->j, "change_type", row->change_type, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str_opt(ds->j, "path", row->path_text, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str_opt(ds->j, "old_path", row->old_path_text, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "author_time", row->author_time, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "commit_time", row->commit_time, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(ds->j, "score_known", row->score_known, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "score", row->score, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(ds->j, "untrusted_data", true, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_obj_end(ds->j, err);
+    }
+    return st;
+}
+
+static atlas_status method_repo_history(dispatch_state *ds, const atlas_ipc_request *req,
+                                        atlas_err *err) {
+    atlas_repo_info info;
+    atlas_repo_info_init(&info);
+    atlas_status st = atlas_server_require_repo(ds, req, &info, err);
+    const char *path = NULL;
+    if (st == ATLAS_OK && !atlas_ipc_param_str(req, "path", &path)) {
+        st = atlas_err_set(err, ATLAS_ERR_USAGE, "repo.history needs a \"path\" parameter");
+    }
+    if (st == ATLAS_OK && info.last_scan_id == 0) {
+        st = atlas_err_set(err, ATLAS_ERR_REPO,
+                           "repository \"%s\" has not been scanned yet (run: atlas scan %s)",
+                           info.name, info.name);
+    }
+    int64_t limit = 0;
+    (void)atlas_ipc_param_int(req, "limit", &limit);
+    if (limit <= 0 || limit > ATLAS_IPC_MAX_ROWS) {
+        limit = ATLAS_IPC_MAX_ROWS;
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "repo", info.name, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key(ds->j, "changes", err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_arr_begin(ds->j, err);
+    }
+    int64_t count = 0;
+    if (st == ATLAS_OK) {
+        st = atlas_service_history_db(ds->db, info.id, path, limit, emit_history_row, ds, &count,
+                                      err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_arr_end(ds->j, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "count", count, err);
+    }
+    atlas_repo_info_free(&info);
+    return st;
+}
+
 static atlas_status method_events_since(dispatch_state *ds, const atlas_ipc_request *req,
                                         atlas_err *err) {
     atlas_repo_info info;
@@ -670,6 +866,8 @@ static const atlas_method_entry METHODS[] = {
     {"repo.list", method_repo_list},
     {"repo.state", method_repo_state},
     {"repo.sync", method_repo_sync},
+    {"repo.file", method_repo_file},
+    {"repo.history", method_repo_history},
     {"events.since", method_events_since},
     /* There is deliberately no daemon.shutdown. Anything local that can open the
      * socket could then disable indexing; systemd owns the lifecycle and SIGTERM

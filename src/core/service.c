@@ -786,7 +786,7 @@ static atlas_status capture_last_commit(const atlas_history_row *row, void *ud, 
 }
 
 typedef struct file_ctx {
-    atlas_ctx *ctx;
+    atlas_db *db;
     int64_t repo_id;
     atlas_file_report_cb cb;
     void *ud;
@@ -801,10 +801,10 @@ static atlas_status on_file_row(const atlas_file_row *row, void *ud, atlas_err *
     atlas_buf_init(&lc.subject);
 
     int64_t change_count = 0;
-    atlas_status st = atlas_db_file_history(fc->ctx->db, fc->repo_id, row->path_raw,
+    atlas_status st = atlas_db_file_history(fc->db, fc->repo_id, row->path_raw,
                                             row->path_raw_len, -1, NULL, NULL, &change_count, err);
     if (st == ATLAS_OK) {
-        st = atlas_db_file_history(fc->ctx->db, fc->repo_id, row->path_raw, row->path_raw_len, 1,
+        st = atlas_db_file_history(fc->db, fc->repo_id, row->path_raw, row->path_raw_len, 1,
                                    capture_last_commit, &lc, NULL, err);
     }
     if (st == ATLAS_OK) {
@@ -846,6 +846,36 @@ static atlas_status resolve_path_variants(const char *path, atlas_buf *decoded, 
     return ATLAS_OK;
 }
 
+/* The lookup itself, over a bare handle.
+ *
+ * Split out for the reason `service.h` gives about the A1 `_db` functions: the
+ * daemon's threads own an `atlas_db` and not an `atlas_ctx`, and a second
+ * implementation of "what does Atlas know about this path" — one for the CLI
+ * and one for the method that answers it over the socket — is exactly the pair
+ * that would drift. There is one, and both call it. */
+atlas_status atlas_service_file_db(atlas_db *db, int64_t repo_id, const char *name,
+                                   const char *path, atlas_file_report_cb cb, void *ud,
+                                   atlas_err *err) {
+    file_ctx fc = {db, repo_id, cb, ud};
+    bool found = false;
+    atlas_status st =
+        atlas_db_file_get(db, repo_id, path, strlen(path), on_file_row, &fc, &found, err);
+    if (st == ATLAS_OK && !found) {
+        atlas_buf decoded = ATLAS_BUF_INIT;
+        bool have_decoded = false;
+        st = resolve_path_variants(path, &decoded, &have_decoded, err);
+        if (st == ATLAS_OK && have_decoded) {
+            st = atlas_db_file_get(db, repo_id, decoded.data, decoded.len, on_file_row, &fc, &found,
+                                   err);
+        }
+        atlas_buf_free(&decoded);
+    }
+    if (st == ATLAS_OK && !found) {
+        st = atlas_err_set(err, ATLAS_ERR_REPO, "path \"%s\" is not indexed in \"%s\"", path, name);
+    }
+    return st;
+}
+
 atlas_status atlas_service_file(atlas_ctx *ctx, const char *name, const char *path,
                                 atlas_file_report_cb cb, void *ud, atlas_err *err) {
     atlas_repo_info info;
@@ -862,24 +892,32 @@ atlas_status atlas_service_file(atlas_ctx *ctx, const char *name, const char *pa
                              name, name);
     }
 
-    file_ctx fc = {ctx, info.id, cb, ud};
-    bool found = false;
-    st = atlas_db_file_get(ctx->db, info.id, path, strlen(path), on_file_row, &fc, &found, err);
+    st = atlas_service_file_db(ctx->db, info.id, name, path, cb, ud, err);
+    atlas_repo_info_free(&info);
+    return st;
+}
 
-    if (st == ATLAS_OK && !found) {
+/* The recorded changes to one path, over a bare handle. Split for the reason
+ * `atlas_service_file_db` is split. */
+atlas_status atlas_service_history_db(atlas_db *db, int64_t repo_id, const char *path,
+                                      int64_t limit, atlas_history_cb cb, void *ud,
+                                      int64_t *count_out, atlas_err *err) {
+    int64_t count = 0;
+    atlas_status st =
+        atlas_db_file_history(db, repo_id, path, strlen(path), limit, cb, ud, &count, err);
+    if (st == ATLAS_OK && count == 0) {
         atlas_buf decoded = ATLAS_BUF_INIT;
         bool have_decoded = false;
         st = resolve_path_variants(path, &decoded, &have_decoded, err);
         if (st == ATLAS_OK && have_decoded) {
-            st = atlas_db_file_get(ctx->db, info.id, decoded.data, decoded.len, on_file_row, &fc,
-                                   &found, err);
+            st = atlas_db_file_history(db, repo_id, decoded.data, decoded.len, limit, cb, ud,
+                                       &count, err);
         }
         atlas_buf_free(&decoded);
     }
-    if (st == ATLAS_OK && !found) {
-        st = atlas_err_set(err, ATLAS_ERR_REPO, "path \"%s\" is not indexed in \"%s\"", path, name);
+    if (st == ATLAS_OK && count_out != NULL) {
+        *count_out = count;
     }
-    atlas_repo_info_free(&info);
     return st;
 }
 
@@ -900,21 +938,7 @@ atlas_status atlas_service_history(atlas_ctx *ctx, const char *name, const char 
                              name, name);
     }
 
-    int64_t count = 0;
-    st = atlas_db_file_history(ctx->db, info.id, path, strlen(path), limit, cb, ud, &count, err);
-    if (st == ATLAS_OK && count == 0) {
-        atlas_buf decoded = ATLAS_BUF_INIT;
-        bool have_decoded = false;
-        st = resolve_path_variants(path, &decoded, &have_decoded, err);
-        if (st == ATLAS_OK && have_decoded) {
-            st = atlas_db_file_history(ctx->db, info.id, decoded.data, decoded.len, limit, cb, ud,
-                                       &count, err);
-        }
-        atlas_buf_free(&decoded);
-    }
-    if (st == ATLAS_OK && count_out != NULL) {
-        *count_out = count;
-    }
+    st = atlas_service_history_db(ctx->db, info.id, path, limit, cb, ud, count_out, err);
     atlas_repo_info_free(&info);
     return st;
 }

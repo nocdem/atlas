@@ -322,6 +322,24 @@ bool atlas_ipc_result_arr_len(const atlas_ipc_response *r, const char *arr_key, 
     return true;
 }
 
+bool atlas_ipc_result_arr_str(const atlas_ipc_response *r, const char *arr_key, size_t index,
+                              const char **out) {
+    *out = NULL;
+    if (r == NULL || r->result == NULL) {
+        return false;
+    }
+    yyjson_val *a = yyjson_obj_get(r->result, arr_key);
+    if (a == NULL || !yyjson_is_arr(a)) {
+        return false;
+    }
+    yyjson_val *v = yyjson_arr_get(a, index);
+    if (v == NULL || !yyjson_is_str(v)) {
+        return false;
+    }
+    *out = yyjson_get_str(v);
+    return true;
+}
+
 static yyjson_val *arr_obj_arr(const atlas_ipc_response *r, const char *arr_key, size_t index,
                                const char *key) {
     yyjson_val *o = arr_obj(r, arr_key, index);

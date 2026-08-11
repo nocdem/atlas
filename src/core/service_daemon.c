@@ -577,6 +577,7 @@ atlas_status atlas_service_status_remote(const char *name, atlas_status_report *
             /* The raw bytes are what git is addressed with, and `root` is the
              * reversible `%XX` display form — decoded rather than used as-is,
              * because a path is bytes and may not be UTF-8. */
+            atlas_buf_reset(&out->repo.root_path);
             st = atlas_path_text_decode(v, strlen(v), &out->repo.root_path, err);
         }
     }
@@ -635,9 +636,11 @@ atlas_status atlas_service_status_remote(const char *name, atlas_status_report *
         out->repo.last_scan_id = n;
     }
     if (st == ATLAS_OK && atlas_ipc_result_str(r, "git_common_dir", &v)) {
+        atlas_buf_reset(&out->repo.git_common_dir);
         st = atlas_path_text_decode(v, strlen(v), &out->repo.git_common_dir, err);
     }
     if (st == ATLAS_OK && atlas_ipc_result_str(r, "git_dir", &v)) {
+        atlas_buf_reset(&out->repo.git_dir);
         st = atlas_path_text_decode(v, strlen(v), &out->repo.git_dir, err);
     }
     atlas_ipc_response_free(r);
@@ -681,6 +684,21 @@ atlas_status atlas_service_repo_state_remote(const char *name, atlas_repo_state_
     }
     if (atlas_ipc_result_str(r, "root", &v)) {
         st = atlas_buf_set_str(&out->repo.root_path_text, v, err);
+        if (st == ATLAS_OK) {
+            /* The raw bytes too. `atlas diff` reads no index — it resolves the
+             * repository and then observes git — so this row is what git is
+             * addressed with, and a path is bytes rather than text. */
+            atlas_buf_reset(&out->repo.root_path);
+            st = atlas_path_text_decode(v, strlen(v), &out->repo.root_path, err);
+        }
+    }
+    if (st == ATLAS_OK && atlas_ipc_result_str(r, "git_common_dir", &v)) {
+        atlas_buf_reset(&out->repo.git_common_dir);
+        st = atlas_path_text_decode(v, strlen(v), &out->repo.git_common_dir, err);
+    }
+    if (st == ATLAS_OK && atlas_ipc_result_str(r, "git_dir", &v)) {
+        atlas_buf_reset(&out->repo.git_dir);
+        st = atlas_path_text_decode(v, strlen(v), &out->repo.git_dir, err);
     }
     if (atlas_ipc_result_int(r, "id", &n)) {
         out->repo.id = n;

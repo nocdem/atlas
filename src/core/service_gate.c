@@ -421,6 +421,18 @@ atlas_status atlas_gate_run_one(atlas_db *db, const char *repo, const char *uid,
     if (st != ATLAS_OK) {
         return st;
     }
+    return atlas_gate_narrow_to_one(out, uid, err);
+}
+
+/* Turns a whole-repository assessment filtered to one decision into the report
+ * `gate show` promises: exactly one item or a refusal, with the counts and the
+ * verdict derived from that item alone.
+ *
+ * Shared with the daemon-served form, which asks `gate.check` with the same
+ * single-decision filter — so "there is no such approved decision here" is one
+ * answer produced in one place, rather than a local error and a remote empty
+ * PASS that both look deliberate. */
+atlas_status atlas_gate_narrow_to_one(atlas_gate_report *out, const char *uid, atlas_err *err) {
     if (out->item_count != 1u) {
         return atlas_err_set(err, ATLAS_ERR_REPO,
                              "no approved decision \"%s\" is attached to this repository", uid);

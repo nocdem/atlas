@@ -1300,6 +1300,14 @@ static atlas_status method_gate_check(dispatch_state *ds, const atlas_ipc_reques
         q.repo_name = info.name;
         q.at_commit = at;
         q.depth = depth;
+        /* Additive, and the whole of what `atlas gate show NAME ID` needs: the
+         * query already carries `only_uid`, so one decision costs one
+         * assessment rather than a repository's worth. Absent, every approved
+         * decision is assessed exactly as before. */
+        const char *only = NULL;
+        if (atlas_ipc_param_str(req, "decision", &only) && only != NULL && only[0] != '\0') {
+            q.only_uid = only;
+        }
         st = atlas_gate_run(ds->db, &q, &rep, err);
     }
     if (st == ATLAS_OK) {
@@ -1454,7 +1462,123 @@ static atlas_status method_gate_check(dispatch_state *ds, const atlas_ipc_reques
  *
  * `tests/test_a7_authority.c` asks a live daemon for each of these names and
  * requires every one to fail. Adding one back deletes the guarantee. */
+/* --- decision.orphaned / decision.legacy -------------------------------------
+ *
+ * Both reads, and both here for the reason `atlas decision orphaned` exists at
+ * all: a canonical record that has become invisible looks exactly like one that
+ * was deleted, and a client that cannot open the index could not see either.
+ * `orphaned` takes no repository — that is the point of it. */
+static atlas_status method_orphaned(dispatch_state *ds, const atlas_ipc_request *req,
+                                    atlas_err *err) {
+    int64_t limit = ATLAS_DECISION_DEFAULT_ROWS;
+    (void)atlas_ipc_param_int(req, "limit", &limit);
+    if (limit <= 0 || limit > ATLAS_DECISION_MAX_ROWS) {
+        limit = ATLAS_DECISION_MAX_ROWS;
+    }
+    atlas_status st = atlas_json_key(ds->j, "decisions", err);
+    if (st == ATLAS_OK) {
+        st = atlas_json_arr_begin(ds->j, err);
+    }
+    int64_t count = 0;
+    bool more = false;
+    list_ctx lc = {ds, ATLAS_OK};
+    if (st == ATLAS_OK) {
+        st = atlas_db_decision_orphans_list(ds->db, limit, on_doc, &lc, &count, &more, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_arr_end(ds->j, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "count", count, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(ds->j, "more", more, err);
+    }
+    return st;
+}
+
+static atlas_status on_legacy(const atlas_decision_legacy_row *v, void *ud, atlas_err *err) {
+    list_ctx *lc = (list_ctx *)ud;
+    dispatch_state *ds = lc->ds;
+    atlas_status st = atlas_json_obj_begin(ds->j, err);
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "id", v->id, err);
+    }
+    /* Project prose, encoded on the way out and labelled with every element for
+     * the reason `write_doc` gives: a caller that reads one element and drops
+     * the envelope must still carry the label with the prose it took. */
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str_opt(
+            ds->j, "title", v->title != NULL ? atlas_safe(&ds->safe, v->title) : NULL, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str_opt(
+            ds->j, "statement", v->statement != NULL ? atlas_safe(&ds->safe, v->statement) : NULL,
+            err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str_opt(ds->j, "provenance", v->provenance, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str_opt(ds->j, "created_at", v->created_at, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str_opt(ds->j, "imported_uid", v->imported_uid, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "paths", v->path_count, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(ds->j, "imported", v->imported, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "trust", "UNTRUSTED_DATA", err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_obj_end(ds->j, err);
+    }
+    return st;
+}
+
+static atlas_status method_legacy(dispatch_state *ds, const atlas_ipc_request *req,
+                                  atlas_err *err) {
+    atlas_repo_info info;
+    atlas_repo_info_init(&info);
+    atlas_status st = atlas_server_require_repo(ds, req, &info, err);
+    int64_t limit = ATLAS_DECISION_DEFAULT_ROWS;
+    (void)atlas_ipc_param_int(req, "limit", &limit);
+    if (limit <= 0 || limit > ATLAS_DECISION_MAX_ROWS) {
+        limit = ATLAS_DECISION_MAX_ROWS;
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "repo", info.name, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key(ds->j, "legacy", err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_arr_begin(ds->j, err);
+    }
+    int64_t count = 0;
+    list_ctx lc = {ds, ATLAS_OK};
+    if (st == ATLAS_OK) {
+        bool lmore = false;
+        st = atlas_db_decision_legacy_list(ds->db, info.id, false, limit, on_legacy, &lc, &count,
+                                           &lmore, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_arr_end(ds->j, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "count", count, err);
+    }
+    atlas_repo_info_free(&info);
+    return st;
+}
+
 static const atlas_method_entry DECISION_METHODS[] = {
+    {"decision.orphaned", method_orphaned},
+    {"decision.legacy", method_legacy},
     /* Reads. */
     {"decision.list", method_list},
     {"decision.get", method_get},

@@ -296,6 +296,8 @@ bool atlas_ipc_result_arr_obj_bool(const atlas_ipc_response *r, const char *arr_
  * tell an empty array from a missing one, and for a reason list those mean
  * different things. */
 bool atlas_ipc_result_arr_len(const atlas_ipc_response *r, const char *arr_key, size_t *out);
+bool atlas_ipc_result_arr_str(const atlas_ipc_response *r, const char *arr_key, size_t index,
+                              const char **out);
 bool atlas_ipc_result_arr_obj_arr_len(const atlas_ipc_response *r, const char *arr_key,
                                       size_t index, const char *key, size_t *out);
 bool atlas_ipc_result_arr_obj_arr_str(const atlas_ipc_response *r, const char *arr_key,

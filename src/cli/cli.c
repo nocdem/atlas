@@ -1112,8 +1112,10 @@ static atlas_status run_gate(cli_state *st, atlas_ctx *ctx, atlas_renderer *r, a
     atlas_gate_report_init(&rep);
     atlas_status result;
     if (one) {
-        result = atlas_service_gate_show(ctx, st->operands[1], st->operands[2],
-                                         st->opts.decision.at_commit, &rep, err);
+        result = ctx != NULL ? atlas_service_gate_show(ctx, st->operands[1], st->operands[2],
+                                                      st->opts.decision.at_commit, &rep, err)
+                             : atlas_service_gate_show_remote(st->operands[1], st->operands[2],
+                                                              &rep, err);
     } else {
         atlas_gate_query q;
         atlas_gate_query_init(&q);
@@ -1290,8 +1292,11 @@ static atlas_status run_decision(cli_state *st, atlas_ctx *ctx, atlas_renderer *
         }
         atlas_decision_document doc;
         atlas_decision_document_init(&doc);
-        result = atlas_service_decision_show(ctx, st->operands[1], st->operands[2],
-                                             st->opts.decision.revision, &doc, err);
+        result = ctx != NULL
+                     ? atlas_service_decision_show(ctx, st->operands[1], st->operands[2],
+                                                   st->opts.decision.revision, &doc, err)
+                     : atlas_service_decision_show_remote(st->operands[1], st->operands[2],
+                                                          st->opts.decision.revision, &doc, err);
         if (result == ATLAS_OK && markdown) {
             /* Markdown goes to stdout as itself rather than through a renderer:
              * it is a document, not a report, and wrapping it would make it
@@ -1335,9 +1340,12 @@ static atlas_status run_decision(cli_state *st, atlas_ctx *ctx, atlas_renderer *
          * for — see the comment on `code_list_begin`. */
         decision_history_render dr = {st, r, 0, 0, false};
         if (result == ATLAS_OK) {
-            result = atlas_service_decision_history(ctx, st->operands[1], st->operands[2],
-                                                    on_history_revision, on_history_event, &dr,
-                                                    &agrees, err);
+            result = ctx != NULL ? atlas_service_decision_history(
+                                       ctx, st->operands[1], st->operands[2], on_history_revision,
+                                       on_history_event, &dr, &agrees, err)
+                                 : atlas_service_decision_history_remote(
+                                       st->operands[1], st->operands[2], on_history_revision,
+                                       on_history_event, &dr, &agrees, err);
         }
         if (result == ATLAS_OK && dr.in_events) {
             result = r->v->code_list_end(r, "timeline", "event", "events", dr.events, false, err);
@@ -1414,8 +1422,10 @@ static atlas_status run_decision(cli_state *st, atlas_ctx *ctx, atlas_renderer *
         bool more = false;
         result = r->v->list_begin(r, "orphaned", err);
         if (result == ATLAS_OK) {
-            result = atlas_service_decision_orphans(ctx, limit, on_decision_item, &dr, &count,
-                                                    &more, err);
+            result = ctx != NULL ? atlas_service_decision_orphans(ctx, limit, on_decision_item,
+                                                                  &dr, &count, &more, err)
+                                 : atlas_service_decision_orphans_remote(limit, on_decision_item,
+                                                                         &dr, &count, &more, err);
         }
         if (result == ATLAS_OK) {
             result = r->v->list_end(r, "orphaned decision", "orphaned decisions", count, err);
@@ -1453,8 +1463,12 @@ static atlas_status run_decision(cli_state *st, atlas_ctx *ctx, atlas_renderer *
             result = r->v->list_begin(r, "a2_proposals", err);
         }
         if (result == ATLAS_OK) {
-            result = atlas_service_decision_legacy(ctx, st->operands[1], limit, on_legacy_item,
-                                                   &dr, &count, &more, err);
+            result = ctx != NULL ? atlas_service_decision_legacy(ctx, st->operands[1], limit,
+                                                                 on_legacy_item, &dr, &count,
+                                                                 &more, err)
+                                 : atlas_service_decision_legacy_remote(st->operands[1], limit,
+                                                                        on_legacy_item, &dr,
+                                                                        &count, &more, err);
         }
         if (result == ATLAS_OK) {
             result = r->v->list_end(r, "proposal", "proposals", count, err);
@@ -1533,12 +1547,13 @@ static bool remote_serves(const cli_state *st) {
         return true;
     }
     if (strcmp(cmd, "status") == 0 || strcmp(cmd, "search") == 0 ||
-        strcmp(cmd, "events") == 0 || strcmp(cmd, "sync") == 0) {
+        strcmp(cmd, "events") == 0 || strcmp(cmd, "sync") == 0 || strcmp(cmd, "file") == 0 ||
+        strcmp(cmd, "history") == 0 || strcmp(cmd, "diff") == 0) {
         return true;
     }
-    /* Keyed on the subcommand, not the command. `code file`, `decision get`,
-     * `gate show` and their neighbours have no remote path yet, and reaching
-     * their handlers with a NULL context would dereference it. */
+    /* Keyed on the subcommand, not the command: a command whose siblings have
+     * no remote form would otherwise reach its handler with a NULL context and
+     * dereference it. */
     if (strcmp(cmd, "repo") == 0) {
         return strcmp(sub, "list") == 0;
     }
@@ -1546,18 +1561,44 @@ static bool remote_serves(const cli_state *st) {
         return strcmp(sub, "status") == 0;
     }
     if (strcmp(cmd, "code") == 0) {
-        return strcmp(sub, "status") == 0;
+        return strcmp(sub, "status") == 0 || strcmp(sub, "file") == 0 ||
+               strcmp(sub, "symbol") == 0 || strcmp(sub, "search") == 0 ||
+               strcmp(sub, "deps") == 0 || strcmp(sub, "impact") == 0;
     }
     if (strcmp(cmd, "gate") == 0) {
-        return strcmp(sub, "check") == 0;
+        return strcmp(sub, "check") == 0 || strcmp(sub, "show") == 0;
     }
     if (strcmp(cmd, "decision") == 0) {
-        /* All three listings, because they are one call site differing only in
-         * a predicate the daemon already accepts — `decision.list` takes a
-         * `query` or a `path`. Routing one and refusing its two siblings would
-         * be an arbitrary line through a single function. */
         return strcmp(sub, "list") == 0 || strcmp(sub, "search") == 0 ||
-               strcmp(sub, "for-file") == 0;
+               strcmp(sub, "for-file") == 0 || strcmp(sub, "show") == 0 ||
+               strcmp(sub, "export") == 0 || strcmp(sub, "history") == 0 ||
+               strcmp(sub, "orphaned") == 0 || strcmp(sub, "legacy") == 0;
+    }
+    return false;
+}
+
+/* Whether `cmd` is a command at all.
+ *
+ * Without this, an unknown command on a foreign index is answered by the
+ * refusal below — which tells somebody who mistyped that the system index is
+ * daemon-owned, and never that there is no such command. The dispatch chain's
+ * own unknown-command error is produced after a context is opened, which is
+ * exactly what a foreign index does not allow, so the check has to happen here.
+ *
+ * A new command must be added to this list. That duplication is real; what
+ * catches it is that the command then reports the wrong error for every client
+ * on a system deployment, which the CLI smoke matrix runs. */
+static bool is_a_command(const char *cmd) {
+    static const char *const COMMANDS[] = {
+        "doctor",  "repo",    "scan",      "status",  "search",  "file",     "history",
+        "diff",    "daemon",  "sync",      "events",  "code",    "decision", "gate",
+        "job",     "dispatcher", "backup", "maintenance", "service", "mcp",  "hook",
+        "integrate", "version", "help",
+    };
+    for (size_t i = 0; i < sizeof COMMANDS / sizeof COMMANDS[0]; i++) {
+        if (strcmp(cmd, COMMANDS[i]) == 0) {
+            return true;
+        }
     }
     return false;
 }
@@ -1577,9 +1618,8 @@ static atlas_status remote_refuse(const cli_state *st, atlas_err *err) {
     return atlas_err_set(err, ATLAS_ERR_CONFIG,
                          "the system index is owned by the Atlas service account and cannot be "
                          "read directly, and `atlas %s%s%s` has no daemon-served form yet. "
-                         "`status`, `search`, `events`, `sync`, `repo list`, `code status`, "
-                         "`gate check`, `decision list`, `daemon status`, `doctor` and the `job` "
-                         "commands do.",
+                         "Every other read-only command does; `backup` and `maintenance` are "
+                         "local operator operations with no RPC surface by design.",
                          st->command, st->operand_count > 0 ? " " : "",
                          st->operand_count > 0 ? st->operands[0] : "");
 }
@@ -1649,7 +1689,9 @@ static atlas_status run_code(cli_state *st, atlas_ctx *ctx, atlas_renderer *r, i
         }
         atlas_code_file_report rep;
         atlas_code_file_report_init(&rep);
-        result = atlas_service_code_file(ctx, st->operands[1], st->operands[2], &rep, err);
+        result = ctx != NULL
+                     ? atlas_service_code_file(ctx, st->operands[1], st->operands[2], &rep, err)
+                     : atlas_service_code_file_remote(st->operands[1], st->operands[2], &rep, err);
         if (result == ATLAS_OK) {
             result = renderer_open(r, st->opts.json, st->out, "code file", err);
         }
@@ -1667,9 +1709,12 @@ static atlas_status run_code(cli_state *st, atlas_ctx *ctx, atlas_renderer *r, i
             bool more = false;
             result = r->v->code_list_begin(r, "symbols", err);
             if (result == ATLAS_OK) {
-                result = atlas_service_code_file_symbols(ctx, st->operands[1], st->operands[2],
-                                                         limit, code_symbol_sink, &ls, &count,
-                                                         &more, err);
+                result = ctx != NULL ? atlas_service_code_file_symbols(
+                                           ctx, st->operands[1], st->operands[2], limit,
+                                           code_symbol_sink, &ls, &count, &more, err)
+                                     : atlas_service_code_file_symbols_remote(
+                                           st->operands[1], st->operands[2], limit,
+                                           code_symbol_sink, &ls, &count, &more, err);
             }
             if (result == ATLAS_OK) {
                 result = r->v->code_list_end(r, "symbols", "symbol", "symbols", count, more, err);
@@ -1678,9 +1723,13 @@ static atlas_status run_code(cli_state *st, atlas_ctx *ctx, atlas_renderer *r, i
                 result = r->v->code_list_begin(r, "includes", err);
             }
             if (result == ATLAS_OK) {
-                result = atlas_service_code_file_edges(ctx, st->operands[1], st->operands[2],
-                                                       "file_includes_file", false, limit,
-                                                       code_edge_sink, &ls, &count, &more, err);
+                result = ctx != NULL ? atlas_service_code_file_edges(
+                                           ctx, st->operands[1], st->operands[2],
+                                           "file_includes_file", false, limit, code_edge_sink, &ls,
+                                           &count, &more, err)
+                                     : atlas_service_code_file_edges_remote(
+                                           st->operands[1], st->operands[2], "file_includes_file",
+                                           false, limit, code_edge_sink, &ls, &count, &more, err);
             }
             if (result == ATLAS_OK) {
                 result = r->v->code_list_end(r, "includes", "include", "includes", count, more,
@@ -1690,9 +1739,14 @@ static atlas_status run_code(cli_state *st, atlas_ctx *ctx, atlas_renderer *r, i
                 result = r->v->code_list_begin(r, "dependents", err);
             }
             if (result == ATLAS_OK) {
-                result = atlas_service_code_file_edges(ctx, st->operands[1], st->operands[2],
-                                                       "file_depends_on_file", true, limit,
-                                                       code_edge_sink, &ls, &count, &more, err);
+                result = ctx != NULL ? atlas_service_code_file_edges(
+                                           ctx, st->operands[1], st->operands[2],
+                                           "file_depends_on_file", true, limit, code_edge_sink,
+                                           &ls, &count, &more, err)
+                                     : atlas_service_code_file_edges_remote(
+                                           st->operands[1], st->operands[2],
+                                           "file_depends_on_file", true, limit, code_edge_sink,
+                                           &ls, &count, &more, err);
             }
             if (result == ATLAS_OK) {
                 result = r->v->code_list_end(r, "dependents", "dependent", "dependents", count,
@@ -1726,8 +1780,12 @@ static atlas_status run_code(cli_state *st, atlas_ctx *ctx, atlas_renderer *r, i
             result = r->v->code_list_begin(r, "sites", err);
         }
         if (result == ATLAS_OK) {
-            result = atlas_service_code_symbol_sites(ctx, st->operands[1], st->operands[2], limit,
-                                                     code_symbol_sink, &ls, &count, &more, err);
+            result = ctx != NULL ? atlas_service_code_symbol_sites(
+                                       ctx, st->operands[1], st->operands[2], limit,
+                                       code_symbol_sink, &ls, &count, &more, err)
+                                 : atlas_service_code_symbol_sites_remote(
+                                       st->operands[1], st->operands[2], limit, code_symbol_sink,
+                                       &ls, &count, &more, err);
         }
         if (result == ATLAS_OK) {
             result = r->v->code_list_end(r, "sites", "site", "sites", count, more, err);
@@ -1736,9 +1794,12 @@ static atlas_status run_code(cli_state *st, atlas_ctx *ctx, atlas_renderer *r, i
             result = r->v->code_list_begin(r, "callers", err);
         }
         if (result == ATLAS_OK) {
-            result = atlas_service_code_symbol_edges(ctx, st->operands[1], st->operands[2], true,
-                                                     limit, code_edge_sink, &ls, &count, &more,
-                                                     err);
+            result = ctx != NULL ? atlas_service_code_symbol_edges(
+                                       ctx, st->operands[1], st->operands[2], true, limit,
+                                       code_edge_sink, &ls, &count, &more, err)
+                                 : atlas_service_code_symbol_edges_remote(
+                                       st->operands[1], st->operands[2], true, limit,
+                                       code_edge_sink, &ls, &count, &more, err);
         }
         if (result == ATLAS_OK) {
             result = r->v->code_list_end(r, "callers", "caller", "callers", count, more, err);
@@ -1747,9 +1808,12 @@ static atlas_status run_code(cli_state *st, atlas_ctx *ctx, atlas_renderer *r, i
             result = r->v->code_list_begin(r, "calls", err);
         }
         if (result == ATLAS_OK) {
-            result = atlas_service_code_symbol_edges(ctx, st->operands[1], st->operands[2], false,
-                                                     limit, code_edge_sink, &ls, &count, &more,
-                                                     err);
+            result = ctx != NULL ? atlas_service_code_symbol_edges(
+                                       ctx, st->operands[1], st->operands[2], false, limit,
+                                       code_edge_sink, &ls, &count, &more, err)
+                                 : atlas_service_code_symbol_edges_remote(
+                                       st->operands[1], st->operands[2], false, limit,
+                                       code_edge_sink, &ls, &count, &more, err);
         }
         if (result == ATLAS_OK) {
             result = r->v->code_list_end(r, "calls", "call", "calls", count, more, err);
@@ -1776,9 +1840,12 @@ static atlas_status run_code(cli_state *st, atlas_ctx *ctx, atlas_renderer *r, i
             bool more = false;
             result = r->v->list_begin(r, "symbols", err);
             if (result == ATLAS_OK) {
-                result = atlas_service_code_symbol_search(ctx, st->operands[1], st->operands[2],
-                                                          NULL, limit, code_symbol_sink, &ls,
-                                                          &count, &more, err);
+                result = ctx != NULL ? atlas_service_code_symbol_search(
+                                           ctx, st->operands[1], st->operands[2], NULL, limit,
+                                           code_symbol_sink, &ls, &count, &more, err)
+                                     : atlas_service_code_symbol_search_remote(
+                                           st->operands[1], st->operands[2], NULL, limit,
+                                           code_symbol_sink, &ls, &count, &more, err);
             }
             if (result == ATLAS_OK) {
                 result = r->v->list_end(r, "symbol", "symbols", count, err);
@@ -1815,9 +1882,12 @@ static atlas_status run_code(cli_state *st, atlas_ctx *ctx, atlas_renderer *r, i
             list_sink ls = {r};
             result = r->v->list_begin(r, "candidates", err);
             if (result == ATLAS_OK) {
-                result = atlas_service_code_walk(ctx, st->operands[1], path, symbol, inbound,
-                                                 st->opts.depth, limit, code_walk_sink, &ls, &sum,
-                                                 err);
+                result = ctx != NULL ? atlas_service_code_walk(
+                                           ctx, st->operands[1], path, symbol, inbound,
+                                           st->opts.depth, limit, code_walk_sink, &ls, &sum, err)
+                                     : atlas_service_code_walk_remote(
+                                           st->operands[1], path, symbol, inbound, st->opts.depth,
+                                           limit, code_walk_sink, &ls, &sum, err);
             }
             if (result == ATLAS_OK) {
                 result = r->v->list_end(r, "candidate", "candidates", sum.emitted, err);
@@ -2239,6 +2309,13 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
         }
         atlas_buf_free(&resolved);
     }
+    if (remote && !is_a_command(cmd)) {
+        /* The same answer a per-user install gives, produced here because the
+         * dispatcher's own unknown-command error comes after a context is
+         * opened and a foreign index has no context to open. */
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "unknown command \"%s\" (try: atlas help)",
+                             cmd);
+    }
     if (remote && !remote_serves(st)) {
         return remote_refuse(st, err);
     }
@@ -2474,8 +2551,10 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
             }
             if (result == ATLAS_OK) {
                 list_sink ls = {&r};
-                result = atlas_service_file(ctx, st->operands[0], st->operands[1],
-                                            file_report_sink, &ls, err);
+                result = ctx != NULL ? atlas_service_file(ctx, st->operands[0], st->operands[1],
+                                                          file_report_sink, &ls, err)
+                                     : atlas_service_file_remote(st->operands[0], st->operands[1],
+                                                                 file_report_sink, &ls, err);
             }
             if (result == ATLAS_OK) {
                 result = renderer_close(&r, err);
@@ -2495,8 +2574,12 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
                 int64_t count = 0;
                 result = r.v->list_begin(&r, "changes", err);
                 if (result == ATLAS_OK) {
-                    result = atlas_service_history(ctx, st->operands[0], st->operands[1], limit,
-                                                   history_item_sink, &ls, &count, err);
+                    result = ctx != NULL
+                                 ? atlas_service_history(ctx, st->operands[0], st->operands[1],
+                                                         limit, history_item_sink, &ls, &count, err)
+                                 : atlas_service_history_remote(st->operands[0], st->operands[1],
+                                                                limit, history_item_sink, &ls,
+                                                                &count, err);
                 }
                 if (result == ATLAS_OK) {
                     result = r.v->list_end(&r, "change", "changes", count, err);
@@ -2525,7 +2608,10 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
             atlas_diff_report rep;
             atlas_diff_report_init(&rep);
             /* First pass gathers the report header and counts without rendering. */
-            result = atlas_service_diff(ctx, st->operands[0], &dopts, NULL, NULL, &rep, err);
+            result = ctx != NULL
+                         ? atlas_service_diff(ctx, st->operands[0], &dopts, NULL, NULL, &rep, err)
+                         : atlas_service_diff_remote(st->operands[0], &dopts, NULL, NULL, &rep,
+                                                     err);
             if (result == ATLAS_OK) {
                 result = renderer_open(&r, st->opts.json, st->out, "diff", err);
                 if (result == ATLAS_OK) {
@@ -2538,8 +2624,11 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
                     list_sink ls = {&r};
                     atlas_diff_report second;
                     atlas_diff_report_init(&second);
-                    result = atlas_service_diff(ctx, st->operands[0], &dopts, diff_item_sink, &ls,
-                                                &second, err);
+                    result = ctx != NULL
+                                 ? atlas_service_diff(ctx, st->operands[0], &dopts, diff_item_sink,
+                                                      &ls, &second, err)
+                                 : atlas_service_diff_remote(st->operands[0], &dopts,
+                                                             diff_item_sink, &ls, &second, err);
                     atlas_diff_report_free(&second);
                 }
                 if (result == ATLAS_OK) {

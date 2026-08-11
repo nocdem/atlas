@@ -118,6 +118,7 @@ set(ATLAS_TESTS
   test_orch_workspace
   test_orch_driver
   test_orch_snapshot
+  test_remote_equivalence
   test_migrate8
 )
 
@@ -222,6 +223,7 @@ set_tests_properties(test_orch_driver PROPERTIES LABELS "integration" TIMEOUT 30
 # The snapshot suite drives the daemon-side read against a fixture repository
 # and a fixture database: the worker never appears in it, which is the point.
 set_tests_properties(test_orch_snapshot PROPERTIES LABELS "integration" TIMEOUT 300)
+set_tests_properties(test_remote_equivalence PROPERTIES LABELS "daemon" TIMEOUT 300)
 target_compile_definitions(test_a7_authority PRIVATE ATLAS_SRC_DIR="${CMAKE_SOURCE_DIR}")
 # Migration 7 rebuilds a table, so its suite drives the storage layer and the
 # backup CLI against real databases. No daemon and no repository.

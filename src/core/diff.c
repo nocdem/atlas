@@ -477,22 +477,34 @@ static atlas_status diff_from_git(atlas_git *g, const atlas_diff_opts *opts,
     return st;
 }
 
+/* The observation itself, given a repository row.
+ *
+ * `diff` reads no index: it resolves the repository and then asks git. Split so
+ * the daemon-served form can supply the row over the socket and run exactly
+ * this, rather than a second implementation of the same observation — the same
+ * reason `atlas_service_status_observe_live` is split, and the reason A8's read
+ * surface needs no `repo.diff` method. */
+atlas_status atlas_service_diff_repo(const atlas_repo_info *info, const atlas_diff_opts *opts,
+                                     atlas_diff_entry_cb cb, void *ud, atlas_diff_report *report,
+                                     atlas_err *err) {
+    atlas_git *g = NULL;
+    atlas_status st = atlas_service_open_repo_git(info, &g, err);
+    if (st == ATLAS_OK) {
+        st = diff_from_git(g, opts, cb, ud, report, err);
+    }
+    atlas_git_close(g);
+    return st;
+}
+
 atlas_status atlas_service_diff(atlas_ctx *ctx, const char *name, const atlas_diff_opts *opts,
                                 atlas_diff_entry_cb cb, void *ud, atlas_diff_report *report,
                                 atlas_err *err) {
     atlas_repo_info info;
     atlas_repo_info_init(&info);
     atlas_status st = atlas_service_require_repo(ctx, name, &info, err);
-    if (st != ATLAS_OK) {
-        atlas_repo_info_free(&info);
-        return st;
-    }
-    atlas_git *g = NULL;
-    st = atlas_service_open_repo_git(&info, &g, err);
     if (st == ATLAS_OK) {
-        st = diff_from_git(g, opts, cb, ud, report, err);
+        st = atlas_service_diff_repo(&info, opts, cb, ud, report, err);
     }
-    atlas_git_close(g);
     atlas_repo_info_free(&info);
     return st;
 }

@@ -52,6 +52,38 @@ const char *atlas_gate_result_name(atlas_gate_result r) {
     return "BLOCKED";
 }
 
+bool atlas_gate_result_parse(const char *name, atlas_gate_result *out) {
+    *out = ATLAS_GATE_BLOCKED;
+    if (name == NULL) {
+        return false;
+    }
+    static const atlas_gate_result ALL[] = {ATLAS_GATE_BLOCKED, ATLAS_GATE_PASS,
+                                            ATLAS_GATE_REVIEW_REQUIRED};
+    for (size_t i = 0; i < sizeof ALL / sizeof ALL[0]; i++) {
+        if (strcmp(atlas_gate_result_name(ALL[i]), name) == 0) {
+            *out = ALL[i];
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The closed set of limit descriptions, which is every string assigned to
+ * `limit_detail` in `src/gate/assess.c`. Adding one there means adding it here,
+ * or a daemon will report a bound a client silently drops. */
+const char *atlas_gate_limit_detail_intern(const char *text) {
+    static const char *const ALL[] = {"structural traversal", "change range", "ancestry walk"};
+    if (text == NULL) {
+        return NULL;
+    }
+    for (size_t i = 0; i < sizeof ALL / sizeof ALL[0]; i++) {
+        if (strcmp(ALL[i], text) == 0) {
+            return ALL[i];
+        }
+    }
+    return NULL;
+}
+
 atlas_gate_result atlas_gate_fold(atlas_gate_result running, atlas_gate_freshness f) {
     /* BLOCKED absorbs. A query that has already failed to prove one thing does
      * not become safe by proving the next; the unproven one is still unproven,

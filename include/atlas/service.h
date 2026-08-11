@@ -835,4 +835,31 @@ atlas_status atlas_service_job_cancel(atlas_ctx *ctx, const char *job, atlas_job
  * start, not a loop that idles. */
 atlas_status atlas_service_dispatcher_run(bool once, FILE *log, atlas_err *err);
 
+/* --- A7.1: the remaining read commands, answered by the daemon --------------
+ *
+ * Declared here, at the end, because each one names a report type defined
+ * above. Every one fills the same struct its local twin fills and is called
+ * from the same CLI call site, so the renderers and the JSON contract are
+ * shared rather than reproduced. See `src/core/service_remote.c`. */
+atlas_status atlas_service_search_remote(const char *name, const char *query, int64_t limit,
+                                         atlas_search_mode *mode_out, atlas_search_cb cb, void *ud,
+                                         int64_t *count_out, atlas_err *err);
+atlas_status atlas_service_events_remote(const char *name, int64_t since, int64_t limit,
+                                         atlas_event_cb cb, void *ud, int64_t *count_out,
+                                         int64_t *next_cursor_out, bool *more_out, atlas_err *err);
+atlas_status atlas_service_sync_remote(const char *name, bool full, bool wait, int timeout_ms,
+                                       atlas_sync_report *out, atlas_err *err);
+atlas_status atlas_service_sync_wait_remote(const char *name, atlas_sync_report *out,
+                                            int timeout_ms, atlas_err *err);
+atlas_status atlas_service_daemon_status_remote(atlas_daemon_status_report *out, atlas_err *err);
+atlas_status atlas_service_code_status_remote(const char *name, atlas_code_status_report *out,
+                                              atlas_err *err);
+atlas_status atlas_service_decision_list_remote(const char *repo,
+                                                const atlas_decision_list_opts *opts,
+                                                atlas_decision_summary_cb cb, void *ud,
+                                                int64_t *count_out, bool *more_out,
+                                                atlas_decision_counts *counts_out, atlas_err *err);
+atlas_status atlas_service_gate_check_remote(const atlas_gate_query *q, atlas_gate_report *out,
+                                             atlas_err *err);
+
 #endif /* ATLAS_SERVICE_H */

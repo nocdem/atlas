@@ -685,5 +685,6 @@ bool atlas_code_index_current(const atlas_index_state *file_state,
  * reported, so a value from anywhere else becomes "other" rather than being
  * reproduced. */
 bool atlas_code_not_current_reason_is_known(const char *reason);
+const char *atlas_code_not_current_reason_intern(const char *reason);
 
 #endif /* ATLAS_CODE_H */

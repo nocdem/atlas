@@ -309,6 +309,56 @@ bool atlas_ipc_result_arr_obj_bool(const atlas_ipc_response *r, const char *arr_
     return true;
 }
 
+bool atlas_ipc_result_arr_len(const atlas_ipc_response *r, const char *arr_key, size_t *out) {
+    *out = 0;
+    if (r == NULL || r->result == NULL) {
+        return false;
+    }
+    yyjson_val *a = yyjson_obj_get(r->result, arr_key);
+    if (a == NULL || !yyjson_is_arr(a)) {
+        return false;
+    }
+    *out = yyjson_arr_size(a);
+    return true;
+}
+
+static yyjson_val *arr_obj_arr(const atlas_ipc_response *r, const char *arr_key, size_t index,
+                               const char *key) {
+    yyjson_val *o = arr_obj(r, arr_key, index);
+    if (o == NULL) {
+        return NULL;
+    }
+    yyjson_val *a = yyjson_obj_get(o, key);
+    return (a != NULL && yyjson_is_arr(a)) ? a : NULL;
+}
+
+bool atlas_ipc_result_arr_obj_arr_len(const atlas_ipc_response *r, const char *arr_key,
+                                      size_t index, const char *key, size_t *out) {
+    *out = 0;
+    yyjson_val *a = arr_obj_arr(r, arr_key, index, key);
+    if (a == NULL) {
+        return false;
+    }
+    *out = yyjson_arr_size(a);
+    return true;
+}
+
+bool atlas_ipc_result_arr_obj_arr_str(const atlas_ipc_response *r, const char *arr_key,
+                                      size_t index, const char *key, size_t sub_index,
+                                      const char **out) {
+    *out = NULL;
+    yyjson_val *a = arr_obj_arr(r, arr_key, index, key);
+    if (a == NULL) {
+        return false;
+    }
+    yyjson_val *v = yyjson_arr_get(a, sub_index);
+    if (v == NULL || !yyjson_is_str(v)) {
+        return false;
+    }
+    *out = yyjson_get_str(v);
+    return true;
+}
+
 bool atlas_ipc_result_int(const atlas_ipc_response *r, const char *key, int64_t *out) {
     *out = 0;
     if (r == NULL || r->result == NULL) {

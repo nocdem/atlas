@@ -1741,6 +1741,14 @@ static atlas_status emit_search_hit(const atlas_search_hit *hit, void *ud, atlas
     if (st == ATLAS_OK && hit->author_time > 0) {
         st = atlas_json_key_int(ds->j, "time", hit->author_time, err);
     }
+    /* Additive, for `atlas search` over the socket: both are display facts the
+     * listing already showed and neither had a reader on the wire. */
+    if (st == ATLAS_OK && strcmp(hit->kind, "file") == 0) {
+        st = atlas_json_key_bool(ds->j, "deleted", hit->deleted, err);
+    }
+    if (st == ATLAS_OK && hit->git_index_oid != NULL) {
+        st = atlas_json_key_str(ds->j, "git_index_oid", hit->git_index_oid, err);
+    }
     if (st == ATLAS_OK) {
         st = atlas_json_key_str(ds->j, "evidence", hit->evidence, err);
     }

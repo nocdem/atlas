@@ -132,6 +132,7 @@ add_library(atlas_core STATIC
   src/daemon/watch.c
   src/daemon/daemon.c
   src/core/service_daemon.c
+    src/core/service_remote.c
   # --- A2: AI session model, MCP adapter, hook adapter, integration ------
   src/db/db_ai.c
   src/ai/ai.c

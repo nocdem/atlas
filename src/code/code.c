@@ -109,6 +109,26 @@ bool atlas_code_why_is_known(const char *why) {
 #define WHY_FILE_STALE "the file index is not current, so the structural index cannot be either"
 #define WHY_ANALYZER "the structural index was produced by a different analyzer version"
 
+/* Resolves a reason back to the Atlas literal it must be, for a reader that
+ * received one over the socket: `not_current_reason` is a `const char *` into
+ * static storage everywhere else, so aliasing a response buffer about to be
+ * freed would leave a dangling pointer in a report. An unrecognised value
+ * becomes NULL rather than being reproduced. */
+const char *atlas_code_not_current_reason_intern(const char *reason) {
+    static const char *const REASONS[] = {
+        WHY_NO_PASS, WHY_OLDER, WHY_DEGRADED, WHY_FILE_STALE, WHY_ANALYZER, NULL,
+    };
+    if (reason == NULL || reason[0] == '\0') {
+        return NULL;
+    }
+    for (size_t i = 0; REASONS[i] != NULL; i++) {
+        if (strcmp(reason, REASONS[i]) == 0) {
+            return REASONS[i];
+        }
+    }
+    return NULL;
+}
+
 bool atlas_code_not_current_reason_is_known(const char *reason) {
     static const char *const REASONS[] = {
         WHY_NO_PASS, WHY_OLDER, WHY_DEGRADED, WHY_FILE_STALE, WHY_ANALYZER, NULL,

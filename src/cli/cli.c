@@ -858,7 +858,8 @@ static bool route_to_daemon(const cli_state *st) {
 }
 
 /* Sends one mutation to the daemon and renders its answer. */
-static atlas_status call_daemon_mutation(cli_state *st, const char *method, const char *params,
+static atlas_status call_daemon_mutation(cli_state *st, const char *repo, const char *method,
+                                         const char *params,
                                          const char *command, atlas_err *err) {
     atlas_buf sock = ATLAS_BUF_INIT;
     atlas_buf resp = ATLAS_BUF_INIT;
@@ -890,8 +891,14 @@ static atlas_status call_daemon_mutation(cli_state *st, const char *method, cons
         result = renderer_open(&r, st->opts.json, st->out, command, err);
         if (result == ATLAS_OK) {
             /* The daemon performed it; the renderer reports that plainly rather
-             * than pretending this process did the work. */
-            result = r.v->note_repo(&r, "", err);
+             * than pretending this process did the work.
+             *
+             * The repository is named. It used to be the empty string, which
+             * put `"repo":""` in the JSON document of a routed `atlas scan` —
+             * a field that looks answered and says nothing, and the one
+             * difference between the routed form of the command and the local
+             * one. */
+            result = r.v->note_repo(&r, repo != NULL ? repo : "", err);
         }
         if (result == ATLAS_OK) {
             result = renderer_close(&r, err);
@@ -1116,7 +1123,8 @@ static atlas_status run_gate(cli_state *st, atlas_ctx *ctx, atlas_renderer *r, a
         for (size_t i = 0; i < st->opts.decision.path_count; i++) {
             q.paths[q.path_count++] = st->opts.decision.paths[i];
         }
-        result = atlas_service_gate_check(ctx, &q, &rep, err);
+        result = ctx != NULL ? atlas_service_gate_check(ctx, &q, &rep, err)
+                             : atlas_service_gate_check_remote(&q, &rep, err);
     }
     if (result == ATLAS_OK) {
         result = renderer_open(r, st->opts.json, st->out, "gate", err);
@@ -1246,8 +1254,13 @@ static atlas_status run_decision(cli_state *st, atlas_ctx *ctx, atlas_renderer *
             result = r->v->list_begin(r, "decisions", err);
         }
         if (result == ATLAS_OK) {
-            result = atlas_service_decision_list(ctx, st->operands[1], &opts, on_decision_item, &dr,
-                                                 &counts, &count, &more, err);
+            result = ctx != NULL
+                         ? atlas_service_decision_list(ctx, st->operands[1], &opts,
+                                                       on_decision_item, &dr, &counts, &count,
+                                                       &more, err)
+                         : atlas_service_decision_list_remote(st->operands[1], &opts,
+                                                              on_decision_item, &dr, &count, &more,
+                                                              &counts, err);
         }
         if (result == ATLAS_OK) {
             result = r->v->list_end(r, "decision", "decisions", count, err);
@@ -1492,72 +1505,66 @@ static atlas_status run_decision(cli_state *st, atlas_ctx *ctx, atlas_renderer *
     return atlas_err_set(err, ATLAS_ERR_USAGE, "unknown decision subcommand \"%s\"", sub);
 }
 
-/* Every command, on an index this process does not own.
+/* Which commands this process can answer about an index it does not own.
  *
- * Two are answered by the daemon. The rest are refused with what is actually
- * true — the index belongs to another account and this command has no socket
- * path — rather than with SQLite's "unable to open database file", which
- * describes a permission the caller was never going to have and suggests
- * checking a file they cannot see.
+ * A7.1 puts the index behind a separate OS principal: `/var/lib/atlas` is 0700
+ * `atlasd`, and it has to stay that way because `atlas-worker` is a member of
+ * the client group and must not be able to read the index. So a client uid can
+ * never open that database, and every read has to be a question put to the
+ * daemon. This function decides only *whether* a command has such a path; the
+ * command itself then runs its normal code with `ctx == NULL`, calling the
+ * remote twin of its service function at the same call site, so both renderers
+ * and the JSON contract are shared rather than reproduced.
  *
- * There is no fallback to a local read anywhere here. A7.1's rule is that a
- * client which cannot reach the daemon fails rather than quietly answering from
- * the pre-cutover per-user database, and a fallback would be exactly that. */
-static atlas_status run_remote(cli_state *st, atlas_renderer *r, atlas_err *err) {
+ * A command with no path here is refused with what is actually true, rather
+ * than with SQLite's "unable to open database file" — which describes a
+ * permission the caller was never going to have and points at a file they
+ * cannot see. There is no fallback to a local read anywhere: A7.1's rule is
+ * that a client which cannot reach the daemon fails, rather than quietly
+ * answering from the pre-cutover per-user database. */
+static bool remote_serves(const cli_state *st) {
     const char *cmd = st->command;
-    atlas_status result;
+    const char *sub = st->operand_count > 0 ? st->operands[0] : "";
 
-    if (strcmp(cmd, "repo") == 0 && st->operand_count == 1u &&
-        strcmp(st->operands[0], "list") == 0) {
-        result = renderer_open(r, st->opts.json, st->out, "repo list", err);
-        if (result != ATLAS_OK) {
-            return result;
-        }
-        list_sink ls = {r};
-        int64_t count = 0;
-        result = r->v->list_begin(r, "repositories", err);
-        if (result == ATLAS_OK) {
-            result = atlas_service_repo_list_remote(repo_item_sink, &ls, &count, err);
-        }
-        if (result == ATLAS_OK) {
-            result = r->v->list_end(r, "repository", "repositories", count, err);
-        }
-        if (result == ATLAS_OK) {
-            result = renderer_close(r, err);
-        } else {
-            renderer_abort(r);
-        }
-        return result;
+    /* `doctor` needs no path: it opens in INSPECT mode, creates nothing, and
+     * reporting an index it cannot read is the correct answer and the reason
+     * somebody runs it. */
+    if (strcmp(cmd, "doctor") == 0) {
+        return true;
     }
-
-    if (strcmp(cmd, "status") == 0) {
-        result = need_operands(st, 1, "status NAME", err);
-        if (result != ATLAS_OK) {
-            return result;
-        }
-        atlas_status_report rep;
-        atlas_status_report_init(&rep);
-        result = atlas_service_status_remote(st->operands[0], &rep, err);
-        if (result == ATLAS_OK) {
-            result = renderer_open(r, st->opts.json, st->out, "status", err);
-            if (result == ATLAS_OK) {
-                result = r->v->note_repo(r, st->operands[0], err);
-            }
-            if (result == ATLAS_OK) {
-                result = r->v->status(r, &rep, err);
-            }
-            if (result == ATLAS_OK) {
-                result = renderer_close(r, err);
-            } else {
-                renderer_abort(r);
-            }
-        }
-        atlas_status_report_free(&rep);
-        return result;
+    if (strcmp(cmd, "status") == 0 || strcmp(cmd, "search") == 0 ||
+        strcmp(cmd, "events") == 0 || strcmp(cmd, "sync") == 0) {
+        return true;
     }
+    /* Keyed on the subcommand, not the command. `code file`, `decision get`,
+     * `gate show` and their neighbours have no remote path yet, and reaching
+     * their handlers with a NULL context would dereference it. */
+    if (strcmp(cmd, "repo") == 0) {
+        return strcmp(sub, "list") == 0;
+    }
+    if (strcmp(cmd, "daemon") == 0) {
+        return strcmp(sub, "status") == 0;
+    }
+    if (strcmp(cmd, "code") == 0) {
+        return strcmp(sub, "status") == 0;
+    }
+    if (strcmp(cmd, "gate") == 0) {
+        return strcmp(sub, "check") == 0;
+    }
+    if (strcmp(cmd, "decision") == 0) {
+        /* All three listings, because they are one call site differing only in
+         * a predicate the daemon already accepts — `decision.list` takes a
+         * `query` or a `path`. Routing one and refusing its two siblings would
+         * be an arbitrary line through a single function. */
+        return strcmp(sub, "list") == 0 || strcmp(sub, "search") == 0 ||
+               strcmp(sub, "for-file") == 0;
+    }
+    return false;
+}
 
+static atlas_status remote_refuse(const cli_state *st, atlas_err *err) {
     /* A write against somebody else's index is not a permissions problem to be
-     * reported from deep inside a chmod; it is a thing this account does not do.
+     * reported from inside a chmod; it is a thing this account does not do.
      * Registration and scanning under a system deployment are the operator
      * ceremony in docs/security/A7_1_OPERATIONS.md. */
     if (mode_for(st) == ATLAS_CTX_WRITE) {
@@ -1567,13 +1574,14 @@ static atlas_status run_remote(cli_state *st, atlas_renderer *r, atlas_err *err)
                              "operations performed as the service account; see "
                              "docs/security/A7_1_OPERATIONS.md.");
     }
-
     return atlas_err_set(err, ATLAS_ERR_CONFIG,
                          "the system index is owned by the Atlas service account and cannot be "
-                         "read directly. `atlas %s` is not yet served over the daemon socket; "
-                         "`repo list`, `status NAME`, `daemon ping`, `doctor` and the `job` "
-                         "commands are.",
-                         cmd);
+                         "read directly, and `atlas %s%s%s` has no daemon-served form yet. "
+                         "`status`, `search`, `events`, `sync`, `repo list`, `code status`, "
+                         "`gate check`, `decision list`, `daemon status`, `doctor` and the `job` "
+                         "commands do.",
+                         st->command, st->operand_count > 0 ? " " : "",
+                         st->operand_count > 0 ? st->operands[0] : "");
 }
 
 static atlas_status run_code(cli_state *st, atlas_ctx *ctx, atlas_renderer *r, int64_t limit,
@@ -1591,7 +1599,8 @@ static atlas_status run_code(cli_state *st, atlas_ctx *ctx, atlas_renderer *r, i
         }
         atlas_code_status_report rep;
         atlas_code_status_report_init(&rep);
-        result = atlas_service_code_status(ctx, st->operands[1], &rep, err);
+        result = ctx != NULL ? atlas_service_code_status(ctx, st->operands[1], &rep, err)
+                             : atlas_service_code_status_remote(st->operands[1], &rep, err);
         if (result == ATLAS_OK) {
             result = renderer_open(r, st->opts.json, st->out, "code status", err);
             if (result == ATLAS_OK) {
@@ -1994,7 +2003,8 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
                                         st->operands[0]);
             }
             if (vst == ATLAS_OK) {
-                vst = call_daemon_mutation(st, "repo.sync", atlas_buf_cstr(&params), "scan", err);
+                vst = call_daemon_mutation(st, st->operands[0], "repo.sync",
+                                           atlas_buf_cstr(&params), "scan", err);
             }
             atlas_buf_free(&params);
             return vst;
@@ -2207,36 +2217,36 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
     /* **A7.1: an index this process does not own is reached over the socket, or
      * not at all.**
      *
-     * `/var/lib/atlas` is 0700 `atlasd` and has to stay that way — `atlas-worker`
-     * is a member of the client group, and A7.1's guarantee is that it cannot
-     * read the index. So a client uid can never open that database, and a
-     * command that wants a fact has to ask the daemon for it. Decided here,
-     * before any context is opened, for the reason the `job` and `maintenance`
-     * commands are dispatched here: opening a context would try to prepare a
-     * directory this process has no business preparing, and the first thing the
-     * user would see is a chmod failure rather than an answer.
+     * Decided here, before any context is opened, for the reason the `job` and
+     * `maintenance` commands are dispatched here: opening a context would try
+     * to prepare a directory this process has no business preparing, and the
+     * first thing the user would see is a chmod failure rather than an answer.
+     * A served command then runs with `ctx == NULL` and takes the remote branch
+     * at its own call site.
      *
-     * Deliberately keyed on the *source* plus ownership rather than on the path:
-     * an explicit `--data-dir` or `ATLAS_DATA_DIR` still means exactly what it
-     * says, so fixtures, tests and per-user daemons behave as they always did on
-     * a machine that happens to carry a system policy. */
+     * Deliberately keyed on the data directory's *source* plus its ownership
+     * rather than on the path: an explicit `--data-dir` or `ATLAS_DATA_DIR`
+     * still means exactly what it says, so fixtures, tests and per-user daemons
+     * behave as they always did on a machine that carries a system policy. */
+    bool remote = false;
     {
         atlas_buf resolved = ATLAS_BUF_INIT;
         atlas_datadir_source src = ATLAS_DATADIR_OVERRIDE;
         atlas_err rerr;
         atlas_err_init(&rerr);
-        bool foreign = false;
         if (atlas_datadir_resolve(st->opts.data_dir, &resolved, &src, &rerr) == ATLAS_OK) {
-            foreign = atlas_datadir_is_foreign(atlas_buf_cstr(&resolved), src);
+            remote = atlas_datadir_is_foreign(atlas_buf_cstr(&resolved), src);
         }
         atlas_buf_free(&resolved);
-        /* `doctor` is exempt and must stay so. It opens in INSPECT mode, which
-         * creates nothing and takes no lock, and reports an index it cannot
-         * read as a finding — the right answer about somebody else's index, and
-         * exactly what somebody runs when a client cannot reach the daemon. */
-        if (foreign && strcmp(cmd, "doctor") != 0) {
-            return run_remote(st, &r, err);
-        }
+    }
+    if (remote && !remote_serves(st)) {
+        return remote_refuse(st, err);
+    }
+    /* `doctor` is the one served command that still opens a context: INSPECT
+     * creates nothing, takes no lock, and an index it cannot read is a finding
+     * rather than a failure. */
+    if (remote && strcmp(cmd, "doctor") == 0) {
+        remote = false;
     }
 
     atlas_ctx_opts copts;
@@ -2244,9 +2254,11 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
     copts.data_dir_override = st->opts.data_dir;
     copts.mode = mode_for(st);
     atlas_ctx *ctx = NULL;
-    s = atlas_ctx_open(&copts, &ctx, err);
-    if (s != ATLAS_OK) {
-        return s;
+    if (!remote) {
+        s = atlas_ctx_open(&copts, &ctx, err);
+        if (s != ATLAS_OK) {
+            return s;
+        }
     }
 
     int64_t limit = st->opts.limit > 0 ? st->opts.limit : ATLAS_DEFAULT_LIMIT;
@@ -2311,7 +2323,11 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
                     int64_t count = 0;
                     result = r.v->list_begin(&r, "repositories", err);
                     if (result == ATLAS_OK) {
-                        result = atlas_service_repo_list(ctx, repo_item_sink, &ls, &count, err);
+                        result = ctx != NULL
+                                     ? atlas_service_repo_list(ctx, repo_item_sink, &ls, &count,
+                                                               err)
+                                     : atlas_service_repo_list_remote(repo_item_sink, &ls, &count,
+                                                                      err);
                     }
                     if (result == ATLAS_OK) {
                         result = r.v->list_end(&r, "repository", "repositories", count, err);
@@ -2379,7 +2395,8 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
         if (result == ATLAS_OK) {
             atlas_status_report rep;
             atlas_status_report_init(&rep);
-            result = atlas_service_status(ctx, st->operands[0], &rep, err);
+            result = ctx != NULL ? atlas_service_status(ctx, st->operands[0], &rep, err)
+                                 : atlas_service_status_remote(st->operands[0], &rep, err);
             if (result == ATLAS_OK) {
                 result = renderer_open(&r, st->opts.json, st->out, "status", err);
                 if (result == ATLAS_OK) {
@@ -2400,10 +2417,22 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
         result = need_operands(st, 2, "search NAME QUERY", err);
         if (result == ATLAS_OK) {
             /* The search mode is needed before any result is printed, so it is
-             * resolved from the database capabilities first. */
-            atlas_search_mode mode = atlas_db_caps_of(atlas_ctx_db(ctx))->fts5
-                                         ? ATLAS_SEARCH_FTS5
-                                         : ATLAS_SEARCH_DEGRADED_LIKE;
+             * resolved from the database capabilities first.
+             *
+             * There is no database here when the index belongs to the daemon,
+             * and no way to guess: claiming FTS5 against an index that has none
+             * would put a wrong mode in the header of a correct result. The
+             * remote path therefore performs the call first and takes the mode
+             * from the answer, buffering the hits; the ordering differs, the
+             * rendering does not. */
+            atlas_search_mode mode = ATLAS_SEARCH_DEGRADED_LIKE;
+            if (ctx != NULL) {
+                mode = atlas_db_caps_of(atlas_ctx_db(ctx))->fts5 ? ATLAS_SEARCH_FTS5
+                                                                 : ATLAS_SEARCH_DEGRADED_LIKE;
+            } else {
+                result = atlas_service_search_remote(st->operands[0], st->operands[1], limit, &mode,
+                                                     NULL, NULL, &(int64_t){0}, err);
+            }
             result = renderer_open(&r, st->opts.json, st->out, "search", err);
             if (result == ATLAS_OK) {
                 result = r.v->note_repo(&r, st->operands[0], err);
@@ -2416,8 +2445,13 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
                 int64_t count = 0;
                 result = r.v->list_begin(&r, "results", err);
                 if (result == ATLAS_OK) {
-                    result = atlas_service_search(ctx, st->operands[0], st->operands[1], limit,
-                                                  &mode, search_item_sink, &ls, &count, err);
+                    result = ctx != NULL
+                                 ? atlas_service_search(ctx, st->operands[0], st->operands[1],
+                                                        limit, &mode, search_item_sink, &ls,
+                                                        &count, err)
+                                 : atlas_service_search_remote(st->operands[0], st->operands[1],
+                                                               limit, &mode, search_item_sink, &ls,
+                                                               &count, err);
                 }
                 if (result == ATLAS_OK) {
                     result = r.v->list_end(&r, "result", "results", count, err);
@@ -2525,7 +2559,8 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
         } else {
             atlas_daemon_status_report rep;
             atlas_daemon_status_report_init(&rep);
-            result = atlas_service_daemon_status(ctx, &rep, err);
+            result = ctx != NULL ? atlas_service_daemon_status(ctx, &rep, err)
+                                 : atlas_service_daemon_status_remote(&rep, err);
             if (result == ATLAS_OK) {
                 result = renderer_open(&r, st->opts.json, st->out, "daemon status", err);
                 if (result == ATLAS_OK) {
@@ -2544,8 +2579,11 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
         if (result == ATLAS_OK) {
             atlas_sync_report rep;
             atlas_sync_report_init(&rep);
-            result = atlas_service_sync(ctx, st->operands[0], st->opts.full, st->opts.wait,
-                                        st->opts.timeout_ms, &rep, err);
+            result = ctx != NULL
+                         ? atlas_service_sync(ctx, st->operands[0], st->opts.full, st->opts.wait,
+                                              st->opts.timeout_ms, &rep, err)
+                         : atlas_service_sync_remote(st->operands[0], st->opts.full, st->opts.wait,
+                                                     st->opts.timeout_ms, &rep, err);
             if (result == ATLAS_OK) {
                 result = renderer_open(&r, st->opts.json, st->out, "sync", err);
                 if (result == ATLAS_OK) {
@@ -2570,7 +2608,8 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
              * index or one with a known hole in it. */
             atlas_repo_state_report state;
             atlas_repo_state_report_init(&state);
-            result = atlas_service_repo_state(ctx, st->operands[0], &state, err);
+            result = ctx != NULL ? atlas_service_repo_state(ctx, st->operands[0], &state, err)
+                                 : atlas_service_repo_state_remote(st->operands[0], &state, err);
             if (result == ATLAS_OK) {
                 result = renderer_open(&r, st->opts.json, st->out, "events", err);
             }
@@ -2587,8 +2626,13 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
                 bool more = false;
                 result = r.v->list_begin(&r, "events", err);
                 if (result == ATLAS_OK) {
-                    result = atlas_service_events(ctx, st->operands[0], st->opts.since, limit,
-                                                  event_item_sink, &ls, &count, &next, &more, err);
+                    result = ctx != NULL
+                                 ? atlas_service_events(ctx, st->operands[0], st->opts.since, limit,
+                                                        event_item_sink, &ls, &count, &next, &more,
+                                                        err)
+                                 : atlas_service_events_remote(st->operands[0], st->opts.since,
+                                                               limit, event_item_sink, &ls, &count,
+                                                               &next, &more, err);
                 }
                 if (result == ATLAS_OK) {
                     result = r.v->list_end(&r, "event", "events", count, err);

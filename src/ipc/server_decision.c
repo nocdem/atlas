@@ -1329,6 +1329,21 @@ static atlas_status method_gate_check(dispatch_state *ds, const atlas_ipc_reques
     if (st == ATLAS_OK) {
         st = atlas_json_key_bool(ds->j, "limit_reached", rep.limit_reached, err);
     }
+    /* Additive, so `atlas gate check` can be answered over the socket by a
+     * client that cannot open the index. Everything here was already in the
+     * report and simply had no reader on the wire. */
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "out_of_scope", rep.out_of_scope, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "depth", rep.depth, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "root", atlas_buf_cstr(&rep.root_text), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str_opt(ds->j, "limit_detail", rep.limit_detail, err);
+    }
     if (st == ATLAS_OK) {
         st = atlas_json_key(ds->j, "decisions", err);
     }
@@ -1377,6 +1392,36 @@ static atlas_status method_gate_check(dispatch_state *ds, const atlas_ipc_reques
         }
         if (st == ATLAS_OK) {
             st = atlas_json_key_bool(ds->j, "limit_reached", a->limit_reached, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str_opt(ds->j, "limit_detail", a->limit_detail, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(ds->j, "evidence_digest", a->evidence_digest, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_bool(ds->j, "validated_by_revalidation",
+                                     a->validated_by_revalidation, err);
+        }
+        {
+            const struct {
+                const char *k;
+                int64_t v;
+            } counters[] = {
+                {"links_total", a->links_total},
+                {"links_current", a->links_current},
+                {"links_changed", a->links_changed},
+                {"links_missing", a->links_missing},
+                {"links_ambiguous", a->links_ambiguous},
+                {"links_unknown", a->links_unknown},
+                {"range_commits", a->range_commits},
+                {"range_paths", a->range_paths},
+                {"walk_visited", a->walk_visited},
+                {"walk_matched", a->walk_matched},
+            };
+            for (size_t c = 0; st == ATLAS_OK && c < sizeof counters / sizeof counters[0]; c++) {
+                st = atlas_json_key_int(ds->j, counters[c].k, counters[c].v, err);
+            }
         }
         if (st == ATLAS_OK) {
             st = atlas_json_obj_end(ds->j, err);

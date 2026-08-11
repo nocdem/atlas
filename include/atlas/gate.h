@@ -101,6 +101,17 @@ typedef enum atlas_gate_result {
 } atlas_gate_result;
 
 const char *atlas_gate_result_name(atlas_gate_result r);
+/* The inverse. False for a name outside the vocabulary, leaving `*out` at
+ * BLOCKED — the fail-closed value, for the reason BLOCKED is zero. */
+bool atlas_gate_result_parse(const char *name, atlas_gate_result *out);
+/* Resolves a limit description back to the Atlas literal it must be.
+ *
+ * `limit_detail` is a `const char *` into static storage everywhere else in
+ * Atlas, so a reader that received one over the socket resolves it rather than
+ * aliasing a buffer it does not own. A value outside the closed set is dropped
+ * rather than reproduced: every one of them is written in `src/gate/assess.c`,
+ * so an unknown one means the two ends disagree about the vocabulary. */
+const char *atlas_gate_limit_detail_intern(const char *text);
 /* Folds one assessment into a running result. The mapping is a function rather
  * than prose in a comment, for the reason `atlas_decision_transition_allowed`
  * is: the tests ask this, so they cannot pass by agreeing with a second copy of

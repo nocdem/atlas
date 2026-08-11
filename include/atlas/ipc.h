@@ -291,6 +291,16 @@ bool atlas_ipc_result_arr_obj_str(const atlas_ipc_response *r, const char *arr_k
                                   const char *key, const char **out);
 bool atlas_ipc_result_arr_obj_bool(const atlas_ipc_response *r, const char *arr_key, size_t index,
                                    const char *key, bool *out);
+/* How many elements a top-level array has, and how many an array *inside* one
+ * of its objects has. A reader that walked until a key was absent could not
+ * tell an empty array from a missing one, and for a reason list those mean
+ * different things. */
+bool atlas_ipc_result_arr_len(const atlas_ipc_response *r, const char *arr_key, size_t *out);
+bool atlas_ipc_result_arr_obj_arr_len(const atlas_ipc_response *r, const char *arr_key,
+                                      size_t index, const char *key, size_t *out);
+bool atlas_ipc_result_arr_obj_arr_str(const atlas_ipc_response *r, const char *arr_key,
+                                      size_t index, const char *key, size_t sub_index,
+                                      const char **out);
 bool atlas_ipc_result_arr_obj_int(const atlas_ipc_response *r, const char *arr_key, size_t index,
                                   const char *key, int64_t *out);
 

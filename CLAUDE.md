@@ -854,14 +854,40 @@ authority state is inspected, never set, and never over a socket.
   question whose answer the caller can supply. Ordering it first also means a
   locked profile never reports on the shape of a request it was not going to
   perform.
-- **No RPC method, MCP tool, hook or plugin command mints or spends a lifecycle
-  capability, or changes the registry.** `decision.challenge`, `decision.approve`,
-  `decision.reject`, `decision.supersede`, `decision.revalidate`, `repo.add`,
-  `repo.ensure` and `repo.remove` were **deleted**, not left refusing — an absent
-  method is answered by the dispatcher's unknown-method case, and a refusing one
-  is a refusal a later edit can weaken. `tests/test_a7_authority.c` asks a live
-  daemon for 34 names, including case variants and aliases, and requires every
+- **No MCP tool, hook or plugin command mints or spends a lifecycle capability,
+  and no RPC method changes the registry.** `repo.add`, `repo.ensure` and
+  `repo.remove` were **deleted**, not left refusing — an absent method is
+  answered by the dispatcher's unknown-method case, and a refusing one is a
+  refusal a later edit can weaken. `tests/test_a7_authority.c` asks a live
+  daemon for the names, including case variants and aliases, and requires every
   one to answer `unknown method` rather than merely to fail.
+
+  **The five operator-channel methods are the one deliberate reversal, and it
+  must be described as one.** `decision.challenge`, `decision.approve`,
+  `decision.reject`, `decision.supersede` and `decision.revalidate` were deleted
+  by A7 and are back, in a group offered only to the peer whose `SO_PEERCRED`
+  uid equals the `operator_uid` in the root-owned policy — checked by the same
+  probe the local path runs, so a policy that is missing, symlinked,
+  group-writable or not root-owned, or a daemon running from a replaceable
+  binary, locks the group exactly as it locks the local channel. Every other
+  peer gets `unknown method`.
+
+  A7's defect was not that the methods existed: it was that `decision.challenge`
+  took no capability and asked for no terminal — it *was* the capability source
+  — so any process able to open the socket could mint one. The identity now
+  comes from the kernel and the constraint from a root-owned file, and a uid
+  written into a request reaches the decision at no point.
+
+  What this bought and what it cost, both stated: the deployment's human
+  operator is a different uid from the account that owns the index, and giving
+  that account the index was not acceptable, so the choice was between an
+  operator who cannot approve and an operator the kernel identifies over the
+  socket. **It does not distinguish a person from a program running as that
+  uid.** Nothing can — `tests/test_decision_operator.c` has demonstrated that
+  since A4 by allocating a pty and typing into it. A model with a shell as the
+  operator's account reaches these methods exactly as a human does; that it must
+  not is an orchestration rule, not something the kernel enforces here. Every
+  honesty limit A4 states about `LOCAL_OPERATOR_CONFIRMED` holds word for word.
 - **Nothing registers a repository except an operator.** Already-registered
   repositories are discovered and attached; an unknown directory is reported and
   left alone. Never restore auto-registration to a hook, an MCP root grant or a

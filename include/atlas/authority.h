@@ -167,6 +167,17 @@ const char *atlas_authority_reason_explain(atlas_authority_reason r);
  * the whole vulnerability. */
 void atlas_authority_probe(atlas_authority *out);
 
+/* The same probe about a peer's uid rather than this process's.
+ *
+ * The daemon runs as its own service account, so `getuid()` there answers a
+ * question nobody asked. `peer_uid` must come from `SO_PEERCRED` — the kernel
+ * fills it, and it is the only identity on the socket Atlas trusts. Passing a
+ * uid taken from a request body would make a client the author of its own
+ * authority, which is the defect A7 was written to remove. */
+void atlas_authority_probe_peer(long long peer_uid, atlas_authority *out);
+void atlas_authority_probe_peer_at(const char *policy_path, const char *exe_path,
+                                   long long peer_uid, atlas_authority *out);
+
 /* The same probe against an explicit policy path and executable path, so the
  * decision procedure can be tested against real filesystem shapes rather than
  * against a description of them.

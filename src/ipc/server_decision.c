@@ -1576,6 +1576,248 @@ static atlas_status method_legacy(dispatch_state *ds, const atlas_ipc_request *r
     return st;
 }
 
+/* --- the operator channel --------------------------------------------------------
+ *
+ * **These five were deleted by A7, and are restored here in a disjoint group
+ * that only the operator peer can reach.** The A7 defect was not that they
+ * existed: it was that `decision.challenge` took no capability and asked for no
+ * terminal — it *was* the capability source — so any process able to open the
+ * socket could mint a token, spend it, and produce a record whose stored actor
+ * was `LOCAL_OPERATOR_CONFIRMED` about a channel nothing had been through. The
+ * terminal check lived in the CLI's own helper, and a check a client performs
+ * on itself is not a boundary.
+ *
+ * What makes this different is where the identity comes from. The group is
+ * offered only to a peer whose `SO_PEERCRED` uid equals the `operator_uid` in
+ * the root-owned policy, checked by the same probe the local path uses —
+ * root-anchored path, root ownership, root-owned executable, and the uid.
+ * Every other peer gets `unknown method`, which is what a name that does not
+ * exist gets. A uid written into a request never reaches this decision.
+ *
+ * **What this does not do, stated plainly:** it does not distinguish a person
+ * from a program running as the operator's account. Nothing can. An AI agent
+ * with a shell as that uid reaches these methods exactly as a human does; the
+ * terminal prompt is a UX confirmation that the right revision is being acted
+ * on, and it is not a security boundary. The rule that a model must not approve
+ * anything is an orchestration rule, not something the kernel enforces here.
+ * `LOCAL_OPERATOR_CONFIRMED` continues to identify the channel and not a
+ * person, and every honesty limit A4 states about it still holds word for word.
+ *
+ * Why restore them at all: the alternative was to leave the lifecycle reachable
+ * only by the account that owns the index, and that account is the daemon's.
+ * The deployment's human operator is a different uid and must not be given the
+ * index — so the choice was between an operator who cannot approve and an
+ * operator identified by the kernel over the socket. This is the second.
+ */
+static atlas_status method_challenge(dispatch_state *ds, const atlas_ipc_request *req,
+                                     atlas_err *err) {
+    atlas_decision_op *op = op_new(ATLAS_DECISION_OP_CHALLENGE);
+    if (op == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory");
+    }
+    atlas_status st = take_where(req, op, err);
+    if (st == ATLAS_OK) {
+        st = take_uid(req, "decision", true, &op->uid, err);
+    }
+    if (st == ATLAS_OK) {
+        st = take_uid(req, "replacement", false, &op->replacement_uid, err);
+    }
+    if (st == ATLAS_OK) {
+        /* A6. The assessment the caller displayed, carried into the capability
+         * so the eventual record preserves what was shown rather than what a
+         * later recomputation would produce. Both are checked against their
+         * closed vocabularies at the write point: a request is not the
+         * authority on what an A6 reason code is. */
+        const char *fresh = NULL;
+        if (atlas_ipc_param_str(req, "prior_freshness", &fresh) && fresh != NULL) {
+            st = atlas_buf_set_str(&op->prior_freshness, fresh, err);
+        }
+        const char *reasons = NULL;
+        if (st == ATLAS_OK && atlas_ipc_param_str(req, "prior_reasons", &reasons) &&
+            reasons != NULL) {
+            st = atlas_buf_set_str(&op->prior_reasons, reasons, err);
+        }
+    }
+    if (st == ATLAS_OK) {
+        (void)atlas_ipc_param_int(req, "revision", &op->expect_revision_no);
+        const char *intent = NULL;
+        op->intent = ATLAS_DECISION_INTENT_APPROVE;
+        if (atlas_ipc_param_str(req, "intent", &intent) && intent != NULL) {
+            /* Parsed against the closed vocabulary, with no default: an
+             * unrecognised intent must not become "approve". */
+            if (!atlas_decision_intent_parse(intent, &op->intent)) {
+                st = atlas_err_set(err, ATLAS_ERR_USAGE,
+                                   "\"intent\" is approve, reject, supersede or revalidate");
+            }
+        }
+    }
+    if (st != ATLAS_OK) {
+        atlas_decision_op_free(op);
+        free(op);
+        return st;
+    }
+    atlas_decision_result result;
+    atlas_decision_result_init(&result);
+    st = submit(ds, op, &result, err);
+    if (st == ATLAS_OK) {
+        st = write_result(ds, &result, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "token", atlas_buf_cstr(&result.token), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "confirm", result.confirm, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "expires_at", result.expires_at, err);
+    }
+    if (st == ATLAS_OK) {
+        /* The title is model- or operator-authored prose. It is displayed to
+         * the operator so they can see what they are confirming, and it is
+         * encoded on the way out like every other untrusted value. */
+        st = atlas_json_key_str(ds->j, "title", atlas_safe(&ds->safe, atlas_buf_cstr(&result.title)),
+                                err);
+    }
+    atlas_decision_result_free(&result);
+    return st;
+}
+
+/* Approve, reject and supersede. One function, because they differ only in the
+ * operation kind and the intent the capability must carry — and three copies of
+ * a capability check is three places for one of them to be weaker. */
+static atlas_status spend_method(dispatch_state *ds, const atlas_ipc_request *req,
+                                 atlas_decision_op_kind kind, atlas_err *err) {
+    atlas_decision_op *op = op_new(kind);
+    if (op == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory");
+    }
+    atlas_status st = take_where(req, op, err);
+    if (st == ATLAS_OK) {
+        st = take_uid(req, "decision", true, &op->uid, err);
+    }
+    /* `token` and `confirmation` are read here and in no other method, which is
+     * what makes "a proposal cannot carry an approval" a property of the
+     * parameter surface rather than of a check. */
+    const char *v = NULL;
+    if (st == ATLAS_OK) {
+        if (!atlas_ipc_param_str(req, "token", &v) || v == NULL || v[0] == '\0') {
+            st = atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                               "this operation needs an approval challenge issued by "
+                               "decision.challenge");
+        } else if (strlen(v) != ATLAS_DECISION_CHALLENGE_HEX) {
+            st = atlas_err_set(err, ATLAS_ERR_INTEGRITY, "that is not an Atlas approval challenge");
+        } else {
+            st = atlas_buf_set_str(&op->token, v, err);
+        }
+    }
+    if (st == ATLAS_OK) {
+        if (!atlas_ipc_param_str(req, "confirmation", &v) || v == NULL) {
+            st = atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                               "this operation needs the confirmation shown at the prompt");
+        } else if (strlen(v) > ATLAS_DECISION_CONFIRM_MAX - 1u) {
+            st = atlas_err_set(err, ATLAS_ERR_INTEGRITY, "that confirmation is too long");
+        } else {
+            st = atlas_buf_set_str(&op->confirmation, v, err);
+        }
+    }
+    if (st != ATLAS_OK) {
+        atlas_decision_op_free(op);
+        free(op);
+        return st;
+    }
+    atlas_decision_result result;
+    atlas_decision_result_init(&result);
+    st = submit(ds, op, &result, err);
+    if (st == ATLAS_OK) {
+        st = write_result(ds, &result, err);
+    }
+    if (st == ATLAS_OK && result.superseded_revision_no > 0) {
+        st = atlas_json_key_int(ds->j, "superseded_revision", result.superseded_revision_no, err);
+    }
+    if (st == ATLAS_OK && result.replaced_by_uid.len > 0) {
+        st = atlas_json_key_str(ds->j, "replaced_by", atlas_buf_cstr(&result.replaced_by_uid), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "actor", "LOCAL_OPERATOR_CONFIRMED", err);
+    }
+    if (st == ATLAS_OK) {
+        /* Said in the response, not only in the documentation. A client that
+         * reads this cannot honestly report that Atlas identified a person. */
+        st = atlas_json_key_str(
+            ds->j, "actor_means",
+            "an explicit action arrived through Atlas' local operator channel. This does not "
+            "identify a person, does not prove a person was present, and is not a signature.",
+            err);
+    }
+    atlas_decision_result_free(&result);
+    return st;
+}
+
+static atlas_status method_approve(dispatch_state *ds, const atlas_ipc_request *req,
+                                   atlas_err *err) {
+    return spend_method(ds, req, ATLAS_DECISION_OP_APPROVE, err);
+}
+
+static atlas_status method_reject(dispatch_state *ds, const atlas_ipc_request *req,
+                                  atlas_err *err) {
+    return spend_method(ds, req, ATLAS_DECISION_OP_REJECT, err);
+}
+
+static atlas_status method_supersede(dispatch_state *ds, const atlas_ipc_request *req,
+                                     atlas_err *err) {
+    return spend_method(ds, req, ATLAS_DECISION_OP_SUPERSEDE, err);
+}
+
+/* A6. Spends a revalidation capability.
+ * It is here, beside approve and reject, because it is the same kind of thing:
+ * an operator action that a capability authorises, reachable over IPC and
+ * useless without one. Like them, it is **not** an AI-facing method — there is
+ * no MCP tool for it, no hook emits it, and a caller that has not been through
+ * the terminal has no token to send. Like them, the whole of what makes it safe
+ * is that `spend_challenge` refuses every request that does not carry a
+ * capability Atlas issued, to this revision, for this intent, unspent and
+ * unexpired.
+ * A6 adds two refusals on top of A4's, and both are in the write point rather
+ * than here: the indexed head must be the one the capability was issued
+ * against, and the evidence must still resolve to the digest it was issued
+ * against. */
+static atlas_status method_revalidate(dispatch_state *ds, const atlas_ipc_request *req,
+                                      atlas_err *err) {
+    return spend_method(ds, req, ATLAS_DECISION_OP_REVALIDATE, err);
+}
+
+/* The operator group. Disjoint from `DECISION_METHODS`, and reachable only from
+ * the peer the root-owned policy names — A8's two-group pattern, for A8's
+ * reason: a name in a group a peer is not in answers `unknown method`, the same
+ * as a name that does not exist, because a refusal that distinguished "you may
+ * not" from "there is no such thing" would tell a caller what to try next. */
+static const atlas_method_entry OPERATOR_METHODS[] = {
+    {"decision.challenge", method_challenge},
+    {"decision.approve", method_approve},
+    {"decision.reject", method_reject},
+    {"decision.supersede", method_supersede},
+    {"decision.revalidate", method_revalidate},
+};
+
+const atlas_method_entry *atlas_server_operator_methods(size_t *count_out) {
+    if (count_out != NULL) {
+        *count_out = sizeof(OPERATOR_METHODS) / sizeof(OPERATOR_METHODS[0]);
+    }
+    return OPERATOR_METHODS;
+}
+
+/* Whether this peer is the operator the root-owned policy names.
+ *
+ * `SO_PEERCRED` and nothing else. The probe is the one the local path runs, so
+ * a policy that is missing, symlinked, group-writable or not root-owned, or an
+ * executable a non-root uid could replace, locks this group exactly as it locks
+ * the local channel. */
+bool atlas_server_peer_is_operator(long long peer_uid) {
+    atlas_authority a;
+    atlas_authority_probe_peer(peer_uid, &a);
+    return a.state == ATLAS_AUTHORITY_GRANTED;
+}
+
 static const atlas_method_entry DECISION_METHODS[] = {
     {"decision.orphaned", method_orphaned},
     {"decision.legacy", method_legacy},

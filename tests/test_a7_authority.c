@@ -181,11 +181,24 @@ static void test_the_daemon_answers_to_no_authority_method(void) {
      *
      * Asked of the running process rather than of the source: a method table is
      * a claim about a file, and this is a claim about a daemon. */
-    static const char *const METHODS[] = {
-        /* A4's operator channel, removed in A7. */
+    /* **A4's operator channel is no longer in this list, and that is a
+     * deliberate reversal recorded here rather than a gap.**
+     *
+     * A7 deleted `decision.challenge/approve/reject/supersede/revalidate`
+     * because the challenge minted a capability for anyone who could open the
+     * socket. They are back, in a group offered only to the peer whose
+     * `SO_PEERCRED` uid equals the `operator_uid` in the root-owned policy — so
+     * the property this list asserted is still asserted, just about the right
+     * set of peers. `test_operator_peer.c` checks the grant itself, and the
+     * loop below checks these five names from a peer that is *not* the
+     * operator. Every other name here is unchanged: nothing else came back. */
+    static const char *const OPERATOR_METHODS[] = {
         "decision.challenge", "decision.approve", "decision.reject", "decision.supersede",
         "decision.revalidate",
-        /* Plausible aliases and case variants of the same thing. A dispatcher
+    };
+    static const char *const METHODS[] = {
+        /* Plausible aliases and case variants of the operator channel. A
+         * dispatcher
          * that matched loosely would answer one of these. */
         "decision.Approve", "DECISION.APPROVE", "decision.confirm", "decision.authorize",
         "decision.authorise", "decision.sign", "decision.validate", "decision.token",
@@ -224,6 +237,36 @@ static void test_the_daemon_answers_to_no_authority_method(void) {
          * which is precisely the state this test has to be able to fail on. */
         T_CHECK_MSG(strstr(body, "unknown method") != NULL,
                     "\"%s\" exists and refused rather than being absent: %s", METHODS[i], body);
+        atlas_buf_free(&resp);
+    }
+
+    /* The five that came back — and which this daemon must still refuse to
+     * offer, whoever is asking.
+     *
+     * A fixture daemon runs from the build tree, so its own executable is
+     * writable by the uid it constrains. That is the last of the four
+     * conditions in `atlas/authority.h`, and it fails here on purpose: a check
+     * running from a binary the constrained uid can replace reports whatever
+     * that uid last compiled. So the operator channel is locked for *every*
+     * peer of *this* daemon, including one the policy names, and the assertion
+     * is unconditional.
+     *
+     * The consequence is worth stating rather than leaving implicit: the
+     * positive half — the operator peer reaching these methods — is a property
+     * only a deployed, root-owned daemon can have, so it is verified against
+     * the deployment and not here. `test_operator_peer.c` pins the decision
+     * procedure itself, which is the part that can be tested in isolation. */
+    for (size_t i = 0; i < sizeof OPERATOR_METHODS / sizeof OPERATOR_METHODS[0]; i++) {
+        atlas_buf resp = ATLAS_BUF_INIT;
+        atlas_err e2;
+        atlas_err_init(&e2);
+        (void)atlas_ipc_call(atlas_buf_cstr(&d.socket), OPERATOR_METHODS[i], "{}", &resp, &e2);
+        const char *body = atlas_buf_cstr(&resp);
+        T_CHECK_MSG(strstr(body, "\"ok\":true") == NULL, "the daemon accepted \"%s\": %s",
+                    OPERATOR_METHODS[i], body);
+        T_CHECK_MSG(strstr(body, "unknown method") != NULL,
+                    "\"%s\" was offered by a daemon running from a replaceable binary: %s",
+                    OPERATOR_METHODS[i], body);
         atlas_buf_free(&resp);
     }
 

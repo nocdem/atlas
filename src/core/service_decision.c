@@ -1040,7 +1040,12 @@ static atlas_status result_from_response(const atlas_ipc_response *r, atlas_deci
 static atlas_status apply_op(atlas_ctx *ctx, atlas_decision_op *op, atlas_decision_result *res,
                              bool *via_daemon_out, atlas_err *err) {
     *via_daemon_out = false;
-    if (atlas_ctx_is_writer(ctx)) {
+    /* A7.1: no context at all means the index belongs to the daemon's account
+     * and this process cannot open it. There is nothing to be the writer of and
+     * no data directory to compare, so the socket is the only path — and the
+     * check below about *which* index a daemon owns is answered by there being
+     * exactly one the policy names. */
+    if (ctx != NULL && atlas_ctx_is_writer(ctx)) {
         atlas_status st = atlas_decision_apply(atlas_ctx_db(ctx), op, res, err);
         atlas_decision_op_free(op);
         free(op);
@@ -1055,7 +1060,7 @@ static atlas_status apply_op(atlas_ctx *ctx, atlas_decision_op *op, atlas_decisi
     /* Owning this data directory, not merely answering: a daemon on another
      * index cannot apply this write, and asking it to would put the record in
      * the wrong place. */
-    if (st == ATLAS_OK && !atlas_ipc_daemon_owns(atlas_ctx_data_dir(ctx))) {
+    if (st == ATLAS_OK && ctx != NULL && !atlas_ipc_daemon_owns(atlas_ctx_data_dir(ctx))) {
         st = atlas_err_set(err, ATLAS_ERR_INTEGRITY,
                            "another Atlas writer owns this index and no daemon for it is answering "
                            "on the IPC socket. Start the daemon (systemctl --user start atlas) or "
@@ -1467,7 +1472,8 @@ atlas_status atlas_service_decision_confirm(atlas_ctx *ctx, const char *repo, co
     atlas_gate_report assessment;
     atlas_gate_report_init(&assessment);
     if (intent == ATLAS_DECISION_INTENT_REVALIDATE) {
-        st = atlas_service_gate_show(ctx, repo, uid, NULL, &assessment, err);
+        st = ctx != NULL ? atlas_service_gate_show(ctx, repo, uid, NULL, &assessment, err)
+                         : atlas_service_gate_show_remote(repo, uid, &assessment, err);
         if (st != ATLAS_OK) {
             atlas_gate_report_free(&assessment);
             atlas_terminal_close(t);
@@ -1527,7 +1533,8 @@ atlas_status atlas_service_decision_confirm(atlas_ctx *ctx, const char *repo, co
      * the capability is bound to rather than what is newest. */
     atlas_decision_document doc;
     atlas_decision_document_init(&doc);
-    st = atlas_service_decision_show(ctx, repo, uid, issued.revision_no, &doc, err);
+    st = ctx != NULL ? atlas_service_decision_show(ctx, repo, uid, issued.revision_no, &doc, err)
+                     : atlas_service_decision_show_remote(repo, uid, issued.revision_no, &doc, err);
     if (st == ATLAS_OK) {
         st = show_prompt(t, repo, uid, &doc, intent, replacement_uid, issued.confirm,
                          intent == ATLAS_DECISION_INTENT_REVALIDATE && assessment.item_count == 1

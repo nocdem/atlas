@@ -211,3 +211,32 @@ Atlas defends the record against everything that reaches it through Atlas, and
 defends nothing against a process that already runs as the uid owning the files —
 for which the answer is a separate OS principal, which is a deployment decision
 Atlas reports on and will not make for you.
+
+## Amendment: the operator channel over the socket
+
+A7 deleted `decision.challenge`, `decision.approve`, `decision.reject`,
+`decision.supersede` and `decision.revalidate` from the protocol. They are back,
+reachable only from the peer whose `SO_PEERCRED` uid equals the `operator_uid`
+in the root-owned policy, and this document is amended rather than left saying
+otherwise.
+
+The defect A7 fixed is still fixed. It was never that the methods existed: it
+was that the challenge minted a capability for anybody who could open the
+socket, because the terminal check lived in the CLI's own helper and a check a
+client runs on itself is not a boundary. The identity now comes from the kernel
+and the constraint from a file only root can write; a uid in a request body
+reaches the decision at no point, and a daemon whose own executable is writable
+by the uid it constrains offers the group to nobody.
+
+Why the reversal was necessary: the account that owns the index is the daemon's,
+and the deployment's human operator is a different uid that must not be given
+the index. The alternative to this change was an operator who cannot approve
+anything.
+
+**What it does not establish.** That the process holding the operator's uid is a
+person. Nothing observable from inside a process establishes that, which is what
+A7 itself says about terminals. An AI agent with a shell as that account reaches
+these methods exactly as a human does. The rule that a model must not approve,
+reject, supersede or revalidate is an orchestration and prompt policy, and it is
+not enforced by the kernel, by the policy file or by Atlas.
+

@@ -971,6 +971,22 @@ atlas_status atlas_server_dispatch(atlas_server_ctx *ctx, const void *payload, s
             }
         }
     }
+    /* The operator group, offered only to the peer the root-owned authority
+     * policy names. Consulted additively like the two orchestration groups, and
+     * hidden the same way: a peer the policy does not name gets `unknown
+     * method` for these five names, which is what a name that does not exist
+     * gets. The identity is `SO_PEERCRED`; nothing in the request body reaches
+     * this decision. */
+    if (fn == NULL && atlas_server_peer_is_operator((long long)peer_uid)) {
+        size_t n = 0;
+        const atlas_method_entry *g = atlas_server_operator_methods(&n);
+        for (size_t i = 0; i < n; i++) {
+            if (strcmp(atlas_ipc_request_method(req), g[i].name) == 0) {
+                fn = g[i].fn;
+                break;
+            }
+        }
+    }
     if (fn == NULL &&
         atlas_orchpolicy_is_any_dispatcher(&ctx->orchpolicy, (long long)peer_uid)) {
         size_t n = 0;

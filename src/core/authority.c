@@ -197,11 +197,28 @@ static bool parse_operator_uid(const char *text, size_t len, long long *uid_out)
 
 void atlas_authority_probe_at(const char *policy_path, const char *exe_path,
                               atlas_authority *out) {
+    atlas_authority_probe_peer_at(policy_path, exe_path, (long long)getuid(), out);
+}
+
+/* The same probe, against a uid the caller names rather than its own.
+ *
+ * Every check is the one `atlas_authority_probe_at` runs, in the same order,
+ * including the root-anchored policy walk, the root-ownership requirement and
+ * the root-owned executable — only the identity being compared differs. It
+ * exists because the daemon has to answer "is *this peer* the operator?" about
+ * a uid the kernel told it, and `getuid()` there is the daemon's own account.
+ *
+ * The uid must come from `SO_PEERCRED` and from nowhere else. A uid a client
+ * wrote into a request is a client describing itself, which is not evidence
+ * about itself — A7.1's rule, and the whole reason this takes a parameter
+ * rather than reading one out of a request. */
+void atlas_authority_probe_peer_at(const char *policy_path, const char *exe_path,
+                                   long long peer_uid, atlas_authority *out) {
     memset(out, 0, sizeof(*out));
     out->state = ATLAS_AUTHORITY_LOCKED;
     out->reason = ATLAS_AUTHORITY_REASON_NO_POLICY;
     out->operator_uid = -1;
-    out->caller_uid = (long long)getuid();
+    out->caller_uid = peer_uid;
 
     int fd = open_root_anchored(policy_path, false, out);
     if (fd < 0) {
@@ -279,6 +296,12 @@ void atlas_authority_probe(atlas_authority *out) {
     char exe[PATH_MAX];
     self_exe(exe, sizeof(exe));
     atlas_authority_probe_at(ATLAS_AUTHORITY_POLICY_PATH, exe, out);
+}
+
+void atlas_authority_probe_peer(long long peer_uid, atlas_authority *out) {
+    char exe[PATH_MAX];
+    self_exe(exe, sizeof(exe));
+    atlas_authority_probe_peer_at(ATLAS_AUTHORITY_POLICY_PATH, exe, peer_uid, out);
 }
 
 atlas_status atlas_authority_require(atlas_authority_op op, atlas_err *err) {

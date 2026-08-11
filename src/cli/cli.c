@@ -1572,7 +1572,16 @@ static bool remote_serves(const cli_state *st) {
         return strcmp(sub, "list") == 0 || strcmp(sub, "search") == 0 ||
                strcmp(sub, "for-file") == 0 || strcmp(sub, "show") == 0 ||
                strcmp(sub, "export") == 0 || strcmp(sub, "history") == 0 ||
-               strcmp(sub, "orphaned") == 0 || strcmp(sub, "legacy") == 0;
+               strcmp(sub, "orphaned") == 0 || strcmp(sub, "legacy") == 0 ||
+               /* The operator channel. Served over the socket, and refused by
+                * the daemon unless this peer is the uid the root-owned policy
+                * names — so reaching the name is not the same as being allowed
+                * to use it. `propose` and `revise` are already served by the
+                * ordinary decision group. */
+               strcmp(sub, "propose") == 0 || strcmp(sub, "revise") == 0 ||
+               strcmp(sub, "promote") == 0 || strcmp(sub, "approve") == 0 ||
+               strcmp(sub, "reject") == 0 || strcmp(sub, "supersede") == 0 ||
+               strcmp(sub, "revalidate") == 0;
     }
     return false;
 }

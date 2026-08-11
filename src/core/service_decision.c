@@ -946,22 +946,37 @@ static atlas_status op_to_params(const atlas_decision_op *op, atlas_buf *out, at
         {"consequences", &op->revision.consequences_text},
     };
     for (size_t i = 0; st == ATLAS_OK && i < sizeof(scalars) / sizeof(scalars[0]); i++) {
-        /* `decision` is the document id and `decision_text` is the prose. The
-         * server reads the prose under the key `decision`, so the one that
-         * carries prose is renamed on the way out rather than colliding. */
+        /* **A8.2: the document id and the prose have separate keys.**
+         *
+         * They used to share `decision`, distinguished only by which operation
+         * was in flight — and the server never made that distinction. A revise
+         * sent the id under `decision` and the prose under `decision_body`,
+         * which nothing read, so the id was stored as the decision text. Two
+         * meanings on one key was the defect; two keys is the fix.
+         *
+         * Both are now emitted explicitly on every operation: `decision_uid`
+         * for the document, `decision_body` for the prose. `decision` is still
+         * sent carrying the id, because a daemon older than this client falls
+         * back to it — and for the one operation where that is ambiguous, a
+         * propose, there is no id to send. */
         const char *key = scalars[i].key;
         if (strcmp(key, "decision_text") == 0) {
-            if (op->kind == ATLAS_DECISION_OP_PROPOSE) {
-                key = "decision";
-            } else {
-                continue; /* handled below, where the id is not also present */
+            continue; /* emitted below, under its own name */
+        }
+        if (strcmp(key, "decision") == 0) {
+            /* The id, under both names: the explicit one this daemon reads and
+             * the legacy one an older daemon reads. A propose has no id, so
+             * `put_buf` emits neither and nothing is ambiguous. */
+            st = put_buf(j, "decision_uid", scalars[i].value, err);
+            if (st != ATLAS_OK) {
+                break;
             }
         }
         st = put_buf(j, key, scalars[i].value, err);
     }
-    if (st == ATLAS_OK && op->kind == ATLAS_DECISION_OP_REVISE) {
-        /* A revise carries both, so the prose goes under its own key and the
-         * server accepts either spelling. */
+    if (st == ATLAS_OK) {
+        /* Always, and never under `decision`: a propose whose prose went out
+         * under the id's key is exactly how the two meanings got entangled. */
         st = put_buf(j, "decision_body", &op->revision.decision_text, err);
     }
     if (st == ATLAS_OK && op->revision.scope != ATLAS_DECISION_SCOPE_UNKNOWN) {
@@ -1795,88 +1810,129 @@ atlas_status atlas_service_decision_link_add(atlas_ctx *ctx, const char *repo, c
         return atlas_err_set(err, ATLAS_ERR_USAGE, "a decision cannot relate to itself (%s)", uid);
     }
 
-    atlas_decision_document doc;
-    atlas_decision_document_init(&doc);
-    atlas_status st = ctx != NULL ? atlas_service_decision_show(ctx, repo, uid, 0, &doc, err)
-                                  : atlas_service_decision_show_remote(repo, uid, 0, &doc, err);
-    if (st != ATLAS_OK) {
-        atlas_decision_document_free(&doc);
+    /* A8.2: over the socket this is the daemon's job. Reading the document here
+     * and re-sending it encoded the prose a second time on every call — see
+     * `method_link_add`. The local path keeps the read-modify-write because it
+     * holds the raw bytes and there is no encoding boundary to cross. */
+    if (ctx == NULL) {
+        return atlas_service_decision_link_add_remote(repo, uid, target_uid, out, err);
+    }
+
+    /* The revision is loaded from the database, not from a rendered document.
+     *
+     * `atlas_service_decision_show` returns every text value in Atlas' safe-text
+     * encoding, because that is what a renderer needs. Feeding those bytes back
+     * in as if they were raw encoded them a second time, so `%0A` became
+     * `%250A` and a body drifted a little further from what it said on every
+     * link add — a write that was supposed to touch only links. Loading the
+     * revision keeps the bytes raw from end to end, and is what the daemon-side
+     * twin does, so the two paths write the same rows. */
+    atlas_repo_info info;
+    atlas_repo_info_init(&info);
+    atlas_status st = atlas_service_require_repo(ctx, repo, &info, err);
+    int64_t doc_id = 0, repo_of = 0, rev_id = 0;
+    bool found = false;
+    if (st == ATLAS_OK) {
+        st = atlas_db_decision_find_uid(atlas_ctx_db(ctx), uid, &doc_id, &repo_of, &found, err);
+    }
+    if (st == ATLAS_OK && !found) {
+        st = atlas_err_set(err, ATLAS_ERR_USAGE, "no decision has that id");
+    }
+    if (st == ATLAS_OK && repo_of != info.id) {
+        st = atlas_err_set(err, ATLAS_ERR_USAGE,
+                           "that decision belongs to another repository");
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_db_decision_current_revision(atlas_ctx_db(ctx), doc_id, &rev_id, err);
+        if (st == ATLAS_OK && rev_id == 0) {
+            int64_t no = 0;
+            char hash[ATLAS_SHA256_HEX_LEN + 1u];
+            char state[16];
+            st = atlas_db_decision_latest_revision(atlas_ctx_db(ctx), doc_id, &rev_id, &no, hash,
+                                                   sizeof(hash), state, sizeof(state), err);
+        }
+        if (st == ATLAS_OK && rev_id == 0) {
+            st = atlas_err_set(err, ATLAS_ERR_USAGE, "this decision has no revision to extend");
+        }
+    }
+    atlas_decision_op *op = NULL;
+    if (st == ATLAS_OK) {
+        op = op_new(ATLAS_DECISION_OP_REVISE);
+        if (op == NULL) {
+            st = atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory");
+        }
+    }
+    if (st == ATLAS_OK) {
+        found = false;
+        st = atlas_db_decision_revision_load(atlas_ctx_db(ctx), rev_id, &op->revision, &found, err);
+        if (st == ATLAS_OK && !found) {
+            st = atlas_err_set(err, ATLAS_ERR_INTERNAL, "the current revision could not be read");
+        }
+    }
+    bool duplicate = false;
+    if (st == ATLAS_OK) {
+        for (size_t i = 0; i < op->revision.link_count; i++) {
+            const atlas_decision_link *l = &op->revision.links[i];
+            if (l->kind == ATLAS_DECISION_LINK_RELATES_TO &&
+                strcmp(atlas_buf_cstr(&l->target_uid), target_uid) == 0) {
+                duplicate = true;
+                break;
+            }
+        }
+    }
+    if (st == ATLAS_OK && duplicate) {
+        int64_t no = 0;
+        char hash[ATLAS_SHA256_HEX_LEN + 1u];
+        char state[16];
+        int64_t tmp = 0;
+        (void)atlas_db_decision_latest_revision(atlas_ctx_db(ctx), doc_id, &tmp, &no, hash,
+                                                sizeof(hash), state, sizeof(state), err);
+        st = atlas_buf_set_str(&out->repo, repo, err);
+        if (st == ATLAS_OK) {
+            st = atlas_buf_set_str(&out->uid, uid, err);
+        }
+        out->revision_no = no;
+        out->duplicate = true;
+        (void)snprintf(out->content_hash, sizeof out->content_hash, "%s", hash);
+        atlas_decision_op_free(op);
+        free(op);
+        atlas_repo_info_free(&info);
         return st;
     }
-
-    /* Already there: report the revision that holds it and write nothing. */
-    for (size_t i = 0; i < doc.link_count; i++) {
-        if (strcmp(atlas_buf_cstr(&doc.links[i].kind), "relates_to") == 0 &&
-            strcmp(atlas_buf_cstr(&doc.links[i].value), target_uid) == 0) {
-            st = atlas_buf_set_str(&out->repo, repo, err);
-            if (st == ATLAS_OK) {
-                st = atlas_buf_set_str(&out->uid, uid, err);
-            }
-            out->revision_no = doc.summary.revision_no;
-            out->duplicate = true;
-            atlas_decision_document_free(&doc);
-            return st;
+    if (st == ATLAS_OK) {
+        atlas_decision_link l;
+        atlas_decision_link_init(&l, ATLAS_DECISION_LINK_RELATES_TO);
+        st = atlas_buf_set_str(&l.target_uid, target_uid, err);
+        if (st == ATLAS_OK) {
+            st = atlas_decision_revision_add_link(&op->revision, &l, err);
         }
+        atlas_decision_link_free(&l);
     }
-
-    /* Carry every link the head revision holds, so a new revision loses none of
-     * them, and append the new relation. The other kinds are rebuilt from their
-     * stored values; a symbol link's snapshot is retaken by `build_op`, which
-     * is the same thing `revise` does for any other reason. */
-    const char *paths[ATLAS_DECISION_MAX_LINKS];
-    const char *commits[ATLAS_DECISION_MAX_LINKS];
-    const char *symbols[ATLAS_DECISION_MAX_LINKS];
-    const char *relations[ATLAS_DECISION_MAX_LINKS];
-    size_t np = 0, nc = 0, ns = 0, nr = 0;
-    for (size_t i = 0; i < doc.link_count; i++) {
-        const char *k = atlas_buf_cstr(&doc.links[i].kind);
-        const char *v = atlas_buf_cstr(&doc.links[i].value);
-        if (strcmp(k, "path") == 0 && np < ATLAS_DECISION_MAX_LINKS) {
-            paths[np++] = v;
-        } else if (strcmp(k, "commit") == 0 && nc < ATLAS_DECISION_MAX_LINKS) {
-            commits[nc++] = v;
-        } else if (strcmp(k, "symbol") == 0 && ns < ATLAS_DECISION_MAX_LINKS) {
-            symbols[ns++] = v;
-        } else if (strcmp(k, "relates_to") == 0 && nr < ATLAS_DECISION_MAX_LINKS) {
-            relations[nr++] = v;
+    if (st == ATLAS_OK) {
+        st = atlas_buf_set_str(&op->uid, uid, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_buf_set_str(&op->repo_name, repo, err);
+    }
+    if (st == ATLAS_OK) {
+        op->revision.proposed_by = ATLAS_DECISION_ACTOR_MODEL_PROPOSAL;
+        st = atlas_decision_revision_validate(&op->revision, err);
+    }
+    atlas_repo_info_free(&info);
+    if (st != ATLAS_OK) {
+        if (op != NULL) {
+            atlas_decision_op_free(op);
+            free(op);
         }
-        /* `supersedes` and `replaced_by` are written by the lifecycle, never
-         * carried forward by a proposal: reproducing one here would assert a
-         * transition nobody performed. */
+        return st;
     }
-    if (nr >= ATLAS_DECISION_MAX_LINKS) {
-        atlas_decision_document_free(&doc);
-        return atlas_err_set(err, ATLAS_ERR_USAGE, "at most %d decision relations",
-                             ATLAS_DECISION_MAX_LINKS);
+    atlas_decision_result result;
+    atlas_decision_result_init(&result);
+    bool via_daemon = false;
+    st = apply_op(ctx, op, &result, &via_daemon, err);
+    if (st == ATLAS_OK) {
+        st = take_outcome(&result, out, via_daemon, false, err);
     }
-    relations[nr++] = target_uid;
-
-    const char *alts[ATLAS_DECISION_MAX_ALTERNATIVES];
-    for (size_t i = 0; i < doc.alternative_count; i++) {
-        alts[i] = atlas_buf_cstr(&doc.alternatives[i]);
-    }
-
-    atlas_decision_input in;
-    memset(&in, 0, sizeof in);
-    in.title = atlas_buf_cstr(&doc.summary.title);
-    in.context_text = doc.context_text.len > 0 ? atlas_buf_cstr(&doc.context_text) : NULL;
-    in.decision_text = atlas_buf_cstr(&doc.decision_text);
-    in.rationale_text = doc.rationale_text.len > 0 ? atlas_buf_cstr(&doc.rationale_text) : NULL;
-    in.consequences_text =
-        doc.consequences_text.len > 0 ? atlas_buf_cstr(&doc.consequences_text) : NULL;
-    in.scope = doc.scope.len > 0 ? atlas_buf_cstr(&doc.scope) : NULL;
-    in.alternatives = alts;
-    in.alternative_count = doc.alternative_count;
-    in.paths = paths;
-    in.path_count = np;
-    in.commits = commits;
-    in.commit_count = nc;
-    in.symbols = symbols;
-    in.symbol_count = ns;
-    in.decision_links = relations;
-    in.decision_link_count = nr;
-
-    st = atlas_service_decision_revise(ctx, repo, uid, &in, out, err);
-    atlas_decision_document_free(&doc);
+    atlas_decision_result_free(&result);
     return st;
 }

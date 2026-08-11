@@ -878,6 +878,11 @@ atlas_status atlas_service_search_remote(const char *name, const char *query, in
  * directory. `name` is one path component and never a path: the destination is
  * fixed and the caller chooses a name within it. `out->path` receives that
  * name, which is also what `verify` takes back. */
+/* Relate one decision to another, daemon-side. The content is never sent, so
+ * nothing can be re-encoded on the way back. */
+atlas_status atlas_service_decision_link_add_remote(const char *repo, const char *uid,
+                                                    const char *target_uid,
+                                                    atlas_decision_outcome *out, atlas_err *err);
 atlas_status atlas_service_backup_create_remote(const char *name, atlas_backup_report *out,
                                                 atlas_backup_verify_report *verified,
                                                 atlas_err *err);

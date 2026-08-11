@@ -79,6 +79,31 @@ static atlas_status take_uid(const atlas_ipc_request *req, const char *key, bool
     return atlas_buf_set_str(out, v, err);
 }
 
+/* The decision id of the document a write is about.
+ *
+ * **A8.2: `decision_uid` is the field, and `decision` is only a fallback.**
+ *
+ * The two meanings used to share one name. A propose put its prose in
+ * `decision`; a revise put the document id there and its prose in
+ * `decision_body`, which the server never read — so every revise stored the uid
+ * as the decision text and reported success. Two meanings on one key is the
+ * defect, so the fix is two keys, and the fallback exists only so a client
+ * older than this daemon keeps working rather than silently mis-writing. */
+static atlas_status take_doc_uid(const atlas_ipc_request *req, bool required, atlas_buf *out,
+                                 atlas_err *err) {
+    const char *v = NULL;
+    if (atlas_ipc_param_str(req, "decision_uid", &v) && v != NULL && v[0] != '\0') {
+        if (!atlas_decision_uid_is_valid(v)) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "\"decision_uid\" is not a decision id; they look like %s "
+                                 "followed by %u lowercase hex characters",
+                                 ATLAS_DECISION_UID_PREFIX, (unsigned)ATLAS_DECISION_UID_HEX);
+        }
+        return atlas_buf_set_str(out, v, err);
+    }
+    return take_uid(req, "decision", required, out, err);
+}
+
 /* Where. `root` wins over `repo`, exactly as in the A2 group. */
 static atlas_status take_where(const atlas_ipc_request *req, atlas_decision_op *op,
                                atlas_err *err) {
@@ -572,8 +597,33 @@ static atlas_status build_revision_op(dispatch_state *ds, const atlas_ipc_reques
                        err);
     }
     if (st == ATLAS_OK) {
-        st = take_text(req, "decision", ATLAS_DECISION_TEXT_MAX, true, &op->revision.decision_text,
-                       err);
+        /* **A8.2: the prose comes from `decision_body`.**
+         *
+         * It used to come from `decision`, which on a revise is the document
+         * id — so every revise, and every `link add` (which is a revise with
+         * the same links re-sent), stored the uid as the decision text and
+         * returned success. `decision` is still read for a propose from a
+         * client older than this daemon, where it is unambiguously prose
+         * because no document exists yet to name.
+         *
+         * The guard below is the one that would have caught this: prose that
+         * equals the document's own id is never a decision, whatever key it
+         * arrived under. */
+        const char *body = NULL;
+        if (atlas_ipc_param_str(req, "decision_body", &body) && body != NULL) {
+            st = take_text(req, "decision_body", ATLAS_DECISION_TEXT_MAX, true,
+                           &op->revision.decision_text, err);
+        } else if (op->uid.len == 0) {
+            st = take_text(req, "decision", ATLAS_DECISION_TEXT_MAX, true,
+                           &op->revision.decision_text, err);
+        }
+        if (st == ATLAS_OK && op->uid.len > 0 &&
+            op->revision.decision_text.len == op->uid.len &&
+            memcmp(op->revision.decision_text.data, op->uid.data, op->uid.len) == 0) {
+            st = atlas_err_set(err, ATLAS_ERR_USAGE,
+                               "the decision text is this decision's own id; a document id is "
+                               "not a decision. Send the prose in \"decision_body\".");
+        }
     }
     if (st == ATLAS_OK) {
         st = take_text(req, "rationale", ATLAS_DECISION_TEXT_MAX, true,
@@ -646,7 +696,7 @@ static atlas_status method_revise(dispatch_state *ds, const atlas_ipc_request *r
     if (op == NULL) {
         return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory");
     }
-    atlas_status st = take_uid(req, "decision", true, &op->uid, err);
+    atlas_status st = take_doc_uid(req, true, &op->uid, err);
     if (st == ATLAS_OK) {
         st = build_revision_op(ds, req, op, err);
     }
@@ -892,7 +942,7 @@ static atlas_status require_document(dispatch_state *ds, const atlas_ipc_request
         return st;
     }
     atlas_buf uid = ATLAS_BUF_INIT;
-    st = take_uid(req, "decision", true, &uid, err);
+    st = take_doc_uid(req, true, &uid, err);
     int64_t repo_of = 0;
     bool found = false;
     if (st == ATLAS_OK) {
@@ -1544,6 +1594,177 @@ static atlas_status method_gate_check(dispatch_state *ds, const atlas_ipc_reques
     return st;
 }
 
+/* decision.link_add — relate one decision to another, changing only the links.
+ *
+ * **A8.2: performed here, on the daemon, and not by the client.**
+ *
+ * It used to be a client-side read-modify-write: read the document, re-send
+ * every field, add one relation. That was wrong twice over. The prose came back
+ * from a remote read already in Atlas' safe-text encoding and was re-sent as if
+ * it were raw, so each link add encoded it again — `%0A` became `%250A` — and
+ * the body drifted a little further from what it said every time a relationship
+ * was recorded. And because it went through revise, it inherited the defect
+ * that stored the uid as the prose.
+ *
+ * Loading the revision here removes the round trip entirely: the content never
+ * leaves the database, so there is nothing to re-encode and nothing to lose.
+ * The client sends two ids and the name of a repository.
+ *
+ * Links are carried across, not rebuilt from rendered values: the whole
+ * revision is loaded, the relation appended, and the result written as one new
+ * immutable revision. */
+static atlas_status method_link_add(dispatch_state *ds, const atlas_ipc_request *req,
+                                    atlas_err *err) {
+    atlas_repo_info info;
+    atlas_repo_info_init(&info);
+    int64_t doc_id = 0;
+    atlas_status st = require_document(ds, req, &info, &doc_id, err);
+    atlas_buf target = ATLAS_BUF_INIT;
+    if (st == ATLAS_OK) {
+        st = take_uid(req, "target", true, &target, err);
+    }
+    atlas_buf self = ATLAS_BUF_INIT;
+    if (st == ATLAS_OK) {
+        st = take_doc_uid(req, true, &self, err);
+    }
+    if (st == ATLAS_OK && strcmp(atlas_buf_cstr(&self), atlas_buf_cstr(&target)) == 0) {
+        st = atlas_err_set(err, ATLAS_ERR_USAGE, "a decision cannot relate to itself (%s)",
+                           atlas_buf_cstr(&self));
+    }
+    /* The target must exist here. The write point checks this too; checking it
+     * first is what makes the message name the problem rather than the row. */
+    if (st == ATLAS_OK) {
+        int64_t tid = 0, trepo = 0;
+        bool found = false;
+        st = atlas_db_decision_find_uid(ds->db, atlas_buf_cstr(&target), &tid, &trepo, &found, err);
+        if (st == ATLAS_OK && !found) {
+            st = atlas_err_set(err, ATLAS_ERR_USAGE,
+                               "a decision link names a document Atlas does not hold");
+        }
+        if (st == ATLAS_OK && trepo != info.id) {
+            st = atlas_err_set(err, ATLAS_ERR_USAGE,
+                               "a decision may only link to another decision in the same "
+                               "repository");
+        }
+    }
+
+    int64_t rev_id = 0;
+    if (st == ATLAS_OK) {
+        st = atlas_db_decision_current_revision(ds->db, doc_id, &rev_id, err);
+        if (st == ATLAS_OK && rev_id == 0) {
+            int64_t no = 0;
+            char hash[ATLAS_SHA256_HEX_LEN + 1u];
+            char state[16];
+            st = atlas_db_decision_latest_revision(ds->db, doc_id, &rev_id, &no, hash, sizeof(hash),
+                                                   state, sizeof(state), err);
+        }
+        if (st == ATLAS_OK && rev_id == 0) {
+            st = atlas_err_set(err, ATLAS_ERR_USAGE, "this decision has no revision to extend");
+        }
+    }
+
+    atlas_decision_op *op = NULL;
+    if (st == ATLAS_OK) {
+        op = op_new(ATLAS_DECISION_OP_REVISE);
+        if (op == NULL) {
+            st = atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory");
+        }
+    }
+    if (st == ATLAS_OK) {
+        bool found = false;
+        st = atlas_db_decision_revision_load(ds->db, rev_id, &op->revision, &found, err);
+        if (st == ATLAS_OK && !found) {
+            st = atlas_err_set(err, ATLAS_ERR_INTERNAL, "the current revision could not be read");
+        }
+    }
+    /* Already related: report the revision that holds it and write nothing. */
+    bool duplicate = false;
+    if (st == ATLAS_OK) {
+        for (size_t i = 0; i < op->revision.link_count; i++) {
+            const atlas_decision_link *l = &op->revision.links[i];
+            if (l->kind == ATLAS_DECISION_LINK_RELATES_TO && l->target_uid.len == target.len &&
+                memcmp(l->target_uid.data, target.data, target.len) == 0) {
+                duplicate = true;
+                break;
+            }
+        }
+    }
+    if (st == ATLAS_OK && !duplicate) {
+        atlas_decision_link l;
+        atlas_decision_link_init(&l, ATLAS_DECISION_LINK_RELATES_TO);
+        st = atlas_buf_set(&l.target_uid, target.data, target.len, err);
+        if (st == ATLAS_OK) {
+            st = atlas_decision_revision_add_link(&op->revision, &l, err);
+        }
+        atlas_decision_link_free(&l);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_buf_set(&op->uid, self.data, self.len, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_buf_set_str(&op->repo_name, info.name, err);
+    }
+    if (st == ATLAS_OK) {
+        op->revision.proposed_by = ATLAS_DECISION_ACTOR_MODEL_PROPOSAL;
+        st = atlas_decision_revision_validate(&op->revision, err);
+    }
+
+    if (st != ATLAS_OK) {
+        if (op != NULL) {
+            atlas_decision_op_free(op);
+            free(op);
+        }
+        atlas_buf_free(&self);
+        atlas_buf_free(&target);
+        atlas_repo_info_free(&info);
+        return st;
+    }
+    if (duplicate) {
+        /* Nothing to write. Reported as the outcome the caller expects, with
+         * the revision that already carries the relation. */
+        int64_t no = 0;
+        char hash[ATLAS_SHA256_HEX_LEN + 1u];
+        char state[16];
+        int64_t tmp = 0;
+        (void)atlas_db_decision_latest_revision(ds->db, doc_id, &tmp, &no, hash, sizeof(hash),
+                                                state, sizeof(state), err);
+        st = atlas_json_key_str(ds->j, "repo", info.name, err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(ds->j, "decision", atlas_buf_cstr(&self), err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_int(ds->j, "revision", no, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(ds->j, "content_hash", hash, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_bool(ds->j, "created", false, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_bool(ds->j, "duplicate", true, err);
+        }
+        atlas_decision_op_free(op);
+        free(op);
+        atlas_buf_free(&self);
+        atlas_buf_free(&target);
+        atlas_repo_info_free(&info);
+        return st;
+    }
+
+    atlas_buf_free(&self);
+    atlas_buf_free(&target);
+    atlas_repo_info_free(&info);
+    atlas_decision_result result;
+    atlas_decision_result_init(&result);
+    st = submit(ds, op, &result, err);
+    if (st == ATLAS_OK) {
+        st = write_result(ds, &result, err);
+    }
+    atlas_decision_result_free(&result);
+    return st;
+}
+
 /* **A7: the operator channel is not an RPC method group.**
  *
  * Until A7 these five sat in the table below, defended by the argument that no
@@ -1718,7 +1939,7 @@ static atlas_status method_challenge(dispatch_state *ds, const atlas_ipc_request
     }
     atlas_status st = take_where(req, op, err);
     if (st == ATLAS_OK) {
-        st = take_uid(req, "decision", true, &op->uid, err);
+        st = take_doc_uid(req, true, &op->uid, err);
     }
     if (st == ATLAS_OK) {
         st = take_uid(req, "replacement", false, &op->replacement_uid, err);
@@ -1794,7 +2015,7 @@ static atlas_status spend_method(dispatch_state *ds, const atlas_ipc_request *re
     }
     atlas_status st = take_where(req, op, err);
     if (st == ATLAS_OK) {
-        st = take_uid(req, "decision", true, &op->uid, err);
+        st = take_doc_uid(req, true, &op->uid, err);
     }
     /* `token` and `confirmation` are read here and in no other method, which is
      * what makes "a proposal cannot carry an approval" a property of the
@@ -1929,6 +2150,9 @@ static const atlas_method_entry DECISION_METHODS[] = {
     /* Writes a model may reach. */
     {"decision.propose", method_propose},
     {"decision.revise", method_revise},
+    /* A8.2: link add is a daemon-side operation now, so the content it must
+     * preserve never travels and cannot be re-encoded on the way back. */
+    {"decision.link_add", method_link_add},
     {"decision.promote", method_promote},
     /* The operator channel is deliberately absent — see A7 below. */
     /* A6, and a read. Nothing here can change an assessment. */

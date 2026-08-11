@@ -123,6 +123,8 @@ set(ATLAS_TESTS
   # The A8 operator-boundary fix: decision links over the socket, and the
   # local/socket agreement that keeps the two paths one behaviour.
   test_decision_link_rpc
+  # A8.2: a revision stores what it was given; a link change changes only links.
+  test_decision_revision_integrity
   test_migrate9
   test_migrate8
 )
@@ -171,7 +173,7 @@ set_tests_properties(test_decision_mcp PROPERTIES LABELS "unit")
 # so they carry the daemon label and its serialisation for the same reason
 # test_daemon does: parallel daemons compete for the machine's inotify budget.
 set_tests_properties(test_ai_trust test_hooks test_mcp_roots test_ai_attribution test_code_trust
-  test_decision_bridge test_decision_link_rpc
+  test_decision_bridge test_decision_link_rpc test_decision_revision_integrity
   PROPERTIES LABELS "daemon" TIMEOUT 900 RUN_SERIAL TRUE)
 
 # A5. Backup builds a real repository and drives the binary; maintenance drives

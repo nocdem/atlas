@@ -1969,3 +1969,88 @@ atlas_status atlas_service_backup_verify_remote(const char *name, atlas_backup_v
     atlas_buf_free(&raw);
     return st;
 }
+
+/* --- decision link add ----------------------------------------------------- */
+
+/* Relate one decision to another, performed by the daemon.
+ *
+ * The local twin reads the document, re-sends every field and adds one relation.
+ * That cannot be done over the socket: the prose comes back safe-encoded and
+ * re-sending it encodes it again, so the body drifted every time a relationship
+ * was recorded. Here the client sends two ids and the daemon never lets the
+ * content out of the database. */
+atlas_status atlas_service_decision_link_add_remote(const char *repo, const char *uid,
+                                                    const char *target_uid,
+                                                    atlas_decision_outcome *out, atlas_err *err) {
+    atlas_buf params = ATLAS_BUF_INIT;
+    atlas_ipc_params *p = NULL;
+    atlas_json *j = NULL;
+    atlas_status st = atlas_db_check_repo_name(repo, err);
+    if (st == ATLAS_OK) {
+        st = atlas_ipc_params_begin(&p, &j, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(j, "repo", repo, err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "decision_uid", uid, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "decision", uid, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "target", target_uid, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_ipc_params_finish(p, &params, err);
+        } else {
+            atlas_ipc_params_abort(p);
+        }
+    }
+    atlas_buf raw = ATLAS_BUF_INIT;
+    atlas_ipc_response *r = NULL;
+    if (st == ATLAS_OK) {
+        st = atlas_remote_call("decision.link_add", atlas_buf_cstr(&params), &raw, &r, err);
+    }
+    atlas_buf_free(&params);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    const char *v = NULL;
+    int64_t n = 0;
+    bool b = false;
+    if (atlas_ipc_result_str(r, "repo", &v) && v != NULL) {
+        st = atlas_buf_set_str(&out->repo, v, err);
+    }
+    if (st == ATLAS_OK && atlas_ipc_result_str(r, "decision", &v) && v != NULL) {
+        st = atlas_buf_set_str(&out->uid, v, err);
+    }
+    if (st == ATLAS_OK && atlas_ipc_result_str(r, "state", &v) && v != NULL) {
+        /* Parsed against the closed vocabulary before it is stored as text, so
+         * a state this binary does not know is a version mismatch rather than
+         * something that renders as an unknown word. */
+        atlas_decision_state parsed;
+        if (!atlas_decision_state_parse(v, &parsed)) {
+            st = atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                               "the Atlas daemon reported a decision state this binary does not "
+                               "recognise; the two are different versions");
+        } else {
+            st = atlas_buf_set_str(&out->state, v, err);
+        }
+    }
+    if (atlas_ipc_result_str(r, "content_hash", &v) && v != NULL) {
+        (void)snprintf(out->content_hash, sizeof out->content_hash, "%s", v);
+    }
+    if (atlas_ipc_result_int(r, "revision", &n)) {
+        out->revision_no = n;
+    }
+    if (atlas_ipc_result_bool(r, "created", &b)) {
+        out->created = b;
+    }
+    if (atlas_ipc_result_bool(r, "duplicate", &b)) {
+        out->duplicate = b;
+    }
+    out->via_daemon = true;
+    atlas_ipc_response_free(r);
+    atlas_buf_free(&raw);
+    return st;
+}

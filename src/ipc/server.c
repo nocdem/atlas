@@ -383,11 +383,108 @@ atlas_status atlas_server_write_repo_state(dispatch_state *ds, const atlas_repo_
     return st;
 }
 
+/* The registration facts a listing shows, beside the index state.
+ *
+ * Added so that `atlas repo list` can be answered over the socket by a client
+ * that cannot open the index — which under A7.1 is every client, because the
+ * data directory is 0700 `atlasd` and must stay so. Purely additive: no key
+ * changes meaning and none is removed, so an older reader is unaffected.
+ *
+ * `name` is validated at registration and `root_path_text` is already in the
+ * safe encoding, so neither is re-encoded. The branch comes from git and is
+ * encoded here. */
+static atlas_status write_repo_registration(dispatch_state *ds, const atlas_repo_info *ri,
+                                            atlas_err *err) {
+    atlas_status st = atlas_json_key_str(ds->j, "last_scan_at", ri->last_scan_at, err);
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "scanned_head", ri->scanned_head, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "branch", atlas_safe(&ds->safe, ri->current_branch), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "head_state", ri->head_state, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "object_format", ri->object_format, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "registered_at", ri->registered_at, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(ds->j, "dirty", ri->dirty, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(ds->j, "linked_worktree", ri->is_linked_worktree, err);
+    }
+    /* Both git directories are raw bytes from the database, so they go on the
+     * wire in the reversible `%XX` form the transport can carry and the client
+     * decodes them back to bytes. A path is bytes and may not be UTF-8. */
+    atlas_buf enc = ATLAS_BUF_INIT;
+    if (st == ATLAS_OK) {
+        st = atlas_path_text_encode(ri->git_common_dir.data, ri->git_common_dir.len, &enc, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "git_common_dir", atlas_buf_cstr(&enc), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_path_text_encode(ri->git_dir.data, ri->git_dir.len, &enc, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "git_dir", atlas_buf_cstr(&enc), err);
+    }
+    atlas_buf_free(&enc);
+    return st;
+}
+
+/* The index-side facts `atlas status NAME` reports, so that command can be
+ * answered over the socket by a client that cannot open the index. Additive.
+ *
+ * The live git observation is deliberately *not* here: it is taken fresh at
+ * query time, by the client, against a repository the client can read. A
+ * daemon-supplied "live" state would be live as of whenever the daemon looked,
+ * and head drift is the one thing that report exists to show. */
+static atlas_status write_repo_status_facts(dispatch_state *ds, const atlas_repo_info *ri,
+                                            atlas_err *err) {
+    atlas_repo_counts c;
+    memset(&c, 0, sizeof c);
+    atlas_status st = atlas_db_repo_counts(ds->db, ri->id, &c, err);
+    int64_t siblings = 0;
+    if (st == ATLAS_OK) {
+        st = atlas_db_repo_siblings(ds->db, ri->id, ri->git_common_dir.data,
+                                    ri->git_common_dir.len, NULL, NULL, &siblings, err);
+    }
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    const struct {
+        const char *k;
+        int64_t v;
+    } ints[] = {
+        {"files_live", c.files_live},
+        {"files_deleted", c.files_deleted},
+        {"commits", c.commits},
+        {"changes", c.changes},
+        {"scans", c.scans},
+        {"evidence", c.evidence},
+        {"compile_databases", c.compile_databases},
+        {"sibling_worktrees", siblings},
+        {"last_scan_id", ri->last_scan_id},
+    };
+    for (size_t i = 0; st == ATLAS_OK && i < sizeof ints / sizeof ints[0]; i++) {
+        st = atlas_json_key_int(ds->j, ints[i].k, ints[i].v, err);
+    }
+    return st;
+}
+
 static atlas_status list_repo_item(const atlas_repo_info *ri, void *ud, atlas_err *err) {
     dispatch_state *ds = (dispatch_state *)ud;
     atlas_status st = atlas_json_obj_begin(ds->j, err);
     if (st == ATLAS_OK) {
         st = atlas_server_write_repo_state(ds, ri, err);
+    }
+    if (st == ATLAS_OK) {
+        st = write_repo_registration(ds, ri, err);
     }
     if (st == ATLAS_OK) {
         st = atlas_json_obj_end(ds->j, err);
@@ -439,6 +536,12 @@ static atlas_status method_repo_state(dispatch_state *ds, const atlas_ipc_reques
     atlas_status st = atlas_server_require_repo(ds, req, &info, err);
     if (st == ATLAS_OK) {
         st = atlas_server_write_repo_state(ds, &info, err);
+    }
+    if (st == ATLAS_OK) {
+        st = write_repo_registration(ds, &info, err);
+    }
+    if (st == ATLAS_OK) {
+        st = write_repo_status_facts(ds, &info, err);
     }
     atlas_repo_info_free(&info);
     return st;

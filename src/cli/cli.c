@@ -1492,6 +1492,90 @@ static atlas_status run_decision(cli_state *st, atlas_ctx *ctx, atlas_renderer *
     return atlas_err_set(err, ATLAS_ERR_USAGE, "unknown decision subcommand \"%s\"", sub);
 }
 
+/* Every command, on an index this process does not own.
+ *
+ * Two are answered by the daemon. The rest are refused with what is actually
+ * true — the index belongs to another account and this command has no socket
+ * path — rather than with SQLite's "unable to open database file", which
+ * describes a permission the caller was never going to have and suggests
+ * checking a file they cannot see.
+ *
+ * There is no fallback to a local read anywhere here. A7.1's rule is that a
+ * client which cannot reach the daemon fails rather than quietly answering from
+ * the pre-cutover per-user database, and a fallback would be exactly that. */
+static atlas_status run_remote(cli_state *st, atlas_renderer *r, atlas_err *err) {
+    const char *cmd = st->command;
+    atlas_status result;
+
+    if (strcmp(cmd, "repo") == 0 && st->operand_count == 1u &&
+        strcmp(st->operands[0], "list") == 0) {
+        result = renderer_open(r, st->opts.json, st->out, "repo list", err);
+        if (result != ATLAS_OK) {
+            return result;
+        }
+        list_sink ls = {r};
+        int64_t count = 0;
+        result = r->v->list_begin(r, "repositories", err);
+        if (result == ATLAS_OK) {
+            result = atlas_service_repo_list_remote(repo_item_sink, &ls, &count, err);
+        }
+        if (result == ATLAS_OK) {
+            result = r->v->list_end(r, "repository", "repositories", count, err);
+        }
+        if (result == ATLAS_OK) {
+            result = renderer_close(r, err);
+        } else {
+            renderer_abort(r);
+        }
+        return result;
+    }
+
+    if (strcmp(cmd, "status") == 0) {
+        result = need_operands(st, 1, "status NAME", err);
+        if (result != ATLAS_OK) {
+            return result;
+        }
+        atlas_status_report rep;
+        atlas_status_report_init(&rep);
+        result = atlas_service_status_remote(st->operands[0], &rep, err);
+        if (result == ATLAS_OK) {
+            result = renderer_open(r, st->opts.json, st->out, "status", err);
+            if (result == ATLAS_OK) {
+                result = r->v->note_repo(r, st->operands[0], err);
+            }
+            if (result == ATLAS_OK) {
+                result = r->v->status(r, &rep, err);
+            }
+            if (result == ATLAS_OK) {
+                result = renderer_close(r, err);
+            } else {
+                renderer_abort(r);
+            }
+        }
+        atlas_status_report_free(&rep);
+        return result;
+    }
+
+    /* A write against somebody else's index is not a permissions problem to be
+     * reported from deep inside a chmod; it is a thing this account does not do.
+     * Registration and scanning under a system deployment are the operator
+     * ceremony in docs/security/A7_1_OPERATIONS.md. */
+    if (mode_for(st) == ATLAS_CTX_WRITE) {
+        return atlas_err_set(err, ATLAS_ERR_CONFIG,
+                             "the system index is owned by the Atlas service account and this "
+                             "command would write to it. Registration and scanning are operator "
+                             "operations performed as the service account; see "
+                             "docs/security/A7_1_OPERATIONS.md.");
+    }
+
+    return atlas_err_set(err, ATLAS_ERR_CONFIG,
+                         "the system index is owned by the Atlas service account and cannot be "
+                         "read directly. `atlas %s` is not yet served over the daemon socket; "
+                         "`repo list`, `status NAME`, `daemon ping`, `doctor` and the `job` "
+                         "commands are.",
+                         cmd);
+}
+
 static atlas_status run_code(cli_state *st, atlas_ctx *ctx, atlas_renderer *r, int64_t limit,
                              atlas_err *err) {
     if (st->operand_count == 0) {
@@ -2118,6 +2202,41 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
         }
         atlas_maintenance_report_free(&rep);
         return ms;
+    }
+
+    /* **A7.1: an index this process does not own is reached over the socket, or
+     * not at all.**
+     *
+     * `/var/lib/atlas` is 0700 `atlasd` and has to stay that way — `atlas-worker`
+     * is a member of the client group, and A7.1's guarantee is that it cannot
+     * read the index. So a client uid can never open that database, and a
+     * command that wants a fact has to ask the daemon for it. Decided here,
+     * before any context is opened, for the reason the `job` and `maintenance`
+     * commands are dispatched here: opening a context would try to prepare a
+     * directory this process has no business preparing, and the first thing the
+     * user would see is a chmod failure rather than an answer.
+     *
+     * Deliberately keyed on the *source* plus ownership rather than on the path:
+     * an explicit `--data-dir` or `ATLAS_DATA_DIR` still means exactly what it
+     * says, so fixtures, tests and per-user daemons behave as they always did on
+     * a machine that happens to carry a system policy. */
+    {
+        atlas_buf resolved = ATLAS_BUF_INIT;
+        atlas_datadir_source src = ATLAS_DATADIR_OVERRIDE;
+        atlas_err rerr;
+        atlas_err_init(&rerr);
+        bool foreign = false;
+        if (atlas_datadir_resolve(st->opts.data_dir, &resolved, &src, &rerr) == ATLAS_OK) {
+            foreign = atlas_datadir_is_foreign(atlas_buf_cstr(&resolved), src);
+        }
+        atlas_buf_free(&resolved);
+        /* `doctor` is exempt and must stay so. It opens in INSPECT mode, which
+         * creates nothing and takes no lock, and reports an index it cannot
+         * read as a finding — the right answer about somebody else's index, and
+         * exactly what somebody runs when a client cannot reach the daemon. */
+        if (foreign && strcmp(cmd, "doctor") != 0) {
+            return run_remote(st, &r, err);
+        }
     }
 
     atlas_ctx_opts copts;

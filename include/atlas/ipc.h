@@ -289,6 +289,8 @@ bool atlas_ipc_result_bool(const atlas_ipc_response *r, const char *key, bool *o
  * bounded, no coercion, and an embedded NUL reads as absent. */
 bool atlas_ipc_result_arr_obj_str(const atlas_ipc_response *r, const char *arr_key, size_t index,
                                   const char *key, const char **out);
+bool atlas_ipc_result_arr_obj_bool(const atlas_ipc_response *r, const char *arr_key, size_t index,
+                                   const char *key, bool *out);
 bool atlas_ipc_result_arr_obj_int(const atlas_ipc_response *r, const char *arr_key, size_t index,
                                   const char *key, int64_t *out);
 

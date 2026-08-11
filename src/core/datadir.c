@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <sys/types.h>
 
 const char *atlas_datadir_source_name(atlas_datadir_source src) {
@@ -185,6 +186,19 @@ atlas_status atlas_datadir_ensure(const char *dir, atlas_err *err) {
                                    "cannot restrict permissions on %s", dir);
     }
     return ATLAS_OK;
+}
+
+bool atlas_datadir_is_foreign(const char *dir, atlas_datadir_source src) {
+    if (src != ATLAS_DATADIR_SYSTEM || dir == NULL) {
+        return false;
+    }
+    struct stat sb;
+    if (stat(dir, &sb) != 0) {
+        /* Unreadable is not "ours". A directory this process cannot even stat
+         * is certainly not one it can prepare or open. */
+        return true;
+    }
+    return sb.st_uid != geteuid();
 }
 
 atlas_status atlas_datadir_db_path(const char *dir, atlas_buf *out, atlas_err *err) {

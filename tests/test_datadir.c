@@ -192,6 +192,61 @@ static void test_ensure_creates_private_tree(void) {
     fx_close(&fx);
 }
 
+/* The bug: a read prepared the directory it was about to read from.
+ *
+ * On a per-user install that was invisible. Under A7.1 the index is 0700 and
+ * owned by the service account, so `atlas status` and `atlas repo list` run as
+ * an ordinary client failed at `chmod` — reporting "cannot restrict permissions
+ * on /var/lib/atlas", which is a fact about something the command should never
+ * have attempted. Creating a directory and tightening its mode is an act of
+ * ownership; only a command that is about to write performs one. */
+static void test_only_a_write_prepares_the_data_directory(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    fixture fx;
+    T_OK(fx_open(&fx, &err), &err);
+
+    atlas_buf absent = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_appendf(&absent, &err, "%s/never-created", fx_data_dir(&fx)), &err);
+
+    const atlas_ctx_mode READERS[] = {ATLAS_CTX_READ, ATLAS_CTX_AUTO, ATLAS_CTX_INSPECT};
+    for (size_t i = 0; i < sizeof READERS / sizeof READERS[0]; i++) {
+        atlas_ctx_opts opts;
+        memset(&opts, 0, sizeof opts);
+        opts.data_dir_override = atlas_buf_cstr(&absent);
+        opts.mode = READERS[i];
+        atlas_ctx *ctx = NULL;
+        atlas_err oerr;
+        atlas_err_init(&oerr);
+        /* Whether the open succeeds is not the claim — INSPECT reports an absent
+         * index and the others fail to open one. The claim is that nothing
+         * appeared on disk either way. */
+        if (atlas_ctx_open(&opts, &ctx, &oerr) == ATLAS_OK) {
+            atlas_ctx_close(ctx);
+        }
+        struct stat sb;
+        T_CHECK_MSG(stat(atlas_buf_cstr(&absent), &sb) != 0,
+                    "mode %d created the data directory", (int)READERS[i]);
+    }
+
+    /* A write still prepares it: a first `repo add` or `scan` on a machine where
+     * Atlas has never run has to create the directory, and that process owns it. */
+    atlas_ctx_opts w;
+    memset(&w, 0, sizeof w);
+    w.data_dir_override = atlas_buf_cstr(&absent);
+    w.mode = ATLAS_CTX_WRITE;
+    atlas_ctx *wctx = NULL;
+    T_OK(atlas_ctx_open(&w, &wctx, &err), &err);
+    atlas_ctx_close(wctx);
+    struct stat sb;
+    T_REQUIRE(stat(atlas_buf_cstr(&absent), &sb) == 0);
+    T_CHECK(S_ISDIR(sb.st_mode));
+    T_EQ_INT(sb.st_mode & 07777, 0700);
+
+    atlas_buf_free(&absent);
+    fx_close(&fx);
+}
+
 static void test_ensure_rejects_a_file(void) {
     atlas_err err;
     atlas_err_init(&err);
@@ -225,6 +280,11 @@ static void test_ctx_uses_override_only(void) {
     atlas_ctx_opts opts;
     memset(&opts, 0, sizeof(opts));
     opts.data_dir_override = atlas_buf_cstr(&dir);
+    /* WRITE because only a write prepares the directory, and this test is about
+     * *which* directory is prepared. A reader would resolve the same path and
+     * then fail to open an index nothing had created, which would prove the
+     * same thing less directly. */
+    opts.mode = ATLAS_CTX_WRITE;
     atlas_ctx *ctx = NULL;
     T_OK(atlas_ctx_open(&opts, &ctx, &err), &err);
     T_EQ_STR(atlas_ctx_data_dir(ctx), atlas_buf_cstr(&dir));
@@ -242,6 +302,7 @@ static void test_ctx_uses_override_only(void) {
 }
 
 static const atlas_test TESTS[] = {
+    {"only a write prepares the data directory", test_only_a_write_prepares_the_data_directory},
     {"explicit override wins", test_override_wins},
     {"resolution order", test_resolution_order},
     {"empty and relative paths are configuration errors", test_empty_and_relative_are_errors},

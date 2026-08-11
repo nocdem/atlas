@@ -18,4 +18,9 @@ atlas_status atlas_service_require_repo(atlas_ctx *ctx, const char *name, atlas_
 atlas_status atlas_service_open_repo_git(const atlas_repo_info *info, atlas_git **out,
                                          atlas_err *err);
 
+/* The fresh git observation behind `atlas status NAME`, shared by the local
+ * read and the daemon-served one. Fills `live_head`, `live_state`, `git_ok`,
+ * `git_error` and `head_drift` from `out->repo.root_path` and `out->scanned`. */
+atlas_status atlas_service_status_observe_live(atlas_status_report *out, atlas_err *err);
+
 #endif /* ATLAS_SERVICE_INTERNAL_H */

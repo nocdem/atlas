@@ -264,6 +264,21 @@ void atlas_repo_state_report_free(atlas_repo_state_report *r);
 atlas_status atlas_service_repo_state(atlas_ctx *ctx, const char *name,
                                       atlas_repo_state_report *out, atlas_err *err);
 
+/* A7.1: the same two reads, answered by the daemon over the socket.
+ *
+ * They take no `atlas_ctx` on purpose — under a system deployment the index is
+ * 0700 `atlasd` and a client uid cannot open it, so there is nothing for a
+ * context to hold. Results land in the same report structs the local reads fill,
+ * so both renderers are unchanged. There is no fallback to a local read: a
+ * client that cannot reach the daemon fails, rather than quietly answering from
+ * the pre-cutover per-user database. */
+atlas_status atlas_service_repo_list_remote(atlas_repo_cb cb, void *ud, int64_t *count_out,
+                                            atlas_err *err);
+atlas_status atlas_service_repo_state_remote(const char *name, atlas_repo_state_report *out,
+                                             atlas_err *err);
+atlas_status atlas_service_status_remote(const char *name, atlas_status_report *out,
+                                         atlas_err *err);
+
 /* Streams the durable event journal from `since`, exclusive. */
 atlas_status atlas_service_events(atlas_ctx *ctx, const char *name, int64_t since, int64_t limit,
                                  atlas_event_cb cb, void *ud, int64_t *count_out,

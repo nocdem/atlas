@@ -294,6 +294,21 @@ bool atlas_ipc_result_arr_obj_int(const atlas_ipc_response *r, const char *arr_k
     return false;
 }
 
+bool atlas_ipc_result_arr_obj_bool(const atlas_ipc_response *r, const char *arr_key, size_t index,
+                                   const char *key, bool *out) {
+    *out = false;
+    yyjson_val *o = arr_obj(r, arr_key, index);
+    if (o == NULL) {
+        return false;
+    }
+    yyjson_val *v = yyjson_obj_get(o, key);
+    if (v == NULL || !yyjson_is_bool(v)) {
+        return false;
+    }
+    *out = yyjson_get_bool(v);
+    return true;
+}
+
 bool atlas_ipc_result_int(const atlas_ipc_response *r, const char *key, int64_t *out) {
     *out = 0;
     if (r == NULL || r->result == NULL) {

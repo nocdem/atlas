@@ -41,9 +41,23 @@ atlas_status atlas_ctx_open(const atlas_ctx_opts *opts, atlas_ctx **out, atlas_e
     atlas_ctx_mode mode = (opts != NULL) ? opts->mode : ATLAS_CTX_AUTO;
     atlas_status st =
         atlas_datadir_resolve(override, &ctx->data_dir, &ctx->data_dir_source, err);
-    /* INSPECT resolves where things would be and creates none of them. Every
-     * other mode ensures the directory, because it is about to write there. */
-    if (st == ATLAS_OK && mode != ATLAS_CTX_INSPECT) {
+    /* **Only a command that is about to write prepares the directory.**
+     *
+     * Creating a directory and tightening its mode is an act of ownership, and
+     * a read has no business performing one. On a per-user install it was
+     * harmless and invisible; under A7.1 it is neither. `/var/lib/atlas` is
+     * 0700 `atlasd`, so `atlas status` and `atlas repo list` run as an ordinary
+     * client uid failed at `chmod` — reporting "cannot restrict permissions on
+     * /var/lib/atlas", which describes something the command should never have
+     * attempted rather than anything about the request.
+     *
+     * INSPECT already declined for the neighbouring reason: a diagnostic that
+     * initialises what it is diagnosing can only ever answer "fine". READ and
+     * AUTO now decline for this one. WRITE still prepares, because a first
+     * `repo add` or `scan` on a machine where Atlas has never run has to create
+     * `~/.local/share/atlas`, and that process does own it. A write against a
+     * *foreign* index is refused earlier, at the CLI, before it gets here. */
+    if (st == ATLAS_OK && mode == ATLAS_CTX_WRITE) {
         st = atlas_datadir_ensure(atlas_buf_cstr(&ctx->data_dir), err);
     }
     if (st == ATLAS_OK) {
@@ -675,6 +689,36 @@ void atlas_status_report_free(atlas_status_report *r) {
     atlas_buf_free(&r->git_error);
 }
 
+/* The live observation is taken fresh: a stale index must be visible as drift
+ * rather than presented as the current state.
+ *
+ * Shared by the local read and the daemon-served one so there is one
+ * implementation of "what git says right now" and one definition of head drift.
+ * It needs nothing but the report's own `root_path`, which is why the remote
+ * path can perform it after fetching the index facts over the socket. */
+atlas_status atlas_service_status_observe_live(atlas_status_report *out, atlas_err *err) {
+    atlas_git *g = NULL;
+    atlas_err git_err;
+    atlas_err_init(&git_err);
+    atlas_status gst = atlas_git_open(atlas_buf_cstr(&out->repo.root_path), &g, &git_err);
+    if (gst == ATLAS_OK) {
+        gst = atlas_git_read_head(g, &out->live_head, &git_err);
+    }
+    if (gst == ATLAS_OK) {
+        gst = atlas_git_read_worktree_state(g, &out->live_state, &git_err);
+    }
+    atlas_git_close(g);
+
+    out->git_ok = (gst == ATLAS_OK);
+    if (!out->git_ok) {
+        return atlas_buf_set_str(&out->git_error, atlas_err_msg(&git_err), err);
+    }
+    if (out->scanned) {
+        out->head_drift = (strcmp(out->live_head.oid, out->repo.scanned_head) != 0);
+    }
+    return ATLAS_OK;
+}
+
 atlas_status atlas_service_status(atlas_ctx *ctx, const char *name, atlas_status_report *out,
                                   atlas_err *err) {
     atlas_status st = atlas_service_require_repo(ctx, name, &out->repo, err);
@@ -697,30 +741,7 @@ atlas_status atlas_service_status(atlas_ctx *ctx, const char *name, atlas_status
         return st;
     }
 
-    /* The live observation is taken fresh: a stale index must be visible as
-     * drift rather than presented as the current state. */
-    atlas_git *g = NULL;
-    atlas_err git_err;
-    atlas_err_init(&git_err);
-    atlas_status gst = atlas_git_open(atlas_buf_cstr(&out->repo.root_path), &g, &git_err);
-    if (gst == ATLAS_OK) {
-        gst = atlas_git_read_head(g, &out->live_head, &git_err);
-    }
-    if (gst == ATLAS_OK) {
-        gst = atlas_git_read_worktree_state(g, &out->live_state, &git_err);
-    }
-    atlas_git_close(g);
-
-    out->git_ok = (gst == ATLAS_OK);
-    if (!out->git_ok) {
-        st = atlas_buf_set_str(&out->git_error, atlas_err_msg(&git_err), err);
-        if (st != ATLAS_OK) {
-            return st;
-        }
-    } else if (out->scanned) {
-        out->head_drift = (strcmp(out->live_head.oid, out->repo.scanned_head) != 0);
-    }
-    return ATLAS_OK;
+    return atlas_service_status_observe_live(out, err);
 }
 
 /* --- search -------------------------------------------------------------- */

@@ -5,6 +5,12 @@ build-asan/
 build-ubsan/
 build-tsan/
 
+# CTest's own scratch directory. It is written into whatever directory `ctest`
+# is invoked from: `build/Testing/` for the normal `make test` path, and the
+# source root for anyone who runs `ctest` from here. Neither is source, and the
+# stray one is easy to commit by accident.
+Testing/
+
 # Editor/clangd convenience symlink created by `make compiledb`.
 compile_commands.json
 

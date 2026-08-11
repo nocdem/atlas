@@ -132,6 +132,34 @@ void atlas_repo_state_report_free(atlas_repo_state_report *r) {
     atlas_index_state_free(&r->state);
 }
 
+/* "Current" means a completed generation exists AND nothing is known to have
+ * been missed. A repository with an outstanding event gap is never current,
+ * however recently it was reconciled — Atlas does not get to describe an index
+ * as up to date while it knows there is a hole in what it observed.
+ *
+ * One authority for the strings, because both the local read and the
+ * daemon-served one produce them and a second copy would drift. The daemon
+ * sends its own `index_current`/`not_current_reason` too; the remote path
+ * re-derives from the flags rather than trusting them, so the two answers
+ * cannot disagree about a state they both hold. */
+static void derive_index_current(atlas_repo_state_report *out) {
+    out->index_current = false;
+    if (!out->state.present || out->state.last_complete_generation == 0) {
+        out->not_current_reason = "the repository has never been reconciled";
+    } else if (out->state.event_gap) {
+        out->not_current_reason =
+            "filesystem events were missed; a full reconciliation is outstanding";
+    } else if (out->state.pending_full_reconcile) {
+        out->not_current_reason = "a full reconciliation is outstanding";
+    } else if (out->state.watch_state == ATLAS_WATCH_ERROR) {
+        out->not_current_reason = "the watcher failed and is not observing this repository";
+    } else if (out->state.watch_state == ATLAS_WATCH_DEGRADED) {
+        out->not_current_reason = "the watcher is degraded and may not observe every change";
+    } else {
+        out->index_current = true;
+    }
+}
+
 atlas_status atlas_service_repo_state(atlas_ctx *ctx, const char *name,
                                       atlas_repo_state_report *out, atlas_err *err) {
     atlas_status st = atlas_service_require_repo(ctx, name, &out->repo, err);
@@ -153,21 +181,7 @@ atlas_status atlas_service_repo_state(atlas_ctx *ctx, const char *name,
      * event gap is never current, however recently it was reconciled — Atlas
      * does not get to describe an index as up to date while it knows there is a
      * hole in what it observed. */
-    out->index_current = false;
-    if (!out->state.present || out->state.last_complete_generation == 0) {
-        out->not_current_reason = "the repository has never been reconciled";
-    } else if (out->state.event_gap) {
-        out->not_current_reason =
-            "filesystem events were missed; a full reconciliation is outstanding";
-    } else if (out->state.pending_full_reconcile) {
-        out->not_current_reason = "a full reconciliation is outstanding";
-    } else if (out->state.watch_state == ATLAS_WATCH_ERROR) {
-        out->not_current_reason = "the watcher failed and is not observing this repository";
-    } else if (out->state.watch_state == ATLAS_WATCH_DEGRADED) {
-        out->not_current_reason = "the watcher is degraded and may not observe every change";
-    } else {
-        out->index_current = true;
-    }
+    derive_index_current(out);
     return ATLAS_OK;
 }
 
@@ -413,5 +427,306 @@ atlas_status atlas_service_sync(atlas_ctx *ctx, const char *name, bool full, boo
     atlas_buf_free(&sock);
     atlas_buf_free(&params);
     atlas_buf_free(&resp);
+    return st;
+}
+
+/* --- A7.1: reads served by the daemon -------------------------------------
+ *
+ * Under a system deployment the index is owned by `atlasd` and is 0700, so a
+ * client uid cannot open it — not because Atlas refuses, but because the kernel
+ * does, and it has to stay that way while `atlas-worker` is a member of the
+ * client group. These two functions are how the CLI answers `repo list` and
+ * `status <repo>` in that deployment: over the socket, with no context, no data
+ * directory and no database handle.
+ *
+ * There is deliberately **no fallback to a local read**. A7.1's rule is that a
+ * client which cannot reach the daemon must fail rather than quietly read the
+ * pre-cutover per-user database, and a fallback here would be exactly that. */
+
+static atlas_status daemon_read(const char *method, const char *params, atlas_buf *raw,
+                                atlas_ipc_response **out, atlas_err *err) {
+    *out = NULL;
+    atlas_buf sock = ATLAS_BUF_INIT;
+    atlas_status st = atlas_ipc_socket_path(&sock, err);
+    if (st == ATLAS_OK) {
+        st = atlas_ipc_call(atlas_buf_cstr(&sock), method, params, raw, err);
+    }
+    atlas_buf_free(&sock);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    st = atlas_ipc_response_parse(raw->data, raw->len, out, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (!atlas_ipc_response_ok(*out)) {
+        return atlas_err_set(err, atlas_ipc_response_status(*out), "%s",
+                             atlas_ipc_response_message(*out));
+    }
+    return ATLAS_OK;
+}
+
+/* Copies one listing item into the struct both renderers already consume, so
+ * the daemon-served listing and the local one render identically. Absent keys
+ * leave their fields empty rather than failing: a daemon older than this binary
+ * answers a shorter object, and a blank column is a better outcome than a
+ * refusal to list anything. */
+static void repo_item_from_response(const atlas_ipc_response *r, size_t i, atlas_repo_info *ri,
+                                    atlas_err *err) {
+    const char *v = NULL;
+    int64_t n = 0;
+    bool b = false;
+    if (atlas_ipc_result_arr_obj_str(r, "repositories", i, "repo", &v)) {
+        (void)snprintf(ri->name, sizeof(ri->name), "%s", v);
+    }
+    if (atlas_ipc_result_arr_obj_str(r, "repositories", i, "root", &v)) {
+        (void)atlas_buf_set_str(&ri->root_path_text, v, err);
+    }
+    if (atlas_ipc_result_arr_obj_str(r, "repositories", i, "last_scan_at", &v)) {
+        (void)snprintf(ri->last_scan_at, sizeof(ri->last_scan_at), "%s", v);
+    }
+    if (atlas_ipc_result_arr_obj_str(r, "repositories", i, "scanned_head", &v)) {
+        (void)snprintf(ri->scanned_head, sizeof(ri->scanned_head), "%s", v);
+    }
+    if (atlas_ipc_result_arr_obj_str(r, "repositories", i, "branch", &v)) {
+        (void)snprintf(ri->current_branch, sizeof(ri->current_branch), "%s", v);
+    }
+    if (atlas_ipc_result_arr_obj_str(r, "repositories", i, "head_state", &v)) {
+        (void)snprintf(ri->head_state, sizeof(ri->head_state), "%s", v);
+    }
+    if (atlas_ipc_result_arr_obj_str(r, "repositories", i, "object_format", &v)) {
+        (void)snprintf(ri->object_format, sizeof(ri->object_format), "%s", v);
+    }
+    if (atlas_ipc_result_arr_obj_str(r, "repositories", i, "registered_at", &v)) {
+        (void)snprintf(ri->registered_at, sizeof(ri->registered_at), "%s", v);
+    }
+    if (atlas_ipc_result_arr_obj_int(r, "repositories", i, "id", &n)) {
+        ri->id = n;
+    }
+    if (atlas_ipc_result_arr_obj_bool(r, "repositories", i, "dirty", &b)) {
+        ri->dirty = b;
+    }
+    if (atlas_ipc_result_arr_obj_bool(r, "repositories", i, "linked_worktree", &b)) {
+        ri->is_linked_worktree = b;
+    }
+}
+
+atlas_status atlas_service_repo_list_remote(atlas_repo_cb cb, void *ud, int64_t *count_out,
+                                            atlas_err *err) {
+    *count_out = 0;
+    atlas_buf raw = ATLAS_BUF_INIT;
+    atlas_ipc_response *r = NULL;
+    atlas_status st = daemon_read("repo.list", "{}", &raw, &r, err);
+    for (size_t i = 0; st == ATLAS_OK; i++) {
+        const char *probe = NULL;
+        if (!atlas_ipc_result_arr_obj_str(r, "repositories", i, "repo", &probe)) {
+            break; /* past the end of the array */
+        }
+        atlas_repo_info ri;
+        atlas_repo_info_init(&ri);
+        repo_item_from_response(r, i, &ri, err);
+        st = cb(&ri, ud, err);
+        atlas_repo_info_free(&ri);
+        if (st == ATLAS_OK) {
+            (*count_out)++;
+        }
+    }
+    atlas_ipc_response_free(r);
+    atlas_buf_free(&raw);
+    return st;
+}
+
+/* `atlas status NAME` with the index behind the daemon.
+ *
+ * The index facts come over the socket; the live git observation is taken here,
+ * fresh, exactly as the local path takes it. That split is not a convenience:
+ * head drift is the whole point of the report, and a "live" state observed by
+ * the daemon at some other moment would be the stale half of the comparison
+ * pretending to be the fresh one. */
+atlas_status atlas_service_status_remote(const char *name, atlas_status_report *out,
+                                         atlas_err *err) {
+    atlas_status st = atlas_db_check_repo_name(name, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    atlas_buf params = ATLAS_BUF_INIT;
+    st = build_repo_params(name, NULL, &params, err);
+    if (st != ATLAS_OK) {
+        atlas_buf_free(&params);
+        return st;
+    }
+    atlas_buf raw = ATLAS_BUF_INIT;
+    atlas_ipc_response *r = NULL;
+    st = daemon_read("repo.state", atlas_buf_cstr(&params), &raw, &r, err);
+    atlas_buf_free(&params);
+    if (st != ATLAS_OK) {
+        atlas_ipc_response_free(r);
+        atlas_buf_free(&raw);
+        return st;
+    }
+
+    const char *v = NULL;
+    int64_t n = 0;
+    bool b = false;
+    if (atlas_ipc_result_str(r, "repo", &v)) {
+        (void)snprintf(out->repo.name, sizeof(out->repo.name), "%s", v);
+    }
+    if (st == ATLAS_OK && atlas_ipc_result_str(r, "root", &v)) {
+        st = atlas_buf_set_str(&out->repo.root_path_text, v, err);
+        if (st == ATLAS_OK) {
+            /* The raw bytes are what git is addressed with, and `root` is the
+             * reversible `%XX` display form — decoded rather than used as-is,
+             * because a path is bytes and may not be UTF-8. */
+            st = atlas_path_text_decode(v, strlen(v), &out->repo.root_path, err);
+        }
+    }
+    if (atlas_ipc_result_str(r, "last_scan_at", &v)) {
+        (void)snprintf(out->repo.last_scan_at, sizeof(out->repo.last_scan_at), "%s", v);
+    }
+    if (atlas_ipc_result_str(r, "scanned_head", &v)) {
+        (void)snprintf(out->repo.scanned_head, sizeof(out->repo.scanned_head), "%s", v);
+    }
+    if (atlas_ipc_result_str(r, "branch", &v)) {
+        (void)snprintf(out->repo.current_branch, sizeof(out->repo.current_branch), "%s", v);
+    }
+    if (atlas_ipc_result_str(r, "head_state", &v)) {
+        (void)snprintf(out->repo.head_state, sizeof(out->repo.head_state), "%s", v);
+    }
+    if (atlas_ipc_result_str(r, "object_format", &v)) {
+        (void)snprintf(out->repo.object_format, sizeof(out->repo.object_format), "%s", v);
+    }
+    if (atlas_ipc_result_str(r, "registered_at", &v)) {
+        (void)snprintf(out->repo.registered_at, sizeof(out->repo.registered_at), "%s", v);
+    }
+    if (atlas_ipc_result_int(r, "id", &n)) {
+        out->repo.id = n;
+    }
+    if (atlas_ipc_result_bool(r, "dirty", &b)) {
+        out->repo.dirty = b;
+    }
+    if (atlas_ipc_result_bool(r, "linked_worktree", &b)) {
+        out->repo.is_linked_worktree = b;
+    }
+    if (atlas_ipc_result_int(r, "files_live", &n)) {
+        out->counts.files_live = n;
+    }
+    if (atlas_ipc_result_int(r, "files_deleted", &n)) {
+        out->counts.files_deleted = n;
+    }
+    if (atlas_ipc_result_int(r, "commits", &n)) {
+        out->counts.commits = n;
+    }
+    if (atlas_ipc_result_int(r, "changes", &n)) {
+        out->counts.changes = n;
+    }
+    if (atlas_ipc_result_int(r, "scans", &n)) {
+        out->counts.scans = n;
+    }
+    if (atlas_ipc_result_int(r, "evidence", &n)) {
+        out->counts.evidence = n;
+    }
+    if (atlas_ipc_result_int(r, "compile_databases", &n)) {
+        out->counts.compile_databases = n;
+    }
+    if (atlas_ipc_result_int(r, "sibling_worktrees", &n)) {
+        out->sibling_worktrees = n;
+    }
+    if (atlas_ipc_result_int(r, "last_scan_id", &n)) {
+        out->repo.last_scan_id = n;
+    }
+    if (st == ATLAS_OK && atlas_ipc_result_str(r, "git_common_dir", &v)) {
+        st = atlas_path_text_decode(v, strlen(v), &out->repo.git_common_dir, err);
+    }
+    if (st == ATLAS_OK && atlas_ipc_result_str(r, "git_dir", &v)) {
+        st = atlas_path_text_decode(v, strlen(v), &out->repo.git_dir, err);
+    }
+    atlas_ipc_response_free(r);
+    atlas_buf_free(&raw);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+
+    out->never_scanned = (out->repo.last_scan_id == 0);
+    out->scanned = !out->never_scanned;
+    return atlas_service_status_observe_live(out, err);
+}
+
+atlas_status atlas_service_repo_state_remote(const char *name, atlas_repo_state_report *out,
+                                             atlas_err *err) {
+    atlas_status st = atlas_db_check_repo_name(name, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    atlas_buf params = ATLAS_BUF_INIT;
+    st = build_repo_params(name, NULL, &params, err);
+    if (st != ATLAS_OK) {
+        atlas_buf_free(&params);
+        return st;
+    }
+    atlas_buf raw = ATLAS_BUF_INIT;
+    atlas_ipc_response *r = NULL;
+    st = daemon_read("repo.state", atlas_buf_cstr(&params), &raw, &r, err);
+    atlas_buf_free(&params);
+    if (st != ATLAS_OK) {
+        atlas_ipc_response_free(r);
+        atlas_buf_free(&raw);
+        return st;
+    }
+
+    const char *v = NULL;
+    int64_t n = 0;
+    bool b = false;
+    if (atlas_ipc_result_str(r, "repo", &v)) {
+        (void)snprintf(out->repo.name, sizeof(out->repo.name), "%s", v);
+    }
+    if (atlas_ipc_result_str(r, "root", &v)) {
+        st = atlas_buf_set_str(&out->repo.root_path_text, v, err);
+    }
+    if (atlas_ipc_result_int(r, "id", &n)) {
+        out->repo.id = n;
+    }
+    if (atlas_ipc_result_int(r, "generation", &n)) {
+        out->state.generation = n;
+    }
+    if (atlas_ipc_result_int(r, "last_complete_generation", &n)) {
+        out->state.last_complete_generation = n;
+    }
+    if (atlas_ipc_result_int(r, "last_sync_seq", &n)) {
+        out->state.last_sync_seq = n;
+    }
+    if (atlas_ipc_result_int(r, "watched_directories", &n)) {
+        out->state.watched_dirs = n;
+    }
+    if (atlas_ipc_result_int(r, "event_cursor", &n)) {
+        out->event_cursor = n;
+    }
+    if (atlas_ipc_result_bool(r, "event_gap", &b)) {
+        out->state.event_gap = b;
+    }
+    if (atlas_ipc_result_bool(r, "pending_full_reconcile", &b)) {
+        out->state.pending_full_reconcile = b;
+    }
+    if (atlas_ipc_result_str(r, "last_reconcile_at", &v)) {
+        (void)snprintf(out->state.last_reconcile_at, sizeof(out->state.last_reconcile_at), "%s", v);
+    }
+    if (atlas_ipc_result_str(r, "last_complete_at", &v)) {
+        (void)snprintf(out->state.last_complete_at, sizeof(out->state.last_complete_at), "%s", v);
+    }
+    if (st == ATLAS_OK && atlas_ipc_result_str(r, "watch_detail", &v)) {
+        st = atlas_buf_set_str(&out->state.watch_detail, v, err);
+    }
+    if (st == ATLAS_OK && atlas_ipc_result_str(r, "last_error", &v)) {
+        st = atlas_buf_set_str(&out->state.last_error, v, err);
+    }
+    if (atlas_ipc_result_str(r, "watch_state", &v)) {
+        out->state.watch_state = atlas_watch_state_parse(v);
+    }
+    /* `present` is not on the wire: the daemon answered about a repository it
+     * holds, and a row it could describe is a row that exists. */
+    out->state.present = true;
+    derive_index_current(out);
+
+    atlas_ipc_response_free(r);
+    atlas_buf_free(&raw);
     return st;
 }

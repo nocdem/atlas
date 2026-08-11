@@ -261,11 +261,17 @@ const char *atlas_git_change_type_name(char kind);
  * invoke. What the worker gets is a directory of ordinary files.
  */
 
-/* One entry of `git ls-tree -r -z`. `mode` is the raw octal string, so a caller
+/* One entry of `git ls-tree -r -z -l`. `mode` is the raw octal string, so a caller
  * can refuse a symlink (120000) or a gitlink (160000) by naming it rather than
  * by inferring it. `path` is raw bytes and may be any length; it is NOT
  * NUL-terminated beyond `path_len`. */
 typedef struct atlas_git_tree_entry {
+    /* The blob's size in bytes, from the listing rather than from reading it.
+     * `-1` when git reported none, which it does for a gitlink: a caller must
+     * treat that as unknown rather than as empty. Knowing the size before the
+     * object is opened is what lets a caller refuse an oversized blob instead of
+     * discovering the bound halfway through a child process's output. */
+    int64_t size;
     const char *mode;
     const char *type;
     const char *oid;

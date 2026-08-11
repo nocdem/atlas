@@ -205,7 +205,17 @@ atlas_status atlas_daemon_run(const atlas_daemon_opts *opts, FILE *log, atlas_er
         goto done;
     }
 
+    /* Loaded before the watcher starts, because the watcher's timer is what
+     * drives A8's recovery sweep and it has to be told whether to sweep. */
+    atlas_orchpolicy orchpolicy;
+    if (serving_system_index) {
+        atlas_orchpolicy_load(&orchpolicy);
+    } else {
+        memset(&orchpolicy, 0, sizeof(orchpolicy));
+    }
+
     st = atlas_watcher_start(atlas_buf_cstr(&db_path), writer, log,
+                             orchpolicy.state == ATLAS_ORCHPOLICY_ENABLED,
                              opts->reconcile_interval_ms, &watcher, err);
     if (st != ATLAS_OK) {
         goto done;
@@ -240,11 +250,7 @@ atlas_status atlas_daemon_run(const atlas_daemon_opts *opts, FILE *log, atlas_er
      * This is the same guard `serving_system_index` applies to the system
      * policy, for the same reason, and a clean-extraction run caught its absence
      * by finding a fixture daemon that had quietly inherited the live policy. */
-    if (serving_system_index) {
-        atlas_orchpolicy_load(&sctx.orchpolicy);
-    } else {
-        memset(&sctx.orchpolicy, 0, sizeof(sctx.orchpolicy));
-    }
+    sctx.orchpolicy = orchpolicy;
     sctx.started_at_ms = monotonic_ms();
 
     atlas_daemon_log(log, "info", "serving on %s with %zu workers",

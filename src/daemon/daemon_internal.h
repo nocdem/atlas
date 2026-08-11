@@ -239,7 +239,11 @@ typedef struct atlas_watcher atlas_watcher;
 
 /* Starts the inotify watcher. It opens its own read-only database handle to
  * enumerate repositories, and submits reconciliations through `writer`. */
+/* `orch_enabled` arms the orchestration recovery sweep on the watcher's timer.
+ * False on every daemon that is not serving the system index under an active
+ * policy, so a fixture or ad-hoc daemon never sweeps. */
 atlas_status atlas_watcher_start(const char *db_path, atlas_writer *writer, FILE *log,
+                                 bool orch_enabled,
                                  int reconcile_interval_ms, atlas_watcher **out, atlas_err *err);
 void atlas_watcher_stop(atlas_watcher *w);
 /* Total inotify watches currently installed, for `daemon status`. */

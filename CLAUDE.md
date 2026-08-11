@@ -894,9 +894,22 @@ docs/security A7_1_THREAT_MODEL.md, A7_1_OPERATIONS.md
   asserting `nocdem` cannot do something**, and never claim in prose that it is
   constrained. The adversary is `atlas-worker`.
 - **Every persistent or autonomous model process runs as `atlas-worker`, never
-  as `nocdem`.** That is the architectural commitment the separation rests on.
-  A8's dispatcher inherits it; if it is broken the guarantee is void and no code
-  change restores it.
+  as `nocdem`, unless a root-owned policy names an exception.** That is the
+  architectural commitment the separation rests on, and A8's worker dispatcher
+  inherits it unchanged.
+
+  **A8.1 is the one configured exception, and it must be described as one.** A
+  second dispatcher — `model_dispatcher_uid` in `/etc/atlas/orchestration.conf`
+  — may run drivers that need a live model as the operator's own account,
+  because Claude Code authenticates with a session that lives in a person's home
+  directory and Atlas must not copy, read or relocate one. What it costs is
+  stated plainly: a job that dispatcher runs holds the operator's filesystem
+  authority, not `atlas-worker`'s, so for those jobs A7.1's OS isolation does
+  not apply. Everything else about the job — record, lease, bounds, snapshot,
+  ledger — is unchanged. Absent that key, which is the default, A8 is exactly as
+  it was. Never widen the exception to drivers that do not need a model, and
+  never let it reach the lifecycle: `atlas_authority_probe` is untouched and
+  A8.1 mints no capability.
 - **The guarantees that matter are kernel-enforced, not Atlas-enforced.**
   `atlas-worker` cannot read the index or the backups (0700 `atlasd`), cannot
   replace the binary or the policies (root-owned), and cannot stop the service

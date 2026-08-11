@@ -263,20 +263,23 @@ static atlas_status claude_run(const atlas_driver_req *req, atlas_driver_res *re
 
     atlas_buf cred = ATLAS_BUF_INIT;
     bool have_cred = false;
-    st = read_service_credential(&cred, &have_cred, err);
-    if (st != ATLAS_OK) {
-        atlas_buf_free(&cred);
-        return st;
-    }
-    if (!have_cred) {
-        atlas_buf_free(&cred);
-        /* Named precisely, and without hinting that any other credential on the
-         * machine could be used instead. An operator's personal session is not
-         * a service credential and Atlas must never reach for one. */
-        return atlas_err_set(err, ATLAS_ERR_CONFIG,
-                             "no worker service credential is installed at %s, so the claude "
-                             "driver cannot run",
-                             ATLAS_CLAUDE_CREDENTIAL_PATH);
+    if (!req->operator_session) {
+        st = read_service_credential(&cred, &have_cred, err);
+        if (st != ATLAS_OK) {
+            atlas_buf_free(&cred);
+            return st;
+        }
+        if (!have_cred) {
+            atlas_buf_free(&cred);
+            /* Named precisely, and without hinting that any other credential on
+             * the machine could be used instead. An operator's personal session
+             * is not a service credential, and Atlas reaches for one only when
+             * the root-owned policy has said so explicitly. */
+            return atlas_err_set(err, ATLAS_ERR_CONFIG,
+                                 "no worker service credential is installed at %s, so the claude "
+                                 "driver cannot run",
+                                 ATLAS_CLAUDE_CREDENTIAL_PATH);
+        }
     }
 
     atlas_buf exe = ATLAS_BUF_INIT;
@@ -287,14 +290,31 @@ static atlas_status claude_run(const atlas_driver_req *req, atlas_driver_res *re
         return st;
     }
 
-    /* A private HOME inside the attempt, so the CLI's own state directory is
-     * created in the workspace and never in the worker's home — and so nothing
-     * a previous job left behind can influence this one. */
+    /* Where the CLI keeps its own state.
+     *
+     * In service mode this is a private directory inside the attempt, so nothing
+     * a previous job left behind can influence this one and the worker's home is
+     * never touched.
+     *
+     * In operator-session mode it is the dispatcher's *real* HOME, because that
+     * is where the operator's existing login lives and using it is the whole
+     * point. Atlas reads nothing there: it sets the variable and executes. */
     atlas_buf home = ATLAS_BUF_INIT;
-    st = atlas_buf_appendf(&home, err, "%s/home", atlas_buf_cstr(&req->ws->driver));
-    if (st == ATLAS_OK && mkdir(atlas_buf_cstr(&home), 0700) != 0 && errno != EEXIST) {
-        st = atlas_err_set_errno(err, ATLAS_ERR_INTERNAL, errno,
-                                 "cannot create the driver home directory");
+    if (req->operator_session) {
+        const char *h = getenv("HOME");
+        if (h == NULL || h[0] != '/') {
+            st = atlas_err_set(err, ATLAS_ERR_CONFIG,
+                               "the model dispatcher has no HOME, so there is no operator "
+                               "session to use");
+        } else {
+            st = atlas_buf_set_str(&home, h, err);
+        }
+    } else {
+        st = atlas_buf_appendf(&home, err, "%s/home", atlas_buf_cstr(&req->ws->driver));
+        if (st == ATLAS_OK && mkdir(atlas_buf_cstr(&home), 0700) != 0 && errno != EEXIST) {
+            st = atlas_err_set_errno(err, ATLAS_ERR_INTERNAL, errno,
+                                     "cannot create the driver home directory");
+        }
     }
 
     /* A constructed environment, never inherited — the rule `src/git` follows,
@@ -304,14 +324,21 @@ static atlas_status claude_run(const atlas_driver_req *req, atlas_driver_res *re
     if (st == ATLAS_OK) {
         st = atlas_buf_appendf(&home_env, err, "HOME=%s", atlas_buf_cstr(&home));
     }
-    const char *env[8];
+    const char *env[10];
     size_t nenv = 0;
     env[nenv++] = "PATH=/usr/local/bin:/usr/bin:/bin";
     env[nenv++] = "LC_ALL=C";
     env[nenv++] = "LANG=C";
     env[nenv++] = "TZ=UTC";
     env[nenv++] = atlas_buf_cstr(&home_env);
-    env[nenv++] = atlas_buf_cstr(&cred);
+    if (!req->operator_session) {
+        env[nenv++] = atlas_buf_cstr(&cred);
+    }
+    /* `CLAUDECODE` is deliberately absent, and its absence is load-bearing:
+     * Claude Code refuses to start when it sees that variable, because a nested
+     * session would share runtime state with its parent. The environment is
+     * constructed rather than inherited, so it is absent by default — this
+     * comment exists so nobody "helpfully" forwards it later. */
     env[nenv] = NULL;
 
     capture out;
@@ -398,7 +425,18 @@ static atlas_status claude_run(const atlas_driver_req *req, atlas_driver_res *re
         while (*s == ' ' || *s == '\n' || *s == '\r' || *s == '\t') {
             s++;
         }
-        res->exit_kind = (*s == '{') ? ATLAS_ORCH_EXIT_OK : ATLAS_ORCH_EXIT_MALFORMED_RESULT;
+        /* `--output-format json` emits a JSON *array* of message objects, not a
+         * single object — measured against Claude Code 2.1.226, after a first
+         * real run that did the work correctly and was then classified
+         * MALFORMED_RESULT for starting with `[`. Both shapes are accepted; a
+         * driver that printed prose still is not.
+         *
+         * The check stays structural and deliberately shallow. Nothing inside
+         * the document is read, because a model's output is never parsed as
+         * authority — the token and cost fields on the result stay zero, which
+         * the header documents as "not reported" rather than "free". */
+        res->exit_kind = (*s == '{' || *s == '[') ? ATLAS_ORCH_EXIT_OK
+                                                  : ATLAS_ORCH_EXIT_MALFORMED_RESULT;
         atlas_err ignore;
         atlas_err_init(&ignore);
         (void)atlas_ws_write(req->ws, "driver/result.json", out.out.data, out.out.len, &ignore);

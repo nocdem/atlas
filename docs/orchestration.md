@@ -201,6 +201,20 @@ be expired. On an expired lease it releases the lease, ends the attempt as
 Recovery is idempotent, and a completed job survives any number of sweeps
 unchanged.
 
+**The sweep runs on the watcher's timer**, every 20 s, on a daemon serving the
+system index under an active policy and on no other. Nothing outside Atlas can
+ask for it, which is what stops one worker expiring another's job — and also
+means it runs if and only if the daemon calls it. It did not, for the whole of
+A8's first deployment: `op_recover` was implemented, documented as timer-driven
+and exercised by four tests, and never wired to a caller. A job whose worker lost
+its lease sat in `PREPARING` indefinitely, which is how it was found. Every
+recovery behaviour in the table above depends on that one call.
+
+Heartbeats keep a lease alive during *every* long phase, not only while a driver
+is running: the snapshot transfer heartbeats on the same throttle, because
+copying a large tree is progress and a lease that expires mid-copy loses the
+attempt.
+
 ## The RPC surface, and the line through it
 
 Two groups, selected by the peer's uid from `SO_PEERCRED` and by nothing else:
@@ -208,11 +222,21 @@ Two groups, selected by the peer's uid from `SO_PEERCRED` and by nothing else:
 | Group | Methods | Reachable from |
 | --- | --- | --- |
 | `job.` | `submit`, `get`, `list`, `cancel`, `artifact` | a uid the policy lists as a submitter |
-| `dispatch.` | `lease`, `heartbeat`, `event`, `complete` | the single uid the policy names as the dispatcher |
+| `dispatch.` | `lease`, `heartbeat`, `event`, `complete` | a uid the policy names as a dispatcher — `dispatcher_uid`, or A8.1's `model_dispatcher_uid` |
 
-A name in the group a peer is not in is simply **not found** — the same answer as
-for a name that does not exist. A refusal that distinguished "you may not" from
-"there is no such thing" would tell a caller what to try next.
+A `dispatch.` name is simply **not found** for a peer the policy does not name —
+the same answer as for a name that does not exist. A refusal distinguishing "you
+may not" from "there is no such thing" would tell a caller what to try next. A
+`job.` name is always found and refuses with *orchestration is not enabled*: a
+submitter learns nothing it could not learn by reading the root-owned policy
+path, and the honest answer is what lets an operator tell a disabled policy apart
+from a binary too old to have the method.
+
+The two sets are consulted **additively**, so a uid that is both a submitter and
+a dispatcher holds both. A8.1 made that case real — the operator's account
+submits jobs and runs the model dispatcher — and an either/or lookup silently
+took `job.submit` away from it. Routing is not authorisation: every method still
+runs its own `require_submitter` or `require_dispatcher`.
 
 ### Why a dispatcher tier is not a privileged tier
 
@@ -374,6 +398,18 @@ There is no `.git` under an attempt, so:
 * **submodules and LFS are not "disabled" — they are absent.** A gitlink entry is
   refused at listing time and no machinery exists to act on one.
 
+A file **larger than the per-file bound is refused and counted**, from the
+listing, before the object is ever opened. `git ls-tree -l` reports the size, so
+the decision is made without reading the blob; the read bound stays as a second
+layer. This is not truncation and must not be described as one: the file is
+excluded whole, counted, and named in the snapshot event beside the symlink and
+gitlink counts, so a driver sees a work tree missing it and an operator is told
+why. The alternative — raising the bound until one repository's largest file
+fits — buffers that file in the daemon and moves a limit to make a run pass. A
+real 68 MB test vector is what produced this: before it, one oversized file
+aborted the entire snapshot and reported a child-process output error rather
+than a fact about the tree.
+
 A tracked **symlink is refused and counted**, never recreated: a materialised
 link is a path that leaves the workspace the moment it is followed. A **gitlink
 is refused at enumeration**, so submodules are absent rather than disabled. Two
@@ -442,14 +478,38 @@ grandchild cannot survive.
 | `fake` | in process, deterministic: success, failure, timeout, cancellation, malformed result | no |
 | `claude` | Claude Code noninteractively (`--print --output-format json`) in `work/` | yes |
 
+A driver needing a model additionally requires `live_model` in the policy, and —
+in `operator_session` mode — a dispatcher the policy named for the purpose. Two
+independent gates, neither of which a worker can set.
+
 A driver is given a workspace, a task and bounds — not the lease token, the job
 identity, the repository path, the pinned commit or the retry limit, because it
 must not be able to change any of them.
 
 **A zero exit is not a success claim Atlas accepts.** The Claude driver requests
 JSON and classifies a zero exit that produced something else as
-`MALFORMED_RESULT`. The check is structural — is this a JSON object? — and
+`MALFORMED_RESULT`. The check is structural — is this a JSON document? — and
 deliberately shallow, because a model's output is never parsed as authority.
+`--output-format json` emits a top-level *array*, so both an array and an object
+are accepted; nothing inside either is read, and the token and cost fields stay
+zero, which the header documents as "not reported" rather than "free".
+
+**A8.1: the model dispatcher and the operator session.** A driver that needs a
+live model has to authenticate, and the only Claude Code credential on this
+machine is a session in a person's home directory. Atlas will not copy, read,
+print or store one. So the root-owned policy may name a *second* dispatcher uid,
+`model_dispatcher_uid`, with its own `model_worker_root`, permitted to lease
+**only** jobs whose driver needs a model; with `model_credential =
+operator_session` that driver runs under the dispatcher's own account and HOME
+and the CLI authenticates itself. Atlas sets a working directory and executes.
+
+The cost is stated rather than hedged: those jobs hold the operator's filesystem
+authority, not `atlas-worker`'s, so A7.1's OS isolation does not cover them.
+Everything else is unchanged — the job record, the lease, the bounds, the
+snapshot, the ledger, and the rule that a completed job is not an authority. The
+key is absent by default, and absent it A8 is exactly as it was. The alternative
+`model_credential = service` requires the root-installed `/etc/atlas/claude.env`
+and refuses without it.
 
 Logs are redacted for credential *shapes* before they are stored. That is a
 mitigation and is documented as one: a secret Atlas has never seen the shape of
@@ -481,7 +541,21 @@ Their absence is the deferral — `tests/test_orch_rpc.c` asks a live daemon for
 every name they would plausibly have and requires each to answer `unknown
 method`.
 
-**Live model execution requires a worker service credential** installed by root
-at `/etc/atlas/claude.env`, and `live_model = on` in the policy. Atlas never
-creates that file and never reaches for an operator's personal session. Without
-it the `claude` driver refuses cleanly and everything else works.
+**Live model execution requires `live_model = on` in the policy and one of two
+credential arrangements**, and Atlas never creates, reads, copies, prints or
+stores either.
+
+* `model_credential = service` (the default): a worker service credential
+  installed by root at `/etc/atlas/claude.env`, used by the `atlas-worker`
+  dispatcher. Without it the `claude` driver refuses cleanly and everything else
+  works.
+* `model_credential = operator_session` (A8.1): the policy also names
+  `model_dispatcher_uid` and `model_worker_root`, and a second dispatcher runs
+  under that account, using whatever session already lives in its HOME. Atlas
+  sets a working directory and executes; it never touches the credential. Those
+  jobs carry that account's filesystem authority — see the note in **Drivers**
+  and `docs/security/A7_1_THREAT_MODEL.md`.
+
+Deferred here too, and for the same reason: A8.1 changes which OS principal a
+model driver runs as, and nothing else. It applies no patch, mints no lifecycle
+capability, adds no RPC method and adds no schema migration.

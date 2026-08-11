@@ -20,6 +20,7 @@
 
 #include "atlas/atlas.h"
 #include "atlas/dispatch.h"
+#include "atlas/driver.h"
 #include "atlas/ipc.h"
 #include "atlas/orch.h"
 #include "atlas/orchpolicy.h"
@@ -306,14 +307,47 @@ atlas_status atlas_service_dispatcher_run(bool once, FILE *log, atlas_err *err) 
                              atlas_orchpolicy_reason_name(op.reason),
                              atlas_orchpolicy_reason_explain(op.reason));
     }
-    /* The dispatcher must be the uid the policy names. Checked here so a
+    /* The dispatcher must be a uid the policy names. Checked here so a
      * misconfigured unit fails at startup with a clear message rather than
-     * being refused on every lease attempt for the lifetime of the service. */
-    if (!atlas_orchpolicy_is_dispatcher(&op, (long long)getuid())) {
+     * being refused on every lease attempt for the lifetime of the service.
+     *
+     * Which of the two it is decides three things — the workspace root, the
+     * driver filter and whose credentials a model driver uses — and all three
+     * come from the root-owned policy rather than from the process deciding for
+     * itself. */
+    const bool is_worker = atlas_orchpolicy_is_dispatcher(&op, (long long)getuid());
+    const bool is_model = atlas_orchpolicy_is_model_dispatcher(&op, (long long)getuid());
+    if (!is_worker && !is_model) {
         return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
                              "this process runs as uid %lld, which the orchestration policy does "
-                             "not name as the dispatcher",
+                             "not name as a dispatcher",
                              (long long)getuid());
+    }
+
+    /* The driver filter is derived from the policy's own driver list rather than
+     * from a flag, so the two dispatchers partition the queue by construction:
+     * whatever needs a model goes to the operator's, everything else to the
+     * worker's. A driver added to the policy lands on exactly one of them. */
+    char filter[256];
+    size_t flen = 0;
+    filter[0] = '\0';
+    for (size_t i = 0; i < op.driver_count; i++) {
+        const atlas_driver *d = atlas_driver_find(op.drivers[i]);
+        bool wants_model = (d != NULL && d->needs_live_model);
+        if (wants_model != is_model) {
+            continue;
+        }
+        int n = snprintf(filter + flen, sizeof(filter) - flen, "%s%s", flen > 0 ? "," : "",
+                         op.drivers[i]);
+        if (n > 0 && (size_t)n < sizeof(filter) - flen) {
+            flen += (size_t)n;
+        }
+    }
+    if (filter[0] == '\0') {
+        return atlas_err_set(err, ATLAS_ERR_CONFIG,
+                             "the orchestration policy configures no %s driver for this "
+                             "dispatcher to run",
+                             is_model ? "model" : "non-model");
     }
 
     char id[128];
@@ -322,7 +356,9 @@ atlas_status atlas_service_dispatcher_run(bool once, FILE *log, atlas_err *err) 
     atlas_dispatch_opts o;
     memset(&o, 0, sizeof(o));
     o.socket_path = sp.socket_path;
-    o.worker_root = op.worker_root;
+    o.worker_root = is_model ? op.model_worker_root : op.worker_root;
+    o.drivers = filter;
+    o.operator_session = is_model && op.model_uses_operator_session;
     o.dispatcher_id = id;
     o.poll_ms = 1000;
     o.max_backoff_ms = 30000;

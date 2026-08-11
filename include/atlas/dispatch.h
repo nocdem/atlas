@@ -39,6 +39,14 @@ typedef struct atlas_dispatch_opts {
 
     /* Whether a driver that calls a live model may run. From the policy. */
     bool live_model;
+    /* A8.1. This dispatcher is the operator's own, so a model driver uses the
+     * session already logged in under its HOME. From the policy, never inferred
+     * from the process's uid. */
+    bool operator_session;
+    /* Comma-separated driver names this dispatcher will run. NULL means any.
+     * Sent with each lease request and matched against the job's stored
+     * driver. */
+    const char *drivers;
     /* Keep a successful attempt's workspace instead of removing it. Failed
      * attempts are always kept as evidence. */
     bool keep_workspaces;

@@ -637,18 +637,43 @@ atlas_status atlas_server_dispatch(atlas_server_ctx *ctx, const void *payload, s
             }
         }
     }
-    /* A8: two groups, and which one is consulted depends on the peer's uid from
-     * SO_PEERCRED. A name in the group this peer is not in is simply not found,
-     * so an ordinary client asking for `dispatch.lease` gets `unknown method` —
-     * the same answer as for a name that does not exist at all. That is
-     * deliberate: a refusal that distinguishes "you may not" from "there is no
-     * such thing" tells a caller what to try next. */
+    /* A8: two groups, routed by the peer's uid from SO_PEERCRED.
+     *
+     * A peer is offered a group only if the policy places it in one, and the
+     * names never overlap — `job.` versus `dispatch.` — so a uid that is *both*
+     * a submitter and a dispatcher gets both sets rather than losing one. A8.1
+     * made that case real: the operator's account submits jobs *and* runs the
+     * model dispatcher, and an either/or lookup silently took `job.submit`
+     * away from it.
+     *
+     * Routing is not authorisation. Each method still calls `require_submitter`
+     * or `require_dispatcher` for itself, so reaching a name is never the same
+     * as being allowed to use it.
+     *
+     * The two groups are hidden differently, on purpose. The **dispatcher**
+     * group is offered only to the uid a root-owned policy names: a name it
+     * does not hold answers `unknown method`, the same as a name that does not
+     * exist, because a refusal distinguishing "you may not" from "there is no
+     * such thing" would tell a caller what to try next. The **client** group is
+     * always dispatchable by name and refuses with "orchestration is not
+     * enabled" — a submitter learning that this daemon runs no jobs learns
+     * nothing it could not learn by reading the root-owned policy path, and the
+     * honest answer is what lets an operator tell a disabled policy apart from
+     * a binary too old to have the method. */
     if (fn == NULL) {
         size_t n = 0;
-        const atlas_method_entry *g =
-            atlas_orchpolicy_is_dispatcher(&ctx->orchpolicy, (long long)peer_uid)
-                ? atlas_server_orch_dispatch_methods(&n)
-                : atlas_server_orch_client_methods(&n);
+        const atlas_method_entry *g = atlas_server_orch_client_methods(&n);
+        for (size_t i = 0; i < n; i++) {
+            if (strcmp(atlas_ipc_request_method(req), g[i].name) == 0) {
+                fn = g[i].fn;
+                break;
+            }
+        }
+    }
+    if (fn == NULL &&
+        atlas_orchpolicy_is_any_dispatcher(&ctx->orchpolicy, (long long)peer_uid)) {
+        size_t n = 0;
+        const atlas_method_entry *g = atlas_server_orch_dispatch_methods(&n);
         for (size_t i = 0; i < n; i++) {
             if (strcmp(atlas_ipc_request_method(req), g[i].name) == 0) {
                 fn = g[i].fn;

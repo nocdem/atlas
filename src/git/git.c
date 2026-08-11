@@ -1310,7 +1310,11 @@ typedef struct lstree_parser {
     int64_t entries;
 } lstree_parser;
 
-/* One record of `git ls-tree -r -z`: "<mode> <type> <oid>\t<path>".
+/* One record of `git ls-tree -r -z -l`: "<mode> <type> <oid> <size>\t<path>".
+ *
+ * `-l` is what makes the size available before the object is read. Git pads the
+ * size field to a fixed width, so the run of spaces before it is variable, and a
+ * gitlink carries "-" rather than a number — parsed as unknown, never as zero.
  *
  * Parsed by position rather than by splitting on whitespace, because a path may
  * contain spaces, tabs and newlines — A0's rule about paths being bytes applies
@@ -1341,11 +1345,33 @@ static atlas_status lstree_token(const char *tok, size_t len, void *ud, atlas_er
         return atlas_err_set(err, ATLAS_ERR_GIT, "malformed ls-tree record header");
     }
     *sp2 = '\0';
+    char *sp3 = strchr(sp2 + 1, ' ');
+    if (sp3 == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_GIT, "malformed ls-tree record header");
+    }
+    *sp3 = '\0';
+    const char *sz = sp3 + 1;
+    while (*sz == ' ') {
+        sz++;
+    }
+    int64_t size = -1;
+    if (*sz >= '0' && *sz <= '9') {
+        size = 0;
+        for (const char *d = sz; *d >= '0' && *d <= '9'; d++) {
+            if (size > (INT64_MAX - (*d - '0')) / 10) {
+                return atlas_err_set(err, ATLAS_ERR_GIT, "malformed ls-tree record header");
+            }
+            size = size * 10 + (*d - '0');
+        }
+    } else if (*sz != '-') {
+        return atlas_err_set(err, ATLAS_ERR_GIT, "malformed ls-tree record header");
+    }
 
     atlas_git_tree_entry e;
     e.mode = head;
     e.type = sp1 + 1;
     e.oid = sp2 + 1;
+    e.size = size;
     e.path = tab + 1;
     e.path_len = len - head_len - 1u;
     lp->entries++;
@@ -1398,8 +1424,8 @@ atlas_status atlas_git_ls_tree(atlas_git *g, const char *commit, atlas_git_tree_
     /* `--full-tree` so the listing is rooted at the commit's tree rather than at
      * whatever directory git thinks it is in; Atlas never changes its own
      * working directory, but saying so removes the question. */
-    const char *sub[] = {"ls-tree", "-r", "-z", "--full-tree", commit};
-    atlas_status st = git_run_checked(g, ATLAS_GIT_CMD_PLAIN, sub, 5u, lstree_sink, &stream, 0,
+    const char *sub[] = {"ls-tree", "-r", "-z", "-l", "--full-tree", commit};
+    atlas_status st = git_run_checked(g, ATLAS_GIT_CMD_PLAIN, sub, 6u, lstree_sink, &stream, 0,
                                       "git ls-tree", err);
     if (st == ATLAS_OK) {
         st = atlas_nulsplit_finish(&stream.split, err);

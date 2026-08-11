@@ -124,6 +124,37 @@ typedef struct atlas_orchpolicy {
      * deliberate operator act, not the consequence of installing a policy. */
     bool live_model;
 
+    /* --- A8.1: the operator's own model dispatcher --------------------------
+     *
+     * A second dispatcher uid, permitted to lease **only** jobs whose driver
+     * needs a live model, and expected to be the operator's own account.
+     *
+     * This is a deliberate, operator-configured relaxation of the A7.1/A8 rule
+     * that every model process runs as `atlas-worker`, and it should be read as
+     * exactly that rather than as a loophole. Claude Code authenticates with a
+     * session that lives in a person's home directory; there is no service
+     * credential on this machine, and Atlas must not copy, read or relocate a
+     * personal one. The only way to use that session is to run the process as
+     * the person who owns it.
+     *
+     * What it costs is stated plainly in `docs/orchestration.md`: a job run by
+     * this dispatcher has the operator's own filesystem authority, not
+     * `atlas-worker`'s. The A8 job record, lease, bounds, snapshot and audit
+     * trail are unchanged — what changes is the OS principal the driver runs
+     * as, and only for drivers that need a model.
+     *
+     * Zero means no model dispatcher, which is the default and leaves A8
+     * exactly as it was. */
+    long long model_dispatcher_uid;
+    /* Where that dispatcher owns its workspaces. Must be writable by the model
+     * dispatcher uid rather than by `atlas-worker`. */
+    char model_worker_root[256];
+    /* `operator_session`: the model driver uses the dispatcher's own logged-in
+     * session — its HOME, its existing credentials — and Atlas never reads,
+     * copies or stores any of it. `service` (the default) requires the
+     * root-installed credential file and refuses without it. */
+    bool model_uses_operator_session;
+
     char detail[256];
 } atlas_orchpolicy;
 
@@ -144,6 +175,13 @@ void atlas_orchpolicy_load_at(const char *path, atlas_orchpolicy *out);
 /* Membership questions. All false when the policy is disabled. */
 bool atlas_orchpolicy_permits_submitter(const atlas_orchpolicy *p, long long uid);
 bool atlas_orchpolicy_is_dispatcher(const atlas_orchpolicy *p, long long uid);
+/* True for the configured model dispatcher uid. Always false when none is
+ * configured, which is the default. */
+bool atlas_orchpolicy_is_model_dispatcher(const atlas_orchpolicy *p, long long uid);
+/* True when `uid` may reach the dispatcher method group at all — either
+ * dispatcher. Which *jobs* it may lease is a separate question, answered by the
+ * driver filter on the lease request. */
+bool atlas_orchpolicy_is_any_dispatcher(const atlas_orchpolicy *p, long long uid);
 bool atlas_orchpolicy_permits_repo(const atlas_orchpolicy *p, const char *name);
 bool atlas_orchpolicy_permits_mode(const atlas_orchpolicy *p, const char *name);
 bool atlas_orchpolicy_permits_driver(const atlas_orchpolicy *p, const char *name);

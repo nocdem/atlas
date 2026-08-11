@@ -312,6 +312,25 @@ void atlas_orchpolicy_load_at(const char *path, atlas_orchpolicy *out) {
                 !plausible_abs_path(out->worker_root)) {
                 BAD();
             }
+        } else if (take_value(line, len, "model_dispatcher_uid", &val, &vlen)) {
+            if (!parse_uid(val, vlen, &out->model_dispatcher_uid)) {
+                BAD();
+            }
+        } else if (take_value(line, len, "model_worker_root", &val, &vlen)) {
+            if (!copy_value(out->model_worker_root, sizeof(out->model_worker_root), val, vlen) ||
+                !plausible_abs_path(out->model_worker_root)) {
+                BAD();
+            }
+        } else if (take_value(line, len, "model_credential", &val, &vlen)) {
+            if (vlen == 16u && strncmp(val, "operator_session", 16u) == 0) {
+                out->model_uses_operator_session = true;
+            } else if (vlen == 7u && strncmp(val, "service", 7u) == 0) {
+                out->model_uses_operator_session = false;
+            } else {
+                /* Not a permissive parser, for the reason `live_model` is not:
+                 * this key decides whose credentials a model process uses. */
+                BAD();
+            }
         } else if (take_value(line, len, "live_model", &val, &vlen)) {
             if (vlen == 2u && strncmp(val, "on", 2u) == 0) {
                 out->live_model = true;
@@ -341,12 +360,33 @@ void atlas_orchpolicy_load_at(const char *path, atlas_orchpolicy *out) {
         out->reason = ATLAS_ORCHPOLICY_REASON_MALFORMED;
         return;
     }
-    /* The dispatcher may not also be a submitter. Keeping the two disjoint is
-     * what makes "an ordinary client cannot forge a dispatcher message, and a
-     * dispatcher cannot create its own work" a property of the configuration
-     * rather than a hope about it. */
+    /* The *worker* dispatcher may not also be a submitter. Keeping those two
+     * disjoint is what makes "an ordinary client cannot forge a dispatcher
+     * message, and a dispatcher cannot create its own work" a property of the
+     * configuration rather than a hope about it.
+     *
+     * The **model** dispatcher is deliberately exempt, and the exemption is
+     * honest rather than convenient: it is expected to be the operator's own
+     * account, which already holds passwordless root on this machine. Requiring
+     * it to be a different uid would buy nothing against that principal and
+     * would only stop the operator submitting the jobs they intend to run. */
     for (size_t k = 0; k < out->submitter_count; k++) {
         if (out->submitter_uids[k] == out->dispatcher_uid) {
+            out->reason = ATLAS_ORCHPOLICY_REASON_MALFORMED;
+            return;
+        }
+    }
+    if (out->model_dispatcher_uid != 0) {
+        /* A model dispatcher needs somewhere to work that it can actually
+         * write, and it must not be the worker's root. */
+        if (out->model_worker_root[0] == '\0' ||
+            strcmp(out->model_worker_root, out->worker_root) == 0) {
+            out->reason = ATLAS_ORCHPOLICY_REASON_MALFORMED;
+            return;
+        }
+        if (out->model_dispatcher_uid == out->dispatcher_uid) {
+            /* One uid cannot be both, or the driver filter would be the only
+             * thing keeping model work off the untrusted account. */
             out->reason = ATLAS_ORCHPOLICY_REASON_MALFORMED;
             return;
         }
@@ -420,6 +460,15 @@ bool atlas_orchpolicy_is_dispatcher(const atlas_orchpolicy *p, long long uid) {
      * the daemon could grant itself a lease. */
     return p != NULL && p->state == ATLAS_ORCHPOLICY_ENABLED && p->dispatcher_uid > 0 &&
            p->dispatcher_uid == uid;
+}
+
+bool atlas_orchpolicy_is_model_dispatcher(const atlas_orchpolicy *p, long long uid) {
+    return p != NULL && p->state == ATLAS_ORCHPOLICY_ENABLED && p->model_dispatcher_uid > 0 &&
+           p->model_dispatcher_uid == uid;
+}
+
+bool atlas_orchpolicy_is_any_dispatcher(const atlas_orchpolicy *p, long long uid) {
+    return atlas_orchpolicy_is_dispatcher(p, uid) || atlas_orchpolicy_is_model_dispatcher(p, uid);
 }
 
 bool atlas_orchpolicy_permits_repo(const atlas_orchpolicy *p, const char *name) {

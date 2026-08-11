@@ -205,7 +205,32 @@ static void attempt_free(attempt *a) {
 
 static atlas_status build_lease(atlas_json *j, void *ud, atlas_err *err) {
     const atlas_dispatch_opts *o = (const atlas_dispatch_opts *)ud;
-    return atlas_json_key_str(j, "dispatcher", o->dispatcher_id, err);
+    atlas_status st = atlas_json_key_str(j, "dispatcher", o->dispatcher_id, err);
+    if (st == ATLAS_OK && o->drivers != NULL && o->drivers[0] != '\0') {
+        /* Which drivers this dispatcher will run. The daemon matches it against
+         * the job's *stored* driver, so this narrows what we are offered and can
+         * never widen it. */
+        st = atlas_json_key(j, "driver", err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_arr_begin(j, err);
+        }
+        const char *p = o->drivers;
+        while (st == ATLAS_OK && *p != '\0') {
+            const char *comma = strchr(p, ',');
+            size_t n = comma != NULL ? (size_t)(comma - p) : strlen(p);
+            if (n > 0 && n < ATLAS_ORCH_NAME_MAX) {
+                char one[ATLAS_ORCH_NAME_MAX + 1u];
+                memcpy(one, p, n);
+                one[n] = '\0';
+                st = atlas_json_str(j, one, err);
+            }
+            p = comma != NULL ? comma + 1 : p + n;
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_arr_end(j, err);
+        }
+    }
+    return st;
 }
 
 /* --- heartbeat -------------------------------------------------------------- */
@@ -250,6 +275,31 @@ static atlas_status heartbeat(attempt *a, const char *phase, atlas_err *err) {
     return st;
 }
 
+/* Heartbeats if the interval has elapsed, and otherwise does nothing.
+ *
+ * Every phase that can run longer than the lease TTL has to call this, not just
+ * the one where a driver is running. A real repository proved why: transferring
+ * a snapshot of 1 924 files took longer than the lease, and because the transfer
+ * loop was the one long phase that never heartbeated, the attempt lost its lease
+ * mid-copy and the job stalled in PREPARING. Keeping a lease alive is a property
+ * of *making progress*, and copying a file is progress.
+ *
+ * A failed heartbeat is not a reason to abandon the work. The lease will expire
+ * and the daemon will reconcile, which is the designed recovery path; the
+ * timestamp is advanced anyway so a dead daemon is not asked once per poll. */
+static void heartbeat_if_due(attempt *a) {
+    int64_t now = now_ms();
+    if (now - a->last_heartbeat_ms < a->opts->heartbeat_ms) {
+        return;
+    }
+    atlas_err err;
+    atlas_err_init(&err);
+    if (heartbeat(a, NULL, &err) != ATLAS_OK) {
+        say(a->opts, "heartbeat failed: %s", atlas_err_msg(&err));
+        a->last_heartbeat_ms = now;
+    }
+}
+
 /* The driver's cancel callback. Called on the runner's poll schedule; it
  * heartbeats no more often than the configured interval, so a long-running
  * driver keeps its lease alive and learns of a cancellation without the
@@ -259,19 +309,7 @@ static bool driver_should_stop(void *ud) {
     if (g_stop != 0) {
         return true;
     }
-    int64_t now = now_ms();
-    if (now - a->last_heartbeat_ms >= a->opts->heartbeat_ms) {
-        atlas_err err;
-        atlas_err_init(&err);
-        if (heartbeat(a, NULL, &err) != ATLAS_OK) {
-            /* A daemon that has gone away is not a reason to kill a running
-             * job: the lease will expire and the daemon will reconcile, which
-             * is the designed behaviour. The attempt keeps working and will
-             * fail to report, which the recovery path handles. */
-            say(a->opts, "heartbeat failed: %s", atlas_err_msg(&err));
-            a->last_heartbeat_ms = now;
-        }
-    }
+    heartbeat_if_due(a);
     return a->cancelled;
 }
 
@@ -520,6 +558,7 @@ static atlas_status fetch_snapshot(attempt *a, const atlas_ws *ws, atlas_ws_snap
     (void)atlas_ipc_result_int(r.resp, "refused_symlinks", &stats->skipped_symlinks);
     (void)atlas_ipc_result_int(r.resp, "refused_gitlinks", &stats->skipped_submodules);
     (void)atlas_ipc_result_int(r.resp, "refused_other", &stats->skipped_other);
+    (void)atlas_ipc_result_int(r.resp, "refused_sizes", &stats->skipped_oversize);
     rpc_free(&r);
 
     if (protocol != ATLAS_SNAPSHOT_PROTOCOL) {
@@ -563,6 +602,9 @@ static atlas_status fetch_snapshot(attempt *a, const atlas_ws *ws, atlas_ws_snap
                                    "the snapshot transfer was cancelled");
                 break;
             }
+            /* Same throttle as the driver phase: a large tree is a long phase,
+             * and a lease that expires mid-transfer loses the whole attempt. */
+            heartbeat_if_due(a);
             chunk_req cr = {a, i, offset};
             rpc cr_resp;
             st = rpc_call(a->opts, "dispatch.snapshot.chunk", snap_build_chunk, &cr, &cr_resp,
@@ -771,10 +813,12 @@ static atlas_status run_attempt(attempt *a, atlas_err *err) {
     if (st == ATLAS_OK) {
         char note[256];
         (void)snprintf(note, sizeof note,
-                       "snapshot: %lld files, %lld bytes, %lld symlinks and %lld submodules "
+                       "snapshot: %lld files, %lld bytes, %lld oversize, %lld symlinks and %lld "
+                       "submodules "
                        "refused",
                        (long long)snap.files, (long long)snap.bytes,
-                       (long long)snap.skipped_symlinks, (long long)snap.skipped_submodules);
+                       (long long)snap.skipped_oversize, (long long)snap.skipped_symlinks,
+                       (long long)snap.skipped_submodules);
         emit_event(a, "snapshot", note);
         st = heartbeat(a, "RUNNING", err);
     }
@@ -802,6 +846,7 @@ static atlas_status run_attempt(attempt *a, atlas_err *err) {
         req.cancel = driver_should_stop;
         req.cancel_ud = a;
         req.live_model = o->live_model;
+        req.operator_session = o->operator_session;
         st = drv->run(&req, &dr, err);
     }
 

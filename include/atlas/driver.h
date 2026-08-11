@@ -62,6 +62,14 @@ typedef struct atlas_driver_req {
      * model. A driver that needs it and does not have it refuses to run rather
      * than degrading to something else. */
     bool live_model;
+    /* A8.1. When set, the model driver runs under the dispatcher's own logged-in
+     * session: it inherits that account's HOME and uses whatever credentials
+     * already live there. Atlas never reads, copies, prints or stores any of
+     * them — it sets HOME and executes, and the CLI authenticates itself.
+     *
+     * This is only ever true in the operator's own model dispatcher, which the
+     * root-owned policy has to name explicitly. */
+    bool operator_session;
 } atlas_driver_req;
 
 typedef struct atlas_driver_res {

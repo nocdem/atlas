@@ -1,0 +1,59 @@
+# Atlas - the A8.1 model dispatcher, run as the operator's own systemd *user*
+# service.
+# Copyright 2026 The Atlas Authors. Licensed under the Apache License 2.0.
+#
+# Installed to ~/.config/systemd/user/atlas-model-dispatcher.service and started
+# with `systemctl --user`. It therefore runs as the operator, with the
+# operator's HOME and the login session already there.
+#
+# ## Why this exists, stated plainly
+#
+# A7.1 and A8 say every model process runs as `atlas-worker`. This unit is a
+# deliberate, operator-configured exception to that, and it is worth naming
+# rather than burying: Claude Code authenticates with a session that lives in a
+# person's home directory. There is no service credential on this machine, and
+# Atlas must not copy, read or relocate a personal one — so the only way to use
+# that session is to run the process as the person who owns it.
+#
+# What it costs: a job this dispatcher runs has the operator's own filesystem
+# authority, not `atlas-worker`'s. It can read and write whatever the operator
+# can. The A8 job record, lease, bounds, snapshot and audit trail are unchanged;
+# what changes is the OS principal, and only for drivers that need a model.
+#
+# The root-owned /etc/atlas/orchestration.conf has to name this uid as
+# `model_dispatcher_uid` before any of it applies. Installing this unit alone
+# grants nothing.
+#
+# ## What is deliberately NOT here
+#
+# No sandbox directives. The operator is a trusted principal on this machine and
+# already holds passwordless root; a sandbox around their own account would be
+# theatre, and A7's rule is that a check an adversary walks around is worse than
+# no check. The isolation that matters — the index, the backups, the trusted
+# binary, the policies — is enforced against `atlas-worker`, which is a
+# different service and is unaffected by this one.
+
+[Unit]
+Description=Atlas model dispatcher (operator session)
+Documentation=man:atlas(1)
+After=default.target
+
+[Service]
+Type=simple
+# The root-owned installed binary, never a build tree — the same rule the system
+# units follow, and for the same reason.
+ExecStart=/usr/local/bin/atlas dispatcher run
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=60
+KillMode=mixed
+KillSignal=SIGTERM
+
+# Claude Code refuses to start when it sees CLAUDECODE, because a nested session
+# would share runtime state with its parent. Atlas builds the child environment
+# explicitly and never forwards it; this is belt and braces for the case where
+# the unit is started from inside a Claude session.
+UnsetEnvironment=CLAUDECODE CLAUDE_CODE_SESSION_ID
+
+[Install]
+WantedBy=default.target

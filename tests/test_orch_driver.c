@@ -342,6 +342,43 @@ static void test_a_child_runs_in_the_directory_it_was_given(void) {
     denv_close(&e);
 }
 
+static bool never_cancel(void *ud) {
+    (void)ud;
+    return false;
+}
+
+static void test_a_cancellable_child_is_not_killed_by_its_own_poll(void) {
+    /* The defect this exists for: with a cancel callback configured, the poll
+     * interval is capped so the callback is consulted promptly — and poll then
+     * returns zero every 100 ms while a healthy child works. Reading that as an
+     * expiry killed every cancellable child almost immediately, which is what
+     * happened to the first real model run and why its logs were empty.
+     *
+     * Both bounds here are far away, so a child that sleeps briefly and then
+     * speaks must survive and exit on its own. */
+    atlas_err err;
+    atlas_err_init(&err);
+    atlas_buf exe = ATLAS_BUF_INIT;
+    T_OK(atlas_proc_which("sleep", "/usr/local/bin:/usr/bin:/bin", &exe, &err), &err);
+    const char *argv[] = {atlas_buf_cstr(&exe), "2", NULL};
+    static const char *const ENV[] = {"PATH=/usr/bin:/bin", NULL};
+    atlas_proc_opts o;
+    memset(&o, 0, sizeof(o));
+    o.argv = argv;
+    o.env = ENV;
+    o.timeout_ms = 60000;
+    o.idle_timeout_ms = 30000;
+    o.cancel = never_cancel;
+    atlas_proc_result res;
+    memset(&res, 0, sizeof(res));
+    T_OK(atlas_proc_run(&o, NULL, NULL, NULL, &res, &err), &err);
+    T_CHECK_MSG(!res.timed_out, "a healthy cancellable child was reported as timed out");
+    T_CHECK_MSG(!res.idle_timed_out, "a healthy cancellable child hit the idle bound");
+    T_CHECK_MSG(!res.cancelled, "a child was cancelled without being asked to stop");
+    T_EQ_INT(res.exit_code, 0);
+    atlas_buf_free(&exe);
+}
+
 static void test_an_idle_child_is_killed_on_its_own_bound(void) {
     /* The wall bound is generous and the idle bound is short, so only the idle
      * bound can be what fires — which is the point of having two. */
@@ -446,6 +483,8 @@ static const atlas_test TESTS[] = {
      test_the_child_environment_is_only_what_atlas_built},
     {"a child runs in the directory it was given",
      test_a_child_runs_in_the_directory_it_was_given},
+    {"a cancellable child is not killed by its own poll",
+     test_a_cancellable_child_is_not_killed_by_its_own_poll},
     {"an idle child is killed on its own bound",
      test_an_idle_child_is_killed_on_its_own_bound},
     {"the whole process group is terminated", test_the_whole_process_group_is_terminated},

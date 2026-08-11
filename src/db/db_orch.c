@@ -74,6 +74,7 @@ atlas_orch_op *atlas_orch_op_new(atlas_orch_op_kind kind) {
     atlas_buf_init(&op->repo_root);
     atlas_buf_init(&op->job_uid);
     atlas_buf_init(&op->dispatcher_id);
+    atlas_buf_init(&op->lease_drivers);
     atlas_buf_init(&op->token);
     atlas_buf_init(&op->event_kind);
     atlas_buf_init(&op->event_payload);
@@ -89,6 +90,7 @@ void atlas_orch_op_free(atlas_orch_op *op) {
     atlas_buf_free(&op->repo_root);
     atlas_buf_free(&op->job_uid);
     atlas_buf_free(&op->dispatcher_id);
+    atlas_buf_free(&op->lease_drivers);
     atlas_buf_free(&op->token);
     atlas_buf_free(&op->event_kind);
     atlas_buf_free(&op->event_payload);
@@ -855,23 +857,63 @@ static atlas_status op_lease(atlas_db *db, const atlas_orch_op *op, atlas_orch_r
     /* Oldest queued job first, and only ones nobody has asked to cancel. `id`
      * rather than `created_at`: the ordering authority is the sequence, and two
      * jobs submitted in the same second must still have an order. */
+    /* Oldest queued job whose driver this dispatcher will run.
+     *
+     * The filter is matched against `orch_jobs.driver` — the driver stored when
+     * the job was created and validated against the policy — never against
+     * anything the requesting worker said about it. */
+    atlas_orch_argv want[1];
+    atlas_orch_argv_init(&want[0]);
+    size_t want_n = 0;
+    if (op->lease_drivers.len > 0) {
+        atlas_status ds = atlas_orch_validations_decode(atlas_buf_cstr(&op->lease_drivers), want,
+                                                        1u, &want_n, err);
+        if (ds != ATLAS_OK) {
+            atlas_orch_argv_free(&want[0]);
+            return ds;
+        }
+    }
     static const char PICK[] =
         "SELECT id FROM orch_jobs WHERE state = 'QUEUED' AND cancel_requested = 0"
-        " ORDER BY id LIMIT 1;";
+        " ORDER BY id;";
     int64_t job_id = 0;
     {
         sqlite3_stmt *q = NULL;
         atlas_status s = atlas_db_prepare(db, PICK, &q, err);
         if (s != ATLAS_OK) {
+            atlas_orch_argv_free(&want[0]);
             return s;
         }
-        int rc = sqlite3_step(q);
-        if (rc == SQLITE_ROW) {
-            job_id = sqlite3_column_int64(q, 0);
-        } else if (rc != SQLITE_DONE) {
-            s = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot scan the job queue");
+        static const char DRV[] = "SELECT driver FROM orch_jobs WHERE id = ?1;";
+        while (sqlite3_step(q) == SQLITE_ROW) {
+            int64_t candidate = sqlite3_column_int64(q, 0);
+            if (want_n == 0 || want[0].count == 0) {
+                job_id = candidate;
+                break;
+            }
+            sqlite3_stmt *dq = NULL;
+            if (atlas_db_prepare(db, DRV, &dq, err) != ATLAS_OK) {
+                break;
+            }
+            (void)sqlite3_bind_int64(dq, 1, candidate);
+            bool match = false;
+            if (sqlite3_step(dq) == SQLITE_ROW) {
+                const char *drv = atlas_db_col_text(dq, 0);
+                for (size_t i = 0; i < want[0].count; i++) {
+                    if (strcmp(drv, atlas_buf_cstr(&want[0].args[i])) == 0) {
+                        match = true;
+                        break;
+                    }
+                }
+            }
+            atlas_db_finish(db, dq);
+            if (match) {
+                job_id = candidate;
+                break;
+            }
         }
         atlas_db_finish(db, q);
+        atlas_orch_argv_free(&want[0]);
         if (s != ATLAS_OK) {
             return s;
         }

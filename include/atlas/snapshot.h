@@ -95,6 +95,16 @@ typedef struct atlas_snapshot_meta {
     int64_t refused_symlinks;
     int64_t refused_gitlinks;
     int64_t refused_other;
+    /* Blobs the committed tree holds that are larger than
+     * `ATLAS_SNAPSHOT_MAX_FILE_BYTES`, refused by size and counted.
+     *
+     * Deliberately **not** a column on `orch_snapshots`, unlike the three above.
+     * Its consumer is the operator-facing event line, which `orch_events`
+     * already stores append-only at the moment the tree is enumerated; a
+     * resumed transfer re-reads a snapshot that is already complete and emits
+     * nothing. Persisting it would buy a duplicate of a durable fact at the
+     * price of a schema migration, so this stays a reported count. */
+    int64_t refused_sizes;
 } atlas_snapshot_meta;
 
 /* Produces the manifest for one attempt and persists it.

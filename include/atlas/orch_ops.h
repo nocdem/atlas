@@ -93,6 +93,15 @@ typedef struct atlas_orch_op {
     /* LEASE. A stable identifier for the dispatcher process, recorded so a
      * restart is visible in the history. It is not an authorisation. */
     atlas_buf dispatcher_id;
+    /* LEASE. Which drivers this dispatcher will run, as a netstring-encoded
+     * list. Empty means "any".
+     *
+     * A8.1 runs two dispatchers on one queue: the untrusted `atlas-worker` one
+     * takes everything that needs no model, and the operator's takes only what
+     * does. The filter is what keeps them from stealing each other's work, and
+     * the daemon applies it to the job's *stored* driver — never to anything the
+     * worker said about the job. */
+    atlas_buf lease_drivers;
 
     /* HEARTBEAT, EVENT, COMPLETE: the bearer capability. Compared by digest and
      * never stored, logged or reported. */

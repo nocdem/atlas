@@ -201,6 +201,28 @@ static atlas_status enum_entry(const atlas_git_tree_entry *e, void *ud, atlas_er
         c->meta->refused_other++;
         return ATLAS_OK;
     }
+    /* Refused by size, from the listing, before `cat-file` is ever spawned.
+     *
+     * A bound reached mid-stream would abort the whole snapshot — which is what
+     * a 68 MB test vector in a real repository did, taking every other file
+     * with it and reporting a proc-output error rather than a fact about the
+     * tree. `ATLAS_SNAPSHOT_REFUSE_SIZE` was already in the refusal vocabulary
+     * with no path that produced it; this is that path.
+     *
+     * Refusing one file is not truncation: the file is excluded whole, counted,
+     * and named in the snapshot event, exactly as a symlink or a gitlink is. A
+     * driver sees a work tree that is missing it, and the operator is told. The
+     * alternative — raising the bound until one repository fits — would buffer
+     * that blob in the daemon and move a limit to make a run pass.
+     *
+     * A size of -1 is unknown, which only a gitlink reports, and that is
+     * refused above. The `cat-file` bound below stays as it was: this check
+     * reads a number git wrote, and defence in depth means not trusting it as
+     * the only one. */
+    if (e->size > ATLAS_SNAPSHOT_MAX_FILE_BYTES) {
+        c->meta->refused_sizes++;
+        return ATLAS_OK;
+    }
     if (!atlas_snapshot_path_ok(e->path, e->path_len)) {
         return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
                              "the committed tree holds a path that cannot be materialised safely");

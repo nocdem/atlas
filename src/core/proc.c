@@ -359,18 +359,34 @@ atlas_status atlas_proc_run(const atlas_proc_opts *opts, atlas_proc_sink sink, v
                 /* Waiting only for the pipes to drain after a kill. */
                 continue;
             }
+            /* A zero from poll is not by itself a timeout.
+             *
+             * When a cancel callback is configured the poll interval is capped
+             * so the callback is consulted promptly, so poll returns zero every
+             * ATLAS_PROC_CANCEL_POLL_MS while a perfectly healthy child is still
+             * working. Treating that as an expiry killed every cancellable child
+             * within 100 ms — which is exactly what happened to the first real
+             * model run, and why its logs were empty.
+             *
+             * So a bound only fires when its own clock says so. */
+            int64_t now = now_ms();
+            bool idle_expired = opts->idle_timeout_ms > 0 &&
+                                now - last_output >= (int64_t)opts->idle_timeout_ms;
+            bool wall_expired = now >= deadline;
+            if (!idle_expired && !wall_expired) {
+                continue; /* a cancel-poll tick; the child is still running */
+            }
             /* Which bound fired is recorded rather than inferred. A child that
              * went quiet and a child that ran too long are different failures,
              * and an operator acts differently on each. */
-            if (opts->idle_timeout_ms > 0 &&
-                now_ms() - last_output >= (int64_t)opts->idle_timeout_ms) {
+            if (idle_expired) {
                 local_res.idle_timed_out = true;
             } else {
                 local_res.timed_out = true;
             }
             kill_requested = true;
             kill_group(pid, SIGTERM);
-            deadline = now_ms() + grace_ms;
+            deadline = now + grace_ms;
             continue;
         }
 

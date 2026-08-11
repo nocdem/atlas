@@ -237,6 +237,17 @@ const char *atlas_orch_exit_kind_name(atlas_orch_exit_kind k);
  * one. Renewals are bounded so a wedged worker cannot hold a job forever by
  * heartbeating — the wall-clock bound is separate and is what finally stops it. */
 #define ATLAS_ORCH_LEASE_MS 60000
+
+/* How often the daemon sweeps for expired leases and past-deadline jobs.
+ *
+ * Comfortably under the lease itself, so an abandoned attempt is reclaimed
+ * within roughly one lease rather than after a multiple of one. This is the
+ * timer `op_recover` documents itself as being driven by; without a caller,
+ * every recovery path A8 describes is exercised only by its tests, and a live
+ * job whose worker died sits in its transient state for ever. That is exactly
+ * what happened, and a job stuck in PREPARING with an expired, unreleased lease
+ * is what found it. */
+#define ATLAS_ORCH_RECOVER_INTERVAL_MS 20000
 #define ATLAS_ORCH_LEASE_MAX_RENEWALS 240
 
 /* Structured worker events per attempt, and bytes per event. Both refuse rather

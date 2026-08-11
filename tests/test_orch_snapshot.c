@@ -156,6 +156,60 @@ static void snapenv_close(snapenv *e) {
     fx_close(&e->fx);
 }
 
+/* Commits a blob one byte past the per-file bound, beside the ordinary files. */
+static void add_an_oversized_file(const char *repo, atlas_err *err) {
+    size_t n = (size_t)ATLAS_SNAPSHOT_MAX_FILE_BYTES + 1u;
+    char *big = (char *)malloc(n);
+    T_REQUIRE(big != NULL);
+    memset(big, 'x', n);
+    mkdirs(repo, "vectors/huge.json");
+    T_OK(fx_write_bytes(repo, "vectors/huge.json", strlen("vectors/huge.json"), big, n, 0644, err), err);
+    free(big);
+}
+
+/* A real repository held a 68 MB test vector, and before this the whole
+ * snapshot aborted with a proc-output error — every other file lost to one
+ * file's size, and the failure reported as a fact about a child process rather
+ * than about the tree. `ATLAS_SNAPSHOT_REFUSE_SIZE` was in the vocabulary with
+ * nothing that produced it. */
+static void test_an_oversized_file_is_refused_and_counted_not_fatal(void) {
+    snapenv e;
+    snapenv_open(&e, add_an_oversized_file);
+    atlas_err err;
+    atlas_err_init(&err);
+
+    atlas_snapshot_meta m;
+    T_OK(atlas_snapshot_open(e.db, e.attempt_id, &m, &err), &err);
+
+    T_CHECK_MSG(m.refused_sizes == 1, "expected exactly one size refusal, got %lld",
+                (long long)m.refused_sizes);
+    /* The ordinary files are still there, which is the whole point: one
+     * oversized blob must not take the rest of the tree with it. */
+    T_CHECK_MSG(m.entries >= 2, "the snapshot kept %lld entries", (long long)m.entries);
+    T_CHECK_MSG(m.total_bytes < ATLAS_SNAPSHOT_MAX_FILE_BYTES,
+                "the refused file's bytes were counted anyway (%lld)", (long long)m.total_bytes);
+
+    /* Refused whole rather than truncated: no manifest entry names it, so a
+     * worker cannot request even one chunk of it. */
+    for (int64_t i = 0; i < m.entries; i++) {
+        atlas_snapshot_chunk c;
+        atlas_snapshot_chunk_init(&c);
+        T_OK(atlas_snapshot_read(e.db, e.attempt_id, i, 0, &c, &err), &err);
+        bool names_it = false;
+        for (size_t k = 0; k + 4u <= c.path.len; k++) {
+            if (memcmp(c.path.data + k, "huge", 4u) == 0) {
+                names_it = true;
+                break;
+            }
+        }
+        T_CHECK_MSG(!names_it, "the refused file appears in the manifest");
+        T_CHECK(c.size_bytes <= ATLAS_SNAPSHOT_MAX_FILE_BYTES);
+        atlas_snapshot_chunk_free(&c);
+    }
+
+    snapenv_close(&e);
+}
+
 /* --- the trusted read ---------------------------------------------------------- */
 
 static void test_the_daemon_enumerates_a_registered_repository(void) {
@@ -480,6 +534,8 @@ static const atlas_test TESTS[] = {
      test_a_worker_cannot_reach_past_the_manifest},
     {"the digest covers the manifest, not the transfer",
      test_the_digest_covers_the_manifest_not_the_transfer},
+    {"an oversized file is refused and counted, not fatal",
+     test_an_oversized_file_is_refused_and_counted_not_fatal},
     {"snapshot paths reject traversal and NULs",
      test_snapshot_paths_reject_traversal_and_nuls},
 };

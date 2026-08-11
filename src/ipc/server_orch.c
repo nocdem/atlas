@@ -72,7 +72,10 @@ static atlas_status require_dispatcher(dispatch_state *ds, atlas_err *err) {
     if (p->state != ATLAS_ORCHPOLICY_ENABLED) {
         return orch_disabled(ds, err);
     }
-    if (!atlas_orchpolicy_is_dispatcher(p, ds->peer_uid)) {
+    /* Either dispatcher may reach the group. *Which* jobs each may lease is a
+     * separate question, answered by the driver filter on the lease request and
+     * enforced against the job's stored driver. */
+    if (!atlas_orchpolicy_is_any_dispatcher(p, ds->peer_uid)) {
         return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
                              "this connection may not act as the job dispatcher");
     }
@@ -658,6 +661,26 @@ static atlas_status method_dispatch_lease(dispatch_state *ds, const atlas_ipc_re
      * visible in the history. It is *not* an authorisation and nothing branches
      * on it; the uid decided that, above. */
     st = atlas_buf_set_str(&op->dispatcher_id, who, err);
+    if (st == ATLAS_OK) {
+        /* A netstring-encoded driver list, built with the typed writer like every
+         * other list on this protocol. Absent means "any driver". */
+        const atlas_ipc_array *arr = NULL;
+        if (atlas_ipc_param_array(req, "driver", &arr)) {
+            atlas_orch_argv one;
+            atlas_orch_argv_init(&one);
+            size_t n = atlas_ipc_array_len(arr);
+            for (size_t i = 0; st == ATLAS_OK && i < n && i < ATLAS_ORCH_MAX_ARGV; i++) {
+                const char *v = NULL;
+                if (atlas_ipc_array_str(arr, i, &v) && v != NULL) {
+                    st = atlas_orch_argv_push(&one, v, strlen(v), err);
+                }
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_orch_validations_encode(&one, 1u, &op->lease_drivers, err);
+            }
+            atlas_orch_argv_free(&one);
+        }
+    }
     if (st != ATLAS_OK) {
         atlas_orch_op_free(op);
         free(op);
@@ -997,6 +1020,7 @@ static atlas_status method_snapshot_open(dispatch_state *ds, const atlas_ipc_req
         {"refused_symlinks", meta.refused_symlinks},
         {"refused_gitlinks", meta.refused_gitlinks},
         {"refused_other", meta.refused_other},
+        {"refused_sizes", meta.refused_sizes},
     };
     for (size_t i = 0; st == ATLAS_OK && i < sizeof ints / sizeof ints[0]; i++) {
         st = atlas_json_key_int(ds->j, ints[i].k, ints[i].v, err);

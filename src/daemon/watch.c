@@ -224,6 +224,9 @@ struct atlas_watcher {
     atlas_buf db_path;
     atlas_db *db; /* read-only, owned by this thread */
     int reconcile_interval_ms;
+    /* A8: whether this daemon sweeps expired leases. */
+    bool orch_enabled;
+    int64_t last_recover_ms;
 
     pthread_mutex_t stat_lock;
     int64_t watch_count; /* guarded by stat_lock */
@@ -878,6 +881,50 @@ static void handle_event(atlas_watcher *w, const struct inotify_event *ev) {
 
 /* --- the loop ------------------------------------------------------------ */
 
+/* A8: the orchestration recovery sweep.
+ *
+ * `op_recover` releases expired leases, requeues attempts that remain, ends
+ * jobs past their wall deadline, and marks an exhausted job RECOVERY_REQUIRED
+ * rather than FAILED. It is the whole of A8's crash recovery, and nothing
+ * outside Atlas can ask for it — which is what stops one worker expiring
+ * another's job, and also means it runs if and only if something here calls it.
+ *
+ * This is the watcher's timer because the watcher is the daemon's timer. The
+ * call waits on the writer, briefly and with a bound: the sweep is a bounded
+ * query over leases, and blocking this thread for a moment costs at most a
+ * debounce tick of watch latency. A failure is logged and retried on the next
+ * tick rather than escalated — an unswept expiry is recovered late, and there
+ * is no state in which sweeping less often loses a record. */
+static void recover_due(atlas_watcher *w) {
+    if (!w->orch_enabled) {
+        return;
+    }
+    int64_t t = now_ms();
+    if (w->last_recover_ms != 0 && t - w->last_recover_ms < ATLAS_ORCH_RECOVER_INTERVAL_MS) {
+        return;
+    }
+    w->last_recover_ms = t;
+
+    atlas_orch_op *op = atlas_orch_op_new(ATLAS_ORCH_OP_RECOVER);
+    if (op == NULL) {
+        return;
+    }
+    op->actor = ATLAS_ORCH_ACTOR_ATLAS;
+    atlas_orch_result r;
+    atlas_orch_result_init(&r);
+    atlas_err err;
+    atlas_err_init(&err);
+    /* `atlas_writer_orch` takes ownership of `op` on every path. */
+    if (atlas_writer_orch(w->writer, op, 5000, &r, &err) != ATLAS_OK) {
+        atlas_daemon_log(w->log, "warn", "orchestration recovery sweep failed: %s",
+                         atlas_err_msg(&err));
+    } else if (r.recovered > 0) {
+        atlas_daemon_log(w->log, "info", "orchestration recovery reclaimed %lld attempts",
+                         (long long)r.recovered);
+    }
+    atlas_orch_result_free(&r);
+}
+
 static void submit_due(atlas_watcher *w) {
     int64_t t = now_ms();
     expire_moves(w, t);
@@ -1026,6 +1073,7 @@ static void *watcher_main(void *arg) {
             }
         }
         submit_due(w);
+        recover_due(w);
         (void)pthread_mutex_lock(&w->stat_lock);
         w->watch_count = (int64_t)w->map.count;
         (void)pthread_mutex_unlock(&w->stat_lock);
@@ -1040,7 +1088,8 @@ static void *watcher_main(void *arg) {
 /* --- lifecycle ----------------------------------------------------------- */
 
 atlas_status atlas_watcher_start(const char *db_path, atlas_writer *writer, FILE *log,
-                                 int reconcile_interval_ms, atlas_watcher **out, atlas_err *err) {
+                                 bool orch_enabled, int reconcile_interval_ms,
+                                 atlas_watcher **out, atlas_err *err) {
     *out = NULL;
     atlas_watcher *w = calloc(1u, sizeof(*w));
     if (w == NULL) {
@@ -1052,6 +1101,7 @@ atlas_status atlas_watcher_start(const char *db_path, atlas_writer *writer, FILE
     w->wake_fd[1] = -1;
     w->writer = writer;
     w->log = log;
+    w->orch_enabled = orch_enabled;
     w->reconcile_interval_ms =
         reconcile_interval_ms > 0 ? reconcile_interval_ms : ATLAS_WATCH_RECONCILE_INTERVAL_MS;
     atomic_init(&w->stop, false);

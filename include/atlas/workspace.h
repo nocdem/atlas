@@ -103,6 +103,9 @@ typedef struct atlas_ws_snapshot_stats {
     int64_t skipped_symlinks;
     int64_t skipped_submodules;
     int64_t skipped_other;
+    /* Committed files larger than the per-file snapshot bound. Refused whole
+     * and counted, never partially materialised — see `atlas/snapshot.h`. */
+    int64_t skipped_oversize;
 } atlas_ws_snapshot_stats;
 
 /* Materialises one received snapshot entry into both `source/` and `work/`.

@@ -31,10 +31,19 @@ What follows from that, and is binding:
 - No test asserts that `nocdem` is unable to do something. Such a test would
   pass only until the operator used their own machine.
 - No document claims `nocdem` is constrained.
-- The separation is meaningful because **A8's dispatcher and every persistent
-  model process run as `atlas-worker`, never as `nocdem`.** That is the
-  architectural commitment A7.1 exists to make possible; if it is broken later,
-  the guarantee below is void and no code change will restore it.
+- The separation is meaningful because **A8's worker dispatcher and every
+  persistent model process run as `atlas-worker`, never as `nocdem`**, except
+  where a root-owned policy names an exception. That is the architectural
+  commitment A7.1 exists to make possible; if it is broken outside such a
+  policy, the guarantee below is void and no code change will restore it.
+- **A8.1 declares one such exception, and the honest reading is that it opts
+  those jobs out of this document.** When `/etc/atlas/orchestration.conf` sets
+  `model_dispatcher_uid`, jobs whose driver needs a live model run as that uid —
+  in this deployment `nocdem` — with that account's filesystem authority. For
+  those jobs `atlas-worker` is not the principal and nothing below applies to
+  them; the reason is that the only Claude Code credential on this machine is a
+  personal session, and Atlas will not copy, read or relocate one. Jobs on every
+  other driver still run as `atlas-worker` under the whole of this model.
 
 ### `atlas-worker` is the adversary A7.1 defends against
 

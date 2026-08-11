@@ -2,8 +2,9 @@
  * sides of it.
  * Copyright 2026 The Atlas Authors. Licensed under the Apache License 2.0.
  *
- * Two defects motivated this suite, and both were invisible to every test that
- * existed when they shipped:
+ * Four defects motivated this suite, and every one was invisible to the tests
+ * that existed when it shipped, because a fixture is a single-user install and
+ * these live only where the client does not own the index:
  *
  *  1. **A client that does not own the index crashed on `--path` and
  *     `--symbol-link`.** Under a system deployment the CLI runs with
@@ -18,6 +19,18 @@
  *     built the `relates_to` links, `op_to_params` serialised paths, commits
  *     and symbols and not those, and the daemon had no parameter to read them
  *     from. The command exited 0 and recorded nothing.
+ *
+ *  3. **A symbol link recorded over the socket bound no file.** The daemon
+ *     filled a file context only when the request carried `symbol_files`,
+ *     which the CLI never sends because the local path resolves the definition
+ *     site itself. The same decision written the two ways produced two
+ *     different content hashes — which is how the equivalence case below found
+ *     it.
+ *
+ *  4. **`decision show` and `decision export` returned an empty document.**
+ *     `decision.get` answers with a nested shape and the client read the names
+ *     flat, so every field came back empty with `ok`. A read that fails is
+ *     noticed; a read that succeeds and says nothing is not.
  *
  * The shape of the test follows from that: every assertion below is made
  * against a daemon over a socket, because the local path was never the one that
@@ -469,7 +482,72 @@ static void test_local_socket_equivalence(void) {
     fx_close(&e.fx);
 }
 
+/* `decision show` must render the same document over the socket as locally.
+ *
+ * It did not. `decision.get` answers with a nested shape — `result.document`
+ * and `result.revision` — and the client parser read those names flat, matched
+ * nothing, and returned an empty document with `ok`. So `atlas decision show`
+ * printed a blank record for a decision that was there, and `atlas decision
+ * export` wrote one. Nothing failed; the record simply came back empty, which
+ * is the worst way for a read to be wrong.
+ *
+ * Compared as whole rendered documents rather than field by field: a field-wise
+ * check only covers the fields somebody remembered to list, and the defect was
+ * that every field was missing at once. */
+static void test_show_local_socket_equivalence(void) {
+    env e;
+    env_open(&e);
+    atlas_err err;
+    atlas_err_init(&err);
+    atlas_buf remote_out = ATLAS_BUF_INIT;
+    atlas_buf local_out = ATLAS_BUF_INIT;
+
+    char uid[64];
+    {
+        const char *args[] = {"--json",     "decision", "propose",       "proj",
+                              "--title",    "shown",    "--decision",    "a document to read back",
+                              "--rationale", "because", "--consequences", "it must read back",
+                              "--path",     "one.c",    "--symbol-link", "only_here",
+                              "--alternative", "the other thing"};
+        T_REQUIRE(run_remote(&e, args, 18u, &remote_out) == 0);
+        extract_uid(&remote_out, uid, sizeof uid);
+    }
+    atlas_buf_reset(&remote_out);
+    {
+        const char *args[] = {"decision", "show", "proj", uid};
+        T_REQUIRE(run_remote(&e, args, 4u, &remote_out) == 0);
+    }
+    /* Every field the defect emptied, present. */
+    {
+        const char *s = atlas_buf_cstr(&remote_out);
+        T_REQUIRE(strstr(s, uid) != NULL);
+        T_REQUIRE(strstr(s, "PROPOSED") != NULL);
+        T_REQUIRE(strstr(s, "shown") != NULL);
+        T_REQUIRE(strstr(s, "a document to read back") != NULL);
+        T_REQUIRE(strstr(s, "because") != NULL);
+        T_REQUIRE(strstr(s, "the other thing") != NULL);
+        T_REQUIRE(strstr(s, "one.c") != NULL);
+        T_REQUIRE(strstr(s, "only_here") != NULL);
+    }
+
+    fx_daemon_stop(&e.d, false);
+    {
+        const char *args[] = {"--data-dir", fx_data_dir(&e.fx), "decision", "show", "proj", uid};
+        int code = -1;
+        T_OK(fx_atlas(args, 6u, &local_out, NULL, &code, &err), &err);
+        T_REQUIRE(code == 0);
+    }
+    T_REQUIRE_MSG(strcmp(atlas_buf_cstr(&remote_out), atlas_buf_cstr(&local_out)) == 0,
+                  "socket and local renderings differ");
+
+    atlas_buf_free(&remote_out);
+    atlas_buf_free(&local_out);
+    fx_daemon_free(&e.d);
+    fx_close(&e.fx);
+}
+
 static const atlas_test TESTS[] = {
+    {"decision show renders identically over the socket", test_show_local_socket_equivalence},
     {"propose carrying path, commit, symbol and decision links", test_propose_all_link_kinds},
     {"revise and link add keep and extend the link set", test_revise_and_link_add},
     {"ambiguous, missing, self, dangling and duplicate", test_refusals},

@@ -437,3 +437,149 @@ atlas_status atlas_ipc_result_write(const atlas_ipc_response *r, atlas_json *j, 
     cast.in = r->result;
     return atlas_jsonv_write(cast.out, j, ATLAS_IPC_MAX_JSON_DEPTH, err);
 }
+
+/* --- one nested object inside the result ---------------------------------- */
+
+/* `decision.get` answers with a nested shape — `result.document` and
+ * `result.revision` — and every accessor above reads one level. The client
+ * parser read the flat names, found none of them, and filled a document whose
+ * every field was empty while reporting success: `atlas decision show` and
+ * `atlas decision export` printed a blank record for a decision that was
+ * there. The daemon was right and the reader was looking in the wrong place.
+ *
+ * These three reach one level in, and no further. A general path syntax would
+ * be a small query language inside the response parser, and the responses that
+ * need it are the ones that should have been flattened instead. */
+static yyjson_val *result_obj(const atlas_ipc_response *r, const char *obj_key) {
+    if (r == NULL || r->result == NULL) {
+        return NULL;
+    }
+    yyjson_val *o = yyjson_obj_get(r->result, obj_key);
+    return (o != NULL && yyjson_is_obj(o)) ? o : NULL;
+}
+
+bool atlas_ipc_result_obj_str(const atlas_ipc_response *r, const char *obj_key, const char *key,
+                              const char **out) {
+    *out = NULL;
+    yyjson_val *o = result_obj(r, obj_key);
+    if (o == NULL) {
+        return false;
+    }
+    yyjson_val *v = yyjson_obj_get(o, key);
+    if (v == NULL || !yyjson_is_str(v)) {
+        return false;
+    }
+    const char *s = yyjson_get_str(v);
+    if (s == NULL || strlen(s) != yyjson_get_len(v)) {
+        return false; /* an embedded NUL would make the two halves disagree */
+    }
+    *out = s;
+    return true;
+}
+
+bool atlas_ipc_result_obj_int(const atlas_ipc_response *r, const char *obj_key, const char *key,
+                              int64_t *out) {
+    yyjson_val *o = result_obj(r, obj_key);
+    if (o == NULL) {
+        return false;
+    }
+    yyjson_val *v = yyjson_obj_get(o, key);
+    if (v == NULL || !yyjson_is_int(v)) {
+        return false;
+    }
+    *out = yyjson_get_sint(v);
+    return true;
+}
+
+bool atlas_ipc_result_obj_bool(const atlas_ipc_response *r, const char *obj_key, const char *key,
+                               bool *out) {
+    yyjson_val *o = result_obj(r, obj_key);
+    if (o == NULL) {
+        return false;
+    }
+    yyjson_val *v = yyjson_obj_get(o, key);
+    if (v == NULL || !yyjson_is_bool(v)) {
+        return false;
+    }
+    *out = yyjson_is_true(v);
+    return true;
+}
+
+/* An array that lives inside a nested object: `result.revision.links`. */
+bool atlas_ipc_result_obj_arr_len(const atlas_ipc_response *r, const char *obj_key,
+                                  const char *arr_key, size_t *out) {
+    *out = 0;
+    yyjson_val *o = result_obj(r, obj_key);
+    if (o == NULL) {
+        return false;
+    }
+    yyjson_val *a = yyjson_obj_get(o, arr_key);
+    if (a == NULL || !yyjson_is_arr(a)) {
+        return false;
+    }
+    *out = yyjson_arr_size(a);
+    return true;
+}
+
+static yyjson_val *obj_arr_elem(const atlas_ipc_response *r, const char *obj_key,
+                                const char *arr_key, size_t index) {
+    yyjson_val *o = result_obj(r, obj_key);
+    if (o == NULL) {
+        return NULL;
+    }
+    yyjson_val *a = yyjson_obj_get(o, arr_key);
+    if (a == NULL || !yyjson_is_arr(a) || index >= yyjson_arr_size(a)) {
+        return NULL;
+    }
+    return yyjson_arr_get(a, index);
+}
+
+bool atlas_ipc_result_obj_arr_str(const atlas_ipc_response *r, const char *obj_key,
+                                  const char *arr_key, size_t index, const char **out) {
+    *out = NULL;
+    yyjson_val *e = obj_arr_elem(r, obj_key, arr_key, index);
+    if (e == NULL || !yyjson_is_str(e)) {
+        return false;
+    }
+    const char *s = yyjson_get_str(e);
+    if (s == NULL || strlen(s) != yyjson_get_len(e)) {
+        return false;
+    }
+    *out = s;
+    return true;
+}
+
+bool atlas_ipc_result_obj_arr_obj_str(const atlas_ipc_response *r, const char *obj_key,
+                                      const char *arr_key, size_t index, const char *key,
+                                      const char **out) {
+    *out = NULL;
+    yyjson_val *e = obj_arr_elem(r, obj_key, arr_key, index);
+    if (e == NULL || !yyjson_is_obj(e)) {
+        return false;
+    }
+    yyjson_val *v = yyjson_obj_get(e, key);
+    if (v == NULL || !yyjson_is_str(v)) {
+        return false;
+    }
+    const char *s = yyjson_get_str(v);
+    if (s == NULL || strlen(s) != yyjson_get_len(v)) {
+        return false;
+    }
+    *out = s;
+    return true;
+}
+
+bool atlas_ipc_result_obj_arr_obj_int(const atlas_ipc_response *r, const char *obj_key,
+                                      const char *arr_key, size_t index, const char *key,
+                                      int64_t *out) {
+    yyjson_val *e = obj_arr_elem(r, obj_key, arr_key, index);
+    if (e == NULL || !yyjson_is_obj(e)) {
+        return false;
+    }
+    yyjson_val *v = yyjson_obj_get(e, key);
+    if (v == NULL || !yyjson_is_int(v)) {
+        return false;
+    }
+    *out = yyjson_get_sint(v);
+    return true;
+}

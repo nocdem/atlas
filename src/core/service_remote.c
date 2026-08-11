@@ -1447,63 +1447,80 @@ atlas_status atlas_service_decision_show_remote(const char *repo, const char *ui
         atlas_buf_free(&raw);
         return st;
     }
+    /* `decision.get` answers with a nested shape: `result.document` carries the
+     * document's identity and lifecycle, `result.revision` the revision's
+     * content and links, and only `repo` sits at the top level. This parser
+     * used to read every one of those names flat, match nothing and return a
+     * document whose every field was empty — with `ok`, so `atlas decision
+     * show` printed a blank record for a decision that was there and `atlas
+     * decision export` wrote one. The names below are the daemon's; the nesting
+     * is the daemon's; nothing here guesses. */
     const char *v = NULL;
     int64_t t = 0;
     bool b = false;
+    if (atlas_ipc_result_str(r, "repo", &v)) {
+        st = atlas_buf_set_str(&out->repo, v, err);
+    }
     const struct {
+        const char *obj;
         const char *k;
         atlas_buf *dst;
     } strs[] = {
-        {"repo", &out->repo},
-        {"decision", &out->summary.uid},
-        {"status", &out->summary.status},
-        {"state", &out->summary.revision_state},
-        {"title", &out->summary.title},
-        {"content_hash", &out->summary.content_hash},
-        {"proposed_by", &out->summary.proposed_by},
-        {"created_at", &out->summary.created_at},
-        {"context", &out->context_text},
-        {"decision_text", &out->decision_text},
-        {"rationale", &out->rationale_text},
-        {"consequences", &out->consequences_text},
-        {"scope", &out->scope},
-        {"basis_head", &out->basis_head},
-        {"basis_repo_identity", &out->basis_repo_identity},
-        {"unbound_reason", &out->unbound_reason},
+        {"document", "decision", &out->summary.uid},
+        {"document", "status", &out->summary.status},
+        {"document", "revision_state", &out->summary.revision_state},
+        {"document", "created_at", &out->summary.created_at},
+        {"revision", "title", &out->summary.title},
+        {"revision", "content_hash", &out->summary.content_hash},
+        {"revision", "proposed_by", &out->summary.proposed_by},
+        {"revision", "context", &out->context_text},
+        {"revision", "decision_body", &out->decision_text},
+        {"revision", "rationale", &out->rationale_text},
+        {"revision", "consequences", &out->consequences_text},
+        {"revision", "scope", &out->scope},
+        {"revision", "basis_head", &out->basis_head},
+        {"revision", "basis_repo_identity", &out->basis_repo_identity},
+        {"revision", "unbound_reason", &out->unbound_reason},
     };
     for (size_t i = 0; st == ATLAS_OK && i < sizeof strs / sizeof strs[0]; i++) {
-        if (atlas_ipc_result_str(r, strs[i].k, &v)) {
+        if (atlas_ipc_result_obj_str(r, strs[i].obj, strs[i].k, &v)) {
             st = atlas_buf_set_str(strs[i].dst, v, err);
         }
     }
-    /* `decision` is the uid at the top level and the prose under the same name
-     * inside the document; the prose is read from its own key. */
-    if (st == ATLAS_OK && atlas_ipc_result_str(r, "decision", &v) && out->decision_text.len == 0) {
-        st = atlas_buf_set_str(&out->summary.uid, v, err);
+    /* The prose lives under `decision` inside the revision, where the same name
+     * at document level is the uid. Read after the table so the uid, taken from
+     * the document, is never overwritten by it. */
+    if (st == ATLAS_OK && out->decision_text.len == 0 &&
+        atlas_ipc_result_obj_str(r, "revision", "decision", &v) &&
+        strncmp(v, ATLAS_DECISION_UID_PREFIX, strlen(ATLAS_DECISION_UID_PREFIX)) != 0) {
+        st = atlas_buf_set_str(&out->decision_text, v, err);
     }
-    if (atlas_ipc_result_int(r, "number", &t)) {
+    if (atlas_ipc_result_obj_int(r, "revision", "number", &t)) {
         out->summary.revision_no = t;
     }
-    if (atlas_ipc_result_bool(r, "session_unbound", &b)) {
+    if (atlas_ipc_result_obj_int(r, "document", "latest_revision", &t)) {
+        out->summary.latest_revision_no = t;
+    }
+    if (atlas_ipc_result_obj_bool(r, "revision", "session_unbound", &b)) {
         out->session_unbound = b;
     }
     size_t n = 0;
-    (void)atlas_ipc_result_arr_len(r, "alternatives", &n);
+    (void)atlas_ipc_result_obj_arr_len(r, "revision", "alternatives", &n);
     for (size_t i = 0; st == ATLAS_OK && i < n && i < ATLAS_DECISION_MAX_ALTERNATIVES; i++) {
         const char *a = NULL;
-        if (atlas_ipc_result_arr_str(r, "alternatives", i, &a)) {
+        if (atlas_ipc_result_obj_arr_str(r, "revision", "alternatives", i, &a)) {
             st = atlas_buf_set_str(&out->alternatives[out->alternative_count], a, err);
             if (st == ATLAS_OK) {
                 out->alternative_count++;
             }
         }
     }
-    (void)atlas_ipc_result_arr_len(r, "links", &n);
+    (void)atlas_ipc_result_obj_arr_len(r, "revision", "links", &n);
     for (size_t i = 0; st == ATLAS_OK && i < n && i < ATLAS_DECISION_MAX_LINKS; i++) {
         atlas_decision_link_view *lv = &out->links[out->link_count];
         atlas_decision_link_view_init(lv);
         const char *kind = NULL;
-        if (!atlas_ipc_result_arr_obj_str(r, "links", i, "kind", &kind)) {
+        if (!atlas_ipc_result_obj_arr_obj_str(r, "revision", "links", i, "kind", &kind)) {
             continue;
         }
         st = atlas_buf_set_str(&lv->kind, kind, err);
@@ -1512,24 +1529,27 @@ atlas_status atlas_service_decision_show_remote(const char *repo, const char *ui
          * has, under a single name. */
         static const char *const VALUE_KEYS[] = {"path", "commit", "symbol", "target"};
         for (size_t k = 0; st == ATLAS_OK && k < sizeof VALUE_KEYS / sizeof VALUE_KEYS[0]; k++) {
-            if (atlas_ipc_result_arr_obj_str(r, "links", i, VALUE_KEYS[k], &v)) {
+            if (atlas_ipc_result_obj_arr_obj_str(r, "revision", "links", i, VALUE_KEYS[k], &v)) {
                 st = atlas_buf_set_str(&lv->value, v, err);
                 break;
             }
         }
-        if (st == ATLAS_OK && atlas_ipc_result_arr_obj_str(r, "links", i, "symbol_kind", &v)) {
+        if (st == ATLAS_OK &&
+            atlas_ipc_result_obj_arr_obj_str(r, "revision", "links", i, "symbol_kind", &v)) {
             st = atlas_buf_set_str(&lv->detail, v, err);
         }
-        if (st == ATLAS_OK && atlas_ipc_result_arr_obj_str(r, "links", i, "currency", &v)) {
+        if (st == ATLAS_OK &&
+            atlas_ipc_result_obj_arr_obj_str(r, "revision", "links", i, "currency", &v)) {
             st = atlas_buf_set_str(&lv->currency, v, err);
         }
-        if (st == ATLAS_OK && atlas_ipc_result_arr_obj_str(r, "links", i, "analyzer", &v)) {
+        if (st == ATLAS_OK &&
+            atlas_ipc_result_obj_arr_obj_str(r, "revision", "links", i, "analyzer", &v)) {
             st = atlas_buf_set_str(&lv->analyzer, v, err);
         }
-        if (atlas_ipc_result_arr_obj_int(r, "links", i, "analyzer_version", &t)) {
+        if (atlas_ipc_result_obj_arr_obj_int(r, "revision", "links", i, "analyzer_version", &t)) {
             lv->analyzer_version = t;
         }
-        if (atlas_ipc_result_arr_obj_int(r, "links", i, "matches", &t)) {
+        if (atlas_ipc_result_obj_arr_obj_int(r, "revision", "links", i, "matches", &t)) {
             lv->matches = t;
         }
         if (strcmp(atlas_buf_cstr(&lv->currency), "CURRENT") != 0 &&

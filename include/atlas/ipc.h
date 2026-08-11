@@ -295,6 +295,32 @@ bool atlas_ipc_result_arr_obj_bool(const atlas_ipc_response *r, const char *arr_
  * of its objects has. A reader that walked until a key was absent could not
  * tell an empty array from a missing one, and for a reason list those mean
  * different things. */
+/* One level into a nested result object, and no further.
+ *
+ * `decision.get` answers with `result.document` and `result.revision`, and
+ * every accessor above reads exactly one level — so the client parser read flat
+ * names, matched nothing, and produced an empty document while reporting
+ * success. These exist so a nested reply can be read rather than guessed at. A
+ * general path syntax is deliberately not offered: it would be a query language
+ * inside the response parser, and the replies that would need one should be
+ * flattened instead. */
+bool atlas_ipc_result_obj_str(const atlas_ipc_response *r, const char *obj_key, const char *key,
+                              const char **out);
+bool atlas_ipc_result_obj_int(const atlas_ipc_response *r, const char *obj_key, const char *key,
+                              int64_t *out);
+bool atlas_ipc_result_obj_bool(const atlas_ipc_response *r, const char *obj_key, const char *key,
+                               bool *out);
+bool atlas_ipc_result_obj_arr_len(const atlas_ipc_response *r, const char *obj_key,
+                                  const char *arr_key, size_t *out);
+bool atlas_ipc_result_obj_arr_str(const atlas_ipc_response *r, const char *obj_key,
+                                  const char *arr_key, size_t index, const char **out);
+bool atlas_ipc_result_obj_arr_obj_str(const atlas_ipc_response *r, const char *obj_key,
+                                      const char *arr_key, size_t index, const char *key,
+                                      const char **out);
+bool atlas_ipc_result_obj_arr_obj_int(const atlas_ipc_response *r, const char *obj_key,
+                                      const char *arr_key, size_t index, const char *key,
+                                      int64_t *out);
+
 bool atlas_ipc_result_arr_len(const atlas_ipc_response *r, const char *arr_key, size_t *out);
 bool atlas_ipc_result_arr_str(const atlas_ipc_response *r, const char *arr_key, size_t index,
                               const char **out);

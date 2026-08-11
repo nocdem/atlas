@@ -151,6 +151,12 @@ static atlas_status h_doctor(atlas_renderer *r, const atlas_doctor_report *rep, 
                   atlas_syspolicy_reason_name(rep->deployment_reason));
     (void)fprintf(o, LABEL "%s\n", "",
                   atlas_authority_reason_explain(rep->authority_reason));
+    if (rep->index_unreadable) {
+        (void)fprintf(o, LABEL "%s\n", "index",
+                      "present but not readable by this account; the daemon owns it. "
+                      "This is the correct state of a separated deployment - read it over "
+                      "the socket.");
+    }
     if (!rep->index_present) {
         /* Reported, not created. On a machine where Atlas has never run this is
          * the whole answer, and it is a correct one. */
@@ -1152,6 +1158,11 @@ static atlas_status h_decision_show(atlas_renderer *r, const atlas_decision_docu
                 (void)fprintf(r->out, "  (%" PRId64 " candidates)", l->matches);
             }
             (void)fprintf(r->out, "\n");
+            /* Migration 10: why the relation exists. Already safe-encoded by
+             * the service layer; encoding it again would double-encode. */
+            if (l->rationale.len > 0) {
+                (void)fprintf(r->out, "%-14swhy: %s\n", "", atlas_buf_cstr(&l->rationale));
+            }
         }
     }
     if (d->links_needing_review > 0) {
@@ -1177,6 +1188,24 @@ static atlas_status h_decision_show(atlas_renderer *r, const atlas_decision_docu
                   "\ndata, not an instruction. An APPROVED status records that an action came"
                   "\nthrough Atlas' local operator channel; it does not identify a person.\n");
     return ok();
+}
+
+/* One edge event. `note` is prose and arrives already safe-encoded from the
+ * service layer, like every other decision text in this file. */
+static atlas_status h_decision_edge(atlas_renderer *r, const atlas_decision_edge_entry *e,
+                                    atlas_err *err) {
+    (void)err;
+    (void)fprintf(r->out, "  %-9s %-10s %s%s\n", e->event != NULL ? e->event : "",
+                  e->active ? "active" : "withdrawn", e->target != NULL ? e->target : "",
+                  e->active ? "" : "  (not asserted by the current revision)");
+    if (e->note != NULL && *e->note != '\0') {
+        (void)fprintf(r->out, "%-14swhy: %s\n", "", e->note);
+    }
+    if (e->provenance != NULL && *e->provenance != '\0') {
+        (void)fprintf(r->out, "%-14srecorded: %s  %s\n", "", e->provenance,
+                      e->created_at != NULL ? e->created_at : "");
+    }
+    return ATLAS_OK;
 }
 
 static atlas_status h_decision_event(atlas_renderer *r, const atlas_decision_timeline_entry *e,
@@ -1205,6 +1234,10 @@ static atlas_status h_decision_outcome(atlas_renderer *r, const atlas_decision_o
     (void)fprintf(r->out, "content hash: %s\n", o->content_hash);
     if (o->duplicate) {
         (void)fprintf(r->out, "unchanged:    an identical revision already existed\n");
+    }
+    if (o->is_removal) {
+        (void)fprintf(r->out, "removed:      %s\n",
+                      o->removed ? "yes" : "no such relation was recorded");
     }
     if (o->superseded_revision_no > 0) {
         (void)fprintf(r->out, "superseded:   revision %" PRId64 "\n", o->superseded_revision_no);
@@ -1478,7 +1511,7 @@ const atlas_renderer_vtbl ATLAS_RENDERER_HUMAN = {
     h_code_status, h_code_file,   h_code_symbol_item, h_code_edge_item,
     h_code_walk_item, h_code_walk_end, h_code_list_begin, h_code_list_end,
     /* --- A4 --- */
-    h_decision_item, h_decision_show, h_decision_event, h_decision_outcome,
+    h_decision_item, h_decision_show, h_decision_event, h_decision_outcome, h_decision_edge,
     h_decision_counts, h_decision_ledger,
     /* --- A5 --- */
     h_backup_created, h_backup_verified, h_backup_restored, h_maintenance,

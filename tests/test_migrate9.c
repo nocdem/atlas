@@ -57,8 +57,8 @@ static void test_a_fresh_database_is_schema_nine_with_relates_to(void) {
     atlas_db *db = NULL;
     T_OK(atlas_db_open(atlas_buf_cstr(&path), &db, &err), &err);
     T_OK(atlas_db_migrate(db, &err), &err);
-    T_EQ_INT(schema_of(db), 9);
-    T_EQ_INT(ATLAS_SCHEMA_VERSION, 9);
+    T_EQ_INT(schema_of(db), 10);
+    T_EQ_INT(ATLAS_SCHEMA_VERSION, 10);
 
     /* Native, not merely tolerated. Asked of the stored schema rather than by
      * inserting a row: the CHECK is what the vocabulary *is*, and a test that

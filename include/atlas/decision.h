@@ -342,6 +342,14 @@ atlas_status atlas_decision_revision_add_alternative(atlas_decision_revision *r,
 atlas_status atlas_decision_revision_add_link(atlas_decision_revision *r,
                                               atlas_decision_link *link, atlas_err *err);
 
+/* Drops one link from a working copy of a revision, returning whether it was
+ * there. Nothing is deleted from the database by this: a revision is immutable,
+ * so a caller loads the current one, drops a link from the copy, and writes the
+ * result as a new revision. The revision that carried the link keeps it, which
+ * is why withdrawing a relation costs no history. */
+bool atlas_decision_revision_remove_link(atlas_decision_revision *r, atlas_decision_link_kind kind,
+                                         const char *target_uid);
+
 /* --- the canonical content hash -------------------------------------------
  *
  * A domain-separated, length-prefixed encoding of exactly the content fields,

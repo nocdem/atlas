@@ -1111,6 +1111,60 @@ absence is the deferral.
   personal session — and `live_model` must be on as well, so there are two
   independent gates.
 
+## A8 final closure — migration 10 and the account of an edge
+
+- **A relation's reason lives outside the revision that carries it, and that
+  placement is the design.** A revision is immutable and its links are covered
+  by the canonical content hash, so a rationale inside one would either change
+  `ATLAS_DECISION_HASH_DOMAIN` — making all 54 approved digests disagree with
+  their content, which `atlas doctor` reports as tampering — or force a new
+  revision and a fresh approval for every document that ever gained an edge. A
+  reason written after an approval was not part of what was approved. It is
+  evidence *about* the edge, the same separation A6 makes between the content
+  hash and the evidence digest, and `docs/decision-lifecycle.md` carries the
+  row saying so.
+- **`decision_edge_events` is keyed by the semantic edge, never by a
+  `decision_links.id`.** A link row is rewritten with a fresh id on every
+  revision, so an id-keyed reason would be silently lost by the next revise —
+  which is the failure the table exists to end. It is append-only: no UPDATE, no
+  DELETE, no `_clear` and no `_prune`; a correction appends and the highest id
+  wins. Ordering is the AUTOINCREMENT id and never a timestamp, which is A8's
+  rule. It is CANONICAL in `RETENTION[]` and not prunable.
+- **What is live is decided by the current revision's links, never by the
+  ledger.** `active` is computed on read, for the reason A6 recomputes freshness
+  and A4 recomputes link currency. A cached flag would be a second answer to a
+  question that already has one.
+- **`link remove` deletes nothing.** It writes a new proposed revision asserting
+  one relation fewer; the revision that carried it keeps it verbatim, with its
+  creation event and its rationale. That is why withdrawing costs no history.
+  Removing a relation that was never drawn reports `removed: false` and writes
+  nothing. A removal never rewrites prose, never fabricates a revision and never
+  reaches a lifecycle state.
+- **`--why` is required to withdraw and optional to draw.** A reason not
+  recorded at removal is not recorded at all; an addition can still be explained
+  afterwards by annotating the edge.
+- **A note that is a decision id is refused.** That is the A8.2 defect — prose
+  and a document id sharing a meaning — made structural rather than detected.
+  Every new prose field gets its own key beside the id it accompanies:
+  `edge_target` names the relation, `edge_note` explains it.
+- **A routed op and a named method are the same operation and must validate
+  identically.** A client holding a context but not the writer lock sends its
+  whole typed op through `decision.revise`, not through `decision.link_add`, so
+  both paths call `take_edge_fields`. A reason that reached one and not the
+  other made the two ways of recording the same relation disagree — which is
+  exactly what `tests/test_decision_edge.c` caught.
+- **A database from a newer Atlas is refused on the writable path.** The
+  migration loop only ever adds, so a future schema fell straight through it and
+  was reported as migrated; an older binary then writing under constraints it
+  does not know is how a rebuildable index stops being rebuildable. The
+  read-only path already refused; both do now.
+- **`atlas doctor` distinguishes "there is no index" from "there is an index I
+  may not read".** Under A7.1 the index is 0700 `atlasd`, so from the operator's
+  account the second looked exactly like the first — "Atlas has never run here"
+  — which is false and is the one command somebody runs to tell them apart. It
+  is a reported finding, not a problem, and does not affect `ok`: an index the
+  operator cannot read is the correct state of a separated deployment.
+
 ## Extending A8 safely
 
 - **A new state** means editing `atlas_orch_state`, both schema CHECKs,

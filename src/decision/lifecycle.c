@@ -72,6 +72,7 @@ const char *atlas_decision_op_kind_name(atlas_decision_op_kind k) {
     case ATLAS_DECISION_OP_SUPERSEDE: return "supersede";
     case ATLAS_DECISION_OP_PROMOTE: return "promote";
     case ATLAS_DECISION_OP_REVALIDATE: return "revalidate";
+    case ATLAS_DECISION_OP_EDGE_NOTE: return "edge note";
     }
     return "propose";
 }
@@ -100,6 +101,10 @@ void atlas_decision_op_init(atlas_decision_op *op, atlas_decision_op_kind kind) 
     atlas_buf_init(&op->confirmation);
     atlas_buf_init(&op->prior_freshness);
     atlas_buf_init(&op->prior_reasons);
+    atlas_buf_init(&op->edge_target_uid);
+    atlas_buf_init(&op->edge_event);
+    atlas_buf_init(&op->edge_note);
+    atlas_buf_init(&op->edge_provenance);
 }
 
 void atlas_decision_op_free(atlas_decision_op *op) {
@@ -119,6 +124,10 @@ void atlas_decision_op_free(atlas_decision_op *op) {
     atlas_buf_free(&op->confirmation);
     atlas_buf_free(&op->prior_freshness);
     atlas_buf_free(&op->prior_reasons);
+    atlas_buf_free(&op->edge_target_uid);
+    atlas_buf_free(&op->edge_event);
+    atlas_buf_free(&op->edge_note);
+    atlas_buf_free(&op->edge_provenance);
 }
 
 void atlas_decision_result_init(atlas_decision_result *r) {
@@ -620,6 +629,133 @@ static atlas_status hash_request(const atlas_decision_revision *src, const apply
     return st;
 }
 
+/* --- the durable account of an edge (migration 10) -------------------------
+ *
+ * One helper, called from `op_revise` inside the transaction that writes the
+ * revision and from `op_edge_note` inside its own. There is no third caller and
+ * no path to `decision_edge_events` that does not come through here, which is
+ * the rule every other Atlas write point follows.
+ *
+ * The note is prose, so it is checked for the one confusion that has already
+ * cost this project a repair: a rationale that is itself a decision id. That
+ * was the A8.2 defect — two meanings on one key — and refusing it structurally
+ * is cheaper than detecting it afterwards. */
+static atlas_status write_edge_note(apply_ctx *ac, const atlas_decision_op *op,
+                                    int64_t source_document_id, int64_t revision_id,
+                                    const char *default_event, atlas_err *err) {
+    const char *target = atlas_buf_cstr(&op->edge_target_uid);
+    if (target == NULL || *target == '\0') {
+        return ATLAS_OK; /* no account carried; every op before this one */
+    }
+    const char *note = atlas_buf_cstr(&op->edge_note);
+    if (note == NULL || *note == '\0') {
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "an edge note needs a reason; relating two decisions without "
+                             "saying why is what this record exists to prevent");
+    }
+    if (strlen(note) > ATLAS_DECISION_EDGE_NOTE_MAX) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "an edge note is at most %d bytes",
+                             ATLAS_DECISION_EDGE_NOTE_MAX);
+    }
+    /* The A8.2 guard, applied to the one new prose field. A note that is a
+     * document id is a caller that has confused the explanation with the thing
+     * being explained. */
+    if (atlas_decision_uid_is_valid(note)) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "that note is a decision id, not a reason; the note says why the "
+                             "relation exists and the target says what it points at");
+    }
+    if (!atlas_decision_uid_is_valid(target)) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "that is not a decision id");
+    }
+
+    int64_t target_id = 0, target_repo = 0;
+    bool found = false;
+    atlas_status st =
+        atlas_db_decision_find_uid(ac->db, target, &target_id, &target_repo, &found, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (!found) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "no decision has that id");
+    }
+    /* Cross-repository isolation, checked here as well as at the edge that
+     * built the op: this is the write point, and a write point that trusts its
+     * caller is not one. */
+    if (target_repo != ac->repo.id) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "that decision belongs to a different repository");
+    }
+    if (target_id == source_document_id) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "a decision cannot relate to itself");
+    }
+
+    const char *event = atlas_buf_cstr(&op->edge_event);
+    if (event == NULL || *event == '\0') {
+        event = default_event;
+    }
+    if (strcmp(event, ATLAS_DECISION_EDGE_EVENT_ADDED) != 0 &&
+        strcmp(event, ATLAS_DECISION_EDGE_EVENT_ANNOTATED) != 0 &&
+        strcmp(event, ATLAS_DECISION_EDGE_EVENT_REMOVED) != 0) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "unknown edge event '%s'", event);
+    }
+    const char *prov = atlas_buf_cstr(&op->edge_provenance);
+    if (prov == NULL || *prov == '\0') {
+        prov = "UNKNOWN";
+    }
+    if (strcmp(prov, "OPERATOR") != 0 && strcmp(prov, "D1_MANIFEST") != 0 &&
+        strcmp(prov, "D3_REPAIR") != 0 && strcmp(prov, "UNKNOWN") != 0) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "unknown edge provenance '%s'", prov);
+    }
+
+    return atlas_db_decision_edge_event_append(ac->db, source_document_id, target_id,
+                                               atlas_decision_link_kind_name(
+                                                   ATLAS_DECISION_LINK_RELATES_TO),
+                                               event, note, prov, revision_id, err);
+}
+
+/* Attach an explanation to an edge that already exists.
+ *
+ * Writes one append-only row and nothing else: no revision, so no content hash
+ * moves and no approval is disturbed. This is what makes it possible to explain
+ * the relations of an already-approved decision without proposing anything —
+ * which is the only honest way to do it, because a rationale written after an
+ * approval was not part of what was approved. */
+static atlas_status op_edge_note(apply_ctx *ac, const atlas_decision_op *op,
+                                 atlas_decision_result *out, atlas_err *err) {
+    int64_t document_id = 0, doc_repo = 0;
+    bool found = false;
+    atlas_status st = atlas_db_decision_find_uid(ac->db, atlas_buf_cstr(&op->uid), &document_id,
+                                                 &doc_repo, &found, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (!found) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "no decision has that id");
+    }
+    if (doc_repo != ac->repo.id) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "that decision belongs to a different repository");
+    }
+    st = write_edge_note(ac, op, document_id, 0, ATLAS_DECISION_EDGE_EVENT_ANNOTATED, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    out->document_id = document_id;
+    /* The status is reported unchanged, because it is unchanged. */
+    int64_t rev_id = 0, rev_no = 0;
+    char hash[ATLAS_SHA256_HEX_LEN + 1u];
+    char state[16];
+    if (atlas_db_decision_latest_revision(ac->db, document_id, &rev_id, &rev_no, hash, sizeof(hash),
+                                          state, sizeof(state), err) == ATLAS_OK) {
+        out->revision_id = rev_id;
+        out->revision_no = rev_no;
+        (void)snprintf(out->content_hash, sizeof(out->content_hash), "%s", hash);
+        (void)atlas_decision_state_parse(state, &out->state);
+    }
+    return atlas_db_decision_uid_of(ac->db, document_id, &out->uid, err);
+}
+
 static atlas_status op_revise(apply_ctx *ac, const atlas_decision_op *op,
                               atlas_decision_result *out, atlas_err *err) {
     atlas_status st = check_proposer(&op->revision, err);
@@ -695,6 +831,13 @@ static atlas_status op_revise(apply_ctx *ac, const atlas_decision_op *op,
     }
     if (st == ATLAS_OK) {
         st = write_revision(ac, op, &built, document_id, last_no + 1, out, err);
+    }
+    /* The account of the edge commits with the revision that carries it, or
+     * neither is written. Inside this transaction, so a rolled-back revise
+     * cannot leave behind a rationale explaining an edge that never existed. */
+    if (st == ATLAS_OK) {
+        st = write_edge_note(ac, op, document_id, out->revision_id,
+                             ATLAS_DECISION_EDGE_EVENT_ADDED, err);
     }
     atlas_decision_revision_free(&built);
     return st;
@@ -1533,6 +1676,7 @@ atlas_status atlas_decision_apply_in_tx(atlas_db *db, const atlas_decision_op *o
         case ATLAS_DECISION_OP_SUPERSEDE: st = op_supersede(&ac, op, out, err); break;
         case ATLAS_DECISION_OP_PROMOTE: st = op_promote(&ac, op, out, err); break;
         case ATLAS_DECISION_OP_REVALIDATE: st = op_revalidate(&ac, op, out, err); break;
+        case ATLAS_DECISION_OP_EDGE_NOTE: st = op_edge_note(&ac, op, out, err); break;
         }
     }
     atlas_repo_info_free(&ac.repo);

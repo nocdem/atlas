@@ -72,6 +72,8 @@ void atlas_decision_link_view_init(atlas_decision_link_view *v) {
     atlas_buf_init(&v->detail);
     atlas_buf_init(&v->currency);
     atlas_buf_init(&v->analyzer);
+    atlas_buf_init(&v->rationale);
+    atlas_buf_init(&v->rationale_provenance);
 }
 
 void atlas_decision_link_view_free(atlas_decision_link_view *v) {
@@ -83,6 +85,8 @@ void atlas_decision_link_view_free(atlas_decision_link_view *v) {
     atlas_buf_free(&v->detail);
     atlas_buf_free(&v->currency);
     atlas_buf_free(&v->analyzer);
+    atlas_buf_free(&v->rationale);
+    atlas_buf_free(&v->rationale_provenance);
 }
 
 void atlas_decision_document_init(atlas_decision_document *d) {
@@ -525,6 +529,36 @@ atlas_status atlas_service_decision_show(atlas_ctx *ctx, const char *repo, const
                 break;
             }
         }
+        /* Migration 10: the durable reason a relation exists. Looked up per
+         * edge rather than carried on the link, because the link lives in an
+         * immutable revision and the reason does not — that separation is the
+         * whole point of the table. */
+        if (st == ATLAS_OK && l->kind == ATLAS_DECISION_LINK_RELATES_TO &&
+            l->target_uid.len > 0) {
+            int64_t tid = 0, trepo = 0;
+            bool tfound = false;
+            if (atlas_db_decision_find_uid(db, atlas_buf_cstr(&l->target_uid), &tid, &trepo,
+                                           &tfound, err) == ATLAS_OK &&
+                tfound) {
+                atlas_buf note = ATLAS_BUF_INIT;
+                atlas_buf prov = ATLAS_BUF_INIT;
+                bool have = false;
+                if (atlas_db_decision_edge_rationale(db, doc_id, tid,
+                                                     atlas_decision_link_kind_name(l->kind), &note,
+                                                     &prov, &have, err) == ATLAS_OK &&
+                    have) {
+                    /* Untrusted prose on its way to a renderer, so it is
+                     * encoded here exactly like every other stored text. */
+                    st = atlas_buf_set_str(&v->rationale, atlas_safe(&dst.ls.safe, atlas_buf_cstr(&note)),
+                                           err);
+                    if (st == ATLAS_OK) {
+                        st = atlas_buf_set(&v->rationale_provenance, prov.data, prov.len, err);
+                    }
+                }
+                atlas_buf_free(&note);
+                atlas_buf_free(&prov);
+            }
+        }
         if (st == ATLAS_OK) {
             if (l->currency == ATLAS_DECISION_LINK_CHANGED ||
                 l->currency == ATLAS_DECISION_LINK_MISSING ||
@@ -908,6 +942,7 @@ static const char *method_for(atlas_decision_op_kind kind) {
     case ATLAS_DECISION_OP_SUPERSEDE: return "decision.supersede";
     case ATLAS_DECISION_OP_PROMOTE: return "decision.promote";
     case ATLAS_DECISION_OP_REVALIDATE: return "decision.revalidate";
+    case ATLAS_DECISION_OP_EDGE_NOTE: return "decision.edge.note";
     }
     return "decision.propose";
 }
@@ -978,6 +1013,22 @@ static atlas_status op_to_params(const atlas_decision_op *op, atlas_buf *out, at
         /* Always, and never under `decision`: a propose whose prose went out
          * under the id's key is exactly how the two meanings got entangled. */
         st = put_buf(j, "decision_body", &op->revision.decision_text, err);
+    }
+    /* Migration 10: the account of an edge. Each under its own key, for the
+     * reason `decision_uid` and `decision_body` are separate — `edge_target` is
+     * a document id and `edge_note` is prose, and one key carrying both is the
+     * A8.2 defect. */
+    if (st == ATLAS_OK) {
+        st = put_buf(j, "edge_target", &op->edge_target_uid, err);
+    }
+    if (st == ATLAS_OK) {
+        st = put_buf(j, "edge_event", &op->edge_event, err);
+    }
+    if (st == ATLAS_OK) {
+        st = put_buf(j, "edge_note", &op->edge_note, err);
+    }
+    if (st == ATLAS_OK) {
+        st = put_buf(j, "edge_provenance", &op->edge_provenance, err);
     }
     if (st == ATLAS_OK && op->revision.scope != ATLAS_DECISION_SCOPE_UNKNOWN) {
         st = atlas_json_key_str(j, "scope", atlas_decision_scope_name(op->revision.scope), err);
@@ -1793,9 +1844,22 @@ atlas_status atlas_service_decision_export_markdown(const atlas_decision_documen
  * This is not an operator operation. It writes a proposal exactly as `propose`
  * and `revise` do, through the same authority path, and adds no capability.
  */
-atlas_status atlas_service_decision_link_add(atlas_ctx *ctx, const char *repo, const char *uid,
-                                             const char *target_uid,
-                                             atlas_decision_outcome *out, atlas_err *err) {
+/* Shared by `link add` and `link remove` on the local path.
+ *
+ * The two differ in one place — whether the working copy of the current
+ * revision gains a link or loses one — so they share every check around it.
+ * Keeping them one function is what makes "removal validates exactly what
+ * addition validates" a property of the code rather than a claim. */
+/* `note_only` writes one append-only row about an edge and touches no link at
+ * all — not even to check that the edge is live. That is what makes it possible
+ * to record the history of a relation that has already been withdrawn: the edge
+ * is not in any current revision, so there is nothing to add or remove, and the
+ * only thing left to do about it is say what happened. */
+static atlas_status link_op_local(atlas_ctx *ctx, const char *repo, const char *uid,
+                                  const char *target_uid, const char *note,
+                                  const char *provenance, bool adding, bool note_only,
+                                  const char *event, atlas_decision_outcome *out,
+                                  bool *removed_out, atlas_err *err) {
     if (!atlas_decision_uid_is_valid(uid)) {
         return atlas_err_set(err, ATLAS_ERR_USAGE,
                              "that is not a decision id; they look like atlas-dec- followed by "
@@ -1815,7 +1879,14 @@ atlas_status atlas_service_decision_link_add(atlas_ctx *ctx, const char *repo, c
      * `method_link_add`. The local path keeps the read-modify-write because it
      * holds the raw bytes and there is no encoding boundary to cross. */
     if (ctx == NULL) {
-        return atlas_service_decision_link_add_remote(repo, uid, target_uid, out, err);
+        if (note_only) {
+            return atlas_service_decision_link_note_remote(repo, uid, target_uid, note, provenance,
+                                                           event, out, err);
+        }
+        return adding ? atlas_service_decision_link_add_remote(repo, uid, target_uid, note,
+                                                               provenance, out, err)
+                      : atlas_service_decision_link_remove_remote(repo, uid, target_uid, note, out,
+                                                                  removed_out, err);
     }
 
     /* The revision is loaded from the database, not from a rendered document.
@@ -1880,7 +1951,22 @@ atlas_status atlas_service_decision_link_add(atlas_ctx *ctx, const char *repo, c
             }
         }
     }
-    if (st == ATLAS_OK && duplicate) {
+    bool have_note = note != NULL && *note != '\0';
+    /* The same refusal the daemon makes, on the path that does not cross the
+     * socket. Both write paths enforce it, so neither can be the weak one. */
+    if (st == ATLAS_OK && !note_only && !adding && !have_note) {
+        st = atlas_err_set(err, ATLAS_ERR_USAGE,
+                           "withdrawing a relation needs a reason: it is the only thing that "
+                           "will still explain it afterwards");
+    }
+    /* Adding a relation that is there, or withdrawing one that is not: nothing
+     * to write. Reported as an outcome rather than an error — a caller retrying
+     * asked for a state that now holds. The one exception is an explanation for
+     * an edge that already exists, which is a real write and is handled below
+     * as an annotation rather than as a revision. */
+    bool nothing_to_do = note_only ? false : (adding ? duplicate : !duplicate);
+    bool annotate_only = note_only || (adding && duplicate && have_note);
+    if (st == ATLAS_OK && nothing_to_do && !annotate_only) {
         int64_t no = 0;
         char hash[ATLAS_SHA256_HEX_LEN + 1u];
         char state[16];
@@ -1892,14 +1978,17 @@ atlas_status atlas_service_decision_link_add(atlas_ctx *ctx, const char *repo, c
             st = atlas_buf_set_str(&out->uid, uid, err);
         }
         out->revision_no = no;
-        out->duplicate = true;
+        out->duplicate = adding;
+        if (removed_out != NULL) {
+            *removed_out = false;
+        }
         (void)snprintf(out->content_hash, sizeof out->content_hash, "%s", hash);
         atlas_decision_op_free(op);
         free(op);
         atlas_repo_info_free(&info);
         return st;
     }
-    if (st == ATLAS_OK) {
+    if (st == ATLAS_OK && !note_only && adding && !duplicate) {
         atlas_decision_link l;
         atlas_decision_link_init(&l, ATLAS_DECISION_LINK_RELATES_TO);
         st = atlas_buf_set_str(&l.target_uid, target_uid, err);
@@ -1907,6 +1996,34 @@ atlas_status atlas_service_decision_link_add(atlas_ctx *ctx, const char *repo, c
             st = atlas_decision_revision_add_link(&op->revision, &l, err);
         }
         atlas_decision_link_free(&l);
+    }
+    if (st == ATLAS_OK && !note_only && !adding) {
+        (void)atlas_decision_revision_remove_link(&op->revision, ATLAS_DECISION_LINK_RELATES_TO,
+                                                  target_uid);
+        if (removed_out != NULL) {
+            *removed_out = true;
+        }
+    }
+    /* The durable account of the edge, carried on the op so that it commits
+     * with the revision rather than beside it. */
+    if (st == ATLAS_OK && have_note) {
+        st = atlas_buf_set_str(&op->edge_target_uid, target_uid, err);
+        if (st == ATLAS_OK) {
+            st = atlas_buf_set_str(&op->edge_note, note, err);
+        }
+        if (st == ATLAS_OK) {
+            const char *ev = event != NULL && *event != '\0' ? event
+                             : !adding                          ? ATLAS_DECISION_EDGE_EVENT_REMOVED
+                             : annotate_only ? ATLAS_DECISION_EDGE_EVENT_ANNOTATED
+                                             : ATLAS_DECISION_EDGE_EVENT_ADDED;
+            st = atlas_buf_set_str(&op->edge_event, ev, err);
+        }
+        if (st == ATLAS_OK && provenance != NULL && *provenance != '\0') {
+            st = atlas_buf_set_str(&op->edge_provenance, provenance, err);
+        }
+    }
+    if (st == ATLAS_OK && annotate_only) {
+        op->kind = ATLAS_DECISION_OP_EDGE_NOTE;
     }
     if (st == ATLAS_OK) {
         st = atlas_buf_set_str(&op->uid, uid, err);
@@ -1934,5 +2051,144 @@ atlas_status atlas_service_decision_link_add(atlas_ctx *ctx, const char *repo, c
         st = take_outcome(&result, out, via_daemon, false, err);
     }
     atlas_decision_result_free(&result);
+    return st;
+}
+
+atlas_status atlas_service_decision_link_add(atlas_ctx *ctx, const char *repo, const char *uid,
+                                             const char *target_uid, const char *note,
+                                             const char *provenance, atlas_decision_outcome *out,
+                                             atlas_err *err) {
+    return link_op_local(ctx, repo, uid, target_uid, note, provenance, true, false, NULL, out, NULL,
+                         err);
+}
+
+atlas_status atlas_service_decision_link_note(atlas_ctx *ctx, const char *repo, const char *uid,
+                                              const char *target_uid, const char *note,
+                                              const char *provenance, const char *event,
+                                              atlas_decision_outcome *out, atlas_err *err) {
+    if (note == NULL || *note == '\0') {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "an edge note needs text");
+    }
+    return link_op_local(ctx, repo, uid, target_uid, note, provenance, true, true, event, out,
+                         NULL, err);
+}
+
+atlas_status atlas_service_decision_link_remove(atlas_ctx *ctx, const char *repo, const char *uid,
+                                                const char *target_uid, const char *reason,
+                                                atlas_decision_outcome *out, bool *removed_out,
+                                                atlas_err *err) {
+    if (removed_out != NULL) {
+        *removed_out = false;
+    }
+    /* A withdrawal is recorded by whoever performed it, so the provenance is
+     * the operator channel rather than UNKNOWN. It identifies the channel, not
+     * a person — the A4 honesty limit applies here word for word. */
+    return link_op_local(ctx, repo, uid, target_uid, reason, "OPERATOR", false, false, NULL, out,
+                         removed_out, err);
+}
+
+/* --- the account of one decision's relations (migration 10) ---------------- */
+
+typedef struct edge_log_state {
+    atlas_decision_edge_cb cb;
+    void *ud;
+    atlas_safe_pool safe;
+    /* The targets the current revision still asserts, so `active` is computed
+     * from the revision rather than remembered in the ledger. */
+    const atlas_decision_revision *current;
+} edge_log_state;
+
+static bool edge_is_active(const edge_log_state *st, const char *target) {
+    if (st->current == NULL || target == NULL) {
+        return false;
+    }
+    for (size_t i = 0; i < st->current->link_count; i++) {
+        const atlas_decision_link *l = &st->current->links[i];
+        if (l->kind == ATLAS_DECISION_LINK_RELATES_TO &&
+            strcmp(atlas_buf_cstr(&l->target_uid), target) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static atlas_status edge_row(const atlas_decision_edge_event_row *row, void *ud, atlas_err *err) {
+    edge_log_state *st = (edge_log_state *)ud;
+    atlas_decision_edge_entry e;
+    memset(&e, 0, sizeof(e));
+    e.id = row->id;
+    e.target = row->target_uid;
+    e.kind = row->kind;
+    e.event = row->event;
+    /* Prose from the database, encoded here on its way to a renderer. Stored
+     * raw, encoded once — the A8.2 rule. */
+    e.note = atlas_safe(&st->safe, row->note != NULL ? row->note : "");
+    e.provenance = row->provenance;
+    e.created_at = row->created_at;
+    e.revision_id = row->revision_id;
+    e.active = edge_is_active(st, row->target_uid);
+    return st->cb(&e, st->ud, err);
+}
+
+atlas_status atlas_service_decision_links(atlas_ctx *ctx, const char *repo, const char *uid,
+                                          atlas_decision_edge_cb cb, void *ud, int64_t *count_out,
+                                          bool *more_out, atlas_err *err) {
+    if (!atlas_decision_uid_is_valid(uid)) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "that is not a decision id; they look like atlas-dec- followed by "
+                             "32 lowercase hex characters");
+    }
+    if (ctx == NULL) {
+        return atlas_service_decision_links_remote(repo, uid, cb, ud, count_out, more_out, err);
+    }
+    atlas_repo_info info;
+    atlas_repo_info_init(&info);
+    atlas_db *db = atlas_ctx_db(ctx);
+    atlas_status st = atlas_service_require_repo(ctx, repo, &info, err);
+    int64_t doc_id = 0, repo_of = 0;
+    bool found = false;
+    if (st == ATLAS_OK) {
+        st = atlas_db_decision_find_uid(db, uid, &doc_id, &repo_of, &found, err);
+    }
+    if (st == ATLAS_OK && !found) {
+        st = atlas_err_set(err, ATLAS_ERR_USAGE, "no decision has that id");
+    }
+    if (st == ATLAS_OK && repo_of != info.id) {
+        st = atlas_err_set(err, ATLAS_ERR_USAGE, "that decision belongs to another repository");
+    }
+
+    /* The current revision, read so that `active` is derived from what the
+     * document asserts now rather than from the ledger's last word. */
+    atlas_decision_revision current;
+    atlas_decision_revision_init(&current);
+    bool have_current = false;
+    if (st == ATLAS_OK) {
+        int64_t rev_id = 0;
+        if (atlas_db_decision_current_revision(db, doc_id, &rev_id, err) == ATLAS_OK &&
+            rev_id == 0) {
+            int64_t no = 0;
+            char hash[ATLAS_SHA256_HEX_LEN + 1u];
+            char state[16];
+            (void)atlas_db_decision_latest_revision(db, doc_id, &rev_id, &no, hash, sizeof(hash),
+                                                    state, sizeof(state), err);
+        }
+        if (rev_id > 0) {
+            (void)atlas_db_decision_revision_load(db, rev_id, &current, &have_current, err);
+        }
+    }
+
+    edge_log_state ls;
+    memset(&ls, 0, sizeof(ls));
+    ls.cb = cb;
+    ls.ud = ud;
+    ls.current = have_current ? &current : NULL;
+    atlas_safe_pool_init(&ls.safe);
+    if (st == ATLAS_OK) {
+        st = atlas_db_decision_edge_events_list(db, doc_id, ATLAS_DECISION_EDGE_EVENTS_MAX,
+                                                edge_row, &ls, count_out, more_out, err);
+    }
+    atlas_safe_pool_free(&ls.safe);
+    atlas_decision_revision_free(&current);
+    atlas_repo_info_free(&info);
     return st;
 }

@@ -21,7 +21,7 @@
 #include "atlas/error.h"
 #include "atlas/limits.h"
 
-#define ATLAS_SCHEMA_VERSION 9
+#define ATLAS_SCHEMA_VERSION 10
 
 typedef struct atlas_db atlas_db;
 
@@ -1759,6 +1759,59 @@ atlas_status atlas_db_decision_revisions_list(atlas_db *db, int64_t document_id,
 atlas_status atlas_db_decision_events_list(atlas_db *db, int64_t document_id, int64_t limit,
                                            atlas_decision_event_cb cb, void *ud, int64_t *count_out,
                                            bool *more_out, atlas_err *err);
+
+/* --- the durable account of a decision-to-decision edge (migration 10) ------
+ *
+ * An edge lives in an immutable revision; the reason it was drawn lives here.
+ * The table is append-only and keyed by the semantic edge — source document,
+ * target document, kind — never by a `decision_links.id`, because a link row is
+ * rewritten with a fresh id on every revision and an id-keyed reason would be
+ * lost by the next revise.
+ *
+ * `ADDED` and `ANNOTATED` carry a rationale, `REMOVED` carries the reason an
+ * edge was withdrawn. Nothing here decides whether an edge is live: the current
+ * revision's links are canonical for that. Ordering is by `id`, never by a
+ * timestamp. */
+#define ATLAS_DECISION_EDGE_EVENT_ADDED "ADDED"
+#define ATLAS_DECISION_EDGE_EVENT_ANNOTATED "ANNOTATED"
+#define ATLAS_DECISION_EDGE_EVENT_REMOVED "REMOVED"
+
+/* One row, borrowed for the duration of the call like every other row callback
+ * in this header. */
+typedef struct atlas_decision_edge_event_row {
+    int64_t id;
+    const char *source_uid;
+    const char *target_uid;
+    const char *kind;
+    const char *event;
+    const char *note; /* safe-encoded prose */
+    const char *provenance;
+    int64_t revision_id;
+    const char *created_at;
+} atlas_decision_edge_event_row;
+
+typedef atlas_status (*atlas_decision_edge_event_cb)(const atlas_decision_edge_event_row *row,
+                                                     void *ud, atlas_err *err);
+
+atlas_status atlas_db_decision_edge_event_append(atlas_db *db, int64_t source_document_id,
+                                                 int64_t target_document_id, const char *kind,
+                                                 const char *event, const char *note,
+                                                 const char *provenance, int64_t revision_id,
+                                                 atlas_err *err);
+
+/* The current rationale of one edge: the note on its highest-id ADDED or
+ * ANNOTATED row. `found_out` is false when the edge has never been explained,
+ * which is a reportable gap rather than an error. */
+atlas_status atlas_db_decision_edge_rationale(atlas_db *db, int64_t source_document_id,
+                                              int64_t target_document_id, const char *kind,
+                                              atlas_buf *note_out, atlas_buf *provenance_out,
+                                              bool *found_out, atlas_err *err);
+
+/* Every event for one document's outgoing edges, oldest first. */
+atlas_status atlas_db_decision_edge_events_list(atlas_db *db, int64_t source_document_id,
+                                                int64_t limit, atlas_decision_edge_event_cb cb,
+                                                void *ud, int64_t *count_out, bool *more_out,
+                                                atlas_err *err);
 /* Documents whose head revision links to a path, by raw bytes. */
 atlas_status atlas_db_decision_for_path(atlas_db *db, int64_t repo_id, const void *path_raw,
                                         size_t path_len, int64_t limit, atlas_decision_doc_cb cb,

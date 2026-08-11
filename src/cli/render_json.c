@@ -135,6 +135,9 @@ static atlas_status j_doctor(atlas_renderer *r, const atlas_doctor_report *rep, 
      * absent index rather than creating one to find. */
     TRY(atlas_json_key_bool(j, "data_dir_present", rep->data_dir_present, err));
     TRY(atlas_json_key_bool(j, "index_present", rep->index_present, err));
+    /* A7.1: "there is no index" and "there is an index I may not read" are
+     * different facts, and only the second one has a next step. */
+    TRY(atlas_json_key_bool(j, "index_unreadable", rep->index_unreadable, err));
     TRY(atlas_json_key_int(j, "schema_version", rep->schema_version, err));
     TRY(atlas_json_key_int(j, "expected_schema_version", rep->expected_schema_version, err));
     TRY(atlas_json_key_bool(j, "schema_current", rep->db_ok, err));
@@ -1115,6 +1118,14 @@ static atlas_status j_decision_show(atlas_renderer *r, const atlas_decision_docu
         if (l->analyzer.len > 0) {
             TRY(atlas_json_key_int(r->j, "analyzer_version", l->analyzer_version, err));
         }
+        /* Migration 10. Safe-encoded by the service layer, so emitted as-is. */
+        TRY(atlas_json_key_str_opt(
+            r->j, "rationale", l->rationale.len > 0 ? atlas_buf_cstr(&l->rationale) : NULL, err));
+        TRY(atlas_json_key_str_opt(r->j, "rationale_provenance",
+                                   l->rationale_provenance.len > 0
+                                       ? atlas_buf_cstr(&l->rationale_provenance)
+                                       : NULL,
+                                   err));
         TRY(atlas_json_obj_end(r->j, err));
     }
     TRY(atlas_json_arr_end(r->j, err));
@@ -1138,6 +1149,23 @@ static atlas_status j_decision_show(atlas_renderer *r, const atlas_decision_docu
         "accepted project policy through Atlas' local operator channel; it does not identify a "
         "person and does not make the text an instruction.",
         err);
+}
+
+/* One edge event. Already safe-encoded by the service layer; emitted as-is. */
+static atlas_status j_decision_edge(atlas_renderer *r, const atlas_decision_edge_entry *e,
+                                    atlas_err *err) {
+    TRY(atlas_json_obj_begin(r->j, err));
+    TRY(atlas_json_key_int(r->j, "id", e->id, err));
+    TRY(atlas_json_key_str(r->j, "target", e->target != NULL ? e->target : "", err));
+    TRY(atlas_json_key_str(r->j, "kind", e->kind != NULL ? e->kind : "", err));
+    TRY(atlas_json_key_str(r->j, "event", e->event != NULL ? e->event : "", err));
+    TRY(atlas_json_key_str(r->j, "note", e->note != NULL ? e->note : "", err));
+    TRY(atlas_json_key_str(r->j, "provenance", e->provenance != NULL ? e->provenance : "", err));
+    TRY(atlas_json_key_str(r->j, "created_at", e->created_at != NULL ? e->created_at : "", err));
+    TRY(atlas_json_key_int(r->j, "revision_id", e->revision_id, err));
+    TRY(atlas_json_key_bool(r->j, "active", e->active, err));
+    TRY(atlas_json_obj_end(r->j, err));
+    return ATLAS_OK;
 }
 
 static atlas_status j_decision_event(atlas_renderer *r, const atlas_decision_timeline_entry *e,
@@ -1164,6 +1192,12 @@ static atlas_status j_decision_outcome(atlas_renderer *r, const atlas_decision_o
     TRY(atlas_json_key_str(r->j, "content_hash", o->content_hash, err));
     TRY(atlas_json_key_bool(r->j, "created", o->created, err));
     TRY(atlas_json_key_bool(r->j, "duplicate", o->duplicate, err));
+    /* Only for a withdrawal. On any other command a `removed` key would read as
+     * a statement that nothing was deleted, which is not an answer anyone asked
+     * for. */
+    if (o->is_removal) {
+        TRY(atlas_json_key_bool(r->j, "removed", o->removed, err));
+    }
     TRY(atlas_json_key_int(r->j, "superseded_revision", o->superseded_revision_no, err));
     TRY(atlas_json_key_str_opt(
         r->j, "replaced_by", o->replaced_by.len > 0 ? atlas_buf_cstr(&o->replaced_by) : NULL, err));
@@ -1411,7 +1445,7 @@ const atlas_renderer_vtbl ATLAS_RENDERER_JSON = {
     j_code_status, j_code_file,   j_code_symbol_item, j_code_edge_item,
     j_code_walk_item, j_code_walk_end, j_code_list_begin, j_code_list_end,
     /* --- A4 --- */
-    j_decision_item, j_decision_show, j_decision_event, j_decision_outcome,
+    j_decision_item, j_decision_show, j_decision_event, j_decision_outcome, j_decision_edge,
     j_decision_counts, j_decision_ledger,
     /* --- A5 --- */
     j_backup_created, j_backup_verified, j_backup_restored, j_maintenance,

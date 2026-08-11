@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <sys/stat.h>
 
 #include "atlas/atlas.h"
@@ -26,6 +27,9 @@ struct atlas_ctx {
     /* INSPECT mode only: what was found without creating anything. */
     bool data_dir_present;
     bool index_present;
+    /* An index exists (or a data directory does) that this process may not
+     * read. Distinct from `index_present == false`, which means there is none. */
+    bool index_unreadable;
 };
 
 atlas_status atlas_ctx_open(const atlas_ctx_opts *opts, atlas_ctx **out, atlas_err *err) {
@@ -74,10 +78,28 @@ atlas_status atlas_ctx_open(const atlas_ctx_opts *opts, atlas_ctx **out, atlas_e
          * index is a finding to report, not a condition to fix: a diagnostic
          * that initialises what it is diagnosing can only ever answer "fine". */
         struct stat sb;
+        errno = 0;
         ctx->data_dir_present =
             stat(atlas_buf_cstr(&ctx->data_dir), &sb) == 0 && S_ISDIR(sb.st_mode);
+        int dir_errno = ctx->data_dir_present ? 0 : errno;
+        errno = 0;
         ctx->index_present =
             stat(atlas_buf_cstr(&ctx->db_path), &sb) == 0 && S_ISREG(sb.st_mode);
+        int db_errno = ctx->index_present ? 0 : errno;
+        /* **"There is no index" and "there is an index I may not read" are
+         * different facts, and a diagnostic that conflates them lies.**
+         *
+         * Under A7.1 the index is 0700 `atlasd`, so from the operator's account
+         * every stat here fails with EACCES and the honest report is not "Atlas
+         * has never run on this machine" — which is what an absent index means
+         * everywhere else, and which is what this said. It is not a *problem*:
+         * an index the operator cannot read is the correct state of a separated
+         * deployment, and the operator reads it over the socket. It is a
+         * finding, and it has to be reported as one or the two states are
+         * indistinguishable in the one command somebody runs to tell them
+         * apart. */
+        ctx->index_unreadable = (dir_errno == EACCES || dir_errno == EPERM ||
+                                 db_errno == EACCES || db_errno == EPERM);
         if (ctx->index_present) {
             /* Read-only, so it cannot create, migrate or take the write lock.
              * A schema skew is reported by the caller rather than repaired. */
@@ -87,6 +109,9 @@ atlas_status atlas_ctx_open(const atlas_ctx_opts *opts, atlas_ctx **out, atlas_e
                 ATLAS_OK) {
                 ctx->db = NULL;
                 ctx->index_present = false;
+                /* The file is there and could not be opened, which is the same
+                 * finding as not being able to stat it. */
+                ctx->index_unreadable = true;
             }
         }
         *out = ctx;
@@ -327,6 +352,7 @@ atlas_status atlas_service_doctor(atlas_ctx *ctx, atlas_doctor_report *out, atla
     out->data_dir_source = ctx->data_dir_source;
     out->data_dir_present = atlas_ctx_data_dir_present(ctx);
     out->index_present = atlas_ctx_index_present(ctx);
+    out->index_unreadable = ctx->index_unreadable;
 
     if (!out->index_present) {
         /* Nothing to inspect, and nothing is created in order to have something

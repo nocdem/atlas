@@ -1552,6 +1552,16 @@ atlas_status atlas_service_decision_show_remote(const char *repo, const char *ui
         if (atlas_ipc_result_obj_arr_obj_int(r, "revision", "links", i, "matches", &t)) {
             lv->matches = t;
         }
+        /* Migration 10. Already safe-encoded by the daemon, so it is taken as
+         * it arrives — encoding it again here is the A8.2 defect. */
+        if (st == ATLAS_OK &&
+            atlas_ipc_result_obj_arr_obj_str(r, "revision", "links", i, "rationale", &v)) {
+            st = atlas_buf_set_str(&lv->rationale, v, err);
+        }
+        if (st == ATLAS_OK && atlas_ipc_result_obj_arr_obj_str(r, "revision", "links", i,
+                                                               "rationale_provenance", &v)) {
+            st = atlas_buf_set_str(&lv->rationale_provenance, v, err);
+        }
         if (strcmp(atlas_buf_cstr(&lv->currency), "CURRENT") != 0 &&
             atlas_buf_cstr(&lv->currency)[0] != '\0' &&
             strcmp(atlas_buf_cstr(&lv->currency), "UNKNOWN") != 0) {
@@ -1979,9 +1989,11 @@ atlas_status atlas_service_backup_verify_remote(const char *name, atlas_backup_v
  * re-sending it encodes it again, so the body drifted every time a relationship
  * was recorded. Here the client sends two ids and the daemon never lets the
  * content out of the database. */
-atlas_status atlas_service_decision_link_add_remote(const char *repo, const char *uid,
-                                                    const char *target_uid,
-                                                    atlas_decision_outcome *out, atlas_err *err) {
+static atlas_status link_op_remote_ev(const char *method, const char *repo, const char *uid,
+                                      const char *target_uid, const char *note,
+                                      const char *provenance, const char *event,
+                                      atlas_decision_outcome *out, bool *removed_out,
+                                      atlas_err *err) {
     atlas_buf params = ATLAS_BUF_INIT;
     atlas_ipc_params *p = NULL;
     atlas_json *j = NULL;
@@ -2000,6 +2012,28 @@ atlas_status atlas_service_decision_link_add_remote(const char *repo, const char
         if (st == ATLAS_OK) {
             st = atlas_json_key_str(j, "target", target_uid, err);
         }
+        /* Under both names, for the reason `decision_uid` and `decision` are
+         * both sent: `decision.link_add` and `decision.link_remove` name the far
+         * end `target`, while a routed op serialises every field under its own
+         * name and so calls it `edge_target`. Sending one and not the other made
+         * `link note` work from a client that owns a context and fail from one
+         * that does not — which is the deployment, and the one arrangement a
+         * fixture cannot reproduce. */
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "edge_target", target_uid, err);
+        }
+        /* The reason, under its own key. `target` is a document id and
+         * `edge_note` is prose: one key carrying both is the A8.2 defect, and
+         * separating them is the fix applied to every new field since. */
+        if (st == ATLAS_OK && note != NULL && *note != '\0') {
+            st = atlas_json_key_str(j, "edge_note", note, err);
+            if (st == ATLAS_OK && provenance != NULL && *provenance != '\0') {
+                st = atlas_json_key_str(j, "edge_provenance", provenance, err);
+            }
+            if (st == ATLAS_OK && event != NULL && *event != '\0') {
+                st = atlas_json_key_str(j, "edge_event", event, err);
+            }
+        }
         if (st == ATLAS_OK) {
             st = atlas_ipc_params_finish(p, &params, err);
         } else {
@@ -2009,7 +2043,7 @@ atlas_status atlas_service_decision_link_add_remote(const char *repo, const char
     atlas_buf raw = ATLAS_BUF_INIT;
     atlas_ipc_response *r = NULL;
     if (st == ATLAS_OK) {
-        st = atlas_remote_call("decision.link_add", atlas_buf_cstr(&params), &raw, &r, err);
+        st = atlas_remote_call(method, atlas_buf_cstr(&params), &raw, &r, err);
     }
     atlas_buf_free(&params);
     if (st != ATLAS_OK) {
@@ -2049,7 +2083,123 @@ atlas_status atlas_service_decision_link_add_remote(const char *repo, const char
     if (atlas_ipc_result_bool(r, "duplicate", &b)) {
         out->duplicate = b;
     }
+    if (atlas_ipc_result_bool(r, "removed", &b) && removed_out != NULL) {
+        *removed_out = b;
+    }
     out->via_daemon = true;
+    atlas_ipc_response_free(r);
+    atlas_buf_free(&raw);
+    return st;
+}
+
+atlas_status atlas_service_decision_link_add_remote(const char *repo, const char *uid,
+                                                    const char *target_uid, const char *note,
+                                                    const char *provenance,
+                                                    atlas_decision_outcome *out, atlas_err *err) {
+    return link_op_remote_ev("decision.link_add", repo, uid, target_uid, note, provenance, NULL,
+                             out, NULL, err);
+}
+
+atlas_status atlas_service_decision_link_note_remote(const char *repo, const char *uid,
+                                                     const char *target_uid, const char *note,
+                                                     const char *provenance, const char *event,
+                                                     atlas_decision_outcome *out, atlas_err *err) {
+    return link_op_remote_ev("decision.edge.note", repo, uid, target_uid, note, provenance, event,
+                             out, NULL, err);
+}
+
+atlas_status atlas_service_decision_link_remove_remote(const char *repo, const char *uid,
+                                                       const char *target_uid, const char *note,
+                                                       atlas_decision_outcome *out,
+                                                       bool *removed_out, atlas_err *err) {
+    return link_op_remote_ev("decision.link_remove", repo, uid, target_uid, note, "OPERATOR", NULL,
+                             out, removed_out, err);
+}
+
+/* --- decision links (migration 10) ----------------------------------------- */
+
+/* The account of one document's relations, read from the daemon. Every value
+ * arrives already safe-encoded, so nothing here encodes again — that was the
+ * A8.2 defect and it is not repeated. */
+atlas_status atlas_service_decision_links_remote(const char *repo, const char *uid,
+                                                 atlas_decision_edge_cb cb, void *ud,
+                                                 int64_t *count_out, bool *more_out,
+                                                 atlas_err *err) {
+    atlas_buf params = ATLAS_BUF_INIT;
+    atlas_ipc_params *p = NULL;
+    atlas_json *j = NULL;
+    atlas_status st = atlas_db_check_repo_name(repo, err);
+    if (st == ATLAS_OK) {
+        st = atlas_ipc_params_begin(&p, &j, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(j, "repo", repo, err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "decision_uid", uid, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "decision", uid, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_ipc_params_finish(p, &params, err);
+        } else {
+            atlas_ipc_params_abort(p);
+        }
+    }
+    atlas_buf raw = ATLAS_BUF_INIT;
+    atlas_ipc_response *r = NULL;
+    if (st == ATLAS_OK) {
+        st = atlas_remote_call("decision.links", atlas_buf_cstr(&params), &raw, &r, err);
+    }
+    atlas_buf_free(&params);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    int64_t n = 0;
+    bool more = false;
+    (void)atlas_ipc_result_int(r, "count", &n);
+    (void)atlas_ipc_result_bool(r, "more", &more);
+    for (int64_t i = 0; st == ATLAS_OK && i < n; i++) {
+        atlas_decision_edge_entry e;
+        memset(&e, 0, sizeof(e));
+        const char *v = NULL;
+        int64_t t = 0;
+        bool b = false;
+        if (atlas_ipc_result_arr_obj_int(r, "edges", (size_t)i, "id", &t)) {
+            e.id = t;
+        }
+        if (atlas_ipc_result_arr_obj_str(r, "edges", (size_t)i, "target", &v)) {
+            e.target = v;
+        }
+        if (atlas_ipc_result_arr_obj_str(r, "edges", (size_t)i, "kind", &v)) {
+            e.kind = v;
+        }
+        if (atlas_ipc_result_arr_obj_str(r, "edges", (size_t)i, "event", &v)) {
+            e.event = v;
+        }
+        if (atlas_ipc_result_arr_obj_str(r, "edges", (size_t)i, "note", &v)) {
+            e.note = v;
+        }
+        if (atlas_ipc_result_arr_obj_str(r, "edges", (size_t)i, "provenance", &v)) {
+            e.provenance = v;
+        }
+        if (atlas_ipc_result_arr_obj_str(r, "edges", (size_t)i, "created_at", &v)) {
+            e.created_at = v;
+        }
+        if (atlas_ipc_result_arr_obj_int(r, "edges", (size_t)i, "revision_id", &t)) {
+            e.revision_id = t;
+        }
+        if (atlas_ipc_result_arr_obj_bool(r, "edges", (size_t)i, "active", &b)) {
+            e.active = b;
+        }
+        st = cb(&e, ud, err);
+    }
+    if (count_out != NULL) {
+        *count_out = n;
+    }
+    if (more_out != NULL) {
+        *more_out = more;
+    }
     atlas_ipc_response_free(r);
     atlas_buf_free(&raw);
     return st;

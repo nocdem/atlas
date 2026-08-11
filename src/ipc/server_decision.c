@@ -690,6 +690,10 @@ static atlas_status method_propose(dispatch_state *ds, const atlas_ipc_request *
     return st;
 }
 
+/* Defined below, beside the link methods that are its other caller. */
+static atlas_status take_edge_fields(const atlas_ipc_request *req, atlas_decision_op *op,
+                                     const atlas_buf *target, const char *event, atlas_err *err);
+
 static atlas_status method_revise(dispatch_state *ds, const atlas_ipc_request *req,
                                   atlas_err *err) {
     atlas_decision_op *op = op_new(ATLAS_DECISION_OP_REVISE);
@@ -699,6 +703,16 @@ static atlas_status method_revise(dispatch_state *ds, const atlas_ipc_request *r
     atlas_status st = take_doc_uid(req, true, &op->uid, err);
     if (st == ATLAS_OK) {
         st = build_revision_op(ds, req, op, err);
+    }
+    /* A revise may carry the account of an edge it draws or drops.
+     *
+     * This is not a second surface: it is the *same* operation arriving by the
+     * other route. A client that holds a context but not the writer lock routes
+     * its whole typed op through `decision.revise` rather than through
+     * `decision.link_add`, and a reason that reached one path and not the other
+     * would make the two ways of recording the same relation disagree. */
+    if (st == ATLAS_OK) {
+        st = take_edge_fields(req, op, NULL, ATLAS_DECISION_EDGE_EVENT_ADDED, err);
     }
     if (st != ATLAS_OK) {
         atlas_decision_op_free(op);
@@ -992,7 +1006,8 @@ static atlas_status index_known(dispatch_state *ds, const atlas_repo_info *info,
 }
 
 static atlas_status write_links(dispatch_state *ds, const atlas_repo_info *info,
-                                atlas_decision_revision *rev, atlas_err *err) {
+                                int64_t document_id, atlas_decision_revision *rev,
+                                atlas_err *err) {
     int64_t repo_id = info->id;
     bool file_known = false, code_known = false;
     atlas_status st = index_known(ds, info, &file_known, &code_known, err);
@@ -1055,6 +1070,36 @@ static atlas_status write_links(dispatch_state *ds, const atlas_repo_info *info,
             st = atlas_json_key_str(ds->j, "analyzer", atlas_buf_cstr(&l->analyzer_name), err);
             if (st == ATLAS_OK) {
                 st = atlas_json_key_int(ds->j, "analyzer_version", l->analyzer_version, err);
+            }
+        }
+        /* Migration 10: the durable reason a relation exists. Looked up per
+         * edge because it lives outside the immutable revision that carries the
+         * link — see the migration comment. */
+        if (st == ATLAS_OK && l->kind == ATLAS_DECISION_LINK_RELATES_TO && document_id > 0 &&
+            l->target_uid.len > 0) {
+            int64_t tid = 0, trepo = 0;
+            bool tfound = false;
+            if (atlas_db_decision_find_uid(ds->db, atlas_buf_cstr(&l->target_uid), &tid, &trepo,
+                                           &tfound, err) == ATLAS_OK &&
+                tfound) {
+                atlas_buf note = ATLAS_BUF_INIT;
+                atlas_buf prov = ATLAS_BUF_INIT;
+                bool have = false;
+                if (atlas_db_decision_edge_rationale(ds->db, document_id, tid,
+                                                     atlas_decision_link_kind_name(l->kind), &note,
+                                                     &prov, &have, err) == ATLAS_OK &&
+                    have) {
+                    /* Untrusted prose, encoded on the way out like every other
+                     * stored text. Stored raw, encoded here, encoded once. */
+                    st = atlas_json_key_str(ds->j, "rationale",
+                                            atlas_safe(&ds->safe, atlas_buf_cstr(&note)), err);
+                    if (st == ATLAS_OK) {
+                        st = atlas_json_key_str(ds->j, "rationale_provenance",
+                                                atlas_buf_cstr(&prov), err);
+                    }
+                }
+                atlas_buf_free(&note);
+                atlas_buf_free(&prov);
             }
         }
         if (st == ATLAS_OK) {
@@ -1220,7 +1265,7 @@ static atlas_status method_get(dispatch_state *ds, const atlas_ipc_request *req,
         st = atlas_json_arr_end(ds->j, err);
     }
     if (st == ATLAS_OK) {
-        st = write_links(ds, &info, &rev, err);
+        st = write_links(ds, &info, doc_id, &rev, err);
     }
     if (st == ATLAS_OK) {
         st = atlas_json_key_str(ds->j, "trust", "UNTRUSTED_DATA", err);
@@ -1613,6 +1658,115 @@ static atlas_status method_gate_check(dispatch_state *ds, const atlas_ipc_reques
  * Links are carried across, not rebuilt from rendered values: the whole
  * revision is loaded, the relation appended, and the result written as one new
  * immutable revision. */
+/* Emits one edge-event row. `active` is computed from the current revision's
+ * links rather than stored: the revision is canonical for what is live. */
+typedef struct edge_emit_state {
+    dispatch_state *ds;
+    const atlas_decision_revision *current;
+} edge_emit_state;
+
+static atlas_status emit_edge_row(const atlas_decision_edge_event_row *row, void *ud,
+                                  atlas_err *err) {
+    edge_emit_state *es = (edge_emit_state *)ud;
+    dispatch_state *ds = es->ds;
+    bool active = false;
+    if (es->current != NULL && row->target_uid != NULL) {
+        for (size_t i = 0; i < es->current->link_count; i++) {
+            const atlas_decision_link *l = &es->current->links[i];
+            if (l->kind == ATLAS_DECISION_LINK_RELATES_TO &&
+                strcmp(atlas_buf_cstr(&l->target_uid), row->target_uid) == 0) {
+                active = true;
+                break;
+            }
+        }
+    }
+    atlas_status st = atlas_json_obj_begin(ds->j, err);
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "id", row->id, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "target", row->target_uid, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "kind", row->kind, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "event", row->event, err);
+    }
+    if (st == ATLAS_OK) {
+        /* Prose, encoded here on the way out. */
+        st = atlas_json_key_str(ds->j, "note",
+                                atlas_safe(&ds->safe, row->note != NULL ? row->note : ""), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "provenance", row->provenance, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "created_at", row->created_at, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "revision_id", row->revision_id, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(ds->j, "active", active, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_obj_end(ds->j, err);
+    }
+    return st;
+}
+
+/* Migration 10: the account of an edge, read off a request.
+ *
+ * `edge_target` is a document id and `edge_note` is prose, under separate keys
+ * and never interchangeable — the A8.2 rule. The values are only carried here;
+ * every one of them is checked against its vocabulary at the write point, which
+ * is where the guarantee has to be, because a request is not the authority on
+ * what a provenance is. */
+static atlas_status take_edge_fields(const atlas_ipc_request *req, atlas_decision_op *op,
+                                     const atlas_buf *target, const char *event, atlas_err *err) {
+    const char *note = NULL;
+    if (!atlas_ipc_param_str(req, "edge_note", &note) || note == NULL || *note == '\0') {
+        return ATLAS_OK; /* no account supplied */
+    }
+    /* `target == NULL` means the edge is named by the request rather than by
+     * the caller. That is the routed-op path: a client that holds a context but
+     * not the writer lock sends the whole operation as `decision.revise`, so
+     * the edge it concerns arrives as a parameter like everything else. Both
+     * paths land here, which is what keeps their validation identical. */
+    atlas_status st;
+    if (target != NULL) {
+        st = atlas_buf_set(&op->edge_target_uid, target->data, target->len, err);
+    } else {
+        const char *t = NULL;
+        if (!atlas_ipc_param_str(req, "edge_target", &t) || t == NULL || *t == '\0') {
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "\"edge_note\" was given without \"edge_target\"; a reason "
+                                 "explains one relation and must name it");
+        }
+        st = atlas_buf_set_str(&op->edge_target_uid, t, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_buf_set_str(&op->edge_note, note, err);
+    }
+    /* The request may name the event; an unrecognised one is refused at the
+     * write point against the closed vocabulary. */
+    if (st == ATLAS_OK) {
+        const char *e = NULL;
+        if (atlas_ipc_param_str(req, "edge_event", &e) && e != NULL && *e != '\0') {
+            event = e;
+        }
+        st = atlas_buf_set_str(&op->edge_event, event, err);
+    }
+    if (st == ATLAS_OK) {
+        const char *prov = NULL;
+        if (atlas_ipc_param_str(req, "edge_provenance", &prov) && prov != NULL && *prov != '\0') {
+            st = atlas_buf_set_str(&op->edge_provenance, prov, err);
+        }
+    }
+    return st;
+}
+
 static atlas_status method_link_add(dispatch_state *ds, const atlas_ipc_request *req,
                                     atlas_err *err) {
     atlas_repo_info info;
@@ -1698,6 +1852,25 @@ static atlas_status method_link_add(dispatch_state *ds, const atlas_ipc_request 
         }
         atlas_decision_link_free(&l);
     }
+    /* The reason the relation exists, if the caller gave one.
+     *
+     * On a new edge it is `ADDED` and rides the revision that introduces it. On
+     * an edge that is already there it is `ANNOTATED`, and the operation stops
+     * being a revise altogether: explaining an existing relation must not
+     * produce a revision, because a rationale written now was not part of what
+     * was approved then, and a new revision would move a content hash to record
+     * something the approval never covered. */
+    if (st == ATLAS_OK) {
+        st = take_edge_fields(req, op, &target,
+                              duplicate ? ATLAS_DECISION_EDGE_EVENT_ANNOTATED
+                                        : ATLAS_DECISION_EDGE_EVENT_ADDED,
+                              err);
+    }
+    bool annotate_only = false;
+    if (st == ATLAS_OK && duplicate && op->edge_note.len > 0) {
+        annotate_only = true;
+        op->kind = ATLAS_DECISION_OP_EDGE_NOTE;
+    }
     if (st == ATLAS_OK) {
         st = atlas_buf_set(&op->uid, self.data, self.len, err);
     }
@@ -1719,7 +1892,7 @@ static atlas_status method_link_add(dispatch_state *ds, const atlas_ipc_request 
         atlas_repo_info_free(&info);
         return st;
     }
-    if (duplicate) {
+    if (duplicate && !annotate_only) {
         /* Nothing to write. Reported as the outcome the caller expects, with
          * the revision that already carries the relation. */
         int64_t no = 0;
@@ -1760,6 +1933,288 @@ static atlas_status method_link_add(dispatch_state *ds, const atlas_ipc_request 
     st = submit(ds, op, &result, err);
     if (st == ATLAS_OK) {
         st = write_result(ds, &result, err);
+    }
+    atlas_decision_result_free(&result);
+    return st;
+}
+
+/* The account of one document's relations: every event, oldest first.
+ *
+ * A read. It takes no capability, writes nothing and creates no process, and it
+ * is in the ordinary method group rather than the operator one because
+ * explaining why two decisions are related is not an authority. */
+static atlas_status method_links(dispatch_state *ds, const atlas_ipc_request *req,
+                                 atlas_err *err) {
+    atlas_repo_info info;
+    atlas_repo_info_init(&info);
+    int64_t doc_id = 0;
+    atlas_status st = require_document(ds, req, &info, &doc_id, err);
+
+    /* The current revision, so `active` says what the document asserts now
+     * rather than what the ledger last said about it. */
+    atlas_decision_revision current;
+    atlas_decision_revision_init(&current);
+    bool have_current = false;
+    if (st == ATLAS_OK) {
+        int64_t rev_id = 0;
+        if (atlas_db_decision_current_revision(ds->db, doc_id, &rev_id, err) == ATLAS_OK &&
+            rev_id == 0) {
+            int64_t no = 0;
+            char hash[ATLAS_SHA256_HEX_LEN + 1u];
+            char state[16];
+            (void)atlas_db_decision_latest_revision(ds->db, doc_id, &rev_id, &no, hash,
+                                                    sizeof(hash), state, sizeof(state), err);
+        }
+        if (rev_id > 0) {
+            (void)atlas_db_decision_revision_load(ds->db, rev_id, &current, &have_current, err);
+        }
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "repo", info.name, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key(ds->j, "edges", err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_arr_begin(ds->j, err);
+    }
+    edge_emit_state es;
+    memset(&es, 0, sizeof(es));
+    es.ds = ds;
+    es.current = have_current ? &current : NULL;
+    int64_t n = 0;
+    bool more = false;
+    if (st == ATLAS_OK) {
+        st = atlas_db_decision_edge_events_list(ds->db, doc_id, ATLAS_DECISION_EDGE_EVENTS_MAX,
+                                                emit_edge_row, &es, &n, &more, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_arr_end(ds->j, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "count", n, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(ds->j, "more", more, err);
+    }
+    atlas_decision_revision_free(&current);
+    atlas_repo_info_free(&info);
+    return st;
+}
+
+/* Attach an explanation to a relation that already exists.
+ *
+ * Writes one append-only row and nothing else. It is in the ordinary group, not
+ * the operator one: explaining why two decisions are related asserts nothing
+ * about either and changes no lifecycle state. */
+static atlas_status method_edge_note(dispatch_state *ds, const atlas_ipc_request *req,
+                                     atlas_err *err) {
+    atlas_decision_op *op = op_new(ATLAS_DECISION_OP_EDGE_NOTE);
+    if (op == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory");
+    }
+    atlas_status st = take_where(req, op, err);
+    if (st == ATLAS_OK) {
+        st = take_doc_uid(req, true, &op->uid, err);
+    }
+    /* The far end of the edge arrives under `target`, the same key
+     * `decision.link_add` and `decision.link_remove` use — this is the same
+     * relation named the same way, and a third spelling for it would be a third
+     * chance to disagree. `edge_target` is still accepted, because a routed op
+     * serialises every field under its own name. */
+    atlas_buf target = ATLAS_BUF_INIT;
+    if (st == ATLAS_OK) {
+        st = take_uid(req, "target", false, &target, err);
+    }
+    if (st == ATLAS_OK) {
+        st = take_edge_fields(req, op, target.len > 0 ? &target : NULL,
+                              ATLAS_DECISION_EDGE_EVENT_ANNOTATED, err);
+    }
+    if (st == ATLAS_OK && op->edge_target_uid.len == 0) {
+        st = atlas_err_set(err, ATLAS_ERR_USAGE, "an edge note must name the relation it explains");
+    }
+    atlas_buf_free(&target);
+    if (st != ATLAS_OK) {
+        atlas_decision_op_free(op);
+        free(op);
+        return st;
+    }
+    atlas_decision_result result;
+    atlas_decision_result_init(&result);
+    st = submit(ds, op, &result, err);
+    if (st == ATLAS_OK) {
+        st = write_result(ds, &result, err);
+    }
+    atlas_decision_result_free(&result);
+    return st;
+}
+
+/* Withdraw a relation between two decisions.
+ *
+ * The exact mirror of `method_link_add`, and it deletes nothing. A revision is
+ * immutable, so this loads the current one, drops the link from a working copy
+ * and writes the result as a new PROPOSED revision. The revision that carried
+ * the relation keeps it verbatim, along with its creation event and whatever
+ * rationale was recorded for it, so the edge remains fully explicable after it
+ * has stopped being live. What the new revision changes is only which relations
+ * the *current* revision asserts.
+ *
+ * Withdrawing an edge that is not there is reported, not invented: `removed`
+ * is false and no revision is written, which makes a repeated removal a no-op
+ * rather than a stream of empty revisions.
+ *
+ * It is a proposal, not an operator action. It mints no capability, moves no
+ * status and cannot reach a terminal decision state — the same standing
+ * `link add` has. */
+static atlas_status method_link_remove(dispatch_state *ds, const atlas_ipc_request *req,
+                                       atlas_err *err) {
+    atlas_repo_info info;
+    atlas_repo_info_init(&info);
+    int64_t doc_id = 0;
+    atlas_status st = require_document(ds, req, &info, &doc_id, err);
+    atlas_buf target = ATLAS_BUF_INIT;
+    if (st == ATLAS_OK) {
+        st = take_uid(req, "target", true, &target, err);
+    }
+    atlas_buf self = ATLAS_BUF_INIT;
+    if (st == ATLAS_OK) {
+        st = take_doc_uid(req, true, &self, err);
+    }
+    if (st == ATLAS_OK && strcmp(atlas_buf_cstr(&self), atlas_buf_cstr(&target)) == 0) {
+        st = atlas_err_set(err, ATLAS_ERR_USAGE, "a decision cannot relate to itself (%s)",
+                           atlas_buf_cstr(&self));
+    }
+    /* The target must exist and must belong to this repository, checked for the
+     * reason `link add` checks it: so the message names the problem, and so a
+     * caller cannot use removal to probe another repository's document ids. */
+    if (st == ATLAS_OK) {
+        int64_t tid = 0, trepo = 0;
+        bool found = false;
+        st = atlas_db_decision_find_uid(ds->db, atlas_buf_cstr(&target), &tid, &trepo, &found, err);
+        if (st == ATLAS_OK && !found) {
+            st = atlas_err_set(err, ATLAS_ERR_USAGE,
+                               "a decision link names a document Atlas does not hold");
+        }
+        if (st == ATLAS_OK && trepo != info.id) {
+            st = atlas_err_set(err, ATLAS_ERR_USAGE,
+                               "a decision may only link to another decision in the same "
+                               "repository");
+        }
+    }
+
+    int64_t rev_id = 0;
+    if (st == ATLAS_OK) {
+        st = atlas_db_decision_current_revision(ds->db, doc_id, &rev_id, err);
+        if (st == ATLAS_OK && rev_id == 0) {
+            int64_t no = 0;
+            char hash[ATLAS_SHA256_HEX_LEN + 1u];
+            char state[16];
+            st = atlas_db_decision_latest_revision(ds->db, doc_id, &rev_id, &no, hash, sizeof(hash),
+                                                   state, sizeof(state), err);
+        }
+        if (st == ATLAS_OK && rev_id == 0) {
+            st = atlas_err_set(err, ATLAS_ERR_USAGE, "this decision has no revision to extend");
+        }
+    }
+
+    atlas_decision_op *op = NULL;
+    if (st == ATLAS_OK) {
+        op = op_new(ATLAS_DECISION_OP_REVISE);
+        if (op == NULL) {
+            st = atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory");
+        }
+    }
+    if (st == ATLAS_OK) {
+        bool found = false;
+        st = atlas_db_decision_revision_load(ds->db, rev_id, &op->revision, &found, err);
+        if (st == ATLAS_OK && !found) {
+            st = atlas_err_set(err, ATLAS_ERR_INTERNAL, "the current revision could not be read");
+        }
+    }
+    bool removed = false;
+    if (st == ATLAS_OK) {
+        removed = atlas_decision_revision_remove_link(&op->revision, ATLAS_DECISION_LINK_RELATES_TO,
+                                                      atlas_buf_cstr(&target));
+    }
+    if (st == ATLAS_OK && removed) {
+        st = take_edge_fields(req, op, &target, ATLAS_DECISION_EDGE_EVENT_REMOVED, err);
+        /* **A withdrawal without a reason is refused here, not only in the
+         * CLI.** A removal is the last thing that happens to an edge: a reason
+         * not recorded now is not recorded at all, and the edge would be gone
+         * from the current revision with nothing saying why. The CLI checks
+         * this too, for a better message — but a check a client runs on itself
+         * is not a boundary, and this is the write path every client shares. */
+        if (st == ATLAS_OK && op->edge_note.len == 0) {
+            st = atlas_err_set(err, ATLAS_ERR_USAGE,
+                               "withdrawing a relation needs \"edge_note\": the reason is the "
+                               "only thing that will still explain it afterwards");
+        }
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_buf_set(&op->uid, self.data, self.len, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_buf_set_str(&op->repo_name, info.name, err);
+    }
+    if (st == ATLAS_OK) {
+        op->revision.proposed_by = ATLAS_DECISION_ACTOR_MODEL_PROPOSAL;
+        st = atlas_decision_revision_validate(&op->revision, err);
+    }
+    if (st != ATLAS_OK) {
+        if (op != NULL) {
+            atlas_decision_op_free(op);
+            free(op);
+        }
+        atlas_buf_free(&self);
+        atlas_buf_free(&target);
+        atlas_repo_info_free(&info);
+        return st;
+    }
+    if (!removed) {
+        /* Nothing was related, so nothing is withdrawn and nothing is written.
+         * Reported as an outcome rather than an error: a caller retrying a
+         * removal it already completed asked for a state that now holds. */
+        int64_t no = 0;
+        char hash[ATLAS_SHA256_HEX_LEN + 1u];
+        char state[16];
+        int64_t tmp = 0;
+        (void)atlas_db_decision_latest_revision(ds->db, doc_id, &tmp, &no, hash, sizeof(hash),
+                                                state, sizeof(state), err);
+        st = atlas_json_key_str(ds->j, "repo", info.name, err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(ds->j, "decision", atlas_buf_cstr(&self), err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_int(ds->j, "revision", no, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(ds->j, "content_hash", hash, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_bool(ds->j, "created", false, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_bool(ds->j, "removed", false, err);
+        }
+        atlas_decision_op_free(op);
+        free(op);
+        atlas_buf_free(&self);
+        atlas_buf_free(&target);
+        atlas_repo_info_free(&info);
+        return st;
+    }
+
+    atlas_buf_free(&self);
+    atlas_buf_free(&target);
+    atlas_repo_info_free(&info);
+    atlas_decision_result result;
+    atlas_decision_result_init(&result);
+    st = submit(ds, op, &result, err);
+    if (st == ATLAS_OK) {
+        st = write_result(ds, &result, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(ds->j, "removed", true, err);
     }
     atlas_decision_result_free(&result);
     return st;
@@ -2153,6 +2608,16 @@ static const atlas_method_entry DECISION_METHODS[] = {
     /* A8.2: link add is a daemon-side operation now, so the content it must
      * preserve never travels and cannot be re-encoded on the way back. */
     {"decision.link_add", method_link_add},
+    /* Migration 10. A proposal like `link_add`, not an operator verb: it writes
+     * a proposed revision that asserts one relation fewer, mints no capability
+     * and changes no status. */
+    {"decision.link_remove", method_link_remove},
+    /* A read: the account of one document's relations. */
+    {"decision.links", method_links},
+    /* The routed form of an annotation: a client holding a context but not the
+     * writer lock sends its typed op here. It writes one append-only row — no
+     * revision, no status change, no capability. */
+    {"decision.edge.note", method_edge_note},
     {"decision.promote", method_promote},
     /* The operator channel is deliberately absent — see A7 below. */
     /* A6, and a read. Nothing here can change an assessment. */

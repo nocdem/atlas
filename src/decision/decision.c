@@ -364,6 +364,39 @@ atlas_status atlas_decision_revision_add_link(atlas_decision_revision *r, atlas_
     return ATLAS_OK;
 }
 
+/* The inverse of `add_link`, and the whole of what "removing a link" means
+ * inside Atlas: a revision is immutable, so nothing is ever deleted — a caller
+ * loads the current revision, drops one link from the working copy, and writes
+ * the result as a *new* revision. The revision that carried the link keeps it
+ * verbatim, for ever, which is why removal costs no history.
+ *
+ * Reports whether it found anything, so a caller can tell "withdrawn" from
+ * "there was nothing to withdraw" and answer the two differently. */
+bool atlas_decision_revision_remove_link(atlas_decision_revision *r, atlas_decision_link_kind kind,
+                                         const char *target_uid) {
+    if (r == NULL || target_uid == NULL) {
+        return false;
+    }
+    for (size_t i = 0; i < r->link_count; i++) {
+        atlas_decision_link *l = &r->links[i];
+        if (l->kind != kind || strcmp(atlas_buf_cstr(&l->target_uid), target_uid) != 0) {
+            continue;
+        }
+        atlas_decision_link_free(l);
+        /* Shift the tail down. The order of a revision's links is part of what
+         * its content hash covers for the kinds that keep an order, so closing
+         * the gap rather than leaving a hole is not tidiness. */
+        for (size_t k = i + 1; k < r->link_count; k++) {
+            r->links[k - 1] = r->links[k];
+        }
+        r->link_count--;
+        memset(&r->links[r->link_count], 0, sizeof(r->links[r->link_count]));
+        atlas_decision_link_init(&r->links[r->link_count], ATLAS_DECISION_LINK_PATH);
+        return true;
+    }
+    return false;
+}
+
 /* --- validation ----------------------------------------------------------- */
 
 /* Strict UTF-8, decoded rather than sniffed.

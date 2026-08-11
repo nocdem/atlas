@@ -1980,6 +1980,76 @@ static const char *const M9_STATEMENTS[] = {
     NULL,
 };
 
+/* --- migration 10: durable evidence about a decision-to-decision edge -----
+ *
+ * Migration 9 made `relates_to` expressible. It did not make it explicable: an
+ * edge could be drawn but the reason it was drawn had nowhere to live, so the
+ * only copy of every justification stayed in the shell manifest that wrote the
+ * edges. A relationship nobody can account for is a relationship nobody can
+ * review.
+ *
+ * The reason is stored **outside the revision**, and that placement is the
+ * whole design rather than a convenience:
+ *
+ *   - A revision is immutable and its links are covered by the canonical
+ *     content hash. A rationale inside one would either change
+ *     `ATLAS_DECISION_HASH_DOMAIN` — making every already-approved digest a
+ *     claim about bytes that no longer encode the same way, which is exactly
+ *     the corruption `atlas doctor` exists to report — or force a new revision
+ *     and a fresh approval for every document that ever gained an edge.
+ *   - An explanation attached after an approval is not part of what was
+ *     approved. It is evidence *about* the edge. A6 draws the same line between
+ *     the content hash, which never changes, and the evidence digest, which is
+ *     expected to.
+ *
+ * The row is keyed by the **semantic edge** — source document, target document,
+ * kind — and never by `decision_links.id`. A link row is written afresh with a
+ * new id on every revision, so an id-keyed explanation would be silently lost
+ * by the next revise, which is the failure this table exists to end.
+ *
+ * The table is append-only: one row per thing that happened to the edge, in
+ * `id` order, never a timestamp (an A8 rule — wall-clock times are evidence,
+ * not ordering). `ADDED` and `ANNOTATED` carry the rationale, `REMOVED` carries
+ * the reason it was withdrawn, and the current rationale of an edge is the note
+ * on its highest-id `ADDED`/`ANNOTATED` row. Nothing here decides whether an
+ * edge is live: the current revision's links are canonical for that, and this
+ * table is the account of how they came to be. Correcting a rationale appends;
+ * there is no UPDATE and no DELETE, so a mistyped explanation is superseded in
+ * the open rather than overwritten.
+ *
+ * Purely additive. No existing table is touched, no index is rebuilt, no
+ * lifecycle rule moves and no stored hash changes — which is what makes this
+ * migration safe to run against a database holding approved decisions. */
+static const char *const M10_STATEMENTS[] = {
+    "CREATE TABLE decision_edge_events ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    /* Both endpoints are decision_documents rowids. A decision record is never
+     * deleted, so unlike A4's cross-model pointers these cannot outlive their
+     * row, and the foreign key is real rather than soft. */
+    "  source_document_id INTEGER NOT NULL REFERENCES decision_documents(id),"
+    "  target_document_id INTEGER NOT NULL REFERENCES decision_documents(id),"
+    "  kind TEXT NOT NULL CHECK(kind IN ('relates_to')),"
+    "  event TEXT NOT NULL CHECK(event IN ('ADDED','ANNOTATED','REMOVED')),"
+    /* Untrusted prose, stored raw and safe-encoded on the way out, exactly as
+     * a revision's own text is. Encoding it here as well is what produced the
+     * A8.2 double-encoding defect. */
+    "  note TEXT NOT NULL,"
+    "  provenance TEXT NOT NULL CHECK(provenance IN"
+    "    ('OPERATOR','D1_MANIFEST','D3_REPAIR','UNKNOWN')),"
+    /* The revision that carried the edge when the event was recorded, when one
+     * is known. A soft reference: 0 means none was recorded. */
+    "  revision_id INTEGER NOT NULL DEFAULT 0,"
+    "  created_at TEXT NOT NULL"
+    ");",
+    /* The one read this table serves: every event for one edge, in order. */
+    "CREATE INDEX idx_decision_edge_events_edge ON decision_edge_events"
+    "  (source_document_id, target_document_id, kind, id);",
+    /* And the account of one document's outgoing edges. */
+    "CREATE INDEX idx_decision_edge_events_source ON decision_edge_events"
+    "  (source_document_id, id);",
+    NULL,
+};
+
 static const atlas_migration MIGRATIONS[] = {
     {1, "initial schema", M1_STATEMENTS},
     {2, "worktree identity", M2_STATEMENTS},
@@ -1990,6 +2060,7 @@ static const atlas_migration MIGRATIONS[] = {
     {7, "decision revalidation records", M7_STATEMENTS},
     {8, "durable orchestration control plane", M8_STATEMENTS},
     {9, "a general decision-to-decision relation", M9_STATEMENTS},
+    {10, "durable evidence about a decision-to-decision edge", M10_STATEMENTS},
 };
 
 const atlas_migration *atlas_migrations(size_t *count_out) {
@@ -2041,6 +2112,21 @@ atlas_status atlas_db_migrate_list(atlas_db *db, const atlas_migration *list, si
     atlas_status st = applied_version(db, &current, err);
     if (st != ATLAS_OK) {
         return st;
+    }
+
+    /* A database from the future is refused, never used. The loop below only
+     * ever *adds* migrations, so without this check a database at a version
+     * this build has never heard of would fall straight through it and be
+     * reported as migrated — and then written to under constraints, tables and
+     * meanings this binary does not know. An older Atlas silently writing into
+     * a newer schema is how a rebuildable index becomes an unrebuildable one.
+     * The read-only path in `atlas_db_migrate` already refuses; this is the
+     * same refusal on the path that can actually do the damage. */
+    if (count > 0 && current > list[count - 1].version) {
+        return atlas_err_set(err, ATLAS_ERR_DB,
+                             "database schema is at version %d but this Atlas understands at "
+                             "most %d. Refusing to open a database written by a newer Atlas.",
+                             current, list[count - 1].version);
     }
 
     for (size_t i = 0; i < count; i++) {

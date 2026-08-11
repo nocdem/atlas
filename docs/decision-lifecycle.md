@@ -314,6 +314,29 @@ would misattribute a record, which is a real fault — but it is not one an
 *approval* covers, and the honest thing is to say so rather than to widen the
 digest until the word "approved" stops meaning anything specific.
 
+**A relation's rationale is excluded**, and the exclusion is what makes it
+possible to record one at all. A rationale explains *why* one decision was
+related to another. It is written whenever somebody can explain the edge, which
+is routinely long after the revision carrying that edge was approved — so it is
+not part of what was approved, and hashing it would say that it was. It would
+also make the record unusable in practice, twice over: adding the field would
+change the encoding of every existing revision, so every stored digest would
+disagree with its content and `atlas doctor` would report all of them as
+tampered with; and attaching a reason afterwards would require a new revision
+and a fresh approval for every document that ever gained an edge.
+
+So the reason lives in `decision_edge_events`, keyed by the semantic edge —
+source document, target document, kind — and never by a `decision_links.id`,
+because a link row is rewritten with a fresh id on every revision and an
+id-keyed reason would be silently lost by the next revise. The table is
+append-only: `ADDED` and `ANNOTATED` carry the rationale, `REMOVED` carries the
+reason an edge was withdrawn, ordering is the `id` and never a timestamp, and a
+correction appends rather than overwrites. What is *live* is still decided by
+the current revision's links, which are canonical for that; this table is the
+account of how they came to be. It is the same separation A6 draws between the
+content hash, which never changes, and the evidence digest, which is expected
+to.
+
 **Live currency is excluded** and this is the load-bearing exclusion. If a
 link's currency were hashed, editing a linked file would change an approved
 revision's digest, and every approval would appear corrupt the first time
@@ -507,6 +530,7 @@ atlas decision list NAME [--status APPROVED] [--limit N]
 atlas decision show NAME ID [--revision N]
 atlas decision search NAME QUERY
 atlas decision history NAME ID
+atlas decision links NAME ID                # the account of this decision's relations
 atlas decision for-file NAME PATH
 atlas decision propose NAME --title T --decision D \
       [--context C] [--rationale R] [--consequences Q] [--scope PATHS] \
@@ -515,6 +539,9 @@ atlas decision revise  NAME ID --title T --decision D [...]
 atlas decision approve NAME ID              # interactive; needs a terminal
 atlas decision reject  NAME ID              # interactive
 atlas decision supersede NAME ID --by ID2   # interactive
+atlas decision link add    NAME SOURCE TARGET [--why TEXT]
+atlas decision link remove NAME SOURCE TARGET  --why TEXT
+atlas decision link note   NAME SOURCE TARGET  --why TEXT [--provenance P] [--event E]
 atlas decision export NAME ID [--format markdown|json]
 atlas decision legacy NAME                  # A2 proposals, and which were promoted
 atlas decision promote NAME LEGACY-ID       # make an A4 document from an A2 proposal
@@ -559,6 +586,67 @@ Type 634eaddd to approve this exact revision, or anything else to abandon:
 `--json` is refused for the three interactive verbs: the prompt goes to the
 terminal and the result to stdout, and interleaving a human prompt with a
 machine document serves neither.
+
+### Relating one decision to another, and withdrawing it
+
+`link add` writes a **new proposed revision** carrying one more relation. It has
+to: a revision is immutable and its links are covered by the content hash, so
+there is no in-place edit and there must not be one. It is idempotent — a target
+already related is reported and nothing is written — and it is a proposal, not
+an operator action: it mints no capability, moves no status, and alters no
+prose.
+
+`--why` records the durable reason. When the relation is **already there**, a
+`--why` attaches the reason to the existing edge and writes **no revision at
+all**, which is the only honest way to explain the relations of a decision that
+is already approved: a reason written now was not part of what was approved
+then, and minting a revision for it would move a content hash to cover something
+the approval never saw.
+
+`link remove` is the exact mirror and **deletes nothing**. It writes a new
+proposed revision asserting one relation fewer; the revision that carried the
+relation keeps it verbatim, together with its creation event and its rationale.
+So a withdrawn edge stays fully explicable — `atlas decision links` shows it
+with `active: false`, the reason it was drawn, and the reason it was withdrawn,
+in the order they happened. Withdrawing a relation that was never drawn reports
+`removed: false` and writes nothing, so a repeated removal is a no-op rather
+than a stream of empty revisions.
+
+`--why` is **required** to withdraw and optional to draw. The asymmetry is
+deliberate: an addition that arrives without a reason can be explained later by
+annotating the edge, but a removal is the last thing that happens to it, so a
+reason not recorded then is not recorded at all.
+
+`link note` records one event about an edge and touches **no link at all** — not
+even to check that the edge is live. It is the only honest way to write down
+what happened to a relation that has already been withdrawn: there is nothing
+left to add or remove, and the remaining act is to say so. It writes no
+revision, moves no status and mints no capability. `--provenance` says where the
+reason came from (`OPERATOR`, `D1_MANIFEST`, `D3_REPAIR`, `UNKNOWN`) and
+`--event` which kind of event it records; both are checked against their closed
+vocabularies at the write point, because a request is not the authority on what
+a provenance is.
+
+**A withdrawal without a reason is refused at both write paths**, not only in
+the CLI. A check a client runs on itself is not a boundary, and a socket caller
+that skipped it would otherwise remove a relation and write no removal event —
+leaving the edge gone from the current revision with nothing saying why, which
+is the one outcome removal must never produce.
+
+**On an approved document, `link remove` does not withdraw the relation
+immediately.** It writes a *proposed* revision asserting one relation fewer, and
+the approved revision stays effective until the replacement is approved — which
+is rule 5 of the lifecycle, unchanged. So the edge continues to read as active
+until an operator approves the new revision. That is not a failed removal; it is
+the same thing every revise does, and it is why removal cannot quietly change
+what is already policy.
+
+A rationale is untrusted prose like every other decision text. It is stored raw,
+safe-encoded once on the way out, bounded at `ATLAS_DECISION_EDGE_NOTE_MAX` and
+**refused rather than truncated** when it does not fit. A rationale that is
+itself a decision id is refused: that is the A8.2 confusion — prose and a
+document id sharing a meaning — and it is refused structurally rather than
+detected afterwards.
 
 ## Export
 

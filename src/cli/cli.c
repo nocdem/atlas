@@ -91,6 +91,9 @@ void atlas_cli_print_help(FILE *out) {
         "  decision supersede NAME ID --by ID2   replace one decision with another\n"
         "  decision export NAME ID    write the decision to stdout as Markdown or JSON\n"
         "  decision link add REPO SOURCE TARGET   relate one decision to another\n"
+        "  decision link remove REPO SOURCE TARGET  withdraw a relation (--why required)\n"
+        "  decision link note REPO SOURCE TARGET    record why, without changing links\n"
+        "  decision links REPO ID     one decision's relations, with why each exists\n"
         "  decision orphaned          decisions attached to no registered repository\n"
         "  decision legacy NAME       A2 decision proposals, and which were promoted\n"
         "  decision promote NAME ID   make an A4 document from an A2 proposal\n"
@@ -146,6 +149,9 @@ void atlas_cli_print_help(FILE *out) {
         "  --context C --rationale R --consequences Q --scope S\n"
         "                             decision propose/revise: the rest of the document\n"
         "  --alternative A            decision propose/revise: repeatable, up to %d\n"
+        "  --why TEXT                 decision link add/remove/note: why the relation\n"
+        "  --provenance P --event E   decision link: where a reason came from, and\n"
+        "                             which event it records\n"
         "  --path P --commit OID --symbol-link S --decision-link UID\n"
         "                             decision propose/revise: repeatable links\n"
         "  --status S                 decision list: PROPOSED|APPROVED|REJECTED|SUPERSEDED\n"
@@ -353,7 +359,8 @@ static atlas_status parse_args(cli_state *st, int argc, char **argv, bool *want_
                 }
             } else if (strcmp(a, "--alternative") == 0 || strcmp(a, "--path") == 0 ||
                        strcmp(a, "--commit") == 0 || strcmp(a, "--symbol-link") == 0 ||
-                       strcmp(a, "--decision-link") == 0) {
+                       strcmp(a, "--why") == 0 || strcmp(a, "--provenance") == 0 ||
+                       strcmp(a, "--event") == 0 || strcmp(a, "--decision-link") == 0) {
                 /* The repeatable ones. Refused past the ceiling rather than
                  * truncated: a decision that silently recorded three of five
                  * alternatives would claim the other two were never considered,
@@ -382,6 +389,12 @@ static atlas_status parse_args(cli_state *st, int argc, char **argv, bool *want_
                                              ATLAS_DECISION_MAX_LINKS);
                     }
                     st->opts.decision.commits[st->opts.decision.commit_count++] = v;
+                } else if (strcmp(a, "--why") == 0) {
+                    st->opts.decision.why = v;
+                } else if (strcmp(a, "--provenance") == 0) {
+                    st->opts.decision.provenance = v;
+                } else if (strcmp(a, "--event") == 0) {
+                    st->opts.decision.edge_event = v;
                 } else if (strcmp(a, "--decision-link") == 0) {
                     if (st->opts.decision.decision_link_count >= ATLAS_DECISION_MAX_LINKS) {
                         return atlas_err_set(err, ATLAS_ERR_USAGE,
@@ -977,6 +990,20 @@ static atlas_status on_decision_item(const atlas_decision_summary *s, void *ud, 
  * delivers all the revisions before any of the events. The list boundaries are
  * therefore opened lazily on the first item of each: opening them up front
  * would need the counts before they are known. */
+/* Migration 10: one edge event on its way to a renderer. */
+typedef struct decision_edge_render {
+    cli_state *st;
+    atlas_renderer *r;
+    int64_t count;
+} decision_edge_render;
+
+static atlas_status on_decision_edge(const atlas_decision_edge_entry *e, void *ud,
+                                     atlas_err *err) {
+    decision_edge_render *er = (decision_edge_render *)ud;
+    er->count++;
+    return er->r->v->decision_edge(er->r, e, err);
+}
+
 typedef struct decision_history_render {
     cli_state *st;
     atlas_renderer *r;
@@ -1225,9 +1252,9 @@ static atlas_status run_decision(cli_state *st, atlas_ctx *ctx, atlas_renderer *
                                  atlas_err *err) {
     if (st->operand_count == 0) {
         return atlas_err_set(err, ATLAS_ERR_USAGE,
-                             "usage: atlas decision list|show|search|history|for-file|propose|"
-                             "revise|approve|reject|supersede|revalidate|export|orphaned|legacy|"
-                             "promote ...");
+                             "usage: atlas decision list|show|search|history|links|for-file|"
+                             "propose|revise|approve|reject|supersede|revalidate|export|orphaned|"
+                             "legacy|promote ...");
     }
     const char *sub = st->operands[0];
     atlas_status result;
@@ -1337,6 +1364,42 @@ static atlas_status run_decision(cli_state *st, atlas_ctx *ctx, atlas_renderer *
         return result;
     }
 
+    /* `decision links REPO ID` — the account of one document's relations.
+     *
+     * A read, and a different ledger from `decision history`: that one is about
+     * the document's lifecycle, this one about its edges. Keeping them apart is
+     * why an edge annotation cannot be mistaken for a lifecycle transition. */
+    if (strcmp(sub, "links") == 0) {
+        if (st->operand_count != 3u) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE, "usage: atlas decision links NAME "
+                                                       "DECISION-ID");
+        }
+        result = renderer_open(r, st->opts.json, st->out, "decision", err);
+        if (result != ATLAS_OK) {
+            return result;
+        }
+        result = r->v->note_repo(r, st->operands[1], err);
+        if (result == ATLAS_OK) {
+            result = r->v->code_list_begin(r, "edges", err);
+        }
+        decision_edge_render er = {st, r, 0};
+        int64_t n = 0;
+        bool more = false;
+        if (result == ATLAS_OK) {
+            result = atlas_service_decision_links(ctx, st->operands[1], st->operands[2],
+                                                  on_decision_edge, &er, &n, &more, err);
+        }
+        if (result == ATLAS_OK) {
+            result = r->v->code_list_end(r, "edges", "edge", "edges", n, more, err);
+        }
+        if (result == ATLAS_OK) {
+            result = renderer_close(r, err);
+        } else {
+            renderer_abort(r);
+        }
+        return result;
+    }
+
     if (strcmp(sub, "history") == 0) {
         if (st->operand_count != 3u) {
             return atlas_err_set(err, ATLAS_ERR_USAGE,
@@ -1428,16 +1491,57 @@ static atlas_status run_decision(cli_state *st, atlas_ctx *ctx, atlas_renderer *
      * operation: it goes through the same authority path `propose` and `revise`
      * use, and mints nothing. */
     if (strcmp(sub, "link") == 0) {
-        if (st->operand_count != 5u || strcmp(st->operands[1], "add") != 0) {
+        bool adding = st->operand_count == 5u && strcmp(st->operands[1], "add") == 0;
+        bool removing = st->operand_count == 5u && strcmp(st->operands[1], "remove") == 0;
+        /* `note` records one event about an edge and touches no link. It is how
+         * the history of a relation that is already gone gets written down:
+         * there is nothing left to add or remove, only something to say. */
+        bool noting = st->operand_count == 5u && strcmp(st->operands[1], "note") == 0;
+        if (!adding && !removing && !noting) {
             return atlas_err_set(err, ATLAS_ERR_USAGE,
-                                 "usage: atlas decision link add REPO SOURCE_ID TARGET_ID");
+                                 "usage: atlas decision link add|remove|note REPO SOURCE_ID "
+                                 "TARGET_ID [--why TEXT] [--provenance P] [--event E]");
+        }
+        /* `--why` is required to withdraw a relation and optional to draw one.
+         * The asymmetry is deliberate: an addition that arrives without a
+         * reason can be explained later by annotating the edge, but a removal
+         * is the last thing that happens to it, so if the reason is not
+         * recorded now it is not recorded at all. */
+        const char *why = st->opts.decision.why;
+        const char *prov = st->opts.decision.provenance != NULL ? st->opts.decision.provenance
+                                                                : "OPERATOR";
+        if (noting && (why == NULL || *why == '\0')) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE, "recording a note about a relation needs "
+                                                       "--why");
+        }
+        if (removing && (why == NULL || *why == '\0')) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "withdrawing a relation needs --why: the reason is the only "
+                                 "thing that will still explain it afterwards");
         }
         atlas_decision_outcome o;
         atlas_decision_outcome_init(&o);
-        atlas_status lr = atlas_service_decision_link_add(ctx, st->operands[2], st->operands[3],
-                                                          st->operands[4], &o, err);
+        bool removed = false;
+        atlas_status lr;
+        if (noting) {
+            lr = atlas_service_decision_link_note(ctx, st->operands[2], st->operands[3],
+                                                  st->operands[4], why, prov,
+                                                  st->opts.decision.edge_event, &o, err);
+        } else if (adding) {
+            lr = atlas_service_decision_link_add(ctx, st->operands[2], st->operands[3],
+                                                 st->operands[4], why, prov, &o, err);
+        } else {
+            lr = atlas_service_decision_link_remove(ctx, st->operands[2], st->operands[3],
+                                                    st->operands[4], why, &o, &removed, err);
+        }
         if (lr == ATLAS_OK) {
-            lr = render_outcome(st, r, "decision link add", &o, err);
+            o.is_removal = removing;
+            o.removed = removed;
+            lr = render_outcome(st, r,
+                                noting    ? "decision link note"
+                                : adding  ? "decision link add"
+                                          : "decision link remove",
+                                &o, err);
         }
         atlas_decision_outcome_free(&o);
         return lr;
@@ -1619,7 +1723,8 @@ static bool remote_serves(const cli_state *st) {
         return strcmp(sub, "create") == 0 || strcmp(sub, "verify") == 0;
     }
     if (strcmp(cmd, "decision") == 0) {
-        return strcmp(sub, "link") == 0 || strcmp(sub, "list") == 0 || strcmp(sub, "search") == 0 ||
+        return strcmp(sub, "link") == 0 || strcmp(sub, "links") == 0 ||
+               strcmp(sub, "list") == 0 || strcmp(sub, "search") == 0 ||
                strcmp(sub, "for-file") == 0 || strcmp(sub, "show") == 0 ||
                strcmp(sub, "export") == 0 || strcmp(sub, "history") == 0 ||
                strcmp(sub, "orphaned") == 0 || strcmp(sub, "legacy") == 0 ||

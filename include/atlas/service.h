@@ -103,6 +103,12 @@ typedef struct atlas_doctor_report {
      * reports the absence instead of creating an index in order to have one. */
     bool data_dir_present;
     bool index_present;
+    /* A7.1. True when a data directory or index exists that this process may
+     * not read — the correct state of a separated deployment seen from the
+     * operator's account, and a different fact from "there is no index". Not a
+     * problem, and it does not affect `ok`; reported so the two are
+     * distinguishable in the one command that is run to tell them apart. */
+    bool index_unreadable;
     bool db_ok;
     int schema_version;
     int expected_schema_version;
@@ -558,6 +564,14 @@ typedef struct atlas_decision_link_view {
     atlas_buf detail;   /* the symbol's file or kind, when there is one */
     atlas_buf currency; /* CURRENT | CHANGED | MISSING | AMBIGUOUS | UNKNOWN */
     atlas_buf analyzer;
+    /* Migration 10, and only ever set for a `relates_to` link: the durable
+     * reason this relation exists, safe-encoded, and where that reason came
+     * from. Empty when nobody has explained the edge, which is a reportable
+     * gap rather than an error. It is read from `decision_edge_events` rather
+     * than from the revision, because a reason recorded after an approval was
+     * not part of what was approved and is not covered by its content hash. */
+    atlas_buf rationale;
+    atlas_buf rationale_provenance;
     int64_t analyzer_version;
     int64_t matches;
 } atlas_decision_link_view;
@@ -629,6 +643,12 @@ typedef struct atlas_decision_outcome {
     /* True for a transition the operator channel authorised. It means the
      * channel was used; it does not identify a person. */
     bool operator_confirmed;
+    /* Migration 10, and only meaningful for `decision link remove`. `is_removal`
+     * says the answer is about a withdrawal at all, so the renderers emit
+     * `removed` for that command and for no other — a `removed: false` on an
+     * unrelated command would read as a claim that something was not deleted. */
+    bool is_removal;
+    bool removed;
 } atlas_decision_outcome;
 
 void atlas_decision_outcome_init(atlas_decision_outcome *o);
@@ -696,6 +716,43 @@ atlas_status atlas_service_decision_history(atlas_ctx *ctx, const char *repo, co
                                             atlas_decision_timeline_cb event_cb, void *ud,
                                             bool *ledger_agrees_out, atlas_err *err);
 
+/* --- the account of one decision's relations (migration 10) ----------------
+ *
+ * Every event ever recorded about this document's outgoing edges, oldest
+ * first: why each was drawn, any later correction, and why any was withdrawn.
+ * It is a separate ledger from `decision_events` and is read separately,
+ * because they record different kinds of act and merging them would make an
+ * edge annotation look like a lifecycle transition.
+ *
+ * `active` says whether the current revision still asserts the edge. It is
+ * computed on read from the revision's links, never stored — the revision is
+ * canonical for what is live, and a cached flag would be a second answer to a
+ * question that already has one. So a withdrawn edge appears here with its
+ * whole history and `active` false, which is what makes "it existed and this
+ * is why it no longer does" answerable at all. */
+typedef struct atlas_decision_edge_entry {
+    int64_t id; /* the append-only order; never a timestamp */
+    const char *target;
+    const char *kind;
+    const char *event;      /* ADDED | ANNOTATED | REMOVED */
+    const char *note;       /* safe-encoded prose */
+    const char *provenance; /* a fixed Atlas vocabulary */
+    const char *created_at;
+    int64_t revision_id;
+    bool active;
+} atlas_decision_edge_entry;
+
+typedef atlas_status (*atlas_decision_edge_cb)(const atlas_decision_edge_entry *e, void *ud,
+                                               atlas_err *err);
+
+atlas_status atlas_service_decision_links(atlas_ctx *ctx, const char *repo, const char *uid,
+                                          atlas_decision_edge_cb cb, void *ud, int64_t *count_out,
+                                          bool *more_out, atlas_err *err);
+atlas_status atlas_service_decision_links_remote(const char *repo, const char *uid,
+                                                 atlas_decision_edge_cb cb, void *ud,
+                                                 int64_t *count_out, bool *more_out,
+                                                 atlas_err *err);
+
 atlas_status atlas_service_decision_propose(atlas_ctx *ctx, const char *repo,
                                             const atlas_decision_input *in,
                                             atlas_decision_outcome *out, atlas_err *err);
@@ -705,9 +762,42 @@ atlas_status atlas_service_decision_propose(atlas_ctx *ctx, const char *repo,
  * idempotent, because a target already related is reported rather than added
  * again. Not an operator operation: it writes a proposal through the same path
  * `propose` and `revise` use. */
+/* `note` is the durable reason the relation exists (migration 10), or NULL.
+ * When the relation is already there and a note is given, the note is attached
+ * to the existing edge and **no revision is written**: an explanation recorded
+ * after an approval was not part of what was approved, and minting a revision
+ * for it would move a content hash to cover something the approval never did.
+ * `provenance` names where the note came from, or NULL for UNKNOWN. */
 atlas_status atlas_service_decision_link_add(atlas_ctx *ctx, const char *repo, const char *uid,
-                                             const char *target_uid,
-                                             atlas_decision_outcome *out, atlas_err *err);
+                                             const char *target_uid, const char *note,
+                                             const char *provenance, atlas_decision_outcome *out,
+                                             atlas_err *err);
+
+/* Withdraws a relation. Writes a new proposed revision asserting one relation
+ * fewer; deletes nothing. The revision that carried the relation keeps it, with
+ * its creation event and its rationale, so a withdrawn edge stays explicable.
+ * `removed_out` is false when there was no such relation, which is reported
+ * rather than treated as an error so that a repeated removal is a no-op. */
+/* Records one event about an edge and touches no link at all.
+ *
+ * The only way to say what happened to a relation that is already gone: the
+ * edge is in no current revision, so there is nothing to add or remove, and the
+ * remaining honest act is to record it. Writes no revision, moves no status and
+ * mints no capability. `event` may name ADDED, ANNOTATED or REMOVED; NULL means
+ * ANNOTATED. */
+atlas_status atlas_service_decision_link_note(atlas_ctx *ctx, const char *repo, const char *uid,
+                                              const char *target_uid, const char *note,
+                                              const char *provenance, const char *event,
+                                              atlas_decision_outcome *out, atlas_err *err);
+atlas_status atlas_service_decision_link_note_remote(const char *repo, const char *uid,
+                                                     const char *target_uid, const char *note,
+                                                     const char *provenance, const char *event,
+                                                     atlas_decision_outcome *out, atlas_err *err);
+
+atlas_status atlas_service_decision_link_remove(atlas_ctx *ctx, const char *repo, const char *uid,
+                                                const char *target_uid, const char *reason,
+                                                atlas_decision_outcome *out, bool *removed_out,
+                                                atlas_err *err);
 
 atlas_status atlas_service_decision_revise(atlas_ctx *ctx, const char *repo, const char *uid,
                                            const atlas_decision_input *in,
@@ -881,8 +971,13 @@ atlas_status atlas_service_search_remote(const char *name, const char *query, in
 /* Relate one decision to another, daemon-side. The content is never sent, so
  * nothing can be re-encoded on the way back. */
 atlas_status atlas_service_decision_link_add_remote(const char *repo, const char *uid,
-                                                    const char *target_uid,
+                                                    const char *target_uid, const char *note,
+                                                    const char *provenance,
                                                     atlas_decision_outcome *out, atlas_err *err);
+atlas_status atlas_service_decision_link_remove_remote(const char *repo, const char *uid,
+                                                       const char *target_uid, const char *note,
+                                                       atlas_decision_outcome *out,
+                                                       bool *removed_out, atlas_err *err);
 atlas_status atlas_service_backup_create_remote(const char *name, atlas_backup_report *out,
                                                 atlas_backup_verify_report *verified,
                                                 atlas_err *err);

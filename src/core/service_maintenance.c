@@ -144,6 +144,12 @@ static const retention_entry RETENTION[] = {
      "durable selector snapshots, also inside the canonical hash"},
     {"decision_events", ATLAS_RETAIN_CANONICAL, false,
      "the append-only ledger the status columns are only a cache of"},
+    {"decision_edge_events", ATLAS_RETAIN_CANONICAL, false,
+     "the only durable account of why one decision was related to another, and of why a relation "
+     "was withdrawn; the edge itself lives in an immutable revision but the reason for it lives "
+     "nowhere else, so an age-pruned history would leave live relations no reader could explain "
+     "and would erase the removal evidence that distinguishes a withdrawn edge from one that was "
+     "never drawn"},
     {"decision_challenges", ATLAS_RETAIN_CANONICAL, false,
      "a consumed challenge is part of an approval record and the event points at it; expired "
      "unconsumed ones are already removed at the point of use, which is the only DELETE the "

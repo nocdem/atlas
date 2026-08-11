@@ -66,7 +66,11 @@ typedef enum atlas_decision_op_kind {
      * `decision_validations` row, which is a different ledger recording a
      * different kind of act — not "this became policy" but "somebody checked
      * that it still describes this code". */
-    ATLAS_DECISION_OP_REVALIDATE
+    ATLAS_DECISION_OP_REVALIDATE,
+    /* Migration 10: attach an explanation to an edge that already exists.
+     * Writes one append-only row and nothing else — no revision, no content
+     * hash, no status change, no capability. */
+    ATLAS_DECISION_OP_EDGE_NOTE
 } atlas_decision_op_kind;
 
 const char *atlas_decision_op_kind_name(atlas_decision_op_kind k);
@@ -135,6 +139,24 @@ typedef struct atlas_decision_op {
      * than A6 types because atlas/gate.h depends on atlas/decision.h. */
     atlas_buf prior_freshness;
     atlas_buf prior_reasons;
+
+    /* Migration 10: the durable account of a decision-to-decision edge.
+     *
+     * Carried on the op rather than written beside it so that the account and
+     * the edge commit together. On a REVISE the note describes the edge the
+     * revision gains (`ADDED`) or the one it drops (`REMOVED`), and it is
+     * written inside the same transaction as the revision — a rationale that
+     * could survive a rolled-back revise would explain an edge that does not
+     * exist. On an EDGE_NOTE it is `ANNOTATED`: an explanation attached to an
+     * edge that is already there, which writes no revision at all and so
+     * changes no content hash and moves no status.
+     *
+     * Empty `edge_target_uid` means the op carries no edge account, which is
+     * every op that predates this. */
+    atlas_buf edge_target_uid;
+    atlas_buf edge_event;      /* ADDED | ANNOTATED | REMOVED */
+    atlas_buf edge_note;       /* the rationale, or why it was withdrawn */
+    atlas_buf edge_provenance; /* OPERATOR | D1_MANIFEST | D3_REPAIR | UNKNOWN */
 } atlas_decision_op;
 
 void atlas_decision_op_init(atlas_decision_op *op, atlas_decision_op_kind kind);

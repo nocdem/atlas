@@ -126,6 +126,12 @@ typedef struct atlas_renderer_vtbl {
                                    atlas_err *err);
     atlas_status (*decision_outcome)(atlas_renderer *r, const atlas_decision_outcome *o,
                                      atlas_err *err);
+    /* Migration 10: one event in the account of a document's relations. Its own
+     * method rather than a variant of `decision_event`, because the two are
+     * different ledgers — one records what happened to the document's lifecycle
+     * and this one records what happened to its edges. */
+    atlas_status (*decision_edge)(atlas_renderer *r, const atlas_decision_edge_entry *e,
+                                  atlas_err *err);
     /* The lifecycle totals a listing reports beside its page. */
     atlas_status (*decision_counts)(atlas_renderer *r, const atlas_decision_counts *c,
                                     atlas_err *err);

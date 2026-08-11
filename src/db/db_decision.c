@@ -1906,6 +1906,169 @@ atlas_status atlas_db_decision_events_list(atlas_db *db, int64_t document_id, in
     return st;
 }
 
+/* --- the durable account of a decision-to-decision edge (migration 10) -----
+ *
+ * Append-only, keyed by the semantic edge rather than by a link row id. See the
+ * migration comment in `migrate.c` for why the reason lives outside the
+ * revision that carries the edge. */
+
+atlas_status atlas_db_decision_edge_event_append(atlas_db *db, int64_t source_document_id,
+                                                 int64_t target_document_id, const char *kind,
+                                                 const char *event, const char *note,
+                                                 const char *provenance, int64_t revision_id,
+                                                 atlas_err *err) {
+    sqlite3_stmt *s = NULL;
+    atlas_status st = atlas_db_prepare(db,
+                                       "INSERT INTO decision_edge_events"
+                                       "(source_document_id, target_document_id, kind, event,"
+                                       " note, provenance, revision_id, created_at)"
+                                       " VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8);",
+                                       &s, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    char now[ATLAS_TS_MAX];
+    atlas_now_iso8601(now, sizeof(now));
+    st = bind_i64(db, s, 1, source_document_id, err);
+    if (st == ATLAS_OK) {
+        st = bind_i64(db, s, 2, target_document_id, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_db_bind_text_opt(db, s, 3, kind, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_db_bind_text_opt(db, s, 4, event, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_db_bind_text_opt(db, s, 5, note, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_db_bind_text_opt(db, s, 6, provenance, err);
+    }
+    if (st == ATLAS_OK) {
+        st = bind_i64(db, s, 7, revision_id, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_db_bind_text_opt(db, s, 8, now, err);
+    }
+    if (st != ATLAS_OK) {
+        atlas_db_finish(db, s);
+        return st;
+    }
+    return atlas_db_step_done(db, s, err);
+}
+
+atlas_status atlas_db_decision_edge_rationale(atlas_db *db, int64_t source_document_id,
+                                              int64_t target_document_id, const char *kind,
+                                              atlas_buf *note_out, atlas_buf *provenance_out,
+                                              bool *found_out, atlas_err *err) {
+    if (found_out != NULL) {
+        *found_out = false;
+    }
+    sqlite3_stmt *s = NULL;
+    /* Latest wins, and "latest" is the highest id rather than the newest
+     * timestamp: a correction is an append, and two appends inside one second
+     * must still order. REMOVED is excluded because it explains a withdrawal,
+     * not the edge. */
+    atlas_status st = atlas_db_prepare(db,
+                                       "SELECT note, provenance FROM decision_edge_events"
+                                       " WHERE source_document_id = ?1 AND target_document_id = ?2"
+                                       "   AND kind = ?3 AND event IN ('ADDED','ANNOTATED')"
+                                       " ORDER BY id DESC LIMIT 1;",
+                                       &s, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    st = bind_i64(db, s, 1, source_document_id, err);
+    if (st == ATLAS_OK) {
+        st = bind_i64(db, s, 2, target_document_id, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_db_bind_text_opt(db, s, 3, kind, err);
+    }
+    if (st != ATLAS_OK) {
+        atlas_db_finish(db, s);
+        return st;
+    }
+    if (sqlite3_step(s) == SQLITE_ROW) {
+        const char *note = atlas_db_col_text(s, 0);
+        const char *prov = atlas_db_col_text(s, 1);
+        if (note_out != NULL) {
+            st = atlas_buf_set_str(note_out, note != NULL ? note : "", err);
+        }
+        if (st == ATLAS_OK && provenance_out != NULL) {
+            st = atlas_buf_set_str(provenance_out, prov != NULL ? prov : "", err);
+        }
+        if (st == ATLAS_OK && found_out != NULL) {
+            *found_out = true;
+        }
+    }
+    atlas_db_finish(db, s);
+    return st;
+}
+
+atlas_status atlas_db_decision_edge_events_list(atlas_db *db, int64_t source_document_id,
+                                                int64_t limit, atlas_decision_edge_event_cb cb,
+                                                void *ud, int64_t *count_out, bool *more_out,
+                                                atlas_err *err) {
+    if (count_out != NULL) {
+        *count_out = 0;
+    }
+    if (more_out != NULL) {
+        *more_out = false;
+    }
+    sqlite3_stmt *s = NULL;
+    /* Ascending, for the reason `decision_events` is: this is one document's
+     * whole edge history and its order is its meaning. */
+    atlas_status st = atlas_db_prepare(
+        db,
+        "SELECT e.id, src.uid, tgt.uid, e.kind, e.event, e.note, e.provenance,"
+        "       e.revision_id, e.created_at"
+        "  FROM decision_edge_events e"
+        "  JOIN decision_documents src ON src.id = e.source_document_id"
+        "  JOIN decision_documents tgt ON tgt.id = e.target_document_id"
+        " WHERE e.source_document_id = ?1 ORDER BY e.id ASC LIMIT ?2;",
+        &s, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    st = bind_i64(db, s, 1, source_document_id, err);
+    if (st == ATLAS_OK) {
+        st = bind_i64(db, s, 2, limit + 1, err);
+    }
+    if (st != ATLAS_OK) {
+        atlas_db_finish(db, s);
+        return st;
+    }
+    int64_t n = 0;
+    while (st == ATLAS_OK && sqlite3_step(s) == SQLITE_ROW) {
+        if (n >= limit) {
+            if (more_out != NULL) {
+                *more_out = true;
+            }
+            break;
+        }
+        atlas_decision_edge_event_row row;
+        memset(&row, 0, sizeof(row));
+        row.id = sqlite3_column_int64(s, 0);
+        row.source_uid = atlas_db_col_text(s, 1);
+        row.target_uid = atlas_db_col_text(s, 2);
+        row.kind = atlas_db_col_text(s, 3);
+        row.event = atlas_db_col_text(s, 4);
+        row.note = atlas_db_col_text(s, 5);
+        row.provenance = atlas_db_col_text(s, 6);
+        row.revision_id = sqlite3_column_int64(s, 7);
+        row.created_at = atlas_db_col_text(s, 8);
+        st = cb(&row, ud, err);
+        n++;
+    }
+    if (count_out != NULL) {
+        *count_out = n;
+    }
+    atlas_db_finish(db, s);
+    return st;
+}
+
 /* --- search ---------------------------------------------------------------
  *
  * FTS5 over `decision_search` when the linked SQLite build has it, and a

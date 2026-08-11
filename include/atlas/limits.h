@@ -333,6 +333,16 @@
 /* Revisions one document may accumulate. A document that needs more than this
  * is two documents. */
 #define ATLAS_DECISION_MAX_REVISIONS 1000
+/* Migration 10: the reason one decision was related to another, or the reason a
+ * relation was withdrawn. Sized like an alternative rather than like a text
+ * field: it explains one edge, and a paragraph that needs more than this is
+ * making an argument that belongs in the decision itself. Refused when it does
+ * not fit, never truncated — a bound that silently shortens an explanation
+ * produces a record that reads as complete and is not. */
+#define ATLAS_DECISION_EDGE_NOTE_MAX 1024u
+/* How many edge events one read returns. The history of one document's
+ * relations, bounded like every other listing. */
+#define ATLAS_DECISION_EDGE_EVENTS_MAX 512
 
 /* The searchable projection of one revision. Bounded so that the degraded
  * (non-FTS5) search is a bounded scan of a narrow table rather than of the

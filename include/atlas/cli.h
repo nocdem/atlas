@@ -75,6 +75,17 @@ typedef struct atlas_cli_opts {
          * `ATLAS_DECISION_LINK_RELATES_TO`. */
         const char *decision_links[ATLAS_DECISION_MAX_LINKS];
         size_t decision_link_count;
+        /* Migration 10: `--why`, the durable reason a relation exists or was
+         * withdrawn. Prose, and deliberately not the same option as
+         * `--rationale`, which is the decision's own argument for itself. */
+        const char *why;
+        /* Migration 10: where a recorded reason came from — OPERATOR (the
+         * default), or the manifest or repair pass an imported one came from.
+         * Checked against the closed vocabulary at the write point. */
+        const char *provenance;
+        /* `decision link note`: which kind of event is being recorded about an
+         * edge. Only a `note` may name one; add and remove name their own. */
+        const char *edge_event;
     } decision;
     /* A5. `apply` is separate from `yes` on purpose: `--yes` confirms an
      * operation the user already named, while `--apply` is what turns

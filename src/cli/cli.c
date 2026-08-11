@@ -94,7 +94,15 @@ void atlas_cli_print_help(FILE *out) {
         "  decision orphaned          decisions attached to no registered repository\n"
         "  decision legacy NAME       A2 decision proposals, and which were promoted\n"
         "  decision promote NAME ID   make an A4 document from an A2 proposal\n"
+        ,
+        ATLAS_VERSION_STRING, ATLAS_PHASE);
+    /* A second split, for the reason the others exist: the backup note pushed
+     * the first literal past the length ISO C99 guarantees. */
+    (void)fprintf(
+        out,
         "  backup create OUTPUT       online snapshot of the index; refuses to overwrite\n"
+        "                             system deployment: OUTPUT is a NAME in the daemon's\n"
+        "                             backup directory, not a path\n"
         "  backup verify BACKUP       check one; creates nothing and repairs nothing\n"
         "  backup restore BACKUP --yes  replace the index; keeps what it displaced\n"
         "  maintenance plan           what a prune would remove, and why each table is kept\n"
@@ -107,9 +115,7 @@ void atlas_cli_print_help(FILE *out) {
         "  integrate claude print     print the one-time setup commands; runs none of them\n"
         "  integrate claude doctor    check the AI integration end to end\n"
         "  integrate claude install --user    record where this Atlas is, for the plugin\n"
-        "  integrate claude uninstall --user  remove that record; never the index\n"
-        ,
-        ATLAS_VERSION_STRING, ATLAS_PHASE);
+        "  integrate claude uninstall --user  remove that record; never the index\n");
     /* A third fprintf for the same reason as the second: A6 pushed the command
      * list past the guaranteed literal length again. */
     (void)fprintf(
@@ -140,7 +146,7 @@ void atlas_cli_print_help(FILE *out) {
         "  --context C --rationale R --consequences Q --scope S\n"
         "                             decision propose/revise: the rest of the document\n"
         "  --alternative A            decision propose/revise: repeatable, up to %d\n"
-        "  --path P --commit OID --symbol-link S\n"
+        "  --path P --commit OID --symbol-link S --decision-link UID\n"
         "                             decision propose/revise: repeatable links\n"
         "  --status S                 decision list: PROPOSED|APPROVED|REJECTED|SUPERSEDED\n"
         "  --revision N               decision show/approve: a specific revision\n"
@@ -1598,6 +1604,20 @@ static bool remote_serves(const cli_state *st) {
     if (strcmp(cmd, "gate") == 0) {
         return strcmp(sub, "check") == 0 || strcmp(sub, "show") == 0;
     }
+    /* Backup create and verify, and deliberately not restore.
+     *
+     * A5 gave backup no remote form because the uid that owns the index can
+     * copy the file anyway. Under A7.1 that stopped being true and nobody
+     * noticed: the index is 0700 `atlasd`, so the operator account could not
+     * take a backup at all and got "there is no Atlas index to back up" — which
+     * is false. These two are served over the socket and refused by the daemon
+     * unless the peer is the uid the root-owned policy names. `restore`
+     * remains local-only: replacing the record should require stopping the
+     * daemon, which is exactly what the local path already enforces through the
+     * writer lock. */
+    if (strcmp(cmd, "backup") == 0) {
+        return strcmp(sub, "create") == 0 || strcmp(sub, "verify") == 0;
+    }
     if (strcmp(cmd, "decision") == 0) {
         return strcmp(sub, "link") == 0 || strcmp(sub, "list") == 0 || strcmp(sub, "search") == 0 ||
                strcmp(sub, "for-file") == 0 || strcmp(sub, "show") == 0 ||
@@ -2027,6 +2047,31 @@ static atlas_status run_job(cli_state *st, atlas_renderer *r, int64_t limit, atl
     return result;
 }
 
+/* Whether the index this invocation names belongs to another account.
+ *
+ * Keyed on the data directory's *source* plus its ownership rather than on the
+ * path, so an explicit `--data-dir` or `ATLAS_DATA_DIR` still means exactly
+ * what it says and fixtures, tests and per-user daemons behave as they always
+ * did on a machine that carries a system policy.
+ *
+ * Extracted because two places need the same answer and they are not adjacent:
+ * `backup` is dispatched before any context is opened, and the general remote
+ * decision happens later. Two copies of this test would eventually disagree,
+ * and the one that disagreed would decide whether a write went to the daemon or
+ * to a database this process cannot open. */
+static bool index_is_foreign(const cli_state *st) {
+    bool foreign = false;
+    atlas_buf resolved = ATLAS_BUF_INIT;
+    atlas_datadir_source src = ATLAS_DATADIR_OVERRIDE;
+    atlas_err rerr;
+    atlas_err_init(&rerr);
+    if (atlas_datadir_resolve(st->opts.data_dir, &resolved, &src, &rerr) == ATLAS_OK) {
+        foreign = atlas_datadir_is_foreign(atlas_buf_cstr(&resolved), src);
+    }
+    atlas_buf_free(&resolved);
+    return foreign;
+}
+
 static atlas_status run_command(cli_state *st, atlas_err *err) {
     const char *cmd = st->command;
     atlas_renderer r;
@@ -2202,7 +2247,7 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
              * separation exists, the filesystem already refuses. */
             if (st->operand_count != 2u) {
                 return atlas_err_set(err, ATLAS_ERR_USAGE,
-                                     "usage: atlas backup create OUTPUT [--force]");
+                                     "usage: atlas backup create OUTPUT|NAME [--force]");
             }
             atlas_backup_create_opts bo;
             memset(&bo, 0, sizeof bo);
@@ -2210,7 +2255,14 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
             bo.force = st->opts.force;
             atlas_backup_report rep;
             atlas_backup_report_init(&rep);
-            atlas_status bs = atlas_service_backup_create(st->opts.data_dir, &bo, &rep, err);
+            /* Remote when this process does not own the index. The operand is
+             * then a name inside the daemon's backup directory rather than a
+             * path this account chooses, because a client that could name a
+             * destination could make the daemon write anywhere it can reach. */
+            atlas_status bs =
+                !index_is_foreign(st)
+                    ? atlas_service_backup_create(st->opts.data_dir, &bo, &rep, err)
+                    : atlas_service_backup_create_remote(st->operands[1], &rep, NULL, err);
             if (bs == ATLAS_OK) {
                 bs = renderer_open(&r, st->opts.json, st->out, "backup create", err);
                 if (bs == ATLAS_OK) {
@@ -2227,7 +2279,9 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
             }
             atlas_backup_verify_report rep;
             atlas_backup_verify_report_init(&rep);
-            atlas_status bs = atlas_service_backup_verify(st->operands[1], &rep, err);
+            atlas_status bs = !index_is_foreign(st)
+                                  ? atlas_service_backup_verify(st->operands[1], &rep, err)
+                                  : atlas_service_backup_verify_remote(st->operands[1], &rep, err);
             if (bs == ATLAS_OK) {
                 bs = renderer_open(&r, st->opts.json, st->out, "backup verify", err);
                 if (bs == ATLAS_OK) {
@@ -2337,17 +2391,7 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
      * rather than on the path: an explicit `--data-dir` or `ATLAS_DATA_DIR`
      * still means exactly what it says, so fixtures, tests and per-user daemons
      * behave as they always did on a machine that carries a system policy. */
-    bool remote = false;
-    {
-        atlas_buf resolved = ATLAS_BUF_INIT;
-        atlas_datadir_source src = ATLAS_DATADIR_OVERRIDE;
-        atlas_err rerr;
-        atlas_err_init(&rerr);
-        if (atlas_datadir_resolve(st->opts.data_dir, &resolved, &src, &rerr) == ATLAS_OK) {
-            remote = atlas_datadir_is_foreign(atlas_buf_cstr(&resolved), src);
-        }
-        atlas_buf_free(&resolved);
-    }
+    bool remote = index_is_foreign(st);
     if (remote && !is_a_command(cmd)) {
         /* The same answer a per-user install gives, produced here because the
          * dispatcher's own unknown-command error comes after a context is

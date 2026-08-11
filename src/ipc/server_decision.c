@@ -316,7 +316,40 @@ static atlas_status snapshot_symbol(dispatch_state *ds, int64_t repo_id, atlas_d
     }
     l->analyzer_version = (int64_t)ATLAS_CODE_ANALYZER_VERSION;
     if (l->path_raw.len == 0) {
-        return ATLAS_OK;
+        /* No file was named, so resolve one: the symbol's definition site, from
+         * this index, and only when there is exactly one of them.
+         *
+         * This used to return here instead, leaving the link with no file
+         * context at all unless the request carried `symbol_files`. The CLI
+         * never sends that — the local path resolves the site itself — so every
+         * symbol link recorded over the socket lost the file and content hash
+         * the local path captured, and the same decision written the two ways
+         * produced two different content hashes. Resolving it here is also the
+         * right layering: the index is the daemon's, and a caller-supplied file
+         * would be a caller asserting what the snapshot exists to check.
+         *
+         * More than one definition site binds nothing, deliberately. A name
+         * defined in several files identifies no single one, and picking the
+         * first would record a file the decision may not be about; the link's
+         * currency then reads AMBIGUOUS, which is the truth. */
+        atlas_buf path_raw = ATLAS_BUF_INIT;
+        atlas_buf hash = ATLAS_BUF_INIT;
+        int64_t matches = 0;
+        st = atlas_db_code_symbol_definition_site(ds->db, repo_id, l->symbol_name.data,
+                                                  l->symbol_name.len, &path_raw, &hash, &matches,
+                                                  err);
+        if (st == ATLAS_OK && matches == 1 && path_raw.len > 0) {
+            st = atlas_buf_set(&l->path_raw, path_raw.data, path_raw.len, err);
+            if (st == ATLAS_OK) {
+                st = atlas_path_text_encode(path_raw.data, path_raw.len, &l->path_text, err);
+            }
+            if (st == ATLAS_OK && hash.len > 0) {
+                st = atlas_buf_set(&l->file_content_hash, hash.data, hash.len, err);
+            }
+        }
+        atlas_buf_free(&path_raw);
+        atlas_buf_free(&hash);
+        return st;
     }
     /* The content hash of the file the symbol was in, as the index holds it
      * now. Absent when the file is not indexed, which makes the link's currency
@@ -377,6 +410,68 @@ static atlas_status take_symbol_links(dispatch_state *ds, const atlas_ipc_reques
         if (st == ATLAS_OK) {
             st = snapshot_symbol(ds, repo_id, &l, head, err);
         }
+        if (st == ATLAS_OK) {
+            st = atlas_decision_revision_add_link(&op->revision, &l, err);
+        }
+        atlas_decision_link_free(&l);
+        if (st != ATLAS_OK) {
+            return st;
+        }
+    }
+    return ATLAS_OK;
+}
+
+/* Decision-to-decision references, as target uids.
+ *
+ * Carried as uids and nothing else. Existence and same-repository are checked at
+ * the write point, inside the transaction that records the revision, so a
+ * dangling or cross-repository target aborts before any row is written rather
+ * than being repaired afterwards — see `lifecycle.c`, which resolves
+ * `relates_to` through the same path as `supersedes`.
+ *
+ * Two checks belong here instead, because this is where the whole requested set
+ * is visible at once:
+ *
+ *   - **self**, when the source document is known. A revise names its document,
+ *     so a relation to itself is refusable; a propose has no uid yet, and the
+ *     client refuses that case for the same reason.
+ *   - **duplicate**, within one request. Recording the same relation twice says
+ *     nothing the first says and doubles it in every walk of the graph. */
+static atlas_status take_decision_links(const atlas_ipc_request *req, const char *source_uid,
+                                        atlas_decision_op *op, atlas_err *err) {
+    const atlas_ipc_array *arr = NULL;
+    if (!atlas_ipc_param_array(req, "decisions", &arr)) {
+        return ATLAS_OK;
+    }
+    size_t n = atlas_ipc_array_len(arr);
+    if (n > ATLAS_DECISION_MAX_LINKS) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "a decision may carry at most %d links, and %zu decision links "
+                             "were given",
+                             ATLAS_DECISION_MAX_LINKS, n);
+    }
+    for (size_t i = 0; i < n; i++) {
+        const char *s = NULL;
+        if (!atlas_ipc_array_str(arr, i, &s) || s == NULL || s[0] == '\0') {
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "\"decisions\" must be non-empty decision ids");
+        }
+        if (source_uid != NULL && source_uid[0] != '\0' && strcmp(source_uid, s) == 0) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE, "a decision cannot relate to itself (%s)",
+                                 s);
+        }
+        for (size_t k = 0; k < op->revision.link_count; k++) {
+            const atlas_decision_link *prev = &op->revision.links[k];
+            if (prev->kind == ATLAS_DECISION_LINK_RELATES_TO &&
+                prev->target_uid.len == strlen(s) &&
+                memcmp(prev->target_uid.data, s, prev->target_uid.len) == 0) {
+                return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                     "the same decision link was given twice (%s)", s);
+            }
+        }
+        atlas_decision_link l;
+        atlas_decision_link_init(&l, ATLAS_DECISION_LINK_RELATES_TO);
+        atlas_status st = atlas_buf_set_str(&l.target_uid, s, err);
         if (st == ATLAS_OK) {
             st = atlas_decision_revision_add_link(&op->revision, &l, err);
         }
@@ -499,6 +594,12 @@ static atlas_status build_revision_op(dispatch_state *ds, const atlas_ipc_reques
     }
     if (st == ATLAS_OK) {
         st = take_symbol_links(ds, req, op, info.id, info.scanned_head, err);
+    }
+    if (st == ATLAS_OK) {
+        /* `op->uid` is set by `take_identity` above: present on a revise, empty
+         * on a propose, which is exactly the difference that decides whether a
+         * self-relation can be detected at all. */
+        st = take_decision_links(req, atlas_buf_cstr(&op->uid), op, err);
     }
     /* Validated here as well as at the write point. Both, because this one
      * produces the better message and that one is the guarantee. */

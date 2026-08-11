@@ -733,10 +733,29 @@ static atlas_status build_op(atlas_ctx *ctx, const char *repo, const char *sourc
                                                      strlen(in->alternatives[i]), err);
     }
     /* Path and symbol links carry a snapshot, so the repository is resolved
-     * once here rather than per link. */
+     * once here rather than per link.
+     *
+     * **Only when this process is the one that will apply the write.** Under a
+     * system deployment the index is 0700 `atlasd` and a client uid never opens
+     * it, so `atlas_ctx_open` is never called and `ctx` is NULL here — see
+     * `remote_serves` in src/cli/cli.c, which routes `decision propose/revise`
+     * over the socket for exactly that reason. Resolving the repository or
+     * reading a file row through a NULL context dereferenced it: any `--path`
+     * or `--symbol-link` crashed the client with SIGSEGV before a request was
+     * ever built, while `--commit` and `--alternative` survived because neither
+     * touches the database.
+     *
+     * The snapshot is not lost by skipping it. `op_to_params` sends the link
+     * intents — path text, commit hex, symbol name — and the daemon re-takes
+     * every snapshot from its own index in `take_path_links` /
+     * `take_symbol_links`, which is the behaviour those functions already
+     * document: a caller-supplied content hash would let a caller assert that a
+     * link is current, so the server never trusts one. Local mode keeps taking
+     * it here so both paths write identical rows. */
+    const bool applies_locally = (ctx != NULL && atlas_ctx_is_writer(ctx));
     atlas_repo_info info;
     atlas_repo_info_init(&info);
-    if (st == ATLAS_OK && (in->path_count > 0 || in->symbol_count > 0)) {
+    if (st == ATLAS_OK && applies_locally && (in->path_count > 0 || in->symbol_count > 0)) {
         st = atlas_service_require_repo(ctx, repo, &info, err);
     }
     for (size_t i = 0; st == ATLAS_OK && i < in->path_count; i++) {
@@ -748,11 +767,13 @@ static atlas_status build_op(atlas_ctx *ctx, const char *repo, const char *sourc
         }
         /* The snapshot, taken from Atlas' own index. A caller-supplied content
          * hash would let a caller assert that a link is current, which is the
-         * claim the snapshot exists to make checkable. */
-        if (st == ATLAS_OK && info.scanned_head[0] != '\0') {
+         * claim the snapshot exists to make checkable. Skipped when the daemon
+         * will apply this write: it takes the same snapshot from the same index
+         * and this process has no handle to take it with. */
+        if (st == ATLAS_OK && applies_locally && info.scanned_head[0] != '\0') {
             st = atlas_buf_set_str(&l.basis_commit, info.scanned_head, err);
         }
-        if (st == ATLAS_OK) {
+        if (st == ATLAS_OK && applies_locally) {
             bool found = false;
             st = atlas_db_file_get(atlas_ctx_db(ctx), info.id, l.path_raw.data, l.path_raw.len,
                                    take_file_hash, &l.file_content_hash, &found, err);
@@ -787,14 +808,16 @@ static atlas_status build_op(atlas_ctx *ctx, const char *repo, const char *sourc
                 st = atlas_path_text_encode(in->symbols[i], strlen(in->symbols[i]),
                                             &l.symbol_name_text, err);
             }
-            if (st == ATLAS_OK) {
+            if (st == ATLAS_OK && applies_locally) {
                 st = atlas_buf_set_str(&l.analyzer_name, ATLAS_CODE_ANALYZER_ID, err);
             }
-            l.analyzer_version = (int64_t)ATLAS_CODE_ANALYZER_VERSION;
-            if (st == ATLAS_OK && info.scanned_head[0] != '\0') {
+            if (applies_locally) {
+                l.analyzer_version = (int64_t)ATLAS_CODE_ANALYZER_VERSION;
+            }
+            if (st == ATLAS_OK && applies_locally && info.scanned_head[0] != '\0') {
                 st = atlas_buf_set_str(&l.basis_commit, info.scanned_head, err);
             }
-            if (st == ATLAS_OK) {
+            if (st == ATLAS_OK && applies_locally) {
                 st = snapshot_symbol(ctx, info.id, &l, err);
             }
             if (st == ATLAS_OK) {
@@ -976,6 +999,15 @@ static atlas_status op_to_params(const atlas_decision_op *op, atlas_buf *out, at
         {"paths", ATLAS_DECISION_LINK_PATH},
         {"commits", ATLAS_DECISION_LINK_COMMIT},
         {"symbols", ATLAS_DECISION_LINK_SYMBOL},
+        /* Decision-to-decision references, as target uids.
+         *
+         * Absent until now, and silently so: `build_op` created the
+         * `relates_to` links, this serialiser dropped them, and the daemon had
+         * no parameter to read them from — so under a system deployment every
+         * `--decision-link` vanished with a success exit and no diagnostic. The
+         * uid is all that travels; the daemon resolves it at the write point,
+         * where existence and same-repository are already checked. */
+        {"decisions", ATLAS_DECISION_LINK_RELATES_TO},
     };
     for (size_t k = 0; st == ATLAS_OK && k < sizeof(lists) / sizeof(lists[0]); k++) {
         size_t n = 0;
@@ -996,9 +1028,10 @@ static atlas_status op_to_params(const atlas_decision_op *op, atlas_buf *out, at
             if (l->kind != lists[k].kind) {
                 continue;
             }
-            const atlas_buf *v = l->kind == ATLAS_DECISION_LINK_PATH      ? &l->path_text
-                                 : l->kind == ATLAS_DECISION_LINK_COMMIT  ? &l->commit_oid
-                                                                          : &l->symbol_name_text;
+            const atlas_buf *v = l->kind == ATLAS_DECISION_LINK_PATH ? &l->path_text
+                                 : l->kind == ATLAS_DECISION_LINK_COMMIT ? &l->commit_oid
+                                 : l->kind == ATLAS_DECISION_LINK_RELATES_TO ? &l->target_uid
+                                                                             : &l->symbol_name_text;
             st = atlas_json_str(j, atlas_buf_cstr(v), err);
         }
         if (st == ATLAS_OK) {

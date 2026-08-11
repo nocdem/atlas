@@ -44,6 +44,38 @@
  * rather than of the database. */
 #define BACKUP_IO_CHUNK (256u * 1024u)
 
+/* The inverse of `atlas_backup_verdict_name`, for the client that reads a
+ * verification the daemon performed.
+ *
+ * Closed vocabulary with no default. A verdict this binary does not know is a
+ * version mismatch between client and daemon, and the caller must be able to
+ * tell that apart from `ok` — silently mapping an unknown name onto any verdict
+ * would report a judgement that was never made. */
+bool atlas_backup_verdict_parse(const char *name, atlas_backup_verdict *out) {
+    static const struct {
+        const char *name;
+        atlas_backup_verdict v;
+    } NAMES[] = {
+        {"ok", ATLAS_BACKUP_OK},
+        {"unreadable", ATLAS_BACKUP_UNREADABLE},
+        {"not_sqlite", ATLAS_BACKUP_NOT_SQLITE},
+        {"not_atlas", ATLAS_BACKUP_NOT_ATLAS},
+        {"schema_future", ATLAS_BACKUP_SCHEMA_FUTURE},
+        {"corrupt", ATLAS_BACKUP_CORRUPT},
+        {"inconsistent", ATLAS_BACKUP_INCONSISTENT},
+    };
+    if (name == NULL || out == NULL) {
+        return false;
+    }
+    for (size_t i = 0; i < sizeof NAMES / sizeof NAMES[0]; i++) {
+        if (strcmp(name, NAMES[i].name) == 0) {
+            *out = NAMES[i].v;
+            return true;
+        }
+    }
+    return false;
+}
+
 const char *atlas_backup_verdict_name(atlas_backup_verdict v) {
     switch (v) {
     case ATLAS_BACKUP_OK:

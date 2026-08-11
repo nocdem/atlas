@@ -34,10 +34,12 @@ typedef struct dispatch_state {
     /* A8. The kernel's answer about the peer, taken from SO_PEERCRED at accept
      * time and carried here unchanged.
      *
-     * A7.1 says the socket carries no *authority*, and it still does not: the
-     * lifecycle, registry, backup, restore and maintenance methods do not exist
-     * in the protocol, so there is nothing on this socket for a privileged tier
-     * to unlock. What A8 adds is a *disjoint* group of orchestration methods
+     * A7.1 says the socket carries no *authority*, and that is now narrower
+     * than it was: the registry, restore and maintenance methods still do not
+     * exist in the protocol, and the lifecycle and backup-read methods exist
+     * only in a group gated on the operator uid the root-owned policy names.
+     * Nothing an ordinary client can reach replaces or prunes the index. What
+     * A8 adds is a *disjoint* group of orchestration methods
      * reachable only from the single uid a root-owned policy names as the
      * dispatcher — leases, heartbeats, events and results for jobs an operator
      * already created. It confers no authority over the record Atlas protects,
@@ -110,5 +112,17 @@ bool atlas_server_index_current(const atlas_index_state *s, const char **reason_
  * `src/ipc/server_decision.c` for what that does and does not guarantee. */
 const atlas_method_entry *atlas_server_operator_methods(size_t *count_out);
 bool atlas_server_peer_is_operator(long long peer_uid);
+
+/* `backup.create` and `backup.verify`, in the same operator-gated group and
+ * behind the same `SO_PEERCRED` test.
+ *
+ * A5 gave backup no RPC surface on the reasoning that the uid owning the index
+ * can copy the file anyway. A7.1 broke that premise without noticing: under a
+ * system deployment the index is 0700 `atlasd`, so the operator uid — the one
+ * the root-owned policy names — was the one account that could not take a
+ * backup at all. These two methods restore the operation to the account that is
+ * supposed to have it, and no further: `backup.restore` deliberately has no RPC
+ * form, because replacing the record should require stopping the daemon. */
+const atlas_method_entry *atlas_server_backup_methods(size_t *count_out);
 
 #endif /* ATLAS_IPC_SERVER_INTERNAL_H */

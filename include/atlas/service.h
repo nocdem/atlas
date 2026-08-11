@@ -14,6 +14,7 @@
 #include <stdio.h>
 
 #include "atlas/authority.h"
+#include "atlas/backup.h"
 #include "atlas/code.h"
 #include "atlas/datadir.h"
 #include "atlas/db.h"
@@ -873,6 +874,15 @@ atlas_status atlas_service_dispatcher_run(bool once, FILE *log, atlas_err *err);
 atlas_status atlas_service_search_remote(const char *name, const char *query, int64_t limit,
                                          atlas_search_mode *mode_out, atlas_search_cb cb, void *ud,
                                          int64_t *count_out, atlas_err *err);
+/* Backup create and verify, performed by the daemon in its own backup
+ * directory. `name` is one path component and never a path: the destination is
+ * fixed and the caller chooses a name within it. `out->path` receives that
+ * name, which is also what `verify` takes back. */
+atlas_status atlas_service_backup_create_remote(const char *name, atlas_backup_report *out,
+                                                atlas_backup_verify_report *verified,
+                                                atlas_err *err);
+atlas_status atlas_service_backup_verify_remote(const char *name, atlas_backup_verify_report *out,
+                                                atlas_err *err);
 atlas_status atlas_service_events_remote(const char *name, int64_t since, int64_t limit,
                                          atlas_event_cb cb, void *ud, int64_t *count_out,
                                          int64_t *next_cursor_out, bool *more_out, atlas_err *err);

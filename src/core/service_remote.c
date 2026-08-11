@@ -38,6 +38,7 @@
 #include <time.h>
 
 #include "atlas/atlas.h"
+#include "atlas/backup.h"
 #include "atlas/code.h"
 #include "atlas/gate.h"
 #include "atlas/ipc.h"
@@ -1798,4 +1799,153 @@ atlas_status atlas_service_gate_show_remote(const char *repo, const char *uid,
         return st;
     }
     return atlas_gate_narrow_to_one(out, uid, err);
+}
+
+/* --- backup ---------------------------------------------------------------- */
+
+/* Fills the verification report from a response object's members.
+ *
+ * Shared by both twins because `backup.create` embeds the same verification it
+ * ran daemon-side, and a create whose embedded report was parsed differently
+ * from a standalone verify would be two answers to one question. */
+static void take_verify(const atlas_ipc_response *r, const char *prefix,
+                        atlas_backup_verify_report *out) {
+    const char *v = NULL;
+    int64_t n = 0;
+    bool b = false;
+    char key[64];
+#define K(field) (prefix[0] == '\0' ? (field) : (snprintf(key, sizeof key, "%s%s", prefix, field), key))
+    if (atlas_ipc_result_str(r, K("verdict"), &v) && v != NULL) {
+        /* Parsed against the closed vocabulary. An unknown verdict is a version
+         * mismatch, and defaulting it to OK would report a backup this binary
+         * cannot judge as one it judged good. */
+        if (!atlas_backup_verdict_parse(v, &out->verdict)) {
+            out->verdict = ATLAS_BACKUP_UNREADABLE;
+            out->ok = false;
+        }
+    }
+    if (atlas_ipc_result_bool(r, K("ok"), &b)) {
+        out->ok = b;
+    }
+    if (atlas_ipc_result_int(r, K("size_bytes"), &n)) {
+        out->size_bytes = n;
+    }
+    if (atlas_ipc_result_str(r, K("sha256"), &v) && v != NULL) {
+        copy_str(out->sha256, sizeof out->sha256, v);
+    }
+    if (atlas_ipc_result_int(r, K("schema_version"), &n)) {
+        out->schema_version = (int)n;
+    }
+    if (atlas_ipc_result_int(r, K("expected_schema_version"), &n)) {
+        out->expected_schema_version = (int)n;
+    }
+    if (atlas_ipc_result_int(r, K("revisions_checked"), &n)) {
+        out->revisions_checked = n;
+    }
+    if (atlas_ipc_result_int(r, K("revisions_corrupt"), &n)) {
+        out->revisions_corrupt = n;
+    }
+    if (atlas_ipc_result_int(r, K("ledger_mismatched"), &n)) {
+        out->ledger_mismatched = n;
+    }
+    if (atlas_ipc_result_int(r, K("repo_count"), &n)) {
+        out->repo_count = n;
+    }
+    atlas_err e;
+    atlas_err_init(&e);
+    if (atlas_ipc_result_str(r, K("integrity"), &v) && v != NULL) {
+        (void)atlas_buf_set_str(&out->integrity, v, &e);
+    }
+    if (atlas_ipc_result_str(r, K("problems"), &v) && v != NULL) {
+        (void)atlas_buf_set_str(&out->problems, v, &e);
+    }
+#undef K
+}
+
+atlas_status atlas_service_backup_create_remote(const char *name, atlas_backup_report *out,
+                                                atlas_backup_verify_report *verified,
+                                                atlas_err *err) {
+    atlas_buf params = ATLAS_BUF_INIT;
+    atlas_ipc_params *p = NULL;
+    atlas_json *j = NULL;
+    atlas_status st = atlas_ipc_params_begin(&p, &j, err);
+    if (st == ATLAS_OK) {
+        if (name != NULL && name[0] != '\0') {
+            st = atlas_json_key_str(j, "name", name, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_ipc_params_finish(p, &params, err);
+        } else {
+            atlas_ipc_params_abort(p);
+        }
+    }
+    atlas_buf raw = ATLAS_BUF_INIT;
+    atlas_ipc_response *r = NULL;
+    if (st == ATLAS_OK) {
+        st = atlas_remote_call("backup.create", atlas_buf_cstr(&params), &raw, &r, err);
+    }
+    atlas_buf_free(&params);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    const char *v = NULL;
+    int64_t n = 0;
+    bool b = false;
+    if (atlas_ipc_result_str(r, "backup", &v) && v != NULL) {
+        st = atlas_buf_set_str(&out->path, v, err);
+    }
+    if (atlas_ipc_result_int(r, "size_bytes", &n)) {
+        out->size_bytes = n;
+    }
+    if (atlas_ipc_result_str(r, "sha256", &v) && v != NULL) {
+        copy_str(out->sha256, sizeof out->sha256, v);
+    }
+    if (atlas_ipc_result_str(r, "atlas_version", &v) && v != NULL) {
+        copy_str(out->atlas_version, sizeof out->atlas_version, v);
+    }
+    if (atlas_ipc_result_int(r, "schema_version", &n)) {
+        out->schema_version = (int)n;
+    }
+    if (atlas_ipc_result_bool(r, "source_online", &b)) {
+        out->source_online = b;
+    }
+    if (verified != NULL) {
+        take_verify(r, "verified_", verified);
+    }
+    atlas_ipc_response_free(r);
+    atlas_buf_free(&raw);
+    return st;
+}
+
+atlas_status atlas_service_backup_verify_remote(const char *name, atlas_backup_verify_report *out,
+                                                atlas_err *err) {
+    atlas_buf params = ATLAS_BUF_INIT;
+    atlas_ipc_params *p = NULL;
+    atlas_json *j = NULL;
+    atlas_status st = atlas_ipc_params_begin(&p, &j, err);
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(j, "name", name != NULL ? name : "", err);
+        if (st == ATLAS_OK) {
+            st = atlas_ipc_params_finish(p, &params, err);
+        } else {
+            atlas_ipc_params_abort(p);
+        }
+    }
+    atlas_buf raw = ATLAS_BUF_INIT;
+    atlas_ipc_response *r = NULL;
+    if (st == ATLAS_OK) {
+        st = atlas_remote_call("backup.verify", atlas_buf_cstr(&params), &raw, &r, err);
+    }
+    atlas_buf_free(&params);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    const char *v = NULL;
+    if (atlas_ipc_result_str(r, "backup", &v) && v != NULL) {
+        st = atlas_buf_set_str(&out->path, v, err);
+    }
+    take_verify(r, "", out);
+    atlas_ipc_response_free(r);
+    atlas_buf_free(&raw);
+    return st;
 }

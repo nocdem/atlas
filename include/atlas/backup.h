@@ -69,6 +69,11 @@ typedef enum atlas_backup_verdict {
 
 const char *atlas_backup_verdict_name(atlas_backup_verdict v);
 
+/* Parses a verdict name back. False for a name this binary does not know, which
+ * is a client/daemon version mismatch rather than a bad backup — the caller
+ * must be able to tell that apart from a verdict of `ok`. */
+bool atlas_backup_verdict_parse(const char *name, atlas_backup_verdict *out);
+
 /* --- create -------------------------------------------------------------- */
 
 typedef struct atlas_backup_report {

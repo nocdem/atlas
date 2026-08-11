@@ -986,6 +986,19 @@ atlas_status atlas_server_dispatch(atlas_server_ctx *ctx, const void *payload, s
                 break;
             }
         }
+        /* Backup create and verify, behind the same test and consulted
+         * additively for the same reason the orchestration groups are: two
+         * tables, one gate, so neither can be reached without the other's
+         * check having run. */
+        if (fn == NULL) {
+            const atlas_method_entry *b = atlas_server_backup_methods(&n);
+            for (size_t i = 0; i < n; i++) {
+                if (strcmp(atlas_ipc_request_method(req), b[i].name) == 0) {
+                    fn = b[i].fn;
+                    break;
+                }
+            }
+        }
     }
     if (fn == NULL &&
         atlas_orchpolicy_is_any_dispatcher(&ctx->orchpolicy, (long long)peer_uid)) {

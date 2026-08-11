@@ -162,11 +162,17 @@ add_library(atlas_core STATIC
   src/ipc/server_decision.c
   # --- A5: operational backup, verification, restore and maintenance -----
   #
-  # There is deliberately no src/ipc file here. Backup, restore and
-  # maintenance are local CLI operations with no RPC method, so nothing
-  # reachable from MCP or a hook can replace or prune the index.
+  # Restore and maintenance are local CLI operations with no RPC method, so
+  # nothing reachable from MCP or a hook can replace or prune the index.
+  #
+  # Backup create and verify do have one, added when A7.1's 0700 index made
+  # the operator account the one account that could not read its own backup.
+  # They live in the operator-gated group in src/ipc/server_backup.c, behind
+  # the SO_PEERCRED test that gates approve and reject — not in the ordinary
+  # client surface, and restore is still absent from the protocol entirely.
   src/db/db_backup.c
   src/core/service_backup.c
+  src/ipc/server_backup.c
   src/db/db_maintenance.c
   src/core/service_maintenance.c
   # --- A6: impact gates and stale-decision detection ---------------------

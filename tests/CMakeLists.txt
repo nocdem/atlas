@@ -120,6 +120,7 @@ set(ATLAS_TESTS
   test_orch_snapshot
   test_remote_equivalence
   test_operator_peer
+  test_migrate9
   test_migrate8
 )
 
@@ -226,6 +227,7 @@ set_tests_properties(test_orch_driver PROPERTIES LABELS "integration" TIMEOUT 30
 set_tests_properties(test_orch_snapshot PROPERTIES LABELS "integration" TIMEOUT 300)
 set_tests_properties(test_remote_equivalence PROPERTIES LABELS "daemon" TIMEOUT 300)
 set_tests_properties(test_operator_peer PROPERTIES LABELS "unit" TIMEOUT 60)
+set_tests_properties(test_migrate9 PROPERTIES LABELS "integration" TIMEOUT 120)
 target_compile_definitions(test_a7_authority PRIVATE ATLAS_SRC_DIR="${CMAKE_SOURCE_DIR}")
 # Migration 7 rebuilds a table, so its suite drives the storage layer and the
 # backup CLI against real databases. No daemon and no repository.

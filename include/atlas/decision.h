@@ -166,7 +166,18 @@ typedef enum atlas_decision_link_kind {
     ATLAS_DECISION_LINK_SUPERSEDES,
     /* This document is replaced by another. Recorded on the superseded side so
      * a reader of the old document is told where to look without a join. */
-    ATLAS_DECISION_LINK_REPLACED_BY
+    ATLAS_DECISION_LINK_REPLACED_BY,
+    /* This document relates to another, and nothing more is claimed.
+     *
+     * Deliberately inert: no status computation reads it, no transition writes
+     * or removes it, and it is not a weaker `supersedes`. Those two are
+     * lifecycle facts — the supersede transition writes them and
+     * `recompute_status` reads them — so a general cross-reference had to be
+     * its own kind rather than a reuse, or an ordinary reference between two
+     * proposals would have changed one of their statuses. The direction is the
+     * one recorded: the revision holding the link is the source, and
+     * `target_uid` is what it points at. */
+    ATLAS_DECISION_LINK_RELATES_TO
 } atlas_decision_link_kind;
 
 const char *atlas_decision_link_kind_name(atlas_decision_link_kind k);

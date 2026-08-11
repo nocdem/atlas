@@ -1908,6 +1908,78 @@ static const char *const M8_STATEMENTS[] = {
     NULL,
 };
 
+
+/* --- migration 9: a general decision-to-decision relation ------------------
+ *
+ * `decision_links.kind` is a closed vocabulary enforced by a CHECK constraint,
+ * and it held no way to say that one decision simply *relates to* another. The
+ * two kinds that reference a document — `supersedes` and `replaced_by` — are
+ * lifecycle facts: the supersede transition writes them and `recompute_status`
+ * reads them, so using either for a general relation would make an ordinary
+ * cross-reference change a document's status. That is why this is a migration
+ * and not a reinterpretation of an existing value.
+ *
+ * SQLite cannot alter a CHECK, so the table is rebuilt. The rebuild copies
+ * every column by name — ids, both endpoints, kind, timestamps and every
+ * snapshot field — recreates all four indexes, and runs inside the single
+ * transaction `atlas_db_migrate` already wraps each migration in, so a failure
+ * leaves both the schema version and the rows exactly as they were.
+ *
+ * Nothing else changes. No other table is touched, no lifecycle rule moves, and
+ * `relates_to` is deliberately inert: it resolves, it is reported, it is
+ * preserved across transitions, and no status computation reads it. */
+static const char M9_LINKS_NEW[] =
+    "CREATE TABLE decision_links_new ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  revision_id INTEGER NOT NULL REFERENCES decision_revisions(id) ON DELETE CASCADE,"
+    "  kind TEXT NOT NULL CHECK(kind IN"
+    "    ('path','commit','change_set','symbol','supersedes','replaced_by','relates_to')),"
+    "  path_raw BLOB,"
+    "  path_text TEXT,"
+    "  commit_oid TEXT,"
+    "  change_set_id INTEGER,"
+    "  target_document_id INTEGER,"
+    "  symbol_name BLOB,"
+    "  symbol_name_text TEXT,"
+    "  symbol_kind TEXT,"
+    "  symbol_line INTEGER NOT NULL DEFAULT 0,"
+    "  basis_commit TEXT,"
+    "  file_content_hash TEXT,"
+    "  analyzer_name TEXT,"
+    "  analyzer_version INTEGER NOT NULL DEFAULT 0,"
+    "  created_at TEXT NOT NULL"
+    ");";
+
+/* Column by column rather than `SELECT *`: a rebuild that relied on column
+ * order would silently move data if the two definitions ever drifted. */
+static const char M9_COPY[] =
+    "INSERT INTO decision_links_new"
+    "  (id, revision_id, kind, path_raw, path_text, commit_oid, change_set_id,"
+    "   target_document_id, symbol_name, symbol_name_text, symbol_kind, symbol_line,"
+    "   basis_commit, file_content_hash, analyzer_name, analyzer_version, created_at)"
+    " SELECT id, revision_id, kind, path_raw, path_text, commit_oid, change_set_id,"
+    "   target_document_id, symbol_name, symbol_name_text, symbol_kind, symbol_line,"
+    "   basis_commit, file_content_hash, analyzer_name, analyzer_version, created_at"
+    " FROM decision_links;";
+
+static const char *const M9_STATEMENTS[] = {
+    M9_LINKS_NEW,
+    M9_COPY,
+    "DROP TABLE decision_links;",
+    "ALTER TABLE decision_links_new RENAME TO decision_links;",
+    /* All four, exactly as migration 6 created them. */
+    "CREATE INDEX idx_decision_links_rev ON decision_links(revision_id, id);",
+    "CREATE INDEX idx_decision_links_path ON decision_links(path_raw)"
+    "  WHERE path_raw IS NOT NULL;",
+    "CREATE INDEX idx_decision_links_symbol ON decision_links(symbol_name)"
+    "  WHERE symbol_name IS NOT NULL;",
+    "CREATE INDEX idx_decision_links_commit ON decision_links(commit_oid)"
+    "  WHERE commit_oid IS NOT NULL;",
+    "CREATE INDEX idx_decision_links_target ON decision_links(target_document_id)"
+    "  WHERE target_document_id IS NOT NULL;",
+    NULL,
+};
+
 static const atlas_migration MIGRATIONS[] = {
     {1, "initial schema", M1_STATEMENTS},
     {2, "worktree identity", M2_STATEMENTS},
@@ -1917,6 +1989,7 @@ static const atlas_migration MIGRATIONS[] = {
     {6, "decision documents, revisions and operator approval", M6_STATEMENTS},
     {7, "decision revalidation records", M7_STATEMENTS},
     {8, "durable orchestration control plane", M8_STATEMENTS},
+    {9, "a general decision-to-decision relation", M9_STATEMENTS},
 };
 
 const atlas_migration *atlas_migrations(size_t *count_out) {

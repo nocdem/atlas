@@ -2441,6 +2441,11 @@ atlas_status atlas_db_decision_link_resolve(atlas_db *db, int64_t repo_id, atlas
                               NULL, 0, l, ATLAS_DECISION_LINK_MISSING, err);
     case ATLAS_DECISION_LINK_SUPERSEDES:
     case ATLAS_DECISION_LINK_REPLACED_BY:
+    /* Resolved the same way and for the same reason: a document link is current
+     * when the document it names is still held. `relates_to` claims nothing
+     * about lifecycle, but "does the thing I point at still exist" is the same
+     * question whatever the relation means. */
+    case ATLAS_DECISION_LINK_RELATES_TO:
         return resolve_exists(db, "SELECT 1 FROM decision_documents WHERE uid = ?1;", 0,
                               l->target_uid.data != NULL ? l->target_uid.data : "",
                               l->target_uid.len, l, ATLAS_DECISION_LINK_MISSING, err);

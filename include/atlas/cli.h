@@ -70,6 +70,11 @@ typedef struct atlas_cli_opts {
         size_t commit_count;
         const char *symbols[ATLAS_DECISION_MAX_LINKS];
         size_t symbol_count;
+        /* Repeatable `--decision-link`: the uids this decision relates to. A
+         * general reference, not a lifecycle one — see
+         * `ATLAS_DECISION_LINK_RELATES_TO`. */
+        const char *decision_links[ATLAS_DECISION_MAX_LINKS];
+        size_t decision_link_count;
     } decision;
     /* A5. `apply` is separate from `yes` on purpose: `--yes` confirms an
      * operation the user already named, while `--apply` is what turns

@@ -206,7 +206,7 @@ static void test_a_populated_schema_six_database_reaches_seven_losslessly(void) 
      * table without renumbering a row — is asserted below and is unaffected by
      * later migrations running on top of it. */
     T_EQ_INT(atlas_db_schema_version(db, &err), ATLAS_SCHEMA_VERSION);
-    T_EQ_INT(ATLAS_SCHEMA_VERSION, 8);
+    T_EQ_INT(ATLAS_SCHEMA_VERSION, 9);
 
     atlas_buf after = ATLAS_BUF_INIT;
     text_of(db,

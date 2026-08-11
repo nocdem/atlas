@@ -90,6 +90,7 @@ void atlas_cli_print_help(FILE *out) {
         "  decision reject NAME ID    refuse a revision. Needs an interactive terminal\n"
         "  decision supersede NAME ID --by ID2   replace one decision with another\n"
         "  decision export NAME ID    write the decision to stdout as Markdown or JSON\n"
+        "  decision link add REPO SOURCE TARGET   relate one decision to another\n"
         "  decision orphaned          decisions attached to no registered repository\n"
         "  decision legacy NAME       A2 decision proposals, and which were promoted\n"
         "  decision promote NAME ID   make an A4 document from an A2 proposal\n"
@@ -345,7 +346,8 @@ static atlas_status parse_args(cli_state *st, int argc, char **argv, bool *want_
                     st->opts.decision.dedup_key = v;
                 }
             } else if (strcmp(a, "--alternative") == 0 || strcmp(a, "--path") == 0 ||
-                       strcmp(a, "--commit") == 0 || strcmp(a, "--symbol-link") == 0) {
+                       strcmp(a, "--commit") == 0 || strcmp(a, "--symbol-link") == 0 ||
+                       strcmp(a, "--decision-link") == 0) {
                 /* The repeatable ones. Refused past the ceiling rather than
                  * truncated: a decision that silently recorded three of five
                  * alternatives would claim the other two were never considered,
@@ -374,6 +376,13 @@ static atlas_status parse_args(cli_state *st, int argc, char **argv, bool *want_
                                              ATLAS_DECISION_MAX_LINKS);
                     }
                     st->opts.decision.commits[st->opts.decision.commit_count++] = v;
+                } else if (strcmp(a, "--decision-link") == 0) {
+                    if (st->opts.decision.decision_link_count >= ATLAS_DECISION_MAX_LINKS) {
+                        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                             "at most %d --decision-link options",
+                                             ATLAS_DECISION_MAX_LINKS);
+                    }
+                    st->opts.decision.decision_links[st->opts.decision.decision_link_count++] = v;
                 } else {
                     if (st->opts.decision.symbol_count >= ATLAS_DECISION_MAX_LINKS) {
                         return atlas_err_set(err, ATLAS_ERR_USAGE,
@@ -1062,6 +1071,8 @@ static void decision_input_from(const cli_state *st, atlas_decision_input *in) {
     in->commit_count = st->opts.decision.commit_count;
     in->symbols = st->opts.decision.symbols;
     in->symbol_count = st->opts.decision.symbol_count;
+    in->decision_links = st->opts.decision.decision_links;
+    in->decision_link_count = st->opts.decision.decision_link_count;
     in->dedup_key = st->opts.decision.dedup_key;
 }
 
@@ -1407,6 +1418,25 @@ static atlas_status run_decision(cli_state *st, atlas_ctx *ctx, atlas_renderer *
         return result;
     }
 
+    /* `decision link add SOURCE TARGET`. A proposal write, not an operator
+     * operation: it goes through the same authority path `propose` and `revise`
+     * use, and mints nothing. */
+    if (strcmp(sub, "link") == 0) {
+        if (st->operand_count != 5u || strcmp(st->operands[1], "add") != 0) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "usage: atlas decision link add REPO SOURCE_ID TARGET_ID");
+        }
+        atlas_decision_outcome o;
+        atlas_decision_outcome_init(&o);
+        atlas_status lr = atlas_service_decision_link_add(ctx, st->operands[2], st->operands[3],
+                                                          st->operands[4], &o, err);
+        if (lr == ATLAS_OK) {
+            lr = render_outcome(st, r, "decision link add", &o, err);
+        }
+        atlas_decision_outcome_free(&o);
+        return lr;
+    }
+
     if (strcmp(sub, "orphaned") == 0) {
         /* Decisions attached to no live repository. Takes no repository name,
          * because a repository is exactly what these do not have. */
@@ -1569,7 +1599,7 @@ static bool remote_serves(const cli_state *st) {
         return strcmp(sub, "check") == 0 || strcmp(sub, "show") == 0;
     }
     if (strcmp(cmd, "decision") == 0) {
-        return strcmp(sub, "list") == 0 || strcmp(sub, "search") == 0 ||
+        return strcmp(sub, "link") == 0 || strcmp(sub, "list") == 0 || strcmp(sub, "search") == 0 ||
                strcmp(sub, "for-file") == 0 || strcmp(sub, "show") == 0 ||
                strcmp(sub, "export") == 0 || strcmp(sub, "history") == 0 ||
                strcmp(sub, "orphaned") == 0 || strcmp(sub, "legacy") == 0 ||

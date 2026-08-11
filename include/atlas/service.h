@@ -650,6 +650,11 @@ typedef struct atlas_decision_input {
     size_t commit_count;
     const char *const *symbols;
     size_t symbol_count;
+    /* Decision uids this decision relates to. A general reference: the revision
+     * holding them is the source and each uid is a target, and no lifecycle
+     * rule reads them. */
+    const char *const *decision_links;
+    size_t decision_link_count;
     const char *dedup_key;
 } atlas_decision_input;
 
@@ -693,6 +698,16 @@ atlas_status atlas_service_decision_history(atlas_ctx *ctx, const char *repo, co
 atlas_status atlas_service_decision_propose(atlas_ctx *ctx, const char *repo,
                                             const atlas_decision_input *in,
                                             atlas_decision_outcome *out, atlas_err *err);
+/* Relates one decision to another, on a document that already exists.
+ *
+ * A new revision, because a revision is immutable and its links are hashed;
+ * idempotent, because a target already related is reported rather than added
+ * again. Not an operator operation: it writes a proposal through the same path
+ * `propose` and `revise` use. */
+atlas_status atlas_service_decision_link_add(atlas_ctx *ctx, const char *repo, const char *uid,
+                                             const char *target_uid,
+                                             atlas_decision_outcome *out, atlas_err *err);
+
 atlas_status atlas_service_decision_revise(atlas_ctx *ctx, const char *repo, const char *uid,
                                            const atlas_decision_input *in,
                                            atlas_decision_outcome *out, atlas_err *err);

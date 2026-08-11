@@ -392,7 +392,14 @@ static atlas_status write_revision(apply_ctx *ac, const atlas_decision_op *op,
     for (size_t i = 0; st == ATLAS_OK && i < rev->link_count; i++) {
         atlas_decision_link *l = &rev->links[i];
         int64_t target = 0;
-        if (l->kind == ATLAS_DECISION_LINK_SUPERSEDES || l->kind == ATLAS_DECISION_LINK_REPLACED_BY) {
+        /* Every kind that names a document resolves the same way: the target
+         * must exist and must be in this repository. `relates_to` is included
+         * because those two checks are about the *reference*, not about what
+         * the reference means — a relation to a document Atlas does not hold is
+         * a dangling pointer whatever it is called. */
+        if (l->kind == ATLAS_DECISION_LINK_SUPERSEDES ||
+            l->kind == ATLAS_DECISION_LINK_REPLACED_BY ||
+            l->kind == ATLAS_DECISION_LINK_RELATES_TO) {
             int64_t trepo = 0;
             bool found = false;
             st = atlas_db_decision_find_uid(ac->db, atlas_buf_cstr(&l->target_uid), &target, &trepo,
@@ -404,7 +411,8 @@ static atlas_status write_revision(apply_ctx *ac, const atlas_decision_op *op,
             /* Rule 7: a link between documents may not cross repositories.
              * Two repositories' decisions are two policies, and a link that
              * crossed would let a supersession in one silently retire a
-             * decision in the other. */
+             * decision in the other, and a relation across them would assert a
+             * connection between two policies nobody agreed to. */
             if (st == ATLAS_OK && trepo != ac->repo.id) {
                 st = atlas_err_set(err, ATLAS_ERR_USAGE,
                                    "a decision may only link to another decision in the same "

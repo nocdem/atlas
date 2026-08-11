@@ -179,6 +179,7 @@ const char *atlas_decision_link_kind_name(atlas_decision_link_kind k) {
     case ATLAS_DECISION_LINK_SYMBOL: return "symbol";
     case ATLAS_DECISION_LINK_SUPERSEDES: return "supersedes";
     case ATLAS_DECISION_LINK_REPLACED_BY: return "replaced_by";
+    case ATLAS_DECISION_LINK_RELATES_TO: return "relates_to";
     }
     return "path";
 }
@@ -197,6 +198,7 @@ bool atlas_decision_link_kind_parse(const char *name, atlas_decision_link_kind *
         {"symbol", ATLAS_DECISION_LINK_SYMBOL},
         {"supersedes", ATLAS_DECISION_LINK_SUPERSEDES},
         {"replaced_by", ATLAS_DECISION_LINK_REPLACED_BY},
+        {"relates_to", ATLAS_DECISION_LINK_RELATES_TO},
     };
     for (size_t i = 0; i < sizeof(TABLE) / sizeof(TABLE[0]); i++) {
         if (strcmp(name, TABLE[i].name) == 0) {
@@ -564,6 +566,7 @@ atlas_status atlas_decision_revision_validate(const atlas_decision_revision *r, 
             break;
         case ATLAS_DECISION_LINK_SUPERSEDES:
         case ATLAS_DECISION_LINK_REPLACED_BY:
+        case ATLAS_DECISION_LINK_RELATES_TO:
             if (!atlas_decision_uid_is_valid(atlas_buf_cstr(&l->target_uid))) {
                 return atlas_err_set(err, ATLAS_ERR_USAGE,
                                      "a document link needs a valid decision id");

@@ -520,6 +520,7 @@ atlas_status atlas_service_decision_show(atlas_ctx *ctx, const char *repo, const
                 break;
             case ATLAS_DECISION_LINK_SUPERSEDES:
             case ATLAS_DECISION_LINK_REPLACED_BY:
+            case ATLAS_DECISION_LINK_RELATES_TO:
                 st = atlas_buf_set(&v->value, l->target_uid.data, l->target_uid.len, err);
                 break;
             }
@@ -686,8 +687,12 @@ static atlas_status snapshot_symbol(atlas_ctx *ctx, int64_t repo_id, atlas_decis
     return st;
 }
 
-static atlas_status build_op(atlas_ctx *ctx, const char *repo, const atlas_decision_input *in,
-                             atlas_decision_op *op, atlas_err *err) {
+/* `source_uid` is the document the revision will belong to, or NULL when it does
+ * not exist yet. It is used for one thing: refusing a relation to itself, which
+ * can only be detected where both ends are known. */
+static atlas_status build_op(atlas_ctx *ctx, const char *repo, const char *source_uid,
+                             const atlas_decision_input *in, atlas_decision_op *op,
+                             atlas_err *err) {
     atlas_status st = atlas_buf_set_str(&op->repo_name, repo, err);
     struct {
         atlas_buf *to;
@@ -797,6 +802,30 @@ static atlas_status build_op(atlas_ctx *ctx, const char *repo, const atlas_decis
             }
             atlas_decision_link_free(&l);
         }
+    }
+    /* Decision-to-decision references. Carried as uids and resolved at the
+     * write point, where the target's existence and its repository are checked
+     * together — the same place `supersedes` is resolved, so there is one
+     * answer to "does that document exist here" rather than two.
+     *
+     * Self-links are refused here because this is where the source uid is
+     * known: at the write point a proposal has no uid yet. A revision that
+     * pointed at its own document would be a relation that says nothing and
+     * reads as a cycle to anything that walks links. */
+    for (size_t i = 0; st == ATLAS_OK && i < in->decision_link_count; i++) {
+        const char *target = in->decision_links[i];
+        if (source_uid != NULL && target != NULL && strcmp(source_uid, target) == 0) {
+            st = atlas_err_set(err, ATLAS_ERR_USAGE,
+                               "a decision cannot relate to itself (%s)", target);
+            break;
+        }
+        atlas_decision_link l;
+        atlas_decision_link_init(&l, ATLAS_DECISION_LINK_RELATES_TO);
+        st = atlas_buf_set_str(&l.target_uid, target != NULL ? target : "", err);
+        if (st == ATLAS_OK) {
+            st = atlas_decision_revision_add_link(&op->revision, &l, err);
+        }
+        atlas_decision_link_free(&l);
     }
     atlas_repo_info_free(&info);
     op->revision.proposed_by = ATLAS_DECISION_ACTOR_MODEL_PROPOSAL;
@@ -1110,7 +1139,7 @@ atlas_status atlas_service_decision_propose(atlas_ctx *ctx, const char *repo,
     if (op == NULL) {
         return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory");
     }
-    atlas_status st = build_op(ctx, repo, in, op, err);
+    atlas_status st = build_op(ctx, repo, NULL, in, op, err);
     if (st != ATLAS_OK) {
         atlas_decision_op_free(op);
         free(op);
@@ -1139,7 +1168,7 @@ atlas_status atlas_service_decision_revise(atlas_ctx *ctx, const char *repo, con
     }
     atlas_status st = atlas_buf_set_str(&op->uid, uid, err);
     if (st == ATLAS_OK) {
-        st = build_op(ctx, repo, in, op, err);
+        st = build_op(ctx, repo, uid, in, op, err);
     }
     if (st != ATLAS_OK) {
         atlas_decision_op_free(op);
@@ -1695,4 +1724,126 @@ atlas_status atlas_service_decision_export_markdown(const atlas_decision_documen
                   "**not** identify a person, does not prove a person was present, and is not a "
                   "signature. Any process running as the same local user could have produced it.\n");
     return ATLAS_OK;
+}
+
+/* --- adding a relation to a decision that already exists --------------------
+ *
+ * A revision is immutable and its links are covered by the content hash, so a
+ * link added later is necessarily a **new revision** — there is no in-place
+ * edit and there must not be one, because every prior approval's hash is a
+ * claim about bytes that would otherwise change underneath it. This is
+ * therefore `revise` with the document's own current content carried forward
+ * and one more link, and the consequence is stated rather than hidden: the
+ * revision number increments and the content hash changes. The status does not
+ * move and no prose is altered.
+ *
+ * Idempotent by reading first: a target already related in the head revision is
+ * a no-op that reports the existing revision, so an automated caller that
+ * retries produces one relation and not a chain of revisions. That is what
+ * makes it safe to run from a loop.
+ *
+ * This is not an operator operation. It writes a proposal exactly as `propose`
+ * and `revise` do, through the same authority path, and adds no capability.
+ */
+atlas_status atlas_service_decision_link_add(atlas_ctx *ctx, const char *repo, const char *uid,
+                                             const char *target_uid,
+                                             atlas_decision_outcome *out, atlas_err *err) {
+    if (!atlas_decision_uid_is_valid(uid)) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "that is not a decision id; they look like atlas-dec- followed by "
+                             "32 lowercase hex characters");
+    }
+    if (!atlas_decision_uid_is_valid(target_uid)) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "that is not a decision id; they look like atlas-dec- followed by "
+                             "32 lowercase hex characters");
+    }
+    if (strcmp(uid, target_uid) == 0) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "a decision cannot relate to itself (%s)", uid);
+    }
+
+    atlas_decision_document doc;
+    atlas_decision_document_init(&doc);
+    atlas_status st = ctx != NULL ? atlas_service_decision_show(ctx, repo, uid, 0, &doc, err)
+                                  : atlas_service_decision_show_remote(repo, uid, 0, &doc, err);
+    if (st != ATLAS_OK) {
+        atlas_decision_document_free(&doc);
+        return st;
+    }
+
+    /* Already there: report the revision that holds it and write nothing. */
+    for (size_t i = 0; i < doc.link_count; i++) {
+        if (strcmp(atlas_buf_cstr(&doc.links[i].kind), "relates_to") == 0 &&
+            strcmp(atlas_buf_cstr(&doc.links[i].value), target_uid) == 0) {
+            st = atlas_buf_set_str(&out->repo, repo, err);
+            if (st == ATLAS_OK) {
+                st = atlas_buf_set_str(&out->uid, uid, err);
+            }
+            out->revision_no = doc.summary.revision_no;
+            out->duplicate = true;
+            atlas_decision_document_free(&doc);
+            return st;
+        }
+    }
+
+    /* Carry every link the head revision holds, so a new revision loses none of
+     * them, and append the new relation. The other kinds are rebuilt from their
+     * stored values; a symbol link's snapshot is retaken by `build_op`, which
+     * is the same thing `revise` does for any other reason. */
+    const char *paths[ATLAS_DECISION_MAX_LINKS];
+    const char *commits[ATLAS_DECISION_MAX_LINKS];
+    const char *symbols[ATLAS_DECISION_MAX_LINKS];
+    const char *relations[ATLAS_DECISION_MAX_LINKS];
+    size_t np = 0, nc = 0, ns = 0, nr = 0;
+    for (size_t i = 0; i < doc.link_count; i++) {
+        const char *k = atlas_buf_cstr(&doc.links[i].kind);
+        const char *v = atlas_buf_cstr(&doc.links[i].value);
+        if (strcmp(k, "path") == 0 && np < ATLAS_DECISION_MAX_LINKS) {
+            paths[np++] = v;
+        } else if (strcmp(k, "commit") == 0 && nc < ATLAS_DECISION_MAX_LINKS) {
+            commits[nc++] = v;
+        } else if (strcmp(k, "symbol") == 0 && ns < ATLAS_DECISION_MAX_LINKS) {
+            symbols[ns++] = v;
+        } else if (strcmp(k, "relates_to") == 0 && nr < ATLAS_DECISION_MAX_LINKS) {
+            relations[nr++] = v;
+        }
+        /* `supersedes` and `replaced_by` are written by the lifecycle, never
+         * carried forward by a proposal: reproducing one here would assert a
+         * transition nobody performed. */
+    }
+    if (nr >= ATLAS_DECISION_MAX_LINKS) {
+        atlas_decision_document_free(&doc);
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "at most %d decision relations",
+                             ATLAS_DECISION_MAX_LINKS);
+    }
+    relations[nr++] = target_uid;
+
+    const char *alts[ATLAS_DECISION_MAX_ALTERNATIVES];
+    for (size_t i = 0; i < doc.alternative_count; i++) {
+        alts[i] = atlas_buf_cstr(&doc.alternatives[i]);
+    }
+
+    atlas_decision_input in;
+    memset(&in, 0, sizeof in);
+    in.title = atlas_buf_cstr(&doc.summary.title);
+    in.context_text = doc.context_text.len > 0 ? atlas_buf_cstr(&doc.context_text) : NULL;
+    in.decision_text = atlas_buf_cstr(&doc.decision_text);
+    in.rationale_text = doc.rationale_text.len > 0 ? atlas_buf_cstr(&doc.rationale_text) : NULL;
+    in.consequences_text =
+        doc.consequences_text.len > 0 ? atlas_buf_cstr(&doc.consequences_text) : NULL;
+    in.scope = doc.scope.len > 0 ? atlas_buf_cstr(&doc.scope) : NULL;
+    in.alternatives = alts;
+    in.alternative_count = doc.alternative_count;
+    in.paths = paths;
+    in.path_count = np;
+    in.commits = commits;
+    in.commit_count = nc;
+    in.symbols = symbols;
+    in.symbol_count = ns;
+    in.decision_links = relations;
+    in.decision_link_count = nr;
+
+    st = atlas_service_decision_revise(ctx, repo, uid, &in, out, err);
+    atlas_decision_document_free(&doc);
+    return st;
 }

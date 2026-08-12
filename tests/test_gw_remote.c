@@ -27,6 +27,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <pthread.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include "atlas/gateway.h"
 #include "atlas_test.h"
@@ -583,6 +588,141 @@ static void test_the_audit_trail_records_what_happened(void) {
     env_close(&e);
 }
 
+/* --- the listener ----------------------------------------------------------
+ *
+ * Everything above drives `atlas_gateway_serve_bytes` directly, which is where
+ * all the behaviour is. This one proves the socket loop around it actually
+ * binds, accepts, reads a request off the wire and writes a response back — the
+ * part that cannot be tested by handing it bytes.
+ */
+
+typedef struct listener {
+    atlas_gateway *g;
+    volatile bool stop;
+    pthread_t thread;
+} listener;
+
+static void *listener_main(void *ud) {
+    listener *l = (listener *)ud;
+    atlas_err err;
+    atlas_err_init(&err);
+    (void)atlas_gateway_serve(l->g, &l->stop, &err);
+    return NULL;
+}
+
+/* Sends one raw request to a listening gateway and returns the raw response. */
+static bool wire_request(int port, const char *request, atlas_buf *out) {
+    atlas_err err;
+    atlas_err_init(&err);
+    atlas_buf_reset(out);
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return false;
+    }
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_port = htons((uint16_t)port);
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(fd, (struct sockaddr *)&a, sizeof a) != 0) {
+        (void)close(fd);
+        return false;
+    }
+    size_t len = strlen(request);
+    if (send(fd, request, len, 0) != (ssize_t)len) {
+        (void)close(fd);
+        return false;
+    }
+    for (;;) {
+        char chunk[4096];
+        ssize_t n = recv(fd, chunk, sizeof chunk, 0);
+        if (n <= 0) {
+            break;
+        }
+        if (atlas_buf_append(out, chunk, (size_t)n, &err) != ATLAS_OK) {
+            break;
+        }
+    }
+    (void)close(fd);
+    return out->len > 0;
+}
+
+static void test_the_listener_binds_and_serves(void) {
+    env e;
+    const char *scopes[] = {"repo:read"};
+    env_open(&e, scopes, 1);
+
+    /* A port high enough to be unprivileged and unlikely to collide. A
+     * collision makes the bind fail, which is reported rather than retried:
+     * silently moving to another port would make the test pass while measuring
+     * something else. */
+    const int port = 38787;
+    atlas_gwpolicy p;
+    char text[256];
+    (void)snprintf(text, sizeof text,
+                   "enabled = yes\ngateway_uid = 1\nremote_mcp = yes\n"
+                   "listen_addr = 127.0.0.1\nlisten_port = %d\n",
+                   port);
+    atlas_gwpolicy_parse_buffer(text, strlen(text), &p);
+    T_REQUIRE(p.state == ATLAS_GWPOLICY_ENABLED);
+
+    atlas_gateway_opts o;
+    memset(&o, 0, sizeof o);
+    o.socket_path = atlas_buf_cstr(&e.d.socket);
+    o.timeout_ms = 15000;
+
+    atlas_err err;
+    atlas_err_init(&err);
+    listener l;
+    memset(&l, 0, sizeof l);
+    l.stop = false;
+    T_OK(atlas_gateway_open(&p, &o, &l.g, &err), &err);
+    T_REQUIRE(pthread_create(&l.thread, NULL, listener_main, &l) == 0);
+
+    /* Wait for the listener rather than sleeping a guessed interval. */
+    atlas_buf resp = ATLAS_BUF_INIT;
+    bool up = false;
+    for (int i = 0; i < 200 && !up; i++) {
+        up = wire_request(port, "GET /healthz HTTP/1.1\r\nHost: t\r\n\r\n", &resp);
+        if (!up) {
+            struct timespec ts = {0, 20 * 1000 * 1000};
+            (void)nanosleep(&ts, NULL);
+        }
+    }
+    T_CHECK_MSG(up, "the gateway never accepted a connection on port %d", port);
+    if (up) {
+        T_CHECK(strstr(atlas_buf_cstr(&resp), "HTTP/1.1 200") != NULL);
+        T_CHECK(strstr(atlas_buf_cstr(&resp), "\"ok\":true") != NULL);
+
+        /* An authenticated tool call, over a real socket. */
+        char req[1024];
+        static const char BODY[] =
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}";
+        (void)snprintf(req, sizeof req,
+                       "POST /mcp HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer %s\r\n"
+                       "Content-Type: application/json\r\nContent-Length: %zu\r\n\r\n%s",
+                       e.token, sizeof BODY - 1u, BODY);
+        T_CHECK(wire_request(port, req, &resp));
+        T_CHECK_MSG(strstr(atlas_buf_cstr(&resp), "HTTP/1.1 200") != NULL,
+                    "the wire request was refused: %s", atlas_buf_cstr(&resp));
+        T_CHECK(strstr(atlas_buf_cstr(&resp), "atlas_repo_overview") != NULL);
+
+        /* And an unauthenticated one over the same socket. */
+        T_CHECK(wire_request(port,
+                             "POST /mcp HTTP/1.1\r\nHost: t\r\nContent-Length: 2\r\n\r\n{}",
+                             &resp));
+        T_CHECK(strstr(atlas_buf_cstr(&resp), "HTTP/1.1 401") != NULL);
+        T_CHECK(strstr(atlas_buf_cstr(&resp), "WWW-Authenticate: Bearer") != NULL);
+    }
+
+    l.stop = true;
+    (void)pthread_join(l.thread, NULL);
+    atlas_gateway_close(l.g);
+    atlas_buf_free(&resp);
+    env_close(&e);
+}
+
 static const atlas_test TESTS[] = {
     {"a scoped credential can call a tool", test_a_scoped_credential_can_call_a_tool},
     {"a tool outside the scopes is refused and hidden",
@@ -596,6 +736,7 @@ static const atlas_test TESTS[] = {
      test_the_gateway_holds_no_credential_administration_verb},
     {"the transport refuses what it should", test_the_transport_refuses_what_it_should},
     {"the audit trail records what happened", test_the_audit_trail_records_what_happened},
+    {"the listener binds and serves", test_the_listener_binds_and_serves},
 };
 
 ATLAS_TEST_MAIN("gw_remote", TESTS)

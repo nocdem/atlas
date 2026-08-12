@@ -607,3 +607,412 @@ atlas_status atlas_gateway_serve_bytes(atlas_gateway *g, const char *request, si
     atlas_http_request_free(&req);
     return st;
 }
+
+/* --- the listener ----------------------------------------------------------
+ *
+ * One thread per connection, capped by the policy. A connection beyond the
+ * ceiling is answered 503 and closed rather than queued: A8-CI's rule about
+ * deterministic refusal, because a queued connection that eventually times out
+ * is a slow failure nobody can tell from a hang.
+ *
+ * Every read carries a deadline, so a peer that stops mid-request costs one
+ * slot for a bounded time rather than forever — which is the whole of the
+ * slow-loris defence, together with the ceiling.
+ */
+
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <poll.h>
+#include <pthread.h>
+#include <signal.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+/* Binds the policy's address and port.
+ *
+ * `AI_NUMERICHOST` is not optional: it means the address is parsed and never
+ * resolved. A gateway that performed a DNS lookup to decide what to bind would
+ * take its listening address from whatever answered, which is not what an
+ * operator wrote down. */
+static atlas_status gw_listen(atlas_gateway *g, int *fd_out, atlas_err *err) {
+    *fd_out = -1;
+    char port[16];
+    (void)snprintf(port, sizeof port, "%d", g->policy.listen_port);
+
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_NUMERICHOST | AI_NUMERICSERV | AI_PASSIVE;
+
+    struct addrinfo *res = NULL;
+    int rc = getaddrinfo(g->policy.listen_addr, port, &hints, &res);
+    if (rc != 0 || res == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_CONFIG,
+                             "the gateway cannot bind \"%s\": it is not a numeric address",
+                             g->policy.listen_addr);
+    }
+
+    int fd = socket(res->ai_family, res->ai_socktype | SOCK_CLOEXEC, res->ai_protocol);
+    if (fd < 0) {
+        int e = errno;
+        freeaddrinfo(res);
+        return atlas_err_set_errno(err, ATLAS_ERR_CONFIG, e, "cannot create the gateway socket");
+    }
+    int one = 1;
+    (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    if (res->ai_family == AF_INET6) {
+        /* v6-only, so binding `::1` cannot silently also accept IPv4 traffic on
+         * a dual-stack kernel. An operator who wrote a loopback address must not
+         * get a wider listener than they asked for. */
+        (void)setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof one);
+    }
+    if (bind(fd, res->ai_addr, res->ai_addrlen) != 0) {
+        int e = errno;
+        freeaddrinfo(res);
+        (void)close(fd);
+        return atlas_err_set_errno(err, ATLAS_ERR_CONFIG, e, "cannot bind %s port %d",
+                                   g->policy.listen_addr, g->policy.listen_port);
+    }
+    freeaddrinfo(res);
+    if (listen(fd, 64) != 0) {
+        int e = errno;
+        (void)close(fd);
+        return atlas_err_set_errno(err, ATLAS_ERR_CONFIG, e, "cannot listen on port %d",
+                                   g->policy.listen_port);
+    }
+    *fd_out = fd;
+    return ATLAS_OK;
+}
+
+/* Reads with a deadline. Returns false on close, error or timeout. */
+static bool read_deadline(int fd, void *buf, size_t cap, int timeout_ms, ssize_t *got) {
+    struct pollfd p = {fd, POLLIN, 0};
+    int rc = poll(&p, 1, timeout_ms);
+    if (rc <= 0) {
+        return false;
+    }
+    *got = recv(fd, buf, cap, 0);
+    return *got > 0;
+}
+
+static bool write_all(int fd, const char *data, size_t len, int timeout_ms) {
+    size_t sent = 0;
+    while (sent < len) {
+        struct pollfd p = {fd, POLLOUT, 0};
+        if (poll(&p, 1, timeout_ms) <= 0) {
+            return false;
+        }
+        ssize_t n = send(fd, data + sent, len - sent, MSG_NOSIGNAL);
+        if (n <= 0) {
+            return false;
+        }
+        sent += (size_t)n;
+    }
+    return true;
+}
+
+typedef struct conn_job {
+    atlas_gateway *g;
+    int fd;
+} conn_job;
+
+/* Live connection count, so the ceiling is enforced across threads. */
+static pthread_mutex_t gw_conn_lock = PTHREAD_MUTEX_INITIALIZER;
+static long long gw_conn_live = 0;
+
+static void serve_one(atlas_gateway *g, int fd) {
+    atlas_buf req = ATLAS_BUF_INIT;
+    atlas_buf resp = ATLAS_BUF_INIT;
+    atlas_err err;
+    atlas_err_init(&err);
+
+    /* Read the head. Bounded twice: by the header ceiling and by the deadline,
+     * so neither a peer that sends a byte a second nor one that sends megabytes
+     * of headers can hold this slot. */
+    size_t head_end = 0;
+    bool ok = true;
+    for (;;) {
+        head_end = atlas_http_head_complete(req.data != NULL ? req.data : "", req.len);
+        if (head_end > 0) {
+            break;
+        }
+        if (req.len >= ATLAS_GW_MAX_HEADER_BYTES) {
+            ok = false;
+            break;
+        }
+        char chunk[4096];
+        ssize_t got = 0;
+        if (!read_deadline(fd, chunk, sizeof chunk, ATLAS_GW_HEADER_TIMEOUT_MS, &got)) {
+            ok = false;
+            break;
+        }
+        if (atlas_buf_append(&req, chunk, (size_t)got, &err) != ATLAS_OK) {
+            ok = false;
+            break;
+        }
+    }
+
+    if (ok) {
+        /* Parse just enough to learn the declared body length. The full parse
+         * happens inside `atlas_gateway_serve_bytes`, which is the one place
+         * routing decisions are made. */
+        atlas_http_request peek;
+        atlas_err perr;
+        atlas_err_init(&perr);
+        int64_t want = 0;
+        if (atlas_http_parse_head(req.data, req.len, g->policy.max_request_bytes, &peek, &perr) ==
+            ATLAS_OK) {
+            want = peek.content_length;
+        }
+        atlas_http_request_free(&peek);
+
+        while (ok && (int64_t)(req.len - head_end) < want) {
+            char chunk[8192];
+            ssize_t got = 0;
+            if (!read_deadline(fd, chunk, sizeof chunk, ATLAS_GW_BODY_TIMEOUT_MS, &got)) {
+                ok = false;
+                break;
+            }
+            if (atlas_buf_append(&req, chunk, (size_t)got, &err) != ATLAS_OK) {
+                ok = false;
+            }
+            if (req.len > ATLAS_GW_MAX_HEADER_BYTES + (size_t)g->policy.max_request_bytes) {
+                ok = false;
+            }
+        }
+    }
+
+    if (ok) {
+        if (atlas_gateway_serve_bytes(g, req.data, req.len, &resp, &err) == ATLAS_OK) {
+            (void)write_all(fd, resp.data, resp.len, ATLAS_GW_IDLE_TIMEOUT_MS);
+        }
+    } else {
+        /* A truncated, over-long or timed-out request still gets an answer
+         * rather than a silent close: a client that is merely slow deserves to
+         * be told, and a scanner learns nothing from 400 that it did not know
+         * from connecting. */
+        static const char BAD[] =
+            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 52\r\n"
+            "Connection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n"
+            "\r\n{\"ok\":false,\"error\":{\"code\":\"bad_request\"}}\n";
+        (void)write_all(fd, BAD, sizeof BAD - 1u, 2000);
+    }
+
+    atlas_buf_free(&resp);
+    atlas_buf_free(&req);
+    (void)close(fd);
+}
+
+static void *conn_thread(void *ud) {
+    conn_job *j = (conn_job *)ud;
+    serve_one(j->g, j->fd);
+    (void)pthread_mutex_lock(&gw_conn_lock);
+    gw_conn_live--;
+    (void)pthread_mutex_unlock(&gw_conn_lock);
+    free(j);
+    return NULL;
+}
+
+atlas_status atlas_gateway_serve(atlas_gateway *g, volatile bool *stop, atlas_err *err) {
+    int lfd = -1;
+    atlas_status st = gw_listen(g, &lfd, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    /* A peer that disconnects mid-write must not kill the process. */
+    (void)signal(SIGPIPE, SIG_IGN);
+
+    gw_log(g, "listening on %s port %d (remote_mcp=%s web_gui=%s tls=%s)", g->policy.listen_addr,
+           g->policy.listen_port, g->policy.remote_mcp ? "yes" : "no",
+           g->policy.web_gui ? "yes" : "no", atlas_gwpolicy_tls_name(g->policy.tls_mode));
+
+    while (!*stop) {
+        struct pollfd p = {lfd, POLLIN, 0};
+        int rc = poll(&p, 1, 500);
+        if (rc <= 0) {
+            continue;
+        }
+        int cfd = accept4(lfd, NULL, NULL, SOCK_CLOEXEC);
+        if (cfd < 0) {
+            continue;
+        }
+
+        bool over = false;
+        (void)pthread_mutex_lock(&gw_conn_lock);
+        if (gw_conn_live >= g->policy.max_concurrent) {
+            over = true;
+        } else {
+            gw_conn_live++;
+        }
+        (void)pthread_mutex_unlock(&gw_conn_lock);
+
+        if (over) {
+            /* Refused deterministically and told so, rather than queued. */
+            static const char BUSY[] =
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\n"
+                "Content-Length: 55\r\nConnection: close\r\nRetry-After: 1\r\n"
+                "Cache-Control: no-store\r\n\r\n"
+                "{\"ok\":false,\"error\":{\"code\":\"too_many_connections\"}}";
+            (void)write_all(cfd, BUSY, sizeof BUSY - 1u, 1000);
+            (void)close(cfd);
+            continue;
+        }
+
+        conn_job *j = calloc(1, sizeof(*j));
+        if (j == NULL) {
+            (void)pthread_mutex_lock(&gw_conn_lock);
+            gw_conn_live--;
+            (void)pthread_mutex_unlock(&gw_conn_lock);
+            (void)close(cfd);
+            continue;
+        }
+        j->g = g;
+        j->fd = cfd;
+        pthread_t t;
+        if (pthread_create(&t, NULL, conn_thread, j) != 0) {
+            (void)pthread_mutex_lock(&gw_conn_lock);
+            gw_conn_live--;
+            (void)pthread_mutex_unlock(&gw_conn_lock);
+            (void)close(cfd);
+            free(j);
+            continue;
+        }
+        /* Detached: nothing joins these, and a connection that finishes must
+         * not wait for the accept loop to notice. */
+        (void)pthread_detach(t);
+    }
+
+    (void)close(lfd);
+    gw_log(g, "%s", "stopped");
+    return ATLAS_OK;
+}
+
+/* --- the commands ---------------------------------------------------------- */
+
+static volatile bool gw_stop_flag = false;
+
+static void gw_on_signal(int sig) {
+    (void)sig;
+    gw_stop_flag = true;
+}
+
+atlas_status atlas_service_gateway_run(atlas_err *err) {
+    atlas_gwpolicy p;
+    atlas_gwpolicy_load(&p);
+    if (p.state != ATLAS_GWPOLICY_ENABLED) {
+        /* Refused with the reason and with what would change it. A gateway that
+         * declined to start and said only "disabled" would send an operator
+         * looking in the wrong place. */
+        return atlas_err_set(err, ATLAS_ERR_CONFIG,
+                             "the Atlas gateway is not enabled: %s (%s). The policy is %s",
+                             atlas_gwpolicy_reason_name(p.reason),
+                             atlas_gwpolicy_reason_detail(p.reason), ATLAS_GWPOLICY_PATH);
+    }
+
+    atlas_gateway_opts o;
+    memset(&o, 0, sizeof o);
+    o.errout = stderr;
+    atlas_gateway *g = NULL;
+    atlas_status st = atlas_gateway_open(&p, &o, &g, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = gw_on_signal;
+    (void)sigaction(SIGTERM, &sa, NULL);
+    (void)sigaction(SIGINT, &sa, NULL);
+
+    gw_stop_flag = false;
+    st = atlas_gateway_serve(g, &gw_stop_flag, err);
+    atlas_gateway_close(g);
+    return st;
+}
+
+atlas_status atlas_service_gateway_status(FILE *out, bool json, atlas_err *err) {
+    atlas_gwpolicy p;
+    atlas_gwpolicy_load(&p);
+
+    if (json) {
+        atlas_json *j = atlas_json_new(out, err);
+        if (j == NULL) {
+            return err->status;
+        }
+        atlas_status st = atlas_json_obj_begin(j, err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "state", atlas_gwpolicy_state_name(p.state), err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "reason", atlas_gwpolicy_reason_name(p.reason), err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "detail", atlas_gwpolicy_reason_detail(p.reason), err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "policy_path", ATLAS_GWPOLICY_PATH, err);
+        }
+        if (st == ATLAS_OK && p.state == ATLAS_GWPOLICY_ENABLED) {
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_str(j, "listen_addr", p.listen_addr, err);
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_int(j, "listen_port", p.listen_port, err);
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_str(j, "tls_mode", atlas_gwpolicy_tls_name(p.tls_mode), err);
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_bool(j, "remote_mcp", p.remote_mcp, err);
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_bool(j, "web_gui", p.web_gui, err);
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_int(j, "gateway_uid", p.gateway_uid, err);
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_int(j, "allowed_origins", (int64_t)p.origin_count, err);
+            }
+        }
+        /* Stated as a field rather than left to a reader's assumption, exactly
+         * as the backup report states `encrypted` and `signed`. */
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_bool(j, "terminates_tls", false, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_obj_end(j, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_finish(j, err);
+        } else {
+            atlas_json_free(j);
+        }
+        return st;
+    }
+
+    (void)fprintf(out, "gateway: %s\n", atlas_gwpolicy_state_name(p.state));
+    (void)fprintf(out, "reason:  %s\n", atlas_gwpolicy_reason_name(p.reason));
+    (void)fprintf(out, "         %s\n", atlas_gwpolicy_reason_detail(p.reason));
+    (void)fprintf(out, "policy:  %s\n", ATLAS_GWPOLICY_PATH);
+    if (p.detail[0] != '\0') {
+        (void)fprintf(out, "at:      %s\n", p.detail);
+    }
+    if (p.state == ATLAS_GWPOLICY_ENABLED) {
+        (void)fprintf(out, "listen:  %s port %d\n", p.listen_addr, p.listen_port);
+        (void)fprintf(out, "tls:     %s (Atlas terminates no TLS)\n",
+                      atlas_gwpolicy_tls_name(p.tls_mode));
+        (void)fprintf(out, "surface: remote_mcp=%s web_gui=%s\n", p.remote_mcp ? "yes" : "no",
+                      p.web_gui ? "yes" : "no");
+        (void)fprintf(out, "uid:     %lld\n", p.gateway_uid);
+        (void)fprintf(out, "origins: %zu allowed\n", p.origin_count);
+        if (p.public_url[0] != '\0') {
+            (void)fprintf(out, "url:     %s/mcp\n", p.public_url);
+        }
+    }
+    return ATLAS_OK;
+}

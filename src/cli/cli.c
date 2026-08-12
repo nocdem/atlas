@@ -14,6 +14,7 @@
 #include "atlas/atlas.h"
 #include "atlas/authority.h"
 #include "atlas/backup.h"
+#include "atlas/gateway.h"
 #include "atlas/daemon.h"
 #include "atlas/hook.h"
 #include "atlas/integrate.h"
@@ -117,6 +118,8 @@ void atlas_cli_print_help(FILE *out) {
         "  api-key list               credential metadata; never a secret\n"
         "  api-key revoke KEY-ID      stops working immediately; the record stays\n"
         "  api-key rotate KEY-ID --label L --scope S   mint a replacement, revoke the old\n"
+        "  gateway status             what the root-owned gateway policy says; binds nothing\n"
+        "  gateway run                serve remote MCP; Atlas terminates no TLS\n"
         "  service print              print the systemd user unit; changes nothing\n"
         "  service install --user     write the unit; never enables or starts it\n"
         "  service uninstall --user   remove the unit Atlas wrote\n"
@@ -1871,7 +1874,7 @@ static bool is_a_command(const char *cmd) {
         "doctor",  "repo",    "scan",      "status",  "search",  "file",     "history",
         "diff",    "daemon",  "sync",      "events",  "code",    "decision", "gate",
         "job",     "dispatcher", "backup", "maintenance", "service", "mcp",  "hook",
-        "integrate", "version", "help", "context", "operation", "api-key",
+        "integrate", "version", "help", "context", "operation", "api-key", "gateway",
     };
     for (size_t i = 0; i < sizeof COMMANDS / sizeof COMMANDS[0]; i++) {
         if (strcmp(cmd, COMMANDS[i]) == 0) {
@@ -2820,6 +2823,22 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
      * which is neither the operator uid nor a dispatcher uid, so even the
      * operator-gated methods answer `unknown method` to it. Remote credential
      * administration is absent in A9 rather than refused. */
+    /* A9. The gateway runs as its own process and its own account. Dispatched
+     * here, before any `atlas_ctx` is opened, because it opens no index at all:
+     * every answer it gives comes over the daemon socket. */
+    if (strcmp(cmd, "gateway") == 0) {
+        if (st->operand_count != 1u) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE, "usage: atlas gateway run|status");
+        }
+        if (strcmp(st->operands[0], "run") == 0) {
+            return atlas_service_gateway_run(err);
+        }
+        if (strcmp(st->operands[0], "status") == 0) {
+            return atlas_service_gateway_status(st->out, st->opts.json, err);
+        }
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "usage: atlas gateway run|status");
+    }
+
     if (strcmp(cmd, "api-key") == 0) {
         if (st->operand_count == 0) {
             return atlas_err_set(err, ATLAS_ERR_USAGE,

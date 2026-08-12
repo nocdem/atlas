@@ -24,6 +24,8 @@
 #include "atlas/atlas.h"
 #include "atlas/datadir.h"
 #include "atlas/gw.h"
+#include "atlas/ipc.h"
+#include "atlas/json.h"
 #include "atlas/lock.h"
 
 void atlas_apikey_created_free(atlas_apikey_created *c) {
@@ -367,4 +369,206 @@ atlas_status atlas_service_apikey_list(const char *data_dir_override, atlas_apik
     }
     close_local(&data_dir, lk, db);
     return st;
+}
+
+/* --- the socket path ------------------------------------------------------
+ *
+ * When a daemon owns this data directory it holds the writer lock, so the local
+ * path above cannot take it — and under A7.1 the operator cannot open the index
+ * at all. Both cases are answered by asking the daemon, over the operator-gated
+ * methods in `src/ipc/server_apikey.c`.
+ *
+ * The CLI chooses between the two exactly as `route_to_daemon()` does for every
+ * other write: the daemon must own *this* directory, or the command runs
+ * locally and takes that directory's own lock. */
+
+static atlas_status call_daemon(const char *method, const char *params, atlas_ipc_response **out,
+                                atlas_err *err) {
+    *out = NULL;
+    atlas_buf sock = ATLAS_BUF_INIT;
+    atlas_status st = atlas_ipc_socket_path(&sock, err);
+    atlas_buf resp = ATLAS_BUF_INIT;
+    if (st == ATLAS_OK) {
+        st = atlas_ipc_call(atlas_buf_cstr(&sock), method, params, &resp, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_ipc_response_parse(resp.data, resp.len, out, err);
+    }
+    if (st == ATLAS_OK && !atlas_ipc_response_ok(*out)) {
+        st = atlas_err_set(err, atlas_ipc_response_status(*out), "%s",
+                           atlas_ipc_response_message(*out));
+        atlas_ipc_response_free(*out);
+        *out = NULL;
+    }
+    atlas_buf_free(&resp);
+    atlas_buf_free(&sock);
+    return st;
+}
+
+atlas_status atlas_service_apikey_create_remote(const atlas_apikey_create_opts *opts,
+                                                atlas_apikey_created *out, atlas_err *err) {
+    memset(out, 0, sizeof(*out));
+    atlas_buf scopes = ATLAS_BUF_INIT;
+    atlas_status st = atlas_apikey_scopes_render(opts->scopes, &scopes, err);
+    atlas_buf params = ATLAS_BUF_INIT;
+    if (st == ATLAS_OK) {
+        atlas_ipc_params *p = NULL;
+        atlas_json *j = NULL;
+        st = atlas_ipc_params_begin(&p, &j, err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "label", opts->label != NULL ? opts->label : "", err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "scopes", atlas_buf_cstr(&scopes), err);
+        }
+        if (st == ATLAS_OK && opts->rotate_from != NULL && opts->rotate_from[0] != '\0') {
+            st = atlas_json_key_str(j, "rotate_from", opts->rotate_from, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_ipc_params_finish(p, &params, err);
+        } else {
+            atlas_ipc_params_abort(p);
+        }
+    }
+    atlas_ipc_response *r = NULL;
+    if (st == ATLAS_OK) {
+        st = call_daemon("apikey.create", atlas_buf_cstr(&params), &r, err);
+    }
+    if (st == ATLAS_OK) {
+        const char *v = NULL;
+        if (atlas_ipc_result_obj_str(r, "api_key", "id", &v) && v != NULL) {
+            (void)snprintf(out->key_id, sizeof out->key_id, "%s", v);
+        }
+        if (atlas_ipc_result_obj_str(r, "api_key", "label", &v) && v != NULL) {
+            (void)snprintf(out->label, sizeof out->label, "%s", v);
+        }
+        if (atlas_ipc_result_obj_str(r, "api_key", "scopes", &v) && v != NULL) {
+            (void)snprintf(out->scopes, sizeof out->scopes, "%s", v);
+        }
+        if (atlas_ipc_result_obj_str(r, "api_key", "created_at", &v) && v != NULL) {
+            (void)snprintf(out->created_at, sizeof out->created_at, "%s", v);
+        }
+        if (atlas_ipc_result_obj_str(r, "api_key", "rotated_from", &v) && v != NULL) {
+            (void)snprintf(out->rotated_from, sizeof out->rotated_from, "%s", v);
+        }
+        bool b = false;
+        if (atlas_ipc_result_obj_bool(r, "api_key", "previous_revoked", &b)) {
+            out->previous_revoked = b;
+        }
+        if (atlas_ipc_result_obj_str(r, "api_key", "secret", &v) && v != NULL) {
+            (void)snprintf(out->token, sizeof out->token, "%s", v);
+        }
+        if (out->token[0] == '\0') {
+            /* A create that produced no plaintext is a create the operator
+             * cannot use, and reporting success would leave them with a
+             * credential nobody holds. */
+            st = atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                               "the daemon created a credential but returned no secret");
+        }
+    }
+    atlas_ipc_response_free(r);
+    atlas_buf_free(&params);
+    atlas_buf_free(&scopes);
+    if (st != ATLAS_OK) {
+        atlas_apikey_created_free(out);
+    }
+    return st;
+}
+
+atlas_status atlas_service_apikey_revoke_remote(const char *key_id, bool *changed,
+                                                atlas_err *err) {
+    *changed = false;
+    atlas_buf params = ATLAS_BUF_INIT;
+    atlas_ipc_params *p = NULL;
+    atlas_json *j = NULL;
+    atlas_status st = atlas_ipc_params_begin(&p, &j, err);
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(j, "key_id", key_id, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_ipc_params_finish(p, &params, err);
+    } else {
+        atlas_ipc_params_abort(p);
+    }
+    atlas_ipc_response *r = NULL;
+    if (st == ATLAS_OK) {
+        st = call_daemon("apikey.revoke", atlas_buf_cstr(&params), &r, err);
+    }
+    if (st == ATLAS_OK) {
+        bool b = false;
+        if (atlas_ipc_result_bool(r, "changed", &b)) {
+            *changed = b;
+        }
+    }
+    atlas_ipc_response_free(r);
+    atlas_buf_free(&params);
+    return st;
+}
+
+typedef struct listing_build {
+    atlas_apikey_listing *out;
+    size_t cap;
+} listing_build;
+
+atlas_status atlas_service_apikey_list_remote(atlas_apikey_listing *out, atlas_err *err) {
+    atlas_apikey_listing_free(out);
+    atlas_ipc_response *r = NULL;
+    atlas_status st = call_daemon("apikey.list", "{}", &r, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    size_t n = 0;
+    (void)atlas_ipc_result_arr_len(r, "api_keys", &n);
+    if (n > 0) {
+        out->keys = calloc(n, sizeof(*out->keys));
+        if (out->keys == NULL) {
+            atlas_ipc_response_free(r);
+            return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory listing credentials");
+        }
+    }
+    for (size_t i = 0; i < n; i++) {
+        atlas_apikey_record *k = &out->keys[out->count];
+        memset(k, 0, sizeof(*k));
+        const char *v = NULL;
+        if (atlas_ipc_result_arr_obj_str(r, "api_keys", i, "id", &v) && v != NULL) {
+            (void)snprintf(k->key_id, sizeof k->key_id, "%s", v);
+        }
+        if (atlas_ipc_result_arr_obj_str(r, "api_keys", i, "label", &v) && v != NULL) {
+            (void)snprintf(k->label, sizeof k->label, "%s", v);
+        }
+        if (atlas_ipc_result_arr_obj_str(r, "api_keys", i, "scopes", &v) && v != NULL) {
+            (void)snprintf(k->scopes, sizeof k->scopes, "%s", v);
+        }
+        if (atlas_ipc_result_arr_obj_str(r, "api_keys", i, "status", &v) && v != NULL) {
+            k->status = atlas_apikey_status_parse(v);
+        }
+        if (atlas_ipc_result_arr_obj_str(r, "api_keys", i, "created_at", &v) && v != NULL) {
+            (void)snprintf(k->created_at, sizeof k->created_at, "%s", v);
+        }
+        if (atlas_ipc_result_arr_obj_str(r, "api_keys", i, "revoked_at", &v) && v != NULL) {
+            (void)snprintf(k->revoked_at, sizeof k->revoked_at, "%s", v);
+        }
+        if (atlas_ipc_result_arr_obj_str(r, "api_keys", i, "last_used_at", &v) && v != NULL) {
+            (void)snprintf(k->last_used_at, sizeof k->last_used_at, "%s", v);
+        }
+        if (atlas_ipc_result_arr_obj_str(r, "api_keys", i, "rotated_from", &v) && v != NULL) {
+            (void)snprintf(k->rotated_from, sizeof k->rotated_from, "%s", v);
+        }
+        if (atlas_ipc_result_arr_obj_str(r, "api_keys", i, "rotated_to", &v) && v != NULL) {
+            (void)snprintf(k->rotated_to, sizeof k->rotated_to, "%s", v);
+        }
+        bool b = false;
+        if (atlas_ipc_result_arr_obj_bool(r, "api_keys", i, "scopes_unreadable", &b)) {
+            k->scopes_unreadable = b;
+        }
+        atlas_err serr;
+        atlas_err_init(&serr);
+        if (atlas_apikey_scopes_parse(k->scopes, &k->mask, &serr) != ATLAS_OK) {
+            k->mask = 0u;
+            k->scopes_unreadable = true;
+        }
+        out->count++;
+    }
+    atlas_ipc_response_free(r);
+    return ATLAS_OK;
 }

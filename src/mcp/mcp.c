@@ -449,6 +449,15 @@ static void roots_fallback(atlas_mcp_server *s) {
     if (s->root_count > 0) {
         return;
     }
+    /* Never over HTTP. `CLAUDE_PROJECT_DIR` describes the environment of a
+     * process a *local* client spawned; the gateway's own environment says
+     * nothing about a remote caller, and letting it choose a default repository
+     * would make "whichever directory the gateway happens to have been started
+     * in" an authorization input. A remote caller names a repository explicitly,
+     * or gets the one registered repository when there is exactly one. */
+    if (s->remote) {
+        return;
+    }
     roots_add(s, getenv("CLAUDE_PROJECT_DIR"));
 }
 
@@ -853,6 +862,12 @@ static atlas_status handle_initialize(atlas_mcp_server *s, const atlas_mcp_id *i
 
 typedef struct list_payload {
     const atlas_mcp_id *id;
+    /* A9. The listing is filtered by what the credential may call, so a remote
+     * client is shown the tools it can actually use. This is a convenience for
+     * the client and never the control: a caller that names a hidden tool
+     * directly is refused by the check in `atlas_mcp_call_tool`. NULL for the
+     * ping reply, which lists nothing. */
+    const atlas_mcp_server *server;
 } list_payload;
 
 static atlas_status build_tools_list(atlas_json *j, void *ud, atlas_err *err) {
@@ -871,7 +886,7 @@ static atlas_status build_tools_list(atlas_json *j, void *ud, atlas_err *err) {
         st = atlas_json_obj_begin(j, err);
     }
     if (st == ATLAS_OK) {
-        st = atlas_mcp_write_tool_list(j, err);
+        st = atlas_mcp_write_tool_list(j, p->server, err);
     }
     if (st == ATLAS_OK) {
         st = atlas_json_obj_end(j, err);
@@ -967,14 +982,22 @@ static atlas_status dispatch(atlas_mcp_server *s, const atlas_jsonv *root, atlas
     } else if (strcmp(method, "notifications/initialized") == 0) {
         s->initialized = true;
         /* Roots are requested only now: the specification says a server should
-         * send nothing but pings and logging before this notification. */
-        request_roots(s);
+         * send nothing but pings and logging before this notification.
+         *
+         * Never over HTTP. `roots/list` is a server-to-client *request*, and a
+         * stateless transport has no client to send one to — the response would
+         * arrive, if ever, on some other connection. */
+        if (!s->remote) {
+            request_roots(s);
+        }
     } else if (strcmp(method, "notifications/roots/list_changed") == 0) {
         /* The granted set changed. Everything cached about it is discarded
          * rather than merged: a root that was revoked must stop authorizing
          * anything immediately. */
         roots_clear(s);
-        request_roots(s);
+        if (!s->remote) {
+            request_roots(s);
+        }
     } else if (strcmp(method, "notifications/cancelled") == 0) {
         /* Nothing to cancel: every request this server handles completes within
          * one bounded daemon call before the next message is read. */
@@ -983,13 +1006,19 @@ static atlas_status dispatch(atlas_mcp_server *s, const atlas_jsonv *root, atlas
         atlas_mcp_log(s, "ignoring an unhandled notification");
     } else if (strcmp(method, "ping") == 0) {
         /* Answerable before initialization, as the specification requires. */
-        list_payload p = {&id};
+        list_payload p = {&id, s};
         st = atlas_mcp_emit(s, build_empty_result, &p, err);
-    } else if (!s->got_initialize) {
+    } else if (!s->got_initialize && !s->remote) {
+        /* Over stdio the handshake is a real precondition: the connection is
+         * long-lived and a client that skipped `initialize` has a bug worth
+         * reporting. Over HTTP each POST is answered on its own, so requiring a
+         * previous request to have happened on the same connection would refuse
+         * a correctly behaving client for a reason that is an artefact of the
+         * transport. */
         st = atlas_mcp_send_error(s, &id, ATLAS_MCP_INVALID_REQUEST,
                                   "the session has not been initialized", err);
     } else if (strcmp(method, "tools/list") == 0) {
-        list_payload p = {&id};
+        list_payload p = {&id, s};
         st = atlas_mcp_emit(s, build_tools_list, &p, err);
     } else if (strcmp(method, "tools/call") == 0) {
         const char *name = atlas_jsonv_str_member(params, "name");
@@ -1124,33 +1153,87 @@ static void bind_session(atlas_mcp_server *s) {
     }
 }
 
-atlas_status atlas_mcp_run(FILE *in, FILE *out, FILE *errout, const atlas_mcp_opts *opts,
-                           atlas_err *err) {
-    atlas_mcp_server s;
-    memset(&s, 0, sizeof(s));
-    s.in = in;
-    s.out = out;
-    s.errout = errout;
-    s.next_outgoing_id = -1;
-    atlas_buf_init(&s.socket);
-    atlas_buf_init(&s.protocol);
-    atlas_buf_init(&s.session_key);
-    atlas_safe_pool_init(&s.safe);
-    s.timeout_ms = (opts != NULL && opts->timeout_ms > 0) ? opts->timeout_ms
-                                                          : ATLAS_MCP_IPC_TIMEOUT_MS;
+/* --- lifecycle, shared with the A9 HTTP transport ------------------------- */
+
+void atlas_mcp_server_init(atlas_mcp_server *s, FILE *in, FILE *out, FILE *errout,
+                           const atlas_mcp_opts *opts) {
+    memset(s, 0, sizeof(*s));
+    s->in = in;
+    s->out = out;
+    s->errout = errout;
+    s->next_outgoing_id = -1;
+    atlas_buf_init(&s->socket);
+    atlas_buf_init(&s->protocol);
+    atlas_buf_init(&s->session_key);
+    atlas_safe_pool_init(&s->safe);
+    s->timeout_ms = (opts != NULL && opts->timeout_ms > 0) ? opts->timeout_ms
+                                                           : ATLAS_MCP_IPC_TIMEOUT_MS;
 
     atlas_err serr;
     atlas_err_init(&serr);
-    bind_session(&s);
+    /* The session binding is a stdio concept: it comes from the environment of
+     * the process a client spawned. A9's transport sets `remote` before calling
+     * this, so nothing is bound and every write — of which there are none a
+     * remote credential can reach — would be recorded sessionless. */
+    if (!s->remote) {
+        bind_session(s);
+    }
     if (opts != NULL && opts->socket_path != NULL) {
-        (void)atlas_buf_set_str(&s.socket, opts->socket_path, &serr);
-    } else if (atlas_ipc_socket_path(&s.socket, &serr) != ATLAS_OK) {
+        (void)atlas_buf_set_str(&s->socket, opts->socket_path, &serr);
+    } else if (atlas_ipc_socket_path(&s->socket, &serr) != ATLAS_OK) {
         /* Not fatal. The server starts, answers, and reports every tool call as
          * degraded — which is more useful than refusing to start, because a
          * client that cannot start its MCP server shows an error the user has to
          * act on before they can work. */
-        atlas_mcp_log(&s, "no Atlas socket: %s", atlas_safe(&s.safe, atlas_err_msg(&serr)));
+        atlas_mcp_log(s, "no Atlas socket: %s", atlas_safe(&s->safe, atlas_err_msg(&serr)));
     }
+}
+
+void atlas_mcp_server_teardown(atlas_mcp_server *s) {
+    roots_clear(s);
+    atlas_safe_pool_free(&s->safe);
+    atlas_buf_free(&s->session_key);
+    atlas_buf_free(&s->protocol);
+    atlas_buf_free(&s->socket);
+}
+
+/* One document in, one response out. The stdio loop and the HTTP transport both
+ * come through here, so the two cannot answer the same message differently. */
+atlas_status atlas_mcp_handle_document(atlas_mcp_server *s, const char *bytes, size_t len,
+                                       atlas_err *err) {
+    atlas_jsondoc *doc = NULL;
+    atlas_err perr;
+    atlas_err_init(&perr);
+    if (atlas_jsondoc_parse(bytes, len, ATLAS_MCP_MAX_MESSAGE_BYTES, ATLAS_IPC_MAX_JSON_DEPTH,
+                            &doc, &perr) != ATLAS_OK) {
+        atlas_mcp_id none;
+        atlas_mcp_id_init(&none);
+        atlas_status st = atlas_mcp_send_error(s, &none, ATLAS_MCP_PARSE_ERROR,
+                                               atlas_err_msg(&perr), err);
+        atlas_mcp_id_free(&none);
+        return st;
+    }
+    if (!atlas_jsonv_is_obj(atlas_jsondoc_root(doc))) {
+        /* A batch (a top-level array) is not accepted. The 2025-06-18 revision
+         * removed batching, and answering one would be inventing behaviour
+         * rather than implementing it. */
+        atlas_mcp_id none;
+        atlas_mcp_id_init(&none);
+        atlas_status st = atlas_mcp_send_error(s, &none, ATLAS_MCP_INVALID_REQUEST,
+                                               "a message must be a single JSON-RPC object", err);
+        atlas_mcp_id_free(&none);
+        atlas_jsondoc_free(doc);
+        return st;
+    }
+    atlas_status st = dispatch(s, atlas_jsondoc_root(doc), err);
+    atlas_jsondoc_free(doc);
+    return st;
+}
+
+atlas_status atlas_mcp_run(FILE *in, FILE *out, FILE *errout, const atlas_mcp_opts *opts,
+                           atlas_err *err) {
+    atlas_mcp_server s;
+    atlas_mcp_server_init(&s, in, out, errout, opts);
 
     atlas_buf line = ATLAS_BUF_INIT;
     atlas_status st = ATLAS_OK;
@@ -1172,29 +1255,7 @@ atlas_status atlas_mcp_run(FILE *in, FILE *out, FILE *errout, const atlas_mcp_op
             }
         }
         if (line.len > 0 && !overlong) {
-            atlas_jsondoc *doc = NULL;
-            atlas_err perr;
-            atlas_err_init(&perr);
-            if (atlas_jsondoc_parse(line.data, line.len, ATLAS_MCP_MAX_MESSAGE_BYTES,
-                                    ATLAS_IPC_MAX_JSON_DEPTH, &doc, &perr) != ATLAS_OK) {
-                atlas_mcp_id none;
-                atlas_mcp_id_init(&none);
-                st = atlas_mcp_send_error(&s, &none, ATLAS_MCP_PARSE_ERROR,
-                                          atlas_err_msg(&perr), err);
-                atlas_mcp_id_free(&none);
-            } else if (!atlas_jsonv_is_obj(atlas_jsondoc_root(doc))) {
-                /* A batch (a top-level array) is not accepted. The 2025-06-18
-                 * revision removed batching, and answering one would be
-                 * inventing behaviour rather than implementing it. */
-                atlas_mcp_id none;
-                atlas_mcp_id_init(&none);
-                st = atlas_mcp_send_error(&s, &none, ATLAS_MCP_INVALID_REQUEST,
-                                          "a message must be a single JSON-RPC object", err);
-                atlas_mcp_id_free(&none);
-            } else {
-                st = dispatch(&s, atlas_jsondoc_root(doc), err);
-            }
-            atlas_jsondoc_free(doc);
+            st = atlas_mcp_handle_document(&s, line.data, line.len, err);
             if (st != ATLAS_OK) {
                 break;
             }
@@ -1205,10 +1266,6 @@ atlas_status atlas_mcp_run(FILE *in, FILE *out, FILE *errout, const atlas_mcp_op
     }
 
     atlas_buf_free(&line);
-    roots_clear(&s);
-    atlas_safe_pool_free(&s.safe);
-    atlas_buf_free(&s.session_key);
-    atlas_buf_free(&s.protocol);
-    atlas_buf_free(&s.socket);
+    atlas_mcp_server_teardown(&s);
     return st;
 }

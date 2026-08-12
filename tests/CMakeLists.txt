@@ -146,6 +146,9 @@ set(ATLAS_TESTS
   # a verdict out. No socket, no daemon, no repository -- except the one case
   # that writes a policy file to prove a user-writable one is refused.
   test_gateway
+  # Remote MCP end to end: HTTP bytes in, HTTP bytes out, against a live
+  # fixture daemon with real credentials. No listening port is opened.
+  test_gw_remote
 )
 
 foreach(test_name IN LISTS ATLAS_TESTS)
@@ -184,6 +187,7 @@ set_tests_properties(test_code_lex PROPERTIES LABELS "unit")
 set_tests_properties(test_hmac PROPERTIES LABELS "unit")
 set_tests_properties(test_apikey PROPERTIES LABELS "integration")
 set_tests_properties(test_gateway PROPERTIES LABELS "unit")
+set_tests_properties(test_gw_remote PROPERTIES LABELS "daemon" TIMEOUT 900 RUN_SERIAL TRUE)
 
 # A4. The content hash, the transition table and validation are pure functions —
 # bytes in, a digest or a verdict out — so this suite needs no repository, no

@@ -214,6 +214,18 @@ atlas_status atlas_daemon_run(const atlas_daemon_opts *opts, FILE *log, atlas_er
         memset(&orchpolicy, 0, sizeof(orchpolicy));
     }
 
+    /* A9. Loaded here for the reason the other two are, and gated the same way:
+     * a per-user daemon serving somebody's own index is not a system deployment
+     * and must not consult a machine-wide policy to decide who may reach a
+     * privileged method group. A zeroed policy leaves `gateway_uid` at zero,
+     * and zero matches no peer, so the `gateway.` group is offered to nobody. */
+    atlas_gwpolicy gwpolicy;
+    if (serving_system_index) {
+        atlas_gwpolicy_load(&gwpolicy);
+    } else {
+        memset(&gwpolicy, 0, sizeof(gwpolicy));
+    }
+
     st = atlas_watcher_start(atlas_buf_cstr(&db_path), writer, log,
                              orchpolicy.state == ATLAS_ORCHPOLICY_ENABLED,
                              opts->reconcile_interval_ms, &watcher, err);
@@ -244,6 +256,7 @@ atlas_status atlas_daemon_run(const atlas_daemon_opts *opts, FILE *log, atlas_er
     sctx.ops = ops;
     sctx.log = log;
     sctx.syspolicy = syspolicy;
+    sctx.gwpolicy = gwpolicy;
     /* A8. Loaded once, here, for the reason the system policy is loaded once:
      * the set of principals, repositories, modes and drivers orchestration runs
      * under must not change under a running serve loop. A machine with no

@@ -20,6 +20,8 @@
 #include "atlas/maintenance.h"
 #include "atlas/ops.h"
 #include "atlas/orch_ops.h"
+#include "atlas/gw.h"
+#include "atlas/gwpolicy.h"
 #include "atlas/orchpolicy.h"
 #include "atlas/snapshot.h"
 #include "atlas/syspolicy.h"
@@ -90,8 +92,54 @@ typedef enum atlas_job_kind {
     /* The one bounded delete. It writes, so it happens on this thread; the
      * caller waits, because a prune of an events table is fast and bounded per
      * batch — unlike an index, which is why that one polls instead. */
-    ATLAS_JOB_MAINTENANCE
+    ATLAS_JOB_MAINTENANCE,
+    /* A9. One gateway audit row, and the credential touch that goes with it.
+     *
+     * Fire-and-forget: the caller queues it and returns without waiting. A9.6
+     * requires that a failure to write the audit trail must not break request
+     * handling, and the way that is guaranteed here is that the request path
+     * never learns the outcome. Atlas prefers answering with a gap in the trail
+     * to refusing a request because it could not write one; the trade is stated
+     * in `docs/remote-access.md` rather than left to be discovered.
+     *
+     * The job owns the entry and frees it, so nothing points at a caller's
+     * stack after the queue accepts it. */
+    ATLAS_JOB_GW_AUDIT,
+    /* A9. One credential operation: create, rotate or revoke.
+     *
+     * It writes, so it happens on the writer thread like every other write, and
+     * the caller waits — a credential operation is a handful of statements and
+     * an operator is standing there.
+     *
+     * It exists at all because revocation must not require stopping the daemon.
+     * The local path takes the data-directory writer lock, which the daemon
+     * holds while it is running, so on any machine with a live daemon `atlas
+     * api-key revoke` could not have worked — and "stop the service to revoke a
+     * leaked credential" is not an answer. */
+    ATLAS_JOB_APIKEY
 } atlas_job_kind;
+
+/* One credential operation, as the writer thread receives it. */
+typedef enum atlas_apikey_job_kind {
+    ATLAS_APIKEY_JOB_CREATE = 0,
+    ATLAS_APIKEY_JOB_REVOKE
+} atlas_apikey_job_kind;
+
+typedef struct atlas_apikey_job {
+    atlas_apikey_job_kind kind;
+    /* create/rotate */
+    char label[ATLAS_APIKEY_LABEL_MAX + 1];
+    atlas_scope_mask scopes;
+    char rotate_from[ATLAS_APIKEY_SELECTOR_HEX + 1];
+    /* revoke */
+    char key_id[ATLAS_APIKEY_SELECTOR_HEX + 1];
+} atlas_apikey_job;
+
+typedef struct atlas_apikey_job_result {
+    /* Holds the one copy of a freshly minted plaintext. The caller wipes it. */
+    atlas_apikey_created created;
+    bool changed;
+} atlas_apikey_job_result;
 
 typedef struct atlas_job atlas_job;
 
@@ -141,6 +189,15 @@ struct atlas_job {
      * Both are owned by the caller, which waits for `done`. */
     const atlas_maintenance_opts *maint;
     atlas_maintenance_report *maint_out;
+
+    /* A9. Owned by the job and freed with it — the caller does not wait, so a
+     * pointer to its stack would dangle the moment it returned. */
+    atlas_gw_audit_entry *gw_audit;
+
+    /* A9. The credential operation, and where the writer puts the result. Both
+     * belong to a caller that waits, like the maintenance pair above. */
+    const atlas_apikey_job *apikey;
+    atlas_apikey_job_result *apikey_out;
 
     /* A2. The job owns the operation and frees it. The result is typed for the
      * same reason the fields above are: a JSON fragment carried through here
@@ -201,6 +258,18 @@ atlas_status atlas_writer_submit_reconcile(atlas_writer *w, int64_t repo_id, boo
  * once. The outcome is recorded in the operations table under `op_id`; nothing
  * blocks on it here, which is what keeps the caller's answer immediate. */
 /* Runs one bounded prune on the writer thread and waits for it. */
+/* A9. Queues one gateway audit row and returns immediately.
+ *
+ * The caller never waits and never learns the outcome, which is what makes
+ * "audit failure does not break request handling" structural rather than
+ * something every call site has to remember. The entry is copied. */
+atlas_status atlas_writer_gw_audit(atlas_writer *w, const atlas_gw_audit_entry *entry,
+                                   atlas_err *err);
+
+/* A9. One credential operation, on the writer thread, with the caller waiting. */
+atlas_status atlas_writer_apikey(atlas_writer *w, const atlas_apikey_job *op,
+                                 atlas_apikey_job_result *out, atlas_err *err);
+
 atlas_status atlas_writer_maintenance(atlas_writer *w, const atlas_maintenance_opts *opts,
                                       atlas_maintenance_report *out, atlas_err *err);
 
@@ -316,6 +385,13 @@ typedef struct atlas_server_ctx {
      * restart and an operator can reason about when. A disabled policy — the
      * zeroed default — leaves every orchestration method refusing. */
     atlas_orchpolicy orchpolicy;
+    /* A9. Loaded once at startup, for the reason the other two are: the uid the
+     * daemon will recognise as the gateway cannot change under a running serve
+     * loop, so a policy edit takes effect on restart and an operator can reason
+     * about when. A disabled policy — the zeroed default — leaves `gateway_uid`
+     * at zero, and zero matches no peer, so the `gateway.` group is offered to
+     * nobody. */
+    atlas_gwpolicy gwpolicy;
 } atlas_server_ctx;
 
 /* Serves until `stop` becomes true. `listen_fd` is owned by the caller. */

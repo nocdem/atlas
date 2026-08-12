@@ -276,6 +276,23 @@ atlas_status atlas_service_apikey_revoke(const char *data_dir_override, const ch
 atlas_status atlas_service_apikey_list(const char *data_dir_override, atlas_apikey_listing *out,
                                        atlas_err *err);
 
+/* The same three operations, over the socket, for when a daemon owns this data
+ * directory.
+ *
+ * A running daemon holds the writer lock, so the local path cannot take it; and
+ * under A7.1 the operator cannot open the index at all. Without these,
+ * revocation would require stopping the service — which is not an answer to a
+ * leaked credential. The CLI chooses between local and remote exactly as
+ * `route_to_daemon()` does for every other write.
+ *
+ * The methods behind these are in the **operator** group, gated on the uid the
+ * root-owned authority policy names. No remote client and no gateway can reach
+ * them. */
+atlas_status atlas_service_apikey_create_remote(const atlas_apikey_create_opts *opts,
+                                                atlas_apikey_created *out, atlas_err *err);
+atlas_status atlas_service_apikey_revoke_remote(const char *key_id, bool *changed, atlas_err *err);
+atlas_status atlas_service_apikey_list_remote(atlas_apikey_listing *out, atlas_err *err);
+
 /* Validates a key id as an operator may type it.
  *
  * Accepts the bare selector and the `key_` display prefix, so the id printed by

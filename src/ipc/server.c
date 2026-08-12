@@ -1012,6 +1012,36 @@ atlas_status atlas_server_dispatch(atlas_server_ctx *ctx, const void *payload, s
                 }
             }
         }
+
+    }
+    /* A9's credential methods. Dispatchable by name; each one asks
+     * `atlas_server_peer_may_administer_credentials` for itself and answers
+     * `unknown method` when the answer is no. Consulted here rather than inside
+     * the operator block because the gate is not the same one: see
+     * src/ipc/server_apikey.c. */
+    if (fn == NULL) {
+        size_t n = 0;
+        const atlas_method_entry *k = atlas_server_apikey_methods(&n);
+        for (size_t i = 0; i < n; i++) {
+            if (strcmp(atlas_ipc_request_method(req), k[i].name) == 0) {
+                fn = k[i].fn;
+                break;
+            }
+        }
+    }
+    /* A9. The gateway group, offered only to the uid a root-owned gateway
+     * policy names, and consulted additively like the orchestration and
+     * operator groups. A daemon with no gateway policy has `gateway_uid` at
+     * zero, and zero matches no peer, so this group is offered to nobody. */
+    if (fn == NULL && atlas_server_peer_is_gateway(ctx, (long long)peer_uid)) {
+        size_t n = 0;
+        const atlas_method_entry *g = atlas_server_gateway_methods(&n);
+        for (size_t i = 0; i < n; i++) {
+            if (strcmp(atlas_ipc_request_method(req), g[i].name) == 0) {
+                fn = g[i].fn;
+                break;
+            }
+        }
     }
     if (fn == NULL &&
         atlas_orchpolicy_is_any_dispatcher(&ctx->orchpolicy, (long long)peer_uid)) {

@@ -9,6 +9,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 
+#include "atlas/apikey.h"
 #include "atlas/buf.h"
 #include "atlas/error.h"
 #include "atlas/ipc.h"
@@ -125,7 +126,48 @@ typedef struct atlas_mcp_server {
     /* Ids for requests the server sends to the client. Negative so they cannot
      * collide with a client's own ids under any plausible numbering scheme. */
     int64_t next_outgoing_id;
+
+    /* --- A9: driven over HTTP rather than over stdio ----------------------
+     *
+     * The tool implementations are shared with the stdio adapter exactly as
+     * they are — same `TOOLS[]`, same `run` functions, same forwarding to the
+     * daemon. What differs is the transport and three things that only make
+     * sense with a long-lived stdio peer:
+     *
+     *   - **No roots request.** `roots/list` is a server-to-client request, and
+     *     over stateless HTTP there is no client to ask. Authorization comes
+     *     from scopes plus the registered-repository whitelist, which is where
+     *     it always came from; roots only ever chose a *default*.
+     *   - **No session binding.** There is no CLAUDE_CODE_SESSION_ID, so a
+     *     remote write would be sessionless anyway — and no A9 credential can
+     *     hold a write scope, so none is reachable.
+     *   - **No initialize handshake required.** Each POST is answered on its
+     *     own, because a stateless transport cannot rely on a previous request
+     *     having happened on the same connection.
+     *
+     * A remote server with no roots resolves a default repository only when
+     * exactly one is registered; anything else is a typed refusal rather than a
+     * guess about which repository was meant. */
+    bool remote;
+    /* What the authenticated credential may read. Zero grants nothing, which is
+     * what an unauthenticated or unscoped principal gets — and the stdio
+     * adapter leaves it zero *and* leaves `remote` false, so the check is
+     * skipped entirely there. A2's local trust boundary is unchanged. */
+    atlas_scope_mask granted;
 } atlas_mcp_server;
+
+/* Sets a server up without running a loop, so a non-stdio transport can drive
+ * one message at a time. `atlas_mcp_run` uses these too, so there is one
+ * lifecycle rather than two. */
+void atlas_mcp_server_init(atlas_mcp_server *s, FILE *in, FILE *out, FILE *errout,
+                           const atlas_mcp_opts *opts);
+void atlas_mcp_server_teardown(atlas_mcp_server *s);
+
+/* Parses and dispatches exactly one JSON-RPC document, writing whatever the
+ * response is to `s->out`. Shared by the stdio loop and the HTTP transport, so
+ * the two cannot answer the same message differently. */
+atlas_status atlas_mcp_handle_document(atlas_mcp_server *s, const char *bytes, size_t len,
+                                       atlas_err *err);
 
 /* --- transport ------------------------------------------------------------ */
 
@@ -168,7 +210,14 @@ atlas_ipc_response *atlas_mcp_call(atlas_mcp_server *s, const char *method, cons
 /* --- tools ---------------------------------------------------------------- */
 
 /* Writes the `tools` array of a tools/list result. */
-atlas_status atlas_mcp_write_tool_list(atlas_json *j, atlas_err *err);
+/* Writes the tool listing.
+ *
+ * `s` may be NULL, which lists everything — that is the stdio case, where the
+ * whole surface is available. A remote server lists only the tools its
+ * credential's scopes permit. Filtering is a convenience for the client; the
+ * authorisation is the check in `atlas_mcp_call_tool`, which a caller naming a
+ * hidden tool directly still meets. */
+atlas_status atlas_mcp_write_tool_list(atlas_json *j, const atlas_mcp_server *s, atlas_err *err);
 
 /* Handles one tools/call. Always sends exactly one response. */
 atlas_status atlas_mcp_call_tool(atlas_mcp_server *s, const atlas_mcp_id *id, const char *name,

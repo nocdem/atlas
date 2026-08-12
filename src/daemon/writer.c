@@ -121,6 +121,7 @@ static void job_free(atlas_job *j) {
         free(j->orch);
     }
     atlas_orch_result_free(&j->orch_result);
+    free(j->gw_audit);
     free(j);
 }
 
@@ -596,6 +597,59 @@ static void *writer_main(void *arg) {
              * result has nowhere to go. */
             if (j->maint != NULL && j->maint_out != NULL) {
                 j->result = atlas_maintenance_on(w->db, j->maint, j->maint_out, &j->result_err);
+            }
+            break;
+        }
+        case ATLAS_JOB_APIKEY: {
+            /* Both pointers belong to a caller that may have stopped waiting;
+             * cleared under the lock in that case, so a NULL here means the
+             * result has nowhere to go — and in particular means a freshly
+             * minted plaintext is never written into a struct nobody owns. */
+            if (j->apikey != NULL && j->apikey_out != NULL) {
+                if (j->apikey->kind == ATLAS_APIKEY_JOB_REVOKE) {
+                    j->result = atlas_apikey_revoke_on(w->db, j->apikey->key_id,
+                                                       &j->apikey_out->changed, &j->result_err);
+                } else {
+                    atlas_apikey_create_opts co;
+                    memset(&co, 0, sizeof co);
+                    co.label = j->apikey->label;
+                    co.scopes = j->apikey->scopes;
+                    co.rotate_from = j->apikey->rotate_from[0] != '\0' ? j->apikey->rotate_from
+                                                                      : NULL;
+                    j->result = atlas_apikey_create_on(w->db, &co, &j->apikey_out->created,
+                                                       &j->result_err);
+                }
+            }
+            break;
+        }
+        case ATLAS_JOB_GW_AUDIT: {
+            /* Nobody is waiting, so a failure is logged and dropped rather than
+             * reported: the request this describes has already been answered,
+             * and failing it retroactively is not something Atlas can do.
+             *
+             * The credential touch rides along because the gateway audits every
+             * request anyway, which makes `last_used_at` free rather than a
+             * second round trip on the path of every authenticated read. It is
+             * throttled in SQL, so two gateway processes cannot each decide it
+             * is their turn. */
+            if (j->gw_audit != NULL) {
+                atlas_err aerr;
+                atlas_err_init(&aerr);
+                if (atlas_db_gw_audit_append(w->db, j->gw_audit, &aerr) != ATLAS_OK) {
+                    /* Logged and dropped. The request this row describes has
+                     * already been answered, and failing it retroactively is
+                     * not something Atlas can do. */
+                    atlas_safe_pool safe;
+                    atlas_safe_pool_init(&safe);
+                    atlas_daemon_log(w->log, "warn", "gateway audit row not written: %s",
+                                     atlas_safe(&safe, atlas_err_msg(&aerr)));
+                    atlas_safe_pool_free(&safe);
+                }
+                if (j->gw_audit->key_id[0] != '\0') {
+                    atlas_err terr;
+                    atlas_err_init(&terr);
+                    (void)atlas_db_apikey_touch(w->db, j->gw_audit->key_id, &terr);
+                }
             }
             break;
         }
@@ -1421,6 +1475,107 @@ atlas_status atlas_writer_maintenance(atlas_writer *w, const atlas_maintenance_o
     if (!done) {
         return atlas_err_set(err, ATLAS_ERR_INTERNAL,
                              "the Atlas daemon did not complete the prune within 300 s");
+    }
+    if (st != ATLAS_OK) {
+        *err = jerr;
+    }
+    return st;
+}
+
+/* --- A9: the gateway audit trail ------------------------------------------
+ *
+ * Queued and forgotten. The caller does not wait, does not learn the outcome,
+ * and cannot fail because of it — A9.6's requirement that audit failure must
+ * not break request handling, made structural rather than handled. The entry is
+ * copied into the job, so nothing points at the caller's stack once this
+ * returns.
+ *
+ * A full queue drops the row and says so in the log. That is the honest
+ * behaviour: the alternative is blocking a request path on the writer, which
+ * would turn a busy index into a stalled gateway. */
+atlas_status atlas_writer_gw_audit(atlas_writer *w, const atlas_gw_audit_entry *entry,
+                                   atlas_err *err) {
+    atlas_job *j = job_new(ATLAS_JOB_GW_AUDIT);
+    if (j == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory queueing an audit row");
+    }
+    j->gw_audit = malloc(sizeof(*j->gw_audit));
+    if (j->gw_audit == NULL) {
+        job_free(j);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory queueing an audit row");
+    }
+    *j->gw_audit = *entry;
+    j->wants_result = false;
+
+    (void)pthread_mutex_lock(&w->lock);
+    if (w->stopping || !queue_push(w, j)) {
+        bool stopping = w->stopping;
+        (void)pthread_mutex_unlock(&w->lock);
+        job_free(j);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                             stopping ? "the Atlas daemon is shutting down"
+                                      : "the Atlas daemon's write queue is full");
+    }
+    (void)pthread_cond_signal(&w->not_empty);
+    (void)pthread_mutex_unlock(&w->lock);
+    return ATLAS_OK;
+}
+
+
+/* --- A9: credential operations on the writer thread ------------------------
+ *
+ * The caller waits. A credential operation is a handful of statements, and an
+ * operator is standing at a terminal — polling would add a mechanism to
+ * something that does not need one.
+ *
+ * This exists so revocation does not require stopping the daemon. The local
+ * path takes the data-directory writer lock, which a running daemon holds, so
+ * without this `atlas api-key revoke` would fail on exactly the machines where
+ * revoking matters most. */
+atlas_status atlas_writer_apikey(atlas_writer *w, const atlas_apikey_job *op,
+                                 atlas_apikey_job_result *out, atlas_err *err) {
+    atlas_job *j = job_new(ATLAS_JOB_APIKEY);
+    if (j == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory queueing a credential change");
+    }
+    j->apikey = op;
+    j->apikey_out = out;
+    j->wants_result = true;
+
+    (void)pthread_mutex_lock(&w->lock);
+    if (w->stopping || !queue_push(w, j)) {
+        bool stopping = w->stopping;
+        (void)pthread_mutex_unlock(&w->lock);
+        job_free(j);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                             stopping ? "the Atlas daemon is shutting down"
+                                      : "the Atlas daemon's write queue is full");
+    }
+    (void)pthread_cond_signal(&w->not_empty);
+
+    struct timespec deadline;
+    (void)clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += 60;
+    int rc = 0;
+    while (!j->done && rc == 0) {
+        rc = pthread_cond_timedwait(&w->job_done, &w->lock, &deadline);
+    }
+    bool done = j->done;
+    atlas_status st = j->result;
+    atlas_err jerr = j->result_err;
+    if (!done) {
+        /* Detached rather than freed: the job is still the writer's. Clearing
+         * the pointers is what stops it writing a plaintext into a result
+         * struct whose owner has gone. */
+        j->wants_result = false;
+        j->apikey = NULL;
+        j->apikey_out = NULL;
+    }
+    (void)pthread_mutex_unlock(&w->lock);
+
+    if (!done) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                             "the Atlas daemon did not complete the credential change within 60 s");
     }
     if (st != ATLAS_OK) {
         *err = jerr;

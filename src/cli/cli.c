@@ -2569,6 +2569,35 @@ static bool index_is_foreign(const cli_state *st) {
     return foreign;
 }
 
+/* Whether a credential operation has to go over the socket.
+ *
+ * Two independent reasons, and either alone is enough:
+ *
+ *   - **The index is foreign.** Under A7.1 it is 0700 `atlasd` and this account
+ *     cannot open it at all.
+ *   - **A daemon owns this directory.** It holds the writer lock, so the local
+ *     path cannot take it — and telling an operator to stop the service in
+ *     order to revoke a leaked credential is not an answer.
+ *
+ * The second is why this is not simply `index_is_foreign`. On an ordinary
+ * single-user machine with the daemon running, the index is perfectly readable
+ * and the lock is still held, which is the common case rather than an exotic
+ * one. */
+static bool apikey_needs_daemon(const cli_state *st) {
+    if (index_is_foreign(st)) {
+        return true;
+    }
+    atlas_buf dir = ATLAS_BUF_INIT;
+    atlas_err rerr;
+    atlas_err_init(&rerr);
+    bool owns = false;
+    if (atlas_datadir_resolve(st->opts.data_dir, &dir, NULL, &rerr) == ATLAS_OK) {
+        owns = atlas_ipc_daemon_owns(atlas_buf_cstr(&dir));
+    }
+    atlas_buf_free(&dir);
+    return owns;
+}
+
 static atlas_status run_command(cli_state *st, atlas_err *err) {
     const char *cmd = st->command;
     atlas_renderer r;
@@ -2858,7 +2887,13 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
 
             atlas_apikey_created created;
             memset(&created, 0, sizeof created);
-            ks = atlas_service_apikey_create(st->opts.data_dir, &co, &created, err);
+            /* Routed to the daemon when it owns this index: it holds the
+             * writer lock, and under A7.1 this account cannot open the index at
+             * all. The methods behind it are operator-gated, so this is the
+             * operator's own uid asking, never a remote client. */
+            ks = apikey_needs_daemon(st)
+                     ? atlas_service_apikey_create_remote(&co, &created, err)
+                     : atlas_service_apikey_create(st->opts.data_dir, &co, &created, err);
             if (ks == ATLAS_OK) {
                 ks = renderer_open(&r, st->opts.json, st->out, "api-key", err);
                 if (ks == ATLAS_OK) {
@@ -2877,7 +2912,8 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
             }
             atlas_apikey_listing l;
             atlas_apikey_listing_init(&l);
-            ks = atlas_service_apikey_list(st->opts.data_dir, &l, err);
+            ks = apikey_needs_daemon(st) ? atlas_service_apikey_list_remote(&l, err)
+                                         : atlas_service_apikey_list(st->opts.data_dir, &l, err);
             if (ks == ATLAS_OK) {
                 ks = renderer_open(&r, st->opts.json, st->out, "api-key", err);
                 if (ks == ATLAS_OK) {
@@ -2900,7 +2936,10 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
                                      (unsigned)ATLAS_APIKEY_SELECTOR_HEX);
             }
             bool changed = false;
-            ks = atlas_service_apikey_revoke(st->opts.data_dir, id, &changed, err);
+            /* Revocation must never require stopping the daemon. */
+            ks = apikey_needs_daemon(st)
+                     ? atlas_service_apikey_revoke_remote(id, &changed, err)
+                     : atlas_service_apikey_revoke(st->opts.data_dir, id, &changed, err);
             if (ks == ATLAS_OK) {
                 ks = renderer_open(&r, st->opts.json, st->out, "api-key", err);
                 if (ks == ATLAS_OK) {

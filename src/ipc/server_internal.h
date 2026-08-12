@@ -127,4 +127,30 @@ bool atlas_server_peer_is_operator(long long peer_uid);
  * form, because replacing the record should require stopping the daemon. */
 const atlas_method_entry *atlas_server_backup_methods(size_t *count_out);
 
+/* A9. The three questions the gateway may ask, in a group offered only to the
+ * peer whose `SO_PEERCRED` uid equals the `gateway_uid` a root-owned policy
+ * names. Disjoint from every other group and hidden the same way the dispatcher
+ * group is: a name the peer does not hold answers `unknown method`, which is
+ * what a name that does not exist gets.
+ *
+ * The gateway is neither an operator nor a dispatcher, so this group confers no
+ * authority over the record Atlas protects. It cannot approve a decision,
+ * change the registry, read a backup, run a job or build an index — and it holds
+ * no credential-administration verb at all, because remote credential
+ * administration does not exist in A9 rather than being refused. */
+/* A9. Credential administration, in the **operator** group beside
+ * `decision.approve` and `backup.create` — not in the gateway group, and not
+ * reachable by any remote client. See src/ipc/server_apikey.c for why the local
+ * CLI path alone was not enough: a running daemon holds the writer lock, so
+ * revocation would have required stopping the service. */
+const atlas_method_entry *atlas_server_apikey_methods(size_t *count_out);
+/* The gate for that group. See src/ipc/server_apikey.c for why it is not simply
+ * `atlas_server_peer_is_operator`: on an unseparated machine the daemon's own
+ * uid owns the index outright, and refusing it there would relocate the verb,
+ * protect nothing, and break revocation on every machine with a live daemon. */
+bool atlas_server_peer_may_administer_credentials(dispatch_state *ds);
+
+const atlas_method_entry *atlas_server_gateway_methods(size_t *count_out);
+bool atlas_server_peer_is_gateway(const atlas_server_ctx *ctx, long long peer_uid);
+
 #endif /* ATLAS_IPC_SERVER_INTERNAL_H */

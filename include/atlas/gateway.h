@@ -42,6 +42,7 @@
 #ifndef ATLAS_GATEWAY_H
 #define ATLAS_GATEWAY_H
 
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -97,7 +98,12 @@ atlas_status atlas_gateway_serve_bytes(atlas_gateway *g, const char *request, si
  *
  * Reads carry deadlines, so a peer that stops mid-request costs one slot for a
  * bounded time rather than forever. */
-atlas_status atlas_gateway_serve(atlas_gateway *g, volatile bool *stop, atlas_err *err);
+/* `stop` is an `atomic_bool` and not a `volatile bool`, which is the same
+ * choice `atlas_server_serve` makes and for the same reason: `volatile` orders
+ * nothing between threads and promises nothing about tearing, so a flag written
+ * by one thread and read by another is a data race however small the object.
+ * ThreadSanitizer reports it as one. */
+atlas_status atlas_gateway_serve(atlas_gateway *g, atomic_bool *stop, atlas_err *err);
 
 /* The `atlas gateway run` command. Loads the compiled-in policy, refuses to
  * start when it is disabled, and reports why. */

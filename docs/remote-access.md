@@ -396,6 +396,29 @@ sudo systemctl stop atlas-gateway
 Setting `enabled = no` in the policy prevents it starting again. Neither affects
 `atlasd`, the local socket, stdio MCP or the Claude integration.
 
+## Concurrency
+
+The gateway is one thread per connection, capped by `max_concurrent`. Three
+things are shared between those threads and each is either locked or absent:
+
+- the rate-limit window is behind a mutex — without it the limit is not merely
+  approximate, it is a data race on a counter and the bound it appears to
+  enforce is not enforced;
+- the browser session table is behind a mutex, and lookups use a constant-time
+  comparison for the reason credential verification does;
+- there is deliberately **no shared `atlas_safe_pool`**. A pool is a ring of
+  scratch buffers with a mutable cursor, so one shared between threads does not
+  merely race — it hands two threads the same slot, and a value encoded by one
+  appears in the other's log line. Every call site declares its own on the
+  stack, as every other pool in Atlas does.
+
+The stop flag is an `atomic_bool` rather than a `volatile bool`: `volatile`
+orders nothing between threads and promises nothing about tearing.
+
+`tests/test_gw_remote.c` drives six concurrent clients through a real socket,
+mixing authenticated and rejected requests so the logging and audit paths run
+together. It is worth little without ThreadSanitizer and everything with it.
+
 ## Known limitations
 
 - Atlas terminates no TLS (above).
@@ -405,3 +428,7 @@ Setting `enabled = no` in the policy prevents it starting again. Neither affects
 - `SQLite` has no per-page checksum, so A5's statement about what backup
   verification cannot detect is unchanged by A9.
 - The audit trail records that a request happened, not what it returned.
+- Rate limiting is a fixed window rather than a leaky bucket, so a burst at a
+  window boundary can briefly exceed the nominal rate.
+- Browser sessions are held in gateway memory: a restart ends every session, and
+  there is no way to enumerate or revoke one other than restarting.

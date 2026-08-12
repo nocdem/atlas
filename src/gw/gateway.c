@@ -34,9 +34,18 @@ struct atlas_gateway {
     atlas_buf socket;
     int timeout_ms;
     FILE *errout;
-    atlas_safe_pool safe;
 
-    /* A fixed-window counter. Crude on purpose: a leaky bucket per peer would
+    /* There is deliberately **no `atlas_safe_pool` here.**
+     *
+     * A pool is a ring of scratch buffers with a mutable cursor, so one shared
+     * between connection threads is a data race and, worse, hands two threads
+     * the same slot — a value encoded by one appearing in the other's log line.
+     * Every other pool in Atlas is request-scoped (dispatch_state, the
+     * renderers, the MCP server) and this one must be too: each call site
+     * declares its own on the stack. Making it absent rather than locked is
+     * what stops a later edit from reintroducing the sharing.
+     *
+     * A fixed-window counter. Crude on purpose: a leaky bucket per peer would
      * need per-peer state, and behind a reverse proxy there is only one peer
      * unless `trust_forwarded_for` is set — so the sophistication would buy
      * nothing while looking as though it did. What this bounds is the total
@@ -44,6 +53,11 @@ struct atlas_gateway {
      * the daemon. Stated as such in `docs/remote-access.md`. */
     int64_t window_started_ms;
     long long window_count;
+    /* The counters above are read-modify-written by every connection thread, so
+     * they need this. Without it the limit is not merely approximate — it is a
+     * data race on a 64-bit counter, and the bound it appears to enforce is not
+     * enforced at all. */
+    pthread_mutex_t rate_lock;
 };
 
 /* --- diagnostics ----------------------------------------------------------- */
@@ -51,10 +65,18 @@ struct atlas_gateway {
 static void gw_log(atlas_gateway *g, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
 
+/* Serialises diagnostics.
+ *
+ * `stderr` is line-buffered at best and several connection threads writing at
+ * once interleave within a line, which turns a log an operator reads under
+ * pressure into one they cannot. */
+static pthread_mutex_t gw_log_lock = PTHREAD_MUTEX_INITIALIZER;
+
 static void gw_log(atlas_gateway *g, const char *fmt, ...) {
     if (g == NULL || g->errout == NULL) {
         return;
     }
+    (void)pthread_mutex_lock(&gw_log_lock);
     char ts[ATLAS_TS_MAX];
     atlas_now_iso8601(ts, sizeof ts);
     (void)fprintf(g->errout, "%s atlas-gateway ", ts);
@@ -64,6 +86,7 @@ static void gw_log(atlas_gateway *g, const char *fmt, ...) {
     va_end(ap);
     (void)fputc('\n', g->errout);
     (void)fflush(g->errout);
+    (void)pthread_mutex_unlock(&gw_log_lock);
 }
 
 /* --- lifecycle ------------------------------------------------------------- */
@@ -83,7 +106,7 @@ atlas_status atlas_gateway_open(const atlas_gwpolicy *policy, const atlas_gatewa
      * whose bounds are not the ones an operator read. */
     g->policy = *policy;
     atlas_buf_init(&g->socket);
-    atlas_safe_pool_init(&g->safe);
+    (void)pthread_mutex_init(&g->rate_lock, NULL);
     g->timeout_ms = (opts != NULL && opts->timeout_ms > 0) ? opts->timeout_ms
                                                            : ATLAS_GW_UPSTREAM_TIMEOUT_MS;
     g->errout = opts != NULL ? opts->errout : NULL;
@@ -106,7 +129,7 @@ void atlas_gateway_close(atlas_gateway *g) {
     if (g == NULL) {
         return;
     }
-    atlas_safe_pool_free(&g->safe);
+    (void)pthread_mutex_destroy(&g->rate_lock);
     atlas_buf_free(&g->socket);
     free(g);
 }
@@ -326,8 +349,11 @@ static void authenticate(atlas_gateway *g, const atlas_http_request *req, princi
     atlas_buf_free(&params);
 
     if (cst != ATLAS_OK) {
+        atlas_safe_pool safe;
+        atlas_safe_pool_init(&safe);
         gw_log(g, "the daemon did not answer gateway.auth: %s",
-               atlas_safe(&g->safe, atlas_err_msg(&cerr)));
+               atlas_safe(&safe, atlas_err_msg(&cerr)));
+        atlas_safe_pool_free(&safe);
         atlas_buf_free(&resp);
         return;
     }
@@ -343,8 +369,11 @@ static void authenticate(atlas_gateway *g, const atlas_http_request *req, princi
              * the daemon recognises. Logged, because otherwise every request
              * fails as "unauthenticated" and an operator has nothing to read.
              * The client is still told only that authentication failed. */
+            atlas_safe_pool safe;
+            atlas_safe_pool_init(&safe);
             gw_log(g, "the daemon refused gateway.auth: %s",
-                   atlas_safe(&g->safe, atlas_ipc_response_message(r)));
+                   atlas_safe(&safe, atlas_ipc_response_message(r)));
+            atlas_safe_pool_free(&safe);
         }
         if (atlas_ipc_response_ok(r) && atlas_ipc_result_bool(r, "authenticated", &yes) && yes) {
             const char *v = NULL;
@@ -466,12 +495,15 @@ static int64_t now_ms(void) {
  * least costs an attacker a credential. */
 static bool rate_ok(atlas_gateway *g) {
     int64_t t = now_ms();
+    (void)pthread_mutex_lock(&g->rate_lock);
     if (g->window_started_ms == 0 || t - g->window_started_ms >= 60000) {
         g->window_started_ms = t;
         g->window_count = 0;
     }
     g->window_count++;
-    return g->window_count <= g->policy.rate_limit_per_minute;
+    bool ok = g->window_count <= g->policy.rate_limit_per_minute;
+    (void)pthread_mutex_unlock(&g->rate_lock);
+    return ok;
 }
 
 /* --- the MCP route --------------------------------------------------------- */
@@ -754,32 +786,32 @@ static const api_route API_ROUTES[] = {
     {"/api/v1/events", "events.since", ATLAS_SCOPE_REPO_READ,
      {"repo", "since", "limit", NULL}, {"since", "limit", NULL}},
     {"/api/v1/search", "repo.search", ATLAS_SCOPE_REPO_READ,
-     {"repo", "q", "limit", "cursor", NULL}, {"limit", "cursor", NULL}},
+     {"repo", "query", "limit", "cursor", NULL}, {"limit", "cursor", NULL}},
     {"/api/v1/file", "repo.file", ATLAS_SCOPE_REPO_READ, {"repo", "path", NULL}, {NULL}},
     {"/api/v1/history", "repo.history", ATLAS_SCOPE_REPO_READ,
      {"repo", "path", "limit", NULL}, {"limit", NULL}},
     {"/api/v1/decisions", "decision.list", ATLAS_SCOPE_DECISIONS_READ,
      {"repo", "status", "limit", "cursor", NULL}, {"limit", "cursor", NULL}},
     {"/api/v1/decision", "decision.get", ATLAS_SCOPE_DECISIONS_READ,
-     {"repo", "uid", NULL}, {NULL}},
+     {"repo", "decision", NULL}, {NULL}},
     {"/api/v1/decision/history", "decision.history", ATLAS_SCOPE_DECISIONS_READ,
-     {"repo", "uid", NULL}, {NULL}},
+     {"repo", "decision", NULL}, {NULL}},
     {"/api/v1/gate", "gate.check", ATLAS_SCOPE_DECISIONS_READ, {"repo", NULL}, {NULL}},
     {"/api/v1/code/status", "code.status", ATLAS_SCOPE_GRAPH_READ, {"repo", NULL}, {NULL}},
     {"/api/v1/code/file", "code.file", ATLAS_SCOPE_GRAPH_READ, {"repo", "path", NULL}, {NULL}},
     {"/api/v1/code/symbol", "code.symbol", ATLAS_SCOPE_GRAPH_READ,
      {"repo", "symbol", NULL}, {NULL}},
     {"/api/v1/code/search", "code.search", ATLAS_SCOPE_GRAPH_READ,
-     {"repo", "q", "limit", NULL}, {"limit", NULL}},
+     {"repo", "query", "limit", NULL}, {"limit", NULL}},
     {"/api/v1/sem/status", "sem.status", ATLAS_SCOPE_GRAPH_READ, {"repo", NULL}, {NULL}},
     {"/api/v1/sem/symbol", "sem.symbol", ATLAS_SCOPE_GRAPH_READ,
-     {"repo", "symbol", NULL}, {NULL}},
+     {"repo", "symbol", "subject", NULL}, {NULL}},
     {"/api/v1/sem/callers", "sem.callers", ATLAS_SCOPE_GRAPH_READ,
      {"repo", "symbol", "depth", NULL}, {"depth", NULL}},
     {"/api/v1/sem/callees", "sem.callees", ATLAS_SCOPE_GRAPH_READ,
      {"repo", "symbol", "depth", NULL}, {"depth", NULL}},
     {"/api/v1/impact", "sem.impact", ATLAS_SCOPE_IMPACT_READ,
-     {"repo", "symbol", "path", "depth", NULL}, {"depth", NULL}},
+     {"repo", "subject", "depth", NULL}, {"depth", NULL}},
     {"/api/v1/code/impact", "code.impact", ATLAS_SCOPE_IMPACT_READ,
      {"repo", "path", "depth", NULL}, {"depth", NULL}},
     {"/api/v1/context", "sem.context", ATLAS_SCOPE_CONTEXT_READ,
@@ -1004,8 +1036,11 @@ static bool api_handle(atlas_gateway *g, const atlas_http_request *req, const pr
     atlas_buf_free(&params);
 
     if (cst != ATLAS_OK) {
+        atlas_safe_pool safe;
+        atlas_safe_pool_init(&safe);
         gw_log(g, "the daemon did not answer %s: %s", route->method,
-               atlas_safe(&g->safe, atlas_err_msg(&cerr)));
+               atlas_safe(&safe, atlas_err_msg(&cerr)));
+        atlas_safe_pool_free(&safe);
         *st_out = respond_error(g, req, 502, "upstream", "the Atlas daemon did not answer",
                                 response, err);
         audit(g, "WEB_API", pr, req->path, true, false, cst, now_ms() - started,
@@ -1549,7 +1584,7 @@ static void *conn_thread(void *ud) {
     return NULL;
 }
 
-atlas_status atlas_gateway_serve(atlas_gateway *g, volatile bool *stop, atlas_err *err) {
+atlas_status atlas_gateway_serve(atlas_gateway *g, atomic_bool *stop, atlas_err *err) {
     int lfd = -1;
     atlas_status st = gw_listen(g, &lfd, err);
     if (st != ATLAS_OK) {
@@ -1562,7 +1597,7 @@ atlas_status atlas_gateway_serve(atlas_gateway *g, volatile bool *stop, atlas_er
            g->policy.listen_port, g->policy.remote_mcp ? "yes" : "no",
            g->policy.web_gui ? "yes" : "no", atlas_gwpolicy_tls_name(g->policy.tls_mode));
 
-    while (!*stop) {
+    while (!atomic_load(stop)) {
         struct pollfd p = {lfd, POLLIN, 0};
         int rc = poll(&p, 1, 500);
         if (rc <= 0) {
@@ -1625,11 +1660,13 @@ atlas_status atlas_gateway_serve(atlas_gateway *g, volatile bool *stop, atlas_er
 
 /* --- the commands ---------------------------------------------------------- */
 
-static volatile bool gw_stop_flag = false;
+/* Written from a signal handler and read by the accept loop. An atomic, not a
+ * `volatile bool`: a handler may run on any thread. */
+static atomic_bool gw_stop_flag = false;
 
 static void gw_on_signal(int sig) {
     (void)sig;
-    gw_stop_flag = true;
+    atomic_store(&gw_stop_flag, true);
 }
 
 atlas_status atlas_service_gateway_run(atlas_err *err) {
@@ -1660,7 +1697,7 @@ atlas_status atlas_service_gateway_run(atlas_err *err) {
     (void)sigaction(SIGTERM, &sa, NULL);
     (void)sigaction(SIGINT, &sa, NULL);
 
-    gw_stop_flag = false;
+    atomic_store(&gw_stop_flag, false);
     st = atlas_gateway_serve(g, &gw_stop_flag, err);
     atlas_gateway_close(g);
     return st;

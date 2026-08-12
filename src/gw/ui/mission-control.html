@@ -335,7 +335,7 @@ async function viewOverview() {
     }
     return table([
       {label: "repo", get: (x) => x.repo},
-      {label: "id", get: (x) => x.uid},
+      {label: "id", get: (x) => x.decision},
       {label: "title", wrap: true, get: (x) => el("span", {class: "untrusted", text: x.title || "—"})},
       {label: "status", get: (x) => statusTag(x.status)},
     ], all, {empty: "nothing is waiting"});
@@ -411,36 +411,44 @@ async function viewDecisions() {
   panel($("d-list"), async () => {
     const d = await api("decisions", {repo: name, status: status, limit: 200});
     return table([
-      {label: "id", get: (x) => x.uid},
+      {label: "id", get: (x) => x.decision},
       {label: "title", wrap: true, get: (x) => el("span", {class: "untrusted", text: x.title || "—"})},
+      {label: "rev", get: (x) => x.revision},
       {label: "status", get: (x) => statusTag(x.status)},
-    ], d.decisions, {empty: "no decisions", onclick: (x) => showDecision(name, x.uid)});
+    ], d.decisions, {empty: "no decisions", onclick: (x) => showDecision(name, x.decision)});
   });
 }
 
 async function showDecision(repo, uid) {
   panel($("d-detail"), async () => {
-    const d = await api("decision", {repo: repo, uid: uid});
+    const got = await api("decision", {repo: repo, decision: uid});
+    const d = got.document || {};
+    const rev = got.revision || {};
     const box = el("div");
     box.appendChild(kv([
-      ["id", d.uid], ["status", statusTag(d.status)],
-      ["revision", d.revision_no], ["created", d.created_at],
+      ["id", d.decision], ["status", statusTag(d.status)],
+      ["revision", d.revision + " of " + d.latest_revision],
+      ["proposed by", d.proposed_by], ["created", d.created_at],
+      ["scope", rev.scope], ["basis head", (rev.basis_head || "").slice(0, 12)],
       ["content hash", d.content_hash],
+      ["links needing review", rev.links_needing_review],
     ]));
-    const prose = [["Title", d.title], ["Decision", d.decision], ["Context", d.context],
-                   ["Rationale", d.rationale]];
+    /* Prose comes from the revision, not the document row. It is repository
+       text and is marked as such in the interface itself. */
+    const prose = [["Title", rev.title], ["Decision", rev.decision], ["Context", rev.context],
+                   ["Rationale", rev.rationale], ["Consequences", rev.consequences]];
     for (const [label, text] of prose) {
       if (!text) continue;
       box.appendChild(el("h3", {text: label}));
       box.appendChild(el("p", {class: "untrusted", text: text}));
     }
-    if (d.links && d.links.length) {
+    if (rev.links && rev.links.length) {
       box.appendChild(el("h3", {text: "Links"}));
       box.appendChild(table([
         {label: "kind", get: (x) => x.kind},
-        {label: "target", wrap: true, get: (x) => x.target || x.path || x.symbol},
-        {label: "currency", get: (x) => statusTag(x.currency)},
-      ], d.links));
+        {label: "target", wrap: true, get: (x) => x.target || x.path || x.symbol || x.name},
+        {label: "currency", get: (x) => statusTag(x.currency || x.state)},
+      ], rev.links));
     }
     box.appendChild(el("p", {class: "dim", text: "Decision prose is UNTRUSTED_DATA: it is repository text, shown as text."}));
     return box;
@@ -451,31 +459,41 @@ async function viewGraph() {
   const name = $("g-pick").value;
   const q = $("g-q").value.trim();
   if (!name || !q) { say($("g-symbol"), "Name a symbol or a path."); return; }
-  panel($("g-symbol"), async () => {
-    const s = await api("sem/symbol", {repo: name, symbol: q});
-    return table([
-      {label: "name", get: (x) => x.name},
-      {label: "kind", get: (x) => x.kind},
-      {label: "file", wrap: true, get: (x) => x.file},
-      {label: "line", get: (x) => x.line},
-    ], s.symbols || s.results, {empty: "no such symbol"});
-  });
-  panel($("g-callers"), async () => {
-    const s = await api("sem/callers", {repo: name, symbol: q, depth: 2});
-    return table([
-      {label: "caller", wrap: true, get: (x) => x.name},
-      {label: "evidence", get: (x) => statusTag(x.evidence)},
-      {label: "file", wrap: true, get: (x) => x.file},
-    ], s.nodes || s.callers, {empty: "nothing calls it, or the index has not run"});
-  });
-  panel($("g-callees"), async () => {
-    const s = await api("sem/callees", {repo: name, symbol: q, depth: 2});
-    return table([
-      {label: "callee", wrap: true, get: (x) => x.name},
-      {label: "evidence", get: (x) => statusTag(x.evidence)},
-      {label: "file", wrap: true, get: (x) => x.file},
-    ], s.nodes || s.callees, {empty: "it calls nothing Atlas can prove"});
-  });
+  /* The structural graph, which is always present. The compiler-derived one
+     needs libclang and an explicit index pass, so it is reported separately on
+     the Repository screen rather than silently looking empty here. */
+  let g = null;
+  try {
+    g = await api("code/symbol", {repo: name, symbol: q});
+  } catch (e) {
+    say($("g-symbol"), String(e.message || e), "err");
+    say($("g-callers"), "", "empty");
+    say($("g-callees"), "", "empty");
+    return;
+  }
+  panel($("g-symbol"), async () => table([
+    {label: "name", get: (x) => x.name},
+    {label: "kind", get: (x) => x.kind},
+    {label: "linkage", get: (x) => x.linkage},
+    {label: "file", wrap: true, get: (x) => x.path},
+    {label: "line", get: (x) => x.line},
+    {label: "resolution", get: (x) => statusTag(x.resolution)},
+  ], g.sites, {empty: "no such symbol in the structural index"}));
+  /* `from_path` is null when the edge's endpoint is a symbol rather than a
+     file, which is the ordinary case for a call. Showing the endpoint kind
+     instead is honest; an em dash would only say Atlas knows nothing. */
+  panel($("g-callers"), async () => table([
+    {label: "from", wrap: true, get: (x) => x.from_path || x.from_kind},
+    {label: "spelling", get: (x) => x.spelling},
+    {label: "resolution", get: (x) => statusTag(x.resolution)},
+    {label: "line", get: (x) => x.line},
+  ], g.callers, {empty: "nothing references it"}));
+  panel($("g-callees"), async () => table([
+    {label: "to", wrap: true, get: (x) => x.to_path || x.to_kind},
+    {label: "spelling", get: (x) => x.spelling},
+    {label: "resolution", get: (x) => statusTag(x.resolution)},
+    {label: "line", get: (x) => x.line},
+  ], g.calls, {empty: "it references nothing Atlas resolved"}));
 }
 
 async function viewSearch() {
@@ -483,11 +501,13 @@ async function viewSearch() {
   const q = $("s-q").value.trim();
   if (!name || !q) { say($("s-out"), "Enter a query."); return; }
   panel($("s-out"), async () => {
-    const r = await api("search", {repo: name, q: q, limit: 100});
+    const r = await api("search", {repo: name, query: q, limit: 100});
     return table([
       {label: "kind", get: (x) => x.kind},
-      {label: "match", wrap: true, get: (x) => el("span", {class: "untrusted", text: x.path || x.subject || "—"})},
-      {label: "commit", get: (x) => x.commit},
+      {label: "match", wrap: true,
+       get: (x) => el("span", {class: "untrusted", text: x.path || x.subject || "—"})},
+      {label: "evidence", get: (x) => statusTag(x.evidence)},
+      {label: "commit", get: (x) => (x.commit || "").slice(0, 12) || "—"},
     ], r.results, {empty: "nothing matched"});
   });
 }
@@ -498,17 +518,22 @@ async function viewImpact() {
   const path = $("i-path").value.trim();
   if (!name || (!sym && !path)) { say($("i-out"), "Name a symbol or a path."); return; }
   panel($("i-out"), async () => {
-    const r = await api("impact", {repo: name, symbol: sym, path: path, depth: 3});
+    const r = await api("code/impact", {repo: name, symbol: sym, path: path, depth: 3});
     const box = el("div");
     box.appendChild(el("p", {class: "dim",
-      text: "Every item says how it was found. PROVEN is the compiler; CANDIDATE crosses an indirect call; LEXICAL is a name match. Totals are reported separately, never summed."}));
+      text: "Graph paths, not predictions. Every candidate says how it resolved — EXACT, UNIQUE_LEXICAL, AMBIGUOUS or UNRESOLVED — and the totals are reported separately, never summed."}));
+    box.appendChild(kv([
+      ["candidates", r.count], ["exact", r.exact], ["unique lexical", r.unique_lexical],
+      ["ambiguous", r.ambiguous], ["unresolved", r.unresolved],
+    ]));
     box.appendChild(table([
-      {label: "item", wrap: true, get: (x) => x.name || x.path},
-      {label: "evidence", get: (x) => statusTag(x.evidence)},
-      {label: "why", get: (x) => x.reason || x.selection_reason},
-      {label: "file", wrap: true, get: (x) => x.file},
-    ], r.items || r.impacted, {empty: "nothing reached, or the index has not run"}));
-    if (r.limit_reached) box.appendChild(el("p", {class: "err", text: "A traversal bound was reached: this result is truncated and says so."}));
+      {label: "item", wrap: true, get: (x) => x.name || x.path || x.from_path},
+      {label: "kind", get: (x) => x.kind},
+      {label: "resolution", get: (x) => statusTag(x.resolution)},
+      {label: "file", wrap: true, get: (x) => x.to_path || x.path},
+      {label: "line", get: (x) => x.line},
+    ], r.candidates, {empty: "nothing reached it"}));
+    if (r.truncated) box.appendChild(el("p", {class: "err", text: "A traversal bound was reached: " + (r.truncated_reason || "this result is truncated") + "."}));
     return box;
   });
 }

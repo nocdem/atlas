@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 #include <time.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -842,7 +843,7 @@ static void test_the_browser_surface_is_absent_when_disabled(void) {
 
 typedef struct listener {
     atlas_gateway *g;
-    volatile bool stop;
+    atomic_bool stop;
     pthread_t thread;
 } listener;
 
@@ -920,7 +921,7 @@ static void test_the_listener_binds_and_serves(void) {
     atlas_err_init(&err);
     listener l;
     memset(&l, 0, sizeof l);
-    l.stop = false;
+    atomic_store(&l.stop, false);
     T_OK(atlas_gateway_open(&p, &o, &l.g, &err), &err);
     T_REQUIRE(pthread_create(&l.thread, NULL, listener_main, &l) == 0);
 
@@ -960,10 +961,123 @@ static void test_the_listener_binds_and_serves(void) {
         T_CHECK(strstr(atlas_buf_cstr(&resp), "WWW-Authenticate: Bearer") != NULL);
     }
 
-    l.stop = true;
+    atomic_store(&l.stop, true);
     (void)pthread_join(l.thread, NULL);
     atlas_gateway_close(l.g);
     atlas_buf_free(&resp);
+    env_close(&e);
+}
+
+/* Many connections at once, over a real socket.
+ *
+ * Every test above drives one request at a time, which is structurally unable
+ * to find a data race — and there were two: an unsynchronised read-modify-write
+ * on the rate-limit window, and one `atlas_safe_pool` shared between connection
+ * threads. A pool is a ring of scratch buffers with a mutable cursor, so
+ * sharing it does not merely race, it hands two threads the same slot.
+ *
+ * This is the test that exercises the loop the way a client fleet would. It is
+ * worth little without ThreadSanitizer and everything with it. */
+typedef struct hammer {
+    int port;
+    const char *token;
+    int ok;
+    int refused;
+} hammer;
+
+static void *hammer_main(void *ud) {
+    hammer *h = (hammer *)ud;
+    atlas_buf resp = ATLAS_BUF_INIT;
+    for (int i = 0; i < 12; i++) {
+        char req[1024];
+        static const char BODY[] =
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}";
+        (void)snprintf(req, sizeof req,
+                       "POST /mcp HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer %s\r\n"
+                       "Content-Type: application/json\r\nContent-Length: %zu\r\n\r\n%s",
+                       h->token, sizeof BODY - 1u, BODY);
+        if (wire_request(h->port, req, &resp)) {
+            if (strstr(atlas_buf_cstr(&resp), "HTTP/1.1 200") != NULL) {
+                h->ok++;
+            } else {
+                h->refused++;
+            }
+        }
+        /* An unauthenticated one too, so the denied path — which logs and
+         * audits — runs concurrently with the allowed one. That is where the
+         * shared pool was reached. */
+        (void)wire_request(h->port,
+                           "POST /mcp HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer bad\r\n"
+                           "Content-Length: 2\r\n\r\n{}",
+                           &resp);
+    }
+    atlas_buf_free(&resp);
+    return NULL;
+}
+
+static void test_concurrent_connections_are_safe(void) {
+    env e;
+    const char *scopes[] = {"repo:read"};
+    env_open(&e, scopes, 1);
+
+    const int port = 38791;
+    char text[256];
+    (void)snprintf(text, sizeof text,
+                   "enabled = yes\ngateway_uid = 1\nremote_mcp = yes\n"
+                   "listen_addr = 127.0.0.1\nlisten_port = %d\n",
+                   port);
+    atlas_gwpolicy p;
+    atlas_gwpolicy_parse_buffer(text, strlen(text), &p);
+    T_REQUIRE(p.state == ATLAS_GWPOLICY_ENABLED);
+
+    atlas_gateway_opts o;
+    memset(&o, 0, sizeof o);
+    o.socket_path = atlas_buf_cstr(&e.d.socket);
+    o.timeout_ms = 15000;
+
+    atlas_err err;
+    atlas_err_init(&err);
+    listener l;
+    memset(&l, 0, sizeof l);
+    T_OK(atlas_gateway_open(&p, &o, &l.g, &err), &err);
+    T_REQUIRE(pthread_create(&l.thread, NULL, listener_main, &l) == 0);
+
+    atlas_buf probe = ATLAS_BUF_INIT;
+    bool up = false;
+    for (int i = 0; i < 200 && !up; i++) {
+        up = wire_request(port, "GET /healthz HTTP/1.1\r\nHost: t\r\n\r\n", &probe);
+        if (!up) {
+            struct timespec ts = {0, 20 * 1000 * 1000};
+            (void)nanosleep(&ts, NULL);
+        }
+    }
+    atlas_buf_free(&probe);
+    T_REQUIRE(up);
+
+    enum { CLIENTS = 6 };
+    pthread_t threads[CLIENTS];
+    hammer hs[CLIENTS];
+    for (int i = 0; i < CLIENTS; i++) {
+        memset(&hs[i], 0, sizeof hs[i]);
+        hs[i].port = port;
+        hs[i].token = e.token;
+        T_REQUIRE(pthread_create(&threads[i], NULL, hammer_main, &hs[i]) == 0);
+    }
+    int ok = 0;
+    for (int i = 0; i < CLIENTS; i++) {
+        (void)pthread_join(threads[i], NULL);
+        ok += hs[i].ok;
+    }
+
+    /* Every authenticated request must have been answered. The rate ceiling is
+     * far above what this sends, so a refusal here would mean the counter was
+     * corrupted rather than that the limit was reached. */
+    T_CHECK_MSG(ok == CLIENTS * 12, "%d of %d concurrent authenticated requests succeeded", ok,
+                CLIENTS * 12);
+
+    atomic_store(&l.stop, true);
+    (void)pthread_join(l.thread, NULL);
+    atlas_gateway_close(l.g);
     env_close(&e);
 }
 
@@ -988,6 +1102,7 @@ static const atlas_test TESTS[] = {
     {"the browser surface is absent when disabled",
      test_the_browser_surface_is_absent_when_disabled},
     {"the listener binds and serves", test_the_listener_binds_and_serves},
+    {"concurrent connections are safe", test_concurrent_connections_are_safe},
 };
 
 ATLAS_TEST_MAIN("gw_remote", TESTS)

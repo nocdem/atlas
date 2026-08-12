@@ -275,6 +275,8 @@ add_library(atlas_core STATIC
   src/gw/apikey.c
   src/db/db_gw.c
   src/core/service_apikey.c
+  src/gw/gwpolicy.c
+  src/gw/http.c
 )
 
 target_include_directories(atlas_core

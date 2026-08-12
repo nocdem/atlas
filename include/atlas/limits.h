@@ -553,4 +553,70 @@
 #define ATLAS_OPS_POLL_INTERVAL_MS 500
 #define ATLAS_OPS_CLIENT_WAIT_MS 1800000
 
+/* --- A9: the remote gateway -------------------------------------------------
+ *
+ * These are the **absolute** ceilings. `/etc/atlas/gateway.conf` may lower any
+ * of them and may never raise one — A8's rule, so the policy decides how much a
+ * deployment permits and this header decides how much the policy may permit. A
+ * gateway that could widen its own bounds is not bounded by anything.
+ *
+ * Every bound here is refused rather than clamped where a caller supplies the
+ * value, and reported where the gateway reaches it. */
+
+/* One HTTP request line, one header line, and the whole header block.
+ *
+ * Small on purpose. A request line is a method, a path and a version; a header
+ * is a name and a value. Anything larger is not a request Atlas serves, and
+ * accepting it would mean buffering bytes chosen by an unauthenticated peer. */
+#define ATLAS_GW_MAX_REQUEST_LINE 8192u
+#define ATLAS_GW_MAX_HEADER_LINE 8192u
+#define ATLAS_GW_MAX_HEADERS 64u
+#define ATLAS_GW_MAX_HEADER_BYTES 32768u
+
+/* One request body. An MCP message is a JSON-RPC document; a web API call
+ * carries almost nothing. The ceiling is checked against `Content-Length`
+ * *before* a byte of body is read, so an attacker cannot make Atlas allocate by
+ * claiming a large request — the same rule the Unix-socket framing follows. */
+#define ATLAS_GW_MAX_BODY_BYTES (1024u * 1024u)
+
+/* One response body the gateway will assemble. A result that does not fit is a
+ * structured statement that it does not fit, never a truncation. */
+#define ATLAS_GW_MAX_RESPONSE_BYTES (8u * 1024u * 1024u)
+
+/* Connections served at once, and how long one may occupy a slot.
+ *
+ * Bounded concurrency is what stops a slow-loris from costing more than a fixed
+ * amount of memory and a fixed number of descriptors. A connection that has not
+ * finished sending its head, or has gone quiet mid-body, loses its slot. */
+#define ATLAS_GW_MAX_CONNECTIONS 64
+#define ATLAS_GW_HEADER_TIMEOUT_MS 10000
+#define ATLAS_GW_BODY_TIMEOUT_MS 30000
+#define ATLAS_GW_IDLE_TIMEOUT_MS 15000
+
+/* How long the gateway will wait for the daemon to answer one forwarded call.
+ * Longer than a read needs and shorter than a client's patience. */
+#define ATLAS_GW_UPSTREAM_TIMEOUT_MS 60000
+
+/* Requests one peer may make per minute, and the ceiling on that ceiling.
+ *
+ * Behind a reverse proxy every request appears to come from the proxy unless
+ * `trust_forwarded_for` is set, so this degrades to a global limit. That is
+ * stated in `docs/remote-access.md` rather than hidden: a limit that looks
+ * per-peer and is not is worse than one nobody believed in. */
+#define ATLAS_GW_DEFAULT_RATE_PER_MINUTE 600
+#define ATLAS_GW_MAX_RATE_PER_MINUTE 60000
+
+/* Browser sessions held in gateway memory, and how long one lives.
+ *
+ * In memory and forgotten on restart, deliberately — the reason A8-CI's
+ * operations table is. A durable session would need a durable secret and a
+ * table to hold it, and re-authenticating after a gateway restart is the
+ * correct experience for an operator tool. */
+#define ATLAS_GW_MAX_SESSIONS 32u
+#define ATLAS_GW_DEFAULT_SESSION_TTL_SECONDS 43200 /* 12 hours */
+#define ATLAS_GW_MAX_SESSION_TTL_SECONDS 604800    /* a week; past this, a typo */
+/* The opaque browser session token: 32 bytes of kernel randomness, hex. */
+#define ATLAS_GW_SESSION_TOKEN_BYTES 32u
+#define ATLAS_GW_SESSION_TOKEN_HEX 64u
+
 #endif /* ATLAS_LIMITS_H */

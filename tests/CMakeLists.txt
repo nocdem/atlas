@@ -142,6 +142,10 @@ set(ATLAS_TESTS
   # directory: created once, listed, revoked, rotated, and searched as raw
   # bytes for a plaintext that must not be there.
   test_apikey
+  # The gateway policy matrix and the HTTP reader are pure functions: bytes in,
+  # a verdict out. No socket, no daemon, no repository -- except the one case
+  # that writes a policy file to prove a user-writable one is refused.
+  test_gateway
 )
 
 foreach(test_name IN LISTS ATLAS_TESTS)
@@ -179,6 +183,7 @@ set_tests_properties(test_code_lex PROPERTIES LABELS "unit")
 # A9. The credential format and the scope vocabulary are pure functions.
 set_tests_properties(test_hmac PROPERTIES LABELS "unit")
 set_tests_properties(test_apikey PROPERTIES LABELS "integration")
+set_tests_properties(test_gateway PROPERTIES LABELS "unit")
 
 # A4. The content hash, the transition table and validation are pure functions —
 # bytes in, a digest or a verdict out — so this suite needs no repository, no

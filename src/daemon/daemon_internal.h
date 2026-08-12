@@ -17,6 +17,8 @@
 #include "atlas/daemon.h"
 #include "atlas/db.h"
 #include "atlas/decision_ops.h"
+#include "atlas/maintenance.h"
+#include "atlas/ops.h"
 #include "atlas/orch_ops.h"
 #include "atlas/orchpolicy.h"
 #include "atlas/snapshot.h"
@@ -78,7 +80,17 @@ typedef enum atlas_job_kind {
      * thread like every other write. It creates a git process, which A1 forbids
      * *inside a transaction* — so `atlas_snapshot_open` opens its transaction
      * only around the rows, after the reads it needs. */
-    ATLAS_JOB_SNAPSHOT
+    ATLAS_JOB_SNAPSHOT,
+    /* A8-CI closeout. Building a semantic index writes the index, so it happens
+     * here and nowhere else — the daemon's one serialized writer path. It is
+     * the only job that reports its outcome through the operations table rather
+     * than through the completion handshake below, because the caller is told
+     * "accepted" long before the work is done and polls for the rest. */
+    ATLAS_JOB_SEM_INDEX,
+    /* The one bounded delete. It writes, so it happens on this thread; the
+     * caller waits, because a prune of an events table is fast and bounded per
+     * batch — unlike an index, which is why that one polls instead. */
+    ATLAS_JOB_MAINTENANCE
 } atlas_job_kind;
 
 typedef struct atlas_job atlas_job;
@@ -118,6 +130,17 @@ struct atlas_job {
     int64_t result_id;
     atlas_buf result_name;      /* validated [A-Za-z0-9._-] */
     atlas_buf result_root_text; /* already in the safe text encoding */
+
+    /* A8-CI closeout: the operations-table record this job reports into, and
+     * the semantic-index request itself. `arg1` carries the repository name and
+     * `arg2` the NUL-separated compilation-database list — bytes, never split
+     * on whitespace. */
+    int64_t op_id;
+    bool sem_rebuild;
+    /* ATLAS_JOB_MAINTENANCE: the request, and where the writer puts the result.
+     * Both are owned by the caller, which waits for `done`. */
+    const atlas_maintenance_opts *maint;
+    atlas_maintenance_report *maint_out;
 
     /* A2. The job owns the operation and frees it. The result is typed for the
      * same reason the fields above are: a JSON fragment carried through here
@@ -174,6 +197,21 @@ atlas_status atlas_writer_submit_reconcile(atlas_writer *w, int64_t repo_id, boo
                                            int64_t *sync_seq_out, atlas_err *err);
 
 /* Queues a mutation and waits for it, bounded by `timeout_ms`. */
+/* A8-CI closeout: queue a semantic index on the writer thread and return at
+ * once. The outcome is recorded in the operations table under `op_id`; nothing
+ * blocks on it here, which is what keeps the caller's answer immediate. */
+/* Runs one bounded prune on the writer thread and waits for it. */
+atlas_status atlas_writer_maintenance(atlas_writer *w, const atlas_maintenance_opts *opts,
+                                      atlas_maintenance_report *out, atlas_err *err);
+
+atlas_status atlas_writer_submit_sem_index(atlas_writer *w, const char *name, const char *compdbs,
+                                           size_t compdbs_len, bool rebuild, int64_t op_id,
+                                           atlas_err *err);
+
+/* Hands the writer the operations table. Called once at startup, after both
+ * exist and before the serve loop accepts anything. */
+void atlas_writer_set_ops(atlas_writer *w, atlas_ops *ops);
+
 atlas_status atlas_writer_call(atlas_writer *w, atlas_job_kind kind, const char *arg1,
                                const char *arg2, int timeout_ms, atlas_writer_result *result,
                                atlas_err *err);
@@ -260,6 +298,10 @@ typedef struct atlas_server_ctx {
     atlas_writer *writer;
     atlas_watcher *watcher;
     atlas_workers *workers;
+    /* Long-running operations that must not run inside the serve loop. See
+     * atlas/ops.h: a backup or a semantic index takes longer than a client will
+     * hold a socket open, and running one here stalled every other client. */
+    atlas_ops *ops;
     FILE *log;
     int64_t started_at_ms;
     /* A7.1. Loaded once at startup and never reloaded, so the set of uids the

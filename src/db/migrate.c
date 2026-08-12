@@ -2050,6 +2050,210 @@ static const char *const M10_STATEMENTS[] = {
     NULL,
 };
 
+/* --- migration 11: the compiler-derived semantic index ----------------------
+ *
+ * Purely additive. No existing table is touched, no index is rebuilt, no
+ * lifecycle rule moves and no stored hash changes — which is what makes this
+ * safe to run against a database holding approved decisions, and why one
+ * migration is enough for the whole season.
+ *
+ * The design decision that shapes every table here: **a semantic index is
+ * derived, rebuildable data and nothing authoritative may depend on it.** So
+ * nothing in A0..A8 gains a foreign key into these tables, `repo_id` is a soft
+ * reference exactly as `orch_jobs.repo_id` is (a `repositories` rowid is reused,
+ * and `atlas_db_repo_remove` clears it inside its own transaction), and every
+ * row is scoped to a *generation* rather than to a repository. Dropping every
+ * generation would lose nothing a pass cannot rebuild from the repository and
+ * the compilation database.
+ *
+ * Generation scoping is also what makes replacement atomic without a rewrite.
+ * A pass writes a new generation's rows while the previous generation is still
+ * being read, and publication is one UPDATE of `sem_current`. A crash leaves a
+ * RUNNING generation nobody points at, which the next pass reports and reaps —
+ * A8's argument for `resolve_settled`, in the shape a generation table wants:
+ * the durable record says what happened rather than what was intended. */
+static const char *const M11_STATEMENTS[] = {
+    /* One row per attempt to build an index. A failed attempt keeps its row on
+     * purpose: "indexing this repository has failed four times today" is an
+     * operational fact, and a table that only recorded successes could not
+     * state it. */
+    "CREATE TABLE sem_generations ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    /* Soft reference. No FK: an FK would make `repo remove --yes` cascade into
+     * the index, and more importantly a reused rowid would silently re-point a
+     * generation at a different repository. Cleared on removal. */
+    "  repo_id INTEGER NOT NULL DEFAULT 0,"
+    /* The durable identity, kept so a generation can still say which repository
+     * it described after the rowid is gone. */
+    "  repo_identity_hash TEXT NOT NULL DEFAULT '',"
+    "  commit_id TEXT NOT NULL DEFAULT '',"
+    "  compdb_digest TEXT NOT NULL DEFAULT '',"
+    "  compdb_count INTEGER NOT NULL DEFAULT 0,"
+    "  compiler_id TEXT NOT NULL DEFAULT '',"
+    "  compiler_version TEXT NOT NULL DEFAULT '',"
+    "  analyzer_id TEXT NOT NULL DEFAULT '',"
+    "  analyzer_version INTEGER NOT NULL DEFAULT 0,"
+    /* UNKNOWN is deliberately absent, so a zeroed or malformed write cannot
+     * produce a generation that looks runnable — the shape every A6/A8 state
+     * CHECK uses. */
+    "  status TEXT NOT NULL CHECK(status IN ('RUNNING','COMPLETE','FAILED')),"
+    "  started_at TEXT NOT NULL,"
+    "  completed_at TEXT NOT NULL DEFAULT '',"
+    "  tu_total INTEGER NOT NULL DEFAULT 0,"
+    "  tu_complete INTEGER NOT NULL DEFAULT 0,"
+    "  tu_partial INTEGER NOT NULL DEFAULT 0,"
+    "  tu_failed INTEGER NOT NULL DEFAULT 0,"
+    "  tu_unsupported INTEGER NOT NULL DEFAULT 0,"
+    "  symbol_count INTEGER NOT NULL DEFAULT 0,"
+    "  edge_count INTEGER NOT NULL DEFAULT 0,"
+    "  include_count INTEGER NOT NULL DEFAULT 0,"
+    "  duration_ms INTEGER NOT NULL DEFAULT 0,"
+    /* A fixed Atlas string or empty. Never compiler output: a diagnostic quotes
+     * untrusted source. */
+    "  failure_reason TEXT NOT NULL DEFAULT ''"
+    ");",
+    "CREATE INDEX idx_sem_generations_repo ON sem_generations(repo_id, id);",
+
+    /* The atomic pointer. One row per repository, updated in the same
+     * transaction that marks a generation COMPLETE, which is what makes
+     * publication a single decision rather than a state readers can catch
+     * half-made. A repository with no row has no index — ABSENT, which is a
+     * different answer from STALE and must stay one. */
+    "CREATE TABLE sem_current ("
+    "  repo_id INTEGER PRIMARY KEY,"
+    "  generation_id INTEGER NOT NULL REFERENCES sem_generations(id)"
+    ");",
+
+    /* The compilation databases a generation read, with the digest of each. Two
+     * rows for a repository that presents two, which DNA does; the generation's
+     * own `compdb_digest` is over all of them in path order, so a change to
+     * either makes the generation stale. */
+    "CREATE TABLE sem_compdbs ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  generation_id INTEGER NOT NULL REFERENCES sem_generations(id),"
+    "  path_text TEXT NOT NULL,"
+    "  digest TEXT NOT NULL,"
+    "  entries INTEGER NOT NULL DEFAULT 0,"
+    "  entries_dropped INTEGER NOT NULL DEFAULT 0"
+    ");",
+    "CREATE INDEX idx_sem_compdbs_gen ON sem_compdbs(generation_id);",
+
+    /* One translation unit: a source compiled under one configuration.
+     *
+     * `config_digest` is what makes two compilations of one file two units
+     * rather than one — the domain-separated, length-prefixed digest over the
+     * include directories, defines, standard and language. `input_digest`
+     * covers the source and every file it included, and is the whole basis of
+     * incremental indexing: a unit whose input digest is unchanged is copied
+     * forward rather than reparsed. */
+    "CREATE TABLE sem_units ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  generation_id INTEGER NOT NULL REFERENCES sem_generations(id),"
+    "  source_text TEXT NOT NULL,"
+    "  compdb_id INTEGER NOT NULL DEFAULT 0,"
+    "  config_digest TEXT NOT NULL DEFAULT '',"
+    "  input_digest TEXT NOT NULL DEFAULT '',"
+    "  status TEXT NOT NULL CHECK(status IN ('COMPLETE','PARTIAL','FAILED','UNSUPPORTED')),"
+    "  why TEXT NOT NULL DEFAULT '',"
+    "  diagnostics_errors INTEGER NOT NULL DEFAULT 0,"
+    "  symbols INTEGER NOT NULL DEFAULT 0,"
+    "  edges INTEGER NOT NULL DEFAULT 0,"
+    "  duration_ms INTEGER NOT NULL DEFAULT 0,"
+    "  reused INTEGER NOT NULL DEFAULT 0,"
+    "  UNIQUE(generation_id, source_text, config_digest)"
+    ");",
+    "CREATE INDEX idx_sem_units_gen_status ON sem_units(generation_id, status);",
+
+    /* A symbol occurrence with an identity.
+     *
+     * The identity is Clang's USR, and a declaration and its definition share
+     * one — correctly, they are the same entity — so `is_definition` is a
+     * property of the row and the definition/declaration relationship is
+     * answered by the rows that share a USR. That is why the unique key is the
+     * whole site rather than the USR: two rows for one USR is the normal,
+     * meaningful case.
+     *
+     * `external` marks an entity Atlas does not describe — a libc function, a
+     * type from a system header — recorded so an edge has a destination.
+     * External rows carry no location, because Atlas did not index the file. */
+    "CREATE TABLE sem_symbols ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  generation_id INTEGER NOT NULL REFERENCES sem_generations(id),"
+    "  usr TEXT NOT NULL,"
+    "  name TEXT NOT NULL DEFAULT '',"
+    "  kind TEXT NOT NULL DEFAULT 'UNKNOWN',"
+    "  linkage TEXT NOT NULL DEFAULT 'UNKNOWN',"
+    "  type_text TEXT NOT NULL DEFAULT '',"
+    "  file_text TEXT NOT NULL DEFAULT '',"
+    "  line INTEGER NOT NULL DEFAULT 0,"
+    "  col INTEGER NOT NULL DEFAULT 0,"
+    "  end_line INTEGER NOT NULL DEFAULT 0,"
+    "  is_definition INTEGER NOT NULL DEFAULT 0,"
+    "  external INTEGER NOT NULL DEFAULT 0,"
+    "  evidence TEXT NOT NULL DEFAULT 'PROVEN'"
+    "    CHECK(evidence IN ('PROVEN','CANDIDATE','LEXICAL','UNKNOWN')),"
+    "  UNIQUE(generation_id, usr, file_text, line, is_definition)"
+    ");",
+    "CREATE INDEX idx_sem_symbols_name ON sem_symbols(generation_id, name);",
+    "CREATE INDEX idx_sem_symbols_usr ON sem_symbols(generation_id, usr);",
+    "CREATE INDEX idx_sem_symbols_file ON sem_symbols(generation_id, file_text);",
+
+    /* An edge between two USRs.
+     *
+     * Endpoints are USRs rather than `sem_symbols` rowids on purpose: a call is
+     * a fact about two *entities*, and an entity has several rows. Joining by
+     * USR at read time keeps "which of the four declarations did you mean" a
+     * question the reader answers rather than one the writer guessed at.
+     *
+     * `dst_usr` may be empty: an indirect call whose target Atlas cannot name is
+     * a recorded edge with no destination, which is the single most important
+     * thing a bounded call graph carries. `proto` holds the canonical prototype
+     * that lets a later step attach candidates. */
+    "CREATE TABLE sem_edges ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  generation_id INTEGER NOT NULL REFERENCES sem_generations(id),"
+    "  kind TEXT NOT NULL CHECK(kind IN"
+    "    ('CALLS','MAY_CALL','ADDRESS_TAKEN','REFERENCES','DECLARATION_OF',"
+    "     'HAS_FIELD','HAS_TYPE','PARAM_TYPE','RETURN_TYPE','EXPANDED_FROM')),"
+    "  src_usr TEXT NOT NULL DEFAULT '',"
+    "  dst_usr TEXT NOT NULL DEFAULT '',"
+    "  evidence TEXT NOT NULL"
+    "    CHECK(evidence IN ('PROVEN','CANDIDATE','LEXICAL','UNKNOWN')),"
+    "  unit_id INTEGER NOT NULL DEFAULT 0,"
+    "  file_text TEXT NOT NULL DEFAULT '',"
+    "  line INTEGER NOT NULL DEFAULT 0,"
+    "  col INTEGER NOT NULL DEFAULT 0,"
+    "  proto TEXT NOT NULL DEFAULT '',"
+    /* The number of candidate targets that *existed*, which may exceed the
+     * number recorded. A3's rule about `candidate_count`: a bound that makes an
+     * ambiguity look smaller than it is is a bound that lies. */
+    "  candidate_total INTEGER NOT NULL DEFAULT 0,"
+    "  UNIQUE(generation_id, kind, src_usr, dst_usr, file_text, line, col)"
+    ");",
+    "CREATE INDEX idx_sem_edges_src ON sem_edges(generation_id, src_usr, kind);",
+    "CREATE INDEX idx_sem_edges_dst ON sem_edges(generation_id, dst_usr, kind);",
+    "CREATE INDEX idx_sem_edges_proto ON sem_edges(generation_id, kind, proto);",
+    "CREATE INDEX idx_sem_edges_file ON sem_edges(generation_id, file_text);",
+
+    /* The include graph, as the preprocessor actually resolved it. `to_text`
+     * empty means the directive led outside the repository: the spelling is
+     * kept, the destination is not claimed. */
+    "CREATE TABLE sem_includes ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  generation_id INTEGER NOT NULL REFERENCES sem_generations(id),"
+    "  from_text TEXT NOT NULL,"
+    "  to_text TEXT NOT NULL DEFAULT '',"
+    "  spelling TEXT NOT NULL DEFAULT '',"
+    "  line INTEGER NOT NULL DEFAULT 0,"
+    "  evidence TEXT NOT NULL"
+    "    CHECK(evidence IN ('PROVEN','CANDIDATE','LEXICAL','UNKNOWN')),"
+    "  UNIQUE(generation_id, from_text, to_text, spelling, line)"
+    ");",
+    "CREATE INDEX idx_sem_includes_from ON sem_includes(generation_id, from_text);",
+    "CREATE INDEX idx_sem_includes_to ON sem_includes(generation_id, to_text);",
+    NULL,
+};
+
 static const atlas_migration MIGRATIONS[] = {
     {1, "initial schema", M1_STATEMENTS},
     {2, "worktree identity", M2_STATEMENTS},
@@ -2061,6 +2265,7 @@ static const atlas_migration MIGRATIONS[] = {
     {8, "durable orchestration control plane", M8_STATEMENTS},
     {9, "a general decision-to-decision relation", M9_STATEMENTS},
     {10, "durable evidence about a decision-to-decision edge", M10_STATEMENTS},
+    {11, "compiler-derived semantic index", M11_STATEMENTS},
 };
 
 const atlas_migration *atlas_migrations(size_t *count_out) {

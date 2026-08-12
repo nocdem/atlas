@@ -97,6 +97,24 @@ typedef struct atlas_renderer_vtbl {
                                    atlas_err *err);
     atlas_status (*code_walk_end)(atlas_renderer *r, const atlas_code_walk_summary *sum,
                                   atlas_err *err);
+    /* A8-CI: the compiler-derived index.
+     *
+     * Deliberately separate methods from the A3 ones above, not an extension of
+     * them. The two layers answer different questions with different evidence
+     * and are never merged, so a renderer that could print one where the other
+     * was meant would be exactly the conflation the season forbids. */
+    atlas_status (*sem_status)(atlas_renderer *r, const atlas_sem_status_report *rep,
+                               atlas_err *err);
+    atlas_status (*sem_symbols)(atlas_renderer *r, const atlas_sem_symbols_report *rep,
+                                atlas_err *err);
+    atlas_status (*sem_graph)(atlas_renderer *r, const atlas_sem_graph_report *rep,
+                              atlas_err *err);
+    atlas_status (*sem_indexed)(atlas_renderer *r, const atlas_sem_index_summary *sum,
+                                atlas_err *err);
+    atlas_status (*sem_impact)(atlas_renderer *r, const atlas_sem_impact_report *rep,
+                               atlas_err *err);
+    atlas_status (*sem_context)(atlas_renderer *r, const atlas_sem_context_report *rep,
+                                atlas_err *err);
     /* A named list, for the commands that emit several.
      *
      * `list_begin`/`list_end` write the count under the fixed key `count`,
@@ -158,6 +176,10 @@ typedef struct atlas_renderer_vtbl {
                                     const char *key, atlas_err *err);
     atlas_status (*backup_restored)(atlas_renderer *r, const atlas_backup_restore_report *rep,
                                     atlas_err *err);
+    /* One long-running operation's state. `message` and `detail` arrive already
+     * safe-encoded from the daemon and are printed as-is. */
+    atlas_status (*operation_status)(atlas_renderer *r, const atlas_operation_report *rep,
+                                     atlas_err *err);
     atlas_status (*maintenance)(atlas_renderer *r, const atlas_maintenance_report *rep,
                                 atlas_err *err);
 

@@ -16,6 +16,7 @@
 #include "atlas/authority.h"
 #include "atlas/backup.h"
 #include "atlas/code.h"
+#include "atlas/sem.h"
 #include "atlas/datadir.h"
 #include "atlas/db.h"
 #include "atlas/error.h"
@@ -978,6 +979,32 @@ atlas_status atlas_service_decision_link_remove_remote(const char *repo, const c
                                                        const char *target_uid, const char *note,
                                                        atlas_decision_outcome *out,
                                                        bool *removed_out, atlas_err *err);
+/* One long-running operation's state, as a client sees it.
+ *
+ * `state` is a fixed vocabulary string from the daemon and `kind` names the
+ * operation; both are Atlas-owned. `message` and `detail` are the daemon's own
+ * summary of its own artefact and arrive already safe-encoded. */
+typedef struct atlas_operation_report {
+    int64_t id;
+    atlas_buf kind;
+    atlas_buf state;
+    bool done;
+    bool succeeded;
+    int64_t duration_ms;
+    atlas_buf message;
+    atlas_buf detail;
+} atlas_operation_report;
+
+void atlas_operation_report_init(atlas_operation_report *r);
+void atlas_operation_report_free(atlas_operation_report *r);
+
+/* Asks the daemon about one accepted operation. A read, and idempotent: a
+ * record that reached a terminal state never changes, so a client may ask as
+ * often as it likes and a client that was killed mid-poll may simply ask
+ * again. */
+atlas_status atlas_service_operation_status_remote(int64_t op_id, atlas_operation_report *out,
+                                                   atlas_err *err);
+
 atlas_status atlas_service_backup_create_remote(const char *name, atlas_backup_report *out,
                                                 atlas_backup_verify_report *verified,
                                                 atlas_err *err);
@@ -1056,5 +1083,208 @@ atlas_status atlas_service_gate_show_remote(const char *repo, const char *uid,
 /* Narrows a single-decision assessment to the report `gate show` promises.
  * Shared by the local and daemon-served forms. */
 atlas_status atlas_gate_narrow_to_one(atlas_gate_report *out, const char *uid, atlas_err *err);
+
+/* --- A8-CI: the compiler-derived semantic index ----------------------------
+ *
+ * Every report here carries three things before it carries any result: which
+ * repository answered, which generation answered, and how fresh that generation
+ * is. A caller that reads only the rows would be unable to tell a current answer
+ * from one describing code that has since changed, and those must never look
+ * alike.
+ *
+ * The repository is always resolved through `atlas_service_require_repo`, which
+ * reads the persistent registry and nothing else — the one resolver CLI, RPC and
+ * MCP share. */
+
+/* Failed or unsupported translation units listed by `code status`. Bounded, and
+ * the true total is reported separately so a short list never reads as the
+ * whole story. */
+#define ATLAS_SEM_STATUS_MAX_UNITS 32
+
+typedef struct atlas_sem_failed_unit {
+    char source[512];
+    char status[16];
+    char why[96];
+    int64_t diagnostics_errors;
+} atlas_sem_failed_unit;
+
+typedef struct atlas_sem_status_report {
+    atlas_repo_info repo;
+    /* False when this Atlas was built without libclang. Reported rather than
+     * silently answering with an empty index. */
+    bool libclang_available;
+    char compiler_id[64];
+    char compiler_version[96];
+
+    bool have_generation;
+    atlas_sem_generation generation;
+    atlas_sem_freshness freshness;
+    const char *stale_reason; /* a fixed Atlas string, or NULL */
+
+    /* The most recent attempt of any status, so a failed index is visible
+     * beside the one still being served. */
+    bool have_latest;
+    atlas_sem_generation latest;
+
+    atlas_sem_failed_unit failed[ATLAS_SEM_STATUS_MAX_UNITS];
+    size_t failed_count;
+    int64_t failed_total;
+    bool failed_truncated;
+} atlas_sem_status_report;
+
+void atlas_sem_status_report_init(atlas_sem_status_report *r);
+void atlas_sem_status_report_free(atlas_sem_status_report *r);
+
+atlas_status atlas_service_sem_status(atlas_ctx *ctx, const char *name,
+                                      atlas_sem_status_report *out, atlas_err *err);
+
+typedef struct atlas_sem_symbol_item {
+    char usr[ATLAS_SEM_MAX_USR_BYTES];
+    char name[ATLAS_SEM_MAX_NAME_BYTES];
+    char kind[32];
+    char linkage[32];
+    char type_text[ATLAS_SEM_MAX_TYPE_BYTES];
+    char file_text[512];
+    char evidence[16];
+    int64_t line;
+    int64_t col;
+    int64_t end_line;
+    bool is_definition;
+    bool external;
+} atlas_sem_symbol_item;
+
+typedef struct atlas_sem_symbols_report {
+    atlas_repo_info repo;
+    atlas_sem_generation generation;
+    atlas_sem_freshness freshness;
+    const char *stale_reason;
+    char query[ATLAS_SEM_MAX_NAME_BYTES];
+    atlas_sem_symbol_item *items;
+    size_t count;
+    size_t cap;
+    int64_t total;
+    bool truncated;
+} atlas_sem_symbols_report;
+
+void atlas_sem_symbols_report_init(atlas_sem_symbols_report *r);
+void atlas_sem_symbols_report_free(atlas_sem_symbols_report *r);
+
+atlas_status atlas_service_sem_symbol(atlas_ctx *ctx, const char *name, const char *symbol,
+                                      const char *kind, int64_t limit,
+                                      atlas_sem_symbols_report *out, atlas_err *err);
+
+typedef struct atlas_sem_graph_item {
+    int64_t depth;
+    char usr[ATLAS_SEM_MAX_USR_BYTES];
+    char name[ATLAS_SEM_MAX_NAME_BYTES];
+    char file_text[512];
+    char edge_kind[32];
+    char via_name[ATLAS_SEM_MAX_NAME_BYTES];
+    char evidence[16];
+    char site_file[512];
+    int64_t line;
+    int64_t site_line;
+    int64_t candidate_total;
+} atlas_sem_graph_item;
+
+typedef struct atlas_sem_graph_report {
+    atlas_repo_info repo;
+    atlas_sem_generation generation;
+    atlas_sem_freshness freshness;
+    const char *stale_reason;
+    char query[ATLAS_SEM_MAX_NAME_BYTES * 2 + 8];
+    bool inbound;
+    atlas_sem_graph_item *items;
+    size_t count;
+    size_t cap;
+    atlas_sem_walk_summary summary;
+} atlas_sem_graph_report;
+
+void atlas_sem_graph_report_init(atlas_sem_graph_report *r);
+void atlas_sem_graph_report_free(atlas_sem_graph_report *r);
+
+/* Callers (`inbound`) or callees. Depth 1 is the direct answer; deeper is the
+ * bounded transitive one. */
+atlas_status atlas_service_sem_graph(atlas_ctx *ctx, const char *name, const char *symbol,
+                                     bool inbound, int64_t depth, int64_t limit, bool proven_only,
+                                     atlas_sem_graph_report *out, atlas_err *err);
+
+atlas_status atlas_service_sem_trace(atlas_ctx *ctx, const char *name, const char *from,
+                                     const char *to, int64_t depth, atlas_sem_graph_report *out,
+                                     atlas_err *err);
+
+/* The one mutating semantic operation.
+ *
+ * Under A7.1 the index is 0700 `atlasd`, so an operator's CLI cannot perform
+ * this locally: it routes over the socket and the daemon offers the method only
+ * to the peer the root-owned policy names. Both paths call this function, so
+ * the local and remote forms cannot drift. */
+atlas_status atlas_service_sem_index(atlas_ctx *ctx, const char *name, const char *const *compdbs,
+                                     size_t compdb_count, bool rebuild,
+                                     atlas_sem_index_summary *out, atlas_err *err);
+
+/* The indexing core, over a raw handle and an already-resolved repository.
+ *
+ * The CLI reaches it through `atlas_service_sem_index`, which resolves the
+ * repository from a context it owns; the daemon's writer thread reaches it
+ * directly, because it already holds the only writable handle and has resolved
+ * the repository from the registry. One implementation, for the reason
+ * `atlas_sem_impact_on` and `atlas_sem_context_on` are one each.
+ *
+ * It creates git and parser processes, so it must never be called with a write
+ * transaction open. */
+atlas_status atlas_sem_index_on(atlas_db *db, const atlas_repo_info *repo,
+                                const char *const *compdbs, size_t compdb_count, bool rebuild,
+                                atlas_sem_index_summary *out, atlas_err *err);
+
+/* The daemon-served form: queue the index on the writer thread and poll until
+ * it finishes. The service keeps running throughout, and no client ever has to
+ * become the service account. */
+atlas_status atlas_service_sem_index_remote(const char *name, const char *const *compdbs,
+                                            size_t compdb_count, bool rebuild,
+                                            atlas_sem_index_summary *out, atlas_err *err);
+
+/* The daemon-served forms. Same reports, same renderers; only the transport
+ * differs, which is what keeps a local answer and a socket answer from drifting
+ * apart. Under A7.1 these are the only forms that work on a deployed machine:
+ * the index is 0700 `atlasd`, so an operator has no local handle at all. */
+/* The impact core, over a raw read-only handle and an already-resolved
+ * repository. The CLI and the daemon both call this, which is what makes their
+ * answers identical by construction rather than by two functions kept in step. */
+atlas_status atlas_sem_impact_on(atlas_db *db, const atlas_repo_info *repo, const char *subject,
+                                 int64_t depth, int64_t limit, atlas_sem_impact_report *out,
+                                 atlas_err *err);
+
+/* Bounded change-impact for a symbol or a repository-relative path. Every item
+ * carries its evidence class and the fixed reason that selected it. */
+atlas_status atlas_service_sem_impact(atlas_ctx *ctx, const char *name, const char *subject,
+                                      int64_t depth, int64_t limit,
+                                      atlas_sem_impact_report *out, atlas_err *err);
+
+/* The deterministic task-context package. Reads only; task text ranks evidence
+ * and authorises nothing. */
+atlas_status atlas_sem_context_on(atlas_db *db, const atlas_repo_info *repo,
+                                  const atlas_sem_context_req *req,
+                                  atlas_sem_context_report *out, atlas_err *err);
+
+atlas_status atlas_service_sem_context(atlas_ctx *ctx, const atlas_sem_context_req *req,
+                                       atlas_sem_context_report *out, atlas_err *err);
+
+atlas_status atlas_service_sem_status_remote(const char *name, atlas_sem_status_report *out,
+                                             atlas_err *err);
+atlas_status atlas_service_sem_symbol_remote(const char *name, const char *symbol,
+                                             const char *kind, int64_t limit,
+                                             atlas_sem_symbols_report *out, atlas_err *err);
+atlas_status atlas_service_sem_graph_remote(const char *name, const char *symbol, bool inbound,
+                                            int64_t depth, int64_t limit, bool proven_only,
+                                            atlas_sem_graph_report *out, atlas_err *err);
+atlas_status atlas_service_sem_trace_remote(const char *name, const char *from, const char *to,
+                                            int64_t depth, atlas_sem_graph_report *out,
+                                            atlas_err *err);
+atlas_status atlas_service_sem_impact_remote(const char *name, const char *subject, int64_t depth,
+                                             int64_t limit, atlas_sem_impact_report *out,
+                                             atlas_err *err);
+atlas_status atlas_service_sem_context_remote(const atlas_sem_context_req *req,
+                                              atlas_sem_context_report *out, atlas_err *err);
 
 #endif /* ATLAS_SERVICE_H */

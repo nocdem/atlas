@@ -21,6 +21,9 @@
 #include "atlas/git.h"
 #include "atlas/reconcile.h"
 #include "atlas/safetext.h"
+#include "atlas/maintenance.h"
+#include "atlas/ops.h"
+#include "atlas/sem.h"
 #include "atlas/service.h"
 #include "daemon/daemon_internal.h"
 
@@ -53,6 +56,8 @@ struct atlas_writer {
     atlas_buf db_path;
     atlas_buf socket_path;
     atlas_db *db; /* owned by the writer thread only */
+    /* Where a semantic-index job records its outcome. Not owned. */
+    atlas_ops *ops;
 };
 
 /* --- logging ------------------------------------------------------------- */
@@ -426,6 +431,80 @@ static void mark_all_repos_gapped(atlas_db *db, const char *detail) {
     (void)atlas_db_repo_list(db, gap_one, &gc, &ignore);
 }
 
+
+/* A8-CI closeout: build a semantic index on the writer thread.
+ *
+ * This is the serialized writer path the closeout requires, and putting it here
+ * rather than on the operations thread is the whole point: every SQLite write
+ * in the daemon happens on this thread, on a handle it never shares. An index
+ * built anywhere else would be a second writer.
+ *
+ * It reports through the operations table instead of the completion handshake,
+ * because the client was answered when the work was *accepted* — a full index
+ * of a large repository was measured at 141 s, and no client is going to hold a
+ * socket open for that.
+ *
+ * The last valid generation is preserved by construction rather than by
+ * anything here: `atlas_sem_index_run` writes a new generation while the
+ * previous one is still being served and publishes it in one statement, so a
+ * failure at any point leaves the old generation current and a RUNNING one that
+ * nothing points at. That is also what makes a crash mid-index survivable. */
+static void run_sem_index(atlas_writer *w, atlas_job *j) {
+    atlas_err err;
+    atlas_err_init(&err);
+    atlas_sem_index_summary sum;
+    atlas_sem_index_summary_init(&sum);
+
+    atlas_repo_info repo;
+    atlas_repo_info_init(&repo);
+    bool found = false;
+    atlas_status st = atlas_db_repo_get(w->db, atlas_buf_cstr(&j->arg1), &repo, &found, &err);
+    if (st == ATLAS_OK && !found) {
+        st = atlas_err_set(&err, ATLAS_ERR_REPO,
+                           "NOT_REGISTERED: the repository was removed from the registry before "
+                           "the index could start");
+    }
+
+    /* The compilation databases arrive as a NUL-separated list and are handed
+     * on as one: they are repository-relative paths validated inside the root
+     * by the indexer, and nothing here re-resolves them from a string. */
+    const char *compdbs[ATLAS_SEM_MAX_COMPDBS];
+    size_t n = 0;
+    if (st == ATLAS_OK) {
+        const char *p = atlas_buf_cstr(&j->arg2);
+        const char *end = p + j->arg2.len;
+        while (p < end && n < ATLAS_SEM_MAX_COMPDBS) {
+            compdbs[n++] = p;
+            p += strlen(p) + 1u;
+        }
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_sem_index_on(w->db, &repo, compdbs, n, j->sem_rebuild, &sum, &err);
+    }
+
+    atlas_buf detail = ATLAS_BUF_INIT;
+    atlas_err derr;
+    atlas_err_init(&derr);
+    if (st == ATLAS_OK) {
+        /* Atlas' own counts about its own pass. Every bound that was reached is
+         * carried through, because a partial index must never be displayed the
+         * way a complete one is. */
+        (void)atlas_buf_appendf(&detail, &derr,
+                                "generation=%lld units=%lld complete=%lld partial=%lld "
+                                "failed=%lld unsupported=%lld symbols=%lld edges=%lld",
+                                (long long)sum.generation_id, (long long)sum.units_total,
+                                (long long)sum.units_complete, (long long)sum.units_partial,
+                                (long long)sum.units_failed, (long long)sum.units_unsupported,
+                                (long long)sum.symbols, (long long)sum.edges);
+    }
+    atlas_ops_finish(w->ops, j->op_id, st,
+                     st == ATLAS_OK ? "semantic index published" : atlas_err_msg(&err),
+                     atlas_buf_cstr(&detail));
+    atlas_buf_free(&detail);
+    atlas_repo_info_free(&repo);
+}
+
+
 static void *writer_main(void *arg) {
     atlas_writer *w = (atlas_writer *)arg;
 
@@ -510,6 +589,16 @@ static void *writer_main(void *arg) {
         case ATLAS_JOB_DECISION: run_decision(w, j); break;
         case ATLAS_JOB_ORCH: run_orch(w, j); break;
         case ATLAS_JOB_SNAPSHOT: run_snapshot(w, j); break;
+        case ATLAS_JOB_SEM_INDEX: run_sem_index(w, j); break;
+        case ATLAS_JOB_MAINTENANCE: {
+            /* Both pointers belong to a caller that may have stopped waiting;
+             * cleared under the lock in that case, so a NULL here means the
+             * result has nowhere to go. */
+            if (j->maint != NULL && j->maint_out != NULL) {
+                j->result = atlas_maintenance_on(w->db, j->maint, j->maint_out, &j->result_err);
+            }
+            break;
+        }
         case ATLAS_JOB_MARK_GAP: {
             atlas_err ignore;
             atlas_err_init(&ignore);
@@ -1239,5 +1328,102 @@ atlas_status atlas_writer_snapshot(atlas_writer *w, int64_t attempt_id, int time
         *err = j->result_err;
     }
     job_free(j);
+    return st;
+}
+
+/* Queues a semantic index and returns immediately.
+ *
+ * `wants_result` is deliberately false: the caller has already been given an
+ * operation id and will poll. Blocking here would put the old timeout back, one
+ * layer down. */
+atlas_status atlas_writer_submit_sem_index(atlas_writer *w, const char *name, const char *compdbs,
+                                           size_t compdbs_len, bool rebuild, int64_t op_id,
+                                           atlas_err *err) {
+    atlas_job *j = job_new(ATLAS_JOB_SEM_INDEX);
+    if (j == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory queueing a semantic index");
+    }
+    j->op_id = op_id;
+    j->sem_rebuild = rebuild;
+    atlas_status st = atlas_buf_set_str(&j->arg1, name, err);
+    if (st == ATLAS_OK && compdbs_len > 0) {
+        st = atlas_buf_append(&j->arg2, compdbs, compdbs_len, err);
+    }
+    if (st != ATLAS_OK) {
+        job_free(j);
+        return st;
+    }
+    (void)pthread_mutex_lock(&w->lock);
+    bool queued = !w->stopping && queue_push(w, j);
+    if (queued) {
+        (void)pthread_cond_signal(&w->not_empty);
+    }
+    (void)pthread_mutex_unlock(&w->lock);
+    if (!queued) {
+        job_free(j);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "the Atlas daemon's write queue is full");
+    }
+    return ATLAS_OK;
+}
+
+void atlas_writer_set_ops(atlas_writer *w, atlas_ops *ops) {
+    /* Set once, after both exist and before the serve loop starts, so no job
+     * that reports through the table can be queued while it is missing. */
+    w->ops = ops;
+}
+
+atlas_status atlas_writer_maintenance(atlas_writer *w, const atlas_maintenance_opts *opts,
+                                      atlas_maintenance_report *out, atlas_err *err) {
+    atlas_job *j = job_new(ATLAS_JOB_MAINTENANCE);
+    if (j == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory queueing a prune");
+    }
+    j->maint = opts;
+    j->maint_out = out;
+    j->wants_result = true;
+
+    (void)pthread_mutex_lock(&w->lock);
+    if (w->stopping || !queue_push(w, j)) {
+        bool stopping = w->stopping;
+        (void)pthread_mutex_unlock(&w->lock);
+        job_free(j);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                             stopping ? "the Atlas daemon is shutting down"
+                                      : "the Atlas daemon's write queue is full");
+    }
+    (void)pthread_cond_signal(&w->not_empty);
+
+    /* The caller waits, unlike an index. A prune deletes in bounded batches and
+     * a plan of the whole retention policy was measured at 78 ms, so there is
+     * nothing here that outlasts a client — and making it poll would add a
+     * mechanism to an operation that does not need one. The ceiling is generous
+     * rather than tight because the writer may be behind other work. */
+    struct timespec deadline;
+    (void)clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += 300;
+    int rc = 0;
+    while (!j->done && rc == 0) {
+        rc = pthread_cond_timedwait(&w->job_done, &w->lock, &deadline);
+    }
+    bool done = j->done;
+    atlas_status st = j->result;
+    atlas_err jerr = j->result_err;
+    if (!done) {
+        /* Detached rather than freed: the job is still the writer's. The
+         * report it was given belongs to the caller, so the writer must not
+         * touch it after this — which is what clearing the pointers does. */
+        j->wants_result = false;
+        j->maint = NULL;
+        j->maint_out = NULL;
+    }
+    (void)pthread_mutex_unlock(&w->lock);
+
+    if (!done) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                             "the Atlas daemon did not complete the prune within 300 s");
+    }
+    if (st != ATLAS_OK) {
+        *err = jerr;
+    }
     return st;
 }

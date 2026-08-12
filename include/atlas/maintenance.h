@@ -102,9 +102,35 @@ typedef struct atlas_maintenance_opts {
  * byte, and can be run while the daemon is serving. With `apply` it acquires
  * the data-directory writer lock exclusively, which means the daemon must be
  * stopped — Atlas has exactly one writer, and a maintenance pass is a writer. */
+/* The maintenance core, over a handle the caller already owns and with no lock
+ * of its own. The local entry point below opens a handle and takes the
+ * data-directory lock; the daemon calls this with the writer thread's handle,
+ * because it already holds that lock. One implementation, so the two cannot
+ * drift. */
+atlas_status atlas_maintenance_on(atlas_db *db, const atlas_maintenance_opts *opts,
+                                  atlas_maintenance_report *out, atlas_err *err);
+
 atlas_status atlas_service_maintenance(const char *data_dir_override,
                                        const atlas_maintenance_opts *opts,
                                        atlas_maintenance_report *out, atlas_err *err);
+
+/* Looks one table up in the compiled-in retention policy.
+ *
+ * Used by the socket client so that the classification, the prunable flag and
+ * the written reason come from *this* binary rather than from the wire. They
+ * are Atlas-owned constants and a report is not the place to start trusting a
+ * peer for them; only the counts cross the socket. A table this binary does not
+ * know is reported as unknown rather than invented. */
+/* The daemon-served form. Same report, same renderers; only the transport
+ * differs — which is what keeps a local answer and a socket answer from
+ * drifting apart. Offered only to the operator uid the root-owned policy
+ * names. */
+atlas_status atlas_service_maintenance_remote(const atlas_maintenance_opts *opts,
+                                              atlas_maintenance_report *out, atlas_err *err);
+
+bool atlas_maintenance_policy_lookup(const char *table, const char **table_out,
+                                     atlas_retention_class *cls_out, bool *prunable_out,
+                                     const char **reason_out);
 
 /* The compiled-in policy's table names, for the test that compares it against
  * the live schema in both directions. A table with no entry, or an entry with

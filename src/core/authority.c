@@ -313,26 +313,46 @@ atlas_status atlas_authority_require(atlas_authority_op op, atlas_err *err) {
     /* The message is long because a refusal nobody understands gets worked
      * around. It says what was refused, why, and precisely what would change
      * it — including the part Atlas cannot do for the operator. */
+    /* The `NOT_AUTHORIZED:` prefix is a stable, machine-readable token, and it is
+     * here rather than only in the prose because a caller has to be able to tell
+     * this apart from the other refusals without reading English. The four a
+     * caller must distinguish are: NOT_REGISTERED (the repository is not in the
+     * registry), an absent index, a stale index, and this — the operation exists
+     * and is visible, and this caller lacks the authority to perform it.
+     *
+     * It does *not* appear on the operator-uid RPC group, and that omission is
+     * A8's rule rather than an oversight: a peer outside that group gets
+     * `unknown method`, the same answer as a name that does not exist, because a
+     * refusal distinguishing "you may not" from "there is no such thing" tells a
+     * caller what to try next. Here the operation is already visible, so naming
+     * the reason gives nothing away. */
+    /* No newlines anywhere in this string, and that is a constraint rather than
+     * a style choice.
+     *
+     * An error message is safe-text-encoded on its way to the terminal, because
+     * parts of one can quote a path or a git identity somebody else chose, and
+     * a newline in such a value forges an output line. The encoder applies to
+     * the whole string and cannot tell Atlas' own control text from an
+     * interpolated value — so the `\n`-formatted version of this message
+     * printed as a single unreadable run of `%0A`, which is how the most
+     * important refusal Atlas has became the least readable thing it prints.
+     *
+     * Exempting the message from encoding would reopen the hole for the part of
+     * it that is not Atlas-owned. Keeping the structure and the newlines was
+     * never available. So the structure is carried by punctuation instead, and
+     * every fact the earlier layout carried is still here. */
     return atlas_err_set(
         err, ATLAS_ERR_CONFIG,
-        "%s is locked in this Atlas profile.\n"
-        "\n"
-        "  reason : %s\n"
-        "  detail : %s\n"
-        "  caller : uid %lld\n"
-        "\n"
-        "Atlas cannot tell a person from a program running as the same user. A terminal, a "
+        "NOT_AUTHORIZED: %s is locked in this Atlas profile. Reason: %s (%s). Caller: uid %lld. "
+        "Atlas cannot tell a person from a program running as the same user; a terminal, a "
         "pseudo-terminal, a typed confirmation and an environment variable are all producible "
         "by any process with this uid, so none of them is treated as evidence that an operator "
-        "acted.\n"
-        "\n"
-        "To enable this operation, a separate OS principal has to exist and Atlas has to be "
-        "told about it:\n"
-        "  1. run the Atlas daemon and its data directory as a uid the model does not have;\n"
-        "  2. install %s, owned by root, mode 0644, on a root-owned path, containing\n"
-        "     operator_uid = <the human's uid>;\n"
-        "  3. install the atlas executable root-owned and not writable by any other uid.\n"
-        "Both steps need root and neither is something Atlas will do to a machine by itself. "
+        "acted. To enable this operation a separate OS principal has to exist and Atlas has to "
+        "be told about it: (1) run the Atlas daemon and its data directory as a uid the model "
+        "does not have; (2) install %s, owned by root, mode 0644, on a root-owned path, "
+        "containing `operator_uid = <the human's uid>`; (3) install the atlas executable "
+        "root-owned and not writable by any other uid. All three need root and none is "
+        "something Atlas will do to a machine by itself. "
         "See docs/security/A7_SECURITY_REVIEW.md.",
         atlas_authority_op_name(op), atlas_authority_reason_name(a.reason),
         atlas_authority_reason_explain(a.reason), a.caller_uid, ATLAS_AUTHORITY_POLICY_PATH);

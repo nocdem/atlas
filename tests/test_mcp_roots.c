@@ -419,11 +419,18 @@ static void test_a_subdirectory_root_does_not_register_its_parent(void) {
      * index files it did not grant, so the refusal is the correct outcome. */
     T_EQ_INT(repo_count(&e, &err), 0);
     /* And it fails clearly rather than silently: the tool reports an error and
-     * says why. */
+     * says why.
+     *
+     * The call named no repository, so the roots were consulted for a *default*
+     * and produced none — and the registry is empty, so there is no default to
+     * fall back to either. The refusal names the registry rather than the
+     * granted root, because the registry is what decides: a granted root that
+     * happens to be a worktree would still not be readable until an operator
+     * registered it. */
     bool degraded = false;
     T_CHECK(last_result_flag(&out, "degraded", &degraded) || strstr(atlas_buf_cstr(&out),
                                                                     "isError") != NULL);
-    T_CHECK_MSG(strstr(atlas_buf_cstr(&out), "worktree") != NULL,
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&out), "no repository is registered") != NULL,
                 "the refusal did not explain itself: %s", atlas_buf_cstr(&out));
     /* Non-destructive: the repository is untouched. */
     char digest[65];
@@ -452,11 +459,22 @@ static void test_root_changes_update_the_authorization_set(void) {
     register_repo(&e, atlas_buf_cstr(&two), "second", &err);
 
     /* Grant both, then send list_changed with only the second, then ask about
-     * the first by name. A revoked root must stop authorizing immediately.
+     * the first by name.
      *
-     * Both are registered up front now: revocation is about what a granted root
-     * *authorizes*, which is a separate question from what is registered, and
-     * since A7 the session cannot answer the second one at all. */
+     * **The first must still answer, and that is the point of this test.**
+     *
+     * It previously asserted the opposite: that revoking a root immediately
+     * stopped Atlas answering about the repository it had named. That coupling
+     * was the defect. A root is client filesystem context — where this session
+     * happens to be looking — and it was never evidence about what an operator
+     * has authorised Atlas to hold. Deriving readability from it meant that a
+     * session started in one registered repository could not read another,
+     * which protected nothing: an operator had registered both, and the model
+     * reached the second one by being started somewhere else.
+     *
+     * Registration is the allowlist, and only an operator changes it. So what a
+     * roots change actually updates is which repository is chosen when the
+     * caller names none — the default — and this test now asserts that. */
     atlas_buf script = ATLAS_BUF_INIT;
     T_OK(atlas_buf_appendf(
              &script, &err,
@@ -484,7 +502,6 @@ static void test_root_changes_update_the_authorization_set(void) {
     /* Three tool responses. The middle one — "first" after it was revoked —
      * must be an error; the others must not be. */
     size_t results = 0;
-    size_t errors_at[8];
     size_t error_count = 0;
     const char *p = atlas_buf_cstr(&out);
     while (*p != '\0') {
@@ -497,8 +514,8 @@ static void test_root_changes_update_the_authorization_set(void) {
             if (flag != NULL && (nl == NULL || flag < nl)) {
                 is_error = strncmp(flag + 10, "true", 4u) == 0;
             }
-            if (is_error && error_count < 8u) {
-                errors_at[error_count++] = results;
+            if (is_error) {
+                error_count++;
             }
             results++;
         }
@@ -508,13 +525,17 @@ static void test_root_changes_update_the_authorization_set(void) {
         p = nl + 1;
     }
     T_CHECK_MSG(results == 3, "expected 3 tool results, got %zu", results);
-    T_CHECK_MSG(error_count == 1, "expected exactly one refused call, got %zu", error_count);
-    if (error_count == 1) {
-        T_CHECK_MSG(errors_at[0] == 1, "the refused call was #%zu, expected the second",
-                    errors_at[0]);
-    }
-    T_CHECK_MSG(strstr(atlas_buf_cstr(&out), "authorized") != NULL,
-                "the refusal did not say it was an authorization failure");
+    /* All three succeed. `first` is answered before the revocation and after
+     * it, because it is registered, and `second` is answered because it is
+     * registered too. Withdrawing a root removed a *default*, not a permission.
+     *
+     * The assertion that the middle call fails is the one this test used to
+     * make, and it is the behaviour the product contract now forbids. Leaving
+     * it in place would have pinned the defect. */
+    T_CHECK_MSG(error_count == 0, "a registered repository was refused after a roots change: %s",
+                atlas_buf_cstr(&out));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&out), "NOT_REGISTERED") == NULL,
+                "a registered repository was reported NOT_REGISTERED");
 
     atlas_buf_free(&out);
     atlas_buf_free(&errout);
@@ -619,7 +640,7 @@ static const atlas_test TESTS[] = {
      test_multiple_roots_and_worktrees},
     {"a subdirectory root does not register its parent worktree",
      test_a_subdirectory_root_does_not_register_its_parent},
-    {"a revoked root stops authorizing immediately",
+    {"a roots change moves the default and never revokes a registration",
      test_root_changes_update_the_authorization_set},
     {"a root whose path contains a space works end to end",
      test_a_root_with_a_space_works_end_to_end},

@@ -20,6 +20,9 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <sqlite3.h>
+
+#include "atlas/db.h"
 #include "atlas/proc.h"
 #include "atlas/sha256.h"
 
@@ -1114,6 +1117,7 @@ void fx_daemon_init(fx_daemon *d) {
     atlas_buf_init(&d->runtime_dir);
     atlas_buf_init(&d->socket);
     atlas_buf_init(&d->log_path);
+    atlas_buf_init(&d->data_dir);
 }
 
 void fx_daemon_free(fx_daemon *d) {
@@ -1123,9 +1127,14 @@ void fx_daemon_free(fx_daemon *d) {
     atlas_buf_free(&d->runtime_dir);
     atlas_buf_free(&d->socket);
     atlas_buf_free(&d->log_path);
+    atlas_buf_free(&d->data_dir);
 }
 
 atlas_status fx_daemon_start(fixture *fx, fx_daemon *d, atlas_err *err) {
+    atlas_status dst = atlas_buf_set_str(&d->data_dir, fx_data_dir(fx), err);
+    if (dst != ATLAS_OK) {
+        return dst;
+    }
     atlas_status st = atlas_buf_set(&d->runtime_dir, fx->root.data, fx->root.len, err);
     if (st == ATLAS_OK) {
         st = atlas_buf_append_str(&d->runtime_dir, "/run", err);
@@ -1205,6 +1214,39 @@ atlas_status fx_daemon_start(fixture *fx, fx_daemon *d, atlas_err *err) {
     return ATLAS_OK;
 }
 
+/* True when the index on disk has reached this binary's schema version.
+ *
+ * Read directly rather than asked over the socket: the question is about the
+ * state a *local* reader would find, which is exactly the state that was racing
+ * the daemon's own migration. */
+static bool fx_daemon_schema_ready(const fx_daemon *d) {
+    atlas_buf path = ATLAS_BUF_INIT;
+    atlas_err ignored;
+    atlas_err_init(&ignored);
+    if (atlas_buf_appendf(&path, &ignored, "%s/atlas.db", atlas_buf_cstr(&d->data_dir)) !=
+        ATLAS_OK) {
+        atlas_buf_free(&path);
+        return false;
+    }
+    sqlite3 *h = NULL;
+    bool ready = false;
+    if (sqlite3_open_v2(atlas_buf_cstr(&path), &h, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
+        sqlite3_stmt *q = NULL;
+        if (sqlite3_prepare_v2(h, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations;", -1,
+                               &q, NULL) == SQLITE_OK) {
+            if (sqlite3_step(q) == SQLITE_ROW) {
+                ready = sqlite3_column_int(q, 0) >= ATLAS_SCHEMA_VERSION;
+            }
+            (void)sqlite3_finalize(q);
+        }
+    }
+    if (h != NULL) {
+        (void)sqlite3_close(h);
+    }
+    atlas_buf_free(&path);
+    return ready;
+}
+
 atlas_status fx_daemon_wait_ready(fx_daemon *d, int timeout_ms, atlas_err *err) {
     /* Polls the socket rather than sleeping a guessed interval, so the test is
      * neither flaky on a slow machine nor artificially slow on a fast one. */
@@ -1217,9 +1259,26 @@ atlas_status fx_daemon_wait_ready(fx_daemon *d, int timeout_ms, atlas_err *err) 
             (void)snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", atlas_buf_cstr(&d->socket));
             if (connect(fd, (const struct sockaddr *)&addr, sizeof(addr)) == 0) {
                 (void)close(fd);
-                return ATLAS_OK;
+                /* Accepting a connection is not the same as being usable.
+                 *
+                 * The daemon binds its socket while the writer thread is still
+                 * migrating the database, so there is a window where a client
+                 * connects successfully and a *local* read of the same index
+                 * sees a half-migrated schema. Waiting only for `connect` made
+                 * daemon tests intermittently fail with "database schema is at
+                 * version N but this Atlas expects M" — a real message about a
+                 * real transient state, arriving because the fixture asked the
+                 * wrong question.
+                 *
+                 * So readiness additionally requires the schema on disk to have
+                 * reached this binary's version. A test that then opens the
+                 * index locally sees what the daemon sees. */
+                if (fx_daemon_schema_ready(d)) {
+                    return ATLAS_OK;
+                }
+            } else {
+                (void)close(fd);
             }
-            (void)close(fd);
         }
         if (fx_daemon_exited(d)) {
             return atlas_err_set(err, ATLAS_ERR_INTERNAL,

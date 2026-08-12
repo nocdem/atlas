@@ -64,6 +64,17 @@ typedef struct atlas_proc_opts {
      * through the same status pipe an exec failure uses, so a command whose
      * directory is missing never runs somewhere else instead. */
     const char *cwd;
+    /* A8-CI addition. Bytes of address space the child may map, applied with
+     * RLIMIT_AS after the fork and before the execve. 0 means no ceiling, which
+     * is what every earlier caller passes and gets.
+     *
+     * This exists because the semantic indexer hands untrusted repository source
+     * to a compiler front end, and a front end holds a whole translation unit's
+     * AST in memory. The bound is enforced by the kernel — the child's
+     * allocation fails and it dies — rather than by asking the child to behave,
+     * which is the same reason A7.1 prefers a filesystem guarantee to a check in
+     * C. */
+    unsigned long long max_address_space;
 } atlas_proc_opts;
 
 #define ATLAS_PROC_DEFAULT_TIMEOUT_MS 60000

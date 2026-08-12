@@ -122,9 +122,32 @@ static void test_arguments_allowlist(void) {
     atlas_code_compdb_free(&c);
 }
 
-static void test_command_is_hashed_not_stored(void) {
+/* A8-CI reversed one A3 decision here, and the reversal is stated rather than
+ * quietly absorbed.
+ *
+ * A3 refused to read the `command` string at all, on the grounds that splitting
+ * it would be "the beginning of interpreting a command line". The reasoning was
+ * sound and the consequence was not: CMake writes the string form, so Atlas
+ * could not read the compilation database of most real repositories — it
+ * extracted nothing, every translation unit parsed without its include paths,
+ * and the result was an index that looked built and described almost nothing.
+ *
+ * What Atlas does now is **word splitting and nothing else**. It honours
+ * backslash, single quotes and double quotes — the three ways a build system
+ * protects a space — and performs no expansion of any kind: no variables, no
+ * command substitution, no globbing, no tilde. The tokens then go through
+ * exactly the same positive allowlist the `arguments` array form goes through,
+ * so the string form cannot reach anything the array form could not.
+ *
+ * The cost, stated plainly: a value passed as `-DSECRET=...` is now recorded
+ * from a command string, exactly as it always was from an `arguments` array.
+ * Atlas cannot tell a secret define from an ordinary one — `-DSECRET=hunter2`
+ * and `-DNDEBUG` are the same shape — so the asymmetry A3 had was accidental
+ * rather than a guarantee. A compilation database is part of a build tree, and
+ * anything in it is as exposed as the build tree is. */
+static void test_command_is_split_but_never_interpreted(void) {
     atlas_code_compdb c;
-    const char *cmd = "/usr/bin/cc -DSECRET=hunter2 -c src/a.c -o a.o";
+    const char *cmd = "/usr/bin/cc -DSECRET=hunter2 -I\\\"/repo/inc\\\" -c src/a.c -o a.o";
     char json[512];
     (void)snprintf(json, sizeof(json),
                    "[{\"directory\":\"/repo\",\"file\":\"src/a.c\",\"command\":\"%s\"}]", cmd);
@@ -134,17 +157,160 @@ static void test_command_is_hashed_not_stored(void) {
     T_CHECK(cu->command_present);
     T_EQ_INT(strlen(cu->command_hash), ATLAS_SHA256_HEX_LEN);
 
-    /* The string itself is nowhere in the result. Searched as raw bytes across
-     * the whole arena, so a value stored in a field nobody thought to check is
-     * still caught. A value nothing holds is a value nothing can run. */
-    T_CHECK(!bytes_contain(c.arena.data, c.arena.len, "hunter2"));
+    /* The raw command text is still never stored. The compiler path is not on
+     * the allowlist, so it is dropped rather than kept — a value nothing holds
+     * is a value nothing can run. */
     T_CHECK(!bytes_contain(c.arena.data, c.arena.len, "/usr/bin/cc"));
 
-    /* `command` is not parsed either: it carries `-DSECRET` and no define is
-     * recorded from it. Shell-splitting it would be the beginning of
-     * interpreting a command line, which Atlas does not do. */
-    T_EQ_INT(cu->define_count, 0);
+    /* The allowlisted arguments are extracted, uniformly with the array form.
+     * Without this the whole compilation configuration is lost. */
+    T_CHECK(has_define(&c, cu, "SECRET", "hunter2", false));
+    T_EQ_STR(atlas_code_compdb_str(&c, cu->output_off), "a.o");
     atlas_code_compdb_free(&c);
+}
+
+/* Splitting is not evaluating, and this is where that is asserted.
+ *
+ * Every shape below is one a shell would act on. Atlas acts on none of them:
+ * each becomes literal bytes inside one token, and a token that is not on the
+ * allowlist is counted and dropped. Nothing is expanded, nothing is opened and
+ * nothing is executed. */
+static void test_a_command_string_is_never_expanded(void) {
+    atlas_code_compdb c;
+    /* Written as it would appear in the file: JSON escapes are doubled here so
+     * the parser sees one backslash, and the shell forms below are therefore
+     * genuinely present in the command string Atlas reads. */
+    const char *cmd = "cc -DA=$(id) -DB=`whoami` -DC=$HOME -I/repo/*/inc "
+                      "-I'/repo/a b/inc' -I/repo/inc;rm -rf / -c src/a.c";
+    char json[1024];
+    (void)snprintf(json, sizeof(json),
+                   "[{\"directory\":\"/repo\",\"file\":\"src/a.c\",\"command\":\"%s\"}]", cmd);
+    parse(json, &c);
+    const atlas_code_cu *cu = unit_for(&c, "src/a.c");
+    T_REQUIRE(cu != NULL);
+
+    /* The substitutions survive as text, which is exactly what "not evaluated"
+     * looks like: had anything run them, the recorded value would be a user
+     * name or a home directory instead of the characters that ask for one. */
+    T_CHECK(has_define(&c, cu, "A", "$(id)", false));
+    T_CHECK(has_define(&c, cu, "B", "`whoami`", false));
+    T_CHECK(has_define(&c, cu, "C", "$HOME", false));
+    /* A glob is a directory name containing an asterisk, not a set of
+     * directories: Atlas expands nothing and opens nothing here. */
+    T_CHECK(bytes_contain(c.arena.data, c.arena.len, "*"));
+    /* Single quotes protect a space, which is the one thing splitting has to
+     * get right — otherwise a directory with a space in its name silently
+     * becomes two arguments and neither exists. */
+    T_CHECK(has_incdir(&c, cu, "a b/inc", ATLAS_CODE_INCDIR_SEARCH, false));
+    /* `;` is an ordinary byte in a directory name. Nothing splits on it,
+     * because nothing here is a shell: the `rm` that follows becomes a separate
+     * token that is simply not on the allowlist and is dropped. */
+    T_CHECK(bytes_contain(c.arena.data, c.arena.len, "inc;rm"));
+    atlas_code_compdb_free(&c);
+}
+
+/* The splitter's own edge cases.
+ *
+ * Hand-written string scanning is where a reader walks off the end, and every
+ * case below is one that would: a quote nobody closed, a backslash with nothing
+ * after it, a token longer than the ceiling, bytes that are not UTF-8, and more
+ * arguments than Atlas walks. None of them may crash, hang, or silently produce
+ * a *different* argument from the one that was written — a truncated `-I` names
+ * a directory that was never asked for, which is worse than dropping it. */
+static void test_the_splitter_survives_its_edges(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+
+    /* An unterminated single quote, an unterminated double quote, and a
+     * trailing backslash. Each ends the string mid-token; the token is closed
+     * at end-of-input rather than read past it. */
+    static const char *const RAGGED[] = {
+        "cc -DA=1 -I'unclosed",
+        "cc -DA=1 -I\\\"unclosed",
+        "cc -DA=1 -Iend\\",
+        "cc",
+        "",
+        "   ",
+        "''",
+        "\\",
+    };
+    for (size_t i = 0; i < sizeof(RAGGED) / sizeof(RAGGED[0]); i++) {
+        atlas_code_compdb c;
+        char json[512];
+        (void)snprintf(json, sizeof(json),
+                       "[{\"directory\":\"/repo\",\"file\":\"src/a.c\",\"command\":\"%s\"}]",
+                       RAGGED[i]);
+        atlas_code_compdb_init(&c);
+        /* Never a failure: a malformed command line is an ordinary outcome and
+         * must not take a pass down. */
+        T_OK(atlas_code_compdb_parse(json, strlen(json), ROOT, strlen(ROOT), &c, &err), &err);
+        atlas_code_compdb_free(&c);
+    }
+
+    /* A token past ATLAS_CODE_MAX_ARG_BYTES is dropped whole, never shortened.
+     * Asserted by looking for a prefix of it: if truncation had happened, a
+     * shortened directory name would be sitting in the arena. */
+    {
+        atlas_code_compdb c;
+        atlas_buf big = ATLAS_BUF_INIT;
+        T_OK(atlas_buf_append_str(&big, "[{\"directory\":\"/repo\",\"file\":\"src/a.c\","
+                                        "\"command\":\"cc -I/repo/",
+                                  &err),
+             &err);
+        for (size_t i = 0; i < ATLAS_CODE_MAX_ARG_BYTES + 64u; i++) {
+            T_OK(atlas_buf_append_str(&big, "z", &err), &err);
+        }
+        T_OK(atlas_buf_append_str(&big, " -DKEEP=1 -c src/a.c\"}]", &err), &err);
+        atlas_code_compdb_init(&c);
+        T_OK(atlas_code_compdb_parse(big.data, big.len, ROOT, strlen(ROOT), &c, &err), &err);
+        const atlas_code_cu *cu = unit_for(&c, "src/a.c");
+        if (cu != NULL) {
+            T_CHECK_MSG(!bytes_contain(c.arena.data, c.arena.len, "zzzzzzzzzzzzzzzzzzzz"),
+                        "an oversized argument was truncated instead of dropped");
+            /* The rest of the line still parses: one bad argument costs one
+             * argument, not the whole configuration. */
+            T_CHECK(has_define(&c, cu, "KEEP", "1", false));
+        }
+        atlas_code_compdb_free(&c);
+        atlas_buf_free(&big);
+    }
+
+    /* More arguments than Atlas walks. The ceiling is recorded rather than
+     * silently applied, so a caller can tell a short list from a complete one. */
+    {
+        atlas_code_compdb c;
+        atlas_buf many = ATLAS_BUF_INIT;
+        T_OK(atlas_buf_append_str(
+                 &many, "[{\"directory\":\"/repo\",\"file\":\"src/a.c\",\"command\":\"cc", &err),
+             &err);
+        for (int i = 0; i < ATLAS_CODE_MAX_COMPILE_ARGS + 32; i++) {
+            T_OK(atlas_buf_appendf(&many, &err, " -DX%d=1", i), &err);
+        }
+        T_OK(atlas_buf_append_str(&many, " -c src/a.c\"}]", &err), &err);
+        atlas_code_compdb_init(&c);
+        T_OK(atlas_code_compdb_parse(many.data, many.len, ROOT, strlen(ROOT), &c, &err), &err);
+        T_CHECK_MSG(c.truncated, "an over-long argument vector was not reported as truncated");
+        atlas_code_compdb_free(&c);
+        atlas_buf_free(&many);
+    }
+
+    /* Bytes that are not valid UTF-8, inside a directory name. Paths are bytes
+     * and Atlas must neither reject them for being unprintable nor reinterpret
+     * them; the splitter copies bytes and says nothing about their encoding.
+     * (JSON itself must stay valid, so the invalid bytes arrive as escapes the
+     * reader decodes.) */
+    {
+        atlas_code_compdb c;
+        const char *json = "[{\"directory\":\"/repo\",\"file\":\"src/a.c\","
+                           "\"command\":\"cc -I/repo/\\u00ff\\u00fe -DA=1 -c src/a.c\"}]";
+        atlas_code_compdb_init(&c);
+        T_OK(atlas_code_compdb_parse(json, strlen(json), ROOT, strlen(ROOT), &c, &err), &err);
+        const atlas_code_cu *cu = unit_for(&c, "src/a.c");
+        if (cu != NULL) {
+            T_CHECK(has_define(&c, cu, "A", "1", false));
+        }
+        atlas_code_compdb_free(&c);
+    }
 }
 
 static void test_hostile_command_strings(void) {
@@ -643,7 +809,10 @@ static void test_a_crashed_pass_relinks_the_unit_edges(void) {
 
 static const atlas_test TESTS[] = {
     {"the argument allowlist", test_arguments_allowlist},
-    {"the command is hashed, not stored", test_command_is_hashed_not_stored},
+    {"a command string is split but never interpreted",
+     test_command_is_split_but_never_interpreted},
+    {"a command string is never expanded", test_a_command_string_is_never_expanded},
+    {"the splitter survives its edges", test_the_splitter_survives_its_edges},
     {"hostile command strings", test_hostile_command_strings},
     {"response files and plugins are dropped", test_response_files_and_plugins_are_dropped},
     {"paths outside the repository", test_paths_outside_the_repository},

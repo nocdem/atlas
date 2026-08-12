@@ -1433,6 +1433,303 @@ static atlas_status j_gate(atlas_renderer *r, const atlas_gate_report *rep, atla
     return atlas_json_obj_end(j, err);
 }
 
+
+/* --- A8-CI: the compiler-derived semantic index --------------------------
+ *
+ * Every field the human renderer prints appears here, under a stable key, and
+ * every evidence class travels with its fact. A JSON consumer that could read
+ * the rows without the class would be able to treat a candidate as a
+ * resolution, which is the one thing this layer must never allow.
+ *
+ * Symbol names, file paths and type spellings are repository-derived and
+ * therefore untrusted, so they go through the safe encoder at the point of
+ * output. Vocabulary values (kinds, linkages, evidence classes, freshness,
+ * truncation reasons) are Atlas' own literals and are emitted as-is. */
+
+static atlas_status j_sem_generation(atlas_renderer *r, const atlas_sem_generation *g,
+                                     atlas_err *err) {
+    TRY(atlas_json_key(r->j, "generation", err));
+    TRY(atlas_json_obj_begin(r->j, err));
+    TRY(atlas_json_key_int(r->j, "id", g->id, err));
+    TRY(atlas_json_key_str(r->j, "status", atlas_sem_gen_status_name(g->status), err));
+    TRY(atlas_json_key_str_opt(r->j, "commit", g->commit_id, err));
+    TRY(atlas_json_key_str_opt(r->j, "compdb_digest", g->compdb_digest, err));
+    TRY(atlas_json_key_int(r->j, "compdb_count", g->compdb_count, err));
+    TRY(atlas_json_key_str_opt(r->j, "compiler_id", g->compiler_id, err));
+    TRY(atlas_json_key_str_opt(r->j, "compiler_version", g->compiler_version, err));
+    TRY(atlas_json_key_str_opt(r->j, "analyzer_id", g->analyzer_id, err));
+    TRY(atlas_json_key_int(r->j, "analyzer_version", g->analyzer_version, err));
+    TRY(atlas_json_key_str_opt(r->j, "started_at", g->started_at, err));
+    TRY(atlas_json_key_str_opt(r->j, "completed_at", g->completed_at, err));
+    TRY(atlas_json_key_int(r->j, "tu_total", g->tu_total, err));
+    TRY(atlas_json_key_int(r->j, "tu_complete", g->tu_complete, err));
+    TRY(atlas_json_key_int(r->j, "tu_partial", g->tu_partial, err));
+    TRY(atlas_json_key_int(r->j, "tu_failed", g->tu_failed, err));
+    TRY(atlas_json_key_int(r->j, "tu_unsupported", g->tu_unsupported, err));
+    TRY(atlas_json_key_int(r->j, "symbols", g->symbol_count, err));
+    TRY(atlas_json_key_int(r->j, "edges", g->edge_count, err));
+    TRY(atlas_json_key_int(r->j, "includes", g->include_count, err));
+    TRY(atlas_json_key_int(r->j, "duration_ms", g->duration_ms, err));
+    TRY(atlas_json_key_str_opt(r->j, "failure_reason", g->failure_reason, err));
+    return atlas_json_obj_end(r->j, err);
+}
+
+static atlas_status j_sem_status(atlas_renderer *r, const atlas_sem_status_report *rep,
+                                 atlas_err *err) {
+    TRY(atlas_json_key_str(r->j, "repo", rep->repo.name, err));
+    TRY(atlas_json_key_bool(r->j, "libclang_available", rep->libclang_available, err));
+    TRY(atlas_json_key_str_opt(r->j, "compiler_id", rep->compiler_id, err));
+    TRY(atlas_json_key_str_opt(r->j, "compiler_version", rep->compiler_version, err));
+    TRY(atlas_json_key_str(r->j, "freshness", atlas_sem_freshness_name(rep->freshness), err));
+    /* Checked against Atlas' own closed set before it is emitted, so a value
+     * from anywhere else becomes absent rather than being reproduced. */
+    TRY(atlas_json_key_str_opt(
+        r->j, "stale_reason",
+        atlas_sem_stale_reason_is_known(rep->stale_reason) ? rep->stale_reason : NULL, err));
+    TRY(atlas_json_key_bool(r->j, "have_generation", rep->have_generation, err));
+    if (rep->have_generation) {
+        TRY(j_sem_generation(r, &rep->generation, err));
+    }
+    if (rep->have_latest) {
+        TRY(atlas_json_key(r->j, "latest_attempt", err));
+        TRY(atlas_json_obj_begin(r->j, err));
+        TRY(atlas_json_key_int(r->j, "id", rep->latest.id, err));
+        TRY(atlas_json_key_str(r->j, "status", atlas_sem_gen_status_name(rep->latest.status),
+                               err));
+        TRY(atlas_json_key_str_opt(r->j, "failure_reason", rep->latest.failure_reason, err));
+        TRY(atlas_json_obj_end(r->j, err));
+    }
+
+    TRY(atlas_json_key_int(r->j, "units_not_complete", rep->failed_total, err));
+    TRY(atlas_json_key_bool(r->j, "units_truncated", rep->failed_truncated, err));
+    TRY(atlas_json_key(r->j, "units", err));
+    TRY(atlas_json_arr_begin(r->j, err));
+    for (size_t i = 0; i < rep->failed_count; i++) {
+        const atlas_sem_failed_unit *u = &rep->failed[i];
+        TRY(atlas_json_obj_begin(r->j, err));
+        TRY(json_safe(r->j, &r->safe, "source", u->source, err));
+        TRY(atlas_json_key_str(r->j, "status", u->status, err));
+        TRY(atlas_json_key_str_opt(r->j, "why", atlas_sem_why_is_known(u->why) ? u->why : NULL,
+                                   err));
+        TRY(atlas_json_key_int(r->j, "diagnostics_errors", u->diagnostics_errors, err));
+        TRY(atlas_json_obj_end(r->j, err));
+    }
+    return atlas_json_arr_end(r->j, err);
+}
+
+static atlas_status j_sem_freshness(atlas_renderer *r, atlas_sem_freshness f, const char *reason,
+                                    const atlas_sem_generation *g, atlas_err *err) {
+    TRY(atlas_json_key_str(r->j, "freshness", atlas_sem_freshness_name(f), err));
+    TRY(atlas_json_key_str_opt(r->j, "stale_reason",
+                               atlas_sem_stale_reason_is_known(reason) ? reason : NULL, err));
+    TRY(atlas_json_key_int(r->j, "generation_id", g->id, err));
+    return atlas_json_key_str_opt(r->j, "indexed_commit", g->commit_id, err);
+}
+
+static atlas_status j_sem_symbols(atlas_renderer *r, const atlas_sem_symbols_report *rep,
+                                  atlas_err *err) {
+    TRY(atlas_json_key_str(r->j, "repo", rep->repo.name, err));
+    TRY(j_sem_freshness(r, rep->freshness, rep->stale_reason, &rep->generation, err));
+    TRY(json_safe(r->j, &r->safe, "query", rep->query, err));
+    TRY(atlas_json_key_bool(r->j, "truncated", rep->truncated, err));
+    TRY(atlas_json_key(r->j, "symbols", err));
+    TRY(atlas_json_arr_begin(r->j, err));
+    for (size_t i = 0; i < rep->count; i++) {
+        const atlas_sem_symbol_item *s = &rep->items[i];
+        TRY(atlas_json_obj_begin(r->j, err));
+        TRY(json_safe(r->j, &r->safe, "usr", s->usr, err));
+        TRY(json_safe(r->j, &r->safe, "name", s->name, err));
+        TRY(atlas_json_key_str(r->j, "kind", s->kind, err));
+        TRY(atlas_json_key_str(r->j, "linkage", s->linkage, err));
+        TRY(json_safe(r->j, &r->safe, "type", s->type_text, err));
+        TRY(atlas_json_key_bool(r->j, "is_definition", s->is_definition, err));
+        TRY(atlas_json_key_bool(r->j, "external", s->external, err));
+        /* An external entity has no location Atlas indexed, so none is
+         * emitted — an empty path would read as a file at the repository root. */
+        if (!s->external) {
+            TRY(json_safe(r->j, &r->safe, "file", s->file_text, err));
+            TRY(atlas_json_key_int(r->j, "line", s->line, err));
+            TRY(atlas_json_key_int(r->j, "col", s->col, err));
+            TRY(atlas_json_key_int(r->j, "end_line", s->end_line, err));
+        }
+        TRY(atlas_json_key_str(r->j, "evidence", s->evidence, err));
+        TRY(atlas_json_obj_end(r->j, err));
+    }
+    return atlas_json_arr_end(r->j, err);
+}
+
+static atlas_status j_sem_graph(atlas_renderer *r, const atlas_sem_graph_report *rep,
+                                atlas_err *err) {
+    TRY(atlas_json_key_str(r->j, "repo", rep->repo.name, err));
+    TRY(j_sem_freshness(r, rep->freshness, rep->stale_reason, &rep->generation, err));
+    TRY(json_safe(r->j, &r->safe, "query", rep->query, err));
+    TRY(atlas_json_key_str(r->j, "direction", rep->inbound ? "callers" : "callees", err));
+    TRY(atlas_json_key(r->j, "nodes", err));
+    TRY(atlas_json_arr_begin(r->j, err));
+    for (size_t i = 0; i < rep->count; i++) {
+        const atlas_sem_graph_item *g = &rep->items[i];
+        TRY(atlas_json_obj_begin(r->j, err));
+        TRY(atlas_json_key_int(r->j, "depth", g->depth, err));
+        TRY(json_safe(r->j, &r->safe, "usr", g->usr, err));
+        TRY(json_safe(r->j, &r->safe, "name", g->name, err));
+        TRY(json_safe(r->j, &r->safe, "file", g->file_text, err));
+        TRY(atlas_json_key_int(r->j, "line", g->line, err));
+        TRY(atlas_json_key_str(r->j, "edge_kind", g->edge_kind, err));
+        TRY(json_safe(r->j, &r->safe, "via", g->via_name, err));
+        TRY(atlas_json_key_str(r->j, "evidence", g->evidence, err));
+        TRY(json_safe(r->j, &r->safe, "site_file", g->site_file, err));
+        TRY(atlas_json_key_int(r->j, "site_line", g->site_line, err));
+        /* The true number of candidate targets, which may exceed how many were
+         * recorded. Reported so an ambiguity never looks smaller than it is. */
+        TRY(atlas_json_key_int(r->j, "candidate_total", g->candidate_total, err));
+        TRY(atlas_json_obj_end(r->j, err));
+    }
+    TRY(atlas_json_arr_end(r->j, err));
+
+    const atlas_sem_walk_summary *s = &rep->summary;
+    TRY(atlas_json_key(r->j, "summary", err));
+    TRY(atlas_json_obj_begin(r->j, err));
+    TRY(atlas_json_key_int(r->j, "visited", s->visited, err));
+    TRY(atlas_json_key_int(r->j, "emitted", s->emitted, err));
+    TRY(atlas_json_key_int(r->j, "max_depth_reached", s->max_depth_reached, err));
+    TRY(atlas_json_key_int(r->j, "proven", s->proven, err));
+    TRY(atlas_json_key_int(r->j, "candidate", s->candidate, err));
+    TRY(atlas_json_key_int(r->j, "lexical", s->lexical, err));
+    TRY(atlas_json_key_int(r->j, "unknown", s->unknown, err));
+    TRY(atlas_json_key_int(r->j, "unresolved_indirect", s->unresolved_indirect, err));
+    TRY(atlas_json_key_bool(r->j, "truncated", s->truncated, err));
+    TRY(atlas_json_key_str_opt(
+        r->j, "truncated_reason",
+        atlas_sem_trunc_reason_is_known(s->truncated_reason) ? s->truncated_reason : NULL, err));
+    return atlas_json_obj_end(r->j, err);
+}
+
+static atlas_status j_sem_indexed(atlas_renderer *r, const atlas_sem_index_summary *sum,
+                                  atlas_err *err) {
+    TRY(atlas_json_key_bool(r->j, "published", sum->published, err));
+    TRY(atlas_json_key_bool(r->j, "no_change", sum->no_change, err));
+    TRY(atlas_json_key_int(r->j, "generation_id", sum->generation_id, err));
+    TRY(atlas_json_key_int(r->j, "units_total", sum->units_total, err));
+    TRY(atlas_json_key_int(r->j, "units_parsed", sum->units_parsed, err));
+    TRY(atlas_json_key_int(r->j, "units_reused", sum->units_reused, err));
+    TRY(atlas_json_key_int(r->j, "units_complete", sum->units_complete, err));
+    TRY(atlas_json_key_int(r->j, "units_partial", sum->units_partial, err));
+    TRY(atlas_json_key_int(r->j, "units_failed", sum->units_failed, err));
+    TRY(atlas_json_key_int(r->j, "units_unsupported", sum->units_unsupported, err));
+    TRY(atlas_json_key_int(r->j, "symbols", sum->symbols, err));
+    TRY(atlas_json_key_int(r->j, "edges", sum->edges, err));
+    TRY(atlas_json_key_int(r->j, "includes", sum->includes, err));
+    TRY(atlas_json_key_int(r->j, "candidates_attached", sum->candidates_attached, err));
+    TRY(atlas_json_key_int(r->j, "duration_ms", sum->duration_ms, err));
+    TRY(atlas_json_key_bool(r->j, "truncated", sum->truncated, err));
+    TRY(atlas_json_key_str_opt(r->j, "truncated_reason", sum->truncated_reason, err));
+    return json_safe(r->j, &r->safe, "failure_reason",
+                     sum->failure_reason[0] != '\0' ? sum->failure_reason : NULL, err);
+}
+
+/* Item lists, shared by the impact report and the context package. Every item
+ * carries its evidence class and the fixed reason that selected it, because a
+ * consumer that could read the list without them could treat a filename guess
+ * as a compiler proof. */
+static atlas_status j_sem_items(atlas_renderer *r, const atlas_sem_item *items, size_t count,
+                                atlas_err *err) {
+    TRY(atlas_json_key(r->j, "items", err));
+    TRY(atlas_json_arr_begin(r->j, err));
+    for (size_t i = 0; i < count; i++) {
+        const atlas_sem_item *it = &items[i];
+        TRY(atlas_json_obj_begin(r->j, err));
+        TRY(atlas_json_key_str(r->j, "kind", it->kind, err));
+        TRY(json_safe(r->j, &r->safe, "name", it->name, err));
+        TRY(json_safe(r->j, &r->safe, "file", it->file_text, err));
+        TRY(atlas_json_key_int(r->j, "line", it->line, err));
+        TRY(atlas_json_key_str(r->j, "evidence", it->evidence, err));
+        /* Checked against Atlas' own closed set before it is emitted. */
+        TRY(atlas_json_key_str_opt(
+            r->j, "why", atlas_sem_selection_reason_is_known(it->why) ? it->why : NULL, err));
+        TRY(atlas_json_key_int(r->j, "depth", it->depth, err));
+        TRY(atlas_json_obj_end(r->j, err));
+    }
+    return atlas_json_arr_end(r->j, err);
+}
+
+static atlas_status j_sem_impact(atlas_renderer *r, const atlas_sem_impact_report *rep,
+                                 atlas_err *err) {
+    TRY(atlas_json_key_str(r->j, "repo", rep->repo.name, err));
+    TRY(atlas_json_key_str(r->j, "freshness", atlas_sem_freshness_name(rep->freshness), err));
+    TRY(atlas_json_key_str_opt(
+        r->j, "stale_reason",
+        atlas_sem_stale_reason_is_known(rep->stale_reason) ? rep->stale_reason : NULL, err));
+    TRY(atlas_json_key_int(r->j, "generation_id", rep->generation.id, err));
+    TRY(json_safe(r->j, &r->safe, "subject", rep->query, err));
+    TRY(atlas_json_key_str(r->j, "subject_kind", rep->subject_is_path ? "file" : "symbol", err));
+    TRY(atlas_json_key_bool(r->j, "subject_found", rep->subject_found, err));
+    TRY(j_sem_items(r, rep->items, rep->count, err));
+    /* Split by evidence, never summed. */
+    TRY(atlas_json_key_int(r->j, "proven", rep->proven, err));
+    TRY(atlas_json_key_int(r->j, "candidate", rep->candidate, err));
+    TRY(atlas_json_key_int(r->j, "lexical", rep->lexical, err));
+    TRY(atlas_json_key_int(r->j, "unresolved_indirect", rep->unresolved_indirect, err));
+    TRY(atlas_json_key_bool(r->j, "truncated", rep->truncated, err));
+    return atlas_json_key_str_opt(
+        r->j, "truncated_reason",
+        atlas_sem_trunc_reason_is_known(rep->truncated_reason) ? rep->truncated_reason : NULL,
+        err);
+}
+
+static atlas_status j_sem_context(atlas_renderer *r, const atlas_sem_context_report *rep,
+                                  atlas_err *err) {
+    TRY(atlas_json_key_str(r->j, "repo", rep->repo.name, err));
+    TRY(atlas_json_key_str_opt(r->j, "commit", rep->repo.scanned_head, err));
+    TRY(atlas_json_key_str(r->j, "freshness", atlas_sem_freshness_name(rep->freshness), err));
+    TRY(atlas_json_key_str_opt(
+        r->j, "stale_reason",
+        atlas_sem_stale_reason_is_known(rep->stale_reason) ? rep->stale_reason : NULL, err));
+    TRY(atlas_json_key_int(r->j, "generation_id", rep->generation.id, err));
+    /* The task is the caller's own text and is echoed safe-encoded. It is not
+     * an instruction Atlas acted on: it ranked evidence and nothing else. */
+    TRY(json_safe(r->j, &r->safe, "task", rep->task, err));
+    TRY(atlas_json_key_int(r->j, "budget_bytes", rep->budget_bytes, err));
+    TRY(atlas_json_key_int(r->j, "used_bytes", rep->used_bytes, err));
+    TRY(atlas_json_key_bool(r->j, "budget_reached", rep->budget_reached, err));
+    TRY(j_sem_items(r, rep->items, rep->count, err));
+    /* The package's own gaps, always present so an empty array is a positive
+     * statement rather than a missing key. */
+    TRY(atlas_json_key(r->j, "not_included", err));
+    TRY(atlas_json_arr_begin(r->j, err));
+    for (size_t i = 0; i < rep->missing_count; i++) {
+        TRY(atlas_json_str(r->j, rep->missing[i], err));
+    }
+    return atlas_json_arr_end(r->j, err);
+}
+static atlas_status j_operation_status(atlas_renderer *r, const atlas_operation_report *rep,
+                                       atlas_err *err) {
+    atlas_json *j = r->j;
+    atlas_status st = atlas_json_key_int(j, "operation_id", rep->id, err);
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(j, "kind", atlas_buf_cstr(&rep->kind), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(j, "state", atlas_buf_cstr(&rep->state), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(j, "done", rep->done, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(j, "succeeded", rep->succeeded, err);
+    }
+    if (st == ATLAS_OK && rep->done) {
+        st = atlas_json_key_int(j, "duration_ms", rep->duration_ms, err);
+    }
+    /* Already safe-encoded by the service layer. */
+    if (st == ATLAS_OK && rep->message.len > 0) {
+        st = atlas_json_key_str(j, "message", atlas_buf_cstr(&rep->message), err);
+    }
+    if (st == ATLAS_OK && rep->detail.len > 0) {
+        st = atlas_json_key_str(j, "detail", atlas_buf_cstr(&rep->detail), err);
+    }
+    return st;
+}
+
 const atlas_renderer_vtbl ATLAS_RENDERER_JSON = {
     j_begin,      j_end,          j_note_repo,    j_note_query,   j_list_begin,
     j_list_end,   j_doctor,       j_version,      j_repo_item,    j_repo_added,
@@ -1443,12 +1740,16 @@ const atlas_renderer_vtbl ATLAS_RENDERER_JSON = {
     j_events_end, j_unit_text,    j_unit_install, j_integrate,
     /* --- A3 --- */
     j_code_status, j_code_file,   j_code_symbol_item, j_code_edge_item,
-    j_code_walk_item, j_code_walk_end, j_code_list_begin, j_code_list_end,
+    j_code_walk_item, j_code_walk_end,
+    /* --- A8-CI --- */
+    j_sem_status, j_sem_symbols, j_sem_graph, j_sem_indexed, j_sem_impact, j_sem_context,
+    j_code_list_begin, j_code_list_end,
     /* --- A4 --- */
     j_decision_item, j_decision_show, j_decision_event, j_decision_outcome, j_decision_edge,
     j_decision_counts, j_decision_ledger,
     /* --- A5 --- */
-    j_backup_created, j_backup_verified, j_backup_restored, j_maintenance,
+    j_backup_created, j_backup_verified, j_backup_restored,
+    j_operation_status, j_maintenance,
     /* --- A6 --- */
     j_gate,
 };

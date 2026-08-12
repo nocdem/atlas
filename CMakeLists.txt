@@ -34,6 +34,43 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(SQLITE3 REQUIRED IMPORTED_TARGET sqlite3)
 message(STATUS "Atlas: SQLite3 ${SQLITE3_VERSION} via pkg-config")
 
+# libclang: the compiler-derived half of the code intelligence (A8-CI).
+#
+# Optional, deliberately. Atlas' rule is that a missing system dependency halts
+# with a clear message, and that still holds for anything Atlas cannot work
+# without — SQLite3 above is REQUIRED. The semantic index is different: it is a
+# derived, rebuildable layer, and a build without it must still produce a binary
+# that indexes, answers decisions and serves every A0..A8 command. What it must
+# *not* do is answer a semantic question with an empty result, so the absence is
+# carried into the binary as ATLAS_HAVE_LIBCLANG and reported by
+# `atlas_sem_available()`, `atlas code status` and every entry point.
+#
+# Nothing is downloaded. This locates a library that is already installed, the
+# same way SQLite3 is located.
+set(ATLAS_LIBCLANG_ROOT "" CACHE PATH "Directory holding clang-c/Index.h and libclang")
+find_path(ATLAS_LIBCLANG_INCLUDE_DIR clang-c/Index.h
+  HINTS ${ATLAS_LIBCLANG_ROOT}/include
+  PATHS /usr/lib/llvm-19/include /usr/lib/llvm-18/include /usr/lib/llvm-17/include
+        /usr/lib/llvm-16/include /usr/lib/llvm-15/include /usr/lib/llvm-14/include
+        /usr/include)
+find_library(ATLAS_LIBCLANG_LIBRARY NAMES clang libclang
+  HINTS ${ATLAS_LIBCLANG_ROOT}/lib
+  PATHS /usr/lib/llvm-19/lib /usr/lib/llvm-18/lib /usr/lib/llvm-17/lib
+        /usr/lib/llvm-16/lib /usr/lib/llvm-15/lib /usr/lib/llvm-14/lib)
+
+if(ATLAS_LIBCLANG_INCLUDE_DIR AND ATLAS_LIBCLANG_LIBRARY)
+  set(ATLAS_HAVE_LIBCLANG ON)
+  message(STATUS "Atlas: libclang ${ATLAS_LIBCLANG_LIBRARY}")
+  message(STATUS "Atlas: libclang headers ${ATLAS_LIBCLANG_INCLUDE_DIR}")
+else()
+  set(ATLAS_HAVE_LIBCLANG OFF)
+  message(WARNING
+    "Atlas: libclang was not found, so this build has NO compiler-aware semantic "
+    "index. Every `atlas code`/`atlas context` semantic command will refuse with a "
+    "typed error rather than return an empty result. Install the libclang "
+    "development package (Debian/Ubuntu: libclang-dev) and reconfigure to enable it.")
+endif()
+
 find_program(GIT_EXECUTABLE git)
 if(NOT GIT_EXECUTABLE)
   message(WARNING
@@ -127,6 +164,7 @@ add_library(atlas_core STATIC
   src/ipc/sock.c
   src/ipc/client.c
   src/ipc/server.c
+  src/daemon/ops.c
   src/daemon/writer.c
   src/daemon/workers.c
   src/daemon/watch.c
@@ -153,6 +191,16 @@ add_library(atlas_core STATIC
   src/code/resolve.c
   src/code/index.c
   src/code/query.c
+  # --- A8-CI: compiler-aware semantic code intelligence ------------------
+  src/sem/sem.c
+  src/sem/clangparse.c
+  src/sem/parse.c
+  src/db/db_sem.c
+  src/sem/index.c
+  src/sem/query.c
+  src/core/service_sem.c
+  src/ipc/server_sem.c
+  src/sem/context.c
   # --- A4: decision documents, revisions and operator approval -----------
   src/db/db_decision.c
   src/decision/decision.c
@@ -223,10 +271,22 @@ target_compile_definitions(atlas_core PRIVATE
 )
 target_link_libraries(atlas_core PUBLIC PkgConfig::SQLITE3 Threads::Threads)
 target_link_libraries(atlas_core PRIVATE atlas_yyjson)
+if(ATLAS_HAVE_LIBCLANG)
+  # PRIVATE, and only src/sem/clangparse.c ever includes the header: libclang is
+  # reachable from exactly one translation unit, which is what keeps "Atlas links
+  # a compiler library in one place" checkable rather than asserted.
+  target_compile_definitions(atlas_core PRIVATE ATLAS_HAVE_LIBCLANG=1)
+  target_include_directories(atlas_core PRIVATE ${ATLAS_LIBCLANG_INCLUDE_DIR})
+  target_link_libraries(atlas_core PRIVATE ${ATLAS_LIBCLANG_LIBRARY})
+endif()
 atlas_set_warnings(atlas_core)
 if(ATLAS_SANITIZE_FLAGS)
   target_compile_options(atlas_core PUBLIC ${ATLAS_SANITIZE_FLAGS})
   target_link_options(atlas_core PUBLIC ${ATLAS_SANITIZE_FLAGS})
+  # Tells src/core/proc.c to leave the child address-space ceiling off: a
+  # sanitizer reserves terabytes of shadow space, so any RLIMIT_AS an ordinary
+  # workload wants kills the child before main. See the comment there.
+  target_compile_definitions(atlas_core PUBLIC ATLAS_SANITIZER_BUILD=1)
 endif()
 
 # --- executable -------------------------------------------------------------

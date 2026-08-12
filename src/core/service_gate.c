@@ -282,7 +282,7 @@ atlas_status atlas_gate_run(atlas_db *db, const atlas_gate_query *q, atlas_gate_
     atlas_status st = atlas_db_repo_get(db, q->repo_name, &info, &found, err);
     if (st == ATLAS_OK && !found) {
         st = atlas_err_set(err, ATLAS_ERR_REPO,
-                           "no repository named \"%s\" is registered (try: atlas repo list)",
+                           "NOT_REGISTERED: no repository named \"%s\" is registered. Repositories are onboarded only by an operator; Atlas does not discover them (try: atlas repo list)",
                            q->repo_name == NULL ? "" : q->repo_name);
     }
     if (st != ATLAS_OK) {

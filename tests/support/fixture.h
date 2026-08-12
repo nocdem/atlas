@@ -124,6 +124,10 @@ typedef struct fx_daemon {
     atlas_buf runtime_dir; /* the fixture's private XDG_RUNTIME_DIR */
     atlas_buf socket;      /* <runtime_dir>/atlas/atlas.sock */
     atlas_buf log_path;
+    /* The index this daemon serves. Recorded at start so readiness can check
+     * that the schema on disk has caught up — accepting a connection is not the
+     * same as being usable. */
+    atlas_buf data_dir;
 } fx_daemon;
 
 void fx_daemon_init(fx_daemon *d);

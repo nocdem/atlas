@@ -1499,6 +1499,327 @@ static atlas_status h_gate(atlas_renderer *r, const atlas_gate_report *rep, atla
     return ATLAS_OK;
 }
 
+
+/* --- A8-CI: the compiler-derived semantic index --------------------------
+ *
+ * Every one of these prints the evidence class beside the fact. That is not
+ * decoration: a caller reading `callers` has to be able to tell a call the
+ * compiler proved from a candidate target of a function pointer, and a layout
+ * that made them look alike would undo the whole model. */
+
+static const char *sem_fresh_word(atlas_sem_freshness f) {
+    return atlas_sem_freshness_name(f);
+}
+
+static atlas_status h_sem_status(atlas_renderer *r, const atlas_sem_status_report *rep,
+                                 atlas_err *err) {
+    (void)err;
+    FILE *o = r->out;
+    (void)fprintf(o, LABEL "%s\n", "repo", rep->repo.name);
+    (void)fprintf(o, LABEL "%s\n", "libclang", yes_no(rep->libclang_available));
+    if (rep->libclang_available) {
+        (void)fprintf(o, LABEL "%s\n", "compiler",
+                      atlas_safe(&r->safe, rep->compiler_version));
+    }
+    if (!rep->have_generation) {
+        /* ABSENT is not STALE, and the wording keeps them apart. */
+        (void)fprintf(o, LABEL "%s\n", "semantic index", "absent (never built)");
+        if (rep->have_latest) {
+            (void)fprintf(o, LABEL "%s\n", "last attempt",
+                          atlas_sem_gen_status_name(rep->latest.status));
+        }
+        return ATLAS_OK;
+    }
+
+    const atlas_sem_generation *g = &rep->generation;
+    (void)fprintf(o, LABEL "%s\n", "semantic index", sem_fresh_word(rep->freshness));
+    if (rep->stale_reason != NULL) {
+        (void)fprintf(o, LABEL "%s\n", "why", rep->stale_reason);
+    }
+    (void)fprintf(o, LABEL "%lld\n", "generation", (long long)g->id);
+    (void)fprintf(o, LABEL "%s\n", "indexed commit",
+                  g->commit_id[0] != '\0' ? g->commit_id : "(none)");
+    (void)fprintf(o, LABEL "%s\n", "compdb digest", g->compdb_digest);
+    (void)fprintf(o, LABEL "%lld\n", "compile databases", (long long)g->compdb_count);
+    (void)fprintf(o, LABEL "%s\n", "built at",
+                  g->completed_at[0] != '\0' ? g->completed_at : g->started_at);
+    (void)fprintf(o, LABEL "%s %lld\n", "analyzer", g->analyzer_id,
+                  (long long)g->analyzer_version);
+    /* Complete, partial, failed and unsupported are reported separately and
+     * never summed: an index that describes 90% of a repository must not be
+     * displayed the same way as one that describes all of it. */
+    (void)fprintf(o, LABEL "%lld\n", "translation units", (long long)g->tu_total);
+    (void)fprintf(o, LABEL "%lld\n", "  complete", (long long)g->tu_complete);
+    (void)fprintf(o, LABEL "%lld\n", "  partial", (long long)g->tu_partial);
+    (void)fprintf(o, LABEL "%lld\n", "  failed", (long long)g->tu_failed);
+    (void)fprintf(o, LABEL "%lld\n", "  unsupported", (long long)g->tu_unsupported);
+    (void)fprintf(o, LABEL "%lld\n", "symbols", (long long)g->symbol_count);
+    (void)fprintf(o, LABEL "%lld\n", "edges", (long long)g->edge_count);
+    (void)fprintf(o, LABEL "%lld\n", "includes", (long long)g->include_count);
+    (void)fprintf(o, LABEL "%lld ms\n", "duration", (long long)g->duration_ms);
+
+    if (rep->failed_count > 0) {
+        (void)fprintf(o, "\nunits not fully described (%lld total):\n",
+                      (long long)rep->failed_total);
+        for (size_t i = 0; i < rep->failed_count; i++) {
+            const atlas_sem_failed_unit *u = &rep->failed[i];
+            (void)fprintf(o, "  %-11s %s", u->status, atlas_safe(&r->safe, u->source));
+            if (u->why[0] != '\0') {
+                (void)fprintf(o, "  (%s)", u->why);
+            }
+            (void)fprintf(o, "\n");
+        }
+        if (rep->failed_truncated) {
+            (void)fprintf(o, "  ... more were not listed\n");
+        }
+    }
+    return ATLAS_OK;
+}
+
+static void h_sem_freshness_banner(atlas_renderer *r, atlas_sem_freshness f, const char *reason,
+                                   const atlas_sem_generation *g) {
+    /* Printed before the rows, on every semantic read.
+     *
+     * A stale answer that looked exactly like a current one is the failure this
+     * banner exists to prevent, so it is not suppressed when the index is fine
+     * — a reader should never have to remember whether absence of a warning
+     * means "fresh" or "nobody checked". */
+    (void)fprintf(r->out, LABEL "%s (generation %lld)\n", "index",
+                  atlas_sem_freshness_name(f), (long long)g->id);
+    if (reason != NULL) {
+        (void)fprintf(r->out, LABEL "%s\n", "why", reason);
+    }
+}
+
+static atlas_status h_sem_symbols(atlas_renderer *r, const atlas_sem_symbols_report *rep,
+                                  atlas_err *err) {
+    (void)err;
+    FILE *o = r->out;
+    (void)fprintf(o, LABEL "%s\n", "repo", rep->repo.name);
+    h_sem_freshness_banner(r, rep->freshness, rep->stale_reason, &rep->generation);
+    if (rep->count == 0) {
+        (void)fprintf(o, "no symbol named %s is in the semantic index\n",
+                      atlas_safe(&r->safe, rep->query));
+        return ATLAS_OK;
+    }
+    for (size_t i = 0; i < rep->count; i++) {
+        const atlas_sem_symbol_item *s = &rep->items[i];
+        (void)fprintf(o, "%-11s %-10s %s\n", s->kind,
+                      s->is_definition ? "definition" : "declaration",
+                      atlas_safe(&r->safe, s->name));
+        if (s->external) {
+            /* No location is claimed for an entity outside the repository, and
+             * saying so is more useful than printing an empty path. */
+            (void)fprintf(o, "            external (declared outside this repository)\n");
+        } else {
+            (void)fprintf(o, "            %s:%lld\n", atlas_safe(&r->safe, s->file_text),
+                          (long long)s->line);
+        }
+        if (s->type_text[0] != '\0') {
+            (void)fprintf(o, "            %s\n", atlas_safe(&r->safe, s->type_text));
+        }
+        (void)fprintf(o, "            linkage %s, evidence %s\n", s->linkage, s->evidence);
+    }
+    if (rep->truncated) {
+        (void)fprintf(o, "\n(the result-row bound was reached; more symbols matched)\n");
+    }
+    return ATLAS_OK;
+}
+
+static atlas_status h_sem_graph(atlas_renderer *r, const atlas_sem_graph_report *rep,
+                                atlas_err *err) {
+    (void)err;
+    FILE *o = r->out;
+    (void)fprintf(o, LABEL "%s\n", "repo", rep->repo.name);
+    h_sem_freshness_banner(r, rep->freshness, rep->stale_reason, &rep->generation);
+    (void)fprintf(o, LABEL "%s\n", "query", atlas_safe(&r->safe, rep->query));
+
+    for (size_t i = 0; i < rep->count; i++) {
+        const atlas_sem_graph_item *g = &rep->items[i];
+        (void)fprintf(o, "%*s%s  [%s", (int)(2 * g->depth), "",
+                      atlas_safe(&r->safe, g->name[0] != '\0' ? g->name : g->usr), g->evidence);
+        if (strcmp(g->edge_kind, "MAY_CALL") == 0) {
+            /* Never printed as a resolved call. The candidate count is shown
+             * even when it exceeds what was recorded, because a bound that made
+             * an ambiguity look smaller than it is would be a bound that lies. */
+            (void)fprintf(o, " via a function pointer");
+            if (g->candidate_total > 0) {
+                (void)fprintf(o, ", %lld candidate%s", (long long)g->candidate_total,
+                              g->candidate_total == 1 ? "" : "s");
+            }
+        }
+        (void)fprintf(o, "]\n");
+        if (g->file_text[0] != '\0') {
+            (void)fprintf(o, "%*s  %s:%lld\n", (int)(2 * g->depth), "",
+                          atlas_safe(&r->safe, g->file_text), (long long)g->line);
+        }
+        if (g->site_file[0] != '\0') {
+            (void)fprintf(o, "%*s  from %s at %s:%lld\n", (int)(2 * g->depth), "",
+                          atlas_safe(&r->safe, g->via_name), atlas_safe(&r->safe, g->site_file),
+                          (long long)g->site_line);
+        }
+    }
+
+    const atlas_sem_walk_summary *s = &rep->summary;
+    (void)fprintf(o, "\n%lld reached — proven %lld, candidate %lld, unknown %lld\n",
+                  (long long)s->emitted, (long long)s->proven, (long long)s->candidate,
+                  (long long)s->unknown);
+    if (s->unresolved_indirect > 0) {
+        /* The most important line this command prints when it appears: the walk
+         * passed calls whose targets Atlas cannot name, so the answer is
+         * incomplete in a way no count of results would reveal. */
+        (void)fprintf(o, "%lld indirect call site%s had no candidate target, so this answer is "
+                         "incomplete\n",
+                      (long long)s->unresolved_indirect, s->unresolved_indirect == 1 ? "" : "s");
+    }
+    if (s->truncated) {
+        (void)fprintf(o, "truncated: %s\n",
+                      s->truncated_reason != NULL ? s->truncated_reason : "a bound was reached");
+    }
+    return ATLAS_OK;
+}
+
+static atlas_status h_sem_indexed(atlas_renderer *r, const atlas_sem_index_summary *sum,
+                                  atlas_err *err) {
+    (void)err;
+    FILE *o = r->out;
+    if (sum->no_change) {
+        (void)fprintf(o, LABEL "%s\n", "result",
+                      "nothing changed; the existing index still describes this state");
+        (void)fprintf(o, LABEL "%lld\n", "generation", (long long)sum->generation_id);
+        return ATLAS_OK;
+    }
+    (void)fprintf(o, LABEL "%s\n", "result", sum->published ? "published" : "not published");
+    (void)fprintf(o, LABEL "%lld\n", "generation", (long long)sum->generation_id);
+    (void)fprintf(o, LABEL "%lld\n", "translation units", (long long)sum->units_total);
+    (void)fprintf(o, LABEL "%lld\n", "  parsed", (long long)sum->units_parsed);
+    (void)fprintf(o, LABEL "%lld\n", "  reused", (long long)sum->units_reused);
+    (void)fprintf(o, LABEL "%lld\n", "  complete", (long long)sum->units_complete);
+    (void)fprintf(o, LABEL "%lld\n", "  partial", (long long)sum->units_partial);
+    (void)fprintf(o, LABEL "%lld\n", "  failed", (long long)sum->units_failed);
+    (void)fprintf(o, LABEL "%lld\n", "  unsupported", (long long)sum->units_unsupported);
+    (void)fprintf(o, LABEL "%lld\n", "symbols", (long long)sum->symbols);
+    (void)fprintf(o, LABEL "%lld\n", "edges", (long long)sum->edges);
+    (void)fprintf(o, LABEL "%lld\n", "indirect candidates", (long long)sum->candidates_attached);
+    (void)fprintf(o, LABEL "%lld ms\n", "duration", (long long)sum->duration_ms);
+    if (sum->truncated && sum->truncated_reason != NULL) {
+        (void)fprintf(o, LABEL "%s\n", "truncated", sum->truncated_reason);
+    }
+    if (sum->failure_reason[0] != '\0') {
+        (void)fprintf(o, LABEL "%s\n", "failure", atlas_safe(&r->safe, sum->failure_reason));
+    }
+    return ATLAS_OK;
+}
+
+/* An impact report and a context package share a shape: a list of items, each
+ * saying what selected it and how strongly. They print the same way, with the
+ * evidence class always beside the item — a reader must never have to guess
+ * whether a line was proven or inferred from a filename. */
+static atlas_status h_sem_impact(atlas_renderer *r, const atlas_sem_impact_report *rep,
+                                 atlas_err *err) {
+    (void)err;
+    FILE *o = r->out;
+    (void)fprintf(o, LABEL "%s\n", "repo", rep->repo.name);
+    (void)fprintf(o, LABEL "%s (generation %lld)\n", "index",
+                  atlas_sem_freshness_name(rep->freshness), (long long)rep->generation.id);
+    if (rep->stale_reason != NULL) {
+        (void)fprintf(o, LABEL "%s\n", "why", rep->stale_reason);
+    }
+    (void)fprintf(o, LABEL "%s (%s)\n", "subject", atlas_safe(&r->safe, rep->query),
+                  rep->subject_is_path ? "file" : "symbol");
+    if (!rep->subject_found) {
+        (void)fprintf(o, "the semantic index holds nothing by that name\n");
+        return ATLAS_OK;
+    }
+
+    for (size_t i = 0; i < rep->count; i++) {
+        const atlas_sem_item *it = &rep->items[i];
+        (void)fprintf(o, "%-9s %-10s %s\n", it->evidence, it->kind,
+                      atlas_safe(&r->safe, it->name));
+        if (it->file_text[0] != '\0' && strcmp(it->file_text, it->name) != 0) {
+            (void)fprintf(o, "                     %s:%lld\n", atlas_safe(&r->safe, it->file_text),
+                          (long long)it->line);
+        }
+        (void)fprintf(o, "                     %s\n", it->why != NULL ? it->why : "");
+    }
+
+    /* Split, never summed: a total would hide the one distinction that
+     * matters. */
+    (void)fprintf(o, "\n%lld proven, %lld candidate, %lld lexical\n", (long long)rep->proven,
+                  (long long)rep->candidate, (long long)rep->lexical);
+    if (rep->unresolved_indirect > 0) {
+        (void)fprintf(o,
+                      "%lld indirect call site%s had no candidate target, so this report is "
+                      "incomplete\n",
+                      (long long)rep->unresolved_indirect,
+                      rep->unresolved_indirect == 1 ? "" : "s");
+    }
+    if (rep->truncated) {
+        (void)fprintf(o, "truncated: %s\n",
+                      rep->truncated_reason != NULL ? rep->truncated_reason
+                                                    : "a bound was reached");
+    }
+    return ATLAS_OK;
+}
+
+static atlas_status h_sem_context(atlas_renderer *r, const atlas_sem_context_report *rep,
+                                  atlas_err *err) {
+    (void)err;
+    FILE *o = r->out;
+    (void)fprintf(o, LABEL "%s\n", "repo", rep->repo.name);
+    (void)fprintf(o, LABEL "%s\n", "commit", rep->repo.scanned_head);
+    (void)fprintf(o, LABEL "%s (generation %lld)\n", "index",
+                  atlas_sem_freshness_name(rep->freshness), (long long)rep->generation.id);
+    (void)fprintf(o, LABEL "%s\n", "task", atlas_safe(&r->safe, rep->task));
+    (void)fprintf(o, LABEL "%lld of %lld bytes, %zu items\n", "budget",
+                  (long long)rep->used_bytes, (long long)rep->budget_bytes, rep->count);
+
+    for (size_t i = 0; i < rep->count; i++) {
+        const atlas_sem_item *it = &rep->items[i];
+        (void)fprintf(o, "%-9s %-10s %s", it->evidence, it->kind, atlas_safe(&r->safe, it->name));
+        if (it->file_text[0] != '\0' && strcmp(it->file_text, it->name) != 0) {
+            (void)fprintf(o, "  %s:%lld", atlas_safe(&r->safe, it->file_text),
+                          (long long)it->line);
+        }
+        (void)fprintf(o, "\n                     %s\n", it->why != NULL ? it->why : "");
+    }
+
+    /* What the package could not supply. Printed last and always, so it reads
+     * as part of the answer rather than as an aside — a context package that
+     * silently omitted its own gaps would be the most dangerous thing this
+     * command could produce. */
+    if (rep->missing_count > 0) {
+        (void)fprintf(o, "\nnot included:\n");
+        for (size_t i = 0; i < rep->missing_count; i++) {
+            (void)fprintf(o, "  %s\n", rep->missing[i]);
+        }
+    }
+    return ATLAS_OK;
+}
+static atlas_status h_operation_status(atlas_renderer *r, const atlas_operation_report *rep,
+                                       atlas_err *err) {
+    (void)err;
+    FILE *o = r->out;
+    (void)fprintf(o, "  operation        %lld\n", (long long)rep->id);
+    (void)fprintf(o, "  kind             %s\n", atlas_buf_cstr(&rep->kind));
+    (void)fprintf(o, "  state            %s\n", atlas_buf_cstr(&rep->state));
+    if (rep->done) {
+        (void)fprintf(o, "  duration         %lld ms\n", (long long)rep->duration_ms);
+    }
+    /* Already safe-encoded by the service layer; printed as-is, never encoded
+     * twice. Both are Atlas' own words about its own artefact. */
+    if (rep->message.len > 0) {
+        (void)fprintf(o, "  message          %s\n", atlas_buf_cstr(&rep->message));
+    }
+    if (rep->detail.len > 0) {
+        (void)fprintf(o, "  detail           %s\n", atlas_buf_cstr(&rep->detail));
+    }
+    if (!rep->done) {
+        (void)fprintf(o, "\nstill running. Asking again does not disturb it.\n");
+    }
+    return ATLAS_OK;
+}
+
 const atlas_renderer_vtbl ATLAS_RENDERER_HUMAN = {
     h_begin,      h_end,          h_note_repo,    h_note_query,   h_list_begin,
     h_list_end,   h_doctor,       h_version,      h_repo_item,    h_repo_added,
@@ -1509,12 +1830,16 @@ const atlas_renderer_vtbl ATLAS_RENDERER_HUMAN = {
     h_events_end, h_unit_text,    h_unit_install, h_integrate,
     /* --- A3 --- */
     h_code_status, h_code_file,   h_code_symbol_item, h_code_edge_item,
-    h_code_walk_item, h_code_walk_end, h_code_list_begin, h_code_list_end,
+    h_code_walk_item, h_code_walk_end,
+    /* --- A8-CI --- */
+    h_sem_status, h_sem_symbols, h_sem_graph, h_sem_indexed, h_sem_impact, h_sem_context,
+    h_code_list_begin, h_code_list_end,
     /* --- A4 --- */
     h_decision_item, h_decision_show, h_decision_event, h_decision_outcome, h_decision_edge,
     h_decision_counts, h_decision_ledger,
     /* --- A5 --- */
-    h_backup_created, h_backup_verified, h_backup_restored, h_maintenance,
+    h_backup_created, h_backup_verified, h_backup_restored,
+    h_operation_status, h_maintenance,
     /* --- A6 --- */
     h_gate,
 };

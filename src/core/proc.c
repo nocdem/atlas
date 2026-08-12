@@ -14,6 +14,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -141,6 +142,47 @@ static void child_exec(const atlas_proc_opts *opts, int out_w, int err_w, int st
         _exit(127);
     }
     (void)close(devnull);
+
+    /* An address-space ceiling, applied last so nothing Atlas itself needs
+     * between fork and exec can be refused by it.
+     *
+     * **Absent in a sanitizer build, and that absence is forced rather than
+     * chosen.** AddressSanitizer and ThreadSanitizer reserve tens of terabytes
+     * of virtual address space for shadow memory at start-up, so any
+     * `RLIMIT_AS` an ordinary workload would want kills the child before
+     * `main`. Atlas found this the honest way: the whole semantic suite passed
+     * under Release and failed under ASan, because every parser child was dying
+     * at exec and every translation unit was being recorded FAILED — a
+     * sanitizer gate that silently exercised nothing.
+     *
+     * The trade is stated rather than hidden. A sanitizer build is a test
+     * build and is not the binary that ships, so the shipped binary does carry
+     * the bound; what the sanitizer matrix cannot cover is the bound itself,
+     * which is why `tests/test_sem.c` asserts the *behaviour* of a child that
+     * exceeds its limits through the timeout path instead. This is the one
+     * place Atlas accepts an `#ifdef` around a guarantee, and A5's argument
+     * against them (the shipped binary is not the one the tests ran against)
+     * is exactly why it is confined to a limit the sanitizer makes
+     * unrepresentable rather than to a check.
+     *
+     * A8-CI needs this because a translation unit is untrusted input to a
+     * compiler front end that holds an entire AST in memory: a pathological
+     * generated header is bounded by nothing else. It is a *limit*, so the
+     * child's allocation fails and it exits — the kernel refuses, rather than
+     * Atlas asking the child to behave. Zero means no ceiling, which is what
+     * every pre-A8-CI caller passes and gets. */
+#if !defined(ATLAS_SANITIZER_BUILD)
+    if (opts->max_address_space > 0) {
+        struct rlimit rl;
+        rl.rlim_cur = (rlim_t)opts->max_address_space;
+        rl.rlim_max = (rlim_t)opts->max_address_space;
+        if (setrlimit(RLIMIT_AS, &rl) != 0) {
+            int e = errno;
+            (void)!write(status_w, &e, sizeof(e));
+            _exit(127);
+        }
+    }
+#endif
 
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));

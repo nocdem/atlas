@@ -217,6 +217,44 @@ static const retention_entry RETENTION[] = {
      "rather than per heartbeat so the row count is bounded by the state machine; it is what "
      "distinguishes a worker that died silently from one that never started"},
 
+    /* --- A8-CI: the compiler-derived semantic index --------------------------
+     *
+     * Every one of these is DERIVED, and that classification is the whole
+     * architectural claim of the season: a semantic index is rebuildable from
+     * the repository and its compilation database, and nothing authoritative
+     * may depend on it. If all seven tables were dropped, Atlas would lose no
+     * decision, no revision, no approval, no link rationale and no audit event
+     * — it would lose an answer it can compute again.
+     *
+     * None is *prunable* even so, and the reason is A5's about `scans` rather
+     * than a reluctance to delete. These tables are pruned as a unit or not at
+     * all: a generation with some of its units removed by age is not a smaller
+     * index, it is a wrong one, and nothing in it records that rows are
+     * missing. Discarding a generation is `sem` index work — a replacement — not
+     * retention work, and it happens when an operator asks for an index, not on
+     * a timer. A8-CI adds no background deleter, exactly as A5 forbids. */
+    {"sem_generations", ATLAS_RETAIN_DERIVED, false,
+     "one row per attempt to build a semantic index, successful or not; rebuilt by indexing, and "
+     "kept whole because a failed attempt is the operational record that indexing is failing — a "
+     "table holding only successes could not state it"},
+    {"sem_current", ATLAS_RETAIN_DERIVED, false,
+     "the one-row-per-repository pointer at the published generation; it is what makes replacement "
+     "atomic, and a pruned pointer would leave a complete index nobody can find"},
+    {"sem_compdbs", ATLAS_RETAIN_DERIVED, false,
+     "the compilation databases a generation read and their digests; rebuilt by indexing, and the "
+     "basis on which that generation is later judged stale"},
+    {"sem_units", ATLAS_RETAIN_DERIVED, false,
+     "one translation unit compiled under one configuration, with its outcome and its input "
+     "digest; rebuilt by indexing, and the record that says which units failed and why"},
+    {"sem_symbols", ATLAS_RETAIN_DERIVED, false,
+     "compiler-derived symbol occurrences; rebuilt by indexing from the repository and the "
+     "compilation database, and referenced by nothing authoritative"},
+    {"sem_edges", ATLAS_RETAIN_DERIVED, false,
+     "compiler-derived relations between symbols, each carrying its evidence class; rebuilt by "
+     "indexing, and referenced by nothing authoritative"},
+    {"sem_includes", ATLAS_RETAIN_DERIVED, false,
+     "the include graph as the preprocessor resolved it; rebuilt by indexing"},
+
     /* --- full-text indexes -------------------------------------------------- */
     {"files_fts", ATLAS_RETAIN_DERIVED, false, "FTS5 index over files; rebuilt from files"},
     {"commits_fts", ATLAS_RETAIN_DERIVED, false, "FTS5 index over commits; rebuilt from commits"},
@@ -236,21 +274,23 @@ void atlas_maintenance_report_free(atlas_maintenance_report *r) {
     r->table_count = 0;
 }
 
-/* The cutoff, as the same ISO-8601 UTC text every timestamp column stores.
- * String comparison is correct for this format because it sorts
- * lexicographically, which is the same property `ai_sessions` idle expiry
- * already relies on. */
 static void cutoff_for(int64_t days, char *out, size_t out_size) {
     atlas_iso8601_before_now(out, out_size, days * 24 * 60 * 60 * 1000);
 }
 
-atlas_status atlas_service_maintenance(const char *data_dir_override,
-                                       const atlas_maintenance_opts *opts,
-                                       atlas_maintenance_report *out, atlas_err *err) {
-    /* Zero means "not given" and takes the documented default. A negative is a
-     * refusal, not a default: silently turning `--older-than -1` into 90 days
-     * would delete far more than was asked for, and the caller would never see
-     * that their number was discarded. */
+/* The maintenance core, over a handle the caller already owns.
+ *
+ * The public entry point below opens its own handle and takes the
+ * data-directory lock, which is right for a local operator invocation. The
+ * daemon cannot do that — it already holds the lock — so it calls this with the
+ * writer thread's handle instead. One implementation, for the reason
+ * `atlas_sem_index_on` is one: two would answer differently the first time
+ * somebody fixed a bug in only one of them.
+ *
+ * Nothing here acquires a lock or opens a database. Whether it may write is
+ * entirely `opts->apply` plus whether the handle it was given is writable. */
+atlas_status atlas_maintenance_on(atlas_db *db, const atlas_maintenance_opts *opts,
+                                  atlas_maintenance_report *out, atlas_err *err) {
     if (opts->older_than_days < 0 || opts->retain_per_repo < 0) {
         return atlas_err_set(err, ATLAS_ERR_USAGE,
                              "--older-than and --retain must not be negative");
@@ -280,27 +320,7 @@ atlas_status atlas_service_maintenance(const char *data_dir_override,
     }
     out->table_count = RETENTION_COUNT;
 
-    atlas_buf data_dir = ATLAS_BUF_INIT;
-    atlas_buf db_path = ATLAS_BUF_INIT;
-    atlas_lock *lk = NULL;
-    atlas_db *db = NULL;
-
-    atlas_status st = atlas_datadir_resolve(data_dir_override, &data_dir, NULL, err);
-    if (st == ATLAS_OK) {
-        st = atlas_datadir_db_path(atlas_buf_cstr(&data_dir), &db_path, err);
-    }
-
-    /* An apply is a write, and Atlas has exactly one writer. Taking the lock is
-     * what makes "the daemon must be stopped" a fact rather than an
-     * instruction. A plan takes nothing and opens read-only. */
-    if (st == ATLAS_OK && opts->apply) {
-        st = atlas_lock_acquire(atlas_buf_cstr(&data_dir), ATLAS_LOCK_ROLE_ONESHOT, &lk, err);
-    }
-    if (st == ATLAS_OK) {
-        st = opts->apply ? atlas_db_open(atlas_buf_cstr(&db_path), &db, err)
-                         : atlas_db_open_readonly(atlas_buf_cstr(&db_path), &db, err);
-    }
-
+    atlas_status st = ATLAS_OK;
     for (size_t i = 0; st == ATLAS_OK && i < RETENTION_COUNT; i++) {
         atlas_maintenance_row *row = &out->tables[i];
         row->table = RETENTION[i].table;
@@ -362,6 +382,46 @@ atlas_status atlas_service_maintenance(const char *data_dir_override,
         }
     }
 
+    return st;
+}
+
+/* The cutoff, as the same ISO-8601 UTC text every timestamp column stores.
+ * String comparison is correct for this format because it sorts
+ * lexicographically, which is the same property `ai_sessions` idle expiry
+ * already relies on. */
+
+atlas_status atlas_service_maintenance(const char *data_dir_override,
+                                       const atlas_maintenance_opts *opts,
+                                       atlas_maintenance_report *out, atlas_err *err) {
+    /* Zero means "not given" and takes the documented default. A negative is a
+     * refusal, not a default: silently turning `--older-than -1` into 90 days
+     * would delete far more than was asked for, and the caller would never see
+     * that their number was discarded. */
+    atlas_buf data_dir = ATLAS_BUF_INIT;
+    atlas_buf db_path = ATLAS_BUF_INIT;
+    atlas_lock *lk = NULL;
+    atlas_db *db = NULL;
+
+    atlas_status st = atlas_datadir_resolve(data_dir_override, &data_dir, NULL, err);
+    if (st == ATLAS_OK) {
+        st = atlas_datadir_db_path(atlas_buf_cstr(&data_dir), &db_path, err);
+    }
+
+    /* An apply is a write, and Atlas has exactly one writer. Taking the lock is
+     * what makes "the daemon must be stopped" a fact rather than an
+     * instruction. A plan takes nothing and opens read-only. */
+    if (st == ATLAS_OK && opts->apply) {
+        st = atlas_lock_acquire(atlas_buf_cstr(&data_dir), ATLAS_LOCK_ROLE_ONESHOT, &lk, err);
+    }
+    if (st == ATLAS_OK) {
+        st = opts->apply ? atlas_db_open(atlas_buf_cstr(&db_path), &db, err)
+                         : atlas_db_open_readonly(atlas_buf_cstr(&db_path), &db, err);
+    }
+
+    if (st == ATLAS_OK) {
+        st = atlas_maintenance_on(db, opts, out, err);
+    }
+
     atlas_db_close(db);
     atlas_lock_release(lk);
     atlas_buf_free(&db_path);
@@ -372,6 +432,21 @@ atlas_status atlas_service_maintenance(const char *data_dir_override,
 /* Exposed for the test that compares this policy against the live schema. It
  * returns the compiled-in list rather than a copy: the strings are literals and
  * the array is const. */
+bool atlas_maintenance_policy_lookup(const char *table, const char **table_out,
+                                     atlas_retention_class *cls_out, bool *prunable_out,
+                                     const char **reason_out) {
+    for (size_t i = 0; i < RETENTION_COUNT; i++) {
+        if (strcmp(RETENTION[i].table, table) == 0) {
+            *table_out = RETENTION[i].table;
+            *cls_out = RETENTION[i].cls;
+            *prunable_out = RETENTION[i].prunable;
+            *reason_out = RETENTION[i].reason;
+            return true;
+        }
+    }
+    return false;
+}
+
 size_t atlas_maintenance_policy(const char *const **names_out) {
     static const char *names[RETENTION_COUNT];
     for (size_t i = 0; i < RETENTION_COUNT; i++) {

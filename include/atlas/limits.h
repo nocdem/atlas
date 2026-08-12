@@ -440,4 +440,117 @@
 /* Path prefixes one gate query may be scoped to. */
 #define ATLAS_GATE_MAX_SCOPE_PATHS 64
 
+/* --- A8-CI: compiler-aware semantic intelligence ---------------------------
+ *
+ * Every bound here refuses rather than clamps, and every one that is reached is
+ * *reported* — A5's rule about `--older-than` and A6's about a truncated walk,
+ * for the same reason. A discarded number nobody is told about turns "Atlas
+ * stopped looking" into "Atlas looked and found nothing", and those are
+ * different answers a caller acts on differently. */
+
+/* Wall clock for one translation unit's child parser. Reaching it is
+ * ATLAS_SEM_WHY_TIMEOUT and the unit is FAILED, never quietly skipped.
+ * The observed worst case on the acceptance corpus is 1.5 s. */
+#define ATLAS_SEM_PARSE_TIMEOUT_MS 120000
+/* Silence from the child before it is presumed wedged. Separate from the wall
+ * clock because the two catch different failures — A8's argument in proc.h. */
+#define ATLAS_SEM_PARSE_IDLE_MS 30000
+/* Address space the child parser may map, in bytes. libclang holds an entire
+ * translation unit's AST in memory, and a pathological generated header is the
+ * input that finds the ceiling. */
+#define ATLAS_SEM_PARSE_MAX_ADDRESS_SPACE (4ull * 1024ull * 1024ull * 1024ull)
+/* NDJSON one child may emit. Bounds the parent's read as well as the child's
+ * write, so neither side depends on the other's good behaviour. */
+#define ATLAS_SEM_PARSE_MAX_STDOUT (256u * 1024u * 1024u)
+/* Facts one translation unit may contribute. */
+#define ATLAS_SEM_MAX_FACTS_PER_UNIT 2000000
+/* Translation units one generation may hold. */
+#define ATLAS_SEM_MAX_UNITS 50000
+/* Bytes of one USR, one symbol name and one type spelling. A USR encodes nested
+ * scopes, so it is allowed to be considerably longer than a name. */
+#define ATLAS_SEM_MAX_USR_BYTES 2048u
+#define ATLAS_SEM_MAX_NAME_BYTES 512u
+#define ATLAS_SEM_MAX_TYPE_BYTES 1024u
+/* Compilation databases one repository may present. */
+#define ATLAS_SEM_MAX_COMPDBS 32
+/* How deep the include closure is followed when deciding whether a translation
+ * unit's inputs changed.
+ *
+ * This is a *correctness* bound, not a performance one. The closure is what
+ * makes "a header changed" invalidate every unit that reaches it, however
+ * indirectly — C projects nest headers five and ten deep, so a shallow walk
+ * would carry a stale unit forward and report it COMPLETE. Reaching this depth
+ * is reported, and a unit whose closure was truncated is reparsed rather than
+ * reused: an input set Atlas could not finish enumerating is one it must not
+ * claim is unchanged. */
+#define ATLAS_SEM_MAX_INCLUDE_DEPTH 64
+/* Candidate targets recorded for one indirect call site. The true number is
+ * reported even when it exceeds this — A3's rule about `candidate_count`: a
+ * bound that makes an ambiguity look smaller than it is is a bound that lies. */
+#define ATLAS_SEM_MAX_INDIRECT_CANDIDATES 32
+/* Rows written per transaction while a generation is applied. A1's rule about
+ * never holding a write transaction across unbounded work. */
+#define ATLAS_SEM_APPLY_BATCH 4000
+
+/* --- bounded semantic queries --- */
+
+/* Default and hard ceiling for call-graph traversal depth. */
+#define ATLAS_SEM_DEFAULT_DEPTH 3
+#define ATLAS_SEM_MAX_DEPTH 16
+/* Nodes and edges one traversal may visit. */
+#define ATLAS_SEM_MAX_NODES 5000
+#define ATLAS_SEM_MAX_EDGES 20000
+/* Rows one query returns, and paths one trace returns. */
+#define ATLAS_SEM_MAX_ROWS 500
+#define ATLAS_SEM_MAX_PATHS 16
+/* Wall clock for one bounded query. Reaching it is an explicit truncation. */
+#define ATLAS_SEM_QUERY_TIMEOUT_MS 10000
+/* Bytes one query result may occupy. */
+#define ATLAS_SEM_MAX_RESULT_BYTES (8u * 1024u * 1024u)
+
+/* --- the task context builder --- */
+
+/* Default and maximum byte budget for one context package. The token budget a
+ * caller gives is converted at ATLAS_SEM_BYTES_PER_TOKEN and then treated as
+ * bytes, because bytes are what Atlas can actually count. */
+#define ATLAS_SEM_CONTEXT_DEFAULT_BYTES (32u * 1024u)
+#define ATLAS_SEM_CONTEXT_MAX_BYTES (512u * 1024u)
+#define ATLAS_SEM_BYTES_PER_TOKEN 4
+/* Items one context package may hold, and terms one task description
+ * contributes to ranking. */
+#define ATLAS_SEM_CONTEXT_MAX_ITEMS 400
+#define ATLAS_SEM_CONTEXT_MAX_TERMS 64
+/* Bytes of one task description Atlas will read. Longer is a usage error, not a
+ * silent truncation: a ranked answer to half a question is worse than a
+ * refusal. */
+#define ATLAS_SEM_CONTEXT_MAX_TASK_BYTES 8192u
+/* Starting paths and symbols one context request may name. */
+#define ATLAS_SEM_CONTEXT_MAX_SEEDS 64
+
+/* --- long-running daemon operations ----------------------------------------
+ *
+ * Operation records the daemon keeps in memory, oldest evicted first.
+ *
+ * Sized for what an operator can actually be waiting on: at most one backup and
+ * one semantic index run at a time, so this is a history rather than a working
+ * set, and 64 covers a long session of both without the table becoming a place
+ * where memory grows without an owner.
+ *
+ * When the ring wraps, the evicted id becomes unknown — which is the same
+ * answer a restart gives for every id, so a client already has to handle it.
+ * The bound is never silently applied to a *result*: no operation is ever
+ * dropped or truncated, only the memory of one that already finished. */
+#define ATLAS_OPS_MAX_RECORDS 64u
+
+/* How long a client waits between polls of a long operation, and how long it
+ * keeps polling before giving up and saying so.
+ *
+ * The wait is a ceiling on politeness rather than on the operation: the client
+ * prints what it knows and exits non-zero if it is reached, and the operation
+ * keeps running — which is the whole point of the split. A full semantic index
+ * of a large repository was measured at 141 s, so the ceiling is set well above
+ * it and is still not a claim about how long indexing takes. */
+#define ATLAS_OPS_POLL_INTERVAL_MS 500
+#define ATLAS_OPS_CLIENT_WAIT_MS 1800000
+
 #endif /* ATLAS_LIMITS_H */

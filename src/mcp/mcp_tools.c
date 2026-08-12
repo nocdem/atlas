@@ -106,6 +106,15 @@ static atlas_status prop_int(atlas_json *j, const char *name, const char *descri
     return st;
 }
 
+static atlas_status prop_bool(atlas_json *j, const char *name, const char *description,
+                              atlas_err *err) {
+    atlas_status st = prop_begin(j, name, "boolean", description, err);
+    if (st == ATLAS_OK) {
+        st = atlas_json_obj_end(j, err);
+    }
+    return st;
+}
+
 static atlas_status prop_enum(atlas_json *j, const char *name, const char *description,
                               const char *const *values, atlas_err *err) {
     atlas_status st = prop_begin(j, name, "string", description, err);
@@ -1991,6 +2000,450 @@ static atlas_status run_gate(atlas_mcp_server *s, const atlas_jsonv *args, atlas
     return st;
 }
 
+/* --- A8-CI: the compiler-derived semantic index -----------------------------
+ *
+ * Five reads, and nothing else. There is no tool here that builds an index,
+ * invalidates one or changes any state, and that absence is the guarantee: a
+ * model holding every Atlas tool still cannot cause a compiler to run.
+ *
+ * Every result carries the index's freshness and generation, because a semantic
+ * answer without them is a claim about a repository as it may no longer be —
+ * the same reason the A3 tools report currency. And every edge carries its
+ * evidence class, so a model can tell a call the compiler proved from a
+ * candidate target of a function pointer. Atlas never claims to know every
+ * target of a function pointer; a traversal that crosses one says so.
+ *
+ * The repository comes from the persistent registry, not from the client's
+ * roots — see `atlas_mcp_resolve_repo`. No tool here accepts an absolute path.
+ * A `usr` is an opaque identifier Atlas itself produced and handed back through
+ * `atlas_sem_symbol`; accepting one opens nothing a name would not. */
+
+typedef struct sem_args {
+    const char *repo;
+    const char *symbol;
+    const char *usr;
+    const char *kind;
+    const char *from;
+    const char *to;
+    int64_t limit;
+    int64_t depth;
+    bool inbound;
+    bool proven_only;
+} sem_args;
+
+static atlas_status put_sem_args(atlas_json *j, void *ud, atlas_err *err) {
+    sem_args *a = (sem_args *)ud;
+    atlas_status st = atlas_json_key_str(j, "repo", a->repo, err);
+    if (st == ATLAS_OK && a->symbol != NULL) {
+        st = atlas_json_key_str(j, "symbol", a->symbol, err);
+    }
+    if (st == ATLAS_OK && a->usr != NULL) {
+        st = atlas_json_key_str(j, "usr", a->usr, err);
+    }
+    if (st == ATLAS_OK && a->kind != NULL) {
+        st = atlas_json_key_str(j, "kind", a->kind, err);
+    }
+    if (st == ATLAS_OK && a->from != NULL) {
+        st = atlas_json_key_str(j, "from", a->from, err);
+    }
+    if (st == ATLAS_OK && a->to != NULL) {
+        st = atlas_json_key_str(j, "to", a->to, err);
+    }
+    if (st == ATLAS_OK && a->limit > 0) {
+        st = atlas_json_key_int(j, "limit", a->limit, err);
+    }
+    if (st == ATLAS_OK && a->depth > 0) {
+        st = atlas_json_key_int(j, "depth", a->depth, err);
+    }
+    if (st == ATLAS_OK && a->inbound) {
+        st = atlas_json_key_bool(j, "inbound", true, err);
+    }
+    if (st == ATLAS_OK && a->proven_only) {
+        st = atlas_json_key_bool(j, "proven_only", true, err);
+    }
+    return st;
+}
+
+static atlas_status begin_sem_call(atlas_mcp_server *s, const atlas_jsonv *args, sem_args *a,
+                                   atlas_buf *repo, atlas_err *err) {
+    memset(a, 0, sizeof(*a));
+    const char *requested = NULL;
+    atlas_status st = arg_str(args, "repo", ATLAS_NAME_MAX, &requested, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    st = atlas_mcp_resolve_repo(s, requested, repo, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    a->repo = atlas_buf_cstr(repo);
+    a->limit = arg_int(args, "limit", 0);
+    a->depth = arg_int(args, "depth", 0);
+    return ATLAS_OK;
+}
+
+static atlas_status schema_sem_status(atlas_json *j, atlas_err *err) {
+    atlas_status st = schema_begin(j, err);
+    if (st == ATLAS_OK) {
+        st = prop_repo(j, err);
+    }
+    if (st == ATLAS_OK) {
+        st = schema_end(j, NULL, err);
+    }
+    return st;
+}
+
+static atlas_status run_sem_status(atlas_mcp_server *s, const atlas_jsonv *args, atlas_buf *body,
+                                   bool *degraded, atlas_err *err) {
+    sem_args a;
+    atlas_buf repo = ATLAS_BUF_INIT;
+    atlas_status st = begin_sem_call(s, args, &a, &repo, err);
+    atlas_buf params = ATLAS_BUF_INIT;
+    if (st == ATLAS_OK) {
+        st = make_params(put_sem_args, &a, &params, err);
+    }
+    if (st == ATLAS_OK) {
+        st = forward(s, "sem.status", atlas_buf_cstr(&params),
+                     atlas_provenance_name(ATLAS_PROV_SOURCE), true, body, degraded, err);
+    }
+    atlas_buf_free(&params);
+    atlas_buf_free(&repo);
+    return st;
+}
+
+static atlas_status schema_sem_symbol(atlas_json *j, atlas_err *err) {
+    static const char *const REQUIRED[] = {"symbol", NULL};
+    atlas_status st = schema_begin(j, err);
+    if (st == ATLAS_OK) {
+        st = prop_repo(j, err);
+    }
+    if (st == ATLAS_OK) {
+        st = prop_str(j, "symbol", "the exact symbol name", ATLAS_SEM_MAX_NAME_BYTES, err);
+    }
+    if (st == ATLAS_OK) {
+        st = prop_str(j, "kind",
+                      "restrict to one kind: FUNCTION, STRUCT, UNION, ENUM, ENUM_CONSTANT, "
+                      "TYPEDEF, FIELD, VARIABLE or MACRO",
+                      32, err);
+    }
+    if (st == ATLAS_OK) {
+        st = prop_int(j, "limit", "maximum symbols to return", 1, ATLAS_SEM_MAX_ROWS, err);
+    }
+    if (st == ATLAS_OK) {
+        st = schema_end(j, REQUIRED, err);
+    }
+    return st;
+}
+
+static atlas_status run_sem_symbol(atlas_mcp_server *s, const atlas_jsonv *args, atlas_buf *body,
+                                   bool *degraded, atlas_err *err) {
+    sem_args a;
+    atlas_buf repo = ATLAS_BUF_INIT;
+    atlas_status st = begin_sem_call(s, args, &a, &repo, err);
+    if (st == ATLAS_OK) {
+        st = arg_str(args, "symbol", ATLAS_SEM_MAX_NAME_BYTES, &a.symbol, err);
+    }
+    if (st == ATLAS_OK) {
+        st = arg_str(args, "kind", 32, &a.kind, err);
+    }
+    if (st == ATLAS_OK && a.symbol == NULL) {
+        st = atlas_err_set(err, ATLAS_ERR_USAGE, "\"symbol\" is required");
+    }
+    atlas_buf params = ATLAS_BUF_INIT;
+    if (st == ATLAS_OK) {
+        st = make_params(put_sem_args, &a, &params, err);
+    }
+    if (st == ATLAS_OK) {
+        st = forward(s, "sem.symbol", atlas_buf_cstr(&params),
+                     atlas_provenance_name(ATLAS_PROV_SOURCE), true, body, degraded, err);
+    }
+    atlas_buf_free(&params);
+    atlas_buf_free(&repo);
+    return st;
+}
+
+/* Callers and callees are one walk in two directions, so they share a schema
+ * and a runner. Two tools rather than one with a direction flag, because
+ * "who calls this" and "what does this call" are the two questions a reader
+ * actually asks, and a flag would make every call site spell out which. */
+static atlas_status schema_sem_graph(atlas_json *j, atlas_err *err) {
+    atlas_status st = schema_begin(j, err);
+    if (st == ATLAS_OK) {
+        st = prop_repo(j, err);
+    }
+    if (st == ATLAS_OK) {
+        st = prop_str(j, "symbol", "the exact symbol name", ATLAS_SEM_MAX_NAME_BYTES, err);
+    }
+    if (st == ATLAS_OK) {
+        st = prop_str(j, "usr",
+                      "an exact symbol identifier returned by atlas_sem_symbol; use this when a "
+                      "name is ambiguous",
+                      ATLAS_SEM_MAX_USR_BYTES, err);
+    }
+    if (st == ATLAS_OK) {
+        st = prop_int(j, "depth", "how many call edges to follow; 1 is the direct answer", 1,
+                      ATLAS_SEM_MAX_DEPTH, err);
+    }
+    if (st == ATLAS_OK) {
+        st = prop_int(j, "limit", "maximum nodes to return", 1, ATLAS_SEM_MAX_ROWS, err);
+    }
+    if (st == ATLAS_OK) {
+        st = prop_bool(j, "proven_only",
+                       "follow only compiler-proven calls, excluding candidate targets of "
+                       "function pointers",
+                       err);
+    }
+    if (st == ATLAS_OK) {
+        st = schema_end(j, NULL, err);
+    }
+    return st;
+}
+
+static atlas_status run_sem_graph(atlas_mcp_server *s, const atlas_jsonv *args, bool inbound,
+                                  atlas_buf *body, bool *degraded, atlas_err *err) {
+    sem_args a;
+    atlas_buf repo = ATLAS_BUF_INIT;
+    atlas_status st = begin_sem_call(s, args, &a, &repo, err);
+    if (st == ATLAS_OK) {
+        st = arg_str(args, "symbol", ATLAS_SEM_MAX_NAME_BYTES, &a.symbol, err);
+    }
+    if (st == ATLAS_OK) {
+        st = arg_str(args, "usr", ATLAS_SEM_MAX_USR_BYTES, &a.usr, err);
+    }
+    if (st == ATLAS_OK && a.symbol == NULL && a.usr == NULL) {
+        st = atlas_err_set(err, ATLAS_ERR_USAGE, "one of \"symbol\" or \"usr\" is required");
+    }
+    a.inbound = inbound;
+    a.proven_only = arg_int(args, "proven_only", 0) != 0;
+    atlas_buf params = ATLAS_BUF_INIT;
+    if (st == ATLAS_OK) {
+        st = make_params(put_sem_args, &a, &params, err);
+    }
+    if (st == ATLAS_OK) {
+        st = forward(s, "sem.graph", atlas_buf_cstr(&params),
+                     atlas_provenance_name(ATLAS_PROV_SOURCE), true, body, degraded, err);
+    }
+    atlas_buf_free(&params);
+    atlas_buf_free(&repo);
+    return st;
+}
+
+static atlas_status run_sem_callers(atlas_mcp_server *s, const atlas_jsonv *args, atlas_buf *body,
+                                    bool *degraded, atlas_err *err) {
+    return run_sem_graph(s, args, true, body, degraded, err);
+}
+
+static atlas_status run_sem_callees(atlas_mcp_server *s, const atlas_jsonv *args, atlas_buf *body,
+                                    bool *degraded, atlas_err *err) {
+    return run_sem_graph(s, args, false, body, degraded, err);
+}
+
+static atlas_status schema_sem_trace(atlas_json *j, atlas_err *err) {
+    static const char *const REQUIRED[] = {"from", "to", NULL};
+    atlas_status st = schema_begin(j, err);
+    if (st == ATLAS_OK) {
+        st = prop_repo(j, err);
+    }
+    if (st == ATLAS_OK) {
+        st = prop_str(j, "from", "the calling symbol's exact name", ATLAS_SEM_MAX_NAME_BYTES, err);
+    }
+    if (st == ATLAS_OK) {
+        st = prop_str(j, "to", "the called symbol's exact name", ATLAS_SEM_MAX_NAME_BYTES, err);
+    }
+    if (st == ATLAS_OK) {
+        st = prop_int(j, "depth", "how many call edges the path may cross", 1,
+                      ATLAS_SEM_MAX_DEPTH, err);
+    }
+    if (st == ATLAS_OK) {
+        st = schema_end(j, REQUIRED, err);
+    }
+    return st;
+}
+
+static atlas_status run_sem_trace(atlas_mcp_server *s, const atlas_jsonv *args, atlas_buf *body,
+                                  bool *degraded, atlas_err *err) {
+    sem_args a;
+    atlas_buf repo = ATLAS_BUF_INIT;
+    atlas_status st = begin_sem_call(s, args, &a, &repo, err);
+    if (st == ATLAS_OK) {
+        st = arg_str(args, "from", ATLAS_SEM_MAX_NAME_BYTES, &a.from, err);
+    }
+    if (st == ATLAS_OK) {
+        st = arg_str(args, "to", ATLAS_SEM_MAX_NAME_BYTES, &a.to, err);
+    }
+    if (st == ATLAS_OK && (a.from == NULL || a.to == NULL)) {
+        st = atlas_err_set(err, ATLAS_ERR_USAGE, "\"from\" and \"to\" are both required");
+    }
+    atlas_buf params = ATLAS_BUF_INIT;
+    if (st == ATLAS_OK) {
+        st = make_params(put_sem_args, &a, &params, err);
+    }
+    if (st == ATLAS_OK) {
+        st = forward(s, "sem.trace", atlas_buf_cstr(&params),
+                     atlas_provenance_name(ATLAS_PROV_SOURCE), true, body, degraded, err);
+    }
+    atlas_buf_free(&params);
+    atlas_buf_free(&repo);
+    return st;
+}
+
+
+static atlas_status schema_sem_impact(atlas_json *j, atlas_err *err) {
+    static const char *const REQUIRED[] = {"subject", NULL};
+    atlas_status st = schema_begin(j, err);
+    if (st == ATLAS_OK) {
+        st = prop_repo(j, err);
+    }
+    if (st == ATLAS_OK) {
+        st = prop_str(j, "subject", "an exact symbol name or a repository-relative path",
+                      ATLAS_SEM_MAX_NAME_BYTES, err);
+    }
+    if (st == ATLAS_OK) {
+        st = prop_int(j, "depth", "how many call edges to follow when finding callers", 1,
+                      ATLAS_SEM_MAX_DEPTH, err);
+    }
+    if (st == ATLAS_OK) {
+        st = prop_int(j, "limit", "maximum items to return", 1, ATLAS_SEM_MAX_ROWS, err);
+    }
+    if (st == ATLAS_OK) {
+        st = schema_end(j, REQUIRED, err);
+    }
+    return st;
+}
+
+static atlas_status run_sem_impact(atlas_mcp_server *s, const atlas_jsonv *args, atlas_buf *body,
+                                   bool *degraded, atlas_err *err) {
+    sem_args a;
+    atlas_buf repo = ATLAS_BUF_INIT;
+    atlas_status st = begin_sem_call(s, args, &a, &repo, err);
+    const char *subject = NULL;
+    if (st == ATLAS_OK) {
+        st = arg_str(args, "subject", ATLAS_SEM_MAX_NAME_BYTES, &subject, err);
+    }
+    if (st == ATLAS_OK && subject == NULL) {
+        st = atlas_err_set(err, ATLAS_ERR_USAGE, "\"subject\" is required");
+    }
+    a.symbol = subject; /* carried under "subject" by the params writer below */
+    atlas_buf params = ATLAS_BUF_INIT;
+    if (st == ATLAS_OK) {
+        atlas_ipc_params *p = NULL;
+        atlas_json *j = NULL;
+        st = atlas_ipc_params_begin(&p, &j, err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "repo", a.repo, err);
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_str(j, "subject", subject, err);
+            }
+            if (st == ATLAS_OK && a.depth > 0) {
+                st = atlas_json_key_int(j, "depth", a.depth, err);
+            }
+            if (st == ATLAS_OK && a.limit > 0) {
+                st = atlas_json_key_int(j, "limit", a.limit, err);
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_ipc_params_finish(p, &params, err);
+            } else {
+                atlas_ipc_params_abort(p);
+            }
+        }
+    }
+    if (st == ATLAS_OK) {
+        st = forward(s, "sem.impact", atlas_buf_cstr(&params),
+                     atlas_provenance_name(ATLAS_PROV_SOURCE), true, body, degraded, err);
+    }
+    atlas_buf_free(&params);
+    atlas_buf_free(&repo);
+    return st;
+}
+
+/* The task-context package.
+ *
+ * The `task` argument is free text a model writes, and it is used for one thing:
+ * ranking evidence Atlas already holds. It selects no repository — `repo` is a
+ * separate argument resolved from the persistent registry — and it authorises
+ * nothing, because every method this reaches is a read. An imperative in it
+ * ("delete the index", "approve the decision") is ranked as words and acted on
+ * by nothing. */
+static atlas_status schema_context_build(atlas_json *j, atlas_err *err) {
+    static const char *const REQUIRED[] = {"task", NULL};
+    atlas_status st = schema_begin(j, err);
+    if (st == ATLAS_OK) {
+        st = prop_repo(j, err);
+    }
+    if (st == ATLAS_OK) {
+        st = prop_str(j, "task", "what you are about to do, in your own words",
+                      ATLAS_SEM_CONTEXT_MAX_TASK_BYTES, err);
+    }
+    if (st == ATLAS_OK) {
+        st = prop_int(j, "depth", "how far to expand from each starting point", 1,
+                      ATLAS_SEM_MAX_DEPTH, err);
+    }
+    if (st == ATLAS_OK) {
+        st = prop_int(j, "max_tokens", "approximate token budget for the package", 1,
+                      ATLAS_SEM_CONTEXT_MAX_BYTES / ATLAS_SEM_BYTES_PER_TOKEN, err);
+    }
+    if (st == ATLAS_OK) {
+        st = prop_int(j, "max_items", "maximum items to include", 1,
+                      ATLAS_SEM_CONTEXT_MAX_ITEMS, err);
+    }
+    if (st == ATLAS_OK) {
+        st = schema_end(j, REQUIRED, err);
+    }
+    return st;
+}
+
+static atlas_status run_context_build(atlas_mcp_server *s, const atlas_jsonv *args,
+                                      atlas_buf *body, bool *degraded, atlas_err *err) {
+    sem_args a;
+    atlas_buf repo = ATLAS_BUF_INIT;
+    atlas_status st = begin_sem_call(s, args, &a, &repo, err);
+    const char *task = NULL;
+    if (st == ATLAS_OK) {
+        st = arg_str(args, "task", ATLAS_SEM_CONTEXT_MAX_TASK_BYTES, &task, err);
+    }
+    if (st == ATLAS_OK && task == NULL) {
+        st = atlas_err_set(err, ATLAS_ERR_USAGE, "\"task\" is required");
+    }
+    atlas_buf params = ATLAS_BUF_INIT;
+    if (st == ATLAS_OK) {
+        atlas_ipc_params *p = NULL;
+        atlas_json *j = NULL;
+        st = atlas_ipc_params_begin(&p, &j, err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "repo", a.repo, err);
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_str(j, "task", task, err);
+            }
+            if (st == ATLAS_OK && a.depth > 0) {
+                st = atlas_json_key_int(j, "depth", a.depth, err);
+            }
+            if (st == ATLAS_OK) {
+                int64_t mt = arg_int(args, "max_tokens", 0);
+                if (mt > 0) {
+                    st = atlas_json_key_int(j, "max_tokens", mt, err);
+                }
+            }
+            if (st == ATLAS_OK) {
+                int64_t mi = arg_int(args, "max_items", 0);
+                if (mi > 0) {
+                    st = atlas_json_key_int(j, "max_items", mi, err);
+                }
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_ipc_params_finish(p, &params, err);
+            } else {
+                atlas_ipc_params_abort(p);
+            }
+        }
+    }
+    if (st == ATLAS_OK) {
+        st = forward(s, "sem.context", atlas_buf_cstr(&params),
+                     atlas_provenance_name(ATLAS_PROV_SOURCE), true, body, degraded, err);
+    }
+    atlas_buf_free(&params);
+    atlas_buf_free(&repo);
+    return st;
+}
 static const tool_def TOOLS[] = {
     {"atlas_status", "Atlas status",
      "Whether the Atlas daemon is running and how current the index is. Call this first if an "
@@ -2070,6 +2523,53 @@ static const tool_def TOOLS[] = {
      "Bounded outward traversal from a file or a symbol: what it structurally depends on, with the "
      "path that reached each result and the weakest resolution on that path.",
      schema_code_walk, run_code_deps, true, false},
+
+    /* --- A8-CI: the compiler-derived semantic index --- */
+    {"atlas_sem_status", "Semantic index status",
+     "Whether a compiler-derived semantic index exists for this repository, which commit and "
+     "compilation databases it was built from, how fresh it is, and how many translation units "
+     "are not fully described. Call this when a semantic answer looks wrong or empty.",
+     schema_sem_status, run_sem_status, true, false},
+
+    {"atlas_sem_symbol", "Find a symbol (compiler-derived)",
+     "Every definition and declaration of an exact symbol name, with kind, linkage, type and "
+     "location, established by the compiler rather than by text matching. A name that resolves "
+     "to several symbols returns all of them; pass the returned identifier to the callers and "
+     "callees tools to disambiguate.",
+     schema_sem_symbol, run_sem_symbol, true, false},
+
+    {"atlas_sem_callers", "Who calls this (compiler-derived)",
+     "Functions that call a symbol, following compiler-proven call edges. Depth 1 is the direct "
+     "answer; deeper is a bounded transitive walk. Every result carries an evidence class: "
+     "PROVEN is a call the compiler resolved, CANDIDATE is a possible target of a function "
+     "pointer. Atlas does not know every target of a function pointer and says so.",
+     schema_sem_graph, run_sem_callers, true, false},
+
+    {"atlas_sem_callees", "What this calls (compiler-derived)",
+     "Functions a symbol calls, following compiler-proven call edges, with the same bounds and "
+     "the same evidence classes as the callers tool. Call sites whose target Atlas cannot name "
+     "are reported as unresolved rather than omitted.",
+     schema_sem_graph, run_sem_callees, true, false},
+
+    {"atlas_sem_impact", "Change impact (compiler-derived)",
+     "What a change to a symbol or file reaches: its callers, what it calls, files that include "
+     "it, and tests that reference it. Every item says how it was found — PROVEN, CANDIDATE or "
+     "LEXICAL — and the totals are reported separately rather than summed. Use this before "
+     "changing a public symbol or a shared header.",
+     schema_sem_impact, run_sem_impact, true, false},
+
+    {"atlas_context_build", "Build a task context package",
+     "A bounded, ranked package of the evidence Atlas holds that is most relevant to a task you "
+     "describe: symbols, files, callers and candidate tests, each labelled with how it was found. "
+     "The description is used only to rank evidence — it authorises nothing and changes nothing. "
+     "The package states its own gaps under not_included.",
+     schema_context_build, run_context_build, true, false},
+
+    {"atlas_sem_trace", "Trace a call path (compiler-derived)",
+     "A bounded shortest path of calls from one symbol to another, if one exists within the "
+     "depth given. The path is as strong as its weakest edge: a path crossing an indirect call "
+     "is a candidate path, never a proven one.",
+     schema_sem_trace, run_sem_trace, true, false},
 
     {"atlas_code_impact", "What may be affected",
      "Bounded inward traversal: what may be affected if this file or symbol changes. Call this "

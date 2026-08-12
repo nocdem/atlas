@@ -1,0 +1,1387 @@
+/* Atlas - typed operations over the migration-11 semantic tables.
+ * Copyright 2026 The Atlas Authors. Licensed under the Apache License 2.0.
+ *
+ * Every statement here is a string literal, so `atlas_db_prepare`'s pointer
+ * cache behaves as its header documents. Every read is scoped to a generation
+ * id, and a generation belongs to exactly one repository — which is what makes
+ * "no query can reach another repository's rows" a property of the shape of
+ * this file rather than a rule callers must remember.
+ */
+#include "atlas/sem_ops.h"
+
+#include <string.h>
+
+#include "atlas/atlas.h"
+#include "db_internal.h"
+
+/* --- small helpers ---------------------------------------------------------- */
+
+static const char *nz(const char *s) { return s == NULL ? "" : s; }
+
+static atlas_status bind_text(atlas_db *db, sqlite3_stmt *stmt, int idx, const char *v,
+                              atlas_err *err) {
+    return atlas_db_bind_text_opt(db, stmt, idx, nz(v), err);
+}
+
+static const char *col_text(sqlite3_stmt *stmt, int idx) {
+    const unsigned char *t = sqlite3_column_text(stmt, idx);
+    return t == NULL ? "" : (const char *)t;
+}
+
+static void copy_field(char *dst, size_t cap, const char *src) {
+    if (src == NULL) {
+        dst[0] = '\0';
+        return;
+    }
+    size_t n = strlen(src);
+    if (n >= cap) {
+        n = cap - 1;
+    }
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
+
+/* --- generations ------------------------------------------------------------ */
+
+atlas_status atlas_db_sem_generation_begin(atlas_db *db, const atlas_sem_generation *g,
+                                           int64_t *id_out, atlas_err *err) {
+    if (g == NULL || id_out == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "semantic generation: bad request");
+    }
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(
+        db,
+        "INSERT INTO sem_generations(repo_id, repo_identity_hash, commit_id, compdb_digest,"
+        "  compdb_count, compiler_id, compiler_version, analyzer_id, analyzer_version,"
+        "  status, started_at)"
+        " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'RUNNING',?10);",
+        &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, g->repo_id) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 5, g->compdb_count) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 9, g->analyzer_version) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind semantic generation");
+    }
+    st = bind_text(db, stmt, 2, g->repo_identity_hash, err);
+    if (st == ATLAS_OK) {
+        st = bind_text(db, stmt, 3, g->commit_id, err);
+    }
+    if (st == ATLAS_OK) {
+        st = bind_text(db, stmt, 4, g->compdb_digest, err);
+    }
+    if (st == ATLAS_OK) {
+        st = bind_text(db, stmt, 6, g->compiler_id, err);
+    }
+    if (st == ATLAS_OK) {
+        st = bind_text(db, stmt, 7, g->compiler_version, err);
+    }
+    if (st == ATLAS_OK) {
+        st = bind_text(db, stmt, 8, g->analyzer_id, err);
+    }
+    if (st == ATLAS_OK) {
+        char now[ATLAS_TS_MAX];
+        atlas_now_iso8601(now, sizeof(now));
+        st = bind_text(db, stmt, 10, now, err);
+    }
+    if (st != ATLAS_OK) {
+        atlas_db_finish(db, stmt);
+        return st;
+    }
+    st = atlas_db_step_done(db, stmt, err);
+    if (st == ATLAS_OK) {
+        *id_out = sqlite3_last_insert_rowid(db->h);
+    }
+    return st;
+}
+
+atlas_status atlas_db_sem_publish(atlas_db *db, int64_t generation_id,
+                                  const atlas_sem_generation *c, atlas_err *err) {
+    if (c == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "semantic publish: bad request");
+    }
+    /* Compare-and-swap on the state it observed, and exactly one row must
+     * change — A4's rule, so two passes racing to publish lose deterministically
+     * instead of last-write-wins. */
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(
+        db,
+        "UPDATE sem_generations SET status = 'COMPLETE', completed_at = ?2, tu_total = ?3,"
+        "  tu_complete = ?4, tu_partial = ?5, tu_failed = ?6, tu_unsupported = ?7,"
+        "  symbol_count = ?8, edge_count = ?9, include_count = ?10, duration_ms = ?11"
+        " WHERE id = ?1 AND status = 'RUNNING';",
+        &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    char now[ATLAS_TS_MAX];
+    atlas_now_iso8601(now, sizeof(now));
+    if (sqlite3_bind_int64(stmt, 1, generation_id) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 3, c->tu_total) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 4, c->tu_complete) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 5, c->tu_partial) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 6, c->tu_failed) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 7, c->tu_unsupported) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 8, c->symbol_count) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 9, c->edge_count) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 10, c->include_count) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 11, c->duration_ms) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind semantic publish");
+    }
+    st = bind_text(db, stmt, 2, now, err);
+    if (st != ATLAS_OK) {
+        atlas_db_finish(db, stmt);
+        return st;
+    }
+    st = atlas_db_step_done(db, stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_changes(db->h) != 1) {
+        return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                             "the semantic generation was not RUNNING when it was published; "
+                             "another pass changed it");
+    }
+
+    /* And the pointer, in the same transaction. Becoming visible is one act. */
+    stmt = NULL;
+    st = atlas_db_prepare(db,
+                          "INSERT INTO sem_current(repo_id, generation_id) VALUES(?1, ?2)"
+                          " ON CONFLICT(repo_id) DO UPDATE SET generation_id = excluded.generation_id;",
+                          &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, c->repo_id) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 2, generation_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind semantic current pointer");
+    }
+    return atlas_db_step_done(db, stmt, err);
+}
+
+atlas_status atlas_db_sem_fail(atlas_db *db, int64_t generation_id, const char *why,
+                               atlas_err *err) {
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(
+        db,
+        "UPDATE sem_generations SET status = 'FAILED', completed_at = ?2, failure_reason = ?3"
+        " WHERE id = ?1 AND status = 'RUNNING';",
+        &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    char now[ATLAS_TS_MAX];
+    atlas_now_iso8601(now, sizeof(now));
+    if (sqlite3_bind_int64(stmt, 1, generation_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind semantic failure");
+    }
+    st = bind_text(db, stmt, 2, now, err);
+    if (st == ATLAS_OK) {
+        /* Only Atlas' own vocabulary is stored. A reason from anywhere else
+         * becomes the generic one rather than being reproduced. */
+        st = bind_text(db, stmt, 3, atlas_sem_why_is_known(why) ? why : "", err);
+    }
+    if (st != ATLAS_OK) {
+        atlas_db_finish(db, stmt);
+        return st;
+    }
+    return atlas_db_step_done(db, stmt, err);
+}
+
+static void read_generation(sqlite3_stmt *stmt, atlas_sem_generation *out) {
+    atlas_sem_generation_init(out);
+    out->id = sqlite3_column_int64(stmt, 0);
+    out->repo_id = sqlite3_column_int64(stmt, 1);
+    copy_field(out->repo_identity_hash, sizeof(out->repo_identity_hash), col_text(stmt, 2));
+    copy_field(out->commit_id, sizeof(out->commit_id), col_text(stmt, 3));
+    copy_field(out->compdb_digest, sizeof(out->compdb_digest), col_text(stmt, 4));
+    out->compdb_count = sqlite3_column_int64(stmt, 5);
+    copy_field(out->compiler_id, sizeof(out->compiler_id), col_text(stmt, 6));
+    copy_field(out->compiler_version, sizeof(out->compiler_version), col_text(stmt, 7));
+    copy_field(out->analyzer_id, sizeof(out->analyzer_id), col_text(stmt, 8));
+    out->analyzer_version = sqlite3_column_int64(stmt, 9);
+    if (!atlas_sem_gen_status_parse(col_text(stmt, 10), &out->status)) {
+        out->status = ATLAS_SEM_GEN_UNKNOWN;
+    }
+    copy_field(out->started_at, sizeof(out->started_at), col_text(stmt, 11));
+    copy_field(out->completed_at, sizeof(out->completed_at), col_text(stmt, 12));
+    out->tu_total = sqlite3_column_int64(stmt, 13);
+    out->tu_complete = sqlite3_column_int64(stmt, 14);
+    out->tu_partial = sqlite3_column_int64(stmt, 15);
+    out->tu_failed = sqlite3_column_int64(stmt, 16);
+    out->tu_unsupported = sqlite3_column_int64(stmt, 17);
+    out->symbol_count = sqlite3_column_int64(stmt, 18);
+    out->edge_count = sqlite3_column_int64(stmt, 19);
+    out->include_count = sqlite3_column_int64(stmt, 20);
+    out->duration_ms = sqlite3_column_int64(stmt, 21);
+    copy_field(out->failure_reason, sizeof(out->failure_reason), col_text(stmt, 22));
+}
+
+#define GEN_COLUMNS                                                                             \
+    "g.id, g.repo_id, g.repo_identity_hash, g.commit_id, g.compdb_digest, g.compdb_count,"      \
+    " g.compiler_id, g.compiler_version, g.analyzer_id, g.analyzer_version, g.status,"          \
+    " g.started_at, g.completed_at, g.tu_total, g.tu_complete, g.tu_partial, g.tu_failed,"      \
+    " g.tu_unsupported, g.symbol_count, g.edge_count, g.include_count, g.duration_ms,"          \
+    " g.failure_reason"
+
+atlas_status atlas_db_sem_current(atlas_db *db, int64_t repo_id, atlas_sem_generation *out,
+                                  bool *found, atlas_err *err) {
+    *found = false;
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st =
+        atlas_db_prepare(db,
+                         "SELECT " GEN_COLUMNS " FROM sem_generations g"
+                         " JOIN sem_current c ON c.generation_id = g.id"
+                         " WHERE c.repo_id = ?1;",
+                         &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, repo_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind repository id");
+    }
+    int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        read_generation(stmt, out);
+        out->is_current = true;
+        *found = true;
+    } else if (rc != SQLITE_DONE) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot read the current semantic generation");
+    }
+    atlas_db_finish(db, stmt);
+    return ATLAS_OK;
+}
+
+atlas_status atlas_db_sem_latest(atlas_db *db, int64_t repo_id, atlas_sem_generation *out,
+                                 bool *found, atlas_err *err) {
+    *found = false;
+    sqlite3_stmt *stmt = NULL;
+    /* Ordered by id, never by a timestamp — A8's rule. */
+    atlas_status st = atlas_db_prepare(db,
+                                       "SELECT " GEN_COLUMNS " FROM sem_generations g"
+                                       " WHERE g.repo_id = ?1 ORDER BY g.id DESC LIMIT 1;",
+                                       &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, repo_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind repository id");
+    }
+    int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        read_generation(stmt, out);
+        *found = true;
+    } else if (rc != SQLITE_DONE) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot read the latest semantic generation");
+    }
+    atlas_db_finish(db, stmt);
+    return ATLAS_OK;
+}
+
+static atlas_status exec_gen_scoped(atlas_db *db, const char *sql, int64_t generation_id,
+                                    atlas_err *err) {
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(db, sql, &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, generation_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind generation id");
+    }
+    return atlas_db_step_done(db, stmt, err);
+}
+
+atlas_status atlas_db_sem_generation_delete(atlas_db *db, int64_t generation_id, atlas_err *err) {
+    /* Refuses to remove what is published. Replacing an index means publishing
+     * a new generation, never deleting the old one first — that ordering is
+     * what keeps a reader from ever seeing no index at all. */
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(
+        db, "SELECT COUNT(*) FROM sem_current WHERE generation_id = ?1;", &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, generation_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind generation id");
+    }
+    int64_t published = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        published = sqlite3_column_int64(stmt, 0);
+    }
+    atlas_db_finish(db, stmt);
+    if (published > 0) {
+        return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                             "the published semantic generation cannot be deleted");
+    }
+
+    static const char *const SQL[] = {
+        "DELETE FROM sem_edges WHERE generation_id = ?1;",
+        "DELETE FROM sem_symbols WHERE generation_id = ?1;",
+        "DELETE FROM sem_includes WHERE generation_id = ?1;",
+        "DELETE FROM sem_units WHERE generation_id = ?1;",
+        "DELETE FROM sem_compdbs WHERE generation_id = ?1;",
+        "DELETE FROM sem_generations WHERE id = ?1;",
+    };
+    for (size_t i = 0; i < sizeof(SQL) / sizeof(SQL[0]); i++) {
+        st = exec_gen_scoped(db, SQL[i], generation_id, err);
+        if (st != ATLAS_OK) {
+            return st;
+        }
+    }
+    return ATLAS_OK;
+}
+
+atlas_status atlas_db_sem_prune_generations(atlas_db *db, int64_t repo_id, int64_t keep,
+                                            atlas_err *err) {
+    if (keep < 1) {
+        keep = 1;
+    }
+    for (;;) {
+        sqlite3_stmt *stmt = NULL;
+        atlas_status st = atlas_db_prepare(
+            db,
+            "SELECT g.id FROM sem_generations g"
+            " WHERE g.repo_id = ?1"
+            "   AND g.id NOT IN (SELECT generation_id FROM sem_current)"
+            "   AND g.id NOT IN (SELECT id FROM sem_generations WHERE repo_id = ?1"
+            "                     ORDER BY id DESC LIMIT ?2)"
+            " ORDER BY g.id ASC LIMIT 1;",
+            &stmt, err);
+        if (st != ATLAS_OK) {
+            return st;
+        }
+        if (sqlite3_bind_int64(stmt, 1, repo_id) != SQLITE_OK ||
+            sqlite3_bind_int64(stmt, 2, keep) != SQLITE_OK) {
+            atlas_db_finish(db, stmt);
+            return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind generation prune");
+        }
+        int64_t victim = 0;
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            victim = sqlite3_column_int64(stmt, 0);
+        }
+        atlas_db_finish(db, stmt);
+        if (victim == 0) {
+            return ATLAS_OK;
+        }
+        st = atlas_db_sem_generation_delete(db, victim, err);
+        if (st != ATLAS_OK) {
+            return st;
+        }
+    }
+}
+
+atlas_status atlas_db_sem_forget_repo(atlas_db *db, int64_t repo_id, atlas_err *err) {
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st =
+        atlas_db_prepare(db, "DELETE FROM sem_current WHERE repo_id = ?1;", &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, repo_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind repository id");
+    }
+    st = atlas_db_step_done(db, stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    stmt = NULL;
+    st = atlas_db_prepare(db, "UPDATE sem_generations SET repo_id = 0 WHERE repo_id = ?1;", &stmt,
+                          err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, repo_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind repository id");
+    }
+    return atlas_db_step_done(db, stmt, err);
+}
+
+/* --- writing a generation's contents ---------------------------------------- */
+
+atlas_status atlas_db_sem_compdb_add(atlas_db *db, int64_t generation_id, const char *path_text,
+                                     const char *digest, int64_t entries, int64_t dropped,
+                                     int64_t *id_out, atlas_err *err) {
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(
+        db,
+        "INSERT INTO sem_compdbs(generation_id, path_text, digest, entries, entries_dropped)"
+        " VALUES(?1,?2,?3,?4,?5);",
+        &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, generation_id) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 4, entries) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 5, dropped) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind compile database");
+    }
+    st = bind_text(db, stmt, 2, path_text, err);
+    if (st == ATLAS_OK) {
+        st = bind_text(db, stmt, 3, digest, err);
+    }
+    if (st != ATLAS_OK) {
+        atlas_db_finish(db, stmt);
+        return st;
+    }
+    st = atlas_db_step_done(db, stmt, err);
+    if (st == ATLAS_OK && id_out != NULL) {
+        *id_out = sqlite3_last_insert_rowid(db->h);
+    }
+    return st;
+}
+
+atlas_status atlas_db_sem_unit_add(atlas_db *db, const atlas_sem_unit_row *row, int64_t *id_out,
+                                   atlas_err *err) {
+    if (row == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "semantic unit: bad request");
+    }
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(
+        db,
+        "INSERT INTO sem_units(generation_id, source_text, compdb_id, config_digest,"
+        "  input_digest, status, why, diagnostics_errors, symbols, edges, duration_ms, reused)"
+        " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)"
+        " ON CONFLICT(generation_id, source_text, config_digest) DO UPDATE SET"
+        "  status = excluded.status, why = excluded.why,"
+        "  diagnostics_errors = excluded.diagnostics_errors, symbols = excluded.symbols,"
+        "  edges = excluded.edges, duration_ms = excluded.duration_ms,"
+        "  input_digest = excluded.input_digest, reused = excluded.reused;",
+        &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, row->generation_id) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 3, row->compdb_id) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 8, row->diagnostics_errors) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 9, row->symbols) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 10, row->edges) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 11, row->duration_ms) != SQLITE_OK ||
+        sqlite3_bind_int(stmt, 12, row->reused ? 1 : 0) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind semantic unit");
+    }
+    st = bind_text(db, stmt, 2, row->source_text, err);
+    if (st == ATLAS_OK) {
+        st = bind_text(db, stmt, 4, row->config_digest, err);
+    }
+    if (st == ATLAS_OK) {
+        st = bind_text(db, stmt, 5, row->input_digest, err);
+    }
+    if (st == ATLAS_OK) {
+        /* UNKNOWN is not in the CHECK, so a status nobody set becomes FAILED
+         * rather than being written as a runnable-looking value. */
+        atlas_sem_tu_status s = row->status;
+        if (s == ATLAS_SEM_TU_UNKNOWN) {
+            s = ATLAS_SEM_TU_FAILED;
+        }
+        st = bind_text(db, stmt, 6, atlas_sem_tu_status_name(s), err);
+    }
+    if (st == ATLAS_OK) {
+        st = bind_text(db, stmt, 7, atlas_sem_why_is_known(row->why) ? row->why : "", err);
+    }
+    if (st != ATLAS_OK) {
+        atlas_db_finish(db, stmt);
+        return st;
+    }
+    st = atlas_db_step_done(db, stmt, err);
+    if (st == ATLAS_OK && id_out != NULL) {
+        *id_out = sqlite3_last_insert_rowid(db->h);
+    }
+    return st;
+}
+
+atlas_status atlas_db_sem_symbol_add(atlas_db *db, int64_t generation_id,
+                                     const atlas_sem_fact *f, atlas_err *err) {
+    if (f == NULL || f->usr == NULL || f->usr[0] == '\0') {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "semantic symbol: no identity");
+    }
+    /* Checked at the write point, not merely at the producer. A symbol row
+     * always states PROVEN — the compiler found it — but the class is validated
+     * rather than assumed, so an unrecognised value cannot be stored. */
+    atlas_sem_symbol_kind kind = ATLAS_SEM_SYM_UNKNOWN;
+    (void)atlas_sem_symbol_kind_parse(f->kind, &kind);
+    atlas_sem_linkage link = ATLAS_SEM_LINK_UNKNOWN;
+    (void)atlas_sem_linkage_parse(f->linkage, &link);
+
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(
+        db,
+        "INSERT INTO sem_symbols(generation_id, usr, name, kind, linkage, type_text, file_text,"
+        "  line, col, end_line, is_definition, external, evidence)"
+        " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'PROVEN')"
+        " ON CONFLICT(generation_id, usr, file_text, line, is_definition) DO NOTHING;",
+        &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, generation_id) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 8, f->line) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 9, f->col) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 10, f->end_line) != SQLITE_OK ||
+        sqlite3_bind_int(stmt, 11, f->is_definition ? 1 : 0) != SQLITE_OK ||
+        sqlite3_bind_int(stmt, 12, f->external ? 1 : 0) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind semantic symbol");
+    }
+    st = bind_text(db, stmt, 2, f->usr, err);
+    if (st == ATLAS_OK) {
+        st = bind_text(db, stmt, 3, f->name, err);
+    }
+    if (st == ATLAS_OK) {
+        st = bind_text(db, stmt, 4, atlas_sem_symbol_kind_name(kind), err);
+    }
+    if (st == ATLAS_OK) {
+        st = bind_text(db, stmt, 5, atlas_sem_linkage_name(link), err);
+    }
+    if (st == ATLAS_OK) {
+        st = bind_text(db, stmt, 6, f->type_text, err);
+    }
+    if (st == ATLAS_OK) {
+        st = bind_text(db, stmt, 7, f->file, err);
+    }
+    if (st != ATLAS_OK) {
+        atlas_db_finish(db, stmt);
+        return st;
+    }
+    return atlas_db_step_done(db, stmt, err);
+}
+
+atlas_status atlas_db_sem_edge_add(atlas_db *db, int64_t generation_id, int64_t unit_id,
+                                   const atlas_sem_fact *f, atlas_err *err) {
+    if (f == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "semantic edge: bad request");
+    }
+    atlas_sem_edge_kind kind = ATLAS_SEM_EDGE_UNKNOWN;
+    if (!atlas_sem_edge_kind_parse(f->kind, &kind) || kind == ATLAS_SEM_EDGE_UNKNOWN) {
+        /* An edge kind Atlas does not recognise is not stored. The CHECK would
+         * refuse it anyway; refusing here produces the better message and keeps
+         * the guarantee at the write point. */
+        return ATLAS_OK;
+    }
+    atlas_sem_evidence ev = ATLAS_SEM_EV_UNKNOWN;
+    (void)atlas_sem_evidence_parse(f->evidence, &ev);
+    /* The cap is applied here as well as in the extractor. Two places on
+     * purpose: the extractor produces the better locality, this is the
+     * guarantee — A4's shape for the actor restriction. A MAY_CALL edge cannot
+     * be stored as PROVEN by any path. */
+    ev = atlas_sem_evidence_weaker(ev, atlas_sem_edge_kind_max_evidence(kind));
+
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(
+        db,
+        "INSERT INTO sem_edges(generation_id, kind, src_usr, dst_usr, evidence, unit_id,"
+        "  file_text, line, col, proto)"
+        " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)"
+        " ON CONFLICT(generation_id, kind, src_usr, dst_usr, file_text, line, col) DO NOTHING;",
+        &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, generation_id) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 6, unit_id) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 8, f->line) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 9, f->col) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind semantic edge");
+    }
+    st = bind_text(db, stmt, 2, atlas_sem_edge_kind_name(kind), err);
+    if (st == ATLAS_OK) {
+        st = bind_text(db, stmt, 3, f->src_usr, err);
+    }
+    if (st == ATLAS_OK) {
+        st = bind_text(db, stmt, 4, f->dst_usr, err);
+    }
+    if (st == ATLAS_OK) {
+        st = bind_text(db, stmt, 5, atlas_sem_evidence_name(ev), err);
+    }
+    if (st == ATLAS_OK) {
+        st = bind_text(db, stmt, 7, f->file, err);
+    }
+    if (st == ATLAS_OK) {
+        st = bind_text(db, stmt, 10, f->detail, err);
+    }
+    if (st != ATLAS_OK) {
+        atlas_db_finish(db, stmt);
+        return st;
+    }
+    return atlas_db_step_done(db, stmt, err);
+}
+
+atlas_status atlas_db_sem_include_add(atlas_db *db, int64_t generation_id,
+                                      const atlas_sem_fact *f, atlas_err *err) {
+    if (f == NULL || f->include_from == NULL || f->include_from[0] == '\0') {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "semantic include: no source file");
+    }
+    atlas_sem_evidence ev = ATLAS_SEM_EV_UNKNOWN;
+    (void)atlas_sem_evidence_parse(f->evidence, &ev);
+
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(
+        db,
+        "INSERT INTO sem_includes(generation_id, from_text, to_text, spelling, line, evidence)"
+        " VALUES(?1,?2,?3,?4,?5,?6)"
+        " ON CONFLICT(generation_id, from_text, to_text, spelling, line) DO NOTHING;",
+        &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, generation_id) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 5, f->line) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind semantic include");
+    }
+    st = bind_text(db, stmt, 2, f->include_from, err);
+    if (st == ATLAS_OK) {
+        st = bind_text(db, stmt, 3, f->include_to, err);
+    }
+    if (st == ATLAS_OK) {
+        st = bind_text(db, stmt, 4, f->dst_name, err);
+    }
+    if (st == ATLAS_OK) {
+        st = bind_text(db, stmt, 6, atlas_sem_evidence_name(ev), err);
+    }
+    if (st != ATLAS_OK) {
+        atlas_db_finish(db, stmt);
+        return st;
+    }
+    return atlas_db_step_done(db, stmt, err);
+}
+
+/* --- carrying a unit forward -------------------------------------------------- */
+
+static atlas_status copy_one(atlas_db *db, const char *sql, int64_t to_gen, int64_t from_gen,
+                             const char *source_text, atlas_err *err) {
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(db, sql, &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, to_gen) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 2, from_gen) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind unit copy");
+    }
+    st = bind_text(db, stmt, 3, source_text, err);
+    if (st != ATLAS_OK) {
+        atlas_db_finish(db, stmt);
+        return st;
+    }
+    return atlas_db_step_done(db, stmt, err);
+}
+
+atlas_status atlas_db_sem_copy_unit(atlas_db *db, int64_t from_generation, int64_t to_generation,
+                                    const char *source_text, const char *config_digest,
+                                    int64_t *symbols_out, int64_t *edges_out, atlas_err *err) {
+    (void)config_digest;
+    /* Facts are carried by the unit that produced them. `sem_edges.unit_id`
+     * names it directly; symbols and includes are reached through that unit's
+     * edges and through the files it described, which is why the symbol copy
+     * selects on the unit's own file set rather than on a unit column the table
+     * does not have. The `INSERT OR IGNORE` is what makes copying two units
+     * that share a header produce one row rather than a constraint failure. */
+    atlas_status st = copy_one(
+        db,
+        "INSERT OR IGNORE INTO sem_edges(generation_id, kind, src_usr, dst_usr, evidence,"
+        "  unit_id, file_text, line, col, proto, candidate_total)"
+        " SELECT ?1, e.kind, e.src_usr, e.dst_usr, e.evidence, e.unit_id, e.file_text, e.line,"
+        "  e.col, e.proto, e.candidate_total"
+        " FROM sem_edges e JOIN sem_units u ON u.id = e.unit_id"
+        " WHERE e.generation_id = ?2 AND u.source_text = ?3;",
+        to_generation, from_generation, source_text, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (edges_out != NULL) {
+        *edges_out += sqlite3_changes(db->h);
+    }
+
+    /* Symbols live in the unit's source and in every file it transitively
+     * includes — the same closure `atlas_db_sem_unit_inputs` computes, and it
+     * has to be the same one. A shallower walk here would carry an incomplete
+     * set of symbols forward, so a reused unit would describe less than the
+     * unit that produced it, and the difference would look like code that had
+     * been deleted. */
+    st = copy_one(db,
+                  "WITH RECURSIVE reach(path, depth) AS ("
+                  "  SELECT ?3, 0"
+                  "  UNION"
+                  "  SELECT i.to_text, r.depth + 1 FROM sem_includes i JOIN reach r"
+                  "    ON i.from_text = r.path"
+                  "   WHERE i.generation_id = ?2 AND i.to_text <> '' AND r.depth < 64)"
+                  " INSERT OR IGNORE INTO sem_symbols(generation_id, usr, name, kind, linkage,"
+                  "  type_text, file_text, line, col, end_line, is_definition, external, evidence)"
+                  " SELECT ?1, s.usr, s.name, s.kind, s.linkage, s.type_text, s.file_text, s.line,"
+                  "  s.col, s.end_line, s.is_definition, s.external, s.evidence"
+                  " FROM sem_symbols s"
+                  " WHERE s.generation_id = ?2"
+                  "   AND (s.external = 1 OR s.file_text IN (SELECT path FROM reach));",
+                  to_generation, from_generation, source_text, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (symbols_out != NULL) {
+        *symbols_out += sqlite3_changes(db->h);
+    }
+
+    /* The include rows for the whole closure, not just the unit's own
+     * directives.
+     *
+     * Without this a carried-forward unit would arrive in the new generation
+     * with a one-level include graph, and the *next* incremental pass would
+     * compute its closure from that — a shallower set each time, until a header
+     * edit stopped invalidating anything. The digest and the graph it is
+     * computed from have to be carried together or neither is meaningful. */
+    return copy_one(db,
+                    "WITH RECURSIVE reach(path, depth) AS ("
+                    "  SELECT ?3, 0"
+                    "  UNION"
+                    "  SELECT i.to_text, r.depth + 1 FROM sem_includes i JOIN reach r"
+                    "    ON i.from_text = r.path"
+                    "   WHERE i.generation_id = ?2 AND i.to_text <> '' AND r.depth < 64)"
+                    " INSERT OR IGNORE INTO sem_includes(generation_id, from_text, to_text,"
+                    "  spelling, line, evidence)"
+                    " SELECT ?1, i.from_text, i.to_text, i.spelling, i.line, i.evidence"
+                    " FROM sem_includes i"
+                    " WHERE i.generation_id = ?2 AND i.from_text IN (SELECT path FROM reach);",
+                    to_generation, from_generation, source_text, err);
+}
+
+/* --- candidate targets for indirect calls ------------------------------------ */
+
+atlas_status atlas_db_sem_attach_candidates(atlas_db *db, int64_t generation_id,
+                                            int64_t max_per_site, int64_t *attached_out,
+                                            atlas_err *err) {
+    if (max_per_site <= 0) {
+        max_per_site = ATLAS_SEM_MAX_INDIRECT_CANDIDATES;
+    }
+
+    /* First: how many candidates each prototype actually has. Recorded on every
+     * MAY_CALL site *before* any are attached, so `candidate_total` reports the
+     * true number even where the ceiling keeps fewer — A3's rule that a bound
+     * which makes an ambiguity look smaller than it is is a bound that lies. */
+    atlas_status st = exec_gen_scoped(
+        db,
+        "UPDATE sem_edges SET candidate_total = ("
+        "  SELECT COUNT(DISTINCT a.dst_usr) FROM sem_edges a"
+        "  WHERE a.generation_id = sem_edges.generation_id AND a.kind = 'ADDRESS_TAKEN'"
+        "    AND a.proto <> '' AND a.proto = sem_edges.proto)"
+        " WHERE generation_id = ?1 AND kind = 'MAY_CALL' AND proto <> '';",
+        generation_id, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+
+    /* Then the edges themselves. CANDIDATE, never PROVEN: `sem_edges`' CHECK
+     * permits the class, and `atlas_sem_edge_kind_max_evidence` caps MAY_CALL
+     * at exactly this — the two agree because the literal here is the only
+     * value this statement can write. */
+    sqlite3_stmt *stmt = NULL;
+    st = atlas_db_prepare(
+        db,
+        "INSERT OR IGNORE INTO sem_edges(generation_id, kind, src_usr, dst_usr, evidence,"
+        "  unit_id, file_text, line, col, proto, candidate_total)"
+        " SELECT m.generation_id, 'MAY_CALL', m.src_usr, c.dst_usr, 'CANDIDATE', m.unit_id,"
+        "        m.file_text, m.line, m.col, m.proto, m.candidate_total"
+        " FROM sem_edges m"
+        " JOIN (SELECT DISTINCT generation_id, proto, dst_usr FROM sem_edges"
+        "        WHERE generation_id = ?1 AND kind = 'ADDRESS_TAKEN' AND proto <> '') c"
+        "   ON c.generation_id = m.generation_id AND c.proto = m.proto"
+        " WHERE m.generation_id = ?1 AND m.kind = 'MAY_CALL' AND m.dst_usr = '' AND m.proto <> ''"
+        "   AND (SELECT COUNT(*) FROM sem_edges x WHERE x.generation_id = m.generation_id"
+        "         AND x.kind = 'MAY_CALL' AND x.src_usr = m.src_usr AND x.file_text = m.file_text"
+        "         AND x.line = m.line AND x.col = m.col AND x.dst_usr <> '') < ?2;",
+        &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, generation_id) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 2, max_per_site) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind candidate attachment");
+    }
+    st = atlas_db_step_done(db, stmt, err);
+    if (st == ATLAS_OK && attached_out != NULL) {
+        *attached_out = sqlite3_changes(db->h);
+    }
+    return st;
+}
+
+/* --- bounded reads ------------------------------------------------------------ */
+
+static void read_symbol(sqlite3_stmt *stmt, atlas_sem_symbol_row *row) {
+    memset(row, 0, sizeof(*row));
+    row->id = sqlite3_column_int64(stmt, 0);
+    row->usr = col_text(stmt, 1);
+    row->name = col_text(stmt, 2);
+    row->kind = col_text(stmt, 3);
+    row->linkage = col_text(stmt, 4);
+    row->type_text = col_text(stmt, 5);
+    row->file_text = col_text(stmt, 6);
+    row->line = sqlite3_column_int64(stmt, 7);
+    row->col = sqlite3_column_int64(stmt, 8);
+    row->end_line = sqlite3_column_int64(stmt, 9);
+    row->is_definition = sqlite3_column_int(stmt, 10) != 0;
+    row->external = sqlite3_column_int(stmt, 11) != 0;
+    row->evidence = col_text(stmt, 12);
+}
+
+#define SYM_COLUMNS                                                                            \
+    "s.id, s.usr, s.name, s.kind, s.linkage, s.type_text, s.file_text, s.line, s.col,"         \
+    " s.end_line, s.is_definition, s.external, s.evidence"
+
+/* One driver for both symbol reads: identical bounding, identical truncation
+ * reporting, identical deterministic order. Two copies would answer differently
+ * the first time somebody fixed a bug in one of them — A3's argument for a
+ * single walk. */
+static atlas_status symbols_query(atlas_db *db, const char *sql, int64_t generation_id,
+                                  const char *a, const char *b, int64_t limit,
+                                  atlas_sem_symbol_cb cb, void *ud, int64_t *total_out,
+                                  bool *truncated_out, atlas_err *err) {
+    if (limit <= 0 || limit > ATLAS_SEM_MAX_ROWS) {
+        limit = ATLAS_SEM_MAX_ROWS;
+    }
+    if (total_out != NULL) {
+        *total_out = 0;
+    }
+    if (truncated_out != NULL) {
+        *truncated_out = false;
+    }
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(db, sql, &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    /* One more than asked for, so "there was more" is observed rather than
+     * inferred from a full page. */
+    if (sqlite3_bind_int64(stmt, 1, generation_id) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 4, limit + 1) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind symbol query");
+    }
+    st = bind_text(db, stmt, 2, a, err);
+    if (st == ATLAS_OK) {
+        st = bind_text(db, stmt, 3, b, err);
+    }
+    if (st != ATLAS_OK) {
+        atlas_db_finish(db, stmt);
+        return st;
+    }
+
+    int64_t emitted = 0;
+    int rc;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (emitted >= limit) {
+            if (truncated_out != NULL) {
+                *truncated_out = true;
+            }
+            break;
+        }
+        atlas_sem_symbol_row row;
+        read_symbol(stmt, &row);
+        if (cb != NULL) {
+            st = cb(&row, ud, err);
+            if (st != ATLAS_OK) {
+                break;
+            }
+        }
+        emitted++;
+    }
+    if (st == ATLAS_OK && rc != SQLITE_ROW && rc != SQLITE_DONE) {
+        st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot read semantic symbols");
+    }
+    atlas_db_finish(db, stmt);
+    if (total_out != NULL) {
+        *total_out = emitted;
+    }
+    return st;
+}
+
+atlas_status atlas_db_sem_symbols_by_name(atlas_db *db, int64_t generation_id, const char *name,
+                                          const char *usr, const char *kind, int64_t limit,
+                                          atlas_sem_symbol_cb cb, void *ud, int64_t *total_out,
+                                          bool *truncated_out, atlas_err *err) {
+    /* Two statements rather than one with an extra predicate, because
+     * `atlas_db_prepare` caches by the SQL *pointer* and both must therefore be
+     * distinct literals. They also want different plans: the name lookup drives
+     * `idx_sem_symbols_name` and the USR lookup drives `idx_sem_symbols_usr`.
+     *
+     * Definitions first, then repository symbols before external ones, then by
+     * file and line: a deterministic order that puts the answer somebody
+     * usually wants at the top without hiding the rest. A name that resolves to
+     * several symbols returns all of them — choosing would be inventing, which
+     * is A3's rule about ambiguity and it holds here too. */
+    if (usr != NULL && usr[0] != '\0') {
+        return symbols_query(db,
+                             "SELECT " SYM_COLUMNS " FROM sem_symbols s"
+                             " WHERE s.generation_id = ?1 AND s.usr = ?2"
+                             "   AND (?3 = '' OR s.kind = ?3)"
+                             " ORDER BY s.is_definition DESC, s.external ASC, s.file_text, s.line"
+                             " LIMIT ?4;",
+                             generation_id, usr, kind != NULL ? kind : "", limit, cb, ud,
+                             total_out, truncated_out, err);
+    }
+    return symbols_query(db,
+                         "SELECT " SYM_COLUMNS " FROM sem_symbols s"
+                         " WHERE s.generation_id = ?1 AND s.name = ?2"
+                         "   AND (?3 = '' OR s.kind = ?3)"
+                         " ORDER BY s.is_definition DESC, s.external ASC, s.file_text, s.line"
+                         " LIMIT ?4;",
+                         generation_id, name != NULL ? name : "", kind != NULL ? kind : "", limit,
+                         cb, ud, total_out, truncated_out, err);
+}
+
+atlas_status atlas_db_sem_symbols_in_file(atlas_db *db, int64_t generation_id,
+                                          const char *file_text, int64_t limit,
+                                          atlas_sem_symbol_cb cb, void *ud, int64_t *total_out,
+                                          bool *truncated_out, atlas_err *err) {
+    return symbols_query(db,
+                         "SELECT " SYM_COLUMNS " FROM sem_symbols s"
+                         " WHERE s.generation_id = ?1 AND s.file_text = ?2 AND ?3 = ''"
+                         " ORDER BY s.line, s.col LIMIT ?4;",
+                         generation_id, file_text, "", limit, cb, ud, total_out, truncated_out,
+                         err);
+}
+
+static void read_edge(sqlite3_stmt *stmt, atlas_sem_edge_row *row) {
+    memset(row, 0, sizeof(*row));
+    row->id = sqlite3_column_int64(stmt, 0);
+    row->kind = col_text(stmt, 1);
+    row->src_usr = col_text(stmt, 2);
+    row->dst_usr = col_text(stmt, 3);
+    row->evidence = col_text(stmt, 4);
+    row->file_text = col_text(stmt, 5);
+    row->line = sqlite3_column_int64(stmt, 6);
+    row->col = sqlite3_column_int64(stmt, 7);
+    row->proto = col_text(stmt, 8);
+    row->candidate_total = sqlite3_column_int64(stmt, 9);
+    row->peer_name = col_text(stmt, 10);
+    row->peer_file = col_text(stmt, 11);
+    row->peer_line = sqlite3_column_int64(stmt, 12);
+}
+
+atlas_status atlas_db_sem_edges_of(atlas_db *db, int64_t generation_id, const char *usr,
+                                   bool inbound, const char *kind, bool calls_only, int64_t limit,
+                                   atlas_sem_edge_cb cb, void *ud, int64_t *total_out,
+                                   bool *truncated_out, atlas_err *err) {
+    if (limit <= 0 || limit > ATLAS_SEM_MAX_ROWS) {
+        limit = ATLAS_SEM_MAX_ROWS;
+    }
+    if (total_out != NULL) {
+        *total_out = 0;
+    }
+    if (truncated_out != NULL) {
+        *truncated_out = false;
+    }
+
+    /* Two statements rather than one with a swapped column, because
+     * `atlas_db_prepare` caches by the SQL pointer and both must be distinct
+     * literals. The peer join resolves the far end's display name and best
+     * location — a definition when there is one — so a caller does not issue a
+     * lookup per edge.
+     *
+     * The inbound query requires a non-empty `dst_usr` implicitly by matching
+     * on it: an indirect call with no destination can never be an edge *into*
+     * anything, and returning one would let an unknown target appear as a
+     * caller. */
+    static const char *const INBOUND =
+        "SELECT e.id, e.kind, e.src_usr, e.dst_usr, e.evidence, e.file_text, e.line, e.col,"
+        "       e.proto, e.candidate_total,"
+        "       COALESCE(p.name,''), COALESCE(p.file_text,''), COALESCE(p.line,0)"
+        " FROM sem_edges e"
+        " LEFT JOIN sem_symbols p ON p.generation_id = e.generation_id AND p.usr = e.src_usr"
+        "   AND p.id = (SELECT q.id FROM sem_symbols q WHERE q.generation_id = e.generation_id"
+        "                AND q.usr = e.src_usr ORDER BY q.is_definition DESC, q.line LIMIT 1)"
+        " WHERE e.generation_id = ?1 AND e.dst_usr = ?2 AND (?3 = '' OR e.kind = ?3)"
+        "   AND (?5 = 0 OR e.kind IN ('CALLS','MAY_CALL'))"
+        " ORDER BY e.evidence, e.file_text, e.line, e.col LIMIT ?4;";
+    static const char *const OUTBOUND =
+        "SELECT e.id, e.kind, e.src_usr, e.dst_usr, e.evidence, e.file_text, e.line, e.col,"
+        "       e.proto, e.candidate_total,"
+        "       COALESCE(p.name,''), COALESCE(p.file_text,''), COALESCE(p.line,0)"
+        " FROM sem_edges e"
+        " LEFT JOIN sem_symbols p ON p.generation_id = e.generation_id AND p.usr = e.dst_usr"
+        "   AND p.id = (SELECT q.id FROM sem_symbols q WHERE q.generation_id = e.generation_id"
+        "                AND q.usr = e.dst_usr ORDER BY q.is_definition DESC, q.line LIMIT 1)"
+        " WHERE e.generation_id = ?1 AND e.src_usr = ?2 AND (?3 = '' OR e.kind = ?3)"
+        "   AND (?5 = 0 OR e.kind IN ('CALLS','MAY_CALL'))"
+        " ORDER BY e.evidence, e.file_text, e.line, e.col LIMIT ?4;";
+
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(db, inbound ? INBOUND : OUTBOUND, &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, generation_id) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 4, limit + 1) != SQLITE_OK ||
+        sqlite3_bind_int(stmt, 5, calls_only ? 1 : 0) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind edge query");
+    }
+    st = bind_text(db, stmt, 2, usr, err);
+    if (st == ATLAS_OK) {
+        /* A kind Atlas does not recognise selects nothing rather than being
+         * passed through: the vocabulary is closed, and a filter naming
+         * something outside it is a caller error, not a wildcard. */
+        atlas_sem_edge_kind k = ATLAS_SEM_EDGE_UNKNOWN;
+        bool named = kind != NULL && kind[0] != '\0';
+        if (named && !atlas_sem_edge_kind_parse(kind, &k)) {
+            atlas_db_finish(db, stmt);
+            return atlas_err_set(err, ATLAS_ERR_USAGE, "unknown semantic edge kind");
+        }
+        st = bind_text(db, stmt, 3, named ? atlas_sem_edge_kind_name(k) : "", err);
+    }
+    if (st != ATLAS_OK) {
+        atlas_db_finish(db, stmt);
+        return st;
+    }
+
+    int64_t emitted = 0;
+    int rc;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (emitted >= limit) {
+            if (truncated_out != NULL) {
+                *truncated_out = true;
+            }
+            break;
+        }
+        atlas_sem_edge_row row;
+        read_edge(stmt, &row);
+        if (cb != NULL) {
+            st = cb(&row, ud, err);
+            if (st != ATLAS_OK) {
+                break;
+            }
+        }
+        emitted++;
+    }
+    if (st == ATLAS_OK && rc != SQLITE_ROW && rc != SQLITE_DONE) {
+        st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot read semantic edges");
+    }
+    atlas_db_finish(db, stmt);
+    if (total_out != NULL) {
+        *total_out = emitted;
+    }
+    return st;
+}
+
+atlas_status atlas_db_sem_includers_of(atlas_db *db, int64_t generation_id, const char *file_text,
+                                       int64_t limit, atlas_sem_edge_cb cb, void *ud,
+                                       int64_t *total_out, bool *truncated_out, atlas_err *err) {
+    if (limit <= 0 || limit > ATLAS_SEM_MAX_ROWS) {
+        limit = ATLAS_SEM_MAX_ROWS;
+    }
+    if (total_out != NULL) {
+        *total_out = 0;
+    }
+    if (truncated_out != NULL) {
+        *truncated_out = false;
+    }
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(
+        db,
+        "SELECT i.id, 'INCLUDES', i.from_text, i.to_text, i.evidence, i.from_text, i.line, 0,"
+        "       '', 0, '', i.from_text, i.line"
+        " FROM sem_includes i"
+        " WHERE i.generation_id = ?1 AND i.to_text = ?2"
+        " ORDER BY i.from_text, i.line LIMIT ?3;",
+        &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, generation_id) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 3, limit + 1) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind include query");
+    }
+    st = bind_text(db, stmt, 2, file_text, err);
+    if (st != ATLAS_OK) {
+        atlas_db_finish(db, stmt);
+        return st;
+    }
+    int64_t emitted = 0;
+    int rc;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (emitted >= limit) {
+            if (truncated_out != NULL) {
+                *truncated_out = true;
+            }
+            break;
+        }
+        atlas_sem_edge_row row;
+        read_edge(stmt, &row);
+        if (cb != NULL) {
+            st = cb(&row, ud, err);
+            if (st != ATLAS_OK) {
+                break;
+            }
+        }
+        emitted++;
+    }
+    if (st == ATLAS_OK && rc != SQLITE_ROW && rc != SQLITE_DONE) {
+        st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot read include relations");
+    }
+    atlas_db_finish(db, stmt);
+    if (total_out != NULL) {
+        *total_out = emitted;
+    }
+    return st;
+}
+
+atlas_status atlas_db_sem_failed_units(atlas_db *db, int64_t generation_id, int64_t limit,
+                                       atlas_sem_unit_cb cb, void *ud, int64_t *total_out,
+                                       bool *truncated_out, atlas_err *err) {
+    if (limit <= 0 || limit > ATLAS_SEM_MAX_ROWS) {
+        limit = ATLAS_SEM_MAX_ROWS;
+    }
+    if (total_out != NULL) {
+        *total_out = 0;
+    }
+    if (truncated_out != NULL) {
+        *truncated_out = false;
+    }
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(
+        db,
+        "SELECT u.source_text, u.status, u.why, u.diagnostics_errors FROM sem_units u"
+        " WHERE u.generation_id = ?1 AND u.status <> 'COMPLETE'"
+        " ORDER BY u.status, u.source_text LIMIT ?2;",
+        &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, generation_id) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 2, limit + 1) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind unit report");
+    }
+    int64_t emitted = 0;
+    int rc;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (emitted >= limit) {
+            if (truncated_out != NULL) {
+                *truncated_out = true;
+            }
+            break;
+        }
+        atlas_sem_unit_report row;
+        row.source_text = col_text(stmt, 0);
+        row.status = col_text(stmt, 1);
+        row.why = col_text(stmt, 2);
+        row.diagnostics_errors = sqlite3_column_int64(stmt, 3);
+        if (cb != NULL) {
+            st = cb(&row, ud, err);
+            if (st != ATLAS_OK) {
+                break;
+            }
+        }
+        emitted++;
+    }
+    if (st == ATLAS_OK && rc != SQLITE_ROW && rc != SQLITE_DONE) {
+        st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot read semantic units");
+    }
+    atlas_db_finish(db, stmt);
+    if (total_out != NULL) {
+        *total_out = emitted;
+    }
+    return st;
+}
+
+atlas_status atlas_db_sem_unit_digest(atlas_db *db, int64_t generation_id, const char *source_text,
+                                      const char *config_digest, atlas_buf *digest_out,
+                                      bool *found, atlas_err *err) {
+    *found = false;
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(
+        db,
+        "SELECT u.input_digest FROM sem_units u"
+        " WHERE u.generation_id = ?1 AND u.source_text = ?2 AND u.config_digest = ?3;",
+        &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, generation_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind unit digest lookup");
+    }
+    st = bind_text(db, stmt, 2, source_text, err);
+    if (st == ATLAS_OK) {
+        st = bind_text(db, stmt, 3, config_digest, err);
+    }
+    if (st != ATLAS_OK) {
+        atlas_db_finish(db, stmt);
+        return st;
+    }
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *d = col_text(stmt, 0);
+        if (d[0] != '\0') {
+            st = atlas_buf_set_str(digest_out, d, err);
+            *found = st == ATLAS_OK;
+        }
+    }
+    atlas_db_finish(db, stmt);
+    return st;
+}
+
+atlas_status atlas_db_sem_unit_inputs(atlas_db *db, int64_t generation_id, const char *source_text,
+                                      atlas_buf *paths_out, atlas_err *err) {
+    /* The unit's own source, plus the **transitive closure** of everything it
+     * includes, in sorted order.
+     *
+     * Transitive is the whole point and the shallow version of this query was a
+     * real defect: a header four levels down is exactly the file whose edit an
+     * incremental pass must notice, and a two-level walk would leave it out of
+     * the digest, carry the unit forward unchanged and report it COMPLETE.
+     *
+     * Sorted because the digest computed over this list must not depend on
+     * SQLite's row order — the whole point of the digest is that identical
+     * inputs produce an identical value on a later run. `UNION` rather than
+     * `UNION ALL` terminates the recursion on a cyclic include graph, which C
+     * produces routinely through include guards. */
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(
+        db,
+        "WITH RECURSIVE reach(path, depth) AS ("
+        "  SELECT ?2, 0"
+        "  UNION"
+        "  SELECT i.to_text, r.depth + 1 FROM sem_includes i JOIN reach r"
+        "    ON i.from_text = r.path"
+        "   WHERE i.generation_id = ?1 AND i.to_text <> '' AND r.depth < ?3)"
+        " SELECT DISTINCT path FROM reach WHERE path <> ?2 ORDER BY path;",
+        &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, generation_id) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 3, ATLAS_SEM_MAX_INCLUDE_DEPTH) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind unit inputs");
+    }
+    st = bind_text(db, stmt, 2, source_text, err);
+    if (st != ATLAS_OK) {
+        atlas_db_finish(db, stmt);
+        return st;
+    }
+    int rc;
+    while (st == ATLAS_OK && (rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        const char *p = col_text(stmt, 0);
+        st = atlas_buf_append(paths_out, p, strlen(p) + 1, err);
+    }
+    atlas_db_finish(db, stmt);
+    return st;
+}
+
+atlas_status atlas_db_sem_units_all(atlas_db *db, int64_t generation_id,
+                                    atlas_sem_unit_key_cb cb, void *ud, atlas_err *err) {
+    sqlite3_stmt *stmt = NULL;
+    /* Ordered, so the sealing pass visits units in a reproducible order and two
+     * runs over one state produce identical generations. */
+    atlas_status st = atlas_db_prepare(db,
+                                       "SELECT u.source_text, u.config_digest FROM sem_units u"
+                                       " WHERE u.generation_id = ?1"
+                                       " ORDER BY u.source_text, u.config_digest;",
+                                       &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, generation_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind unit enumeration");
+    }
+    int rc;
+    while (st == ATLAS_OK && (rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        atlas_sem_unit_key key;
+        key.source_text = col_text(stmt, 0);
+        key.config_digest = col_text(stmt, 1);
+        if (cb != NULL) {
+            st = cb(&key, ud, err);
+        }
+    }
+    atlas_db_finish(db, stmt);
+    return st;
+}
+
+atlas_status atlas_db_sem_unit_set_digest(atlas_db *db, int64_t generation_id,
+                                          const char *source_text, const char *config_digest,
+                                          const char *digest, atlas_err *err) {
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(
+        db,
+        "UPDATE sem_units SET input_digest = ?4"
+        " WHERE generation_id = ?1 AND source_text = ?2 AND config_digest = ?3;",
+        &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, generation_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind unit digest update");
+    }
+    st = bind_text(db, stmt, 2, source_text, err);
+    if (st == ATLAS_OK) {
+        st = bind_text(db, stmt, 3, config_digest, err);
+    }
+    if (st == ATLAS_OK) {
+        st = bind_text(db, stmt, 4, digest, err);
+    }
+    if (st != ATLAS_OK) {
+        atlas_db_finish(db, stmt);
+        return st;
+    }
+    return atlas_db_step_done(db, stmt, err);
+}
+
+/* One bounded count over a generation-scoped index. */
+static atlas_status count_scoped(atlas_db *db, const char *sql, int64_t generation_id,
+                                 int64_t *out, atlas_err *err) {
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(db, sql, &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, generation_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind a generation id");
+    }
+    *out = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        *out = sqlite3_column_int64(stmt, 0);
+        st = ATLAS_OK;
+    } else {
+        st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot count a generation");
+    }
+    atlas_db_finish(db, stmt);
+    return st;
+}
+
+atlas_status atlas_db_sem_generation_counts(atlas_db *db, int64_t generation_id,
+                                            int64_t *symbols_out, int64_t *edges_out,
+                                            int64_t *includes_out, atlas_err *err) {
+    /* Three string literals rather than one built string: `atlas_db_prepare`
+     * caches on the SQL pointer, so every call site passes a literal. */
+    atlas_status st =
+        count_scoped(db, "SELECT count(*) FROM sem_symbols WHERE generation_id = ?1;",
+                     generation_id, symbols_out, err);
+    if (st == ATLAS_OK) {
+        st = count_scoped(db, "SELECT count(*) FROM sem_edges WHERE generation_id = ?1;",
+                          generation_id, edges_out, err);
+    }
+    if (st == ATLAS_OK) {
+        st = count_scoped(db, "SELECT count(*) FROM sem_includes WHERE generation_id = ?1;",
+                          generation_id, includes_out, err);
+    }
+    return st;
+}

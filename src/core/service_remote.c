@@ -43,6 +43,7 @@
 #include "atlas/gate.h"
 #include "atlas/ipc.h"
 #include "atlas/pathrep.h"
+#include "atlas/maintenance.h"
 #include "atlas/service.h"
 #include "core/service_internal.h"
 
@@ -1872,6 +1873,15 @@ static void take_verify(const atlas_ipc_response *r, const char *prefix,
     if (atlas_ipc_result_int(r, K("revisions_checked"), &n)) {
         out->revisions_checked = n;
     }
+    if (atlas_ipc_result_int(r, K("revisions_rehashed"), &n)) {
+        out->revisions_rehashed = n;
+    }
+    if (atlas_ipc_result_int(r, K("tables_required"), &n)) {
+        out->tables_required = n;
+    }
+    if (atlas_ipc_result_int(r, K("tables_present"), &n)) {
+        out->tables_present = n;
+    }
     if (atlas_ipc_result_int(r, K("revisions_corrupt"), &n)) {
         out->revisions_corrupt = n;
     }
@@ -1886,12 +1896,431 @@ static void take_verify(const atlas_ipc_response *r, const char *prefix,
     if (atlas_ipc_result_str(r, K("integrity"), &v) && v != NULL) {
         (void)atlas_buf_set_str(&out->integrity, v, &e);
     }
+    if (atlas_ipc_result_str(r, K("foreign_key_check"), &v) && v != NULL) {
+        (void)atlas_buf_set_str(&out->foreign_key_check, v, &e);
+    }
+    if (atlas_ipc_result_str(r, K("missing_tables"), &v) && v != NULL) {
+        (void)atlas_buf_set_str(&out->missing_tables, v, &e);
+    }
     if (atlas_ipc_result_str(r, K("problems"), &v) && v != NULL) {
         (void)atlas_buf_set_str(&out->problems, v, &e);
     }
 #undef K
 }
 
+/* Tells the user the operation exists, before waiting on it.
+ *
+ * On stderr, so stdout stays exactly one document — and *before* the wait, so a
+ * user who interrupts has already seen the id. The operator guide says to ask
+ * again with the id the daemon reported; without this line the daemon never
+ * reported one, and the instruction was impossible to follow at the moment it
+ * was needed. Interrupting is the case that matters, because interrupting is
+ * the one thing the split makes safe. */
+static void announce_operation(int64_t op_id, const char *what) {
+    (void)fprintf(stderr,
+                  "atlas: %s accepted as operation %lld; waiting. Interrupting does not cancel "
+                  "it — ask again with `atlas operation status %lld`.\n",
+                  what, (long long)op_id, (long long)op_id);
+    (void)fflush(stderr);
+}
+
+/* Polls one accepted operation until it reaches a terminal state.
+ *
+ * The wait is a ceiling on this client's patience, never on the operation. If
+ * it is reached, the operation is still running on the daemon and the message
+ * says so and says how to ask again — because the whole defect being fixed here
+ * was a client deciding that a server-side success was a failure. Reporting
+ * "still running, ask again" is true; reporting a timeout as a failure is not. */
+static atlas_status wait_for_operation(int64_t op_id, atlas_buf *message_out,
+                                       atlas_buf *detail_out, atlas_backup_report *backup_out,
+                                       int64_t *duration_out, atlas_err *err) {
+    int waited_ms = 0;
+    for (;;) {
+        atlas_buf params = ATLAS_BUF_INIT;
+        atlas_ipc_params *p = NULL;
+        atlas_json *j = NULL;
+        atlas_status st = atlas_ipc_params_begin(&p, &j, err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_int(j, "operation_id", op_id, err);
+            if (st == ATLAS_OK) {
+                st = atlas_ipc_params_finish(p, &params, err);
+            } else {
+                atlas_ipc_params_abort(p);
+            }
+        }
+        atlas_buf raw = ATLAS_BUF_INIT;
+        atlas_ipc_response *r = NULL;
+        if (st == ATLAS_OK) {
+            st = atlas_remote_call("operation.get", atlas_buf_cstr(&params), &raw, &r, err);
+        }
+        atlas_buf_free(&params);
+        if (st != ATLAS_OK) {
+            /* A poll that failed says nothing about the operation.
+             *
+             * This is the same mistake the whole split exists to undo, one
+             * layer down: a semantic index makes the daemon write hard for a
+             * minute, ordinary reads slow under that load, and the poll's own
+             * frame read hit ATLAS_IPC_READ_TIMEOUT_MS — so the client reported
+             * failure while the index went on to publish successfully. The
+             * operation is running on the daemon and this client's inability to
+             * ask about it right now is not evidence about it.
+             *
+             * So a failed poll is retried until the overall ceiling, and only
+             * the ceiling ends the wait — with a message that says the
+             * operation is still running rather than that it failed. */
+            atlas_buf_free(&raw);
+            atlas_ipc_response_free(r);
+            atlas_err_init(err);
+            if (waited_ms >= ATLAS_OPS_CLIENT_WAIT_MS) {
+                return atlas_err_set(err, ATLAS_ERR_CONFIG,
+                                     "operation %lld could not be polled and this client stopped "
+                                     "waiting after %d seconds. It has not failed and it has not "
+                                     "been cancelled; ask again with `atlas operation status %lld`",
+                                     (long long)op_id, waited_ms / 1000, (long long)op_id);
+            }
+            struct timespec rts;
+            rts.tv_sec = ATLAS_OPS_POLL_INTERVAL_MS / 1000;
+            rts.tv_nsec = (long)(ATLAS_OPS_POLL_INTERVAL_MS % 1000) * 1000000L;
+            (void)nanosleep(&rts, NULL);
+            waited_ms += ATLAS_OPS_POLL_INTERVAL_MS;
+            continue;
+        }
+        bool done = false;
+        bool ok = false;
+        const char *v = NULL;
+        (void)atlas_ipc_result_bool(r, "done", &done);
+        (void)atlas_ipc_result_bool(r, "succeeded", &ok);
+        if (done) {
+            int64_t dur = 0;
+            if (duration_out != NULL && atlas_ipc_result_int(r, "duration_ms", &dur)) {
+                *duration_out = dur;
+            }
+            if (atlas_ipc_result_str(r, "message", &v) && v != NULL && message_out != NULL) {
+                (void)atlas_buf_set_str(message_out, v, err);
+            }
+            if (atlas_ipc_result_str(r, "detail", &v) && v != NULL && detail_out != NULL) {
+                (void)atlas_buf_set_str(detail_out, v, err);
+            }
+            if (backup_out != NULL && ok) {
+                int64_t n = 0;
+                if (atlas_ipc_result_int(r, "size_bytes", &n)) {
+                    backup_out->size_bytes = n;
+                }
+                if (atlas_ipc_result_int(r, "page_size", &n)) {
+                    backup_out->page_size = n;
+                }
+                if (atlas_ipc_result_int(r, "page_count", &n)) {
+                    backup_out->page_count = n;
+                }
+                if (atlas_ipc_result_int(r, "schema_version", &n)) {
+                    backup_out->schema_version = (int)n;
+                }
+                (void)atlas_ipc_result_bool(r, "source_online", &backup_out->source_online);
+                if (atlas_ipc_result_str(r, "sha256", &v) && v != NULL) {
+                    copy_str(backup_out->sha256, sizeof backup_out->sha256, v);
+                }
+                if (atlas_ipc_result_str(r, "atlas_version", &v) && v != NULL) {
+                    copy_str(backup_out->atlas_version, sizeof backup_out->atlas_version, v);
+                }
+            }
+            atlas_status result = ATLAS_OK;
+            if (!ok) {
+                result = atlas_err_set(err, ATLAS_ERR_INTEGRITY, "%s",
+                                       message_out != NULL && message_out->len > 0
+                                           ? atlas_buf_cstr(message_out)
+                                           : "the operation failed");
+            }
+            atlas_ipc_response_free(r);
+            atlas_buf_free(&raw);
+            return result;
+        }
+        atlas_ipc_response_free(r);
+        atlas_buf_free(&raw);
+
+        if (waited_ms >= ATLAS_OPS_CLIENT_WAIT_MS) {
+            return atlas_err_set(
+                err, ATLAS_ERR_CONFIG,
+                "operation %lld is still running after %d seconds. It has not failed and it has "
+                "not been cancelled; this client simply stopped waiting. Ask again with "
+                "`atlas operation status %lld`",
+                (long long)op_id, waited_ms / 1000, (long long)op_id);
+        }
+        struct timespec ts;
+        ts.tv_sec = ATLAS_OPS_POLL_INTERVAL_MS / 1000;
+        ts.tv_nsec = (long)(ATLAS_OPS_POLL_INTERVAL_MS % 1000) * 1000000L;
+        (void)nanosleep(&ts, NULL);
+        waited_ms += ATLAS_OPS_POLL_INTERVAL_MS;
+    }
+}
+
+/* Submits a semantic index to the daemon, then polls until it finishes.
+ *
+ * Before the closeout there was no remote form: under A7.1 the index is 0700
+ * `atlasd`, so an operator's only route was to stop the service and run the
+ * command as the service account. That is a documented workaround standing in
+ * for a missing feature, and the closeout forbids exactly that. The service
+ * stays running now; the work is queued to the daemon's writer thread and the
+ * caller polls. */
+atlas_status atlas_service_sem_index_remote(const char *name, const char *const *compdbs,
+                                            size_t compdb_count, bool rebuild,
+                                            atlas_sem_index_summary *out, atlas_err *err) {
+    atlas_buf params = ATLAS_BUF_INIT;
+    atlas_ipc_params *p = NULL;
+    atlas_json *j = NULL;
+    atlas_status st = atlas_ipc_params_begin(&p, &j, err);
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(j, "repo", name, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key(j, "compdbs", err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_arr_begin(j, err);
+        }
+        for (size_t i = 0; i < compdb_count && st == ATLAS_OK; i++) {
+            st = atlas_json_str(j, compdbs[i], err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_arr_end(j, err);
+        }
+    }
+    if (st == ATLAS_OK && rebuild) {
+        st = atlas_json_key_bool(j, "rebuild", true, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_ipc_params_finish(p, &params, err);
+    } else {
+        atlas_ipc_params_abort(p);
+    }
+    atlas_buf raw = ATLAS_BUF_INIT;
+    atlas_ipc_response *r = NULL;
+    if (st == ATLAS_OK) {
+        st = atlas_remote_call("code.index", atlas_buf_cstr(&params), &raw, &r, err);
+    }
+    atlas_buf_free(&params);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    int64_t op_id = 0;
+    (void)atlas_ipc_result_int(r, "operation_id", &op_id);
+    atlas_ipc_response_free(r);
+    atlas_buf_free(&raw);
+    if (op_id <= 0) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                             "the daemon accepted the index but named no operation to poll");
+    }
+
+    atlas_buf message = ATLAS_BUF_INIT;
+    atlas_buf detail = ATLAS_BUF_INIT;
+    announce_operation(op_id, "semantic index");
+    int64_t op_duration_ms = 0;
+    st = wait_for_operation(op_id, &message, &detail, NULL, &op_duration_ms, err);
+    if (st == ATLAS_OK) {
+        /* The summary is read back from the published generation rather than
+         * carried through the operation record.
+         *
+         * The generation is the record; the operation's message is a log line
+         * about producing it. Reading it back also means the local and remote
+         * forms print numbers that came from the same place, so they cannot
+         * describe the same index differently. */
+        atlas_sem_status_report srep;
+        atlas_sem_status_report_init(&srep);
+        st = atlas_service_sem_status_remote(name, &srep, err);
+        if (st == ATLAS_OK && srep.have_generation) {
+            out->generation_id = srep.generation.id;
+            out->units_total = srep.generation.tu_total;
+            out->units_complete = srep.generation.tu_complete;
+            out->units_partial = srep.generation.tu_partial;
+            out->units_failed = srep.generation.tu_failed;
+            out->units_unsupported = srep.generation.tu_unsupported;
+            out->symbols = srep.generation.symbol_count;
+            out->edges = srep.generation.edge_count;
+            out->includes = srep.generation.include_count;
+            /* This invocation's own duration, not the generation's.
+             *
+             * The generation records how long it took to build, which for a
+             * no-change run is a number from some earlier pass — printing it
+             * would tell an operator their half-second run took two minutes.
+             * The operation measured what actually just happened. */
+            out->duration_ms = op_duration_ms;
+            out->published = true;
+        }
+        atlas_sem_status_report_free(&srep);
+    }
+    atlas_buf_free(&message);
+    atlas_buf_free(&detail);
+    return st;
+}
+
+/* Maintenance over the socket.
+ *
+ * A5 gave maintenance no RPC surface, on the reasoning that whoever owns the
+ * data directory can prune it anyway — and A7.1 broke that premise exactly as
+ * it did for backup: under a system deployment the index is 0700 `atlasd`, so
+ * the operator account could neither plan nor prune without becoming the
+ * service account. The guarantee A5 wanted is that nothing a *model* can reach
+ * may prune the index, and that is untouched: these two methods live in the
+ * operator-uid group, and every other peer is told they do not exist. */
+atlas_status atlas_service_maintenance_remote(const atlas_maintenance_opts *opts,
+                                              atlas_maintenance_report *out, atlas_err *err) {
+    atlas_buf params = ATLAS_BUF_INIT;
+    atlas_ipc_params *p = NULL;
+    atlas_json *j = NULL;
+    atlas_status st = atlas_ipc_params_begin(&p, &j, err);
+    if (st == ATLAS_OK && opts->older_than_days > 0) {
+        st = atlas_json_key_int(j, "older_than_days", opts->older_than_days, err);
+    }
+    if (st == ATLAS_OK && opts->retain_per_repo > 0) {
+        st = atlas_json_key_int(j, "retain_per_repo", opts->retain_per_repo, err);
+    }
+    if (st == ATLAS_OK && opts->apply) {
+        st = atlas_json_key_bool(j, "apply", true, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_ipc_params_finish(p, &params, err);
+    } else {
+        atlas_ipc_params_abort(p);
+    }
+    atlas_buf raw = ATLAS_BUF_INIT;
+    atlas_ipc_response *r = NULL;
+    if (st == ATLAS_OK) {
+        st = atlas_remote_call(opts->apply ? "maintenance.prune" : "maintenance.plan",
+                               atlas_buf_cstr(&params), &raw, &r, err);
+    }
+    atlas_buf_free(&params);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    int64_t n = 0;
+    const char *v = NULL;
+    (void)atlas_ipc_result_bool(r, "applied", &out->applied);
+    if (atlas_ipc_result_int(r, "older_than_days", &n)) {
+        out->older_than_days = n;
+    }
+    if (atlas_ipc_result_int(r, "retain_per_repo", &n)) {
+        out->retain_per_repo = n;
+    }
+    if (atlas_ipc_result_str(r, "cutoff", &v) && v != NULL) {
+        copy_str(out->cutoff, sizeof out->cutoff, v);
+    }
+    if (atlas_ipc_result_int(r, "total_rows", &n)) {
+        out->total_rows = n;
+    }
+    if (atlas_ipc_result_int(r, "total_eligible", &n)) {
+        out->total_eligible = n;
+    }
+    if (atlas_ipc_result_int(r, "total_removed", &n)) {
+        out->total_removed = n;
+    }
+    if (atlas_ipc_result_int(r, "prunable_tables", &n)) {
+        out->prunable_tables = (size_t)n;
+    }
+    if (atlas_ipc_result_int(r, "protected_tables", &n)) {
+        out->protected_tables = (size_t)n;
+    }
+    /* The per-table rows. `table` and `reason` are Atlas-owned constants, but
+     * they are copied rather than aliased into the response, which is freed
+     * below — the row-callback rule, applied to a response document. */
+    size_t rows = 0;
+    (void)atlas_ipc_result_arr_len(r, "tables", &rows);
+    if (rows > 0) {
+        out->tables = calloc(rows, sizeof(*out->tables));
+        if (out->tables == NULL) {
+            atlas_ipc_response_free(r);
+            atlas_buf_free(&raw);
+            return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory reading a maintenance "
+                                                          "report");
+        }
+        out->table_count = rows;
+        for (size_t i = 0; i < rows; i++) {
+            atlas_maintenance_row *row = &out->tables[i];
+            /* The classification, the prunable flag and the written reason come
+             * from this binary's own policy, looked up by table name. They are
+             * Atlas-owned constants and a report is not the place to start
+             * trusting a peer for them; only the counts cross the socket. */
+            if (atlas_ipc_result_arr_obj_str(r, "tables", i, "table", &v) && v != NULL) {
+                if (!atlas_maintenance_policy_lookup(v, &row->table, &row->cls, &row->prunable,
+                                                     &row->reason)) {
+                    row->table = "(unknown to this Atlas)";
+                    row->reason = "this build's retention policy has no entry for that table";
+                }
+            }
+            (void)atlas_ipc_result_arr_obj_bool(r, "tables", i, "counted", &row->counted);
+            if (atlas_ipc_result_arr_obj_int(r, "tables", i, "rows_before", &n)) {
+                row->rows_before = n;
+            }
+            if (atlas_ipc_result_arr_obj_int(r, "tables", i, "rows_eligible", &n)) {
+                row->rows_eligible = n;
+            }
+            if (atlas_ipc_result_arr_obj_int(r, "tables", i, "rows_removed", &n)) {
+                row->rows_removed = n;
+            }
+            if (atlas_ipc_result_arr_obj_int(r, "tables", i, "rows_after", &n)) {
+                row->rows_after = n;
+            }
+        }
+    }
+    atlas_ipc_response_free(r);
+    atlas_buf_free(&raw);
+    return st;
+}
+
+atlas_status atlas_service_operation_status_remote(int64_t op_id, atlas_operation_report *out,
+                                                   atlas_err *err) {
+    atlas_buf params = ATLAS_BUF_INIT;
+    atlas_ipc_params *p = NULL;
+    atlas_json *j = NULL;
+    atlas_status st = atlas_ipc_params_begin(&p, &j, err);
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(j, "operation_id", op_id, err);
+        if (st == ATLAS_OK) {
+            st = atlas_ipc_params_finish(p, &params, err);
+        } else {
+            atlas_ipc_params_abort(p);
+        }
+    }
+    atlas_buf raw = ATLAS_BUF_INIT;
+    atlas_ipc_response *r = NULL;
+    if (st == ATLAS_OK) {
+        st = atlas_remote_call("operation.get", atlas_buf_cstr(&params), &raw, &r, err);
+    }
+    atlas_buf_free(&params);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    const char *v = NULL;
+    int64_t n = 0;
+    out->id = op_id;
+    if (atlas_ipc_result_str(r, "kind", &v) && v != NULL) {
+        (void)atlas_buf_set_str(&out->kind, v, err);
+    }
+    if (atlas_ipc_result_str(r, "state", &v) && v != NULL) {
+        (void)atlas_buf_set_str(&out->state, v, err);
+    }
+    (void)atlas_ipc_result_bool(r, "done", &out->done);
+    (void)atlas_ipc_result_bool(r, "succeeded", &out->succeeded);
+    if (atlas_ipc_result_int(r, "duration_ms", &n)) {
+        out->duration_ms = n;
+    }
+    if (atlas_ipc_result_str(r, "message", &v) && v != NULL) {
+        (void)atlas_buf_set_str(&out->message, v, err);
+    }
+    if (atlas_ipc_result_str(r, "detail", &v) && v != NULL) {
+        (void)atlas_buf_set_str(&out->detail, v, err);
+    }
+    atlas_ipc_response_free(r);
+    atlas_buf_free(&raw);
+    return st;
+}
+
+/* Submits the backup, then polls until it finishes.
+ *
+ * The two halves used to be one blocking call, and a 437 MiB index took longer
+ * than ATLAS_IPC_READ_TIMEOUT_MS — so the client reported "timed out while
+ * reading a frame header" and exit 1 while the daemon went on to write and
+ * verify a perfectly good backup. Worse, the work ran inside the non-blocking
+ * serve loop, so it stalled every other client for the duration. Splitting it
+ * fixes both: the request returns as soon as the work is accepted, and the work
+ * itself runs on a thread that is not the serve loop. */
 atlas_status atlas_service_backup_create_remote(const char *name, atlas_backup_report *out,
                                                 atlas_backup_verify_report *verified,
                                                 atlas_err *err) {
@@ -1918,32 +2347,35 @@ atlas_status atlas_service_backup_create_remote(const char *name, atlas_backup_r
     if (st != ATLAS_OK) {
         return st;
     }
+    int64_t op_id = 0;
     const char *v = NULL;
-    int64_t n = 0;
-    bool b = false;
+    (void)atlas_ipc_result_int(r, "operation_id", &op_id);
     if (atlas_ipc_result_str(r, "backup", &v) && v != NULL) {
         st = atlas_buf_set_str(&out->path, v, err);
     }
-    if (atlas_ipc_result_int(r, "size_bytes", &n)) {
-        out->size_bytes = n;
-    }
-    if (atlas_ipc_result_str(r, "sha256", &v) && v != NULL) {
-        copy_str(out->sha256, sizeof out->sha256, v);
-    }
-    if (atlas_ipc_result_str(r, "atlas_version", &v) && v != NULL) {
-        copy_str(out->atlas_version, sizeof out->atlas_version, v);
-    }
-    if (atlas_ipc_result_int(r, "schema_version", &n)) {
-        out->schema_version = (int)n;
-    }
-    if (atlas_ipc_result_bool(r, "source_online", &b)) {
-        out->source_online = b;
-    }
-    if (verified != NULL) {
-        take_verify(r, "verified_", verified);
-    }
     atlas_ipc_response_free(r);
     atlas_buf_free(&raw);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (op_id <= 0) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                             "the daemon accepted the backup but named no operation to poll");
+    }
+
+    announce_operation(op_id, "backup");
+    atlas_buf message = ATLAS_BUF_INIT;
+    atlas_buf detail = ATLAS_BUF_INIT;
+    st = wait_for_operation(op_id, &message, &detail, out, NULL, err);
+    if (st == ATLAS_OK && verified != NULL) {
+        /* The daemon already verified it before letting the operation succeed.
+         * This second read fills in the verification detail the renderers
+         * print; it is a read of a finished file, not a re-decision about
+         * whether the backup is good. */
+        st = atlas_service_backup_verify_remote(name, verified, err);
+    }
+    atlas_buf_free(&message);
+    atlas_buf_free(&detail);
     return st;
 }
 
@@ -1954,7 +2386,9 @@ atlas_status atlas_service_backup_verify_remote(const char *name, atlas_backup_v
     atlas_json *j = NULL;
     atlas_status st = atlas_ipc_params_begin(&p, &j, err);
     if (st == ATLAS_OK) {
-        st = atlas_json_key_str(j, "name", name != NULL ? name : "", err);
+        if (name != NULL && name[0] != '\0') {
+            st = atlas_json_key_str(j, "name", name, err);
+        }
         if (st == ATLAS_OK) {
             st = atlas_ipc_params_finish(p, &params, err);
         } else {
@@ -1970,13 +2404,53 @@ atlas_status atlas_service_backup_verify_remote(const char *name, atlas_backup_v
     if (st != ATLAS_OK) {
         return st;
     }
+    int64_t op_id = 0;
     const char *v = NULL;
+    (void)atlas_ipc_result_int(r, "operation_id", &op_id);
     if (atlas_ipc_result_str(r, "backup", &v) && v != NULL) {
-        st = atlas_buf_set_str(&out->path, v, err);
+        (void)atlas_buf_set_str(&out->path, v, err);
     }
-    take_verify(r, "", out);
     atlas_ipc_response_free(r);
     atlas_buf_free(&raw);
+    if (op_id <= 0) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                             "the daemon accepted the verification but named no operation");
+    }
+
+    /* Wait, then read the finished record: it carries the whole report, so the
+     * answer arrives from the same place that says the work is done. */
+    announce_operation(op_id, "verification");
+    atlas_buf message = ATLAS_BUF_INIT;
+    atlas_buf detail = ATLAS_BUF_INIT;
+    st = wait_for_operation(op_id, &message, &detail, NULL, NULL, err);
+    atlas_buf_free(&message);
+    atlas_buf_free(&detail);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    atlas_buf p2 = ATLAS_BUF_INIT;
+    atlas_ipc_params *pp = NULL;
+    atlas_json *jj = NULL;
+    st = atlas_ipc_params_begin(&pp, &jj, err);
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(jj, "operation_id", op_id, err);
+        if (st == ATLAS_OK) {
+            st = atlas_ipc_params_finish(pp, &p2, err);
+        } else {
+            atlas_ipc_params_abort(pp);
+        }
+    }
+    atlas_buf raw2 = ATLAS_BUF_INIT;
+    atlas_ipc_response *r2 = NULL;
+    if (st == ATLAS_OK) {
+        st = atlas_remote_call("operation.get", atlas_buf_cstr(&p2), &raw2, &r2, err);
+    }
+    atlas_buf_free(&p2);
+    if (st == ATLAS_OK) {
+        take_verify(r2, "", out);
+        atlas_ipc_response_free(r2);
+    }
+    atlas_buf_free(&raw2);
     return st;
 }
 
@@ -2203,4 +2677,693 @@ atlas_status atlas_service_decision_links_remote(const char *repo, const char *u
     atlas_ipc_response_free(r);
     atlas_buf_free(&raw);
     return st;
+}
+
+/* --- A8-CI: the compiler-derived semantic reads ----------------------------
+ *
+ * The remote half of `atlas_service_sem_*`. Same service functions, same
+ * report structs, same renderers — only the transport differs, which is what
+ * keeps the local and daemon-served answers from drifting apart.
+ *
+ * Under A7.1 these are the *only* form that works on a deployed machine: the
+ * index is 0700 `atlasd`, so an operator's account has no local handle at all
+ * and every semantic read is a socket call. */
+
+static void take_freshness(const atlas_ipc_response *r, atlas_sem_generation *gen,
+                           atlas_sem_freshness *fresh, const char **reason) {
+    const char *v = NULL;
+    int64_t t = 0;
+    *fresh = ATLAS_SEM_FRESH_ABSENT;
+    *reason = NULL;
+    if (atlas_ipc_result_str(r, "freshness", &v)) {
+        /* Parsed against Atlas' own closed set. A value from anywhere else
+         * leaves the safe default rather than being believed. */
+        for (int f = 0; f <= (int)ATLAS_SEM_FRESH_REBUILDING; f++) {
+            if (strcmp(v, atlas_sem_freshness_name((atlas_sem_freshness)f)) == 0) {
+                *fresh = (atlas_sem_freshness)f;
+                break;
+            }
+        }
+    }
+    if (atlas_ipc_result_str(r, "stale_reason", &v) && atlas_sem_stale_reason_is_known(v)) {
+        *reason = atlas_sem_stale_reason_intern(v);
+    }
+    if (atlas_ipc_result_int(r, "generation_id", &t)) {
+        gen->id = t;
+    }
+    if (atlas_ipc_result_str(r, "indexed_commit", &v)) {
+        copy_str(gen->commit_id, sizeof gen->commit_id, v);
+    }
+}
+
+atlas_status atlas_service_sem_status_remote(const char *name, atlas_sem_status_report *out,
+                                             atlas_err *err) {
+    atlas_buf params = ATLAS_BUF_INIT;
+    atlas_status st = atlas_db_check_repo_name(name, err);
+    if (st == ATLAS_OK) {
+        st = atlas_buf_appendf(&params, err, "{\"repo\":\"%s\"}", name);
+    }
+    atlas_buf raw = ATLAS_BUF_INIT;
+    atlas_ipc_response *r = NULL;
+    if (st == ATLAS_OK) {
+        st = atlas_remote_call("sem.status", atlas_buf_cstr(&params), &raw, &r, err);
+    }
+    atlas_buf_free(&params);
+    if (st != ATLAS_OK) {
+        atlas_ipc_response_free(r);
+        atlas_buf_free(&raw);
+        return st;
+    }
+
+    const char *v = NULL;
+    int64_t t = 0;
+    bool b = false;
+    if (atlas_ipc_result_str(r, "repo", &v)) {
+        copy_str(out->repo.name, sizeof out->repo.name, v);
+    }
+    if (atlas_ipc_result_bool(r, "libclang_available", &b)) {
+        out->libclang_available = b;
+    }
+    if (atlas_ipc_result_str(r, "compiler_version", &v)) {
+        copy_str(out->compiler_version, sizeof out->compiler_version, v);
+    }
+    if (atlas_ipc_result_bool(r, "have_generation", &b)) {
+        out->have_generation = b;
+    }
+    take_freshness(r, &out->generation, &out->freshness, &out->stale_reason);
+
+    if (atlas_ipc_result_str(r, "compdb_digest", &v)) {
+        copy_str(out->generation.compdb_digest, sizeof out->generation.compdb_digest, v);
+    }
+    if (atlas_ipc_result_int(r, "compdb_count", &t)) {
+        out->generation.compdb_count = t;
+    }
+    if (atlas_ipc_result_str(r, "completed_at", &v)) {
+        copy_str(out->generation.completed_at, sizeof out->generation.completed_at, v);
+    }
+    if (atlas_ipc_result_str(r, "analyzer_id", &v)) {
+        copy_str(out->generation.analyzer_id, sizeof out->generation.analyzer_id, v);
+    }
+    if (atlas_ipc_result_int(r, "analyzer_version", &t)) {
+        out->generation.analyzer_version = t;
+    }
+    if (atlas_ipc_result_int(r, "tu_total", &t)) {
+        out->generation.tu_total = t;
+    }
+    if (atlas_ipc_result_int(r, "tu_complete", &t)) {
+        out->generation.tu_complete = t;
+    }
+    if (atlas_ipc_result_int(r, "tu_partial", &t)) {
+        out->generation.tu_partial = t;
+    }
+    if (atlas_ipc_result_int(r, "tu_failed", &t)) {
+        out->generation.tu_failed = t;
+    }
+    if (atlas_ipc_result_int(r, "tu_unsupported", &t)) {
+        out->generation.tu_unsupported = t;
+    }
+    if (atlas_ipc_result_int(r, "symbols", &t)) {
+        out->generation.symbol_count = t;
+    }
+    if (atlas_ipc_result_int(r, "edges", &t)) {
+        out->generation.edge_count = t;
+    }
+    if (atlas_ipc_result_int(r, "includes", &t)) {
+        out->generation.include_count = t;
+    }
+    if (atlas_ipc_result_int(r, "duration_ms", &t)) {
+        out->generation.duration_ms = t;
+    }
+    if (atlas_ipc_result_int(r, "units_not_complete", &t)) {
+        out->failed_total = t;
+    }
+    /* The generation is COMPLETE by construction: the daemon only publishes a
+     * pointer at one that is, and only a published generation is served. */
+    if (out->have_generation) {
+        out->generation.status = ATLAS_SEM_GEN_COMPLETE;
+    }
+
+    size_t n = 0;
+    (void)atlas_ipc_result_arr_len(r, "units", &n);
+    for (size_t i = 0; i < n && out->failed_count < ATLAS_SEM_STATUS_MAX_UNITS; i++) {
+        atlas_sem_failed_unit *u = &out->failed[out->failed_count];
+        if (atlas_ipc_result_arr_obj_str(r, "units", i, "source", &v)) {
+            copy_str(u->source, sizeof u->source, v);
+        }
+        if (atlas_ipc_result_arr_obj_str(r, "units", i, "status", &v)) {
+            copy_str(u->status, sizeof u->status, v);
+        }
+        if (atlas_ipc_result_arr_obj_str(r, "units", i, "why", &v)) {
+            copy_str(u->why, sizeof u->why, v);
+        }
+        if (atlas_ipc_result_arr_obj_int(r, "units", i, "diagnostics_errors", &t)) {
+            u->diagnostics_errors = t;
+        }
+        out->failed_count++;
+    }
+    out->failed_truncated = out->failed_total > (int64_t)out->failed_count;
+
+    atlas_ipc_response_free(r);
+    atlas_buf_free(&raw);
+    return ATLAS_OK;
+}
+
+atlas_status atlas_service_sem_symbol_remote(const char *name, const char *symbol,
+                                             const char *kind, int64_t limit,
+                                             atlas_sem_symbols_report *out, atlas_err *err) {
+    atlas_buf params = ATLAS_BUF_INIT;
+    atlas_status st = atlas_db_check_repo_name(name, err);
+    if (st == ATLAS_OK) {
+        /* Built with the typed writer, never by formatting bytes into JSON —
+         * there is still no "write these bytes as JSON" primitive in Atlas. */
+        atlas_ipc_params *p = NULL;
+        atlas_json *j = NULL;
+        st = atlas_ipc_params_begin(&p, &j, err);
+        if (st != ATLAS_OK) {
+            atlas_buf_free(&params);
+            return st;
+        }
+        st = atlas_json_key_str(j, "repo", name, err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "symbol", symbol, err);
+        }
+        if (st == ATLAS_OK && kind != NULL && kind[0] != '\0') {
+            st = atlas_json_key_str(j, "kind", kind, err);
+        }
+        if (st == ATLAS_OK && limit > 0) {
+            st = atlas_json_key_int(j, "limit", limit, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_ipc_params_finish(p, &params, err);
+        } else {
+            atlas_ipc_params_abort(p);
+        }
+    }
+    atlas_buf raw = ATLAS_BUF_INIT;
+    atlas_ipc_response *r = NULL;
+    if (st == ATLAS_OK) {
+        st = atlas_remote_call("sem.symbol", atlas_buf_cstr(&params), &raw, &r, err);
+    }
+    atlas_buf_free(&params);
+    if (st != ATLAS_OK) {
+        atlas_ipc_response_free(r);
+        atlas_buf_free(&raw);
+        return st;
+    }
+
+    const char *v = NULL;
+    bool b = false;
+    if (atlas_ipc_result_str(r, "repo", &v)) {
+        copy_str(out->repo.name, sizeof out->repo.name, v);
+    }
+    take_freshness(r, &out->generation, &out->freshness, &out->stale_reason);
+    copy_str(out->query, sizeof out->query, symbol);
+    if (atlas_ipc_result_bool(r, "truncated", &b)) {
+        out->truncated = b;
+    }
+
+    size_t n = 0;
+    (void)atlas_ipc_result_arr_len(r, "symbols", &n);
+    for (size_t i = 0; i < n; i++) {
+        if (out->count >= out->cap) {
+            size_t ncap = out->cap == 0 ? 32 : out->cap * 2;
+            atlas_sem_symbol_item *ni = realloc(out->items, ncap * sizeof(*ni));
+            if (ni == NULL) {
+                break;
+            }
+            out->items = ni;
+            out->cap = ncap;
+        }
+        atlas_sem_symbol_item *it = &out->items[out->count];
+        memset(it, 0, sizeof(*it));
+        int64_t t = 0;
+        if (atlas_ipc_result_arr_obj_str(r, "symbols", i, "usr", &v)) {
+            copy_str(it->usr, sizeof it->usr, v);
+        }
+        if (atlas_ipc_result_arr_obj_str(r, "symbols", i, "name", &v)) {
+            copy_str(it->name, sizeof it->name, v);
+        }
+        if (atlas_ipc_result_arr_obj_str(r, "symbols", i, "kind", &v)) {
+            copy_str(it->kind, sizeof it->kind, v);
+        }
+        if (atlas_ipc_result_arr_obj_str(r, "symbols", i, "linkage", &v)) {
+            copy_str(it->linkage, sizeof it->linkage, v);
+        }
+        if (atlas_ipc_result_arr_obj_str(r, "symbols", i, "type", &v)) {
+            copy_str(it->type_text, sizeof it->type_text, v);
+        }
+        if (atlas_ipc_result_arr_obj_str(r, "symbols", i, "file", &v)) {
+            copy_str(it->file_text, sizeof it->file_text, v);
+        }
+        if (atlas_ipc_result_arr_obj_str(r, "symbols", i, "evidence", &v)) {
+            copy_str(it->evidence, sizeof it->evidence, v);
+        }
+        if (atlas_ipc_result_arr_obj_int(r, "symbols", i, "line", &t)) {
+            it->line = t;
+        }
+        if (atlas_ipc_result_arr_obj_int(r, "symbols", i, "col", &t)) {
+            it->col = t;
+        }
+        if (atlas_ipc_result_arr_obj_int(r, "symbols", i, "end_line", &t)) {
+            it->end_line = t;
+        }
+        if (atlas_ipc_result_arr_obj_bool(r, "symbols", i, "is_definition", &b)) {
+            it->is_definition = b;
+        }
+        if (atlas_ipc_result_arr_obj_bool(r, "symbols", i, "external", &b)) {
+            it->external = b;
+        }
+        out->count++;
+    }
+
+    atlas_ipc_response_free(r);
+    atlas_buf_free(&raw);
+    return ATLAS_OK;
+}
+
+/* Shared by `sem.graph` and `sem.trace`: both return the same node array and
+ * the same summary, so both are read the same way. */
+static void take_graph(const atlas_ipc_response *r, atlas_sem_graph_report *out) {
+    const char *v = NULL;
+    int64_t t = 0;
+    bool b = false;
+    if (atlas_ipc_result_str(r, "repo", &v)) {
+        copy_str(out->repo.name, sizeof out->repo.name, v);
+    }
+    take_freshness(r, &out->generation, &out->freshness, &out->stale_reason);
+    if (atlas_ipc_result_str(r, "direction", &v)) {
+        out->inbound = strcmp(v, "callers") == 0;
+    }
+
+    size_t n = 0;
+    (void)atlas_ipc_result_arr_len(r, "nodes", &n);
+    for (size_t i = 0; i < n; i++) {
+        if (out->count >= out->cap) {
+            size_t ncap = out->cap == 0 ? 32 : out->cap * 2;
+            atlas_sem_graph_item *ni = realloc(out->items, ncap * sizeof(*ni));
+            if (ni == NULL) {
+                break;
+            }
+            out->items = ni;
+            out->cap = ncap;
+        }
+        atlas_sem_graph_item *it = &out->items[out->count];
+        memset(it, 0, sizeof(*it));
+        if (atlas_ipc_result_arr_obj_int(r, "nodes", i, "depth", &t)) {
+            it->depth = t;
+        }
+        if (atlas_ipc_result_arr_obj_str(r, "nodes", i, "usr", &v)) {
+            copy_str(it->usr, sizeof it->usr, v);
+        }
+        if (atlas_ipc_result_arr_obj_str(r, "nodes", i, "name", &v)) {
+            copy_str(it->name, sizeof it->name, v);
+        }
+        if (atlas_ipc_result_arr_obj_str(r, "nodes", i, "file", &v)) {
+            copy_str(it->file_text, sizeof it->file_text, v);
+        }
+        if (atlas_ipc_result_arr_obj_str(r, "nodes", i, "edge_kind", &v)) {
+            copy_str(it->edge_kind, sizeof it->edge_kind, v);
+        }
+        if (atlas_ipc_result_arr_obj_str(r, "nodes", i, "via", &v)) {
+            copy_str(it->via_name, sizeof it->via_name, v);
+        }
+        if (atlas_ipc_result_arr_obj_str(r, "nodes", i, "evidence", &v)) {
+            copy_str(it->evidence, sizeof it->evidence, v);
+        }
+        if (atlas_ipc_result_arr_obj_str(r, "nodes", i, "site_file", &v)) {
+            copy_str(it->site_file, sizeof it->site_file, v);
+        }
+        if (atlas_ipc_result_arr_obj_int(r, "nodes", i, "line", &t)) {
+            it->line = t;
+        }
+        if (atlas_ipc_result_arr_obj_int(r, "nodes", i, "site_line", &t)) {
+            it->site_line = t;
+        }
+        if (atlas_ipc_result_arr_obj_int(r, "nodes", i, "candidate_total", &t)) {
+            it->candidate_total = t;
+        }
+        out->count++;
+    }
+
+    atlas_sem_walk_summary *s = &out->summary;
+    if (atlas_ipc_result_obj_int(r, "summary", "visited", &t)) {
+        s->visited = t;
+    }
+    if (atlas_ipc_result_obj_int(r, "summary", "emitted", &t)) {
+        s->emitted = t;
+    }
+    if (atlas_ipc_result_obj_int(r, "summary", "max_depth_reached", &t)) {
+        s->max_depth_reached = t;
+    }
+    if (atlas_ipc_result_obj_int(r, "summary", "proven", &t)) {
+        s->proven = t;
+    }
+    if (atlas_ipc_result_obj_int(r, "summary", "candidate", &t)) {
+        s->candidate = t;
+    }
+    if (atlas_ipc_result_obj_int(r, "summary", "lexical", &t)) {
+        s->lexical = t;
+    }
+    if (atlas_ipc_result_obj_int(r, "summary", "unknown", &t)) {
+        s->unknown = t;
+    }
+    if (atlas_ipc_result_obj_int(r, "summary", "unresolved_indirect", &t)) {
+        s->unresolved_indirect = t;
+    }
+    if (atlas_ipc_result_obj_bool(r, "summary", "truncated", &b)) {
+        s->truncated = b;
+    }
+    if (atlas_ipc_result_obj_str(r, "summary", "truncated_reason", &v) &&
+        atlas_sem_trunc_reason_is_known(v)) {
+        s->truncated_reason = atlas_sem_trunc_reason_intern(v);
+    }
+}
+
+atlas_status atlas_service_sem_graph_remote(const char *name, const char *symbol, bool inbound,
+                                            int64_t depth, int64_t limit, bool proven_only,
+                                            atlas_sem_graph_report *out, atlas_err *err) {
+    atlas_buf params = ATLAS_BUF_INIT;
+    atlas_status st = atlas_db_check_repo_name(name, err);
+    if (st == ATLAS_OK) {
+        atlas_ipc_params *p = NULL;
+        atlas_json *j = NULL;
+        st = atlas_ipc_params_begin(&p, &j, err);
+        if (st != ATLAS_OK) {
+            return st;
+        }
+        st = atlas_json_key_str(j, "repo", name, err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "symbol", symbol, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_bool(j, "inbound", inbound, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_bool(j, "proven_only", proven_only, err);
+        }
+        if (st == ATLAS_OK && depth > 0) {
+            st = atlas_json_key_int(j, "depth", depth, err);
+        }
+        if (st == ATLAS_OK && limit > 0) {
+            st = atlas_json_key_int(j, "limit", limit, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_ipc_params_finish(p, &params, err);
+        } else {
+            atlas_ipc_params_abort(p);
+        }
+    }
+    atlas_buf raw = ATLAS_BUF_INIT;
+    atlas_ipc_response *r = NULL;
+    if (st == ATLAS_OK) {
+        st = atlas_remote_call("sem.graph", atlas_buf_cstr(&params), &raw, &r, err);
+    }
+    atlas_buf_free(&params);
+    if (st != ATLAS_OK) {
+        atlas_ipc_response_free(r);
+        atlas_buf_free(&raw);
+        return st;
+    }
+    copy_str(out->query, sizeof out->query, symbol);
+    take_graph(r, out);
+    atlas_ipc_response_free(r);
+    atlas_buf_free(&raw);
+    return ATLAS_OK;
+}
+
+atlas_status atlas_service_sem_trace_remote(const char *name, const char *from, const char *to,
+                                            int64_t depth, atlas_sem_graph_report *out,
+                                            atlas_err *err) {
+    atlas_buf params = ATLAS_BUF_INIT;
+    atlas_status st = atlas_db_check_repo_name(name, err);
+    if (st == ATLAS_OK) {
+        atlas_ipc_params *p = NULL;
+        atlas_json *j = NULL;
+        st = atlas_ipc_params_begin(&p, &j, err);
+        if (st != ATLAS_OK) {
+            return st;
+        }
+        st = atlas_json_key_str(j, "repo", name, err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "from", from, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "to", to, err);
+        }
+        if (st == ATLAS_OK && depth > 0) {
+            st = atlas_json_key_int(j, "depth", depth, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_ipc_params_finish(p, &params, err);
+        } else {
+            atlas_ipc_params_abort(p);
+        }
+    }
+    atlas_buf raw = ATLAS_BUF_INIT;
+    atlas_ipc_response *r = NULL;
+    if (st == ATLAS_OK) {
+        st = atlas_remote_call("sem.trace", atlas_buf_cstr(&params), &raw, &r, err);
+    }
+    atlas_buf_free(&params);
+    if (st != ATLAS_OK) {
+        atlas_ipc_response_free(r);
+        atlas_buf_free(&raw);
+        return st;
+    }
+    (void)snprintf(out->query, sizeof out->query, "%s -> %s", from, to);
+    take_graph(r, out);
+    atlas_ipc_response_free(r);
+    atlas_buf_free(&raw);
+    return ATLAS_OK;
+}
+
+/* --- impact and the context package, over the socket -------------------------
+ *
+ * Both parse the same item array, so both use one reader. Under A7.1 these are
+ * the only forms that work from an operator's account: the index is 0700
+ * `atlasd`, and without them `code sem-impact` and `context build` are usable
+ * only by the service account — which is exactly the gap this closes. */
+static void take_items(const atlas_ipc_response *r, atlas_sem_item **items, size_t *count,
+                       size_t *cap) {
+    size_t n = 0;
+    (void)atlas_ipc_result_arr_len(r, "items", &n);
+    for (size_t i = 0; i < n; i++) {
+        if (*count >= *cap) {
+            size_t ncap = *cap == 0 ? 64 : *cap * 2;
+            atlas_sem_item *ni = realloc(*items, ncap * sizeof(*ni));
+            if (ni == NULL) {
+                return;
+            }
+            *items = ni;
+            *cap = ncap;
+        }
+        atlas_sem_item *it = &(*items)[*count];
+        memset(it, 0, sizeof(*it));
+        const char *v = NULL;
+        int64_t t = 0;
+        if (atlas_ipc_result_arr_obj_str(r, "items", i, "kind", &v)) {
+            copy_str(it->kind, sizeof it->kind, v);
+        }
+        if (atlas_ipc_result_arr_obj_str(r, "items", i, "name", &v)) {
+            copy_str(it->name, sizeof it->name, v);
+        }
+        if (atlas_ipc_result_arr_obj_str(r, "items", i, "file", &v)) {
+            copy_str(it->file_text, sizeof it->file_text, v);
+        }
+        if (atlas_ipc_result_arr_obj_str(r, "items", i, "evidence", &v)) {
+            copy_str(it->evidence, sizeof it->evidence, v);
+        }
+        /* Re-interned against Atlas' own closed set: a reason that arrived over
+         * a socket is a matching string, not Atlas' string. */
+        if (atlas_ipc_result_arr_obj_str(r, "items", i, "why", &v)) {
+            it->why = atlas_sem_selection_reason_intern(v);
+        }
+        if (atlas_ipc_result_arr_obj_int(r, "items", i, "line", &t)) {
+            it->line = t;
+        }
+        if (atlas_ipc_result_arr_obj_int(r, "items", i, "depth", &t)) {
+            it->depth = t;
+        }
+        (*count)++;
+    }
+}
+
+atlas_status atlas_service_sem_impact_remote(const char *name, const char *subject, int64_t depth,
+                                             int64_t limit, atlas_sem_impact_report *out,
+                                             atlas_err *err) {
+    atlas_buf params = ATLAS_BUF_INIT;
+    atlas_status st = atlas_db_check_repo_name(name, err);
+    if (st == ATLAS_OK) {
+        atlas_ipc_params *p = NULL;
+        atlas_json *j = NULL;
+        st = atlas_ipc_params_begin(&p, &j, err);
+        if (st != ATLAS_OK) {
+            return st;
+        }
+        st = atlas_json_key_str(j, "repo", name, err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "subject", subject, err);
+        }
+        if (st == ATLAS_OK && depth > 0) {
+            st = atlas_json_key_int(j, "depth", depth, err);
+        }
+        if (st == ATLAS_OK && limit > 0) {
+            st = atlas_json_key_int(j, "limit", limit, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_ipc_params_finish(p, &params, err);
+        } else {
+            atlas_ipc_params_abort(p);
+        }
+    }
+    atlas_buf raw = ATLAS_BUF_INIT;
+    atlas_ipc_response *r = NULL;
+    if (st == ATLAS_OK) {
+        st = atlas_remote_call("sem.impact", atlas_buf_cstr(&params), &raw, &r, err);
+    }
+    atlas_buf_free(&params);
+    if (st != ATLAS_OK) {
+        atlas_ipc_response_free(r);
+        atlas_buf_free(&raw);
+        return st;
+    }
+
+    const char *v = NULL;
+    int64_t t = 0;
+    bool b = false;
+    if (atlas_ipc_result_str(r, "repo", &v)) {
+        copy_str(out->repo.name, sizeof out->repo.name, v);
+    }
+    take_freshness(r, &out->generation, &out->freshness, &out->stale_reason);
+    copy_str(out->query, sizeof out->query, subject);
+    if (atlas_ipc_result_str(r, "subject_kind", &v)) {
+        out->subject_is_path = strcmp(v, "file") == 0;
+    }
+    if (atlas_ipc_result_bool(r, "subject_found", &b)) {
+        out->subject_found = b;
+    }
+    take_items(r, &out->items, &out->count, &out->cap);
+    if (atlas_ipc_result_int(r, "proven", &t)) {
+        out->proven = t;
+    }
+    if (atlas_ipc_result_int(r, "candidate", &t)) {
+        out->candidate = t;
+    }
+    if (atlas_ipc_result_int(r, "lexical", &t)) {
+        out->lexical = t;
+    }
+    if (atlas_ipc_result_int(r, "unresolved_indirect", &t)) {
+        out->unresolved_indirect = t;
+    }
+    if (atlas_ipc_result_bool(r, "truncated", &b)) {
+        out->truncated = b;
+    }
+    atlas_ipc_response_free(r);
+    atlas_buf_free(&raw);
+    return ATLAS_OK;
+}
+
+atlas_status atlas_service_sem_context_remote(const atlas_sem_context_req *req,
+                                              atlas_sem_context_report *out, atlas_err *err) {
+    atlas_buf params = ATLAS_BUF_INIT;
+    atlas_status st = atlas_db_check_repo_name(req->repo, err);
+    if (st == ATLAS_OK) {
+        atlas_ipc_params *p = NULL;
+        atlas_json *j = NULL;
+        st = atlas_ipc_params_begin(&p, &j, err);
+        if (st != ATLAS_OK) {
+            return st;
+        }
+        st = atlas_json_key_str(j, "repo", req->repo, err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "task", req->task, err);
+        }
+        if (st == ATLAS_OK && req->depth > 0) {
+            st = atlas_json_key_int(j, "depth", req->depth, err);
+        }
+        if (st == ATLAS_OK && req->max_tokens > 0) {
+            st = atlas_json_key_int(j, "max_tokens", req->max_tokens, err);
+        }
+        if (st == ATLAS_OK && req->max_items > 0) {
+            st = atlas_json_key_int(j, "max_items", req->max_items, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_ipc_params_finish(p, &params, err);
+        } else {
+            atlas_ipc_params_abort(p);
+        }
+    }
+    atlas_buf raw = ATLAS_BUF_INIT;
+    atlas_ipc_response *r = NULL;
+    if (st == ATLAS_OK) {
+        st = atlas_remote_call("sem.context", atlas_buf_cstr(&params), &raw, &r, err);
+    }
+    atlas_buf_free(&params);
+    if (st != ATLAS_OK) {
+        atlas_ipc_response_free(r);
+        atlas_buf_free(&raw);
+        return st;
+    }
+
+    const char *v = NULL;
+    int64_t t = 0;
+    bool b = false;
+    if (atlas_ipc_result_str(r, "repo", &v)) {
+        copy_str(out->repo.name, sizeof out->repo.name, v);
+    }
+    if (atlas_ipc_result_str(r, "commit", &v)) {
+        copy_str(out->repo.scanned_head, sizeof out->repo.scanned_head, v);
+    }
+    take_freshness(r, &out->generation, &out->freshness, &out->stale_reason);
+    copy_str(out->task, sizeof out->task, req->task);
+    if (atlas_ipc_result_int(r, "budget_bytes", &t)) {
+        out->budget_bytes = t;
+    }
+    if (atlas_ipc_result_int(r, "used_bytes", &t)) {
+        out->used_bytes = t;
+    }
+    if (atlas_ipc_result_bool(r, "budget_reached", &b)) {
+        out->budget_reached = b;
+    }
+    take_items(r, &out->items, &out->count, &out->cap);
+    /* The package's own gaps, re-interned so what reaches an operator is Atlas'
+     * literal rather than a string that merely matched. */
+    size_t n = 0;
+    (void)atlas_ipc_result_arr_len(r, "not_included", &n);
+    static const char *const MISSING[] = {
+        ATLAS_SEM_MISSING_INDEX, ATLAS_SEM_MISSING_STALE, ATLAS_SEM_MISSING_SEEDS,
+        ATLAS_SEM_MISSING_BUDGET, ATLAS_SEM_MISSING_DECISIONS,
+    };
+    for (size_t i = 0; i < n && out->missing_count < 8u; i++) {
+        if (!atlas_ipc_result_arr_str(r, "not_included", i, &v)) {
+            continue;
+        }
+        for (size_t k = 0; k < sizeof(MISSING) / sizeof(MISSING[0]); k++) {
+            if (strcmp(v, MISSING[k]) == 0) {
+                out->missing[out->missing_count++] = MISSING[k];
+                break;
+            }
+        }
+    }
+    atlas_ipc_response_free(r);
+    atlas_buf_free(&raw);
+    return ATLAS_OK;
+}
+
+void atlas_operation_report_init(atlas_operation_report *r) {
+    memset(r, 0, sizeof(*r));
+    atlas_buf_init(&r->kind);
+    atlas_buf_init(&r->state);
+    atlas_buf_init(&r->message);
+    atlas_buf_init(&r->detail);
+}
+
+void atlas_operation_report_free(atlas_operation_report *r) {
+    if (r == NULL) {
+        return;
+    }
+    atlas_buf_free(&r->kind);
+    atlas_buf_free(&r->state);
+    atlas_buf_free(&r->message);
+    atlas_buf_free(&r->detail);
 }

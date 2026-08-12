@@ -160,6 +160,14 @@ static void build_schema6(const char *path, atlas_err *err) {
              "DROP TABLE orch_leases;"
              "DROP TABLE orch_attempts;"
              "DROP TABLE orch_jobs;"
+             /* Migration 11's tables, children before parents. */
+             "DROP TABLE sem_includes;"
+             "DROP TABLE sem_edges;"
+             "DROP TABLE sem_symbols;"
+             "DROP TABLE sem_units;"
+             "DROP TABLE sem_compdbs;"
+             "DROP TABLE sem_current;"
+             "DROP TABLE sem_generations;"
              /* Migration 10's table. Winding back below 7 means winding back
               * past 10 as well, and a rewind that leaves a later migration's
               * table behind is not a schema-6 database. */
@@ -210,7 +218,7 @@ static void test_a_populated_schema_six_database_reaches_seven_losslessly(void) 
      * table without renumbering a row — is asserted below and is unaffected by
      * later migrations running on top of it. */
     T_EQ_INT(atlas_db_schema_version(db, &err), ATLAS_SCHEMA_VERSION);
-    T_EQ_INT(ATLAS_SCHEMA_VERSION, 10);
+    T_EQ_INT(ATLAS_SCHEMA_VERSION, 11);
 
     atlas_buf after = ATLAS_BUF_INIT;
     text_of(db,

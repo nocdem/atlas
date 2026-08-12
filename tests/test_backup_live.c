@@ -322,8 +322,18 @@ static void test_a_mutation_goes_to_the_data_directory_it_named(void) {
     atlas_buf so2 = ATLAS_BUF_INIT, se2 = ATLAS_BUF_INIT;
     T_OK(fx_atlas_with_runtime(&fx, &d, add2, 5, &so2, &se2, &code, &err), &err);
     T_CHECK_MSG(code != 0, "repo add against a running daemon must be refused, exited %d", code);
-    T_CHECK_MSG(strstr(atlas_buf_cstr(&se2), "Stop it first") != NULL,
+    /* The remedy, not a phrase. The message used to name `systemctl --user`,
+     * which is right for a per-user install and wrong for the system
+     * deployment this refusal is most likely to be seen on — so it now
+     * describes the condition and points at the operations document instead.
+     * What the test holds is that the two things an operator has to do are
+     * both named. */
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&se2), "Stop the daemon") != NULL &&
+                    strstr(atlas_buf_cstr(&se2), "atlas repo add") != NULL,
                 "the refusal must tell the operator what to do: %s", atlas_buf_cstr(&se2));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&se2), "%0A") == NULL,
+                "the refusal printed an encoded newline, so it is unreadable: %s",
+                atlas_buf_cstr(&se2));
     atlas_buf_free(&so2);
     atlas_buf_free(&se2);
     /* And nothing reached the daemon's index. */

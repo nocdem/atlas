@@ -30,12 +30,55 @@ atlas backup restore ~/backups/atlas-2026-08-07.db --yes
 `--force` lets `create` replace an existing destination; without it an existing
 file is refused. `restore` requires `--yes`.
 
-All three are **local CLI operations**. There is no RPC method, no MCP tool and
-no hook that can create, read or restore a backup. A model that can call every
-method Atlas exposes still cannot replace the index. The absence is structural —
+**`restore` is a local CLI operation with no RPC method**, and no MCP tool or
+hook can create, read or restore a backup. A model that can call every method in
+the ordinary group still cannot replace the index. The absence is structural —
 no such method exists — rather than a check that could be forgotten, and
 `tests/test_backup_live.c` proves it by asking a live daemon for each of the
 names such a method would plausibly have.
+
+`create` and `verify` are additionally served over the socket to the operator
+uid the root-owned policy names, because under a system deployment the index is
+`0700 atlasd` and the operator account could otherwise not take a backup of its
+own index at all.
+
+### Long backups do not fail just because they take a while
+
+A backup of a large index takes tens of seconds — 32 s to write and 15 s to
+verify an 815 MiB index on the reference machine. Over the socket both `create`
+and `verify` are **accepted, then polled**: the request returns an operation id
+as soon as the work is queued, and the command waits.
+
+Verification is in that list because it reads every page: `PRAGMA
+integrity_check` walks the b-trees and every decision revision is rehashed.
+
+This is worth stating plainly because it used to be wrong. The work ran inside
+the request, the client's frame read timed out at 10 s, and `atlas backup
+create` reported `timed out while reading a frame header` and exit 1 — while the
+daemon went on to write and verify a complete, correct backup. A success
+reported as a failure is worse than a failure, because the next thing anybody
+does about it is re-run it or work around it.
+
+What follows from the split:
+
+* **Interrupting the command does not cancel the backup.** The work holds no
+  reference to your connection. The command prints the operation id to stderr
+  before it starts waiting, so an interrupted run has already told you what to
+  ask about: `atlas operation status ID`. You can also just verify the file.
+* **Ids are not small counters.** Each daemon seeds them above every id any
+  previous daemon issued, so an id from before a restart is reported unknown
+  rather than resolving to a different operation.
+* **Success is reported only after the backup is complete and verified.** The
+  daemon verifies before the operation is allowed to reach SUCCEEDED.
+* **Asking twice gives the same answer.** A record that has reached SUCCEEDED or
+  FAILED never changes.
+* **Other clients are not blocked.** Ordinary reads were measured at 25 ms
+  during a backup that previously stalled every client for its whole duration.
+* **A second backup while one is running is refused**, naming the one in flight.
+* **A restart forgets operation records.** They live in the daemon's memory. An
+  id that is no longer known is reported as unknown rather than guessed at, and
+  the message points at the backup file — which is what actually survives, since
+  nothing partial is ever published. Ask `atlas backup verify NAME`.
 
 ### Why not copy the files
 
@@ -315,10 +358,31 @@ other command. Rows go away when an operator runs `atlas maintenance prune
 capped by the daemon's own long-standing per-repository ceiling; that is A1
 behaviour A5 neither adds nor changes.)
 
-There is no RPC method, no MCP tool and no hook that can plan or apply a prune.
+No MCP tool and no hook can plan or apply a prune, and no method in the ordinary
+group can either. A model holding every tool Atlas exposes cannot prune the
+index.
 
-`atlas maintenance prune --apply` is a writer, so like a restore it requires the
-daemon to be stopped. Atlas has exactly one writer; a maintenance pass is one.
+`maintenance.plan` and `maintenance.prune` are served in the **operator-uid**
+group — offered only to the peer whose `SO_PEERCRED` uid matches the root-owned
+policy, and answered with `unknown method` for everybody else, including
+`atlas-worker`. They were added by the A8-CI closeout, and the reason is worth
+stating: A5 gave maintenance no RPC surface on the premise that whoever owns the
+data directory can prune it anyway, and A7.1 broke that premise without anyone
+noticing. Under a system deployment the index is `0700 atlasd`, so the operator
+account could neither plan nor prune without becoming the service account —
+manual impersonation standing in for a missing feature, which is not a
+procedure.
+
+**The daemon no longer has to be stopped for a prune.** Atlas still has exactly
+one writer and a maintenance pass is still one: the prune runs *on* the writer
+thread, so it is serialized with every other write rather than competing for the
+lock. Everything else is unchanged — `--apply` is required, the delete is per
+batch and not per loop, bounds are checked rather than clamped, and there is no
+background deleter.
+
+A local invocation, as the account that owns the data directory, still takes the
+lock and still requires the daemon stopped. That path is unchanged and is what a
+per-user install uses.
 
 ---
 

@@ -221,6 +221,18 @@ atlas_status atlas_daemon_run(const atlas_daemon_opts *opts, FILE *log, atlas_er
         goto done;
     }
 
+    /* Started after the writer, because a queued semantic index reports back
+     * through this table and the writer must never find it missing; stopped
+     * before the writer for the same reason, so nothing is still trying to
+     * record a result into a table that has gone. */
+    atlas_ops *ops = NULL;
+    st = atlas_ops_start(atlas_buf_cstr(&data_dir), log, &ops, err);
+    if (st != ATLAS_OK) {
+        goto done;
+    }
+
+    atlas_writer_set_ops(writer, ops);
+
     atlas_server_ctx sctx;
     memset(&sctx, 0, sizeof(sctx));
     sctx.db_path = atlas_buf_cstr(&db_path);
@@ -229,6 +241,7 @@ atlas_status atlas_daemon_run(const atlas_daemon_opts *opts, FILE *log, atlas_er
     sctx.writer = writer;
     sctx.watcher = watcher;
     sctx.workers = workers;
+    sctx.ops = ops;
     sctx.log = log;
     sctx.syspolicy = syspolicy;
     /* A8. Loaded once, here, for the reason the system policy is loaded once:
@@ -281,6 +294,12 @@ done:
      * its handle; the workers are last because the writer may still be using
      * them as it drains. */
     atlas_watcher_stop(watcher);
+    /* Before the writer: an operation in flight is a backup being verified or a
+     * semantic generation being written, and both must reach a decision point
+     * rather than stop half-way. Waiting here is what makes "a failed or
+     * interrupted index never replaces the last valid generation" true of a
+     * clean shutdown as well as of a crash. */
+    atlas_ops_stop(ops);
     atlas_writer_stop(writer);
     atlas_workers_stop(workers);
     if (signal_fd >= 0) {

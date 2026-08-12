@@ -9,6 +9,7 @@
 
 #include "atlas/atlas.h"
 #include "atlas/orch_ops.h"
+#include "atlas/sem_ops.h"
 #include "atlas/pathrep.h"
 
 /* Column order shared by every repository query. */
@@ -504,6 +505,16 @@ atlas_status atlas_db_repo_remove(atlas_db *db, const char *name, bool *removed,
         st = atlas_db_repo_get(db, name, &ri, &found, err);
         if (st == ATLAS_OK && found) {
             st = atlas_db_orch_forget_repo(db, ri.id, err);
+        }
+        /* The semantic index holds `repo_id` the same way and for the same
+         * reason, so it is cleared the same way. A8-CI's generations are derived
+         * data — dropping them would lose nothing that cannot be rebuilt — but a
+         * *stale pointer* is not a loss, it is a wrong answer: the next
+         * repository to take this rowid would inherit an index describing
+         * somebody else's code, and every symbol it returned would look
+         * legitimate. That is the A4 defect, and it is not repeated. */
+        if (st == ATLAS_OK && found) {
+            st = atlas_db_sem_forget_repo(db, ri.id, err);
         }
         atlas_repo_info_free(&ri);
     }

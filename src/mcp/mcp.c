@@ -523,13 +523,129 @@ static void absorb_roots(atlas_mcp_server *s, const atlas_jsonv *result) {
     atlas_mcp_log(s, "roots: %zu granted", s->root_count);
 }
 
+/* --- resolving against the persistent registry ------------------------------
+ *
+ * **The registry is the repository allowlist, and the client's roots are not.**
+ *
+ * This is a deliberate reversal of the original A2 rule, and the reason it was
+ * wrong is worth keeping rather than deleting. A2 made the client's granted
+ * roots the set of readable repositories, reasoning that a whitelist derived
+ * from the client beat a path comparison. It does beat a path comparison — but
+ * it answers the wrong question. A root is *where the client happens to be
+ * looking*; it says nothing about what an operator has authorised Atlas to
+ * hold. Coupling the two meant that starting a session inside one registered
+ * repository made every other registered repository unreadable, and that was
+ * never a security property: an operator had already registered both, and the
+ * model could reach the second one simply by being started somewhere else.
+ *
+ * What actually constrains these calls is unchanged, and none of it lives here:
+ * only an operator registers a repository; `repo.add`, `repo.ensure` and
+ * `repo.remove` do not exist as RPC methods at all; no MCP tool accepts an
+ * absolute path; and every name given here must match a registered repository
+ * *exactly*. Roots keep one honest job — choosing a default when the caller
+ * named nothing — which is what a root legitimately is.
+ *
+ * `repo.list` is the registry read every surface shares, which is what makes
+ * CLI, RPC and MCP agree about repository identity by construction rather than
+ * by three copies of a rule. */
+static atlas_status resolve_registered(atlas_mcp_server *s, const char *requested,
+                                       atlas_buf *repo_out, atlas_err *err) {
+    atlas_ipc_response *resp = atlas_mcp_call(s, "repo.list", NULL);
+    if (resp == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_CONFIG,
+                             "the Atlas daemon is not answering, so the repository registry could "
+                             "not be read");
+    }
+    if (!atlas_ipc_response_ok(resp)) {
+        atlas_status st =
+            atlas_err_set(err, ATLAS_ERR_REPO, "%s", atlas_ipc_response_message(resp));
+        atlas_ipc_response_free(resp);
+        return st;
+    }
+    size_t n = 0;
+    (void)atlas_ipc_result_arr_len(resp, "repositories", &n);
+    for (size_t i = 0; i < n; i++) {
+        const char *name = NULL;
+        if (atlas_ipc_result_arr_obj_str(resp, "repositories", i, "repo", &name) && name != NULL &&
+            strcmp(name, requested) == 0) {
+            atlas_status st = atlas_buf_set_str(repo_out, name, err);
+            atlas_ipc_response_free(resp);
+            return st;
+        }
+    }
+    atlas_ipc_response_free(resp);
+    /* NOT_REGISTERED, and deliberately the same answer whether the directory
+     * exists, is a git repository, or is nothing at all. Atlas did not look at
+     * the filesystem to produce this and must not appear to have: an error that
+     * distinguished "exists but unregistered" from "no such thing" would be
+     * reporting on a path the caller named, which is exactly the filesystem
+     * probe this layer does not perform. */
+    return atlas_err_set(err, ATLAS_ERR_REPO,
+                         "NOT_REGISTERED: \"%s\" is not a repository registered with Atlas. "
+                         "Repositories are onboarded only by an operator; Atlas does not discover "
+                         "them",
+                         atlas_safe(&s->safe, requested));
+}
+
+/* No repository was named and no root selected one. With exactly one registered
+ * there is no ambiguity to resolve and refusing would be pedantry; with several,
+ * Atlas asks rather than guessing, because naming one would be inventing an
+ * answer to "which did you mean". */
+static atlas_status resolve_default(atlas_mcp_server *s, atlas_buf *repo_out, atlas_err *err) {
+    atlas_ipc_response *resp = atlas_mcp_call(s, "repo.list", NULL);
+    if (resp == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_CONFIG,
+                             "the Atlas daemon is not answering, so the repository registry could "
+                             "not be read");
+    }
+    if (!atlas_ipc_response_ok(resp)) {
+        atlas_status st =
+            atlas_err_set(err, ATLAS_ERR_REPO, "%s", atlas_ipc_response_message(resp));
+        atlas_ipc_response_free(resp);
+        return st;
+    }
+    size_t n = 0;
+    (void)atlas_ipc_result_arr_len(resp, "repositories", &n);
+    const char *name = NULL;
+    if (n == 1 && atlas_ipc_result_arr_obj_str(resp, "repositories", 0, "repo", &name) &&
+        name != NULL) {
+        atlas_status st = atlas_buf_set_str(repo_out, name, err);
+        atlas_ipc_response_free(resp);
+        return st;
+    }
+    atlas_ipc_response_free(resp);
+    if (n > 1) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "several repositories are registered with Atlas and none of this "
+                             "session's roots names one; pass an explicit \"repo\"");
+    }
+    return atlas_err_set(err, ATLAS_ERR_REPO,
+                         "no repository is registered with Atlas; an operator registers one with "
+                         "`atlas repo add`");
+}
+
 atlas_status atlas_mcp_resolve_repo(atlas_mcp_server *s, const char *requested, atlas_buf *repo_out,
                                     atlas_err *err) {
     roots_fallback(s);
+
+    /* A named repository is answered from the registry, and a session with no
+     * granted roots at all can still answer one.
+     *
+     * This early return is the second half of decoupling reads from roots. The
+     * guard that used to stand here refused every request when the client had
+     * advertised nothing — which made "where the client happens to be started"
+     * decide whether Atlas would answer a question about a repository an
+     * operator had explicitly registered. A client run from a directory that is
+     * not a repository at all is a completely ordinary way to ask Atlas about
+     * one. */
+    if (requested != NULL && requested[0] != '\0') {
+        return resolve_registered(s, requested, repo_out, err);
+    }
+
     if (s->root_count == 0) {
-        return atlas_err_set(err, ATLAS_ERR_CONFIG,
-                             "no filesystem root has been granted to this MCP server, so there is "
-                             "no repository it is authorized to read");
+        /* No name and no root. Fall through to the registry, which answers when
+         * exactly one repository is registered and asks otherwise. */
+        return resolve_default(s, repo_out, err);
     }
 
     /* Resolve every root once, lazily. **A7: resolve, never register.**
@@ -602,38 +718,24 @@ atlas_status atlas_mcp_resolve_repo(atlas_mcp_server *s, const char *requested, 
         atlas_ipc_response_free(resp);
     }
 
+    /* A name still resolves against the registry even after the roots were
+     * walked: the walk above only ever *added* a default candidate, and which
+     * repository a caller may read was never the roots' to decide. */
     if (requested != NULL && requested[0] != '\0') {
-        for (size_t i = 0; i < s->root_count; i++) {
-            if (s->roots[i].repo.len > 0 &&
-                strcmp(atlas_buf_cstr(&s->roots[i].repo), requested) == 0) {
-                return atlas_buf_set(repo_out, s->roots[i].repo.data, s->roots[i].repo.len, err);
-            }
-        }
-        /* A whitelist, not a path comparison. There is no argument a caller can
-         * construct that reaches a repository the client did not grant, because
-         * the only names accepted are the ones a granted root produced. */
-        return atlas_err_set(err, ATLAS_ERR_REPO,
-                             "\"%s\" is not a repository this MCP session is authorized to read; "
-                             "the authorized set comes from the client's roots",
-                             atlas_safe(&s->safe, requested));
+        return resolve_registered(s, requested, repo_out, err);
     }
 
+    /* No repository was named. The client's roots are used *here* and only
+     * here: to pick a sensible default for "the repository I am working in".
+     * That is what a root legitimately is — client filesystem context — and
+     * using it to choose a default is a different act from using it to decide
+     * what may be read. */
     for (size_t i = 0; i < s->root_count; i++) {
         if (s->roots[i].repo.len > 0) {
             return atlas_buf_set(repo_out, s->roots[i].repo.data, s->roots[i].repo.len, err);
         }
     }
-    /* Nothing resolved. Say why for the first root that was refused, so the
-     * caller gets an actionable answer rather than a bare negative. */
-    for (size_t i = 0; i < s->root_count; i++) {
-        if (s->roots[i].register_failed && s->roots[i].refusal.len > 0) {
-            return atlas_err_set(err, ATLAS_ERR_REPO,
-                                 "no granted root could be used as an Atlas repository: %s",
-                                 atlas_safe(&s->safe, atlas_buf_cstr(&s->roots[i].refusal)));
-        }
-    }
-    return atlas_err_set(err, ATLAS_ERR_REPO,
-                         "none of the granted roots is a repository Atlas can index");
+    return resolve_default(s, repo_out, err);
 }
 
 /* --- lifecycle ------------------------------------------------------------ */

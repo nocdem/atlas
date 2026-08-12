@@ -372,8 +372,16 @@ static void test_documented_tool_names_are_plugin_scoped_correctly(void) {
      * no revalidation tool; `tests/test_decision_mcp.c` asserts that no tool
      * name contains an approval or revalidation verb and that no schema
      * declares a capability argument. A6's one addition is a read: it can say
-     * that a decision has gone stale and cannot do anything about it. */
-    T_CHECK_MSG(n == 21, "expected 21 tools, found %zu", n);
+     * that a decision has gone stale and cannot do anything about it.
+     *
+     * A8-CI added seven, and the same argument applies to all of them: they are
+     * `atlas_sem_status`, `atlas_sem_symbol`, `atlas_sem_callers`,
+     * `atlas_sem_callees` and `atlas_sem_trace`, and every one is a read. What
+     * A8-CI did *not* add is an index tool. Building a semantic index runs a
+     * compiler over repository source, so it is an authorised operator action
+     * with no MCP surface at all — a model holding every tool in this list
+     * still cannot cause a compiler to run. */
+    T_CHECK_MSG(n == 28, "expected 28 tools, found %zu", n);
 }
 
 /* --- the integration record ----------------------------------------------

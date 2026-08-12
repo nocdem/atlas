@@ -1,7 +1,10 @@
 # Atlas — working notes for Claude Code
 
 Atlas is a generic, headless engineering-memory and repository-intelligence CLI in
-C17. Phase **A8**: the durable orchestration control plane — a job queue, an
+C17. Phase **A8-CI**: compiler-aware code intelligence — a semantic index built
+with libclang beside A3's lexical one, a call graph whose every edge states
+whether the compiler proved it, bounded change-impact, and a deterministic
+task-context builder. See the A8-CI sections below. On top of **A8**: the durable orchestration control plane — a job queue, an
 explicit state machine, expiring leases, crash recovery, an unprivileged
 dispatcher running as `atlas-worker`, isolated per-attempt workspaces, bounded
 command execution and a versioned driver interface. See `docs/orchestration.md`.
@@ -279,16 +282,45 @@ src/ipc      server_code.c (the seven-method A3 group)
   `atlas_provenance_writable_in_a2`. `settle()` in `resolve.c` is the single
   write point and checks it. Do not add a second.
 - **`compile_commands.json` is data, never a command.** The `command` string is
-  SHA-256'd and discarded — never executed, never passed to a shell, never
-  stored. Arguments are read through a positive allowlist (include dirs, system
+  SHA-256'd, **word-split without a shell**, and otherwise discarded — never
+  executed, never passed to a shell, never stored verbatim. Arguments from
+  either form are read through one positive allowlist (include dirs, system
   include dirs, defines and undefines, the standard, the source, the output) and
   nothing else; `@response-files` and `-fplugin=` are recognised only well enough
-  to be ignored. An include directory outside the repository is recorded with
+  to be ignored.
+
+  **A8-CI reversed A3's refusal to read the `command` string at all.** A3
+  declined on the grounds that splitting it would be "the beginning of
+  interpreting a command line". The reasoning was sound and the consequence was
+  not: CMake writes the string form, so Atlas could not read the compilation
+  database of most real repositories — it extracted nothing, every translation
+  unit parsed without its include paths, and the result was an index that looked
+  built and described almost nothing.
+
+  What happens now is **word splitting and nothing else**: backslash, single
+  quotes and double quotes, and no expansion of any kind — no variables, no
+  command substitution, no globbing, no tilde. `$(id)` becomes six ordinary
+  characters inside one argument, which is then dropped for not being on the
+  allowlist. Both forms feed the *same* allowlist, so the string form reaches
+  nothing the array form could not. The cost is stated in
+  `tests/test_code_compdb.c`: a `-DSECRET=` value is now recorded from a command
+  string exactly as it always was from an `arguments` array, because Atlas
+  cannot tell a secret define from an ordinary one. An include directory outside the repository is recorded with
   `external = 1` and **never opened**. `tests/test_code_compdb.c` plants an
   executable marker in four places and asserts it never ran.
-- **No new dependency, ever, for this.** No Clang, no libclang, no tree-sitter,
-  no ctags, no Python, no Node. The lexer is first-party and bounded, and every
+- **A3 adds no dependency, and its lexer never will.** No tree-sitter, no
+  ctags, no Python, no Node. The lexer is first-party and bounded, and every
   ceiling it reaches is reported rather than silently applied.
+
+  **A8-CI reversed the "no libclang, ever" half of this rule, deliberately, and
+  the reversal is confined to a separate layer.** A3 still reads bytes with its
+  own lexer and still produces its own resolution classes; nothing about it
+  changed. What A8-CI added is a *second* layer beside it that asks a compiler,
+  in `src/sem/`, linking libclang from exactly one translation unit
+  (`src/sem/clangparse.c`). The two never merge and neither promotes the other:
+  a UNIQUE_LEXICAL edge stays lexical even when Clang proves the same call,
+  because the bytes that produced it did not become more true. See the A8-CI
+  rules below.
 - **The structural stage inherits A1's rules unchanged.** Workers touch no
   database handle and create no process; nothing forks off the writer thread; no
   transaction is held across unbounded work; the select/parse/apply loop is
@@ -411,8 +443,28 @@ src/ipc      server_code.c (the seven-method A3 group)
   if the two constants drift apart the lookup misses silently and every MCP write
   becomes unattributed. `tests/test_ai_attribution.c` is what catches it.
 - **MCP is not a filesystem reader.** No tool accepts an absolute path, and a
-  `repo` argument must name a repository one of the client's granted roots
-  resolved to — a whitelist, not a path comparison.
+  `repo` argument must name a repository **the persistent registry holds** — a
+  whitelist, not a path comparison.
+
+  **This reverses A2's original rule, which made the client's granted roots the
+  allowlist, and the reason it was wrong is worth keeping.** A root is *where
+  the client happens to be looking*; it says nothing about what an operator has
+  authorised Atlas to hold. Coupling them meant that starting a session inside
+  one registered repository made every other registered repository unreadable —
+  which protected nothing, because an operator had already registered both and
+  the model reached the second one simply by being started somewhere else.
+
+  What constrains the call is unchanged and lives elsewhere: only an operator
+  registers a repository; `repo.add`, `repo.ensure` and `repo.remove` do not
+  exist as RPC methods at all; no tool accepts a path; and a name must match a
+  registered repository *exactly* or the answer is `NOT_REGISTERED` — the same
+  answer whether the directory exists, is a git repository, or is nothing.
+  Atlas does not look at the filesystem to produce it.
+
+  Roots keep one honest job: choosing a *default* when the caller names no
+  repository. `tests/test_registry.c` pins all of this, including the case the
+  old rule got wrong — a session granting one repository and asking about
+  another must answer.
 - **Requests are built with the typed writer.** `atlas_ipc_params_begin`/`_finish`,
   never `atlas_buf_appendf`. There is still no "write these bytes as JSON"
   primitive anywhere in Atlas, and `atlas_ipc_result_write` /
@@ -600,6 +652,28 @@ There is deliberately **no `src/ipc` file here**, and no entry in any method
 table. That absence is the A5 guarantee, not an omission.
 
 ## A5 rules — these are not negotiable
+
+- **Restore is a local CLI operation with no RPC method, and nothing in the
+  ordinary group creates, reads, restores or prunes.**
+
+  **A7.1 broke this rule's premise twice, and both are now corrected in
+  writing.** A5 reasoned that the uid owning the index could copy or prune the
+  file anyway, so an RPC method added nothing. Under a system deployment the
+  index is `0700 atlasd` and the operator is a different uid — so the operator
+  account could not back up, verify, plan or prune its own index at all, and the
+  documented remedy was to become the service account. That is manual
+  impersonation standing in for a missing feature. `backup.create`,
+  `backup.verify`, `maintenance.plan` and `maintenance.prune` are served in the
+  **operator-uid** group, gated on `SO_PEERCRED` against the root-owned policy;
+  every other peer, including `atlas-worker` and every MCP client, is told the
+  method does not exist. `backup.restore` deliberately has no RPC form: replacing
+  the record should require stopping the daemon.
+
+  What A5 actually wanted is untouched — nothing a model can reach may replace or
+  prune the index — and so is everything else: `--apply` is required, the delete
+  is per batch, bounds are checked rather than clamped, and there is no
+  background deleter. The prune runs *on* the writer thread rather than taking
+  the lock, so "Atlas has exactly one writer" is still true of it.
 
 - **Backup, restore and maintenance are local CLI operations with no RPC
   method.** Nothing reachable over the socket — and so nothing reachable from
@@ -1110,6 +1184,200 @@ absence is the deferral.
   Atlas never creates it, never prints it, and never reaches for an operator's
   personal session — and `live_model` must be on as well, so there are two
   independent gates.
+
+## A8-CI layers — additions
+
+```
+src/sem       sem.c (the evidence vocabulary and the configuration digest),
+              clangparse.c (the libclang reader — the ONE file that includes
+              clang-c), parse.c (spawning and reading the bounded child),
+              index.c (generations, incremental, publication),
+              query.c (the bounded walk and the trace),
+              context.c (impact, candidate tests, the task context package)
+src/db        db_sem.c (the one write point over the migration-11 tables)
+src/core      service_sem.c (the `code` semantic commands and `context build`)
+src/ipc       server_sem.c (six reads; no method builds an index)
+src/daemon    ops.c (long operations: accepted, polled, terminal for ever)
+```
+
+libclang is a **system dependency, located not downloaded**, and optional: a
+build without it still indexes, answers decisions and serves every A0..A8
+command, and every semantic entry point reports the absence rather than
+returning an empty result. `atlas_sem_available()` is the one place that says
+so.
+
+## A8-CI rules — these are not negotiable
+
+- **PROVEN means the compiler proved it, and nothing else earns the word.** A
+  direct call to a named function is PROVEN. A call through a function pointer
+  is CANDIDATE at best and is capped at CANDIDATE by
+  `atlas_sem_edge_kind_max_evidence`, which is asked at the write point rather
+  than trusted from the extractor — so a bug in the parser cannot mint a proven
+  indirect call. **Atlas never claims to know every target of a function
+  pointer.** C has no such property without whole-program analysis this season
+  excludes, and every traversal that crosses an indirect call says so.
+- **A path is as strong as its weakest edge.** `atlas_sem_evidence_weaker` folds
+  the class along a walk and is the only place a reached node's evidence is
+  decided. A chain crossing one indirect call is a candidate chain however many
+  proven edges surround it. UNKNOWN is zero, for the reason A6 keeps UNKNOWN and
+  BLOCKED there.
+- **A3's facts and A8-CI's facts are never merged and never promoted.** A
+  UNIQUE_LEXICAL edge stays lexical even when Clang proves the same call. They
+  live in different tables and a query that reports both says which is which.
+- **Identity is Clang's USR.** Atlas invents no mangling. A USR already
+  distinguishes two files' `static void helper(void)`, two scopes' `i`, and a
+  struct from a typedef of the same name. A declaration and its definition share
+  a USR — correctly, they are one entity — so decl-versus-def is a property of
+  the row, and the relationship is answered by the rows that share a USR.
+- **Parsing happens in a bounded child process, never on the writer thread.**
+  It is this same binary re-executed through `atlas_proc_run` — still the one
+  process-creation path — with an empty environment, an `RLIMIT_AS` ceiling, a
+  wall clock and an idle bound. A malformed input that crashes a compiler front
+  end costs one translation unit, not the daemon that owns the index. The child
+  holds no database handle and takes no lock; `atlas sem-parse` is dispatched
+  from raw argv before any `atlas_ctx` exists, and that absence is the guarantee.
+- **Compiler diagnostics are counted, never reproduced.** A diagnostic quotes
+  untrusted repository source. The count is the fact; the text is not Atlas' to
+  relay, and the child's stderr is captured and discarded.
+- **Compilation databases are named, never discovered.** Atlas does not search a
+  repository for a file that tells it how to compile things. `--compdb` is
+  explicit, repository-relative, and validated inside the root.
+- **Publication is one statement.** A generation's rows are written while the
+  previous generation is still being served, and `atlas_db_sem_publish` marks it
+  COMPLETE and repoints `sem_current` in one transaction. There is no path that
+  makes a partially written generation visible, and a crash leaves a RUNNING
+  generation nobody points at.
+- **The input digest is sealed once, at the end of a pass, over the finished
+  generation.** A unit's digest covers its *transitive* include closure, and
+  that closure is assembled from rows every unit contributes — so computing it
+  when the unit was parsed measured whatever had been recorded by then and made
+  the digest depend on processing order. Incremental indexing then never
+  converged: a fixed set of units was reparsed for ever. The closure walk is
+  `WITH RECURSIVE` bounded by `ATLAS_SEM_MAX_INCLUDE_DEPTH`; a two-level walk
+  would miss a header four levels down and carry a stale unit forward while
+  reporting it COMPLETE.
+- **Freshness is recomputed on every read, never cached** — A6's rule about
+  freshness and A4's about link currency. ABSENT and STALE are different
+  answers and stay different: "nobody has indexed this" and "what was indexed no
+  longer describes the code" call for different actions.
+- **Every bound that is reached is reported.** A truncated walk cannot say it
+  found nothing, an ambiguity never looks smaller than it is (`candidate_total`
+  records the true number even when fewer were kept), and an index that
+  describes nine tenths of a repository is never displayed the way one
+  describing all of it is — COMPLETE, PARTIAL, FAILED and UNSUPPORTED are
+  reported separately and never summed.
+- **Every selected item says how it was found.** Impact and context items carry
+  an evidence class *and* a fixed selection reason from a closed vocabulary. A
+  test found by reading a filename is LEXICAL however useful it turns out to be;
+  a test that references the subject is PROVEN about the reference and lexical
+  only about being a test. C offers no proven test-to-code relationship and
+  Atlas does not invent one.
+- **The context builder is deterministic and reads only.** Ranking uses counted,
+  comparable facts and a total tie-break on (file, line, name), so the same
+  request over one generation produces the same package. Task text ranks
+  evidence and authorises nothing: there is no code path from it to a mutation,
+  which is an absence rather than a check. A task longer than its ceiling is
+  refused, not truncated.
+- **No MCP tool and no *ordinary* RPC method builds an index.** Indexing runs a
+  compiler over repository source, so it is an authorised operator action. A
+  model holding every Atlas tool still cannot cause a compiler to run.
+
+  **The A8-CI closeout added `code.index`, and it must be described as the
+  narrow exception it is.** The original rule said no RPC method at all, and
+  the consequence was not the one intended: under A7.1 the index is 0700
+  `atlasd`, so with no method the *only* way to reindex was to stop
+  `atlas.service` and run the command as the service account. That is a
+  documented workaround standing in for a missing feature, and it asks an
+  operator to do by hand the one thing the separation exists to prevent.
+  `service.h` had meanwhile described the method as already existing, so the
+  documentation was wrong as well.
+
+  What changed is the group, not the guarantee. `code.index` sits in the
+  operator-uid table beside `backup.create` — offered only to the peer whose
+  `SO_PEERCRED` uid equals the `operator_uid` in the root-owned policy, and
+  answered with `unknown method` for everybody else, including `atlas-worker`
+  and every MCP client. There is still no MCP tool that can build an index and
+  no ordinary method that can. The work is queued to the writer thread, which
+  is the daemon's one serialized writer path, so this adds no second writer.
+- **One implementation per answer.** `atlas_sem_impact_on` and
+  `atlas_sem_context_on` take a raw handle and a resolved repository; the CLI
+  and the daemon both call them. Parity between the surfaces is structural
+  rather than two functions somebody keeps in step.
+
+## Long operations — the A8-CI closeout
+
+- **An operation that can outlast a client's patience does not run in the serve
+  loop.** `atlas_server_dispatch` runs inline, so a thirty-second backup stalled
+  every other client for thirty seconds — which the serve loop is written to
+  prevent, and which the backup path simply was not covered by. Backups run on
+  the operations thread; semantic indexes run on the writer thread. Neither runs
+  where a request is dispatched.
+- **The client is answered when the work is accepted, not when it is done**, and
+  polls `operation.get` for the rest. This is the shape `repo.sync` already
+  used; it is now general. A backup of a 437 MiB index failed at 10.022 s with
+  "timed out while reading a frame header" and exit 1 while the daemon wrote and
+  verified a perfectly good one. **A success reported as a failure is worse than
+  a failure**, because the next thing anybody does about it is re-run the
+  operation or work around it.
+- **A terminal record never changes.** `atlas_ops_finish` ignores a second
+  transition, which is what makes polling idempotent and what lets a client
+  killed mid-poll simply ask again. It is reachable from an error path that can
+  itself run twice.
+- **A failed poll is not a failed operation.** The client retries to
+  `ATLAS_OPS_CLIENT_WAIT_MS` and reports "still running, ask again" if it gets
+  there. Running out of patience is a statement about the client. This is the
+  same mistake as the original one, one layer down, and it happened: a semantic
+  index makes the daemon write hard for minutes and the poll's own frame read
+  hit the transport timeout.
+- **The client is not the operation.** The work holds no reference to the
+  connection, so a disconnected, killed or merely bored client neither cancels
+  nor corrupts it — verified by killing a client mid-backup.
+- **An id is never reused by a later daemon.** The table is in memory, so the
+  counter restarted at 1 and an id issued before a restart named a different
+  operation afterwards — a client polling it got another operation's verdict,
+  which is a confident wrong answer rather than the "unknown" the contract
+  promises, and is exactly the failure this layer exists to prevent. Each
+  daemon seeds its ids above every id any previous one issued.
+- **The table is in memory and a restart forgets it, deliberately.** The
+  underlying operations already have deterministic crash behaviour a durable
+  record could only describe: a backup publishes atomically or leaves nothing,
+  and a generation publishes atomically or leaves a RUNNING one nothing points
+  at while the last valid one is still served. An unknown id is reported as
+  unknown — the same answer eviction gives — and the message points at the
+  artefact, which is what actually survives.
+- **A second concurrent request is refused, naming the first.** Deterministic
+  refusal beats queueing: two backups of one index, or two indexes of one
+  repository, differ only in which artefact somebody ends up looking at.
+- **A generation reports the rows it holds, not the work the pass did.** The
+  counts were accumulated per translation unit, so a symbol declared in a header
+  was added once per including unit: DNA generation 1 stored 520,925 symbols and
+  978,122 edges for a generation holding 22,305 and 325,218, and the full and
+  incremental paths disagreed by more than twenty times about identical content.
+  `atlas_db_sem_generation_counts` measures them once, at publication, from the
+  rows. Any figure quoted for DNA from before that fix is the inflated one.
+
+## Extending A8-CI safely
+
+- **A new evidence class** means editing `atlas_sem_evidence`, `strength()` in
+  `src/sem/sem.c`, `atlas_sem_evidence_weaker`, every CHECK naming the class in
+  migration 11, and the enumerated expectations in `tests/test_sem.c`. Keep
+  UNKNOWN at zero.
+- **A new edge kind** means a member, a name, a row in
+  `atlas_sem_edge_kind_max_evidence` stating the strongest class it may carry,
+  and the CHECK on `sem_edges.kind`. A kind whose ceiling is not stated cannot
+  be written.
+- **A new fact the parser emits** changes what identical bytes produce, so bump
+  `ATLAS_SEM_ANALYZER_VERSION`. The next pass then rebuilds and the graph is
+  reported stale until it does.
+- **A new bound** goes in `include/atlas/limits.h` under the A8-CI section with
+  a written reason, and is reported when reached. A bound that silently trims a
+  result is the one thing this layer must never have.
+- **A new RPC method** goes in `SEM_METHODS[]` and must be a read. If it is
+  plausibly a mutation verb, add its name to the negative enumeration in
+  `tests/test_orch_rpc.c`. A method that *mutates* goes in the operator-uid
+  table instead, and which table it goes in is the security decision.
+- **A new MCP tool** follows the A2 rule and changes the pinned count in
+  `tests/test_plugin.c`. It must not be able to build or invalidate an index.
 
 ## A8 final closure — migration 10 and the account of an edge
 

@@ -528,7 +528,7 @@ atlas_status atlas_server_require_repo(dispatch_state *ds, const atlas_ipc_reque
     st = atlas_db_repo_get(ds->db, name, out, &found, err);
     if (st == ATLAS_OK && !found) {
         return atlas_err_set(err, ATLAS_ERR_REPO,
-                             "no repository named \"%s\" is registered (try: atlas repo list)",
+                             "NOT_REGISTERED: no repository named \"%s\" is registered. Repositories are onboarded only by an operator; Atlas does not discover them (try: atlas repo list)",
                              atlas_safe(&ds->safe, name));
     }
     return st;
@@ -924,6 +924,19 @@ atlas_status atlas_server_dispatch(atlas_server_ctx *ctx, const void *payload, s
         for (size_t i = 0; i < n; i++) {
             if (strcmp(atlas_ipc_request_method(req), code[i].name) == 0) {
                 fn = code[i].fn;
+                break;
+            }
+        }
+    }
+    if (fn == NULL) {
+        /* A8-CI. Four reads, in the ordinary group: a semantic query needs no
+         * more authority than a structural one, and index construction is not
+         * here at all. */
+        size_t n = 0;
+        const atlas_method_entry *sem = atlas_server_sem_methods(&n);
+        for (size_t i = 0; i < n; i++) {
+            if (strcmp(atlas_ipc_request_method(req), sem[i].name) == 0) {
+                fn = sem[i].fn;
                 break;
             }
         }

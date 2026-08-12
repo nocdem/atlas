@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "atlas/atlas.h"
 #include "atlas/authority.h"
@@ -19,6 +20,7 @@
 #include "atlas/ipc.h"
 #include "atlas/maintenance.h"
 #include "atlas/mcp.h"
+#include "atlas/sem.h"
 #include "atlas/unit.h"
 #include "cli/render.h"
 
@@ -103,6 +105,7 @@ void atlas_cli_print_help(FILE *out) {
      * the first literal past the length ISO C99 guarantees. */
     (void)fprintf(
         out,
+        "  operation status ID        state of a long operation (backup, code index)\n"
         "  backup create OUTPUT       online snapshot of the index; refuses to overwrite\n"
         "                             system deployment: OUTPUT is a NAME in the daemon's\n"
         "                             backup directory, not a path\n"
@@ -247,6 +250,40 @@ static atlas_status parse_args(cli_state *st, int argc, char **argv, bool *want_
                 st->opts.reverse = true;
             } else if (strcmp(a, "--symbol") == 0) {
                 st->opts.symbol = true;
+            } else if (strcmp(a, "--proven") == 0) {
+                st->opts.proven_only = true;
+            } else if (strcmp(a, "--history") == 0) {
+                st->opts.history = true;
+            } else if (strcmp(a, "--repo") == 0) {
+                if (i + 1 >= argc) {
+                    return atlas_err_set(err, ATLAS_ERR_USAGE, "--repo needs a name");
+                }
+                st->opts.repo = argv[++i];
+            } else if (strcmp(a, "--task") == 0) {
+                if (i + 1 >= argc) {
+                    return atlas_err_set(err, ATLAS_ERR_USAGE, "--task needs a description");
+                }
+                st->opts.task = argv[++i];
+            } else if (strcmp(a, "--max-tokens") == 0) {
+                if (i + 1 >= argc) {
+                    return atlas_err_set(err, ATLAS_ERR_USAGE, "--max-tokens needs a number");
+                }
+                atlas_status ts = parse_long(argv[++i], "--max-tokens", &st->opts.max_tokens, err);
+                if (ts != ATLAS_OK) {
+                    return ts;
+                }
+            } else if (strcmp(a, "--rebuild") == 0) {
+                st->opts.rebuild = true;
+            } else if (strcmp(a, "--compdb") == 0) {
+                if (i + 1 >= argc) {
+                    return atlas_err_set(err, ATLAS_ERR_USAGE, "--compdb needs a path");
+                }
+                if (st->opts.compdb_count >= sizeof(st->opts.compdbs) / sizeof(st->opts.compdbs[0])) {
+                    return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                         "at most %zu compilation databases may be named",
+                                         sizeof(st->opts.compdbs) / sizeof(st->opts.compdbs[0]));
+                }
+                st->opts.compdbs[st->opts.compdb_count++] = argv[++i];
             } else if (strcmp(a, "--depth") == 0) {
                 if (i + 1 >= argc) {
                     return atlas_err_set(err, ATLAS_ERR_USAGE, "--depth needs a value");
@@ -572,9 +609,41 @@ static atlas_status diff_item_sink(const atlas_diff_entry *e, void *ud, atlas_er
     return ls->r->v->diff_item(ls->r, e, err);
 }
 
+/* `file` is the one streaming read whose service call can fail having produced
+ * no row at all — asking a repository for a path it does not index is an error
+ * rather than an empty result. Every other streaming command answers that with
+ * zero rows.
+ *
+ * Opened eagerly like the others, the document header and the repository line
+ * were already on stdout when the call failed, and the error document went out
+ * after them: two documents, the first one unterminated, from a `--json`
+ * invocation that promises exactly one. A streaming writer cannot recall bytes,
+ * so the fix is not to write them until there is something to write.
+ *
+ * So the sink opens the renderer on its first call and the command closes it
+ * only if the sink ever fired. A failure before the first row leaves stdout
+ * untouched and the error document is the whole output. */
+typedef struct file_sink {
+    atlas_renderer *r;
+    cli_state *st;
+    const char *repo;
+    bool opened;
+} file_sink;
+
 static atlas_status file_report_sink(const atlas_file_report *rep, void *ud, atlas_err *err) {
-    list_sink *ls = (list_sink *)ud;
-    return ls->r->v->file(ls->r, rep, err);
+    file_sink *fs = (file_sink *)ud;
+    if (!fs->opened) {
+        atlas_status s = renderer_open(fs->r, fs->st->opts.json, fs->st->out, "file", err);
+        if (s != ATLAS_OK) {
+            return s;
+        }
+        fs->opened = true;
+        s = fs->r->v->note_repo(fs->r, fs->repo, err);
+        if (s != ATLAS_OK) {
+            return s;
+        }
+    }
+    return fs->r->v->file(fs->r, rep, err);
 }
 
 static atlas_status need_operands(const cli_state *st, size_t want, const char *usage,
@@ -1695,6 +1764,10 @@ static bool remote_serves(const cli_state *st) {
      * no remote form would otherwise reach its handler with a NULL context and
      * dereference it. */
     if (strcmp(cmd, "repo") == 0) {
+        /* Only `list`. `add` and `remove` are absent deliberately — nothing over
+         * the socket may change the registry — and there is no `repo state`
+         * subcommand: the repository-state report belongs to `atlas events`,
+         * which is routed in its own block. */
         return strcmp(sub, "list") == 0;
     }
     if (strcmp(cmd, "daemon") == 0) {
@@ -1703,10 +1776,33 @@ static bool remote_serves(const cli_state *st) {
     if (strcmp(cmd, "code") == 0) {
         return strcmp(sub, "status") == 0 || strcmp(sub, "file") == 0 ||
                strcmp(sub, "symbol") == 0 || strcmp(sub, "search") == 0 ||
-               strcmp(sub, "deps") == 0 || strcmp(sub, "impact") == 0;
+               strcmp(sub, "deps") == 0 || strcmp(sub, "impact") == 0 ||
+               /* A8-CI. Four reads, served by the ordinary method group. Under
+                * A7.1 these are the only forms that work at all from an
+                * operator's account: the index is 0700 `atlasd`. `index` is
+                * absent on purpose — it is a write and has no read method. */
+               /* A8-CI closeout: indexing is served over the socket now, so an
+                * operator never has to stop the service or become the service
+                * account. It is offered only to the peer the root-owned policy
+                * names, so reaching the name is not the same as being allowed
+                * to use it. */
+               strcmp(sub, "index") == 0 ||
+               strcmp(sub, "sem-status") == 0 || strcmp(sub, "semantic") == 0 ||
+               strcmp(sub, "callers") == 0 || strcmp(sub, "callees") == 0 ||
+               strcmp(sub, "trace") == 0 || strcmp(sub, "sem-impact") == 0 ||
+               strcmp(sub, "tests") == 0 || strcmp(sub, "explain") == 0;
     }
     if (strcmp(cmd, "gate") == 0) {
         return strcmp(sub, "check") == 0 || strcmp(sub, "show") == 0;
+    }
+    if (strcmp(cmd, "context") == 0) {
+        return strcmp(sub, "build") == 0;
+    }
+    /* Served over the socket and by nothing else: the operations table lives in
+     * the daemon's memory, so there is no local form of this question and never
+     * will be. */
+    if (strcmp(cmd, "operation") == 0) {
+        return strcmp(sub, "status") == 0;
     }
     /* Backup create and verify, and deliberately not restore.
      *
@@ -1757,7 +1853,7 @@ static bool is_a_command(const char *cmd) {
         "doctor",  "repo",    "scan",      "status",  "search",  "file",     "history",
         "diff",    "daemon",  "sync",      "events",  "code",    "decision", "gate",
         "job",     "dispatcher", "backup", "maintenance", "service", "mcp",  "hook",
-        "integrate", "version", "help",
+        "integrate", "version", "help", "context", "operation",
     };
     for (size_t i = 0; i < sizeof COMMANDS / sizeof COMMANDS[0]; i++) {
         if (strcmp(cmd, COMMANDS[i]) == 0) {
@@ -1767,35 +1863,313 @@ static bool is_a_command(const char *cmd) {
     return false;
 }
 
+/* Whether this invocation would write the index.
+ *
+ * `mode_for` answers it for `scan`, `repo add` and `repo remove`, which it must
+ * because it also chooses the context mode. It answers AUTO for `code index`
+ * and `code sync`, which is right for a per-user install — AUTO takes the
+ * writer lock when it is free — and wrong for the question asked here.
+ *
+ * The consequence was that on a system deployment both fell through to the
+ * generic "not served over the socket" answer, which does not say that the
+ * operation exists and that this account may not perform it. The deterministic
+ * NOT_AUTHORIZED distinction was implemented and unreachable on the one
+ * deployment where it is the whole point.
+ *
+ * Two names, not an inventory: these are the only commands that write the index
+ * and are not already WRITE. A third would be a deliberate edit here, and the
+ * failure if it is forgotten is a vaguer message rather than a wrong one. */
+static bool would_write_index(const cli_state *st) {
+    if (mode_for(st) == ATLAS_CTX_WRITE) {
+        return true;
+    }
+    return strcmp(st->command, "code") == 0 && st->operand_count > 0 &&
+           (strcmp(st->operands[0], "index") == 0 || strcmp(st->operands[0], "sync") == 0);
+}
+
 static atlas_status remote_refuse(const cli_state *st, atlas_err *err) {
     /* A write against somebody else's index is not a permissions problem to be
      * reported from inside a chmod; it is a thing this account does not do.
      * Registration and scanning under a system deployment are the operator
-     * ceremony in docs/security/A7_1_OPERATIONS.md. */
-    if (mode_for(st) == ATLAS_CTX_WRITE) {
+     * ceremony in docs/security/A7_1_OPERATIONS.md.
+     *
+     * NOT_AUTHORIZED leads, as a stable token rather than prose, so a caller
+     * tells it from NOT_REGISTERED without reading English. The two answer
+     * different questions — "Atlas does not hold this" and "Atlas holds it and
+     * you may not do this to it" — and a caller that cannot tell them apart
+     * will retry the wrong one. */
+    if (would_write_index(st)) {
         return atlas_err_set(err, ATLAS_ERR_CONFIG,
-                             "the system index is owned by the Atlas service account and this "
-                             "command would write to it. Registration and scanning are operator "
-                             "operations performed as the service account; see "
-                             "docs/security/A7_1_OPERATIONS.md.");
+                             "NOT_AUTHORIZED: `atlas %s%s%s` writes the index, and the index is "
+                             "owned by the Atlas service account. The operation exists and this "
+                             "account may not perform it. Indexing, registration and scanning are "
+                             "operator operations performed as the service account; see "
+                             "docs/security/A7_1_OPERATIONS.md.",
+                             st->command, st->operand_count > 0 ? " " : "",
+                             st->operand_count > 0 ? st->operands[0] : "");
     }
+    /* Deliberately says "is not served" rather than "has no daemon-served form
+     * yet". The second wording asserts that the name exists, and a mistyped
+     * subcommand reaches here too — `atlas code sem-symbol`, which has never
+     * been a command, was told the system index is daemon-owned and that its
+     * command is merely unavailable. Both halves were false, and the reader's
+     * next move is to go looking for a feature nobody has removed.
+     *
+     * The honest answer covers both cases without a second copy of the command
+     * inventory. A list here would be a fourth one — after `COMMANDS[]`,
+     * `remote_serves` and the dispatch chain — and its drift would turn a
+     * working command into "unknown" on every system deployment, which is a
+     * worse fault than an imprecise sentence about a typo. `atlas help` is the
+     * one authority, so the message points at it. */
     return atlas_err_set(err, ATLAS_ERR_CONFIG,
                          "the system index is owned by the Atlas service account and cannot be "
-                         "read directly, and `atlas %s%s%s` has no daemon-served form yet. "
-                         "Every other read-only command does; `backup` and `maintenance` are "
-                         "local operator operations with no RPC surface by design.",
+                         "read directly, and `atlas %s%s%s` is not served over the socket — it is "
+                         "either a write operation or not a command. Every read-only command is "
+                         "served; `backup restore` and `maintenance` are local operator "
+                         "operations with no RPC surface by design. Run `atlas help` for the "
+                         "command list.",
                          st->command, st->operand_count > 0 ? " " : "",
                          st->operand_count > 0 ? st->operands[0] : "");
+}
+
+/* The semantic commands need a writable-or-readable handle on the index
+ * itself. Under A7.1 the index is 0700 `atlasd`, so an operator running this
+ * from their own account has no context and is told exactly that rather than
+ * being given an empty answer. Serving these over the socket is the daemon
+ * side of the same work and is where this refusal goes away. */
+static const char SEM_LOCAL_ONLY[] =
+    "NOT_AUTHORIZED: building a semantic index writes to the index, and this process cannot open "
+    "it for writing; on a system deployment the index is owned by the `atlasd` account. Every "
+    "semantic *read* is served over the socket.";
+
+/* `atlas context build --repo R --task "..."`.
+ *
+ * The task description ranks evidence Atlas already holds and does nothing
+ * else: it selects no repository, authorises nothing, and no imperative in it
+ * can cause a write, because this path reaches only read functions. */
+static atlas_status run_context(cli_state *st, atlas_ctx *ctx, atlas_renderer *r, atlas_err *err) {
+    if (st->operand_count == 0 || strcmp(st->operands[0], "build") != 0) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "usage: atlas context build --repo NAME --task TEXT");
+    }
+    if (st->opts.repo == NULL || st->opts.task == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "atlas context build needs --repo NAME and --task TEXT");
+    }
+    atlas_sem_context_req req;
+    atlas_sem_context_req_init(&req);
+    req.repo = st->opts.repo;
+    req.task = st->opts.task;
+    req.depth = st->opts.depth;
+    req.max_tokens = st->opts.max_tokens;
+    req.max_items = st->opts.limit;
+    req.include_history = st->opts.history;
+
+    atlas_sem_context_report rep;
+    atlas_sem_context_report_init(&rep);
+    atlas_status result = ctx != NULL ? atlas_service_sem_context(ctx, &req, &rep, err)
+                                      : atlas_service_sem_context_remote(&req, &rep, err);
+    if (result == ATLAS_OK) {
+        result = renderer_open(r, st->opts.json, st->out, "context build", err);
+        if (result == ATLAS_OK) {
+            result = r->v->sem_context(r, &rep, err);
+        }
+        result = result == ATLAS_OK ? renderer_close(r, err) : (renderer_abort(r), result);
+    }
+    atlas_sem_context_report_free(&rep);
+    return result;
 }
 
 static atlas_status run_code(cli_state *st, atlas_ctx *ctx, atlas_renderer *r, int64_t limit,
                              atlas_err *err) {
     if (st->operand_count == 0) {
         return atlas_err_set(err, ATLAS_ERR_USAGE,
-                             "usage: atlas code status|sync|file|symbol|search|deps|impact ...");
+                             "usage: atlas code status|sync|file|symbol|search|deps|impact"
+                             "|index|semantic|callers|callees|trace ...");
     }
     const char *sub = st->operands[0];
     atlas_status result;
+
+    /* --- A8-CI: the compiler-derived index ------------------------------
+     *
+     * Deliberately separate subcommands from the A3 ones below rather than a
+     * flag on them. `code symbol` answers from the lexical graph and `code
+     * semantic` from the compiler-derived one, and they are different questions
+     * with different evidence — a `--semantic` switch would invite a reader to
+     * treat one answer as an improved version of the other. */
+    if (strcmp(sub, "index") == 0) {
+        /* usage: atlas code index NAME --compdb PATH [--compdb PATH...] [--rebuild] */
+        if (st->operand_count < 2u) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "usage: atlas code index NAME --compdb PATH [--compdb PATH...] "
+                                 "[--rebuild]");
+        }
+        /* The compilation databases come from the option parser, which owns
+         * every `--` argument. They are repository-relative and named
+         * explicitly: Atlas never searches a repository for one. */
+        const char *const *compdbs = st->opts.compdbs;
+        size_t ncompdb = st->opts.compdb_count;
+        bool rebuild = st->opts.rebuild;
+        if (ncompdb == 0) {
+            /* No search, ever. Atlas does not go looking through a repository
+             * for a file that tells it how to compile things. */
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "name at least one compilation database with --compdb "
+                                 "(repository-relative); Atlas does not search for one");
+        }
+
+        atlas_sem_index_summary sum;
+        atlas_sem_index_summary_init(&sum);
+        /* Two routes, one behaviour.
+         *
+         * With a context this process holds the writer lock and indexes here.
+         * Without one — which under A7.1 is every operator invocation, because
+         * the index is 0700 `atlasd` — it goes over the socket, where the
+         * daemon queues it on its writer thread and this client polls. Both
+         * end in `atlas_sem_index_on`.
+         *
+         * The service does not have to be stopped and nobody has to become the
+         * service account. That was the state before the closeout, and a
+         * documented workaround standing in for a missing feature is a defect
+         * rather than a procedure.
+         *
+         * A context that exists but cannot write is still refused, and refused
+         * before any work starts: that is a real condition (another process
+         * holds the lock on this data directory) and NOT_AUTHORIZED names it. */
+        if (ctx != NULL && !atlas_ctx_is_writer(ctx)) {
+            return atlas_err_set(err, ATLAS_ERR_CONFIG, "%s", SEM_LOCAL_ONLY);
+        }
+        result = ctx != NULL ? atlas_service_sem_index(ctx, st->operands[1], compdbs, ncompdb,
+                                                       rebuild, &sum, err)
+                             : atlas_service_sem_index_remote(st->operands[1], compdbs, ncompdb,
+                                                              rebuild, &sum, err);
+        if (result == ATLAS_OK) {
+            result = renderer_open(r, st->opts.json, st->out, "code index", err);
+            if (result == ATLAS_OK) {
+                result = r->v->sem_indexed(r, &sum, err);
+            }
+            result = result == ATLAS_OK ? renderer_close(r, err) : (renderer_abort(r), result);
+        }
+        return result;
+    }
+
+    if (strcmp(sub, "semantic") == 0 || strcmp(sub, "callers") == 0 ||
+        strcmp(sub, "callees") == 0 || strcmp(sub, "trace") == 0) {
+        const char *repo_name = st->operand_count > 1u ? st->operands[1] : NULL;
+        if (repo_name == NULL) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE, "usage: atlas code %s NAME ...", sub);
+        }
+
+        if (strcmp(sub, "semantic") == 0) {
+            if (st->operand_count < 3u) {
+                return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                     "usage: atlas code semantic NAME SYMBOL [KIND]");
+            }
+            atlas_sem_symbols_report rep;
+            atlas_sem_symbols_report_init(&rep);
+            const char *kind = st->operand_count > 3u ? st->operands[3] : NULL;
+            result = ctx != NULL ? atlas_service_sem_symbol(ctx, repo_name, st->operands[2],
+                                                            kind, limit, &rep, err)
+                                 : atlas_service_sem_symbol_remote(repo_name, st->operands[2],
+                                                                   kind, limit, &rep, err);
+            if (result == ATLAS_OK) {
+                result = renderer_open(r, st->opts.json, st->out, "code semantic", err);
+                if (result == ATLAS_OK) {
+                    result = r->v->sem_symbols(r, &rep, err);
+                }
+                result = result == ATLAS_OK ? renderer_close(r, err) : (renderer_abort(r), result);
+            }
+            atlas_sem_symbols_report_free(&rep);
+            return result;
+        }
+
+        atlas_sem_graph_report rep;
+        atlas_sem_graph_report_init(&rep);
+        int64_t depth = st->opts.depth > 0 ? st->opts.depth : ATLAS_SEM_DEFAULT_DEPTH;
+
+        if (strcmp(sub, "trace") == 0) {
+            if (st->operand_count < 4u) {
+                return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                     "usage: atlas code trace NAME FROM TO");
+            }
+            result = ctx != NULL
+                         ? atlas_service_sem_trace(ctx, repo_name, st->operands[2],
+                                                   st->operands[3], depth, &rep, err)
+                         : atlas_service_sem_trace_remote(repo_name, st->operands[2],
+                                                          st->operands[3], depth, &rep, err);
+        } else {
+            if (st->operand_count < 3u) {
+                return atlas_err_set(err, ATLAS_ERR_USAGE, "usage: atlas code %s NAME SYMBOL",
+                                     sub);
+            }
+            bool inbound = strcmp(sub, "callers") == 0;
+            /* Depth 1 is the direct answer; a caller asking for more gets the
+             * bounded transitive one and is told when a bound was reached. */
+            result = ctx != NULL
+                         ? atlas_service_sem_graph(ctx, repo_name, st->operands[2], inbound, depth,
+                                                   limit, st->opts.proven_only, &rep, err)
+                         : atlas_service_sem_graph_remote(repo_name, st->operands[2], inbound,
+                                                          depth, limit, st->opts.proven_only,
+                                                          &rep, err);
+        }
+        if (result == ATLAS_OK) {
+            result = renderer_open(r, st->opts.json, st->out, "code graph", err);
+            if (result == ATLAS_OK) {
+                result = r->v->sem_graph(r, &rep, err);
+            }
+            result = result == ATLAS_OK ? renderer_close(r, err) : (renderer_abort(r), result);
+        }
+        atlas_sem_graph_report_free(&rep);
+        return result;
+    }
+
+    /* `impact`, `tests` and `explain` are one report seen three ways: what a
+     * change to the subject reaches. `tests` is that report filtered to test
+     * files and `explain` is it with the subject's own definition first, so
+     * three commands share one service call rather than three that could
+     * disagree. */
+    if (strcmp(sub, "sem-impact") == 0 || strcmp(sub, "tests") == 0 ||
+        strcmp(sub, "explain") == 0) {
+        if (st->operand_count < 3u) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE, "usage: atlas code %s NAME SYMBOL-OR-PATH",
+                                 sub);
+        }
+        atlas_sem_impact_report rep;
+        atlas_sem_impact_report_init(&rep);
+        int64_t depth = st->opts.depth > 0 ? st->opts.depth : ATLAS_SEM_DEFAULT_DEPTH;
+        result = ctx != NULL ? atlas_service_sem_impact(ctx, st->operands[1], st->operands[2],
+                                                        depth, limit, &rep, err)
+                             : atlas_service_sem_impact_remote(st->operands[1], st->operands[2],
+                                                               depth, limit, &rep, err);
+        if (result == ATLAS_OK) {
+            result = renderer_open(r, st->opts.json, st->out, "code impact", err);
+            if (result == ATLAS_OK) {
+                result = r->v->sem_impact(r, &rep, err);
+            }
+            result = result == ATLAS_OK ? renderer_close(r, err) : (renderer_abort(r), result);
+        }
+        atlas_sem_impact_report_free(&rep);
+        return result;
+    }
+
+    if (strcmp(sub, "sem-status") == 0) {
+        if (st->operand_count != 2u) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE, "usage: atlas code sem-status NAME");
+        }
+        atlas_sem_status_report rep;
+        atlas_sem_status_report_init(&rep);
+        result = ctx != NULL ? atlas_service_sem_status(ctx, st->operands[1], &rep, err)
+                             : atlas_service_sem_status_remote(st->operands[1], &rep, err);
+        if (result == ATLAS_OK) {
+            result = renderer_open(r, st->opts.json, st->out, "code sem-status", err);
+            if (result == ATLAS_OK) {
+                result = r->v->sem_status(r, &rep, err);
+            }
+            result = result == ATLAS_OK ? renderer_close(r, err) : (renderer_abort(r), result);
+        }
+        atlas_sem_status_report_free(&rep);
+        return result;
+    }
 
     if (strcmp(sub, "status") == 0) {
         if (st->operand_count != 2u) {
@@ -2284,17 +2658,71 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
          * stopped" is then enforced by the kernel rather than promised in a
          * manual. */
         if (strcmp(st->operands[0], "add") == 0 || strcmp(st->operands[0], "remove") == 0) {
+            /* One line, and no embedded newlines.
+             *
+             * An error message is untrusted-text-encoded on its way to the
+             * terminal, which is right — parts of it can quote a path somebody
+             * else chose. But that encoding applies to the whole string, so the
+             * `\n` in Atlas' own control text came out as a literal `%0A` and
+             * the three-line recipe printed as one unreadable run. The fix is
+             * not to exempt the message from encoding — that would reopen the
+             * hole for the part of it that is a path — but to stop putting
+             * newlines in it.
+             *
+             * It also no longer names `systemctl --user`. That is right for a
+             * per-user install and wrong for the system deployment this
+             * refusal is most likely to be seen on, where the unit is
+             * system-scoped and stopping it needs root. A recipe that is wrong
+             * half the time is worse than a description of what has to be true,
+             * so it states the condition and points at the one document that
+             * knows which deployment this is. */
             return atlas_err_set(err, ATLAS_ERR_CONFIG,
-                                 "changing the repository registry is a local operation and the "
-                                 "Atlas daemon currently owns this index. Stop it first:\n"
-                                 "    systemctl --user stop atlas\n"
-                                 "    atlas repo %s ...\n"
-                                 "    systemctl --user start atlas\n"
-                                 "Atlas exposes no RPC method for this, so that nothing reachable "
-                                 "over the socket — including MCP and hooks — can decide what "
-                                 "Atlas indexes.",
+                                 "changing the repository registry is a local operation under the "
+                                 "data-directory write lock, and the Atlas daemon currently holds "
+                                 "it. Stop the daemon, run `atlas repo %s ...`, then start it "
+                                 "again; the unit is user-scoped on a per-user install and "
+                                 "system-scoped on a system deployment, see "
+                                 "docs/security/A7_1_OPERATIONS.md. Atlas exposes no RPC method "
+                                 "for this, so that nothing reachable over the socket — including "
+                                 "MCP and hooks — can decide what Atlas indexes.",
                                  st->operands[0]);
         }
+    }
+
+    /* `operation status ID` — ask about a long operation.
+     *
+     * A read, and the counterpart to accepting one. Dispatched here with the
+     * backup family because it is answered by the same operator-gated method
+     * group, and because the operations it reports on are the two that take
+     * longer than a client will hold a socket open for. */
+    if (strcmp(cmd, "operation") == 0) {
+        atlas_status ost = need_operands(st, 2, "operation status ID", err);
+        if (ost != ATLAS_OK) {
+            return ost;
+        }
+        if (strcmp(st->operands[0], "status") != 0) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE, "usage: atlas operation status ID");
+        }
+        char *end = NULL;
+        long long id = strtoll(st->operands[1], &end, 10);
+        if (end == NULL || *end != '\0' || id <= 0) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "an operation id is a positive integer");
+        }
+        atlas_operation_report rep;
+        atlas_operation_report_init(&rep);
+        ost = atlas_service_operation_status_remote((int64_t)id, &rep, err);
+        if (ost == ATLAS_OK) {
+            atlas_renderer orend;
+            ost = renderer_open(&orend, st->opts.json, st->out, "operation status", err);
+            if (ost == ATLAS_OK) {
+                ost = orend.v->operation_status(&orend, &rep, err);
+            }
+            ost = ost == ATLAS_OK ? renderer_close(&orend, err)
+                                  : (renderer_abort(&orend), ost);
+        }
+        atlas_operation_report_free(&rep);
+        return ost;
     }
 
     /* --- A5: backup and maintenance -------------------------------------
@@ -2443,6 +2871,60 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
             return atlas_err_set(err, ATLAS_ERR_USAGE, "unknown maintenance subcommand \"%s\"",
                                  sub);
         }
+        /* Maintenance opens the index directly, and is dispatched before any
+         * context exists so that it cannot take the writer lock by accident.
+         * That also means it never reaches the refusal every other command gets
+         * on a system deployment — so from the operator's account it failed
+         * with SQLite's own "unable to open database file", which describes a
+         * permission the caller was never going to have and points at a file
+         * they cannot see.
+         *
+         * The answer is the honest one, not an RPC method: A5 gives maintenance
+         * no socket surface deliberately, because nothing reachable from a
+         * model may prune the index, and adding one to improve an error message
+         * would delete that guarantee. */
+        /* On a system deployment this goes over the socket, where the daemon
+         * offers it only to the peer the root-owned policy names.
+         *
+         * It used to refuse outright, and the refusal told the operator to
+         * become the service account — which is precisely the "manual
+         * service-account impersonation" a supported operation must not
+         * require. A5's rule that maintenance has no RPC surface rested on the
+         * premise that whoever owns the data directory can prune it anyway, and
+         * A7.1 broke that premise without anyone noticing, exactly as it did
+         * for backup. What A5 actually wanted — that nothing a model can reach
+         * may prune the index — is untouched. */
+        bool maint_remote = index_is_foreign(st);
+        /* And the other way maintenance met a database it could not open: there
+         * is no index at all. That is a perfectly ordinary state — nobody has
+         * run Atlas in this data directory — and reporting it as SQLite's
+         * "unable to open database file" tells the reader nothing they can act
+         * on. `atlas doctor` already distinguishes "there is no index" from
+         * "there is one I may not read"; so does this. */
+        {
+            atlas_buf dir = ATLAS_BUF_INIT;
+            atlas_buf dbp = ATLAS_BUF_INIT;
+            atlas_err rerr;
+            atlas_err_init(&rerr);
+            bool missing = false;
+            if (!maint_remote &&
+                atlas_datadir_resolve(st->opts.data_dir, &dir, NULL, &rerr) == ATLAS_OK &&
+                atlas_buf_appendf(&dbp, &rerr, "%s/atlas.db", atlas_buf_cstr(&dir)) == ATLAS_OK) {
+                missing = access(atlas_buf_cstr(&dbp), F_OK) != 0;
+            }
+            atlas_status mst = ATLAS_OK;
+            if (missing) {
+                mst = atlas_err_set(err, ATLAS_ERR_CONFIG,
+                                    "there is no Atlas index in %s to maintain. Nothing has been "
+                                    "indexed here yet; `atlas doctor` reports what Atlas can see",
+                                    atlas_safe(&r.safe, atlas_buf_cstr(&dir)));
+            }
+            atlas_buf_free(&dbp);
+            atlas_buf_free(&dir);
+            if (mst != ATLAS_OK) {
+                return mst;
+            }
+        }
         /* `prune` is not guarded by operator authority either: the rows it
          * deletes are in a database the calling uid can already open and
          * delete from. See atlas/authority.h for why a check that an adversary
@@ -2469,7 +2951,9 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
         mo.apply = prune;
         atlas_maintenance_report rep;
         atlas_maintenance_report_init(&rep);
-        atlas_status ms = atlas_service_maintenance(st->opts.data_dir, &mo, &rep, err);
+        atlas_status ms = maint_remote ? atlas_service_maintenance_remote(&mo, &rep, err)
+                                       : atlas_service_maintenance(st->opts.data_dir, &mo, &rep,
+                                                                   err);
         if (ms == ATLAS_OK) {
             ms = renderer_open(&r, st->opts.json, st->out,
                                prune ? "maintenance prune" : "maintenance plan", err);
@@ -2733,21 +3217,22 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
     } else if (strcmp(cmd, "file") == 0) {
         result = need_operands(st, 2, "file NAME PATH", err);
         if (result == ATLAS_OK) {
-            result = renderer_open(&r, st->opts.json, st->out, "file", err);
-            if (result == ATLAS_OK) {
-                result = r.v->note_repo(&r, st->operands[0], err);
+            file_sink fs = {&r, st, st->operands[0], false};
+            result = ctx != NULL ? atlas_service_file(ctx, st->operands[0], st->operands[1],
+                                                      file_report_sink, &fs, err)
+                                 : atlas_service_file_remote(st->operands[0], st->operands[1],
+                                                             file_report_sink, &fs, err);
+            if (result == ATLAS_OK && !fs.opened) {
+                /* The path resolved but produced nothing. Still one complete
+                 * document, so a script sees an answer rather than silence. */
+                result = renderer_open(&r, st->opts.json, st->out, "file", err);
+                if (result == ATLAS_OK) {
+                    result = r.v->note_repo(&r, st->operands[0], err);
+                }
+                fs.opened = result == ATLAS_OK;
             }
-            if (result == ATLAS_OK) {
-                list_sink ls = {&r};
-                result = ctx != NULL ? atlas_service_file(ctx, st->operands[0], st->operands[1],
-                                                          file_report_sink, &ls, err)
-                                     : atlas_service_file_remote(st->operands[0], st->operands[1],
-                                                                 file_report_sink, &ls, err);
-            }
-            if (result == ATLAS_OK) {
-                result = renderer_close(&r, err);
-            } else {
-                renderer_abort(&r);
+            if (fs.opened) {
+                result = result == ATLAS_OK ? renderer_close(&r, err) : (renderer_abort(&r), result);
             }
         }
     } else if (strcmp(cmd, "history") == 0) {
@@ -2929,6 +3414,8 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
         }
     } else if (strcmp(cmd, "code") == 0) {
         result = run_code(st, ctx, &r, limit, err);
+    } else if (strcmp(cmd, "context") == 0) {
+        result = run_context(st, ctx, &r, err);
     } else if (strcmp(cmd, "gate") == 0) {
         result = run_gate(st, ctx, &r, err);
     } else if (strcmp(cmd, "decision") == 0) {
@@ -2942,6 +3429,92 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
     return result;
 }
 
+/* --- A8-CI: the bounded translation-unit parser ----------------------------
+ *
+ * `atlas sem-parse` is the child half of the semantic indexer, and it is
+ * dispatched from raw argv before any option is parsed and before any
+ * `atlas_ctx` is opened. Both placements are guarantees rather than
+ * conveniences:
+ *
+ *   - **It never touches the index.** No context, no database handle, no writer
+ *     lock. A context in AUTO mode takes the lock when it is free, and a parser
+ *     child that took the writer lock would deadlock the pass that spawned it.
+ *     The absence of a code path prevents that, not care at the call site —
+ *     A5's argument for dispatching backup before any context exists.
+ *   - **It is the process that feeds untrusted repository source to a compiler
+ *     front end.** Keeping it a separate process with an address-space rlimit
+ *     and a wall clock is what bounds it; keeping it out of the daemon is what
+ *     stops a crash inside a compiler library from taking down the process that
+ *     owns the index.
+ *   - **Its arguments are a protocol, not an operator interface.** Everything
+ *     after `--` is a compiler argument vector the compile-database reader
+ *     already reduced to a positive allowlist, and those genuinely look like
+ *     options. Running them through Atlas' own option parser would either
+ *     reject them or, far worse, silently read one as an Atlas flag.
+ *
+ * It is absent from the help text and from the completion list because it is
+ * not an operator command. That is not a security measure: running it by hand
+ * does nothing an operator could not do with clang directly, and it can write
+ * nothing at all. */
+static int atlas_cli_sem_parse_child(int argc, char **argv, FILE *out, atlas_err *err) {
+    const char *source = NULL;
+    const char *root = NULL;
+    const char *directory = NULL;
+    const char *args[ATLAS_CODE_MAX_COMPILE_ARGS];
+    size_t argn = 0;
+    bool rest = false;
+
+    for (int i = 2; i < argc; i++) {
+        const char *a = argv[i];
+        if (rest) {
+            if (argn < ATLAS_CODE_MAX_COMPILE_ARGS) {
+                args[argn++] = a;
+            }
+            continue;
+        }
+        if (strcmp(a, "--") == 0) {
+            rest = true;
+        } else if (strcmp(a, "--source") == 0 && i + 1 < argc) {
+            source = argv[++i];
+        } else if (strcmp(a, "--root") == 0 && i + 1 < argc) {
+            root = argv[++i];
+        } else if (strcmp(a, "--directory") == 0 && i + 1 < argc) {
+            directory = argv[++i];
+        } else {
+            return (int)atlas_err_set(err, ATLAS_ERR_USAGE,
+                                      "atlas sem-parse: unexpected argument before \"--\"");
+        }
+    }
+    if (source == NULL || root == NULL) {
+        return (int)atlas_err_set(err, ATLAS_ERR_USAGE,
+                                  "usage: atlas sem-parse --source PATH --root PATH [-- ARGS...]");
+    }
+
+    atlas_sem_parse_req req;
+    memset(&req, 0, sizeof(req));
+    req.source = source;
+    req.root = root;
+    req.directory = directory;
+    req.args = args;
+    req.arg_count = argn;
+
+    atlas_buf doc = ATLAS_BUF_INIT;
+    atlas_sem_parse_result res;
+    atlas_status st = atlas_sem_parse_here(&req, &doc, &res, err);
+    if (st != ATLAS_OK) {
+        atlas_buf_free(&doc);
+        return (int)st;
+    }
+    /* One JSON document on stdout and nothing else. The parent reads it through
+     * the one yyjson facade and checks every field against Atlas' own closed
+     * vocabularies, so a child that produced nonsense becomes a failed unit
+     * rather than trusted input — A8's rule that a zero exit is not a success
+     * claim. */
+    (void)fwrite(doc.data, 1, doc.len, out);
+    atlas_buf_free(&doc);
+    return 0;
+}
+
 int atlas_cli_main(int argc, char **argv, FILE *out, FILE *errout) {
     cli_state st;
     memset(&st, 0, sizeof(st));
@@ -2950,6 +3523,28 @@ int atlas_cli_main(int argc, char **argv, FILE *out, FILE *errout) {
 
     atlas_err err;
     atlas_err_init(&err);
+
+    /* A8-CI: the child parser, dispatched from raw argv before options are
+     * parsed at all.
+     *
+     * Its arguments are Atlas' protocol with its own child, not an operator
+     * interface: everything after `--` is a compiler argument vector that the
+     * compile-database reader already reduced to an allowlist, and those
+     * genuinely look like options (`-I`, `-D`, `-std=`). Running them through
+     * the CLI's own option parser would either reject them or, far worse,
+     * silently interpret one as an Atlas flag. Keeping the two argument
+     * languages apart is the point.
+     *
+     * It opens no context, takes no lock and touches no database — see the
+     * handler for why that placement is the guarantee rather than a
+     * convenience. */
+    if (argc > 1 && strcmp(argv[1], "sem-parse") == 0) {
+        int rc = atlas_cli_sem_parse_child(argc, argv, out, &err);
+        if (rc != 0) {
+            atlas_render_error(out, errout, false, "sem-parse", &err);
+        }
+        return rc;
+    }
 
     bool want_help = false;
     bool want_version = false;

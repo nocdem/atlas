@@ -35,6 +35,19 @@ typedef struct atlas_cli_opts {
     bool reverse; /* `code deps`: report what depends on this instead */
     bool symbol;  /* `code deps`/`code impact`: the operand is a symbol name */
     long depth;
+    /* A8-CI: follow only compiler-proven edges. A caller that wants certainty
+     * asks for it explicitly rather than being handed it silently. */
+    bool proven_only;
+    /* A8-CI `context build`. `--task` is free text used only for ranking. */
+    const char *repo;
+    const char *task;
+    long max_tokens;
+    bool history;
+    /* A8-CI: `code index --compdb PATH`, repeatable. Repository-relative, and
+     * never discovered: Atlas does not search a repository for a file that
+     * tells it how to compile things. */
+    const char *compdbs[32];
+    size_t compdb_count;
     long since;
     const char *data_dir;
     long limit;

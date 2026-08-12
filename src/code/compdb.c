@@ -345,20 +345,166 @@ static atlas_status add_define(unit_build *ub, const char *text, bool undef, atl
  * the compiler's own path, the source file, `-include`, `-fplugin=` and any
  * `@response-file` — none of which Atlas acts on, and the last of which it
  * explicitly does not open. */
-static atlas_status walk_arguments(unit_build *ub, const atlas_jsonv *args, atlas_buf *output_out,
-                                   atlas_buf *std_out, atlas_buf *lang_out, atlas_err *err) {
-    size_t n = atlas_jsonv_arr_len(args);
+/* The positive allowlist, over a plain argument vector.
+ *
+ * **One allowlist, two source forms.** A compile database may present its
+ * arguments as a JSON array or as a single `command` string, and both have to
+ * end up here — a second copy of this walk for the string form is exactly how
+ * one of them would quietly start accepting something the other refuses. The
+ * callers differ only in how they produce the vector. */
+/* --- converting a `command` string into an argument vector ------------------
+ *
+ * A compile database may present its arguments as a JSON array or as one
+ * `command` string. CMake writes the string form, which is what DNA has, so
+ * refusing to read it would mean refusing to index most real repositories.
+ *
+ * **This is word splitting, and nothing else.** It honours the three quoting
+ * forms a build system uses to protect a space — backslash, single quotes and
+ * double quotes — and performs no expansion of any kind: no variables, no
+ * command substitution, no globbing, no tilde, no history, no arithmetic. There
+ * is no shell here and there never will be; a `$(...)` in a command string
+ * becomes six ordinary characters inside one argument, and Atlas would drop
+ * that argument for not being on the allowlist rather than evaluate it.
+ *
+ * The result is fed through exactly the same allowlist the array form uses, so
+ * a repository cannot reach anything through the string form that it could not
+ * reach through the array form.
+ *
+ * Bounded: at most ATLAS_CODE_MAX_COMPILE_ARGS tokens and
+ * ATLAS_CODE_MAX_ARG_BYTES per token, and reaching either is recorded rather
+ * than silently applied. */
+typedef struct argv_vec {
+    atlas_buf bytes;                            /* NUL-separated token text */
+    size_t offsets[ATLAS_CODE_MAX_COMPILE_ARGS];
+    const char *items[ATLAS_CODE_MAX_COMPILE_ARGS];
+    size_t count;
+    bool truncated;
+} argv_vec;
+
+static void argv_vec_init(argv_vec *v) {
+    memset(v, 0, sizeof(*v));
+    atlas_buf_init(&v->bytes);
+}
+
+static void argv_vec_free(argv_vec *v) { atlas_buf_free(&v->bytes); }
+
+static atlas_status tokenize_command(const char *cmd, argv_vec *v, atlas_err *err) {
+    const char *p = cmd;
+    atlas_status st = ATLAS_OK;
+
+    while (*p != '\0' && st == ATLAS_OK) {
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') {
+            p++;
+        }
+        if (*p == '\0') {
+            break;
+        }
+        if (v->count >= ATLAS_CODE_MAX_COMPILE_ARGS) {
+            v->truncated = true;
+            break;
+        }
+
+        size_t start = v->bytes.len;
+        size_t len = 0;
+        bool overlong = false;
+
+        while (*p != '\0' && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r' &&
+               st == ATLAS_OK) {
+            char c = *p;
+            if (c == '\\' && p[1] != '\0') {
+                /* A backslash protects exactly the next byte. */
+                p++;
+                c = *p;
+            } else if (c == '\'') {
+                /* Single quotes protect everything up to the next single
+                 * quote, backslash included — the shell's rule, and the one a
+                 * build system relies on. */
+                p++;
+                while (*p != '\0' && *p != '\'' && st == ATLAS_OK) {
+                    if (len < ATLAS_CODE_MAX_ARG_BYTES) {
+                        st = atlas_buf_append(&v->bytes, p, 1, err);
+                        len++;
+                    } else {
+                        overlong = true;
+                    }
+                    p++;
+                }
+                if (*p == '\'') {
+                    p++;
+                }
+                continue;
+            } else if (c == '"') {
+                /* Double quotes protect spaces; a backslash inside them still
+                 * escapes the next byte. No expansion happens either way,
+                 * because nothing here expands. */
+                p++;
+                while (*p != '\0' && *p != '"' && st == ATLAS_OK) {
+                    char d = *p;
+                    if (d == '\\' && p[1] != '\0') {
+                        p++;
+                        d = *p;
+                    }
+                    if (len < ATLAS_CODE_MAX_ARG_BYTES) {
+                        st = atlas_buf_append(&v->bytes, &d, 1, err);
+                        len++;
+                    } else {
+                        overlong = true;
+                    }
+                    p++;
+                }
+                if (*p == '"') {
+                    p++;
+                }
+                continue;
+            }
+            if (len < ATLAS_CODE_MAX_ARG_BYTES) {
+                st = atlas_buf_append(&v->bytes, &c, 1, err);
+                len++;
+            } else {
+                overlong = true;
+            }
+            p++;
+        }
+
+        if (st != ATLAS_OK) {
+            break;
+        }
+        st = atlas_buf_append(&v->bytes, "", 1, err);
+        if (st != ATLAS_OK) {
+            break;
+        }
+        if (overlong) {
+            /* An argument longer than the ceiling is *dropped*, not truncated:
+             * a shortened `-I` names a different directory, and a shortened
+             * `-D` defines something else. */
+            v->bytes.len = start;
+            v->truncated = true;
+            continue;
+        }
+        v->offsets[v->count++] = start;
+    }
+
+    /* Resolved after every append, because the buffer moves as it grows. */
+    for (size_t i = 0; i < v->count; i++) {
+        v->items[i] = (const char *)v->bytes.data + v->offsets[i];
+    }
+    return st;
+}
+static atlas_status walk_argv(unit_build *ub, const char *const *argv, size_t total,
+                              atlas_buf *output_out, atlas_buf *std_out, atlas_buf *lang_out,
+                              atlas_err *err) {
+    size_t n = total;
     if (n > (size_t)ATLAS_CODE_MAX_COMPILE_ARGS) {
         n = (size_t)ATLAS_CODE_MAX_COMPILE_ARGS;
         ub->out->truncated = true;
         ub->out->truncated_reason = "a compile-database entry has more arguments than Atlas walks";
     }
-    ub->cu->arg_count = (int64_t)atlas_jsonv_arr_len(args);
+    ub->cu->arg_count = (int64_t)total;
 
     atlas_status st = ATLAS_OK;
     for (size_t i = 0; i < n && st == ATLAS_OK; i++) {
-        const char *a = NULL;
-        if (!atlas_jsonv_str(atlas_jsonv_at(args, i), &a, NULL)) {
+        const char *a = argv[i];
+        if (a == NULL) {
             ub->cu->dropped_args++;
             continue;
         }
@@ -373,7 +519,7 @@ static atlas_status walk_arguments(unit_build *ub, const atlas_jsonv *args, atla
                                        : arg_is(a, "-isystem")  ? ATLAS_CODE_INCDIR_SYSTEM
                                                                 : ATLAS_CODE_INCDIR_AFTER;
             const char *v = NULL;
-            if (i + 1u < n && atlas_jsonv_str(atlas_jsonv_at(args, i + 1u), &v, NULL)) {
+            if (i + 1u < n && (v = argv[i + 1u]) != NULL) {
                 st = add_incdir(ub, v, k, err);
                 i++;
             } else {
@@ -383,7 +529,7 @@ static atlas_status walk_arguments(unit_build *ub, const atlas_jsonv *args, atla
         }
         if (arg_is(a, "-D") || arg_is(a, "-U")) {
             const char *v = NULL;
-            if (i + 1u < n && atlas_jsonv_str(atlas_jsonv_at(args, i + 1u), &v, NULL)) {
+            if (i + 1u < n && (v = argv[i + 1u]) != NULL) {
                 st = add_define(ub, v, arg_is(a, "-U"), err);
                 i++;
             } else {
@@ -393,8 +539,7 @@ static atlas_status walk_arguments(unit_build *ub, const atlas_jsonv *args, atla
         }
         if (arg_is(a, "-o")) {
             const char *v = NULL;
-            if (i + 1u < n && atlas_jsonv_str(atlas_jsonv_at(args, i + 1u), &v, NULL) &&
-                strlen(v) <= ATLAS_CODE_MAX_ARG_BYTES) {
+            if (i + 1u < n && (v = argv[i + 1u]) != NULL && strlen(v) <= ATLAS_CODE_MAX_ARG_BYTES) {
                 st = atlas_buf_set_str(output_out, v, err);
                 i++;
             } else {
@@ -404,8 +549,7 @@ static atlas_status walk_arguments(unit_build *ub, const atlas_jsonv *args, atla
         }
         if (arg_is(a, "-x")) {
             const char *v = NULL;
-            if (i + 1u < n && atlas_jsonv_str(atlas_jsonv_at(args, i + 1u), &v, NULL) &&
-                strlen(v) <= 32u) {
+            if (i + 1u < n && (v = argv[i + 1u]) != NULL && strlen(v) <= 32u) {
                 st = atlas_buf_set_str(lang_out, v, err);
                 i++;
             } else {
@@ -544,10 +688,39 @@ static atlas_status read_entry(atlas_code_compdb *c, const atlas_jsonv *entry, c
     ub.directory_len = dir_len;
     ub.cu = cu;
 
+    /* `arguments` is preferred when both are present: an explicit vector needs
+     * no splitting at all, so it cannot be split wrongly. The `command` string
+     * is the fallback, tokenized without a shell and then walked by the same
+     * allowlist. */
+    argv_vec vec;
+    argv_vec_init(&vec);
     const atlas_jsonv *args = atlas_jsonv_get(entry, "arguments");
     if (st == ATLAS_OK && args != NULL && atlas_jsonv_is_arr(args)) {
-        st = walk_arguments(&ub, args, &output, &std, &lang, err);
+        size_t an = atlas_jsonv_arr_len(args);
+        if (an > ATLAS_CODE_MAX_COMPILE_ARGS) {
+            an = ATLAS_CODE_MAX_COMPILE_ARGS;
+            vec.truncated = true;
+        }
+        for (size_t i = 0; i < an; i++) {
+            const char *s = NULL;
+            if (atlas_jsonv_str(atlas_jsonv_at(args, i), &s, NULL)) {
+                vec.items[vec.count++] = s;
+            } else {
+                cu->dropped_args++;
+            }
+        }
+        st = walk_argv(&ub, vec.items, vec.count, &output, &std, &lang, err);
+    } else if (st == ATLAS_OK && command != NULL) {
+        st = tokenize_command(command, &vec, err);
+        if (st == ATLAS_OK) {
+            st = walk_argv(&ub, vec.items, vec.count, &output, &std, &lang, err);
+        }
     }
+    if (vec.truncated) {
+        c->truncated = true;
+        c->truncated_reason = "a compile-database entry has more arguments than Atlas walks";
+    }
+    argv_vec_free(&vec);
     if (st == ATLAS_OK) {
         st = cd_intern(c, output.data, output.len, &cu->output_off, &cu->output_len, err);
     }

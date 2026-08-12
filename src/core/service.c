@@ -216,7 +216,7 @@ atlas_status atlas_service_require_repo(atlas_ctx *ctx, const char *name, atlas_
     }
     if (!found) {
         return atlas_err_set(err, ATLAS_ERR_REPO,
-                             "no repository named \"%s\" is registered (try: atlas repo list)",
+                             "NOT_REGISTERED: no repository named \"%s\" is registered. Repositories are onboarded only by an operator; Atlas does not discover them (try: atlas repo list)",
                              name);
     }
     return ATLAS_OK;
@@ -655,7 +655,7 @@ atlas_status atlas_service_repo_remove_db(atlas_db *db, const char *name, atlas_
     atlas_status st = atlas_db_repo_get(db, name, &info, &found, err);
     if (st == ATLAS_OK && !found) {
         st = atlas_err_set(err, ATLAS_ERR_REPO,
-                           "no repository named \"%s\" is registered (try: atlas repo list)", name);
+                           "NOT_REGISTERED: no repository named \"%s\" is registered. Repositories are onboarded only by an operator; Atlas does not discover them (try: atlas repo list)", name);
     }
     if (st != ATLAS_OK) {
         atlas_repo_info_free(&info);

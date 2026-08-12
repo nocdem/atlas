@@ -90,7 +90,7 @@ static void test_a_schema_nine_database_reaches_ten_additively(void) {
     atlas_db *db = NULL;
     T_OK(atlas_db_open(atlas_buf_cstr(&path), &db, &err), &err);
     T_OK(atlas_db_migrate(db, &err), &err);
-    T_EQ_INT(schema_of(db), 12);
+    T_EQ_INT(schema_of(db), 13);
 
     /* A real decision, so the "nothing else moved" assertions are about rows
      * rather than about two empty tables agreeing. */
@@ -140,7 +140,7 @@ static void test_a_schema_nine_database_reaches_ten_additively(void) {
     T_CHECK(!table_exists(db, "decision_edge_events"));
 
     T_OK(atlas_db_migrate(db, &err), &err);
-    T_EQ_INT(schema_of(db), 12);
+    T_EQ_INT(schema_of(db), 13);
     T_CHECK_MSG(table_exists(db, "decision_edge_events"), "migration 10 created nothing");
 
     /* The assertion the whole design rests on. */
@@ -153,7 +153,7 @@ static void test_a_schema_nine_database_reaches_ten_additively(void) {
     /* And it is idempotent as a set: migrating an up-to-date database is a
      * no-op rather than a second CREATE. */
     T_OK(atlas_db_migrate(db, &err), &err);
-    T_EQ_INT(schema_of(db), 12);
+    T_EQ_INT(schema_of(db), 13);
 
     atlas_buf_free(&before);
     atlas_buf_free(&after);
@@ -232,8 +232,8 @@ static void test_a_future_schema_is_refused_on_the_writable_path(void) {
      * colliding with a migration that genuinely applied. Raise it with every
      * schema bump. */
     exec(db, "INSERT INTO schema_migrations(version, name, applied_at)"
-             " VALUES(13, 'from the future', '2030-01-01T00:00:00Z');");
-    T_EQ_INT(schema_of(db), 13);
+             " VALUES(14, 'from the future', '2030-01-01T00:00:00Z');");
+    T_EQ_INT(schema_of(db), 14);
 
     atlas_err ferr;
     atlas_err_init(&ferr);
@@ -242,7 +242,7 @@ static void test_a_future_schema_is_refused_on_the_writable_path(void) {
     T_CHECK_MSG(strstr(atlas_err_msg(&ferr), "newer Atlas") != NULL,
                 "the refusal does not say why: %s", atlas_err_msg(&ferr));
     /* Refused, not rewritten. The row is still there. */
-    T_EQ_INT(schema_of(db), 13);
+    T_EQ_INT(schema_of(db), 14);
 
     atlas_db_close(db);
     atlas_buf_free(&path);

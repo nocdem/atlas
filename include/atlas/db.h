@@ -21,7 +21,7 @@
 #include "atlas/error.h"
 #include "atlas/limits.h"
 
-#define ATLAS_SCHEMA_VERSION 12
+#define ATLAS_SCHEMA_VERSION 13
 
 typedef struct atlas_db atlas_db;
 
@@ -1494,7 +1494,13 @@ typedef struct atlas_decision_doc_row {
     int64_t repo_id;
     const char *created_at;
     const char *updated_at;
-    const char *status; /* PROPOSED | APPROVED | REJECTED | SUPERSEDED */
+    const char *status; /* PROPOSED | APPROVED | REJECTED | SUPERSEDED | RESOLVED */
+    /* A9.1. Which sort of knowledge record this is, from
+     * `atlas_decision_kind_name`. Orthogonal to `status`, and never derived from
+     * it: an APPROVED INVARIANT and an APPROVED ACCEPTED_RISK differ here and
+     * nowhere else. Every document has one, and a record written before the
+     * vocabulary existed reads as DECISION. */
+    const char *kind;
     int64_t latest_revision_no;
     int64_t current_revision_id; /* 0 when no revision is approved */
     /* The revision a reader is shown: the approved one when there is one, the
@@ -1515,7 +1521,7 @@ typedef struct atlas_decision_event_row {
     int64_t id;
     int64_t revision_id;
     int64_t revision_no;
-    const char *event; /* PROPOSED | APPROVED | REJECTED | SUPERSEDED */
+    const char *event; /* PROPOSED | APPROVED | REJECTED | SUPERSEDED | RESOLVED */
     const char *actor; /* the actor vocabulary; LOCAL_OPERATOR_CONFIRMED is a
                         * statement about a channel, never about a person */
     const char *content_hash;
@@ -1558,10 +1564,18 @@ typedef atlas_status (*atlas_decision_rev_cb)(const atlas_decision_rev_row *row,
  * inside the caller's transaction. That is why this is not two functions: a
  * document without a uid is not a document, and leaving the window open for a
  * caller to forget is how one appears. */
+/* A9.1: `kind` is supplied here and nowhere else. It is written by the INSERT
+ * that creates the row and no UPDATE in this layer names the column, which is
+ * what makes a document's classification as immutable as a revision's prose. */
 atlas_status atlas_db_decision_document_create(atlas_db *db, int64_t repo_id,
-                                               const char *root_hash, const char *created_at,
-                                               int64_t *id_out, char *uid_out, size_t uid_size,
-                                               atlas_err *err);
+                                               const char *root_hash, atlas_decision_kind kind,
+                                               const char *created_at, int64_t *id_out,
+                                               char *uid_out, size_t uid_size, atlas_err *err);
+/* The document's kind, for the caller that has to decide whether an operation
+ * is meaningful for it — a resolve, or a revise that asserts a different one. */
+atlas_status atlas_db_decision_kind_of(atlas_db *db, int64_t document_id,
+                                       atlas_decision_kind *kind_out, bool *found_out,
+                                       atlas_err *err);
 /* Inserts one immutable revision. `r` supplies content, `document_id`,
  * `revision_no` and `content_hash`; nothing about state is taken from it.
  *
@@ -1729,12 +1743,22 @@ atlas_status atlas_db_decision_uid_of(atlas_db *db, int64_t document_id, atlas_b
  * several. */
 atlas_status atlas_db_decision_current_revision(atlas_db *db, int64_t document_id,
                                                 int64_t *revision_id_out, atlas_err *err);
-/* The two facts a status recomputation needs besides the current revision:
- * which document supersedes this one (0 for none), and how many of its
- * revisions are still merely proposed. */
+/* The same fact, derived from `decision_revisions` instead of read from the
+ * cache. 0 when no revision is approved.
+ *
+ * A9.1 needed it because a status *recomputation* that reads the cached column
+ * cannot notice that the cache is now wrong — and resolving an approved revision
+ * is the first operation that makes it wrong, since the revision leaves APPROVED
+ * while the document still points at it. The partial unique index on
+ * `state = 'APPROVED'` is what makes this a lookup rather than a choice. */
+atlas_status atlas_db_decision_approved_revision(atlas_db *db, int64_t document_id,
+                                                 int64_t *revision_id_out, atlas_err *err);
+/* The facts a status recomputation needs besides the approved revision: which
+ * document supersedes this one (0 for none), how many of its revisions are still
+ * merely proposed, and how many have been resolved. */
 atlas_status atlas_db_decision_document_shape(atlas_db *db, int64_t document_id,
                                               int64_t *superseded_by_out, int64_t *proposed_out,
-                                              atlas_err *err);
+                                              int64_t *resolved_out, atlas_err *err);
 /* The newest revision of a document, whatever its state. */
 atlas_status atlas_db_decision_latest_revision(atlas_db *db, int64_t document_id, int64_t *id_out,
                                                int64_t *no_out, char *hash_out, size_t hash_size,
@@ -1747,8 +1771,13 @@ atlas_status atlas_db_decision_revision_load(atlas_db *db, int64_t revision_id,
 atlas_status atlas_db_decision_revision_by_no(atlas_db *db, int64_t document_id, int64_t revision_no,
                                               int64_t *id_out, bool *found_out, atlas_err *err);
 
+/* `status` and `kind` are both optional filters and both are NULL for "any".
+ * They are separate parameters because they are separate dimensions: asking for
+ * approved invariants is one query, and neither filter implies anything about
+ * the other. */
 atlas_status atlas_db_decision_documents_list(atlas_db *db, int64_t repo_id, const char *status,
-                                              int64_t limit, atlas_decision_doc_cb cb, void *ud,
+                                              const char *kind, int64_t limit,
+                                              atlas_decision_doc_cb cb, void *ud,
                                               int64_t *count_out, bool *more_out, atlas_err *err);
 atlas_status atlas_db_decision_document_row(atlas_db *db, int64_t document_id,
                                             atlas_decision_doc_cb cb, void *ud, bool *found_out,
@@ -1812,23 +1841,33 @@ atlas_status atlas_db_decision_edge_events_list(atlas_db *db, int64_t source_doc
                                                 int64_t limit, atlas_decision_edge_event_cb cb,
                                                 void *ud, int64_t *count_out, bool *more_out,
                                                 atlas_err *err);
-/* Documents whose head revision links to a path, by raw bytes. */
+/* Documents whose head revision links to a path, by raw bytes. `kind` is the
+ * A9.1 filter and is NULL for any. */
 atlas_status atlas_db_decision_for_path(atlas_db *db, int64_t repo_id, const void *path_raw,
-                                        size_t path_len, int64_t limit, atlas_decision_doc_cb cb,
-                                        void *ud, int64_t *count_out, bool *more_out,
-                                        atlas_err *err);
+                                        size_t path_len, const char *kind, int64_t limit,
+                                        atlas_decision_doc_cb cb, void *ud, int64_t *count_out,
+                                        bool *more_out, atlas_err *err);
 /* Bounded search. Uses FTS5 over `decision_search` when the linked SQLite build
  * has it, and a repository-filtered scan of the same narrow table when it does
  * not. Both are bounded, and `atlas doctor` reports which is in use. */
 atlas_status atlas_db_decision_search(atlas_db *db, int64_t repo_id, const char *query,
-                                      int64_t limit, atlas_decision_doc_cb cb, void *ud,
-                                      int64_t *count_out, bool *more_out, atlas_err *err);
+                                      const char *kind, int64_t limit, atlas_decision_doc_cb cb,
+                                      void *ud, int64_t *count_out, bool *more_out, atlas_err *err);
 /* Lifecycle counts for one repository, for the automatic context envelope and
  * for `decision list`. These are the real state, replacing A2's placeholder
  * zero for approvals. */
 atlas_status atlas_db_decision_repo_counts(atlas_db *db, int64_t repo_id, int64_t *proposed,
                                            int64_t *approved, int64_t *rejected,
-                                           int64_t *superseded, atlas_err *err);
+                                           int64_t *superseded, int64_t *resolved, atlas_err *err);
+/* A9.1: the same repository's documents counted by knowledge kind, indexed by
+ * the enum's own value so a caller cannot mismatch the order. `out` must have
+ * `atlas_decision_kind_count()` elements.
+ *
+ * A separate function rather than a second dimension on the status counts,
+ * because a cross-tabulation of five states by eight kinds is forty numbers
+ * nobody asked for, and both callers want one axis at a time. */
+atlas_status atlas_db_decision_kind_counts(atlas_db *db, int64_t repo_id, int64_t *out,
+                                           size_t out_count, atlas_err *err);
 /* Approved decisions in a repository with at least one path link whose file has
  * changed or gone since the link was recorded.
  *

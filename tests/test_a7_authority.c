@@ -195,6 +195,11 @@ static void test_the_daemon_answers_to_no_authority_method(void) {
     static const char *const OPERATOR_METHODS[] = {
         "decision.challenge", "decision.approve", "decision.reject", "decision.supersede",
         "decision.revalidate",
+        /* A9.1's one new lifecycle verb. Added here rather than left out, because
+         * this list is the only place that asserts an operator method is not
+         * offered to an ordinary peer, and a verb added to the group without a
+         * row here would be unchecked. */
+        "decision.resolve",
     };
     static const char *const METHODS[] = {
         /* Plausible aliases and case variants of the operator channel. A
@@ -203,6 +208,13 @@ static void test_the_daemon_answers_to_no_authority_method(void) {
         "decision.Approve", "DECISION.APPROVE", "decision.confirm", "decision.authorize",
         "decision.authorise", "decision.sign", "decision.validate", "decision.token",
         "decision.capability", "decision.grant", "decision.unlock", "decision.force",
+        /* A9.1: plausible aliases and case variants of the resolve verb, and the
+         * names a "close this out without a capability" shortcut would take. */
+        "decision.Resolve", "DECISION.RESOLVE", "decision_resolve", "decision.close",
+        "decision.discharge", "decision.complete", "decision.done", "decision.satisfy",
+        /* And the classification must not be settable over the wire: a kind is
+         * written by the INSERT that creates a document and by nothing else. */
+        "decision.set_kind", "decision.reclassify", "decision.kind",
         /* The registry, removed in A7. */
         "repo.add", "repo.ensure", "repo.remove", "repo.register", "repo.create", "repo.delete",
         "repo.forget", "repo.trust",

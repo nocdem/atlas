@@ -191,8 +191,8 @@ static void test_a_schema_seven_database_reaches_eight_losslessly(void) {
     }
 
     T_OK(atlas_db_migrate(db, &err), &err);
-    T_EQ_INT(atlas_db_schema_version(db, &err), 12);
-    T_EQ_INT(ATLAS_SCHEMA_VERSION, 12);
+    T_EQ_INT(atlas_db_schema_version(db, &err), 13);
+    T_EQ_INT(ATLAS_SCHEMA_VERSION, 13);
 
     for (size_t i = 0; i < sizeof A8_TABLES / sizeof A8_TABLES[0]; i++) {
         T_CHECK_MSG(table_exists(db, A8_TABLES[i]), "migration 8 did not create %s",
@@ -229,7 +229,7 @@ static void test_a_schema_seven_database_reaches_eight_losslessly(void) {
 
     /* Idempotent as a set: running it again is a no-op. */
     T_OK(atlas_db_migrate(db, &err), &err);
-    T_EQ_INT(atlas_db_schema_version(db, &err), 12);
+    T_EQ_INT(atlas_db_schema_version(db, &err), 13);
 
     atlas_db_close(db);
     atlas_buf_free(&path);
@@ -294,7 +294,7 @@ static void test_a_failed_migration_eight_leaves_seven_untouched(void) {
     /* And the real migration still applies cleanly afterwards, which is what
      * makes the rollback a recoverable state rather than a wedged one. */
     T_OK(atlas_db_migrate(db, &err), &err);
-    T_EQ_INT(atlas_db_schema_version(db, &err), 12);
+    T_EQ_INT(atlas_db_schema_version(db, &err), 13);
 
     atlas_db_close(db);
     atlas_buf_free(&path);

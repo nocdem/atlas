@@ -761,7 +761,12 @@ static bool take_login_key(const char *body, size_t len, char *out, size_t out_s
  * path.
  */
 
-#define GW_API_MAX_PARAMS 6
+/* Room for the parameters *and* the NULL terminator every row relies on. A9.1's
+ * `kind` filter took `/api/v1/decisions` to five parameters and exactly filled a
+ * six-element array, which still worked and left the next route with nowhere to
+ * put its terminator — a bound that is exactly full is a bound about to be
+ * exceeded silently. */
+#define GW_API_MAX_PARAMS 8
 
 typedef struct api_route {
     const char *path;
@@ -790,8 +795,12 @@ static const api_route API_ROUTES[] = {
     {"/api/v1/file", "repo.file", ATLAS_SCOPE_REPO_READ, {"repo", "path", NULL}, {NULL}},
     {"/api/v1/history", "repo.history", ATLAS_SCOPE_REPO_READ,
      {"repo", "path", "limit", NULL}, {"limit", NULL}},
+    /* A9.1 adds `kind` beside `status`: two independent filters, both forwarded,
+     * both validated by the daemon against their vocabularies. Adding a parameter
+     * to the row is the only way a query string reaches a daemon call, which is
+     * what keeps the surface a fixed table rather than a proxy. */
     {"/api/v1/decisions", "decision.list", ATLAS_SCOPE_DECISIONS_READ,
-     {"repo", "status", "limit", "cursor", NULL}, {"limit", "cursor", NULL}},
+     {"repo", "status", "kind", "limit", "cursor", NULL}, {"limit", "cursor", NULL}},
     {"/api/v1/decision", "decision.get", ATLAS_SCOPE_DECISIONS_READ,
      {"repo", "decision", NULL}, {NULL}},
     {"/api/v1/decision/history", "decision.history", ATLAS_SCOPE_DECISIONS_READ,

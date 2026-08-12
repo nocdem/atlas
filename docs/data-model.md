@@ -805,7 +805,7 @@ structural break with everything above.
 
 | table | holds |
 | --- | --- |
-| `decision_documents` | stable identity: the public `uid`, the soft `repo_id`, the durable `repo_root_hash`, and a **cache** of the ledger (`current_status`, `current_revision_id`) |
+| `decision_documents` | stable identity: the public `uid`, the soft `repo_id`, the durable `repo_root_hash`, the immutable A9.1 `kind`, and a **cache** of the ledger (`current_status`, `current_revision_id`) |
 | `decision_revisions` | immutable revisions: content, `content_hash`, `proposed_by`, `state`, `imported_from_ai_decision_id` |
 | `decision_alternatives` | the alternatives considered, in order |
 | `decision_links` | paths, commits, change sets, symbol snapshots, and links to other documents |

@@ -2355,19 +2355,342 @@ static const char *const M12_STATEMENTS[] = {
     NULL,
 };
 
+/* --- migration 13: knowledge kinds, and a lifecycle state for closure ------
+ *
+ * A9.1. Two changes to meaning, and no new table.
+ *
+ * 1. `decision_documents` gains `kind`: which sort of durable engineering
+ *    knowledge this record is. A4 had one category and called it a decision, so
+ *    a consensus constant, a release rule, a currently deployed chain id and an
+ *    approach that was tried and abandoned all had to be written down as
+ *    choices between alternatives. The prose survived that; the reason a later
+ *    reader should treat them differently did not.
+ *
+ *    The column defaults to `DECISION` and every existing row takes that
+ *    default, which is not a migration convenience but the definition: every
+ *    record written before this vocabulary existed *was* a decision, so
+ *    defaulting is what preserves its meaning rather than what approximates it.
+ *
+ *    It is on the document rather than on the revision, and therefore **not
+ *    part of the canonical content hash**. Hashing it would move all 79 stored
+ *    digests on the machine this was written for — 56 of them approved — and
+ *    `atlas doctor` reports a moved digest as tampering, correctly. The kind is
+ *    also identity-like rather than content: it is fixed before revision 1
+ *    exists, no statement in `db_decision.c` names it in an UPDATE, and
+ *    reclassifying is superseding with a document of the right kind, which keeps
+ *    the record of how the knowledge used to be classified. See the
+ *    field-by-field table in docs/decision-lifecycle.md.
+ *
+ * 2. The lifecycle vocabulary gains `RESOLVED`, so `decision_revisions.state`,
+ *    `decision_documents.current_status` and `decision_events.event` widen, and
+ *    `decision_challenges.intent` gains `resolve`. An approved OBLIGATION whose
+ *    demand has been met is not superseded — nothing replaced it — and is not
+ *    rejected, because it was accepted and was real. Without a fourth terminal
+ *    state, closing one out meant either lying about a replacement or leaving a
+ *    discharged obligation reported as outstanding for ever.
+ *
+ * **Four tables are rebuilt, because SQLite cannot widen a CHECK in place.**
+ * That is the precedent migrations 7 and 9 set. What is new here is that three
+ * of them are foreign-key parents, and one child — `decision_links` — declares
+ * `ON DELETE CASCADE`, so a rebuild of `decision_revisions` with foreign keys
+ * enforced would have deleted every link of every decision *silently*. This is
+ * the migration that carries `foreign_keys_off`, and that cascade is the reason
+ * the flag exists rather than a hypothetical one.
+ *
+ * Row ids are copied explicitly in every one of the four, column by column
+ * rather than by `SELECT *`. `decision_events.challenge_id` points into
+ * `decision_challenges` with no foreign key, `decision_validations.challenge_id`
+ * likewise, and both would silently name somebody else's capability if a rebuild
+ * renumbered. Every index is recreated by name; missing
+ * `idx_decision_rev_current` — the partial unique index that is the *only*
+ * enforcement of "at most one approved revision per document" — would delete
+ * that guarantee without any statement failing.
+ *
+ * And the migration verifies itself before it commits: it records every
+ * affected and every child table's row count first, then requires afterwards
+ * that all nine counts are unchanged, that every document's id and uid and
+ * every revision's id and content hash survived as pairs, that the events
+ * sequence still covers the highest id, and that `foreign_key_check` is silent.
+ * Any of those failing aborts the transaction, so the failure mode of the
+ * riskiest statement in Atlas is a rollback rather than a quiet loss. */
+static const char M13_SNAPSHOT[] =
+    /* Taken before anything is touched. Both helpers are dropped at the end of
+     * the migration, so a completed schema 13 contains neither. */
+    "CREATE TABLE m13_counts(t TEXT PRIMARY KEY, n INTEGER NOT NULL);"
+    "INSERT INTO m13_counts(t, n) SELECT 'decision_documents', count(*) FROM decision_documents;"
+    "INSERT INTO m13_counts(t, n) SELECT 'decision_revisions', count(*) FROM decision_revisions;"
+    "INSERT INTO m13_counts(t, n) SELECT 'decision_events', count(*) FROM decision_events;"
+    "INSERT INTO m13_counts(t, n) SELECT 'decision_challenges', count(*) FROM decision_challenges;"
+    "INSERT INTO m13_counts(t, n) SELECT 'decision_alternatives', count(*)"
+    "  FROM decision_alternatives;"
+    "INSERT INTO m13_counts(t, n) SELECT 'decision_links', count(*) FROM decision_links;"
+    "INSERT INTO m13_counts(t, n) SELECT 'decision_search', count(*) FROM decision_search;"
+    "INSERT INTO m13_counts(t, n) SELECT 'decision_validations', count(*)"
+    "  FROM decision_validations;"
+    "INSERT INTO m13_counts(t, n) SELECT 'decision_edge_events', count(*)"
+    "  FROM decision_edge_events;"
+    "INSERT INTO m13_counts(t, n) SELECT 'events_max_id',"
+    "  COALESCE((SELECT max(id) FROM decision_events), 0);"
+    /* Identity pairs, so the check is not merely about how many rows there are.
+     * A rebuild that preserved the count and renumbered the ids would pass a
+     * count check and destroy every soft reference in the database. */
+    "CREATE TABLE m13_docs(id INTEGER PRIMARY KEY, uid TEXT NOT NULL, status TEXT NOT NULL);"
+    "INSERT INTO m13_docs(id, uid, status)"
+    "  SELECT id, uid, current_status FROM decision_documents;"
+    "CREATE TABLE m13_revs(id INTEGER PRIMARY KEY, content_hash TEXT NOT NULL, state TEXT NOT NULL);"
+    "INSERT INTO m13_revs(id, content_hash, state)"
+    "  SELECT id, content_hash, state FROM decision_revisions;";
+
+static const char M13_DOCUMENTS[] =
+    "CREATE TABLE decision_documents_new ("
+    "  id INTEGER PRIMARY KEY,"
+    "  uid TEXT NOT NULL UNIQUE,"
+    "  repo_id INTEGER NOT NULL,"
+    "  repo_root_hash TEXT NOT NULL,"
+    "  repo_identity_hash TEXT NOT NULL DEFAULT '',"
+    /* A9.1. Which sort of knowledge this record is, orthogonal to
+     * `current_status`. The default is the definition of every pre-A9.1 row and
+     * not a fallback: those records were decisions.
+     *
+     * Immutable. No UPDATE in `db_decision.c` names this column, which is the
+     * same guarantee a revision's prose columns have. */
+    "  kind TEXT NOT NULL DEFAULT 'DECISION' CHECK(kind IN"
+    "    ('DECISION','POLICY','INVARIANT','OPERATIONAL_FACT','ACCEPTED_RISK','OBLIGATION',"
+    "     'PARKED','REJECTED_ALTERNATIVE')),"
+    "  created_at TEXT NOT NULL,"
+    "  updated_at TEXT NOT NULL,"
+    "  latest_revision_no INTEGER NOT NULL DEFAULT 0,"
+    "  current_revision_id INTEGER,"
+    "  current_status TEXT NOT NULL DEFAULT 'PROPOSED' CHECK(current_status IN"
+    "    ('PROPOSED','APPROVED','REJECTED','SUPERSEDED','RESOLVED')),"
+    "  superseded_by_document_id INTEGER,"
+    "  superseded_at TEXT"
+    ");"
+    "INSERT INTO decision_documents_new"
+    "  (id, uid, repo_id, repo_root_hash, repo_identity_hash, kind, created_at, updated_at,"
+    "   latest_revision_no, current_revision_id, current_status, superseded_by_document_id,"
+    "   superseded_at)"
+    "  SELECT id, uid, repo_id, repo_root_hash, repo_identity_hash, 'DECISION', created_at,"
+    "         updated_at, latest_revision_no, current_revision_id, current_status,"
+    "         superseded_by_document_id, superseded_at"
+    "  FROM decision_documents;"
+    "DROP TABLE decision_documents;"
+    "ALTER TABLE decision_documents_new RENAME TO decision_documents;"
+    /* All four exactly as migration 6 created them, plus one. */
+    "CREATE INDEX idx_decision_docs_repo ON decision_documents(repo_id, id DESC);"
+    "CREATE INDEX idx_decision_docs_status ON decision_documents(repo_id, current_status, id DESC);"
+    "CREATE INDEX idx_decision_docs_root ON decision_documents(repo_root_hash);"
+    "CREATE INDEX idx_decision_docs_identity ON decision_documents(repo_identity_hash)"
+    "  WHERE repo_identity_hash <> '';"
+    /* The new read A9.1 adds: one repository's records of one kind. Status and
+     * kind get an index each rather than one composite, because either filter
+     * is used alone as often as both are used together and SQLite will pick the
+     * more selective one. */
+    "CREATE INDEX idx_decision_docs_kind ON decision_documents(repo_id, kind, id DESC);";
+
+static const char M13_REVISIONS[] =
+    "CREATE TABLE decision_revisions_new ("
+    "  id INTEGER PRIMARY KEY,"
+    "  document_id INTEGER NOT NULL REFERENCES decision_documents(id),"
+    "  revision_no INTEGER NOT NULL,"
+    "  content_hash TEXT NOT NULL,"
+    "  title TEXT NOT NULL,"
+    "  context_text TEXT NOT NULL DEFAULT '',"
+    "  decision_text TEXT NOT NULL DEFAULT '',"
+    "  rationale_text TEXT NOT NULL DEFAULT '',"
+    "  consequences_text TEXT NOT NULL DEFAULT '',"
+    "  scope TEXT NOT NULL DEFAULT 'UNKNOWN' CHECK(scope IN"
+    "    ('UNKNOWN','REPOSITORY','SUBSYSTEM','PATHS')),"
+    "  proposed_by TEXT NOT NULL CHECK(proposed_by IN"
+    "    ('MODEL_PROPOSAL','MODEL_INFERENCE','LOCAL_OPERATOR_CONFIRMED','ATLAS_AUTOMATIC')),"
+    "  session_id INTEGER,"
+    "  session_unbound INTEGER NOT NULL DEFAULT 0,"
+    "  unbound_reason TEXT,"
+    "  basis_head TEXT,"
+    "  basis_repo_identity_hash TEXT NOT NULL DEFAULT '',"
+    "  created_at TEXT NOT NULL,"
+    /* RESOLVED joins the vocabulary. A revision that is resolved was approved,
+     * is no longer effective, and was not replaced — see atlas/decision.h. */
+    "  state TEXT NOT NULL DEFAULT 'PROPOSED' CHECK(state IN"
+    "    ('PROPOSED','APPROVED','REJECTED','SUPERSEDED','RESOLVED')),"
+    "  imported_from_ai_decision_id INTEGER,"
+    "  dedup_key TEXT,"
+    "  UNIQUE(document_id, revision_no)"
+    ");"
+    "INSERT INTO decision_revisions_new"
+    "  (id, document_id, revision_no, content_hash, title, context_text, decision_text,"
+    "   rationale_text, consequences_text, scope, proposed_by, session_id, session_unbound,"
+    "   unbound_reason, basis_head, basis_repo_identity_hash, created_at, state,"
+    "   imported_from_ai_decision_id, dedup_key)"
+    "  SELECT id, document_id, revision_no, content_hash, title, context_text, decision_text,"
+    "         rationale_text, consequences_text, scope, proposed_by, session_id, session_unbound,"
+    "         unbound_reason, basis_head, basis_repo_identity_hash, created_at, state,"
+    "         imported_from_ai_decision_id, dedup_key"
+    "  FROM decision_revisions;"
+    "DROP TABLE decision_revisions;"
+    "ALTER TABLE decision_revisions_new RENAME TO decision_revisions;"
+    "CREATE INDEX idx_decision_rev_doc ON decision_revisions(document_id, revision_no DESC);"
+    /* Rule 9 of A4, and the one index whose absence would be invisible: it is
+     * the sole enforcement of at most one approved revision per document. */
+    "CREATE UNIQUE INDEX idx_decision_rev_current ON decision_revisions(document_id)"
+    "  WHERE state = 'APPROVED';"
+    "CREATE UNIQUE INDEX idx_decision_rev_import ON decision_revisions"
+    "  (imported_from_ai_decision_id)"
+    "  WHERE imported_from_ai_decision_id IS NOT NULL;"
+    "CREATE UNIQUE INDEX idx_decision_rev_dedup ON decision_revisions(document_id, dedup_key)"
+    "  WHERE dedup_key IS NOT NULL;";
+
+static const char M13_EVENTS[] =
+    /* AUTOINCREMENT is recreated as AUTOINCREMENT: A8's ordering rule is that
+     * the ledger's id orders it, and a reused id would let a later event sort
+     * before an earlier one. Copying the ids explicitly sets `sqlite_sequence`
+     * to the highest of them, which the verification below requires. */
+    "CREATE TABLE decision_events_new ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  document_id INTEGER NOT NULL REFERENCES decision_documents(id),"
+    "  revision_id INTEGER REFERENCES decision_revisions(id),"
+    "  revision_no INTEGER NOT NULL DEFAULT 0,"
+    "  event TEXT NOT NULL CHECK(event IN"
+    "    ('PROPOSED','APPROVED','REJECTED','SUPERSEDED','RESOLVED')),"
+    "  actor TEXT NOT NULL CHECK(actor IN"
+    "    ('MODEL_PROPOSAL','MODEL_INFERENCE','LOCAL_OPERATOR_CONFIRMED','ATLAS_AUTOMATIC')),"
+    "  content_hash TEXT,"
+    "  challenge_id INTEGER,"
+    "  superseded_by_revision_id INTEGER,"
+    "  superseded_by_document_id INTEGER,"
+    "  detail TEXT,"
+    "  created_at TEXT NOT NULL,"
+    "  dedup_key TEXT"
+    ");"
+    "INSERT INTO decision_events_new"
+    "  (id, document_id, revision_id, revision_no, event, actor, content_hash, challenge_id,"
+    "   superseded_by_revision_id, superseded_by_document_id, detail, created_at, dedup_key)"
+    "  SELECT id, document_id, revision_id, revision_no, event, actor, content_hash, challenge_id,"
+    "         superseded_by_revision_id, superseded_by_document_id, detail, created_at, dedup_key"
+    "  FROM decision_events;"
+    "DROP TABLE decision_events;"
+    "ALTER TABLE decision_events_new RENAME TO decision_events;"
+    "CREATE INDEX idx_decision_events_doc ON decision_events(document_id, id);"
+    "CREATE INDEX idx_decision_events_rev ON decision_events(revision_id, id);"
+    "CREATE UNIQUE INDEX idx_decision_events_dedup ON decision_events(document_id, dedup_key)"
+    "  WHERE dedup_key IS NOT NULL;";
+
+static const char M13_CHALLENGES[] =
+    "CREATE TABLE decision_challenges_new ("
+    "  id INTEGER PRIMARY KEY,"
+    "  token TEXT NOT NULL UNIQUE,"
+    "  repo_id INTEGER NOT NULL,"
+    "  document_id INTEGER NOT NULL REFERENCES decision_documents(id),"
+    "  revision_id INTEGER NOT NULL REFERENCES decision_revisions(id),"
+    "  revision_no INTEGER NOT NULL,"
+    "  content_hash TEXT NOT NULL,"
+    /* `resolve` joins the intents. A fourth intent on one capability rather than
+     * a second mechanism, for the reason `revalidate` was: it needs exactly the
+     * properties approval needed and no others. */
+    "  intent TEXT NOT NULL CHECK(intent IN ('approve','reject','supersede','revalidate',"
+    "    'resolve')),"
+    "  supersede_document_id INTEGER,"
+    "  indexed_commit TEXT,"
+    "  evidence_digest TEXT,"
+    "  prior_freshness TEXT CHECK(prior_freshness IS NULL OR prior_freshness IN"
+    "    ('FRESH','STALE','IMPACTED','UNKNOWN')),"
+    "  prior_reasons TEXT,"
+    "  created_at TEXT NOT NULL,"
+    "  expires_at TEXT NOT NULL,"
+    "  consumed INTEGER NOT NULL DEFAULT 0,"
+    "  consumed_at TEXT"
+    ");"
+    "INSERT INTO decision_challenges_new"
+    "  (id, token, repo_id, document_id, revision_id, revision_no, content_hash, intent,"
+    "   supersede_document_id, indexed_commit, evidence_digest, prior_freshness, prior_reasons,"
+    "   created_at, expires_at, consumed, consumed_at)"
+    "  SELECT id, token, repo_id, document_id, revision_id, revision_no, content_hash, intent,"
+    "         supersede_document_id, indexed_commit, evidence_digest, prior_freshness,"
+    "         prior_reasons, created_at, expires_at, consumed, consumed_at"
+    "  FROM decision_challenges;"
+    "DROP TABLE decision_challenges;"
+    "ALTER TABLE decision_challenges_new RENAME TO decision_challenges;"
+    "CREATE INDEX idx_decision_challenges_repo ON decision_challenges"
+    "  (repo_id, consumed, expires_at);";
+
+/* The migration's own acceptance test, run inside its own transaction.
+ *
+ * The named CHECK is the error message: a failure reports
+ * `no_decision_row_may_be_lost_in_migration_13`, the runner wraps it as
+ * "migration 13 ... failed and was rolled back", and nothing is written. */
+static const char M13_VERIFY[] =
+    "CREATE TABLE m13_verify(ok INTEGER NOT NULL,"
+    "  CONSTRAINT no_decision_row_may_be_lost_in_migration_13 CHECK(ok = 1));"
+    "INSERT INTO m13_verify(ok) SELECT CASE WHEN"
+    "     (SELECT n FROM m13_counts WHERE t='decision_documents')"
+    "       = (SELECT count(*) FROM decision_documents)"
+    " AND (SELECT n FROM m13_counts WHERE t='decision_revisions')"
+    "       = (SELECT count(*) FROM decision_revisions)"
+    " AND (SELECT n FROM m13_counts WHERE t='decision_events')"
+    "       = (SELECT count(*) FROM decision_events)"
+    " AND (SELECT n FROM m13_counts WHERE t='decision_challenges')"
+    "       = (SELECT count(*) FROM decision_challenges)"
+    " AND (SELECT n FROM m13_counts WHERE t='decision_alternatives')"
+    "       = (SELECT count(*) FROM decision_alternatives)"
+    /* The cascade this whole flag exists for. */
+    " AND (SELECT n FROM m13_counts WHERE t='decision_links')"
+    "       = (SELECT count(*) FROM decision_links)"
+    " AND (SELECT n FROM m13_counts WHERE t='decision_search')"
+    "       = (SELECT count(*) FROM decision_search)"
+    " AND (SELECT n FROM m13_counts WHERE t='decision_validations')"
+    "       = (SELECT count(*) FROM decision_validations)"
+    " AND (SELECT n FROM m13_counts WHERE t='decision_edge_events')"
+    "       = (SELECT count(*) FROM decision_edge_events)"
+    /* Identity, not just arithmetic: every id/uid and id/content_hash pair
+     * survived as a pair, and every status and state came across unchanged. */
+    " AND (SELECT count(*) FROM m13_docs h JOIN decision_documents d"
+    "        ON d.id = h.id AND d.uid = h.uid AND d.current_status = h.status)"
+    "       = (SELECT n FROM m13_counts WHERE t='decision_documents')"
+    " AND (SELECT count(*) FROM m13_revs h JOIN decision_revisions r"
+    "        ON r.id = h.id AND r.content_hash = h.content_hash AND r.state = h.state)"
+    "       = (SELECT n FROM m13_counts WHERE t='decision_revisions')"
+    /* Every migrated document is a DECISION, which is what backward
+     * compatibility means here rather than what it approximates. */
+    " AND (SELECT count(*) FROM decision_documents WHERE kind <> 'DECISION') = 0"
+    /* The ledger's AUTOINCREMENT sequence still covers every id it issued, so no
+     * future event can take an id an existing one already has. */
+    " AND COALESCE((SELECT seq FROM sqlite_sequence WHERE name='decision_events'), 0)"
+    "       >= (SELECT n FROM m13_counts WHERE t='events_max_id')"
+    /* And nothing dangles. Foreign keys were off for the rebuild; this is the
+     * check that says the schema is consistent again before the commit that
+     * makes it visible. */
+    " AND (SELECT count(*) FROM pragma_foreign_key_check) = 0"
+    "  THEN 1 ELSE 0 END;"
+    "DROP TABLE m13_verify;"
+    "DROP TABLE m13_counts;"
+    "DROP TABLE m13_docs;"
+    "DROP TABLE m13_revs;";
+
+static const char *const M13_STATEMENTS[] = {
+    M13_SNAPSHOT, M13_DOCUMENTS, M13_REVISIONS, M13_EVENTS, M13_CHALLENGES, M13_VERIFY, NULL,
+};
+
+/* `foreign_keys_off` is written out for every row rather than left to default,
+ * so that "which migrations run with foreign keys enforced?" is answered by
+ * reading this table instead of by counting initialisers. */
 static const atlas_migration MIGRATIONS[] = {
-    {1, "initial schema", M1_STATEMENTS},
-    {2, "worktree identity", M2_STATEMENTS},
-    {3, "continuous indexing state", M3_STATEMENTS},
-    {4, "AI sessions, change reasons and decisions", M4_STATEMENTS},
-    {5, "structural code graph", M5_STATEMENTS},
-    {6, "decision documents, revisions and operator approval", M6_STATEMENTS},
-    {7, "decision revalidation records", M7_STATEMENTS},
-    {8, "durable orchestration control plane", M8_STATEMENTS},
-    {9, "a general decision-to-decision relation", M9_STATEMENTS},
-    {10, "durable evidence about a decision-to-decision edge", M10_STATEMENTS},
-    {11, "compiler-derived semantic index", M11_STATEMENTS},
-    {12, "remote API credentials and the gateway audit trail", M12_STATEMENTS},
+    {1, "initial schema", M1_STATEMENTS, false},
+    {2, "worktree identity", M2_STATEMENTS, false},
+    {3, "continuous indexing state", M3_STATEMENTS, false},
+    {4, "AI sessions, change reasons and decisions", M4_STATEMENTS, false},
+    {5, "structural code graph", M5_STATEMENTS, false},
+    {6, "decision documents, revisions and operator approval", M6_STATEMENTS, false},
+    {7, "decision revalidation records", M7_STATEMENTS, false},
+    {8, "durable orchestration control plane", M8_STATEMENTS, false},
+    {9, "a general decision-to-decision relation", M9_STATEMENTS, false},
+    {10, "durable evidence about a decision-to-decision edge", M10_STATEMENTS, false},
+    {11, "compiler-derived semantic index", M11_STATEMENTS, false},
+    {12, "remote API credentials and the gateway audit trail", M12_STATEMENTS, false},
+    /* The one migration that rebuilds foreign-key parents. See
+     * `atlas_migration.foreign_keys_off` and the migration 13 comment: with
+     * foreign keys enforced, `decision_links`' declared cascade would have made
+     * the rebuild of `decision_revisions` delete every link silently. */
+    {13, "knowledge kinds and a lifecycle state for closure", M13_STATEMENTS, true},
 };
 
 const atlas_migration *atlas_migrations(size_t *count_out) {
@@ -2447,30 +2770,59 @@ atlas_status atlas_db_migrate_list(atlas_db *db, const atlas_migration *list, si
                                  current);
         }
 
+        /* Before `BEGIN`, because `PRAGMA foreign_keys` is a no-op inside a
+         * transaction and would silently do nothing here. See
+         * `atlas_migration.foreign_keys_off` for why any migration needs it:
+         * rebuilding a table that a child references with `ON DELETE CASCADE`
+         * would otherwise empty the child without failing. The migration itself
+         * is still one transaction, and it checks its own row preservation and
+         * `foreign_key_check` before that transaction commits. */
+        if (m->foreign_keys_off) {
+            st = atlas_db_exec_sql(db, "PRAGMA foreign_keys=OFF;", err);
+            if (st != ATLAS_OK) {
+                return st;
+            }
+        }
         st = atlas_db_begin(db, err);
-        if (st != ATLAS_OK) {
-            return st;
-        }
-        for (size_t k = 0; st == ATLAS_OK && m->statements != NULL && m->statements[k] != NULL;
-             k++) {
-            st = atlas_db_exec_sql(db, m->statements[k], err);
-        }
         if (st == ATLAS_OK) {
-            st = record_migration(db, m, err);
+            for (size_t k = 0; st == ATLAS_OK && m->statements != NULL && m->statements[k] != NULL;
+                 k++) {
+                st = atlas_db_exec_sql(db, m->statements[k], err);
+            }
+            if (st == ATLAS_OK) {
+                st = record_migration(db, m, err);
+            }
+            if (st != ATLAS_OK) {
+                atlas_db_rollback(db);
+            } else {
+                st = atlas_db_commit(db, err);
+                if (st != ATLAS_OK) {
+                    atlas_db_rollback(db);
+                }
+            }
+        }
+        /* Restored on every exit path, including the failing ones: a connection
+         * left with foreign keys off is a connection whose next write is
+         * unchecked, and this one goes on to serve the process. */
+        if (m->foreign_keys_off) {
+            atlas_err restore;
+            atlas_err_init(&restore);
+            atlas_status rst = atlas_db_exec_sql(db, "PRAGMA foreign_keys=ON;", &restore);
+            if (rst != ATLAS_OK && st == ATLAS_OK) {
+                return atlas_err_set(err, ATLAS_ERR_DB,
+                                     "migration %d (%s) applied but foreign key enforcement could "
+                                     "not be restored: %s",
+                                     m->version, m->name != NULL ? m->name : "unnamed",
+                                     atlas_err_msg(&restore));
+            }
         }
         if (st != ATLAS_OK) {
-            atlas_db_rollback(db);
             /* Preserve the sqlite message but make the failing migration clear. */
             char detail[ATLAS_ERR_MSG_MAX];
             (void)snprintf(detail, sizeof(detail), "%s", atlas_err_msg(err));
             return atlas_err_set(err, ATLAS_ERR_DB,
                                  "migration %d (%s) failed and was rolled back: %s", m->version,
                                  m->name != NULL ? m->name : "unnamed", detail);
-        }
-        st = atlas_db_commit(db, err);
-        if (st != ATLAS_OK) {
-            atlas_db_rollback(db);
-            return st;
         }
         current = m->version;
     }

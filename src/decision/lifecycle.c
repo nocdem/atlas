@@ -73,6 +73,7 @@ const char *atlas_decision_op_kind_name(atlas_decision_op_kind k) {
     case ATLAS_DECISION_OP_PROMOTE: return "promote";
     case ATLAS_DECISION_OP_REVALIDATE: return "revalidate";
     case ATLAS_DECISION_OP_EDGE_NOTE: return "edge note";
+    case ATLAS_DECISION_OP_RESOLVE: return "resolve";
     }
     return "propose";
 }
@@ -82,7 +83,8 @@ bool atlas_decision_op_needs_challenge(atlas_decision_op_kind k) {
      * so that adding an operation kind forces a decision about it here instead
      * of defaulting it into the unauthenticated set. */
     return k == ATLAS_DECISION_OP_APPROVE || k == ATLAS_DECISION_OP_REJECT ||
-           k == ATLAS_DECISION_OP_SUPERSEDE || k == ATLAS_DECISION_OP_REVALIDATE;
+           k == ATLAS_DECISION_OP_SUPERSEDE || k == ATLAS_DECISION_OP_REVALIDATE ||
+           k == ATLAS_DECISION_OP_RESOLVE;
 }
 
 void atlas_decision_op_init(atlas_decision_op *op, atlas_decision_op_kind kind) {
@@ -570,8 +572,13 @@ static atlas_status op_propose(apply_ctx *ac, const atlas_decision_op *op,
     int64_t document_id = 0;
     char uid[ATLAS_DECISION_UID_MAX];
     if (st == ATLAS_OK) {
-        st = atlas_db_decision_document_create(ac->db, ac->repo.id, ac->root_hash, ac->now,
-                                               &document_id, uid, sizeof(uid), err);
+        /* A9.1: the kind is decided here, once, and written by the INSERT that
+         * creates the document. `op->knowledge_kind` is DECISION unless a caller
+         * asked for something else, which is what makes every client written
+         * before this vocabulary existed keep working unchanged. */
+        st = atlas_db_decision_document_create(ac->db, ac->repo.id, ac->root_hash,
+                                               op->knowledge_kind, ac->now, &document_id, uid,
+                                               sizeof(uid), err);
     }
     if (st == ATLAS_OK) {
         st = atlas_buf_set_str(&out->uid, uid, err);
@@ -579,6 +586,7 @@ static atlas_status op_propose(apply_ctx *ac, const atlas_decision_op *op,
     if (st == ATLAS_OK) {
         out->document_id = document_id;
         out->document_created = true;
+        out->knowledge_kind = op->knowledge_kind;
         st = write_revision(ac, op, &rev, document_id, 1, out, err);
     }
     atlas_decision_revision_free(&rev);
@@ -776,6 +784,34 @@ static atlas_status op_revise(apply_ctx *ac, const atlas_decision_op *op,
     if (doc_repo != ac->repo.id) {
         return atlas_err_set(err, ATLAS_ERR_USAGE,
                              "that decision belongs to a different repository");
+    }
+
+    /* **A9.1: a revision cannot reclassify a document.**
+     *
+     * The kind is a property of the durable record, so "revise it into an
+     * invariant" is a request to change what a record has always been, and the
+     * honest form of that is a new record of the right kind that supersedes this
+     * one — which keeps the history of how the knowledge used to be classified
+     * instead of quietly rewriting it.
+     *
+     * A caller that said nothing is not asserting DECISION: `knowledge_kind_given`
+     * is what separates the two, so a client that has never heard of kinds can
+     * still revise a POLICY. */
+    {
+        atlas_decision_kind kind = ATLAS_DECISION_KIND_DECISION;
+        bool kfound = false;
+        st = atlas_db_decision_kind_of(ac->db, document_id, &kind, &kfound, err);
+        if (st != ATLAS_OK) {
+            return st;
+        }
+        if (op->knowledge_kind_given && op->knowledge_kind != kind) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "this record's kind is %s and a revision cannot change that; "
+                                 "propose a record of kind %s and supersede this one with it",
+                                 atlas_decision_kind_name(kind),
+                                 atlas_decision_kind_name(op->knowledge_kind));
+        }
+        out->knowledge_kind = kind;
     }
 
     int64_t last_id = 0, last_no = 0;
@@ -1030,6 +1066,40 @@ static atlas_status op_challenge(apply_ctx *ac, const atlas_decision_op *op,
                        c.evidence_digest);
     }
 
+    /* --- A9.1: what a resolution capability additionally requires -------------
+     *
+     * The revision must be approved and the document's kind must be one whose
+     * approved form makes a demand. Both are checked here, at issue, as well as
+     * at the write point — for the reason the supersede replacement is checked
+     * twice: an operator learns at the prompt that the operation is meaningless
+     * for this record, rather than after typing a confirmation. The write point
+     * is still the guarantee. */
+    {
+        atlas_decision_kind kind = ATLAS_DECISION_KIND_DECISION;
+        bool kfound = false;
+        st = atlas_db_decision_kind_of(ac->db, document_id, &kind, &kfound, err);
+        if (st != ATLAS_OK) {
+            return st;
+        }
+        out->knowledge_kind = kind;
+        if (c.intent == ATLAS_DECISION_INTENT_RESOLVE) {
+            if (strcmp(state, "APPROVED") != 0) {
+                return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                     "only an approved revision can be resolved; revision %lld is "
+                                     "%s",
+                                     (long long)rev_no, state);
+            }
+            if (!atlas_decision_kind_resolvable(kind)) {
+                return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                     "a record of kind %s cannot be resolved: resolving records "
+                                     "that the demand a record made has been met, and this kind "
+                                     "makes none. Supersede it with a record that replaces it "
+                                     "instead",
+                                     atlas_decision_kind_name(kind));
+            }
+        }
+    }
+
     int64_t cid = 0;
     st = atlas_db_decision_challenge_insert(ac->db, &c, &cid, err);
     if (st != ATLAS_OK) {
@@ -1181,17 +1251,28 @@ static atlas_status spend_challenge(apply_ctx *ac, const atlas_decision_op *op,
  * that case — the document is still PROPOSED, not REJECTED.
  *
  * The precedence is the replay's: a document-level supersession is the
- * strongest fact, then an effective revision, then an outstanding proposal, and
- * only a document with nothing left is REJECTED. */
+ * strongest fact, then an effective revision, then an outstanding proposal, then
+ * a resolved one, and only a document with nothing left is REJECTED. The order
+ * is the same one `atlas_db_decision_verify` uses, and it has to be.
+ *
+ * The approved revision is **derived** rather than read from the cache this
+ * function exists to write. It used to be read from `current_revision_id`, which
+ * worked only because no operation could invalidate it — resolving one can: the
+ * revision leaves APPROVED while the document still points at it, so a
+ * recomputation that trusted the pointer would report a discharged obligation as
+ * effective for ever. The partial unique index over `state = 'APPROVED'` is what
+ * makes the derivation a seek that cannot return two answers. */
 static atlas_status recompute_status(apply_ctx *ac, int64_t document_id, atlas_err *err) {
     int64_t current = 0;
-    atlas_status st = atlas_db_decision_current_revision(ac->db, document_id, &current, err);
+    atlas_status st = atlas_db_decision_approved_revision(ac->db, document_id, &current, err);
     if (st != ATLAS_OK) {
         return st;
     }
     int64_t superseded_by = 0;
     int64_t proposed = 0;
-    st = atlas_db_decision_document_shape(ac->db, document_id, &superseded_by, &proposed, err);
+    int64_t resolved = 0;
+    st = atlas_db_decision_document_shape(ac->db, document_id, &superseded_by, &proposed, &resolved,
+                                          err);
     if (st != ATLAS_OK) {
         return st;
     }
@@ -1202,23 +1283,42 @@ static atlas_status recompute_status(apply_ctx *ac, int64_t document_id, atlas_e
         status = "APPROVED";
     } else if (proposed > 0) {
         status = "PROPOSED";
+    } else if (resolved > 0) {
+        status = "RESOLVED";
     } else {
         status = "REJECTED";
     }
     return atlas_db_decision_document_set_state(ac->db, document_id, current, status, ac->now, err);
 }
 
-/* The conditional transition, plus the cache update that must accompany it. */
+/* The conditional transition, plus the cache update that must accompany it.
+ *
+ * A9.1: the transition table is kind-aware, and the kind it is asked about is
+ * **read from the document** here rather than taken from the operation. A caller
+ * that supplied it could name a resolvable kind for a record that is not one,
+ * and this is the single write point precisely so that no caller gets to
+ * describe the record it is changing. */
 static atlas_status transition(apply_ctx *ac, int64_t document_id, int64_t revision_id,
                                int64_t revision_no, atlas_decision_state from,
                                atlas_decision_state to, atlas_decision_actor actor,
                                int64_t challenge_id, int64_t superseded_by_revision_id,
                                int64_t superseded_by_document_id, const char *detail,
                                const char *content_hash, atlas_err *err) {
-    if (!atlas_decision_transition_allowed(from, to)) {
+    atlas_decision_kind kind = ATLAS_DECISION_KIND_DECISION;
+    bool found = false;
+    atlas_status kst = atlas_db_decision_kind_of(ac->db, document_id, &kind, &found, err);
+    if (kst != ATLAS_OK) {
+        return kst;
+    }
+    if (!found) {
         return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
-                             "a decision revision that is %s cannot become %s",
-                             atlas_decision_state_name(from), atlas_decision_state_name(to));
+                             "that decision document no longer exists, so no transition was made");
+    }
+    if (!atlas_decision_transition_allowed(kind, from, to)) {
+        return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                             "a record of kind %s that is %s cannot become %s",
+                             atlas_decision_kind_name(kind), atlas_decision_state_name(from),
+                             atlas_decision_state_name(to));
     }
     bool changed = false;
     atlas_status st = atlas_db_decision_revision_set_state(
@@ -1347,6 +1447,56 @@ static atlas_status op_reject(apply_ctx *ac, const atlas_decision_op *op,
     out->revision_id = c.revision_id;
     out->revision_no = c.revision_no;
     out->state = ATLAS_DECISION_REJECTED;
+    (void)snprintf(out->content_hash, sizeof(out->content_hash), "%s", c.content_hash);
+    return atlas_db_decision_uid_of(ac->db, c.document_id, &out->uid, err);
+}
+
+/* A9.1. Close out an approved record whose demand has been met.
+ *
+ * It is `op_reject`'s shape rather than `op_supersede`'s, and that is the design:
+ * nothing replaces the record, nothing is deleted, no prose is rewritten, no
+ * second document is named, and no `superseded_by_document_id` is set — because
+ * a resolved obligation was not replaced by anything. What changes is one
+ * revision's state and one ledger row, and the document stops being effective.
+ *
+ * The kind check is in `transition`, which reads the kind from the document
+ * rather than from this operation, and in `op_challenge`, which refuses to mint
+ * a capability for a record the operation is meaningless for. Two checks, one
+ * authority: the write point. */
+static atlas_status op_resolve(apply_ctx *ac, const atlas_decision_op *op,
+                               atlas_decision_result *out, atlas_err *err) {
+    atlas_decision_challenge c;
+    atlas_decision_challenge_init(&c);
+    atlas_status st = spend_challenge(ac, op, ATLAS_DECISION_INTENT_RESOLVE, &c, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    st = transition(ac, c.document_id, c.revision_id, c.revision_no, ATLAS_DECISION_APPROVED,
+                    ATLAS_DECISION_RESOLVED, ATLAS_DECISION_ACTOR_LOCAL_OPERATOR_CONFIRMED, c.id, 0,
+                    0,
+                    "the demand this record made was recorded as met through the Atlas local "
+                    "operator channel; this records that the channel was used, not which person "
+                    "used it",
+                    c.content_hash, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    /* Recomputed rather than assigned, for the reason rejection recomputes: a
+     * document with another revision still outstanding is PROPOSED, not
+     * RESOLVED, and deciding that here would disagree with the ledger replay. */
+    st = recompute_status(ac, c.document_id, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    bool kfound = false;
+    st = atlas_db_decision_kind_of(ac->db, c.document_id, &out->knowledge_kind, &kfound, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    out->document_id = c.document_id;
+    out->revision_id = c.revision_id;
+    out->revision_no = c.revision_no;
+    out->state = ATLAS_DECISION_RESOLVED;
     (void)snprintf(out->content_hash, sizeof(out->content_hash), "%s", c.content_hash);
     return atlas_db_decision_uid_of(ac->db, c.document_id, &out->uid, err);
 }
@@ -1570,9 +1720,17 @@ static atlas_status op_promote(apply_ctx *ac, const atlas_decision_op *op,
      * most damaging thing this phase could do. */
     int64_t document_id = 0;
     char uid[ATLAS_DECISION_UID_MAX];
-    st = atlas_db_decision_document_create(ac->db, ac->repo.id, ac->root_hash, ac->now,
-                                           &document_id, uid, sizeof(uid), err);
+    /* A9.1: a promoted A2 proposal is a DECISION, and the caller's kind is not
+     * consulted. An `ai_decisions` row was written when Atlas had exactly one
+     * semantic category, so `DECISION` is the only classification the source
+     * evidence supports — inferring a richer one from prose would be Atlas
+     * deciding what somebody meant. Reclassifying afterwards is the supersede
+     * path, like every other reclassification. */
+    st = atlas_db_decision_document_create(ac->db, ac->repo.id, ac->root_hash,
+                                           ATLAS_DECISION_KIND_DECISION, ac->now, &document_id, uid,
+                                           sizeof(uid), err);
     if (st == ATLAS_OK) {
+        out->knowledge_kind = ATLAS_DECISION_KIND_DECISION;
         st = atlas_buf_set_str(&out->uid, uid, err);
     }
     if (st == ATLAS_OK) {
@@ -1677,6 +1835,7 @@ atlas_status atlas_decision_apply_in_tx(atlas_db *db, const atlas_decision_op *o
         case ATLAS_DECISION_OP_PROMOTE: st = op_promote(&ac, op, out, err); break;
         case ATLAS_DECISION_OP_REVALIDATE: st = op_revalidate(&ac, op, out, err); break;
         case ATLAS_DECISION_OP_EDGE_NOTE: st = op_edge_note(&ac, op, out, err); break;
+        case ATLAS_DECISION_OP_RESOLVE: st = op_resolve(&ac, op, out, err); break;
         }
     }
     atlas_repo_info_free(&ac.repo);

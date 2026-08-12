@@ -971,6 +971,9 @@ static void test_the_earlier_protections_are_intact(void) {
         "atlas_repo_add",       "atlas_repo_remove",   "atlas_repo_ensure",
         "atlas_decision_approve", "atlas_decision_reject", "atlas_decision_supersede",
         "atlas_decision_revalidate", "atlas_sem_index",  "atlas_code_index",
+        /* A9.1: resolving is a lifecycle act through the operator channel, so no
+         * tool spells it — and nothing may set a record's kind after creation. */
+        "atlas_decision_resolve", "atlas_resolve_decision", "atlas_decision_set_kind",
         "atlas_backup_create",  "atlas_backup_restore", "atlas_maintenance_prune",
     };
 

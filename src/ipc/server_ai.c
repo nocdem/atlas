@@ -898,7 +898,8 @@ static atlas_status method_context(dispatch_state *ds, const atlas_ipc_request *
         if (st == ATLAS_OK) {
             st = atlas_db_decision_repo_counts(ds->db, info.id, &c.proposed_decisions,
                                                &c.approved_decisions, &c.rejected_decisions,
-                                               &c.superseded_decisions, err);
+                                               &c.superseded_decisions, &c.resolved_decisions,
+                                               err);
         }
         if (st == ATLAS_OK) {
             st = atlas_db_decision_review_count(ds->db, info.id, &c.decisions_needing_review, err);

@@ -535,6 +535,11 @@ atlas_status atlas_service_diff_repo(const atlas_repo_info *info, const atlas_di
 typedef struct atlas_decision_summary {
     atlas_buf uid;
     atlas_buf status;
+    /* A9.1. Which sort of knowledge record this is, from the closed
+     * `atlas_decision_kind` vocabulary. Carried beside `status` and never folded
+     * into it: a reader has to be able to tell an approved invariant from an
+     * approved accepted risk, and one field cannot say both. */
+    atlas_buf kind;
     atlas_buf revision_state;
     atlas_buf title;
     atlas_buf content_hash;
@@ -550,12 +555,19 @@ typedef struct atlas_decision_summary {
 void atlas_decision_summary_init(atlas_decision_summary *s);
 void atlas_decision_summary_free(atlas_decision_summary *s);
 
-/* The counts a listing reports alongside its page. */
+/* The counts a listing reports alongside its page.
+ *
+ * Two axes, counted separately rather than cross-tabulated: five states and
+ * eight kinds is forty numbers, and every caller wants one axis at a time. */
 typedef struct atlas_decision_counts {
     int64_t proposed;
     int64_t approved;
     int64_t rejected;
     int64_t superseded;
+    int64_t resolved;
+    /* Indexed by `atlas_decision_kind`, so `by_kind[ATLAS_DECISION_KIND_OBLIGATION]`
+     * is the obligation count whatever order a query returned rows in. */
+    int64_t by_kind[ATLAS_DECISION_KIND_MAX];
 } atlas_decision_counts;
 
 /* One resolved link, ready to render. */
@@ -632,6 +644,10 @@ typedef struct atlas_decision_outcome {
     atlas_buf repo;
     atlas_buf uid;
     atlas_buf state;
+    /* A9.1. The record's kind, echoed by every write so a caller that proposed
+     * without naming one is told what it created rather than having to read the
+     * record back. Beside `state`, never folded into it. */
+    atlas_buf kind;
     atlas_buf replaced_by;
     atlas_buf unbound_reason;
     char content_hash[ATLAS_SHA256_HEX_LEN + 1u];
@@ -664,6 +680,10 @@ typedef struct atlas_decision_input {
     const char *rationale_text;
     const char *consequences_text;
     const char *scope;
+    /* A9.1. The knowledge kind, or NULL for "the caller said nothing" — which
+     * means DECISION on a propose and "do not check" on a revise. An
+     * unrecognised name is a usage error rather than a silent default. */
+    const char *kind;
     const char *const *alternatives;
     size_t alternative_count;
     const char *const *paths;
@@ -699,6 +719,11 @@ typedef struct atlas_decision_list_opts {
     const char *status; /* LIST_STATUS */
     const char *query;  /* LIST_SEARCH */
     const char *path;   /* LIST_PATH, in the safe text encoding */
+    /* A9.1. An optional knowledge-kind filter, honoured in every mode, NULL for
+     * any. It is not a mode of its own: filtering by kind is orthogonal to
+     * filtering by status, by text and by path, so making it a mode would have
+     * made "approved invariants" inexpressible. */
+    const char *kind;
     int64_t limit;
 } atlas_decision_list_opts;
 

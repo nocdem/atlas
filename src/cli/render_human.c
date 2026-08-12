@@ -1071,9 +1071,16 @@ static atlas_status h_decision_item(atlas_renderer *r, const atlas_decision_summ
                                     atlas_err *err) {
     (void)err;
     r->items++;
-    (void)fprintf(r->out, "  %-26s  %-10s  rev %" PRId64 "/%" PRId64 "  %s\n",
-                  atlas_buf_cstr(&s->uid), atlas_buf_cstr(&s->status), s->revision_no,
-                  s->latest_revision_no, atlas_buf_cstr(&s->title));
+    /* A9.1: kind and status are two columns, never one badge.
+     *
+     * The whole point of the dimension is that a reader can tell an approved
+     * invariant from an approved accepted risk at a glance, so they get their own
+     * fields with their own widths, in a fixed order — kind first, because it
+     * says what the record *is* and the status says how far through the workflow
+     * it got. */
+    (void)fprintf(r->out, "  %-26s  %-20s  %-10s  rev %" PRId64 "/%" PRId64 "  %s\n",
+                  atlas_buf_cstr(&s->uid), dash(&s->kind), atlas_buf_cstr(&s->status),
+                  s->revision_no, s->latest_revision_no, atlas_buf_cstr(&s->title));
     if (s->superseded_by.len > 0) {
         (void)fprintf(r->out, "      superseded by %s\n", atlas_buf_cstr(&s->superseded_by));
     }
@@ -1104,6 +1111,7 @@ static atlas_status h_decision_show(atlas_renderer *r, const atlas_decision_docu
     const atlas_decision_summary *s = &d->summary;
     (void)fprintf(r->out, "decision:     %s\n", atlas_buf_cstr(&s->uid));
     (void)fprintf(r->out, "repository:   %s\n", atlas_buf_cstr(&d->repo));
+    (void)fprintf(r->out, "kind:         %s\n", dash(&s->kind));
     (void)fprintf(r->out, "status:       %s\n", atlas_buf_cstr(&s->status));
     (void)fprintf(r->out, "revision:     %" PRId64 " of %" PRId64 " (%s)\n", s->revision_no,
                   s->latest_revision_no, dash(&s->revision_state));
@@ -1230,6 +1238,11 @@ static atlas_status h_decision_outcome(atlas_renderer *r, const atlas_decision_o
     (void)fprintf(r->out, "decision:     %s\n", atlas_buf_cstr(&o->uid));
     (void)fprintf(r->out, "repository:   %s\n", atlas_buf_cstr(&o->repo));
     (void)fprintf(r->out, "revision:     %" PRId64 "\n", o->revision_no);
+    /* A9.1: kind before state, so what was created is legible before how far
+     * through the workflow it is. */
+    if (o->kind.len > 0) {
+        (void)fprintf(r->out, "kind:         %s\n", atlas_buf_cstr(&o->kind));
+    }
     (void)fprintf(r->out, "state:        %s\n", atlas_buf_cstr(&o->state));
     (void)fprintf(r->out, "content hash: %s\n", o->content_hash);
     if (o->duplicate) {
@@ -1270,9 +1283,25 @@ static atlas_status h_decision_counts(atlas_renderer *r, const atlas_decision_co
                                       atlas_err *err) {
     (void)err;
     (void)fprintf(r->out,
-                  "\ntotals: %" PRId64 " proposed, %" PRId64 " approved, %" PRId64
-                  " rejected, %" PRId64 " superseded\n",
-                  c->proposed, c->approved, c->rejected, c->superseded);
+                  "\nby status: %" PRId64 " proposed, %" PRId64 " approved, %" PRId64
+                  " rejected, %" PRId64 " superseded, %" PRId64 " resolved\n",
+                  c->proposed, c->approved, c->rejected, c->superseded, c->resolved);
+    /* A9.1: the second axis, on its own line, and only the kinds that are
+     * actually present. Printing eight zeroes on a repository that has never
+     * classified anything would bury the one number that matters. */
+    bool any = false;
+    for (size_t i = 0; i < atlas_decision_kind_count(); i++) {
+        atlas_decision_kind k = atlas_decision_kind_at(i);
+        if (c->by_kind[(size_t)k] == 0) {
+            continue;
+        }
+        (void)fprintf(r->out, "%s %" PRId64 " %s", any ? "," : "by kind:", c->by_kind[(size_t)k],
+                      atlas_decision_kind_name(k));
+        any = true;
+    }
+    if (any) {
+        (void)fprintf(r->out, "\n");
+    }
     return ok();
 }
 
@@ -1862,9 +1891,23 @@ static atlas_status h_sem_context(atlas_renderer *r, const atlas_sem_context_rep
     for (size_t i = 0; i < rep->count; i++) {
         const atlas_sem_item *it = &rep->items[i];
         (void)fprintf(o, "%-9s %-10s %s", it->evidence, it->kind, atlas_safe(&r->safe, it->name));
+        /* A9.1. A knowledge record leads with `[KIND · STATUS]`, in that order and
+         * with both words present, so an approved invariant and an approved
+         * accepted risk are two visibly different lines. */
+        if (it->knowledge_kind[0] != '\0') {
+            (void)fprintf(o, "  [%s · %s]", it->knowledge_kind,
+                          it->knowledge_status[0] != '\0' ? it->knowledge_status : "UNKNOWN");
+        }
         if (it->file_text[0] != '\0' && strcmp(it->file_text, it->name) != 0) {
-            (void)fprintf(o, "  %s:%lld", atlas_safe(&r->safe, it->file_text),
-                          (long long)it->line);
+            /* A line of 0 means Atlas does not know one — a knowledge record has
+             * no line at all — so it is omitted rather than printed as `:0`,
+             * which reads as the first line of the file. */
+            if (it->line > 0) {
+                (void)fprintf(o, "  %s:%lld", atlas_safe(&r->safe, it->file_text),
+                              (long long)it->line);
+            } else {
+                (void)fprintf(o, "  %s", atlas_safe(&r->safe, it->file_text));
+            }
         }
         (void)fprintf(o, "\n                     %s\n", it->why != NULL ? it->why : "");
     }

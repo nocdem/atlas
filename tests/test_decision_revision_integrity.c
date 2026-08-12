@@ -444,8 +444,92 @@ static void test_local_socket_revise_equivalence(void) {
     fx_close(&e.fx);
 }
 
+/* A9.1. Every read surface reports the kind the record was created with — through
+ * the binary, over the socket, because that is the layer the defect was in.
+ *
+ * The defect: `decision list` reported the kind correctly and `decision show`
+ * reported nothing, because the show path copies the summary field by field into
+ * a second struct and the new field had not been added to the copy. Both paths
+ * read the same row and the same projection, so a database-level test could not
+ * see it — and `decision export`, which reads the show path, was printing
+ * `DECISION` for an ACCEPTED_RISK. A confident wrong classification is worse than
+ * no classification, which is the whole reason this suite compares what came back
+ * with what went in rather than checking that a command exited zero. */
+static void test_every_read_surface_reports_the_kind(void) {
+    env e;
+    env_open(&e);
+    char uid[64];
+    {
+        /* A path link, so the `for-file` case below has something to find. */
+        const char *extra[] = {"--kind", "ACCEPTED_RISK", "--path", "one.c"};
+        propose(&e, "an accepted risk", BODY_ONE, uid, sizeof uid, extra, 4u);
+    }
+
+    /* propose echoes it. */
+    atlas_buf j = ATLAS_BUF_INIT;
+    {
+        const char *args[] = {"--json",         "decision", "propose",   "proj",
+                              "--title",        "a second risk",
+                              "--decision",     "another body",
+                              "--kind",         "ACCEPTED_RISK"};
+        T_REQUIRE(run_remote(&e, args, 10u, &j) == 0);
+        T_REQUIRE_MSG(strstr(atlas_buf_cstr(&j), "\"kind\":\"ACCEPTED_RISK\"") != NULL,
+                      "propose did not echo the kind: %s", atlas_buf_cstr(&j));
+    }
+    atlas_buf_free(&j);
+
+    /* list, show and for-file all report it, and none of them says DECISION. */
+    static const char *const CASES[][6] = {
+        {"--json", "decision", "list", "proj", NULL, NULL},
+        {"--json", "decision", "show", "proj", NULL /* uid */, NULL},
+        {"--json", "decision", "for-file", "proj", "one.c", NULL},
+    };
+    static const size_t NARGS[] = {4u, 5u, 5u};
+    for (size_t i = 0; i < sizeof CASES / sizeof CASES[0]; i++) {
+        const char *args[6];
+        for (size_t k = 0; k < NARGS[i]; k++) {
+            args[k] = CASES[i][k] != NULL ? CASES[i][k] : uid;
+        }
+        atlas_buf out = ATLAS_BUF_INIT;
+        T_REQUIRE(run_remote(&e, args, NARGS[i], &out) == 0);
+        T_CHECK_MSG(strstr(atlas_buf_cstr(&out), "\"kind\":\"ACCEPTED_RISK\"") != NULL,
+                    "%s did not report the kind: %s", CASES[i][2], atlas_buf_cstr(&out));
+        T_CHECK_MSG(strstr(atlas_buf_cstr(&out), "\"kind\":\"DECISION\"") == NULL,
+                    "%s reported the wrong kind: %s", CASES[i][2], atlas_buf_cstr(&out));
+        T_CHECK_MSG(strstr(atlas_buf_cstr(&out), "\"kind\":\"\"") == NULL,
+                    "%s reported an empty kind: %s", CASES[i][2], atlas_buf_cstr(&out));
+        atlas_buf_free(&out);
+    }
+
+    /* And the Markdown export, which reads the show path. */
+    {
+        atlas_buf md = ATLAS_BUF_INIT;
+        const char *args[] = {"decision", "export", "proj", uid, "--format", "markdown"};
+        T_REQUIRE(run_remote(&e, args, 6u, &md) == 0);
+        T_CHECK_MSG(strstr(atlas_buf_cstr(&md), "- kind: **ACCEPTED_RISK**") != NULL,
+                    "the export did not name the kind: %s", atlas_buf_cstr(&md));
+        T_CHECK_MSG(strstr(atlas_buf_cstr(&md), "**DECISION**") == NULL,
+                    "the export claimed the wrong kind: %s", atlas_buf_cstr(&md));
+        atlas_buf_free(&md);
+    }
+
+    /* A record proposed without a kind reads as DECISION, everywhere. */
+    char plain[64];
+    propose(&e, "no kind was named", "an ordinary decision", plain, sizeof plain, NULL, 0);
+    {
+        atlas_buf out = ATLAS_BUF_INIT;
+        const char *args[] = {"--json", "decision", "show", "proj", plain};
+        T_REQUIRE(run_remote(&e, args, 5u, &out) == 0);
+        T_CHECK_MSG(strstr(atlas_buf_cstr(&out), "\"kind\":\"DECISION\"") != NULL,
+                    "an unclassified record did not read as DECISION: %s", atlas_buf_cstr(&out));
+        atlas_buf_free(&out);
+    }
+    env_close(&e);
+}
+
 static const atlas_test TESTS[] = {
     {"a proposed body is stored, and is not the uid", test_propose_body_is_not_the_uid},
+    {"every read surface reports the kind", test_every_read_surface_reports_the_kind},
     {"a revise stores its body and leaves revision 1 alone", test_revise_stores_the_body},
     {"link add changes links and preserves all content", test_link_add_preserves_content},
     {"an exact link set replaces links in one revision", test_exact_link_set_replacement},

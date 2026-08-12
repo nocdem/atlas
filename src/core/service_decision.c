@@ -41,6 +41,7 @@ void atlas_decision_summary_init(atlas_decision_summary *s) {
     memset(s, 0, sizeof(*s));
     atlas_buf_init(&s->uid);
     atlas_buf_init(&s->status);
+    atlas_buf_init(&s->kind);
     atlas_buf_init(&s->revision_state);
     atlas_buf_init(&s->title);
     atlas_buf_init(&s->content_hash);
@@ -56,6 +57,7 @@ void atlas_decision_summary_free(atlas_decision_summary *s) {
     }
     atlas_buf_free(&s->uid);
     atlas_buf_free(&s->status);
+    atlas_buf_free(&s->kind);
     atlas_buf_free(&s->revision_state);
     atlas_buf_free(&s->title);
     atlas_buf_free(&s->content_hash);
@@ -135,6 +137,7 @@ void atlas_decision_outcome_init(atlas_decision_outcome *o) {
     atlas_buf_init(&o->repo);
     atlas_buf_init(&o->uid);
     atlas_buf_init(&o->state);
+    atlas_buf_init(&o->kind);
     atlas_buf_init(&o->replaced_by);
     atlas_buf_init(&o->unbound_reason);
 }
@@ -145,6 +148,7 @@ void atlas_decision_outcome_free(atlas_decision_outcome *o) {
     }
     atlas_buf_free(&o->repo);
     atlas_buf_free(&o->uid);
+    atlas_buf_free(&o->kind);
     atlas_buf_free(&o->state);
     atlas_buf_free(&o->replaced_by);
     atlas_buf_free(&o->unbound_reason);
@@ -169,6 +173,9 @@ static atlas_status fill_summary(list_state *ls, const atlas_decision_doc_row *r
     } fields[] = {
         {&s->uid, row->uid, false},
         {&s->status, row->status, false},
+        /* A closed Atlas vocabulary, so it is not encoded and does not need to
+         * be: no repository byte and no model byte can reach it. */
+        {&s->kind, row->kind, false},
         {&s->revision_state, row->head_state, false},
         {&s->content_hash, row->content_hash, false},
         {&s->proposed_by, row->proposed_by, false},
@@ -234,8 +241,8 @@ atlas_status atlas_service_decision_list(atlas_ctx *ctx, const char *repo,
     atlas_db *db = atlas_ctx_db(ctx);
     switch (opts->mode) {
     case ATLAS_DECISION_LIST_SEARCH:
-        st = atlas_db_decision_search(db, info.id, opts->query, limit, on_doc, &ls, count_out,
-                                      more_out, err);
+        st = atlas_db_decision_search(db, info.id, opts->query, opts->kind, limit, on_doc, &ls,
+                                      count_out, more_out, err);
         break;
     case ATLAS_DECISION_LIST_PATH: {
         /* A path arrives in the safe text encoding and is looked up by raw
@@ -243,25 +250,35 @@ atlas_status atlas_service_decision_list(atlas_ctx *ctx, const char *repo,
         atlas_buf raw = ATLAS_BUF_INIT;
         st = atlas_path_text_decode(opts->path, strlen(opts->path), &raw, err);
         if (st == ATLAS_OK) {
-            st = atlas_db_decision_for_path(db, info.id, raw.data, raw.len, limit, on_doc, &ls,
-                                            count_out, more_out, err);
+            st = atlas_db_decision_for_path(db, info.id, raw.data, raw.len, opts->kind, limit,
+                                            on_doc, &ls, count_out, more_out, err);
         }
         atlas_buf_free(&raw);
         break;
     }
     case ATLAS_DECISION_LIST_STATUS:
-        st = atlas_db_decision_documents_list(db, info.id, opts->status, limit, on_doc, &ls,
-                                              count_out, more_out, err);
+        st = atlas_db_decision_documents_list(db, info.id, opts->status, opts->kind, limit, on_doc,
+                                              &ls, count_out, more_out, err);
         break;
     case ATLAS_DECISION_LIST_ALL:
     default:
-        st = atlas_db_decision_documents_list(db, info.id, NULL, limit, on_doc, &ls, count_out,
-                                              more_out, err);
+        st = atlas_db_decision_documents_list(db, info.id, NULL, opts->kind, limit, on_doc, &ls,
+                                              count_out, more_out, err);
         break;
     }
     if (st == ATLAS_OK) {
         st = atlas_db_decision_repo_counts(db, info.id, &counts->proposed, &counts->approved,
-                                           &counts->rejected, &counts->superseded, err);
+                                           &counts->rejected, &counts->superseded,
+                                           &counts->resolved, err);
+    }
+    if (st == ATLAS_OK) {
+        /* The counts are of the whole repository and are deliberately *not*
+         * narrowed by the filters: they are the denominator a filtered page is
+         * read against, and a total that moved with the filter would answer a
+         * question nobody asked. */
+        st = atlas_db_decision_kind_counts(db, info.id, counts->by_kind,
+                                           sizeof(counts->by_kind) / sizeof(counts->by_kind[0]),
+                                           err);
     }
     atlas_safe_pool_free(&ls.safe);
     atlas_repo_info_free(&info);
@@ -339,6 +356,13 @@ static atlas_status on_doc_header(const atlas_decision_summary *s, void *ud, atl
         const atlas_buf *from;
     } fields[] = {
         {&to->uid, &s->uid},           {&to->status, &s->status},
+        /* A9.1. Copied field by field like everything else here, because this
+         * function is a copy rather than an assignment — the summary owns its
+         * buffers. A field added to `atlas_decision_summary` and not to this
+         * list is silently empty in `decision show` and `decision export` while
+         * `decision list` reports it correctly, which is exactly what the kind
+         * did until the acceptance run caught it. */
+        {&to->kind, &s->kind},
         {&to->revision_state, &s->revision_state}, {&to->title, &s->title},
         {&to->content_hash, &s->content_hash},     {&to->proposed_by, &s->proposed_by},
         {&to->superseded_by, &s->superseded_by},   {&to->created_at, &s->created_at},
@@ -759,6 +783,18 @@ static atlas_status build_op(atlas_ctx *ctx, const char *repo, const char *sourc
         st = atlas_err_set(err, ATLAS_ERR_USAGE,
                            "--scope is UNKNOWN, REPOSITORY, SUBSYSTEM or PATHS");
     }
+    /* A9.1. An unrecognised kind is refused, never defaulted: silently recording
+     * an `INVARIENT` as a DECISION would produce a record classified as something
+     * its author did not ask for, and the whole value of the dimension is that
+     * the label is reliable. */
+    if (st == ATLAS_OK && in->kind != NULL && in->kind[0] != '\0') {
+        if (!atlas_decision_kind_parse(in->kind, &op->knowledge_kind)) {
+            st = atlas_err_set(err, ATLAS_ERR_USAGE, "--kind is one of %s",
+                               atlas_decision_kind_list());
+        } else {
+            op->knowledge_kind_given = true;
+        }
+    }
     if (st == ATLAS_OK && in->dedup_key != NULL) {
         st = atlas_buf_set_str(&op->dedup_key, in->dedup_key, err);
     }
@@ -911,6 +947,9 @@ static atlas_status take_outcome(const atlas_decision_result *r, atlas_decision_
         st = atlas_buf_set_str(&out->state, atlas_decision_state_name(r->state), err);
     }
     if (st == ATLAS_OK) {
+        st = atlas_buf_set_str(&out->kind, atlas_decision_kind_name(r->knowledge_kind), err);
+    }
+    if (st == ATLAS_OK) {
         st = atlas_buf_set(&out->replaced_by, r->replaced_by_uid.data, r->replaced_by_uid.len, err);
     }
     if (st == ATLAS_OK && r->unbound_reason != NULL) {
@@ -943,6 +982,7 @@ static const char *method_for(atlas_decision_op_kind kind) {
     case ATLAS_DECISION_OP_PROMOTE: return "decision.promote";
     case ATLAS_DECISION_OP_REVALIDATE: return "decision.revalidate";
     case ATLAS_DECISION_OP_EDGE_NOTE: return "decision.edge.note";
+    case ATLAS_DECISION_OP_RESOLVE: return "decision.resolve";
     }
     return "decision.propose";
 }
@@ -1032,6 +1072,16 @@ static atlas_status op_to_params(const atlas_decision_op *op, atlas_buf *out, at
     }
     if (st == ATLAS_OK && op->revision.scope != ATLAS_DECISION_SCOPE_UNKNOWN) {
         st = atlas_json_key_str(j, "scope", atlas_decision_scope_name(op->revision.scope), err);
+    }
+    /* A9.1. Sent only when the caller actually named a kind, because the server
+     * distinguishes "asked for DECISION" from "said nothing" and a revise is
+     * refused for the first if the document is something else. Emitting it
+     * unconditionally would make every revise sent over the socket assert a kind
+     * the caller never mentioned — which is the local path and the routed path
+     * disagreeing about the same operation, the defect
+     * `tests/test_decision_edge.c` was written for. */
+    if (st == ATLAS_OK && op->knowledge_kind_given) {
+        st = atlas_json_key_str(j, "kind", atlas_decision_kind_name(op->knowledge_kind), err);
     }
     if (st == ATLAS_OK && op->kind == ATLAS_DECISION_OP_CHALLENGE) {
         st = atlas_json_key_str(j, "intent", atlas_decision_intent_name(op->intent), err);
@@ -1153,6 +1203,19 @@ static atlas_status result_from_response(const atlas_ipc_response *r, atlas_deci
         if (!atlas_decision_state_parse(s, &res->state)) {
             return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
                                  "the Atlas daemon reported a decision state this binary does not "
+                                 "recognise; the two are different versions");
+        }
+    }
+    if (atlas_ipc_result_str(r, "kind", &s) && s != NULL && s[0] != '\0') {
+        /* Parsed against the closed vocabulary with no default, for the reason
+         * `state` is: a kind this binary does not know is a version mismatch, and
+         * must not silently become DECISION — that would report a record as an
+         * ordinary decision when the daemon knows it is an accepted risk. A
+         * daemon older than this client omits the key, and DECISION is then
+         * correct rather than a fallback: that daemon has no other kind. */
+        if (!atlas_decision_kind_parse(s, &res->knowledge_kind)) {
+            return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                                 "the Atlas daemon reported a knowledge kind this binary does not "
                                  "recognise; the two are different versions");
         }
     }
@@ -1449,7 +1512,13 @@ static atlas_status show_prompt(atlas_terminal *t, const char *repo, const char 
         t, err, "\nAtlas decision %s\n  repository : %s\n  decision   : %s\n",
         atlas_decision_intent_name(intent), repo, uid);
     if (st == ATLAS_OK) {
-        st = atlas_terminal_writef(t, err, "  revision   : %lld\n  status     : %s\n",
+        /* A9.1: kind and status on separate lines, because they are separate
+         * facts and the operator is confirming both. Approving an ACCEPTED_RISK
+         * and approving an INVARIANT are different acts, and a prompt that
+         * printed one word for both would hide which one this is. */
+        st = atlas_terminal_writef(t, err,
+                                   "  kind       : %s\n  revision   : %lld\n  status     : %s\n",
+                                   atlas_buf_cstr(&doc->summary.kind),
                                    (long long)doc->summary.revision_no,
                                    atlas_buf_cstr(&doc->summary.status));
     }
@@ -1551,6 +1620,22 @@ static atlas_status show_prompt(atlas_terminal *t, const char *repo, const char 
                 "has moved, and that is the whole of what it is telling you.\n";
             st = atlas_terminal_write(t, WHAT, sizeof(WHAT) - 1u, err);
         }
+    }
+    if (st == ATLAS_OK && intent == ATLAS_DECISION_INTENT_RESOLVE) {
+        /* A9.1. What resolving is and is not, said at the moment it matters.
+         *
+         * The sentence a reader could otherwise supply for themselves — that the
+         * record was wrong, or that it has been withdrawn — is the one Atlas must
+         * not let stand: a discharged obligation was a real obligation, and its
+         * rationale stays readable precisely so the next person can see why the
+         * work was required. */
+        static const char WHAT[] =
+            "\nResolving records that the demand this approved record made has been met. It\n"
+            "does not edit the revision, does not delete anything, and does not say the record\n"
+            "was wrong or withdrawn: what it says is that the record is no longer asking for\n"
+            "anything, so it stops being effective and its history stays intact. Atlas has not\n"
+            "checked that the work was done and cannot — it is recording that you say so.\n";
+        st = atlas_terminal_write(t, WHAT, sizeof(WHAT) - 1u, err);
     }
     if (st == ATLAS_OK) {
         /* Atlas' own statement about what the operator is about to record.
@@ -1705,6 +1790,7 @@ atlas_status atlas_service_decision_confirm(atlas_ctx *ctx, const char *repo, co
         [ATLAS_DECISION_INTENT_REJECT] = ATLAS_DECISION_OP_REJECT,
         [ATLAS_DECISION_INTENT_SUPERSEDE] = ATLAS_DECISION_OP_SUPERSEDE,
         [ATLAS_DECISION_INTENT_REVALIDATE] = ATLAS_DECISION_OP_REVALIDATE,
+        [ATLAS_DECISION_INTENT_RESOLVE] = ATLAS_DECISION_OP_RESOLVE,
     };
     atlas_decision_op *spend = op_new(KIND[intent]);
     if (spend == NULL) {
@@ -1765,6 +1851,15 @@ atlas_status atlas_service_decision_export_markdown(const atlas_decision_documen
     (void)fprintf(out, "# %s\n\n", atlas_buf_cstr(&s->title));
     (void)fprintf(out, "- id: `%s`\n", atlas_buf_cstr(&s->uid));
     (void)fprintf(out, "- repository: `%s`\n", atlas_buf_cstr(&doc->repo));
+    /* A9.1: the kind on its own line, before the status. An export is what
+     * somebody pastes into a review or a wiki, so the two dimensions have to be
+     * as separable there as they are on screen.
+     *
+     * Printed as it arrives, with no fallback. A fallback to `DECISION` was here
+     * for one build and it turned a plumbing bug — the show path was not copying
+     * the field — into a document asserting that an ACCEPTED_RISK was a decision.
+     * An empty value is visible; a confident wrong one is not. */
+    (void)fprintf(out, "- kind: **%s**\n", atlas_buf_cstr(&s->kind));
     (void)fprintf(out, "- status: **%s**\n", atlas_buf_cstr(&s->status));
     (void)fprintf(out, "- revision: %lld of %lld (%s)\n", (long long)s->revision_no,
                   (long long)s->latest_revision_no, atlas_buf_cstr(&s->revision_state));

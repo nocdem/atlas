@@ -244,7 +244,7 @@ fi
 
 capture --json maintenance plan --older-than 30 \
     && check_doc "maintenance plan" --expect command="maintenance plan" \
-                 --expect-raw applied=false --expect-raw prunable_tables=1 --no-control
+                 --expect-raw applied=false --expect-raw prunable_tables=2 --no-control
 if $A maintenance prune --older-than 30 > /dev/null 2>&1; then
     bad "maintenance prune ran without --apply"
 else

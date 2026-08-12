@@ -82,7 +82,7 @@ void atlas_cli_print_help(FILE *out) {
         "  code search NAME QUERY     search indexed symbol names\n"
         "  code deps NAME PATH        what a file depends on\n"
         "  code impact NAME PATH      what may be affected if it changes (candidates, not proof)\n"
-        "  decision list NAME         recorded decisions and their lifecycle status\n"
+        "  decision list NAME         recorded knowledge, its kind and its lifecycle status\n"
         "  decision show NAME ID      one decision in full, with its links' currency\n"
         "  decision search NAME QUERY search recorded decisions\n"
         "  decision history NAME ID   every revision and every lifecycle event\n"
@@ -135,6 +135,8 @@ void atlas_cli_print_help(FILE *out) {
         out,
         "  decision revalidate NAME ID  record that an approved decision was checked\n"
         "                             against the current indexed state; needs a terminal\n"
+        "  decision resolve NAME ID   record that the demand an approved OBLIGATION or\n"
+        "                             ACCEPTED_RISK made has been met. Needs a terminal\n"
         "  gate check NAME            assess every approved decision against the indexed\n"
         "                             state; exits 8 on review required, 9 on blocked\n"
         "  gate show NAME ID          the same assessment, for one decision\n"
@@ -164,7 +166,14 @@ void atlas_cli_print_help(FILE *out) {
         "                             which event it records\n"
         "  --path P --commit OID --symbol-link S --decision-link UID\n"
         "                             decision propose/revise: repeatable links\n"
-        "  --status S                 decision list: PROPOSED|APPROVED|REJECTED|SUPERSEDED\n"
+        "  --status S                 decision list: PROPOSED|APPROVED|REJECTED|SUPERSEDED|\n"
+        "                             RESOLVED. What stage of the approval workflow a record\n"
+        "                             reached; a separate dimension from --kind\n"
+        "  --kind K                   which sort of knowledge record: DECISION (the default)|\n"
+        "                             POLICY|INVARIANT|OPERATIONAL_FACT|ACCEPTED_RISK|\n"
+        "                             OBLIGATION|PARKED|REJECTED_ALTERNATIVE. On propose it\n"
+        "                             says what to create, on list/search/for-file it filters,\n"
+        "                             and a revision can never change it\n"
         "  --revision N               decision show/approve: a specific revision\n"
         "  --at OID                   gate check/show: the exact state to assess\n"
         "  --by ID                    decision supersede: the replacement decision\n"
@@ -384,7 +393,7 @@ static atlas_status parse_args(cli_state *st, int argc, char **argv, bool *want_
                        strcmp(a, "--consequences") == 0 || strcmp(a, "--scope") == 0 ||
                        strcmp(a, "--status") == 0 || strcmp(a, "--by") == 0 ||
                        strcmp(a, "--format") == 0 || strcmp(a, "--dedup-key") == 0 ||
-                       strcmp(a, "--at") == 0) {
+                       strcmp(a, "--at") == 0 || strcmp(a, "--kind") == 0) {
                 /* One arm for every A4 option that takes exactly one value, so
                  * the "a flag at the end of the line has no value" check exists
                  * once rather than ten times. */
@@ -412,6 +421,14 @@ static atlas_status parse_args(cli_state *st, int argc, char **argv, bool *want_
                     st->opts.decision.format = v;
                 } else if (strcmp(a, "--at") == 0) {
                     st->opts.decision.at_commit = v;
+                } else if (strcmp(a, "--kind") == 0) {
+                    /* A9.1. One flag, two jobs, and they cannot be confused:
+                     * on `propose` it says what to create, on `list`, `search`
+                     * and `for-file` it filters. Both are "which kind of
+                     * knowledge are we talking about", which is why one name is
+                     * right — and on `revise` it is an assertion that is
+                     * checked, never applied. */
+                    st->opts.decision.kind = v;
                 } else {
                     st->opts.decision.dedup_key = v;
                 }
@@ -1186,6 +1203,7 @@ static void decision_input_from(const cli_state *st, atlas_decision_input *in) {
     in->rationale_text = st->opts.decision.rationale;
     in->consequences_text = st->opts.decision.consequences;
     in->scope = st->opts.decision.scope;
+    in->kind = st->opts.decision.kind;
     in->alternatives = st->opts.decision.alternatives;
     in->alternative_count = st->opts.decision.alternative_count;
     in->paths = st->opts.decision.paths;
@@ -1281,9 +1299,10 @@ static atlas_status run_gate(cli_state *st, atlas_ctx *ctx, atlas_renderer *r, a
     return result;
 }
 
-/* The three operator-only verbs. One function: they differ by intent and by
- * whether a replacement is required, and three copies of the `--yes` refusal
- * would be three chances for one of them to be missing. */
+/* The operator-only verbs — approve, reject, supersede, revalidate and A9.1's
+ * resolve. One function: they differ by intent and by whether a replacement is
+ * required, and five copies of the `--yes` refusal would be five chances for one
+ * of them to be missing. */
 static atlas_status run_decision_confirm(cli_state *st, atlas_ctx *ctx, atlas_renderer *r,
                                          atlas_decision_intent intent, atlas_err *err) {
     /* **A7: authority before anything else, including argument shape.**
@@ -1304,8 +1323,8 @@ static atlas_status run_decision_confirm(cli_state *st, atlas_ctx *ctx, atlas_re
     if (st->opts.yes) {
         /* Refused, not ignored. */
         return atlas_err_set(err, ATLAS_ERR_USAGE,
-                             "--yes cannot approve, reject or supersede a decision. This command "
-                             "needs an interactive terminal, and Atlas will not accept a "
+                             "--yes cannot approve, reject, supersede or resolve a decision. This "
+                             "command needs an interactive terminal, and Atlas will not accept a "
                              "confirmation from a flag, a pipe, a file or an environment "
                              "variable.");
     }
@@ -1343,7 +1362,8 @@ static atlas_status run_decision(cli_state *st, atlas_ctx *ctx, atlas_renderer *
     if (st->operand_count == 0) {
         return atlas_err_set(err, ATLAS_ERR_USAGE,
                              "usage: atlas decision list|show|search|history|links|for-file|"
-                             "propose|revise|approve|reject|supersede|revalidate|export|orphaned|"
+                             "propose|revise|approve|reject|supersede|revalidate|resolve|export|"
+                             "orphaned|"
                              "legacy|promote ...");
     }
     const char *sub = st->operands[0];
@@ -1354,7 +1374,8 @@ static atlas_status run_decision(cli_state *st, atlas_ctx *ctx, atlas_renderer *
         if (st->operand_count != want) {
             return atlas_err_set(err, ATLAS_ERR_USAGE,
                                  strcmp(sub, "list") == 0
-                                     ? "usage: atlas decision list NAME [--status STATUS]"
+                                     ? "usage: atlas decision list NAME [--status STATUS] "
+                                       "[--kind KIND]"
                                      : (strcmp(sub, "search") == 0
                                             ? "usage: atlas decision search NAME QUERY"
                                             : "usage: atlas decision for-file NAME PATH"));
@@ -1372,17 +1393,34 @@ static atlas_status run_decision(cli_state *st, atlas_ctx *ctx, atlas_renderer *
             atlas_decision_state parsed;
             if (!atlas_decision_state_parse(st->opts.decision.status, &parsed)) {
                 return atlas_err_set(err, ATLAS_ERR_USAGE,
-                                     "--status is PROPOSED, APPROVED, REJECTED or SUPERSEDED");
+                                     "--status is PROPOSED, APPROVED, REJECTED, SUPERSEDED or "
+                                     "RESOLVED");
             }
             opts.mode = ATLAS_DECISION_LIST_STATUS;
             opts.status = st->opts.decision.status;
+        }
+        /* A9.1. The kind filter is orthogonal to the mode, so it is set after the
+         * mode is chosen and applies to all three. Validated here as well as at
+         * the service layer, because a misspelt kind must be a usage error rather
+         * than an empty result that looks like an answer. */
+        if (st->opts.decision.kind != NULL) {
+            atlas_decision_kind parsed;
+            if (!atlas_decision_kind_parse(st->opts.decision.kind, &parsed)) {
+                return atlas_err_set(err, ATLAS_ERR_USAGE, "--kind is one of %s",
+                                     atlas_decision_kind_list());
+            }
+            opts.kind = st->opts.decision.kind;
         }
         result = renderer_open(r, st->opts.json, st->out, "decision", err);
         if (result != ATLAS_OK) {
             return result;
         }
         decision_render dr = {st, r};
+        /* Zeroed here rather than trusted to the callee: the remote path fills
+         * only the counts the daemon actually reported, so an older daemon that
+         * omits one would otherwise have it read from uninitialised stack. */
         atlas_decision_counts counts;
+        memset(&counts, 0, sizeof(counts));
         int64_t count = 0;
         bool more = false;
         result = r->v->note_repo(r, st->operands[1], err);
@@ -1745,6 +1783,12 @@ static atlas_status run_decision(cli_state *st, atlas_ctx *ctx, atlas_renderer *
     if (strcmp(sub, "supersede") == 0) {
         return run_decision_confirm(st, ctx, r, ATLAS_DECISION_INTENT_SUPERSEDE, err);
     }
+    /* A9.1. The same interactive channel as approve, reject, supersede and
+     * revalidate, through the same function, so there is one place a lifecycle
+     * capability is minted and spent and this adds no second path. */
+    if (strcmp(sub, "resolve") == 0) {
+        return run_decision_confirm(st, ctx, r, ATLAS_DECISION_INTENT_RESOLVE, err);
+    }
 
     return atlas_err_set(err, ATLAS_ERR_USAGE, "unknown decision subcommand \"%s\"", sub);
 }
@@ -1853,7 +1897,7 @@ static bool remote_serves(const cli_state *st) {
                strcmp(sub, "propose") == 0 || strcmp(sub, "revise") == 0 ||
                strcmp(sub, "promote") == 0 || strcmp(sub, "approve") == 0 ||
                strcmp(sub, "reject") == 0 || strcmp(sub, "supersede") == 0 ||
-               strcmp(sub, "revalidate") == 0;
+               strcmp(sub, "revalidate") == 0 || strcmp(sub, "resolve") == 0;
     }
     return false;
 }
@@ -1986,6 +2030,37 @@ static atlas_status run_context(cli_state *st, atlas_ctx *ctx, atlas_renderer *r
     req.max_items = st->opts.limit;
     req.include_history = st->opts.history;
 
+    /* A9.1: the seeds the request struct has always had a field for, and which no
+     * command line could reach.
+     *
+     * `atlas_sem_context_req.paths` and `.symbols` are documented as "optional
+     * starting points" and were filled by nothing, so `context build` could only
+     * rank the whole symbol table by the task's words — and on a repository with
+     * no semantic index that is nothing at all. The repeatable `--path` and
+     * `--symbol-link` options were already parsed for `decision propose`, so this
+     * wires them through rather than inventing a second spelling. NUL-separated,
+     * which is the form the field documents. */
+    atlas_buf seed_paths = ATLAS_BUF_INIT;
+    atlas_buf seed_symbols = ATLAS_BUF_INIT;
+    atlas_status seed_st = ATLAS_OK;
+    for (size_t i = 0; seed_st == ATLAS_OK && i < st->opts.decision.path_count; i++) {
+        seed_st = atlas_buf_append(&seed_paths, st->opts.decision.paths[i],
+                                   strlen(st->opts.decision.paths[i]) + 1u, err);
+    }
+    for (size_t i = 0; seed_st == ATLAS_OK && i < st->opts.decision.symbol_count; i++) {
+        seed_st = atlas_buf_append(&seed_symbols, st->opts.decision.symbols[i],
+                                   strlen(st->opts.decision.symbols[i]) + 1u, err);
+    }
+    if (seed_st != ATLAS_OK) {
+        atlas_buf_free(&seed_paths);
+        atlas_buf_free(&seed_symbols);
+        return seed_st;
+    }
+    req.paths = seed_paths.len > 0 ? seed_paths.data : NULL;
+    req.paths_len = seed_paths.len;
+    req.symbols = seed_symbols.len > 0 ? seed_symbols.data : NULL;
+    req.symbols_len = seed_symbols.len;
+
     atlas_sem_context_report rep;
     atlas_sem_context_report_init(&rep);
     atlas_status result = ctx != NULL ? atlas_service_sem_context(ctx, &req, &rep, err)
@@ -1998,6 +2073,8 @@ static atlas_status run_context(cli_state *st, atlas_ctx *ctx, atlas_renderer *r
         result = result == ATLAS_OK ? renderer_close(r, err) : (renderer_abort(r), result);
     }
     atlas_sem_context_report_free(&rep);
+    atlas_buf_free(&seed_paths);
+    atlas_buf_free(&seed_symbols);
     return result;
 }
 

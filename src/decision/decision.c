@@ -30,6 +30,7 @@ const char *atlas_decision_state_name(atlas_decision_state s) {
     case ATLAS_DECISION_APPROVED: return "APPROVED";
     case ATLAS_DECISION_REJECTED: return "REJECTED";
     case ATLAS_DECISION_SUPERSEDED: return "SUPERSEDED";
+    case ATLAS_DECISION_RESOLVED: return "RESOLVED";
     }
     return "PROPOSED";
 }
@@ -46,6 +47,7 @@ bool atlas_decision_state_parse(const char *name, atlas_decision_state *out) {
         {"APPROVED", ATLAS_DECISION_APPROVED},
         {"REJECTED", ATLAS_DECISION_REJECTED},
         {"SUPERSEDED", ATLAS_DECISION_SUPERSEDED},
+        {"RESOLVED", ATLAS_DECISION_RESOLVED},
     };
     for (size_t i = 0; i < sizeof(TABLE) / sizeof(TABLE[0]); i++) {
         if (strcmp(name, TABLE[i].name) == 0) {
@@ -56,32 +58,154 @@ bool atlas_decision_state_parse(const char *name, atlas_decision_state *out) {
     return false;
 }
 
+/* --- knowledge kinds (A9.1) ------------------------------------------------
+ *
+ * One row per kind, carrying the name, one fixed sentence of meaning, and the
+ * single lifecycle consequence a kind has. Everything else about a kind is
+ * reporting, which is the point: the classification tells a reader how to treat
+ * a record and tells Atlas almost nothing.
+ *
+ * `resolvable` is the whole of the kind's authority over the lifecycle. It is
+ * true exactly where an approved record makes a demand that can be discharged,
+ * and false everywhere else because "this invariant has been resolved" is not a
+ * sentence with a meaning. */
+static const struct kind_row {
+    atlas_decision_kind value;
+    const char *name;
+    bool resolvable;
+    const char *description;
+} KINDS[] = {
+    {ATLAS_DECISION_KIND_DECISION, "DECISION", false,
+     "a choice between alternatives that establishes project direction or architecture"},
+    {ATLAS_DECISION_KIND_POLICY, "POLICY", false,
+     "a rule governing development, release, operation or process"},
+    {ATLAS_DECISION_KIND_INVARIANT, "INVARIANT", false,
+     "a technical property implementations must preserve"},
+    {ATLAS_DECISION_KIND_OPERATIONAL_FACT, "OPERATIONAL_FACT", false,
+     "a mutable, environment-specific fact about what is currently deployed or relevant; it "
+     "carries no architectural permanence and is replaced by superseding it"},
+    {ATLAS_DECISION_KIND_ACCEPTED_RISK, "ACCEPTED_RISK", true,
+     "a risk that has been explicitly accepted; a proposed one is a risk somebody recorded and "
+     "nobody accepted, and acceptance is the ordinary approval"},
+    {ATLAS_DECISION_KIND_OBLIGATION, "OBLIGATION", true,
+     "required future work: a remediation, a blocker or a release gate"},
+    {ATLAS_DECISION_KIND_PARKED, "PARKED", false,
+     "work or architecture intentionally deferred and not currently active; parked is not "
+     "rejected"},
+    {ATLAS_DECISION_KIND_REJECTED_ALTERNATIVE, "REJECTED_ALTERNATIVE", false,
+     "an approach considered or built and deliberately rejected, recorded with why so it is not "
+     "retried without new evidence"},
+};
+
+/* The array bound callers use and the table are the same length, checked here
+ * rather than trusted: a kind added to the enum and to KINDS[] but not to the
+ * bound would silently write past every `by_kind[]` array in Atlas. */
+_Static_assert(sizeof(KINDS) / sizeof(KINDS[0]) == ATLAS_DECISION_KIND_MAX,
+               "ATLAS_DECISION_KIND_MAX must equal the number of rows in KINDS[]");
+
+static const struct kind_row *kind_row_of(atlas_decision_kind k) {
+    for (size_t i = 0; i < sizeof(KINDS) / sizeof(KINDS[0]); i++) {
+        if (KINDS[i].value == k) {
+            return &KINDS[i];
+        }
+    }
+    return NULL;
+}
+
+const char *atlas_decision_kind_name(atlas_decision_kind k) {
+    const struct kind_row *row = kind_row_of(k);
+    /* A member with no row falls back to the default rather than to a
+     * placeholder, because DECISION is what an unset kind means everywhere else
+     * in Atlas. `tests/test_decision_kind.c` asserts every member has a row, so
+     * this path is unreachable rather than merely unlikely. */
+    return row != NULL ? row->name : "DECISION";
+}
+
+bool atlas_decision_kind_parse(const char *name, atlas_decision_kind *out) {
+    if (name == NULL || out == NULL) {
+        return false;
+    }
+    for (size_t i = 0; i < sizeof(KINDS) / sizeof(KINDS[0]); i++) {
+        if (strcmp(name, KINDS[i].name) == 0) {
+            *out = KINDS[i].value;
+            return true;
+        }
+    }
+    return false;
+}
+
+const char *atlas_decision_kind_description(atlas_decision_kind k) {
+    const struct kind_row *row = kind_row_of(k);
+    return row != NULL ? row->description : KINDS[0].description;
+}
+
+size_t atlas_decision_kind_count(void) {
+    return sizeof(KINDS) / sizeof(KINDS[0]);
+}
+
+atlas_decision_kind atlas_decision_kind_at(size_t index) {
+    if (index >= sizeof(KINDS) / sizeof(KINDS[0])) {
+        return ATLAS_DECISION_KIND_DECISION;
+    }
+    return KINDS[index].value;
+}
+
+const char *atlas_decision_kind_list(void) {
+    return "DECISION, POLICY, INVARIANT, OPERATIONAL_FACT, ACCEPTED_RISK, OBLIGATION, PARKED or "
+           "REJECTED_ALTERNATIVE";
+}
+
+bool atlas_decision_kind_resolvable(atlas_decision_kind k) {
+    const struct kind_row *row = kind_row_of(k);
+    return row != NULL && row->resolvable;
+}
+
 /* The transition table. This function is the only authority on it.
  *
  * `lifecycle.c` asks it before every write and the tests assert against it, so
  * a test cannot pass by agreeing with a second copy of the rules — which is
  * what would happen if the table were an `if` chain in the writer and a list in
  * a test. Enumerating the refusals rather than the permissions would be shorter
- * and is not done on purpose: the safe default for an unlisted pair is "no". */
-bool atlas_decision_transition_allowed(atlas_decision_state from, atlas_decision_state to) {
+ * and is not done on purpose: the safe default for an unlisted pair is "no".
+ *
+ * A9.1 gave it the document's kind. The kind widens the table in exactly one
+ * place and narrows it nowhere: every kind is proposable, approvable,
+ * rejectable and supersedable, and only a kind whose approved form makes a
+ * demand may also be resolved. Uniformity in the rest is deliberate — a reader
+ * should not have to consult a matrix to find out whether a record can be
+ * refused. */
+bool atlas_decision_transition_allowed(atlas_decision_kind kind, atlas_decision_state from,
+                                       atlas_decision_state to) {
     switch (from) {
     case ATLAS_DECISION_PROPOSED:
         /* A proposal may be accepted or refused. It may not jump straight to
          * SUPERSEDED: superseding something that was never effective would
-         * record that policy changed when it never existed. */
+         * record that policy changed when it never existed. Nor to RESOLVED:
+         * discharging an obligation nobody accepted would make recording a
+         * demand and satisfying it one step, and the acceptance is the part an
+         * operator has to have seen. */
         return to == ATLAS_DECISION_APPROVED || to == ATLAS_DECISION_REJECTED;
     case ATLAS_DECISION_APPROVED:
-        /* The only way out of effective is to be replaced by a later approval.
+        /* The ways out of effective. Replacement by a later approval, always.
          * There is deliberately no APPROVED -> REJECTED: retracting a decision
          * is proposing and approving its replacement, which leaves a record of
-         * what replaced it instead of a hole where policy used to be. */
-        return to == ATLAS_DECISION_SUPERSEDED;
+         * what replaced it instead of a hole where policy used to be.
+         *
+         * And, for the kinds that make a demand, closure: the demand was met,
+         * nothing replaced the record, and it stops being effective. */
+        if (to == ATLAS_DECISION_SUPERSEDED) {
+            return true;
+        }
+        return to == ATLAS_DECISION_RESOLVED && atlas_decision_kind_resolvable(kind);
     case ATLAS_DECISION_REJECTED:
     case ATLAS_DECISION_SUPERSEDED:
+    case ATLAS_DECISION_RESOLVED:
         /* Terminal. In particular REJECTED -> APPROVED is refused: "we said no
          * and then it quietly became policy" is the failure the ledger exists
          * to make impossible, and revisiting a rejected idea means proposing a
-         * new revision of it. */
+         * new revision of it. RESOLVED is terminal for the same reason and with
+         * the same remedy: reopening a discharged obligation is a new revision,
+         * approved through the channel, not a state that quietly comes back. */
         return false;
     }
     return false;
@@ -226,6 +350,7 @@ const char *atlas_decision_intent_name(atlas_decision_intent i) {
     case ATLAS_DECISION_INTENT_REJECT: return "reject";
     case ATLAS_DECISION_INTENT_SUPERSEDE: return "supersede";
     case ATLAS_DECISION_INTENT_REVALIDATE: return "revalidate";
+    case ATLAS_DECISION_INTENT_RESOLVE: return "resolve";
     }
     return "approve";
 }
@@ -248,6 +373,10 @@ bool atlas_decision_intent_parse(const char *name, atlas_decision_intent *out) {
     }
     if (strcmp(name, "revalidate") == 0) {
         *out = ATLAS_DECISION_INTENT_REVALIDATE;
+        return true;
+    }
+    if (strcmp(name, "resolve") == 0) {
+        *out = ATLAS_DECISION_INTENT_RESOLVE;
         return true;
     }
     return false;

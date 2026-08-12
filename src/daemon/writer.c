@@ -1192,6 +1192,13 @@ atlas_status atlas_writer_decision(atlas_writer *w, atlas_decision_op *op, int t
         result->revision_id = j->decision_result.revision_id;
         result->revision_no = j->decision_result.revision_no;
         result->state = j->decision_result.state;
+        /* A9.1. Copied like every other scalar: this block is a field-by-field
+         * copy across a thread boundary, so a field added to
+         * `atlas_decision_result` and not added here is silently zero on the
+         * daemon path while the local path reports it — and zero for a kind is
+         * DECISION, which is a confident wrong answer rather than an absent one.
+         * The acceptance run caught exactly that. */
+        result->knowledge_kind = j->decision_result.knowledge_kind;
         result->superseded_revision_no = j->decision_result.superseded_revision_no;
         result->document_created = j->decision_result.document_created;
         result->duplicate = j->decision_result.duplicate;

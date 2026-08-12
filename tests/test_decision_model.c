@@ -40,10 +40,16 @@ static void basic(atlas_decision_revision *r, const char *title, const char *dec
 /* --- the transition table --------------------------------------------------- */
 
 static void test_transition_table_is_the_only_authority(void) {
-    /* Every pair, enumerated. The permitted set is tiny and stated here as data
-     * so a change to `atlas_decision_transition_allowed` has to be reflected in
-     * a list somebody reads, rather than passing because the test asks the same
-     * function it is testing. */
+    /* Every pair, enumerated, for a kind that cannot be resolved. The permitted
+     * set is tiny and stated here as data so a change to
+     * `atlas_decision_transition_allowed` has to be reflected in a list somebody
+     * reads, rather than passing because the test asks the same function it is
+     * testing.
+     *
+     * A9.1 gave the function the document's kind. These twenty-five pairs are the
+     * table for every kind whose approved form makes no demand — which is six of
+     * the eight — and `test_only_a_demand_can_be_resolved` covers the other two
+     * and the one cell they differ in. */
     struct {
         atlas_decision_state from;
         atlas_decision_state to;
@@ -55,6 +61,10 @@ static void test_transition_table_is_the_only_authority(void) {
          * effective would record that policy changed when none existed. */
         {ATLAS_DECISION_PROPOSED, ATLAS_DECISION_SUPERSEDED, false},
         {ATLAS_DECISION_PROPOSED, ATLAS_DECISION_PROPOSED, false},
+        /* Nor resolved. Discharging a demand nobody accepted would make recording
+         * a demand and satisfying it one step, and the acceptance is the part an
+         * operator has to have seen. */
+        {ATLAS_DECISION_PROPOSED, ATLAS_DECISION_RESOLVED, false},
 
         {ATLAS_DECISION_APPROVED, ATLAS_DECISION_SUPERSEDED, true},
         /* No retraction path. Withdrawing a decision means approving its
@@ -62,6 +72,9 @@ static void test_transition_table_is_the_only_authority(void) {
         {ATLAS_DECISION_APPROVED, ATLAS_DECISION_REJECTED, false},
         {ATLAS_DECISION_APPROVED, ATLAS_DECISION_PROPOSED, false},
         {ATLAS_DECISION_APPROVED, ATLAS_DECISION_APPROVED, false},
+        /* The cell the kind decides. For a DECISION there is nothing to
+         * discharge, so it is refused here and permitted for an OBLIGATION. */
+        {ATLAS_DECISION_APPROVED, ATLAS_DECISION_RESOLVED, false},
 
         /* Rule 3. The single most important refusal in the table: "we said no
          * and then it quietly became policy" must be impossible. */
@@ -69,18 +82,94 @@ static void test_transition_table_is_the_only_authority(void) {
         {ATLAS_DECISION_REJECTED, ATLAS_DECISION_PROPOSED, false},
         {ATLAS_DECISION_REJECTED, ATLAS_DECISION_SUPERSEDED, false},
         {ATLAS_DECISION_REJECTED, ATLAS_DECISION_REJECTED, false},
+        {ATLAS_DECISION_REJECTED, ATLAS_DECISION_RESOLVED, false},
 
         {ATLAS_DECISION_SUPERSEDED, ATLAS_DECISION_APPROVED, false},
         {ATLAS_DECISION_SUPERSEDED, ATLAS_DECISION_PROPOSED, false},
         {ATLAS_DECISION_SUPERSEDED, ATLAS_DECISION_REJECTED, false},
         {ATLAS_DECISION_SUPERSEDED, ATLAS_DECISION_SUPERSEDED, false},
+        {ATLAS_DECISION_SUPERSEDED, ATLAS_DECISION_RESOLVED, false},
+
+        /* A9.1. RESOLVED is terminal for the same reason REJECTED is, and with
+         * the same remedy: reopening a discharged obligation is a new revision
+         * approved through the channel, not a state that quietly comes back. */
+        {ATLAS_DECISION_RESOLVED, ATLAS_DECISION_APPROVED, false},
+        {ATLAS_DECISION_RESOLVED, ATLAS_DECISION_PROPOSED, false},
+        {ATLAS_DECISION_RESOLVED, ATLAS_DECISION_REJECTED, false},
+        {ATLAS_DECISION_RESOLVED, ATLAS_DECISION_SUPERSEDED, false},
+        {ATLAS_DECISION_RESOLVED, ATLAS_DECISION_RESOLVED, false},
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-        bool got = atlas_decision_transition_allowed(cases[i].from, cases[i].to);
+        bool got = atlas_decision_transition_allowed(ATLAS_DECISION_KIND_DECISION, cases[i].from,
+                                                     cases[i].to);
         T_CHECK_MSG(got == cases[i].allowed, "%s -> %s should be %s",
                     atlas_decision_state_name(cases[i].from),
                     atlas_decision_state_name(cases[i].to),
                     cases[i].allowed ? "allowed" : "refused");
+    }
+    /* All twenty-five pairs hold for every non-resolvable kind, not just for
+     * DECISION: the kind widens the table in one cell and narrows it nowhere, and
+     * a future edit that made some other kind unrejectable would be caught here
+     * rather than in whichever surface first refused a rejection. */
+    for (size_t k = 0; k < atlas_decision_kind_count(); k++) {
+        atlas_decision_kind kind = atlas_decision_kind_at(k);
+        if (atlas_decision_kind_resolvable(kind)) {
+            continue;
+        }
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            bool got = atlas_decision_transition_allowed(kind, cases[i].from, cases[i].to);
+            T_CHECK_MSG(got == cases[i].allowed, "%s: %s -> %s should be %s",
+                        atlas_decision_kind_name(kind),
+                        atlas_decision_state_name(cases[i].from),
+                        atlas_decision_state_name(cases[i].to),
+                        cases[i].allowed ? "allowed" : "refused");
+        }
+    }
+}
+
+/* A9.1. The one cell the knowledge kind decides, from both directions. */
+static void test_only_a_demand_can_be_resolved(void) {
+    /* Which kinds may be resolved, stated as data rather than asked of
+     * `atlas_decision_kind_resolvable` — otherwise this test would agree with
+     * whatever the table says. */
+    struct {
+        atlas_decision_kind kind;
+        bool resolvable;
+    } expect[] = {
+        {ATLAS_DECISION_KIND_DECISION, false},
+        {ATLAS_DECISION_KIND_POLICY, false},
+        {ATLAS_DECISION_KIND_INVARIANT, false},
+        {ATLAS_DECISION_KIND_OPERATIONAL_FACT, false},
+        /* A risk that was eliminated rather than replaced. */
+        {ATLAS_DECISION_KIND_ACCEPTED_RISK, true},
+        /* The kind the state exists for. */
+        {ATLAS_DECISION_KIND_OBLIGATION, true},
+        {ATLAS_DECISION_KIND_PARKED, false},
+        {ATLAS_DECISION_KIND_REJECTED_ALTERNATIVE, false},
+    };
+    T_REQUIRE(sizeof(expect) / sizeof(expect[0]) == atlas_decision_kind_count());
+    for (size_t i = 0; i < sizeof(expect) / sizeof(expect[0]); i++) {
+        T_CHECK_MSG(atlas_decision_kind_resolvable(expect[i].kind) == expect[i].resolvable,
+                    "%s resolvable should be %s", atlas_decision_kind_name(expect[i].kind),
+                    expect[i].resolvable ? "true" : "false");
+        /* The predicate and the table must agree, in both directions, for every
+         * kind. Two answers to one question is how a surface ends up minting a
+         * capability the write point then refuses. */
+        T_CHECK_MSG(atlas_decision_transition_allowed(expect[i].kind, ATLAS_DECISION_APPROVED,
+                                                      ATLAS_DECISION_RESOLVED) ==
+                        expect[i].resolvable,
+                    "%s APPROVED -> RESOLVED disagrees with the predicate",
+                    atlas_decision_kind_name(expect[i].kind));
+        /* And a resolvable kind gains *only* that cell: everything else about its
+         * lifecycle is the same as a decision's. */
+        T_CHECK(atlas_decision_transition_allowed(expect[i].kind, ATLAS_DECISION_PROPOSED,
+                                                  ATLAS_DECISION_RESOLVED) == false);
+        T_CHECK(atlas_decision_transition_allowed(expect[i].kind, ATLAS_DECISION_RESOLVED,
+                                                  ATLAS_DECISION_APPROVED) == false);
+        T_CHECK(atlas_decision_transition_allowed(expect[i].kind, ATLAS_DECISION_APPROVED,
+                                                  ATLAS_DECISION_SUPERSEDED) == true);
+        T_CHECK(atlas_decision_transition_allowed(expect[i].kind, ATLAS_DECISION_PROPOSED,
+                                                  ATLAS_DECISION_REJECTED) == true);
     }
 }
 
@@ -669,6 +758,7 @@ static void test_challenge_tokens_are_random_and_distinct(void) {
 
 static const atlas_test TESTS[] = {
     {"the transition table is the only authority", test_transition_table_is_the_only_authority},
+    {"only a demand can be resolved", test_only_a_demand_can_be_resolved},
     {"vocabularies are closed", test_vocabularies_are_closed},
     {"the hash is stable and domain separated", test_hash_is_stable_and_domain_separated},
     {"no delimiter collision", test_hash_cannot_be_collided_by_moving_a_delimiter},

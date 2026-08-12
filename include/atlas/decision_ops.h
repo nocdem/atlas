@@ -70,7 +70,16 @@ typedef enum atlas_decision_op_kind {
     /* Migration 10: attach an explanation to an edge that already exists.
      * Writes one append-only row and nothing else — no revision, no content
      * hash, no status change, no capability. */
-    ATLAS_DECISION_OP_EDGE_NOTE
+    ATLAS_DECISION_OP_EDGE_NOTE,
+    /* A9.1. Close out an approved record whose demand has been met: an
+     * OBLIGATION that was discharged, an ACCEPTED_RISK that was eliminated.
+     *
+     * It consumes a capability exactly as approve, reject and supersede do, and
+     * it is refused for a kind whose approved form makes no demand. Nothing is
+     * deleted and no prose is rewritten: the revision moves from APPROVED to
+     * RESOLVED, one `decision_events` row records that it did, and the document
+     * stops being effective. */
+    ATLAS_DECISION_OP_RESOLVE
 } atlas_decision_op_kind;
 
 const char *atlas_decision_op_kind_name(atlas_decision_op_kind k);
@@ -94,6 +103,21 @@ typedef struct atlas_decision_op {
     /* PROPOSE and REVISE: the content. Validated before it reaches the writer
      * and validated again at the write point. */
     atlas_decision_revision revision;
+
+    /* A9.1. PROPOSE: which sort of knowledge record to create. Defaults to
+     * DECISION, because the enum's zero is DECISION and a caller that says
+     * nothing means what every caller written before A9.1 meant.
+     *
+     * On REVISE it is checked rather than applied: a revision of a document
+     * whose kind differs is refused, naming supersede. A kind is a property of
+     * the document, so "revise it into a different kind" is a request to change
+     * what a durable record has always been, and the honest form of that is a
+     * new record that replaces this one. `knowledge_kind_given` distinguishes
+     * "the caller asked for DECISION" from "the caller said nothing", so a
+     * revise of a POLICY by a client that has never heard of kinds is not
+     * refused for asserting DECISION it never asserted. */
+    atlas_decision_kind knowledge_kind;
+    bool knowledge_kind_given;
 
     /* Attribution, following A2's rule exactly: a session is found by its key
      * and by nothing else, and a record that cannot be attached is stored
@@ -173,6 +197,11 @@ typedef struct atlas_decision_result {
     int64_t revision_no;
     char content_hash[ATLAS_SHA256_HEX_LEN + 1u];
     atlas_decision_state state;
+    /* A9.1. The document's kind, reported by every operation that resolved one:
+     * `propose` echoes what it created, and the operator operations echo what
+     * they acted on, so a caller never has to guess and a refusal can say what
+     * the record actually is. */
+    atlas_decision_kind knowledge_kind;
 
     /* CHALLENGE only. `title` is the revision's title — untrusted prose that
      * the CLI displays, encoded, so the operator sees what they are approving.

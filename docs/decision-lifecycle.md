@@ -4,6 +4,15 @@ A4 is the phase in which a proposal can become project policy. The whole
 difficulty of the phase is in what that sentence is allowed to mean, so this
 document leads with the limits rather than ending with them.
 
+**A9.1 added a second, orthogonal dimension: the knowledge kind.** Everything
+below about approval, immutability, the ledger and the operator channel is
+unchanged by it. What changed is that a durable record now says *what sort of
+knowledge it is* as well as *how far through the approval workflow it got*, and
+the two are separate fields that no code path derives from each other. See
+[kind and status](#a91-kind-and-status) — read that section before the state
+machine if you are new to the model, because "decision" now names one kind among
+eight rather than the whole category.
+
 ## The claim, and the non-claim
 
 When Atlas reports a decision as `APPROVED`, it means exactly this:
@@ -101,34 +110,206 @@ Conflating those two would turn an approval button into a prompt-injection
 channel: propose a document containing instructions, get it approved on the
 strength of a plausible title, and have it treated as authoritative thereafter.
 
+## A9.1: kind and status
+
+Two dimensions, and keeping them apart is the whole of what this season is
+about.
+
+**Status** answers *how far through the approval workflow is this record?* It is
+`atlas_decision_state`: PROPOSED, APPROVED, REJECTED, SUPERSEDED and — new in
+A9.1 — RESOLVED.
+
+**Kind** answers *what sort of durable engineering knowledge is this?* It is
+`atlas_decision_kind`, eight values, and it has almost no effect on anything
+Atlas does. It is a label a reader acts on.
+
+An **APPROVED INVARIANT**, an **APPROVED ACCEPTED_RISK** and an **APPROVED
+DECISION** are one status and three kinds. Every surface reports both, in
+separate fields, and none of them folds one into the other.
+
+### Why the dimension exists
+
+A4 had one semantic category and called it a decision, so every durable fact an
+operator wanted to keep had to be dressed as a choice between alternatives. A
+real consolidation exercise on an indexed repository broke that: a consensus
+constant implementations must preserve is not a choice, a release rule is not an
+architecture, a currently deployed chain id is not permanent, and an approach
+that was built and abandoned is valuable precisely because it is *not* current
+direction. Recording all of them as decisions did not lose the prose. It lost the
+reason a later reader should treat them differently.
+
+### The kinds
+
+| kind | means | resolvable |
+| --- | --- | --- |
+| `DECISION` | a choice between alternatives that establishes project direction or architecture | no |
+| `POLICY` | a rule governing development, release, operation or process | no |
+| `INVARIANT` | a technical property implementations must preserve | no |
+| `OPERATIONAL_FACT` | a mutable, environment-specific fact about what is currently deployed or relevant | no |
+| `ACCEPTED_RISK` | a security, privacy, reliability or operational risk that has been explicitly accepted | **yes** |
+| `OBLIGATION` | required future work: a remediation, a blocker, a release gate | **yes** |
+| `PARKED` | work or architecture intentionally deferred and not currently active | no |
+| `REJECTED_ALTERNATIVE` | an approach considered or built and deliberately rejected, recorded with why | no |
+
+`DECISION` is **zero**, deliberately, and it is the one Atlas vocabulary whose
+zero is not "unknown". A zeroed struct, an omitted argument and an absent column
+all mean DECISION, because every record written before this vocabulary existed
+*was* a decision. There is no such thing as a knowledge record whose kind Atlas
+does not know.
+
+### Semantics worth stating precisely
+
+**OPERATIONAL_FACT carries the least permanence of any kind, and that is a
+reporting obligation rather than a storage difference.** The record is exactly as
+durable as any other; what it *asserts* is only about now. Replacing one is the
+ordinary supersede path, which is why the kind needs no special machinery. Never
+present one with the permanence of an architectural decision.
+
+**Discovering a risk does not accept it.** A PROPOSED `ACCEPTED_RISK` is a risk
+somebody wrote down and nobody accepted. Acceptance is the ordinary approval,
+through the operator channel, and there is no path by which recording a risk
+approves it. The kind name describes what an *approved* one means; the status is
+what says whether it has been.
+
+**PARKED is not REJECTED.** An approved PARKED record is an accepted statement
+that something is deliberately not being done now — a more useful fact than
+silence, and a different one from a refusal.
+
+**REJECTED_ALTERNATIVE is where conflating the two dimensions is easiest, so read
+them separately.** An **APPROVED** REJECTED_ALTERNATIVE means "it is accepted
+knowledge that we rejected this approach" — the normal, useful state, and the one
+that stops a later agent rediscovering it. A **REJECTED** REJECTED_ALTERNATIVE
+means the record itself was refused: somebody wrote down that an approach was
+rejected and that claim was not accepted. Both are expressible and they mean
+different things.
+
+### A kind never changes
+
+The kind lives on the **document**, is written by the INSERT that creates it, and
+no `UPDATE` in `db_decision.c` names the column — the same guarantee a revision's
+prose has. A revision that asserts a different kind is refused, naming the
+remedy: propose a record of the right kind and supersede the old one with it.
+
+That is not a limitation dressed as a principle. Reclassifying by supersession
+keeps the record of how the knowledge *used to be* classified, which is exactly
+what a durable record is for; rewriting the label in place would erase it.
+
+**The kind is therefore not part of the canonical content hash**, and that needs
+saying explicitly because everything else immutable about a revision is hashed.
+Two reasons, both load-bearing:
+
+1. Hashing it would move every digest that has already been approved. `atlas
+   doctor` rehashes every revision and reports a mismatch as tampering — which
+   is correct, and which would then fire on every healthy record in every
+   existing database.
+2. The kind is identity-like rather than content: it is fixed before revision 1
+   exists and cannot change under an approval. An approval binds document uid +
+   revision number + content hash, and the document's kind is immutable, so the
+   approval covers it by construction. The document's `uid` is outside the hash
+   for the same reason.
+
+### The surfaces
+
+Every surface names the two dimensions identically, so a client written against
+one reads the others:
+
+| surface | kind | status |
+| --- | --- | --- |
+| CLI human | its own `kind:` line and its own column | its own `status:` line and column |
+| CLI `--json` | `"kind"` | `"status"` |
+| RPC `decision.list` / `decision.get` | `"kind"` on the document object | `"status"` |
+| MCP `atlas_decisions` / `atlas_decision` | `"kind"` | `"status"` |
+| Web API `/api/v1/decisions` | `"kind"` | `"status"` |
+| Mission Control | a filled chip, its own column, its own filter | an outlined traffic-light tag, its own column, its own filter |
+| `context build` items | `"knowledge_kind"` | `"knowledge_status"` |
+
+Filtering is per axis and the axes are independent: `--kind INVARIANT`,
+`--status APPROVED`, or both. Totals are reported per axis too —
+`total_by_kind` beside the five `total_*` status counts — and are never narrowed
+by the filters, because they are the denominator a filtered page is read
+against.
+
+A client that omits `kind` creates a DECISION. A client that has never heard of
+kinds is unaffected in every direction: it proposes decisions, it can still
+revise a POLICY (an absent `kind` is not an assertion), and it reads a `kind`
+field it can ignore.
+
 ## The state machine
 
-Four states, one closed vocabulary, and an append-only ledger.
+Five states, one closed vocabulary, and an append-only ledger.
 
 ```
                   approve
    PROPOSED ─────────────────────▶ APPROVED
-      │                               │
-      │ reject                        │ a later revision of the same document
-      ▼                               │ is approved, or the document is
-   REJECTED  (terminal)               │ superseded by another document
-                                      ▼
-                                 SUPERSEDED  (terminal)
+      │                            │    │
+      │ reject                     │    │ resolve, for an OBLIGATION or an
+      ▼                            │    │ ACCEPTED_RISK whose demand was met
+   REJECTED  (terminal)            │    ▼
+                                   │  RESOLVED  (terminal)
+                                   │
+                                   │ a later revision of the same document
+                                   │ is approved, or the document is
+                                   │ superseded by another document
+                                   ▼
+                              SUPERSEDED  (terminal)
 ```
 
 The complete transition table, which `atlas_decision_transition_allowed` is the
-sole authority on:
+sole authority on. A9.1 gave it the document's kind, and the kind widens the
+table in exactly one cell and narrows it nowhere:
 
 | from | to | allowed | why |
 | --- | --- | --- | --- |
 | PROPOSED | APPROVED | yes | the point of the phase |
-| PROPOSED | REJECTED | yes | refusing is a first-class outcome |
+| PROPOSED | REJECTED | yes | refusing is a first-class outcome, for every kind |
 | PROPOSED | SUPERSEDED | **no** | superseding something never effective records that policy changed when none existed |
-| APPROVED | SUPERSEDED | yes | the only way out of effective |
+| PROPOSED | RESOLVED | **no** | discharging a demand nobody accepted would make recording it and satisfying it one step |
+| APPROVED | SUPERSEDED | yes | the only way out of effective that names a replacement |
+| APPROVED | RESOLVED | **kind-dependent** | yes for OBLIGATION and ACCEPTED_RISK, no for the other six |
 | APPROVED | REJECTED | **no** | retracting means approving a replacement, which leaves a record of what replaced it |
 | REJECTED | APPROVED | **no** | "we said no and then it quietly became policy" is the failure the ledger exists to prevent |
 | REJECTED | anything | **no** | terminal |
 | SUPERSEDED | anything | **no** | terminal |
+| RESOLVED | anything | **no** | terminal |
+
+### RESOLVED, precisely
+
+An approved OBLIGATION whose demand has been met is **not superseded** — nothing
+replaced it — and **not rejected**, because it was accepted and it was real.
+Without a fifth state, closing one out meant either lying about a replacement or
+leaving a discharged obligation reported as outstanding for ever.
+
+What resolving does: moves one revision from APPROVED to RESOLVED, appends one
+`decision_events` row, and stops the document being effective. What it does not
+do: delete anything, edit any prose, name any replacement, or say the record was
+wrong. A resolved obligation was a real obligation and its rationale stays
+readable, which is the point — the next person can see why the work was
+required.
+
+It is **not** a synonym for "we changed our mind". Withdrawing a record that
+still stands is a supersession, as it always was.
+
+**Resolving is an operator action.** It consumes a single-use capability bound to
+one revision and one content hash, obtained through the same interactive channel
+approval uses, with the same honesty limits (see [the claim](#the-claim-and-the-non-claim)
+— every word of it applies to `resolve` unchanged). `decision.resolve` sits in
+the operator-uid RPC group beside `decision.approve`; there is no MCP tool for
+it and no gateway route. Closing an obligation is a claim that work was done, and
+a model must not be able to make it.
+
+**Reopening is possible and is not a transition.** A resolved revision stays
+resolved for ever. Proposing a new revision and approving it makes the document
+effective again — so reopening leaves exactly the trail an approval does, rather
+than a state that quietly comes back.
+
+`RESOLVED` sits between an outstanding proposal and a refusal in the status
+precedence, in both `recompute_status` and the ledger replay in
+`atlas_db_decision_verify`. The two must agree exactly: this is the replay that
+decides whether the cached status is honest, and a replay with its own opinion is
+not a check. A document with a resolved revision *and* an outstanding proposal
+reads as PROPOSED, for the same reason rejecting one revision never made a
+document REJECTED while another was pending — what a reader needs to know first
+is that there is something to look at.
 
 ### The twelve rules, and where each is enforced
 
@@ -222,6 +403,7 @@ computed from something else, either at write time or at read time.
 | `basis_head` | immutable | **yes** | a decision taken against commit X is not the one taken against commit Y |
 | `decision_revisions.basis_repo_identity_hash` | immutable, **captured on the revision** | **yes** | "about *that* repository" is part of what was approved. The identity hash and not the row id, because a row id is reused and is not comparable across databases. Written once, at insert, from whatever the identity was at that moment — **including an explicit empty string when there was none** — and never updated afterwards by any statement in Atlas |
 | `decision_documents.repo_identity_hash` | **mutable** — document-level attachment metadata | **no** | a different thing that reads like the same one. It governs where the *document* is currently attached and which repository may automatically relink it, it starts empty and is backfilled when the lineage first becomes knowable, and it is deliberately outside the hash |
+| `decision_documents.kind` (A9.1) | immutable — written by the INSERT that creates the document, named by no `UPDATE` | **no** | it is *identity-like rather than content*: fixed before revision 1 exists, unchangeable under an approval, and therefore covered by the approval by construction — an approval binds document uid + revision number + hash, and the uid's kind cannot move. Hashing it would also move every digest already approved, and `atlas doctor` reports a moved digest as tampering. Reclassifying is superseding with a record of the right kind, which keeps the history of how the knowledge used to be classified rather than erasing it |
 | link kind | immutable | **yes** | selector |
 | link `path_raw` | immutable | **yes** | selector; raw bytes, because a path is bytes |
 | link `commit_oid` | immutable | **yes** | selector |
@@ -519,26 +701,38 @@ Approval makes no difference to that — approved prose is accepted policy, not
 system instruction. A consumer that wants a decision's text asks for it through
 an explicit MCP call, where it arrives labelled `UNTRUSTED_DATA`.
 
-`tests/test_ai_trust.c` enumerates the envelope's complete line vocabulary and
-fails on any line Atlas did not start, which is how A4's additions were forced
-to be deliberate.
+A9.1 adds one integer, `decisions_resolved`, so the status axis in the envelope
+is complete — without it the counts stopped summing to the number of records,
+which reads as a bug in whichever count a consumer happens to check. It adds
+**no** per-kind counts: a knowledge kind is a fixed Atlas vocabulary and so would
+be safe to emit, but eight more integers is a lot of envelope for a question one
+MCP call answers exactly, and the envelope's job is to be small enough to read.
+
+`tests/test_ai_trust.c` enumerates the envelope's complete field vocabulary and
+fails on any `key=` Atlas did not list, which is how A4's and A9.1's additions
+were forced to be deliberate. A9.1 widened that check from line *prefixes* to
+every field on a line — it had been possible to append a field to a line somebody
+had already listed and never list it, which is what `decisions_rejected=`,
+`decisions_superseded=` and `decisions_resolved=` all did.
 
 ## CLI
 
 ```sh
-atlas decision list NAME [--status APPROVED] [--limit N]
+atlas decision list NAME [--status APPROVED] [--kind INVARIANT] [--limit N]
 atlas decision show NAME ID [--revision N]
-atlas decision search NAME QUERY
+atlas decision search NAME QUERY [--kind OBLIGATION]
 atlas decision history NAME ID
 atlas decision links NAME ID                # the account of this decision's relations
-atlas decision for-file NAME PATH
+atlas decision for-file NAME PATH [--kind POLICY]
 atlas decision propose NAME --title T --decision D \
+      [--kind DECISION|POLICY|INVARIANT|OPERATIONAL_FACT|ACCEPTED_RISK|OBLIGATION|PARKED|REJECTED_ALTERNATIVE] \
       [--context C] [--rationale R] [--consequences Q] [--scope PATHS] \
       [--alternative A]... [--path P]... [--commit OID]... [--symbol-link S]...
-atlas decision revise  NAME ID --title T --decision D [...]
+atlas decision revise  NAME ID --title T --decision D [...]   # --kind is checked, never applied
 atlas decision approve NAME ID              # interactive; needs a terminal
 atlas decision reject  NAME ID              # interactive
 atlas decision supersede NAME ID --by ID2   # interactive
+atlas decision resolve NAME ID              # interactive; OBLIGATION and ACCEPTED_RISK only
 atlas decision link add    NAME SOURCE TARGET [--why TEXT]
 atlas decision link remove NAME SOURCE TARGET  --why TEXT
 atlas decision link note   NAME SOURCE TARGET  --why TEXT [--provenance P] [--event E]
@@ -1125,3 +1319,103 @@ a signature.
 
 See `docs/impact-gates.md` for freshness, the gate, and the full revalidation
 contract, and `docs/data-model.md` for the schema-7 tables.
+
+## A9.1: who may perform which lifecycle mutation
+
+The prompt behind this season asked for an audit rather than an assumption, so
+here is the whole matrix. "Absent" means there is no such name to call: the
+dispatcher answers `unknown method` exactly as it does for a name that was never
+invented, because a refusal that distinguished "you may not" from "there is no
+such thing" would tell a caller what to try next.
+
+| operation | writes | local CLI | ordinary RPC group | operator-uid RPC group | MCP tool | web API |
+| --- | --- | --- | --- | --- | --- | --- |
+| propose | a new document, revision 1, PROPOSED | yes | `decision.propose` | — | `atlas_propose_decision` | absent |
+| revise | a new PROPOSED revision | yes | `decision.revise` | — | `atlas_revise_decision` (A9.1) | absent |
+| link add / remove / note | a revision, or one append-only edge row | yes | `decision.link_*` | — | absent | absent |
+| promote | an A4 document from an A2 proposal | yes | `decision.promote` | — | absent | absent |
+| challenge | a single-use capability | yes, with a terminal | absent | `decision.challenge` | absent | absent |
+| **approve** | PROPOSED → APPROVED | yes, with a terminal | absent | `decision.approve` | **absent** | absent |
+| **reject** | PROPOSED → REJECTED | yes, with a terminal | absent | `decision.reject` | **absent** | absent |
+| **supersede** | APPROVED → SUPERSEDED | yes, with a terminal | absent | `decision.supersede` | **absent** | absent |
+| **revalidate** | a validation record, no state change | yes, with a terminal | absent | `decision.revalidate` | **absent** | absent |
+| **resolve** (A9.1) | APPROVED → RESOLVED | yes, with a terminal | absent | `decision.resolve` | **absent** | absent |
+| set or change a kind | — | only at propose | only at propose | — | only at propose | absent |
+
+Read the rows in two groups. Everything above `challenge` writes a **proposal**:
+it changes no lifecycle state, needs no capability, and records
+`MODEL_PROPOSAL` — which is why an MCP tool for it is a convenience rather than a
+grant. Everything from `challenge` down is the operator channel: it consumes a
+capability, it is offered over the socket only to the peer whose `SO_PEERCRED`
+uid equals the `operator_uid` in the root-owned policy, and it has no MCP tool
+and no web route at all.
+
+### What A9.1 changed here, and what it deliberately did not
+
+**Added:** `decision.resolve` in the operator group, and `atlas_revise_decision`
+in MCP.
+
+The MCP addition is the one worth justifying, because "do not grant new mutation
+authority" and "eliminate accidental surface gaps" pull against each other.
+`decision.revise` has existed since A4 and writes exactly what
+`atlas_propose_decision` writes — a PROPOSED revision by a `MODEL_PROPOSAL`
+actor — differing only in whether a document already exists. MCP could express
+the second and not the first, so a model that noticed an approved record had
+gone out of date could only write a *new* record beside it, leaving two documents
+about one subject with no relation between them. That is a worse record than the
+one it was trying to improve, and nothing about the gap was a boundary: the
+operator still has to approve the revision before it means anything.
+
+**Not added, on purpose:** no MCP tool and no web route approves, rejects,
+supersedes, revalidates or resolves. Closing an obligation is a claim that work
+was done, and a model must not be able to make it. `tests/test_decision_mcp.c`
+asserts the whole tool inventory and rejects any tool name containing an approval
+verb; `tests/test_orch_rpc.c` asks a live daemon for the names such methods would
+plausibly have.
+
+**Unchanged:** every honesty limit in [the claim](#the-claim-and-the-non-claim).
+`LOCAL_OPERATOR_CONFIRMED` on a resolution says the channel was used. It does not
+name a person, does not prove one was present, and is not a signature — and a
+same-uid process, including an AI agent with shell access, may imitate the
+channel exactly as it may for an approval.
+
+## A9.1: provenance, per kind
+
+Classification destroys no provenance: every knowledge record keeps the whole A4
+and A6 apparatus — the immutable revision, the append-only ledger, the link
+snapshots, the edge accounts, the validation records. What follows is where each
+kind's particular provenance question is answered.
+
+**An ACCEPTED_RISK distinguishes discovery from acceptance by its status, and
+only by its status.** Recording the risk writes a PROPOSED revision with a
+`MODEL_PROPOSAL` or operator actor; accepting it is an APPROVED event in the
+ledger with `LOCAL_OPERATOR_CONFIRMED` and a consumed capability. The two are
+different rows recording different acts, and there is no path from the first to
+the second. `atlas decision history` shows both.
+
+**An OPERATIONAL_FACT identifies its source through the ordinary link and
+evidence machinery**: path links, commit links, symbol snapshots and
+`basis_head`, each with its own currency computed on read. Because the kind
+asserts something about *now*, the useful reading is the currency: a link that
+reports `CHANGED` on an operational fact is the signal that the fact may have
+moved on, which is the same mechanism A6 uses and needs no new field.
+
+**A REJECTED_ALTERNATIVE preserves why it was rejected in its own prose** —
+`rationale` and `consequences` are the fields for it, and an `--alternative` list
+records what was considered instead. Where the rejection is a *relation* to
+another record, `decision link add --why` and `decision link note --why` put the
+reason in `decision_edge_events`, which is append-only and outlives every
+revision.
+
+**A SUPERSEDED record identifies its successor** through the `replaced_by` link
+recorded on the superseded side and `superseded_by_document_id` on the document,
+so a reader of the old record is told where to look without a join.
+
+**A RESOLVED record identifies nothing as its successor, deliberately, because
+there is none.** What it has instead is the ledger: the APPROVED event that
+accepted the demand and the RESOLVED event that closed it, in order, with the
+content hash on both. The historical obligation is retained in full — nothing is
+deleted and no prose is rewritten — which is what "resolved without rewriting
+history" means. If a resolution needs an explanation, the edge-note path records
+one; the ledger's `detail` stays a fixed Atlas vocabulary, as it does for every
+other transition, so that no operator prose can forge a line in it.

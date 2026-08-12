@@ -1053,6 +1053,10 @@ static atlas_status j_decision_summary_members(atlas_renderer *r,
                                                const atlas_decision_summary *s, atlas_err *err) {
     TRY(atlas_json_key_str(r->j, "decision", atlas_buf_cstr(&s->uid), err));
     TRY(atlas_json_key_str(r->j, "status", atlas_buf_cstr(&s->status), err));
+    /* A9.1: the same key the daemon and the web API emit, beside `status` and
+     * never merged with it. Both surfaces name the two dimensions identically so
+     * a client written against one reads the other. */
+    TRY(atlas_json_key_str(r->j, "kind", atlas_buf_cstr(&s->kind), err));
     TRY(atlas_json_key_int(r->j, "revision", s->revision_no, err));
     TRY(atlas_json_key_int(r->j, "latest_revision", s->latest_revision_no, err));
     TRY(atlas_json_key_str(r->j, "revision_state", atlas_buf_cstr(&s->revision_state), err));
@@ -1189,6 +1193,8 @@ static atlas_status j_decision_outcome(atlas_renderer *r, const atlas_decision_o
     TRY(atlas_json_key_str(r->j, "decision", atlas_buf_cstr(&o->uid), err));
     TRY(atlas_json_key_int(r->j, "revision", o->revision_no, err));
     TRY(atlas_json_key_str(r->j, "state", atlas_buf_cstr(&o->state), err));
+    /* A9.1: the same key every other decision object uses. */
+    TRY(atlas_json_key_str(r->j, "kind", atlas_buf_cstr(&o->kind), err));
     TRY(atlas_json_key_str(r->j, "content_hash", o->content_hash, err));
     TRY(atlas_json_key_bool(r->j, "created", o->created, err));
     TRY(atlas_json_key_bool(r->j, "duplicate", o->duplicate, err));
@@ -1226,7 +1232,19 @@ static atlas_status j_decision_counts(atlas_renderer *r, const atlas_decision_co
     TRY(atlas_json_key_int(r->j, "total_proposed", c->proposed, err));
     TRY(atlas_json_key_int(r->j, "total_approved", c->approved, err));
     TRY(atlas_json_key_int(r->j, "total_rejected", c->rejected, err));
-    return atlas_json_key_int(r->j, "total_superseded", c->superseded, err);
+    TRY(atlas_json_key_int(r->j, "total_superseded", c->superseded, err));
+    TRY(atlas_json_key_int(r->j, "total_resolved", c->resolved, err));
+    /* A9.1: the kind axis as one object, matching `decision.list` over IPC
+     * exactly — same key, same member names, every kind present including the
+     * zeroes, because a parser reading a fixed set of names is simpler than one
+     * that has to cope with absent members. */
+    TRY(atlas_json_key(r->j, "total_by_kind", err));
+    TRY(atlas_json_obj_begin(r->j, err));
+    for (size_t i = 0; i < atlas_decision_kind_count(); i++) {
+        atlas_decision_kind k = atlas_decision_kind_at(i);
+        TRY(atlas_json_key_int(r->j, atlas_decision_kind_name(k), c->by_kind[(size_t)k], err));
+    }
+    return atlas_json_obj_end(r->j, err);
 }
 
 
@@ -1726,6 +1744,14 @@ static atlas_status j_sem_items(atlas_renderer *r, const atlas_sem_item *items, 
         TRY(json_safe(r->j, &r->safe, "name", it->name, err));
         TRY(json_safe(r->j, &r->safe, "file", it->file_text, err));
         TRY(atlas_json_key_int(r->j, "line", it->line, err));
+        /* A9.1: the same keys `sem.context` emits over IPC, present only on a
+         * decision item. Same names on both surfaces so one consumer reads both. */
+        if (it->knowledge_kind[0] != '\0') {
+            TRY(atlas_json_key_str(r->j, "knowledge_kind", it->knowledge_kind, err));
+        }
+        if (it->knowledge_status[0] != '\0') {
+            TRY(atlas_json_key_str(r->j, "knowledge_status", it->knowledge_status, err));
+        }
         TRY(atlas_json_key_str(r->j, "evidence", it->evidence, err));
         /* Checked against Atlas' own closed set before it is emitted. */
         TRY(atlas_json_key_str_opt(

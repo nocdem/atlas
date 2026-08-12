@@ -110,43 +110,95 @@ static void test_envelope_allowlist_holds_for_hostile_values(void) {
         T_CHECK_MSG(strstr(body, "<|im_start|>") == NULL,
                     "case %zu reproduced a chat control token unescaped", i);
 
-        /* Every line starts with a key Atlas chose. */
-        /* The envelope's line set is a closed vocabulary, and a new line has to
-         * be added here deliberately rather than appear. That is the point of
-         * this check, and it has now caught two phases in a row.
+        /* Every `key=` in the envelope is one Atlas chose.
+         *
+         * The envelope's vocabulary is closed, and a new field has to be added
+         * here deliberately rather than appear. That is the point of this check,
+         * and it has now caught two phases in a row.
          *
          * A3 added the two `code_` lines. A4 added `decisions_needing_review=`
          * and widened `decisions_proposed=` to carry the rejected and
-         * superseded counts on the same line. Every one of them is an integer
-         * or a boolean: no decision title, no rationale, no path, no symbol
-         * name, and no decision id either. Approval does not change that —
+         * superseded counts on the same line. A9.1 added `decisions_resolved=`
+         * to that same line. Every one of them is an integer or a boolean: no
+         * decision title, no rationale, no path, no symbol name, no knowledge
+         * kind, and no decision id either. Approval does not change that —
          * approved prose is accepted project policy, not system instruction,
-         * and it reaches a model only through an explicit MCP call. */
+         * and it reaches a model only through an explicit MCP call.
+         *
+         * **A9.1 widened the check from lines to keys, and that is a fix rather
+         * than a tidy-up.** It used to compare only the *start* of each line, so
+         * a field appended to an existing line — which is exactly what
+         * `decisions_resolved=` is, and what A4's `decisions_rejected=` and
+         * `decisions_superseded=` were before it — passed without ever being
+         * listed. A closed vocabulary that only checks the first key on a line
+         * is not closed. */
         static const char *const KEYS[] = {"<atlas-context",
                                            "atlas=",
+                                           "phase=",
+                                           "protocol=",
+                                           "schema=",
                                            "daemon=",
                                            "repo=",
                                            "repo_id=",
+                                           "root_hash=",
                                            "head=",
+                                           "state=",
                                            "index_current=",
+                                           "generation=",
+                                           "cursor=",
                                            "not_current=",
                                            "changed_paths=",
+                                           "unresolved_reasons=",
                                            "decisions_proposed=",
+                                           "decisions_approved=",
+                                           "decisions_rejected=",
+                                           "decisions_superseded=",
+                                           "decisions_resolved=",
                                            "decisions_needing_review=",
                                            "session=",
+                                           "change_set=",
                                            "note=",
                                            "code_index_current=",
+                                           "code_generation=",
                                            "code_symbols=",
+                                           "code_relations=",
+                                           "code_ambiguous=",
+                                           "code_unresolved=",
                                            "</atlas-context>",
                                            NULL};
         for (const char *p = body; *p != '\0';) {
             const char *nl = strchr(p, '\n');
             size_t len = (nl != NULL) ? (size_t)(nl - p) : strlen(p);
-            bool known = (len == 0);
-            for (size_t k = 0; !known && KEYS[k] != NULL; k++) {
-                known = strncmp(p, KEYS[k], strlen(KEYS[k])) == 0;
+            /* The two tag lines carry no `key=` pairs. */
+            bool is_tag = false;
+            for (size_t k = 0; !is_tag && KEYS[k] != NULL; k++) {
+                if (KEYS[k][0] == '<' && strncmp(p, KEYS[k], strlen(KEYS[k])) == 0) {
+                    is_tag = true;
+                }
             }
-            T_CHECK_MSG(known, "case %zu produced a line Atlas did not start", i);
+            if (!is_tag && len > 0) {
+                /* Every token on the line, not merely the first: a field
+                 * appended to a line somebody already listed is still a new
+                 * field. `note=` is the one line whose value is prose, and it is
+                 * Atlas' own string literal, so it is matched and skipped
+                 * whole. */
+                bool is_note = strncmp(p, "note=", 5u) == 0;
+                for (const char *q = p; !is_note && q < p + len;) {
+                    const char *sp = memchr(q, ' ', (size_t)(p + len - q));
+                    size_t tlen = sp != NULL ? (size_t)(sp - q) : (size_t)(p + len - q);
+                    bool known = false;
+                    for (size_t k = 0; !known && KEYS[k] != NULL; k++) {
+                        size_t klen = strlen(KEYS[k]);
+                        known = klen <= tlen && strncmp(q, KEYS[k], klen) == 0;
+                    }
+                    T_CHECK_MSG(known, "case %zu produced a field Atlas did not list: %.*s", i,
+                                (int)tlen, q);
+                    if (sp == NULL) {
+                        break;
+                    }
+                    q = sp + 1;
+                }
+            }
             if (nl == NULL) {
                 break;
             }

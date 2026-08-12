@@ -112,6 +112,29 @@ typedef struct atlas_migration {
     int version;
     const char *name;
     const char *const *statements;
+    /* A9.1. Run this migration with `PRAGMA foreign_keys=OFF`, restored
+     * afterwards on every exit path.
+     *
+     * Set on exactly one migration, and it is not a convenience. SQLite cannot
+     * widen a CHECK in place, so a migration that adds a member to a stored
+     * vocabulary must rebuild the table — and with foreign keys enforced, the
+     * implicit DELETE that `DROP TABLE` performs on a table other tables
+     * reference does one of two things, both wrong: it fails outright, or, where
+     * a child declares `ON DELETE CASCADE`, it silently empties the child.
+     * `decision_links.revision_id` declares exactly that, so rebuilding
+     * `decision_revisions` with foreign keys on would have deleted every link
+     * of every decision without failing.
+     *
+     * `PRAGMA defer_foreign_keys` does not help: it defers the violations the
+     * implicit delete counts and nothing decrements them, so the COMMIT fails
+     * even after the rows are back. Measured, not assumed.
+     *
+     * The pragma is issued before `BEGIN`, because inside a transaction it is a
+     * no-op. The migration is still a single transaction, so a failure still
+     * leaves the schema version and every row exactly as they were, and the
+     * rebuild verifies its own row preservation before that transaction
+     * commits. */
+    bool foreign_keys_off;
 } atlas_migration;
 
 const atlas_migration *atlas_migrations(size_t *count_out);

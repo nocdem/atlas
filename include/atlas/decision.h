@@ -60,12 +60,19 @@
 
 /* --- lifecycle -----------------------------------------------------------
  *
- * A closed Atlas-owned vocabulary. Four states, and the transitions between
- * them are the whole of what an approval workflow is.
+ * A closed Atlas-owned vocabulary. The transitions between these states are the
+ * whole of what an approval workflow is.
  *
- * The same four names describe a *revision's* status and an *event* in the
- * ledger, because they are the same fact seen twice: the ledger records that a
- * transition happened, the status column records where it left the revision. */
+ * The same names describe a *revision's* status and an *event* in the ledger,
+ * because they are the same fact seen twice: the ledger records that a
+ * transition happened, the status column records where it left the revision.
+ *
+ * **A state is not a kind.** This vocabulary answers "how far through the
+ * approval workflow is this record?"; `atlas_decision_kind` answers "what sort
+ * of knowledge is it?". The two are orthogonal and A9.1 keeps them so — an
+ * APPROVED INVARIANT, an APPROVED ACCEPTED_RISK and an APPROVED DECISION are
+ * the same state and three different kinds, and no code path may derive one
+ * from the other. */
 typedef enum atlas_decision_state {
     /* Written down, not accepted. Everything a model can produce stops here. */
     ATLAS_DECISION_PROPOSED = 0,
@@ -77,17 +84,165 @@ typedef enum atlas_decision_state {
     ATLAS_DECISION_REJECTED,
     /* Was approved, and a later approval replaced it. Terminal, and historical
      * rather than deleted: what was policy at a point in time is a fact. */
-    ATLAS_DECISION_SUPERSEDED
+    ATLAS_DECISION_SUPERSEDED,
+    /* A9.1. Was approved, and the thing it demanded has happened.
+     *
+     * Terminal for the revision, and only reachable for the kinds whose
+     * semantics contain a demand — an OBLIGATION that was discharged, an
+     * ACCEPTED_RISK that was eliminated rather than replaced. It is *not* a
+     * synonym for SUPERSEDED: superseded says "another record replaced this
+     * one", resolved says "nothing replaced it, and it no longer asks for
+     * anything". Both are historical and neither deletes anything, which is
+     * what lets an obligation be closed out without rewriting its history.
+     *
+     * Deliberately not a statement that the record was *wrong*. A resolved
+     * obligation was a real obligation and its rationale stays readable.
+     *
+     * Reopening is possible and is not a transition: a resolved revision stays
+     * resolved for ever, and a new revision proposed and approved through the
+     * operator channel makes the document effective again. So reopening leaves
+     * exactly the trail an approval does. */
+    ATLAS_DECISION_RESOLVED
 } atlas_decision_state;
 
 const char *atlas_decision_state_name(atlas_decision_state s);
 bool atlas_decision_state_parse(const char *name, atlas_decision_state *out);
+
+/* --- what sort of knowledge this is --------------------------------------
+ *
+ * A9.1. A closed Atlas-owned vocabulary that is **orthogonal to the lifecycle**.
+ *
+ * A4 had one semantic category and called it a decision, so every durable
+ * engineering fact an operator wanted to keep had to be dressed as a choice
+ * between alternatives. A real consolidation exercise on an indexed repository
+ * broke that: a consensus constant that implementations must preserve is not a
+ * choice, a release rule is not an architecture, a currently deployed chain id
+ * is not permanent, and an approach that was tried and abandoned is knowledge
+ * precisely because it is *not* current direction. Recording all of them as
+ * decisions did not lose the prose. It lost the reason a later reader should
+ * treat them differently.
+ *
+ * **DECISION is zero.** A zeroed struct, an absent column and an omitted
+ * argument all mean DECISION, which is what makes every record written before
+ * this vocabulary existed exactly as meaningful as it was — see
+ * `docs/decision-lifecycle.md`. That is the opposite of the rule A6 and A8
+ * follow about UNKNOWN being zero, and deliberately so: there is no such thing
+ * as a knowledge record whose kind Atlas does not know. Every A4 record was a
+ * decision when it was written and is a DECISION now.
+ *
+ * The kind lives on the **document**, is set when the document is created, and
+ * is never updated. It is not part of the canonical content hash, for two
+ * reasons stated in full in `docs/decision-lifecycle.md`: hashing it would move
+ * every digest an operator has already approved, and the kind is identity-like
+ * rather than content — it is fixed before the first revision is written and no
+ * statement in `db_decision.c` names the column in an UPDATE, which is the same
+ * guarantee a revision's own prose has. Reclassifying is superseding: a new
+ * document of the right kind that replaces the old one, so the record of how the
+ * knowledge used to be classified survives. */
+typedef enum atlas_decision_kind {
+    /* A choice between alternatives that establishes project direction or
+     * architecture. What every A4 record is, and the default. */
+    ATLAS_DECISION_KIND_DECISION = 0,
+    /* A rule governing development, release, operation or process. Not an
+     * architecture: it constrains how people and pipelines behave. */
+    ATLAS_DECISION_KIND_POLICY,
+    /* A technical property implementations must preserve. The thing a reviewer
+     * checks a diff against. */
+    ATLAS_DECISION_KIND_INVARIANT,
+    /* A mutable, environment-specific fact about what is currently deployed or
+     * currently relevant — a live chain id, an active endpoint.
+     *
+     * It carries the *least* permanence of any kind and must never be presented
+     * with the permanence of an architectural decision. That is a reporting
+     * obligation rather than a storage difference: the record is as durable as
+     * any other, and what it asserts is only about now. Replacing one is the
+     * ordinary supersede path, which is why the kind needs no special
+     * machinery. */
+    ATLAS_DECISION_KIND_OPERATIONAL_FACT,
+    /* A known security, privacy, reliability or operational risk that has been
+     * explicitly accepted.
+     *
+     * **Discovering a risk does not accept it.** A proposed ACCEPTED_RISK is a
+     * risk somebody has written down and nobody has accepted; acceptance is the
+     * ordinary approval, through the operator channel, and there is no path by
+     * which recording a risk approves it. The kind name describes what an
+     * approved one means, and the lifecycle state is what says whether it has
+     * been. */
+    ATLAS_DECISION_KIND_ACCEPTED_RISK,
+    /* Required future work: a remediation, a blocker, a release gate. The one
+     * kind whose approved form makes a demand, which is why RESOLVED exists. */
+    ATLAS_DECISION_KIND_OBLIGATION,
+    /* Work or architecture intentionally deferred and not currently active.
+     *
+     * Parked is not rejected. An approved PARKED record is an accepted
+     * statement that something is deliberately not being done now, which is a
+     * different and more useful fact than silence. */
+    ATLAS_DECISION_KIND_PARKED,
+    /* An approach that was considered, or built experimentally, and deliberately
+     * rejected — recorded so a later agent does not rediscover it and retry it
+     * without new evidence.
+     *
+     * Read the kind and the state separately, because this is the kind where
+     * conflating them is easiest. An **APPROVED** REJECTED_ALTERNATIVE means
+     * "it is accepted knowledge that we rejected this approach". A **REJECTED**
+     * REJECTED_ALTERNATIVE means the record itself was refused — somebody wrote
+     * down that an approach was rejected and that claim was not accepted. Both
+     * are expressible and they mean different things. */
+    ATLAS_DECISION_KIND_REJECTED_ALTERNATIVE
+} atlas_decision_kind;
+
+/* How many kinds there are, as a compile-time constant, so a caller can hold one
+ * count per kind in a fixed array. `atlas_decision_kind_count()` returns the
+ * length of the table in `src/decision/decision.c` and a static assertion there
+ * ties the two together, so a kind added without widening this fails to
+ * compile rather than overflowing an array. */
+#define ATLAS_DECISION_KIND_MAX 8u
+
+const char *atlas_decision_kind_name(atlas_decision_kind k);
+bool atlas_decision_kind_parse(const char *name, atlas_decision_kind *out);
+/* One fixed sentence saying what the kind means, from a string literal in
+ * `src/decision/decision.c`. Atlas-owned text: no repository byte and no model
+ * byte reaches it, which is why it may be reported to a model and printed
+ * without encoding. */
+const char *atlas_decision_kind_description(atlas_decision_kind k);
+/* Iteration for help text, `--json` vocabularies and the tests, so no caller
+ * has to keep its own copy of the list. */
+size_t atlas_decision_kind_count(void);
+atlas_decision_kind atlas_decision_kind_at(size_t index);
+/* The whole vocabulary as one fixed string, for a usage message and for help
+ * text: `DECISION, POLICY, ...`.
+ *
+ * A literal rather than something assembled into a buffer, because the callers
+ * are error paths and an error path that can fail to allocate reports the wrong
+ * error. `tests/test_decision_kind.c` asserts it names every kind exactly once,
+ * so it cannot drift from the table. */
+const char *atlas_decision_kind_list(void);
+
 /* The transition table, as a function rather than as prose in a comment.
  *
  * This is the single authority on what may follow what; `lifecycle.c` asks it
  * and so do the tests, so a test cannot pass by agreeing with a second copy of
- * the rules. */
-bool atlas_decision_transition_allowed(atlas_decision_state from, atlas_decision_state to);
+ * the rules.
+ *
+ * **A9.1 made it kind-aware, and that is the whole of the kind's effect on the
+ * lifecycle.** Not every kind supports every transition: RESOLVED is reachable
+ * only where the approved record makes a demand that can be discharged, because
+ * "this architectural decision has been resolved" is not a sentence with a
+ * meaning. Everything else is uniform across kinds on purpose — every kind is
+ * proposable, approvable and rejectable, and every approved record can be
+ * superseded — so that a reader does not have to memorise a matrix to know
+ * whether a record can be refused.
+ *
+ * `kind` is the *document's* kind, which cannot change; passing a different one
+ * for two calls about the same document is a caller bug rather than a state
+ * this function has to reconcile. */
+bool atlas_decision_transition_allowed(atlas_decision_kind kind, atlas_decision_state from,
+                                       atlas_decision_state to);
+/* Whether this kind's approved form can be resolved at all. Asked by the CLI
+ * and by the IPC edge so a refusal names the kind before a capability is minted,
+ * and equal by construction to `atlas_decision_transition_allowed(kind,
+ * APPROVED, RESOLVED)` — the tests assert that rather than trusting it. */
+bool atlas_decision_kind_resolvable(atlas_decision_kind k);
 
 /* --- who did it ----------------------------------------------------------
  *
@@ -492,7 +647,16 @@ typedef enum atlas_decision_intent {
      * It changes no lifecycle state. An approved revision that is revalidated
      * was approved before and is approved after; what changed is the point in
      * history that later assessments measure from. */
-    ATLAS_DECISION_INTENT_REVALIDATE
+    ATLAS_DECISION_INTENT_REVALIDATE,
+    /* A9.1. Move an approved revision to RESOLVED.
+     *
+     * A fourth intent on the same capability rather than a second mechanism,
+     * for the reason REVALIDATE is one: it needs exactly the properties
+     * approval needed — an interactive terminal, one use, a short life, a
+     * binding to this revision and this content hash — and reusing the channel
+     * is what keeps the claim about it true. There is still exactly one way to
+     * cause any lifecycle change and it is still the one A4 describes. */
+    ATLAS_DECISION_INTENT_RESOLVE
 } atlas_decision_intent;
 
 const char *atlas_decision_intent_name(atlas_decision_intent i);

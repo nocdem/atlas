@@ -27,6 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "atlas/pathrep.h"
 #include "atlas/sem.h"
 #include "atlas/sem_ops.h"
 #include "atlas/service.h"
@@ -151,6 +152,161 @@ static atlas_status item_add(item_list *l, const char *kind, const char *name, c
     it->why = atlas_sem_selection_reason_intern(why);
     it->depth = depth;
     return ATLAS_OK;
+}
+
+/* --- A9.1: recorded knowledge as a context item ------------------------------
+ *
+ * A decision item's `name` is the record's public uid — Atlas-minted, carrying no
+ * repository byte — and its `file_text` is the anchoring path. Its prose is
+ * deliberately absent: a title is untrusted project text and the package is read
+ * by a model, so what is offered is the identifier to fetch with
+ * `atlas_decision`, where the prose arrives labelled. That is the A2 boundary,
+ * unchanged. */
+typedef struct decision_sink {
+    item_list *list;
+    /* The path this query anchored from, carried in rather than read from the
+     * row: the row describes the document, and which of its links matched is the
+     * caller's own question. */
+    const char *anchor;
+    bool include_history;
+    atlas_err *err;
+    atlas_status st;
+} decision_sink;
+
+static atlas_status take_decision(const atlas_decision_doc_row *row, void *ud, atlas_err *err) {
+    (void)err;
+    decision_sink *s = (decision_sink *)ud;
+    if (s->st != ATLAS_OK) {
+        return s->st;
+    }
+    const char *status = row->status != NULL ? row->status : "";
+    /* What is *currently effective* by default. A proposal is not authority, and
+     * a rejected, superseded or resolved record is history — including it beside
+     * the effective ones without saying so would present withdrawn prose as
+     * current. `--include-history` asks for the rest explicitly, and every item
+     * still carries its own status. */
+    if (!s->include_history && strcmp(status, "APPROVED") != 0) {
+        return ATLAS_OK;
+    }
+    size_t before = *s->list->count;
+    s->st = item_add(s->list, "decision", row->uid != NULL ? row->uid : "",
+                     s->anchor != NULL ? s->anchor : "", 0, ATLAS_SEM_EV_LEXICAL,
+                     ATLAS_SEM_SEL_DECISION, 0, s->err);
+    if (s->st == ATLAS_OK && *s->list->count > before) {
+        atlas_sem_item *it = &(*s->list->items)[*s->list->count - 1u];
+        (void)snprintf(it->knowledge_kind, sizeof it->knowledge_kind, "%s",
+                       row->kind != NULL ? row->kind : "DECISION");
+        (void)snprintf(it->knowledge_status, sizeof it->knowledge_status, "%s", status);
+    }
+    return s->st;
+}
+
+static void note_missing(atlas_sem_context_report *out, const char *what) {
+    if (out->missing_count >= sizeof(out->missing) / sizeof(out->missing[0])) {
+        return;
+    }
+    for (size_t i = 0; i < out->missing_count; i++) {
+        if (out->missing[i] == what) {
+            return;
+        }
+    }
+    out->missing[out->missing_count++] = what;
+}
+
+/* --- A9.1: the recorded knowledge anchored to what the task touches ----------
+ *
+ * `ATLAS_SEM_SEL_DECISION` and `ATLAS_SEM_MISSING_DECISIONS` were in the
+ * vocabulary from A8-CI and nothing ever produced either, so a task-context
+ * package described the code and silently omitted every rule, invariant and
+ * outstanding obligation about it. That is the omission this season exists to
+ * end: a package that lists twelve callers of a function and not the INVARIANT
+ * saying what the function must preserve has left out the part a reader most
+ * needs.
+ *
+ * Selection is by **path anchor**, which is the one relation between a knowledge
+ * record and code that Atlas holds exactly: for each distinct file the request
+ * named or the seeds reached, the records whose links name that path. Bounded on
+ * both axes, deterministic, and it adds no new query shape — it is
+ * `atlas_db_decision_for_path`, the same read `decision for-file` performs.
+ *
+ * **The caller's own paths anchor it too, and that is why this is a function.**
+ * A repository with no semantic index returns early, and the comment at that
+ * early return has always said the package is still useful because "the
+ * repository, its decisions and its file index are all still there". Until A9.1
+ * nothing produced a decision item, so the claim cost nothing and was never
+ * tested; now it would be false. An explicitly named path needs no semantic
+ * index to anchor a record, so the pass runs on both paths.
+ *
+ * The evidence class is **LEXICAL for every one of them, deliberately**. A path
+ * link is a path somebody wrote down and matching it is a byte comparison; no
+ * compiler established that this record governs this code, and A8-CI's rule is
+ * that PROVEN means the compiler proved it. That the anchor is exact does not
+ * make it compiler-derived.
+ *
+ * The kind is reported and **never ranked on**. Atlas has no basis for deciding
+ * that an invariant matters more than an accepted risk, or a decision more than
+ * an obligation; that is a judgement about the reader's task. What Atlas can do
+ * is say which is which, so the reader can. */
+static atlas_status add_knowledge(atlas_db *db, const atlas_sem_context_req *req,
+                                  atlas_sem_context_report *out, item_list *list, size_t *count,
+                                  atlas_err *err) {
+    const char *anchors[ATLAS_SEM_CONTEXT_MAX_DECISION_ANCHORS];
+    size_t nanchors = 0;
+    const size_t cap = sizeof anchors / sizeof anchors[0];
+
+    /* The caller's own paths first: they are the most direct statement of what
+     * the task is about, so they must not be crowded out by a ceiling that a
+     * ranked seed expansion filled. */
+    const char *p = req->paths;
+    const char *pend = p != NULL ? p + req->paths_len : NULL;
+    while (p != NULL && p < pend && *p != '\0' && nanchors < cap) {
+        anchors[nanchors++] = p;
+        p += strlen(p) + 1;
+    }
+    /* Then the distinct files the seeds reached. A `decision` item has no file to
+     * anchor from, so only code items seed this — which also makes the pass
+     * non-recursive by construction. */
+    for (size_t i = 0; i < *count && nanchors < cap; i++) {
+        const char *f = (*list->items)[i].file_text;
+        if (f[0] == '\0' || strcmp((*list->items)[i].kind, "decision") == 0) {
+            continue;
+        }
+        bool seen = false;
+        for (size_t k = 0; k < nanchors; k++) {
+            if (strcmp(anchors[k], f) == 0) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) {
+            anchors[nanchors++] = f;
+        }
+    }
+
+    atlas_status st = ATLAS_OK;
+    size_t before = *count;
+    for (size_t i = 0; st == ATLAS_OK && i < nanchors; i++) {
+        atlas_buf raw = ATLAS_BUF_INIT;
+        st = atlas_path_text_decode(anchors[i], strlen(anchors[i]), &raw, err);
+        if (st == ATLAS_OK) {
+            decision_sink sink = {list, anchors[i], req->include_history, err, ATLAS_OK};
+            int64_t n = 0;
+            bool more = false;
+            atlas_err ignored;
+            atlas_err_init(&ignored);
+            /* A failure to read one anchor's records must not empty the rest of
+             * the package: the code half is still true. */
+            (void)atlas_db_decision_for_path(db, out->repo.id, raw.data, raw.len, NULL,
+                                             ATLAS_SEM_CONTEXT_MAX_DECISIONS_PER_ANCHOR,
+                                             take_decision, &sink, &n, &more, &ignored);
+            st = sink.st;
+        }
+        atlas_buf_free(&raw);
+    }
+    if (st == ATLAS_OK && *count == before) {
+        note_missing(out, ATLAS_SEM_MISSING_DECISIONS);
+    }
+    return st;
 }
 
 /* --- test candidates ------------------------------------------------------------
@@ -564,18 +720,6 @@ static size_t split_terms(const char *task, char *buf, size_t bufsz, const char 
     return n;
 }
 
-static void note_missing(atlas_sem_context_report *out, const char *what) {
-    if (out->missing_count >= sizeof(out->missing) / sizeof(out->missing[0])) {
-        return;
-    }
-    for (size_t i = 0; i < out->missing_count; i++) {
-        if (out->missing[i] == what) {
-            return;
-        }
-    }
-    out->missing[out->missing_count++] = what;
-}
-
 /* The `atlas_ctx` wrapper: resolve the repository, then run the same core. */
 atlas_status atlas_service_sem_impact(atlas_ctx *ctx, const char *name, const char *subject,
                                       int64_t depth, int64_t limit,
@@ -636,16 +780,26 @@ atlas_status atlas_sem_context_on(atlas_db *db, const atlas_repo_info *repo,
     /* A missing or stale index does not fail the request. The package is still
      * useful — the repository, its decisions and its file index are all still
      * there — and it must say what it could not supply rather than read as
-     * complete. */
+     * complete.
+     *
+     * **A9.1 made that sentence true rather than merely written.** It used to
+     * return here, so a repository with no semantic index got an empty package
+     * whose only content was the note saying why — including none of the
+     * decisions the comment claimed were still there, because until A9.1 nothing
+     * produced a decision item at all. Now the knowledge pass runs on this path
+     * too, anchored on the paths the caller named, and the package is ranked and
+     * filled exactly as on the ordinary path. What is absent is the code half,
+     * and the note is what says so. */
     if (!found) {
         note_missing(out, ATLAS_SEM_MISSING_INDEX);
         out->freshness = ATLAS_SEM_FRESH_ABSENT;
-        return ATLAS_OK;
-    }
-    out->freshness = atlas_sem_freshness_of(&out->generation, true, false,
-                                            out->repo.scanned_head, NULL, true, &out->stale_reason);
-    if (out->freshness == ATLAS_SEM_FRESH_STALE) {
-        note_missing(out, ATLAS_SEM_MISSING_STALE);
+    } else {
+        out->freshness = atlas_sem_freshness_of(&out->generation, true, false,
+                                                out->repo.scanned_head, NULL, true,
+                                                &out->stale_reason);
+        if (out->freshness == ATLAS_SEM_FRESH_STALE) {
+            note_missing(out, ATLAS_SEM_MISSING_STALE);
+        }
     }
 
     char termbuf[ATLAS_SEM_CONTEXT_MAX_TASK_BYTES];
@@ -663,8 +817,8 @@ atlas_status atlas_sem_context_on(atlas_db *db, const atlas_repo_info *repo,
     bool any_seed = false;
 
     const char *p = req->symbols;
-    const char *end = p != NULL ? p + req->symbols_len : NULL;
-    while (st == ATLAS_OK && p != NULL && p < end && *p != '\0') {
+    const char *end = found && p != NULL ? p + req->symbols_len : NULL;
+    while (st == ATLAS_OK && found && p != NULL && p < end && *p != '\0') {
         atlas_sem_impact_report imp;
         atlas_sem_impact_report_init(&imp);
         atlas_err ignored;
@@ -688,7 +842,7 @@ atlas_status atlas_sem_context_on(atlas_db *db, const atlas_repo_info *repo,
     /* No explicit seed: rank the whole symbol table by the task's terms.
      * Bounded by the row ceiling, and the package says so when it finds
      * nothing. */
-    if (st == ATLAS_OK && !any_seed) {
+    if (st == ATLAS_OK && found && !any_seed) {
         for (size_t t = 0; t < nterms && st == ATLAS_OK; t++) {
             subject_sink probe;
             memset(&probe, 0, sizeof(probe));
@@ -729,8 +883,15 @@ atlas_status atlas_sem_context_on(atlas_db *db, const atlas_repo_info *repo,
             atlas_sem_impact_report_free(&imp);
         }
     }
-    if (!any_seed) {
+    if (found && !any_seed) {
+        /* Only when there was an index to search. With none, the missing index is
+         * the reason there are no seeds, and saying both would report one fact
+         * twice. */
         note_missing(out, ATLAS_SEM_MISSING_SEEDS);
+    }
+
+    if (st == ATLAS_OK) {
+        st = add_knowledge(db, req, out, &list, &count, err);
     }
 
     /* Rank, then fill to the budget. */

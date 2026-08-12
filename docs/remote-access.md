@@ -201,7 +201,7 @@ to answer `unknown tool`.
 |---|---|
 | `context:read` | task context packages, recorded memory, session state |
 | `repo:read` | repository identity, HEAD, index freshness, changed files, file context, search |
-| `decisions:read` | decision documents, history, freshness gates |
+| `decisions:read` | knowledge records of every kind, their history, freshness gates |
 | `graph:read` | the structural and compiler-derived code graph |
 | `impact:read` | change-impact analysis |
 | `audit:read` | the gateway's own activity trail |
@@ -265,6 +265,51 @@ The credential must be read-only. It must not permit repository writes, decision
 mutation, process execution, configuration mutation, admin operations or
 credential management — and in A9 it structurally cannot, because no grantable
 scope reaches any of them.
+
+## A9.1: knowledge kinds over the remote surfaces
+
+A9.1 gave every knowledge record a `kind` beside its `status`, and the remote
+surfaces expose both in the same shape the local ones do — see
+`docs/decision-lifecycle.md` for what the kinds mean.
+
+**Web API.** `GET /api/v1/decisions` gains a `kind` query parameter beside
+`status`. Both are optional, both are independent, and both are validated by the
+daemon against their closed vocabularies — an unrecognised value is a refusal
+rather than an empty result, because a filter that matched nothing and a filter
+that was misspelt are indistinguishable otherwise. Every document object carries
+`"kind"` beside `"status"`, and the response carries `total_by_kind` beside the
+five `total_*` status counts.
+
+Adding the parameter meant adding it to the row in `API_ROUTES[]`, which is the
+only way a query-string value reaches a daemon call. Nothing else in a query
+string is forwarded.
+
+**Remote MCP.** `atlas_decisions` gains a `kind` filter; `atlas_propose_decision`
+gains a `kind` argument. Both are ordinary tool arguments, forwarded and validated
+by the daemon.
+
+**`atlas_revise_decision` is new, and it is a gap fix rather than a grant.**
+`decision.revise` has existed since A4 and writes a PROPOSED revision by a
+`MODEL_PROPOSAL` actor — exactly what `atlas_propose_decision` writes — so MCP
+being unable to express it meant a model could only write a *new* record beside
+an out-of-date one. Its scope is `memory:write`, which **cannot be granted**, so
+no A9 credential can call it: remotely it is listed to nobody and refused to
+everybody, and it is reachable only over stdio MCP where the local operator's own
+session is the peer.
+
+**Mission Control.** The Knowledge screen has two independent selects — kind and
+status — and shows both as separate columns in the list and separate rows in the
+detail pane. The two use **visually different treatments on purpose**: a status is
+an outlined pill in the traffic-light palette, a kind is a filled uppercase chip
+in a neutral tone, with `ACCEPTED_RISK` and `OBLIGATION` picking up colour because
+those are the two a reader must not skim past. So an APPROVED INVARIANT, an
+APPROVED ACCEPTED_RISK and an APPROVED DECISION are three visibly different rows
+without opening anything.
+
+Nothing about the boundary moved. There is still no route and no tool that
+approves, rejects, supersedes, revalidates or resolves anything. A9.1's one new
+lifecycle verb, `decision.resolve`, is in the operator-uid RPC group — a group the
+gateway's uid is not in, so the gateway is told the method does not exist.
 
 ## Audit
 

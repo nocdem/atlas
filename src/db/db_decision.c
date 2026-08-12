@@ -86,9 +86,9 @@ static atlas_status set_buf_from_col(atlas_buf *dst, sqlite3_stmt *s, int col, a
 /* --- documents ------------------------------------------------------------ */
 
 atlas_status atlas_db_decision_document_create(atlas_db *db, int64_t repo_id,
-                                               const char *root_hash, const char *created_at,
-                                               int64_t *id_out, char *uid_out, size_t uid_size,
-                                               atlas_err *err) {
+                                               const char *root_hash, atlas_decision_kind kind,
+                                               const char *created_at, int64_t *id_out,
+                                               char *uid_out, size_t uid_size, atlas_err *err) {
     *id_out = 0;
     if (uid_size > 0) {
         uid_out[0] = '\0';
@@ -115,9 +115,9 @@ atlas_status atlas_db_decision_document_create(atlas_db *db, int64_t repo_id,
     sqlite3_stmt *s = NULL;
     st = atlas_db_prepare(db,
                           "INSERT INTO decision_documents"
-                          "(uid, repo_id, repo_root_hash, repo_identity_hash, created_at,"
+                          "(uid, repo_id, repo_root_hash, repo_identity_hash, kind, created_at,"
                           " updated_at, latest_revision_no, current_status)"
-                          " VALUES(?1, ?2, ?3, ?4, ?5, ?5, 0, 'PROPOSED');",
+                          " VALUES(?1, ?2, ?3, ?4, ?6, ?5, ?5, 0, 'PROPOSED');",
                           &s, err);
     if (st != ATLAS_OK) {
         atlas_buf_free(&identity);
@@ -139,6 +139,12 @@ atlas_status atlas_db_decision_document_create(atlas_db *db, int64_t repo_id,
     }
     if (st == ATLAS_OK) {
         st = atlas_db_bind_text_opt(db, s, 5, created_at, err);
+    }
+    if (st == ATLAS_OK) {
+        /* The one place a kind is written. `atlas_decision_kind_name` cannot
+         * return anything outside the vocabulary, and the column's CHECK
+         * refuses one anyway. */
+        st = atlas_db_bind_text_opt(db, s, 6, atlas_decision_kind_name(kind), err);
     }
     if (st != ATLAS_OK) {
         atlas_db_finish(db, s);
@@ -1261,17 +1267,80 @@ atlas_status atlas_db_decision_current_revision(atlas_db *db, int64_t document_i
     return ATLAS_OK;
 }
 
+atlas_status atlas_db_decision_approved_revision(atlas_db *db, int64_t document_id,
+                                                 int64_t *revision_id_out, atlas_err *err) {
+    *revision_id_out = 0;
+    sqlite3_stmt *s = NULL;
+    /* A seek on `idx_decision_rev_current`, the partial unique index over
+     * `state = 'APPROVED'`. That index is also why this cannot return "several":
+     * a second approved revision of one document cannot exist. */
+    atlas_status st = atlas_db_prepare(db,
+                                       "SELECT id FROM decision_revisions"
+                                       " WHERE document_id = ?1 AND state = 'APPROVED';",
+                                       &s, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    st = bind_i64(db, s, 1, document_id, err);
+    if (st != ATLAS_OK) {
+        atlas_db_finish(db, s);
+        return st;
+    }
+    if (sqlite3_step(s) == SQLITE_ROW) {
+        *revision_id_out = sqlite3_column_int64(s, 0);
+    }
+    atlas_db_finish(db, s);
+    return ATLAS_OK;
+}
+
+atlas_status atlas_db_decision_kind_of(atlas_db *db, int64_t document_id,
+                                       atlas_decision_kind *kind_out, bool *found_out,
+                                       atlas_err *err) {
+    *kind_out = ATLAS_DECISION_KIND_DECISION;
+    *found_out = false;
+    sqlite3_stmt *s = NULL;
+    atlas_status st =
+        atlas_db_prepare(db, "SELECT kind FROM decision_documents WHERE id = ?1;", &s, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    st = bind_i64(db, s, 1, document_id, err);
+    if (st != ATLAS_OK) {
+        atlas_db_finish(db, s);
+        return st;
+    }
+    if (sqlite3_step(s) == SQLITE_ROW) {
+        *found_out = true;
+        /* A value the CHECK constraint cannot hold is a corrupt row rather than
+         * an unknown kind, and is reported rather than defaulted: defaulting a
+         * garbled classification to DECISION is how a resolvable obligation
+         * quietly stops being one. */
+        if (!atlas_decision_kind_parse(atlas_db_col_text(s, 0), kind_out)) {
+            atlas_db_finish(db, s);
+            return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                                 "decision document %lld stores a knowledge kind Atlas does not "
+                                 "recognise",
+                                 (long long)document_id);
+        }
+    }
+    atlas_db_finish(db, s);
+    return ATLAS_OK;
+}
+
 atlas_status atlas_db_decision_document_shape(atlas_db *db, int64_t document_id,
                                               int64_t *superseded_by_out, int64_t *proposed_out,
-                                              atlas_err *err) {
+                                              int64_t *resolved_out, atlas_err *err) {
     *superseded_by_out = 0;
     *proposed_out = 0;
+    *resolved_out = 0;
     sqlite3_stmt *s = NULL;
     atlas_status st = atlas_db_prepare(
         db,
         "SELECT COALESCE(d.superseded_by_document_id, 0),"
         "       (SELECT COUNT(*) FROM decision_revisions r"
-        "         WHERE r.document_id = d.id AND r.state = 'PROPOSED')"
+        "         WHERE r.document_id = d.id AND r.state = 'PROPOSED'),"
+        "       (SELECT COUNT(*) FROM decision_revisions r"
+        "         WHERE r.document_id = d.id AND r.state = 'RESOLVED')"
         "  FROM decision_documents d WHERE d.id = ?1;",
         &s, err);
     if (st != ATLAS_OK) {
@@ -1285,6 +1354,7 @@ atlas_status atlas_db_decision_document_shape(atlas_db *db, int64_t document_id,
     if (sqlite3_step(s) == SQLITE_ROW) {
         *superseded_by_out = sqlite3_column_int64(s, 0);
         *proposed_out = sqlite3_column_int64(s, 1);
+        *resolved_out = sqlite3_column_int64(s, 2);
     }
     atlas_db_finish(db, s);
     return ATLAS_OK;
@@ -1594,7 +1664,11 @@ atlas_status atlas_db_decision_revision_load(atlas_db *db, int64_t revision_id,
     "       d.latest_revision_no, COALESCE(d.current_revision_id, 0),"                             \
     "       r.id, r.revision_no, r.state, r.title, r.content_hash, r.proposed_by,"                 \
     "       sup.uid,"                                                                              \
-    "       (SELECT COUNT(*) FROM decision_links dl WHERE dl.revision_id = r.id)"                  \
+    "       (SELECT COUNT(*) FROM decision_links dl WHERE dl.revision_id = r.id),"                 \
+    /* A9.1. In the shared projection rather than in each query, so `list`,      \
+     * `show`, `search`, `for-file` and the orphan listing all report the kind    \
+     * and none of them can be the one that forgets. */                          \
+    "       d.kind"                                                                                \
     "  FROM decision_documents d"                                                                  \
     "  LEFT JOIN decision_revisions r ON r.id = COALESCE(d.current_revision_id,"                   \
     "       (SELECT id FROM decision_revisions x WHERE x.document_id = d.id"                       \
@@ -1631,6 +1705,7 @@ static atlas_status emit_doc_rows(atlas_db *db, sqlite3_stmt *s, int64_t limit,
         row.proposed_by = atlas_db_col_text(s, 13);
         row.superseded_by_uid = atlas_db_col_text_opt(s, 14);
         row.link_count = sqlite3_column_int64(s, 15);
+        row.kind = atlas_db_col_text(s, 16);
         st = cb(&row, ud, err);
         if (st != ATLAS_OK) {
             break;
@@ -1680,7 +1755,8 @@ atlas_status atlas_db_decision_orphans_list(atlas_db *db, int64_t limit,
 }
 
 atlas_status atlas_db_decision_documents_list(atlas_db *db, int64_t repo_id, const char *status,
-                                              int64_t limit, atlas_decision_doc_cb cb, void *ud,
+                                              const char *kind, int64_t limit,
+                                              atlas_decision_doc_cb cb, void *ud,
                                               int64_t *count_out, bool *more_out, atlas_err *err) {
     if (count_out != NULL) {
         *count_out = 0;
@@ -1693,11 +1769,16 @@ atlas_status atlas_db_decision_documents_list(atlas_db *db, int64_t repo_id, con
      * planner uses `idx_decision_docs_status` when the parameter is bound and
      * `idx_decision_docs_repo` when it is not, and one statement is one place
      * for the projection to be right. The LIMIT is `?3 + 1` so that "there are
-     * more" is observed rather than assumed from a full page. */
+     * more" is observed rather than assumed from a full page.
+     *
+     * A9.1 adds the kind filter the same way, with `idx_decision_docs_kind`
+     * behind it. The two filters are independent and either, both or neither may
+     * be bound — which is the whole point of the dimension being separate. */
     atlas_status st = atlas_db_prepare(db,
                                        DECISION_DOC_SELECT
                                        " WHERE d.repo_id = ?1"
                                        "   AND (?2 IS NULL OR d.current_status = ?2)"
+                                       "   AND (?4 IS NULL OR d.kind = ?4)"
                                        " ORDER BY d.id DESC LIMIT ?3;",
                                        &s, err);
     if (st != ATLAS_OK) {
@@ -1709,6 +1790,9 @@ atlas_status atlas_db_decision_documents_list(atlas_db *db, int64_t repo_id, con
     }
     if (st == ATLAS_OK) {
         st = bind_i64(db, s, 3, limit + 1, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_db_bind_text_opt(db, s, 4, kind, err);
     }
     if (st != ATLAS_OK) {
         atlas_db_finish(db, s);
@@ -1738,9 +1822,9 @@ atlas_status atlas_db_decision_document_row(atlas_db *db, int64_t document_id,
 }
 
 atlas_status atlas_db_decision_for_path(atlas_db *db, int64_t repo_id, const void *path_raw,
-                                        size_t path_len, int64_t limit, atlas_decision_doc_cb cb,
-                                        void *ud, int64_t *count_out, bool *more_out,
-                                        atlas_err *err) {
+                                        size_t path_len, const char *kind, int64_t limit,
+                                        atlas_decision_doc_cb cb, void *ud, int64_t *count_out,
+                                        bool *more_out, atlas_err *err) {
     if (count_out != NULL) {
         *count_out = 0;
     }
@@ -1760,7 +1844,13 @@ atlas_status atlas_db_decision_for_path(atlas_db *db, int64_t repo_id, const voi
                                        "          FROM decision_links dl"
                                        "          JOIN decision_revisions rv"
                                        "            ON rv.id = dl.revision_id"
+                                       "          JOIN decision_documents dk"
+                                       "            ON dk.id = rv.document_id"
                                        "         WHERE dl.path_raw = ?2"
+                                       /* Inside the bound, for the reason the
+                                        * search filter is: a limit has to bound
+                                        * the set the caller asked for. */
+                                       "           AND (?4 IS NULL OR dk.kind = ?4)"
                                        "         LIMIT ?3) m ON m.did = d.id"
                                        " WHERE d.repo_id = ?1"
                                        " ORDER BY d.id DESC;",
@@ -1774,6 +1864,9 @@ atlas_status atlas_db_decision_for_path(atlas_db *db, int64_t repo_id, const voi
     }
     if (st == ATLAS_OK) {
         st = bind_i64(db, s, 3, limit + 1, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_db_bind_text_opt(db, s, 4, kind, err);
     }
     if (st != ATLAS_OK) {
         atlas_db_finish(db, s);
@@ -2123,9 +2216,17 @@ static atlas_status build_fts_phrase(atlas_buf *out, const char *query, atlas_er
     return st;
 }
 
+/* The A9.1 kind filter is inside the bounded inner select, not outside it.
+ *
+ * Applying it to the already-limited match set would silently return fewer
+ * results than exist: "the first fifty matches, of which these were invariants"
+ * is not "fifty matching invariants", and nothing in the answer would say which
+ * one it was. Filtering before the LIMIT makes the bound bound the thing the
+ * caller asked for. */
 atlas_status atlas_db_decision_search(atlas_db *db, int64_t repo_id, const char *query,
-                                      int64_t limit, atlas_decision_doc_cb cb, void *ud,
-                                      int64_t *count_out, bool *more_out, atlas_err *err) {
+                                      const char *kind, int64_t limit, atlas_decision_doc_cb cb,
+                                      void *ud, int64_t *count_out, bool *more_out,
+                                      atlas_err *err) {
     if (count_out != NULL) {
         *count_out = 0;
     }
@@ -2146,7 +2247,9 @@ atlas_status atlas_db_decision_search(atlas_db *db, int64_t repo_id, const char 
                                   "  JOIN (SELECT DISTINCT ds.document_id AS did"
                                   "          FROM decisions_fts f"
                                   "          JOIN decision_search ds ON ds.revision_id = f.rowid"
+                                  "          JOIN decision_documents dk ON dk.id = ds.document_id"
                                   "         WHERE f.haystack MATCH ?2 AND ds.repo_id = ?1"
+                                  "           AND (?4 IS NULL OR dk.kind = ?4)"
                                   "         LIMIT ?3) m ON m.did = d.id"
                                   " WHERE d.repo_id = ?1"
                                   " ORDER BY d.id DESC;",
@@ -2159,8 +2262,10 @@ atlas_status atlas_db_decision_search(atlas_db *db, int64_t repo_id, const char 
                                   DECISION_DOC_SELECT
                                   "  JOIN (SELECT DISTINCT ds.document_id AS did"
                                   "          FROM decision_search ds"
+                                  "          JOIN decision_documents dk ON dk.id = ds.document_id"
                                   "         WHERE ds.repo_id = ?1"
                                   "           AND ds.haystack LIKE ?2 ESCAPE '\\'"
+                                  "           AND (?4 IS NULL OR dk.kind = ?4)"
                                   "         LIMIT ?3) m ON m.did = d.id"
                                   " WHERE d.repo_id = ?1"
                                   " ORDER BY d.id DESC;",
@@ -2178,6 +2283,9 @@ atlas_status atlas_db_decision_search(atlas_db *db, int64_t repo_id, const char 
     if (st == ATLAS_OK) {
         st = bind_i64(db, s, 3, limit + 1, err);
     }
+    if (st == ATLAS_OK) {
+        st = atlas_db_bind_text_opt(db, s, 4, kind, err);
+    }
     if (st != ATLAS_OK) {
         atlas_db_finish(db, s);
         atlas_buf_free(&pattern);
@@ -2192,11 +2300,13 @@ atlas_status atlas_db_decision_search(atlas_db *db, int64_t repo_id, const char 
 
 atlas_status atlas_db_decision_repo_counts(atlas_db *db, int64_t repo_id, int64_t *proposed,
                                            int64_t *approved, int64_t *rejected,
-                                           int64_t *superseded, atlas_err *err) {
+                                           int64_t *superseded, int64_t *resolved,
+                                           atlas_err *err) {
     *proposed = 0;
     *approved = 0;
     *rejected = 0;
     *superseded = 0;
+    *resolved = 0;
     sqlite3_stmt *s = NULL;
     atlas_status st = atlas_db_prepare(db,
                                        "SELECT current_status, COUNT(*) FROM decision_documents"
@@ -2221,6 +2331,47 @@ atlas_status atlas_db_decision_repo_counts(atlas_db *db, int64_t repo_id, int64_
             *rejected = n;
         } else if (strcmp(k, "SUPERSEDED") == 0) {
             *superseded = n;
+        } else if (strcmp(k, "RESOLVED") == 0) {
+            *resolved = n;
+        }
+    }
+    atlas_db_finish(db, s);
+    return ATLAS_OK;
+}
+
+atlas_status atlas_db_decision_kind_counts(atlas_db *db, int64_t repo_id, int64_t *out,
+                                           size_t out_count, atlas_err *err) {
+    if (out_count < atlas_decision_kind_count()) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                             "a knowledge-kind count array needs %zu elements, not %zu",
+                             atlas_decision_kind_count(), out_count);
+    }
+    for (size_t i = 0; i < out_count; i++) {
+        out[i] = 0;
+    }
+    sqlite3_stmt *s = NULL;
+    atlas_status st = atlas_db_prepare(db,
+                                       "SELECT kind, COUNT(*) FROM decision_documents"
+                                       " WHERE repo_id = ?1 GROUP BY kind;",
+                                       &s, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    st = bind_i64(db, s, 1, repo_id, err);
+    if (st != ATLAS_OK) {
+        atlas_db_finish(db, s);
+        return st;
+    }
+    while (sqlite3_step(s) == SQLITE_ROW) {
+        atlas_decision_kind k;
+        if (atlas_decision_kind_parse(atlas_db_col_text(s, 0), &k)) {
+            /* Indexed by the enum's value, so a caller reads the count for the
+             * kind it names rather than for whatever position the GROUP BY
+             * happened to produce. A value outside the vocabulary is skipped
+             * rather than folded into DECISION: it cannot exist under the CHECK
+             * constraint, and counting it as something else would hide the row
+             * that proves otherwise. */
+            out[(size_t)k] = sqlite3_column_int64(s, 1);
         }
     }
     atlas_db_finish(db, s);
@@ -2703,6 +2854,7 @@ atlas_status atlas_db_decision_verify(atlas_db *db, int64_t document_id, bool *o
     int64_t rejected_count = 0;
     int64_t proposed_count = 0;
     int64_t superseded_count = 0;
+    int64_t resolved_count = 0;
     while (sqlite3_step(s) == SQLITE_ROW) {
         int64_t rev = sqlite3_column_int64(s, 0);
         const char *ev = atlas_db_col_text(s, 1);
@@ -2713,15 +2865,29 @@ atlas_status atlas_db_decision_verify(atlas_db *db, int64_t document_id, bool *o
             rejected_count++;
         } else if (strcmp(ev, "SUPERSEDED") == 0) {
             superseded_count++;
+        } else if (strcmp(ev, "RESOLVED") == 0) {
+            resolved_count++;
         } else {
             proposed_count++;
         }
     }
     atlas_db_finish(db, s);
 
+    /* The precedence, and it is the same order `recompute_status` uses in
+     * `lifecycle.c`. The two have to agree exactly or every resolved document
+     * would be reported as tampered with: this is the replay that decides
+     * whether the cache is honest, and a replay with its own opinion is not a
+     * check.
+     *
+     * A9.1 slots RESOLVED between the outstanding proposal and the refusal. An
+     * outstanding proposal still outranks it, for the reason a rejection never
+     * made a document REJECTED while another revision was pending: what a reader
+     * needs to know first is that there is something to look at. */
     const char *replay_status = "PROPOSED";
     if (approved_count > 0) {
         replay_status = "APPROVED";
+    } else if (proposed_count == 0 && resolved_count > 0) {
+        replay_status = "RESOLVED";
     } else if (proposed_count == 0 && rejected_count > 0) {
         replay_status = "REJECTED";
     } else if (proposed_count == 0 && superseded_count > 0) {

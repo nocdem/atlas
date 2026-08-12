@@ -45,6 +45,16 @@ td.wrap,th.wrap{white-space:normal;min-width:220px}
 .bad{color:var(--bad);border-color:currentColor}
 .unknown{color:var(--unknown);border-color:currentColor}
 .dim{color:var(--dim)}
+/* A9.1. A knowledge kind is not a status and must never look like one.
+   A status tag is an outlined pill in the traffic-light palette; a kind tag is a
+   filled, uppercase, letter-spaced chip in a neutral tone. So APPROVED INVARIANT
+   and APPROVED ACCEPTED_RISK differ in the chip a reader is already looking at,
+   without opening anything. `.risk` is the one kind that gets a colour, because
+   an accepted risk is the one whose meaning a reader must not skim past. */
+.kindtag{display:inline-block;padding:0 6px;border-radius:8px;font-size:10px;letter-spacing:.06em;
+  background:rgba(127,127,127,.18);color:var(--ink);border:1px solid transparent;white-space:nowrap}
+.kindtag.risk{background:rgba(242,104,95,.18);color:var(--bad)}
+.kindtag.duty{background:rgba(232,180,81,.18);color:var(--warn)}
 input,select,button.go{font:inherit;background:var(--bg);color:var(--ink);border:1px solid var(--line);border-radius:3px;padding:4px 8px}
 button.go{cursor:pointer}
 button.go:hover{border-color:var(--accent)}
@@ -86,7 +96,7 @@ code{background:rgba(127,127,127,.12);padding:0 4px;border-radius:2px}
     <div class="grid">
       <div class="panel"><h2>Atlas</h2><div id="o-status"></div></div>
       <div class="panel"><h2>Repositories</h2><div id="o-repos"></div></div>
-      <div class="panel"><h2>Unresolved decisions</h2><div id="o-decisions"></div></div>
+      <div class="panel"><h2>Awaiting approval</h2><div id="o-decisions"></div></div>
       <div class="panel"><h2>Recent activity</h2><div id="o-events"></div></div>
     </div>
   </section>
@@ -106,10 +116,18 @@ code{background:rgba(127,127,127,.12);padding:0 4px;border-radius:2px}
       <label>repository <select id="d-pick"></select></label>
       <label>status <select id="d-status">
         <option value="">any</option><option>PROPOSED</option><option>APPROVED</option>
-        <option>REJECTED</option><option>SUPERSEDED</option></select></label>
+        <option>REJECTED</option><option>SUPERSEDED</option><option>RESOLVED</option></select></label>
+      <!-- A9.1. Two selects, never one. Kind and status are independent
+           dimensions, so "approved invariants" has to be expressible; a single
+           combined dropdown would have made that a choice between them. -->
+      <label>kind <select id="d-kind">
+        <option value="">any</option><option>DECISION</option><option>POLICY</option>
+        <option>INVARIANT</option><option>OPERATIONAL_FACT</option><option>ACCEPTED_RISK</option>
+        <option>OBLIGATION</option><option>PARKED</option>
+        <option>REJECTED_ALTERNATIVE</option></select></label>
     </div>
     <div class="grid" style="grid-template-columns:minmax(340px,1fr) minmax(340px,1.4fr)">
-      <div class="panel"><h2>Decisions</h2><div id="d-list"></div></div>
+      <div class="panel"><h2>Knowledge</h2><div id="d-list"></div></div>
       <div class="panel"><h2>Detail</h2><div id="d-detail"><p class="empty">Select a decision.</p></div></div>
     </div>
   </section>
@@ -162,7 +180,7 @@ code{background:rgba(127,127,127,.12);padding:0 4px;border-radius:2px}
    JSON-safe rather than inert in a DOM, so the escaping happens here too. */
 
 const VIEWS = [
-  ["overview","Overview"],["repository","Repository"],["decisions","Decisions"],
+  ["overview","Overview"],["repository","Repository"],["decisions","Knowledge"],
   ["graph","Graph"],["search","Search"],["impact","Impact"],["audit","Audit"],
 ];
 let scopes = new Set();
@@ -268,11 +286,20 @@ function kv(pairs) {
 function tag(text, kind) { return el("span", {class: "tag " + (kind || ""), text: text}); }
 
 function statusTag(s) {
-  const k = {APPROVED: "ok", PROPOSED: "warn", REJECTED: "bad", SUPERSEDED: "dim",
+  const k = {APPROVED: "ok", PROPOSED: "warn", REJECTED: "bad", SUPERSEDED: "dim", RESOLVED: "dim",
              FRESH: "ok", STALE: "warn", IMPACTED: "warn", BLOCKED: "bad", UNKNOWN: "unknown",
              PROVEN: "ok", CANDIDATE: "warn", LEXICAL: "unknown",
              ALLOWED: "ok", DENIED: "bad", OK: "ok", FAILED: "bad"}[s] || "";
   return tag(s === undefined || s === null ? "—" : String(s), k);
+}
+
+/* A9.1. The kind, rendered as a chip that cannot be mistaken for a status.
+   An absent kind reads as DECISION rather than as a dash, because that is what
+   it means: a record written before the vocabulary existed was a decision. */
+function kindTag(s) {
+  const v = s === undefined || s === null || s === "" ? "DECISION" : String(s);
+  const cls = {ACCEPTED_RISK: "risk", OBLIGATION: "duty"}[v] || "";
+  return el("span", {class: "kindtag " + cls, text: v});
 }
 
 /* --- views ---------------------------------------------------------------- */
@@ -336,6 +363,7 @@ async function viewOverview() {
     return table([
       {label: "repo", get: (x) => x.repo},
       {label: "id", get: (x) => x.decision},
+      {label: "kind", get: (x) => kindTag(x.kind)},
       {label: "title", wrap: true, get: (x) => el("span", {class: "untrusted", text: x.title || "—"})},
       {label: "status", get: (x) => statusTag(x.status)},
     ], all, {empty: "nothing is waiting"});
@@ -407,15 +435,21 @@ async function viewRepository() {
 async function viewDecisions() {
   const name = $("d-pick").value;
   const status = $("d-status").value;
+  const kind = $("d-kind").value;
   if (!name) { say($("d-list"), "no repository selected"); return; }
   panel($("d-list"), async () => {
-    const d = await api("decisions", {repo: name, status: status, limit: 200});
+    const d = await api("decisions", {repo: name, status: status, kind: kind, limit: 200});
+    /* Kind before status, and in their own columns. The whole reason the
+       dimension exists is that a reader can separate what a record is from how
+       far through approval it got. */
     return table([
       {label: "id", get: (x) => x.decision},
+      {label: "kind", get: (x) => kindTag(x.kind)},
+      {label: "status", get: (x) => statusTag(x.status)},
       {label: "title", wrap: true, get: (x) => el("span", {class: "untrusted", text: x.title || "—"})},
       {label: "rev", get: (x) => x.revision},
-      {label: "status", get: (x) => statusTag(x.status)},
-    ], d.decisions, {empty: "no decisions", onclick: (x) => showDecision(name, x.decision)});
+    ], d.decisions, {empty: "nothing recorded of that kind and status",
+                     onclick: (x) => showDecision(name, x.decision)});
   });
 }
 
@@ -426,8 +460,11 @@ async function showDecision(repo, uid) {
     const rev = got.revision || {};
     const box = el("div");
     box.appendChild(kv([
-      ["id", d.decision], ["status", statusTag(d.status)],
+      ["id", d.decision], ["kind", kindTag(d.kind)], ["status", statusTag(d.status)],
       ["revision", d.revision + " of " + d.latest_revision],
+      /* Present only when it is true, so a record that was superseded or
+         resolved says which, and one that was neither says nothing. */
+      ["superseded by", d.superseded_by || undefined],
       ["proposed by", d.proposed_by], ["created", d.created_at],
       ["scope", rev.scope], ["basis head", (rev.basis_head || "").slice(0, 12)],
       ["content hash", d.content_hash],
@@ -607,6 +644,7 @@ async function start() {
   try { await loadRepos(); } catch (e) { /* the views report it individually */ }
 
   for (const [id, ev] of [["r-pick","change"],["d-pick","change"],["d-status","change"],
+                          ["d-kind","change"],
                           ["g-pick","change"],["s-pick","change"],["i-pick","change"]]) {
     const n = $(id);
     if (n) n.addEventListener(ev, () => show(location.hash.slice(1) || "overview"));

@@ -672,6 +672,17 @@ static atlas_status write_items(dispatch_state *ds, const atlas_sem_item *items,
         if (st == ATLAS_OK) {
             st = atlas_json_key_int(ds->j, "line", it->line, err);
         }
+        /* A9.1, and only on a decision item: what sort of knowledge it is and
+         * where the approval workflow left it. Absent rather than empty on a
+         * symbol or a file, so a consumer does not have to distinguish "not a
+         * knowledge record" from "a record with no kind". Both are closed Atlas
+         * vocabularies and need no encoding. */
+        if (st == ATLAS_OK && it->knowledge_kind[0] != '\0') {
+            st = atlas_json_key_str(ds->j, "knowledge_kind", it->knowledge_kind, err);
+        }
+        if (st == ATLAS_OK && it->knowledge_status[0] != '\0') {
+            st = atlas_json_key_str(ds->j, "knowledge_status", it->knowledge_status, err);
+        }
         if (st == ATLAS_OK) {
             st = atlas_json_key_str(ds->j, "evidence", it->evidence, err);
         }

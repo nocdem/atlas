@@ -58,6 +58,10 @@ static const char *const FORBIDDEN_METHODS[] = {
     /* A4/A6 lifecycle. A job may never mint or spend a capability. */
     "decision.challenge", "decision.approve", "decision.reject", "decision.supersede",
     "decision.revalidate", "Decision.Approve", "DECISION.APPROVE", "decision_approve",
+    /* A9.1's resolve, for the same reason: a dispatcher's peer is `atlas-worker`,
+     * and a completed job must not be able to record that the obligation it was
+     * working on has been discharged. */
+    "decision.resolve", "decision_resolve", "DECISION.RESOLVE",
     /* A7 registry. Nothing registers a repository except an operator. */
     "repo.add", "repo.ensure", "repo.remove", "repo.register", "repo.unregister",
     /* A5 backup, restore and maintenance. */

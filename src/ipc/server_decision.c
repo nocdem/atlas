@@ -185,6 +185,30 @@ static atlas_status take_scope(const atlas_ipc_request *req, atlas_decision_op *
     return ATLAS_OK;
 }
 
+/* A9.1. The knowledge kind on a propose, and the assertion checked on a revise.
+ *
+ * `knowledge_kind_given` records whether the request said anything at all, which
+ * is a distinction the server has to keep: a client that has never heard of kinds
+ * omits the key and must be able to revise a POLICY, while a client that sends
+ * `"kind": "DECISION"` for a POLICY document is asserting something false and is
+ * refused. Defaulting the absent case to an assertion would break every existing
+ * client's revise. */
+static atlas_status take_kind(const atlas_ipc_request *req, atlas_decision_op *op,
+                              atlas_err *err) {
+    const char *v = NULL;
+    op->knowledge_kind = ATLAS_DECISION_KIND_DECISION;
+    op->knowledge_kind_given = false;
+    if (!atlas_ipc_param_str(req, "kind", &v) || v == NULL || v[0] == '\0') {
+        return ATLAS_OK;
+    }
+    if (!atlas_decision_kind_parse(v, &op->knowledge_kind)) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "\"kind\" is one of %s",
+                             atlas_decision_kind_list());
+    }
+    op->knowledge_kind_given = true;
+    return ATLAS_OK;
+}
+
 static atlas_status take_alternatives(const atlas_ipc_request *req, atlas_decision_op *op,
                                       atlas_err *err) {
     const atlas_ipc_array *arr = NULL;
@@ -550,6 +574,11 @@ static atlas_status write_result(dispatch_state *ds, const atlas_decision_result
     if (st == ATLAS_OK) {
         st = atlas_json_key_str(ds->j, "state", atlas_decision_state_name(r->state), err);
     }
+    /* A9.1: echoed on every write, so a client that proposed without naming a
+     * kind is told what it created rather than having to assume. */
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "kind", atlas_decision_kind_name(r->knowledge_kind), err);
+    }
     if (st == ATLAS_OK) {
         st = atlas_json_key_bool(ds->j, "created", r->document_created, err);
     }
@@ -588,6 +617,9 @@ static atlas_status build_revision_op(dispatch_state *ds, const atlas_ipc_reques
     }
     if (st == ATLAS_OK) {
         st = take_scope(req, op, err);
+    }
+    if (st == ATLAS_OK) {
+        st = take_kind(req, op, err);
     }
     if (st == ATLAS_OK) {
         st = take_text(req, "title", ATLAS_DECISION_TITLE_MAX, false, &op->revision.title, err);
@@ -805,6 +837,13 @@ static atlas_status write_doc(dispatch_state *ds, const atlas_decision_doc_row *
     if (st == ATLAS_OK) {
         st = atlas_json_key_str(ds->j, "status", row->status, err);
     }
+    /* A9.1. Its own key beside `status`, always present, from a closed Atlas
+     * vocabulary. Never folded into `status`: an approved invariant and an
+     * approved accepted risk share a status and differ here, and a client that
+     * had to parse one field for both would be guessing. */
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "kind", row->kind != NULL ? row->kind : "DECISION", err);
+    }
     if (st == ATLAS_OK) {
         st = atlas_json_key_int(ds->j, "revision", row->head_revision_no, err);
     }
@@ -875,10 +914,25 @@ static atlas_status doc_list(dispatch_state *ds, const atlas_ipc_request *req,
         if (!atlas_decision_state_parse(status, &s)) {
             atlas_repo_info_free(&info);
             return atlas_err_set(err, ATLAS_ERR_USAGE,
-                                 "\"status\" is PROPOSED, APPROVED, REJECTED or SUPERSEDED");
+                                 "\"status\" is PROPOSED, APPROVED, REJECTED, SUPERSEDED or "
+                                 "RESOLVED");
         }
     } else {
         status = NULL;
+    }
+    /* A9.1. Validated against the vocabulary here rather than passed through: an
+     * unrecognised kind must be a refusal, because a filter that matches nothing
+     * and a filter that was misspelt look identical in an empty result. */
+    const char *kind = NULL;
+    if (atlas_ipc_param_str(req, "kind", &kind) && kind != NULL && kind[0] != '\0') {
+        atlas_decision_kind k;
+        if (!atlas_decision_kind_parse(kind, &k)) {
+            atlas_repo_info_free(&info);
+            return atlas_err_set(err, ATLAS_ERR_USAGE, "\"kind\" is one of %s",
+                                 atlas_decision_kind_list());
+        }
+    } else {
+        kind = NULL;
     }
 
     st = atlas_json_key_str(ds->j, "repo", info.name, err);
@@ -898,19 +952,19 @@ static atlas_status doc_list(dispatch_state *ds, const atlas_ipc_request *req,
             if (strlen(query) > ATLAS_DECISION_QUERY_MAX) {
                 st = atlas_err_set(err, ATLAS_ERR_USAGE, "that query is too long");
             } else {
-                st = atlas_db_decision_search(ds->db, info.id, query, limit, on_doc, &lc, &count,
-                                              &more, err);
+                st = atlas_db_decision_search(ds->db, info.id, query, kind, limit, on_doc, &lc,
+                                              &count, &more, err);
             }
         } else if (atlas_ipc_param_str(req, "path", &path) && path != NULL && path[0] != '\0') {
             atlas_buf raw = ATLAS_BUF_INIT;
             st = atlas_path_text_decode(path, strlen(path), &raw, err);
             if (st == ATLAS_OK) {
-                st = atlas_db_decision_for_path(ds->db, info.id, raw.data, raw.len, limit, on_doc,
-                                                &lc, &count, &more, err);
+                st = atlas_db_decision_for_path(ds->db, info.id, raw.data, raw.len, kind, limit,
+                                                on_doc, &lc, &count, &more, err);
             }
             atlas_buf_free(&raw);
         } else {
-            st = atlas_db_decision_documents_list(ds->db, info.id, status, limit, on_doc, &lc,
+            st = atlas_db_decision_documents_list(ds->db, info.id, status, kind, limit, on_doc, &lc,
                                                   &count, &more, err);
         }
     }
@@ -924,9 +978,9 @@ static atlas_status doc_list(dispatch_state *ds, const atlas_ipc_request *req,
         st = atlas_json_key_bool(ds->j, "more", more, err);
     }
     if (st == ATLAS_OK) {
-        int64_t proposed = 0, approved = 0, rejected = 0, superseded = 0;
+        int64_t proposed = 0, approved = 0, rejected = 0, superseded = 0, resolved = 0;
         st = atlas_db_decision_repo_counts(ds->db, info.id, &proposed, &approved, &rejected,
-                                           &superseded, err);
+                                           &superseded, &resolved, err);
         if (st == ATLAS_OK) {
             st = atlas_json_key_int(ds->j, "total_proposed", proposed, err);
         }
@@ -938,6 +992,31 @@ static atlas_status doc_list(dispatch_state *ds, const atlas_ipc_request *req,
         }
         if (st == ATLAS_OK) {
             st = atlas_json_key_int(ds->j, "total_superseded", superseded, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_int(ds->j, "total_resolved", resolved, err);
+        }
+        /* A9.1: one object keyed by the kind names, rather than eight
+         * `total_*` keys. The status totals keep their flat shape because
+         * clients already read them by name; a nested object for the new axis
+         * means a kind added later changes no key a client depends on. */
+        if (st == ATLAS_OK) {
+            int64_t by_kind[ATLAS_DECISION_KIND_MAX];
+            st = atlas_db_decision_kind_counts(ds->db, info.id, by_kind,
+                                               sizeof(by_kind) / sizeof(by_kind[0]), err);
+            if (st == ATLAS_OK) {
+                st = atlas_json_key(ds->j, "total_by_kind", err);
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_obj_begin(ds->j, err);
+            }
+            for (size_t i = 0; st == ATLAS_OK && i < atlas_decision_kind_count(); i++) {
+                atlas_decision_kind k = atlas_decision_kind_at(i);
+                st = atlas_json_key_int(ds->j, atlas_decision_kind_name(k), by_kind[(size_t)k], err);
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_obj_end(ds->j, err);
+            }
         }
     }
     atlas_repo_info_free(&info);
@@ -2563,6 +2642,19 @@ static atlas_status method_revalidate(dispatch_state *ds, const atlas_ipc_reques
     return spend_method(ds, req, ATLAS_DECISION_OP_REVALIDATE, err);
 }
 
+/* A9.1. Spends a resolution capability.
+ *
+ * In the operator group beside approve, reject and supersede, because it is the
+ * same kind of thing: a lifecycle transition that a single-use capability
+ * authorises. It is *not* in the ordinary group and there is no MCP tool for it,
+ * so a model holding every Atlas tool cannot close out an obligation — which is
+ * the same boundary A4 drew around approval and for the same reason. Closing an
+ * obligation is a claim that work was done. */
+static atlas_status method_resolve(dispatch_state *ds, const atlas_ipc_request *req,
+                                   atlas_err *err) {
+    return spend_method(ds, req, ATLAS_DECISION_OP_RESOLVE, err);
+}
+
 /* The operator group. Disjoint from `DECISION_METHODS`, and reachable only from
  * the peer the root-owned policy names — A8's two-group pattern, for A8's
  * reason: a name in a group a peer is not in answers `unknown method`, the same
@@ -2574,6 +2666,7 @@ static const atlas_method_entry OPERATOR_METHODS[] = {
     {"decision.reject", method_reject},
     {"decision.supersede", method_supersede},
     {"decision.revalidate", method_revalidate},
+    {"decision.resolve", method_resolve},
 };
 
 const atlas_method_entry *atlas_server_operator_methods(size_t *count_out) {

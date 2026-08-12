@@ -340,8 +340,20 @@ atlas_status atlas_gate_run(atlas_db *db, const atlas_gate_query *q, atlas_gate_
         bool more = false;
         /* Approved decisions only. A proposal has never been policy, so there
          * is nothing about it that could have gone stale, and blocking on one
-         * would let anybody stop a pipeline by proposing something. */
-        st = atlas_db_decision_documents_list(db, info.id, "APPROVED",
+         * would let anybody stop a pipeline by proposing something.
+         *
+         * **A9.1 filters by status and by nothing else, deliberately.** Every
+         * knowledge kind is gated the same way: an approved INVARIANT and an
+         * approved OPERATIONAL_FACT both have anchors that can move, and Atlas
+         * has no basis for deciding that drift in one matters less than drift in
+         * the other. A gate that quietly skipped a kind would report a clean
+         * assessment of a repository it had only partly assessed. The kind is
+         * reported on each item so a reader can weigh it; the engine does not
+         * weigh it for them.
+         *
+         * A RESOLVED record drops out here for free, and correctly: it is no
+         * longer effective, so there is nothing left to have gone stale. */
+        st = atlas_db_decision_documents_list(db, info.id, "APPROVED", NULL,
                                               ATLAS_GATE_MAX_DECISIONS + 1, on_document, &c,
                                               &count, &more, err);
         /* A single-decision query is not truncated by a ceiling on how many

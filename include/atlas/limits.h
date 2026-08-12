@@ -520,6 +520,24 @@
  * contributes to ranking. */
 #define ATLAS_SEM_CONTEXT_MAX_ITEMS 400
 #define ATLAS_SEM_CONTEXT_MAX_TERMS 64
+/* A9.1. How far the knowledge pass reaches: how many distinct anchor paths one
+ * package asks about, and how many records it takes per anchor.
+ *
+ * Two separate bounds because they bound two different costs. The anchor count
+ * bounds the number of queries, and it is small because the seeds are already
+ * ranked — the files a task is about are at the top, and asking about four
+ * hundred of them would spend the package's whole budget on records anchored to
+ * something the reader will never open. The per-anchor count bounds one file's
+ * records, and a file with more knowledge recorded against it than this is a file
+ * whose records a reader should list explicitly with `decision for-file` rather
+ * than meet inside a context package.
+ *
+ * Both are reported when reached: the package's `missing` list already carries
+ * ATLAS_SEM_MISSING_BUDGET, and neither of these silently trims a result that
+ * looks complete — an anchor beyond the ceiling contributes no item, and the item
+ * count and budget accounting say what was actually included. */
+#define ATLAS_SEM_CONTEXT_MAX_DECISION_ANCHORS 16u
+#define ATLAS_SEM_CONTEXT_MAX_DECISIONS_PER_ANCHOR 8
 /* Bytes of one task description Atlas will read. Longer is a usage error, not a
  * silent truncation: a ranked answer to half a question is worse than a
  * refusal. */

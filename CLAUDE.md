@@ -1,7 +1,13 @@
 # Atlas — working notes for Claude Code
 
 Atlas is a generic, headless engineering-memory and repository-intelligence CLI in
-C17. Phase **A9**: secure remote access — an HTTP gateway that authenticates a
+C17. Phase **A9.1**: knowledge semantics — a durable record now says *what sort of
+knowledge it is* (`DECISION`, `POLICY`, `INVARIANT`, `OPERATIONAL_FACT`,
+`ACCEPTED_RISK`, `OBLIGATION`, `PARKED`, `REJECTED_ALTERNATIVE`) as well as how far
+through the approval workflow it got, and an approved record whose demand has been
+met can be closed out as `RESOLVED` without rewriting its history. The two
+dimensions are orthogonal and no code path derives one from the other. See
+`docs/decision-lifecycle.md` and the A9.1 sections below. On top of **A9**: secure remote access — an HTTP gateway that authenticates a
 bearer credential, checks scopes and forwards only explicitly supported reads to
 `atlasd`; remote MCP over the same tool implementations stdio uses; a versioned
 read-only web API; and an embedded Mission Control page. Credentials are minted
@@ -1570,6 +1576,140 @@ docs         remote-access.md
   widening that applies: the argument is in `RETENTION[]` and must survive being
   read back. `api_keys` is CANONICAL — a credential goes away when an operator
   revokes it, never by age.
+
+## A9.1 layers — additions
+
+There are no new files and no new tables. A9.1 is one column, one lifecycle state
+and one vocabulary, threaded through the layers that already existed:
+
+```
+include/atlas/decision.h  atlas_decision_kind, ATLAS_DECISION_RESOLVED,
+                          ATLAS_DECISION_INTENT_RESOLVE, and a kind-aware
+                          atlas_decision_transition_allowed
+src/decision/decision.c   KINDS[]: the vocabulary, one written meaning per kind,
+                          and the single lifecycle consequence a kind has
+src/decision/lifecycle.c  op_resolve, the kind on propose, the revise refusal,
+                          RESOLVED in recompute_status
+src/db/migrate.c          migration 13, and the one migration in Atlas that runs
+                          with foreign keys off
+src/db/db_decision.c      the kind column, both filters, the kind counts,
+                          atlas_db_decision_approved_revision, RESOLVED in the
+                          ledger replay
+src/sem/context.c         recorded knowledge as a context item, which
+                          ATLAS_SEM_SEL_DECISION had described since A8-CI and
+                          nothing produced
+```
+
+## A9.1 rules — these are not negotiable
+
+- **A kind is not a status, and no code path may derive one from the other.** An
+  APPROVED INVARIANT, an APPROVED ACCEPTED_RISK and an APPROVED DECISION are one
+  status and three kinds. Every surface reports both in separate fields; the human
+  renderer gives them separate columns and the GUI gives them visually different
+  treatments. A single badge carrying both is the one presentation this season
+  exists to prevent.
+- **DECISION is zero, and it is the one Atlas vocabulary whose zero is not
+  "unknown".** A zeroed struct, an omitted argument and an absent column all mean
+  DECISION, because every record written before this vocabulary existed *was* a
+  decision. There is no such thing as a knowledge record whose kind Atlas does not
+  know, so an UNKNOWN member would be a value nothing could ever legitimately
+  hold. Backward compatibility is exact for that reason rather than approximate.
+- **The kind lives on the document, is immutable, and is not part of the canonical
+  content hash.** No `UPDATE` in `db_decision.c` names the column — the same
+  guarantee a revision's prose has. Hashing it would move every digest already
+  approved, and `atlas doctor` reports a moved digest as tampering; and the kind is
+  identity-like rather than content, fixed before revision 1 exists and
+  unchangeable under an approval, so the approval covers it by construction.
+  Reclassifying is superseding with a record of the right kind, which keeps the
+  history of how the knowledge used to be classified. The field-by-field table in
+  `docs/decision-lifecycle.md` carries the row.
+- **A revision cannot reclassify a document**, and an absent kind is not an
+  assertion. `knowledge_kind_given` is what separates "asked for DECISION" from
+  "said nothing", so a client that has never heard of kinds can still revise a
+  POLICY. Losing that distinction would break every pre-A9.1 client's revise.
+- **The transition table is asked with the kind Atlas has stored, never with one a
+  caller supplied.** `transition()` reads it from the document. That is what makes
+  the single write point the authority rather than the request: a caller that could
+  name a resolvable kind for a record that is not one would be describing the
+  record it is changing.
+- **RESOLVED is reachable only from APPROVED and only for a kind whose approved
+  form makes a demand** — OBLIGATION and ACCEPTED_RISK. It is terminal, it names no
+  successor, it deletes nothing and it does not say the record was wrong. Reopening
+  is a new revision approved through the channel, not a transition back.
+- **`recompute_status` and the ledger replay in `atlas_db_decision_verify` must
+  agree exactly about where RESOLVED sits in the precedence.** The replay is what
+  decides whether the cached status is honest, so a replay with its own opinion is
+  not a check. `recompute_status` also derives the approved revision from
+  `decision_revisions` rather than from the cache it is about to write — resolving
+  is the first operation that invalidates that pointer, and a recomputation that
+  trusted it would report a discharged obligation as effective for ever.
+- **Resolving is an operator action with A4's honesty limits word for word.**
+  `decision.resolve` is in the operator-uid group beside `decision.approve`, spends
+  a single-use capability bound to one revision and one content hash, and has no
+  MCP tool and no gateway route. Closing an obligation is a claim that work was
+  done. `LOCAL_OPERATOR_CONFIRMED` on a resolution says the channel was used and
+  nothing more.
+- **`atlas_revise_decision` is a gap fix and must be described as one.**
+  `decision.revise` has existed since A4 and writes a PROPOSED revision by a
+  MODEL_PROPOSAL actor — exactly what `atlas_propose_decision` writes — so MCP
+  being unable to express it meant a model could only write a *new* record beside
+  an out-of-date one, leaving two documents about one subject with no relation
+  between them. Its scope is `memory:write`, which cannot be granted, so no remote
+  credential reaches it. What stays absent is every lifecycle verb.
+- **Migration 13 rebuilds four tables and is the one migration that runs with
+  `PRAGMA foreign_keys=OFF`.** The reason is measured, not hypothetical:
+  `decision_links.revision_id` declares `ON DELETE CASCADE`, so the implicit delete
+  that `DROP TABLE decision_revisions` performs with foreign keys enabled empties
+  the link table *silently and successfully* — verified directly. `defer_foreign_keys`
+  does not help; nothing decrements the violations the implicit delete counts, so
+  the COMMIT fails even after the rows are back. The flag is a field on
+  `atlas_migration`, written out `false` for every other migration so the table
+  answers "which run unchecked?" by being read.
+- **A migration that rebuilds a table verifies its own row preservation before it
+  commits.** Migration 13 records every affected and child table's count first,
+  then requires all nine unchanged, every document id/uid pair and revision
+  id/hash/state triple preserved, the events sequence still covering the highest id
+  it issued, and `pragma_foreign_key_check` silent. The named CHECK
+  `no_decision_row_may_be_lost_in_migration_13` is the error message. Every index is
+  recreated by name; missing `idx_decision_rev_current` would delete the only
+  enforcement of "at most one approved revision per document" without any statement
+  failing.
+- **A path-anchored knowledge record in a context package is LEXICAL evidence, and
+  its kind is reported but never ranked on.** A path link is a path somebody wrote
+  down and matching it is a byte comparison; no compiler established that the record
+  governs the code, and A8-CI's rule is that PROVEN means the compiler proved it.
+  Atlas also has no basis for deciding that an invariant matters more than an
+  accepted risk — that is a judgement about the reader's task, so what Atlas does is
+  say which is which.
+- **The gate filters by status and by nothing else.** Every kind is assessed the
+  same way: an approved INVARIANT and an approved OPERATIONAL_FACT both have anchors
+  that can move, and a gate that quietly skipped a kind would report a clean
+  assessment of a repository it had only partly assessed. A RESOLVED record drops
+  out for free and correctly — it is no longer effective, so nothing is left to have
+  gone stale.
+
+## Extending A9.1 safely
+
+- **A new knowledge kind** means a member of `atlas_decision_kind`, a row in
+  `KINDS[]` carrying its name, whether it is resolvable and one written sentence of
+  meaning, a wider `ATLAS_DECISION_KIND_MAX` (a static assertion in
+  `src/decision/decision.c` refuses otherwise), the string in
+  `atlas_decision_kind_list`, the CHECK on `decision_documents.kind` — which means a
+  **migration**, because SQLite cannot widen a CHECK in place — the `KIND_ENUM[]`
+  schema list and the `<select>` in `mission-control.html`, the table in
+  `docs/decision-lifecycle.md`, and the enumerated expectations in
+  `tests/test_decision_kind.c` and `tests/test_decision_model.c`. Keep DECISION at
+  zero.
+- **A new lifecycle state** is A4's checklist plus this one: the precedence in
+  `recompute_status` and in `atlas_db_decision_verify` must be edited together, and
+  the 25-pair enumeration in `tests/test_decision_model.c` grows by a row and a
+  column.
+- **A new migration that rebuilds a table** decides `foreign_keys_off` deliberately
+  and states why in the row. If any child declares `ON DELETE CASCADE`, the flag is
+  required and the rebuild must verify its own row counts before committing.
+- **A new envelope field** goes in the `KEYS` list in `tests/test_ai_trust.c`, which
+  A9.1 widened from line prefixes to every `key=` on a line — appending a field to a
+  line somebody already listed used to pass unnoticed.
 
 ## Extending A9 safely
 

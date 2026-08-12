@@ -266,11 +266,13 @@ atlas_status atlas_ai_context_render(const atlas_ai_context *c, atlas_buf *out, 
         if (st == ATLAS_OK) {
             st = atlas_buf_appendf(out, err,
                                    "decisions_proposed=%lld decisions_approved=%lld "
-                                   "decisions_rejected=%lld decisions_superseded=%lld\n",
+                                   "decisions_rejected=%lld decisions_superseded=%lld "
+                                   "decisions_resolved=%lld\n",
                                    (long long)c->proposed_decisions,
                                    (long long)c->approved_decisions,
                                    (long long)c->rejected_decisions,
-                                   (long long)c->superseded_decisions);
+                                   (long long)c->superseded_decisions,
+                                   (long long)c->resolved_decisions);
         }
         if (st == ATLAS_OK) {
             st = atlas_buf_appendf(out, err, "decisions_needing_review=%lld\n",

@@ -74,6 +74,13 @@ typedef struct atlas_cli_opts {
         const char *consequences;
         const char *scope;
         const char *status;   /* `decision list --status` */
+        /* A9.1. `--kind`: which sort of knowledge record. On `propose` it says
+         * what to create; on `list`, `search` and `for-file` it filters; on
+         * `revise` it is an assertion Atlas checks against the document and
+         * refuses if it differs. One flag because it is one question, and the
+         * two dimensions stay separate — `--kind` never affects `--status` and
+         * neither implies the other. */
+        const char *kind;
         const char *by;       /* `decision supersede --by` */
         const char *format;   /* `decision export --format` */
         const char *dedup_key;

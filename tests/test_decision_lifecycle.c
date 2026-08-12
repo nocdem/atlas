@@ -1800,11 +1800,11 @@ static void test_nothing_is_ever_deleted(void) {
                 "documents were attached to it",
                 (long long)relinked);
 
-    int64_t proposed = 0, approved_n = 0, rejected = 0, superseded = 0;
+    int64_t proposed = 0, approved_n = 0, rejected = 0, superseded = 0, resolved_n = 0;
     T_OK(atlas_db_decision_repo_counts(e.db, other_id, &proposed, &approved_n, &rejected,
-                                       &superseded, &err),
+                                       &superseded, &resolved_n, &err),
          &err);
-    T_CHECK_MSG(proposed + approved_n + rejected + superseded == 0,
+    T_CHECK_MSG(proposed + approved_n + rejected + superseded + resolved_n == 0,
                 "a replaced repository must inherit no decisions");
 
     /* They are orphaned rather than deleted, and visible as such. A canonical
@@ -1841,11 +1841,11 @@ static void test_nothing_is_ever_deleted(void) {
                 (long long)relinked);
 
     T_OK(atlas_db_decision_repo_counts(e.db, again, &proposed, &approved_n, &rejected, &superseded,
-                                       &err),
+                                       &resolved_n, &err),
          &err);
-    T_CHECK_MSG(proposed + approved_n + rejected + superseded == 2,
+    T_CHECK_MSG(proposed + approved_n + rejected + superseded + resolved_n == 2,
                 "both documents must be reattached to the re-registered repository, and %lld were",
-                (long long)(proposed + approved_n + rejected + superseded));
+                (long long)(proposed + approved_n + rejected + superseded + resolved_n));
 
     atlas_buf_free(&a);
     atlas_buf_free(&b);

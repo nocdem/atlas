@@ -198,6 +198,41 @@ decision prose enters automatic model context at any status.
 Full detail, the state machine, and the explicit non-claims are in
 [docs/decision-lifecycle.md](docs/decision-lifecycle.md).
 
+## Phase A9.1
+
+A9.1 gives a durable record a second, orthogonal dimension: **what sort of
+knowledge it is**, beside how far through the approval workflow it got.
+
+A4 had one semantic category and called it a decision, so a consensus constant an
+implementation must preserve, a release rule, a currently deployed chain id and an
+approach that was tried and abandoned all had to be written down as choices
+between alternatives. The prose survived that; the reason a later reader should
+treat them differently did not.
+
+The kinds are `DECISION`, `POLICY`, `INVARIANT`, `OPERATIONAL_FACT`,
+`ACCEPTED_RISK`, `OBLIGATION`, `PARKED` and `REJECTED_ALTERNATIVE`. They are
+independent of the lifecycle status in both directions: an APPROVED INVARIANT, an
+APPROVED ACCEPTED_RISK and an APPROVED DECISION are one status and three kinds,
+and every surface reports both in separate fields.
+
+Two things follow that are worth stating here:
+
+- **Recording a risk does not accept it.** A proposed `ACCEPTED_RISK` is a risk
+  somebody wrote down and nobody accepted; acceptance is the ordinary approval
+  through the operator channel.
+- **An approved record whose demand has been met can be closed out.** A fifth
+  lifecycle state, `RESOLVED`, exists for `OBLIGATION` and `ACCEPTED_RISK`: it
+  says the demand was met, names no replacement, deletes nothing, and does not say
+  the record was wrong. Resolving is an operator action with exactly A4's honesty
+  limits, and no MCP tool or web route can perform it.
+
+A record written before A9.1 reads as a `DECISION`, its content hash does not
+move, and a client that has never heard of kinds keeps working unchanged.
+
+Full detail — the kinds, the transition table, the authorization matrix and the
+migration — is in
+[docs/decision-lifecycle.md](docs/decision-lifecycle.md).
+
 ## Phase A3
 
 A3 makes Atlas answer structural questions about C source, with the resolution

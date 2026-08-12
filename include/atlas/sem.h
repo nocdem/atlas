@@ -597,7 +597,13 @@ atlas_status atlas_sem_trace(atlas_db *db, int64_t generation_id, const char *fr
 #define ATLAS_SEM_SEL_TYPE "is a type the subject uses"
 #define ATLAS_SEM_SEL_TEST_BY_REFERENCE "a test file that references the subject"
 #define ATLAS_SEM_SEL_TEST_BY_NAME "a test file whose name resembles the subject"
-#define ATLAS_SEM_SEL_DECISION "an approved Atlas decision anchored near the subject"
+/* A9.1 corrected this literal. It said "an approved Atlas decision anchored near
+ * the subject", which was accurate for nothing: A8-CI never produced an item
+ * carrying it, and A9.1's items may be any knowledge kind and — with
+ * `include_history` — any status, so "approved" and "decision" were both claims
+ * the item itself contradicts. A selection reason says *how the item was found*;
+ * what it is, is in `knowledge_kind` and `knowledge_status`. */
+#define ATLAS_SEM_SEL_DECISION "a recorded knowledge record whose links name a file in scope"
 #define ATLAS_SEM_SEL_SUBJECT "the subject itself"
 bool atlas_sem_selection_reason_is_known(const char *reason);
 const char *atlas_sem_selection_reason_intern(const char *reason);
@@ -608,6 +614,17 @@ typedef struct atlas_sem_item {
     char kind[16];
     char name[ATLAS_SEM_MAX_NAME_BYTES];
     char file_text[512];
+    /* A9.1, and set only when `kind` is "decision": what sort of knowledge the
+     * record is, from `atlas_decision_kind_name`, and where the approval workflow
+     * left it.
+     *
+     * Two fields because they are two dimensions. A package that said only
+     * "decision" would tell a reader that a record exists and not whether it is
+     * an invariant they must preserve, a risk somebody accepted, or an obligation
+     * still outstanding — which is the difference that decides what they do next.
+     * Empty on every other kind of item. */
+    char knowledge_kind[24];
+    char knowledge_status[16];
     int64_t line;
     /* How strong the evidence for including this is. A test found by reading a
      * filename is LEXICAL however useful it turns out to be. */
@@ -708,7 +725,7 @@ void atlas_sem_context_report_free(atlas_sem_context_report *r);
 #define ATLAS_SEM_MISSING_STALE "the semantic index does not describe the current commit"
 #define ATLAS_SEM_MISSING_SEEDS "no starting path or symbol matched the task"
 #define ATLAS_SEM_MISSING_BUDGET "the byte budget was reached before every item was included"
-#define ATLAS_SEM_MISSING_DECISIONS "no approved decision was found for this repository"
+#define ATLAS_SEM_MISSING_DECISIONS "no recorded knowledge was found for the files in scope"
 
 /* The libclang version string Atlas will record, e.g. "clang version 14.0.6".
  * Read from the library, never from a command's output. */

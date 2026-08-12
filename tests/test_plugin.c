@@ -380,8 +380,17 @@ static void test_documented_tool_names_are_plugin_scoped_correctly(void) {
      * A8-CI did *not* add is an index tool. Building a semantic index runs a
      * compiler over repository source, so it is an authorised operator action
      * with no MCP surface at all — a model holding every tool in this list
-     * still cannot cause a compiler to run. */
-    T_CHECK_MSG(n == 28, "expected 28 tools, found %zu", n);
+     * still cannot cause a compiler to run.
+     *
+     * A9.1 added one, `atlas_revise_decision`, and it is the same argument in the
+     * other direction: `decision.revise` had existed since A4 and writes a
+     * PROPOSED revision by a MODEL_PROPOSAL actor — exactly what
+     * `atlas_propose_decision` writes — so MCP being unable to express it was an
+     * accidental gap rather than a boundary. What stays absent is every lifecycle
+     * verb: approve, reject, supersede, revalidate and resolve have no tool here,
+     * live in the operator-uid RPC group, and need a capability only the terminal
+     * channel can obtain. */
+    T_CHECK_MSG(n == 29, "expected 29 tools, found %zu", n);
 }
 
 /* --- the integration record ----------------------------------------------

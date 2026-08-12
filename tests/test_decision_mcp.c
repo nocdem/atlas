@@ -58,15 +58,27 @@ static void test_the_tool_inventory_has_no_approval_verb(void) {
 
     size_t n = 0;
     bool saw_propose = false;
+    bool saw_revise = false;
     bool saw_read = false;
     bool saw_legacy = false;
     for (size_t i = 0; names[i] != NULL; i++, n++) {
         const char *t = names[i];
-        /* No tool name may contain an approval verb. Checked as substrings
+        /* No tool name may contain a lifecycle verb. Checked as substrings
          * rather than as exact names, so a future `atlas_decision_approve_all`
-         * or `atlas_approve` is caught by the same assertion. */
-        static const char *const FORBIDDEN[] = {"approve", "approval", "reject", "supersede",
-                                                "confirm", "sign",     NULL};
+         * or `atlas_approve` is caught by the same assertion.
+         *
+         * A9.1 added `resolve` and `revalidate`. Both are lifecycle acts through
+         * the operator channel — resolving records that an obligation's demand was
+         * met, which is a claim that work was done — so a tool for either would be
+         * the same defect approve would be, and the list has to keep pace with the
+         * vocabulary rather than with the verbs that existed when it was written.
+         *
+         * `resolve` as a substring is deliberately broad: it also refuses
+         * `atlas_unresolved_*`, which is a name Atlas does not use and would be a
+         * confusing one anyway. */
+        static const char *const FORBIDDEN[] = {"approve",  "approval",   "reject",
+                                                "supersede", "confirm",   "sign",
+                                                "resolve",  "revalidate", NULL};
         for (size_t k = 0; FORBIDDEN[k] != NULL; k++) {
             T_CHECK_MSG(strstr(t, FORBIDDEN[k]) == NULL,
                         "MCP tool \"%s\" contains the forbidden verb \"%s\": a lifecycle "
@@ -75,6 +87,9 @@ static void test_the_tool_inventory_has_no_approval_verb(void) {
         }
         if (strcmp(t, "atlas_propose_decision") == 0) {
             saw_propose = true;
+        }
+        if (strcmp(t, "atlas_revise_decision") == 0) {
+            saw_revise = true;
         }
         if (strcmp(t, "atlas_decision") == 0) {
             saw_read = true;
@@ -86,6 +101,12 @@ static void test_the_tool_inventory_has_no_approval_verb(void) {
         }
     }
     T_CHECK_MSG(saw_propose, "the A4 proposal tool must exist");
+    /* A9.1. Pinned by name rather than left to the count in
+     * `tests/test_plugin.c`: the count says how many tools there are and this
+     * says *which*, so removing the revise tool and adding an unrelated one would
+     * be caught. It is a proposal tool — it writes a PROPOSED revision by a
+     * MODEL_PROPOSAL actor — which is why it may exist at all. */
+    T_CHECK_MSG(saw_revise, "the A9.1 revision-proposal tool must exist");
     T_CHECK_MSG(saw_read, "the A4 read tool must exist");
     T_CHECK_MSG(saw_legacy, "atlas_record_decision must be retained for compatibility");
     T_CHECK(n > 10u);

@@ -149,6 +149,14 @@ set(ATLAS_TESTS
   # Remote MCP end to end: HTTP bytes in, HTTP bytes out, against a live
   # fixture daemon with real credentials. No listening port is opened.
   test_gw_remote
+  # --- A9.1: knowledge kinds, and a lifecycle state that closes a demand ---
+  #
+  # The vocabulary, the kind-aware transition table, the resolve capability,
+  # both filters, migration 13 and the backup contract, driven against a real
+  # database in process. No daemon and no repository, like the A4 lifecycle
+  # suite, because what is under test is the model, the schema and the
+  # migration rather than a transport.
+  test_decision_kind
 )
 
 foreach(test_name IN LISTS ATLAS_TESTS)
@@ -196,6 +204,10 @@ set_tests_properties(test_decision_model PROPERTIES LABELS "unit")
 # The lifecycle suite drives the state machine against a real database in
 # process, like test_ai_schema: no daemon, no repository, no filesystem events.
 set_tests_properties(test_decision_lifecycle test_migrate6 PROPERTIES LABELS "unit")
+# A9.1. Same shape and the same reason: a real database in process, no daemon.
+# It builds a schema-12 database from the migration list rather than winding a
+# finished one back, so it genuinely exercises the four-table rebuild.
+set_tests_properties(test_decision_kind PROPERTIES LABELS "unit")
 # The operator suite builds a real repository and drives the binary through a
 # pseudo-terminal, so it is an integration test rather than a unit one.
 set_tests_properties(test_decision_operator PROPERTIES LABELS "integration")

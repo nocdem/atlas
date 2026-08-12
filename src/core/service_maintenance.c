@@ -81,7 +81,8 @@ static const retention_pruner *pruner_for(const char *table) {
     return NULL;
 }
 
-/* One row per table. `prunable` is true exactly once. */
+/* One row per table. `prunable` is true exactly twice: `repo_events` since A5 and
+ * `gw_audit` since A9, each with its argument written beside it. */
 static const retention_entry RETENTION[] = {
     /* --- the schema's own record ----------------------------------------- */
     {"schema_migrations", ATLAS_RETAIN_CANONICAL, false,

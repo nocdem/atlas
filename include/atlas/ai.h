@@ -367,6 +367,16 @@ typedef struct atlas_ai_context {
     int64_t proposed_decisions;
     int64_t rejected_decisions;
     int64_t superseded_decisions;
+    /* A9.1. Records whose demand was met and which are therefore no longer
+     * effective. Added so the status axis in the envelope is complete: without
+     * it the four counts stopped summing to the number of records, which reads
+     * as a bug in whichever count a consumer happens to check.
+     *
+     * The envelope deliberately gains **no** per-kind counts. A knowledge kind
+     * is a fixed Atlas vocabulary and so would be safe to emit, but eight more
+     * integers is a lot of envelope for a question one MCP call answers exactly,
+     * and the envelope's job is to be small enough to read. */
+    int64_t resolved_decisions;
     /* Approved decisions with at least one link that no longer matches the code
      * it was recorded against. A count, not a list. */
     int64_t decisions_needing_review;

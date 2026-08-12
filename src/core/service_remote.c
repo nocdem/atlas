@@ -323,6 +323,12 @@ atlas_status atlas_service_decision_list_remote(const char *repo,
         if (st == ATLAS_OK && opts != NULL && opts->path != NULL && opts->path[0] != '\0') {
             st = atlas_json_key_str(j, "path", opts->path, err);
         }
+        /* A9.1. Forwarded so `--kind` narrows the query at the daemon rather than
+         * here: filtering a page the daemon already truncated would return fewer
+         * records than exist and say nothing about it. */
+        if (st == ATLAS_OK && opts != NULL && opts->kind != NULL && opts->kind[0] != '\0') {
+            st = atlas_json_key_str(j, "kind", opts->kind, err);
+        }
         if (st == ATLAS_OK && opts != NULL && opts->limit > 0) {
             st = atlas_json_key_int(j, "limit", opts->limit, err);
         }
@@ -357,6 +363,7 @@ atlas_status atlas_service_decision_list_remote(const char *repo,
         } strs[] = {
             {"decision", &sum.uid},
             {"status", &sum.status},
+            {"kind", &sum.kind},
             {"revision_state", &sum.revision_state},
             {"title", &sum.title},
             {"content_hash", &sum.content_hash},
@@ -404,6 +411,19 @@ atlas_status atlas_service_decision_list_remote(const char *repo,
         }
         if (atlas_ipc_result_int(r, "total_superseded", &t)) {
             counts_out->superseded = t;
+        }
+        if (atlas_ipc_result_int(r, "total_resolved", &t)) {
+            counts_out->resolved = t;
+        }
+        /* A9.1: read by the kind's own name out of `total_by_kind`, so the two
+         * sides agree on names rather than on positions. A daemon older than this
+         * client omits the object and every count stays zero, which is the honest
+         * answer — it has no kinds to report. */
+        for (size_t k = 0; k < atlas_decision_kind_count(); k++) {
+            atlas_decision_kind kind = atlas_decision_kind_at(k);
+            if (atlas_ipc_result_obj_int(r, "total_by_kind", atlas_decision_kind_name(kind), &t)) {
+                counts_out->by_kind[(size_t)kind] = t;
+            }
         }
     }
     atlas_ipc_response_free(r);
@@ -1469,6 +1489,9 @@ atlas_status atlas_service_decision_show_remote(const char *repo, const char *ui
     } strs[] = {
         {"document", "decision", &out->summary.uid},
         {"document", "status", &out->summary.status},
+        /* A9.1. From the document, never from the revision: the kind is a
+         * property of the record and every revision of it shares one. */
+        {"document", "kind", &out->summary.kind},
         {"document", "revision_state", &out->summary.revision_state},
         {"document", "created_at", &out->summary.created_at},
         {"revision", "title", &out->summary.title},
@@ -1714,6 +1737,7 @@ atlas_status atlas_service_decision_orphans_remote(int64_t limit, atlas_decision
             atlas_buf *dst;
         } strs[] = {
             {"decision", &sum.uid},          {"status", &sum.status},
+            {"kind", &sum.kind},
             {"revision_state", &sum.revision_state}, {"title", &sum.title},
             {"content_hash", &sum.content_hash},  {"proposed_by", &sum.proposed_by},
             {"superseded_by", &sum.superseded_by}, {"created_at", &sum.created_at},
@@ -3172,6 +3196,24 @@ static void take_items(const atlas_ipc_response *r, atlas_sem_item **items, size
         }
         if (atlas_ipc_result_arr_obj_str(r, "items", i, "evidence", &v)) {
             copy_str(it->evidence, sizeof it->evidence, v);
+        }
+        /* A9.1. Checked against the closed vocabularies rather than copied: they
+         * arrived over a socket, and a kind Atlas does not recognise must not be
+         * reported as one it does. A value that fails leaves the field empty,
+         * which reads as "not a knowledge record" — the safe direction. */
+        if (atlas_ipc_result_arr_obj_str(r, "items", i, "knowledge_kind", &v)) {
+            atlas_decision_kind parsed;
+            if (atlas_decision_kind_parse(v, &parsed)) {
+                copy_str(it->knowledge_kind, sizeof it->knowledge_kind,
+                         atlas_decision_kind_name(parsed));
+            }
+        }
+        if (atlas_ipc_result_arr_obj_str(r, "items", i, "knowledge_status", &v)) {
+            atlas_decision_state parsed;
+            if (atlas_decision_state_parse(v, &parsed)) {
+                copy_str(it->knowledge_status, sizeof it->knowledge_status,
+                         atlas_decision_state_name(parsed));
+            }
         }
         /* Re-interned against Atlas' own closed set: a reason that arrived over
          * a socket is a matching string, not Atlas' string. */

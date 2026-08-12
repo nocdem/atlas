@@ -192,7 +192,8 @@ static void test_failing_migration_rolls_back_completely(void) {
         "CREATE TABLE m4_partial(x INTEGER);", /* the same name twice: fails */
         NULL,
     };
-    const atlas_migration broken = {ATLAS_SCHEMA_VERSION + 1, "deliberately broken", BROKEN_STMTS};
+    const atlas_migration broken = {ATLAS_SCHEMA_VERSION + 1, "deliberately broken", BROKEN_STMTS,
+                                    false};
 
     atlas_err merr;
     atlas_err_init(&merr);

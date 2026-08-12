@@ -35,6 +35,7 @@
 #include <unistd.h>
 
 #include "atlas/gateway.h"
+#include "atlas/ipc.h"
 #include "atlas_test.h"
 #include "support/fixture.h"
 
@@ -283,7 +284,11 @@ static void test_no_credential_can_reach_a_write_tool(void) {
     bearer(&e, auth, sizeof auth);
 
     static const char *const WRITES[] = {"atlas_record_reason", "atlas_record_unknown_reason",
-                                         "atlas_record_decision", "atlas_propose_decision"};
+                                         "atlas_record_decision", "atlas_propose_decision",
+                                         /* A9.1's one new tool. It writes a
+                                          * PROPOSED revision, so it is a write,
+                                          * so no A9 credential reaches it. */
+                                         "atlas_revise_decision"};
     for (size_t i = 0; i < sizeof WRITES / sizeof WRITES[0]; i++) {
         char msg[512];
         (void)snprintf(msg, sizeof msg,
@@ -1081,6 +1086,105 @@ static void test_concurrent_connections_are_safe(void) {
     env_close(&e);
 }
 
+/* --- A9.1: the knowledge dimension over the remote surfaces --------------- */
+
+/* Both filters over the web API, and the one new tool refused for want of a scope
+ * no credential can hold.
+ *
+ * The point of the route half is that a query parameter reaches a daemon call only
+ * because a row in `API_ROUTES[]` names it, so a filter that works is evidence the
+ * row is right — and a *misspelt* kind must be a refusal rather than an empty
+ * result, because an empty result reads as an answer. */
+static void test_the_api_exposes_the_knowledge_dimension(void) {
+    env e;
+    const char *scopes[] = {"decisions:read"};
+    env_open(&e, scopes, 1);
+    atlas_buf resp = ATLAS_BUF_INIT;
+    char auth[256];
+    bearer(&e, auth, sizeof auth);
+
+    /* Two records of different kinds. Written over the fixture daemon's own
+     * socket rather than through the CLI: the daemon owns the index by the time
+     * `env_open` returns, and the credential under test cannot propose — that is
+     * the boundary, not a limitation of the test. */
+    atlas_err err;
+    atlas_err_init(&err);
+    static const char *const SEED[] = {
+        "{\"repo\":\"proj\",\"kind\":\"OBLIGATION\",\"actor\":\"MODEL_PROPOSAL\","
+        "\"title\":\"licensing must be settled\","
+        "\"decision_body\":\"before any public release\"}",
+        "{\"repo\":\"proj\",\"kind\":\"INVARIANT\",\"actor\":\"MODEL_PROPOSAL\","
+        "\"title\":\"the timestamp is inert\","
+        "\"decision_body\":\"and is encoded as zero\"}",
+    };
+    for (size_t i = 0; i < sizeof SEED / sizeof SEED[0]; i++) {
+        atlas_buf seeded = ATLAS_BUF_INIT;
+        atlas_err serr;
+        atlas_err_init(&serr);
+        T_OK(atlas_ipc_call(atlas_buf_cstr(&e.d.socket), "decision.propose", SEED[i], &seeded,
+                            &serr),
+             &serr);
+        T_REQUIRE_MSG(strstr(atlas_buf_cstr(&seeded), "\"ok\":true") != NULL,
+                      "seeding a record failed: %s", atlas_buf_cstr(&seeded));
+        atlas_buf_free(&seeded);
+    }
+
+    /* Unfiltered: both, each carrying its own kind. */
+    request(&e, "GET", "/api/v1/decisions?repo=proj", auth, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 200);
+    T_CHECK_MSG(strstr(body_of(&resp), "\"kind\":\"OBLIGATION\"") != NULL,
+                "the API omitted the kind: %s", body_of(&resp));
+    T_CHECK(strstr(body_of(&resp), "\"kind\":\"INVARIANT\"") != NULL);
+    /* And the per-kind totals, which are the second axis of the same answer. */
+    T_CHECK_MSG(strstr(body_of(&resp), "total_by_kind") != NULL,
+                "the API omitted the kind totals: %s", body_of(&resp));
+
+    /* Filtered by kind: one, and not the other. */
+    request(&e, "GET", "/api/v1/decisions?repo=proj&kind=OBLIGATION", auth, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 200);
+    T_CHECK_MSG(strstr(body_of(&resp), "\"kind\":\"OBLIGATION\"") != NULL,
+                "the kind filter dropped the matching record: %s", body_of(&resp));
+    T_CHECK_MSG(strstr(body_of(&resp), "\"kind\":\"INVARIANT\"") == NULL,
+                "the kind filter kept a record of another kind: %s", body_of(&resp));
+
+    /* Both filters at once — the combination the dimension exists for. */
+    request(&e, "GET", "/api/v1/decisions?repo=proj&kind=INVARIANT&status=PROPOSED", auth, NULL,
+            &resp);
+    T_EQ_INT(status_of(&resp), 200);
+    T_CHECK(strstr(body_of(&resp), "\"kind\":\"INVARIANT\"") != NULL);
+    T_CHECK(strstr(body_of(&resp), "\"kind\":\"OBLIGATION\"") == NULL);
+
+    /* A kind outside the vocabulary is refused, not silently empty. */
+    request(&e, "GET", "/api/v1/decisions?repo=proj&kind=INVARIENT", auth, NULL, &resp);
+    T_CHECK_MSG(status_of(&resp) >= 400,
+                "a misspelt kind returned %d rather than a refusal: %s", status_of(&resp),
+                body_of(&resp));
+
+    /* The listing offers the revise tool to nobody: its scope is not grantable. */
+    request(&e, "POST", "/mcp", auth,
+            "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/list\",\"params\":{}}", &resp);
+    T_CHECK_MSG(strstr(body_of(&resp), "atlas_revise_decision") == NULL,
+                "a read-only credential was offered the revise tool: %s", body_of(&resp));
+
+    /* And there is no remote resolve, under any spelling. */
+    static const char *const NAMES[] = {"atlas_decision_resolve", "atlas_resolve_decision",
+                                        "atlas_decision_approve", "atlas_decision_set_kind"};
+    for (size_t i = 0; i < sizeof NAMES / sizeof NAMES[0]; i++) {
+        char msg[512];
+        (void)snprintf(msg, sizeof msg,
+                       "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":"
+                       "{\"name\":\"%s\",\"arguments\":{\"repo\":\"proj\"}}}",
+                       NAMES[i]);
+        request(&e, "POST", "/mcp", auth, msg, &resp);
+        T_EQ_INT(status_of(&resp), 200);
+        T_CHECK_MSG(strstr(body_of(&resp), "unknown tool") != NULL,
+                    "\"%s\" was not answered as an unknown tool: %s", NAMES[i], body_of(&resp));
+    }
+
+    atlas_buf_free(&resp);
+    env_close(&e);
+}
+
 static const atlas_test TESTS[] = {
     {"a scoped credential can call a tool", test_a_scoped_credential_can_call_a_tool},
     {"a tool outside the scopes is refused and hidden",
@@ -1095,6 +1199,7 @@ static const atlas_test TESTS[] = {
     {"the transport refuses what it should", test_the_transport_refuses_what_it_should},
     {"the audit trail records what happened", test_the_audit_trail_records_what_happened},
     {"the web API reads and refuses", test_the_web_api_reads_and_refuses},
+    {"the API exposes the knowledge dimension", test_the_api_exposes_the_knowledge_dimension},
     {"the API forwards only what a route declares",
      test_the_api_forwards_only_what_a_route_declares},
     {"the browser exchanges a key for a session",

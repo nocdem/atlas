@@ -1,0 +1,628 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Atlas Mission Control</title>
+<style>
+/* An engineering console, not a website. Density first: small type, tight
+   leading, tables rather than cards, and no animation that delays a reader. */
+:root{
+  --bg:#0e1116; --panel:#151a21; --line:#232a34; --ink:#d7dee8; --dim:#8b97a8;
+  --accent:#6aa5ff; --ok:#4ec9a0; --warn:#e8b451; --bad:#f2685f; --unknown:#8b7fd4;
+  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme:light){
+  :root{--bg:#f6f7f9;--panel:#fff;--line:#dde2e9;--ink:#1a2029;--dim:#5d6878;--accent:#1c5fd0;}
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:13px/1.45 var(--mono)}
+a{color:var(--accent)}
+header{display:flex;align-items:center;gap:16px;padding:8px 14px;border-bottom:1px solid var(--line);background:var(--panel);position:sticky;top:0;z-index:5}
+header h1{font-size:13px;margin:0;letter-spacing:.06em;text-transform:uppercase;color:var(--dim)}
+nav{display:flex;gap:2px;flex-wrap:wrap}
+nav button{background:transparent;border:1px solid transparent;color:var(--dim);padding:4px 10px;font:inherit;cursor:pointer;border-radius:3px}
+nav button:hover{color:var(--ink);border-color:var(--line)}
+nav button[aria-current="true"]{color:var(--ink);background:var(--bg);border-color:var(--line)}
+#who{margin-left:auto;color:var(--dim);display:flex;gap:10px;align-items:center}
+main{padding:14px;max-width:1500px}
+section[hidden]{display:none}
+.grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:4px}
+.panel>h2{margin:0;padding:7px 10px;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--dim);border-bottom:1px solid var(--line);font-weight:600}
+.panel>div{padding:10px;overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-size:12px}
+th,td{text-align:left;padding:3px 10px 3px 0;vertical-align:top;white-space:nowrap}
+th{color:var(--dim);font-weight:600;border-bottom:1px solid var(--line)}
+tbody tr:hover{background:rgba(127,127,127,.07)}
+td.wrap,th.wrap{white-space:normal;min-width:220px}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:2px 14px}
+.kv dt{color:var(--dim)}
+.kv dd{margin:0;overflow-wrap:anywhere}
+.tag{display:inline-block;padding:0 6px;border-radius:3px;border:1px solid var(--line);font-size:11px}
+.ok{color:var(--ok);border-color:currentColor}
+.warn{color:var(--warn);border-color:currentColor}
+.bad{color:var(--bad);border-color:currentColor}
+.unknown{color:var(--unknown);border-color:currentColor}
+.dim{color:var(--dim)}
+input,select,button.go{font:inherit;background:var(--bg);color:var(--ink);border:1px solid var(--line);border-radius:3px;padding:4px 8px}
+button.go{cursor:pointer}
+button.go:hover{border-color:var(--accent)}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
+.empty{color:var(--dim);padding:6px 0}
+.err{color:var(--bad);padding:6px 0;overflow-wrap:anywhere}
+#login{max-width:460px;margin:14vh auto;padding:20px}
+#login h2{margin:0 0 6px}
+#login p{color:var(--dim);margin:0 0 14px}
+#login input{width:100%;margin-bottom:10px}
+code{background:rgba(127,127,127,.12);padding:0 4px;border-radius:2px}
+.bar{height:4px;background:var(--line);border-radius:2px;overflow:hidden}
+.bar>i{display:block;height:100%;background:var(--accent)}
+.untrusted{border-left:2px solid var(--warn);padding-left:8px}
+</style>
+</head>
+<body>
+
+<div id="login" class="panel" hidden>
+  <div>
+    <h2>Atlas Mission Control</h2>
+    <p>Paste an Atlas API key. It is exchanged for a session cookie and is not
+       kept in the browser.</p>
+    <input id="key" type="password" placeholder="atlas_..." autocomplete="off" spellcheck="false">
+    <button class="go" id="signin">Sign in</button>
+    <div id="loginerr" class="err"></div>
+  </div>
+</div>
+
+<div id="app" hidden>
+<header>
+  <h1>Atlas</h1>
+  <nav id="nav"></nav>
+  <div id="who"><span id="principal" class="dim"></span><button class="go" id="signout">Sign out</button></div>
+</header>
+
+<main>
+  <section id="v-overview">
+    <div class="grid">
+      <div class="panel"><h2>Atlas</h2><div id="o-status"></div></div>
+      <div class="panel"><h2>Repositories</h2><div id="o-repos"></div></div>
+      <div class="panel"><h2>Unresolved decisions</h2><div id="o-decisions"></div></div>
+      <div class="panel"><h2>Recent activity</h2><div id="o-events"></div></div>
+    </div>
+  </section>
+
+  <section id="v-repository" hidden>
+    <div class="row"><label>repository <select id="r-pick"></select></label></div>
+    <div class="grid">
+      <div class="panel"><h2>State</h2><div id="r-state"></div></div>
+      <div class="panel"><h2>Index</h2><div id="r-index"></div></div>
+      <div class="panel"><h2>Structural graph</h2><div id="r-code"></div></div>
+      <div class="panel"><h2>Semantic index</h2><div id="r-sem"></div></div>
+    </div>
+  </section>
+
+  <section id="v-decisions" hidden>
+    <div class="row">
+      <label>repository <select id="d-pick"></select></label>
+      <label>status <select id="d-status">
+        <option value="">any</option><option>PROPOSED</option><option>APPROVED</option>
+        <option>REJECTED</option><option>SUPERSEDED</option></select></label>
+    </div>
+    <div class="grid" style="grid-template-columns:minmax(340px,1fr) minmax(340px,1.4fr)">
+      <div class="panel"><h2>Decisions</h2><div id="d-list"></div></div>
+      <div class="panel"><h2>Detail</h2><div id="d-detail"><p class="empty">Select a decision.</p></div></div>
+    </div>
+  </section>
+
+  <section id="v-graph" hidden>
+    <div class="row">
+      <label>repository <select id="g-pick"></select></label>
+      <input id="g-q" placeholder="symbol or path" size="34">
+      <button class="go" id="g-go">Explore</button>
+    </div>
+    <div class="grid" style="grid-template-columns:minmax(300px,1fr) minmax(300px,1fr) minmax(300px,1fr)">
+      <div class="panel"><h2>Symbol</h2><div id="g-symbol"><p class="empty">Nothing selected.</p></div></div>
+      <div class="panel"><h2>Callers</h2><div id="g-callers"></div></div>
+      <div class="panel"><h2>Callees</h2><div id="g-callees"></div></div>
+    </div>
+  </section>
+
+  <section id="v-search" hidden>
+    <div class="row">
+      <label>repository <select id="s-pick"></select></label>
+      <input id="s-q" placeholder="paths and commit messages" size="40">
+      <button class="go" id="s-go">Search</button>
+    </div>
+    <div class="panel"><h2>Results</h2><div id="s-out"><p class="empty">Enter a query.</p></div></div>
+  </section>
+
+  <section id="v-impact" hidden>
+    <div class="row">
+      <label>repository <select id="i-pick"></select></label>
+      <input id="i-q" placeholder="symbol" size="28">
+      <input id="i-path" placeholder="or path" size="28">
+      <button class="go" id="i-go">Analyse</button>
+    </div>
+    <div class="panel"><h2>Impact</h2><div id="i-out"><p class="empty">Name a symbol or a path.</p></div></div>
+  </section>
+
+  <section id="v-audit" hidden>
+    <div class="panel"><h2>Remote activity</h2><div id="a-out"></div></div>
+  </section>
+</main>
+</div>
+
+<script>
+"use strict";
+/* No framework and no build step. Atlas' rules forbid Node in the build, the
+   tests and the runtime, so this is hand-written and served from the binary.
+
+   Every value Atlas returns is inserted with textContent, never innerHTML. The
+   daemon safe-encodes repository prose, but that makes it terminal-safe and
+   JSON-safe rather than inert in a DOM, so the escaping happens here too. */
+
+const VIEWS = [
+  ["overview","Overview"],["repository","Repository"],["decisions","Decisions"],
+  ["graph","Graph"],["search","Search"],["impact","Impact"],["audit","Audit"],
+];
+let scopes = new Set();
+let repos = [];
+
+const $ = (id) => document.getElementById(id);
+
+function el(tag, opts = {}, kids = []) {
+  const n = document.createElement(tag);
+  if (opts.class) n.className = opts.class;
+  if (opts.text !== undefined) n.textContent = String(opts.text);
+  if (opts.title) n.title = String(opts.title);
+  for (const k of kids) n.appendChild(k);
+  return n;
+}
+
+function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+
+function say(node, msg, cls) {
+  clear(node);
+  node.appendChild(el("p", {class: cls || "empty", text: msg}));
+}
+
+/* One fetch path, so every view handles loading, permission denied, server
+   error and malformed data the same way. */
+async function api(path, params) {
+  const q = new URLSearchParams();
+  for (const [k, v] of Object.entries(params || {})) {
+    if (v !== undefined && v !== null && v !== "") q.set(k, v);
+  }
+  const url = "/api/v1/" + path + (q.toString() ? "?" + q.toString() : "");
+  let res;
+  try {
+    res = await fetch(url, {credentials: "same-origin", headers: {"Accept": "application/json"}});
+  } catch (e) {
+    throw new Error("the gateway is not reachable");
+  }
+  if (res.status === 401) { showLogin(); throw new Error("the session has ended"); }
+  let body = null;
+  try { body = await res.json(); } catch (e) { body = null; }
+  if (!res.ok) {
+    const m = body && body.error && body.error.message ? body.error.message : ("HTTP " + res.status);
+    const err = new Error(m);
+    err.status = res.status;
+    throw err;
+  }
+  if (body === null) throw new Error("the gateway returned something that is not JSON");
+  return body.result !== undefined ? body.result : body;
+}
+
+/* Renders into a panel, turning every failure into a readable line rather than
+   an empty box. A panel that silently shows nothing is indistinguishable from
+   one whose data is genuinely empty. */
+async function panel(node, fn) {
+  say(node, "loading…", "dim");
+  try {
+    const out = await fn();
+    if (out === undefined) return;
+    clear(node);
+    if (out === null) { say(node, "nothing to show"); return; }
+    node.appendChild(out);
+  } catch (e) {
+    if (e.status === 403) say(node, "this credential does not permit that read", "err");
+    else say(node, String(e.message || e), "err");
+  }
+}
+
+function table(cols, rows, opts) {
+  if (!rows || rows.length === 0) return el("p", {class: "empty", text: (opts && opts.empty) || "nothing"});
+  const t = el("table");
+  const thead = el("thead");
+  const tr = el("tr");
+  for (const c of cols) tr.appendChild(el("th", {text: c.label, class: c.wrap ? "wrap" : ""}));
+  thead.appendChild(tr);
+  t.appendChild(thead);
+  const tb = el("tbody");
+  for (const r of rows) {
+    const row = el("tr");
+    for (const c of cols) {
+      const v = c.get(r);
+      const td = el("td", {class: c.wrap ? "wrap" : ""});
+      if (v instanceof Node) td.appendChild(v); else td.textContent = v === undefined || v === null ? "—" : String(v);
+      row.appendChild(td);
+    }
+    if (opts && opts.onclick) { row.style.cursor = "pointer"; row.onclick = () => opts.onclick(r); }
+    tb.appendChild(row);
+  }
+  t.appendChild(tb);
+  return t;
+}
+
+function kv(pairs) {
+  const dl = el("dl", {class: "kv"});
+  for (const [k, v] of pairs) {
+    dl.appendChild(el("dt", {text: k}));
+    const dd = el("dd");
+    if (v instanceof Node) dd.appendChild(v); else dd.textContent = v === undefined || v === null ? "—" : String(v);
+    dl.appendChild(dd);
+  }
+  return dl;
+}
+
+function tag(text, kind) { return el("span", {class: "tag " + (kind || ""), text: text}); }
+
+function statusTag(s) {
+  const k = {APPROVED: "ok", PROPOSED: "warn", REJECTED: "bad", SUPERSEDED: "dim",
+             FRESH: "ok", STALE: "warn", IMPACTED: "warn", BLOCKED: "bad", UNKNOWN: "unknown",
+             PROVEN: "ok", CANDIDATE: "warn", LEXICAL: "unknown",
+             ALLOWED: "ok", DENIED: "bad", OK: "ok", FAILED: "bad"}[s] || "";
+  return tag(s === undefined || s === null ? "—" : String(s), k);
+}
+
+/* --- views ---------------------------------------------------------------- */
+
+async function loadRepos() {
+  const r = await api("repos");
+  repos = (r.repositories || []).map((x) => x.repo || x.name).filter(Boolean);
+  for (const id of ["r-pick","d-pick","g-pick","s-pick","i-pick"]) {
+    const sel = $(id);
+    if (!sel) continue;
+    const keep = sel.value;
+    clear(sel);
+    for (const name of repos) {
+      const o = el("option", {text: name});
+      o.value = name;
+      sel.appendChild(o);
+    }
+    if (keep && repos.includes(keep)) sel.value = keep;
+  }
+  return repos;
+}
+
+async function viewOverview() {
+  panel($("o-status"), async () => {
+    const s = await api("status");
+    return kv([
+      ["daemon", s.running === false ? tag("not running", "bad") : tag("running", "ok")],
+      ["version", s.version],
+      ["protocol", s.protocol],
+      ["schema", s.schema],
+      ["repositories", s.repositories],
+      ["uptime (s)", s.uptime_s],
+    ]);
+  });
+
+  panel($("o-repos"), async () => {
+    const r = await api("repos");
+    return table([
+      {label: "repository", get: (x) => x.repo || x.name},
+      {label: "branch", get: (x) => x.branch},
+      {label: "index", get: (x) => x.index_current === false ? tag("stale", "warn") : tag("current", "ok")},
+      {label: "changes", get: (x) => x.changed_paths},
+    ], r.repositories, {empty: "no repositories are registered"});
+  });
+
+  panel($("o-decisions"), async () => {
+    if (!scopes.has("decisions:read")) return el("p", {class: "empty", text: "needs decisions:read"});
+    await loadRepos();
+    const all = [];
+    for (const name of repos.slice(0, 8)) {
+      try {
+        const d = await api("decisions", {repo: name, status: "PROPOSED", limit: 25});
+        for (const x of (d.decisions || [])) all.push(Object.assign({repo: name}, x));
+      } catch (e) { /* one repository failing must not empty the panel */ }
+    }
+    return table([
+      {label: "repo", get: (x) => x.repo},
+      {label: "id", get: (x) => x.uid},
+      {label: "title", wrap: true, get: (x) => el("span", {class: "untrusted", text: x.title || "—"})},
+      {label: "status", get: (x) => statusTag(x.status)},
+    ], all, {empty: "nothing is waiting"});
+  });
+
+  panel($("o-events"), async () => {
+    await loadRepos();
+    if (repos.length === 0) return el("p", {class: "empty", text: "no repositories"});
+    const e = await api("events", {repo: repos[0], limit: 30});
+    return table([
+      {label: "at", get: (x) => (x.at || "").replace("T", " ").replace("Z", "")},
+      {label: "kind", get: (x) => x.kind},
+      {label: "detail", wrap: true, get: (x) => el("span", {class: "untrusted", text: x.detail || x.path || "—"})},
+    ], e.events, {empty: "no recent events"});
+  });
+}
+
+async function viewRepository() {
+  const name = $("r-pick").value;
+  if (!name) { say($("r-state"), "no repository selected"); return; }
+  panel($("r-state"), async () => {
+    const s = await api("repo", {repo: name});
+    return kv([
+      ["repository", s.repo || name],
+      ["head", s.head],
+      ["branch", s.branch],
+      ["dirty", s.dirty ? tag("yes", "warn") : tag("no", "ok")],
+      ["root hash", s.root_hash],
+    ]);
+  });
+  panel($("r-index"), async () => {
+    const s = await api("repo", {repo: name});
+    return kv([
+      ["current", s.index_current === false ? tag("no", "warn") : tag("yes", "ok")],
+      ["reason", s.index_reason],
+      ["generation", s.generation],
+      ["files", s.files],
+      ["commits", s.commits],
+      ["changed paths", s.changed_paths],
+    ]);
+  });
+  panel($("r-code"), async () => {
+    if (!scopes.has("graph:read")) return el("p", {class: "empty", text: "needs graph:read"});
+    const c = await api("code/status", {repo: name});
+    return kv([
+      ["current", c.current ? tag("yes", "ok") : tag("no", "warn")],
+      ["symbols", c.symbols], ["relations", c.relations],
+      ["ambiguous", c.ambiguous], ["unresolved", c.unresolved],
+      ["analyzer", c.analyzer + " " + (c.analyzer_version || "")],
+    ]);
+  });
+  panel($("r-sem"), async () => {
+    if (!scopes.has("graph:read")) return el("p", {class: "empty", text: "needs graph:read"});
+    const c = await api("sem/status", {repo: name});
+    if (c.available === false) return el("p", {class: "empty", text: "this Atlas has no compiler-aware index"});
+    return kv([
+      ["freshness", statusTag(c.freshness)],
+      ["generation", c.generation],
+      ["symbols", c.symbols], ["edges", c.edges],
+      ["units complete", c.units_complete], ["units partial", c.units_partial],
+      ["units failed", c.units_failed],
+    ]);
+  });
+}
+
+async function viewDecisions() {
+  const name = $("d-pick").value;
+  const status = $("d-status").value;
+  if (!name) { say($("d-list"), "no repository selected"); return; }
+  panel($("d-list"), async () => {
+    const d = await api("decisions", {repo: name, status: status, limit: 200});
+    return table([
+      {label: "id", get: (x) => x.uid},
+      {label: "title", wrap: true, get: (x) => el("span", {class: "untrusted", text: x.title || "—"})},
+      {label: "status", get: (x) => statusTag(x.status)},
+    ], d.decisions, {empty: "no decisions", onclick: (x) => showDecision(name, x.uid)});
+  });
+}
+
+async function showDecision(repo, uid) {
+  panel($("d-detail"), async () => {
+    const d = await api("decision", {repo: repo, uid: uid});
+    const box = el("div");
+    box.appendChild(kv([
+      ["id", d.uid], ["status", statusTag(d.status)],
+      ["revision", d.revision_no], ["created", d.created_at],
+      ["content hash", d.content_hash],
+    ]));
+    const prose = [["Title", d.title], ["Decision", d.decision], ["Context", d.context],
+                   ["Rationale", d.rationale]];
+    for (const [label, text] of prose) {
+      if (!text) continue;
+      box.appendChild(el("h3", {text: label}));
+      box.appendChild(el("p", {class: "untrusted", text: text}));
+    }
+    if (d.links && d.links.length) {
+      box.appendChild(el("h3", {text: "Links"}));
+      box.appendChild(table([
+        {label: "kind", get: (x) => x.kind},
+        {label: "target", wrap: true, get: (x) => x.target || x.path || x.symbol},
+        {label: "currency", get: (x) => statusTag(x.currency)},
+      ], d.links));
+    }
+    box.appendChild(el("p", {class: "dim", text: "Decision prose is UNTRUSTED_DATA: it is repository text, shown as text."}));
+    return box;
+  });
+}
+
+async function viewGraph() {
+  const name = $("g-pick").value;
+  const q = $("g-q").value.trim();
+  if (!name || !q) { say($("g-symbol"), "Name a symbol or a path."); return; }
+  panel($("g-symbol"), async () => {
+    const s = await api("sem/symbol", {repo: name, symbol: q});
+    return table([
+      {label: "name", get: (x) => x.name},
+      {label: "kind", get: (x) => x.kind},
+      {label: "file", wrap: true, get: (x) => x.file},
+      {label: "line", get: (x) => x.line},
+    ], s.symbols || s.results, {empty: "no such symbol"});
+  });
+  panel($("g-callers"), async () => {
+    const s = await api("sem/callers", {repo: name, symbol: q, depth: 2});
+    return table([
+      {label: "caller", wrap: true, get: (x) => x.name},
+      {label: "evidence", get: (x) => statusTag(x.evidence)},
+      {label: "file", wrap: true, get: (x) => x.file},
+    ], s.nodes || s.callers, {empty: "nothing calls it, or the index has not run"});
+  });
+  panel($("g-callees"), async () => {
+    const s = await api("sem/callees", {repo: name, symbol: q, depth: 2});
+    return table([
+      {label: "callee", wrap: true, get: (x) => x.name},
+      {label: "evidence", get: (x) => statusTag(x.evidence)},
+      {label: "file", wrap: true, get: (x) => x.file},
+    ], s.nodes || s.callees, {empty: "it calls nothing Atlas can prove"});
+  });
+}
+
+async function viewSearch() {
+  const name = $("s-pick").value;
+  const q = $("s-q").value.trim();
+  if (!name || !q) { say($("s-out"), "Enter a query."); return; }
+  panel($("s-out"), async () => {
+    const r = await api("search", {repo: name, q: q, limit: 100});
+    return table([
+      {label: "kind", get: (x) => x.kind},
+      {label: "match", wrap: true, get: (x) => el("span", {class: "untrusted", text: x.path || x.subject || "—"})},
+      {label: "commit", get: (x) => x.commit},
+    ], r.results, {empty: "nothing matched"});
+  });
+}
+
+async function viewImpact() {
+  const name = $("i-pick").value;
+  const sym = $("i-q").value.trim();
+  const path = $("i-path").value.trim();
+  if (!name || (!sym && !path)) { say($("i-out"), "Name a symbol or a path."); return; }
+  panel($("i-out"), async () => {
+    const r = await api("impact", {repo: name, symbol: sym, path: path, depth: 3});
+    const box = el("div");
+    box.appendChild(el("p", {class: "dim",
+      text: "Every item says how it was found. PROVEN is the compiler; CANDIDATE crosses an indirect call; LEXICAL is a name match. Totals are reported separately, never summed."}));
+    box.appendChild(table([
+      {label: "item", wrap: true, get: (x) => x.name || x.path},
+      {label: "evidence", get: (x) => statusTag(x.evidence)},
+      {label: "why", get: (x) => x.reason || x.selection_reason},
+      {label: "file", wrap: true, get: (x) => x.file},
+    ], r.items || r.impacted, {empty: "nothing reached, or the index has not run"}));
+    if (r.limit_reached) box.appendChild(el("p", {class: "err", text: "A traversal bound was reached: this result is truncated and says so."}));
+    return box;
+  });
+}
+
+async function viewAudit() {
+  panel($("a-out"), async () => {
+    if (!scopes.has("audit:read")) return el("p", {class: "empty", text: "needs audit:read"});
+    const a = await api("audit", {limit: 200});
+    return table([
+      {label: "at", get: (x) => (x.at || "").replace("T", " ").replace("Z", "")},
+      {label: "interface", get: (x) => x.interface},
+      {label: "key", get: (x) => x.key_id || "—"},
+      {label: "label", get: (x) => x.label || "—"},
+      {label: "operation", wrap: true, get: (x) => x.operation},
+      {label: "decision", get: (x) => statusTag(x.decision)},
+      {label: "outcome", get: (x) => statusTag(x.outcome)},
+      {label: "ms", get: (x) => x.duration_ms},
+    ], a.events, {empty: "no remote activity recorded"});
+  });
+}
+
+const LOADERS = {overview: viewOverview, repository: viewRepository, decisions: viewDecisions,
+                 graph: viewGraph, search: viewSearch, impact: viewImpact, audit: viewAudit};
+
+function show(view) {
+  for (const [id] of VIEWS) {
+    const s = $("v-" + id);
+    if (s) s.hidden = id !== view;
+    const b = $("nav-" + id);
+    if (b) b.setAttribute("aria-current", String(id === view));
+  }
+  location.hash = view;
+  const fn = LOADERS[view];
+  if (fn) fn().catch((e) => console.error(e));
+}
+
+function buildNav() {
+  const nav = $("nav");
+  clear(nav);
+  for (const [id, label] of VIEWS) {
+    const b = el("button", {text: label});
+    b.id = "nav-" + id;
+    b.onclick = () => show(id);
+    nav.appendChild(b);
+  }
+}
+
+/* --- session -------------------------------------------------------------- */
+
+function showLogin() {
+  $("app").hidden = true;
+  $("login").hidden = false;
+  $("key").value = "";
+  $("key").focus();
+}
+
+async function start() {
+  let me;
+  try {
+    const res = await fetch("/auth/me", {credentials: "same-origin"});
+    if (!res.ok) { showLogin(); return; }
+    me = await res.json();
+  } catch (e) { showLogin(); return; }
+
+  scopes = new Set((me.scopes || "").split(" ").filter(Boolean));
+  $("login").hidden = true;
+  $("app").hidden = false;
+  $("principal").textContent = (me.label || "?") + " · " + [...scopes].join(" ");
+
+  buildNav();
+  try { await loadRepos(); } catch (e) { /* the views report it individually */ }
+
+  for (const [id, ev] of [["r-pick","change"],["d-pick","change"],["d-status","change"],
+                          ["g-pick","change"],["s-pick","change"],["i-pick","change"]]) {
+    const n = $(id);
+    if (n) n.addEventListener(ev, () => show(location.hash.slice(1) || "overview"));
+  }
+  $("g-go").onclick = viewGraph;
+  $("s-go").onclick = viewSearch;
+  $("i-go").onclick = viewImpact;
+  for (const id of ["g-q","s-q","i-q","i-path"]) {
+    $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") LOADERS[location.hash.slice(1) || "graph"](); });
+  }
+
+  const want = location.hash.slice(1);
+  show(VIEWS.some(([v]) => v === want) ? want : "overview");
+}
+
+$("signin").onclick = async () => {
+  const k = $("key").value.trim();
+  $("loginerr").textContent = "";
+  if (!k) { $("loginerr").textContent = "Paste an API key."; return; }
+  try {
+    const res = await fetch("/auth/login", {
+      method: "POST", credentials: "same-origin",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({key: k}),
+    });
+    /* The key leaves this function here and is never stored: not in
+       localStorage, not in a variable that outlives this handler, and not in
+       the URL. What the browser keeps is the HttpOnly cookie the server set,
+       which script cannot read. */
+    $("key").value = "";
+    if (!res.ok) { $("loginerr").textContent = "That key was not accepted."; return; }
+    await start();
+  } catch (e) {
+    $("loginerr").textContent = "The gateway is not reachable.";
+  }
+};
+
+$("key").addEventListener("keydown", (e) => { if (e.key === "Enter") $("signin").click(); });
+
+$("signout").onclick = async () => {
+  try { await fetch("/auth/logout", {method: "POST", credentials: "same-origin"}); } catch (e) {}
+  showLogin();
+};
+
+window.addEventListener("hashchange", () => {
+  if (!$("app").hidden) show(location.hash.slice(1) || "overview");
+});
+
+start();
+</script>
+</body>
+</html>

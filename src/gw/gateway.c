@@ -19,6 +19,8 @@
 #include <string.h>
 #include <time.h>
 
+#include <pthread.h>
+
 #include "atlas/atlas.h"
 #include "atlas/hmac.h"
 #include "atlas/ipc.h"
@@ -467,6 +469,187 @@ static atlas_status mcp_exchange(atlas_gateway *g, const principal *pr, const ch
     return st;
 }
 
+
+
+/* --- browser sessions ------------------------------------------------------
+ *
+ * A9.9 says not to hand a long-lived API key to browser JavaScript. So the key
+ * is posted once to `/auth/login`, exchanged for an opaque session, and the
+ * browser keeps only an `HttpOnly` cookie that script cannot read. The page
+ * clears the input immediately and stores the key nowhere.
+ *
+ * **Sessions live in gateway memory and a restart forgets them**, deliberately —
+ * the reason A8-CI's operations table is in memory. A durable session would need
+ * a durable secret and a table to hold it, and re-authenticating after a gateway
+ * restart is the correct experience for an operator tool. There is no
+ * `gw_sessions` migration and there must not be one.
+ *
+ * A session maps to exactly the same server-side principal a bearer token does:
+ * one key id, one label, one scope mask, one audit identity. The two
+ * authentication mechanisms differ; the authorization engine does not.
+ *
+ * The token is 32 bytes of kernel randomness. CSRF is handled by `SameSite=Strict`
+ * plus the origin check, and by every API route being a GET — the only POSTs are
+ * login and logout, and a forged login is an attacker authenticating as
+ * themselves. */
+
+typedef struct gw_session {
+    char token[ATLAS_GW_SESSION_TOKEN_HEX + 1u];
+    char key_id[ATLAS_APIKEY_SELECTOR_HEX + 1];
+    char label[ATLAS_APIKEY_LABEL_MAX + 1];
+    atlas_scope_mask scopes;
+    int64_t expires_ms;
+} gw_session;
+
+static pthread_mutex_t gw_sess_lock = PTHREAD_MUTEX_INITIALIZER;
+static gw_session gw_sessions[ATLAS_GW_MAX_SESSIONS];
+
+static void session_put(atlas_gateway *g, const principal *pr, char *token_out) {
+    unsigned char raw[ATLAS_GW_SESSION_TOKEN_BYTES];
+    atlas_err err;
+    atlas_err_init(&err);
+    token_out[0] = '\0';
+    if (atlas_random_bytes(raw, sizeof raw, &err) != ATLAS_OK) {
+        /* No randomness, no session. Atlas does not issue a credential — of any
+         * kind — that it could not make unpredictable. */
+        return;
+    }
+    char hex[ATLAS_GW_SESSION_TOKEN_HEX + 1u];
+    atlas_hex_encode(raw, sizeof raw, hex);
+    memset(raw, 0, sizeof raw);
+
+    int64_t now = now_ms();
+    (void)pthread_mutex_lock(&gw_sess_lock);
+    size_t slot = 0;
+    int64_t oldest = 0;
+    bool found = false;
+    for (size_t i = 0; i < ATLAS_GW_MAX_SESSIONS; i++) {
+        if (gw_sessions[i].token[0] == '\0' || gw_sessions[i].expires_ms <= now) {
+            slot = i;
+            found = true;
+            break;
+        }
+        if (!found && (oldest == 0 || gw_sessions[i].expires_ms < oldest)) {
+            oldest = gw_sessions[i].expires_ms;
+            slot = i;
+        }
+    }
+    memset(&gw_sessions[slot], 0, sizeof gw_sessions[slot]);
+    (void)snprintf(gw_sessions[slot].token, sizeof gw_sessions[slot].token, "%s", hex);
+    (void)snprintf(gw_sessions[slot].key_id, sizeof gw_sessions[slot].key_id, "%s", pr->key_id);
+    (void)snprintf(gw_sessions[slot].label, sizeof gw_sessions[slot].label, "%s", pr->label);
+    gw_sessions[slot].scopes = pr->scopes;
+    gw_sessions[slot].expires_ms = now + g->policy.session_ttl_seconds * 1000;
+    (void)pthread_mutex_unlock(&gw_sess_lock);
+
+    (void)snprintf(token_out, ATLAS_GW_SESSION_TOKEN_HEX + 1u, "%s", hex);
+    memset(hex, 0, sizeof hex);
+}
+
+/* Resolves a cookie to a principal. An expired session is cleared rather than
+ * merely refused, so a slot is not held by something nobody can use. */
+static bool session_get(const char *token, principal *out) {
+    memset(out, 0, sizeof(*out));
+    if (token == NULL || token[0] == '\0') {
+        return false;
+    }
+    size_t tlen = strlen(token);
+    if (tlen != ATLAS_GW_SESSION_TOKEN_HEX) {
+        return false;
+    }
+    bool ok = false;
+    int64_t now = now_ms();
+    (void)pthread_mutex_lock(&gw_sess_lock);
+    for (size_t i = 0; i < ATLAS_GW_MAX_SESSIONS; i++) {
+        if (gw_sessions[i].token[0] == '\0') {
+            continue;
+        }
+        if (gw_sessions[i].expires_ms <= now) {
+            memset(&gw_sessions[i], 0, sizeof gw_sessions[i]);
+            continue;
+        }
+        /* Constant-time, for the reason the credential comparison is: this is a
+         * secret an attacker supplies and can vary. */
+        if (atlas_ct_equal(gw_sessions[i].token, token, ATLAS_GW_SESSION_TOKEN_HEX)) {
+            (void)snprintf(out->key_id, sizeof out->key_id, "%s", gw_sessions[i].key_id);
+            (void)snprintf(out->label, sizeof out->label, "%s", gw_sessions[i].label);
+            out->scopes = gw_sessions[i].scopes;
+            out->authenticated = true;
+            ok = true;
+        }
+    }
+    (void)pthread_mutex_unlock(&gw_sess_lock);
+    return ok;
+}
+
+static void session_drop(const char *token) {
+    if (token == NULL || token[0] == '\0') {
+        return;
+    }
+    (void)pthread_mutex_lock(&gw_sess_lock);
+    for (size_t i = 0; i < ATLAS_GW_MAX_SESSIONS; i++) {
+        if (gw_sessions[i].token[0] != '\0' &&
+            atlas_ct_equal(gw_sessions[i].token, token, ATLAS_GW_SESSION_TOKEN_HEX)) {
+            memset(&gw_sessions[i], 0, sizeof gw_sessions[i]);
+        }
+    }
+    (void)pthread_mutex_unlock(&gw_sess_lock);
+}
+
+extern const unsigned char atlas_ui_page[];
+extern const size_t atlas_ui_page_len;
+
+/* Reads the `key` member out of a login body.
+ *
+ * Deliberately not a JSON parse: the body is one member whose value is a
+ * credential, and running an untrusted document through a parser to reach it
+ * would be more machinery than the job needs. The scan is bounded, refuses
+ * anything that is not the documented shape, and never copies more than a token
+ * can be. */
+static bool take_login_key(const char *body, size_t len, char *out, size_t out_size) {
+    out[0] = '\0';
+    static const char NEEDLE[] = "\"key\"";
+    if (body == NULL || len == 0 || len > 4096u) {
+        return false;
+    }
+    size_t nlen = sizeof NEEDLE - 1u;
+    size_t i = 0;
+    for (; i + nlen <= len; i++) {
+        if (memcmp(body + i, NEEDLE, nlen) == 0) {
+            break;
+        }
+    }
+    if (i + nlen > len) {
+        return false;
+    }
+    i += nlen;
+    while (i < len && (body[i] == ' ' || body[i] == ':' || body[i] == '\t')) {
+        i++;
+    }
+    if (i >= len || body[i] != '"') {
+        return false;
+    }
+    i++;
+    size_t start = i;
+    while (i < len && body[i] != '"') {
+        /* No escapes: a token is base64url and hex, so a backslash in one is a
+         * token that is not ours. */
+        if (body[i] == '\\') {
+            return false;
+        }
+        i++;
+    }
+    if (i >= len) {
+        return false;
+    }
+    size_t vlen = i - start;
+    if (vlen == 0 || vlen + 1u > out_size) {
+        return false;
+    }
+    memcpy(out, body + start, vlen);
+    out[vlen] = '\0';
+    return true;
+}
 
 /* --- the web API -----------------------------------------------------------
  *
@@ -932,11 +1115,144 @@ atlas_status atlas_gateway_serve_bytes(atlas_gateway *g, const char *request, si
         return st;
     }
 
+
+    /* --- the browser surface --------------------------------------------- */
+
+    if (g->policy.web_gui) {
+        if (strcmp(req.path, "/auth/login") == 0 && strcmp(req.method, "POST") == 0) {
+            const char *body = request + req.body_offset;
+            size_t blen = len > req.body_offset ? len - req.body_offset : 0;
+            if (req.has_content_length && (size_t)req.content_length < blen) {
+                blen = (size_t)req.content_length;
+            }
+            char key[ATLAS_APIKEY_TOKEN_MAX];
+            principal pr;
+            memset(&pr, 0, sizeof pr);
+            if (take_login_key(body, blen, key, sizeof key)) {
+                /* Reuse the one authentication path by presenting the key the
+                 * way a bearer client would. There is no second verifier. */
+                atlas_http_request as_bearer = req;
+                (void)snprintf(as_bearer.authorization, sizeof as_bearer.authorization,
+                               "Bearer %s", key);
+                authenticate(g, &as_bearer, &pr);
+                volatile unsigned char *z = (volatile unsigned char *)as_bearer.authorization;
+                for (size_t i = 0; i < sizeof as_bearer.authorization; i++) {
+                    z[i] = 0;
+                }
+            }
+            {
+                volatile unsigned char *z = (volatile unsigned char *)key;
+                for (size_t i = 0; i < sizeof key; i++) {
+                    z[i] = 0;
+                }
+            }
+            atlas_status st;
+            if (!pr.authenticated) {
+                st = respond_error(g, &req, 401, "unauthenticated",
+                                   "that key was not accepted", response, err);
+                audit(g, "WEB_GUI", NULL, "auth.login", false, false, ATLAS_ERR_INTEGRITY,
+                      now_ms() - started, "authentication failed");
+            } else {
+                char token[ATLAS_GW_SESSION_TOKEN_HEX + 1u];
+                session_put(g, &pr, token);
+                if (token[0] == '\0') {
+                    st = respond_error(g, &req, 500, "internal",
+                                       "no session could be created", response, err);
+                } else {
+                    char cookie[256];
+                    /* HttpOnly: script cannot read it. SameSite=Strict: it is
+                     * not sent on a cross-site request, which is the CSRF
+                     * defence. Secure is set only when TLS is declared in
+                     * front, because a Secure cookie over plain HTTP is one the
+                     * browser silently drops — and an operator debugging that
+                     * has no way to see why. */
+                    (void)snprintf(cookie, sizeof cookie,
+                                   "Set-Cookie: atlas_session=%s; Path=/; HttpOnly; "
+                                   "SameSite=Strict; Max-Age=%lld%s\r\n",
+                                   token, g->policy.session_ttl_seconds,
+                                   g->policy.tls_mode == ATLAS_GWPOLICY_TLS_REVERSE_PROXY
+                                       ? "; Secure"
+                                       : "");
+                    static const char OKB[] = "{\"ok\":true}";
+                    st = respond(g, &req, 200, "application/json", OKB, sizeof OKB - 1u, cookie,
+                                 response, err);
+                    audit(g, "WEB_GUI", &pr, "auth.login", true, true, 0, now_ms() - started,
+                          NULL);
+                    memset(cookie, 0, sizeof cookie);
+                }
+                memset(token, 0, sizeof token);
+            }
+            atlas_http_request_free(&req);
+            return st;
+        }
+
+        if (strcmp(req.path, "/auth/logout") == 0 && strcmp(req.method, "POST") == 0) {
+            session_drop(req.session);
+            static const char OKB[] = "{\"ok\":true}";
+            atlas_status st = respond(g, &req, 200, "application/json", OKB, sizeof OKB - 1u,
+                                      "Set-Cookie: atlas_session=; Path=/; HttpOnly; "
+                                      "SameSite=Strict; Max-Age=0\r\n",
+                                      response, err);
+            atlas_http_request_free(&req);
+            return st;
+        }
+
+        if (strcmp(req.path, "/auth/me") == 0 && strcmp(req.method, "GET") == 0) {
+            principal pr;
+            atlas_status st;
+            if (!session_get(req.session, &pr)) {
+                st = respond_error(g, &req, 401, "unauthenticated", "no session", response, err);
+            } else {
+                /* The scope list, so the page can hide what this principal
+                 * cannot read. Hiding is courtesy; every route checks for
+                 * itself. */
+                atlas_buf scopes = ATLAS_BUF_INIT;
+                atlas_err serr;
+                atlas_err_init(&serr);
+                (void)atlas_apikey_scopes_render(pr.scopes, &scopes, &serr);
+                atlas_buf body = ATLAS_BUF_INIT;
+                atlas_err berr;
+                atlas_err_init(&berr);
+                (void)atlas_buf_appendf(&body, &berr,
+                                        "{\"ok\":true,\"label\":\"%s\",\"scopes\":\"%s\"}",
+                                        pr.label, atlas_buf_cstr(&scopes));
+                st = respond(g, &req, 200, "application/json", body.data, body.len, NULL, response,
+                             err);
+                atlas_buf_free(&body);
+                atlas_buf_free(&scopes);
+            }
+            atlas_http_request_free(&req);
+            return st;
+        }
+
+        if ((strcmp(req.path, "/") == 0 || strcmp(req.path, "/index.html") == 0) &&
+            strcmp(req.method, "GET") == 0) {
+            /* One page, from the binary. The gateway has no filesystem read
+             * path, so there is no directory an attacker could aim a request
+             * at. The page's own CSP permits its inline style and script and
+             * nothing else — no external origin, no eval, no frame. */
+            atlas_status st = respond(
+                g, &req, 200, "text/html; charset=utf-8", atlas_ui_page, atlas_ui_page_len,
+                "Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; "
+                "script-src 'unsafe-inline'; connect-src 'self'; form-action 'none'; "
+                "frame-ancestors 'none'; base-uri 'none'\r\n",
+                response, err);
+            atlas_http_request_free(&req);
+            return st;
+        }
+    }
+
     /* The web API. Authenticated the same way and audited the same way; the
      * route table is what stops a request naming a daemon method. */
     if (strncmp(req.path, "/api/", 5u) == 0) {
         principal pr;
-        authenticate(g, &req, &pr);
+        /* Either mechanism, one principal. A bearer token is the remote-MCP
+         * shape; a session cookie is the browser's. They map to the same
+         * key id, label, scope mask and audit identity — the authorization
+         * engine does not know which was used. */
+        if (!session_get(req.session, &pr)) {
+            authenticate(g, &req, &pr);
+        }
         atlas_status ast = ATLAS_OK;
         bool handled = api_handle(g, &req, &pr, started, response, &ast, err);
         memset(&pr, 0, sizeof pr);

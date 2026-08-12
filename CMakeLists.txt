@@ -127,6 +127,32 @@ endif()
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 
+# --- the embedded Mission Control page --------------------------------------
+#
+# A9 serves one page from the binary rather than from disk, so the gateway has
+# no filesystem read path at all — which is what makes "no arbitrary filesystem
+# access introduced by the gateway" a property of the code rather than a claim
+# about a directory's permissions.
+#
+# The generator is first-party C, for the reason the JSON checker and the
+# fixture generators are: the build depends on no language runtime. Not `xxd`,
+# which is not guaranteed present; not a shell loop, because there is no shell
+# in this build; and not Node, which the hard rules forbid outright — so the
+# page is hand-written HTML, CSS and JavaScript with no bundler.
+
+add_executable(atlas-embed tools/atlas_embed.c)
+atlas_set_warnings(atlas-embed)
+
+set(ATLAS_UI_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/gw/ui/mission-control.html)
+set(ATLAS_UI_GEN ${CMAKE_CURRENT_BINARY_DIR}/atlas_ui_page.c)
+add_custom_command(
+  OUTPUT ${ATLAS_UI_GEN}
+  COMMAND atlas-embed atlas_ui_page ${ATLAS_UI_SRC} ${ATLAS_UI_GEN}
+  DEPENDS atlas-embed ${ATLAS_UI_SRC}
+  COMMENT "Atlas: embedding the Mission Control page"
+  VERBATIM
+)
+
 # --- core library -----------------------------------------------------------
 
 add_library(atlas_core STATIC
@@ -280,6 +306,7 @@ add_library(atlas_core STATIC
   src/ipc/server_apikey.c
   src/ipc/server_gw.c
   src/gw/gateway.c
+  ${ATLAS_UI_GEN}
 )
 
 target_include_directories(atlas_core

@@ -680,6 +680,158 @@ static void test_the_api_forwards_only_what_a_route_declares(void) {
     env_close(&e);
 }
 
+/* --- the browser surface ---------------------------------------------------- */
+
+/* Opens a gateway with the web GUI on, over the same fixture daemon. */
+static void gui_env(env *e, atlas_gateway **g) {
+    atlas_err err;
+    atlas_err_init(&err);
+    static const char *const TEXT =
+        "enabled = yes\ngateway_uid = 1\nremote_mcp = yes\nweb_gui = yes\n";
+    atlas_gwpolicy p;
+    atlas_gwpolicy_parse_buffer(TEXT, strlen(TEXT), &p);
+    T_REQUIRE(p.state == ATLAS_GWPOLICY_ENABLED);
+    atlas_gateway_opts o;
+    memset(&o, 0, sizeof o);
+    o.socket_path = atlas_buf_cstr(&e->d.socket);
+    o.timeout_ms = 15000;
+    T_OK(atlas_gateway_open(&p, &o, g, &err), &err);
+}
+
+/* Pulls the session cookie value out of a response's Set-Cookie header. */
+static void cookie_of(const atlas_buf *resp, char *out, size_t n) {
+    out[0] = '\0';
+    const char *s = strstr(atlas_buf_cstr(resp), "Set-Cookie: atlas_session=");
+    if (s == NULL) {
+        return;
+    }
+    s += strlen("Set-Cookie: atlas_session=");
+    size_t k = 0;
+    while (s[k] != '\0' && s[k] != ';' && s[k] != '\r' && k + 1 < n) {
+        k++;
+    }
+    memcpy(out, s, k);
+    out[k] = '\0';
+}
+
+static void gui_request(atlas_gateway *g, const char *method, const char *path,
+                        const char *cookie, const char *body, atlas_buf *resp) {
+    atlas_err err;
+    atlas_err_init(&err);
+    atlas_buf req = ATLAS_BUF_INIT;
+    size_t blen = body != NULL ? strlen(body) : 0;
+    T_OK(atlas_buf_appendf(&req, &err, "%s %s HTTP/1.1\r\nHost: t\r\n", method, path), &err);
+    if (cookie != NULL && cookie[0] != '\0') {
+        T_OK(atlas_buf_appendf(&req, &err, "Cookie: atlas_session=%s\r\n", cookie), &err);
+    }
+    T_OK(atlas_buf_appendf(&req, &err,
+                           "Content-Type: application/json\r\nContent-Length: %zu\r\n\r\n",
+                           blen),
+         &err);
+    if (blen > 0) {
+        T_OK(atlas_buf_append(&req, body, blen, &err), &err);
+    }
+    T_OK(atlas_gateway_serve_bytes(g, req.data, req.len, resp, &err), &err);
+    atlas_buf_free(&req);
+}
+
+static void test_the_browser_exchanges_a_key_for_a_session(void) {
+    env e;
+    const char *scopes[] = {"repo:read"};
+    env_open(&e, scopes, 1);
+    atlas_gateway *g = NULL;
+    gui_env(&e, &g);
+    atlas_buf resp = ATLAS_BUF_INIT;
+
+    /* The page is served from the binary. */
+    gui_request(g, "GET", "/", NULL, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 200);
+    T_CHECK(strstr(body_of(&resp), "Atlas Mission Control") != NULL);
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&resp), "Content-Security-Policy:") != NULL,
+                "the page was served without a content security policy");
+
+    /* No session yet. */
+    gui_request(g, "GET", "/auth/me", NULL, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 401);
+
+    /* A wrong key is refused and sets no cookie. */
+    gui_request(g, "POST", "/auth/login", NULL,
+                "{\"key\":\"atlas_0123456789abcdef_"
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"}",
+                &resp);
+    T_EQ_INT(status_of(&resp), 401);
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&resp), "Set-Cookie") == NULL,
+                "a refused login set a session cookie");
+
+    /* The real key is exchanged for a session. */
+    char body[512];
+    (void)snprintf(body, sizeof body, "{\"key\":\"%s\"}", e.token);
+    gui_request(g, "POST", "/auth/login", NULL, body, &resp);
+    T_EQ_INT(status_of(&resp), 200);
+
+    char cookie[128];
+    cookie_of(&resp, cookie, sizeof cookie);
+    T_CHECK_MSG(cookie[0] != '\0', "login set no session cookie");
+    T_CHECK_MSG(strlen(cookie) == 64u, "the session token is %zu characters", strlen(cookie));
+    /* The cookie must be unreadable by script and not sent cross-site. */
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&resp), "HttpOnly") != NULL, "the session cookie is readable by script");
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&resp), "SameSite=Strict") != NULL,
+                "the session cookie is sent cross-site");
+    /* And the API key must not come back in the response. */
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&resp), e.token) == NULL, "login echoed the API key");
+
+    /* The session is the same principal a bearer token would be. */
+    gui_request(g, "GET", "/auth/me", cookie, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 200);
+    T_CHECK(strstr(body_of(&resp), "repo:read") != NULL);
+    T_CHECK(strstr(body_of(&resp), "chatgpt-test") != NULL);
+
+    /* It authorises the API exactly as the bearer token does — and no more. */
+    gui_request(g, "GET", "/api/v1/repos", cookie, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 200);
+    T_CHECK(strstr(body_of(&resp), "proj") != NULL);
+    gui_request(g, "GET", "/api/v1/audit", cookie, NULL, &resp);
+    T_CHECK_MSG(status_of(&resp) == 403, "a session granted a scope its key did not hold");
+
+    /* A forged session token is refused. */
+    gui_request(g, "GET", "/auth/me",
+                "0000000000000000000000000000000000000000000000000000000000000000", NULL, &resp);
+    T_EQ_INT(status_of(&resp), 401);
+
+    /* Logout ends it immediately. */
+    gui_request(g, "POST", "/auth/logout", cookie, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 200);
+    gui_request(g, "GET", "/auth/me", cookie, NULL, &resp);
+    T_CHECK_MSG(status_of(&resp) == 401, "a session survived logout");
+
+    atlas_gateway_close(g);
+    atlas_buf_free(&resp);
+    env_close(&e);
+}
+
+static void test_the_browser_surface_is_absent_when_disabled(void) {
+    /* `web_gui = no` is the default, and the routes do not exist rather than
+     * refusing: a gateway serving only remote MCP has no browser surface at
+     * all. */
+    env e;
+    const char *scopes[] = {"repo:read"};
+    env_open(&e, scopes, 1);
+    atlas_buf resp = ATLAS_BUF_INIT;
+    char auth[256];
+    bearer(&e, auth, sizeof auth);
+
+    /* e.g is the remote-MCP-only gateway from env_open. */
+    request(&e, "GET", "/", auth, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 404);
+    request(&e, "POST", "/auth/login", NULL, "{\"key\":\"x\"}", &resp);
+    T_EQ_INT(status_of(&resp), 404);
+    request(&e, "GET", "/auth/me", auth, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 404);
+
+    atlas_buf_free(&resp);
+    env_close(&e);
+}
+
 /* --- the listener ----------------------------------------------------------
  *
  * Everything above drives `atlas_gateway_serve_bytes` directly, which is where
@@ -831,6 +983,10 @@ static const atlas_test TESTS[] = {
     {"the web API reads and refuses", test_the_web_api_reads_and_refuses},
     {"the API forwards only what a route declares",
      test_the_api_forwards_only_what_a_route_declares},
+    {"the browser exchanges a key for a session",
+     test_the_browser_exchanges_a_key_for_a_session},
+    {"the browser surface is absent when disabled",
+     test_the_browser_surface_is_absent_when_disabled},
     {"the listener binds and serves", test_the_listener_binds_and_serves},
 };
 

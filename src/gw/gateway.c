@@ -467,6 +467,338 @@ static atlas_status mcp_exchange(atlas_gateway *g, const principal *pr, const ch
     return st;
 }
 
+
+/* --- the web API -----------------------------------------------------------
+ *
+ * A fixed table of routes. Each names the daemon method it forwards to, the
+ * scope it needs, and the query parameters it will pass on — and nothing else
+ * from the request reaches the socket. A client cannot name an Atlas method, add
+ * a parameter, or reach a repository it did not name through a parameter the
+ * route declares.
+ *
+ * The response is the daemon's own document, returned unchanged. Every value in
+ * it was already safe-encoded by the daemon, so re-serialising here would either
+ * double-encode it — the A8.2 defect — or require a second renderer that could
+ * drift from the first. What the browser receives is what Atlas said.
+ *
+ * Paths are exact literals and parameters live in the query string, so no route
+ * has a path component to parse and nothing is ever joined to a filesystem
+ * path.
+ */
+
+#define GW_API_MAX_PARAMS 6
+
+typedef struct api_route {
+    const char *path;
+    const char *method;     /* the daemon method it forwards to */
+    atlas_apikey_scope scope;
+    /* Query parameters this route forwards, by name. Anything else in the query
+     * string is ignored — not an error, because a browser adds cache-busting
+     * parameters, but never forwarded. */
+    const char *params[GW_API_MAX_PARAMS];
+    /* Which of those are integers rather than strings. Typed at the edge so a
+     * value that is not a number is refused rather than reaching the daemon as
+     * a string it will reject less clearly. */
+    const char *ints[GW_API_MAX_PARAMS];
+} api_route;
+
+/* Every route is a read. There is no write anywhere in this table, and adding
+ * one would need a write scope no A9 credential can hold. */
+static const api_route API_ROUTES[] = {
+    {"/api/v1/status", "daemon.status", ATLAS_SCOPE_REPO_READ, {NULL}, {NULL}},
+    {"/api/v1/repos", "repo.list", ATLAS_SCOPE_REPO_READ, {NULL}, {NULL}},
+    {"/api/v1/repo", "repo.state", ATLAS_SCOPE_REPO_READ, {"repo", NULL}, {NULL}},
+    {"/api/v1/events", "events.since", ATLAS_SCOPE_REPO_READ,
+     {"repo", "since", "limit", NULL}, {"since", "limit", NULL}},
+    {"/api/v1/search", "repo.search", ATLAS_SCOPE_REPO_READ,
+     {"repo", "q", "limit", "cursor", NULL}, {"limit", "cursor", NULL}},
+    {"/api/v1/file", "repo.file", ATLAS_SCOPE_REPO_READ, {"repo", "path", NULL}, {NULL}},
+    {"/api/v1/history", "repo.history", ATLAS_SCOPE_REPO_READ,
+     {"repo", "path", "limit", NULL}, {"limit", NULL}},
+    {"/api/v1/decisions", "decision.list", ATLAS_SCOPE_DECISIONS_READ,
+     {"repo", "status", "limit", "cursor", NULL}, {"limit", "cursor", NULL}},
+    {"/api/v1/decision", "decision.get", ATLAS_SCOPE_DECISIONS_READ,
+     {"repo", "uid", NULL}, {NULL}},
+    {"/api/v1/decision/history", "decision.history", ATLAS_SCOPE_DECISIONS_READ,
+     {"repo", "uid", NULL}, {NULL}},
+    {"/api/v1/gate", "gate.check", ATLAS_SCOPE_DECISIONS_READ, {"repo", NULL}, {NULL}},
+    {"/api/v1/code/status", "code.status", ATLAS_SCOPE_GRAPH_READ, {"repo", NULL}, {NULL}},
+    {"/api/v1/code/file", "code.file", ATLAS_SCOPE_GRAPH_READ, {"repo", "path", NULL}, {NULL}},
+    {"/api/v1/code/symbol", "code.symbol", ATLAS_SCOPE_GRAPH_READ,
+     {"repo", "symbol", NULL}, {NULL}},
+    {"/api/v1/code/search", "code.search", ATLAS_SCOPE_GRAPH_READ,
+     {"repo", "q", "limit", NULL}, {"limit", NULL}},
+    {"/api/v1/sem/status", "sem.status", ATLAS_SCOPE_GRAPH_READ, {"repo", NULL}, {NULL}},
+    {"/api/v1/sem/symbol", "sem.symbol", ATLAS_SCOPE_GRAPH_READ,
+     {"repo", "symbol", NULL}, {NULL}},
+    {"/api/v1/sem/callers", "sem.callers", ATLAS_SCOPE_GRAPH_READ,
+     {"repo", "symbol", "depth", NULL}, {"depth", NULL}},
+    {"/api/v1/sem/callees", "sem.callees", ATLAS_SCOPE_GRAPH_READ,
+     {"repo", "symbol", "depth", NULL}, {"depth", NULL}},
+    {"/api/v1/impact", "sem.impact", ATLAS_SCOPE_IMPACT_READ,
+     {"repo", "symbol", "path", "depth", NULL}, {"depth", NULL}},
+    {"/api/v1/code/impact", "code.impact", ATLAS_SCOPE_IMPACT_READ,
+     {"repo", "path", "depth", NULL}, {"depth", NULL}},
+    {"/api/v1/context", "sem.context", ATLAS_SCOPE_CONTEXT_READ,
+     {"repo", "task", "max_tokens", NULL}, {"max_tokens", NULL}},
+    {"/api/v1/audit", "gateway.audit_list", ATLAS_SCOPE_AUDIT_READ,
+     {"limit", "cursor", "key_id", NULL}, {"limit", "cursor", NULL}},
+};
+
+static bool route_wants(const api_route *r, const char *name, bool *is_int) {
+    *is_int = false;
+    bool found = false;
+    for (size_t i = 0; i < GW_API_MAX_PARAMS && r->params[i] != NULL; i++) {
+        if (strcmp(r->params[i], name) == 0) {
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        return false;
+    }
+    for (size_t i = 0; i < GW_API_MAX_PARAMS && r->ints[i] != NULL; i++) {
+        if (strcmp(r->ints[i], name) == 0) {
+            *is_int = true;
+            break;
+        }
+    }
+    return true;
+}
+
+/* Percent-decodes one query value in place.
+ *
+ * This is the *only* place the gateway decodes anything, and it decodes a value
+ * that is about to be passed as a typed JSON string — never a path, never a
+ * method name, never anything that selects behaviour. A malformed escape is a
+ * refusal rather than a guess, and a decoded NUL is refused outright: a value
+ * that ends early is a different value from the one that was sent. */
+static bool percent_decode(const char *in, size_t len, char *out, size_t out_size) {
+    size_t o = 0;
+    for (size_t i = 0; i < len; i++) {
+        char c = in[i];
+        if (c == '+') {
+            c = ' ';
+        } else if (c == '%') {
+            if (i + 2 >= len) {
+                return false;
+            }
+            int hi = -1, lo = -1;
+            for (int k = 0; k < 2; k++) {
+                char h = in[i + 1 + (size_t)k];
+                int v = -1;
+                if (h >= '0' && h <= '9') {
+                    v = h - '0';
+                } else if (h >= 'a' && h <= 'f') {
+                    v = h - 'a' + 10;
+                } else if (h >= 'A' && h <= 'F') {
+                    v = h - 'A' + 10;
+                } else {
+                    return false;
+                }
+                if (k == 0) {
+                    hi = v;
+                } else {
+                    lo = v;
+                }
+            }
+            c = (char)((hi << 4) | lo);
+            i += 2;
+        }
+        if (c == '\0') {
+            return false;
+        }
+        if (o + 1 >= out_size) {
+            return false;
+        }
+        out[o++] = c;
+    }
+    out[o] = '\0';
+    return true;
+}
+
+/* Builds the daemon params for one route from the request's query string.
+ *
+ * Only names the route declares are read. Everything else in the query string
+ * is ignored rather than forwarded, so a client cannot add a parameter to a
+ * daemon call by adding one to a URL. */
+static atlas_status build_api_params(const api_route *r, const char *query, atlas_buf *out,
+                                     atlas_err *err) {
+    atlas_ipc_params *p = NULL;
+    atlas_json *j = NULL;
+    atlas_status st = atlas_ipc_params_begin(&p, &j, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    size_t i = 0;
+    size_t qlen = query != NULL ? strlen(query) : 0;
+    while (st == ATLAS_OK && i < qlen) {
+        size_t start = i;
+        while (i < qlen && query[i] != '&') {
+            i++;
+        }
+        size_t end = i;
+        if (i < qlen) {
+            i++;
+        }
+        const char *eq = memchr(query + start, '=', end - start);
+        if (eq == NULL) {
+            continue;
+        }
+        size_t nlen = (size_t)(eq - (query + start));
+        char name[32];
+        if (nlen == 0 || nlen >= sizeof name) {
+            continue;
+        }
+        memcpy(name, query + start, nlen);
+        name[nlen] = '\0';
+        bool is_int = false;
+        if (!route_wants(r, name, &is_int)) {
+            continue;
+        }
+        char value[1024];
+        if (!percent_decode(eq + 1, (size_t)(query + end - (eq + 1)), value, sizeof value)) {
+            atlas_ipc_params_abort(p);
+            atlas_buf_free(out);
+            return atlas_err_set(err, ATLAS_ERR_USAGE, "a query parameter is malformed");
+        }
+        if (is_int) {
+            int64_t n = 0;
+            if (value[0] == '\0') {
+                continue;
+            }
+            for (const char *c = value; *c != '\0'; c++) {
+                if (*c < '0' || *c > '9') {
+                    atlas_ipc_params_abort(p);
+                    return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                         "a numeric query parameter is not a number");
+                }
+                n = n * 10 + (*c - '0');
+                if (n > 1000000) {
+                    atlas_ipc_params_abort(p);
+                    return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                         "a numeric query parameter is out of range");
+                }
+            }
+            st = atlas_json_key_int(j, name, n, err);
+        } else {
+            st = atlas_json_key_str(j, name, value, err);
+        }
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_ipc_params_finish(p, out, err);
+    } else {
+        atlas_ipc_params_abort(p);
+    }
+    return st;
+}
+
+/* Handles one API request. Returns false when the path names no route. */
+static bool api_handle(atlas_gateway *g, const atlas_http_request *req, const principal *pr,
+                       int64_t started, atlas_buf *response, atlas_status *st_out,
+                       atlas_err *err) {
+    const api_route *route = NULL;
+    for (size_t i = 0; i < sizeof API_ROUTES / sizeof API_ROUTES[0]; i++) {
+        if (strcmp(API_ROUTES[i].path, req->path) == 0) {
+            route = &API_ROUTES[i];
+            break;
+        }
+    }
+    if (route == NULL) {
+        return false;
+    }
+    if (strcmp(req->method, "GET") != 0) {
+        /* Every route is a read. A POST to one is not a different operation, it
+         * is a request for something that does not exist. */
+        *st_out = respond_error(g, req, 405, "method_not_allowed", "this endpoint reads only",
+                                response, err);
+        return true;
+    }
+    if (!pr->authenticated) {
+        static const char UNAUTH[] =
+            "{\"ok\":false,\"error\":{\"code\":\"unauthenticated\","
+            "\"message\":\"a valid Atlas API key is required\"}}";
+        *st_out = respond(g, req, 401, "application/json", UNAUTH, sizeof UNAUTH - 1u,
+                          "WWW-Authenticate: Bearer\r\n", response, err);
+        audit(g, "WEB_API", NULL, req->path, false, false, ATLAS_ERR_INTEGRITY,
+              now_ms() - started, "authentication failed");
+        return true;
+    }
+    if (!atlas_scope_has(pr->scopes, route->scope)) {
+        const char *needed = atlas_apikey_scope_name(route->scope);
+        atlas_buf msg = ATLAS_BUF_INIT;
+        atlas_err merr;
+        atlas_err_init(&merr);
+        (void)atlas_buf_appendf(&msg, &merr, "this credential does not hold the \"%s\" scope",
+                                needed != NULL ? needed : "required");
+        *st_out = respond_error(g, req, 403, "forbidden", atlas_buf_cstr(&msg), response, err);
+        atlas_buf_free(&msg);
+        audit(g, "WEB_API", pr, req->path, false, false, ATLAS_ERR_INTEGRITY, now_ms() - started,
+              "the credential lacks the required scope");
+        return true;
+    }
+
+    atlas_buf params = ATLAS_BUF_INIT;
+    atlas_err perr;
+    atlas_err_init(&perr);
+    if (build_api_params(route, req->query, &params, &perr) != ATLAS_OK) {
+        *st_out = respond_error(g, req, 400, "bad_request", "a query parameter is malformed",
+                                response, err);
+        atlas_buf_free(&params);
+        audit(g, "WEB_API", pr, req->path, true, false, ATLAS_ERR_USAGE, now_ms() - started,
+              "a query parameter was malformed");
+        return true;
+    }
+
+    atlas_buf resp = ATLAS_BUF_INIT;
+    atlas_err cerr;
+    atlas_err_init(&cerr);
+    atlas_status cst = atlas_ipc_call_timeout(atlas_buf_cstr(&g->socket), route->method,
+                                              atlas_buf_cstr(&params), g->timeout_ms, &resp, &cerr);
+    atlas_buf_free(&params);
+
+    if (cst != ATLAS_OK) {
+        gw_log(g, "the daemon did not answer %s: %s", route->method,
+               atlas_safe(&g->safe, atlas_err_msg(&cerr)));
+        *st_out = respond_error(g, req, 502, "upstream", "the Atlas daemon did not answer",
+                                response, err);
+        audit(g, "WEB_API", pr, req->path, true, false, cst, now_ms() - started,
+              "the daemon did not answer");
+        atlas_buf_free(&resp);
+        return true;
+    }
+
+    /* The daemon's own document, unchanged. Every value in it was safe-encoded
+     * by the daemon; re-serialising would either double-encode — the A8.2
+     * defect — or need a second renderer that could drift from the first. */
+    atlas_ipc_response *r = NULL;
+    atlas_err rerr;
+    atlas_err_init(&rerr);
+    int status = 200;
+    if (atlas_ipc_response_parse(resp.data, resp.len, &r, &rerr) == ATLAS_OK &&
+        !atlas_ipc_response_ok(r)) {
+        /* Atlas' status vocabulary mapped onto HTTP, so a caller does not have
+         * to read the body to know what happened. */
+        switch (atlas_ipc_response_status(r)) {
+        case ATLAS_ERR_USAGE: status = 400; break;
+        case ATLAS_ERR_REPO: status = 404; break;
+        case ATLAS_ERR_CONFIG: status = 503; break;
+        case ATLAS_OK:
+        case ATLAS_ERR_INTERNAL:
+        case ATLAS_ERR_DB:
+        case ATLAS_ERR_GIT:
+        case ATLAS_ERR_INTEGRITY: status = 500; break;
+        }
+    }
+    atlas_ipc_response_free(r);
+
+    *st_out = respond(g, req, status, "application/json", resp.data, resp.len, NULL, response, err);
+    audit(g, "WEB_API", pr, req->path, true, status == 200, status == 200 ? 0 : ATLAS_ERR_INTERNAL,
+          now_ms() - started, NULL);
+    atlas_buf_free(&resp);
+    return true;
+}
+
 /* --- routing --------------------------------------------------------------- */
 
 atlas_status atlas_gateway_serve_bytes(atlas_gateway *g, const char *request, size_t len,
@@ -598,6 +930,20 @@ atlas_status atlas_gateway_serve_bytes(atlas_gateway *g, const char *request, si
         atlas_buf_free(&doc);
         atlas_http_request_free(&req);
         return st;
+    }
+
+    /* The web API. Authenticated the same way and audited the same way; the
+     * route table is what stops a request naming a daemon method. */
+    if (strncmp(req.path, "/api/", 5u) == 0) {
+        principal pr;
+        authenticate(g, &req, &pr);
+        atlas_status ast = ATLAS_OK;
+        bool handled = api_handle(g, &req, &pr, started, response, &ast, err);
+        memset(&pr, 0, sizeof pr);
+        if (handled) {
+            atlas_http_request_free(&req);
+            return ast;
+        }
     }
 
     /* Everything else. A request that matches no route never becomes a socket

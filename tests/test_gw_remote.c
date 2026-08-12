@@ -588,6 +588,98 @@ static void test_the_audit_trail_records_what_happened(void) {
     env_close(&e);
 }
 
+/* --- the web API ------------------------------------------------------------ */
+
+static void test_the_web_api_reads_and_refuses(void) {
+    env e;
+    const char *scopes[] = {"repo:read", "decisions:read"};
+    env_open(&e, scopes, 2);
+    atlas_buf resp = ATLAS_BUF_INIT;
+    char auth[256];
+    bearer(&e, auth, sizeof auth);
+
+    /* A route inside the credential's scopes, answering from the real index. */
+    request(&e, "GET", "/api/v1/repos", auth, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 200);
+    T_CHECK_MSG(strstr(body_of(&resp), "proj") != NULL, "the listing did not name the repository: %s",
+                body_of(&resp));
+
+    request(&e, "GET", "/api/v1/status", auth, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 200);
+
+    /* A parameter the route declares, percent-encoded. */
+    request(&e, "GET", "/api/v1/repo?repo=proj", auth, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 200);
+    T_CHECK(strstr(body_of(&resp), "proj") != NULL);
+
+    /* A route outside the credential's scopes: 403, naming the scope. */
+    request(&e, "GET", "/api/v1/sem/status?repo=proj", auth, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 403);
+    T_CHECK_MSG(strstr(body_of(&resp), "graph:read") != NULL,
+                "the refusal does not name the missing scope: %s", body_of(&resp));
+
+    request(&e, "GET", "/api/v1/audit", auth, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 403);
+
+    /* Unauthenticated. */
+    request(&e, "GET", "/api/v1/repos", NULL, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 401);
+    T_CHECK(strstr(atlas_buf_cstr(&resp), "WWW-Authenticate: Bearer") != NULL);
+
+    /* Every route is a read: a POST to one is not a different operation. */
+    request(&e, "POST", "/api/v1/repos", auth, "{}", &resp);
+    T_EQ_INT(status_of(&resp), 405);
+
+    /* A path that names no route never becomes a socket message. */
+    request(&e, "GET", "/api/v1/nope", auth, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 404);
+    request(&e, "GET", "/api/v1/../mcp", auth, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 404);
+
+    /* A missing repository is 404 rather than 500: Atlas' status vocabulary
+     * mapped onto HTTP, so a caller need not read the body to know what
+     * happened. */
+    request(&e, "GET", "/api/v1/repo?repo=nosuchrepo", auth, NULL, &resp);
+    T_CHECK_MSG(status_of(&resp) == 404, "an unknown repository produced %d", status_of(&resp));
+
+    atlas_buf_free(&resp);
+    env_close(&e);
+}
+
+static void test_the_api_forwards_only_what_a_route_declares(void) {
+    env e;
+    const char *scopes[] = {"repo:read"};
+    env_open(&e, scopes, 1);
+    atlas_buf resp = ATLAS_BUF_INIT;
+    char auth[256];
+    bearer(&e, auth, sizeof auth);
+
+    /* A parameter the route does not declare is ignored, not forwarded. The
+     * request still succeeds, which is what proves it was dropped rather than
+     * passed through and rejected downstream. */
+    request(&e, "GET", "/api/v1/repo?repo=proj&full=true&method=decision.approve", auth, NULL,
+            &resp);
+    T_EQ_INT(status_of(&resp), 200);
+    T_CHECK(strstr(body_of(&resp), "proj") != NULL);
+
+    /* A numeric parameter that is not a number is refused at the edge rather
+     * than reaching the daemon as a string. */
+    request(&e, "GET", "/api/v1/events?repo=proj&limit=notanumber", auth, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 400);
+
+    /* A malformed percent escape is a refusal, never a guess. */
+    request(&e, "GET", "/api/v1/repo?repo=pro%zz", auth, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 400);
+
+    /* A decoded NUL is refused: a value that ends early is a different value
+     * from the one that was sent. */
+    request(&e, "GET", "/api/v1/repo?repo=proj%00extra", auth, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 400);
+
+    atlas_buf_free(&resp);
+    env_close(&e);
+}
+
 /* --- the listener ----------------------------------------------------------
  *
  * Everything above drives `atlas_gateway_serve_bytes` directly, which is where
@@ -736,6 +828,9 @@ static const atlas_test TESTS[] = {
      test_the_gateway_holds_no_credential_administration_verb},
     {"the transport refuses what it should", test_the_transport_refuses_what_it_should},
     {"the audit trail records what happened", test_the_audit_trail_records_what_happened},
+    {"the web API reads and refuses", test_the_web_api_reads_and_refuses},
+    {"the API forwards only what a route declares",
+     test_the_api_forwards_only_what_a_route_declares},
     {"the listener binds and serves", test_the_listener_binds_and_serves},
 };
 

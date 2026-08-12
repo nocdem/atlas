@@ -119,8 +119,12 @@ static void test_a_policy_that_says_no_is_not_malformed(void) {
     atlas_gwpolicy p;
     parse_policy("enabled = no\ngateway_uid = 1001\nremote_mcp = yes\n", &p);
     T_CHECK(p.state == ATLAS_GWPOLICY_DISABLED);
-    T_CHECK_MSG(p.reason == ATLAS_GWPOLICY_REASON_ABSENT,
+    T_CHECK_MSG(p.reason == ATLAS_GWPOLICY_REASON_DISABLED,
                 "a policy that says no reported %s", atlas_gwpolicy_reason_name(p.reason));
+    /* And it must not be reported as absent: an operator who installed a policy
+     * and switched it off should not be told there is no policy. */
+    T_CHECK(p.reason != ATLAS_GWPOLICY_REASON_ABSENT);
+    T_CHECK(strstr(atlas_gwpolicy_reason_detail(p.reason), "enabled = no") != NULL);
 }
 
 static void test_a_wider_bind_needs_a_written_tls_stance(void) {

@@ -37,6 +37,7 @@ const char *atlas_gwpolicy_reason_name(atlas_gwpolicy_reason r) {
     case ATLAS_GWPOLICY_REASON_PATH_UNSAFE: return "PATH_UNSAFE";
     case ATLAS_GWPOLICY_REASON_WRITABLE: return "WRITABLE";
     case ATLAS_GWPOLICY_REASON_MALFORMED: return "MALFORMED";
+    case ATLAS_GWPOLICY_REASON_DISABLED: return "DISABLED";
     case ATLAS_GWPOLICY_REASON_ACTIVE: return "ACTIVE";
     }
     return "UNKNOWN";
@@ -57,6 +58,9 @@ const char *atlas_gwpolicy_reason_detail(atlas_gwpolicy_reason r) {
                "root, so it constrains nobody — least of all the gateway it is meant to bound";
     case ATLAS_GWPOLICY_REASON_MALFORMED:
         return "the policy exists but does not describe a complete, safe gateway";
+    case ATLAS_GWPOLICY_REASON_DISABLED:
+        return "the policy is installed and says `enabled = no`, so no gateway runs; change that "
+               "line to `enabled = yes` and restart";
     case ATLAS_GWPOLICY_REASON_ACTIVE:
         return "a root-anchored policy defines the listener, the surfaces and the bounds";
     }
@@ -406,7 +410,7 @@ void atlas_gwpolicy_parse_buffer(const char *buf, size_t total, atlas_gwpolicy *
         /* Present and switched off is a complete, valid policy that says no.
          * It is not malformed, and reporting it as such would send an operator
          * looking for a syntax error. */
-        out->reason = have_enabled ? ATLAS_GWPOLICY_REASON_ABSENT
+        out->reason = have_enabled ? ATLAS_GWPOLICY_REASON_DISABLED
                                    : ATLAS_GWPOLICY_REASON_MALFORMED;
         return;
     }

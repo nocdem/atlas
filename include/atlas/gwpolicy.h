@@ -83,6 +83,13 @@ typedef enum atlas_gwpolicy_reason {
     ATLAS_GWPOLICY_REASON_PATH_UNSAFE,
     ATLAS_GWPOLICY_REASON_WRITABLE,
     ATLAS_GWPOLICY_REASON_MALFORMED,
+    /* A complete, valid policy that says no.
+     *
+     * Distinct from ABSENT because they call for different actions: an operator
+     * who installed a policy and switched it off should not be told there is no
+     * policy, and one who never installed one should not be sent looking for a
+     * switch. */
+    ATLAS_GWPOLICY_REASON_DISABLED,
     ATLAS_GWPOLICY_REASON_ACTIVE
 } atlas_gwpolicy_reason;
 

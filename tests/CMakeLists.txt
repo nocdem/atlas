@@ -138,6 +138,10 @@ set(ATLAS_TESTS
   # functions: bytes in, a digest or a verdict out. No database, no daemon, no
   # repository, so this belongs in the fast subset.
   test_hmac
+  # The credential lifecycle drives the real binary against a fixture data
+  # directory: created once, listed, revoked, rotated, and searched as raw
+  # bytes for a plaintext that must not be there.
+  test_apikey
 )
 
 foreach(test_name IN LISTS ATLAS_TESTS)
@@ -174,6 +178,7 @@ set_tests_properties(test_code_lex PROPERTIES LABELS "unit")
 
 # A9. The credential format and the scope vocabulary are pure functions.
 set_tests_properties(test_hmac PROPERTIES LABELS "unit")
+set_tests_properties(test_apikey PROPERTIES LABELS "integration")
 
 # A4. The content hash, the transition table and validation are pure functions —
 # bytes in, a digest or a verdict out — so this suite needs no repository, no

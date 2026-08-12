@@ -102,12 +102,28 @@ atlas_status atlas_apikey_scopes_parse(const char *list, atlas_scope_mask *out, 
         token[len] = '\0';
         atlas_apikey_scope s = atlas_apikey_scope_parse(token);
         if (s == ATLAS_SCOPE_UNKNOWN) {
-            /* Fail closed and name it. The token came from an operator's command
-             * line or from a row this binary wrote, so echoing it is safe — and
-             * a refusal that does not say which scope was wrong is a refusal
-             * nobody can act on. */
+            /* Fail closed, and name it only when naming it is safe.
+             *
+             * The token reaches here from an operator's command line or from a
+             * stored row, and a refusal that does not say which scope was wrong
+             * is a refusal nobody can act on. But this message goes to a
+             * terminal and into an error document, and there is no safe pool at
+             * this layer — so a value carrying anything but printable ASCII is
+             * described rather than reproduced. */
+            bool printable = true;
+            for (size_t k = 0; k < len; k++) {
+                unsigned char c = (unsigned char)token[k];
+                if (c < 0x21u || c > 0x7eu) {
+                    printable = false;
+                    break;
+                }
+            }
             *out = 0u;
-            return atlas_err_set(err, ATLAS_ERR_USAGE, "unknown scope \"%s\"", token);
+            if (printable) {
+                return atlas_err_set(err, ATLAS_ERR_USAGE, "unknown scope \"%s\"", token);
+            }
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "unknown scope (its name is not printable ASCII)");
         }
         m |= ATLAS_SCOPE_BIT(s);
     }

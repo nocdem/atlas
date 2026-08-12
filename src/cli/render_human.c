@@ -1432,6 +1432,91 @@ static atlas_status h_maintenance(atlas_renderer *r, const atlas_maintenance_rep
  * prose and is labelled where it is printed. The freshness and reason words are
  * closed vocabularies, the commits are object ids out of Atlas' own index, and
  * the rest are counts. */
+/* --- A9: remote credentials ------------------------------------------------ */
+
+/* The one place in Atlas that prints a secret.
+ *
+ * It is printed once because this is the only moment it exists: what the index
+ * holds is HMAC-SHA256(salt, secret), there is no column a plaintext could be
+ * written to, and no read returns one. The sentence saying so is part of the
+ * output rather than something an operator has to know, because the cost of not
+ * knowing is discovering it when the key is already lost. */
+static atlas_status h_apikey_created(atlas_renderer *r, const atlas_apikey_created *c,
+                                     atlas_err *err) {
+    (void)err;
+    FILE *o = r->out;
+    (void)fprintf(o, "API key created.\n\n");
+    (void)fprintf(o, "id:     %s%s\n", ATLAS_APIKEY_ID_PREFIX, c->key_id);
+    (void)fprintf(o, "label:  %s\n", atlas_safe(&r->safe, c->label));
+    (void)fprintf(o, "scopes:\n");
+    {
+        /* One per line, in the canonical order the index stores. */
+        const char *p = c->scopes;
+        while (*p != '\0') {
+            const char *sp = strchr(p, ' ');
+            int n = sp != NULL ? (int)(sp - p) : (int)strlen(p);
+            (void)fprintf(o, "  %.*s\n", n, p);
+            if (sp == NULL) {
+                break;
+            }
+            p = sp + 1;
+        }
+    }
+    (void)fprintf(o, "created: %s\n", c->created_at);
+    if (c->rotated_from[0] != '\0') {
+        (void)fprintf(o, "replaces: %s%s%s\n", ATLAS_APIKEY_ID_PREFIX, c->rotated_from,
+                      c->previous_revoked ? " (now revoked)" : " (was already revoked)");
+    }
+    (void)fprintf(o, "\nATLAS_API_KEY=%s\n", c->token);
+    (void)fprintf(o, "\nThis secret will not be shown again. Atlas stores a one-way verifier, so "
+                     "no Atlas command, backup or database read can return it.\n");
+    return ok();
+}
+
+static atlas_status h_apikey_listed(atlas_renderer *r, const atlas_apikey_listing *l,
+                                    atlas_err *err) {
+    (void)err;
+    FILE *o = r->out;
+    if (l->count == 0) {
+        (void)fprintf(o, "no API keys\n");
+        return ok();
+    }
+    (void)fprintf(o, "%-20s %-20s %-9s %-20s %-20s %s\n", "id", "label", "status", "created",
+                  "last used", "scopes");
+    for (size_t i = 0; i < l->count; i++) {
+        const atlas_apikey_record *k = &l->keys[i];
+        char id[ATLAS_APIKEY_SELECTOR_HEX + 8];
+        (void)snprintf(id, sizeof id, "%s%s", ATLAS_APIKEY_ID_PREFIX, k->key_id);
+        (void)fprintf(o, "%-20s %-20s %-9s %-20s %-20s %s\n", id, atlas_safe(&r->safe, k->label),
+                      atlas_apikey_status_name(k->status), k->created_at,
+                      k->last_used_at[0] != '\0' ? k->last_used_at : "never",
+                      k->scopes[0] != '\0' ? k->scopes : "(none)");
+        /* A row this binary cannot read is reported, never shown as a smaller
+         * grant. "Atlas cannot tell what this credential grants" and "this
+         * credential grants nothing" call for different actions. */
+        if (k->scopes_unreadable) {
+            (void)fprintf(o, "%-20s   unusable: this Atlas does not understand its stored scopes\n",
+                          "");
+        }
+        if (k->rotated_to[0] != '\0') {
+            (void)fprintf(o, "%-20s   replaced by %s%s\n", "", ATLAS_APIKEY_ID_PREFIX,
+                          k->rotated_to);
+        }
+    }
+    (void)fprintf(o, "\nnote: secrets are never stored and are never listed.\n");
+    return ok();
+}
+
+static atlas_status h_apikey_revoked(atlas_renderer *r, const char *key_id, bool changed,
+                                     atlas_err *err) {
+    (void)err;
+    /* "Already revoked" is not an error — the outcome asked for holds — but it
+     * is a different fact and is reported as one. */
+    (void)fprintf(r->out, "%s%s: %s\n", ATLAS_APIKEY_ID_PREFIX, key_id,
+                  changed ? "revoked" : "no active key with that id (nothing changed)");
+    return ok();
+}
+
 static atlas_status h_gate(atlas_renderer *r, const atlas_gate_report *rep, atlas_err *err) {
     (void)err;
     FILE *o = r->out;
@@ -1842,4 +1927,6 @@ const atlas_renderer_vtbl ATLAS_RENDERER_HUMAN = {
     h_operation_status, h_maintenance,
     /* --- A6 --- */
     h_gate,
+    /* --- A9 --- */
+    h_apikey_created, h_apikey_listed, h_apikey_revoked,
 };

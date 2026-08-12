@@ -1368,6 +1368,90 @@ static atlas_status j_maintenance(atlas_renderer *r, const atlas_maintenance_rep
 }
 
 
+/* --- A9: remote credentials ------------------------------------------------ */
+
+/* Carries the plaintext, once, for the same reason the human renderer does: an
+ * operator scripting a bootstrap has to capture it somewhere, and a JSON form
+ * that omitted it would push them to parse the human one. `shown_once` and
+ * `recoverable` are emitted as fields rather than left to a reader's
+ * assumption, exactly as the backup renderer states `encrypted` and `signed`. */
+static atlas_status j_apikey_created(atlas_renderer *r, const atlas_apikey_created *c,
+                                     atlas_err *err) {
+    atlas_json *j = r->j;
+    atlas_safe_pool *p = &r->safe;
+    TRY(atlas_json_key(j, "api_key", err));
+    TRY(atlas_json_obj_begin(j, err));
+    TRY(atlas_json_key_str(j, "id", c->key_id, err));
+    TRY(json_safe(j, p, "label", c->label, err));
+    TRY(atlas_json_key(j, "scopes", err));
+    TRY(atlas_json_arr_begin(j, err));
+    {
+        const char *s = c->scopes;
+        while (*s != '\0') {
+            const char *sp = strchr(s, ' ');
+            size_t n = sp != NULL ? (size_t)(sp - s) : strlen(s);
+            char one[64];
+            if (n < sizeof one) {
+                memcpy(one, s, n);
+                one[n] = '\0';
+                TRY(atlas_json_str(j, one, err));
+            }
+            if (sp == NULL) {
+                break;
+            }
+            s = sp + 1;
+        }
+    }
+    TRY(atlas_json_arr_end(j, err));
+    TRY(atlas_json_key_str(j, "created_at", c->created_at, err));
+    TRY(atlas_json_key_str(j, "rotated_from", c->rotated_from, err));
+    TRY(atlas_json_key_bool(j, "previous_revoked", c->previous_revoked, err));
+    TRY(atlas_json_key_str(j, "secret", c->token, err));
+    TRY(atlas_json_key_bool(j, "shown_once", true, err));
+    TRY(atlas_json_key_bool(j, "recoverable", false, err));
+    return atlas_json_obj_end(j, err);
+}
+
+static atlas_status j_apikey_listed(atlas_renderer *r, const atlas_apikey_listing *l,
+                                    atlas_err *err) {
+    atlas_json *j = r->j;
+    atlas_safe_pool *p = &r->safe;
+    TRY(atlas_json_key(j, "api_keys", err));
+    TRY(atlas_json_arr_begin(j, err));
+    for (size_t i = 0; i < l->count; i++) {
+        const atlas_apikey_record *k = &l->keys[i];
+        TRY(atlas_json_obj_begin(j, err));
+        TRY(atlas_json_key_str(j, "id", k->key_id, err));
+        TRY(json_safe(j, p, "label", k->label, err));
+        TRY(atlas_json_key_str(j, "status", atlas_apikey_status_name(k->status), err));
+        TRY(atlas_json_key_str(j, "scopes", k->scopes, err));
+        TRY(atlas_json_key_bool(j, "scopes_unreadable", k->scopes_unreadable, err));
+        TRY(atlas_json_key_str(j, "created_at", k->created_at, err));
+        TRY(atlas_json_key_str(j, "revoked_at", k->revoked_at, err));
+        TRY(atlas_json_key_str(j, "last_used_at", k->last_used_at, err));
+        TRY(atlas_json_key_str(j, "rotated_from", k->rotated_from, err));
+        TRY(atlas_json_key_str(j, "rotated_to", k->rotated_to, err));
+        TRY(atlas_json_obj_end(j, err));
+    }
+    TRY(atlas_json_arr_end(j, err));
+    TRY(atlas_json_key_int(j, "count", (int64_t)l->count, err));
+    /* There is no field here that could hold a secret, and saying so in the
+     * document means a consumer never has to wonder whether one was omitted by
+     * accident. */
+    TRY(atlas_json_key_bool(j, "secrets_included", false, err));
+    return ATLAS_OK;
+}
+
+static atlas_status j_apikey_revoked(atlas_renderer *r, const char *key_id, bool changed,
+                                     atlas_err *err) {
+    atlas_json *j = r->j;
+    TRY(atlas_json_key(j, "revoked", err));
+    TRY(atlas_json_obj_begin(j, err));
+    TRY(atlas_json_key_str(j, "id", key_id, err));
+    TRY(atlas_json_key_bool(j, "changed", changed, err));
+    return atlas_json_obj_end(j, err);
+}
+
 static atlas_status j_gate(atlas_renderer *r, const atlas_gate_report *rep, atlas_err *err) {
     atlas_json *j = r->j;
     TRY(atlas_json_key(j, "gate", err));
@@ -1752,6 +1836,8 @@ const atlas_renderer_vtbl ATLAS_RENDERER_JSON = {
     j_operation_status, j_maintenance,
     /* --- A6 --- */
     j_gate,
+    /* --- A9 --- */
+    j_apikey_created, j_apikey_listed, j_apikey_revoked,
 };
 
 void atlas_render_error(FILE *out, FILE *errout, bool json, const char *command,

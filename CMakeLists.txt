@@ -273,6 +273,8 @@ add_library(atlas_core STATIC
   # touches a database. `hmac.c` is in src/core because it is a primitive,
   # not a gateway concern.
   src/gw/apikey.c
+  src/db/db_gw.c
+  src/core/service_apikey.c
 )
 
 target_include_directories(atlas_core

@@ -16,6 +16,7 @@
 #include <stdio.h>
 
 #include "atlas/backup.h"
+#include "atlas/gw.h"
 #include "atlas/integrate.h"
 #include "atlas/json.h"
 #include "atlas/maintenance.h"
@@ -197,6 +198,25 @@ typedef struct atlas_renderer_vtbl {
      * and is labelled as untrusted wherever it appears, exactly as A4's
      * decision renderers label theirs. */
     atlas_status (*gate)(atlas_renderer *r, const atlas_gate_report *rep, atlas_err *err);
+
+    /* --- A9: remote credentials -------------------------------------------
+     *
+     * `apikey_created` is the one renderer in Atlas that prints a secret, and
+     * it prints it exactly once because that is the only moment it exists. The
+     * JSON form carries it too — an operator scripting a bootstrap needs it —
+     * and both say so in the output, so nobody has to infer that it will not
+     * come back.
+     *
+     * `apikey_listed` must never print one, and cannot: `atlas_apikey_record`
+     * has no field that could hold a plaintext. The label is operator text,
+     * validated at creation to printable ASCII, and is still safe-encoded on
+     * the way out for the reason every other value is. */
+    atlas_status (*apikey_created)(atlas_renderer *r, const atlas_apikey_created *c,
+                                   atlas_err *err);
+    atlas_status (*apikey_listed)(atlas_renderer *r, const atlas_apikey_listing *l,
+                                  atlas_err *err);
+    atlas_status (*apikey_revoked)(atlas_renderer *r, const char *key_id, bool changed,
+                                   atlas_err *err);
 } atlas_renderer_vtbl;
 
 struct atlas_renderer {

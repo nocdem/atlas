@@ -113,6 +113,10 @@ void atlas_cli_print_help(FILE *out) {
         "  backup restore BACKUP --yes  replace the index; keeps what it displaced\n"
         "  maintenance plan           what a prune would remove, and why each table is kept\n"
         "  maintenance prune --apply  remove only the rows the plan called eligible\n"
+        "  api-key create --label L --scope S   mint a remote credential; prints the secret once\n"
+        "  api-key list               credential metadata; never a secret\n"
+        "  api-key revoke KEY-ID      stops working immediately; the record stays\n"
+        "  api-key rotate KEY-ID --label L --scope S   mint a replacement, revoke the old\n"
         "  service print              print the systemd user unit; changes nothing\n"
         "  service install --user     write the unit; never enables or starts it\n"
         "  service uninstall --user   remove the unit Atlas wrote\n"
@@ -284,6 +288,20 @@ static atlas_status parse_args(cli_state *st, int argc, char **argv, bool *want_
                                          sizeof(st->opts.compdbs) / sizeof(st->opts.compdbs[0]));
                 }
                 st->opts.compdbs[st->opts.compdb_count++] = argv[++i];
+            } else if (strcmp(a, "--label") == 0) {
+                if (i + 1 >= argc) {
+                    return atlas_err_set(err, ATLAS_ERR_USAGE, "--label needs a value");
+                }
+                st->opts.label = argv[++i];
+            } else if (strcmp(a, "--scope") == 0) {
+                if (i + 1 >= argc) {
+                    return atlas_err_set(err, ATLAS_ERR_USAGE, "--scope needs a value");
+                }
+                if (st->opts.scope_count >= sizeof(st->opts.scopes) / sizeof(st->opts.scopes[0])) {
+                    return atlas_err_set(err, ATLAS_ERR_USAGE, "at most %zu scopes may be named",
+                                         sizeof(st->opts.scopes) / sizeof(st->opts.scopes[0]));
+                }
+                st->opts.scopes[st->opts.scope_count++] = argv[++i];
             } else if (strcmp(a, "--depth") == 0) {
                 if (i + 1 >= argc) {
                     return atlas_err_set(err, ATLAS_ERR_USAGE, "--depth needs a value");
@@ -1853,7 +1871,7 @@ static bool is_a_command(const char *cmd) {
         "doctor",  "repo",    "scan",      "status",  "search",  "file",     "history",
         "diff",    "daemon",  "sync",      "events",  "code",    "decision", "gate",
         "job",     "dispatcher", "backup", "maintenance", "service", "mcp",  "hook",
-        "integrate", "version", "help", "context", "operation",
+        "integrate", "version", "help", "context", "operation", "api-key",
     };
     for (size_t i = 0; i < sizeof COMMANDS / sizeof COMMANDS[0]; i++) {
         if (strcmp(cmd, COMMANDS[i]) == 0) {
@@ -2762,6 +2780,138 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
         /* Logs to stderr so a systemd unit captures them in the journal without
          * the service needing a writable log path. */
         return atlas_service_dispatcher_run(st->opts.job.once, st->errout, err);
+    }
+
+    /* A9. Credential administration, dispatched here — before any `atlas_ctx`
+     * is opened — for A5's reason about backup and prune: a context in AUTO
+     * mode takes the writer lock when it is free, and these take it themselves.
+     *
+     * There is deliberately no MCP tool, no ordinary RPC method and no gateway
+     * route that reaches any of this. The gateway runs as its own account,
+     * which is neither the operator uid nor a dispatcher uid, so even the
+     * operator-gated methods answer `unknown method` to it. Remote credential
+     * administration is absent in A9 rather than refused. */
+    if (strcmp(cmd, "api-key") == 0) {
+        if (st->operand_count == 0) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "usage: atlas api-key create|list|revoke|rotate ...");
+        }
+        const char *sub = st->operands[0];
+        atlas_status ks = ATLAS_OK;
+
+        if (strcmp(sub, "create") == 0 || strcmp(sub, "rotate") == 0) {
+            const bool rotating = strcmp(sub, "rotate") == 0;
+            /* `rotate` takes the id it replaces; `create` takes nothing. */
+            if (st->operand_count != (rotating ? 2u : 1u)) {
+                return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                     rotating ? "usage: atlas api-key rotate KEY-ID --label L "
+                                                "--scope S [--scope S...]"
+                                              : "usage: atlas api-key create --label L "
+                                                "--scope S [--scope S...]");
+            }
+            if (st->opts.label == NULL) {
+                return atlas_err_set(err, ATLAS_ERR_USAGE, "--label is required");
+            }
+            if (st->opts.scope_count == 0) {
+                return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                     "at least one --scope is required; a credential with no "
+                                     "scopes could not read anything");
+            }
+            /* Each scope is checked against the closed vocabulary here so the
+             * refusal names the offending value. The service layer checks again
+             * at the write point, which is the guarantee; this one is the
+             * message. */
+            atlas_scope_mask mask = 0u;
+            for (size_t i = 0; i < st->opts.scope_count; i++) {
+                atlas_apikey_scope one = atlas_apikey_scope_parse(st->opts.scopes[i]);
+                if (one == ATLAS_SCOPE_UNKNOWN) {
+                    /* The offending value is deliberately not echoed. It came
+                     * from argv and could carry a control sequence into a
+                     * terminal, and there is no safe pool open yet — the
+                     * renderer has not been started, because nothing has
+                     * succeeded. Listing the vocabulary is more actionable
+                     * anyway: it says what to type rather than what was typed. */
+                    atlas_buf known = ATLAS_BUF_INIT;
+                    for (int si = 1; si < (int)ATLAS_SCOPE__COUNT; si++) {
+                        atlas_apikey_scope sc = (atlas_apikey_scope)si;
+                        if (!atlas_apikey_scope_grantable(sc)) {
+                            continue;
+                        }
+                        if (known.len > 0) {
+                            (void)atlas_buf_append_str(&known, ", ", err);
+                        }
+                        (void)atlas_buf_append_str(&known, atlas_apikey_scope_name(sc), err);
+                    }
+                    atlas_status us = atlas_err_set(err, ATLAS_ERR_USAGE,
+                                                    "unknown scope; the grantable scopes are %s",
+                                                    atlas_buf_cstr(&known));
+                    atlas_buf_free(&known);
+                    return us;
+                }
+                mask |= ATLAS_SCOPE_BIT(one);
+            }
+            atlas_apikey_create_opts co;
+            memset(&co, 0, sizeof co);
+            co.label = st->opts.label;
+            co.scopes = mask;
+            co.rotate_from = rotating ? st->operands[1] : NULL;
+
+            atlas_apikey_created created;
+            memset(&created, 0, sizeof created);
+            ks = atlas_service_apikey_create(st->opts.data_dir, &co, &created, err);
+            if (ks == ATLAS_OK) {
+                ks = renderer_open(&r, st->opts.json, st->out, "api-key", err);
+                if (ks == ATLAS_OK) {
+                    ks = r.v->apikey_created(&r, &created, err);
+                }
+                ks = ks == ATLAS_OK ? renderer_close(&r, err) : (renderer_abort(&r), ks);
+            }
+            /* Wiped on every path, including the failing ones. This is the only
+             * copy of the plaintext that will ever exist. */
+            atlas_apikey_created_free(&created);
+            return ks;
+        }
+        if (strcmp(sub, "list") == 0) {
+            if (st->operand_count != 1u) {
+                return atlas_err_set(err, ATLAS_ERR_USAGE, "usage: atlas api-key list");
+            }
+            atlas_apikey_listing l;
+            atlas_apikey_listing_init(&l);
+            ks = atlas_service_apikey_list(st->opts.data_dir, &l, err);
+            if (ks == ATLAS_OK) {
+                ks = renderer_open(&r, st->opts.json, st->out, "api-key", err);
+                if (ks == ATLAS_OK) {
+                    ks = r.v->apikey_listed(&r, &l, err);
+                }
+                ks = ks == ATLAS_OK ? renderer_close(&r, err) : (renderer_abort(&r), ks);
+            }
+            atlas_apikey_listing_free(&l);
+            return ks;
+        }
+        if (strcmp(sub, "revoke") == 0) {
+            if (st->operand_count != 2u) {
+                return atlas_err_set(err, ATLAS_ERR_USAGE, "usage: atlas api-key revoke KEY-ID");
+            }
+            char id[ATLAS_APIKEY_SELECTOR_HEX + 1];
+            if (!atlas_apikey_id_normalise(st->operands[1], id)) {
+                return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                     "a key id is %u lowercase hex characters, optionally written "
+                                     "\"" ATLAS_APIKEY_ID_PREFIX "<id>\"",
+                                     (unsigned)ATLAS_APIKEY_SELECTOR_HEX);
+            }
+            bool changed = false;
+            ks = atlas_service_apikey_revoke(st->opts.data_dir, id, &changed, err);
+            if (ks == ATLAS_OK) {
+                ks = renderer_open(&r, st->opts.json, st->out, "api-key", err);
+                if (ks == ATLAS_OK) {
+                    ks = r.v->apikey_revoked(&r, id, changed, err);
+                }
+                ks = ks == ATLAS_OK ? renderer_close(&r, err) : (renderer_abort(&r), ks);
+            }
+            return ks;
+        }
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "usage: atlas api-key create|list|revoke|rotate ...");
     }
 
     if (strcmp(cmd, "backup") == 0) {

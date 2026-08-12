@@ -48,6 +48,15 @@ typedef struct atlas_cli_opts {
      * tells it how to compile things. */
     const char *compdbs[32];
     size_t compdb_count;
+    /* A9: `api-key create --label L --scope S [--scope S...]`.
+     *
+     * `--scope` is repeatable and every value must be in the closed vocabulary;
+     * an unrecognised one is a refusal rather than something dropped, because a
+     * credential granted fewer scopes than were written down is a credential
+     * whose behaviour nobody can predict from the command that made it. */
+    const char *label;
+    const char *scopes[16];
+    size_t scope_count;
     long since;
     const char *data_dir;
     long limit;

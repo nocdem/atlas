@@ -13,6 +13,25 @@ checked against a read-only allowlist before the process is created, hooks and
 external diff drivers are disabled, and the working tree and index are only ever
 read. See [docs/git-safety.md](docs/git-safety.md).
 
+## Status: phase A9
+
+A9 adds secure remote access: an HTTP gateway that authenticates a bearer
+credential, checks scopes and forwards only explicitly supported reads to
+`atlasd`; remote MCP over the same tool implementations the stdio adapter uses;
+a versioned read-only web API; and an embedded Mission Control page.
+
+```sh
+atlas api-key create --label chatgpt --scope repo:read --scope decisions:read
+atlas gateway status     # what the root-owned policy says; binds nothing
+atlas gateway run        # serves remote MCP and, optionally, the web GUI
+```
+
+The secret is printed once and cannot be retrieved afterwards. **Atlas
+terminates no TLS** — it is designed to sit behind a reverse proxy that does.
+Credential administration is local and operator-only; no remote caller can
+create, rotate or revoke a credential, and none can write anything at all. See
+`docs/remote-access.md`.
+
 ## Status: phase A6
 
 A6 turns Atlas' stored decisions into deterministic safety gates: it detects

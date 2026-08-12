@@ -299,22 +299,27 @@ async function viewOverview() {
   panel($("o-status"), async () => {
     const s = await api("status");
     return kv([
-      ["daemon", s.running === false ? tag("not running", "bad") : tag("running", "ok")],
-      ["version", s.version],
+      ["daemon", tag("running", "ok")],
+      ["atlas", s.atlas],
       ["protocol", s.protocol],
-      ["schema", s.schema],
       ["repositories", s.repositories],
-      ["uptime (s)", s.uptime_s],
+      ["watching", s.watching],
+      ["uptime", s.uptime_ms === undefined ? undefined : Math.round(s.uptime_ms / 1000) + " s"],
+      ["write queue", s.write_queue_depth + " / " + s.write_queue_limit],
+      ["event gaps", s.repositories_with_event_gap],
+      ["degraded", s.degraded ? tag("yes", "warn") : tag("no", "ok")],
     ]);
   });
 
   panel($("o-repos"), async () => {
     const r = await api("repos");
     return table([
-      {label: "repository", get: (x) => x.repo || x.name},
+      {label: "repository", get: (x) => x.repo},
       {label: "branch", get: (x) => x.branch},
+      {label: "head", get: (x) => (x.scanned_head || "").slice(0, 12)},
       {label: "index", get: (x) => x.index_current === false ? tag("stale", "warn") : tag("current", "ok")},
-      {label: "changes", get: (x) => x.changed_paths},
+      {label: "gen", get: (x) => x.generation},
+      {label: "watch", get: (x) => x.watch_state},
     ], r.repositories, {empty: "no repositories are registered"});
   });
 
@@ -355,21 +360,24 @@ async function viewRepository() {
     const s = await api("repo", {repo: name});
     return kv([
       ["repository", s.repo || name],
-      ["head", s.head],
+      ["head", s.scanned_head || s.head],
       ["branch", s.branch],
-      ["dirty", s.dirty ? tag("yes", "warn") : tag("no", "ok")],
-      ["root hash", s.root_hash],
+      ["watch", s.watch_state],
+      ["watched dirs", s.watched_directories],
+      ["last scan", s.last_scan_at],
+      ["last error", s.last_error || "none"],
     ]);
   });
   panel($("r-index"), async () => {
     const s = await api("repo", {repo: name});
     return kv([
       ["current", s.index_current === false ? tag("no", "warn") : tag("yes", "ok")],
-      ["reason", s.index_reason],
+      ["reason", s.not_current_reason || "—"],
       ["generation", s.generation],
-      ["files", s.files],
-      ["commits", s.commits],
-      ["changed paths", s.changed_paths],
+      ["last complete", s.last_complete_generation],
+      ["event gap", s.event_gap ? tag("yes", "warn") : tag("no", "ok")],
+      ["event cursor", s.event_cursor],
+      ["last reconcile", s.last_reconcile_at],
     ]);
   });
   panel($("r-code"), async () => {

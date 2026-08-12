@@ -1,0 +1,59 @@
+# Atlas A9 — the remote gateway.
+#
+# Installed by an operator, never by Atlas. `atlas gateway run` refuses to start
+# unless /etc/atlas/gateway.conf is root-owned and says `enabled = yes`.
+#
+# This unit deliberately does NOT run as the operator account. The gateway
+# terminates connections from the Internet; if it ran as the operator, a
+# compromised gateway could approve decisions, administer credentials and read
+# backups. The whole A9 isolation claim is that it runs as somebody else.
+
+[Unit]
+Description=Atlas remote gateway (HTTP -> atlasd)
+Documentation=file:///usr/local/share/doc/atlas/remote-access.md
+After=network.target atlas.service
+Wants=atlas.service
+
+[Service]
+Type=simple
+User=atlas-gateway
+Group=atlas-gateway
+# The socket is reached through the client group, exactly as any other client.
+SupplementaryGroups=atlas-clients
+ExecStart=/usr/local/bin/atlas gateway run
+Restart=on-failure
+RestartSec=5
+
+# The gateway holds no database handle, opens no repository, creates no process
+# and has no filesystem write path. The sandbox says so to the kernel as well.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @debug @obsolete
+# It never writes anything. There is no ReadWritePaths line, deliberately.
+ReadOnlyPaths=/etc/atlas
+# The registered repositories are the daemon's business, never the gateway's.
+InaccessiblePaths=/opt
+CapabilityBoundingSet=
+AmbientCapabilities=
+# Binding a port below 1024 would need CAP_NET_BIND_SERVICE. Do not add it:
+# put a reverse proxy in front, which is where TLS terminates anyway.
+IPAddressAllow=localhost
+
+[Install]
+WantedBy=multi-user.target

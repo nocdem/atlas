@@ -59,8 +59,23 @@ static int64_t ops_id_base(void) {
         ms = (int64_t)ts.tv_sec * 1000 + (int64_t)(ts.tv_nsec / 1000000);
     }
     (void)pthread_mutex_lock(&base_lock);
-    if (ms <= last_base) {
-        ms = last_base + (int64_t)ATLAS_OPS_MAX_RECORDS + 1;
+    /* The floor is the previous base plus every id that base could have issued,
+     * not the previous base itself.
+     *
+     * A table issues ids from its base upwards, so after `atlas_ops_start` at
+     * base B the ids B, B+1, ... are already spent. Guarding only against
+     * `ms <= last_base` left the one-millisecond case wrong: a second table
+     * created 1 ms later takes base B+1, which the first table had already
+     * handed out — and a client polling that id is given another operation's
+     * verdict, which is the confident wrong answer this whole layer exists to
+     * prevent.
+     *
+     * Sub-millisecond creation was already covered and is why this survived: it
+     * only appears when the two starts land in adjacent milliseconds, which a
+     * sanitizer build makes ordinary and a release build makes rare. */
+    int64_t floor = last_base + (int64_t)ATLAS_OPS_MAX_RECORDS + 1;
+    if (ms <= floor) {
+        ms = floor;
     }
     last_base = ms;
     (void)pthread_mutex_unlock(&base_lock);

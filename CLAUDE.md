@@ -1,7 +1,12 @@
 # Atlas — working notes for Claude Code
 
 Atlas is a generic, headless engineering-memory and repository-intelligence CLI in
-C17. Phase **A8-CI**: compiler-aware code intelligence — a semantic index built
+C17. Phase **A9**: secure remote access — an HTTP gateway that authenticates a
+bearer credential, checks scopes and forwards only explicitly supported reads to
+`atlasd`; remote MCP over the same tool implementations stdio uses; a versioned
+read-only web API; and an embedded Mission Control page. Credentials are minted
+locally by the operator and the plaintext is shown once. Atlas terminates no
+TLS. See `docs/remote-access.md` and the A9 sections below. On top of **A8-CI**: compiler-aware code intelligence — a semantic index built
 with libclang beside A3's lexical one, a call graph whose every edge states
 whether the compiler proved it, bounded change-impact, and a deterministic
 task-context builder. See the A8-CI sections below. On top of **A8**: the durable orchestration control plane — a job queue, an
@@ -45,6 +50,10 @@ sh scripts/perf-a4.sh build   # A4 decision-lifecycle acceptance (~2 minutes)
 sh scripts/perf-a5.sh build   # A5 backup/verify/restore acceptance (~3 minutes)
 sh scripts/perf-a6.sh build   # A6 gate-latency acceptance (~4 minutes)
 ```
+
+A9 adds `atlas api-key create|list|revoke|rotate` and `atlas gateway run|status`.
+`gateway status` reads the root-owned policy and binds nothing, so it is safe to
+run anywhere; with no policy installed it says so and names the path.
 
 `perf-a3.sh` measures peak RSS from `/proc/<pid>/VmHWM` rather than from
 `time(1)`, because `busybox time -v` reports `ru_maxrss` multiplied by the page
@@ -1433,6 +1442,154 @@ so.
   is a reported finding, not a problem, and does not affect `ok`: an index the
   operator cannot read is the correct state of a separated deployment.
 
+## A9 layers — additions
+
+```
+src/gw       apikey.c (the credential format, the verifier, the scope
+             vocabulary), gwpolicy.c (the root-owned gateway policy),
+             http.c (the bounded HTTP/1.1 reader and the one response writer),
+             gateway.c (routing, authentication, scopes, audit, the listener,
+             browser sessions, the web API)
+src/gw/ui    mission-control.html — one page, embedded in the binary
+src/db       db_gw.c (typed operations over the migration-12 tables)
+src/core     hmac.c (RFC 2104 HMAC-SHA256, constant-time compare, kernel
+             randomness), service_apikey.c (the `api-key` command behaviour,
+             local and over the socket)
+src/ipc      server_apikey.c (three operator-gated credential methods),
+             server_gw.c (three gateway-only methods)
+tools        atlas_embed.c (the first-party asset embedder)
+deploy/a9    atlas-gateway.service, gateway.conf.template
+docs         remote-access.md
+```
+
+## A9 rules — these are not negotiable
+
+- **What the gateway cannot do is true because of who it runs as, not because
+  of anything in `src/gw`.** It runs as `gateway_uid` from the root-owned
+  policy, which is neither the operator uid nor a dispatcher uid, so
+  `decision.approve`, `backup.create`, `code.index`, `apikey.*`, every `job.`
+  and every `dispatch.` answer it `unknown method` — and under A7.1 it cannot
+  open the index at all. A bug in the gateway cannot make that false. **Never
+  write a check in `src/gw` and describe it as the boundary.**
+
+  On an unseparated machine the guarantee does not apply, and
+  `docs/remote-access.md` says so in those words rather than letting a reader
+  infer A7.1's separation.
+
+- **Atlas terminates no TLS, and must never be described as providing it.** An
+  in-process stack would be a new third-party dependency, which the hard rules
+  forbid. `tls_mode = REVERSE_PROXY` records the operator's statement that
+  something in front terminates it. The default bind is loopback and anything
+  wider requires an explicit `tls_mode` — even `NONE`, which is then a decision
+  an auditor can find rather than the consequence of an absent key.
+
+- **The secret is shown once because after that no copy exists.** The index
+  holds `HMAC-SHA256(salt, secret)`; `atlas_apikey_record` has no field that
+  could hold a plaintext, no read returns one, and no method local or remote
+  could produce one. `tests/test_apikey.c` searches the database as **raw
+  bytes**, because a query only finds a leak in a column somebody thought to
+  check. Adding a column, a field or a method that could carry a plaintext
+  deletes the guarantee.
+
+- **One HMAC pass, not a slow KDF, and the argument is in `include/atlas/hmac.h`.**
+  PBKDF2 defends a guessable secret; an Atlas key is 256 bits of `/dev/urandom`.
+  An iteration count buys nothing against the only attack that exists and hands
+  an attacker a per-request CPU amplifier on an Internet-facing endpoint. If a
+  future phase accepts a credential a human chose, it must not use this path.
+
+- **`memory:write` is in the vocabulary and is not grantable.** Every tool that
+  records something durable maps to it, so denying a remote write is the
+  ordinary scope check finding a clear bit rather than a rule each tool must
+  remember. The scope is a field on `tool_def`, so a tool added without deciding
+  what it exposes does not compile.
+
+- **Hiding is not authorisation.** `tools/list` and the GUI omit what a
+  credential cannot reach, and both are conveniences: naming a hidden tool or
+  route directly meets the same check and is refused. Never replace the check
+  with the filter.
+
+- **Remote credential administration does not exist in A9 — it is absent, not
+  refused.** No MCP tool, no gateway route, and no method the gateway's uid can
+  reach creates, lists, rotates or revokes a credential.
+  `tests/test_gw_remote.c` asks for every name such a tool would plausibly have
+  and requires `unknown tool`.
+
+- **The credential methods are gated by their own predicate, and it is not
+  `atlas_server_peer_is_operator`.** See `src/ipc/server_apikey.c`: the
+  policy's operator uid where one exists, refused under a system deployment
+  that names none, and the daemon's own uid in legacy mode — because that
+  account already owns `atlas.db` and can write `api_keys` with `sqlite3`, so
+  refusing it relocates the verb and protects nothing while breaking revocation
+  on every ordinary machine.
+
+- **Revocation must never require stopping the daemon.** The local path takes
+  the writer lock a running daemon holds, so `api-key revoke` routes over the
+  socket when a daemon owns the directory or the index is foreign. "Stop the
+  service to revoke a leaked credential" is not an answer.
+
+- **There is one peer test per gate, asked wherever it is needed.** The static
+  helper in `server_gw.c` delegates to `atlas_server_peer_is_gateway` rather
+  than repeating the rule — the two disagreed once about legacy mode and every
+  gateway request failed as "unauthenticated" with nothing saying why. Asked
+  twice is fine and correct: the dispatcher decides whether a *name* is offered
+  and the method decides whether the *operation* runs.
+
+- **Audit failure does not break request handling, structurally.** The row is
+  queued to the writer and the gateway never learns whether it landed. Atlas
+  prefers answering with a gap in the trail to refusing a request because it
+  could not write one, and `docs/remote-access.md` states the trade.
+
+- **`key_id` in an audit row means "the principal Atlas authenticated" and must
+  never hold a value somebody merely claimed.** A denied row names the
+  presented selector in `detail` instead — the selector is not secret and an
+  operator needs to know *which* credential was rejected, but the column that
+  identifies a principal must stay trustworthy.
+
+- **One CSP header, never two.** `atlas_http_response.csp` exists because a
+  browser enforces the intersection of every policy it receives: a page that
+  added `connect-src 'self'` beside a default of `default-src 'none'` had no
+  connect permission at all, and the GUI could not call its own API. A route
+  needing a different policy sets the field; it must not add a second header
+  through `extra`.
+
+- **No route becomes a socket message unless it matched the fixed table.** The
+  API route table names the daemon method, the scope and the parameters it will
+  forward; everything else in a query string is ignored rather than passed on.
+  A client cannot name an Atlas method or add a parameter to a daemon call.
+
+- **The gateway has no filesystem read path.** The page is embedded in the
+  binary by a first-party C generator. Paths are never decoded and never joined
+  to a filesystem path, so an encoded traversal is a route that matches nothing.
+
+- **Browser sessions live in gateway memory and a restart forgets them.** The
+  reason A8-CI's operations table does. There is no `gw_sessions` migration and
+  there must not be one; a durable session needs a durable secret. A session and
+  a bearer token map to the same principal, scope mask and audit identity.
+
+- **`gw_audit` is the second prunable table in Atlas**, and A5's rule about
+  widening that applies: the argument is in `RETENTION[]` and must survive being
+  read back. `api_keys` is CANONICAL — a credential goes away when an operator
+  revokes it, never by age.
+
+## Extending A9 safely
+
+- **A new scope** means a member of `atlas_apikey_scope`, a row in `SCOPES[]`
+  stating whether an operator may grant it, the table in
+  `docs/remote-access.md`, and a decision about every existing tool. Keep
+  UNKNOWN at zero.
+- **A new MCP tool** must state its scope in `tool_def`; the initialiser does
+  not compile without one. A write tool maps to `ATLAS_SCOPE_MEMORY_WRITE`.
+- **A new API route** is a row in `API_ROUTES[]` naming its daemon method, its
+  scope and the parameters it forwards. It must be a read. A route that mutates
+  needs a write scope no A9 credential can hold, which is the argument it has to
+  survive.
+- **A new gateway policy key** means a branch in `atlas_gwpolicy_parse_buffer`,
+  a field, a documented line in `deploy/a9/gateway.conf.template`, and a case in
+  the malformed matrix in `tests/test_gateway.c`. An unknown key stays an error,
+  and a ceiling may only lower the compiled-in bound.
+- **A new response header** goes in `atlas_http_write_head`, which is the one
+  writer, so no route can invent a header set or forget the security ones.
+
 ## Extending A8 safely
 
 - **A new state** means editing `atlas_orch_state`, both schema CHECKs,
@@ -1777,7 +1934,8 @@ two documents on stdout.
 `docs/operations.md` · `docs/impact-gates.md` ·
 `docs/security/A7_THREAT_MODEL.md` · `docs/security/A7_SECURITY_REVIEW.md` ·
 `docs/security/A7_1_THREAT_MODEL.md` · `docs/security/A7_1_OPERATIONS.md` ·
-`docs/orchestration.md` · `docs/git-safety.md` · `docs/daemon-and-ipc.md` ·
+`docs/orchestration.md` · `docs/remote-access.md` · `docs/git-safety.md` ·
+`docs/daemon-and-ipc.md` ·
 `docs/watcher-consistency.md` · `docs/systemd-user-service.md` ·
 `docs/ai-trust-boundary.md` · `docs/claude-integration.md` ·
 `docs/backlog.md` · `docs/roadmap.md` ·

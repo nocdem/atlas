@@ -275,6 +275,14 @@ failed, how long it took.
 Never recorded: raw API keys, Authorization headers, request bodies, or any
 secret Atlas returns. There is no column that could hold one.
 
+A **denied** row names the selector that was presented, in `detail` — the
+selector is not secret (it is half of what the client sent in the clear, and
+exists so a token can be looked up by an indexed test). An operator needs to
+know *which* credential was rejected four hundred times; "something was
+rejected" is not actionable. It is deliberately kept out of `key_id`, which
+means "the principal Atlas authenticated" and must never hold a value somebody
+merely claimed.
+
 Every text field is safe-encoded before it is written, which is the audit-log
 injection defence — and a header value carrying a control byte is refused at the
 HTTP parser, so nothing downstream ever receives one.
@@ -288,6 +296,23 @@ Retention: `gw_audit` is the second prunable table in Atlas — see
 `RETENTION[]` in `src/core/service_maintenance.c` for the argument. It is removed
 only by `atlas maintenance prune --apply`, never on a timer, at startup or on low
 disk.
+
+## Running it
+
+```sh
+atlas gateway status     # what the policy says; binds nothing, safe anywhere
+atlas gateway run        # serves until SIGTERM
+```
+
+`deploy/a9/` holds a systemd unit and a documented configuration template. The
+unit runs as a dedicated `atlas-gateway` account — **not** the operator's, which
+is the whole separation — with `ProtectSystem=strict`, no `ReadWritePaths` at
+all, and `InaccessiblePaths=/opt` so the registered repositories are the daemon's
+business and never the gateway's.
+
+Neither the unit nor the policy is installed by Atlas. `atlas gateway run`
+refuses to start unless the root-owned policy says `enabled = yes`, and reports
+which condition failed and what would change it.
 
 ## Configuration
 

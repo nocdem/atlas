@@ -1,0 +1,89 @@
+# Atlas A9 — the root-owned gateway policy.
+#
+# Install as /etc/atlas/gateway.conf, owned by root, mode 0644, with every
+# directory on the path owned by root and writable by nobody else. Atlas walks
+# the path from / and refuses to read it otherwise: the principal this file
+# constrains is the gateway, and a gateway that could edit its own policy is
+# constrained by nothing.
+#
+# An unrecognised key is an error, not something skipped. A policy Atlas
+# half-understands is one whose author believes they configured something Atlas
+# never read — and here that something is very likely to have been a
+# restriction.
+#
+# Every ceiling below may only LOWER the compiled-in bound in
+# include/atlas/limits.h. A value above it is a malformed policy.
+
+# Nothing runs without this.
+enabled = no
+
+# The uid the gateway process runs as. The daemon compares it against
+# SO_PEERCRED before offering the `gateway.` method group; zero, or absent,
+# means no gateway may reach it.
+#
+# MUST NOT be the operator uid from authority.conf. That is the whole
+# separation: the gateway terminates connections from the Internet, and if it
+# runs as the operator then a compromised gateway can approve decisions,
+# administer credentials and read backups. Create a dedicated account:
+#
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin \
+#        --groups atlas-clients atlas-gateway
+#
+# and add its uid as a `client_uid` in /etc/atlas/system.conf so it may open
+# the socket at all.
+gateway_uid = CHANGEME
+
+# --- the listener -----------------------------------------------------------
+#
+# The default is loopback. Binding anything else REQUIRES tls_mode below, even
+# when the answer is NONE — which is then a decision an auditor can find rather
+# than the silent consequence of leaving a key out.
+listen_addr = 127.0.0.1
+listen_port = 8787
+
+# Printed in connection instructions. Nothing routes on it.
+# public_url = https://atlas.example.com
+
+# --- transport security -----------------------------------------------------
+#
+# Atlas terminates NO TLS. An in-process TLS stack would be a new third-party
+# dependency, which the project's hard rules forbid. REVERSE_PROXY says
+# something in front — nginx, Caddy, a load balancer — terminates it and
+# forwards over loopback. Atlas cannot verify that and does not try.
+#
+# REVERSE_PROXY | NONE
+tls_mode = REVERSE_PROXY
+
+# --- surfaces ---------------------------------------------------------------
+#
+# Both default off. Enabling the gateway is one decision; exposing a particular
+# surface on it is another. A policy that enables neither is refused.
+remote_mcp = yes
+web_gui = no
+
+# --- browser origins --------------------------------------------------------
+#
+# Exact strings, compared whole — scheme, host and port. A suffix match is how
+# https://atlas.example.com.attacker.net is accepted by a check that meant to
+# allow atlas.example.com, so there is no suffix match. `*` is refused
+# outright: a wildcard origin with credentials is the one CORS configuration
+# that is always wrong.
+#
+# An empty list means no cross-origin browser request is accepted at all, which
+# is correct when the GUI is served from this same origin.
+# allowed_origin = https://atlas.example.com
+
+# --- bounds -----------------------------------------------------------------
+max_request_bytes = 1048576
+max_concurrent = 64
+rate_limit_per_minute = 600
+session_ttl_seconds = 43200
+
+# Whether a forwarded client address may be believed for rate limiting.
+#
+# Off by default, and the consequence is stated rather than hidden: behind a
+# reverse proxy every request appears to come from the proxy, so per-peer rate
+# limiting degrades to a global one. Believing the header by default would be
+# worse — an attacker would vary it, and the limit would become unenforceable
+# while continuing to look enforced.
+trust_forwarded_for = no

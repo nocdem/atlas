@@ -20,6 +20,46 @@ Six classes:
 | **lifecycle mutation** | Changes a decision's state. Requires an operator capability. |
 | **administrative** | Backup, restore, prune, service units. |
 
+## A9 additions
+
+Six methods and two surfaces. The classification below is unchanged for
+everything that existed before; nothing was reclassified.
+
+| operation | class | authority |
+|---|---|---|
+| `apikey.create` | administrative | operator uid, or the daemon's own uid in legacy mode |
+| `apikey.list` | administrative | same |
+| `apikey.revoke` | administrative | same |
+| `gateway.auth` | global read | the `gateway_uid` a root-owned policy names |
+| `gateway.audit` | index mutation | same — one append-only row, queued to the writer |
+| `gateway.audit_list` | global read | same |
+
+The credential methods are gated by their own predicate rather than by
+`atlas_server_peer_is_operator`; see `src/ipc/server_apikey.c` for why, and note
+that the gateway's uid is not among them. The gateway group is disjoint from
+every other group and is hidden the way the dispatcher group is: a peer the
+policy does not name gets `unknown method`.
+
+**The remote surfaces add no operation.** Remote MCP exposes the same
+`TOOLS[]` the stdio adapter does, filtered by the credential's scopes, and the
+web API's 23 routes each forward to a daemon method already in the table above.
+A client never names an Atlas method.
+
+## The four A9 absences that carry its guarantees
+
+1. **No remote credential administration.** No MCP tool and no gateway route
+   creates, lists, rotates or revokes a credential, or changes its own scopes.
+   Absent, not refused.
+2. **No operation anywhere returns the plaintext of an existing credential.**
+   The index holds a one-way verifier and there is no column to read one from,
+   so there is no `apikey.show`, `apikey.reveal` or `apikey.export` — and their
+   absence is a property of the storage rather than a refusal.
+3. **No write scope is grantable.** `memory:write` exists so every recording
+   tool maps to it, and no operator can grant it in A9.
+4. **No route reaches the socket unless it matched the fixed table.** The web
+   API's parameter allowlist is per route; anything else in a query string is
+   ignored rather than forwarded.
+
 ## The three absences that carry the guarantees
 
 1. **There is no `repo.add`, `repo.ensure` or `repo.remove` RPC method.** They
@@ -129,6 +169,13 @@ from "there is no such thing" tells a caller what to try next.
 group rather than nested inside it.
 
 ## MCP tools — 28, every one a read or a proposal
+
+Each carries a scope in `tool_def`. A remote credential sees and can call only
+the tools its scopes permit; the four that record something durable map to
+`memory:write`, which no A9 credential can hold. The stdio adapter is
+unaffected — a local Claude session is authorised by an operator having
+installed the plugin, which is A2's boundary and is unchanged.
+
 
 Repository context, files, search, history, decisions, gate checks, and the
 seven A8-CI tools: `atlas_sem_status`, `atlas_sem_symbol`, `atlas_sem_callers`,

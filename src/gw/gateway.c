@@ -115,9 +115,10 @@ void atlas_gateway_close(atlas_gateway *g) {
 
 /* Builds one complete response. Every route ends here, so no route can invent a
  * header set or forget the security headers. */
-static atlas_status respond(atlas_gateway *g, const atlas_http_request *req, int status,
-                            const char *content_type, const void *body, size_t body_len,
-                            const char *extra, atlas_buf *out, atlas_err *err) {
+static atlas_status respond_csp(atlas_gateway *g, const atlas_http_request *req, int status,
+                                const char *content_type, const void *body, size_t body_len,
+                                const char *extra, const char *csp, atlas_buf *out,
+                                atlas_err *err) {
     atlas_http_response r;
     atlas_http_response_init(&r);
     r.status = status;
@@ -125,6 +126,11 @@ static atlas_status respond(atlas_gateway *g, const atlas_http_request *req, int
     r.body = body;
     r.body_len = body_len;
     r.extra = extra;
+    /* One CSP header, never two. A second one added through `extra` would be
+     * enforced alongside this one and a browser applies the intersection, so a
+     * page needing `connect-src 'self'` beside a default of `default-src 'none'`
+     * would end up with no connect permission at all. */
+    r.csp = csp;
     /* Every response closes. Keep-alive would mean holding a slot for a peer
      * that may send nothing else, and the concurrency ceiling is what bounds
      * this process's exposure — so a connection is worth one request. */
@@ -147,6 +153,12 @@ static atlas_status respond(atlas_gateway *g, const atlas_http_request *req, int
         st = atlas_buf_append(out, body, body_len, err);
     }
     return st;
+}
+
+static atlas_status respond(atlas_gateway *g, const atlas_http_request *req, int status,
+                            const char *content_type, const void *body, size_t body_len,
+                            const char *extra, atlas_buf *out, atlas_err *err) {
+    return respond_csp(g, req, status, content_type, body, body_len, extra, NULL, out, err);
 }
 
 /* A JSON error document, in the shape the rest of Atlas uses so a caller has one
@@ -220,6 +232,17 @@ typedef struct principal {
     char key_id[ATLAS_APIKEY_SELECTOR_HEX + 1];
     char label[ATLAS_APIKEY_LABEL_MAX + 1];
     atlas_scope_mask scopes;
+    /* The selector the client presented, whether or not it authenticated.
+     *
+     * Not a secret — see `atlas/apikey.h`: it exists so a token can be looked up
+     * by an indexed test, and it is half of what the client sent in the clear.
+     * Recorded so a DENIED audit row can say *which* credential was tried, which
+     * is what an operator reads the trail for: "this key was rejected four
+     * hundred times" is actionable and "something was rejected" is not.
+     *
+     * It is deliberately kept out of `key_id`, which means "the principal Atlas
+     * authenticated" and must never hold a value somebody merely claimed. */
+    char presented[ATLAS_APIKEY_SELECTOR_HEX + 1];
 } principal;
 
 /* Authenticates the request's bearer credential by asking the daemon.
@@ -240,6 +263,29 @@ static void authenticate(atlas_gateway *g, const atlas_http_request *req, princi
     atlas_err_init(&perr);
     if (atlas_apikey_bearer_parse(req->authorization, token, sizeof token, &perr) != ATLAS_OK) {
         return;
+    }
+
+    /* The selector, for the audit trail only.
+     *
+     * The gateway does not verify anything with it — it cannot, because the
+     * verifier lives in the index it may not read. It records *what was
+     * claimed*, so a DENIED row can name the credential somebody tried rather
+     * than saying only that something was rejected. The secret half is decoded
+     * as a side effect of parsing and is wiped immediately; it is forwarded to
+     * the daemon in `token`, not from here. */
+    {
+        char selector[ATLAS_APIKEY_SELECTOR_HEX + 1];
+        unsigned char secret[ATLAS_APIKEY_SECRET_BYTES];
+        atlas_err serr;
+        atlas_err_init(&serr);
+        if (atlas_apikey_token_parse(token, selector, secret, &serr) == ATLAS_OK) {
+            (void)snprintf(out->presented, sizeof out->presented, "%s", selector);
+        }
+        volatile unsigned char *z = secret;
+        for (size_t i = 0; i < sizeof secret; i++) {
+            z[i] = 0;
+        }
+        memset(selector, 0, sizeof selector);
     }
 
     atlas_buf params = ATLAS_BUF_INIT;
@@ -322,6 +368,20 @@ static void authenticate(atlas_gateway *g, const atlas_http_request *req, princi
     }
     atlas_ipc_response_free(r);
     atlas_buf_free(&resp);
+}
+
+/* Fixed Atlas text naming the selector that was presented, when one was.
+ *
+ * Never the secret half, never the header, and never a value that is not 16
+ * lowercase hex characters — the parser refused anything else before this could
+ * be reached. */
+static const char *auth_detail(const principal *pr, char *buf, size_t n) {
+    if (pr == NULL || pr->presented[0] == '\0') {
+        return "authentication failed; no usable credential was presented";
+    }
+    (void)snprintf(buf, n, "authentication failed for the credential claiming id %s",
+                   pr->presented);
+    return buf;
 }
 
 /* --- audit ----------------------------------------------------------------- */
@@ -903,8 +963,11 @@ static bool api_handle(atlas_gateway *g, const atlas_http_request *req, const pr
             "\"message\":\"a valid Atlas API key is required\"}}";
         *st_out = respond(g, req, 401, "application/json", UNAUTH, sizeof UNAUTH - 1u,
                           "WWW-Authenticate: Bearer\r\n", response, err);
-        audit(g, "WEB_API", NULL, req->path, false, false, ATLAS_ERR_INTEGRITY,
-              now_ms() - started, "authentication failed");
+        {
+            char detail[128];
+            audit(g, "WEB_API", NULL, req->path, false, false, ATLAS_ERR_INTEGRITY,
+                  now_ms() - started, auth_detail(pr, detail, sizeof detail));
+        }
         return true;
     }
     if (!atlas_scope_has(pr->scopes, route->scope)) {
@@ -1067,6 +1130,7 @@ atlas_status atlas_gateway_serve_bytes(atlas_gateway *g, const char *request, si
 
         principal pr;
         authenticate(g, &req, &pr);
+        char detail[128];
         if (!pr.authenticated) {
             /* One answer for every authentication failure. `WWW-Authenticate`
              * names the scheme, which is what a conforming client needs, and
@@ -1078,7 +1142,7 @@ atlas_status atlas_gateway_serve_bytes(atlas_gateway *g, const char *request, si
                                       sizeof UNAUTH - 1u, "WWW-Authenticate: Bearer\r\n",
                                       response, err);
             audit(g, "REMOTE_MCP", NULL, "mcp", false, false, ATLAS_ERR_INTEGRITY,
-                  now_ms() - started, "authentication failed");
+                  now_ms() - started, auth_detail(&pr, detail, sizeof detail));
             atlas_http_request_free(&req);
             return st;
         }
@@ -1150,8 +1214,11 @@ atlas_status atlas_gateway_serve_bytes(atlas_gateway *g, const char *request, si
             if (!pr.authenticated) {
                 st = respond_error(g, &req, 401, "unauthenticated",
                                    "that key was not accepted", response, err);
-                audit(g, "WEB_GUI", NULL, "auth.login", false, false, ATLAS_ERR_INTEGRITY,
-                      now_ms() - started, "authentication failed");
+                {
+                    char detail[128];
+                    audit(g, "WEB_GUI", NULL, "auth.login", false, false, ATLAS_ERR_INTEGRITY,
+                          now_ms() - started, auth_detail(&pr, detail, sizeof detail));
+                }
             } else {
                 char token[ATLAS_GW_SESSION_TOKEN_HEX + 1u];
                 session_put(g, &pr, token);
@@ -1231,11 +1298,14 @@ atlas_status atlas_gateway_serve_bytes(atlas_gateway *g, const char *request, si
              * path, so there is no directory an attacker could aim a request
              * at. The page's own CSP permits its inline style and script and
              * nothing else — no external origin, no eval, no frame. */
-            atlas_status st = respond(
-                g, &req, 200, "text/html; charset=utf-8", atlas_ui_page, atlas_ui_page_len,
-                "Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; "
-                "script-src 'unsafe-inline'; connect-src 'self'; form-action 'none'; "
-                "frame-ancestors 'none'; base-uri 'none'\r\n",
+            atlas_status st = respond_csp(
+                g, &req, 200, "text/html; charset=utf-8", atlas_ui_page, atlas_ui_page_len, NULL,
+                /* The page's own policy, replacing the default rather than
+                 * joining it: it needs its inline style and script and it needs
+                 * to call its own origin, and nothing else. No external origin,
+                 * no eval, no frame, no form target. */
+                "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
+                "connect-src 'self'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'",
                 response, err);
             atlas_http_request_free(&req);
             return st;

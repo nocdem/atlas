@@ -127,6 +127,18 @@ typedef struct atlas_http_response {
      * browser refuse the response. */
     const char *allow_origin;
     const char *extra;      /* additional fixed header lines, or NULL */
+    /* The Content-Security-Policy value, without the header name.
+     *
+     * NULL means the default: `default-src 'none'`, which makes an error body
+     * inert even if something one day puts reflected content in one.
+     *
+     * A caller that needs a different policy must set this rather than adding a
+     * second header through `extra`. Two CSP headers are both enforced and a
+     * browser applies their *intersection*, so a page that added
+     * `connect-src 'self'` alongside a default of `default-src 'none'` would
+     * have no connect permission at all — which is exactly the bug this field
+     * exists to make impossible. */
+    const char *csp;
     const void *body;
     size_t body_len;
     bool keep_alive;

@@ -358,12 +358,14 @@ size_t atlas_http_write_head(const atlas_http_response *r, char *out, size_t out
         "X-Content-Type-Options: nosniff\r\n"
         "X-Frame-Options: DENY\r\n"
         "Referrer-Policy: no-referrer\r\n"
-        "Content-Security-Policy: default-src 'none'; frame-ancestors 'none'; base-uri 'none'\r\n"
+        "Content-Security-Policy: %s\r\n"
         "%s%s%s"
         "%s"
         "\r\n",
         r->status, atlas_http_status_text(r->status), r->content_type, r->body_len,
         r->keep_alive ? "keep-alive" : "close",
+        r->csp != NULL ? r->csp
+                       : "default-src 'none'; frame-ancestors 'none'; base-uri 'none'",
         r->allow_origin != NULL ? "Access-Control-Allow-Origin: " : "",
         r->allow_origin != NULL ? r->allow_origin : "",
         r->allow_origin != NULL ? "\r\nAccess-Control-Allow-Credentials: true\r\nVary: Origin\r\n"

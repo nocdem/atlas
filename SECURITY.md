@@ -450,6 +450,54 @@ the content validator refuses C0, C1, DEL, `U+2028`/`U+2029` and the bidi
 override and isolate set at the point of writing; `atlas_safe()` encodes on the
 way out; and `atlas_terminal_write` replaces any byte a terminal would act on.
 
+## A9: the remote gateway, and what it is worth
+
+A9 makes Atlas reachable from off the machine. Everything below is stated in
+full in `docs/remote-access.md`; this is the short form an auditor needs.
+
+**What holds.** The gateway runs as `gateway_uid` from a root-owned policy. That
+uid is neither the operator uid nor a dispatcher uid, so the daemon answers
+`unknown method` to `decision.approve`, `backup.create`, `code.index`,
+`apikey.*`, every `job.` and every `dispatch.` — and under an A7.1 deployment it
+cannot open the index at all, because the index is `0700 atlasd`. A compromised
+gateway therefore cannot approve a decision, register a repository, read a
+backup, run a job, build an index, administer credentials or read the database.
+
+That is true because of *who the gateway runs as*. No code in `src/gw` is what
+makes it true, and a bug there cannot make it false.
+
+**What does not hold, stated plainly.**
+
+- **Atlas terminates no TLS.** An in-process stack would be a new third-party
+  dependency, which the project's hard rules forbid. `tls_mode = REVERSE_PROXY`
+  records that something in front terminates it; Atlas cannot verify that and
+  does not try. Do not describe A9 as providing TLS.
+- **On an unseparated machine the isolation guarantee does not apply.** If the
+  gateway runs as the account that owns the index, a compromised gateway is a
+  compromised everything. The separation is real only when a root-owned policy
+  names a distinct `gateway_uid` and the index is `0700 atlasd`.
+- **Rate limiting is global, not per-peer, behind a reverse proxy.** Every
+  request appears to come from the proxy unless `trust_forwarded_for` is set,
+  and that key is off by default because believing a header an attacker can vary
+  would make the limit unenforceable while continuing to look enforced.
+- **The audit trail records that a request happened, not what it returned.**
+- **A browser session is an in-memory record and a restart forgets it.** That is
+  deliberate; it is not durable evidence of anything.
+
+**Credentials.** 256 bits from `/dev/urandom`, stored as
+`HMAC-SHA256(salt, secret)`. The plaintext is printed once and no operation
+anywhere can return it afterwards — there is no column holding one. Verification
+is a single HMAC pass and a constant-time compare, deliberately: PBKDF2 defends
+a guessable secret, an Atlas key is uniform over 2^256, and a slow KDF on an
+Internet-facing endpoint is a per-request CPU amplifier handed to an attacker.
+The reasoning is in `include/atlas/hmac.h`; if a future phase accepts a
+credential a human chose, it must not use that path.
+
+**Writes.** No A9 credential can hold `memory:write`, which every recording tool
+maps to, so no remote caller can record a reason, a decision or a proposal.
+Remote credential administration does not exist — it is absent rather than
+refused.
+
 ## Reporting a vulnerability
 
 Atlas has no public distribution or security contact yet. Until it does, report

@@ -2254,6 +2254,107 @@ static const char *const M11_STATEMENTS[] = {
     NULL,
 };
 
+/* --- migration 12: A9 remote credentials and the gateway audit trail --------
+ *
+ * Purely additive, like migration 11. Nothing in A0..A8 gains a column, a
+ * foreign key or a CHECK, and no stored hash changes — which is what makes this
+ * safe to run against a database holding approved decisions.
+ *
+ * Two tables, and they answer two different questions that must not be merged:
+ * `api_keys` is *who may ask*, and `gw_audit` is *what was asked*. An audit row
+ * therefore records the key id as plain text rather than as a foreign key: the
+ * account of what a credential did must survive the credential, and a revoked
+ * key whose audit rows vanished with it would be the one case an operator most
+ * needs to read.
+ *
+ * There is deliberately no column anywhere here that could hold a plaintext
+ * secret. `verifier` is an HMAC output and `salt` is its key; neither is
+ * reversible, and no statement in `db_gw.c` ever writes the token. That is not
+ * a convention — there is no column to write it to.
+ */
+static const char *const M12_STATEMENTS[] = {
+    "CREATE TABLE api_keys ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    /* The selector, lowercase hex. Not a secret: it is the indexed lookup that
+     * keeps verification O(1) and stops the cost of authenticating scaling with
+     * how many credentials exist. */
+    "  key_id TEXT NOT NULL UNIQUE,"
+    /* Operator text, validated by atlas_apikey_label_valid before it arrives:
+     * printable ASCII, no quote, backslash or percent, so what an operator
+     * reads back is what they typed. */
+    "  label TEXT NOT NULL,"
+    /* The canonical space-separated scope list, in enum order. Stored as text
+     * rather than as a mask so a future Atlas can add a scope without a
+     * migration, and so an *older* Atlas reading a newer row fails closed on a
+     * name it does not know rather than silently dropping the bit. */
+    "  scopes TEXT NOT NULL,"
+    /* The verifier and its salt. 16 and 32 bytes; a row of any other shape
+     * matches nothing rather than everything, checked in atlas_apikey_verify. */
+    "  salt BLOB NOT NULL,"
+    "  verifier BLOB NOT NULL,"
+    /* Names the construction, so a future phase that changes it can tell an old
+     * row from a new one instead of verifying it under the wrong rule. */
+    "  kdf TEXT NOT NULL CHECK(kdf IN ('HMAC-SHA256')),"
+    /* UNKNOWN is deliberately absent from the CHECK: the schema will not hold a
+     * key whose status Atlas cannot read, and the enum keeps UNKNOWN at zero so
+     * a zeroed struct authorises nothing either. */
+    "  status TEXT NOT NULL CHECK(status IN ('ACTIVE','REVOKED')),"
+    "  created_at TEXT NOT NULL,"
+    "  revoked_at TEXT NOT NULL DEFAULT '',"
+    /* Written at most once per throttle interval rather than per request: a
+     * timestamp that costs a write on every authenticated call would make the
+     * daemon's single writer the gateway's bottleneck. It is evidence of use,
+     * not an access log — that is what gw_audit is. */
+    "  last_used_at TEXT NOT NULL DEFAULT '',"
+    /* Rotation is create-then-revoke, recorded from both ends so the chain can
+     * be read in either direction. Soft references by key_id text, never by
+     * rowid: these must survive anything that renumbers rows. */
+    "  rotated_from TEXT NOT NULL DEFAULT '',"
+    "  rotated_to TEXT NOT NULL DEFAULT ''"
+    ");",
+    "CREATE INDEX idx_api_keys_status ON api_keys(status, id);",
+
+    "CREATE TABLE gw_audit ("
+    /* AUTOINCREMENT because this table is prunable and a reused id would
+     * silently re-point any cursor a reader holds — A5's rule about repo_events,
+     * and the reason `scans` is not prunable. */
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  at TEXT NOT NULL,"
+    /* Which surface the request arrived on. A closed vocabulary: an audit trail
+     * that cannot say whether something came from a model or a browser cannot
+     * answer the question it exists for. */
+    "  interface TEXT NOT NULL CHECK(interface IN ('REMOTE_MCP','WEB_API','WEB_GUI')),"
+    /* The principal, by key id and label. Plain text and not a foreign key, so
+     * the account of what a credential did outlives the credential. Empty when
+     * the request never authenticated — which is itself the fact being
+     * recorded. */
+    "  key_id TEXT NOT NULL DEFAULT '',"
+    "  label TEXT NOT NULL DEFAULT '',"
+    /* What was asked for: an Atlas method or tool name, or the fixed name of the
+     * gateway route. Never a URL, never a header, never a body. */
+    "  operation TEXT NOT NULL,"
+    /* Was it permitted, and did it then work? Two questions, two columns: a
+     * request that was allowed and failed is a different event from one that
+     * was denied, and folding them loses exactly the distinction an operator
+     * reads this table for. */
+    "  decision TEXT NOT NULL CHECK(decision IN ('ALLOWED','DENIED')),"
+    "  outcome TEXT NOT NULL CHECK(outcome IN ('OK','FAILED','UNKNOWN')),"
+    /* The Atlas status code, so the exit-code vocabulary is the same one here. */
+    "  status INTEGER NOT NULL DEFAULT 0,"
+    "  duration_ms INTEGER NOT NULL DEFAULT 0,"
+    /* Fixed Atlas-owned text saying why a request was denied, or the safe-encoded
+     * message of a failure. Never a secret, never an Authorization header, never
+     * a request body, and safe-encoded before it is written so a crafted input
+     * cannot forge a line in this table. */
+    "  detail TEXT NOT NULL DEFAULT ''"
+    ");",
+    /* The two reads this table serves: most recent first, and one principal's
+     * history. */
+    "CREATE INDEX idx_gw_audit_at ON gw_audit(id DESC);",
+    "CREATE INDEX idx_gw_audit_key ON gw_audit(key_id, id DESC);",
+    NULL,
+};
+
 static const atlas_migration MIGRATIONS[] = {
     {1, "initial schema", M1_STATEMENTS},
     {2, "worktree identity", M2_STATEMENTS},
@@ -2266,6 +2367,7 @@ static const atlas_migration MIGRATIONS[] = {
     {9, "a general decision-to-decision relation", M9_STATEMENTS},
     {10, "durable evidence about a decision-to-decision edge", M10_STATEMENTS},
     {11, "compiler-derived semantic index", M11_STATEMENTS},
+    {12, "remote API credentials and the gateway audit trail", M12_STATEMENTS},
 };
 
 const atlas_migration *atlas_migrations(size_t *count_out) {

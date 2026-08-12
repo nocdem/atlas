@@ -137,6 +137,16 @@ bool atlas_maintenance_policy_lookup(const char *table, const char **table_out,
  * no table, is a failure rather than something to notice later. */
 size_t atlas_maintenance_policy(const char *const **names_out);
 
+/* The tables Atlas actually knows how to prune, as opposed to the ones the
+ * policy classifies as prunable.
+ *
+ * The two must agree, and the test that checks it runs in both directions: a
+ * prunable table with no pruner reports zero eligible rows for ever, which
+ * reads as "nothing to remove" rather than as a defect, and a pruner for a
+ * protected table is a delete statement aimed at something the policy says is
+ * never removed by age. */
+size_t atlas_maintenance_pruners(const char *const **names_out);
+
 /* --- internals shared with src/db ---------------------------------------- */
 
 atlas_status atlas_db_maintenance_table_exists(atlas_db *db, const char *table, bool *out,
@@ -155,5 +165,24 @@ atlas_status atlas_db_maintenance_events_eligible(atlas_db *db, const char *cuto
 atlas_status atlas_db_maintenance_events_prune(atlas_db *db, const char *cutoff, int64_t retain,
                                                int64_t batch, int64_t *removed_out, bool *more_out,
                                                atlas_err *err);
+
+/* A9. The same pair for `gw_audit`, the second prunable table.
+ *
+ * The signature is identical on purpose: `RETENTION[]` now carries a pair of
+ * function pointers per prunable table rather than the loop calling the
+ * `repo_events` functions by name, so adding a third prunable table is a row
+ * with two more functions and not an edit to the loop. A loop that knows which
+ * table it is pruning is a loop that prunes the wrong one the first time a
+ * second table appears — which is exactly what would have happened here.
+ *
+ * `retain` is a global floor rather than a per-repository one, because an audit
+ * row belongs to a credential and an interface, not to a repository. The
+ * meaning is the same in the way that matters: age alone would empty the trail
+ * of a quiet installation, so the newest `retain` rows survive any cutoff. */
+atlas_status atlas_db_maintenance_audit_eligible(atlas_db *db, const char *cutoff, int64_t retain,
+                                                 int64_t *out, atlas_err *err);
+atlas_status atlas_db_maintenance_audit_prune(atlas_db *db, const char *cutoff, int64_t retain,
+                                              int64_t batch, int64_t *removed_out, bool *more_out,
+                                              atlas_err *err);
 
 #endif /* ATLAS_MAINTENANCE_H */

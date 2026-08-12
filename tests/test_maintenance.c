@@ -196,10 +196,79 @@ static void test_every_table_has_a_classification_and_every_classification_a_tab
     fx_close(&fx);
 }
 
-/* Exactly one table is prunable in A5, and it is the one with a documented
- * ceiling already. If a later phase makes a second table prunable, this fails
- * and somebody has to say so out loud. */
-static void test_exactly_one_table_is_prunable(void) {
+/* A5 had exactly one prunable table. A9 has two, and the second one was added
+ * here deliberately rather than discovered — which is the whole purpose of this
+ * test. The enumeration below is the list somebody has to edit, out loud, to
+ * widen it again.
+ *
+ * `repo_events`: a bounded observation stream with a documented per-repository
+ * ceiling (A5).
+ * `gw_audit`: the gateway's operational access record. Unbounded by
+ * construction because it grows with remote traffic rather than with the
+ * repository, so A9.6 requires it to be bounded or to state a retention
+ * strategy; nothing holds its rowids and its id is AUTOINCREMENT, which is the
+ * property that makes a deletion unable to re-point a reader's cursor.
+ *
+ * Everything Atlas *decides* stays in a canonical table that is not prunable.
+ * If a later phase adds a third name here, the argument goes in RETENTION[]
+ * beside the reason, and it has to survive being read back. */
+static void test_only_the_enumerated_tables_are_prunable(void) {
+    fixture fx;
+    atlas_err err;
+    atlas_err_init(&err);
+    T_REQUIRE(fx_open(&fx, &err) == ATLAS_OK);
+    atlas_db *db = NULL;
+    T_OK(open_at(fx_data_dir(&fx), &db, &err), &err);
+    atlas_db_close(db);
+
+    static const char *const PRUNABLE[] = {"repo_events", "gw_audit"};
+    const size_t prunable_count = sizeof PRUNABLE / sizeof PRUNABLE[0];
+
+    atlas_maintenance_report rep;
+    atlas_maintenance_report_init(&rep);
+    plan_or_prune(fx_data_dir(&fx), 30, 0, false, &rep, &err, ATLAS_OK);
+    T_EQ_INT((long long)rep.prunable_tables, (long long)prunable_count);
+
+    for (size_t i = 0; i < prunable_count; i++) {
+        const atlas_maintenance_row *r = row_for(&rep, PRUNABLE[i]);
+        T_REQUIRE_MSG(r != NULL, "\"%s\" is not in the retention policy at all", PRUNABLE[i]);
+        T_CHECK_MSG(r->prunable, "\"%s\" stopped being prunable", PRUNABLE[i]);
+    }
+    for (size_t i = 0; i < rep.table_count; i++) {
+        bool enumerated = false;
+        for (size_t k = 0; k < prunable_count; k++) {
+            if (strcmp(rep.tables[i].table, PRUNABLE[k]) == 0) {
+                enumerated = true;
+                break;
+            }
+        }
+        if (!enumerated) {
+            T_CHECK_MSG(!rep.tables[i].prunable, "\"%s\" became prunable without a note",
+                        rep.tables[i].table);
+        }
+        T_CHECK_MSG(rep.tables[i].reason != NULL && rep.tables[i].reason[0] != '\0',
+                    "\"%s\" is classified without a reason", rep.tables[i].table);
+    }
+    atlas_maintenance_report_free(&rep);
+    fx_close(&fx);
+}
+
+/* The classification and the machinery must agree in both directions.
+ *
+ * A table marked prunable with nothing that knows how to prune it would report
+ * zero eligible rows for ever — which reads as "there is nothing to remove"
+ * rather than as a defect. A pruner for a table nobody marked prunable is the
+ * more dangerous half: it is a delete statement aimed at a table the policy
+ * says is protected, waiting for one flag to change.
+ *
+ * Before A9 the prune loop simply called the `repo_events` functions by name,
+ * so a second prunable table would have been counted and deleted from using the
+ * wrong query while every test still passed. */
+static void test_every_prunable_table_has_a_pruner_and_no_other_does(void) {
+    const char *const *pruners = NULL;
+    size_t n = atlas_maintenance_pruners(&pruners);
+    T_REQUIRE(pruners != NULL);
+
     fixture fx;
     atlas_err err;
     atlas_err_init(&err);
@@ -211,17 +280,29 @@ static void test_exactly_one_table_is_prunable(void) {
     atlas_maintenance_report rep;
     atlas_maintenance_report_init(&rep);
     plan_or_prune(fx_data_dir(&fx), 30, 0, false, &rep, &err, ATLAS_OK);
-    T_EQ_INT((long long)rep.prunable_tables, 1);
-    const atlas_maintenance_row *ev = row_for(&rep, "repo_events");
-    T_REQUIRE(ev != NULL);
-    T_CHECK(ev->prunable);
+
+    /* Every prunable table has a pruner. */
     for (size_t i = 0; i < rep.table_count; i++) {
-        if (strcmp(rep.tables[i].table, "repo_events") != 0) {
-            T_CHECK_MSG(!rep.tables[i].prunable, "\"%s\" became prunable without a note",
-                        rep.tables[i].table);
+        if (!rep.tables[i].prunable) {
+            continue;
         }
-        T_CHECK_MSG(rep.tables[i].reason != NULL && rep.tables[i].reason[0] != '\0',
-                    "\"%s\" is classified without a reason", rep.tables[i].table);
+        bool found = false;
+        for (size_t k = 0; k < n; k++) {
+            if (strcmp(pruners[k], rep.tables[i].table) == 0) {
+                found = true;
+                break;
+            }
+        }
+        T_CHECK_MSG(found, "\"%s\" is prunable but nothing knows how to prune it",
+                    rep.tables[i].table);
+    }
+    /* And nothing else has one. */
+    for (size_t k = 0; k < n; k++) {
+        const atlas_maintenance_row *r = row_for(&rep, pruners[k]);
+        T_REQUIRE_MSG(r != NULL, "there is a pruner for \"%s\", which is not in the policy",
+                      pruners[k]);
+        T_CHECK_MSG(r->prunable, "there is a pruner for \"%s\", which the policy protects",
+                    pruners[k]);
     }
     atlas_maintenance_report_free(&rep);
     fx_close(&fx);
@@ -536,7 +617,9 @@ static void test_maintenance_is_absent_from_the_ai_surface(void) {
 static const atlas_test TESTS[] = {
     {"every table has a classification and every classification a table",
      test_every_table_has_a_classification_and_every_classification_a_table},
-    {"exactly one table is prunable", test_exactly_one_table_is_prunable},
+    {"only the enumerated tables are prunable", test_only_the_enumerated_tables_are_prunable},
+    {"every prunable table has a pruner and no other does",
+     test_every_prunable_table_has_a_pruner_and_no_other_does},
     {"a plan writes nothing", test_a_plan_writes_nothing},
     {"a plan predicts what an apply removes", test_a_plan_predicts_what_an_apply_removes},
     {"protected tables and cursors survive an applied prune",

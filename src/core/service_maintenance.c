@@ -40,6 +40,47 @@ typedef struct retention_entry {
     const char *reason;
 } retention_entry;
 
+/* How a prunable table counts and removes its own eligible rows.
+ *
+ * Until A9 there was one prunable table and the loop below called the
+ * `repo_events` functions by name. That was correct exactly as long as the
+ * count stayed one, and silently wrong the moment it did not: a second prunable
+ * table would have been counted, and *deleted from*, using `repo_events`'
+ * query — reporting the wrong number and removing the wrong rows, while every
+ * existing test still passed.
+ *
+ * So the pair lives here, keyed by table name, and `pruner_for` returns NULL
+ * for anything not listed. A table marked prunable in RETENTION[] with no row
+ * here cannot be pruned at all rather than falling back to some default, and
+ * `tests/test_maintenance.c` asserts the two lists agree — in both directions,
+ * because a pruner for a table nobody marked prunable is the more dangerous
+ * half. */
+typedef atlas_status (*retention_eligible_fn)(atlas_db *db, const char *cutoff, int64_t retain,
+                                              int64_t *out, atlas_err *err);
+typedef atlas_status (*retention_prune_fn)(atlas_db *db, const char *cutoff, int64_t retain,
+                                           int64_t batch, int64_t *removed_out, bool *more_out,
+                                           atlas_err *err);
+
+typedef struct retention_pruner {
+    const char *table;
+    retention_eligible_fn eligible;
+    retention_prune_fn prune;
+} retention_pruner;
+
+static const retention_pruner PRUNERS[] = {
+    {"repo_events", atlas_db_maintenance_events_eligible, atlas_db_maintenance_events_prune},
+    {"gw_audit", atlas_db_maintenance_audit_eligible, atlas_db_maintenance_audit_prune},
+};
+
+static const retention_pruner *pruner_for(const char *table) {
+    for (size_t i = 0; i < sizeof PRUNERS / sizeof PRUNERS[0]; i++) {
+        if (strcmp(PRUNERS[i].table, table) == 0) {
+            return &PRUNERS[i];
+        }
+    }
+    return NULL;
+}
+
 /* One row per table. `prunable` is true exactly once. */
 static const retention_entry RETENTION[] = {
     /* --- the schema's own record ----------------------------------------- */
@@ -260,6 +301,53 @@ static const retention_entry RETENTION[] = {
     {"commits_fts", ATLAS_RETAIN_DERIVED, false, "FTS5 index over commits; rebuilt from commits"},
     {"decisions_fts", ATLAS_RETAIN_DERIVED, false,
      "FTS5 index over decision prose; rebuilt from decision_search"},
+
+    /* --- A9: remote credentials and the gateway audit trail ------------------
+     *
+     * `api_keys` is CANONICAL for the reason `repositories` is: a credential
+     * goes away when an operator revokes it, an explicit act aimed at one key,
+     * and never by age. A key aged out of existence would not stop working
+     * safely — it would stop working *silently*, and the operator holding it
+     * would have no row to read to find out why.
+     *
+     * `gw_audit` is the **second prunable table in Atlas**, and A5 says
+     * widening that needs an argument that survives being read back. Here it
+     * is, in the shape A5 asks for.
+     *
+     *   *What holds a rowid into it?* Nothing. No column in any table
+     *   references `gw_audit.id`, and the id is AUTOINCREMENT, so a deleted row
+     *   can never hand its id to a later one — which is exactly why `scans` is
+     *   not prunable and this is.
+     *
+     *   *What cursor points at it?* Only a reader's own paging cursor within a
+     *   single listing. AUTOINCREMENT means a cursor that outlives a prune
+     *   points past the deleted rows rather than at different ones, so the
+     *   worst outcome is a page that is shorter than expected, never one that
+     *   describes other events.
+     *
+     *   *What is lost that cannot be rebuilt?* The record of one request. That
+     *   is a real loss and the reason this is `--older-than` rather than a
+     *   ceiling: an operational access log is unbounded by construction — it
+     *   grows with traffic rather than with the repository — and A9.6 requires
+     *   it to be bounded or to have a stated retention strategy. An index that
+     *   fills a disk with audit rows stops answering anything at all, which is
+     *   a worse outcome for the record than aged-out access history. Nothing
+     *   Atlas *decides* is stored here: an approval, a revision, a job or a
+     *   reason is in a canonical table that is not prunable, and this holds who
+     *   asked and when.
+     *
+     * The strategy is A5's unchanged: no background deleter, no prune on a
+     * timer, at startup or on low disk. Rows go away when an operator runs
+     * `atlas maintenance prune --apply`, and at no other moment. */
+    {"api_keys", ATLAS_RETAIN_CANONICAL, false,
+     "a remote credential is revoked by an explicit operator act aimed at one key, never by age; "
+     "an aged-out key would stop authenticating with no row left to say that it had been removed, "
+     "and the verifier it holds is not recoverable from anything else"},
+    {"gw_audit", ATLAS_RETAIN_OPERATIONAL, true,
+     "the bounded operational record of remote requests: who asked, on which interface, whether it "
+     "was allowed and whether it worked; nothing holds its rowids, its id is AUTOINCREMENT so a "
+     "deletion can never re-point a reader's cursor, and every fact Atlas decides — an approval, a "
+     "revision, a job, a reason — lives in a canonical table that is not prunable"},
 };
 
 #define RETENTION_COUNT (sizeof RETENTION / sizeof RETENTION[0])
@@ -348,8 +436,17 @@ atlas_status atlas_maintenance_on(atlas_db *db, const atlas_maintenance_opts *op
         if (!row->prunable) {
             continue;
         }
-        st = atlas_db_maintenance_events_eligible(db, out->cutoff, retain, &row->rows_eligible,
-                                                  err);
+        const retention_pruner *p = pruner_for(row->table);
+        if (p == NULL) {
+            /* Marked prunable with nothing that knows how to prune it. Refused
+             * rather than skipped: the plan would otherwise report zero
+             * eligible rows for a table an operator was told is prunable, which
+             * reads as "there is nothing to remove" rather than as a defect. */
+            st = atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                               "\"%s\" is marked prunable but has no pruner", row->table);
+            break;
+        }
+        st = p->eligible(db, out->cutoff, retain, &row->rows_eligible, err);
         if (st == ATLAS_OK) {
             out->total_eligible += row->rows_eligible;
         }
@@ -363,11 +460,16 @@ atlas_status atlas_maintenance_on(atlas_db *db, const atlas_maintenance_opts *op
             if (!row->prunable || !row->counted) {
                 continue;
             }
+            const retention_pruner *p = pruner_for(row->table);
+            if (p == NULL) {
+                st = atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                                   "\"%s\" is marked prunable but has no pruner", row->table);
+                break;
+            }
             bool more = true;
             while (st == ATLAS_OK && more) {
                 int64_t removed = 0;
-                st = atlas_db_maintenance_events_prune(db, out->cutoff, retain,
-                                                       ATLAS_DB_BATCH_MAX, &removed, &more, err);
+                st = p->prune(db, out->cutoff, retain, ATLAS_DB_BATCH_MAX, &removed, &more, err);
                 if (st == ATLAS_OK) {
                     row->rows_removed += removed;
                     out->total_removed += removed;
@@ -454,4 +556,13 @@ size_t atlas_maintenance_policy(const char *const **names_out) {
     }
     *names_out = names;
     return RETENTION_COUNT;
+}
+
+size_t atlas_maintenance_pruners(const char *const **names_out) {
+    static const char *names[sizeof PRUNERS / sizeof PRUNERS[0]];
+    for (size_t i = 0; i < sizeof PRUNERS / sizeof PRUNERS[0]; i++) {
+        names[i] = PRUNERS[i].table;
+    }
+    *names_out = names;
+    return sizeof PRUNERS / sizeof PRUNERS[0];
 }

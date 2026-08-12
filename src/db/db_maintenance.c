@@ -145,3 +145,87 @@ atlas_status atlas_db_maintenance_events_prune(atlas_db *db, const char *cutoff,
     *more_out = *removed_out >= batch;
     return ATLAS_OK;
 }
+
+/* --- A9: the gateway audit trail -------------------------------------------
+ *
+ * Same shape as the `repo_events` pair above, and deliberately not a
+ * generalisation of it: the two differ in what the retain floor is counted
+ * over, and a single parameterised query that took a table name would be a
+ * query built from a string, which is the one thing this file does not do.
+ *
+ * The floor is global rather than per-repository because an audit row belongs
+ * to a credential and an interface, not to a repository. Both conditions still
+ * apply together: a row goes only when it is older than the cutoff *and* is
+ * outside the newest `retain`, so a quiet installation keeps its whole trail
+ * however old it is. */
+atlas_status atlas_db_maintenance_audit_eligible(atlas_db *db, const char *cutoff, int64_t retain,
+                                                 int64_t *out, atlas_err *err) {
+    *out = 0;
+    static const char SQL[] = "SELECT count(*) FROM gw_audit"
+                              " WHERE at < ?1"
+                              "   AND id <= (SELECT x.id FROM gw_audit x"
+                              "              ORDER BY x.id DESC LIMIT 1 OFFSET ?2);";
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(db, SQL, &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_text(stmt, 1, cutoff, -1, SQLITE_STATIC) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 2, retain) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind maintenance bounds");
+    }
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        *out = sqlite3_column_int64(stmt, 0);
+    } else {
+        st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot count eligible audit rows");
+    }
+    atlas_db_finish(db, stmt);
+    return st;
+}
+
+atlas_status atlas_db_maintenance_audit_prune(atlas_db *db, const char *cutoff, int64_t retain,
+                                              int64_t batch, int64_t *removed_out, bool *more_out,
+                                              atlas_err *err) {
+    *removed_out = 0;
+    *more_out = false;
+    static const char SQL[] = "DELETE FROM gw_audit WHERE id IN ("
+                              "SELECT id FROM gw_audit"
+                              " WHERE at < ?1"
+                              "   AND id <= (SELECT x.id FROM gw_audit x"
+                              "              ORDER BY x.id DESC LIMIT 1 OFFSET ?2)"
+                              " LIMIT ?3);";
+    /* One transaction per batch, never one across the loop — A1's rule about
+     * never holding a write transaction across unbounded work. A failure rolls
+     * this batch back whole and the operation is idempotent, so re-running
+     * finishes it. */
+    atlas_status st = atlas_db_begin(db, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    sqlite3_stmt *stmt = NULL;
+    st = atlas_db_prepare(db, SQL, &stmt, err);
+    if (st == ATLAS_OK) {
+        if (sqlite3_bind_text(stmt, 1, cutoff, -1, SQLITE_STATIC) != SQLITE_OK ||
+            sqlite3_bind_int64(stmt, 2, retain) != SQLITE_OK ||
+            sqlite3_bind_int64(stmt, 3, batch) != SQLITE_OK) {
+            st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind maintenance bounds");
+            atlas_db_finish(db, stmt);
+        } else {
+            st = atlas_db_step_done(db, stmt, err);
+            if (st == ATLAS_OK) {
+                *removed_out = sqlite3_changes(db->h);
+            }
+        }
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_db_commit(db, err);
+    }
+    if (st != ATLAS_OK) {
+        atlas_db_rollback(db);
+        *removed_out = 0;
+        return st;
+    }
+    *more_out = *removed_out >= batch;
+    return ATLAS_OK;
+}

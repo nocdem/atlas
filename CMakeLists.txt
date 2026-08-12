@@ -133,6 +133,7 @@ add_library(atlas_core STATIC
   src/core/error.c
   src/core/buf.c
   src/core/sha256.c
+  src/core/hmac.c
   src/core/util.c
   src/core/pathrep.c
   src/core/proc.c
@@ -259,6 +260,19 @@ add_library(atlas_core STATIC
   src/core/service_orch.c
   src/db/db_orch.c
   src/ipc/server_orch.c
+  # --- A9: remote access, API credentials and the web control plane -------
+  #
+  # The gateway is a *client* of the daemon, structurally the same shape as
+  # the MCP adapter: it holds no database handle, opens no repository and
+  # creates no process. Every answer it gives came over the Unix socket, and
+  # the account it runs as is neither the operator uid nor a dispatcher uid,
+  # so the kernel — not a check in C — is what stops it approving a decision,
+  # changing the registry, reading a backup or running a job.
+  #
+  # `apikey.c` holds the credential format and the verifier; nothing in it
+  # touches a database. `hmac.c` is in src/core because it is a primitive,
+  # not a gateway concern.
+  src/gw/apikey.c
 )
 
 target_include_directories(atlas_core

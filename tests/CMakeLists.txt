@@ -132,6 +132,12 @@ set(ATLAS_TESTS
   test_decision_revision_integrity
   test_migrate9
   test_migrate8
+  # --- A9: remote access, API credentials and the web control plane ---
+  #
+  # The credential format, the verifier and the scope vocabulary are pure
+  # functions: bytes in, a digest or a verdict out. No database, no daemon, no
+  # repository, so this belongs in the fast subset.
+  test_hmac
 )
 
 foreach(test_name IN LISTS ATLAS_TESTS)
@@ -165,6 +171,9 @@ set_tests_properties(test_ai_schema test_mcp test_plugin PROPERTIES LABELS "unit
 # A3. The extractor is pure — bytes in, a bounded object out — so its suite needs
 # no repository, no database and no daemon, and belongs in the fast subset.
 set_tests_properties(test_code_lex PROPERTIES LABELS "unit")
+
+# A9. The credential format and the scope vocabulary are pure functions.
+set_tests_properties(test_hmac PROPERTIES LABELS "unit")
 
 # A4. The content hash, the transition table and validation are pure functions —
 # bytes in, a digest or a verdict out — so this suite needs no repository, no

@@ -58,7 +58,55 @@ void atlas_verify_report_free(atlas_verify_report *r) {
     atlas_buf_free(&r->domain);
     atlas_buf_free(&r->record_uid);
     atlas_buf_free(&r->record_title);
+    atlas_verify_detail_free(&r->detail);
     memset(r, 0, sizeof *r);
+}
+
+/* Loads the readable evidence and attestations, and marks which independent
+ * group each attestation landed in.
+ *
+ * The grouping is recomputed here rather than carried out of the assessment,
+ * and that is deliberate: `atlas_verify_independent_groups` is a pure function
+ * of the same inputs, so asking it twice cannot produce a different partition
+ * than the one the score was computed from. Threading the partition out of the
+ * aggregation would have made the display a second consumer of the algorithm's
+ * internals — and the first thing a later edit would then be tempted to do is
+ * feed something from the display back in. Nothing loaded here reaches a
+ * verdict; A9.2's rule that `atlas_verify_assess` writes nothing is untouched,
+ * because this reads nothing but rows.
+ *
+ * A failure to load the detail is not a failure to assess: an answer with no
+ * visible evidence is worse than the same answer with it, but it is still the
+ * answer, and refusing to report a verdict because a display query failed
+ * would turn a cosmetic fault into an outage. */
+static atlas_status load_detail(atlas_db *db, const atlas_verifypolicy *p, int64_t claim_id,
+                                atlas_verify_report *out, atlas_err *err) {
+    char stale_before[ATLAS_TS_MAX];
+    long long age = p != NULL && p->max_evidence_age > 0 ? p->max_evidence_age
+                                                         : ATLAS_VERIFY_DEFAULT_MAX_EVIDENCE_AGE;
+    atlas_iso8601_before_now(stale_before, sizeof stale_before, age * 1000);
+
+    atlas_status st = atlas_db_verify_detail_load(db, claim_id, stale_before, &out->detail, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    atlas_verify_inputs in;
+    memset(&in, 0, sizeof in);
+    st = atlas_db_verify_inputs_load(db, claim_id, stale_before, &in, err);
+    if (st == ATLAS_OK) {
+        (void)atlas_verify_independent_groups(in.items, in.count, in.dep_from, in.dep_to,
+                                              in.dep_count);
+        for (size_t i = 0; i < in.count; i++) {
+            for (size_t k = 0; k < out->detail.attestation_count; k++) {
+                if (out->detail.attestations[k].id == in.items[i].attestation_id) {
+                    out->detail.attestations[k].group = in.items[i].group;
+                    break;
+                }
+            }
+        }
+    }
+    atlas_verify_inputs_free(&in);
+    return st;
 }
 
 /* Fills the descriptive half of a report from the claim and its record.
@@ -145,6 +193,7 @@ atlas_status atlas_service_verify_show_on(atlas_db *db, int64_t claim_id, const 
     if (st != ATLAS_OK) {
         return st;
     }
+    (void)load_detail(db, &p, claim_id, out, err);
     return atlas_verify_assess(db, &p, claim_id, &out->assessment, err);
 }
 
@@ -171,6 +220,7 @@ atlas_status atlas_service_verify_show(atlas_ctx *ctx, int64_t claim_id, atlas_v
      * row, no transition. `atlas_verify_assess` is side-effect-free so that
      * asking what Atlas thinks cannot change what Atlas thinks — the same
      * property A6's gate has, and for the same reason. */
+    (void)load_detail(db, &p, claim_id, out, err);
     return atlas_verify_assess(db, &p, claim_id, &out->assessment, err);
 }
 
@@ -188,6 +238,7 @@ atlas_status atlas_service_verify_run(atlas_ctx *ctx, int64_t claim_id, const ch
     if (st != ATLAS_OK) {
         return st;
     }
+    (void)load_detail(db, &p, claim_id, out, err);
     return atlas_verify_autolifecycle_run(db, &p, claim_id, repo_name, &out->assessment, err);
 }
 
@@ -397,6 +448,193 @@ atlas_status atlas_service_verify_write_policy(atlas_json *j, const atlas_verify
     return st;
 }
 
+/* The evidence and the attestations, as one shape every surface re-emits.
+ *
+ * Two pairs of fields here are the ones a reader must not see collapsed, and
+ * they are separate keys for that reason rather than for tidiness:
+ *
+ *   `class` / `producer_identity` — what sort of thing the evidence is, and how
+ *   well Atlas knows who produced it. AI_ANALYSIS produced by a SELF_DECLARED
+ *   actor and COMPILER evidence ATLAS_ATTESTED are both legitimate rows and
+ *   mean entirely different things; a UI that prints only the first is telling
+ *   somebody a model is a compiler.
+ *
+ *   `actor` / `group` — who spoke, and which independent evidence group they
+ *   landed in. Two attestations in one group corroborate each other not at all,
+ *   however many actors they represent, and printing the actor count as if it
+ *   were an evidence count is precisely the error this season exists to stop.
+ *
+ * Every field either produced by a model or read out of a repository is
+ * safe-encoded here. Atlas' own vocabularies and its minted uids are not: they
+ * come from closed enums and a fixed alphabet, so they carry no byte anybody
+ * else chose. */
+atlas_status atlas_service_verify_write_detail(atlas_json *j, atlas_safe_pool *safe,
+                                               const atlas_verify_detail *d, atlas_err *err) {
+    atlas_status st = atlas_json_key(j, "evidence", err);
+    if (st == ATLAS_OK) {
+        st = atlas_json_arr_begin(j, err);
+    }
+    for (size_t i = 0; st == ATLAS_OK && i < d->evidence_count; i++) {
+        const atlas_verify_evidence_detail *e = &d->evidence[i];
+        st = atlas_json_obj_begin(j, err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "uid", atlas_buf_cstr(&e->uid), err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "class", atlas_verify_evidence_class_name(e->cls), err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "family", atlas_verify_evidence_family_name(e->family), err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "producer_class",
+                                    atlas_verify_actor_class_name(e->producer_class), err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "producer_identity",
+                                    atlas_verify_actor_identity_name(e->producer_identity), err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "producer", atlas_buf_cstr(&e->producer_uid), err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "producer_name",
+                                    atlas_safe(safe, atlas_buf_cstr(&e->producer_name)), err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "commit", atlas_buf_cstr(&e->commit_oid), err);
+        }
+        /* Already stored `%XX`-encoded, so it is emitted as-is. */
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "path", atlas_buf_cstr(&e->path_text), err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "symbol", atlas_safe(safe, atlas_buf_cstr(&e->symbol)), err);
+        }
+        if (st == ATLAS_OK && e->line_start > 0) {
+            st = atlas_json_key_int(j, "line_start", e->line_start, err);
+        }
+        if (st == ATLAS_OK && e->line_end > 0) {
+            st = atlas_json_key_int(j, "line_end", e->line_end, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "target", atlas_safe(safe, atlas_buf_cstr(&e->target)), err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "observed", atlas_safe(safe, atlas_buf_cstr(&e->observed)),
+                                    err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "observed_at", atlas_buf_cstr(&e->observed_at), err);
+        }
+        if (st == ATLAS_OK && e->tool.len > 0) {
+            st = atlas_json_key_str(j, "tool", atlas_safe(safe, atlas_buf_cstr(&e->tool)), err);
+        }
+        if (st == ATLAS_OK && e->proof_class.len > 0) {
+            st = atlas_json_key_str(j, "proof_class", atlas_buf_cstr(&e->proof_class), err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_bool(j, "stale", e->stale, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_obj_end(j, err);
+        }
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_arr_end(j, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(j, "evidence_total", (int64_t)d->evidence_total, err);
+    }
+
+    if (st == ATLAS_OK) {
+        st = atlas_json_key(j, "attestations", err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_arr_begin(j, err);
+    }
+    for (size_t i = 0; st == ATLAS_OK && i < d->attestation_count; i++) {
+        const atlas_verify_attestation_detail *a = &d->attestations[i];
+        st = atlas_json_obj_begin(j, err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "uid", atlas_buf_cstr(&a->uid), err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "verdict", atlas_verify_verdict_name(a->verdict), err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "actor", atlas_buf_cstr(&a->actor_uid), err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "actor_class", atlas_verify_actor_class_name(a->actor_class),
+                                    err);
+        }
+        /* The honest half of §10: SELF_DECLARED says Atlas took the speaker's
+         * word for who it is. Never omitted, because its absence would read as
+         * certainty. */
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "actor_identity",
+                                    atlas_verify_actor_identity_name(a->actor_identity), err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "actor_name",
+                                    atlas_safe(safe, atlas_buf_cstr(&a->actor_name)), err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "actor_provider",
+                                    atlas_safe(safe, atlas_buf_cstr(&a->actor_provider)), err);
+        }
+        if (st == ATLAS_OK && a->actor_family.len > 0) {
+            st = atlas_json_key_str(j, "actor_family",
+                                    atlas_safe(safe, atlas_buf_cstr(&a->actor_family)), err);
+        }
+        if (st == ATLAS_OK && a->actor_version.len > 0) {
+            st = atlas_json_key_str(j, "actor_version",
+                                    atlas_safe(safe, atlas_buf_cstr(&a->actor_version)), err);
+        }
+        if (st == ATLAS_OK && a->actor_role.len > 0) {
+            st = atlas_json_key_str(j, "actor_role",
+                                    atlas_safe(safe, atlas_buf_cstr(&a->actor_role)), err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "method", atlas_safe(safe, atlas_buf_cstr(&a->method)), err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "scope", atlas_safe(safe, atlas_buf_cstr(&a->scope_note)),
+                                    err);
+        }
+        if (st == ATLAS_OK && a->basis_commit.len > 0) {
+            st = atlas_json_key_str(j, "commit", atlas_buf_cstr(&a->basis_commit), err);
+        }
+        /* The actor's own number, and named so nothing can mistake it for
+         * Atlas'. Absent rather than -1 when it did not give one. */
+        if (st == ATLAS_OK && a->self_confidence >= 0) {
+            st = atlas_json_key_int(j, "self_confidence", a->self_confidence, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_bool(j, "superseded", a->superseded, err);
+        }
+        if (st == ATLAS_OK && a->group >= 0) {
+            st = atlas_json_key_int(j, "group", a->group, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_obj_end(j, err);
+        }
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_arr_end(j, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(j, "attestation_rows", (int64_t)d->attestation_total, err);
+    }
+    /* A6's rule, again: a bound that was reached is reported, so a truncated
+     * evidence list can never be read as a complete one. */
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(j, "detail_truncated", d->limit_reached, err);
+    }
+    return st;
+}
+
 atlas_status atlas_service_verify_write_report(atlas_json *j, atlas_safe_pool *safe,
                                                const atlas_verify_report *r, atlas_err *err) {
     atlas_status st = atlas_json_key_str(j, "claim", atlas_buf_cstr(&r->claim_uid), err);
@@ -415,6 +653,9 @@ atlas_status atlas_service_verify_write_report(atlas_json *j, atlas_safe_pool *s
     }
     if (st == ATLAS_OK) {
         st = atlas_service_verify_write_assessment(j, &r->assessment, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_service_verify_write_detail(j, safe, &r->detail, err);
     }
     if (st == ATLAS_OK) {
         st = atlas_service_verify_write_policy(j, r, err);

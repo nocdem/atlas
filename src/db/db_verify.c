@@ -954,6 +954,258 @@ atlas_status atlas_db_verify_sem_generation(atlas_db *db, int64_t repo_id, int64
     return st;
 }
 
+/* --- A9.2.1 closeout: the readable detail ---------------------------------
+ *
+ * Two straight reads. They are separate from `atlas_db_verify_inputs_load`
+ * on purpose: that one reduces each attestation to the counted facts the
+ * algorithm needs, and anything it returned would be a field somebody could
+ * later be tempted to feed back into a score. Nothing loaded here reaches the
+ * aggregation, so a wrong value here misleads a reader and moves no verdict. */
+
+void atlas_verify_detail_init(atlas_verify_detail *d) {
+    if (d != NULL) {
+        memset(d, 0, sizeof *d);
+    }
+}
+
+void atlas_verify_detail_free(atlas_verify_detail *d) {
+    if (d == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < d->evidence_count; i++) {
+        atlas_verify_evidence_detail *e = &d->evidence[i];
+        atlas_buf_free(&e->uid);
+        atlas_buf_free(&e->producer_uid);
+        atlas_buf_free(&e->producer_name);
+        atlas_buf_free(&e->commit_oid);
+        atlas_buf_free(&e->path_text);
+        atlas_buf_free(&e->symbol);
+        atlas_buf_free(&e->target);
+        atlas_buf_free(&e->observed);
+        atlas_buf_free(&e->observed_at);
+        atlas_buf_free(&e->tool);
+        atlas_buf_free(&e->proof_class);
+    }
+    free(d->evidence);
+    for (size_t i = 0; i < d->attestation_count; i++) {
+        atlas_verify_attestation_detail *a = &d->attestations[i];
+        atlas_buf_free(&a->uid);
+        atlas_buf_free(&a->actor_uid);
+        atlas_buf_free(&a->actor_name);
+        atlas_buf_free(&a->actor_provider);
+        atlas_buf_free(&a->actor_family);
+        atlas_buf_free(&a->actor_version);
+        atlas_buf_free(&a->actor_role);
+        atlas_buf_free(&a->method);
+        atlas_buf_free(&a->scope_note);
+        atlas_buf_free(&a->basis_commit);
+    }
+    free(d->attestations);
+    memset(d, 0, sizeof *d);
+}
+
+static atlas_status count_rows(atlas_db *db, const char *sql, int64_t claim_id, size_t *out,
+                               atlas_err *err) {
+    sqlite3_stmt *st = NULL;
+    atlas_status s = atlas_db_prepare(db, sql, &st, err);
+    if (s != ATLAS_OK) {
+        return s;
+    }
+    if (sqlite3_bind_int64(st, 1, claim_id) != SQLITE_OK) {
+        atlas_db_finish(db, st);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the claim id");
+    }
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        *out = (size_t)sqlite3_column_int64(st, 0);
+    }
+    atlas_db_finish(db, st);
+    return ATLAS_OK;
+}
+
+static atlas_status load_evidence_detail(atlas_db *db, int64_t claim_id, const char *stale_before,
+                                         atlas_verify_detail *out, atlas_err *err) {
+    static const char CSQL[] =
+        "SELECT COUNT(DISTINCT ae.evidence_id) FROM verify_attestation_evidence ae"
+        "  JOIN verify_attestations a ON a.id = ae.attestation_id WHERE a.claim_id = ?1;";
+    atlas_status st = count_rows(db, CSQL, claim_id, &out->evidence_total, err);
+    if (st != ATLAS_OK || out->evidence_total == 0) {
+        return st;
+    }
+    size_t cap = out->evidence_total;
+    if (cap > ATLAS_VERIFY_MAX_EVIDENCE) {
+        cap = ATLAS_VERIFY_MAX_EVIDENCE;
+        out->limit_reached = true;
+    }
+    out->evidence = calloc(cap, sizeof *out->evidence);
+    if (out->evidence == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory loading evidence");
+    }
+    static const char SQL[] =
+        "SELECT DISTINCT e.id, e.uid, e.class, e.commit_oid, e.path_text, e.symbol,"
+        "       e.line_start, e.line_end, e.target, e.probe, e.observed, e.observed_at,"
+        "       e.tool, e.proof_class,"
+        "       COALESCE(act.uid,''), COALESCE(act.class,'UNKNOWN'),"
+        "       COALESCE(act.identity,'SELF_DECLARED'), COALESCE(act.name,''),"
+        "       CASE WHEN COALESCE(NULLIF(e.observed_at,''), e.recorded_at) < ?2 THEN 1 ELSE 0 END"
+        "  FROM verify_evidence e"
+        "  JOIN verify_attestation_evidence ae ON ae.evidence_id = e.id"
+        "  JOIN verify_attestations a ON a.id = ae.attestation_id"
+        "  LEFT JOIN verify_actors act ON act.id = e.actor_id"
+        " WHERE a.claim_id = ?1 ORDER BY e.id LIMIT ?3;";
+    sqlite3_stmt *s = NULL;
+    st = atlas_db_prepare(db, SQL, &s, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(s, 1, claim_id) != SQLITE_OK ||
+        sqlite3_bind_text(s, 2, stale_before != NULL ? stale_before : "", -1, SQLITE_TRANSIENT) !=
+            SQLITE_OK ||
+        sqlite3_bind_int64(s, 3, (int64_t)cap) != SQLITE_OK) {
+        atlas_db_finish(db, s);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the evidence query");
+    }
+    int rc = 0;
+    while (st == ATLAS_OK && (rc = sqlite3_step(s)) == SQLITE_ROW &&
+           out->evidence_count < cap) {
+        atlas_verify_evidence_detail *e = &out->evidence[out->evidence_count];
+        e->id = sqlite3_column_int64(s, 0);
+        st = take_text(&e->uid, (const char *)sqlite3_column_text(s, 1), err);
+        if (st == ATLAS_OK) {
+            (void)atlas_verify_evidence_class_parse((const char *)sqlite3_column_text(s, 2),
+                                                    &e->cls);
+            e->family = atlas_verify_evidence_family_of(e->cls);
+            st = take_text(&e->commit_oid, (const char *)sqlite3_column_text(s, 3), err);
+        }
+        if (st == ATLAS_OK) {
+            st = take_text(&e->path_text, (const char *)sqlite3_column_text(s, 4), err);
+        }
+        if (st == ATLAS_OK) {
+            st = take_text(&e->symbol, (const char *)sqlite3_column_text(s, 5), err);
+        }
+        if (st == ATLAS_OK) {
+            e->line_start = sqlite3_column_int64(s, 6);
+            e->line_end = sqlite3_column_int64(s, 7);
+            st = take_text(&e->target, (const char *)sqlite3_column_text(s, 8), err);
+        }
+        if (st == ATLAS_OK) {
+            st = take_text(&e->observed, (const char *)sqlite3_column_text(s, 10), err);
+        }
+        if (st == ATLAS_OK) {
+            st = take_text(&e->observed_at, (const char *)sqlite3_column_text(s, 11), err);
+        }
+        if (st == ATLAS_OK) {
+            st = take_text(&e->tool, (const char *)sqlite3_column_text(s, 12), err);
+        }
+        if (st == ATLAS_OK) {
+            st = take_text(&e->proof_class, (const char *)sqlite3_column_text(s, 13), err);
+        }
+        if (st == ATLAS_OK) {
+            st = take_text(&e->producer_uid, (const char *)sqlite3_column_text(s, 14), err);
+        }
+        if (st == ATLAS_OK) {
+            (void)atlas_verify_actor_class_parse((const char *)sqlite3_column_text(s, 15),
+                                                 &e->producer_class);
+            (void)atlas_verify_actor_identity_parse((const char *)sqlite3_column_text(s, 16),
+                                                    &e->producer_identity);
+            st = take_text(&e->producer_name, (const char *)sqlite3_column_text(s, 17), err);
+        }
+        if (st == ATLAS_OK) {
+            e->stale = sqlite3_column_int(s, 18) != 0;
+            out->evidence_count++;
+        }
+    }
+    atlas_db_finish(db, s);
+    return st;
+}
+
+static atlas_status load_attestation_detail(atlas_db *db, int64_t claim_id,
+                                            atlas_verify_detail *out, atlas_err *err) {
+    static const char CSQL[] = "SELECT COUNT(*) FROM verify_attestations WHERE claim_id = ?1;";
+    atlas_status st = count_rows(db, CSQL, claim_id, &out->attestation_total, err);
+    if (st != ATLAS_OK || out->attestation_total == 0) {
+        return st;
+    }
+    size_t cap = out->attestation_total;
+    if (cap > ATLAS_VERIFY_MAX_ATTESTATIONS) {
+        cap = ATLAS_VERIFY_MAX_ATTESTATIONS;
+        out->limit_reached = true;
+    }
+    out->attestations = calloc(cap, sizeof *out->attestations);
+    if (out->attestations == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory loading attestations");
+    }
+    static const char SQL[] =
+        "SELECT a.id, a.uid, a.verdict, a.self_confidence, a.method, a.scope_note,"
+        "       a.basis_commit, act.uid, act.class, act.identity, act.name, act.provider,"
+        "       act.family, act.version, act.role,"
+        "       (SELECT COUNT(*) FROM verify_attestations s"
+        "         WHERE s.claim_id = ?1 AND s.supersedes_id = a.id)"
+        "  FROM verify_attestations a JOIN verify_actors act ON act.id = a.actor_id"
+        " WHERE a.claim_id = ?1 ORDER BY a.id LIMIT ?2;";
+    sqlite3_stmt *s = NULL;
+    st = atlas_db_prepare(db, SQL, &s, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(s, 1, claim_id) != SQLITE_OK ||
+        sqlite3_bind_int64(s, 2, (int64_t)cap) != SQLITE_OK) {
+        atlas_db_finish(db, s);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the attestation query");
+    }
+    static const struct {
+        int col;
+        size_t off;
+    } TEXTS[] = {
+        {1, offsetof(atlas_verify_attestation_detail, uid)},
+        {4, offsetof(atlas_verify_attestation_detail, method)},
+        {5, offsetof(atlas_verify_attestation_detail, scope_note)},
+        {6, offsetof(atlas_verify_attestation_detail, basis_commit)},
+        {7, offsetof(atlas_verify_attestation_detail, actor_uid)},
+        {10, offsetof(atlas_verify_attestation_detail, actor_name)},
+        {11, offsetof(atlas_verify_attestation_detail, actor_provider)},
+        {12, offsetof(atlas_verify_attestation_detail, actor_family)},
+        {13, offsetof(atlas_verify_attestation_detail, actor_version)},
+        {14, offsetof(atlas_verify_attestation_detail, actor_role)},
+    };
+    while (st == ATLAS_OK && sqlite3_step(s) == SQLITE_ROW && out->attestation_count < cap) {
+        atlas_verify_attestation_detail *a = &out->attestations[out->attestation_count];
+        a->id = sqlite3_column_int64(s, 0);
+        a->group = -1;
+        for (size_t i = 0; st == ATLAS_OK && i < sizeof TEXTS / sizeof TEXTS[0]; i++) {
+            st = take_text((atlas_buf *)((char *)a + TEXTS[i].off),
+                           (const char *)sqlite3_column_text(s, TEXTS[i].col), err);
+        }
+        if (st == ATLAS_OK) {
+            (void)atlas_verify_verdict_parse((const char *)sqlite3_column_text(s, 2), &a->verdict);
+            a->self_confidence = sqlite3_column_int(s, 3);
+            (void)atlas_verify_actor_class_parse((const char *)sqlite3_column_text(s, 8),
+                                                 &a->actor_class);
+            (void)atlas_verify_actor_identity_parse((const char *)sqlite3_column_text(s, 9),
+                                                    &a->actor_identity);
+            a->superseded = sqlite3_column_int64(s, 15) > 0;
+            out->attestation_count++;
+        }
+    }
+    atlas_db_finish(db, s);
+    return st;
+}
+
+atlas_status atlas_db_verify_detail_load(atlas_db *db, int64_t claim_id, const char *stale_before,
+                                         atlas_verify_detail *out, atlas_err *err) {
+    if (db == NULL || out == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "nowhere to put the detail");
+    }
+    atlas_verify_detail_init(out);
+    atlas_status st = load_evidence_detail(db, claim_id, stale_before, out, err);
+    if (st == ATLAS_OK) {
+        st = load_attestation_detail(db, claim_id, out, err);
+    }
+    if (st != ATLAS_OK) {
+        atlas_verify_detail_free(out);
+    }
+    return st;
+}
+
 /* --- aggregation inputs ---------------------------------------------------- */
 
 void atlas_verify_inputs_free(atlas_verify_inputs *in) {

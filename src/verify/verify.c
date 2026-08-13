@@ -575,6 +575,56 @@ const char *atlas_verify_check_name(atlas_verify_check c) {
     return "UNAVAILABLE";
 }
 
+/* A9.2.1. The parsers the socket client needs, written the same way as every
+ * other `_parse` in this file: a name is matched against the closed vocabulary
+ * and an unrecognised one is **refused**, leaving the caller's value at its
+ * zero.
+ *
+ * That zero is the safe answer in each of these vocabularies by construction —
+ * UNAVAILABLE for a check, NEEDS_REVIEW for a verdict — so a newer daemon
+ * naming something this binary has never heard of degrades to "Atlas cannot
+ * tell" rather than to something permissive. A parser that guessed would let a
+ * version skew manufacture a PASS. */
+bool atlas_verify_check_parse(const char *name, atlas_verify_check *out) {
+    if (name == NULL || out == NULL) {
+        return false;
+    }
+    for (size_t i = 0; i < sizeof CHECK_NAMES / sizeof CHECK_NAMES[0]; i++) {
+        if (strcmp(name, CHECK_NAMES[i]) == 0) {
+            *out = (atlas_verify_check)i;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool atlas_verify_policy_verdict_parse(const char *name, atlas_verify_policy_verdict *out) {
+    if (name == NULL || out == NULL) {
+        return false;
+    }
+    for (size_t i = 0; i < sizeof POLICY_VERDICT_NAMES / sizeof POLICY_VERDICT_NAMES[0]; i++) {
+        if (strcmp(name, POLICY_VERDICT_NAMES[i]) == 0) {
+            *out = (atlas_verify_policy_verdict)i;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool atlas_verify_reason_parse(const char *name, atlas_verify_reason *out) {
+    if (name == NULL || out == NULL) {
+        return false;
+    }
+    for (size_t i = 0; i < atlas_verify_reason_count(); i++) {
+        atlas_verify_reason r = (atlas_verify_reason)i;
+        if (strcmp(name, atlas_verify_reason_name(r)) == 0) {
+            *out = r;
+            return true;
+        }
+    }
+    return false;
+}
+
 /* --- conservative priors --------------------------------------------------
  *
  * §20 in a table. Read the numbers as "how much weight does Atlas give a source

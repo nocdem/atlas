@@ -3409,3 +3409,544 @@ void atlas_operation_report_free(atlas_operation_report *r) {
     atlas_buf_free(&r->message);
     atlas_buf_free(&r->detail);
 }
+
+/* --- A9.2.1: the verification surface over the socket -----------------------
+ *
+ * A9.2.1 added nine RPC methods and no client for them, so on a system
+ * deployment — where the index is 0700 `atlasd` and the CLI has no context at
+ * all — `atlas verify show` answered "no index is available to read" about a
+ * claim the daemon was holding and would happily have described. The methods
+ * existing is what stopped it segfaulting; this is what makes it answer.
+ *
+ * Every function here is the remote twin of one in `service_verify.c`, and the
+ * pair exists for the reason A8-CI gives about `atlas_sem_impact_on`: the CLI
+ * and the daemon must not be able to disagree about what a claim says. The
+ * daemon builds its answer with `atlas_service_verify_write_report`; this reads
+ * that exact shape back into the same struct, so the human renderer prints the
+ * same thing from either path and the JSON renderer emits the same document.
+ *
+ * **Nothing here decides anything.** The channel, the actor's class and the
+ * verifier's verdict are all established daemon-side; a field this file could
+ * set would be a field a caller could set. */
+
+static void take_cstr(char *dst, size_t n, const atlas_ipc_response *r, const char *key) {
+    const char *v = NULL;
+    if (atlas_ipc_result_str(r, key, &v) && v != NULL) {
+        (void)snprintf(dst, n, "%s", v);
+    }
+}
+
+static void read_assessment(const atlas_ipc_response *r, atlas_verify_assessment *a) {
+    const char *v = NULL;
+    int64_t n = 0;
+    bool b = false;
+
+    /* Every enum is parsed against its closed vocabulary and left at its zero
+     * value when the name is unknown. That zero is UNKNOWN or BLOCKED in every
+     * one of these vocabularies by deliberate design, so a newer daemon naming
+     * a state this binary has never heard of degrades to "Atlas cannot tell"
+     * rather than to something permissive. */
+    if (atlas_ipc_result_str(r, "state", &v) && v != NULL) {
+        (void)atlas_verify_state_parse(v, &a->aggregate.state);
+    }
+    if (atlas_ipc_result_str(r, "basis", &v) && v != NULL) {
+        (void)atlas_verify_basis_parse(v, &a->basis);
+        a->aggregate.basis = a->basis;
+    }
+    if (atlas_ipc_result_str(r, "semantics", &v) && v != NULL) {
+        (void)atlas_verify_claim_semantics_parse(v, &a->semantics);
+    }
+    if (atlas_ipc_result_str(r, "verifier", &v) && v != NULL) {
+        (void)atlas_verify_verifier_parse(v, &a->verifier);
+    }
+    if (atlas_ipc_result_str(r, "check", &v) && v != NULL) {
+        (void)atlas_verify_check_parse(v, &a->check);
+    }
+    if (atlas_ipc_result_str(r, "calibration", &v) && v != NULL) {
+        (void)atlas_verify_calibration_parse(v, &a->aggregate.calibration);
+    }
+    if (atlas_ipc_result_str(r, "policy_verdict", &v) && v != NULL) {
+        (void)atlas_verify_policy_verdict_parse(v, &a->aggregate.verdict);
+    }
+    if (atlas_ipc_result_str(r, "conflict", &v) && v != NULL) {
+        (void)atlas_verify_conflict_parse(v, &a->aggregate.conflict);
+    }
+    if (atlas_ipc_result_int(r, "confidence_score", &n)) {
+        a->aggregate.confidence = (int)n;
+    }
+    /* Absent unless calibration supports it, and absent must stay absent: a
+     * missing key becomes -1, never 0. Zero is a probability. */
+    a->aggregate.calibrated_probability = -1;
+    if (atlas_ipc_result_int(r, "calibrated_probability", &n)) {
+        a->aggregate.calibrated_probability = (int)n;
+    }
+    static const struct {
+        const char *key;
+        size_t off;
+    } INTS[] = {
+        {"support_count", offsetof(atlas_verify_aggregate, support_count)},
+        {"contradict_count", offsetof(atlas_verify_aggregate, contradict_count)},
+        {"inconclusive_count", offsetof(atlas_verify_aggregate, inconclusive_count)},
+        {"independent_groups", offsetof(atlas_verify_aggregate, independent_groups)},
+        {"independent_families", offsetof(atlas_verify_aggregate, independent_families)},
+        {"family_version", offsetof(atlas_verify_aggregate, family_version)},
+    };
+    for (size_t i = 0; i < sizeof INTS / sizeof INTS[0]; i++) {
+        if (atlas_ipc_result_int(r, INTS[i].key, &n)) {
+            *(int *)((char *)&a->aggregate + INTS[i].off) = (int)n;
+        }
+    }
+    if (atlas_ipc_result_int(r, "attestation_total", &n)) {
+        a->attestation_total = (size_t)n;
+    }
+    if (atlas_ipc_result_int(r, "sem_generation", &n)) {
+        a->sem_generation = n;
+    }
+    if (atlas_ipc_result_int(r, "result_id", &n)) {
+        a->result_id = n;
+    }
+    if (atlas_ipc_result_int(r, "audit_id", &n)) {
+        a->audit_id = n;
+    }
+    if (atlas_ipc_result_bool(r, "truncated", &b)) {
+        a->truncated = b;
+    }
+    if (atlas_ipc_result_bool(r, "stale", &b)) {
+        a->aggregate.stale = b;
+    }
+    if (atlas_ipc_result_bool(r, "source_drift", &b)) {
+        a->source_drift = b;
+    }
+    if (atlas_ipc_result_bool(r, "actionable", &b)) {
+        a->actionable = b;
+    }
+    if (atlas_ipc_result_bool(r, "transitioned", &b)) {
+        a->transitioned = b;
+    }
+    if (atlas_ipc_result_str(r, "from_status", &v) && v != NULL) {
+        (void)atlas_decision_state_parse(v, &a->from);
+    }
+    if (atlas_ipc_result_str(r, "to_status", &v) && v != NULL) {
+        (void)atlas_decision_state_parse(v, &a->to);
+    }
+    take_cstr(a->verified_scope, sizeof a->verified_scope, r, "verified_scope");
+    take_cstr(a->detail, sizeof a->detail, r, "detail");
+    take_cstr(a->claim_commit, sizeof a->claim_commit, r, "claim_commit");
+    take_cstr(a->evaluated_commit, sizeof a->evaluated_commit, r, "evaluated_commit");
+
+    /* The reason list, and its true total separately. A6's rule: a list that
+     * was cut short must never read as a complete one, so `reason_total` comes
+     * from the wire rather than from counting what arrived. */
+    size_t len = 0;
+    if (atlas_ipc_result_arr_len(r, "reasons", &len)) {
+        for (size_t i = 0; i < len && a->aggregate.reason_count < ATLAS_VERIFY_MAX_REASONS; i++) {
+            const char *code = NULL;
+            atlas_verify_reason reason;
+            if (atlas_ipc_result_arr_obj_str(r, "reasons", i, "code", &code) && code != NULL &&
+                atlas_verify_reason_parse(code, &reason)) {
+                a->aggregate.reasons[a->aggregate.reason_count++] = reason;
+            }
+        }
+    }
+    a->aggregate.reason_total = a->aggregate.reason_count;
+    if (atlas_ipc_result_int(r, "reason_total", &n) && (size_t)n > a->aggregate.reason_total) {
+        a->aggregate.reason_total = (size_t)n;
+    }
+}
+
+static void read_policy(const atlas_ipc_response *r, atlas_verify_report *out) {
+    const char *v = NULL;
+    int64_t n = 0;
+    bool b = false;
+    if (atlas_ipc_result_obj_str(r, "policy", "state", &v) && v != NULL) {
+        (void)atlas_verifypolicy_state_parse(v, &out->policy_state);
+    }
+    if (atlas_ipc_result_obj_str(r, "policy", "reason", &v) && v != NULL) {
+        (void)atlas_verifypolicy_reason_parse(v, &out->policy_reason);
+    }
+    if (atlas_ipc_result_obj_str(r, "policy", "id", &v) && v != NULL) {
+        (void)snprintf(out->policy_id, sizeof out->policy_id, "%s", v);
+    }
+    if (atlas_ipc_result_obj_str(r, "policy", "hash", &v) && v != NULL) {
+        (void)snprintf(out->policy_hash, sizeof out->policy_hash, "%s", v);
+    }
+    if (atlas_ipc_result_obj_str(r, "policy", "path", &v) && v != NULL) {
+        (void)snprintf(out->policy_path, sizeof out->policy_path, "%s", v);
+    }
+    if (atlas_ipc_result_obj_str(r, "policy", "detail", &v) && v != NULL) {
+        (void)snprintf(out->policy_detail, sizeof out->policy_detail, "%s", v);
+    }
+    if (atlas_ipc_result_obj_bool(r, "policy", "deterministic_enforce", &b)) {
+        out->deterministic_enforce = b;
+    }
+    if (atlas_ipc_result_obj_bool(r, "policy", "empirical_enforce", &b)) {
+        out->empirical_enforce = b;
+    }
+    if (atlas_ipc_result_obj_int(r, "policy", "rules", &n)) {
+        out->rule_count = (size_t)n;
+    }
+}
+
+/* The evidence and attestation lists. Read into the same structs the local
+ * path fills, so `verify show` prints one shape whichever side produced it. */
+static atlas_status read_detail(const atlas_ipc_response *r, atlas_verify_detail *d,
+                                atlas_err *err) {
+    size_t len = 0;
+    bool b = false;
+    int64_t n = 0;
+    const char *v = NULL;
+    atlas_status st = ATLAS_OK;
+
+    if (atlas_ipc_result_arr_len(r, "evidence", &len) && len > 0) {
+        d->evidence = calloc(len, sizeof *d->evidence);
+        if (d->evidence == NULL) {
+            return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory reading evidence");
+        }
+        for (size_t i = 0; st == ATLAS_OK && i < len; i++) {
+            atlas_verify_evidence_detail *e = &d->evidence[d->evidence_count];
+            static const struct {
+                const char *key;
+                size_t off;
+            } T[] = {
+                {"uid", offsetof(atlas_verify_evidence_detail, uid)},
+                {"producer", offsetof(atlas_verify_evidence_detail, producer_uid)},
+                {"producer_name", offsetof(atlas_verify_evidence_detail, producer_name)},
+                {"commit", offsetof(atlas_verify_evidence_detail, commit_oid)},
+                {"path", offsetof(atlas_verify_evidence_detail, path_text)},
+                {"symbol", offsetof(atlas_verify_evidence_detail, symbol)},
+                {"target", offsetof(atlas_verify_evidence_detail, target)},
+                {"observed", offsetof(atlas_verify_evidence_detail, observed)},
+                {"observed_at", offsetof(atlas_verify_evidence_detail, observed_at)},
+                {"tool", offsetof(atlas_verify_evidence_detail, tool)},
+                {"proof_class", offsetof(atlas_verify_evidence_detail, proof_class)},
+            };
+            for (size_t k = 0; st == ATLAS_OK && k < sizeof T / sizeof T[0]; k++) {
+                if (atlas_ipc_result_arr_obj_str(r, "evidence", i, T[k].key, &v) && v != NULL) {
+                    st = atlas_buf_set_str((atlas_buf *)((char *)e + T[k].off), v, err);
+                }
+            }
+            if (st == ATLAS_OK &&
+                atlas_ipc_result_arr_obj_str(r, "evidence", i, "class", &v) && v != NULL) {
+                (void)atlas_verify_evidence_class_parse(v, &e->cls);
+                e->family = atlas_verify_evidence_family_of(e->cls);
+            }
+            if (st == ATLAS_OK &&
+                atlas_ipc_result_arr_obj_str(r, "evidence", i, "producer_class", &v) && v != NULL) {
+                (void)atlas_verify_actor_class_parse(v, &e->producer_class);
+            }
+            if (st == ATLAS_OK &&
+                atlas_ipc_result_arr_obj_str(r, "evidence", i, "producer_identity", &v) &&
+                v != NULL) {
+                (void)atlas_verify_actor_identity_parse(v, &e->producer_identity);
+            }
+            if (st == ATLAS_OK && atlas_ipc_result_arr_obj_int(r, "evidence", i, "line_start", &n)) {
+                e->line_start = n;
+            }
+            if (st == ATLAS_OK && atlas_ipc_result_arr_obj_int(r, "evidence", i, "line_end", &n)) {
+                e->line_end = n;
+            }
+            if (st == ATLAS_OK && atlas_ipc_result_arr_obj_bool(r, "evidence", i, "stale", &b)) {
+                e->stale = b;
+            }
+            if (st == ATLAS_OK) {
+                d->evidence_count++;
+            }
+        }
+    }
+    if (st == ATLAS_OK && atlas_ipc_result_int(r, "evidence_total", &n)) {
+        d->evidence_total = (size_t)n;
+    }
+
+    len = 0;
+    if (st == ATLAS_OK && atlas_ipc_result_arr_len(r, "attestations", &len) && len > 0) {
+        d->attestations = calloc(len, sizeof *d->attestations);
+        if (d->attestations == NULL) {
+            return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory reading attestations");
+        }
+        for (size_t i = 0; st == ATLAS_OK && i < len; i++) {
+            atlas_verify_attestation_detail *a = &d->attestations[d->attestation_count];
+            a->self_confidence = -1;
+            a->group = -1;
+            static const struct {
+                const char *key;
+                size_t off;
+            } T[] = {
+                {"uid", offsetof(atlas_verify_attestation_detail, uid)},
+                {"actor", offsetof(atlas_verify_attestation_detail, actor_uid)},
+                {"actor_name", offsetof(atlas_verify_attestation_detail, actor_name)},
+                {"actor_provider", offsetof(atlas_verify_attestation_detail, actor_provider)},
+                {"actor_family", offsetof(atlas_verify_attestation_detail, actor_family)},
+                {"actor_version", offsetof(atlas_verify_attestation_detail, actor_version)},
+                {"actor_role", offsetof(atlas_verify_attestation_detail, actor_role)},
+                {"method", offsetof(atlas_verify_attestation_detail, method)},
+                {"scope", offsetof(atlas_verify_attestation_detail, scope_note)},
+                {"commit", offsetof(atlas_verify_attestation_detail, basis_commit)},
+            };
+            for (size_t k = 0; st == ATLAS_OK && k < sizeof T / sizeof T[0]; k++) {
+                if (atlas_ipc_result_arr_obj_str(r, "attestations", i, T[k].key, &v) && v != NULL) {
+                    st = atlas_buf_set_str((atlas_buf *)((char *)a + T[k].off), v, err);
+                }
+            }
+            if (st == ATLAS_OK &&
+                atlas_ipc_result_arr_obj_str(r, "attestations", i, "verdict", &v) && v != NULL) {
+                (void)atlas_verify_verdict_parse(v, &a->verdict);
+            }
+            if (st == ATLAS_OK &&
+                atlas_ipc_result_arr_obj_str(r, "attestations", i, "actor_class", &v) &&
+                v != NULL) {
+                (void)atlas_verify_actor_class_parse(v, &a->actor_class);
+            }
+            if (st == ATLAS_OK &&
+                atlas_ipc_result_arr_obj_str(r, "attestations", i, "actor_identity", &v) &&
+                v != NULL) {
+                (void)atlas_verify_actor_identity_parse(v, &a->actor_identity);
+            }
+            if (st == ATLAS_OK &&
+                atlas_ipc_result_arr_obj_int(r, "attestations", i, "self_confidence", &n)) {
+                a->self_confidence = (int)n;
+            }
+            if (st == ATLAS_OK && atlas_ipc_result_arr_obj_int(r, "attestations", i, "group", &n)) {
+                a->group = (int)n;
+            }
+            if (st == ATLAS_OK &&
+                atlas_ipc_result_arr_obj_bool(r, "attestations", i, "superseded", &b)) {
+                a->superseded = b;
+            }
+            if (st == ATLAS_OK) {
+                d->attestation_count++;
+            }
+        }
+    }
+    if (st == ATLAS_OK && atlas_ipc_result_int(r, "attestation_rows", &n)) {
+        d->attestation_total = (size_t)n;
+    }
+    if (st == ATLAS_OK && atlas_ipc_result_bool(r, "detail_truncated", &b)) {
+        d->limit_reached = b;
+    }
+    return st;
+}
+
+static atlas_status read_report(const atlas_ipc_response *r, atlas_verify_report *out,
+                                atlas_err *err) {
+    const char *v = NULL;
+    atlas_status st = ATLAS_OK;
+    if (atlas_ipc_result_str(r, "claim", &v) && v != NULL) {
+        st = atlas_buf_set_str(&out->claim_uid, v, err);
+    }
+    /* UNTRUSTED_DATA, and already safe-encoded by the daemon. Encoding it a
+     * second time would double every `%` — the "do not double-encode" rule. */
+    if (st == ATLAS_OK && atlas_ipc_result_str(r, "text", &v) && v != NULL) {
+        st = atlas_buf_set_str(&out->claim_text, v, err);
+    }
+    if (st == ATLAS_OK && atlas_ipc_result_str(r, "domain", &v) && v != NULL) {
+        st = atlas_buf_set_str(&out->domain, v, err);
+    }
+    if (st == ATLAS_OK && atlas_ipc_result_str(r, "decision", &v) && v != NULL) {
+        st = atlas_buf_set_str(&out->record_uid, v, err);
+    }
+    if (st == ATLAS_OK) {
+        read_assessment(r, &out->assessment);
+        read_policy(r, out);
+        st = read_detail(r, &out->detail, err);
+    }
+    return st;
+}
+
+atlas_status atlas_service_verify_show_remote(int64_t claim_id, const char *claim_uid,
+                                             atlas_verify_report *out, atlas_err *err) {
+    atlas_buf params = ATLAS_BUF_INIT;
+    atlas_ipc_params *p = NULL;
+    atlas_json *j = NULL;
+    atlas_status st = atlas_ipc_params_begin(&p, &j, err);
+    if (st == ATLAS_OK && claim_id > 0) {
+        st = atlas_json_key_int(j, "claim_id", claim_id, err);
+    }
+    if (st == ATLAS_OK && claim_uid != NULL && *claim_uid != '\0') {
+        st = atlas_json_key_str(j, "claim", claim_uid, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_ipc_params_finish(p, &params, err);
+    } else {
+        atlas_ipc_params_abort(p);
+    }
+    atlas_buf raw = ATLAS_BUF_INIT;
+    atlas_ipc_response *r = NULL;
+    if (st == ATLAS_OK) {
+        st = atlas_remote_call("verify.show", atlas_buf_cstr(&params), &raw, &r, err);
+    }
+    atlas_buf_free(&params);
+    if (st == ATLAS_OK) {
+        st = read_report(r, out, err);
+    }
+    atlas_ipc_response_free(r);
+    atlas_buf_free(&raw);
+    return st;
+}
+
+/* The intake verbs. One serializer, because the six requests differ only in
+ * which members are set — and because a field that reached one method and not
+ * another is exactly the defect A8's closure caught between `decision.revise`
+ * and `decision.link_add`. */
+static atlas_status put_op(atlas_json *j, const atlas_verify_op *op, atlas_err *err) {
+    static const struct {
+        const char *key;
+        size_t off;
+    } FIELDS[] = {
+        {"repo", offsetof(atlas_verify_op, repo_name)},
+        {"claim", offsetof(atlas_verify_op, claim_uid)},
+        {"decision", offsetof(atlas_verify_op, document_uid)},
+        {"domain", offsetof(atlas_verify_op, domain)},
+        {"text", offsetof(atlas_verify_op, text)},
+        {"scope", offsetof(atlas_verify_op, scope_note)},
+        {"verifier", offsetof(atlas_verify_op, verifier)},
+        {"verifier_input", offsetof(atlas_verify_op, verifier_input)},
+        {"environment", offsetof(atlas_verify_op, environment)},
+        {"path", offsetof(atlas_verify_op, path_text)},
+        {"symbol", offsetof(atlas_verify_op, symbol)},
+        {"target", offsetof(atlas_verify_op, target)},
+        {"probe", offsetof(atlas_verify_op, probe)},
+        {"observed", offsetof(atlas_verify_op, observed)},
+        {"observed_at", offsetof(atlas_verify_op, observed_at)},
+        {"method", offsetof(atlas_verify_op, method)},
+        {"evidence", offsetof(atlas_verify_op, evidence_uids)},
+        {"supersedes", offsetof(atlas_verify_op, supersedes_uid)},
+        {"actor", offsetof(atlas_verify_op, actor_name)},
+        {"provider", offsetof(atlas_verify_op, actor_provider)},
+        {"family", offsetof(atlas_verify_op, actor_family)},
+        {"model_version", offsetof(atlas_verify_op, actor_version)},
+        {"role", offsetof(atlas_verify_op, actor_role)},
+        {"session", offsetof(atlas_verify_op, session_key)},
+        {"run", offsetof(atlas_verify_op, run_id)},
+        {"orchestrator", offsetof(atlas_verify_op, parent_actor_uid)},
+        {"derives_from", offsetof(atlas_verify_op, source_uid)},
+    };
+    atlas_status st = ATLAS_OK;
+    for (size_t i = 0; st == ATLAS_OK && i < sizeof FIELDS / sizeof FIELDS[0]; i++) {
+        const atlas_buf *b = (const atlas_buf *)((const char *)op + FIELDS[i].off);
+        if (b->len > 0) {
+            st = atlas_json_key_str(j, FIELDS[i].key, atlas_buf_cstr(b), err);
+        }
+    }
+    /* `commit` and `evidence` are spelled differently by op kind, so they are
+     * placed here rather than in the table: a dependency names the derived
+     * evidence in `evidence`, and everything else means the claim's basis. */
+    if (st == ATLAS_OK && op->kind == ATLAS_VERIFY_OP_DEPENDENCY_ADD && op->derived_uid.len > 0) {
+        st = atlas_json_key_str(j, "evidence", atlas_buf_cstr(&op->derived_uid), err);
+    }
+    if (st == ATLAS_OK && op->basis_commit.len > 0) {
+        st = atlas_json_key_str(j, "commit", atlas_buf_cstr(&op->basis_commit), err);
+    }
+    if (st == ATLAS_OK && op->commit_oid.len > 0) {
+        st = atlas_json_key_str(j, "commit", atlas_buf_cstr(&op->commit_oid), err);
+    }
+    if (st == ATLAS_OK && op->kind == ATLAS_VERIFY_OP_CLAIM_CREATE && op->semantics_given) {
+        st = atlas_json_key_str(j, "semantics", atlas_verify_claim_semantics_name(op->semantics),
+                                err);
+    }
+    if (st == ATLAS_OK && op->kind == ATLAS_VERIFY_OP_EVIDENCE_ADD) {
+        st = atlas_json_key_str(j, "class", atlas_verify_evidence_class_name(op->evidence_class),
+                                err);
+    }
+    if (st == ATLAS_OK && op->kind == ATLAS_VERIFY_OP_ATTESTATION_ADD) {
+        st = atlas_json_key_str(j, "verdict", atlas_verify_verdict_name(op->verdict), err);
+        if (st == ATLAS_OK && op->self_confidence >= 0) {
+            st = atlas_json_key_int(j, "self_confidence", op->self_confidence, err);
+        }
+    }
+    if (st == ATLAS_OK && op->line_start > 0) {
+        st = atlas_json_key_int(j, "line_start", op->line_start, err);
+    }
+    if (st == ATLAS_OK && op->line_end > 0) {
+        st = atlas_json_key_int(j, "line_end", op->line_end, err);
+    }
+    return st;
+}
+
+static const char *method_for_op(atlas_verify_op_kind k) {
+    switch (k) {
+    case ATLAS_VERIFY_OP_CLAIM_CREATE:
+        return "verify.claim_create";
+    case ATLAS_VERIFY_OP_EVIDENCE_ADD:
+        return "verify.evidence_add";
+    case ATLAS_VERIFY_OP_EVIDENCE_PRODUCE:
+        return "verify.evidence_produce";
+    case ATLAS_VERIFY_OP_ATTESTATION_ADD:
+        return "verify.attestation_add";
+    case ATLAS_VERIFY_OP_DEPENDENCY_ADD:
+        return "verify.dependency_add";
+    case ATLAS_VERIFY_OP_EVALUATE:
+        return "verify.evaluate";
+    }
+    return NULL;
+}
+
+atlas_status atlas_service_verify_intake_remote(const atlas_verify_op *op,
+                                               atlas_verify_intake_result *out, atlas_err *err) {
+    const char *method = method_for_op(op->kind);
+    if (method == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "no method carries that operation");
+    }
+    atlas_buf params = ATLAS_BUF_INIT;
+    atlas_ipc_params *p = NULL;
+    atlas_json *j = NULL;
+    atlas_status st = atlas_ipc_params_begin(&p, &j, err);
+    if (st == ATLAS_OK) {
+        st = put_op(j, op, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_ipc_params_finish(p, &params, err);
+    } else {
+        atlas_ipc_params_abort(p);
+    }
+    atlas_buf raw = ATLAS_BUF_INIT;
+    atlas_ipc_response *r = NULL;
+    if (st == ATLAS_OK) {
+        st = atlas_remote_call(method, atlas_buf_cstr(&params), &raw, &r, err);
+    }
+    atlas_buf_free(&params);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    const char *v = NULL;
+    int64_t n = 0;
+    bool b = false;
+    if (out != NULL) {
+        if (atlas_ipc_result_str(r, "uid", &v) && v != NULL) {
+            st = atlas_buf_set_str(&out->uid, v, err);
+        }
+        if (st == ATLAS_OK && atlas_ipc_result_str(r, "actor", &v) && v != NULL) {
+            st = atlas_buf_set_str(&out->actor_uid, v, err);
+        }
+        if (atlas_ipc_result_int(r, "claim_id", &n)) {
+            out->claim_id = n;
+        }
+        if (atlas_ipc_result_int(r, "evidence_id", &n)) {
+            out->evidence_id = n;
+        }
+        if (atlas_ipc_result_int(r, "attestation_id", &n)) {
+            out->attestation_id = n;
+        }
+        if (atlas_ipc_result_bool(r, "duplicate", &b)) {
+            out->duplicate = b;
+        }
+        if (atlas_ipc_result_str(r, "check", &v) && v != NULL) {
+            (void)atlas_verify_check_parse(v, &out->check);
+        }
+        take_cstr(out->verified_scope, sizeof out->verified_scope, r, "verified_scope");
+        take_cstr(out->detail, sizeof out->detail, r, "detail");
+    }
+    /* `verify.evaluate` answers with a whole assessment rather than an id, and
+     * it lands in the same member the local path fills — so the CLI renders one
+     * shape whichever side computed it. */
+    if (st == ATLAS_OK && out != NULL && op->kind == ATLAS_VERIFY_OP_EVALUATE) {
+        if (atlas_ipc_result_str(r, "claim", &v) && v != NULL) {
+            st = atlas_buf_set_str(&out->uid, v, err);
+        }
+        if (st == ATLAS_OK) {
+            read_assessment(r, &out->assessment);
+        }
+    }
+    atlas_ipc_response_free(r);
+    atlas_buf_free(&raw);
+    return st;
+}

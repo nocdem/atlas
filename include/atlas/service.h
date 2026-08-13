@@ -23,6 +23,7 @@
 #include "atlas/gate.h"
 #include "atlas/json.h"
 #include "atlas/safetext.h"
+#include "atlas/verify_ops.h"
 #include "atlas/verifypolicy.h"
 #include "atlas/git.h"
 #include "atlas/limits.h"
@@ -936,6 +937,14 @@ typedef struct atlas_verify_report {
     atlas_buf record_uid;
     atlas_buf record_title; /* UNTRUSTED_DATA */
 
+    /* A9.2.1 closeout: the evidence and attestations behind the numbers.
+     *
+     * A verification result whose evidence a reader cannot see is a number to
+     * be taken on trust, which is the opposite of what recording evidence is
+     * for. Every surface that shows a score shows this beside it, and every
+     * text field in it is UNTRUSTED_DATA. */
+    atlas_verify_detail detail;
+
     /* The root-owned policy as it was when the assessment ran, so a reader can
      * see *why* an answer was shadow rather than automatic without going to
      * look at a file they may not be able to read. */
@@ -999,6 +1008,12 @@ atlas_status atlas_service_verify_write_assessment(atlas_json *j,
                                                    atlas_err *err);
 atlas_status atlas_service_verify_write_policy(atlas_json *j, const atlas_verify_report *r,
                                                atlas_err *err);
+/* The evidence and attestation lists. Exported because the CLI's JSON renderer
+ * builds its own envelope but must not build its own *evidence*: a surface that
+ * showed a confidence score with a different set of evidence behind it than the
+ * daemon showed would be two answers to one question. */
+atlas_status atlas_service_verify_write_detail(atlas_json *j, atlas_safe_pool *safe,
+                                               const atlas_verify_detail *d, atlas_err *err);
 atlas_status atlas_service_verify_write_report(atlas_json *j, atlas_safe_pool *safe,
                                                const atlas_verify_report *r, atlas_err *err);
 
@@ -1404,3 +1419,19 @@ atlas_status atlas_service_sem_context_remote(const atlas_sem_context_req *req,
                                               atlas_sem_context_report *out, atlas_err *err);
 
 #endif /* ATLAS_SERVICE_H */
+
+/* --- A9.2.1: the verification surface over the socket -----------------------
+ *
+ * The remote twins of the functions above. Under A7.1 the index is 0700
+ * `atlasd`, so from the operator's account these are the *only* forms that can
+ * answer — A9.2.1 shipped the nine RPC methods without them, and the result was
+ * `atlas verify show` reporting "no index is available to read" about a claim
+ * the daemon was holding. The CLI picks between the pair on whether it has a
+ * context, which is the shape `atlas_service_gate_show` already uses. */
+atlas_status atlas_service_verify_show_remote(int64_t claim_id, const char *claim_uid,
+                                             atlas_verify_report *out, atlas_err *err);
+/* Carries one typed intake operation to its method, and reads the answer back
+ * into the same result struct the local write point fills — including the
+ * assessment EVALUATE returns, so the two paths render identically. */
+atlas_status atlas_service_verify_intake_remote(const atlas_verify_op *op,
+                                               atlas_verify_intake_result *out, atlas_err *err);

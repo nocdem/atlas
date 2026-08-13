@@ -31,6 +31,37 @@ const char *atlas_verifypolicy_state_name(atlas_verifypolicy_state s) {
     return s == ATLAS_VERIFYPOLICY_ENABLED ? "ENABLED" : "DISABLED";
 }
 
+bool atlas_verifypolicy_state_parse(const char *name, atlas_verifypolicy_state *out) {
+    if (name == NULL || out == NULL) {
+        return false;
+    }
+    /* DISABLED is the zero and the safe answer: a name this binary does not
+     * recognise must never read as a policy that is switched on. */
+    if (strcmp(name, "ENABLED") == 0) {
+        *out = ATLAS_VERIFYPOLICY_ENABLED;
+        return true;
+    }
+    if (strcmp(name, "DISABLED") == 0) {
+        *out = ATLAS_VERIFYPOLICY_DISABLED;
+        return true;
+    }
+    return false;
+}
+
+bool atlas_verifypolicy_reason_parse(const char *name, atlas_verifypolicy_reason *out) {
+    if (name == NULL || out == NULL) {
+        return false;
+    }
+    for (int i = 0; i <= (int)ATLAS_VERIFYPOLICY_REASON_ACTIVE; i++) {
+        atlas_verifypolicy_reason r = (atlas_verifypolicy_reason)i;
+        if (strcmp(name, atlas_verifypolicy_reason_name(r)) == 0) {
+            *out = r;
+            return true;
+        }
+    }
+    return false;
+}
+
 const char *atlas_verifypolicy_reason_name(atlas_verifypolicy_reason r) {
     switch (r) {
     case ATLAS_VERIFYPOLICY_REASON_UNKNOWN: return "UNKNOWN";

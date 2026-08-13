@@ -68,6 +68,22 @@ bool atlas_verify_channel_parse(const char *name, atlas_verify_channel *out) {
     return false;
 }
 
+int atlas_verify_channel_authority(atlas_verify_channel c) {
+    switch (c) {
+    case ATLAS_VERIFY_CHANNEL_MODEL:
+        return 1;
+    case ATLAS_VERIFY_CHANNEL_OPERATOR:
+        return 2;
+    case ATLAS_VERIFY_CHANNEL_ATLAS:
+        return 3;
+    case ATLAS_VERIFY_CHANNEL_UNKNOWN:
+        break;
+    }
+    /* The house rule: a `memset` must not produce a channel that outranks
+     * anything, so the zero value sits below every real one. */
+    return 0;
+}
+
 atlas_verify_actor_class atlas_verify_channel_actor_class(atlas_verify_channel c) {
     switch (c) {
     case ATLAS_VERIFY_CHANNEL_MODEL:

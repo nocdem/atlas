@@ -139,6 +139,50 @@ typedef struct atlas_cli_opts {
          * live smoke drives exactly one attempt without a service. */
         bool once;
     } job;
+    /* A9.2.1. The verification-intake fields, grouped for the reason the A4
+     * ones are: there are a dozen and a half of them, six subcommands use
+     * them, and mixing them into the flat set would make every other command's
+     * option list unreadable.
+     *
+     * There is deliberately **no field here for an actor class, an actor
+     * identity, a channel or a verifier's verdict.** The first three are
+     * derived from the transport and the fourth from having run the verifier,
+     * so an option that set any of them would be the forgery this season
+     * exists to prevent, offered as a flag. */
+    struct {
+        const char *claim;     /* the claim uid an operation is about */
+        const char *text;      /* the proposition */
+        const char *domain;
+        const char *scope;
+        const char *semantics; /* DESCRIPTIVE | NORMATIVE */
+        const char *decision;  /* the knowledge record it bears on */
+        const char *verifier;
+        const char *verifier_input;
+        const char *commit;
+        const char *environment;
+        const char *cls; /* evidence class */
+        const char *path;
+        const char *symbol;
+        const char *target;
+        const char *probe;
+        const char *observed;
+        const char *observed_at;
+        const char *verdict;
+        const char *method;
+        const char *evidence;
+        const char *supersedes;
+        const char *derives_from;
+        /* §11's asserted metadata. Stored as asserted on every channel — the
+         * operator channel authenticates a *uid*, never a name somebody typed. */
+        const char *actor;
+        const char *provider;
+        const char *role;
+        long line_start;
+        long line_end;
+        /* The actor's own number, 0..100, or -1 for "not given". Never Atlas'
+         * confidence, and named so that it cannot be mistaken for it. */
+        long self_confidence;
+    } verify;
 } atlas_cli_opts;
 
 /* Runs one command line. `argv[0]` is the program name. Returns the process

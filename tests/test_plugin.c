@@ -389,8 +389,29 @@ static void test_documented_tool_names_are_plugin_scoped_correctly(void) {
      * accidental gap rather than a boundary. What stays absent is every lifecycle
      * verb: approve, reject, supersede, revalidate and resolve have no tool here,
      * live in the operator-uid RPC group, and need a capability only the terminal
-     * channel can obtain. */
-    T_CHECK_MSG(n == 29, "expected 29 tools, found %zu", n);
+     * channel can obtain.
+     *
+     * A9.2.1 added eight, the verification workflow, and the argument is the
+     * shape of the surface rather than its size. A9.2 shipped an engine that
+     * weighs evidence and no way for a model to put evidence in, so the ten
+     * verification tables stayed empty on every real deployment while every test
+     * that reads them passed. These eight are that way in: state a claim,
+     * reference what you read, ask Atlas to check something itself, attest,
+     * declare a derivation, evaluate, and read the result back.
+     *
+     * None of them is authority, and three separations are what make that true
+     * rather than hoped for. A model may *reference* evidence and may not have
+     * *produced* it — COMPILER, TEST, RUNTIME and DEPLOYED_CONFIG are refused on
+     * the reference path, not discounted. The channel that decides an actor's
+     * class is sent as MODEL and honoured only because it asserts *less* than
+     * the peer uid would. And `atlas_verify_evaluate` may cause Atlas to move a
+     * lifecycle state, but the gates are in a root-owned file the caller cannot
+     * read and the transition is Atlas', recorded as VERIFICATION_POLICY.
+     *
+     * What stays absent is unchanged and is the whole list: approve, reject,
+     * supersede, revalidate, resolve, minting or spending a warrant, editing the
+     * verification policy, and naming a verifier's verdict. */
+    T_CHECK_MSG(n == 37, "expected 37 tools, found %zu", n);
 }
 
 /* --- the integration record ----------------------------------------------

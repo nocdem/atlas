@@ -140,6 +140,13 @@ void atlas_cli_print_help(FILE *out) {
         "  gate check NAME            assess every approved decision against the indexed\n"
         "                             state; exits 8 on review required, 9 on blocked\n"
         "  gate show NAME ID          the same assessment, for one decision\n"
+        "  verify claim --repo R --text \"...\"   state a checkable proposition\n"
+        "  verify evidence --claim UID --class C  reference what you looked at\n"
+        "  verify produce --claim UID            have Atlas run a bounded verifier itself\n"
+        "  verify attest --claim UID --verdict V  record a conclusion and what it rests on\n"
+        "  verify depend --evidence UID --derives-from UID   declare a shared source, so\n"
+        "                             one document read by several agents counts once\n"
+        "  verify evaluate --claim UID  weigh everything recorded and store the result\n"
         "  verify show CLAIM-ID       what evidence bears on one claim, and what a policy\n"
         "                             would do about it; writes nothing\n"
         "  verify run NAME CLAIM-ID   the same, recording the result and performing the\n"
@@ -489,6 +496,90 @@ static atlas_status parse_args(cli_state *st, int argc, char **argv, bool *want_
                                              ATLAS_DECISION_MAX_LINKS);
                     }
                     st->opts.decision.symbols[st->opts.decision.symbol_count++] = v;
+                }
+            } else if (strcmp(a, "--claim") == 0 || strcmp(a, "--text") == 0 ||
+                       strcmp(a, "--domain") == 0 || strcmp(a, "--semantics") == 0 ||
+                       strcmp(a, "--verifier") == 0 || strcmp(a, "--verifier-input") == 0 ||
+                       strcmp(a, "--environment") == 0 || strcmp(a, "--class") == 0 ||
+                       strcmp(a, "--symbol") == 0 || strcmp(a, "--target") == 0 ||
+                       strcmp(a, "--probe") == 0 || strcmp(a, "--observed") == 0 ||
+                       strcmp(a, "--observed-at") == 0 || strcmp(a, "--verdict") == 0 ||
+                       strcmp(a, "--method") == 0 || strcmp(a, "--evidence") == 0 ||
+                       strcmp(a, "--supersedes") == 0 || strcmp(a, "--derives-from") == 0 ||
+                       strcmp(a, "--actor") == 0 || strcmp(a, "--provider") == 0 ||
+                       strcmp(a, "--record") == 0 || strcmp(a, "--role") == 0) {
+                /* A9.2.1. One arm for every verification option taking exactly
+                 * one value, so "a flag at the end of the line has no value" is
+                 * checked once rather than twenty times — the shape the A4 arm
+                 * above uses, and for the same reason. */
+                if (i + 1 >= argc) {
+                    return atlas_err_set(err, ATLAS_ERR_USAGE, "%s needs a value", a);
+                }
+                const char *v = argv[++i];
+                static const struct {
+                    const char *flag;
+                    size_t off;
+                } VFIELDS[] = {
+                    {"--claim", offsetof(atlas_cli_opts, verify.claim)},
+                    {"--text", offsetof(atlas_cli_opts, verify.text)},
+                    {"--domain", offsetof(atlas_cli_opts, verify.domain)},
+                    {"--semantics", offsetof(atlas_cli_opts, verify.semantics)},
+                    {"--verifier", offsetof(atlas_cli_opts, verify.verifier)},
+                    {"--verifier-input", offsetof(atlas_cli_opts, verify.verifier_input)},
+                    {"--environment", offsetof(atlas_cli_opts, verify.environment)},
+                    {"--class", offsetof(atlas_cli_opts, verify.cls)},
+                    {"--symbol", offsetof(atlas_cli_opts, verify.symbol)},
+                    {"--target", offsetof(atlas_cli_opts, verify.target)},
+                    {"--probe", offsetof(atlas_cli_opts, verify.probe)},
+                    {"--observed", offsetof(atlas_cli_opts, verify.observed)},
+                    {"--observed-at", offsetof(atlas_cli_opts, verify.observed_at)},
+                    {"--verdict", offsetof(atlas_cli_opts, verify.verdict)},
+                    {"--method", offsetof(atlas_cli_opts, verify.method)},
+                    {"--evidence", offsetof(atlas_cli_opts, verify.evidence)},
+                    {"--supersedes", offsetof(atlas_cli_opts, verify.supersedes)},
+                    {"--derives-from", offsetof(atlas_cli_opts, verify.derives_from)},
+                    {"--actor", offsetof(atlas_cli_opts, verify.actor)},
+                    {"--provider", offsetof(atlas_cli_opts, verify.provider)},
+                    {"--role", offsetof(atlas_cli_opts, verify.role)},
+                    /* `--record`, not `--decision`: `--decision` already means
+                     * a decision's *body text* on `decision propose`, and one
+                     * spelling meaning two things is the A8.2 defect — prose
+                     * and a document id sharing a key — which A8's closure made
+                     * structural rather than detected. */
+                    {"--record", offsetof(atlas_cli_opts, verify.decision)},
+                };
+                for (size_t k = 0; k < sizeof VFIELDS / sizeof VFIELDS[0]; k++) {
+                    if (strcmp(a, VFIELDS[k].flag) == 0) {
+                        *(const char **)((char *)&st->opts + VFIELDS[k].off) = v;
+                        break;
+                    }
+                }
+            } else if (strcmp(a, "--line-start") == 0 || strcmp(a, "--line-end") == 0 ||
+                       strcmp(a, "--self-confidence") == 0) {
+                if (i + 1 >= argc) {
+                    return atlas_err_set(err, ATLAS_ERR_USAGE, "%s needs a number", a);
+                }
+                char *endp = NULL;
+                long v = strtol(argv[++i], &endp, 10);
+                if (endp == NULL || *endp != '\0' || v < 0) {
+                    return atlas_err_set(err, ATLAS_ERR_USAGE, "%s takes a number that is not "
+                                                               "negative", a);
+                }
+                if (strcmp(a, "--line-start") == 0) {
+                    st->opts.verify.line_start = v;
+                } else if (strcmp(a, "--line-end") == 0) {
+                    st->opts.verify.line_end = v;
+                } else {
+                    /* A5's rule that bounds refuse rather than clamp: a
+                     * self-reported 300 is a caller who meant something Atlas
+                     * cannot represent, and silently storing 100 would record a
+                     * number nobody wrote. */
+                    if (v > 100) {
+                        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                             "--self-confidence is 0..100; it is the actor's own "
+                                             "number and is never used as Atlas' confidence");
+                    }
+                    st->opts.verify.self_confidence = v;
                 }
             } else if (strcmp(a, "--revision") == 0) {
                 if (i + 1 >= argc) {
@@ -1271,6 +1362,206 @@ static atlas_status render_outcome(cli_state *st, atlas_renderer *r, const char 
  *
  * `verify policy` opens no index and binds nothing, so it answers on a machine
  * where Atlas has never run — which is exactly when somebody asks it. */
+/* The six intake verbs.
+ *
+ * These are **intake, not lifecycle finalisation**, and that is why none of
+ * them opens a terminal, mints a challenge or asks for a confirmation. Stating
+ * a claim, citing evidence and attesting change no knowledge record and no
+ * lifecycle state; requiring a `/dev/tty` for them would be ceremony borrowed
+ * from an operation with entirely different consequences, and would make the
+ * verification workflow unusable from the scripts and agents it exists for.
+ * `decision approve` still needs everything it always needed.
+ *
+ * What the operator channel *does* buy here is one thing: the actor recorded
+ * carries PEER_AUTHENTICATED identity rather than SELF_DECLARED, which is a
+ * claim about a uid and never about a person. A7.1's honesty limits hold word
+ * for word.
+ *
+ * The local/remote choice is the same one `verify show` makes and for the same
+ * reason: under A7.1 the index is 0700 `atlasd`, so from the operator's account
+ * the socket is the only path that can write. */
+static atlas_status run_verify_intake(cli_state *st, atlas_ctx *ctx, atlas_renderer *r,
+                                      const char *sub, atlas_err *err) {
+    atlas_verify_op op;
+    atlas_verify_op_init(&op);
+    /* Which channel the local CLI speaks on is decided by the **root-owned
+     * authority policy**, not by the fact that this is the CLI.
+     *
+     * Asserting OPERATOR unconditionally was wrong, and the fixture caught it:
+     * on a machine where the profile is LOCKED — no root-owned policy, or a
+     * binary the running uid can replace — the authority to speak as the
+     * operator does not exist, so claiming it would mint exactly the
+     * PEER_AUTHENTICATED row A7 says nothing may mint from an unprivileged
+     * shape. It would also have made the two paths disagree: the socket edge
+     * already asks this same probe, so a locked profile downgraded a request
+     * that arrived over the socket and not one that ran locally.
+     *
+     * MODEL is the floor rather than a refusal. A locked profile does not stop
+     * anybody recording evidence; it stops the record claiming the uid was
+     * established when nothing established it. */
+    atlas_authority auth;
+    atlas_authority_probe(&auth);
+    op.channel = auth.state == ATLAS_AUTHORITY_GRANTED ? ATLAS_VERIFY_CHANNEL_OPERATOR
+                                                       : ATLAS_VERIFY_CHANNEL_MODEL;
+    op.self_confidence = st->opts.verify.self_confidence > 0
+                             ? (int)st->opts.verify.self_confidence
+                             : -1;
+    op.line_start = st->opts.verify.line_start;
+    op.line_end = st->opts.verify.line_end;
+
+    atlas_status s = ATLAS_OK;
+    const char *sem = st->opts.verify.semantics;
+    if (strcmp(sub, "claim") == 0) {
+        op.kind = ATLAS_VERIFY_OP_CLAIM_CREATE;
+        if (st->opts.verify.text == NULL) {
+            atlas_verify_op_free(&op);
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "usage: atlas verify claim --repo R --text \"...\" "
+                                 "[--semantics DESCRIPTIVE|NORMATIVE] [--record UID] [--domain D] "
+                                 "[--scope S] [--verifier V --verifier-input I] [--commit OID]");
+        }
+        if (sem != NULL && !atlas_verify_claim_semantics_parse(sem, &op.semantics)) {
+            atlas_verify_op_free(&op);
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "--semantics is DESCRIPTIVE or NORMATIVE: it says whether the "
+                                 "claim observes what is or declares what ought to be");
+        }
+        op.semantics_given = sem != NULL;
+    } else if (strcmp(sub, "evidence") == 0) {
+        op.kind = ATLAS_VERIFY_OP_EVIDENCE_ADD;
+        if (st->opts.verify.claim == NULL || st->opts.verify.cls == NULL) {
+            atlas_verify_op_free(&op);
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "usage: atlas verify evidence --claim UID --class C [--path P] "
+                                 "[--symbol S] [--commit OID] [--observed \"...\"]");
+        }
+        if (!atlas_verify_evidence_class_parse(st->opts.verify.cls, &op.evidence_class)) {
+            atlas_verify_op_free(&op);
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "--class must name an evidence class; there is no unclassified "
+                                 "evidence");
+        }
+    } else if (strcmp(sub, "produce") == 0) {
+        op.kind = ATLAS_VERIFY_OP_EVIDENCE_PRODUCE;
+        if (st->opts.verify.claim == NULL) {
+            atlas_verify_op_free(&op);
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "usage: atlas verify produce --claim UID [--verifier V]");
+        }
+    } else if (strcmp(sub, "attest") == 0) {
+        op.kind = ATLAS_VERIFY_OP_ATTESTATION_ADD;
+        if (st->opts.verify.claim == NULL || st->opts.verify.verdict == NULL) {
+            atlas_verify_op_free(&op);
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "usage: atlas verify attest --claim UID --verdict "
+                                 "SUPPORT|CONTRADICT|INCONCLUSIVE [--evidence \"uid uid\"] "
+                                 "[--method M] [--self-confidence N] [--supersedes UID]");
+        }
+        if (!atlas_verify_verdict_parse(st->opts.verify.verdict, &op.verdict)) {
+            atlas_verify_op_free(&op);
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "--verdict is SUPPORT, CONTRADICT or INCONCLUSIVE");
+        }
+    } else if (strcmp(sub, "depend") == 0) {
+        op.kind = ATLAS_VERIFY_OP_DEPENDENCY_ADD;
+        if (st->opts.verify.evidence == NULL || st->opts.verify.derives_from == NULL) {
+            atlas_verify_op_free(&op);
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "usage: atlas verify depend --evidence UID --derives-from UID");
+        }
+    } else {
+        op.kind = ATLAS_VERIFY_OP_EVALUATE;
+        if (st->opts.verify.claim == NULL) {
+            atlas_verify_op_free(&op);
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "usage: atlas verify evaluate --claim UID [--repo R]");
+        }
+    }
+
+    /* `--path`, `--commit` and `--scope` are already spoken for by the A4 arm,
+     * so they are read from where that arm puts them rather than given a second
+     * spelling. One flag, one meaning. */
+    const char *path = st->opts.decision.path_count > 0 ? st->opts.decision.paths[0] : NULL;
+    const char *commit = st->opts.decision.commit_count > 0 ? st->opts.decision.commits[0] : NULL;
+    static const struct {
+        size_t opt_off;
+        size_t op_off;
+    } COPY[] = {
+        {offsetof(atlas_cli_opts, verify.claim), offsetof(atlas_verify_op, claim_uid)},
+        {offsetof(atlas_cli_opts, verify.text), offsetof(atlas_verify_op, text)},
+        {offsetof(atlas_cli_opts, verify.domain), offsetof(atlas_verify_op, domain)},
+        {offsetof(atlas_cli_opts, verify.decision), offsetof(atlas_verify_op, document_uid)},
+        {offsetof(atlas_cli_opts, verify.verifier), offsetof(atlas_verify_op, verifier)},
+        {offsetof(atlas_cli_opts, verify.verifier_input),
+         offsetof(atlas_verify_op, verifier_input)},
+        {offsetof(atlas_cli_opts, verify.environment), offsetof(atlas_verify_op, environment)},
+        {offsetof(atlas_cli_opts, verify.symbol), offsetof(atlas_verify_op, symbol)},
+        {offsetof(atlas_cli_opts, verify.target), offsetof(atlas_verify_op, target)},
+        {offsetof(atlas_cli_opts, verify.probe), offsetof(atlas_verify_op, probe)},
+        {offsetof(atlas_cli_opts, verify.observed), offsetof(atlas_verify_op, observed)},
+        {offsetof(atlas_cli_opts, verify.observed_at), offsetof(atlas_verify_op, observed_at)},
+        {offsetof(atlas_cli_opts, verify.method), offsetof(atlas_verify_op, method)},
+        {offsetof(atlas_cli_opts, verify.supersedes), offsetof(atlas_verify_op, supersedes_uid)},
+        {offsetof(atlas_cli_opts, verify.actor), offsetof(atlas_verify_op, actor_name)},
+        {offsetof(atlas_cli_opts, verify.provider), offsetof(atlas_verify_op, actor_provider)},
+        {offsetof(atlas_cli_opts, verify.role), offsetof(atlas_verify_op, actor_role)},
+    };
+    for (size_t i = 0; s == ATLAS_OK && i < sizeof COPY / sizeof COPY[0]; i++) {
+        const char *v = *(const char **)((char *)&st->opts + COPY[i].opt_off);
+        if (v != NULL) {
+            s = atlas_buf_set_str((atlas_buf *)((char *)&op + COPY[i].op_off), v, err);
+        }
+    }
+    /* A dependency names the derived evidence in `--evidence`; every other verb
+     * means "the evidence this attestation rests on" by the same flag. */
+    if (s == ATLAS_OK && st->opts.verify.evidence != NULL) {
+        s = atlas_buf_set_str(op.kind == ATLAS_VERIFY_OP_DEPENDENCY_ADD ? &op.derived_uid
+                                                                        : &op.evidence_uids,
+                              st->opts.verify.evidence, err);
+    }
+    if (s == ATLAS_OK && st->opts.verify.derives_from != NULL) {
+        s = atlas_buf_set_str(&op.source_uid, st->opts.verify.derives_from, err);
+    }
+    if (s == ATLAS_OK && st->opts.repo != NULL) {
+        s = atlas_buf_set_str(&op.repo_name, st->opts.repo, err);
+    }
+    if (s == ATLAS_OK && st->opts.decision.scope != NULL) {
+        s = atlas_buf_set_str(&op.scope_note, st->opts.decision.scope, err);
+    }
+    if (s == ATLAS_OK && path != NULL) {
+        s = atlas_buf_set_str(&op.path_text, path, err);
+    }
+    if (s == ATLAS_OK && commit != NULL) {
+        s = atlas_buf_set_str(op.kind == ATLAS_VERIFY_OP_EVIDENCE_ADD ? &op.commit_oid
+                                                                      : &op.basis_commit,
+                              commit, err);
+    }
+
+    atlas_verify_intake_result res;
+    atlas_verify_intake_result_init(&res);
+    if (s == ATLAS_OK) {
+        /* The test is whether this process *holds the writer lock*, not whether
+         * it has a context at all. With a daemon running, `atlas_ctx` in AUTO
+         * mode still opens — read-only — so `ctx != NULL` is true and the local
+         * write then fails with "attempt to write a readonly database". A4's
+         * predicate is the right one: apply locally when this process is the
+         * writer, and go over the socket when something else is. */
+        s = (ctx != NULL && atlas_ctx_is_writer(ctx))
+                ? atlas_verify_intake_apply(atlas_ctx_db(ctx), &op, &res, err)
+                : atlas_service_verify_intake_remote(&op, &res, err);
+    }
+    if (s == ATLAS_OK) {
+        s = renderer_open(r, st->opts.json, st->out, "verify", err);
+    }
+    if (s == ATLAS_OK) {
+        s = r->v->verify_intake(r, sub, &res, err);
+    }
+    s = s == ATLAS_OK ? renderer_close(r, err) : (renderer_abort(r), s);
+    atlas_verify_intake_result_free(&res);
+    atlas_verify_op_free(&op);
+    return s;
+}
+
 static atlas_status run_verify(cli_state *st, atlas_ctx *ctx, atlas_renderer *r, atlas_err *err) {
     if (st->operand_count == 0) {
         return atlas_err_set(err, ATLAS_ERR_USAGE,
@@ -1291,9 +1582,32 @@ static atlas_status run_verify(cli_state *st, atlas_ctx *ctx, atlas_renderer *r,
     } else if (strcmp(sub, "show") == 0) {
         if (st->operand_count != 2) {
             atlas_verify_report_free(&rep);
-            return atlas_err_set(err, ATLAS_ERR_USAGE, "usage: atlas verify show CLAIM-ID");
+            return atlas_err_set(err, ATLAS_ERR_USAGE, "usage: atlas verify show CLAIM");
         }
-        result = atlas_service_verify_show(ctx, strtoll(st->operands[1], NULL, 10), &rep, err);
+        /* A claim may be named by its uid — which is what every surface reports
+         * — or by the rowid A9.2's CLI took. A uid never parses as a number, so
+         * the two spellings cannot collide.
+         *
+         * The remote form is not a fallback: under A7.1 the index is 0700
+         * `atlasd`, so from the operator's account it is the *only* form that
+         * can answer. A9.2.1 shipped the method without this branch and the
+         * command reported "no index is available to read" about a claim the
+         * daemon was holding. */
+        char *endp = NULL;
+        long long as_id = strtoll(st->operands[1], &endp, 10);
+        bool numeric = endp != NULL && *endp == '\0' && endp != st->operands[1];
+        result = ctx != NULL
+                     ? atlas_service_verify_show_on(atlas_ctx_db(ctx), numeric ? as_id : 0,
+                                                    numeric ? NULL : st->operands[1], &rep, err)
+                     : atlas_service_verify_show_remote(numeric ? as_id : 0,
+                                                        numeric ? NULL : st->operands[1], &rep,
+                                                        err);
+    } else if (strcmp(sub, "claim") == 0 || strcmp(sub, "evidence") == 0 ||
+               strcmp(sub, "produce") == 0 || strcmp(sub, "attest") == 0 ||
+               strcmp(sub, "depend") == 0 || strcmp(sub, "evaluate") == 0) {
+        result = run_verify_intake(st, ctx, r, sub, err);
+        atlas_verify_report_free(&rep);
+        return result;
     } else if (strcmp(sub, "run") == 0) {
         if (st->operand_count != 3) {
             atlas_verify_report_free(&rep);
@@ -1303,7 +1617,9 @@ static atlas_status run_verify(cli_state *st, atlas_ctx *ctx, atlas_renderer *r,
                                           st->operands[1], &rep, err);
     } else {
         atlas_verify_report_free(&rep);
-        return atlas_err_set(err, ATLAS_ERR_USAGE, "usage: atlas verify show|run|policy");
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "usage: atlas verify claim|evidence|produce|attest|depend|evaluate|"
+                             "show|run|policy");
     }
 
     if (result == ATLAS_OK) {
@@ -1938,8 +2254,17 @@ static bool remote_serves(const cli_state *st) {
         return strcmp(sub, "check") == 0 || strcmp(sub, "show") == 0;
     }
     if (strcmp(cmd, "verify") == 0) {
+        /* A9.2.1. The six intake verbs are served too, and they have to be:
+         * under A7.1 the index is 0700 `atlasd`, so the socket is the only
+         * path by which an operator's account can record a claim at all.
+         * Being served is not being authorised — `verify.evaluate` may cause
+         * Atlas to move a lifecycle state, but the gates are in a root-owned
+         * file no peer here can read, let alone edit. */
         return strcmp(sub, "show") == 0 || strcmp(sub, "run") == 0 ||
-               strcmp(sub, "policy") == 0;
+               strcmp(sub, "policy") == 0 || strcmp(sub, "claim") == 0 ||
+               strcmp(sub, "evidence") == 0 || strcmp(sub, "produce") == 0 ||
+               strcmp(sub, "attest") == 0 || strcmp(sub, "depend") == 0 ||
+               strcmp(sub, "evaluate") == 0;
     }
     if (strcmp(cmd, "context") == 0) {
         return strcmp(sub, "build") == 0;

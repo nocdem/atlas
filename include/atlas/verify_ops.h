@@ -102,6 +102,28 @@ const char *atlas_verify_channel_name(atlas_verify_channel c);
  * could name the one that makes its evidence authentic. */
 bool atlas_verify_channel_parse(const char *name, atlas_verify_channel *out);
 
+/* How much a channel asserts, as a total order: UNKNOWN 0 < MODEL 1 <
+ * OPERATOR 2 < ATLAS 3.
+ *
+ * It exists so a transport can let a caller **weaken** its own channel and
+ * never raise it, and that asymmetry is the whole point.
+ *
+ * The peer's uid is the only thing the kernel establishes, and on an
+ * unseparated machine — or on a separated one where a person runs a model from
+ * their own account, which A7.1 explicitly permits — an MCP session speaks from
+ * the operator uid. Deriving the channel from that uid alone recorded a model's
+ * attestations as a HUMAN actor with PEER_AUTHENTICATED identity, which is the
+ * one thing §10 forbids: the transport *knows* an MCP tool call is a model
+ * speaking, and that knowledge is more specific than the uid, not less.
+ *
+ * So the MCP adapter says so, and the write point believes it only downwards.
+ * Claiming less authority than you hold is never a forgery; it is the accurate
+ * statement. Claiming more is refused by comparing ranks, and `..._parse`
+ * additionally refuses ATLAS and UNKNOWN by name — so no request can reach the
+ * channel that makes evidence authentic, whatever it sends and whatever uid it
+ * sends it from. */
+int atlas_verify_channel_authority(atlas_verify_channel c);
+
 /* The actor class and identity this channel produces. Functions rather than a
  * table each caller keeps, so the mapping has one definition and a test can ask
  * it the same question the write point asks. */

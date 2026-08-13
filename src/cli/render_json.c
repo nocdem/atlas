@@ -1476,6 +1476,71 @@ static atlas_status j_apikey_revoked(atlas_renderer *r, const char *key_id, bool
  * read it as a probability by accident. `calibrated_probability` is emitted
  * **only** when calibration supports one — absent rather than null or zero,
  * because a null invites a default and a zero is a probability of nought. */
+/* A9.2.1. What one intake operation recorded.
+ *
+ * `duplicate` is always present, never omitted when false: it is the field that
+ * says a resubmission did not become a second corroboration, and a reader of an
+ * audit trail needs it stated rather than inferred from its absence. */
+static atlas_status j_verify_intake(atlas_renderer *r, const char *verb,
+                                    const atlas_verify_intake_result *res, atlas_err *err) {
+    atlas_json *j = r->j;
+    TRY(atlas_json_key(j, "verification", err));
+    TRY(atlas_json_obj_begin(j, err));
+    TRY(atlas_json_key_str(j, "operation", verb, err));
+    TRY(atlas_json_key_str(j, "uid", atlas_buf_cstr(&res->uid), err));
+    if (res->actor_uid.len > 0) {
+        TRY(atlas_json_key_str(j, "actor", atlas_buf_cstr(&res->actor_uid), err));
+    }
+    if (res->claim_id > 0) {
+        TRY(atlas_json_key_int(j, "claim_id", res->claim_id, err));
+    }
+    if (res->evidence_id > 0) {
+        TRY(atlas_json_key_int(j, "evidence_id", res->evidence_id, err));
+    }
+    if (res->attestation_id > 0) {
+        TRY(atlas_json_key_int(j, "attestation_id", res->attestation_id, err));
+    }
+    TRY(atlas_json_key_bool(j, "duplicate", res->duplicate, err));
+    if (strcmp(verb, "produce") == 0) {
+        /* Atlas' own vocabulary and Atlas' own sentence; neither carries a
+         * repository byte, so neither is encoded. */
+        TRY(atlas_json_key_str(j, "check", atlas_verify_check_name(res->check), err));
+        if (res->verified_scope[0] != '\0') {
+            TRY(atlas_json_key_str(j, "verified_scope", res->verified_scope, err));
+        }
+        if (res->detail[0] != '\0') {
+            TRY(atlas_json_key_str(j, "detail", res->detail, err));
+        }
+    }
+    if (strcmp(verb, "evaluate") == 0) {
+        const atlas_verify_assessment *a = &res->assessment;
+        /* The three axes, in three separate fields. Never one badge. */
+        TRY(atlas_json_key_str(j, "kind", atlas_decision_kind_name(a->kind), err));
+        TRY(atlas_json_key_str(j, "status", atlas_decision_state_name(a->from), err));
+        TRY(atlas_json_key_str(j, "state", atlas_verify_state_name(a->aggregate.state), err));
+        TRY(atlas_json_key_str(j, "basis", atlas_verify_basis_name(a->basis), err));
+        TRY(atlas_json_key_int(j, "confidence_score", a->aggregate.confidence, err));
+        TRY(atlas_json_key_str(j, "calibration",
+                               atlas_verify_calibration_name(a->aggregate.calibration), err));
+        /* Emitted only when calibration supports it. Absent, never null and
+         * never zero: zero is a probability. */
+        if (a->aggregate.calibrated_probability >= 0) {
+            TRY(atlas_json_key_int(j, "calibrated_probability",
+                                   a->aggregate.calibrated_probability, err));
+        }
+        TRY(atlas_json_key_int(j, "independent_groups", a->aggregate.independent_groups, err));
+        TRY(atlas_json_key_str(j, "policy_verdict",
+                               atlas_verify_policy_verdict_name(a->aggregate.verdict), err));
+        TRY(atlas_json_key_bool(j, "source_drift", a->source_drift, err));
+        TRY(atlas_json_key_bool(j, "actionable", a->actionable, err));
+        TRY(atlas_json_key_bool(j, "transitioned", a->transitioned, err));
+        if (a->transitioned) {
+            TRY(atlas_json_key_str(j, "actor_of_record", "VERIFICATION_POLICY", err));
+        }
+    }
+    return atlas_json_obj_end(j, err);
+}
+
 static atlas_status j_verify(atlas_renderer *r, const atlas_verify_report *rep, atlas_err *err) {
     atlas_json *j = r->j;
     const atlas_verify_assessment *a = &rep->assessment;
@@ -1560,6 +1625,9 @@ static atlas_status j_verify(atlas_renderer *r, const atlas_verify_report *rep, 
     }
     TRY(atlas_json_key_int(j, "result_id", a->result_id, err));
     TRY(atlas_json_key_int(j, "audit_id", a->audit_id, err));
+    /* The evidence behind the number, from the one writer every surface uses.
+     * A score whose evidence a reader cannot see is a score taken on trust. */
+    TRY(atlas_service_verify_write_detail(j, &r->safe, &rep->detail, err));
     return atlas_json_obj_end(j, err);
 }
 
@@ -1957,6 +2025,7 @@ const atlas_renderer_vtbl ATLAS_RENDERER_JSON = {
     j_gate,
     /* --- A9.2 --- */
     j_verify,
+    j_verify_intake,
     /* --- A9 --- */
     j_apikey_created, j_apikey_listed, j_apikey_revoked,
 };

@@ -1662,6 +1662,117 @@ static atlas_status h_verify(atlas_renderer *r, const atlas_verify_report *rep, 
         (void)fprintf(o, "  This records which policy acted. It does not say the record is "
                          "true, and it does not say a person agreed.\n");
     }
+
+    /* The evidence behind the number. A confidence score printed alone is a
+     * number to be taken on trust, which is the opposite of what recording
+     * evidence is for.
+     *
+     * Two columns here are the ones that must never be collapsed. Evidence
+     * prints its class *and* its producer identity, because AI_ANALYSIS from a
+     * SELF_DECLARED actor and COMPILER evidence that is ATLAS_ATTESTED are
+     * entirely different things. Attestations print the actor *and* the group,
+     * because two actors in one group corroborate each other not at all — and
+     * reading an actor count as an evidence count is the error this whole
+     * season exists to prevent. */
+    const atlas_verify_detail *d = &rep->detail;
+    if (d->evidence_count > 0) {
+        (void)fprintf(o, "\nevidence:     %zu\n", d->evidence_total);
+        for (size_t i = 0; i < d->evidence_count; i++) {
+            const atlas_verify_evidence_detail *e = &d->evidence[i];
+            (void)fprintf(o, "  %s  %s  by %s/%s%s\n", atlas_buf_cstr(&e->uid),
+                          atlas_verify_evidence_class_name(e->cls),
+                          atlas_verify_actor_class_name(e->producer_class),
+                          atlas_verify_actor_identity_name(e->producer_identity),
+                          e->stale ? "  [stale]" : "");
+            if (e->path_text.len > 0) {
+                (void)fprintf(o, "    path (untrusted project text): %s\n",
+                              atlas_buf_cstr(&e->path_text));
+            }
+            if (e->observed.len > 0) {
+                (void)fprintf(o, "    observed (untrusted project text): %s\n",
+                              atlas_buf_cstr(&e->observed));
+            }
+        }
+    }
+    if (d->attestation_count > 0) {
+        (void)fprintf(o, "\nattestations: %zu in %d independent evidence group%s\n",
+                      d->attestation_total, a->aggregate.independent_groups,
+                      a->aggregate.independent_groups == 1 ? "" : "s");
+        for (size_t i = 0; i < d->attestation_count; i++) {
+            const atlas_verify_attestation_detail *t = &d->attestations[i];
+            (void)fprintf(o, "  %s  %s  %s/%s%s", atlas_buf_cstr(&t->uid),
+                          atlas_verify_verdict_name(t->verdict),
+                          atlas_verify_actor_class_name(t->actor_class),
+                          atlas_verify_actor_identity_name(t->actor_identity),
+                          t->superseded ? "  [superseded]" : "");
+            if (t->group >= 0) {
+                (void)fprintf(o, "  group %d", t->group);
+            }
+            (void)fprintf(o, "\n");
+            if (t->actor_name.len > 0) {
+                (void)fprintf(o, "    actor (untrusted, as asserted): %s\n",
+                              atlas_buf_cstr(&t->actor_name));
+            }
+        }
+    }
+    if (d->limit_reached) {
+        (void)fprintf(o, "  (the lists above are bounded and were cut short)\n");
+    }
+    return ATLAS_OK;
+}
+
+/* A9.2.1. What one intake operation recorded.
+ *
+ * `duplicate` is printed whenever it is true and says so plainly: a caller that
+ * retried needs to know it resolved to the row it already had, and a reader of
+ * the trail needs to know a repeated submission did not become a second
+ * corroboration. */
+static atlas_status h_verify_intake(atlas_renderer *r, const char *verb,
+                                    const atlas_verify_intake_result *res, atlas_err *err) {
+    (void)err;
+    FILE *o = r->out;
+    (void)fprintf(o, "%s: %s%s\n", verb, atlas_buf_cstr(&res->uid),
+                  res->duplicate ? "  (already recorded; not a second corroboration)" : "");
+    if (res->actor_uid.len > 0) {
+        (void)fprintf(o, "  actor:      %s\n", atlas_buf_cstr(&res->actor_uid));
+    }
+    if (strcmp(verb, "produce") == 0) {
+        (void)fprintf(o, "  check:      %s\n", atlas_verify_check_name(res->check));
+        if (res->verified_scope[0] != '\0') {
+            (void)fprintf(o, "  scope:      %s\n", res->verified_scope);
+        }
+        if (res->detail[0] != '\0') {
+            (void)fprintf(o, "  detail:     %s\n", res->detail);
+        }
+    }
+    if (strcmp(verb, "evaluate") == 0) {
+        const atlas_verify_assessment *a = &res->assessment;
+        (void)fprintf(o, "  state:      %s\n", atlas_verify_state_name(a->aggregate.state));
+        (void)fprintf(o, "  basis:      %s\n", atlas_verify_basis_name(a->basis));
+        /* Out of 100, never with a percent sign. */
+        (void)fprintf(o, "  confidence: %d/100 (score, not a probability)\n",
+                      a->aggregate.confidence);
+        (void)fprintf(o, "  calibration:%s\n",
+                      atlas_verify_calibration_name(a->aggregate.calibration));
+        if (a->aggregate.calibration == ATLAS_CALIBRATION_CALIBRATED &&
+            a->aggregate.calibrated_probability >= 0) {
+            (void)fprintf(o, "  probability:%d%%\n", a->aggregate.calibrated_probability);
+        }
+        (void)fprintf(o, "  groups:     %d independent\n", a->aggregate.independent_groups);
+        (void)fprintf(o, "  policy:     %s\n",
+                      atlas_verify_policy_verdict_name(a->aggregate.verdict));
+        if (a->source_drift) {
+            (void)fprintf(o, "  SOURCE_DRIFT: the repository left the tree this claim was bound "
+                             "to; the result describes %s, not the current HEAD\n",
+                          a->claim_commit);
+        }
+        if (a->transitioned) {
+            (void)fprintf(o, "  transition: %s -> %s, recorded as VERIFICATION_POLICY\n",
+                          atlas_decision_state_name(a->from), atlas_decision_state_name(a->to));
+            (void)fprintf(o, "  This records which policy acted. It does not say the record is "
+                             "true, and it does not say a person agreed.\n");
+        }
+    }
     return ATLAS_OK;
 }
 
@@ -2091,6 +2202,7 @@ const atlas_renderer_vtbl ATLAS_RENDERER_HUMAN = {
     h_gate,
     /* --- A9.2 --- */
     h_verify,
+    h_verify_intake,
     /* --- A9 --- */
     h_apikey_created, h_apikey_listed, h_apikey_revoked,
 };

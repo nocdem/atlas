@@ -215,6 +215,17 @@ typedef struct atlas_renderer_vtbl {
      * labelled untrusted exactly as A4's decision renderers label theirs.
      * Verification changes a status, never the nature of bytes. */
     atlas_status (*verify)(atlas_renderer *r, const atlas_verify_report *rep, atlas_err *err);
+    /* A9.2.1. What one intake operation recorded: the uid Atlas minted, the
+     * actor it resolved the speaker to, and whether the submission was a
+     * duplicate of one already held.
+     *
+     * `duplicate` is reported rather than silent because a retry must not read
+     * as a second corroboration — to the caller, and more importantly to
+     * whoever later reads the trail. `verb` names which operation ran, so one
+     * renderer serves all six rather than six near-identical ones drifting
+     * apart. EVALUATE additionally carries an assessment. */
+    atlas_status (*verify_intake)(atlas_renderer *r, const char *verb,
+                                  const atlas_verify_intake_result *res, atlas_err *err);
 
     /* --- A9: remote credentials -------------------------------------------
      *

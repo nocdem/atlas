@@ -103,6 +103,7 @@ typedef enum atlas_verifypolicy_state {
 } atlas_verifypolicy_state;
 
 const char *atlas_verifypolicy_state_name(atlas_verifypolicy_state s);
+bool atlas_verifypolicy_state_parse(const char *name, atlas_verifypolicy_state *out);
 
 typedef enum atlas_verifypolicy_reason {
     ATLAS_VERIFYPOLICY_REASON_UNKNOWN = 0,
@@ -115,6 +116,7 @@ typedef enum atlas_verifypolicy_reason {
 } atlas_verifypolicy_reason;
 
 const char *atlas_verifypolicy_reason_name(atlas_verifypolicy_reason r);
+bool atlas_verifypolicy_reason_parse(const char *name, atlas_verifypolicy_reason *out);
 const char *atlas_verifypolicy_reason_detail(atlas_verifypolicy_reason r);
 
 /* One transition this policy permits Atlas to make on its own.

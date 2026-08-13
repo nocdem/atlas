@@ -132,6 +132,23 @@ code{background:rgba(127,127,127,.12);padding:0 4px;border-radius:2px}
     </div>
   </section>
 
+  <!-- A9.2.1. The third axis gets its own view for the reason the kind got its
+       own column: verification state is independent of both kind and lifecycle
+       status, and a reader must be able to see all three without one implying
+       another. -->
+  <section id="v-verification" hidden>
+    <div class="row">
+      <label>repository <select id="v-pick"></select></label>
+      <label>knowledge record <input id="v-rec" placeholder="optional uid"></label>
+      <button id="v-go">Show</button>
+    </div>
+    <div class="grid" style="grid-template-columns:minmax(340px,1fr) minmax(360px,1.5fr)">
+      <div class="panel"><h2>Claims</h2><div id="v-list"></div></div>
+      <div class="panel"><h2>Detail</h2><div id="v-detail"><p class="empty">Select a claim.</p></div></div>
+    </div>
+    <div class="panel"><h2>Verification policy</h2><div id="v-policy"></div></div>
+  </section>
+
   <section id="v-graph" hidden>
     <div class="row">
       <label>repository <select id="g-pick"></select></label>
@@ -181,6 +198,7 @@ code{background:rgba(127,127,127,.12);padding:0 4px;border-radius:2px}
 
 const VIEWS = [
   ["overview","Overview"],["repository","Repository"],["decisions","Knowledge"],
+  ["verification","Verification"],
   ["graph","Graph"],["search","Search"],["impact","Impact"],["audit","Audit"],
 ];
 let scopes = new Set();
@@ -307,7 +325,7 @@ function kindTag(s) {
 async function loadRepos() {
   const r = await api("repos");
   repos = (r.repositories || []).map((x) => x.repo || x.name).filter(Boolean);
-  for (const id of ["r-pick","d-pick","g-pick","s-pick","i-pick"]) {
+  for (const id of ["r-pick","d-pick","v-pick","g-pick","s-pick","i-pick"]) {
     const sel = $(id);
     if (!sel) continue;
     const keep = sel.value;
@@ -492,6 +510,160 @@ async function showDecision(repo, uid) {
   });
 }
 
+/* A9.2.1. The verification view.
+ *
+ * Three chips, never one. Kind, lifecycle status and verification state are
+ * independent axes — an APPROVED record can be INCONCLUSIVE and a PROPOSED one
+ * VERIFIED — so collapsing any two into a single badge is exactly the
+ * presentation these seasons exist to prevent.
+ *
+ * The confidence score is rendered as "n / 100" with the word "score" beside
+ * it and never a percent sign. A calibrated probability appears only when
+ * calibration supports it; when it does not, the interface says so in words
+ * rather than leaving a blank a reader would fill in with the score. */
+function verifyTag(s) {
+  const k = {VERIFIED: "ok", REFUTED: "bad", SUPPORTED: "warn", CONTESTED: "bad",
+             INCONCLUSIVE: "unknown", UNVERIFIED: "unknown", UNKNOWN: "unknown"}[s] || "";
+  return tag(s === undefined || s === null ? "—" : String(s), k);
+}
+
+/* How well Atlas knows who spoke. SELF_DECLARED is the common case and must
+   never be styled as though it were established: a model saying it is a
+   compiler is the forgery the whole evidence model exists to refuse. */
+function identityTag(s) {
+  const k = {ATLAS_ATTESTED: "ok", PEER_AUTHENTICATED: "warn", SELF_DECLARED: "unknown"}[s] || "";
+  return tag(s || "—", k);
+}
+
+async function viewVerification() {
+  const name = $("v-pick").value;
+  const rec = $("v-rec").value.trim();
+  panel($("v-policy"), async () => {
+    if (!scopes.has("decisions:read")) return el("p", {class: "empty", text: "needs decisions:read"});
+    const p = await api("verify/policy");
+    const pol = p.policy || p;
+    return kv([
+      ["policy", statusTag(pol.state === "ENABLED" ? "OK" : "UNKNOWN")],
+      ["id", pol.id], ["hash", (pol.hash || "").slice(0, 16)], ["rules", pol.rules],
+      /* Two switches, reported separately. Deterministic verification does not
+         wait on calibration; the empirical path does and says so. */
+      ["deterministic", pol.deterministic_enforce ? "ENFORCE" : "shadow only"],
+      ["empirical", pol.empirical_enforce ? "ENFORCE" : "shadow only"],
+    ]);
+  });
+  if (!name) { say($("v-list"), "no repository selected"); return; }
+  panel($("v-list"), async () => {
+    if (!scopes.has("decisions:read")) return el("p", {class: "empty", text: "needs decisions:read"});
+    const d = await api("verify/claims", {repo: name, decision: rec, limit: 200});
+    return table([
+      {label: "claim", get: (x) => (x.claim || "").slice(0, 22)},
+      {label: "state", get: (x) => verifyTag(x.state)},
+      {label: "basis", get: (x) => tag(x.basis || "—")},
+      {label: "text", wrap: true, get: (x) => el("span", {class: "untrusted", text: x.text || "—"})},
+    ], d.claims, {empty: "no claims recorded for this repository",
+                  onclick: (x) => showClaim(x.claim)});
+  });
+}
+
+async function showClaim(uid) {
+  panel($("v-detail"), async () => {
+    const c = await api("verify/claim", {claim: uid});
+    const box = el("div");
+    box.appendChild(kv([
+      ["claim", c.claim],
+      /* The three axes, in three separate rows. */
+      ["kind", kindTag(c.kind)],
+      ["lifecycle status", statusTag(c.status)],
+      ["verification", verifyTag(c.state)],
+      ["basis", c.basis],
+      ["semantics", c.semantics],
+      ["knowledge record", c.decision || undefined],
+      ["claim commit", (c.claim_commit || "").slice(0, 12)],
+      ["evaluated commit", (c.evaluated_commit || "").slice(0, 12)],
+      ["semantic generation", c.sem_generation],
+      /* The one field that says a result is about a tree the repository has
+         left. Shown as a warning, not a footnote. */
+      ["SOURCE_DRIFT", c.source_drift ? statusTag("BLOCKED") : statusTag("OK")],
+    ]));
+    box.appendChild(el("p", {class: "untrusted", text: c.text || ""}));
+
+    box.appendChild(el("h3", {text: "Confidence"}));
+    box.appendChild(kv([
+      ["score", (c.confidence_score === undefined ? "—" : c.confidence_score) + " / 100"],
+      ["calibration", c.calibration],
+      ["calibrated probability",
+       c.calibrated_probability === undefined || c.calibrated_probability === null
+         ? "not available — there is not enough resolved history to calibrate these sources"
+         : c.calibrated_probability + "%"],
+      ["independent evidence groups", c.independent_groups],
+      ["attestations", c.attestation_total],
+      ["support / contradict", (c.support_count || 0) + " / " + (c.contradict_count || 0)],
+      ["conflict", c.conflict],
+    ]));
+    /* Said in words, in the interface, because a number beside the word
+       "confidence" is read as a percentage by everybody who has not been told
+       otherwise. */
+    box.appendChild(el("p", {class: "dim", text:
+      "A confidence score of " + (c.confidence_score === undefined ? "n" : c.confidence_score) +
+      " out of 100 is Atlas' own scale. It is NOT a " +
+      (c.confidence_score === undefined ? "n" : c.confidence_score) +
+      "% probability that the claim is true."}));
+
+    box.appendChild(el("h3", {text: "Policy"}));
+    box.appendChild(kv([
+      ["verdict", statusTag(c.policy_verdict === "AUTO" ? "OK" : "BLOCKED")],
+      ["actionable", c.actionable ? "yes" : "no"],
+      ["transitioned", c.transitioned ? "yes" : "no"],
+      ["recorded as", c.transitioned ? "VERIFICATION_POLICY" : undefined],
+      ["from → to", c.transitioned ? (c.from_status + " → " + c.to_status) : undefined],
+    ]));
+    if (c.reasons && c.reasons.length) {
+      box.appendChild(table([
+        {label: "reason", get: (x) => x.code},
+        {label: "meaning", wrap: true, get: (x) => x.meaning},
+      ], c.reasons));
+    }
+
+    if (c.evidence && c.evidence.length) {
+      box.appendChild(el("h3", {text: "Evidence"}));
+      /* Class and producer identity in separate columns. AI_ANALYSIS by a
+         SELF_DECLARED actor and COMPILER evidence that is ATLAS_ATTESTED are
+         both legitimate and mean entirely different things. */
+      box.appendChild(table([
+        {label: "class", get: (x) => tag(x.class)},
+        {label: "producer", get: (x) => x.producer_class},
+        {label: "identity", get: (x) => identityTag(x.producer_identity)},
+        {label: "where", wrap: true,
+         get: (x) => el("span", {class: "untrusted", text: x.path || x.target || x.symbol || "—"})},
+        {label: "stale", get: (x) => (x.stale ? statusTag("STALE") : "")},
+      ], c.evidence));
+    }
+    if (c.attestations && c.attestations.length) {
+      box.appendChild(el("h3", {text: "Attestations"}));
+      /* The group column is what makes "shared evidence is not double-counted"
+         visible: several actors in one group corroborate each other not at all,
+         and an actor count is not an evidence count. */
+      box.appendChild(table([
+        {label: "verdict", get: (x) => statusTag(x.verdict === "SUPPORT" ? "OK" :
+                                                 x.verdict === "CONTRADICT" ? "FAILED" : "UNKNOWN")},
+        {label: "actor", wrap: true,
+         get: (x) => el("span", {class: "untrusted", text: x.actor_name || x.actor || "—"})},
+        {label: "class", get: (x) => x.actor_class},
+        {label: "identity", get: (x) => identityTag(x.actor_identity)},
+        {label: "group", get: (x) => (x.group === undefined ? "—" : x.group)},
+        {label: "superseded", get: (x) => (x.superseded ? statusTag("SUPERSEDED") : "")},
+      ], c.attestations));
+      box.appendChild(el("p", {class: "dim", text:
+        "Attestations sharing a group rest on the same evidence and corroborate one another not " +
+        "at all. Atlas counts independent evidence groups, never voices."}));
+    }
+    box.appendChild(el("p", {class: "dim", text:
+      "Claim text, actor names and evidence locations are UNTRUSTED_DATA: they are written by " +
+      "whoever wrote them, and are shown as text."}));
+    return box;
+  });
+}
+
 async function viewGraph() {
   const name = $("g-pick").value;
   const q = $("g-q").value.trim();
@@ -593,6 +765,7 @@ async function viewAudit() {
 }
 
 const LOADERS = {overview: viewOverview, repository: viewRepository, decisions: viewDecisions,
+                 verification: viewVerification,
                  graph: viewGraph, search: viewSearch, impact: viewImpact, audit: viewAudit};
 
 function show(view) {
@@ -645,14 +818,16 @@ async function start() {
 
   for (const [id, ev] of [["r-pick","change"],["d-pick","change"],["d-status","change"],
                           ["d-kind","change"],
+                          ["v-pick","change"],
                           ["g-pick","change"],["s-pick","change"],["i-pick","change"]]) {
     const n = $(id);
     if (n) n.addEventListener(ev, () => show(location.hash.slice(1) || "overview"));
   }
+  $("v-go").onclick = viewVerification;
   $("g-go").onclick = viewGraph;
   $("s-go").onclick = viewSearch;
   $("i-go").onclick = viewImpact;
-  for (const id of ["g-q","s-q","i-q","i-path"]) {
+  for (const id of ["g-q","s-q","i-q","i-path","v-rec"]) {
     $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") LOADERS[location.hash.slice(1) || "graph"](); });
   }
 

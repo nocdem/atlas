@@ -825,6 +825,27 @@ static const api_route API_ROUTES[] = {
      {"repo", "path", "depth", NULL}, {"depth", NULL}},
     {"/api/v1/context", "sem.context", ATLAS_SCOPE_CONTEXT_READ,
      {"repo", "task", "max_tokens", NULL}, {"max_tokens", NULL}},
+    /* A9.2.1. The verification workflow, read-only and no more.
+     *
+     * Three routes, all reads, and the absence of a fourth is the point: there
+     * is no remote route that creates a claim, cites evidence, attests, or asks
+     * for an evaluation. A9's rule says a mutating route "needs a write scope no
+     * A9 credential can hold, which is the argument it has to survive" — and
+     * intake has not survived it. `verify.evaluate` can cause Atlas to move a
+     * lifecycle state, and putting that behind an Internet-facing credential
+     * would mean a leaked bearer token could drive the one path in Atlas that
+     * transitions a record without a person. A local model reaches intake
+     * through MCP over a Unix socket, where the peer uid is a kernel fact; that
+     * is a different trust position and it is the one intake requires.
+     *
+     * DECISIONS_READ rather than a scope of its own: a claim is evidence about
+     * a knowledge record, and a credential trusted to read the records is
+     * trusted to read what bears on them. */
+    {"/api/v1/verify/claims", "verify.claims", ATLAS_SCOPE_DECISIONS_READ,
+     {"repo", "decision", "limit", NULL}, {"limit", NULL}},
+    {"/api/v1/verify/claim", "verify.show", ATLAS_SCOPE_DECISIONS_READ,
+     {"claim", "claim_id", NULL}, {"claim_id", NULL}},
+    {"/api/v1/verify/policy", "verify.policy", ATLAS_SCOPE_DECISIONS_READ, {NULL}, {NULL}},
     {"/api/v1/audit", "gateway.audit_list", ATLAS_SCOPE_AUDIT_READ,
      {"limit", "cursor", "key_id", NULL}, {"limit", "cursor", NULL}},
 };

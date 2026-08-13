@@ -48,30 +48,57 @@
 
 /* --- the channel -----------------------------------------------------------
  *
- * **The one thing in this file that must never come from the request body.**
+ * **Nothing in the request body may raise what this returns.**
  *
  * A peer whose uid the root-owned policy names as the operator speaks on the
- * OPERATOR channel; every other peer speaks on MODEL. There is no parameter
- * that selects it, `atlas_verify_channel_parse` refuses the ATLAS name, and the
- * kernel is what answers the question — A7.1's rule that a client describing
- * itself is not evidence about itself, which is the whole reason an attestation
- * from a model cannot become tool evidence.
+ * OPERATOR channel; every other peer speaks on MODEL. That is A7.1's rule that
+ * a client describing itself is not evidence about itself, and it is the whole
+ * reason an attestation from a model cannot become tool evidence.
  *
  * PEER_AUTHENTICATED, which the operator channel produces, is a claim about the
  * *uid* and not about a person. A7.1's honesty limits hold word for word: a
  * model with a shell as that account reaches this channel exactly as a human
- * does. What the distinction asserts is only that the caller was not anonymous. */
-static atlas_verify_channel channel_for(dispatch_state *ds) {
-    return atlas_server_peer_is_operator((long long)ds->peer_uid) ? ATLAS_VERIFY_CHANNEL_OPERATOR
-                                                                  : ATLAS_VERIFY_CHANNEL_MODEL;
+ * does. What the distinction asserts is only that the caller was not anonymous.
+ *
+ * A9.2.1 closeout: the uid is the *ceiling*, not the answer.
+ *
+ * Deriving the channel from `SO_PEERCRED` alone was right about forgery and
+ * wrong about the ordinary case. A7.1 permits a person to run a model from
+ * their own account, and on an unseparated machine there is no other account to
+ * run it from — so a local MCP session speaks from the operator uid, and every
+ * attestation a model made was stored as a HUMAN actor with PEER_AUTHENTICATED
+ * identity. That is the forged-human row §21 exists to make impossible, minted
+ * by Atlas itself rather than by an attacker.
+ *
+ * The transport knows something the kernel does not: an MCP tool call is a
+ * model speaking, whatever uid carried it. So a request may name its channel,
+ * and the name is honoured **only when it asserts less** than the uid would.
+ * `..._parse` refuses ATLAS and UNKNOWN outright, and the rank comparison
+ * refuses every raise, so the two failure directions are closed by different
+ * mechanisms: a caller cannot become Atlas by naming it, and cannot become the
+ * operator by out-ranking the kernel. Claiming less is not a forgery — it is
+ * the accurate statement, and the only one a model is entitled to make. */
+static atlas_verify_channel channel_for(dispatch_state *ds, const atlas_ipc_request *req) {
+    atlas_verify_channel peer = atlas_server_peer_is_operator((long long)ds->peer_uid)
+                                    ? ATLAS_VERIFY_CHANNEL_OPERATOR
+                                    : ATLAS_VERIFY_CHANNEL_MODEL;
+    const char *asked = NULL;
+    atlas_verify_channel want = ATLAS_VERIFY_CHANNEL_UNKNOWN;
+    if (atlas_ipc_param_str(req, "speaking_for", &asked) && asked != NULL &&
+        atlas_verify_channel_parse(asked, &want) &&
+        atlas_verify_channel_authority(want) < atlas_verify_channel_authority(peer)) {
+        return want;
+    }
+    return peer;
 }
 
-static atlas_verify_op *op_new(atlas_verify_op_kind kind, dispatch_state *ds) {
+static atlas_verify_op *op_new(atlas_verify_op_kind kind, dispatch_state *ds,
+                               const atlas_ipc_request *req) {
     atlas_verify_op *op = calloc(1u, sizeof(*op));
     if (op != NULL) {
         atlas_verify_op_init(op);
         op->kind = kind;
-        op->channel = channel_for(ds);
+        op->channel = channel_for(ds, req);
     }
     return op;
 }
@@ -162,7 +189,7 @@ static atlas_status write_result(dispatch_state *ds, const atlas_verify_intake_r
 
 static atlas_status method_claim_create(dispatch_state *ds, const atlas_ipc_request *req,
                                         atlas_err *err) {
-    atlas_verify_op *op = op_new(ATLAS_VERIFY_OP_CLAIM_CREATE, ds);
+    atlas_verify_op *op = op_new(ATLAS_VERIFY_OP_CLAIM_CREATE, ds, req);
     if (op == NULL) {
         return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory");
     }
@@ -219,7 +246,7 @@ static atlas_status method_claim_create(dispatch_state *ds, const atlas_ipc_requ
 
 static atlas_status method_evidence_add(dispatch_state *ds, const atlas_ipc_request *req,
                                         atlas_err *err) {
-    atlas_verify_op *op = op_new(ATLAS_VERIFY_OP_EVIDENCE_ADD, ds);
+    atlas_verify_op *op = op_new(ATLAS_VERIFY_OP_EVIDENCE_ADD, ds, req);
     if (op == NULL) {
         return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory");
     }
@@ -279,7 +306,7 @@ static atlas_status method_evidence_add(dispatch_state *ds, const atlas_ipc_requ
  * concluded is whatever it concluded. */
 static atlas_status method_evidence_produce(dispatch_state *ds, const atlas_ipc_request *req,
                                             atlas_err *err) {
-    atlas_verify_op *op = op_new(ATLAS_VERIFY_OP_EVIDENCE_PRODUCE, ds);
+    atlas_verify_op *op = op_new(ATLAS_VERIFY_OP_EVIDENCE_PRODUCE, ds, req);
     if (op == NULL) {
         return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory");
     }
@@ -315,7 +342,7 @@ static atlas_status method_evidence_produce(dispatch_state *ds, const atlas_ipc_
 
 static atlas_status method_attestation_add(dispatch_state *ds, const atlas_ipc_request *req,
                                            atlas_err *err) {
-    atlas_verify_op *op = op_new(ATLAS_VERIFY_OP_ATTESTATION_ADD, ds);
+    atlas_verify_op *op = op_new(ATLAS_VERIFY_OP_ATTESTATION_ADD, ds, req);
     if (op == NULL) {
         return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory");
     }
@@ -374,7 +401,7 @@ static atlas_status method_attestation_add(dispatch_state *ds, const atlas_ipc_r
 
 static atlas_status method_dependency_add(dispatch_state *ds, const atlas_ipc_request *req,
                                           atlas_err *err) {
-    atlas_verify_op *op = op_new(ATLAS_VERIFY_OP_DEPENDENCY_ADD, ds);
+    atlas_verify_op *op = op_new(ATLAS_VERIFY_OP_DEPENDENCY_ADD, ds, req);
     if (op == NULL) {
         return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory");
     }
@@ -406,7 +433,7 @@ static atlas_status method_dependency_add(dispatch_state *ds, const atlas_ipc_re
 
 static atlas_status method_evaluate(dispatch_state *ds, const atlas_ipc_request *req,
                                     atlas_err *err) {
-    atlas_verify_op *op = op_new(ATLAS_VERIFY_OP_EVALUATE, ds);
+    atlas_verify_op *op = op_new(ATLAS_VERIFY_OP_EVALUATE, ds, req);
     if (op == NULL) {
         return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory");
     }

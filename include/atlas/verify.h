@@ -511,6 +511,7 @@ typedef enum atlas_verify_policy_verdict {
 } atlas_verify_policy_verdict;
 
 const char *atlas_verify_policy_verdict_name(atlas_verify_policy_verdict v);
+bool atlas_verify_policy_verdict_parse(const char *name, atlas_verify_policy_verdict *out);
 
 /* Why the policy engine said what it said. One closed vocabulary, so an
  * explanation is machine-readable rather than a sentence somebody wrote.
@@ -571,6 +572,7 @@ typedef enum atlas_verify_reason {
 } atlas_verify_reason;
 
 const char *atlas_verify_reason_name(atlas_verify_reason r);
+bool atlas_verify_reason_parse(const char *name, atlas_verify_reason *out);
 /* One fixed Atlas-owned sentence per reason. No repository byte and no model
  * byte reaches it, which is why it may be reported to a model unencoded. */
 const char *atlas_verify_reason_description(atlas_verify_reason r);
@@ -1036,6 +1038,7 @@ typedef enum atlas_verify_check {
 } atlas_verify_check;
 
 const char *atlas_verify_check_name(atlas_verify_check c);
+bool atlas_verify_check_parse(const char *name, atlas_verify_check *out);
 
 /* Runs one deterministic verifier over one claim's bounded input.
  *
@@ -1196,6 +1199,97 @@ typedef struct atlas_verify_inputs {
 } atlas_verify_inputs;
 
 void atlas_verify_inputs_free(atlas_verify_inputs *in);
+
+/* --- A9.2.1 closeout: the detail every product surface reads ---------------
+ *
+ * `atlas_verify_input` is aggregation-shaped: it carries what the algorithm
+ * needs to weigh an attestation and nothing a person could read. That is right
+ * for the algorithm and useless for a reader, and a verification system whose
+ * answer is a number with no visible evidence behind it is one nobody can check
+ * — which defeats the point of recording evidence at all.
+ *
+ * These rows are the readable half. They are **display detail, never inputs**:
+ * nothing here is fed back into a verdict, so a field being wrong misleads a
+ * reader without changing a score. Every field a repository or a model chose is
+ * UNTRUSTED_DATA and is safe-encoded at the surface that renders it.
+ *
+ * The two identity columns are the ones that matter and are deliberately
+ * separate: `producer_class`/`actor_class` say *what sort of thing* spoke, and
+ * `producer_identity`/`actor_identity` say *how well Atlas knows it* —
+ * SELF_DECLARED, PEER_AUTHENTICATED or ATLAS_ATTESTED. A UI that prints the
+ * first without the second is telling somebody a model is a compiler. */
+typedef struct atlas_verify_evidence_detail {
+    atlas_buf uid;
+    atlas_buf producer_uid;
+    atlas_buf producer_name; /* UNTRUSTED_DATA */
+    atlas_buf commit_oid;
+    atlas_buf path_text;
+    atlas_buf symbol;
+    atlas_buf target;    /* UNTRUSTED_DATA */
+    atlas_buf observed;  /* UNTRUSTED_DATA */
+    atlas_buf observed_at;
+    atlas_buf tool;
+    atlas_buf proof_class;
+    atlas_verify_evidence_class cls;
+    atlas_verify_evidence_family family;
+    atlas_verify_actor_class producer_class;
+    atlas_verify_actor_identity producer_identity;
+    int64_t id;
+    int64_t line_start;
+    int64_t line_end;
+    /* Older than the policy's evidence horizon. Marked rather than dropped:
+     * §47 keeps the historical record and lets only its current weight fall. */
+    bool stale;
+} atlas_verify_evidence_detail;
+
+typedef struct atlas_verify_attestation_detail {
+    atlas_buf uid;
+    atlas_buf actor_uid;
+    atlas_buf actor_name;     /* UNTRUSTED_DATA */
+    atlas_buf actor_provider; /* UNTRUSTED_DATA */
+    atlas_buf actor_family;   /* UNTRUSTED_DATA */
+    atlas_buf actor_version;  /* UNTRUSTED_DATA */
+    atlas_buf actor_role;     /* UNTRUSTED_DATA */
+    atlas_buf method;         /* UNTRUSTED_DATA */
+    atlas_buf scope_note;     /* UNTRUSTED_DATA */
+    atlas_buf basis_commit;
+    atlas_verify_actor_class actor_class;
+    atlas_verify_actor_identity actor_identity;
+    atlas_verify_verdict verdict;
+    int64_t id;
+    /* The actor's own number, 0..100, or -1 when it did not give one. Data
+     * about the source; never Atlas' confidence. */
+    int self_confidence;
+    /* This actor said something later that replaces this. Kept readable
+     * because a reversal is a fact reliability must be able to see; it does
+     * not vote. */
+    bool superseded;
+    /* Which independent evidence group this attestation landed in, or -1 when
+     * it did not vote. Two attestations sharing a group corroborate each other
+     * not at all, and this is what makes that visible rather than a number a
+     * reader has to take on trust. */
+    int group;
+} atlas_verify_attestation_detail;
+
+typedef struct atlas_verify_detail {
+    atlas_verify_evidence_detail *evidence;
+    size_t evidence_count;
+    size_t evidence_total;
+    atlas_verify_attestation_detail *attestations;
+    size_t attestation_count;
+    size_t attestation_total;
+    /* A9.2's rule and A3's before it: a bound that makes a set look smaller
+     * than it is is a bound that lies. */
+    bool limit_reached;
+} atlas_verify_detail;
+
+void atlas_verify_detail_init(atlas_verify_detail *d);
+void atlas_verify_detail_free(atlas_verify_detail *d);
+
+/* Loads the readable evidence and attestations for one claim, superseded rows
+ * included and marked. A read; it writes nothing. */
+atlas_status atlas_db_verify_detail_load(atlas_db *db, int64_t claim_id, const char *stale_before,
+                                         atlas_verify_detail *out, atlas_err *err);
 
 /* Loads the inputs for one claim. `stale_before` is the ISO-8601 instant
  * against which an observation is judged to have lost current force; evidence

@@ -268,8 +268,37 @@ typedef enum atlas_decision_actor {
      * running as the same user could produce it. */
     ATLAS_DECISION_ACTOR_LOCAL_OPERATOR_CONFIRMED,
     /* Atlas itself, for a transition that follows mechanically from another —
-     * the supersession that an approval implies. Never a judgement. */
-    ATLAS_DECISION_ACTOR_ATLAS_AUTOMATIC
+     * the supersession that an approval implies. Never a judgement.
+     *
+     * Note what this does *not* cover: a transition a policy decided to make.
+     * That is the actor below, and keeping the two apart is what lets a reader
+     * of the ledger answer "which lifecycle changes did Atlas make on its own
+     * authority?" by reading the ledger. */
+    ATLAS_DECISION_ACTOR_ATLAS_AUTOMATIC,
+    /* A9.2. A root-owned verification policy authorised this transition, on the
+     * strength of a verification result, spending a single-use warrant bound to
+     * one revision and one content hash.
+     *
+     * Read the name as literally as `LOCAL_OPERATOR_CONFIRMED` must be read. It
+     * says a policy Atlas could not itself edit named this exact transition and
+     * the gates that policy set were met. It does **not** say the record is
+     * true, does not say a person agreed, and confers nothing beyond the one
+     * transition the warrant named.
+     *
+     * The honesty limits are the mirror image of the operator channel's. There,
+     * Atlas cannot prove a person acted. Here, Atlas can prove precisely what
+     * acted — a named policy at a recorded hash, over a recorded verification
+     * result — and cannot prove that the policy was *wise*. An operator who
+     * writes a rule authorising too much has authorised too much, and every
+     * transition that follows will be correctly recorded as policy-authorised.
+     *
+     * It is deliberately not writable by any adapter, exactly as
+     * `LOCAL_OPERATOR_CONFIRMED` is not: the actor is evidence of a path that
+     * was taken, so a request that could name it would be a request that could
+     * forge the path. Only `src/verify/autolifecycle.c` produces it, and only
+     * after `atlas_db_verify_warrant_check` has matched the document, the
+     * revision, the target state and the content hash. */
+    ATLAS_DECISION_ACTOR_VERIFICATION_POLICY
 } atlas_decision_actor;
 
 const char *atlas_decision_actor_name(atlas_decision_actor a);

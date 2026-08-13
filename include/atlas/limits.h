@@ -637,4 +637,55 @@
 #define ATLAS_GW_SESSION_TOKEN_BYTES 32u
 #define ATLAS_GW_SESSION_TOKEN_HEX 64u
 
+/* --- A9.2: claims, attestations, evidence and verification ----------------
+ *
+ * A6's rule governs every bound here: **a limit that is reached is reported**.
+ * A truncated reason list, a claim with more attestations than fit, or an
+ * evidence graph deeper than the walk allows must never look like a smaller
+ * problem than it is — that is the one property a verification engine cannot
+ * afford to lack, because its whole output is a statement about how much
+ * evidence there is. */
+
+/* Reasons kept on one aggregate. The *fold* happens before a reason is stored,
+ * so exceeding this weakens the verdict exactly as much as fitting would; what
+ * is lost is only the enumeration, and `reason_total` reports the true count. */
+#define ATLAS_VERIFY_MAX_REASONS 12u
+
+/* Text ceilings. A claim is one discrete proposition: if it does not fit in
+ * this, it is a topic rather than a claim and splitting it is the fix. Refused,
+ * never truncated — a silently shortened proposition is a different one. */
+#define ATLAS_VERIFY_CLAIM_TEXT_MAX 4096u
+#define ATLAS_VERIFY_SCOPE_MAX 1024u
+#define ATLAS_VERIFY_DOMAIN_MAX 64u
+#define ATLAS_VERIFY_METHOD_MAX 1024u
+#define ATLAS_VERIFY_NAME_MAX 256u
+#define ATLAS_VERIFY_VERIFIER_INPUT_MAX 2048u
+
+/* Attestations and evidence folded into one aggregation, and evidence
+ * dependency edges walked while grouping.
+ *
+ * Bounded because aggregation runs inside a read that a remote client can ask
+ * for, and an unbounded fold over a table anybody may append to is a request
+ * that costs whatever the table costs. Reaching either bound is
+ * `ATLAS_VREASON_...` noted on the result and reported, so a partial fold never
+ * reads as a complete one. */
+#define ATLAS_VERIFY_MAX_ATTESTATIONS 512u
+#define ATLAS_VERIFY_MAX_EVIDENCE 2048u
+#define ATLAS_VERIFY_MAX_DEP_EDGES 4096u
+
+/* Claims examined when assessing one knowledge record. */
+#define ATLAS_VERIFY_MAX_CLAIMS 256u
+
+/* Rules a root-owned verification policy may carry. Small on purpose: the
+ * phase's guidance is that a deterministic enforcement allowlist should be
+ * narrow enough for a reviewer to read in one sitting, and a ceiling that makes
+ * a sprawling one impossible is worth more than advice saying not to. */
+#define ATLAS_VERIFY_MAX_POLICY_RULES 32u
+
+/* The default ceiling on how old evidence may be and still bear on a claim
+ * about the present, in seconds. An operational fact observed a fortnight ago
+ * says little about a system redeployed since. Policy may lower it per kind;
+ * this is what applies when policy says nothing. */
+#define ATLAS_VERIFY_DEFAULT_MAX_EVIDENCE_AGE 86400
+
 #endif /* ATLAS_LIMITS_H */

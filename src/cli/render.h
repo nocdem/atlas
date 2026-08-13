@@ -199,6 +199,23 @@ typedef struct atlas_renderer_vtbl {
      * decision renderers label theirs. */
     atlas_status (*gate)(atlas_renderer *r, const atlas_gate_report *rep, atlas_err *err);
 
+    /* --- A9.2: verification -----------------------------------------------
+     *
+     * One renderer for all three `verify` subcommands, because they report the
+     * same structure and a second would drift.
+     *
+     * **The score and the probability are printed differently and are never
+     * both present.** `confidence_score` is an integer out of 100 and carries
+     * no percent sign anywhere in either renderer; `calibrated_probability` is
+     * emitted only when calibration supports it, and is absent — not zero —
+     * otherwise. That separation is the point of the pair existing, and the
+     * schema enforces it independently.
+     *
+     * `claim_text` is project prose and is safe-encoded by the service layer,
+     * labelled untrusted exactly as A4's decision renderers label theirs.
+     * Verification changes a status, never the nature of bytes. */
+    atlas_status (*verify)(atlas_renderer *r, const atlas_verify_report *rep, atlas_err *err);
+
     /* --- A9: remote credentials -------------------------------------------
      *
      * `apikey_created` is the one renderer in Atlas that prints a secret, and

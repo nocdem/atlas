@@ -983,6 +983,22 @@ static const char *method_for(atlas_decision_op_kind kind) {
     case ATLAS_DECISION_OP_REVALIDATE: return "decision.revalidate";
     case ATLAS_DECISION_OP_EDGE_NOTE: return "decision.edge.note";
     case ATLAS_DECISION_OP_RESOLVE: return "decision.resolve";
+    /* A9.2. **There is no RPC method for a policy-authorised transition, and
+     * that absence is the guarantee.**
+     *
+     * A machine transition is minted and spent inside one transaction on the
+     * writer thread, on the strength of a warrant the verification engine wrote
+     * moments earlier in that same transaction. There is nothing for a client
+     * to send: no method name, no parameter that could carry a warrant id, and
+     * therefore no request any peer — operator, dispatcher, gateway or MCP —
+     * can make that reaches this path.
+     *
+     * Returning NULL rather than a refusing method name is deliberate, and it
+     * is the pattern A7 used when it deleted `repo.add` instead of leaving it
+     * refusing: an absent method is answered by the dispatcher's unknown-method
+     * case, and a refusing one is a refusal a later edit can weaken. */
+    case ATLAS_DECISION_OP_AUTO_APPROVE:
+    case ATLAS_DECISION_OP_AUTO_RESOLVE: return NULL;
     }
     return "decision.propose";
 }
@@ -1256,6 +1272,16 @@ static atlas_status apply_op(atlas_ctx *ctx, atlas_decision_op *op, atlas_decisi
                            "another Atlas writer owns this index and no daemon for it is answering "
                            "on the IPC socket. Start the daemon (systemctl --user start atlas) or "
                            "wait for the other command to finish.");
+    }
+    /* A policy-authorised transition has no wire form and must never acquire
+     * one: it is minted and spent inside a single writer-thread transaction.
+     * Refused here as well as having no method name, because the two checks
+     * answer different questions — this one says the operation cannot travel,
+     * and `method_for` says there is nothing for it to travel as. */
+    if (st == ATLAS_OK && atlas_decision_op_is_machine(op->kind)) {
+        st = atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                           "a policy-authorised transition is not something a client can request; "
+                           "it exists only inside the verification engine's own transaction");
     }
     if (st == ATLAS_OK) {
         st = op_to_params(op, &params, err);

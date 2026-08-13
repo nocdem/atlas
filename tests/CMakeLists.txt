@@ -157,6 +157,8 @@ set(ATLAS_TESTS
   # suite, because what is under test is the model, the schema and the
   # migration rather than a transport.
   test_decision_kind
+  test_verify_model
+  test_verify_engine
 )
 
 foreach(test_name IN LISTS ATLAS_TESTS)
@@ -208,6 +210,11 @@ set_tests_properties(test_decision_lifecycle test_migrate6 PROPERTIES LABELS "un
 # It builds a schema-12 database from the migration list rather than winding a
 # finished one back, so it genuinely exercises the four-table rebuild.
 set_tests_properties(test_decision_kind PROPERTIES LABELS "unit")
+# A9.2. The model tests need no database and are pure functions of counted
+# inputs, which is what makes the scoring auditable; the engine tests build a
+# real repository and drive migrations, so they are integration.
+set_tests_properties(test_verify_model PROPERTIES LABELS "unit")
+set_tests_properties(test_verify_engine PROPERTIES LABELS "integration")
 # The operator suite builds a real repository and drives the binary through a
 # pseudo-terminal, so it is an integration test rather than a unit one.
 set_tests_properties(test_decision_operator PROPERTIES LABELS "integration")

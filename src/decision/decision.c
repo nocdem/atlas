@@ -219,6 +219,7 @@ const char *atlas_decision_actor_name(atlas_decision_actor a) {
     case ATLAS_DECISION_ACTOR_MODEL_INFERENCE: return "MODEL_INFERENCE";
     case ATLAS_DECISION_ACTOR_LOCAL_OPERATOR_CONFIRMED: return "LOCAL_OPERATOR_CONFIRMED";
     case ATLAS_DECISION_ACTOR_ATLAS_AUTOMATIC: return "ATLAS_AUTOMATIC";
+    case ATLAS_DECISION_ACTOR_VERIFICATION_POLICY: return "VERIFICATION_POLICY";
     }
     return "MODEL_PROPOSAL";
 }
@@ -235,6 +236,7 @@ bool atlas_decision_actor_parse(const char *name, atlas_decision_actor *out) {
         {"MODEL_INFERENCE", ATLAS_DECISION_ACTOR_MODEL_INFERENCE},
         {"LOCAL_OPERATOR_CONFIRMED", ATLAS_DECISION_ACTOR_LOCAL_OPERATOR_CONFIRMED},
         {"ATLAS_AUTOMATIC", ATLAS_DECISION_ACTOR_ATLAS_AUTOMATIC},
+        {"VERIFICATION_POLICY", ATLAS_DECISION_ACTOR_VERIFICATION_POLICY},
     };
     for (size_t i = 0; i < sizeof(TABLE) / sizeof(TABLE[0]); i++) {
         if (strcmp(name, TABLE[i].name) == 0) {

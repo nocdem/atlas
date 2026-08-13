@@ -349,6 +349,65 @@ static const retention_entry RETENTION[] = {
      "was allowed and whether it worked; nothing holds its rowids, its id is AUTOINCREMENT so a "
      "deletion can never re-point a reader's cursor, and every fact Atlas decides — an approval, a "
      "revision, a job, a reason — lives in a canonical table that is not prunable"},
+
+    /* --- A9.2: claims, attestations, evidence and verification -------------
+     *
+     * Every one of these is CANONICAL and not one is prunable, and the argument
+     * is the same for all ten: **none of it is rebuildable**. The repository
+     * remembers its own bytes, so a code index can be thrown away and rebuilt;
+     * it does not remember that anybody spoke about them. An attestation is a
+     * statement an actor made at a moment, and once deleted there is nothing
+     * anywhere from which to recover it.
+     *
+     * There is a second reason that applies specifically to the age-based
+     * pruning A5 makes available, and it is the more dangerous one. These
+     * tables are the input to a *count*: how many independent evidence groups
+     * support this claim, how many samples does this source have. A half-aged
+     * evidence table is not a smaller evidence table — it is a wrong one, and
+     * nothing in it records that rows are missing, so every confidence score
+     * computed afterwards would be confidently wrong in the direction of less
+     * support. That is the failure this phase exists to prevent, so the tables
+     * it stores its own answers in must not be able to cause it.
+     *
+     * Staleness is handled by weighting, never by deletion. §47: old evidence
+     * keeps its historical value and loses its current force. */
+    {"verify_actors", ATLAS_RETAIN_CANONICAL, false,
+     "who spoke; attestations and evidence reference these rows and an actor that vanished would "
+     "make every statement it made unattributable, which is the one property a provenance system "
+     "cannot lose"},
+    {"verify_claims", ATLAS_RETAIN_CANONICAL, false,
+     "the propositions Atlas checks knowledge against; nothing else holds them and a repository "
+     "cannot regenerate a question somebody chose to ask"},
+    {"verify_evidence", ATLAS_RETAIN_CANONICAL, false,
+     "where each fact came from; an aged-out row would silently reduce the independent-group count "
+     "for every claim resting on it, and a confidence score computed from a partially deleted "
+     "evidence table is wrong with nothing recording that it is"},
+    {"verify_evidence_deps", ATLAS_RETAIN_CANONICAL, false,
+     "the declared derivation edges that make correlated evidence detectable; deleting one does "
+     "not lose a fact, it *creates* a false independence — the exact inflation the aggregation "
+     "exists to prevent"},
+    {"verify_attestations", ATLAS_RETAIN_CANONICAL, false,
+     "one actor's verdict at one moment, never overwritten and never removed; a source that "
+     "reversed itself is a fact a reliability system must be able to see"},
+    {"verify_attestation_evidence", ATLAS_RETAIN_CANONICAL, false,
+     "which evidence each attestation rests on; without it an attestation's independence cannot be "
+     "computed at all, and unknown independence is treated as none"},
+    {"verify_results", ATLAS_RETAIN_CANONICAL, false,
+     "the append-only record of what an aggregation concluded, under which algorithm and taxonomy "
+     "version; a machine lifecycle transition must be reconstructable from it years later, which "
+     "is the same argument A6 makes for decision_validations"},
+    {"verify_outcomes", ATLAS_RETAIN_CANONICAL, false,
+     "the resolved ground truth reliability is learned from; deleting outcomes would move every "
+     "source's measured accuracy without any statement recording that the sample changed"},
+    {"verify_reliability", ATLAS_RETAIN_CANONICAL, false,
+     "per actor and domain accuracy, derived from verify_outcomes but not cheaply: it is the "
+     "accumulated result of every resolution, and a rebuild would need the whole outcome history "
+     "that is itself canonical"},
+    {"verify_lifecycle_audit", ATLAS_RETAIN_CANONICAL, false,
+     "why Atlas itself changed a lifecycle state, with the policy hash and evidence snapshot that "
+     "justified it; this is the record that makes automatic transitions auditable at all, and an "
+     "automatic transition whose justification had been pruned is indistinguishable from one that "
+     "never had a justification"},
 };
 
 #define RETENTION_COUNT (sizeof RETENTION / sizeof RETENTION[0])

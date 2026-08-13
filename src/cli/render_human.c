@@ -1546,6 +1546,125 @@ static atlas_status h_apikey_revoked(atlas_renderer *r, const char *key_id, bool
     return ok();
 }
 
+/* --- A9.2: verification ------------------------------------------------------
+ *
+ * Three axes are printed on three separate lines with three separate labels,
+ * because collapsing them into one badge is the presentation this season exists
+ * to prevent — A9.1 says the same about kind and status, and A9.2 adds the
+ * third. A reader must be able to see `PROPOSED` beside `VERIFIED` and
+ * understand that Atlas established the proposition and nobody adopted it. */
+static atlas_status h_verify(atlas_renderer *r, const atlas_verify_report *rep, atlas_err *err) {
+    (void)err;
+    FILE *o = r->out;
+    const atlas_verify_assessment *a = &rep->assessment;
+
+    /* `verify policy` carries no claim, so the assessment block is all zeros and
+     * printing it would read as a verdict about something. A policy query gets
+     * the policy and nothing else. */
+    bool have_claim = rep->claim_uid.len > 0;
+    if (!have_claim) {
+        (void)fprintf(o, "policy:       %s\n",
+                      atlas_verifypolicy_state_name(rep->policy_state));
+        if (rep->policy_path[0] != '\0') {
+            (void)fprintf(o, "  path:       %s\n", rep->policy_path);
+        }
+        (void)fprintf(o, "  %s\n", rep->policy_detail);
+        if (rep->policy_state == ATLAS_VERIFYPOLICY_ENABLED) {
+            (void)fprintf(o, "  id:         %s\n", rep->policy_id);
+            (void)fprintf(o, "  hash:       %s\n", rep->policy_hash);
+            (void)fprintf(o, "  rules:      %zu\n", rep->rule_count);
+            (void)fprintf(o, "  determin.:  %s\n",
+                          rep->deterministic_enforce ? "ENFORCE" : "shadow only");
+            (void)fprintf(o, "  empirical:  %s\n",
+                          rep->empirical_enforce ? "ENFORCE" : "shadow only");
+        }
+        return ATLAS_OK;
+    }
+    (void)fprintf(o, "claim:        %s\n", atlas_buf_cstr(&rep->claim_uid));
+    (void)fprintf(o, "  text (untrusted project text): %s\n", atlas_buf_cstr(&rep->claim_text));
+    if (rep->record_uid.len > 0) {
+        (void)fprintf(o, "record:       %s  [%s / %s]\n", atlas_buf_cstr(&rep->record_uid),
+                      atlas_decision_kind_name(a->kind), atlas_decision_state_name(a->from));
+    }
+    (void)fprintf(o, "verification: %s\n", atlas_verify_state_name(a->aggregate.state));
+    (void)fprintf(o, "basis:        %s\n", atlas_verify_basis_name(a->basis));
+    (void)fprintf(o, "semantics:    %s\n", atlas_verify_claim_semantics_name(a->semantics));
+
+    /* Out of 100, never with a percent sign. */
+    (void)fprintf(o, "confidence:   %d/100 (score, not a probability)\n", a->aggregate.confidence);
+    (void)fprintf(o, "calibration:  %s\n",
+                  atlas_verify_calibration_name(a->aggregate.calibration));
+    if (a->aggregate.calibration == ATLAS_CALIBRATION_CALIBRATED &&
+        a->aggregate.calibrated_probability >= 0) {
+        (void)fprintf(o, "probability:  %d%%\n", a->aggregate.calibrated_probability);
+    } else {
+        /* Said rather than left blank: the absence of a probability is a fact
+         * about what Atlas can justify, and a reader who is not told will
+         * assume the score is one. */
+        (void)fprintf(o, "probability:  not available; no calibrated history supports one\n");
+    }
+    (void)fprintf(o, "algorithm:    %s (priors v%d, families v%d)\n", a->aggregate.algorithm,
+                  ATLAS_VERIFY_PRIOR_VERSION, a->aggregate.family_version);
+
+    if (a->verifier != ATLAS_VERIFIER_NONE) {
+        (void)fprintf(o, "verifier:     %s -> %s\n", atlas_verify_verifier_name(a->verifier),
+                      atlas_verify_check_name(a->check));
+        if (a->verified_scope[0] != '\0') {
+            (void)fprintf(o, "  established: %s\n", a->verified_scope);
+        }
+        if (a->detail[0] != '\0') {
+            (void)fprintf(o, "  detail:      %s\n", a->detail);
+        }
+    }
+
+    (void)fprintf(o, "evidence:     %d support, %d contradict, %d inconclusive\n",
+                  a->aggregate.support_count, a->aggregate.contradict_count,
+                  a->aggregate.inconclusive_count);
+    (void)fprintf(o, "independence: %d evidence groups, %d families\n",
+                  a->aggregate.independent_groups, a->aggregate.independent_families);
+    if (a->attestation_total > (size_t)(a->aggregate.support_count +
+                                        a->aggregate.contradict_count +
+                                        a->aggregate.inconclusive_count)) {
+        (void)fprintf(o, "              %zu attestations exist in total\n", a->attestation_total);
+    }
+    if (a->truncated) {
+        (void)fprintf(o, "limit:        reached; this answer is a subset of an answer\n");
+    }
+    if (a->aggregate.stale) {
+        (void)fprintf(o, "freshness:    some evidence is older than policy allows\n");
+    }
+
+    (void)fprintf(o, "policy:       %s", atlas_verifypolicy_state_name(rep->policy_state));
+    if (rep->policy_state == ATLAS_VERIFYPOLICY_ENABLED) {
+        (void)fprintf(o, " (%s, %zu rules, deterministic %s, empirical %s)", rep->policy_id,
+                      rep->rule_count, rep->deterministic_enforce ? "enforce" : "shadow",
+                      rep->empirical_enforce ? "enforce" : "shadow");
+    }
+    (void)fprintf(o, "\n");
+    if (rep->policy_path[0] != '\0') {
+        (void)fprintf(o, "  path:       %s\n", rep->policy_path);
+        (void)fprintf(o, "  %s\n", rep->policy_detail);
+    }
+
+    (void)fprintf(o, "automatic:    %s\n",
+                  atlas_verify_policy_verdict_name(a->aggregate.verdict));
+    for (size_t i = 0; i < a->aggregate.reason_count; i++) {
+        (void)fprintf(o, "  - %s: %s\n", atlas_verify_reason_name(a->aggregate.reasons[i]),
+                      atlas_verify_reason_description(a->aggregate.reasons[i]));
+    }
+    if (a->aggregate.reason_total > a->aggregate.reason_count) {
+        (void)fprintf(o, "  (%zu reasons in total; the list above is bounded)\n",
+                      a->aggregate.reason_total);
+    }
+    if (a->transitioned) {
+        (void)fprintf(o, "transition:   %s -> %s, recorded as VERIFICATION_POLICY\n",
+                      atlas_decision_state_name(a->from), atlas_decision_state_name(a->to));
+        (void)fprintf(o, "  This records which policy acted. It does not say the record is "
+                         "true, and it does not say a person agreed.\n");
+    }
+    return ATLAS_OK;
+}
+
 static atlas_status h_gate(atlas_renderer *r, const atlas_gate_report *rep, atlas_err *err) {
     (void)err;
     FILE *o = r->out;
@@ -1970,6 +2089,8 @@ const atlas_renderer_vtbl ATLAS_RENDERER_HUMAN = {
     h_operation_status, h_maintenance,
     /* --- A6 --- */
     h_gate,
+    /* --- A9.2 --- */
+    h_verify,
     /* --- A9 --- */
     h_apikey_created, h_apikey_listed, h_apikey_revoked,
 };

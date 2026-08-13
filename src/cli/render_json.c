@@ -1470,6 +1470,99 @@ static atlas_status j_apikey_revoked(atlas_renderer *r, const char *key_id, bool
     return atlas_json_obj_end(j, err);
 }
 
+/* --- A9.2: verification ------------------------------------------------------
+ *
+ * `confidence_score` is the key name, not `confidence`, so that no consumer can
+ * read it as a probability by accident. `calibrated_probability` is emitted
+ * **only** when calibration supports one — absent rather than null or zero,
+ * because a null invites a default and a zero is a probability of nought. */
+static atlas_status j_verify(atlas_renderer *r, const atlas_verify_report *rep, atlas_err *err) {
+    atlas_json *j = r->j;
+    const atlas_verify_assessment *a = &rep->assessment;
+    TRY(atlas_json_key(j, "verification", err));
+    TRY(atlas_json_obj_begin(j, err));
+    TRY(atlas_json_key_str(j, "claim", atlas_buf_cstr(&rep->claim_uid), err));
+    TRY(atlas_json_key_str(j, "claim_text", atlas_buf_cstr(&rep->claim_text), err));
+    /* Labelled, exactly as A4's decision documents are. Verification changes a
+     * status; it does not make prose trustworthy. */
+    TRY(atlas_json_key_str(j, "trust", "UNTRUSTED_DATA", err));
+    TRY(atlas_json_key_str(j, "domain", atlas_buf_cstr(&rep->domain), err));
+    TRY(atlas_json_key_str(j, "record", atlas_buf_cstr(&rep->record_uid), err));
+
+    /* The three axes, in three separate fields. Never one badge. */
+    TRY(atlas_json_key_str(j, "kind", atlas_decision_kind_name(a->kind), err));
+    TRY(atlas_json_key_str(j, "status", atlas_decision_state_name(a->from), err));
+    TRY(atlas_json_key_str(j, "state", atlas_verify_state_name(a->aggregate.state), err));
+
+    TRY(atlas_json_key_str(j, "basis", atlas_verify_basis_name(a->basis), err));
+    TRY(atlas_json_key_str(j, "semantics", atlas_verify_claim_semantics_name(a->semantics), err));
+    TRY(atlas_json_key_int(j, "confidence_score", a->aggregate.confidence, err));
+    TRY(atlas_json_key_str(j, "calibration",
+                           atlas_verify_calibration_name(a->aggregate.calibration), err));
+    if (a->aggregate.calibration == ATLAS_CALIBRATION_CALIBRATED &&
+        a->aggregate.calibrated_probability >= 0) {
+        TRY(atlas_json_key_int(j, "calibrated_probability", a->aggregate.calibrated_probability,
+                               err));
+    }
+    TRY(atlas_json_key_str(j, "algorithm", a->aggregate.algorithm, err));
+    TRY(atlas_json_key_int(j, "prior_version", ATLAS_VERIFY_PRIOR_VERSION, err));
+    TRY(atlas_json_key_int(j, "family_version", a->aggregate.family_version, err));
+
+    TRY(atlas_json_key_str(j, "verifier", atlas_verify_verifier_name(a->verifier), err));
+    TRY(atlas_json_key_str(j, "check", atlas_verify_check_name(a->check), err));
+    TRY(atlas_json_key_str_opt(j, "verified_scope", a->verified_scope, err));
+    TRY(atlas_json_key_str_opt(j, "detail", a->detail, err));
+
+    TRY(atlas_json_key_int(j, "support_count", a->aggregate.support_count, err));
+    TRY(atlas_json_key_int(j, "contradict_count", a->aggregate.contradict_count, err));
+    TRY(atlas_json_key_int(j, "inconclusive_count", a->aggregate.inconclusive_count, err));
+    TRY(atlas_json_key_int(j, "independent_groups", a->aggregate.independent_groups, err));
+    TRY(atlas_json_key_int(j, "independent_families", a->aggregate.independent_families, err));
+    TRY(atlas_json_key_int(j, "support_mass", a->aggregate.support_mass, err));
+    TRY(atlas_json_key_int(j, "contradict_mass", a->aggregate.contradict_mass, err));
+    TRY(atlas_json_key_int(j, "attestation_total", (int64_t)a->attestation_total, err));
+    TRY(atlas_json_key_bool(j, "truncated", a->truncated, err));
+    TRY(atlas_json_key_bool(j, "stale", a->aggregate.stale, err));
+    TRY(atlas_json_key_str(j, "conflict", atlas_verify_conflict_name(a->aggregate.conflict), err));
+
+    TRY(atlas_json_key_str(j, "policy_state", atlas_verifypolicy_state_name(rep->policy_state),
+                           err));
+    TRY(atlas_json_key_str(j, "policy_reason", atlas_verifypolicy_reason_name(rep->policy_reason),
+                           err));
+    TRY(atlas_json_key_str_opt(j, "policy_id", rep->policy_id, err));
+    TRY(atlas_json_key_str_opt(j, "policy_hash", rep->policy_hash, err));
+    TRY(atlas_json_key_str_opt(j, "policy_path", rep->policy_path, err));
+    TRY(atlas_json_key_bool(j, "deterministic_enforce", rep->deterministic_enforce, err));
+    TRY(atlas_json_key_bool(j, "empirical_enforce", rep->empirical_enforce, err));
+    TRY(atlas_json_key_int(j, "policy_rules", (int64_t)rep->rule_count, err));
+
+    TRY(atlas_json_key_str(j, "policy_verdict",
+                           atlas_verify_policy_verdict_name(a->aggregate.verdict), err));
+    TRY(atlas_json_key(j, "reasons", err));
+    TRY(atlas_json_arr_begin(j, err));
+    for (size_t i = 0; i < a->aggregate.reason_count; i++) {
+        TRY(atlas_json_obj_begin(j, err));
+        TRY(atlas_json_key_str(j, "reason", atlas_verify_reason_name(a->aggregate.reasons[i]),
+                               err));
+        TRY(atlas_json_key_str(j, "meaning",
+                               atlas_verify_reason_description(a->aggregate.reasons[i]), err));
+        TRY(atlas_json_obj_end(j, err));
+    }
+    TRY(atlas_json_arr_end(j, err));
+    /* The true count, even when fewer were kept. */
+    TRY(atlas_json_key_int(j, "reason_total", (int64_t)a->aggregate.reason_total, err));
+
+    TRY(atlas_json_key_bool(j, "transitioned", a->transitioned, err));
+    if (a->transitioned) {
+        TRY(atlas_json_key_str(j, "transition_from", atlas_decision_state_name(a->from), err));
+        TRY(atlas_json_key_str(j, "transition_to", atlas_decision_state_name(a->to), err));
+        TRY(atlas_json_key_str(j, "actor", "VERIFICATION_POLICY", err));
+    }
+    TRY(atlas_json_key_int(j, "result_id", a->result_id, err));
+    TRY(atlas_json_key_int(j, "audit_id", a->audit_id, err));
+    return atlas_json_obj_end(j, err);
+}
+
 static atlas_status j_gate(atlas_renderer *r, const atlas_gate_report *rep, atlas_err *err) {
     atlas_json *j = r->j;
     TRY(atlas_json_key(j, "gate", err));
@@ -1862,6 +1955,8 @@ const atlas_renderer_vtbl ATLAS_RENDERER_JSON = {
     j_operation_status, j_maintenance,
     /* --- A6 --- */
     j_gate,
+    /* --- A9.2 --- */
+    j_verify,
     /* --- A9 --- */
     j_apikey_created, j_apikey_listed, j_apikey_revoked,
 };

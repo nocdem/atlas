@@ -53,6 +53,7 @@
  * carries the expected state in its WHERE clause so that cannot happen.
  */
 #include "atlas/decision_ops.h"
+#include "atlas/verify.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -74,6 +75,8 @@ const char *atlas_decision_op_kind_name(atlas_decision_op_kind k) {
     case ATLAS_DECISION_OP_REVALIDATE: return "revalidate";
     case ATLAS_DECISION_OP_EDGE_NOTE: return "edge note";
     case ATLAS_DECISION_OP_RESOLVE: return "resolve";
+    case ATLAS_DECISION_OP_AUTO_APPROVE: return "policy approve";
+    case ATLAS_DECISION_OP_AUTO_RESOLVE: return "policy resolve";
     }
     return "propose";
 }
@@ -85,6 +88,10 @@ bool atlas_decision_op_needs_challenge(atlas_decision_op_kind k) {
     return k == ATLAS_DECISION_OP_APPROVE || k == ATLAS_DECISION_OP_REJECT ||
            k == ATLAS_DECISION_OP_SUPERSEDE || k == ATLAS_DECISION_OP_REVALIDATE ||
            k == ATLAS_DECISION_OP_RESOLVE;
+}
+
+bool atlas_decision_op_is_machine(atlas_decision_op_kind k) {
+    return k == ATLAS_DECISION_OP_AUTO_APPROVE || k == ATLAS_DECISION_OP_AUTO_RESOLVE;
 }
 
 void atlas_decision_op_init(atlas_decision_op *op, atlas_decision_op_kind kind) {
@@ -1759,6 +1766,201 @@ static atlas_status op_promote(apply_ctx *ac, const atlas_decision_op *op,
 
 /* --- the entry point ---------------------------------------------------------- */
 
+/* A9.2. A transition a root-owned verification policy authorised.
+ *
+ * This is the machine counterpart of `op_approve` and `op_resolve`, and it is
+ * written to be their equal in strictness rather than their shortcut. Compare
+ * it with `spend_challenge` line by line: both bind to one document, one
+ * revision and one content hash; both rehash the stored content and refuse a
+ * mismatch; both consume a single-use capability with an UPDATE that names the
+ * state it observed, so a replay loses deterministically. The *only* thing that
+ * differs between the two paths is who is able to mint the capability — an
+ * operator at a terminal, or the verification engine under a policy neither
+ * Atlas nor any model can edit.
+ *
+ * That equivalence is the whole security argument for automating anything here.
+ * If the machine path bound more loosely than the human one, every gate in
+ * front of it would be arguing about which evidence justifies a capability that
+ * is easier to satisfy than the one a person needs.
+ *
+ * Three things this function will not do:
+ *
+ *   - it never *creates* the warrant. `atlas_verify_autolifecycle_run` writes
+ *     the audit row before calling in, in the same transaction, so a transition
+ *     and its justification commit together or neither does;
+ *   - it never approves over an existing approved revision. That would be a
+ *     supersession, and supersession needs an argument Atlas cannot make
+ *     mechanically. The engine blocks the case before it gets here and this
+ *     refuses it again, because two checks and one authority is the pattern;
+ *   - it never widens what the state machine allows. `transition` reads the
+ *     kind from the document and asks `atlas_decision_transition_allowed`,
+ *     exactly as the operator path does.
+ */
+static atlas_status op_auto(apply_ctx *ac, const atlas_decision_op *op,
+                            atlas_decision_result *out, atlas_err *err) {
+    if (op->warrant_id <= 0) {
+        return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                             "%s is a policy-authorised transition and needs a warrant; there is "
+                             "no request that can supply one",
+                             atlas_decision_op_kind_name(op->kind));
+    }
+
+    int64_t document_id = 0, doc_repo = 0;
+    bool found = false;
+    atlas_status st = atlas_db_decision_find_uid(ac->db, atlas_buf_cstr(&op->uid), &document_id,
+                                                 &doc_repo, &found, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (!found) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "no knowledge record has that id");
+    }
+    if (doc_repo != ac->repo.id) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "that knowledge record belongs to a different repository");
+    }
+
+    const atlas_decision_state from = op->kind == ATLAS_DECISION_OP_AUTO_APPROVE
+                                          ? ATLAS_DECISION_PROPOSED
+                                          : ATLAS_DECISION_APPROVED;
+    const atlas_decision_state to = op->kind == ATLAS_DECISION_OP_AUTO_APPROVE
+                                        ? ATLAS_DECISION_APPROVED
+                                        : ATLAS_DECISION_RESOLVED;
+
+    /* Approving over something already approved is a supersession, and this
+     * path does not make those. Checked before the warrant is examined so the
+     * refusal names the real reason rather than a hash mismatch. */
+    if (op->kind == ATLAS_DECISION_OP_AUTO_APPROVE) {
+        int64_t current = 0;
+        st = atlas_db_decision_approved_revision(ac->db, document_id, &current, err);
+        if (st != ATLAS_OK) {
+            return st;
+        }
+        if (current > 0) {
+            return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                                 "this record already has an approved revision, so approving "
+                                 "another would replace it; replacing an approved record is an "
+                                 "operator action and no policy performs it");
+        }
+    }
+
+    /* The revision the warrant is about. Derived from the document and the
+     * transition rather than taken from the request, for the reason `transition`
+     * reads the kind from the document: the single write point must not let a
+     * caller describe the thing it is changing. */
+    int64_t revision_id = 0, revision_no = 0;
+    if (op->kind == ATLAS_DECISION_OP_AUTO_RESOLVE) {
+        /* The approved revision, derived through the partial unique index that
+         * guarantees there is at most one, never read from the document's
+         * cached pointer — `recompute_status` explains why that pointer is the
+         * one resolving invalidates. */
+        st = atlas_db_decision_approved_revision(ac->db, document_id, &revision_id, err);
+    } else {
+        char hash[ATLAS_SHA256_HEX_LEN + 1u];
+        char state[16];
+        st = atlas_db_decision_latest_revision(ac->db, document_id, &revision_id, &revision_no,
+                                               hash, sizeof hash, state, sizeof state, err);
+        if (st == ATLAS_OK && revision_id > 0 &&
+            strcmp(state, atlas_decision_state_name(ATLAS_DECISION_PROPOSED)) != 0) {
+            /* The newest revision is not the proposed one. Refused rather than
+             * searching backwards for one that is: approving a revision that
+             * is not the latest would make a policy adopt something an author
+             * has already moved on from. */
+            return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                                 "the newest revision of this record is %s, not PROPOSED", state);
+        }
+    }
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (revision_id <= 0) {
+        return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                             "this record has no %s revision, so there is nothing to transition",
+                             atlas_decision_state_name(from));
+    }
+
+    /* Rehash the stored content and compare against what the revision records,
+     * exactly as `spend_challenge` does. A warrant bound to a digest the content
+     * no longer has binds to nothing, and a policy acting on altered bytes is
+     * the failure this check exists to make impossible. */
+    atlas_decision_revision loaded;
+    atlas_decision_revision_init(&loaded);
+    bool lfound = false;
+    st = atlas_db_decision_revision_load(ac->db, revision_id, &loaded, &lfound, err);
+    if (st == ATLAS_OK && !lfound) {
+        st = atlas_err_set(err, ATLAS_ERR_INTEGRITY, "that revision is no longer present");
+    }
+    char content_hash[ATLAS_SHA256_HEX_LEN + 1u];
+    content_hash[0] = '\0';
+    if (st == ATLAS_OK) {
+        revision_no = loaded.revision_no;
+        char rehash[ATLAS_SHA256_HEX_LEN + 1u];
+        st = atlas_decision_content_hash(&loaded, rehash, err);
+        if (st == ATLAS_OK && strcmp(rehash, loaded.content_hash) != 0) {
+            st = atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                               "this revision's stored content does not hash to its recorded "
+                               "value; Atlas refuses to transition it");
+        }
+        if (st == ATLAS_OK) {
+            (void)snprintf(content_hash, sizeof content_hash, "%s", loaded.content_hash);
+        }
+    }
+    atlas_decision_revision_free(&loaded);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+
+    /* The warrant itself. Every binding is in the query rather than read back
+     * and compared, so there is no window in which one value could be examined
+     * and another acted on. */
+    bool ok = false;
+    st = atlas_db_verify_warrant_check(ac->db, op->warrant_id, document_id, revision_id,
+                                       atlas_decision_state_name(to), content_hash, &ok, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (!ok) {
+        return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                             "no live verification warrant authorises this exact transition of "
+                             "this revision at this content hash");
+    }
+    bool spent = false;
+    st = atlas_db_verify_warrant_consume(ac->db, op->warrant_id, ac->now, &spent, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (!spent) {
+        return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                             "that verification warrant was already spent; a warrant authorises "
+                             "exactly one transition");
+    }
+
+    st = transition(ac, document_id, revision_id, revision_no, from, to,
+                    ATLAS_DECISION_ACTOR_VERIFICATION_POLICY, 0, 0, 0,
+                    "authorised by a root-owned verification policy against a recorded "
+                    "verification result; this records which policy acted, not that the record "
+                    "is true and not that a person agreed",
+                    content_hash, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    st = recompute_status(ac, document_id, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    bool kfound = false;
+    st = atlas_db_decision_kind_of(ac->db, document_id, &out->knowledge_kind, &kfound, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    out->document_id = document_id;
+    out->revision_id = revision_id;
+    out->revision_no = revision_no;
+    out->state = to;
+    (void)snprintf(out->content_hash, sizeof(out->content_hash), "%s", content_hash);
+    return atlas_db_decision_uid_of(ac->db, document_id, &out->uid, err);
+}
+
 atlas_status atlas_decision_apply_in_tx(atlas_db *db, const atlas_decision_op *op,
                                         atlas_decision_result *out, atlas_err *err) {
     if (atlas_db_is_readonly(db)) {
@@ -1836,6 +2038,8 @@ atlas_status atlas_decision_apply_in_tx(atlas_db *db, const atlas_decision_op *o
         case ATLAS_DECISION_OP_REVALIDATE: st = op_revalidate(&ac, op, out, err); break;
         case ATLAS_DECISION_OP_EDGE_NOTE: st = op_edge_note(&ac, op, out, err); break;
         case ATLAS_DECISION_OP_RESOLVE: st = op_resolve(&ac, op, out, err); break;
+        case ATLAS_DECISION_OP_AUTO_APPROVE:
+        case ATLAS_DECISION_OP_AUTO_RESOLVE: st = op_auto(&ac, op, out, err); break;
         }
     }
     atlas_repo_info_free(&ac.repo);

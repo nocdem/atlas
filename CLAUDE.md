@@ -1,7 +1,17 @@
 # Atlas — working notes for Claude Code
 
 Atlas is a generic, headless engineering-memory and repository-intelligence CLI in
-C17. Phase **A9.1**: knowledge semantics — a durable record now says *what sort of
+C17. Phase **A9.2**: evidence, verification and automatic lifecycle — a durable
+record now also says *what evidence bears on whether it holds*, as a third axis
+that no code path derives from the other two. Claims, attestations, actors and
+evidence are first class; independence is computed by union-find over declared
+derivation edges so that three models reading one document count once; a
+confidence score is never a probability; and a root-owned policy may authorise
+Atlas to make narrow, mechanically-justified lifecycle transitions by itself,
+recorded as the `VERIFICATION_POLICY` actor and spending a single-use warrant.
+**Deterministic verification does not require historical calibration**; empirical
+verification does, has none on this machine, and stays in shadow. See
+`docs/verification.md` and the A9.2 sections below. On top of **A9.1**: knowledge semantics — a durable record now says *what sort of
 knowledge it is* (`DECISION`, `POLICY`, `INVARIANT`, `OPERATIONAL_FACT`,
 `ACCEPTED_RISK`, `OBLIGATION`, `PARKED`, `REJECTED_ALTERNATIVE`) as well as how far
 through the approval workflow it got, and an approved record whose demand has been
@@ -1688,6 +1698,158 @@ src/sem/context.c         recorded knowledge as a context item, which
   out for free and correctly — it is no longer effective, so nothing is left to have
   gone stale.
 
+## A9.2 layers — additions
+
+```
+include/atlas/verify.h        the vocabularies, the claim/actor/evidence/
+                              attestation model, the aggregate and the db API
+include/atlas/verifypolicy.h  the root-owned policy and the assessment
+src/verify/verify.c           the vocabularies, the priors, the union-find and
+                              `atlas-reliability-v1`; touches no database
+src/verify/policy.c           the root-owned policy loader
+src/verify/detverify.c        the four deterministic verifiers, every one a read
+src/verify/autolifecycle.c    the one place a verification result becomes a
+                              lifecycle transition; the third caller of
+                              `atlas_decision_apply_in_tx`
+src/db/db_verify.c            the single write point over migration 14
+src/core/service_verify.c     the `verify` command behaviour
+src/db/migrate.c              migration 14 (ten tables, additive) and
+                              migration 15 (widens one CHECK on a leaf table)
+```
+
+## A9.2 rules — these are not negotiable
+
+- **Deterministic verification does not require historical calibration, and
+  making it wait for one is a category error rather than caution.** If a
+  proposition has a complete mechanical truth condition and Atlas evaluated it,
+  how often some model has been right in the past is not an input to the answer.
+  `atlas_verify_basis_requires_calibration` is a function precisely so a test can
+  assert it and no policy path can quietly reintroduce the coupling; the
+  calibration gate in `autolifecycle.c` is guarded on the basis for the same
+  reason. The converse holds just as hard: **reliability never substitutes for
+  authority**, and no score, sample count or number of agreeing sources accepts a
+  risk or adopts an architecture.
+- **The three axes are orthogonal and no code path derives one from another.**
+  Kind (A9.1), status (A4) and verification state (A9.2). `INVARIANT · PROPOSED ·
+  VERIFIED` and `DECISION · APPROVED · INCONCLUSIVE` are both legal and both
+  mean something. Every surface reports all three in separate fields; a single
+  badge carrying more than one is the presentation these seasons exist to
+  prevent.
+- **An actor is not evidence.** Three models reading one document are three
+  attestations over one evidence root. Within an independent group only the
+  strongest attestation counts, never the sum, so repetition contributes exactly
+  nothing — `tests/test_verify_model.c` drives forty duplicated attestations and
+  requires the score not to move. Independence is **never assumed**: an
+  interpretation that declares no source joins one shared group rather than
+  becoming a root, which is what defeats both the many-models-one-document case
+  and an orchestrator's fleet of subagents.
+- **A confidence score is not a probability, and they are different fields with
+  different printers.** `confidence_score` is an integer out of 100 and carries
+  no percent sign in either renderer; `calibrated_probability` is emitted only
+  when calibration supports it and is **absent** rather than null or zero
+  otherwise. A schema CHECK enforces the pairing independently. Never write
+  "94% probability" of an uncalibrated score, in code, output or prose.
+- **A deterministic verifier may only establish a DESCRIPTIVE claim.**
+  `atlas_verify_basis_may_verify_semantics` refuses DETERMINISTIC + NORMATIVE,
+  and that one cell is the whole enforcement of "descriptive truth is not
+  normative adoption". Allowing it would let any observation of the current
+  implementation become permanent policy with an impeccable audit trail.
+- **Every deterministic verifier is a read.** None creates a process, runs a
+  repository's build, executes a command or opens a file the repository controls.
+  That is a deliberate restriction: a verifier running a command named in
+  configuration is a code-execution path with an audit trail attached. Adding one
+  needs the argument in writing and A8-CI's bounded-child sandbox first.
+- **UNAVAILABLE is not FAIL.** An index that has not run cannot establish an
+  absence, and reporting "could not look" as "it is not there" closes obligations
+  that are still outstanding. `atlas.symbol_absent` requires a *complete*
+  generation; `atlas.symbol_present` does not, and the asymmetry is the point.
+- **`atlas_verify_assess` writes nothing.** Asking what Atlas thinks cannot change
+  what Atlas thinks — A6's property, for A6's reason. Only
+  `atlas_verify_autolifecycle_run` writes, and it owns its transaction.
+- **`autolifecycle.c` is the third and last caller of
+  `atlas_decision_apply_in_tx`, and it earns that by owning a wider unit of
+  work.** A machine transition and the audit row justifying it are one fact: an
+  audit row with no transition describes something that did not happen, and a
+  transition with no audit row is an automatic change to project knowledge with
+  no recoverable reason. `tests/test_decision_mcp.c` pins the count at three and
+  names all three files.
+- **The audit row is the warrant, and it binds exactly as tightly as an operator
+  challenge.** One document, one revision, one target state, one content hash,
+  single-use, consumed by an UPDATE that names the state it observed. Compare
+  `op_auto` with `spend_challenge`: what differs is *who can mint one*, never how
+  loosely it binds. A path that bound more loosely would make every gate in front
+  of it argue about a capability easier to satisfy than a person's.
+- **`VERIFICATION_POLICY` is not `ATLAS_AUTOMATIC` and not
+  `LOCAL_OPERATOR_CONFIRMED`.** It says a root-owned policy named this exact
+  transition and its gates were met. It does not say the record is true and does
+  not say a person agreed. It is unwritable by any adapter, has no RPC method, no
+  MCP tool and no gateway route, and `method_for` returns NULL for the AUTO ops —
+  an absent method rather than a refusing one, which is A7's pattern.
+- **Refusals no policy can lift are checked before the policy is read.** A
+  JUDGMENT basis, an ACCEPTED_RISK approval, a normative claim reached
+  deterministically, and a transition the kind-aware state machine refuses. "Root
+  wrote it" establishes that an instruction is authentic, not that it is one Atlas
+  should carry out — and a FORBIDDEN answer must never depend on configuration,
+  or it would read as something more evidence could change.
+- **A machine transition is never ground truth for reliability.** A model
+  supports a claim, the aggregate likes it, Atlas transitions, the transition
+  becomes a label, the model's reliability rises. Every step looks reasonable and
+  the system has taught itself to trust a source using that source's own output.
+  `atlas_verify_outcome_eligible` refuses `MACHINE_TRANSITION`, and an ineligible
+  outcome is stored-and-not-counted so the case stays auditable.
+- **A model cannot become a tool.** `TOOL`, `TEST`, `RUNTIME_OBSERVATION` and
+  `ATLAS_VERIFIER` may only exist with `ATLAS_ATTESTED` identity — refused in C
+  for the message and by a schema CHECK for the guarantee. Refused rather than
+  discounted: a discounted forgery still reads as tool output to somebody
+  skimming a UI.
+- **All ten A9.2 tables are CANONICAL and none is prunable.** None is rebuildable
+  — a repository does not remember that anybody spoke — and, more sharply, these
+  tables are the input to a *count*. A half-aged evidence table is not a smaller
+  one, it is a wrong one, and every score computed afterwards would be
+  confidently wrong with nothing recording why.
+- **Migration 14 is additive and migration 15 rebuilds a leaf.** No decision row
+  is written by 14, so no content hash moves. 15 widens one CHECK on
+  `decision_events`, which nothing references, so foreign keys stay enforced —
+  and `decision_revisions.proposed_by` keeps its four-value CHECK unchanged,
+  because a policy that could author a revision would be a policy that could
+  write project knowledge.
+- **`AUTO_REJECT` and `AUTO_SUPERSEDE` are absent, not refused.** Auto-rejection
+  needs an explicit falsification condition and low confidence is not one;
+  supersession needs a mechanical test for "same subject, compatible scope" that
+  Atlas does not have, and a timestamp is emphatically not one. An absent path
+  cannot be weakened by a later edit the way a refusing one can.
+
+## Extending A9.2 safely
+
+- **A new deterministic verifier** means a member of `atlas_verify_verifier`, a
+  row in `VERIFIERS[]` with a written description, a case in
+  `atlas_verify_run_verifier`, a scope sentence in `scope_of`, and — the part
+  that is not optional — a written argument that it is a **read**.
+- **A new basis** means editing `atlas_verify_basis_writable`,
+  `atlas_verify_basis_requires_calibration` and
+  `atlas_verify_basis_may_verify_semantics`, plus the CHECK on
+  `verify_results.basis`. Deciding whether it requires calibration is the whole
+  point of adding it. Keep UNKNOWN at zero and unwritable.
+- **A new reason** means a member and a row in `REASONS[]` carrying its name, the
+  verdict it implies on its own, and one written sentence of meaning. A6's
+  arrangement: the verdict follows from the reason rather than being chosen
+  beside it.
+- **A new evidence class** means a member, a name, a row in
+  `atlas_verify_evidence_family_of`, the CHECK on `verify_evidence.class`, and a
+  decision about whether it may be a root. Bump `ATLAS_VERIFY_FAMILY_VERSION`
+  when the map changes, so stored results are not reinterpreted.
+- **A change to the aggregation** means a new `ATLAS_VERIFY_ALGORITHM` string,
+  because a stored result records the algorithm that produced it and a future
+  version must not silently reinterpret a past one. Same for
+  `ATLAS_VERIFY_PRIOR_VERSION`.
+- **A new policy key** means a branch in `atlas_verifypolicy_parse_buffer`, a
+  field, a documented line in `deploy/a92/verification.conf.template`, and a case
+  in the malformed matrix. An unknown key stays an error.
+- **A new struct field on `atlas_migration`** means auditing every construction
+  site: `tests/test_db.c` built two of them field by field and silently stopped
+  being complete when A9.1 added `foreign_keys_off`, which UBSan reported only
+  once A9.2's schema bump changed the stack layout. Zero first, assign after.
+
 ## Extending A9.1 safely
 
 - **A new knowledge kind** means a member of `atlas_decision_kind`, a row in
@@ -1898,11 +2060,20 @@ a command means adding a service function plus a method on both renderers.
   still runs under a bare `ctest` but is invisible to `ctest -L unit` and to
   `ctest -LE daemon`, so it silently stops being part of the subsets people
   actually run.
-- **A new command** touches four places: a service function in `src/core/service.c`
-  (or `service_daemon.c`), a method on `atlas_renderer_vtbl` in `src/cli/render.h`,
-  an implementation in **both** `render_human.c` and `render_json.c`, and dispatch
-  plus help text in `src/cli/cli.c`. The vtbl is not optional-per-renderer: a
-  missing implementation is how human and JSON output drift apart.
+- **A new command** touches **five** places: a service function in
+  `src/core/service.c` (or another `service_*.c`), a method on
+  `atlas_renderer_vtbl` in `src/cli/render.h`, an implementation in **both**
+  `render_human.c` and `render_json.c`, dispatch plus help text in
+  `src/cli/cli.c`, **and the `COMMANDS[]` table in `is_a_command`**. The vtbl is
+  not optional-per-renderer: a missing implementation is how human and JSON
+  output drift apart.
+
+  The fifth is the one that gets forgotten, and its failure mode is the
+  misleading one: everything else is wired, the code is reachable, every test
+  that calls the service layer passes — and the binary answers `unknown command`.
+  A9.2 shipped `verify` into a real deployment before anything noticed, because
+  nothing in the suite drives the argument parser for a command that does not
+  exist yet. If you add a command, run it once from the built binary.
 
 ## Test conventions
 
@@ -2074,7 +2245,8 @@ two documents on stdout.
 `docs/operations.md` · `docs/impact-gates.md` ·
 `docs/security/A7_THREAT_MODEL.md` · `docs/security/A7_SECURITY_REVIEW.md` ·
 `docs/security/A7_1_THREAT_MODEL.md` · `docs/security/A7_1_OPERATIONS.md` ·
-`docs/orchestration.md` · `docs/remote-access.md` · `docs/git-safety.md` ·
+`docs/orchestration.md` · `docs/remote-access.md` · `docs/verification.md` ·
+`docs/git-safety.md` ·
 `docs/daemon-and-ipc.md` ·
 `docs/watcher-consistency.md` · `docs/systemd-user-service.md` ·
 `docs/ai-trust-boundary.md` · `docs/claude-integration.md` ·

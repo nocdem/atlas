@@ -26,6 +26,8 @@
 #include "atlas/datadir.h"
 #include <sqlite3.h>
 
+#include <stdio.h>
+
 #include "atlas/db.h"
 #include "atlas/decision_ops.h"
 #include "atlas_test.h"
@@ -90,7 +92,7 @@ static void test_a_schema_nine_database_reaches_ten_additively(void) {
     atlas_db *db = NULL;
     T_OK(atlas_db_open(atlas_buf_cstr(&path), &db, &err), &err);
     T_OK(atlas_db_migrate(db, &err), &err);
-    T_EQ_INT(schema_of(db), 13);
+    T_EQ_INT(schema_of(db), ATLAS_SCHEMA_VERSION);
 
     /* A real decision, so the "nothing else moved" assertions are about rows
      * rather than about two empty tables agreeing. */
@@ -125,7 +127,17 @@ static void test_a_schema_nine_database_reaches_ten_additively(void) {
     T_REQUIRE_MSG(before.len > 0, "the fixture wrote no revision");
 
     /* Wind back to nine exactly as an upgrade would find it, then forward. */
-    exec(db, "DROP TABLE gw_audit;"
+    exec(db, "DROP TABLE verify_lifecycle_audit;"
+             "DROP TABLE verify_reliability;"
+             "DROP TABLE verify_outcomes;"
+             "DROP TABLE verify_results;"
+             "DROP TABLE verify_attestation_evidence;"
+             "DROP TABLE verify_attestations;"
+             "DROP TABLE verify_evidence_deps;"
+             "DROP TABLE verify_evidence;"
+             "DROP TABLE verify_claims;"
+             "DROP TABLE verify_actors;"
+             "DROP TABLE gw_audit;"
              "DROP TABLE api_keys;"
              "DROP TABLE sem_includes;"
              "DROP TABLE sem_edges;"
@@ -140,7 +152,7 @@ static void test_a_schema_nine_database_reaches_ten_additively(void) {
     T_CHECK(!table_exists(db, "decision_edge_events"));
 
     T_OK(atlas_db_migrate(db, &err), &err);
-    T_EQ_INT(schema_of(db), 13);
+    T_EQ_INT(schema_of(db), ATLAS_SCHEMA_VERSION);
     T_CHECK_MSG(table_exists(db, "decision_edge_events"), "migration 10 created nothing");
 
     /* The assertion the whole design rests on. */
@@ -153,7 +165,7 @@ static void test_a_schema_nine_database_reaches_ten_additively(void) {
     /* And it is idempotent as a set: migrating an up-to-date database is a
      * no-op rather than a second CREATE. */
     T_OK(atlas_db_migrate(db, &err), &err);
-    T_EQ_INT(schema_of(db), 13);
+    T_EQ_INT(schema_of(db), ATLAS_SCHEMA_VERSION);
 
     atlas_buf_free(&before);
     atlas_buf_free(&after);
@@ -228,12 +240,18 @@ static void test_a_future_schema_is_refused_on_the_writable_path(void) {
      *
      * This number has to stay ahead of `ATLAS_SCHEMA_VERSION`: the test is
      * about a database an *older* binary must refuse, so the moment the real
-     * schema catches up, the fixture stops simulating the future and starts
-     * colliding with a migration that genuinely applied. Raise it with every
-     * schema bump. */
-    exec(db, "INSERT INTO schema_migrations(version, name, applied_at)"
-             " VALUES(14, 'from the future', '2030-01-01T00:00:00Z');");
-    T_EQ_INT(schema_of(db), 14);
+     * schema catches up, a fixed number stops simulating the future and starts
+     * colliding with a migration that genuinely applied — which is exactly what
+     * happened when A9.2 added migration 14. Derived from
+     * `ATLAS_SCHEMA_VERSION` instead, so it is always one ahead and the collision
+     * cannot recur. */
+    char future[128];
+    (void)snprintf(future, sizeof future,
+                   "INSERT INTO schema_migrations(version, name, applied_at)"
+                   " VALUES(%d, 'from the future', '2030-01-01T00:00:00Z');",
+                   ATLAS_SCHEMA_VERSION + 1);
+    exec(db, future);
+    T_EQ_INT(schema_of(db), ATLAS_SCHEMA_VERSION + 1);
 
     atlas_err ferr;
     atlas_err_init(&ferr);
@@ -242,7 +260,7 @@ static void test_a_future_schema_is_refused_on_the_writable_path(void) {
     T_CHECK_MSG(strstr(atlas_err_msg(&ferr), "newer Atlas") != NULL,
                 "the refusal does not say why: %s", atlas_err_msg(&ferr));
     /* Refused, not rewritten. The row is still there. */
-    T_EQ_INT(schema_of(db), 14);
+    T_EQ_INT(schema_of(db), ATLAS_SCHEMA_VERSION + 1);
 
     atlas_db_close(db);
     atlas_buf_free(&path);

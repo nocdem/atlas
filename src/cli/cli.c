@@ -140,6 +140,11 @@ void atlas_cli_print_help(FILE *out) {
         "  gate check NAME            assess every approved decision against the indexed\n"
         "                             state; exits 8 on review required, 9 on blocked\n"
         "  gate show NAME ID          the same assessment, for one decision\n"
+        "  verify show CLAIM-ID       what evidence bears on one claim, and what a policy\n"
+        "                             would do about it; writes nothing\n"
+        "  verify run NAME CLAIM-ID   the same, recording the result and performing the\n"
+        "                             transition when a root-owned policy allows it\n"
+        "  verify policy              the root-owned verification policy; opens no index\n"
         "  version                    print the version\n"
         "  help                       print this help\n");
     /* Split because ISO C only guarantees 4095-byte string literals, and
@@ -956,6 +961,14 @@ static atlas_ctx_mode mode_for(const cli_state *st) {
     if (strcmp(cmd, "gate") == 0) {
         return ATLAS_CTX_READ;
     }
+    /* A9.2. `verify show` assesses and writes nothing, so it must not take the
+     * writer lock — the reason `gate` is READ. `verify run` records a result and
+     * may transition, so it needs AUTO. `verify policy` opens no index at all,
+     * and READ is what lets it answer on a machine where Atlas has never run. */
+    if (strcmp(cmd, "verify") == 0 && st->operand_count > 0 &&
+        (strcmp(st->operands[0], "show") == 0 || strcmp(st->operands[0], "policy") == 0)) {
+        return ATLAS_CTX_READ;
+    }
     if (strcmp(cmd, "repo") == 0 && st->operand_count > 0 &&
         (strcmp(st->operands[0], "add") == 0 || strcmp(st->operands[0], "remove") == 0)) {
         return ATLAS_CTX_WRITE;
@@ -1244,6 +1257,70 @@ static atlas_status render_outcome(cli_state *st, atlas_renderer *r, const char 
  * are distinct because an automation that treats "a human should look at this"
  * and "Atlas could not tell" identically will eventually be handed the second
  * and behave as though it got the first. */
+/* --- A9.2: verification ------------------------------------------------------
+ *
+ * `verify show` and `verify policy` are reads. `verify run` can change a
+ * lifecycle state and is the one subcommand that writes.
+ *
+ * There is no `verify approve`, no `verify override` and no flag that lowers a
+ * threshold, and their absence is deliberate rather than unfinished: every
+ * bound on what Atlas may automate lives in a root-owned file that this process
+ * cannot edit. A command-line switch that relaxed one would hand the constrained
+ * principal the power to unconstrain itself, which is the argument A7 makes
+ * about `ATLAS_AUTHORITY_POLICY_PATH` and it holds here word for word.
+ *
+ * `verify policy` opens no index and binds nothing, so it answers on a machine
+ * where Atlas has never run — which is exactly when somebody asks it. */
+static atlas_status run_verify(cli_state *st, atlas_ctx *ctx, atlas_renderer *r, atlas_err *err) {
+    if (st->operand_count == 0) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "usage: atlas verify show CLAIM-ID | atlas verify run NAME CLAIM-ID "
+                             "| atlas verify policy");
+    }
+    const char *sub = st->operands[0];
+    atlas_verify_report rep;
+    atlas_verify_report_init(&rep);
+    atlas_status result;
+
+    if (strcmp(sub, "policy") == 0) {
+        if (st->operand_count != 1) {
+            atlas_verify_report_free(&rep);
+            return atlas_err_set(err, ATLAS_ERR_USAGE, "usage: atlas verify policy");
+        }
+        result = atlas_service_verify_policy(&rep, err);
+    } else if (strcmp(sub, "show") == 0) {
+        if (st->operand_count != 2) {
+            atlas_verify_report_free(&rep);
+            return atlas_err_set(err, ATLAS_ERR_USAGE, "usage: atlas verify show CLAIM-ID");
+        }
+        result = atlas_service_verify_show(ctx, strtoll(st->operands[1], NULL, 10), &rep, err);
+    } else if (strcmp(sub, "run") == 0) {
+        if (st->operand_count != 3) {
+            atlas_verify_report_free(&rep);
+            return atlas_err_set(err, ATLAS_ERR_USAGE, "usage: atlas verify run NAME CLAIM-ID");
+        }
+        result = atlas_service_verify_run(ctx, strtoll(st->operands[2], NULL, 10),
+                                          st->operands[1], &rep, err);
+    } else {
+        atlas_verify_report_free(&rep);
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "usage: atlas verify show|run|policy");
+    }
+
+    if (result == ATLAS_OK) {
+        result = renderer_open(r, st->opts.json, st->out, "verify", err);
+    }
+    if (result == ATLAS_OK) {
+        result = r->v->verify(r, &rep, err);
+    }
+    if (result == ATLAS_OK) {
+        result = renderer_close(r, err);
+    } else {
+        renderer_abort(r);
+    }
+    atlas_verify_report_free(&rep);
+    return result;
+}
+
 static atlas_status run_gate(cli_state *st, atlas_ctx *ctx, atlas_renderer *r, atlas_err *err) {
     if (st->operand_count == 0) {
         return atlas_err_set(err, ATLAS_ERR_USAGE,
@@ -1860,6 +1937,10 @@ static bool remote_serves(const cli_state *st) {
     if (strcmp(cmd, "gate") == 0) {
         return strcmp(sub, "check") == 0 || strcmp(sub, "show") == 0;
     }
+    if (strcmp(cmd, "verify") == 0) {
+        return strcmp(sub, "show") == 0 || strcmp(sub, "run") == 0 ||
+               strcmp(sub, "policy") == 0;
+    }
     if (strcmp(cmd, "context") == 0) {
         return strcmp(sub, "build") == 0;
     }
@@ -1919,6 +2000,7 @@ static bool is_a_command(const char *cmd) {
         "diff",    "daemon",  "sync",      "events",  "code",    "decision", "gate",
         "job",     "dispatcher", "backup", "maintenance", "service", "mcp",  "hook",
         "integrate", "version", "help", "context", "operation", "api-key", "gateway",
+        "verify",
     };
     for (size_t i = 0; i < sizeof COMMANDS / sizeof COMMANDS[0]; i++) {
         if (strcmp(cmd, COMMANDS[i]) == 0) {
@@ -3703,6 +3785,8 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
         result = run_context(st, ctx, &r, err);
     } else if (strcmp(cmd, "gate") == 0) {
         result = run_gate(st, ctx, &r, err);
+    } else if (strcmp(cmd, "verify") == 0) {
+        result = run_verify(st, ctx, &r, err);
     } else if (strcmp(cmd, "decision") == 0) {
         result = run_decision(st, ctx, &r, limit, err);
     } else {

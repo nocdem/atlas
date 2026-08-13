@@ -79,8 +79,49 @@ typedef enum atlas_decision_op_kind {
      * deleted and no prose is rewritten: the revision moves from APPROVED to
      * RESOLVED, one `decision_events` row records that it did, and the document
      * stops being effective. */
-    ATLAS_DECISION_OP_RESOLVE
+    ATLAS_DECISION_OP_RESOLVE,
+    /* A9.2. The three transitions a root-owned verification policy may make on
+     * its own authority.
+     *
+     * They are separate op kinds rather than a flag on the existing three, and
+     * that is the security decision. An operator approval and a machine
+     * approval reach the same transition by completely different routes — one
+     * spends a terminal challenge, the other spends a warrant — and a boolean
+     * on a shared op would be a boolean some future caller could set. Two
+     * disjoint kinds mean the authorisation check is chosen by the operation's
+     * identity rather than by a field inside it.
+     *
+     * `atlas_decision_op_needs_challenge` returns **false** for all three, which
+     * looks alarming and is not: they require a warrant instead, checked with
+     * exactly the strictness `spend_challenge` applies — bound to one document,
+     * one revision, one target state and one content hash, single-use, and
+     * consumed by a conditional UPDATE that names the state it observed. What
+     * changes is *who can mint the capability*, not how tightly it binds.
+     *
+     * Two absences are deliberate and are the phase's deferrals.
+     *
+     * **No AUTO_REJECT.** Automatic rejection needs an explicit falsification
+     * condition, and low confidence is not one — it usually means missing
+     * evidence, an index that has not run, or a scope mismatch. Rejecting a
+     * legitimate proposal is not the mirror of failing to approve one: the
+     * first destroys work and is terminal, the second costs a wait.
+     *
+     * **No AUTO_SUPERSEDE.** Supersession must establish that two records are
+     * about the same subject at compatible scope, and Atlas has no mechanical
+     * test for that; a newer record existing is not one, and a timestamp is
+     * emphatically not one. Deciding wrongly would retire a live decision in
+     * favour of an unrelated one, with an impeccable audit trail. Replacing an
+     * approved record therefore stays an operator act.
+     *
+     * Both are **absent rather than refused**, the house pattern: an absent
+     * path cannot be weakened by a later edit the way a refusing one can. */
+    ATLAS_DECISION_OP_AUTO_APPROVE,
+    ATLAS_DECISION_OP_AUTO_RESOLVE
 } atlas_decision_op_kind;
+
+/* True for the three A9.2 machine operations. Asked wherever the distinction
+ * matters, so no caller keeps its own list. */
+bool atlas_decision_op_is_machine(atlas_decision_op_kind k);
 
 const char *atlas_decision_op_kind_name(atlas_decision_op_kind k);
 /* True when this operation changes a lifecycle state and therefore requires a
@@ -152,6 +193,18 @@ typedef struct atlas_decision_op {
 
     /* PROMOTE: the `ai_decisions` row id. */
     int64_t legacy_id;
+
+    /* A9.2. AUTO_*: the `verify_lifecycle_audit` row that authorises this
+     * transition, written by the verification engine in the same transaction.
+     *
+     * It is the machine analogue of `token`, and it is an id rather than a
+     * secret for a reason that is worth being explicit about: a warrant is not
+     * something anybody carries in from outside. It is minted and spent inside
+     * one transaction on the writer thread, and the check is against the
+     * document, the revision, the target state and the content hash — so
+     * guessing an integer buys nothing. There is no RPC method, MCP tool or
+     * gateway route that accepts this field. */
+    int64_t warrant_id;
 
     /* CHALLENGE with a REVALIDATE intent: the assessment the operator is being
      * shown, so the validation record preserves what was actually seen rather

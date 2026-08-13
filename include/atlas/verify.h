@@ -1,0 +1,1185 @@
+/* Atlas - A9.2: claims, attestations, evidence and self-verifying memory.
+ * Copyright 2026 The Atlas Authors. Licensed under the Apache License 2.0.
+ *
+ * A9.1 made a durable record say *what sort of knowledge it is* and *how far
+ * through the approval workflow it got*. Neither axis says anything about
+ * whether the record is **true**, and nothing in A0..A9.1 could: an approved
+ * INVARIANT and an approved guess are the same row.
+ *
+ * A9.2 adds the third axis. It answers a different question from either
+ * existing one, and the whole difficulty of the phase is in keeping the three
+ * apart:
+ *
+ *   kind    — what sort of knowledge is this?          (A9.1, on the document)
+ *   status  — how far through approval did it get?     (A4, from the ledger)
+ *   verify  — what evidence bears on whether it holds? (A9.2, derived on read)
+ *
+ * `INVARIANT + PROPOSED + VERIFIED` is a legal and useful combination: Atlas
+ * has mechanically established the proposition and nobody has adopted it as
+ * project policy. So is `DECISION + APPROVED + INCONCLUSIVE`: somebody with
+ * authority chose a direction and the evidence that it was carried out is
+ * incomplete. **No code path derives any one of the three from another**, which
+ * is the same rule A9.1 states about kind and status, extended to three.
+ *
+ * ## The five separations this header exists to enforce
+ *
+ * 1. **An actor is not evidence.** Three models reading one document are three
+ *    attestations over one evidence root. Counting them as three independent
+ *    corroborations is the single most attractive mistake available to a system
+ *    like this, because it is what makes a confident wrong answer cheap to
+ *    manufacture. See `atlas_verify_aggregate` and the union-find in
+ *    `src/verify/verify.c`: within one independent group only the strongest
+ *    attestation counts, never the sum.
+ *
+ * 2. **Reliability is not authority.** A source that has been right about
+ *    control flow a thousand times has thereby gained no power to accept a
+ *    privacy risk on the project's behalf. Reliability is a property of a
+ *    source's past factual accuracy in a domain; authority is a property an
+ *    operator confers. `atlas_verify_basis` separates the two questions and
+ *    `ATLAS_VERIFY_BASIS_JUDGMENT` is the class for which no amount of the
+ *    former substitutes for the latter.
+ *
+ * 3. **A confidence score is not a probability.** `confidence` is an integer
+ *    0..100 produced by a named, versioned, reproducible aggregation over the
+ *    evidence Atlas holds *now*. It becomes a probability only after the
+ *    calibration this phase ships the machinery for and — on this machine, at
+ *    this moment — has no data for. Reporting `94/100` as `94%` is the lie this
+ *    vocabulary is shaped to make hard to tell: they are different types with
+ *    different printers, and `atlas_verify_calibration` gates the second.
+ *
+ * 4. **Descriptive truth is not normative adoption.** Atlas can mechanically
+ *    establish "the serializer emits zero here". It cannot thereby establish
+ *    "the protocol shall always emit zero here" — that is a choice somebody
+ *    makes, and a verifier that blurred the two would let any observation of
+ *    the current implementation quietly become permanent policy.
+ *    `atlas_verify_claim_semantics` is where the distinction lives, and
+ *    `atlas_verify_basis_may_verify_semantics` is where it is enforced: a
+ *    deterministic verifier may only ever establish a DESCRIPTIVE claim.
+ *
+ * 5. **Deterministic verification does not wait for calibration.** This is the
+ *    rule the phase is built around and it runs against the intuition that more
+ *    caution is always safer. If a proposition has a complete mechanical truth
+ *    condition and Atlas evaluated it, how often some model has been right in
+ *    the past is not an input to the answer and must not be made into a
+ *    precondition for acting on it. Blocking a proven fact on an unrelated
+ *    statistic is not conservatism; it is a category error that happens to look
+ *    like conservatism. See `atlas_verify_basis_requires_calibration`.
+ *
+ * ## What is stored and what is derived
+ *
+ * Stored: claims, actors, attestations, evidence, the evidence dependency
+ * edges, append-only verification results, reliability outcomes and the machine
+ * lifecycle audit. All of it is canonical — none of it is rebuildable from the
+ * repository, because an attestation is a statement somebody made and a
+ * repository does not remember that anybody spoke.
+ *
+ * Derived on read: the verification state, the confidence score, the
+ * independent-group count, staleness and the policy verdict. This is A6's rule
+ * about freshness and A4's about link currency, for their reason — a cached
+ * verdict is a value that is wrong between the change and the recomputation,
+ * and "does the evidence still support this?" is exactly the question that must
+ * not be answered from a stale cache.
+ *
+ * A **verification result** row is the one apparent exception and is not one:
+ * it records what an aggregation concluded *at a moment*, with the algorithm
+ * version and the evidence snapshot that produced it, because a machine
+ * lifecycle transition must be reconstructable years later. It is history, not
+ * state — the same argument A6 makes for `decision_validations`.
+ *
+ * ## Backward compatibility is exact rather than approximate
+ *
+ * `ATLAS_VERIFY_UNVERIFIED` is zero and a record with no claims has no
+ * evidence, so every record written before this phase existed reports
+ * UNVERIFIED without a migration touching a single decision row. Migration 14
+ * is purely additive for that reason: it adds tables and changes nothing, so no
+ * content hash moves and `atlas doctor` has nothing new to report.
+ */
+#ifndef ATLAS_VERIFY_H
+#define ATLAS_VERIFY_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#include "atlas/buf.h"
+#include "atlas/decision.h"
+#include "atlas/error.h"
+#include "atlas/limits.h"
+
+/* Forward-declared rather than pulling in `atlas/db.h`, the way `orch_ops.h`
+ * and `snapshot.h` do: sqlite3 types must not escape src/db, and a vocabulary
+ * header should not drag the whole schema API behind it. */
+typedef struct atlas_db atlas_db;
+
+/* --- the third axis -------------------------------------------------------
+ *
+ * What Atlas currently knows about whether a proposition holds. Derived from
+ * the claims attached to a record and the evidence attached to those claims,
+ * recomputed on every read.
+ *
+ * **UNVERIFIED is zero**, which is A6's rule about UNKNOWN and A8's about
+ * DISABLED: a zeroed struct, an absent row and a record nobody has looked at
+ * must all read as "Atlas has not established this", never as "fine". */
+typedef enum atlas_verify_state {
+    /* No claim, or no attestation on any claim. The state of every record
+     * Atlas held before this phase, and the state a new proposal starts in. */
+    ATLAS_VERIFY_UNVERIFIED = 0,
+    /* A verification run is in flight. Transient and never terminal; a crash
+     * leaves it here and the next read recomputes from what actually landed. */
+    ATLAS_VERIFY_VERIFYING,
+    /* Evidence leans in favour and does not meet the bar for VERIFIED. The
+     * ordinary outcome of the empirical path, and never sufficient on its own
+     * for a machine lifecycle transition. */
+    ATLAS_VERIFY_SUPPORTED,
+    /* Established. For a DETERMINISTIC basis this means a mechanical verifier
+     * evaluated the claim's stated truth condition and it passed — within the
+     * claim's declared scope and no further. For an EMPIRICAL basis it means
+     * the aggregate cleared the policy's threshold with the required number of
+     * genuinely independent evidence groups. */
+    ATLAS_VERIFY_VERIFIED,
+    /* Evidence against. Not the same as "the record is wrong": a contradicted
+     * claim about an approved decision usually means the implementation
+     * diverged from what was approved, which is `ATLAS_CONFLICT_IMPLEMENTATION`
+     * and an obligation, not grounds to retract the decision. */
+    ATLAS_VERIFY_CONTRADICTED,
+    /* Looked, could not tell. Distinct from UNVERIFIED on purpose: "nobody has
+     * examined this" and "we examined it and the evidence does not decide"
+     * call for different actions, and collapsing them loses the more useful
+     * half. */
+    ATLAS_VERIFY_INCONCLUSIVE,
+    /* There was a verdict and its evidence no longer describes the present —
+     * the commit moved, the deployment changed, the observation aged past what
+     * policy allows for this kind. The verdict is kept and reported as stale;
+     * nothing is deleted. A9.2 never silently re-verifies. */
+    ATLAS_VERIFY_STALE
+} atlas_verify_state;
+
+const char *atlas_verify_state_name(atlas_verify_state s);
+bool atlas_verify_state_parse(const char *name, atlas_verify_state *out);
+
+/* --- which epistemic mechanism produced the verdict -----------------------
+ *
+ * The most load-bearing enum in the phase, because it decides which of three
+ * completely different rulebooks applies.
+ *
+ * **UNKNOWN is zero and is not writable.** A verification result must say how
+ * it was reached; one that does not is not a result. `atlas_verify_basis_
+ * writable` refuses it at the write point, mirroring
+ * `atlas_provenance_writable_in_a2`, `atlas_code_resolution_writable_in_a3` and
+ * `atlas_decision_actor_writable_by_adapter`. */
+typedef enum atlas_verify_basis {
+    ATLAS_VERIFY_BASIS_UNKNOWN = 0,
+    /* A reproducible mechanical verifier evaluated an explicitly bounded truth
+     * condition over explicitly bound artifacts.
+     *
+     * **This does not mean "proven for all implementations for all time".** It
+     * means: within the scope the claim declares, Atlas has a pass/fail
+     * procedure that another run over the same artifacts reproduces. A unit
+     * test establishing `f rejects y at commit z` is deterministic about
+     * exactly that and about nothing wider, and a claim whose text outruns its
+     * verifier's scope is the failure mode this phase watches for — see
+     * `atlas_verify_claim.scope_note` and A8-CI's rule that PROVEN means the
+     * compiler proved it.
+     *
+     * Historical source reliability is not an input here and must never become
+     * a precondition. */
+    ATLAS_VERIFY_BASIS_DETERMINISTIC,
+    /* The proposition depends materially on aggregating evidence of varying
+     * quality from sources of varying reliability. Several documents to
+     * reconcile, several interpretations to weigh, no single mechanical
+     * verifier that settles it.
+     *
+     * This is the path for which calibration is genuinely required, because the
+     * number it produces is a claim about how often sources of this kind have
+     * been right — and with no history that claim has no content. */
+    ATLAS_VERIFY_BASIS_EMPIRICAL,
+    /* A normative choice rather than a discoverable fact. Which architecture to
+     * adopt, what to call the product, whether a known risk is acceptable.
+     *
+     * Evidence informs it and never settles it, because there is nothing for a
+     * verifier to measure the proposition against: the question is not what is
+     * so but what the project shall do. Atlas may verify the *premises* of a
+     * judgment to any strength and still have established nothing about the
+     * judgment. No confidence score authorises a JUDGMENT transition. */
+    ATLAS_VERIFY_BASIS_JUDGMENT
+} atlas_verify_basis;
+
+const char *atlas_verify_basis_name(atlas_verify_basis b);
+bool atlas_verify_basis_parse(const char *name, atlas_verify_basis *out);
+/* Refuses UNKNOWN. Asked at the single write point, not remembered by callers. */
+bool atlas_verify_basis_writable(atlas_verify_basis b);
+
+/* Whether a verdict on this basis needs historical calibration before it may
+ * drive a lifecycle transition.
+ *
+ * True for EMPIRICAL and false for DETERMINISTIC, and that asymmetry is the
+ * phase's central rule rather than an optimisation. It is a *function* so that
+ * the tests can assert it and no policy path can quietly reintroduce the
+ * coupling: a deterministic verdict blocked on an actor's sample count would be
+ * blocked on a statistic that is not an input to it.
+ *
+ * JUDGMENT returns false too, and for a reason that is not the same reason:
+ * calibration is irrelevant there because no automatic transition happens at
+ * all. Never read a false here as "may proceed". */
+bool atlas_verify_basis_requires_calibration(atlas_verify_basis b);
+
+/* --- descriptive versus normative ----------------------------------------
+ *
+ * The mechanism behind separation 4. A claim says which of two utterly
+ * different things it asserts, and a verifier is only allowed to establish the
+ * one it can actually observe.
+ *
+ * DESCRIPTIVE is zero because it is the safe default: a claim that does not say
+ * asserts the weaker thing. Recording an observation as normative would be
+ * the direction that manufactures policy out of a measurement, so that is the
+ * direction that must be stated explicitly. */
+typedef enum atlas_verify_claim_semantics {
+    /* "The system currently does X." Observable, falsifiable, and true only of
+     * the artifacts and moment it is bound to. */
+    ATLAS_CLAIM_DESCRIPTIVE = 0,
+    /* "The system shall do X." A rule. No measurement of the present
+     * establishes it, because it is not about the present. */
+    ATLAS_CLAIM_NORMATIVE
+} atlas_verify_claim_semantics;
+
+const char *atlas_verify_claim_semantics_name(atlas_verify_claim_semantics s);
+bool atlas_verify_claim_semantics_parse(const char *name, atlas_verify_claim_semantics *out);
+
+/* Whether a verdict on this basis may establish a claim with these semantics.
+ *
+ * DETERMINISTIC + NORMATIVE is **false**, and that single cell is the whole of
+ * separation 4's enforcement. A mechanical verifier reads the world; a
+ * normative claim is not about the world; so there is nothing for it to read.
+ * Allowing the pair would mean that observing an implementation detail once,
+ * with a policy that auto-approves deterministic INVARIANTs, silently converts
+ * "it happens to do this" into "it must always do this" — with an audit trail
+ * that looks impeccable. */
+bool atlas_verify_basis_may_verify_semantics(atlas_verify_basis b,
+                                             atlas_verify_claim_semantics s);
+
+/* --- what one actor said about one claim ---------------------------------
+ *
+ * INCONCLUSIVE is zero: an attestation nobody filled in asserts nothing. */
+typedef enum atlas_verify_verdict {
+    ATLAS_ATTEST_INCONCLUSIVE = 0,
+    ATLAS_ATTEST_SUPPORT,
+    ATLAS_ATTEST_CONTRADICT
+} atlas_verify_verdict;
+
+const char *atlas_verify_verdict_name(atlas_verify_verdict v);
+bool atlas_verify_verdict_parse(const char *name, atlas_verify_verdict *out);
+
+/* --- who is speaking ------------------------------------------------------
+ *
+ * Vendor-neutral by construction. There is no `CLAUDE`, no `ANTHROPIC` and no
+ * `OPENAI` in this enum and there must not be: a model's name is a string an
+ * operator or a model supplies, and a schema that enumerated vendors would be
+ * a schema that has to change when the market does, and — worse — one that
+ * invites a reliability rule keyed on a name anybody can type.
+ *
+ * UNKNOWN is zero. An actor whose class was never established is the weakest
+ * thing that can speak, not a neutral one. */
+typedef enum atlas_verify_actor_class {
+    ATLAS_ACTOR_UNKNOWN = 0,
+    /* A person, identified by a stable reference an operator configured.
+     * Authority roles are *not* here — see the note on authority below. */
+    ATLAS_ACTOR_HUMAN,
+    /* A model. Its provider, family, version, role, session and orchestrator
+     * are metadata on the row and are self-declared unless authenticated. */
+    ATLAS_ACTOR_AI_AGENT,
+    /* A program Atlas ran, such as a compiler or a static analyser. */
+    ATLAS_ACTOR_TOOL,
+    /* A test suite Atlas executed. */
+    ATLAS_ACTOR_TEST,
+    /* A probe against a running system, at a moment, against a deployed
+     * revision. */
+    ATLAS_ACTOR_RUNTIME_OBSERVATION,
+    /* The repository itself: bytes at a commit. */
+    ATLAS_ACTOR_REPOSITORY_EVIDENCE,
+    /* A document, at a revision. */
+    ATLAS_ACTOR_DOCUMENT,
+    /* Atlas' own verification engine, executing a named deterministic
+     * verifier. The only actor that may carry a DETERMINISTIC verdict. */
+    ATLAS_ACTOR_ATLAS_VERIFIER
+} atlas_verify_actor_class;
+
+const char *atlas_verify_actor_class_name(atlas_verify_actor_class c);
+bool atlas_verify_actor_class_parse(const char *name, atlas_verify_actor_class *out);
+
+/* --- how well Atlas knows the speaker is who it says ----------------------
+ *
+ * Separation: **self-description is not identification**. A model submitting an
+ * attestation may say it is an AI agent called anything it likes; it may not
+ * thereby become a compiler.
+ *
+ * SELF_DECLARED is zero, because an identity nobody checked is the default and
+ * must be the weakest. */
+typedef enum atlas_verify_actor_identity {
+    /* The submitter said so. Every field is a claim about itself, which is not
+     * evidence about itself — A7.1's rule about peer identity, one layer up. */
+    ATLAS_ACTOR_IDENTITY_SELF_DECLARED = 0,
+    /* The kernel or a credential established it: an `SO_PEERCRED` uid on the
+     * socket, or an authenticated gateway credential. */
+    ATLAS_ACTOR_IDENTITY_PEER_AUTHENTICATED,
+    /* Atlas created this actor because Atlas performed the act. The only way a
+     * TOOL, TEST, RUNTIME_OBSERVATION or ATLAS_VERIFIER actor comes into
+     * existence. */
+    ATLAS_ACTOR_IDENTITY_ATLAS_ATTESTED
+} atlas_verify_actor_identity;
+
+const char *atlas_verify_actor_identity_name(atlas_verify_actor_identity i);
+bool atlas_verify_actor_identity_parse(const char *name, atlas_verify_actor_identity *out);
+
+/* Whether this actor class may only exist with `ATLAS_ACTOR_IDENTITY_ATLAS_
+ * ATTESTED` identity.
+ *
+ * True for TOOL, TEST, RUNTIME_OBSERVATION and ATLAS_VERIFIER — the four
+ * classes whose whole evidentiary weight comes from Atlas having *done* the
+ * thing. This is the enforcement for "an AI saying `clang proves this` is not
+ * equivalent to Atlas running clang": a model-submitted actor is always
+ * SELF_DECLARED, so naming one of these classes is refused at the write point
+ * rather than accepted and quietly discounted.
+ *
+ * Discounting would not be enough. A discounted forgery still appears in the
+ * evidence list, still reads as tool output to a human skimming a UI, and still
+ * has to be argued away by whoever finds it. */
+bool atlas_verify_actor_class_requires_atlas_identity(atlas_verify_actor_class c);
+
+/* --- where a piece of evidence came from ----------------------------------
+ *
+ * Every evidence row answers "where did this come from?" in a form somebody can
+ * go and check. There is deliberately no `TEXT` class: opaque prose with no
+ * provenance is what this phase exists to stop being counted as evidence. */
+typedef enum atlas_verify_evidence_class {
+    ATLAS_EVIDENCE_UNKNOWN = 0,
+    /* Bytes in a repository at a commit, optionally a path, symbol and range. */
+    ATLAS_EVIDENCE_SOURCE_CODE,
+    /* A compiler or static analyser's finding, carrying A8-CI's own evidence
+     * class so PROVEN and CANDIDATE do not get flattened into each other. */
+    ATLAS_EVIDENCE_COMPILER,
+    /* A named test in a named suite, at a commit, with a result. */
+    ATLAS_EVIDENCE_TEST,
+    /* An observation of a running system at a timestamp. */
+    ATLAS_EVIDENCE_RUNTIME,
+    /* A value read from deployed configuration, with the config's identity. */
+    ATLAS_EVIDENCE_DEPLOYED_CONFIG,
+    /* A commit, a range, an authorship fact. */
+    ATLAS_EVIDENCE_GIT_HISTORY,
+    /* A protocol or specification document at a revision. Describes intent,
+     * which is why it is not the same class as source. */
+    ATLAS_EVIDENCE_SPECIFICATION,
+    /* Any other document at a revision. */
+    ATLAS_EVIDENCE_DOCUMENT,
+    /* An existing Atlas knowledge record. Derived, never a root: what Atlas
+     * already believes cannot be independent corroboration of itself. */
+    ATLAS_EVIDENCE_ATLAS_KNOWLEDGE,
+    /* A person said so. */
+    ATLAS_EVIDENCE_HUMAN_STATEMENT,
+    /* A model's analysis. Always an interpretation of something else, which is
+     * why it must declare what it read. */
+    ATLAS_EVIDENCE_AI_ANALYSIS
+} atlas_verify_evidence_class;
+
+const char *atlas_verify_evidence_class_name(atlas_verify_evidence_class c);
+bool atlas_verify_evidence_class_parse(const char *name, atlas_verify_evidence_class *out);
+
+/* --- evidence families ----------------------------------------------------
+ *
+ * Which evidence classes share failure modes, versioned so that a later phase
+ * can revise the taxonomy without silently reinterpreting stored results.
+ *
+ * The point is not to model causation. It is the single conservative rule that
+ * **known shared roots must not be double-counted**, plus a coarse statement of
+ * which kinds of evidence can fail together. A test generated from the
+ * implementation it tests shares failure modes with reading that
+ * implementation; a runtime probe against a deployed binary genuinely does not.
+ *
+ * V1 is three families and no probabilistic machinery, because an auditable
+ * rule that is right about the obvious cases beats an elaborate one nobody can
+ * check. */
+typedef enum atlas_verify_evidence_family {
+    ATLAS_EVIDENCE_FAMILY_UNKNOWN = 0,
+    /* Artifacts at rest: source, compiler output over that source, git history,
+     * documents, specifications. All ultimately readings of a tree. */
+    ATLAS_EVIDENCE_FAMILY_STATIC_ARTIFACT,
+    /* Behaviour observed by execution: tests, runtime probes, deployed
+     * configuration as actually loaded. */
+    ATLAS_EVIDENCE_FAMILY_DYNAMIC_OBSERVATION,
+    /* Somebody's reading of something else: AI analysis, human statement, an
+     * existing Atlas record. Never a root. */
+    ATLAS_EVIDENCE_FAMILY_INTERPRETATION
+} atlas_verify_evidence_family;
+
+const char *atlas_verify_evidence_family_name(atlas_verify_evidence_family f);
+/* The class-to-family map, as a function so no caller keeps a second copy. */
+atlas_verify_evidence_family atlas_verify_evidence_family_of(atlas_verify_evidence_class c);
+/* Bumped when the map changes. Stored on every verification result, so an old
+ * result is never reinterpreted under a new taxonomy. */
+#define ATLAS_VERIFY_FAMILY_VERSION 1
+
+/* Whether evidence of this class can ever stand as an independent root.
+ *
+ * False for the INTERPRETATION family. An interpretation is by definition of
+ * something, so an interpretation that declares no source is not a fresh
+ * observation of the world — it is an undeclared derivation. Treating it as a
+ * root is precisely how three models reading one document become "three
+ * independent sources", so they are all folded into one shared group instead.
+ * See `atlas_verify_independent_groups`. */
+bool atlas_verify_evidence_class_may_be_root(atlas_verify_evidence_class c);
+
+/* --- how confident, and whether that word means anything ------------------
+ *
+ * INSUFFICIENT_DATA is zero. With no history, the honest report is that there
+ * is no history — never a default probability, and never silence. */
+typedef enum atlas_verify_calibration {
+    /* Fewer resolved outcomes than policy requires to say anything. The state
+     * of every actor and domain on a machine where this phase has just been
+     * installed, and reporting it plainly is the correct behaviour rather than
+     * a deficiency to be papered over. */
+    ATLAS_CALIBRATION_INSUFFICIENT_DATA = 0,
+    /* Outcomes exist, none has been folded into a reliability estimate yet. */
+    ATLAS_CALIBRATION_UNCALIBRATED,
+    /* Enough to estimate, not enough for the quality bar policy sets. */
+    ATLAS_CALIBRATION_CALIBRATING,
+    /* Sample count and calibration quality both satisfy policy. Only in this
+     * state may a score be reported as a probability, and only then does the
+     * empirical path have anything to enforce with. */
+    ATLAS_CALIBRATION_CALIBRATED
+} atlas_verify_calibration;
+
+const char *atlas_verify_calibration_name(atlas_verify_calibration c);
+bool atlas_verify_calibration_parse(const char *name, atlas_verify_calibration *out);
+
+/* --- what kind of disagreement this is ------------------------------------
+ *
+ * §28's taxonomy. Two claims that disagree textually are usually not a
+ * contradiction, and reporting them as one is how a conflict engine becomes
+ * noise nobody reads.
+ *
+ * NONE is zero. */
+typedef enum atlas_verify_conflict {
+    ATLAS_CONFLICT_NONE = 0,
+    /* Same subject, same scope, same binding, incompatible. The only kind that
+     * is a genuine contradiction. */
+    ATLAS_CONFLICT_CONTRADICTION,
+    /* Both were true, at different times. The older is history and stays. */
+    ATLAS_CONFLICT_SUPERSESSION,
+    /* Both are true, of different things. The compiled default is false and
+     * the deployment sets it true: two correct claims at two scopes, and
+     * reporting them as a contradiction would train everybody to ignore the
+     * conflict list. */
+    ATLAS_CONFLICT_SCOPE_MISMATCH,
+    /* Approved knowledge says one thing and the implementation does another.
+     * **This does not falsify the approved record.** It is a finding against
+     * the implementation, and under policy it opens an obligation. Collapsing
+     * it into CONTRADICTION would let a broken implementation retract the
+     * design it violates, which is exactly backwards. */
+    ATLAS_CONFLICT_IMPLEMENTATION,
+    /* One side's evidence no longer describes the present. */
+    ATLAS_CONFLICT_STALE_EVIDENCE,
+    /* Two normative alternatives. Not a factual conflict at all: nothing
+     * observable decides between them, and the resolution is a judgment. */
+    ATLAS_CONFLICT_COMPETING_NORMATIVE
+} atlas_verify_conflict;
+
+const char *atlas_verify_conflict_name(atlas_verify_conflict c);
+bool atlas_verify_conflict_parse(const char *name, atlas_verify_conflict *out);
+
+/* --- what the policy engine decided ---------------------------------------
+ *
+ * The verdict about *acting*, kept separate from the verdict about *truth*.
+ * A claim can be VERIFIED and still produce `ATLAS_POLICY_FORBIDDEN` here,
+ * which is the normal and correct outcome for an ACCEPTED_RISK.
+ *
+ * NEEDS_REVIEW is zero: with no policy, nothing is automatic and a human
+ * looks. */
+typedef enum atlas_verify_policy_verdict {
+    ATLAS_POLICY_NEEDS_REVIEW = 0,
+    /* Every gate passed and enforcement is on: Atlas performed the transition. */
+    ATLAS_POLICY_AUTO,
+    /* Every gate passed and enforcement is off for this path. Atlas records
+     * what it would have done and does nothing. This is what shadow mode
+     * produces, and it is a full result rather than a failure. */
+    ATLAS_POLICY_SHADOW,
+    /* A gate failed. `reason` says which. */
+    ATLAS_POLICY_BLOCKED,
+    /* No policy could ever allow this: a JUDGMENT transition, an ACCEPTED_RISK
+     * approval, a normative claim reached by a deterministic verifier.
+     * Distinct from BLOCKED because BLOCKED invites "add more evidence" and
+     * this does not. */
+    ATLAS_POLICY_FORBIDDEN
+} atlas_verify_policy_verdict;
+
+const char *atlas_verify_policy_verdict_name(atlas_verify_policy_verdict v);
+
+/* Why the policy engine said what it said. One closed vocabulary, so an
+ * explanation is machine-readable rather than a sentence somebody wrote.
+ *
+ * A9.2 follows A6's rule here: the *verdict follows from the reason* rather
+ * than being chosen beside it, so a reason added without deciding what it
+ * implies cannot exist. See `REASONS[]` in `src/verify/verify.c`. */
+typedef enum atlas_verify_reason {
+    ATLAS_VREASON_NONE = 0,
+    /* No root-owned verification policy is installed, or it is disabled. */
+    ATLAS_VREASON_NO_POLICY,
+    /* The policy has no rule allowing this kind and transition. */
+    ATLAS_VREASON_NOT_ALLOWED,
+    /* Enforcement is off for this basis; the gates otherwise passed. */
+    ATLAS_VREASON_SHADOW_MODE,
+    /* The claim is not verified. */
+    ATLAS_VREASON_NOT_VERIFIED,
+    /* Confidence below the policy threshold. */
+    ATLAS_VREASON_LOW_CONFIDENCE,
+    /* Fewer genuinely independent evidence groups than policy requires. */
+    ATLAS_VREASON_INSUFFICIENT_INDEPENDENCE,
+    /* Evidence older than policy allows for this kind. */
+    ATLAS_VREASON_STALE_EVIDENCE,
+    /* A blocking conflict exists. */
+    ATLAS_VREASON_CONFLICT,
+    /* The empirical path, with calibration that does not meet policy. Never
+     * produced on the deterministic path — that is the point of the phase. */
+    ATLAS_VREASON_CALIBRATION_INSUFFICIENT,
+    /* The state machine does not permit this transition for this kind. */
+    ATLAS_VREASON_TRANSITION_ILLEGAL,
+    /* A JUDGMENT-basis claim. No policy enables these. */
+    ATLAS_VREASON_JUDGMENT_REQUIRES_AUTHORITY,
+    /* An ACCEPTED_RISK approval. Verifying that a risk exists, or that it has
+     * been mitigated, establishes nothing about whether the project accepts
+     * it — that is a decision with an owner. */
+    ATLAS_VREASON_RISK_REQUIRES_AUTHORITY,
+    /* A deterministic verifier reached a normative claim. Separation 4. */
+    ATLAS_VREASON_NORMATIVE_CLAIM,
+    /* Every gate passed. */
+    ATLAS_VREASON_OK
+} atlas_verify_reason;
+
+const char *atlas_verify_reason_name(atlas_verify_reason r);
+/* One fixed Atlas-owned sentence per reason. No repository byte and no model
+ * byte reaches it, which is why it may be reported to a model unencoded. */
+const char *atlas_verify_reason_description(atlas_verify_reason r);
+/* The verdict this reason implies, on its own. The engine folds these the way
+ * A6 folds freshness — weakest wins — so a reason that does not fit in a
+ * result's list still weakens the answer. */
+atlas_verify_policy_verdict atlas_verify_reason_verdict(atlas_verify_reason r);
+size_t atlas_verify_reason_count(void);
+atlas_verify_reason atlas_verify_reason_at(size_t index);
+
+/* Folds two verdicts to the weaker. FORBIDDEN absorbs everything, then
+ * BLOCKED, then NEEDS_REVIEW, then SHADOW, and AUTO is the only value that can
+ * be reached by nothing going wrong. */
+atlas_verify_policy_verdict atlas_verify_verdict_fold(atlas_verify_policy_verdict a,
+                                                      atlas_verify_policy_verdict b);
+
+/* --- the aggregation algorithm -------------------------------------------
+ *
+ * Named and versioned, and stored on every result, so that a future algorithm
+ * cannot silently reinterpret a past one. The same inputs produce the same
+ * output: the arithmetic is integer throughout, with no floating point
+ * anywhere, so "deterministic" is a property of the code rather than a hope
+ * about rounding.
+ *
+ * V1 is deliberately simple and auditable rather than Bayesian. What it does:
+ *
+ *   - every attestation gets an integer weight from actor class, identity
+ *     authenticity, declared reliability for the domain, freshness and whether
+ *     its scope matches the claim's;
+ *   - attestations are partitioned into independent evidence groups by
+ *     union-find over declared derivation edges;
+ *   - **within a group only the single strongest weight counts**, for support
+ *     and for contradiction separately. This is the anti-inflation rule and it
+ *     is why the algorithm cannot be fooled by repetition;
+ *   - the score is `100 * support / (support + contradiction + PRIOR_MASS)`,
+ *     where the prior mass is a fixed constant standing for "absence of
+ *     evidence", so one weak attestation cannot reach certainty.
+ *
+ * What it deliberately does not do: majority vote, arithmetic means of
+ * self-reported model confidence, or treating differently-named sources as
+ * independent. Its limitations are written in `docs/verification.md`. */
+#define ATLAS_VERIFY_ALGORITHM "atlas-reliability-v1"
+
+/* The fixed-point scale for internal weights. Weights are integers in units of
+ * 1/1000, so a "full strength" attestation is 1000. Nothing here is a
+ * probability and none of it is exposed as one. */
+#define ATLAS_VERIFY_WEIGHT_SCALE 1000
+
+/* The absence-of-evidence mass, in the same units. One perfectly weighted
+ * supporting attestation from a single group therefore yields 1000/(1000+250)
+ * = 80, not 100: a lone source, however good, is not certainty. Reaching a high
+ * score needs several genuinely independent groups, which is the behaviour the
+ * whole phase is for. */
+#define ATLAS_VERIFY_PRIOR_MASS 250
+
+/* --- structures ----------------------------------------------------------- */
+
+/* One discrete proposition.
+ *
+ * Claims are verification objects attached to knowledge, not a second knowledge
+ * store. A claim has no lifecycle, no approval and no revisions: it says one
+ * thing, it is bound to the artifacts that make it checkable, and evidence
+ * accumulates against it. The knowledge record remains the canonical statement
+ * of what the project believes; the claim is how Atlas checks up on it.
+ *
+ * Small claims verify and large ones do not. `require_peer_auth defaults to
+ * false at commit abc` is checkable; `the protocol is secure` is not a claim,
+ * it is a topic. */
+typedef struct atlas_verify_claim {
+    int64_t id;
+    atlas_buf uid; /* `atlas-claim-<32 hex>`, stable and public */
+    int64_t repo_id;
+    atlas_buf repo_identity_hash; /* durable, survives re-registration */
+
+    /* The knowledge record and the exact revision this claim is about. A
+     * revision rather than a document, because §64: an old revision of an
+     * inflation schedule and the current one are different propositions and
+     * must not share a verdict. 0 for a claim not yet attached. */
+    int64_t document_id;
+    int64_t revision_id;
+
+    /* A short fixed-vocabulary label for the area of knowledge, used to key
+     * reliability. Free text from a bounded charset rather than an enum,
+     * because the useful partition is project-specific and an enum would make
+     * every project use somebody else's. Validated to be short, printable and
+     * lowercase — never rendered as control bytes. */
+    atlas_buf domain;
+
+    /* The proposition, and the scope that bounds it. Both UNTRUSTED_DATA
+     * wherever they are reported: a claim's text is written by whoever wrote
+     * it, and approval never changes the nature of bytes. */
+    atlas_buf text;
+    atlas_buf scope_note;
+
+    atlas_verify_claim_semantics semantics;
+
+    /* What makes it mechanically checkable, when it is. The verifier is named
+     * from a closed Atlas-owned table and is chosen by root-owned policy, never
+     * by a model: `verifier` here records which one applies, and
+     * `verifier_input` its bounded, structured argument. Empty means no
+     * deterministic verifier applies and the claim is empirical at best. */
+    atlas_buf verifier;
+    atlas_buf verifier_input;
+
+    /* Temporal and revision binding. What the claim is true *of*. */
+    atlas_buf basis_commit;
+    atlas_buf environment; /* deployment identity, empty for repository claims */
+
+    atlas_buf created_at;
+    int64_t superseded_by_claim_id; /* 0 when live */
+} atlas_verify_claim;
+
+void atlas_verify_claim_init(atlas_verify_claim *c);
+void atlas_verify_claim_free(atlas_verify_claim *c);
+
+/* One actor. See the two identity enums above: `identity` is how well Atlas
+ * knows this is who it says, and it is not something the actor supplies. */
+typedef struct atlas_verify_actor {
+    int64_t id;
+    atlas_buf uid;
+    atlas_verify_actor_class cls;
+    atlas_verify_actor_identity identity;
+
+    atlas_buf name;     /* display identity, UNTRUSTED_DATA */
+    atlas_buf provider; /* AI: vendor, self-declared */
+    atlas_buf family;   /* AI: model family */
+    atlas_buf version;  /* AI: model version; TOOL: tool version */
+    atlas_buf role;
+    atlas_buf session_key; /* AI: the session it spoke in */
+    atlas_buf run_id;
+    int64_t parent_actor_id; /* orchestrator, 0 for none */
+
+    atlas_buf first_seen_at;
+    atlas_buf last_seen_at;
+} atlas_verify_actor;
+
+void atlas_verify_actor_init(atlas_verify_actor *a);
+void atlas_verify_actor_free(atlas_verify_actor *a);
+
+/* One piece of evidence, with the provenance that makes it checkable.
+ *
+ * The fields are a union in spirit rather than in C: which ones are meaningful
+ * depends on `cls`, and the ones that are not are empty. A struct rather than a
+ * blob because "where did this come from?" must be queryable, and a JSON
+ * document in a column is a place for provenance to go missing. */
+typedef struct atlas_verify_evidence {
+    int64_t id;
+    atlas_buf uid;
+    atlas_verify_evidence_class cls;
+    int64_t repo_id;
+
+    /* Repository binding: commit, path, symbol, line range, content identity. */
+    atlas_buf commit_oid;
+    atlas_buf path_raw;
+    atlas_buf path_text;
+    atlas_buf symbol;
+    int64_t line_start;
+    int64_t line_end;
+    atlas_buf content_hash;
+
+    /* TEST: suite, name, result, binary identity, environment. */
+    atlas_buf suite;
+    atlas_buf test_name;
+    atlas_buf result;
+    atlas_buf binary_id;
+    atlas_buf environment;
+
+    /* COMPILER: the A8-CI evidence class this finding carries, so PROVEN and
+     * CANDIDATE stay distinguishable rather than both becoming "the compiler
+     * said so". */
+    atlas_buf tool;
+    atlas_buf tool_version;
+    atlas_buf proof_class;
+
+    /* RUNTIME / DEPLOYED_CONFIG: what was probed and what came back. */
+    atlas_buf target;
+    atlas_buf probe;
+    atlas_buf observed;
+    atlas_buf deployed_revision;
+
+    /* When the evidence describes, which is not when the row was written. */
+    atlas_buf observed_at;
+    atlas_buf recorded_at;
+
+    /* Who produced it. An Atlas-attested actor for anything Atlas ran. */
+    int64_t actor_id;
+} atlas_verify_evidence;
+
+void atlas_verify_evidence_init(atlas_verify_evidence *e);
+void atlas_verify_evidence_free(atlas_verify_evidence *e);
+
+/* One actor's verdict on one claim at one moment.
+ *
+ * **Never overwritten.** An actor that changes its mind writes a second
+ * attestation naming the first in `supersedes_id`; both stay readable, because
+ * "this source reversed itself" is exactly the kind of fact a reliability
+ * system must be able to see. */
+typedef struct atlas_verify_attestation {
+    int64_t id;
+    atlas_buf uid;
+    int64_t claim_id;
+    int64_t actor_id;
+    atlas_verify_verdict verdict;
+
+    /* What the actor says about its own confidence, 0..100, or -1 for none.
+     * Stored, reported, and **never** used directly as Atlas' confidence. A
+     * source's opinion of itself is data about the source. */
+    int self_confidence;
+
+    /* How the actor reached the verdict. Free text, bounded, UNTRUSTED_DATA. */
+    atlas_buf method;
+    /* The scope the actor says it examined, compared against the claim's. */
+    atlas_buf scope_note;
+
+    atlas_buf created_at;
+    int64_t supersedes_id;   /* 0 for none */
+    bool proposer;           /* this actor proposed the record; §26 */
+    atlas_buf basis_commit;  /* the revision the actor examined */
+    atlas_buf environment;
+} atlas_verify_attestation;
+
+void atlas_verify_attestation_init(atlas_verify_attestation *a);
+void atlas_verify_attestation_free(atlas_verify_attestation *a);
+
+/* --- aggregation ---------------------------------------------------------- */
+
+/* Everything the aggregation concluded, and enough to explain every part of it.
+ *
+ * §25: a user must be able to ask "why 96?" and get structured reasons. That is
+ * why this is a struct of counted facts rather than a number and a sentence.
+ * There is no prose explanation field at all — an LLM-written justification of
+ * a machine verdict is the one thing that must not be the explanation. */
+typedef struct atlas_verify_aggregate {
+    atlas_verify_state state;
+    atlas_verify_basis basis;
+
+    /* 0..100. A **score**, not a probability, and the JSON key is
+     * `confidence_score` precisely so nobody can read it as one. */
+    int confidence;
+
+    atlas_verify_calibration calibration;
+    /* 0..100, and meaningful only when `calibration == CALIBRATED`. -1
+     * otherwise, which is what every read on this machine returns today. A
+     * separate field from `confidence` rather than a flag on it, because two
+     * things that must never be confused should not share a slot. */
+    int calibrated_probability;
+
+    const char *algorithm; /* ATLAS_VERIFY_ALGORITHM */
+    int family_version;
+
+    int support_count;     /* attestations, not groups */
+    int contradict_count;
+    int inconclusive_count;
+    int independent_groups;  /* union-find components; the honest count */
+    int independent_families;
+    int evidence_count;
+    int actor_count;
+
+    /* Support and contradiction mass in ATLAS_VERIFY_WEIGHT_SCALE units, after
+     * per-group collapse. Exposed because they are what the score is computed
+     * from and an explanation that omits them is not one. */
+    int64_t support_mass;
+    int64_t contradict_mass;
+
+    atlas_verify_conflict conflict;
+    bool stale;
+    /* The strongest deterministic verdict present, if any. A deterministic
+     * PASS is not a vote among others: it settles the claim. */
+    bool deterministic_pass;
+    bool deterministic_fail;
+
+    /* Reasons, weakest-wins folded. */
+    atlas_verify_policy_verdict verdict;
+    atlas_verify_reason reasons[ATLAS_VERIFY_MAX_REASONS];
+    size_t reason_count;
+    size_t reason_total; /* the true number, even when more than fit */
+} atlas_verify_aggregate;
+
+void atlas_verify_aggregate_init(atlas_verify_aggregate *a);
+
+/* Records a reason, folding the verdict before storing it.
+ *
+ * A6's rule exactly: the fold happens first, so a reason that does not fit in
+ * the list still weakens the answer and a claim with thirteen problems cannot
+ * report a better verdict than one with twelve. */
+void atlas_verify_aggregate_note(atlas_verify_aggregate *a, atlas_verify_reason r);
+
+/* One attestation reduced to what the aggregation needs. Built by the db layer
+ * so the algorithm is a pure function of counted inputs and can be tested
+ * without a database. */
+typedef struct atlas_verify_input {
+    int64_t attestation_id;
+    int64_t actor_id;
+    atlas_verify_actor_class actor_class;
+    atlas_verify_actor_identity actor_identity;
+    atlas_verify_verdict verdict;
+    bool proposer;
+    bool scope_match;
+    bool stale;
+    /* The evidence group this attestation lands in, assigned by
+     * `atlas_verify_independent_groups`. */
+    int group;
+    atlas_verify_evidence_family family;
+    /* Declared reliability for this actor and domain in weight units, or -1
+     * when there is no calibrated estimate — which is the case for everything
+     * on a fresh install, and is handled by falling back to the documented
+     * conservative prior rather than to an invented number. */
+    int reliability;
+} atlas_verify_input;
+
+/* Partitions inputs into independent evidence groups.
+ *
+ * Union-find over declared derivation edges, plus the conservative rules that
+ * make it safe:
+ *
+ *   - evidence connected by any derivation edge is one group;
+ *   - INTERPRETATION-family evidence declaring no roots joins **one shared
+ *     group**, not one group each. This is what makes three models reading one
+ *     document count once even when none of them declared the document;
+ *   - an attestation with no evidence at all joins that same group.
+ *
+ * Independence is never assumed. If it cannot be demonstrated from declared
+ * structure, the evidence is treated as correlated — which costs confidence and
+ * never manufactures it. Writes `group` on each input and returns the number of
+ * components. */
+int atlas_verify_independent_groups(atlas_verify_input *inputs, size_t count,
+                                    const int64_t *dep_from, const int64_t *dep_to,
+                                    size_t dep_count);
+
+/* The algorithm. Pure, integer, deterministic; the same inputs always produce
+ * the same aggregate. */
+void atlas_verify_aggregate_compute(atlas_verify_aggregate *out, atlas_verify_input *inputs,
+                                    size_t count, atlas_verify_basis basis);
+
+/* --- conservative priors --------------------------------------------------
+ *
+ * §20. Explicit, documented, versioned, vendor-neutral, and dominated by
+ * empirical outcomes once there are any.
+ *
+ * Nothing here is `human = 100` or `model X = 95`. The prior is a statement
+ * about *what sort of thing is speaking and how well Atlas knows it did*, which
+ * is the only thing Atlas actually observes on a fresh install. A human's
+ * factual recollection is not weighted above a compiler's proof, because on
+ * questions of fact it should not be. */
+int atlas_verify_prior_reliability(atlas_verify_actor_class cls,
+                                   atlas_verify_actor_identity identity);
+#define ATLAS_VERIFY_PRIOR_VERSION 1
+
+/* --- eligibility for calibration -----------------------------------------
+ *
+ * §45 and §65: which resolved outcomes may become reliability labels.
+ *
+ * The forbidden loop is short and easy to build by accident: a model supports a
+ * claim, the aggregate likes it, Atlas auto-approves, the approval is counted
+ * as ground truth, the model's reliability rises, and the next claim clears the
+ * bar more easily. Every step looks reasonable and the result is a system that
+ * has taught itself to trust a source using that source's own output.
+ *
+ * So ground truth must come from resolution classes that do not depend on the
+ * aggregation: a deterministic verifier's pass or fail, an operator's explicit
+ * resolution through the terminal channel, or an observed outcome recorded by
+ * an Atlas-attested actor. An empirical auto-transition is **not** eligible,
+ * and neither is a machine transition on any basis, which is what breaks the
+ * loop structurally rather than by a rule somebody has to remember. */
+typedef enum atlas_verify_outcome_source {
+    ATLAS_OUTCOME_UNKNOWN = 0,
+    ATLAS_OUTCOME_DETERMINISTIC_VERIFIER,
+    ATLAS_OUTCOME_OPERATOR_RESOLUTION,
+    ATLAS_OUTCOME_RUNTIME_OBSERVATION,
+    /* Recorded so the ineligible case is representable and auditable rather
+     * than absent. Never counted. */
+    ATLAS_OUTCOME_MACHINE_TRANSITION
+} atlas_verify_outcome_source;
+
+const char *atlas_verify_outcome_source_name(atlas_verify_outcome_source s);
+/* Whether an outcome from this source may update a source's reliability.
+ * False for MACHINE_TRANSITION and UNKNOWN. */
+bool atlas_verify_outcome_eligible(atlas_verify_outcome_source s);
+
+/* --- deterministic verifiers ---------------------------------------------
+ *
+ * A closed, Atlas-owned table. A verifier is named by root-owned policy and by
+ * nothing else: not by a claim's text, not by a model, not by a request
+ * argument. That is what makes "a model cannot forge deterministic evidence" a
+ * property of the surface rather than a check somebody could weaken.
+ *
+ * V1 ships four, and every one is a **read**. None creates a process, none runs
+ * a repository's own build, and none executes a command from anywhere. That is
+ * a deliberate restriction rather than an unfinished one: a verifier that runs
+ * a command named in configuration is a code-execution path with an audit trail
+ * attached, and the argument for adding one belongs to whoever needs it, in
+ * writing, with the sandbox already built. `docs/verification.md` says so and
+ * names the bounded-child pattern A8-CI already has for when that day comes. */
+typedef enum atlas_verify_verifier {
+    ATLAS_VERIFIER_NONE = 0,
+    /* The content of a repository path at a bound commit hashes to a stated
+     * value. Establishes exactly "these bytes were there", which is a small
+     * claim and a completely mechanical one. */
+    ATLAS_VERIFIER_CONTENT_HASH,
+    /* A named symbol exists in the current semantic generation, with the
+     * A8-CI evidence class the index recorded. PROVEN and CANDIDATE stay
+     * distinct: a candidate never satisfies a deterministic verifier. */
+    ATLAS_VERIFIER_SYMBOL_PRESENT,
+    /* No symbol of a given name exists. The remediation detector: an
+     * obligation whose condition is "this must be gone" is discharged by its
+     * absence, and absence in a *complete* generation is a mechanical fact.
+     * A PARTIAL generation cannot establish it, and saying so is the whole
+     * difficulty — see the implementation. */
+    ATLAS_VERIFIER_SYMBOL_ABSENT,
+    /* A direct call edge the compiler proved exists between two symbols. */
+    ATLAS_VERIFIER_PROVEN_EDGE
+} atlas_verify_verifier;
+
+const char *atlas_verify_verifier_name(atlas_verify_verifier v);
+bool atlas_verify_verifier_parse(const char *name, atlas_verify_verifier *out);
+const char *atlas_verify_verifier_description(atlas_verify_verifier v);
+size_t atlas_verify_verifier_count(void);
+atlas_verify_verifier atlas_verify_verifier_at(size_t index);
+
+/* What a deterministic verifier concluded.
+ *
+ * `PASS` and `FAIL` are both results. `UNAVAILABLE` is not a fail: an index
+ * that has not run cannot establish absence, and reporting "could not look" as
+ * "it is not there" is how a remediation detector closes an obligation that is
+ * still outstanding. */
+typedef enum atlas_verify_check {
+    ATLAS_CHECK_UNAVAILABLE = 0,
+    ATLAS_CHECK_PASS,
+    ATLAS_CHECK_FAIL
+} atlas_verify_check;
+
+const char *atlas_verify_check_name(atlas_verify_check c);
+
+/* Runs one deterministic verifier over one claim's bounded input.
+ *
+ * `scope_out` receives Atlas' own sentence saying what was actually
+ * established, which the caller compares against the claim's declared scope: a
+ * claim whose text outruns its verifier is not verified, it is a claim with an
+ * unverified remainder. `detail_out` receives a fixed Atlas-owned explanation.
+ * Neither ever carries repository bytes.
+ *
+ * Returns ATLAS_OK with `UNAVAILABLE` when it could not look. That is not a
+ * failure of the call and not evidence about the claim. */
+atlas_status atlas_verify_run_verifier(atlas_db *db, atlas_verify_verifier v, int64_t repo_id,
+                                       const char *input, atlas_verify_check *check_out,
+                                       char *scope_out, size_t scope_size, char *detail_out,
+                                       size_t detail_size, atlas_err *err);
+
+/* --- the machine lifecycle audit row, which is also the warrant -----------
+ *
+ * §40's requirement in a struct: everything needed to reconstruct why Atlas
+ * finalized a record, including the policy hash, so the reconstruction does not
+ * depend on the policy file still saying what it said.
+ *
+ * It is also the capability. A row whose verdict is AUTO and which has not been
+ * consumed authorises exactly one transition of exactly one revision at exactly
+ * one content hash — the shape `decision_challenges` has, because the machine
+ * path must bind no more loosely than the operator path. What differs between
+ * them is who may mint one, not how tightly it binds. */
+typedef struct atlas_verify_audit {
+    int64_t id;
+    int64_t claim_id;
+    int64_t result_id;
+    int64_t document_id;
+    int64_t revision_id;
+    const char *content_hash;
+    const char *kind;
+    const char *from_status;
+    const char *to_status;
+    atlas_verify_basis basis;
+    atlas_verify_policy_verdict verdict;
+    const char *reasons;
+    const char *policy_id;
+    const char *policy_hash;
+    const char *algorithm;
+    int prior_version;
+    int family_version;
+    int confidence;
+    atlas_verify_calibration calibration;
+    int calibrated_probability; /* -1 for none */
+    int independent_groups;
+    const char *evidence_snapshot;
+    const char *verifier;
+    atlas_verify_check check_result;
+    const char *binary_id;
+} atlas_verify_audit;
+
+/* --- the database layer ---------------------------------------------------
+ *
+ * `src/db/db_verify.c` is the single write point over the migration-14 tables,
+ * the rule `settle()`, `atlas_db_evidence_insert`, `atlas_decision_apply_in_tx`
+ * and `atlas_orch_apply_in_tx` all follow. Nothing else writes them. */
+
+/* Finds an actor by uid or creates it. **Refuses a class that requires Atlas
+ * attestation unless the identity says Atlas attested it** — the schema CHECK
+ * says the same thing, and both are here because the C refusal produces the
+ * better message and the CHECK is the guarantee. */
+atlas_status atlas_db_verify_actor_upsert(atlas_db *db, atlas_verify_actor *a, const char *now,
+                                          atlas_err *err);
+atlas_status atlas_db_verify_actor_get(atlas_db *db, int64_t id, atlas_verify_actor *out,
+                                       bool *found, atlas_err *err);
+
+atlas_status atlas_db_verify_claim_insert(atlas_db *db, atlas_verify_claim *c, const char *now,
+                                          atlas_err *err);
+atlas_status atlas_db_verify_claim_get(atlas_db *db, int64_t id, atlas_verify_claim *out,
+                                       bool *found, atlas_err *err);
+atlas_status atlas_db_verify_claim_find(atlas_db *db, const char *uid, atlas_verify_claim *out,
+                                        bool *found, atlas_err *err);
+
+/* Every live claim attached to one revision, newest first, bounded by
+ * ATLAS_VERIFY_MAX_CLAIMS. `truncated_out` reports the bound being reached, so
+ * a partial answer never reads as a complete one. */
+typedef atlas_status (*atlas_verify_claim_cb)(const atlas_verify_claim *c, void *ctx,
+                                              atlas_err *err);
+atlas_status atlas_db_verify_claims_for_revision(atlas_db *db, int64_t document_id,
+                                                 int64_t revision_id, atlas_verify_claim_cb cb,
+                                                 void *ctx, bool *truncated_out, atlas_err *err);
+
+atlas_status atlas_db_verify_evidence_insert(atlas_db *db, atlas_verify_evidence *e,
+                                             const char *now, atlas_err *err);
+atlas_status atlas_db_verify_evidence_dep_add(atlas_db *db, int64_t evidence_id,
+                                              int64_t derives_from_id, const char *now,
+                                              atlas_err *err);
+
+/* Writes one attestation and the evidence it rests on, together. They are one
+ * statement: an attestation whose evidence links failed to land would be
+ * counted as an undeclared interpretation for ever, which silently changes what
+ * it is worth. */
+atlas_status atlas_db_verify_attestation_insert(atlas_db *db, atlas_verify_attestation *a,
+                                                const int64_t *evidence_ids, size_t evidence_count,
+                                                const char *now, atlas_err *err);
+
+/* Everything the aggregation needs about one claim, already reduced to counted
+ * inputs so the algorithm stays a pure function that tests can drive without a
+ * database. Owns its allocations; release with `atlas_verify_inputs_free`. */
+typedef struct atlas_verify_inputs {
+    atlas_verify_input *items;
+    size_t count;
+    /* The true number of attestations, even when more existed than were kept.
+     * A3's rule about `candidate_count`: a bound that makes something look
+     * smaller than it is is a bound that lies. */
+    size_t total;
+    int64_t *dep_from;
+    int64_t *dep_to;
+    size_t dep_count;
+    bool limit_reached;
+} atlas_verify_inputs;
+
+void atlas_verify_inputs_free(atlas_verify_inputs *in);
+
+/* Loads the inputs for one claim. `stale_before` is the ISO-8601 instant
+ * against which an observation is judged to have lost current force; evidence
+ * older than it is marked stale rather than dropped, because §47 requires the
+ * historical record to survive and only its *current* weight to fall. */
+atlas_status atlas_db_verify_inputs_load(atlas_db *db, int64_t claim_id, const char *stale_before,
+                                         atlas_verify_inputs *out, atlas_err *err);
+
+atlas_status atlas_db_verify_result_insert(atlas_db *db, int64_t claim_id,
+                                           const atlas_verify_aggregate *agg, const char *verifier,
+                                           atlas_verify_check check, const char *now,
+                                           int64_t *id_out, atlas_err *err);
+
+atlas_status atlas_db_verify_audit_insert(atlas_db *db, const atlas_verify_audit *a,
+                                          const char *now, int64_t *id_out, atlas_err *err);
+
+/* Whether this audit row is a live warrant for exactly this transition.
+ *
+ * Called from the decision layer's single write point, inside the transaction
+ * that spends it. Requires the row to exist, to carry verdict AUTO, to be
+ * unconsumed, and to name this document, this revision, this target state and
+ * this content hash. A mismatch on any of them is a refusal, never a warning:
+ * a warrant bound to a hash the content no longer has binds to nothing. */
+atlas_status atlas_db_verify_warrant_check(atlas_db *db, int64_t warrant_id, int64_t document_id,
+                                           int64_t revision_id, const char *to_status,
+                                           const char *content_hash, bool *ok_out,
+                                           atlas_err *err);
+/* Marks it spent. Reports `spent_out = false` when the row had already been
+ * consumed, which is what makes a replayed warrant fail deterministically
+ * rather than transition twice. */
+atlas_status atlas_db_verify_warrant_consume(atlas_db *db, int64_t warrant_id, const char *now,
+                                             bool *spent_out, atlas_err *err);
+
+/* Measured reliability for one actor in one domain, in weight units.
+ *
+ * `reliability_out` is -1 when there is no estimate, which is the state of
+ * every actor on a machine where this phase has just been installed. The caller
+ * then falls back to `atlas_verify_prior_reliability`, which is documented,
+ * versioned and conservative — never to an invented number. */
+atlas_status atlas_db_verify_reliability_get(atlas_db *db, int64_t actor_id, const char *domain,
+                                             int *reliability_out, int *samples_out,
+                                             atlas_verify_calibration *calibration_out,
+                                             atlas_err *err);
+
+/* Records one resolved outcome and folds it into the actor's reliability.
+ *
+ * An ineligible source is stored and **not** counted, so the ineligible case is
+ * auditable rather than absent. That is what breaks the circular-ground-truth
+ * loop structurally: a machine transition can be seen in the outcome table and
+ * can never move a reliability estimate. */
+atlas_status atlas_db_verify_outcome_record(atlas_db *db, int64_t claim_id, int64_t actor_id,
+                                            const char *domain, atlas_verify_verdict attested,
+                                            bool truth, atlas_verify_outcome_source source,
+                                            const char *now, atlas_err *err);
+
+/* The three bounded reads the deterministic verifiers are built from.
+ *
+ * Every one is a read. No A9.2 verifier creates a process, runs a repository's
+ * build, or executes a command from anywhere, so there is no input on any of
+ * these paths that could become an instruction — which is what lets a
+ * deterministic verdict be trusted without asking who supplied the claim. */
+atlas_status atlas_db_verify_file_hash(atlas_db *db, int64_t repo_id, const char *path_text,
+                                       atlas_buf *hash_out, bool *found_out, atlas_err *err);
+/* `complete_out` is false for a generation with failed, partial or unsupported
+ * translation units. An absence cannot be established over a partial index —
+ * "I did not find it" is not "it is not there" — and reporting otherwise would
+ * close obligations that are still outstanding. */
+atlas_status atlas_db_verify_sem_symbol(atlas_db *db, int64_t repo_id, const char *name,
+                                        int64_t *count_out, bool *complete_out, bool *indexed_out,
+                                        atlas_err *err);
+atlas_status atlas_db_verify_sem_proven_edge(atlas_db *db, int64_t repo_id, const char *src,
+                                             const char *dst, bool *exists_out, bool *indexed_out,
+                                             atlas_err *err);
+
+/* Clears the soft repository references A4's rule requires, inside
+ * `atlas_db_repo_remove`'s transaction. `repositories.id` is a reused rowid and
+ * a pointer left behind would eventually name a different repository. */
+atlas_status atlas_db_verify_forget_repo(atlas_db *db, int64_t repo_id, atlas_err *err);
+
+#endif /* ATLAS_VERIFY_H */

@@ -1327,6 +1327,30 @@ atlas_status atlas_db_decision_kind_of(atlas_db *db, int64_t document_id,
     return ATLAS_OK;
 }
 
+atlas_status atlas_db_decision_document_status(atlas_db *db, int64_t document_id, char *out,
+                                               size_t out_size, atlas_err *err) {
+    if (out == NULL || out_size == 0) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "nowhere to put the status");
+    }
+    out[0] = '\0';
+    static const char SQL[] = "SELECT current_status FROM decision_documents WHERE id = ?1;";
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(db, SQL, &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, document_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the document id");
+    }
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *s = (const char *)sqlite3_column_text(stmt, 0);
+        (void)snprintf(out, out_size, "%s", s != NULL ? s : "");
+    }
+    atlas_db_finish(db, stmt);
+    return st;
+}
+
 atlas_status atlas_db_decision_document_shape(atlas_db *db, int64_t document_id,
                                               int64_t *superseded_by_out, int64_t *proposed_out,
                                               int64_t *resolved_out, atlas_err *err) {

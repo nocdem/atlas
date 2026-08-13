@@ -21,6 +21,7 @@
 #include "atlas/db.h"
 #include "atlas/error.h"
 #include "atlas/gate.h"
+#include "atlas/verifypolicy.h"
 #include "atlas/git.h"
 #include "atlas/limits.h"
 #include "atlas/reconcile.h"
@@ -910,6 +911,64 @@ atlas_status atlas_service_gate_check(atlas_ctx *ctx, const atlas_gate_query *q,
 atlas_status atlas_service_gate_show(atlas_ctx *ctx, const char *repo, const char *uid,
                                      const char *at_commit, atlas_gate_report *out,
                                      atlas_err *err);
+
+
+/* --- A9.2: verification -----------------------------------------------------
+ *
+ * What a `verify` command reports. It carries the assessment, the policy state
+ * that shaped it, and the descriptive halves a reader needs — the claim's text
+ * and the record's identity — so a renderer never has to query anything.
+ *
+ * `claim_text` and `record_title` are **UNTRUSTED_DATA**. Verification changes
+ * a status, never the nature of bytes: a VERIFIED claim's proposition is
+ * exactly as untrusted as a proposed one's, and both renderers encode it. That
+ * is A4's rule about approved prose, restated because the temptation is
+ * stronger here — "Atlas verified this" reads like a warrant for the text, and
+ * it is a statement about a truth condition, not about the sentence. */
+typedef struct atlas_verify_report {
+    atlas_verify_assessment assessment;
+
+    atlas_buf claim_uid;
+    atlas_buf claim_text;   /* UNTRUSTED_DATA */
+    atlas_buf domain;
+    atlas_buf record_uid;
+    atlas_buf record_title; /* UNTRUSTED_DATA */
+
+    /* The root-owned policy as it was when the assessment ran, so a reader can
+     * see *why* an answer was shadow rather than automatic without going to
+     * look at a file they may not be able to read. */
+    atlas_verifypolicy_state policy_state;
+    atlas_verifypolicy_reason policy_reason;
+    char policy_id[128];
+    char policy_hash[ATLAS_SHA256_HEX_LEN + 1u];
+    char policy_path[256];
+    char policy_detail[512];
+    bool deterministic_enforce;
+    bool empirical_enforce;
+    size_t rule_count;
+} atlas_verify_report;
+
+void atlas_verify_report_init(atlas_verify_report *r);
+void atlas_verify_report_free(atlas_verify_report *r);
+
+/* Assesses one claim and writes nothing — no result row, no audit row, no
+ * transition. Asking what Atlas thinks cannot change what Atlas thinks, which
+ * is the property A6's gate has and for the same reason. */
+atlas_status atlas_service_verify_show(atlas_ctx *ctx, int64_t claim_id, atlas_verify_report *out,
+                                       atlas_err *err);
+/* Assesses, records the result and the audit row, and performs the transition
+ * when every gate passed and enforcement is on for that path.
+ *
+ * **An operator action**, served over IPC only in the operator-uid group. It
+ * mints no capability and approves nothing: it asks Atlas to evaluate a policy
+ * somebody else installed, which is why it needs no terminal, no challenge and
+ * no confirmation. What it can produce is a `VERIFICATION_POLICY` ledger entry,
+ * which is not `LOCAL_OPERATOR_CONFIRMED` and never becomes it. */
+atlas_status atlas_service_verify_run(atlas_ctx *ctx, int64_t claim_id, const char *repo_name,
+                                      atlas_verify_report *out, atlas_err *err);
+/* Reports the root-owned policy. Opens no index and binds nothing, so it is
+ * safe to run anywhere — the shape `gateway status` has. */
+atlas_status atlas_service_verify_policy(atlas_verify_report *out, atlas_err *err);
 
 
 /* --- A8: orchestration ------------------------------------------------------

@@ -306,6 +306,23 @@ add_library(atlas_core STATIC
   src/ipc/server_apikey.c
   src/ipc/server_gw.c
   src/gw/gateway.c
+
+  # --- A9.2: claims, attestations, evidence and self-verifying memory -------
+  #
+  # `verify.c` is the vocabularies and the aggregation algorithm and touches no
+  # database: it is a pure function of counted inputs, which is what lets the
+  # scoring be tested without one. `db_verify.c` is the single write point over
+  # the migration-14 tables. `policy.c` loads the root-owned verification
+  # policy. `detverify.c` runs the deterministic verifiers, every one of which
+  # is a read. `autolifecycle.c` is the only thing that turns a verification
+  # result into a lifecycle transition, and it owns its transaction because the
+  # audit row and the transition must commit together.
+  src/verify/verify.c
+  src/core/service_verify.c
+  src/verify/policy.c
+  src/db/db_verify.c
+  src/verify/detverify.c
+  src/verify/autolifecycle.c
   ${ATLAS_UI_GEN}
 )
 

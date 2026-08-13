@@ -127,6 +127,16 @@ static void build_schema6(const char *path, atlas_err *err) {
      * recorded version. */
     T_OK(atlas_db_exec_sql(
              db,
+             "DROP TABLE verify_lifecycle_audit;"
+             "DROP TABLE verify_reliability;"
+             "DROP TABLE verify_outcomes;"
+             "DROP TABLE verify_results;"
+             "DROP TABLE verify_attestation_evidence;"
+             "DROP TABLE verify_attestations;"
+             "DROP TABLE verify_evidence_deps;"
+             "DROP TABLE verify_evidence;"
+             "DROP TABLE verify_claims;"
+             "DROP TABLE verify_actors;"
              "DROP TABLE gw_audit;"
              "DROP TABLE api_keys;"
              "DROP TABLE decision_validations;"
@@ -220,7 +230,7 @@ static void test_a_populated_schema_six_database_reaches_seven_losslessly(void) 
      * table without renumbering a row — is asserted below and is unaffected by
      * later migrations running on top of it. */
     T_EQ_INT(atlas_db_schema_version(db, &err), ATLAS_SCHEMA_VERSION);
-    T_EQ_INT(ATLAS_SCHEMA_VERSION, 13);
+    T_EQ_INT(ATLAS_SCHEMA_VERSION, 15);
 
     atlas_buf after = ATLAS_BUF_INIT;
     text_of(db,

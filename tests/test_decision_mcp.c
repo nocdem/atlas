@@ -515,32 +515,44 @@ static void scan_for_needle(const char *path, void *ud) {
     atlas_buf_free(&text);
 }
 
-static void test_the_single_write_point_has_exactly_two_callers(void) {
+static void test_the_single_write_point_has_exactly_three_callers(void) {
     /* The claim in `decision_ops.h`, `lifecycle.c`, `docs/architecture.md` and
      * CLAUDE.md is that `atlas_decision_apply_in_tx` is the only function that
-     * writes a lifecycle transition, and that exactly two functions call it:
-     * the public wrapper and the A2 bridge.
+     * writes a lifecycle transition, and that a small, enumerated set of
+     * functions call it.
      *
      * A claim about a call graph decays the moment somebody adds a caller, and
      * nothing about the new call site would look wrong — it would look like
-     * reuse. So the claim is checked rather than asserted in prose. A third
+     * reuse. So the claim is checked rather than asserted in prose. A further
      * caller is not forbidden outright, but it has to come here and argue that
      * it genuinely owns a wider unit of work, in the same change.
+     *
+     * **A9.2 came here and made that argument, which is why the count is now
+     * three.** `src/verify/autolifecycle.c` owns its transaction because a
+     * policy-authorised transition and the audit row justifying it are one
+     * fact: an audit row with no transition describes something that did not
+     * happen, and a transition with no audit row is an automatic change to
+     * project knowledge with no recoverable reason. The audit row is also the
+     * warrant the write point spends, so the two cannot be split across
+     * transactions even in principle.
      *
      * Scanning `src/` and not a fixed list is the point: a fixed list would be
      * satisfied by a new file the list does not name. */
     callsite_scan sc = {"atlas_decision_apply_in_tx(", 0u, ATLAS_BUF_INIT};
     walk_sources(ATLAS_SRC_DIR "/src", scan_for_needle, &sc);
 
-    /* Three files mention it: the two callers and the definition in
-     * lifecycle.c, which is also one of the callers, so the set is two files. */
-    T_CHECK_MSG(sc.files_with_calls == 2u,
-                "expected exactly 2 files in src/ to name the single write point, found %zu: %s",
+    /* Three files mention it: the three callers, one of which is lifecycle.c,
+     * which also defines it. */
+    T_CHECK_MSG(sc.files_with_calls == 3u,
+                "expected exactly 3 files in src/ to name the single write point, found %zu: %s",
                 sc.files_with_calls, atlas_buf_cstr(&sc.names));
     T_CHECK_MSG(strstr(atlas_buf_cstr(&sc.names), "/src/decision/lifecycle.c") != NULL,
                 "lifecycle.c must define and wrap it; found %s", atlas_buf_cstr(&sc.names));
     T_CHECK_MSG(strstr(atlas_buf_cstr(&sc.names), "/src/ai/ai.c") != NULL,
                 "ai.c is the documented second caller, the A2 bridge; found %s",
+                atlas_buf_cstr(&sc.names));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&sc.names), "/src/verify/autolifecycle.c") != NULL,
+                "autolifecycle.c is the documented third caller, the A9.2 policy engine; found %s",
                 atlas_buf_cstr(&sc.names));
     atlas_buf_free(&sc.names);
 }
@@ -657,8 +669,8 @@ static const atlas_test TESTS[] = {
     {"the approval prompt endorses nothing", test_the_approval_prompt_endorses_nothing},
     {"the repository identity is described accurately",
      test_the_repository_identity_is_described_accurately},
-    {"the single write point has exactly two callers",
-     test_the_single_write_point_has_exactly_two_callers},
+    {"the single write point has exactly three callers",
+     test_the_single_write_point_has_exactly_three_callers},
     {"no source or document overstates the approval claim",
      test_no_source_or_document_overstates_the_approval_claim},
     {"the documents state the precise contract",

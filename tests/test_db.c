@@ -145,12 +145,21 @@ static void test_migration_rollback(void) {
     const atlas_migration *base = atlas_migrations(&base_count);
     T_REQUIRE(base_count >= 1u);
 
-    atlas_migration list[16];
+    /* Zeroed before anything is assigned. `atlas_migration` gained
+     * `foreign_keys_off` in A9.1 and both construction sites in this file kept
+     * assigning three fields out of four, so the flag was whatever the stack
+     * happened to hold — which UBSan reported as a load of 192 into a `_Bool`
+     * once A9.2's schema bump changed the frame layout. A struct built field by
+     * field silently stops being complete the moment somebody adds a field, so
+     * these sites zero first and assign after. */
+    atlas_migration list[32];
     T_REQUIRE(base_count + 1u <= sizeof(list) / sizeof(list[0]));
+    memset(list, 0, sizeof(list));
     memcpy(list, base, base_count * sizeof(list[0]));
     list[base_count].version = (int)base_count + 1;
     list[base_count].name = "deliberately broken";
     list[base_count].statements = bad_statements;
+    list[base_count].foreign_keys_off = false;
 
     T_FAILS_WITH(atlas_db_migrate_list(e.db, list, base_count + 1u, &err), ATLAS_ERR_DB, &err);
     T_CHECK_MSG(strstr(atlas_err_msg(&err), "rolled back") != NULL,
@@ -183,9 +192,11 @@ static void test_migration_out_of_sequence(void) {
     /* A gap in the numbering is refused rather than applied out of order. */
     static const char *const stmts[] = {"CREATE TABLE gap_probe(id INTEGER);", NULL};
     atlas_migration list[1];
+    memset(list, 0, sizeof(list));
     list[0].version = ATLAS_SCHEMA_VERSION + 5;
     list[0].name = "far future";
     list[0].statements = stmts;
+    list[0].foreign_keys_off = false;
 
     T_FAILS_WITH(atlas_db_migrate_list(e.db, list, 1u, &err), ATLAS_ERR_DB, &err);
     T_CHECK(strstr(atlas_err_msg(&err), "out of sequence") != NULL);

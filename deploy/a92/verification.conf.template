@@ -1,0 +1,140 @@
+# Atlas A9.2 — the root-owned verification policy.
+#
+# Install as /etc/atlas/verification.conf, owned by root, mode 0644, with every
+# directory leading to it owned by root and writable by nobody else. Atlas
+# reaches it through a root-anchored walk with no symlink traversed; a policy
+# that fails any of those checks leaves every lifecycle transition manual, with
+# a reason `atlas verify policy` will print.
+#
+# ATLAS_VERIFYPOLICY_PATH is compiled in. There is no environment override, no
+# flag and no data-directory-relative variant, because a caller that can choose
+# the policy is not constrained by it.
+#
+# ## What this file decides
+#
+# Whether Atlas may change a knowledge record's lifecycle state BY ITSELF, and
+# if so: for exactly which knowledge kinds, exactly which transitions,
+# established by exactly which deterministic verifier, above which thresholds.
+#
+# ## What it cannot decide
+#
+# Some things are refused before this file is read, so writing them here makes
+# the policy malformed rather than powerful:
+#
+#   - ACCEPTED_RISK reaching APPROVED. Atlas can verify that a risk exists and
+#     that it has been mitigated. That the project is willing to live with it is
+#     a claim with an owner, and no evidence supplies one.
+#   - REJECTED as a target. Automatic rejection needs an explicit falsification
+#     condition; low confidence is not one, and rejecting a legitimate proposal
+#     destroys work irreversibly.
+#   - a transition the kind-aware state machine refuses — a DECISION cannot be
+#     RESOLVED, because "this architectural decision has been resolved" is not a
+#     sentence with a meaning.
+#
+# There is also NO judgment switch, and its absence is the design: a normative
+# choice is not a discoverable fact, so there is nothing a verifier could
+# establish and no threshold that would mean anything.
+#
+# ## Fail-closed
+#
+# Every default is the most demanding value that still lets the deterministic
+# path function, so an absent key never loosens anything. An UNRECOGNISED KEY IS
+# AN ERROR that disables the whole policy — the thing an author most plausibly
+# believes they configured, and Atlas most plausibly never read, is a
+# restriction.
+
+# Required. Without it the policy does not load at all.
+enabled = yes
+
+# An operator-chosen label, recorded in every audit row, so an auditor can tell
+# which generation of policy authorised a transition even after this file has
+# changed. The exact bytes are also hashed into each audit row.
+policy_id = atlas-verification-v1
+
+# --- enforcement, PER PATH -------------------------------------------------
+#
+# This split is the structural expression of A9.2's central rule. Deterministic
+# transitions may enforce on a machine with no calibration data whatsoever,
+# because how often some source has been right in the past is not an input to a
+# mechanical evaluation of a bounded truth condition. Tying the two to one flag
+# would make an unrelated statistic a precondition for acting on a proof.
+#
+# With both off — the default, and the correct first deployment — Atlas records
+# a full shadow verdict for everything and changes nothing.
+deterministic_enforce = yes
+
+# Leave this off until replay evidence justifies it. An empirical verdict rests
+# on source reliability, and with no resolved history that claim has no content;
+# the engine will refuse to enforce anyway while calibration is insufficient,
+# so setting it yes prematurely buys nothing and reads as though it did.
+empirical_enforce = no
+
+# --- thresholds ------------------------------------------------------------
+
+# The confidence score, 0..100, that a claim must reach. 100 is the right value
+# for a deterministic-only policy: a mechanical PASS scores 100 and nothing else
+# does, so this threshold refuses anything that was not actually established.
+# Lower it only when the empirical path is being enforced, and then only with
+# replay evidence for the number chosen.
+min_confidence = 100
+
+# Genuinely independent evidence groups. Checked on the EMPIRICAL path only:
+# independent corroboration is what substitutes for a proof, and where there is
+# a proof, asking for opinion to confirm it is the wrong question.
+min_evidence_groups = 2
+
+# How old evidence may be and still bear on a claim about the present, in
+# seconds. An operational fact observed a fortnight ago says little about a
+# system redeployed since.
+max_evidence_age = 86400
+
+# Resolved outcomes a source needs before its measured reliability may be used
+# rather than the documented conservative prior. Empirical path only.
+min_calibration_samples = 100
+
+# --- the transition allowlist ----------------------------------------------
+#
+#   allow = KIND FROM TO VERIFIER
+#
+# Four whitespace-separated tokens, exactly. A rule with a missing verifier is
+# refused rather than defaulted, because a deterministic rule with no named
+# verifier is a rule that any evidence at all satisfies — the single most
+# dangerous line this file could contain.
+#
+# A rule cannot name a document, an actor, a model or a repository. A policy
+# that could bless one specific record would launder a single approval through a
+# file; one that could bless a specific source would be reliability written down
+# as authority.
+#
+# Keep this list NARROW. A broad wildcard such as "every INVARIANT
+# auto-approves" is exactly what A9.2 says not to enable: the point of the
+# allowlist is that a reviewer can read all of it in one sitting.
+#
+# Verifiers available in A9.2, every one a read:
+#
+#   atlas.content_hash    the content of a repository path at a bound commit
+#                         hashes to a stated value
+#   atlas.symbol_present  a named symbol exists in the current generation
+#   atlas.symbol_absent   no symbol of a given name exists in a COMPLETE
+#                         generation; a partial index reports UNAVAILABLE, which
+#                         is not a pass and not a fail
+#   atlas.proven_edge     the compiler proved a direct call edge between two
+#                         named symbols
+#
+# Nothing is enabled by default. Uncomment deliberately, one line at a time,
+# and read `atlas verify show CLAIM-ID` against a real claim before enabling
+# enforcement for it.
+#
+# A technical obligation whose remediation condition is the disappearance of a
+# symbol may be closed out mechanically. This is the safest transition to
+# automate first: it discharges work that was already approved, it names no new
+# policy, and an incomplete index refuses rather than closing it.
+#
+# allow = OBLIGATION APPROVED RESOLVED atlas.symbol_absent
+#
+# A release blocker that a root-owned rule already establishes may be opened
+# mechanically when its condition is detected. This is policy EXECUTION rather
+# than new judgment: the decision that the condition is a blocker was made when
+# this file was written.
+#
+# allow = OBLIGATION PROPOSED APPROVED atlas.content_hash

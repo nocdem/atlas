@@ -21,7 +21,7 @@
 #include "atlas/error.h"
 #include "atlas/limits.h"
 
-#define ATLAS_SCHEMA_VERSION 13
+#define ATLAS_SCHEMA_VERSION 15
 
 typedef struct atlas_db atlas_db;
 
@@ -1759,6 +1759,16 @@ atlas_status atlas_db_decision_approved_revision(atlas_db *db, int64_t document_
 atlas_status atlas_db_decision_document_shape(atlas_db *db, int64_t document_id,
                                               int64_t *superseded_by_out, int64_t *proposed_out,
                                               int64_t *resolved_out, atlas_err *err);
+/* A9.2. The document's cached `current_status`, read rather than re-derived.
+ *
+ * Deliberately a read of the cache and not a second implementation of the
+ * precedence: `recompute_status` in `lifecycle.c` is the single authority on
+ * what a document's status is, `atlas_db_decision_verify` checks the cache
+ * against the ledger replay, and a third opinion in a caller is exactly the
+ * disagreement A4 warns about. A reader that wants to know the status asks for
+ * the status. */
+atlas_status atlas_db_decision_document_status(atlas_db *db, int64_t document_id, char *out,
+                                               size_t out_size, atlas_err *err);
 /* The newest revision of a document, whatever its state. */
 atlas_status atlas_db_decision_latest_revision(atlas_db *db, int64_t document_id, int64_t *id_out,
                                                int64_t *no_out, char *hash_out, size_t hash_size,

@@ -45,6 +45,48 @@ policy does not name gets `unknown method`.
 web API's 23 routes each forward to a daemon method already in the table above.
 A client never names an Atlas method.
 
+## A9.2 additions
+
+**One CLI command and no protocol operation at all.** That is the whole surface
+change, and the absence is the guarantee rather than an omission.
+
+| operation | class | authority |
+|---|---|---|
+| `verify policy` (CLI) | global read | none — opens no index and binds nothing |
+| `verify show` (CLI) | repo read | reads the index; takes no writer lock |
+| `verify run` (CLI) | lifecycle mutation | writes the index; a root-owned policy decides whether a transition follows |
+
+`verify run` is the only operation in Atlas that can change a lifecycle state
+without an operator capability, and the reason it is allowed to is that **it
+holds no authority of its own**. It asks Atlas to evaluate a policy the running
+process cannot edit, at a path compiled into the binary. What it can produce is a
+`VERIFICATION_POLICY` ledger entry — a fifth actor that is not
+`LOCAL_OPERATOR_CONFIRMED`, is not `ATLAS_AUTOMATIC`, and is unwritable by any
+adapter.
+
+### The A9.2 absences
+
+1. **No RPC method, MCP tool or gateway route reaches the verification engine.**
+   Not a read of it, and emphatically not the trigger. `method_for` in
+   `service_decision.c` returns NULL for the two machine operations, so there is
+   no method name to send; `atlas_decision_op_is_machine` refuses the wire path
+   independently; and the warrant a machine transition spends is minted and
+   consumed inside one writer-thread transaction, so there is no field a request
+   could carry it in.
+2. **No surface can mint a warrant.** The audit row *is* the capability, it is
+   written only by `atlas_verify_autolifecycle_run`, and a shadow row can never
+   be spent because the check requires `verdict = 'AUTO'`.
+3. **No model can create tool, test, runtime or verifier evidence.** Those four
+   actor classes require `ATLAS_ATTESTED` identity, refused in C and by a schema
+   CHECK. A model saying "clang proves this" is not Atlas running clang.
+4. **No policy switch enables judgment automation, and none exists to add.**
+   Risk acceptance and every normative choice are refused before the policy file
+   is read, so a mistaken root-owned rule is refused rather than obeyed.
+
+Model-facing attestation submission is **deferred rather than absent-by-design**;
+see the status section of `docs/verification.md` for what adding it would
+require and why the enforcing half of A9.2 is complete without it.
+
 ## The four A9 absences that carry its guarantees
 
 1. **No remote credential administration.** No MCP tool and no gateway route

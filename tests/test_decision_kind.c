@@ -290,7 +290,21 @@ static void wind_back_to_schema_12(env *e, atlas_err *err) {
         "ALTER TABLE d12_challenges RENAME TO decision_challenges;"
         "CREATE INDEX idx_decision_challenges_repo ON decision_challenges"
         "  (repo_id, consumed, expires_at);";
+    /* A9.2's tables were added by migrations 14 and 15, so a database rewound
+     * to twelve must not still be carrying them: the forward migration would
+     * find them already present and fail. A new table means a line here, which
+     * is the same "nothing is globbed" discipline the source list follows. */
     static const char BACK_VERSION[] =
+        "DROP TABLE verify_lifecycle_audit;"
+        "DROP TABLE verify_reliability;"
+        "DROP TABLE verify_outcomes;"
+        "DROP TABLE verify_results;"
+        "DROP TABLE verify_attestation_evidence;"
+        "DROP TABLE verify_attestations;"
+        "DROP TABLE verify_evidence_deps;"
+        "DROP TABLE verify_evidence;"
+        "DROP TABLE verify_claims;"
+        "DROP TABLE verify_actors;"
         "DELETE FROM schema_migrations WHERE version >= 13;";
 
     T_OK(atlas_db_exec_sql(e->db, BACK_DOCUMENTS, err), err);
@@ -304,7 +318,11 @@ static void wind_back_to_schema_12(env *e, atlas_err *err) {
      * everything. Without these the forward migration could be measured against
      * a database that already had the new shape, or one the wind-back had
      * quietly emptied. */
-    T_EQ_INT(atlas_db_schema_version(e->db, err), ATLAS_SCHEMA_VERSION - 1);
+    /* Twelve as a literal, not `ATLAS_SCHEMA_VERSION - 1`. This test is about
+     * migration *thirteen* specifically, so the wind-back target is a fixed
+     * point in history; expressing it relative to the current version made it
+     * silently mean something else the moment A9.2 added migrations 14 and 15. */
+    T_EQ_INT(atlas_db_schema_version(e->db, err), 12);
     T_CHECK_MSG(!column_exists(e->db, "decision_documents", "kind"),
                 "the wind-back left the kind column in place");
     T_CHECK_MSG(!ddl_mentions(e->db, "decision_revisions", "RESOLVED"),
@@ -1212,7 +1230,7 @@ static void test_a_failed_migration_thirteen_leaves_twelve_untouched(void) {
                 "the failure did not report a rollback: %s", atlas_err_msg(&merr));
 
     /* Rolled back whole. */
-    T_EQ_INT(atlas_db_schema_version(e.db, &err), ATLAS_SCHEMA_VERSION - 1);
+    T_EQ_INT(atlas_db_schema_version(e.db, &err), 12);
     T_EQ_INT((int)count_of(&e, "SELECT COUNT(*) FROM decision_documents;"), (int)docs);
     T_EQ_INT((int)count_of(&e, "SELECT COUNT(*) FROM decision_links;"), (int)links);
     atlas_buf after = ATLAS_BUF_INIT;

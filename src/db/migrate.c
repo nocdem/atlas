@@ -2673,6 +2673,471 @@ static const char *const M13_STATEMENTS[] = {
 /* `foreign_keys_off` is written out for every row rather than left to default,
  * so that "which migrations run with foreign keys enforced?" is answered by
  * reading this table instead of by counting initialisers. */
+/* --- migration 14: A9.2 claims, attestations, evidence and verification -----
+ *
+ * **Purely additive**, and that is a deliberate design constraint rather than a
+ * convenience. Migration 13 had to rebuild four tables and needed the one
+ * `foreign_keys_off` argument in Atlas; this one adds ten tables and alters
+ * nothing, so:
+ *
+ *   - no decision row is written, so no content hash moves and `atlas doctor`
+ *     reports nothing new;
+ *   - `foreign_keys_off` is false, and the rebuild-verification discipline
+ *     migration 13 needed does not apply because nothing is rebuilt;
+ *   - §51 falls out for free. A record with no claims has no attestations, so
+ *     it aggregates to `UNVERIFIED` on read. Every record written before this
+ *     phase is correctly unverified without a single UPDATE, and there is no
+ *     path by which a migration could fabricate historical confidence.
+ *
+ * ## Why verification state is not a column here
+ *
+ * There is no `verification_state` on `decision_documents` and there must not
+ * be. Freshness, link currency and gate verdicts are all recomputed on read in
+ * Atlas for one reason — a cached judgement is wrong between the change and the
+ * recomputation — and "does the evidence still support this?" is the question
+ * for which a stale answer is least acceptable. The state is derived from these
+ * tables every time it is asked for.
+ *
+ * `verify_results` is the apparent exception and is not one: it records what an
+ * aggregation concluded at a moment, with the algorithm version and evidence
+ * counts that produced it, because a machine transition must be reconstructable
+ * later. That is history. A6 keeps `decision_validations` for the same reason.
+ *
+ * ## Soft references, for A4's reason
+ *
+ * `repo_id` carries no foreign key and is cleared by `atlas_db_repo_remove`,
+ * because `repositories.id` is a reused rowid and a pointer left behind would
+ * eventually name a different repository. `document_id` and `revision_id` are
+ * likewise soft: A4 records do not cascade, and an attestation about a record
+ * must survive anything that could remove the pointer without removing the
+ * record. `repo_identity_hash` is the durable identity, exactly as in A4.
+ */
+static const char *const M14_STATEMENTS[] = {
+    /* --- actors ------------------------------------------------------------
+     *
+     * Vendor-neutral: `provider`, `family` and `version` are free text an actor
+     * supplies, and `identity` says how much that is worth. The CHECK on
+     * `identity` together with the one below is what makes "a model cannot
+     * become a compiler" a schema fact: a TOOL, TEST, RUNTIME_OBSERVATION or
+     * ATLAS_VERIFIER row must carry ATLAS_ATTESTED, and only Atlas writes that
+     * value. */
+    "CREATE TABLE verify_actors ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  uid TEXT NOT NULL UNIQUE,"
+    "  class TEXT NOT NULL CHECK(class IN"
+    "    ('UNKNOWN','HUMAN','AI_AGENT','TOOL','TEST','RUNTIME_OBSERVATION',"
+    "     'REPOSITORY_EVIDENCE','DOCUMENT','ATLAS_VERIFIER')),"
+    "  identity TEXT NOT NULL DEFAULT 'SELF_DECLARED'"
+    "    CHECK(identity IN ('SELF_DECLARED','PEER_AUTHENTICATED','ATLAS_ATTESTED')),"
+    "  name TEXT NOT NULL DEFAULT '',"
+    "  provider TEXT NOT NULL DEFAULT '',"
+    "  family TEXT NOT NULL DEFAULT '',"
+    "  version TEXT NOT NULL DEFAULT '',"
+    "  role TEXT NOT NULL DEFAULT '',"
+    "  session_key TEXT NOT NULL DEFAULT '',"
+    "  run_id TEXT NOT NULL DEFAULT '',"
+    "  parent_actor_id INTEGER NOT NULL DEFAULT 0,"
+    "  first_seen_at TEXT NOT NULL,"
+    "  last_seen_at TEXT NOT NULL,"
+    /* The forgery guard, in the schema rather than only in C. A row claiming to
+     * be a tool without Atlas having attested it cannot be inserted at all, so
+     * a bug in a caller cannot produce one. A table constraint rather than a
+     * column one because it spans two columns. */
+    "  CHECK(class NOT IN ('TOOL','TEST','RUNTIME_OBSERVATION','ATLAS_VERIFIER')"
+    "        OR identity = 'ATLAS_ATTESTED')"
+    ");",
+    "CREATE INDEX idx_verify_actors_class ON verify_actors(class, identity);",
+    "CREATE INDEX idx_verify_actors_session ON verify_actors(session_key);",
+
+    /* --- claims -------------------------------------------------------------
+     *
+     * `semantics` is separation 4 in a column: a DESCRIPTIVE claim says what is
+     * so and a NORMATIVE one says what ought to be, and only the first is
+     * something a mechanical verifier can read. */
+    "CREATE TABLE verify_claims ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  uid TEXT NOT NULL UNIQUE,"
+    "  repo_id INTEGER NOT NULL DEFAULT 0,"
+    "  repo_identity_hash TEXT NOT NULL DEFAULT '',"
+    "  document_id INTEGER NOT NULL DEFAULT 0,"
+    "  revision_id INTEGER NOT NULL DEFAULT 0,"
+    "  domain TEXT NOT NULL DEFAULT '',"
+    "  text TEXT NOT NULL,"
+    "  scope_note TEXT NOT NULL DEFAULT '',"
+    "  semantics TEXT NOT NULL DEFAULT 'DESCRIPTIVE'"
+    "    CHECK(semantics IN ('DESCRIPTIVE','NORMATIVE')),"
+    "  verifier TEXT NOT NULL DEFAULT '',"
+    "  verifier_input TEXT NOT NULL DEFAULT '',"
+    "  basis_commit TEXT NOT NULL DEFAULT '',"
+    "  environment TEXT NOT NULL DEFAULT '',"
+    "  created_at TEXT NOT NULL,"
+    "  superseded_by_claim_id INTEGER NOT NULL DEFAULT 0"
+    ");",
+    "CREATE INDEX idx_verify_claims_doc ON verify_claims(document_id, revision_id);",
+    "CREATE INDEX idx_verify_claims_repo ON verify_claims(repo_id);",
+    "CREATE INDEX idx_verify_claims_domain ON verify_claims(domain);",
+
+    /* --- evidence -----------------------------------------------------------
+     *
+     * Columns rather than a JSON blob, because "where did this come from?" has
+     * to be queryable and a document in a column is where provenance goes to
+     * be forgotten. Which columns are meaningful depends on `class`; the rest
+     * are empty. */
+    "CREATE TABLE verify_evidence ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  uid TEXT NOT NULL UNIQUE,"
+    "  class TEXT NOT NULL CHECK(class IN"
+    "    ('UNKNOWN','SOURCE_CODE','COMPILER','TEST','RUNTIME','DEPLOYED_CONFIG',"
+    "     'GIT_HISTORY','SPECIFICATION','DOCUMENT','ATLAS_KNOWLEDGE',"
+    "     'HUMAN_STATEMENT','AI_ANALYSIS')),"
+    "  repo_id INTEGER NOT NULL DEFAULT 0,"
+    "  commit_oid TEXT NOT NULL DEFAULT '',"
+    "  path_raw BLOB,"
+    "  path_text TEXT NOT NULL DEFAULT '',"
+    "  symbol TEXT NOT NULL DEFAULT '',"
+    "  line_start INTEGER NOT NULL DEFAULT 0,"
+    "  line_end INTEGER NOT NULL DEFAULT 0,"
+    "  content_hash TEXT NOT NULL DEFAULT '',"
+    "  suite TEXT NOT NULL DEFAULT '',"
+    "  test_name TEXT NOT NULL DEFAULT '',"
+    "  result TEXT NOT NULL DEFAULT '',"
+    "  binary_id TEXT NOT NULL DEFAULT '',"
+    "  environment TEXT NOT NULL DEFAULT '',"
+    "  tool TEXT NOT NULL DEFAULT '',"
+    "  tool_version TEXT NOT NULL DEFAULT '',"
+    /* A8-CI's own evidence class, carried through rather than flattened, so
+     * PROVEN and CANDIDATE never both become "the compiler said so". */
+    "  proof_class TEXT NOT NULL DEFAULT '',"
+    "  target TEXT NOT NULL DEFAULT '',"
+    "  probe TEXT NOT NULL DEFAULT '',"
+    "  observed TEXT NOT NULL DEFAULT '',"
+    "  deployed_revision TEXT NOT NULL DEFAULT '',"
+    /* When the evidence describes, which is not when the row was written. The
+     * distinction is what makes staleness computable. */
+    "  observed_at TEXT NOT NULL DEFAULT '',"
+    "  recorded_at TEXT NOT NULL,"
+    "  actor_id INTEGER NOT NULL DEFAULT 0"
+    ");",
+    "CREATE INDEX idx_verify_evidence_class ON verify_evidence(class);",
+    "CREATE INDEX idx_verify_evidence_repo ON verify_evidence(repo_id, commit_oid);",
+    "CREATE INDEX idx_verify_evidence_actor ON verify_evidence(actor_id);",
+
+    /* --- the evidence dependency graph --------------------------------------
+     *
+     * `evidence_id` derives from `derives_from_id`. This is the structure that
+     * makes independence computable: without a declared edge Atlas cannot show
+     * two pieces of evidence are related, and — crucially — it also cannot show
+     * they are *un*related, which is why the aggregation treats undeclared
+     * interpretation as correlated rather than independent.
+     *
+     * Append-only and self-referential. A row pointing at itself is refused by
+     * the CHECK; longer cycles are harmless to the union-find, which is why
+     * they are not chased at write time. */
+    "CREATE TABLE verify_evidence_deps ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  evidence_id INTEGER NOT NULL REFERENCES verify_evidence(id) ON DELETE CASCADE,"
+    "  derives_from_id INTEGER NOT NULL REFERENCES verify_evidence(id) ON DELETE CASCADE,"
+    "  recorded_at TEXT NOT NULL,"
+    "  CHECK(evidence_id <> derives_from_id),"
+    "  UNIQUE(evidence_id, derives_from_id)"
+    ");",
+    "CREATE INDEX idx_verify_deps_from ON verify_evidence_deps(derives_from_id);",
+
+    /* --- attestations -------------------------------------------------------
+     *
+     * Never updated. An actor that changes its mind writes a second row naming
+     * the first in `supersedes_id`, and both stay readable — a source reversing
+     * itself is exactly the kind of fact a reliability system must be able to
+     * see, and an UPDATE would erase it.
+     *
+     * `self_confidence` is stored and never becomes Atlas' confidence. -1 means
+     * the actor said nothing, which is not the same as saying zero. */
+    "CREATE TABLE verify_attestations ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  uid TEXT NOT NULL UNIQUE,"
+    "  claim_id INTEGER NOT NULL REFERENCES verify_claims(id) ON DELETE CASCADE,"
+    "  actor_id INTEGER NOT NULL REFERENCES verify_actors(id),"
+    "  verdict TEXT NOT NULL CHECK(verdict IN ('SUPPORT','CONTRADICT','INCONCLUSIVE')),"
+    "  self_confidence INTEGER NOT NULL DEFAULT -1"
+    "    CHECK(self_confidence >= -1 AND self_confidence <= 100),"
+    "  method TEXT NOT NULL DEFAULT '',"
+    "  scope_note TEXT NOT NULL DEFAULT '',"
+    "  created_at TEXT NOT NULL,"
+    "  supersedes_id INTEGER NOT NULL DEFAULT 0,"
+    "  proposer INTEGER NOT NULL DEFAULT 0,"
+    "  basis_commit TEXT NOT NULL DEFAULT '',"
+    "  environment TEXT NOT NULL DEFAULT ''"
+    ");",
+    "CREATE INDEX idx_verify_attest_claim ON verify_attestations(claim_id, created_at);",
+    "CREATE INDEX idx_verify_attest_actor ON verify_attestations(actor_id);",
+
+    /* Which evidence one attestation rests on. Many-to-many, because one piece
+     * of evidence legitimately supports several attestations — and that sharing
+     * is precisely what makes them correlated. */
+    "CREATE TABLE verify_attestation_evidence ("
+    "  attestation_id INTEGER NOT NULL REFERENCES verify_attestations(id) ON DELETE CASCADE,"
+    "  evidence_id INTEGER NOT NULL REFERENCES verify_evidence(id) ON DELETE CASCADE,"
+    "  PRIMARY KEY(attestation_id, evidence_id)"
+    ");",
+    "CREATE INDEX idx_verify_ae_evidence ON verify_attestation_evidence(evidence_id);",
+
+    /* --- verification results ----------------------------------------------
+     *
+     * Append-only history: what an aggregation concluded at a moment, under a
+     * named algorithm version and a named family taxonomy version. Never read
+     * as current state — the current state is recomputed — and kept so a
+     * machine transition can be reconstructed years later.
+     *
+     * `confidence_score` is named that way in the column as well as in the API,
+     * so that a query cannot accidentally present it as a probability.
+     * `calibrated_probability` is a separate nullable column and is NULL unless
+     * calibration actually supports it. */
+    "CREATE TABLE verify_results ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  claim_id INTEGER NOT NULL REFERENCES verify_claims(id) ON DELETE CASCADE,"
+    "  state TEXT NOT NULL CHECK(state IN"
+    "    ('UNVERIFIED','VERIFYING','SUPPORTED','VERIFIED','CONTRADICTED',"
+    "     'INCONCLUSIVE','STALE')),"
+    "  basis TEXT NOT NULL CHECK(basis IN ('DETERMINISTIC','EMPIRICAL','JUDGMENT')),"
+    "  confidence_score INTEGER NOT NULL CHECK(confidence_score >= 0 AND confidence_score <= 100),"
+    "  calibration TEXT NOT NULL CHECK(calibration IN"
+    "    ('INSUFFICIENT_DATA','UNCALIBRATED','CALIBRATING','CALIBRATED')),"
+    "  calibrated_probability INTEGER"
+    "    CHECK(calibrated_probability IS NULL OR"
+    "          (calibrated_probability >= 0 AND calibrated_probability <= 100)),"
+    "  algorithm TEXT NOT NULL,"
+    "  family_version INTEGER NOT NULL,"
+    "  support_count INTEGER NOT NULL DEFAULT 0,"
+    "  contradict_count INTEGER NOT NULL DEFAULT 0,"
+    "  inconclusive_count INTEGER NOT NULL DEFAULT 0,"
+    "  independent_groups INTEGER NOT NULL DEFAULT 0,"
+    "  independent_families INTEGER NOT NULL DEFAULT 0,"
+    "  support_mass INTEGER NOT NULL DEFAULT 0,"
+    "  contradict_mass INTEGER NOT NULL DEFAULT 0,"
+    "  conflict TEXT NOT NULL DEFAULT 'NONE',"
+    "  stale INTEGER NOT NULL DEFAULT 0,"
+    "  verifier TEXT NOT NULL DEFAULT '',"
+    "  check_result TEXT NOT NULL DEFAULT '',"
+    "  reasons TEXT NOT NULL DEFAULT '',"
+    "  reason_total INTEGER NOT NULL DEFAULT 0,"
+    "  created_at TEXT NOT NULL,"
+    /* A probability may only exist alongside calibration that supports it. The
+     * separation between a score and a probability is thereby a constraint the
+     * database enforces, not a convention a renderer remembers. */
+    "  CHECK(calibrated_probability IS NULL OR calibration = 'CALIBRATED')"
+    ");",
+    "CREATE INDEX idx_verify_results_claim ON verify_results(claim_id, id);",
+
+    /* --- calibration outcomes ----------------------------------------------
+     *
+     * The ground truth a reliability estimate is allowed to learn from.
+     *
+     * `source` is the loop-breaker. `MACHINE_TRANSITION` is representable so
+     * that an ineligible outcome is auditable rather than absent, and
+     * `atlas_verify_outcome_eligible` refuses to count it: a machine transition
+     * driven by a source's own attestation must never become evidence that the
+     * source was right, or Atlas would be teaching itself to trust a source
+     * using its trust in that source. */
+    "CREATE TABLE verify_outcomes ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  claim_id INTEGER NOT NULL REFERENCES verify_claims(id) ON DELETE CASCADE,"
+    "  actor_id INTEGER NOT NULL REFERENCES verify_actors(id),"
+    "  domain TEXT NOT NULL DEFAULT '',"
+    "  attested TEXT NOT NULL CHECK(attested IN ('SUPPORT','CONTRADICT','INCONCLUSIVE')),"
+    "  truth TEXT NOT NULL CHECK(truth IN ('TRUE','FALSE')),"
+    "  source TEXT NOT NULL CHECK(source IN"
+    "    ('UNKNOWN','DETERMINISTIC_VERIFIER','OPERATOR_RESOLUTION','RUNTIME_OBSERVATION',"
+    "     'MACHINE_TRANSITION')),"
+    "  eligible INTEGER NOT NULL DEFAULT 0,"
+    "  recorded_at TEXT NOT NULL,"
+    "  UNIQUE(claim_id, actor_id)"
+    ");",
+    "CREATE INDEX idx_verify_outcomes_actor ON verify_outcomes(actor_id, domain);",
+
+    /* --- reliability --------------------------------------------------------
+     *
+     * actor × domain, never one permanent global percentage per actor. A source
+     * excellent at control-flow reasoning and poor at runtime recollection is
+     * the ordinary case, and a single number would average away the only thing
+     * worth knowing.
+     *
+     * `reliability` is in weight units (0..1000) and is NULL until there are
+     * enough samples: absent rather than defaulted, so a reader is told there
+     * is no estimate instead of being handed a number that means nothing. */
+    "CREATE TABLE verify_reliability ("
+    "  actor_id INTEGER NOT NULL REFERENCES verify_actors(id) ON DELETE CASCADE,"
+    "  domain TEXT NOT NULL DEFAULT '',"
+    "  correct INTEGER NOT NULL DEFAULT 0,"
+    "  incorrect INTEGER NOT NULL DEFAULT 0,"
+    "  support_when_false INTEGER NOT NULL DEFAULT 0,"
+    "  contradict_when_true INTEGER NOT NULL DEFAULT 0,"
+    "  inconclusive INTEGER NOT NULL DEFAULT 0,"
+    "  abstained INTEGER NOT NULL DEFAULT 0,"
+    "  samples INTEGER NOT NULL DEFAULT 0,"
+    "  reliability INTEGER,"
+    "  calibration TEXT NOT NULL DEFAULT 'INSUFFICIENT_DATA'"
+    "    CHECK(calibration IN ('INSUFFICIENT_DATA','UNCALIBRATED','CALIBRATING','CALIBRATED')),"
+    /* Brier score in ten-thousandths, so the metric is stored as an integer and
+     * a replay is exactly reproducible. NULL when the sample is too small for
+     * the number to mean anything, which on this machine is always. */
+    "  brier_x10000 INTEGER,"
+    "  updated_at TEXT NOT NULL,"
+    "  PRIMARY KEY(actor_id, domain)"
+    ");",
+
+    /* --- the machine lifecycle audit, which is also the warrant -------------
+     *
+     * §40 requires that a future audit can reconstruct why Atlas finalized a
+     * record. Every field it names is here, including the policy hash and the
+     * algorithm version, so the reconstruction does not depend on the policy
+     * file still saying what it said.
+     *
+     * This table is **also the capability**. A row with `verdict='AUTO'` and
+     * `consumed=0` is a warrant: single-use, bound to one document, one
+     * revision and one content hash, and checked by the decision layer's single
+     * write point in the same transaction that spends it. That is deliberately
+     * the shape `decision_challenges` has, because the machine path must be no
+     * easier to satisfy than the operator path — the difference between them is
+     * *who* may mint one, not how loosely it binds.
+     *
+     * A SHADOW row is written too, and can never be consumed: it records what
+     * Atlas would have done. That is what makes shadow mode a full result
+     * rather than a silence. */
+    "CREATE TABLE verify_lifecycle_audit ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  claim_id INTEGER NOT NULL DEFAULT 0,"
+    "  result_id INTEGER NOT NULL DEFAULT 0,"
+    "  document_id INTEGER NOT NULL,"
+    "  revision_id INTEGER NOT NULL,"
+    "  content_hash TEXT NOT NULL,"
+    "  kind TEXT NOT NULL,"
+    "  from_status TEXT NOT NULL,"
+    "  to_status TEXT NOT NULL,"
+    "  basis TEXT NOT NULL CHECK(basis IN ('DETERMINISTIC','EMPIRICAL','JUDGMENT')),"
+    "  verdict TEXT NOT NULL CHECK(verdict IN"
+    "    ('NEEDS_REVIEW','AUTO','SHADOW','BLOCKED','FORBIDDEN')),"
+    "  reasons TEXT NOT NULL DEFAULT '',"
+    "  policy_id TEXT NOT NULL DEFAULT '',"
+    "  policy_hash TEXT NOT NULL DEFAULT '',"
+    "  algorithm TEXT NOT NULL DEFAULT '',"
+    "  prior_version INTEGER NOT NULL DEFAULT 0,"
+    "  family_version INTEGER NOT NULL DEFAULT 0,"
+    "  confidence_score INTEGER NOT NULL DEFAULT 0,"
+    "  calibration TEXT NOT NULL DEFAULT 'INSUFFICIENT_DATA',"
+    "  calibrated_probability INTEGER,"
+    "  independent_groups INTEGER NOT NULL DEFAULT 0,"
+    "  evidence_snapshot TEXT NOT NULL DEFAULT '',"
+    "  verifier TEXT NOT NULL DEFAULT '',"
+    "  check_result TEXT NOT NULL DEFAULT '',"
+    "  binary_id TEXT NOT NULL DEFAULT '',"
+    "  consumed INTEGER NOT NULL DEFAULT 0,"
+    "  consumed_at TEXT,"
+    "  created_at TEXT NOT NULL"
+    ");",
+    "CREATE INDEX idx_verify_audit_doc ON verify_lifecycle_audit(document_id, id);",
+    /* At most one live warrant per revision, as a schema constraint rather than
+     * as care — the shape A4 uses for "at most one approved revision per
+     * document" and A8 for "at most one unreleased lease per job". It makes a
+     * duplicate mint a hard failure instead of two warrants that a later reader
+     * would have to choose between. */
+    "CREATE UNIQUE INDEX idx_verify_audit_live_warrant"
+    "  ON verify_lifecycle_audit(revision_id, to_status)"
+    "  WHERE verdict = 'AUTO' AND consumed = 0;",
+    NULL,
+};
+
+/* --- migration 15: a distinct actor for a policy-authorised transition -------
+ *
+ * A9.2 needs the ledger to distinguish two things Atlas does that look alike
+ * from the outside and are not alike at all:
+ *
+ *   ATLAS_AUTOMATIC      — a transition that follows *mechanically from another
+ *                          Atlas operation*, with no policy involved: the
+ *                          supersession an approval implies.
+ *   VERIFICATION_POLICY  — a transition a **root-owned policy** authorised,
+ *                          justified by a verification result, spending a
+ *                          single-use warrant bound to one revision and one
+ *                          content hash.
+ *
+ * Collapsing them would make "which lifecycle changes did Atlas make on its own
+ * authority?" unanswerable by reading the ledger, which is exactly the question
+ * an auditor of an automating system asks first.
+ *
+ * ## Why only `decision_events`
+ *
+ * `decision_revisions.proposed_by` keeps the four-value CHECK **unchanged and
+ * deliberately so**. A verification policy never proposes anything: it can move
+ * a record that already exists between states its own state machine permits,
+ * and nothing more. A policy able to author a revision would be a policy able
+ * to write project knowledge, which is a different and much larger authority
+ * than this phase grants. The narrower CHECK is what makes that structural.
+ *
+ * ## Why this needs no `foreign_keys_off`
+ *
+ * Migration 13 needed it because `DROP TABLE decision_revisions` triggered
+ * `decision_links`' declared cascade and silently emptied the link table.
+ * `decision_events` is a **leaf**: nothing in the schema references it, which
+ * `tests/test_verify_migrate.c` asserts rather than assumes. Dropping a child
+ * with foreign keys enforced deletes nothing else, so the flag stays false and
+ * the migration runs fully checked.
+ *
+ * The row-preservation discipline migration 13 introduced still applies: the
+ * count is captured first and the rebuilt table must match it exactly, with the
+ * named CHECK as the error message. `id` is copied explicitly because it is
+ * AUTOINCREMENT and the ledger's ordering *is* that id — a reused id would let
+ * a later event sort before an earlier one.
+ */
+static const char M15_EVENTS[] =
+    "CREATE TABLE decision_events_new ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  document_id INTEGER NOT NULL REFERENCES decision_documents(id),"
+    "  revision_id INTEGER REFERENCES decision_revisions(id),"
+    "  revision_no INTEGER NOT NULL DEFAULT 0,"
+    "  event TEXT NOT NULL CHECK(event IN"
+    "    ('PROPOSED','APPROVED','REJECTED','SUPERSEDED','RESOLVED')),"
+    "  actor TEXT NOT NULL CHECK(actor IN"
+    "    ('MODEL_PROPOSAL','MODEL_INFERENCE','LOCAL_OPERATOR_CONFIRMED','ATLAS_AUTOMATIC',"
+    "     'VERIFICATION_POLICY')),"
+    "  content_hash TEXT,"
+    "  challenge_id INTEGER,"
+    "  superseded_by_revision_id INTEGER,"
+    "  superseded_by_document_id INTEGER,"
+    "  detail TEXT,"
+    "  created_at TEXT NOT NULL,"
+    "  dedup_key TEXT"
+    ");"
+    "INSERT INTO decision_events_new"
+    "  (id, document_id, revision_id, revision_no, event, actor, content_hash, challenge_id,"
+    "   superseded_by_revision_id, superseded_by_document_id, detail, created_at, dedup_key)"
+    "  SELECT id, document_id, revision_id, revision_no, event, actor, content_hash, challenge_id,"
+    "         superseded_by_revision_id, superseded_by_document_id, detail, created_at, dedup_key"
+    "  FROM decision_events;"
+    "DROP TABLE decision_events;"
+    "ALTER TABLE decision_events_new RENAME TO decision_events;"
+    "CREATE INDEX idx_decision_events_doc ON decision_events(document_id, id);"
+    "CREATE INDEX idx_decision_events_rev ON decision_events(revision_id, id);"
+    "CREATE UNIQUE INDEX idx_decision_events_dedup ON decision_events(document_id, dedup_key)"
+    "  WHERE dedup_key IS NOT NULL;";
+
+/* The rebuild verifies its own row preservation before it commits, the
+ * discipline migration 13 established. The named CHECK is the error message:
+ * a migration that lost ledger rows must say so in words an operator can act
+ * on, not fail with a constraint number. */
+static const char M15_VERIFY[] =
+    "CREATE TEMP TABLE m15_before AS SELECT COUNT(*) AS n FROM decision_events;";
+
+static const char M15_CONFIRM[] =
+    "CREATE TEMP TABLE m15_check(ok INTEGER NOT NULL"
+    "  CHECK(ok = 1) CONSTRAINT no_decision_event_may_be_lost_in_migration_15);"
+    "INSERT INTO m15_check(ok) SELECT CASE WHEN"
+    "  (SELECT n FROM m15_before) = (SELECT COUNT(*) FROM decision_events)"
+    "  AND (SELECT COUNT(*) FROM pragma_foreign_key_check) = 0"
+    "  THEN 1 ELSE 0 END;"
+    "DROP TABLE m15_check;"
+    "DROP TABLE m15_before;";
+
+static const char *const M15_STATEMENTS[] = {M15_VERIFY, M15_EVENTS, M15_CONFIRM, NULL};
+
 static const atlas_migration MIGRATIONS[] = {
     {1, "initial schema", M1_STATEMENTS, false},
     {2, "worktree identity", M2_STATEMENTS, false},
@@ -2691,6 +3156,12 @@ static const atlas_migration MIGRATIONS[] = {
      * foreign keys enforced, `decision_links`' declared cascade would have made
      * the rebuild of `decision_revisions` delete every link silently. */
     {13, "knowledge kinds and a lifecycle state for closure", M13_STATEMENTS, true},
+    /* Additive: ten new tables, no existing table altered, so no content hash
+     * moves and foreign keys stay enforced throughout. See the M14 comment. */
+    {14, "claims, attestations, evidence and machine verification", M14_STATEMENTS, false},
+    /* Rebuilds one leaf table to widen a CHECK. Foreign keys stay enforced:
+     * nothing references `decision_events`, so the drop cascades nowhere. */
+    {15, "a distinct actor for a policy-authorised transition", M15_STATEMENTS, false},
 };
 
 const atlas_migration *atlas_migrations(size_t *count_out) {

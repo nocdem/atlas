@@ -32,6 +32,18 @@ Credential administration is local and operator-only; no remote caller can
 create, rotate or revoke a credential, and none can write anything at all. See
 `docs/remote-access.md`.
 
+**A9.2 adds a third axis to a durable record: what evidence bears on whether it
+holds.** Claims, attestations, actors and evidence are first class; independence
+is computed from declared derivation edges, so three models reading one document
+count as one corroboration rather than three; a confidence score is reported as a
+score and never as a probability; and a root-owned policy may authorise Atlas to
+make narrow, mechanically-justified lifecycle transitions by itself, recorded
+against a distinct `VERIFICATION_POLICY` actor and spending a single-use warrant
+that binds as tightly as an operator's challenge. **Deterministic verification
+does not wait for historical calibration**; empirical verification does require
+it, has none here, and stays in shadow. Nothing a model can reach approves,
+rejects, supersedes or resolves anything. See `docs/verification.md`.
+
 ## Status: phase A6
 
 A6 turns Atlas' stored decisions into deterministic safety gates: it detects

@@ -1185,6 +1185,298 @@ static void test_the_api_exposes_the_knowledge_dimension(void) {
     env_close(&e);
 }
 
+/* A9.2.1 — the three verification routes, over a real listening socket.
+ *
+ * A9.2.1 shipped `/api/v1/verify/claims`, `/api/v1/verify/claim` and
+ * `/api/v1/verify/policy` with no test between them, which meant the remote
+ * half of the verification surface was argued for in prose and never executed.
+ * This drives all three the way a client does — bytes onto a loopback socket,
+ * a bearer credential, the gateway's own routing and scope check, the daemon
+ * over the Unix socket, and the answer back.
+ *
+ * The listener binds `127.0.0.1` and nothing else. The gateway policy is built
+ * with `atlas_gwpolicy_parse_buffer`, so no file is read and the root-owned
+ * `/etc/atlas/gateway.conf` is neither consulted nor touched.
+ *
+ * Two properties, and the second is the one that matters:
+ *
+ *   - a credential holding `decisions:read` reads a claim, its evidence and the
+ *     policy, and the reply carries the four A9.2.1 source-binding fields;
+ *   - **there is no intake route.** Every verification path answers 405 to a
+ *     POST, and every plausible spelling of an intake endpoint is 404. A leaked
+ *     bearer token cannot state a claim, cite evidence, attest or ask for an
+ *     evaluation, because `verify.evaluate` can move a lifecycle state. That
+ *     absence is the argument A9's rule demands, so it is asserted rather than
+ *     described.
+ */
+static void test_the_verification_routes_read_and_offer_no_intake(void) {
+    env e;
+    const char *scopes[] = {"repo:read", "decisions:read"};
+    env_open(&e, scopes, 2);
+
+    atlas_err err;
+    atlas_err_init(&err);
+    atlas_buf out = ATLAS_BUF_INIT;
+
+    /* One claim, stated through the CLI against the running daemon. The gateway
+     * has no way to do this, which is the point of the test below. */
+    {
+        const char *args[] = {"verify", "claim",   "--repo", "proj",
+                              "--text", "the gateway offers no intake route", "--json"};
+        T_EQ_INT(run_cli_ex(&e, args, 7, true, &out, &err), 0);
+    }
+    char claim_uid[128];
+    claim_uid[0] = '\0';
+    {
+        const char *s = strstr(atlas_buf_cstr(&out), "atlas-claim-");
+        T_REQUIRE_MSG(s != NULL, "no claim uid in: %s", atlas_buf_cstr(&out));
+        size_t n = 0;
+        while (s[n] != '\0' && s[n] != '"' && n + 1 < sizeof claim_uid) {
+            n++;
+        }
+        memcpy(claim_uid, s, n);
+        claim_uid[n] = '\0';
+    }
+    atlas_buf_free(&out);
+
+    /* A real listener, on loopback. */
+    const int port = 38791;
+    atlas_gwpolicy p;
+    char text[256];
+    (void)snprintf(text, sizeof text,
+                   "enabled = yes\ngateway_uid = 1\nremote_mcp = yes\n"
+                   "listen_addr = 127.0.0.1\nlisten_port = %d\n",
+                   port);
+    atlas_gwpolicy_parse_buffer(text, strlen(text), &p);
+    T_REQUIRE(p.state == ATLAS_GWPOLICY_ENABLED);
+
+    atlas_gateway_opts o;
+    memset(&o, 0, sizeof o);
+    o.socket_path = atlas_buf_cstr(&e.d.socket);
+    o.timeout_ms = 15000;
+
+    listener l;
+    memset(&l, 0, sizeof l);
+    atomic_store(&l.stop, false);
+    T_OK(atlas_gateway_open(&p, &o, &l.g, &err), &err);
+    T_REQUIRE(pthread_create(&l.thread, NULL, listener_main, &l) == 0);
+
+    atlas_buf resp = ATLAS_BUF_INIT;
+    bool up = false;
+    for (int i = 0; i < 200 && !up; i++) {
+        up = wire_request(port, "GET /healthz HTTP/1.1\r\nHost: t\r\n\r\n", &resp);
+        if (!up) {
+            struct timespec ts = {0, 20 * 1000 * 1000};
+            (void)nanosleep(&ts, NULL);
+        }
+    }
+    T_CHECK_MSG(up, "the gateway never accepted a connection on port %d", port);
+
+    if (up) {
+        char req[1024];
+
+        /* The claim list. */
+        (void)snprintf(req, sizeof req,
+                       "GET /api/v1/verify/claims?repo=proj HTTP/1.1\r\nHost: t\r\n"
+                       "Authorization: Bearer %s\r\n\r\n",
+                       e.token);
+        T_CHECK(wire_request(port, req, &resp));
+        T_CHECK_MSG(strstr(atlas_buf_cstr(&resp), "HTTP/1.1 200") != NULL,
+                    "verify/claims was refused: %s", atlas_buf_cstr(&resp));
+        T_CHECK_MSG(strstr(atlas_buf_cstr(&resp), claim_uid) != NULL,
+                    "the claim is missing from the list: %s", atlas_buf_cstr(&resp));
+
+        /* One claim, with the fields migration 16 added. A reply that omitted
+         * them would leave a remote reader unable to tell whether the result
+         * describes the tree the repository is actually on. */
+        (void)snprintf(req, sizeof req,
+                       "GET /api/v1/verify/claim?claim=%s HTTP/1.1\r\nHost: t\r\n"
+                       "Authorization: Bearer %s\r\n\r\n",
+                       claim_uid, e.token);
+        T_CHECK(wire_request(port, req, &resp));
+        T_CHECK_MSG(strstr(atlas_buf_cstr(&resp), "HTTP/1.1 200") != NULL,
+                    "verify/claim was refused: %s", atlas_buf_cstr(&resp));
+        static const char *const FIELDS[] = {"claim_commit", "evaluated_commit", "sem_generation",
+                                             "source_drift", "state",            "basis",
+                                             "confidence_score", "calibration", "kind", "status"};
+        for (size_t i = 0; i < sizeof FIELDS / sizeof FIELDS[0]; i++) {
+            T_CHECK_MSG(strstr(atlas_buf_cstr(&resp), FIELDS[i]) != NULL,
+                        "the reply carries no \"%s\": %s", FIELDS[i], atlas_buf_cstr(&resp));
+        }
+        /* A9.2's rule, at the transport: a score is never a probability, and an
+         * uncalibrated one carries no probability field at all. */
+        T_CHECK(strstr(atlas_buf_cstr(&resp), "calibrated_probability") == NULL);
+
+        /* The policy, which opens no index. */
+        (void)snprintf(req, sizeof req,
+                       "GET /api/v1/verify/policy HTTP/1.1\r\nHost: t\r\n"
+                       "Authorization: Bearer %s\r\n\r\n",
+                       e.token);
+        T_CHECK(wire_request(port, req, &resp));
+        T_CHECK_MSG(strstr(atlas_buf_cstr(&resp), "HTTP/1.1 200") != NULL,
+                    "verify/policy was refused: %s", atlas_buf_cstr(&resp));
+
+        /* Intake is absent. A POST to a route that exists reads only; a route
+         * that would perform intake does not exist at all. */
+        static const char *const READ_ONLY[] = {"/api/v1/verify/claims", "/api/v1/verify/claim",
+                                                "/api/v1/verify/policy"};
+        for (size_t i = 0; i < sizeof READ_ONLY / sizeof READ_ONLY[0]; i++) {
+            (void)snprintf(req, sizeof req,
+                           "POST %s HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer %s\r\n"
+                           "Content-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+                           READ_ONLY[i], e.token);
+            T_CHECK(wire_request(port, req, &resp));
+            T_CHECK_MSG(strstr(atlas_buf_cstr(&resp), "HTTP/1.1 405") != NULL,
+                        "POST %s did not answer 405: %s", READ_ONLY[i], atlas_buf_cstr(&resp));
+        }
+        static const char *const ABSENT[] = {
+            "/api/v1/verify/claim_create", "/api/v1/verify/create", "/api/v1/verify/evidence",
+            "/api/v1/verify/produce",      "/api/v1/verify/attest", "/api/v1/verify/attestation",
+            "/api/v1/verify/depend",       "/api/v1/verify/evaluate", "/api/v1/verify/run",
+            "/api/v1/verify/resolve",      "/api/v1/verify/approve",
+        };
+        for (size_t i = 0; i < sizeof ABSENT / sizeof ABSENT[0]; i++) {
+            for (int m = 0; m < 2; m++) {
+                (void)snprintf(req, sizeof req,
+                               "%s %s HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer %s\r\n"
+                               "Content-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+                               m == 0 ? "GET" : "POST", ABSENT[i], e.token);
+                T_CHECK(wire_request(port, req, &resp));
+                T_CHECK_MSG(strstr(atlas_buf_cstr(&resp), "HTTP/1.1 404") != NULL,
+                            "%s %s is not absent: %s", m == 0 ? "GET" : "POST", ABSENT[i],
+                            atlas_buf_cstr(&resp));
+            }
+        }
+    }
+
+    atomic_store(&l.stop, true);
+    (void)pthread_join(l.thread, NULL);
+    atlas_gateway_close(l.g);
+    atlas_buf_free(&resp);
+    env_close(&e);
+}
+
+/* The same routes, to a credential that was never granted `decisions:read`.
+ *
+ * Hiding is not authorisation: naming the route directly meets the same check.
+ */
+static void test_a_credential_without_decisions_read_cannot_read_a_claim(void) {
+    env e;
+    const char *scopes[] = {"repo:read"};
+    env_open(&e, scopes, 1);
+
+    atlas_buf resp = ATLAS_BUF_INIT;
+    char auth[ATLAS_APIKEY_TOKEN_MAX + 16];
+    (void)snprintf(auth, sizeof auth, "Bearer %s", e.token);
+
+    static const char *const PATHS[] = {"/api/v1/verify/claims?repo=proj",
+                                        "/api/v1/verify/claim?claim=atlas-claim-0",
+                                        "/api/v1/verify/policy"};
+    for (size_t i = 0; i < sizeof PATHS / sizeof PATHS[0]; i++) {
+        request(&e, "GET", PATHS[i], auth, NULL, &resp);
+        T_CHECK_MSG(status_of(&resp) == 403, "%s answered %d rather than 403: %s", PATHS[i],
+                    status_of(&resp), body_of(&resp));
+    }
+
+    atlas_buf_free(&resp);
+    env_close(&e);
+}
+
+/* Mission Control's verification view, over the browser's own authentication.
+ *
+ * The page is not a second implementation: it renders exactly what
+ * `/api/v1/verify/claim` returns. What this establishes is the other half —
+ * that the browser principal reaches those routes at all, and that the page
+ * shipped in the binary carries the bindings for the fields the route sends.
+ * A page whose bindings had drifted from the JSON would render blanks while
+ * every API test still passed.
+ */
+static void test_mission_control_reaches_the_verification_routes(void) {
+    env e;
+    const char *scopes[] = {"repo:read", "decisions:read"};
+    env_open(&e, scopes, 2);
+
+    atlas_err err;
+    atlas_err_init(&err);
+    atlas_buf out = ATLAS_BUF_INIT;
+    {
+        const char *args[] = {"verify", "claim",   "--repo", "proj",
+                              "--text", "mission control reads this", "--json"};
+        T_EQ_INT(run_cli_ex(&e, args, 7, true, &out, &err), 0);
+    }
+    char claim_uid[128];
+    claim_uid[0] = '\0';
+    {
+        const char *s = strstr(atlas_buf_cstr(&out), "atlas-claim-");
+        T_REQUIRE_MSG(s != NULL, "no claim uid in: %s", atlas_buf_cstr(&out));
+        size_t n = 0;
+        while (s[n] != '\0' && s[n] != '"' && n + 1 < sizeof claim_uid) {
+            n++;
+        }
+        memcpy(claim_uid, s, n);
+        claim_uid[n] = '\0';
+    }
+    atlas_buf_free(&out);
+
+    atlas_gateway *g = NULL;
+    gui_env(&e, &g);
+    atlas_buf resp = ATLAS_BUF_INIT;
+
+    /* The page, and the bindings the verification view depends on. */
+    gui_request(g, "GET", "/", NULL, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 200);
+    static const char *const BOUND[] = {"verify/claim",  "verify/claims", "verify/policy",
+                                        "source_drift",  "claim_commit",  "evaluated_commit",
+                                        "sem_generation", "calibration",  "confidence_score",
+                                        "independent_groups"};
+    for (size_t i = 0; i < sizeof BOUND / sizeof BOUND[0]; i++) {
+        T_CHECK_MSG(strstr(body_of(&resp), BOUND[i]) != NULL,
+                    "the page carries no binding for \"%s\"", BOUND[i]);
+    }
+    /* The page says in words that a score is not a percentage. */
+    T_CHECK_MSG(strstr(body_of(&resp), "% probability") != NULL,
+                "the page does not say the score is not a probability");
+
+    /* A browser session, then the three routes through it. */
+    char body[512];
+    (void)snprintf(body, sizeof body, "{\"key\":\"%s\"}", e.token);
+    gui_request(g, "POST", "/auth/login", NULL, body, &resp);
+    T_EQ_INT(status_of(&resp), 200);
+    char cookie[128];
+    cookie_of(&resp, cookie, sizeof cookie);
+    T_REQUIRE_MSG(cookie[0] != '\0', "login set no session cookie");
+
+    char path[256];
+    (void)snprintf(path, sizeof path, "/api/v1/verify/claims?repo=proj");
+    gui_request(g, "GET", path, cookie, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 200);
+    T_CHECK_MSG(strstr(body_of(&resp), claim_uid) != NULL, "the claim is missing: %s",
+                body_of(&resp));
+
+    (void)snprintf(path, sizeof path, "/api/v1/verify/claim?claim=%s", claim_uid);
+    gui_request(g, "GET", path, cookie, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 200);
+    static const char *const FIELDS[] = {"claim_commit", "evaluated_commit", "sem_generation",
+                                         "source_drift", "state",           "basis",
+                                         "confidence_score", "calibration", "kind", "status"};
+    for (size_t i = 0; i < sizeof FIELDS / sizeof FIELDS[0]; i++) {
+        T_CHECK_MSG(strstr(body_of(&resp), FIELDS[i]) != NULL, "the reply carries no \"%s\": %s",
+                    FIELDS[i], body_of(&resp));
+    }
+
+    gui_request(g, "GET", "/api/v1/verify/policy", cookie, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 200);
+
+    /* And the browser has no intake either. */
+    gui_request(g, "POST", "/api/v1/verify/evaluate", cookie, "{}", &resp);
+    T_CHECK_MSG(status_of(&resp) == 404, "the browser reached an intake route: %d",
+                status_of(&resp));
+
+    atlas_gateway_close(g);
+    atlas_buf_free(&resp);
+    env_close(&e);
+}
+
 static const atlas_test TESTS[] = {
     {"a scoped credential can call a tool", test_a_scoped_credential_can_call_a_tool},
     {"a tool outside the scopes is refused and hidden",
@@ -1207,6 +1499,12 @@ static const atlas_test TESTS[] = {
     {"the browser surface is absent when disabled",
      test_the_browser_surface_is_absent_when_disabled},
     {"the listener binds and serves", test_the_listener_binds_and_serves},
+    {"the verification routes read and offer no intake",
+     test_the_verification_routes_read_and_offer_no_intake},
+    {"a credential without decisions:read cannot read a claim",
+     test_a_credential_without_decisions_read_cannot_read_a_claim},
+    {"mission control reaches the verification routes",
+     test_mission_control_reaches_the_verification_routes},
     {"concurrent connections are safe", test_concurrent_connections_are_safe},
 };
 

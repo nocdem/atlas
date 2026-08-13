@@ -1145,9 +1145,25 @@ static atlas_status op_challenge(apply_ctx *ac, const atlas_decision_op *op,
  * what the capability names. The last cannot happen through Atlas, because
  * revisions are immutable — and it is checked anyway, because "cannot happen"
  * is a belief and this is a check. */
+/* Spends a capability, and reports the kind of the record it was spent on.
+ *
+ * `out->knowledge_kind` is filled here rather than in each of the five ops that
+ * spend a capability, because zero is `DECISION` and a field nobody sets is
+ * therefore not empty — it is a confident wrong answer. `atlas decision
+ * approve` reported `kind: DECISION` for an APPROVED `INVARIANT` and for an
+ * APPROVED `OBLIGATION`: the document, `decision show`, `decision list` and the
+ * JSON surface all carried the right kind, and the one surface an operator sees
+ * at the moment of approving carried the wrong one. A9.1's rule is that every
+ * surface reports kind and status in separate fields, and a surface reporting
+ * the *wrong* kind is worse than one reporting neither.
+ *
+ * One place, five ops: approve, reject, resolve, supersede and revalidate all
+ * arrive here, so the answer cannot drift between them. The kind is read from
+ * the document, never from the operation — the rule `transition()` follows and
+ * for the same reason. */
 static atlas_status spend_challenge(apply_ctx *ac, const atlas_decision_op *op,
                                     atlas_decision_intent want, atlas_decision_challenge *out_c,
-                                    atlas_err *err) {
+                                    atlas_decision_result *out, atlas_err *err) {
     if (op->token.len == 0) {
         return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
                              "this operation changes a decision's lifecycle state and needs an "
@@ -1244,6 +1260,14 @@ static atlas_status spend_challenge(apply_ctx *ac, const atlas_decision_op *op,
         return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
                              "that approval challenge was consumed concurrently; nothing was "
                              "changed");
+    }
+    if (out != NULL) {
+        bool kfound = false;
+        st = atlas_db_decision_kind_of(ac->db, out_c->document_id, &out->knowledge_kind, &kfound,
+                                       err);
+        if (st != ATLAS_OK) {
+            return st;
+        }
     }
     return ATLAS_OK;
 }
@@ -1354,7 +1378,7 @@ static atlas_status op_approve(apply_ctx *ac, const atlas_decision_op *op,
                                atlas_decision_result *out, atlas_err *err) {
     atlas_decision_challenge c;
     atlas_decision_challenge_init(&c);
-    atlas_status st = spend_challenge(ac, op, ATLAS_DECISION_INTENT_APPROVE, &c, err);
+    atlas_status st = spend_challenge(ac, op, ATLAS_DECISION_INTENT_APPROVE, &c, out, err);
     if (st != ATLAS_OK) {
         return st;
     }
@@ -1432,7 +1456,7 @@ static atlas_status op_reject(apply_ctx *ac, const atlas_decision_op *op,
                               atlas_decision_result *out, atlas_err *err) {
     atlas_decision_challenge c;
     atlas_decision_challenge_init(&c);
-    atlas_status st = spend_challenge(ac, op, ATLAS_DECISION_INTENT_REJECT, &c, err);
+    atlas_status st = spend_challenge(ac, op, ATLAS_DECISION_INTENT_REJECT, &c, out, err);
     if (st != ATLAS_OK) {
         return st;
     }
@@ -1474,7 +1498,7 @@ static atlas_status op_resolve(apply_ctx *ac, const atlas_decision_op *op,
                                atlas_decision_result *out, atlas_err *err) {
     atlas_decision_challenge c;
     atlas_decision_challenge_init(&c);
-    atlas_status st = spend_challenge(ac, op, ATLAS_DECISION_INTENT_RESOLVE, &c, err);
+    atlas_status st = spend_challenge(ac, op, ATLAS_DECISION_INTENT_RESOLVE, &c, out, err);
     if (st != ATLAS_OK) {
         return st;
     }
@@ -1512,7 +1536,7 @@ static atlas_status op_supersede(apply_ctx *ac, const atlas_decision_op *op,
                                  atlas_decision_result *out, atlas_err *err) {
     atlas_decision_challenge c;
     atlas_decision_challenge_init(&c);
-    atlas_status st = spend_challenge(ac, op, ATLAS_DECISION_INTENT_SUPERSEDE, &c, err);
+    atlas_status st = spend_challenge(ac, op, ATLAS_DECISION_INTENT_SUPERSEDE, &c, out, err);
     if (st != ATLAS_OK) {
         return st;
     }
@@ -1613,7 +1637,7 @@ static atlas_status op_revalidate(apply_ctx *ac, const atlas_decision_op *op,
                                   atlas_decision_result *out, atlas_err *err) {
     atlas_decision_challenge c;
     atlas_decision_challenge_init(&c);
-    atlas_status st = spend_challenge(ac, op, ATLAS_DECISION_INTENT_REVALIDATE, &c, err);
+    atlas_status st = spend_challenge(ac, op, ATLAS_DECISION_INTENT_REVALIDATE, &c, out, err);
     if (st != ATLAS_OK) {
         return st;
     }

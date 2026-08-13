@@ -1326,9 +1326,104 @@ static void test_kind_and_resolution_survive_a_backup(void) {
     env_close(&e);
 }
 
+/* Every lifecycle transition reports the kind of the record it changed.
+ *
+ * `propose` has always echoed it — `propose_kind` above asserts so. The five
+ * operations that spend a capability did not: `atlas_decision_result` is zeroed
+ * by its initialiser, `DECISION` is zero, and no transition path filled the
+ * field in. So `atlas decision approve` printed `kind: DECISION` over an
+ * APPROVED `INVARIANT` and over an APPROVED `OBLIGATION`, while the document,
+ * `decision show`, `decision list` and the JSON surface all carried the right
+ * one. `--json` is refused for the interactive commands, so the operator's only
+ * view of what they had just approved was the wrong one.
+ *
+ * This is the hazard the zero-value rule exists for: a field nobody assigns is
+ * not blank, it is `DECISION` — a confident wrong answer rather than a missing
+ * one. A9.1's rule is that kind and status are orthogonal and every surface
+ * reports both, and a surface reporting the *wrong* kind is worse than one
+ * reporting neither.
+ *
+ * Asserted for every kind, so a kind added later without a transition answer is
+ * a failure here rather than a wrong line on somebody's terminal. */
+static void test_every_transition_reports_the_records_kind(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    env e;
+    env_open(&e, &err);
+
+    /* `ATLAS_DECISION_KIND_MAX` is the number of kinds, not the last member. */
+    for (unsigned k = 0; k < (unsigned)ATLAS_DECISION_KIND_MAX; k++) {
+        atlas_decision_kind kind = (atlas_decision_kind)k;
+        atlas_buf uid = ATLAS_BUF_INIT;
+        char title[64];
+        (void)snprintf(title, sizeof title, "transition kind %s",
+                       atlas_decision_kind_name(kind));
+        propose_kind(&e, kind, title, &uid, &err);
+
+        /* Approve. */
+        atlas_buf token = ATLAS_BUF_INIT;
+        char confirm[ATLAS_DECISION_CONFIRM_MAX];
+        challenge_for(&e, atlas_buf_cstr(&uid), ATLAS_DECISION_INTENT_APPROVE, &token, confirm,
+                      &err);
+        atlas_decision_result res;
+        atlas_decision_result_init(&res);
+        T_OK(spend(&e, ATLAS_DECISION_OP_APPROVE, atlas_buf_cstr(&uid), atlas_buf_cstr(&token),
+                   confirm, &res, &err),
+             &err);
+        T_CHECK_MSG(res.knowledge_kind == kind, "approving a %s reported %s",
+                    atlas_decision_kind_name(kind),
+                    atlas_decision_kind_name(res.knowledge_kind));
+        atlas_decision_result_free(&res);
+        atlas_buf_free(&token);
+
+        /* Resolve, for the kinds whose approved form makes a demand. */
+        if (atlas_decision_kind_resolvable(kind)) {
+            atlas_buf t2 = ATLAS_BUF_INIT;
+            char c2[ATLAS_DECISION_CONFIRM_MAX];
+            challenge_for(&e, atlas_buf_cstr(&uid), ATLAS_DECISION_INTENT_RESOLVE, &t2, c2, &err);
+            atlas_decision_result r2;
+            atlas_decision_result_init(&r2);
+            T_OK(spend(&e, ATLAS_DECISION_OP_RESOLVE, atlas_buf_cstr(&uid), atlas_buf_cstr(&t2),
+                       c2, &r2, &err),
+                 &err);
+            T_CHECK_MSG(r2.knowledge_kind == kind, "resolving a %s reported %s",
+                        atlas_decision_kind_name(kind),
+                        atlas_decision_kind_name(r2.knowledge_kind));
+            atlas_decision_result_free(&r2);
+            atlas_buf_free(&t2);
+        }
+        atlas_buf_free(&uid);
+    }
+
+    /* Rejection takes the same path and must answer the same way. */
+    {
+        atlas_buf uid = ATLAS_BUF_INIT;
+        propose_kind(&e, ATLAS_DECISION_KIND_ACCEPTED_RISK, "a risk to refuse", &uid, &err);
+        atlas_buf token = ATLAS_BUF_INIT;
+        char confirm[ATLAS_DECISION_CONFIRM_MAX];
+        challenge_for(&e, atlas_buf_cstr(&uid), ATLAS_DECISION_INTENT_REJECT, &token, confirm,
+                      &err);
+        atlas_decision_result res;
+        atlas_decision_result_init(&res);
+        T_OK(spend(&e, ATLAS_DECISION_OP_REJECT, atlas_buf_cstr(&uid), atlas_buf_cstr(&token),
+                   confirm, &res, &err),
+             &err);
+        T_CHECK_MSG(res.knowledge_kind == ATLAS_DECISION_KIND_ACCEPTED_RISK,
+                    "rejecting an ACCEPTED_RISK reported %s",
+                    atlas_decision_kind_name(res.knowledge_kind));
+        atlas_decision_result_free(&res);
+        atlas_buf_free(&token);
+        atlas_buf_free(&uid);
+    }
+
+    env_close(&e);
+}
+
 static const atlas_test TESTS[] = {
     {"the kind vocabulary is closed and DECISION is zero",
      test_the_kind_vocabulary_is_closed_and_decision_is_zero},
+    {"every transition reports the record's kind",
+     test_every_transition_reports_the_records_kind},
     {"every kind can be created and reads back",
      test_every_kind_can_be_created_and_reads_back},
     {"the schema refuses a kind outside the vocabulary",

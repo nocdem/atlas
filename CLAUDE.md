@@ -1906,6 +1906,39 @@ src/gw/ui/mission-control.html  the Verification view
   `service_remote.c`, and is rendered by both renderers. Missing the read-back is
   how the socket path and the local path start disagreeing.
 
+## What the A9.2.1 closure found — four rules
+
+- **A result field nobody assigns is not blank; it is the zero value, and every
+  Atlas zero means something.** `atlas_decision_result.knowledge_kind` was never
+  set by any transition, so `decision approve` reported `kind: DECISION` over an
+  APPROVED `INVARIANT` and an APPROVED `OBLIGATION` — while the document,
+  `decision show`, `decision list` and the JSON surface all carried the right
+  kind, and `--json` is refused for the interactive commands so there was no
+  second view. It is filled in `spend_challenge`, which approve, reject, resolve,
+  supersede and revalidate all reach, so the five cannot answer differently.
+  **A surface reporting the wrong kind is worse than one reporting none.**
+- **The three axes must be in the shape the *daemon* sends, not only the one the
+  CLI renders.** `verify.show` omitted `kind` and `status`, so MCP (which relays
+  it verbatim), the gateway (which forwards it) and Mission Control (which binds
+  `c.kind` and `c.status`) all lost two of the three — and on a system
+  deployment, where the socket is the only path, `atlas verify show --json`
+  answered `DECISION` / `PROPOSED` for an APPROVED OBLIGATION. Add such a field
+  to `atlas_service_verify_write_assessment` **and** read it back in
+  `service_remote.c`; one without the other is how the two paths start
+  disagreeing.
+- **A claim is named by its uid on every surface that reports one, so every
+  command taking a claim accepts both spellings.** `verify show` grew uid
+  resolution and `verify run` did not, so the one command that performs a machine
+  transition answered "no claim has that id" to the id `verify claim` had just
+  printed. `resolve_claim()` in `service_verify.c` is the one implementation;
+  a uid never parses as a number, so the two cannot collide.
+- **Verify that an install installed, and that the services are running it.**
+  `make install` reported `-- Up-to-date: /usr/local/bin/atlas` while the
+  installed file differed from `build/atlas`; use `cmp` rather than the report.
+  Separately, `atlas-dispatcher.service` was found running a **deleted inode** of
+  a previous binary, so `readlink /proc/<MainPID>/exe` ending in `(deleted)` is
+  part of checking that the installed binary is the one being executed.
+
 ## Extending A9.2 safely
 
 - **A new deterministic verifier** means a member of `atlas_verify_verifier`, a

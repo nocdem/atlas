@@ -974,9 +974,15 @@ atlas_status atlas_service_verify_show(atlas_ctx *ctx, int64_t claim_id, atlas_v
  * mints no capability and approves nothing: it asks Atlas to evaluate a policy
  * somebody else installed, which is why it needs no terminal, no challenge and
  * no confirmation. What it can produce is a `VERIFICATION_POLICY` ledger entry,
- * which is not `LOCAL_OPERATOR_CONFIRMED` and never becomes it. */
-atlas_status atlas_service_verify_run(atlas_ctx *ctx, int64_t claim_id, const char *repo_name,
-                                      atlas_verify_report *out, atlas_err *err);
+ * which is not `LOCAL_OPERATOR_CONFIRMED` and never becomes it.
+ *
+ * The claim may be named by its rowid or by the uid every surface reports; pass
+ * one and leave the other empty. Both spellings are accepted for the reason
+ * `verify show` accepts both, and the two cannot collide because a uid never
+ * parses as a number. */
+atlas_status atlas_service_verify_run(atlas_ctx *ctx, int64_t claim_id, const char *claim_uid,
+                                      const char *repo_name, atlas_verify_report *out,
+                                      atlas_err *err);
 /* Reports the root-owned policy. Opens no index and binds nothing, so it is
  * safe to run anywhere — the shape `gateway status` has. */
 atlas_status atlas_service_verify_policy(atlas_verify_report *out, atlas_err *err);

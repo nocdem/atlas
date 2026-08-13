@@ -1613,8 +1613,15 @@ static atlas_status run_verify(cli_state *st, atlas_ctx *ctx, atlas_renderer *r,
             atlas_verify_report_free(&rep);
             return atlas_err_set(err, ATLAS_ERR_USAGE, "usage: atlas verify run NAME CLAIM-ID");
         }
-        result = atlas_service_verify_run(ctx, strtoll(st->operands[2], NULL, 10),
-                                          st->operands[1], &rep, err);
+        /* The same two spellings `verify show` accepts, and for the same
+         * reason: the uid is what every surface reports, the rowid is what
+         * A9.2's CLI took, and a uid never parses as a number. */
+        char *rend = NULL;
+        long long run_id = strtoll(st->operands[2], &rend, 10);
+        bool run_numeric = rend != NULL && *rend == '\0' && rend != st->operands[2];
+        result = atlas_service_verify_run(ctx, run_numeric ? run_id : 0,
+                                          run_numeric ? NULL : st->operands[2], st->operands[1],
+                                          &rep, err);
     } else {
         atlas_verify_report_free(&rep);
         return atlas_err_set(err, ATLAS_ERR_USAGE,
@@ -2259,8 +2266,17 @@ static bool remote_serves(const cli_state *st) {
          * path by which an operator's account can record a claim at all.
          * Being served is not being authorised — `verify.evaluate` may cause
          * Atlas to move a lifecycle state, but the gates are in a root-owned
-         * file no peer here can read, let alone edit. */
-        return strcmp(sub, "show") == 0 || strcmp(sub, "run") == 0 ||
+         * file no peer here can read, let alone edit.
+         *
+         * **`run` is deliberately absent from this list, because there is no
+         * `verify.run` method.** Claiming it was served cost the accuracy of
+         * the one message that explains the situation: on a system deployment
+         * the command opened a context, failed to get a writable index, and
+         * said "no index is available to write" — which reads as a broken
+         * install rather than as an operation this account cannot perform
+         * here. Saying nothing is served is the truthful answer, and it points
+         * at the documented gap instead of at the operator's machine. */
+        return strcmp(sub, "show") == 0 ||
                strcmp(sub, "policy") == 0 || strcmp(sub, "claim") == 0 ||
                strcmp(sub, "evidence") == 0 || strcmp(sub, "produce") == 0 ||
                strcmp(sub, "attest") == 0 || strcmp(sub, "depend") == 0 ||

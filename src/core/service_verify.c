@@ -160,12 +160,22 @@ static void policy_into(const atlas_verifypolicy *p, atlas_verify_report *out) {
  * A claim may be named by rowid or by public uid. The uid is what every other
  * surface reports and therefore what a client has; the rowid is what A9.2's CLI
  * took. Both resolve here so the two spellings cannot answer differently. */
-atlas_status atlas_service_verify_show_on(atlas_db *db, int64_t claim_id, const char *claim_uid,
-                                          atlas_verify_report *out, atlas_err *err) {
-    if (db == NULL) {
-        return atlas_err_set(err, ATLAS_ERR_CONFIG, "no index is available to read");
-    }
-    if (claim_id == 0 && claim_uid != NULL && *claim_uid != '\0') {
+/* Resolves a claim named by its uid to the rowid the engine works in.
+ *
+ * A claim is reported by its uid everywhere — `verify claim` prints one, MCP
+ * returns one, the gateway returns one — and by its rowid nowhere. Both
+ * spellings are accepted and they cannot collide, because a uid never parses as
+ * a number.
+ *
+ * One helper, two callers, deliberately. `verify show` grew this and `verify
+ * run` did not, so the command that *reads* took the id every surface hands you
+ * and the command that *enforces* answered "no claim has that id" to the same
+ * string. An operator following the documented workflow could not run the one
+ * command in Atlas that performs a machine transition, and nothing in the
+ * message suggested a rowid was wanted. */
+static atlas_status resolve_claim(atlas_db *db, int64_t *claim_id, const char *claim_uid,
+                                  const char *what, atlas_err *err) {
+    if (*claim_id == 0 && claim_uid != NULL && *claim_uid != '\0') {
         atlas_verify_claim c;
         atlas_verify_claim_init(&c);
         bool found = false;
@@ -174,15 +184,29 @@ atlas_status atlas_service_verify_show_on(atlas_db *db, int64_t claim_id, const 
             fst = atlas_err_set(err, ATLAS_ERR_USAGE, "no claim has that id");
         }
         if (fst == ATLAS_OK) {
-            claim_id = c.id;
+            *claim_id = c.id;
         }
         atlas_verify_claim_free(&c);
         if (fst != ATLAS_OK) {
             return fst;
         }
     }
-    if (claim_id == 0) {
-        return atlas_err_set(err, ATLAS_ERR_USAGE, "name the claim to show");
+    if (*claim_id == 0) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "name the claim to %s", what);
+    }
+    return ATLAS_OK;
+}
+
+atlas_status atlas_service_verify_show_on(atlas_db *db, int64_t claim_id, const char *claim_uid,
+                                          atlas_verify_report *out, atlas_err *err) {
+    if (db == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_CONFIG, "no index is available to read");
+    }
+    {
+        atlas_status rst = resolve_claim(db, &claim_id, claim_uid, "show", err);
+        if (rst != ATLAS_OK) {
+            return rst;
+        }
     }
     atlas_verifypolicy p;
     atlas_verifypolicy_load(&p);
@@ -224,11 +248,18 @@ atlas_status atlas_service_verify_show(atlas_ctx *ctx, int64_t claim_id, atlas_v
     return atlas_verify_assess(db, &p, claim_id, &out->assessment, err);
 }
 
-atlas_status atlas_service_verify_run(atlas_ctx *ctx, int64_t claim_id, const char *repo_name,
-                                      atlas_verify_report *out, atlas_err *err) {
+atlas_status atlas_service_verify_run(atlas_ctx *ctx, int64_t claim_id, const char *claim_uid,
+                                      const char *repo_name, atlas_verify_report *out,
+                                      atlas_err *err) {
     atlas_db *db = ctx == NULL ? NULL : atlas_ctx_db(ctx);
     if (db == NULL) {
         return atlas_err_set(err, ATLAS_ERR_CONFIG, "no index is available to write");
+    }
+    {
+        atlas_status rst = resolve_claim(db, &claim_id, claim_uid, "run", err);
+        if (rst != ATLAS_OK) {
+            return rst;
+        }
     }
     atlas_verifypolicy p;
     atlas_verifypolicy_load(&p);
@@ -263,7 +294,26 @@ atlas_status atlas_service_verify_write_assessment(atlas_json *j,
                                                    const atlas_verify_assessment *a,
                                                    atlas_err *err) {
     const atlas_verify_aggregate *g = &a->aggregate;
-    atlas_status st = atlas_json_key_str(j, "state", atlas_verify_state_name(g->state), err);
+    /* The three axes, in three separate fields — the rule A9.1 and A9.2 both
+     * state, applied to the shape the *daemon* sends rather than only to the
+     * one the CLI renders locally.
+     *
+     * These two were missing here, and the local and remote paths therefore
+     * disagreed about a record's kind and its lifecycle status. Every surface
+     * that reads over the socket lost both: MCP relays this object verbatim,
+     * the gateway forwards it, and Mission Control binds `c.kind` and
+     * `c.status` — so the page rendered nothing for the two rows, and on a
+     * system deployment, where the index is `0700 atlasd` and the socket is the
+     * only path, `atlas verify show --json` reported the zero values. Zero is
+     * `DECISION` and `PROPOSED`, so what a caller received was not a gap but a
+     * confident wrong answer about an APPROVED OBLIGATION. */
+    atlas_status st = atlas_json_key_str(j, "kind", atlas_decision_kind_name(a->kind), err);
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(j, "status", atlas_decision_state_name(a->from), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(j, "state", atlas_verify_state_name(g->state), err);
+    }
     if (st == ATLAS_OK) {
         st = atlas_json_key_str(j, "basis", atlas_verify_basis_name(a->basis), err);
     }

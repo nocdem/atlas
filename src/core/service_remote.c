@@ -3446,6 +3446,15 @@ static void read_assessment(const atlas_ipc_response *r, atlas_verify_assessment
      * one of these vocabularies by deliberate design, so a newer daemon naming
      * a state this binary has never heard of degrades to "Atlas cannot tell"
      * rather than to something permissive. */
+    /* The other two axes. Read back for the reason they are sent: without this
+     * the socket path answers `DECISION` / `PROPOSED` for every record, which
+     * is a wrong answer rather than a missing one. */
+    if (atlas_ipc_result_str(r, "kind", &v) && v != NULL) {
+        (void)atlas_decision_kind_parse(v, &a->kind);
+    }
+    if (atlas_ipc_result_str(r, "status", &v) && v != NULL) {
+        (void)atlas_decision_state_parse(v, &a->from);
+    }
     if (atlas_ipc_result_str(r, "state", &v) && v != NULL) {
         (void)atlas_verify_state_parse(v, &a->aggregate.state);
     }

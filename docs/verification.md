@@ -659,7 +659,7 @@ that everything it refuses, it refuses **at the boundary a caller meets**.
 | read one claim | `atlas_verify_show` | `verify show` | `verify.show` | `GET /api/v1/verify/claim` |
 | list claims | `atlas_verify_claims` | — | `verify.claims` | `GET /api/v1/verify/claims` |
 | read the policy | — | `verify policy` | `verify.policy` | `GET /api/v1/verify/policy` |
-| evaluate and enforce | — | `verify run` | *(operator group)* | — |
+| evaluate and enforce | — | `verify run` | *(no method)* | — |
 
 Nine RPC methods, eight MCP tools, three gateway routes — **all three of them
 reads**.
@@ -772,3 +772,27 @@ wait on it, and that separation is the point of the phase.
   threshold, or states a verifier's verdict.
 - **No remote credential administration**, unchanged from A9.
 - **Historical replay and calibration metrics.** There is still no dataset.
+
+## The one gap A9.2.1 did not close
+
+**`verify run` has no RPC method, so on a system deployment the operator
+account cannot enforce anything.** Under A7.1 the index is `0700 atlasd`;
+A9.2.1 added nine methods so that reads and intake reach it over the socket,
+and did not add one for `verify run`. The consequence is exact: on the
+deployment Atlas was built for, `atlas verify run` answers "no index is
+available to write", and the only way to perform a machine transition is to
+stop `atlas.service` and run the command as the service account — the
+documented workaround standing in for a missing feature that A8-CI's closeout
+removed for `code.index` and that this phase reintroduced for enforcement.
+
+Everything else works there: `verify show`, `verify claims` and `verify policy`
+read over the socket, and all six intake verbs write over it.
+
+Closing it means one method in the **operator-uid** table beside `code.index`
+and `decision.approve` — offered only to the peer whose `SO_PEERCRED` uid the
+root-owned policy names, answered `unknown method` for everybody else including
+`atlas-worker` and every gateway client. It is deliberately not done here: a
+method that can move a lifecycle state is the most security-relevant addition
+this surface can take, and it belongs to a change that is reviewed as one rather
+than to a closure pass. What was fixed instead is the honesty of the failure —
+the CLI no longer claims `run` is served, so the message names the situation.

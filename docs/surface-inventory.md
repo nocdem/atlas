@@ -83,9 +83,75 @@ adapter.
    Risk acceptance and every normative choice are refused before the policy file
    is read, so a mistaken root-owned rule is refused rather than obeyed.
 
-Model-facing attestation submission is **deferred rather than absent-by-design**;
-see the status section of `docs/verification.md` for what adding it would
-require and why the enforcing half of A9.2 is complete without it.
+Model-facing attestation submission was **deferred rather than
+absent-by-design**. A9.2.1 delivered it; the section below is what it added, and
+`docs/verification.md` carries the reasoning.
+
+## A9.2.1 additions — the intake surfaces
+
+A9.2 built the engine and shipped no way to put evidence in, so on a real
+deployment all ten verification tables stayed empty while every test that read
+them passed. A9.2.1 wired the intake. **Nothing about the engine's authority
+changed**: no surface below approves, rejects, supersedes, resolves,
+revalidates, mints a warrant, edits the policy or states a verifier's verdict.
+
+Nine RPC methods, eight MCP tools, six CLI verbs and three gateway routes.
+
+| operation | MCP tool | CLI | RPC method | gateway route | class | authority |
+|---|---|---|---|---|---|---|
+| state a claim | `atlas_verify_claim_create` | `verify claim` | `verify.claim_create` | — | index mutation | any peer the socket policy admits; scope `memory:write` |
+| reference evidence | `atlas_verify_evidence` | `verify evidence` | `verify.evidence_add` | — | index mutation | same |
+| have Atlas check it | `atlas_verify_produce` | `verify produce` | `verify.evidence_produce` | — | index mutation | same |
+| attest | `atlas_verify_attest` | `verify attest` | `verify.attestation_add` | — | index mutation | same |
+| declare a derivation | `atlas_verify_depend` | `verify depend` | `verify.dependency_add` | — | index mutation | same |
+| evaluate | `atlas_verify_evaluate` | `verify evaluate` | `verify.evaluate` | — | index mutation | same |
+| read one claim | `atlas_verify_show` | `verify show` | `verify.show` | `GET /api/v1/verify/claim` | repo read | scope `decisions:read` |
+| list claims | `atlas_verify_claims` | — | `verify.claims` | `GET /api/v1/verify/claims` | repo read | scope `decisions:read` |
+| read the policy | — | `verify policy` | `verify.policy` | `GET /api/v1/verify/policy` | global read | scope `decisions:read`; opens no index |
+| evaluate and enforce | — | `verify run` | *(no method — absent)* | — | lifecycle mutation | the root-owned policy, never a caller |
+
+**Every intake tool maps to `memory:write`, which is not grantable**, so the six
+mutating operations are unreachable by any remote credential that could ever be
+minted. The two reads and the policy read map to `decisions:read`.
+
+### Authority classification, stated exactly
+
+The word for who may perform a lifecycle transition is **operator capability**,
+not "human". Atlas cannot establish that a person acted; A4's honesty limits
+hold word for word. Three authorities exist and they do not overlap:
+
+| authority | who holds it | what it can do |
+|---|---|---|
+| model proposal | any adapter — MCP, hook, CLI, ordinary RPC peer | state claims, cite evidence, attest, declare derivations, ask for an evaluation. Writes `PROPOSED` revisions. **Never a lifecycle transition.** |
+| operator capability | the local operator channel, or the peer whose `SO_PEERCRED` uid equals the root-owned policy's `operator_uid` | approve, reject, supersede, resolve, revalidate |
+| verification policy | a root-owned file the running process cannot edit | only the transitions that file names, spending a single-use warrant, recorded as `VERIFICATION_POLICY` |
+
+The actor an intake row carries is decided by the transport, never by the
+request. `MODEL` yields `AI_AGENT` / `SELF_DECLARED`; `OPERATOR` yields `HUMAN` /
+`PEER_AUTHENTICATED`, which is a claim about a uid and never about a person; and
+`ATLAS` — `ATLAS_ATTESTED` — is unreachable from every transport because
+`atlas_verify_channel_parse` refuses the name. A request may name a channel and
+it is honoured **only when it asserts less** than the peer uid would.
+
+### The A9.2.1 absences
+
+1. **Intake is absent from the gateway.** A9's rule is that a mutating route
+   needs a write scope no credential can hold, "which is the argument it has to
+   survive". Intake has not survived it: `verify.evaluate` can move a lifecycle
+   state, and a leaked bearer token must not reach the one path that transitions
+   a record without a person. The three routes that exist are reads, they answer
+   405 to a POST, and every plausible intake path is 404 —
+   `tests/test_gw_remote.c` asserts both over a real loopback listener.
+2. **No MCP tool name contains an authority verb**, which is why the tools are
+   `atlas_verify_evidence`, `_attest` and `_depend` rather than `_add` spellings.
+   `tests/test_registry.c` enforces it.
+3. **A model may reference evidence and may not have produced it.** `COMPILER`,
+   `TEST`, `RUNTIME` and `DEPLOYED_CONFIG` are refused on the reference path —
+   refused, not discounted, because a discounted forgery still reads as tool
+   output to somebody skimming a UI. `atlas_verify_produce` is the honest route
+   and has no parameter that could carry a verdict.
+4. **`verify run` has no RPC method, MCP tool or gateway route.** Absent rather
+   than refusing, which is A7's pattern.
 
 ## The four A9 absences that carry its guarantees
 
@@ -169,7 +235,7 @@ generation publishes atomically or leaves a RUNNING one that nothing points at
 while the last valid one is still served. An unknown id is reported as unknown
 and the message points at the artefact, which is what survives.
 
-## Daemon RPC — 73 methods
+## Daemon RPC — 89 methods
 
 ### Ordinary group — served to any peer the socket policy admits
 
@@ -210,19 +276,18 @@ from "there is no such thing" tells a caller what to try next.
 `dispatch.snapshot.open`, `dispatch.snapshot.chunk` — disjoint from the client
 group rather than nested inside it.
 
-## MCP tools — 28, every one a read or a proposal
+## MCP tools — 37, every one a read, a proposal or an intake write
 
 Each carries a scope in `tool_def`. A remote credential sees and can call only
-the tools its scopes permit; the four that record something durable map to
+the tools its scopes permit; every tool that records something durable maps to
 `memory:write`, which no A9 credential can hold. The stdio adapter is
 unaffected — a local Claude session is authorised by an operator having
 installed the plugin, which is A2's boundary and is unchanged.
 
-
-Repository context, files, search, history, decisions, gate checks, and the
-seven A8-CI tools: `atlas_sem_status`, `atlas_sem_symbol`, `atlas_sem_callers`,
+Repository context, files, search, history, decisions, gate checks, the seven
+A8-CI tools (`atlas_sem_status`, `atlas_sem_symbol`, `atlas_sem_callers`,
 `atlas_sem_callees`, `atlas_sem_trace`, `atlas_sem_impact`,
-`atlas_context_build`.
+`atlas_context_build`), and the eight A9.2.1 verification tools below.
 
 No tool accepts an absolute path. No tool name contains an approval or
 revalidation verb, and no schema declares a `token` or `confirmation` argument —
@@ -230,7 +295,7 @@ revalidation verb, and no schema declares a `token` or `confirmation` argument �
 containing an approval verb. The count is pinned in `tests/test_plugin.c` so a
 tool appearing or vanishing is a deliberate change.
 
-## Hooks — 19 events, all metadata-only
+## Hooks — 15 events, all metadata-only
 
 Every hook returns valid JSON and exits 0 whatever happened. No hook emits
 `decision`, `continue` or a permission verdict, which is what makes a Stop loop
@@ -247,7 +312,10 @@ exactly.
 | `status`, `search`, `file`, `history`, `diff`, `events`, `code *`, `context build`, `gate *`, `decision list/show/search/links/history/orphaned` | repo read |
 | `repo add`, `repo remove` | **repo mutation** — local only, no RPC form |
 | `scan`, `sync`, `code sync`, `code index` | **index mutation** — needs the writer lock |
-| `decision approve/reject/supersede/revalidate` | **lifecycle mutation** — operator capability |
+| `verify show`, `verify policy` | repo read / global read — `verify policy` opens no index. There is no CLI list verb; `verify.claims` is reached by MCP and by the gateway |
+| `verify claim/evidence/produce/attest/depend/evaluate` | **index mutation** — intake; opens no terminal and mints no capability |
+| `verify run` | **lifecycle mutation** — the root-owned verification policy, not an operator capability |
+| `decision approve/reject/supersede/resolve/revalidate` | **lifecycle mutation** — operator capability |
 | `backup create/verify/restore`, `maintenance plan/prune`, `service install` | administrative |
 | `operation status ID` | global read — the state of a long operation |
 | `mcp`, `hook`, `dispatcher run`, `sem-parse` | adapters — not operator commands |

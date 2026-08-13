@@ -37,7 +37,10 @@ if [ "$(id -u)" != "0" ]; then
   exit 2
 fi
 
-OPERATOR="${ATLAS_A71_OPERATOR:-nocdem}"
+# The operator account. Derived from the invocation rather than baked in, so
+# this script carries no site-specific identity: under sudo the invoking user
+# is the operator, and ATLAS_A71_OPERATOR overrides it explicitly.
+OPERATOR="${ATLAS_A71_OPERATOR:-${SUDO_USER:-$(id -un)}}"
 OPUID=$(id -u "$OPERATOR")
 
 run() {

@@ -14,6 +14,11 @@
 
 set -eu
 
+# The repositories this deployment indexes, space separated. Site-specific, so
+# it is a variable rather than a baked-in list: set ATLAS_REPOS to match the
+# ReadOnlyPaths line in atlas.service.
+ATLAS_REPOS="${ATLAS_REPOS:-/opt/atlas}"
+
 RC=0
 ok()   { printf '  ok    %s\n' "$1"; }
 bad()  { printf '  FAIL  %s: %s\n' "$1" "$2"; RC=1; }
@@ -208,7 +213,7 @@ case "$out" in
 esac
 
 printf '\nindexed repositories are unwritable by the service sandbox\n'
-for r in /opt/dna /opt/swapper /opt/atlas; do
+for r in $ATLAS_REPOS; do
   info "$r" "$(cd "$r" && git rev-parse HEAD)"
 done
 

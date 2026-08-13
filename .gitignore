@@ -17,3 +17,7 @@ compile_commands.json
 # Local editor state.
 .cache/
 *.swp
+
+# Site-local deployment reports: they name a specific machine, its indexed
+# repositories and its backup digests, none of which belong in a public repo.
+*.local.md

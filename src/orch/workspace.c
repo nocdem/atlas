@@ -392,7 +392,7 @@ static bool snapshot_path_is_safe(const char *p, size_t len) {
  * The worker receives bytes from `atlasd` and writes them. It opens no
  * repository, resolves no commit and runs no git: `atlas_ws_snapshot` used to do
  * all three and is deliberately gone, because requiring the untrusted account to
- * hold a read path to `/opt/dna`, `/opt/atlas` and `/opt/swapper` was the wrong
+ * hold a read path to every indexed repository was the wrong
  * boundary — and, on a machine where the repositories are owned by somebody
  * else, one git refuses to honour anyway.
  */

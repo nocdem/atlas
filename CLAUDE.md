@@ -1012,14 +1012,14 @@ docs/security A7_1_THREAT_MODEL.md, A7_1_OPERATIONS.md
 
 ## A7.1 rules — these are not negotiable
 
-- **`nocdem` and root are trusted by design and Atlas does not defend against
+- **The operator account and root are trusted by design and Atlas does not defend against
   them.** The operator holds passwordless root; any process intentionally
   launched as that account — including an AI session — is outside Atlas' OS
   isolation guarantee, by the operator's explicit decision. **Never write a test
-  asserting `nocdem` cannot do something**, and never claim in prose that it is
+  asserting the operator account cannot do something**, and never claim in prose that it is
   constrained. The adversary is `atlas-worker`.
 - **Every persistent or autonomous model process runs as `atlas-worker`, never
-  as `nocdem`, unless a root-owned policy names an exception.** That is the
+  as the operator account, unless a root-owned policy names an exception.** That is the
   architectural commitment the separation rests on, and A8's worker dispatcher
   inherits it unchanged.
 
@@ -1072,8 +1072,8 @@ docs/security A7_1_THREAT_MODEL.md, A7_1_OPERATIONS.md
   `docs/security/A7_1_OPERATIONS.md`, and it is not exposed through MCP, the
   plugin or any model-callable helper.
 - **Deployment tooling never uses `eval`, never interpolates repository text as
-  shell, never recursively deletes or chowns, and never names `/opt/dna` or
-  `/opt/swapper` except to read.** Dry-run is the default and `--apply` is a
+  shell, never recursively deletes or chowns, and never names an indexed
+  repository except to read.** Dry-run is the default and `--apply` is a
   second deliberate invocation.
 
 ## A8 layers — additions

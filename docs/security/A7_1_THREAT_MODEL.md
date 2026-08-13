@@ -12,34 +12,34 @@ A7.1, and getting it wrong in either direction makes the rest meaningless.
 | principal | trusted? | what it is |
 |---|---|---|
 | `root` | **yes, by design** | owns the binary, the policies and the unit |
-| `nocdem` | **yes, by design** | the human operator and deployment principal; holds `NOPASSWD: ALL` |
+| the operator account | **yes, by design** | the human operator and deployment principal; holds `NOPASSWD: ALL` |
 | `atlasd` | **partly** — trusted with the index, nothing else | the service account the daemon runs as; no login, no password, no sudo, no writable code |
 | `atlas-worker` | **no. This is the adversary.** | the account every persistent or autonomous model process runs as |
 | other local users | no | anyone else with a shell on the machine |
 
-### `nocdem` is trusted and can bypass everything. This is deliberate.
+### The operator account is trusted and can bypass everything. This is deliberate.
 
-`nocdem` holds passwordless root. It can read `/var/lib/atlas/atlas.db`, replace
+The operator account holds passwordless root. It can read `/var/lib/atlas/atlas.db`, replace
 `/usr/local/bin/atlas`, rewrite `/etc/atlas/system.conf`, become `atlasd`, and
 approve any decision it likes. **Atlas does not defend against this and must
-never be described as doing so.** Any process intentionally launched as `nocdem`
+never be described as doing so.** Any process intentionally launched as the operator account
 — including an AI session started by the operator — is outside Atlas' OS
 isolation guarantee, by the operator's explicit decision.
 
 What follows from that, and is binding:
 
-- No test asserts that `nocdem` is unable to do something. Such a test would
+- No test asserts that the operator account is unable to do something. Such a test would
   pass only until the operator used their own machine.
-- No document claims `nocdem` is constrained.
+- No document claims the operator account is constrained.
 - The separation is meaningful because **A8's worker dispatcher and every
-  persistent model process run as `atlas-worker`, never as `nocdem`**, except
+  persistent model process run as `atlas-worker`, never as the operator account**, except
   where a root-owned policy names an exception. That is the architectural
   commitment A7.1 exists to make possible; if it is broken outside such a
   policy, the guarantee below is void and no code change will restore it.
 - **A8.1 declares one such exception, and the honest reading is that it opts
   those jobs out of this document.** When `/etc/atlas/orchestration.conf` sets
   `model_dispatcher_uid`, jobs whose driver needs a live model run as that uid —
-  in this deployment `nocdem` — with that account's filesystem authority. For
+  in this deployment the operator account — with that account's filesystem authority. For
   those jobs `atlas-worker` is not the principal and nothing below applies to
   them; the reason is that the only Claude Code credential on this machine is a
   personal session, and Atlas will not copy, read or relocate one. Jobs on every
@@ -104,7 +104,7 @@ Consequences, stated plainly:
 
 - `atlas-worker` probes `LOCKED`. It is not the operator uid, and it could not
   open the database even if it were.
-- `nocdem` probes `LOCKED` in its own right — and, being root-equivalent, can
+- The operator account probes `LOCKED` in its own right — and, being root-equivalent, can
   trivially become `atlasd` and probe `GRANTED`. That is not a defect; it is the
   trusted-operator path, and it is how the documented ceremony works.
 - Terminal presence, PTY ownership, `isatty`, environment and typed
@@ -113,7 +113,7 @@ Consequences, stated plainly:
 
 ## Out of scope, explicitly
 
-- **Root and `nocdem`.** Trusted by design, per the operator's decision.
+- **Root and the operator account.** Trusted by design, per the operator's decision.
 - A malicious trusted compiler, and supply-chain attacks on the toolchain.
 - Physical access, memory-bus attacks, side channels.
 - Denial of service by any principal that can exhaust disk or CPU.
@@ -130,4 +130,4 @@ Consequences, stated plainly:
 Atlas A7.1 makes the index, the backups, the binary and the policies unreachable
 by `atlas-worker` through the kernel rather than through Atlas' own checks, gives
 it a socket whose entire vocabulary is reads and proposals, and is honest that
-`nocdem` and root stand outside all of it by the operator's choice.
+The operator account and root stand outside all of it by the operator's choice.

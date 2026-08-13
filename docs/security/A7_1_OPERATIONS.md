@@ -47,7 +47,7 @@ socket_path = /run/atlas/atlas.sock
 data_dir = /var/lib/atlas
 client_group = atlas-clients
 client_uid = $(id -u atlas-worker)
-client_uid = $(id -u nocdem)
+client_uid = $(id -u "$OPERATOR")   # the operator account
 EOF
 
 sudo install -o root -g root -m 0644 /dev/stdin /etc/atlas/authority.conf <<EOF
@@ -171,7 +171,7 @@ service start, so this cannot regress silently.
 
 ### Group membership needs a fresh session
 
-`nocdem` and `atlas-worker` reach the socket through `atlas-clients`. A process
+The operator account and `atlas-worker` reach the socket through `atlas-clients`. A process
 that was already running when the group was added keeps its old credential set
 and gets `Permission denied` — including any Claude MCP or hook process started
 before the cutover. Log out and back in, or restart Claude, after the deployment.

@@ -6,8 +6,8 @@
 # same discipline scripts/a71-deploy.sh follows and for the same reason.
 #
 # This script never uses eval, never interpolates repository text as shell,
-# never recursively deletes, never chowns a tree, and names /opt/dna and
-# /opt/swapper only inside a read-only unit directive.
+# never recursively deletes, never chowns a tree, and names an indexed
+# repository only inside a read-only unit directive.
 set -eu
 
 APPLY=0

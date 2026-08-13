@@ -363,7 +363,7 @@ with more C.
 - A copy-migrate-switch cutover to schema 7, leaving the original schema-6
   per-user database byte-identical as a rollback target.
 
-**`nocdem` and root remain trusted by design** and are explicitly outside the
+**The operator account and root remain trusted by design** and are explicitly outside the
 isolation guarantee, at the operator's decision. A7.1 defends against
 `atlas-worker`; see `docs/security/A7_1_THREAT_MODEL.md`.
 

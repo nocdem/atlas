@@ -567,7 +567,7 @@ before Atlas is involved.
 The residual risk is re-scoped rather than removed, and the operator has
 explicitly accepted its shape:
 
-- **`nocdem` holds `NOPASSWD: ALL` and is trusted by design.** It can read and
+- **The operator account holds `NOPASSWD: ALL` and is trusted by design.** It can read and
   write the index, become `atlasd`, replace the binary and approve anything.
   A7.1 does not defend against this and no test asserts otherwise. The
   separation is meaningful because A8's dispatcher and every persistent model

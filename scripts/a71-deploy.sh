@@ -20,7 +20,7 @@
 #   - every path is a literal; none is built from repository content
 #   - no eval, no shell interpolation of anything read from a file
 #   - no recursive chown, chmod or rm, ever, on any path
-#   - /opt/dna and /opt/swapper are never named except to read
+#   - indexed repositories are never named except to read
 #   - refuses a symlink at any privileged target
 #   - preserves any existing file by moving it aside, never overwriting the only
 #     copy

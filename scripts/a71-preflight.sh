@@ -14,6 +14,11 @@
 
 set -eu
 
+# The repositories this deployment indexes, space separated. Site-specific, so
+# it is a variable rather than a baked-in list: set ATLAS_REPOS to match the
+# ReadOnlyPaths line in atlas.service.
+ATLAS_REPOS="${ATLAS_REPOS:-/opt/atlas}"
+
 RC=0
 note() { printf '  %-46s %s\n' "$1" "$2"; }
 fail() { printf '  %-46s FAIL: %s\n' "$1" "$2"; RC=1; }
@@ -79,7 +84,7 @@ for p in "$USER_BIN" "$USER_DB" "$USER_UNIT"; do
 done
 
 printf '\nindexed repositories (must be readable, never written)\n'
-for r in /opt/atlas /opt/dna /opt/swapper; do
+for r in $ATLAS_REPOS; do
   if [ -d "$r/.git" ]; then
     note "$r" "git worktree, mode $(stat -c %a "$r")"
   else

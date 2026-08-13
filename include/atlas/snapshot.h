@@ -7,7 +7,7 @@
  * wrong twice over. It failed in practice — git refuses a repository owned by
  * another uid, and A7.1 deliberately splits the principals — and it was wrong in
  * principle: it required `atlas-worker`, the untrusted account, to hold a
- * read-only path to `/opt/dna`, `/opt/atlas` and `/opt/swapper`.
+ * read-only path to every indexed repository.
  *
  * So the direction is inverted. **`atlasd` reads; the worker receives.** The
  * daemon resolves the repository from its own registry, validates the pinned

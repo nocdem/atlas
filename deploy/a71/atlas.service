@@ -65,7 +65,7 @@ StateDirectoryMode=0700
 # ProtectSystem=strict makes the entire filesystem read-only except for what is
 # named below, so the read-only guarantee over indexed repositories is enforced
 # by the kernel and not only by Atlas' own discipline. Even a hypothetical bug
-# that tried to write into /opt/dna would fail with EROFS.
+# that tried to write into an indexed repository would fail with EROFS.
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
@@ -98,7 +98,13 @@ ReadWritePaths=/var/lib/atlas
 # Read-only access to what it indexes. Listed explicitly rather than relying on
 # ProtectSystem=strict alone, so adding a repository is a deliberate edit here
 # and an unlisted directory is simply invisible.
-ReadOnlyPaths=/opt/atlas /opt/dna /opt/swapper
+#
+# SITE-SPECIFIC: append each indexed repository to this line, space separated.
+# The daemon cannot read a repository that is not listed, so an omission shows
+# up as a repository Atlas cannot scan rather than as a silent partial index.
+# Deliberately shipped with only Atlas' own checkout, so that a deployment
+# never inherits somebody else's paths.
+ReadOnlyPaths=/opt/atlas
 # Backups are written by the operator with the daemon stopped, so the running
 # daemon needs no access to them at all and is given none.
 InaccessiblePaths=/var/backups/atlas

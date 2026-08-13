@@ -138,6 +138,57 @@ atlas_status atlas_verify_assess(atlas_db *db, const atlas_verifypolicy *policy,
     out->revision_id = claim.revision_id;
     out->semantics = claim.semantics;
 
+    /* --- A9.2.1, §5: SOURCE_DRIFT -----------------------------------------
+     *
+     * The claim says which repository state it is true of. Atlas asks its own
+     * index which state it currently describes. If those disagree, everything
+     * below — the verifier's answer, the evidence, the fold — is about a tree
+     * the repository has since left.
+     *
+     * Detected here, once, because both the read path and the write path come
+     * through this function: a check in `atlas_verify_autolifecycle_run` alone
+     * would let `verify show` report a confident verdict that the recording path
+     * would then refuse, and the two must not disagree.
+     *
+     * The enforcement is the existing fold. `SOURCE_DRIFT` carries BLOCKED in
+     * `REASONS[]`, `atlas_verify_aggregate_note` folds before it records, and
+     * `actionable` is computed from the folded verdict — so a drifting claim
+     * cannot reach a transition and no code below has to remember that. The
+     * result is still published, still bound to the snapshot it examined, and
+     * still true of that snapshot; what it may not do is move a lifecycle
+     * state.
+     *
+     * Both commits are recorded even when they agree, so a stored result always
+     * says what it was of rather than only saying so when something went
+     * wrong. */
+    (void)snprintf(out->claim_commit, sizeof out->claim_commit, "%s",
+                   atlas_buf_cstr(&claim.basis_commit));
+    if (claim.repo_id != 0) {
+        atlas_repo_info repo;
+        atlas_repo_info_init(&repo);
+        bool repo_found = false;
+        st = atlas_db_repo_get_by_id(db, claim.repo_id, &repo, &repo_found, err);
+        if (st != ATLAS_OK) {
+            atlas_repo_info_free(&repo);
+            atlas_verify_claim_free(&claim);
+            return st;
+        }
+        if (repo_found) {
+            (void)snprintf(out->evaluated_commit, sizeof out->evaluated_commit, "%s",
+                           repo.scanned_head);
+        }
+        atlas_repo_info_free(&repo);
+        (void)atlas_db_verify_sem_generation(db, claim.repo_id, &out->sem_generation, err);
+    }
+    /* Only when both are known. An unindexed repository has no head, and
+     * "Atlas could not look" is not "the ground moved" — reporting the second
+     * for the first would make an ordinary unindexed fixture look like
+     * tampering. */
+    if (out->claim_commit[0] != '\0' && out->evaluated_commit[0] != '\0' &&
+        strcmp(out->claim_commit, out->evaluated_commit) != 0) {
+        out->source_drift = true;
+    }
+
     /* The basis follows from what is available, and the order is the phase's
      * central rule made operational: a claim with a named deterministic
      * verifier is verified deterministically, whatever anybody has said about
@@ -196,6 +247,14 @@ atlas_status atlas_verify_assess(atlas_db *db, const atlas_verifypolicy *policy,
          * being insufficient, and blocks for a different reason. */
         atlas_verify_aggregate_note(&out->aggregate, ATLAS_VREASON_CONFLICT);
         out->truncated = true;
+    }
+    /* §5. Noted after the fold is computed, so the reason weakens the verdict
+     * the way every other reason does rather than being a special case checked
+     * somewhere else. `atlas_verify_aggregate_note` folds before it records, so
+     * a drifting claim reports BLOCKED however good its evidence was about the
+     * tree it examined. */
+    if (out->source_drift) {
+        atlas_verify_aggregate_note(&out->aggregate, ATLAS_VREASON_SOURCE_DRIFT);
     }
     atlas_verify_inputs_free(&inputs);
 
@@ -390,9 +449,18 @@ atlas_status atlas_verify_autolifecycle_run(atlas_db *db, const atlas_verifypoli
     /* The result row first: it is the justification the audit row points at,
      * and a warrant naming a result that does not exist is not a justification. */
     int64_t result_id = 0;
+    /* §5. The result records the pair of commits the assessment compared and
+     * whether they disagreed, so a reader years later can tell what tree this
+     * verdict was about without the repository having to still be at it. */
+    const atlas_verify_source_binding binding = {
+        a->claim_commit[0] != '\0' ? a->claim_commit : NULL,
+        a->evaluated_commit[0] != '\0' ? a->evaluated_commit : NULL,
+        a->sem_generation,
+        a->source_drift,
+    };
     st = atlas_db_verify_result_insert(db, claim_id, &a->aggregate,
-                                       atlas_verify_verifier_name(a->verifier), a->check, now,
-                                       &result_id, err);
+                                       atlas_verify_verifier_name(a->verifier), a->check, &binding,
+                                       now, &result_id, err);
     if (st != ATLAS_OK) {
         atlas_db_rollback(db);
         return st;

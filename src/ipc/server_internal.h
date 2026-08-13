@@ -73,6 +73,10 @@ const atlas_method_entry *atlas_server_sem_methods(size_t *count_out);
 /* The A4 method group: everything under `decision.`. Looked up through the same
  * dispatch as the others, in server.c. */
 const atlas_method_entry *atlas_server_decision_methods(size_t *count_out);
+/* A9.2.1: verification intake, evaluation and reads, all in the ordinary group.
+ * Intake is a proposal rather than authority; nothing here approves, rejects,
+ * supersedes, resolves, revalidates, or mints or spends a warrant. */
+const atlas_method_entry *atlas_server_verify_methods(size_t *count_out);
 
 /* The A8 method groups, and there are deliberately two of them.
  *

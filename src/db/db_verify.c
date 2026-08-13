@@ -256,8 +256,8 @@ atlas_status atlas_db_verify_claim_insert(atlas_db *db, atlas_verify_claim *c, c
     static const char SQL[] =
         "INSERT INTO verify_claims(uid, repo_id, repo_identity_hash, document_id, revision_id,"
         "  domain, text, scope_note, semantics, verifier, verifier_input, basis_commit,"
-        "  environment, created_at)"
-        " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14) RETURNING id;";
+        "  environment, created_at, content_key, created_by_actor_id)"
+        " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16) RETURNING id;";
     sqlite3_stmt *stmt = NULL;
     atlas_status st = atlas_db_prepare(db, SQL, &stmt, err);
     if (st != ATLAS_OK) {
@@ -299,6 +299,12 @@ atlas_status atlas_db_verify_claim_insert(atlas_db *db, atlas_verify_claim *c, c
     }
     if (st == ATLAS_OK) {
         st = atlas_db_bind_text_opt(db, stmt, 14, bs(&c->created_at), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_db_bind_text_opt(db, stmt, 15, bs(&c->content_key), err);
+    }
+    if (st == ATLAS_OK && sqlite3_bind_int64(stmt, 16, c->created_by_actor_id) != SQLITE_OK) {
+        st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the claim's author");
     }
     if (st == ATLAS_OK) {
         int rc = sqlite3_step(stmt);
@@ -349,6 +355,10 @@ static atlas_status claim_from_row(sqlite3_stmt *stmt, atlas_verify_claim *out, 
     }
     if (st == ATLAS_OK) {
         out->superseded_by_claim_id = sqlite3_column_int64(stmt, 15);
+        st = take_text(&out->content_key, (const char *)sqlite3_column_text(stmt, 16), err);
+    }
+    if (st == ATLAS_OK) {
+        out->created_by_actor_id = sqlite3_column_int64(stmt, 17);
     }
     return st;
 }
@@ -356,7 +366,7 @@ static atlas_status claim_from_row(sqlite3_stmt *stmt, atlas_verify_claim *out, 
 #define CLAIM_COLUMNS                                                                              \
     "id, uid, repo_id, repo_identity_hash, document_id, revision_id, domain, text, scope_note,"    \
     " semantics, verifier, verifier_input, basis_commit, environment, created_at,"                 \
-    " superseded_by_claim_id"
+    " superseded_by_claim_id, content_key, created_by_actor_id"
 
 atlas_status atlas_db_verify_claim_get(atlas_db *db, int64_t id, atlas_verify_claim *out,
                                        bool *found, atlas_err *err) {
@@ -484,9 +494,9 @@ atlas_status atlas_db_verify_evidence_insert(atlas_db *db, atlas_verify_evidence
         "INSERT INTO verify_evidence(uid, class, repo_id, commit_oid, path_raw, path_text, symbol,"
         "  line_start, line_end, content_hash, suite, test_name, result, binary_id, environment,"
         "  tool, tool_version, proof_class, target, probe, observed, deployed_revision,"
-        "  observed_at, recorded_at, actor_id)"
+        "  observed_at, recorded_at, actor_id, content_key, sem_generation)"
         " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,"
-        "  ?23,?24,?25) RETURNING id;";
+        "  ?23,?24,?25,?26,?27) RETURNING id;";
     sqlite3_stmt *stmt = NULL;
     atlas_status st = atlas_db_prepare(db, SQL, &stmt, err);
     if (st != ATLAS_OK) {
@@ -547,6 +557,12 @@ atlas_status atlas_db_verify_evidence_insert(atlas_db *db, atlas_verify_evidence
     if (st == ATLAS_OK) {
         st = atlas_db_bind_text_opt(db, stmt, 24,
                                     e->recorded_at.len > 0 ? bs(&e->recorded_at) : now, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_db_bind_text_opt(db, stmt, 26, bs(&e->content_key), err);
+    }
+    if (st == ATLAS_OK && sqlite3_bind_int64(stmt, 27, e->sem_generation) != SQLITE_OK) {
+        st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the evidence generation");
     }
     if (st == ATLAS_OK) {
         int rc = sqlite3_step(stmt);
@@ -610,8 +626,9 @@ atlas_status atlas_db_verify_attestation_insert(atlas_db *db, atlas_verify_attes
 
     static const char SQL[] =
         "INSERT INTO verify_attestations(uid, claim_id, actor_id, verdict, self_confidence,"
-        "  method, scope_note, created_at, supersedes_id, proposer, basis_commit, environment)"
-        " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12) RETURNING id;";
+        "  method, scope_note, created_at, supersedes_id, proposer, basis_commit, environment,"
+        "  content_key)"
+        " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13) RETURNING id;";
     sqlite3_stmt *stmt = NULL;
     atlas_status st = atlas_db_prepare(db, SQL, &stmt, err);
     if (st != ATLAS_OK) {
@@ -643,6 +660,9 @@ atlas_status atlas_db_verify_attestation_insert(atlas_db *db, atlas_verify_attes
     }
     if (st == ATLAS_OK) {
         st = atlas_db_bind_text_opt(db, stmt, 12, bs(&a->environment), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_db_bind_text_opt(db, stmt, 13, bs(&a->content_key), err);
     }
     if (st == ATLAS_OK) {
         int rc = sqlite3_step(stmt);
@@ -678,6 +698,259 @@ atlas_status atlas_db_verify_attestation_insert(atlas_db *db, atlas_verify_attes
         }
         atlas_db_finish(db, ls);
     }
+    return st;
+}
+
+/* --- A9.2.1: listing a repository's claims ----------------------------------
+ *
+ * `atlas_db_verify_claims_for_revision` answers "what claims bear on this exact
+ * revision?", which is what the assessment needs. This answers "what claims
+ * exist here at all?", which is what a *client* needs: without it, an agent that
+ * created a claim and lost the response has no way to find it again, and the
+ * idempotency machinery would be pointless in practice because nothing could
+ * discover the row it resolved to.
+ *
+ * Live claims only — a superseded claim is history and reporting it beside a
+ * live one would invite acting on a proposition somebody has already replaced.
+ * Newest first, bounded, and the bound is reported rather than absorbed. */
+atlas_status atlas_db_verify_claims_for_repo(atlas_db *db, int64_t repo_id, int64_t document_id,
+                                             int64_t revision_id, int64_t limit,
+                                             atlas_verify_claim_cb cb, void *ctx,
+                                             bool *truncated_out, atlas_err *err) {
+    *truncated_out = false;
+    if (limit <= 0 || limit > (int64_t)ATLAS_VERIFY_MAX_CLAIMS) {
+        limit = (int64_t)ATLAS_VERIFY_MAX_CLAIMS;
+    }
+    /* One statement with the filters expressed as "match, or the filter was not
+     * given". Two statements would be two string literals and a branch, and the
+     * prepared-statement cache keys on the literal's address — so a single
+     * parameterised query is both simpler and the shape the cache expects. */
+    static const char SQL[] =
+        "SELECT " CLAIM_COLUMNS " FROM verify_claims"
+        " WHERE repo_id = ?1 AND superseded_by_claim_id = 0"
+        "   AND (?2 = 0 OR document_id = ?2)"
+        "   AND (?3 = 0 OR revision_id = ?3)"
+        " ORDER BY id DESC LIMIT ?4;";
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(db, SQL, &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, repo_id) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 2, document_id) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 3, revision_id) != SQLITE_OK ||
+        /* One more than asked for, so reaching the bound is observed rather
+         * than inferred from a full page — which would be wrong exactly when
+         * the count happens to land on the limit. */
+        sqlite3_bind_int64(stmt, 4, limit + 1) != SQLITE_OK) {
+        st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the claim query");
+    }
+    int64_t emitted = 0;
+    while (st == ATLAS_OK) {
+        int rc = sqlite3_step(stmt);
+        if (rc == SQLITE_DONE) {
+            break;
+        }
+        if (rc != SQLITE_ROW) {
+            st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot read the claims");
+            break;
+        }
+        if (emitted >= limit) {
+            *truncated_out = true;
+            break;
+        }
+        atlas_verify_claim c;
+        atlas_verify_claim_init(&c);
+        st = claim_from_row(stmt, &c, err);
+        if (st == ATLAS_OK) {
+            st = cb(&c, ctx, err);
+        }
+        atlas_verify_claim_free(&c);
+        emitted++;
+    }
+    atlas_db_finish(db, stmt);
+    return st;
+}
+
+/* --- A9.2.1: identity lookups ----------------------------------------------
+ *
+ * §27. An intake surface is retried, and the count of evidence rows is an input
+ * to a confidence score — so a retry that created a second row would be
+ * confidence inflation with no author. Each intake object carries a
+ * deterministic key over its immutable content and the write point resolves a
+ * collision to the row that already exists.
+ *
+ * The SQL is written out per table rather than built from a table name, because
+ * `atlas_db_prepare` caches by the string literal's address: a formatted
+ * statement would present the same address with different text and be handed
+ * the previous table's statement. See the prepared-statement cache note in
+ * CLAUDE.md — this is exactly the shape that caused it. */
+static atlas_status key_lookup(atlas_db *db, const char *sql, const char *key, int64_t *id_out,
+                               atlas_buf *uid_out, bool *found, atlas_err *err) {
+    *found = false;
+    if (key == NULL || *key == '\0') {
+        /* An empty key never matches. The unique indexes are partial on
+         * `content_key <> ''` for the same reason: the rows A9.2 wrote carry no
+         * key and must not collide with each other. */
+        return ATLAS_OK;
+    }
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(db, sql, &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    st = atlas_db_bind_text_opt(db, stmt, 1, key, err);
+    if (st == ATLAS_OK) {
+        int rc = sqlite3_step(stmt);
+        if (rc == SQLITE_ROW) {
+            *found = true;
+            *id_out = sqlite3_column_int64(stmt, 0);
+            if (uid_out != NULL) {
+                st = take_text(uid_out, (const char *)sqlite3_column_text(stmt, 1), err);
+            }
+        } else if (rc != SQLITE_DONE) {
+            st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot look up a verification object");
+        }
+    }
+    atlas_db_finish(db, stmt);
+    return st;
+}
+
+atlas_status atlas_db_verify_claim_by_key(atlas_db *db, const char *key, int64_t *id_out,
+                                          atlas_buf *uid_out, bool *found, atlas_err *err) {
+    static const char SQL[] = "SELECT id, uid FROM verify_claims WHERE content_key = ?1;";
+    return key_lookup(db, SQL, key, id_out, uid_out, found, err);
+}
+
+atlas_status atlas_db_verify_evidence_by_key(atlas_db *db, const char *key, int64_t *id_out,
+                                             atlas_buf *uid_out, bool *found, atlas_err *err) {
+    static const char SQL[] = "SELECT id, uid FROM verify_evidence WHERE content_key = ?1;";
+    return key_lookup(db, SQL, key, id_out, uid_out, found, err);
+}
+
+atlas_status atlas_db_verify_attestation_by_key(atlas_db *db, const char *key, int64_t *id_out,
+                                                atlas_buf *uid_out, bool *found, atlas_err *err) {
+    static const char SQL[] = "SELECT id, uid FROM verify_attestations WHERE content_key = ?1;";
+    return key_lookup(db, SQL, key, id_out, uid_out, found, err);
+}
+
+/* Resolves a public evidence uid to a rowid. §12 requires every referenced
+ * object to be validated: a dependency naming evidence that does not exist is
+ * refused rather than recorded, because an edge to nothing would silently make
+ * an interpretation look like a root. */
+atlas_status atlas_db_verify_evidence_find(atlas_db *db, const char *uid, int64_t *id_out,
+                                           atlas_verify_evidence_class *class_out, bool *found,
+                                           atlas_err *err) {
+    *found = false;
+    if (uid == NULL || *uid == '\0') {
+        return ATLAS_OK;
+    }
+    static const char SQL[] = "SELECT id, class FROM verify_evidence WHERE uid = ?1;";
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(db, SQL, &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    st = atlas_db_bind_text_opt(db, stmt, 1, uid, err);
+    if (st == ATLAS_OK) {
+        int rc = sqlite3_step(stmt);
+        if (rc == SQLITE_ROW) {
+            *found = true;
+            *id_out = sqlite3_column_int64(stmt, 0);
+            if (class_out != NULL) {
+                (void)atlas_verify_evidence_class_parse((const char *)sqlite3_column_text(stmt, 1),
+                                                        class_out);
+            }
+        } else if (rc != SQLITE_DONE) {
+            st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot look up evidence");
+        }
+    }
+    atlas_db_finish(db, stmt);
+    return st;
+}
+
+/* Resolves a public attestation uid to a rowid, for `supersedes`. */
+atlas_status atlas_db_verify_attestation_find(atlas_db *db, const char *uid, int64_t *id_out,
+                                              bool *found, atlas_err *err) {
+    static const char SQL[] = "SELECT id, uid FROM verify_attestations WHERE uid = ?1;";
+    return key_lookup(db, SQL, uid, id_out, NULL, found, err);
+}
+
+/* Resolves a public actor uid to a rowid, for an orchestrator parent. */
+atlas_status atlas_db_verify_actor_find(atlas_db *db, const char *uid, int64_t *id_out, bool *found,
+                                        atlas_err *err) {
+    static const char SQL[] = "SELECT id, uid FROM verify_actors WHERE uid = ?1;";
+    return key_lookup(db, SQL, uid, id_out, NULL, found, err);
+}
+
+/* Whether a commit has been *ingested* for this repository.
+ *
+ * §4 requires every repository-backed verification object to bind to an explicit
+ * source state, and the only source state Atlas can honestly validate against on
+ * the writer thread is the one it has indexed — A1 forbids creating a git process
+ * there, and A6's rule is that ancestry is computed from the index rather than
+ * from a new git call.
+ *
+ * So this fails closed on a commit that exists in the repository but has not been
+ * ingested. That is a false refusal and a recoverable one; accepting an
+ * unvalidated reference would be a false acceptance, and A2's rule is that a gap
+ * is repairable and a wrong row is not. */
+atlas_status atlas_db_verify_commit_exists(atlas_db *db, int64_t repo_id, const char *oid,
+                                           bool *found, atlas_err *err) {
+    *found = false;
+    if (oid == NULL || *oid == '\0') {
+        return ATLAS_OK;
+    }
+    static const char SQL[] = "SELECT 1 FROM commits WHERE repo_id = ?1 AND oid = ?2 LIMIT 1;";
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(db, SQL, &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, repo_id) != SQLITE_OK) {
+        st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the repository");
+    } else {
+        st = atlas_db_bind_text_opt(db, stmt, 2, oid, err);
+    }
+    if (st == ATLAS_OK) {
+        int rc = sqlite3_step(stmt);
+        if (rc == SQLITE_ROW) {
+            *found = true;
+        } else if (rc != SQLITE_DONE) {
+            st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot look up the commit");
+        }
+    }
+    atlas_db_finish(db, stmt);
+    return st;
+}
+
+/* The A8-CI semantic generation currently served for a repository, or 0.
+ *
+ * §30. Compiler-derived evidence is *of* a generation, and a generation is
+ * replaced when the repository moves. Recording which one produced a piece of
+ * evidence is what stops it being silently reinterpreted as current after the
+ * next index; 0 means no generation was involved, which is the honest answer
+ * for evidence that did not come from the semantic index at all. */
+atlas_status atlas_db_verify_sem_generation(atlas_db *db, int64_t repo_id, int64_t *gen_out,
+                                            atlas_err *err) {
+    *gen_out = 0;
+    static const char SQL[] = "SELECT generation_id FROM sem_current WHERE repo_id = ?1;";
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(db, SQL, &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, repo_id) != SQLITE_OK) {
+        st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the repository");
+    } else {
+        int rc = sqlite3_step(stmt);
+        if (rc == SQLITE_ROW) {
+            *gen_out = sqlite3_column_int64(stmt, 0);
+        } else if (rc != SQLITE_DONE) {
+            st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot read the semantic generation");
+        }
+    }
+    atlas_db_finish(db, stmt);
     return st;
 }
 
@@ -944,10 +1217,18 @@ static atlas_status reasons_text(const atlas_verify_aggregate *agg, atlas_buf *o
 
 atlas_status atlas_db_verify_result_insert(atlas_db *db, int64_t claim_id,
                                            const atlas_verify_aggregate *agg, const char *verifier,
-                                           atlas_verify_check check, const char *now,
+                                           atlas_verify_check check,
+                                           const atlas_verify_source_binding *src, const char *now,
                                            int64_t *id_out, atlas_err *err) {
     if (agg == NULL) {
         return atlas_err_set(err, ATLAS_ERR_INTERNAL, "no aggregate to record");
+    }
+    /* A9.2.1, §5. A result always says what it was of. `src` may be NULL only
+     * for a caller that genuinely has no repository binding; the columns then
+     * stay empty, which reads as "unbound" rather than as "the same commit". */
+    static const atlas_verify_source_binding NO_BINDING = {NULL, NULL, 0, false};
+    if (src == NULL) {
+        src = &NO_BINDING;
     }
     /* A result must say how it was reached; one that does not is not a result.
      * The same refusal the header states, at the write point rather than
@@ -969,8 +1250,9 @@ atlas_status atlas_db_verify_result_insert(atlas_db *db, int64_t claim_id,
         "  calibrated_probability, algorithm, family_version, support_count, contradict_count,"
         "  inconclusive_count, independent_groups, independent_families, support_mass,"
         "  contradict_mass, conflict, stale, verifier, check_result, reasons, reason_total,"
-        "  created_at)"
-        " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)"
+        "  created_at, claim_commit, evaluated_commit, sem_generation, source_drift)"
+        " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,"
+        "  ?23,?24,?25,?26)"
         " RETURNING id;";
     sqlite3_stmt *stmt = NULL;
     st = atlas_db_prepare(db, SQL, &stmt, err);
@@ -1004,6 +1286,23 @@ atlas_status atlas_db_verify_result_insert(atlas_db *db, int64_t claim_id,
         if (rc != SQLITE_OK) {
             st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the calibrated probability");
         }
+    }
+    if (st == ATLAS_OK && (sqlite3_bind_int64(stmt, 25, src->sem_generation) != SQLITE_OK ||
+                           sqlite3_bind_int(stmt, 26, src->drift ? 1 : 0) != SQLITE_OK)) {
+        st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the result's source binding");
+    }
+    /* Empty rather than NULL: both columns are NOT NULL with an empty default,
+     * and empty is what "not bound to a repository state" means here. Binding
+     * NULL would make a result with no repository binding fail the constraint
+     * instead of recording the honest absence. */
+    if (st == ATLAS_OK) {
+        st = atlas_db_bind_text_opt(db, stmt, 23,
+                                    src->claim_commit != NULL ? src->claim_commit : "", err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_db_bind_text_opt(db, stmt, 24,
+                                    src->evaluated_commit != NULL ? src->evaluated_commit : "",
+                                    err);
     }
     if (st == ATLAS_OK) {
         st = atlas_db_bind_text_opt(db, stmt, 2, atlas_verify_state_name(agg->state), err);

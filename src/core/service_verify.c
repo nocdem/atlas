@@ -28,6 +28,8 @@
 #include "atlas/atlas.h"
 #include "core/service_internal.h"
 #include "atlas/db.h"
+#include "atlas/json.h"
+#include "atlas/safetext.h"
 #include "atlas/service.h"
 #include "atlas/verify.h"
 #include "atlas/verifypolicy.h"
@@ -101,9 +103,59 @@ static void policy_into(const atlas_verifypolicy *p, atlas_verify_report *out) {
     out->rule_count = p->rule_count;
 }
 
+/* --- A9.2.1: the daemon-side forms -----------------------------------------
+ *
+ * These take a raw handle rather than an `atlas_ctx`, so the CLI and the daemon
+ * call one implementation — A8-CI's rule that parity between surfaces is
+ * structural rather than two functions somebody keeps in step.
+ *
+ * A claim may be named by rowid or by public uid. The uid is what every other
+ * surface reports and therefore what a client has; the rowid is what A9.2's CLI
+ * took. Both resolve here so the two spellings cannot answer differently. */
+atlas_status atlas_service_verify_show_on(atlas_db *db, int64_t claim_id, const char *claim_uid,
+                                          atlas_verify_report *out, atlas_err *err) {
+    if (db == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_CONFIG, "no index is available to read");
+    }
+    if (claim_id == 0 && claim_uid != NULL && *claim_uid != '\0') {
+        atlas_verify_claim c;
+        atlas_verify_claim_init(&c);
+        bool found = false;
+        atlas_status fst = atlas_db_verify_claim_find(db, claim_uid, &c, &found, err);
+        if (fst == ATLAS_OK && !found) {
+            fst = atlas_err_set(err, ATLAS_ERR_USAGE, "no claim has that id");
+        }
+        if (fst == ATLAS_OK) {
+            claim_id = c.id;
+        }
+        atlas_verify_claim_free(&c);
+        if (fst != ATLAS_OK) {
+            return fst;
+        }
+    }
+    if (claim_id == 0) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "name the claim to show");
+    }
+    atlas_verifypolicy p;
+    atlas_verifypolicy_load(&p);
+    policy_into(&p, out);
+    (void)snprintf(out->policy_path, sizeof out->policy_path, "%s", ATLAS_VERIFYPOLICY_PATH);
+
+    atlas_status st = describe(db, claim_id, out, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    return atlas_verify_assess(db, &p, claim_id, &out->assessment, err);
+}
+
 atlas_status atlas_service_verify_show(atlas_ctx *ctx, int64_t claim_id, atlas_verify_report *out,
                                        atlas_err *err) {
-    atlas_db *db = atlas_ctx_db(ctx);
+    /* A9.2 read `ctx->db` through `atlas_ctx_db` before testing anything, and
+     * `atlas_ctx_db` dereferences its argument — so on a system deployment,
+     * where the CLI reaches this with no context because the index is 0700
+     * `atlasd`, `atlas verify show` segfaulted. The null test has to be on the
+     * context, not on the handle it would have returned. */
+    atlas_db *db = ctx == NULL ? NULL : atlas_ctx_db(ctx);
     if (db == NULL) {
         return atlas_err_set(err, ATLAS_ERR_CONFIG, "no index is available to read");
     }
@@ -124,7 +176,7 @@ atlas_status atlas_service_verify_show(atlas_ctx *ctx, int64_t claim_id, atlas_v
 
 atlas_status atlas_service_verify_run(atlas_ctx *ctx, int64_t claim_id, const char *repo_name,
                                       atlas_verify_report *out, atlas_err *err) {
-    atlas_db *db = atlas_ctx_db(ctx);
+    atlas_db *db = ctx == NULL ? NULL : atlas_ctx_db(ctx);
     if (db == NULL) {
         return atlas_err_set(err, ATLAS_ERR_CONFIG, "no index is available to write");
     }
@@ -137,6 +189,341 @@ atlas_status atlas_service_verify_run(atlas_ctx *ctx, int64_t claim_id, const ch
         return st;
     }
     return atlas_verify_autolifecycle_run(db, &p, claim_id, repo_name, &out->assessment, err);
+}
+
+/* --- A9.2.1: one serialization, used by the daemon and by the CLI's JSON
+ *             renderer -------------------------------------------------------
+ *
+ * A9.2 had one surface and could keep the shape in the renderer. A9.2.1 has
+ * four, and the invariant Atlas states about them — "human and JSON output
+ * consume identical service results" — is only true if there is one writer. So
+ * the shape lives here and `render_json.c` calls it, which is also what lets
+ * the CLI's socket path re-emit exactly what the daemon produced.
+ *
+ * **The three axes are printed as three fields, never as one.** A9.1's rule
+ * about kind and status, extended: a single badge carrying a knowledge kind, a
+ * lifecycle status and a verification state is the presentation these seasons
+ * exist to prevent.
+ *
+ * **A confidence score carries no percent sign and a probability is absent
+ * rather than null when calibration does not support it.** They are different
+ * types with different printers and this is one of the printers. */
+atlas_status atlas_service_verify_write_assessment(atlas_json *j,
+                                                   const atlas_verify_assessment *a,
+                                                   atlas_err *err) {
+    const atlas_verify_aggregate *g = &a->aggregate;
+    atlas_status st = atlas_json_key_str(j, "state", atlas_verify_state_name(g->state), err);
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(j, "basis", atlas_verify_basis_name(a->basis), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(j, "semantics", atlas_verify_claim_semantics_name(a->semantics),
+                                err);
+    }
+    /* An integer out of 100. Never a percentage: `atlas_verify_calibration`
+     * gates the only field that may be read as a probability. */
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(j, "confidence_score", g->confidence, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(j, "calibration", atlas_verify_calibration_name(g->calibration),
+                                err);
+    }
+    /* Emitted only when calibration supports it — **absent**, not null and not
+     * zero. A null would invite a client to render "0%", which is the exact lie
+     * the two-field split exists to make impossible. */
+    if (st == ATLAS_OK && g->calibration == ATLAS_CALIBRATION_CALIBRATED &&
+        g->calibrated_probability >= 0) {
+        st = atlas_json_key_int(j, "calibrated_probability", g->calibrated_probability, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(j, "policy_verdict", atlas_verify_policy_verdict_name(g->verdict),
+                                err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(j, "support_count", g->support_count, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(j, "contradict_count", g->contradict_count, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(j, "inconclusive_count", g->inconclusive_count, err);
+    }
+    /* The number that makes "an actor is not evidence" visible: three models
+     * reading one document are three attestations and one group. */
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(j, "independent_groups", g->independent_groups, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(j, "independent_families", g->independent_families, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(j, "attestation_total", (int64_t)a->attestation_total, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(j, "truncated", a->truncated, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(j, "conflict", atlas_verify_conflict_name(g->conflict), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(j, "stale", g->stale, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(j, "verifier", atlas_verify_verifier_name(a->verifier), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(j, "check", atlas_verify_check_name(a->check), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(j, "algorithm", ATLAS_VERIFY_ALGORITHM, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(j, "family_version", g->family_version, err);
+    }
+    /* §4/§5. What this assessment was of, and whether the ground moved. */
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str_opt(j, "claim_commit",
+                                    a->claim_commit[0] != '\0' ? a->claim_commit : NULL, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str_opt(
+            j, "evaluated_commit", a->evaluated_commit[0] != '\0' ? a->evaluated_commit : NULL,
+            err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(j, "sem_generation", a->sem_generation, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(j, "source_drift", a->source_drift, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(j, "actionable", a->actionable, err);
+    }
+    /* Whether Atlas actually moved a lifecycle state on its own authority. The
+     * single most important field for an auditor of an automating system, so it
+     * is always present rather than only when true. */
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(j, "transitioned", a->transitioned, err);
+    }
+    if (st == ATLAS_OK && a->result_id != 0) {
+        st = atlas_json_key_int(j, "result_id", a->result_id, err);
+    }
+    if (st == ATLAS_OK && a->audit_id != 0) {
+        st = atlas_json_key_int(j, "audit_id", a->audit_id, err);
+    }
+    if (st == ATLAS_OK && a->transitioned) {
+        st = atlas_json_key_str(j, "from_status", atlas_decision_state_name(a->from), err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "to_status", atlas_decision_state_name(a->to), err);
+        }
+    }
+    /* Atlas' own fixed sentences from a closed vocabulary. No repository byte
+     * and no model byte reaches them, which is why they need no encoding. */
+    if (st == ATLAS_OK) {
+        st = atlas_json_key(j, "reasons", err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_arr_begin(j, err);
+    }
+    for (size_t i = 0; st == ATLAS_OK && i < g->reason_count; i++) {
+        st = atlas_json_obj_begin(j, err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "code", atlas_verify_reason_name(g->reasons[i]), err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "meaning", atlas_verify_reason_description(g->reasons[i]),
+                                    err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_obj_end(j, err);
+        }
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_arr_end(j, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(j, "reason_total", (int64_t)g->reason_total, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str_opt(j, "verified_scope",
+                                    a->verified_scope[0] != '\0' ? a->verified_scope : NULL, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str_opt(j, "detail", a->detail[0] != '\0' ? a->detail : NULL, err);
+    }
+    return st;
+}
+
+atlas_status atlas_service_verify_write_policy(atlas_json *j, const atlas_verify_report *r,
+                                               atlas_err *err) {
+    atlas_status st = atlas_json_key(j, "policy", err);
+    if (st == ATLAS_OK) {
+        st = atlas_json_obj_begin(j, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(j, "state", atlas_verifypolicy_state_name(r->policy_state), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(j, "reason", atlas_verifypolicy_reason_name(r->policy_reason), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str_opt(j, "id", r->policy_id[0] != '\0' ? r->policy_id : NULL, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str_opt(j, "hash", r->policy_hash[0] != '\0' ? r->policy_hash : NULL,
+                                    err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str_opt(j, "path", r->policy_path[0] != '\0' ? r->policy_path : NULL,
+                                    err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str_opt(j, "detail",
+                                    r->policy_detail[0] != '\0' ? r->policy_detail : NULL, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(j, "deterministic_enforce", r->deterministic_enforce, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(j, "empirical_enforce", r->empirical_enforce, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(j, "rules", (int64_t)r->rule_count, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_obj_end(j, err);
+    }
+    return st;
+}
+
+atlas_status atlas_service_verify_write_report(atlas_json *j, atlas_safe_pool *safe,
+                                               const atlas_verify_report *r, atlas_err *err) {
+    atlas_status st = atlas_json_key_str(j, "claim", atlas_buf_cstr(&r->claim_uid), err);
+    /* UNTRUSTED_DATA. Verification changes a status, never the nature of bytes:
+     * a VERIFIED claim's proposition is exactly as untrusted as a proposed
+     * one's, and "Atlas verified this" reads like a warrant for the sentence
+     * when it is a statement about a truth condition. */
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(j, "text", atlas_safe(safe, atlas_buf_cstr(&r->claim_text)), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(j, "domain", atlas_safe(safe, atlas_buf_cstr(&r->domain)), err);
+    }
+    if (st == ATLAS_OK && r->record_uid.len > 0) {
+        st = atlas_json_key_str(j, "decision", atlas_buf_cstr(&r->record_uid), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_service_verify_write_assessment(j, &r->assessment, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_service_verify_write_policy(j, r, err);
+    }
+    return st;
+}
+
+/* --- A9.2.1: listing claims -------------------------------------------------
+ *
+ * The read that makes the rest usable: without it a client that created a claim
+ * and lost the response has no way to find it again, which would make the
+ * idempotency work pointless in practice.
+ *
+ * Bounded, and the bound is reported. A3's rule about `candidate_count`: a
+ * partial list must never read as a complete one. */
+typedef struct claims_ctx {
+    atlas_json *j;
+    atlas_safe_pool *safe;
+    atlas_status st;
+    size_t emitted;
+} claims_ctx;
+
+static atlas_status claim_row(const atlas_verify_claim *c, void *vctx, atlas_err *err) {
+    claims_ctx *cc = (claims_ctx *)vctx;
+    atlas_status st = atlas_json_obj_begin(cc->j, err);
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(cc->j, "claim", atlas_buf_cstr(&c->uid), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(cc->j, "text", atlas_safe(cc->safe, atlas_buf_cstr(&c->text)), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(cc->j, "domain", atlas_safe(cc->safe, atlas_buf_cstr(&c->domain)),
+                                err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(cc->j, "scope", atlas_safe(cc->safe, atlas_buf_cstr(&c->scope_note)),
+                                err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(cc->j, "semantics", atlas_verify_claim_semantics_name(c->semantics),
+                                err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str_opt(cc->j, "verifier",
+                                    c->verifier.len > 0 ? atlas_buf_cstr(&c->verifier) : NULL, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str_opt(cc->j, "commit",
+                                    c->basis_commit.len > 0 ? atlas_buf_cstr(&c->basis_commit)
+                                                            : NULL,
+                                    err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(cc->j, "created_at", atlas_buf_cstr(&c->created_at), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_obj_end(cc->j, err);
+    }
+    cc->emitted++;
+    return st;
+}
+
+atlas_status atlas_service_verify_claims_on(atlas_db *db, atlas_json *j, atlas_safe_pool *safe,
+                                            int64_t repo_id, const char *decision_uid,
+                                            int64_t limit, atlas_err *err) {
+    if (db == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_CONFIG, "no index is available to read");
+    }
+    int64_t document_id = 0;
+    int64_t revision_id = 0;
+    if (decision_uid != NULL && *decision_uid != '\0') {
+        bool found = false;
+        int64_t doc_repo = 0;
+        atlas_status fst =
+            atlas_db_decision_find_uid(db, decision_uid, &document_id, &doc_repo, &found, err);
+        if (fst == ATLAS_OK && !found) {
+            fst = atlas_err_set(err, ATLAS_ERR_CONFIG, "no knowledge record by that id exists");
+        }
+        if (fst == ATLAS_OK) {
+            fst = atlas_db_decision_approved_revision(db, document_id, &revision_id, err);
+        }
+        if (fst != ATLAS_OK) {
+            return fst;
+        }
+    }
+
+    claims_ctx cc = {j, safe, ATLAS_OK, 0};
+    atlas_status st = atlas_json_key(j, "claims", err);
+    if (st == ATLAS_OK) {
+        st = atlas_json_arr_begin(j, err);
+    }
+    bool truncated = false;
+    if (st == ATLAS_OK) {
+        st = atlas_db_verify_claims_for_repo(db, repo_id, document_id, revision_id, limit,
+                                             claim_row, &cc, &truncated, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_arr_end(j, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(j, "count", (int64_t)cc.emitted, err);
+    }
+    /* Reported, always. A6's rule: a bound that is reached is reported, and a
+     * truncated list can never read as a complete one. */
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(j, "truncated", truncated, err);
+    }
+    return st;
 }
 
 atlas_status atlas_service_verify_policy(atlas_verify_report *out, atlas_err *err) {

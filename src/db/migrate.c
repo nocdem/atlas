@@ -3138,6 +3138,92 @@ static const char M15_CONFIRM[] =
 
 static const char *const M15_STATEMENTS[] = {M15_VERIFY, M15_EVENTS, M15_CONFIRM, NULL};
 
+/* --- migration 16: what a verification object is *of*, and which one it is ---
+ *
+ * A9.2 built the verification engine and A9.2.1 discovered that nothing outside
+ * its own tests could feed it. Wiring the intake surfaces exposed four facts the
+ * A9.2 schema had nowhere to put, and every one of them is a fact about
+ * *identity* or *binding* rather than a new kind of thing — which is why this
+ * migration adds columns and indexes and rebuilds nothing.
+ *
+ * ## `content_key`: identity, so a retry is not a corroboration
+ *
+ * An intake surface is retried. A model that loses a response and calls again
+ * must not thereby create a second evidence row, because the count of evidence
+ * rows is an input to a confidence score: duplicate intake is confidence
+ * inflation with no author. So each of the three intake objects gains a
+ * deterministic key over its immutable content, with a UNIQUE index, and the
+ * intake path resolves a collision to the existing row.
+ *
+ * The key is **scoped**, and the scoping is the whole difficulty. §27 states
+ * both halves: the same evidence reference submitted twice is one object, and
+ * the same *text* at a different commit is emphatically not — nor is the same
+ * runtime fact at a different time. So the key covers the revision, the commit
+ * and the observation instant wherever those bound the object's meaning. A key
+ * that omitted the commit would merge an assertion about last week's tree into
+ * this week's and report it as corroborated.
+ *
+ * Existing rows get `''`, and the index is partial on `content_key <> ''` for
+ * that reason: the A9.2 rows that exist on a developer machine were written
+ * before keys existed and must not collide with each other.
+ *
+ * ## `created_by_actor_id`: §3, a claim records who made it
+ *
+ * A model may create a claim. That creates no authority, but it does create an
+ * obligation to record *whose* claim it is — an intake surface that forgot the
+ * author would make "who asserted this?" unanswerable at exactly the moment it
+ * matters. Zero means a claim written before this column existed, which is
+ * honest: no actor was recorded, rather than some actor being guessed.
+ *
+ * ## `sem_generation`: §30, compiler evidence is of one generation
+ *
+ * A8-CI semantic evidence is produced against a numbered generation, and a
+ * generation is replaced when the repository moves. Evidence that did not say
+ * which generation it came from would be silently reinterpreted as current the
+ * next time anybody read it, which is the compiler-evidence form of the drift
+ * this season exists to stop.
+ *
+ * ## the four drift columns on `verify_results`: §5
+ *
+ * A result now records the commit the claim was *bound to*, the commit the
+ * repository was actually at when the aggregation ran, the generation used, and
+ * whether those disagreed. Storing the disagreement rather than deriving it
+ * later is deliberate: the repository will have moved again by the time anybody
+ * reads the row, so a derivation would answer a different question every time
+ * it ran. `source_drift` is the durable, auditable record that a result
+ * describes a tree the repository has since left.
+ *
+ * ## Why this is additive and needs no `foreign_keys_off`
+ *
+ * `ALTER TABLE ... ADD COLUMN` rebuilds nothing, drops nothing and triggers no
+ * cascade, so no row can be lost and no content hash moves — the argument
+ * migration 14 makes. Migration 13's row-preservation ceremony exists for
+ * rebuilds and has nothing to check here. Every added column has a DEFAULT, so
+ * every row that already exists stays valid without being rewritten. */
+static const char M16_STATEMENTS_SQL[] =
+    /* Identity for the three intake objects. */
+    "ALTER TABLE verify_claims ADD COLUMN content_key TEXT NOT NULL DEFAULT '';"
+    "ALTER TABLE verify_evidence ADD COLUMN content_key TEXT NOT NULL DEFAULT '';"
+    "ALTER TABLE verify_attestations ADD COLUMN content_key TEXT NOT NULL DEFAULT '';"
+    /* §3: who created the claim. */
+    "ALTER TABLE verify_claims ADD COLUMN created_by_actor_id INTEGER NOT NULL DEFAULT 0;"
+    /* §30: which semantic generation this evidence came from. */
+    "ALTER TABLE verify_evidence ADD COLUMN sem_generation INTEGER NOT NULL DEFAULT 0;"
+    /* §5: what the result is of, and whether the ground moved under it. */
+    "ALTER TABLE verify_results ADD COLUMN claim_commit TEXT NOT NULL DEFAULT '';"
+    "ALTER TABLE verify_results ADD COLUMN evaluated_commit TEXT NOT NULL DEFAULT '';"
+    "ALTER TABLE verify_results ADD COLUMN sem_generation INTEGER NOT NULL DEFAULT 0;"
+    "ALTER TABLE verify_results ADD COLUMN source_drift INTEGER NOT NULL DEFAULT 0;"
+    /* Partial, so the pre-A9.2.1 rows that carry no key do not collide. */
+    "CREATE UNIQUE INDEX idx_verify_claims_key ON verify_claims(content_key)"
+    "  WHERE content_key <> '';"
+    "CREATE UNIQUE INDEX idx_verify_evidence_key ON verify_evidence(content_key)"
+    "  WHERE content_key <> '';"
+    "CREATE UNIQUE INDEX idx_verify_attest_key ON verify_attestations(content_key)"
+    "  WHERE content_key <> '';";
+
+static const char *const M16_STATEMENTS[] = {M16_STATEMENTS_SQL, NULL};
+
 static const atlas_migration MIGRATIONS[] = {
     {1, "initial schema", M1_STATEMENTS, false},
     {2, "worktree identity", M2_STATEMENTS, false},
@@ -3162,6 +3248,9 @@ static const atlas_migration MIGRATIONS[] = {
     /* Rebuilds one leaf table to widen a CHECK. Foreign keys stay enforced:
      * nothing references `decision_events`, so the drop cascades nowhere. */
     {15, "a distinct actor for a policy-authorised transition", M15_STATEMENTS, false},
+    /* Additive: nine columns and three partial unique indexes, no table
+     * rebuilt, so foreign keys stay enforced and no row is rewritten. */
+    {16, "verification object identity and source binding", M16_STATEMENTS, false},
 };
 
 const atlas_migration *atlas_migrations(size_t *count_out) {

@@ -21,6 +21,8 @@
 #include "atlas/db.h"
 #include "atlas/error.h"
 #include "atlas/gate.h"
+#include "atlas/json.h"
+#include "atlas/safetext.h"
 #include "atlas/verifypolicy.h"
 #include "atlas/git.h"
 #include "atlas/limits.h"
@@ -969,6 +971,36 @@ atlas_status atlas_service_verify_run(atlas_ctx *ctx, int64_t claim_id, const ch
 /* Reports the root-owned policy. Opens no index and binds nothing, so it is
  * safe to run anywhere — the shape `gateway status` has. */
 atlas_status atlas_service_verify_policy(atlas_verify_report *out, atlas_err *err);
+
+/* --- A9.2.1: the forms the daemon calls -------------------------------------
+ *
+ * These take a raw handle and a resolved repository, so the CLI and the daemon
+ * call one implementation and parity between the surfaces is structural rather
+ * than two functions somebody keeps in step — A8-CI's rule about
+ * `atlas_sem_impact_on`.
+ *
+ * A claim may be named by rowid or by public uid; both resolve to the same
+ * claim, because the uid is what every surface reports and the rowid is what
+ * A9.2's CLI took. */
+atlas_status atlas_service_verify_show_on(atlas_db *db, int64_t claim_id, const char *claim_uid,
+                                          atlas_verify_report *out, atlas_err *err);
+atlas_status atlas_service_verify_claims_on(atlas_db *db, atlas_json *j, atlas_safe_pool *safe,
+                                            int64_t repo_id, const char *decision_uid,
+                                            int64_t limit, atlas_err *err);
+
+/* The one serialization of a verification answer, so the daemon's response and
+ * the CLI's `--json` cannot describe the same assessment differently.
+ *
+ * The three axes are separate fields and a confidence score carries no percent
+ * sign; `calibrated_probability` is **absent** rather than null when calibration
+ * does not support one, because a null invites a client to render "0%". */
+atlas_status atlas_service_verify_write_assessment(atlas_json *j,
+                                                   const atlas_verify_assessment *a,
+                                                   atlas_err *err);
+atlas_status atlas_service_verify_write_policy(atlas_json *j, const atlas_verify_report *r,
+                                               atlas_err *err);
+atlas_status atlas_service_verify_write_report(atlas_json *j, atlas_safe_pool *safe,
+                                               const atlas_verify_report *r, atlas_err *err);
 
 
 /* --- A8: orchestration ------------------------------------------------------

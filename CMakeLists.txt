@@ -323,6 +323,13 @@ add_library(atlas_core STATIC
   src/db/db_verify.c
   src/verify/detverify.c
   src/verify/autolifecycle.c
+  # A9.2.1. `intake.c` is the one write point for a claim, a piece of evidence,
+  # an attestation and a dependency edge — the half A9.2 shipped without, which
+  # left the engine above unable to be fed by anything but its own tests. The
+  # channel check, the actor derivation, the forged-producer refusal, the
+  # reference validation and the content-key idempotency all live behind it.
+  src/verify/intake.c
+  src/ipc/server_verify.c
   ${ATLAS_UI_GEN}
 )
 

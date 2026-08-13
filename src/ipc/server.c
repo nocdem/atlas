@@ -951,6 +951,31 @@ atlas_status atlas_server_dispatch(atlas_server_ctx *ctx, const void *payload, s
             }
         }
     }
+    if (fn == NULL) {
+        /* A9.2.1. Intake, evaluation and three reads, in the ordinary group.
+         *
+         * Creating a claim, referencing evidence and attesting are proposals,
+         * not authority — the shape `decision.propose` has. `verify.evaluate`
+         * is here too and that is the deliberate part: §17 says a model may
+         * *request* an evaluation and that Atlas, not the caller, performs any
+         * transition the root-owned policy authorises. What keeps that safe is
+         * not this table — it is that a deterministic verdict requires an
+         * Atlas-attested verifier a model cannot forge, that the empirical path
+         * is shadow-only without calibration nothing here can supply, and that
+         * every gate is set by a root-owned file this peer cannot read.
+         *
+         * No method in this group approves, rejects, supersedes, resolves or
+         * revalidates, and none mints or spends a warrant. Those are absent
+         * rather than refused. */
+        size_t n = 0;
+        const atlas_method_entry *v = atlas_server_verify_methods(&n);
+        for (size_t i = 0; i < n; i++) {
+            if (strcmp(atlas_ipc_request_method(req), v[i].name) == 0) {
+                fn = v[i].fn;
+                break;
+            }
+        }
+    }
     /* A8: two groups, routed by the peer's uid from SO_PEERCRED.
      *
      * A peer is offered a group only if the policy places it in one, and the

@@ -25,6 +25,7 @@
 #include "atlas/orchpolicy.h"
 #include "atlas/snapshot.h"
 #include "atlas/syspolicy.h"
+#include "atlas/verify_ops.h"
 #include "atlas/error.h"
 #include "atlas/limits.h"
 #include "atlas/workers.h"
@@ -116,7 +117,22 @@ typedef enum atlas_job_kind {
      * holds while it is running, so on any machine with a live daemon `atlas
      * api-key revoke` could not have worked — and "stop the service to revoke a
      * leaked credential" is not an answer. */
-    ATLAS_JOB_APIKEY
+    ATLAS_JOB_APIKEY,
+    /* A9.2.1. One job kind carrying one typed verification-intake operation,
+     * for exactly the reasons ATLAS_JOB_AI, ATLAS_JOB_DECISION and
+     * ATLAS_JOB_ORCH are one each: validation happens at the IPC edge before
+     * anything is queued, and the writer's switch stays a switch rather than
+     * becoming a second dispatch table that can drift from the first.
+     *
+     * Every verification write comes through here, including an evaluation —
+     * which reads far more than it writes but records a durable result and may
+     * spend a warrant, so it is a write and belongs on the one writer thread.
+     *
+     * It is pure database work, which is what makes it legal here: A1 forbids
+     * creating a process or reading a file inside a write transaction, and
+     * intake does neither. Every reference it validates is checked against the
+     * index rather than by asking git, for exactly that reason. */
+    ATLAS_JOB_VERIFY
 } atlas_job_kind;
 
 /* One credential operation, as the writer thread receives it. */
@@ -216,6 +232,12 @@ struct atlas_job {
     atlas_orch_op *orch;
     atlas_orch_result orch_result;
 
+    /* A9.2.1. Same ownership rule as `ai`, `decision` and `orch`: the job owns
+     * the operation and frees it, and the result is typed rather than a JSON
+     * fragment. */
+    atlas_verify_op *verify;
+    atlas_verify_intake_result *verify_result;
+
     /* A8 snapshot enumeration. */
     int64_t snapshot_attempt_id;
     struct atlas_snapshot_meta *snapshot_meta;
@@ -311,6 +333,14 @@ atlas_status atlas_writer_ai(atlas_writer *w, atlas_ai_op *op, int timeout_ms,
  * it on the wrong one. */
 atlas_status atlas_writer_orch(atlas_writer *w, atlas_orch_op *op, int timeout_ms,
                                atlas_orch_result *result, atlas_err *err);
+
+/* A9.2.1. Ownership of `op` is taken unconditionally, as everywhere else. The
+ * result is moved rather than copied field by field, so a field added to
+ * `atlas_verify_intake_result` cannot silently stay zero on the daemon path
+ * while the local path reports it — which is the A9.1 defect this shape avoids
+ * rather than remembers to avoid. */
+atlas_status atlas_writer_verify(atlas_writer *w, atlas_verify_op *op, int timeout_ms,
+                                 atlas_verify_intake_result *result, atlas_err *err);
 
 /* A8. Enumerates and persists one attempt's snapshot manifest on the writer
  * thread. Idempotent per attempt. */

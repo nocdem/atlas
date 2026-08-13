@@ -673,6 +673,21 @@
 #define ATLAS_VERIFY_MAX_EVIDENCE 2048u
 #define ATLAS_VERIFY_MAX_DEP_EDGES 4096u
 
+/* A9.2.1. Pieces of evidence one *intake call* may attach to one attestation.
+ *
+ * Far below `ATLAS_VERIFY_MAX_EVIDENCE`, which bounds a fold over a whole
+ * claim; this bounds a single request, and a request is a thing somebody
+ * retries. It is reached by refusing rather than by trimming — A5's rule about
+ * bounds — because an attestation silently recorded as resting on fewer pieces
+ * of evidence than it declared would be grouped as a weaker interpretation than
+ * it is, which changes what it is worth without saying so.
+ *
+ * The public id of a verification object: `atlas-ev-` and a hex digest, plus
+ * room for the longer prefixes. Bounded so a uid list can be parsed into fixed
+ * storage without allocating per element. */
+#define ATLAS_VERIFY_MAX_EVIDENCE_PER_ATTESTATION 64u
+#define ATLAS_VERIFY_UID_MAX 96u
+
 /* Claims examined when assessing one knowledge record. */
 #define ATLAS_VERIFY_MAX_CLAIMS 256u
 

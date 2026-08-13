@@ -549,6 +549,23 @@ typedef enum atlas_verify_reason {
     ATLAS_VREASON_RISK_REQUIRES_AUTHORITY,
     /* A deterministic verifier reached a normative claim. Separation 4. */
     ATLAS_VREASON_NORMATIVE_CLAIM,
+    /* A9.2.1, §5. The claim is bound to one repository state and the repository
+     * is at another, so the evidence Atlas weighed describes a tree the
+     * repository has since left.
+     *
+     * This is BLOCKED rather than NEEDS_REVIEW, and the distinction is the
+     * whole point of the reason existing. NEEDS_REVIEW says the answer is
+     * probably right and somebody should confirm it. What Atlas actually has
+     * here is an answer about commit X being asked to justify a transition
+     * about commit Y, and it has no basis at all for the second — the code the
+     * claim describes may have been deleted between them. Treating a stale
+     * mechanical proof as weak-but-usable evidence about the current tree is
+     * precisely the silent republication §5 forbids.
+     *
+     * The result is still *published*, bound to the snapshot it examined, and
+     * still readable: it remains true of commit X and saying so costs nothing.
+     * What it may not do is move a lifecycle state. */
+    ATLAS_VREASON_SOURCE_DRIFT,
     /* Every gate passed. */
     ATLAS_VREASON_OK
 } atlas_verify_reason;
@@ -664,6 +681,16 @@ typedef struct atlas_verify_claim {
 
     atlas_buf created_at;
     int64_t superseded_by_claim_id; /* 0 when live */
+
+    /* A9.2.1. The deterministic identity of this claim's immutable content,
+     * scoped by repository, document revision and basis commit. Empty for a
+     * claim written before A9.2.1, and the UNIQUE index is partial for that
+     * reason. §27: a retry resolves to the existing row rather than creating a
+     * second proposition that would be counted beside the first. */
+    atlas_buf content_key;
+    /* §3. Which actor created it. 0 for a claim written before the column
+     * existed — honestly absent rather than attributed to a guess. */
+    int64_t created_by_actor_id;
 } atlas_verify_claim;
 
 void atlas_verify_claim_init(atlas_verify_claim *c);
@@ -740,6 +767,19 @@ typedef struct atlas_verify_evidence {
 
     /* Who produced it. An Atlas-attested actor for anything Atlas ran. */
     int64_t actor_id;
+
+    /* A9.2.1, §27. Deterministic identity over the immutable reference: the
+     * class, the repository, the commit, the path, the symbol, the range and —
+     * for a dynamic observation — the instant. The commit is in the key because
+     * the same lines at a different revision are a different fact, and merging
+     * them would let last week's reading corroborate this week's claim. */
+    atlas_buf content_key;
+    /* A9.2.1, §30. Which A8-CI semantic generation produced this, for the
+     * classes where that is the difference between current and merely recent.
+     * 0 when no generation was involved. Evidence that did not record its
+     * generation would be silently reinterpreted as current the next time the
+     * index was rebuilt. */
+    int64_t sem_generation;
 } atlas_verify_evidence;
 
 void atlas_verify_evidence_init(atlas_verify_evidence *e);
@@ -773,6 +813,16 @@ typedef struct atlas_verify_attestation {
     bool proposer;           /* this actor proposed the record; §26 */
     atlas_buf basis_commit;  /* the revision the actor examined */
     atlas_buf environment;
+
+    /* A9.2.1, §27/§28. Deterministic identity over claim, actor, verdict,
+     * method, scope and examined commit. One actor repeating itself is one
+     * attestation; the same actor reaching the same verdict about a *different*
+     * commit is a second, because it examined a different tree.
+     *
+     * This bounds replay, and it does so without suppressing a genuine change
+     * of mind: a different verdict is a different key, so it lands as the new
+     * row `supersedes_id` is designed to carry. */
+    atlas_buf content_key;
 } atlas_verify_attestation;
 
 void atlas_verify_attestation_init(atlas_verify_attestation *a);
@@ -1072,11 +1122,54 @@ atlas_status atlas_db_verify_claims_for_revision(atlas_db *db, int64_t document_
                                                  int64_t revision_id, atlas_verify_claim_cb cb,
                                                  void *ctx, bool *truncated_out, atlas_err *err);
 
+/* A9.2.1. Every live claim in one repository, optionally narrowed to one
+ * knowledge record, newest first. `document_id` and `revision_id` of 0 mean "no
+ * filter". Bounded by `ATLAS_VERIFY_MAX_CLAIMS`, and `truncated_out` reports
+ * the bound being reached so a partial list never reads as a complete one. */
+atlas_status atlas_db_verify_claims_for_repo(atlas_db *db, int64_t repo_id, int64_t document_id,
+                                             int64_t revision_id, int64_t limit,
+                                             atlas_verify_claim_cb cb, void *ctx,
+                                             bool *truncated_out, atlas_err *err);
+
 atlas_status atlas_db_verify_evidence_insert(atlas_db *db, atlas_verify_evidence *e,
                                              const char *now, atlas_err *err);
 atlas_status atlas_db_verify_evidence_dep_add(atlas_db *db, int64_t evidence_id,
                                               int64_t derives_from_id, const char *now,
                                               atlas_err *err);
+
+/* --- A9.2.1: identity and reference resolution ----------------------------
+ *
+ * The `_by_key` lookups implement §27: a repeated intake call carrying the same
+ * immutable content resolves to the row that already exists rather than writing
+ * a second one, so a retry is never counted as a corroboration. An empty key
+ * never matches, which is what keeps the pre-A9.2.1 rows — written before keys
+ * existed — from colliding with each other.
+ *
+ * The `_find` lookups implement §12's validation requirement: a reference to an
+ * object that does not exist is refused at the write point rather than stored,
+ * because a dangling edge would silently leave an interpretation looking like an
+ * independent root. */
+atlas_status atlas_db_verify_claim_by_key(atlas_db *db, const char *key, int64_t *id_out,
+                                          atlas_buf *uid_out, bool *found, atlas_err *err);
+atlas_status atlas_db_verify_evidence_by_key(atlas_db *db, const char *key, int64_t *id_out,
+                                             atlas_buf *uid_out, bool *found, atlas_err *err);
+atlas_status atlas_db_verify_attestation_by_key(atlas_db *db, const char *key, int64_t *id_out,
+                                                atlas_buf *uid_out, bool *found, atlas_err *err);
+atlas_status atlas_db_verify_evidence_find(atlas_db *db, const char *uid, int64_t *id_out,
+                                           atlas_verify_evidence_class *class_out, bool *found,
+                                           atlas_err *err);
+atlas_status atlas_db_verify_attestation_find(atlas_db *db, const char *uid, int64_t *id_out,
+                                              bool *found, atlas_err *err);
+atlas_status atlas_db_verify_actor_find(atlas_db *db, const char *uid, int64_t *id_out, bool *found,
+                                        atlas_err *err);
+/* The semantic generation currently served for a repository, or 0. §30. */
+atlas_status atlas_db_verify_sem_generation(atlas_db *db, int64_t repo_id, int64_t *gen_out,
+                                            atlas_err *err);
+/* Whether a commit has been ingested for this repository. §4: source binding is
+ * validated against the index, never by asking git, because intake runs on the
+ * writer thread where A1 forbids creating a process. */
+atlas_status atlas_db_verify_commit_exists(atlas_db *db, int64_t repo_id, const char *oid,
+                                           bool *found, atlas_err *err);
 
 /* Writes one attestation and the evidence it rests on, together. They are one
  * statement: an attestation whose evidence links failed to land would be
@@ -1111,9 +1204,27 @@ void atlas_verify_inputs_free(atlas_verify_inputs *in);
 atlas_status atlas_db_verify_inputs_load(atlas_db *db, int64_t claim_id, const char *stale_before,
                                          atlas_verify_inputs *out, atlas_err *err);
 
+/* A9.2.1, §5. What a stored result is *of*: the repository state the claim was
+ * bound to, the state Atlas had indexed when the aggregation ran, the semantic
+ * generation it used, and whether the first two disagreed.
+ *
+ * Stored rather than derived on read, which is the one place A9.2's "recompute
+ * everything" rule is deliberately reversed and the reversal is the point: the
+ * repository will have moved again by the time anybody reads the row, so a
+ * derived answer would be about a different pair of commits every time it ran.
+ * A9.2 makes the same exception for the result row itself, for the same reason
+ * — it is history, not state. */
+typedef struct atlas_verify_source_binding {
+    const char *claim_commit;     /* what the claim was bound to; NULL for none */
+    const char *evaluated_commit; /* what Atlas had indexed; NULL for none */
+    int64_t sem_generation;
+    bool drift;
+} atlas_verify_source_binding;
+
 atlas_status atlas_db_verify_result_insert(atlas_db *db, int64_t claim_id,
                                            const atlas_verify_aggregate *agg, const char *verifier,
-                                           atlas_verify_check check, const char *now,
+                                           atlas_verify_check check,
+                                           const atlas_verify_source_binding *src, const char *now,
                                            int64_t *id_out, atlas_err *err);
 
 atlas_status atlas_db_verify_audit_insert(atlas_db *db, const atlas_verify_audit *a,

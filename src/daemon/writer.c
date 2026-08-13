@@ -121,6 +121,14 @@ static void job_free(atlas_job *j) {
         free(j->orch);
     }
     atlas_orch_result_free(&j->orch_result);
+    if (j->verify != NULL) {
+        atlas_verify_op_free(j->verify);
+        free(j->verify);
+    }
+    if (j->verify_result != NULL) {
+        atlas_verify_intake_result_free(j->verify_result);
+        free(j->verify_result);
+    }
     free(j->gw_audit);
     free(j);
 }
@@ -381,6 +389,26 @@ static void run_decision(atlas_writer *w, atlas_job *j) {
     j->result = atlas_decision_apply(w->db, j->decision, &j->decision_result, &j->result_err);
 }
 
+/* A9.2.1. `atlas_verify_intake_apply` owns its own transaction, exactly like
+ * `atlas_ai_apply`, `atlas_decision_apply` and `atlas_orch_apply`, and is called
+ * with none open — so an operation is whole or nothing.
+ *
+ * That matters most for the one operation here that can reach a lifecycle
+ * state. An evaluation records a durable result, and if the root-owned policy's
+ * gates are met it spends a warrant and transitions the record; the audit row
+ * and the transition must commit together or neither, because an audit row with
+ * no transition describes something that did not happen and a transition with
+ * no audit row is an automatic change to project knowledge with no recoverable
+ * reason. */
+static void run_verify(atlas_writer *w, atlas_job *j) {
+    if (j->verify == NULL || j->verify_result == NULL) {
+        j->result = atlas_err_set(&j->result_err, ATLAS_ERR_INTERNAL,
+                                  "a verification job arrived with no operation attached");
+        return;
+    }
+    j->result = atlas_verify_intake_apply(w->db, j->verify, j->verify_result, &j->result_err);
+}
+
 static void run_orch(atlas_writer *w, atlas_job *j) {
     if (j->orch == NULL) {
         j->result = atlas_err_set(&j->result_err, ATLAS_ERR_INTERNAL,
@@ -589,6 +617,7 @@ static void *writer_main(void *arg) {
         case ATLAS_JOB_AI: run_ai(w, j); break;
         case ATLAS_JOB_DECISION: run_decision(w, j); break;
         case ATLAS_JOB_ORCH: run_orch(w, j); break;
+        case ATLAS_JOB_VERIFY: run_verify(w, j); break;
         case ATLAS_JOB_SNAPSHOT: run_snapshot(w, j); break;
         case ATLAS_JOB_SEM_INDEX: run_sem_index(w, j); break;
         case ATLAS_JOB_MAINTENANCE: {
@@ -1225,6 +1254,88 @@ atlas_status atlas_writer_decision(atlas_writer *w, atlas_decision_op *op, int t
         for (size_t i = 0; st == ATLAS_OK && i < sizeof(copies) / sizeof(copies[0]); i++) {
             st = atlas_buf_set(copies[i].to, copies[i].from->data, copies[i].from->len, err);
         }
+    } else {
+        *err = j->result_err;
+    }
+    job_free(j);
+    return st;
+}
+
+/* A9.2.1. The same shape as `atlas_writer_decision` and `atlas_writer_orch`, and
+ * for the same reasons: the job owns the operation unconditionally, the wait is
+ * bounded, and a request that times out is detached rather than freed — it is
+ * still the writer's, and the writer frees it when it finishes.
+ *
+ * The result is moved rather than copied field by field. A9.1's postmortem is
+ * the argument for doing it this way: a scalar added to the result struct and
+ * not added to a hand-written copy block is silently zero on the daemon path
+ * while the local path reports it, and zero is a legitimate value for most of
+ * these fields — so the two paths disagree with no error anywhere. Handing over
+ * the whole allocation cannot drift. */
+atlas_status atlas_writer_verify(atlas_writer *w, atlas_verify_op *op, int timeout_ms,
+                                 atlas_verify_intake_result *result, atlas_err *err) {
+    atlas_job *j = job_new(ATLAS_JOB_VERIFY);
+    atlas_verify_intake_result *slot = calloc(1u, sizeof *slot);
+    if (j == NULL || slot == NULL) {
+        /* Ownership is taken unconditionally, here as everywhere: a caller that
+         * has to free the operation on some paths and not others eventually
+         * frees it on the wrong one. */
+        atlas_verify_op_free(op);
+        free(op);
+        free(slot);
+        job_free(j);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                             "out of memory queueing a verification request");
+    }
+    atlas_verify_intake_result_init(slot);
+    j->verify = op;
+    j->verify_result = slot;
+    j->wants_result = true;
+
+    (void)pthread_mutex_lock(&w->lock);
+    if (w->stopping || !queue_push(w, j)) {
+        bool stopping = w->stopping;
+        (void)pthread_mutex_unlock(&w->lock);
+        job_free(j);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                             stopping ? "the Atlas daemon is shutting down"
+                                      : "the Atlas daemon's write queue is full");
+    }
+    (void)pthread_cond_signal(&w->not_empty);
+
+    struct timespec deadline;
+    (void)clock_gettime(CLOCK_REALTIME, &deadline);
+    int ms = timeout_ms > 0 ? timeout_ms : 5000;
+    deadline.tv_sec += ms / 1000;
+    deadline.tv_nsec += (long)(ms % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    int rc = 0;
+    while (!j->done && rc == 0) {
+        rc = pthread_cond_timedwait(&w->job_done, &w->lock, &deadline);
+    }
+    bool done = j->done;
+    (void)pthread_mutex_unlock(&w->lock);
+
+    if (!done) {
+        /* Detached rather than freed: the job is still the writer's, and the
+         * writer frees it when it finishes. */
+        (void)pthread_mutex_lock(&w->lock);
+        j->wants_result = false;
+        (void)pthread_mutex_unlock(&w->lock);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                             "the Atlas daemon did not complete the request within %d ms", ms);
+    }
+
+    atlas_status st = j->result;
+    if (st == ATLAS_OK) {
+        /* Move: the caller's struct takes the job's allocations whole, and the
+         * job's slot is emptied so `job_free` releases nothing twice. */
+        atlas_verify_intake_result_free(result);
+        *result = *j->verify_result;
+        memset(j->verify_result, 0, sizeof *j->verify_result);
     } else {
         *err = j->result_err;
     }

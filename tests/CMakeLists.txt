@@ -159,6 +159,7 @@ set(ATLAS_TESTS
   test_decision_kind
   test_verify_model
   test_verify_engine
+  test_verify_intake
 )
 
 foreach(test_name IN LISTS ATLAS_TESTS)
@@ -215,6 +216,7 @@ set_tests_properties(test_decision_kind PROPERTIES LABELS "unit")
 # real repository and drive migrations, so they are integration.
 set_tests_properties(test_verify_model PROPERTIES LABELS "unit")
 set_tests_properties(test_verify_engine PROPERTIES LABELS "integration")
+set_tests_properties(test_verify_intake PROPERTIES LABELS "integration")
 # The operator suite builds a real repository and drives the binary through a
 # pseudo-terminal, so it is an integration test rather than a unit one.
 set_tests_properties(test_decision_operator PROPERTIES LABELS "integration")

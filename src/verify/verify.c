@@ -430,6 +430,10 @@ static const reason_entry REASONS[] = {
     {ATLAS_VREASON_NORMATIVE_CLAIM, "NORMATIVE_CLAIM", ATLAS_POLICY_FORBIDDEN,
      "a mechanical verifier cannot establish a rule about what ought to be; it can only observe "
      "what is"},
+    {ATLAS_VREASON_SOURCE_DRIFT, "SOURCE_DRIFT", ATLAS_POLICY_BLOCKED,
+     "the claim is bound to one repository state and the repository is at another, so this result "
+     "describes a tree the repository has since left and cannot justify a transition about the "
+     "current one"},
     {ATLAS_VREASON_OK, "OK", ATLAS_POLICY_AUTO, "every gate this policy sets was passed"},
 };
 
@@ -706,6 +710,7 @@ void atlas_verify_claim_init(atlas_verify_claim *c) {
     atlas_buf_init(&c->basis_commit);
     atlas_buf_init(&c->environment);
     atlas_buf_init(&c->created_at);
+    atlas_buf_init(&c->content_key);
 }
 
 void atlas_verify_claim_free(atlas_verify_claim *c) {
@@ -722,6 +727,7 @@ void atlas_verify_claim_free(atlas_verify_claim *c) {
     atlas_buf_free(&c->basis_commit);
     atlas_buf_free(&c->environment);
     atlas_buf_free(&c->created_at);
+    atlas_buf_free(&c->content_key);
     memset(c, 0, sizeof *c);
 }
 
@@ -784,6 +790,7 @@ void atlas_verify_evidence_init(atlas_verify_evidence *e) {
     atlas_buf_init(&e->deployed_revision);
     atlas_buf_init(&e->observed_at);
     atlas_buf_init(&e->recorded_at);
+    atlas_buf_init(&e->content_key);
 }
 
 void atlas_verify_evidence_free(atlas_verify_evidence *e) {
@@ -810,6 +817,7 @@ void atlas_verify_evidence_free(atlas_verify_evidence *e) {
     atlas_buf_free(&e->deployed_revision);
     atlas_buf_free(&e->observed_at);
     atlas_buf_free(&e->recorded_at);
+    atlas_buf_free(&e->content_key);
     memset(e, 0, sizeof *e);
 }
 
@@ -824,6 +832,7 @@ void atlas_verify_attestation_init(atlas_verify_attestation *a) {
     atlas_buf_init(&a->created_at);
     atlas_buf_init(&a->basis_commit);
     atlas_buf_init(&a->environment);
+    atlas_buf_init(&a->content_key);
     /* -1 rather than 0: an actor that stated no confidence is not an actor
      * that stated zero confidence. */
     a->self_confidence = -1;
@@ -839,6 +848,7 @@ void atlas_verify_attestation_free(atlas_verify_attestation *a) {
     atlas_buf_free(&a->created_at);
     atlas_buf_free(&a->basis_commit);
     atlas_buf_free(&a->environment);
+    atlas_buf_free(&a->content_key);
     memset(a, 0, sizeof *a);
 }
 

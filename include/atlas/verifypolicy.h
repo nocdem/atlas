@@ -232,6 +232,26 @@ typedef struct atlas_verify_assessment {
     char verified_scope[512];
     char detail[512];
 
+    /* --- A9.2.1, §4/§5: what this assessment is *of* ---------------------
+     *
+     * `claim_commit` is the repository state the claim was bound to when it was
+     * written. `evaluated_commit` is the state Atlas had indexed when the
+     * aggregation ran. They are normally equal and the interesting case is when
+     * they are not.
+     *
+     * `source_drift` records that they disagreed. It is stored on the result
+     * rather than derived later because the repository will have moved again by
+     * the time anybody reads the row, so a derivation would answer a different
+     * question every time it ran.
+     *
+     * A drifting assessment notes `ATLAS_VREASON_SOURCE_DRIFT`, which folds to
+     * BLOCKED through `REASONS[]` — so `actionable` is false and no machine
+     * transition is possible, without a second rule anywhere deciding that. */
+    char claim_commit[ATLAS_OID_HEX_MAX + 1u];
+    char evaluated_commit[ATLAS_OID_HEX_MAX + 1u];
+    int64_t sem_generation;
+    bool source_drift;
+
     /* Every gate passed and a rule authorised it. Distinct from
      * `aggregate.verdict == AUTO`, which is about the gates alone: this also
      * requires a candidate transition and a matching rule to exist. */

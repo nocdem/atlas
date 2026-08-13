@@ -626,18 +626,6 @@ verifiers, and any way for a model to mint or spend a lifecycle capability.
 
 **Deferred, with reasons:**
 
-- **Model-facing attestation submission (MCP) and the read RPC/gateway
-  surfaces.** These belong with the empirical path, which is shadow-only: a
-  model's attestation can move an empirical score and an empirical score
-  currently authorises nothing. The deterministic path — the one that enforces —
-  takes no model input at all, so the enforcing half of A9.2 is complete without
-  them. Adding them means an RPC method group (reads in the ordinary group, the
-  `verify.run` trigger in the operator-uid group beside `code.index`), an MCP
-  tool whose actor identity is assigned by the surface and never accepted from
-  the request, and a stable actor key derived from provider/client/session so
-  reliability can accumulate per source.
-- **Mission Control drill-down.** The JSON surface carries every field it needs;
-  the page does not yet render them.
 - **Historical replay and calibration metrics.** There is no dataset — see below.
 
 **Calibration on this machine: `INSUFFICIENT_DATA`, for every actor and domain.**
@@ -645,3 +633,142 @@ The production index holds zero approved, rejected, superseded or resolved
 records, so there is no resolved history to learn from. That is reported plainly
 rather than papered over, and it is **not** a blocker for the deterministic path
 — which is the whole point of the phase.
+
+---
+
+# A9.2.1 — the product wiring
+
+A9.2 built the engine and shipped no way to put evidence in. The three insert
+functions had no caller outside the tests, so on a real deployment all ten
+verification tables stayed empty while every test that read them passed. A9.2.1
+is the missing half: the surfaces a model and an operator actually reach.
+
+Nothing about the engine changed. What changed is that it can now be fed, and
+that everything it refuses, it refuses **at the boundary a caller meets**.
+
+## The surfaces
+
+| Operation | MCP tool | CLI | RPC method | Gateway |
+|---|---|---|---|---|
+| state a claim | `atlas_verify_claim_create` | `verify claim` | `verify.claim_create` | — |
+| reference evidence | `atlas_verify_evidence` | `verify evidence` | `verify.evidence_add` | — |
+| have Atlas check it | `atlas_verify_produce` | `verify produce` | `verify.evidence_produce` | — |
+| attest | `atlas_verify_attest` | `verify attest` | `verify.attestation_add` | — |
+| declare a derivation | `atlas_verify_depend` | `verify depend` | `verify.dependency_add` | — |
+| evaluate | `atlas_verify_evaluate` | `verify evaluate` | `verify.evaluate` | — |
+| read one claim | `atlas_verify_show` | `verify show` | `verify.show` | `GET /api/v1/verify/claim` |
+| list claims | `atlas_verify_claims` | — | `verify.claims` | `GET /api/v1/verify/claims` |
+| read the policy | — | `verify policy` | `verify.policy` | `GET /api/v1/verify/policy` |
+| evaluate and enforce | — | `verify run` | *(operator group)* | — |
+
+Nine RPC methods, eight MCP tools, three gateway routes — **all three of them
+reads**.
+
+**Intake is deliberately absent from the gateway.** A9's rule is that a mutating
+route needs a write scope no A9 credential can hold, "which is the argument it
+has to survive". Intake has not survived it: `verify.evaluate` can cause Atlas to
+move a lifecycle state, and a leaked bearer token must not reach the one path
+that transitions a record without a person. A local model reaches intake through
+MCP over a Unix socket, where the peer uid is a kernel fact. That is a different
+trust position, and it is the one intake requires.
+
+## Actor identity: the channel is derived, never asserted
+
+The three facts that decide what an attestation is *worth* — the actor's class,
+its identity, and whether evidence was produced by something Atlas ran — are
+never read from a request. They come from `atlas_verify_channel`, which the
+transport edge sets.
+
+| Channel | Actor class | Identity | Set by |
+|---|---|---|---|
+| `MODEL` | `AI_AGENT` | `SELF_DECLARED` | an MCP tool, or an ordinary RPC peer |
+| `OPERATOR` | `HUMAN` | `PEER_AUTHENTICATED` | a peer whose uid the root-owned policy names |
+| `ATLAS` | `ATLAS_VERIFIER` etc. | `ATLAS_ATTESTED` | Atlas' own code, having performed the act |
+
+`ATLAS` is unreachable from every transport: no request parser sets it and
+`atlas_verify_channel_parse` does not accept its name.
+
+**The uid is a ceiling, not the answer.** Deriving the channel from `SO_PEERCRED`
+alone was right about forgery and wrong about the ordinary case. A7.1 permits a
+person to run a model from their own account, and on an unseparated machine
+there is no other account to run it from — so a local MCP session speaks from the
+operator uid, and every attestation a model made was stored as a `HUMAN` actor
+with `PEER_AUTHENTICATED` identity. Atlas was minting the forged-human rows this
+season exists to refuse.
+
+A request may therefore name its channel, and the name is honoured **only when it
+asserts less** than the uid would. The two failure directions are closed by
+different mechanisms: a caller cannot become Atlas by naming it (the parser
+refuses the name), and cannot become the operator by out-ranking the kernel (the
+rank comparison refuses every raise). Claiming less authority than you hold is
+never a forgery — it is the accurate statement, and the only one a model is
+entitled to make.
+
+Everything else a speaker says about itself — name, provider, family, version,
+role, run, orchestrator — is **asserted metadata**, stored as asserted. The
+transport carries no cryptographic statement about which model is speaking, and
+the row's `identity` column is what says so. Never describe it as authenticated.
+
+## Referenced evidence versus produced evidence
+
+This is the distinction the whole intake path exists to keep.
+
+**A model may point Atlas at evidence.** `atlas_verify_evidence` records what the
+caller read: a file at a commit, a symbol, a specification, a document, or its
+own analysis of them. That is a claim about what it looked at.
+
+**A model may not have produced evidence.** `COMPILER`, `TEST`, `RUNTIME` and
+`DEPLOYED_CONFIG` derive their entire weight from Atlas having *performed* the
+act. Naming one on the reference path is **refused, not discounted** — a
+discounted forgery still appears in the evidence list, still reads as tool output
+to somebody skimming a UI, and still has to be argued away by whoever finds it.
+
+**The honest route is `atlas_verify_produce`**: Atlas runs a named allowlisted
+verifier and records what it found. The caller chooses which verifier applies; it
+does not choose the verdict, and there is no parameter that could carry one. An
+index that has not run answers `UNAVAILABLE`, which is not `FAIL`.
+
+## Reading the evidence back
+
+Every surface that reports a confidence score reports the evidence behind it. A
+score whose evidence a reader cannot see is a number taken on trust, which is the
+opposite of what recording evidence is for.
+
+Two pairs of fields are kept separate on purpose, and a renderer that collapses
+either is wrong:
+
+- **`class` and `producer_identity`.** `AI_ANALYSIS` produced by a
+  `SELF_DECLARED` actor and `COMPILER` evidence that is `ATLAS_ATTESTED` are both
+  legitimate rows meaning entirely different things. A view that prints the first
+  without the second is telling somebody a model is a compiler.
+- **`actor` and `group`.** Attestations sharing a group rest on the same evidence
+  and corroborate one another not at all. Printing an actor count as though it
+  were an evidence count is the error this season exists to prevent.
+
+The detail is display only. Nothing loaded for it reaches the aggregation, so a
+wrong value there misleads a reader without moving a verdict — and
+`atlas_verify_assess` still writes nothing at all.
+
+## Confidence is still not a probability
+
+`confidence_score` is an integer out of 100 and carries no percent sign in any
+renderer. `calibrated_probability` is emitted **only** when calibration supports
+it, and is absent rather than null or zero otherwise — zero is a probability.
+Mission Control says so in words beside the number, because a figure next to the
+word "confidence" is read as a percentage by everybody who has not been told
+otherwise.
+
+Calibration on this machine remains `INSUFFICIENT_DATA` for every actor and
+domain, so the empirical path stays in shadow. The deterministic path does not
+wait on it, and that separation is the point of the phase.
+
+## What is still absent
+
+- **No MCP tool, CLI verb, RPC method or gateway route approves, rejects,
+  supersedes, resolves or revalidates anything.** Absent rather than refusing,
+  which is A7's pattern: an absent name is answered by the dispatcher's
+  unknown-name case, and a refusing one is a refusal a later edit can weaken.
+- **Nothing mints or spends a warrant**, edits the verification policy, lowers a
+  threshold, or states a verifier's verdict.
+- **No remote credential administration**, unchanged from A9.
+- **Historical replay and calibration metrics.** There is still no dataset.

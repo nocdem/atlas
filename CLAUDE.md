@@ -1819,6 +1819,93 @@ src/db/migrate.c              migration 14 (ten tables, additive) and
   Atlas does not have, and a timestamp is emphatically not one. An absent path
   cannot be weakened by a later edit the way a refusing one can.
 
+## A9.2.1 layers — additions
+
+A9.2.1 adds no table and no migration. It is the product wiring for the engine
+A9.2 shipped with no way to feed it:
+
+```
+src/mcp/mcp_tools.c   eight verification tools; the channel is sent as MODEL and
+                      honoured only because it asserts less than the peer uid
+src/cli/cli.c         six intake verbs, routed local-or-socket on whether this
+                      process holds the writer lock
+src/core/service_remote.c  the client for all nine RPC methods, reading the
+                      daemon's shape back into the struct the local path fills
+src/db/db_verify.c    atlas_db_verify_detail_load: the readable evidence and
+                      attestations, display-only and never an aggregation input
+src/gw/gateway.c      three read-only API routes; intake is deliberately absent
+src/gw/ui/mission-control.html  the Verification view
+```
+
+## A9.2.1 rules — these are not negotiable
+
+- **The peer uid is a ceiling, not the answer.** A request may name its channel
+  and the name is honoured **only when it asserts less** than the uid would.
+  Deriving the channel from `SO_PEERCRED` alone stored every locally-run model's
+  attestations as `HUMAN` / `PEER_AUTHENTICATED`, because A7.1 permits running a
+  model from the operator's account and on an unseparated machine there is no
+  other account — so Atlas was minting the forged-human rows this season exists
+  to refuse. The two failure directions are closed by different mechanisms:
+  `atlas_verify_channel_parse` refuses the `ATLAS` name, and
+  `atlas_verify_channel_authority` refuses every raise. Claiming less authority
+  than you hold is never a forgery; it is the accurate statement.
+- **A locked authority profile costs a label, never the ability to record.** The
+  local CLI asks `atlas_authority_probe` rather than assuming it is the operator,
+  so a profile that grants nothing produces a `MODEL` actor instead of an
+  unearned `PEER_AUTHENTICATED` one. Both paths ask the same probe; a surface
+  that assumed would disagree with the one that asks.
+- **A model may reference evidence and may not have produced it.** `COMPILER`,
+  `TEST`, `RUNTIME` and `DEPLOYED_CONFIG` are refused on the reference path, not
+  discounted — a discounted forgery still reads as tool output to somebody
+  skimming a UI. `atlas_verify_produce` is the honest route, and it has no
+  parameter for the verdict and must never grow one.
+- **Intake is absent from the gateway, and the absence is the argument.** A9's
+  rule says a mutating route needs a write scope no credential can hold;
+  `verify.evaluate` can move a lifecycle state, so a leaked bearer token must not
+  reach it. The three routes that exist are reads. MCP over a Unix socket, where
+  the peer uid is a kernel fact, is the trust position intake requires.
+- **Every surface that shows a score shows its evidence**, through the one
+  writer `atlas_service_verify_write_detail`. Two pairs never collapse: `class`
+  with `producer_identity`, and `actor` with `group`. A view printing the first
+  of either pair alone tells somebody a model is a compiler, or reads an actor
+  count as an evidence count.
+- **The detail is display, never an input.** Nothing `atlas_db_verify_detail_load`
+  returns reaches the aggregation, so a wrong value misleads a reader without
+  moving a verdict. The independent-group partition shown beside an attestation
+  is recomputed by the same pure function the score used, never threaded out of
+  the aggregation — the first thing a later edit would otherwise be tempted to do
+  is feed something from the display back in.
+- **The local/remote choice is `atlas_ctx_is_writer`, never `ctx != NULL`.** With
+  a daemon running, `atlas_ctx` in AUTO mode still opens read-only, so a write
+  routed on the weaker test failed with "attempt to write a readonly database".
+- **Intake verbs open no terminal and mint no capability.** Stating a claim,
+  citing evidence and attesting change no record and no lifecycle state;
+  requiring a `/dev/tty` for them would be ceremony borrowed from an operation
+  with entirely different consequences. `decision approve` still needs everything
+  it always needed.
+- **No MCP tool name may contain an authority verb**, which is why the tools are
+  `atlas_verify_evidence`, `_attest` and `_depend` rather than `_add` spellings.
+  `tests/test_registry.c` enforces it and must not grow an exception; the names
+  now mirror the CLI subcommands one-to-one, which is what §29 parity should look
+  like.
+- **Security refusals are tested through the transport.** A refusal that exists
+  only below it is one an attacker never meets, so `tests/test_verify_product.c`
+  drives JSON on stdin through the real MCP adapter against a live daemon.
+
+## Extending A9.2.1 safely
+
+- **A new MCP verification tool** states its scope in `tool_def`, keeps the
+  authority-verb ban, and changes the pinned count in `tests/test_plugin.c`. If it
+  writes, it maps to `ATLAS_SCOPE_MEMORY_WRITE`, which no credential can hold.
+- **A new gateway route** must be a read, for the reason above. A mutating one
+  needs an argument that survives the "leaked bearer token" test, and intake has
+  not survived it.
+- **A new field on the readable detail** goes in `atlas_verify_evidence_detail` or
+  `atlas_verify_attestation_detail`, is written by
+  `atlas_service_verify_write_detail`, is read back by `read_detail` in
+  `service_remote.c`, and is rendered by both renderers. Missing the read-back is
+  how the socket path and the local path start disagreeing.
+
 ## Extending A9.2 safely
 
 - **A new deterministic verifier** means a member of `atlas_verify_verifier`, a

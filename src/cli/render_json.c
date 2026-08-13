@@ -1578,6 +1578,16 @@ static atlas_status j_verify(atlas_renderer *r, const atlas_verify_report *rep, 
     TRY(atlas_json_key_str_opt(j, "verified_scope", a->verified_scope, err));
     TRY(atlas_json_key_str_opt(j, "detail", a->detail, err));
 
+    /* A9.2.1: what the result is *of*. The daemon's `verify.show` has carried
+     * these since migration 16 and this renderer did not, so `atlas verify show
+     * --json` and the socket answered differently about whether a result
+     * describes the tree the repository is on — which is the one question
+     * SOURCE_DRIFT exists to answer, and the worst one to disagree about. */
+    TRY(atlas_json_key_str(j, "claim_commit", a->claim_commit, err));
+    TRY(atlas_json_key_str(j, "evaluated_commit", a->evaluated_commit, err));
+    TRY(atlas_json_key_int(j, "sem_generation", a->sem_generation, err));
+    TRY(atlas_json_key_bool(j, "source_drift", a->source_drift, err));
+
     TRY(atlas_json_key_int(j, "support_count", a->aggregate.support_count, err));
     TRY(atlas_json_key_int(j, "contradict_count", a->aggregate.contradict_count, err));
     TRY(atlas_json_key_int(j, "inconclusive_count", a->aggregate.inconclusive_count, err));

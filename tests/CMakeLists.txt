@@ -89,6 +89,7 @@ set(ATLAS_TESTS
   test_code_lex
   test_code_graph
   test_sem
+  test_sem_freshness
   test_registry
   test_ops
   test_code_compdb
@@ -177,6 +178,7 @@ endforeach()
 # A repository is required for the integration suites; a missing git makes them
 # fail loudly rather than silently pass.
 set_tests_properties(test_sem PROPERTIES LABELS "integration")
+set_tests_properties(test_sem_freshness PROPERTIES LABELS "integration")
 # A live daemon and real MCP sessions, so it belongs to the serialised group.
 set_tests_properties(test_registry PROPERTIES LABELS "daemon")
 set_tests_properties(test_ops PROPERTIES LABELS "daemon")

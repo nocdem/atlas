@@ -43,6 +43,7 @@
 #include "atlas/db.h"
 #include "atlas/decision.h"
 #include "atlas/decision_ops.h"
+#include "atlas/sem.h"
 #include "atlas/verify.h"
 #include "atlas/verifypolicy.h"
 #include "atlas_test.h"
@@ -127,12 +128,42 @@ static void env_close(env *e) {
  * current and partial, and the fixtures need both cases separately because they
  * produce different truth reasons. */
 static int64_t seed_generation(env *e, bool complete, const char *commit, atlas_err *err) {
+    /* A9.2.3 widened what "complete" has to mean, and the fixture has to build
+     * the whole of it or the verifiers under test are being asked about a
+     * generation Atlas would rightly refuse to answer from.
+     *
+     * Three things beyond the unit counts:
+     *
+     *   - the **coverage manifest**. `tu_complete == tu_total` says every unit
+     *     the compilation database named was parsed, and says nothing about
+     *     whether it named every source in the tree. A generation with no
+     *     manifest reads `scope_discovery = UNKNOWN`, which is never sufficient
+     *     for an absence — correctly, and it is why this is set here.
+     *   - the **analyzer identity**, because a generation produced by a
+     *     different algorithm is stale whatever else is true of it.
+     *   - the **file index state**, because a semantic graph built on an index
+     *     nobody can vouch for is not one to answer a negative question from.
+     *
+     * `source_identity` is deliberately left empty: an empty stored identity
+     * never makes a generation stale, which is exactly how a pre-A9.2.3 row
+     * behaves, and the fixture has no working tree to compute one from. */
+    EXEC(e, err,
+             "INSERT INTO repo_index_state(repo_id, generation, last_complete_generation,"
+             "  last_reconcile_at, last_complete_at, event_gap, pending_full_reconcile)"
+             "  VALUES(%lld, 1, 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 0, 0)"
+             "  ON CONFLICT(repo_id) DO UPDATE SET last_complete_generation = 1,"
+             "    event_gap = 0, pending_full_reconcile = 0;",
+             (long long)e->repo_id);
     EXEC(e, err,
              "INSERT INTO sem_generations(repo_id, commit_id, status, started_at, completed_at,"
-             "  tu_total, tu_complete, tu_partial, tu_failed, tu_unsupported)"
+             "  tu_total, tu_complete, tu_partial, tu_failed, tu_unsupported,"
+             "  analyzer_id, analyzer_version,"
+             "  scope_discovery, scope_candidates, scope_covered, scope_uncovered)"
              "  VALUES(%lld, '%s', 'COMPLETE', '2026-01-01T00:00:00Z', '2026-01-01T00:01:00Z',"
-             "         2, %d, 0, %d, 0);",
-             (long long)e->repo_id, commit, complete ? 2 : 1, complete ? 0 : 1);
+             "         2, %d, 0, %d, 0, '%s', %d, 'DECLARED', 2, %d, %d);",
+             (long long)e->repo_id, commit, complete ? 2 : 1, complete ? 0 : 1,
+             ATLAS_SEM_ANALYZER_ID, (int)ATLAS_SEM_ANALYZER_VERSION, complete ? 2 : 1,
+             complete ? 0 : 1);
     int64_t gen = last_id(e, "sem_generations", err);
     EXEC(e, err,
              "INSERT INTO sem_current(repo_id, generation_id) VALUES(%lld, %lld)"
@@ -773,6 +804,97 @@ static void test_no_intake_path_can_assert_coverage_or_absence(void) {
     atlas_buf_free(&src);
 }
 
+
+/* A9.2.3 fixture C: source-current, scope-incomplete.
+ *
+ * The state the season exists to make visible, and the one A9.2.2 could not
+ * see. Every translation unit the compilation database named was parsed without
+ * error and the generation describes the current source — so every A9.2.2 signal
+ * says complete — and the compilation database named two of three tracked
+ * sources. The third could hold a caller, and nothing about the unit counts says
+ * so.
+ *
+ * Before A9.2.3 this answered ABSENT. */
+static void test_fixture_c2_a_scope_incomplete_generation_cannot_establish_absence(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    env e;
+    env_open(&e, &err);
+
+    int64_t gen = seed_generation(&e, /*complete=*/true, HEAD_COMMIT, &err);
+    seed_symbol(&e, gen, "c:a.c@F@orphan", "orphan", /*internal=*/true, &err);
+
+    /* Every unit parsed; one tracked source the compilation database never
+     * named. Only the second number can refuse the absence. */
+    EXEC(&e, &err,
+             "UPDATE sem_generations SET scope_candidates = 3, scope_covered = 2,"
+             "  scope_uncovered = 1 WHERE id = %lld;",
+             (long long)gen);
+
+    atlas_verify_check check = ATLAS_CHECK_UNAVAILABLE;
+    atlas_verify_coverage_report cov;
+    atlas_verify_truth_reason why = ATLAS_TREASON_NONE;
+    atlas_verify_truth t =
+        run(&e, ATLAS_VERIFIER_NO_PROVEN_CALLER, "symbol=orphan", &check, &cov, &why, &err);
+
+    T_CHECK_MSG(t == ATLAS_TRUTH_UNKNOWN,
+                "a generation that read two of three tracked sources established an absence: %s",
+                atlas_verify_truth_name(t));
+    /* UNAVAILABLE, not FAIL. "Atlas could not look" is not evidence in either
+     * direction, and the coverage gate moves the *check* and not only the truth
+     * — otherwise one row would carry CONTRADICTED and UNKNOWN at once. */
+    T_EQ_INT((int)check, (int)ATLAS_CHECK_UNAVAILABLE);
+    T_EQ_INT((int)why, (int)ATLAS_TREASON_COVERAGE_PARTIAL);
+    /* The dimension that refused it, and the one that did not: the units were
+     * complete, the tracked sources were not, and reporting them separately is
+     * what tells an operator to widen the compilation database rather than to
+     * fix a parse error. */
+    T_EQ_INT((int)cov.dims[ATLAS_COVDIM_TRACKED_SOURCE], (int)ATLAS_COVERAGE_PARTIAL);
+    T_EQ_INT((int)cov.dims[ATLAS_COVDIM_SEMANTIC_GENERATION], (int)ATLAS_COVERAGE_COMPLETE);
+
+    env_close(&e);
+}
+
+/* A9.2.3 fixture D: a caller found over an index whose coverage is incomplete.
+ *
+ * The asymmetry, from the other side. Finding one caller proves a caller exists
+ * however incomplete the index, because an incomplete index cannot conjure a
+ * call that is not there. A gate applied to both directions would make Atlas
+ * uselessly cautious rather than correctly cautious. */
+static void test_fixture_d2_a_caller_is_present_despite_incomplete_scope(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    env e;
+    env_open(&e, &err);
+
+    /* Every unit parsed, so this is not fixture A's case: the shortfall is
+     * purely in scope — one tracked source the compilation database never
+     * named — which is the state A9.2.2 could not see at all. */
+    int64_t gen = seed_generation(&e, /*complete=*/true, HEAD_COMMIT, &err);
+    seed_symbol(&e, gen, "c:@F@target", "target", true, &err);
+    seed_symbol(&e, gen, "c:@F@caller", "caller", true, &err);
+    seed_edge(&e, gen, "CALLS", "c:@F@caller", "c:@F@target", "PROVEN", 20, &err);
+    EXEC(&e, &err,
+             "UPDATE sem_generations SET scope_candidates = 3, scope_covered = 2,"
+             "  scope_uncovered = 1 WHERE id = %lld;",
+             (long long)gen);
+
+    atlas_verify_check check = ATLAS_CHECK_UNAVAILABLE;
+    atlas_verify_coverage_report cov;
+    atlas_verify_truth t =
+        run(&e, ATLAS_VERIFIER_NO_PROVEN_CALLER, "symbol=target", &check, &cov, NULL, &err);
+
+    T_CHECK_MSG(t == ATLAS_TRUTH_PRESENT,
+                "a caller that exists was refused because unrelated scope was incomplete: %s",
+                atlas_verify_truth_name(t));
+    T_EQ_INT((int)check, (int)ATLAS_CHECK_FAIL); /* FAIL of "no caller", i.e. one exists */
+    /* And the coverage really is incomplete, so this is not passing because the
+     * fixture accidentally built a complete generation. */
+    T_EQ_INT((int)cov.dims[ATLAS_COVDIM_TRACKED_SOURCE], (int)ATLAS_COVERAGE_PARTIAL);
+
+    env_close(&e);
+}
+
 static void test_a_model_cannot_forge_a_complete_generation(void) {
     /* Coverage is derived from index state and from nothing a caller supplied.
      * The demonstration: the same claim, the same input, the same everything —
@@ -788,8 +910,15 @@ static void test_a_model_cannot_forge_a_complete_generation(void) {
         run(&e, ATLAS_VERIFIER_SYMBOL_ABSENT, "symbol=ghost", NULL, NULL, NULL, &err);
     T_EQ_INT((int)before, (int)ATLAS_TRUTH_UNKNOWN);
 
-    /* Only the indexer can write this row; there is no request that reaches it. */
-    EXEC(&e, &err, "UPDATE sem_generations SET tu_failed = 0, tu_complete = 2 WHERE id = %lld;",
+    /* Only the indexer can write this row; there is no request that reaches it.
+     *
+     * A9.2.3 widened what has to be true — the scope manifest as well as the
+     * unit counts — which strengthens rather than weakens the demonstration:
+     * there are now more fields a caller would have to forge, and still not one
+     * request that reaches any of them. */
+    EXEC(&e, &err,
+             "UPDATE sem_generations SET tu_failed = 0, tu_complete = 2, scope_covered = 2,"
+             "  scope_uncovered = 0 WHERE id = %lld;",
              (long long)gen);
     atlas_verify_truth after =
         run(&e, ATLAS_VERIFIER_SYMBOL_ABSENT, "symbol=ghost", NULL, NULL, NULL, &err);
@@ -1181,6 +1310,10 @@ static const atlas_test TESTS[] = {
      test_fixture_b_zero_callers_with_an_escaping_address_is_unknown},
     {"fixture c a bounded complete absence is absent",
      test_fixture_c_a_bounded_complete_absence_is_absent},
+    {"a scope-incomplete generation cannot establish absence",
+     test_fixture_c2_a_scope_incomplete_generation_cannot_establish_absence},
+    {"a caller is present despite incomplete scope",
+     test_fixture_d2_a_caller_is_present_despite_incomplete_scope},
     {"external linkage keeps an absence unknown",
      test_external_linkage_keeps_an_absence_unknown},
     {"fixture d repository absence is not operational absence",

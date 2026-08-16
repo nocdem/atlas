@@ -809,6 +809,61 @@ atlas_status atlas_sem_index_run(atlas_db *db, int64_t repo_id, const atlas_sem_
             }
         }
         if (all_same && seen == prev.tu_total) {
+            /* A9.2.3: re-stamp the source identity, and this is not optional.
+             *
+             * A repository can hold a source the compilation database does not
+             * name — on a real tree, hundreds of them. Editing one moves the
+             * live source identity, because that identity covers every source
+             * and header the *file index* holds; it moves no unit digest and no
+             * scope count, because the file was never compiled and was already
+             * counted as uncovered. So freshness reads STALE, the scheduler
+             * queues a build, the build finds nothing to do and publishes
+             * nothing — and the stored identity stays old. The repository is
+             * stale again on the next tick and rebuilds every sweep, for ever,
+             * achieving nothing.
+             *
+             * Re-stamping is honest rather than a paper over. This pass has just
+             * verified that every input which determines what the generation
+             * would contain is identical: each unit's digest over its transitive
+             * include closure, the compilation-database digest, the compiler,
+             * the analyzer, and the scope counts. The generation therefore
+             * describes the new tree to exactly the same extent it described the
+             * old one, and saying so is a statement Atlas can support. It is the
+             * same move as sealing a unit's input digest at the end of a pass:
+             * recording what was measured, once the measurement is complete.
+             *
+             * A failure here is not fatal to the answer — the previous
+             * generation is still correct and still served — but it is worth
+             * reporting, because a repository that cannot record its identity is
+             * one that will rebuild on every sweep. */
+            char ident[65];
+            ident[0] = '\0';
+            atlas_repo_info ri;
+            atlas_repo_info_init(&ri);
+            ri.id = repo_id;
+            st = atlas_buf_set_str(&ri.root_path, opts->root, err);
+            if (st == ATLAS_OK) {
+                st = atlas_sem_source_identity(db, &ri, ident, err);
+            }
+            atlas_repo_info_free(&ri);
+            if (st == ATLAS_OK && strcmp(ident, prev.source_identity) != 0) {
+                /* Its own small transaction: nothing else is being written, and
+                 * the identity is measured before it opens — A1's rule that no
+                 * file read happens inside a write transaction. */
+                st = atlas_db_begin(db, err);
+                if (st == ATLAS_OK) {
+                    st = atlas_db_sem_source_identity_set(db, prev.id, ident, err);
+                }
+                if (st == ATLAS_OK) {
+                    st = atlas_db_commit(db, err);
+                } else {
+                    atlas_db_rollback(db);
+                }
+            }
+            if (st != ATLAS_OK) {
+                goto cleanup;
+            }
+
             sum->no_change = true;
             sum->published = true;
             sum->generation_id = prev.id;
@@ -1283,6 +1338,36 @@ atlas_status atlas_sem_index_run(atlas_db *db, int64_t repo_id, const atlas_sem_
             }
         }
 
+        /* The identity this generation was built from.
+         *
+         * Measured *after* the pass rather than before it: what a generation may
+         * claim to describe is the tree as it stood when the last unit was read,
+         * and recording the identity Atlas saw at the start would claim a tree
+         * the pass never finished looking at. When the tree moves mid-build the
+         * consequence is the honest one — the later identity is recorded, the
+         * generation publishes, and the very next freshness read compares it
+         * against a tree that has moved again and reports STALE, which the
+         * scheduler acts on. A generation is never published as describing a
+         * state it did not observe.
+         *
+         * Measured **before** `atlas_db_begin`, and that placement is a rule
+         * rather than a preference: computing it reads the compilation databases
+         * from disk, and A1 forbids a file read inside a write transaction. The
+         * transaction below writes what was measured and does no reading of its
+         * own. */
+        char identity[65];
+        identity[0] = '\0';
+        if (st == ATLAS_OK) {
+            atlas_repo_info ri;
+            atlas_repo_info_init(&ri);
+            ri.id = repo_id;
+            st = atlas_buf_set_str(&ri.root_path, opts->root, err);
+            if (st == ATLAS_OK) {
+                st = atlas_sem_source_identity(db, &ri, identity, err);
+            }
+            atlas_repo_info_free(&ri);
+        }
+
         st = st == ATLAS_OK ? atlas_db_begin(db, err) : st;
         if (st == ATLAS_OK) {
             st = atlas_db_sem_publish(db, sum->generation_id, &gen, err);
@@ -1296,32 +1381,8 @@ atlas_status atlas_sem_index_run(atlas_db *db, int64_t repo_id, const atlas_sem_
         if (st == ATLAS_OK) {
             st = atlas_db_sem_scope_set(db, sum->generation_id, &gen, err);
         }
-        /* The identity this generation was built from, recorded in the same
-         * transaction. Measured *after* the pass rather than before it: what a
-         * generation may claim to describe is the tree as it stood when the last
-         * unit was read, and recording the identity Atlas saw at the start would
-         * claim a tree the pass never finished looking at.
-         *
-         * The consequence when the tree moves mid-build is the honest one: the
-         * identity recorded is the later one, the generation publishes, and the
-         * very next freshness read compares it against a tree that has moved
-         * again and reports STALE. The scheduler then rebuilds. A generation is
-         * never published as describing a state it did not observe. */
         if (st == ATLAS_OK) {
-            char ident[65];
-            ident[0] = '\0';
-            atlas_repo_info ri;
-            atlas_repo_info_init(&ri);
-            ri.id = repo_id;
-            atlas_status ist = atlas_buf_set_str(&ri.root_path, opts->root, err);
-            if (ist == ATLAS_OK) {
-                ist = atlas_sem_source_identity(db, &ri, ident, err);
-            }
-            atlas_repo_info_free(&ri);
-            st = ist;
-            if (st == ATLAS_OK) {
-                st = atlas_db_sem_source_identity_set(db, sum->generation_id, ident, err);
-            }
+            st = atlas_db_sem_source_identity_set(db, sum->generation_id, identity, err);
         }
         if (st == ATLAS_OK) {
             st = atlas_db_commit(db, err);

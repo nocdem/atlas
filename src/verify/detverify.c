@@ -86,6 +86,9 @@
 #include <string.h>
 
 #include "atlas/atlas.h"
+#include "atlas/sem.h"
+#include "atlas/sem_ops.h"
+#include "atlas/sem_schedule.h"
 
 /* The verifier input is a bounded, structured argument Atlas parses, never a
  * command and never a pattern. Its grammar is `key=value` pairs separated by
@@ -162,33 +165,131 @@ static void scope_of(atlas_verify_verifier v, const char *a, const char *b, char
     }
 }
 
-/* Fills the three semantic-index dimensions from one generation's state.
+/* A9.2.3: the generation's state, asked of the one implementation of the
+ * question rather than of a second one written here.
  *
- * Each of the three answers implies a different reason and a different remedy,
- * which is why they are not one boolean: nothing published, a look that missed
- * part of the tree, and a look at a tree the repository has since left. */
-static void sem_coverage(atlas_verify_coverage_report *cov, bool indexed, bool complete,
-                         bool current) {
-    atlas_verify_coverage c;
-    if (!indexed) {
-        c = ATLAS_COVERAGE_UNKNOWN;
-    } else if (!complete) {
-        c = ATLAS_COVERAGE_PARTIAL;
-    } else if (!current) {
-        c = ATLAS_COVERAGE_STALE;
-    } else {
-        c = ATLAS_COVERAGE_COMPLETE;
+ * Before A9.2.3 this layer derived currency from `generation.commit_id ==
+ * repositories.scanned_head` in SQL, and `code sem-status` derived it from
+ * `atlas_sem_freshness_of`. The two disagreed the moment A9.2.3 taught freshness
+ * about the working tree: after an uncommitted edit the verifier called a
+ * generation current while every other surface called it stale — two
+ * implementations of one currency rule, which is how a verifier comes to believe
+ * a stale snapshot is current and then reports "there is no caller" for code it
+ * never read.
+ *
+ * `atlas_sem_plan_for` is a read: no transaction, no lock, no process. Asking it
+ * here costs a repository row and a digest and buys the guarantee that a
+ * negative conclusion and the status page cannot describe the same generation
+ * differently. */
+static atlas_status sem_state(atlas_db *db, int64_t repo_id, bool *indexed_out,
+                              bool *units_complete_out, bool *scope_complete_out,
+                              bool *current_out, atlas_err *err) {
+    *indexed_out = false;
+    *units_complete_out = false;
+    *scope_complete_out = false;
+    *current_out = false;
+
+    atlas_repo_info info;
+    atlas_repo_info_init(&info);
+    bool found = false;
+    atlas_status st = atlas_db_repo_get_by_id(db, repo_id, &info, &found, err);
+    if (st != ATLAS_OK || !found) {
+        /* A repository Atlas cannot resolve is one whose index it cannot vouch
+         * for. Every dimension stays UNKNOWN, which is never sufficient for an
+         * absence — the fail-closed reading, not an error. */
+        atlas_repo_info_free(&info);
+        return st;
     }
-    cov->dims[ATLAS_COVDIM_SEMANTIC_GENERATION] = c;
-    /* A complete generation is a parse of every translation unit the
-     * compilation database named, which is what "every tracked source in scope
-     * was read" means for a semantic question — and it covers generated sources
-     * on the same footing, because a generated `.c` in the compilation database
-     * is parsed exactly like any other. Where the generation is not complete,
-     * neither claim can be made. */
-    cov->dims[ATLAS_COVDIM_TRACKED_SOURCE] = c;
-    cov->dims[ATLAS_COVDIM_GENERATED_SOURCE] = c;
-    cov->dims[ATLAS_COVDIM_DIRECT_CALLS] = c;
+    atlas_sem_plan plan;
+    atlas_sem_plan_init(&plan);
+    st = atlas_sem_plan_for(db, &info, false, &plan, err);
+    atlas_repo_info_free(&info);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    *indexed_out = plan.freshness != ATLAS_SEM_FRESH_ABSENT;
+    *current_out = plan.freshness == ATLAS_SEM_FRESH_CURRENT;
+
+    /* Two completenesses, because they answer two different questions and
+     * A9.2.2 could only ask one.
+     *
+     * `units_complete` is A9.2's: every translation unit the compilation
+     * database named was parsed without error. `scope_complete` is A9.2.3's and
+     * additionally requires that the compilation database named every source the
+     * file index holds. A generation can satisfy the first and fail the second
+     * by a wide margin, and which dimensions rest on which is the substance of
+     * this file's change. */
+    *scope_complete_out = plan.coverage_complete;
+    *units_complete_out = plan.scope_uncovered == 0 ? plan.coverage_complete : false;
+    /* A generation whose only shortfall is uncovered sources still parsed every
+     * unit it was given, so the unit-level answer stands on its own. */
+    if (!*units_complete_out) {
+        atlas_sem_generation g;
+        bool have = false;
+        atlas_err ignored;
+        atlas_err_init(&ignored);
+        if (atlas_db_sem_current(db, repo_id, &g, &have, &ignored) == ATLAS_OK && have) {
+            *units_complete_out = g.status == ATLAS_SEM_GEN_COMPLETE && g.tu_partial == 0 &&
+                                  g.tu_failed == 0 && g.tu_unsupported == 0;
+        }
+    }
+    return ATLAS_OK;
+}
+
+/* Fills the semantic-index dimensions from one generation's state.
+ *
+ * Each answer implies a different reason and a different remedy, which is why
+ * they are not one boolean: nothing published, a look that missed part of the
+ * tree, and a look at a tree the repository has since left. */
+static atlas_verify_coverage fold_coverage(bool indexed, bool complete, bool current) {
+    if (!indexed) {
+        return ATLAS_COVERAGE_UNKNOWN;
+    }
+    if (!current) {
+        /* Stale before partial. A generation describing a tree the repository
+         * has left is stale whatever its coverage was of the tree it did
+         * describe, and the remedy is a rebuild rather than a wider parse. */
+        return ATLAS_COVERAGE_STALE;
+    }
+    return complete ? ATLAS_COVERAGE_COMPLETE : ATLAS_COVERAGE_PARTIAL;
+}
+
+static void sem_coverage(atlas_verify_coverage_report *cov, bool indexed, bool units_complete,
+                         bool scope_complete, bool current) {
+    /* A9.2.3 splits what A9.2.2 had to fold, and the split is the point.
+     *
+     * `SEMANTIC_GENERATION`, `GENERATED_SOURCE` and `DIRECT_CALLS` follow the
+     * **units**: every translation unit the compilation database named was
+     * parsed without error. That is genuinely what those three assert.
+     * `GENERATED_SOURCE` in particular is answered by the compilation database
+     * and by nothing else — a build-generated source that is compiled *is* an
+     * entry in it, and a generated `.c` there is parsed exactly like any other.
+     * The file index cannot answer it, because a generated source usually lives
+     * under an ignored build directory and is not tracked at all; asking the
+     * scope manifest about it would be asking a denominator that is blind to
+     * exactly those files. What bounds this is that the compilation database
+     * must be *current*, which A9.2.3 finally checks: until this season the
+     * staleness branch for it was unreachable, so the dimension was asserted
+     * from a build description that could have changed months earlier.
+     *
+     * `TRACKED_SOURCE` follows the **scope manifest**, which is what its own
+     * description always meant — "every tracked source file in scope was read".
+     * A8-CI could only offer "every unit the compilation database named was
+     * parsed", and asserting COMPLETE on that basis was the overclaim this
+     * season exists to end: a compilation database naming two of three tracked
+     * sources reported `2/2` and supported an absence over a tree it had read
+     * two thirds of. `scope_uncovered` is now what refuses that.
+     *
+     * The honest limit, stated rather than implied: a source that some build
+     * compiles but that this repository's compilation database does not name is
+     * invisible to both dimensions. Atlas answers from the description it was
+     * given, and `code sem-config` is where an operator gives it. */
+    const atlas_verify_coverage units = fold_coverage(indexed, units_complete, current);
+    const atlas_verify_coverage scope = fold_coverage(indexed, scope_complete, current);
+    cov->dims[ATLAS_COVDIM_SEMANTIC_GENERATION] = units;
+    cov->dims[ATLAS_COVDIM_GENERATED_SOURCE] = units;
+    cov->dims[ATLAS_COVDIM_DIRECT_CALLS] = units;
+    cov->dims[ATLAS_COVDIM_TRACKED_SOURCE] = scope;
 }
 
 /* §11. No A9.2.2 verifier observes a running system or reads deployed
@@ -363,16 +464,19 @@ atlas_status atlas_verify_run_verifier(atlas_db *db, atlas_verify_verifier v, in
             return ATLAS_OK;
         }
         int64_t count = 0;
-        bool complete = false, indexed = false, current = false;
-        atlas_status st =
-            atlas_db_verify_sem_symbol(db, repo_id, arg_a, &count, &complete, &indexed, err);
+        bool units_complete = false, scope_complete = false, indexed = false, current = false;
+        /* The count from the query, the *state* from `sem_state` and from
+         * nowhere else: the query's own completeness flag is A9.2's narrower
+         * one, and passing NULL for it says which of the two is authoritative
+         * rather than leaving one to overwrite the other. */
+        atlas_status st = atlas_db_verify_sem_symbol(db, repo_id, arg_a, &count, NULL, NULL, err);
         if (st == ATLAS_OK) {
-            st = atlas_db_verify_sem_current(db, repo_id, NULL, NULL, &current, err);
+            st = sem_state(db, repo_id, &indexed, &units_complete, &scope_complete, &current, err);
         }
         if (st != ATLAS_OK) {
             return st;
         }
-        sem_coverage(cov, indexed, complete, current);
+        sem_coverage(cov, indexed, units_complete, scope_complete, current);
         scope_of(v, arg_a, NULL, scope_out, scope_size);
         if (!indexed) {
             /* Recorded so the reason survives: without it `truth_of` sees only
@@ -415,16 +519,17 @@ atlas_status atlas_verify_run_verifier(atlas_db *db, atlas_verify_verifier v, in
             }
             return ATLAS_OK;
         }
-        bool exists = false, indexed = false, complete = false, current = false;
-        atlas_status st = atlas_db_verify_sem_proven_edge(db, repo_id, arg_a, arg_b, &exists,
-                                                          &indexed, &complete, err);
+        bool exists = false, indexed = false, units_complete = false, scope_complete = false,
+             current = false;
+        atlas_status st = atlas_db_verify_sem_proven_edge(db, repo_id, arg_a, arg_b, &exists, NULL,
+                                                          NULL, err);
         if (st == ATLAS_OK) {
-            st = atlas_db_verify_sem_current(db, repo_id, NULL, NULL, &current, err);
+            st = sem_state(db, repo_id, &indexed, &units_complete, &scope_complete, &current, err);
         }
         if (st != ATLAS_OK) {
             return st;
         }
-        sem_coverage(cov, indexed, complete, current);
+        sem_coverage(cov, indexed, units_complete, scope_complete, current);
         /* This verifier makes no claim about indirect calls, so the dimension
          * is NOT_APPLICABLE rather than UNKNOWN. That distinction matters: a
          * claim must not be blocked by a dimension it does not depend on, and
@@ -466,17 +571,17 @@ atlas_status atlas_verify_run_verifier(atlas_db *db, atlas_verify_verifier v, in
             return ATLAS_OK;
         }
         int64_t callers = 0, address_taken = 0;
-        bool internal = false, defined = false, complete = false, indexed = false, current = false;
-        atlas_status st =
-            atlas_db_verify_sem_callers(db, repo_id, arg_a, &callers, &address_taken, &internal,
-                                        &defined, &complete, &indexed, err);
+        bool internal = false, defined = false, indexed = false, current = false;
+        bool units_complete = false, scope_complete = false;
+        atlas_status st = atlas_db_verify_sem_callers(db, repo_id, arg_a, &callers, &address_taken,
+                                                      &internal, &defined, NULL, NULL, err);
         if (st == ATLAS_OK) {
-            st = atlas_db_verify_sem_current(db, repo_id, NULL, NULL, &current, err);
+            st = sem_state(db, repo_id, &indexed, &units_complete, &scope_complete, &current, err);
         }
         if (st != ATLAS_OK) {
             return st;
         }
-        sem_coverage(cov, indexed, complete, current);
+        sem_coverage(cov, indexed, units_complete, scope_complete, current);
         scope_of(v, arg_a, NULL, scope_out, scope_size);
 
         if (!indexed) {
@@ -517,10 +622,15 @@ atlas_status atlas_verify_run_verifier(atlas_db *db, atlas_verify_verifier v, in
          *
          * The generation must be complete for the count itself to be worth
          * anything: a translation unit that failed to parse could hold the
-         * address-take. That is why this is gated on `complete` rather than
-         * read on its own. */
+         * address-take. That is why this is gated rather than read on its own —
+         * and A9.2.3 gates it on the **scope** completeness, not merely the unit
+         * one: a tracked source the compilation database never named could hold
+         * the address-take just as surely as a unit that failed to parse, and
+         * "zero address-takes over the units we happened to compile" is not the
+         * statement this dimension makes. */
         cov->dims[ATLAS_COVDIM_INDIRECT_CALLS] =
-            (complete && address_taken == 0) ? ATLAS_COVERAGE_COMPLETE : ATLAS_COVERAGE_PARTIAL;
+            (scope_complete && address_taken == 0) ? ATLAS_COVERAGE_COMPLETE
+                                                   : ATLAS_COVERAGE_PARTIAL;
 
         /* EXTERNAL_CALLERS: an internal-linkage symbol cannot be named from
          * outside its own translation unit, so the indexed tree is the whole

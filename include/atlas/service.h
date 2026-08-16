@@ -17,6 +17,7 @@
 #include "atlas/backup.h"
 #include "atlas/code.h"
 #include "atlas/sem.h"
+#include "atlas/sem_schedule.h"
 #include "atlas/datadir.h"
 #include "atlas/db.h"
 #include "atlas/error.h"
@@ -1267,6 +1268,25 @@ typedef struct atlas_sem_status_report {
     size_t failed_count;
     int64_t failed_total;
     bool failed_truncated;
+
+    /* --- A9.2.3 -------------------------------------------------------------
+     *
+     * The derived state, the coverage manifest and the operator's build
+     * description, so `code sem-status` answers "is semantic evidence from this
+     * repository trustworthy, and if not what would fix it" without anybody
+     * opening the database. §24 asks for exactly that.
+     *
+     * The plan carries freshness and coverage as *separate* fields and the
+     * renderers print them as separate lines. A single badge combining them is
+     * the presentation A9.1, A9.2 and A9.2.2 each exist to prevent, and it would
+     * hide the one state this season adds: source-current and coverage
+     * incomplete. */
+    atlas_sem_plan plan;
+    /* Newline-separated, repository-relative, as the operator wrote them.
+     * Owned. Untrusted only in the weak sense that an operator chose them, but
+     * still encoded at the point of output like every other path. */
+    atlas_buf compdbs;
+    atlas_buf test_roots;
 } atlas_sem_status_report;
 
 void atlas_sem_status_report_init(atlas_sem_status_report *r);
@@ -1380,6 +1400,67 @@ atlas_status atlas_sem_index_on(atlas_db *db, const atlas_repo_info *repo,
 atlas_status atlas_service_sem_index_remote(const char *name, const char *const *compdbs,
                                             size_t compdb_count, bool rebuild,
                                             atlas_sem_index_summary *out, atlas_err *err);
+
+/* --- A9.2.3: writing the durable build description --------------------------
+ *
+ * The one operation that decides whether this daemon will run a compiler over a
+ * repository when that repository changes. It is an operator action for exactly
+ * that reason — A8-CI's rule that indexing runs a compiler and is therefore
+ * authorised — and it has no MCP tool and no gateway route.
+ *
+ * `auto_rebuild` is a tri-state: negative leaves the stored value alone,
+ * zero disables, positive enables. That distinction matters because an operator
+ * adjusting a compilation-database list must not silently turn automatic
+ * rebuilding on or off as a side effect of a command about something else.
+ *
+ * `compdbs` and `test_roots` are NULL to leave the stored lists unchanged, and a
+ * zero count with a non-NULL array clears one. Paths are repository-relative;
+ * they are validated inside the root by the indexer, never here, because this
+ * function must not need a repository on disk to record an operator's
+ * intention — a description can legitimately be written before the tree it
+ * describes has been built. */
+atlas_status atlas_service_sem_config_set(atlas_ctx *ctx, const char *name,
+                                          const char *const *compdbs, size_t compdb_count,
+                                          const char *const *test_roots, size_t test_root_count,
+                                          int auto_rebuild, atlas_sem_status_report *out,
+                                          atlas_err *err);
+
+/* One build-description write, in the storage form.
+ *
+ * Here rather than in the daemon's internal header because both the CLI and the
+ * writer thread build one: it is a service request, not a daemon detail, and a
+ * second copy of its shape is how the two paths would start disagreeing about
+ * what "leave this list alone" means. */
+typedef struct atlas_sem_config_job {
+    const char *repo_name;
+    /* NUL-separated lists, or NULL to leave the stored value alone. A non-NULL
+     * pointer with a zero length clears one. */
+    const char *compdbs;
+    size_t compdbs_len;
+    const char *test_roots;
+    size_t test_roots_len;
+    /* Negative leaves the stored value alone, zero disables, positive enables. */
+    int auto_rebuild;
+} atlas_sem_config_job;
+
+/* The raw-handle cores, for the reason `atlas_sem_index_on` and
+ * `atlas_sem_impact_on` exist: the daemon's writer thread has a handle and no
+ * `atlas_ctx`, and one implementation is what makes the two surfaces agree by
+ * construction rather than by being kept in step. */
+atlas_status atlas_sem_config_on(atlas_db *db, const atlas_sem_config_job *job,
+                                 atlas_sem_status_report *out, atlas_err *err);
+atlas_status atlas_sem_status_on(atlas_db *db, const char *name, atlas_sem_status_report *out,
+                                 atlas_err *err);
+
+/* The daemon-served form. Routed on `atlas_ctx_is_writer` rather than on
+ * `ctx != NULL`: with a daemon running, a context in AUTO mode still opens
+ * read-only, so the weaker test fails with "attempt to write a readonly
+ * database" — the A9.2.1 defect, and it is not repeated. */
+atlas_status atlas_service_sem_config_set_remote(const char *name, const char *const *compdbs,
+                                                 size_t compdb_count,
+                                                 const char *const *test_roots,
+                                                 size_t test_root_count, int auto_rebuild,
+                                                 atlas_sem_status_report *out, atlas_err *err);
 
 /* The daemon-served forms. Same reports, same renderers; only the transport
  * differs, which is what keeps a local answer and a socket answer from drifting

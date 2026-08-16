@@ -227,6 +227,10 @@ const char *atlas_sem_freshness_name(atlas_sem_freshness f);
 
 /* Why a generation is stale. Fixed strings, reported rather than reproduced. */
 #define ATLAS_SEM_STALE_COMMIT "the_repository_moved_since_this_index_was_built"
+/* A9.2.3. Atlas indexes the working tree, so this is the reason that fires for
+ * an edit nobody has committed — which every A8-CI check missed, because all
+ * four of them compare something that moves with a commit. */
+#define ATLAS_SEM_STALE_SOURCE "the_working_tree_changed_since_this_index_was_built"
 #define ATLAS_SEM_STALE_COMPDB "a_compilation_database_changed_since_this_index_was_built"
 #define ATLAS_SEM_STALE_COMPILER "the_compiler_changed_since_this_index_was_built"
 #define ATLAS_SEM_STALE_ANALYZER "atlas_semantic_analyzer_changed_since_this_index_was_built"
@@ -307,6 +311,11 @@ typedef struct atlas_sem_generation {
     int64_t tu_test;
     int64_t tu_production;
     bool test_scope_known;
+    /* A9.2.3. What this generation was built from, in one value: the content of
+     * every source and header the file index holds, plus the build description
+     * and the toolchain. Empty on a pre-A9.2.3 generation, and an empty stored
+     * identity never makes one stale. */
+    char source_identity[65];
 } atlas_sem_generation;
 
 void atlas_sem_generation_init(atlas_sem_generation *g);
@@ -615,14 +624,53 @@ atlas_status atlas_sem_live_compdb_digest(int root_fd, const char *compdbs, size
 atlas_status atlas_sem_repo_compdb_digest(atlas_db *db, atlas_repo_info *repo, char out[65],
                                           atlas_err *err);
 
+/* A9.2.3: everything that determines what a semantic generation would contain,
+ * in one comparable value.
+ *
+ * Domain-separated and length-prefixed, for A4's reason. It covers, in path
+ * order: every live C source and header the file index holds, by path and
+ * content hash; the live compilation-database digest; the compiler version; and
+ * the analyzer id and version. A generation whose stored identity differs from
+ * this one would be built differently, and one whose identity matches would not.
+ *
+ * The **content hashes** are what make this the working-tree answer rather than
+ * a commit answer: Atlas indexes the tree it can see, and an uncommitted edit
+ * changes a hash while every commit-derived value stands still.
+ *
+ * A file the index cannot vouch for — no content hash — contributes a fixed
+ * marker rather than being skipped. Skipping it would make a file whose hash
+ * Atlas lost compare equal to one that was never there. */
+atlas_status atlas_sem_source_identity(atlas_db *db, atlas_repo_info *repo, char out[65],
+                                       atlas_err *err);
+
 /* Freshness of the published generation, recomputed from live facts.
  *
  * Never cached — A6's rule. `reason_out` is one of the ATLAS_SEM_STALE_*
  * strings, or NULL when the generation is current. */
 atlas_sem_freshness atlas_sem_freshness_of(const atlas_sem_generation *g, bool have_generation,
                                            bool running, const char *live_commit,
-                                           const char *live_compdb_digest, bool file_index_current,
-                                           const char **reason_out);
+                                           const char *live_compdb_digest,
+                                           const char *live_source_identity,
+                                           bool file_index_current, const char **reason_out);
+
+/* The same question, with every live fact gathered from the database rather than
+ * supplied by the caller.
+ *
+ * **One implementation per answer**, which is the rule `atlas_sem_impact_on` and
+ * `atlas_sem_context_on` follow. Before A9.2.3 four call sites each assembled
+ * their own arguments to `atlas_sem_freshness_of`, and they disagreed: the CLI
+ * and the daemon passed NULL for the compilation-database digest, and the
+ * context builder passed NULL for it *and* hard-coded `file_index_current` to
+ * true — so a context package could report a stale index as current, which is
+ * exactly the statement a model must never be handed. Parity between the
+ * surfaces is structural here rather than four call sites somebody keeps in
+ * step.
+ *
+ * `running` is passed in because it is the caller's own observation of whether a
+ * generation is being built, which a read of the current generation cannot see. */
+atlas_sem_freshness atlas_sem_freshness_now(atlas_db *db, atlas_repo_info *repo,
+                                            const atlas_sem_generation *g, bool have_generation,
+                                            bool running, const char **reason_out);
 
 /* --- bounded queries ---------------------------------------------------------
  *

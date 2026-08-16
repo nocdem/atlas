@@ -12,6 +12,7 @@
 #include <string.h>
 
 #include "atlas/atlas.h"
+#include "atlas/sha256.h"
 #include "db_internal.h"
 
 /* --- small helpers ---------------------------------------------------------- */
@@ -245,6 +246,7 @@ static void read_generation(sqlite3_stmt *stmt, atlas_sem_generation *out) {
     out->tu_test = sqlite3_column_int64(stmt, 27);
     out->tu_production = sqlite3_column_int64(stmt, 28);
     out->test_scope_known = sqlite3_column_int64(stmt, 29) != 0;
+    copy_field(out->source_identity, sizeof(out->source_identity), col_text(stmt, 30));
 }
 
 #define GEN_COLUMNS                                                                             \
@@ -253,7 +255,8 @@ static void read_generation(sqlite3_stmt *stmt, atlas_sem_generation *out) {
     " g.started_at, g.completed_at, g.tu_total, g.tu_complete, g.tu_partial, g.tu_failed,"      \
     " g.tu_unsupported, g.symbol_count, g.edge_count, g.include_count, g.duration_ms,"          \
     " g.failure_reason, g.scope_discovery, g.scope_candidates, g.scope_covered,"                \
-    " g.scope_uncovered, g.tu_test, g.tu_production, g.test_scope_known"
+    " g.scope_uncovered, g.tu_test, g.tu_production, g.test_scope_known,"                \
+    " g.source_identity"
 
 atlas_status atlas_db_sem_current(atlas_db *db, int64_t repo_id, atlas_sem_generation *out,
                                   bool *found, atlas_err *err) {
@@ -1745,6 +1748,85 @@ atlas_status atlas_db_sem_scope_set(atlas_db *db, int64_t generation_id,
         return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the coverage manifest");
     }
     st = bind_text(db, stmt, 2, atlas_sem_scope_discovery_name(m->scope_discovery), err);
+    if (st != ATLAS_OK) {
+        atlas_db_finish(db, stmt);
+        return st;
+    }
+    return atlas_db_step_done(db, stmt, err);
+}
+
+atlas_status atlas_db_sem_source_content_digest(atlas_db *db, int64_t repo_id, char out[65],
+                                                atlas_err *err) {
+    out[0] = '\0';
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(db,
+                                       "SELECT path_text, content_hash FROM files"
+                                       " WHERE repo_id = ?1 AND deleted = 0"
+                                       "   AND file_type = 'regular'"
+                                       "   AND language IN ('c','c-header')"
+                                       " ORDER BY path_text;",
+                                       &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, repo_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind repository id");
+    }
+    atlas_sha256 h;
+    atlas_sha256_init(&h);
+    static const char DOMAIN[] = "atlas.sem.source-content.v1";
+    unsigned char len[8];
+    /* Length-prefixed, for A4's reason: with any single-byte delimiter, two
+     * different (path, hash) lists could encode identically, and this value
+     * decides whether a repository is rebuilt. */
+    const char *first = DOMAIN;
+    for (int i = 0; i < 8; i++) {
+        len[i] = (unsigned char)((strlen(first) >> (8 * (7 - i))) & 0xffu);
+    }
+    atlas_sha256_update(&h, len, sizeof len);
+    atlas_sha256_update(&h, first, strlen(first));
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *path = col_text(stmt, 0);
+        const char *hash = col_text(stmt, 1);
+        /* A file whose content hash the index does not hold contributes a fixed
+         * marker, not nothing. Skipping it would make a file Atlas could not
+         * read compare equal to one that was never there — and the second is a
+         * repository that has not changed, while the first is one Atlas cannot
+         * currently describe. */
+        const char *parts[2] = {path, hash[0] != '\0' ? hash : "\x01unknown-content"};
+        for (int p = 0; p < 2; p++) {
+            size_t n = strlen(parts[p]);
+            for (int i = 0; i < 8; i++) {
+                len[i] = (unsigned char)((n >> (8 * (7 - i))) & 0xffu);
+            }
+            atlas_sha256_update(&h, len, sizeof len);
+            atlas_sha256_update(&h, parts[p], n);
+        }
+    }
+    atlas_db_finish(db, stmt);
+
+    unsigned char digest[ATLAS_SHA256_DIGEST_LEN];
+    atlas_sha256_final(&h, digest);
+    atlas_hex_encode(digest, sizeof digest, out);
+    out[ATLAS_SHA256_HEX_LEN] = '\0';
+    return ATLAS_OK;
+}
+
+atlas_status atlas_db_sem_source_identity_set(atlas_db *db, int64_t generation_id,
+                                              const char *identity, atlas_err *err) {
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(
+        db, "UPDATE sem_generations SET source_identity = ?2 WHERE id = ?1;", &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, generation_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind generation id");
+    }
+    st = bind_text(db, stmt, 2, identity, err);
     if (st != ATLAS_OK) {
         atlas_db_finish(db, stmt);
         return st;

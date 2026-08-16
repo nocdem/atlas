@@ -318,6 +318,7 @@ static void wind_back_to_schema_12(env *e, atlas_err *err) {
         "ALTER TABLE sem_generations DROP COLUMN tu_test;"
         "ALTER TABLE sem_generations DROP COLUMN tu_production;"
         "ALTER TABLE sem_generations DROP COLUMN test_scope_known;"
+        "ALTER TABLE sem_generations DROP COLUMN source_identity;"
         "DELETE FROM schema_migrations WHERE version >= 13;";
 
     T_OK(atlas_db_exec_sql(e->db, BACK_DOCUMENTS, err), err);

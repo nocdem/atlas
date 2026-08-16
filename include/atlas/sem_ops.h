@@ -144,6 +144,22 @@ atlas_status atlas_db_sem_scope_test_split(atlas_db *db, int64_t generation_id,
                                            int64_t *production_out, bool *known_out,
                                            atlas_err *err);
 
+/* A digest of every live C source and header this repository holds, by path and
+ * content hash, in path order — domain-separated and length-prefixed.
+ *
+ * The working-tree half of `atlas_sem_source_identity`, and it lives here
+ * because sqlite3 types do not leave `src/db`. A file whose content hash the
+ * index does not hold contributes a fixed marker rather than being skipped:
+ * skipping it would make a file Atlas could not read compare equal to one that
+ * was never there, and those are different states. */
+atlas_status atlas_db_sem_source_content_digest(atlas_db *db, int64_t repo_id, char out[65],
+                                                atlas_err *err);
+
+/* Records the source identity a generation was built from, inside the
+ * publishing transaction with the rest of the manifest. */
+atlas_status atlas_db_sem_source_identity_set(atlas_db *db, int64_t generation_id,
+                                              const char *identity, atlas_err *err);
+
 /* Writes the manifest into the generation row. Called inside the publishing
  * transaction, so the manifest and the generation become visible together: a
  * reader must never see a published generation whose coverage is still zero and

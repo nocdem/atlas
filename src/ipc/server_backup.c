@@ -451,8 +451,8 @@ static atlas_status method_code_index(dispatch_state *ds, const atlas_ipc_reques
         st = atlas_ops_begin_sem_index(ds->ctx->ops, info.id, &op_id, err);
     }
     if (st == ATLAS_OK) {
-        st = atlas_writer_submit_sem_index(ds->ctx->writer, name, (const char *)list.data,
-                                           list.len, rebuild, op_id, err);
+        st = atlas_writer_submit_sem_index(ds->ctx->writer, info.id, name,
+                                           (const char *)list.data, list.len, rebuild, op_id, err);
         if (st != ATLAS_OK) {
             /* The record exists and nothing will ever run for it, so it is
              * closed here rather than left RUNNING for ever. */
@@ -471,6 +471,85 @@ static atlas_status method_code_index(dispatch_state *ds, const atlas_ipc_reques
     }
     atlas_buf_free(&list);
     atlas_repo_info_free(&info);
+    return st;
+}
+
+/* code.sem_config — write a repository's durable semantic build description.
+ *
+ * In the operator-uid table beside `code.index`, and it is the same security
+ * decision made for a stronger reason. `code.index` runs a compiler once, when
+ * an operator asks. This method decides whether the daemon runs one **every
+ * time the repository changes**, so a principal that could reach it could turn
+ * an ordinary repository edit into a compiler invocation — which is precisely
+ * the capability A8-CI's rule reserves to an operator. Every other peer,
+ * including `atlas-worker` and every MCP client, is told the method does not
+ * exist.
+ *
+ * There is deliberately no MCP tool and no gateway route. A9's rule is that a
+ * mutating route needs a write scope no credential can hold, and this one moves
+ * more than data: it changes what the machine does on its own. */
+static atlas_status method_code_sem_config(dispatch_state *ds, const atlas_ipc_request *req,
+                                           atlas_err *err) {
+    const char *name = NULL;
+    if (!atlas_ipc_param_str(req, "repo", &name) || name == NULL || name[0] == '\0') {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "code.sem_config needs a \"repo\"");
+    }
+
+    /* An absent array leaves the stored list alone; a present but empty one
+     * clears it. Those are different intentions and the protocol keeps them
+     * apart, because an operator turning automatic rebuild on must not silently
+     * discard the compilation databases they configured last week. */
+    atlas_buf compdbs = ATLAS_BUF_INIT;
+    atlas_buf test_roots = ATLAS_BUF_INIT;
+    bool have_compdbs = false;
+    bool have_roots = false;
+    atlas_status st = ATLAS_OK;
+    static const char *const KEYS[2] = {"compdbs", "test_roots"};
+    atlas_buf *const BUFS[2] = {&compdbs, &test_roots};
+    bool *const FLAGS[2] = {&have_compdbs, &have_roots};
+    for (size_t k = 0; k < 2 && st == ATLAS_OK; k++) {
+        const atlas_ipc_array *arr = NULL;
+        if (!atlas_ipc_param_array(req, KEYS[k], &arr)) {
+            continue;
+        }
+        *FLAGS[k] = true;
+        size_t count = atlas_ipc_array_len(arr);
+        for (size_t i = 0; i < count && st == ATLAS_OK; i++) {
+            const char *one = NULL;
+            if (atlas_ipc_array_str(arr, i, &one) && one != NULL && one[0] != '\0') {
+                st = atlas_buf_append(BUFS[k], one, strlen(one) + 1u, err);
+            }
+        }
+    }
+
+    /* Tri-state, sent as two independent booleans rather than one: a request
+     * that says nothing about automatic rebuild must leave it as it was. */
+    int auto_rebuild = -1;
+    bool flag = false;
+    if (atlas_ipc_param_bool(req, "auto_rebuild", &flag)) {
+        auto_rebuild = flag ? 1 : 0;
+    }
+
+    atlas_sem_status_report rep;
+    atlas_sem_status_report_init(&rep);
+    if (st == ATLAS_OK) {
+        atlas_sem_config_job job;
+        memset(&job, 0, sizeof job);
+        job.repo_name = name;
+        job.compdbs = have_compdbs ? (const char *)(compdbs.data != NULL ? compdbs.data : "") : NULL;
+        job.compdbs_len = have_compdbs ? compdbs.len : 0;
+        job.test_roots =
+            have_roots ? (const char *)(test_roots.data != NULL ? test_roots.data : "") : NULL;
+        job.test_roots_len = have_roots ? test_roots.len : 0;
+        job.auto_rebuild = auto_rebuild;
+        st = atlas_writer_sem_config(ds->ctx->writer, &job, &rep, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_server_write_sem_config(ds, &rep, err);
+    }
+    atlas_sem_status_report_free(&rep);
+    atlas_buf_free(&compdbs);
+    atlas_buf_free(&test_roots);
     return st;
 }
 
@@ -627,6 +706,7 @@ static const atlas_method_entry BACKUP_METHODS[] = {
     {"backup.create", method_backup_create},
     {"operation.get", method_operation_get},
     {"code.index", method_code_index},
+    {"code.sem_config", method_code_sem_config},
     {"maintenance.plan", method_maintenance_plan},
     {"maintenance.prune", method_maintenance_prune},
     {"backup.verify", method_backup_verify},

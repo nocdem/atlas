@@ -284,6 +284,7 @@ const char *atlas_sem_stale_reason_intern(const char *reason) {
     static const char *const REASONS[] = {
         ATLAS_SEM_STALE_COMMIT,     ATLAS_SEM_STALE_COMPDB,     ATLAS_SEM_STALE_COMPILER,
         ATLAS_SEM_STALE_ANALYZER,   ATLAS_SEM_STALE_FILE_INDEX, ATLAS_SEM_STALE_INCOMPLETE,
+        ATLAS_SEM_STALE_SOURCE,
     };
     if (reason == NULL) {
         return NULL;

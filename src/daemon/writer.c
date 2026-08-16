@@ -24,6 +24,7 @@
 #include "atlas/maintenance.h"
 #include "atlas/ops.h"
 #include "atlas/sem.h"
+#include "atlas/sem_ops.h"
 #include "atlas/service.h"
 #include "daemon/daemon_internal.h"
 
@@ -50,6 +51,13 @@ struct atlas_writer {
     int64_t next_sync_seq;
     int64_t passes;
     bool watch_dirty;
+    /* A9.2.3. The repository whose semantic index this thread is building right
+     * now, or 0. Guarded by `lock` and set around the whole job rather than
+     * around the generation, because the window that matters is the one before
+     * a generation exists: a job dequeued but not yet started is invisible in
+     * the durable record, and a scheduler that only looked there would queue a
+     * second build of the same repository. */
+    int64_t sem_index_running_repo;
 
     atlas_workers *workers;
     FILE *log;
@@ -479,6 +487,12 @@ static void mark_all_repos_gapped(atlas_db *db, const char *detail) {
  * failure at any point leaves the old generation current and a RUNNING one that
  * nothing points at. That is also what makes a crash mid-index survivable. */
 static void run_sem_index(atlas_writer *w, atlas_job *j) {
+    /* Claimed for the whole job, so `atlas_writer_sem_index_pending` covers the
+     * window before a generation row exists as well as the one after. */
+    (void)pthread_mutex_lock(&w->lock);
+    w->sem_index_running_repo = j->repo_id;
+    (void)pthread_mutex_unlock(&w->lock);
+
     atlas_err err;
     atlas_err_init(&err);
     atlas_sem_index_summary sum;
@@ -507,8 +521,44 @@ static void run_sem_index(atlas_writer *w, atlas_job *j) {
             p += strlen(p) + 1u;
         }
     }
+    /* A9.2.3. The identity the attempt is made *at*, measured before the pass
+     * rather than after it.
+     *
+     * The retry governor asks "have the inputs changed since the attempt that
+     * failed?", so what it must record is the state the failing attempt saw. If
+     * the tree moves during a failed build, recording the later identity would
+     * block a retry that has every reason to succeed — the inputs did change,
+     * just not in time for that attempt. Recording the earlier one means the
+     * next sweep sees a moved identity and tries again, which is correct. */
+    char attempt_identity[65];
+    attempt_identity[0] = '\0';
+    if (st == ATLAS_OK && j->op_id == 0) {
+        atlas_err ignored;
+        atlas_err_init(&ignored);
+        (void)atlas_sem_source_identity(w->db, &repo, attempt_identity, &ignored);
+    }
+
     if (st == ATLAS_OK) {
         st = atlas_sem_index_on(w->db, &repo, compdbs, n, j->sem_rebuild, &sum, &err);
+    }
+
+    /* Only an *automatic* attempt feeds the governor, and `op_id == 0` is how
+     * this thread knows: an operation id exists when a client asked and is
+     * polling, and a client asking is a different principal making a different
+     * decision. An operator running `code index` against a repository that
+     * cannot build should get the failure reported to them every time rather
+     * than be told the governor is holding — and their attempt must not be able
+     * to clear a governor record either, which is why success only clears it on
+     * this path. */
+    if (j->op_id == 0) {
+        atlas_err rerr;
+        atlas_err_init(&rerr);
+        /* The reason stored is a fixed Atlas string, never the error text: an
+         * error message can quote a path or a compiler diagnostic, and this
+         * column is read back by an operator and by a model. */
+        (void)atlas_db_sem_config_record_attempt(w->db, repo.id, attempt_identity, st == ATLAS_OK,
+                                                 st == ATLAS_OK ? "" : ATLAS_SEM_WHY_CHILD_FAILED,
+                                                 &rerr);
     }
 
     atlas_buf detail = ATLAS_BUF_INIT;
@@ -531,6 +581,14 @@ static void run_sem_index(atlas_writer *w, atlas_job *j) {
                      atlas_buf_cstr(&detail));
     atlas_buf_free(&detail);
     atlas_repo_info_free(&repo);
+
+    /* Released on every path, including the failing ones. A claim left behind
+     * would make the scheduler hold for ever on a repository whose build
+     * failed — which is the same defect as a flag that never clears, one layer
+     * down, and it must not be reintroduced here. */
+    (void)pthread_mutex_lock(&w->lock);
+    w->sem_index_running_repo = 0;
+    (void)pthread_mutex_unlock(&w->lock);
 }
 
 
@@ -626,6 +684,13 @@ static void *writer_main(void *arg) {
              * result has nowhere to go. */
             if (j->maint != NULL && j->maint_out != NULL) {
                 j->result = atlas_maintenance_on(w->db, j->maint, j->maint_out, &j->result_err);
+            }
+            break;
+        }
+        case ATLAS_JOB_SEM_CONFIG: {
+            if (j->sem_config != NULL && j->sem_config_out != NULL) {
+                j->result = atlas_sem_config_on(w->db, j->sem_config, j->sem_config_out,
+                                                &j->result_err);
             }
             break;
         }
@@ -1503,18 +1568,50 @@ atlas_status atlas_writer_snapshot(atlas_writer *w, int64_t attempt_id, int time
     return st;
 }
 
+/* True when a semantic index for this repository is queued or running.
+ *
+ * The durable record cannot answer this on its own: a job that has been queued,
+ * or dequeued and not yet reached the point of opening a generation, leaves no
+ * RUNNING row — so a scheduler consulting only the index would queue a second
+ * build of the same repository. A flag on the scheduler's own side cannot answer
+ * it either, because nothing tells the scheduler when a job finished; the
+ * daemon's first cut kept one, fed it back into the plan it used to clear it,
+ * and so never cleared it at all: the repository reported DIRTY for ever and
+ * rebuilt exactly once.
+ *
+ * The writer knows, because the writer owns the queue and runs the job. */
+bool atlas_writer_sem_index_pending(atlas_writer *w, int64_t repo_id) {
+    if (w == NULL || repo_id <= 0) {
+        return false;
+    }
+    bool pending = false;
+    (void)pthread_mutex_lock(&w->lock);
+    if (w->sem_index_running_repo == repo_id) {
+        pending = true;
+    }
+    for (size_t k = 0; !pending && k < w->count; k++) {
+        const atlas_job *q = w->queue[(w->head + k) % ATLAS_WRITER_QUEUE_MAX];
+        if (q->kind == ATLAS_JOB_SEM_INDEX && q->repo_id == repo_id) {
+            pending = true;
+        }
+    }
+    (void)pthread_mutex_unlock(&w->lock);
+    return pending;
+}
+
 /* Queues a semantic index and returns immediately.
  *
  * `wants_result` is deliberately false: the caller has already been given an
  * operation id and will poll. Blocking here would put the old timeout back, one
  * layer down. */
-atlas_status atlas_writer_submit_sem_index(atlas_writer *w, const char *name, const char *compdbs,
-                                           size_t compdbs_len, bool rebuild, int64_t op_id,
-                                           atlas_err *err) {
+atlas_status atlas_writer_submit_sem_index(atlas_writer *w, int64_t repo_id, const char *name,
+                                           const char *compdbs, size_t compdbs_len, bool rebuild,
+                                           int64_t op_id, atlas_err *err) {
     atlas_job *j = job_new(ATLAS_JOB_SEM_INDEX);
     if (j == NULL) {
         return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory queueing a semantic index");
     }
+    j->repo_id = repo_id;
     j->op_id = op_id;
     j->sem_rebuild = rebuild;
     atlas_status st = atlas_buf_set_str(&j->arg1, name, err);
@@ -1542,6 +1639,67 @@ void atlas_writer_set_ops(atlas_writer *w, atlas_ops *ops) {
     /* Set once, after both exist and before the serve loop starts, so no job
      * that reports through the table can be queued while it is missing. */
     w->ops = ops;
+}
+
+/* A9.2.3. The synchronous shape a prune uses, for the reason a prune uses it:
+ * this is a single-row upsert followed by a bounded read, so there is nothing
+ * here that can outlast a client and making it poll would add a mechanism to an
+ * operation that does not need one. It is on the writer thread because it
+ * writes, and exactly one thread in this daemon writes. */
+atlas_status atlas_writer_sem_config(atlas_writer *w, const atlas_sem_config_job *job,
+                                     atlas_sem_status_report *out, atlas_err *err) {
+    atlas_job *j = job_new(ATLAS_JOB_SEM_CONFIG);
+    if (j == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                             "out of memory queueing a semantic build description");
+    }
+    j->sem_config = job;
+    j->sem_config_out = out;
+    j->wants_result = true;
+
+    (void)pthread_mutex_lock(&w->lock);
+    if (w->stopping || !queue_push(w, j)) {
+        bool stopping = w->stopping;
+        (void)pthread_mutex_unlock(&w->lock);
+        job_free(j);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                             stopping ? "the Atlas daemon is shutting down"
+                                      : "the Atlas daemon's write queue is full");
+    }
+    (void)pthread_cond_signal(&w->not_empty);
+
+    struct timespec deadline;
+    (void)clock_gettime(CLOCK_REALTIME, &deadline);
+    /* Generous rather than tight: the work itself is milliseconds, but the
+     * writer may be behind a semantic index that takes minutes, and a client
+     * that gave up would report a failure for a write that then succeeds. */
+    deadline.tv_sec += 300;
+    int rc = 0;
+    while (!j->done && rc == 0) {
+        rc = pthread_cond_timedwait(&w->job_done, &w->lock, &deadline);
+    }
+    bool done = j->done;
+    atlas_status st = j->result;
+    atlas_err jerr = j->result_err;
+    if (!done) {
+        /* Detached rather than freed: the job is still the writer's, and the
+         * report it was given belongs to the caller, so the writer must not
+         * touch it after this. */
+        j->wants_result = false;
+        j->sem_config = NULL;
+        j->sem_config_out = NULL;
+    }
+    (void)pthread_mutex_unlock(&w->lock);
+
+    if (!done) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                             "the Atlas daemon did not record the semantic build description "
+                             "within 300 s");
+    }
+    if (st != ATLAS_OK) {
+        *err = jerr;
+    }
+    return st;
 }
 
 atlas_status atlas_writer_maintenance(atlas_writer *w, const atlas_maintenance_opts *opts,

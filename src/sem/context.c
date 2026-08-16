@@ -493,8 +493,8 @@ atlas_status atlas_sem_impact_on(atlas_db *db, const atlas_repo_info *repo, cons
                              "no semantic index exists for this repository; an operator builds "
                              "one with `atlas code index`");
     }
-    out->freshness = atlas_sem_freshness_of(&out->generation, true, false,
-                                            out->repo.scanned_head, NULL, true, &out->stale_reason);
+    out->freshness = atlas_sem_freshness_now(db, &out->repo, &out->generation, true, false,
+                                             &out->stale_reason);
     (void)snprintf(out->query, sizeof out->query, "%s", subject);
 
     item_list list = {&out->items, &out->count, &out->cap};
@@ -809,9 +809,8 @@ atlas_status atlas_sem_context_on(atlas_db *db, const atlas_repo_info *repo,
         note_missing(out, ATLAS_SEM_MISSING_INDEX);
         out->freshness = ATLAS_SEM_FRESH_ABSENT;
     } else {
-        out->freshness = atlas_sem_freshness_of(&out->generation, true, false,
-                                                out->repo.scanned_head, NULL, true,
-                                                &out->stale_reason);
+        out->freshness = atlas_sem_freshness_now(db, &out->repo, &out->generation, true,
+                                                 false, &out->stale_reason);
         if (out->freshness == ATLAS_SEM_FRESH_STALE) {
             note_missing(out, ATLAS_SEM_MISSING_STALE);
         }

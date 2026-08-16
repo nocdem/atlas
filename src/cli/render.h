@@ -106,6 +106,12 @@ typedef struct atlas_renderer_vtbl {
      * was meant would be exactly the conflation the season forbids. */
     atlas_status (*sem_status)(atlas_renderer *r, const atlas_sem_status_report *rep,
                                atlas_err *err);
+    /* A9.2.3. The build description and the derived state, over the same report
+     * `sem_status` renders — one report, two views: `sem-status` leads with the
+     * generation, `sem-config` leads with what an operator configured and what
+     * the daemon will do about it. */
+    atlas_status (*sem_config)(atlas_renderer *r, const atlas_sem_status_report *rep,
+                               atlas_err *err);
     atlas_status (*sem_symbols)(atlas_renderer *r, const atlas_sem_symbols_report *rep,
                                 atlas_err *err);
     atlas_status (*sem_graph)(atlas_renderer *r, const atlas_sem_graph_report *rep,

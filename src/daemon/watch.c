@@ -43,6 +43,9 @@
 #include "atlas/atlas.h"
 #include "atlas/git.h"
 #include "atlas/safetext.h"
+#include "atlas/sem.h"
+#include "atlas/sem_ops.h"
+#include "atlas/sem_schedule.h"
 #include "daemon/daemon_internal.h"
 
 /* The events Atlas cares about.
@@ -227,6 +230,8 @@ struct atlas_watcher {
     /* A8: whether this daemon sweeps expired leases. */
     bool orch_enabled;
     int64_t last_recover_ms;
+    /* A9.2.3. When the semantic freshness sweep last ran. */
+    int64_t last_sem_sweep_ms;
 
     pthread_mutex_t stat_lock;
     int64_t watch_count; /* guarded by stat_lock */
@@ -925,6 +930,144 @@ static void recover_due(atlas_watcher *w) {
     atlas_orch_result_free(&r);
 }
 
+/* A9.2.3: the daemon's semantic freshness sweep.
+ *
+ * This is the whole of "the daemon owns semantic freshness", and it is
+ * deliberately small, because everything that could have been state here is
+ * derived instead. There is no dirty bit, no queue of pending source states and
+ * no debounce of its own: on each tick it asks `atlas_sem_plan_for` what the
+ * situation is, and queues a build if the answer is that one is due.
+ *
+ * **Coalescing falls out of that rather than being implemented.** A build is
+ * always a build of the tree as it is when the build starts, so six saves during
+ * one build produce one further build and not six, and no save is lost — if the
+ * tree has moved again by the time the build publishes, the next tick sees STALE
+ * and builds again. The system converges on the newest state without ever
+ * building an intermediate one, which is what §34 asks for, and it does so
+ * because it has no memory of intermediate states to build from.
+ *
+ * **Backpressure is the writer queue's, unchanged.** The job goes through
+ * `atlas_writer_submit_sem_index` — the same entry point `code.index` uses — so
+ * a semantic rebuild is serialized against every other write exactly as a manual
+ * one is, and a full queue means the repository stays dirty and the next tick
+ * tries again. One repository failing to build never blocks another from being
+ * considered, because the sweep asks about each independently and the answer for
+ * a failing one is a hold rather than a retry.
+ *
+ * This runs on the watcher's thread because the watcher is the daemon's timer,
+ * which is the argument A8's recovery sweep already makes. It holds a read-only
+ * handle, so it cannot write and does not need to. */
+static void sem_sweep(atlas_watcher *w) {
+    int64_t t = now_ms();
+    if (w->last_sem_sweep_ms != 0 && t - w->last_sem_sweep_ms < ATLAS_SEM_SWEEP_INTERVAL_MS) {
+        return;
+    }
+    w->last_sem_sweep_ms = t;
+    if (w->db == NULL || !atlas_sem_available()) {
+        return;
+    }
+
+    int64_t repos[ATLAS_SEM_SWEEP_MAX_REPOS];
+    size_t n = 0;
+    bool truncated = false;
+    atlas_err err;
+    atlas_err_init(&err);
+    if (atlas_db_sem_config_repos(w->db, repos, ATLAS_SEM_SWEEP_MAX_REPOS, &n, &truncated, &err) !=
+        ATLAS_OK) {
+        atlas_daemon_log(w->log, "warn", "the semantic freshness sweep could not read the "
+                                         "configured repositories: %s",
+                         atlas_err_msg(&err));
+        return;
+    }
+    if (truncated) {
+        /* Reported rather than silently applied. A repository dropped from a
+         * sweep is one that never rebuilds, and a bound that trims a result
+         * without saying so is the one thing this layer must not have. */
+        atlas_daemon_log(w->log, "warn",
+                         "more than %d repositories have a semantic build description; this "
+                         "sweep considered %zu of them",
+                         ATLAS_SEM_SWEEP_MAX_REPOS, n);
+    }
+
+    for (size_t i = 0; i < n; i++) {
+        repo_watch *rw = find_repo(w, repos[i]);
+        if (rw == NULL) {
+            /* Configured but not watched: the registry and the build description
+             * disagree, which happens while a repository is being removed. There
+             * is nothing to rebuild and nothing to report. */
+            continue;
+        }
+        atlas_repo_info info;
+        atlas_repo_info_init(&info);
+        bool found = false;
+        atlas_err rerr;
+        atlas_err_init(&rerr);
+        if (atlas_db_repo_get(w->db, atlas_buf_cstr(&rw->name), &info, &found, &rerr) != ATLAS_OK ||
+            !found) {
+            atlas_repo_info_free(&info);
+            continue;
+        }
+
+        /* Asked of the writer, which owns the queue and runs the job.
+         *
+         * The daemon's first cut kept a flag here instead and fed it into the
+         * plan it then used to decide whether to clear it — so the plan always
+         * said BUILDING, the flag never cleared, and the repository reported
+         * DIRTY for ever having rebuilt exactly once. A scheduler must not
+         * derive its own liveness from a value it supplied. */
+        const bool in_flight = atlas_writer_sem_index_pending(w->writer, rw->repo_id);
+
+        atlas_sem_plan plan;
+        atlas_sem_plan_init(&plan);
+        atlas_err perr;
+        atlas_err_init(&perr);
+        atlas_status pst = atlas_sem_plan_for(w->db, &info, in_flight, &plan, &perr);
+        atlas_repo_info_free(&info);
+        if (pst != ATLAS_OK) {
+            atlas_daemon_log(w->log, "warn", "cannot plan a semantic rebuild: %s",
+                             atlas_err_msg(&perr));
+            continue;
+        }
+        if (!plan.should_build) {
+            continue;
+        }
+
+        atlas_sem_config cfg;
+        atlas_sem_config_init(&cfg);
+        atlas_buf list = ATLAS_BUF_INIT;
+        atlas_err cerr;
+        atlas_err_init(&cerr);
+        atlas_status cst = atlas_db_sem_config_get(w->db, rw->repo_id, &cfg, &cerr);
+        if (cst == ATLAS_OK) {
+            cst = atlas_sem_config_unpack(atlas_buf_cstr(&cfg.compdbs), &list, NULL, &cerr);
+        }
+        atlas_sem_config_free(&cfg);
+        if (cst != ATLAS_OK || list.len == 0) {
+            atlas_buf_free(&list);
+            continue;
+        }
+
+        atlas_err serr;
+        atlas_err_init(&serr);
+        /* `op_id` is zero: nobody is polling for this. The operations table
+         * exists so a *client* that asked for an index can find out how it went,
+         * and no client asked for this one. What it produced is the generation
+         * record, which is durable and is what an operator reads. */
+        if (atlas_writer_submit_sem_index(w->writer, rw->repo_id, atlas_buf_cstr(&rw->name),
+                                          (const char *)list.data, list.len, false, 0,
+                                          &serr) == ATLAS_OK) {
+            atlas_daemon_log(w->log, "info",
+                             "semantic index scheduled for repository %lld: %s",
+                             (long long)rw->repo_id,
+                             plan.stale_reason != NULL ? plan.stale_reason
+                                                       : atlas_sem_activity_name(plan.activity));
+        }
+        /* On failure the repository simply stays dirty and the next sweep tries
+         * again — the same backpressure `submit_due` uses, and nothing is lost. */
+        atlas_buf_free(&list);
+    }
+}
+
 static void submit_due(atlas_watcher *w) {
     int64_t t = now_ms();
     expire_moves(w, t);
@@ -1074,6 +1217,10 @@ static void *watcher_main(void *arg) {
         }
         submit_due(w);
         recover_due(w);
+        /* After `submit_due`, deliberately: the semantic sweep holds while the
+         * file index is behind, so asking it before the reconciliation pass has
+         * even been queued would only ever produce that hold. */
+        sem_sweep(w);
         (void)pthread_mutex_lock(&w->stat_lock);
         w->watch_count = (int64_t)w->map.count;
         (void)pthread_mutex_unlock(&w->stat_lock);

@@ -132,8 +132,17 @@ typedef enum atlas_job_kind {
      * creating a process or reading a file inside a write transaction, and
      * intake does neither. Every reference it validates is checked against the
      * index rather than by asking git, for exactly that reason. */
-    ATLAS_JOB_VERIFY
+    ATLAS_JOB_VERIFY,
+    /* A9.2.3: writing a repository's durable semantic build description.
+     *
+     * A single-row upsert, so it takes the synchronous shape `ATLAS_JOB_MAINTENANCE`
+     * uses rather than the operations-table shape an index needs: the caller
+     * waits, because there is nothing here that can outlast a client. It is on
+     * the writer thread for the ordinary reason — it writes, and exactly one
+     * thread in this daemon writes. */
+    ATLAS_JOB_SEM_CONFIG
 } atlas_job_kind;
+
 
 /* One credential operation, as the writer thread receives it. */
 typedef enum atlas_apikey_job_kind {
@@ -213,6 +222,11 @@ struct atlas_job {
     /* A9. The credential operation, and where the writer puts the result. Both
      * belong to a caller that waits, like the maintenance pair above. */
     const atlas_apikey_job *apikey;
+
+    /* A9.2.3. The build-description write and where the writer puts the state
+     * it produced. Both belong to a caller that waits. */
+    const atlas_sem_config_job *sem_config;
+    atlas_sem_status_report *sem_config_out;
     atlas_apikey_job_result *apikey_out;
 
     /* A2. The job owns the operation and frees it. The result is typed for the
@@ -292,12 +306,25 @@ atlas_status atlas_writer_gw_audit(atlas_writer *w, const atlas_gw_audit_entry *
 atlas_status atlas_writer_apikey(atlas_writer *w, const atlas_apikey_job *op,
                                  atlas_apikey_job_result *out, atlas_err *err);
 
+/* A9.2.3. Queues a build-description write and waits for it, like a prune. */
+atlas_status atlas_writer_sem_config(atlas_writer *w, const atlas_sem_config_job *job,
+                                     atlas_sem_status_report *out, atlas_err *err);
+
 atlas_status atlas_writer_maintenance(atlas_writer *w, const atlas_maintenance_opts *opts,
                                       atlas_maintenance_report *out, atlas_err *err);
 
-atlas_status atlas_writer_submit_sem_index(atlas_writer *w, const char *name, const char *compdbs,
-                                           size_t compdbs_len, bool rebuild, int64_t op_id,
-                                           atlas_err *err);
+atlas_status atlas_writer_submit_sem_index(atlas_writer *w, int64_t repo_id, const char *name,
+                                           const char *compdbs, size_t compdbs_len, bool rebuild,
+                                           int64_t op_id, atlas_err *err);
+
+/* A9.2.3. Whether a semantic index for this repository is queued or running.
+ *
+ * The scheduler's one guard against queueing a second build. The durable record
+ * cannot answer it — a job dequeued but not yet at the point of opening a
+ * generation leaves no RUNNING row — and a flag on the scheduler's side cannot
+ * either, because nothing tells the scheduler when a job finished. The writer
+ * owns the queue and runs the job, so the writer is the only place that knows. */
+bool atlas_writer_sem_index_pending(atlas_writer *w, int64_t repo_id);
 
 /* Hands the writer the operations table. Called once at startup, after both
  * exist and before the serve loop accepts anything. */

@@ -66,6 +66,7 @@ static int64_t now_ms(void) {
 atlas_sem_freshness atlas_sem_freshness_of(const atlas_sem_generation *g, bool have_generation,
                                            bool running, const char *live_commit,
                                            const char *live_compdb_digest,
+                                           const char *live_source_identity,
                                            bool file_index_current, const char **reason_out) {
     if (reason_out != NULL) {
         *reason_out = NULL;
@@ -122,10 +123,66 @@ atlas_sem_freshness atlas_sem_freshness_of(const atlas_sem_generation *g, bool h
         }
         return ATLAS_SEM_FRESH_STALE;
     }
+    /* A9.2.3, and it is last on purpose: it is the broadest check and the least
+     * specific answer.
+     *
+     * Every check above compares something that moves with a *commit*. Atlas
+     * indexes the working tree, so a source could be edited, added or deleted
+     * with the head standing still and all four of them would agree the index
+     * was current — which is exactly the state a developer is in for most of a
+     * working day, and the state the daemon has to notice.
+     *
+     * Ordered after the others so a repository that has moved on is told *why*
+     * in the most useful terms available, and falls back to "the working tree
+     * changed" only when nothing more specific applies.
+     *
+     * An empty stored identity does not make a generation stale. A generation
+     * built before this season recorded nothing to compare, and "this index did
+     * not record what it was built from" is not evidence that the tree has
+     * moved. It is rebuilt on its next automatic pass and records one. */
+    if (live_source_identity != NULL && live_source_identity[0] != '\0' &&
+        g->source_identity[0] != '\0' && strcmp(live_source_identity, g->source_identity) != 0) {
+        if (reason_out != NULL) {
+            *reason_out = ATLAS_SEM_STALE_SOURCE;
+        }
+        return ATLAS_SEM_FRESH_STALE;
+    }
     if (running) {
         return ATLAS_SEM_FRESH_REBUILDING;
     }
     return ATLAS_SEM_FRESH_CURRENT;
+}
+
+atlas_sem_freshness atlas_sem_freshness_now(atlas_db *db, atlas_repo_info *repo,
+                                            const atlas_sem_generation *g, bool have_generation,
+                                            bool running, const char **reason_out) {
+    /* The file index has to be current too: a semantic graph built on a file
+     * index nobody can vouch for is not one to act on. Asked through
+     * `atlas_index_state_is_current`, which is the single authority on that
+     * question — A9.2.2 moved it out of the serve loop so exactly this kind of
+     * caller could ask it rather than restate it. */
+    atlas_index_state fs;
+    atlas_index_state_init(&fs);
+    atlas_err ignored;
+    atlas_err_init(&ignored);
+    bool file_current = atlas_db_index_state_get(db, repo->id, &fs, &ignored) == ATLAS_OK &&
+                        atlas_index_state_is_current(&fs, NULL);
+    atlas_index_state_free(&fs);
+
+    /* Both live values are best effort, and both fail *open* on purpose: an
+     * empty live value never makes a generation stale, because "Atlas could not
+     * look" is not evidence that anything changed. A repository whose build
+     * description cannot be read is reported by the index attempt, where the
+     * failure has somewhere to go. */
+    char live_digest[65];
+    live_digest[0] = '\0';
+    (void)atlas_sem_repo_compdb_digest(db, repo, live_digest, &ignored);
+    char live_identity[65];
+    live_identity[0] = '\0';
+    (void)atlas_sem_source_identity(db, repo, live_identity, &ignored);
+
+    return atlas_sem_freshness_of(g, have_generation, running, repo->scanned_head, live_digest,
+                                  live_identity, file_current, reason_out);
 }
 
 /* --- reading a compilation database ---------------------------------------- */
@@ -249,6 +306,21 @@ static void digest_list(const char (*digests)[65], size_t n, char out[65]) {
     out[ATLAS_SHA256_HEX_LEN] = '\0';
 }
 
+/* Domain-separated and length-prefixed, for A4's reason: with any single-byte
+ * delimiter two different lists could encode identically, and this one decides
+ * whether a repository is rebuilt. */
+static void feed_str(atlas_sha256 *h, const char *s) {
+    uint64_t n = s == NULL ? 0 : (uint64_t)strlen(s);
+    unsigned char len[8];
+    for (int i = 0; i < 8; i++) {
+        len[i] = (unsigned char)((n >> (8 * (7 - i))) & 0xffu);
+    }
+    atlas_sha256_update(h, len, sizeof(len));
+    if (n > 0) {
+        atlas_sha256_update(h, s, (size_t)n);
+    }
+}
+
 static void digest_all(const compdb_slot *slots, size_t n, char out[65]) {
     char digests[ATLAS_SEM_MAX_COMPDBS][65];
     for (size_t i = 0; i < n && i < ATLAS_SEM_MAX_COMPDBS; i++) {
@@ -354,6 +426,52 @@ atlas_status atlas_sem_repo_compdb_digest(atlas_db *db, atlas_repo_info *repo, c
     atlas_buf_free(&list);
     atlas_sem_config_free(&cfg);
     return st;
+}
+
+atlas_status atlas_sem_source_identity(atlas_db *db, atlas_repo_info *repo, char out[65],
+                                       atlas_err *err) {
+    out[0] = '\0';
+
+    char compdb[65];
+    compdb[0] = '\0';
+    /* Best effort. An unreadable build description leaves the field empty and
+     * the identity still describes the tree, so a rebuild is scheduled on the
+     * tree's own evidence rather than suppressed by a file Atlas could not
+     * read. The unreadable database is reported by the index attempt, where it
+     * is a failure with a reason. */
+    atlas_err ignored;
+    atlas_err_init(&ignored);
+    (void)atlas_sem_repo_compdb_digest(db, repo, compdb, &ignored);
+
+    atlas_sha256 h;
+    atlas_sha256_init(&h);
+    feed_str(&h, "atlas.sem.source-identity.v1");
+    feed_str(&h, compdb);
+    feed_str(&h, atlas_sem_compiler_version());
+    feed_str(&h, ATLAS_SEM_ANALYZER_ID);
+    char av[32];
+    (void)snprintf(av, sizeof av, "%d", ATLAS_SEM_ANALYZER_VERSION);
+    feed_str(&h, av);
+
+    /* Every live C source and header, by path and content hash, in path order —
+     * digested in `src/db`, because sqlite3 types do not leave that layer.
+     * Headers as well as sources: a header edit changes what every unit
+     * including it compiles to, which is the case A8-CI's own incremental
+     * digest exists to catch, and an identity that ignored headers would report
+     * a repository unchanged after an edit that changes half its graph. */
+    char content[65];
+    content[0] = '\0';
+    atlas_status st = atlas_db_sem_source_content_digest(db, repo->id, content, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    feed_str(&h, content);
+
+    unsigned char digest[ATLAS_SHA256_DIGEST_LEN];
+    atlas_sha256_final(&h, digest);
+    atlas_hex_encode(digest, sizeof(digest), out);
+    out[ATLAS_SHA256_HEX_LEN] = '\0';
+    return ATLAS_OK;
 }
 
 /* --- applying one unit's facts ---------------------------------------------- */
@@ -1177,6 +1295,33 @@ atlas_status atlas_sem_index_run(atlas_db *db, int64_t repo_id, const atlas_sem_
          * "nothing was covered". */
         if (st == ATLAS_OK) {
             st = atlas_db_sem_scope_set(db, sum->generation_id, &gen, err);
+        }
+        /* The identity this generation was built from, recorded in the same
+         * transaction. Measured *after* the pass rather than before it: what a
+         * generation may claim to describe is the tree as it stood when the last
+         * unit was read, and recording the identity Atlas saw at the start would
+         * claim a tree the pass never finished looking at.
+         *
+         * The consequence when the tree moves mid-build is the honest one: the
+         * identity recorded is the later one, the generation publishes, and the
+         * very next freshness read compares it against a tree that has moved
+         * again and reports STALE. The scheduler then rebuilds. A generation is
+         * never published as describing a state it did not observe. */
+        if (st == ATLAS_OK) {
+            char ident[65];
+            ident[0] = '\0';
+            atlas_repo_info ri;
+            atlas_repo_info_init(&ri);
+            ri.id = repo_id;
+            atlas_status ist = atlas_buf_set_str(&ri.root_path, opts->root, err);
+            if (ist == ATLAS_OK) {
+                ist = atlas_sem_source_identity(db, &ri, ident, err);
+            }
+            atlas_repo_info_free(&ri);
+            st = ist;
+            if (st == ATLAS_OK) {
+                st = atlas_db_sem_source_identity_set(db, sum->generation_id, ident, err);
+            }
         }
         if (st == ATLAS_OK) {
             st = atlas_db_commit(db, err);

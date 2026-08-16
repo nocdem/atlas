@@ -2740,6 +2740,112 @@ static void take_freshness(const atlas_ipc_response *r, atlas_sem_generation *ge
     }
 }
 
+
+/* A9.2.3. Reads the derived state and the build description back into the
+ * report, so the socket path and the local path describe a repository
+ * identically.
+ *
+ * Every new field on the plan goes here as well as into the daemon's writer.
+ * Missing the read-back is how the two paths start disagreeing — the A9.2.1
+ * closure named that failure and it applies unchanged to this block. */
+static void read_sem_plan(const atlas_ipc_response *r, atlas_sem_status_report *out) {
+    const char *v = NULL;
+    int64_t t = 0;
+    bool b = false;
+    atlas_sem_plan *p = &out->plan;
+    if (atlas_ipc_result_str(r, "activity", &v)) {
+        /* Parsed by name against Atlas' own vocabulary; anything else stays
+         * UNKNOWN, which is the zero and the safe reading. */
+        static const struct {
+            const char *name;
+            atlas_sem_activity value;
+        } ACTS[] = {
+            {"DISABLED", ATLAS_SEM_ACT_DISABLED},   {"UNAVAILABLE", ATLAS_SEM_ACT_UNAVAILABLE},
+            {"CURRENT", ATLAS_SEM_ACT_CURRENT},     {"INCOMPLETE", ATLAS_SEM_ACT_INCOMPLETE},
+            {"BUILDING", ATLAS_SEM_ACT_BUILDING},   {"DIRTY", ATLAS_SEM_ACT_DIRTY},
+            {"FAILED", ATLAS_SEM_ACT_FAILED},
+        };
+        for (size_t i = 0; i < sizeof ACTS / sizeof ACTS[0]; i++) {
+            if (strcmp(v, ACTS[i].name) == 0) {
+                p->activity = ACTS[i].value;
+                break;
+            }
+        }
+    }
+    p->freshness = out->freshness;
+    p->stale_reason = out->stale_reason;
+    if (atlas_ipc_result_str(r, "hold_reason", &v)) {
+        /* Interned to Atlas' own literal, never the bytes that arrived: a value
+         * that came over a socket is a *matching* string, not Atlas' string. */
+        p->hold_reason = atlas_sem_hold_reason_is_known(v) ? atlas_sem_hold_intern(v) : NULL;
+    }
+    if (atlas_ipc_result_bool(r, "coverage_complete", &b)) {
+        p->coverage_complete = b;
+    }
+    if (atlas_ipc_result_str(r, "scope_discovery", &v)) {
+        if (!atlas_sem_scope_discovery_parse(v, &p->scope_discovery)) {
+            p->scope_discovery = ATLAS_SEM_SCOPE_UNKNOWN;
+        }
+    }
+    if (atlas_ipc_result_int(r, "scope_candidates", &t)) {
+        p->scope_candidates = t;
+    }
+    if (atlas_ipc_result_int(r, "scope_covered", &t)) {
+        p->scope_covered = t;
+    }
+    if (atlas_ipc_result_int(r, "scope_uncovered", &t)) {
+        p->scope_uncovered = t;
+    }
+    if (atlas_ipc_result_bool(r, "configured", &b)) {
+        p->configured = b;
+    }
+    if (atlas_ipc_result_bool(r, "auto_rebuild", &b)) {
+        p->auto_rebuild = b;
+    }
+    if (atlas_ipc_result_bool(r, "rebuild_due", &b)) {
+        p->should_build = b;
+    }
+    if (atlas_ipc_result_int(r, "fail_count", &t)) {
+        p->fail_count = t;
+    }
+    if (atlas_ipc_result_str(r, "fail_reason", &v)) {
+        copy_str(p->fail_reason, sizeof p->fail_reason, v);
+    }
+    if (atlas_ipc_result_str(r, "fail_at", &v)) {
+        copy_str(p->fail_at, sizeof p->fail_at, v);
+    }
+    if (atlas_ipc_result_str(r, "source_identity", &v)) {
+        copy_str(p->source_identity, sizeof p->source_identity, v);
+    }
+    if (atlas_ipc_result_str(r, "generation_identity", &v)) {
+        copy_str(p->generation_identity, sizeof p->generation_identity, v);
+    }
+    p->generation_id = out->generation.id;
+
+    /* The declared lists, rejoined into the storage form the renderers read.
+     * One representation past this point, so a renderer cannot be handed two. */
+    static const char *const KEYS[2] = {"compdbs", "test_roots"};
+    atlas_buf *const BUFS[2] = {&out->compdbs, &out->test_roots};
+    for (size_t k = 0; k < 2; k++) {
+        size_t n = 0;
+        (void)atlas_ipc_result_arr_len(r, KEYS[k], &n);
+        atlas_err ignored;
+        atlas_err_init(&ignored);
+        atlas_buf_reset(BUFS[k]);
+        for (size_t i = 0; i < n; i++) {
+            if (!atlas_ipc_result_arr_str(r, KEYS[k], i, &v) || v == NULL || v[0] == '\0') {
+                continue;
+            }
+            if (BUFS[k]->len > 0 && atlas_buf_append(BUFS[k], "\n", 1u, &ignored) != ATLAS_OK) {
+                break;
+            }
+            if (atlas_buf_append(BUFS[k], v, strlen(v), &ignored) != ATLAS_OK) {
+                break;
+            }
+        }
+    }
+}
+
 atlas_status atlas_service_sem_status_remote(const char *name, atlas_sem_status_report *out,
                                              atlas_err *err) {
     atlas_buf params = ATLAS_BUF_INIT;
@@ -2885,10 +2991,90 @@ atlas_status atlas_service_sem_status_remote(const char *name, atlas_sem_status_
         out->failed_count++;
     }
     out->failed_truncated = out->failed_total > (int64_t)out->failed_count;
+    read_sem_plan(r, out);
 
     atlas_ipc_response_free(r);
     atlas_buf_free(&raw);
     return ATLAS_OK;
+}
+
+
+/* A9.2.3. The daemon-served form of writing a build description.
+ *
+ * Under A7.1 this is the only form that works on a deployed machine: the index
+ * is 0700 `atlasd`, so an operator's account has no local handle at all. The
+ * method is in the operator-uid group, so reaching it over the socket is not the
+ * same as being allowed to use it — a peer the root-owned policy does not name
+ * is told the method does not exist.
+ *
+ * A NULL array leaves the stored list alone and is expressed by *omitting* the
+ * key; a non-NULL array with a zero count clears the list and is expressed by
+ * sending an empty one. The protocol keeps those apart because they are
+ * different intentions. */
+atlas_status atlas_service_sem_config_set_remote(const char *name, const char *const *compdbs,
+                                                 size_t compdb_count,
+                                                 const char *const *test_roots,
+                                                 size_t test_root_count, int auto_rebuild,
+                                                 atlas_sem_status_report *out, atlas_err *err) {
+    atlas_buf params = ATLAS_BUF_INIT;
+    atlas_ipc_params *p = NULL;
+    atlas_json *j = NULL;
+    /* Built with the typed writer, never by formatting bytes into JSON — there
+     * is still no "write these bytes as JSON" primitive in Atlas. */
+    atlas_status st = atlas_ipc_params_begin(&p, &j, err);
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(j, "repo", name, err);
+    }
+    const char *const KEYS[2] = {"compdbs", "test_roots"};
+    const char *const *ARRS[2] = {compdbs, test_roots};
+    const size_t COUNTS[2] = {compdb_count, test_root_count};
+    for (size_t k = 0; k < 2 && st == ATLAS_OK; k++) {
+        if (ARRS[k] == NULL) {
+            continue;
+        }
+        st = atlas_json_key(j, KEYS[k], err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_arr_begin(j, err);
+        }
+        for (size_t i = 0; i < COUNTS[k] && st == ATLAS_OK; i++) {
+            st = atlas_json_str(j, ARRS[k][i], err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_arr_end(j, err);
+        }
+    }
+    if (st == ATLAS_OK && auto_rebuild >= 0) {
+        st = atlas_json_key_bool(j, "auto_rebuild", auto_rebuild > 0, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_ipc_params_finish(p, &params, err);
+    } else {
+        atlas_ipc_params_abort(p);
+    }
+
+    atlas_buf raw = ATLAS_BUF_INIT;
+    atlas_ipc_response *r = NULL;
+    if (st == ATLAS_OK) {
+        st = atlas_remote_call("code.sem_config", atlas_buf_cstr(&params), &raw, &r, err);
+    }
+    atlas_buf_free(&params);
+    if (st != ATLAS_OK) {
+        atlas_ipc_response_free(r);
+        atlas_buf_free(&raw);
+        return st;
+    }
+    atlas_ipc_response_free(r);
+    atlas_buf_free(&raw);
+
+    /* The write is accepted; the *state* is then read through the ordinary
+     * status path, into the same report the local form fills.
+     *
+     * Deliberately a second call rather than parsing the write's own response:
+     * it means `sem-config` and `sem-status` print identical numbers for the
+     * same repository because they came from the same method, rather than
+     * because two parsers were kept in step. The write's response is still
+     * checked above — a failure there is reported and nothing is read back. */
+    return atlas_service_sem_status_remote(name, out, err);
 }
 
 atlas_status atlas_service_sem_symbol_remote(const char *name, const char *symbol,

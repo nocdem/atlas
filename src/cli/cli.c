@@ -82,6 +82,9 @@ void atlas_cli_print_help(FILE *out) {
         "  code search NAME QUERY     search indexed symbol names\n"
         "  code deps NAME PATH        what a file depends on\n"
         "  code impact NAME PATH      what may be affected if it changes (candidates, not proof)\n"
+        "  code sem-status NAME       the semantic index: freshness, coverage and what is due\n"
+        "  code sem-config NAME       read or write the semantic build description\n"
+        "                             [--compdb P]... [--test-root P]... [--auto|--no-auto]\n"
         "  decision list NAME         recorded knowledge, its kind and its lifecycle status\n"
         "  decision show NAME ID      one decision in full, with its links' currency\n"
         "  decision search NAME QUERY search recorded decisions\n"
@@ -250,6 +253,12 @@ static atlas_status parse_long(const char *text, const char *what, long *out, at
  * command and the rest are its operands. */
 static atlas_status parse_args(cli_state *st, int argc, char **argv, bool *want_help,
                                bool *want_version, atlas_err *err) {
+    /* A9.2.3. The one option in Atlas whose "not given" is not the zero value:
+     * zero means `--no-auto` and would otherwise disable automatic rebuild on
+     * every command that never mentioned it. Set before the loop rather than in
+     * the caller's `memset`, so the distinction lives beside the flags it is
+     * about. */
+    st->opts.auto_rebuild = -1;
     bool no_more_options = false;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -312,6 +321,32 @@ static atlas_status parse_args(cli_state *st, int argc, char **argv, bool *want_
                                          sizeof(st->opts.compdbs) / sizeof(st->opts.compdbs[0]));
                 }
                 st->opts.compdbs[st->opts.compdb_count++] = argv[++i];
+            } else if (strcmp(a, "--test-root") == 0) {
+                if (i + 1 >= argc) {
+                    return atlas_err_set(err, ATLAS_ERR_USAGE, "--test-root needs a path");
+                }
+                if (st->opts.test_root_count >=
+                    sizeof(st->opts.test_roots) / sizeof(st->opts.test_roots[0])) {
+                    /* Refused, never clamped — A5's rule. A silently dropped
+                     * root would classify a test source as production, which is
+                     * wrong in the direction that lets a production-scope
+                     * absence be answered when it should not be. */
+                    return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                         "at most %zu test roots may be named",
+                                         sizeof(st->opts.test_roots) /
+                                             sizeof(st->opts.test_roots[0]));
+                }
+                st->opts.test_roots_given = true;
+                st->opts.test_roots[st->opts.test_root_count++] = argv[++i];
+            } else if (strcmp(a, "--no-test-roots") == 0) {
+                /* Clearing is spelled explicitly, because an empty repetition
+                 * of `--test-root` is indistinguishable from not passing it. */
+                st->opts.test_roots_given = true;
+                st->opts.test_root_count = 0;
+            } else if (strcmp(a, "--auto") == 0) {
+                st->opts.auto_rebuild = 1;
+            } else if (strcmp(a, "--no-auto") == 0) {
+                st->opts.auto_rebuild = 0;
             } else if (strcmp(a, "--label") == 0) {
                 if (i + 1 >= argc) {
                     return atlas_err_set(err, ATLAS_ERR_USAGE, "--label needs a value");
@@ -2252,6 +2287,12 @@ static bool remote_serves(const cli_state *st) {
                 * names, so reaching the name is not the same as being allowed
                 * to use it. */
                strcmp(sub, "index") == 0 ||
+               /* A9.2.3. Served for the same reason `index` is: under A7.1 the
+                * index is 0700 `atlasd`, so an operator's account has no local
+                * handle and could not record a build description at all. It is
+                * in the operator-uid group, so being served is not being
+                * allowed. */
+               strcmp(sub, "sem-config") == 0 ||
                strcmp(sub, "sem-status") == 0 || strcmp(sub, "semantic") == 0 ||
                strcmp(sub, "callers") == 0 || strcmp(sub, "callees") == 0 ||
                strcmp(sub, "trace") == 0 || strcmp(sub, "sem-impact") == 0 ||
@@ -2685,6 +2726,54 @@ static atlas_status run_code(cli_state *st, atlas_ctx *ctx, atlas_renderer *r, i
             result = renderer_open(r, st->opts.json, st->out, "code sem-status", err);
             if (result == ATLAS_OK) {
                 result = r->v->sem_status(r, &rep, err);
+            }
+            result = result == ATLAS_OK ? renderer_close(r, err) : (renderer_abort(r), result);
+        }
+        atlas_sem_status_report_free(&rep);
+        return result;
+    }
+
+    /* usage: atlas code sem-config NAME [--compdb P]... [--test-root P]...
+     *                               [--no-test-roots] [--auto|--no-auto]
+     *
+     * With no flags it reads. An operator can therefore see the description
+     * before changing it, which matters because every flag here is a
+     * *replacement* of a list rather than an addition to one — repeating
+     * `--compdb` builds the whole list, and a command that named one database
+     * would otherwise silently drop the second. */
+    if (strcmp(sub, "sem-config") == 0) {
+        if (st->operand_count != 2u) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "usage: atlas code sem-config NAME [--compdb PATH]... "
+                                 "[--test-root PATH]... [--no-test-roots] [--auto|--no-auto]");
+        }
+        const bool writing = st->opts.compdb_count > 0 || st->opts.test_roots_given ||
+                             st->opts.auto_rebuild >= 0;
+        atlas_sem_status_report rep;
+        atlas_sem_status_report_init(&rep);
+        if (!writing) {
+            result = ctx != NULL ? atlas_service_sem_status(ctx, st->operands[1], &rep, err)
+                                 : atlas_service_sem_status_remote(st->operands[1], &rep, err);
+        } else {
+            const char *const *compdbs = st->opts.compdb_count > 0 ? st->opts.compdbs : NULL;
+            const char *const *roots = st->opts.test_roots_given ? st->opts.test_roots : NULL;
+            /* Routed on `atlas_ctx_is_writer`, never on `ctx != NULL`: with a
+             * daemon running, a context in AUTO mode still opens read-only, and
+             * the weaker test fails with "attempt to write a readonly
+             * database". That is the A9.2.1 defect and it is not repeated. */
+            result = (ctx != NULL && atlas_ctx_is_writer(ctx))
+                         ? atlas_service_sem_config_set(ctx, st->operands[1], compdbs,
+                                                        st->opts.compdb_count, roots,
+                                                        st->opts.test_root_count,
+                                                        st->opts.auto_rebuild, &rep, err)
+                         : atlas_service_sem_config_set_remote(
+                               st->operands[1], compdbs, st->opts.compdb_count, roots,
+                               st->opts.test_root_count, st->opts.auto_rebuild, &rep, err);
+        }
+        if (result == ATLAS_OK) {
+            result = renderer_open(r, st->opts.json, st->out, "code sem-config", err);
+            if (result == ATLAS_OK) {
+                result = r->v->sem_config(r, &rep, err);
             }
             result = result == ATLAS_OK ? renderer_close(r, err) : (renderer_abort(r), result);
         }

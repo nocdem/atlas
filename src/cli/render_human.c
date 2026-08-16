@@ -1898,6 +1898,112 @@ static const char *sem_fresh_word(atlas_sem_freshness f) {
     return atlas_sem_freshness_name(f);
 }
 
+
+/* A9.2.3. The four axes on four lines, never one badge.
+ *
+ * `activity` is the fold an operator acts on and it is printed *beside* the two
+ * axes it folds, not instead of them: a repository that is source-current and
+ * describes half its tree reads CURRENT on freshness and incomplete on
+ * coverage, and a single word carrying both would hide exactly the state this
+ * season adds. `coverage` is never a percentage — the counts are printed and a
+ * denominator Atlas cannot state is reported as unknown rather than made up. */
+static void h_sem_plan_block(atlas_renderer *r, const atlas_sem_status_report *rep) {
+    FILE *o = r->out;
+    const atlas_sem_plan *p = &rep->plan;
+    (void)fprintf(o, LABEL "%s\n", "state", atlas_sem_activity_name(p->activity));
+    (void)fprintf(o, LABEL "%s\n", "freshness", atlas_sem_freshness_name(p->freshness));
+    if (p->stale_reason != NULL) {
+        (void)fprintf(o, LABEL "%s\n", "  why", p->stale_reason);
+    }
+    (void)fprintf(o, LABEL "%s\n", "coverage",
+                  p->coverage_complete ? "complete" : "not complete");
+    (void)fprintf(o, LABEL "%s\n", "  scope discovery",
+                  atlas_sem_scope_discovery_name(p->scope_discovery));
+    if (p->scope_discovery == ATLAS_SEM_SCOPE_DECLARED) {
+        (void)fprintf(o, LABEL "%lld of %lld source files\n", "  scope covered",
+                      (long long)p->scope_covered, (long long)p->scope_candidates);
+        (void)fprintf(o, LABEL "%lld\n", "  scope uncovered", (long long)p->scope_uncovered);
+    }
+    if (rep->have_generation && rep->generation.test_scope_known) {
+        (void)fprintf(o, LABEL "%lld test, %lld production\n", "  unit scope",
+                      (long long)rep->generation.tu_test,
+                      (long long)rep->generation.tu_production);
+    } else if (rep->have_generation) {
+        /* Not "no tests". Atlas does not know which sources are tests, which is
+         * a different statement and the one that makes a production-scope
+         * absence unanswerable rather than wrong. */
+        (void)fprintf(o, LABEL "%s\n", "  unit scope",
+                      "unknown (no test roots declared)");
+    }
+
+    (void)fprintf(o, LABEL "%s\n", "automatic rebuild",
+                  !p->configured ? "not configured" : (p->auto_rebuild ? "enabled" : "disabled"));
+    if (p->hold_reason != NULL) {
+        (void)fprintf(o, LABEL "%s\n", "  holding", p->hold_reason);
+    }
+    if (p->should_build) {
+        (void)fprintf(o, LABEL "%s\n", "  next", "a rebuild is due");
+    }
+    if (p->fail_count > 0) {
+        (void)fprintf(o, LABEL "%lld\n", "failed attempts", (long long)p->fail_count);
+        if (p->fail_reason[0] != '\0') {
+            (void)fprintf(o, LABEL "%s\n", "  reason", p->fail_reason);
+        }
+        if (p->fail_at[0] != '\0') {
+            (void)fprintf(o, LABEL "%s\n", "  at", p->fail_at);
+        }
+    }
+}
+
+/* The declared lists, one path per line. Encoded at the point of output: an
+ * operator chose these, which makes them less hostile than repository text and
+ * not exempt from the rule. */
+static void h_sem_path_list(atlas_renderer *r, const char *label, const atlas_buf *packed) {
+    FILE *o = r->out;
+    if (packed->len == 0) {
+        (void)fprintf(o, LABEL "%s\n", label, "(none)");
+        return;
+    }
+    const char *data = (const char *)packed->data;
+    size_t start = 0;
+    bool first = true;
+    for (size_t i = 0; i <= packed->len; i++) {
+        if (i != packed->len && data[i] != '\n') {
+            continue;
+        }
+        if (i > start) {
+            char one[ATLAS_SEM_CONFIG_MAX_BYTES];
+            size_t n = i - start;
+            if (n < sizeof one) {
+                memcpy(one, data + start, n);
+                one[n] = '\0';
+                (void)fprintf(o, LABEL "%s\n", first ? label : "", atlas_safe(&r->safe, one));
+                first = false;
+            }
+        }
+        start = i + 1u;
+    }
+    if (first) {
+        (void)fprintf(o, LABEL "%s\n", label, "(none)");
+    }
+}
+
+static atlas_status h_sem_config(atlas_renderer *r, const atlas_sem_status_report *rep,
+                                 atlas_err *err) {
+    (void)err;
+    FILE *o = r->out;
+    (void)fprintf(o, LABEL "%s\n", "repo", rep->repo.name);
+    h_sem_path_list(r, "compile databases", &rep->compdbs);
+    h_sem_path_list(r, "test roots", &rep->test_roots);
+    h_sem_plan_block(r, rep);
+    if (rep->have_generation) {
+        (void)fprintf(o, LABEL "%lld\n", "generation", (long long)rep->generation.id);
+    } else {
+        (void)fprintf(o, LABEL "%s\n", "generation", "absent (never built)");
+    }
+    return ATLAS_OK;
+}
+
 static atlas_status h_sem_status(atlas_renderer *r, const atlas_sem_status_report *rep,
                                  atlas_err *err) {
     (void)err;
@@ -1944,6 +2050,12 @@ static atlas_status h_sem_status(atlas_renderer *r, const atlas_sem_status_repor
     (void)fprintf(o, LABEL "%lld\n", "edges", (long long)g->edge_count);
     (void)fprintf(o, LABEL "%lld\n", "includes", (long long)g->include_count);
     (void)fprintf(o, LABEL "%lld ms\n", "duration", (long long)g->duration_ms);
+
+    /* A9.2.3. Printed after the generation's own counts and never mixed with
+     * them: `translation units` says what the compilation database named, and
+     * `scope covered` says how much of the repository that was. Summing or
+     * conflating the two is what made `198/198` read as full coverage. */
+    h_sem_plan_block(r, rep);
 
     if (rep->failed_count > 0) {
         (void)fprintf(o, "\nunits not fully described (%lld total):\n",
@@ -2240,7 +2352,7 @@ const atlas_renderer_vtbl ATLAS_RENDERER_HUMAN = {
     h_code_status, h_code_file,   h_code_symbol_item, h_code_edge_item,
     h_code_walk_item, h_code_walk_end,
     /* --- A8-CI --- */
-    h_sem_status, h_sem_symbols, h_sem_graph, h_sem_indexed, h_sem_impact, h_sem_context,
+    h_sem_status, h_sem_config, h_sem_symbols, h_sem_graph, h_sem_indexed, h_sem_impact, h_sem_context,
     h_code_list_begin, h_code_list_end,
     /* --- A4 --- */
     h_decision_item, h_decision_show, h_decision_event, h_decision_outcome, h_decision_edge,

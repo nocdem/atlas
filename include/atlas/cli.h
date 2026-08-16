@@ -48,6 +48,20 @@ typedef struct atlas_cli_opts {
      * tells it how to compile things. */
     const char *compdbs[32];
     size_t compdb_count;
+    /* A9.2.3: `code sem-config NAME --test-root PATH`, repeatable. Declared
+     * prefixes, never guessed: a directory called `tests` is a directory
+     * somebody named, and Atlas classifying it on that basis would be inventing
+     * the scope information a production-only absence rests on. */
+    const char *test_roots[32];
+    size_t test_root_count;
+    /* Whether any `--test-root` was given at all, which is a different fact
+     * from how many: it separates "leave the stored roots alone" from "clear
+     * them", and `--no-test-roots` is how the second is spelled. */
+    bool test_roots_given;
+    /* A9.2.3: `--auto` / `--no-auto`. Negative means neither was given, so the
+     * stored value is left alone — an operator adjusting a path list must not
+     * turn automatic rebuilding on or off as a side effect. */
+    int auto_rebuild;
     /* A9: `api-key create --label L --scope S [--scope S...]`.
      *
      * `--scope` is repeatable and every value must be in the closed vocabulary;

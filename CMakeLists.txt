@@ -224,6 +224,7 @@ add_library(atlas_core STATIC
   src/sem/parse.c
   src/db/db_sem.c
   src/sem/index.c
+  src/sem/schedule.c
   src/sem/query.c
   src/core/service_sem.c
   src/ipc/server_sem.c

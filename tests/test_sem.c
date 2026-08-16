@@ -494,7 +494,7 @@ static void test_replacement_is_atomic_and_failure_preserves(void) {
     T_OK(atlas_db_sem_current(e.db, e.repo_id, &g, &found, &err), &err);
     T_CHECK_MSG(!found, "a generation existed before anything was indexed");
     const char *reason = NULL;
-    T_CHECK(atlas_sem_freshness_of(&g, false, false, "", "", true, &reason) ==
+    T_CHECK(atlas_sem_freshness_of(&g, false, false, "", "", "", true, &reason) ==
             ATLAS_SEM_FRESH_ABSENT);
 
     atlas_sem_index_summary first;
@@ -528,26 +528,26 @@ static void test_replacement_is_atomic_and_failure_preserves(void) {
 
     /* Freshness is recomputed, never cached: the same stored generation reports
      * CURRENT or STALE according to what it is compared against. */
-    T_CHECK(atlas_sem_freshness_of(&g, true, false, "", "", true, &reason) ==
+    T_CHECK(atlas_sem_freshness_of(&g, true, false, "", "", "", true, &reason) ==
             ATLAS_SEM_FRESH_CURRENT);
     T_CHECK(reason == NULL);
 
     atlas_sem_generation moved = g;
     (void)snprintf(moved.commit_id, sizeof moved.commit_id, "%s", "0123456789abcdef");
-    T_CHECK(atlas_sem_freshness_of(&moved, true, false, "fedcba9876543210", "", true, &reason) ==
+    T_CHECK(atlas_sem_freshness_of(&moved, true, false, "fedcba9876543210", "", "", true, &reason) ==
             ATLAS_SEM_FRESH_STALE);
     T_CHECK_MSG(reason != NULL && strcmp(reason, ATLAS_SEM_STALE_COMMIT) == 0,
                 "a moved commit did not report the commit reason");
 
     atlas_sem_generation reanalyzed = g;
     reanalyzed.analyzer_version = ATLAS_SEM_ANALYZER_VERSION + 1;
-    T_CHECK(atlas_sem_freshness_of(&reanalyzed, true, false, "", "", true, &reason) ==
+    T_CHECK(atlas_sem_freshness_of(&reanalyzed, true, false, "", "", "", true, &reason) ==
             ATLAS_SEM_FRESH_STALE);
     T_CHECK_MSG(reason != NULL && strcmp(reason, ATLAS_SEM_STALE_ANALYZER) == 0,
                 "a changed analyzer did not report the analyzer reason");
 
     /* A graph built on a file index nobody can vouch for is not one to act on. */
-    T_CHECK(atlas_sem_freshness_of(&g, true, false, "", "", false, &reason) ==
+    T_CHECK(atlas_sem_freshness_of(&g, true, false, "", "", "", false, &reason) ==
             ATLAS_SEM_FRESH_STALE);
     T_CHECK_MSG(reason != NULL && strcmp(reason, ATLAS_SEM_STALE_FILE_INDEX) == 0,
                 "a stale file index did not report its reason");
@@ -570,14 +570,14 @@ static void test_replacement_is_atomic_and_failure_preserves(void) {
     {
         /* absent — no generation has ever completed. */
         const char *r = NULL;
-        T_CHECK_MSG(atlas_sem_freshness_of(NULL, false, false, "", "", true, &r) ==
+        T_CHECK_MSG(atlas_sem_freshness_of(NULL, false, false, "", "", "", true, &r) ==
                         ATLAS_SEM_FRESH_ABSENT,
                     "a repository that was never indexed did not report ABSENT");
         T_CHECK_MSG(r == NULL, "ABSENT carried a staleness reason, which it cannot have");
 
         /* current — complete, and nothing it depends on has moved. */
         r = NULL;
-        T_CHECK_MSG(atlas_sem_freshness_of(&g, true, false, "", "", true, &r) ==
+        T_CHECK_MSG(atlas_sem_freshness_of(&g, true, false, "", "", "", true, &r) ==
                         ATLAS_SEM_FRESH_CURRENT,
                     "a complete generation against unmoved inputs did not report CURRENT");
         T_CHECK_MSG(r == NULL, "CURRENT carried a staleness reason");
@@ -588,7 +588,7 @@ static void test_replacement_is_atomic_and_failure_preserves(void) {
         atlas_sem_generation part = g;
         part.status = ATLAS_SEM_GEN_RUNNING;
         r = NULL;
-        T_CHECK_MSG(atlas_sem_freshness_of(&part, true, false, "", "", true, &r) ==
+        T_CHECK_MSG(atlas_sem_freshness_of(&part, true, false, "", "", "", true, &r) ==
                         ATLAS_SEM_FRESH_STALE,
                     "a generation that never completed was served as if it had");
         T_CHECK_MSG(r != NULL && strcmp(r, ATLAS_SEM_STALE_INCOMPLETE) == 0,
@@ -597,7 +597,7 @@ static void test_replacement_is_atomic_and_failure_preserves(void) {
 
         part.status = ATLAS_SEM_GEN_FAILED;
         r = NULL;
-        T_CHECK_MSG(atlas_sem_freshness_of(&part, true, false, "", "", true, &r) ==
+        T_CHECK_MSG(atlas_sem_freshness_of(&part, true, false, "", "", "", true, &r) ==
                         ATLAS_SEM_FRESH_STALE,
                     "a failed generation was served as if it had completed");
         T_CHECK_MSG(r != NULL && strcmp(r, ATLAS_SEM_STALE_INCOMPLETE) == 0,
@@ -608,7 +608,7 @@ static void test_replacement_is_atomic_and_failure_preserves(void) {
          * reported as merely out of date by a commit. */
         part.status = ATLAS_SEM_GEN_RUNNING;
         r = NULL;
-        T_CHECK(atlas_sem_freshness_of(&part, true, false, "fedcba9876543210", "", false, &r) ==
+        T_CHECK(atlas_sem_freshness_of(&part, true, false, "fedcba9876543210", "", "", false, &r) ==
                 ATLAS_SEM_FRESH_STALE);
         T_CHECK_MSG(r != NULL && strcmp(r, ATLAS_SEM_STALE_INCOMPLETE) == 0,
                     "an incomplete generation reported a different reason when other inputs "

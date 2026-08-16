@@ -70,6 +70,16 @@ const atlas_method_entry *atlas_server_ai_methods(size_t *count_out);
 const atlas_method_entry *atlas_server_code_methods(size_t *count_out);
 /* A8-CI: the four compiler-derived semantic reads. */
 const atlas_method_entry *atlas_server_sem_methods(size_t *count_out);
+
+/* A9.2.3. Writes the derived semantic state, the coverage manifest and the
+ * operator's build description into the current response.
+ *
+ * One writer, called by `sem.status` (an ordinary read) and by
+ * `code.sem_config` (an operator-gated write), so the two cannot describe the
+ * same repository differently — the parity rule A9.2.1's
+ * `atlas_service_verify_write_detail` follows. */
+atlas_status atlas_server_write_sem_config(dispatch_state *ds, const atlas_sem_status_report *rep,
+                                           atlas_err *err);
 /* The A4 method group: everything under `decision.`. Looked up through the same
  * dispatch as the others, in server.c. */
 const atlas_method_entry *atlas_server_decision_methods(size_t *count_out);

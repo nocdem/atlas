@@ -545,6 +545,29 @@
 /* Starting paths and symbols one context request may name. */
 #define ATLAS_SEM_CONTEXT_MAX_SEEDS 64
 
+/* --- A9.2.3: the daemon's semantic freshness sweep --------------------------
+ *
+ * How often the daemon asks whether any configured repository's semantic index
+ * has fallen behind. It is a bounded read per repository — a digest over the
+ * file index's content hashes and a read of the build description — so the
+ * interval is chosen for how quickly an edit should turn into a rebuild rather
+ * than for the cost of asking.
+ *
+ * Deliberately slower than the watcher's debounce and faster than its
+ * reconciliation interval: the semantic sweep has nothing to do until the file
+ * index has caught up, and holding until it has is part of the plan rather than
+ * a delay. Nothing about correctness depends on this number — a sweep that
+ * happens late converges late — which is why it is a constant and not a policy
+ * key. */
+#define ATLAS_SEM_SWEEP_INTERVAL_MS 15000
+
+/* How many configured repositories one sweep will consider.
+ *
+ * Reached rather than silently applied: a repository dropped from a sweep is one
+ * that never rebuilds, and A8-CI's rule is that every bound that is reached is
+ * reported. */
+#define ATLAS_SEM_SWEEP_MAX_REPOS 256
+
 /* --- long-running daemon operations ----------------------------------------
  *
  * Operation records the daemon keeps in memory, oldest evicted first.

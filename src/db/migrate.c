@@ -3421,7 +3421,24 @@ static const char M18_STATEMENTS_SQL[] =
      * which is a different statement from "no test units". */
     "ALTER TABLE sem_generations ADD COLUMN tu_test INTEGER NOT NULL DEFAULT 0;"
     "ALTER TABLE sem_generations ADD COLUMN tu_production INTEGER NOT NULL DEFAULT 0;"
-    "ALTER TABLE sem_generations ADD COLUMN test_scope_known INTEGER NOT NULL DEFAULT 0;";
+    "ALTER TABLE sem_generations ADD COLUMN test_scope_known INTEGER NOT NULL DEFAULT 0;"
+
+    /* The source identity this generation was built from.
+     *
+     * Every staleness check A8-CI had compares something that moves with a
+     * *commit*: the head, the compilation database, the compiler, the analyzer.
+     * Atlas indexes the **working tree**, so a source can be edited, added or
+     * deleted with the head standing still — and a semantic index describing
+     * bytes that are no longer there reported itself CURRENT for as long as
+     * nobody committed. That was tolerable while a person decided when to
+     * rebuild, and it is the whole of what the daemon has to notice.
+     *
+     * Empty on every pre-A9.2.3 generation, and an empty stored identity never
+     * makes one stale: "this generation did not record what it was built from"
+     * is not evidence that the tree has changed. It is a generation that must be
+     * rebuilt before its identity can be compared, which the first automatic
+     * pass does. */
+    "ALTER TABLE sem_generations ADD COLUMN source_identity TEXT NOT NULL DEFAULT '';";
 
 static const char *const M18_STATEMENTS[] = {M18_STATEMENTS_SQL, NULL};
 

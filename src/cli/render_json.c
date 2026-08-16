@@ -1789,7 +1789,90 @@ static atlas_status j_sem_generation(atlas_renderer *r, const atlas_sem_generati
     TRY(atlas_json_key_int(r->j, "includes", g->include_count, err));
     TRY(atlas_json_key_int(r->j, "duration_ms", g->duration_ms, err));
     TRY(atlas_json_key_str_opt(r->j, "failure_reason", g->failure_reason, err));
+    /* A9.2.3's coverage manifest, beside the unit counts and never summed with
+     * them: the first pair says what the compilation database named, the second
+     * says how much of the repository that was. */
+    TRY(atlas_json_key_str(r->j, "scope_discovery",
+                           atlas_sem_scope_discovery_name(g->scope_discovery), err));
+    TRY(atlas_json_key_int(r->j, "scope_candidates", g->scope_candidates, err));
+    TRY(atlas_json_key_int(r->j, "scope_covered", g->scope_covered, err));
+    TRY(atlas_json_key_int(r->j, "scope_uncovered", g->scope_uncovered, err));
+    TRY(atlas_json_key_bool(r->j, "test_scope_known", g->test_scope_known, err));
+    TRY(atlas_json_key_int(r->j, "tu_test", g->tu_test, err));
+    TRY(atlas_json_key_int(r->j, "tu_production", g->tu_production, err));
+    TRY(atlas_json_key_str_opt(r->j, "source_identity", g->source_identity, err));
     return atlas_json_obj_end(r->j, err);
+}
+
+/* A9.2.3. The derived state, as its own object, so the four axes stay four
+ * fields on every surface. A caller binding one of them cannot accidentally
+ * read a fold as an axis. */
+static atlas_status j_sem_plan(atlas_renderer *r, const atlas_sem_plan *p, atlas_err *err) {
+    TRY(atlas_json_key(r->j, "semantic_state", err));
+    TRY(atlas_json_obj_begin(r->j, err));
+    TRY(atlas_json_key_str(r->j, "activity", atlas_sem_activity_name(p->activity), err));
+    TRY(atlas_json_key_str(r->j, "freshness", atlas_sem_freshness_name(p->freshness), err));
+    TRY(atlas_json_key_str_opt(
+        r->j, "stale_reason",
+        atlas_sem_stale_reason_is_known(p->stale_reason) ? p->stale_reason : NULL, err));
+    TRY(atlas_json_key_str_opt(
+        r->j, "hold_reason",
+        atlas_sem_hold_reason_is_known(p->hold_reason) ? p->hold_reason : NULL, err));
+    TRY(atlas_json_key_bool(r->j, "coverage_complete", p->coverage_complete, err));
+    TRY(atlas_json_key_str(r->j, "scope_discovery",
+                           atlas_sem_scope_discovery_name(p->scope_discovery), err));
+    TRY(atlas_json_key_int(r->j, "scope_candidates", p->scope_candidates, err));
+    TRY(atlas_json_key_int(r->j, "scope_covered", p->scope_covered, err));
+    TRY(atlas_json_key_int(r->j, "scope_uncovered", p->scope_uncovered, err));
+    TRY(atlas_json_key_bool(r->j, "configured", p->configured, err));
+    TRY(atlas_json_key_bool(r->j, "auto_rebuild", p->auto_rebuild, err));
+    TRY(atlas_json_key_bool(r->j, "rebuild_due", p->should_build, err));
+    TRY(atlas_json_key_int(r->j, "fail_count", p->fail_count, err));
+    TRY(atlas_json_key_str_opt(r->j, "fail_reason",
+                               atlas_sem_why_is_known(p->fail_reason) ? p->fail_reason : NULL,
+                               err));
+    TRY(atlas_json_key_str_opt(r->j, "fail_at", p->fail_at, err));
+    TRY(atlas_json_key_str_opt(r->j, "source_identity", p->source_identity, err));
+    TRY(atlas_json_key_str_opt(r->j, "generation_identity", p->generation_identity, err));
+    return atlas_json_obj_end(r->j, err);
+}
+
+/* The declared lists, each element its own string rather than the newline-joined
+ * storage form: a client must not have to parse a separator to learn what an
+ * operator configured. */
+static atlas_status j_sem_path_list(atlas_renderer *r, const char *key, const atlas_buf *packed,
+                                    atlas_err *err) {
+    TRY(atlas_json_key(r->j, key, err));
+    TRY(atlas_json_arr_begin(r->j, err));
+    const char *data = packed->len > 0 ? (const char *)packed->data : "";
+    size_t start = 0;
+    for (size_t i = 0; i <= packed->len; i++) {
+        if (i != packed->len && data[i] != '\n') {
+            continue;
+        }
+        size_t n = i - start;
+        char one[ATLAS_SEM_CONFIG_MAX_BYTES];
+        if (n > 0 && n < sizeof one) {
+            memcpy(one, data + start, n);
+            one[n] = '\0';
+            TRY(atlas_json_str(r->j, atlas_safe(&r->safe, one), err));
+        }
+        start = i + 1u;
+    }
+    return atlas_json_arr_end(r->j, err);
+}
+
+static atlas_status j_sem_config(atlas_renderer *r, const atlas_sem_status_report *rep,
+                                 atlas_err *err) {
+    TRY(atlas_json_key_str(r->j, "repo", rep->repo.name, err));
+    TRY(j_sem_path_list(r, "compdbs", &rep->compdbs, err));
+    TRY(j_sem_path_list(r, "test_roots", &rep->test_roots, err));
+    TRY(j_sem_plan(r, &rep->plan, err));
+    TRY(atlas_json_key_bool(r->j, "have_generation", rep->have_generation, err));
+    if (rep->have_generation) {
+        TRY(j_sem_generation(r, &rep->generation, err));
+    }
+    return ATLAS_OK;
 }
 
 static atlas_status j_sem_status(atlas_renderer *r, const atlas_sem_status_report *rep,
@@ -1808,6 +1891,11 @@ static atlas_status j_sem_status(atlas_renderer *r, const atlas_sem_status_repor
     if (rep->have_generation) {
         TRY(j_sem_generation(r, &rep->generation, err));
     }
+    /* A9.2.3. The derived state and the build description, on the same document
+     * as the generation, so one read answers "is this evidence trustworthy". */
+    TRY(j_sem_plan(r, &rep->plan, err));
+    TRY(j_sem_path_list(r, "compdbs", &rep->compdbs, err));
+    TRY(j_sem_path_list(r, "test_roots", &rep->test_roots, err));
     if (rep->have_latest) {
         TRY(atlas_json_key(r->j, "latest_attempt", err));
         TRY(atlas_json_obj_begin(r->j, err));
@@ -2077,7 +2165,7 @@ const atlas_renderer_vtbl ATLAS_RENDERER_JSON = {
     j_code_status, j_code_file,   j_code_symbol_item, j_code_edge_item,
     j_code_walk_item, j_code_walk_end,
     /* --- A8-CI --- */
-    j_sem_status, j_sem_symbols, j_sem_graph, j_sem_indexed, j_sem_impact, j_sem_context,
+    j_sem_status, j_sem_config, j_sem_symbols, j_sem_graph, j_sem_indexed, j_sem_impact, j_sem_context,
     j_code_list_begin, j_code_list_end,
     /* --- A4 --- */
     j_decision_item, j_decision_show, j_decision_event, j_decision_outcome, j_decision_edge,

@@ -37,7 +37,7 @@
  * `found` false means ABSENT — nobody has indexed this repository — which is a
  * different answer from STALE and must stay one. Both are ordinary outcomes and
  * neither is an error: a caller is told what Atlas holds, and decides. */
-static atlas_status load_generation(atlas_ctx *ctx, atlas_repo_info *repo,
+static atlas_status load_generation(atlas_db *db, atlas_repo_info *repo,
                                     atlas_sem_generation *gen, bool *found,
                                     atlas_sem_freshness *fresh, const char **reason,
                                     atlas_err *err) {
@@ -45,7 +45,7 @@ static atlas_status load_generation(atlas_ctx *ctx, atlas_repo_info *repo,
     *fresh = ATLAS_SEM_FRESH_ABSENT;
     *reason = NULL;
 
-    atlas_status st = atlas_db_sem_current(atlas_ctx_db(ctx), repo->id, gen, found, err);
+    atlas_status st = atlas_db_sem_current(db, repo->id, gen, found, err);
     if (st != ATLAS_OK) {
         return st;
     }
@@ -54,51 +54,19 @@ static atlas_status load_generation(atlas_ctx *ctx, atlas_repo_info *repo,
      * so "rebuilding" and "stale" are distinguishable. */
     atlas_sem_generation latest;
     bool have_latest = false;
-    st = atlas_db_sem_latest(atlas_ctx_db(ctx), repo->id, &latest, &have_latest, err);
+    st = atlas_db_sem_latest(db, repo->id, &latest, &have_latest, err);
     if (st != ATLAS_OK) {
         return st;
     }
     bool running = have_latest && latest.status == ATLAS_SEM_GEN_RUNNING;
 
-    /* The file index has to be current too: a semantic graph built on a file
-     * index nobody can vouch for is not one to act on. */
-    atlas_index_state fs;
-    atlas_index_state_init(&fs);
-    st = atlas_db_index_state_get(atlas_ctx_db(ctx), repo->id, &fs, err);
-    /* The same three conditions `code status` uses: a pass has completed, no
-     * unresolved event gap, and no owed full verification. Asked here rather
-     * than restated, so the semantic layer and the structural one cannot
-     * disagree about what "current" means. */
-    bool file_current = st == ATLAS_OK && fs.present && fs.last_complete_generation > 0 &&
-                        !fs.event_gap && !fs.pending_full_reconcile;
-    atlas_index_state_free(&fs);
-    if (st != ATLAS_OK) {
-        return st;
-    }
-
-    /* The live commit is the repository's own scanned head.
-     *
-     * **A9.2.3 recomputes the compilation-database digest here, reversing an
-     * A8-CI decision, and the reversal is the point.** A8-CI declined on the
-     * grounds that hashing every database on every read was expensive and that a
-     * changed one would be caught by the next index. That held while rebuilding
-     * was something a person did: "the next index" was a command somebody would
-     * run, and the unreached check only decided how a status line read. It stops
-     * holding once the daemon owns freshness, because the daemon schedules by
-     * *noticing* — so a check that never fires is a repository whose build
-     * description can change without anything ever rebuilding it.
-     *
-     * It costs one bounded read and one SHA-256 per declared database, of files
-     * an operator named. A repository with no declared description pays nothing
-     * and yields an empty digest, which never makes a generation stale. */
-    char live_digest[65];
-    live_digest[0] = '\0';
-    atlas_err ignored;
-    atlas_err_init(&ignored);
-    (void)atlas_sem_repo_compdb_digest(atlas_ctx_db(ctx), repo, live_digest, &ignored);
-
-    *fresh = atlas_sem_freshness_of(gen, *found, running, repo->scanned_head, live_digest,
-                                    file_current, reason);
+    /* Every live fact — the file index's currency, the compilation-database
+     * digest and the working-tree identity — is gathered by one function, so
+     * this surface and the daemon's cannot disagree about the same generation.
+     * They did before A9.2.3: each assembled its own arguments and each passed
+     * NULL for the digest, which made the compilation-database check
+     * unreachable from either. */
+    *fresh = atlas_sem_freshness_now(db, repo, gen, *found, running, reason);
     return ATLAS_OK;
 }
 
@@ -115,7 +83,7 @@ static atlas_status begin_read(atlas_ctx *ctx, const char *name, atlas_repo_info
         return st;
     }
     bool found = false;
-    st = load_generation(ctx, repo, gen, &found, fresh, reason, err);
+    st = load_generation(atlas_ctx_db(ctx), repo, gen, &found, fresh, reason, err);
     if (st != ATLAS_OK) {
         return st;
     }
@@ -133,6 +101,9 @@ void atlas_sem_status_report_init(atlas_sem_status_report *r) {
     memset(r, 0, sizeof(*r));
     atlas_repo_info_init(&r->repo);
     atlas_sem_generation_init(&r->generation);
+    atlas_sem_plan_init(&r->plan);
+    atlas_buf_init(&r->compdbs);
+    atlas_buf_init(&r->test_roots);
 }
 
 void atlas_sem_status_report_free(atlas_sem_status_report *r) {
@@ -140,6 +111,8 @@ void atlas_sem_status_report_free(atlas_sem_status_report *r) {
         return;
     }
     atlas_repo_info_free(&r->repo);
+    atlas_buf_free(&r->compdbs);
+    atlas_buf_free(&r->test_roots);
 }
 
 typedef struct unit_sink {
@@ -162,9 +135,33 @@ static atlas_status take_unit(const atlas_sem_unit_report *row, void *ud, atlas_
     return ATLAS_OK;
 }
 
-atlas_status atlas_service_sem_status(atlas_ctx *ctx, const char *name,
-                                      atlas_sem_status_report *out, atlas_err *err) {
-    atlas_status st = atlas_service_require_repo(ctx, name, &out->repo, err);
+/* Resolving a repository from a raw handle, with the same refusal
+ * `atlas_service_require_repo` gives.
+ *
+ * The `_on` forms below exist because the daemon's writer thread has a handle
+ * and no `atlas_ctx` — the reason `atlas_sem_index_on` and `atlas_sem_impact_on`
+ * exist. Duplicating the *refusal* rather than the resolution keeps
+ * NOT_REGISTERED identical on both surfaces, which is what a caller sees. */
+static atlas_status require_repo_on(atlas_db *db, const char *name, atlas_repo_info *out,
+                                    atlas_err *err) {
+    bool found = false;
+    atlas_status st = atlas_db_repo_get(db, name, out, &found, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (!found) {
+        return atlas_err_set(err, ATLAS_ERR_REPO,
+                             "NOT_REGISTERED: no repository named \"%s\" is registered. "
+                             "Repositories are onboarded only by an operator; Atlas does not "
+                             "discover them (try: atlas repo list)",
+                             name);
+    }
+    return ATLAS_OK;
+}
+
+atlas_status atlas_sem_status_on(atlas_db *db, const char *name, atlas_sem_status_report *out,
+                                 atlas_err *err) {
+    atlas_status st = require_repo_on(db, name, &out->repo, err);
     if (st != ATLAS_OK) {
         return st;
     }
@@ -174,24 +171,48 @@ atlas_status atlas_service_sem_status(atlas_ctx *ctx, const char *name,
                    atlas_sem_compiler_version());
 
     bool found = false;
-    st = load_generation(ctx, &out->repo, &out->generation, &found, &out->freshness,
+    st = load_generation(db, &out->repo, &out->generation, &found, &out->freshness,
                          &out->stale_reason, err);
     if (st != ATLAS_OK) {
         return st;
     }
     out->have_generation = found;
 
+    /* A9.2.3. The derived state and the operator's build description, so this
+     * command answers "is semantic evidence from this repository trustworthy,
+     * and if not what would fix it" without anybody opening the database. The
+     * plan is a read — it opens no transaction, takes no lock and creates no
+     * process — which is what lets the scheduler and this status page be the
+     * same function rather than two that agree by inspection. */
+    st = atlas_sem_plan_for(db, &out->repo, false, &out->plan, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    atlas_sem_config cfg;
+    atlas_sem_config_init(&cfg);
+    st = atlas_db_sem_config_get(db, out->repo.id, &cfg, err);
+    if (st == ATLAS_OK) {
+        st = atlas_buf_set(&out->compdbs, cfg.compdbs.data, cfg.compdbs.len, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_buf_set(&out->test_roots, cfg.test_roots.data, cfg.test_roots.len, err);
+    }
+    atlas_sem_config_free(&cfg);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+
     /* The most recent attempt, whatever became of it. A failed index is an
      * operational fact and a status that only ever reported successes could not
      * state it. */
-    st = atlas_db_sem_latest(atlas_ctx_db(ctx), out->repo.id, &out->latest, &out->have_latest, err);
+    st = atlas_db_sem_latest(db, out->repo.id, &out->latest, &out->have_latest, err);
     if (st != ATLAS_OK || !found) {
         return st;
     }
 
     unit_sink sink = {out};
     int64_t listed = 0;
-    atlas_status ust = atlas_db_sem_failed_units(atlas_ctx_db(ctx), out->generation.id,
+    atlas_status ust = atlas_db_sem_failed_units(db, out->generation.id,
                                                  ATLAS_SEM_STATUS_MAX_UNITS, take_unit, &sink,
                                                  &listed, &out->failed_truncated, err);
     /* The true number, taken from the generation's own tallies rather than from
@@ -201,6 +222,117 @@ atlas_status atlas_service_sem_status(atlas_ctx *ctx, const char *name,
     out->failed_total = out->generation.tu_partial + out->generation.tu_failed +
                         out->generation.tu_unsupported;
     return ust;
+}
+
+atlas_status atlas_service_sem_status(atlas_ctx *ctx, const char *name,
+                                      atlas_sem_status_report *out, atlas_err *err) {
+    return atlas_sem_status_on(atlas_ctx_db(ctx), name, out, err);
+}
+
+/* --- A9.2.3: the durable build description ------------------------------------
+ *
+ * Writing this row is what authorises the daemon to run a compiler over a
+ * repository when that repository changes, which is why it is an operator
+ * action and has no model-facing surface at all. Reading it back into the
+ * status report afterwards means one command shows the operator exactly what
+ * their change did, including the state it moved the repository into. */
+atlas_status atlas_sem_config_on(atlas_db *db, const atlas_sem_config_job *job,
+                                 atlas_sem_status_report *out, atlas_err *err) {
+    if (job == NULL || job->repo_name == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "semantic configuration: bad request");
+    }
+    atlas_repo_info repo;
+    atlas_repo_info_init(&repo);
+    atlas_status st = require_repo_on(db, job->repo_name, &repo, err);
+    if (st != ATLAS_OK) {
+        atlas_repo_info_free(&repo);
+        return st;
+    }
+
+    atlas_sem_config cfg;
+    atlas_sem_config_init(&cfg);
+    st = atlas_db_sem_config_get(db, repo.id, &cfg, err);
+    cfg.repo_id = repo.id;
+
+    /* The durable identity, so the row can still say which repository lineage
+     * it described after the rowid is gone — the reason every other durable
+     * Atlas record that references a repository carries one. */
+    if (st == ATLAS_OK) {
+        atlas_buf identity = ATLAS_BUF_INIT;
+        atlas_err ignored;
+        atlas_err_init(&ignored);
+        if (atlas_db_repo_identity_hash(db, repo.id, &identity, &ignored) == ATLAS_OK) {
+            (void)snprintf(cfg.repo_identity_hash, sizeof cfg.repo_identity_hash, "%s",
+                           atlas_buf_cstr(&identity));
+        }
+        atlas_buf_free(&identity);
+    }
+
+    /* NULL leaves a list alone; a non-NULL pointer with a zero length clears
+     * one. An operator adjusting the test roots must not silently drop the
+     * compilation databases, and vice versa. */
+    if (st == ATLAS_OK && job->compdbs != NULL) {
+        st = atlas_buf_set(&cfg.compdbs, job->compdbs, job->compdbs_len, err);
+    }
+    if (st == ATLAS_OK && job->test_roots != NULL) {
+        st = atlas_buf_set(&cfg.test_roots, job->test_roots, job->test_roots_len, err);
+    }
+    if (job->auto_rebuild >= 0) {
+        cfg.auto_rebuild = job->auto_rebuild > 0;
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_db_sem_config_set(db, &cfg, err);
+    }
+    atlas_sem_config_free(&cfg);
+    atlas_repo_info_free(&repo);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    /* Read the whole state back, so the operator sees what their change did
+     * rather than being told it was accepted. */
+    return atlas_sem_status_on(db, job->repo_name, out, err);
+}
+
+/* Packs the caller's argument arrays into the storage form and hands the whole
+ * request to the core. One place converts, so the CLI's `--compdb` repetition
+ * and the daemon's JSON array reach the same bytes. */
+static atlas_status pack_optional(const char *const *items, size_t count, atlas_buf *out,
+                                  bool *given, atlas_err *err) {
+    *given = items != NULL;
+    if (items == NULL) {
+        return ATLAS_OK;
+    }
+    return atlas_sem_config_pack(items, count, out, err);
+}
+
+atlas_status atlas_service_sem_config_set(atlas_ctx *ctx, const char *name,
+                                          const char *const *compdbs, size_t compdb_count,
+                                          const char *const *test_roots, size_t test_root_count,
+                                          int auto_rebuild, atlas_sem_status_report *out,
+                                          atlas_err *err) {
+    atlas_buf packed_db = ATLAS_BUF_INIT;
+    atlas_buf packed_tr = ATLAS_BUF_INIT;
+    bool db_given = false;
+    bool tr_given = false;
+    atlas_status st = pack_optional(compdbs, compdb_count, &packed_db, &db_given, err);
+    if (st == ATLAS_OK) {
+        st = pack_optional(test_roots, test_root_count, &packed_tr, &tr_given, err);
+    }
+    if (st == ATLAS_OK) {
+        atlas_sem_config_job job;
+        memset(&job, 0, sizeof job);
+        job.repo_name = name;
+        job.compdbs = db_given ? (const char *)(packed_db.data != NULL ? packed_db.data : "") : NULL;
+        job.compdbs_len = db_given ? packed_db.len : 0;
+        job.test_roots =
+            tr_given ? (const char *)(packed_tr.data != NULL ? packed_tr.data : "") : NULL;
+        job.test_roots_len = tr_given ? packed_tr.len : 0;
+        job.auto_rebuild = auto_rebuild;
+        st = atlas_sem_config_on(atlas_ctx_db(ctx), &job, out, err);
+    }
+    atlas_buf_free(&packed_db);
+    atlas_buf_free(&packed_tr);
+    return st;
 }
 
 /* --- symbols ------------------------------------------------------------------ */

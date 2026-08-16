@@ -25,6 +25,11 @@
 #include "atlas/service.h"
 #include "ipc/server_internal.h"
 
+
+/* A9.2.3. Defined near the bottom, beside the full writer it shares its fields
+ * with. Declared here because `sem.status` needs it before that point. */
+static atlas_status write_sem_plan_fields(dispatch_state *ds, const atlas_sem_status_report *rep,
+                                          atlas_err *err);
 /* --- resolving what to answer from ------------------------------------------- */
 
 /* The published generation and its freshness, written into the response before
@@ -49,31 +54,13 @@ static atlas_status open_generation(dispatch_state *ds, atlas_repo_info *info,
     }
     bool running = have_latest && latest.status == ATLAS_SEM_GEN_RUNNING;
 
-    atlas_index_state fs;
-    atlas_index_state_init(&fs);
-    st = atlas_db_index_state_get(ds->db, info->id, &fs, err);
-    bool file_current = st == ATLAS_OK && fs.present && fs.last_complete_generation > 0 &&
-                        !fs.event_gap && !fs.pending_full_reconcile;
-    atlas_index_state_free(&fs);
-    if (st != ATLAS_OK) {
-        return st;
-    }
-
-    /* A9.2.3. The live compilation-database digest, for the reason
-     * `load_generation` in `service_sem.c` states: the daemon schedules a
-     * rebuild by noticing that a generation is stale, so a staleness check that
-     * never fires is a repository that never rebuilds. Both read paths ask the
-     * same question of the same helper, so the socket and the local context
-     * cannot answer differently about the same generation. */
-    char live_digest[65];
-    live_digest[0] = '\0';
-    atlas_err ignored;
-    atlas_err_init(&ignored);
-    (void)atlas_sem_repo_compdb_digest(ds->db, info, live_digest, &ignored);
-
+    /* A9.2.3. One implementation of the freshness question, shared with the
+     * local CLI path: the daemon schedules a rebuild by noticing that a
+     * generation is stale, so a check that never fires is a repository that
+     * never rebuilds — and a check that fires on one surface and not the other
+     * is two answers to one question. */
     const char *reason = NULL;
-    atlas_sem_freshness f = atlas_sem_freshness_of(gen, *found, running, info->scanned_head,
-                                                   live_digest, file_current, &reason);
+    atlas_sem_freshness f = atlas_sem_freshness_now(ds->db, info, gen, *found, running, &reason);
 
     st = atlas_json_key_str(ds->j, "repo", info->name, err);
     if (st == ATLAS_OK) {
@@ -273,6 +260,22 @@ static atlas_status method_sem_status(dispatch_state *ds, const atlas_ipc_reques
     }
     if (st == ATLAS_OK) {
         st = atlas_json_key_int(ds->j, "tu_production", gen.tu_production, err);
+    }
+
+    /* A9.2.3's derived state and build description, through the one writer the
+     * operator-gated `code.sem_config` also uses. `repo` and `freshness` are
+     * emitted by `open_generation` above, so the plan is loaded here and its
+     * remaining fields written — a status that reported the generation without
+     * the state would leave a client to re-derive "is a rebuild due?", which is
+     * the question this season exists to answer once. */
+    if (st == ATLAS_OK) {
+        atlas_sem_status_report plan_rep;
+        atlas_sem_status_report_init(&plan_rep);
+        st = atlas_sem_status_on(ds->db, info.name, &plan_rep, err);
+        if (st == ATLAS_OK) {
+            st = write_sem_plan_fields(ds, &plan_rep, err);
+        }
+        atlas_sem_status_report_free(&plan_rep);
     }
 
     if (st == ATLAS_OK) {
@@ -936,4 +939,128 @@ const atlas_method_entry *atlas_server_sem_methods(size_t *count_out) {
         *count_out = sizeof(SEM_METHODS) / sizeof(SEM_METHODS[0]);
     }
     return SEM_METHODS;
+}
+
+/* --- A9.2.3: the derived state, the manifest and the build description -------
+ *
+ * One writer, for the reason `atlas_service_verify_write_detail` is one: two
+ * places emitting the same block is how a read and a write start describing the
+ * same repository differently, and here one of them is the command an operator
+ * runs to check the other.
+ *
+ * Every value is Atlas' own: a fixed vocabulary name, an integer Atlas counted,
+ * a boolean, or a path an *operator* wrote down. The paths are the only thing
+ * here a person chose, and they are written through the ordinary string writer,
+ * which escapes them.
+ *
+ * The four axes stay four fields. `activity` is the fold an operator acts on;
+ * `freshness` and `coverage_complete` are the two axes it folds, and both are
+ * sent beside it. A surface holding only the fold could not distinguish
+ * "current and complete" from "current and describing half the tree", which is
+ * the whole state this season adds. */
+/* The fields `open_generation` has not already written.
+ *
+ * Split from the full writer because `sem.status` emits `repo`, `freshness` and
+ * `stale_reason` before it has a plan — freshness comes first on every semantic
+ * read, which is A8-CI's rule — and a response must not carry a key twice. */
+static atlas_status write_sem_plan_fields(dispatch_state *ds, const atlas_sem_status_report *rep,
+                                          atlas_err *err) {
+    const atlas_sem_plan *p = &rep->plan;
+    atlas_status st = atlas_json_key_str(ds->j, "activity", atlas_sem_activity_name(p->activity),
+                                         err);
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str_opt(
+            ds->j, "hold_reason",
+            atlas_sem_hold_reason_is_known(p->hold_reason) ? p->hold_reason : NULL, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(ds->j, "coverage_complete", p->coverage_complete, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(ds->j, "configured", p->configured, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(ds->j, "auto_rebuild", p->auto_rebuild, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(ds->j, "rebuild_due", p->should_build, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "fail_count", p->fail_count, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str_opt(ds->j, "fail_reason",
+                                    atlas_sem_why_is_known(p->fail_reason) ? p->fail_reason : NULL,
+                                    err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str_opt(ds->j, "fail_at", p->fail_at, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str_opt(ds->j, "source_identity", p->source_identity, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str_opt(ds->j, "generation_identity", p->generation_identity, err);
+    }
+
+    /* The declared lists, each element its own string. Sent as arrays rather
+     * than as the newline-joined storage form: a client must not have to parse
+     * a separator to find out what an operator configured. */
+    static const char *const KEYS[2] = {"compdbs", "test_roots"};
+    const atlas_buf *const BUFS[2] = {&rep->compdbs, &rep->test_roots};
+    for (size_t k = 0; k < 2 && st == ATLAS_OK; k++) {
+        st = atlas_json_key(ds->j, KEYS[k], err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_arr_begin(ds->j, err);
+        }
+        if (st != ATLAS_OK) {
+            break;
+        }
+        const char *data = BUFS[k]->len > 0 ? (const char *)BUFS[k]->data : "";
+        size_t len = BUFS[k]->len;
+        size_t start = 0;
+        for (size_t i = 0; i <= len && st == ATLAS_OK; i++) {
+            if (i != len && data[i] != '\n') {
+                continue;
+            }
+            size_t n = i - start;
+            /* Bounded and *skipped* rather than truncated when it does not fit.
+             * A truncated path names a different file, and a client reading it
+             * back would configure the repository to read something else. The
+             * bound cannot be reached through this path — `atlas_sem_config_pack`
+             * refuses a description longer than `ATLAS_SEM_CONFIG_MAX_BYTES` in
+             * total — so this is the belt to that braces. */
+            char one[ATLAS_SEM_CONFIG_MAX_BYTES];
+            if (n > 0 && n < sizeof one) {
+                memcpy(one, data + start, n);
+                one[n] = '\0';
+                st = atlas_json_str(ds->j, atlas_safe(&ds->safe, one), err);
+            }
+            start = i + 1u;
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_arr_end(ds->j, err);
+        }
+    }
+    return st;
+}
+
+atlas_status atlas_server_write_sem_config(dispatch_state *ds, const atlas_sem_status_report *rep,
+                                           atlas_err *err) {
+    const atlas_sem_plan *p = &rep->plan;
+    atlas_status st = atlas_json_key_str(ds->j, "repo", rep->repo.name, err);
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "freshness", atlas_sem_freshness_name(p->freshness), err);
+    }
+    if (st == ATLAS_OK) {
+        /* Checked against Atlas' own closed set before it crosses the socket,
+         * so a value from anywhere else becomes absent rather than reproduced. */
+        st = atlas_json_key_str_opt(
+            ds->j, "stale_reason",
+            atlas_sem_stale_reason_is_known(p->stale_reason) ? p->stale_reason : NULL, err);
+    }
+    if (st == ATLAS_OK) {
+        st = write_sem_plan_fields(ds, rep, err);
+    }
+    return st;
 }

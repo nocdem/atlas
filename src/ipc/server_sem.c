@@ -163,12 +163,50 @@ static atlas_status method_sem_status(dispatch_state *ds, const atlas_ipc_reques
         st = atlas_json_key_str_opt(ds->j, "compiler_id", atlas_sem_compiler_id(), err);
     }
 
-    atlas_sem_generation gen;
-    bool found = false;
+    /* A9.2.3: one computation for the whole response.
+     *
+     * `atlas_sem_status_on` resolves the repository, computes the plan and reads
+     * the published generation, and the plan already carries the freshness — so
+     * calling `open_generation` here as well would hash every declared
+     * compilation database a second time within one response. Measured against a
+     * repository with two databases totalling 485 KiB, the redundant work was
+     * most of the command's cost; and two computations within one document could
+     * disagree if the tree moved between them. */
+    atlas_sem_status_report rep;
+    atlas_sem_status_report_init(&rep);
     if (st == ATLAS_OK) {
-        st = open_generation(ds, &info, &gen, &found, err);
+        st = atlas_sem_status_on(ds->db, info.name, &rep, err);
     }
-    /* A9.2.3's derived state and build description, **before** the early return
+    const atlas_sem_generation gen = rep.generation;
+    const bool found = rep.have_generation;
+
+    /* Freshness first, always. A caller that read the rows without it could not
+     * tell an answer about the current code from one about code that has since
+     * changed, and those must never be indistinguishable. */
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "repo", info.name, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "freshness", atlas_sem_freshness_name(rep.freshness), err);
+    }
+    if (st == ATLAS_OK) {
+        /* Checked against Atlas' own closed set before it crosses the socket,
+         * so a value from anywhere else becomes absent rather than reproduced. */
+        st = atlas_json_key_str_opt(
+            ds->j, "stale_reason",
+            atlas_sem_stale_reason_is_known(rep.stale_reason) ? rep.stale_reason : NULL, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(ds->j, "have_generation", found, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "generation_id", gen.id, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str_opt(ds->j, "indexed_commit", gen.commit_id, err);
+    }
+
+    /* The derived state and build description, **before** the early return
      * for a repository with no generation.
      *
      * That return used to end the response, so a repository Atlas had never
@@ -180,16 +218,11 @@ static atlas_status method_sem_status(dispatch_state *ds, const atlas_ipc_reques
      * after a write the daemon had accepted, because the write's own read-back
      * went through this method. */
     if (st == ATLAS_OK) {
-        atlas_sem_status_report plan_rep;
-        atlas_sem_status_report_init(&plan_rep);
-        st = atlas_sem_status_on(ds->db, info.name, &plan_rep, err);
-        if (st == ATLAS_OK) {
-            st = write_sem_plan_fields(ds, &plan_rep, err);
-        }
-        atlas_sem_status_report_free(&plan_rep);
+        st = write_sem_plan_fields(ds, &rep, err);
     }
 
     if (st != ATLAS_OK || !found) {
+        atlas_sem_status_report_free(&rep);
         atlas_repo_info_free(&info);
         return st;
     }
@@ -307,6 +340,7 @@ static atlas_status method_sem_status(dispatch_state *ds, const atlas_ipc_reques
     if (st == ATLAS_OK) {
         st = atlas_json_arr_end(ds->j, err);
     }
+    atlas_sem_status_report_free(&rep);
     atlas_repo_info_free(&info);
     return st;
 }

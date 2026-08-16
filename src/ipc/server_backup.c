@@ -42,6 +42,7 @@
 
 #include "atlas/backup.h"
 #include "atlas/maintenance.h"
+#include "atlas/sem.h"
 #include "atlas/buf.h"
 #include "atlas/error.h"
 #include "atlas/ipc.h"
@@ -513,12 +514,33 @@ static atlas_status method_code_sem_config(dispatch_state *ds, const atlas_ipc_r
             continue;
         }
         *FLAGS[k] = true;
+        /* Packed by `atlas_sem_config_pack`, which is the *one* function that
+         * produces the storage form — and that is a correctness requirement, not
+         * tidiness. The first cut appended NUL-separated bytes here while the
+         * local path packed newline-separated, so a request naming two
+         * compilation databases stored `a\0b`, SQLite read the TEXT back up to
+         * the first NUL, and the second database silently vanished. It was
+         * visible only on a repository that has two, which is the acceptance
+         * repository and not the fixture. */
         size_t count = atlas_ipc_array_len(arr);
+        const char *items[ATLAS_SEM_MAX_COMPDBS];
+        size_t n = 0;
         for (size_t i = 0; i < count && st == ATLAS_OK; i++) {
             const char *one = NULL;
-            if (atlas_ipc_array_str(arr, i, &one) && one != NULL && one[0] != '\0') {
-                st = atlas_buf_append(BUFS[k], one, strlen(one) + 1u, err);
+            if (!atlas_ipc_array_str(arr, i, &one) || one == NULL || one[0] == '\0') {
+                continue;
             }
+            if (n >= ATLAS_SEM_MAX_COMPDBS) {
+                /* Refused, never truncated: a silently shortened description
+                 * names a build nobody asked for. */
+                st = atlas_err_set(err, ATLAS_ERR_USAGE, "at most %d paths may be named",
+                                   ATLAS_SEM_MAX_COMPDBS);
+                break;
+            }
+            items[n++] = one;
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_sem_config_pack(items, n, BUFS[k], err);
         }
     }
 

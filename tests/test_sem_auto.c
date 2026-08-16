@@ -483,6 +483,71 @@ static void test_a_generation_left_running_by_a_dead_daemon_is_reaped(void) {
     live_stop(&L);
 }
 
+
+/* Two compilation databases, through the write path a real deployment uses.
+ *
+ * The RPC handler packed the array NUL-separated while the storage form is
+ * newline-separated, so `a\0b` went into a TEXT column, SQLite read it back up
+ * to the first NUL, and the second database silently vanished. Invisible on a
+ * repository with one — which every fixture had, and which is why this one has
+ * two. Found on the acceptance repository, by reading what came back.
+ *
+ * Driven locally because the write is operator-gated (see `enable_auto`); what
+ * is under test is that one packer produces the storage form, and the local and
+ * remote paths now call the same one. */
+static void test_two_compilation_databases_both_survive_the_write(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    live L;
+    live_start(&L, /*configured=*/false, &err);
+    fx_daemon_stop(&L.d, false);
+
+    T_OK(fx_mkdir(fx_repo(&L.fx), "second", &err), &err);
+    T_OK(fx_write(fx_repo(&L.fx), "second/compile_commands.json", "[]", &err), &err);
+
+    const char *args[] = {"--data-dir",
+                          fx_data_dir(&L.fx),
+                          "code",
+                          "sem-config",
+                          "fixture",
+                          "--compdb",
+                          "compile_commands.json",
+                          "--compdb",
+                          "second/compile_commands.json",
+                          "--test-root",
+                          "tests",
+                          "--test-root",
+                          "spec",
+                          "--json"};
+    atlas_buf out = ATLAS_BUF_INIT;
+    int code = 0;
+    T_OK(fx_atlas(args, 14u, &out, NULL, &code, &err), &err);
+    T_EQ_INT(code, 0);
+    const char *doc = atlas_buf_cstr(&out);
+    T_CHECK_MSG(strstr(doc, "\"compile_commands.json\"") != NULL,
+                "the first compilation database was lost: %s", doc);
+    T_CHECK_MSG(strstr(doc, "\"second/compile_commands.json\"") != NULL,
+                "the second compilation database was lost: %s", doc);
+    T_CHECK_MSG(strstr(doc, "\"tests\"") != NULL && strstr(doc, "\"spec\"") != NULL,
+                "a declared test root was lost: %s", doc);
+    atlas_buf_free(&out);
+
+    /* And it reads back the same way, which is the half that was broken: the
+     * write appeared to succeed and the loss showed only on the next read. */
+    const char *read[] = {"--data-dir", fx_data_dir(&L.fx), "code", "sem-config", "fixture",
+                          "--json"};
+    atlas_buf back = ATLAS_BUF_INIT;
+    T_OK(fx_atlas(read, 6u, &back, NULL, &code, &err), &err);
+    T_EQ_INT(code, 0);
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&back), "\"second/compile_commands.json\"") != NULL,
+                "the second compilation database did not survive a round trip: %s",
+                atlas_buf_cstr(&back));
+    atlas_buf_free(&back);
+
+    fx_daemon_free(&L.d);
+    fx_close(&L.fx);
+}
+
 static const atlas_test TESTS[] = {
     {"the daemon reaches current and stays there without being asked",
      test_the_daemon_reaches_current_and_stays_there},
@@ -498,6 +563,8 @@ static const atlas_test TESTS[] = {
      test_a_model_can_read_freshness_and_cannot_change_it},
     {"a generation left running by a dead daemon is reaped",
      test_a_generation_left_running_by_a_dead_daemon_is_reaped},
+    {"two compilation databases both survive the write",
+     test_two_compilation_databases_both_survive_the_write},
 };
 
 ATLAS_TEST_MAIN("sem_auto", TESTS)

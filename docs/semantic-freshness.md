@@ -426,7 +426,60 @@ automatic implementation and a manual one with divergent semantics.
 It remains diagnostic and administrative. Normal semantic freshness does not
 depend on anybody remembering to run it.
 
-## 15. What is not claimed
+## 15. Observed costs
+
+Observations on one machine, from one run each. **They are observations, not
+bounds** — a different tree, a larger compilation database or a busier machine
+produces different numbers, and nothing here is a limit Atlas holds.
+
+| Measurement | Observed |
+|---|---|
+| `code sem-status` on a repository with no build description | 23 ms per invocation |
+| `code sem-status` on a repository with two databases totalling 485 KiB and 1,208 C sources and headers | 42 ms per invocation |
+| a first semantic index of a 3-unit repository, scheduled and built unaided | 4 s from the edit to `CURRENT` |
+| an automatic rebuild after an uncommitted edit, same repository | published within 4 s of the edit |
+
+Both figures include process start, which dominates the first. The difference —
+about 19 ms — is what this season adds to a semantic read of that repository:
+one bounded read and SHA-256 of each declared compilation database, and a digest
+over every C source and header the file index holds.
+
+It is paid on **every** semantic read of a configured repository, and it scales
+with the size of the compilation databases. A first cut paid it several times per
+response, because `sem.status` computed freshness once for its header and again
+for the derived state; collapsing that to one computation took the same
+measurement from 61 ms to 42 ms. Two computations within one response could also
+have disagreed if the tree moved between them.
+
+A repository with no build description pays nothing: there is nothing declared to
+hash.
+
+## 16. Observed on a real repository
+
+The finding this season exists for, measured on a 761-source C repository whose
+semantic index was built before A9.2.3:
+
+```
+  translation units 416
+    complete        416
+    ...
+  scope discovery   UNKNOWN
+```
+
+Under A9.2.2 that generation asserted `tracked_source = COMPLETE` — every unit
+the compilation database named had parsed — and could therefore support "there is
+no caller of X". Counted against the tree the file index enumerated, it covers
+**369 of 761** C sources. Nearly 400 sources it had never read.
+
+Nothing was wrong with the index. `416/416` was true. It simply was not a
+coverage claim, and reading it as one is the error the manifest exists to end.
+
+The same generation now reads `scope_discovery: UNKNOWN`, because it was built
+before the manifest existed and recorded nothing from which its scope could be
+reconstructed — so it supports no absence at all until it is rebuilt. That is
+migration 18's conservatism, and it is the correct answer rather than a gap.
+
+## 17. What is not claimed
 
 - **Atlas does not observe a running system.** No verifier and no part of this
   layer reads deployed configuration or runs the software. Repository absence is

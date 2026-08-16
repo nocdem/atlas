@@ -170,24 +170,30 @@ atlas_status atlas_sem_status_on(atlas_db *db, const char *name, atlas_sem_statu
     (void)snprintf(out->compiler_version, sizeof(out->compiler_version), "%s",
                    atlas_sem_compiler_version());
 
-    bool found = false;
-    st = load_generation(db, &out->repo, &out->generation, &found, &out->freshness,
-                         &out->stale_reason, err);
-    if (st != ATLAS_OK) {
-        return st;
-    }
-    out->have_generation = found;
-
-    /* A9.2.3. The derived state and the operator's build description, so this
-     * command answers "is semantic evidence from this repository trustworthy,
-     * and if not what would fix it" without anybody opening the database. The
-     * plan is a read — it opens no transaction, takes no lock and creates no
-     * process — which is what lets the scheduler and this status page be the
-     * same function rather than two that agree by inspection. */
+    /* A9.2.3. The derived state, the freshness and the generation, from **one**
+     * computation.
+     *
+     * The plan is a read — no transaction, no lock, no process — which is what
+     * lets the scheduler and this status page be the same function rather than
+     * two that agree by inspection. It also already contains the freshness, and
+     * that matters for more than tidiness: computing freshness twice within one
+     * response means hashing every declared compilation database twice, and it
+     * means the two halves of one document could disagree if the tree moved
+     * between them. Measured on a repository with two databases totalling 485
+     * KiB, the redundant work was most of the command's cost. */
     st = atlas_sem_plan_for(db, &out->repo, false, &out->plan, err);
     if (st != ATLAS_OK) {
         return st;
     }
+    out->freshness = out->plan.freshness;
+    out->stale_reason = out->plan.stale_reason;
+
+    bool found = false;
+    st = atlas_db_sem_current(db, out->repo.id, &out->generation, &found, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    out->have_generation = found;
     atlas_sem_config cfg;
     atlas_sem_config_init(&cfg);
     st = atlas_db_sem_config_get(db, out->repo.id, &cfg, err);

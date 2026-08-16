@@ -336,6 +336,28 @@ static atlas_status method_evidence_produce(dispatch_state *ds, const atlas_ipc_
     if (st == ATLAS_OK) {
         st = atlas_json_key_str_opt(ds->j, "detail", res.detail, err);
     }
+    /* A9.2.2. The truth axis and its coverage, sent in the shape the *daemon*
+     * produces. Under A7.1 the socket is the only path to the index, so a field
+     * that existed only in the local renderer would be one every remote surface
+     * silently lacked — the A9.2.1 closure defect, which is why these are wired
+     * here, read back in `service_remote.c`, and rendered by both renderers in
+     * the same change. */
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "truth", atlas_verify_truth_name(res.truth), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "truth_reason",
+                                atlas_verify_truth_reason_name(res.truth_reason), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "truth_detail",
+                                atlas_verify_truth_reason_description(res.truth_reason), err);
+    }
+    if (st == ATLAS_OK) {
+        char cov[512];
+        (void)atlas_verify_coverage_render(&res.coverage, cov, sizeof cov);
+        st = atlas_json_key_str(ds->j, "coverage_detail", cov, err);
+    }
     atlas_verify_intake_result_free(&res);
     return st;
 }

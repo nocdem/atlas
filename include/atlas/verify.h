@@ -567,6 +567,23 @@ typedef enum atlas_verify_reason {
      * still readable: it remains true of commit X and saying so costs nothing.
      * What it may not do is move a lifecycle state. */
     ATLAS_VREASON_SOURCE_DRIFT,
+    /* A9.2.2. The transition would rest on a proposition Atlas has not
+     * established on the truth axis — the subject is neither shown present nor
+     * shown absent, because a coverage dimension the conclusion depends on is
+     * partial, stale or was never established.
+     *
+     * §18's requirement made explicit rather than left implicit. The gates
+     * above already make it *structurally* hard to reach a transition on an
+     * unestablished truth — a negative conclusion with insufficient coverage
+     * comes back UNAVAILABLE from the verifier, which is not VERIFIED, which is
+     * already BLOCKED. This reason exists so the rule is **checked** rather
+     * than merely implied, and so the audit row says which of the two it was:
+     * "the evidence was thin" and "Atlas never looked everywhere it would have
+     * had to" are different findings and want different remedies.
+     *
+     * BLOCKED rather than NEEDS_REVIEW, for SOURCE_DRIFT's reason: this is not
+     * an answer that is probably right and wants confirming. */
+    ATLAS_VREASON_COVERAGE_INSUFFICIENT,
     /* Every gate passed. */
     ATLAS_VREASON_OK
 } atlas_verify_reason;
@@ -1016,7 +1033,20 @@ typedef enum atlas_verify_verifier {
      * difficulty — see the implementation. */
     ATLAS_VERIFIER_SYMBOL_ABSENT,
     /* A direct call edge the compiler proved exists between two symbols. */
-    ATLAS_VERIFIER_PROVEN_EDGE
+    ATLAS_VERIFIER_PROVEN_EDGE,
+    /* A9.2.2. No caller reaches a symbol.
+     *
+     * The one verifier whose *whole purpose* is a negative conclusion, which is
+     * why it is the one that needed the coverage model before it could exist.
+     * "Nothing calls X" cannot be established from an empty result set: a
+     * translation unit that failed to parse may hold the call, a function
+     * pointer may reach it, and an external-linkage symbol may be called from
+     * code Atlas never indexed.
+     *
+     * So it is bounded by three mechanical questions rather than by a caveat —
+     * see `atlas_verify_verifier_absence_dims` and the implementation. Every
+     * one is a read over `sem_edges` and `sem_symbols`. */
+    ATLAS_VERIFIER_NO_PROVEN_CALLER
 } atlas_verify_verifier;
 
 const char *atlas_verify_verifier_name(atlas_verify_verifier v);
@@ -1040,6 +1070,392 @@ typedef enum atlas_verify_check {
 const char *atlas_verify_check_name(atlas_verify_check c);
 bool atlas_verify_check_parse(const char *name, atlas_verify_check *out);
 
+/* ==========================================================================
+ * A9.2.2 — epistemic absence and coverage semantics
+ *
+ * The invariant this section exists to make structural:
+ *
+ *   **NO EVIDENCE OF X IS NOT EVIDENCE OF NO X.**
+ *
+ * and its operational half:
+ *
+ *   **ABSENCE requires positive proof that the observation coverage is
+ *   sufficient for the bounded claim.** Where coverage is insufficient,
+ *   incomplete, stale, unsupported or unknown, the answer is UNKNOWN — never
+ *   ABSENT.
+ *
+ * ## Why a fourth axis rather than a wider `atlas_verify_check`
+ *
+ * `atlas_verify_check` answers "was this verifier's truth condition met?", and
+ * that is not the same question as "does the thing exist?". PASS means *absent*
+ * for `atlas.symbol_absent` and *present* for `atlas.symbol_present`, so a
+ * reader holding a result cannot say which without knowing which verifier ran
+ * and inverting by hand. Every surface that reported a check therefore reported
+ * something a person or a model had to decode, and decoding it wrongly in the
+ * safe-looking direction is exactly the failure this season is about.
+ *
+ * So Atlas now carries four orthogonal axes, and **no code path derives any one
+ * of them from another**:
+ *
+ *   kind     — what sort of knowledge is this?          (A9.1, on the document)
+ *   status   — how far through approval did it get?     (A4, from the ledger)
+ *   verify   — what evidence bears on whether it holds? (A9.2, derived on read)
+ *   truth    — is the thing there, not there, or unknown? (A9.2.2, derived)
+ *
+ * ## The asymmetry, stated once
+ *
+ * Positive evidence needs less coverage than negative evidence, and this is not
+ * a convenience — it is the shape of the world. Finding one caller proves a
+ * caller exists however incomplete the index, because an incomplete index
+ * cannot conjure a call that is not there. Finding zero callers proves nothing
+ * at all unless Atlas can show it looked everywhere a caller could have been.
+ *
+ * One direction is monotone in coverage and the other is not. Everything below
+ * follows from that sentence.
+ * ========================================================================== */
+
+/* What Atlas knows about whether the proposition's subject is there.
+ *
+ * **UNKNOWN is zero**, which is the house rule (A6's UNKNOWN, A8's DISABLED,
+ * A9.2's UNVERIFIED) and here it is load-bearing rather than conventional: a
+ * zeroed struct, an absent column and a row written before this vocabulary
+ * existed must all read as "Atlas has not established this". A zero that meant
+ * ABSENT would make `memset` assert non-existence. */
+typedef enum atlas_verify_truth {
+    /* Epistemic uncertainty. **Not a negative fact**, and every consumer —
+     * including a future A10 — must treat it as "Atlas has not established
+     * this", never as "no". This is the value a zero-result search produces,
+     * and producing it is the whole point of the season. */
+    ATLAS_TRUTH_UNKNOWN = 0,
+    /* Established to be there, within the claim's declared scope. */
+    ATLAS_TRUTH_PRESENT,
+    /* Established **not** to be there, within the claim's declared scope, with
+     * every coverage dimension the verifier requires for a negative shown to be
+     * sufficient. Reachable through exactly one function — see
+     * `atlas_verify_truth_of` — and through no caller, transport or intake
+     * parameter. */
+    ATLAS_TRUTH_ABSENT,
+    /* Not a bounded factual question at all: a normative choice, or a judgment.
+     * Distinct from UNKNOWN on purpose and this is §13's requirement rather
+     * than a nicety — UNKNOWN says "more evidence would settle it", and for
+     * "architecture A will be the best design in 2030" no evidence would.
+     * Reporting a normative proposition as UNKNOWN invites somebody to go and
+     * look, which is a category error dressed as diligence.
+     *
+     * Derived from `semantics == NORMATIVE` or `basis == JUDGMENT` rather than
+     * stored independently: it is a projection of facts Atlas already holds
+     * onto this axis, not a fifth axis. */
+    ATLAS_TRUTH_NOT_VERIFIABLE
+} atlas_verify_truth;
+
+const char *atlas_verify_truth_name(atlas_verify_truth t);
+bool atlas_verify_truth_parse(const char *name, atlas_verify_truth *out);
+/* Whether this value asserts something about the world. False for UNKNOWN and
+ * NOT_VERIFIABLE. Asked by the policy layer so "UNKNOWN must never satisfy a
+ * condition requiring ABSENT" is one check rather than a rule each rule
+ * remembers. */
+bool atlas_verify_truth_is_established(atlas_verify_truth t);
+
+/* --- coverage -------------------------------------------------------------
+ *
+ * How much of what would have to be looked at was actually looked at, per
+ * dimension. **Never a percentage.** A denominator Atlas cannot state is a
+ * denominator that makes a number up, and `coverage = 87%` reads as precision
+ * about exactly the thing that is unknown. A small closed vocabulary an auditor
+ * can check beats a figure nobody can reproduce.
+ *
+ * UNKNOWN is zero: a dimension nobody established is not a satisfied one. */
+typedef enum atlas_verify_coverage {
+    /* Nothing established this dimension. The default, and insufficient. */
+    ATLAS_COVERAGE_UNKNOWN = 0,
+    /* Everything in scope for this dimension was observed. */
+    ATLAS_COVERAGE_COMPLETE,
+    /* Some of it was observed and Atlas can say that some was not. */
+    ATLAS_COVERAGE_PARTIAL,
+    /* It was observed, and what was observed no longer describes the present.
+     * Distinct from PARTIAL because the remedy differs: PARTIAL needs a wider
+     * look, STALE needs a fresh one. */
+    ATLAS_COVERAGE_STALE,
+    /* This claim cannot depend on this dimension, so there is nothing to
+     * cover. The only value besides COMPLETE that is *sufficient*, and it must
+     * be asserted from a mechanical fact rather than assumed — an unconsidered
+     * dimension is UNKNOWN, not NOT_APPLICABLE. */
+    ATLAS_COVERAGE_NOT_APPLICABLE
+} atlas_verify_coverage;
+
+const char *atlas_verify_coverage_name(atlas_verify_coverage c);
+bool atlas_verify_coverage_parse(const char *name, atlas_verify_coverage *out);
+/* Whether this state permits a negative conclusion to rest on this dimension.
+ * True for COMPLETE and NOT_APPLICABLE and for nothing else — in particular
+ * **not** for UNKNOWN, which is the whole invariant in one line. */
+bool atlas_verify_coverage_sufficient(atlas_verify_coverage c);
+
+/* The dimensions a negative conclusion can turn on.
+ *
+ * Explicit and closed, because §4 requires a reader to be able to ask *which*
+ * part of the looking was incomplete. A single opaque "coverage: partial" tells
+ * somebody that something was missed without telling them what, which is not
+ * enough to act on and not enough to audit. */
+typedef enum atlas_verify_coverage_dim {
+    /* A semantic generation is published, COMPLETE (no failed, partial or
+     * unsupported translation units) and describes the current commit. */
+    ATLAS_COVDIM_SEMANTIC_GENERATION = 0,
+    /* The file index describes the working tree as it is now. Separate from
+     * SOURCE_DRIFT, which compares the claim's commit against the scanned head;
+     * this compares the scanned head against what is on disk. */
+    ATLAS_COVDIM_REPOSITORY_SNAPSHOT,
+    /* Every tracked source file in scope was read. */
+    ATLAS_COVDIM_TRACKED_SOURCE,
+    /* Build-generated sources were included. Generated code is where a symbol
+     * hides from a reader who only grepped the tree. */
+    ATLAS_COVDIM_GENERATED_SOURCE,
+    /* Every compiler-proved direct call edge in scope is recorded. */
+    ATLAS_COVDIM_DIRECT_CALLS,
+    /* Calls through function pointers, callbacks, dispatch tables and dynamic
+     * registration are accounted for. §9: direct-call completeness is **not**
+     * sufficient for "no caller reaches X", and this dimension is why that is a
+     * structural fact rather than a warning in a comment. */
+    ATLAS_COVDIM_INDIRECT_CALLS,
+    /* Callers outside the indexed repository, and reachability through dynamic
+     * symbol lookup, are excluded. Decidable for an internal-linkage symbol and
+     * not for an external-linkage one. */
+    ATLAS_COVDIM_EXTERNAL_CALLERS,
+    /* Test sources were included in scope. */
+    ATLAS_COVDIM_TESTS,
+    /* The document corpus a documentation claim is bounded by was enumerated.
+     * §12: searching three Markdown files establishes nothing project-wide
+     * unless those three files *are* the declared corpus. */
+    ATLAS_COVDIM_DOCUMENT_CORPUS,
+    /* The running system was observed. §11: repository absence is not
+     * operational absence, and Atlas has no runtime probe, so this is UNKNOWN
+     * for every claim that needs it — which makes such claims UNKNOWN, which is
+     * the correct fail-closed answer. */
+    ATLAS_COVDIM_RUNTIME_STATE,
+    /* Deployed configuration was read. Unavailable for the same reason. */
+    ATLAS_COVDIM_DEPLOYED_CONFIG
+} atlas_verify_coverage_dim;
+
+#define ATLAS_VERIFY_COVERAGE_DIMS 11
+
+const char *atlas_verify_coverage_dim_name(atlas_verify_coverage_dim d);
+bool atlas_verify_coverage_dim_parse(const char *name, atlas_verify_coverage_dim *out);
+const char *atlas_verify_coverage_dim_description(atlas_verify_coverage_dim d);
+
+/* Why the truth axis says what it says.
+ *
+ * A closed vocabulary rather than prose, because §22 requires a model to be able
+ * to ask "why is this UNKNOWN?" and receive something it can branch on. A
+ * sentence is not an answer a program can act on, and an LLM-written
+ * justification of a machine verdict is the one explanation that must not be
+ * the explanation.
+ *
+ * Kept **separate from `atlas_verify_reason`** on purpose. That vocabulary
+ * explains a *policy* verdict and each member carries the verdict it implies;
+ * this one explains a *truth* value. Merging them would have the two axes this
+ * season exists to separate sharing a field. */
+typedef enum atlas_verify_truth_reason {
+    ATLAS_TREASON_NONE = 0,
+    /* The verifier evaluated its truth condition and coverage sufficed. */
+    ATLAS_TREASON_ESTABLISHED,
+    /* No deterministic verifier ran, so nothing was mechanically evaluated. */
+    ATLAS_TREASON_NOT_EVALUATED,
+    /* A required dimension is PARTIAL. */
+    ATLAS_TREASON_COVERAGE_PARTIAL,
+    /* A required dimension was never established at all. */
+    ATLAS_TREASON_COVERAGE_UNKNOWN,
+    /* The semantic index does not describe the current commit. */
+    ATLAS_TREASON_SEMANTIC_INDEX_STALE,
+    /* No semantic generation is published; Atlas could not look. */
+    ATLAS_TREASON_SEMANTIC_INDEX_ABSENT,
+    /* The generation has failed, partial or unsupported translation units, so a
+     * symbol may live in a file that never parsed. */
+    ATLAS_TREASON_SEMANTIC_INDEX_INCOMPLETE,
+    /* The symbol's address is taken, so a call through a pointer, a dispatch
+     * table or a dynamic registration cannot be ruled out. */
+    ATLAS_TREASON_INDIRECT_CALLS_UNRESOLVED,
+    /* External linkage: callers outside the indexed repository, and dynamic
+     * symbol lookup, are not observable from here. */
+    ATLAS_TREASON_EXTERNAL_CALLERS_POSSIBLE,
+    /* §11. The running system was not observed. */
+    ATLAS_TREASON_RUNTIME_NOT_OBSERVED,
+    /* §11. Deployed configuration was not available. */
+    ATLAS_TREASON_DEPLOYED_CONFIG_UNAVAILABLE,
+    /* The file index does not describe the working tree. */
+    ATLAS_TREASON_REPOSITORY_SNAPSHOT_STALE,
+    /* A9.2.1 §5. The claim is bound to one commit and the index to another, so
+     * the evaluation is about a tree the repository has left. */
+    ATLAS_TREASON_SOURCE_DRIFT,
+    /* The claim declares no bound, so there is no set over which an absence
+     * could be complete. */
+    ATLAS_TREASON_SCOPE_UNBOUNDED,
+    /* Normative or judgment: not a factual question. */
+    ATLAS_TREASON_NOT_FACTUAL,
+    /* §15. An empirical basis never establishes PRESENT or ABSENT however high
+     * the score. Five agents failing to find X is not absence; it is five
+     * failures to find. */
+    ATLAS_TREASON_EMPIRICAL_BASIS
+} atlas_verify_truth_reason;
+
+const char *atlas_verify_truth_reason_name(atlas_verify_truth_reason r);
+bool atlas_verify_truth_reason_parse(const char *name, atlas_verify_truth_reason *out);
+/* One fixed Atlas-owned sentence per reason. No repository byte and no model
+ * byte reaches it, so it may be reported to a model unencoded. */
+const char *atlas_verify_truth_reason_description(atlas_verify_truth_reason r);
+size_t atlas_verify_truth_reason_count(void);
+atlas_verify_truth_reason atlas_verify_truth_reason_at(size_t index);
+
+/* What was looked at, per dimension, plus why the answer came out as it did.
+ *
+ * Derived server-side from index state and from nothing a caller supplied.
+ * There is deliberately **no intake path that can set a dimension**: a model
+ * may state a hypothesis and may not manufacture the coverage that would make
+ * it an absence proof. §29's adversarial requirement is met by the absence of a
+ * parameter rather than by a check on one. */
+typedef struct atlas_verify_coverage_report {
+    atlas_verify_coverage dims[ATLAS_VERIFY_COVERAGE_DIMS];
+    atlas_verify_truth_reason reason;
+} atlas_verify_coverage_report;
+
+/* Zeroes every dimension to UNKNOWN, which is the safe default and the one a
+ * `memset` would produce anyway. */
+void atlas_verify_coverage_report_init(atlas_verify_coverage_report *r);
+
+/* Whether every listed dimension is sufficient.
+ *
+ * `failed_out` receives the first insufficient dimension and `why_out` the
+ * reason it implies, so a caller reports *which* part of the looking fell short
+ * rather than that some part did. */
+bool atlas_verify_coverage_satisfies(const atlas_verify_coverage_report *r,
+                                     const atlas_verify_coverage_dim *dims, size_t count,
+                                     atlas_verify_coverage_dim *failed_out,
+                                     atlas_verify_truth_reason *why_out);
+
+/* One value for display: the weakest state among the dimensions that are not
+ * NOT_APPLICABLE, or NOT_APPLICABLE when every one of them is.
+ *
+ * A summary only. Never an input to `atlas_verify_truth_of`, which asks about
+ * the dimensions the verifier actually requires — a claim must not be blocked
+ * by a dimension it does not depend on, and must not be let through because an
+ * irrelevant dimension happened to be complete. */
+atlas_verify_coverage atlas_verify_coverage_summary(const atlas_verify_coverage_report *r);
+
+/* Renders `dim=STATE;dim=STATE` from the two closed vocabularies. Every byte is
+ * Atlas-owned, so the result is safe to store, relay and print unencoded.
+ * Returns the number of bytes written, excluding the terminator. */
+size_t atlas_verify_coverage_render(const atlas_verify_coverage_report *r, char *out,
+                                    size_t out_size);
+/* Reads back what `atlas_verify_coverage_render` wrote. An unrecognised
+ * dimension or state leaves that dimension UNKNOWN rather than being skipped,
+ * so a row written by a newer Atlas is read conservatively rather than
+ * optimistically. */
+bool atlas_verify_coverage_parse_detail(const char *text, atlas_verify_coverage_report *out);
+
+/* --- verifier polarity ----------------------------------------------------
+ *
+ * What PASS and FAIL mean on the truth axis, per verifier. A table rather than
+ * a convention, because the mapping is genuinely per-verifier: PASS is PRESENT
+ * for `atlas.symbol_present` and ABSENT for `atlas.symbol_absent`, and a
+ * consumer that assumed either would be wrong about half the vocabulary. */
+atlas_verify_truth atlas_verify_verifier_truth_of_check(atlas_verify_verifier v,
+                                                        atlas_verify_check c);
+
+/* The coverage dimensions this verifier requires before a **negative**
+ * conclusion may be drawn. Writes a pointer to a static table and returns its
+ * length; zero for a verifier whose negative rests on a positive reading.
+ *
+ * This is the per-verifier half of the absence-proof rule, and the reason it is
+ * a function rather than a constant per call site is that a test can enumerate
+ * it and a new verifier cannot quietly ship without deciding. */
+size_t atlas_verify_verifier_absence_dims(atlas_verify_verifier v,
+                                          const atlas_verify_coverage_dim **out);
+
+/* --- THE ABSENCE-PROOF RULE ----------------------------------------------
+ *
+ * §6, and the single most important function in the season. **The only
+ * producer of `ATLAS_TRUTH_ABSENT` in Atlas.** Nothing else may assign that
+ * value, no caller may pass it in, no transport carries a field that could hold
+ * it, and no intake verb accepts one. That is the same single-write-point shape
+ * as `settle()`, `atlas_db_evidence_insert`, `atlas_decision_apply_in_tx` and
+ * `atlas_orch_apply_in_tx`, applied to a value rather than to a table.
+ *
+ * The order is the argument, and each step refuses for a different reason:
+ *
+ *   1. Normative semantics or a JUDGMENT basis → NOT_VERIFIABLE. Asked first
+ *      because no amount of evidence changes it, so nothing below should get a
+ *      chance to matter.
+ *   2. A basis other than DETERMINISTIC → UNKNOWN. §15: empirical evidence
+ *      never establishes presence or absence however high the score, because
+ *      "nobody found it" is a fact about the searchers.
+ *   3. `check == UNAVAILABLE` → UNKNOWN. Atlas could not look, which is not a
+ *      finding.
+ *   4. The verifier's polarity decides which of PRESENT/ABSENT the check maps
+ *      to.
+ *   5. **If and only if that is ABSENT**, every dimension the verifier declares
+ *      must be sufficient. Otherwise UNKNOWN, naming the dimension that fell
+ *      short.
+ *   6. PRESENT is returned without a coverage requirement. §7's asymmetry, and
+ *      the one step that is deliberately permissive: an incomplete index cannot
+ *      conjure a symbol that is not there, so finding one is finding one.
+ *
+ * `why_out` always receives a reason, including on the PRESENT and ABSENT
+ * paths, so every surface can answer "why?" without a second call. */
+atlas_verify_truth atlas_verify_truth_of(atlas_verify_verifier v, atlas_verify_basis basis,
+                                         atlas_verify_claim_semantics semantics,
+                                         atlas_verify_check check,
+                                         const atlas_verify_coverage_report *coverage,
+                                         atlas_verify_truth_reason *why_out);
+
+/* Whether these two truth values, about the same subject and scope, are logical
+ * opposites. §21, and deliberately no more than this: PRESENT versus ABSENT is
+ * a contradiction, anything involving UNKNOWN or NOT_VERIFIABLE is not.
+ *
+ * Atlas does no natural-language negation detection and must not start. What is
+ * recognised is the mechanical case — the same verifier subject reached by
+ * `atlas.symbol_present` and `atlas.symbol_absent` — and nothing wider. */
+bool atlas_verify_truth_contradicts(atlas_verify_truth a, atlas_verify_truth b);
+
+/* --- what a change in the answer means ------------------------------------
+ *
+ * §16 and §20. Atlas concluded one thing and now concludes another. Whether
+ * that is a *verification error* depends on two questions a bare before/after
+ * pair cannot answer, and getting either wrong corrupts calibration in a
+ * direction that is hard to notice.
+ *
+ * The three cases, and why they must stay apart:
+ *
+ *   - **ACQUISITION.** UNKNOWN became PRESENT or ABSENT. Atlas said it did not
+ *     know and now it does. This is the system working, not failing. Counting
+ *     it as a false negative would charge a verifier for having been honest
+ *     about the limits of its coverage — which is exactly the behaviour A9.2.2
+ *     exists to encourage, so penalising it would push every verifier back
+ *     towards guessing, which is the failure this season set out to end.
+ *   - **HISTORICAL.** An established answer changed, and the snapshots differ.
+ *     The code changed. §20's SUPERSESSION: both were true, at different times,
+ *     and the older stays as history. Charging a verifier for the passage of
+ *     time would make every long-lived claim eventually look like a failure.
+ *   - **ERROR.** An established answer was contradicted **at the same bound
+ *     snapshot and scope**. Atlas asserted a thing over coverage it certified
+ *     sufficient, and it was wrong. This is the one case that is a genuine
+ *     verifier error and the one case eligible for calibration feedback.
+ *
+ * `same_snapshot` is what separates the last two, and it is decided from what
+ * the earlier result was *bound to* — its evaluated commit and semantic
+ * generation — never from how long ago it was written. */
+typedef enum atlas_verify_truth_change {
+    /* Nothing changed, or nothing established changed. */
+    ATLAS_TRUTH_CHANGE_NONE = 0,
+    /* UNKNOWN became established. Normal, and never an error. */
+    ATLAS_TRUTH_CHANGE_ACQUISITION,
+    /* An established answer changed across different snapshots. History. */
+    ATLAS_TRUTH_CHANGE_HISTORICAL,
+    /* An established answer was contradicted at the same snapshot. */
+    ATLAS_TRUTH_CHANGE_ERROR
+} atlas_verify_truth_change;
+
+const char *atlas_verify_truth_change_name(atlas_verify_truth_change c);
+atlas_verify_truth_change atlas_verify_truth_change_of(atlas_verify_truth prior,
+                                                       atlas_verify_truth now, bool same_snapshot);
+
 /* Runs one deterministic verifier over one claim's bounded input.
  *
  * `scope_out` receives Atlas' own sentence saying what was actually
@@ -1049,11 +1465,23 @@ bool atlas_verify_check_parse(const char *name, atlas_verify_check *out);
  * Neither ever carries repository bytes.
  *
  * Returns ATLAS_OK with `UNAVAILABLE` when it could not look. That is not a
- * failure of the call and not evidence about the claim. */
+ * failure of the call and not evidence about the claim.
+ *
+ * A9.2.2: `coverage_out` receives what the verifier was able to observe, per
+ * dimension. It is filled **before** the check is decided, and that ordering is
+ * the fix for the two defects the season's audit found rather than a detail: a
+ * *negative* raw result over insufficient coverage is reported as UNAVAILABLE
+ * here, not as FAIL, so the verification-state axis and the truth axis cannot
+ * disagree about the same evaluation. A negative verdict that reached the check
+ * axis while the truth axis said UNKNOWN would be one row contradicting itself.
+ *
+ * A *positive* raw result stays PASS or FAIL whatever the coverage, which is
+ * §7's asymmetry: finding the thing is finding it. */
 atlas_status atlas_verify_run_verifier(atlas_db *db, atlas_verify_verifier v, int64_t repo_id,
                                        const char *input, atlas_verify_check *check_out,
-                                       char *scope_out, size_t scope_size, char *detail_out,
-                                       size_t detail_size, atlas_err *err);
+                                       atlas_verify_coverage_report *coverage_out, char *scope_out,
+                                       size_t scope_size, char *detail_out, size_t detail_size,
+                                       atlas_err *err);
 
 /* --- the machine lifecycle audit row, which is also the warrant -----------
  *
@@ -1315,10 +1743,24 @@ typedef struct atlas_verify_source_binding {
     bool drift;
 } atlas_verify_source_binding;
 
+/* A9.2.2. What a result concluded on the truth axis, and what that conclusion
+ * rested on. Grouped the way `atlas_verify_source_binding` groups the drift
+ * columns: three facts that are only meaningful together, so a caller cannot
+ * record the verdict and forget the coverage that justifies it.
+ *
+ * `coverage` may be NULL, which records every dimension as UNKNOWN — the honest
+ * reading for a result that ran no verifier. */
+typedef struct atlas_verify_truth_record {
+    atlas_verify_truth truth;
+    atlas_verify_truth_reason reason;
+    const atlas_verify_coverage_report *coverage;
+} atlas_verify_truth_record;
+
 atlas_status atlas_db_verify_result_insert(atlas_db *db, int64_t claim_id,
                                            const atlas_verify_aggregate *agg, const char *verifier,
                                            atlas_verify_check check,
-                                           const atlas_verify_source_binding *src, const char *now,
+                                           const atlas_verify_source_binding *src,
+                                           const atlas_verify_truth_record *truth, const char *now,
                                            int64_t *id_out, atlas_err *err);
 
 atlas_status atlas_db_verify_audit_insert(atlas_db *db, const atlas_verify_audit *a,
@@ -1380,7 +1822,98 @@ atlas_status atlas_db_verify_sem_symbol(atlas_db *db, int64_t repo_id, const cha
                                         atlas_err *err);
 atlas_status atlas_db_verify_sem_proven_edge(atlas_db *db, int64_t repo_id, const char *src,
                                              const char *dst, bool *exists_out, bool *indexed_out,
-                                             atlas_err *err);
+                                             bool *complete_out, atlas_err *err);
+
+/* A9.2.2. Everything `atlas.no_proven_caller` needs to decide whether "nothing
+ * calls X" is establishable, in one bounded read.
+ *
+ * `caller_count` is compiler-proved direct callers. `address_taken` is the
+ * number of PROVEN `ADDRESS_TAKEN` edges naming this symbol, and it is the
+ * mechanical form of "could a function pointer reach it?" — a C function cannot
+ * be called indirectly unless its address escapes somewhere, so zero
+ * address-takes over a *complete* generation rules out every dispatch table,
+ * callback and registration in the indexed tree at once.
+ *
+ * `internal_linkage` is true only when the compiler computed INTERNAL for every
+ * definition of the name — never for EXTERNAL, NONE or UNKNOWN, so an
+ * unestablished linkage is treated as the dangerous case rather than the
+ * convenient one. It decides `ATLAS_COVDIM_EXTERNAL_CALLERS`: an internal
+ * symbol cannot be named from outside its translation unit, so the indexed tree
+ * is the whole world for it. An external one can be called from code Atlas
+ * never indexed and reached through dynamic symbol lookup, neither of which any
+ * amount of indexing would show — so that dimension is PARTIAL and the answer
+ * is UNKNOWN. Bounding the claim mechanically beats a caveat nobody reads.
+ *
+ * It is reported as a boolean rather than as `atlas_sem_linkage` so this header
+ * does not have to include `atlas/sem.h`, which would drag `atlas/db.h` behind
+ * it — the dependency this file's opening comment declines to take.
+ *
+ * `defined` reports whether the symbol exists at all: "nothing calls a function
+ * that does not exist" is a statement about the wrong thing, and answering it
+ * as an absence would be true and useless. */
+atlas_status atlas_db_verify_sem_callers(atlas_db *db, int64_t repo_id, const char *name,
+                                         int64_t *caller_count_out, int64_t *address_taken_out,
+                                         bool *internal_linkage_out, bool *defined_out,
+                                         bool *complete_out, bool *indexed_out, atlas_err *err);
+
+/* A9.2.2. The published semantic generation's state, for the coverage model.
+ *
+ * `indexed` — a generation is published at all. `complete` — it holds no failed,
+ * partial or unsupported translation unit. `current` — it was built from the
+ * commit the repository is now scanned at.
+ *
+ * Three separate answers because they call for three different actions and
+ * carry three different truth reasons: nothing to look at, a look that missed
+ * part of the tree, and a look at a tree that has since moved. Collapsing any
+ * two would tell a reader that something was wrong without telling them what to
+ * do about it. */
+atlas_status atlas_db_verify_sem_current(atlas_db *db, int64_t repo_id, bool *indexed_out,
+                                         bool *complete_out, bool *current_out, atlas_err *err);
+
+/* A9.2.2. The most recently *recorded* verdict for one claim.
+ *
+ * For the claim list, where recomputing an assessment per row would run a
+ * verifier for every claim in a repository. What a list shows is therefore the
+ * last recorded answer rather than a fresh one — history, explicitly, which is
+ * the same distinction A9.2 draws between `verify_results` and everything else
+ * it recomputes on read.
+ *
+ * Both out-parameters keep their zero — UNVERIFIED and UNKNOWN — when no result
+ * has ever been recorded, so a claim nobody has evaluated reads as unevaluated
+ * rather than as anything about the world. */
+atlas_status atlas_db_verify_last_result(atlas_db *db, int64_t claim_id,
+                                         atlas_verify_state *state_out,
+                                         atlas_verify_truth *truth_out, atlas_err *err);
+
+/* A9.2.2, §24. What Atlas most recently concluded about a knowledge record, on
+ * the truth axis, for the context builder.
+ *
+ * **Deliberately conservative, and the conservatism is the feature.** The
+ * answer is an established value only when every live claim on the record that
+ * has a stored result agrees on one; a record with no claims, no results, or
+ * claims that disagree reports UNKNOWN.
+ *
+ * The reason is §24 exactly. A context package is read by a model, and a model
+ * given a record whose claim is "no runtime override for X exists" must not be
+ * able to come away with "runtime override X does not exist". Reporting the
+ * strongest or the newest of several claims would let one settled claim speak
+ * for a record whose other claims are open — so where there is any doubt the
+ * answer is that Atlas does not know, which is the reading that cannot mislead.
+ *
+ * Recomputed on read, never cached: A6's rule about freshness. */
+atlas_status atlas_db_verify_truth_for_document(atlas_db *db, int64_t document_id,
+                                                atlas_verify_truth *truth_out, atlas_err *err);
+
+/* A9.2.2. Whether the file index currently describes the working tree.
+ *
+ * `ATLAS_COVDIM_REPOSITORY_SNAPSHOT`, and it is a different question from
+ * A9.2.1's SOURCE_DRIFT: drift compares the claim's commit against the scanned
+ * head, and this compares the scanned head against what is on disk. A watcher
+ * that is behind makes `atlas_db_verify_file_hash` report bytes the file no
+ * longer has, so a content-hash mismatch would be "read a stale snapshot"
+ * rather than "read the actual content" — which must not become an absence. */
+atlas_status atlas_db_verify_index_current(atlas_db *db, int64_t repo_id, bool *current_out,
+                                           atlas_err *err);
 
 /* Clears the soft repository references A4's rule requires, inside
  * `atlas_db_repo_remove`'s transaction. `repositories.id` is a reused rowid and

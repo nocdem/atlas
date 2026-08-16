@@ -109,6 +109,12 @@ void atlas_verify_assessment_init(atlas_verify_assessment *a) {
     atlas_verify_aggregate_init(&a->aggregate);
     a->check = ATLAS_CHECK_UNAVAILABLE;
     a->verifier = ATLAS_VERIFIER_NONE;
+    /* A9.2.2. Every zero here already means the safe thing — UNKNOWN truth,
+     * UNKNOWN coverage on every dimension, NONE reason — which is why the
+     * vocabularies were shaped that way. Stated rather than relied on. */
+    a->truth = ATLAS_TRUTH_UNKNOWN;
+    a->truth_reason = ATLAS_TREASON_NONE;
+    atlas_verify_coverage_report_init(&a->coverage);
 }
 
 /* Assesses one claim: runs its deterministic verifier if it has one, folds the
@@ -207,12 +213,18 @@ atlas_status atlas_verify_assess(atlas_db *db, const atlas_verifypolicy *policy,
     }
     out->basis = basis;
 
-    /* Run the verifier. It is a read and creates no process; see detverify.c. */
+    /* Run the verifier. It is a read and creates no process; see detverify.c.
+     *
+     * A9.2.2: it also fills the coverage report, and it fills it *before* it
+     * decides the check — so a negative conclusion whose coverage is
+     * insufficient comes back UNAVAILABLE rather than FAIL, and the check axis
+     * and the truth axis cannot end up disagreeing about one evaluation. */
     if (basis == ATLAS_VERIFY_BASIS_DETERMINISTIC) {
         st = atlas_verify_run_verifier(db, verifier, claim.repo_id,
                                        atlas_buf_cstr(&claim.verifier_input), &out->check,
-                                       out->verified_scope, sizeof out->verified_scope,
-                                       out->detail, sizeof out->detail, err);
+                                       &out->coverage, out->verified_scope,
+                                       sizeof out->verified_scope, out->detail, sizeof out->detail,
+                                       err);
         if (st != ATLAS_OK) {
             atlas_verify_claim_free(&claim);
             return st;
@@ -284,6 +296,35 @@ atlas_status atlas_verify_assess(atlas_db *db, const atlas_verifypolicy *policy,
              * fresh claim is UNVERIFIED. */
             break;
         }
+    }
+
+    /* --- A9.2.2: the truth axis ------------------------------------------
+     *
+     * Computed here, after the check has settled and the drift is known, and
+     * computed by `atlas_verify_truth_of` — **the only producer of
+     * `ATLAS_TRUTH_ABSENT` in Atlas**. Nothing in this file assigns that value,
+     * no request carries it and no intake verb accepts one, which is the same
+     * single-write-point shape `settle()` and `atlas_decision_apply_in_tx`
+     * have, applied to a value rather than to a table.
+     *
+     * It is a *fourth* axis and is derived from none of the other three. An
+     * OBLIGATION (kind) that is APPROVED (status) may be VERIFIED (verification
+     * state) and ABSENT (truth) — that combination is exactly what discharges
+     * it — and every one of the four is reported separately. */
+    out->truth = atlas_verify_truth_of(verifier, basis, claim.semantics, out->check, &out->coverage,
+                                       &out->truth_reason);
+
+    /* §19. A result about the tree Atlas has indexed is not a result about the
+     * tree the claim is bound to. Both directions are demoted, not just the
+     * negative one: a symbol found in the index at commit Y may have been added
+     * after the claim's commit X, so PRESENT is no safer than ABSENT across a
+     * drift.
+     *
+     * NOT_VERIFIABLE survives, because a normative proposition does not become
+     * a factual one by the repository moving. */
+    if (out->source_drift && out->truth != ATLAS_TRUTH_NOT_VERIFIABLE) {
+        out->truth = ATLAS_TRUTH_UNKNOWN;
+        out->truth_reason = ATLAS_TREASON_SOURCE_DRIFT;
     }
 
     /* Calibration. On this machine, and on any machine where this phase has
@@ -385,6 +426,24 @@ atlas_status atlas_verify_assess(atlas_db *db, const atlas_verifypolicy *policy,
         atlas_verify_aggregate_note(&out->aggregate, ATLAS_VREASON_STALE_EVIDENCE);
     }
 
+    /* §18. **UNKNOWN must never satisfy a policy condition that requires
+     * ABSENT.** A machine transition that rests on a deterministic verifier is
+     * a claim that Atlas established something about the world, so the truth
+     * axis has to have established it.
+     *
+     * Largely belt-and-braces by construction — a negative conclusion with
+     * insufficient coverage never reaches PASS, so it is never VERIFIED, so it
+     * is already BLOCKED by `NOT_VERIFIED` above. It is checked anyway, for the
+     * reason A6 gives about asserting a permissive verdict deliberately: a
+     * guarantee that holds only because three other gates happen to catch it is
+     * one a later edit to any of the three can delete silently. The distinct
+     * reason also tells an auditor *which* of the two happened — thin evidence,
+     * or a look that never covered the ground it would have had to. */
+    if (basis == ATLAS_VERIFY_BASIS_DETERMINISTIC && have_candidate &&
+        !atlas_verify_truth_is_established(out->truth)) {
+        atlas_verify_aggregate_note(&out->aggregate, ATLAS_VREASON_COVERAGE_INSUFFICIENT);
+    }
+
     /* Gate 4 — calibration, for the empirical path only.
      *
      * **This is the rule the whole phase turns on.** The check is guarded on
@@ -458,9 +517,13 @@ atlas_status atlas_verify_autolifecycle_run(atlas_db *db, const atlas_verifypoli
         a->sem_generation,
         a->source_drift,
     };
+    /* A9.2.2. The truth axis travels with the result, so a row read years later
+     * says what Atlas concluded about the subject and what coverage that rested
+     * on — not merely how strong the evidence was. */
+    const atlas_verify_truth_record truth_record = {a->truth, a->truth_reason, &a->coverage};
     st = atlas_db_verify_result_insert(db, claim_id, &a->aggregate,
                                        atlas_verify_verifier_name(a->verifier), a->check, &binding,
-                                       now, &result_id, err);
+                                       &truth_record, now, &result_id, err);
     if (st != ATLAS_OK) {
         atlas_db_rollback(db);
         return st;

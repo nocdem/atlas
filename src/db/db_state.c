@@ -74,6 +74,41 @@ atlas_status atlas_db_index_state_ensure(atlas_db *db, int64_t repo_id, atlas_er
     return atlas_db_step_done(db, stmt, err);
 }
 
+bool atlas_index_state_is_current(const atlas_index_state *s, const char **reason_out) {
+    /* The one claim a caller actually acts on, computed once here rather than
+     * reconstructed by every consumer from the flags. The reason strings are a
+     * fixed Atlas vocabulary: they reach a model's context, so they must not be
+     * assembled from anything a repository can influence.
+     *
+     * A9.2.2 moved this out of `src/ipc/server.c`, where it lived as
+     * `atlas_server_index_current`, because the coverage model has to ask the
+     * same question from `src/verify` when it decides
+     * `ATLAS_COVDIM_REPOSITORY_SNAPSHOT`. Two copies of a currency rule is how
+     * the serve loop and the verifier start disagreeing about whether Atlas is
+     * looking at the working tree — and a verifier that believed a stale
+     * snapshot was current would report "the bytes differ" for bytes it never
+     * read. */
+    const char *reason = NULL;
+    bool current = false;
+    if (!s->present || s->last_complete_generation <= 0) {
+        reason = "no reconciliation pass has completed for this repository yet";
+    } else if (s->event_gap) {
+        reason = "an unresolved event gap means Atlas cannot prove it observed every change";
+    } else if (s->pending_full_reconcile) {
+        reason = "a full content verification is owed and has not completed";
+    } else if (s->watch_state == ATLAS_WATCH_ERROR) {
+        reason = "the filesystem watcher failed and is not observing this repository";
+    } else if (s->watch_state == ATLAS_WATCH_DEGRADED) {
+        reason = "the filesystem watcher is running with a known blind spot";
+    } else {
+        current = true;
+    }
+    if (reason_out != NULL) {
+        *reason_out = reason;
+    }
+    return current;
+}
+
 atlas_status atlas_db_index_state_get(atlas_db *db, int64_t repo_id, atlas_index_state *out,
                                       atlas_err *err) {
     out->repo_id = repo_id;

@@ -1,7 +1,19 @@
 # Atlas — working notes for Claude Code
 
 Atlas is a generic, headless engineering-memory and repository-intelligence CLI in
-C17. Phase **A9.2**: evidence, verification and automatic lifecycle — a durable
+C17. Phase **A9.2.2**: epistemic absence and coverage semantics — a durable record
+now also says *whether the thing it is about is there*, as a fourth axis
+(`PRESENT` / `ABSENT` / `UNKNOWN` / `NOT_VERIFIABLE`) that no code path derives
+from the other three. The invariant the season exists for is
+**NO EVIDENCE OF X IS NOT EVIDENCE OF NO X**: an absence is reported only where
+Atlas can show, dimension by dimension, that its coverage was sufficient for that
+bounded claim, and everywhere else the answer is `UNKNOWN` — which is epistemic
+uncertainty and never a negative fact. Coverage is first class and never a
+percentage; positive and negative conclusions are deliberately asymmetric, because
+an incomplete index cannot conjure a symbol that is not there but can easily fail
+to find one; and `atlas_verify_truth_of` is the single producer of `ABSENT` in
+Atlas. See `docs/verification.md` and the A9.2.2 sections below. On top of
+**A9.2**: evidence, verification and automatic lifecycle — a durable
 record now also says *what evidence bears on whether it holds*, as a third axis
 that no code path derives from the other two. Claims, attestations, actors and
 evidence are first class; independence is computed by union-find over declared
@@ -1891,6 +1903,151 @@ src/gw/ui/mission-control.html  the Verification view
 - **Security refusals are tested through the transport.** A refusal that exists
   only below it is one an attacker never meets, so `tests/test_verify_product.c`
   drives JSON on stdin through the real MCP adapter against a live daemon.
+
+## A9.2.2 layers — additions
+
+A9.2.2 adds one migration and no new file. It is a fourth axis and a coverage
+model, threaded through the layers that already existed:
+
+```
+include/atlas/verify.h    atlas_verify_truth, atlas_verify_coverage,
+                          atlas_verify_coverage_dim, atlas_verify_truth_reason,
+                          atlas_verify_truth_of — the one producer of ABSENT —
+                          and atlas_verify_truth_change_of
+src/verify/verify.c       the vocabularies, COVERAGE_DIMS[], TRUTH_REASONS[],
+                          the polarity table and the absence-proof rule
+src/verify/detverify.c    settle(): every check now goes through one place that
+                          applies the positive/negative asymmetry
+src/db/db_verify.c        sem_generation_state(), atlas_db_verify_sem_callers,
+                          atlas_db_verify_index_current, the truth columns
+src/db/db_state.c         atlas_index_state_is_current, moved out of src/ipc so
+                          one rule serves the serve loop and the verifier
+src/db/migrate.c          migration 17 (six columns, additive)
+src/sem/context.c         knowledge_truth on a context item — §24
+src/gw/ui/mission-control.html  the truth chip and the coverage table
+```
+
+## A9.2.2 rules — these are not negotiable
+
+- **NO EVIDENCE OF X IS NOT EVIDENCE OF NO X.** ABSENCE requires positive proof
+  that the observation coverage is sufficient for the bounded claim. Where
+  coverage is insufficient, incomplete, stale, unsupported or unknown, the answer
+  is UNKNOWN — never ABSENT. Everything below is that sentence made structural.
+- **`atlas_verify_truth_of` is the only producer of `ATLAS_TRUTH_ABSENT`.**
+  Nothing else assigns it, no caller passes it in, no transport carries a field
+  that could hold it, and no intake verb accepts one. That is the shape
+  `settle()`, `atlas_db_evidence_insert`, `atlas_decision_apply_in_tx` and
+  `atlas_orch_apply_in_tx` have, applied to a value rather than to a table.
+  `tests/test_verify_absence.c` scans `atlas_verify_op` for a field that could
+  carry truth or coverage in from a caller: **the guarantee is an absent
+  parameter, not a check on one.**
+- **The four axes are orthogonal and no code path derives one from another.**
+  Kind (A9.1), status (A4), verification state (A9.2), truth (A9.2.2). An
+  APPROVED OBLIGATION that is VERIFIED and ABSENT is exactly what discharges it;
+  a PROPOSED INVARIANT can be VERIFIED and PRESENT. Every surface reports all
+  four in separate fields, and a single badge carrying more than one is the
+  presentation these seasons exist to prevent.
+- **The asymmetry is the shape of the world, not a convenience.** Finding one
+  caller proves a caller exists however incomplete the index, because an
+  incomplete index cannot conjure a call that is not there. Finding zero callers
+  proves nothing unless Atlas can show it looked everywhere a caller could have
+  been. One direction is monotone in coverage and the other is not. A gate
+  applied to *both* directions would make Atlas uselessly cautious rather than
+  correctly cautious, and `test_fixture_a_...` is what notices.
+- **The coverage gate moves the check, not only the truth.** A negative
+  conclusion with insufficient coverage returns UNAVAILABLE from the verifier,
+  not FAIL. If the gate lived only in `truth_of`, one row would carry
+  `state = CONTRADICTED` and `truth = UNKNOWN` — the same mechanical evaluation
+  contradicting itself across two fields, which is worse than the defect it was
+  meant to fix. `settle()` in `detverify.c` is the one place that decides, and it
+  asks the polarity table rather than assuming which of PASS/FAIL is the
+  negative.
+- **UNKNOWN is zero on the truth axis and on every coverage dimension.** A zero
+  that meant ABSENT would make `memset` assert non-existence. **UNKNOWN coverage
+  is never sufficient** — that single line in
+  `atlas_verify_coverage_sufficient` is the whole difference between "I found no
+  evidence of X" and "X is absent".
+- **Coverage is never a percentage.** A denominator Atlas cannot state is one
+  that makes a number up, and `coverage = 87%` reads as precision about exactly
+  the thing that is unknown. Explicit dimensions with a five-value vocabulary,
+  and `NOT_APPLICABLE` is asserted from a mechanical fact — an unconsidered
+  dimension is UNKNOWN.
+- **Empirical evidence never establishes PRESENT or ABSENT**, however high the
+  score and however many sources agree. Five agents failing to find X is a fact
+  about five agents. Checked on the basis in `atlas_verify_truth_of` before any
+  coverage is consulted.
+- **NOT_VERIFIABLE is not a fifth axis and UNKNOWN is not its substitute.** It is
+  derived from `semantics == NORMATIVE || basis == JUDGMENT`. UNKNOWN says "more
+  evidence would settle it"; for a normative proposition none would, and saying
+  UNKNOWN invites somebody to go and look.
+- **Repository absence is not operational absence.** No verifier observes a
+  running system or reads deployed configuration, so `runtime_state` and
+  `deployed_config` are UNKNOWN for every one of them — which makes a claim whose
+  negative rests on either UNKNOWN **by construction**, with no rule anywhere
+  deciding that it must not. Adding a runtime probe is a code-execution path and
+  needs the argument every verifier's read-only restriction already demands.
+- **"No PROVEN direct caller" and "no caller" stay different claims.**
+  `atlas.proven_edge` answers the first, `atlas.no_proven_caller` the second.
+  Two verifiers rather than one with a footnote, because that is what makes the
+  distinction survive being read quickly. The second is bounded by three
+  mechanical questions — direct callers, whether the address ever escapes, and
+  linkage — and its scope sentence says what it does **not** claim: nothing about
+  dynamic symbol lookup or code outside the indexed repository.
+- **An escaping address is what makes indirect calls unresolvable, and that is
+  the whole argument.** A C function cannot be reached through a pointer, a
+  dispatch table, a callback or a dynamic registration unless its address is
+  taken, and `ADDRESS_TAKEN` is a PROVEN edge naming it — so zero address-takes
+  over a *complete* generation excludes every one of those at once. The
+  completeness is not optional: a translation unit that failed to parse could
+  hold the address-take.
+- **Linkage is treated as external unless every definition is established
+  INTERNAL.** UNKNOWN linkage is the dangerous case, not the convenient one.
+- **An ABSENT result never survives the source moving.** It stays bound to its
+  snapshot as history; the current truth is recomputed on every read and a moved
+  repository yields UNKNOWN until something re-establishes it. Both directions are
+  demoted across a drift, not just the negative one — a symbol found at commit Y
+  may have been added after the claim's commit X.
+- **UNKNOWN must never satisfy a policy condition that requires ABSENT.**
+  Structurally true already, and checked anyway via
+  `ATLAS_VREASON_COVERAGE_INSUFFICIENT`, for A6's reason about asserting a
+  permissive verdict deliberately: a guarantee that holds only because three
+  other gates catch it is one a later edit to any of the three deletes silently.
+- **UNKNOWN → PRESENT is knowledge acquisition, not a verifier error.** Charging
+  it would penalise a verifier for having been honest about the limits of its
+  coverage, which is the behaviour this season exists to encourage. Only an
+  established answer contradicted **at the same bound snapshot** is an error, and
+  `atlas_verify_truth_change_of` decides that from the binding, never from
+  elapsed time.
+- **Migration 17 is additive and relabels nothing.** Every column defaults to its
+  vocabulary's zero, so every pre-A9.2.2 result reads UNKNOWN. A result written
+  before the coverage model existed carries no information from which its truth
+  could be reconstructed, and inventing one would be the exact error this season
+  exists to prevent.
+- **`atlas_index_state_is_current` has one implementation.** It moved from
+  `src/ipc/server.c` to `src/db/db_state.c` because the coverage model asks the
+  same question from `src/verify`; `atlas_server_index_current` delegates. Two
+  copies of a currency rule is how a verifier comes to believe a stale snapshot
+  is current — and then reports "the bytes differ" for bytes it never read.
+
+## Extending A9.2.2 safely
+
+- **A new verifier** additionally needs a row in
+  `atlas_verify_verifier_truth_of_check` and one in
+  `atlas_verify_verifier_absence_dims`. `tests/test_verify_absence.c` fails a
+  verifier that can conclude ABSENT while declaring no dimension, and one whose
+  PASS and FAIL mean the same thing.
+- **A new coverage dimension** means a member, a row in `COVERAGE_DIMS[]` with
+  its name and the truth reason its insufficiency implies, a wider
+  `ATLAS_VERIFY_COVERAGE_DIMS` — a static assertion refuses otherwise — and a
+  decision for every verifier about whether its negative depends on it.
+- **A new truth value** means editing the enum,
+  `atlas_verify_truth_is_established`, `_contradicts`, `_change_of`, the CHECKs on
+  `verify_results.truth` and `verify_outcomes.prior_truth` — so a **migration** —
+  and the enumerations in `tests/test_verify_absence.c`. Keep UNKNOWN at zero.
+- **A new field on the assessment** goes in
+  `atlas_service_verify_write_assessment` **and** is read back in
+  `service_remote.c`, and is rendered by both renderers. Missing the read-back is
+  how the socket path and the local path start disagreeing.
 
 ## Extending A9.2.1 safely
 

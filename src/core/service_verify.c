@@ -314,6 +314,60 @@ atlas_status atlas_service_verify_write_assessment(atlas_json *j,
     if (st == ATLAS_OK) {
         st = atlas_json_key_str(j, "state", atlas_verify_state_name(g->state), err);
     }
+    /* --- A9.2.2: the fourth axis, and what it rests on --------------------
+     *
+     * `truth` answers a different question from `state`: `state` is how strong
+     * the evidence is, `truth` is whether the subject is there. A caller given
+     * only `state` cannot tell PRESENT from ABSENT, because `check_result`
+     * means opposite things for `atlas.symbol_present` and
+     * `atlas.symbol_absent`.
+     *
+     * `truth_reason` and the coverage fields are what make §22 answerable: a
+     * model asking "why is this UNKNOWN?" gets a value from a closed vocabulary
+     * it can branch on — `INDIRECT_CALLS_UNRESOLVED`, `SEMANTIC_INDEX_STALE`,
+     * `RUNTIME_NOT_OBSERVED` — rather than a sentence it has to parse.
+     *
+     * All four are added here, in the shape the *daemon* sends, because that is
+     * the lesson the A9.2.1 closure paid for: MCP relays this object verbatim,
+     * the gateway forwards it and Mission Control binds its keys, so a field
+     * that exists only in the local renderer is a field every remote surface
+     * silently lacks. */
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(j, "truth", atlas_verify_truth_name(a->truth), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(j, "truth_reason", atlas_verify_truth_reason_name(a->truth_reason),
+                                err);
+    }
+    /* One fixed Atlas-owned sentence. No repository byte and no model byte
+     * reaches it, which is why it may be relayed to a model unencoded. */
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(j, "truth_detail",
+                                atlas_verify_truth_reason_description(a->truth_reason), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(
+            j, "coverage", atlas_verify_coverage_name(atlas_verify_coverage_summary(&a->coverage)),
+            err);
+    }
+    /* Every dimension, by name, including the UNKNOWN ones — a reader asking
+     * why an answer is UNKNOWN needs to see which part of the looking fell
+     * short, and a map that listed only what succeeded would answer the
+     * opposite question. */
+    if (st == ATLAS_OK) {
+        st = atlas_json_key(j, "coverage_dimensions", err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_obj_begin(j, err);
+    }
+    for (size_t i = 0; st == ATLAS_OK && i < ATLAS_VERIFY_COVERAGE_DIMS; i++) {
+        atlas_verify_coverage_dim d = (atlas_verify_coverage_dim)i;
+        st = atlas_json_key_str(j, atlas_verify_coverage_dim_name(d),
+                                atlas_verify_coverage_name(a->coverage.dims[i]), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_obj_end(j, err);
+    }
     if (st == ATLAS_OK) {
         st = atlas_json_key_str(j, "basis", atlas_verify_basis_name(a->basis), err);
     }
@@ -724,6 +778,9 @@ atlas_status atlas_service_verify_write_report(atlas_json *j, atlas_safe_pool *s
 typedef struct claims_ctx {
     atlas_json *j;
     atlas_safe_pool *safe;
+    /* A9.2.2. For the last recorded verdict per row. A read; the list writes
+     * nothing. */
+    atlas_db *db;
     atlas_status st;
     size_t emitted;
 } claims_ctx;
@@ -762,6 +819,22 @@ static atlas_status claim_row(const atlas_verify_claim *c, void *vctx, atlas_err
     if (st == ATLAS_OK) {
         st = atlas_json_key_str(cc->j, "created_at", atlas_buf_cstr(&c->created_at), err);
     }
+    /* A9.2.2. The last *recorded* verification state and truth, so a list is
+     * scannable without opening every row — and so Mission Control's "state"
+     * and "truth" columns have something real to show. Both are history rather
+     * than a fresh assessment: recomputing one per row would run a verifier for
+     * every claim in the repository, and the detail view is where a current
+     * answer belongs. A claim nobody has evaluated reports UNVERIFIED and
+     * UNKNOWN, which is what it is. */
+    if (st == ATLAS_OK) {
+        atlas_verify_state last_state = ATLAS_VERIFY_UNVERIFIED;
+        atlas_verify_truth last_truth = ATLAS_TRUTH_UNKNOWN;
+        (void)atlas_db_verify_last_result(cc->db, c->id, &last_state, &last_truth, err);
+        st = atlas_json_key_str(cc->j, "state", atlas_verify_state_name(last_state), err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(cc->j, "truth", atlas_verify_truth_name(last_truth), err);
+        }
+    }
     if (st == ATLAS_OK) {
         st = atlas_json_obj_end(cc->j, err);
     }
@@ -793,7 +866,7 @@ atlas_status atlas_service_verify_claims_on(atlas_db *db, atlas_json *j, atlas_s
         }
     }
 
-    claims_ctx cc = {j, safe, ATLAS_OK, 0};
+    claims_ctx cc = {j, safe, db, ATLAS_OK, 0};
     atlas_status st = atlas_json_key(j, "claims", err);
     if (st == ATLAS_OK) {
         st = atlas_json_arr_begin(j, err);

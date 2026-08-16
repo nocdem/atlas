@@ -625,6 +625,25 @@ typedef struct atlas_sem_item {
      * Empty on every other kind of item. */
     char knowledge_kind[24];
     char knowledge_status[16];
+    /* A9.2.2, §24. What Atlas has established about whether the record's
+     * subject is *there* — PRESENT, ABSENT, UNKNOWN or NOT_VERIFIABLE — as a
+     * third field beside the other two, because it is a third dimension.
+     *
+     * This exists so that a model reading a context package cannot turn
+     *
+     *     [OPERATIONAL_FACT · PROPOSED] "no runtime override for X exists"
+     *     truth: UNKNOWN (deployed config unavailable)
+     *
+     * into "runtime override X does not exist". Without the field the package
+     * offers a record whose text is a negative claim and no indication that
+     * Atlas never confirmed it, and the summary a reader writes from that is
+     * the wrong one.
+     *
+     * Conservative by construction: `atlas_db_verify_truth_for_document`
+     * reports an established value only when every live claim on the record
+     * agrees, so the default a reader sees is "Atlas has not established this".
+     * Empty on every item that is not a knowledge record. */
+    char knowledge_truth[16];
     int64_t line;
     /* How strong the evidence for including this is. A test found by reading a
      * filename is LEXICAL however useful it turns out to be. */

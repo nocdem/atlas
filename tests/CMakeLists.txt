@@ -159,6 +159,7 @@ set(ATLAS_TESTS
   test_decision_kind
   test_verify_model
   test_verify_engine
+  test_verify_absence
   test_verify_intake
   test_verify_product
 )
@@ -217,6 +218,10 @@ set_tests_properties(test_decision_kind PROPERTIES LABELS "unit")
 # real repository and drive migrations, so they are integration.
 set_tests_properties(test_verify_model PROPERTIES LABELS "unit")
 set_tests_properties(test_verify_engine PROPERTIES LABELS "integration")
+set_tests_properties(test_verify_absence PROPERTIES LABELS "integration")
+# Scans `verify_ops.h` for a field that could carry truth or coverage in from a
+# caller: the absence-proof guarantee is an absent parameter, not a check.
+target_compile_definitions(test_verify_absence PRIVATE ATLAS_SRC_DIR="${CMAKE_SOURCE_DIR}")
 set_tests_properties(test_verify_intake PROPERTIES LABELS "integration")
 # Drives a live daemon and the MCP adapter, so it is a daemon test and is
 # serialised against the others for the inotify budget.

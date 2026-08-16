@@ -14,6 +14,7 @@
  */
 #include "atlas/verify.h"
 
+#include <stdio.h>
 #include <string.h>
 
 /* --- verification state --------------------------------------------------- */
@@ -434,6 +435,10 @@ static const reason_entry REASONS[] = {
      "the claim is bound to one repository state and the repository is at another, so this result "
      "describes a tree the repository has since left and cannot justify a transition about the "
      "current one"},
+    {ATLAS_VREASON_COVERAGE_INSUFFICIENT, "COVERAGE_INSUFFICIENT", ATLAS_POLICY_BLOCKED,
+     "the transition would rest on a proposition Atlas has not established: a coverage dimension "
+     "the conclusion depends on is partial, stale or was never established, so the subject is "
+     "neither shown present nor shown absent"},
     {ATLAS_VREASON_OK, "OK", ATLAS_POLICY_AUTO, "every gate this policy sets was passed"},
 };
 
@@ -522,6 +527,10 @@ static const verifier_entry VERIFIERS[] = {
      "cannot establish an absence and reports UNAVAILABLE instead"},
     {ATLAS_VERIFIER_PROVEN_EDGE, "atlas.proven_edge",
      "the compiler proved a direct call edge between two named symbols"},
+    {ATLAS_VERIFIER_NO_PROVEN_CALLER, "atlas.no_proven_caller",
+     "no caller reaches a named symbol: no compiler-proved direct caller, no function whose "
+     "address escapes, and internal linkage — over a complete semantic generation. Nothing is "
+     "claimed about dynamic symbol lookup or about code outside the indexed repository"},
 };
 
 const char *atlas_verify_verifier_name(atlas_verify_verifier v) {
@@ -1187,4 +1196,652 @@ void atlas_verify_aggregate_compute(atlas_verify_aggregate *out, atlas_verify_in
     } else {
         out->state = ATLAS_VERIFY_SUPPORTED;
     }
+}
+
+/* ==========================================================================
+ * A9.2.2 — the truth axis, the coverage model and the absence-proof rule
+ *
+ *   NO EVIDENCE OF X IS NOT EVIDENCE OF NO X.
+ *
+ * Everything below exists to make that sentence a property of the code rather
+ * than a warning in a document. The whole of the enforcement is one function,
+ * `atlas_verify_truth_of`, and the whole of its difficulty is step 5.
+ * ========================================================================== */
+
+static const char *const TRUTH_NAMES[] = {"UNKNOWN", "PRESENT", "ABSENT", "NOT_VERIFIABLE"};
+
+const char *atlas_verify_truth_name(atlas_verify_truth t) {
+    if ((size_t)t < sizeof TRUTH_NAMES / sizeof TRUTH_NAMES[0]) {
+        return TRUTH_NAMES[t];
+    }
+    return "UNKNOWN";
+}
+
+bool atlas_verify_truth_parse(const char *name, atlas_verify_truth *out) {
+    if (name == NULL || out == NULL) {
+        return false;
+    }
+    for (size_t i = 0; i < sizeof TRUTH_NAMES / sizeof TRUTH_NAMES[0]; i++) {
+        if (strcmp(name, TRUTH_NAMES[i]) == 0) {
+            *out = (atlas_verify_truth)i;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool atlas_verify_truth_is_established(atlas_verify_truth t) {
+    return t == ATLAS_TRUTH_PRESENT || t == ATLAS_TRUTH_ABSENT;
+}
+
+bool atlas_verify_truth_contradicts(atlas_verify_truth a, atlas_verify_truth b) {
+    /* §21, and no wider. Only the two established values can contradict each
+     * other; anything involving UNKNOWN is an absence of knowledge rather than a
+     * disagreement, and anything involving NOT_VERIFIABLE is not a factual
+     * question. Atlas does no natural-language negation detection here and must
+     * not start: the mechanical case is `atlas.symbol_present` and
+     * `atlas.symbol_absent` over one subject, and that is what this decides. */
+    return (a == ATLAS_TRUTH_PRESENT && b == ATLAS_TRUTH_ABSENT) ||
+           (a == ATLAS_TRUTH_ABSENT && b == ATLAS_TRUTH_PRESENT);
+}
+
+/* --- coverage -------------------------------------------------------------- */
+
+static const char *const COVERAGE_NAMES[] = {"UNKNOWN", "COMPLETE", "PARTIAL", "STALE",
+                                             "NOT_APPLICABLE"};
+
+const char *atlas_verify_coverage_name(atlas_verify_coverage c) {
+    if ((size_t)c < sizeof COVERAGE_NAMES / sizeof COVERAGE_NAMES[0]) {
+        return COVERAGE_NAMES[c];
+    }
+    return "UNKNOWN";
+}
+
+bool atlas_verify_coverage_parse(const char *name, atlas_verify_coverage *out) {
+    if (name == NULL || out == NULL) {
+        return false;
+    }
+    for (size_t i = 0; i < sizeof COVERAGE_NAMES / sizeof COVERAGE_NAMES[0]; i++) {
+        if (strcmp(name, COVERAGE_NAMES[i]) == 0) {
+            *out = (atlas_verify_coverage)i;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool atlas_verify_coverage_sufficient(atlas_verify_coverage c) {
+    /* The invariant in one line. **UNKNOWN is not sufficient**, which is the
+     * whole difference between "I found no evidence of X" and "X is absent". */
+    return c == ATLAS_COVERAGE_COMPLETE || c == ATLAS_COVERAGE_NOT_APPLICABLE;
+}
+
+/* One row per dimension: the name a surface prints and the reason an
+ * insufficiency implies. A6's arrangement — the reason follows from the
+ * dimension rather than being chosen beside it at each call site, so a
+ * dimension added without deciding what its failure means cannot exist. */
+/* One row per dimension: the name a surface prints, and the reason each *kind*
+ * of insufficiency implies.
+ *
+ * `partial` and `stale` are separate fields rather than one, because the two
+ * states call for different actions and the vocabulary already distinguishes
+ * them: a PARTIAL semantic generation needs a wider parse and a STALE one needs
+ * a fresh one. Collapsing them would tell a reader to widen a parse that is
+ * already complete — which is worse than saying nothing, because it is a
+ * confident instruction to do the wrong thing.
+ *
+ * For dimensions where the two genuinely mean the same, both fields carry the
+ * same reason, stated rather than defaulted. */
+typedef struct coverage_dim_entry {
+    atlas_verify_coverage_dim dim;
+    const char *name;
+    atlas_verify_truth_reason partial;
+    atlas_verify_truth_reason stale;
+    const char *description;
+} coverage_dim_entry;
+
+static const coverage_dim_entry COVERAGE_DIMS[] = {
+    /* The one dimension where PARTIAL and STALE are genuinely different
+     * problems: an incomplete generation missed part of the tree, a stale one
+     * described a tree the repository has left. */
+    {ATLAS_COVDIM_SEMANTIC_GENERATION, "semantic_generation",
+     ATLAS_TREASON_SEMANTIC_INDEX_INCOMPLETE, ATLAS_TREASON_SEMANTIC_INDEX_STALE,
+     "a semantic generation is published, holds no failed, partial or unsupported translation "
+     "unit, and describes the current commit"},
+    {ATLAS_COVDIM_REPOSITORY_SNAPSHOT, "repository_snapshot",
+     ATLAS_TREASON_REPOSITORY_SNAPSHOT_STALE, ATLAS_TREASON_REPOSITORY_SNAPSHOT_STALE,
+     "the file index describes the working tree as it is now"},
+    /* These three are derived from the generation's own state, so a stale
+     * generation makes them stale for the generation's reason rather than for
+     * one of their own. */
+    {ATLAS_COVDIM_TRACKED_SOURCE, "tracked_source", ATLAS_TREASON_COVERAGE_PARTIAL,
+     ATLAS_TREASON_SEMANTIC_INDEX_STALE, "every tracked source file in scope was read"},
+    {ATLAS_COVDIM_GENERATED_SOURCE, "generated_source", ATLAS_TREASON_COVERAGE_PARTIAL,
+     ATLAS_TREASON_SEMANTIC_INDEX_STALE, "build-generated sources were included in scope"},
+    {ATLAS_COVDIM_DIRECT_CALLS, "direct_calls", ATLAS_TREASON_COVERAGE_PARTIAL,
+     ATLAS_TREASON_SEMANTIC_INDEX_STALE,
+     "every compiler-proved direct call edge in scope is recorded"},
+    {ATLAS_COVDIM_INDIRECT_CALLS, "indirect_calls", ATLAS_TREASON_INDIRECT_CALLS_UNRESOLVED,
+     ATLAS_TREASON_SEMANTIC_INDEX_STALE,
+     "calls through function pointers, callbacks, dispatch tables and dynamic registration are "
+     "accounted for"},
+    {ATLAS_COVDIM_EXTERNAL_CALLERS, "external_callers", ATLAS_TREASON_EXTERNAL_CALLERS_POSSIBLE,
+     ATLAS_TREASON_EXTERNAL_CALLERS_POSSIBLE,
+     "callers outside the indexed repository, and reachability through dynamic symbol lookup, are "
+     "excluded"},
+    {ATLAS_COVDIM_TESTS, "tests", ATLAS_TREASON_COVERAGE_PARTIAL, ATLAS_TREASON_COVERAGE_PARTIAL,
+     "test sources were included in scope"},
+    {ATLAS_COVDIM_DOCUMENT_CORPUS, "document_corpus", ATLAS_TREASON_SCOPE_UNBOUNDED,
+     ATLAS_TREASON_SCOPE_UNBOUNDED,
+     "the document corpus the claim is bounded by was enumerated"},
+    {ATLAS_COVDIM_RUNTIME_STATE, "runtime_state", ATLAS_TREASON_RUNTIME_NOT_OBSERVED,
+     ATLAS_TREASON_RUNTIME_NOT_OBSERVED, "the running system was observed"},
+    {ATLAS_COVDIM_DEPLOYED_CONFIG, "deployed_config", ATLAS_TREASON_DEPLOYED_CONFIG_UNAVAILABLE,
+     ATLAS_TREASON_DEPLOYED_CONFIG_UNAVAILABLE, "deployed configuration was read"},
+};
+
+/* The table and the enum must describe the same set. A dimension added to one
+ * and not the other would silently read as UNKNOWN for ever — which is safe,
+ * and is exactly the kind of safe-looking wrongness that survives review. */
+_Static_assert(sizeof COVERAGE_DIMS / sizeof COVERAGE_DIMS[0] == ATLAS_VERIFY_COVERAGE_DIMS,
+               "every coverage dimension needs a row carrying its name and what its "
+               "insufficiency means");
+
+const char *atlas_verify_coverage_dim_name(atlas_verify_coverage_dim d) {
+    if ((size_t)d < ATLAS_VERIFY_COVERAGE_DIMS) {
+        return COVERAGE_DIMS[d].name;
+    }
+    return "unknown";
+}
+
+const char *atlas_verify_coverage_dim_description(atlas_verify_coverage_dim d) {
+    if ((size_t)d < ATLAS_VERIFY_COVERAGE_DIMS) {
+        return COVERAGE_DIMS[d].description;
+    }
+    return "no such coverage dimension";
+}
+
+bool atlas_verify_coverage_dim_parse(const char *name, atlas_verify_coverage_dim *out) {
+    if (name == NULL || out == NULL) {
+        return false;
+    }
+    for (size_t i = 0; i < ATLAS_VERIFY_COVERAGE_DIMS; i++) {
+        if (strcmp(name, COVERAGE_DIMS[i].name) == 0) {
+            *out = COVERAGE_DIMS[i].dim;
+            return true;
+        }
+    }
+    return false;
+}
+
+void atlas_verify_coverage_report_init(atlas_verify_coverage_report *r) {
+    if (r == NULL) {
+        return;
+    }
+    memset(r, 0, sizeof *r); /* every dimension UNKNOWN, reason NONE */
+}
+
+bool atlas_verify_coverage_satisfies(const atlas_verify_coverage_report *r,
+                                     const atlas_verify_coverage_dim *dims, size_t count,
+                                     atlas_verify_coverage_dim *failed_out,
+                                     atlas_verify_truth_reason *why_out) {
+    if (r == NULL) {
+        /* No report is not an empty requirement. A caller with nothing to show
+         * has shown nothing, and the answer is that coverage is unknown. */
+        if (why_out != NULL) {
+            *why_out = ATLAS_TREASON_COVERAGE_UNKNOWN;
+        }
+        return count == 0;
+    }
+    for (size_t i = 0; i < count; i++) {
+        atlas_verify_coverage_dim d = dims[i];
+        if ((size_t)d >= ATLAS_VERIFY_COVERAGE_DIMS) {
+            continue;
+        }
+        atlas_verify_coverage c = r->dims[d];
+        if (atlas_verify_coverage_sufficient(c)) {
+            continue;
+        }
+        if (failed_out != NULL) {
+            *failed_out = d;
+        }
+        if (why_out != NULL) {
+            /* Three insufficiencies, three reasons. UNKNOWN means the dimension
+             * was never established at all — a different statement from either
+             * "part of it" or "it aged", and the only one that says Atlas did
+             * not look. PARTIAL and STALE take the dimension's own two reasons,
+             * which for the semantic generation are genuinely different
+             * remedies: widen the parse, or run a fresh one. */
+            *why_out = c == ATLAS_COVERAGE_UNKNOWN ? ATLAS_TREASON_COVERAGE_UNKNOWN
+                       : c == ATLAS_COVERAGE_STALE ? COVERAGE_DIMS[d].stale
+                                                   : COVERAGE_DIMS[d].partial;
+        }
+        return false;
+    }
+    return true;
+}
+
+atlas_verify_coverage atlas_verify_coverage_summary(const atlas_verify_coverage_report *r) {
+    if (r == NULL) {
+        return ATLAS_COVERAGE_UNKNOWN;
+    }
+    /* Weakest wins among the dimensions that are in play, which is A6's fold.
+     * NOT_APPLICABLE is skipped rather than counted: a claim that cannot depend
+     * on runtime state should not be reported as having incomplete coverage of
+     * it. If every dimension is NOT_APPLICABLE the summary is NOT_APPLICABLE. */
+    bool any = false;
+    atlas_verify_coverage worst = ATLAS_COVERAGE_COMPLETE;
+    for (size_t i = 0; i < ATLAS_VERIFY_COVERAGE_DIMS; i++) {
+        atlas_verify_coverage c = r->dims[i];
+        if (c == ATLAS_COVERAGE_NOT_APPLICABLE) {
+            continue;
+        }
+        any = true;
+        /* Order of severity: UNKNOWN is the weakest because it is the one that
+         * says Atlas never established the dimension at all. */
+        if (c == ATLAS_COVERAGE_UNKNOWN) {
+            return ATLAS_COVERAGE_UNKNOWN;
+        }
+        if (c == ATLAS_COVERAGE_STALE) {
+            worst = ATLAS_COVERAGE_STALE;
+        } else if (c == ATLAS_COVERAGE_PARTIAL && worst != ATLAS_COVERAGE_STALE) {
+            worst = ATLAS_COVERAGE_PARTIAL;
+        }
+    }
+    return any ? worst : ATLAS_COVERAGE_NOT_APPLICABLE;
+}
+
+size_t atlas_verify_coverage_render(const atlas_verify_coverage_report *r, char *out,
+                                    size_t out_size) {
+    if (out == NULL || out_size == 0) {
+        return 0;
+    }
+    out[0] = '\0';
+    if (r == NULL) {
+        return 0;
+    }
+    size_t n = 0;
+    for (size_t i = 0; i < ATLAS_VERIFY_COVERAGE_DIMS; i++) {
+        /* Every dimension is emitted, including UNKNOWN ones. A renderer that
+         * omitted them would make a report that established nothing look like a
+         * short one that established everything it mentioned. */
+        int wrote = snprintf(out + n, out_size > n ? out_size - n : 0, "%s%s=%s", n > 0 ? ";" : "",
+                             COVERAGE_DIMS[i].name, atlas_verify_coverage_name(r->dims[i]));
+        if (wrote < 0 || (size_t)wrote >= (out_size > n ? out_size - n : 0)) {
+            break;
+        }
+        n += (size_t)wrote;
+    }
+    return n;
+}
+
+bool atlas_verify_coverage_parse_detail(const char *text, atlas_verify_coverage_report *out) {
+    if (out == NULL) {
+        return false;
+    }
+    atlas_verify_coverage_report_init(out);
+    if (text == NULL || text[0] == '\0') {
+        return false;
+    }
+    bool any = false;
+    const char *p = text;
+    while (*p != '\0') {
+        const char *end = strchr(p, ';');
+        size_t seg = end != NULL ? (size_t)(end - p) : strlen(p);
+        const char *eq = memchr(p, '=', seg);
+        if (eq != NULL) {
+            char dname[64];
+            char sname[32];
+            size_t dlen = (size_t)(eq - p);
+            size_t slen = seg - dlen - 1u;
+            if (dlen < sizeof dname && slen < sizeof sname) {
+                memcpy(dname, p, dlen);
+                dname[dlen] = '\0';
+                memcpy(sname, eq + 1, slen);
+                sname[slen] = '\0';
+                atlas_verify_coverage_dim d;
+                atlas_verify_coverage c;
+                /* An unrecognised dimension or state leaves that slot UNKNOWN.
+                 * A row written by a newer Atlas is therefore read
+                 * conservatively — the reading that under-claims — rather than
+                 * being skipped into whatever the caller had. */
+                if (atlas_verify_coverage_dim_parse(dname, &d) &&
+                    atlas_verify_coverage_parse(sname, &c)) {
+                    out->dims[d] = c;
+                    any = true;
+                }
+            }
+        }
+        if (end == NULL) {
+            break;
+        }
+        p = end + 1;
+    }
+    return any;
+}
+
+/* --- truth reasons --------------------------------------------------------- */
+
+typedef struct truth_reason_entry {
+    atlas_verify_truth_reason r;
+    const char *name;
+    const char *description;
+} truth_reason_entry;
+
+static const truth_reason_entry TRUTH_REASONS[] = {
+    {ATLAS_TREASON_NONE, "NONE", "no reason was recorded, which is not a statement that anything "
+                                 "was established"},
+    {ATLAS_TREASON_ESTABLISHED, "ESTABLISHED",
+     "a deterministic verifier evaluated the truth condition and every coverage dimension it "
+     "requires was sufficient"},
+    {ATLAS_TREASON_NOT_EVALUATED, "NOT_EVALUATED",
+     "no deterministic verifier ran, so no truth condition was mechanically evaluated"},
+    {ATLAS_TREASON_COVERAGE_PARTIAL, "COVERAGE_PARTIAL",
+     "a coverage dimension a negative conclusion depends on is only partly covered"},
+    {ATLAS_TREASON_COVERAGE_UNKNOWN, "COVERAGE_UNKNOWN",
+     "a coverage dimension a negative conclusion depends on was never established at all"},
+    {ATLAS_TREASON_SEMANTIC_INDEX_STALE, "SEMANTIC_INDEX_STALE",
+     "the semantic index does not describe the current commit"},
+    {ATLAS_TREASON_SEMANTIC_INDEX_ABSENT, "SEMANTIC_INDEX_ABSENT",
+     "no semantic generation is published for this repository, so Atlas could not look"},
+    {ATLAS_TREASON_SEMANTIC_INDEX_INCOMPLETE, "SEMANTIC_INDEX_INCOMPLETE",
+     "the semantic generation holds failed, partial or unsupported translation units, so the "
+     "subject may live in a file that never parsed"},
+    {ATLAS_TREASON_INDIRECT_CALLS_UNRESOLVED, "INDIRECT_CALLS_UNRESOLVED",
+     "the symbol's address is taken, so a call through a pointer, a dispatch table or a dynamic "
+     "registration cannot be ruled out"},
+    {ATLAS_TREASON_EXTERNAL_CALLERS_POSSIBLE, "EXTERNAL_CALLERS_POSSIBLE",
+     "the symbol has external linkage, so callers outside the indexed repository and reachability "
+     "through dynamic symbol lookup are not observable from here"},
+    {ATLAS_TREASON_RUNTIME_NOT_OBSERVED, "RUNTIME_NOT_OBSERVED",
+     "the running system was not observed, and repository absence is not operational absence"},
+    {ATLAS_TREASON_DEPLOYED_CONFIG_UNAVAILABLE, "DEPLOYED_CONFIG_UNAVAILABLE",
+     "deployed configuration was not available, so what the deployment sets is unknown"},
+    {ATLAS_TREASON_REPOSITORY_SNAPSHOT_STALE, "REPOSITORY_SNAPSHOT_STALE",
+     "the file index does not describe the working tree, so what was read may not be what is "
+     "there"},
+    {ATLAS_TREASON_SOURCE_DRIFT, "SOURCE_DRIFT",
+     "the claim is bound to one repository state and the index describes another"},
+    {ATLAS_TREASON_SCOPE_UNBOUNDED, "SCOPE_UNBOUNDED",
+     "the claim declares no bound, so there is no set over which an absence could be complete"},
+    {ATLAS_TREASON_NOT_FACTUAL, "NOT_FACTUAL",
+     "the proposition is normative or a judgment, so it is not a question a verifier could settle"},
+    {ATLAS_TREASON_EMPIRICAL_BASIS, "EMPIRICAL_BASIS",
+     "the basis is empirical, and no amount of agreement among sources establishes presence or "
+     "absence"},
+};
+
+const char *atlas_verify_truth_reason_name(atlas_verify_truth_reason r) {
+    for (size_t i = 0; i < sizeof TRUTH_REASONS / sizeof TRUTH_REASONS[0]; i++) {
+        if (TRUTH_REASONS[i].r == r) {
+            return TRUTH_REASONS[i].name;
+        }
+    }
+    return "NONE";
+}
+
+const char *atlas_verify_truth_reason_description(atlas_verify_truth_reason r) {
+    for (size_t i = 0; i < sizeof TRUTH_REASONS / sizeof TRUTH_REASONS[0]; i++) {
+        if (TRUTH_REASONS[i].r == r) {
+            return TRUTH_REASONS[i].description;
+        }
+    }
+    return TRUTH_REASONS[0].description;
+}
+
+bool atlas_verify_truth_reason_parse(const char *name, atlas_verify_truth_reason *out) {
+    if (name == NULL || out == NULL) {
+        return false;
+    }
+    for (size_t i = 0; i < sizeof TRUTH_REASONS / sizeof TRUTH_REASONS[0]; i++) {
+        if (strcmp(name, TRUTH_REASONS[i].name) == 0) {
+            *out = TRUTH_REASONS[i].r;
+            return true;
+        }
+    }
+    return false;
+}
+
+size_t atlas_verify_truth_reason_count(void) {
+    return sizeof TRUTH_REASONS / sizeof TRUTH_REASONS[0];
+}
+
+atlas_verify_truth_reason atlas_verify_truth_reason_at(size_t index) {
+    if (index < sizeof TRUTH_REASONS / sizeof TRUTH_REASONS[0]) {
+        return TRUTH_REASONS[index].r;
+    }
+    return ATLAS_TREASON_NONE;
+}
+
+/* --- verifier polarity ----------------------------------------------------- */
+
+atlas_verify_truth atlas_verify_verifier_truth_of_check(atlas_verify_verifier v,
+                                                        atlas_verify_check c) {
+    if (c == ATLAS_CHECK_UNAVAILABLE) {
+        return ATLAS_TRUTH_UNKNOWN;
+    }
+    bool pass = c == ATLAS_CHECK_PASS;
+    switch (v) {
+    case ATLAS_VERIFIER_CONTENT_HASH:
+        /* PASS: the stated bytes are there. FAIL: they are not — and that is a
+         * genuine absence rather than a failure to look, because the verifier
+         * read the actual recorded content and it differed. What it still needs
+         * is that the recorded content is current; see the dimensions below. */
+        return pass ? ATLAS_TRUTH_PRESENT : ATLAS_TRUTH_ABSENT;
+    case ATLAS_VERIFIER_SYMBOL_PRESENT:
+        return pass ? ATLAS_TRUTH_PRESENT : ATLAS_TRUTH_ABSENT;
+    case ATLAS_VERIFIER_SYMBOL_ABSENT:
+        /* Inverted, and this is why polarity is a table rather than a
+         * convention: PASS here *is* the negative conclusion. */
+        return pass ? ATLAS_TRUTH_ABSENT : ATLAS_TRUTH_PRESENT;
+    case ATLAS_VERIFIER_PROVEN_EDGE:
+        return pass ? ATLAS_TRUTH_PRESENT : ATLAS_TRUTH_ABSENT;
+    case ATLAS_VERIFIER_NO_PROVEN_CALLER:
+        return pass ? ATLAS_TRUTH_ABSENT : ATLAS_TRUTH_PRESENT;
+    case ATLAS_VERIFIER_NONE:
+        break;
+    }
+    return ATLAS_TRUTH_UNKNOWN;
+}
+
+/* The dimensions each verifier's *negative* conclusion rests on.
+ *
+ * Read these as the argument for why an absence is establishable at all. A
+ * verifier whose row is empty is one whose negative is a positive reading of
+ * something — not one nobody thought about. */
+
+static const atlas_verify_coverage_dim DIMS_CONTENT_HASH[] = {
+    /* The recorded content must describe the working tree, or a mismatch is
+     * "Atlas read a stale snapshot" rather than "the bytes differ". This is a
+     * different question from A9.2.1's SOURCE_DRIFT, which compares the claim's
+     * commit against the scanned head; this compares the scanned head against
+     * what is on disk, and neither implies the other. */
+    ATLAS_COVDIM_REPOSITORY_SNAPSHOT,
+};
+
+static const atlas_verify_coverage_dim DIMS_SYMBOL[] = {
+    ATLAS_COVDIM_SEMANTIC_GENERATION,
+    ATLAS_COVDIM_TRACKED_SOURCE,
+    ATLAS_COVDIM_GENERATED_SOURCE,
+};
+
+static const atlas_verify_coverage_dim DIMS_PROVEN_EDGE[] = {
+    /* A missing proven direct edge is an absence *of a proven direct edge*, and
+     * the claim says so. Indirect calls are deliberately **not** required here:
+     * this verifier never claimed anything about them, and demanding coverage
+     * of a dimension a claim does not depend on would block a true answer for
+     * an irrelevant reason. `atlas.no_proven_caller` is the verifier for the
+     * wider question, and it does require them. §9's distinction, as two
+     * verifiers rather than as a footnote. */
+    ATLAS_COVDIM_SEMANTIC_GENERATION,
+    ATLAS_COVDIM_DIRECT_CALLS,
+};
+
+static const atlas_verify_coverage_dim DIMS_NO_PROVEN_CALLER[] = {
+    ATLAS_COVDIM_SEMANTIC_GENERATION,
+    ATLAS_COVDIM_TRACKED_SOURCE,
+    ATLAS_COVDIM_GENERATED_SOURCE,
+    ATLAS_COVDIM_DIRECT_CALLS,
+    ATLAS_COVDIM_INDIRECT_CALLS,
+    ATLAS_COVDIM_EXTERNAL_CALLERS,
+};
+
+size_t atlas_verify_verifier_absence_dims(atlas_verify_verifier v,
+                                          const atlas_verify_coverage_dim **out) {
+    const atlas_verify_coverage_dim *dims = NULL;
+    size_t count = 0;
+    switch (v) {
+    case ATLAS_VERIFIER_CONTENT_HASH:
+        dims = DIMS_CONTENT_HASH;
+        count = sizeof DIMS_CONTENT_HASH / sizeof DIMS_CONTENT_HASH[0];
+        break;
+    case ATLAS_VERIFIER_SYMBOL_PRESENT:
+    case ATLAS_VERIFIER_SYMBOL_ABSENT:
+        dims = DIMS_SYMBOL;
+        count = sizeof DIMS_SYMBOL / sizeof DIMS_SYMBOL[0];
+        break;
+    case ATLAS_VERIFIER_PROVEN_EDGE:
+        dims = DIMS_PROVEN_EDGE;
+        count = sizeof DIMS_PROVEN_EDGE / sizeof DIMS_PROVEN_EDGE[0];
+        break;
+    case ATLAS_VERIFIER_NO_PROVEN_CALLER:
+        dims = DIMS_NO_PROVEN_CALLER;
+        count = sizeof DIMS_NO_PROVEN_CALLER / sizeof DIMS_NO_PROVEN_CALLER[0];
+        break;
+    case ATLAS_VERIFIER_NONE:
+        break;
+    }
+    if (out != NULL) {
+        *out = dims;
+    }
+    return count;
+}
+
+/* --- THE ABSENCE-PROOF RULE ------------------------------------------------
+ *
+ * The only producer of ATLAS_TRUTH_ABSENT in Atlas. */
+
+atlas_verify_truth atlas_verify_truth_of(atlas_verify_verifier v, atlas_verify_basis basis,
+                                         atlas_verify_claim_semantics semantics,
+                                         atlas_verify_check check,
+                                         const atlas_verify_coverage_report *coverage,
+                                         atlas_verify_truth_reason *why_out) {
+    atlas_verify_truth_reason why = ATLAS_TREASON_NONE;
+    atlas_verify_truth truth = ATLAS_TRUTH_UNKNOWN;
+
+    /* 1. Not a factual question. Asked first because no evidence changes it, so
+     *    nothing below should get a chance to matter — the same ordering
+     *    `autolifecycle.c` uses for refusals no policy can lift. */
+    if (semantics == ATLAS_CLAIM_NORMATIVE || basis == ATLAS_VERIFY_BASIS_JUDGMENT) {
+        why = ATLAS_TREASON_NOT_FACTUAL;
+        truth = ATLAS_TRUTH_NOT_VERIFIABLE;
+        goto done;
+    }
+
+    /* 2. §15. Empirical evidence never establishes presence or absence, however
+     *    high the score and however many sources agree. Five agents failing to
+     *    find X is a fact about five agents. */
+    if (basis != ATLAS_VERIFY_BASIS_DETERMINISTIC) {
+        why = ATLAS_TREASON_EMPIRICAL_BASIS;
+        goto done;
+    }
+
+    if (v == ATLAS_VERIFIER_NONE) {
+        why = ATLAS_TREASON_NOT_EVALUATED;
+        goto done;
+    }
+
+    /* 3. Atlas could not look. Not a finding in either direction.
+     *
+     * The verifier may have recorded *why* it could not look — in particular
+     * when it declined to emit a negative because coverage was insufficient,
+     * which is the common case and the one §22 cares about. Preferring the
+     * recorded reason keeps "the index is stale" and "the symbol's address
+     * escapes" distinguishable; falling back to NOT_EVALUATED would collapse
+     * both into "no verifier ran", which is wrong and the least actionable of
+     * the available answers. */
+    if (check == ATLAS_CHECK_UNAVAILABLE) {
+        why = (coverage != NULL && coverage->reason != ATLAS_TREASON_NONE)
+                  ? coverage->reason
+                  : ATLAS_TREASON_NOT_EVALUATED;
+        goto done;
+    }
+
+    /* 4. What this verifier's verdict means on the truth axis. */
+    truth = atlas_verify_verifier_truth_of_check(v, check);
+
+    /* 5. The gate. **Only the negative direction is gated**, and that asymmetry
+     *    is §7: an incomplete index cannot conjure a symbol that is not there,
+     *    so finding one is finding one; but not finding one over an incomplete
+     *    index is not an absence, it is a failure to look everywhere. */
+    if (truth == ATLAS_TRUTH_ABSENT) {
+        const atlas_verify_coverage_dim *dims = NULL;
+        size_t count = atlas_verify_verifier_absence_dims(v, &dims);
+        atlas_verify_coverage_dim failed = ATLAS_COVDIM_SEMANTIC_GENERATION;
+        atlas_verify_truth_reason unmet = ATLAS_TREASON_COVERAGE_UNKNOWN;
+        if (!atlas_verify_coverage_satisfies(coverage, dims, count, &failed, &unmet)) {
+            /* Demoted to UNKNOWN, naming the dimension that fell short. This is
+             * the line the season exists for: a zero result whose coverage
+             * cannot be shown sufficient becomes "Atlas does not know", never
+             * "it is not there". */
+            (void)failed;
+            why = unmet;
+            truth = ATLAS_TRUTH_UNKNOWN;
+            goto done;
+        }
+    }
+
+    /* 6. Established, in whichever direction. A reason is recorded even here,
+     *    so every surface can answer "why?" without a second call. */
+    why = ATLAS_TREASON_ESTABLISHED;
+
+done:
+    if (why_out != NULL) {
+        *why_out = why;
+    }
+    return truth;
+}
+
+/* --- §16 / §20: what a change in the answer means -------------------------- */
+
+static const char *const TRUTH_CHANGE_NAMES[] = {"NONE", "ACQUISITION", "HISTORICAL", "ERROR"};
+
+const char *atlas_verify_truth_change_name(atlas_verify_truth_change c) {
+    if ((size_t)c < sizeof TRUTH_CHANGE_NAMES / sizeof TRUTH_CHANGE_NAMES[0]) {
+        return TRUTH_CHANGE_NAMES[c];
+    }
+    return "NONE";
+}
+
+atlas_verify_truth_change atlas_verify_truth_change_of(atlas_verify_truth prior,
+                                                       atlas_verify_truth now,
+                                                       bool same_snapshot) {
+    /* A normative proposition never becomes a factual error, in either
+     * direction: there was nothing for a verifier to be wrong about. */
+    if (prior == ATLAS_TRUTH_NOT_VERIFIABLE || now == ATLAS_TRUTH_NOT_VERIFIABLE) {
+        return ATLAS_TRUTH_CHANGE_NONE;
+    }
+    /* Learning something is not failing at something. This is the branch that
+     * makes honest UNKNOWNs free, and it must come before the contradiction
+     * test — otherwise every first real answer after an UNKNOWN would be
+     * examined for whether it disagreed with a verdict Atlas never gave. */
+    if (prior == ATLAS_TRUTH_UNKNOWN) {
+        return atlas_verify_truth_is_established(now) ? ATLAS_TRUTH_CHANGE_ACQUISITION
+                                                      : ATLAS_TRUTH_CHANGE_NONE;
+    }
+    /* Losing an answer is not an error either. Coverage that used to be
+     * sufficient and no longer is — a generation that went partial, a
+     * repository that moved — is Atlas correctly withdrawing a claim it can no
+     * longer support, which §19 requires it to do. */
+    if (now == ATLAS_TRUTH_UNKNOWN) {
+        return ATLAS_TRUTH_CHANGE_NONE;
+    }
+    if (!atlas_verify_truth_contradicts(prior, now)) {
+        return ATLAS_TRUTH_CHANGE_NONE;
+    }
+    /* Established, contradicted. The snapshot decides which of the two
+     * remaining readings applies, and it is the *binding* that decides it —
+     * never elapsed time, which would eventually make every long-lived claim
+     * look like a failure. */
+    return same_snapshot ? ATLAS_TRUTH_CHANGE_ERROR : ATLAS_TRUTH_CHANGE_HISTORICAL;
 }

@@ -202,7 +202,7 @@ static void test_a_schema_seven_database_reaches_eight_losslessly(void) {
 
     T_OK(atlas_db_migrate(db, &err), &err);
     T_EQ_INT(atlas_db_schema_version(db, &err), ATLAS_SCHEMA_VERSION);
-    T_EQ_INT(ATLAS_SCHEMA_VERSION, 16);
+    T_EQ_INT(ATLAS_SCHEMA_VERSION, 17);
 
     for (size_t i = 0; i < sizeof A8_TABLES / sizeof A8_TABLES[0]; i++) {
         T_CHECK_MSG(table_exists(db, A8_TABLES[i]), "migration 8 did not create %s",
@@ -277,7 +277,12 @@ static void test_a_failed_migration_eight_leaves_seven_untouched(void) {
     size_t base_count = 0;
     const atlas_migration *base = atlas_migrations(&base_count);
     T_REQUIRE(base_count >= 8u);
-    atlas_migration list[16];
+    /* Sized from the schema version rather than pinned at a literal, so a new
+     * migration does not silently overflow it. A9.2.2 found this at 16 with 17
+     * migrations to copy: the `T_REQUIRE` caught it, which is what it is for,
+     * but a bound that has to be edited by hand every season is one that will
+     * eventually be edited to whatever makes the test pass. */
+    atlas_migration list[ATLAS_SCHEMA_VERSION];
     T_REQUIRE(base_count <= sizeof list / sizeof list[0]);
     memcpy(list, base, base_count * sizeof list[0]);
     /* Replace the real migration 8 with the broken one. */

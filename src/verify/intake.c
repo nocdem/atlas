@@ -821,9 +821,23 @@ static atlas_status op_evidence_produce(atlas_db *db, const atlas_verify_op *op,
         st = atlas_verify_run_verifier(db, v, claim.repo_id,
                                        claim.verifier_input.len > 0 ? claim.verifier_input.data
                                                                     : "",
-                                       &out->check, out->verified_scope,
+                                       &out->check, &out->coverage, out->verified_scope,
                                        sizeof out->verified_scope, out->detail, sizeof out->detail,
                                        err);
+        if (st == ATLAS_OK) {
+            /* A9.2.2. The same single producer the assessment path uses. A
+             * second implementation here — even an obviously equivalent one —
+             * would be a second place ABSENT could come from, and the whole
+             * guarantee is that there is one.
+             *
+             * The basis is DETERMINISTIC because this operation *is* Atlas
+             * running a mechanical verifier; that is what distinguishes
+             * `verify produce` from `verify evidence`, which merely references
+             * something. */
+            out->truth = atlas_verify_truth_of(v, ATLAS_VERIFY_BASIS_DETERMINISTIC,
+                                               claim.semantics, out->check, &out->coverage,
+                                               &out->truth_reason);
+        }
     }
 
     atlas_repo_info repo;

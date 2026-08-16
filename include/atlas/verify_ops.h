@@ -269,6 +269,18 @@ typedef struct atlas_verify_intake_result {
     char verified_scope[512];
     char detail[512];
 
+    /* A9.2.2. What the verifier was able to observe, per dimension, and what
+     * that makes of the proposition on the truth axis.
+     *
+     * `verify produce` reports these for the same reason `verify show` does: a
+     * caller told only that a check came back UNAVAILABLE knows that Atlas
+     * declined and not why, and "the semantic generation is partial" and "the
+     * symbol's address is taken" call for entirely different responses. Both
+     * come from closed Atlas-owned vocabularies. */
+    atlas_verify_truth truth;
+    atlas_verify_truth_reason truth_reason;
+    atlas_verify_coverage_report coverage;
+
     /* EVALUATE: the whole assessment, including whether Atlas transitioned. */
     atlas_verify_assessment assessment;
 } atlas_verify_intake_result;

@@ -254,6 +254,27 @@ typedef struct atlas_verify_assessment {
     int64_t sem_generation;
     bool source_drift;
 
+    /* --- A9.2.2: the fourth axis, and what it rests on -------------------
+     *
+     * `truth` is what Atlas knows about whether the proposition's subject is
+     * there — PRESENT, ABSENT, UNKNOWN or NOT_VERIFIABLE — and it is a
+     * different question from `aggregate.state`, which is about the strength of
+     * the evidence. A claim can be VERIFIED and ABSENT (the obligation's symbol
+     * is gone), VERIFIED and PRESENT (the option exists), or INCONCLUSIVE and
+     * UNKNOWN. **No code path derives either from the other.**
+     *
+     * It is produced by `atlas_verify_truth_of` and by nothing else, so ABSENT
+     * cannot appear here without every coverage dimension the verifier requires
+     * having been shown sufficient.
+     *
+     * `coverage` is what was actually looked at, per dimension, and
+     * `truth_reason` says why the answer came out as it did — both from closed
+     * Atlas-owned vocabularies, so §22's "why is this UNKNOWN?" is answerable
+     * with something a program can branch on rather than a sentence. */
+    atlas_verify_truth truth;
+    atlas_verify_truth_reason truth_reason;
+    atlas_verify_coverage_report coverage;
+
     /* Every gate passed and a rule authorised it. Distinct from
      * `aggregate.verdict == AUTO`, which is about the gates alone: this also
      * requires a candidate transition and a matching rule to exist. */

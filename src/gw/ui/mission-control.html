@@ -527,6 +527,32 @@ function verifyTag(s) {
   return tag(s === undefined || s === null ? "—" : String(s), k);
 }
 
+/* A9.2.2. The truth axis — a fourth chip, never folded into the verification
+   one. They answer different questions: "how strong is the evidence?" and "is
+   the thing there?".
+
+   **UNKNOWN is styled as unknown and is never rendered as "No", "None" or
+   "Absent".** That substitution is the single presentation failure this season
+   exists to prevent, and it is the one a well-meaning UI makes by itself: an
+   empty result looks like a negative, and a negative looks like a fact. The
+   word shown is the word Atlas computed.
+
+   ABSENT is styled "ok" rather than "bad" because it is an *established*
+   answer, and often the one somebody wanted — an obligation's symbol being gone
+   is success. Only a genuinely missing answer is dimmed. */
+function truthTag(s) {
+  const k = {PRESENT: "ok", ABSENT: "ok", UNKNOWN: "unknown", NOT_VERIFIABLE: "warn"}[s] || "";
+  return tag(s === undefined || s === null ? "UNKNOWN" : String(s), k);
+}
+
+/* Coverage per dimension. Never a percentage: a denominator Atlas cannot state
+   would be precision about exactly the thing that is unknown. */
+function coverageTag(s) {
+  const k = {COMPLETE: "ok", NOT_APPLICABLE: "", PARTIAL: "warn", STALE: "warn",
+             UNKNOWN: "unknown"}[s] || "";
+  return tag(s === undefined || s === null ? "UNKNOWN" : String(s), k);
+}
+
 /* How well Atlas knows who spoke. SELF_DECLARED is the common case and must
    never be styled as though it were established: a model saying it is a
    compiler is the forgery the whole evidence model exists to refuse. */
@@ -558,6 +584,9 @@ async function viewVerification() {
     return table([
       {label: "claim", get: (x) => (x.claim || "").slice(0, 22)},
       {label: "state", get: (x) => verifyTag(x.state)},
+      /* A9.2.2: its own column in the list too, so a reader scanning claims
+         sees which are established and which Atlas merely could not settle. */
+      {label: "truth", get: (x) => truthTag(x.truth)},
       {label: "basis", get: (x) => tag(x.basis || "—")},
       {label: "text", wrap: true, get: (x) => el("span", {class: "untrusted", text: x.text || "—"})},
     ], d.claims, {empty: "no claims recorded for this repository",
@@ -571,10 +600,20 @@ async function showClaim(uid) {
     const box = el("div");
     box.appendChild(kv([
       ["claim", c.claim],
-      /* The three axes, in three separate rows. */
+      /* A9.2.2: the four axes, in four separate rows. Kind, lifecycle status,
+         verification state and truth are independent — an APPROVED OBLIGATION
+         can be VERIFIED and ABSENT, and a PROPOSED INVARIANT can be VERIFIED
+         and PRESENT — so collapsing any two into one badge is the presentation
+         these seasons exist to prevent. */
       ["kind", kindTag(c.kind)],
       ["lifecycle status", statusTag(c.status)],
       ["verification", verifyTag(c.state)],
+      ["truth", truthTag(c.truth)],
+      /* Why the truth axis says what it says, in Atlas' own words. Shown
+         beside the value rather than on hover: a reader who sees UNKNOWN and no
+         reason will supply one, and the one they supply is usually "no". */
+      ["because", c.truth_detail || "—"],
+      ["coverage", coverageTag(c.coverage)],
       ["basis", c.basis],
       ["semantics", c.semantics],
       ["knowledge record", c.decision || undefined],
@@ -586,6 +625,23 @@ async function showClaim(uid) {
       ["SOURCE_DRIFT", c.source_drift ? statusTag("BLOCKED") : statusTag("OK")],
     ]));
     box.appendChild(el("p", {class: "untrusted", text: c.text || ""}));
+
+    /* A9.2.2, §4. What was actually looked at, dimension by dimension.
+       An opaque summary tells somebody that something was missed without
+       telling them what, which is not enough to act on and not enough to
+       audit — so every dimension is listed, including the ones that are
+       NOT_APPLICABLE, because "this claim cannot depend on runtime state" is an
+       answer and hiding it would leave a reader wondering whether Atlas simply
+       forgot to look. */
+    if (c.coverage_dimensions) {
+      box.appendChild(el("h3", {text: "Coverage"}));
+      box.appendChild(kv(Object.keys(c.coverage_dimensions).map(
+        (d) => [d.replace(/_/g, " "), coverageTag(c.coverage_dimensions[d])])));
+      box.appendChild(el("p", {class: "dim", text:
+        "No evidence of X is not evidence of no X. An absence is reported only " +
+        "where every dimension it rests on is COMPLETE or NOT_APPLICABLE; " +
+        "otherwise the answer is UNKNOWN, which does not mean no."}));
+    }
 
     box.appendChild(el("h3", {text: "Confidence"}));
     box.appendChild(kv([

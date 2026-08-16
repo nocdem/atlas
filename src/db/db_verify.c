@@ -1470,10 +1470,19 @@ static atlas_status reasons_text(const atlas_verify_aggregate *agg, atlas_buf *o
 atlas_status atlas_db_verify_result_insert(atlas_db *db, int64_t claim_id,
                                            const atlas_verify_aggregate *agg, const char *verifier,
                                            atlas_verify_check check,
-                                           const atlas_verify_source_binding *src, const char *now,
+                                           const atlas_verify_source_binding *src,
+                                           const atlas_verify_truth_record *truth, const char *now,
                                            int64_t *id_out, atlas_err *err) {
     if (agg == NULL) {
         return atlas_err_set(err, ATLAS_ERR_INTERNAL, "no aggregate to record");
+    }
+    /* A9.2.2. A caller with nothing to say about truth records UNKNOWN with
+     * every coverage dimension unestablished, which is the honest reading and
+     * the one every Atlas zero already means. */
+    static const atlas_verify_truth_record NO_TRUTH = {ATLAS_TRUTH_UNKNOWN, ATLAS_TREASON_NONE,
+                                                       NULL};
+    if (truth == NULL) {
+        truth = &NO_TRUTH;
     }
     /* A9.2.1, §5. A result always says what it was of. `src` may be NULL only
      * for a caller that genuinely has no repository binding; the columns then
@@ -1502,9 +1511,10 @@ atlas_status atlas_db_verify_result_insert(atlas_db *db, int64_t claim_id,
         "  calibrated_probability, algorithm, family_version, support_count, contradict_count,"
         "  inconclusive_count, independent_groups, independent_families, support_mass,"
         "  contradict_mass, conflict, stale, verifier, check_result, reasons, reason_total,"
-        "  created_at, claim_commit, evaluated_commit, sem_generation, source_drift)"
+        "  created_at, claim_commit, evaluated_commit, sem_generation, source_drift,"
+        "  truth, truth_reason, coverage_summary, coverage_detail)"
         " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,"
-        "  ?23,?24,?25,?26)"
+        "  ?23,?24,?25,?26,?27,?28,?29,?30)"
         " RETURNING id;";
     sqlite3_stmt *stmt = NULL;
     st = atlas_db_prepare(db, SQL, &stmt, err);
@@ -1583,6 +1593,33 @@ atlas_status atlas_db_verify_result_insert(atlas_db *db, int64_t claim_id,
     }
     if (st == ATLAS_OK) {
         st = atlas_db_bind_text_opt(db, stmt, 22, now, err);
+    }
+    /* A9.2.2. The truth axis and what it rested on.
+     *
+     * `coverage_detail` names every dimension, including the ones that are
+     * UNKNOWN. A detail that listed only what was established would make a
+     * result establishing nothing look like a short one that established
+     * everything it mentioned — and this column is what a reader consults when
+     * they ask why an answer came back UNKNOWN. */
+    if (st == ATLAS_OK) {
+        st = atlas_db_bind_text_opt(db, stmt, 27, atlas_verify_truth_name(truth->truth), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_db_bind_text_opt(db, stmt, 28,
+                                    atlas_verify_truth_reason_name(truth->reason), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_db_bind_text_opt(
+            db, stmt, 29, atlas_verify_coverage_name(atlas_verify_coverage_summary(truth->coverage)),
+            err);
+    }
+    if (st == ATLAS_OK) {
+        char detail[512];
+        detail[0] = '\0';
+        if (truth->coverage != NULL) {
+            (void)atlas_verify_coverage_render(truth->coverage, detail, sizeof detail);
+        }
+        st = atlas_db_bind_text_opt(db, stmt, 30, detail, err);
     }
     if (st == ATLAS_OK) {
         int rc = sqlite3_step(stmt);
@@ -1803,15 +1840,116 @@ atlas_status atlas_db_verify_reliability_get(atlas_db *db, int64_t actor_id, con
     return st;
 }
 
+/* A9.2.2, §16. What Atlas previously concluded about this claim on the truth
+ * axis, and the result row that concluded it.
+ *
+ * The distinction this exists to draw is the one a bare before/after pair
+ * cannot:
+ *
+ *   - **UNKNOWN → PRESENT** is ordinary knowledge acquisition. Atlas said it did
+ *     not know, and now it does. Counting that as a verifier error would
+ *     penalise a verifier for having been honest about the limits of its
+ *     coverage — which is precisely the behaviour A9.2.2 exists to encourage, so
+ *     making it costly would push every verifier back towards guessing.
+ *   - **ABSENT → PRESENT at the same bound snapshot** is a genuine verification
+ *     error. Atlas asserted the thing was not there, over coverage it certified
+ *     sufficient, and it was there.
+ *
+ * "At the same bound snapshot" is the load-bearing half. ABSENT at commit X and
+ * PRESENT at commit Y is a repository that changed — §20's SUPERSESSION — not a
+ * verifier that was wrong, and charging a verifier for the passage of time
+ * would make every long-lived claim eventually look like a failure. So the
+ * comparison is made against what the earlier result was *bound to*, which is
+ * why this reads the row rather than trusting a remembered enum. */
+static atlas_status prior_truth_of(atlas_db *db, int64_t claim_id, atlas_verify_truth *truth_out,
+                                   int64_t *result_id_out, atlas_buf *commit_out,
+                                   int64_t *generation_out, atlas_err *err) {
+    *truth_out = ATLAS_TRUTH_UNKNOWN;
+    *result_id_out = 0;
+    *generation_out = 0;
+    static const char SQL[] =
+        "SELECT id, truth, evaluated_commit, sem_generation FROM verify_results"
+        " WHERE claim_id = ?1 ORDER BY id DESC LIMIT 1;";
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(db, SQL, &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, claim_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the claim id");
+    }
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        *result_id_out = sqlite3_column_int64(stmt, 0);
+        const char *name = (const char *)sqlite3_column_text(stmt, 1);
+        if (name != NULL) {
+            /* An unparseable value leaves UNKNOWN, which is the conservative
+             * reading: a truth Atlas cannot identify is not one it may charge a
+             * verifier for having got wrong. */
+            (void)atlas_verify_truth_parse(name, truth_out);
+        }
+        st = take_text(commit_out, (const char *)sqlite3_column_text(stmt, 2), err);
+        *generation_out = sqlite3_column_int64(stmt, 3);
+    }
+    atlas_db_finish(db, stmt);
+    return st;
+}
+
 atlas_status atlas_db_verify_outcome_record(atlas_db *db, int64_t claim_id, int64_t actor_id,
                                             const char *domain, atlas_verify_verdict attested,
                                             bool truth, atlas_verify_outcome_source source,
                                             const char *now, atlas_err *err) {
-    bool eligible = atlas_verify_outcome_eligible(source);
+    /* §16. What Atlas concluded before, so the two failure kinds stay apart. */
+    atlas_verify_truth prior = ATLAS_TRUTH_UNKNOWN;
+    int64_t prior_result_id = 0;
+    int64_t prior_generation = 0;
+    atlas_buf prior_commit = ATLAS_BUF_INIT;
+    {
+        atlas_status pst = prior_truth_of(db, claim_id, &prior, &prior_result_id, &prior_commit,
+                                          &prior_generation, err);
+        if (pst != ATLAS_OK) {
+            atlas_buf_free(&prior_commit);
+            return pst;
+        }
+    }
+    atlas_buf_free(&prior_commit);
+
+    /* Two independent eligibility conditions, and both must hold.
+     *
+     * The first is A9.2's loop-breaker: the *source* must be one that does not
+     * depend on the aggregation, or Atlas would be learning to trust a source
+     * from that source's own output.
+     *
+     * The second is A9.2.2's, and it is about the *shape of the change*. An
+     * outcome that follows an UNKNOWN is knowledge acquisition — Atlas said it
+     * did not know, and now it does — and folding that into reliability would
+     * charge somebody for a verdict Atlas never gave. Only a contradiction of
+     * something Atlas actually established is feedback about whether it was
+     * right, which is what §16 asks for. `truth` here is the resolved fact, so
+     * the pairing is exactly the ABSENT-then-PRESENT case the season names. */
+    atlas_verify_truth resolved = truth ? ATLAS_TRUTH_PRESENT : ATLAS_TRUTH_ABSENT;
+    /* `same_snapshot = true` deliberately, and this is the one place the choice
+     * has to be argued rather than assumed.
+     *
+     * Only the ACQUISITION branch is consulted here, and that branch is decided
+     * before the snapshot is ever examined — an UNKNOWN prior is knowledge
+     * acquisition whichever tree it was about. Passing `true` therefore selects
+     * nothing: it is the value that makes the *other* branches reachable, so a
+     * later edit that starts distinguishing ERROR from HISTORICAL on this path
+     * fails loudly rather than quietly classifying every historical change as a
+     * verifier error.
+     *
+     * When that edit comes, `prior_commit` and `prior_generation` above are what
+     * it needs, and `prior_result_id` is stored on the row so the comparison can
+     * be made against what the earlier verdict was actually bound to. */
+    atlas_verify_truth_change change = atlas_verify_truth_change_of(prior, resolved, true);
+    bool eligible =
+        atlas_verify_outcome_eligible(source) && change != ATLAS_TRUTH_CHANGE_ACQUISITION;
 
     static const char SQL[] =
         "INSERT INTO verify_outcomes(claim_id, actor_id, domain, attested, truth, source,"
-        "  eligible, recorded_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)"
+        "  eligible, recorded_at, prior_truth, prior_result_id)"
+        " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)"
         " ON CONFLICT(claim_id, actor_id) DO NOTHING;";
     sqlite3_stmt *stmt = NULL;
     atlas_status st = atlas_db_prepare(db, SQL, &stmt, err);
@@ -1820,9 +1958,13 @@ atlas_status atlas_db_verify_outcome_record(atlas_db *db, int64_t claim_id, int6
     }
     if (sqlite3_bind_int64(stmt, 1, claim_id) != SQLITE_OK ||
         sqlite3_bind_int64(stmt, 2, actor_id) != SQLITE_OK ||
-        sqlite3_bind_int(stmt, 7, eligible ? 1 : 0) != SQLITE_OK) {
+        sqlite3_bind_int(stmt, 7, eligible ? 1 : 0) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 10, prior_result_id) != SQLITE_OK) {
         atlas_db_finish(db, stmt);
         return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the outcome");
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_db_bind_text_opt(db, stmt, 9, atlas_verify_truth_name(prior), err);
     }
     st = atlas_db_bind_text_opt(db, stmt, 3, domain != NULL ? domain : "", err);
     if (st == ATLAS_OK) {
@@ -1951,48 +2093,199 @@ atlas_status atlas_db_verify_file_hash(atlas_db *db, int64_t repo_id, const char
  * obligation that is still outstanding — the exact failure that makes an
  * automatic RESOLVED dangerous — so an incomplete generation yields
  * UNAVAILABLE and the transition does not happen. */
+/* A9.2.2. The current generation and everything the coverage model needs to
+ * know about it, in one read.
+ *
+ * `complete` is the A9.2 flag unchanged: the generation finished and no
+ * translation unit failed, was partial or was unsupported. `current` is new and
+ * separate: the generation was built from the commit the repository is now
+ * scanned at. They are different questions with different remedies — an
+ * incomplete generation needs a wider parse, a stale one needs a fresh one —
+ * and collapsing them would lose which of the two a reader has to act on.
+ *
+ * Neither is the same question as A9.2.1's SOURCE_DRIFT, which compares the
+ * *claim's* commit against the scanned head. This compares the *generation's*
+ * commit against it. A claim can be perfectly current while the semantic index
+ * is three commits behind, and Atlas must not answer a negative question from
+ * an index that has not caught up. */
+static atlas_status sem_generation_state(atlas_db *db, int64_t repo_id, int64_t *generation_out,
+                                         bool *indexed_out, bool *complete_out, bool *current_out,
+                                         atlas_err *err) {
+    if (generation_out != NULL) {
+        *generation_out = 0;
+    }
+    if (indexed_out != NULL) {
+        *indexed_out = false;
+    }
+    if (complete_out != NULL) {
+        *complete_out = false;
+    }
+    if (current_out != NULL) {
+        *current_out = false;
+    }
+    static const char GSQL[] =
+        "SELECT g.id, g.status, g.tu_failed, g.tu_unsupported, g.tu_partial,"
+        "       g.commit_id, r.scanned_head"
+        "  FROM sem_current c"
+        "  JOIN sem_generations g ON g.id = c.generation_id"
+        "  LEFT JOIN repositories r ON r.id = c.repo_id"
+        " WHERE c.repo_id = ?1;";
+    sqlite3_stmt *gs = NULL;
+    atlas_status st = atlas_db_prepare(db, GSQL, &gs, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(gs, 1, repo_id) != SQLITE_OK) {
+        atlas_db_finish(db, gs);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the repository id");
+    }
+    if (sqlite3_step(gs) == SQLITE_ROW) {
+        if (generation_out != NULL) {
+            *generation_out = sqlite3_column_int64(gs, 0);
+        }
+        const char *status = (const char *)sqlite3_column_text(gs, 1);
+        int64_t failed = sqlite3_column_int64(gs, 2);
+        int64_t unsupported = sqlite3_column_int64(gs, 3);
+        int64_t partial = sqlite3_column_int64(gs, 4);
+        const char *gen_commit = (const char *)sqlite3_column_text(gs, 5);
+        const char *head = (const char *)sqlite3_column_text(gs, 6);
+        if (indexed_out != NULL) {
+            *indexed_out = true;
+        }
+        if (complete_out != NULL) {
+            *complete_out = status != NULL && strcmp(status, "COMPLETE") == 0 && failed == 0 &&
+                            unsupported == 0 && partial == 0;
+        }
+        if (current_out != NULL) {
+            /* Both must be known. An unindexed head is not evidence that the
+             * generation is stale, and reporting it as such would make an
+             * ordinary fresh fixture look like a drifting repository. */
+            *current_out = gen_commit != NULL && head != NULL && gen_commit[0] != '\0' &&
+                           head[0] != '\0' && strcmp(gen_commit, head) == 0;
+        }
+    }
+    atlas_db_finish(db, gs);
+    return ATLAS_OK;
+}
+
+atlas_status atlas_db_verify_sem_current(atlas_db *db, int64_t repo_id, bool *indexed_out,
+                                         bool *complete_out, bool *current_out, atlas_err *err) {
+    return sem_generation_state(db, repo_id, NULL, indexed_out, complete_out, current_out, err);
+}
+
+atlas_status atlas_db_verify_last_result(atlas_db *db, int64_t claim_id,
+                                         atlas_verify_state *state_out,
+                                         atlas_verify_truth *truth_out, atlas_err *err) {
+    if (state_out != NULL) {
+        *state_out = ATLAS_VERIFY_UNVERIFIED;
+    }
+    if (truth_out != NULL) {
+        *truth_out = ATLAS_TRUTH_UNKNOWN;
+    }
+    if (claim_id <= 0) {
+        return ATLAS_OK;
+    }
+    static const char SQL[] = "SELECT state, truth FROM verify_results"
+                              " WHERE claim_id = ?1 ORDER BY id DESC LIMIT 1;";
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(db, SQL, &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, claim_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the claim id");
+    }
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *s = (const char *)sqlite3_column_text(stmt, 0);
+        const char *t = (const char *)sqlite3_column_text(stmt, 1);
+        /* An unrecognised name leaves the zero, which is UNVERIFIED and
+         * UNKNOWN. A row written by a newer Atlas degrades to "nothing
+         * established" rather than to a guess. */
+        if (s != NULL && state_out != NULL) {
+            (void)atlas_verify_state_parse(s, state_out);
+        }
+        if (t != NULL && truth_out != NULL) {
+            (void)atlas_verify_truth_parse(t, truth_out);
+        }
+    }
+    atlas_db_finish(db, stmt);
+    return st;
+}
+
+atlas_status atlas_db_verify_truth_for_document(atlas_db *db, int64_t document_id,
+                                                atlas_verify_truth *truth_out, atlas_err *err) {
+    if (truth_out != NULL) {
+        *truth_out = ATLAS_TRUTH_UNKNOWN;
+    }
+    if (document_id <= 0) {
+        return ATLAS_OK;
+    }
+    /* The latest result per live claim, then: how many claims have one, and how
+     * many distinct answers they gave. Anything other than "at least one, and
+     * all the same" is UNKNOWN — §24's conservatism, decided in SQL rather than
+     * by a caller that might decide differently. */
+    static const char SQL[] =
+        "WITH latest AS ("
+        "  SELECT (SELECT r.truth FROM verify_results r"
+        "            WHERE r.claim_id = c.id ORDER BY r.id DESC LIMIT 1) AS truth"
+        "    FROM verify_claims c"
+        "   WHERE c.document_id = ?1 AND c.superseded_by_claim_id = 0)"
+        " SELECT COUNT(truth), COUNT(DISTINCT truth), MIN(truth) FROM latest;";
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(db, SQL, &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, document_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the document id");
+    }
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        int64_t have = sqlite3_column_int64(stmt, 0);
+        int64_t distinct = sqlite3_column_int64(stmt, 1);
+        const char *name = (const char *)sqlite3_column_text(stmt, 2);
+        if (have > 0 && distinct == 1 && name != NULL && truth_out != NULL) {
+            /* An unparseable name leaves UNKNOWN, which is what a value written
+             * by a newer Atlas must degrade to rather than being guessed at. */
+            (void)atlas_verify_truth_parse(name, truth_out);
+        }
+    }
+    atlas_db_finish(db, stmt);
+    return st;
+}
+
+atlas_status atlas_db_verify_index_current(atlas_db *db, int64_t repo_id, bool *current_out,
+                                           atlas_err *err) {
+    if (current_out != NULL) {
+        *current_out = false;
+    }
+    atlas_index_state s;
+    atlas_index_state_init(&s);
+    atlas_status st = atlas_db_index_state_get(db, repo_id, &s, err);
+    if (st == ATLAS_OK && current_out != NULL) {
+        /* One implementation of the rule, shared with the A2 serve loop, so the
+         * verifier and the context envelope cannot disagree about whether Atlas
+         * is looking at the working tree. */
+        *current_out = atlas_index_state_is_current(&s, NULL);
+    }
+    atlas_index_state_free(&s);
+    return st;
+}
+
 atlas_status atlas_db_verify_sem_symbol(atlas_db *db, int64_t repo_id, const char *name,
                                         int64_t *count_out, bool *complete_out, bool *indexed_out,
                                         atlas_err *err) {
     if (count_out != NULL) {
         *count_out = 0;
     }
-    if (complete_out != NULL) {
-        *complete_out = false;
-    }
-    if (indexed_out != NULL) {
-        *indexed_out = false;
-    }
     int64_t generation = 0;
     {
-        static const char GSQL[] =
-            "SELECT g.id, g.status, g.tu_failed, g.tu_unsupported, g.tu_partial"
-            "  FROM sem_current c JOIN sem_generations g ON g.id = c.generation_id"
-            " WHERE c.repo_id = ?1;";
-        sqlite3_stmt *gs = NULL;
-        atlas_status st = atlas_db_prepare(db, GSQL, &gs, err);
-        if (st != ATLAS_OK) {
-            return st;
+        atlas_status gst =
+            sem_generation_state(db, repo_id, &generation, indexed_out, complete_out, NULL, err);
+        if (gst != ATLAS_OK) {
+            return gst;
         }
-        if (sqlite3_bind_int64(gs, 1, repo_id) != SQLITE_OK) {
-            atlas_db_finish(db, gs);
-            return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the repository id");
-        }
-        if (sqlite3_step(gs) == SQLITE_ROW) {
-            generation = sqlite3_column_int64(gs, 0);
-            const char *status = (const char *)sqlite3_column_text(gs, 1);
-            int64_t failed = sqlite3_column_int64(gs, 2);
-            int64_t unsupported = sqlite3_column_int64(gs, 3);
-            int64_t partial = sqlite3_column_int64(gs, 4);
-            if (indexed_out != NULL) {
-                *indexed_out = true;
-            }
-            if (complete_out != NULL) {
-                *complete_out = status != NULL && strcmp(status, "COMPLETE") == 0 && failed == 0 &&
-                                unsupported == 0 && partial == 0;
-            }
-        }
-        atlas_db_finish(db, gs);
     }
     if (generation == 0) {
         return ATLAS_OK;
@@ -2024,30 +2317,41 @@ atlas_status atlas_db_verify_sem_symbol(atlas_db *db, int64_t repo_id, const cha
  * deterministic verifier however useful it is to a human reading a graph. */
 atlas_status atlas_db_verify_sem_proven_edge(atlas_db *db, int64_t repo_id, const char *src,
                                              const char *dst, bool *exists_out, bool *indexed_out,
-                                             atlas_err *err) {
+                                             bool *complete_out, atlas_err *err) {
     if (exists_out != NULL) {
         *exists_out = false;
     }
-    if (indexed_out != NULL) {
-        *indexed_out = false;
+    /* A9.2.2. The completeness flag was not merely unused here — it was never
+     * gathered, so a missing edge over a generation whose calling translation
+     * unit failed to parse read as "the call does not happen". Reported now,
+     * and `detverify.c` refuses to turn a negative into a FAIL without it. */
+    int64_t generation = 0;
+    {
+        atlas_status gst =
+            sem_generation_state(db, repo_id, &generation, indexed_out, complete_out, NULL, err);
+        if (gst != ATLAS_OK) {
+            return gst;
+        }
+    }
+    if (generation == 0) {
+        return ATLAS_OK;
     }
     static const char SQL[] =
         "SELECT EXISTS("
         "  SELECT 1 FROM sem_edges e"
         "    JOIN sem_symbols s ON s.generation_id = e.generation_id AND s.usr = e.src_usr"
         "    JOIN sem_symbols d ON d.generation_id = e.generation_id AND d.usr = e.dst_usr"
-        "   WHERE e.generation_id = (SELECT generation_id FROM sem_current WHERE repo_id = ?1)"
+        "   WHERE e.generation_id = ?1"
         "     AND e.kind = 'CALLS' AND e.evidence = 'PROVEN'"
-        "     AND s.name = ?2 AND d.name = ?3),"
-        " (SELECT COUNT(*) FROM sem_current WHERE repo_id = ?1);";
+        "     AND s.name = ?2 AND d.name = ?3);";
     sqlite3_stmt *stmt = NULL;
     atlas_status st = atlas_db_prepare(db, SQL, &stmt, err);
     if (st != ATLAS_OK) {
         return st;
     }
-    if (sqlite3_bind_int64(stmt, 1, repo_id) != SQLITE_OK) {
+    if (sqlite3_bind_int64(stmt, 1, generation) != SQLITE_OK) {
         atlas_db_finish(db, stmt);
-        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the repository id");
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the generation");
     }
     st = atlas_db_bind_text_opt(db, stmt, 2, src, err);
     if (st == ATLAS_OK) {
@@ -2057,8 +2361,107 @@ atlas_status atlas_db_verify_sem_proven_edge(atlas_db *db, int64_t repo_id, cons
         if (exists_out != NULL) {
             *exists_out = sqlite3_column_int(stmt, 0) != 0;
         }
-        if (indexed_out != NULL) {
-            *indexed_out = sqlite3_column_int64(stmt, 1) > 0;
+    }
+    atlas_db_finish(db, stmt);
+    return st;
+}
+
+/* A9.2.2. Everything `atlas.no_proven_caller` needs, in one bounded read.
+ *
+ * The three counts are the three ways a caller could exist, and the argument
+ * that they are exhaustive *within the indexed tree* is the whole reason this
+ * verifier may report an absence at all:
+ *
+ *   - a compiler-proved direct call names the callee, so it is a `CALLS` edge
+ *     whose destination USR is the symbol's;
+ *   - a call through a pointer, a dispatch table, a callback or a dynamic
+ *     registration requires the function's address to have been taken
+ *     somewhere, which is a PROVEN `ADDRESS_TAKEN` edge naming it. Zero
+ *     address-takes over a *complete* generation rules out every one of those
+ *     at once, which is a far stronger statement than enumerating the
+ *     mechanisms individually;
+ *   - a caller in code Atlas never indexed, or one reached through dynamic
+ *     symbol lookup, can only name a symbol with external linkage.
+ *
+ * The third is why `internal_linkage` is reported. It is true only when every
+ * definition of the name has compiler-computed INTERNAL linkage — never for
+ * EXTERNAL, NONE or UNKNOWN, so a linkage Atlas failed to establish is treated
+ * as the dangerous case. `dlsym` and out-of-tree callers are then excluded by
+ * the language rather than by a search Atlas would have to have performed. */
+atlas_status atlas_db_verify_sem_callers(atlas_db *db, int64_t repo_id, const char *name,
+                                         int64_t *caller_count_out, int64_t *address_taken_out,
+                                         bool *internal_linkage_out, bool *defined_out,
+                                         bool *complete_out, bool *indexed_out, atlas_err *err) {
+    if (caller_count_out != NULL) {
+        *caller_count_out = 0;
+    }
+    if (address_taken_out != NULL) {
+        *address_taken_out = 0;
+    }
+    if (internal_linkage_out != NULL) {
+        *internal_linkage_out = false;
+    }
+    if (defined_out != NULL) {
+        *defined_out = false;
+    }
+    int64_t generation = 0;
+    {
+        atlas_status gst =
+            sem_generation_state(db, repo_id, &generation, indexed_out, complete_out, NULL, err);
+        if (gst != ATLAS_OK) {
+            return gst;
+        }
+    }
+    if (generation == 0) {
+        return ATLAS_OK;
+    }
+
+    /* One statement, four facts. `definitions` counts the symbol rows so a
+     * question about a name nothing defines can be answered as such rather than
+     * as a true-but-useless absence; `externals` counts the rows whose linkage
+     * is anything other than INTERNAL, so internal linkage is established only
+     * when there is at least one definition and none of them is external. */
+    static const char SQL[] =
+        "SELECT"
+        " (SELECT COUNT(*) FROM sem_edges e"
+        "    JOIN sem_symbols d ON d.generation_id = e.generation_id AND d.usr = e.dst_usr"
+        "   WHERE e.generation_id = ?1 AND e.kind = 'CALLS' AND e.evidence = 'PROVEN'"
+        "     AND d.name = ?2),"
+        " (SELECT COUNT(*) FROM sem_edges e"
+        "    JOIN sem_symbols d ON d.generation_id = e.generation_id AND d.usr = e.dst_usr"
+        "   WHERE e.generation_id = ?1 AND e.kind = 'ADDRESS_TAKEN'"
+        "     AND d.name = ?2),"
+        " (SELECT COUNT(*) FROM sem_symbols"
+        "   WHERE generation_id = ?1 AND name = ?2 AND external = 0),"
+        " (SELECT COUNT(*) FROM sem_symbols"
+        "   WHERE generation_id = ?1 AND name = ?2 AND external = 0"
+        "     AND linkage <> 'INTERNAL');";
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(db, SQL, &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, generation) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the generation");
+    }
+    st = atlas_db_bind_text_opt(db, stmt, 2, name, err);
+    if (st == ATLAS_OK && sqlite3_step(stmt) == SQLITE_ROW) {
+        int64_t callers = sqlite3_column_int64(stmt, 0);
+        int64_t taken = sqlite3_column_int64(stmt, 1);
+        int64_t definitions = sqlite3_column_int64(stmt, 2);
+        int64_t externals = sqlite3_column_int64(stmt, 3);
+        if (caller_count_out != NULL) {
+            *caller_count_out = callers;
+        }
+        if (address_taken_out != NULL) {
+            *address_taken_out = taken;
+        }
+        if (defined_out != NULL) {
+            *defined_out = definitions > 0;
+        }
+        if (internal_linkage_out != NULL) {
+            *internal_linkage_out = definitions > 0 && externals == 0;
         }
     }
     atlas_db_finish(db, stmt);

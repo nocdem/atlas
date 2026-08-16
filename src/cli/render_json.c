@@ -1511,6 +1511,24 @@ static atlas_status j_verify_intake(atlas_renderer *r, const char *verb,
         if (res->detail[0] != '\0') {
             TRY(atlas_json_key_str(j, "detail", res->detail, err));
         }
+        /* A9.2.2. `check` says whether the verifier's truth condition was met;
+         * `truth` says whether the subject is there. They are different
+         * questions and PASS means opposite things for `atlas.symbol_present`
+         * and `atlas.symbol_absent`, so a consumer given only the first would
+         * have to invert by hand. */
+        TRY(atlas_json_key_str(j, "truth", atlas_verify_truth_name(res->truth), err));
+        TRY(atlas_json_key_str(j, "truth_reason",
+                               atlas_verify_truth_reason_name(res->truth_reason), err));
+        TRY(atlas_json_key_str(j, "truth_detail",
+                               atlas_verify_truth_reason_description(res->truth_reason), err));
+        TRY(atlas_json_key_str(
+            j, "coverage",
+            atlas_verify_coverage_name(atlas_verify_coverage_summary(&res->coverage)), err));
+        {
+            char cov[512];
+            (void)atlas_verify_coverage_render(&res->coverage, cov, sizeof cov);
+            TRY(atlas_json_key_str(j, "coverage_detail", cov, err));
+        }
     }
     if (strcmp(verb, "evaluate") == 0) {
         const atlas_verify_assessment *a = &res->assessment;
@@ -1922,6 +1940,15 @@ static atlas_status j_sem_items(atlas_renderer *r, const atlas_sem_item *items, 
         }
         if (it->knowledge_status[0] != '\0') {
             TRY(atlas_json_key_str(r->j, "knowledge_status", it->knowledge_status, err));
+        }
+        /* A9.2.2, §24. Emitted whenever the item is a knowledge record — keyed
+         * on `knowledge_kind` rather than on its own emptiness, so a record
+         * Atlas knows nothing about still carries an explicit `UNKNOWN` rather
+         * than an absent key a consumer would have to interpret. */
+        if (it->knowledge_kind[0] != '\0') {
+            TRY(atlas_json_key_str(r->j, "knowledge_truth",
+                                   it->knowledge_truth[0] != '\0' ? it->knowledge_truth : "UNKNOWN",
+                                   err));
         }
         TRY(atlas_json_key_str(r->j, "evidence", it->evidence, err));
         /* Checked against Atlas' own closed set before it is emitted. */

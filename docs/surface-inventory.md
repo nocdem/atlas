@@ -114,6 +114,27 @@ Nine RPC methods, eight MCP tools, six CLI verbs and three gateway routes.
 mutating operations are unreachable by any remote credential that could ever be
 minted. The two reads and the policy read map to `decisions:read`.
 
+### A9.2.2 added fields, not operations
+
+The truth axis and the coverage model changed **what these surfaces report**,
+not which surfaces exist: no RPC method, MCP tool, CLI verb or gateway route was
+added or removed, and the counts above are unchanged.
+
+`truth`, `truth_reason`, `truth_detail`, `coverage` and `coverage_dimensions`
+are carried by `verify.show`, `verify.evaluate` and `verify.evidence_produce`,
+so every surface that relays or forwards those objects gets them — MCP relays
+verbatim, the gateway forwards, Mission Control binds them, and the CLI's
+renderers print them from the same struct the socket client reads back into.
+The claim list additionally reports the last **recorded** `state` and `truth`
+per row, which is history rather than a fresh assessment.
+
+**No intake surface gained a way to supply any of them.** Coverage is derived
+from index state and truth is produced by one function; there is no parameter on
+any tool, verb or method that could carry either in from a caller, and
+`tests/test_verify_absence.c` scans `atlas_verify_op` for exactly that while
+`tests/test_verify_product.c` drives the forgeries through the real MCP
+transport and asserts the derived answer is unmoved.
+
 ### Authority classification, stated exactly
 
 The word for who may perform a lifecycle transition is **operator capability**,

@@ -164,6 +164,9 @@ static atlas_status item_add(item_list *l, const char *kind, const char *name, c
  * unchanged. */
 typedef struct decision_sink {
     item_list *list;
+    /* A9.2.2, §24: needed to ask what Atlas has established about the record on
+     * the truth axis. A read only; the context builder writes nothing. */
+    atlas_db *db;
     /* The path this query anchored from, carried in rather than read from the
      * row: the row describes the document, and which of its links matched is the
      * caller's own question. */
@@ -197,6 +200,18 @@ static atlas_status take_decision(const atlas_decision_doc_row *row, void *ud, a
         (void)snprintf(it->knowledge_kind, sizeof it->knowledge_kind, "%s",
                        row->kind != NULL ? row->kind : "DECISION");
         (void)snprintf(it->knowledge_status, sizeof it->knowledge_status, "%s", status);
+        /* A9.2.2, §24. The third axis, so a negative claim nobody confirmed
+         * cannot be read as a settled negative. Conservative: an established
+         * value only when every live claim on the record agrees, so what a
+         * reader sees by default is that Atlas has not established this.
+         *
+         * A read failure leaves UNKNOWN rather than propagating: a context
+         * package that could not answer this question should say it does not
+         * know, not refuse to be built. */
+        atlas_verify_truth truth = ATLAS_TRUTH_UNKNOWN;
+        (void)atlas_db_verify_truth_for_document(s->db, row->id, &truth, s->err);
+        (void)snprintf(it->knowledge_truth, sizeof it->knowledge_truth, "%s",
+                       atlas_verify_truth_name(truth));
     }
     return s->st;
 }
@@ -289,7 +304,7 @@ static atlas_status add_knowledge(atlas_db *db, const atlas_sem_context_req *req
         atlas_buf raw = ATLAS_BUF_INIT;
         st = atlas_path_text_decode(anchors[i], strlen(anchors[i]), &raw, err);
         if (st == ATLAS_OK) {
-            decision_sink sink = {list, anchors[i], req->include_history, err, ATLAS_OK};
+            decision_sink sink = {list, db, anchors[i], req->include_history, err, ATLAS_OK};
             int64_t n = 0;
             bool more = false;
             atlas_err ignored;

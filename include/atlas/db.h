@@ -21,7 +21,7 @@
 #include "atlas/error.h"
 #include "atlas/limits.h"
 
-#define ATLAS_SCHEMA_VERSION 16
+#define ATLAS_SCHEMA_VERSION 17
 
 typedef struct atlas_db atlas_db;
 
@@ -482,6 +482,20 @@ typedef struct atlas_index_state {
 
 void atlas_index_state_init(atlas_index_state *s);
 void atlas_index_state_free(atlas_index_state *s);
+
+/* Whether Atlas can prove the file index describes the working tree.
+ *
+ * The single authority on that question, asked by the A2 serve loop
+ * (`atlas_server_index_current` delegates to it) and by A9.2.2's coverage model
+ * when it decides `ATLAS_COVDIM_REPOSITORY_SNAPSHOT`. `reason_out` receives one
+ * of a fixed Atlas-owned vocabulary of sentences, or NULL when the index is
+ * current; nothing a repository can influence reaches it.
+ *
+ * A pure function of the state, so it takes no handle and can be asked
+ * anywhere. **Fail-closed**: every path that cannot establish currency returns
+ * false, and A1's rule that an event gap makes the index non-current until a
+ * full pass resolves it is enforced here rather than by each caller. */
+bool atlas_index_state_is_current(const atlas_index_state *s, const char **reason_out);
 
 /* Reads the state, reporting `present=false` rather than failing when the
  * repository has never been watched or scanned under A1. */

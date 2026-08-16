@@ -1587,8 +1587,33 @@ static atlas_status h_verify(atlas_renderer *r, const atlas_verify_report *rep, 
                       atlas_decision_kind_name(a->kind), atlas_decision_state_name(a->from));
     }
     (void)fprintf(o, "verification: %s\n", atlas_verify_state_name(a->aggregate.state));
+    /* A9.2.2. Its **own line**, never folded into the verification state.
+     *
+     * They answer different questions — "how strong is the evidence?" and "is
+     * the thing there?" — and a single badge carrying both is the presentation
+     * these seasons exist to prevent. UNKNOWN is printed as UNKNOWN and must
+     * never be rendered as "no", "none" or "absent": the whole season is the
+     * difference between those two words. */
+    (void)fprintf(o, "truth:        %s\n", atlas_verify_truth_name(a->truth));
+    (void)fprintf(o, "  because:    %s\n",
+                  atlas_verify_truth_reason_description(a->truth_reason));
     (void)fprintf(o, "basis:        %s\n", atlas_verify_basis_name(a->basis));
     (void)fprintf(o, "semantics:    %s\n", atlas_verify_claim_semantics_name(a->semantics));
+
+    /* Coverage, per dimension. Printed whenever anything was established, so a
+     * reader can see *which* part of the looking fell short rather than only
+     * that something did. NOT_APPLICABLE dimensions are shown too: "this claim
+     * cannot depend on runtime state" is an answer, and hiding it would leave a
+     * reader wondering whether Atlas forgot to look. */
+    {
+        atlas_verify_coverage sum = atlas_verify_coverage_summary(&a->coverage);
+        (void)fprintf(o, "coverage:     %s\n", atlas_verify_coverage_name(sum));
+        for (size_t i = 0; i < ATLAS_VERIFY_COVERAGE_DIMS; i++) {
+            atlas_verify_coverage_dim d = (atlas_verify_coverage_dim)i;
+            (void)fprintf(o, "  %-20s %s\n", atlas_verify_coverage_dim_name(d),
+                          atlas_verify_coverage_name(a->coverage.dims[i]));
+        }
+    }
 
     /* Out of 100, never with a percent sign. */
     (void)fprintf(o, "confidence:   %d/100 (score, not a probability)\n", a->aggregate.confidence);
@@ -1744,6 +1769,13 @@ static atlas_status h_verify_intake(atlas_renderer *r, const char *verb,
         if (res->detail[0] != '\0') {
             (void)fprintf(o, "  detail:     %s\n", res->detail);
         }
+        /* A9.2.2. Its own line, never folded into `check`. UNKNOWN is printed
+         * as UNKNOWN and is never rendered as "no" or "absent". */
+        (void)fprintf(o, "  truth:      %s\n", atlas_verify_truth_name(res->truth));
+        (void)fprintf(o, "  because:    %s\n",
+                      atlas_verify_truth_reason_description(res->truth_reason));
+        (void)fprintf(o, "  coverage:   %s\n",
+                      atlas_verify_coverage_name(atlas_verify_coverage_summary(&res->coverage)));
     }
     if (strcmp(verb, "evaluate") == 0) {
         const atlas_verify_assessment *a = &res->assessment;
@@ -2127,6 +2159,13 @@ static atlas_status h_sem_context(atlas_renderer *r, const atlas_sem_context_rep
         if (it->knowledge_kind[0] != '\0') {
             (void)fprintf(o, "  [%s · %s]", it->knowledge_kind,
                           it->knowledge_status[0] != '\0' ? it->knowledge_status : "UNKNOWN");
+            /* A9.2.2, §24. The third axis, in its own bracket rather than
+             * folded into the first. A reader must be able to see that a record
+             * whose text is a negative claim carries `truth UNKNOWN` — otherwise
+             * the summary they write from this line is "X does not exist",
+             * which is the one reading this season exists to prevent. */
+            (void)fprintf(o, " [truth %s]",
+                          it->knowledge_truth[0] != '\0' ? it->knowledge_truth : "UNKNOWN");
         }
         if (it->file_text[0] != '\0' && strcmp(it->file_text, it->name) != 0) {
             /* A line of 0 means Atlas does not know one — a knowledge record has

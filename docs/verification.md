@@ -159,7 +159,8 @@ This is A8-CI's rule about PROVEN, one layer up: no semantic inflation.
 
 ## The deterministic verifiers
 
-Four ship in V1, and **every one is a read**.
+
+Five ship as of A9.2.2, and **every one is a read**.
 
 | Verifier | Establishes |
 |---|---|
@@ -167,6 +168,7 @@ Four ship in V1, and **every one is a read**.
 | `atlas.symbol_present` | a named symbol exists in the current semantic generation |
 | `atlas.symbol_absent` | no symbol of a given name exists **in a complete generation** |
 | `atlas.proven_edge` | the compiler proved a direct call edge between two named symbols |
+| `atlas.no_proven_caller` | no caller reaches a named symbol — see A9.2.2 below for the three questions that bound it |
 
 None creates a process, runs a repository's build, executes a command, or opens
 a file the repository controls. That is a **deliberate V1 restriction, not an
@@ -796,3 +798,352 @@ method that can move a lifecycle state is the most security-relevant addition
 this surface can take, and it belongs to a change that is reviewed as one rather
 than to a closure pass. What was fixed instead is the honesty of the failure —
 the CLI no longer claims `run` is served, so the message names the situation.
+
+---
+
+# A9.2.2 — epistemic absence and coverage semantics
+
+## The invariant
+
+> **NO EVIDENCE OF X IS NOT EVIDENCE OF NO X.**
+>
+> **ABSENCE requires positive proof that the observation coverage is sufficient
+> for the bounded claim.** Where coverage is insufficient, incomplete, stale,
+> unsupported or unknown, the answer is `UNKNOWN` — never `ABSENT`.
+
+Everything in this section exists to make those two sentences a property of the
+code rather than a warning somebody has to remember.
+
+## Why a fourth axis
+
+`atlas_verify_check` answers *"was this verifier's truth condition met?"*, and
+that is not the same question as *"does the thing exist?"*. `PASS` means
+**absent** for `atlas.symbol_absent` and **present** for `atlas.symbol_present`,
+so no reader holding a result could say which without knowing which verifier ran
+and inverting by hand. Decoding it wrongly in the safe-looking direction is
+exactly the failure this season is about.
+
+```
+kind     — what sort of knowledge is this?             A9.1, on the document
+status   — how far through approval did it get?        A4, from the ledger
+verify   — what evidence bears on whether it holds?    A9.2, derived on read
+truth    — is the subject there, not there, or unknown? A9.2.2, derived on read
+```
+
+**No code path derives any one of the four from another.** Every surface reports
+all four in separate fields, and a single badge carrying more than one is the
+presentation these seasons exist to prevent.
+
+| Truth | Means |
+|---|---|
+| `UNKNOWN` | epistemic uncertainty. **Not a negative fact.** The value a zero-result search produces |
+| `PRESENT` | established to be there, within the claim's declared scope |
+| `ABSENT` | established **not** to be there, with every required coverage dimension shown sufficient |
+| `NOT_VERIFIABLE` | not a bounded factual question: a normative choice or a judgment |
+
+`UNKNOWN` is zero. A zeroed struct, an absent column and a row written before
+this season all read as "Atlas has not established this" — a zero that meant
+`ABSENT` would make `memset` assert non-existence.
+
+### NOT_VERIFIABLE is not a fifth axis
+
+It is derived from `semantics == NORMATIVE || basis == JUDGMENT` — a projection
+of facts Atlas already holds onto the truth axis. It exists because `UNKNOWN`
+says *"more evidence would settle it"*, and for "architecture A will be the best
+design in 2030" no evidence would. Reporting a normative proposition as
+`UNKNOWN` invites somebody to go and look, which is a category error dressed as
+diligence.
+
+## The asymmetry
+
+> Positive evidence needs less coverage than negative evidence.
+
+This is not a convenience; it is the shape of the world. Finding one caller
+proves a caller exists **however incomplete the index**, because an incomplete
+index cannot conjure a call that is not there. Finding zero callers proves
+nothing at all unless Atlas can show it looked everywhere a caller could have
+been.
+
+One direction is monotone in coverage and the other is not. Everything below
+follows from that sentence.
+
+## Coverage is first class
+
+Never a percentage. A denominator Atlas cannot state is a denominator that makes
+a number up, and `coverage = 87%` reads as precision about exactly the thing
+that is unknown.
+
+| State | Means | Sufficient for a negative? |
+|---|---|---|
+| `UNKNOWN` | nothing established this dimension | **no** |
+| `COMPLETE` | everything in scope was observed | yes |
+| `PARTIAL` | some was observed and Atlas can say some was not | no |
+| `STALE` | it was observed and no longer describes the present | no |
+| `NOT_APPLICABLE` | the claim cannot depend on this dimension | yes |
+
+`NOT_APPLICABLE` must be asserted from a mechanical fact, never assumed — an
+unconsidered dimension is `UNKNOWN`.
+
+### The dimensions
+
+| Dimension | Question |
+|---|---|
+| `semantic_generation` | is a generation published, complete, and describing the current commit? |
+| `repository_snapshot` | does the file index describe the working tree now? |
+| `tracked_source` | was every tracked source file in scope read? |
+| `generated_source` | were build-generated sources included? |
+| `direct_calls` | is every compiler-proved direct call edge recorded? |
+| `indirect_calls` | are function pointers, callbacks, dispatch tables and dynamic registration accounted for? |
+| `external_callers` | are callers outside the indexed repository, and dynamic symbol lookup, excluded? |
+| `tests` | were test sources in scope? |
+| `document_corpus` | was the bounded document corpus enumerated? |
+| `runtime_state` | was the running system observed? |
+| `deployed_config` | was deployed configuration read? |
+
+`semantic_generation` decomposes three questions that A9.2 had collapsed into
+one boolean, and they stay separate because they call for different actions:
+nothing published (`UNKNOWN`), a look that missed part of the tree (`PARTIAL`),
+and a look at a tree the repository has since left (`STALE`).
+
+## The absence-proof rule
+
+`atlas_verify_truth_of` is the **only producer of `ATLAS_TRUTH_ABSENT` in
+Atlas**. Nothing else assigns it, no caller passes it in, no transport carries a
+field that could hold it, and no intake verb accepts one. That is the same
+single-write-point shape as `settle()`, `atlas_db_evidence_insert`,
+`atlas_decision_apply_in_tx` and `atlas_orch_apply_in_tx`, applied to a value.
+
+The order is the argument, and each step refuses for a different reason:
+
+1. normative semantics or a `JUDGMENT` basis → `NOT_VERIFIABLE`. Asked first
+   because no evidence changes it;
+2. a basis other than `DETERMINISTIC` → `UNKNOWN`. §15: empirical evidence never
+   establishes presence or absence however high the score;
+3. `check == UNAVAILABLE` → `UNKNOWN`. Atlas could not look, which is not a
+   finding;
+4. the verifier's **polarity** decides which of `PRESENT`/`ABSENT` the check maps
+   to;
+5. **if and only if that is `ABSENT`**, every dimension the verifier declares
+   must be sufficient. Otherwise `UNKNOWN`, naming the dimension that fell short;
+6. `PRESENT` is returned with no coverage requirement — the asymmetry, explicit.
+
+### Verifier polarity and what each negative rests on
+
+| Verifier | PASS | FAIL | dimensions required for ABSENT |
+|---|---|---|---|
+| `atlas.content_hash` | PRESENT | ABSENT | `repository_snapshot` |
+| `atlas.symbol_present` | PRESENT | ABSENT | `semantic_generation`, `tracked_source`, `generated_source` |
+| `atlas.symbol_absent` | ABSENT | PRESENT | `semantic_generation`, `tracked_source`, `generated_source` |
+| `atlas.proven_edge` | PRESENT | ABSENT | `semantic_generation`, `direct_calls` |
+| `atlas.no_proven_caller` | ABSENT | PRESENT | the above plus `indirect_calls`, `external_callers` |
+
+## `atlas.no_proven_caller`, and the three questions that bound it
+
+"Nothing calls X" cannot be established from an empty result set. Three
+mechanical questions bound it, and each is a read over tables Atlas already
+built:
+
+1. **Direct callers.** Compiler-proved `CALLS` edges naming the symbol.
+2. **Indirect reachability.** A C function cannot be reached through a pointer,
+   a dispatch table, a callback or a dynamic registration **unless its address is
+   taken somewhere**, and `ADDRESS_TAKEN` is a PROVEN edge naming it. Zero
+   address-takes over a *complete* generation excludes every one of those
+   mechanisms at once — a stronger and far more checkable statement than
+   enumerating them. Where the address does escape, no amount of further indexing
+   recovers the target set, so `indirect_calls` is `PARTIAL` and the answer is
+   `UNKNOWN`.
+3. **Out-of-tree callers.** An internal-linkage symbol cannot be named from
+   outside its own translation unit, so the indexed tree is the whole world for
+   it and `external_callers` is `NOT_APPLICABLE`. An **external**-linkage symbol
+   can be called from code Atlas never indexed and reached through `dlsym`,
+   neither of which any amount of indexing would reveal — so that dimension stays
+   `PARTIAL` and the claim comes back `UNKNOWN`. Linkage is the compiler's, not a
+   lexer's guess, and is treated as external unless every definition is
+   established INTERNAL.
+
+The generation must be complete for questions 1 and 2 to be worth anything: a
+translation unit that failed to parse could hold the call or the address-take.
+
+**"No PROVEN direct caller exists" and "no caller exists" remain different
+claims.** `atlas.proven_edge` answers the first and says so in its scope
+sentence; `atlas.no_proven_caller` answers the second and is bounded by all
+three questions. Keeping them as two verifiers rather than one with a footnote
+is what makes the distinction survive being read quickly.
+
+## Repository absence is not operational absence
+
+No A9.2.2 verifier observes a running system or reads deployed configuration, so
+`runtime_state` and `deployed_config` are `UNKNOWN` for every one of them. That
+is the correct, fail-closed answer rather than a gap:
+
+> No chain-id found in source ≠ there is no live chain id.
+> No deployment config in the repository ≠ the deployment does not set it.
+
+A claim whose negative would rest on either dimension therefore cannot reach
+`ABSENT` **by construction**, without a rule anywhere deciding that it must not.
+Adding a runtime probe would be a code-execution path and needs the argument
+every deterministic verifier's read-only restriction already demands.
+
+## Staleness
+
+An `ABSENT` result stays bound to the snapshot it examined — `claim_commit`,
+`evaluated_commit` and `sem_generation`, stored since A9.2.1. The **current**
+truth is recomputed on every read and never served from the row, so a repository
+that has moved yields `UNKNOWN` until something re-establishes the absence. The
+stored row is history and is never rewritten.
+
+## The calibration consequence
+
+Two changes in the answer look identical in a bare before/after pair and must
+not be treated alike:
+
+| Change | Classification | Calibration |
+|---|---|---|
+| `UNKNOWN` → established | `ACQUISITION` | **not** an error |
+| established → contradicted, **different** snapshot | `HISTORICAL` | not an error |
+| established → contradicted, **same** snapshot | `ERROR` | eligible |
+| established → `UNKNOWN` | `NONE` | not an error |
+
+Charging `UNKNOWN → PRESENT` as a false negative would penalise a verifier for
+having been honest about the limits of its coverage — which is the behaviour
+this whole season is built to encourage, so making it costly would push every
+verifier back towards guessing. And "the same snapshot" is the load-bearing half
+of the third row: `ABSENT` at commit X and `PRESENT` at commit Y is a repository
+that changed, not a verifier that was wrong. `atlas_verify_truth_change_of`
+decides this from the *binding*, never from elapsed time.
+
+## Auto-lifecycle
+
+**`UNKNOWN` must never satisfy a policy condition that requires `ABSENT`.** A
+negative conclusion with insufficient coverage never reaches `PASS`, so it is
+never `VERIFIED`, so it is already blocked — but `COVERAGE_INSUFFICIENT` is
+noted explicitly anyway, for A6's reason about asserting a permissive verdict
+deliberately: a guarantee that holds only because three other gates happen to
+catch it is one a later edit to any of the three can delete silently. The
+distinct reason also tells an auditor *which* happened — thin evidence, or a
+look that never covered the ground it would have had to.
+
+## What A9.2.2 fixed
+
+Two live defects, both the same shape, both in `src/verify/detverify.c`:
+
+- **`atlas.symbol_present` returned `FAIL` on `count == 0`** having checked only
+  that *some* generation existed. Over a partial generation the defining
+  translation unit may be the one that failed to parse. Downstream this is worse
+  than it sounds: `FAIL` becomes `CONTRADICTED` at confidence 0, and the
+  deterministic verdict overrides the attestation fold entirely — so a partial
+  index turned an unexamined claim into a mechanically contradicted one.
+- **`atlas.proven_edge` never consulted completeness at all.** The flag was not
+  merely ignored; it was not gathered.
+
+Neither was reachable by the installed policy, which allows only
+`atlas.symbol_absent`, so no production knowledge was mis-transitioned. Both were
+reachable by `atlas verify run` and by the MCP `atlas_verify_evaluate` tool.
+
+The fix is structural rather than two extra checks: every verifier computes its
+coverage report **before** it decides a check, and every check goes through one
+function that applies the asymmetry. A negative conclusion with insufficient
+coverage returns `UNAVAILABLE`, so the verification-state axis and the truth axis
+cannot disagree about one evaluation — a row carrying `state = CONTRADICTED` and
+`truth = UNKNOWN` would be the same mechanical evaluation contradicting itself.
+
+## Answering "why is this UNKNOWN?"
+
+§22's requirement is that a model receive something it can branch on, not a
+sentence it has to parse. `truth_reason` is a closed vocabulary:
+
+`ESTABLISHED` · `NOT_EVALUATED` · `COVERAGE_PARTIAL` · `COVERAGE_UNKNOWN` ·
+`SEMANTIC_INDEX_STALE` · `SEMANTIC_INDEX_ABSENT` · `SEMANTIC_INDEX_INCOMPLETE` ·
+`INDIRECT_CALLS_UNRESOLVED` · `EXTERNAL_CALLERS_POSSIBLE` ·
+`RUNTIME_NOT_OBSERVED` · `DEPLOYED_CONFIG_UNAVAILABLE` ·
+`REPOSITORY_SNAPSHOT_STALE` · `SOURCE_DRIFT` · `SCOPE_UNBOUNDED` ·
+`NOT_FACTUAL` · `EMPIRICAL_BASIS`
+
+It is kept **separate from `atlas_verify_reason`**, which explains a *policy*
+verdict. Merging them would have the two axes this season exists to separate
+sharing a field.
+
+## Claim negation
+
+`atlas_verify_truth_contradicts` recognises `PRESENT` versus `ABSENT` and
+nothing else. Anything involving `UNKNOWN` is an absence of knowledge rather than
+a disagreement; anything involving `NOT_VERIFIABLE` is not a factual question.
+
+Atlas does **no natural-language negation detection** here and must not start.
+The mechanical case is `atlas.symbol_present` and `atlas.symbol_absent` over one
+subject, and that is the whole of what is claimed.
+
+## Context retrieval
+
+A knowledge record in a context package carries a third field beside its kind and
+status:
+
+```
+[OPERATIONAL_FACT · PROPOSED] [truth UNKNOWN]
+```
+
+This exists so a model cannot turn a record whose text is a negative claim into
+a settled negative. `atlas_db_verify_truth_for_document` is deliberately
+conservative: an established value only when **every** live claim on the record
+agrees, so what a reader sees by default is that Atlas has not established this.
+
+## Schema
+
+Migration 17, additive. Four columns on `verify_results` (`truth`,
+`truth_reason`, `coverage_summary`, `coverage_detail`) and two on
+`verify_outcomes` (`prior_truth`, `prior_result_id`).
+
+Every column defaults to its vocabulary's zero, so **every result written before
+this season reads `UNKNOWN`**. A result written before the coverage model existed
+carries no information from which its truth could be reconstructed, and inventing
+one would be the exact error this season exists to prevent. No existing row is
+silently relabelled `PRESENT` or `ABSENT`.
+
+`coverage_detail` is `dim=STATE;dim=STATE` over the two closed vocabularies —
+never free text — and lists **every** dimension including the `UNKNOWN` ones,
+because a detail that listed only what succeeded would make a result establishing
+nothing look like a short one that established everything it mentioned.
+
+## The A10 prerequisite contract
+
+A future Experience Learning phase must be unable to learn *"X does not exist"*
+from *"X was not found"*. What A9.2.2 exposes for that:
+
+| A10 needs | Atlas provides |
+|---|---|
+| `KNOWN_PRESENT` | `truth = PRESENT` |
+| `KNOWN_ABSENT` | `truth = ABSENT`, reachable only through the absence-proof rule |
+| `UNKNOWN` | `truth = UNKNOWN`, **epistemic uncertainty, never a negative fact** |
+| `NOT_VERIFIABLE` | `truth = NOT_VERIFIABLE` |
+| why it is unknown | `truth_reason`, a closed vocabulary |
+| what was looked at | `coverage_dimensions`, per dimension |
+| whether a change was a mistake | `atlas_verify_truth_change_of` |
+
+**A10 must treat `UNKNOWN` as epistemic uncertainty and must never fold it into
+a negative fact.** That is a contract on the consumer: Atlas can guarantee it
+never *produces* an unjustified `ABSENT`, and cannot guarantee that a later phase
+reads `UNKNOWN` correctly. This table is what a reviewer of A10 checks against.
+
+## Extending A9.2.2 safely
+
+- **A new verifier** additionally needs a row in
+  `atlas_verify_verifier_truth_of_check` stating what its PASS and FAIL mean on
+  the truth axis, and a row in `atlas_verify_verifier_absence_dims` stating what
+  its negative rests on. `tests/test_verify_absence.c` enumerates the vocabulary
+  and fails a verifier that can conclude `ABSENT` while declaring no dimension.
+- **A new coverage dimension** means a member, a row in `COVERAGE_DIMS[]`
+  carrying its name and the truth reason its insufficiency implies, a wider
+  `ATLAS_VERIFY_COVERAGE_DIMS` (a static assertion refuses otherwise), and a
+  decision for every verifier about whether its negative depends on it. Keep
+  `UNKNOWN` at zero.
+- **A new truth value** means editing `atlas_verify_truth`,
+  `atlas_verify_truth_is_established`, `atlas_verify_truth_contradicts`,
+  `atlas_verify_truth_change_of`, the CHECK on `verify_results.truth` and
+  `verify_outcomes.prior_truth` — which means a **migration** — and the
+  enumerations in `tests/test_verify_absence.c`.
+- **A new truth reason** means a member and a row in `TRUTH_REASONS[]` carrying
+  its name and one written sentence of meaning.
+- **Never add a parameter that could carry truth or coverage in from a caller.**
+  The guarantee is an absent field, not a check on one, and
+  `test_no_intake_path_can_assert_coverage_or_absence` scans `atlas_verify_op`
+  for exactly that.

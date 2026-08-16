@@ -3215,6 +3215,16 @@ static void take_items(const atlas_ipc_response *r, atlas_sem_item **items, size
                          atlas_decision_state_name(parsed));
             }
         }
+        /* A9.2.2, §24. Re-interned against Atlas' own vocabulary like the other
+         * two: a name that arrived over a socket is a matching string, not
+         * Atlas' string, and one this binary does not recognise leaves UNKNOWN
+         * rather than being copied through. */
+        if (atlas_ipc_result_arr_obj_str(r, "items", i, "knowledge_truth", &v)) {
+            atlas_verify_truth parsed = ATLAS_TRUTH_UNKNOWN;
+            (void)atlas_verify_truth_parse(v, &parsed);
+            copy_str(it->knowledge_truth, sizeof it->knowledge_truth,
+                     atlas_verify_truth_name(parsed));
+        }
         /* Re-interned against Atlas' own closed set: a reason that arrived over
          * a socket is a matching string, not Atlas' string. */
         if (atlas_ipc_result_arr_obj_str(r, "items", i, "why", &v)) {
@@ -3457,6 +3467,30 @@ static void read_assessment(const atlas_ipc_response *r, atlas_verify_assessment
     }
     if (atlas_ipc_result_str(r, "state", &v) && v != NULL) {
         (void)atlas_verify_state_parse(v, &a->aggregate.state);
+    }
+    /* A9.2.2's fourth axis, read back for the reason the other two are. An
+     * unrecognised name leaves UNKNOWN truth and UNKNOWN coverage, which is the
+     * conservative degradation: a binary that has never heard of a truth value
+     * a newer daemon sent reports that it does not know, never that the subject
+     * is absent. */
+    if (atlas_ipc_result_str(r, "truth", &v) && v != NULL) {
+        (void)atlas_verify_truth_parse(v, &a->truth);
+    }
+    if (atlas_ipc_result_str(r, "truth_reason", &v) && v != NULL) {
+        (void)atlas_verify_truth_reason_parse(v, &a->truth_reason);
+    }
+    /* The per-dimension map, read back by name so the local renderer can print
+     * the same coverage table the daemon computed. Missing the read-back is how
+     * the socket path and the local path start disagreeing — the A9.2.1 closure
+     * lesson, and the reason this loop exists rather than a summary field. */
+    for (size_t i = 0; i < ATLAS_VERIFY_COVERAGE_DIMS; i++) {
+        atlas_verify_coverage_dim d = (atlas_verify_coverage_dim)i;
+        const char *state = NULL;
+        if (atlas_ipc_result_obj_str(r, "coverage_dimensions",
+                                     atlas_verify_coverage_dim_name(d), &state) &&
+            state != NULL) {
+            (void)atlas_verify_coverage_parse(state, &a->coverage.dims[i]);
+        }
     }
     if (atlas_ipc_result_str(r, "basis", &v) && v != NULL) {
         (void)atlas_verify_basis_parse(v, &a->basis);
@@ -3943,6 +3977,18 @@ atlas_status atlas_service_verify_intake_remote(const atlas_verify_op *op,
         }
         take_cstr(out->verified_scope, sizeof out->verified_scope, r, "verified_scope");
         take_cstr(out->detail, sizeof out->detail, r, "detail");
+        /* A9.2.2. Read back so the socket path and the local path report the
+         * same four axes. An unrecognised name leaves UNKNOWN, which is the
+         * conservative degradation for every vocabulary Atlas parses. */
+        if (atlas_ipc_result_str(r, "truth", &v) && v != NULL) {
+            (void)atlas_verify_truth_parse(v, &out->truth);
+        }
+        if (atlas_ipc_result_str(r, "truth_reason", &v) && v != NULL) {
+            (void)atlas_verify_truth_reason_parse(v, &out->truth_reason);
+        }
+        if (atlas_ipc_result_str(r, "coverage_detail", &v) && v != NULL) {
+            (void)atlas_verify_coverage_parse_detail(v, &out->coverage);
+        }
     }
     /* `verify.evaluate` answers with a whole assessment rather than an id, and
      * it lands in the same member the local path fills — so the CLI renders one

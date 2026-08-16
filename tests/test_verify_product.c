@@ -310,6 +310,122 @@ static void test_a_model_cannot_produce_evidence_only_atlas_could_have(void) {
     env_stop(&e);
 }
 
+/* A9.2.2, §29. A model may state a hypothesis; it may not manufacture an
+ * authenticated absence proof.
+ *
+ * Driven **through the real MCP adapter** rather than against the C API,
+ * because a refusal that exists only below the transport is one an attacker
+ * never meets — the rule A9.2.1 states and `tests/test_verify_absence.c` can
+ * only half-satisfy in process.
+ *
+ * The guarantee being tested is an *absence of a parameter*: no tool names
+ * `truth`, `coverage` or any coverage dimension, so nothing reads one. Every
+ * schema advertises `additionalProperties: false` and the adapter ignores any
+ * member a tool does not name — so a forged argument is not refused, it is
+ * simply never read, which is the shape A9 gives the gateway's route table.
+ *
+ * The assertion is therefore about the *answer* rather than about a rejection:
+ * whatever a caller supplies, the reported truth and coverage must remain the
+ * ones Atlas derived from index state. That is a stronger check than a schema
+ * refusal, because it fails if a future edit ever threads a caller's value
+ * through — however politely the request was phrased. */
+static void test_no_mcp_call_can_assert_truth_or_coverage(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    env e;
+    env_start(&e, &err);
+
+    atlas_buf out = ATLAS_BUF_INIT;
+    run_mcp(&e,
+            MCP_INIT "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":"
+                     "{\"name\":\"atlas_verify_claim_create\",\"arguments\":"
+                     "{\"repo\":\"subject\",\"text\":\"nothing calls the helper\"}}}\n",
+            &out, &err);
+    const char *p = strstr(atlas_buf_cstr(&out), "atlas-claim-");
+    T_REQUIRE(p != NULL);
+    char claim[96];
+    size_t n = 0;
+    while (n + 1u < sizeof claim && p[n] != '\0' && p[n] != '\\' && p[n] != '"') {
+        claim[n] = p[n];
+        n++;
+    }
+    claim[n] = '\0';
+
+    /* Each of these would, if accepted, let a caller supply the very thing the
+     * absence-proof rule exists to derive. */
+    static const char *const FORGERIES[] = {
+        "\"truth\":\"ABSENT\"",
+        "\"coverage\":\"COMPLETE\"",
+        "\"coverage_detail\":\"indirect_calls=COMPLETE\"",
+        "\"semantic_generation\":\"COMPLETE\"",
+        "\"indirect_calls\":\"COMPLETE\"",
+        "\"truth_reason\":\"ESTABLISHED\"",
+    };
+    for (size_t i = 0; i < sizeof FORGERIES / sizeof FORGERIES[0]; i++) {
+        atlas_buf script = ATLAS_BUF_INIT;
+        T_OK(atlas_buf_appendf(&script, &err,
+                               MCP_INIT
+                               "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\","
+                               "\"params\":{\"name\":\"atlas_verify_evaluate\",\"arguments\":"
+                               "{\"repo\":\"subject\",\"claim\":\"%s\",%s}}}\n",
+                               claim, FORGERIES[i]),
+             &err);
+        run_mcp(&e, atlas_buf_cstr(&script), &out, &err);
+        /* The guarantee is that the supplied value **reaches nothing**, not
+         * that the request is rejected.
+         *
+         * Every tool schema advertises `additionalProperties: false`, and the
+         * adapter additionally *ignores* any member a tool does not name —
+         * `run_verify_evaluate` reads `repo` and `claim` and nothing else. So a
+         * forged argument is not refused; it is not read. That is the same
+         * shape A9 gives the gateway's route table, where anything else in a
+         * query string is ignored rather than forwarded.
+         *
+         * Which means the assertion that matters is about the *answer*: the
+         * reply must still carry the truth and coverage Atlas derived from
+         * index state. This fixture has no semantic generation, so the only
+         * honest answer is UNKNOWN — and if a caller-supplied ABSENT or
+         * COMPLETE could ever reach the aggregation, it is here that it would
+         * show. */
+        T_CHECK_MSG(strstr(atlas_buf_cstr(&out), "\"truth\":\"UNKNOWN\"") != NULL,
+                    "a model supplied %s and the reported truth was not the derived UNKNOWN; "
+                    "truth must come from index state, never from a caller: %s",
+                    FORGERIES[i], atlas_buf_cstr(&out));
+        T_CHECK_MSG(strstr(atlas_buf_cstr(&out), "\"truth\":\"ABSENT\"") == NULL,
+                    "a model supplied %s and Atlas reported ABSENT: %s", FORGERIES[i],
+                    atlas_buf_cstr(&out));
+        T_CHECK_MSG(strstr(atlas_buf_cstr(&out), "\"coverage\":\"COMPLETE\"") == NULL,
+                    "a model supplied %s and Atlas reported COMPLETE coverage: %s", FORGERIES[i],
+                    atlas_buf_cstr(&out));
+        atlas_buf_free(&script);
+    }
+
+    /* The honest call still works, so this is testing a closed door rather than
+     * a broken one. */
+    {
+        atlas_buf script = ATLAS_BUF_INIT;
+        T_OK(atlas_buf_appendf(&script, &err,
+                               MCP_INIT
+                               "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"tools/call\","
+                               "\"params\":{\"name\":\"atlas_verify_evaluate\",\"arguments\":"
+                               "{\"repo\":\"subject\",\"claim\":\"%s\"}}}\n",
+                               claim),
+             &err);
+        run_mcp(&e, atlas_buf_cstr(&script), &out, &err);
+        T_CHECK_MSG(tool_ok(&out, "\"id\":10"),
+                    "the ordinary evaluate call was refused: %s", atlas_buf_cstr(&out));
+        /* And what comes back carries the truth axis, so a model reading over
+         * the transport sees UNKNOWN rather than inferring a negative from a
+         * verifier verdict it would have to invert by hand. */
+        T_CHECK_MSG(strstr(atlas_buf_cstr(&out), "truth") != NULL,
+                    "the MCP reply carried no truth axis: %s", atlas_buf_cstr(&out));
+        atlas_buf_free(&script);
+    }
+
+    atlas_buf_free(&out);
+    env_stop(&e);
+}
+
 /* Absent rather than refused, which is A7's pattern: an absent name is answered
  * by the dispatcher's unknown-tool case, and a refusing one is a refusal a
  * later edit can weaken. */
@@ -531,6 +647,8 @@ static const atlas_test TESTS[] = {
      test_an_mcp_call_speaks_as_a_model_whatever_uid_carries_it},
     {"a model cannot produce evidence only Atlas could have",
      test_a_model_cannot_produce_evidence_only_atlas_could_have},
+    {"no MCP call can assert truth or coverage",
+     test_no_mcp_call_can_assert_truth_or_coverage},
     {"no tool approves, rejects, supersedes, resolves or revalidates",
      test_no_tool_approves_rejects_supersedes_resolves_or_revalidates},
     {"every knowledge kind reaches the record through MCP",

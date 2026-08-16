@@ -683,6 +683,16 @@ static atlas_status write_items(dispatch_state *ds, const atlas_sem_item *items,
         if (st == ATLAS_OK && it->knowledge_status[0] != '\0') {
             st = atlas_json_key_str(ds->j, "knowledge_status", it->knowledge_status, err);
         }
+        /* A9.2.2, §24. Sent in the shape the daemon produces, so MCP — which
+         * relays this object — and the local renderer carry the same three
+         * axes. Explicit `UNKNOWN` rather than an absent key: a consumer must
+         * not have to decide what a missing truth means. */
+        if (st == ATLAS_OK && it->knowledge_kind[0] != '\0') {
+            st = atlas_json_key_str(ds->j, "knowledge_truth",
+                                    it->knowledge_truth[0] != '\0' ? it->knowledge_truth
+                                                                   : "UNKNOWN",
+                                    err);
+        }
         if (st == ATLAS_OK) {
             st = atlas_json_key_str(ds->j, "evidence", it->evidence, err);
         }

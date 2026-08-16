@@ -48,7 +48,9 @@ three orthogonal things, and no code path derives one from another: what sort of
 knowledge it is (`DECISION`, `POLICY`, `INVARIANT`, `OPERATIONAL_FACT`,
 `ACCEPTED_RISK`, `OBLIGATION`, `PARKED`, `REJECTED_ALTERNATIVE`), how far
 through the approval workflow it got (`PROPOSED`, `APPROVED`, `REJECTED`,
-`SUPERSEDED`, `RESOLVED`), and what evidence bears on whether it holds. Asked
+`SUPERSEDED`, `RESOLVED`), and what evidence bears on whether it holds. A fourth
+axis says whether the thing the record is about is actually **there** —
+`PRESENT`, `ABSENT`, `UNKNOWN` or `NOT_VERIFIABLE`. Asked
 why something changed with nothing recorded, Atlas answers `UNKNOWN` — it never
 invents a historical reason. See
 [docs/decision-lifecycle.md](docs/decision-lifecycle.md) and
@@ -92,7 +94,7 @@ from a model. See [docs/operations.md](docs/operations.md).
 
 ## Status
 
-Atlas is at phase **A9.2**. Each phase built on the last and none removed a
+Atlas is at phase **A9.2.2**. Each phase built on the last and none removed a
 guarantee:
 
 | Phase | What it added |
@@ -111,6 +113,7 @@ guarantee:
 | A9 | secure remote access: gateway, API keys, remote MCP, web API, GUI |
 | A9.1 | knowledge kinds and the `RESOLVED` lifecycle state |
 | A9.2 | evidence, verification and policy-authorised automatic lifecycle |
+| A9.2.2 | epistemic absence: the truth axis, first-class coverage, and the absence-proof rule |
 
 ## Requirements
 
@@ -405,6 +408,17 @@ so rather than implying otherwise. See
   none on a fresh machine, and stays in shadow until it does. Deterministic
   verification does not wait for calibration, because a mechanical truth
   condition Atlas evaluated does not depend on anyone's track record.
+- **No evidence of X is not evidence of no X.** Atlas reports `ABSENT` only
+  where it can show, dimension by dimension, that its coverage was sufficient
+  for that bounded claim; everywhere else the answer is `UNKNOWN`, which is
+  epistemic uncertainty and never a negative fact. The practical limits that
+  follow are real ones: an absence can be established over the semantic index
+  and cannot be established about a running system, because Atlas has no
+  runtime probe — so a key absent from the repository never becomes a key the
+  deployment does not set. An external-linkage symbol's callers cannot be
+  enumerated from the index alone, and a symbol whose address escapes has
+  indirect callers Atlas cannot rule out. Every one of those answers `UNKNOWN`
+  rather than guessing.
 - Applying a job's patch, committing, pushing and every GitHub verb are absent
   from the orchestration layer, deliberately — see the status section of
   [docs/orchestration.md](docs/orchestration.md).

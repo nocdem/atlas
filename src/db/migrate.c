@@ -3224,6 +3224,93 @@ static const char M16_STATEMENTS_SQL[] =
 
 static const char *const M16_STATEMENTS[] = {M16_STATEMENTS_SQL, NULL};
 
+/* --- migration 17: A9.2.2, the truth axis and coverage --------------------
+ *
+ * The central invariant this season makes structural:
+ *
+ *   NO EVIDENCE OF X IS NOT EVIDENCE OF NO X.
+ *
+ * ## the four columns on `verify_results`
+ *
+ * A verification result now records what Atlas concluded on the **truth** axis
+ * — PRESENT, ABSENT, UNKNOWN or NOT_VERIFIABLE — separately from `state`, which
+ * is about the strength of the evidence, and separately from `check_result`,
+ * which records whether a verifier's own truth condition was met.
+ *
+ * Those three were not redundant before and are not now. `check_result = PASS`
+ * means *absent* for `atlas.symbol_absent` and *present* for
+ * `atlas.symbol_present`, so no reader holding a row could say which without
+ * knowing the verifier and inverting by hand. `truth` says it directly.
+ *
+ * `coverage_summary` and `coverage_detail` record what was actually looked at.
+ * The detail is `dim=STATE;dim=STATE` over the two closed vocabularies in
+ * `atlas/verify.h`, never free text and never a percentage: a coverage figure
+ * with a denominator Atlas cannot state would be precision about exactly the
+ * thing that is unknown.
+ *
+ * ## the two columns on `verify_outcomes`: §16
+ *
+ * Calibration has to tell two things apart that look identical in a bare
+ * before/after pair:
+ *
+ *   - Atlas said UNKNOWN and later evidence shows PRESENT. That is ordinary
+ *     knowledge acquisition and **not** a verifier error. Counting it as one
+ *     would penalise a verifier for having been honest about not knowing, which
+ *     is the behaviour this whole season is trying to encourage.
+ *   - Atlas said ABSENT and later valid evidence shows PRESENT **for the same
+ *     bound snapshot and scope**. That is a genuine verification error and is
+ *     calibration-eligible.
+ *
+ * `prior_truth` alone cannot distinguish them, because "the same bound
+ * snapshot" is the load-bearing half: an ABSENT at commit X and a PRESENT at
+ * commit Y is a repository that changed, not a verifier that was wrong.
+ * `prior_result_id` therefore references the result row, which already carries
+ * `claim_commit`, `evaluated_commit` and `sem_generation` from migration 16 —
+ * so the comparison is made against what the earlier verdict was actually bound
+ * to rather than against a remembered enum.
+ *
+ * ## Why this is additive and needs no `foreign_keys_off`
+ *
+ * `ALTER TABLE ... ADD COLUMN` rebuilds nothing, drops nothing and triggers no
+ * cascade, so no row can be lost and no content hash moves — migration 14's and
+ * 16's argument. Migration 13's row-preservation ceremony exists for rebuilds
+ * and has nothing to check here.
+ *
+ * ## §27: history is preserved conservatively, never relabelled
+ *
+ * Every added column defaults to its vocabulary's zero — `UNKNOWN` truth,
+ * `UNKNOWN` coverage, an empty detail. A result written before this season had
+ * no coverage model, so there is no information from which its truth could be
+ * reconstructed, and inventing one would be the exact error the season exists
+ * to prevent. An old row therefore reads as "Atlas has not established this",
+ * which is both true and the safe reading. **No existing row is silently
+ * relabelled PRESENT or ABSENT.**
+ *
+ * The CHECK constraints enumerate the vocabularies, so adding a value later is
+ * a migration rather than a silent widening — which is the point. */
+static const char M17_STATEMENTS_SQL[] =
+    /* The truth axis. Defaults to UNKNOWN so every pre-A9.2.2 row is honestly
+     * unclassified rather than confidently wrong. */
+    "ALTER TABLE verify_results ADD COLUMN truth TEXT NOT NULL DEFAULT 'UNKNOWN'"
+    "  CHECK(truth IN ('UNKNOWN','PRESENT','ABSENT','NOT_VERIFIABLE'));"
+    "ALTER TABLE verify_results ADD COLUMN truth_reason TEXT NOT NULL DEFAULT 'NONE';"
+    /* What was looked at. The summary is the fold across the dimensions that
+     * are in play; the detail is every dimension, including the UNKNOWN ones —
+     * a detail that omitted them would make a report establishing nothing look
+     * like a short one that established everything it mentioned. */
+    "ALTER TABLE verify_results ADD COLUMN coverage_summary TEXT NOT NULL DEFAULT 'UNKNOWN'"
+    "  CHECK(coverage_summary IN ('UNKNOWN','COMPLETE','PARTIAL','STALE','NOT_APPLICABLE'));"
+    "ALTER TABLE verify_results ADD COLUMN coverage_detail TEXT NOT NULL DEFAULT '';"
+    /* §16. What Atlas previously concluded, and the result row that concluded
+     * it — so "the same bound snapshot" is decided from what that verdict was
+     * bound to rather than from a remembered value. */
+    "ALTER TABLE verify_outcomes ADD COLUMN prior_truth TEXT NOT NULL DEFAULT 'UNKNOWN'"
+    "  CHECK(prior_truth IN ('UNKNOWN','PRESENT','ABSENT','NOT_VERIFIABLE'));"
+    "ALTER TABLE verify_outcomes ADD COLUMN prior_result_id INTEGER NOT NULL DEFAULT 0;"
+    "CREATE INDEX idx_verify_results_truth ON verify_results(claim_id, truth, id);";
+
+static const char *const M17_STATEMENTS[] = {M17_STATEMENTS_SQL, NULL};
+
 static const atlas_migration MIGRATIONS[] = {
     {1, "initial schema", M1_STATEMENTS, false},
     {2, "worktree identity", M2_STATEMENTS, false},
@@ -3251,6 +3338,12 @@ static const atlas_migration MIGRATIONS[] = {
     /* Additive: nine columns and three partial unique indexes, no table
      * rebuilt, so foreign keys stay enforced and no row is rewritten. */
     {16, "verification object identity and source binding", M16_STATEMENTS, false},
+    /* Additive: six columns and one index, no table rebuilt, so foreign keys
+     * stay enforced and no row is rewritten. Every column defaults to its
+     * vocabulary's zero, so every pre-A9.2.2 result reads UNKNOWN rather than
+     * being relabelled — §27's "preserve conservatively rather than invent
+     * certainty", for free. */
+    {17, "epistemic truth, coverage and the absence-proof record", M17_STATEMENTS, false},
 };
 
 const atlas_migration *atlas_migrations(size_t *count_out) {

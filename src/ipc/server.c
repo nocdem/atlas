@@ -276,32 +276,12 @@ static atlas_status method_status(dispatch_state *ds, const atlas_ipc_request *r
 }
 
 bool atlas_server_index_current(const atlas_index_state *s, const char **reason_out) {
-    /* The one claim a caller actually acts on, computed once here rather than
-     * reconstructed by every consumer from the flags. The reason strings are a
-     * fixed Atlas vocabulary: they reach a model's context, so they must not be
-     * assembled from anything a repository can influence. */
-    if (!s->present || s->last_complete_generation <= 0) {
-        *reason_out = "no reconciliation pass has completed for this repository yet";
-        return false;
-    }
-    if (s->event_gap) {
-        *reason_out = "an unresolved event gap means Atlas cannot prove it observed every change";
-        return false;
-    }
-    if (s->pending_full_reconcile) {
-        *reason_out = "a full content verification is owed and has not completed";
-        return false;
-    }
-    if (s->watch_state == ATLAS_WATCH_ERROR) {
-        *reason_out = "the filesystem watcher failed and is not observing this repository";
-        return false;
-    }
-    if (s->watch_state == ATLAS_WATCH_DEGRADED) {
-        *reason_out = "the filesystem watcher is running with a known blind spot";
-        return false;
-    }
-    *reason_out = NULL;
-    return true;
+    /* A9.2.2 moved the rule itself to `atlas_index_state_is_current` in
+     * `src/db/db_state.c`, because A9.2.2's coverage model has to ask the same
+     * question from `src/verify` and a second copy of a currency rule is how two
+     * surfaces start disagreeing about whether the index is current. This stays
+     * as the name the A2 serve loop has always called. */
+    return atlas_index_state_is_current(s, reason_out);
 }
 
 atlas_status atlas_server_write_repo_state(dispatch_state *ds, const atlas_repo_info *ri,

@@ -354,7 +354,29 @@ A9.2.2 already had.
 | `generated_source` | the units, via a current compilation database (§5) |
 | `tracked_source` | the **scope manifest** — every tracked source in scope was read |
 | `indirect_calls` | the scope manifest, and zero address-takes |
-| `tests` | declared test roots (`UNKNOWN` without them) |
+| `tests` | **nothing — always `UNKNOWN`** (see below) |
+
+### The tests dimension, and what is honestly missing
+
+`ATLAS_COVDIM_TESTS` is set by nothing and is always `UNKNOWN`. No verifier's
+absence rests on it, so this costs no correctness — but it is worth stating
+rather than leaving to be discovered.
+
+A9.2.3 records the test/production split **on the generation** (`tu_test`,
+`tu_production`, `test_scope_known`) and reports it on every surface, and
+**nothing consumes it**. There is no production-scope caller verifier: Atlas
+cannot currently be asked "does any *production* caller of X exist" at all.
+
+So the §45 distinction — "no production caller" versus "no caller anywhere
+including tests" — is **inexpressible today rather than wrongly answerable**,
+which is the safe half of the two. `atlas.no_proven_caller` answers the second
+question over the whole indexed scope, and says so in its own scope sentence.
+The scope information a production-only claim would need now exists and is
+recorded; the verifier that would consume it does not, and adding one means
+adding a row to `atlas_verify_verifier_absence_dims` that includes
+`ATLAS_COVDIM_TESTS` and a source for that dimension.
+
+### One currency rule
 
 Before A9.2.3 the verify layer derived currency from `generation.commit_id ==
 repositories.scanned_head` in SQL while every other surface asked
@@ -489,7 +511,10 @@ migration 18's conservatism, and it is the correct answer rather than a gap.
   describe.
 - **A successful build does not imply complete coverage.** That sentence is the
   reason `scope_uncovered` exists.
-- **Atlas does not guess which sources are tests.**
+- **Atlas does not guess which sources are tests**, and **no verifier consumes
+  the split it records**. "No production caller exists" is not a question Atlas
+  can currently be asked — inexpressible rather than wrongly answerable, which
+  is the safe half. See §11.
 - **The sweep interval is not a correctness property.** A sweep that happens late
   converges late. Nothing about the model depends on how quickly it runs, which
   is why it is a compiled-in constant and not a policy key.

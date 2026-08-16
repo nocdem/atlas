@@ -453,3 +453,27 @@ than forgotten:
   direct anchors carry a content snapshot. The asymmetry is documented in
   `docs/impact-gates.md` rather than hidden: a direct anchor that changed and
   changed back is `FRESH`, a dependency that did the same is still `IMPACTED`.
+
+## A9.2.3: a production-scope caller verifier
+
+A9.2.3 records the test/production split on every semantic generation
+(`tu_test`, `tu_production`, `test_scope_known`, from operator-declared test
+roots) and reports it on every surface. **Nothing consumes it.**
+
+There is no verifier for "does any *production* caller of X exist", so §45's
+distinction — "no production caller" versus "no caller anywhere including tests"
+— is inexpressible today. That is the safe half of the two: Atlas cannot answer
+the narrower question wrongly, because it cannot be asked at all.
+`atlas.no_proven_caller` answers the wider question over the whole indexed scope
+and its scope sentence says so.
+
+Adding one means: a member of `atlas_verify_verifier`, a row in `VERIFIERS[]`, a
+scope sentence, a written argument that it is a read, a row in
+`atlas_verify_verifier_absence_dims` that includes `ATLAS_COVDIM_TESTS`, and a
+source for that dimension in `sem_coverage` — which would be
+`test_scope_known` together with the scope manifest, since a production-scope
+absence needs both "we know which sources are tests" and "we read every
+production source".
+
+`ATLAS_COVDIM_TESTS` is UNKNOWN until that exists. No absence rests on it today,
+so this is a missing capability rather than a defect.

@@ -1833,3 +1833,42 @@ atlas_status atlas_db_sem_source_identity_set(atlas_db *db, int64_t generation_i
     }
     return atlas_db_step_done(db, stmt, err);
 }
+
+atlas_status atlas_db_sem_reap_running(atlas_db *db, int64_t *reaped_out, atlas_err *err) {
+    if (reaped_out != NULL) {
+        *reaped_out = 0;
+    }
+    sqlite3_stmt *stmt = NULL;
+    /* A generation left RUNNING is one whose pass died before it could publish
+     * or fail. It is marked FAILED with a fixed Atlas reason rather than
+     * deleted: "indexing this repository died four times today" is an
+     * operational fact, and a table that only recorded outcomes it reached
+     * could not state it.
+     *
+     * `sem_current` is untouched by construction — publication is the only
+     * statement that repoints it, and this row was never published. The
+     * last-known-good generation goes on being served throughout. */
+    atlas_status st = atlas_db_prepare(db,
+                                       "UPDATE sem_generations SET status = 'FAILED',"
+                                       "  completed_at = ?1, failure_reason = ?2"
+                                       " WHERE status = 'RUNNING';",
+                                       &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    char now[ATLAS_TS_MAX];
+    atlas_now_iso8601(now, sizeof now);
+    st = bind_text(db, stmt, 1, now, err);
+    if (st == ATLAS_OK) {
+        st = bind_text(db, stmt, 2, ATLAS_SEM_WHY_CHILD_FAILED, err);
+    }
+    if (st != ATLAS_OK) {
+        atlas_db_finish(db, stmt);
+        return st;
+    }
+    st = atlas_db_step_done(db, stmt, err);
+    if (st == ATLAS_OK && reaped_out != NULL) {
+        *reaped_out = sqlite3_changes(db->h);
+    }
+    return st;
+}

@@ -58,6 +58,26 @@ atlas_status atlas_db_sem_publish(atlas_db *db, int64_t generation_id,
 atlas_status atlas_db_sem_fail(atlas_db *db, int64_t generation_id, const char *why,
                                atlas_err *err);
 
+/* Marks every RUNNING generation FAILED, at daemon startup.
+ *
+ * A generation left RUNNING is one whose pass died before it could publish or
+ * fail — a crash, a kill, a machine that went away. A8-CI said the next pass
+ * would report and reap it and nothing ever did, which was harmless while
+ * nothing scheduled off the record: the row sat there and only a status command
+ * ever mentioned it.
+ *
+ * A9.2.3 made it fatal. The scheduler holds while a generation is being built,
+ * and a RUNNING row from a daemon that no longer exists is indistinguishable
+ * from one being built right now — so a single crash left the repository
+ * reporting BUILDING for ever and never rebuilding again.
+ *
+ * Called once from the writer thread at startup, which is the only moment a
+ * daemon can be certain nothing of its own is running: it holds the data
+ * directory lock, so no other process can be building this index either.
+ * `sem_current` is untouched — an unpublished generation was never pointed at,
+ * and the last-known-good one is served throughout. */
+atlas_status atlas_db_sem_reap_running(atlas_db *db, int64_t *reaped_out, atlas_err *err);
+
 /* The published generation for a repository, if any. `found` is false when the
  * repository has never been indexed, which is ABSENT and not STALE. */
 atlas_status atlas_db_sem_current(atlas_db *db, int64_t repo_id, atlas_sem_generation *out,

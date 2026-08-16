@@ -623,6 +623,38 @@ static void *writer_main(void *arg) {
     w->ready = true;
     (void)pthread_cond_broadcast(&w->ready_cv);
     (void)pthread_mutex_unlock(&w->lock);
+
+    /* A9.2.3: reap semantic generations left RUNNING by a daemon that is gone.
+     *
+     * Here because this is the only moment a daemon can be certain nothing of
+     * its own is building: the writer has just opened the index, no job has run,
+     * and the data-directory lock this process holds means no other process can
+     * be building it either. A row still RUNNING is therefore a pass that died.
+     *
+     * A8-CI said the next pass would report and reap one and nothing ever did.
+     * That was harmless while nothing scheduled off the record. A9.2.3 holds the
+     * scheduler while a generation is being built, and a RUNNING row from a dead
+     * daemon is indistinguishable from a live build — so one crash left the
+     * repository reporting BUILDING for ever and never rebuilding again. Found
+     * by killing a daemon mid-build and restarting it. */
+    {
+        atlas_err rerr;
+        atlas_err_init(&rerr);
+        int64_t reaped = 0;
+        if (atlas_db_sem_reap_running(w->db, &reaped, &rerr) != ATLAS_OK) {
+            atlas_daemon_log(w->log, "warn",
+                             "could not reap interrupted semantic generations: %s",
+                             atlas_err_msg(&rerr));
+        } else if (reaped > 0) {
+            /* Reported rather than silent: "indexing died and nobody noticed"
+             * is exactly the operational fact a log exists for. */
+            atlas_daemon_log(w->log, "info",
+                             "reaped %lld semantic generation(s) left running by a previous "
+                             "daemon; the last published generation is unaffected",
+                             (long long)reaped);
+        }
+    }
+
     /* Did the previous run shut down cleanly?
      *
      * A clean stop records `stopped_at`. A record with a start and no stop means

@@ -1,7 +1,21 @@
 # Atlas — working notes for Claude Code
 
 Atlas is a generic, headless engineering-memory and repository-intelligence CLI in
-C17. Phase **A9.2.2**: epistemic absence and coverage semantics — a durable record
+C17. Phase **A9.2.3**: semantic freshness, coverage and daemon-owned automatic
+rebuild — the daemon now keeps the compiler-derived index current for
+repositories an operator has explicitly enabled, and a generation says what it
+actually covered. The two sentences the season exists for are
+**A SEMANTIC INDEX CAN BE SOURCE-CURRENT BUT COVERAGE-INCOMPLETE** and
+**ZERO RESULTS ARE ONLY NEGATIVE PROOF WHEN THE CLAIM'S REQUIRED SEMANTIC
+COVERAGE IS COMPLETE**. Freshness is derived and never stored; a source identity
+over the working tree is what makes an uncommitted edit visible, which every
+A8-CI check missed because all four compare something that moves with a commit;
+the coverage manifest supplies a denominator taken from the file index rather
+than from the compilation database's own contents; and `sem_repo_config` is both
+the durable build description and the authority opt-in that keeps A8-CI's rule —
+no model can cause a compiler to run — true after repository changes became a
+rebuild trigger. See `docs/semantic-freshness.md` and the A9.2.3 sections below.
+On top of **A9.2.2**: epistemic absence and coverage semantics — a durable record
 now also says *whether the thing it is about is there*, as a fourth axis
 (`PRESENT` / `ABSENT` / `UNKNOWN` / `NOT_VERIFIABLE`) that no code path derives
 from the other three. The invariant the season exists for is
@@ -2029,6 +2043,200 @@ src/gw/ui/mission-control.html  the truth chip and the coverage table
   copies of a currency rule is how a verifier comes to believe a stale snapshot
   is current — and then reports "the bytes differ" for bytes it never read.
 
+## A9.2.3 layers — additions
+
+A9.2.3 adds one migration, one file and one header. It is a lifecycle the daemon
+owns and a coverage manifest a generation carries, threaded through the layers
+that already existed:
+
+```
+include/atlas/sem_schedule.h  atlas_sem_activity, atlas_sem_plan, the
+                              ATLAS_SEM_HOLD_* vocabulary
+src/sem/schedule.c            atlas_sem_plan_for — the whole derived state, and
+                              a read: no transaction, no lock, no process
+include/atlas/sem.h           atlas_sem_scope_discovery, atlas_sem_config, the
+                              coverage manifest and `source_identity` on a
+                              generation, ATLAS_SEM_STALE_SOURCE
+src/sem/index.c               atlas_sem_source_identity, the live compdb digest,
+                              atlas_sem_freshness_now (one implementation of the
+                              freshness question), the manifest at publication,
+                              and the no-change re-stamp
+src/db/migrate.c              migration 18 (one table, eight columns, additive)
+src/db/db_sem.c               sem_repo_config, the scope counts, the test split
+src/db/db_verify.c            unchanged; the verify layer now asks the plan
+src/verify/detverify.c        sem_state(), and the units/scope split across the
+                              coverage dimensions
+src/daemon/watch.c            sem_sweep() on the watcher's timer
+src/daemon/writer.c           the automatic attempt's governor record,
+                              atlas_writer_sem_index_pending
+src/ipc/server_backup.c       code.sem_config, in the operator-uid table
+src/ipc/server_sem.c          atlas_server_write_sem_config, one writer for the
+                              derived state on every surface
+src/cli/cli.c                 code sem-config, --test-root, --auto/--no-auto
+src/gw/ui/mission-control.html  state, freshness and coverage as three rows
+```
+
+## A9.2.3 rules — these are not negotiable
+
+- **A SEMANTIC INDEX CAN BE SOURCE-CURRENT BUT COVERAGE-INCOMPLETE.** Freshness
+  and coverage are two axes and neither is derived from the other. `INCOMPLETE`
+  is the state that proves it: a generation built from exactly the current source
+  that describes half the tree. Every surface reports both, and a single badge
+  carrying both is the presentation A9.1, A9.2, A9.2.2 and this season each exist
+  to prevent. **`CURRENT` never means "a semantic index exists".**
+- **There is no dirty bit and there must not be one.** Freshness is recomputed on
+  every read — A6's rule about gate freshness and A4's about link currency — so a
+  stored flag would be a second answer to a question that already has one.
+  `atlas_sem_plan_for` is a pure read, which is what lets the daemon's scheduler
+  and `code sem-status` be the same function rather than two that agree by
+  inspection.
+- **`atlas_sem_source_identity` is what makes an uncommitted edit visible.**
+  Every A8-CI staleness check compares something that moves with a *commit*, and
+  Atlas indexes the working tree — so a source could be edited, added or deleted
+  with the head standing still and all four agreed the index was current. It
+  covers every live C source and header the file index holds by path and content
+  hash, the live compilation-database digest, the compiler version and the
+  analyzer epoch, domain-separated and length-prefixed for A4's reason. A file
+  whose hash Atlas does not hold contributes a fixed marker rather than being
+  skipped: skipping it would make a file Atlas could not read compare equal to
+  one that was never there.
+- **An empty stored identity never makes a generation stale, and neither does an
+  empty live one.** "This index did not record what it was built from" and "Atlas
+  could not look" are both absences of evidence, not evidence of change. That is
+  what makes migration 18 conservative by construction rather than by a rule.
+- **A9.2.3 reverses A8-CI's decision not to recompute the compilation-database
+  digest on a read, and the reversal must be described as one.** Every caller
+  passed NULL for it, so the branch reporting a changed build description was
+  unreachable. A8-CI's reasoning was sound while a person ran the next index —
+  the check only decided how a status line read. It stops being sound once the
+  daemon schedules by *noticing*: a check that never fires is a repository whose
+  build description can change without anything ever rebuilding it.
+- **`atlas_sem_freshness_now` is the one implementation of the freshness
+  question.** Before A9.2.3 four call sites each assembled their own arguments and
+  disagreed: the CLI and the daemon passed NULL for the compdb digest, and the
+  context builder passed NULL *and* hard-coded `file_index_current` to true — so a
+  context package could report a stale index as current, which is the one
+  statement a model must never be handed. `src/verify` asks the same question
+  through `atlas_sem_plan_for`; it used to derive currency from SQL of its own,
+  and the two disagreed the moment freshness learned about the working tree.
+- **Coverage is measured against the tree, never against the compilation
+  database's own contents, and is never a percentage.** `tu_complete == tu_total`
+  says every unit the database named was parsed; `scope_uncovered` is the only
+  number that can refuse an absence. A denominator Atlas cannot state is one that
+  would be made up. `UNKNOWN` scope discovery is never sufficient for an absence.
+- **Atlas does not guess which sources are tests.** A directory called `tests` is
+  a directory somebody named. An operator declares roots; without them
+  `test_scope_known` is false, which is "Atlas does not know" and is a different
+  statement from "there are no test units". A declared root matches on a **path
+  component boundary** — `tests` must not match `tests_helper.c`, because a
+  production source misclassified as a test is wrong in the one direction that
+  matters.
+- **`ATLAS_COVDIM_GENERATED_SOURCE` follows the units, not the scope manifest,
+  and the argument is written down.** A generated source that is compiled *is* an
+  entry in the compilation database; the file index cannot see it under an
+  ignored build directory, so asking the manifest about it would be asking a
+  denominator blind to exactly those files. What bounds the claim is that the
+  database must be current — which until this season was a check that could never
+  fire. The honest limit stays stated: a source some build compiles but this
+  repository's database does not name is invisible to both dimensions.
+- **`sem_repo_config` is the authority opt-in, and that is not a secondary use.**
+  A8-CI's rule is that indexing runs a compiler and is therefore an authorised
+  operator action. Making a repository change a rebuild trigger would delete that
+  rule for every registered repository at once; it does not, because
+  `auto_rebuild` defaults to 0, only an operator writes the row, and migration 18
+  enables nothing that was not enabled before it ran. `code.sem_config` is in the
+  **operator-uid** table beside `code.index` and for a stronger reason: that runs
+  a compiler once when asked, this decides whether one runs on every change. No
+  MCP tool, no gateway route.
+- **A pass that finds nothing to do still records that it looked.** A repository
+  holds sources the compilation database does not name. Editing one moves the
+  live identity, moves no unit digest and moves no scope count, so the pass
+  publishes nothing — and without re-stamping the stored identity the repository
+  is stale again on the next tick and rebuilds every sweep for ever. Re-stamping
+  is honest because the pass has just verified every content-determining input is
+  identical; it is the same move as sealing a unit's input digest.
+- **The identity is measured after the pass and before the publishing
+  transaction.** After, because what a generation may claim is the tree as it
+  stood when the last unit was read. Before, because computing it reads files and
+  A1 forbids a file read inside a write transaction. A generation is never
+  published as describing a state it did not observe: when the tree moves
+  mid-build the later identity is recorded, the generation publishes, and the next
+  read reports STALE.
+- **The retry governor compares identities, never elapsed time.** A deterministic
+  failure retried on an interval runs a compiler over the whole tree for ever and
+  achieves nothing. What makes another attempt worth making is that the inputs
+  changed — which is exactly what fixing the fault does, so recovery is automatic.
+  The identity recorded is the one the attempt *started* from, so a tree that
+  moved during a failed build is retried. An operator's `code index` is not
+  governed by this and its failure is reported every time.
+- **A scheduler must not derive its own liveness from a value it supplied.** The
+  first cut kept an in-flight flag on the watcher and passed it into the plan it
+  then used to decide whether to clear it, so the plan always said BUILDING, the
+  flag never cleared, and the repository reported DIRTY for ever having rebuilt
+  exactly once. Every unit test would have passed. `atlas_writer_sem_index_pending`
+  asks the writer, which owns the queue and runs the job.
+- **Coalescing falls out of the derivation rather than being implemented.** The
+  scheduler always builds *now* — there is no queue of source states, only one
+  question asked again on the next tick. Six saves during a build produce one
+  further build and none is lost. **Correctness never depends on timing**; only
+  how soon it converges does, which is why the sweep interval is a compiled-in
+  constant and not a policy key.
+- **The sweep holds while the file index is behind.** The source identity is
+  computed from its content hashes, so a generation built then would describe
+  hashes nobody can vouch for and be stale the moment the reconciliation pass
+  completes. The pass is already scheduled; waiting is the ordering, not a delay.
+- **Manual and automatic rebuild are one pipeline.** Both reach
+  `atlas_sem_index_on`. There is not an automatic implementation and a manual one
+  with divergent semantics, and `code index` stays diagnostic and administrative.
+- **One shape on every surface.** The CLI's `--json`, `sem.status`, the gateway
+  route and MCP emit the same keys for the derived state. The first cut nested it
+  under `semantic_state` in the CLI and left it flat on the wire, which would have
+  made a client have to know which produced a document.
+- **All of `sem_repo_config` is CANONICAL and not prunable.** Every other `sem_`
+  table is rebuilt by indexing; this one is what says indexing may run at all. A
+  repository does not record that an operator authorised a compiler to be run over
+  it, and an aged-out row would silently stop a repository being maintained —
+  which looks exactly like a repository nobody ever configured. It is *deleted*
+  rather than zeroed on `repo remove`, because `repositories.id` is a reused rowid
+  and a row left behind would hand the next repository somebody else's opt-in.
+
+## Extending A9.2.3 safely
+
+- **A new semantic activity state** means a member of `atlas_sem_activity`, a
+  case in `atlas_sem_activity_name`, the parse table in `read_sem_plan`
+  (`service_remote.c`), both renderers, the Mission Control row, and the table in
+  `docs/semantic-freshness.md`. Keep UNKNOWN at zero, and decide explicitly
+  whether `should_build` may be true in it.
+- **A new hold reason** means a `ATLAS_SEM_HOLD_*` literal, a row in the table in
+  `atlas_sem_hold_intern`, and one written sentence of meaning. A value that
+  arrives over a socket is a *matching* string and must be interned to Atlas' own
+  literal before it reaches an operator or a model.
+- **A new staleness reason** means an `ATLAS_SEM_STALE_*` literal, a row in
+  `atlas_sem_stale_reason_intern`, and a branch in `atlas_sem_freshness_of`
+  placed deliberately: the order is the order an operator wants to be told, and
+  the broadest check goes last so a repository is told *why* in the most useful
+  terms available.
+- **A new input to the source identity** changes what every stored identity
+  means, so it invalidates every generation's freshness comparison at once. Bump
+  the domain string in `atlas_sem_source_identity`, and add a row to the table in
+  `docs/semantic-freshness.md` with a reason.
+- **A new coverage manifest field** goes on `atlas_sem_generation`, in migration
+  N with its vocabulary's zero as the default, in `GEN_COLUMNS` and
+  `read_generation`, in `atlas_db_sem_scope_set`, on the wire in
+  `server_sem.c`, **read back** in `service_remote.c`, and in both renderers.
+  Missing the read-back is how the socket path and the local path start
+  disagreeing.
+- **A new coverage dimension's source** — deciding whether it follows the units
+  or the scope manifest — needs the argument in `sem_coverage`. "It is more
+  conservative" is not one on its own: a gate applied where it does not belong
+  makes Atlas uselessly cautious rather than correctly cautious, and the
+  asymmetry rule exists because that is a real failure mode.
+- **A new field on the build description** means a column in migration N, the
+  struct, `atlas_db_sem_config_get`/`_set`, the job payload, the CLI flag, the
+  RPC parameter and the negative enumeration if it is plausibly an authority
+  verb. Decide whether an absent value means "leave alone" or "clear" and make
+  the two expressible separately.
+
 ## Extending A9.2.2 safely
 
 - **A new verifier** additionally needs a row in
@@ -2523,6 +2731,7 @@ two documents on stdout.
 `docs/security/A7_THREAT_MODEL.md` · `docs/security/A7_SECURITY_REVIEW.md` ·
 `docs/security/A7_1_THREAT_MODEL.md` · `docs/security/A7_1_OPERATIONS.md` ·
 `docs/orchestration.md` · `docs/remote-access.md` · `docs/verification.md` ·
+`docs/semantic-freshness.md` ·
 `docs/git-safety.md` ·
 `docs/daemon-and-ipc.md` ·
 `docs/watcher-consistency.md` · `docs/systemd-user-service.md` ·

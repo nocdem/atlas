@@ -441,6 +441,9 @@ so rather than implying otherwise. See
   model: kinds, the state machine, the operator channel and its honest limits
 - [docs/verification.md](docs/verification.md) — claims, attestations,
   independence, and the automatic lifecycle policy
+- [docs/semantic-freshness.md](docs/semantic-freshness.md) — how the daemon
+  keeps the compiler-derived index current, what a generation says it covered,
+  and why source-current is not the same as coverage-complete
 - [docs/impact-gates.md](docs/impact-gates.md) — freshness and gate semantics,
   reason codes, exit codes, the revalidation workflow, traversal limits
 - [docs/operations.md](docs/operations.md) — backup, verification, restore,

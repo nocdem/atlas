@@ -187,6 +187,9 @@ translation units are `COMPLETE`, `PARTIAL`, `FAILED` and `UNSUPPORTED`.
 
 `STALE` always carries a reason. The common ones:
 
+- `the_working_tree_changed_since_this_index_was_built` — somebody edited a
+  source and has not committed it. The daemon rebuilds this on its own for a
+  repository you have enabled.
 - `the_repository_moved_since_this_index_was_built` — reindex.
 - `a_compilation_database_changed_since_this_index_was_built` — the build
   description changed; reindex.
@@ -195,6 +198,55 @@ translation units are `COMPLETE`, `PARTIAL`, `FAILED` and `UNSUPPORTED`.
   sync`.
 
 `ABSENT` is not `STALE`. It means nobody has ever built one.
+
+### Read the two axes separately
+
+`code sem-status` reports **state**, **freshness** and **coverage** as three
+lines, and they are three questions:
+
+```
+  state             INCOMPLETE
+  freshness         CURRENT
+  coverage          not complete
+    scope discovery DECLARED
+    scope covered   416 of 759 source files
+    scope uncovered 343
+```
+
+That index is built from exactly the current source **and** describes a little
+over half the repository. `343` is the number that decides whether Atlas may
+answer "there is no caller of X" — and the unit counts, which would read
+`416/416`, cannot see it at all. Widen the compilation database, or accept that
+negative questions about this repository answer `UNKNOWN`.
+
+`unit scope` reads `unknown (no test roots declared)` until you declare them.
+That is Atlas saying it does not know which sources are tests, which is not the
+same as saying there are none.
+
+## Let the daemon keep it current
+
+```sh
+atlas code sem-config dna --compdb build/compile_commands.json --auto
+atlas code sem-config dna --test-root tests
+atlas code sem-config dna                    # read it back
+```
+
+The daemon then rebuilds when the repository changes, with nobody running a
+command: it notices, waits for the file index to catch up, builds a new
+generation while the previous one is still being served, and publishes
+atomically. A failed build keeps the last-known-good generation and does not
+retry until the source changes — so a tree that does not compile is reported
+rather than recompiled every few seconds, and fixing it recovers on its own.
+
+Each flag **replaces** a list rather than adding to one, so name every
+compilation database in the same command. `--no-auto` stops the daemon
+maintaining the repository without forgetting the description; `--no-test-roots`
+clears the declared roots.
+
+A repository with no description is reported `DISABLED`, which is a
+configuration fact and not a fault: Atlas runs a compiler only over repositories
+an operator has said it may. See
+[semantic-freshness.md](semantic-freshness.md).
 
 ## Build or refresh an index
 

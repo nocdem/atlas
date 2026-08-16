@@ -30,8 +30,10 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "atlas/db.h"
 #include "atlas/limits.h"
 #include "atlas_test.h"
+#include "db/db_internal.h"
 #include "support/fixture.h"
 
 /* Generous: a semantic index runs a compiler over the fixture, and the sweep
@@ -417,6 +419,70 @@ static void test_a_model_can_read_freshness_and_cannot_change_it(void) {
     live_stop(&L);
 }
 
+
+/* §31: a generation left RUNNING by a daemon that is gone must not wedge the
+ * scheduler.
+ *
+ * A8-CI said the next pass would report and reap one, and nothing ever did —
+ * harmless while nothing scheduled off the record. A9.2.3 holds the scheduler
+ * while a generation is being built, and a RUNNING row from a dead daemon is
+ * indistinguishable from a live build, so one crash left the repository
+ * reporting BUILDING for ever and never rebuilding again.
+ *
+ * The row is planted directly rather than by killing a daemon mid-build,
+ * because a compiler over a one-file fixture finishes in milliseconds and the
+ * window cannot be hit reliably. What is under test is what the *next daemon*
+ * makes of the record, and the record is the same either way. */
+static void test_a_generation_left_running_by_a_dead_daemon_is_reaped(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    live L;
+    live_start(&L, /*configured=*/true, &err);
+    T_CHECK_MSG(wait_status(&L, "\"activity\":\"CURRENT\"", &err),
+                "the daemon did not build a first semantic index");
+
+    /* Stop it, then plant the wreckage a crash would leave. */
+    fx_daemon_stop(&L.d, false);
+
+    atlas_buf db_path = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_appendf(&db_path, &err, "%s/atlas.db", fx_data_dir(&L.fx)), &err);
+    atlas_db *db = NULL;
+    T_OK(atlas_db_open(atlas_buf_cstr(&db_path), &db, &err), &err);
+    T_OK(atlas_db_exec_sql(db,
+                           "INSERT INTO sem_generations(repo_id, commit_id, status, started_at,"
+                           "  analyzer_id, analyzer_version)"
+                           "  SELECT id, 'deadbeef', 'RUNNING', '2026-01-01T00:00:00Z',"
+                           "         'atlas-c-libclang', 1 FROM repositories WHERE name='fixture';",
+                           &err),
+         &err);
+    atlas_db_close(db);
+    atlas_buf_free(&db_path);
+
+    /* The same struct, restarted — no second fx_daemon_init, which would memset
+     * over the buffers it owns. */
+    T_OK(fx_daemon_start(&L.fx, &L.d, &err), &err);
+    T_OK(fx_daemon_wait_ready(&L.d, WAIT_MS, &err), &err);
+
+    /* The published generation is untouched and the repository is answerable
+     * again. Without the reap this reports BUILDING and never leaves it. */
+    T_CHECK_MSG(wait_status(&L, "\"activity\":\"CURRENT\"", &err),
+                "an interrupted generation left the repository reporting a build for ever");
+
+    const char *args[] = {"code", "sem-status", "fixture", "--json"};
+    atlas_buf out = ATLAS_BUF_INIT;
+    int code = 0;
+    cli(&L, args, 4u, &out, &code, &err);
+    T_EQ_INT(code, 0);
+    /* And the interrupted attempt is recorded rather than erased: "indexing
+     * died" is an operational fact and the table that could not state it would
+     * be the one that only recorded outcomes it reached. */
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&out), "\"have_generation\":true") != NULL,
+                "the reap discarded the generation that was working: %s", atlas_buf_cstr(&out));
+    atlas_buf_free(&out);
+
+    live_stop(&L);
+}
+
 static const atlas_test TESTS[] = {
     {"the daemon reaches current and stays there without being asked",
      test_the_daemon_reaches_current_and_stays_there},
@@ -430,6 +496,8 @@ static const atlas_test TESTS[] = {
      test_the_socket_and_the_local_path_describe_one_generation},
     {"a model can read freshness and cannot change it",
      test_a_model_can_read_freshness_and_cannot_change_it},
+    {"a generation left running by a dead daemon is reaped",
+     test_a_generation_left_running_by_a_dead_daemon_is_reaped},
 };
 
 ATLAS_TEST_MAIN("sem_auto", TESTS)

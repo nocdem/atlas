@@ -1421,24 +1421,35 @@ bool atlas_verify_coverage_satisfies(const atlas_verify_coverage_report *r,
     return true;
 }
 
-atlas_verify_coverage atlas_verify_coverage_summary(const atlas_verify_coverage_report *r) {
+atlas_verify_coverage atlas_verify_coverage_summary(const atlas_verify_coverage_report *r,
+                                                    atlas_verify_verifier v) {
     if (r == NULL) {
         return ATLAS_COVERAGE_UNKNOWN;
     }
-    /* Weakest wins among the dimensions that are in play, which is A6's fold.
-     * NOT_APPLICABLE is skipped rather than counted: a claim that cannot depend
-     * on runtime state should not be reported as having incomplete coverage of
-     * it. If every dimension is NOT_APPLICABLE the summary is NOT_APPLICABLE. */
+    /* Only the dimensions this verifier's conclusion depends on. Folding over
+     * all eleven would report UNKNOWN for every claim Atlas can answer, because
+     * nothing observes a running system — see the header. */
+    const atlas_verify_coverage_dim *dims = NULL;
+    size_t count = atlas_verify_verifier_absence_dims(v, &dims);
+    if (count == 0 || dims == NULL) {
+        /* No verifier, or one whose negative rests on nothing to cover. There
+         * is no coverage question to answer, which is NOT_APPLICABLE rather
+         * than UNKNOWN: nothing was left unlooked-at. */
+        return ATLAS_COVERAGE_NOT_APPLICABLE;
+    }
     bool any = false;
     atlas_verify_coverage worst = ATLAS_COVERAGE_COMPLETE;
-    for (size_t i = 0; i < ATLAS_VERIFY_COVERAGE_DIMS; i++) {
-        atlas_verify_coverage c = r->dims[i];
+    for (size_t i = 0; i < count; i++) {
+        if ((size_t)dims[i] >= ATLAS_VERIFY_COVERAGE_DIMS) {
+            continue;
+        }
+        atlas_verify_coverage c = r->dims[dims[i]];
         if (c == ATLAS_COVERAGE_NOT_APPLICABLE) {
             continue;
         }
         any = true;
-        /* Order of severity: UNKNOWN is the weakest because it is the one that
-         * says Atlas never established the dimension at all. */
+        /* UNKNOWN is weakest: it is the one value that says Atlas never
+         * established the dimension at all. */
         if (c == ATLAS_COVERAGE_UNKNOWN) {
             return ATLAS_COVERAGE_UNKNOWN;
         }

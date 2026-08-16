@@ -1330,14 +1330,29 @@ bool atlas_verify_coverage_satisfies(const atlas_verify_coverage_report *r,
                                      atlas_verify_coverage_dim *failed_out,
                                      atlas_verify_truth_reason *why_out);
 
-/* One value for display: the weakest state among the dimensions that are not
- * NOT_APPLICABLE, or NOT_APPLICABLE when every one of them is.
+/* One value for display: the weakest state among the dimensions **this
+ * verifier's conclusion actually depends on**.
  *
- * A summary only. Never an input to `atlas_verify_truth_of`, which asks about
- * the dimensions the verifier actually requires — a claim must not be blocked
- * by a dimension it does not depend on, and must not be let through because an
- * irrelevant dimension happened to be complete. */
-atlas_verify_coverage atlas_verify_coverage_summary(const atlas_verify_coverage_report *r);
+ * Folding over *every* dimension would be the obvious implementation and is
+ * wrong in a way that shows up immediately in a UI. No verifier observes a
+ * running system, so `runtime_state` and `deployed_config` are UNKNOWN for all
+ * of them — and an all-dimensions fold is therefore UNKNOWN for every claim
+ * Atlas can answer, including the ones it answered completely. A reader then
+ * sees `truth: ABSENT` beside `coverage: UNKNOWN` and has to work out that the
+ * two are not in conflict, which is exactly the confusion this season exists to
+ * remove.
+ *
+ * So the summary answers the question a reader is actually asking: *was the
+ * coverage this conclusion rested on sufficient?* The per-dimension map is
+ * still reported in full beside it, so nothing is hidden — a dimension that was
+ * never established is visible there whether or not this claim needed it.
+ *
+ * A summary only. Never an input to `atlas_verify_truth_of`, which asks the
+ * dimensions directly: a claim must not be blocked by a dimension it does not
+ * depend on, and must not be let through because an irrelevant one happened to
+ * be complete. */
+atlas_verify_coverage atlas_verify_coverage_summary(const atlas_verify_coverage_report *r,
+                                                    atlas_verify_verifier v);
 
 /* Renders `dim=STATE;dim=STATE` from the two closed vocabularies. Every byte is
  * Atlas-owned, so the result is safe to store, relay and print unencoded.
@@ -1754,6 +1769,9 @@ typedef struct atlas_verify_truth_record {
     atlas_verify_truth truth;
     atlas_verify_truth_reason reason;
     const atlas_verify_coverage_report *coverage;
+    /* Which verifier produced this, so the stored `coverage_summary` folds the
+     * dimensions the conclusion actually rested on rather than all eleven. */
+    atlas_verify_verifier verifier;
 } atlas_verify_truth_record;
 
 atlas_status atlas_db_verify_result_insert(atlas_db *db, int64_t claim_id,

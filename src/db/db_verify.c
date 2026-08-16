@@ -1480,7 +1480,7 @@ atlas_status atlas_db_verify_result_insert(atlas_db *db, int64_t claim_id,
      * every coverage dimension unestablished, which is the honest reading and
      * the one every Atlas zero already means. */
     static const atlas_verify_truth_record NO_TRUTH = {ATLAS_TRUTH_UNKNOWN, ATLAS_TREASON_NONE,
-                                                       NULL};
+                                                       NULL, ATLAS_VERIFIER_NONE};
     if (truth == NULL) {
         truth = &NO_TRUTH;
     }
@@ -1610,7 +1610,9 @@ atlas_status atlas_db_verify_result_insert(atlas_db *db, int64_t claim_id,
     }
     if (st == ATLAS_OK) {
         st = atlas_db_bind_text_opt(
-            db, stmt, 29, atlas_verify_coverage_name(atlas_verify_coverage_summary(truth->coverage)),
+            db, stmt, 29,
+            atlas_verify_coverage_name(
+                atlas_verify_coverage_summary(truth->coverage, truth->verifier)),
             err);
     }
     if (st == ATLAS_OK) {

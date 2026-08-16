@@ -853,7 +853,12 @@ static void test_every_zero_is_the_safe_value(void) {
                     "a zeroed coverage report satisfied dimension %s",
                     atlas_verify_coverage_dim_name((atlas_verify_coverage_dim)i));
     }
-    T_EQ_INT((int)atlas_verify_coverage_summary(&zero), (int)ATLAS_COVERAGE_UNKNOWN);
+    T_EQ_INT((int)atlas_verify_coverage_summary(&zero, ATLAS_VERIFIER_SYMBOL_ABSENT),
+             (int)ATLAS_COVERAGE_UNKNOWN);
+    /* And a verifier that rests on nothing has no coverage question to answer,
+     * which is NOT_APPLICABLE rather than UNKNOWN: nothing was left unlooked-at. */
+    T_EQ_INT((int)atlas_verify_coverage_summary(&zero, ATLAS_VERIFIER_NONE),
+             (int)ATLAS_COVERAGE_NOT_APPLICABLE);
 
     /* UNKNOWN is the one state that is neither complete nor a statement about
      * the world, and it must never be sufficient. */

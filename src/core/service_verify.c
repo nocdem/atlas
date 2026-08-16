@@ -347,7 +347,8 @@ atlas_status atlas_service_verify_write_assessment(atlas_json *j,
     }
     if (st == ATLAS_OK) {
         st = atlas_json_key_str(
-            j, "coverage", atlas_verify_coverage_name(atlas_verify_coverage_summary(&a->coverage)),
+            j, "coverage",
+            atlas_verify_coverage_name(atlas_verify_coverage_summary(&a->coverage, a->verifier)),
             err);
     }
     /* Every dimension, by name, including the UNKNOWN ones — a reader asking

@@ -1606,7 +1606,7 @@ static atlas_status h_verify(atlas_renderer *r, const atlas_verify_report *rep, 
      * cannot depend on runtime state" is an answer, and hiding it would leave a
      * reader wondering whether Atlas forgot to look. */
     {
-        atlas_verify_coverage sum = atlas_verify_coverage_summary(&a->coverage);
+        atlas_verify_coverage sum = atlas_verify_coverage_summary(&a->coverage, a->verifier);
         (void)fprintf(o, "coverage:     %s\n", atlas_verify_coverage_name(sum));
         for (size_t i = 0; i < ATLAS_VERIFY_COVERAGE_DIMS; i++) {
             atlas_verify_coverage_dim d = (atlas_verify_coverage_dim)i;
@@ -1775,11 +1775,22 @@ static atlas_status h_verify_intake(atlas_renderer *r, const char *verb,
         (void)fprintf(o, "  because:    %s\n",
                       atlas_verify_truth_reason_description(res->truth_reason));
         (void)fprintf(o, "  coverage:   %s\n",
-                      atlas_verify_coverage_name(atlas_verify_coverage_summary(&res->coverage)));
+                      atlas_verify_coverage_name(
+                          atlas_verify_coverage_summary(&res->coverage, ATLAS_VERIFIER_NONE)));
     }
     if (strcmp(verb, "evaluate") == 0) {
         const atlas_verify_assessment *a = &res->assessment;
         (void)fprintf(o, "  state:      %s\n", atlas_verify_state_name(a->aggregate.state));
+        /* A9.2.2. `verify evaluate` is the verb a model reaches for, so it must
+         * not be the one surface that reports the evidence strength and leaves
+         * out what Atlas concluded about the subject. UNKNOWN is printed as
+         * UNKNOWN and never as "no". */
+        (void)fprintf(o, "  truth:      %s\n", atlas_verify_truth_name(a->truth));
+        (void)fprintf(o, "  because:    %s\n",
+                      atlas_verify_truth_reason_description(a->truth_reason));
+        (void)fprintf(o, "  coverage:   %s\n",
+                      atlas_verify_coverage_name(
+                          atlas_verify_coverage_summary(&a->coverage, a->verifier)));
         (void)fprintf(o, "  basis:      %s\n", atlas_verify_basis_name(a->basis));
         /* Out of 100, never with a percent sign. */
         (void)fprintf(o, "  confidence: %d/100 (score, not a probability)\n",

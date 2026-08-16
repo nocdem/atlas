@@ -520,7 +520,8 @@ atlas_status atlas_verify_autolifecycle_run(atlas_db *db, const atlas_verifypoli
     /* A9.2.2. The truth axis travels with the result, so a row read years later
      * says what Atlas concluded about the subject and what coverage that rested
      * on — not merely how strong the evidence was. */
-    const atlas_verify_truth_record truth_record = {a->truth, a->truth_reason, &a->coverage};
+    const atlas_verify_truth_record truth_record = {a->truth, a->truth_reason, &a->coverage,
+                                                   a->verifier};
     st = atlas_db_verify_result_insert(db, claim_id, &a->aggregate,
                                        atlas_verify_verifier_name(a->verifier), a->check, &binding,
                                        &truth_record, now, &result_id, err);

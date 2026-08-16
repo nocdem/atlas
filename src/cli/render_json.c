@@ -1523,7 +1523,9 @@ static atlas_status j_verify_intake(atlas_renderer *r, const char *verb,
                                atlas_verify_truth_reason_description(res->truth_reason), err));
         TRY(atlas_json_key_str(
             j, "coverage",
-            atlas_verify_coverage_name(atlas_verify_coverage_summary(&res->coverage)), err));
+            atlas_verify_coverage_name(
+                atlas_verify_coverage_summary(&res->coverage, ATLAS_VERIFIER_NONE)),
+            err));
         {
             char cov[512];
             (void)atlas_verify_coverage_render(&res->coverage, cov, sizeof cov);
@@ -1572,10 +1574,35 @@ static atlas_status j_verify(atlas_renderer *r, const atlas_verify_report *rep, 
     TRY(atlas_json_key_str(j, "domain", atlas_buf_cstr(&rep->domain), err));
     TRY(atlas_json_key_str(j, "record", atlas_buf_cstr(&rep->record_uid), err));
 
-    /* The three axes, in three separate fields. Never one badge. */
+    /* A9.2.2: the four axes, in four separate fields. Never one badge.
+     *
+     * These are the same key names `atlas_service_verify_write_assessment`
+     * sends over the socket, so one consumer reads both surfaces — the CLI's
+     * `--json` and the daemon's reply must not describe the same claim with
+     * different keys. */
     TRY(atlas_json_key_str(j, "kind", atlas_decision_kind_name(a->kind), err));
     TRY(atlas_json_key_str(j, "status", atlas_decision_state_name(a->from), err));
     TRY(atlas_json_key_str(j, "state", atlas_verify_state_name(a->aggregate.state), err));
+    TRY(atlas_json_key_str(j, "truth", atlas_verify_truth_name(a->truth), err));
+    TRY(atlas_json_key_str(j, "truth_reason", atlas_verify_truth_reason_name(a->truth_reason),
+                           err));
+    TRY(atlas_json_key_str(j, "truth_detail",
+                           atlas_verify_truth_reason_description(a->truth_reason), err));
+    TRY(atlas_json_key_str(
+        j, "coverage",
+        atlas_verify_coverage_name(atlas_verify_coverage_summary(&a->coverage, a->verifier)),
+        err));
+    /* Every dimension by name, including the UNKNOWN ones: a reader asking why
+     * an answer is UNKNOWN needs to see which part of the looking fell short,
+     * and a map listing only what succeeded answers the opposite question. */
+    TRY(atlas_json_key(j, "coverage_dimensions", err));
+    TRY(atlas_json_obj_begin(j, err));
+    for (size_t cd = 0; cd < ATLAS_VERIFY_COVERAGE_DIMS; cd++) {
+        atlas_verify_coverage_dim d = (atlas_verify_coverage_dim)cd;
+        TRY(atlas_json_key_str(j, atlas_verify_coverage_dim_name(d),
+                               atlas_verify_coverage_name(a->coverage.dims[cd]), err));
+    }
+    TRY(atlas_json_obj_end(j, err));
 
     TRY(atlas_json_key_str(j, "basis", atlas_verify_basis_name(a->basis), err));
     TRY(atlas_json_key_str(j, "semantics", atlas_verify_claim_semantics_name(a->semantics), err));

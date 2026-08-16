@@ -67,6 +67,17 @@ static const char *const FORBIDDEN_METHODS[] = {
     /* A5 backup, restore and maintenance. */
     "backup.create", "backup.verify", "backup.restore", "backup.list",
     "maintenance.prune", "maintenance.plan", "db.restore", "index.rebuild",
+    /* A8-CI and A9.2.3: causing a compiler to run.
+     *
+     * `code.index` runs one when an operator asks. `code.sem_config` decides
+     * whether the daemon runs one **every time the repository changes**, which
+     * is the stronger capability of the two — so it goes in the operator-uid
+     * table beside it, and an ordinary peer is told neither exists. The name
+     * variants are here because a gate that a caller can walk around by
+     * changing case is not a gate. */
+    "code.index", "code.sem_config", "Code.Sem_Config", "CODE.SEM_CONFIG",
+    "code.semconfig", "code.sem-config", "sem.config", "sem.config_set",
+    "sem.index", "sem.rebuild", "code.rebuild",
     /* The daemon's own lifecycle. */
     "daemon.shutdown", "daemon.stop", "daemon.restart",
     /* And the ones an orchestration phase would reach for if somebody decided a

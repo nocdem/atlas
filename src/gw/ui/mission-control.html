@@ -440,13 +440,44 @@ async function viewRepository() {
     if (!scopes.has("graph:read")) return el("p", {class: "empty", text: "needs graph:read"});
     const c = await api("sem/status", {repo: name});
     if (c.available === false) return el("p", {class: "empty", text: "this Atlas has no compiler-aware index"});
-    return kv([
+    /* A9.2.3. State, freshness and coverage as three rows, never one badge.
+       A generation can be perfectly source-current and describe half a tree, and
+       that is exactly the state a single green chip would hide — which is the
+       presentation this season, A9.2.2, A9.2 and A9.1 each exist to prevent.
+       `scope covered` is a pair of counts and never a percentage: a denominator
+       Atlas cannot state is one that would be made up. */
+    const rows = [
+      ["state", statusTag(c.activity)],
       ["freshness", statusTag(c.freshness)],
-      ["generation", c.generation],
-      ["symbols", c.symbols], ["edges", c.edges],
-      ["units complete", c.units_complete], ["units partial", c.units_partial],
-      ["units failed", c.units_failed],
-    ]);
+      ["coverage", c.coverage_complete ? tag("complete", "ok") : tag("not complete", "warn")],
+      ["scope discovery", c.scope_discovery || "UNKNOWN"],
+    ];
+    if (c.scope_discovery === "DECLARED") {
+      rows.push(["scope covered", (c.scope_covered || 0) + " of " + (c.scope_candidates || 0) + " source files"]);
+      rows.push(["scope uncovered", c.scope_uncovered || 0]);
+    }
+    /* "Atlas does not know which sources are tests" is a different statement
+       from "there are no tests", and only the first is honest without declared
+       roots. */
+    rows.push(["unit scope", c.test_scope_known
+      ? (c.tu_test || 0) + " test, " + (c.tu_production || 0) + " production"
+      : "unknown (no test roots declared)"]);
+    if (c.stale_reason) rows.push(["why stale", c.stale_reason]);
+    rows.push(["automatic rebuild", c.configured
+      ? (c.auto_rebuild ? tag("enabled", "ok") : tag("disabled", "warn"))
+      : tag("not configured", "warn")]);
+    if (c.hold_reason) rows.push(["holding", c.hold_reason]);
+    if (c.rebuild_due) rows.push(["next", "a rebuild is due"]);
+    if (c.fail_count) {
+      rows.push(["failed attempts", c.fail_count]);
+      if (c.fail_reason) rows.push(["failure", c.fail_reason]);
+      if (c.fail_at) rows.push(["last failure at", c.fail_at]);
+    }
+    rows.push(["generation", c.generation_id || c.generation]);
+    rows.push(["symbols", c.symbols], ["edges", c.edges]);
+    rows.push(["units complete", c.tu_complete], ["units partial", c.tu_partial],
+              ["units failed", c.tu_failed]);
+    return kv(rows);
   });
 }
 

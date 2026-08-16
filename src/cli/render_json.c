@@ -1804,17 +1804,21 @@ static atlas_status j_sem_generation(atlas_renderer *r, const atlas_sem_generati
     return atlas_json_obj_end(r->j, err);
 }
 
-/* A9.2.3. The derived state, as its own object, so the four axes stay four
- * fields on every surface. A caller binding one of them cannot accidentally
- * read a fold as an axis. */
+/* A9.2.3. The derived state, in **exactly the shape the daemon sends it**.
+ *
+ * Flat keys and the same names as `write_sem_plan_fields` in `server_sem.c`,
+ * deliberately: this renderer serves the local path and the daemon serves MCP,
+ * the gateway and Mission Control, and a client that had to know which produced
+ * a document would be a client that eventually gets it wrong. The first cut
+ * nested these under `semantic_state` here and left them flat on the wire —
+ * one answer in two shapes, which is the drift every one of these seasons has
+ * had to fix once.
+ *
+ * `freshness` and `stale_reason` are not written here because `j_sem_status`
+ * has already written them: freshness comes first on every semantic read, which
+ * is A8-CI's rule, and a document must not carry a key twice. */
 static atlas_status j_sem_plan(atlas_renderer *r, const atlas_sem_plan *p, atlas_err *err) {
-    TRY(atlas_json_key(r->j, "semantic_state", err));
-    TRY(atlas_json_obj_begin(r->j, err));
     TRY(atlas_json_key_str(r->j, "activity", atlas_sem_activity_name(p->activity), err));
-    TRY(atlas_json_key_str(r->j, "freshness", atlas_sem_freshness_name(p->freshness), err));
-    TRY(atlas_json_key_str_opt(
-        r->j, "stale_reason",
-        atlas_sem_stale_reason_is_known(p->stale_reason) ? p->stale_reason : NULL, err));
     TRY(atlas_json_key_str_opt(
         r->j, "hold_reason",
         atlas_sem_hold_reason_is_known(p->hold_reason) ? p->hold_reason : NULL, err));
@@ -1833,8 +1837,7 @@ static atlas_status j_sem_plan(atlas_renderer *r, const atlas_sem_plan *p, atlas
                                err));
     TRY(atlas_json_key_str_opt(r->j, "fail_at", p->fail_at, err));
     TRY(atlas_json_key_str_opt(r->j, "source_identity", p->source_identity, err));
-    TRY(atlas_json_key_str_opt(r->j, "generation_identity", p->generation_identity, err));
-    return atlas_json_obj_end(r->j, err);
+    return atlas_json_key_str_opt(r->j, "generation_identity", p->generation_identity, err);
 }
 
 /* The declared lists, each element its own string rather than the newline-joined
@@ -1865,9 +1868,17 @@ static atlas_status j_sem_path_list(atlas_renderer *r, const char *key, const at
 static atlas_status j_sem_config(atlas_renderer *r, const atlas_sem_status_report *rep,
                                  atlas_err *err) {
     TRY(atlas_json_key_str(r->j, "repo", rep->repo.name, err));
+    /* Freshness first, as on every semantic read, and then the fields
+     * `j_sem_plan` does not repeat — the same order `code.sem_config` uses on
+     * the wire. */
+    TRY(atlas_json_key_str(r->j, "freshness", atlas_sem_freshness_name(rep->plan.freshness), err));
+    TRY(atlas_json_key_str_opt(
+        r->j, "stale_reason",
+        atlas_sem_stale_reason_is_known(rep->plan.stale_reason) ? rep->plan.stale_reason : NULL,
+        err));
+    TRY(j_sem_plan(r, &rep->plan, err));
     TRY(j_sem_path_list(r, "compdbs", &rep->compdbs, err));
     TRY(j_sem_path_list(r, "test_roots", &rep->test_roots, err));
-    TRY(j_sem_plan(r, &rep->plan, err));
     TRY(atlas_json_key_bool(r->j, "have_generation", rep->have_generation, err));
     if (rep->have_generation) {
         TRY(j_sem_generation(r, &rep->generation, err));

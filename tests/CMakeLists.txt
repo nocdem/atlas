@@ -90,6 +90,7 @@ set(ATLAS_TESTS
   test_code_graph
   test_sem
   test_sem_freshness
+  test_sem_auto
   test_registry
   test_ops
   test_code_compdb
@@ -326,6 +327,14 @@ set_tests_properties(test_daemon PROPERTIES LABELS "daemon" TIMEOUT 900)
 # watch-limit degradation path fire for reasons that have nothing to do with the
 # code under test.
 set_tests_properties(test_daemon PROPERTIES RUN_SERIAL TRUE)
+
+# A9.2.3's automatic-rebuild suite is a daemon suite for the same reasons, and
+# additionally runs a compiler: its waits are for observable outcomes with a
+# deadline rather than for a guessed interval, so a slow machine takes longer
+# instead of failing. Serialised for the inotify reason above and because two
+# fixtures compiling at once is not what any of these tests is measuring.
+set_tests_properties(test_sem_auto PROPERTIES LABELS "daemon" TIMEOUT 1200)
+set_tests_properties(test_sem_auto PROPERTIES RUN_SERIAL TRUE)
 
 # Vendored third-party source is only trustworthy if it is still what was
 # vendored, so the digest check is part of the suite rather than a manual step.

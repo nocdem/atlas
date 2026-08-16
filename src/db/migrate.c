@@ -3242,11 +3242,21 @@ static const char *const M16_STATEMENTS[] = {M16_STATEMENTS_SQL, NULL};
  * `atlas.symbol_present`, so no reader holding a row could say which without
  * knowing the verifier and inverting by hand. `truth` says it directly.
  *
- * `coverage_summary` and `coverage_detail` record what was actually looked at.
- * The detail is `dim=STATE;dim=STATE` over the two closed vocabularies in
- * `atlas/verify.h`, never free text and never a percentage: a coverage figure
- * with a denominator Atlas cannot state would be precision about exactly the
- * thing that is unknown.
+ * `coverage_summary` and `coverage_detail` record what was actually looked at,
+ * and they answer two different questions.
+ *
+ * `coverage_detail` is the whole map — `dim=STATE;dim=STATE` over the two closed
+ * vocabularies in `atlas/verify.h`, every dimension present including the
+ * UNKNOWN ones, never free text and never a percentage. A coverage figure with a
+ * denominator Atlas cannot state would be precision about exactly the thing that
+ * is unknown.
+ *
+ * `coverage_summary` is narrower on purpose: the weakest state among the
+ * dimensions **this result's verifier actually depends on**. A summary folded
+ * over all eleven would be UNKNOWN for every result Atlas can produce, because
+ * nothing observes a running system — and a row reading `truth = ABSENT,
+ * coverage_summary = UNKNOWN` invites a reader to treat a complete answer as a
+ * doubtful one. The full map is stored beside it, so nothing is hidden.
  *
  * ## the two columns on `verify_outcomes`: §16
  *

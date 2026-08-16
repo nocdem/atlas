@@ -1907,9 +1907,14 @@ atlas_status atlas_db_verify_last_result(atlas_db *db, int64_t claim_id,
  * the truth axis, for the context builder.
  *
  * **Deliberately conservative, and the conservatism is the feature.** The
- * answer is an established value only when every live claim on the record that
- * has a stored result agrees on one; a record with no claims, no results, or
- * claims that disagree reports UNKNOWN.
+ * answer is an established value only when the record has at least one live
+ * claim, **every** one of them has been evaluated, and they all agree. A record
+ * with no claims, with any claim nobody has evaluated, or with claims that
+ * disagree reports UNKNOWN.
+ *
+ * The "every one evaluated" half is the part that is easy to get wrong and was:
+ * counting only the claims that *have* a result lets one settled claim speak
+ * for a record whose others are still open.
  *
  * The reason is §24 exactly. A context package is read by a model, and a model
  * given a record whose claim is "no runtime override for X exists" must not be

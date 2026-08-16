@@ -1075,6 +1075,105 @@ static void test_truth_and_coverage_survive_a_backup_and_restore(void) {
     env_close(&e);
 }
 
+/* ==========================================================================
+ * §24 — context retrieval must preserve these semantics.
+ *
+ * The failure this prevents, in the spec's own words: a package carrying
+ *
+ *     [OPERATIONAL_FACT · PROPOSED]
+ *     Claim: No runtime override for X exists
+ *     Truth: UNKNOWN   (deployed config unavailable)
+ *
+ * must NOT be summarized by its reader into "Runtime override X does not
+ * exist." A model given a record whose *text* is a negative claim, and no
+ * indication that Atlas never confirmed it, will write the second sentence.
+ *
+ * `atlas_db_verify_truth_for_document` is what decides the `knowledge_truth`
+ * field on a context item, so it is what this pins. The four places that carry
+ * the field onward — `src/sem/context.c`, both renderers, `server_sem.c` and
+ * the read-back in `service_remote.c` — are wiring; what is *interesting* is
+ * that the value they carry is conservative, which is decided here.
+ * ========================================================================== */
+static void test_context_reports_unknown_for_an_unconfirmed_negative_claim(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    env e;
+    env_open(&e, &err);
+    seed_index_current(&e, &err);
+
+    atlas_buf uid = ATLAS_BUF_INIT;
+    propose(&e, ATLAS_DECISION_KIND_OPERATIONAL_FACT, "no runtime override for X exists", &uid,
+            &err);
+    int64_t doc = 0, repo = 0;
+    bool found = false;
+    T_OK(atlas_db_decision_find_uid(e.db, atlas_buf_cstr(&uid), &doc, &repo, &found, &err), &err);
+    T_REQUIRE(found);
+
+    /* A record with no claims at all. Nothing has been established, and the
+     * context must say so rather than leaving a reader to infer from the
+     * record's text that the negative holds. */
+    atlas_verify_truth t = ATLAS_TRUTH_PRESENT; /* deliberately not the expected value */
+    T_OK(atlas_db_verify_truth_for_document(e.db, doc, &t, &err), &err);
+    T_CHECK_MSG(t == ATLAS_TRUTH_UNKNOWN,
+                "a record with no claims reported %s into a context package",
+                atlas_verify_truth_name(t));
+
+    /* A claim exists but nothing has evaluated it. Still UNKNOWN: stating a
+     * proposition is not establishing it. */
+    int64_t c1 = claim(&e, &uid, "no runtime override for X exists", ATLAS_CLAIM_DESCRIPTIVE, NULL,
+                       NULL, HEAD_COMMIT, &err);
+    T_OK(atlas_db_verify_truth_for_document(e.db, doc, &t, &err), &err);
+    T_EQ_INT((int)t, (int)ATLAS_TRUTH_UNKNOWN);
+
+    /* A recorded ABSENT. Now — and only now — the context may carry it. */
+    EXEC(&e, &err,
+         "INSERT INTO verify_results(claim_id, state, basis, confidence_score, calibration,"
+         "  algorithm, family_version, created_at, truth, truth_reason, coverage_summary)"
+         " VALUES(%lld, 'VERIFIED', 'DETERMINISTIC', 100, 'INSUFFICIENT_DATA',"
+         "        'atlas-reliability-v1', 1, '2026-01-01T00:00:00Z', 'ABSENT', 'ESTABLISHED',"
+         "        'COMPLETE');",
+         (long long)c1);
+    T_OK(atlas_db_verify_truth_for_document(e.db, doc, &t, &err), &err);
+    T_EQ_INT((int)t, (int)ATLAS_TRUTH_ABSENT);
+
+    /* A second live claim on the same record that nobody has evaluated drops it
+     * back to UNKNOWN. **This is the conservatism §24 needs**: one settled claim
+     * must not speak for a record whose other claims are open, because the
+     * reader takes the field as being about the record. */
+    (void)claim(&e, &uid, "and nothing sets it at startup either", ATLAS_CLAIM_DESCRIPTIVE, NULL,
+                NULL, HEAD_COMMIT, &err);
+    T_OK(atlas_db_verify_truth_for_document(e.db, doc, &t, &err), &err);
+    T_CHECK_MSG(t == ATLAS_TRUTH_UNKNOWN,
+                "one settled claim spoke for a record whose other claim is open, reporting %s",
+                atlas_verify_truth_name(t));
+
+    /* And two claims that disagree are UNKNOWN rather than either answer. */
+    atlas_buf uid2 = ATLAS_BUF_INIT;
+    propose(&e, ATLAS_DECISION_KIND_OPERATIONAL_FACT, "a second record", &uid2, &err);
+    int64_t doc2 = 0;
+    T_OK(atlas_db_decision_find_uid(e.db, atlas_buf_cstr(&uid2), &doc2, &repo, &found, &err), &err);
+    int64_t a = claim(&e, &uid2, "it is there", ATLAS_CLAIM_DESCRIPTIVE, NULL, NULL, HEAD_COMMIT,
+                      &err);
+    int64_t b = claim(&e, &uid2, "it is not there", ATLAS_CLAIM_DESCRIPTIVE, NULL, NULL,
+                      HEAD_COMMIT, &err);
+    EXEC(&e, &err,
+         "INSERT INTO verify_results(claim_id, state, basis, confidence_score, calibration,"
+         "  algorithm, family_version, created_at, truth, truth_reason, coverage_summary)"
+         " VALUES(%lld, 'VERIFIED', 'DETERMINISTIC', 100, 'INSUFFICIENT_DATA',"
+         "        'atlas-reliability-v1', 1, '2026-01-01T00:00:00Z', 'PRESENT', 'ESTABLISHED',"
+         "        'COMPLETE'),"
+         "       (%lld, 'VERIFIED', 'DETERMINISTIC', 100, 'INSUFFICIENT_DATA',"
+         "        'atlas-reliability-v1', 1, '2026-01-01T00:00:00Z', 'ABSENT', 'ESTABLISHED',"
+         "        'COMPLETE');",
+         (long long)a, (long long)b);
+    T_OK(atlas_db_verify_truth_for_document(e.db, doc2, &t, &err), &err);
+    T_EQ_INT((int)t, (int)ATLAS_TRUTH_UNKNOWN);
+
+    atlas_buf_free(&uid2);
+    atlas_buf_free(&uid);
+    env_close(&e);
+}
+
 static const atlas_test TESTS[] = {
     {"fixture a one caller over a partial index is present",
      test_fixture_a_one_caller_over_a_partial_index_is_present},
@@ -1120,6 +1219,8 @@ static const atlas_test TESTS[] = {
      test_coverage_renders_and_reads_back_exactly},
     {"truth and coverage survive a backup and restore",
      test_truth_and_coverage_survive_a_backup_and_restore},
+    {"context reports unknown for an unconfirmed negative claim",
+     test_context_reports_unknown_for_an_unconfirmed_negative_claim},
 };
 
 ATLAS_TEST_MAIN("verify_absence", TESTS)

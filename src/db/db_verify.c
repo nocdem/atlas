@@ -2233,7 +2233,14 @@ atlas_status atlas_db_verify_truth_for_document(atlas_db *db, int64_t document_i
         "            WHERE r.claim_id = c.id ORDER BY r.id DESC LIMIT 1) AS truth"
         "    FROM verify_claims c"
         "   WHERE c.document_id = ?1 AND c.superseded_by_claim_id = 0)"
-        " SELECT COUNT(truth), COUNT(DISTINCT truth), MIN(truth) FROM latest;";
+        /* Three counts, and the difference between the first two is the whole
+         * conservatism. `COUNT(*)` is every live claim; `COUNT(truth)` skips
+         * the NULLs, which are the claims nothing has evaluated. Requiring them
+         * equal is what stops one settled claim speaking for a record whose
+         * other claims are still open — a reader takes this field as being
+         * about the *record*, so a record that is only partly established must
+         * report UNKNOWN. */
+        " SELECT COUNT(*), COUNT(truth), COUNT(DISTINCT truth), MIN(truth) FROM latest;";
     sqlite3_stmt *stmt = NULL;
     atlas_status st = atlas_db_prepare(db, SQL, &stmt, err);
     if (st != ATLAS_OK) {
@@ -2244,10 +2251,11 @@ atlas_status atlas_db_verify_truth_for_document(atlas_db *db, int64_t document_i
         return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the document id");
     }
     if (sqlite3_step(stmt) == SQLITE_ROW) {
-        int64_t have = sqlite3_column_int64(stmt, 0);
-        int64_t distinct = sqlite3_column_int64(stmt, 1);
-        const char *name = (const char *)sqlite3_column_text(stmt, 2);
-        if (have > 0 && distinct == 1 && name != NULL && truth_out != NULL) {
+        int64_t live = sqlite3_column_int64(stmt, 0);
+        int64_t evaluated = sqlite3_column_int64(stmt, 1);
+        int64_t distinct = sqlite3_column_int64(stmt, 2);
+        const char *name = (const char *)sqlite3_column_text(stmt, 3);
+        if (live > 0 && evaluated == live && distinct == 1 && name != NULL && truth_out != NULL) {
             /* An unparseable name leaves UNKNOWN, which is what a value written
              * by a newer Atlas must degrade to rather than being guessed at. */
             (void)atlas_verify_truth_parse(name, truth_out);

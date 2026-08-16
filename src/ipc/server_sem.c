@@ -154,12 +154,41 @@ static atlas_status method_sem_status(dispatch_state *ds, const atlas_ipc_reques
     if (st == ATLAS_OK) {
         st = atlas_json_key_str_opt(ds->j, "compiler_version", atlas_sem_compiler_version(), err);
     }
+    /* The live compiler's id, beside its version. Sent because it was not: the
+     * local path filled it from `atlas_sem_compiler_id()` and the socket path
+     * left it empty, so on a system deployment `code sem-status` printed a
+     * version with no compiler. The same parity defect as `started_at`, found
+     * the same way — by reading the installed system's own output. */
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str_opt(ds->j, "compiler_id", atlas_sem_compiler_id(), err);
+    }
 
     atlas_sem_generation gen;
     bool found = false;
     if (st == ATLAS_OK) {
         st = open_generation(ds, &info, &gen, &found, err);
     }
+    /* A9.2.3's derived state and build description, **before** the early return
+     * for a repository with no generation.
+     *
+     * That return used to end the response, so a repository Atlas had never
+     * indexed reported no state at all over the socket — no activity, no build
+     * description, nothing. Which is exactly the case where an operator most
+     * needs it: they have just configured the repository and want to know that
+     * Atlas took it and that a build is due. `atlas code sem-config` against a
+     * fresh repository printed `state UNKNOWN` and `not configured` moments
+     * after a write the daemon had accepted, because the write's own read-back
+     * went through this method. */
+    if (st == ATLAS_OK) {
+        atlas_sem_status_report plan_rep;
+        atlas_sem_status_report_init(&plan_rep);
+        st = atlas_sem_status_on(ds->db, info.name, &plan_rep, err);
+        if (st == ATLAS_OK) {
+            st = write_sem_plan_fields(ds, &plan_rep, err);
+        }
+        atlas_sem_status_report_free(&plan_rep);
+    }
+
     if (st != ATLAS_OK || !found) {
         atlas_repo_info_free(&info);
         return st;
@@ -260,22 +289,6 @@ static atlas_status method_sem_status(dispatch_state *ds, const atlas_ipc_reques
     }
     if (st == ATLAS_OK) {
         st = atlas_json_key_int(ds->j, "tu_production", gen.tu_production, err);
-    }
-
-    /* A9.2.3's derived state and build description, through the one writer the
-     * operator-gated `code.sem_config` also uses. `repo` and `freshness` are
-     * emitted by `open_generation` above, so the plan is loaded here and its
-     * remaining fields written — a status that reported the generation without
-     * the state would leave a client to re-derive "is a rebuild due?", which is
-     * the question this season exists to answer once. */
-    if (st == ATLAS_OK) {
-        atlas_sem_status_report plan_rep;
-        atlas_sem_status_report_init(&plan_rep);
-        st = atlas_sem_status_on(ds->db, info.name, &plan_rep, err);
-        if (st == ATLAS_OK) {
-            st = write_sem_plan_fields(ds, &plan_rep, err);
-        }
-        atlas_sem_status_report_free(&plan_rep);
     }
 
     if (st == ATLAS_OK) {

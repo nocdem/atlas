@@ -194,6 +194,13 @@ bool atlas_sem_tu_status_parse(const char *name, atlas_sem_tu_status *out);
 #define ATLAS_SEM_WHY_TOO_LARGE "a_per_unit_ceiling_was_reached"
 #define ATLAS_SEM_WHY_CHILD_FAILED "the_parser_process_did_not_report_a_result"
 #define ATLAS_SEM_WHY_MISSING_FILE "the_source_file_is_not_in_the_index"
+/* A9.2.3. Why an *automatic* attempt failed, recorded on the build description
+ * so an operator can act without reading a log. Kept apart from the per-unit
+ * reasons above because they answer different questions: those say why one
+ * translation unit is not fully described, these say why the pass never got
+ * that far. */
+#define ATLAS_SEM_WHY_BUILD_DESCRIPTION "the_named_compilation_databases_could_not_be_read"
+#define ATLAS_SEM_WHY_PASS_FAILED "the_semantic_index_pass_did_not_complete"
 bool atlas_sem_why_is_known(const char *why);
 /* Returns Atlas' own copy of a known reason, or NULL.
  *

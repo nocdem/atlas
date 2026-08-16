@@ -703,6 +703,39 @@ atlas_status atlas_sem_index_run(atlas_db *db, int64_t repo_id, const atlas_sem_
         return st;
     }
 
+    /* A9.2.3: a build description that names no translation unit is refused,
+     * exactly as a missing one is — and this is not a tidiness check.
+     *
+     * `atlas_code_compdb_parse` reduces every entry through a positive allowlist
+     * and drops what it cannot use, so a truncated, malformed or half-written
+     * `compile_commands.json` yields *zero units* rather than an error. Before
+     * this refusal the pass then built a generation describing nothing, published
+     * it, and replaced a perfectly good one: on the installed acceptance
+     * repository a corrupted database turned `4 of 4 source files` into `0 of 4`
+     * in one automatic rebuild.
+     *
+     * The coverage model held — `scope_covered = 0` cannot support any absence,
+     * so nothing false was ever concluded — but the operational guarantee did
+     * not, and "a failed rebuild preserves the last-known-good generation" is the
+     * guarantee. Failing here is what makes it true: no generation is opened, the
+     * previous one stays current, and the daemon's governor records the attempt
+     * so it does not retry until the description changes.
+     *
+     * A repository whose build genuinely compiles nothing has nothing to index,
+     * and saying so is better than publishing an index of nothing. */
+    size_t declared_units = 0;
+    for (size_t i = 0; i < slot_count; i++) {
+        declared_units += slots[i].parsed.unit_count;
+    }
+    if (declared_units == 0) {
+        for (size_t i = 0; i < slot_count; i++) {
+            slot_free(&slots[i]);
+        }
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "the named compilation databases describe no translation unit that "
+                             "Atlas can read; the previous semantic index is unchanged");
+    }
+
     char all_digest[65];
     digest_all(slots, slot_count, all_digest);
 

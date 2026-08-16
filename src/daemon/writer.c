@@ -555,10 +555,23 @@ static void run_sem_index(atlas_writer *w, atlas_job *j) {
         atlas_err_init(&rerr);
         /* The reason stored is a fixed Atlas string, never the error text: an
          * error message can quote a path or a compiler diagnostic, and this
-         * column is read back by an operator and by a model. */
+         * column is read back by an operator and by a model.
+         *
+         * Two reasons rather than one, chosen from the status, because they call
+         * for different actions. A usage failure is the build description: the
+         * named compilation databases could not be read, or describe nothing
+         * Atlas can compile, and an operator fixes the file. Anything else is
+         * the pass itself. Recording every failure as
+         * `the_parser_process_did_not_report_a_result` — which is what the first
+         * cut did — told an operator to look at a parser that had never run. */
+        const char *why = ATLAS_SEM_WHY_PASS_FAILED;
+        if (st == ATLAS_OK) {
+            why = "";
+        } else if (st == ATLAS_ERR_USAGE || st == ATLAS_ERR_CONFIG) {
+            why = ATLAS_SEM_WHY_BUILD_DESCRIPTION;
+        }
         (void)atlas_db_sem_config_record_attempt(w->db, repo.id, attempt_identity, st == ATLAS_OK,
-                                                 st == ATLAS_OK ? "" : ATLAS_SEM_WHY_CHILD_FAILED,
-                                                 &rerr);
+                                                 why, &rerr);
     }
 
     atlas_buf detail = ATLAS_BUF_INIT;

@@ -2877,6 +2877,9 @@ atlas_status atlas_service_sem_status_remote(const char *name, atlas_sem_status_
     if (atlas_ipc_result_str(r, "compiler_version", &v)) {
         copy_str(out->compiler_version, sizeof out->compiler_version, v);
     }
+    if (atlas_ipc_result_str(r, "compiler_id", &v)) {
+        copy_str(out->compiler_id, sizeof out->compiler_id, v);
+    }
     if (atlas_ipc_result_bool(r, "have_generation", &b)) {
         out->have_generation = b;
     }

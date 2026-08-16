@@ -247,6 +247,10 @@ static const char *const WHY[] = {
     ATLAS_SEM_WHY_PARSE_ERROR,  ATLAS_SEM_WHY_NO_TU,       ATLAS_SEM_WHY_OUTSIDE_REPO,
     ATLAS_SEM_WHY_ARG_REFUSED,  ATLAS_SEM_WHY_TIMEOUT,     ATLAS_SEM_WHY_TOO_LARGE,
     ATLAS_SEM_WHY_CHILD_FAILED, ATLAS_SEM_WHY_MISSING_FILE,
+    /* A9.2.3's pass-level reasons. In the same vocabulary because they reach the
+     * same surfaces and must be interned the same way, and kept distinct in
+     * meaning: these say why the pass never got as far as a translation unit. */
+    ATLAS_SEM_WHY_BUILD_DESCRIPTION, ATLAS_SEM_WHY_PASS_FAILED,
 };
 
 const char *atlas_sem_why_intern(const char *why) {

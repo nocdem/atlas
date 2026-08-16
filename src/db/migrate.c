@@ -3321,6 +3321,110 @@ static const char M17_STATEMENTS_SQL[] =
 
 static const char *const M17_STATEMENTS[] = {M17_STATEMENTS_SQL, NULL};
 
+/* --- migration 18: A9.2.3, the durable build description and the manifest ----
+ *
+ * Two things, and they answer two different questions the semantic layer could
+ * not answer before.
+ *
+ * ## `sem_repo_config`: what would Atlas rebuild, and may it?
+ *
+ * Until A9.2.3 a compilation database reached the indexer only as an argument to
+ * the command that ran it, so nothing durable said which build description a
+ * repository has. The daemon therefore could not rebuild anything unaided: it
+ * knew a generation was stale and had no way to know what to read.
+ *
+ * The row is also the **authority opt-in**, and that is not a secondary use.
+ * A8-CI's rule is that indexing runs a compiler over repository source, so it is
+ * an authorised operator action and no model may cause one. A9.2.3 makes a
+ * repository change a rebuild trigger, which would quietly delete that rule for
+ * every registered repository at once. It does not, because `auto_rebuild`
+ * defaults to 0 and only an operator writes the row: absent configuration means
+ * this daemon never runs a compiler for this repository, and the migration
+ * enables nothing that was not enabled before it ran.
+ *
+ * ## `sem_generations`' coverage manifest: what did that generation cover?
+ *
+ * `tu_complete = tu_total` says every translation unit the compilation database
+ * named was parsed. It says nothing about whether the compilation database named
+ * every source in the repository, so `198/198` was a statement about the
+ * denominator's own contents. The manifest adds the denominator Atlas can
+ * actually state — the source files the *file index* enumerated — and the number
+ * that makes it honest, `scope_uncovered`.
+ *
+ * ## Why this is additive and needs no `foreign_keys_off`
+ *
+ * One CREATE TABLE and seven ADD COLUMNs. Nothing is rebuilt, nothing is
+ * dropped, no cascade fires, no row is rewritten and no content hash moves —
+ * migrations 14, 16 and 17's argument, unchanged.
+ *
+ * ## History is preserved conservatively, never relabelled
+ *
+ * Every added column defaults to its vocabulary's zero: `scope_discovery` is
+ * `UNKNOWN` and every count is 0. A generation built before this season recorded
+ * nothing from which its scope could be reconstructed, so it reads "Atlas has
+ * not established this" rather than being retro-declared complete. That is
+ * migration 17's rule applied to coverage, and it is the difference between an
+ * old generation that must be rebuilt before it can support an absence and one
+ * that silently supports absences it never earned. */
+static const char M18_STATEMENTS_SQL[] =
+    "CREATE TABLE sem_repo_config ("
+    /* Soft reference and a primary key, not a foreign key: `repositories.id` is
+     * a reused rowid, so an FK would eventually attach one repository's build
+     * description to another. Cleared on removal, like `orch_jobs.repo_id`. */
+    "  repo_id INTEGER PRIMARY KEY,"
+    /* The durable identity, so a row can still say which repository lineage it
+     * described after the rowid is gone. */
+    "  repo_identity_hash TEXT NOT NULL DEFAULT '',"
+    /* DISABLED is zero — the shape every A6/A8/A9 state default uses. A zeroed
+     * or malformed row schedules nothing. */
+    "  auto_rebuild INTEGER NOT NULL DEFAULT 0,"
+    /* Newline-separated repository-relative paths. Validated inside the root by
+     * the indexer exactly as `--compdb` is, and never discovered: Atlas does not
+     * search a repository for a file that tells it how to compile things. */
+    "  compdbs TEXT NOT NULL DEFAULT '',"
+    /* Newline-separated repository-relative prefixes an operator declares to be
+     * test sources. Empty is not "there are no tests" — it is "Atlas does not
+     * know which sources are tests", which leaves the tests coverage dimension
+     * UNKNOWN and makes 'no production caller' unanswerable. Atlas guesses at no
+     * point: a directory called `tests` is a directory somebody named. */
+    "  test_roots TEXT NOT NULL DEFAULT '',"
+    "  configured_at TEXT NOT NULL DEFAULT '',"
+    /* The retry governor. A deterministic failure must not spin, so a further
+     * automatic attempt is allowed only once the source identity has moved past
+     * the one that failed — never after an interval, which would retry an
+     * unbuildable tree for ever. */
+    "  fail_count INTEGER NOT NULL DEFAULT 0,"
+    "  fail_identity TEXT NOT NULL DEFAULT '',"
+    /* A fixed Atlas string or empty. Never compiler output: a diagnostic quotes
+     * untrusted repository source. */
+    "  fail_reason TEXT NOT NULL DEFAULT '',"
+    "  fail_at TEXT NOT NULL DEFAULT ''"
+    ");"
+
+    /* How the denominator was established. UNKNOWN is zero-equivalent and is
+     * what every pre-A9.2.3 generation reads. DECLARED means the file index was
+     * current when the generation published, so the enumeration of candidate
+     * sources is one Atlas can vouch for. */
+    "ALTER TABLE sem_generations ADD COLUMN scope_discovery TEXT NOT NULL DEFAULT 'UNKNOWN'"
+    "  CHECK(scope_discovery IN ('UNKNOWN','DECLARED'));"
+    /* Source files the file index holds for this repository that a C translation
+     * unit could be built from. The denominator §14 asks for. */
+    "ALTER TABLE sem_generations ADD COLUMN scope_candidates INTEGER NOT NULL DEFAULT 0;"
+    /* Of those, how many this generation actually parsed as a unit. */
+    "ALTER TABLE sem_generations ADD COLUMN scope_covered INTEGER NOT NULL DEFAULT 0;"
+    /* The difference, and the only number that can refuse an absence. A
+     * generation with `tu_complete = tu_total` and `scope_uncovered = 40`
+     * parsed everything it was told about and read four fifths of the tree. */
+    "ALTER TABLE sem_generations ADD COLUMN scope_uncovered INTEGER NOT NULL DEFAULT 0;"
+    /* The test/production split, from the operator's declared roots and from
+     * nothing else. Both zero with `test_scope_known = 0` means unclassified,
+     * which is a different statement from "no test units". */
+    "ALTER TABLE sem_generations ADD COLUMN tu_test INTEGER NOT NULL DEFAULT 0;"
+    "ALTER TABLE sem_generations ADD COLUMN tu_production INTEGER NOT NULL DEFAULT 0;"
+    "ALTER TABLE sem_generations ADD COLUMN test_scope_known INTEGER NOT NULL DEFAULT 0;";
+
+static const char *const M18_STATEMENTS[] = {M18_STATEMENTS_SQL, NULL};
+
 static const atlas_migration MIGRATIONS[] = {
     {1, "initial schema", M1_STATEMENTS, false},
     {2, "worktree identity", M2_STATEMENTS, false},
@@ -3354,6 +3458,13 @@ static const atlas_migration MIGRATIONS[] = {
      * being relabelled — §27's "preserve conservatively rather than invent
      * certainty", for free. */
     {17, "epistemic truth, coverage and the absence-proof record", M17_STATEMENTS, false},
+    /* Additive: one new table and seven columns, no table rebuilt, so foreign
+     * keys stay enforced and no row is rewritten. The new table enables nothing
+     * — `auto_rebuild` defaults to 0 and only an operator writes a row — so a
+     * machine that migrates does not begin running compilers. See the M18
+     * comment. */
+    {18, "the durable semantic build description and a generation's coverage manifest",
+     M18_STATEMENTS, false},
 };
 
 const atlas_migration *atlas_migrations(size_t *count_out) {

@@ -516,6 +516,15 @@ atlas_status atlas_db_repo_remove(atlas_db *db, const char *name, bool *removed,
         if (st == ATLAS_OK && found) {
             st = atlas_db_sem_forget_repo(db, ri.id, err);
         }
+        /* A9.2.3's build description is keyed on the same reused rowid, and it
+         * is the row that decides whether the daemon runs a compiler. Left
+         * behind, the next repository to take this rowid would inherit somebody
+         * else's opt-in — so this one is *deleted* rather than zeroed: an
+         * operator's statement about a repository that is gone describes
+         * nothing, and there is no later question it could answer. */
+        if (st == ATLAS_OK && found) {
+            st = atlas_db_sem_config_forget_repo(db, ri.id, err);
+        }
         atlas_repo_info_free(&ri);
     }
 

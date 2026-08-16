@@ -37,7 +37,7 @@
  * `found` false means ABSENT — nobody has indexed this repository — which is a
  * different answer from STALE and must stay one. Both are ordinary outcomes and
  * neither is an error: a caller is told what Atlas holds, and decides. */
-static atlas_status load_generation(atlas_ctx *ctx, const atlas_repo_info *repo,
+static atlas_status load_generation(atlas_ctx *ctx, atlas_repo_info *repo,
                                     atlas_sem_generation *gen, bool *found,
                                     atlas_sem_freshness *fresh, const char **reason,
                                     atlas_err *err) {
@@ -76,14 +76,29 @@ static atlas_status load_generation(atlas_ctx *ctx, const atlas_repo_info *repo,
         return st;
     }
 
-    /* The live commit is the repository's own scanned head. The compilation
-     * database digest is deliberately *not* recomputed here: doing so would
-     * mean opening and hashing every compile database on every read, and a
-     * changed one is caught by the next index rather than by every query. The
-     * generation records the digest it used, and `code status` reports it, so
-     * an operator can see which description the index was built from. */
-    *fresh = atlas_sem_freshness_of(gen, *found, running, repo->scanned_head, NULL, file_current,
-                                    reason);
+    /* The live commit is the repository's own scanned head.
+     *
+     * **A9.2.3 recomputes the compilation-database digest here, reversing an
+     * A8-CI decision, and the reversal is the point.** A8-CI declined on the
+     * grounds that hashing every database on every read was expensive and that a
+     * changed one would be caught by the next index. That held while rebuilding
+     * was something a person did: "the next index" was a command somebody would
+     * run, and the unreached check only decided how a status line read. It stops
+     * holding once the daemon owns freshness, because the daemon schedules by
+     * *noticing* — so a check that never fires is a repository whose build
+     * description can change without anything ever rebuilding it.
+     *
+     * It costs one bounded read and one SHA-256 per declared database, of files
+     * an operator named. A repository with no declared description pays nothing
+     * and yields an empty digest, which never makes a generation stale. */
+    char live_digest[65];
+    live_digest[0] = '\0';
+    atlas_err ignored;
+    atlas_err_init(&ignored);
+    (void)atlas_sem_repo_compdb_digest(atlas_ctx_db(ctx), repo, live_digest, &ignored);
+
+    *fresh = atlas_sem_freshness_of(gen, *found, running, repo->scanned_head, live_digest,
+                                    file_current, reason);
     return ATLAS_OK;
 }
 
@@ -516,6 +531,34 @@ atlas_status atlas_sem_index_on(atlas_db *db, const atlas_repo_info *repo_in,
     atlas_buf exe = ATLAS_BUF_INIT;
     st = atlas_unit_self_path(&exe, err);
 
+    /* A9.2.3. The durable identity, so a generation can still say which
+     * repository lineage it described after the rowid is gone — every other
+     * durable Atlas record that references a repository carries it, and this one
+     * had a column for it that nothing ever filled. Best effort: a repository
+     * whose identity cannot be computed still gets an index, with the field
+     * empty and honestly so, rather than no index at all. */
+    atlas_buf identity = ATLAS_BUF_INIT;
+    if (st == ATLAS_OK) {
+        atlas_err ignored;
+        atlas_err_init(&ignored);
+        if (atlas_db_repo_identity_hash(db, repo.id, &identity, &ignored) != ATLAS_OK) {
+            atlas_buf_reset(&identity);
+        }
+    }
+
+    /* A9.2.3. The operator's declared test roots, used only to classify this
+     * generation's units at publication. It changes nothing about what is
+     * parsed: excluding tests from the *index* would make a caller in a test
+     * invisible rather than merely labelled, which is the opposite of what the
+     * test-scope question needs. */
+    atlas_sem_config cfg;
+    atlas_sem_config_init(&cfg);
+    if (st == ATLAS_OK) {
+        atlas_err ignored;
+        atlas_err_init(&ignored);
+        (void)atlas_db_sem_config_get(db, repo.id, &cfg, &ignored);
+    }
+
     if (st == ATLAS_OK) {
         atlas_sem_index_opts o;
         atlas_sem_index_opts_init(&o);
@@ -526,10 +569,13 @@ atlas_status atlas_sem_index_on(atlas_db *db, const atlas_repo_info *repo_in,
         o.root = atlas_git_root(g);
         o.root_fd = atlas_git_root_fd(g);
         o.commit_id = repo.scanned_head;
-        o.repo_identity_hash = "";
+        o.repo_identity_hash = atlas_buf_cstr(&identity);
+        o.test_roots = atlas_buf_cstr(&cfg.test_roots);
         st = atlas_sem_index_run(db, repo.id, &o, out, err);
     }
 
+    atlas_sem_config_free(&cfg);
+    atlas_buf_free(&identity);
     atlas_buf_free(&exe);
     atlas_git_close(g);
     atlas_buf_free(&list);

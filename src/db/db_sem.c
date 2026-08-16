@@ -23,6 +23,19 @@ static atlas_status bind_text(atlas_db *db, sqlite3_stmt *stmt, int idx, const c
     return atlas_db_bind_text_opt(db, stmt, idx, nz(v), err);
 }
 
+/* Binds a buffer's exact bytes. Separate from `bind_text` because an
+ * `atlas_buf` is not necessarily NUL-terminated and `atlas_buf_cstr` would
+ * terminate it, which needs a writable handle on something a writer has no
+ * business modifying. */
+static atlas_status bind_buf(atlas_db *db, sqlite3_stmt *stmt, int idx, const atlas_buf *b,
+                             atlas_err *err) {
+    const char *p = b->len > 0 ? (const char *)b->data : "";
+    if (sqlite3_bind_text(stmt, idx, p, (int)b->len, SQLITE_TRANSIENT) != SQLITE_OK) {
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind a text value");
+    }
+    return ATLAS_OK;
+}
+
 static const char *col_text(sqlite3_stmt *stmt, int idx) {
     const unsigned char *t = sqlite3_column_text(stmt, idx);
     return t == NULL ? "" : (const char *)t;
@@ -220,6 +233,18 @@ static void read_generation(sqlite3_stmt *stmt, atlas_sem_generation *out) {
     out->include_count = sqlite3_column_int64(stmt, 20);
     out->duration_ms = sqlite3_column_int64(stmt, 21);
     copy_field(out->failure_reason, sizeof(out->failure_reason), col_text(stmt, 22));
+    /* A9.2.3's manifest. An unparseable value leaves UNKNOWN, which is the zero
+     * and the safe reading: a generation whose scope Atlas cannot read is not
+     * one whose coverage may support an absence. */
+    if (!atlas_sem_scope_discovery_parse(col_text(stmt, 23), &out->scope_discovery)) {
+        out->scope_discovery = ATLAS_SEM_SCOPE_UNKNOWN;
+    }
+    out->scope_candidates = sqlite3_column_int64(stmt, 24);
+    out->scope_covered = sqlite3_column_int64(stmt, 25);
+    out->scope_uncovered = sqlite3_column_int64(stmt, 26);
+    out->tu_test = sqlite3_column_int64(stmt, 27);
+    out->tu_production = sqlite3_column_int64(stmt, 28);
+    out->test_scope_known = sqlite3_column_int64(stmt, 29) != 0;
 }
 
 #define GEN_COLUMNS                                                                             \
@@ -227,7 +252,8 @@ static void read_generation(sqlite3_stmt *stmt, atlas_sem_generation *out) {
     " g.compiler_id, g.compiler_version, g.analyzer_id, g.analyzer_version, g.status,"          \
     " g.started_at, g.completed_at, g.tu_total, g.tu_complete, g.tu_partial, g.tu_failed,"      \
     " g.tu_unsupported, g.symbol_count, g.edge_count, g.include_count, g.duration_ms,"          \
-    " g.failure_reason"
+    " g.failure_reason, g.scope_discovery, g.scope_candidates, g.scope_covered,"                \
+    " g.scope_uncovered, g.tu_test, g.tu_production, g.test_scope_known"
 
 atlas_status atlas_db_sem_current(atlas_db *db, int64_t repo_id, atlas_sem_generation *out,
                                   bool *found, atlas_err *err) {
@@ -1384,4 +1410,344 @@ atlas_status atlas_db_sem_generation_counts(atlas_db *db, int64_t generation_id,
                           generation_id, includes_out, err);
     }
     return st;
+}
+
+/* --- A9.2.3: the durable build description ----------------------------------
+ *
+ * The row is the operator's statement about a repository, and its absence is the
+ * default: no row means this daemon never runs a compiler for that repository,
+ * which is what keeps A8-CI's rule true after repository changes became a
+ * rebuild trigger. Nothing here creates a row implicitly.
+ */
+
+atlas_status atlas_db_sem_config_get(atlas_db *db, int64_t repo_id, atlas_sem_config *out,
+                                     atlas_err *err) {
+    if (out == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "semantic configuration: bad request");
+    }
+    atlas_sem_config_init(out);
+    out->repo_id = repo_id;
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(db,
+                                       "SELECT repo_identity_hash, auto_rebuild, compdbs,"
+                                       "  test_roots, configured_at, fail_count, fail_identity,"
+                                       "  fail_reason, fail_at"
+                                       " FROM sem_repo_config WHERE repo_id = ?1;",
+                                       &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, repo_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind repository id");
+    }
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        out->present = true;
+        copy_field(out->repo_identity_hash, sizeof out->repo_identity_hash, col_text(stmt, 0));
+        out->auto_rebuild = sqlite3_column_int64(stmt, 1) != 0;
+        st = atlas_buf_set_str(&out->compdbs, col_text(stmt, 2), err);
+        if (st == ATLAS_OK) {
+            st = atlas_buf_set_str(&out->test_roots, col_text(stmt, 3), err);
+        }
+        copy_field(out->configured_at, sizeof out->configured_at, col_text(stmt, 4));
+        out->fail_count = sqlite3_column_int64(stmt, 5);
+        copy_field(out->fail_identity, sizeof out->fail_identity, col_text(stmt, 6));
+        copy_field(out->fail_reason, sizeof out->fail_reason, col_text(stmt, 7));
+        copy_field(out->fail_at, sizeof out->fail_at, col_text(stmt, 8));
+    }
+    atlas_db_finish(db, stmt);
+    return st;
+}
+
+atlas_status atlas_db_sem_config_set(atlas_db *db, const atlas_sem_config *c, atlas_err *err) {
+    if (c == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "semantic configuration: bad request");
+    }
+    /* The retry-governor columns are deliberately absent from the update list.
+     * Configuring a repository is not a claim that a previous failure has been
+     * resolved, and clearing the record here would let one command turn a
+     * deterministic failure back into a spin. What legitimately makes the next
+     * attempt eligible is that changing the description moves the source
+     * identity, which the governor compares against. */
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st =
+        atlas_db_prepare(db,
+                         "INSERT INTO sem_repo_config(repo_id, repo_identity_hash, auto_rebuild,"
+                         "  compdbs, test_roots, configured_at)"
+                         " VALUES(?1,?2,?3,?4,?5,?6)"
+                         " ON CONFLICT(repo_id) DO UPDATE SET"
+                         "  repo_identity_hash = excluded.repo_identity_hash,"
+                         "  auto_rebuild = excluded.auto_rebuild,"
+                         "  compdbs = excluded.compdbs,"
+                         "  test_roots = excluded.test_roots,"
+                         "  configured_at = excluded.configured_at;",
+                         &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    char now[ATLAS_TS_MAX];
+    atlas_now_iso8601(now, sizeof now);
+    if (sqlite3_bind_int64(stmt, 1, c->repo_id) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 3, c->auto_rebuild ? 1 : 0) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind semantic configuration");
+    }
+    st = bind_text(db, stmt, 2, c->repo_identity_hash, err);
+    if (st == ATLAS_OK) {
+        st = bind_buf(db, stmt, 4, &c->compdbs, err);
+    }
+    if (st == ATLAS_OK) {
+        st = bind_buf(db, stmt, 5, &c->test_roots, err);
+    }
+    if (st == ATLAS_OK) {
+        st = bind_text(db, stmt, 6, now, err);
+    }
+    if (st != ATLAS_OK) {
+        atlas_db_finish(db, stmt);
+        return st;
+    }
+    return atlas_db_step_done(db, stmt, err);
+}
+
+atlas_status atlas_db_sem_config_record_attempt(atlas_db *db, int64_t repo_id,
+                                                const char *source_identity, bool ok,
+                                                const char *why, atlas_err *err) {
+    sqlite3_stmt *stmt = NULL;
+    /* Success clears the record entirely: a repository that has just built is
+     * not one carrying a failure, and leaving a count behind would make the
+     * governor's "has the identity moved?" question compare against an identity
+     * that no longer describes a failure. */
+    atlas_status st =
+        atlas_db_prepare(db,
+                         ok ? "UPDATE sem_repo_config SET fail_count = 0, fail_identity = '',"
+                              "  fail_reason = '', fail_at = '' WHERE repo_id = ?1;"
+                            : "UPDATE sem_repo_config SET fail_count = fail_count + 1,"
+                              "  fail_identity = ?2, fail_reason = ?3, fail_at = ?4"
+                              " WHERE repo_id = ?1;",
+                         &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, repo_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind repository id");
+    }
+    if (!ok) {
+        char now[ATLAS_TS_MAX];
+        atlas_now_iso8601(now, sizeof now);
+        st = bind_text(db, stmt, 2, source_identity, err);
+        if (st == ATLAS_OK) {
+            /* A fixed Atlas string. Never compiler output and never an error
+             * message assembled from repository bytes. */
+            st = bind_text(db, stmt, 3, why, err);
+        }
+        if (st == ATLAS_OK) {
+            st = bind_text(db, stmt, 4, now, err);
+        }
+        if (st != ATLAS_OK) {
+            atlas_db_finish(db, stmt);
+            return st;
+        }
+    }
+    return atlas_db_step_done(db, stmt, err);
+}
+
+atlas_status atlas_db_sem_config_repos(atlas_db *db, int64_t *out, size_t max, size_t *count_out,
+                                       bool *truncated_out, atlas_err *err) {
+    if (count_out != NULL) {
+        *count_out = 0;
+    }
+    if (truncated_out != NULL) {
+        *truncated_out = false;
+    }
+    if (out == NULL || max == 0) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "semantic configuration: bad request");
+    }
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(
+        db, "SELECT repo_id FROM sem_repo_config WHERE repo_id > 0 ORDER BY repo_id;", &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    size_t n = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        if (n >= max) {
+            /* Reported, never silently shortened: a repository dropped from a
+             * scheduling sweep is one that never rebuilds, and nothing in a
+             * truncated list would say so. */
+            if (truncated_out != NULL) {
+                *truncated_out = true;
+            }
+            break;
+        }
+        out[n++] = sqlite3_column_int64(stmt, 0);
+    }
+    atlas_db_finish(db, stmt);
+    if (count_out != NULL) {
+        *count_out = n;
+    }
+    return ATLAS_OK;
+}
+
+atlas_status atlas_db_sem_config_forget_repo(atlas_db *db, int64_t repo_id, atlas_err *err) {
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st =
+        atlas_db_prepare(db, "DELETE FROM sem_repo_config WHERE repo_id = ?1;", &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, repo_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind repository id");
+    }
+    return atlas_db_step_done(db, stmt, err);
+}
+
+/* --- A9.2.3: the coverage manifest ------------------------------------------ */
+
+atlas_status atlas_db_sem_scope_counts(atlas_db *db, int64_t repo_id, int64_t generation_id,
+                                       int64_t *candidates_out, int64_t *covered_out,
+                                       atlas_err *err) {
+    if (candidates_out != NULL) {
+        *candidates_out = 0;
+    }
+    if (covered_out != NULL) {
+        *covered_out = 0;
+    }
+    /* The denominator is the *file index's* enumeration of the tree, never the
+     * compilation database's own contents. `language` is the file index's own
+     * classification, so nothing here hard-codes an extension and a repository
+     * in another language is described by the same query. */
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(db,
+                                       "SELECT COUNT(*) FROM files"
+                                       " WHERE repo_id = ?1 AND deleted = 0"
+                                       "   AND file_type = 'regular' AND language = 'c';",
+                                       &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, repo_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind repository id");
+    }
+    if (sqlite3_step(stmt) == SQLITE_ROW && candidates_out != NULL) {
+        *candidates_out = sqlite3_column_int64(stmt, 0);
+    }
+    atlas_db_finish(db, stmt);
+
+    /* Distinct sources, because one file compiled under two configurations is
+     * two translation units and one covered source. Counting units here would
+     * make a repository with several build configurations look like one whose
+     * coverage exceeded its own tree. */
+    stmt = NULL;
+    st = atlas_db_prepare(db,
+                          "SELECT COUNT(DISTINCT u.source_text) FROM sem_units u"
+                          " JOIN files f ON f.repo_id = ?1 AND f.deleted = 0"
+                          "   AND f.file_type = 'regular' AND f.language = 'c'"
+                          "   AND f.path_text = u.source_text"
+                          " WHERE u.generation_id = ?2;",
+                          &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, repo_id) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 2, generation_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the scope query");
+    }
+    if (sqlite3_step(stmt) == SQLITE_ROW && covered_out != NULL) {
+        *covered_out = sqlite3_column_int64(stmt, 0);
+    }
+    atlas_db_finish(db, stmt);
+    return ATLAS_OK;
+}
+
+atlas_status atlas_db_sem_scope_test_split(atlas_db *db, int64_t generation_id,
+                                           const char *packed_test_roots, int64_t *test_out,
+                                           int64_t *production_out, bool *known_out,
+                                           atlas_err *err) {
+    if (test_out != NULL) {
+        *test_out = 0;
+    }
+    if (production_out != NULL) {
+        *production_out = 0;
+    }
+    if (known_out != NULL) {
+        *known_out = false;
+    }
+    if (packed_test_roots == NULL || packed_test_roots[0] == '\0') {
+        /* No declared roots. Both counts stay zero and `known` stays false,
+         * which is "Atlas does not know which sources are tests" — a different
+         * statement from "there are no test units", and the one that makes a
+         * production-scope absence unanswerable rather than wrong. */
+        return ATLAS_OK;
+    }
+    /* Classified in C rather than in SQL, because the match must end on a path
+     * component boundary and `LIKE 'tests%'` would classify `tests_helper.c` as
+     * a test. */
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(
+        db, "SELECT DISTINCT source_text FROM sem_units WHERE generation_id = ?1;", &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, generation_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind generation id");
+    }
+    int64_t t = 0;
+    int64_t p = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        if (atlas_sem_path_is_test(packed_test_roots, col_text(stmt, 0))) {
+            t++;
+        } else {
+            p++;
+        }
+    }
+    atlas_db_finish(db, stmt);
+    if (test_out != NULL) {
+        *test_out = t;
+    }
+    if (production_out != NULL) {
+        *production_out = p;
+    }
+    if (known_out != NULL) {
+        *known_out = true;
+    }
+    return ATLAS_OK;
+}
+
+atlas_status atlas_db_sem_scope_set(atlas_db *db, int64_t generation_id,
+                                    const atlas_sem_generation *m, atlas_err *err) {
+    if (m == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "semantic coverage manifest: bad request");
+    }
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(db,
+                                       "UPDATE sem_generations SET scope_discovery = ?2,"
+                                       "  scope_candidates = ?3, scope_covered = ?4,"
+                                       "  scope_uncovered = ?5, tu_test = ?6, tu_production = ?7,"
+                                       "  test_scope_known = ?8"
+                                       " WHERE id = ?1;",
+                                       &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, generation_id) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 3, m->scope_candidates) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 4, m->scope_covered) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 5, m->scope_uncovered) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 6, m->tu_test) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 7, m->tu_production) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 8, m->test_scope_known ? 1 : 0) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the coverage manifest");
+    }
+    st = bind_text(db, stmt, 2, atlas_sem_scope_discovery_name(m->scope_discovery), err);
+    if (st != ATLAS_OK) {
+        atlas_db_finish(db, stmt);
+        return st;
+    }
+    return atlas_db_step_done(db, stmt, err);
 }

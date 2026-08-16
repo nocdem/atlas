@@ -2782,6 +2782,18 @@ atlas_status atlas_service_sem_status_remote(const char *name, atlas_sem_status_
     if (atlas_ipc_result_int(r, "compdb_count", &t)) {
         out->generation.compdb_count = t;
     }
+    /* A9.2.3. Read back because they are now sent; before this season the
+     * daemon never sent them and the two paths reported different generations
+     * for the same row. */
+    if (atlas_ipc_result_str(r, "generation_compiler_id", &v)) {
+        copy_str(out->generation.compiler_id, sizeof out->generation.compiler_id, v);
+    }
+    if (atlas_ipc_result_str(r, "generation_compiler_version", &v)) {
+        copy_str(out->generation.compiler_version, sizeof out->generation.compiler_version, v);
+    }
+    if (atlas_ipc_result_str(r, "started_at", &v)) {
+        copy_str(out->generation.started_at, sizeof out->generation.started_at, v);
+    }
     if (atlas_ipc_result_str(r, "completed_at", &v)) {
         copy_str(out->generation.completed_at, sizeof out->generation.completed_at, v);
     }
@@ -2820,6 +2832,33 @@ atlas_status atlas_service_sem_status_remote(const char *name, atlas_sem_status_
     }
     if (atlas_ipc_result_int(r, "units_not_complete", &t)) {
         out->failed_total = t;
+    }
+    /* A9.2.3's coverage manifest. An absent `scope_discovery` leaves UNKNOWN,
+     * which is what an older daemon's response means and the safe reading of it:
+     * a generation whose scope this response did not describe is not one whose
+     * coverage may support an absence. */
+    if (atlas_ipc_result_str(r, "scope_discovery", &v)) {
+        if (!atlas_sem_scope_discovery_parse(v, &out->generation.scope_discovery)) {
+            out->generation.scope_discovery = ATLAS_SEM_SCOPE_UNKNOWN;
+        }
+    }
+    if (atlas_ipc_result_int(r, "scope_candidates", &t)) {
+        out->generation.scope_candidates = t;
+    }
+    if (atlas_ipc_result_int(r, "scope_covered", &t)) {
+        out->generation.scope_covered = t;
+    }
+    if (atlas_ipc_result_int(r, "scope_uncovered", &t)) {
+        out->generation.scope_uncovered = t;
+    }
+    if (atlas_ipc_result_bool(r, "test_scope_known", &b)) {
+        out->generation.test_scope_known = b;
+    }
+    if (atlas_ipc_result_int(r, "tu_test", &t)) {
+        out->generation.tu_test = t;
+    }
+    if (atlas_ipc_result_int(r, "tu_production", &t)) {
+        out->generation.tu_production = t;
     }
     /* The generation is COMPLETE by construction: the daemon only publishes a
      * pointer at one that is, and only a published generation is served. */

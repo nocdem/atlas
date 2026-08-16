@@ -305,6 +305,19 @@ static void wind_back_to_schema_12(env *e, atlas_err *err) {
         "DROP TABLE verify_evidence;"
         "DROP TABLE verify_claims;"
         "DROP TABLE verify_actors;"
+        /* A9.2.3's table, added by migration 18, for the same reason. Its seven
+         * columns on `sem_generations` go too: that table belongs to migration
+         * 11 and correctly survives a rewind to twelve, but the columns a later
+         * migration added to it do not, and leaving them would present migration
+         * 18 with columns it is about to add. */
+        "DROP TABLE sem_repo_config;"
+        "ALTER TABLE sem_generations DROP COLUMN scope_discovery;"
+        "ALTER TABLE sem_generations DROP COLUMN scope_candidates;"
+        "ALTER TABLE sem_generations DROP COLUMN scope_covered;"
+        "ALTER TABLE sem_generations DROP COLUMN scope_uncovered;"
+        "ALTER TABLE sem_generations DROP COLUMN tu_test;"
+        "ALTER TABLE sem_generations DROP COLUMN tu_production;"
+        "ALTER TABLE sem_generations DROP COLUMN test_scope_known;"
         "DELETE FROM schema_migrations WHERE version >= 13;";
 
     T_OK(atlas_db_exec_sql(e->db, BACK_DOCUMENTS, err), err);

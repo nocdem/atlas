@@ -364,3 +364,166 @@ atlas_status atlas_sem_config_digest(const atlas_code_compdb *db, size_t unit_in
     out[ATLAS_SHA256_HEX_LEN] = '\0';
     return ATLAS_OK;
 }
+
+/* --- A9.2.3: scope discovery, the durable configuration, and test scope ------ */
+
+const char *atlas_sem_scope_discovery_name(atlas_sem_scope_discovery d) {
+    switch (d) {
+    case ATLAS_SEM_SCOPE_DECLARED:
+        return "DECLARED";
+    case ATLAS_SEM_SCOPE_UNKNOWN:
+        break;
+    }
+    return "UNKNOWN";
+}
+
+bool atlas_sem_scope_discovery_parse(const char *name, atlas_sem_scope_discovery *out) {
+    if (name == NULL || out == NULL) {
+        return false;
+    }
+    if (strcmp(name, "DECLARED") == 0) {
+        *out = ATLAS_SEM_SCOPE_DECLARED;
+        return true;
+    }
+    if (strcmp(name, "UNKNOWN") == 0) {
+        *out = ATLAS_SEM_SCOPE_UNKNOWN;
+        return true;
+    }
+    return false;
+}
+
+void atlas_sem_config_init(atlas_sem_config *c) {
+    if (c == NULL) {
+        return;
+    }
+    memset(c, 0, sizeof(*c));
+    atlas_buf_init(&c->compdbs);
+    atlas_buf_init(&c->test_roots);
+}
+
+void atlas_sem_config_free(atlas_sem_config *c) {
+    if (c == NULL) {
+        return;
+    }
+    atlas_buf_free(&c->compdbs);
+    atlas_buf_free(&c->test_roots);
+}
+
+atlas_status atlas_sem_config_pack(const char *const *items, size_t count, atlas_buf *out,
+                                   atlas_err *err) {
+    if (out == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "semantic configuration: bad request");
+    }
+    atlas_buf_reset(out);
+    size_t total = 0;
+    for (size_t i = 0; i < count; i++) {
+        const char *s = items[i];
+        if (s == NULL || s[0] == '\0') {
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "an empty path cannot be part of a semantic build description");
+        }
+        if (strchr(s, '\n') != NULL) {
+            /* Refused rather than truncated at the newline, which would name a
+             * different file. A path containing a newline is legal on this
+             * filesystem and Atlas' rule is that paths are bytes, so this is a
+             * real restriction and is stated as one rather than hidden. */
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "a path containing a newline cannot be named in a semantic "
+                                 "build description");
+        }
+        total += strlen(s) + 1u;
+        if (total > ATLAS_SEM_CONFIG_MAX_BYTES) {
+            /* Bounds refuse, never clamp — A5's rule. A silently shortened list
+             * would describe a build nobody asked for. */
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "a semantic build description may not exceed %u bytes",
+                                 (unsigned)ATLAS_SEM_CONFIG_MAX_BYTES);
+        }
+        atlas_status st = atlas_buf_append(out, s, strlen(s), err);
+        if (st == ATLAS_OK && i + 1u < count) {
+            st = atlas_buf_append(out, "\n", 1u, err);
+        }
+        if (st != ATLAS_OK) {
+            return st;
+        }
+    }
+    return ATLAS_OK;
+}
+
+atlas_status atlas_sem_config_unpack(const char *packed, atlas_buf *out, size_t *count_out,
+                                     atlas_err *err) {
+    if (count_out != NULL) {
+        *count_out = 0;
+    }
+    if (out == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "semantic configuration: bad request");
+    }
+    atlas_buf_reset(out);
+    if (packed == NULL || packed[0] == '\0') {
+        return ATLAS_OK;
+    }
+    size_t n = 0;
+    const char *p = packed;
+    while (*p != '\0') {
+        const char *nl = strchr(p, '\n');
+        size_t len = nl != NULL ? (size_t)(nl - p) : strlen(p);
+        if (len > 0) {
+            if (n >= ATLAS_SEM_MAX_COMPDBS) {
+                /* Refused, never truncated: a shorter list describes a build
+                 * nobody asked for and nothing in the result would say so. */
+                return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                     "the semantic build description names more than %d paths",
+                                     ATLAS_SEM_MAX_COMPDBS);
+            }
+            atlas_status st = atlas_buf_append(out, p, len, err);
+            if (st == ATLAS_OK) {
+                st = atlas_buf_append(out, "", 1u, err);
+            }
+            if (st != ATLAS_OK) {
+                return st;
+            }
+            n++;
+        }
+        if (nl == NULL) {
+            break;
+        }
+        p = nl + 1;
+    }
+    if (count_out != NULL) {
+        *count_out = n;
+    }
+    return ATLAS_OK;
+}
+
+bool atlas_sem_path_is_test(const char *packed_roots, const char *rel) {
+    if (packed_roots == NULL || packed_roots[0] == '\0' || rel == NULL || rel[0] == '\0') {
+        return false;
+    }
+    const char *p = packed_roots;
+    while (*p != '\0') {
+        const char *nl = strchr(p, '\n');
+        size_t len = nl != NULL ? (size_t)(nl - p) : strlen(p);
+        /* A trailing slash in a declared root is accepted and ignored, so
+         * `tests` and `tests/` mean the same thing. */
+        while (len > 0 && p[len - 1] == '/') {
+            len--;
+        }
+        if (len > 0 && strncmp(rel, p, len) == 0) {
+            /* The match must end on a path-component boundary. A substring match
+             * would classify `tests_helper.c` as a test because `tests` is a
+             * declared root, and a production source misclassified as a test is
+             * wrong in the one direction that matters: it would let "no
+             * production caller" be answered ABSENT while a production caller
+             * sits in the file it excluded. */
+            char after = rel[len];
+            if (after == '/' || after == '\0') {
+                return true;
+            }
+        }
+        if (nl == NULL) {
+            break;
+        }
+        p = nl + 1;
+    }
+    return false;
+}

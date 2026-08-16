@@ -21,7 +21,7 @@
 #include "atlas/error.h"
 #include "atlas/limits.h"
 
-#define ATLAS_SCHEMA_VERSION 17
+#define ATLAS_SCHEMA_VERSION 18
 
 typedef struct atlas_db atlas_db;
 

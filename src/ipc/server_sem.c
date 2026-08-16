@@ -33,7 +33,7 @@
  * Freshness first, always. A caller that read the rows without it could not
  * tell an answer about the current code from one about code that has since
  * changed, and those must never be indistinguishable. */
-static atlas_status open_generation(dispatch_state *ds, const atlas_repo_info *info,
+static atlas_status open_generation(dispatch_state *ds, atlas_repo_info *info,
                                     atlas_sem_generation *gen, bool *found, atlas_err *err) {
     atlas_sem_generation_init(gen);
     atlas_status st = atlas_db_sem_current(ds->db, info->id, gen, found, err);
@@ -59,9 +59,21 @@ static atlas_status open_generation(dispatch_state *ds, const atlas_repo_info *i
         return st;
     }
 
+    /* A9.2.3. The live compilation-database digest, for the reason
+     * `load_generation` in `service_sem.c` states: the daemon schedules a
+     * rebuild by noticing that a generation is stale, so a staleness check that
+     * never fires is a repository that never rebuilds. Both read paths ask the
+     * same question of the same helper, so the socket and the local context
+     * cannot answer differently about the same generation. */
+    char live_digest[65];
+    live_digest[0] = '\0';
+    atlas_err ignored;
+    atlas_err_init(&ignored);
+    (void)atlas_sem_repo_compdb_digest(ds->db, info, live_digest, &ignored);
+
     const char *reason = NULL;
-    atlas_sem_freshness f = atlas_sem_freshness_of(gen, *found, running, info->scanned_head, NULL,
-                                                   file_current, &reason);
+    atlas_sem_freshness f = atlas_sem_freshness_of(gen, *found, running, info->scanned_head,
+                                                   live_digest, file_current, &reason);
 
     st = atlas_json_key_str(ds->j, "repo", info->name, err);
     if (st == ATLAS_OK) {
@@ -175,6 +187,23 @@ static atlas_status method_sem_status(dispatch_state *ds, const atlas_ipc_reques
     if (st == ATLAS_OK) {
         st = atlas_json_key_int(ds->j, "compdb_count", gen.compdb_count, err);
     }
+    /* A9.2.3. Both of these existed on the generation, were stored, and were
+     * never sent — so on a system deployment, where the socket is the only path
+     * to the index, `atlas code sem-status` reported an empty compiler id and no
+     * start time for a generation that recorded both. That is the A9.2.1 closure
+     * defect one layer over: a field added to the struct and to the renderer but
+     * not to the wire makes the two surfaces disagree, and only the local one is
+     * ever tested by hand. */
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str_opt(ds->j, "generation_compiler_id", gen.compiler_id, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str_opt(ds->j, "generation_compiler_version", gen.compiler_version,
+                                    err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str_opt(ds->j, "started_at", gen.started_at, err);
+    }
     if (st == ATLAS_OK) {
         st = atlas_json_key_str_opt(ds->j, "completed_at", gen.completed_at, err);
     }
@@ -216,6 +245,34 @@ static atlas_status method_sem_status(dispatch_state *ds, const atlas_ipc_reques
     if (st == ATLAS_OK) {
         st = atlas_json_key_int(ds->j, "units_not_complete",
                                 gen.tu_partial + gen.tu_failed + gen.tu_unsupported, err);
+    }
+
+    /* A9.2.3's coverage manifest. Sent beside the unit counts and never summed
+     * with them: `tu_complete/tu_total` says the compilation database's units
+     * were parsed, and `scope_covered/scope_candidates` says how much of the
+     * repository that was. A surface holding only the first cannot tell the
+     * difference between an index of a whole tree and an index of part of one. */
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "scope_discovery",
+                                atlas_sem_scope_discovery_name(gen.scope_discovery), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "scope_candidates", gen.scope_candidates, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "scope_covered", gen.scope_covered, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "scope_uncovered", gen.scope_uncovered, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(ds->j, "test_scope_known", gen.test_scope_known, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "tu_test", gen.tu_test, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "tu_production", gen.tu_production, err);
     }
 
     if (st == ATLAS_OK) {

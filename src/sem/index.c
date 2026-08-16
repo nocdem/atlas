@@ -229,13 +229,13 @@ static atlas_status load_compdb(int root_fd, const char *root, const char *rel, 
 /* The digest a generation is judged stale against: every database's own digest,
  * in the order the operator named them, domain-separated and length-prefixed for
  * A4's reason. */
-static void digest_all(compdb_slot *slots, size_t n, char out[65]) {
+static void digest_list(const char (*digests)[65], size_t n, char out[65]) {
     atlas_sha256 h;
     atlas_sha256_init(&h);
     static const char DOMAIN[] = "atlas.sem.compdbs.v1";
     unsigned char len[8];
     for (size_t i = 0; i <= n; i++) {
-        const char *s = i == 0 ? DOMAIN : slots[i - 1].digest;
+        const char *s = i == 0 ? DOMAIN : digests[i - 1];
         uint64_t sn = strlen(s);
         for (int b = 0; b < 8; b++) {
             len[b] = (unsigned char)((sn >> (8 * (7 - b))) & 0xffu);
@@ -247,6 +247,113 @@ static void digest_all(compdb_slot *slots, size_t n, char out[65]) {
     atlas_sha256_final(&h, digest);
     atlas_hex_encode(digest, sizeof(digest), out);
     out[ATLAS_SHA256_HEX_LEN] = '\0';
+}
+
+static void digest_all(const compdb_slot *slots, size_t n, char out[65]) {
+    char digests[ATLAS_SEM_MAX_COMPDBS][65];
+    for (size_t i = 0; i < n && i < ATLAS_SEM_MAX_COMPDBS; i++) {
+        (void)snprintf(digests[i], sizeof digests[i], "%s", slots[i].digest);
+    }
+    digest_list((const char (*)[65])digests, n, out);
+}
+
+/* --- A9.2.3: the same digest, from the files as they are now -----------------
+ *
+ * Until A9.2.3 every caller of `atlas_sem_freshness_of` passed NULL for the live
+ * digest, so the branch that reports a changed compilation database was
+ * unreachable. The reason given at the time was that recomputing it would mean
+ * hashing every compilation database on every read, and that a changed one would
+ * be caught by the next index.
+ *
+ * **That reasoning is reversed here, deliberately, and the reversal is what
+ * A9.2.3 needs.** It was sound while rebuilding was something a person did:
+ * "the next index" was a command somebody would run, and the check merely
+ * decided how a status line read. It is not sound once the daemon owns
+ * freshness, because "the next index" is now scheduled by *noticing* — so a
+ * check that never fires is a repository whose build description can change
+ * without anything ever rebuilding it. The dead branch was the whole of §18.
+ *
+ * The cost is real and bounded: one read and one SHA-256 of each declared
+ * database per freshness read, of files an operator named and Atlas already
+ * reads with the same bounded, symlink-refusing open the indexer uses. Nothing
+ * is searched for and nothing outside the root is opened.
+ *
+ * A database that cannot be read now yields an empty digest, and an empty live
+ * digest does not make a generation stale — "Atlas could not look" is not
+ * evidence that the description changed, which is the same asymmetry A9.2.2
+ * applies to absence. It is reported through the ordinary index attempt, where
+ * it is a failure with a reason, rather than through a freshness read that has
+ * nowhere to put it. */
+atlas_status atlas_sem_live_compdb_digest(int root_fd, const char *compdbs, size_t compdbs_len,
+                                          char out[65], atlas_err *err) {
+    out[0] = '\0';
+    if (compdbs == NULL || compdbs_len == 0 || compdbs[0] == '\0') {
+        return ATLAS_OK;
+    }
+    char digests[ATLAS_SEM_MAX_COMPDBS][65];
+    size_t n = 0;
+    const char *p = compdbs;
+    const char *end = compdbs + compdbs_len;
+    while (p < end && *p != '\0') {
+        if (n >= ATLAS_SEM_MAX_COMPDBS) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "more than %d compilation databases were named",
+                                 ATLAS_SEM_MAX_COMPDBS);
+        }
+        atlas_buf data = ATLAS_BUF_INIT;
+        atlas_status st = read_bounded(root_fd, p, ATLAS_CODE_MAX_COMPILE_DB_BYTES, &data, err);
+        if (st != ATLAS_OK) {
+            atlas_buf_free(&data);
+            /* Unreadable now: report the empty digest rather than a different
+             * one. A digest computed from what could be read would differ from
+             * the stored one and report a change that may not have happened. */
+            out[0] = '\0';
+            return st;
+        }
+        atlas_sha256_hex(data.data, data.len, digests[n]);
+        atlas_buf_free(&data);
+        n++;
+        p += strlen(p) + 1;
+    }
+    digest_list((const char (*)[65])digests, n, out);
+    return ATLAS_OK;
+}
+
+atlas_status atlas_sem_repo_compdb_digest(atlas_db *db, atlas_repo_info *repo, char out[65],
+                                          atlas_err *err) {
+    out[0] = '\0';
+    atlas_sem_config cfg;
+    atlas_sem_config_init(&cfg);
+    atlas_status st = atlas_db_sem_config_get(db, repo->id, &cfg, err);
+    if (st != ATLAS_OK || !cfg.present || cfg.compdbs.len == 0) {
+        /* No declared build description, so there is nothing to compare against
+         * and no claim to make. An empty digest never makes a generation stale. */
+        atlas_sem_config_free(&cfg);
+        return st;
+    }
+    atlas_buf list = ATLAS_BUF_INIT;
+    st = atlas_sem_config_unpack(atlas_buf_cstr(&cfg.compdbs), &list, NULL, err);
+    if (st == ATLAS_OK) {
+        /* The registered root, opened without following a symlink on its final
+         * component: a root that has been replaced by a link since registration
+         * refuses the read rather than being followed somewhere else. Every
+         * descent below it is `atlas_path_open_nofollow`, which is the same
+         * discipline the indexer uses. No git process is created — this runs on
+         * a read path, and forking git to hash two files an operator named would
+         * make every status read cost a process. */
+        int fd = open(atlas_buf_cstr(&repo->root_path),
+                      O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (fd < 0) {
+            st = atlas_err_set_errno(err, ATLAS_ERR_REPO, errno,
+                                     "cannot open the registered repository root");
+        } else {
+            st = atlas_sem_live_compdb_digest(fd, (const char *)list.data, list.len, out, err);
+            (void)close(fd);
+        }
+    }
+    atlas_buf_free(&list);
+    atlas_sem_config_free(&cfg);
+    return st;
 }
 
 /* --- applying one unit's facts ---------------------------------------------- */
@@ -546,9 +653,43 @@ atlas_status atlas_sem_index_run(atlas_db *db, int64_t repo_id, const atlas_sem_
                 }
             }
         }
-        /* A unit that vanished from the compilation database also counts as a
-         * change: the previous generation describes something this one would
-         * not, and serving it would report code that is no longer compiled. */
+        /* A9.2.3: the *scope* must be unchanged too, not only the units.
+         *
+         * A repository can gain a `.c` file the compilation database does not
+         * name. Every unit's input digest is then identical, so the unit
+         * comparison above finds nothing — and yet what Atlas may claim has
+         * changed, because the tree now holds a source this index did not read.
+         * Short-circuiting on the units alone would carry the previous
+         * generation's manifest forward unchanged and keep reporting a
+         * `scope_uncovered` measured against a tree that has since grown, which
+         * is precisely the overclaim the manifest exists to end.
+         *
+         * When the scope has moved this is not a no-change run. The generation
+         * that follows reuses every unit — so it costs a copy rather than a
+         * reparse — and seals a manifest measured against the tree as it is. */
+        if (all_same && seen == prev.tu_total) {
+            int64_t cand = 0;
+            int64_t cov = 0;
+            st = atlas_db_sem_scope_counts(db, repo_id, prev.id, &cand, &cov, err);
+            if (st != ATLAS_OK) {
+                goto cleanup;
+            }
+            atlas_index_state fs;
+            atlas_index_state_init(&fs);
+            atlas_status fst = atlas_db_index_state_get(db, repo_id, &fs, err);
+            bool file_current = fst == ATLAS_OK && atlas_index_state_is_current(&fs, NULL);
+            atlas_index_state_free(&fs);
+            if (fst != ATLAS_OK) {
+                st = fst;
+                goto cleanup;
+            }
+            atlas_sem_scope_discovery disc =
+                file_current ? ATLAS_SEM_SCOPE_DECLARED : ATLAS_SEM_SCOPE_UNKNOWN;
+            if (cand != prev.scope_candidates || cov != prev.scope_covered ||
+                disc != prev.scope_discovery) {
+                all_same = false;
+            }
+        }
         if (all_same && seen == prev.tu_total) {
             sum->no_change = true;
             sum->published = true;
@@ -976,9 +1117,66 @@ atlas_status atlas_sem_index_run(atlas_db *db, int64_t repo_id, const atlas_sem_
         gen.include_count = sum->includes;
         gen.duration_ms = sum->duration_ms;
 
-        st = atlas_db_begin(db, err);
+        /* --- A9.2.3: the coverage manifest ---
+         *
+         * `tu_complete == tu_total` says every translation unit the compilation
+         * database named was parsed. It says nothing about whether the
+         * compilation database named every source in the repository — so on its
+         * own it is a statement about the denominator's own contents, and
+         * reading it as coverage was the overclaim this season exists to end.
+         *
+         * The denominator Atlas can state is the one A0/A1 established by
+         * enumerating the tree, and `scope_discovery` records whether that
+         * enumeration was one Atlas can vouch for at this moment. A file index
+         * that is not current has not stopped being an enumeration — it has
+         * stopped being an enumeration of *this* tree, and a candidate count
+         * taken from it would be a denominator for a repository that has moved.
+         * UNKNOWN is then the honest value and it is never sufficient for an
+         * absence.
+         *
+         * Computed here, immediately before the publishing transaction, so the
+         * manifest describes the generation that is about to become current
+         * rather than one measured minutes earlier. */
+        if (st == ATLAS_OK) {
+            atlas_index_state fs;
+            atlas_index_state_init(&fs);
+            atlas_status fst = atlas_db_index_state_get(db, repo_id, &fs, err);
+            bool file_current = fst == ATLAS_OK && atlas_index_state_is_current(&fs, NULL);
+            atlas_index_state_free(&fs);
+            st = fst;
+            if (st == ATLAS_OK) {
+                gen.scope_discovery =
+                    file_current ? ATLAS_SEM_SCOPE_DECLARED : ATLAS_SEM_SCOPE_UNKNOWN;
+                st = atlas_db_sem_scope_counts(db, repo_id, sum->generation_id,
+                                               &gen.scope_candidates, &gen.scope_covered, err);
+            }
+            if (st == ATLAS_OK) {
+                /* Clamped at zero rather than allowed to go negative: a unit
+                 * whose source the file index does not hold — a generated
+                 * source under a build directory, say — is coverage the
+                 * denominator never counted, and it must not make the shortfall
+                 * look smaller than it is. */
+                gen.scope_uncovered = gen.scope_candidates > gen.scope_covered
+                                          ? gen.scope_candidates - gen.scope_covered
+                                          : 0;
+                st = atlas_db_sem_scope_test_split(db, sum->generation_id, opts->test_roots,
+                                                   &gen.tu_test, &gen.tu_production,
+                                                   &gen.test_scope_known, err);
+            }
+        }
+
+        st = st == ATLAS_OK ? atlas_db_begin(db, err) : st;
         if (st == ATLAS_OK) {
             st = atlas_db_sem_publish(db, sum->generation_id, &gen, err);
+        }
+        /* Inside the publishing transaction, so the manifest and the generation
+         * become visible together. Written separately from `publish` only
+         * because `publish` is the compare-and-swap that names the state it
+         * observed and must stay exactly that; a reader can never see a
+         * published generation whose coverage is still zero and read it as
+         * "nothing was covered". */
+        if (st == ATLAS_OK) {
+            st = atlas_db_sem_scope_set(db, sum->generation_id, &gen, err);
         }
         if (st == ATLAS_OK) {
             st = atlas_db_commit(db, err);

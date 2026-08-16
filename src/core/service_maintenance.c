@@ -296,6 +296,17 @@ static const retention_entry RETENTION[] = {
      "indexing, and referenced by nothing authoritative"},
     {"sem_includes", ATLAS_RETAIN_DERIVED, false,
      "the include graph as the preprocessor resolved it; rebuilt by indexing"},
+    /* A9.2.3. CANONICAL rather than DERIVED, and the distinction is the whole
+     * table: every other `sem_` table is rebuilt by indexing, and this one is
+     * what says indexing may run at all. A repository does not record that an
+     * operator authorised a compiler to be run over it, so nothing could rebuild
+     * this row — and an aged-out row would silently stop a repository being
+     * maintained, which looks exactly like a repository nobody ever configured. */
+    {"sem_repo_config", ATLAS_RETAIN_CANONICAL, false,
+     "an operator's semantic build description for one repository — which compilation databases to "
+     "read, which roots are tests, and whether this daemon may rebuild automatically; nothing "
+     "rebuilds it because the repository never held it, and its absence is what keeps a compiler "
+     "from being run on a repository nobody authorised"},
 
     /* --- full-text indexes -------------------------------------------------- */
     {"files_fts", ATLAS_RETAIN_DERIVED, false, "FTS5 index over files; rebuilt from files"},

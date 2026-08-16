@@ -234,6 +234,33 @@ const char *atlas_sem_freshness_name(atlas_sem_freshness f);
 #define ATLAS_SEM_STALE_INCOMPLETE "the_last_generation_did_not_complete"
 bool atlas_sem_stale_reason_is_known(const char *reason);
 
+/* --- A9.2.3: how a generation's scope was discovered -------------------------
+ *
+ * `tu_complete == tu_total` says every translation unit the compilation database
+ * named was parsed. It says nothing about whether the compilation database named
+ * every source in the repository, which is the question a negative conclusion
+ * actually rests on — so until A9.2.3 `198/198` was a statement about the
+ * denominator's own contents, and reading it as coverage was §14's overclaim.
+ *
+ * The denominator Atlas can state is the one A0/A1 established by enumerating
+ * the tree: the source files the *file index* holds. `scope_covered` is how many
+ * of those this generation parsed, and `scope_uncovered` is the only number that
+ * can refuse an absence.
+ *
+ * UNKNOWN is zero, and it is what every generation built before A9.2.3 reads. A
+ * generation that recorded no scope cannot have one reconstructed, and inventing
+ * one would be the exact error the coverage model exists to prevent. */
+typedef enum atlas_sem_scope_discovery {
+    /* Nothing established the candidate set. Never sufficient for an absence. */
+    ATLAS_SEM_SCOPE_UNKNOWN = 0,
+    /* The file index was current when this generation published, so the
+     * enumeration of candidate sources is one Atlas can vouch for. */
+    ATLAS_SEM_SCOPE_DECLARED
+} atlas_sem_scope_discovery;
+
+const char *atlas_sem_scope_discovery_name(atlas_sem_scope_discovery d);
+bool atlas_sem_scope_discovery_parse(const char *name, atlas_sem_scope_discovery *out);
+
 /* --- a generation ------------------------------------------------------------ */
 
 typedef struct atlas_sem_generation {
@@ -262,9 +289,98 @@ typedef struct atlas_sem_generation {
     /* A fixed Atlas string, or "" — never compiler output. */
     char failure_reason[96];
     bool is_current;
+
+    /* --- A9.2.3: the coverage manifest, sealed at publication ---------------
+     *
+     * Reported beside the unit counts and never summed with them: they answer
+     * different questions, and a surface that added them would report a
+     * generation that read four fifths of a repository the way it reports one
+     * that read all of it. */
+    atlas_sem_scope_discovery scope_discovery;
+    int64_t scope_candidates; /* source files the file index holds */
+    int64_t scope_covered;    /* of those, parsed as a translation unit */
+    int64_t scope_uncovered;  /* the difference; non-zero refuses an absence */
+    /* The test/production split, from the operator's declared test roots and
+     * from nothing else. Both zero with `test_scope_known` false means
+     * unclassified, which is a different statement from "no test units" — and
+     * it is the statement that makes "no production caller" unanswerable. */
+    int64_t tu_test;
+    int64_t tu_production;
+    bool test_scope_known;
 } atlas_sem_generation;
 
 void atlas_sem_generation_init(atlas_sem_generation *g);
+
+/* --- A9.2.3: the durable semantic build description --------------------------
+ *
+ * Until A9.2.3 a compilation database reached the indexer only as an argument to
+ * the command that ran it, so nothing durable said which build description a
+ * repository has — and the daemon therefore could not rebuild anything unaided:
+ * it could see that a generation was stale and had no way to know what to read.
+ *
+ * The row is also the **authority opt-in**, and that is not a secondary use.
+ * A8-CI's rule is that indexing runs a compiler over repository source, so it is
+ * an authorised operator action and no model may cause one. Making a repository
+ * change a rebuild trigger would quietly delete that rule for every registered
+ * repository at once. It does not, because `auto_rebuild` is false by default
+ * and only an operator writes the row: absent configuration means this daemon
+ * never runs a compiler for this repository.
+ *
+ * Paths are repository-relative, validated inside the root by the indexer
+ * exactly as `--compdb` is, and **never discovered**: Atlas does not search a
+ * repository for a file that will tell it how to compile things. */
+#define ATLAS_SEM_CONFIG_MAX_BYTES 8192u
+
+typedef struct atlas_sem_config {
+    bool present;
+    int64_t repo_id;
+    char repo_identity_hash[65];
+    bool auto_rebuild;
+    /* Newline-separated, repository-relative. Owned. */
+    atlas_buf compdbs;
+    /* Newline-separated, repository-relative prefixes an operator declares to be
+     * test sources. Owned. Empty is not "there are no tests" — it is "Atlas does
+     * not know which sources are tests", which leaves the tests coverage
+     * dimension UNKNOWN. Atlas guesses at no point: a directory called `tests`
+     * is a directory somebody named. */
+    atlas_buf test_roots;
+    char configured_at[ATLAS_TS_MAX];
+    /* The retry governor's durable half. A further automatic attempt is allowed
+     * only once the source identity has moved past `fail_identity` — never after
+     * an interval, which would retry an unbuildable tree for ever. */
+    int64_t fail_count;
+    char fail_identity[65];
+    char fail_reason[96]; /* a fixed Atlas string, never compiler output */
+    char fail_at[ATLAS_TS_MAX];
+} atlas_sem_config;
+
+void atlas_sem_config_init(atlas_sem_config *c);
+void atlas_sem_config_free(atlas_sem_config *c);
+
+/* Splits a NUL-separated list into the newline-separated storage form, refusing
+ * any element that contains a newline or exceeds the bound.
+ *
+ * A newline in a path is legal on this filesystem and Atlas' rule is that paths
+ * are bytes — so the refusal is deliberate and is the honest trade for a storage
+ * form an operator can read back: a path containing a newline cannot be named as
+ * a compilation database, and it is refused rather than silently truncated at
+ * the newline, which would name a different file. */
+atlas_status atlas_sem_config_pack(const char *const *items, size_t count, atlas_buf *out,
+                                   atlas_err *err);
+/* The inverse: the newline-separated storage form becomes the NUL-separated form
+ * every bounded path list in Atlas is carried in — which is the form
+ * `atlas_sem_index_opts.compdbs` already takes, so the durable configuration
+ * feeds the indexer without a third representation in between. */
+atlas_status atlas_sem_config_unpack(const char *packed, atlas_buf *out, size_t *count_out,
+                                     atlas_err *err);
+
+/* True when `rel` lies under one of the declared test-root prefixes.
+ *
+ * A prefix match on a path *component boundary*, never a substring: `tests` must
+ * not match `tests_helper.c` sitting beside it, which would classify a
+ * production source as a test and make a production-scope absence wrong in the
+ * one direction that matters. */
+bool atlas_sem_path_is_test(const char *packed_roots, const char *rel);
 
 /* --- the configuration digest -------------------------------------------------
  *
@@ -424,6 +540,12 @@ typedef struct atlas_sem_index_opts {
     const char *root; /* canonical repository root, absolute */
     const char *commit_id;
     const char *repo_identity_hash;
+    /* A9.2.3. Newline-separated, repository-relative prefixes an operator
+     * declared to be test sources, or NULL. Used only to classify this
+     * generation's units at publication; it changes nothing about what is
+     * parsed, because excluding tests from the *index* would make a caller in a
+     * test invisible rather than merely labelled. */
+    const char *test_roots;
     int64_t max_units;
     /* Polled between units so a long index can be asked to stop. Returning true
      * fails the generation rather than publishing a partial one. */
@@ -468,6 +590,30 @@ void atlas_sem_index_summary_init(atlas_sem_index_summary *s);
 atlas_status atlas_sem_index_run(atlas_db *db, int64_t repo_id,
                                  const atlas_sem_index_opts *opts,
                                  atlas_sem_index_summary *sum, atlas_err *err);
+
+/* A9.2.3: the compilation-database digest, computed from the files as they are
+ * now rather than as the generation recorded them.
+ *
+ * `compdbs` is the NUL-separated repository-relative list, opened bounded and
+ * without following a symlink from `root_fd`. This is the value
+ * `atlas_sem_freshness_of` compares against a generation's stored
+ * `compdb_digest`, and until A9.2.3 every caller passed NULL for it, which made
+ * that comparison unreachable — see the implementation for why that was
+ * defensible while rebuilding was manual and is not once the daemon owns
+ * freshness.
+ *
+ * An unreadable database yields an empty digest and a non-OK status; an empty
+ * live digest never makes a generation stale, because "Atlas could not look" is
+ * not evidence that the description changed. */
+atlas_status atlas_sem_live_compdb_digest(int root_fd, const char *compdbs, size_t compdbs_len,
+                                          char out[65], atlas_err *err);
+
+/* The same, for a registered repository, reading the databases its durable
+ * build description names. A repository with no description yields an empty
+ * digest and no error: there is nothing declared to compare against, so there is
+ * no claim to make. */
+atlas_status atlas_sem_repo_compdb_digest(atlas_db *db, atlas_repo_info *repo, char out[65],
+                                          atlas_err *err);
 
 /* Freshness of the published generation, recomputed from live facts.
  *

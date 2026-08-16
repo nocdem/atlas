@@ -88,6 +88,69 @@ atlas_status atlas_db_sem_prune_generations(atlas_db *db, int64_t repo_id, int64
  * transaction, because `repositories.id` is a reused rowid. */
 atlas_status atlas_db_sem_forget_repo(atlas_db *db, int64_t repo_id, atlas_err *err);
 
+/* --- A9.2.3: the durable build description ----------------------------------
+ *
+ * Reads leave `present` false when no operator has configured this repository,
+ * which is the default and means this daemon never runs a compiler for it. */
+atlas_status atlas_db_sem_config_get(atlas_db *db, int64_t repo_id, atlas_sem_config *out,
+                                     atlas_err *err);
+
+/* Writes the operator's build description. The retry-governor columns are not
+ * touched here: configuring a repository is not a claim that a previous failure
+ * is resolved, and a write that cleared the record would let an operator turn a
+ * deterministic failure back into a spin by re-running one command. Changing the
+ * description does move the source identity, which is what legitimately makes
+ * the next attempt eligible. */
+atlas_status atlas_db_sem_config_set(atlas_db *db, const atlas_sem_config *c, atlas_err *err);
+
+/* Records the outcome of an *automatic* attempt against the source identity it
+ * was made at. Success clears the record; a failure stores the identity, so a
+ * further attempt is allowed only once the identity has moved. */
+atlas_status atlas_db_sem_config_record_attempt(atlas_db *db, int64_t repo_id,
+                                                const char *source_identity, bool ok,
+                                                const char *why, atlas_err *err);
+
+/* Every repository with a build description, for the daemon's scheduler.
+ * Bounded by `max`; a truncated list is reported rather than silently shortened,
+ * because a repository dropped from a scheduling sweep is one that never
+ * rebuilds and nothing would say so. */
+atlas_status atlas_db_sem_config_repos(atlas_db *db, int64_t *out, size_t max, size_t *count_out,
+                                       bool *truncated_out, atlas_err *err);
+
+/* Clears the soft `repo_id` reference for the same reason the generations do. */
+atlas_status atlas_db_sem_config_forget_repo(atlas_db *db, int64_t repo_id, atlas_err *err);
+
+/* --- A9.2.3: the coverage manifest ------------------------------------------
+ *
+ * Counts the candidate source files the *file index* holds for this repository
+ * and how many of them this generation parsed as a translation unit. The
+ * denominator is the file index's enumeration of the tree, never the compilation
+ * database's own contents — which is the whole point: a compilation database
+ * that names two of three sources reports `2/2` units and `2/3` scope, and only
+ * the second number can refuse an absence.
+ *
+ * Read once, at publication, over generation-scoped indexes — the shape
+ * `atlas_db_sem_generation_counts` uses and for its reason. */
+atlas_status atlas_db_sem_scope_counts(atlas_db *db, int64_t repo_id, int64_t generation_id,
+                                       int64_t *candidates_out, int64_t *covered_out,
+                                       atlas_err *err);
+
+/* Classifies this generation's units against the operator's declared test roots.
+ * With no roots declared both counts are zero and `known_out` is false, which is
+ * "Atlas does not know which sources are tests" and is a different statement
+ * from "there are no test units". */
+atlas_status atlas_db_sem_scope_test_split(atlas_db *db, int64_t generation_id,
+                                           const char *packed_test_roots, int64_t *test_out,
+                                           int64_t *production_out, bool *known_out,
+                                           atlas_err *err);
+
+/* Writes the manifest into the generation row. Called inside the publishing
+ * transaction, so the manifest and the generation become visible together: a
+ * reader must never see a published generation whose coverage is still zero and
+ * read it as "nothing was covered". */
+atlas_status atlas_db_sem_scope_set(atlas_db *db, int64_t generation_id,
+                                    const atlas_sem_generation *m, atlas_err *err);
+
 /* --- writing a generation's contents ---------------------------------------- */
 
 atlas_status atlas_db_sem_compdb_add(atlas_db *db, int64_t generation_id, const char *path_text,

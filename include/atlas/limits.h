@@ -568,6 +568,62 @@
  * reported. */
 #define ATLAS_SEM_SWEEP_MAX_REPOS 256
 
+/* --- A9.2.4: build-input discovery ------------------------------------------
+ *
+ * A9.2.3 stated that compilation databases are *named, never discovered*, and
+ * A9.2.4 reverses that. The refusal is replaced by a bounded search universe,
+ * and these constants are what bounds it. Every one of them is **reported when
+ * it is reached**, because a walk that stopped early and said nothing would be
+ * indistinguishable from a repository that has no further build description —
+ * which is the exact confusion this season exists to end.
+ *
+ * How often the daemon re-walks a repository looking for compilation databases.
+ *
+ * Far slower than `ATLAS_SEM_SWEEP_INTERVAL_MS` on purpose, and the asymmetry is
+ * the design rather than a compromise. The sweep asks a question answered from
+ * the index and from a handful of file digests; discovery walks a directory
+ * tree, which is the one expensive thing in this layer. Splitting them is what
+ * lets an *edited* compilation database move the source identity immediately —
+ * its content is digested on every identity computation — while a *newly
+ * created* one is noticed at the next discovery pass. That is convergence, not
+ * correctness: nothing is ever wrong in between, only later. */
+#define ATLAS_SEM_DISCOVERY_INTERVAL_MS 300000
+
+/* Directory depth below the repository root the walk will descend.
+ *
+ * A build tree is shallow — `build/`, `out/x86_64/`, `cmake-build-debug/` — and a
+ * ceiling this generous covers every layout anybody writes while refusing a
+ * pathological tree the cost of an unbounded descent. Reached ⇒ PARTIAL. */
+#define ATLAS_SEM_DISCOVERY_MAX_DEPTH 12
+
+/* Directory entries the walk will read in total across the whole repository.
+ *
+ * The bound that actually protects the daemon: depth alone does not, because a
+ * wide tree is expensive at depth one. Reached ⇒ PARTIAL. */
+#define ATLAS_SEM_DISCOVERY_MAX_ENTRIES 400000
+
+/* Candidate compilation databases one repository may hold.
+ *
+ * Distinct from `ATLAS_SEM_MAX_COMPDBS`, which bounds how many are *accepted*
+ * into a generation: a candidate that is rejected still costs a row and still
+ * has to be shown, so the candidate ceiling is the larger of the two. Reached ⇒
+ * PARTIAL. */
+#define ATLAS_SEM_DISCOVERY_MAX_CANDIDATES 128
+
+/* Operator-declared exclusion prefixes, and vendor prefixes, per repository.
+ * Bounded for the reason every stored list in Atlas is: a durable value an
+ * operator reads back should not be able to grow without a stated ceiling. */
+#define ATLAS_SEM_DISCOVERY_MAX_EXCLUDES 64
+
+/* Bytes of one candidate's repository-relative path, `%XX`-encoded.
+ *
+ * Encoding can triple a path made entirely of bytes that need escaping, so this
+ * is the encoded length rather than the raw one — a bound stated about the wrong
+ * representation is a bound that does not hold. A candidate whose path does not
+ * fit is *not* silently dropped: it makes the walk PARTIAL, because a path Atlas
+ * could not name is a part of the universe it cannot account for. */
+#define ATLAS_SEM_MAX_PATH_BYTES 1024u
+
 /* --- long-running daemon operations ----------------------------------------
  *
  * Operation records the daemon keeps in memory, oldest evicted first.

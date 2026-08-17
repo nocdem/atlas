@@ -1,0 +1,357 @@
+# Atlas — extension checklists
+
+One checklist per extensible vocabulary, table, method table or bound. They were
+in `CLAUDE.md` until A9.2.4 moved them; see `docs/engineering-rules.md` for why.
+
+Each list exists because the thing it describes is edited in more places than
+anybody remembers, and the failure mode of missing one is almost never a build
+error. It is a value that silently reads as its zero, a socket path and a local
+path that quietly disagree, a test that stops being in the subset people run, or
+a command that is fully wired and answers `unknown command`. Every entry below
+was written after one of those actually happened.
+
+The rule underneath all of them: **when you add a member to a closed vocabulary,
+find every place that switches on it, and every place that stores it.** The
+compiler finds the first kind and not the second.
+
+## Extending A8-CI safely
+
+- **A new evidence class** means editing `atlas_sem_evidence`, `strength()` in
+  `src/sem/sem.c`, `atlas_sem_evidence_weaker`, every CHECK naming the class in
+  migration 11, and the enumerated expectations in `tests/test_sem.c`. Keep
+  UNKNOWN at zero.
+- **A new edge kind** means a member, a name, a row in
+  `atlas_sem_edge_kind_max_evidence` stating the strongest class it may carry,
+  and the CHECK on `sem_edges.kind`. A kind whose ceiling is not stated cannot
+  be written.
+- **A new fact the parser emits** changes what identical bytes produce, so bump
+  `ATLAS_SEM_ANALYZER_VERSION`. The next pass then rebuilds and the graph is
+  reported stale until it does.
+- **A new bound** goes in `include/atlas/limits.h` under the A8-CI section with
+  a written reason, and is reported when reached. A bound that silently trims a
+  result is the one thing this layer must never have.
+- **A new RPC method** goes in `SEM_METHODS[]` and must be a read. If it is
+  plausibly a mutation verb, add its name to the negative enumeration in
+  `tests/test_orch_rpc.c`. A method that *mutates* goes in the operator-uid
+  table instead, and which table it goes in is the security decision.
+- **A new MCP tool** follows the A2 rule and changes the pinned count in
+  `tests/test_plugin.c`. It must not be able to build or invalidate an index.
+
+## Extending A9.2.3 safely
+
+- **A new semantic activity state** means a member of `atlas_sem_activity`, a
+  case in `atlas_sem_activity_name`, the parse table in `read_sem_plan`
+  (`service_remote.c`), both renderers, the Mission Control row, and the table in
+  `docs/semantic-freshness.md`. Keep UNKNOWN at zero, and decide explicitly
+  whether `should_build` may be true in it.
+- **A new hold reason** means a `ATLAS_SEM_HOLD_*` literal, a row in the table in
+  `atlas_sem_hold_intern`, and one written sentence of meaning. A value that
+  arrives over a socket is a *matching* string and must be interned to Atlas' own
+  literal before it reaches an operator or a model.
+- **A new staleness reason** means an `ATLAS_SEM_STALE_*` literal, a row in
+  `atlas_sem_stale_reason_intern`, and a branch in `atlas_sem_freshness_of`
+  placed deliberately: the order is the order an operator wants to be told, and
+  the broadest check goes last so a repository is told *why* in the most useful
+  terms available.
+- **A new input to the source identity** changes what every stored identity
+  means, so it invalidates every generation's freshness comparison at once. Bump
+  the domain string in `atlas_sem_source_identity`, and add a row to the table in
+  `docs/semantic-freshness.md` with a reason.
+- **A new coverage manifest field** goes on `atlas_sem_generation`, in migration
+  N with its vocabulary's zero as the default, in `GEN_COLUMNS` and
+  `read_generation`, in `atlas_db_sem_scope_set`, on the wire in
+  `server_sem.c`, **read back** in `service_remote.c`, and in both renderers.
+  Missing the read-back is how the socket path and the local path start
+  disagreeing.
+- **A new coverage dimension's source** — deciding whether it follows the units
+  or the scope manifest — needs the argument in `sem_coverage`. "It is more
+  conservative" is not one on its own: a gate applied where it does not belong
+  makes Atlas uselessly cautious rather than correctly cautious, and the
+  asymmetry rule exists because that is a real failure mode.
+- **A new field on the build description** means a column in migration N, the
+  struct, `atlas_db_sem_config_get`/`_set`, the job payload, the CLI flag, the
+  RPC parameter and the negative enumeration if it is plausibly an authority
+  verb. Decide whether an absent value means "leave alone" or "clear" and make
+  the two expressible separately.
+
+## Extending A9.2.2 safely
+
+- **A new verifier** additionally needs a row in
+  `atlas_verify_verifier_truth_of_check` and one in
+  `atlas_verify_verifier_absence_dims`. `tests/test_verify_absence.c` fails a
+  verifier that can conclude ABSENT while declaring no dimension, and one whose
+  PASS and FAIL mean the same thing.
+- **A new coverage dimension** means a member, a row in `COVERAGE_DIMS[]` with
+  its name and the truth reason its insufficiency implies, a wider
+  `ATLAS_VERIFY_COVERAGE_DIMS` — a static assertion refuses otherwise — and a
+  decision for every verifier about whether its negative depends on it.
+- **A new truth value** means editing the enum,
+  `atlas_verify_truth_is_established`, `_contradicts`, `_change_of`, the CHECKs on
+  `verify_results.truth` and `verify_outcomes.prior_truth` — so a **migration** —
+  and the enumerations in `tests/test_verify_absence.c`. Keep UNKNOWN at zero.
+- **A new field on the assessment** goes in
+  `atlas_service_verify_write_assessment` **and** is read back in
+  `service_remote.c`, and is rendered by both renderers. Missing the read-back is
+  how the socket path and the local path start disagreeing.
+
+## Extending A9.2.1 safely
+
+- **A new MCP verification tool** states its scope in `tool_def`, keeps the
+  authority-verb ban, and changes the pinned count in `tests/test_plugin.c`. If it
+  writes, it maps to `ATLAS_SCOPE_MEMORY_WRITE`, which no credential can hold.
+- **A new gateway route** must be a read, for the reason above. A mutating one
+  needs an argument that survives the "leaked bearer token" test, and intake has
+  not survived it.
+- **A new field on the readable detail** goes in `atlas_verify_evidence_detail` or
+  `atlas_verify_attestation_detail`, is written by
+  `atlas_service_verify_write_detail`, is read back by `read_detail` in
+  `service_remote.c`, and is rendered by both renderers. Missing the read-back is
+  how the socket path and the local path start disagreeing.
+
+## Extending A9.2 safely
+
+- **A new deterministic verifier** means a member of `atlas_verify_verifier`, a
+  row in `VERIFIERS[]` with a written description, a case in
+  `atlas_verify_run_verifier`, a scope sentence in `scope_of`, and — the part
+  that is not optional — a written argument that it is a **read**.
+- **A new basis** means editing `atlas_verify_basis_writable`,
+  `atlas_verify_basis_requires_calibration` and
+  `atlas_verify_basis_may_verify_semantics`, plus the CHECK on
+  `verify_results.basis`. Deciding whether it requires calibration is the whole
+  point of adding it. Keep UNKNOWN at zero and unwritable.
+- **A new reason** means a member and a row in `REASONS[]` carrying its name, the
+  verdict it implies on its own, and one written sentence of meaning. A6's
+  arrangement: the verdict follows from the reason rather than being chosen
+  beside it.
+- **A new evidence class** means a member, a name, a row in
+  `atlas_verify_evidence_family_of`, the CHECK on `verify_evidence.class`, and a
+  decision about whether it may be a root. Bump `ATLAS_VERIFY_FAMILY_VERSION`
+  when the map changes, so stored results are not reinterpreted.
+- **A change to the aggregation** means a new `ATLAS_VERIFY_ALGORITHM` string,
+  because a stored result records the algorithm that produced it and a future
+  version must not silently reinterpret a past one. Same for
+  `ATLAS_VERIFY_PRIOR_VERSION`.
+- **A new policy key** means a branch in `atlas_verifypolicy_parse_buffer`, a
+  field, a documented line in `deploy/a92/verification.conf.template`, and a case
+  in the malformed matrix. An unknown key stays an error.
+- **A new struct field on `atlas_migration`** means auditing every construction
+  site: `tests/test_db.c` built two of them field by field and silently stopped
+  being complete when A9.1 added `foreign_keys_off`, which UBSan reported only
+  once A9.2's schema bump changed the stack layout. Zero first, assign after.
+
+## Extending A9.1 safely
+
+- **A new knowledge kind** means a member of `atlas_decision_kind`, a row in
+  `KINDS[]` carrying its name, whether it is resolvable and one written sentence of
+  meaning, a wider `ATLAS_DECISION_KIND_MAX` (a static assertion in
+  `src/decision/decision.c` refuses otherwise), the string in
+  `atlas_decision_kind_list`, the CHECK on `decision_documents.kind` — which means a
+  **migration**, because SQLite cannot widen a CHECK in place — the `KIND_ENUM[]`
+  schema list and the `<select>` in `mission-control.html`, the table in
+  `docs/decision-lifecycle.md`, and the enumerated expectations in
+  `tests/test_decision_kind.c` and `tests/test_decision_model.c`. Keep DECISION at
+  zero.
+- **A new lifecycle state** is A4's checklist plus this one: the precedence in
+  `recompute_status` and in `atlas_db_decision_verify` must be edited together, and
+  the 25-pair enumeration in `tests/test_decision_model.c` grows by a row and a
+  column.
+- **A new migration that rebuilds a table** decides `foreign_keys_off` deliberately
+  and states why in the row. If any child declares `ON DELETE CASCADE`, the flag is
+  required and the rebuild must verify its own row counts before committing.
+- **A new envelope field** goes in the `KEYS` list in `tests/test_ai_trust.c`, which
+  A9.1 widened from line prefixes to every `key=` on a line — appending a field to a
+  line somebody already listed used to pass unnoticed.
+
+## Extending A9 safely
+
+- **A new scope** means a member of `atlas_apikey_scope`, a row in `SCOPES[]`
+  stating whether an operator may grant it, the table in
+  `docs/remote-access.md`, and a decision about every existing tool. Keep
+  UNKNOWN at zero.
+- **A new MCP tool** must state its scope in `tool_def`; the initialiser does
+  not compile without one. A write tool maps to `ATLAS_SCOPE_MEMORY_WRITE`.
+- **A new API route** is a row in `API_ROUTES[]` naming its daemon method, its
+  scope and the parameters it forwards. It must be a read. A route that mutates
+  needs a write scope no A9 credential can hold, which is the argument it has to
+  survive.
+- **A new gateway policy key** means a branch in `atlas_gwpolicy_parse_buffer`,
+  a field, a documented line in `deploy/a9/gateway.conf.template`, and a case in
+  the malformed matrix in `tests/test_gateway.c`. An unknown key stays an error,
+  and a ceiling may only lower the compiled-in bound.
+- **A new response header** goes in `atlas_http_write_head`, which is the one
+  writer, so no route can invent a header set or forget the security ones.
+
+## Extending A8 safely
+
+- **A new state** means editing `atlas_orch_state`, both schema CHECKs,
+  `atlas_orch_transition_allowed`, and the enumerated table in
+  `tests/test_orch_model.c`, which checks all 144 pairs. The transition table is
+  a *function* precisely so a test cannot pass by agreeing with a second copy.
+- **A new RPC method** goes in one of the two tables in `server_orch.c`, and
+  which table is the security decision. If it is plausibly an authority or
+  mutation verb, add its name to the negative enumeration in
+  `tests/test_orch_rpc.c`.
+- **A new field in the job digest** changes what every stored `spec_digest`
+  means, so it invalidates every idempotency record. Bump
+  `ATLAS_ORCH_SPEC_DOMAIN`, and add a row to the table in
+  `docs/orchestration.md` with a reason.
+- **A new policy key** means a branch in `atlas_orchpolicy_load_at`, a field, a
+  documented line, and a malformed-matrix case. An unknown key stays an error.
+
+## Extending A7.1 safely
+
+- **A new policy key** means a branch in `atlas_syspolicy_load_at`, a field, a
+  line in `deploy/a71/system.conf.template` explaining it, and a case in the
+  malformed matrix in `scripts/a71-verify.sh`. An unknown key must stay an
+  error.
+- **A new client identity** is a `client_uid` line an operator adds. Never a
+  group check in C, never a name lookup at accept time, and never a role
+  supplied by the client.
+- **A new writable path for the service** means an argued edit to
+  `ReadWritePaths` in `deploy/a71/atlas.service`. The plugin, both home
+  directories, the backups, the binary, the policies and every indexed
+  repository must stay out of it — that absence is ATLAS-A7-006's fix.
+
+## Extending A7 safely
+
+- **A new guarded operation** means a member of `atlas_authority_op`, a case in
+  `atlas_authority_op_name`, a call at the CLI entry point, and — the part that
+  is not optional — a written argument that refusing it stops something a shell
+  builtin does not already do. Without that argument it is theatre.
+- **A new authority reason** means a member of `atlas_authority_reason`, a name,
+  a one-sentence explanation that says what would change it, and a case in
+  `test_no_unprivileged_shape_grants_authority`. Keep UNKNOWN at zero.
+- **A new RPC method** must be a read. If it is plausibly an authority verb, add
+  its name to the negative enumeration in `tests/test_a7_authority.c` so the
+  list keeps pace with the vocabulary.
+
+## Extending A6 safely
+
+- **A new reason code** means a member of `atlas_gate_reason`, a row in
+  `REASONS[]` in `src/gate/gate.c` carrying its name *and* the freshness it
+  implies, a row in the table in `docs/impact-gates.md`, and nothing else — the
+  verdict follows from the reason rather than being chosen beside it. A member
+  with no row falls through to the placeholder name and
+  `tests/test_gate_model.c` fails on it.
+- **A new freshness value** means editing `atlas_gate_freshness`, `strength()`
+  in `src/gate/gate.c`, `atlas_gate_fold`, the CHECK on
+  `decision_validations.prior_freshness` and the challenge's, and the enumerated
+  table in `tests/test_gate_model.c`. Keep UNKNOWN at zero.
+- **A new bound** goes in `include/atlas/limits.h` under the A6 section with a
+  written reason, is reported through `limit_reached` and `limit_detail`, and
+  notes `TRAVERSAL_LIMIT`. A bound that silently trims a result is the one thing
+  A6 must never have.
+- **A new field in the evidence digest** changes what every stored
+  `evidence_digest` means, so it invalidates every outstanding capability and
+  every revalidation baseline. Bump `ATLAS_GATE_EVIDENCE_DOMAIN` when it
+  changes.
+- **A new A6 RPC method** must be a read, and adding a mutating one deletes the
+  phase's guarantee. `tests/test_gate_trust.c` asks a live daemon for the names
+  such a method would plausibly have; add the new name there if you add a read,
+  so the negative list keeps pace.
+
+## Extending A5 safely
+
+- **A new verification check** goes in `atlas_db_backup_inspect`, before the
+  checks that read rows, and gets its own verdict only if an operator would act
+  differently on it. Add the case to `tests/test_backup.c`; if the check cannot
+  detect something a reader would assume it detects, say so in
+  `docs/operations.md` and add the assertion that it is *not* detected.
+- **A new prunable table** means a row in `RETENTION[]` with `prunable = true`,
+  an eligibility predicate whose count and delete select the same set, and an
+  argument that survives being read back: what holds a rowid into it, what
+  cursor points at it, and what is lost that cannot be rebuilt. It also fails
+  `test_exactly_one_table_is_prunable` until somebody updates it deliberately,
+  which is the point.
+- **A new backup field** is reported, never stored: A5 adds no migration and the
+  schema stays 6. Do not bump it to record a timestamp that can be observed from
+  outside the database.
+- **A new fault point** is a string in `fault()` and a case in
+  `test_every_injected_failure_leaves_the_original_untouched`. It must abort,
+  never weaken.
+
+## Extending A4 safely
+
+- **A new lifecycle state** means editing `atlas_decision_state`, the schema
+  CHECKs on `decision_revisions.state`, `decision_documents.current_status` and
+  `decision_events.event`, `atlas_decision_transition_allowed`, the replay in
+  `atlas_db_decision_verify`, `recompute_status()`, and the enumerated table in
+  `tests/test_decision_model.c`. The transition table is a *function* precisely
+  so a test cannot pass by agreeing with a second copy of the rules.
+- **A new operation that must be atomic with something else** uses
+  `atlas_decision_apply_in_tx` and owns the transaction itself.
+  `atlas_decision_apply` is begin + that + commit; calling it from inside
+  another transaction would nest, and its rollback would discard the caller's
+  work. **Never add a second `atlas_db_begin` inside `apply_in_tx`** — a stray
+  one made `decision propose` report success and write nothing, because the
+  nested commit only decremented the depth counter.
+- **A new writer payload** goes in `atlas_decision_op`, is freed in
+  `atlas_decision_op_free`, is copied field by field in
+  `atlas_writer_decision`'s result block, and is serialised in `op_to_params`
+  for the daemon path. The service layer routes a write locally when this
+  process holds the lock and over the socket when it does not; both must carry
+  it or the two paths behave differently.
+- **A new RPC method** goes in `DECISION_METHODS[]` in `server_decision.c`.
+  Decide explicitly whether it consumes a capability, and if it does, add it to
+  `atlas_decision_op_needs_challenge` — that function is asked by
+  `atlas_decision_apply` itself, so a new kind cannot default into the
+  unauthenticated set.
+- **A new MCP tool** follows the A2 rule, plus: it must not accept a capability
+  argument, and adding it changes the pinned count in `tests/test_plugin.c`.
+- **A new renderer field** carrying decision prose is already safe-encoded by
+  the service layer — do not encode again — and both renderers say so at the
+  top. Anything copied out of a result struct must be copied, not aliased:
+  row callbacks hand out borrowed pointers.
+- **A new envelope line** must be added to the `KEYS` list in
+  `tests/test_ai_trust.c`. That list is the envelope's closed vocabulary and has
+  now caught two phases in a row.
+- **A new claim about approval** goes through the tripwire in
+  `tests/test_decision_mcp.c`: the forbidden-phrase list and the
+  required-wording list are both there, and both are the point.
+
+## Extending A9.2.4 safely
+
+- **A new discovery state** means a member of `atlas_sem_discovery`, a case in
+  `atlas_sem_discovery_name` and `_parse`, a wider CHECK on
+  `sem_repo_config.discovery_state` **and** `sem_generations.discovery` — which
+  means a **migration**, because SQLite cannot widen a CHECK in place — the fold
+  in `coverage_is_complete`, the mapping in `sem_coverage`
+  (`src/verify/detverify.c`), both renderers, the Mission Control row, and the
+  table in `docs/semantic-discovery.md`. Keep UNKNOWN at zero, and decide
+  explicitly whether an absence may rest on it.
+- **A new rejection reason** means an `ATLAS_SEM_REJECT_*` literal, a row in the
+  table in `atlas_sem_reject_intern`, a row in the table in
+  `docs/semantic-discovery.md`, and one written sentence of meaning. A value that
+  arrives over a socket is a *matching* string and must be interned to Atlas' own
+  literal before it reaches an operator or a model.
+- **A new discovery bound** goes in `include/atlas/limits.h` under the A9.2.4
+  section with a written reason, is reported through `note_limit`, and makes the
+  search PARTIAL when it is reached. A bound that silently trims a search is the
+  one thing this layer must never have — a smaller search that says nothing is
+  indistinguishable from a repository with nothing more to find.
+- **A new input to the discovery identity** changes what every stored identity
+  means, so bump `ATLAS_SEM_DISCOVERY_DOMAIN` *and* the domain string in
+  `atlas_sem_source_identity`, and add a row to the table in
+  `docs/semantic-discovery.md`.
+- **A new activation intent or provenance value** means a member, a name, a
+  parse, a wider CHECK on `sem_repo_config.auto_intent` / `auto_intent_by` — a
+  **migration** — a case in `atlas_sem_auto_effective`, and a decision about what
+  a migrated row becomes. Keep UNSET and DEFAULT at zero, and never let a
+  migration invent an intent nobody expressed.
+- **A new `sem-config` field** means a column in migration N, a field on
+  `atlas_sem_config`, `atlas_db_sem_config_get`/`_set`, a field on
+  `atlas_sem_config_job` **and** `atlas_sem_config_request`, the CLI flag and its
+  `--no-` clearing spelling, the RPC parameter in `server_backup.c`, the wire
+  shape in `server_sem.c`, the **read-back** in `service_remote.c`, both
+  renderers, and the negative enumeration in `tests/test_orch_rpc.c` if it is
+  plausibly an authority verb. Decide whether an absent value means "leave alone"
+  or "clear" and make the two expressible separately.
+- **A new coverage dimension** follows the A9.2.2 checklist above, and
+  additionally needs a decision, per verifier, about whether its *negative*
+  depends on the new dimension. "It is more conservative" is not an argument on
+  its own: a gate applied where it does not belong makes Atlas uselessly cautious
+  rather than correctly cautious.
+- **A new syspolicy key** means a branch in `atlas_syspolicy_parse_buffer`, a
+  field, a documented line in `deploy/a71/system.conf.template`, and a case in
+  the malformed matrix. An unknown key stays an error, and an unrecognised
+  *value* is malformed rather than silently taken as one of the known ones.

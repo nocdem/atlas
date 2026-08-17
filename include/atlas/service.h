@@ -1287,6 +1287,22 @@ typedef struct atlas_sem_status_report {
      * still encoded at the point of output like every other path. */
     atlas_buf compdbs;
     atlas_buf test_roots;
+
+    /* --- A9.2.4 -------------------------------------------------------------
+     *
+     * The rest of the build description, and what discovery actually found.
+     *
+     * The candidate list carries **rejected** candidates as well as accepted
+     * ones, with the reason for each. That is the difference between a status
+     * that says "two build inputs" and one that says "two accepted, one refused
+     * because it is a symlink, one because it does not parse" — and the second
+     * is what somebody debugging a coverage gap needs. A rejected candidate
+     * nobody is shown is indistinguishable from a candidate that does not
+     * exist. */
+    atlas_buf excludes;
+    atlas_buf vendor_roots;
+    struct atlas_sem_input *inputs; /* owned; ATLAS_SEM_DISCOVERY_MAX_CANDIDATES */
+    size_t input_count;
 } atlas_sem_status_report;
 
 void atlas_sem_status_report_init(atlas_sem_status_report *r);
@@ -1419,11 +1435,38 @@ atlas_status atlas_service_sem_index_remote(const char *name, const char *const 
  * function must not need a repository on disk to record an operator's
  * intention — a description can legitimately be written before the tree it
  * describes has been built. */
-atlas_status atlas_service_sem_config_set(atlas_ctx *ctx, const char *name,
-                                          const char *const *compdbs, size_t compdb_count,
-                                          const char *const *test_roots, size_t test_root_count,
-                                          int auto_rebuild, atlas_sem_status_report *out,
-                                          atlas_err *err);
+/* A9.2.4. One build-description write, in the caller's array form.
+ *
+ * A struct rather than a widening parameter list, because the season adds four
+ * more optional lists and two more tri-states and a nine-argument function whose
+ * arguments are all `const char *const *` and `size_t` is one somebody will
+ * eventually mis-order silently.
+ *
+ * Every list follows the same rule: NULL leaves the stored value alone, and a
+ * non-NULL pointer with a zero count clears it. An operator adjusting their test
+ * roots must not silently drop their exclusions, and vice versa. Every tri-state
+ * follows the same rule too: negative leaves it alone. */
+typedef struct atlas_sem_config_request {
+    const char *name;
+    const char *const *compdbs;
+    size_t compdb_count;
+    const char *const *test_roots;
+    size_t test_root_count;
+    const char *const *excludes;
+    size_t exclude_count;
+    const char *const *vendor_roots;
+    size_t vendor_root_count;
+    /* Negative leaves the stored intent alone; zero records an operator's
+     * explicit DISABLED; positive records an operator's explicit ENABLED. Both
+     * non-negative values also record OPERATOR provenance, which is what makes
+     * a deliberate refusal distinguishable from a migrated default for ever. */
+    int auto_rebuild;
+    /* Negative leaves it alone; zero is AUTOMATIC; positive is MANUAL. */
+    int discovery_mode;
+} atlas_sem_config_request;
+
+atlas_status atlas_service_sem_config_set(atlas_ctx *ctx, const atlas_sem_config_request *req,
+                                          atlas_sem_status_report *out, atlas_err *err);
 
 /* One build-description write, in the storage form.
  *
@@ -1439,8 +1482,17 @@ typedef struct atlas_sem_config_job {
     size_t compdbs_len;
     const char *test_roots;
     size_t test_roots_len;
-    /* Negative leaves the stored value alone, zero disables, positive enables. */
+    /* A9.2.4. The same rule, for the two lists that bound the search universe. */
+    const char *excludes;
+    size_t excludes_len;
+    const char *vendor_roots;
+    size_t vendor_roots_len;
+    /* Negative leaves the stored value alone, zero disables, positive enables.
+     * A9.2.4: a non-negative value records an *operator* intent with OPERATOR
+     * provenance, which is what a machine-wide default can never overrule. */
     int auto_rebuild;
+    /* Negative leaves it alone; zero is AUTOMATIC; positive is MANUAL. */
+    int discovery_mode;
 } atlas_sem_config_job;
 
 /* The raw-handle cores, for the reason `atlas_sem_index_on` and
@@ -1456,10 +1508,7 @@ atlas_status atlas_sem_status_on(atlas_db *db, const char *name, atlas_sem_statu
  * `ctx != NULL`: with a daemon running, a context in AUTO mode still opens
  * read-only, so the weaker test fails with "attempt to write a readonly
  * database" — the A9.2.1 defect, and it is not repeated. */
-atlas_status atlas_service_sem_config_set_remote(const char *name, const char *const *compdbs,
-                                                 size_t compdb_count,
-                                                 const char *const *test_roots,
-                                                 size_t test_root_count, int auto_rebuild,
+atlas_status atlas_service_sem_config_set_remote(const atlas_sem_config_request *req,
                                                  atlas_sem_status_report *out, atlas_err *err);
 
 /* The daemon-served forms. Same reports, same renderers; only the transport

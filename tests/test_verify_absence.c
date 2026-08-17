@@ -146,7 +146,16 @@ static int64_t seed_generation(env *e, bool complete, const char *commit, atlas_
      *
      * `source_identity` is deliberately left empty: an empty stored identity
      * never makes a generation stale, which is exactly how a pre-A9.2.3 row
-     * behaves, and the fixture has no working tree to compute one from. */
+     * behaves, and the fixture has no working tree to compute one from.
+     *
+     * A9.2.4 adds a fourth, and it is the one underneath the other three:
+     * `discovery`. Complete processing of the configured inputs does not prove
+     * complete discovery of the relevant inputs, so a generation whose walk
+     * Atlas cannot vouch for supports no absence — which is right, and which
+     * means a fixture asking about ABSENT has to state that the walk was
+     * complete. It is set from `complete` for the same reason the unit counts
+     * are: the fixture's one knob is whether this generation is good enough to
+     * answer a negative question from. */
     EXEC(e, err,
              "INSERT INTO repo_index_state(repo_id, generation, last_complete_generation,"
              "  last_reconcile_at, last_complete_at, event_gap, pending_full_reconcile)"
@@ -158,12 +167,13 @@ static int64_t seed_generation(env *e, bool complete, const char *commit, atlas_
              "INSERT INTO sem_generations(repo_id, commit_id, status, started_at, completed_at,"
              "  tu_total, tu_complete, tu_partial, tu_failed, tu_unsupported,"
              "  analyzer_id, analyzer_version,"
-             "  scope_discovery, scope_candidates, scope_covered, scope_uncovered)"
+             "  scope_discovery, scope_candidates, scope_covered, scope_uncovered,"
+             "  discovery, input_count)"
              "  VALUES(%lld, '%s', 'COMPLETE', '2026-01-01T00:00:00Z', '2026-01-01T00:01:00Z',"
-             "         2, %d, 0, %d, 0, '%s', %d, 'DECLARED', 2, %d, %d);",
+             "         2, %d, 0, %d, 0, '%s', %d, 'DECLARED', 2, %d, %d, '%s', 1);",
              (long long)e->repo_id, commit, complete ? 2 : 1, complete ? 0 : 1,
              ATLAS_SEM_ANALYZER_ID, (int)ATLAS_SEM_ANALYZER_VERSION, complete ? 2 : 1,
-             complete ? 0 : 1);
+             complete ? 0 : 1, complete ? "COMPLETE" : "PARTIAL");
     int64_t gen = last_id(e, "sem_generations", err);
     EXEC(e, err,
              "INSERT INTO sem_current(repo_id, generation_id) VALUES(%lld, %lld)"
@@ -742,7 +752,9 @@ static void test_proven_edge_does_not_report_a_missing_edge_over_a_partial_index
 
     /* Over a *complete* generation the same missing edge is a genuine finding —
      * the fix must not have made the verifier useless. */
-    EXEC(&e, &err, "UPDATE sem_generations SET tu_failed = 0, tu_complete = 2 WHERE id = %lld;",
+    EXEC(&e, &err,
+             "UPDATE sem_generations SET tu_failed = 0, tu_complete = 2,"
+             "  discovery = 'COMPLETE' WHERE id = %lld;",
              (long long)gen);
     t = run(&e, ATLAS_VERIFIER_PROVEN_EDGE, "from=a;to=b", &check, NULL, NULL, &err);
     T_EQ_INT((int)check, (int)ATLAS_CHECK_FAIL);
@@ -918,7 +930,7 @@ static void test_a_model_cannot_forge_a_complete_generation(void) {
      * request that reaches any of them. */
     EXEC(&e, &err,
              "UPDATE sem_generations SET tu_failed = 0, tu_complete = 2, scope_covered = 2,"
-             "  scope_uncovered = 0 WHERE id = %lld;",
+             "  scope_uncovered = 0, discovery = 'COMPLETE' WHERE id = %lld;",
              (long long)gen);
     atlas_verify_truth after =
         run(&e, ATLAS_VERIFIER_SYMBOL_ABSENT, "symbol=ghost", NULL, NULL, NULL, &err);

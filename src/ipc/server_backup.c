@@ -42,6 +42,7 @@
 
 #include "atlas/backup.h"
 #include "atlas/maintenance.h"
+#include "atlas/sem_discover.h"
 #include "atlas/sem.h"
 #include "atlas/buf.h"
 #include "atlas/error.h"
@@ -420,10 +421,16 @@ static atlas_status method_code_index(dispatch_state *ds, const atlas_ipc_reques
         return st;
     }
 
-    /* A NUL-separated list of repository-relative paths. Never discovered: the
-     * caller names them or there is nothing to do, which is A8-CI's rule that
-     * Atlas does not search a repository for a file telling it how to compile
-     * things. */
+    /* A NUL-separated list of repository-relative paths, and **an empty one is
+     * not an error**.
+     *
+     * A8-CI's rule was that the caller names them or there is nothing to do,
+     * because Atlas did not search a repository for a file telling it how to
+     * compile things. A9.2.4 searches, inside a bounded universe, so an empty
+     * list means "use what discovery accepted" — which the writer resolves,
+     * because it is the thread that will run the job and the accepted set could
+     * legitimately change between here and there. A named list is still honoured
+     * exactly as given. */
     atlas_buf list = ATLAS_BUF_INIT;
     const atlas_ipc_array *arr = NULL;
     if (atlas_ipc_param_array(req, "compdbs", &arr)) {
@@ -435,12 +442,6 @@ static atlas_status method_code_index(dispatch_state *ds, const atlas_ipc_reques
             }
         }
     }
-    if (st == ATLAS_OK && list.len == 0) {
-        st = atlas_err_set(err, ATLAS_ERR_USAGE,
-                           "name at least one compilation database with --compdb; Atlas does not "
-                           "search a repository for one");
-    }
-
     bool rebuild = false;
     (void)atlas_ipc_param_bool(req, "rebuild", &rebuild);
 
@@ -502,13 +503,17 @@ static atlas_status method_code_sem_config(dispatch_state *ds, const atlas_ipc_r
      * discard the compilation databases they configured last week. */
     atlas_buf compdbs = ATLAS_BUF_INIT;
     atlas_buf test_roots = ATLAS_BUF_INIT;
+    atlas_buf excludes = ATLAS_BUF_INIT;
+    atlas_buf vendor_roots = ATLAS_BUF_INIT;
     bool have_compdbs = false;
     bool have_roots = false;
+    bool have_excludes = false;
+    bool have_vendor = false;
     atlas_status st = ATLAS_OK;
-    static const char *const KEYS[2] = {"compdbs", "test_roots"};
-    atlas_buf *const BUFS[2] = {&compdbs, &test_roots};
-    bool *const FLAGS[2] = {&have_compdbs, &have_roots};
-    for (size_t k = 0; k < 2 && st == ATLAS_OK; k++) {
+    static const char *const KEYS[4] = {"compdbs", "test_roots", "excludes", "vendor_roots"};
+    atlas_buf *const BUFS[4] = {&compdbs, &test_roots, &excludes, &vendor_roots};
+    bool *const FLAGS[4] = {&have_compdbs, &have_roots, &have_excludes, &have_vendor};
+    for (size_t k = 0; k < 4 && st == ATLAS_OK; k++) {
         const atlas_ipc_array *arr = NULL;
         if (!atlas_ipc_param_array(req, KEYS[k], &arr)) {
             continue;
@@ -552,6 +557,26 @@ static atlas_status method_code_sem_config(dispatch_state *ds, const atlas_ipc_r
         auto_rebuild = flag ? 1 : 0;
     }
 
+    /* A9.2.4. The same tri-state discipline, sent as the vocabulary name rather
+     * than as a boolean: an absent key leaves the mode alone, and an
+     * unrecognised value is refused rather than silently taken as one of the
+     * two — a request whose author wrote something Atlas half-understood is the
+     * failure every policy parser in Atlas refuses. */
+    int discovery_mode = -1;
+    const char *mode = NULL;
+    if (atlas_ipc_param_str(req, "discovery_mode", &mode) && mode != NULL) {
+        atlas_sem_discovery_mode parsed = ATLAS_SEM_DISCMODE_AUTOMATIC;
+        if (!atlas_sem_discovery_mode_parse(mode, &parsed)) {
+            atlas_buf_free(&compdbs);
+            atlas_buf_free(&test_roots);
+            atlas_buf_free(&excludes);
+            atlas_buf_free(&vendor_roots);
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "\"discovery_mode\" must be AUTOMATIC or MANUAL");
+        }
+        discovery_mode = parsed == ATLAS_SEM_DISCMODE_MANUAL ? 1 : 0;
+    }
+
     atlas_sem_status_report rep;
     atlas_sem_status_report_init(&rep);
     if (st == ATLAS_OK) {
@@ -563,7 +588,14 @@ static atlas_status method_code_sem_config(dispatch_state *ds, const atlas_ipc_r
         job.test_roots =
             have_roots ? (const char *)(test_roots.data != NULL ? test_roots.data : "") : NULL;
         job.test_roots_len = have_roots ? test_roots.len : 0;
+        job.excludes =
+            have_excludes ? (const char *)(excludes.data != NULL ? excludes.data : "") : NULL;
+        job.excludes_len = have_excludes ? excludes.len : 0;
+        job.vendor_roots =
+            have_vendor ? (const char *)(vendor_roots.data != NULL ? vendor_roots.data : "") : NULL;
+        job.vendor_roots_len = have_vendor ? vendor_roots.len : 0;
         job.auto_rebuild = auto_rebuild;
+        job.discovery_mode = discovery_mode;
         st = atlas_writer_sem_config(ds->ctx->writer, &job, &rep, err);
     }
     if (st == ATLAS_OK) {
@@ -572,6 +604,8 @@ static atlas_status method_code_sem_config(dispatch_state *ds, const atlas_ipc_r
     atlas_sem_status_report_free(&rep);
     atlas_buf_free(&compdbs);
     atlas_buf_free(&test_roots);
+    atlas_buf_free(&excludes);
+    atlas_buf_free(&vendor_roots);
     return st;
 }
 

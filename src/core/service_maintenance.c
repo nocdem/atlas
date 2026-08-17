@@ -308,6 +308,21 @@ static const retention_entry RETENTION[] = {
      "rebuilds it because the repository never held it, and its absence is what keeps a compiler "
      "from being run on a repository nobody authorised"},
 
+    /* A9.2.4. The candidates one bounded walk found, accepted and rejected.
+     *
+     * DERIVED, because another walk reproduces it exactly — which is what makes
+     * it safe to rewrite whole on every discovery pass. Not prunable by age for
+     * A5's reason about derived tables: a half-aged candidate list is not a
+     * smaller search, it is a *wrong* one, and nothing in the surviving rows
+     * would record that some are missing. That matters more here than for most
+     * derived data, because this table is what a negative conclusion's coverage
+     * rests on: rows silently gone would make a repository look like one whose
+     * build inputs were fewer than they are. */
+    {"sem_build_inputs", ATLAS_RETAIN_DERIVED, false,
+     "the compilation databases one bounded discovery walk found for a repository, accepted and "
+     "rejected, with the reason for each; reproduced by walking again, and never aged out because "
+     "a partly-deleted candidate list is a search nobody performed"},
+
     /* --- full-text indexes -------------------------------------------------- */
     {"files_fts", ATLAS_RETAIN_DERIVED, false, "FTS5 index over files; rebuilt from files"},
     {"commits_fts", ATLAS_RETAIN_DERIVED, false, "FTS5 index over commits; rebuilt from commits"},

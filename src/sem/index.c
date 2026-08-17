@@ -41,6 +41,7 @@
 
 #include "atlas/atlas.h"
 #include "atlas/db.h"
+#include "atlas/sem_discover.h"
 #include "atlas/sem_ops.h"
 #include "atlas/pathrep.h"
 #include "atlas/sha256.h"
@@ -67,6 +68,7 @@ atlas_sem_freshness atlas_sem_freshness_of(const atlas_sem_generation *g, bool h
                                            bool running, const char *live_commit,
                                            const char *live_compdb_digest,
                                            const char *live_source_identity,
+                                           const atlas_sem_live_inputs *live_inputs,
                                            bool file_index_current, const char **reason_out) {
     if (reason_out != NULL) {
         *reason_out = NULL;
@@ -123,6 +125,28 @@ atlas_sem_freshness atlas_sem_freshness_of(const atlas_sem_generation *g, bool h
         }
         return ATLAS_SEM_FRESH_STALE;
     }
+    /* A9.2.4, and placed here — after everything specific, before the broadest
+     * check — for the reason the ordering exists at all: an operator should be
+     * told *why* in the most useful terms available.
+     *
+     * "The set of build descriptions changed" and "the working tree changed" are
+     * both true when a new compilation database appears, and only the first
+     * tells anybody what happened. Without this branch a new build directory
+     * would report `the_repository_moved_since_this_index_was_built`, which is
+     * accurate, useless, and would send somebody looking at their source.
+     *
+     * A `known` flag rather than a sentinel count, because zero accepted inputs
+     * is a real and meaningful state: a repository whose build description
+     * vanished has *fewer* inputs than its generation, and that is exactly the
+     * case this must catch rather than mistake for "nothing was measured". */
+    if (live_inputs != NULL && live_inputs->known && g->discovery != ATLAS_SEM_DISC_UNKNOWN &&
+        (live_inputs->accepted_count != g->input_count ||
+         live_inputs->discovery != g->discovery)) {
+        if (reason_out != NULL) {
+            *reason_out = ATLAS_SEM_STALE_DISCOVERY;
+        }
+        return ATLAS_SEM_FRESH_STALE;
+    }
     /* A9.2.3, and it is last on purpose: it is the broadest check and the least
      * specific answer.
      *
@@ -153,6 +177,22 @@ atlas_sem_freshness atlas_sem_freshness_of(const atlas_sem_generation *g, bool h
     return ATLAS_SEM_FRESH_CURRENT;
 }
 
+/* Every live fact a freshness comparison needs, gathered in one pass.
+ *
+ * The compilation databases feed two digests — the compdb-list digest that gives
+ * the specific "a compilation database changed" reason, and the discovery digest
+ * that feeds the source identity — and reading their bytes once for both is why
+ * this struct exists. See the comment at the call site. */
+typedef struct live_fact_set {
+    char discovery_digest[65];
+    char compdb_digest[65];
+    char source_identity[65];
+    atlas_sem_live_inputs inputs;
+} live_fact_set;
+
+static atlas_status live_facts(atlas_db *db, atlas_repo_info *repo, live_fact_set *out,
+                               atlas_err *err);
+
 atlas_sem_freshness atlas_sem_freshness_now(atlas_db *db, atlas_repo_info *repo,
                                             const atlas_sem_generation *g, bool have_generation,
                                             bool running, const char **reason_out) {
@@ -169,20 +209,29 @@ atlas_sem_freshness atlas_sem_freshness_now(atlas_db *db, atlas_repo_info *repo,
                         atlas_index_state_is_current(&fs, NULL);
     atlas_index_state_free(&fs);
 
-    /* Both live values are best effort, and both fail *open* on purpose: an
+    /* Every live fact, from **one** pass over the build description.
+     *
+     * Best effort throughout, and every one of them fails *open* on purpose: an
      * empty live value never makes a generation stale, because "Atlas could not
      * look" is not evidence that anything changed. A repository whose build
      * description cannot be read is reported by the index attempt, where the
-     * failure has somewhere to go. */
-    char live_digest[65];
-    live_digest[0] = '\0';
-    (void)atlas_sem_repo_compdb_digest(db, repo, live_digest, &ignored);
-    char live_identity[65];
-    live_identity[0] = '\0';
-    (void)atlas_sem_source_identity(db, repo, live_identity, &ignored);
+     * failure has somewhere to go.
+     *
+     * One pass rather than three, and that is a correctness and a cost argument
+     * in one. A9.2.3's closure measured this exact shape: `sem.status` computed
+     * freshness twice per response and hashed every declared compilation
+     * database twice, and two computations within one document could also have
+     * disagreed if the tree moved between them. A9.2.4 would have made it worse
+     * — the compilation databases feed *two* digests now — so `live_facts`
+     * reads each one once and derives both from the same bytes. */
+    live_fact_set lf;
+    (void)live_facts(db, repo, &lf, &ignored);
+    const char *live_digest = lf.compdb_digest;
+    const char *live_identity = lf.source_identity;
+    atlas_sem_live_inputs live_inputs = lf.inputs;
 
     return atlas_sem_freshness_of(g, have_generation, running, repo->scanned_head, live_digest,
-                                  live_identity, file_current, reason_out);
+                                  live_identity, &live_inputs, file_current, reason_out);
 }
 
 /* --- reading a compilation database ---------------------------------------- */
@@ -329,148 +378,321 @@ static void digest_all(const compdb_slot *slots, size_t n, char out[65]) {
     digest_list((const char (*)[65])digests, n, out);
 }
 
-/* --- A9.2.3: the same digest, from the files as they are now -----------------
+/* --- the three public live values, each a thin read of one shared pass -------
  *
- * Until A9.2.3 every caller of `atlas_sem_freshness_of` passed NULL for the live
- * digest, so the branch that reports a changed compilation database was
- * unreachable. The reason given at the time was that recomputing it would mean
- * hashing every compilation database on every read, and that a changed one would
- * be caught by the next index.
- *
- * **That reasoning is reversed here, deliberately, and the reversal is what
- * A9.2.3 needs.** It was sound while rebuilding was something a person did:
- * "the next index" was a command somebody would run, and the check merely
- * decided how a status line read. It is not sound once the daemon owns
- * freshness, because "the next index" is now scheduled by *noticing* — so a
- * check that never fires is a repository whose build description can change
- * without anything ever rebuilding it. The dead branch was the whole of §18.
- *
- * The cost is real and bounded: one read and one SHA-256 of each declared
- * database per freshness read, of files an operator named and Atlas already
- * reads with the same bounded, symlink-refusing open the indexer uses. Nothing
- * is searched for and nothing outside the root is opened.
- *
- * A database that cannot be read now yields an empty digest, and an empty live
- * digest does not make a generation stale — "Atlas could not look" is not
- * evidence that the description changed, which is the same asymmetry A9.2.2
- * applies to absence. It is reported through the ordinary index attempt, where
- * it is a failure with a reason, rather than through a freshness read that has
- * nowhere to put it. */
-atlas_status atlas_sem_live_compdb_digest(int root_fd, const char *compdbs, size_t compdbs_len,
-                                          char out[65], atlas_err *err) {
-    out[0] = '\0';
-    if (compdbs == NULL || compdbs_len == 0 || compdbs[0] == '\0') {
-        return ATLAS_OK;
-    }
-    char digests[ATLAS_SEM_MAX_COMPDBS][65];
-    size_t n = 0;
-    const char *p = compdbs;
-    const char *end = compdbs + compdbs_len;
-    while (p < end && *p != '\0') {
-        if (n >= ATLAS_SEM_MAX_COMPDBS) {
-            return atlas_err_set(err, ATLAS_ERR_USAGE,
-                                 "more than %d compilation databases were named",
-                                 ATLAS_SEM_MAX_COMPDBS);
-        }
-        atlas_buf data = ATLAS_BUF_INIT;
-        atlas_status st = read_bounded(root_fd, p, ATLAS_CODE_MAX_COMPILE_DB_BYTES, &data, err);
-        if (st != ATLAS_OK) {
-            atlas_buf_free(&data);
-            /* Unreadable now: report the empty digest rather than a different
-             * one. A digest computed from what could be read would differ from
-             * the stored one and report a change that may not have happened. */
-            out[0] = '\0';
-            return st;
-        }
-        atlas_sha256_hex(data.data, data.len, digests[n]);
-        atlas_buf_free(&data);
-        n++;
-        p += strlen(p) + 1;
-    }
-    digest_list((const char (*)[65])digests, n, out);
-    return ATLAS_OK;
-}
+ * All three are `live_facts`, and that is the whole point: the compilation
+ * databases feed two digests and the source identity folds the second, so three
+ * separate implementations would read the same bytes three times *and* be three
+ * chances for the stored and the live form of one value to be computed
+ * differently. A9.2.3's closure fixed exactly that shape once already. */
 
 atlas_status atlas_sem_repo_compdb_digest(atlas_db *db, atlas_repo_info *repo, char out[65],
                                           atlas_err *err) {
     out[0] = '\0';
-    atlas_sem_config cfg;
-    atlas_sem_config_init(&cfg);
-    atlas_status st = atlas_db_sem_config_get(db, repo->id, &cfg, err);
-    if (st != ATLAS_OK || !cfg.present || cfg.compdbs.len == 0) {
-        /* No declared build description, so there is nothing to compare against
-         * and no claim to make. An empty digest never makes a generation stale. */
-        atlas_sem_config_free(&cfg);
-        return st;
-    }
-    atlas_buf list = ATLAS_BUF_INIT;
-    st = atlas_sem_config_unpack(atlas_buf_cstr(&cfg.compdbs), &list, NULL, err);
+    live_fact_set lf;
+    atlas_status st = live_facts(db, repo, &lf, err);
     if (st == ATLAS_OK) {
-        /* The registered root, opened without following a symlink on its final
-         * component: a root that has been replaced by a link since registration
-         * refuses the read rather than being followed somewhere else. Every
-         * descent below it is `atlas_path_open_nofollow`, which is the same
-         * discipline the indexer uses. No git process is created — this runs on
-         * a read path, and forking git to hash two files an operator named would
-         * make every status read cost a process. */
-        int fd = open(atlas_buf_cstr(&repo->root_path),
-                      O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-        if (fd < 0) {
-            st = atlas_err_set_errno(err, ATLAS_ERR_REPO, errno,
-                                     "cannot open the registered repository root");
-        } else {
-            st = atlas_sem_live_compdb_digest(fd, (const char *)list.data, list.len, out, err);
-            (void)close(fd);
-        }
+        (void)snprintf(out, 65, "%s", lf.compdb_digest);
     }
-    atlas_buf_free(&list);
-    atlas_sem_config_free(&cfg);
+    return st;
+}
+
+atlas_status atlas_sem_repo_discovery_identity(atlas_db *db, atlas_repo_info *repo, char out[65],
+                                               atlas_err *err) {
+    out[0] = '\0';
+    live_fact_set lf;
+    atlas_status st = live_facts(db, repo, &lf, err);
+    if (st == ATLAS_OK) {
+        (void)snprintf(out, 65, "%s", lf.discovery_digest);
+    }
     return st;
 }
 
 atlas_status atlas_sem_source_identity(atlas_db *db, atlas_repo_info *repo, char out[65],
                                        atlas_err *err) {
     out[0] = '\0';
+    live_fact_set lf;
+    atlas_status st = live_facts(db, repo, &lf, err);
+    if (st == ATLAS_OK) {
+        (void)snprintf(out, 65, "%s", lf.source_identity);
+    }
+    return st;
+}
 
-    char compdb[65];
-    compdb[0] = '\0';
-    /* Best effort. An unreadable build description leaves the field empty and
-     * the identity still describes the tree, so a rebuild is scheduled on the
-     * tree's own evidence rather than suppressed by a file Atlas could not
-     * read. The unreadable database is reported by the index attempt, where it
-     * is a failure with a reason. */
-    atlas_err ignored;
-    atlas_err_init(&ignored);
-    (void)atlas_sem_repo_compdb_digest(db, repo, compdb, &ignored);
+/* A9.2.4. Walks a repository for compilation databases and records what it
+ * found, in one transaction.
+ *
+ * The walk itself is `atlas_sem_discover`, which touches no database; this is
+ * the layer that makes its result durable, and it is deliberately the only one.
+ * The delete and the inserts are one fact — a candidate list half replaced is a
+ * search nobody performed — so the transaction is opened here rather than left
+ * to a caller who might reasonably forget.
+ *
+ * A1's rule that no file read happens inside a write transaction is why the walk
+ * runs to completion *before* `atlas_db_begin`. */
+atlas_status atlas_sem_discovery_run(atlas_db *db, atlas_repo_info *repo,
+                                     atlas_sem_discovery_result *out, atlas_err *err) {
+    if (db == NULL || repo == NULL || out == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "build-input discovery: bad request");
+    }
+    atlas_sem_config cfg;
+    atlas_sem_config_init(&cfg);
+    atlas_status st = atlas_db_sem_config_get(db, repo->id, &cfg, err);
+    if (st != ATLAS_OK) {
+        atlas_sem_config_free(&cfg);
+        return st;
+    }
 
+    st = atlas_sem_discover(atlas_buf_cstr(&repo->root_path), &cfg, out, err);
+    if (st != ATLAS_OK) {
+        /* Atlas could not look at all — an unreadable or replaced root. The
+         * stored verdict is left alone rather than overwritten with UNKNOWN:
+         * "I could not look this time" is not evidence that what was found last
+         * time is wrong, and blanking it would turn a transient failure into a
+         * repository that cannot support an absence until somebody notices. */
+        atlas_sem_config_free(&cfg);
+        return st;
+    }
+
+    st = atlas_db_begin(db, err);
+    if (st == ATLAS_OK) {
+        st = atlas_db_sem_inputs_replace(db, repo->id, out->inputs, out->count, out->discovered_at,
+                                         err);
+    }
+    if (st == ATLAS_OK) {
+        /* Best effort on the durable identity: it is what lets a row still say
+         * which repository lineage it described after the rowid is gone, and a
+         * discovery result is worth recording even when that lookup fails. */
+        atlas_buf identity = ATLAS_BUF_INIT;
+        atlas_err ignored;
+        atlas_err_init(&ignored);
+        (void)atlas_db_repo_identity_hash(db, repo->id, &identity, &ignored);
+        st = atlas_db_sem_discovery_set(db, repo->id, atlas_buf_cstr(&identity),
+                                        atlas_sem_discovery_name(out->state), out->discovered_at,
+                                        out->limit_reached ? out->limit_detail : "", err);
+        atlas_buf_free(&identity);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_db_commit(db, err);
+    } else {
+        atlas_db_rollback(db);
+    }
+    atlas_sem_config_free(&cfg);
+    return st;
+}
+
+/* The accepted set as the indexer takes it: NUL-separated, repository-relative,
+ * in path order.
+ *
+ * Read from the persisted candidate list rather than from the operator's pinned
+ * list, which is the whole difference between A9.2.3 and this season: what gets
+ * indexed is what discovery accepted, and a pinned path is one input to that
+ * rather than the entirety of it. */
+atlas_status atlas_sem_accepted_inputs(atlas_db *db, int64_t repo_id, atlas_buf *out,
+                                       size_t *count_out, atlas_err *err) {
+    if (count_out != NULL) {
+        *count_out = 0;
+    }
+    if (out == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "accepted build inputs: bad request");
+    }
+    atlas_sem_input *inputs = calloc(ATLAS_SEM_DISCOVERY_MAX_CANDIDATES, sizeof(*inputs));
+    if (inputs == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory reading the build inputs");
+    }
+    size_t count = 0;
+    atlas_status st = atlas_db_sem_inputs_get(db, repo_id, inputs,
+                                              ATLAS_SEM_DISCOVERY_MAX_CANDIDATES, &count, err);
+    for (size_t i = 0; st == ATLAS_OK && i < count; i++) {
+        if (!inputs[i].accepted) {
+            continue;
+        }
+        st = atlas_buf_append(out, inputs[i].path, strlen(inputs[i].path), err);
+        if (st == ATLAS_OK) {
+            st = atlas_buf_append_ch(out, '\0', err);
+        }
+        if (st == ATLAS_OK && count_out != NULL) {
+            (*count_out)++;
+        }
+    }
+    free(inputs);
+    return st;
+}
+
+/* The source identity's final fold, given the two digests it composes.
+ *
+ * One composer, so the stored and the live form of an identity can never differ
+ * about the domain or the order — which would make a generation's recorded
+ * identity incomparable with a freshly computed one and report a change nobody
+ * made.
+ *
+ * The domain bumped from v1 with A9.2.4, because what the identity covers
+ * changed: it now folds the whole *input universe* rather than a digest over the
+ * compilation databases an operator happened to name. Every identity stored
+ * before this season means something different from one computed now, so the
+ * bump makes every pre-A9.2.4 generation stale exactly once — the honest
+ * outcome, since those generations were built without knowing whether their
+ * input set was complete.
+ *
+ * The **content hashes** in `content_digest` are what make this the working-tree
+ * answer rather than a commit answer: Atlas indexes the tree it can see, and an
+ * uncommitted edit changes a hash while every commit-derived value stands
+ * still. */
+static void source_identity_from(const char *discovery_digest, const char *content_digest,
+                                 char out[65]) {
     atlas_sha256 h;
     atlas_sha256_init(&h);
-    feed_str(&h, "atlas.sem.source-identity.v1");
-    feed_str(&h, compdb);
+    feed_str(&h, "atlas.sem.source-identity.v2");
+    feed_str(&h, discovery_digest);
     feed_str(&h, atlas_sem_compiler_version());
     feed_str(&h, ATLAS_SEM_ANALYZER_ID);
     char av[32];
     (void)snprintf(av, sizeof av, "%d", ATLAS_SEM_ANALYZER_VERSION);
     feed_str(&h, av);
-
     /* Every live C source and header, by path and content hash, in path order —
      * digested in `src/db`, because sqlite3 types do not leave that layer.
      * Headers as well as sources: a header edit changes what every unit
-     * including it compiles to, which is the case A8-CI's own incremental
-     * digest exists to catch, and an identity that ignored headers would report
-     * a repository unchanged after an edit that changes half its graph. */
-    char content[65];
-    content[0] = '\0';
-    atlas_status st = atlas_db_sem_source_content_digest(db, repo->id, content, err);
-    if (st != ATLAS_OK) {
-        return st;
-    }
-    feed_str(&h, content);
+     * including it compiles to, and an identity that ignored headers would
+     * report a repository unchanged after an edit that changes half its graph. */
+    feed_str(&h, content_digest);
 
     unsigned char digest[ATLAS_SHA256_DIGEST_LEN];
     atlas_sha256_final(&h, digest);
     atlas_hex_encode(digest, sizeof(digest), out);
     out[ATLAS_SHA256_HEX_LEN] = '\0';
+}
+
+/* One pass over the build description, producing every live value a freshness
+ * comparison needs.
+ *
+ * The reads it does *not* repeat are the point. A9.2.3's closure commit measured
+ * `sem.status` computing freshness twice and hashing every declared compilation
+ * database twice, and fixed it; A9.2.4 gives the same bytes a second consumer —
+ * the discovery digest that feeds the source identity — so without this the
+ * regression would have come back larger. Each accepted database is opened,
+ * read and hashed exactly once, and both digests are derived from that hash.
+ *
+ * Fails open at every step: an unreadable root, an unreadable database or a
+ * missing candidate list leaves the corresponding value empty, and an empty live
+ * value never makes a generation stale. */
+static atlas_status live_facts(atlas_db *db, atlas_repo_info *repo, live_fact_set *out,
+                               atlas_err *err) {
+    memset(out, 0, sizeof(*out));
+    if (db == NULL || repo == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "live semantic facts: bad request");
+    }
+
+    atlas_sem_config cfg;
+    atlas_sem_config_init(&cfg);
+    atlas_status st = atlas_db_sem_config_get(db, repo->id, &cfg, err);
+    if (st != ATLAS_OK) {
+        atlas_sem_config_free(&cfg);
+        return st;
+    }
+
+    atlas_sem_input *inputs = calloc(ATLAS_SEM_DISCOVERY_MAX_CANDIDATES, sizeof(*inputs));
+    size_t count = 0;
+    if (inputs != NULL &&
+        atlas_db_sem_inputs_get(db, repo->id, inputs, ATLAS_SEM_DISCOVERY_MAX_CANDIDATES, &count,
+                                err) == ATLAS_OK) {
+        /* `known` is "a walk has happened", not "the query succeeded". An empty
+         * candidate list from a repository nobody has walked is Atlas not having
+         * looked, and comparing it against a generation's recorded count would
+         * report a change nobody made — the same rule as an empty stored
+         * identity never making a generation stale. */
+        out->inputs.known = cfg.discovery_state != ATLAS_SEM_DISC_UNKNOWN;
+        out->inputs.discovery = cfg.discovery_state;
+    } else {
+        count = 0;
+    }
+
+    int root_fd = open(atlas_buf_cstr(&repo->root_path),
+                       O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+
+    /* The discovery digest, built as the accepted set is walked. Domain, state
+     * and exclusions first, in the order `ATLAS_SEM_DISCOVERY_DOMAIN` documents
+     * them — the two must agree, because a generation sealed by one is compared
+     * against a value produced by the other. */
+    atlas_sha256 dh;
+    atlas_sha256_init(&dh);
+    feed_str(&dh, ATLAS_SEM_DISCOVERY_DOMAIN);
+    feed_str(&dh, atlas_sem_discovery_name(cfg.discovery_state));
+    feed_str(&dh, cfg.excludes.len > 0 ? atlas_buf_cstr(&cfg.excludes) : "");
+
+    char per_file[ATLAS_SEM_MAX_COMPDBS][65];
+    size_t accepted = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (!inputs[i].accepted) {
+            continue;
+        }
+        out->inputs.accepted_count++;
+        char digest[65];
+        digest[0] = '\0';
+        if (root_fd >= 0) {
+            atlas_buf data = ATLAS_BUF_INIT;
+            atlas_err ignored;
+            atlas_err_init(&ignored);
+            if (read_bounded(root_fd, inputs[i].path, ATLAS_CODE_MAX_COMPILE_DB_BYTES, &data,
+                             &ignored) == ATLAS_OK) {
+                atlas_sha256_hex(data.data, data.len, digest);
+            }
+            atlas_buf_free(&data);
+        }
+        /* A fixed marker rather than nothing, and it goes into **both** digests.
+         *
+         * Skipping an unreadable input would make a repository whose second
+         * compilation database has just vanished compare equal to one that only
+         * ever had the first — the same mistake A9.2.3 refuses when a file's
+         * content hash is missing, and the more dangerous half of the trade. A
+         * transient read failure costs one unnecessary rebuild, which is
+         * self-correcting; an input that disappeared without moving the digest
+         * leaves the index describing build descriptions that are gone, with
+         * nothing saying so. */
+        const char *contribution = digest[0] != '\0' ? digest : "atlas.sem.input.unreadable";
+        feed_str(&dh, inputs[i].path);
+        feed_str(&dh, contribution);
+        if (accepted < (size_t)ATLAS_SEM_MAX_COMPDBS) {
+            (void)snprintf(per_file[accepted], sizeof per_file[accepted], "%s", contribution);
+            accepted++;
+        }
+    }
+    if (root_fd >= 0) {
+        (void)close(root_fd);
+    }
+
+    unsigned char raw[ATLAS_SHA256_DIGEST_LEN];
+    atlas_sha256_final(&dh, raw);
+    atlas_hex_encode(raw, sizeof raw, out->discovery_digest);
+    out->discovery_digest[ATLAS_SHA256_HEX_LEN] = '\0';
+
+    /* The narrower digest, over the same per-file hashes: it is what gives the
+     * specific `a compilation database changed` reason, which the broader
+     * identity cannot, because the identity also moves for an ordinary source
+     * edit. Empty when nothing was accepted, and an empty live digest never
+     * makes a generation stale.
+     *
+     * A **partly** readable set reports as changed, which reverses what A9.2.3's
+     * `atlas_sem_live_compdb_digest` did: that function returned an empty digest
+     * for the whole set the moment one file could not be read, on the argument
+     * that "Atlas could not look" is not evidence of change. The argument holds
+     * for a set of *named* paths, where an unreadable one is usually a typo. It
+     * does not hold for a set Atlas discovered and accepted, where an unreadable
+     * one usually means the build tree was removed — and that function is gone,
+     * because it had no callers left once every live value came from one pass. */
+    if (accepted > 0) {
+        digest_list((const char (*)[65])per_file, accepted, out->compdb_digest);
+    }
+
+    /* And the source identity, from the discovery digest already in hand rather
+     * than from a second read of the same files. */
+    char content[65];
+    content[0] = '\0';
+    if (atlas_db_sem_source_content_digest(db, repo->id, content, err) == ATLAS_OK) {
+        source_identity_from(out->discovery_digest, content, out->source_identity);
+    }
+
+    free(inputs);
+    atlas_sem_config_free(&cfg);
     return ATLAS_OK;
 }
 
@@ -570,8 +792,36 @@ static atlas_status input_digest(atlas_db *db, int64_t repo_id, int64_t prev_gen
                                  atlas_err *err) {
     atlas_sha256 h;
     atlas_sha256_init(&h);
-    static const char DOMAIN[] = "atlas.sem.unit.v1";
+    /* v2 since A9.2.4: the **producer** is part of a unit's inputs.
+     *
+     * It was not, and that made the analyzer epoch unenforceable. Bumping
+     * `ATLAS_SEM_ANALYZER_VERSION` makes a generation *stale*, which schedules a
+     * rebuild — and the rebuild then compared a digest that knew nothing about
+     * the analyzer, found every unit unchanged, and carried forward facts the
+     * *old* analyzer had produced. The new generation recorded the new version
+     * and contained the old graph.
+     *
+     * A3 states the rule the epoch exists for: bump it whenever a pass would
+     * produce different facts from identical bytes, and the next pass rebuilds.
+     * The second half was not true of an incremental pass, so every analyzer
+     * bump in Atlas' history was a no-op unless somebody happened to pass
+     * `--rebuild`. Measured on this machine: after bumping to 2, a scheduled
+     * rebuild reused 203 of 203 units and republished the same graph under the
+     * new version.
+     *
+     * The compiler version is here for the same reason and with the same force:
+     * `atlas_sem_freshness_of` already treats a changed compiler as stale, and
+     * that staleness was equally unenforceable. */
+    static const char DOMAIN[] = "atlas.sem.unit.v2";
     atlas_sha256_update(&h, DOMAIN, sizeof(DOMAIN));
+    atlas_sha256_update(&h, ATLAS_SEM_ANALYZER_ID, sizeof(ATLAS_SEM_ANALYZER_ID));
+    char av[32];
+    int avn = snprintf(av, sizeof av, "%d", ATLAS_SEM_ANALYZER_VERSION);
+    if (avn > 0) {
+        atlas_sha256_update(&h, av, (size_t)avn);
+    }
+    const char *cv = atlas_sem_compiler_version();
+    atlas_sha256_update(&h, cv, strlen(cv));
     atlas_sha256_update(&h, config_digest, strlen(config_digest));
 
     atlas_buf paths = ATLAS_BUF_INIT;
@@ -991,22 +1241,44 @@ atlas_status atlas_sem_index_run(atlas_db *db, int64_t repo_id, const atlas_sem_
                 if (st == ATLAS_OK && found && strcmp(atlas_buf_cstr(&had), want) == 0) {
                     st = atlas_db_begin(db, err);
                     int64_t syms = 0, edges = 0;
+                    /* **The unit row first, then its facts.**
+                     *
+                     * The order is the fix for A9.2.4's worst find. An edge
+                     * belongs to the unit that produced it, and a carried-forward
+                     * edge must belong to the unit row in *this* generation — so
+                     * that row has to exist before the copy can name it. The
+                     * previous order made that impossible, so the copy carried
+                     * the ancestor generation's `unit_id` across instead, and the
+                     * graph decayed on every incremental pass: the next pass
+                     * selects the edges to carry by joining `sem_units`, and once
+                     * the ancestor's rows were pruned the join found nothing.
+                     * Measured on a real repository, 475,741 edges became 10,631
+                     * over four passes.
+                     *
+                     * Written twice on purpose: once to exist, once to record
+                     * what it carried. `atlas_db_sem_unit_add` upserts on the
+                     * table's unique key, so the second write updates rather than
+                     * duplicating, and both are inside the one transaction. */
+                    int64_t unit_id = 0;
+                    atlas_sem_unit_row row;
+                    memset(&row, 0, sizeof(row));
+                    row.generation_id = sum->generation_id;
+                    row.source_text = source_rel;
+                    row.compdb_id = slots[si].row_id;
+                    row.config_digest = config;
+                    row.input_digest = want;
+                    row.status = ATLAS_SEM_TU_COMPLETE;
+                    row.reused = true;
                     if (st == ATLAS_OK) {
-                        st = atlas_db_sem_copy_unit(db, prev_gen, sum->generation_id, source_rel,
-                                                    config, &syms, &edges, err);
+                        st = atlas_db_sem_unit_add(db, &row, &unit_id, err);
                     }
                     if (st == ATLAS_OK) {
-                        atlas_sem_unit_row row;
-                        memset(&row, 0, sizeof(row));
-                        row.generation_id = sum->generation_id;
-                        row.source_text = source_rel;
-                        row.compdb_id = slots[si].row_id;
-                        row.config_digest = config;
-                        row.input_digest = want;
-                        row.status = ATLAS_SEM_TU_COMPLETE;
+                        st = atlas_db_sem_copy_unit(db, prev_gen, sum->generation_id, unit_id,
+                                                    source_rel, config, &syms, &edges, err);
+                    }
+                    if (st == ATLAS_OK) {
                         row.symbols = syms;
                         row.edges = edges;
-                        row.reused = true;
                         st = atlas_db_sem_unit_add(db, &row, NULL, err);
                     }
                     if (st == ATLAS_OK) {
@@ -1368,6 +1640,48 @@ atlas_status atlas_sem_index_run(atlas_db *db, int64_t repo_id, const atlas_sem_
                 st = atlas_db_sem_scope_test_split(db, sum->generation_id, opts->test_roots,
                                                    &gen.tu_test, &gen.tu_production,
                                                    &gen.test_scope_known, err);
+            }
+            /* --- A9.2.4: what the *input universe* looked like ---
+             *
+             * The axis underneath the one above. `scope_uncovered = 0` says
+             * every source the file index enumerated was read; it says nothing
+             * about whether Atlas found every compilation database that could
+             * have named more. That is what `discovery` records, and it is
+             * sealed here for the same reason the rest of the manifest is: it
+             * describes the generation about to become current, not the state of
+             * the repository at some later read.
+             *
+             * The verdict comes from the stored discovery pass rather than from
+             * a fresh walk. A pass runs before an index attempt precisely so
+             * that this value is a fact about the inputs this generation was
+             * built from — walking again here would record a universe the
+             * generation was not built under. */
+            if (st == ATLAS_OK) {
+                atlas_sem_config dcfg;
+                atlas_sem_config_init(&dcfg);
+                if (atlas_db_sem_config_get(db, repo_id, &dcfg, err) == ATLAS_OK) {
+                    gen.discovery = dcfg.discovery_state;
+                    st = atlas_db_sem_scope_vendor_count(
+                        db, repo_id,
+                        dcfg.vendor_roots.len > 0 ? atlas_buf_cstr(&dcfg.vendor_roots) : "",
+                        &gen.scope_excluded, err);
+                }
+                atlas_sem_config_free(&dcfg);
+            }
+            if (st == ATLAS_OK) {
+                /* Vendored candidates are a classification, not a coverage
+                 * failure: subtracting them from the shortfall is what keeps a
+                 * repository with a vendored dependency able to state an absence
+                 * about its own code. Clamped at zero for the reason above. */
+                gen.scope_uncovered = gen.scope_uncovered > gen.scope_excluded
+                                          ? gen.scope_uncovered - gen.scope_excluded
+                                          : 0;
+                /* The same number `compdb_count` carries, recorded again under
+                 * the name the discovery model uses. The redundancy is
+                 * deliberate: they are counted on different sides of the pass —
+                 * one from the slots the indexer opened, one from the manifest —
+                 * so a disagreement is visible rather than reconciled. */
+                gen.input_count = gen.compdb_count;
             }
         }
 

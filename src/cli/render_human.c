@@ -23,6 +23,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "atlas/sem_discover.h"
 #include "atlas/atlas.h"
 
 #define LABEL "  %-17s "
@@ -1923,6 +1924,13 @@ static void h_sem_plan_block(atlas_renderer *r, const atlas_sem_status_report *r
         (void)fprintf(o, LABEL "%lld of %lld source files\n", "  scope covered",
                       (long long)p->scope_covered, (long long)p->scope_candidates);
         (void)fprintf(o, LABEL "%lld\n", "  scope uncovered", (long long)p->scope_uncovered);
+        if (rep->have_generation && rep->generation.scope_excluded > 0) {
+            /* Reported separately and never folded into `uncovered`: a subtree
+             * an operator declared to be somebody else's code is a
+             * classification, not a coverage failure. */
+            (void)fprintf(o, LABEL "%lld\n", "  scope vendor-excluded",
+                          (long long)rep->generation.scope_excluded);
+        }
     }
     if (rep->have_generation && rep->generation.test_scope_known) {
         (void)fprintf(o, LABEL "%lld test, %lld production\n", "  unit scope",
@@ -1936,8 +1944,58 @@ static void h_sem_plan_block(atlas_renderer *r, const atlas_sem_status_report *r
                       "unknown (no test roots declared)");
     }
 
-    (void)fprintf(o, LABEL "%s\n", "automatic rebuild",
-                  !p->configured ? "not configured" : (p->auto_rebuild ? "enabled" : "disabled"));
+    /* --- A9.2.4: discovery, on its own lines ---
+     *
+     * Printed *above* the activation lines because it answers a question that
+     * comes first: whether Atlas knows what this repository's build inputs are.
+     * A green coverage figure over an UNKNOWN discovery is the presentation this
+     * season exists to prevent — every configured input processed, and no idea
+     * whether they were all the inputs. */
+    (void)fprintf(o, LABEL "%s\n", "build-input discovery",
+                  atlas_sem_discovery_name(p->discovery));
+    (void)fprintf(o, LABEL "%s\n", "  mode", atlas_sem_discovery_mode_name(p->discovery_mode));
+    (void)fprintf(o, LABEL "%lld accepted, %lld rejected\n", "  candidates",
+                  (long long)p->inputs_accepted, (long long)p->inputs_rejected);
+    if (p->discovered_at[0] != '\0') {
+        (void)fprintf(o, LABEL "%s\n", "  last walked", p->discovered_at);
+    }
+    if (p->discovery_limit[0] != '\0') {
+        /* Every reason a search fell short is reported — A8-CI's rule about
+         * bounds, widened to obstacles for the same reason. A PARTIAL verdict
+         * without the reason tells an operator something was missed without
+         * telling them what, which is not enough to act on. */
+        (void)fprintf(o, LABEL "%s\n", "  incomplete because",
+                      atlas_safe(&r->safe, p->discovery_limit));
+    }
+    if (p->discovery == ATLAS_SEM_DISC_UNKNOWN) {
+        (void)fprintf(o, LABEL "%s\n", "  note",
+                      "Atlas has not established the build-input set; no absence rests on this");
+    } else if (p->discovery == ATLAS_SEM_DISC_PARTIAL) {
+        (void)fprintf(o, LABEL "%s\n", "  note",
+                      "the search stopped early; not discovering is not proof of not existing");
+    }
+    if (rep->have_generation && rep->generation.discovery != p->discovery) {
+        /* The served generation was built under a different verdict from the one
+         * that holds now. Reported rather than folded, because it is the
+         * difference between "this index is complete" and "this index was built
+         * before Atlas could tell". */
+        (void)fprintf(o, LABEL "%s\n", "  generation built under",
+                      atlas_sem_discovery_name(rep->generation.discovery));
+    }
+
+    (void)fprintf(o, LABEL "%s\n", "automatic maintenance",
+                  p->auto_rebuild ? "enabled" : "disabled");
+    /* The intent and its provenance beside the effective answer, never instead
+     * of it: "disabled" is one word and three situations — an operator's
+     * refusal, a machine-wide policy, and a default nobody has revisited — and
+     * an operator told only the word cannot tell which they are looking at. */
+    (void)fprintf(o, LABEL "%s (%s)\n", "  operator intent",
+                  atlas_sem_auto_intent_name(p->auto_intent),
+                  atlas_sem_intent_source_name(p->auto_intent_by));
+    if (p->auto_intent == ATLAS_SEM_INTENT_UNSET) {
+        (void)fprintf(o, LABEL "%s\n", "  policy default",
+                      p->policy_default ? "enabled" : "disabled");
+    }
     if (p->hold_reason != NULL) {
         (void)fprintf(o, LABEL "%s\n", "  holding", p->hold_reason);
     }
@@ -1988,13 +2046,43 @@ static void h_sem_path_list(atlas_renderer *r, const char *label, const atlas_bu
     }
 }
 
+/* A9.2.4. Every candidate, accepted and rejected, with the reason for each.
+ *
+ * The rejected ones are the point. A candidate nobody is shown is
+ * indistinguishable from one that does not exist, and that is exactly how a
+ * third compilation database stayed invisible for a season. */
+static void h_sem_inputs(atlas_renderer *r, const atlas_sem_status_report *rep) {
+    FILE *o = r->out;
+    if (rep->input_count == 0) {
+        (void)fprintf(o, LABEL "%s\n", "build inputs", "(none discovered)");
+        return;
+    }
+    bool first = true;
+    for (size_t i = 0; i < rep->input_count; i++) {
+        const struct atlas_sem_input *in = &rep->inputs[i];
+        if (in->accepted) {
+            (void)fprintf(o, LABEL "%s  [%s, %lld units]\n", first ? "build inputs" : "",
+                          atlas_safe(&r->safe, in->path),
+                          atlas_sem_input_origin_name(in->origin), (long long)in->unit_count);
+        } else {
+            (void)fprintf(o, LABEL "%s  [rejected: %s]\n", first ? "build inputs" : "",
+                          atlas_safe(&r->safe, in->path),
+                          in->reject_reason[0] != '\0' ? in->reject_reason : "unknown");
+        }
+        first = false;
+    }
+}
+
 static atlas_status h_sem_config(atlas_renderer *r, const atlas_sem_status_report *rep,
                                  atlas_err *err) {
     (void)err;
     FILE *o = r->out;
     (void)fprintf(o, LABEL "%s\n", "repo", rep->repo.name);
-    h_sem_path_list(r, "compile databases", &rep->compdbs);
+    h_sem_inputs(r, rep);
+    h_sem_path_list(r, "pinned databases", &rep->compdbs);
     h_sem_path_list(r, "test roots", &rep->test_roots);
+    h_sem_path_list(r, "discovery exclusions", &rep->excludes);
+    h_sem_path_list(r, "vendor roots", &rep->vendor_roots);
     h_sem_plan_block(r, rep);
     if (rep->have_generation) {
         (void)fprintf(o, LABEL "%lld\n", "generation", (long long)rep->generation.id);
@@ -2056,6 +2144,13 @@ static atlas_status h_sem_status(atlas_renderer *r, const atlas_sem_status_repor
      * `scope covered` says how much of the repository that was. Summing or
      * conflating the two is what made `198/198` read as full coverage. */
     h_sem_plan_block(r, rep);
+    /* A9.2.4. And after that, what the inputs actually were — because
+     * `scope covered` is a statement about the sources the accepted databases
+     * named, and the question underneath it is whether those were all the
+     * databases. */
+    h_sem_inputs(r, rep);
+    h_sem_path_list(r, "discovery exclusions", &rep->excludes);
+    h_sem_path_list(r, "vendor roots", &rep->vendor_roots);
 
     if (rep->failed_count > 0) {
         (void)fprintf(o, "\nunits not fully described (%lld total):\n",

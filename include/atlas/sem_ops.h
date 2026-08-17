@@ -130,7 +130,18 @@ atlas_status atlas_db_sem_config_record_attempt(atlas_db *db, int64_t repo_id,
                                                 const char *source_identity, bool ok,
                                                 const char *why, atlas_err *err);
 
-/* Every repository with a build description, for the daemon's scheduler.
+/* Every **registered** repository, for the daemon's scheduler.
+ *
+ * A9.2.3 enumerated only repositories that had a build description, which was
+ * right while a row was the authority opt-in and absent configuration meant
+ * "never". A9.2.4 makes an absent row mean "nobody has said anything", which the
+ * root-owned default resolves — so a repository with no row must be *considered*
+ * and then held or built on its merits. Enumerating the configured set would
+ * make the new default unreachable for exactly the repositories it exists for.
+ *
+ * Considering a repository costs a plan, which is a bounded read; it does not
+ * cost a compiler run, because `atlas_sem_plan_for` decides that.
+ *
  * Bounded by `max`; a truncated list is reported rather than silently shortened,
  * because a repository dropped from a scheduling sweep is one that never
  * rebuilds and nothing would say so. */
@@ -187,6 +198,53 @@ atlas_status atlas_db_sem_source_identity_set(atlas_db *db, int64_t generation_i
 atlas_status atlas_db_sem_scope_set(atlas_db *db, int64_t generation_id,
                                     const atlas_sem_generation *m, atlas_err *err);
 
+/* A9.2.4. Of the candidate sources, how many lie under an operator-declared
+ * vendor prefix. Reported separately and never counted as uncovered: an operator
+ * saying "this subtree is somebody else's code" is a classification, and treating
+ * it as a coverage failure would make every repository with a vendored
+ * dependency permanently unable to state an absence about its own code. */
+atlas_status atlas_db_sem_scope_vendor_count(atlas_db *db, int64_t repo_id,
+                                             const char *packed_vendor_roots, int64_t *out,
+                                             atlas_err *err);
+
+/* --- A9.2.4: the discovered build inputs -------------------------------------
+ *
+ * `atlas_sem_input` is declared in `atlas/sem_discover.h`, which this header
+ * does not include: a caller of these three already has the walk's types, and
+ * pulling the walk into every translation unit that touches the database would
+ * be the wrong dependency in the wrong direction. */
+struct atlas_sem_input;
+
+/* Replaces one repository's candidate list whole.
+ *
+ * Not a merge. The table is a snapshot of a *search*, and a row surviving from a
+ * previous walk would be a candidate Atlas is no longer asserting anything about
+ * sitting beside ones it is, with nothing in the row saying which is which. The
+ * caller owns the transaction, so the delete and the inserts are one fact. */
+atlas_status atlas_db_sem_inputs_replace(atlas_db *db, int64_t repo_id,
+                                         const struct atlas_sem_input *inputs, size_t count,
+                                         const char *discovered_at, atlas_err *err);
+
+/* Records one discovery pass's verdict on the repository row.
+ *
+ * Upserts: a repository with no build description still has a discovery result,
+ * which is the point of the season. The row this creates expresses no intent —
+ * `auto_intent` keeps its UNSET default — so creating it authorises nothing. */
+atlas_status atlas_db_sem_discovery_set(atlas_db *db, int64_t repo_id,
+                                        const char *repo_identity_hash, const char *state,
+                                        const char *discovered_at, const char *limit_detail,
+                                        atlas_err *err);
+
+/* Reads them back in path order — the order discovery produced, so a surface
+ * shows what the walk saw rather than what SQLite happened to return. */
+atlas_status atlas_db_sem_inputs_get(atlas_db *db, int64_t repo_id, struct atlas_sem_input *out,
+                                     size_t max, size_t *count_out, atlas_err *err);
+
+/* Drops them, for `repo remove`. `repositories.id` is a reused rowid, so a row
+ * left behind would eventually describe another repository's build inputs —
+ * `sem_repo_config`'s argument, and A4's before it. */
+atlas_status atlas_db_sem_inputs_forget(atlas_db *db, int64_t repo_id, atlas_err *err);
+
 /* --- writing a generation's contents ---------------------------------------- */
 
 atlas_status atlas_db_sem_compdb_add(atlas_db *db, int64_t generation_id, const char *path_text,
@@ -222,14 +280,36 @@ atlas_status atlas_db_sem_include_add(atlas_db *db, int64_t generation_id,
 
 /* Copies one translation unit's facts forward from another generation.
  *
+ * `to_unit_id` is the **new** generation's row for this unit, and it must exist
+ * before this is called. A9.2.4 found out why the hard way: the copy used to
+ * carry `sem_edges.unit_id` across verbatim, so every carried edge pointed at a
+ * unit row belonging to an *ancestor* generation. Two things followed, and the
+ * second is the serious one:
+ *
+ *   - the new generation's edge rows referenced units that were not in it, so
+ *     nothing could ask "which unit produced this edge" and get an answer;
+ *   - the next incremental pass selects the edges to carry by joining
+ *     `sem_units`, and once the ancestor's unit rows were cleaned up the join
+ *     found nothing. **The call graph decayed generation by generation.**
+ *     Measured on the acceptance repository: a full pass produced 475,741
+ *     edges, and four incremental passes later the published generation held
+ *     10,631, of which 3,479 referenced unit rows that no longer existed.
+ *
+ * It was invisible for two seasons because nothing rebuilt automatically — the
+ * repositories that would have decayed were never rebuilt at all. A9.2.4 makes
+ * automatic maintenance the default, which turns a latent defect into a graph
+ * that quietly empties itself, so the fix belongs to this season even though the
+ * defect does not.
+ *
  * This is what makes incremental indexing incremental: a unit whose input
  * digest is unchanged is not reparsed, its rows are carried over. Copying is
  * cheap relative to a compiler front end and, unlike sharing rows between
  * generations, keeps a generation a self-contained description of one state —
  * so dropping an old generation can never damage a newer one. */
 atlas_status atlas_db_sem_copy_unit(atlas_db *db, int64_t from_generation, int64_t to_generation,
-                                    const char *source_text, const char *config_digest,
-                                    int64_t *symbols_out, int64_t *edges_out, atlas_err *err);
+                                    int64_t to_unit_id, const char *source_text,
+                                    const char *config_digest, int64_t *symbols_out,
+                                    int64_t *edges_out, atlas_err *err);
 
 /* Attaches candidate targets to the indirect call sites of a generation.
  *

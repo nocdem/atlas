@@ -51,11 +51,28 @@
 typedef enum atlas_sem_activity {
     /* Nothing has been established — a read failed, or nobody asked. */
     ATLAS_SEM_ACT_UNKNOWN = 0,
-    /* No build description, or one that does not enable automatic rebuild. This
-     * daemon runs no compiler for this repository, and that is a configured
-     * fact rather than a fault: a repository nobody has configured is not one
-     * that is failing. */
+    /* Automatic maintenance is off because the root-owned default says so and
+     * no operator has said otherwise. A configured fact rather than a fault: a
+     * repository nobody has spoken about is not one that is failing.
+     *
+     * A9.2.4 narrowed this. Before it, DISABLED also covered "no operator has
+     * enabled this repository" — which after the default reversed is no longer a
+     * state that exists — and "there is no compilation database", which is now
+     * NO_INPUTS. Keeping all three under one word was what made
+     * `activity = DISABLED` unreadable in the field: it named a policy, a
+     * configuration gap and a missing file with the same string. */
     ATLAS_SEM_ACT_DISABLED,
+    /* An operator explicitly refused automatic maintenance for this repository.
+     * Distinct from DISABLED on purpose, and never lifted by a policy change:
+     * the two are a machine-wide default and a per-repository decision, and
+     * collapsing them would let a default quietly overrule a person. */
+    ATLAS_SEM_ACT_EXPLICITLY_DISABLED,
+    /* Maintenance would run, and build-input discovery accepted no compilation
+     * database. Not a refusal and not a failure — most often a repository whose
+     * build has not been configured yet — and it is deliberately not DISABLED,
+     * because the remedy is to generate a build description rather than to
+     * change a setting. */
+    ATLAS_SEM_ACT_NO_INPUTS,
     /* No usable generation exists. Different from DISABLED, and different from
      * STALE: nobody has ever indexed this. */
     ATLAS_SEM_ACT_UNAVAILABLE,
@@ -85,6 +102,26 @@ const char *atlas_sem_activity_name(atlas_sem_activity a);
  * — the discipline `ATLAS_SEM_STALE_*` and `ATLAS_SEM_WHY_*` follow. */
 #define ATLAS_SEM_HOLD_DISABLED "no_operator_has_enabled_automatic_rebuild_for_this_repository"
 #define ATLAS_SEM_HOLD_NO_COMPDB "the_build_description_names_no_compilation_database"
+/* A9.2.4. An operator's own refusal, honoured whatever the machine-wide default
+ * says. Kept apart from every other reason a repository is not being maintained
+ * so that a status surface can say *whose* decision it was. */
+#define ATLAS_SEM_HOLD_EXPLICIT_DISABLE                                                            \
+    "an_operator_explicitly_disabled_automatic_semantic_maintenance_for_this_repository"
+/* The root-owned `semantic_auto_default` key says no, and nobody has said
+ * otherwise about this repository. */
+#define ATLAS_SEM_HOLD_POLICY_DEFAULT_OFF                                                          \
+    "the_root_owned_policy_disables_automatic_semantic_maintenance_by_default"
+/* Discovery ran and accepted nothing. Different from NO_COMPDB, which is about a
+ * build description that names none: this is about a repository where Atlas
+ * looked and there was nothing to find, which is a statement about the
+ * repository rather than about its configuration. */
+#define ATLAS_SEM_HOLD_NO_INPUTS "build_input_discovery_accepted_no_compilation_database"
+/* Atlas has not walked this repository yet, so it has no accepted inputs and no
+ * grounds to say there are none. Kept apart from NO_INPUTS for the reason this
+ * season exists: "I looked and there is nothing here" and "I have not looked"
+ * are different statements, and reporting the second as the first is the exact
+ * conflation A9.2.2's absence rule refuses one layer up. */
+#define ATLAS_SEM_HOLD_NOT_DISCOVERED "build_input_discovery_has_not_run_for_this_repository"
 #define ATLAS_SEM_HOLD_BUILDING "a_generation_is_already_being_built"
 #define ATLAS_SEM_HOLD_FAILED_UNCHANGED "the_last_attempt_failed_and_the_source_has_not_changed_since"
 #define ATLAS_SEM_HOLD_NO_LIBCLANG "this_atlas_was_built_without_libclang"
@@ -122,7 +159,37 @@ typedef struct atlas_sem_plan {
     const char *hold_reason; /* an ATLAS_SEM_HOLD_* string, or NULL */
 
     bool configured;
+    /* The effective answer — what the daemon acts on. Derived from the intent
+     * and the root-owned default by `atlas_sem_auto_effective`. */
     bool auto_rebuild;
+
+    /* --- A9.2.4: the third axis, and who decided it -------------------------
+     *
+     * Reported beside the effective answer rather than instead of it, for the
+     * reason every season since A9.1 reports its axes separately: `auto_rebuild
+     * = false` is one fact and three quite different situations, and a surface
+     * that showed only the boolean would tell an operator their repository is
+     * off without telling them whether that was their own doing, a machine-wide
+     * policy, or a default nobody has ever revisited. */
+    atlas_sem_auto_intent auto_intent;
+    atlas_sem_intent_source auto_intent_by;
+    bool policy_default;
+
+    /* Build-input discovery, as it stands now — not as the published generation
+     * recorded it. Both are reported: `discovery` says what Atlas can currently
+     * account for, `generation_discovery` says what the index being served was
+     * built under, and they differ exactly when a rebuild is due. */
+    atlas_sem_discovery discovery;
+    atlas_sem_discovery_mode discovery_mode;
+    atlas_sem_discovery generation_discovery;
+    int64_t inputs_accepted;
+    int64_t inputs_rejected;
+    char discovered_at[ATLAS_TS_MAX];
+    /* Why the last walk fell short, if it did — a ceiling, a directory Atlas
+     * could not enter, or a subtree an operator excluded. A fixed Atlas string,
+     * or "". A PARTIAL verdict without it tells an operator that something was
+     * missed without telling them what, which is not enough to act on. */
+    char discovery_limit[128];
 
     /* The generation being served, and the source identity of the tree as it is
      * now. Both reported so a surface can show the divergence rather than only
@@ -149,5 +216,18 @@ void atlas_sem_plan_init(atlas_sem_plan *p);
  * generation cannot see a build the caller has in flight. */
 atlas_status atlas_sem_plan_for(atlas_db *db, atlas_repo_info *repo, bool building,
                                 atlas_sem_plan *out, atlas_err *err);
+
+/* The same computation with the machine-wide default supplied rather than read.
+ *
+ * `atlas_sem_plan_for` reads the root-owned policy itself, which is what every
+ * ordinary caller wants. This form exists so that a test can drive the policy
+ * both ways without a root-owned file, and so that a caller which has already
+ * loaded the policy does not load it again per repository in a sweep. It is not
+ * a bypass: the parameter is a boolean the caller must have obtained from
+ * somewhere, and in the shipped binary every caller obtains it from
+ * `atlas_syspolicy_semantic_auto_default`. */
+atlas_status atlas_sem_plan_for_with_default(atlas_db *db, atlas_repo_info *repo, bool building,
+                                             bool policy_default, atlas_sem_plan *out,
+                                             atlas_err *err);
 
 #endif /* ATLAS_SEM_SCHEDULE_H */

@@ -140,7 +140,22 @@ typedef enum atlas_job_kind {
      * waits, because there is nothing here that can outlast a client. It is on
      * the writer thread for the ordinary reason — it writes, and exactly one
      * thread in this daemon writes. */
-    ATLAS_JOB_SEM_CONFIG
+    ATLAS_JOB_SEM_CONFIG,
+    /* A9.2.4. One bounded walk of one repository, looking for compilation
+     * databases, and the write that records what it found.
+     *
+     * It is a *separate* job from the index rather than a step inside one,
+     * because it has to happen for repositories that are never going to be
+     * built: an explicitly disabled repository still reports what Atlas can see,
+     * and — more importantly — a repository can only become DIRTY because a new
+     * build description appeared if something noticed it appearing. Folding
+     * discovery into the index would make the trigger depend on the thing it
+     * triggers.
+     *
+     * On the writer thread because it writes, and because exactly one thread in
+     * this daemon writes. The walk itself runs before the transaction opens,
+     * which is A1's rule about file reads. */
+    ATLAS_JOB_SEM_DISCOVER
 } atlas_job_kind;
 
 
@@ -316,6 +331,15 @@ atlas_status atlas_writer_maintenance(atlas_writer *w, const atlas_maintenance_o
 atlas_status atlas_writer_submit_sem_index(atlas_writer *w, int64_t repo_id, const char *name,
                                            const char *compdbs, size_t compdbs_len, bool rebuild,
                                            int64_t op_id, atlas_err *err);
+
+/* A9.2.4. Queues one bounded walk for compilation databases.
+ *
+ * Fire-and-forget: nobody polls for it, and what it produces is a durable
+ * candidate list. Coalesced against the queue, because a walk of a repository
+ * already waiting to be walked adds nothing and a slow writer must not
+ * accumulate a backlog of identical tree walks. */
+atlas_status atlas_writer_submit_sem_discover(atlas_writer *w, int64_t repo_id, const char *name,
+                                              atlas_err *err);
 
 /* A9.2.3. Whether a semantic index for this repository is queued or running.
  *

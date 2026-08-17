@@ -1338,6 +1338,16 @@ static const coverage_dim_entry COVERAGE_DIMS[] = {
      ATLAS_TREASON_RUNTIME_NOT_OBSERVED, "the running system was observed"},
     {ATLAS_COVDIM_DEPLOYED_CONFIG, "deployed_config", ATLAS_TREASON_DEPLOYED_CONFIG_UNAVAILABLE,
      ATLAS_TREASON_DEPLOYED_CONFIG_UNAVAILABLE, "deployed configuration was read"},
+    /* A9.2.4. Insufficiency here is COVERAGE_PARTIAL under both readings, and
+     * that sameness is deliberate rather than lazy: a walk that stopped early
+     * and a repository nobody walked are different *causes* with the same
+     * consequence, which is that the set of things Atlas read is smaller than
+     * the set it would have to have read. The cause is reported beside the
+     * verdict by `code sem-status`, which is where somebody acts on it; what
+     * belongs here is only what it means for a claim. */
+    {ATLAS_COVDIM_BUILD_INPUT_DISCOVERY, "build_input_discovery",
+     ATLAS_TREASON_COVERAGE_PARTIAL, ATLAS_TREASON_COVERAGE_PARTIAL,
+     "every compilation database relevant to this repository was discovered"},
 };
 
 /* The table and the enum must describe the same set. A dimension added to one
@@ -1674,6 +1684,12 @@ static const atlas_verify_coverage_dim DIMS_SYMBOL[] = {
     ATLAS_COVDIM_SEMANTIC_GENERATION,
     ATLAS_COVDIM_TRACKED_SOURCE,
     ATLAS_COVDIM_GENERATED_SOURCE,
+    /* A9.2.4. "This symbol is nowhere in the repository" rests on having read
+     * the repository, and what Atlas read is what the accepted compilation
+     * databases named. A database Atlas never found could name the file that
+     * defines the symbol — which is not hypothetical: it is what happened on the
+     * repository that produced this season. */
+    ATLAS_COVDIM_BUILD_INPUT_DISCOVERY,
 };
 
 static const atlas_verify_coverage_dim DIMS_PROVEN_EDGE[] = {
@@ -1686,6 +1702,10 @@ static const atlas_verify_coverage_dim DIMS_PROVEN_EDGE[] = {
      * verifiers rather than as a footnote. */
     ATLAS_COVDIM_SEMANTIC_GENERATION,
     ATLAS_COVDIM_DIRECT_CALLS,
+    /* An undiscovered compilation database could name the source holding the
+     * edge, so even this narrow negative depends on the search having been
+     * complete. */
+    ATLAS_COVDIM_BUILD_INPUT_DISCOVERY,
 };
 
 static const atlas_verify_coverage_dim DIMS_NO_PROVEN_CALLER[] = {
@@ -1695,6 +1715,7 @@ static const atlas_verify_coverage_dim DIMS_NO_PROVEN_CALLER[] = {
     ATLAS_COVDIM_DIRECT_CALLS,
     ATLAS_COVDIM_INDIRECT_CALLS,
     ATLAS_COVDIM_EXTERNAL_CALLERS,
+    ATLAS_COVDIM_BUILD_INPUT_DISCOVERY,
 };
 
 size_t atlas_verify_verifier_absence_dims(atlas_verify_verifier v,

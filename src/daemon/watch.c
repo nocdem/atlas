@@ -44,8 +44,10 @@
 #include "atlas/git.h"
 #include "atlas/safetext.h"
 #include "atlas/sem.h"
+#include "atlas/sem_discover.h"
 #include "atlas/sem_ops.h"
 #include "atlas/sem_schedule.h"
+#include "atlas/syspolicy.h"
 #include "daemon/daemon_internal.h"
 
 /* The events Atlas cares about.
@@ -232,6 +234,8 @@ struct atlas_watcher {
     int64_t last_recover_ms;
     /* A9.2.3. When the semantic freshness sweep last ran. */
     int64_t last_sem_sweep_ms;
+    /* A9.2.4. The bounded walk runs on its own, much slower, timer. */
+    int64_t last_discovery_sweep_ms;
 
     pthread_mutex_t stat_lock;
     int64_t watch_count; /* guarded by stat_lock */
@@ -957,6 +961,46 @@ static void recover_due(atlas_watcher *w) {
  * This runs on the watcher's thread because the watcher is the daemon's timer,
  * which is the argument A8's recovery sweep already makes. It holds a read-only
  * handle, so it cannot write and does not need to. */
+/* A9.2.4. The bounded walk, on its own much slower timer.
+ *
+ * Separate from the freshness sweep, and the asymmetry is the design rather than
+ * a compromise. The freshness sweep asks a question answered from the index and
+ * a handful of file digests, so it can run every fifteen seconds. Discovery
+ * walks a directory tree, which is the one expensive thing in this layer, so it
+ * runs on `ATLAS_SEM_DISCOVERY_INTERVAL_MS` — and everything stays correct in
+ * between, because the *content* of an already-accepted database is digested on
+ * every freshness read. An edited or deleted database therefore moves the source
+ * identity at once; only a *newly created* one waits for the next walk.
+ *
+ * It considers every registered repository, including ones an operator has
+ * explicitly disabled. Discovery is what a status surface reports, and a
+ * repository nobody is building still deserves an honest answer about what Atlas
+ * can see in it — refusing to look would make "explicitly disabled" also mean
+ * "and Atlas will not tell you what is there", which is not what an operator
+ * asked for. */
+static void discovery_sweep(atlas_watcher *w) {
+    int64_t t = now_ms();
+    if (w->last_discovery_sweep_ms != 0 &&
+        t - w->last_discovery_sweep_ms < ATLAS_SEM_DISCOVERY_INTERVAL_MS) {
+        return;
+    }
+    w->last_discovery_sweep_ms = t;
+    if (w->db == NULL || w->writer == NULL || !atlas_sem_available()) {
+        return;
+    }
+    for (size_t i = 0; i < w->repo_count; i++) {
+        repo_watch *rw = &w->repos[i];
+        atlas_err err;
+        atlas_err_init(&err);
+        (void)atlas_writer_submit_sem_discover(w->writer, rw->repo_id, atlas_buf_cstr(&rw->name),
+                                               &err);
+        /* A failure means the queue is full and this repository keeps the
+         * verdict it had. The next interval tries again — the same backpressure
+         * every sweep here uses, and nothing is lost by a walk that did not
+         * happen this time. */
+    }
+}
+
 static void sem_sweep(atlas_watcher *w) {
     int64_t t = now_ms();
     if (w->last_sem_sweep_ms != 0 && t - w->last_sem_sweep_ms < ATLAS_SEM_SWEEP_INTERVAL_MS) {
@@ -967,6 +1011,12 @@ static void sem_sweep(atlas_watcher *w) {
         return;
     }
 
+    /* A9.2.4. The root-owned answer to "may this daemon run a compiler over a
+     * repository nobody has spoken about?", read once for the whole sweep. */
+    atlas_syspolicy pol;
+    atlas_syspolicy_load(&pol);
+    const bool policy_default = atlas_syspolicy_semantic_auto_default(&pol);
+
     int64_t repos[ATLAS_SEM_SWEEP_MAX_REPOS];
     size_t n = 0;
     bool truncated = false;
@@ -975,7 +1025,7 @@ static void sem_sweep(atlas_watcher *w) {
     if (atlas_db_sem_config_repos(w->db, repos, ATLAS_SEM_SWEEP_MAX_REPOS, &n, &truncated, &err) !=
         ATLAS_OK) {
         atlas_daemon_log(w->log, "warn", "the semantic freshness sweep could not read the "
-                                         "configured repositories: %s",
+                                         "registered repositories: %s",
                          atlas_err_msg(&err));
         return;
     }
@@ -984,8 +1034,8 @@ static void sem_sweep(atlas_watcher *w) {
          * sweep is one that never rebuilds, and a bound that trims a result
          * without saying so is the one thing this layer must not have. */
         atlas_daemon_log(w->log, "warn",
-                         "more than %d repositories have a semantic build description; this "
-                         "sweep considered %zu of them",
+                         "more than %d repositories are registered; this semantic sweep "
+                         "considered %zu of them",
                          ATLAS_SEM_SWEEP_MAX_REPOS, n);
     }
 
@@ -1021,7 +1071,13 @@ static void sem_sweep(atlas_watcher *w) {
         atlas_sem_plan_init(&plan);
         atlas_err perr;
         atlas_err_init(&perr);
-        atlas_status pst = atlas_sem_plan_for(w->db, &info, in_flight, &plan, &perr);
+        /* The root-owned default, read once for the whole sweep rather than
+         * once per repository: it is a file on disk, the answer is the same for
+         * every repository in this pass, and a sweep that re-read it per
+         * repository could see it change halfway and treat two repositories
+         * under two policies. */
+        atlas_status pst = atlas_sem_plan_for_with_default(w->db, &info, in_flight, policy_default,
+                                                           &plan, &perr);
         atlas_repo_info_free(&info);
         if (pst != ATLAS_OK) {
             atlas_daemon_log(w->log, "warn", "cannot plan a semantic rebuild: %s",
@@ -1032,16 +1088,15 @@ static void sem_sweep(atlas_watcher *w) {
             continue;
         }
 
-        atlas_sem_config cfg;
-        atlas_sem_config_init(&cfg);
+        /* A9.2.4: what discovery accepted, not what an operator pinned. A
+         * repository whose compilation databases were found rather than named
+         * has an empty pinned list and a full accepted one, and reading the
+         * pinned list here would mean the daemon never builds exactly the
+         * repositories this season exists to maintain. */
         atlas_buf list = ATLAS_BUF_INIT;
         atlas_err cerr;
         atlas_err_init(&cerr);
-        atlas_status cst = atlas_db_sem_config_get(w->db, rw->repo_id, &cfg, &cerr);
-        if (cst == ATLAS_OK) {
-            cst = atlas_sem_config_unpack(atlas_buf_cstr(&cfg.compdbs), &list, NULL, &cerr);
-        }
-        atlas_sem_config_free(&cfg);
+        atlas_status cst = atlas_sem_accepted_inputs(w->db, rw->repo_id, &list, NULL, &cerr);
         if (cst != ATLAS_OK || list.len == 0) {
             atlas_buf_free(&list);
             continue;
@@ -1220,6 +1275,7 @@ static void *watcher_main(void *arg) {
         /* After `submit_due`, deliberately: the semantic sweep holds while the
          * file index is behind, so asking it before the reconciliation pass has
          * even been queued would only ever produce that hold. */
+        discovery_sweep(w);
         sem_sweep(w);
         (void)pthread_mutex_lock(&w->stat_lock);
         w->watch_count = (int64_t)w->map.count;

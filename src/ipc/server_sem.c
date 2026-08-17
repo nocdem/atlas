@@ -20,6 +20,7 @@
  */
 #include <string.h>
 
+#include "atlas/sem_discover.h"
 #include "atlas/sem.h"
 #include "atlas/sem_ops.h"
 #include "atlas/service.h"
@@ -313,6 +314,21 @@ static atlas_status method_sem_status(dispatch_state *ds, const atlas_ipc_reques
     }
     if (st == ATLAS_OK) {
         st = atlas_json_key_int(ds->j, "scope_uncovered", gen.scope_uncovered, err);
+    }
+    /* A9.2.4. The generation's own record of the input universe it was sealed
+     * under. Reported on the generation rather than only on the plan, because
+     * they answer different questions: the plan says what Atlas can account for
+     * *now*, and this says what the index being served was built under. They
+     * differ exactly when a rebuild is due, which is the moment somebody wants
+     * to see both. */
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "discovery", atlas_sem_discovery_name(gen.discovery), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "input_count", gen.input_count, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "scope_excluded", gen.scope_excluded, err);
     }
     if (st == ATLAS_OK) {
         st = atlas_json_key_bool(ds->j, "test_scope_known", gen.test_scope_known, err);
@@ -1050,12 +1066,114 @@ static atlas_status write_sem_plan_fields(dispatch_state *ds, const atlas_sem_st
         st = atlas_json_key_str_opt(ds->j, "generation_identity", p->generation_identity, err);
     }
 
+    /* --- A9.2.4 ---
+     *
+     * The activation intent and its provenance travel beside the effective
+     * boolean rather than instead of it, because `auto_rebuild = false` is one
+     * value and three different situations: an operator's refusal, a
+     * machine-wide default, and a default nobody has ever revisited. A client
+     * that could only see the boolean would tell somebody their repository is
+     * off without telling them whose decision that was.
+     *
+     * Discovery travels as three separate values for the same reason A9.2.3
+     * sends freshness and coverage separately: what Atlas can currently account
+     * for, what the served generation was built under, and how many candidates
+     * were accepted or refused are four questions, and a fold of them would hide
+     * exactly the state this season exists to expose. */
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "auto_intent", atlas_sem_auto_intent_name(p->auto_intent),
+                                err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "auto_intent_by",
+                                atlas_sem_intent_source_name(p->auto_intent_by), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(ds->j, "policy_default", p->policy_default, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "discovery", atlas_sem_discovery_name(p->discovery), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "discovery_mode",
+                                atlas_sem_discovery_mode_name(p->discovery_mode), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "generation_discovery",
+                                atlas_sem_discovery_name(p->generation_discovery), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "inputs_accepted", p->inputs_accepted, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "inputs_rejected", p->inputs_rejected, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str_opt(ds->j, "discovered_at", p->discovered_at, err);
+    }
+    if (st == ATLAS_OK) {
+        /* Encoded like every other value that could in principle have come from
+         * outside — it cannot here, being one of a fixed set of Atlas strings,
+         * and encoding it costs nothing and removes the question. */
+        st = atlas_json_key_str_opt(ds->j, "discovery_limit",
+                                    p->discovery_limit[0] != '\0'
+                                        ? atlas_safe(&ds->safe, p->discovery_limit)
+                                        : NULL,
+                                    err);
+    }
+
+    /* Every candidate, accepted and rejected, with the reason for each.
+     *
+     * Rejected candidates are sent because a candidate nobody is shown is
+     * indistinguishable from one that does not exist — which is precisely what
+     * kept a third compilation database invisible for a season. The reason is
+     * checked against Atlas' own closed set before it crosses the socket, so a
+     * value from anywhere else becomes absent rather than reproduced. */
+    if (st == ATLAS_OK) {
+        st = atlas_json_key(ds->j, "build_inputs", err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_arr_begin(ds->j, err);
+    }
+    for (size_t i = 0; i < rep->input_count && st == ATLAS_OK; i++) {
+        const struct atlas_sem_input *in = &rep->inputs[i];
+        st = atlas_json_obj_begin(ds->j, err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(ds->j, "path", atlas_safe(&ds->safe, in->path), err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(ds->j, "origin", atlas_sem_input_origin_name(in->origin), err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_bool(ds->j, "accepted", in->accepted, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str_opt(
+                ds->j, "reject_reason",
+                atlas_sem_reject_reason_is_known(in->reject_reason) ? in->reject_reason : NULL,
+                err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str_opt(ds->j, "digest", in->digest, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_int(ds->j, "units", in->unit_count, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_obj_end(ds->j, err);
+        }
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_arr_end(ds->j, err);
+    }
+
     /* The declared lists, each element its own string. Sent as arrays rather
      * than as the newline-joined storage form: a client must not have to parse
      * a separator to find out what an operator configured. */
-    static const char *const KEYS[2] = {"compdbs", "test_roots"};
-    const atlas_buf *const BUFS[2] = {&rep->compdbs, &rep->test_roots};
-    for (size_t k = 0; k < 2 && st == ATLAS_OK; k++) {
+    static const char *const KEYS[4] = {"compdbs", "test_roots", "excludes", "vendor_roots"};
+    const atlas_buf *const BUFS[4] = {&rep->compdbs, &rep->test_roots, &rep->excludes,
+                                      &rep->vendor_roots};
+    for (size_t k = 0; k < 4 && st == ATLAS_OK; k++) {
         st = atlas_json_key(ds->j, KEYS[k], err);
         if (st == ATLAS_OK) {
             st = atlas_json_arr_begin(ds->j, err);

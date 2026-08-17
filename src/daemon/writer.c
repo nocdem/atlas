@@ -23,6 +23,7 @@
 #include "atlas/safetext.h"
 #include "atlas/maintenance.h"
 #include "atlas/ops.h"
+#include "atlas/sem_discover.h"
 #include "atlas/sem.h"
 #include "atlas/sem_ops.h"
 #include "atlas/service.h"
@@ -486,6 +487,43 @@ static void mark_all_repos_gapped(atlas_db *db, const char *detail) {
  * previous one is still being served and publishes it in one statement, so a
  * failure at any point leaves the old generation current and a RUNNING one that
  * nothing points at. That is also what makes a crash mid-index survivable. */
+/* A9.2.4. One bounded walk of one repository, and the write that records it.
+ *
+ * Everything about how the walk is bounded is in `atlas_sem_discover`; what
+ * belongs here is only that this runs on the writer thread and that a failure is
+ * logged rather than propagated — nobody asked for this walk and nobody is
+ * waiting for it. A repository whose root cannot be opened keeps the verdict it
+ * had: "Atlas could not look this time" is not evidence that what it found last
+ * time is wrong. */
+static void run_sem_discover(atlas_writer *w, atlas_job *j) {
+    atlas_err err;
+    atlas_err_init(&err);
+    atlas_repo_info repo;
+    atlas_repo_info_init(&repo);
+    bool found = false;
+    if (atlas_db_repo_get(w->db, atlas_buf_cstr(&j->arg1), &repo, &found, &err) != ATLAS_OK ||
+        !found) {
+        atlas_repo_info_free(&repo);
+        return;
+    }
+    atlas_sem_discovery_result res;
+    atlas_sem_discovery_result_init(&res);
+    if (atlas_sem_discovery_run(w->db, &repo, &res, &err) != ATLAS_OK) {
+        atlas_daemon_log(w->log, "warn",
+                         "build-input discovery could not run for repository %lld: %s",
+                         (long long)j->repo_id, atlas_err_msg(&err));
+    } else if (res.limit_reached) {
+        /* Every bound that is reached is reported — A8-CI's rule, and it matters
+         * more here than usual: a walk that stopped early is why a repository
+         * can never state an absence, and an operator who is not told will spend
+         * their time looking at coverage instead. */
+        atlas_daemon_log(w->log, "warn",
+                         "build-input discovery for repository %lld is PARTIAL: %s",
+                         (long long)j->repo_id, res.limit_detail);
+    }
+    atlas_repo_info_free(&repo);
+}
+
 static void run_sem_index(atlas_writer *w, atlas_job *j) {
     /* Claimed for the whole job, so `atlas_writer_sem_index_pending` covers the
      * window before a generation row exists as well as the one after. */
@@ -513,10 +551,22 @@ static void run_sem_index(atlas_writer *w, atlas_job *j) {
      * by the indexer, and nothing here re-resolves them from a string. */
     const char *compdbs[ATLAS_SEM_MAX_COMPDBS];
     size_t n = 0;
+    /* A9.2.4. An empty list is not "nothing to do": it means *use what discovery
+     * accepted*, which is how every automatic build now arrives. A caller that
+     * names databases explicitly — an operator running `code index --compdb` —
+     * still gets exactly those, because naming them is a deliberate act about a
+     * particular build and discovery is not entitled to overrule it. */
+    atlas_buf accepted = ATLAS_BUF_INIT;
+    if (st == ATLAS_OK && j->arg2.len == 0) {
+        atlas_err ignored;
+        atlas_err_init(&ignored);
+        (void)atlas_sem_accepted_inputs(w->db, j->repo_id, &accepted, NULL, &ignored);
+    }
     if (st == ATLAS_OK) {
-        const char *p = atlas_buf_cstr(&j->arg2);
-        const char *end = p + j->arg2.len;
-        while (p < end && n < ATLAS_SEM_MAX_COMPDBS) {
+        const char *p = j->arg2.len > 0 ? atlas_buf_cstr(&j->arg2) : (const char *)accepted.data;
+        size_t len = j->arg2.len > 0 ? j->arg2.len : accepted.len;
+        const char *end = p != NULL ? p + len : NULL;
+        while (p != NULL && p < end && n < ATLAS_SEM_MAX_COMPDBS) {
             compdbs[n++] = p;
             p += strlen(p) + 1u;
         }
@@ -583,16 +633,28 @@ static void run_sem_index(atlas_writer *w, atlas_job *j) {
          * way a complete one is. */
         (void)atlas_buf_appendf(&detail, &derr,
                                 "generation=%lld units=%lld complete=%lld partial=%lld "
-                                "failed=%lld unsupported=%lld symbols=%lld edges=%lld",
+                                "failed=%lld unsupported=%lld symbols=%lld edges=%lld "
+                                /* A9.2.4. How much work *this pass* did, which the
+                                 * generation deliberately does not record — it reports
+                                 * the rows it holds, which is a different question and
+                                 * the one A8-CI's closure fixed. The remote form reads
+                                 * its summary from the generation, so without these two
+                                 * `code index` on a deployed machine reported
+                                 * "parsed 0, reused 0" after parsing every unit in the
+                                 * repository. Under A7.1 the socket is the operator's
+                                 * only path, so that was the *only* thing they saw. */
+                                "parsed=%lld reused=%lld",
                                 (long long)sum.generation_id, (long long)sum.units_total,
                                 (long long)sum.units_complete, (long long)sum.units_partial,
                                 (long long)sum.units_failed, (long long)sum.units_unsupported,
-                                (long long)sum.symbols, (long long)sum.edges);
+                                (long long)sum.symbols, (long long)sum.edges,
+                                (long long)sum.units_parsed, (long long)sum.units_reused);
     }
     atlas_ops_finish(w->ops, j->op_id, st,
                      st == ATLAS_OK ? "semantic index published" : atlas_err_msg(&err),
                      atlas_buf_cstr(&detail));
     atlas_buf_free(&detail);
+    atlas_buf_free(&accepted);
     atlas_repo_info_free(&repo);
 
     /* Released on every path, including the failing ones. A claim left behind
@@ -723,6 +785,7 @@ static void *writer_main(void *arg) {
         case ATLAS_JOB_VERIFY: run_verify(w, j); break;
         case ATLAS_JOB_SNAPSHOT: run_snapshot(w, j); break;
         case ATLAS_JOB_SEM_INDEX: run_sem_index(w, j); break;
+        case ATLAS_JOB_SEM_DISCOVER: run_sem_discover(w, j); break;
         case ATLAS_JOB_MAINTENANCE: {
             /* Both pointers belong to a caller that may have stopped waiting;
              * cleared under the lock in that case, so a NULL here means the
@@ -1675,6 +1738,50 @@ atlas_status atlas_writer_submit_sem_index(atlas_writer *w, int64_t repo_id, con
     (void)pthread_mutex_unlock(&w->lock);
     if (!queued) {
         job_free(j);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "the Atlas daemon's write queue is full");
+    }
+    return ATLAS_OK;
+}
+
+/* A9.2.4. Queues one bounded walk of one repository.
+ *
+ * Fire-and-forget, like the automatic index: nobody is polling for it, and what
+ * it produces is a durable candidate list an operator reads through
+ * `code sem-status`. A failure means the repository keeps the verdict it had,
+ * and the next interval tries again — the same backpressure the freshness sweep
+ * uses, and nothing is lost by a walk that did not happen this time. */
+atlas_status atlas_writer_submit_sem_discover(atlas_writer *w, int64_t repo_id, const char *name,
+                                              atlas_err *err) {
+    atlas_job *j = job_new(ATLAS_JOB_SEM_DISCOVER);
+    if (j == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory queueing build-input discovery");
+    }
+    j->repo_id = repo_id;
+    atlas_status st = atlas_buf_set_str(&j->arg1, name, err);
+    if (st != ATLAS_OK) {
+        job_free(j);
+        return st;
+    }
+    (void)pthread_mutex_lock(&w->lock);
+    /* Coalesced against the queue for the reason the reconcile job is: a walk of
+     * a repository already waiting to be walked adds nothing, and a slow writer
+     * must not accumulate a backlog of identical tree walks. */
+    bool duplicate = false;
+    for (size_t k = 0; !duplicate && k < w->count; k++) {
+        const atlas_job *q = w->queue[(w->head + k) % ATLAS_WRITER_QUEUE_MAX];
+        if (q->kind == ATLAS_JOB_SEM_DISCOVER && q->repo_id == repo_id) {
+            duplicate = true;
+        }
+    }
+    bool queued = duplicate || (!w->stopping && queue_push(w, j));
+    if (queued && !duplicate) {
+        (void)pthread_cond_signal(&w->not_empty);
+    }
+    (void)pthread_mutex_unlock(&w->lock);
+    if (duplicate || !queued) {
+        job_free(j);
+    }
+    if (!queued) {
         return atlas_err_set(err, ATLAS_ERR_INTERNAL, "the Atlas daemon's write queue is full");
     }
     return ATLAS_OK;

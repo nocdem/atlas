@@ -208,6 +208,24 @@ static atlas_status collect_edge(const atlas_sem_edge_row *row, void *ud, atlas_
     return ATLAS_OK;
 }
 
+/* A9.2.4. One scalar from a SQL query, for the two assertions below that are
+ * about *rows* rather than about anything the service layer reports.
+ *
+ * Deliberately raw SQL rather than a new typed operation: what is being checked
+ * is an invariant of the storage — that no edge references a unit outside its
+ * own generation — and a typed reader would be a second place for the same
+ * mistake to hide. */
+static int64_t count_of(env *e, const char *sql, atlas_err *err) {
+    sqlite3_stmt *stmt = NULL;
+    T_OK(atlas_db_prepare(e->db, sql, &stmt, err), err);
+    int64_t n = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        n = sqlite3_column_int64(stmt, 0);
+    }
+    atlas_db_finish(e->db, stmt);
+    return n;
+}
+
 static size_t symbols_named(env *e, int64_t gen, const char *name, symbol_bag *bag,
                             atlas_err *err) {
     memset(bag, 0, sizeof(*bag));
@@ -494,7 +512,7 @@ static void test_replacement_is_atomic_and_failure_preserves(void) {
     T_OK(atlas_db_sem_current(e.db, e.repo_id, &g, &found, &err), &err);
     T_CHECK_MSG(!found, "a generation existed before anything was indexed");
     const char *reason = NULL;
-    T_CHECK(atlas_sem_freshness_of(&g, false, false, "", "", "", true, &reason) ==
+    T_CHECK(atlas_sem_freshness_of(&g, false, false, "", "", "", NULL, true, &reason) ==
             ATLAS_SEM_FRESH_ABSENT);
 
     atlas_sem_index_summary first;
@@ -528,26 +546,26 @@ static void test_replacement_is_atomic_and_failure_preserves(void) {
 
     /* Freshness is recomputed, never cached: the same stored generation reports
      * CURRENT or STALE according to what it is compared against. */
-    T_CHECK(atlas_sem_freshness_of(&g, true, false, "", "", "", true, &reason) ==
+    T_CHECK(atlas_sem_freshness_of(&g, true, false, "", "", "", NULL, true, &reason) ==
             ATLAS_SEM_FRESH_CURRENT);
     T_CHECK(reason == NULL);
 
     atlas_sem_generation moved = g;
     (void)snprintf(moved.commit_id, sizeof moved.commit_id, "%s", "0123456789abcdef");
-    T_CHECK(atlas_sem_freshness_of(&moved, true, false, "fedcba9876543210", "", "", true, &reason) ==
+    T_CHECK(atlas_sem_freshness_of(&moved, true, false, "fedcba9876543210", "", "", NULL, true, &reason) ==
             ATLAS_SEM_FRESH_STALE);
     T_CHECK_MSG(reason != NULL && strcmp(reason, ATLAS_SEM_STALE_COMMIT) == 0,
                 "a moved commit did not report the commit reason");
 
     atlas_sem_generation reanalyzed = g;
     reanalyzed.analyzer_version = ATLAS_SEM_ANALYZER_VERSION + 1;
-    T_CHECK(atlas_sem_freshness_of(&reanalyzed, true, false, "", "", "", true, &reason) ==
+    T_CHECK(atlas_sem_freshness_of(&reanalyzed, true, false, "", "", "", NULL, true, &reason) ==
             ATLAS_SEM_FRESH_STALE);
     T_CHECK_MSG(reason != NULL && strcmp(reason, ATLAS_SEM_STALE_ANALYZER) == 0,
                 "a changed analyzer did not report the analyzer reason");
 
     /* A graph built on a file index nobody can vouch for is not one to act on. */
-    T_CHECK(atlas_sem_freshness_of(&g, true, false, "", "", "", false, &reason) ==
+    T_CHECK(atlas_sem_freshness_of(&g, true, false, "", "", "", NULL, false, &reason) ==
             ATLAS_SEM_FRESH_STALE);
     T_CHECK_MSG(reason != NULL && strcmp(reason, ATLAS_SEM_STALE_FILE_INDEX) == 0,
                 "a stale file index did not report its reason");
@@ -570,14 +588,14 @@ static void test_replacement_is_atomic_and_failure_preserves(void) {
     {
         /* absent — no generation has ever completed. */
         const char *r = NULL;
-        T_CHECK_MSG(atlas_sem_freshness_of(NULL, false, false, "", "", "", true, &r) ==
+        T_CHECK_MSG(atlas_sem_freshness_of(NULL, false, false, "", "", "", NULL, true, &r) ==
                         ATLAS_SEM_FRESH_ABSENT,
                     "a repository that was never indexed did not report ABSENT");
         T_CHECK_MSG(r == NULL, "ABSENT carried a staleness reason, which it cannot have");
 
         /* current — complete, and nothing it depends on has moved. */
         r = NULL;
-        T_CHECK_MSG(atlas_sem_freshness_of(&g, true, false, "", "", "", true, &r) ==
+        T_CHECK_MSG(atlas_sem_freshness_of(&g, true, false, "", "", "", NULL, true, &r) ==
                         ATLAS_SEM_FRESH_CURRENT,
                     "a complete generation against unmoved inputs did not report CURRENT");
         T_CHECK_MSG(r == NULL, "CURRENT carried a staleness reason");
@@ -588,7 +606,7 @@ static void test_replacement_is_atomic_and_failure_preserves(void) {
         atlas_sem_generation part = g;
         part.status = ATLAS_SEM_GEN_RUNNING;
         r = NULL;
-        T_CHECK_MSG(atlas_sem_freshness_of(&part, true, false, "", "", "", true, &r) ==
+        T_CHECK_MSG(atlas_sem_freshness_of(&part, true, false, "", "", "", NULL, true, &r) ==
                         ATLAS_SEM_FRESH_STALE,
                     "a generation that never completed was served as if it had");
         T_CHECK_MSG(r != NULL && strcmp(r, ATLAS_SEM_STALE_INCOMPLETE) == 0,
@@ -597,7 +615,7 @@ static void test_replacement_is_atomic_and_failure_preserves(void) {
 
         part.status = ATLAS_SEM_GEN_FAILED;
         r = NULL;
-        T_CHECK_MSG(atlas_sem_freshness_of(&part, true, false, "", "", "", true, &r) ==
+        T_CHECK_MSG(atlas_sem_freshness_of(&part, true, false, "", "", "", NULL, true, &r) ==
                         ATLAS_SEM_FRESH_STALE,
                     "a failed generation was served as if it had completed");
         T_CHECK_MSG(r != NULL && strcmp(r, ATLAS_SEM_STALE_INCOMPLETE) == 0,
@@ -608,7 +626,7 @@ static void test_replacement_is_atomic_and_failure_preserves(void) {
          * reported as merely out of date by a commit. */
         part.status = ATLAS_SEM_GEN_RUNNING;
         r = NULL;
-        T_CHECK(atlas_sem_freshness_of(&part, true, false, "fedcba9876543210", "", "", false, &r) ==
+        T_CHECK(atlas_sem_freshness_of(&part, true, false, "fedcba9876543210", "", "", NULL, false, &r) ==
                 ATLAS_SEM_FRESH_STALE);
         T_CHECK_MSG(r != NULL && strcmp(r, ATLAS_SEM_STALE_INCOMPLETE) == 0,
                     "an incomplete generation reported a different reason when other inputs "
@@ -680,6 +698,43 @@ static void test_incremental_notices_a_deeply_nested_header(void) {
     symbol_bag bag;
     size_t n = symbols_named(&e, third.generation_id, "entry", &bag, &err);
     T_CHECK_MSG(n >= 1, "the carried-forward unit's symbols did not survive the copy");
+
+    /* **And every edge must belong to a unit of its own generation.**
+     *
+     * A9.2.4 found the alternative in production: the copy carried
+     * `sem_edges.unit_id` across verbatim, so a carried edge pointed at the
+     * *ancestor* generation's unit row. Nothing failed at the time. What failed
+     * was the pass after that, which selects the edges to carry by joining
+     * `sem_units` — once the ancestor's rows were pruned the join found nothing,
+     * and the call graph decayed on every rebuild. On the acceptance repository
+     * 475,741 edges became 10,631 over four passes, 3,479 of them dangling.
+     *
+     * Two assertions, because each catches a different half: no edge may
+     * reference a unit outside this generation, and the generation's edge count
+     * must not collapse against the full pass that preceded it. The first is the
+     * defect; the second is what an operator would eventually notice. */
+    int64_t foreign = count_of(&e,
+                               "SELECT COUNT(*) FROM sem_edges e"
+                               " LEFT JOIN sem_units u ON u.id = e.unit_id"
+                               " WHERE e.generation_id = (SELECT MAX(id) FROM sem_generations)"
+                               "   AND (u.id IS NULL OR u.generation_id <> e.generation_id);",
+                               &err);
+    T_CHECK_MSG(foreign == 0,
+                "%lld carried-forward edges reference a unit outside their own generation",
+                (long long)foreign);
+
+    int64_t before_edges = count_of(&e,
+                                    "SELECT edge_count FROM sem_generations"
+                                    " WHERE id = (SELECT MAX(id) FROM sem_generations"
+                                    "             WHERE id < (SELECT MAX(id) FROM sem_generations));",
+                                    &err);
+    int64_t after_edges = count_of(&e,
+                                   "SELECT edge_count FROM sem_generations"
+                                   " WHERE id = (SELECT MAX(id) FROM sem_generations);",
+                                   &err);
+    T_CHECK_MSG(before_edges == 0 || after_edges >= before_edges / 2,
+                "an incremental generation lost most of its edges: %lld became %lld",
+                (long long)before_edges, (long long)after_edges);
 
     env_close(&e);
 }

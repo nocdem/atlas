@@ -43,9 +43,12 @@ typedef struct atlas_cli_opts {
     const char *task;
     long max_tokens;
     bool history;
-    /* A8-CI: `code index --compdb PATH`, repeatable. Repository-relative, and
-     * never discovered: Atlas does not search a repository for a file that
-     * tells it how to compile things. */
+    /* A8-CI: `code index --compdb PATH`, repeatable. Repository-relative.
+     *
+     * A9.2.4: optional, and no longer the whole story. With none given, the
+     * databases are whatever build-input discovery accepted; with some, exactly
+     * those, because naming one is a deliberate act about a particular build and
+     * discovery is not entitled to overrule it. */
     const char *compdbs[32];
     size_t compdb_count;
     /* A9.2.3: `code sem-config NAME --test-root PATH`, repeatable. Declared
@@ -62,6 +65,24 @@ typedef struct atlas_cli_opts {
      * stored value is left alone — an operator adjusting a path list must not
      * turn automatic rebuilding on or off as a side effect. */
     int auto_rebuild;
+    /* A9.2.4: `code sem-config NAME --exclude PATH`, repeatable. Prefixes the
+     * build-input walk does not enter. Declared rather than guessed, for the
+     * reason test roots are, and *shown* on every status surface: an exclusion
+     * nobody can see is a hole in the search universe nobody can see. */
+    const char *excludes[32];
+    size_t exclude_count;
+    bool excludes_given;
+    /* A9.2.4: `--vendor-root PATH`, repeatable. Prefixes an operator declares to
+     * be somebody else's code; candidates under one are reported as excluded
+     * rather than as uncovered. */
+    const char *vendor_roots[32];
+    size_t vendor_root_count;
+    bool vendor_roots_given;
+    /* A9.2.4: `--discover` / `--no-discover`. Negative means neither was given.
+     * Zero is AUTOMATIC (walk the repository), positive is MANUAL (use only the
+     * pinned list, and report discovery as UNKNOWN — because a pinned list is a
+     * list somebody wrote, and this season exists because one was incomplete). */
+    int discovery_mode;
     /* A9: `api-key create --label L --scope S [--scope S...]`.
      *
      * `--scope` is repeatable and every value must be in the closed vocabulary;

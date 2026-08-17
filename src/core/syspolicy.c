@@ -69,6 +69,30 @@ bool atlas_syspolicy_permits(const atlas_syspolicy *p, long long uid) {
     return false;
 }
 
+/* A9.2.4. The policy's answer where it gives one, and the named compiled-in
+ * default where it does not.
+ *
+ * Deliberately not sensitive to `state`: an absent or legacy policy is the
+ * ordinary condition of a per-user install, and reading it as "disabled" would
+ * make the reversal apply only on separated deployments — which is the one shape
+ * of machine where an operator is most likely to have configured something
+ * deliberately. The absence of a policy is the absence of a statement, and the
+ * default is what a missing statement means. */
+bool atlas_syspolicy_semantic_auto_default(const atlas_syspolicy *p) {
+    if (p == NULL) {
+        return ATLAS_SEM_AUTO_DEFAULT;
+    }
+    switch (p->semantic_auto_default) {
+    case ATLAS_SYSPOLICY_SEMAUTO_ENABLED:
+        return true;
+    case ATLAS_SYSPOLICY_SEMAUTO_DISABLED:
+        return false;
+    case ATLAS_SYSPOLICY_SEMAUTO_UNSET:
+        break;
+    }
+    return ATLAS_SEM_AUTO_DEFAULT;
+}
+
 /* --- parsing ---------------------------------------------------------------
  *
  * Deliberately dull. One `key = value` per line, `#` comments, no quoting, no
@@ -250,6 +274,19 @@ void atlas_syspolicy_load_at(const char *path, atlas_syspolicy *out) {
                 return;
             }
             out->client_uids[out->client_count++] = uid;
+        } else if (take_value(line, len, "semantic_auto_default", &val, &vlen)) {
+            /* A9.2.4. Two spellings and nothing else; an unrecognised value is
+             * malformed rather than treated as one of them. A policy whose
+             * author wrote `yes` and whose reader silently chose `DISABLED` is
+             * the failure this parser's dullness exists to prevent. */
+            if (vlen == 7 && strncmp(val, "ENABLED", 7) == 0) {
+                out->semantic_auto_default = ATLAS_SYSPOLICY_SEMAUTO_ENABLED;
+            } else if (vlen == 8 && strncmp(val, "DISABLED", 8) == 0) {
+                out->semantic_auto_default = ATLAS_SYSPOLICY_SEMAUTO_DISABLED;
+            } else {
+                out->reason = ATLAS_SYSPOLICY_REASON_MALFORMED;
+                return;
+            }
         } else {
             /* An unrecognised key is malformed rather than ignored. A policy
              * Atlas half-understands is one whose author believes they

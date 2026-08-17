@@ -78,6 +78,16 @@ static const char *const FORBIDDEN_METHODS[] = {
     "code.index", "code.sem_config", "Code.Sem_Config", "CODE.SEM_CONFIG",
     "code.semconfig", "code.sem-config", "sem.config", "sem.config_set",
     "sem.index", "sem.rebuild", "code.rebuild",
+    /* A9.2.4. Discovery decides what a compiler is run *over*, and activation
+     * decides whether one runs at all — so every verb somebody would reach for
+     * to declare a search complete, add a build input, enable maintenance or
+     * clear an operator's refusal is enumerated here. None of them exists:
+     * `sem.status` already carries the whole derived state as a read, and a
+     * separate verb would only be a second surface to defend. */
+    "sem.discover", "code.discover", "sem.discovery", "code.sem_discover",
+    "sem.enable", "sem.disable", "code.sem_enable", "code.sem_disable",
+    "sem.set_discovery", "sem.set_auto", "sem.compdb_add", "code.compdb_add",
+    "sem.mark_complete", "sem.mark_current", "sem.build_inputs_set",
     /* The daemon's own lifecycle. */
     "daemon.shutdown", "daemon.stop", "daemon.restart",
     /* And the ones an orchestration phase would reach for if somebody decided a

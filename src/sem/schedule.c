@@ -13,13 +13,25 @@
  * refusal the ones after it never get to overrule:
  *
  *   1. no libclang — this Atlas cannot build an index at all;
- *   2. no build description, or automatic rebuild not enabled — an operator has
- *      not authorised a compiler to run over this repository, and A8-CI's rule
- *      that no model can cause one to run survives A9.2.3 because of this line;
- *   3. a build is already in flight;
- *   4. the last automatic attempt failed and nothing has changed since;
- *   5. freshness, which is A8-CI's axis;
- *   6. coverage, which is A9.2.3's.
+ *   2. an operator explicitly refused maintenance for this repository, which no
+ *      machine-wide default overrules in either direction;
+ *   3. the root-owned default says no and nobody has said otherwise;
+ *   4. build-input discovery accepted nothing — either because Atlas walked and
+ *      found nothing, or because it has not walked yet, which are different
+ *      statements and get different reasons;
+ *   5. a build is already in flight;
+ *   6. the last automatic attempt failed and nothing has changed since;
+ *   7. freshness, which is A8-CI's axis;
+ *   8. coverage, which is A9.2.3's and which A9.2.4 widened to include whether
+ *      the *search for build inputs* was complete.
+ *
+ * A9.2.4 reversed A9.2.3's second check. It used to be "no build description, or
+ * automatic rebuild not enabled", which kept A8-CI's rule that no model can cause
+ * a compiler to run by refusing for every repository nobody had configured. That
+ * rule survives, and now survives elsewhere: enabling is still operator-only —
+ * there is no MCP tool, gateway route or ordinary RPC method that reaches it —
+ * and what a repository nobody has spoken about does is a root-owned decision
+ * rather than a compiled-in refusal. See `atlas_sem_auto_effective`.
  */
 #include "atlas/sem_schedule.h"
 
@@ -27,12 +39,18 @@
 #include <string.h>
 
 #include "atlas/atlas.h"
+#include "atlas/sem_discover.h"
 #include "atlas/sem_ops.h"
+#include "atlas/syspolicy.h"
 
 const char *atlas_sem_activity_name(atlas_sem_activity a) {
     switch (a) {
     case ATLAS_SEM_ACT_DISABLED:
         return "DISABLED";
+    case ATLAS_SEM_ACT_EXPLICITLY_DISABLED:
+        return "EXPLICITLY_DISABLED";
+    case ATLAS_SEM_ACT_NO_INPUTS:
+        return "NO_INPUTS";
     case ATLAS_SEM_ACT_UNAVAILABLE:
         return "UNAVAILABLE";
     case ATLAS_SEM_ACT_CURRENT:
@@ -59,10 +77,12 @@ const char *atlas_sem_activity_name(atlas_sem_activity a) {
  * as `atlas_sem_why_intern` and `atlas_sem_stale_reason_intern`. */
 const char *atlas_sem_hold_intern(const char *reason) {
     static const char *const HOLDS[] = {
-        ATLAS_SEM_HOLD_DISABLED,         ATLAS_SEM_HOLD_NO_COMPDB,
-        ATLAS_SEM_HOLD_BUILDING,         ATLAS_SEM_HOLD_FAILED_UNCHANGED,
-        ATLAS_SEM_HOLD_NO_LIBCLANG,      ATLAS_SEM_HOLD_CURRENT,
-        ATLAS_SEM_HOLD_FILE_INDEX,
+        ATLAS_SEM_HOLD_DISABLED,          ATLAS_SEM_HOLD_NO_COMPDB,
+        ATLAS_SEM_HOLD_BUILDING,          ATLAS_SEM_HOLD_FAILED_UNCHANGED,
+        ATLAS_SEM_HOLD_NO_LIBCLANG,       ATLAS_SEM_HOLD_CURRENT,
+        ATLAS_SEM_HOLD_FILE_INDEX,        ATLAS_SEM_HOLD_EXPLICIT_DISABLE,
+        ATLAS_SEM_HOLD_POLICY_DEFAULT_OFF, ATLAS_SEM_HOLD_NO_INPUTS,
+        ATLAS_SEM_HOLD_NOT_DISCOVERED,
     };
     if (reason == NULL) {
         return NULL;
@@ -99,6 +119,16 @@ void atlas_sem_plan_init(atlas_sem_plan *p) {
  * database never named, and an enumeration Atlas cannot vouch for — and every
  * one of them means the generation cannot support "there is no X". */
 static bool coverage_is_complete(const atlas_sem_generation *g) {
+    if (g->discovery != ATLAS_SEM_DISC_COMPLETE) {
+        /* A9.2.4, and it is the fourth different problem folded into this one
+         * boolean: **complete processing of configured inputs does not prove
+         * complete discovery of relevant inputs.** A generation may have parsed
+         * every unit of every database it was given, and covered every source
+         * those databases named, and still have been built without knowing
+         * whether another database exists. Every generation built before this
+         * season reads UNKNOWN here and is conservative for free. */
+        return false;
+    }
     if (g->scope_discovery != ATLAS_SEM_SCOPE_DECLARED) {
         /* Includes every generation built before A9.2.3, which recorded no
          * scope. Conservative by construction rather than by a rule that says
@@ -113,6 +143,19 @@ static bool coverage_is_complete(const atlas_sem_generation *g) {
 
 atlas_status atlas_sem_plan_for(atlas_db *db, atlas_repo_info *repo, bool building,
                                 atlas_sem_plan *out, atlas_err *err) {
+    /* The root-owned policy, read here so that every caller which does not care
+     * gets the right answer without knowing the key exists. A sweep that will
+     * ask about many repositories reads it once and calls the `_with_default`
+     * form instead. */
+    atlas_syspolicy pol;
+    atlas_syspolicy_load(&pol);
+    return atlas_sem_plan_for_with_default(db, repo, building,
+                                           atlas_syspolicy_semantic_auto_default(&pol), out, err);
+}
+
+atlas_status atlas_sem_plan_for_with_default(atlas_db *db, atlas_repo_info *repo, bool building,
+                                             bool policy_default, atlas_sem_plan *out,
+                                             atlas_err *err) {
     atlas_sem_plan_init(out);
     if (db == NULL || repo == NULL || out == NULL) {
         return atlas_err_set(err, ATLAS_ERR_INTERNAL, "semantic plan: bad request");
@@ -143,6 +186,7 @@ atlas_status atlas_sem_plan_for(atlas_db *db, atlas_repo_info *repo, bool buildi
         out->generation_id = gen.id;
         (void)snprintf(out->generation_identity, sizeof out->generation_identity, "%s",
                        gen.source_identity);
+        out->generation_discovery = gen.discovery;
         out->scope_discovery = gen.scope_discovery;
         out->scope_candidates = gen.scope_candidates;
         out->scope_covered = gen.scope_covered;
@@ -164,15 +208,53 @@ atlas_status atlas_sem_plan_for(atlas_db *db, atlas_repo_info *repo, bool buildi
         return st;
     }
     out->configured = cfg.present;
-    out->auto_rebuild = cfg.present && cfg.auto_rebuild;
+    /* A9.2.4. The intent decides, and an absent row is UNSET rather than a
+     * refusal — which is the whole of the activation reversal. `cfg.present` no
+     * longer gates it: requiring a row would put the "remember to configure it"
+     * problem straight back, one field along. */
+    out->auto_intent = cfg.auto_intent;
+    out->auto_intent_by = cfg.auto_intent_by;
+    out->policy_default = policy_default;
+    out->discovery_mode = cfg.discovery_mode;
+    out->auto_rebuild = atlas_sem_auto_effective(cfg.auto_intent, policy_default);
     out->fail_count = cfg.fail_count;
     (void)snprintf(out->fail_reason, sizeof out->fail_reason, "%s", cfg.fail_reason);
     (void)snprintf(out->fail_at, sizeof out->fail_at, "%s", cfg.fail_at);
     const bool identity_unmoved =
         cfg.fail_count > 0 && cfg.fail_identity[0] != '\0' && out->source_identity[0] != '\0' &&
         strcmp(cfg.fail_identity, out->source_identity) == 0;
-    const bool have_compdbs = cfg.present && cfg.compdbs.len > 0;
+    /* The discovery verdict of the last walk, and when it ran. Both are stored
+     * beside the operator's statements for the reason the retry governor's
+     * fields are: they are facts about the repository, not about any candidate. */
+    out->discovery = cfg.discovery_state;
+    (void)snprintf(out->discovered_at, sizeof out->discovered_at, "%s", cfg.discovered_at);
+    (void)snprintf(out->discovery_limit, sizeof out->discovery_limit, "%s", cfg.discovery_limit);
     atlas_sem_config_free(&cfg);
+
+    /* A9.2.4. What discovery last found, read from the persisted candidate list
+     * rather than by walking the tree.
+     *
+     * The walk is the one expensive thing in this layer and this function runs
+     * on every status read, every verification and every sweep tick — so
+     * membership is persisted and refreshed on its own slower interval, while
+     * the *content* of each accepted database is digested live inside
+     * `atlas_sem_source_identity`. An edited or deleted database therefore moves
+     * the identity at once; a newly created one is noticed at the next discovery
+     * pass. Convergence, not correctness. */
+    atlas_sem_input inputs[ATLAS_SEM_DISCOVERY_MAX_CANDIDATES];
+    size_t input_count = 0;
+    if (atlas_db_sem_inputs_get(db, repo->id, inputs, ATLAS_SEM_DISCOVERY_MAX_CANDIDATES,
+                                &input_count, &ignored) != ATLAS_OK) {
+        input_count = 0;
+    }
+    for (size_t i = 0; i < input_count; i++) {
+        if (inputs[i].accepted) {
+            out->inputs_accepted++;
+        } else {
+            out->inputs_rejected++;
+        }
+    }
+    const bool have_compdbs = out->inputs_accepted > 0;
 
     /* --- the activity, then the decision --- */
 
@@ -199,17 +281,40 @@ atlas_status atlas_sem_plan_for(atlas_db *db, atlas_repo_info *repo, bool buildi
         out->hold_reason = ATLAS_SEM_HOLD_NO_LIBCLANG;
         return ATLAS_OK;
     }
+    if (out->auto_intent == ATLAS_SEM_INTENT_DISABLED) {
+        /* An operator's own refusal, and it is checked *before* the effective
+         * boolean so that the reason names the person rather than the policy.
+         * `atlas_sem_auto_effective` already returns false here; what this
+         * ordering buys is that a status surface can say whose decision it was,
+         * which §20 requires and which "disabled" alone never could. */
+        out->activity = ATLAS_SEM_ACT_EXPLICITLY_DISABLED;
+        out->hold_reason = ATLAS_SEM_HOLD_EXPLICIT_DISABLE;
+        return ATLAS_OK;
+    }
     if (!out->auto_rebuild) {
-        /* Not a fault. A repository nobody has configured is not one that is
-         * failing, and reporting it as such would teach an operator to ignore
-         * the state that means something. */
+        /* The root-owned default says no and nobody has said otherwise about
+         * this repository. Not a fault, and not the operator's doing — which is
+         * exactly why it is a different state and a different reason from the
+         * one above. */
         out->activity = ATLAS_SEM_ACT_DISABLED;
-        out->hold_reason = ATLAS_SEM_HOLD_DISABLED;
+        out->hold_reason = ATLAS_SEM_HOLD_POLICY_DEFAULT_OFF;
         return ATLAS_OK;
     }
     if (!have_compdbs) {
-        out->activity = ATLAS_SEM_ACT_DISABLED;
-        out->hold_reason = ATLAS_SEM_HOLD_NO_COMPDB;
+        /* Maintenance is on and there is nothing to build from. Reported as its
+         * own state rather than as DISABLED: the remedy is to generate a build
+         * description, not to change a setting, and an operator told "disabled"
+         * would go looking for the setting.
+         *
+         * Two reasons, not one. A repository Atlas has walked and found nothing
+         * in is a statement about the repository; a repository Atlas has not
+         * walked yet is a statement about Atlas, and it is temporary. Reporting
+         * the second as the first is the conflation this whole season exists to
+         * end, one layer down from where A9.2.2 refuses it. */
+        out->activity = ATLAS_SEM_ACT_NO_INPUTS;
+        out->hold_reason = out->discovery == ATLAS_SEM_DISC_UNKNOWN
+                               ? ATLAS_SEM_HOLD_NOT_DISCOVERED
+                               : ATLAS_SEM_HOLD_NO_INPUTS;
         return ATLAS_OK;
     }
     if (running) {

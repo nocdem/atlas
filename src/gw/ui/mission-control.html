@@ -463,9 +463,40 @@ async function viewRepository() {
       ? (c.tu_test || 0) + " test, " + (c.tu_production || 0) + " production"
       : "unknown (no test roots declared)"]);
     if (c.stale_reason) rows.push(["why stale", c.stale_reason]);
-    rows.push(["automatic rebuild", c.configured
-      ? (c.auto_rebuild ? tag("enabled", "ok") : tag("disabled", "warn"))
-      : tag("not configured", "warn")]);
+
+    /* A9.2.4. Build-input discovery is its own axis and gets its own rows.
+       COMPLETE PROCESSING OF CONFIGURED INPUTS DOES NOT PROVE COMPLETE DISCOVERY
+       OF RELEVANT INPUTS — so a green coverage chip above an UNKNOWN discovery
+       would be exactly the badge this whole family of seasons exists to refuse.
+       Discovery is therefore never folded into `coverage`, and UNKNOWN and
+       PARTIAL are shown as warnings rather than as a neutral value. */
+    rows.push(["build-input discovery", c.discovery === "COMPLETE"
+      ? tag("complete", "ok")
+      : tag((c.discovery || "UNKNOWN").toLowerCase(), "warn")]);
+    rows.push(["discovery mode", c.discovery_mode || "AUTOMATIC"]);
+    rows.push(["build inputs", (c.inputs_accepted || 0) + " accepted, " +
+                               (c.inputs_rejected || 0) + " rejected"]);
+    if (c.discovered_at) rows.push(["last walked", c.discovered_at]);
+    /* Every reason a search fell short is reported — a ceiling, a directory
+       Atlas could not enter, or an operator's own exclusion. A PARTIAL verdict
+       without the reason tells somebody a search was cut short without saying
+       where. */
+    if (c.discovery_limit) rows.push(["incomplete because", tag(c.discovery_limit, "warn")]);
+    if (c.generation_discovery && c.generation_discovery !== c.discovery) {
+      rows.push(["generation built under", c.generation_discovery]);
+    }
+
+    /* The effective answer, and beside it whose decision it was. "disabled" is
+       one word and three situations — an operator's refusal, a machine-wide
+       policy, and a default nobody has revisited — and an operator shown only
+       the word cannot tell which they are looking at. */
+    rows.push(["automatic maintenance",
+      c.auto_rebuild ? tag("enabled", "ok") : tag("disabled", "warn")]);
+    rows.push(["operator intent",
+      (c.auto_intent || "UNSET") + " (" + (c.auto_intent_by || "DEFAULT") + ")"]);
+    if ((c.auto_intent || "UNSET") === "UNSET") {
+      rows.push(["policy default", c.policy_default ? "enabled" : "disabled"]);
+    }
     if (c.hold_reason) rows.push(["holding", c.hold_reason]);
     if (c.rebuild_due) rows.push(["next", "a rebuild is due"]);
     if (c.fail_count) {
@@ -477,7 +508,24 @@ async function viewRepository() {
     rows.push(["symbols", c.symbols], ["edges", c.edges]);
     rows.push(["units complete", c.tu_complete], ["units partial", c.tu_partial],
               ["units failed", c.tu_failed]);
-    return kv(rows);
+    const out = [kv(rows)];
+    /* Every candidate, accepted and rejected, with the reason for each. A
+       rejected candidate nobody is shown is indistinguishable from one that does
+       not exist, and that indistinguishability is what kept a third compilation
+       database invisible for a season. */
+    if (Array.isArray(c.build_inputs) && c.build_inputs.length > 0) {
+      out.push(el("h3", {text: "build inputs"}));
+      out.push(table([
+        {label: "path", get: (x) => x.path},
+        {label: "origin", get: (x) => x.origin},
+        {label: "state", get: (x) => x.accepted ? tag("accepted", "ok") : tag("rejected", "warn")},
+        {label: "units", get: (x) => x.accepted ? x.units : ""},
+        {label: "why not", get: (x) => x.reject_reason || ""},
+      ], c.build_inputs, {empty: "no candidates"}));
+    }
+    const box = el("div");
+    for (const n of out) box.appendChild(n);
+    return box;
   });
 }
 

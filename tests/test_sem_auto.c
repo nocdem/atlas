@@ -32,6 +32,7 @@
 
 #include "atlas/db.h"
 #include "atlas/limits.h"
+#include "atlas/sem_schedule.h"
 #include "atlas_test.h"
 #include "db/db_internal.h"
 #include "support/fixture.h"
@@ -218,13 +219,23 @@ static void test_the_operator_method_is_hidden_from_an_ordinary_peer(void) {
     atlas_buf_free(&errout);
     atlas_buf_free(&out);
 
-    /* And the repository is still unconfigured, so nothing will rebuild it. */
+    /* And the refused request expressed no intent.
+     *
+     * A9.2.4 changed what has to be asserted here, and the change is worth
+     * stating. The effective boolean is now decided by the root-owned default,
+     * so `auto_rebuild` may legitimately be true for a repository nobody has
+     * spoken about — checking it would be checking the policy rather than the
+     * refusal. What the refusal must not have done is record an *operator
+     * intent*, and that is what `auto_intent` says. */
     const char *read[] = {"code", "sem-config", "fixture", "--json"};
     atlas_buf state = ATLAS_BUF_INIT;
     cli(&L, read, 4u, &state, &code, &err);
     T_EQ_INT(code, 0);
-    T_CHECK_MSG(strstr(atlas_buf_cstr(&state), "\"auto_rebuild\":false") != NULL,
-                "a refused request still enabled automatic rebuild: %s", atlas_buf_cstr(&state));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&state), "\"auto_intent\":\"UNSET\"") != NULL,
+                "a refused request recorded an operator intent: %s", atlas_buf_cstr(&state));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&state), "\"auto_intent_by\":\"DEFAULT\"") != NULL,
+                "a refused request recorded an operator as the source of an intent: %s",
+                atlas_buf_cstr(&state));
     atlas_buf_free(&state);
 
     live_stop(&L);
@@ -276,10 +287,29 @@ static void test_a_failed_build_preserves_the_last_good_generation(void) {
     live_stop(&L);
 }
 
-static void test_an_unconfigured_repository_is_never_rebuilt(void) {
-    /* A8-CI's rule, after A9.2.3 made a repository change a rebuild trigger.
-     * The repository is registered, watched, edited and reconciled — and no
-     * compiler runs, because no operator said one may. */
+static void test_an_unconfigured_repository_follows_the_policy_default(void) {
+    /* **The headline claim of A9.2.4, driven against a live daemon.**
+     *
+     * This test used to assert the opposite, and the inversion is the season.
+     * A8-CI's rule that no model can cause a compiler to run was kept by
+     * refusing to maintain any repository nobody had explicitly enabled — so a
+     * registered, watched, edited, reconciled repository with a perfectly good
+     * compilation database sat at DISABLED for ever, and the operator was told
+     * so in words that read like a diagnosis. That is the state the season
+     * exists to leave.
+     *
+     * What is asserted now is the *conditional*, not a fixed outcome, and that
+     * is deliberate rather than weak: whether an unconfigured repository is
+     * maintained is a **root-owned** decision, so a test that demanded one
+     * answer would be a test that fails on a machine whose operator legitimately
+     * chose the other. The invariant is that the daemon does what the policy it
+     * reports says, and that it invents no operator intent either way.
+     *
+     * Both branches assert the second half. `auto_intent = UNSET` with
+     * `auto_intent_by = DEFAULT` is what "nobody has spoken about this
+     * repository" looks like, and nothing the daemon does on its own may change
+     * it — an intent is an operator's statement, and no amount of automatic
+     * maintenance turns into one. */
     atlas_err err;
     atlas_err_init(&err);
     live L;
@@ -289,8 +319,8 @@ static void test_an_unconfigured_repository_is_never_rebuilt(void) {
          &err);
 
     /* Wait for the *file* index to notice, which proves the daemon is awake and
-     * looking at this repository — so a subsequent absence of semantic activity
-     * is a decision rather than a daemon that never ran. */
+     * looking at this repository — so whatever the semantic layer does next is a
+     * decision rather than a daemon that never ran. */
     {
         const char *args[] = {"code", "status", "fixture", "--json"};
         bool found = false;
@@ -300,16 +330,49 @@ static void test_an_unconfigured_repository_is_never_rebuilt(void) {
         T_CHECK(found);
     }
 
+    /* The daemon's own discovery sweep runs on its first tick, so this is what
+     * it found rather than anything this test asked for. */
+    T_CHECK_MSG(wait_status(&L, "\"discovery\":\"COMPLETE\"", &err),
+                "the daemon never walked a registered repository for build inputs");
+
     const char *args[] = {"code", "sem-config", "fixture", "--json"};
     atlas_buf out = ATLAS_BUF_INIT;
     int code = 0;
     cli(&L, args, 4u, &out, &code, &err);
     T_EQ_INT(code, 0);
-    T_CHECK_MSG(strstr(atlas_buf_cstr(&out), "\"activity\":\"DISABLED\"") != NULL,
-                "an unconfigured repository left DISABLED: %s", atlas_buf_cstr(&out));
-    T_CHECK_MSG(strstr(atlas_buf_cstr(&out), "\"have_generation\":false") != NULL,
-                "a compiler ran over a repository nobody authorised: %s", atlas_buf_cstr(&out));
+    const bool policy_on = strstr(atlas_buf_cstr(&out), "\"policy_default\":true") != NULL;
+
+    /* Whichever way the machine's root-owned policy points, no operator intent
+     * was invented. */
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&out), "\"auto_intent\":\"UNSET\"") != NULL,
+                "the daemon recorded an operator intent nobody expressed: %s",
+                atlas_buf_cstr(&out));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&out), "\"auto_intent_by\":\"DEFAULT\"") != NULL,
+                "the daemon recorded an operator as the source of an intent: %s",
+                atlas_buf_cstr(&out));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&out), "\"inputs_accepted\":1") != NULL,
+                "the daemon did not discover the repository's one build input: %s",
+                atlas_buf_cstr(&out));
     atlas_buf_free(&out);
+
+    if (policy_on) {
+        /* The season's product claim: **nobody enabled this repository, and it
+         * is maintained anyway.** No `sem-config`, no `code index`, no operator
+         * action of any kind between registration and a published generation. */
+        T_CHECK_MSG(wait_status(&L, "\"activity\":\"CURRENT\"", &err),
+                    "an unconfigured repository was not maintained under a policy default of on");
+        T_CHECK_MSG(wait_status(&L, "\"have_generation\":true", &err),
+                    "the daemon reported CURRENT with no published generation");
+    } else {
+        /* And where root said no, it is held — with the reason naming the
+         * policy rather than the operator, because the operator said nothing. */
+        T_CHECK_MSG(wait_status(&L, "\"activity\":\"DISABLED\"", &err),
+                    "a repository was maintained under a policy default of off");
+        T_CHECK_MSG(wait_status(&L, ATLAS_SEM_HOLD_POLICY_DEFAULT_OFF, &err),
+                    "the hold reason did not name the policy");
+        T_CHECK_MSG(wait_status(&L, "\"have_generation\":false", &err),
+                    "a compiler ran under a policy default of off");
+    }
 
     live_stop(&L);
 }
@@ -346,6 +409,23 @@ static void test_the_socket_and_the_local_path_describe_one_generation(void) {
     T_CHECK_MSG(strstr(doc, "\"activity\":") != NULL, "no derived state crossed the socket");
     T_CHECK_MSG(strstr(doc, "\"auto_rebuild\":true") != NULL,
                 "the build description did not cross the socket: %s", doc);
+    /* A9.2.4's, which **did** repeat it once and were caught by the installed
+     * system rather than by a fixture: three manifest fields were added to the
+     * generation row and to nothing that reports one, so `code sem-status
+     * --json` answered without them on every surface. Every field the season
+     * adds is named here, so the next one cannot go missing quietly. */
+    static const char *const A924_KEYS[] = {
+        /* the derived state */
+        "\"auto_intent\":", "\"auto_intent_by\":", "\"policy_default\":", "\"discovery\":",
+        "\"discovery_mode\":", "\"generation_discovery\":", "\"inputs_accepted\":",
+        "\"inputs_rejected\":", "\"build_inputs\":", "\"excludes\":", "\"vendor_roots\":",
+        /* the generation's own sealed manifest */
+        "\"input_count\":", "\"scope_excluded\":",
+    };
+    for (size_t k = 0; k < sizeof A924_KEYS / sizeof A924_KEYS[0]; k++) {
+        T_CHECK_MSG(strstr(doc, A924_KEYS[k]) != NULL,
+                    "%s did not cross the socket: %s", A924_KEYS[k], doc);
+    }
     atlas_buf_free(&out);
 
     live_stop(&L);
@@ -555,8 +635,8 @@ static const atlas_test TESTS[] = {
      test_the_operator_method_is_hidden_from_an_ordinary_peer},
     {"a failed build preserves the last-known-good generation and recovers",
      test_a_failed_build_preserves_the_last_good_generation},
-    {"an unconfigured repository is never rebuilt",
-     test_an_unconfigured_repository_is_never_rebuilt},
+    {"an unconfigured repository follows the policy default",
+     test_an_unconfigured_repository_follows_the_policy_default},
     {"the socket and the local path describe one generation",
      test_the_socket_and_the_local_path_describe_one_generation},
     {"a model can read freshness and cannot change it",

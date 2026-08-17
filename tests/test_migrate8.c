@@ -161,6 +161,7 @@ static void build_schema7(const char *path, atlas_err *err) {
                               "DROP TABLE verify_actors;"
                               "DROP TABLE gw_audit;"
                               "DROP TABLE api_keys;"
+                              "DROP TABLE sem_build_inputs;"
                               "DROP TABLE sem_repo_config;"
                               "DROP TABLE sem_includes;"
                               "DROP TABLE sem_edges;"
@@ -203,7 +204,7 @@ static void test_a_schema_seven_database_reaches_eight_losslessly(void) {
 
     T_OK(atlas_db_migrate(db, &err), &err);
     T_EQ_INT(atlas_db_schema_version(db, &err), ATLAS_SCHEMA_VERSION);
-    T_EQ_INT(ATLAS_SCHEMA_VERSION, 18);
+    T_EQ_INT(ATLAS_SCHEMA_VERSION, 19);
 
     for (size_t i = 0; i < sizeof A8_TABLES / sizeof A8_TABLES[0]; i++) {
         T_CHECK_MSG(table_exists(db, A8_TABLES[i]), "migration 8 did not create %s",

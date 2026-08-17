@@ -1232,10 +1232,28 @@ typedef enum atlas_verify_coverage_dim {
      * the correct fail-closed answer. */
     ATLAS_COVDIM_RUNTIME_STATE,
     /* Deployed configuration was read. Unavailable for the same reason. */
-    ATLAS_COVDIM_DEPLOYED_CONFIG
+    ATLAS_COVDIM_DEPLOYED_CONFIG,
+    /* A9.2.4. Every compilation database relevant to this repository was found.
+     *
+     * The dimension underneath every other semantic one, and the one A9.2.3
+     * could not express:
+     *
+     *   **COMPLETE PROCESSING OF CONFIGURED INPUTS DOES NOT PROVE COMPLETE
+     *   DISCOVERY OF RELEVANT INPUTS.**
+     *
+     * `TRACKED_SOURCE` says every source in scope was read; the scope is
+     * whatever the accepted compilation databases named, and this says whether
+     * Atlas can account for having found them all. Two databases reporting
+     * 200/200 and 216/216 establish nothing about whether a third exists — and
+     * on the repository that produced this season, a third did.
+     *
+     * UNKNOWN whenever discovery has not run or was pinned by hand, PARTIAL
+     * whenever the bounded walk stopped early or an operator excluded a subtree.
+     * Both refuse an absence, which is the whole point of adding it. */
+    ATLAS_COVDIM_BUILD_INPUT_DISCOVERY
 } atlas_verify_coverage_dim;
 
-#define ATLAS_VERIFY_COVERAGE_DIMS 11
+#define ATLAS_VERIFY_COVERAGE_DIMS 12
 
 const char *atlas_verify_coverage_dim_name(atlas_verify_coverage_dim d);
 bool atlas_verify_coverage_dim_parse(const char *name, atlas_verify_coverage_dim *out);

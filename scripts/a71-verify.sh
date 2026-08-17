@@ -196,6 +196,13 @@ matrix_case 'non-numeric uid'  'socket_path = /run/atlas/atlas.sock
 data_dir = /var/lib/atlas
 client_uid = root
 '
+# A9.2.4. An unrecognised *value* is malformed too, not silently taken as one of
+# the two it resembles: a policy whose author wrote something Atlas half
+# understood is the failure this parser's dullness exists to prevent.
+matrix_case 'bad semantic_auto_default' 'socket_path = /run/atlas/atlas.sock
+data_dir = /var/lib/atlas
+semantic_auto_default = yes
+'
 # A group-writable policy must be refused even though its content is perfect.
 if [ -n "$BAK" ]; then cp -a "$BAK" "$POLICY"; fi
 chmod 0664 "$POLICY"

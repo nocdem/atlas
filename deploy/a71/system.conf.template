@@ -44,3 +44,27 @@ client_group = atlas-clients
 #
 # uid 0 is rejected: root does not need the allowlist, and listing it would
 # suggest the socket is a route to privilege.
+
+# A9.2.4. Whether this daemon may keep a repository's *semantic* index current on
+# its own initiative, for repositories about which no operator has said anything.
+#
+# ENABLED (the default when this key is absent) is the A9.2.4 reversal of
+# A9.2.3's per-repository opt-in. The season's product rule is that semantic
+# maintenance must not depend on an operator remembering to repair freshness —
+# and what the opt-in protected was never code execution: libclang *parses*
+# repository text, the compilation database's `command` string is word-split and
+# never executed, arguments pass a positive allowlist, include directories
+# outside the repository are recorded and never opened, and the parse runs in a
+# bounded child with an empty environment and an address-space ceiling. What it
+# protected was authority and resource policy, which is what this key is.
+#
+# Set DISABLED on a machine where a compiler must not run unasked. It changes
+# nothing for a repository whose operator has said something: an explicit
+# `code sem-config REPO --auto` or `--no-auto` is honoured in either direction
+# and is never overruled by this default.
+#
+# An unrecognised value is malformed and leaves the whole policy inactive, which
+# is legacy per-user mode — the fail-closed direction.
+#
+#   semantic_auto_default = ENABLED
+#   semantic_auto_default = DISABLED

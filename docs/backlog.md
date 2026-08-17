@@ -477,3 +477,72 @@ production source".
 
 `ATLAS_COVDIM_TESTS` is UNKNOWN until that exists. No absence rests on it today,
 so this is a missing capability rather than a defect.
+
+## A9.2.4: decayed semantic graphs heal only on a full rebuild
+
+The incremental carry-forward defect described in
+`docs/semantic-discovery.md` is fixed, and `ATLAS_SEM_ANALYZER_VERSION = 2`
+makes every affected generation stale so the daemon rebuilds it once. That is the
+repair and it is automatic.
+
+What it does **not** do is tell anybody which generations were affected or by how
+much. A generation built before the fix carried a call graph that had lost an
+unknown fraction of its edges, and nothing recorded the loss — the symbol count
+was untouched, the unit counts were untouched, and `tu_complete == tu_total`
+throughout. Any conclusion drawn from such a graph before the rebuild was drawn
+from an index that was quietly incomplete.
+
+Two things a later phase could add, neither of which belongs here:
+
+- **A structural check in `atlas doctor`**: no `sem_edges` row may reference a
+  unit outside its own generation. It is one query, it is exactly the invariant
+  the fix establishes, and `doctor` already replays the decision ledger for the
+  same kind of reason. It would report, never repair — A4's rule.
+- **An edge-count sanity signal on a generation**: a rebuild whose edge count
+  falls by an order of magnitude against the generation it replaced is either a
+  large deletion or a defect, and Atlas cannot currently tell an operator that it
+  happened at all.
+
+## A9.2.4: semantic indexing occupies the writer thread
+
+A8-CI put the semantic index pass on the writer thread, which is correct — it is
+the one thread that owns a writable handle — and A9.2.3 was content with it
+because a pass ran only when an operator asked or when a repository the operator
+had explicitly enabled changed.
+
+**A9.2.4 makes automatic maintenance the default, which increases exposure to a
+cost that was always there.** While a pass runs, no other write to the index
+proceeds: no reconciliation, no session bookkeeping, no decision write, no
+credential operation. On a repository with several build configurations that is
+minutes. Observed on this machine: 235 s for one configuration of 198
+translation units, and a repository presenting five such configurations is five
+times that on its first build.
+
+What already limits it, and why none of it is the fix:
+
+- one build per repository at a time (`atlas_writer_sem_index_pending`) — bounds
+  concurrency, not duration;
+- coalescing, which falls out of the derived plan — bounds how *many* builds
+  happen, not how long one takes;
+- the retry governor — stops a failing repository spinning, and a succeeding one
+  is not spinning;
+- unit reuse across generations — makes the *steady state* cheap and does
+  nothing for a first build or for an edit to a widely-included header.
+
+The fix is to stop holding the writer for the whole pass. Two shapes, neither of
+which belongs in a season about discovery:
+
+1. **Yield between units.** The pass already chunks its work and already commits
+   per batch; what it does not do is let another writer job run between chunks.
+   That is a scheduling change in `src/daemon/writer.c` plus an argument about
+   what a half-built generation means to a concurrent write — nothing, since a
+   generation is invisible until `atlas_db_sem_publish`, which is why this is
+   tractable at all.
+2. **A second writer for derived data.** Larger, and it reopens "exactly one
+   process writes the index", which is A1's rule and is not to be reopened
+   casually.
+
+Until then the honest statement is the one `docs/semantic-discovery.md` makes: a
+first automatic build of a large repository will make the daemon unresponsive to
+*writes* for its duration, reads are unaffected, and an operator who cannot
+accept that sets `semantic_auto_default = DISABLED` or disables the repository.

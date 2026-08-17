@@ -91,6 +91,27 @@ typedef enum atlas_syspolicy_reason {
     ATLAS_SYSPOLICY_REASON_ACTIVE
 } atlas_syspolicy_reason;
 
+/* A9.2.4. The root-owned answer to "may this daemon run a compiler over a
+ * registered repository nobody has spoken about?".
+ *
+ * A9.2.3's answer was a compiled-in no, expressed as `auto_rebuild` defaulting
+ * to 0 per repository, and A9.2.4 reverses that default. The reversal is
+ * accounted for here rather than assumed: whether a machine's daemon maintains
+ * semantic indexes unasked is a resource and authority decision, and it belongs
+ * to root — the one principal Atlas already trusts by design and the one an
+ * unprivileged account, including `atlas-worker` and every model, cannot
+ * influence. */
+typedef enum atlas_syspolicy_semauto {
+    /* The policy says nothing. `ATLAS_SEM_AUTO_DEFAULT` decides. */
+    ATLAS_SYSPOLICY_SEMAUTO_UNSET = 0,
+    ATLAS_SYSPOLICY_SEMAUTO_ENABLED,
+    ATLAS_SYSPOLICY_SEMAUTO_DISABLED
+} atlas_syspolicy_semauto;
+
+/* What UNSET resolves to. Named rather than inlined so the reversal has one
+ * place to be found, argued about and changed. */
+#define ATLAS_SEM_AUTO_DEFAULT true
+
 typedef struct atlas_syspolicy {
     atlas_syspolicy_state state;
     atlas_syspolicy_reason reason;
@@ -106,6 +127,17 @@ typedef struct atlas_syspolicy {
     /* Peers permitted in addition to the daemon's own uid. */
     long long client_uids[ATLAS_SYSPOLICY_MAX_CLIENTS];
     size_t client_count;
+    /* A9.2.4. Whether this daemon may keep the semantic index of a registered
+     * repository current on its own initiative, for repositories about which no
+     * operator has said anything either way. See `atlas_sem_auto_intent`.
+     *
+     * UNSET is zero and means *the policy says nothing*, which is what a legacy
+     * or absent policy leaves. What UNSET resolves to is the named compiled-in
+     * constant `ATLAS_SEM_AUTO_DEFAULT` — so a `memset` produces "no statement"
+     * rather than a zero that happens to authorise a compiler, and the statement
+     * it resolves to is a constant with its argument written beside it rather
+     * than a value buried in a struct. */
+    atlas_syspolicy_semauto semantic_auto_default;
     char detail[256];
 } atlas_syspolicy;
 
@@ -131,5 +163,12 @@ void atlas_syspolicy_load_at(const char *path, atlas_syspolicy *out);
  * daemon's own uid is checked separately by the caller, so this function can
  * never be the only thing standing between a stranger and the socket. */
 bool atlas_syspolicy_permits(const atlas_syspolicy *p, long long uid);
+
+/* A9.2.4. Whether automatic semantic maintenance is on for a repository whose
+ * operator has expressed no intent. Reads the policy where it states one and
+ * `ATLAS_SEM_AUTO_DEFAULT` where it does not, so a legacy or absent policy —
+ * every ordinary per-user install — gets the documented default rather than a
+ * silent no. */
+bool atlas_syspolicy_semantic_auto_default(const atlas_syspolicy *p);
 
 #endif /* ATLAS_SYSPOLICY_H */

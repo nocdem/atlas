@@ -38,6 +38,7 @@
 #include "atlas/reconcile.h"
 #include "atlas/sem.h"
 #include "atlas/sem_ops.h"
+#include "atlas/sem_discover.h"
 #include "atlas/sem_schedule.h"
 #include "atlas/service.h"
 #include "atlas_test.h"
@@ -145,10 +146,35 @@ static void repo_of(env *e, atlas_repo_info *out, atlas_err *err) {
     T_REQUIRE_MSG(found, "the fixture repository is not registered");
 }
 
-static void plan_of(env *e, atlas_sem_plan *out, atlas_err *err) {
+/* A9.2.4. Every plan in this file is computed with the machine-wide default
+ * supplied explicitly rather than read from `/etc/atlas/system.conf`.
+ *
+ * `atlas_sem_plan_for` reads the root-owned policy, which is right for the
+ * shipped binary and wrong for a test: the answers would depend on how the
+ * machine running the suite happens to be configured, which is the one thing a
+ * test must never depend on. `plan_of` asks with the default ON — the shipped
+ * `ATLAS_SEM_AUTO_DEFAULT` — and `plan_of_with_default` drives both. */
+static void plan_of_with_default(env *e, bool policy_default, atlas_sem_plan *out,
+                                 atlas_err *err) {
     atlas_repo_info info;
     repo_of(e, &info, err);
-    T_OK(atlas_sem_plan_for(e->db, &info, false, out, err), err);
+    T_OK(atlas_sem_plan_for_with_default(e->db, &info, false, policy_default, out, err), err);
+    atlas_repo_info_free(&info);
+}
+
+static void plan_of(env *e, atlas_sem_plan *out, atlas_err *err) {
+    plan_of_with_default(e, ATLAS_SEM_AUTO_DEFAULT, out, err);
+}
+
+/* A9.2.4. Runs one bounded discovery walk, because nothing is an accepted build
+ * input until a walk has accepted it. A test that wrote a compilation database
+ * and expected the scheduler to see it would be testing A9.2.3's model. */
+static void discover(env *e, atlas_err *err) {
+    atlas_repo_info info;
+    repo_of(e, &info, err);
+    atlas_sem_discovery_result res;
+    atlas_sem_discovery_result_init(&res);
+    T_OK(atlas_sem_discovery_run(e->db, &info, &res, err), err);
     atlas_repo_info_free(&info);
 }
 
@@ -246,21 +272,21 @@ static void test_an_empty_stored_identity_never_makes_a_generation_stale(void) {
     g.analyzer_version = ATLAS_SEM_ANALYZER_VERSION;
 
     const char *reason = NULL;
-    T_CHECK(atlas_sem_freshness_of(&g, true, false, "", "", "abc", true, &reason) ==
+    T_CHECK(atlas_sem_freshness_of(&g, true, false, "", "", "abc", NULL, true, &reason) ==
             ATLAS_SEM_FRESH_CURRENT);
     T_CHECK(reason == NULL);
 
     /* And with an identity recorded, a different one is STALE with its own
      * reason — the working tree, not the commit. */
     (void)snprintf(g.source_identity, sizeof g.source_identity, "%s", "abc");
-    T_CHECK(atlas_sem_freshness_of(&g, true, false, "", "", "def", true, &reason) ==
+    T_CHECK(atlas_sem_freshness_of(&g, true, false, "", "", "def", NULL, true, &reason) ==
             ATLAS_SEM_FRESH_STALE);
     T_CHECK(reason != NULL && strcmp(reason, ATLAS_SEM_STALE_SOURCE) == 0);
     T_CHECK(atlas_sem_stale_reason_is_known(ATLAS_SEM_STALE_SOURCE));
 
     /* An empty *live* identity does not either: "Atlas could not look" is not
      * evidence that anything changed. */
-    T_CHECK(atlas_sem_freshness_of(&g, true, false, "", "", "", true, &reason) ==
+    T_CHECK(atlas_sem_freshness_of(&g, true, false, "", "", "", NULL, true, &reason) ==
             ATLAS_SEM_FRESH_CURRENT);
 }
 
@@ -451,10 +477,15 @@ static void test_without_declared_test_roots_the_unit_scope_is_unknown(void) {
 
 /* --- the rebuild decision --------------------------------------------------- */
 
-static void test_no_build_description_means_no_compiler_runs(void) {
-    /* A8-CI's rule, kept alive after A9.2.3 made a repository change a rebuild
-     * trigger. Absent configuration is the default and it schedules nothing;
-     * the migration enables nothing that was not enabled before it ran. */
+static void test_no_build_input_means_no_compiler_runs(void) {
+    /* A8-CI's rule, kept alive after **A9.2.4 reversed the activation default**.
+     *
+     * A9.2.3 kept it by refusing to run for a repository nobody had configured.
+     * That is no longer the rule, so this asserts what is: a repository with no
+     * discoverable compilation database runs no compiler, whatever the policy
+     * says — and it says so as NO_INPUTS rather than as DISABLED, because the
+     * remedy is to generate a build description rather than to change a
+     * setting. */
     atlas_err err;
     atlas_err_init(&err);
     env e;
@@ -462,33 +493,121 @@ static void test_no_build_description_means_no_compiler_runs(void) {
 
     T_OK(fx_write(fx_repo(&e.fx), "a.c", "int f(void){return 0;}\n", &err), &err);
     run_file_pass(&e, &err);
+    discover(&e, &err);
 
     atlas_sem_plan p;
     plan_of(&e, &p, &err);
-    T_CHECK_MSG(!p.should_build, "an unconfigured repository scheduled a compiler run");
-    T_CHECK(p.activity == ATLAS_SEM_ACT_DISABLED);
-    T_CHECK(!p.configured);
-    T_CHECK(p.hold_reason != NULL &&
-            strcmp(p.hold_reason, ATLAS_SEM_HOLD_DISABLED) == 0);
+    T_CHECK_MSG(!p.should_build, "a repository with no build input scheduled a compiler run");
+    T_CHECK(p.activity == ATLAS_SEM_ACT_NO_INPUTS);
+    T_CHECK(p.hold_reason != NULL && strcmp(p.hold_reason, ATLAS_SEM_HOLD_NO_INPUTS) == 0);
     T_CHECK(atlas_sem_hold_reason_is_known(p.hold_reason));
     /* And the reason that comes back is Atlas' own literal, not a copy. */
-    T_CHECK(atlas_sem_hold_intern(ATLAS_SEM_HOLD_DISABLED) == p.hold_reason);
+    T_CHECK(atlas_sem_hold_intern(ATLAS_SEM_HOLD_NO_INPUTS) == p.hold_reason);
+    /* The walk ran and covered the whole bounded universe, so discovery is
+     * COMPLETE even though it found nothing. "I looked and there is nothing
+     * here" is a different statement from "I have not looked". */
+    T_CHECK(p.discovery == ATLAS_SEM_DISC_COMPLETE);
+    T_EQ_INT(p.inputs_accepted, 0);
 
-    /* Naming databases without enabling automatic rebuild still schedules
-     * nothing: an operator recording how a repository is built has not asked
-     * for a compiler to run every time it changes. */
+    /* A root-owned policy that says no holds the repository even once it has an
+     * input, and says so in its own words. */
+    const char *srcs[] = {"a.c"};
+    write_compdb(&e, srcs, 1, &err);
+    discover(&e, &err);
+    plan_of_with_default(&e, false, &p, &err);
+    T_CHECK_MSG(!p.should_build, "a policy-disabled repository scheduled a compiler run");
+    T_CHECK(p.activity == ATLAS_SEM_ACT_DISABLED);
+    T_CHECK(p.hold_reason != NULL &&
+            strcmp(p.hold_reason, ATLAS_SEM_HOLD_POLICY_DEFAULT_OFF) == 0);
+    T_CHECK(p.auto_intent == ATLAS_SEM_INTENT_UNSET);
+
+    env_close(&e);
+}
+
+static void test_an_operator_refusal_outlives_the_policy(void) {
+    /* §20 and §25. The default being permissive is only acceptable because an
+     * operator's explicit refusal is never lifted behind their back — so the
+     * refusal is checked with the machine-wide default ON, which is the only
+     * configuration in which it could be overruled. */
+    atlas_err err;
+    atlas_err_init(&err);
+    env e;
+    env_open(&e, &err);
+
+    T_OK(fx_write(fx_repo(&e.fx), "a.c", "int f(void){return 0;}\n", &err), &err);
+    const char *srcs[] = {"a.c"};
+    write_compdb(&e, srcs, 1, &err);
+    run_file_pass(&e, &err);
+    discover(&e, &err);
+
     atlas_sem_config cfg;
     atlas_sem_config_init(&cfg);
     cfg.repo_id = e.repo_id;
-    const char *dbs[] = {"compile_commands.json"};
-    T_OK(atlas_sem_config_pack(dbs, 1, &cfg.compdbs, &err), &err);
+    cfg.auto_intent = ATLAS_SEM_INTENT_DISABLED;
+    cfg.auto_intent_by = ATLAS_SEM_INTENT_BY_OPERATOR;
     T_OK(atlas_db_sem_config_set(e.db, &cfg, &err), &err);
     atlas_sem_config_free(&cfg);
 
-    plan_of(&e, &p, &err);
-    T_CHECK(p.configured);
-    T_CHECK_MSG(!p.should_build, "a configured but disabled repository scheduled a compiler run");
-    T_CHECK(p.activity == ATLAS_SEM_ACT_DISABLED);
+    atlas_sem_plan p;
+    plan_of_with_default(&e, true, &p, &err);
+    T_CHECK_MSG(!p.should_build, "an explicitly disabled repository scheduled a compiler run");
+    T_CHECK(p.activity == ATLAS_SEM_ACT_EXPLICITLY_DISABLED);
+    T_CHECK(p.hold_reason != NULL &&
+            strcmp(p.hold_reason, ATLAS_SEM_HOLD_EXPLICIT_DISABLE) == 0);
+    /* And the surface can say *whose* decision it was, which is the whole
+     * reason the intent and its provenance are separate fields. */
+    T_CHECK(p.auto_intent == ATLAS_SEM_INTENT_DISABLED);
+    T_CHECK(p.auto_intent_by == ATLAS_SEM_INTENT_BY_OPERATOR);
+
+    /* Re-enabling converges without anybody running a rebuild by hand. */
+    atlas_sem_config on;
+    atlas_sem_config_init(&on);
+    on.repo_id = e.repo_id;
+    on.auto_intent = ATLAS_SEM_INTENT_ENABLED;
+    on.auto_intent_by = ATLAS_SEM_INTENT_BY_OPERATOR;
+    T_OK(atlas_db_sem_config_set(e.db, &on, &err), &err);
+    atlas_sem_config_free(&on);
+    plan_of_with_default(&e, false, &p, &err);
+    T_CHECK_MSG(p.should_build,
+                "an explicitly enabled repository did not schedule a build under a policy "
+                "default of off");
+    T_CHECK(p.auto_intent == ATLAS_SEM_INTENT_ENABLED);
+
+    env_close(&e);
+}
+
+static void test_a_migrated_default_is_not_an_operator_refusal(void) {
+    /* §4 and §26. A stored `auto_rebuild = 0` could not distinguish an
+     * operator's `--no-auto` from nobody ever having said anything, so migration
+     * 19 records the second as UNSET/MIGRATION rather than inventing the first.
+     * What that must produce is a repository the default decides — never one
+     * reported as explicitly disabled. */
+    atlas_err err;
+    atlas_err_init(&err);
+    env e;
+    env_open(&e, &err);
+
+    T_OK(fx_write(fx_repo(&e.fx), "a.c", "int f(void){return 0;}\n", &err), &err);
+    const char *srcs[] = {"a.c"};
+    write_compdb(&e, srcs, 1, &err);
+    run_file_pass(&e, &err);
+    discover(&e, &err);
+
+    /* Exactly what migration 19 leaves behind for a pre-A9.2.4 row. */
+    atlas_sem_config cfg;
+    atlas_sem_config_init(&cfg);
+    cfg.repo_id = e.repo_id;
+    cfg.auto_intent = ATLAS_SEM_INTENT_UNSET;
+    cfg.auto_intent_by = ATLAS_SEM_INTENT_BY_MIGRATION;
+    T_OK(atlas_db_sem_config_set(e.db, &cfg, &err), &err);
+    atlas_sem_config_free(&cfg);
+
+    atlas_sem_plan p;
+    plan_of_with_default(&e, true, &p, &err);
+    T_CHECK_MSG(p.should_build, "a migrated default was treated as an operator refusal");
+    T_CHECK(p.activity != ATLAS_SEM_ACT_EXPLICITLY_DISABLED);
+    T_CHECK(p.auto_intent == ATLAS_SEM_INTENT_UNSET);
+    T_CHECK(p.auto_intent_by == ATLAS_SEM_INTENT_BY_MIGRATION);
 
     env_close(&e);
 }
@@ -511,11 +630,14 @@ static void test_the_retry_governor_holds_until_the_source_moves(void) {
     atlas_sem_config cfg;
     atlas_sem_config_init(&cfg);
     cfg.repo_id = e.repo_id;
-    cfg.auto_rebuild = true;
+    cfg.auto_intent = ATLAS_SEM_INTENT_ENABLED;
+    cfg.auto_intent_by = ATLAS_SEM_INTENT_BY_OPERATOR;
     const char *dbs[] = {"compile_commands.json"};
     T_OK(atlas_sem_config_pack(dbs, 1, &cfg.compdbs, &err), &err);
     T_OK(atlas_db_sem_config_set(e.db, &cfg, &err), &err);
     atlas_sem_config_free(&cfg);
+    /* A9.2.4: nothing is an accepted build input until a walk has accepted it. */
+    discover(&e, &err);
 
     atlas_sem_plan p;
     plan_of(&e, &p, &err);
@@ -561,7 +683,8 @@ static void test_removing_a_repository_forgets_its_build_description(void) {
     atlas_sem_config cfg;
     atlas_sem_config_init(&cfg);
     cfg.repo_id = e.repo_id;
-    cfg.auto_rebuild = true;
+    cfg.auto_intent = ATLAS_SEM_INTENT_ENABLED;
+    cfg.auto_intent_by = ATLAS_SEM_INTENT_BY_OPERATOR;
     const char *dbs[] = {"compile_commands.json"};
     T_OK(atlas_sem_config_pack(dbs, 1, &cfg.compdbs, &err), &err);
     T_OK(atlas_db_sem_config_set(e.db, &cfg, &err), &err);
@@ -598,8 +721,11 @@ static const atlas_test TESTS[] = {
      test_coverage_is_measured_against_the_tree_not_the_build_description},
     {"without declared test roots the unit scope is unknown",
      test_without_declared_test_roots_the_unit_scope_is_unknown},
-    {"no build description means no compiler runs",
-     test_no_build_description_means_no_compiler_runs},
+    {"no build input means no compiler runs",
+     test_no_build_input_means_no_compiler_runs},
+    {"an operator refusal outlives the policy", test_an_operator_refusal_outlives_the_policy},
+    {"a migrated default is not an operator refusal",
+     test_a_migrated_default_is_not_an_operator_refusal},
     {"the retry governor holds until the source moves",
      test_the_retry_governor_holds_until_the_source_moves},
     {"removing a repository forgets its build description",

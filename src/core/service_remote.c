@@ -44,6 +44,7 @@
 #include "atlas/ipc.h"
 #include "atlas/pathrep.h"
 #include "atlas/maintenance.h"
+#include "atlas/sem_discover.h"
 #include "atlas/service.h"
 #include "core/service_internal.h"
 
@@ -2169,6 +2170,27 @@ atlas_status atlas_service_sem_index_remote(const char *name, const char *const 
             out->published = true;
         }
         atlas_sem_status_report_free(&srep);
+
+        /* A9.2.4. The two counters the generation deliberately does not hold.
+         *
+         * `units_parsed` and `units_reused` describe what the *pass* did, and
+         * A8-CI's closure made a generation report the rows it holds instead —
+         * correctly, because the two answer different questions. The consequence
+         * was that the remote form, which reads its summary from the generation,
+         * had nowhere to get them: `code index` on a deployed machine printed
+         * "parsed 0, reused 0" having parsed every unit in the repository, and
+         * under A7.1 the socket is the operator's only path, so that was the
+         * only report there was. They ride on the operation's detail line, which
+         * is what the detail line is for. */
+        const char *det = atlas_buf_cstr(&detail);
+        const char *pk = strstr(det, "parsed=");
+        const char *rk = strstr(det, "reused=");
+        if (pk != NULL) {
+            out->units_parsed = strtoll(pk + 7, NULL, 10);
+        }
+        if (rk != NULL) {
+            out->units_reused = strtoll(rk + 7, NULL, 10);
+        }
     }
     atlas_buf_free(&message);
     atlas_buf_free(&detail);
@@ -2764,6 +2786,8 @@ static void read_sem_plan(const atlas_ipc_response *r, atlas_sem_status_report *
             {"CURRENT", ATLAS_SEM_ACT_CURRENT},     {"INCOMPLETE", ATLAS_SEM_ACT_INCOMPLETE},
             {"BUILDING", ATLAS_SEM_ACT_BUILDING},   {"DIRTY", ATLAS_SEM_ACT_DIRTY},
             {"FAILED", ATLAS_SEM_ACT_FAILED},
+            {"EXPLICITLY_DISABLED", ATLAS_SEM_ACT_EXPLICITLY_DISABLED},
+            {"NO_INPUTS", ATLAS_SEM_ACT_NO_INPUTS},
         };
         for (size_t i = 0; i < sizeof ACTS / sizeof ACTS[0]; i++) {
             if (strcmp(v, ACTS[i].name) == 0) {
@@ -2822,11 +2846,101 @@ static void read_sem_plan(const atlas_ipc_response *r, atlas_sem_status_report *
     }
     p->generation_id = out->generation.id;
 
+    /* --- A9.2.4 ---
+     *
+     * Read back here as well as written in `server_sem.c`, and that pairing is
+     * not optional: a field written on the wire and not read here is a field on
+     * which the socket path and the local path silently disagree, which is the
+     * defect every season since A9.2.1 has had to name. */
+    if (atlas_ipc_result_str(r, "auto_intent", &v)) {
+        if (!atlas_sem_auto_intent_parse(v, &p->auto_intent)) {
+            p->auto_intent = ATLAS_SEM_INTENT_UNSET;
+        }
+    }
+    if (atlas_ipc_result_str(r, "auto_intent_by", &v)) {
+        if (!atlas_sem_intent_source_parse(v, &p->auto_intent_by)) {
+            p->auto_intent_by = ATLAS_SEM_INTENT_BY_DEFAULT;
+        }
+    }
+    if (atlas_ipc_result_bool(r, "policy_default", &b)) {
+        p->policy_default = b;
+    }
+    if (atlas_ipc_result_str(r, "discovery", &v)) {
+        if (!atlas_sem_discovery_parse(v, &p->discovery)) {
+            p->discovery = ATLAS_SEM_DISC_UNKNOWN;
+        }
+    }
+    if (atlas_ipc_result_str(r, "discovery_mode", &v)) {
+        if (!atlas_sem_discovery_mode_parse(v, &p->discovery_mode)) {
+            p->discovery_mode = ATLAS_SEM_DISCMODE_AUTOMATIC;
+        }
+    }
+    if (atlas_ipc_result_str(r, "generation_discovery", &v)) {
+        if (!atlas_sem_discovery_parse(v, &p->generation_discovery)) {
+            p->generation_discovery = ATLAS_SEM_DISC_UNKNOWN;
+        }
+    }
+    if (atlas_ipc_result_int(r, "inputs_accepted", &t)) {
+        p->inputs_accepted = t;
+    }
+    if (atlas_ipc_result_int(r, "inputs_rejected", &t)) {
+        p->inputs_rejected = t;
+    }
+    if (atlas_ipc_result_str(r, "discovered_at", &v)) {
+        copy_str(p->discovered_at, sizeof p->discovered_at, v);
+    }
+    if (atlas_ipc_result_str(r, "discovery_limit", &v)) {
+        copy_str(p->discovery_limit, sizeof p->discovery_limit, v);
+    }
+
+    /* The candidates, accepted and rejected. Allocated here because the local
+     * path allocates them too and the renderers must not be able to tell which
+     * path filled the report. */
+    size_t in_n = 0;
+    (void)atlas_ipc_result_arr_len(r, "build_inputs", &in_n);
+    if (in_n > 0 && out->inputs == NULL) {
+        out->inputs = calloc(ATLAS_SEM_DISCOVERY_MAX_CANDIDATES, sizeof(*out->inputs));
+    }
+    if (out->inputs != NULL) {
+        for (size_t i = 0; i < in_n && out->input_count < ATLAS_SEM_DISCOVERY_MAX_CANDIDATES;
+             i++) {
+            struct atlas_sem_input *in = &out->inputs[out->input_count];
+            memset(in, 0, sizeof(*in));
+            if (atlas_ipc_result_arr_obj_str(r, "build_inputs", i, "path", &v)) {
+                copy_str(in->path, sizeof in->path, v);
+            }
+            if (in->path[0] == '\0') {
+                continue;
+            }
+            if (atlas_ipc_result_arr_obj_str(r, "build_inputs", i, "origin", &v)) {
+                (void)atlas_sem_input_origin_parse(v, &in->origin);
+            }
+            bool acc = false;
+            if (atlas_ipc_result_arr_obj_bool(r, "build_inputs", i, "accepted", &acc)) {
+                in->accepted = acc;
+            }
+            if (atlas_ipc_result_arr_obj_str(r, "build_inputs", i, "reject_reason", &v)) {
+                /* Interned to Atlas' own literal, never the bytes that arrived. */
+                const char *own = atlas_sem_reject_intern(v);
+                copy_str(in->reject_reason, sizeof in->reject_reason, own != NULL ? own : "");
+            }
+            if (atlas_ipc_result_arr_obj_str(r, "build_inputs", i, "digest", &v)) {
+                copy_str(in->digest, sizeof in->digest, v);
+            }
+            int64_t units = 0;
+            if (atlas_ipc_result_arr_obj_int(r, "build_inputs", i, "units", &units)) {
+                in->unit_count = units;
+            }
+            out->input_count++;
+        }
+    }
+
     /* The declared lists, rejoined into the storage form the renderers read.
      * One representation past this point, so a renderer cannot be handed two. */
-    static const char *const KEYS[2] = {"compdbs", "test_roots"};
-    atlas_buf *const BUFS[2] = {&out->compdbs, &out->test_roots};
-    for (size_t k = 0; k < 2; k++) {
+    static const char *const KEYS[4] = {"compdbs", "test_roots", "excludes", "vendor_roots"};
+    atlas_buf *const BUFS[4] = {&out->compdbs, &out->test_roots, &out->excludes,
+                                &out->vendor_roots};
+    for (size_t k = 0; k < 4; k++) {
         size_t n = 0;
         (void)atlas_ipc_result_arr_len(r, KEYS[k], &n);
         atlas_err ignored;
@@ -2960,6 +3074,19 @@ atlas_status atlas_service_sem_status_remote(const char *name, atlas_sem_status_
     if (atlas_ipc_result_int(r, "scope_uncovered", &t)) {
         out->generation.scope_uncovered = t;
     }
+    /* A9.2.4. Read back here as well as written on the wire; one without the
+     * other is how the socket path and the local path start disagreeing. */
+    if (atlas_ipc_result_str(r, "discovery", &v)) {
+        if (!atlas_sem_discovery_parse(v, &out->generation.discovery)) {
+            out->generation.discovery = ATLAS_SEM_DISC_UNKNOWN;
+        }
+    }
+    if (atlas_ipc_result_int(r, "input_count", &t)) {
+        out->generation.input_count = t;
+    }
+    if (atlas_ipc_result_int(r, "scope_excluded", &t)) {
+        out->generation.scope_excluded = t;
+    }
     if (atlas_ipc_result_bool(r, "test_scope_known", &b)) {
         out->generation.test_scope_known = b;
     }
@@ -3014,11 +3141,11 @@ atlas_status atlas_service_sem_status_remote(const char *name, atlas_sem_status_
  * key; a non-NULL array with a zero count clears the list and is expressed by
  * sending an empty one. The protocol keeps those apart because they are
  * different intentions. */
-atlas_status atlas_service_sem_config_set_remote(const char *name, const char *const *compdbs,
-                                                 size_t compdb_count,
-                                                 const char *const *test_roots,
-                                                 size_t test_root_count, int auto_rebuild,
+atlas_status atlas_service_sem_config_set_remote(const atlas_sem_config_request *req,
                                                  atlas_sem_status_report *out, atlas_err *err) {
+    if (req == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "semantic configuration: bad request");
+    }
     atlas_buf params = ATLAS_BUF_INIT;
     atlas_ipc_params *p = NULL;
     atlas_json *j = NULL;
@@ -3026,12 +3153,14 @@ atlas_status atlas_service_sem_config_set_remote(const char *name, const char *c
      * is still no "write these bytes as JSON" primitive in Atlas. */
     atlas_status st = atlas_ipc_params_begin(&p, &j, err);
     if (st == ATLAS_OK) {
-        st = atlas_json_key_str(j, "repo", name, err);
+        st = atlas_json_key_str(j, "repo", req->name, err);
     }
-    const char *const KEYS[2] = {"compdbs", "test_roots"};
-    const char *const *ARRS[2] = {compdbs, test_roots};
-    const size_t COUNTS[2] = {compdb_count, test_root_count};
-    for (size_t k = 0; k < 2 && st == ATLAS_OK; k++) {
+    const char *const KEYS[4] = {"compdbs", "test_roots", "excludes", "vendor_roots"};
+    const char *const *ARRS[4] = {req->compdbs, req->test_roots, req->excludes,
+                                  req->vendor_roots};
+    const size_t COUNTS[4] = {req->compdb_count, req->test_root_count, req->exclude_count,
+                              req->vendor_root_count};
+    for (size_t k = 0; k < 4 && st == ATLAS_OK; k++) {
         if (ARRS[k] == NULL) {
             continue;
         }
@@ -3046,8 +3175,14 @@ atlas_status atlas_service_sem_config_set_remote(const char *name, const char *c
             st = atlas_json_arr_end(j, err);
         }
     }
-    if (st == ATLAS_OK && auto_rebuild >= 0) {
-        st = atlas_json_key_bool(j, "auto_rebuild", auto_rebuild > 0, err);
+    if (st == ATLAS_OK && req->auto_rebuild >= 0) {
+        st = atlas_json_key_bool(j, "auto_rebuild", req->auto_rebuild > 0, err);
+    }
+    if (st == ATLAS_OK && req->discovery_mode >= 0) {
+        /* Sent as the vocabulary name rather than as a boolean, so a reader of
+         * the wire sees the same word every other surface prints. */
+        st = atlas_json_key_str(j, "discovery_mode",
+                                req->discovery_mode > 0 ? "MANUAL" : "AUTOMATIC", err);
     }
     if (st == ATLAS_OK) {
         st = atlas_ipc_params_finish(p, &params, err);
@@ -3077,7 +3212,7 @@ atlas_status atlas_service_sem_config_set_remote(const char *name, const char *c
      * same repository because they came from the same method, rather than
      * because two parsers were kept in step. The write's response is still
      * checked above — a failure there is reported and nothing is read back. */
-    return atlas_service_sem_status_remote(name, out, err);
+    return atlas_service_sem_status_remote(req->name, out, err);
 }
 
 atlas_status atlas_service_sem_symbol_remote(const char *name, const char *symbol,

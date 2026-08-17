@@ -444,6 +444,14 @@ so rather than implying otherwise. See
 - [docs/semantic-freshness.md](docs/semantic-freshness.md) — how the daemon
   keeps the compiler-derived index current, what a generation says it covered,
   and why source-current is not the same as coverage-complete
+- [docs/semantic-discovery.md](docs/semantic-discovery.md) — how Atlas *finds* a
+  repository's compilation databases, how it knows whether that search was
+  complete, and why complete processing of configured inputs does not prove
+  complete discovery of relevant inputs
+- [docs/engineering-rules.md](docs/engineering-rules.md) — the per-season layer
+  maps and the full text of every non-negotiable rule, with the reasoning
+- [docs/extending.md](docs/extending.md) — one checklist per extensible
+  vocabulary, table, method table and bound
 - [docs/impact-gates.md](docs/impact-gates.md) — freshness and gate semantics,
   reason codes, exit codes, the revalidation workflow, traversal limits
 - [docs/operations.md](docs/operations.md) — backup, verification, restore,

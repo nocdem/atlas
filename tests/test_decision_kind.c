@@ -319,6 +319,13 @@ static void wind_back_to_schema_12(env *e, atlas_err *err) {
         "ALTER TABLE sem_generations DROP COLUMN tu_production;"
         "ALTER TABLE sem_generations DROP COLUMN test_scope_known;"
         "ALTER TABLE sem_generations DROP COLUMN source_identity;"
+        /* A9.2.4's columns and its candidate table go for the same reason:
+         * migration 19 adds them, so a database wound back past 19 must not
+         * still hold them or the re-run fails on a duplicate column. */
+        "DROP TABLE sem_build_inputs;"
+        "ALTER TABLE sem_generations DROP COLUMN discovery;"
+        "ALTER TABLE sem_generations DROP COLUMN input_count;"
+        "ALTER TABLE sem_generations DROP COLUMN scope_excluded;"
         "DELETE FROM schema_migrations WHERE version >= 13;";
 
     T_OK(atlas_db_exec_sql(e->db, BACK_DOCUMENTS, err), err);

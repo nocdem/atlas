@@ -12,7 +12,9 @@
 #include <string.h>
 
 #include "atlas/atlas.h"
+#include "atlas/sem_discover.h"
 #include "atlas/sha256.h"
+#include "atlas/syspolicy.h"
 #include "db_internal.h"
 
 /* --- small helpers ---------------------------------------------------------- */
@@ -247,6 +249,11 @@ static void read_generation(sqlite3_stmt *stmt, atlas_sem_generation *out) {
     out->tu_production = sqlite3_column_int64(stmt, 28);
     out->test_scope_known = sqlite3_column_int64(stmt, 29) != 0;
     copy_field(out->source_identity, sizeof(out->source_identity), col_text(stmt, 30));
+    /* A9.2.4. An unrecognised stored value leaves UNKNOWN, which is the reading
+     * that supports no absence. */
+    (void)atlas_sem_discovery_parse(col_text(stmt, 31), &out->discovery);
+    out->input_count = sqlite3_column_int64(stmt, 32);
+    out->scope_excluded = sqlite3_column_int64(stmt, 33);
 }
 
 #define GEN_COLUMNS                                                                             \
@@ -256,7 +263,7 @@ static void read_generation(sqlite3_stmt *stmt, atlas_sem_generation *out) {
     " g.tu_unsupported, g.symbol_count, g.edge_count, g.include_count, g.duration_ms,"          \
     " g.failure_reason, g.scope_discovery, g.scope_candidates, g.scope_covered,"                \
     " g.scope_uncovered, g.tu_test, g.tu_production, g.test_scope_known,"                \
-    " g.source_identity"
+    " g.source_identity, g.discovery, g.input_count, g.scope_excluded"
 
 atlas_status atlas_db_sem_current(atlas_db *db, int64_t repo_id, atlas_sem_generation *out,
                                   bool *found, atlas_err *err) {
@@ -527,9 +534,42 @@ atlas_status atlas_db_sem_unit_add(atlas_db *db, const atlas_sem_unit_row *row, 
         return st;
     }
     st = atlas_db_step_done(db, stmt, err);
-    if (st == ATLAS_OK && id_out != NULL) {
-        *id_out = sqlite3_last_insert_rowid(db->h);
+    if (st != ATLAS_OK || id_out == NULL) {
+        return st;
     }
+    /* Looked up rather than taken from `sqlite3_last_insert_rowid`.
+     *
+     * This is an upsert, and on the DO UPDATE branch no row is inserted — so
+     * `last_insert_rowid` would return whatever this connection inserted last,
+     * which is some other table's row. A9.2.4 threads this id into
+     * `atlas_db_sem_copy_unit`, where a wrong one would attach a unit's carried
+     * edges to a different unit entirely: silently, and only on the replay path
+     * a crash produces. Asked of the table's own unique key instead, which is
+     * the only value that is right in both branches. */
+    stmt = NULL;
+    atlas_status lst = atlas_db_prepare(db,
+                                        "SELECT id FROM sem_units WHERE generation_id = ?1"
+                                        "  AND source_text = ?2 AND config_digest = ?3;",
+                                        &stmt, err);
+    if (lst != ATLAS_OK) {
+        return lst;
+    }
+    if (sqlite3_bind_int64(stmt, 1, row->generation_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the generation");
+    }
+    lst = bind_text(db, stmt, 2, row->source_text, err);
+    if (lst == ATLAS_OK) {
+        lst = bind_text(db, stmt, 3, row->config_digest != NULL ? row->config_digest : "", err);
+    }
+    if (lst != ATLAS_OK) {
+        atlas_db_finish(db, stmt);
+        return lst;
+    }
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        *id_out = sqlite3_column_int64(stmt, 0);
+    }
+    atlas_db_finish(db, stmt);
     return st;
 }
 
@@ -692,8 +732,10 @@ atlas_status atlas_db_sem_include_add(atlas_db *db, int64_t generation_id,
 
 /* --- carrying a unit forward -------------------------------------------------- */
 
+/* `to_unit_id` is bound as `?4` and is ignored by the statements that do not
+ * name it — only the edge copy does, because only an edge belongs to a unit. */
 static atlas_status copy_one(atlas_db *db, const char *sql, int64_t to_gen, int64_t from_gen,
-                             const char *source_text, atlas_err *err) {
+                             const char *source_text, int64_t to_unit_id, atlas_err *err) {
     sqlite3_stmt *stmt = NULL;
     atlas_status st = atlas_db_prepare(db, sql, &stmt, err);
     if (st != ATLAS_OK) {
@@ -704,6 +746,11 @@ static atlas_status copy_one(atlas_db *db, const char *sql, int64_t to_gen, int6
         atlas_db_finish(db, stmt);
         return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind unit copy");
     }
+    if (sqlite3_bind_parameter_count(stmt) >= 4 &&
+        sqlite3_bind_int64(stmt, 4, to_unit_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the destination unit");
+    }
     st = bind_text(db, stmt, 3, source_text, err);
     if (st != ATLAS_OK) {
         atlas_db_finish(db, stmt);
@@ -713,8 +760,9 @@ static atlas_status copy_one(atlas_db *db, const char *sql, int64_t to_gen, int6
 }
 
 atlas_status atlas_db_sem_copy_unit(atlas_db *db, int64_t from_generation, int64_t to_generation,
-                                    const char *source_text, const char *config_digest,
-                                    int64_t *symbols_out, int64_t *edges_out, atlas_err *err) {
+                                    int64_t to_unit_id, const char *source_text,
+                                    const char *config_digest, int64_t *symbols_out,
+                                    int64_t *edges_out, atlas_err *err) {
     (void)config_digest;
     /* Facts are carried by the unit that produced them. `sem_edges.unit_id`
      * names it directly; symbols and includes are reached through that unit's
@@ -726,11 +774,15 @@ atlas_status atlas_db_sem_copy_unit(atlas_db *db, int64_t from_generation, int64
         db,
         "INSERT OR IGNORE INTO sem_edges(generation_id, kind, src_usr, dst_usr, evidence,"
         "  unit_id, file_text, line, col, proto, candidate_total)"
-        " SELECT ?1, e.kind, e.src_usr, e.dst_usr, e.evidence, e.unit_id, e.file_text, e.line,"
+        /* `?4`, never `e.unit_id`: an edge belongs to the unit in *this*
+         * generation that produced it. Carrying the ancestor's id across left
+         * every generation referencing rows it did not contain, and made the
+         * next pass's join find nothing once those rows were gone. */
+        " SELECT ?1, e.kind, e.src_usr, e.dst_usr, e.evidence, ?4, e.file_text, e.line,"
         "  e.col, e.proto, e.candidate_total"
         " FROM sem_edges e JOIN sem_units u ON u.id = e.unit_id"
-        " WHERE e.generation_id = ?2 AND u.source_text = ?3;",
-        to_generation, from_generation, source_text, err);
+        " WHERE e.generation_id = ?2 AND u.generation_id = ?2 AND u.source_text = ?3;",
+        to_generation, from_generation, source_text, to_unit_id, err);
     if (st != ATLAS_OK) {
         return st;
     }
@@ -758,7 +810,7 @@ atlas_status atlas_db_sem_copy_unit(atlas_db *db, int64_t from_generation, int64
                   " FROM sem_symbols s"
                   " WHERE s.generation_id = ?2"
                   "   AND (s.external = 1 OR s.file_text IN (SELECT path FROM reach));",
-                  to_generation, from_generation, source_text, err);
+                  to_generation, from_generation, source_text, to_unit_id, err);
     if (st != ATLAS_OK) {
         return st;
     }
@@ -786,7 +838,7 @@ atlas_status atlas_db_sem_copy_unit(atlas_db *db, int64_t from_generation, int64
                     " SELECT ?1, i.from_text, i.to_text, i.spelling, i.line, i.evidence"
                     " FROM sem_includes i"
                     " WHERE i.generation_id = ?2 AND i.from_text IN (SELECT path FROM reach);",
-                    to_generation, from_generation, source_text, err);
+                    to_generation, from_generation, source_text, to_unit_id, err);
 }
 
 /* --- candidate targets for indirect calls ------------------------------------ */
@@ -1434,7 +1486,9 @@ atlas_status atlas_db_sem_config_get(atlas_db *db, int64_t repo_id, atlas_sem_co
     atlas_status st = atlas_db_prepare(db,
                                        "SELECT repo_identity_hash, auto_rebuild, compdbs,"
                                        "  test_roots, configured_at, fail_count, fail_identity,"
-                                       "  fail_reason, fail_at"
+                                       "  fail_reason, fail_at, auto_intent, auto_intent_by,"
+                                       "  discovery_mode, excludes, vendor_roots,"
+                                       "  discovery_state, discovered_at, discovery_limit"
                                        " FROM sem_repo_config WHERE repo_id = ?1;",
                                        &stmt, err);
     if (st != ATLAS_OK) {
@@ -1447,7 +1501,14 @@ atlas_status atlas_db_sem_config_get(atlas_db *db, int64_t repo_id, atlas_sem_co
     if (sqlite3_step(stmt) == SQLITE_ROW) {
         out->present = true;
         copy_field(out->repo_identity_hash, sizeof out->repo_identity_hash, col_text(stmt, 0));
-        out->auto_rebuild = sqlite3_column_int64(stmt, 1) != 0;
+        /* A9.2.4: **never the stored column.** It is a cache written by
+         * `sem-config` under the compiled-in default, and migration 19 leaves it
+         * at 0 for every row whose intent it could not recover — so a reader
+         * that trusted it would disagree with every surface for exactly the
+         * migrated rows. The intent is the authority; the plan recomputes the
+         * effective answer against the live root-owned policy on every read,
+         * which is A6's rule about never storing a derived answer. */
+        (void)sqlite3_column_int64(stmt, 1);
         st = atlas_buf_set_str(&out->compdbs, col_text(stmt, 2), err);
         if (st == ATLAS_OK) {
             st = atlas_buf_set_str(&out->test_roots, col_text(stmt, 3), err);
@@ -1457,6 +1518,25 @@ atlas_status atlas_db_sem_config_get(atlas_db *db, int64_t repo_id, atlas_sem_co
         copy_field(out->fail_identity, sizeof out->fail_identity, col_text(stmt, 6));
         copy_field(out->fail_reason, sizeof out->fail_reason, col_text(stmt, 7));
         copy_field(out->fail_at, sizeof out->fail_at, col_text(stmt, 8));
+        /* A9.2.4. An unrecognised stored value leaves the field at its zero,
+         * which is the safe reading for all three: UNSET intent, DEFAULT
+         * provenance, AUTOMATIC discovery. The CHECKs make an unrecognised value
+         * impossible through Atlas; this is what happens if somebody edits the
+         * database with `sqlite3`, and refusing to enable on a value Atlas does
+         * not understand is the correct answer to that. */
+        (void)atlas_sem_auto_intent_parse(col_text(stmt, 9), &out->auto_intent);
+        out->auto_rebuild = atlas_sem_auto_effective(out->auto_intent, ATLAS_SEM_AUTO_DEFAULT);
+        (void)atlas_sem_intent_source_parse(col_text(stmt, 10), &out->auto_intent_by);
+        (void)atlas_sem_discovery_mode_parse(col_text(stmt, 11), &out->discovery_mode);
+        if (st == ATLAS_OK) {
+            st = atlas_buf_set_str(&out->excludes, col_text(stmt, 12), err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_buf_set_str(&out->vendor_roots, col_text(stmt, 13), err);
+        }
+        (void)atlas_sem_discovery_parse(col_text(stmt, 14), &out->discovery_state);
+        copy_field(out->discovered_at, sizeof out->discovered_at, col_text(stmt, 15));
+        copy_field(out->discovery_limit, sizeof out->discovery_limit, col_text(stmt, 16));
     }
     atlas_db_finish(db, stmt);
     return st;
@@ -1476,14 +1556,20 @@ atlas_status atlas_db_sem_config_set(atlas_db *db, const atlas_sem_config *c, at
     atlas_status st =
         atlas_db_prepare(db,
                          "INSERT INTO sem_repo_config(repo_id, repo_identity_hash, auto_rebuild,"
-                         "  compdbs, test_roots, configured_at)"
-                         " VALUES(?1,?2,?3,?4,?5,?6)"
+                         "  compdbs, test_roots, configured_at,"
+                         "  auto_intent, auto_intent_by, discovery_mode, excludes, vendor_roots)"
+                         " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)"
                          " ON CONFLICT(repo_id) DO UPDATE SET"
                          "  repo_identity_hash = excluded.repo_identity_hash,"
                          "  auto_rebuild = excluded.auto_rebuild,"
                          "  compdbs = excluded.compdbs,"
                          "  test_roots = excluded.test_roots,"
-                         "  configured_at = excluded.configured_at;",
+                         "  configured_at = excluded.configured_at,"
+                         "  auto_intent = excluded.auto_intent,"
+                         "  auto_intent_by = excluded.auto_intent_by,"
+                         "  discovery_mode = excluded.discovery_mode,"
+                         "  excludes = excluded.excludes,"
+                         "  vendor_roots = excluded.vendor_roots;",
                          &stmt, err);
     if (st != ATLAS_OK) {
         return st;
@@ -1505,9 +1591,195 @@ atlas_status atlas_db_sem_config_set(atlas_db *db, const atlas_sem_config *c, at
     if (st == ATLAS_OK) {
         st = bind_text(db, stmt, 6, now, err);
     }
+    if (st == ATLAS_OK) {
+        st = bind_text(db, stmt, 7, atlas_sem_auto_intent_name(c->auto_intent), err);
+    }
+    if (st == ATLAS_OK) {
+        st = bind_text(db, stmt, 8, atlas_sem_intent_source_name(c->auto_intent_by), err);
+    }
+    if (st == ATLAS_OK) {
+        st = bind_text(db, stmt, 9, atlas_sem_discovery_mode_name(c->discovery_mode), err);
+    }
+    if (st == ATLAS_OK) {
+        st = bind_buf(db, stmt, 10, &c->excludes, err);
+    }
+    if (st == ATLAS_OK) {
+        st = bind_buf(db, stmt, 11, &c->vendor_roots, err);
+    }
     if (st != ATLAS_OK) {
         atlas_db_finish(db, stmt);
         return st;
+    }
+    return atlas_db_step_done(db, stmt, err);
+}
+
+/* --- A9.2.4: the discovered candidates ---------------------------------------
+ *
+ * Rewritten whole by each discovery pass rather than merged into, because the
+ * table is a *snapshot of a search*, not an accumulation of sightings. A row
+ * left behind from a previous walk would be a candidate Atlas is no longer
+ * asserting anything about, sitting beside ones it is — and nothing in the row
+ * would say which kind it was. Delete-then-insert in one transaction is the
+ * honest shape, and the caller owns that transaction. */
+atlas_status atlas_db_sem_inputs_replace(atlas_db *db, int64_t repo_id,
+                                         const struct atlas_sem_input *inputs, size_t count,
+                                         const char *discovered_at, atlas_err *err) {
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st =
+        atlas_db_prepare(db, "DELETE FROM sem_build_inputs WHERE repo_id = ?1;", &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, repo_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind repository id");
+    }
+    st = atlas_db_step_done(db, stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        const atlas_sem_input *in = &inputs[i];
+        stmt = NULL;
+        st = atlas_db_prepare(db,
+                              "INSERT INTO sem_build_inputs(repo_id, path_text, origin, accepted,"
+                              "  reject_reason, digest, unit_count, discovered_at)"
+                              " VALUES(?1,?2,?3,?4,?5,?6,?7,?8);",
+                              &stmt, err);
+        if (st != ATLAS_OK) {
+            return st;
+        }
+        if (sqlite3_bind_int64(stmt, 1, repo_id) != SQLITE_OK ||
+            sqlite3_bind_int64(stmt, 4, in->accepted ? 1 : 0) != SQLITE_OK ||
+            sqlite3_bind_int64(stmt, 7, in->unit_count) != SQLITE_OK) {
+            atlas_db_finish(db, stmt);
+            return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind a build input");
+        }
+        st = bind_text(db, stmt, 2, in->path, err);
+        if (st == ATLAS_OK) {
+            st = bind_text(db, stmt, 3, atlas_sem_input_origin_name(in->origin), err);
+        }
+        if (st == ATLAS_OK) {
+            /* Interned rather than stored as the caller gave it: a reason that
+             * arrived over a socket is a *matching* string, not Atlas' string,
+             * and a column an operator reads must hold bytes Atlas owns. An
+             * unrecognised value becomes empty rather than being stored. */
+            const char *reason = atlas_sem_reject_intern(in->reject_reason);
+            st = bind_text(db, stmt, 5, reason != NULL ? reason : "", err);
+        }
+        if (st == ATLAS_OK) {
+            st = bind_text(db, stmt, 6, in->digest, err);
+        }
+        if (st == ATLAS_OK) {
+            st = bind_text(db, stmt, 8, discovered_at != NULL ? discovered_at : "", err);
+        }
+        if (st != ATLAS_OK) {
+            atlas_db_finish(db, stmt);
+            return st;
+        }
+        st = atlas_db_step_done(db, stmt, err);
+        if (st != ATLAS_OK) {
+            return st;
+        }
+    }
+    return ATLAS_OK;
+}
+
+/* Records the verdict of one discovery pass.
+ *
+ * Upserts, because a repository with no build description still has a discovery
+ * result — that is the whole point of the season: a repository nobody configured
+ * is one Atlas looks at, and what it found has to be recorded somewhere. The row
+ * this creates expresses no intent (`auto_intent` keeps its 'UNSET' default), so
+ * creating it authorises nothing. */
+atlas_status atlas_db_sem_discovery_set(atlas_db *db, int64_t repo_id,
+                                        const char *repo_identity_hash, const char *state,
+                                        const char *discovered_at, const char *limit_detail,
+                                        atlas_err *err) {
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st =
+        atlas_db_prepare(db,
+                         "INSERT INTO sem_repo_config(repo_id, repo_identity_hash,"
+                         "  discovery_state, discovered_at, discovery_limit)"
+                         " VALUES(?1,?2,?3,?4,?5)"
+                         " ON CONFLICT(repo_id) DO UPDATE SET"
+                         "  discovery_state = excluded.discovery_state,"
+                         "  discovered_at = excluded.discovered_at,"
+                         "  discovery_limit = excluded.discovery_limit;",
+                         &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, repo_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind repository id");
+    }
+    st = bind_text(db, stmt, 2, repo_identity_hash != NULL ? repo_identity_hash : "", err);
+    if (st == ATLAS_OK) {
+        st = bind_text(db, stmt, 3, state, err);
+    }
+    if (st == ATLAS_OK) {
+        st = bind_text(db, stmt, 4, discovered_at != NULL ? discovered_at : "", err);
+    }
+    if (st == ATLAS_OK) {
+        st = bind_text(db, stmt, 5, limit_detail != NULL ? limit_detail : "", err);
+    }
+    if (st != ATLAS_OK) {
+        atlas_db_finish(db, stmt);
+        return st;
+    }
+    return atlas_db_step_done(db, stmt, err);
+}
+
+atlas_status atlas_db_sem_inputs_get(atlas_db *db, int64_t repo_id, struct atlas_sem_input *out,
+                                     size_t max, size_t *count_out, atlas_err *err) {
+    if (count_out != NULL) {
+        *count_out = 0;
+    }
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(db,
+                                       "SELECT path_text, origin, accepted, reject_reason,"
+                                       "  digest, unit_count"
+                                       " FROM sem_build_inputs WHERE repo_id = ?1"
+                                       " ORDER BY path_text;",
+                                       &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, repo_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind repository id");
+    }
+    size_t n = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW && n < max) {
+        atlas_sem_input *in = &out[n];
+        memset(in, 0, sizeof(*in));
+        copy_field(in->path, sizeof in->path, col_text(stmt, 0));
+        (void)atlas_sem_input_origin_parse(col_text(stmt, 1), &in->origin);
+        in->accepted = sqlite3_column_int64(stmt, 2) != 0;
+        copy_field(in->reject_reason, sizeof in->reject_reason, col_text(stmt, 3));
+        copy_field(in->digest, sizeof in->digest, col_text(stmt, 4));
+        in->unit_count = sqlite3_column_int64(stmt, 5);
+        n++;
+    }
+    atlas_db_finish(db, stmt);
+    if (count_out != NULL) {
+        *count_out = n;
+    }
+    return ATLAS_OK;
+}
+
+atlas_status atlas_db_sem_inputs_forget(atlas_db *db, int64_t repo_id, atlas_err *err) {
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st =
+        atlas_db_prepare(db, "DELETE FROM sem_build_inputs WHERE repo_id = ?1;", &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, repo_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind repository id");
     }
     return atlas_db_step_done(db, stmt, err);
 }
@@ -1567,8 +1839,12 @@ atlas_status atlas_db_sem_config_repos(atlas_db *db, int64_t *out, size_t max, s
         return atlas_err_set(err, ATLAS_ERR_INTERNAL, "semantic configuration: bad request");
     }
     sqlite3_stmt *stmt = NULL;
+    /* A9.2.4: every registered repository, not only the configured ones. See the
+     * declaration — an absent build description now means "nobody has said
+     * anything", which the root-owned default resolves, so a repository with no
+     * row has to be considered before it can be held or built. */
     atlas_status st = atlas_db_prepare(
-        db, "SELECT repo_id FROM sem_repo_config WHERE repo_id > 0 ORDER BY repo_id;", &stmt, err);
+        db, "SELECT id FROM repositories WHERE id > 0 ORDER BY id;", &stmt, err);
     if (st != ATLAS_OK) {
         return st;
     }
@@ -1666,6 +1942,54 @@ atlas_status atlas_db_sem_scope_counts(atlas_db *db, int64_t repo_id, int64_t ge
     return ATLAS_OK;
 }
 
+/* A9.2.4. Candidate sources under an operator-declared vendor prefix.
+ *
+ * Counted in C rather than in SQL because the prefix rule is a path-component
+ * match, which `LIKE` cannot express without matching `vendorish/` as well as
+ * `vendor/` — and a production source misclassified as somebody else's code is
+ * wrong in the one direction that matters, exactly as it is for test roots.
+ * `atlas_sem_path_under_prefix` is the single implementation of that rule.
+ *
+ * Runs once, at publication, over the same candidate set the denominator counts. */
+atlas_status atlas_db_sem_scope_vendor_count(atlas_db *db, int64_t repo_id,
+                                             const char *packed_vendor_roots, int64_t *out,
+                                             atlas_err *err) {
+    if (out != NULL) {
+        *out = 0;
+    }
+    if (packed_vendor_roots == NULL || packed_vendor_roots[0] == '\0') {
+        /* No declared vendor prefix is "Atlas does not know of any", never
+         * "there are none". Zero excluded is the honest count either way; what
+         * differs is that nothing was classified, and the manifest says that by
+         * carrying the operator's list rather than by a flag here. */
+        return ATLAS_OK;
+    }
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(db,
+                                       "SELECT path_text FROM files"
+                                       " WHERE repo_id = ?1 AND deleted = 0"
+                                       "   AND file_type = 'regular' AND language = 'c';",
+                                       &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, repo_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind repository id");
+    }
+    int64_t n = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        if (atlas_sem_path_under_prefix(packed_vendor_roots, col_text(stmt, 0))) {
+            n++;
+        }
+    }
+    atlas_db_finish(db, stmt);
+    if (out != NULL) {
+        *out = n;
+    }
+    return ATLAS_OK;
+}
+
 atlas_status atlas_db_sem_scope_test_split(atlas_db *db, int64_t generation_id,
                                            const char *packed_test_roots, int64_t *test_out,
                                            int64_t *production_out, bool *known_out,
@@ -1731,7 +2055,8 @@ atlas_status atlas_db_sem_scope_set(atlas_db *db, int64_t generation_id,
                                        "UPDATE sem_generations SET scope_discovery = ?2,"
                                        "  scope_candidates = ?3, scope_covered = ?4,"
                                        "  scope_uncovered = ?5, tu_test = ?6, tu_production = ?7,"
-                                       "  test_scope_known = ?8"
+                                       "  test_scope_known = ?8, discovery = ?9,"
+                                       "  input_count = ?10, scope_excluded = ?11"
                                        " WHERE id = ?1;",
                                        &stmt, err);
     if (st != ATLAS_OK) {
@@ -1743,11 +2068,16 @@ atlas_status atlas_db_sem_scope_set(atlas_db *db, int64_t generation_id,
         sqlite3_bind_int64(stmt, 5, m->scope_uncovered) != SQLITE_OK ||
         sqlite3_bind_int64(stmt, 6, m->tu_test) != SQLITE_OK ||
         sqlite3_bind_int64(stmt, 7, m->tu_production) != SQLITE_OK ||
-        sqlite3_bind_int64(stmt, 8, m->test_scope_known ? 1 : 0) != SQLITE_OK) {
+        sqlite3_bind_int64(stmt, 8, m->test_scope_known ? 1 : 0) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 10, m->input_count) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 11, m->scope_excluded) != SQLITE_OK) {
         atlas_db_finish(db, stmt);
         return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the coverage manifest");
     }
     st = bind_text(db, stmt, 2, atlas_sem_scope_discovery_name(m->scope_discovery), err);
+    if (st == ATLAS_OK) {
+        st = bind_text(db, stmt, 9, atlas_sem_discovery_name(m->discovery), err);
+    }
     if (st != ATLAS_OK) {
         atlas_db_finish(db, stmt);
         return st;

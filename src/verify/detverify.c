@@ -183,11 +183,15 @@ static void scope_of(atlas_verify_verifier v, const char *a, const char *b, char
  * differently. */
 static atlas_status sem_state(atlas_db *db, int64_t repo_id, bool *indexed_out,
                               bool *units_complete_out, bool *scope_complete_out,
-                              bool *current_out, atlas_err *err) {
+                              bool *current_out, atlas_sem_discovery *discovery_out,
+                              atlas_err *err) {
     *indexed_out = false;
     *units_complete_out = false;
     *scope_complete_out = false;
     *current_out = false;
+    /* A9.2.4. UNKNOWN unless the plan says otherwise — a repository Atlas cannot
+     * resolve is one whose build inputs it has certainly not enumerated. */
+    *discovery_out = ATLAS_SEM_DISC_UNKNOWN;
 
     atlas_repo_info info;
     atlas_repo_info_init(&info);
@@ -209,6 +213,11 @@ static atlas_status sem_state(atlas_db *db, int64_t repo_id, bool *indexed_out,
     }
     *indexed_out = plan.freshness != ATLAS_SEM_FRESH_ABSENT;
     *current_out = plan.freshness == ATLAS_SEM_FRESH_CURRENT;
+    /* The verdict the *served generation* was built under, not the one that
+     * holds now. A claim is answered from the published index, so what bounds it
+     * is what that index could account for — a walk that has since completed
+     * says nothing about a generation built before it did. */
+    *discovery_out = plan.generation_discovery;
 
     /* Two completenesses, because they answer two different questions and
      * A9.2.2 could only ask one.
@@ -255,7 +264,7 @@ static atlas_verify_coverage fold_coverage(bool indexed, bool complete, bool cur
 }
 
 static void sem_coverage(atlas_verify_coverage_report *cov, bool indexed, bool units_complete,
-                         bool scope_complete, bool current) {
+                         bool scope_complete, bool current, atlas_sem_discovery discovery) {
     /* A9.2.3 splits what A9.2.2 had to fold, and the split is the point.
      *
      * `SEMANTIC_GENERATION`, `GENERATED_SOURCE` and `DIRECT_CALLS` follow the
@@ -290,6 +299,20 @@ static void sem_coverage(atlas_verify_coverage_report *cov, bool indexed, bool u
     cov->dims[ATLAS_COVDIM_GENERATED_SOURCE] = units;
     cov->dims[ATLAS_COVDIM_DIRECT_CALLS] = units;
     cov->dims[ATLAS_COVDIM_TRACKED_SOURCE] = scope;
+
+    /* A9.2.4. The dimension underneath the other three, and the reason it is a
+     * dimension rather than a stricter reading of `scope`: the two answer
+     * different questions and a reader must be able to tell which one failed.
+     * `TRACKED_SOURCE` PARTIAL means the accepted databases did not name every
+     * source; `BUILD_INPUT_DISCOVERY` PARTIAL means Atlas cannot say those were
+     * all the databases. A repository can be perfect on the first and hopeless
+     * on the second — which is exactly the state that produced this season. */
+    cov->dims[ATLAS_COVDIM_BUILD_INPUT_DISCOVERY] =
+        !indexed          ? ATLAS_COVERAGE_UNKNOWN
+        : !current        ? ATLAS_COVERAGE_STALE
+        : discovery == ATLAS_SEM_DISC_COMPLETE ? ATLAS_COVERAGE_COMPLETE
+        : discovery == ATLAS_SEM_DISC_PARTIAL  ? ATLAS_COVERAGE_PARTIAL
+                                               : ATLAS_COVERAGE_UNKNOWN;
 }
 
 /* §11. No A9.2.2 verifier observes a running system or reads deployed
@@ -465,18 +488,20 @@ atlas_status atlas_verify_run_verifier(atlas_db *db, atlas_verify_verifier v, in
         }
         int64_t count = 0;
         bool units_complete = false, scope_complete = false, indexed = false, current = false;
+        atlas_sem_discovery discovery = ATLAS_SEM_DISC_UNKNOWN;
         /* The count from the query, the *state* from `sem_state` and from
          * nowhere else: the query's own completeness flag is A9.2's narrower
          * one, and passing NULL for it says which of the two is authoritative
          * rather than leaving one to overwrite the other. */
         atlas_status st = atlas_db_verify_sem_symbol(db, repo_id, arg_a, &count, NULL, NULL, err);
         if (st == ATLAS_OK) {
-            st = sem_state(db, repo_id, &indexed, &units_complete, &scope_complete, &current, err);
+            st = sem_state(db, repo_id, &indexed, &units_complete, &scope_complete, &current,
+                           &discovery, err);
         }
         if (st != ATLAS_OK) {
             return st;
         }
-        sem_coverage(cov, indexed, units_complete, scope_complete, current);
+        sem_coverage(cov, indexed, units_complete, scope_complete, current, discovery);
         scope_of(v, arg_a, NULL, scope_out, scope_size);
         if (!indexed) {
             /* Recorded so the reason survives: without it `truth_of` sees only
@@ -521,15 +546,17 @@ atlas_status atlas_verify_run_verifier(atlas_db *db, atlas_verify_verifier v, in
         }
         bool exists = false, indexed = false, units_complete = false, scope_complete = false,
              current = false;
+        atlas_sem_discovery discovery = ATLAS_SEM_DISC_UNKNOWN;
         atlas_status st = atlas_db_verify_sem_proven_edge(db, repo_id, arg_a, arg_b, &exists, NULL,
                                                           NULL, err);
         if (st == ATLAS_OK) {
-            st = sem_state(db, repo_id, &indexed, &units_complete, &scope_complete, &current, err);
+            st = sem_state(db, repo_id, &indexed, &units_complete, &scope_complete, &current,
+                           &discovery, err);
         }
         if (st != ATLAS_OK) {
             return st;
         }
-        sem_coverage(cov, indexed, units_complete, scope_complete, current);
+        sem_coverage(cov, indexed, units_complete, scope_complete, current, discovery);
         /* This verifier makes no claim about indirect calls, so the dimension
          * is NOT_APPLICABLE rather than UNKNOWN. That distinction matters: a
          * claim must not be blocked by a dimension it does not depend on, and
@@ -573,15 +600,17 @@ atlas_status atlas_verify_run_verifier(atlas_db *db, atlas_verify_verifier v, in
         int64_t callers = 0, address_taken = 0;
         bool internal = false, defined = false, indexed = false, current = false;
         bool units_complete = false, scope_complete = false;
+        atlas_sem_discovery discovery = ATLAS_SEM_DISC_UNKNOWN;
         atlas_status st = atlas_db_verify_sem_callers(db, repo_id, arg_a, &callers, &address_taken,
                                                       &internal, &defined, NULL, NULL, err);
         if (st == ATLAS_OK) {
-            st = sem_state(db, repo_id, &indexed, &units_complete, &scope_complete, &current, err);
+            st = sem_state(db, repo_id, &indexed, &units_complete, &scope_complete, &current,
+                           &discovery, err);
         }
         if (st != ATLAS_OK) {
             return st;
         }
-        sem_coverage(cov, indexed, units_complete, scope_complete, current);
+        sem_coverage(cov, indexed, units_complete, scope_complete, current, discovery);
         scope_of(v, arg_a, NULL, scope_out, scope_size);
 
         if (!indexed) {

@@ -59,7 +59,16 @@
  * identical compilation database. The stored generation records it, and a
  * mismatch makes the generation stale rather than silently wrong. */
 #define ATLAS_SEM_ANALYZER_ID "atlas-c-libclang"
-#define ATLAS_SEM_ANALYZER_VERSION 1
+/* 2 since A9.2.4: an incremental pass now attributes a carried-forward edge to
+ * the unit in its **own** generation rather than to the ancestor unit that first
+ * produced it. Identical bytes therefore produce a different — and correct —
+ * graph, which is exactly the condition this epoch exists for.
+ *
+ * Bumping it is also the repair. Every generation built before the fix has a
+ * call graph that decayed a little on each incremental pass, and nothing short
+ * of a full rebuild can restore one; a stale epoch is what makes the daemon
+ * rebuild them, once, without anybody having to know which are affected. */
+#define ATLAS_SEM_ANALYZER_VERSION 2
 
 /* --- evidence classes ------------------------------------------------------ */
 
@@ -242,6 +251,12 @@ const char *atlas_sem_freshness_name(atlas_sem_freshness f);
 #define ATLAS_SEM_STALE_COMPILER "the_compiler_changed_since_this_index_was_built"
 #define ATLAS_SEM_STALE_ANALYZER "atlas_semantic_analyzer_changed_since_this_index_was_built"
 #define ATLAS_SEM_STALE_FILE_INDEX "the_file_index_is_not_current"
+/* A9.2.4. The *set* of build descriptions changed — one appeared, one vanished,
+ * or the walk's verdict about whether it found them all moved. Kept apart from
+ * STALE_COMPDB, which is about a database whose *contents* changed, and from
+ * STALE_SOURCE, which would also be true and would send somebody looking at
+ * their source instead of at their build tree. */
+#define ATLAS_SEM_STALE_DISCOVERY "the_set_of_discovered_build_inputs_changed_since_this_index_was_built"
 #define ATLAS_SEM_STALE_INCOMPLETE "the_last_generation_did_not_complete"
 bool atlas_sem_stale_reason_is_known(const char *reason);
 
@@ -271,6 +286,87 @@ typedef enum atlas_sem_scope_discovery {
 
 const char *atlas_sem_scope_discovery_name(atlas_sem_scope_discovery d);
 bool atlas_sem_scope_discovery_parse(const char *name, atlas_sem_scope_discovery *out);
+
+/* --- A9.2.4: build-input discovery, and how complete it is --------------------
+ *
+ * `scope_discovery` above answers "did Atlas enumerate the *sources*?".  This
+ * answers the question underneath it, which A9.2.3 could not ask at all:
+ *
+ *   **COMPLETE PROCESSING OF CONFIGURED INPUTS DOES NOT PROVE COMPLETE
+ *   DISCOVERY OF RELEVANT INPUTS.**
+ *
+ * `tu_complete == tu_total` says every unit the named databases contained was
+ * parsed. Two databases reporting 200/200 and 216/216 establish nothing whatever
+ * about whether a third database exists — and on the repository that produced
+ * this season, one did. So a second, separate axis: not "were the inputs
+ * processed" but "were the inputs *found*".
+ *
+ * UNKNOWN is zero, and it is what a repository nobody has walked reads. It is
+ * also what a repository whose build description was pinned by hand reads,
+ * deliberately: an operator naming two databases is not evidence that there are
+ * two, which is the precise mistake this season exists to make unrepeatable. */
+typedef enum atlas_sem_discovery {
+    /* Atlas did not look, or looking failed. Never sufficient for an absence. */
+    ATLAS_SEM_DISC_UNKNOWN = 0,
+    /* Atlas looked and stopped early: a ceiling was reached, a subtree was
+     * excluded, or a directory could not be read. What was not discovered is not
+     * thereby proven absent — DID NOT DISCOVER is not PROVEN NOT TO EXIST. */
+    ATLAS_SEM_DISC_PARTIAL,
+    /* Atlas walked the whole bounded search universe without reaching a ceiling
+     * and without a subtree it could not account for. The claim is bounded by
+     * that universe and by nothing wider, and the universe is reported beside
+     * the verdict rather than left for a reader to assume. */
+    ATLAS_SEM_DISC_COMPLETE
+} atlas_sem_discovery;
+
+const char *atlas_sem_discovery_name(atlas_sem_discovery d);
+bool atlas_sem_discovery_parse(const char *name, atlas_sem_discovery *out);
+
+/* Whether a repository's compilation databases are searched for or only taken
+ * from the operator's pinned list. AUTOMATIC is zero because it is the default,
+ * and because the zero must not be the state that *suppresses* looking: a
+ * `memset` that turned discovery off would produce a repository reporting
+ * UNKNOWN discovery for ever with nothing saying why. */
+typedef enum atlas_sem_discovery_mode {
+    ATLAS_SEM_DISCMODE_AUTOMATIC = 0,
+    ATLAS_SEM_DISCMODE_MANUAL
+} atlas_sem_discovery_mode;
+
+const char *atlas_sem_discovery_mode_name(atlas_sem_discovery_mode m);
+bool atlas_sem_discovery_mode_parse(const char *name, atlas_sem_discovery_mode *out);
+
+/* --- A9.2.4: whether automatic maintenance runs, and who said so -------------
+ *
+ * A9.2.3 stored one boolean, `auto_rebuild`, written unconditionally as 0 or 1.
+ * A stored 0 therefore could not distinguish "an operator disabled this" from
+ * "nobody has ever said anything", and the two call for opposite behaviour: the
+ * first must be honoured for ever, the second carries no information at all.
+ *
+ * The intent and its provenance are separate fields so that the ambiguity cannot
+ * recur. A migrated row is UNSET/MIGRATION and reads *migrated, intent unknown*
+ * — never *operator disabled*, which would be inventing an intent nobody
+ * expressed. */
+typedef enum atlas_sem_auto_intent {
+    /* Nobody has expressed an intent. The default policy decides. */
+    ATLAS_SEM_INTENT_UNSET = 0,
+    ATLAS_SEM_INTENT_ENABLED,
+    /* Honoured for ever, and never lifted by anything but an operator. */
+    ATLAS_SEM_INTENT_DISABLED
+} atlas_sem_auto_intent;
+
+const char *atlas_sem_auto_intent_name(atlas_sem_auto_intent i);
+bool atlas_sem_auto_intent_parse(const char *name, atlas_sem_auto_intent *out);
+
+typedef enum atlas_sem_intent_source {
+    /* No row, or a row that predates anybody saying anything. */
+    ATLAS_SEM_INTENT_BY_DEFAULT = 0,
+    ATLAS_SEM_INTENT_BY_OPERATOR,
+    /* Written by migration 19 from a value that carried no information. */
+    ATLAS_SEM_INTENT_BY_MIGRATION
+} atlas_sem_intent_source;
+
+const char *atlas_sem_intent_source_name(atlas_sem_intent_source s);
+bool atlas_sem_intent_source_parse(const char *name, atlas_sem_intent_source *out);
 
 /* --- a generation ------------------------------------------------------------ */
 
@@ -323,6 +419,23 @@ typedef struct atlas_sem_generation {
      * and the toolchain. Empty on a pre-A9.2.3 generation, and an empty stored
      * identity never makes one stale. */
     char source_identity[65];
+
+    /* --- A9.2.4: what the input universe looked like when this was built -----
+     *
+     * Sealed with the rest of the manifest, and reported beside the unit counts
+     * rather than folded into them. `input_count` is how many compilation
+     * databases were accepted; `discovery` is whether Atlas can say that was all
+     * of them. A generation whose discovery is UNKNOWN or PARTIAL may be
+     * perfectly current and perfectly complete over what it read, and still
+     * cannot support "there is no X anywhere in this repository". */
+    atlas_sem_discovery discovery;
+    int64_t input_count;
+    /* Candidate sources under an operator-declared vendor prefix. Reported
+     * separately and *not* counted as uncovered: an operator saying "this
+     * subtree is somebody else's code" is a classification, and treating it as a
+     * coverage failure would make every repository with a vendored dependency
+     * permanently unable to state an absence about its own code. */
+    int64_t scope_excluded;
 } atlas_sem_generation;
 
 void atlas_sem_generation_init(atlas_sem_generation *g);
@@ -342,17 +455,51 @@ void atlas_sem_generation_init(atlas_sem_generation *g);
  * and only an operator writes the row: absent configuration means this daemon
  * never runs a compiler for this repository.
  *
- * Paths are repository-relative, validated inside the root by the indexer
- * exactly as `--compdb` is, and **never discovered**: Atlas does not search a
- * repository for a file that will tell it how to compile things. */
+ * Paths are repository-relative and validated inside the root by the indexer
+ * exactly as `--compdb` is.
+ *
+ * **A9.2.4 reversed the second half of this rule.** It said compilation
+ * databases are *never discovered* — Atlas does not search a repository for a
+ * file that will tell it how to compile things — and the consequence was that
+ * the answer to "what are this repository's build inputs?" was whatever somebody
+ * had typed, which on the repository that produced that season was two of three.
+ * Atlas now searches, inside a bounded universe with every ceiling reported; see
+ * `atlas/sem_discover.h`. What survives is that a *pinned* path is still exactly
+ * what an operator named, and that the search never follows a symlink or leaves
+ * the root. */
 #define ATLAS_SEM_CONFIG_MAX_BYTES 8192u
 
 typedef struct atlas_sem_config {
     bool present;
     int64_t repo_id;
     char repo_identity_hash[65];
+    /* A9.2.3's boolean, kept as the *effective* answer so that every existing
+     * reader keeps working. It is derived from `auto_intent` and the root-owned
+     * default by `atlas_sem_auto_effective`, and is never the thing an operator
+     * writes. */
     bool auto_rebuild;
-    /* Newline-separated, repository-relative. Owned. */
+    /* A9.2.4. What an operator actually said, and who said it. See
+     * `atlas_sem_auto_intent`: these two exist because one boolean could not
+     * tell a deliberate refusal from silence. */
+    atlas_sem_auto_intent auto_intent;
+    atlas_sem_intent_source auto_intent_by;
+    /* A9.2.4. Whether Atlas searches this repository for compilation databases.
+     * MANUAL leaves discovery UNKNOWN, which is honest rather than harsh: a
+     * pinned list is a list somebody wrote, and this season exists because one
+     * such list was incomplete and nothing could say so. */
+    atlas_sem_discovery_mode discovery_mode;
+    /* Newline-separated, repository-relative prefixes the walk does not enter.
+     * Owned. Visible in every status surface, because an exclusion that is not
+     * shown is a hole in the search universe nobody can see. */
+    atlas_buf excludes;
+    /* Newline-separated, repository-relative prefixes the operator declares to
+     * be somebody else's code. Owned. Candidates under one are counted as
+     * `scope_excluded` rather than as uncovered. Atlas guesses at no point: a
+     * directory called `vendor` is a directory somebody named. */
+    atlas_buf vendor_roots;
+    /* Newline-separated, repository-relative. Owned. Under AUTOMATIC discovery
+     * these are *pinned* paths, accepted in addition to whatever the walk finds;
+     * under MANUAL they are the whole accepted set. */
     atlas_buf compdbs;
     /* Newline-separated, repository-relative prefixes an operator declares to be
      * test sources. Owned. Empty is not "there are no tests" — it is "Atlas does
@@ -361,6 +508,16 @@ typedef struct atlas_sem_config {
      * is a directory somebody named. */
     atlas_buf test_roots;
     char configured_at[ATLAS_TS_MAX];
+    /* A9.2.4. The last discovery pass's verdict, when it ran, and which ceiling
+     * stopped it if one did.
+     *
+     * Derived rather than declared — the retry-governor fields below are the
+     * same shape, and for the same reason: it is a fact about the repository
+     * rather than about any one candidate, and the alternative is a table with
+     * one row in it. Written only by a discovery pass, never by `sem-config`. */
+    atlas_sem_discovery discovery_state;
+    char discovered_at[ATLAS_TS_MAX];
+    char discovery_limit[128];
     /* The retry governor's durable half. A further automatic attempt is allowed
      * only once the source identity has moved past `fail_identity` — never after
      * an interval, which would retry an unbuildable tree for ever. */
@@ -397,6 +554,47 @@ atlas_status atlas_sem_config_unpack(const char *packed, atlas_buf *out, size_t 
  * production source as a test and make a production-scope absence wrong in the
  * one direction that matters. */
 bool atlas_sem_path_is_test(const char *packed_roots, const char *rel);
+
+/* True when `rel` lies under one of the packed prefixes, on a path component
+ * boundary. The general form `atlas_sem_path_is_test` is one use of; exclusions
+ * and vendor roots are the others, and they must all match identically or an
+ * operator would have to learn three different prefix rules. */
+bool atlas_sem_path_under_prefix(const char *packed_prefixes, const char *rel);
+
+/* --- A9.2.4: what "automatic maintenance is on" resolves to -------------------
+ *
+ * The whole activation policy, in one pure function, so that the daemon, the CLI
+ * and every status surface answer identically because they call it rather than
+ * because somebody keeps three copies in step.
+ *
+ *   DISABLED -> off, for ever, until an operator says otherwise.
+ *   ENABLED  -> on.
+ *   UNSET    -> `policy_default`, which is the root-owned machine-wide answer.
+ *
+ * A9.2.3's rule was that `auto_rebuild` defaults to 0 so that no compiler runs
+ * over a repository nobody has spoken about, and **A9.2.4 reverses that
+ * default**. The reversal is stated rather than slipped in:
+ *
+ *   - What the opt-in protected was never code execution. libclang *parses*
+ *     repository text; the `command` string is word-split and never executed,
+ *     arguments pass a positive allowlist, include directories outside the
+ *     repository are recorded and never opened, and the parse runs in a bounded
+ *     child with an empty environment and an address-space ceiling. The opt-in
+ *     was authority and resource policy, and it is replaced by authority and
+ *     resource policy rather than removed.
+ *   - Registering a repository is already an operator act that no model can
+ *     perform, and it is the act that now carries the consent.
+ *   - Whether this daemon may run a compiler on its own initiative for a
+ *     repository nobody has spoken about stays a *root-owned* decision — the
+ *     `semantic_auto_default` key — rather than becoming a compiled-in fact.
+ *   - Nothing model-facing changed: no MCP tool, no gateway route and no
+ *     ordinary RPC method enables, disables or triggers semantic maintenance,
+ *     and `code.sem_config` stays in the operator-uid table.
+ *
+ * What it buys is the property the season exists for: **semantic maintenance
+ * must not depend on an operator remembering to repair freshness, except where
+ * the operator has explicitly disabled it.** */
+bool atlas_sem_auto_effective(atlas_sem_auto_intent intent, bool policy_default);
 
 /* --- the configuration digest -------------------------------------------------
  *
@@ -607,37 +805,55 @@ atlas_status atlas_sem_index_run(atlas_db *db, int64_t repo_id,
                                  const atlas_sem_index_opts *opts,
                                  atlas_sem_index_summary *sum, atlas_err *err);
 
-/* A9.2.3: the compilation-database digest, computed from the files as they are
- * now rather than as the generation recorded them.
+/* The digest over the compilation databases this repository's semantic index is
+ * actually built from — since A9.2.4, the set **discovery accepted** rather than
+ * the set an operator pinned.
  *
- * `compdbs` is the NUL-separated repository-relative list, opened bounded and
- * without following a symlink from `root_fd`. This is the value
- * `atlas_sem_freshness_of` compares against a generation's stored
- * `compdb_digest`, and until A9.2.3 every caller passed NULL for it, which made
- * that comparison unreachable — see the implementation for why that was
- * defensible while rebuilding was manual and is not once the daemon owns
- * freshness.
+ * It is what gives the specific `a compilation database changed` staleness
+ * reason, which `atlas_sem_source_identity` cannot: that value also moves for an
+ * ordinary source edit, and an operator told "the working tree changed" would go
+ * looking at their source rather than at their build tree.
  *
- * An unreadable database yields an empty digest and a non-OK status; an empty
- * live digest never makes a generation stale, because "Atlas could not look" is
- * not evidence that the description changed. */
-atlas_status atlas_sem_live_compdb_digest(int root_fd, const char *compdbs, size_t compdbs_len,
-                                          char out[65], atlas_err *err);
-
-/* The same, for a registered repository, reading the databases its durable
- * build description names. A repository with no description yields an empty
- * digest and no error: there is nothing declared to compare against, so there is
- * no claim to make. */
+ * A repository with nothing accepted yields an empty digest and no error, and an
+ * empty live digest never makes a generation stale. A **partly** readable set
+ * does report as changed: an accepted database that can no longer be read
+ * contributes a fixed marker rather than being skipped, because skipping it
+ * would make a repository that has just lost one compare equal to one that never
+ * had it.
+ *
+ * A9.2.3's `atlas_sem_live_compdb_digest` — the same digest over a caller's
+ * explicit list — is gone. Every live value now comes from one pass over the
+ * accepted set, so it had no callers left, and a second implementation of a
+ * digest that decides whether a repository is rebuilt is exactly what must not
+ * survive. */
 atlas_status atlas_sem_repo_compdb_digest(atlas_db *db, atlas_repo_info *repo, char out[65],
                                           atlas_err *err);
+
+/* A9.2.4: the digest over one repository's *input universe*, as it stands now.
+ *
+ * Membership from the persisted candidate list a discovery pass wrote; content
+ * read live, so an edited or removed compilation database moves this value at
+ * once and a newly created one moves it at the next discovery pass. The
+ * discovery state is folded in as well, so a PARTIAL walk that later completes
+ * with an identical accepted set still moves the identity — which is the only
+ * way a generation's sealed manifest can be upgraded, and it costs almost
+ * nothing because every unit is reused.
+ *
+ * This replaces `atlas_sem_repo_compdb_digest`'s role inside
+ * `atlas_sem_source_identity`. That function stays, because it answers a
+ * narrower question the freshness reasons still want: *did the databases this
+ * generation was built from change?* */
+atlas_status atlas_sem_repo_discovery_identity(atlas_db *db, atlas_repo_info *repo, char out[65],
+                                               atlas_err *err);
 
 /* A9.2.3: everything that determines what a semantic generation would contain,
  * in one comparable value.
  *
  * Domain-separated and length-prefixed, for A4's reason. It covers, in path
  * order: every live C source and header the file index holds, by path and
- * content hash; the live compilation-database digest; the compiler version; and
- * the analyzer id and version. A generation whose stored identity differs from
+ * content hash; the **input universe** — A9.2.4, replacing the configured-list
+ * digest, so that a compilation database appearing or disappearing moves it; the
+ * compiler version; and the analyzer id and version. A generation whose stored identity differs from
  * this one would be built differently, and one whose identity matches would not.
  *
  * The **content hashes** are what make this the working-tree answer rather than
@@ -650,14 +866,30 @@ atlas_status atlas_sem_repo_compdb_digest(atlas_db *db, atlas_repo_info *repo, c
 atlas_status atlas_sem_source_identity(atlas_db *db, atlas_repo_info *repo, char out[65],
                                        atlas_err *err);
 
+/* A9.2.4. The live input universe, as a comparable pair.
+ *
+ * `known` rather than a sentinel count, because **zero accepted inputs is a
+ * real and meaningful state**: a repository whose build description has just
+ * vanished has fewer inputs than its generation recorded, and that is exactly
+ * the case freshness must catch rather than mistake for "nothing was measured".
+ * A caller that has not looked passes `known = false` and the check does not
+ * fire — "Atlas did not look" is never evidence of change. */
+typedef struct atlas_sem_live_inputs {
+    bool known;
+    int64_t accepted_count;
+    atlas_sem_discovery discovery;
+} atlas_sem_live_inputs;
+
 /* Freshness of the published generation, recomputed from live facts.
  *
  * Never cached — A6's rule. `reason_out` is one of the ATLAS_SEM_STALE_*
- * strings, or NULL when the generation is current. */
+ * strings, or NULL when the generation is current. `live_inputs` may be NULL,
+ * which means the same as `known = false`. */
 atlas_sem_freshness atlas_sem_freshness_of(const atlas_sem_generation *g, bool have_generation,
                                            bool running, const char *live_commit,
                                            const char *live_compdb_digest,
                                            const char *live_source_identity,
+                                           const atlas_sem_live_inputs *live_inputs,
                                            bool file_index_current, const char **reason_out);
 
 /* The same question, with every live fact gathered from the database rather than

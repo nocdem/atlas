@@ -525,6 +525,14 @@ atlas_status atlas_db_repo_remove(atlas_db *db, const char *name, bool *removed,
         if (st == ATLAS_OK && found) {
             st = atlas_db_sem_config_forget_repo(db, ri.id, err);
         }
+        /* A9.2.4's discovered candidates are keyed on the same reused rowid.
+         * They are derived — another walk reproduces them — but a row left
+         * behind would tell the next repository to take this rowid that Atlas
+         * had discovered build inputs it never looked for, complete with a
+         * discovery verdict nobody earned. */
+        if (st == ATLAS_OK && found) {
+            st = atlas_db_sem_inputs_forget(db, ri.id, err);
+        }
         atlas_repo_info_free(&ri);
     }
 

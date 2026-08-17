@@ -288,7 +288,7 @@ const char *atlas_sem_stale_reason_intern(const char *reason) {
     static const char *const REASONS[] = {
         ATLAS_SEM_STALE_COMMIT,     ATLAS_SEM_STALE_COMPDB,     ATLAS_SEM_STALE_COMPILER,
         ATLAS_SEM_STALE_ANALYZER,   ATLAS_SEM_STALE_FILE_INDEX, ATLAS_SEM_STALE_INCOMPLETE,
-        ATLAS_SEM_STALE_SOURCE,
+        ATLAS_SEM_STALE_SOURCE,     ATLAS_SEM_STALE_DISCOVERY,
     };
     if (reason == NULL) {
         return NULL;
@@ -382,6 +382,149 @@ const char *atlas_sem_scope_discovery_name(atlas_sem_scope_discovery d) {
     return "UNKNOWN";
 }
 
+/* --- A9.2.4 vocabularies ------------------------------------------------------
+ *
+ * Every zero below is the safe reading, and each one is the safe reading of a
+ * different question. UNKNOWN discovery cannot support an absence; UNSET intent
+ * expresses nothing and lets the root-owned default decide; DEFAULT provenance
+ * says nobody has spoken. AUTOMATIC is the one zero that is not an absence — it
+ * is the default *behaviour*, and it is zero precisely so that a zeroed
+ * configuration keeps looking rather than silently stopping. */
+const char *atlas_sem_discovery_name(atlas_sem_discovery d) {
+    switch (d) {
+    case ATLAS_SEM_DISC_PARTIAL:
+        return "PARTIAL";
+    case ATLAS_SEM_DISC_COMPLETE:
+        return "COMPLETE";
+    case ATLAS_SEM_DISC_UNKNOWN:
+        break;
+    }
+    return "UNKNOWN";
+}
+
+bool atlas_sem_discovery_parse(const char *name, atlas_sem_discovery *out) {
+    if (name == NULL || out == NULL) {
+        return false;
+    }
+    if (strcmp(name, "PARTIAL") == 0) {
+        *out = ATLAS_SEM_DISC_PARTIAL;
+        return true;
+    }
+    if (strcmp(name, "COMPLETE") == 0) {
+        *out = ATLAS_SEM_DISC_COMPLETE;
+        return true;
+    }
+    if (strcmp(name, "UNKNOWN") == 0) {
+        *out = ATLAS_SEM_DISC_UNKNOWN;
+        return true;
+    }
+    return false;
+}
+
+const char *atlas_sem_discovery_mode_name(atlas_sem_discovery_mode m) {
+    switch (m) {
+    case ATLAS_SEM_DISCMODE_MANUAL:
+        return "MANUAL";
+    case ATLAS_SEM_DISCMODE_AUTOMATIC:
+        break;
+    }
+    return "AUTOMATIC";
+}
+
+bool atlas_sem_discovery_mode_parse(const char *name, atlas_sem_discovery_mode *out) {
+    if (name == NULL || out == NULL) {
+        return false;
+    }
+    if (strcmp(name, "MANUAL") == 0) {
+        *out = ATLAS_SEM_DISCMODE_MANUAL;
+        return true;
+    }
+    if (strcmp(name, "AUTOMATIC") == 0) {
+        *out = ATLAS_SEM_DISCMODE_AUTOMATIC;
+        return true;
+    }
+    return false;
+}
+
+const char *atlas_sem_auto_intent_name(atlas_sem_auto_intent i) {
+    switch (i) {
+    case ATLAS_SEM_INTENT_ENABLED:
+        return "ENABLED";
+    case ATLAS_SEM_INTENT_DISABLED:
+        return "DISABLED";
+    case ATLAS_SEM_INTENT_UNSET:
+        break;
+    }
+    return "UNSET";
+}
+
+bool atlas_sem_auto_intent_parse(const char *name, atlas_sem_auto_intent *out) {
+    if (name == NULL || out == NULL) {
+        return false;
+    }
+    if (strcmp(name, "ENABLED") == 0) {
+        *out = ATLAS_SEM_INTENT_ENABLED;
+        return true;
+    }
+    if (strcmp(name, "DISABLED") == 0) {
+        *out = ATLAS_SEM_INTENT_DISABLED;
+        return true;
+    }
+    if (strcmp(name, "UNSET") == 0) {
+        *out = ATLAS_SEM_INTENT_UNSET;
+        return true;
+    }
+    return false;
+}
+
+const char *atlas_sem_intent_source_name(atlas_sem_intent_source s) {
+    switch (s) {
+    case ATLAS_SEM_INTENT_BY_OPERATOR:
+        return "OPERATOR";
+    case ATLAS_SEM_INTENT_BY_MIGRATION:
+        return "MIGRATION";
+    case ATLAS_SEM_INTENT_BY_DEFAULT:
+        break;
+    }
+    return "DEFAULT";
+}
+
+bool atlas_sem_intent_source_parse(const char *name, atlas_sem_intent_source *out) {
+    if (name == NULL || out == NULL) {
+        return false;
+    }
+    if (strcmp(name, "OPERATOR") == 0) {
+        *out = ATLAS_SEM_INTENT_BY_OPERATOR;
+        return true;
+    }
+    if (strcmp(name, "MIGRATION") == 0) {
+        *out = ATLAS_SEM_INTENT_BY_MIGRATION;
+        return true;
+    }
+    if (strcmp(name, "DEFAULT") == 0) {
+        *out = ATLAS_SEM_INTENT_BY_DEFAULT;
+        return true;
+    }
+    return false;
+}
+
+/* The whole activation policy. See `include/atlas/sem.h` for why the A9.2.3
+ * default is reversed and what is preserved unchanged. */
+bool atlas_sem_auto_effective(atlas_sem_auto_intent intent, bool policy_default) {
+    switch (intent) {
+    case ATLAS_SEM_INTENT_ENABLED:
+        return true;
+    case ATLAS_SEM_INTENT_DISABLED:
+        /* Honoured whatever the policy says. An operator's explicit refusal is
+         * never lifted behind their back — which is the property that makes the
+         * default being permissive acceptable at all. */
+        return false;
+    case ATLAS_SEM_INTENT_UNSET:
+        break;
+    }
+    return policy_default;
+}
+
 bool atlas_sem_scope_discovery_parse(const char *name, atlas_sem_scope_discovery *out) {
     if (name == NULL || out == NULL) {
         return false;
@@ -404,6 +547,12 @@ void atlas_sem_config_init(atlas_sem_config *c) {
     memset(c, 0, sizeof(*c));
     atlas_buf_init(&c->compdbs);
     atlas_buf_init(&c->test_roots);
+    atlas_buf_init(&c->excludes);
+    atlas_buf_init(&c->vendor_roots);
+    /* Everything the memset left is the safe reading: no intent expressed, no
+     * provenance, AUTOMATIC discovery — and `auto_rebuild` false, which stays
+     * false until `atlas_sem_auto_effective` is asked with the root-owned
+     * default. A zeroed configuration never enables a compiler on its own. */
 }
 
 void atlas_sem_config_free(atlas_sem_config *c) {
@@ -412,6 +561,8 @@ void atlas_sem_config_free(atlas_sem_config *c) {
     }
     atlas_buf_free(&c->compdbs);
     atlas_buf_free(&c->test_roots);
+    atlas_buf_free(&c->excludes);
+    atlas_buf_free(&c->vendor_roots);
 }
 
 atlas_status atlas_sem_config_pack(const char *const *items, size_t count, atlas_buf *out,
@@ -501,10 +652,21 @@ atlas_status atlas_sem_config_unpack(const char *packed, atlas_buf *out, size_t 
 }
 
 bool atlas_sem_path_is_test(const char *packed_roots, const char *rel) {
-    if (packed_roots == NULL || packed_roots[0] == '\0' || rel == NULL || rel[0] == '\0') {
+    return atlas_sem_path_under_prefix(packed_roots, rel);
+}
+
+/* A9.2.4. The one prefix rule, shared by test roots, vendor roots and discovery
+ * exclusions.
+ *
+ * Three separate implementations would be three chances for an operator to have
+ * to learn a different matching rule per flag — and one of the three would
+ * eventually match on a substring, which is the mistake the component-boundary
+ * check below exists to prevent. */
+bool atlas_sem_path_under_prefix(const char *packed_prefixes, const char *rel) {
+    if (packed_prefixes == NULL || packed_prefixes[0] == '\0' || rel == NULL || rel[0] == '\0') {
         return false;
     }
-    const char *p = packed_roots;
+    const char *p = packed_prefixes;
     while (*p != '\0') {
         const char *nl = strchr(p, '\n');
         size_t len = nl != NULL ? (size_t)(nl - p) : strlen(p);

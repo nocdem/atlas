@@ -82,9 +82,12 @@ void atlas_cli_print_help(FILE *out) {
         "  code search NAME QUERY     search indexed symbol names\n"
         "  code deps NAME PATH        what a file depends on\n"
         "  code impact NAME PATH      what may be affected if it changes (candidates, not proof)\n"
-        "  code sem-status NAME       the semantic index: freshness, coverage and what is due\n"
+        "  code sem-status NAME       the semantic index: freshness, coverage, build-input\n"
+        "                             discovery and what is due\n"
         "  code sem-config NAME       read or write the semantic build description\n"
-        "                             [--compdb P]... [--test-root P]... [--auto|--no-auto]\n"
+        "                             [--compdb P]... [--test-root P]... [--vendor-root P]...\n"
+        "                             [--exclude P]... [--discover|--no-discover]\n"
+        "                             [--auto|--no-auto]\n"
         "  decision list NAME         recorded knowledge, its kind and its lifecycle status\n"
         "  decision show NAME ID      one decision in full, with its links' currency\n"
         "  decision search NAME QUERY search recorded decisions\n"
@@ -259,6 +262,10 @@ static atlas_status parse_args(cli_state *st, int argc, char **argv, bool *want_
      * the caller's `memset`, so the distinction lives beside the flags it is
      * about. */
     st->opts.auto_rebuild = -1;
+    /* A9.2.4. Negative means "neither flag was given", so the stored value is
+     * left alone. Zero would mean AUTOMATIC, which is a *statement*, and an
+     * operator adjusting a path list must not make one as a side effect. */
+    st->opts.discovery_mode = -1;
     bool no_more_options = false;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -343,6 +350,44 @@ static atlas_status parse_args(cli_state *st, int argc, char **argv, bool *want_
                  * of `--test-root` is indistinguishable from not passing it. */
                 st->opts.test_roots_given = true;
                 st->opts.test_root_count = 0;
+            } else if (strcmp(a, "--exclude") == 0) {
+                if (i + 1 >= argc) {
+                    return atlas_err_set(err, ATLAS_ERR_USAGE, "--exclude needs a path");
+                }
+                if (st->opts.exclude_count >=
+                    sizeof(st->opts.excludes) / sizeof(st->opts.excludes[0])) {
+                    /* Refused, never clamped. A silently dropped exclusion would
+                     * make Atlas walk a subtree an operator asked it not to. */
+                    return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                         "at most %zu discovery exclusions may be named",
+                                         sizeof(st->opts.excludes) /
+                                             sizeof(st->opts.excludes[0]));
+                }
+                st->opts.excludes_given = true;
+                st->opts.excludes[st->opts.exclude_count++] = argv[++i];
+            } else if (strcmp(a, "--no-excludes") == 0) {
+                st->opts.excludes_given = true;
+                st->opts.exclude_count = 0;
+            } else if (strcmp(a, "--vendor-root") == 0) {
+                if (i + 1 >= argc) {
+                    return atlas_err_set(err, ATLAS_ERR_USAGE, "--vendor-root needs a path");
+                }
+                if (st->opts.vendor_root_count >=
+                    sizeof(st->opts.vendor_roots) / sizeof(st->opts.vendor_roots[0])) {
+                    return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                         "at most %zu vendor roots may be named",
+                                         sizeof(st->opts.vendor_roots) /
+                                             sizeof(st->opts.vendor_roots[0]));
+                }
+                st->opts.vendor_roots_given = true;
+                st->opts.vendor_roots[st->opts.vendor_root_count++] = argv[++i];
+            } else if (strcmp(a, "--no-vendor-roots") == 0) {
+                st->opts.vendor_roots_given = true;
+                st->opts.vendor_root_count = 0;
+            } else if (strcmp(a, "--discover") == 0) {
+                st->opts.discovery_mode = 0;
+            } else if (strcmp(a, "--no-discover") == 0) {
+                st->opts.discovery_mode = 1;
             } else if (strcmp(a, "--auto") == 0) {
                 st->opts.auto_rebuild = 1;
             } else if (strcmp(a, "--no-auto") == 0) {
@@ -2560,26 +2605,21 @@ static atlas_status run_code(cli_state *st, atlas_ctx *ctx, atlas_renderer *r, i
      * with different evidence — a `--semantic` switch would invite a reader to
      * treat one answer as an improved version of the other. */
     if (strcmp(sub, "index") == 0) {
-        /* usage: atlas code index NAME --compdb PATH [--compdb PATH...] [--rebuild] */
+        /* usage: atlas code index NAME [--compdb PATH]... [--rebuild]
+         *
+         * A9.2.4: `--compdb` is optional. With none, the databases are whatever
+         * build-input discovery accepted — which is the ordinary case now, and
+         * refusing it would have made `code index` the one command that could
+         * not use the season's own mechanism. With some, those exactly: naming a
+         * database is a deliberate act about a particular build and discovery is
+         * not entitled to overrule it. */
         if (st->operand_count < 2u) {
             return atlas_err_set(err, ATLAS_ERR_USAGE,
-                                 "usage: atlas code index NAME --compdb PATH [--compdb PATH...] "
-                                 "[--rebuild]");
+                                 "usage: atlas code index NAME [--compdb PATH]... [--rebuild]");
         }
-        /* The compilation databases come from the option parser, which owns
-         * every `--` argument. They are repository-relative and named
-         * explicitly: Atlas never searches a repository for one. */
         const char *const *compdbs = st->opts.compdbs;
         size_t ncompdb = st->opts.compdb_count;
         bool rebuild = st->opts.rebuild;
-        if (ncompdb == 0) {
-            /* No search, ever. Atlas does not go looking through a repository
-             * for a file that tells it how to compile things. */
-            return atlas_err_set(err, ATLAS_ERR_USAGE,
-                                 "name at least one compilation database with --compdb "
-                                 "(repository-relative); Atlas does not search for one");
-        }
-
         atlas_sem_index_summary sum;
         atlas_sem_index_summary_init(&sum);
         /* Two routes, one behaviour.
@@ -2734,41 +2774,59 @@ static atlas_status run_code(cli_state *st, atlas_ctx *ctx, atlas_renderer *r, i
     }
 
     /* usage: atlas code sem-config NAME [--compdb P]... [--test-root P]...
-     *                               [--no-test-roots] [--auto|--no-auto]
+     *                               [--exclude P]... [--vendor-root P]...
+     *                               [--discover|--no-discover] [--auto|--no-auto]
      *
      * With no flags it reads. An operator can therefore see the description
      * before changing it, which matters because every flag here is a
      * *replacement* of a list rather than an addition to one — repeating
      * `--compdb` builds the whole list, and a command that named one database
-     * would otherwise silently drop the second. */
+     * would otherwise silently drop the second.
+     *
+     * A9.2.4: `--compdb` no longer means "these are the compilation databases".
+     * It means "these as well as whatever discovery finds", unless
+     * `--no-discover` is also given — which makes the pinned list the whole of
+     * it and, honestly, leaves discovery UNKNOWN. `--auto`/`--no-auto` now
+     * record an *operator intent* that no machine-wide default can overrule in
+     * either direction. */
     if (strcmp(sub, "sem-config") == 0) {
         if (st->operand_count != 2u) {
             return atlas_err_set(err, ATLAS_ERR_USAGE,
                                  "usage: atlas code sem-config NAME [--compdb PATH]... "
-                                 "[--test-root PATH]... [--no-test-roots] [--auto|--no-auto]");
+                                 "[--test-root PATH]... [--no-test-roots] "
+                                 "[--exclude PATH]... [--no-excludes] "
+                                 "[--vendor-root PATH]... [--no-vendor-roots] "
+                                 "[--discover|--no-discover] [--auto|--no-auto]");
         }
         const bool writing = st->opts.compdb_count > 0 || st->opts.test_roots_given ||
-                             st->opts.auto_rebuild >= 0;
+                             st->opts.excludes_given || st->opts.vendor_roots_given ||
+                             st->opts.discovery_mode >= 0 || st->opts.auto_rebuild >= 0;
         atlas_sem_status_report rep;
         atlas_sem_status_report_init(&rep);
         if (!writing) {
             result = ctx != NULL ? atlas_service_sem_status(ctx, st->operands[1], &rep, err)
                                  : atlas_service_sem_status_remote(st->operands[1], &rep, err);
         } else {
-            const char *const *compdbs = st->opts.compdb_count > 0 ? st->opts.compdbs : NULL;
-            const char *const *roots = st->opts.test_roots_given ? st->opts.test_roots : NULL;
+            atlas_sem_config_request req;
+            memset(&req, 0, sizeof req);
+            req.name = st->operands[1];
+            req.compdbs = st->opts.compdb_count > 0 ? st->opts.compdbs : NULL;
+            req.compdb_count = st->opts.compdb_count;
+            req.test_roots = st->opts.test_roots_given ? st->opts.test_roots : NULL;
+            req.test_root_count = st->opts.test_root_count;
+            req.excludes = st->opts.excludes_given ? st->opts.excludes : NULL;
+            req.exclude_count = st->opts.exclude_count;
+            req.vendor_roots = st->opts.vendor_roots_given ? st->opts.vendor_roots : NULL;
+            req.vendor_root_count = st->opts.vendor_root_count;
+            req.auto_rebuild = st->opts.auto_rebuild;
+            req.discovery_mode = st->opts.discovery_mode;
             /* Routed on `atlas_ctx_is_writer`, never on `ctx != NULL`: with a
              * daemon running, a context in AUTO mode still opens read-only, and
              * the weaker test fails with "attempt to write a readonly
              * database". That is the A9.2.1 defect and it is not repeated. */
             result = (ctx != NULL && atlas_ctx_is_writer(ctx))
-                         ? atlas_service_sem_config_set(ctx, st->operands[1], compdbs,
-                                                        st->opts.compdb_count, roots,
-                                                        st->opts.test_root_count,
-                                                        st->opts.auto_rebuild, &rep, err)
-                         : atlas_service_sem_config_set_remote(
-                               st->operands[1], compdbs, st->opts.compdb_count, roots,
-                               st->opts.test_root_count, st->opts.auto_rebuild, &rep, err);
+                         ? atlas_service_sem_config_set(ctx, &req, &rep, err)
+                         : atlas_service_sem_config_set_remote(&req, &rep, err);
         }
         if (result == ATLAS_OK) {
             result = renderer_open(r, st->opts.json, st->out, "code sem-config", err);

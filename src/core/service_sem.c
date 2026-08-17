@@ -25,6 +25,7 @@
 
 #include "atlas/atlas.h"
 #include "atlas/sem.h"
+#include "atlas/sem_discover.h"
 #include "atlas/sem_ops.h"
 #include "atlas/service.h"
 #include "atlas/unit.h"
@@ -104,6 +105,8 @@ void atlas_sem_status_report_init(atlas_sem_status_report *r) {
     atlas_sem_plan_init(&r->plan);
     atlas_buf_init(&r->compdbs);
     atlas_buf_init(&r->test_roots);
+    atlas_buf_init(&r->excludes);
+    atlas_buf_init(&r->vendor_roots);
 }
 
 void atlas_sem_status_report_free(atlas_sem_status_report *r) {
@@ -113,6 +116,11 @@ void atlas_sem_status_report_free(atlas_sem_status_report *r) {
     atlas_repo_info_free(&r->repo);
     atlas_buf_free(&r->compdbs);
     atlas_buf_free(&r->test_roots);
+    atlas_buf_free(&r->excludes);
+    atlas_buf_free(&r->vendor_roots);
+    free(r->inputs);
+    r->inputs = NULL;
+    r->input_count = 0;
 }
 
 typedef struct unit_sink {
@@ -203,7 +211,28 @@ atlas_status atlas_sem_status_on(atlas_db *db, const char *name, atlas_sem_statu
     if (st == ATLAS_OK) {
         st = atlas_buf_set(&out->test_roots, cfg.test_roots.data, cfg.test_roots.len, err);
     }
+    if (st == ATLAS_OK) {
+        st = atlas_buf_set(&out->excludes, cfg.excludes.data, cfg.excludes.len, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_buf_set(&out->vendor_roots, cfg.vendor_roots.data, cfg.vendor_roots.len, err);
+    }
     atlas_sem_config_free(&cfg);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+
+    /* A9.2.4. Every candidate, accepted and rejected, with its reason.
+     *
+     * Rejected ones are carried because a candidate nobody is shown is
+     * indistinguishable from one that does not exist — which is precisely the
+     * confusion that made a third compilation database invisible for a season. */
+    out->inputs = calloc(ATLAS_SEM_DISCOVERY_MAX_CANDIDATES, sizeof(*out->inputs));
+    if (out->inputs == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory reading the build inputs");
+    }
+    st = atlas_db_sem_inputs_get(db, out->repo.id, out->inputs,
+                                 ATLAS_SEM_DISCOVERY_MAX_CANDIDATES, &out->input_count, err);
     if (st != ATLAS_OK) {
         return st;
     }
@@ -283,13 +312,55 @@ atlas_status atlas_sem_config_on(atlas_db *db, const atlas_sem_config_job *job,
     if (st == ATLAS_OK && job->test_roots != NULL) {
         st = atlas_buf_set(&cfg.test_roots, job->test_roots, job->test_roots_len, err);
     }
-    if (job->auto_rebuild >= 0) {
-        cfg.auto_rebuild = job->auto_rebuild > 0;
+    if (st == ATLAS_OK && job->excludes != NULL) {
+        st = atlas_buf_set(&cfg.excludes, job->excludes, job->excludes_len, err);
     }
+    if (st == ATLAS_OK && job->vendor_roots != NULL) {
+        st = atlas_buf_set(&cfg.vendor_roots, job->vendor_roots, job->vendor_roots_len, err);
+    }
+    if (job->auto_rebuild >= 0) {
+        /* A9.2.4. The intent *and* its provenance, written together and never
+         * apart. A stored value with no provenance is exactly the ambiguity this
+         * season exists to end: it could not tell a deliberate refusal from a
+         * default nobody had ever revisited. Anything that reaches this line is
+         * an operator, because there is no MCP tool, no gateway route and no
+         * ordinary RPC method that reaches it. */
+        cfg.auto_intent =
+            job->auto_rebuild > 0 ? ATLAS_SEM_INTENT_ENABLED : ATLAS_SEM_INTENT_DISABLED;
+        cfg.auto_intent_by = ATLAS_SEM_INTENT_BY_OPERATOR;
+    }
+    if (job->discovery_mode >= 0) {
+        cfg.discovery_mode =
+            job->discovery_mode > 0 ? ATLAS_SEM_DISCMODE_MANUAL : ATLAS_SEM_DISCMODE_AUTOMATIC;
+    }
+    /* The legacy boolean is kept in step with the intent so nothing that still
+     * reads it can disagree with what the intent says. It is a cache of
+     * `atlas_sem_auto_effective` under the *compiled-in* default, never the
+     * authority — the plan recomputes it against the live root-owned policy on
+     * every read, which is A6's rule about never storing a derived answer. */
+    cfg.auto_rebuild = atlas_sem_auto_effective(cfg.auto_intent, ATLAS_SEM_AUTO_DEFAULT);
     if (st == ATLAS_OK) {
         st = atlas_db_sem_config_set(db, &cfg, err);
     }
     atlas_sem_config_free(&cfg);
+    if (st == ATLAS_OK) {
+        /* A9.2.4. Re-walk immediately, because the write just changed what the
+         * walk would do: the mode, the exclusions and the pinned list are all
+         * inputs to it. Waiting for the periodic pass would mean an operator who
+         * has just excluded a build tree still sees it accepted, which reads as
+         * the command not having worked.
+         *
+         * Best effort and deliberately not allowed to fail the write. An
+         * operator's statement about a repository is recorded whether or not
+         * Atlas can currently look at the tree — a description can legitimately
+         * be written before the tree it describes has been built, which is the
+         * same reason paths are not validated here. */
+        atlas_sem_discovery_result res;
+        atlas_sem_discovery_result_init(&res);
+        atlas_err ignored;
+        atlas_err_init(&ignored);
+        (void)atlas_sem_discovery_run(db, &repo, &res, &ignored);
+    }
     atlas_repo_info_free(&repo);
     if (st != ATLAS_OK) {
         return st;
@@ -311,33 +382,55 @@ static atlas_status pack_optional(const char *const *items, size_t count, atlas_
     return atlas_sem_config_pack(items, count, out, err);
 }
 
-atlas_status atlas_service_sem_config_set(atlas_ctx *ctx, const char *name,
-                                          const char *const *compdbs, size_t compdb_count,
-                                          const char *const *test_roots, size_t test_root_count,
-                                          int auto_rebuild, atlas_sem_status_report *out,
-                                          atlas_err *err) {
-    atlas_buf packed_db = ATLAS_BUF_INIT;
-    atlas_buf packed_tr = ATLAS_BUF_INIT;
-    bool db_given = false;
-    bool tr_given = false;
-    atlas_status st = pack_optional(compdbs, compdb_count, &packed_db, &db_given, err);
-    if (st == ATLAS_OK) {
-        st = pack_optional(test_roots, test_root_count, &packed_tr, &tr_given, err);
+/* A9.2.4. Builds the storage-form job from the caller's four optional arrays.
+ *
+ * One place converts, so `--compdb` repeated on a command line, a JSON array
+ * over the socket and a test's literal array all reach the same bytes — the
+ * defect A9.2.3 shipped was two packers disagreeing about the separator, and one
+ * function is what stops that recurring. */
+atlas_status atlas_service_sem_config_set(atlas_ctx *ctx, const atlas_sem_config_request *req,
+                                          atlas_sem_status_report *out, atlas_err *err) {
+    if (req == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "semantic configuration: bad request");
+    }
+    atlas_buf packed[4];
+    bool given[4] = {false, false, false, false};
+    for (size_t i = 0; i < 4; i++) {
+        atlas_buf_init(&packed[i]);
+    }
+    const char *const *lists[4] = {req->compdbs, req->test_roots, req->excludes,
+                                   req->vendor_roots};
+    const size_t counts[4] = {req->compdb_count, req->test_root_count, req->exclude_count,
+                              req->vendor_root_count};
+
+    atlas_status st = ATLAS_OK;
+    for (size_t i = 0; st == ATLAS_OK && i < 4; i++) {
+        st = pack_optional(lists[i], counts[i], &packed[i], &given[i], err);
     }
     if (st == ATLAS_OK) {
         atlas_sem_config_job job;
         memset(&job, 0, sizeof job);
-        job.repo_name = name;
-        job.compdbs = db_given ? (const char *)(packed_db.data != NULL ? packed_db.data : "") : NULL;
-        job.compdbs_len = db_given ? packed_db.len : 0;
-        job.test_roots =
-            tr_given ? (const char *)(packed_tr.data != NULL ? packed_tr.data : "") : NULL;
-        job.test_roots_len = tr_given ? packed_tr.len : 0;
-        job.auto_rebuild = auto_rebuild;
+        job.repo_name = req->name;
+        const char *bytes[4];
+        for (size_t i = 0; i < 4; i++) {
+            bytes[i] = given[i] ? (const char *)(packed[i].data != NULL ? packed[i].data : "")
+                                : NULL;
+        }
+        job.compdbs = bytes[0];
+        job.compdbs_len = given[0] ? packed[0].len : 0;
+        job.test_roots = bytes[1];
+        job.test_roots_len = given[1] ? packed[1].len : 0;
+        job.excludes = bytes[2];
+        job.excludes_len = given[2] ? packed[2].len : 0;
+        job.vendor_roots = bytes[3];
+        job.vendor_roots_len = given[3] ? packed[3].len : 0;
+        job.auto_rebuild = req->auto_rebuild;
+        job.discovery_mode = req->discovery_mode;
         st = atlas_sem_config_on(atlas_ctx_db(ctx), &job, out, err);
     }
-    atlas_buf_free(&packed_db);
-    atlas_buf_free(&packed_tr);
+    for (size_t i = 0; i < 4; i++) {
+        atlas_buf_free(&packed[i]);
+    }
     return st;
 }
 
@@ -603,14 +696,6 @@ atlas_status atlas_service_sem_index(atlas_ctx *ctx, const char *name, const cha
                              "this Atlas was built without libclang, so it cannot build a "
                              "compiler-derived semantic index");
     }
-    if (compdbs == NULL || compdb_count == 0) {
-        /* No search, ever. Atlas does not go looking through a repository for a
-         * file that tells it how to compile things. */
-        return atlas_err_set(err, ATLAS_ERR_USAGE,
-                             "name at least one compilation database with --compdb; Atlas does "
-                             "not search a repository for one");
-    }
-
     atlas_repo_info repo;
     atlas_repo_info_init(&repo);
     atlas_status st = atlas_service_require_repo(ctx, name, &repo, err);
@@ -618,7 +703,50 @@ atlas_status atlas_service_sem_index(atlas_ctx *ctx, const char *name, const cha
         atlas_repo_info_free(&repo);
         return st;
     }
-    st = atlas_sem_index_on(atlas_ctx_db(ctx), &repo, compdbs, compdb_count, rebuild, out, err);
+
+    /* A9.2.4. Naming no compilation database is no longer a usage error.
+     *
+     * A9.2.3 refused here because Atlas did not search a repository for a file
+     * that tells it how to compile things. It does now, inside a bounded search
+     * universe, so an operator asking to index a repository whose databases were
+     * *discovered* rather than typed is asking a perfectly well-formed question —
+     * and refusing it would have made `code index` the one command that could not
+     * use the season's own mechanism.
+     *
+     * A named list is still honoured exactly as given: naming databases is a
+     * deliberate act about a particular build, and discovery is not entitled to
+     * overrule it. */
+    atlas_buf accepted = ATLAS_BUF_INIT;
+    const char *slots[ATLAS_SEM_MAX_COMPDBS];
+    if (compdbs == NULL || compdb_count == 0) {
+        atlas_sem_discovery_result res;
+        atlas_sem_discovery_result_init(&res);
+        atlas_err ignored;
+        atlas_err_init(&ignored);
+        /* Walk first, so an operator who has just generated a build directory
+         * gets an index of it rather than of what Atlas last happened to see. */
+        (void)atlas_sem_discovery_run(atlas_ctx_db(ctx), &repo, &res, &ignored);
+        st = atlas_sem_accepted_inputs(atlas_ctx_db(ctx), repo.id, &accepted, NULL, err);
+        if (st == ATLAS_OK) {
+            const char *p = (const char *)accepted.data;
+            const char *end = p != NULL ? p + accepted.len : NULL;
+            while (p != NULL && p < end && *p != '\0' && compdb_count < ATLAS_SEM_MAX_COMPDBS) {
+                slots[compdb_count++] = p;
+                p += strlen(p) + 1u;
+            }
+            compdbs = slots;
+        }
+        if (st == ATLAS_OK && compdb_count == 0) {
+            st = atlas_err_set(err, ATLAS_ERR_USAGE,
+                               "build-input discovery found no compilation database in this "
+                               "repository; generate one, or name it with --compdb");
+        }
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_sem_index_on(atlas_ctx_db(ctx), &repo, compdbs, compdb_count, rebuild, out,
+                                err);
+    }
+    atlas_buf_free(&accepted);
     atlas_repo_info_free(&repo);
     return st;
 }

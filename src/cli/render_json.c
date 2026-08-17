@@ -15,6 +15,7 @@
 
 #include <string.h>
 
+#include "atlas/sem_discover.h"
 #include "atlas/atlas.h"
 #include "atlas/pathrep.h"
 
@@ -1797,6 +1798,12 @@ static atlas_status j_sem_generation(atlas_renderer *r, const atlas_sem_generati
     TRY(atlas_json_key_int(r->j, "scope_candidates", g->scope_candidates, err));
     TRY(atlas_json_key_int(r->j, "scope_covered", g->scope_covered, err));
     TRY(atlas_json_key_int(r->j, "scope_uncovered", g->scope_uncovered, err));
+    /* A9.2.4. What the generation was sealed under, beside what it covered.
+     * Exactly the keys `server_sem.c` writes, so a client cannot tell which
+     * surface produced the document. */
+    TRY(atlas_json_key_str(r->j, "discovery", atlas_sem_discovery_name(g->discovery), err));
+    TRY(atlas_json_key_int(r->j, "input_count", g->input_count, err));
+    TRY(atlas_json_key_int(r->j, "scope_excluded", g->scope_excluded, err));
     TRY(atlas_json_key_bool(r->j, "test_scope_known", g->test_scope_known, err));
     TRY(atlas_json_key_int(r->j, "tu_test", g->tu_test, err));
     TRY(atlas_json_key_int(r->j, "tu_production", g->tu_production, err));
@@ -1837,7 +1844,54 @@ static atlas_status j_sem_plan(atlas_renderer *r, const atlas_sem_plan *p, atlas
                                err));
     TRY(atlas_json_key_str_opt(r->j, "fail_at", p->fail_at, err));
     TRY(atlas_json_key_str_opt(r->j, "source_identity", p->source_identity, err));
-    return atlas_json_key_str_opt(r->j, "generation_identity", p->generation_identity, err);
+    TRY(atlas_json_key_str_opt(r->j, "generation_identity", p->generation_identity, err));
+
+    /* --- A9.2.4 ---
+     *
+     * The activation intent and its provenance beside the effective boolean, and
+     * discovery as its own axis. Exactly the keys `server_sem.c` writes, in the
+     * same order: one shape on every surface is what stops a client having to
+     * know whether the CLI or the daemon produced the document. */
+    TRY(atlas_json_key_str(r->j, "auto_intent", atlas_sem_auto_intent_name(p->auto_intent), err));
+    TRY(atlas_json_key_str(r->j, "auto_intent_by",
+                           atlas_sem_intent_source_name(p->auto_intent_by), err));
+    TRY(atlas_json_key_bool(r->j, "policy_default", p->policy_default, err));
+    TRY(atlas_json_key_str(r->j, "discovery", atlas_sem_discovery_name(p->discovery), err));
+    TRY(atlas_json_key_str(r->j, "discovery_mode",
+                           atlas_sem_discovery_mode_name(p->discovery_mode), err));
+    TRY(atlas_json_key_str(r->j, "generation_discovery",
+                           atlas_sem_discovery_name(p->generation_discovery), err));
+    TRY(atlas_json_key_int(r->j, "inputs_accepted", p->inputs_accepted, err));
+    TRY(atlas_json_key_int(r->j, "inputs_rejected", p->inputs_rejected, err));
+    TRY(atlas_json_key_str_opt(r->j, "discovered_at", p->discovered_at, err));
+    return atlas_json_key_str_opt(
+        r->j, "discovery_limit",
+        p->discovery_limit[0] != '\0' ? atlas_safe(&r->safe, p->discovery_limit) : NULL, err);
+}
+
+/* A9.2.4. Every candidate, accepted and rejected, with the reason for each.
+ *
+ * The rejected ones are the point: a candidate nobody is shown is
+ * indistinguishable from one that does not exist, and that indistinguishability
+ * is what let a third compilation database go unnoticed for a season. */
+static atlas_status j_sem_inputs(atlas_renderer *r, const atlas_sem_status_report *rep,
+                                 atlas_err *err) {
+    TRY(atlas_json_key(r->j, "build_inputs", err));
+    TRY(atlas_json_arr_begin(r->j, err));
+    for (size_t i = 0; i < rep->input_count; i++) {
+        const struct atlas_sem_input *in = &rep->inputs[i];
+        TRY(atlas_json_obj_begin(r->j, err));
+        TRY(json_safe(r->j, &r->safe, "path", in->path, err));
+        TRY(atlas_json_key_str(r->j, "origin", atlas_sem_input_origin_name(in->origin), err));
+        TRY(atlas_json_key_bool(r->j, "accepted", in->accepted, err));
+        TRY(atlas_json_key_str_opt(
+            r->j, "reject_reason",
+            atlas_sem_reject_reason_is_known(in->reject_reason) ? in->reject_reason : NULL, err));
+        TRY(atlas_json_key_str_opt(r->j, "digest", in->digest, err));
+        TRY(atlas_json_key_int(r->j, "units", in->unit_count, err));
+        TRY(atlas_json_obj_end(r->j, err));
+    }
+    return atlas_json_arr_end(r->j, err);
 }
 
 /* The declared lists, each element its own string rather than the newline-joined
@@ -1877,8 +1931,11 @@ static atlas_status j_sem_config(atlas_renderer *r, const atlas_sem_status_repor
         atlas_sem_stale_reason_is_known(rep->plan.stale_reason) ? rep->plan.stale_reason : NULL,
         err));
     TRY(j_sem_plan(r, &rep->plan, err));
+    TRY(j_sem_inputs(r, rep, err));
     TRY(j_sem_path_list(r, "compdbs", &rep->compdbs, err));
     TRY(j_sem_path_list(r, "test_roots", &rep->test_roots, err));
+    TRY(j_sem_path_list(r, "excludes", &rep->excludes, err));
+    TRY(j_sem_path_list(r, "vendor_roots", &rep->vendor_roots, err));
     TRY(atlas_json_key_bool(r->j, "have_generation", rep->have_generation, err));
     if (rep->have_generation) {
         TRY(j_sem_generation(r, &rep->generation, err));
@@ -1905,8 +1962,11 @@ static atlas_status j_sem_status(atlas_renderer *r, const atlas_sem_status_repor
     /* A9.2.3. The derived state and the build description, on the same document
      * as the generation, so one read answers "is this evidence trustworthy". */
     TRY(j_sem_plan(r, &rep->plan, err));
+    TRY(j_sem_inputs(r, rep, err));
     TRY(j_sem_path_list(r, "compdbs", &rep->compdbs, err));
     TRY(j_sem_path_list(r, "test_roots", &rep->test_roots, err));
+    TRY(j_sem_path_list(r, "excludes", &rep->excludes, err));
+    TRY(j_sem_path_list(r, "vendor_roots", &rep->vendor_roots, err));
     if (rep->have_latest) {
         TRY(atlas_json_key(r->j, "latest_attempt", err));
         TRY(atlas_json_obj_begin(r->j, err));

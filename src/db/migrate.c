@@ -3442,6 +3442,181 @@ static const char M18_STATEMENTS_SQL[] =
 
 static const char *const M18_STATEMENTS[] = {M18_STATEMENTS_SQL, NULL};
 
+/* --- migration 19: A9.2.4, build-input discovery and an intent with provenance
+ *
+ * ## The sentence this migration exists for
+ *
+ *   **COMPLETE PROCESSING OF CONFIGURED INPUTS DOES NOT PROVE COMPLETE
+ *   DISCOVERY OF RELEVANT INPUTS.**
+ *
+ * Migration 18 gave a generation a denominator over the *sources* the file index
+ * enumerates, which turned `416/416 units complete` into the honest `369 of 761
+ * sources covered`. It could not ask the question underneath: were those the
+ * right compilation databases, and were there only those? Nothing could ask it,
+ * because A9.2.3's rule was that compilation databases are named and never
+ * discovered — so the answer was always whatever an operator had typed, and on
+ * the repository that produced this season an operator had typed two of three.
+ *
+ * `sem_build_inputs` records what a bounded walk found, what was accepted, and
+ * why each rejection happened; `sem_generations.discovery` records whether the
+ * walk behind a generation could account for the whole search universe. A
+ * generation whose `discovery` is UNKNOWN or PARTIAL may be perfectly current
+ * and perfectly complete over what it read and still cannot support "there is no
+ * X in this repository".
+ *
+ * ## The half of this migration that is about intent, and why it is two columns
+ *
+ * `auto_rebuild` was written unconditionally as 0 or 1, so a stored 0 could not
+ * distinguish an operator's `--no-auto` from nobody ever having said anything.
+ * The two call for opposite behaviour: the first must be honoured for ever, the
+ * second carries no information at all. A migration cannot recover an intent
+ * that was never recorded, so it does not invent one:
+ *
+ *   auto_rebuild = 1  ->  auto_intent ENABLED,  auto_intent_by OPERATOR
+ *   auto_rebuild = 0  ->  auto_intent UNSET,    auto_intent_by MIGRATION
+ *
+ * Only an operator ever wrote a 1, so ENABLED is a fact. A 0 was the
+ * unconditional default, so it is evidence of nothing and is migrated to "intent
+ * unknown, written by a migration" — never to DISABLED, which would be Atlas
+ * asserting an operator's refusal nobody expressed. Every surface reports the
+ * provenance beside the intent so a reader can tell a decision from a default.
+ *
+ * ## What this migration does and does not enable
+ *
+ * It enables nothing on its own: it adds columns and a table, and changes no
+ * behaviour by itself. What the *season* changes is which way an UNSET intent
+ * resolves, and that resolution is a root-owned policy key with a named
+ * compiled-in default — `semantic_auto_default` and `ATLAS_SEM_AUTO_DEFAULT`.
+ * A machine whose operator wants the previous behaviour writes one line in
+ * `/etc/atlas/system.conf`, and a repository whose operator wants it writes
+ * `code sem-config --no-auto`, which now records a DISABLED intent that nothing
+ * lifts.
+ *
+ * ## Why this is additive and needs no `foreign_keys_off`
+ *
+ * One CREATE TABLE, one index, eleven ADD COLUMNs and two UPDATEs over a table
+ * no foreign key references. Nothing is rebuilt, nothing is dropped, no cascade
+ * fires and no content hash moves — migrations 14, 16, 17 and 18's argument,
+ * unchanged. The two UPDATEs touch only the columns this migration just added,
+ * so no pre-existing value is rewritten. */
+static const char M19_STATEMENTS_SQL[] =
+    /* --- the intent, and who expressed it --- */
+
+    /* UNSET is zero-equivalent and is what a row that predates this migration
+     * reads. It is not DISABLED: see the comment above. */
+    "ALTER TABLE sem_repo_config ADD COLUMN auto_intent TEXT NOT NULL DEFAULT 'UNSET'"
+    "  CHECK(auto_intent IN ('UNSET','ENABLED','DISABLED'));"
+    /* DEFAULT is zero-equivalent: nobody has spoken. OPERATOR is the only value
+     * that can silence the root-owned default in either direction, and MIGRATION
+     * marks a value derived from one that carried no information. */
+    "ALTER TABLE sem_repo_config ADD COLUMN auto_intent_by TEXT NOT NULL DEFAULT 'DEFAULT'"
+    "  CHECK(auto_intent_by IN ('DEFAULT','OPERATOR','MIGRATION'));"
+
+    /* AUTOMATIC is the default *behaviour*, and it is the default here for the
+     * reason it is the enum's zero: a configuration nobody has touched should
+     * keep looking, not silently stop. MANUAL is an operator saying "use exactly
+     * the list I pinned", which leaves discovery UNKNOWN — honestly, because a
+     * pinned list is a list somebody wrote and this season exists because one
+     * was incomplete. */
+    "ALTER TABLE sem_repo_config ADD COLUMN discovery_mode TEXT NOT NULL DEFAULT 'AUTOMATIC'"
+    "  CHECK(discovery_mode IN ('AUTOMATIC','MANUAL'));"
+    /* Newline-separated repository-relative prefixes the walk does not enter.
+     * Shown on every status surface: an exclusion nobody can see is a hole in
+     * the search universe nobody can see, and a subtree Atlas did not look in
+     * makes discovery PARTIAL rather than COMPLETE. */
+    "ALTER TABLE sem_repo_config ADD COLUMN excludes TEXT NOT NULL DEFAULT '';"
+    /* Newline-separated repository-relative prefixes an operator declares to be
+     * somebody else's code. Candidates under one are counted as `scope_excluded`
+     * rather than as uncovered — a classification, not a coverage failure.
+     * Empty means Atlas does not know of any, never that there are none: a
+     * directory called `vendor` is a directory somebody named. */
+    "ALTER TABLE sem_repo_config ADD COLUMN vendor_roots TEXT NOT NULL DEFAULT '';"
+
+    /* The last discovery pass's verdict, and when it ran.
+     *
+     * Derived state on a table that mostly holds an operator's statements —
+     * which the retry-governor columns beside it already are, and for the same
+     * reason: it belongs to the repository rather than to any one candidate row,
+     * and the alternative is a table with one row in it. UNKNOWN is the default,
+     * so a repository nobody has walked reads "Atlas has not looked here yet"
+     * and supports no absence. */
+    "ALTER TABLE sem_repo_config ADD COLUMN discovery_state TEXT NOT NULL DEFAULT 'UNKNOWN'"
+    "  CHECK(discovery_state IN ('UNKNOWN','PARTIAL','COMPLETE'));"
+    "ALTER TABLE sem_repo_config ADD COLUMN discovered_at TEXT NOT NULL DEFAULT '';"
+    /* Which ceiling stopped the last walk, if one did. A fixed Atlas string or
+     * empty — never a path, because a path is bytes a repository chose. */
+    "ALTER TABLE sem_repo_config ADD COLUMN discovery_limit TEXT NOT NULL DEFAULT '';"
+
+    /* --- what the generation's input universe looked like --- */
+
+    /* UNKNOWN is zero-equivalent and is what every generation built before this
+     * season reads. A generation recorded nothing from which the completeness of
+     * its build-input discovery could be reconstructed, so it reads "Atlas has
+     * not established this" rather than being retro-declared complete —
+     * migration 17 and 18's rule, applied to the axis they could not see. */
+    "ALTER TABLE sem_generations ADD COLUMN discovery TEXT NOT NULL DEFAULT 'UNKNOWN'"
+    "  CHECK(discovery IN ('UNKNOWN','PARTIAL','COMPLETE'));"
+    /* How many compilation databases were accepted into this generation.
+     * Reported beside `compdb_count`, which counts the same thing from the
+     * indexer's side; they agree, and the redundancy is deliberate so that a
+     * disagreement is visible rather than reconciled. */
+    "ALTER TABLE sem_generations ADD COLUMN input_count INTEGER NOT NULL DEFAULT 0;"
+    /* Candidate sources under an operator-declared vendor prefix. Reported
+     * separately and not counted as uncovered: treating a declared third-party
+     * subtree as a coverage failure would make every repository with a vendored
+     * dependency permanently unable to state an absence about its own code. */
+    "ALTER TABLE sem_generations ADD COLUMN scope_excluded INTEGER NOT NULL DEFAULT 0;"
+
+    /* --- the candidates, accepted and rejected --- */
+
+    /* A derived table: everything in it is reproduced by running discovery
+     * again, which is why it is rewritten whole by each pass rather than merged
+     * into. It is kept durable so that a status surface, a restored backup and a
+     * daemon that has just started all report the same candidates without one of
+     * them having to walk a directory tree to find out.
+     *
+     * Not prunable by age, for A5's reason about derived tables: a half-aged
+     * candidate list is not a smaller one, it is a wrong one, and nothing in it
+     * would record that rows are missing. */
+    "CREATE TABLE sem_build_inputs ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    /* Soft reference, like `sem_repo_config.repo_id` and for the same reason:
+     * `repositories.id` is a reused rowid. Deleted on `repo remove`. */
+    "  repo_id INTEGER NOT NULL,"
+    /* Repository-relative, `%XX`-encoded — the representation every path Atlas
+     * reports uses. */
+    "  path_text TEXT NOT NULL,"
+    /* PINNED, DISCOVERED or BOTH. "You asked for this one" and "Atlas found this
+     * one" are different facts about the same path, and an operator debugging a
+     * build description needs to tell them apart. */
+    "  origin TEXT NOT NULL DEFAULT 'UNKNOWN'"
+    "    CHECK(origin IN ('UNKNOWN','PINNED','DISCOVERED','BOTH')),"
+    "  accepted INTEGER NOT NULL DEFAULT 0,"
+    /* A fixed Atlas string or empty. Never a parser's message and never a
+     * filename a repository chose — the discipline every `ATLAS_SEM_*` reason
+     * vocabulary follows, and it matters most here because these rows describe
+     * files whose names came from the repository. */
+    "  reject_reason TEXT NOT NULL DEFAULT '',"
+    "  digest TEXT NOT NULL DEFAULT '',"
+    /* Translation units the document named. Zero is not an error and not a
+     * rejection: an empty compilation database is a build that has produced
+     * nothing yet, which is a different fact from one Atlas could not read. */
+    "  unit_count INTEGER NOT NULL DEFAULT 0,"
+    "  discovered_at TEXT NOT NULL DEFAULT '',"
+    "  UNIQUE(repo_id, path_text)"
+    ");"
+    "CREATE INDEX idx_sem_build_inputs_repo ON sem_build_inputs(repo_id, accepted);"
+
+    /* --- the one-way migration of an intent that was never recorded --- */
+
+    /* Order matters only for readability; the two sets are disjoint. */
+    "UPDATE sem_repo_config SET auto_intent = 'ENABLED', auto_intent_by = 'OPERATOR'"
+    "  WHERE auto_rebuild = 1;"
+    "UPDATE sem_repo_config SET auto_intent = 'UNSET', auto_intent_by = 'MIGRATION'"
+    "  WHERE auto_rebuild = 0;";
+
+static const char *const M19_STATEMENTS[] = {M19_STATEMENTS_SQL, NULL};
+
 static const atlas_migration MIGRATIONS[] = {
     {1, "initial schema", M1_STATEMENTS, false},
     {2, "worktree identity", M2_STATEMENTS, false},
@@ -3482,6 +3657,14 @@ static const atlas_migration MIGRATIONS[] = {
      * comment. */
     {18, "the durable semantic build description and a generation's coverage manifest",
      M18_STATEMENTS, false},
+    /* Additive: one new table, one index, eight columns and two UPDATEs over
+     * columns this migration itself added. No table is rebuilt, so foreign keys
+     * stay enforced and no pre-existing value is rewritten. It enables nothing
+     * on its own — what an UNSET intent resolves to is a root-owned policy key
+     * with a named compiled-in default, not something this migration decides.
+     * See the M19 comment for why a stored 0 becomes UNSET and never DISABLED. */
+    {19, "build-input discovery, and an activation intent that records who expressed it",
+     M19_STATEMENTS, false},
 };
 
 const atlas_migration *atlas_migrations(size_t *count_out) {

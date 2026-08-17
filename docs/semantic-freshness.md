@@ -19,6 +19,18 @@ uselessly.
 A9.2.3 makes the daemon own the difference, and makes a generation say what it
 actually covered.
 
+> **Superseded in part by A9.2.4 — see `docs/semantic-discovery.md`.** Two rules
+> below were reversed deliberately and both reversals are documented there:
+> compilation databases are now **discovered** inside a bounded search universe
+> rather than only named, and automatic maintenance is **on by default** rather
+> than requiring a per-repository opt-in. What did not change is everything this
+> document argues for: the two axes stay two, freshness is still recomputed on
+> every read, the source identity is still what makes an uncommitted edit
+> visible, and coverage is still measured against the tree and is still never a
+> percentage. A9.2.4 adds a third axis underneath them — whether the *search for
+> build inputs* was complete — because complete processing of configured inputs
+> does not prove complete discovery of relevant inputs.
+
 ---
 
 ## 1. The two axes, and why they are two

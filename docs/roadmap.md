@@ -369,6 +369,67 @@ isolation guarantee, at the operator's decision. A7.1 defends against
 
 A7.1 added no orchestration.
 
+## A9.2.5 — semantic index trust closure (CLOSED)
+
+The sentence the season exists for:
+
+> **A SEMANTIC READ THAT FOUND NOTHING HAS NOT ESTABLISHED THAT THERE IS
+> NOTHING.**
+
+A9.2.2 proved that for claims and built the coverage model an absence rests on;
+A9.2.3 gave a generation a coverage manifest; A9.2.4 gave it a discovery verdict.
+None of it reached the answer to `callers of X`, which replied with its rows plus
+freshness and stopped — so `zero rows` and `zero rows over a tree Atlas read a
+third of` were the same document. This repository answered exactly that,
+`CURRENT` and `0 reached`, with a PROVEN caller in a file the compilation
+database never named.
+
+Shipped:
+
+- `result_verdict` — PRESENT, ABSENT or UNKNOWN — plus twenty trust fields on
+  every load-bearing semantic read, from one `atlas_sem_trust_write_json` that
+  the CLI renderer and the IPC server both call. UNKNOWN is the enum's zero and
+  never means "no".
+- A9.2.2's asymmetry one layer out: one row settles PRESENT whatever the
+  coverage; zero rows settle ABSENT only over a universe Atlas can vouch for.
+- `sem_discovery_obstacles` (migration 20): every place a walk could not look,
+  with its exact `%XX`-encoded path and a fixed reason, sorted and deduplicated.
+  A9.2.4 kept the first reason and no path, so one `--exclude` masked the rest.
+- A FAILED translation unit is never carried forward as COMPLETE, and a
+  transient parse failure gets one bounded retry per unit and a bounded total
+  per pass.
+- `repo_identity_hash` is compared on the read path; `INCOMPLETE` is no longer
+  held with `HOLD_CURRENT`; the context package states its coverage gaps.
+- A symbol that is not in the index is no longer a usage error. Ambiguity is.
+
+Deliberately not done: Atlas still does not guess which sources are tests, and
+declaring one test root is not evidence that every test root was declared, so
+`ATLAS_COVDIM_TESTS` stays UNKNOWN and a production-scope absence stays
+UNAVAILABLE.
+
+## A9.2.6 — daemon responsiveness (next, before O10)
+
+Small and operational, carrying the one finding A9.2.5 established and did not
+fix. A semantic index pass can leave the daemon answering nothing for tens of
+minutes: the serve loop in `src/ipc/server.c` is a single `poll()` loop that
+dispatches each request synchronously, so one slow request blocks every client
+including `daemon ping`, which touches no repository at all.
+
+Verdict on the cause: **SUPPORTED BUT INCOMPLETE**. Measured and *disproven*: the
+WAL is not the cause — `wal_autocheckpoint` is 1000 and active,
+`wal_checkpoint(PASSIVE)` returns `0|22|22`, and `daemon ping` measures 22 ms
+with the WAL at 255 MB. Established: the stall is coincident with a semantic
+pass, the serve loop is serial, and it exhausted a 5 s SQLite busy timeout during
+one. Not established: which lock, which request, and whether the cause is
+contention or plain I/O saturation.
+
+It does not break trust correctness — every answer the daemon gave was correct —
+but a repository-intelligence daemon that answers nothing is indistinguishable
+from one that is down, and A9.2.4 made the triggering condition the default. The
+first lever is A8-CI's own rule that an operation which can outlast a client's
+patience does not run in the serve loop: indexing was moved out, semantic *reads*
+were not. `docs/backlog.md` carries the evidence and the candidate fixes.
+
 ## A7 (original plan) — optional MCP adapter (absorbed into A2)
 
 A7 was conditional: an MCP adapter only if a skill driving the CLI turned out to

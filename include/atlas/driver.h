@@ -44,7 +44,18 @@
 #define ATLAS_DRIVER_VERSION_MAX 128u
 
 typedef struct atlas_driver_req {
+    /* The isolated workspace, when the caller provisioned one. A11.1's run
+     * driver has none and passes NULL: it works in the registered repository's
+     * own tree, so there is nothing to snapshot into and nowhere in the
+     * workspace for a log to go. A driver that dereferences this without
+     * checking is a driver A11.1 may not run. */
     const atlas_ws *ws;
+    /* A11.1. The directory the child process is executed in, absolute and
+     * resolved by Atlas from the registry — never from the task text, never
+     * from the environment and never from anything the model said. NULL means
+     * `ws->work`, which is A8's isolated case and is what every existing caller
+     * passes. */
+    const char *work_dir;
     const char *job_uid;
     int64_t attempt_no;
     /* UNTRUSTED_DATA: what a submitter typed. Handed to the driver because the
@@ -86,6 +97,12 @@ typedef struct atlas_driver_res {
     int64_t input_tokens;
     int64_t output_tokens;
     atlas_buf cost;
+    /* A11.1. The redacted, bounded capture of what the child said, for a caller
+     * that has no workspace to write it into. UNTRUSTED_DATA: it is stored as
+     * an artifact and quoted into a follow-up task's text, and no branch
+     * anywhere reads it. A driver with a workspace leaves this empty and writes
+     * its own log file, which is A8's arrangement unchanged. */
+    atlas_buf log;
 } atlas_driver_res;
 
 void atlas_driver_res_init(atlas_driver_res *r);
@@ -103,6 +120,13 @@ typedef struct atlas_driver {
     bool needs_live_model;
     atlas_status (*run)(const atlas_driver_req *req, atlas_driver_res *res, atlas_err *err);
 } atlas_driver;
+
+/* Whether a driver works in the registered repository's own tree is **not** a
+ * member of this struct. It is `atlas_orch_driver_is_repo_tree`, in the
+ * orchestration model, because the daemon has to answer it about a stored name
+ * before anything is granted and must not link the driver table's `run`
+ * functions into that decision. One list, so the two answers cannot drift;
+ * `tests/test_a11_run.c` checks it against every shipped driver. */
 
 /* Resolves a driver by name. NULL for an unknown name — an unknown driver is a
  * refusal, never a default: silently substituting one would run something other

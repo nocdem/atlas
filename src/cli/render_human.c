@@ -23,6 +23,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "atlas/orch.h"
 #include "atlas/sem_discover.h"
 #include "atlas/atlas.h"
 
@@ -571,6 +572,32 @@ static atlas_status h_job_item(atlas_renderer *r, const atlas_job_render *jr, at
     if (jr->task != NULL && jr->task[0] != '\0') {
         /* Labelled, because it is a submitter's words and not Atlas'. */
         (void)fprintf(out, "task (untrusted, atlas-safe-1)\n  %s\n", jr->task);
+    }
+    /* A11.0/A11.1. Printed only when present. A run this job does not belong to
+     * is an absent line, never an empty identifier — the two read differently
+     * and only one of them is true. */
+    if (jr->run != NULL && jr->run[0] != '\0') {
+        (void)fprintf(out, "run           %s\n", jr->run);
+    }
+    if (jr->run_status != NULL && jr->run_status[0] != '\0') {
+        (void)fprintf(out, "run status    %s\n", jr->run_status);
+    }
+    if (jr->tasks > 0 || jr->worker_starts > 0) {
+        (void)fprintf(out, "worker starts %lld of %lld (this invocation carried %lld task(s))\n",
+                      (long long)jr->worker_starts,
+                      (long long)ATLAS_ORCH_RUN_MAX_WORKER_STARTS, (long long)jr->tasks);
+    }
+    if (jr->follow_up != NULL && jr->follow_up[0] != '\0') {
+        (void)fprintf(out, "next task     %s\n", jr->follow_up);
+    }
+    if (jr->busy) {
+        /* Said in full, because the short version of it reads like a refusal.
+         * Nothing was written, the run is untouched, and repeating the command
+         * is safe. */
+        (void)fprintf(out,
+                      "\nThe run's active task is already held by another driver, so nothing\n"
+                      "was started and nothing was written. The run is still ACTIVE and this\n"
+                      "command can simply be run again.\n");
     }
     (void)atlas_err_init;
     (void)err;

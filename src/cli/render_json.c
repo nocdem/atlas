@@ -15,6 +15,7 @@
 
 #include <string.h>
 
+#include "atlas/orch.h"
 #include "atlas/sem_discover.h"
 #include "atlas/atlas.h"
 #include "atlas/pathrep.h"
@@ -604,6 +605,38 @@ static atlas_status j_job_item(atlas_renderer *r, const atlas_job_render *jr, at
     }
     if (st == ATLAS_OK) {
         st = atlas_json_key_int(j, "attempts", jr->attempts, err);
+    }
+    /* A11.0/A11.1. Emitted only when present, and outside the detail block
+     * because a list row carries a run too. An absent key means "this job
+     * belongs to no run"; there is deliberately no empty-string spelling of
+     * that, since an empty identifier reads like an identifier. */
+    {
+        struct {
+            const char *k;
+            const char *v;
+        } runf[] = {
+            {"run", jr->run}, {"run_status", jr->run_status}, {"follow_up", jr->follow_up},
+        };
+        for (size_t i = 0; st == ATLAS_OK && i < sizeof runf / sizeof runf[0]; i++) {
+            if (runf[i].v != NULL && runf[i].v[0] != '\0') {
+                st = atlas_json_key_str(j, runf[i].k, runf[i].v, err);
+            }
+        }
+    }
+    if (st == ATLAS_OK && (jr->tasks > 0 || jr->worker_starts > 0)) {
+        st = atlas_json_key_int(j, "worker_starts", jr->worker_starts, err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_int(j, "worker_start_limit", ATLAS_ORCH_RUN_MAX_WORKER_STARTS,
+                                    err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_int(j, "tasks_carried", jr->tasks, err);
+        }
+    }
+    if (st == ATLAS_OK && jr->busy) {
+        /* Present only when true, and named so it cannot be read as a verdict
+         * about the run: nothing was started and nothing was written. */
+        st = atlas_json_key_bool(j, "busy", true, err);
     }
     if (st == ATLAS_OK && jr->in_list) {
         st = atlas_json_obj_end(j, err);

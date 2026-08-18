@@ -125,6 +125,19 @@ typedef struct atlas_orch_op {
     int64_t exit_code;
     atlas_orch_reason failure_reason;
     atlas_buf driver_version;
+
+    /* COMPLETE, A11.1. Which of the job's **stored** validation commands failed,
+     * as a zero-based index into them, or -1 when none did. An index rather
+     * than a name: the follow-up task is told which gate failed by rendering
+     * the argv Atlas has on the job row, so a caller cannot name a gate the job
+     * never declared. Out-of-range is refused, not clamped.
+     *
+     * `failure_detail` is the bounded excerpt of what that gate actually
+     * printed. It is UNTRUSTED_DATA — a compiler's or a test runner's output —
+     * and it is used for exactly one thing: quoting into the follow-up task's
+     * text, where it is already labelled as such. No branch reads it. */
+    int64_t failed_gate;
+    atlas_buf failure_detail;
     atlas_orch_artifact *artifacts;
     size_t artifact_count;
 
@@ -163,6 +176,21 @@ typedef struct atlas_orch_result {
     /* HEARTBEAT: an operator has asked for cancellation and the worker must
      * stop. The worker learns it here rather than being signalled. */
     bool cancel_requested;
+
+    /* COMPLETE, A11.1. What this completion did to the run the job belongs to.
+     * `run_status` is the run's status *after* the operation — ACTIVE when it
+     * is still open, and one of the two terminal answers when this completion
+     * settled it. UNKNOWN when the job belongs to no run at all, which is every
+     * job submitted before migration 21.
+     *
+     * `follow_up_job_uid` names the task this completion created, and is empty
+     * when it created none — because the run was settled, because the budget
+     * was spent, or because a resumed completion found the follow-up already
+     * there. A caller reads it; nothing decides from it. */
+    atlas_orch_run_status run_status;
+    atlas_buf follow_up_job_uid;
+    /* How many worker starts this run has spent, after this operation. */
+    int64_t worker_starts;
 
     /* LEASE only, and once: the bearer token, returned at grant and never
      * retrievable afterwards. */

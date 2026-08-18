@@ -283,6 +283,8 @@ add_library(atlas_core STATIC
   src/orch/policy.c
   src/orch/workspace.c
   src/orch/driver.c
+  src/orch/validate.c
+  src/orch/rundriver.c
   src/orch/dispatch.c
   src/orch/snapshot.c
   src/core/service_orch.c

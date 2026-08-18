@@ -313,6 +313,33 @@ const char *atlas_orch_exit_kind_name(atlas_orch_exit_kind k);
  * never streamed through the control socket. */
 #define ATLAS_ORCH_ARTIFACT_INLINE_MAX (256u * 1024u)
 
+/* --- A11.1: the bound on one run -------------------------------------------
+ *
+ * How many times a worker may actually be *started* inside one run: the root
+ * task's own run, and at most two follow-ups. One constant, compiled in, with
+ * no policy key and no flag — the season asked for a single explicit contract
+ * rather than a retry framework, and a bound a caller can raise is not a bound.
+ *
+ * It counts **worker starts**, not tasks, not attempts and not submissions. The
+ * count is derived from the ledger — every transition to RUNNING within the run
+ * — because that is the one event that happens immediately before an exec and
+ * is durable before it. A crash therefore spends budget, and a `BUSY` that
+ * never reached a lease does not: a caller that was refused before anything ran
+ * has consumed nothing, which is exactly what makes retrying it safe.
+ *
+ * `ATLAS_ORCH_MAX_ATTEMPTS` is a different bound with a different subject: how
+ * many attempts one *task* may make. Both apply, and the tighter one wins,
+ * which is why this is never compared against it. */
+#define ATLAS_ORCH_RUN_MAX_WORKER_STARTS 3
+
+/* How much of a failing gate's real output travels into the follow-up task's
+ * text. Bounded because it is UNTRUSTED_DATA a compiler or a test runner
+ * produced, it is stored, hashed and rendered, and an unbounded excerpt would
+ * be a memory bound set by whatever the gate happened to print. Truncation here
+ * is reported in the text itself rather than silent — the excerpt says it is an
+ * excerpt. */
+#define ATLAS_ORCH_GATE_EXCERPT_MAX 4096u
+
 /* --- the canonical job specification --------------------------------------
  *
  * Everything immutable that changes what was asked for. The digest covers all of
@@ -416,6 +443,34 @@ atlas_status atlas_orch_validations_decode(const char *text, atlas_orch_argv *v,
 bool atlas_orch_relpath_is_safe(const char *path, size_t len);
 
 /* --- identifiers ---------------------------------------------------------- */
+
+/* --- A11.1: which drivers work in the repository's own tree -----------------
+ *
+ * The one list, asked by name, and the whole scope of A11.1's reversal of "a
+ * job works on a snapshot in a workspace".
+ *
+ * It lives here rather than as a flag on `atlas_driver` because the daemon has
+ * to answer it about a *stored* driver name, at the moment a lease would be
+ * granted, without linking the driver table's `run` functions into that
+ * decision — and because one list cannot drift from itself.
+ *
+ * Two things follow from a true answer, and both are refusals:
+ *
+ *   * **No lease that did not name this driver is ever granted one.** The A8
+ *     dispatcher polls with an empty filter, which means "any"; without this it
+ *     would take an A11 task, provision a workspace the driver does not use,
+ *     run it somewhere it was not meant to run, and complete it — settling the
+ *     run without a gate having run where the changes are.
+ *   * **This is the driver whose completion settles a run.** A run whose task
+ *     ran under an A8 workspace driver has no A11.1 driver behind it, so
+ *     nothing has decided anything about it, and A11.0's answer — that its
+ *     status is its own axis and nothing derives it — still stands for it.
+ *
+ * An unknown name answers false. What the predicate guards is a repo-tree
+ * execution; a name Atlas cannot resolve is one no dispatcher can execute at
+ * all, so withholding the grant would protect nothing and would cost the
+ * operator the recorded failure A8 already produces for it. */
+bool atlas_orch_driver_is_repo_tree(const char *name);
 
 /* A fresh job identifier from the kernel's random source. Fails rather than
  * falling back to anything weaker: a predictable job id is a job another local

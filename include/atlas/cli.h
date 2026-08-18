@@ -173,6 +173,13 @@ typedef struct atlas_cli_opts {
         /* `atlas dispatcher run --once`: take at most one job and stop. How the
          * live smoke drives exactly one attempt without a service. */
         bool once;
+        /* A11.1. `atlas job run`. The gates a run is fixed with at its root
+         * task, and the run to resume instead of starting a new one. A gate is
+         * split on spaces here and never by a shell; `argv[0]` is checked
+         * against the binary's own allowlist by the layer that runs it. */
+        const char *gates[8];
+        size_t gate_count;
+        const char *resume;
     } job;
     /* A9.2.1. The verification-intake fields, grouped for the reason the A4
      * ones are: there are a dozen and a half of them, six subcommands use

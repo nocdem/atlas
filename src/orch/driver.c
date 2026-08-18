@@ -3,12 +3,22 @@
  *
  * See atlas/driver.h for what a driver may and may not decide.
  *
- * Two drivers ship: a deterministic `fake` that runs entirely in process, and
- * `claude`, which executes the installed Claude Code CLI noninteractively inside
- * a job workspace. The fake one exists so that every part of A8 above the driver
- * — leasing, heartbeats, cancellation, retry, artifact collection, completion —
- * can be exercised without a model, a network or a credential, deterministically
- * and in milliseconds.
+ * Four drivers ship, in two pairs.
+ *
+ * A8's pair works inside an isolated job workspace: a deterministic `fake` that
+ * runs entirely in process, and `claude`, which executes the installed Claude
+ * Code CLI noninteractively there. The fake one exists so that every part of A8
+ * above the driver — leasing, heartbeats, cancellation, retry, artifact
+ * collection, completion — can be exercised without a model, a network or a
+ * credential, deterministically and in milliseconds.
+ *
+ * A11.1's pair, `claude-repo` and `fake-repo`, works in the registered
+ * repository's own tree. That is the milestone's one reversal and it is scoped
+ * to these two entries: `atlas_orch_driver_is_repo_tree` names both, no lease
+ * that does not ask for one by name is ever granted one, and the operator's
+ * foreground run driver is the only thing in Atlas that asks. `fake-repo`
+ * stands in the same relation to `claude-repo` that `fake` does to `claude`,
+ * and for the same reason.
  */
 #define _GNU_SOURCE 1
 
@@ -44,6 +54,7 @@ void atlas_driver_res_init(atlas_driver_res *r) {
     r->exit_code = -1;
     atlas_buf_init(&r->version);
     atlas_buf_init(&r->cost);
+    atlas_buf_init(&r->log);
 }
 
 void atlas_driver_res_free(atlas_driver_res *r) {
@@ -52,6 +63,7 @@ void atlas_driver_res_free(atlas_driver_res *r) {
     }
     atlas_buf_free(&r->version);
     atlas_buf_free(&r->cost);
+    atlas_buf_free(&r->log);
 }
 
 /* --- shared: capturing a driver's streams --------------------------------- */
@@ -75,15 +87,23 @@ static atlas_status capture_sink(const char *chunk, size_t n, void *ud, atlas_er
 }
 
 /* Redacts, then writes a captured stream into the workspace. Every log a driver
- * produces goes through here — there is no path that stores one unredacted. */
+ * produces goes through here — there is no path that stores one unredacted.
+ *
+ * A11.1 added the second destination. When the caller provisioned no workspace
+ * — the run driver works in the registered repository's own tree and has none —
+ * the redacted bytes are appended to `sink` instead, and the caller carries them
+ * as an artifact. Redaction is not the branch: it happens before either
+ * destination is chosen, so there is still no path that stores an unredacted
+ * one. A driver's log is never written into the repository. */
 static atlas_status store_log(const atlas_ws *ws, const char *rel, const atlas_buf *raw,
-                              int64_t *redactions, atlas_err *err) {
+                              atlas_buf *sink, int64_t *redactions, atlas_err *err) {
     atlas_buf clean = ATLAS_BUF_INIT;
     int64_t hits = 0;
     atlas_status st = atlas_ws_redact(raw->data != NULL ? raw->data : "", raw->len, &clean, &hits,
                                       err);
     if (st == ATLAS_OK) {
-        st = atlas_ws_write(ws, rel, clean.data, clean.len, err);
+        st = ws != NULL ? atlas_ws_write(ws, rel, clean.data, clean.len, err)
+                        : atlas_buf_append(sink, clean.data, clean.len, err);
     }
     if (redactions != NULL) {
         *redactions += hits;
@@ -130,7 +150,7 @@ static atlas_status fake_run(const atlas_driver_req *req, atlas_driver_res *res,
         /* A timed-out run still leaves a log, empty though it is: "the driver
          * said nothing" is itself the evidence. */
         atlas_buf empty = ATLAS_BUF_INIT;
-        atlas_status ls = store_log(req->ws, "logs/stdout.log", &empty, &res->redactions, err);
+        atlas_status ls = store_log(req->ws, "logs/stdout.log", &empty, &res->log, &res->redactions, err);
         atlas_buf_free(&empty);
         return ls;
     }
@@ -172,7 +192,7 @@ static atlas_status fake_run(const atlas_driver_req *req, atlas_driver_res *res,
         atlas_status ls = atlas_buf_appendf(&log, err, "fake driver ran for job %s\n",
                                             req->job_uid != NULL ? req->job_uid : "");
         if (ls == ATLAS_OK) {
-            ls = store_log(req->ws, "logs/stdout.log", &log, &res->redactions, err);
+            ls = store_log(req->ws, "logs/stdout.log", &log, &res->log, &res->redactions, err);
         }
         atlas_buf_free(&log);
         st = ls;
@@ -249,12 +269,17 @@ static atlas_status read_service_credential(atlas_buf *out, bool *present_out, a
     return ATLAS_OK;
 }
 
-static atlas_status claude_run(const atlas_driver_req *req, atlas_driver_res *res,
-                               atlas_err *err) {
-    atlas_status st = atlas_buf_set_str(&res->version, "claude/1", err);
-    if (st != ATLAS_OK) {
-        return st;
-    }
+/* The Claude Code CLI, executed once, noninteractively.
+ *
+ * One implementation for both drivers that use it. What differs between them is
+ * *where the child runs* and *where its log goes*, and both are already
+ * parameters: `req->work_dir` and `req->ws`. Two copies of this function would
+ * be two places for the environment construction, the credential handling and
+ * the exit classification to drift apart, and the exit classification is the
+ * part that decides whether a zero exit is read as success. */
+static atlas_status claude_exec(const atlas_driver_req *req, atlas_driver_res *res,
+                                atlas_err *err) {
+    atlas_status st = ATLAS_OK;
     if (!req->live_model) {
         return atlas_err_set(err, ATLAS_ERR_CONFIG,
                              "the orchestration policy does not enable live model execution "
@@ -309,6 +334,16 @@ static atlas_status claude_run(const atlas_driver_req *req, atlas_driver_res *re
         } else {
             st = atlas_buf_set_str(&home, h, err);
         }
+    } else if (req->ws == NULL) {
+        /* A11.1. Service mode keeps the CLI's state in a private directory
+         * *inside the attempt's workspace*, and a caller with no workspace has
+         * nowhere private to put it. Refused rather than substituted: the
+         * substitutes are the real HOME, which is the operator session this
+         * caller did not ask for, and the repository, which Atlas will not put
+         * a credential store in. */
+        st = atlas_err_set(err, ATLAS_ERR_CONFIG,
+                           "this driver has no workspace, so it can only run under an operator "
+                           "session; the orchestration policy asked for service mode");
     } else {
         st = atlas_buf_appendf(&home, err, "%s/home", atlas_buf_cstr(&req->ws->driver));
         if (st == ATLAS_OK && mkdir(atlas_buf_cstr(&home), 0700) != 0 && errno != EEXIST) {
@@ -374,7 +409,12 @@ static atlas_status claude_run(const atlas_driver_req *req, atlas_driver_res *re
         memset(&opts, 0, sizeof(opts));
         opts.argv = argv;
         opts.env = env;
-        opts.cwd = atlas_buf_cstr(&req->ws->work);
+        /* A11.1. The explicit working directory when the caller gave one, and
+         * the workspace's writable tree otherwise. Both come from Atlas: the
+         * first is the registry's canonical repository root, the second is a
+         * path the dispatcher provisioned. Neither is ever taken from the task
+         * text, the environment or anything the model produced. */
+        opts.cwd = req->work_dir != NULL ? req->work_dir : atlas_buf_cstr(&req->ws->work);
         opts.timeout_ms = (int)(req->wall_timeout_ms > 0 ? req->wall_timeout_ms : 600000);
         opts.idle_timeout_ms = (int)req->idle_timeout_ms;
         opts.max_stdout = (size_t)out.max;
@@ -392,8 +432,8 @@ static atlas_status claude_run(const atlas_driver_req *req, atlas_driver_res *re
     if (out.out.len > 0 || pr.exit_code != 0) {
         atlas_err ignore;
         atlas_err_init(&ignore);
-        (void)store_log(req->ws, "logs/stdout.log", &out.out, &res->redactions, &ignore);
-        (void)store_log(req->ws, "logs/stderr.log", &errbuf, &res->redactions, &ignore);
+        (void)store_log(req->ws, "logs/stdout.log", &out.out, &res->log, &res->redactions, &ignore);
+        (void)store_log(req->ws, "logs/stderr.log", &errbuf, &res->log, &res->redactions, &ignore);
     }
     res->stdout_bytes = (int64_t)out.out.len;
     res->stderr_bytes = (int64_t)errbuf.len;
@@ -437,9 +477,12 @@ static atlas_status claude_run(const atlas_driver_req *req, atlas_driver_res *re
          * the header documents as "not reported" rather than "free". */
         res->exit_kind = (*s == '{' || *s == '[') ? ATLAS_ORCH_EXIT_OK
                                                   : ATLAS_ORCH_EXIT_MALFORMED_RESULT;
-        atlas_err ignore;
-        atlas_err_init(&ignore);
-        (void)atlas_ws_write(req->ws, "driver/result.json", out.out.data, out.out.len, &ignore);
+        if (req->ws != NULL) {
+            atlas_err ignore;
+            atlas_err_init(&ignore);
+            (void)atlas_ws_write(req->ws, "driver/result.json", out.out.data, out.out.len,
+                                 &ignore);
+        }
     }
     /* A cancelled or bounded run is not a failure of Atlas, so the status is
      * cleared and the outcome is carried in `exit_kind` where the caller reads
@@ -457,12 +500,144 @@ static atlas_status claude_run(const atlas_driver_req *req, atlas_driver_res *re
     return st;
 }
 
+static atlas_status claude_run(const atlas_driver_req *req, atlas_driver_res *res,
+                               atlas_err *err) {
+    atlas_status st = atlas_buf_set_str(&res->version, "claude/1", err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (req->ws == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "the claude driver runs in an isolated workspace and was given none");
+    }
+    return claude_exec(req, res, err);
+}
+
+/* --- A11.1: the two drivers that work in the repository's own tree -----------
+ *
+ * The reversal this milestone makes, and the whole of it. A8's drivers work on
+ * a snapshot in a worker-owned workspace, and Atlas applies nothing they
+ * produce; A11.1's work in the registered repository's own tree, because the
+ * season the operator asked for is a chain of tasks that build on each other's
+ * changes and a follow-up task that could not see the first one's work would be
+ * a follow-up to nothing.
+ *
+ * That does not weaken "never modify a registered target repository" anywhere
+ * else. Atlas' own reads — scan, the index passes, every `src/git` invocation —
+ * are unchanged and still read-only. What changes is that an **operator running
+ * a foreground command** may now start a child process whose purpose is to
+ * edit the tree, in a directory Atlas resolved from its own registry. The full
+ * argument is in `docs/engineering-rules.md` under A11.1.
+ *
+ * Both are `exclusive`: they may only be handed to a lease that names them, so
+ * the background dispatcher — which polls with an empty filter meaning "any" —
+ * can never pick one up and run it somewhere it was not meant to run. */
+static atlas_status claude_repo_run(const atlas_driver_req *req, atlas_driver_res *res,
+                                    atlas_err *err) {
+    atlas_status st = atlas_buf_set_str(&res->version, "claude-repo/1", err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (req->work_dir == NULL || req->work_dir[0] != '/') {
+        /* Refused rather than defaulted. The one safe value for this is an
+         * absolute path Atlas resolved from the registry, and every other value
+         * — a relative path, the caller's cwd, a workspace — is a different
+         * repository than the one the job was authorised over. */
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "the claude-repo driver needs an absolute working directory "
+                             "resolved by Atlas and was given none");
+    }
+    return claude_exec(req, res, err);
+}
+
+/* The repository-tree counterpart of `fake`, and the reason the ten A11.1
+ * acceptance contracts need no model, no network and no credential.
+ *
+ * It appends one line per start to a single file in the work tree, so a gate
+ * can distinguish "the first worker ran" from "a second one did" without the
+ * fixture having to reach inside Atlas. That is what lets one test prove a
+ * failing gate produces exactly one follow-up whose worker then passes. The
+ * `fake:` prefixes are the same Atlas literals `fake` matches, so a real task
+ * text cannot select a behaviour by accident. */
+static atlas_status fake_repo_run(const atlas_driver_req *req, atlas_driver_res *res,
+                                  atlas_err *err) {
+    atlas_status st = atlas_buf_set_str(&res->version, "fake-repo/1", err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (req->work_dir == NULL || req->work_dir[0] != '/') {
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "the fake-repo driver needs an absolute working directory resolved "
+                             "by Atlas and was given none");
+    }
+    if (req->cancel != NULL && req->cancel(req->cancel_ud)) {
+        res->exit_kind = ATLAS_ORCH_EXIT_CANCELLED;
+        res->exit_code = -1;
+        return ATLAS_OK;
+    }
+    if (task_is(req->task, "fake:timeout")) {
+        res->exit_kind = ATLAS_ORCH_EXIT_TIMEOUT;
+        res->exit_code = -1;
+        return atlas_buf_set_str(&res->log, "fake-repo: the worker did not finish\n", err);
+    }
+    if (task_is(req->task, "fake:cancel")) {
+        res->exit_kind = ATLAS_ORCH_EXIT_CANCELLED;
+        res->exit_code = -1;
+        return ATLAS_OK;
+    }
+    if (task_is(req->task, "fake:malformed")) {
+        res->exit_kind = ATLAS_ORCH_EXIT_MALFORMED_RESULT;
+        res->exit_code = 0;
+        return atlas_buf_set_str(&res->log, "fake-repo: this is not a result document\n", err);
+    }
+
+    bool fail = task_is(req->task, "fake:fail");
+
+    atlas_buf path = ATLAS_BUF_INIT;
+    st = atlas_buf_appendf(&path, err, "%s/ATLAS_FAKE_DRIVER.txt", req->work_dir);
+    if (st == ATLAS_OK) {
+        FILE *f = fopen(atlas_buf_cstr(&path), "ae");
+        if (f == NULL) {
+            st = atlas_err_set_errno(err, ATLAS_ERR_INTERNAL, errno,
+                                     "cannot write into the repository work tree");
+        } else {
+            (void)fprintf(f, "atlas fake-repo driver job %s attempt %lld\n",
+                          req->job_uid != NULL ? req->job_uid : "", (long long)req->attempt_no);
+            if (fclose(f) != 0) {
+                st = atlas_err_set_errno(err, ATLAS_ERR_INTERNAL, errno,
+                                         "cannot flush the fake driver's work");
+            }
+        }
+    }
+    atlas_buf_free(&path);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    st = atlas_buf_appendf(&res->log, err, "fake-repo ran for job %s\n",
+                           req->job_uid != NULL ? req->job_uid : "");
+    res->stdout_bytes = (int64_t)res->log.len;
+    res->exit_kind = fail ? ATLAS_ORCH_EXIT_NONZERO : ATLAS_ORCH_EXIT_OK;
+    res->exit_code = fail ? 1 : 0;
+    return st;
+}
+
 /* --- the registry ----------------------------------------------------------- */
 
-static const atlas_driver DRIVER_FAKE = {"fake", "1", false, fake_run};
-static const atlas_driver DRIVER_CLAUDE = {"claude", "1", true, claude_run};
+static const atlas_driver DRIVER_FAKE = {
+    .name = "fake", .version = "1", .needs_live_model = false,
+    .run = fake_run};
+static const atlas_driver DRIVER_CLAUDE = {
+    .name = "claude", .version = "1", .needs_live_model = true,
+    .run = claude_run};
+static const atlas_driver DRIVER_CLAUDE_REPO = {
+    .name = "claude-repo", .version = "1", .needs_live_model = true,
+    .run = claude_repo_run};
+static const atlas_driver DRIVER_FAKE_REPO = {
+    .name = "fake-repo", .version = "1", .needs_live_model = false,
+    .run = fake_repo_run};
 
-static const atlas_driver *const DRIVERS[] = {&DRIVER_FAKE, &DRIVER_CLAUDE};
+static const atlas_driver *const DRIVERS[] = {&DRIVER_FAKE, &DRIVER_CLAUDE, &DRIVER_CLAUDE_REPO,
+                                              &DRIVER_FAKE_REPO};
 
 const atlas_driver *const *atlas_drivers(size_t *count_out) {
     if (count_out != NULL) {

@@ -3,8 +3,8 @@
  *
  * Two groups, looked up separately in `server.c` by the peer's uid:
  *
- *   `job.`      submit, get, list, cancel, artifact — for a submitter.
- *   `dispatch.` lease, heartbeat, event, complete   — for the dispatcher.
+ *   `job.`      submit, get, list, cancel, artifact, run_status — for a submitter.
+ *   `dispatch.` lease, heartbeat, event, complete              — for the dispatcher.
  *
  * The selection is on `SO_PEERCRED` and on nothing else. A uid, gid, pid or role
  * in the request body is a client describing itself, which is not evidence about
@@ -40,6 +40,7 @@
 #include "atlas/git.h"
 #include "atlas/orch_ops.h"
 #include "atlas/orchpolicy.h"
+#include "atlas/sha256.h"
 #include "atlas/snapshot.h"
 #include "server_internal.h"
 
@@ -92,6 +93,12 @@ static atlas_status write_job_summary(dispatch_state *ds, const atlas_orch_resul
     }
     if (st == ATLAS_OK) {
         st = atlas_json_key_int(ds->j, "seq", r->seq, err);
+    }
+    /* A11.0's run, when the operation settled one. Absent rather than empty for
+     * a job that belongs to none, so a reader never has to decide whether an
+     * empty identifier means "no run" or "a run nobody named". */
+    if (st == ATLAS_OK && r->run_uid.len > 0) {
+        st = atlas_json_key_str(ds->j, "run", atlas_buf_cstr(&r->run_uid), err);
     }
     return st;
 }
@@ -639,6 +646,76 @@ static atlas_status method_job_artifact(dispatch_state *ds, const atlas_ipc_requ
     return st;
 }
 
+/* --- job.run_status (A11.1) --------------------------------------------------------
+ *
+ * A read, and only a read. There is no `job.run_settle`, no `job.run_accept`
+ * and no `job.run_block`: a run's status changes inside the completion that
+ * justifies it
+ * and nowhere else, which is what makes "a model payload cannot accept a run"
+ * true by absence. Adding a method here that writes would undo that in one
+ * line, so this one is the only member of its family and is expected to stay
+ * that way.
+ *
+ * Scoped like every other client read: through the run's root task's submitter.
+ * A run belonging to somebody else answers "no such run", never "forbidden".
+ */
+static atlas_status method_run_get(dispatch_state *ds, const atlas_ipc_request *req,
+                                   atlas_err *err) {
+    atlas_status st = require_submitter(ds, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    const char *uid = NULL;
+    if (!atlas_ipc_param_str(req, "run", &uid) || uid == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "which run?");
+    }
+    atlas_orch_run_view rv;
+    memset(&rv, 0, sizeof(rv));
+    bool found = false;
+    st = atlas_db_orch_run_get(ds->db, uid, &rv, &found, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (!found) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "no such run");
+    }
+    atlas_orch_job_view root;
+    atlas_orch_job_view_init(&root);
+    bool root_found = false;
+    st = atlas_db_orch_job_get(ds->db, rv.root_job_uid, &root, &root_found, err);
+    long long submitter = root.submitter_uid;
+    atlas_orch_job_view_free(&root);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (!root_found || submitter != ds->peer_uid) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "no such run");
+    }
+
+    struct {
+        const char *key;
+        const char *val;
+    } strs[] = {
+        {"run", rv.run_uid},
+        {"root", rv.root_job_uid},
+        {"status", atlas_orch_run_status_name(rv.status)},
+        {"created_at", rv.created_at},
+    };
+    for (size_t i = 0; st == ATLAS_OK && i < sizeof strs / sizeof strs[0]; i++) {
+        st = atlas_json_key_str(ds->j, strs[i].key, strs[i].val, err);
+    }
+    /* The active task is emitted only when there is one. An empty run_uid-shaped
+     * string would read as an identifier; an absent key reads as what it is. */
+    if (st == ATLAS_OK && rv.active_job_uid[0] != '\0') {
+        st = atlas_json_key_str(ds->j, "active", rv.active_job_uid, err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(ds->j, "active_state",
+                                    atlas_orch_state_name(rv.active_state), err);
+        }
+    }
+    return st;
+}
+
 /* --- dispatch.lease ---------------------------------------------------------- */
 
 static atlas_status method_dispatch_lease(dispatch_state *ds, const atlas_ipc_request *req,
@@ -661,6 +738,16 @@ static atlas_status method_dispatch_lease(dispatch_state *ds, const atlas_ipc_re
      * visible in the history. It is *not* an authorisation and nothing branches
      * on it; the uid decided that, above. */
     st = atlas_buf_set_str(&op->dispatcher_id, who, err);
+    if (st == ATLAS_OK) {
+        /* A11.1. A lease may name the one job it wants. Absent is A8's "give me
+         * whatever is next"; present is a run driver claiming its own run's
+         * active task and nothing else. The daemon still decides whether the
+         * named job is grantable — a name is a narrowing, never a permission. */
+        const char *want_job = NULL;
+        if (atlas_ipc_param_str(req, "job", &want_job) && want_job != NULL) {
+            st = atlas_buf_set_str(&op->job_uid, want_job, err);
+        }
+    }
     if (st == ATLAS_OK) {
         /* A netstring-encoded driver list, built with the typed writer like every
          * other list on this protocol. Absent means "any driver". */
@@ -841,6 +928,34 @@ static atlas_status method_dispatch_event(dispatch_state *ds, const atlas_ipc_re
     return st;
 }
 
+/* Decodes lowercase hex into bytes. Refuses anything that is not a pair of hex
+ * digits rather than skipping it: a manifest whose content field was half
+ * understood is one whose digest will not match, and saying so at the parse is
+ * clearer than saying so at the check. */
+static atlas_status unhex(const char *in, size_t len, atlas_buf *out, atlas_err *err) {
+    atlas_status st = atlas_buf_reserve(out, len / 2u + 1u, err);
+    for (size_t i = 0; st == ATLAS_OK && i + 1u < len + 1u && i < len; i += 2u) {
+        int hi = -1, lo = -1;
+        for (int k = 0; k < 2; k++) {
+            char c = in[i + (size_t)k];
+            int v = (c >= '0' && c <= '9')   ? c - '0'
+                    : (c >= 'a' && c <= 'f') ? c - 'a' + 10
+                                             : -1;
+            if (k == 0) {
+                hi = v;
+            } else {
+                lo = v;
+            }
+        }
+        if (hi < 0 || lo < 0) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE, "artifact content is not lowercase hex");
+        }
+        char byte = (char)((hi << 4) | lo);
+        st = atlas_buf_append(out, &byte, 1u, err);
+    }
+    return st;
+}
+
 static atlas_status method_dispatch_complete(dispatch_state *ds, const atlas_ipc_request *req,
                                              atlas_err *err) {
     atlas_status st = require_dispatcher(ds, err);
@@ -878,8 +993,38 @@ static atlas_status method_dispatch_complete(dispatch_state *ds, const atlas_ipc
         }
         op->failure_reason = op->success ? ATLAS_ORCH_REASON_WORKER_SUCCESS
                                          : ATLAS_ORCH_REASON_WORKER_FAILURE;
+        /* A11.1. A closed vocabulary again, and a deliberately short one: the
+         * three failures whose *kind* changes what the run does next. Anything
+         * else stays WORKER_FAILURE, which is the conservative reading — it
+         * retries within the task's own bound rather than ending the run.
+         *
+         * A worker cannot reach this. It is set by the run driver from its own
+         * gate execution and its own pinned-commit check, and there is no path
+         * from a model's output to any of these names. */
+        const char *why = NULL;
+        if (!op->success && atlas_ipc_param_str(req, "reason", &why) && why != NULL) {
+            static const atlas_orch_reason REASONS[] = {ATLAS_ORCH_REASON_VALIDATION_FAILED,
+                                                        ATLAS_ORCH_REASON_POLICY_REFUSED,
+                                                        ATLAS_ORCH_REASON_WALL_TIMEOUT};
+            for (size_t i = 0; i < sizeof REASONS / sizeof REASONS[0]; i++) {
+                if (strcmp(why, atlas_orch_reason_name(REASONS[i])) == 0) {
+                    op->failure_reason = REASONS[i];
+                    break;
+                }
+            }
+        }
+        (void)atlas_ipc_param_int(req, "failed_gate", &op->failed_gate);
+        const char *detail = NULL;
+        if (st == ATLAS_OK && atlas_ipc_param_str(req, "detail", &detail) && detail != NULL) {
+            /* UNTRUSTED_DATA, bounded here as well as at the write point. It is
+             * quoted into a follow-up task's text and read by nothing. */
+            size_t n = strlen(detail);
+            st = atlas_buf_set(&op->failure_detail, detail,
+                               n < ATLAS_ORCH_GATE_EXCERPT_MAX ? n : ATLAS_ORCH_GATE_EXCERPT_MAX,
+                               err);
+        }
         const char *dv = NULL;
-        if (atlas_ipc_param_str(req, "driver_version", &dv) && dv != NULL) {
+        if (st == ATLAS_OK && atlas_ipc_param_str(req, "driver_version", &dv) && dv != NULL) {
             st = atlas_buf_set_str(&op->driver_version, dv, err);
         }
     }
@@ -887,10 +1032,19 @@ static atlas_status method_dispatch_complete(dispatch_state *ds, const atlas_ipc
     /* The artifact manifest. Each entry is one string:
      * `<name>\x1f<kind>\x1f<sha256>\x1f<size>` — separated by a byte that cannot
      * occur in any of the fields, since a name is a safe relative path, a kind
-     * and a digest are names, and a size is decimal. Inline content is not
-     * carried here; the worker sends it separately for artifacts small enough to
-     * be worth storing, and everything else is described and left in the
-     * workspace.
+     * and a digest are names, and a size is decimal.
+     *
+     * A11.1 adds an optional fifth field, the content itself as lowercase hex.
+     * The A8 dispatcher never sends one: its artifacts live in a workspace it
+     * owns and Atlas describes them rather than holding them. The run driver has
+     * no workspace at all, so an artifact it does not carry inline is an
+     * artifact nobody can ever read — and "the worker's result survives a
+     * restart" is one of the things this milestone has to be able to show. Hex
+     * rather than raw bytes because the field is inside a unit-separated string
+     * and an artifact log contains arbitrary ones.
+     *
+     * Four fields and five are both valid, which is what keeps an A8 dispatcher
+     * speaking to an A11 daemon unchanged.
      *
      * There is deliberately no path field. An artifact is addressed by its
      * server-assigned id, never by a location a worker chose. */
@@ -915,20 +1069,20 @@ static atlas_status method_dispatch_complete(dispatch_state *ds, const atlas_ipc
                 }
                 atlas_orch_artifact_init(&op->artifacts[i]);
                 op->artifact_count = i + 1u;
-                const char *f[4] = {ent, NULL, NULL, NULL};
+                const char *f[5] = {ent, NULL, NULL, NULL, NULL};
                 size_t nf = 1;
-                for (const char *p = ent; *p != '\0' && nf < 4; p++) {
+                for (const char *p = ent; *p != '\0' && nf < 5; p++) {
                     if (*p == '\x1f') {
                         f[nf++] = p + 1;
                     }
                 }
-                if (nf != 4) {
+                if (nf < 4) {
                     st = atlas_err_set(err, ATLAS_ERR_USAGE,
                                        "artifact %zu is not a manifest entry", i);
                     break;
                 }
-                size_t lens[4];
-                for (size_t k = 0; k < 4; k++) {
+                size_t lens[5] = {0, 0, 0, 0, 0};
+                for (size_t k = 0; k < nf; k++) {
                     const char *sep = strchr(f[k], '\x1f');
                     lens[k] = sep != NULL ? (size_t)(sep - f[k]) : strlen(f[k]);
                 }
@@ -950,6 +1104,35 @@ static atlas_status method_dispatch_complete(dispatch_state *ds, const atlas_ipc
                         op->artifacts[i].size_bytes = strtoll(num, NULL, 10);
                     }
                 }
+                if (st == ATLAS_OK && nf == 5 && lens[4] > 0) {
+                    if (lens[4] % 2u != 0u || lens[4] / 2u > ATLAS_ORCH_ARTIFACT_INLINE_MAX) {
+                        st = atlas_err_set(err, ATLAS_ERR_USAGE,
+                                           "artifact %zu carries content Atlas will not store "
+                                           "inline",
+                                           i);
+                    } else {
+                        st = unhex(f[4], lens[4], &op->artifacts[i].content, err);
+                        if (st == ATLAS_OK) {
+                            /* The declared size must be the size of what
+                             * arrived. A manifest that describes one thing and
+                             * carries another is a record that cannot be
+                             * checked afterwards, and the digest is verified
+                             * against the bytes, not against the claim. */
+                            char hex[ATLAS_SHA256_HEX_LEN + 1u];
+                            atlas_sha256_hex(op->artifacts[i].content.data,
+                                             op->artifacts[i].content.len, hex);
+                            if ((int64_t)op->artifacts[i].content.len !=
+                                    op->artifacts[i].size_bytes ||
+                                strcmp(hex, atlas_buf_cstr(&op->artifacts[i].sha256)) != 0) {
+                                st = atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                                                   "artifact %zu does not match what it declares",
+                                                   i);
+                            } else {
+                                op->artifacts[i].content_stored = true;
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -964,6 +1147,20 @@ static atlas_status method_dispatch_complete(dispatch_state *ds, const atlas_ipc
     st = atlas_writer_orch(ds->ctx->writer, op, 10000, &r, err);
     if (st == ATLAS_OK) {
         st = write_job_summary(ds, &r, err);
+    }
+    /* A11.1. What the completion did to the run. Reported so the run driver can
+     * print it and stop; it decides nothing from these — the decision has
+     * already been taken, inside the transaction, by the daemon. */
+    if (st == ATLAS_OK && r.run_status != ATLAS_ORCH_RUN_UNKNOWN) {
+        st = atlas_json_key_str(ds->j, "run_status", atlas_orch_run_status_name(r.run_status),
+                                err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_int(ds->j, "worker_starts", r.worker_starts, err);
+        }
+        if (st == ATLAS_OK && r.follow_up_job_uid.len > 0) {
+            st = atlas_json_key_str(ds->j, "follow_up", atlas_buf_cstr(&r.follow_up_job_uid),
+                                    err);
+        }
     }
     atlas_orch_result_free(&r);
     return st;
@@ -1123,6 +1320,7 @@ static const atlas_method_entry ORCH_CLIENT_METHODS[] = {
     {"job.list", method_job_list},
     {"job.cancel", method_job_cancel},
     {"job.artifact", method_job_artifact},
+    {"job.run_status", method_run_get},
 };
 
 static const atlas_method_entry ORCH_DISPATCH_METHODS[] = {

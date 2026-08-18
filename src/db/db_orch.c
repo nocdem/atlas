@@ -79,6 +79,8 @@ atlas_orch_op *atlas_orch_op_new(atlas_orch_op_kind kind) {
     atlas_buf_init(&op->event_kind);
     atlas_buf_init(&op->event_payload);
     atlas_buf_init(&op->driver_version);
+    atlas_buf_init(&op->failure_detail);
+    op->failed_gate = -1;
     return op;
 }
 
@@ -95,6 +97,7 @@ void atlas_orch_op_free(atlas_orch_op *op) {
     atlas_buf_free(&op->event_kind);
     atlas_buf_free(&op->event_payload);
     atlas_buf_free(&op->driver_version);
+    atlas_buf_free(&op->failure_detail);
     for (size_t i = 0; i < op->artifact_count; i++) {
         atlas_orch_artifact_free(&op->artifacts[i]);
     }
@@ -116,6 +119,7 @@ void atlas_orch_result_init(atlas_orch_result *r) {
     atlas_buf_init(&r->task_text);
     atlas_buf_init(&r->allowed_paths);
     atlas_buf_init(&r->validations);
+    atlas_buf_init(&r->follow_up_job_uid);
 }
 
 void atlas_orch_result_free(atlas_orch_result *r) {
@@ -133,6 +137,7 @@ void atlas_orch_result_free(atlas_orch_result *r) {
     atlas_buf_free(&r->task_text);
     atlas_buf_free(&r->allowed_paths);
     atlas_buf_free(&r->validations);
+    atlas_buf_free(&r->follow_up_job_uid);
 }
 
 /* --- the job row ----------------------------------------------------------- */
@@ -791,6 +796,29 @@ static atlas_status submit_resolve_run(atlas_db *db, const atlas_orch_spec *s, c
 static atlas_status op_submit(atlas_db *db, const atlas_orch_op *op, atlas_orch_result *out,
                               atlas_err *err) {
     const atlas_orch_spec *s = &op->spec;
+
+    /* A11.1. A task that works in the registered repository's own tree declares
+     * at least one verification gate, or it is not created.
+     *
+     * The reason is what "accepted" would otherwise mean. A11.1 settles a run
+     * ACCEPTED when its task succeeded, and a task with no gates succeeds on the
+     * worker's process outcome alone — which is the one thing this repository
+     * has said since A8 is not a success claim. Without this check a caller
+     * could reach that by submitting a gateless repo-tree job directly, so the
+     * check is here, at the write point, and not only on the command that
+     * usually creates one. It is the same reasoning `atlas_verify_intake` uses
+     * for placing its refusals where the row is written rather than where the
+     * request arrives.
+     *
+     * A follow-up inherits its parent's list, so this is checked once per chain
+     * and satisfied by every task in it by construction. */
+    if (atlas_orch_driver_is_repo_tree(atlas_buf_cstr(&s->driver)) && s->validation_count == 0) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "a task that runs in the repository's own tree must declare at "
+                             "least one verification command; a run with none could only be "
+                             "accepted on a worker's exit code, which is not a success claim");
+    }
+
     char digest[65];
     atlas_status st = atlas_orch_spec_digest(s, digest, err);
     if (st != ATLAS_OK) {
@@ -983,9 +1011,16 @@ static atlas_status op_submit(atlas_db *db, const atlas_orch_op *op, atlas_orch_
      * legitimately: as the absence a creation moved out of. */
     {
         int64_t seq = 0;
+        /* A11.1. The actor the operation carried, and CLIENT when it carried
+         * none — which every request from the IPC edge does. A follow-up task
+         * is created by Atlas rather than by a client and its first ledger row
+         * says ATLAS, because reading it later as a submission somebody made is
+         * exactly the confusion the ledger exists to prevent. */
         st = record_transition(db, out->job_id, 0, ATLAS_ORCH_STATE_UNKNOWN,
                                ATLAS_ORCH_STATE_QUEUED, ATLAS_ORCH_REASON_SUBMITTED,
-                               ATLAS_ORCH_ACTOR_CLIENT, op->peer_uid, digest, &seq, err);
+                               op->actor != ATLAS_ORCH_ACTOR_UNKNOWN ? op->actor
+                                                                     : ATLAS_ORCH_ACTOR_CLIENT,
+                               op->peer_uid, digest, &seq, err);
         if (st != ATLAS_OK) {
             goto done;
         }
@@ -1123,24 +1158,45 @@ static atlas_status op_lease(atlas_db *db, const atlas_orch_op *op, atlas_orch_r
             return ds;
         }
     }
+    /* A11.1. A lease may name the job it wants.
+     *
+     * A8's dispatcher takes whatever is next, which is right for a queue it
+     * owns. A run driver is resuming one particular chain and must claim *that*
+     * run's active task or nothing — taking someone else's would start work the
+     * operator did not ask this invocation for. The two forms share the
+     * transaction, the attempt allocation and the lease, so there is still one
+     * grant path; what differs is which row it picks.
+     *
+     * Naming a job that is not QUEUED grants nothing and is not an error: it is
+     * the ordinary answer when another driver already holds it, and it is what
+     * makes "two concurrent drivers start one worker" fall out of the machine
+     * rather than out of a check. */
     static const char PICK[] =
         "SELECT id FROM orch_jobs WHERE state = 'QUEUED' AND cancel_requested = 0"
         " ORDER BY id;";
+    static const char PICK_ONE[] =
+        "SELECT id FROM orch_jobs WHERE job_uid = ?1 AND state = 'QUEUED'"
+        "  AND cancel_requested = 0;";
+    bool targeted = op->job_uid.len > 0;
     int64_t job_id = 0;
     {
         sqlite3_stmt *q = NULL;
-        atlas_status s = atlas_db_prepare(db, PICK, &q, err);
+        atlas_status s = atlas_db_prepare(db, targeted ? PICK_ONE : PICK, &q, err);
         if (s != ATLAS_OK) {
             atlas_orch_argv_free(&want[0]);
             return s;
         }
+        if (targeted) {
+            s = atlas_db_bind_text_opt(db, q, 1, atlas_buf_cstr(&op->job_uid), err);
+            if (s != ATLAS_OK) {
+                atlas_db_finish(db, q);
+                atlas_orch_argv_free(&want[0]);
+                return s;
+            }
+        }
         static const char DRV[] = "SELECT driver FROM orch_jobs WHERE id = ?1;";
         while (sqlite3_step(q) == SQLITE_ROW) {
             int64_t candidate = sqlite3_column_int64(q, 0);
-            if (want_n == 0 || want[0].count == 0) {
-                job_id = candidate;
-                break;
-            }
             sqlite3_stmt *dq = NULL;
             if (atlas_db_prepare(db, DRV, &dq, err) != ATLAS_OK) {
                 break;
@@ -1149,10 +1205,23 @@ static atlas_status op_lease(atlas_db *db, const atlas_orch_op *op, atlas_orch_r
             bool match = false;
             if (sqlite3_step(dq) == SQLITE_ROW) {
                 const char *drv = atlas_db_col_text(dq, 0);
-                for (size_t i = 0; i < want[0].count; i++) {
-                    if (strcmp(drv, atlas_buf_cstr(&want[0].args[i])) == 0) {
-                        match = true;
-                        break;
+                if (want_n == 0 || want[0].count == 0) {
+                    /* An unfiltered lease means "any", and A11.1 narrows what
+                     * "any" covers: never a driver that works in the registered
+                     * repository's own tree. The background dispatcher polls
+                     * exactly this way, and without the exclusion it would take
+                     * an A11 task, provision a workspace the driver does not
+                     * use, run it somewhere it was not meant to run, and
+                     * complete it — settling a run with no gate having run
+                     * where the changes are. Refusing at the grant covers every
+                     * dispatcher that exists and every one that might. */
+                    match = !atlas_orch_driver_is_repo_tree(drv);
+                } else {
+                    for (size_t i = 0; i < want[0].count; i++) {
+                        if (strcmp(drv, atlas_buf_cstr(&want[0].args[i])) == 0) {
+                            match = true;
+                            break;
+                        }
                     }
                 }
             }
@@ -1610,6 +1679,491 @@ static atlas_status op_event(atlas_db *db, const atlas_orch_op *op, atlas_orch_r
     out->cancel_requested = j.cancel_requested;
     return s;
 }
+/* --- A11.1: the run's own axis, settled here and nowhere else ----------------
+ *
+ * A11.0 left one question open on purpose: a run's status is its own axis, no
+ * task transition wrote it, and nothing in production produced ACCEPTED or
+ * BLOCKED. *Who may decide* was named as A11.1's question. This is the answer,
+ * and its shape is the answer's content.
+ *
+ * **Every settlement travels on a COMPLETE.** There is no `run.settle` RPC
+ * method, no MCP tool and no gateway route, and `atlas_db_orch_run_set_status`
+ * still has no standalone caller outside this file — so "a model payload cannot
+ * accept a run" stays true by absence rather than by a check. A run is settled
+ * in the same transaction as the task completion that justifies it, from facts
+ * this function reads: the state the task machine put the job in, the ledger's
+ * count of worker starts, and the repository identity checked again here.
+ *
+ * **A model's output reaches none of it.** The completion carries an exit
+ * classification Atlas computed and a gate verdict Atlas ran; the model's
+ * stdout, its result document, its prose and its exit code are evidence about a
+ * process, never a claim this branch reads. `op->failure_detail` is the single
+ * piece of untrusted text that survives, and it survives into exactly one
+ * place: quoted, labelled, into a follow-up task's text.
+ *
+ * **It is scoped to the drivers A11.1 dispatches.** A run whose task ran under
+ * an A8 workspace driver is not settled at all — nothing decided anything about
+ * it, and A11.0's statement still holds for it unchanged.
+ */
+
+/* How many worker starts this run has spent.
+ *
+ * Derived from the ledger and stored nowhere. RUNNING is the state the run
+ * driver records immediately *before* it execs, so the count is durable before
+ * the worker exists: a crash spends budget exactly as a finished run does, and
+ * a refusal that never reached a lease spends none — which is what makes
+ * retrying a `BUSY` safe rather than merely likely to be safe.
+ *
+ * A stored counter would be a second place for this to be true, and the two
+ * would disagree the first time a process died between the exec and the
+ * increment. */
+static atlas_status run_worker_starts(atlas_db *db, const char *run_uid, int64_t *out,
+                                      atlas_err *err) {
+    static const char SQL[] =
+        "SELECT COUNT(*) FROM orch_transitions t JOIN orch_jobs j ON j.id = t.job_id"
+        "  WHERE j.run_uid = ?1 AND t.to_state = 'RUNNING';";
+    *out = 0;
+    sqlite3_stmt *st = NULL;
+    atlas_status s = atlas_db_prepare(db, SQL, &st, err);
+    if (s != ATLAS_OK) {
+        return s;
+    }
+    s = atlas_db_bind_text_opt(db, st, 1, run_uid, err);
+    if (s == ATLAS_OK) {
+        int rc = sqlite3_step(st);
+        if (rc == SQLITE_ROW) {
+            *out = sqlite3_column_int64(st, 0);
+        } else if (rc != SQLITE_DONE) {
+            s = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot count a run's worker starts");
+        }
+    }
+    atlas_db_finish(db, st);
+    return s;
+}
+
+/* The columns a follow-up inherits verbatim, which `job_row` deliberately does
+ * not carry: they are large, they are UNTRUSTED_DATA, and every other reader of
+ * a job row needs none of them. */
+typedef struct job_spec_row {
+    int spec_version;
+    atlas_buf task_text;
+    atlas_buf allowed_paths;
+    atlas_buf validations;
+    atlas_buf correlation;
+} job_spec_row;
+
+static void job_spec_row_init(job_spec_row *r) {
+    memset(r, 0, sizeof(*r));
+    atlas_buf_init(&r->task_text);
+    atlas_buf_init(&r->allowed_paths);
+    atlas_buf_init(&r->validations);
+    atlas_buf_init(&r->correlation);
+}
+
+static void job_spec_row_free(job_spec_row *r) {
+    atlas_buf_free(&r->task_text);
+    atlas_buf_free(&r->allowed_paths);
+    atlas_buf_free(&r->validations);
+    atlas_buf_free(&r->correlation);
+}
+
+static atlas_status job_spec_by_uid(atlas_db *db, const char *uid, job_spec_row *out, bool *found,
+                                    atlas_err *err) {
+    static const char SQL[] =
+        "SELECT spec_version, task_text, allowed_paths, validations, correlation"
+        "  FROM orch_jobs WHERE job_uid = ?1;";
+    *found = false;
+    sqlite3_stmt *st = NULL;
+    atlas_status s = atlas_db_prepare(db, SQL, &st, err);
+    if (s != ATLAS_OK) {
+        return s;
+    }
+    s = atlas_db_bind_text_opt(db, st, 1, uid, err);
+    if (s == ATLAS_OK) {
+        int rc = sqlite3_step(st);
+        if (rc == SQLITE_ROW) {
+            out->spec_version = sqlite3_column_int(st, 0);
+            const void *blob = sqlite3_column_blob(st, 1);
+            int n = sqlite3_column_bytes(st, 1);
+            s = atlas_buf_set(&out->task_text, blob != NULL ? blob : "", (size_t)(n > 0 ? n : 0),
+                              err);
+            if (s == ATLAS_OK) {
+                s = atlas_buf_set_str(&out->allowed_paths, atlas_db_col_text(st, 2), err);
+            }
+            if (s == ATLAS_OK) {
+                s = atlas_buf_set_str(&out->validations, atlas_db_col_text(st, 3), err);
+            }
+            if (s == ATLAS_OK) {
+                s = atlas_buf_set_str(&out->correlation, atlas_db_col_text(st, 4), err);
+            }
+            *found = (s == ATLAS_OK);
+        } else if (rc != SQLITE_DONE) {
+            s = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot read a job specification");
+        }
+    }
+    atlas_db_finish(db, st);
+    return s;
+}
+
+/* Appends at most `cap` bytes of `text`, and says so when it stops.
+ *
+ * Truncation is never silent here: a follow-up task whose evidence stopped
+ * mid-sentence, with nothing saying it did, is a task told a shorter story than
+ * happened — the same complaint A5 makes about a clamped bound. */
+static atlas_status append_bounded(atlas_buf *out, const char *text, size_t len, size_t cap,
+                                   atlas_err *err) {
+    if (text == NULL) {
+        return ATLAS_OK;
+    }
+    size_t n = len < cap ? len : cap;
+    atlas_status s = atlas_buf_append(out, text, n, err);
+    if (s == ATLAS_OK && n < len) {
+        s = atlas_buf_appendf(out, err, "\n[... %zu further bytes not shown ...]\n", len - n);
+    }
+    return s;
+}
+
+/* Renders one stored validation command as the argv it is, for naming the gate
+ * that failed. The name comes from the job row and never from the caller: a
+ * completion supplies an *index*, so it cannot tell a follow-up that a gate the
+ * job never declared is the one to fix. */
+static atlas_status gate_name(const char *encoded, int64_t which, atlas_buf *out, atlas_err *err) {
+    atlas_orch_argv cmds[ATLAS_ORCH_MAX_VALIDATIONS];
+    for (size_t i = 0; i < ATLAS_ORCH_MAX_VALIDATIONS; i++) {
+        atlas_orch_argv_init(&cmds[i]);
+    }
+    size_t n = 0;
+    atlas_status s = atlas_orch_validations_decode(encoded, cmds, ATLAS_ORCH_MAX_VALIDATIONS, &n,
+                                                   err);
+    if (s == ATLAS_OK) {
+        if (which < 0 || (size_t)which >= n) {
+            s = atlas_err_set(err, ATLAS_ERR_USAGE,
+                              "the completion names validation command %lld; this job declared %zu",
+                              (long long)which, n);
+        } else {
+            for (size_t a = 0; s == ATLAS_OK && a < cmds[which].count; a++) {
+                s = atlas_buf_appendf(out, err, "%s%s", a > 0 ? " " : "",
+                                      atlas_buf_cstr(&cmds[which].args[a]));
+            }
+        }
+    }
+    for (size_t i = 0; i < ATLAS_ORCH_MAX_VALIDATIONS; i++) {
+        atlas_orch_argv_free(&cmds[i]);
+    }
+    return s;
+}
+
+/* The follow-up task's text.
+ *
+ * Deterministic, and assembled entirely from stored rows plus the one bounded
+ * excerpt the completion carried. It quotes the **root** task's goal rather than
+ * the immediate parent's, so a third-generation task states the same objective
+ * as the first rather than a summary of a summary — and so the text is a
+ * function of (root, parent, attempt) and nothing else, which is what lets the
+ * idempotency key be one too.
+ *
+ * The constraints are restated because they are the boundary of what the worker
+ * is being asked to do, and a task that carries the goal without them is a task
+ * that has been told to do anything. They are also enforced elsewhere and by
+ * other means — the gate is run by Atlas, the run is settled by Atlas, and a
+ * worker cannot reach either — so this is instruction, never enforcement. */
+static atlas_status follow_up_text(atlas_db *db, const job_row *parent, const job_spec_row *pspec,
+                                   const atlas_orch_op *op, const char *root_job_uid,
+                                   atlas_buf *out, atlas_err *err) {
+    job_spec_row root;
+    job_spec_row_init(&root);
+    bool found = false;
+    atlas_status s = job_spec_by_uid(db, root_job_uid, &root, &found, err);
+    if (s == ATLAS_OK && !found) {
+        s = atlas_err_set(err, ATLAS_ERR_INTEGRITY, "run root task %s is gone", root_job_uid);
+    }
+    /* The root of a chain is the run's root task; if this job *is* it, its own
+     * text is the goal. */
+    const atlas_buf *goal = found ? &root.task_text : &pspec->task_text;
+
+    if (s == ATLAS_OK) {
+        s = atlas_buf_set_str(out,
+                              "atlas-follow-up: the previous task in this run did not pass its "
+                              "verification gates.\n\n", err);
+    }
+    if (s == ATLAS_OK) {
+        s = atlas_buf_appendf(out, err, "original-goal:\n");
+    }
+    if (s == ATLAS_OK) {
+        s = append_bounded(out, goal->data, goal->len, ATLAS_ORCH_TASK_MAX / 4u, err);
+    }
+    if (s == ATLAS_OK) {
+        s = atlas_buf_appendf(out, err, "\n\nprevious-task: %s\nprevious-outcome: %s\n",
+                              parent->uid, atlas_orch_exit_kind_name(op->exit_kind));
+    }
+    if (s == ATLAS_OK && op->failed_gate >= 0) {
+        atlas_buf name = ATLAS_BUF_INIT;
+        s = gate_name(atlas_buf_cstr(&pspec->validations), op->failed_gate, &name, err);
+        if (s == ATLAS_OK) {
+            s = atlas_buf_appendf(out, err, "failed-gate: %s\n", atlas_buf_cstr(&name));
+        }
+        atlas_buf_free(&name);
+    }
+    if (s == ATLAS_OK && op->failure_detail.len > 0) {
+        s = atlas_buf_appendf(out, err, "gate-output (bounded excerpt, untrusted):\n");
+        if (s == ATLAS_OK) {
+            s = append_bounded(out, op->failure_detail.data, op->failure_detail.len,
+                               ATLAS_ORCH_GATE_EXCERPT_MAX, err);
+        }
+    }
+    if (s == ATLAS_OK) {
+        s = atlas_buf_appendf(
+            out, err,
+            "\nFix this failure and preserve the existing work in the tree.\n"
+            "Constraints:\n"
+            "- Work only inside the registered repository's own root.\n"
+            "- Do not commit, push, deploy, restart a daemon, or run any destructive git\n"
+            "  operation. Leave the working tree as you found it plus your changes.\n"
+            "- Do not change the acceptance rules or the verification gates.\n"
+            "- Report honestly. Your report is not an acceptance decision: Atlas runs the\n"
+            "  gates itself and settles this run itself.\n");
+    }
+    job_spec_row_free(&root);
+    return s;
+}
+
+/* Creates the run's next task.
+ *
+ * Through `op_submit` — the same write point, the same digest, the same
+ * idempotency table, the same four A11.0 refusals — because a second insert path
+ * would bypass exactly the checks a forger would want somewhere else. The parent
+ * is already terminal when this runs, which is what lets
+ * `idx_orch_jobs_one_active_per_run` accept the row.
+ *
+ * The idempotency key is derived from the failure it answers,
+ * `a11.<parent>.<attempt>`, so a resumed or replayed completion of the same
+ * attempt resolves to the task that already exists rather than making a second
+ * one. That is belt and braces over the transaction and the partial unique
+ * index; all three would have to fail together for a run to sprout two
+ * follow-ups for one failure. */
+static atlas_status spawn_follow_up(atlas_db *db, const atlas_orch_op *op, const job_row *parent,
+                                    int64_t attempt_no, const run_row *run,
+                                    atlas_orch_result *out, atlas_err *err) {
+    job_spec_row pspec;
+    job_spec_row_init(&pspec);
+    bool found = false;
+    atlas_status s = job_spec_by_uid(db, parent->uid, &pspec, &found, err);
+    if (s == ATLAS_OK && !found) {
+        s = atlas_err_set(err, ATLAS_ERR_INTEGRITY, "the completing job is gone");
+    }
+
+    atlas_orch_op *child = NULL;
+    if (s == ATLAS_OK) {
+        child = atlas_orch_op_new(ATLAS_ORCH_OP_SUBMIT);
+        if (child == NULL) {
+            s = atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory");
+        }
+    }
+    if (s == ATLAS_OK) {
+        atlas_orch_spec *cs = &child->spec;
+        /* Atlas is the actor. A follow-up is not a client submission and the
+         * ledger says so; the row's `submitter_uid` stays the parent's, because
+         * the task belongs to the same principal's work and the idempotency key
+         * is scoped to that principal. */
+        child->actor = ATLAS_ORCH_ACTOR_ATLAS;
+        child->peer_uid = parent->submitter_uid;
+        child->repo_id = parent->repo_id;
+        child->now_ms = op->now_ms;
+        cs->spec_version = pspec.spec_version;
+        cs->submitter_uid = parent->submitter_uid;
+        s = atlas_buf_set_str(&cs->repo_name, parent->repo_name, err);
+        if (s == ATLAS_OK) {
+            s = atlas_buf_set_str(&cs->repo_identity_hash, parent->repo_identity_hash, err);
+        }
+        /* The pinned commit is inherited, never re-resolved. A follow-up that
+         * looked HEAD up again would be authorised over whatever the tree had
+         * become, which is the one thing the pin exists to prevent. */
+        if (s == ATLAS_OK) {
+            s = atlas_buf_set_str(&cs->source_commit, parent->source_commit, err);
+        }
+        if (s == ATLAS_OK) {
+            s = atlas_buf_set_str(&cs->mode, parent->mode, err);
+        }
+        if (s == ATLAS_OK) {
+            s = atlas_buf_set_str(&cs->driver, parent->driver, err);
+        }
+        if (s == ATLAS_OK) {
+            s = atlas_buf_set_str(&cs->correlation, atlas_buf_cstr(&pspec.correlation), err);
+        }
+        if (s == ATLAS_OK) {
+            s = atlas_buf_set_str(&cs->parent_job_uid, parent->uid, err);
+        }
+        if (s == ATLAS_OK) {
+            s = atlas_buf_appendf(&cs->idempotency_key, err, "a11.%s.%lld", parent->uid,
+                                  (long long)attempt_no);
+        }
+        /* The gates are inherited **verbatim**. A follow-up cannot be given a
+         * shorter list than the task it follows, because it is not given a list
+         * at all — it is given the parent's, decoded and re-encoded by the same
+         * canonical functions. */
+        if (s == ATLAS_OK) {
+            s = atlas_orch_paths_decode(atlas_buf_cstr(&pspec.allowed_paths), cs->allowed_paths,
+                                        ATLAS_ORCH_MAX_ALLOWED_PATHS, &cs->allowed_path_count,
+                                        err);
+        }
+        if (s == ATLAS_OK) {
+            s = atlas_orch_validations_decode(atlas_buf_cstr(&pspec.validations), cs->validations,
+                                              ATLAS_ORCH_MAX_VALIDATIONS, &cs->validation_count,
+                                              err);
+        }
+        if (s == ATLAS_OK) {
+            cs->wall_timeout_ms = parent->wall_timeout_ms;
+            cs->idle_timeout_ms = parent->idle_timeout_ms;
+            cs->max_attempts = parent->max_attempts;
+            cs->max_output_bytes = parent->max_output_bytes;
+            cs->max_artifact_bytes = parent->max_artifact_bytes;
+            cs->max_artifact_count = parent->max_artifact_count;
+            s = follow_up_text(db, parent, &pspec, op, run->root_job_uid, &cs->task_text, err);
+        }
+        /* Validated exactly as a client's specification is. A follow-up that
+         * could not be submitted through the front door is one Atlas will not
+         * create through the back one. */
+        if (s == ATLAS_OK) {
+            s = atlas_orch_spec_validate(cs, err);
+        }
+    }
+
+    atlas_orch_result cres;
+    atlas_orch_result_init(&cres);
+    if (s == ATLAS_OK) {
+        s = op_submit(db, child, &cres, err);
+    }
+    if (s == ATLAS_OK) {
+        s = atlas_buf_set(&out->follow_up_job_uid, cres.job_uid.data, cres.job_uid.len, err);
+    }
+    atlas_orch_result_free(&cres);
+    atlas_orch_op_free(child);
+    free(child);
+    job_spec_row_free(&pspec);
+    return s;
+}
+
+
+
+/* What this completion did to the run, and the whole of A11.1's authority.
+ *
+ * Three answers, in this order, and the order is the argument:
+ *
+ *   1. **The run is already terminal.** Nothing happens. A settled run is
+ *      final in both directions and takes no further task; a completion that
+ *      arrives afterwards is recorded against its job and changes nothing else.
+ *   2. **The task succeeded.** ACCEPTED, but only after the repository identity
+ *      is checked *again*, here, at the moment of settlement. It was checked at
+ *      lease time and that is not the same claim: a repository re-registered or
+ *      replaced between the grant and now is not the repository the work was
+ *      authorised over, and accepting a run over it would be accepting work
+ *      against something else. When it fails, the run is BLOCKED rather than
+ *      accepted — the honest answer, because Atlas cannot tell what the worker
+ *      changed and where.
+ *   3. **The task ended some other way.** If the budget is spent, or the ending
+ *      is one no follow-up can help — cancellation, or an ambiguous recovery —
+ *      the run is BLOCKED. Otherwise the run stays ACTIVE and gets exactly one
+ *      new task.
+ *
+ * A task that went back to the queue for another attempt is none of these: the
+ * run is still ACTIVE with an active task in it, and there is nothing to decide.
+ *
+ * **Success is the task machine's word, not the worker's.** `to` is what
+ * `atlas_orch_transition_allowed` and the branch above produced from an exit
+ * classification Atlas computed and a gate verdict Atlas ran. Nothing the model
+ * wrote is read here, and there is no field on the operation through which it
+ * could be. */
+static atlas_status settle_run_after_complete(atlas_db *db, const atlas_orch_op *op,
+                                              const job_row *j, atlas_orch_state to,
+                                              int64_t attempt_no, int64_t starts,
+                                              atlas_orch_result *out, atlas_err *err) {
+    run_row r;
+    bool found = false;
+    atlas_status s = run_by_uid(db, j->run_uid, &r, &found, err);
+    if (s != ATLAS_OK) {
+        return s;
+    }
+    if (!found) {
+        return atlas_err_set(err, ATLAS_ERR_INTEGRITY, "job %s names a run that does not exist",
+                             j->uid);
+    }
+    out->run_status = r.status;
+    if (atlas_orch_run_status_is_terminal(r.status) || !atlas_orch_state_is_terminal(to)) {
+        return ATLAS_OK;
+    }
+
+    atlas_orch_run_status want = ATLAS_ORCH_RUN_UNKNOWN;
+    if (to == ATLAS_ORCH_STATE_SUCCEEDED) {
+        atlas_buf identity = ATLAS_BUF_INIT;
+        atlas_repo_info ri;
+        atlas_repo_info_init(&ri);
+        bool repo_ok = false;
+        if (atlas_db_repo_get(db, j->repo_name, &ri, &repo_ok, err) == ATLAS_OK && repo_ok) {
+            if (atlas_db_repo_identity_hash(db, ri.id, &identity, err) == ATLAS_OK) {
+                repo_ok = strcmp(atlas_buf_cstr(&identity), j->repo_identity_hash) == 0;
+            } else {
+                repo_ok = false;
+            }
+        }
+        atlas_buf_free(&identity);
+        atlas_repo_info_free(&ri);
+        atlas_err_init(err);
+        want = repo_ok ? ATLAS_ORCH_RUN_ACCEPTED : ATLAS_ORCH_RUN_BLOCKED;
+    } else if (op->failure_reason == ATLAS_ORCH_REASON_POLICY_REFUSED ||
+               to == ATLAS_ORCH_STATE_CANCELLED ||
+               to == ATLAS_ORCH_STATE_RECOVERY_REQUIRED) {
+        /* Neither is a failure a narrower task can answer. Cancellation was
+         * asked for, and RECOVERY_REQUIRED is Atlas saying it does not know
+         * what ran — starting more work on top of that is the opposite of what
+         * the state means. */
+        want = ATLAS_ORCH_RUN_BLOCKED;
+    } else if (starts >= ATLAS_ORCH_RUN_MAX_WORKER_STARTS) {
+        want = ATLAS_ORCH_RUN_BLOCKED;
+    }
+
+    if (want != ATLAS_ORCH_RUN_UNKNOWN) {
+        s = atlas_db_orch_run_set_status(db, r.run_uid, ATLAS_ORCH_RUN_ACTIVE, want, err);
+        if (s == ATLAS_OK) {
+            out->run_status = want;
+        }
+        return s;
+    }
+
+    /* One follow-up, in this transaction, with the parent already terminal —
+     * which is what lets `idx_orch_jobs_one_active_per_run` accept it. */
+    s = spawn_follow_up(db, op, j, attempt_no, &r, out, err);
+    if (s == ATLAS_OK) {
+        out->run_status = ATLAS_ORCH_RUN_ACTIVE;
+    }
+    return s;
+}
+
+/* A11.1. What recovery does to a run.
+ *
+ * Recovery is Atlas saying, in the state's own words, that it does not know
+ * what ran. When that ends a task in a run this milestone drives, the run is
+ * BLOCKED: starting a fresh worker on top of a tree an unknown process may have
+ * been half-way through editing is the opposite of what RECOVERY_REQUIRED
+ * means, and leaving the run ACTIVE with no task in it would be a chain that
+ * can never be resumed and never says why.
+ *
+ * A recovery that merely re-queued the task settles nothing — the run still has
+ * an active task and the ordinary path will reach it. */
+static atlas_status run_blocked_by_recovery(atlas_db *db, const job_row *j, atlas_orch_state to,
+                                            atlas_err *err) {
+    if (j->run_uid[0] == '\0' || !atlas_orch_driver_is_repo_tree(j->driver) ||
+        !atlas_orch_state_is_terminal(to)) {
+        return ATLAS_OK;
+    }
+    run_row r;
+    bool found = false;
+    atlas_status s = run_by_uid(db, j->run_uid, &r, &found, err);
+    if (s != ATLAS_OK || !found || atlas_orch_run_status_is_terminal(r.status)) {
+        return s;
+    }
+    return atlas_db_orch_run_set_status(db, r.run_uid, ATLAS_ORCH_RUN_ACTIVE,
+                                        ATLAS_ORCH_RUN_BLOCKED, err);
+}
 
 /* --- COMPLETE ---------------------------------------------------------------
  *
@@ -1752,6 +2306,21 @@ static atlas_status op_complete(atlas_db *db, const atlas_orch_op *op, atlas_orc
         }
     }
 
+    /* A11.1. Whether this task belongs to a chain this milestone drives, and
+     * how much of that chain's budget is already spent. Both are read *before*
+     * the transition is decided, because the budget is one of the things that
+     * decides it: a run with nothing left must not be handed a task that goes
+     * back to the queue for an attempt nobody may start. */
+    bool in_run = j.run_uid[0] != '\0' && atlas_orch_driver_is_repo_tree(j.driver);
+    int64_t starts = 0;
+    if (in_run) {
+        s = run_worker_starts(db, j.run_uid, &starts, err);
+        if (s != ATLAS_OK) {
+            return s;
+        }
+        out->worker_starts = starts;
+    }
+
     /* Cancellation wins. A completion that arrives after an operator asked to
      * cancel is refused as a success and the job settles as CANCELLED — the
      * transition table has no CANCEL_REQUESTED to SUCCEEDED edge, so this is
@@ -1764,9 +2333,30 @@ static atlas_status op_complete(atlas_db *db, const atlas_orch_op *op, atlas_orc
     } else if (op->success) {
         to = ATLAS_ORCH_STATE_SUCCEEDED;
         reason = ATLAS_ORCH_REASON_WORKER_SUCCESS;
-    } else if (lr.attempt_no < j.max_attempts) {
+    } else if (in_run && op->failure_reason == ATLAS_ORCH_REASON_VALIDATION_FAILED) {
+        /* A11.1. A gate failure is deterministic: the same task over the same
+         * tree fails the same gate again, so another attempt at it is not a
+         * retry, it is the same thing twice. The run's answer to a failed gate
+         * is a *different, narrower task*, which is created below.
+         *
+         * This is why the retry branch and the follow-up branch are not one
+         * mechanism. A crashed worker says nothing about the task; a failed
+         * gate says something specific about it. */
+        to = ATLAS_ORCH_STATE_FAILED;
+        reason = ATLAS_ORCH_REASON_VALIDATION_FAILED;
+    } else if (in_run && op->failure_reason == ATLAS_ORCH_REASON_POLICY_REFUSED) {
+        /* A11.1. The run driver refused to start, or refused to judge what it
+         * started, because the repository is not where the task was pinned. No
+         * retry answers that and no narrower task answers it either: the tree
+         * the work was authorised over is not the tree that is there. It ends
+         * the task, and below it ends the run. */
+        to = ATLAS_ORCH_STATE_FAILED;
+        reason = ATLAS_ORCH_REASON_POLICY_REFUSED;
+    } else if (lr.attempt_no < j.max_attempts &&
+               (!in_run || starts < ATLAS_ORCH_RUN_MAX_WORKER_STARTS)) {
         /* Bounded retry with a recorded reason, and never an infinite loop: the
-         * attempt counter is the bound and it only goes up. */
+         * attempt counter is the bound and it only goes up. A11.1 adds the
+         * run's own bound beside it, and the tighter of the two wins. */
         to = ATLAS_ORCH_STATE_QUEUED;
         reason = ATLAS_ORCH_REASON_RETRY;
     } else {
@@ -1791,6 +2381,9 @@ static atlas_status op_complete(atlas_db *db, const atlas_orch_op *op, atlas_orc
         s = release_lease(db, lr.attempt_id, atlas_orch_reason_name(reason), err);
     }
     out->state = to;
+    if (s == ATLAS_OK && in_run) {
+        s = settle_run_after_complete(db, op, &j, to, lr.attempt_no, starts, out, err);
+    }
     return s;
 }
 
@@ -1910,6 +2503,10 @@ static atlas_status op_recover(atlas_db *db, const atlas_orch_op *op, atlas_orch
         if (s != ATLAS_OK) {
             return s;
         }
+        s = run_blocked_by_recovery(db, &j, to, err);
+        if (s != ATLAS_OK) {
+            return s;
+        }
         out->expired++;
         if (to == ATLAS_ORCH_STATE_QUEUED) {
             out->retried++;
@@ -1950,6 +2547,10 @@ static atlas_status op_recover(atlas_db *db, const atlas_orch_op *op, atlas_orch
             }
             s = transition(db, &j, 0, ATLAS_ORCH_STATE_TIMED_OUT, ATLAS_ORCH_REASON_WALL_TIMEOUT,
                            ATLAS_ORCH_ACTOR_ATLAS, 0, "the job was never leased", NULL, err);
+            if (s != ATLAS_OK) {
+                return s;
+            }
+            s = run_blocked_by_recovery(db, &j, ATLAS_ORCH_STATE_TIMED_OUT, err);
             if (s != ATLAS_OK) {
                 return s;
             }

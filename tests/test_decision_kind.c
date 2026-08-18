@@ -330,6 +330,21 @@ static void wind_back_to_schema_12(env *e, atlas_err *err) {
         "ALTER TABLE sem_generations DROP COLUMN discovery;"
         "ALTER TABLE sem_generations DROP COLUMN input_count;"
         "ALTER TABLE sem_generations DROP COLUMN scope_excluded;"
+        /* A11.0's run, added by migration 21, for exactly the reason every line
+         * above it is here: a rewind that leaves a later migration's table
+         * behind is not a database at the version it claims, and migration 21
+         * then fails on `table orch_runs already exists`. `orch_jobs` itself
+         * belongs to migration 8 and correctly survives a rewind to twelve, but
+         * the column and the index migration 21 added to it do not.
+         *
+         * This line was missing from A11.0 and the failure it caused was real:
+         * the case below could not reach migration 13's assertions at all. It is
+         * the cost of the discipline the comment above states — a new table
+         * means a line here — being obeyed by hand. */
+        "DROP TABLE orch_runs;"
+        "DROP INDEX idx_orch_jobs_one_active_per_run;"
+        "DROP INDEX idx_orch_jobs_run;"
+        "ALTER TABLE orch_jobs DROP COLUMN run_uid;"
         "DELETE FROM schema_migrations WHERE version >= 13;";
 
     T_OK(atlas_db_exec_sql(e->db, BACK_DOCUMENTS, err), err);

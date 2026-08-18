@@ -57,6 +57,10 @@ void atlas_cli_print_help(FILE *out) {
         "commands:\n"
         "  job submit --repo NAME --task TEXT [--driver D] [--mode M]\n"
         "                            [--idempotency-key K] [--attempts N]\n"
+        "  job run --repo NAME --task TEXT --gate CMD [--gate CMD]...\n"
+        "                            start one run and drive it in the foreground\n"
+        "  job run --resume RUN      continue a run that already exists\n"
+        "  job run-status RUN        what a run is waiting on, and how it ended\n"
         "  job get|cancel JOB        read or cancel one job\n"
         "  job list                  jobs this principal submitted\n"
         "  dispatcher run [--once]   run the job dispatcher (as atlas-worker)\n"
@@ -503,6 +507,24 @@ static atlas_status parse_args(cli_state *st, int argc, char **argv, bool *want_
                 } else {
                     st->opts.job.attempts = strtol(v, NULL, 10);
                 }
+            } else if (strcmp(a, "--gate") == 0) {
+                /* Repeatable, and bounded at the point of parsing rather than
+                 * later: a ninth gate is refused with the bound named, never
+                 * dropped. A11.1 fixes this list on the root task and every
+                 * follow-up inherits it unchanged. */
+                if (i + 1 >= argc) {
+                    return atlas_err_set(err, ATLAS_ERR_USAGE, "--gate needs a command");
+                }
+                if (st->opts.job.gate_count >= 8u) {
+                    return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                         "a run may declare at most 8 gates");
+                }
+                st->opts.job.gates[st->opts.job.gate_count++] = argv[++i];
+            } else if (strcmp(a, "--resume") == 0) {
+                if (i + 1 >= argc) {
+                    return atlas_err_set(err, ATLAS_ERR_USAGE, "--resume needs a run identifier");
+                }
+                st->opts.job.resume = argv[++i];
             } else if (strcmp(a, "--once") == 0) {
                 st->opts.job.once = true;
             } else if (strcmp(a, "--title") == 0 || strcmp(a, "--context") == 0 ||
@@ -3162,7 +3184,8 @@ static atlas_status run_job(cli_state *st, atlas_renderer *r, int64_t limit, atl
     const char *sub = st->operand_count > 0 ? st->operands[0] : NULL;
     if (sub == NULL) {
         return atlas_err_set(err, ATLAS_ERR_USAGE,
-                             "atlas job <submit|get|list|cancel> (try: atlas help)");
+                             "atlas job <submit|run|run-status|get|list|cancel> "
+                             "(try: atlas help)");
     }
     job_render_ctx jc = {r};
     atlas_status result;
@@ -3193,6 +3216,36 @@ static atlas_status run_job(cli_state *st, atlas_renderer *r, int64_t limit, atl
         result = renderer_open(r, st->opts.json, st->out, "job cancel", err);
         if (result == ATLAS_OK) {
             result = atlas_service_job_cancel(NULL, job, emit_job, &jc, err);
+        }
+    } else if (strcmp(sub, "run") == 0) {
+        /* A11.1. The one surface that starts a worker, and it is in the
+         * foreground because an operator asked for it in this terminal. It
+         * schedules nothing and leaves nothing running behind it. */
+        atlas_job_run_opts o;
+        memset(&o, 0, sizeof(o));
+        o.repo = st->opts.job.repo;
+        o.task = st->opts.job.task;
+        o.resume = st->opts.job.resume;
+        o.mode = st->opts.job.mode;
+        o.driver = st->opts.job.driver;
+        o.idempotency_key = st->opts.job.key;
+        o.wall_timeout_ms = st->opts.job.wall_ms;
+        o.idle_timeout_ms = st->opts.job.idle_ms;
+        for (size_t g = 0; g < st->opts.job.gate_count; g++) {
+            o.gates[o.gate_count++] = st->opts.job.gates[g];
+        }
+        /* The narration goes to stderr, so `--json` still puts exactly one
+         * document on stdout. */
+        o.log = st->opts.json ? stderr : st->out;
+        result = renderer_open(r, st->opts.json, st->out, "job run", err);
+        if (result == ATLAS_OK) {
+            result = atlas_service_job_run(NULL, &o, emit_job, &jc, err);
+        }
+    } else if (strcmp(sub, "run-status") == 0) {
+        const char *run = st->operand_count > 1 ? st->operands[1] : NULL;
+        result = renderer_open(r, st->opts.json, st->out, "job run-status", err);
+        if (result == ATLAS_OK) {
+            result = atlas_service_job_run_status(NULL, run, emit_job, &jc, err);
         }
     } else if (strcmp(sub, "list") == 0) {
         result = renderer_open(r, st->opts.json, st->out, "job list", err);

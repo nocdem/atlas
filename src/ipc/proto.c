@@ -344,3 +344,7 @@ bool atlas_ipc_param_bool(const atlas_ipc_request *req, const char *key, bool *o
     *out = yyjson_get_bool(v);
     return true;
 }
+
+bool atlas_ipc_message_is_busy(const char *message) {
+    return message != NULL && strstr(message, ATLAS_IPC_BUSY_TOKEN) != NULL;
+}

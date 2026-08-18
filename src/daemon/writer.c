@@ -23,6 +23,7 @@
 #include "atlas/safetext.h"
 #include "atlas/maintenance.h"
 #include "atlas/ops.h"
+#include "atlas/ipc.h"
 #include "atlas/sem_discover.h"
 #include "atlas/sem.h"
 #include "atlas/sem_ops.h"
@@ -247,7 +248,8 @@ static bool queue_remove(atlas_writer *w, const atlas_job *j) {
  * and a caller cannot infer it from a status code, so it is said. The two
  * messages are never merged. */
 static const char WRITER_BUSY_MSG[] =
-    "BUSY: the Atlas daemon is performing semantic maintenance and cannot take this write yet. "
+    ATLAS_IPC_BUSY_TOKEN
+    " the Atlas daemon is performing semantic maintenance and cannot take this write yet. "
     "Nothing was queued and nothing will run, so the request may be sent again.";
 
 /* A9.2.6. Whether a job of this kind has a duration Atlas can state.
@@ -1824,6 +1826,8 @@ atlas_status atlas_writer_orch(atlas_writer *w, atlas_orch_op *op, int timeout_m
         result->retried = j->orch_result.retried;
         result->timed_out = j->orch_result.timed_out;
         result->recovered = j->orch_result.recovered;
+        result->run_status = j->orch_result.run_status;
+        result->worker_starts = j->orch_result.worker_starts;
         memcpy(result->spec_digest, j->orch_result.spec_digest, sizeof(result->spec_digest));
         struct {
             atlas_buf *to;
@@ -1839,6 +1843,14 @@ atlas_status atlas_writer_orch(atlas_writer *w, atlas_orch_op *op, int timeout_m
             {&result->task_text, &j->orch_result.task_text},
             {&result->allowed_paths, &j->orch_result.allowed_paths},
             {&result->validations, &j->orch_result.validations},
+            /* A11.0/A11.1. The run the operation settled, the task it created,
+             * and what the run now is. Copied here for the reason every line
+             * above it is: this is the boundary between the writer thread's
+             * result and the caller's, and a field that is not on this list
+             * reaches a socket client as an absent key however carefully the
+             * write point filled it in. */
+            {&result->run_uid, &j->orch_result.run_uid},
+            {&result->follow_up_job_uid, &j->orch_result.follow_up_job_uid},
         };
         for (size_t i = 0; st == ATLAS_OK && i < sizeof copies / sizeof copies[0]; i++) {
             st = atlas_buf_set(copies[i].to, copies[i].from->data, copies[i].from->len, err);

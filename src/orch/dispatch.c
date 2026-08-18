@@ -35,6 +35,7 @@
 
 #include "atlas/atlas.h"
 #include "atlas/driver.h"
+#include "atlas/validate.h"
 #include "atlas/ipc.h"
 #include "atlas/orch.h"
 #include "atlas/orchpolicy.h"
@@ -354,33 +355,25 @@ static void emit_event(attempt *a, const char *kind, const char *payload) {
 
 /* --- validation commands ----------------------------------------------------
  *
- * Structured argv, an exact working directory, a clean environment, and bounded
- * output. There is no shell anywhere on this path: `atlas_proc_run` execve's an
- * argument vector, and a validation command is a vector of counted arguments all
- * the way from the job specification.
- *
- * argv[0] is resolved against a fixed allowlist rather than against PATH, so a
- * job cannot name an arbitrary program and a `PATH` a driver planted in the
- * workspace cannot select one. */
-static const char *const VALIDATION_PROGRAMS[] = {"make", "sh-free-placeholder"};
-
-static bool validation_program_allowed(const char *name) {
-    /* Deliberately tiny, and deliberately not containing a shell. A deployment
-     * that needs another program adds it here, in the binary, rather than in a
-     * job — which is the difference between an operator's decision and a
-     * submitter's. */
-    (void)VALIDATION_PROGRAMS;
-    static const char *const ALLOWED[] = {"make", "ctest", "cmake", "true", "false"};
-    for (size_t i = 0; i < sizeof ALLOWED / sizeof ALLOWED[0]; i++) {
-        if (strcmp(name, ALLOWED[i]) == 0) {
-            return true;
-        }
-    }
-    return false;
+ * The running of them is `atlas_validations_run`, shared with A11.1's run driver.
+ * What is local to the dispatcher is where the evidence goes: one redacted log
+ * per command, inside the attempt's workspace. */
+static atlas_status validation_log(size_t index, const atlas_buf *redacted, void *ud,
+                                   atlas_err *err) {
+    atlas_ws *ws = ud;
+    char rel[64];
+    (void)snprintf(rel, sizeof rel, "tests/validation-%zu.log", index);
+    /* Evidence is stored whatever the outcome, and a workspace that will not
+     * take it does not fail the attempt: the gate's verdict is the answer, and
+     * losing the log of it is worse reported than fatal. */
+    atlas_err ignore;
+    atlas_err_init(&ignore);
+    (void)atlas_ws_write(ws, rel, redacted->data, redacted->len, &ignore);
+    (void)err;
+    return ATLAS_OK;
 }
 
-static atlas_status run_validations(attempt *a, const atlas_ws *ws, bool *passed, atlas_err *err) {
-    *passed = true;
+static atlas_status run_validations(attempt *a, atlas_ws *ws, bool *passed, atlas_err *err) {
     atlas_orch_argv cmds[ATLAS_ORCH_MAX_VALIDATIONS];
     for (size_t i = 0; i < ATLAS_ORCH_MAX_VALIDATIONS; i++) {
         atlas_orch_argv_init(&cmds[i]);
@@ -388,72 +381,26 @@ static atlas_status run_validations(attempt *a, const atlas_ws *ws, bool *passed
     size_t n = 0;
     atlas_status st = atlas_orch_validations_decode(atlas_buf_cstr(&a->validations), cmds,
                                                     ATLAS_ORCH_MAX_VALIDATIONS, &n, err);
-    for (size_t i = 0; st == ATLAS_OK && i < n && *passed; i++) {
-        const char *prog = atlas_buf_cstr(&cmds[i].args[0]);
-        if (!validation_program_allowed(prog)) {
-            *passed = false;
-            emit_event(a, "validation", "refused: program is not on the allowlist");
-            break;
-        }
-        atlas_buf exe = ATLAS_BUF_INIT;
-        st = atlas_proc_which(prog, "/usr/local/bin:/usr/bin:/bin", &exe, err);
-        if (st != ATLAS_OK) {
-            *passed = false;
-            atlas_buf_free(&exe);
-            break;
-        }
-        const char *argv[ATLAS_ORCH_MAX_ARGV + 2u];
-        size_t k = 0;
-        argv[k++] = atlas_buf_cstr(&exe);
-        for (size_t v = 1; v < cmds[i].count; v++) {
-            argv[k++] = atlas_buf_cstr(&cmds[i].args[v]);
-        }
-        argv[k] = NULL;
-
-        /* A clean, explicitly built environment. Nothing inherited: no SSH
-         * agent, no sudo askpass, no credential, no operator configuration. */
-        static const char *const ENV[] = {"PATH=/usr/local/bin:/usr/bin:/bin", "LC_ALL=C",
-                                          "LANG=C", "TZ=UTC", NULL};
-        atlas_buf out = ATLAS_BUF_INIT;
-        atlas_buf errout = ATLAS_BUF_INIT;
-        atlas_proc_opts opts;
-        memset(&opts, 0, sizeof(opts));
-        opts.argv = argv;
-        opts.env = ENV;
-        opts.cwd = atlas_buf_cstr(&ws->work);
-        opts.timeout_ms = (int)a->wall_timeout_ms;
-        opts.idle_timeout_ms = (int)a->idle_timeout_ms;
-        opts.max_stdout = (size_t)a->max_output_bytes;
-        opts.max_stderr = 256u * 1024u;
-        opts.cancel = driver_should_stop;
-        opts.cancel_ud = a;
-        atlas_proc_result pr;
-        memset(&pr, 0, sizeof(pr));
-        atlas_status rs = atlas_proc_run(&opts, atlas_proc_sink_buf, &out, &errout, &pr, err);
-
-        /* Evidence is stored whatever the outcome; a failed validation's output
-         * is the only account of why it failed. */
-        char rel[64];
-        (void)snprintf(rel, sizeof rel, "tests/validation-%zu.log", i);
-        atlas_err ignore;
-        atlas_err_init(&ignore);
-        /* Redacted like every other captured stream. A validation command's
-         * output is as likely to echo an environment as a driver's is. */
-        atlas_buf clean = ATLAS_BUF_INIT;
-        if (atlas_ws_redact(out.data != NULL ? out.data : "", out.len, &clean, NULL, &ignore) ==
-            ATLAS_OK) {
-            (void)atlas_ws_write(ws, rel, clean.data, clean.len, &ignore);
-        }
-        atlas_buf_free(&clean);
-
-        if (rs != ATLAS_OK || pr.exit_code != 0 || pr.timed_out || pr.idle_timed_out) {
-            *passed = false;
-            atlas_err_init(err);
-        }
-        atlas_buf_free(&out);
-        atlas_buf_free(&errout);
-        atlas_buf_free(&exe);
+    atlas_validation_result gr;
+    atlas_validation_result_init(&gr);
+    if (st == ATLAS_OK) {
+        atlas_validation_opts o;
+        memset(&o, 0, sizeof(o));
+        o.cwd = atlas_buf_cstr(&ws->work);
+        o.wall_timeout_ms = a->wall_timeout_ms;
+        o.idle_timeout_ms = a->idle_timeout_ms;
+        o.max_output_bytes = a->max_output_bytes;
+        o.cancel = driver_should_stop;
+        o.cancel_ud = a;
+        o.log = validation_log;
+        o.log_ud = ws;
+        st = atlas_validations_run(cmds, n, &o, &gr, err);
     }
+    *passed = st == ATLAS_OK && gr.passed;
+    if (st == ATLAS_OK && !gr.passed && gr.failed_index >= 0) {
+        emit_event(a, "validation", "a declared validation command did not pass");
+    }
+    atlas_validation_result_free(&gr);
     for (size_t i = 0; i < ATLAS_ORCH_MAX_VALIDATIONS; i++) {
         atlas_orch_argv_free(&cmds[i]);
     }

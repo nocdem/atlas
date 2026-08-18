@@ -1051,6 +1051,17 @@ typedef struct atlas_job_render {
     int64_t seq;
     bool cancel_requested;
     bool duplicate;
+    /* A11.0/A11.1. The run this job belongs to, and — for `job run` — what the
+     * invocation did to it. All are NULL or zero when they do not apply; a
+     * renderer prints what is present and infers nothing from what is not. */
+    const char *run;
+    const char *run_status;
+    const char *follow_up;
+    int64_t worker_starts;
+    int64_t tasks;
+    /* The run's active task was already held, so nothing was started. Neither
+     * an acceptance nor a refusal: the run stays ACTIVE and resumable. */
+    bool busy;
     /* True for `job get`, which prints every field; false for a list row. */
     bool detail;
     /* True only when this row is being emitted inside a `jobs` array. The JSON
@@ -1071,7 +1082,39 @@ typedef struct atlas_job_submit_opts {
     int64_t wall_timeout_ms;
     int64_t idle_timeout_ms;
     int64_t max_attempts;
+    /* A11.1. The verification gates, fixed here — at the root task's submission
+     * — and inherited verbatim by every follow-up in the run. Each is a command
+     * line split on ASCII spaces and **never by a shell**: there is no quoting,
+     * no expansion and no way to express an argument containing a space, which
+     * is deliberate. `argv[0]` must still be on the binary's own allowlist.
+     *
+     * A worker cannot add, remove or weaken one. It never sees this structure,
+     * the daemon stores what arrives here on the job row, and a follow-up's list
+     * is copied from its parent's rather than supplied. */
+    const char *gates[8];
+    size_t gate_count;
 } atlas_job_submit_opts;
+
+/* A11.1. `atlas job run`: submit a root task and drive its run to a settled
+ * answer, or resume one that already exists.
+ *
+ * Exactly one of `repo`+`task` (start) and `resume` (continue) is given. There
+ * is no form that names a job: which task is next is the run's answer, not the
+ * caller's. */
+typedef struct atlas_job_run_opts {
+    const char *repo;
+    const char *task;
+    const char *resume;
+    const char *mode;
+    const char *driver;
+    const char *idempotency_key;
+    int64_t wall_timeout_ms;
+    int64_t idle_timeout_ms;
+    const char *gates[8];
+    size_t gate_count;
+    /* Where the driver narrates what it is doing. NULL is silent. */
+    FILE *log;
+} atlas_job_run_opts;
 
 /* Receives one job. A callback rather than a renderer, because the service
  * layer never formats output and must not know that renderers exist — the
@@ -1088,6 +1131,20 @@ atlas_status atlas_service_job_list(atlas_ctx *ctx, int64_t after, int64_t limit
                                     bool *more_out, atlas_err *err);
 atlas_status atlas_service_job_cancel(atlas_ctx *ctx, const char *job, atlas_job_sink sink,
                                       void *ud, atlas_err *err);
+
+/* A11.1. Drives one run in the foreground, to a settled answer or to the point
+ * where there is nothing more this invocation may do.
+ *
+ * It starts nothing in the background, polls no queue and schedules nothing. It
+ * decides neither ACCEPTED nor BLOCKED: it reports an exit classification Atlas
+ * computed and a gate verdict Atlas ran, and the daemon derives the run's status
+ * inside the transaction that records them. */
+atlas_status atlas_service_job_run(atlas_ctx *ctx, const atlas_job_run_opts *o,
+                                   atlas_job_sink sink, void *ud, atlas_err *err);
+/* Reads one run: its status, its root, and the task it is waiting on. A read,
+ * and the only run-shaped surface there is. */
+atlas_status atlas_service_job_run_status(atlas_ctx *ctx, const char *run, atlas_job_sink sink,
+                                          void *ud, atlas_err *err);
 
 /* Runs the dispatcher loop. Reads the root-owned policies itself and refuses to
  * start when orchestration is disabled — a disabled policy is a refusal to

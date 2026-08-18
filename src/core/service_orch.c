@@ -24,6 +24,7 @@
 #include "atlas/ipc.h"
 #include "atlas/orch.h"
 #include "atlas/orchpolicy.h"
+#include "atlas/rundriver.h"
 #include "atlas/service.h"
 #include "atlas/syspolicy.h"
 #include "service_internal.h"
@@ -91,7 +92,8 @@ static void fill_render(const atlas_ipc_response *r, atlas_job_render *jr, bool 
         {&jr->repo, "repo"},      {&jr->driver, "driver"},
         {&jr->commit, "commit"},  {&jr->created_at, "created_at"},
         {&jr->terminal_at, "terminal_at"}, {&jr->spec_digest, "spec_digest"},
-        {&jr->task, "task"},
+        {&jr->task, "task"},      {&jr->run, "run"},
+        {&jr->run_status, "run_status"}, {&jr->follow_up, "follow_up"},
     };
     for (size_t i = 0; i < sizeof strs / sizeof strs[0]; i++) {
         const char *v = NULL;
@@ -104,9 +106,41 @@ static void fill_render(const atlas_ipc_response *r, atlas_job_render *jr, bool 
     (void)atlas_ipc_result_int(r, "seq", &jr->seq);
     (void)atlas_ipc_result_bool(r, "cancel_requested", &jr->cancel_requested);
     (void)atlas_ipc_result_bool(r, "duplicate", &jr->duplicate);
+    (void)atlas_ipc_result_int(r, "worker_starts", &jr->worker_starts);
 }
 
 /* --- job submit -------------------------------------------------------------- */
+
+/* Splits a gate command line into an argv vector on ASCII spaces and tabs.
+ *
+ * Not a shell, and deliberately not shell-like: no quoting, no escaping, no
+ * expansion, no variable, no glob. An argument containing a space cannot be
+ * expressed, which is a limitation rather than an oversight — the alternative
+ * is a miniature quoting language, and a miniature quoting language on the path
+ * to `execve` is how a gate eventually runs something other than what it reads
+ * like. `argv[0]` is checked against the binary's own allowlist later. */
+static atlas_status split_words(const char *line, atlas_orch_argv *out, atlas_err *err) {
+    const char *p = line;
+    while (*p != '\0') {
+        while (*p == ' ' || *p == '\t') {
+            p++;
+        }
+        const char *start = p;
+        while (*p != '\0' && *p != ' ' && *p != '\t') {
+            p++;
+        }
+        if (p > start) {
+            atlas_status st = atlas_orch_argv_push(out, start, (size_t)(p - start), err);
+            if (st != ATLAS_OK) {
+                return st;
+            }
+        }
+    }
+    if (out->count == 0) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "a gate needs a command");
+    }
+    return ATLAS_OK;
+}
 
 static atlas_status build_submit(atlas_json *j, void *ud, atlas_err *err) {
     const atlas_job_submit_opts *o = (const atlas_job_submit_opts *)ud;
@@ -142,6 +176,33 @@ static atlas_status build_submit(atlas_json *j, void *ud, atlas_err *err) {
     for (size_t i = 0; st == ATLAS_OK && i < sizeof nums / sizeof nums[0]; i++) {
         if (nums[i].v > 0) {
             st = atlas_json_key_int(j, nums[i].k, nums[i].v, err);
+        }
+    }
+    /* A11.1. The gates, each sent as a length-prefixed argv encoding rather than
+     * as a command line, so no element of one can be confused with a separator
+     * whatever it contains. The split happened here, on ASCII spaces, with no
+     * shell involved at any point. */
+    if (st == ATLAS_OK && o->gate_count > 0) {
+        st = atlas_json_key(j, "validation", err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_arr_begin(j, err);
+        }
+        for (size_t i = 0; st == ATLAS_OK && i < o->gate_count; i++) {
+            atlas_orch_argv one;
+            atlas_orch_argv_init(&one);
+            st = split_words(o->gates[i], &one, err);
+            atlas_buf enc = ATLAS_BUF_INIT;
+            if (st == ATLAS_OK) {
+                st = atlas_orch_validations_encode(&one, 1u, &enc, err);
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_str(j, atlas_buf_cstr(&enc), err);
+            }
+            atlas_buf_free(&enc);
+            atlas_orch_argv_free(&one);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_arr_end(j, err);
         }
     }
     return st;
@@ -337,6 +398,19 @@ atlas_status atlas_service_dispatcher_run(bool once, FILE *log, atlas_err *err) 
         if (wants_model != is_model) {
             continue;
         }
+        /* A11.1. A driver that works in the registered repository's own tree is
+         * never on a *background* dispatcher's filter, however the policy lists
+         * it. This dispatcher provisions a workspace and would run the driver
+         * somewhere it was not meant to run, then complete the task — settling a
+         * run with no gate having run where the changes are.
+         *
+         * The daemon refuses such a grant to an unfiltered lease as well, and
+         * both checks are needed: that one catches "give me anything", this one
+         * catches a filter that names the driver because the policy did. Only
+         * the operator's foreground run driver asks for these by name. */
+        if (atlas_orch_driver_is_repo_tree(op.drivers[i])) {
+            continue;
+        }
         int n = snprintf(filter + flen, sizeof(filter) - flen, "%s%s", flen > 0 ? "," : "",
                          op.drivers[i]);
         if (n > 0 && (size_t)n < sizeof(filter) - flen) {
@@ -369,4 +443,425 @@ atlas_status atlas_service_dispatcher_run(bool once, FILE *log, atlas_err *err) 
     o.max_iterations = once ? 1 : 0;
     o.log = log;
     return atlas_dispatch_run(&o, err);
+}
+
+/* --- A11.1: `atlas job run` -------------------------------------------------
+ *
+ * The socket transport for the run driver, and the command that uses it.
+ *
+ * The driver speaks in `atlas_orch_op`s and reads `atlas_orch_result`s; this
+ * carries them over the same socket, the same method groups and the same
+ * `SO_PEERCRED` checks as every other orchestration message. Nothing here
+ * relaxes anything: it translates, and what the IPC edge refuses it still
+ * refuses.
+ */
+
+typedef struct run_xport {
+    atlas_buf sock;
+} run_xport;
+
+/* The lease request. */
+static atlas_status build_run_lease(atlas_json *j, void *ud, atlas_err *err) {
+    const atlas_orch_op *op = (const atlas_orch_op *)ud;
+    atlas_status st = atlas_json_key_str(j, "dispatcher", atlas_buf_cstr(&op->dispatcher_id), err);
+    if (st == ATLAS_OK && op->job_uid.len > 0) {
+        st = atlas_json_key_str(j, "job", atlas_buf_cstr(&op->job_uid), err);
+    }
+    if (st == ATLAS_OK && op->lease_drivers.len > 0) {
+        atlas_orch_argv one[1];
+        atlas_orch_argv_init(&one[0]);
+        size_t n = 0;
+        st = atlas_orch_validations_decode(atlas_buf_cstr(&op->lease_drivers), one, 1u, &n, err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_key(j, "driver", err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_arr_begin(j, err);
+        }
+        for (size_t i = 0; st == ATLAS_OK && n > 0 && i < one[0].count; i++) {
+            st = atlas_json_str(j, atlas_buf_cstr(&one[0].args[i]), err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_arr_end(j, err);
+        }
+        atlas_orch_argv_free(&one[0]);
+    }
+    return st;
+}
+
+static atlas_status build_run_heartbeat(atlas_json *j, void *ud, atlas_err *err) {
+    const atlas_orch_op *op = (const atlas_orch_op *)ud;
+    atlas_status st = atlas_json_key_str(j, "token", atlas_buf_cstr(&op->token), err);
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(j, "phase", atlas_orch_state_name(op->phase), err);
+    }
+    return st;
+}
+
+/* The completion. Every field is either an Atlas classification or a bounded
+ * excerpt; there is no field here a model could fill in even if it could reach
+ * the socket, because none of them is copied from anything it produced. */
+static atlas_status build_run_complete(atlas_json *j, void *ud, atlas_err *err) {
+    const atlas_orch_op *op = (const atlas_orch_op *)ud;
+    atlas_status st = atlas_json_key_str(j, "token", atlas_buf_cstr(&op->token), err);
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(j, "success", op->success, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(j, "exit_kind", atlas_orch_exit_kind_name(op->exit_kind), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(j, "exit_code", op->exit_code, err);
+    }
+    if (st == ATLAS_OK && !op->success) {
+        st = atlas_json_key_str(j, "reason", atlas_orch_reason_name(op->failure_reason), err);
+    }
+    if (st == ATLAS_OK && op->failed_gate >= 0) {
+        st = atlas_json_key_int(j, "failed_gate", op->failed_gate, err);
+    }
+    if (st == ATLAS_OK && op->failure_detail.len > 0) {
+        st = atlas_json_key_str(j, "detail", atlas_buf_cstr(&op->failure_detail), err);
+    }
+    if (st == ATLAS_OK && op->driver_version.len > 0) {
+        st = atlas_json_key_str(j, "driver_version", atlas_buf_cstr(&op->driver_version), err);
+    }
+    if (st == ATLAS_OK && op->artifact_count > 0) {
+        st = atlas_json_key(j, "artifact", err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_arr_begin(j, err);
+        }
+        for (size_t i = 0; st == ATLAS_OK && i < op->artifact_count; i++) {
+            const atlas_orch_artifact *a = &op->artifacts[i];
+            atlas_buf ent = ATLAS_BUF_INIT;
+            st = atlas_buf_appendf(&ent, err, "%s\x1f%s\x1f%s\x1f%lld",
+                                   atlas_buf_cstr(&a->name), atlas_buf_cstr(&a->kind),
+                                   atlas_buf_cstr(&a->sha256), (long long)a->size_bytes);
+            if (st == ATLAS_OK && a->content_stored) {
+                st = atlas_buf_append(&ent, "\x1f", 1u, err);
+                static const char D[] = "0123456789abcdef";
+                for (size_t k = 0; st == ATLAS_OK && k < a->content.len; k++) {
+                    unsigned char c = (unsigned char)a->content.data[k];
+                    char pair[2] = {D[c >> 4], D[c & 0x0fu]};
+                    st = atlas_buf_append(&ent, pair, 2u, err);
+                }
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_str(j, atlas_buf_cstr(&ent), err);
+            }
+            atlas_buf_free(&ent);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_arr_end(j, err);
+        }
+    }
+    return st;
+}
+
+static atlas_status xport_apply(void *ud, const atlas_orch_op *op, atlas_orch_result *out,
+                                atlas_err *err) {
+    run_xport *x = (run_xport *)ud;
+    const char *method = NULL;
+    orch_build_fn build = NULL;
+    switch (op->kind) {
+    case ATLAS_ORCH_OP_LEASE:
+        method = "dispatch.lease";
+        build = build_run_lease;
+        break;
+    case ATLAS_ORCH_OP_HEARTBEAT:
+        method = "dispatch.heartbeat";
+        build = build_run_heartbeat;
+        break;
+    case ATLAS_ORCH_OP_COMPLETE:
+        method = "dispatch.complete";
+        build = build_run_complete;
+        break;
+    /* The run driver issues three operations and no others. The rest are
+     * written out rather than left to a `default:`, so adding an operation to
+     * the vocabulary makes this stop compiling instead of silently widening
+     * what the run driver may ask the daemon for. */
+    case ATLAS_ORCH_OP_NONE:
+    case ATLAS_ORCH_OP_SUBMIT:
+    case ATLAS_ORCH_OP_CANCEL:
+    case ATLAS_ORCH_OP_EVENT:
+    case ATLAS_ORCH_OP_RECOVER: break;
+    }
+    if (method == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                             "the run driver does not carry that operation");
+    }
+
+    atlas_ipc_params *p = NULL;
+    atlas_json *j = NULL;
+    atlas_status st = atlas_ipc_params_begin(&p, &j, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    st = build(j, (void *)(uintptr_t)(const void *)op, err);
+    atlas_buf params = ATLAS_BUF_INIT;
+    if (st == ATLAS_OK) {
+        st = atlas_ipc_params_finish(p, &params, err);
+    } else {
+        atlas_ipc_params_abort(p);
+    }
+    atlas_buf raw = ATLAS_BUF_INIT;
+    if (st == ATLAS_OK) {
+        st = atlas_ipc_call(atlas_buf_cstr(&x->sock), method, atlas_buf_cstr(&params), &raw, err);
+    }
+    atlas_buf_free(&params);
+    atlas_ipc_response *resp = NULL;
+    if (st == ATLAS_OK) {
+        st = atlas_ipc_response_parse(raw.data, raw.len, &resp, err);
+    }
+    if (st == ATLAS_OK && !atlas_ipc_response_ok(resp)) {
+        st = atlas_err_set(err, atlas_ipc_response_status(resp), "%s: %s", method,
+                           atlas_ipc_response_message(resp));
+    }
+    if (st == ATLAS_OK) {
+        const char *v = NULL;
+        (void)atlas_ipc_result_bool(resp, "granted", &out->granted);
+        (void)atlas_ipc_result_bool(resp, "cancel_requested", &out->cancel_requested);
+        (void)atlas_ipc_result_int(resp, "attempt", &out->attempt_no);
+        (void)atlas_ipc_result_int(resp, "wall_timeout_ms", &out->wall_timeout_ms);
+        (void)atlas_ipc_result_int(resp, "idle_timeout_ms", &out->idle_timeout_ms);
+        (void)atlas_ipc_result_int(resp, "max_output_bytes", &out->max_output_bytes);
+        (void)atlas_ipc_result_int(resp, "worker_starts", &out->worker_starts);
+        struct {
+            atlas_buf *dst;
+            const char *key;
+        } strs[] = {
+            {&out->job_uid, "job"},        {&out->token, "token"},
+            {&out->repo_root, "repo_root"}, {&out->source_commit, "commit"},
+            {&out->mode, "mode"},          {&out->driver, "driver"},
+            {&out->task_text, "task"},     {&out->validations, "validations"},
+            {&out->run_uid, "run"},        {&out->follow_up_job_uid, "follow_up"},
+        };
+        for (size_t i = 0; st == ATLAS_OK && i < sizeof strs / sizeof strs[0]; i++) {
+            if (atlas_ipc_result_str(resp, strs[i].key, &v) && v != NULL) {
+                st = atlas_buf_set_str(strs[i].dst, v, err);
+            }
+        }
+        if (st == ATLAS_OK && atlas_ipc_result_str(resp, "state", &v) && v != NULL) {
+            (void)atlas_orch_state_parse(v, &out->state);
+        }
+        /* An unrecognised run status leaves UNKNOWN, which is not terminal and
+         * settles nothing. A newer daemon answering an older CLI must never
+         * make this one read as an ending. */
+        if (st == ATLAS_OK && atlas_ipc_result_str(resp, "run_status", &v) && v != NULL) {
+            (void)atlas_orch_run_status_parse(v, &out->run_status);
+        }
+    }
+    atlas_ipc_response_free(resp);
+    atlas_buf_free(&raw);
+    return st;
+}
+
+typedef struct run_get_req {
+    const char *run;
+} run_get_req;
+
+static atlas_status build_run_get(atlas_json *j, void *ud, atlas_err *err) {
+    return atlas_json_key_str(j, "run", ((const run_get_req *)ud)->run, err);
+}
+
+static atlas_status xport_run_get(void *ud, const char *run_uid, atlas_orch_run_view *out,
+                                  bool *found, atlas_err *err) {
+    run_xport *x = (run_xport *)ud;
+    *found = false;
+    memset(out, 0, sizeof(*out));
+    run_get_req rq = {run_uid};
+    atlas_ipc_params *p = NULL;
+    atlas_json *j = NULL;
+    atlas_status st = atlas_ipc_params_begin(&p, &j, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    st = build_run_get(j, &rq, err);
+    atlas_buf params = ATLAS_BUF_INIT;
+    if (st == ATLAS_OK) {
+        st = atlas_ipc_params_finish(p, &params, err);
+    } else {
+        atlas_ipc_params_abort(p);
+    }
+    atlas_buf raw = ATLAS_BUF_INIT;
+    if (st == ATLAS_OK) {
+        st = atlas_ipc_call(atlas_buf_cstr(&x->sock), "job.run_status", atlas_buf_cstr(&params), &raw,
+                            err);
+    }
+    atlas_buf_free(&params);
+    atlas_ipc_response *resp = NULL;
+    if (st == ATLAS_OK) {
+        st = atlas_ipc_response_parse(raw.data, raw.len, &resp, err);
+    }
+    if (st == ATLAS_OK && !atlas_ipc_response_ok(resp)) {
+        st = atlas_err_set(err, atlas_ipc_response_status(resp), "%s",
+                           atlas_ipc_response_message(resp));
+    }
+    if (st == ATLAS_OK) {
+        const char *v = NULL;
+        if (atlas_ipc_result_str(resp, "run", &v) && v != NULL) {
+            (void)snprintf(out->run_uid, sizeof(out->run_uid), "%s", v);
+            *found = true;
+        }
+        if (atlas_ipc_result_str(resp, "root", &v) && v != NULL) {
+            (void)snprintf(out->root_job_uid, sizeof(out->root_job_uid), "%s", v);
+        }
+        if (atlas_ipc_result_str(resp, "status", &v) && v != NULL) {
+            (void)atlas_orch_run_status_parse(v, &out->status);
+        }
+        if (atlas_ipc_result_str(resp, "created_at", &v) && v != NULL) {
+            (void)snprintf(out->created_at, sizeof(out->created_at), "%s", v);
+        }
+        if (atlas_ipc_result_str(resp, "active", &v) && v != NULL) {
+            (void)snprintf(out->active_job_uid, sizeof(out->active_job_uid), "%s", v);
+        }
+        if (atlas_ipc_result_str(resp, "active_state", &v) && v != NULL) {
+            (void)atlas_orch_state_parse(v, &out->active_state);
+        }
+    }
+    atlas_ipc_response_free(resp);
+    atlas_buf_free(&raw);
+    return st;
+}
+
+atlas_status atlas_service_job_run_status(atlas_ctx *ctx, const char *run, atlas_job_sink sink,
+                                          void *ud, atlas_err *err) {
+    if (run == NULL || run[0] == '\0') {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "which run?");
+    }
+    run_get_req rq = {run};
+    atlas_ipc_response *resp = NULL;
+    atlas_buf raw = ATLAS_BUF_INIT;
+    atlas_status st = orch_call(ctx, "job.run_status", build_run_get, &rq, &resp, &raw, err);
+    if (st == ATLAS_OK && sink != NULL) {
+        atlas_job_render jr;
+        memset(&jr, 0, sizeof(jr));
+        jr.detail = true;
+        (void)atlas_ipc_result_str(resp, "run", &jr.run);
+        (void)atlas_ipc_result_str(resp, "status", &jr.run_status);
+        (void)atlas_ipc_result_str(resp, "root", &jr.job);
+        (void)atlas_ipc_result_str(resp, "created_at", &jr.created_at);
+        (void)atlas_ipc_result_str(resp, "active_state", &jr.state);
+        (void)atlas_ipc_result_str(resp, "active", &jr.follow_up);
+        st = sink(&jr, ud, err);
+    }
+    atlas_ipc_response_free(resp);
+    atlas_buf_free(&raw);
+    return st;
+}
+
+atlas_status atlas_service_job_run(atlas_ctx *ctx, const atlas_job_run_opts *o,
+                                   atlas_job_sink sink, void *ud, atlas_err *err) {
+    const bool resuming = o->resume != NULL && o->resume[0] != '\0';
+    if (!resuming && (o->repo == NULL || o->repo[0] == '\0' || o->task == NULL ||
+                      o->task[0] == '\0')) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "atlas job run needs --repo and --task, or --resume RUN");
+    }
+    if (resuming && (o->repo != NULL || o->task != NULL)) {
+        /* Refused rather than silently preferring one. A caller that named both
+         * a new task and a run to resume has asked for two different things and
+         * Atlas does not pick. */
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "--resume names an existing run, so --repo and --task do not apply");
+    }
+    if (!resuming && o->gate_count == 0) {
+        /* The gates are fixed at the root task and inherited unchanged by every
+         * follow-up, so a run created without one could never be accepted on
+         * anything but a process exit code. Refused at the only moment it can
+         * still be fixed. */
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "a run needs at least one --gate; a run with no gate can only be "
+                             "accepted on a worker's exit code, which is not a success claim");
+    }
+
+    /* The policy decides whether a live model may run and whose session it uses.
+     * Read here from its compiled-in root-owned path, exactly as the background
+     * dispatcher reads it, and overridable by nothing. */
+    atlas_orchpolicy pol;
+    atlas_orchpolicy_load(&pol);
+    if (pol.state != ATLAS_ORCHPOLICY_ENABLED) {
+        return atlas_err_set(err, ATLAS_ERR_CONFIG, "orchestration is not enabled (%s: %s)",
+                             atlas_orchpolicy_reason_name(pol.reason),
+                             atlas_orchpolicy_reason_explain(pol.reason));
+    }
+
+    atlas_buf run_uid = ATLAS_BUF_INIT;
+    atlas_status st = ATLAS_OK;
+    if (resuming) {
+        st = atlas_buf_set_str(&run_uid, o->resume, err);
+    } else {
+        /* The root task goes through the ordinary submit path — the same RPC, the
+         * same policy checks, the same write point. There is no second submit
+         * surface and this milestone does not add one. */
+        atlas_job_submit_opts so;
+        memset(&so, 0, sizeof(so));
+        so.repo = o->repo;
+        so.task = o->task;
+        so.mode = o->mode;
+        so.driver = o->driver != NULL ? o->driver : "claude-repo";
+        so.idempotency_key = o->idempotency_key;
+        so.wall_timeout_ms = o->wall_timeout_ms;
+        so.idle_timeout_ms = o->idle_timeout_ms;
+        so.max_attempts = ATLAS_ORCH_RUN_MAX_WORKER_STARTS;
+        for (size_t i = 0; i < o->gate_count && i < 8u; i++) {
+            so.gates[so.gate_count++] = o->gates[i];
+        }
+        atlas_ipc_response *resp = NULL;
+        atlas_buf raw = ATLAS_BUF_INIT;
+        st = orch_call(ctx, "job.submit", build_submit, &so, &resp, &raw, err);
+        if (st == ATLAS_OK) {
+            const char *v = NULL;
+            if (!atlas_ipc_result_str(resp, "run", &v) || v == NULL) {
+                st = atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                                   "the daemon accepted a task without a run");
+            } else {
+                st = atlas_buf_set_str(&run_uid, v, err);
+            }
+        }
+        atlas_ipc_response_free(resp);
+        atlas_buf_free(&raw);
+    }
+    if (st != ATLAS_OK) {
+        atlas_buf_free(&run_uid);
+        return st;
+    }
+
+    run_xport x;
+    atlas_buf_init(&x.sock);
+    st = atlas_ipc_socket_path(&x.sock, err);
+
+    atlas_rundriver_report rep;
+    atlas_rundriver_report_init(&rep);
+    if (st == ATLAS_OK) {
+        char id[128];
+        (void)snprintf(id, sizeof id, "atlas-run/%lld", (long long)getpid());
+        atlas_rundriver_opts ro;
+        memset(&ro, 0, sizeof(ro));
+        ro.run_uid = atlas_buf_cstr(&run_uid);
+        ro.dispatcher_id = id;
+        ro.live_model = pol.live_model;
+        ro.operator_session = atlas_orchpolicy_is_model_dispatcher(&pol, (long long)getuid()) &&
+                              pol.model_uses_operator_session;
+        ro.log = o->log;
+        ro.transport.apply = xport_apply;
+        ro.transport.run_get = xport_run_get;
+        ro.transport.ud = &x;
+        st = atlas_rundriver_run(&ro, &rep, err);
+    }
+    if (st == ATLAS_OK && sink != NULL) {
+        atlas_job_render jr;
+        memset(&jr, 0, sizeof(jr));
+        jr.detail = true;
+        jr.run = atlas_buf_cstr(&rep.run_uid);
+        jr.run_status = atlas_orch_run_status_name(rep.status);
+        jr.job = rep.last_job_uid.len > 0 ? atlas_buf_cstr(&rep.last_job_uid) : NULL;
+        jr.worker_starts = rep.worker_starts;
+        jr.tasks = rep.tasks;
+        jr.busy = rep.busy;
+        st = sink(&jr, ud, err);
+    }
+    atlas_rundriver_report_free(&rep);
+    atlas_buf_free(&x.sock);
+    atlas_buf_free(&run_uid);
+    return st;
 }

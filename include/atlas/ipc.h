@@ -346,4 +346,26 @@ bool atlas_ipc_result_arr_obj_int(const atlas_ipc_response *r, const char *arr_k
  * limit exists to prevent. */
 atlas_status atlas_ipc_result_write(const atlas_ipc_response *r, atlas_json *j, atlas_err *err);
 
+/* --- A9.2.6: the one refusal a client may safely retry ----------------------
+ *
+ * The daemon refuses a write it cannot take right now — because the single
+ * writer thread is inside a semantic pass with no statable end — with a message
+ * that *begins with this token*. The token is the contract, not the prose after
+ * it, and it is a token rather than a status code deliberately: the other way a
+ * synchronous write fails is the deadline expiring, which leaves the job queued
+ * and running, so the write does happen and the caller simply never hears the
+ * outcome. Those two are the same status and opposite facts, and a caller that
+ * confuses them either retries a write that already ran or abandons one that
+ * did not.
+ *
+ * A11.1's run driver is the first caller to act on it: a completion refused
+ * this way carries a worker's whole result, so retrying is the difference
+ * between recording it and running a second worker for the same task. */
+#define ATLAS_IPC_BUSY_TOKEN "BUSY:"
+
+/* True when `message` is that refusal. Matched anywhere in the text rather than
+ * only at the start, because a client that wrapped the daemon's message in its
+ * own context is still reading the same refusal. */
+bool atlas_ipc_message_is_busy(const char *message);
+
 #endif /* ATLAS_IPC_H */

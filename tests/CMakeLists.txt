@@ -136,6 +136,7 @@ set(ATLAS_TESTS
   test_orch_model
   test_orch_lifecycle
   test_orch_run
+  test_a11_run
   test_orch_rpc
   test_orch_workspace
   test_orch_driver
@@ -305,6 +306,7 @@ set_tests_properties(test_orch_model PROPERTIES LABELS "unit")
 # integration test. It sleeps for nothing: expiry and deadlines are supplied.
 set_tests_properties(test_orch_lifecycle PROPERTIES LABELS "integration")
 set_tests_properties(test_orch_run PROPERTIES LABELS "integration")
+set_tests_properties(test_a11_run PROPERTIES LABELS "integration")
 # The RPC suite drives a live daemon to prove the negative enumeration still
 # holds and that a dispatcher method is unreachable from a client connection.
 set_tests_properties(test_orch_rpc PROPERTIES LABELS "daemon" TIMEOUT 900 RUN_SERIAL TRUE)

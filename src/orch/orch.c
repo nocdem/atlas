@@ -857,6 +857,23 @@ static atlas_status random_hex(size_t nbytes, atlas_buf *out, atlas_err *err) {
     return atlas_buf_set_str(out, hex, err);
 }
 
+bool atlas_orch_driver_is_repo_tree(const char *name) {
+    /* Written out, in one place, rather than derived from a flag somewhere
+     * else. Adding a member is a deliberate act with an entry in
+     * `docs/extending.md`, because what it adds is a driver that may edit a
+     * registered repository. */
+    static const char *const REPO_TREE[] = {"claude-repo", "fake-repo"};
+    if (name == NULL) {
+        return false;
+    }
+    for (size_t i = 0; i < sizeof REPO_TREE / sizeof REPO_TREE[0]; i++) {
+        if (strcmp(name, REPO_TREE[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 atlas_status atlas_orch_new_uid(atlas_buf *out, atlas_err *err) {
     atlas_buf hex = ATLAS_BUF_INIT;
     atlas_status st = random_hex(ATLAS_ORCH_UID_HEX / 2u, &hex, err);

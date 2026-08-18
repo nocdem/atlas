@@ -24,11 +24,24 @@ add_executable(atlas-marker tools/atlas_marker.c)
 target_compile_definitions(atlas-marker PRIVATE _POSIX_C_SOURCE=200809L)
 atlas_set_warnings(atlas-marker)
 
+# A9.2.5. A parse child that fails transiently before it succeeds, so the
+# per-unit retry can be tested end to end rather than recorded as untestable.
+# It uses `atlas_sem_index_opts.atlas_exe`, which has been the child's path since
+# A8-CI; nothing in production changes for it.
+add_executable(atlas-flaky-parse tools/atlas_flaky_parse.c)
+target_compile_definitions(atlas-flaky-parse PRIVATE
+  _POSIX_C_SOURCE=200809L
+  ATLAS_BIN="$<TARGET_FILE:atlas>"
+)
+add_dependencies(atlas-flaky-parse atlas)
+atlas_set_warnings(atlas-flaky-parse)
+
 target_compile_definitions(atlas_test_support PUBLIC
   _POSIX_C_SOURCE=200809L
   ATLAS_BIN="$<TARGET_FILE:atlas>"
   ATLAS_MARKER_BIN="$<TARGET_FILE:atlas-marker>"
   ATLAS_SPAWNER_BIN="$<TARGET_FILE:atlas-spawner>"
+  ATLAS_FLAKY_PARSE_BIN="$<TARGET_FILE:atlas-flaky-parse>"
 )
 target_link_libraries(atlas_test_support PUBLIC atlas_core)
 atlas_set_warnings(atlas_test_support)

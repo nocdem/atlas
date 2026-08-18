@@ -1288,8 +1288,25 @@ atlas_status atlas_db_sem_unit_digest(atlas_db *db, int64_t generation_id, const
     sqlite3_stmt *stmt = NULL;
     atlas_status st = atlas_db_prepare(
         db,
+        /* A9.2.5. **`status = 'COMPLETE'` is the whole of the correctness here.**
+         *
+         * Without it a unit that FAILED — a parse child killed twice, a compiler
+         * that produced no translation unit — is carried forward on a digest
+         * match alone and rewritten as COMPLETE with the zero symbols and zero
+         * edges it never produced. One unrelated edit anywhere in the tree moves
+         * the source identity, the next pass carries the failure forward as a
+         * success, and the generation then reports `tu_failed = 0`,
+         * `scope_uncovered = 0` and complete coverage over a file Atlas has
+         * never parsed.
+         *
+         * That was survivable while these counters only advised the scheduler.
+         * A9.2.5 makes `units_complete` a gate on `ATLAS_SEM_VERDICT_ABSENT`, so
+         * it became a path to a *proven absence* over an unread file, with every
+         * field in the trust block saying the coverage was whole. A unit that did
+         * not succeed is re-parsed; that is the only honest carry rule. */
         "SELECT u.input_digest FROM sem_units u"
-        " WHERE u.generation_id = ?1 AND u.source_text = ?2 AND u.config_digest = ?3;",
+        " WHERE u.generation_id = ?1 AND u.source_text = ?2 AND u.config_digest = ?3"
+        "   AND u.status = 'COMPLETE';",
         &stmt, err);
     if (st != ATLAS_OK) {
         return st;
@@ -1371,8 +1388,15 @@ atlas_status atlas_db_sem_units_all(atlas_db *db, int64_t generation_id,
     /* Ordered, so the sealing pass visits units in a reproducible order and two
      * runs over one state produce identical generations. */
     atlas_status st = atlas_db_prepare(db,
+                                       /* A9.2.5. Only a COMPLETE unit is sealed
+                                        * with a reusable digest, for the reason
+                                        * `atlas_db_sem_unit_digest` filters on
+                                        * the same column: a digest sealed onto a
+                                        * failed unit is an invitation for the
+                                        * next pass to carry the failure forward
+                                        * as a success. */
                                        "SELECT u.source_text, u.config_digest FROM sem_units u"
-                                       " WHERE u.generation_id = ?1"
+                                       " WHERE u.generation_id = ?1 AND u.status = 'COMPLETE'"
                                        " ORDER BY u.source_text, u.config_digest;",
                                        &stmt, err);
     if (st != ATLAS_OK) {

@@ -305,6 +305,19 @@ bool atlas_sem_stale_reason_is_known(const char *reason) {
     return atlas_sem_stale_reason_intern(reason) != NULL;
 }
 
+bool atlas_sem_why_is_transient(const char *why) {
+    if (why == NULL) {
+        return false;
+    }
+    /* Exactly two, and the list is closed deliberately. Every other reason in
+     * the vocabulary is a property of the input: a compiler error, a source
+     * outside the repository, a refused argument, a ceiling, a file the index
+     * does not hold. Retrying any of those spends a compiler run to reach the
+     * same answer, which is the storm this bound exists to prevent. */
+    return strcmp(why, ATLAS_SEM_WHY_CHILD_FAILED) == 0 ||
+           strcmp(why, ATLAS_SEM_WHY_TIMEOUT) == 0;
+}
+
 void atlas_sem_generation_init(atlas_sem_generation *g) {
     if (g == NULL) {
         return;

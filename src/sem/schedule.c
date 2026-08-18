@@ -220,9 +220,28 @@ atlas_status atlas_sem_plan_for_with_default(atlas_db *db, atlas_repo_info *repo
     out->fail_count = cfg.fail_count;
     (void)snprintf(out->fail_reason, sizeof out->fail_reason, "%s", cfg.fail_reason);
     (void)snprintf(out->fail_at, sizeof out->fail_at, "%s", cfg.fail_at);
+    /* A9.2.5. One further attempt after an *interrupted* pass, and exactly one.
+     *
+     * The governor's rule is unchanged for every other failure: an attempt is
+     * allowed again only once the source identity has moved, never after an
+     * interval, because retrying a tree that does not compile spends a compiler
+     * run over the whole repository to reach the same answer. That is what makes
+     * a storm impossible and it stays.
+     *
+     * What it could not distinguish was a pass that failed *because of the
+     * machine* — out of memory, a database error — from one that failed because
+     * of the inputs. Both pinned `fail_identity`, so a transient interruption
+     * held a repository on `HOLD_FAILED_UNCHANGED` until somebody happened to
+     * edit a file. The exception is bounded by `fail_count`, which the attempt
+     * recorder increments and which is durable: the second interruption reaches
+     * `fail_count == 2` and holds. There is no timer, so nothing can wake up and
+     * try a third time, and a daemon restart reads the same persisted count and
+     * reaches the same answer. */
+    const bool interrupted_once =
+        cfg.fail_count == 1 && strcmp(cfg.fail_reason, ATLAS_SEM_WHY_PASS_INTERRUPTED) == 0;
     const bool identity_unmoved =
         cfg.fail_count > 0 && cfg.fail_identity[0] != '\0' && out->source_identity[0] != '\0' &&
-        strcmp(cfg.fail_identity, out->source_identity) == 0;
+        strcmp(cfg.fail_identity, out->source_identity) == 0 && !interrupted_once;
     /* The discovery verdict of the last walk, and when it ran. Both are stored
      * beside the operator's statements for the reason the retry governor's
      * fields are: they are facts about the repository, not about any candidate. */

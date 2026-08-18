@@ -1465,6 +1465,64 @@ atlas_status atlas_sem_index_run(atlas_db *db, int64_t repo_id, const atlas_sem_
             atlas_sem_parse_result pres;
             atlas_status pst =
                 atlas_sem_parse_unit(opts->atlas_exe, &req, on_fact, &ctx, &pres, err);
+
+            /* A9.2.5. A bounded second attempt, and only for a failure that a
+             * second attempt could plausibly change.
+             *
+             * A parse child that was OOM-killed or that ran out of wall clock
+             * failed for a reason that has nothing to do with the bytes — and
+             * before this season the consequence was permanent: `tu_failed > 0`
+             * makes coverage incomplete, the retry governor compares identities,
+             * and identical bytes never retry. One transient memory-pressure
+             * event therefore cost a repository the ability to state an absence
+             * until somebody happened to edit a file.
+             *
+             * **Two compile-time bounds, and the second is not redundant.**
+             * `ATLAS_SEM_UNIT_TRANSIENT_RETRIES` bounds one unit;
+             * `ATLAS_SEM_PASS_TRANSIENT_RETRIES` bounds the pass, because a
+             * per-unit bound alone still permits every unit to retry and a
+             * `TIMEOUT` retry costs a whole parse timeout again — so the worst
+             * case without it is twice the pass, inside the write transaction
+             * each unit holds while its child runs.
+             *
+             * Nothing durable records that a retry happened, so a restart has no
+             * half-finished state to interpret; nothing schedules a later
+             * attempt, so no timer can spin. A unit that fails twice is recorded
+             * failed exactly as it was before, and the generation is visibly
+             * INCOMPLETE. */
+            for (int attempt = 0;
+                 pst == ATLAS_OK && ctx.st == ATLAS_OK &&
+                 attempt < ATLAS_SEM_UNIT_TRANSIENT_RETRIES &&
+                 sum->units_retried < ATLAS_SEM_PASS_TRANSIENT_RETRIES &&
+                 pres.status == ATLAS_SEM_TU_FAILED && atlas_sem_why_is_transient(pres.why);
+                 attempt++) {
+                /* The counters are reset so the unit row records what the
+                 * *successful* attempt produced rather than the sum of both.
+                 *
+                 * The rows a partial first attempt already wrote are not deleted,
+                 * and do not need to be: every fact insert is
+                 * `ON CONFLICT(...) DO NOTHING` on a natural key —
+                 * `(generation_id, usr, file_text, line, is_definition)` for a
+                 * symbol, `(generation_id, kind, src_usr, dst_usr, file_text,
+                 * line, col)` for an edge — so re-inserting the same facts is a
+                 * no-op. Both attempts parse the same bytes with the same
+                 * arguments, so the first attempt's output is a prefix of the
+                 * second's and the union is the second's set. Deleting them
+                 * instead is not available: `sem_symbols` and `sem_includes` are
+                 * generation-scoped, not unit-scoped, so there is no correct
+                 * "this unit's rows" to remove.
+                 *
+                 * The generation's published counts come from
+                 * `atlas_db_sem_generation_counts`, which reads the rows that
+                 * exist rather than these counters, so nothing downstream can be
+                 * inflated by a retry either. */
+                ctx.symbols = 0;
+                ctx.edges = 0;
+                ctx.includes = 0;
+                sum->units_retried++;
+                pst = atlas_sem_parse_unit(opts->atlas_exe, &req, on_fact, &ctx, &pres, err);
+            }
+
             if (pst != ATLAS_OK) {
                 st = pst;
             } else if (ctx.st != ATLAS_OK) {

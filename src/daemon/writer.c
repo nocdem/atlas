@@ -619,6 +619,14 @@ static void run_sem_index(atlas_writer *w, atlas_job *j) {
             why = "";
         } else if (st == ATLAS_ERR_USAGE || st == ATLAS_ERR_CONFIG) {
             why = ATLAS_SEM_WHY_BUILD_DESCRIPTION;
+        } else if (st == ATLAS_ERR_INTERNAL || st == ATLAS_ERR_DB) {
+            /* A9.2.5. Out of memory, a database error, a write that could not
+             * complete — a failure of the machine rather than of the inputs.
+             * Recorded distinctly so the governor can allow exactly one further
+             * attempt, which `ATLAS_SEM_WHY_PASS_FAILED` must not: the source
+             * identity has not moved, so without this the repository holds on
+             * `HOLD_FAILED_UNCHANGED` until somebody happens to edit a file. */
+            why = ATLAS_SEM_WHY_PASS_INTERRUPTED;
         }
         (void)atlas_db_sem_config_record_attempt(w->db, repo.id, attempt_identity, st == ATLAS_OK,
                                                  why, &rerr);
@@ -643,12 +651,13 @@ static void run_sem_index(atlas_writer *w, atlas_job *j) {
                                  * "parsed 0, reused 0" after parsing every unit in the
                                  * repository. Under A7.1 the socket is the operator's
                                  * only path, so that was the *only* thing they saw. */
-                                "parsed=%lld reused=%lld",
+                                "parsed=%lld reused=%lld retried=%lld",
                                 (long long)sum.generation_id, (long long)sum.units_total,
                                 (long long)sum.units_complete, (long long)sum.units_partial,
                                 (long long)sum.units_failed, (long long)sum.units_unsupported,
                                 (long long)sum.symbols, (long long)sum.edges,
-                                (long long)sum.units_parsed, (long long)sum.units_reused);
+                                (long long)sum.units_parsed, (long long)sum.units_reused,
+                                (long long)sum.units_retried);
     }
     atlas_ops_finish(w->ops, j->op_id, st,
                      st == ATLAS_OK ? "semantic index published" : atlas_err_msg(&err),

@@ -210,7 +210,30 @@ bool atlas_sem_tu_status_parse(const char *name, atlas_sem_tu_status *out);
  * that far. */
 #define ATLAS_SEM_WHY_BUILD_DESCRIPTION "the_named_compilation_databases_could_not_be_read"
 #define ATLAS_SEM_WHY_PASS_FAILED "the_semantic_index_pass_did_not_complete"
+/* A9.2.5. A pass that failed for a reason that is not the build description and
+ * not the source: out of memory, a database error, a write that could not
+ * complete. Kept apart from PASS_FAILED because the two call for opposite
+ * behaviour from the retry governor — one is worth exactly one more attempt and
+ * the other is not worth any. */
+#define ATLAS_SEM_WHY_PASS_INTERRUPTED "the_semantic_index_pass_was_interrupted"
 bool atlas_sem_why_is_known(const char *why);
+
+/* A9.2.5. Whether a unit's failure is one a second attempt could plausibly
+ * change.
+ *
+ * **The distinction is not cosmetic and it is not a heuristic.** A compiler that
+ * reported errors will report them again from identical bytes; a unit outside
+ * the repository will be outside it again; a refused argument stays refused. But
+ * a parse child that was OOM-killed, or that exceeded its wall clock while the
+ * machine was loaded, failed for a reason that has nothing to do with the bytes
+ * — and until A9.2.5 both outcomes were identical in their consequence:
+ * `tu_failed > 0` makes the generation's coverage incomplete for ever, because
+ * the retry governor compares *identities* and identical bytes never retry.
+ *
+ * So a transient memory-pressure event permanently cost a repository the ability
+ * to state an absence, and nothing anywhere recorded that this had happened.
+ * Only these two are transient; everything else is a property of the input. */
+bool atlas_sem_why_is_transient(const char *why);
 /* Returns Atlas' own copy of a known reason, or NULL.
  *
  * A reason that came back over a pipe is a *matching* string, not Atlas' string.
@@ -774,6 +797,12 @@ typedef struct atlas_sem_index_summary {
     int64_t units_total;
     int64_t units_parsed;
     int64_t units_reused;
+    /* A9.2.5. Second attempts spent on transiently failed units. Travels on the
+     * operation's detail line with `units_parsed` and `units_reused`, because
+     * like them it describes *the pass* rather than the rows the generation
+     * holds — A8-CI's closure rule, and the one A9.2.4 had to relearn when the
+     * remote form printed `parsed 0` after parsing a whole repository. */
+    int64_t units_retried;
     int64_t units_complete;
     int64_t units_partial;
     int64_t units_failed;

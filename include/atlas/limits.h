@@ -466,6 +466,39 @@
 #define ATLAS_SEM_MAX_FACTS_PER_UNIT 2000000
 /* Translation units one generation may hold. */
 #define ATLAS_SEM_MAX_UNITS 50000
+
+/* A9.2.5. Extra attempts one translation unit gets when its failure was
+ * transient — a parse child that died, or one that exceeded its wall clock.
+ *
+ * **One**, and the bound is compile-time and per unit and per pass, which is
+ * what makes a storm impossible rather than unlikely. The retry happens inside
+ * the pass that is already running: no durable retry state exists, so a daemon
+ * restart cannot find a half-finished retry to be confused about, and no timer
+ * anywhere can wake up and try again. A unit that fails twice in one pass is
+ * recorded failed exactly as before and the generation is INCOMPLETE, visibly.
+ *
+ * Higher would buy very little: the failures this covers are memory pressure and
+ * load, and a second immediate attempt either finds the pressure gone or does
+ * not. What it would cost is bounded compiler runs on a machine that is already
+ * short of memory, which is the situation that produced the failure. */
+#define ATLAS_SEM_UNIT_TRANSIENT_RETRIES 1
+
+/* A9.2.5. Transient retries one *pass* may spend in total.
+ *
+ * The per-unit bound alone is not a bound on the pass. A machine under enough
+ * memory pressure to kill one parse child will kill many, and
+ * `ATLAS_SEM_WHY_TIMEOUT` is worse: a unit that exhausted
+ * `ATLAS_SEM_PARSE_TIMEOUT_MS` and is retried spends it again, so the worst case
+ * without this is **twice the whole pass's duration** rather than twice one
+ * unit's — each doubling inside the write transaction the unit holds while its
+ * child runs.
+ *
+ * 64 is chosen to be generous for the case the retry exists for — a handful of
+ * children lost to a transient spike — and far below the point where retrying is
+ * the dominant cost. Reaching it means the machine, not the repository, is the
+ * problem; the pass finishes with the units it has and says so, and the
+ * remaining failures are recorded exactly as they were before A9.2.5. */
+#define ATLAS_SEM_PASS_TRANSIENT_RETRIES 64
 /* Bytes of one USR, one symbol name and one type spelling. A USR encodes nested
  * scopes, so it is allowed to be considerably longer than a name. */
 #define ATLAS_SEM_MAX_USR_BYTES 2048u

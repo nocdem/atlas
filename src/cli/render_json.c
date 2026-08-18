@@ -2089,6 +2089,7 @@ static atlas_status j_sem_indexed(atlas_renderer *r, const atlas_sem_index_summa
     TRY(atlas_json_key_int(r->j, "units_total", sum->units_total, err));
     TRY(atlas_json_key_int(r->j, "units_parsed", sum->units_parsed, err));
     TRY(atlas_json_key_int(r->j, "units_reused", sum->units_reused, err));
+    TRY(atlas_json_key_int(r->j, "units_retried", sum->units_retried, err));
     TRY(atlas_json_key_int(r->j, "units_complete", sum->units_complete, err));
     TRY(atlas_json_key_int(r->j, "units_partial", sum->units_partial, err));
     TRY(atlas_json_key_int(r->j, "units_failed", sum->units_failed, err));

@@ -2185,11 +2185,17 @@ atlas_status atlas_service_sem_index_remote(const char *name, const char *const 
         const char *det = atlas_buf_cstr(&detail);
         const char *pk = strstr(det, "parsed=");
         const char *rk = strstr(det, "reused=");
+        /* A9.2.5. Same reason, same place: a second attempt spent on a
+         * transiently failed unit is a fact about the pass. */
+        const char *tk = strstr(det, "retried=");
         if (pk != NULL) {
             out->units_parsed = strtoll(pk + 7, NULL, 10);
         }
         if (rk != NULL) {
             out->units_reused = strtoll(rk + 7, NULL, 10);
+        }
+        if (tk != NULL) {
+            out->units_retried = strtoll(tk + 8, NULL, 10);
         }
     }
     atlas_buf_free(&message);

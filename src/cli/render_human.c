@@ -2288,6 +2288,12 @@ static atlas_status h_sem_indexed(atlas_renderer *r, const atlas_sem_index_summa
     (void)fprintf(o, LABEL "%lld\n", "translation units", (long long)sum->units_total);
     (void)fprintf(o, LABEL "%lld\n", "  parsed", (long long)sum->units_parsed);
     (void)fprintf(o, LABEL "%lld\n", "  reused", (long long)sum->units_reused);
+    if (sum->units_retried > 0) {
+        /* Only when it happened: a zero here every time would train a reader to
+         * stop seeing the line, and a transient failure that was recovered from
+         * is exactly the thing worth noticing. */
+        (void)fprintf(o, LABEL "%lld\n", "  retried", (long long)sum->units_retried);
+    }
     (void)fprintf(o, LABEL "%lld\n", "  complete", (long long)sum->units_complete);
     (void)fprintf(o, LABEL "%lld\n", "  partial", (long long)sum->units_partial);
     (void)fprintf(o, LABEL "%lld\n", "  failed", (long long)sum->units_failed);

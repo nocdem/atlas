@@ -547,7 +547,20 @@ first automatic build of a large repository will make the daemon unresponsive to
 *writes* for its duration, reads are unaffected, and an operator who cannot
 accept that sets `semantic_auto_default = DISABLED` or disables the repository.
 
+> **A9.2.6: "reads are unaffected" was false, and measurably so.** The serve loop
+> dispatches one request at a time, so a write blocked behind a pass blocked every
+> other client with it — a second client's ping was measured at 4009 ms. Writes
+> during a pass are now refused quickly and retryably rather than waiting, and
+> reads are genuinely unaffected. The rest of the paragraph stands: an operator
+> who cannot accept a pass at all still disables it.
+
 ## A9.2.5: a semantic index pass makes the daemon unreachable to every client
+
+> **RESOLVED IN A9.2.6.** The resolution and the two corrections it forces are
+> appended at the end of this entry. Everything above that appendix is left as it
+> was written, including the parts measurement later contradicted: what was
+> believed at the time is part of the record, and an entry silently edited to
+> agree with the answer teaches nobody how the answer was reached.
 
 **IMMEDIATE OPERATIONAL ITEM — to be resolved before O10.** Not an ordinary
 low-priority backlog line: the observed effect is a daemon that answered no read
@@ -628,4 +641,51 @@ but it does not reduce it either.
 
 The suite passed 79/79 while the daemon was unreachable. Nothing asserts daemon
 liveness under load, and that is the test this entry most needs.
+
+### Resolution — A9.2.6
+
+The missing half was found by reproducing the stall under control and taking a
+stack sample rather than reasoning from the strace. The serve loop was here:
+
+```
+atlas_server_serve -> atlas_server_dispatch -> method_session_open
+                   -> atlas_writer_ai -> pthread_cond_timedwait
+```
+
+and the writer thread here:
+
+```
+atlas_sem_index_on -> atlas_sem_index_run -> atlas_sem_parse_unit
+```
+
+So the answer to "which lock" is **no lock**: it is the writer's completion
+condition variable. A synchronous writer call queues a job on the single writer
+thread and waits with a timeout; a minutes-long semantic pass was ahead of it in
+the FIFO; and because the serve loop dispatches one request at a time, every
+other client — `daemon ping` included — waited behind that wait. Measured on this
+repository: ping 26 ms idle, **3.9 s per such write**, the write itself failing
+after 4027 ms. See `docs/engineering-rules.md` for the rules and the fix.
+
+**Correction 1 — "reads are unaffected" was wrong.** Both this file and
+`docs/semantic-discovery.md` said a pass costs the daemon its *writes* while
+reads continue. It does not: the cost is head-of-line, so a blocked write takes
+every client with it. A second client's `daemon ping` was measured at 4009 ms
+beside one blocked write, and the regression test asserts exactly that.
+
+**Correction 2 — the 5 s `ETIMEDOUT` was probably never SQLite's busy timeout,
+and this is stated as unestablished rather than corrected.** The original
+incident's strace was not re-run and cannot be, so what follows is inference
+about that incident from a mechanism proved in another. `writer_call_impl`'s
+default wait is 5000 ms — the same figure as `sqlite3_busy_timeout`, which is
+why the coincidence was persuasive. But a single `restart_syscall = -1
+ETIMEDOUT` after one uninterrupted interval is the shape of one
+`pthread_cond_timedwait`, whereas SQLite's busy handler sleeps in repeated small
+increments and would have left many short waits. The condvar is therefore the
+likelier reading of that trace, and the `fcntl(F_SETLK, F_WRLCK) = -1 EBADF` it
+also recorded remains unexplained by anything found here.
+
+**The test this entry said it most needs now exists.**
+`tests/test_daemon_responsive.c` drives a live daemon through a semantic pass and
+asserts liveness under exactly that load. It fails without the fix, with the
+figures above.
 

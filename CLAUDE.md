@@ -1,10 +1,18 @@
 # Atlas — working notes for Claude Code
 
 Atlas is a generic, headless engineering-memory and repository-intelligence CLI
-in C17. Phase **A9.2.5**: semantic index trust closure — every load-bearing
-semantic answer now carries the evidence for its own verdict, and a read that
-found nothing says whether that means anything. The two sentences the season
-exists for are
+in C17. Phase **A9.2.6**: daemon responsiveness — a caller waiting for the single
+writer thread can now stop waiting, so a semantic pass no longer takes every
+client with it. The sentence the season exists for is
+
+> **THE DEADLINE WAS NEVER THE BOUND; THE SHORT JOB WAS.**
+
+See `docs/daemon-and-ipc.md`.
+
+The season before it, **A9.2.5**, was semantic index trust closure: every
+load-bearing semantic answer carries the evidence for its own verdict, and a read
+that found nothing says whether that means anything. The two sentences it exists
+for are
 
 > **A SEMANTIC READ THAT FOUND NOTHING HAS NOT ESTABLISHED THAT THERE IS
 > NOTHING.**
@@ -51,6 +59,7 @@ document that carries it:
 
 | Season | What it added | Document |
 | --- | --- | --- |
+| A9.2.6 | a waiter that can stop waiting; one slow write no longer holds every client | `docs/daemon-and-ipc.md` |
 | A9.2.5 | the verdict every semantic read carries; zero rows are not an absence | `docs/semantic-trust.md` |
 | A9.2.4 | build-input discovery, and an activation policy that does not depend on memory | `docs/semantic-discovery.md` |
 | A9.2.3 | semantic freshness and coverage the daemon maintains; a source-current index can still be coverage-incomplete | `docs/semantic-freshness.md` |
@@ -540,6 +549,30 @@ is not written down is one somebody deletes.** Both halves are load-bearing.
   timing. **The sweep holds while the file index is behind.**
 - **Manual and automatic rebuild are one pipeline**, and there is **one shape on
   every surface**.
+
+### A9.2.6 — daemon responsiveness
+
+- **THE DEADLINE WAS NEVER THE BOUND; THE SHORT JOB WAS.** Every synchronous
+  writer call waits with a timeout, and that bounded a stall only while every job
+  on the queue was a handful of statements. A9.2.4 put a minutes-long pass on the
+  same thread and the same FIFO and the premise stopped holding.
+- **The serve loop dispatches one request at a time, so a caller waiting on the
+  writer is every client waiting.** A blocked write is not a cost to that write.
+- **`job_kind_is_unbounded` is asked of the kind, never of elapsed time**, and its
+  switch has no `default:`. Two kinds answer yes: the compiler pass and the
+  discovery walk.
+- **Reconciliation deliberately answers no.** A hook write refused during one
+  would be *dropped*, because hooks fail open, and refusing a write that would
+  have succeeded is the worse failure.
+- **`writer_wait_locked` is the one implementation of "a caller waits for the
+  writer"**, and it waits in slices so the condition can be re-asked.
+- **Backing out and timing out are different claims and never one message.**
+  `BUSY:` says nothing was queued and nothing will run, which is what makes a
+  retry safe; the timeout means the write is still on its way.
+- **Nothing overtakes anything.** `queue_remove` excises one never-started job
+  and the queue stays first-in-first-out.
+- **Ownership is settled under the lock that completes a job**, because a waiter
+  that has given up clears `wants_result` under that same lock.
 
 ### A9.2.5 — semantic index trust closure
 

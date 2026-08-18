@@ -2168,3 +2168,143 @@ rather than left to hold by accident.
 A repository whose A3 structural index is current may have a semantic index that
 is not. A query answer inherits the **semantic** verdict, never the structural
 index's currency, and no code path derives one from the other.
+
+## A9.2.6 layers — additions
+
+| File | Owns |
+| --- | --- |
+| `src/daemon/writer.c` | `job_kind_is_unbounded`, `writer_wait_locked`, `queue_remove`, `WRITER_BUSY_MSG`, the `running`/`running_kind` claim |
+| `include/atlas/limits.h` | `ATLAS_WRITER_WAIT_SLICE_MS` |
+| `tests/test_daemon_responsive.c` | liveness under load, driven against a live daemon |
+
+Nothing outside `src/daemon/writer.c` changed. The serve loop in
+`src/ipc/server.c` is untouched, deliberately: the defect was never that it
+dispatches serially — that is its design, and a second dispatcher would have been
+a new architecture for a bug with a smaller cause.
+
+## A9.2.6 rules — these are not negotiable
+
+### The deadline was never the bound; the short job was
+
+Every synchronous writer call in `src/daemon/writer.c` waits with a timeout, and
+the comment explaining why has always said the timeout is what stops one slow
+mutation stalling every other client. Read carefully, that was never true. The
+timeout bounds the stall *at the timeout* — four or five seconds, or three
+hundred for a maintenance call. What made it acceptable was that no job on the
+writer's queue ever took that long: the bound nobody wrote down was the job, not
+the deadline.
+
+A9.2.4 put an automatic, minutes-long semantic pass on the same thread and the
+same FIFO. Nothing in the waiting code changed, and it stopped being correct.
+This is the shape of failure worth remembering: **a premise that lives in a
+comment rather than in a check does not fail loudly when a different season
+invalidates it.**
+
+### A caller waiting on the writer is every client waiting
+
+The serve loop dispatches one request at a time. That is A1's design and it is
+fine — until a handler blocks, at which point the cost is not paid by that
+request, it is paid by every client with a connection and every client trying to
+open one. Measured on this repository before the fix: `daemon ping`, which
+touches no database and takes no lock, went from 26 ms to 3.9 s, and a second
+client's ping was measured at 4009 ms beside a single blocked write.
+
+So the rule for anything added to a serve-loop handler is not "is this fast
+enough for its caller" but **"is this fast enough for everybody else"**.
+
+### The question is asked of the kind, never of elapsed time
+
+`job_kind_is_unbounded` answers whether a job has a duration Atlas can state.
+Elapsed time was the obvious alternative and is wrong: it cannot distinguish a
+job that is nearly finished from one that has barely started, and a waiter
+guessing wrong in the second direction abandons a write that was about to
+succeed. The switch has **no `default:`**, so adding a job kind will not compile
+until somebody decides which side it is on.
+
+### Reconciliation deliberately answers no, and this is the season's trade
+
+Only two kinds answer yes: the pass that runs a compiler and the walk that looks
+for build descriptions.
+
+Reconciliation was considered and excluded on evidence. A first full pass over a
+large tree genuinely can exceed these timeouts — it was measured doing so under a
+ThreadSanitizer build, and that is why the regression test scopes its timings to
+the semantic window rather than pretending otherwise. But the common case is an
+incremental pass that finishes well inside them, reconciliation fires on every
+file change, and a hook write refused during one would be **dropped rather than
+delayed**, because hooks fail open and store metadata only. Refusing a write that
+would have succeeded is the worse failure and it would have been the frequent
+one. `ATLAS_JOB_SNAPSHOT` and `ATLAS_JOB_MAINTENANCE` are excluded for the same
+reason and carry the same residual.
+
+**The residuals, written down rather than discovered later:**
+
+1. During a semantic pass or a discovery walk, writer-bound ordinary writes are
+   **refused, not deferred**, and hook session records for its duration are lost.
+   That is the trade: a fast retryable refusal in place of a stalled daemon.
+2. A reconciliation, snapshot or maintenance job can still hold the serve loop up
+   to the waiting caller's own timeout. Nothing here fixes that, and nothing here
+   pretends to.
+
+### Backing out and timing out are different claims and never one message
+
+A synchronous writer call now fails in two ways that mean opposite things:
+
+- `BUSY:` — the job was **taken back out of the queue before anything looked at
+  it**. Nothing ran and nothing will, so sending the request again is safe.
+- the existing timeout — the job was accepted and **will run**; only the result
+  was abandoned. Retrying duplicates the write.
+
+A caller cannot tell these apart from a status code, which is why the difference
+is spelled out in the message rather than left to be inferred. Merging them into
+one wording would be a correctness bug in the caller, not a wording preference.
+No exit code was added: the exit-code vocabulary is a stable contract, and Atlas
+already types refusals with an uppercase token in the message.
+
+### The back-out condition is a conjunction, in one lock hold
+
+Backing out requires **both** that the writer is inside an unbounded job **and**
+that `queue_remove` found this job still queued. If it is not found, the writer
+has dequeued it and is running it: there is nothing to take back, and reporting a
+refusal would be reporting one for a write already in progress. Checking either
+half alone, or the two across separate lock holds, reintroduces exactly that.
+
+### Nothing overtakes anything
+
+`queue_remove` excises one never-started job and shifts the rest up by one. The
+queue stays first-in-first-out, and that is load-bearing well outside this file:
+the orchestration ledger and the decision lifecycle both depend on writes applying
+in the order they were accepted. A queue that let one job jump another to save a
+caller some latency would break them silently.
+
+### One implementation of "a caller waits for the writer"
+
+`writer_wait_locked` replaced nine identical wait loops. Nine copies of a waiting
+rule is nine places to fix it, and a daemon that is responsive on eight of nine
+methods is indistinguishable from one that is intermittently broken. Each caller
+still handles its own ownership and its own detach, because those genuinely
+differ — three of them clear pointers into caller-owned result structs, and one
+of those is a freshly minted credential that must never be written into a struct
+whose owner has gone.
+
+The wait is **sliced** rather than made in one call, so the condition can be
+asked again: a pass that starts *after* a job is queued blocks it exactly as much
+as one already running, and a single `pthread_cond_timedwait` would sleep
+straight through the difference. A slice expiring is not a timeout; only the
+caller's deadline is.
+
+### Ownership is settled under the lock that completes a job
+
+The writer reads `wants_result` in the same hold that sets `done` and clears the
+running claim. A waiter that has given up clears `wants_result` under that same
+lock, so reading it outside the hold could observe a waiter that has already
+returned and hand it the job to free.
+
+### A gate that cannot fail is worse than no gate
+
+`tests/test_daemon_responsive.c` asserts that it observed a pass in flight and
+that at least one write actually met the busy path, and fails saying so if
+neither happened. Without those two assertions a fixture that finished before
+anything could look at it would let every other assertion pass while testing
+nothing — which is precisely how the suite passed 79/79 while the daemon was
+unreachable for twenty-five minutes.

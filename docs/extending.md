@@ -431,3 +431,55 @@ Raising either needs an argument about storms. The unit retry bound is
 compile-time, per unit and per pass, and nothing durable records that a retry
 happened — that is the whole guarantee, and a durable retry counter would replace
 it with one that has to be reasoned about after a restart.
+
+## A9.2.6 — how long a caller waits for the writer
+
+### Adding a job kind to `atlas_job_kind`
+
+`job_kind_is_unbounded` in `src/daemon/writer.c` has **no `default:`**, so the
+build fails until the new kind is placed on one side of it. That is the checklist
+entry: it is not optional and it cannot be skipped, by construction.
+
+Answer `true` only if the job has no duration Atlas can state — it runs a
+compiler, walks a tree, or otherwise does work bounded by the repository rather
+than by a statement count. Everything else answers `false`.
+
+What answering `true` costs: for the whole time that job runs, **every**
+synchronous writer call is refused with `BUSY:` rather than queued. For a hook
+session write that means the record is *lost*, because hooks fail open. Answering
+`true` for a frequent job is therefore not a conservative choice — it is a
+data-loss choice, which is why reconciliation answers `false`. See the A9.2.6
+section of `docs/engineering-rules.md` for that argument in full.
+
+What answering `false` costs: a caller — and therefore every other client, since
+the serve loop dispatches serially — can wait up to that caller's own timeout.
+
+### Adding a synchronous writer call
+
+Use `writer_wait_locked`. Do not write a fresh `while (!j->done)` loop: it will be
+the tenth copy of a rule that took a season to get right, and the first one to
+miss the next change to it.
+
+The caller keeps its own ownership handling, and there are three exits to get
+right:
+
+| Outcome | Job ran? | Who frees it |
+| --- | --- | --- |
+| `j->done` | yes | the caller, after reading the result |
+| backed out (`writer_wait_locked` returned `true`) | **no** | the caller, immediately |
+| deadline passed | **yes, eventually** | the writer; the caller clears `wants_result` and any pointers into its own structs |
+
+Report the back-out with `WRITER_BUSY_MSG` and nothing else. Its second sentence
+— nothing was queued and nothing will run — is what makes a retry safe, and it is
+false for the deadline case, which is why the two messages are separate.
+
+### Bounds this season added
+
+| Bound | Where | Reached ⇒ |
+| --- | --- | --- |
+| `ATLAS_WRITER_WAIT_SLICE_MS` | `limits.h` | nothing; the waiter re-asks the busy question |
+
+It is a responsiveness bound, never a correctness one: a waiter that never woke
+early would still return the right answer, just later. Lowering it wakes an idle
+daemon more often for nothing; raising it lengthens the head-of-line stall before
+a waiter notices it should stop waiting.

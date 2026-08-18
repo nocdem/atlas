@@ -407,28 +407,83 @@ declaring one test root is not evidence that every test root was declared, so
 `ATLAS_COVDIM_TESTS` stays UNKNOWN and a production-scope absence stays
 UNAVAILABLE.
 
-## A9.2.6 — daemon responsiveness (next, before O10)
+## A9.2.6 — daemon responsiveness (CLOSED)
 
-Small and operational, carrying the one finding A9.2.5 established and did not
-fix. A semantic index pass can leave the daemon answering nothing for tens of
-minutes: the serve loop in `src/ipc/server.c` is a single `poll()` loop that
-dispatches each request synchronously, so one slow request blocks every client
-including `daemon ping`, which touches no repository at all.
+The sentence the season exists for:
 
-Verdict on the cause: **SUPPORTED BUT INCOMPLETE**. Measured and *disproven*: the
-WAL is not the cause — `wal_autocheckpoint` is 1000 and active,
-`wal_checkpoint(PASSIVE)` returns `0|22|22`, and `daemon ping` measures 22 ms
-with the WAL at 255 MB. Established: the stall is coincident with a semantic
-pass, the serve loop is serial, and it exhausted a 5 s SQLite busy timeout during
-one. Not established: which lock, which request, and whether the cause is
-contention or plain I/O saturation.
+> **THE DEADLINE WAS NEVER THE BOUND; THE SHORT JOB WAS.**
 
-It does not break trust correctness — every answer the daemon gave was correct —
-but a repository-intelligence daemon that answers nothing is indistinguishable
-from one that is down, and A9.2.4 made the triggering condition the default. The
-first lever is A8-CI's own rule that an operation which can outlast a client's
-patience does not run in the serve loop: indexing was moved out, semantic *reads*
-were not. `docs/backlog.md` carries the evidence and the candidate fixes.
+Carried the one finding A9.2.5 established and deliberately did not fix: a
+semantic index pass could leave the daemon answering nothing. The cause was
+recorded then as **SUPPORTED BUT INCOMPLETE** — the WAL explanation measured and
+disproven, the serial serve loop established, and *which* request held it
+explicitly not established. This season established it, and the answer was not
+the one the earlier evidence pointed at.
+
+Reproduced under control, then sampled rather than reasoned about. The serve loop
+in `src/ipc/server.c` dispatches each request synchronously, so it was sitting in
+
+```
+atlas_server_serve -> atlas_server_dispatch -> method_session_open
+                   -> atlas_writer_ai -> pthread_cond_timedwait
+```
+
+while the writer thread sat in `atlas_sem_index_on -> atlas_sem_parse_unit`. Not
+a SQLite lock at all: a synchronous writer call, waiting out its whole timeout
+for a job queued behind a minutes-long pass on the single writer thread. Measured
+on this repository: `daemon ping` 26 ms idle, **3.9 s for every write that arrived
+during a pass**, with the write itself failing after 4027 ms. Claude Code fires a
+hook on every event and every hook opens a session, so on any repository with
+automatic semantic maintenance this was the ordinary case rather than a corner.
+
+Every synchronous writer call already waited with a timeout, and the comment
+saying why has always claimed the timeout is what stops one slow mutation
+stalling every other client. That held only while every job on the queue was a
+handful of statements. A9.2.4 put an automatic, minutes-long pass on the same
+thread and the same FIFO, and the premise stopped holding without a line of the
+waiting code changing.
+
+The fix is that a waiter can now ask what the writer is doing.
+`job_kind_is_unbounded` is the question, asked of the job *kind* rather than of
+elapsed time — elapsed time cannot tell a job nearly finished from one barely
+started, and guessing wrong that way abandons a write about to succeed. Two kinds
+answer yes: the pass that runs a compiler, and the walk that looks for build
+descriptions. `writer_wait_locked` is the one implementation of "a caller waits
+for the writer", replacing nine identical copies, and it waits in slices so the
+condition can be re-asked. A job still queued is taken back out and the caller is
+told `BUSY:` — **nothing was queued and nothing will run**, which is what makes
+retrying safe and is the claim the existing timeout deliberately does not make.
+
+No schema change, no migration, no new thread, no new queue, no exit code added,
+and nothing in A9.2.5's PRESENT/ABSENT/UNKNOWN rules moved: this season is about
+when a caller stops waiting, not about what any answer means. Ordering did not
+move either — `queue_remove` excises one never-started job and shifts the rest up
+by one, because the orchestration ledger and the decision lifecycle both depend on
+writes applying in the order they were accepted.
+
+Deliberately not done, and written down rather than discovered later:
+
+- **Reconciliation is not treated as unbounded.** An incremental pass finishes
+  well inside these timeouts, and a hook write refused during one would be
+  *dropped* rather than delayed, because hooks fail open. A first full pass over a
+  large tree can therefore still hold the loop up to a caller's timeout, and a
+  sanitiser build makes that visible.
+- **Snapshot and maintenance are not treated as unbounded either**, for the same
+  reason and with the same residual.
+- **Writes are refused, not deferred, for the duration of a pass.** That is the
+  trade the season makes: a fast, retryable refusal in place of a stalled daemon.
+
+`docs/engineering-rules.md` carries the rules and the full argument;
+`docs/daemon-and-ipc.md` carries the behaviour; `docs/backlog.md` carries the
+original incident with this resolution appended to it.
+
+## Next: O10
+
+O10 is the next milestone. This roadmap has never carried a section for it — it
+is named here, in `docs/backlog.md` and in the A9.2.5 closure notes as the thing
+the operational items were to be resolved before, and its scope is not written
+down in this repository. It is named as next rather than described, because
+describing it would mean inventing it.
 
 ## A7 (original plan) — optional MCP adapter (absorbed into A2)
 

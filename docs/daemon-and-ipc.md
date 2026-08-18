@@ -56,6 +56,56 @@ takes it when it is free (so a first run can create and migrate the database) an
 falls back to a read-only handle when the daemon holds it. That is what lets
 `atlas status`, `atlas search` and the rest keep working while the daemon runs.
 
+## A9.2.6: what happens to a write while the writer is busy
+
+One writer thread and one FIFO means a write can be queued behind work that takes
+minutes — an automatic semantic index pass, or the walk that looks for build
+descriptions. The serve loop dispatches one request at a time, so a caller
+waiting on the writer is not the only one waiting: **every** client is, including
+`daemon.ping`, which touches no database and takes no lock.
+
+That is what used to happen. Measured on Atlas' own repository: ping 26 ms idle,
+**3.9 s for every write that arrived during a pass**, with the write itself
+failing after 4027 ms — and Claude Code fires a hook, and therefore a session
+write, on every event.
+
+A waiter now asks what the writer is doing. If the writer is inside a job with no
+statable duration *and* the waiter's job is still in the queue, the job is taken
+back out and the caller is answered at once:
+
+```
+BUSY: the Atlas daemon is performing semantic maintenance and cannot take this
+write yet. Nothing was queued and nothing will run, so the request may be sent
+again.
+```
+
+**That second sentence is the contract.** A `BUSY:` refusal means nothing ran, so
+the request may be retried. It is a different claim from the timeout a
+synchronous write can still hit — that one means the write *was* accepted and
+will be applied, and only the result was abandoned. Retrying it duplicates the
+write. The two are never merged into one message, and neither adds an exit code:
+both are `internal` (1), typed by the token, as Atlas types every other refusal.
+
+What this does **not** cover, deliberately:
+
+- **Reconciliation, snapshot and maintenance jobs are not treated as unbounded.**
+  An incremental reconciliation finishes well inside these timeouts and fires on
+  every file change, and refusing writes during one would *drop* hook records
+  rather than delay them, because hooks fail open. A first full pass over a large
+  tree can therefore still hold the loop up to the waiting caller's timeout.
+- **Writes during a semantic pass are refused, not deferred.** Hook session
+  records for the duration of a pass are lost. That is the trade the season
+  makes: a fast, retryable refusal in place of a daemon that answers nothing.
+
+Ordering is unchanged. A job that backs out is excised from the queue and the
+rest shift up by one; nothing overtakes anything, because the orchestration
+ledger and the decision lifecycle both depend on writes applying in the order they
+were accepted.
+
+`docs/engineering-rules.md` carries the rules and the argument for each;
+`docs/extending.md` carries the checklist for adding a job kind or a new
+synchronous writer call.
+
 ## Socket
 
 ```

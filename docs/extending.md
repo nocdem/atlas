@@ -356,6 +356,61 @@ compiler finds the first kind and not the second.
   the malformed matrix. An unknown key stays an error, and an unrecognised
   *value* is malformed rather than silently taken as one of the known ones.
 
+## A11.0 — the run, and what may join one
+
+### Adding a value to `atlas_orch_run_status`
+
+The vocabulary is `UNKNOWN`, `ACTIVE`, `ACCEPTED`, `BLOCKED`. Adding a member
+means all of:
+
+1. The enum in `include/atlas/orch.h`. **UNKNOWN stays zero.**
+2. `atlas_orch_run_status_name` and `atlas_orch_run_status_is_terminal` in
+   `src/orch/orch.c`. Neither switch has a `default:`, so both are compile errors
+   until you handle the new member — which is the point.
+3. `atlas_orch_run_status_parse`'s table, **unless the new member is another
+   "nobody filled this in" value**, which must not parse for the same reason
+   `UNKNOWN` does not.
+4. The `CHECK` on `orch_runs.status`, in a new additive migration. Migration 21's
+   own `CHECK` is not edited: an existing database keeps the constraint it was
+   created with, and a migration that rewrites a table to widen a `CHECK` is a
+   rebuild with all of A9.1's migration-13 obligations.
+5. `atlas_db_orch_run_set_status`'s permitted-target test, deliberately, because
+   it is a positive list rather than a "not terminal" check.
+6. `tests/test_orch_run.c`'s vocabulary case.
+
+**If the new member is terminal**, `submit_resolve_run` already refuses a child
+against it through `atlas_orch_run_status_is_terminal` — nothing there needs
+editing, which is why that predicate exists rather than a comparison against two
+named constants.
+
+### Adding a state to `atlas_orch_state`
+
+A8's checklist still applies, and A11.0 adds one obligation: **the partial unique
+index `idx_orch_jobs_one_active_per_run` spells the terminal set out in SQL**,
+because SQLite cannot call `atlas_orch_state_is_terminal`. A new terminal state
+must be added to that predicate in a new migration that drops and recreates the
+index. `tests/test_orch_run.c` compares the two spellings over the whole
+vocabulary and fails if they disagree, so this cannot be forgotten silently — but
+it can only be *fixed* in a migration, not by editing migration 21.
+
+### Who may settle a run
+
+**Nothing in production calls `atlas_db_orch_run_set_status`.** Before adding the
+first caller, the question to answer is not "where does this go?" but "whose
+authority is this?" — and the answer must not be a model's. A8's rule holds
+underneath: a completed job is not an authority, and it approves, applies and
+commits nothing. If a run's acceptance ever becomes reachable over the socket,
+it belongs in the operator-uid method group, alongside `code.index` and
+`code.sem_config`, and never in the ordinary group or in `TOOLS[]`.
+
+### Bounds this season added
+
+| Bound | Where | What happens when it is reached |
+| --- | --- | --- |
+| one active task per run | `idx_orch_jobs_one_active_per_run` and `submit_resolve_run` | the submission is refused, naming the task in the way |
+| one root per run | `orch_runs.root_job_uid`, written once at creation | nothing rewrites it; a run has exactly one root |
+| a run's repository | `orch_runs.repo_identity_hash`, compared against every child | a child describing a different repository is refused |
+
 ## A9.2.5 — the semantic verdict, and where a walk could not look
 
 ### Adding a value to `atlas_sem_verdict`

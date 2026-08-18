@@ -562,11 +562,92 @@ Deliberately not done:
   a reconciliation, snapshot or maintenance job can still wait out its caller's
   timeout.
 
-## Next: A11.0
+## A11.0 — the durable single-worker run (CLOSED)
 
-A11.0 is the next milestone. Its scope is not written down in this repository,
+The sentence the season exists for:
+
+> **A CHAIN OF TASKS WAS EXPRESSIBLE AND NOT ENFORCEABLE.**
+
+A11.0 was named as next in the O10 closure notes with its scope deliberately
+unwritten. Written down, it turned out to be a milestone whose task half already
+existed and whose run half did not exist at all — and the interesting part is
+exactly where the line fell, because it was not where the field names suggested.
+
+**What was already delivered, and by which season.** A8's control plane already
+held most of the state A11.0 was asked to establish, and it holds it durably:
+
+| The requirement | Where it already lived |
+| --- | --- |
+| `task_id` | `orch_jobs.job_uid` — random, unguessable, unique |
+| `attempt_number` | `orch_attempts.attempt_no`, `UNIQUE(job_id, attempt_no)`, monotonic per task |
+| `status` | the eleven-state machine, `atlas_orch_transition_allowed`, and the `orch_transitions` ledger |
+| the repository and source a task is bound to | `repo_identity_hash`, `repo_name` and a pinned `source_commit` — never a branch |
+| duplicate and retry collapsing to one task | `orch_idempotency`, keyed per submitter, checked inside the submit transaction |
+| a model payload producing no authority | A8's design: the submitter is `SO_PEERCRED`, every reason is a closed vocabulary, and a completed job approves, applies and commits nothing |
+| a refusal that does not become a silent loss | A9.2.6's `BUSY:`, which says nothing was queued and nothing will run |
+
+None of that was rebuilt, and no vocabulary was invented beside one that already
+worked. `parent_task_id` maps onto a column A8 already had.
+
+**What A11.0 added.** The column A8 had was `parent_job_uid`, and it was checked
+for *shape* at submission — `'j'` plus 32 lowercase hex — and for nothing else.
+Nothing asked whether the parent existed. A submission naming
+`j00000000000000000000000000000000` as its parent was accepted and stored, and
+every later reader of that chain would have been wrong about it. The gap was not
+a missing field; it was a field nobody resolved.
+
+So A11.0 is the resolution, and the run it needs to be resolvable against:
+
+1. **The run.** `orch_runs` — a run uid, the one task it was created for, the
+   repository identity it is bound to, and a status. A root task creates its run;
+   a child inherits its parent's. The run identity is *derived*, never supplied:
+   it is not a field of `atlas_orch_spec`, so `ATLAS_ORCH_SPEC_DOMAIN` did not
+   move and no stored `spec_digest` means anything different than it did.
+2. **Four refusals at submission**, all inside the transaction that inserts the
+   job, because a check that a run is still ACTIVE is worthless if a second
+   submission can land between the check and the insert: the parent must exist,
+   it must describe the same repository, its run must not be terminal, and the
+   run must have no other active task.
+3. **One active task per run, in the schema.** A partial unique index on
+   `orch_jobs(run_uid)` over the non-terminal states, following `M8_LEASES`'
+   precedent for "at most one unreleased lease per job". This is not belt and
+   braces: with the C check disabled the submission is still refused, by the
+   constraint. The check exists so the caller gets a sentence naming the task in
+   the way instead of a constraint violation it cannot act on.
+
+**What A11.0 deliberately did not build.** No worker is started, no driver runs,
+no follow-up task is generated, and nothing settles a run automatically.
+
+The run's status is **its own axis and is derived from nothing**. A task ending
+SUCCEEDED does not accept its run and a task ending FAILED does not block one,
+because "this attempt finished" and "this line of work is settled" are different
+claims — the separation A9.2 keeps between a verification state and a lifecycle
+status, one layer out. `atlas_db_orch_run_set_status` exists so that a caller
+which has decided can record the decision; **A11.0 calls it from no automatic
+path**, and there is no RPC method, no MCP tool and no gateway route that reaches
+it. That is what makes "a model payload cannot accept a run" true by absence
+rather than by a check, which is the house form of the claim.
+
+**Residuals, written down rather than left to be discovered.**
+
+- **`ATLAS_ORCH_RUN_ACCEPTED` and `ATLAS_ORCH_RUN_BLOCKED` have no producer in
+  production code.** They exist, the schema stores them, the submit path refuses
+  a child against them, and only a test moves a run into one. Who may settle a
+  run is A11.1's question and answering it here would have been inventing it.
+- **No job that existed before migration 21 belongs to a run**, and none was
+  backfilled. `run_uid` is empty for every one of them, which reads as "this job
+  belongs to no run" and never as "this job is the root of its own run". Such a
+  job is refused as a parent, with a message saying so.
+- **The run is per single worker, as the name says.** Nothing here makes two
+  tasks in one run safe to run at once; the index makes it impossible instead.
+
+## Next: A11.1
+
+A11.1 is the next milestone. Its scope is not written down in this repository,
 and it is named as next rather than described, because describing it would mean
-inventing it.
+inventing it. What A11.0 leaves it is a resolved chain and two unproduced
+statuses, which is a smaller and more honest starting point than a phase that had
+guessed who was allowed to write them.
 
 **A10 is not closed and is not cancelled**, and the ordering is deliberate rather
 than an oversight. A10 is the Experience Learning phase, and the contract it must
@@ -576,7 +657,7 @@ is that **A10 must treat `UNKNOWN` as epistemic uncertainty and must never fold
 it into a negative fact.** Atlas can guarantee it never *produces* an unjustified
 `ABSENT`; it cannot guarantee a later phase reads `UNKNOWN` correctly, which is
 what makes that a contract on the consumer and not a property of this codebase.
-Nothing here weakens it, and a reader who arrives at A11.0 should not conclude
+Nothing here weakens it, and a reader who arrives at A11.1 should not conclude
 that the phase before it was absorbed.
 
 ## A7 (original plan) — optional MCP adapter (absorbed into A2)

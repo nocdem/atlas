@@ -1,16 +1,30 @@
 # Atlas — working notes for Claude Code
 
 Atlas is a generic, headless engineering-memory and repository-intelligence CLI
-in C17. Phase **O10**: production evidence ingestion — the verification intake
-surface a real agent submits through is now proved, at that surface, to be one a
-client can rely on. The sentence the season exists for is
+in C17. Phase **A11.0**: the durable single-worker run — a chain of tasks is now
+a fact about stored rows rather than a well-formed string. The sentence the
+season exists for is
+
+> **A CHAIN OF TASKS WAS EXPRESSIBLE AND NOT ENFORCEABLE.**
+
+A8 gave `orch_jobs` a `parent_job_uid` and resolved it nowhere: the column was
+checked for shape and nothing asked whether the parent existed. A11.0 adds the
+run that makes it resolvable, four refusals at submission, and one active task
+per run enforced by a partial unique index. It starts no worker and settles no
+run: the run's status is its own axis, no task transition writes it, and nothing
+in production produces `ACCEPTED` or `BLOCKED`. See the A11.0 section in
+`docs/roadmap.md` and `docs/orchestration.md`.
+
+The season before it, **O10**, was production evidence ingestion: the
+verification intake surface a real agent submits through is now proved, at that
+surface, to be one a client can rely on. The sentence it exists for is
 
 > **THE SURFACE WAS ALREADY THERE; NOBODY HAD PROVED A CLIENT COULD RELY ON IT.**
 
 It changed no line of `src/`. Production ingestion shipped in A9.2.1; what was
 missing was evidence that a retry makes one row, that a record survives a
 restart, and that a submission refused while the daemon is busy wrote nothing.
-See the O10 section in `docs/roadmap.md` and `docs/verification.md`.
+See `docs/verification.md`.
 
 The season before it, **A9.2.6**, was daemon responsiveness: a caller waiting for
 the single writer thread can now stop waiting, so a semantic pass no longer takes
@@ -70,6 +84,7 @@ document that carries it:
 
 | Season | What it added | Document |
 | --- | --- | --- |
+| A11.0 | the run a chain of tasks belongs to; a parent that resolves, and one active task in it | `docs/orchestration.md` |
 | O10 | the intake surface proved at the boundary a client reaches; no line of `src/` changed | `docs/verification.md` |
 | A9.2.6 | a waiter that can stop waiting; one slow write no longer holds every client | `docs/daemon-and-ipc.md` |
 | A9.2.5 | the verdict every semantic read carries; zero rows are not an absence | `docs/semantic-trust.md` |
@@ -561,6 +576,47 @@ is not written down is one somebody deletes.** Both halves are load-bearing.
   timing. **The sweep holds while the file index is behind.**
 - **Manual and automatic rebuild are one pipeline**, and there is **one shape on
   every surface**.
+
+### A11.0 — the durable single-worker run
+
+- **A CHAIN OF TASKS WAS EXPRESSIBLE AND NOT ENFORCEABLE.** A8 gave `orch_jobs` a
+  `parent_job_uid`, checked it for shape — `'j'` plus 32 lowercase hex — and
+  resolved it nowhere. A submission naming a parent that never existed was
+  accepted and stored. The gap was not a missing field; it was a field nobody
+  resolved.
+- **The run identity is derived, never supplied.** It is not a member of
+  `atlas_orch_spec`, so `ATLAS_ORCH_SPEC_DOMAIN` did not move and no stored
+  `spec_digest` means anything different than it did. A root task creates its
+  run; a child inherits its parent's.
+- **Every check is inside the submit transaction**, for the reason the
+  idempotency check is: a check that a run is still ACTIVE is worthless if a
+  second submission can land between the check and the insert. Four conditions,
+  all refusals and none a repair — the parent exists, it describes the same
+  repository, its run is not terminal, and the run has no other active task.
+- **"One active task per run" is a partial unique index**, following `M8_LEASES`'
+  precedent. With the C check disabled the submission is still refused, by the
+  constraint: the schema is the guarantee and the check is there to name the task
+  in the way instead of raising a constraint violation nobody can act on.
+- **CANCEL_REQUESTED is not terminal on either side.** A task asked to stop has
+  not stopped, and a run that admitted a second task at that moment would have
+  two. The SQL predicate and `atlas_orch_state_is_terminal` are compared over the
+  whole vocabulary in `tests/test_orch_run.c`, because SQLite cannot call the C
+  function and two spellings of one rule drift.
+- **The run's status is its own axis and is derived from nothing.** A task ending
+  SUCCEEDED does not accept its run; a task ending FAILED does not block one.
+  UNKNOWN is zero, is not terminal, and does not parse — a stored run may never
+  hold it, so a database presenting it is reporting corruption.
+- **Nothing in production settles a run.** `ACCEPTED` and `BLOCKED` have no
+  producer outside a test. `atlas_db_orch_run_set_status` is a compare-and-swap
+  with no RPC method, no MCP tool and no gateway route, which is what makes "a
+  model payload cannot accept a run" true by absence rather than by a check.
+  Who may decide is A11.1's question.
+- **No pre-migration job was backfilled into a run.** An empty `run_uid` reads as
+  "this job belongs to no run", never as "this job is the root of its own", and
+  such a job is refused as a parent. Inventing a run for a parentless historical
+  job would be migration 19's mistake.
+- **A11.0 starts no worker**, runs no driver, generates no follow-up task and
+  makes no automatic decision. It builds the chain A11.1 will use.
 
 ### O10 — production evidence ingestion
 

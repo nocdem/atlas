@@ -524,6 +524,113 @@ following them, refuses anything that is not a directory or regular file, and
 takes only the same three validated components `atlas_ws_open` takes. **Atlas has
 no "remove this path recursively" primitive and must not grow one.**
 
+## The run (A11.0)
+
+A8 gave a job a `parent_job_uid` and resolved it nowhere. The column was checked
+for shape at submission — `'j'` plus 32 lowercase hex — and nothing asked whether
+the parent existed, whether it described the same repository, or whether anything
+already followed it. A submission naming `j00000000000000000000000000000000` as
+its parent was accepted and stored, and every later reader of that chain would
+have been wrong about it.
+
+> **A CHAIN OF TASKS WAS EXPRESSIBLE AND NOT ENFORCEABLE.**
+
+A **run** is the durable grouping one chain of tasks belongs to: a root task, and
+whatever follows it, under one identity that survives a restart.
+
+### The state, and where each field lives
+
+| What A11.1 needs | Where it is | Notes |
+| --- | --- | --- |
+| `run_id` | `orch_runs.run_uid`, and `orch_jobs.run_uid` on every task in it | `'r'` plus 32 lowercase hex; a different prefix from a job's `'j'` so the two cannot be confused |
+| `task_id` | `orch_jobs.job_uid` | A8's, unchanged |
+| `parent_task_id` | `orch_jobs.parent_job_uid` | A8's column; A11.0 is what resolves it |
+| `attempt_number` | `orch_attempts.attempt_no` | monotonic per task, `UNIQUE(job_id, attempt_no)`; a child's attempts start at 1 and inherit nothing from its parent |
+| task `status` | `orch_jobs.state` | A8's eleven-state machine |
+| run `status` | `orch_runs.status` | `ACTIVE`, `ACCEPTED`, `BLOCKED` — its own axis |
+| the repository and source | `orch_runs.repo_identity_hash`, and each task's `repo_identity_hash` and pinned `source_commit` | every task in a run must agree with the run |
+
+The run identity is **derived, never supplied**. It is not a member of
+`atlas_orch_spec`, so `ATLAS_ORCH_SPEC_DOMAIN` did not move and every stored
+`spec_digest` means exactly what it meant before A11.0. A root task — one
+submitted with no parent — creates its run. A child inherits its parent's.
+
+### What submission refuses
+
+All four checks run inside the transaction that inserts the job, for the reason
+the idempotency check does: a check that a run is still ACTIVE is worthless if a
+second submission can land between the check and the insert. Every one refuses
+the whole submission; none repairs anything.
+
+1. **The parent must exist.** `no job named %s exists to be a parent`.
+2. **The parent must belong to a run.** A job from before migration 21 does not,
+   and inventing one for it now would be the backfill the migration refused.
+3. **The parent must describe the same repository.** A chain that changes
+   repository midway is two chains, and joining them would let a child inherit a
+   run whose source identity it does not share.
+4. **The run must be ACTIVE, and must have no other active task.**
+
+### One active task per run
+
+This is a partial unique index on `orch_jobs(run_uid)` over the non-terminal
+states, not only a checked `SELECT`. It follows `M8_LEASES`' precedent for "at
+most one unreleased lease per job", and it is load-bearing rather than
+decorative: with the C check disabled the submission is still refused, by the
+constraint. The check in `submit_resolve_run` exists so the caller gets a
+sentence naming the task in the way instead of a constraint violation it cannot
+act on.
+
+**CANCEL_REQUESTED is deliberately not terminal**, on either side. A task that
+has been asked to stop has not stopped, and a run that admitted a second task at
+that moment would have two. The index predicate spells the terminal set out in
+SQL because SQLite cannot call `atlas_orch_state_is_terminal`;
+`tests/test_orch_run.c` compares the two over the whole vocabulary rather than
+trusting they were kept in step by hand.
+
+### The run's status is its own axis
+
+A task ending SUCCEEDED **does not** accept its run. A task ending FAILED **does
+not** block one. "This attempt finished" and "this line of work is settled" are
+different claims, and no code path derives either from the other — the separation
+A9.2 keeps between a verification state and a lifecycle status, one layer out. A
+run whose only task succeeded is still `ACTIVE`, which is exactly what lets a
+follow-up task join it.
+
+`UNKNOWN` is zero, is not terminal, and **does not parse**: it is the
+vocabulary's zero, no stored run may hold it, and a database presenting it is
+reporting corruption rather than a state.
+
+`atlas_db_orch_run_set_status` is a compare-and-swap — the caller names the
+status it believes the run holds, and exactly one row must change. Only
+`ACTIVE -> ACCEPTED` and `ACTIVE -> BLOCKED` are permitted; a terminal run is
+final in both directions.
+
+### What A11.0 deliberately does not do
+
+- **It starts no worker**, runs no driver, and generates no follow-up task.
+- **Nothing in production settles a run.** `ACCEPTED` and `BLOCKED` have no
+  producer outside a test. There is **no RPC method, no MCP tool and no gateway
+  route** that reaches `atlas_db_orch_run_set_status`, which is what makes "a
+  model payload cannot accept a run" true by absence rather than by a check —
+  the house form of the claim, as A9.2's `AUTO_REJECT` and A9's remote credential
+  administration are absent rather than refused. Who may settle a run is A11.1's
+  question, and answering it here would have been inventing it.
+- **It backfills nothing.** Every job that existed before migration 21 keeps an
+  empty `run_uid` and belongs to no run.
+
+### Reading it back
+
+`atlas_db_orch_run_get` returns the run whole: its identity, its root, the
+repository it is bound to, its status, and the one task in it that is still
+active with that task's state. `active_job_uid` is part of the view rather than a
+second query because "which task is this run waiting on?" is the question a
+caller resuming after a restart actually has, and answering it in two reads would
+let the two disagree. An empty `active_job_uid` is an ordinary answer — a run
+between tasks — and never an error.
+
+`atlas_orch_job_view` carries `run_uid` and `parent_job_uid`, so the chain is
+read back rather than reconstructed.
+
 ## Status: what is implemented, and what is not
 
 Everything A8 set out to build is implemented and tested: the job model and its
@@ -533,6 +640,10 @@ root-owned policy, the two RPC groups, the dispatcher process, workspace
 provisioning and source snapshotting, bounded command execution, both drivers,
 patch and artifact collection, log redaction, the CLI surface and the systemd
 unit.
+
+**A11.0 added the run** — see the section above. Its two terminal statuses have no
+producer in production code, and settling a run is reachable from no RPC method,
+MCP tool or gateway route. That absence is the deferral, not an oversight.
 
 **Deferred past A8, and absent rather than refused:** applying a generated patch,
 autonomous commits, branch creation, push, GitHub issue ingestion, PR creation,

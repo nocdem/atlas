@@ -147,6 +147,42 @@ static void expect_tool_refused(const atlas_buf *out, const char *marker, const 
     T_CHECK_MSG(!tool_ok(out, marker), "%s was accepted through MCP and must not be", what);
 }
 
+/* One of the uids Atlas minted, read out of a reply the way a client does.
+ *
+ * Atlas mints every uid from a fixed alphabet with a written prefix, so scanning
+ * for the prefix is safe: no repository byte can appear inside one. The reply is
+ * JSON-escaped, which is why the scan stops at a backslash as well as a quote. */
+static void uid_from(const atlas_buf *out, const char *prefix, char *uid, size_t cap) {
+    const char *p = strstr(atlas_buf_cstr(out), prefix);
+    T_REQUIRE(p != NULL);
+    size_t n = 0;
+    while (n + 1u < cap && p[n] != '\0' && p[n] != '\\' && p[n] != '"') {
+        uid[n] = p[n];
+        n++;
+    }
+    uid[n] = '\0';
+}
+
+/* One scalar out of the fixture's index, read locally. The daemon must be
+ * stopped first — these tests read the same file it writes. */
+static int64_t count_in_db(env *e, const char *sql, const char *bind, atlas_err *err) {
+    atlas_buf db_path = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_appendf(&db_path, err, "%s/atlas.db", fx_data_dir(&e->fx)), err);
+    sqlite3 *db = NULL;
+    T_REQUIRE(sqlite3_open_v2(atlas_buf_cstr(&db_path), &db, SQLITE_OPEN_READONLY, NULL) ==
+              SQLITE_OK);
+    sqlite3_stmt *st = NULL;
+    T_REQUIRE(sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK);
+    if (bind != NULL) {
+        T_REQUIRE(sqlite3_bind_text(st, 1, bind, -1, SQLITE_STATIC) == SQLITE_OK);
+    }
+    int64_t n = sqlite3_step(st) == SQLITE_ROW ? sqlite3_column_int64(st, 0) : -1;
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    atlas_buf_free(&db_path);
+    return n;
+}
+
 /* --- §10: the transport decides what an actor is -------------------------- */
 
 /* The defect this closes was Atlas' own, not an attacker's.
@@ -258,16 +294,8 @@ static void test_a_model_cannot_produce_evidence_only_atlas_could_have(void) {
                      "{\"name\":\"atlas_verify_claim_create\",\"arguments\":"
                      "{\"repo\":\"subject\",\"text\":\"c\"}}}\n",
             &out, &err);
-    /* The uid Atlas minted, read out of the reply the way a client would. */
-    const char *p = strstr(atlas_buf_cstr(&out), "atlas-claim-");
-    T_REQUIRE(p != NULL);
     char claim[96];
-    size_t n = 0;
-    while (n + 1u < sizeof claim && p[n] != '\0' && p[n] != '\\' && p[n] != '"') {
-        claim[n] = p[n];
-        n++;
-    }
-    claim[n] = '\0';
+    uid_from(&out, "atlas-claim-", claim, sizeof claim);
 
     /* Every class whose entire evidentiary weight comes from Atlas having
      * performed the act. A model naming one is making a claim about what it is,
@@ -341,15 +369,8 @@ static void test_no_mcp_call_can_assert_truth_or_coverage(void) {
                      "{\"name\":\"atlas_verify_claim_create\",\"arguments\":"
                      "{\"repo\":\"subject\",\"text\":\"nothing calls the helper\"}}}\n",
             &out, &err);
-    const char *p = strstr(atlas_buf_cstr(&out), "atlas-claim-");
-    T_REQUIRE(p != NULL);
     char claim[96];
-    size_t n = 0;
-    while (n + 1u < sizeof claim && p[n] != '\0' && p[n] != '\\' && p[n] != '"') {
-        claim[n] = p[n];
-        n++;
-    }
-    claim[n] = '\0';
+    uid_from(&out, "atlas-claim-", claim, sizeof claim);
 
     /* Each of these would, if accepted, let a caller supply the very thing the
      * absence-proof rule exists to derive. */
@@ -560,15 +581,8 @@ static void test_agreement_cannot_accept_a_risk(void) {
                      "{\"repo\":\"subject\",\"text\":\"this privacy risk is acceptable\","
                      "\"semantics\":\"NORMATIVE\"}}}\n",
             &out, &err);
-    const char *p = strstr(atlas_buf_cstr(&out), "atlas-claim-");
-    T_REQUIRE(p != NULL);
     char claim[96];
-    size_t n = 0;
-    while (n + 1u < sizeof claim && p[n] != '\0' && p[n] != '\\' && p[n] != '"') {
-        claim[n] = p[n];
-        n++;
-    }
-    claim[n] = '\0';
+    uid_from(&out, "atlas-claim-", claim, sizeof claim);
 
     static const char *const ACTORS[] = {"alpha", "beta", "gamma", "delta", "epsilon"};
     for (size_t i = 0; i < sizeof ACTORS / sizeof ACTORS[0]; i++) {
@@ -642,6 +656,232 @@ static void test_agreement_cannot_accept_a_risk(void) {
     env_stop(&e);
 }
 
+/* --- O10: what a production submitter needs to be able to rely on --------- */
+
+/* §27 through the transport a model actually reaches.
+ *
+ * `tests/test_verify_intake.c` proves the write point resolves a repeat to the
+ * row it already made. That is the rule; this is the property a client depends
+ * on, and the two are not the same test. An intake surface is retried — a
+ * dropped connection, a lost reply, an agent restarted mid-task — and the count
+ * of evidence and attestation rows is an input to a confidence score. A retry
+ * that created a second row would be confidence inflation with no author, and
+ * the author would be Atlas.
+ *
+ * The reply says `duplicate` rather than staying silent about it, because a
+ * client that cannot tell a fresh row from a resolved one has to guess, and the
+ * guess it makes when a score moved is the wrong one. */
+static void test_a_repeated_submission_through_the_transport_makes_one_row(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    env e;
+    env_start(&e, &err);
+
+    static const char TEXT[] = "the subject translation unit defines exactly one function";
+    atlas_buf script = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_appendf(&script, &err,
+                           MCP_INIT "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\","
+                                    "\"params\":{\"name\":\"atlas_verify_claim_create\","
+                                    "\"arguments\":{\"repo\":\"subject\",\"text\":\"%s\","
+                                    "\"domain\":\"code\",\"actor\":\"a-model\","
+                                    "\"run\":\"o10-run-1\"}}}\n",
+                           TEXT),
+         &err);
+
+    atlas_buf first = ATLAS_BUF_INIT;
+    run_mcp(&e, atlas_buf_cstr(&script), &first, &err);
+    T_CHECK_MSG(tool_ok(&first, "\"id\":2"), "the first submission failed: %s",
+                atlas_buf_cstr(&first));
+    char uid_first[96];
+    uid_from(&first, "atlas-claim-", uid_first, sizeof uid_first);
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&first), "\\\"duplicate\\\":false") != NULL,
+                "a first submission reported itself a duplicate: %s", atlas_buf_cstr(&first));
+
+    /* The same submission again, in a second process, exactly as a retry is. */
+    atlas_buf second = ATLAS_BUF_INIT;
+    run_mcp(&e, atlas_buf_cstr(&script), &second, &err);
+    T_CHECK_MSG(tool_ok(&second, "\"id\":2"), "the retry failed rather than resolving: %s",
+                atlas_buf_cstr(&second));
+    char uid_second[96];
+    uid_from(&second, "atlas-claim-", uid_second, sizeof uid_second);
+
+    T_CHECK_MSG(strcmp(uid_first, uid_second) == 0,
+                "a retry minted a second uid: %s then %s", uid_first, uid_second);
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&second), "\\\"duplicate\\\":true") != NULL,
+                "a retry did not say it had resolved to an existing row: %s",
+                atlas_buf_cstr(&second));
+
+    /* And the index agrees, which is the claim the reply is only evidence of. */
+    fx_daemon_stop(&e.d, false);
+    int64_t rows = count_in_db(&e, "SELECT COUNT(*) FROM verify_claims WHERE text = ?1;", TEXT,
+                               &err);
+    T_CHECK_MSG(rows == 1, "one proposition submitted twice produced %lld rows",
+                (long long)rows);
+
+    atlas_buf_free(&first);
+    atlas_buf_free(&second);
+    atlas_buf_free(&script);
+    env_stop(&e);
+}
+
+/* A submission accepted is a submission that is still there tomorrow.
+ *
+ * Invariant 1 says SQLite is a rebuildable index and never the canonical record
+ * of history, and that is right about files and commits — git holds those. It is
+ * not right about this: a claim, its evidence and its attestations exist nowhere
+ * else, and nothing could rebuild them. So "accepted" has to mean committed and
+ * readable by a daemon that did not accept it, and the only honest way to assert
+ * that is to stop the process that wrote the rows and ask a new one.
+ *
+ * The read goes back through MCP rather than through SQLite. Reading the file
+ * would prove the bytes survived; it would not prove the surface a client
+ * actually has can find them again, which is the part that was worth doubting —
+ * a claim a client cannot rediscover after losing its reply is a claim it will
+ * submit again under a new proposition. */
+static void test_a_recorded_claim_survives_a_daemon_restart(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    env e;
+    env_start(&e, &err);
+
+    /* A knowledge record for the claim to bear on.
+     *
+     * Not decoration. `verify.show` reports the record's lifecycle status, and
+     * for a claim bound to nothing `atlas_verify_assess` reports `PROPOSED`
+     * because that is the zero of `atlas_decision_status` and there is no record
+     * to read one from. Asserting PROPOSED against an unbound claim therefore
+     * asserts nothing — it would pass identically if the daemon had approved
+     * something — and the status is the axis this test exists to pin. Binding
+     * the claim to a real record is what makes the assertion able to fail. */
+    atlas_buf out = ATLAS_BUF_INIT;
+    run_mcp(&e,
+            MCP_INIT "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":"
+                     "{\"name\":\"atlas_propose_decision\",\"arguments\":"
+                     "{\"repo\":\"subject\",\"kind\":\"DECISION\","
+                     "\"title\":\"the subject is built without warnings\","
+                     "\"decision\":\"body\"}}}\n",
+            &out, &err);
+    T_CHECK_MSG(tool_ok(&out, "\"id\":2"), "the record was not proposed: %s",
+                atlas_buf_cstr(&out));
+    char record[96];
+    uid_from(&out, "atlas-dec-", record, sizeof record);
+
+    atlas_buf script = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_appendf(&script, &err,
+                           MCP_INIT "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\","
+                                    "\"params\":{\"name\":\"atlas_verify_claim_create\","
+                                    "\"arguments\":{\"repo\":\"subject\",\"decision\":\"%s\","
+                                    "\"text\":\"the subject compiles without a warning\","
+                                    "\"domain\":\"code\",\"actor\":\"a-model\","
+                                    "\"run\":\"o10-run-2\"}}}\n",
+                           record),
+         &err);
+    run_mcp(&e, atlas_buf_cstr(&script), &out, &err);
+    T_CHECK_MSG(tool_ok(&out, "\"id\":3"), "the claim was not created: %s", atlas_buf_cstr(&out));
+    char claim[96];
+    uid_from(&out, "atlas-claim-", claim, sizeof claim);
+    atlas_buf_free(&script);
+
+    /* Evidence too, so what has to survive is a graph rather than one row. */
+    T_OK(atlas_buf_appendf(&script, &err,
+                           MCP_INIT "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\","
+                                    "\"params\":{\"name\":\"atlas_verify_evidence\","
+                                    "\"arguments\":{\"repo\":\"subject\",\"claim\":\"%s\","
+                                    "\"class\":\"AI_ANALYSIS\",\"path\":\"a.c\","
+                                    "\"observed\":\"one definition and no diagnostics quoted\","
+                                    "\"actor\":\"a-model\"}}}\n",
+                           claim),
+         &err);
+    run_mcp(&e, atlas_buf_cstr(&script), &out, &err);
+    T_CHECK_MSG(tool_ok(&out, "\"id\":4"), "the evidence was not recorded: %s",
+                atlas_buf_cstr(&out));
+    char evidence[96];
+    uid_from(&out, "atlas-ev-", evidence, sizeof evidence);
+    atlas_buf_free(&script);
+
+    /* And an attestation citing it. Three tables rather than one, and the
+     * citation is what makes the evidence readable: `verify.show` lists the
+     * evidence an attestation *relied on*, because a row nobody cited has not
+     * yet borne on the claim. Recording all three is what makes this a test of a
+     * graph surviving rather than of a row surviving. */
+    T_OK(atlas_buf_appendf(&script, &err,
+                           MCP_INIT "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\","
+                                    "\"params\":{\"name\":\"atlas_verify_attest\",\"arguments\":"
+                                    "{\"claim\":\"%s\",\"verdict\":\"SUPPORT\","
+                                    "\"evidence\":\"%s\",\"method\":\"read the unit\","
+                                    "\"actor\":\"a-model\"}}}\n",
+                           claim, evidence),
+         &err);
+    run_mcp(&e, atlas_buf_cstr(&script), &out, &err);
+    T_CHECK_MSG(tool_ok(&out, "\"id\":5"), "the attestation was not recorded: %s",
+                atlas_buf_cstr(&out));
+    atlas_buf_free(&script);
+
+    /* A different daemon process, on the same data directory. */
+    fx_daemon_stop(&e.d, false);
+    T_OK(fx_daemon_start(&e.fx, &e.d, &err), &err);
+    T_OK(fx_daemon_wait_ready(&e.d, 15000, &err), &err);
+
+    /* The listing a client uses to rediscover what it submitted. */
+    run_mcp(&e,
+            MCP_INIT "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":"
+                     "{\"name\":\"atlas_verify_claims\",\"arguments\":{\"repo\":\"subject\"}}}\n",
+            &out, &err);
+    T_CHECK_MSG(tool_ok(&out, "\"id\":6"), "the claims could not be listed: %s",
+                atlas_buf_cstr(&out));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&out), claim) != NULL,
+                "a claim recorded before the restart is not in the listing after it: %s",
+                atlas_buf_cstr(&out));
+
+    /* And the whole record, evidence included. */
+    T_OK(atlas_buf_appendf(&script, &err,
+                           MCP_INIT "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\","
+                                    "\"params\":{\"name\":\"atlas_verify_show\",\"arguments\":"
+                                    "{\"claim\":\"%s\"}}}\n",
+                           claim),
+         &err);
+    run_mcp(&e, atlas_buf_cstr(&script), &out, &err);
+    T_CHECK_MSG(tool_ok(&out, "\"id\":7"), "the claim could not be read back: %s",
+                atlas_buf_cstr(&out));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&out), "AI_ANALYSIS") != NULL,
+                "the evidence did not survive the restart: %s", atlas_buf_cstr(&out));
+    atlas_buf_free(&script);
+
+    /* Surviving is not the same as having acquired anything, and a restart is a
+     * point at which a state machine can be re-entered — so §22, reliability is
+     * not authority, is asserted on the far side of one. It has to hold across a
+     * process boundary or it holds only while somebody is watching.
+     *
+     * The axis matters here and is easy to get wrong. The claim reads SUPPORTED,
+     * which is its *verification* state and is the honest reading: one actor did
+     * attest to it. What must not have moved is the *lifecycle* status of the
+     * record it bears on, which is where authority lives, and it is still
+     * PROPOSED. A9.2's rule is that the axes are orthogonal and no badge carries
+     * more than one, so requiring UNVERIFIED here would be asserting the wrong
+     * thing — a model's attestation is supposed to register on the verification
+     * axis. Registering there is not a step towards approval.
+     *
+     * `transitioned` is deliberately **not** asserted here. `verify.show` runs
+     * `atlas_verify_assess`, which writes nothing and never sets it; only the
+     * `verify.evaluate` path does. A check that cannot fail reads like evidence
+     * and is not any, and the audit-row count below is the honest form of the
+     * same question. */
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&out), "\\\"status\\\":\\\"PROPOSED\\\"") != NULL,
+                "a submitted claim's record did not stay PROPOSED across a restart: %s",
+                atlas_buf_cstr(&out));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&out), "\\\"actionable\\\":true") == NULL,
+                "a submission became actionable by surviving a restart: %s",
+                atlas_buf_cstr(&out));
+
+    fx_daemon_stop(&e.d, false);
+    int64_t audits = count_in_db(&e, "SELECT COUNT(*) FROM verify_lifecycle_audit;", NULL, &err);
+    T_CHECK_MSG(audits == 0, "a submission acquired %lld lifecycle transitions by being made",
+                (long long)audits);
+
+    atlas_buf_free(&out);
+    env_stop(&e);
+}
+
 static const atlas_test TESTS[] = {
     {"an MCP call speaks as a model whatever uid carries it",
      test_an_mcp_call_speaks_as_a_model_whatever_uid_carries_it},
@@ -654,6 +894,10 @@ static const atlas_test TESTS[] = {
     {"every knowledge kind reaches the record through MCP",
      test_every_knowledge_kind_reaches_the_record_through_mcp},
     {"agreement cannot accept a risk", test_agreement_cannot_accept_a_risk},
+    {"a repeated submission through the transport makes one row",
+     test_a_repeated_submission_through_the_transport_makes_one_row},
+    {"a recorded claim survives a daemon restart",
+     test_a_recorded_claim_survives_a_daemon_restart},
 };
 
 ATLAS_TEST_MAIN("verify_product", TESTS)

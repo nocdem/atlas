@@ -44,6 +44,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <sqlite3.h>
+
 #include "atlas/hook.h"
 #include "atlas/limits.h"
 #include "atlas_test.h"
@@ -443,11 +445,232 @@ static void test_one_blocked_write_does_not_hold_the_other_clients(void) {
     live_stop(&L);
 }
 
+/* --- O10: a refused submission is refused, not swallowed ------------------ */
+
+/* The proposition under test, submitted over and over until it lands. Fixed
+ * rather than varied per attempt, because the question at the end is how many
+ * rows one proposition produced. */
+#define BUSY_CLAIM_TEXT "the shared entry point is declared in exactly one header"
+
+#define MCP_HANDSHAKE                                                                              \
+    "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":"                          \
+    "{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{}}}\n"                                  \
+    "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n"
+
+/* One MCP script through the stdio adapter, timed, exactly as a model's client
+ * sends it: JSON on stdin, JSON on stdout. */
+static int64_t run_mcp(live *L, const char *script, atlas_buf *out, atlas_err *err) {
+    const char *env[] = {atlas_buf_cstr(&L->runtime_env), atlas_buf_cstr(&L->data_env), NULL};
+    const char *args[] = {"mcp"};
+    int code = 0;
+    atlas_buf_reset(out);
+    int64_t t0 = now_ms();
+    T_OK(fx_atlas_stdin(args, 1u, env, script, strlen(script), out, NULL, &code, err), err);
+    int64_t took = now_ms() - t0;
+    /* The adapter reports a refusal inside a successful reply, so a non-zero
+     * exit here is the adapter failing rather than Atlas refusing. */
+    T_EQ_INT(code, 0);
+    return took;
+}
+
+/* Whether the reply carrying `id` says the tool ran and succeeded. A refusal is
+ * `ok:false` in the structured body inside an otherwise healthy envelope, so
+ * reading the envelope would score every refusal as a success. */
+static bool mcp_tool_ok(const atlas_buf *out, const char *id_marker) {
+    const char *p = strstr(atlas_buf_cstr(out), id_marker);
+    if (p == NULL) {
+        return false;
+    }
+    const char *line_end = strchr(p, '\n');
+    size_t len = line_end != NULL ? (size_t)(line_end - p) : strlen(p);
+    static const char OK[] = "\\\"ok\\\":true";
+    const size_t oklen = sizeof OK - 1u;
+    for (size_t i = 0; i + oklen <= len; i++) {
+        if (memcmp(p + i, OK, oklen) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Whether the claim is on the read surface right now. Asked over MCP rather than
+ * of the file, because "is it stored?" and "can the caller find it?" are two
+ * questions and only the second one is the one a client has. Reads do not touch
+ * the writer, so this is answerable while a pass is running — which is the whole
+ * reason the check can be made at the moment of the refusal rather than after. */
+static bool claim_is_listed(live *L, atlas_buf *out, atlas_err *err) {
+    (void)run_mcp(L,
+                  MCP_HANDSHAKE
+                  "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":"
+                  "{\"name\":\"atlas_verify_claims\",\"arguments\":{\"repo\":\"fixture\"}}}\n",
+                  out, err);
+    T_CHECK_MSG(mcp_tool_ok(out, "\"id\":9"), "the claims could not be listed: %s",
+                atlas_buf_cstr(out));
+    return strstr(atlas_buf_cstr(out), BUSY_CLAIM_TEXT) != NULL;
+}
+
+/* **A write refused because the daemon is busy wrote nothing.**
+ *
+ * A9.2.6 made a caller stop waiting; it did not say what happens to the record
+ * the caller was trying to make. For a hook that question has a written answer —
+ * hooks fail open and the metadata is lost on purpose — but a verification
+ * submission is not metadata. A claim, its evidence and its attestations exist
+ * nowhere but here: git cannot be re-read to recover one, and no pass rebuilds
+ * them. A refusal that half-wrote, or that wrote and reported failure, would be
+ * a record whose existence nobody could determine from the answer they got.
+ *
+ * So the two halves are asserted at the moment they are true rather than
+ * inferred at the end:
+ *
+ *   - the refusal is explicit, says nothing was queued, and arrives quickly;
+ *   - **at that instant the claim is not on the read surface**, which is what
+ *     makes the advertised retry safe rather than a way to submit twice;
+ *   - the retry that eventually lands produces exactly one row.
+ *
+ * The last one alone would not discriminate: a refusal that silently stored the
+ * row would still total one, because the retry would resolve to it by content
+ * key. Checking at the refusal is what separates "nothing was written" from
+ * "something was written and the idempotency machinery covered for it". */
+static void test_a_verification_write_refused_while_busy_stores_nothing(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    live L;
+    live_start(&L, &err);
+
+    static const char SUBMIT[] =
+        MCP_HANDSHAKE "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"tools/call\",\"params\":"
+                      "{\"name\":\"atlas_verify_claim_create\",\"arguments\":"
+                      "{\"repo\":\"fixture\",\"text\":\"" BUSY_CLAIM_TEXT "\","
+                      "\"domain\":\"code\",\"actor\":\"a-model\",\"run\":\"o10-busy\"}}}\n";
+
+    bool observed_building = false;
+    bool saw_busy = false;
+    bool accepted = false;
+    /* True once a submission has been answered in a way that leaves a write
+     * possibly still on its way. Two outcomes do that and both are documented
+     * rather than defects: a repository the daemon has not finished indexing
+     * yet, and — the one A9.2.6 wrote down as a residual — a submission queued
+     * behind a *bounded* job, which `job_kind_is_unbounded` deliberately refuses
+     * to back out of, so the caller waits out its own timeout and the job still
+     * runs. After either, "the claim is not on the read surface" stops being a
+     * statement about the busy refusal and becomes a race with that write, so
+     * the check is not made again. */
+    bool write_may_be_in_flight = false;
+    int64_t worst_submit = 0;
+    atlas_buf last_other = ATLAS_BUF_INIT;
+
+    atlas_buf out = ATLAS_BUF_INIT;
+    int64_t deadline = now_ms() + WAIT_MS;
+    while (now_ms() < deadline) {
+        bool building = false;
+        bool current = false;
+        sem_status(&L, &building, &current, &err);
+        if (building) {
+            observed_building = true;
+        }
+
+        int64_t took = run_mcp(&L, SUBMIT, &out, &err);
+        if (building && took > worst_submit) {
+            worst_submit = took;
+        }
+
+        if (mcp_tool_ok(&out, "\"id\":8")) {
+            accepted = true;
+        } else if (strstr(atlas_buf_cstr(&out), "BUSY:") != NULL) {
+            saw_busy = true;
+            /* The refusal must carry the claim that makes retrying safe: a
+             * caller cannot tell "nothing ran" from "the result was abandoned"
+             * by status, so the message is where the difference is stated. */
+            T_CHECK_MSG(strstr(atlas_buf_cstr(&out), "Nothing was queued") != NULL,
+                        "a busy refusal did not say the write had not been queued: %s",
+                        atlas_buf_cstr(&out));
+            T_CHECK_MSG(took < RESPONSIVE_MS,
+                        "a submission refused as busy still took %lld ms", (long long)took);
+            /* The half that cannot be reconstructed afterwards: at this instant
+             * nothing was written, which is what makes the advertised retry safe
+             * rather than a way to submit twice. */
+            if (!accepted && !write_may_be_in_flight) {
+                atlas_buf listing = ATLAS_BUF_INIT;
+                bool listed = claim_is_listed(&L, &listing, &err);
+                T_CHECK_MSG(!listed,
+                            "a submission refused as busy is on the read surface, so a refusal "
+                            "wrote a row and the advertised retry would submit it twice: %s",
+                            atlas_buf_cstr(&listing));
+                atlas_buf_free(&listing);
+            }
+        } else {
+            /* Neither accepted nor refused as busy. This is **not** a failure
+             * here, and treating it as one was the first version's mistake: the
+             * two outcomes that land here are both documented behaviour, not
+             * defects, and both are transient. Failing on them would convert
+             * A9.2.6's written residual into a broken test, most often under a
+             * sanitiser where the window is widest.
+             *
+             * So it is recorded and retried. What decides the test is the pair
+             * of end conditions — a busy refusal was seen, and a retry was
+             * eventually accepted — and this text is carried so that a genuine
+             * refusal is reported instead of a bare "never accepted". */
+            write_may_be_in_flight = true;
+            T_OK(atlas_buf_set(&last_other, out.data, out.len, &err), &err);
+        }
+
+        if (accepted && current) {
+            break;
+        }
+    }
+
+    /* A fixture that never made the daemon busy would let all of the above pass
+     * without testing anything. */
+    T_CHECK_MSG(observed_building,
+                "the semantic pass was never observed in flight, so this test proved nothing");
+    T_CHECK_MSG(saw_busy,
+                "no submission ever met the busy path, so this test did not exercise the refusal");
+    /* **The refusal was transient and the retry was safe.** A daemon that
+     * refused for ever would satisfy every assertion above. */
+    T_CHECK_MSG(accepted, "a submission was never accepted on a retry; last other answer: %s",
+                last_other.len > 0 ? atlas_buf_cstr(&last_other) : "(none)");
+    T_CHECK_MSG(worst_submit < RESPONSIVE_MS,
+                "the worst submission during a semantic pass was %lld ms",
+                (long long)worst_submit);
+
+    /* One proposition, however many times it was refused and resubmitted. */
+    {
+        bool listed = claim_is_listed(&L, &out, &err);
+        T_CHECK_MSG(listed, "the accepted claim is not on the read surface: %s",
+                    atlas_buf_cstr(&out));
+    }
+    fx_daemon_stop(&L.d, false);
+    {
+        atlas_buf db_path = ATLAS_BUF_INIT;
+        T_OK(atlas_buf_appendf(&db_path, &err, "%s/atlas.db", fx_data_dir(&L.fx)), &err);
+        sqlite3 *db = NULL;
+        T_REQUIRE(sqlite3_open_v2(atlas_buf_cstr(&db_path), &db, SQLITE_OPEN_READONLY, NULL) ==
+                  SQLITE_OK);
+        sqlite3_stmt *st = NULL;
+        T_REQUIRE(sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM verify_claims WHERE text = ?1;", -1,
+                                     &st, NULL) == SQLITE_OK);
+        T_REQUIRE(sqlite3_bind_text(st, 1, BUSY_CLAIM_TEXT, -1, SQLITE_STATIC) == SQLITE_OK);
+        int64_t rows = sqlite3_step(st) == SQLITE_ROW ? sqlite3_column_int64(st, 0) : -1;
+        sqlite3_finalize(st);
+        sqlite3_close(db);
+        atlas_buf_free(&db_path);
+        T_CHECK_MSG(rows == 1,
+                    "one proposition, refused and resubmitted, produced %lld rows",
+                    (long long)rows);
+    }
+
+    atlas_buf_free(&out);
+    atlas_buf_free(&last_other);
+    live_stop(&L);
+}
+
 static const atlas_test TESTS[] = {
     {"a semantic pass does not stall the serve loop",
      test_a_semantic_pass_does_not_stall_the_serve_loop},
     {"one blocked write does not hold the other clients",
      test_one_blocked_write_does_not_hold_the_other_clients},
+    {"a verification write refused while busy stores nothing",
+     test_a_verification_write_refused_while_busy_stores_nothing},
 };
 
 ATLAS_TEST_MAIN("daemon_responsive", TESTS)

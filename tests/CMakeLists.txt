@@ -246,7 +246,10 @@ target_compile_definitions(test_verify_absence PRIVATE ATLAS_SRC_DIR="${CMAKE_SO
 set_tests_properties(test_verify_intake PROPERTIES LABELS "integration")
 # Drives a live daemon and the MCP adapter, so it is a daemon test and is
 # serialised against the others for the inotify budget.
-set_tests_properties(test_verify_product PROPERTIES LABELS "daemon")
+# O10 added a restart test and an idempotency test, each with its own full
+# fixture, so the default 300 s no longer leaves headroom under a sanitiser —
+# where the failure would surface as a ctest timeout and read as a hang.
+set_tests_properties(test_verify_product PROPERTIES LABELS "daemon" TIMEOUT 900)
 # The operator suite builds a real repository and drives the binary through a
 # pseudo-terminal, so it is an integration test rather than a unit one.
 set_tests_properties(test_decision_operator PROPERTIES LABELS "integration")
@@ -355,8 +358,11 @@ set_tests_properties(test_sem_auto PROPERTIES LABELS "daemon" TIMEOUT 1200)
 # Serialised against every other daemon test: this one asserts how long the
 # daemon takes to answer, and a second daemon competing for the machine would
 # make a real regression gate flaky for a reason that is not the daemon.
+# O10 added a third test to it, and each one drives a full semantic pass to
+# CURRENT over the 160-unit fixture, so the budget is three passes rather than
+# two. Raised rather than left to be discovered as a timeout under a sanitiser.
 set_tests_properties(test_daemon_responsive
-  PROPERTIES LABELS "daemon" TIMEOUT 1200 RUN_SERIAL TRUE)
+  PROPERTIES LABELS "daemon" TIMEOUT 2100 RUN_SERIAL TRUE)
 set_tests_properties(test_sem_auto PROPERTIES RUN_SERIAL TRUE)
 
 # Vendored third-party source is only trustworthy if it is still what was

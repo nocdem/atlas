@@ -1,9 +1,20 @@
 # Atlas — working notes for Claude Code
 
 Atlas is a generic, headless engineering-memory and repository-intelligence CLI
-in C17. Phase **A9.2.6**: daemon responsiveness — a caller waiting for the single
-writer thread can now stop waiting, so a semantic pass no longer takes every
-client with it. The sentence the season exists for is
+in C17. Phase **O10**: production evidence ingestion — the verification intake
+surface a real agent submits through is now proved, at that surface, to be one a
+client can rely on. The sentence the season exists for is
+
+> **THE SURFACE WAS ALREADY THERE; NOBODY HAD PROVED A CLIENT COULD RELY ON IT.**
+
+It changed no line of `src/`. Production ingestion shipped in A9.2.1; what was
+missing was evidence that a retry makes one row, that a record survives a
+restart, and that a submission refused while the daemon is busy wrote nothing.
+See the O10 section in `docs/roadmap.md` and `docs/verification.md`.
+
+The season before it, **A9.2.6**, was daemon responsiveness: a caller waiting for
+the single writer thread can now stop waiting, so a semantic pass no longer takes
+every client with it. The sentence it exists for is
 
 > **THE DEADLINE WAS NEVER THE BOUND; THE SHORT JOB WAS.**
 
@@ -59,6 +70,7 @@ document that carries it:
 
 | Season | What it added | Document |
 | --- | --- | --- |
+| O10 | the intake surface proved at the boundary a client reaches; no line of `src/` changed | `docs/verification.md` |
 | A9.2.6 | a waiter that can stop waiting; one slow write no longer holds every client | `docs/daemon-and-ipc.md` |
 | A9.2.5 | the verdict every semantic read carries; zero rows are not an absence | `docs/semantic-trust.md` |
 | A9.2.4 | build-input discovery, and an activation policy that does not depend on memory | `docs/semantic-discovery.md` |
@@ -549,6 +561,33 @@ is not written down is one somebody deletes.** Both halves are load-bearing.
   timing. **The sweep holds while the file index is behind.**
 - **Manual and automatic rebuild are one pipeline**, and there is **one shape on
   every surface**.
+
+### O10 — production evidence ingestion
+
+- **THE SURFACE WAS ALREADY THERE; NOBODY HAD PROVED A CLIENT COULD RELY ON IT.**
+  Verification intake shipped in A9.2.1 — nine RPC methods, eight MCP tools, one
+  write point. **There is no second submit surface and adding one is not an
+  extension of this milestone**: a parallel path bypasses
+  `atlas_verify_intake_apply_in_tx`, whose checks are exactly the ones a forger
+  would want somewhere else.
+- **A rule proved at the write point is not the same claim as a property at the
+  boundary.** A client sends JSON to a daemon that may be busy, restarted, or
+  already holding the row — three places a correct rule can fail to reach a
+  caller.
+- **A refused submission is checked at the moment of the refusal, never totalled
+  afterwards.** A refusal that silently stored a row would still total one,
+  because the retry resolves to it by content key.
+- **A verification record is not rebuildable, and invariant 1 does not cover it.**
+  Accepted must mean committed and rediscoverable by a process that did not
+  accept it.
+- **The axes stay apart when asserting that nothing was acquired.** A model's
+  SUPPORT moves the *verification* state to SUPPORTED; the *lifecycle* status
+  stays PROPOSED, and that is the axis carrying authority.
+- **Evidence nobody cited is stored and is not shown.** `verify.show` lists what
+  an attestation relied on, by design.
+- **The claim key omits the actor deliberately, and the evidence and attestation
+  keys do not.** One proposition stated twice is one claim; two readings and two
+  votes are two rows.
 
 ### A9.2.6 — daemon responsiveness
 

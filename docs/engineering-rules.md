@@ -2308,3 +2308,82 @@ neither happened. Without those two assertions a fixture that finished before
 anything could look at it would let every other assertion pass while testing
 nothing — which is precisely how the suite passed 79/79 while the daemon was
 unreachable for twenty-five minutes.
+
+## O10 layers — additions
+
+| File | Owns |
+| --- | --- |
+| `tests/test_verify_product.c` | idempotency and durability through the transport a client reaches |
+| `tests/test_daemon_responsive.c` | what a busy refusal did *not* write |
+
+Nothing in `src/` changed. That is the season's finding rather than an omission:
+the production ingestion path shipped in A9.2.1, and what was missing was the
+evidence that a client could rely on it. See the O10 section in
+`docs/roadmap.md` for the table of which season delivered which requirement.
+
+## O10 rules — these are not negotiable
+
+### The surface was already there; nobody had proved a client could rely on it
+
+Before adding a submit path, read `src/ipc/server_verify.c` and `TOOLS[]` in
+`src/mcp/mcp_tools.c`. Verification intake is complete: nine RPC methods, eight
+MCP tools, one write point. A second path would bypass
+`atlas_verify_intake_apply_in_tx`, and the checks there are exactly the ones a
+forger would want to be somewhere else. **There is no second submit surface, and
+adding one is not an extension of this milestone.**
+
+### A rule proved at the write point is not a property proved at the boundary
+
+`tests/test_verify_intake.c` drives `atlas_verify_intake_apply_in_tx` directly
+and proves what it refuses. That is necessary and it is not sufficient: a client
+does not call that function, it sends JSON over a socket to a daemon that may be
+busy, may be restarted, and may already hold the row being submitted. Every one
+of those is a place a correct rule can fail to reach a caller. Where a property
+is what a client depends on, assert it through the transport.
+
+### A refusal is checked at the moment of the refusal, never totalled afterwards
+
+The obvious test — resubmit until it lands, then count the rows — cannot
+discriminate. A refusal that silently stored a row would still total one, because
+the retry resolves to it by content key. So the check is made **at the instant of
+the refusal**, against the read surface, which is answerable then because a read
+never touches the writer. Counting at the end is the weaker test that looks like
+the stronger one.
+
+### A verification record is not rebuildable, and invariant 1 does not cover it
+
+SQLite is a rebuildable index and never the canonical record of history — true
+of files, commits and the structural graph, all of which git or a pass can
+produce again. A claim, its evidence and its attestations exist nowhere else. Nothing
+rebuilds them, so **accepted must mean committed and rediscoverable by a process
+that did not accept it**, and the read that proves it goes through the client's
+own surface rather than through the file.
+
+### The axes stay apart when asserting that nothing was acquired
+
+A model's SUPPORT attestation moves a claim to `SUPPORTED`. That is the
+**verification** axis and it is the honest reading — an actor did attest. The
+axis that carries authority is the **lifecycle status**, and it stays `PROPOSED`.
+A9.2's orthogonality rule is not decoration here: a test asserting `UNVERIFIED`
+to mean "no authority" asserts the wrong axis, passes for the wrong reason, and
+breaks the first time a model legitimately attests. Assert the status, the
+absence of a transition, and the absence of a lifecycle audit row.
+
+### Evidence nobody cited is stored and is not shown
+
+`verify.show` lists the evidence an attestation *relied on*, by way of
+`verify_attestation_evidence`. A free-standing evidence row is durable and does
+not appear until something cites it, because a row nobody cited has not yet borne
+on the claim. This is the designed semantics and not a gap; a test that submits
+evidence and expects to read it back must attest to it as well.
+
+### The claim key omits the actor deliberately, and the others do not
+
+Two people stating the same proposition about the same tree are stating one
+claim, and the second should attest to it rather than fork it — so the claim
+content key covers the repository, the record revision, the domain, the text,
+the scope, the semantics, the verifier and its input, the commit and the
+environment, and not the author or the clock. The **evidence and attestation**
+keys do fold in the actor, because two actors having read the same file are two
+observations and two attestations are two votes. Do not "fix" the asymmetry: it
+is the design.

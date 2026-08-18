@@ -477,13 +477,107 @@ Deliberately not done, and written down rather than discovered later:
 `docs/daemon-and-ipc.md` carries the behaviour; `docs/backlog.md` carries the
 original incident with this resolution appended to it.
 
-## Next: O10
+## O10 — production evidence ingestion (CLOSED)
 
-O10 is the next milestone. This roadmap has never carried a section for it — it
-is named here, in `docs/backlog.md` and in the A9.2.5 closure notes as the thing
-the operational items were to be resolved before, and its scope is not written
-down in this repository. It is named as next rather than described, because
-describing it would mean inventing it.
+The sentence the season exists for:
+
+> **THE SURFACE WAS ALREADY THERE; NOBODY HAD PROVED A CLIENT COULD RELY ON IT.**
+
+O10 was named as next in the A9.2.5 closure notes and its scope was deliberately
+left unwritten. Written down, it turned out to be a milestone whose central
+demand had already been met — and saying so plainly is the whole value of the
+section, because a milestone that quietly re-ships what exists is how a roadmap
+stops describing the system.
+
+**What was already delivered, and by which season.** Production ingestion —
+"real agent and MCP work can write claims, evidence and attestations into the
+verification ledger, and the test-only insert functions are on a production path"
+— is exactly the gap A9.2.1 closed. `tests/test_verify_intake.c` states it in its
+own header: A9.2's three insert functions had no caller outside the tests, so on
+a real deployment the ten verification tables stayed empty while the engine that
+reads them passed everything it had. The intake write point, the nine RPC
+methods, the eight MCP tools, the channel derivation and every refusal that hangs
+off it shipped then. So did the parts O10's scope names one by one:
+
+| The requirement | Where it already lived |
+| --- | --- |
+| a bounded authenticated submit surface | `src/ipc/server_verify.c`, `TOOLS[]` in `src/mcp/mcp_tools.c` |
+| the actor derived from the channel, never the payload | `channel_for` and `atlas_verify_channel_actor_class` |
+| a model that cannot become HUMAN, OPERATOR, TOOL, COMPILER, TEST or RUNTIME | `atlas_verify_channel_parse` and `atlas_verify_evidence_class_requires_atlas_production` |
+| everything a model sends recorded as a model's | `ATLAS_ACTOR_AI_AGENT` with `SELF_DECLARED` identity; `AI_ANALYSIS` for what it read |
+| real tool evidence only from a verifier Atlas ran | `verify.evidence_produce` and `src/verify/detverify.c` |
+| idempotent submission | the §27 content keys in `src/verify/intake.c` |
+| an explicit retryable refusal rather than a silent drop | A9.2.6's `writer_wait_locked`, which `ATLAS_JOB_VERIFY` already used |
+| no authority acquired by submitting | the absent verbs, and `VERIFICATION_POLICY` |
+| provenance carrying repo, actor, session, run and time | `atlas_verify_op`'s `session_key`, `run_id` and the actor fields |
+
+**What O10 added.** Three properties a production client depends on that no test
+asserted, all three at the boundary a client actually reaches rather than at the
+write point below it:
+
+1. **A repeated submission through the transport makes one row.**
+   `tests/test_verify_intake.c` proved the write point resolves a repeat to the
+   row it already made; that is the rule, and it is not the same statement as
+   "the surface a retrying client uses behaves that way". The reply says
+   `duplicate` rather than staying silent, because a client that cannot tell a
+   fresh row from a resolved one has to guess, and it guesses wrong exactly when
+   a confidence score moved.
+2. **A recorded claim survives a daemon restart.** Invariant 1 — SQLite is a
+   rebuildable index and never the canonical record — is right about files and
+   commits and is *not* right about this: a claim, its evidence and its
+   attestations exist nowhere else and nothing rebuilds them. So "accepted" has
+   to mean committed and rediscoverable by a daemon that did not accept it, read
+   back through MCP rather than out of the file, because surviving and being
+   findable again are two claims.
+3. **A submission refused while the daemon is busy wrote nothing.** A9.2.6 made a
+   caller stop waiting and did not say what became of the record it was trying to
+   make. For a hook that has a written answer — hooks fail open and the metadata
+   is lost on purpose. A verification submission is not metadata. The test checks
+   the read surface *at the instant of the refusal*, because totalling the rows
+   at the end cannot discriminate: a refusal that silently stored the row would
+   still total one, the retry having resolved to it by content key.
+
+Two things were learned by writing them, and both are recorded rather than
+smoothed over. `verify.show` lists the evidence an attestation *relied on*, so a
+free-standing evidence row is stored and not yet shown — a row nobody cited has
+not yet borne on the claim. And a model's SUPPORT attestation moves the claim to
+`SUPPORTED` on the **verification** axis while the lifecycle status stays
+`PROPOSED`; asserting `UNVERIFIED` there would have been asserting the wrong
+thing, and A9.2's orthogonality rule is what says which axis carries authority.
+
+No schema change, no migration, no new RPC method, no new MCP tool, no new job
+kind, no exit code, and not one line of `src/` — the season is three tests, and
+that it is three tests is the finding.
+
+Deliberately not done:
+
+- **No second submit surface.** A parallel path would have bypassed
+  `atlas_verify_intake_apply_in_tx`, and the checks there are exactly the ones a
+  forger would want somewhere else.
+- **No caller-supplied submission id.** The content key is stronger where it
+  matters — the actor is folded into the evidence and attestation keys, and the
+  claim key deliberately omits it, so two actors stating one proposition state
+  one claim and the second attests rather than forks.
+- **The residuals A9.2.6 wrote down are unchanged.** A submission arriving during
+  a reconciliation, snapshot or maintenance job can still wait out its caller's
+  timeout.
+
+## Next: A11.0
+
+A11.0 is the next milestone. Its scope is not written down in this repository,
+and it is named as next rather than described, because describing it would mean
+inventing it.
+
+**A10 is not closed and is not cancelled**, and the ordering is deliberate rather
+than an oversight. A10 is the Experience Learning phase, and the contract it must
+satisfy is already written: `docs/verification.md` carries "The A10 prerequisite
+contract" — the table a reviewer of A10 checks against, whose load-bearing line
+is that **A10 must treat `UNKNOWN` as epistemic uncertainty and must never fold
+it into a negative fact.** Atlas can guarantee it never *produces* an unjustified
+`ABSENT`; it cannot guarantee a later phase reads `UNKNOWN` correctly, which is
+what makes that a contract on the consumer and not a property of this codebase.
+Nothing here weakens it, and a reader who arrives at A11.0 should not conclude
+that the phase before it was absorbed.
 
 ## A7 (original plan) — optional MCP adapter (absorbed into A2)
 

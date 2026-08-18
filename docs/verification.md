@@ -1147,3 +1147,78 @@ reads `UNKNOWN` correctly. This table is what a reviewer of A10 checks against.
   The guarantee is an absent field, not a check on one, and
   `test_no_intake_path_can_assert_coverage_or_absence` scans `atlas_verify_op`
   for exactly that.
+
+## O10 — what a production submitter can rely on
+
+Intake shipped in A9.2.1 and this section does not restate it. What it records is
+the three properties a real client depends on that nothing asserted until O10,
+each stated at the surface a client actually reaches rather than at the write
+point below it. All three are tests; O10 changed no line of `src/`.
+
+### A retry makes one row, and the reply says which
+
+Every intake object carries a deterministic key over its immutable content, and
+the write point resolves a collision to the row that already exists. The reply
+carries `duplicate`, so a client can tell a fresh row from a resolved one. That
+matters because the count of evidence and attestation rows is an input to a
+confidence score: a retry that created a second row would be confidence inflation
+with no author, and a client that could not tell would have no way to notice.
+
+What goes into each key is what makes it the same object:
+
+| Object | The key covers | And deliberately not |
+| --- | --- | --- |
+| claim | repository identity, record revision, domain, text, scope, semantics, verifier and its input, commit, environment | the author and the clock — two people stating one proposition state one claim, and the second attests rather than forks |
+| evidence | class, repository, commit, path, symbol, lines, target, probe, observation, `observed_at`, **the actor** | — two actors having read one file are two observations |
+| attestation | claim, **the actor**, verdict, method, scope, examined commit, the cited evidence | — a change of mind is a different verdict, so a different key, so it lands as the reversal `supersedes_id` exists to carry |
+
+The asymmetry is the design and not an oversight. Replay protection that
+suppressed a reversal would hide exactly the fact a reliability system most needs
+to see.
+
+### An accepted submission is still there after a restart
+
+Invariant 1 says SQLite is a rebuildable index and never the canonical record of
+history. That is right about files, commits and the structural graph — git or a
+pass produces them again. It is **not** right about a claim, its evidence and its
+attestations: those exist nowhere else and nothing rebuilds them. So "accepted"
+has to mean committed and rediscoverable by a daemon that did not accept it, and
+the read that proves it goes back through MCP rather than into the file, because
+surviving and being findable again are two claims and only the second is the one
+a client has.
+
+Two behaviours are worth knowing before writing anything against this surface:
+
+- **`verify.show` lists the evidence an attestation relied on.** A free-standing
+  evidence row is durable and does not appear until something cites it, because a
+  row nobody cited has not yet borne on the claim.
+- **A model's SUPPORT attestation moves the verification state to `SUPPORTED`
+  while the lifecycle status stays `PROPOSED`.** The axes are orthogonal, and the
+  one that carries authority is the status. Nothing transitioned, nothing became
+  actionable, and no lifecycle audit row was written — those three are what "no
+  authority was acquired" means, and `state` is not one of them.
+
+### A submission refused while the daemon is busy wrote nothing
+
+A9.2.6 let a caller waiting on the writer stop waiting; it did not say what
+became of the record that caller was trying to make. For a hook the answer is
+written down — hooks fail open, store metadata only, and losing one is the
+deliberate trade. A verification submission is not metadata.
+
+`ATLAS_JOB_VERIFY` goes through `writer_wait_locked` like every other synchronous
+writer call, so a submission arriving while a semantic pass or a discovery walk
+holds the writer is answered `BUSY:` — **nothing was queued and nothing will
+run** — rather than made to wait out its timeout. What O10 establishes is the
+half that could not be recovered afterwards: at the instant of that refusal the
+claim is **not on the read surface**, which is what makes the advertised retry
+safe rather than a way to submit twice.
+
+The check has to be made then. Resubmitting until it lands and counting the rows
+at the end cannot discriminate: a refusal that silently stored the row would
+still total one, the retry having resolved to it by content key. Reads never
+touch the writer, which is why the question is answerable while the pass is still
+running.
+
+The residuals A9.2.6 wrote down are unchanged. A submission arriving during a
+reconciliation, a snapshot or a maintenance job is not refused early and can
+still wait out its caller's own timeout.

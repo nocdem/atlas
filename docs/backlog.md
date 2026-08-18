@@ -546,3 +546,86 @@ Until then the honest statement is the one `docs/semantic-discovery.md` makes: a
 first automatic build of a large repository will make the daemon unresponsive to
 *writes* for its duration, reads are unaffected, and an operator who cannot
 accept that sets `semantic_auto_default = DISABLED` or disables the repository.
+
+## A9.2.5: a semantic index pass makes the daemon unreachable to every client
+
+**IMMEDIATE OPERATIONAL ITEM — to be resolved before O10.** Not an ordinary
+low-priority backlog line: the observed effect is a daemon that answered no read
+for roughly 25 minutes. It does not break trust correctness — every answer it
+did give was correct — but a repository-intelligence daemon nothing can query is
+indistinguishable from one that is down.
+
+### What was measured
+
+- **Correlation, established.** A 400 s monitor recorded nine consecutive samples
+  from 11:39:14 to 11:40:33 with `daemon ping` at the client ceiling
+  (`rpc_ms 6008-6020`) while one daemon thread held ~100 % CPU, and recovery the
+  moment the burst ended. Idle samples either side: 22-52 ms.
+- **The burst is a semantic index pass.** A bounded 15 s `strace` during it shows
+  thread 2783442 doing 19 244 `pread64` + 14 236 `pwrite64` with libclang parse
+  children spawning and reaping.
+- **The serve loop stalls inside a lock wait.** The main thread
+  (`accept4(4,...)`) shows `restart_syscall = -1 ETIMEDOUT` after ~5 s — the
+  configured `sqlite3_busy_timeout` — then answers `{"id":"cli","ok":false}`.
+- **The serve loop is single-threaded.** `src/ipc/server.c` is one `poll()` loop
+  that dispatches each request synchronously in `client_step_read`. One slow
+  request therefore blocks every other client, including `daemon ping`, which
+  touches no repository at all.
+
+### The WAL explanation was wrong — DISPROVEN
+
+An earlier draft of this entry blamed an un-checkpointed 253 MB WAL. Measured
+against the live daemon, that is false:
+
+```
+PRAGMA page_size            -> 4096
+PRAGMA journal_mode         -> wal
+PRAGMA wal_autocheckpoint   -> 1000        (the default IS active)
+PRAGMA wal_checkpoint(PASSIVE) -> 0|22|22  (busy=0, log=22, checkpointed=22)
+```
+
+The WAL *file* is 255 MB but holds **22 live frames**. SQLite does not truncate
+the WAL below its high-water mark without `journal_size_limit` or a TRUNCATE
+checkpoint, so a large file is expected and harmless. `busy=0` means no reader
+was blocking a checkpoint. And the decisive comparison: **with the WAL still at
+255 MB, `daemon ping` measures 22-23 ms.** WAL size does not correlate with
+latency.
+
+### Verdict: SUPPORTED BUT INCOMPLETE
+
+Established: the stall is coincident with a semantic pass; the serve loop is
+serial, so any one slow request blocks all clients; the serve loop did exhaust a
+5 s SQLite busy timeout during the burst.
+
+**Not established:** which specific lock the timeout was on, which request was
+slow, and whether the cause is lock contention or plain I/O saturation from
+33 000 syscalls in 15 s. The `fcntl(F_SETLK, F_WRLCK) = -1 EBADF` seen just
+before the refusal is unexplained.
+
+### Why it is worse now
+
+A9.2.4 made semantic maintenance the default, so the condition is no longer
+something an operator opts into. A9.2.5 adds nothing to the serve loop's cost —
+`atlas_sem_trust_now` replaces `atlas_sem_freshness_now` rather than joining it —
+but it does not reduce it either.
+
+### Candidate fixes, none implemented
+
+- **The serial serve loop is the real lever.** A8-CI's own rule is that "an
+  operation that can outlast a client's patience does not run in the serve loop";
+  indexing was moved out, but semantic *reads* were not, and under a concurrent
+  pass they can exceed a client timeout. A cheap first step is to answer
+  `daemon.ping` before any database work, so liveness stops depending on the
+  index being queryable.
+- A typed IPC refusal ("the index is busy, retry") instead of a bare frame-header
+  timeout, so a client can tell "Atlas is loaded" from "Atlas is gone".
+- Measure `atlas_sem_source_identity` cost per semantic read on a large
+  repository; it is the one part of a read that scales with the tree.
+- `journal_size_limit` if the 255 MB file is itself unwanted — cosmetic, and
+  explicitly **not** a fix for this.
+
+### What must not be repeated
+
+The suite passed 79/79 while the daemon was unreachable. Nothing asserts daemon
+liveness under load, and that is the test this entry most needs.
+

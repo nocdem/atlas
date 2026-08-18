@@ -1965,3 +1965,206 @@ src/gw/ui/mission-control.html  state, freshness and coverage as three rows
   Separately, `atlas-dispatcher.service` was found running a **deleted inode** of
   a previous binary, so `readlink /proc/<MainPID>/exe` ending in `(deleted)` is
   part of checking that the installed binary is the one being executed.
+
+## A9.2.5 layers — additions
+
+| File | Owns |
+| --- | --- |
+| `src/sem/sem.c` | the verdict vocabulary, `atlas_sem_trust_settle`, `atlas_sem_trust_write_json`, `atlas_sem_coverage_gap`, `atlas_sem_why_is_transient` |
+| `src/sem/index.c` | `atlas_sem_trust_now`, the repository-identity freshness check, the bounded per-unit retry |
+| `src/sem/schedule.c` | the `INCOMPLETE` hold split, `coverage_gap`, `operator_action_required`, the interrupted-pass exception |
+| `src/sem/discover.c` | per-path obstacles: `note_obstacle`, `note_partial_at`, the deterministic sort |
+| `src/db/db_sem.c` | `sem_discovery_obstacles` replace/get/forget |
+| `src/db/migrate.c` | migration 20 |
+| `src/core/service_sem.c`, `src/sem/context.c` | settling the verdict once the result set is final |
+| `src/ipc/server_sem.c`, `src/cli/render_json.c` | calling the one trust writer; **never writing the block themselves** |
+| `src/core/service_remote.c` | `take_trust`, which must leave the conservative value for every absent key |
+
+`docs/semantic-trust.md` carries the full argument. **A9.2.4 has no section in
+this file**; that is a gap in the previous season's documentation rather than a
+statement that its rules are weaker, and it is worth closing.
+
+## A9.2.5 rules — these are not negotiable
+
+### A semantic read that found nothing has not established that there is nothing
+
+A9.2.2 proved this for *claims* and built the coverage model an absence rests on.
+A9.2.3 gave a generation a coverage manifest; A9.2.4 gave it a discovery verdict.
+None of it reached `callers of X`, which answered with its rows plus
+`{freshness, stale_reason, generation_id, indexed_commit}` and stopped.
+
+So `zero rows` and `zero rows over a tree Atlas read a third of` were the same
+document, and the repository that produced this season answered exactly that with
+a PROVEN caller sitting in a file the compilation database never named. The
+information needed to refuse the conclusion existed, in the same process, one
+function away, and was not on the answer.
+
+**Every load-bearing semantic answer now carries the evidence for its own
+verdict.** A surface that omits the trust block is not "less detailed"; it is one
+whose answers cannot be reasoned about.
+
+### UNKNOWN is zero, and UNKNOWN does not mean "no"
+
+`atlas_sem_trust_settle` is the only producer of `ATLAS_SEM_VERDICT_ABSENT`, and
+a `memset` must never produce an absence proof. `atlas_sem_verdict_parse` refuses
+anything unrecognised rather than falling back, because defaulting an unparsed
+verdict to ABSENT is the one error that would matter.
+
+### The asymmetry is A9.2.2's, applied one layer out
+
+One row settles PRESENT and nothing else is consulted: a caller Atlas *found*
+exists whatever it failed to look at. Coverage bounds a negative conclusion and
+bounds nothing about a positive one — which is why positive rows from a **stale**
+generation are still emitted, with the generation that produced them beside them.
+Suppressing them would discard evidence; presenting them without their generation
+would turn evidence about one tree into a claim about another.
+
+### The verdict rests on the generation's discovery, never the live one
+
+`generation_discovery` is what the index being served was built under;
+`discovery` is what Atlas can account for now. Both are reported and they differ
+exactly when a rebuild is due. Reading the live value in `settle` would let an
+improvement nobody has indexed vouch for an index that predates it.
+
+### A repository nobody maintains cannot settle an absence
+
+A freshness value is only ever a statement about the instant it was computed.
+`atlas_sem_auto_effective` decides, and the reason names the remedy —
+`code sem-config --auto` — rather than sending an operator to look at their
+compilation database. The cost is stated rather than hidden: a repository built
+by hand with `--no-auto` can never answer ABSENT.
+
+### One implementation of "is this coverage complete?"
+
+`atlas_sem_coverage_gap` returns *which* dimension failed rather than a boolean,
+because the four are four different problems with four different remedies. The
+scheduler (`coverage_gap_of`), the verdict (`settle`) and the gatherer
+(`atlas_sem_trust_now`) all ask it. A repository the scheduler calls INCOMPLETE
+and a query that answers UNKNOWN therefore name the same dimension because they
+consulted the same function, not because three copies are kept in step.
+
+### One writer for the trust block, and it is a placement decision
+
+`src/cli/render_json.c` and `src/ipc/server_sem.c` were two independently
+maintained serializers of the same answers and had **already drifted**:
+`have_generation` was on the RPC document and not the CLI's. Adding twenty fields
+to two writers by hand would have made that certain rather than likely.
+
+`atlas_sem_trust_write_json` lives in the sem layer and both call it. Do not add a
+trust field to either serializer directly; that is the drift the function exists
+to make impossible. Every value it emits is an Atlas integer, an Atlas boolean, a
+string from a checked Atlas vocabulary or a checked hex digest — A2's five kinds
+— so nothing in it needs `atlas_safe`, and nothing that would may be added.
+
+**It is written after the results.** A verdict is a statement about a result set,
+so on a streaming writer it cannot precede it. Key order is not a JSON contract
+and the guarantee that mattered — that no answer can be read without its currency
+— is unchanged, because the block is in the same document.
+
+### The remote parser fails closed on every absent key
+
+A newer CLI against an older daemon finds no `result_verdict`, no coverage and no
+discovery. `take_trust` leaves UNKNOWN with `coverage_complete` false, never
+errors, and never defaults to a value that would let an absence be believed. A
+missing key is Atlas not having been told, which is what UNKNOWN means.
+
+### A symbol that is not in the index is not a usage error
+
+"You asked for something that does not exist" and "Atlas did not read the file it
+is in" are different claims, and exit 2 — the operator-typo class — merged them.
+Over an incomplete generation Atlas cannot make the second claim at all. It is an
+ordinary empty result set and settles like any other. **Ambiguity stays exit 2**,
+because a name that resolves to three symbols is a question Atlas cannot answer
+as asked.
+
+### INCOMPLETE is never held with HOLD_CURRENT, and is still a hold
+
+`the_published_generation_describes_the_current_source` is *true* of an
+INCOMPLETE repository and conceals the half that decides whether any absence over
+it means anything. On `/opt/atlas` itself the state is permanent and its only
+cause is the operator's own `--exclude`; that one sentence was everything anybody
+ever saw about it.
+
+It is still a hold rather than a rebuild trigger. Rebuilding cannot widen a
+compilation database, cannot un-exclude a subtree, and cannot make a unit that
+failed on these bytes succeed on them, so scheduling one would spin without
+converging. `coverage_gap` names the dimension and `operator_action_required`
+says that waiting will not help.
+
+### Discovery records every obstacle, with its exact path
+
+A9.2.4 kept the **first** reason and no path, so one declared `--exclude`
+consumed the only slot and masked every unreadable directory for the rest of the
+walk. The objection it raised against recording the path — "a path is bytes a
+repository chose" — was already answered by `encode_rel`, which every accepted
+and rejected candidate's path goes through, twelve lines from where the reason
+was recorded.
+
+The reason and the path are separate columns and separate JSON keys. Never
+concatenate them: a value an operator reads must stay one Atlas owns. Obstacles
+are sorted by path so two walks over an unchanged tree agree whatever order
+`readdir` returned, and reaching `ATLAS_SEM_DISCOVERY_MAX_OBSTACLES` sets
+`obstacles_truncated` — a list trimmed without saying so would recreate the
+invisible hole it exists to close.
+
+`sem_discovery_obstacles` is DERIVED and **never prunable by age**: a
+partly-deleted list of what was missed reads as a search that missed less.
+
+### repo_identity_hash is compared, before the commit
+
+It has been written onto every generation since A8-CI and compared by nothing,
+while `src/gate/assess.c` compares exactly this value and revalidates on a
+mismatch. "This index describes a different repository" outranks "this index
+describes an older commit of the same one".
+
+The source identity cannot stand in for it: it is built from repository-*relative*
+paths and content hashes, so a tree with identical content under a different
+canonical root produces an identical value. Both empty-value guards hold — an
+empty stored identity is a generation built before this was recorded, an empty
+live one is Atlas not having looked, and neither is evidence of change.
+
+### A transient failure is not permanent coverage loss, and both bounds are hard
+
+`tu_failed > 0` makes coverage incomplete for ever, because the retry governor
+compares *identities* and identical bytes never retry. A parse child that was
+OOM-killed therefore cost a repository the ability to state an absence until
+somebody happened to edit a file.
+
+- **Per unit**: `ATLAS_SEM_UNIT_TRANSIENT_RETRIES` further attempts, inside the
+  pass that is already running, and only for a reason
+  `atlas_sem_why_is_transient` accepts. **Nothing durable records that a retry
+  happened**, so a restart has no half-finished state to interpret and no timer
+  can wake up and try again. Re-inserting facts is safe because every fact insert
+  is `ON CONFLICT … DO NOTHING` on a natural key, and the generation's published
+  counts come from `atlas_db_sem_generation_counts` reading the rows that exist.
+- **Per pass**: `ATLAS_SEM_WHY_PASS_INTERRUPTED` — `ATLAS_ERR_INTERNAL` or
+  `ATLAS_ERR_DB`, a failure of the machine rather than of the inputs — permits
+  exactly one further attempt with the source unmoved, bounded by the durable
+  `fail_count`.
+
+Everything else is a property of the input and is never retried. Adding a timer,
+or widening the transient set to a compiler error, would replace a bound that is
+provably storm-free with one that has to be argued about.
+
+### Atlas still does not guess which sources are tests
+
+A declared root matches from the start of the path on a component boundary, so a
+nested test directory must be declared by its full relative path. A heuristic that
+guessed would classify a production source as a test the first time a repository
+used the word differently, and a production source excluded from a
+production-scope absence is the failure that matters.
+
+What follows is the rule: **an operator declaring a test root is not evidence
+that they declared every test root** — the same shape as A9.2.4's rule that a
+pinned compilation-database list is not a completeness claim. `ATLAS_COVDIM_TESTS`
+is therefore established by no verifier and stays UNKNOWN, and any absence that
+would depend on the test/production split is UNAVAILABLE. The failure mode is
+silent — somebody sets the dimension COMPLETE from a non-empty root list and a
+whole class of negative answers quietly becomes believable — so it is tested
+rather than left to hold by accident.
+
+### The structural and semantic trust surfaces stay apart
+
+A repository whose A3 structural index is current may have a semantic index that
+is not. A query answer inherits the **semantic** verdict, never the structural
+index's currency, and no code path derives one from the other.

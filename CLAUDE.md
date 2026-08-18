@@ -1,21 +1,20 @@
 # Atlas — working notes for Claude Code
 
 Atlas is a generic, headless engineering-memory and repository-intelligence CLI
-in C17. Phase **A9.2.4**: semantic discovery and activation — Atlas now *finds*
-a repository's compilation databases inside a bounded search universe, knows
-whether that search was complete, and maintains the semantic index by default
-rather than when an operator remembers to. The two sentences the season exists
-for are
+in C17. Phase **A9.2.5**: semantic index trust closure — every load-bearing
+semantic answer now carries the evidence for its own verdict, and a read that
+found nothing says whether that means anything. The two sentences the season
+exists for are
 
-> **COMPLETE PROCESSING OF CONFIGURED INPUTS DOES NOT PROVE COMPLETE DISCOVERY
-> OF RELEVANT INPUTS.**
+> **A SEMANTIC READ THAT FOUND NOTHING HAS NOT ESTABLISHED THAT THERE IS
+> NOTHING.**
 
 and
 
-> **SEMANTIC AUTO-MAINTENANCE MUST NOT DEPEND ON AN OPERATOR REMEMBERING TO
-> REBUILD, EXCEPT WHERE THE OPERATOR HAS EXPLICITLY DISABLED IT.**
+> **EVERY LOAD-BEARING SEMANTIC ANSWER CARRIES THE EVIDENCE FOR ITS OWN
+> VERDICT.**
 
-See `docs/semantic-discovery.md`.
+See `docs/semantic-trust.md`.
 
 ## How to read this file
 
@@ -52,6 +51,7 @@ document that carries it:
 
 | Season | What it added | Document |
 | --- | --- | --- |
+| A9.2.5 | the verdict every semantic read carries; zero rows are not an absence | `docs/semantic-trust.md` |
 | A9.2.4 | build-input discovery, and an activation policy that does not depend on memory | `docs/semantic-discovery.md` |
 | A9.2.3 | semantic freshness and coverage the daemon maintains; a source-current index can still be coverage-incomplete | `docs/semantic-freshness.md` |
 | A9.2.2 | epistemic absence: no evidence of X is not evidence of no X | `docs/verification.md` |
@@ -541,6 +541,47 @@ is not written down is one somebody deletes.** Both halves are load-bearing.
 - **Manual and automatic rebuild are one pipeline**, and there is **one shape on
   every surface**.
 
+### A9.2.5 — semantic index trust closure
+
+- **A SEMANTIC READ THAT FOUND NOTHING HAS NOT ESTABLISHED THAT THERE IS
+  NOTHING.** `zero rows` and `zero rows over a tree Atlas read a third of` were
+  one document until this season; every load-bearing semantic answer now carries
+  a `result_verdict` and the coverage that earned it.
+- **UNKNOWN is zero and UNKNOWN does not mean "no".** `atlas_sem_trust_settle` is
+  the only producer of `ATLAS_SEM_VERDICT_ABSENT`.
+- **The asymmetry is A9.2.2's, one layer out**: one row settles PRESENT whatever
+  the coverage, and positive rows from a stale generation are emitted with the
+  generation that produced them. Zero rows settle ABSENT only over a universe
+  Atlas can vouch for.
+- **The verdict rests on the *generation's* discovery, never the live one.** A
+  walk that has since completed says nothing about a generation built before it.
+- **A repository nobody maintains cannot settle an absence**, and the reason says
+  so rather than sending an operator to look at their compilation database.
+- **`atlas_sem_coverage_gap` is the one implementation of "is this coverage
+  complete?"** — the scheduler, the verdict and the status surface all ask it, and
+  it returns *which* dimension failed rather than a boolean.
+- **`atlas_sem_trust_write_json` is the one writer of the trust block**, called by
+  both serializers. It is written after the results because a verdict about a
+  result set cannot precede it; nothing public was removed.
+- **The remote parser leaves the conservative value for every absent key.** A
+  newer CLI against an older daemon reads UNKNOWN, never ABSENT, and never errors.
+- **A symbol that is not in the index is not a usage error.** Ambiguity still is.
+- **INCOMPLETE is never held with `HOLD_CURRENT`**, and it is still a hold rather
+  than a rebuild: rebuilding cannot widen a compilation database.
+- **Discovery records every obstacle with its exact `%XX`-encoded path**, not the
+  first reason and no path. `sem_discovery_obstacles` is DERIVED and never
+  prunable by age.
+- **`repo_identity_hash` is compared, before the commit.** The source identity
+  cannot stand in for it: it is built from repository-*relative* paths.
+- **A transient failure is not permanent coverage loss**, and both recovery
+  bounds are compile-time or durable — one per-unit retry inside the running
+  pass, one per-pass retry bounded by `fail_count`. No timer exists anywhere.
+- **Atlas still does not guess which sources are tests**, and declaring one test
+  root is not evidence that every test root was declared: `ATLAS_COVDIM_TESTS` is
+  established by no verifier and stays UNKNOWN.
+- **The structural and semantic trust surfaces stay apart.** A query answer
+  inherits the semantic verdict, never the structural index's currency.
+
 ### A9.2.4 — build-input discovery and activation
 
 - **COMPLETE PROCESSING OF CONFIGURED INPUTS DOES NOT PROVE COMPLETE DISCOVERY OF
@@ -872,6 +913,7 @@ two documents on stdout.
 `docs/security/A7_1_THREAT_MODEL.md` · `docs/security/A7_1_OPERATIONS.md` ·
 `docs/orchestration.md` · `docs/remote-access.md` · `docs/verification.md` ·
 `docs/semantic-freshness.md` · `docs/semantic-discovery.md` ·
+`docs/semantic-trust.md` ·
 `docs/git-safety.md` ·
 `docs/daemon-and-ipc.md` ·
 `docs/watcher-consistency.md` · `docs/systemd-user-service.md` ·

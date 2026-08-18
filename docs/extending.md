@@ -355,3 +355,79 @@ compiler finds the first kind and not the second.
   field, a documented line in `deploy/a71/system.conf.template`, and a case in
   the malformed matrix. An unknown key stays an error, and an unrecognised
   *value* is malformed rather than silently taken as one of the known ones.
+
+## A9.2.5 — the semantic verdict, and where a walk could not look
+
+### Adding a value to `atlas_sem_verdict`
+
+Don't, without a written argument. Three values are the whole model — found, not
+found over a universe Atlas can vouch for, and cannot say — and a fourth would
+have to answer a question the other three cannot. `UNKNOWN` must stay zero.
+
+If you do: `VERDICT_NAMES[]` in `src/sem/sem.c`, `atlas_sem_verdict_parse`
+(which must keep refusing anything unrecognised rather than falling back), the
+truth table in `docs/semantic-trust.md`, and `test_verdict_vocabulary`.
+
+### Adding an `ATLAS_SEM_UNK_*` reason
+
+1. The macro in `include/atlas/sem.h`, beside the others, in precedence order.
+2. **The `REASONS[]` array in `atlas_sem_unknown_reason_intern`.** A reason not in
+   that array is dropped at every surface boundary — the JSON writer, the socket,
+   the remote parser — so the answer reaches an operator with a verdict and no
+   explanation. This is the step that gets forgotten.
+3. The check in `atlas_sem_trust_settle`, placed where an operator would want to
+   be told about it: most actionable first.
+4. A case in `test_verdict_reason_precedence_is_the_most_actionable`, or the
+   ordering can be quietly reshuffled by a later edit.
+
+Note that the four *coverage* reasons are produced by `atlas_sem_coverage_gap`
+and not by `settle` directly, because the scheduler asks the same function. A new
+coverage dimension goes there, and `coverage_gap_of` in `src/sem/schedule.c` and
+`atlas_sem_trust_now` both inherit it.
+
+### Adding a field to the trust block
+
+One struct, one writer, four readers.
+
+1. `atlas_sem_trust` in `include/atlas/sem.h`. The zero must be the safe reading.
+2. `atlas_sem_trust_write_json` in `src/sem/sem.c` — the **only** writer. Do not
+   add it to `src/cli/render_json.c` or `src/ipc/server_sem.c`; that is the drift
+   this function exists to make impossible.
+3. `atlas_sem_trust_now_with_default` in `src/sem/index.c`, which must fill it
+   from facts the **existing** `live_facts` pass already has. A field that needs a
+   new database read puts that read on every semantic query; measure it or find
+   another way.
+4. `take_trust` in `src/core/service_remote.c`. **An absent key must leave the
+   conservative value** — never error, never default to a value that would let an
+   absence be believed.
+5. The human renderer only if an operator would act on it. Not everything in the
+   block belongs on a terminal.
+
+Every value must be an Atlas integer, an Atlas boolean, a string from a checked
+Atlas vocabulary, or a checked hex digest — A2's five kinds. Nothing in this
+block needs `atlas_safe`, and nothing that would may be added to it.
+
+### Adding an `ATLAS_SEM_OBSTACLE_*` reason
+
+1. The macro in `include/atlas/sem_discover.h`.
+2. **`REASONS[]` in `atlas_sem_obstacle_intern`** — interned on the way into the
+   database and on the way out of it, so an unlisted reason is silently dropped
+   at both ends.
+3. The `note_partial_at` call site in `src/sem/discover.c`, with the **path** the
+   obstacle is about. A pathless obstacle is the A9.2.4 defect.
+4. A case in `tests/test_sem_discovery.c`.
+
+The reason and the path are separate columns and separate JSON keys. Never
+concatenate them: a value an operator reads must stay one Atlas owns.
+
+### Bounds this season added
+
+| Bound | Where | Reached ⇒ |
+| --- | --- | --- |
+| `ATLAS_SEM_DISCOVERY_MAX_OBSTACLES` | `limits.h` | `obstacles_truncated`, reported |
+| `ATLAS_SEM_UNIT_TRANSIENT_RETRIES` | `limits.h` | the unit is recorded failed |
+
+Raising either needs an argument about storms. The unit retry bound is
+compile-time, per unit and per pass, and nothing durable records that a retry
+happened — that is the whole guarantee, and a durable retry counter would replace
+it with one that has to be reasoned about after a restart.

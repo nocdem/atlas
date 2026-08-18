@@ -108,6 +108,29 @@ void atlas_cli_print_help(FILE *out) {
         "  decision promote NAME ID   make an A4 document from an A2 proposal\n"
         ,
         ATLAS_VERSION_STRING, ATLAS_PHASE);
+    /* A9.2.5. A third split, for the reason the second exists: the eight
+     * semantic commands below pushed the first literal past the length ISO C99
+     * guarantees.
+     *
+     * All eight existed, were dispatched, were served over the socket, and
+     * appeared in no help text — including `code index`, which the "no semantic
+     * index exists" error tells an operator to run. CLAUDE.md warns that the
+     * COMMANDS[] table is the wiring place that gets forgotten; this is a sixth,
+     * and its failure mode is quieter still: the command works, every test
+     * passes, and nobody can find it. */
+    (void)fprintf(
+        out,
+        "  code index NAME            build the semantic index (operator; runs a compiler)\n"
+        "                             [--compdb PATH]... [--rebuild]\n"
+        "  code semantic NAME SYMBOL  compiler-derived facts about a symbol\n"
+        "  code callers NAME SYMBOL   who calls it, with the evidence for each edge\n"
+        "  code callees NAME SYMBOL   what it calls\n"
+        "  code trace NAME FROM TO    a bounded call path between two symbols\n"
+        "  code sem-impact NAME SUBJ  compiler-derived change impact for a symbol or file\n"
+        "  code tests NAME SUBJ       the same report, filtered to test files\n"
+        "  code explain NAME SUBJ     the same report, subject definition first\n"
+        "  context build --repo NAME --task TEXT   a deterministic task context package\n");
+
     /* A second split, for the reason the others exist: the backup note pushed
      * the first literal past the length ISO C99 guarantees. */
     (void)fprintf(

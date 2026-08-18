@@ -56,6 +56,21 @@
 /* Daemon internals ------------------------------------------------------- */
 /* Pending jobs in the single-writer queue before producers get backpressure. */
 #define ATLAS_WRITER_QUEUE_MAX 4096u
+/* A9.2.6. How often a caller waiting for the writer re-examines what the writer
+ * is actually doing.
+ *
+ * The serve loop dispatches one request at a time, so every millisecond it
+ * spends waiting for the writer is a millisecond no other client is served —
+ * including `daemon.ping`. A waiter therefore does not sleep out its whole
+ * timeout in one call: it wakes on this interval and asks whether the writer has
+ * entered a job whose duration Atlas cannot state, which is the one condition
+ * under which continuing to wait is pointless rather than merely slow.
+ *
+ * Short enough that the head-of-line stall it bounds is below any figure a
+ * client would call unresponsive, long enough that an idle daemon is not woken
+ * for nothing. It is a responsiveness bound, never a correctness one: a waiter
+ * that never woke early would still return the right answer, just later. */
+#define ATLAS_WRITER_WAIT_SLICE_MS 100
 /* Hashing/stat worker threads. Clamped against the online CPU count. */
 #define ATLAS_WORKER_COUNT_MAX 8u
 #define ATLAS_WORKER_COUNT_DEFAULT 4u

@@ -59,6 +59,19 @@ struct atlas_writer {
      * the durable record, and a scheduler that only looked there would queue a
      * second build of the same repository. */
     int64_t sem_index_running_repo;
+    /* A9.2.6. What this thread is executing right now, and whether it is
+     * executing anything at all.
+     *
+     * `running_kind` is meaningless unless `running` is set, so the two are
+     * always read together: there is no idle value to reserve in the enum, and
+     * inventing one would put a member in `atlas_job_kind` that names no job.
+     *
+     * Both are set in the same lock hold that dequeues the job and cleared in
+     * the same one that completes it, so a waiter never observes the writer as
+     * idle while its own job is still unfinished, nor as busy after the job it
+     * was waiting for has been handed back. */
+    bool running;
+    atlas_job_kind running_kind;
 
     atlas_workers *workers;
     FILE *log;
@@ -186,6 +199,177 @@ static atlas_job *queue_pop(atlas_writer *w) {
     w->head = (w->head + 1u) % ATLAS_WRITER_QUEUE_MAX;
     w->count--;
     return j;
+}
+
+/* Caller holds the lock. Removes one job a submitter has given up on, and
+ * returns whether it was still there to remove.
+ *
+ * The answer is the whole point of the function. A job that is still queued has
+ * not been looked at: excising it means nothing ran, which is what makes the
+ * refusal its submitter reports honest. A job that is *not* found has been
+ * dequeued and is executing, and there is nothing to take back — the caller must
+ * keep waiting rather than treat "not found" as "cancelled".
+ *
+ * Every other job keeps its position. Only the abandoned one leaves, and the
+ * jobs behind it shift up by one, so the queue stays first-in-first-out. That
+ * ordering is load-bearing well outside this file: the orchestration ledger and
+ * the decision lifecycle both depend on writes being applied in the order they
+ * were accepted, and a queue that let one job overtake another to save a caller
+ * some latency would break them silently. */
+static bool queue_remove(atlas_writer *w, const atlas_job *j) {
+    for (size_t k = 0; k < w->count; k++) {
+        if (w->queue[(w->head + k) % ATLAS_WRITER_QUEUE_MAX] != j) {
+            continue;
+        }
+        for (size_t m = k + 1u; m < w->count; m++) {
+            w->queue[(w->head + m - 1u) % ATLAS_WRITER_QUEUE_MAX] =
+                w->queue[(w->head + m) % ATLAS_WRITER_QUEUE_MAX];
+        }
+        w->count--;
+        return true;
+    }
+    return false;
+}
+
+/* A9.2.6. The one thing a caller is told when the writer is busy with work that
+ * has no statable end.
+ *
+ * "Semantic maintenance" rather than "rebuilding an index", because two kinds
+ * produce this and only one of them is a rebuild: a discovery walk is looking
+ * for build descriptions, and an operator sent to look at a build that is not
+ * running has been told something false in the one message they will read.
+ *
+ * The sentence after the token is the load-bearing half. The other way a
+ * synchronous writer call can fail — the deadline expiring — leaves the job
+ * queued and running, so the write *does* happen and the caller simply never
+ * hears the outcome. This one guarantees the opposite: the job was taken back
+ * out before anything looked at it. Only that difference makes retrying safe,
+ * and a caller cannot infer it from a status code, so it is said. The two
+ * messages are never merged. */
+static const char WRITER_BUSY_MSG[] =
+    "BUSY: the Atlas daemon is performing semantic maintenance and cannot take this write yet. "
+    "Nothing was queued and nothing will run, so the request may be sent again.";
+
+/* A9.2.6. Whether a job of this kind has a duration Atlas can state.
+ *
+ * **THE DEADLINE WAS NEVER THE BOUND; THE SHORT JOB WAS.** Every synchronous
+ * writer call below waits with a timeout, and the comment explaining why has
+ * always said that the timeout is what stops one slow mutation stalling every
+ * other client. That was true only because every job on this queue was a handful
+ * of statements: the timeout bounded a stall nothing was expected to reach.
+ * A9.2.4 put an automatic, minutes-long semantic pass on the same thread and the
+ * same queue, and the premise stopped holding without a line of the waiting code
+ * changing. A hook's session write queued behind such a pass now sits out its
+ * whole four seconds and *then* fails — and because the serve loop dispatches
+ * one request at a time, `daemon.ping` and every other client sit behind it too.
+ * Measured: ping goes from 26 ms to 3.9 s for each such write.
+ *
+ * So a waiter has to be able to ask what the writer is doing, and this is the
+ * question. It is asked of the kind rather than of elapsed time because elapsed
+ * time cannot distinguish a job that is nearly finished from one that has barely
+ * started, and a waiter that guesses wrong in the second direction abandons a
+ * write that was about to succeed.
+ *
+ * `true` costs the caller a refusal it must retry. `false` costs it a wait. The
+ * kinds that answer `true` are the two that run a compiler or walk a whole tree
+ * — the ones with no statable bound. **Reconciliation is deliberately `false`**
+ * even though a first pass over a large repository can exceed the timeouts here:
+ * an incremental pass is the common case, it finishes well inside them, and a
+ * hook write refused during one would be dropped rather than delayed, because
+ * hooks fail open. Refusing a write that would have succeeded is the worse
+ * failure, and it would be the frequent one.
+ *
+ * There is no `default:`, so adding a job kind will not compile until somebody
+ * decides which side it is on. See `docs/extending.md`. */
+static bool job_kind_is_unbounded(atlas_job_kind kind) {
+    switch (kind) {
+    /* Runs a compiler over every translation unit the build describes. */
+    case ATLAS_JOB_SEM_INDEX:
+    /* Walks the repository looking for build descriptions. */
+    case ATLAS_JOB_SEM_DISCOVER:
+        return true;
+    case ATLAS_JOB_RECONCILE:
+    case ATLAS_JOB_REPO_ADD:
+    case ATLAS_JOB_REPO_REMOVE:
+    case ATLAS_JOB_MARK_GAP:
+    case ATLAS_JOB_SET_WATCH:
+    case ATLAS_JOB_AI:
+    case ATLAS_JOB_DECISION:
+    case ATLAS_JOB_ORCH:
+    case ATLAS_JOB_SNAPSHOT:
+    case ATLAS_JOB_MAINTENANCE:
+    case ATLAS_JOB_GW_AUDIT:
+    case ATLAS_JOB_APIKEY:
+    case ATLAS_JOB_VERIFY:
+    case ATLAS_JOB_SEM_CONFIG:
+        return false;
+    }
+    return false;
+}
+
+/* A9.2.6. Wait for one queued job, and say whether waiting was abandoned.
+ *
+ * **THE DEADLINE WAS NEVER THE BOUND; THE SHORT JOB WAS.** Every synchronous
+ * writer call in this file waits with a timeout, and the comment explaining why
+ * has always said the timeout is what stops one slow mutation stalling every
+ * other client. That held only because every job on this queue was a handful of
+ * statements — the timeout bounded a stall nothing was expected to reach.
+ * A9.2.4 put an automatic, minutes-long semantic pass on the same thread and the
+ * same queue, and the premise stopped holding without a line of the waiting code
+ * changing. A hook's session write queued behind such a pass sits out its whole
+ * four seconds and *then* fails; and because the serve loop dispatches one
+ * request at a time, `daemon.ping` and every other client sit behind it too.
+ * Measured on this repository: ping 26 ms idle, 3.9 s per such write.
+ *
+ * Caller holds the lock and still holds it on return. Every synchronous caller
+ * uses this rather than its own wait loop: nine copies of a waiting rule is nine
+ * places to fix it, and a daemon responsive on eight of nine methods is
+ * indistinguishable from an intermittent one.
+ *
+ * `true` means the job was removed from the queue and **never ran**, which is
+ * the caller's licence to report a retryable refusal. `false` means the ordinary
+ * two outcomes are still in play and the caller decides between them by reading
+ * `j->done`, exactly as it did before.
+ *
+ * The wait is sliced rather than made in one call so the condition can be asked
+ * again: a pass that starts *after* this job is queued blocks it exactly as much
+ * as one already running, and a single `pthread_cond_timedwait` would sleep
+ * straight through the difference. A slice expiring is not the timeout — only
+ * the deadline is, which is why the slice is clamped to it rather than allowed
+ * to overrun it. */
+static bool writer_wait_locked(atlas_writer *w, atlas_job *j, const struct timespec *deadline) {
+    while (!j->done) {
+        struct timespec now;
+        (void)clock_gettime(CLOCK_REALTIME, &now);
+        if (now.tv_sec > deadline->tv_sec ||
+            (now.tv_sec == deadline->tv_sec && now.tv_nsec >= deadline->tv_nsec)) {
+            return false; /* the caller's deadline, and the only timeout there is */
+        }
+        struct timespec slice = now;
+        slice.tv_nsec += (long)ATLAS_WRITER_WAIT_SLICE_MS * 1000000L;
+        if (slice.tv_nsec >= 1000000000L) {
+            slice.tv_sec++;
+            slice.tv_nsec -= 1000000000L;
+        }
+        if (slice.tv_sec > deadline->tv_sec ||
+            (slice.tv_sec == deadline->tv_sec && slice.tv_nsec > deadline->tv_nsec)) {
+            slice = *deadline;
+        }
+        (void)pthread_cond_timedwait(&w->job_done, &w->lock, &slice);
+
+        /* One question, asked in the one lock hold the wait reacquired, because
+         * either half alone gives the wrong answer. "The writer is busy with
+         * something unbounded" is not a reason to give up unless this job is
+         * also still queued: if `queue_remove` cannot find it, the writer has
+         * dequeued it and is running *this* job — there is nothing to take back,
+         * and abandoning it would report a refusal for a write already in
+         * progress. Keep waiting instead, which is what the deadline is for. */
+        if (!j->done && w->running && job_kind_is_unbounded(w->running_kind) &&
+            queue_remove(w, j)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /* --- the work ------------------------------------------------------------ */
@@ -779,6 +963,13 @@ static void *writer_main(void *arg) {
             break;
         }
         atlas_job *j = queue_pop(w);
+        /* Claimed in the hold that dequeued it, so there is no instant in which
+         * this thread owns a job and reports itself idle. A waiter that saw that
+         * instant would conclude its own job could not be the one running. */
+        if (j != NULL) {
+            w->running = true;
+            w->running_kind = j->kind;
+        }
         (void)pthread_mutex_unlock(&w->lock);
         if (j == NULL) {
             continue;
@@ -883,15 +1074,27 @@ static void *writer_main(void *arg) {
         default: break;
         }
 
-        if (j->wants_result) {
-            (void)pthread_mutex_lock(&w->lock);
+        /* One hold clears the claim, completes the job and wakes the waiters,
+         * because a waiter that saw the writer idle while its own job was still
+         * unfinished would take its job back out of a queue it is no longer in.
+         *
+         * `wants_result` is read here rather than before the lock, and that is
+         * what decides who frees the job. A waiter that has given up clears it
+         * under this same lock, so reading it outside could see the waiter still
+         * present, hand the job to it, and leak — the waiter has already
+         * returned. Whoever observes it last under the lock owns the answer. */
+        (void)pthread_mutex_lock(&w->lock);
+        w->running = false;
+        bool waited_on = j->wants_result;
+        if (waited_on) {
             j->done = true;
-            (void)pthread_cond_broadcast(&w->job_done);
-            (void)pthread_mutex_unlock(&w->lock);
-            /* Ownership stays with the waiter, which frees it. */
-        } else {
+        }
+        (void)pthread_cond_broadcast(&w->job_done);
+        (void)pthread_mutex_unlock(&w->lock);
+        if (!waited_on) {
             job_free(j);
         }
+        /* Otherwise ownership stays with the waiter, which frees it. */
     }
 
     atlas_err ignore;
@@ -1177,12 +1380,17 @@ static atlas_status writer_call_impl(atlas_writer *w, atlas_job_kind kind, const
         deadline.tv_sec++;
         deadline.tv_nsec -= 1000000000L;
     }
-    int rc = 0;
-    while (!j->done && rc == 0) {
-        rc = pthread_cond_timedwait(&w->job_done, &w->lock, &deadline);
-    }
+    bool backed_out = writer_wait_locked(w, j, &deadline);
     bool done = j->done;
     (void)pthread_mutex_unlock(&w->lock);
+
+    /* Taken back out of the queue before anything looked at it, so this reports
+     * a refusal rather than a failure: the write did not happen and asking again
+     * is safe. Freed here because the writer never saw it. */
+    if (backed_out) {
+        job_free(j);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "%s", WRITER_BUSY_MSG);
+    }
 
     if (!done) {
         /* The job is still owned by the writer, which will free it when it
@@ -1243,12 +1451,17 @@ atlas_status atlas_writer_ai(atlas_writer *w, atlas_ai_op *op, int timeout_ms,
         deadline.tv_sec++;
         deadline.tv_nsec -= 1000000000L;
     }
-    int rc = 0;
-    while (!j->done && rc == 0) {
-        rc = pthread_cond_timedwait(&w->job_done, &w->lock, &deadline);
-    }
+    bool backed_out = writer_wait_locked(w, j, &deadline);
     bool done = j->done;
     (void)pthread_mutex_unlock(&w->lock);
+
+    /* Taken back out of the queue before anything looked at it, so this reports
+     * a refusal rather than a failure: the write did not happen and asking again
+     * is safe. Freed here because the writer never saw it. */
+    if (backed_out) {
+        job_free(j);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "%s", WRITER_BUSY_MSG);
+    }
 
     if (!done) {
         /* Detached rather than freed: the job is still the writer's, and the
@@ -1379,12 +1592,17 @@ atlas_status atlas_writer_decision(atlas_writer *w, atlas_decision_op *op, int t
         deadline.tv_sec++;
         deadline.tv_nsec -= 1000000000L;
     }
-    int rc = 0;
-    while (!j->done && rc == 0) {
-        rc = pthread_cond_timedwait(&w->job_done, &w->lock, &deadline);
-    }
+    bool backed_out = writer_wait_locked(w, j, &deadline);
     bool done = j->done;
     (void)pthread_mutex_unlock(&w->lock);
+
+    /* Taken back out of the queue before anything looked at it, so this reports
+     * a refusal rather than a failure: the write did not happen and asking again
+     * is safe. Freed here because the writer never saw it. */
+    if (backed_out) {
+        job_free(j);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "%s", WRITER_BUSY_MSG);
+    }
 
     if (!done) {
         /* Detached rather than freed: the job is still the writer's, and the
@@ -1494,12 +1712,17 @@ atlas_status atlas_writer_verify(atlas_writer *w, atlas_verify_op *op, int timeo
         deadline.tv_sec++;
         deadline.tv_nsec -= 1000000000L;
     }
-    int rc = 0;
-    while (!j->done && rc == 0) {
-        rc = pthread_cond_timedwait(&w->job_done, &w->lock, &deadline);
-    }
+    bool backed_out = writer_wait_locked(w, j, &deadline);
     bool done = j->done;
     (void)pthread_mutex_unlock(&w->lock);
+
+    /* Taken back out of the queue before anything looked at it, so this reports
+     * a refusal rather than a failure: the write did not happen and asking again
+     * is safe. Freed here because the writer never saw it. */
+    if (backed_out) {
+        job_free(j);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "%s", WRITER_BUSY_MSG);
+    }
 
     if (!done) {
         /* Detached rather than freed: the job is still the writer's, and the
@@ -1561,12 +1784,17 @@ atlas_status atlas_writer_orch(atlas_writer *w, atlas_orch_op *op, int timeout_m
         deadline.tv_sec++;
         deadline.tv_nsec -= 1000000000L;
     }
-    int rc = 0;
-    while (!j->done && rc == 0) {
-        rc = pthread_cond_timedwait(&w->job_done, &w->lock, &deadline);
-    }
+    bool backed_out = writer_wait_locked(w, j, &deadline);
     bool done = j->done;
     (void)pthread_mutex_unlock(&w->lock);
+
+    /* Taken back out of the queue before anything looked at it, so this reports
+     * a refusal rather than a failure: the write did not happen and asking again
+     * is safe. Freed here because the writer never saw it. */
+    if (backed_out) {
+        job_free(j);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "%s", WRITER_BUSY_MSG);
+    }
 
     if (!done) {
         (void)pthread_mutex_lock(&w->lock);
@@ -1661,12 +1889,17 @@ atlas_status atlas_writer_snapshot(atlas_writer *w, int64_t attempt_id, int time
         deadline.tv_sec++;
         deadline.tv_nsec -= 1000000000L;
     }
-    int rc = 0;
-    while (!j->done && rc == 0) {
-        rc = pthread_cond_timedwait(&w->job_done, &w->lock, &deadline);
-    }
+    bool backed_out = writer_wait_locked(w, j, &deadline);
     bool done = j->done;
     (void)pthread_mutex_unlock(&w->lock);
+
+    /* Taken back out of the queue before anything looked at it, so this reports
+     * a refusal rather than a failure: the write did not happen and asking again
+     * is safe. Freed here because the writer never saw it. */
+    if (backed_out) {
+        job_free(j);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "%s", WRITER_BUSY_MSG);
+    }
     if (!done) {
         /* Detached, not freed: the job is still the writer's, and it must not
          * write into a struct the caller has stopped waiting on. */
@@ -1835,10 +2068,7 @@ atlas_status atlas_writer_sem_config(atlas_writer *w, const atlas_sem_config_job
      * writer may be behind a semantic index that takes minutes, and a client
      * that gave up would report a failure for a write that then succeeds. */
     deadline.tv_sec += 300;
-    int rc = 0;
-    while (!j->done && rc == 0) {
-        rc = pthread_cond_timedwait(&w->job_done, &w->lock, &deadline);
-    }
+    bool backed_out = writer_wait_locked(w, j, &deadline);
     bool done = j->done;
     atlas_status st = j->result;
     atlas_err jerr = j->result_err;
@@ -1851,6 +2081,14 @@ atlas_status atlas_writer_sem_config(atlas_writer *w, const atlas_sem_config_job
         j->sem_config_out = NULL;
     }
     (void)pthread_mutex_unlock(&w->lock);
+
+    /* Taken back out of the queue before anything looked at it, so this reports
+     * a refusal rather than a failure: the write did not happen and asking again
+     * is safe. Freed here because the writer never saw it. */
+    if (backed_out) {
+        job_free(j);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "%s", WRITER_BUSY_MSG);
+    }
 
     if (!done) {
         return atlas_err_set(err, ATLAS_ERR_INTERNAL,
@@ -1892,10 +2130,7 @@ atlas_status atlas_writer_maintenance(atlas_writer *w, const atlas_maintenance_o
     struct timespec deadline;
     (void)clock_gettime(CLOCK_REALTIME, &deadline);
     deadline.tv_sec += 300;
-    int rc = 0;
-    while (!j->done && rc == 0) {
-        rc = pthread_cond_timedwait(&w->job_done, &w->lock, &deadline);
-    }
+    bool backed_out = writer_wait_locked(w, j, &deadline);
     bool done = j->done;
     atlas_status st = j->result;
     atlas_err jerr = j->result_err;
@@ -1908,6 +2143,14 @@ atlas_status atlas_writer_maintenance(atlas_writer *w, const atlas_maintenance_o
         j->maint_out = NULL;
     }
     (void)pthread_mutex_unlock(&w->lock);
+
+    /* Taken back out of the queue before anything looked at it, so this reports
+     * a refusal rather than a failure: the write did not happen and asking again
+     * is safe. Freed here because the writer never saw it. */
+    if (backed_out) {
+        job_free(j);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "%s", WRITER_BUSY_MSG);
+    }
 
     if (!done) {
         return atlas_err_set(err, ATLAS_ERR_INTERNAL,
@@ -1993,10 +2236,7 @@ atlas_status atlas_writer_apikey(atlas_writer *w, const atlas_apikey_job *op,
     struct timespec deadline;
     (void)clock_gettime(CLOCK_REALTIME, &deadline);
     deadline.tv_sec += 60;
-    int rc = 0;
-    while (!j->done && rc == 0) {
-        rc = pthread_cond_timedwait(&w->job_done, &w->lock, &deadline);
-    }
+    bool backed_out = writer_wait_locked(w, j, &deadline);
     bool done = j->done;
     atlas_status st = j->result;
     atlas_err jerr = j->result_err;
@@ -2009,6 +2249,14 @@ atlas_status atlas_writer_apikey(atlas_writer *w, const atlas_apikey_job *op,
         j->apikey_out = NULL;
     }
     (void)pthread_mutex_unlock(&w->lock);
+
+    /* Taken back out of the queue before anything looked at it, so this reports
+     * a refusal rather than a failure: the write did not happen and asking again
+     * is safe. Freed here because the writer never saw it. */
+    if (backed_out) {
+        job_free(j);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "%s", WRITER_BUSY_MSG);
+    }
 
     if (!done) {
         return atlas_err_set(err, ATLAS_ERR_INTERNAL,

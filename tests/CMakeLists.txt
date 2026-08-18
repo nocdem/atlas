@@ -106,6 +106,7 @@ set(ATLAS_TESTS
   test_sem_discovery
   test_sem_trust
   test_sem_auto
+  test_daemon_responsive
   test_registry
   test_ops
   test_code_compdb
@@ -351,6 +352,11 @@ set_tests_properties(test_daemon PROPERTIES RUN_SERIAL TRUE)
 # instead of failing. Serialised for the inotify reason above and because two
 # fixtures compiling at once is not what any of these tests is measuring.
 set_tests_properties(test_sem_auto PROPERTIES LABELS "daemon" TIMEOUT 1200)
+# Serialised against every other daemon test: this one asserts how long the
+# daemon takes to answer, and a second daemon competing for the machine would
+# make a real regression gate flaky for a reason that is not the daemon.
+set_tests_properties(test_daemon_responsive
+  PROPERTIES LABELS "daemon" TIMEOUT 1200 RUN_SERIAL TRUE)
 set_tests_properties(test_sem_auto PROPERTIES RUN_SERIAL TRUE)
 
 # Vendored third-party source is only trustworthy if it is still what was

@@ -872,6 +872,70 @@ atlas_status atlas_orch_new_uid(atlas_buf *out, atlas_err *err) {
     return st;
 }
 
+
+/* --- the run's own axis (A11.0) ------------------------------------------
+ *
+ * No `default:` in either switch, so adding a member to the vocabulary is a
+ * compile error here rather than a value that silently reads as neither
+ * terminal nor active. */
+const char *atlas_orch_run_status_name(atlas_orch_run_status s) {
+    switch (s) {
+    case ATLAS_ORCH_RUN_ACTIVE: return "ACTIVE";
+    case ATLAS_ORCH_RUN_ACCEPTED: return "ACCEPTED";
+    case ATLAS_ORCH_RUN_BLOCKED: return "BLOCKED";
+    case ATLAS_ORCH_RUN_UNKNOWN: break;
+    }
+    return "UNKNOWN";
+}
+
+bool atlas_orch_run_status_parse(const char *name, atlas_orch_run_status *out) {
+    if (name == NULL || out == NULL) {
+        return false;
+    }
+    static const struct {
+        const char *name;
+        atlas_orch_run_status value;
+    } TABLE[] = {
+        {"ACTIVE", ATLAS_ORCH_RUN_ACTIVE},
+        {"ACCEPTED", ATLAS_ORCH_RUN_ACCEPTED},
+        {"BLOCKED", ATLAS_ORCH_RUN_BLOCKED},
+    };
+    for (size_t i = 0; i < sizeof TABLE / sizeof TABLE[0]; i++) {
+        if (strcmp(name, TABLE[i].name) == 0) {
+            *out = TABLE[i].value;
+            return true;
+        }
+    }
+    /* "UNKNOWN" is deliberately absent from the table. It is the zero of the
+     * vocabulary, never a value a stored row may hold, so a database that
+     * presents it is reporting corruption and must not parse cleanly. */
+    return false;
+}
+
+bool atlas_orch_run_status_is_terminal(atlas_orch_run_status s) {
+    switch (s) {
+    case ATLAS_ORCH_RUN_ACCEPTED:
+    case ATLAS_ORCH_RUN_BLOCKED: return true;
+    case ATLAS_ORCH_RUN_UNKNOWN:
+    case ATLAS_ORCH_RUN_ACTIVE: break;
+    }
+    return false;
+}
+
+atlas_status atlas_orch_new_run_uid(atlas_buf *out, atlas_err *err) {
+    atlas_buf hex = ATLAS_BUF_INIT;
+    atlas_status st = random_hex(ATLAS_ORCH_RUN_UID_HEX / 2u, &hex, err);
+    if (st == ATLAS_OK) {
+        /* "r", so a run id is recognisable on sight and can never be mistaken
+         * for a job id, a commit id, a content hash or a token. */
+        st = atlas_buf_set_str(out, "r", err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_buf_append(out, hex.data, hex.len, err);
+    }
+    atlas_buf_free(&hex);
+    return st;
+}
 atlas_status atlas_orch_new_token(atlas_buf *out, atlas_err *err) {
     return random_hex(ATLAS_ORCH_TOKEN_BYTES, out, err);
 }

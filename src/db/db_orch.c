@@ -106,6 +106,7 @@ void atlas_orch_op_free(atlas_orch_op *op) {
 void atlas_orch_result_init(atlas_orch_result *r) {
     memset(r, 0, sizeof(*r));
     atlas_buf_init(&r->job_uid);
+    atlas_buf_init(&r->run_uid);
     atlas_buf_init(&r->token);
     atlas_buf_init(&r->repo_name);
     atlas_buf_init(&r->repo_root);
@@ -122,6 +123,7 @@ void atlas_orch_result_free(atlas_orch_result *r) {
         return;
     }
     atlas_buf_free(&r->job_uid);
+    atlas_buf_free(&r->run_uid);
     atlas_buf_free(&r->token);
     atlas_buf_free(&r->repo_name);
     atlas_buf_free(&r->repo_root);
@@ -156,6 +158,10 @@ typedef struct job_row {
     int64_t max_artifact_count;
     int64_t deadline_ms;
     bool cancel_requested;
+    /* A11.0. Empty for every job submitted before migration 21, which reads as
+     * "this job belongs to no run" and never as "this job is its own root". */
+    char run_uid[ATLAS_ORCH_RUN_UID_MAX];
+    char parent_job_uid[ATLAS_ORCH_UID_MAX];
 } job_row;
 
 /* The two job lookups below select the same columns in the same order and share
@@ -208,6 +214,14 @@ static atlas_status job_fill(atlas_db *db, sqlite3_stmt *st, job_row *j, atlas_e
     j->max_artifact_count = sqlite3_column_int64(st, 17);
     j->deadline_ms = sqlite3_column_int64(st, 18);
     j->cancel_requested = sqlite3_column_int64(st, 19) != 0;
+    s = atlas_db_col_copy(st, 20, j->run_uid, sizeof(j->run_uid), "run_uid", err);
+    if (s == ATLAS_OK) {
+        s = atlas_db_col_copy(st, 21, j->parent_job_uid, sizeof(j->parent_job_uid),
+                              "parent_job_uid", err);
+    }
+    if (s != ATLAS_OK) {
+        return s;
+    }
     (void)db;
     return ATLAS_OK;
 }
@@ -218,7 +232,7 @@ static atlas_status job_by_uid(atlas_db *db, const char *uid, job_row *j, bool *
         "SELECT id, job_uid, state, repo_id, repo_name, repo_identity_hash, source_commit, mode,"
         "       driver, spec_digest, submitter_uid, attempts_started, max_attempts,"
         "       wall_timeout_ms, idle_timeout_ms, max_output_bytes, max_artifact_bytes,"
-        "       max_artifact_count, deadline_ms, cancel_requested"
+        "       max_artifact_count, deadline_ms, cancel_requested, run_uid, parent_job_uid"
         "  FROM orch_jobs WHERE job_uid = ?1;";
     *found = false;
     sqlite3_stmt *st = NULL;
@@ -247,7 +261,7 @@ static atlas_status job_by_id(atlas_db *db, int64_t id, job_row *j, bool *found,
         "SELECT id, job_uid, state, repo_id, repo_name, repo_identity_hash, source_commit, mode,"
         "       driver, spec_digest, submitter_uid, attempts_started, max_attempts,"
         "       wall_timeout_ms, idle_timeout_ms, max_output_bytes, max_artifact_bytes,"
-        "       max_artifact_count, deadline_ms, cancel_requested"
+        "       max_artifact_count, deadline_ms, cancel_requested, run_uid, parent_job_uid"
         "  FROM orch_jobs WHERE id = ?1;";
     *found = false;
     sqlite3_stmt *st = NULL;
@@ -556,6 +570,222 @@ static atlas_status require_lease(atlas_db *db, const atlas_orch_op *op, int64_t
     return ATLAS_OK;
 }
 
+/* --- the run (A11.0) --------------------------------------------------------
+ *
+ * A8 stored `parent_job_uid` and resolved it nowhere. What follows is the
+ * resolution, and it happens inside the submit transaction rather than beside
+ * it, for the reason the idempotency check is in there: a check that a run is
+ * still ACTIVE is worthless if a second submission can land between the check
+ * and the insert.
+ *
+ * Everything here refuses. Nothing in this function repairs a chain, invents a
+ * run for a parent that has none, or downgrades a mismatch to a warning.
+ */
+
+/* The complement of `atlas_orch_state_is_terminal`, as SQLite must spell it.
+ * `tests/test_orch_run.c` asserts this predicate and the C function agree over
+ * the whole vocabulary, so the duplication cannot drift silently. It is a string
+ * literal so `atlas_db_prepare`'s pointer cache still works — concatenation of
+ * literals happens at translation time, not at run time. */
+#define ORCH_SQL_ACTIVE_STATE \
+    "state NOT IN ('SUCCEEDED','FAILED','CANCELLED','TIMED_OUT','RECOVERY_REQUIRED')"
+
+/* A bounded copy between two fixed fields. Every use below copies between
+ * arrays of equal declared size, so the refusal is unreachable today; it is
+ * written anyway because "unreachable" is a property of the current sizes and
+ * a silent truncation of an identifier is the failure it would become. */
+static atlas_status copy_fixed(char *dst, size_t cap, const char *src, const char *what,
+                               atlas_err *err) {
+    size_t n = strlen(src);
+    if (n + 1u > cap) {
+        return atlas_err_set(err, ATLAS_ERR_DB, "a stored %s does not fit", what);
+    }
+    memcpy(dst, src, n + 1u);
+    return ATLAS_OK;
+}
+
+typedef struct run_row {
+    int64_t id;
+    char run_uid[ATLAS_ORCH_RUN_UID_MAX];
+    char root_job_uid[ATLAS_ORCH_UID_MAX];
+    char repo_identity_hash[ATLAS_SHA256_HEX_LEN + 1u];
+    atlas_orch_run_status status;
+} run_row;
+
+static atlas_status run_by_uid(atlas_db *db, const char *uid, run_row *r, bool *found,
+                               atlas_err *err) {
+    static const char SQL[] =
+        "SELECT id, run_uid, root_job_uid, repo_identity_hash, status"
+        "  FROM orch_runs WHERE run_uid = ?1;";
+    *found = false;
+    memset(r, 0, sizeof(*r));
+    sqlite3_stmt *st = NULL;
+    atlas_status s = atlas_db_prepare(db, SQL, &st, err);
+    if (s != ATLAS_OK) {
+        return s;
+    }
+    s = atlas_db_bind_text_opt(db, st, 1, uid, err);
+    if (s != ATLAS_OK) {
+        atlas_db_finish(db, st);
+        return s;
+    }
+    int rc = sqlite3_step(st);
+    if (rc == SQLITE_ROW) {
+        r->id = sqlite3_column_int64(st, 0);
+        s = atlas_db_col_copy(st, 1, r->run_uid, sizeof(r->run_uid), "run_uid", err);
+        if (s == ATLAS_OK) {
+            s = atlas_db_col_copy(st, 2, r->root_job_uid, sizeof(r->root_job_uid), "root_job_uid",
+                                  err);
+        }
+        if (s == ATLAS_OK) {
+            s = atlas_db_col_copy(st, 3, r->repo_identity_hash, sizeof(r->repo_identity_hash),
+                                  "repo_identity_hash", err);
+        }
+        if (s == ATLAS_OK && !atlas_orch_run_status_parse(atlas_db_col_text(st, 4), &r->status)) {
+            /* Includes the literal 'UNKNOWN', which the parser refuses on
+             * purpose: it is the vocabulary's zero and no stored run may hold
+             * it, so a row presenting it is corruption rather than a state. */
+            s = atlas_err_set(err, ATLAS_ERR_DB,
+                              "run %s holds a status Atlas does not recognise", r->run_uid);
+        }
+        *found = (s == ATLAS_OK);
+    } else if (rc != SQLITE_DONE) {
+        s = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot read a run");
+    }
+    atlas_db_finish(db, st);
+    return s;
+}
+
+/* Names the run's active task, if it has one. The answer is a uid rather than a
+ * count because the caller's refusal has to say *which* task is in the way — a
+ * bare "there is already an active task" sends an operator looking for it. */
+static atlas_status run_active_job(atlas_db *db, const char *run_uid, char out[ATLAS_ORCH_UID_MAX],
+                                   bool *found, atlas_err *err) {
+    static const char SQL[] = "SELECT job_uid FROM orch_jobs"
+                              "  WHERE run_uid = ?1 AND " ORCH_SQL_ACTIVE_STATE " ORDER BY id"
+                              "  LIMIT 1;";
+    *found = false;
+    out[0] = '\0';
+    sqlite3_stmt *st = NULL;
+    atlas_status s = atlas_db_prepare(db, SQL, &st, err);
+    if (s != ATLAS_OK) {
+        return s;
+    }
+    s = atlas_db_bind_text_opt(db, st, 1, run_uid, err);
+    if (s != ATLAS_OK) {
+        atlas_db_finish(db, st);
+        return s;
+    }
+    int rc = sqlite3_step(st);
+    if (rc == SQLITE_ROW) {
+        s = atlas_db_col_copy(st, 0, out, ATLAS_ORCH_UID_MAX, "job_uid", err);
+        *found = (s == ATLAS_OK);
+    } else if (rc != SQLITE_DONE) {
+        s = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot read a run's active task");
+    }
+    atlas_db_finish(db, st);
+    return s;
+}
+
+/* Decides which run the job being submitted belongs to, creating one when the
+ * job is a root. On success `run_uid_out` holds the run this job joins.
+ *
+ * A root task — one with no parent — always gets a fresh run. A child task
+ * joins its parent's, and every one of the four conditions below is a refusal
+ * rather than a repair. */
+static atlas_status submit_resolve_run(atlas_db *db, const atlas_orch_spec *s, const char *job_uid,
+                                       int64_t created_ms, atlas_buf *run_uid_out,
+                                       atlas_err *err) {
+    if (s->parent_job_uid.len == 0) {
+        atlas_status st = atlas_orch_new_run_uid(run_uid_out, err);
+        if (st != ATLAS_OK) {
+            return st;
+        }
+        static const char INS[] =
+            "INSERT INTO orch_runs(run_uid, root_job_uid, repo_identity_hash, status,"
+            "  created_at, created_ms) VALUES(?1, ?2, ?3, 'ACTIVE', ?4, ?5);";
+        sqlite3_stmt *q = NULL;
+        st = atlas_db_prepare(db, INS, &q, err);
+        if (st != ATLAS_OK) {
+            return st;
+        }
+        char at[ATLAS_TS_MAX];
+        atlas_now_iso8601(at, sizeof(at));
+        const char *texts[] = {atlas_buf_cstr(run_uid_out), job_uid,
+                               atlas_buf_cstr(&s->repo_identity_hash), at};
+        for (size_t i = 0; st == ATLAS_OK && i < sizeof texts / sizeof texts[0]; i++) {
+            st = atlas_db_bind_text_opt(db, q, (int)i + 1, texts[i], err);
+        }
+        if (st == ATLAS_OK) {
+            (void)sqlite3_bind_int64(q, 5, created_ms);
+            st = atlas_db_step_done(db, q, err);
+        } else {
+            atlas_db_finish(db, q);
+        }
+        return st;
+    }
+
+    /* A child. The parent is resolved, not merely well formed — which is the
+     * whole difference between A8's column and A11.0's chain. */
+    const char *parent = atlas_buf_cstr(&s->parent_job_uid);
+    job_row p;
+    bool found = false;
+    atlas_status st = job_by_uid(db, parent, &p, &found, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (!found) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "no job named %s exists to be a parent",
+                             parent);
+    }
+    if (p.run_uid[0] == '\0') {
+        /* A job from before migration 21. It belongs to no run, and inventing
+         * one for it now would be the backfill the migration refused to do. */
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "job %s belongs to no run and cannot be a parent", parent);
+    }
+    if (strcmp(p.repo_identity_hash, atlas_buf_cstr(&s->repo_identity_hash)) != 0) {
+        /* A chain that changes repository midway is two chains. Joining them
+         * would let a child inherit a run whose source identity it does not
+         * share, and every later reader of the run would be wrong about one of
+         * them. */
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "job %s describes a different repository from this submission",
+                             parent);
+    }
+
+    run_row r;
+    bool run_found = false;
+    st = run_by_uid(db, p.run_uid, &r, &run_found, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (!run_found) {
+        return atlas_err_set(err, ATLAS_ERR_INTEGRITY, "job %s names a run that does not exist",
+                             parent);
+    }
+    if (atlas_orch_run_status_is_terminal(r.status)) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "run %s already ended in %s and takes no further task",
+                             r.run_uid, atlas_orch_run_status_name(r.status));
+    }
+
+    char active[ATLAS_ORCH_UID_MAX];
+    bool busy = false;
+    st = run_active_job(db, p.run_uid, active, &busy, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (busy) {
+        /* The schema's partial unique index would refuse this too. The check is
+         * here so the caller gets a sentence naming the task in the way, rather
+         * than a constraint violation it cannot act on. */
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "run %s already has an active task, %s; it takes no second one",
+                             r.run_uid, active);
+    }
+    return atlas_buf_set_str(run_uid_out, r.run_uid, err);
+}
+
 /* --- SUBMIT ---------------------------------------------------------------- */
 
 static atlas_status op_submit(atlas_db *db, const atlas_orch_op *op, atlas_orch_result *out,
@@ -614,6 +844,12 @@ static atlas_status op_submit(atlas_db *db, const atlas_orch_op *op, atlas_orch_
             out->duplicate = true;
             out->job_id = j.id;
             out->state = j.state;
+            /* A duplicate joins no run and creates none: the run it reports is
+             * the one the original submission already settled. */
+            atlas_status rs = atlas_buf_set_str(&out->run_uid, j.run_uid, err);
+            if (rs != ATLAS_OK) {
+                return rs;
+            }
             return atlas_buf_set_str(&out->job_uid, j.uid, err);
         }
         atlas_db_finish(db, q);
@@ -625,12 +861,21 @@ static atlas_status op_submit(atlas_db *db, const atlas_orch_op *op, atlas_orch_
     atlas_buf uid = ATLAS_BUF_INIT;
     atlas_buf paths = ATLAS_BUF_INIT;
     atlas_buf vals = ATLAS_BUF_INIT;
+    atlas_buf run_uid = ATLAS_BUF_INIT;
     st = atlas_orch_new_uid(&uid, err);
     if (st == ATLAS_OK) {
         st = atlas_orch_paths_encode(s->allowed_paths, s->allowed_path_count, &paths, err);
     }
     if (st == ATLAS_OK) {
         st = atlas_orch_validations_encode(s->validations, s->validation_count, &vals, err);
+    }
+    if (st == ATLAS_OK) {
+        /* Which run this job joins, decided before the job row exists and inside
+         * the same transaction as its insert. Every refusal in here refuses the
+         * whole submission: a job whose run could not be settled is not stored
+         * without one. */
+        st = submit_resolve_run(db, s, atlas_buf_cstr(&uid), op->now_ms > 0 ? op->now_ms : now_ms(),
+                                &run_uid, err);
     }
     if (st != ATLAS_OK) {
         goto done;
@@ -642,9 +887,9 @@ static atlas_status op_submit(atlas_db *db, const atlas_orch_op *op, atlas_orch_
             "  repo_name, repo_identity_hash, source_commit, mode, driver, task_text,"
             "  allowed_paths, validations, wall_timeout_ms, idle_timeout_ms, max_attempts,"
             "  max_output_bytes, max_artifact_bytes, max_artifact_count, correlation,"
-            "  parent_job_uid, idempotency_key, state, created_at, created_ms, deadline_ms)"
+            "  parent_job_uid, idempotency_key, state, created_at, created_ms, deadline_ms, run_uid)"
             " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,"
-            "        ?21,?22,'QUEUED',?23,?24,?25);";
+            "        ?21,?22,'QUEUED',?23,?24,?25,?26);";
         sqlite3_stmt *q = NULL;
         st = atlas_db_prepare(db, INS, &q, err);
         if (st != ATLAS_OK) {
@@ -669,6 +914,7 @@ static atlas_status op_submit(atlas_db *db, const atlas_orch_op *op, atlas_orch_
             {20, atlas_buf_cstr(&s->correlation)},
             {21, atlas_buf_cstr(&s->parent_job_uid)},
             {22, atlas_buf_cstr(&s->idempotency_key)},
+            {26, atlas_buf_cstr(&run_uid)},
             {23, at},
         };
         for (size_t i = 0; st == ATLAS_OK && i < sizeof texts / sizeof texts[0]; i++) {
@@ -760,9 +1006,13 @@ static atlas_status op_submit(atlas_db *db, const atlas_orch_op *op, atlas_orch_
 
     out->state = ATLAS_ORCH_STATE_QUEUED;
     st = atlas_buf_set(&out->job_uid, uid.data, uid.len, err);
+    if (st == ATLAS_OK) {
+        st = atlas_buf_set(&out->run_uid, run_uid.data, run_uid.len, err);
+    }
 
 done:
     atlas_buf_free(&uid);
+    atlas_buf_free(&run_uid);
     atlas_buf_free(&paths);
     atlas_buf_free(&vals);
     return st;
@@ -1756,7 +2006,8 @@ atlas_status atlas_db_orch_job_get(atlas_db *db, const char *uid, atlas_orch_job
         "SELECT job_uid, state, repo_name, source_commit, mode, driver, spec_digest,"
         "       submitter_uid, attempts_started, max_attempts, created_at, terminal_at,"
         "       cancel_requested, state_seq, task_text, correlation, wall_timeout_ms,"
-        "       idle_timeout_ms FROM orch_jobs WHERE job_uid = ?1;";
+        "       idle_timeout_ms, run_uid, parent_job_uid"
+        "  FROM orch_jobs WHERE job_uid = ?1;";
     *found = false;
     memset(out, 0, sizeof(*out));
     sqlite3_stmt *st = NULL;
@@ -1817,11 +2068,147 @@ atlas_status atlas_db_orch_job_get(atlas_db *db, const char *uid, atlas_orch_job
         if (s == ATLAS_OK) {
             out->wall_timeout_ms = sqlite3_column_int64(st, 16);
             out->idle_timeout_ms = sqlite3_column_int64(st, 17);
+            s = atlas_db_col_copy(st, 18, out->run_uid, sizeof(out->run_uid), "run_uid", err);
+        }
+        if (s == ATLAS_OK) {
+            s = atlas_db_col_copy(st, 19, out->parent_job_uid, sizeof(out->parent_job_uid),
+                                  "parent_job_uid", err);
+        }
+        if (s == ATLAS_OK) {
             *found = true;
         }
     }
     atlas_db_finish(db, st);
     return s;
+}
+
+/* --- the run, read and settled (A11.0) ------------------------------------ */
+
+atlas_status atlas_db_orch_run_get(atlas_db *db, const char *run_uid, atlas_orch_run_view *out,
+                                   bool *found, atlas_err *err) {
+    *found = false;
+    memset(out, 0, sizeof(*out));
+    run_row r;
+    bool got = false;
+    atlas_status s = run_by_uid(db, run_uid, &r, &got, err);
+    if (s != ATLAS_OK || !got) {
+        return s;
+    }
+    s = copy_fixed(out->run_uid, sizeof(out->run_uid), r.run_uid, "run_uid", err);
+    if (s == ATLAS_OK) {
+        s = copy_fixed(out->root_job_uid, sizeof(out->root_job_uid), r.root_job_uid,
+                                  "root_job_uid", err);
+    }
+    if (s == ATLAS_OK) {
+        s = copy_fixed(out->repo_identity_hash, sizeof(out->repo_identity_hash),
+                                  r.repo_identity_hash, "repo_identity_hash", err);
+    }
+    if (s != ATLAS_OK) {
+        return s;
+    }
+    out->status = r.status;
+
+    {
+        static const char SQL[] = "SELECT created_at FROM orch_runs WHERE run_uid = ?1;";
+        sqlite3_stmt *st = NULL;
+        s = atlas_db_prepare(db, SQL, &st, err);
+        if (s != ATLAS_OK) {
+            return s;
+        }
+        s = atlas_db_bind_text_opt(db, st, 1, run_uid, err);
+        if (s == ATLAS_OK) {
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                s = atlas_db_col_copy(st, 0, out->created_at, sizeof(out->created_at), "created_at",
+                                      err);
+            }
+        }
+        atlas_db_finish(db, st);
+        if (s != ATLAS_OK) {
+            return s;
+        }
+    }
+
+    /* The active task, if there is one. Its state comes from the same row, so a
+     * caller resuming after a restart cannot read a uid from one moment and a
+     * state from another. */
+    {
+        static const char SQL[] = "SELECT job_uid, state FROM orch_jobs"
+                                  "  WHERE run_uid = ?1 AND " ORCH_SQL_ACTIVE_STATE
+                                  "  ORDER BY id LIMIT 1;";
+        sqlite3_stmt *st = NULL;
+        s = atlas_db_prepare(db, SQL, &st, err);
+        if (s != ATLAS_OK) {
+            return s;
+        }
+        s = atlas_db_bind_text_opt(db, st, 1, run_uid, err);
+        if (s == ATLAS_OK) {
+            int rc = sqlite3_step(st);
+            if (rc == SQLITE_ROW) {
+                s = atlas_db_col_copy(st, 0, out->active_job_uid, sizeof(out->active_job_uid),
+                                      "job_uid", err);
+                if (s == ATLAS_OK && !atlas_orch_state_parse(atlas_db_col_text(st, 1),
+                                                             &out->active_state)) {
+                    s = atlas_err_set(err, ATLAS_ERR_DB,
+                                      "job %s holds a state Atlas does not recognise",
+                                      out->active_job_uid);
+                }
+            } else if (rc != SQLITE_DONE) {
+                s = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot read a run's active task");
+            }
+        }
+        atlas_db_finish(db, st);
+    }
+    *found = (s == ATLAS_OK);
+    return s;
+}
+
+atlas_status atlas_db_orch_run_set_status(atlas_db *db, const char *run_uid,
+                                          atlas_orch_run_status observed,
+                                          atlas_orch_run_status want, atlas_err *err) {
+    if (observed != ATLAS_ORCH_RUN_ACTIVE) {
+        /* Includes UNKNOWN, deliberately. A caller that did not read the run
+         * cannot settle it, and a terminal run is final. */
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "a run can only be settled from ACTIVE, not from %s",
+                             atlas_orch_run_status_name(observed));
+    }
+    if (want != ATLAS_ORCH_RUN_ACCEPTED && want != ATLAS_ORCH_RUN_BLOCKED) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "a run cannot be moved to %s",
+                             atlas_orch_run_status_name(want));
+    }
+    static const char UPD[] = "UPDATE orch_runs SET status = ?1, terminal_at = ?2"
+                              "  WHERE run_uid = ?3 AND status = ?4;";
+    sqlite3_stmt *q = NULL;
+    atlas_status s = atlas_db_prepare(db, UPD, &q, err);
+    if (s != ATLAS_OK) {
+        return s;
+    }
+    char at[ATLAS_TS_MAX];
+    atlas_now_iso8601(at, sizeof(at));
+    const char *texts[] = {atlas_orch_run_status_name(want), at, run_uid,
+                           atlas_orch_run_status_name(observed)};
+    for (size_t i = 0; s == ATLAS_OK && i < sizeof texts / sizeof texts[0]; i++) {
+        s = atlas_db_bind_text_opt(db, q, (int)i + 1, texts[i], err);
+    }
+    if (s == ATLAS_OK) {
+        s = atlas_db_step_done(db, q, err);
+    } else {
+        atlas_db_finish(db, q);
+        return s;
+    }
+    if (s != ATLAS_OK) {
+        return s;
+    }
+    /* Exactly one changed row, the way every A8 compare-and-swap ends. Zero
+     * means the run moved under the caller or does not exist, and the two are
+     * reported as one because both mean "the state you named is not the state
+     * that is there". */
+    if (sqlite3_changes(db->h) != 1) {
+        return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                             "run %s was not in %s, so it was not settled", run_uid,
+                             atlas_orch_run_status_name(observed));
+    }
+    return ATLAS_OK;
 }
 
 void atlas_orch_job_view_init(atlas_orch_job_view *v) {

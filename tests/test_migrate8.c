@@ -148,6 +148,10 @@ static void build_schema7(const char *path, atlas_err *err) {
     /* Migration 10's table too: winding back past 8 winds back past 10, and a
      * rewind that leaves a later migration's table behind is not a schema-7
      * database. */
+    /* A11.0's table, and migration 10's below it: winding back past 8 winds
+     * back past both, and a rewind that leaves a later migration's table behind
+     * is not a schema-7 database. */
+    T_OK(atlas_buf_append_str(&drop, "DROP TABLE orch_runs;", err), err);
     T_OK(atlas_buf_append_str(&drop,
                               "DROP TABLE verify_lifecycle_audit;"
                               "DROP TABLE verify_reliability;"
@@ -208,7 +212,7 @@ static void test_a_schema_seven_database_reaches_eight_losslessly(void) {
 
     T_OK(atlas_db_migrate(db, &err), &err);
     T_EQ_INT(atlas_db_schema_version(db, &err), ATLAS_SCHEMA_VERSION);
-    T_EQ_INT(ATLAS_SCHEMA_VERSION, 20);
+    T_EQ_INT(ATLAS_SCHEMA_VERSION, 21);
 
     for (size_t i = 0; i < sizeof A8_TABLES / sizeof A8_TABLES[0]; i++) {
         T_CHECK_MSG(table_exists(db, A8_TABLES[i]), "migration 8 did not create %s",

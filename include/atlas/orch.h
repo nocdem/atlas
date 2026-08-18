@@ -119,6 +119,56 @@ bool atlas_orch_state_is_active(atlas_orch_state s);
  * an invalid transition fails closed. */
 bool atlas_orch_transition_allowed(atlas_orch_state from, atlas_orch_state to);
 
+/* --- the run -------------------------------------------------------------
+ *
+ * A11.0. A **run** is the durable grouping one chain of tasks belongs to: a
+ * root task, and whatever follows it, under one identity that survives a
+ * restart. A8 shipped `parent_job_uid` and never resolved it; the run is what
+ * makes a parent chain a fact about stored rows rather than a well-formed
+ * string.
+ *
+ * The run's status is **its own axis** and is derived from nothing. A task
+ * ending SUCCEEDED does not accept its run and a task ending FAILED does not
+ * block one, because "this attempt finished" and "this line of work is settled"
+ * are different claims and Atlas does not let one stand in for the other. That
+ * is the same separation A9.2 keeps between a verification state and a
+ * lifecycle status, one layer out.
+ *
+ * A11.0 writes no automatic transition into a terminal status at all. Nothing
+ * in this milestone decides that a run is ACCEPTED or BLOCKED; the states exist
+ * so that a caller which has decided can record it, and so that the submit path
+ * has something to refuse a child against. Who may decide is A11.1's question,
+ * and leaving it unanswered here is deliberate rather than unfinished.
+ */
+typedef enum atlas_orch_run_status {
+    /* Zero, and not a status a persisted run can hold. A row that reads UNKNOWN
+     * is a row nobody wrote correctly; the schema's CHECK omits it. */
+    ATLAS_ORCH_RUN_UNKNOWN = 0,
+    /* The run is open: a task may be created in it, subject to there being no
+     * other active one. */
+    ATLAS_ORCH_RUN_ACTIVE,
+    /* Terminal. The work this run existed for was accepted. */
+    ATLAS_ORCH_RUN_ACCEPTED,
+    /* Terminal. The run cannot proceed. Not a synonym for a failed task: a task
+     * may fail and its run stay ACTIVE so a retry can follow. */
+    ATLAS_ORCH_RUN_BLOCKED
+} atlas_orch_run_status;
+
+const char *atlas_orch_run_status_name(atlas_orch_run_status s);
+bool atlas_orch_run_status_parse(const char *name, atlas_orch_run_status *out);
+/* True for ACCEPTED and BLOCKED. UNKNOWN is not terminal — it is unwritten, and
+ * treating "nobody filled this in" as a settled answer is the one reading that
+ * would let a malformed row close a run. */
+bool atlas_orch_run_status_is_terminal(atlas_orch_run_status s);
+
+/* A run identifier: "r" plus 32 lowercase hex. The prefix differs from a job's
+ * "j" so the two can never be confused on sight or by a parser. */
+#define ATLAS_ORCH_RUN_UID_HEX 32u
+#define ATLAS_ORCH_RUN_UID_MAX 40u
+
+/* Generates a fresh unguessable run identifier. */
+atlas_status atlas_orch_new_run_uid(atlas_buf *out, atlas_err *err);
+
 /* --- why a transition happened -------------------------------------------
  *
  * A closed vocabulary, because a free-form reason on an audit row is a place for

@@ -144,6 +144,9 @@ void atlas_orch_op_free(atlas_orch_op *op);
 typedef struct atlas_orch_result {
     int64_t job_id;
     atlas_buf job_uid;
+    /* A11.0. The run this job belongs to. On a duplicate it is the run the
+     * original submission settled, because a duplicate creates nothing. */
+    atlas_buf run_uid;
     atlas_orch_state state;
     int64_t attempt_id;
     int64_t attempt_no;
@@ -218,6 +221,11 @@ atlas_status atlas_orch_apply_in_tx(atlas_db *db, const atlas_orch_op *op,
 
 typedef struct atlas_orch_job_view {
     char job_uid[ATLAS_ORCH_UID_MAX];
+    /* A11.0. The run this task belongs to, and the task it followed. Both are
+     * empty for a job submitted before migration 21; `run_uid` empty means the
+     * job belongs to no run, never that it is the root of one. */
+    char run_uid[ATLAS_ORCH_RUN_UID_MAX];
+    char parent_job_uid[ATLAS_ORCH_UID_MAX];
     atlas_orch_state state;
     char repo_name[ATLAS_ORCH_NAME_MAX + 1u];
     char source_commit[41];
@@ -244,6 +252,48 @@ void atlas_orch_job_view_free(atlas_orch_job_view *v);
 
 atlas_status atlas_db_orch_job_get(atlas_db *db, const char *uid, atlas_orch_job_view *out,
                                    bool *found, atlas_err *err);
+
+/* --- the run (A11.0) --------------------------------------------------------
+ *
+ * A run is read whole: its identity, its root, the repository it is bound to,
+ * its status, and the one task in it that is still active. `active_job_uid` is
+ * part of the view rather than a second query because "which task is this run
+ * waiting on?" is the question a caller resuming after a restart actually has,
+ * and answering it in two reads would let the two disagree.
+ */
+typedef struct atlas_orch_run_view {
+    char run_uid[ATLAS_ORCH_RUN_UID_MAX];
+    char root_job_uid[ATLAS_ORCH_UID_MAX];
+    char repo_identity_hash[65];
+    atlas_orch_run_status status;
+    /* The run's single non-terminal task, or empty when it has none. Empty is
+     * an ordinary answer — a run between tasks — and never an error. */
+    char active_job_uid[ATLAS_ORCH_UID_MAX];
+    atlas_orch_state active_state;
+    char created_at[ATLAS_ORCH_TS_MAX];
+} atlas_orch_run_view;
+
+atlas_status atlas_db_orch_run_get(atlas_db *db, const char *run_uid, atlas_orch_run_view *out,
+                                   bool *found, atlas_err *err);
+
+/* Settles a run, as a compare-and-swap. `observed` is the status the caller
+ * believes the run holds and the update applies only if it still does, so two
+ * callers racing to settle one run cannot both succeed — A8's rule for every
+ * orchestration state change, and A4's before it.
+ *
+ * Only ACTIVE -> ACCEPTED and ACTIVE -> BLOCKED are permitted. A terminal run is
+ * final: nothing reopens it, and there is no edge between the two terminal
+ * answers.
+ *
+ * **A11.0 calls this from no automatic path.** Nothing in this milestone decides
+ * that a run is accepted or blocked — not a succeeding task, not a failing one.
+ * It exists so that a caller which has decided can record the decision, and the
+ * question of who may decide is deliberately left to A11.1. There is no RPC
+ * method, no MCP tool and no gateway route that reaches it, which is what makes
+ * "a model payload cannot accept a run" true by absence rather than by a check. */
+atlas_status atlas_db_orch_run_set_status(atlas_db *db, const char *run_uid,
+                                          atlas_orch_run_status observed,
+                                          atlas_orch_run_status want, atlas_err *err);
 
 typedef struct atlas_orch_list_row {
     int64_t id;

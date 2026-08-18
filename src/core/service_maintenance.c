@@ -220,6 +220,11 @@ static const retention_entry RETENTION[] = {
      * A retention policy that mattered here would be about the *workspaces* on
      * disk — bytes the worker owns, bounded by the dispatcher — not about these
      * rows, which are small and are the audit trail. */
+    {"orch_runs", ATLAS_RETAIN_CANONICAL, false,
+     "the durable grouping one chain of tasks belongs to: its root, the repository it is bound "
+     "to, and whether it has been settled; nothing rebuilds it, and pruning a run by age would "
+     "orphan every task still pointing at it while leaving those tasks perfectly readable, which "
+     "is a worse answer than not pruning at all"},
     {"orch_jobs", ATLAS_RETAIN_CANONICAL, false,
      "the specification, submitter and outcome of every job Atlas accepted; it is the only record "
      "of what was asked for, and its digest is what makes an idempotent resubmission provably the "

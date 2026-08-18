@@ -135,6 +135,7 @@ set(ATLAS_TESTS
   # --- A8: the durable orchestration control plane ---
   test_orch_model
   test_orch_lifecycle
+  test_orch_run
   test_orch_rpc
   test_orch_workspace
   test_orch_driver
@@ -303,6 +304,7 @@ set_tests_properties(test_orch_model PROPERTIES LABELS "unit")
 # CLI and drives the one write point against an isolated database, so it is an
 # integration test. It sleeps for nothing: expiry and deadlines are supplied.
 set_tests_properties(test_orch_lifecycle PROPERTIES LABELS "integration")
+set_tests_properties(test_orch_run PROPERTIES LABELS "integration")
 # The RPC suite drives a live daemon to prove the negative enumeration still
 # holds and that a dispatcher method is unreachable from a client connection.
 set_tests_properties(test_orch_rpc PROPERTIES LABELS "daemon" TIMEOUT 900 RUN_SERIAL TRUE)

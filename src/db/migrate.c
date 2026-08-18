@@ -3665,6 +3665,95 @@ static const char M20_STATEMENTS_SQL[] =
 
 static const char *const M20_STATEMENTS[] = {M20_STATEMENTS_SQL, NULL};
 
+
+/* --- migration 21: the durable single-worker run -------------------------
+ *
+ * A8 gave a job a `parent_job_uid` and then never resolved it. The column was
+ * syntax-checked at submission — 'j' plus 32 lowercase hex — and nothing
+ * anywhere asked whether the parent existed, whether it described the same
+ * repository, or whether anything already followed it. A chain of tasks was
+ * therefore expressible and not enforceable, which is the weaker of the two
+ * things a caller needs before it can build on one.
+ *
+ * A11.0 adds the missing half: the **run**, the durable grouping a chain of
+ * tasks belongs to. It is deliberately additive. One new table, one column and
+ * two indexes; no table is rebuilt, so foreign keys stay enforced throughout
+ * and no pre-existing row is rewritten.
+ *
+ * **No legacy job is backfilled into a run.** Every `orch_jobs` row that
+ * existed before this migration keeps `run_uid = ''`, which reads as "this job
+ * belongs to no run" and never as "this job is the root of its own run".
+ * Inventing a run for a parentless historical job would manufacture a fact
+ * nobody stated, which is the mistake migration 19 is written to avoid; a
+ * default carries no information and must not be read as an intention.
+ *
+ * `orch_runs.repo_identity_hash` is the durable identity and there is **no
+ * foreign key to `repositories`**, exactly as `orch_jobs.repo_id` has none and
+ * for the same reason given at migration 8: an FK would let `repo remove --yes`
+ * destroy execution history.
+ *
+ * The partial unique index is the whole "one active task per run" guarantee,
+ * and it is in the schema rather than in a checked SELECT for the reason
+ * `M8_LEASES` puts "at most one unreleased lease per job" there: a concurrency
+ * invariant that lives only in C is one a second write path can walk around.
+ * The service layer checks it too, but only so the caller gets a sentence
+ * instead of a constraint violation — the schema is what makes it true.
+ *
+ * The `run_uid <> ''` half of the predicate is what keeps every pre-migration
+ * job out of the index entirely: without it every legacy row would collide with
+ * every other legacy row on the empty string.
+ *
+ * `status` omits 'UNKNOWN' from its CHECK for the reason every A8 state column
+ * does: UNKNOWN is the zero of `atlas_orch_run_status` and means "nobody filled
+ * this in", so a persisted run may never be in it and the schema refuses to
+ * store it rather than trusting every writer to remember.
+ */
+static const char M21_RUNS[] =
+    "CREATE TABLE orch_runs ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    /* The external identifier: 'r' plus 32 lowercase hex, unguessable for the
+     * reason `job_uid` is. A predictable run id is one another local process
+     * can name before it exists. */
+    "  run_uid TEXT NOT NULL UNIQUE,"
+    /* The task the run was created for. Set once, at creation, and never
+     * changed: a run has exactly one root and rewriting it would make the
+     * parent chain describe a history that did not happen. */
+    "  root_job_uid TEXT NOT NULL,"
+    /* The durable repository identity, copied from the root task. Every task in
+     * the run must agree with it — a chain that changes repository midway is
+     * two chains, and joining them would let a child inherit a run whose source
+     * identity it does not share. */
+    "  repo_identity_hash TEXT NOT NULL,"
+    /* ACTIVE, or one of the two terminal answers. These are the *run's* axis and
+     * are derived from nothing: a task's SUCCEEDED does not accept a run and a
+     * task's FAILED does not block one. A11.0 writes no automatic transition
+     * here at all. */
+    "  status TEXT NOT NULL DEFAULT 'ACTIVE'"
+    "    CHECK(status IN ('ACTIVE','ACCEPTED','BLOCKED')),"
+    "  created_at TEXT NOT NULL,"
+    "  created_ms INTEGER NOT NULL,"
+    "  terminal_at TEXT"
+    ");"
+    "CREATE INDEX idx_orch_runs_status ON orch_runs(status, id);"
+    "CREATE INDEX idx_orch_runs_repo ON orch_runs(repo_identity_hash, id);";
+
+static const char M21_JOB_RUN[] =
+    "ALTER TABLE orch_jobs ADD COLUMN run_uid TEXT NOT NULL DEFAULT '';"
+    "CREATE INDEX idx_orch_jobs_run ON orch_jobs(run_uid, id);";
+
+/* At most one non-terminal task per run. The terminal set here is exactly
+ * `atlas_orch_state_is_terminal`'s, written out because SQLite cannot call it;
+ * `tests/test_orch_run.c` asserts the two agree rather than trusting that they
+ * were kept in step by hand. CANCEL_REQUESTED is deliberately *not* terminal on
+ * either side — an attempt that has been asked to stop has not stopped, and a
+ * run that admitted a second task at that moment would have two. */
+static const char M21_ONE_ACTIVE[] =
+    "CREATE UNIQUE INDEX idx_orch_jobs_one_active_per_run ON orch_jobs(run_uid)"
+    "  WHERE run_uid <> '' AND state NOT IN"
+    "    ('SUCCEEDED','FAILED','CANCELLED','TIMED_OUT','RECOVERY_REQUIRED');";
+
+static const char *const M21_STATEMENTS[] = {M21_RUNS, M21_JOB_RUN, M21_ONE_ACTIVE, NULL};
+
 static const atlas_migration MIGRATIONS[] = {
     {1, "initial schema", M1_STATEMENTS, false},
     {2, "worktree identity", M2_STATEMENTS, false},
@@ -3720,6 +3809,12 @@ static const atlas_migration MIGRATIONS[] = {
      * season is about. */
     {20, "where a build-input discovery walk could not look, with the exact path",
      M20_STATEMENTS, false},
+    /* Additive: one new table, one column and four indexes. No table is
+     * rebuilt, so foreign keys stay enforced and no pre-existing row is
+     * rewritten. It creates no run: every job that existed before it keeps an
+     * empty `run_uid` and belongs to no run, because a parentless historical
+     * job is not evidence that somebody intended a run. See the M21 comment. */
+    {21, "the durable single-worker run, and one active task within it", M21_STATEMENTS, false},
 };
 
 const atlas_migration *atlas_migrations(size_t *count_out) {

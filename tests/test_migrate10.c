@@ -127,6 +127,16 @@ static void test_a_schema_nine_database_reaches_ten_additively(void) {
     T_REQUIRE_MSG(before.len > 0, "the fixture wrote no revision");
 
     /* Wind back to nine exactly as an upgrade would find it, then forward. */
+    /* A11.0's table: winding back past 10 winds back past 21 too, and leaving a
+     * later migration's table behind would make migration 21 fail to create it. */
+    /* A11.0's table and its column on `orch_jobs`. This rewind stops at 9, so
+     * `orch_jobs` itself survives and migration 21 would meet its own column
+     * again; the indexes go first because SQLite refuses to drop an indexed
+     * column. Undoing a migration means undoing all of it, not the table half. */
+    exec(db, "DROP INDEX idx_orch_jobs_one_active_per_run;"
+             "DROP INDEX idx_orch_jobs_run;"
+             "ALTER TABLE orch_jobs DROP COLUMN run_uid;"
+             "DROP TABLE orch_runs;");
     exec(db, "DROP TABLE verify_lifecycle_audit;"
              "DROP TABLE verify_reliability;"
              "DROP TABLE verify_outcomes;"

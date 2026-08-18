@@ -162,6 +162,11 @@ static void build_schema6(const char *path, atlas_err *err) {
               * tables in place while rewinding the recorded version would
               * present migration 8 with tables it is about to create. That is
               * a property of this simulation, not of the migration. */
+             
+             /* A11.0's table. Winding back past 8 winds back past 21, and a rewind
+              * that leaves a later migration's table behind is not a database at the
+              * version it claims: migration 21 would then fail to create it. */
+             "DROP TABLE orch_runs;"
              "DROP TABLE orch_snapshot_entries;"
              "DROP TABLE orch_snapshots;"
              "DROP TABLE orch_observations;"
@@ -238,7 +243,7 @@ static void test_a_populated_schema_six_database_reaches_seven_losslessly(void) 
      * table without renumbering a row — is asserted below and is unaffected by
      * later migrations running on top of it. */
     T_EQ_INT(atlas_db_schema_version(db, &err), ATLAS_SCHEMA_VERSION);
-    T_EQ_INT(ATLAS_SCHEMA_VERSION, 20);
+    T_EQ_INT(ATLAS_SCHEMA_VERSION, 21);
 
     atlas_buf after = ATLAS_BUF_INIT;
     text_of(db,

@@ -37,6 +37,10 @@ static const atlas_backup_table REQUIRED_TABLES[] = {
      * forgotten every job it ever ran while reporting itself intact. */
     {"orch_jobs", 8},          {"orch_attempts", 8},      {"orch_transitions", 8},
     {"orch_leases", 8},
+    /* A11.0. The run is canonical for the same reason: nothing rebuilds it, and
+     * a restore without it would return an Atlas whose task chains had lost the
+     * grouping that makes them chains. */
+    {"orch_runs", 21},
 };
 
 /* --- the online copy ----------------------------------------------------- */

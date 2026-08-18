@@ -858,7 +858,27 @@ static atlas_status input_digest(atlas_db *db, int64_t repo_id, int64_t prev_gen
             if (found && hash.len > 0) {
                 atlas_sha256_update(&h, hash.data, hash.len);
             } else {
-                atlas_sha256_update(&h, "\x00absent", 7);
+                /* A9.2.5, found by ASan. This read one byte past its own string
+                 * literal, every time, since the marker was introduced.
+                 *
+                 * `"\x00absent"` does not mean `NUL` followed by `absent`. A C
+                 * hex escape consumes *every* following hex digit, and `0`, `0`,
+                 * `a` and `b` are all hex digits — so the literal compiles to
+                 * `{0xAB,'s','e','n','t',0}`, six bytes, and the length below
+                 * said seven. The overflowing byte is whatever `.rodata` holds
+                 * next, which is undefined behaviour and, worse for this
+                 * function, is **not stable across builds**: a unit whose
+                 * include closure holds a file the index cannot vouch for could
+                 * therefore digest differently after a relink and be reparsed
+                 * for no reason.
+                 *
+                 * Written as two adjacent literals, which is what stops the
+                 * escape: string concatenation happens after escapes are
+                 * resolved, so `"\x00" "absent"` is exactly the seven bytes
+                 * intended. `sizeof - 1` rather than a written 7, so the length
+                 * can never disagree with the bytes again. */
+                static const char ABSENT_MARKER[] = "\x00" "absent";
+                atlas_sha256_update(&h, ABSENT_MARKER, sizeof ABSENT_MARKER - 1u);
             }
         }
         atlas_buf_free(&hash);

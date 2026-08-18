@@ -28,6 +28,7 @@
  * live socket, a real database or a registered repository.
  */
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -41,6 +42,7 @@
 #include "atlas/sem_discover.h"
 #include "atlas/sem_schedule.h"
 #include "atlas/service.h"
+#include "atlas/verify.h"
 #include "atlas_test.h"
 #include "support/fixture.h"
 
@@ -227,6 +229,98 @@ static void test_a_test_root_matches_on_a_component_boundary(void) {
     T_CHECK(atlas_sem_path_is_test("tests\nspec", "spec/x.c"));
 }
 
+/* --- A9.2.5 / GAP-4: nested test roots -------------------------------------
+ *
+ * A declared root is matched from the start of the path on a component
+ * boundary, so a test directory nested inside another directory has to be
+ * declared by its full relative path. That is the model working as specified —
+ * "Atlas does not guess which sources are tests" — and the season's requirement
+ * is that it be *provable*, generically, with no repository name anywhere near
+ * the code.
+ *
+ * The names below are deliberately arbitrary. Nothing in Atlas may know what any
+ * particular repository calls its test directories. */
+static void test_a_nested_test_root_is_matched_when_it_is_declared(void) {
+    /* Declared by its full relative path: everything under it is a test. */
+    T_CHECK(atlas_sem_path_is_test("sub/tests", "sub/tests/a.c"));
+    T_CHECK(atlas_sem_path_is_test("sub/tests", "sub/tests/deep/b.c"));
+    T_CHECK(atlas_sem_path_is_test("sub/tests/", "sub/tests/a.c"));
+    T_CHECK(atlas_sem_path_is_test("sub/tests", "sub/tests"));
+
+    /* The component boundary holds at depth too: a sibling whose name merely
+     * starts with the root's last component is production, and misclassifying it
+     * as a test is wrong in the one direction that matters — it would let a
+     * "no production caller" answer exclude a file that holds one. */
+    T_CHECK(!atlas_sem_path_is_test("sub/tests", "sub/tests_helper.c"));
+    T_CHECK(!atlas_sem_path_is_test("sub/tests", "sub/testsuite/a.c"));
+    T_CHECK(!atlas_sem_path_is_test("sub/tests", "other/sub/tests/a.c"));
+
+    /* Several nested roots, each independent. */
+    const char *roots = "one/tests\ntwo/spec\nthree/deep/t";
+    T_CHECK(atlas_sem_path_is_test(roots, "one/tests/a.c"));
+    T_CHECK(atlas_sem_path_is_test(roots, "two/spec/b.c"));
+    T_CHECK(atlas_sem_path_is_test(roots, "three/deep/t/c.c"));
+    T_CHECK(!atlas_sem_path_is_test(roots, "one/spec/a.c"));
+    T_CHECK(!atlas_sem_path_is_test(roots, "three/deep/tools/c.c"));
+}
+
+static void test_an_undeclared_nested_test_directory_is_not_guessed(void) {
+    /* **The rule, stated as a test.** A directory named `tests` sitting inside
+     * another directory is *not* a test root unless somebody declared it, and
+     * Atlas does not promote it on the strength of its name. Declaring the
+     * top-level `tests` says nothing about `sub/tests`.
+     *
+     * This is deliberately the behaviour rather than a defect to fix: a
+     * heuristic that guessed would classify a production source as a test the
+     * first time a repository used the word differently, and a production source
+     * excluded from a production-scope absence is the failure that matters. What
+     * A9.2.5 adds is not a guess — it is that the consequence is visible, and
+     * that no negative conclusion may rest on the classification being complete
+     * (see `test_declaring_one_test_root_does_not_prove_they_are_all_declared`). */
+    T_CHECK(!atlas_sem_path_is_test("tests", "sub/tests/a.c"));
+    T_CHECK(!atlas_sem_path_is_test("tests", "vendor/tests/a.c"));
+    /* And the generated/ignored case: a path under a build directory is neither
+     * guessed as a test nor as anything else by this function. Classification is
+     * declaration and nothing else. */
+    T_CHECK(!atlas_sem_path_is_test("tests", "build/tests/generated.c"));
+    T_CHECK(!atlas_sem_path_is_test("", "build/tests/generated.c"));
+
+    /* With no declared roots at all, nothing is a test — which is "Atlas does
+     * not know which sources are tests", not "there are no tests". The
+     * generation records that separately as `test_scope_known`. */
+    T_CHECK(!atlas_sem_path_is_test("", "tests/a.c"));
+    T_CHECK(!atlas_sem_path_is_test(NULL, "sub/tests/a.c"));
+}
+
+static void test_declaring_one_test_root_does_not_prove_they_are_all_declared(void) {
+    /* A9.2.5's epistemic requirement, and the reason the matcher above is not a
+     * defect: **an operator declaring a test root is not evidence that they
+     * declared every test root.** It is the same shape as A9.2.4's rule that a
+     * pinned compilation-database list is not a completeness claim.
+     *
+     * So `ATLAS_COVDIM_TESTS` must never be established by any verifier. It is
+     * UNKNOWN — the enum's zero — for every claim, which makes any absence that
+     * would depend on the test/production split UNAVAILABLE rather than ABSENT.
+     * That is checked here rather than left to hold by accident, because the
+     * failure mode is silent: somebody sets the dimension COMPLETE from a
+     * non-empty root list and a whole class of negative answers quietly becomes
+     * believable. */
+    atlas_verify_coverage_report cov;
+    memset(&cov, 0, sizeof cov);
+    T_CHECK_MSG(cov.dims[ATLAS_COVDIM_TESTS] == ATLAS_COVERAGE_UNKNOWN,
+                "a zeroed coverage report must leave the tests dimension UNKNOWN");
+
+    /* A dimension set is not sufficient unless it is COMPLETE, and nothing in
+     * Atlas sets this one. The guard is that `atlas_verify_coverage_satisfies`
+     * refuses UNKNOWN. */
+    const atlas_verify_coverage_dim dims[] = {ATLAS_COVDIM_TESTS};
+    atlas_verify_coverage_dim failed = ATLAS_COVDIM_SEMANTIC_GENERATION;
+    atlas_verify_truth_reason why = ATLAS_TREASON_COVERAGE_UNKNOWN;
+    T_CHECK_MSG(!atlas_verify_coverage_satisfies(&cov, dims, 1u, &failed, &why),
+                "an absence resting on the tests dimension must not be satisfiable");
+    T_CHECK(failed == ATLAS_COVDIM_TESTS);
+}
+
 static void test_a_build_description_round_trips_and_refuses_a_newline(void) {
     atlas_err err;
     atlas_err_init(&err);
@@ -272,21 +366,21 @@ static void test_an_empty_stored_identity_never_makes_a_generation_stale(void) {
     g.analyzer_version = ATLAS_SEM_ANALYZER_VERSION;
 
     const char *reason = NULL;
-    T_CHECK(atlas_sem_freshness_of(&g, true, false, "", "", "abc", NULL, true, &reason) ==
+    T_CHECK(atlas_sem_freshness_of(&g, true, false, "", "", "", "abc", NULL, true, &reason) ==
             ATLAS_SEM_FRESH_CURRENT);
     T_CHECK(reason == NULL);
 
     /* And with an identity recorded, a different one is STALE with its own
      * reason — the working tree, not the commit. */
     (void)snprintf(g.source_identity, sizeof g.source_identity, "%s", "abc");
-    T_CHECK(atlas_sem_freshness_of(&g, true, false, "", "", "def", NULL, true, &reason) ==
+    T_CHECK(atlas_sem_freshness_of(&g, true, false, "", "", "", "def", NULL, true, &reason) ==
             ATLAS_SEM_FRESH_STALE);
     T_CHECK(reason != NULL && strcmp(reason, ATLAS_SEM_STALE_SOURCE) == 0);
     T_CHECK(atlas_sem_stale_reason_is_known(ATLAS_SEM_STALE_SOURCE));
 
     /* An empty *live* identity does not either: "Atlas could not look" is not
      * evidence that anything changed. */
-    T_CHECK(atlas_sem_freshness_of(&g, true, false, "", "", "", NULL, true, &reason) ==
+    T_CHECK(atlas_sem_freshness_of(&g, true, false, "", "", "", "", NULL, true, &reason) ==
             ATLAS_SEM_FRESH_CURRENT);
 }
 
@@ -612,6 +706,432 @@ static void test_a_migrated_default_is_not_an_operator_refusal(void) {
     env_close(&e);
 }
 
+/* --- A9.2.5 / GAP-8: the per-unit retry, end to end -------------------------
+ *
+ * `tu_failed > 0` makes a generation's coverage incomplete for ever, because the
+ * retry governor compares identities and identical bytes never retry. So a parse
+ * child that was OOM-killed cost a repository the ability to state an absence
+ * until somebody happened to edit a file.
+ *
+ * The retry that fixes it is scheduler behaviour, so it is tested by running a
+ * real pass against a parse child that really fails — `tests/tools/atlas_flaky_parse.c`,
+ * supplied through `atlas_sem_index_opts.atlas_exe`, which has been the child's
+ * executable path since A8-CI. No production code knows a test is running. */
+
+/* Copies the flaky child into the fixture so its counters are per-test, and
+ * returns its path in `out`. `failures` leading invocations will fail. */
+static void install_flaky_parse(env *e, long failures, atlas_buf *out, atlas_err *err) {
+    /* Copied rather than used in place, so two tests running at once cannot
+     * share a counter and so the state files land inside the fixture that owns
+     * them. */
+    FILE *in = fopen(ATLAS_FLAKY_PARSE_BIN, "rb");
+    T_REQUIRE_MSG(in != NULL, "cannot open the flaky parse child");
+    atlas_buf_reset(out);
+    T_OK(atlas_buf_appendf(out, err, "%s/flaky-parse", fx_data_dir(&e->fx)), err);
+    FILE *f = fopen(atlas_buf_cstr(out), "wb");
+    T_REQUIRE_MSG(f != NULL, "cannot write the flaky parse child");
+    unsigned char chunk[8192];
+    size_t got = 0;
+    while ((got = fread(chunk, 1, sizeof chunk, in)) > 0) {
+        T_REQUIRE_MSG(fwrite(chunk, 1, got, f) == got, "short write copying the parse child");
+    }
+    (void)fclose(in);
+    (void)fclose(f);
+    T_REQUIRE_MSG(chmod(atlas_buf_cstr(out), 0700) == 0, "cannot make the child executable");
+
+    char path[4096];
+    (void)snprintf(path, sizeof path, "%s.failures", atlas_buf_cstr(out));
+    f = fopen(path, "w");
+    T_REQUIRE_MSG(f != NULL, "cannot set the failure count");
+    (void)fprintf(f, "%ld\n", failures);
+    (void)fclose(f);
+}
+
+/* How many times the child was actually invoked. The bound is the whole
+ * guarantee, so it is asserted rather than assumed. */
+static long flaky_calls(const atlas_buf *exe) {
+    char path[4096];
+    (void)snprintf(path, sizeof path, "%s.calls", atlas_buf_cstr(exe));
+    FILE *f = fopen(path, "r");
+    if (f == NULL) {
+        return 0;
+    }
+    long n = 0;
+    if (fscanf(f, "%ld", &n) != 1) {
+        n = 0;
+    }
+    (void)fclose(f);
+    return n;
+}
+
+/* `index_once` with the parse child replaced. */
+static void index_with_exe(env *e, const char *exe, atlas_sem_index_summary *sum,
+                           atlas_status *st_out, atlas_err *err) {
+    atlas_sem_index_opts o;
+    atlas_sem_index_opts_init(&o);
+    o.compdbs = "compile_commands.json";
+    o.compdbs_len = strlen("compile_commands.json") + 1u;
+    o.atlas_exe = exe;
+    o.root = atlas_git_root(e->g);
+    o.commit_id = "";
+    o.repo_identity_hash = "";
+    int fd = open(atlas_git_root(e->g), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    T_REQUIRE_MSG(fd >= 0, "cannot open the fixture repository root");
+    o.root_fd = fd;
+    atlas_sem_index_summary_init(sum);
+    *st_out = atlas_sem_index_run(e->db, e->repo_id, &o, sum, err);
+    (void)close(fd);
+}
+
+static void test_a_transient_child_failure_is_retried_once_and_recovers(void) {
+    /* (1) the first child call fails transiently, (2) the second succeeds for the
+     * same unit, (3) the generation publishes complete, (4) the unit does not run
+     * more than twice. */
+    atlas_err err;
+    atlas_err_init(&err);
+    env e;
+    env_open(&e, &err);
+
+    T_OK(fx_write(fx_repo(&e.fx), "a.c", "int f(void){return 0;}\n", &err), &err);
+    const char *srcs[] = {"a.c"};
+    write_compdb(&e, srcs, 1, &err);
+    run_file_pass(&e, &err);
+
+    atlas_buf exe = ATLAS_BUF_INIT;
+    install_flaky_parse(&e, 1, &exe, &err);
+
+    atlas_sem_index_summary sum;
+    atlas_status st = ATLAS_OK;
+    index_with_exe(&e, atlas_buf_cstr(&exe), &sum, &st, &err);
+    T_OK(st, &err);
+
+    T_CHECK_MSG(flaky_calls(&exe) == 2,
+                "the unit must be attempted exactly twice, was attempted %ld times",
+                flaky_calls(&exe));
+    T_CHECK_MSG(sum.units_retried == 1, "expected one recorded retry, got %lld",
+                (long long)sum.units_retried);
+    T_CHECK_MSG(sum.published, "a recovered unit must still publish a generation");
+    T_CHECK_MSG(sum.units_complete == 1, "the retried unit must end COMPLETE, got %lld",
+                (long long)sum.units_complete);
+    T_CHECK_MSG(sum.units_failed == 0, "no unit should be left failed, got %lld",
+                (long long)sum.units_failed);
+    T_CHECK_MSG(sum.symbols > 0, "the successful attempt must have produced real facts");
+
+    /* And the published generation is genuinely complete, not merely reported so. */
+    atlas_sem_generation g;
+    bool found = false;
+    T_OK(atlas_db_sem_current(e.db, e.repo_id, &g, &found, &err), &err);
+    T_REQUIRE_MSG(found, "no generation was published");
+    T_CHECK(g.status == ATLAS_SEM_GEN_COMPLETE);
+    T_CHECK_MSG(g.tu_failed == 0 && g.tu_partial == 0 && g.tu_unsupported == 0,
+                "the generation must hold no undescribed unit");
+
+    atlas_buf_free(&exe);
+    env_close(&e);
+}
+
+static void test_a_unit_that_fails_twice_stays_failed_and_is_not_retried_again(void) {
+    /* (5) both attempts fail -> the generation is published but incomplete, and
+     * (4 again) the bound holds: exactly two attempts, never a third. */
+    atlas_err err;
+    atlas_err_init(&err);
+    env e;
+    env_open(&e, &err);
+
+    T_OK(fx_write(fx_repo(&e.fx), "a.c", "int f(void){return 0;}\n", &err), &err);
+    const char *srcs[] = {"a.c"};
+    write_compdb(&e, srcs, 1, &err);
+    run_file_pass(&e, &err);
+
+    atlas_buf exe = ATLAS_BUF_INIT;
+    install_flaky_parse(&e, 99, &exe, &err); /* always fails */
+
+    atlas_sem_index_summary sum;
+    atlas_status st = ATLAS_OK;
+    index_with_exe(&e, atlas_buf_cstr(&exe), &sum, &st, &err);
+    T_OK(st, &err);
+
+    T_CHECK_MSG(flaky_calls(&exe) == 2,
+                "the bound is one retry: expected exactly two attempts, got %ld",
+                flaky_calls(&exe));
+    T_CHECK_MSG(sum.units_retried == 1, "the spent retry must be reported, got %lld",
+                (long long)sum.units_retried);
+    T_CHECK_MSG(sum.units_failed == 1, "a unit that failed twice must be recorded failed");
+    T_CHECK_MSG(sum.units_complete == 0, "nothing completed");
+
+    /* A generation is still published — one lost unit must not lose the pass —
+     * and it says it is incomplete rather than reading as complete. */
+    atlas_sem_generation g;
+    bool found = false;
+    T_OK(atlas_db_sem_current(e.db, e.repo_id, &g, &found, &err), &err);
+    if (found) {
+        T_CHECK_MSG(g.tu_failed == 1,
+                    "the published generation must carry the failed unit, got %lld",
+                    (long long)g.tu_failed);
+        T_CHECK_MSG(atlas_sem_coverage_gap(g.scope_discovery, g.discovery,
+                                           g.tu_partial == 0 && g.tu_failed == 0 &&
+                                               g.tu_unsupported == 0,
+                                           g.scope_uncovered) != NULL,
+                    "a generation holding a failed unit must not read as complete coverage");
+    }
+
+    /* (6) The scheduler must not spin on it. The source identity has not moved,
+     * so asking twice gives the same answer and neither is an unbounded build. */
+    atlas_sem_plan p1;
+    atlas_sem_plan p2;
+    plan_of(&e, &p1, &err);
+    plan_of(&e, &p2, &err);
+    T_CHECK_MSG(p1.should_build == p2.should_build,
+                "the plan must be stable on an unmoved source identity");
+    T_CHECK_MSG(p1.activity == p2.activity, "and so must the activity");
+
+    atlas_buf_free(&exe);
+    env_close(&e);
+}
+
+static void test_a_deterministic_compiler_error_is_never_retried(void) {
+    /* (7) The real parse child, over a source the compiler cannot accept. The
+     * unit is not complete, and **no retry is spent**: retrying identical bytes
+     * through the same compiler reaches the same answer, which is the storm the
+     * transient classification exists to prevent. */
+    atlas_err err;
+    atlas_err_init(&err);
+    env e;
+    env_open(&e, &err);
+
+    T_OK(fx_write(fx_repo(&e.fx), "a.c",
+                  "#include \"there_is_no_such_header_anywhere.h\"\n"
+                  "int f(void){ return undefined_thing_entirely(; }\n",
+                  &err),
+         &err);
+    const char *srcs[] = {"a.c"};
+    write_compdb(&e, srcs, 1, &err);
+    run_file_pass(&e, &err);
+
+    atlas_sem_index_summary sum;
+    index_once(&e, NULL, &sum, &err);
+
+    T_CHECK_MSG(sum.units_retried == 0,
+                "a compiler error must not spend a retry, %lld were spent",
+                (long long)sum.units_retried);
+    T_CHECK_MSG(sum.units_complete == 0, "a unit the compiler rejected is not complete");
+    T_CHECK_MSG(sum.units_parsed == 1, "the unit was attempted exactly once");
+
+    atlas_buf_free(&e.exe);
+    atlas_buf_init(&e.exe);
+    T_OK(atlas_buf_set_str(&e.exe, ATLAS_BIN, &err), &err);
+    env_close(&e);
+}
+
+/* The trust block for the fixture's published generation, gathered the way every
+ * production surface gathers it. The policy default is supplied rather than read
+ * from `/etc`, for `plan_of`'s reason: a test must not depend on how the machine
+ * running it happens to be configured. */
+static void trust_after(env *e, atlas_sem_trust *out, atlas_err *err) {
+    atlas_repo_info info;
+    repo_of(e, &info, err);
+    atlas_sem_generation g;
+    bool found = false;
+    T_OK(atlas_db_sem_current(e->db, info.id, &g, &found, err), err);
+    atlas_sem_trust_now_with_default(e->db, &info, &g, found, false, ATLAS_SEM_AUTO_DEFAULT, out);
+    atlas_repo_info_free(&info);
+}
+
+typedef struct sym_count_sink {
+    size_t n;
+} sym_count_sink;
+
+static atlas_status count_symbol(const atlas_sem_symbol_row *row, void *ud, atlas_err *err) {
+    (void)row;
+    (void)err;
+    ((sym_count_sink *)ud)->n++;
+    return ATLAS_OK;
+}
+
+static void test_a_failed_unit_is_never_carried_forward_as_complete(void) {
+    /* **The defect this test exists for could turn a failed parse into a proven
+     * absence.**
+     *
+     * The carry-forward decision used to ask only whether a unit's input digest
+     * matched, with no status filter, and the carry branch writes
+     * `status = COMPLETE`. So a unit that failed in pass N — a parse child killed
+     * twice — was rewritten as COMPLETE in pass N+1, with the zero symbols and
+     * zero edges it never produced. One unrelated edit anywhere in the tree moves
+     * the source identity and triggers that pass.
+     *
+     * Before A9.2.5 that was a wrong counter. A9.2.5 makes `units_complete` a
+     * gate on `ATLAS_SEM_VERDICT_ABSENT`, so it became a path to a *proven
+     * absence* over a file Atlas has never successfully parsed — with every field
+     * in the trust block saying the coverage was whole. */
+    atlas_err err;
+    atlas_err_init(&err);
+    env e;
+    env_open(&e, &err);
+
+    T_OK(fx_write(fx_repo(&e.fx), "a.c", "int f(void){return 0;}\n", &err), &err);
+    const char *srcs[] = {"a.c"};
+    write_compdb(&e, srcs, 1, &err);
+    run_file_pass(&e, &err);
+    /* A walk, so the generation records COMPLETE discovery and the *units*
+     * dimension is the one under test. Without it discovery is UNKNOWN and
+     * outranks everything, which would make this test pass for the wrong
+     * reason. */
+    discover(&e, &err);
+
+    /* Pass 1: the child always fails, so the unit ends FAILED. */
+    atlas_buf exe = ATLAS_BUF_INIT;
+    install_flaky_parse(&e, 99, &exe, &err);
+    atlas_sem_index_summary first;
+    atlas_status st = ATLAS_OK;
+    index_with_exe(&e, atlas_buf_cstr(&exe), &first, &st, &err);
+    T_OK(st, &err);
+    T_REQUIRE_MSG(first.units_failed == 1, "the fixture must leave one failed unit");
+    T_CHECK(first.symbols == 0);
+
+    /* **The epistemic state after pass 1**, asserted before anything about
+     * counters: a generation holding a unit Atlas could not parse must not let an
+     * empty answer read as an absence. */
+    atlas_sem_trust t;
+    trust_after(&e, &t, &err);
+    atlas_sem_trust_settle(&t, 0, false);
+    T_CHECK_MSG(t.verdict == ATLAS_SEM_VERDICT_UNKNOWN,
+                "a generation with a failed unit must answer UNKNOWN, got %s",
+                atlas_sem_verdict_name(t.verdict));
+    T_CHECK_MSG(t.unknown_reason != NULL &&
+                    strcmp(t.unknown_reason, ATLAS_SEM_UNK_UNITS) == 0,
+                "and must say which dimension failed, got %s",
+                t.unknown_reason == NULL ? "(null)" : t.unknown_reason);
+    T_CHECK(!t.units_complete);
+
+    /* Pass 2: the real parse child, identical bytes and identical configuration,
+     * so the digest a naive carry rule would match is exactly the same. The unit
+     * must be **re-parsed**, not carried. */
+    atlas_sem_index_summary second;
+    index_once(&e, NULL, &second, &err);
+
+    T_CHECK_MSG(second.units_reused == 0,
+                "a failed unit must never be reused: %lld unit(s) were carried forward",
+                (long long)second.units_reused);
+    T_CHECK_MSG(second.units_parsed == 1, "the failed unit must be parsed again, parsed %lld",
+                (long long)second.units_parsed);
+    T_CHECK_MSG(second.units_complete == 1, "and it succeeds this time");
+    T_CHECK_MSG(second.symbols > 0,
+                "a unit carried forward as COMPLETE would hold zero facts; this one must hold "
+                "the facts a real parse produced");
+
+    atlas_sem_generation g2;
+    bool found2 = false;
+    T_OK(atlas_db_sem_current(e.db, e.repo_id, &g2, &found2, &err), &err);
+    T_REQUIRE_MSG(found2, "no generation was published by the second pass");
+    T_CHECK_MSG(g2.tu_failed == 0, "the second generation holds no failed unit");
+    T_CHECK_MSG(g2.symbol_count > 0, "and it holds real symbols");
+
+    /* **And now the epistemic half, which is the reason any of this matters.**
+     *
+     * Counters are evidence about the bug; the verdict is the consequence. After
+     * the second pass an empty answer may finally settle ABSENT — and it must do
+     * so because the file was *read*, not because a failure was relabelled. */
+    trust_after(&e, &t, &err);
+    atlas_sem_trust_settle(&t, 0, false);
+    T_CHECK_MSG(t.verdict == ATLAS_SEM_VERDICT_ABSENT,
+                "after a real parse an empty answer may settle ABSENT, got %s (%s)",
+                atlas_sem_verdict_name(t.verdict),
+                t.unknown_reason == NULL ? "-" : t.unknown_reason);
+    T_CHECK(t.units_complete && t.coverage_complete);
+
+    /* The symbol the failed pass never saw is genuinely in the index now, and a
+     * read that finds it settles PRESENT. */
+    atlas_sem_symbols_report syms;
+    atlas_sem_symbols_report_init(&syms);
+    sym_count_sink sink = {0};
+    int64_t total = 0;
+    bool trunc = false;
+    T_OK(atlas_db_sem_symbols_by_name(e.db, g2.id, "f", NULL, NULL, 64, count_symbol, &sink,
+                                      &total, &trunc, &err),
+         &err);
+    atlas_sem_symbols_report_free(&syms);
+    T_CHECK_MSG(sink.n > 0, "the re-parsed unit must actually contain its symbol");
+    trust_after(&e, &t, &err);
+    atlas_sem_trust_settle(&t, (int64_t)sink.n, false);
+    T_CHECK_MSG(t.verdict == ATLAS_SEM_VERDICT_PRESENT,
+                "a read that found the symbol settles PRESENT, got %s",
+                atlas_sem_verdict_name(t.verdict));
+
+    atlas_buf_free(&exe);
+    env_close(&e);
+}
+
+/* A9.2.5 / GAP-8, the whole-pass half. */
+static void test_an_interrupted_pass_gets_exactly_one_more_attempt(void) {
+    /* The governor could not tell a pass that failed *because of the machine* —
+     * out of memory, a database error — from one that failed because of the
+     * inputs. Both pinned `fail_identity`, so a transient interruption held a
+     * repository on HOLD_FAILED_UNCHANGED until somebody happened to edit a
+     * file. The exception is bounded by `fail_count`, which is durable, so a
+     * second interruption holds and a daemon restart reaches the same answer.
+     * There is no timer: nothing can wake up and try a third time. */
+    atlas_err err;
+    atlas_err_init(&err);
+    env e;
+    env_open(&e, &err);
+
+    T_OK(fx_write(fx_repo(&e.fx), "a.c", "int f(void){return 0;}\n", &err), &err);
+    const char *srcs[] = {"a.c"};
+    write_compdb(&e, srcs, 1, &err);
+    run_file_pass(&e, &err);
+
+    atlas_sem_config cfg;
+    atlas_sem_config_init(&cfg);
+    cfg.repo_id = e.repo_id;
+    cfg.auto_intent = ATLAS_SEM_INTENT_ENABLED;
+    cfg.auto_intent_by = ATLAS_SEM_INTENT_BY_OPERATOR;
+    const char *dbs[] = {"compile_commands.json"};
+    T_OK(atlas_sem_config_pack(dbs, 1, &cfg.compdbs, &err), &err);
+    T_OK(atlas_db_sem_config_set(e.db, &cfg, &err), &err);
+    atlas_sem_config_free(&cfg);
+    discover(&e, &err);
+
+    atlas_sem_plan p;
+    plan_of(&e, &p, &err);
+    T_CHECK(p.should_build);
+
+    /* One interruption. The source has not moved, and the attempt is still
+     * allowed — exactly once. */
+    T_OK(atlas_db_sem_config_record_attempt(e.db, e.repo_id, p.source_identity, false,
+                                            ATLAS_SEM_WHY_PASS_INTERRUPTED, &err),
+         &err);
+    plan_of(&e, &p, &err);
+    T_EQ_INT(p.fail_count, 1);
+    T_CHECK_MSG(p.should_build,
+                "one interrupted pass must be worth one more attempt with the source unmoved");
+
+    /* A second interruption at the same identity: the bound is reached and the
+     * repository holds, visibly, with the reason recorded. */
+    T_OK(atlas_db_sem_config_record_attempt(e.db, e.repo_id, p.source_identity, false,
+                                            ATLAS_SEM_WHY_PASS_INTERRUPTED, &err),
+         &err);
+    plan_of(&e, &p, &err);
+    T_EQ_INT(p.fail_count, 2);
+    T_CHECK_MSG(!p.should_build, "the retry bound is one; a second interruption must hold");
+    T_CHECK(p.activity == ATLAS_SEM_ACT_FAILED);
+    T_CHECK(p.hold_reason != NULL &&
+            strcmp(p.hold_reason, ATLAS_SEM_HOLD_FAILED_UNCHANGED) == 0);
+
+    /* And the exception is *only* for an interruption. A deterministic failure
+     * holds on the first one, unchanged from A9.2.3. */
+    T_OK(atlas_db_sem_config_record_attempt(e.db, e.repo_id, p.source_identity, true, "", &err),
+         &err);
+    T_OK(atlas_db_sem_config_record_attempt(e.db, e.repo_id, p.source_identity, false,
+                                            ATLAS_SEM_WHY_BUILD_DESCRIPTION, &err),
+         &err);
+    plan_of(&e, &p, &err);
+    T_EQ_INT(p.fail_count, 1);
+    T_CHECK_MSG(!p.should_build,
+                "a build-description failure must hold on the first attempt, as before");
+
+    env_close(&e);
+}
+
 static void test_the_retry_governor_holds_until_the_source_moves(void) {
     /* Conservative on purpose. Retrying after an interval would spin on a
      * repository that does not compile — every attempt running a compiler over
@@ -707,6 +1227,12 @@ static void test_removing_a_repository_forgets_its_build_description(void) {
 
 static const atlas_test TESTS[] = {
     {"every zero is the safe reading", test_every_zero_is_the_safe_reading},
+    {"a nested test root is matched when it is declared",
+     test_a_nested_test_root_is_matched_when_it_is_declared},
+    {"an undeclared nested test directory is not guessed",
+     test_an_undeclared_nested_test_directory_is_not_guessed},
+    {"declaring one test root does not prove they are all declared",
+     test_declaring_one_test_root_does_not_prove_they_are_all_declared},
     {"a declared test root matches on a path-component boundary",
      test_a_test_root_matches_on_a_component_boundary},
     {"a build description round-trips and refuses a newline",
@@ -726,6 +1252,16 @@ static const atlas_test TESTS[] = {
     {"an operator refusal outlives the policy", test_an_operator_refusal_outlives_the_policy},
     {"a migrated default is not an operator refusal",
      test_a_migrated_default_is_not_an_operator_refusal},
+    {"a failed unit is never carried forward as complete",
+     test_a_failed_unit_is_never_carried_forward_as_complete},
+    {"a transient child failure is retried once and recovers",
+     test_a_transient_child_failure_is_retried_once_and_recovers},
+    {"a unit that fails twice stays failed and is not retried again",
+     test_a_unit_that_fails_twice_stays_failed_and_is_not_retried_again},
+    {"a deterministic compiler error is never retried",
+     test_a_deterministic_compiler_error_is_never_retried},
+    {"an interrupted pass gets exactly one more attempt",
+     test_an_interrupted_pass_gets_exactly_one_more_attempt},
     {"the retry governor holds until the source moves",
      test_the_retry_governor_holds_until_the_source_moves},
     {"removing a repository forgets its build description",

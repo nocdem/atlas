@@ -252,7 +252,8 @@ static const char *const WHY[] = {
     /* A9.2.3's pass-level reasons. In the same vocabulary because they reach the
      * same surfaces and must be interned the same way, and kept distinct in
      * meaning: these say why the pass never got as far as a translation unit. */
-    ATLAS_SEM_WHY_BUILD_DESCRIPTION, ATLAS_SEM_WHY_PASS_FAILED,
+    ATLAS_SEM_WHY_BUILD_DESCRIPTION,
+        ATLAS_SEM_WHY_PASS_INTERRUPTED, ATLAS_SEM_WHY_PASS_FAILED,
 };
 
 const char *atlas_sem_why_intern(const char *why) {
@@ -290,7 +291,7 @@ const char *atlas_sem_stale_reason_intern(const char *reason) {
     static const char *const REASONS[] = {
         ATLAS_SEM_STALE_COMMIT,     ATLAS_SEM_STALE_COMPDB,     ATLAS_SEM_STALE_COMPILER,
         ATLAS_SEM_STALE_ANALYZER,   ATLAS_SEM_STALE_FILE_INDEX, ATLAS_SEM_STALE_INCOMPLETE,
-        ATLAS_SEM_STALE_SOURCE,     ATLAS_SEM_STALE_DISCOVERY,
+        ATLAS_SEM_STALE_SOURCE,     ATLAS_SEM_STALE_DISCOVERY,  ATLAS_SEM_STALE_REPO_IDENTITY,
     };
     if (reason == NULL) {
         return NULL;
@@ -305,6 +306,59 @@ const char *atlas_sem_stale_reason_intern(const char *reason) {
 
 bool atlas_sem_stale_reason_is_known(const char *reason) {
     return atlas_sem_stale_reason_intern(reason) != NULL;
+}
+
+/* --- A9.2.5: the verdict vocabulary ----------------------------------------- */
+
+static const char *const VERDICT_NAMES[] = {
+    "UNKNOWN",
+    "PRESENT",
+    "ABSENT",
+};
+
+const char *atlas_sem_verdict_name(atlas_sem_verdict v) {
+    size_t i = (size_t)v;
+    if (i >= sizeof(VERDICT_NAMES) / sizeof(VERDICT_NAMES[0])) {
+        return "UNKNOWN";
+    }
+    return VERDICT_NAMES[i];
+}
+
+bool atlas_sem_verdict_parse(const char *name, atlas_sem_verdict *out) {
+    if (name == NULL || out == NULL) {
+        return false;
+    }
+    for (size_t i = 0; i < sizeof(VERDICT_NAMES) / sizeof(VERDICT_NAMES[0]); i++) {
+        if (strcmp(name, VERDICT_NAMES[i]) == 0) {
+            *out = (atlas_sem_verdict)i;
+            return true;
+        }
+    }
+    /* No fallback. An unparsed verdict must not become a known one, and least of
+     * all ABSENT — the value whose whole point is that it was earned. */
+    return false;
+}
+
+const char *atlas_sem_unknown_reason_intern(const char *reason) {
+    static const char *const REASONS[] = {
+        ATLAS_SEM_UNK_NO_LIBCLANG, ATLAS_SEM_UNK_NO_GENERATION, ATLAS_SEM_UNK_BUILDING,
+        ATLAS_SEM_UNK_STALE,       ATLAS_SEM_UNK_MAINTENANCE,   ATLAS_SEM_UNK_SCOPE_UNKNOWN,
+        ATLAS_SEM_UNK_DISCOVERY,   ATLAS_SEM_UNK_UNITS,         ATLAS_SEM_UNK_COVERAGE,
+        ATLAS_SEM_UNK_TRUNCATED,
+    };
+    if (reason == NULL) {
+        return NULL;
+    }
+    for (size_t i = 0; i < sizeof(REASONS) / sizeof(REASONS[0]); i++) {
+        if (strcmp(reason, REASONS[i]) == 0) {
+            return REASONS[i];
+        }
+    }
+    return NULL;
+}
+
+bool atlas_sem_unknown_reason_is_known(const char *reason) {
+    return atlas_sem_unknown_reason_intern(reason) != NULL;
 }
 
 bool atlas_sem_why_is_transient(const char *why) {
@@ -341,6 +395,207 @@ const char *atlas_sem_obstacle_intern(const char *reason) {
 
 bool atlas_sem_obstacle_reason_is_known(const char *reason) {
     return atlas_sem_obstacle_intern(reason) != NULL;
+}
+
+const char *atlas_sem_coverage_gap(atlas_sem_scope_discovery scope_discovery,
+                                   atlas_sem_discovery generation_discovery, bool units_complete,
+                                   int64_t scope_uncovered) {
+    if (scope_discovery != ATLAS_SEM_SCOPE_DECLARED) {
+        /* Includes every generation built before A9.2.3, which recorded no
+         * manifest. Conservative by construction rather than by a rule that has
+         * to name them. */
+        return ATLAS_SEM_UNK_SCOPE_UNKNOWN;
+    }
+    if (generation_discovery != ATLAS_SEM_DISC_COMPLETE) {
+        /* A9.2.4's sentence: complete processing of configured inputs does not
+         * prove complete discovery of relevant inputs. */
+        return ATLAS_SEM_UNK_DISCOVERY;
+    }
+    if (!units_complete) {
+        return ATLAS_SEM_UNK_UNITS;
+    }
+    if (scope_uncovered > 0) {
+        return ATLAS_SEM_UNK_COVERAGE;
+    }
+    return NULL;
+}
+
+void atlas_sem_trust_init(atlas_sem_trust *t) {
+    if (t == NULL) {
+        return;
+    }
+    memset(t, 0, sizeof(*t));
+    /* Every zero is the safe reading: UNKNOWN verdict, no generation, ABSENT
+     * freshness, coverage not complete, discovery UNKNOWN, maintenance off. A
+     * zeroed trust block can never let an empty result read as an absence. */
+}
+
+void atlas_sem_trust_settle(atlas_sem_trust *t, int64_t rows_emitted, bool truncated) {
+    if (t == NULL) {
+        return;
+    }
+    t->verdict = ATLAS_SEM_VERDICT_UNKNOWN;
+    t->unknown_reason = NULL;
+
+    /* **One row settles PRESENT and nothing else is consulted.**
+     *
+     * A9.2.2's asymmetry, and it is the whole reason this is not a boolean: a
+     * caller Atlas *found* exists whatever it failed to look at. Coverage bounds
+     * a negative conclusion; it bounds nothing about a positive one. A stale
+     * generation that found a caller is still evidence that the caller existed
+     * in the tree that generation described — which is why the freshness and the
+     * generation id travel on the answer rather than being suppressed. */
+    if (rows_emitted > 0) {
+        t->verdict = ATLAS_SEM_VERDICT_PRESENT;
+        return;
+    }
+
+    /* Everything below is the negative branch, and the order is the order an
+     * operator would want to be told: the thing they would fix first.
+     *
+     * A repository with no index at all must not be lectured about its coverage
+     * manifest, and one whose Atlas has no libclang must not be told to rebuild
+     * something that cannot be built. Each check therefore returns rather than
+     * accumulating, and `test_verdict_reason_precedence_is_the_most_actionable`
+     * pins the order so a later edit cannot quietly reshuffle it. */
+    if (!t->libclang_available) {
+        t->unknown_reason = ATLAS_SEM_UNK_NO_LIBCLANG;
+        return;
+    }
+    if (!t->have_generation) {
+        t->unknown_reason = ATLAS_SEM_UNK_NO_GENERATION;
+        return;
+    }
+    if (t->freshness == ATLAS_SEM_FRESH_REBUILDING) {
+        /* Not STALE, and the difference is what an operator does about it: one
+         * is "wait", the other is "something moved". */
+        t->unknown_reason = ATLAS_SEM_UNK_BUILDING;
+        return;
+    }
+    if (t->freshness != ATLAS_SEM_FRESH_CURRENT) {
+        t->unknown_reason = ATLAS_SEM_UNK_STALE;
+        return;
+    }
+    if (!t->auto_maintenance) {
+        /* A repository nobody maintains drifts, and a freshness value is only
+         * ever a statement about the instant it was computed. Reported as its
+         * own reason because the remedy is `code sem-config --auto` rather than
+         * a rebuild, and an operator told "coverage" would go looking at their
+         * compilation database. */
+        t->unknown_reason = ATLAS_SEM_UNK_MAINTENANCE;
+        return;
+    }
+    /* The coverage dimensions, from the one rule the scheduler also asks — so a
+     * repository the scheduler calls INCOMPLETE and a query that answers UNKNOWN
+     * name the same dimension, because they consulted the same function.
+     *
+     * The **generation's** discovery, never the live one. A walk that has since
+     * completed says nothing about a generation built while it had not, and
+     * reading the live value here would let an improvement nobody has indexed
+     * vouch for an index that predates it. */
+    const char *gap = atlas_sem_coverage_gap(t->scope_discovery, t->generation_discovery,
+                                             t->units_complete, t->scope_uncovered);
+    if (gap != NULL) {
+        t->unknown_reason = gap;
+        return;
+    }
+    if (truncated) {
+        /* A8-CI's rule about every bound that is reached, applied to the
+         * verdict. A walk that stopped at a ceiling has not searched its
+         * universe, so it cannot report the universe empty. Last, because it is
+         * a property of this one query rather than of the index, and an operator
+         * fixes it by asking a narrower question. */
+        t->unknown_reason = ATLAS_SEM_UNK_TRUNCATED;
+        return;
+    }
+    /* Nothing found, over a universe Atlas can vouch for. */
+    t->verdict = ATLAS_SEM_VERDICT_ABSENT;
+}
+
+/* The one writer of the trust block. See the header for why it lives here and
+ * not in either of the two serializers that call it. */
+atlas_status atlas_sem_trust_write_json(atlas_json *j, const atlas_sem_trust *t, atlas_err *err) {
+    if (j == NULL || t == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                             "a semantic trust block was written with no writer or no value");
+    }
+    atlas_status st = atlas_json_key_str(j, "result_verdict", atlas_sem_verdict_name(t->verdict), err);
+    if (st == ATLAS_OK) {
+        /* Checked against Atlas' own closed set before it is emitted, so a value
+         * from anywhere else becomes absent rather than reproduced — the rule
+         * every model-facing vocabulary in this layer follows. */
+        st = atlas_json_key_str_opt(
+            j, "unknown_reason",
+            atlas_sem_unknown_reason_is_known(t->unknown_reason) ? t->unknown_reason : NULL, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(j, "freshness", atlas_sem_freshness_name(t->freshness), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str_opt(
+            j, "stale_reason",
+            atlas_sem_stale_reason_is_known(t->stale_reason) ? t->stale_reason : NULL, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(j, "have_generation", t->have_generation, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(j, "generation_id", t->generation_id, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str_opt(j, "indexed_commit", t->indexed_commit, err);
+    }
+    if (st == ATLAS_OK) {
+        /* Both identities. A surface that showed only the verdict could not say
+         * how far behind the index is, and the divergence is the fact. */
+        st = atlas_json_key_str_opt(j, "generation_identity", t->generation_identity, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str_opt(j, "live_identity", t->live_identity, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(j, "coverage_complete", t->coverage_complete, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(j, "units_complete", t->units_complete, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(j, "scope_discovery",
+                                atlas_sem_scope_discovery_name(t->scope_discovery), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(j, "scope_candidates", t->scope_candidates, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(j, "scope_covered", t->scope_covered, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(j, "scope_uncovered", t->scope_uncovered, err);
+    }
+    if (st == ATLAS_OK) {
+        /* Two discovery values, never one. `generation_discovery` is what the
+         * verdict rests on; `discovery` is what Atlas can account for now. They
+         * differ exactly when a rebuild is due, and a consumer that saw only one
+         * could not tell which. */
+        st = atlas_json_key_str(j, "generation_discovery",
+                                atlas_sem_discovery_name(t->generation_discovery), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(j, "discovery", atlas_sem_discovery_name(t->discovery), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(j, "inputs_accepted", t->inputs_accepted, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(j, "inputs_rejected", t->inputs_rejected, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(j, "auto_maintenance", t->auto_maintenance, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(j, "libclang_available", t->libclang_available, err);
+    }
+    return st;
 }
 
 void atlas_sem_generation_init(atlas_sem_generation *g) {

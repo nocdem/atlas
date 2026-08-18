@@ -45,6 +45,7 @@
 #include "atlas/sem_ops.h"
 #include "atlas/pathrep.h"
 #include "atlas/sha256.h"
+#include "atlas/syspolicy.h"
 
 void atlas_sem_index_opts_init(atlas_sem_index_opts *o) {
     memset(o, 0, sizeof(*o));
@@ -66,6 +67,7 @@ static int64_t now_ms(void) {
  * description moved, then the tools moved. */
 atlas_sem_freshness atlas_sem_freshness_of(const atlas_sem_generation *g, bool have_generation,
                                            bool running, const char *live_commit,
+                                           const char *live_repo_identity,
                                            const char *live_compdb_digest,
                                            const char *live_source_identity,
                                            const atlas_sem_live_inputs *live_inputs,
@@ -82,6 +84,21 @@ atlas_sem_freshness atlas_sem_freshness_of(const atlas_sem_generation *g, bool h
     if (g->status != ATLAS_SEM_GEN_COMPLETE) {
         if (reason_out != NULL) {
             *reason_out = ATLAS_SEM_STALE_INCOMPLETE;
+        }
+        return ATLAS_SEM_FRESH_STALE;
+    }
+    /* A9.2.5. A different repository outranks a different commit of the same one.
+     *
+     * Guarded by the same empty-value rule every other check here uses: an empty
+     * stored identity is a generation built before this was recorded, and an
+     * empty live one is Atlas not having looked. Neither is evidence of change,
+     * and treating either as one would make every pre-A9.2.5 generation stale
+     * for a reason nobody could act on. */
+    if (live_repo_identity != NULL && live_repo_identity[0] != '\0' &&
+        g->repo_identity_hash[0] != '\0' &&
+        strcmp(live_repo_identity, g->repo_identity_hash) != 0) {
+        if (reason_out != NULL) {
+            *reason_out = ATLAS_SEM_STALE_REPO_IDENTITY;
         }
         return ATLAS_SEM_FRESH_STALE;
     }
@@ -188,6 +205,16 @@ typedef struct live_fact_set {
     char compdb_digest[65];
     char source_identity[65];
     atlas_sem_live_inputs inputs;
+    /* A9.2.5. Two more facts the same pass already has in hand, carried out
+     * rather than fetched again: `atlas_sem_trust_now` needs the rejected count
+     * and the operator's activation intent, and re-reading the build description
+     * for them would put a second config read on every semantic query — the
+     * shape A9.2.3's closure measured and removed. */
+    int64_t inputs_rejected;
+    atlas_sem_auto_intent auto_intent;
+    /* A9.2.5. The repository's *current* lineage fingerprint, so freshness can
+     * notice that a generation describes a different repository. */
+    char repo_identity[65];
 } live_fact_set;
 
 static atlas_status live_facts(atlas_db *db, atlas_repo_info *repo, live_fact_set *out,
@@ -230,8 +257,97 @@ atlas_sem_freshness atlas_sem_freshness_now(atlas_db *db, atlas_repo_info *repo,
     const char *live_identity = lf.source_identity;
     atlas_sem_live_inputs live_inputs = lf.inputs;
 
-    return atlas_sem_freshness_of(g, have_generation, running, repo->scanned_head, live_digest,
-                                  live_identity, &live_inputs, file_current, reason_out);
+    return atlas_sem_freshness_of(g, have_generation, running, repo->scanned_head,
+                                  lf.repo_identity, live_digest, live_identity, &live_inputs,
+                                  file_current, reason_out);
+}
+
+/* A9.2.5: every trust fact a semantic read must carry, from **one** pass.
+ *
+ * This replaces `atlas_sem_freshness_now` on the query paths rather than joining
+ * it, and that is the whole cost argument: `live_facts` already reads the build
+ * description, the accepted inputs and every source hash, and it is already
+ * called once per semantic response. Adding the verdict therefore costs the
+ * `atlas_db_sem_current`-shaped reads the caller has already done plus nothing —
+ * no second source-identity computation, no second config read.
+ *
+ * `atlas_sem_plan_for` is deliberately **not** called here even though it holds
+ * the same fields. It loads the root-owned policy and computes a scheduling
+ * decision, and a query has no business asking whether a rebuild is due; the
+ * activation answer it does need arrives as `policy_default` from a caller who
+ * already has it.
+ *
+ * The verdict is left unsettled: only the caller knows how many rows it emitted
+ * and whether its walk was truncated, and `atlas_sem_trust_settle` is the one
+ * function that decides. */
+void atlas_sem_trust_now_with_default(atlas_db *db, atlas_repo_info *repo,
+                                      const atlas_sem_generation *g, bool have_generation,
+                                      bool running, bool policy_default, atlas_sem_trust *out) {
+    if (out == NULL) {
+        return;
+    }
+    atlas_sem_trust_init(out);
+    out->libclang_available = atlas_sem_available();
+    if (db == NULL || repo == NULL) {
+        return;
+    }
+
+    atlas_index_state fs;
+    atlas_index_state_init(&fs);
+    atlas_err ignored;
+    atlas_err_init(&ignored);
+    bool file_current = atlas_db_index_state_get(db, repo->id, &fs, &ignored) == ATLAS_OK &&
+                        atlas_index_state_is_current(&fs, NULL);
+    atlas_index_state_free(&fs);
+
+    live_fact_set lf;
+    (void)live_facts(db, repo, &lf, &ignored);
+
+    const char *reason = NULL;
+    out->freshness = atlas_sem_freshness_of(g, have_generation, running, repo->scanned_head,
+                                            lf.repo_identity, lf.compdb_digest, lf.source_identity,
+                                            &lf.inputs, file_current, &reason);
+    out->stale_reason = atlas_sem_stale_reason_intern(reason);
+
+    out->have_generation = have_generation;
+    (void)snprintf(out->live_identity, sizeof out->live_identity, "%s", lf.source_identity);
+    out->discovery = lf.inputs.discovery;
+    out->inputs_accepted = lf.inputs.accepted_count;
+    out->inputs_rejected = lf.inputs_rejected;
+    /* The whole activation policy in one pure function, so this surface and the
+     * scheduler answer identically because they call it rather than because two
+     * copies are kept in step. */
+    out->auto_maintenance = atlas_sem_auto_effective(lf.auto_intent, policy_default);
+
+    if (have_generation && g != NULL) {
+        out->generation_id = g->id;
+        (void)snprintf(out->indexed_commit, sizeof out->indexed_commit, "%s", g->commit_id);
+        (void)snprintf(out->generation_identity, sizeof out->generation_identity, "%s",
+                       g->source_identity);
+        out->scope_discovery = g->scope_discovery;
+        out->scope_candidates = g->scope_candidates;
+        out->scope_covered = g->scope_covered;
+        out->scope_uncovered = g->scope_uncovered;
+        out->generation_discovery = g->discovery;
+        out->units_complete =
+            g->tu_partial == 0 && g->tu_failed == 0 && g->tu_unsupported == 0;
+        /* Asked, not restated. An earlier cut open-coded the same four
+         * conditions here and conceded in a comment that "the two must agree" —
+         * which is exactly the second copy `atlas_sem_coverage_gap` exists to
+         * remove, and which made `docs/engineering-rules.md`'s claim that all
+         * three callers ask one function untrue. */
+        out->coverage_complete =
+            atlas_sem_coverage_gap(g->scope_discovery, g->discovery, out->units_complete,
+                                   g->scope_uncovered) == NULL;
+    }
+}
+
+void atlas_sem_trust_now(atlas_db *db, atlas_repo_info *repo, const atlas_sem_generation *g,
+                         bool have_generation, bool running, atlas_sem_trust *out) {
+    atlas_syspolicy pol;
+    atlas_syspolicy_load(&pol);
+    atlas_sem_trust_now_with_default(db, repo, g, have_generation, running,
+                                     atlas_syspolicy_semantic_auto_default(&pol), out);
 }
 
 /* --- reading a compilation database ---------------------------------------- */
@@ -606,8 +722,24 @@ static atlas_status live_facts(atlas_db *db, atlas_repo_info *repo, live_fact_se
          * identity never making a generation stale. */
         out->inputs.known = cfg.discovery_state != ATLAS_SEM_DISC_UNKNOWN;
         out->inputs.discovery = cfg.discovery_state;
+        for (size_t i = 0; i < count; i++) {
+            if (!inputs[i].accepted) {
+                out->inputs_rejected++;
+            }
+        }
     } else {
         count = 0;
+    }
+    out->auto_intent = cfg.auto_intent;
+    {
+        atlas_buf ident = ATLAS_BUF_INIT;
+        atlas_err iderr;
+        atlas_err_init(&iderr);
+        if (atlas_db_repo_identity_hash(db, repo->id, &ident, &iderr) == ATLAS_OK) {
+            (void)snprintf(out->repo_identity, sizeof out->repo_identity, "%s",
+                           atlas_buf_cstr(&ident));
+        }
+        atlas_buf_free(&ident);
     }
 
     int root_fd = open(atlas_buf_cstr(&repo->root_path),

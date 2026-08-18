@@ -281,6 +281,22 @@ const char *atlas_sem_freshness_name(atlas_sem_freshness f);
  * their source instead of at their build tree. */
 #define ATLAS_SEM_STALE_DISCOVERY "the_set_of_discovered_build_inputs_changed_since_this_index_was_built"
 #define ATLAS_SEM_STALE_INCOMPLETE "the_last_generation_did_not_complete"
+/* A9.2.5. The generation describes a *different repository*.
+ *
+ * `repo_identity_hash` is A4's path-qualified lineage fingerprint — the
+ * canonical root path, the object format and the sorted set of ingested root
+ * commits — and a generation has recorded it since A8-CI. Nothing ever compared
+ * it. `src/gate/assess.c` compares exactly this value and treats a mismatch as
+ * grounds to revalidate; the semantic layer wrote it and forgot it.
+ *
+ * It is checked *before* the commit, because "this index describes a different
+ * repository" outranks "this index describes an older commit of the same one",
+ * and an operator told the second when the first is true looks in the wrong
+ * place. The source identity cannot catch this: it is built from
+ * repository-*relative* paths and content hashes, so a tree with identical
+ * content under a new root produces an identical value. */
+#define ATLAS_SEM_STALE_REPO_IDENTITY                                                              \
+    "this_index_was_built_for_a_different_repository_identity"
 bool atlas_sem_stale_reason_is_known(const char *reason);
 
 /* --- A9.2.3: how a generation's scope was discovered -------------------------
@@ -462,6 +478,210 @@ typedef struct atlas_sem_generation {
 } atlas_sem_generation;
 
 void atlas_sem_generation_init(atlas_sem_generation *g);
+
+/* --- A9.2.5: the verdict every semantic read carries --------------------------
+ *
+ * ## The sentence this section exists for
+ *
+ *   **A SEMANTIC READ THAT FOUND NOTHING HAS NOT ESTABLISHED THAT THERE IS
+ *   NOTHING.**
+ *
+ * A9.2.2 established that for *claims*: `atlas_verify_truth_of` refuses
+ * `ABSENT` unless the coverage dimensions an absence rests on were shown
+ * sufficient. A9.2.3 gave a generation a coverage manifest and A9.2.4 gave it a
+ * discovery verdict. What none of them did was put any of it on the answer to
+ * `callers of X`.
+ *
+ * So until this season every semantic query replied with the rows it found plus
+ * `{freshness, stale_reason, generation_id, indexed_commit}` and stopped. A
+ * caller receiving
+ *
+ *     {"freshness":"CURRENT","nodes":[],"summary":{"emitted":0,...}}
+ *
+ * had nothing in the document telling it the generation had read one source file
+ * out of three — and the repository that produced this season answered exactly
+ * that, with a PROVEN caller sitting in the file the compilation database never
+ * named. The information needed to refuse the conclusion existed, in the same
+ * process, one function away, and was not on the answer.
+ *
+ * ## The asymmetry is A9.2.2's, unchanged, applied one layer out
+ *
+ *   - One row is enough to establish PRESENT. Coverage does not enter into it:
+ *     a caller Atlas *found* exists whatever it failed to look at, and a stale
+ *     generation that found one is still evidence that one existed. Positive
+ *     rows are therefore emitted whatever the trust facts say, and the
+ *     generation they came from is reported beside them so nothing reads as a
+ *     statement about the current tree.
+ *   - Zero rows establish ABSENT only when the universe searched can be shown
+ *     to have been the whole of the relevant one. Anything less is UNKNOWN.
+ *
+ * UNKNOWN is zero, for the reason every Atlas vocabulary keeps its zero there: a
+ * `memset` must not produce an absence proof. */
+typedef enum atlas_sem_verdict {
+    /* Atlas cannot say. Never evidence in either direction. */
+    ATLAS_SEM_VERDICT_UNKNOWN = 0,
+    /* At least one row was found. Establishes existence, never completeness. */
+    ATLAS_SEM_VERDICT_PRESENT,
+    /* Nothing was found, over a universe Atlas can vouch for. */
+    ATLAS_SEM_VERDICT_ABSENT
+} atlas_sem_verdict;
+
+const char *atlas_sem_verdict_name(atlas_sem_verdict v);
+/* False for anything unrecognised — never falls back to a known value, because
+ * defaulting an unparsed verdict to ABSENT is the one error that matters. */
+bool atlas_sem_verdict_parse(const char *name, atlas_sem_verdict *out);
+
+/* Why a read could not settle. Fixed Atlas strings, checked before they are
+ * emitted, never assembled from repository bytes or compiler output — the
+ * discipline every `ATLAS_SEM_*` vocabulary follows.
+ *
+ * Ordered here as `atlas_sem_trust_settle` tests them: the most actionable
+ * answer first, so an operator is told the thing they would fix. */
+#define ATLAS_SEM_UNK_NO_LIBCLANG "this_atlas_was_built_without_libclang"
+#define ATLAS_SEM_UNK_NO_GENERATION                                                                \
+    "no_semantic_generation_has_been_published_for_this_repository"
+#define ATLAS_SEM_UNK_BUILDING "a_semantic_generation_is_being_built_right_now"
+#define ATLAS_SEM_UNK_STALE "the_semantic_generation_does_not_describe_the_current_source"
+#define ATLAS_SEM_UNK_MAINTENANCE                                                                  \
+    "automatic_semantic_maintenance_is_disabled_for_this_repository"
+#define ATLAS_SEM_UNK_SCOPE_UNKNOWN "the_generation_recorded_no_coverage_manifest"
+#define ATLAS_SEM_UNK_DISCOVERY                                                                    \
+    "build_input_discovery_cannot_say_it_found_every_compilation_database"
+#define ATLAS_SEM_UNK_UNITS "a_translation_unit_was_not_fully_described"
+#define ATLAS_SEM_UNK_COVERAGE "the_generation_did_not_cover_every_candidate_source"
+#define ATLAS_SEM_UNK_TRUNCATED "the_query_reached_a_bound_before_it_finished"
+
+bool atlas_sem_unknown_reason_is_known(const char *reason);
+
+/* Which coverage dimension, if any, stops a generation supporting an absence.
+ *
+ * **The one implementation of "is this generation's coverage complete?"**, and
+ * it returns *which* dimension failed rather than a boolean, because the four
+ * are four different problems with four different remedies and a caller that got
+ * `false` could only say "something". `NULL` means complete.
+ *
+ * A9.2.3 put this rule in `coverage_is_complete` in `src/sem/schedule.c` and
+ * A9.2.5 needed it twice more — in the verdict and in the scheduler's hold
+ * reason. Three copies of a rule that decides whether Atlas may state an absence
+ * is exactly the shape this codebase keeps removing, so there is one, and the
+ * others ask it. The order is the order `atlas_sem_trust_settle` reports. */
+const char *atlas_sem_coverage_gap(atlas_sem_scope_discovery scope_discovery,
+                                   atlas_sem_discovery generation_discovery, bool units_complete,
+                                   int64_t scope_uncovered);
+/* Atlas' own copy of a known reason, or NULL. A value that arrived over a socket
+ * is a *matching* string, not Atlas' string — `atlas_sem_why_intern`'s rule. */
+const char *atlas_sem_unknown_reason_intern(const char *reason);
+
+/* Everything a consumer needs in order to decide what a semantic answer is worth,
+ * gathered once and carried on every load-bearing read.
+ *
+ * It is one struct rather than a handful of loose fields because it must appear
+ * **identically** on `symbol`, `callers`, `callees`, `trace`, `impact`,
+ * `context` and `status`, across the CLI's two renderers, the RPC document and
+ * the MCP passthrough. Six surfaces keeping seven fields in step by hand is how
+ * `have_generation` came to be on the RPC document and not the CLI's; one struct
+ * with one writer is how that stops being possible. */
+typedef struct atlas_sem_trust {
+    atlas_sem_verdict verdict;
+    /* An ATLAS_SEM_UNK_* string when `verdict` is UNKNOWN, NULL otherwise. */
+    const char *unknown_reason;
+
+    /* Which generation answered, and what it was built from. Reported even when
+     * the verdict is PRESENT, because positive rows from a stale generation are
+     * evidence about the tree that generation described and about no other. */
+    bool have_generation;
+    int64_t generation_id;
+    char indexed_commit[65];
+    /* The generation's sealed `source_identity`, and the tree's identity now.
+     * Both, because the divergence is the fact — a surface that showed only the
+     * verdict could not say how far behind the index is. Either may be "". */
+    char generation_identity[65];
+    char live_identity[65];
+
+    atlas_sem_freshness freshness;
+    const char *stale_reason; /* an ATLAS_SEM_STALE_* string, or NULL */
+
+    /* A9.2.3's axis, kept separate from freshness for A9.2.3's reason: a
+     * generation can be perfectly current and describe half a tree. */
+    bool coverage_complete;
+    bool units_complete; /* no partial, failed or unsupported translation unit */
+    atlas_sem_scope_discovery scope_discovery;
+    int64_t scope_candidates;
+    int64_t scope_covered;
+    int64_t scope_uncovered;
+
+    /* A9.2.4's axis. Two values, never one: `generation_discovery` is what the
+     * index being served was built under and is what the verdict rests on;
+     * `discovery` is what Atlas can account for now. They differ exactly when a
+     * rebuild is due. */
+    atlas_sem_discovery generation_discovery;
+    atlas_sem_discovery discovery;
+    int64_t inputs_accepted;
+    int64_t inputs_rejected;
+
+    /* The effective activation answer from `atlas_sem_auto_effective`. A
+     * repository nobody maintains drifts, and a consumer is told so rather than
+     * left to infer it from a freshness value that was true a moment ago. */
+    bool auto_maintenance;
+    bool libclang_available;
+} atlas_sem_trust;
+
+void atlas_sem_trust_init(atlas_sem_trust *t);
+
+/* Settles the verdict from the trust facts and what the read actually emitted.
+ *
+ * Pure: it reads `*t`, consults nothing else, and writes only `verdict` and
+ * `unknown_reason`. That is what lets the CLI, the RPC server and the daemon
+ * reach the same verdict because they call one function rather than because
+ * three copies of a rule are kept in step — the property `atlas_sem_freshness_now`
+ * established for the freshness question and this season extends to the verdict.
+ *
+ * `rows_emitted > 0` settles PRESENT and stops. `truncated` matters only when
+ * nothing was emitted: a walk that hit a bound and found nothing has not
+ * searched its universe. */
+void atlas_sem_trust_settle(atlas_sem_trust *t, int64_t rows_emitted, bool truncated);
+
+/* Writes the trust block into an open JSON object, as one fixed set of keys.
+ *
+ * **This is the whole of the parity fix, and it is a placement decision rather
+ * than a helper.** Before A9.2.5 the CLI's renderer and the IPC server were two
+ * independently maintained serializers of the same answers, and they had already
+ * drifted: `have_generation` was on the RPC document and not the CLI's. Adding
+ * fourteen more fields to two writers by hand would have made that certain
+ * rather than likely. Both call this, so the block is identical by construction
+ * and `tests/test_sem_trust.c` can compare them field for field.
+ *
+ * Every value it emits is an Atlas integer, an Atlas boolean, a string from a
+ * checked Atlas vocabulary or a checked hex digest — A2's five kinds. No
+ * repository-controlled byte reaches it, so nothing here needs `atlas_safe`,
+ * and nothing here may be extended with a value that would.
+ *
+ * `atlas_json` is forward-declared rather than included: this header is on the
+ * include path of most of Atlas and does not otherwise need the writer. */
+typedef struct atlas_json atlas_json;
+atlas_status atlas_sem_trust_write_json(atlas_json *j, const atlas_sem_trust *t, atlas_err *err);
+
+/* Gathers every trust fact for one repository's published generation.
+ *
+ * **Replaces `atlas_sem_freshness_now` on the query paths rather than joining
+ * it.** Both compute freshness from the same one pass over the build
+ * description; this one keeps the rest of what that pass already had in hand.
+ * Calling both would read every source hash twice per response, which is the
+ * defect A9.2.3's closure measured and removed.
+ *
+ * It does **not** settle the verdict: only the caller knows how many rows it
+ * emitted, and `atlas_sem_trust_settle` is the one function that decides.
+ *
+ * `running` is the caller's own observation of whether a generation is being
+ * built, for `atlas_sem_freshness_now`'s reason. The `_with_default` form takes
+ * the machine-wide activation answer rather than reading the root-owned policy,
+ * so a test can drive it both ways and a sweep can read the policy once — the
+ * shape `atlas_sem_plan_for_with_default` established, and not a bypass. */
+void atlas_sem_trust_now(atlas_db *db, atlas_repo_info *repo, const atlas_sem_generation *g,
+                         bool have_generation, bool running, atlas_sem_trust *out);
+void atlas_sem_trust_now_with_default(atlas_db *db, atlas_repo_info *repo,
+                                      const atlas_sem_generation *g, bool have_generation,
+                                      bool running, bool policy_default, atlas_sem_trust *out);
 
 /* --- A9.2.3: the durable semantic build description --------------------------
  *
@@ -916,6 +1136,7 @@ typedef struct atlas_sem_live_inputs {
  * which means the same as `known = false`. */
 atlas_sem_freshness atlas_sem_freshness_of(const atlas_sem_generation *g, bool have_generation,
                                            bool running, const char *live_commit,
+                                           const char *live_repo_identity,
                                            const char *live_compdb_digest,
                                            const char *live_source_identity,
                                            const atlas_sem_live_inputs *live_inputs,
@@ -1120,6 +1341,7 @@ typedef struct atlas_sem_impact_report {
     atlas_sem_generation generation;
     atlas_sem_freshness freshness;
     const char *stale_reason;
+    atlas_sem_trust trust; /* A9.2.5 */
     char query[ATLAS_SEM_MAX_NAME_BYTES];
     /* True when the subject named a file rather than a symbol. The two are
      * different questions and the report says which was asked. */
@@ -1184,6 +1406,7 @@ typedef struct atlas_sem_context_report {
     atlas_sem_generation generation;
     atlas_sem_freshness freshness;
     const char *stale_reason;
+    atlas_sem_trust trust; /* A9.2.5 */
     char task[ATLAS_SEM_CONTEXT_MAX_TASK_BYTES];
 
     atlas_sem_item *items;
@@ -1207,6 +1430,18 @@ void atlas_sem_context_report_free(atlas_sem_context_report *r);
 #define ATLAS_SEM_MISSING_SEEDS "no starting path or symbol matched the task"
 #define ATLAS_SEM_MISSING_BUDGET "the byte budget was reached before every item was included"
 #define ATLAS_SEM_MISSING_DECISIONS "no recorded knowledge was found for the files in scope"
+/* A9.2.5. The package could not state its own coverage gaps.
+ *
+ * A context package built from an INCOMPLETE generation stated its budget gaps
+ * and its staleness and said nothing whatever about having read a third of the
+ * tree — and this is the package that goes to a model. Two constants rather than
+ * one, because they are two different holes with two different remedies: the
+ * compilation database names a strict subset of the sources, and Atlas cannot
+ * say it found every compilation database. */
+#define ATLAS_SEM_MISSING_COVERAGE                                                                 \
+    "the semantic index did not cover every candidate source in this repository"
+#define ATLAS_SEM_MISSING_DISCOVERY                                                                \
+    "Atlas cannot say it found every compilation database in this repository"
 
 /* The libclang version string Atlas will record, e.g. "clang version 14.0.6".
  * Read from the library, never from a command's output. */

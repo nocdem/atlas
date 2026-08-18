@@ -1258,6 +1258,7 @@ typedef struct atlas_sem_status_report {
     atlas_sem_generation generation;
     atlas_sem_freshness freshness;
     const char *stale_reason; /* a fixed Atlas string, or NULL */
+    atlas_sem_trust trust;    /* A9.2.5 */
 
     /* The most recent attempt of any status, so a failed index is visible
      * beside the one still being served. */
@@ -1342,6 +1343,11 @@ typedef struct atlas_sem_symbols_report {
     atlas_sem_generation generation;
     atlas_sem_freshness freshness;
     const char *stale_reason;
+    /* A9.2.5. What this answer is worth. `freshness` and `stale_reason` above
+     * are kept because every existing reader uses them and nothing public is
+     * removed; they are also inside `trust`, which is what the renderers and the
+     * IPC server both emit from. */
+    atlas_sem_trust trust;
     char query[ATLAS_SEM_MAX_NAME_BYTES];
     atlas_sem_symbol_item *items;
     size_t count;
@@ -1376,6 +1382,7 @@ typedef struct atlas_sem_graph_report {
     atlas_sem_generation generation;
     atlas_sem_freshness freshness;
     const char *stale_reason;
+    atlas_sem_trust trust; /* A9.2.5 */
     char query[ATLAS_SEM_MAX_NAME_BYTES * 2 + 8];
     bool inbound;
     atlas_sem_graph_item *items;

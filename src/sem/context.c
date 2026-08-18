@@ -493,8 +493,12 @@ atlas_status atlas_sem_impact_on(atlas_db *db, const atlas_repo_info *repo, cons
                              "no semantic index exists for this repository; an operator builds "
                              "one with `atlas code index`");
     }
-    out->freshness = atlas_sem_freshness_now(db, &out->repo, &out->generation, true, false,
-                                             &out->stale_reason);
+    /* A9.2.5. One gatherer, replacing `atlas_sem_freshness_now`: both compute
+     * freshness from the same single pass, and calling both would hash every
+     * source twice per response. */
+    atlas_sem_trust_now(db, &out->repo, &out->generation, true, false, &out->trust);
+    out->freshness = out->trust.freshness;
+    out->stale_reason = out->trust.stale_reason;
     (void)snprintf(out->query, sizeof out->query, "%s", subject);
 
     item_list list = {&out->items, &out->count, &out->cap};
@@ -630,6 +634,12 @@ atlas_status atlas_sem_impact_on(atlas_db *db, const atlas_repo_info *repo, cons
             default:
                 break;
         }
+    }
+    /* A9.2.5. Settled once the item list is final. An impact report is a search
+     * like any other: nothing found over a generation that read a third of the
+     * tree is not evidence that a change reaches nothing. */
+    if (st == ATLAS_OK) {
+        atlas_sem_trust_settle(&out->trust, (int64_t)out->count, out->truncated);
     }
     return st;
 }
@@ -808,11 +818,27 @@ atlas_status atlas_sem_context_on(atlas_db *db, const atlas_repo_info *repo,
     if (!found) {
         note_missing(out, ATLAS_SEM_MISSING_INDEX);
         out->freshness = ATLAS_SEM_FRESH_ABSENT;
+        atlas_sem_trust_init(&out->trust);
+        out->trust.libclang_available = atlas_sem_available();
     } else {
-        out->freshness = atlas_sem_freshness_now(db, &out->repo, &out->generation, true,
-                                                 false, &out->stale_reason);
+        atlas_sem_trust_now(db, &out->repo, &out->generation, true, false, &out->trust);
+        out->freshness = out->trust.freshness;
+        out->stale_reason = out->trust.stale_reason;
         if (out->freshness == ATLAS_SEM_FRESH_STALE) {
             note_missing(out, ATLAS_SEM_MISSING_STALE);
+        }
+        /* A9.2.5. The package states its coverage gaps in the same place it
+         * states its budget gaps, because a reader who cannot see them will read
+         * the space where an item would have been as evidence that no such code
+         * exists. Two notes, not one: an uncovered source and an unfindable
+         * compilation database are different holes with different remedies. */
+        if (out->trust.scope_uncovered > 0 ||
+            out->trust.scope_discovery != ATLAS_SEM_SCOPE_DECLARED ||
+            !out->trust.units_complete) {
+            note_missing(out, ATLAS_SEM_MISSING_COVERAGE);
+        }
+        if (out->trust.generation_discovery != ATLAS_SEM_DISC_COMPLETE) {
+            note_missing(out, ATLAS_SEM_MISSING_DISCOVERY);
         }
     }
 
@@ -950,6 +976,31 @@ atlas_status atlas_sem_context_on(atlas_db *db, const atlas_repo_info *repo,
     }
 
     free(items);
+    /* Settled last, once the item list and the budget flag are final.
+     *
+     * A package is a read rather than a search for one thing, so what its
+     * verdict says is what a *negative* reading of it would be worth: a gap in a
+     * package built from an incomplete generation is not evidence that no such
+     * code exists. A budget that was reached truncates it exactly as a walk
+     * bound truncates a graph query, and settles the same way. */
+    if (st == ATLAS_OK) {
+        /* **The row count that settles this is the *semantic* one.**
+         *
+         * A context package mixes compiler-derived items with recorded knowledge,
+         * and a repository that has never been indexed can still contribute a
+         * decision document. Counting those as "rows found" made a package with
+         * no semantic generation at all settle PRESENT — a verdict about a
+         * semantic read, asserted from rows that are not semantic. `PRESENT`
+         * means "Atlas found a compiler-derived item"; anything else settles on
+         * the trust facts, which for an unindexed repository say NO_GENERATION. */
+        int64_t sem_items = 0;
+        for (size_t i = 0; i < out->count; i++) {
+            if (strcmp(out->items[i].kind, "decision") != 0) {
+                sem_items++;
+            }
+        }
+        atlas_sem_trust_settle(&out->trust, sem_items, out->budget_reached);
+    }
     return st;
 }
 

@@ -1912,12 +1912,32 @@ static void h_sem_plan_block(atlas_renderer *r, const atlas_sem_status_report *r
     FILE *o = r->out;
     const atlas_sem_plan *p = &rep->plan;
     (void)fprintf(o, LABEL "%s\n", "state", atlas_sem_activity_name(p->activity));
+    /* A9.2.5. The same verdict every query answer carries, so an operator reading
+     * `sem-status` and a model reading `code callers` are told the same thing in
+     * the same words. Here it answers "could a negative conclusion rest on this
+     * index right now?" rather than "was anything found", because `sem-status`
+     * reports the index rather than searching it. */
+    (void)fprintf(o, LABEL "%s\n", "supports an absence",
+                  rep->trust.verdict == ATLAS_SEM_VERDICT_ABSENT ? "yes" : "no");
+    if (rep->trust.verdict != ATLAS_SEM_VERDICT_ABSENT &&
+        atlas_sem_unknown_reason_is_known(rep->trust.unknown_reason)) {
+        (void)fprintf(o, LABEL "%s\n", "  why not", rep->trust.unknown_reason);
+    }
     (void)fprintf(o, LABEL "%s\n", "freshness", atlas_sem_freshness_name(p->freshness));
     if (p->stale_reason != NULL) {
         (void)fprintf(o, LABEL "%s\n", "  why", p->stale_reason);
     }
     (void)fprintf(o, LABEL "%s\n", "coverage",
                   p->coverage_complete ? "complete" : "not complete");
+    /* A9.2.5. Which dimension is short, printed next to the verdict rather than
+     * left to be worked out from the numbers below it. */
+    if (atlas_sem_unknown_reason_is_known(p->coverage_gap)) {
+        (void)fprintf(o, LABEL "%s\n", "  gap", p->coverage_gap);
+    }
+    if (p->operator_action_required) {
+        (void)fprintf(o, LABEL "%s\n", "  needs",
+                      "an operator: no automatic rebuild can widen this coverage");
+    }
     (void)fprintf(o, LABEL "%s\n", "  scope discovery",
                   atlas_sem_scope_discovery_name(p->scope_discovery));
     if (p->scope_discovery == ATLAS_SEM_SCOPE_DECLARED) {
@@ -2203,6 +2223,36 @@ static atlas_status h_sem_status(atlas_renderer *r, const atlas_sem_status_repor
     return ATLAS_OK;
 }
 
+/* A9.2.5. The verdict, and — when it is UNKNOWN — the coverage that refused it.
+ *
+ * Printed after the rows, because it is a statement about them. It is never
+ * suppressed: a reader must not have to remember whether the absence of a line
+ * means "Atlas is sure" or "nobody wrote the line". A `0 reached` with no
+ * verdict beneath it is the exact document this season exists to abolish.
+ *
+ * Every value here is an Atlas literal or an Atlas integer, so nothing needs
+ * `atlas_safe` — and nothing that would may be added. */
+static void h_sem_verdict(atlas_renderer *r, const atlas_sem_trust *t) {
+    FILE *o = r->out;
+    (void)fprintf(o, LABEL "%s\n", "verdict", atlas_sem_verdict_name(t->verdict));
+    if (t->verdict == ATLAS_SEM_VERDICT_UNKNOWN &&
+        atlas_sem_unknown_reason_is_known(t->unknown_reason)) {
+        (void)fprintf(o, LABEL "%s\n", "why", t->unknown_reason);
+    }
+    if (t->verdict == ATLAS_SEM_VERDICT_ABSENT) {
+        /* An absence is only ever a claim about the universe that was searched,
+         * so the universe is printed beside it rather than left to be assumed —
+         * A9.2.4's rule about reporting the search universe beside the verdict. */
+        (void)fprintf(o, LABEL "%lld of %lld source files, build inputs %s\n", "searched",
+                      (long long)t->scope_covered, (long long)t->scope_candidates,
+                      atlas_sem_discovery_name(t->generation_discovery));
+    } else if (t->verdict == ATLAS_SEM_VERDICT_UNKNOWN && t->have_generation) {
+        (void)fprintf(o, LABEL "%lld of %lld source files covered, %lld not\n", "coverage",
+                      (long long)t->scope_covered, (long long)t->scope_candidates,
+                      (long long)t->scope_uncovered);
+    }
+}
+
 static void h_sem_freshness_banner(atlas_renderer *r, atlas_sem_freshness f, const char *reason,
                                    const atlas_sem_generation *g) {
     /* Printed before the rows, on every semantic read.
@@ -2225,8 +2275,13 @@ static atlas_status h_sem_symbols(atlas_renderer *r, const atlas_sem_symbols_rep
     (void)fprintf(o, LABEL "%s\n", "repo", rep->repo.name);
     h_sem_freshness_banner(r, rep->freshness, rep->stale_reason, &rep->generation);
     if (rep->count == 0) {
-        (void)fprintf(o, "no symbol named %s is in the semantic index\n",
+        /* "Not in the index" and "not in the repository" are different claims,
+         * and over an incomplete generation Atlas cannot make the second. The
+         * sentence therefore says only what it knows, and the verdict beneath it
+         * says what that is worth. */
+        (void)fprintf(o, "no symbol named %s is in this generation\n",
                       atlas_safe(&r->safe, rep->query));
+        h_sem_verdict(r, &rep->trust);
         return ATLAS_OK;
     }
     for (size_t i = 0; i < rep->count; i++) {
@@ -2250,6 +2305,7 @@ static atlas_status h_sem_symbols(atlas_renderer *r, const atlas_sem_symbols_rep
     if (rep->truncated) {
         (void)fprintf(o, "\n(the result-row bound was reached; more symbols matched)\n");
     }
+    h_sem_verdict(r, &rep->trust);
     return ATLAS_OK;
 }
 
@@ -2303,6 +2359,7 @@ static atlas_status h_sem_graph(atlas_renderer *r, const atlas_sem_graph_report 
         (void)fprintf(o, "truncated: %s\n",
                       s->truncated_reason != NULL ? s->truncated_reason : "a bound was reached");
     }
+    h_sem_verdict(r, &rep->trust);
     return ATLAS_OK;
 }
 
@@ -2392,6 +2449,7 @@ static atlas_status h_sem_impact(atlas_renderer *r, const atlas_sem_impact_repor
                       rep->truncated_reason != NULL ? rep->truncated_reason
                                                     : "a bound was reached");
     }
+    h_sem_verdict(r, &rep->trust);
     return ATLAS_OK;
 }
 
@@ -2448,8 +2506,10 @@ static atlas_status h_sem_context(atlas_renderer *r, const atlas_sem_context_rep
             (void)fprintf(o, "  %s\n", rep->missing[i]);
         }
     }
+    h_sem_verdict(r, &rep->trust);
     return ATLAS_OK;
 }
+
 static atlas_status h_operation_status(atlas_renderer *r, const atlas_operation_report *rep,
                                        atlas_err *err) {
     (void)err;

@@ -104,6 +104,7 @@ set(ATLAS_TESTS
   test_sem
   test_sem_freshness
   test_sem_discovery
+  test_sem_trust
   test_sem_auto
   test_registry
   test_ops
@@ -195,6 +196,7 @@ endforeach()
 set_tests_properties(test_sem PROPERTIES LABELS "integration")
 set_tests_properties(test_sem_freshness PROPERTIES LABELS "integration")
 set_tests_properties(test_sem_discovery PROPERTIES LABELS "integration")
+set_tests_properties(test_sem_trust PROPERTIES LABELS "integration")
 # A live daemon and real MCP sessions, so it belongs to the serialised group.
 set_tests_properties(test_registry PROPERTIES LABELS "daemon")
 set_tests_properties(test_ops PROPERTIES LABELS "daemon")

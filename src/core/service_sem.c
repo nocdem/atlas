@@ -27,6 +27,7 @@
 #include "atlas/sem.h"
 #include "atlas/sem_discover.h"
 #include "atlas/sem_ops.h"
+#include "atlas/syspolicy.h"
 #include "atlas/service.h"
 #include "atlas/unit.h"
 #include "service_internal.h"
@@ -41,7 +42,7 @@
 static atlas_status load_generation(atlas_db *db, atlas_repo_info *repo,
                                     atlas_sem_generation *gen, bool *found,
                                     atlas_sem_freshness *fresh, const char **reason,
-                                    atlas_err *err) {
+                                    atlas_sem_trust *trust, atlas_err *err) {
     atlas_sem_generation_init(gen);
     *fresh = ATLAS_SEM_FRESH_ABSENT;
     *reason = NULL;
@@ -67,7 +68,14 @@ static atlas_status load_generation(atlas_db *db, atlas_repo_info *repo,
      * They did before A9.2.3: each assembled its own arguments and each passed
      * NULL for the digest, which made the compilation-database check
      * unreachable from either. */
-    *fresh = atlas_sem_freshness_now(db, repo, gen, *found, running, reason);
+    /* A9.2.5. One gatherer, replacing `atlas_sem_freshness_now` rather than
+     * joining it: both compute freshness from the same single pass over the
+     * build description, and calling both would hash every source twice per
+     * response. The verdict is left unsettled — only the caller knows what it
+     * emitted. */
+    atlas_sem_trust_now(db, repo, gen, *found, running, trust);
+    *fresh = trust->freshness;
+    *reason = trust->stale_reason;
     return ATLAS_OK;
 }
 
@@ -78,13 +86,13 @@ static atlas_status load_generation(atlas_db *db, atlas_repo_info *repo,
  * about them: build an index, rebuild a stale one, or install libclang. */
 static atlas_status begin_read(atlas_ctx *ctx, const char *name, atlas_repo_info *repo,
                                atlas_sem_generation *gen, atlas_sem_freshness *fresh,
-                               const char **reason, atlas_err *err) {
+                               const char **reason, atlas_sem_trust *trust, atlas_err *err) {
     atlas_status st = atlas_service_require_repo(ctx, name, repo, err);
     if (st != ATLAS_OK) {
         return st;
     }
     bool found = false;
-    st = load_generation(atlas_ctx_db(ctx), repo, gen, &found, fresh, reason, err);
+    st = load_generation(atlas_ctx_db(ctx), repo, gen, &found, fresh, reason, trust, err);
     if (st != ATLAS_OK) {
         return st;
     }
@@ -192,19 +200,38 @@ atlas_status atlas_sem_status_on(atlas_db *db, const char *name, atlas_sem_statu
      * means the two halves of one document could disagree if the tree moved
      * between them. Measured on a repository with two databases totalling 485
      * KiB, the redundant work was most of the command's cost. */
-    st = atlas_sem_plan_for(db, &out->repo, false, &out->plan, err);
-    if (st != ATLAS_OK) {
-        return st;
-    }
-    out->freshness = out->plan.freshness;
-    out->stale_reason = out->plan.stale_reason;
-
+    /* A9.2.5. The generation and the trust block first, then the plan **from
+     * them**. `atlas_sem_plan_for` would otherwise reach `live_facts` a second
+     * time — see `atlas_sem_plan_for_with_trust`. */
     bool found = false;
     st = atlas_db_sem_current(db, out->repo.id, &out->generation, &found, err);
     if (st != ATLAS_OK) {
         return st;
     }
+    atlas_sem_generation latest;
+    bool have_latest = false;
+    st = atlas_db_sem_latest(db, out->repo.id, &latest, &have_latest, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    const bool running = have_latest && latest.status == ATLAS_SEM_GEN_RUNNING;
+
+    atlas_syspolicy pol;
+    atlas_syspolicy_load(&pol);
+    const bool policy_default = atlas_syspolicy_semantic_auto_default(&pol);
+    atlas_sem_trust_now_with_default(db, &out->repo, &out->generation, found, running,
+                                     policy_default, &out->trust);
+    atlas_sem_trust_settle(&out->trust, 0, false);
+
+    st = atlas_sem_plan_for_with_trust(db, &out->repo, false, policy_default, &out->trust,
+                                       &out->plan, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    out->freshness = out->trust.freshness;
+    out->stale_reason = out->trust.stale_reason;
     out->have_generation = found;
+
     atlas_sem_config cfg;
     atlas_sem_config_init(&cfg);
     st = atlas_db_sem_config_get(db, out->repo.id, &cfg, err);
@@ -513,6 +540,7 @@ atlas_status atlas_service_sem_symbol(atlas_ctx *ctx, const char *name, const ch
                                       atlas_sem_symbols_report *out, atlas_err *err) {
     atlas_status st =
         begin_read(ctx, name, &out->repo, &out->generation, &out->freshness, &out->stale_reason,
+                   &out->trust,
                    err);
     if (st != ATLAS_OK) {
         return st;
@@ -523,9 +551,13 @@ atlas_status atlas_service_sem_symbol(atlas_ctx *ctx, const char *name, const ch
     /* A name that resolves to several symbols returns all of them. Choosing one
      * would be inventing — A3's rule about ambiguity, and the reason `code
      * symbol` is how a caller disambiguates before asking for callers. */
-    return atlas_db_sem_symbols_by_name(atlas_ctx_db(ctx), out->generation.id, symbol, NULL, kind,
-                                        limit, take_symbol, &sink, &out->total, &out->truncated,
-                                        err);
+    st = atlas_db_sem_symbols_by_name(atlas_ctx_db(ctx), out->generation.id, symbol, NULL, kind,
+                                      limit, take_symbol, &sink, &out->total, &out->truncated,
+                                      err);
+    if (st == ATLAS_OK) {
+        atlas_sem_trust_settle(&out->trust, (int64_t)out->count, out->truncated);
+    }
+    return st;
 }
 
 /* --- the call graph ------------------------------------------------------------ */
@@ -580,9 +612,17 @@ static atlas_status take_walk(const atlas_sem_walk_row *row, void *ud, atlas_err
  *
  * A caller asking "who calls parse()" when there are three `parse`s must not be
  * given one of them silently. The refusal carries the candidates so the next
- * command can name the right one. */
+ * command can name the right one, and **ambiguity stays a usage error**: it is a
+ * question Atlas cannot answer as asked, which is what exit 2 means.
+ *
+ * A9.2.5 split the *other* refusal out of that class. "No symbol of that name is
+ * in the index" was also ATLAS_ERR_USAGE, and it is not an operator's typo — it
+ * is a statement about what the index holds, and over an incomplete generation
+ * it cannot even be that: the symbol may sit in a file the compilation database
+ * never named. It is reported through `found` and settles as an ordinary
+ * verdict, so a caller is told UNKNOWN rather than being blamed. */
 static atlas_status resolve_one(atlas_ctx *ctx, int64_t gen, const char *symbol, atlas_buf *usr_out,
-                                atlas_err *err) {
+                                bool *found, atlas_err *err) {
     atlas_sem_symbols_report tmp;
     atlas_sem_symbols_report_init(&tmp);
     sym_sink sink = {&tmp, err, ATLAS_OK};
@@ -597,8 +637,10 @@ static atlas_status resolve_one(atlas_ctx *ctx, int64_t gen, const char *symbol,
     }
     if (tmp.count == 0) {
         atlas_sem_symbols_report_free(&tmp);
-        return atlas_err_set(err, ATLAS_ERR_USAGE,
-                             "no symbol named \"%s\" is in the semantic index", symbol);
+        if (found != NULL) {
+            *found = false;
+        }
+        return ATLAS_OK;
     }
 
     /* Distinct entities, not distinct rows: a declaration and its definition
@@ -634,6 +676,9 @@ static atlas_status resolve_one(atlas_ctx *ctx, int64_t gen, const char *symbol,
     }
 
     st = atlas_buf_set_str(usr_out, tmp.items[0].usr, err);
+    if (st == ATLAS_OK && found != NULL) {
+        *found = true;
+    }
     atlas_sem_symbols_report_free(&tmp);
     return st;
 }
@@ -643,6 +688,7 @@ atlas_status atlas_service_sem_graph(atlas_ctx *ctx, const char *name, const cha
                                      atlas_sem_graph_report *out, atlas_err *err) {
     atlas_status st =
         begin_read(ctx, name, &out->repo, &out->generation, &out->freshness, &out->stale_reason,
+                   &out->trust,
                    err);
     if (st != ATLAS_OK) {
         return st;
@@ -651,10 +697,19 @@ atlas_status atlas_service_sem_graph(atlas_ctx *ctx, const char *name, const cha
     out->inbound = inbound;
 
     atlas_buf usr = ATLAS_BUF_INIT;
-    st = resolve_one(ctx, out->generation.id, symbol, &usr, err);
+    bool found = false;
+    st = resolve_one(ctx, out->generation.id, symbol, &usr, &found, err);
     if (st != ATLAS_OK) {
         atlas_buf_free(&usr);
         return st;
+    }
+    if (!found) {
+        /* The subject is not in this generation. That is an empty result set,
+         * not a refusal, and it settles exactly like any other: ABSENT over a
+         * generation that read the whole tree, UNKNOWN over one that did not. */
+        atlas_buf_free(&usr);
+        atlas_sem_trust_settle(&out->trust, 0, false);
+        return ATLAS_OK;
     }
 
     atlas_sem_walk_opts o;
@@ -669,6 +724,9 @@ atlas_status atlas_service_sem_graph(atlas_ctx *ctx, const char *name, const cha
     st = atlas_sem_walk(atlas_ctx_db(ctx), out->generation.id, &o, take_walk, &sink, &out->summary,
                         err);
     atlas_buf_free(&usr);
+    if (st == ATLAS_OK) {
+        atlas_sem_trust_settle(&out->trust, (int64_t)out->count, out->summary.truncated);
+    }
     return st;
 }
 
@@ -677,6 +735,7 @@ atlas_status atlas_service_sem_trace(atlas_ctx *ctx, const char *name, const cha
                                      atlas_err *err) {
     atlas_status st =
         begin_read(ctx, name, &out->repo, &out->generation, &out->freshness, &out->stale_reason,
+                   &out->trust,
                    err);
     if (st != ATLAS_OK) {
         return st;
@@ -686,11 +745,16 @@ atlas_status atlas_service_sem_trace(atlas_ctx *ctx, const char *name, const cha
 
     atlas_buf from_usr = ATLAS_BUF_INIT;
     atlas_buf to_usr = ATLAS_BUF_INIT;
-    st = resolve_one(ctx, out->generation.id, from, &from_usr, err);
+    bool from_found = false;
+    bool to_found = false;
+    st = resolve_one(ctx, out->generation.id, from, &from_usr, &from_found, err);
     if (st == ATLAS_OK) {
-        st = resolve_one(ctx, out->generation.id, to, &to_usr, err);
+        st = resolve_one(ctx, out->generation.id, to, &to_usr, &to_found, err);
     }
-    if (st == ATLAS_OK) {
+    /* Either end missing is an empty path set. A trace between two symbols one
+     * of which this generation never read is precisely the case that must not
+     * read as "there is no path". */
+    if (st == ATLAS_OK && from_found && to_found) {
         walk_sink sink = {out};
         st = atlas_sem_trace(atlas_ctx_db(ctx), out->generation.id, atlas_buf_cstr(&from_usr),
                              atlas_buf_cstr(&to_usr), depth, 1, take_walk, &sink, &out->summary,
@@ -698,6 +762,9 @@ atlas_status atlas_service_sem_trace(atlas_ctx *ctx, const char *name, const cha
     }
     atlas_buf_free(&from_usr);
     atlas_buf_free(&to_usr);
+    if (st == ATLAS_OK) {
+        atlas_sem_trust_settle(&out->trust, (int64_t)out->count, out->summary.truncated);
+    }
     return st;
 }
 

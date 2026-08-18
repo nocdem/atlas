@@ -80,6 +80,7 @@ const char *atlas_sem_hold_intern(const char *reason) {
         ATLAS_SEM_HOLD_DISABLED,          ATLAS_SEM_HOLD_NO_COMPDB,
         ATLAS_SEM_HOLD_BUILDING,          ATLAS_SEM_HOLD_FAILED_UNCHANGED,
         ATLAS_SEM_HOLD_NO_LIBCLANG,       ATLAS_SEM_HOLD_CURRENT,
+        ATLAS_SEM_HOLD_COVERAGE_INCOMPLETE,
         ATLAS_SEM_HOLD_FILE_INDEX,        ATLAS_SEM_HOLD_EXPLICIT_DISABLE,
         ATLAS_SEM_HOLD_POLICY_DEFAULT_OFF, ATLAS_SEM_HOLD_NO_INPUTS,
         ATLAS_SEM_HOLD_NOT_DISCOVERED,
@@ -118,27 +119,24 @@ void atlas_sem_plan_init(atlas_sem_plan *p) {
  * different remedy — a unit that failed to parse, a source the compilation
  * database never named, and an enumeration Atlas cannot vouch for — and every
  * one of them means the generation cannot support "there is no X". */
-static bool coverage_is_complete(const atlas_sem_generation *g) {
-    if (g->discovery != ATLAS_SEM_DISC_COMPLETE) {
-        /* A9.2.4, and it is the fourth different problem folded into this one
-         * boolean: **complete processing of configured inputs does not prove
-         * complete discovery of relevant inputs.** A generation may have parsed
-         * every unit of every database it was given, and covered every source
-         * those databases named, and still have been built without knowing
-         * whether another database exists. Every generation built before this
-         * season reads UNKNOWN here and is conservative for free. */
-        return false;
-    }
-    if (g->scope_discovery != ATLAS_SEM_SCOPE_DECLARED) {
-        /* Includes every generation built before A9.2.3, which recorded no
-         * scope. Conservative by construction rather than by a rule that says
-         * so: a generation with no manifest is not one with a complete one. */
-        return false;
-    }
-    if (g->tu_partial != 0 || g->tu_failed != 0 || g->tu_unsupported != 0) {
-        return false;
-    }
-    return g->scope_uncovered == 0;
+/* A9.2.3's rule, now asked rather than restated.
+ *
+ * `atlas_sem_coverage_gap` is the one implementation, shared with
+ * `atlas_sem_trust_settle`, so a repository the scheduler calls INCOMPLETE and a
+ * query that answers UNKNOWN name the same dimension because they consulted the
+ * same function. Three copies of the rule that decides whether Atlas may state
+ * an absence is exactly what this codebase keeps removing. */
+static const char *coverage_gap_of(const atlas_sem_generation *g) {
+    return atlas_sem_coverage_gap(g->scope_discovery, g->discovery,
+                                  g->tu_partial == 0 && g->tu_failed == 0 &&
+                                      g->tu_unsupported == 0,
+                                  g->scope_uncovered);
+}
+
+atlas_status atlas_sem_plan_for_with_default(atlas_db *db, atlas_repo_info *repo, bool building,
+                                             bool policy_default, atlas_sem_plan *out,
+                                             atlas_err *err) {
+    return atlas_sem_plan_for_with_trust(db, repo, building, policy_default, NULL, out, err);
 }
 
 atlas_status atlas_sem_plan_for(atlas_db *db, atlas_repo_info *repo, bool building,
@@ -153,9 +151,10 @@ atlas_status atlas_sem_plan_for(atlas_db *db, atlas_repo_info *repo, bool buildi
                                            atlas_syspolicy_semantic_auto_default(&pol), out, err);
 }
 
-atlas_status atlas_sem_plan_for_with_default(atlas_db *db, atlas_repo_info *repo, bool building,
-                                             bool policy_default, atlas_sem_plan *out,
-                                             atlas_err *err) {
+atlas_status atlas_sem_plan_for_with_trust(atlas_db *db, atlas_repo_info *repo, bool building,
+                                           bool policy_default,
+                                           const atlas_sem_trust *have_trust,
+                                           atlas_sem_plan *out, atlas_err *err) {
     atlas_sem_plan_init(out);
     if (db == NULL || repo == NULL || out == NULL) {
         return atlas_err_set(err, ATLAS_ERR_INTERNAL, "semantic plan: bad request");
@@ -180,8 +179,22 @@ atlas_status atlas_sem_plan_for_with_default(atlas_db *db, atlas_repo_info *repo
     }
     bool running = building || (have_latest && latest.status == ATLAS_SEM_GEN_RUNNING);
 
-    out->freshness =
-        atlas_sem_freshness_now(db, repo, &gen, found, running, &out->stale_reason);
+    /* A9.2.5. When the caller has already gathered the trust facts — which
+     * `atlas_sem_status_on` has, because it must emit them — the freshness comes
+     * from there rather than being computed a second time.
+     *
+     * Both `atlas_sem_freshness_now` and `atlas_sem_trust_now` reach
+     * `live_facts`, which reads and SHA-256s every accepted compilation database
+     * and every source hash. Calling both in one response is the defect A9.2.3's
+     * closure measured and removed; it came back when the trust block was added
+     * beside the plan instead of in place of it. */
+    if (have_trust != NULL) {
+        out->freshness = have_trust->freshness;
+        out->stale_reason = have_trust->stale_reason;
+    } else {
+        out->freshness =
+            atlas_sem_freshness_now(db, repo, &gen, found, running, &out->stale_reason);
+    }
     if (found) {
         out->generation_id = gen.id;
         (void)snprintf(out->generation_identity, sizeof out->generation_identity, "%s",
@@ -191,7 +204,8 @@ atlas_status atlas_sem_plan_for_with_default(atlas_db *db, atlas_repo_info *repo
         out->scope_candidates = gen.scope_candidates;
         out->scope_covered = gen.scope_covered;
         out->scope_uncovered = gen.scope_uncovered;
-        out->coverage_complete = coverage_is_complete(&gen);
+        out->coverage_gap = coverage_gap_of(&gen);
+        out->coverage_complete = out->coverage_gap == NULL;
     }
 
     /* The tree as it is now, reported whether or not anything is built from it,
@@ -352,7 +366,41 @@ atlas_status atlas_sem_plan_for_with_default(atlas_db *db, atlas_repo_info *repo
         out->hold_reason = ATLAS_SEM_HOLD_FAILED_UNCHANGED;
         return ATLAS_OK;
     }
-    if (out->activity == ATLAS_SEM_ACT_CURRENT || out->activity == ATLAS_SEM_ACT_INCOMPLETE) {
+    if (out->activity == ATLAS_SEM_ACT_INCOMPLETE) {
+        /* A9.2.5. **Not HOLD_CURRENT.**
+         *
+         * It was, and the sentence — "the published generation describes the
+         * current source" — is true and conceals the half that decides whether
+         * any absence over this index means anything. A repository can sit here
+         * for ever: on the repository that produced this season the cause was
+         * the operator's own `--exclude`, which makes discovery PARTIAL, which
+         * makes coverage incomplete, which no rebuild can change.
+         *
+         * Still a hold rather than a build. Rebuilding cannot widen a
+         * compilation database, cannot un-exclude a subtree, and cannot make a
+         * unit that failed on these bytes succeed on them, so scheduling one
+         * would spin without converging — the rebuild storm this season is
+         * required not to create. What changes is that the state is now *named*,
+         * `coverage_gap` says which dimension, and `operator_action_required`
+         * says that waiting will not fix it. */
+        out->hold_reason = ATLAS_SEM_HOLD_COVERAGE_INCOMPLETE;
+        /* **Only the two gaps an automatic pass genuinely cannot close.**
+         *
+         * The header defines this as "true exactly when the repository is held on
+         * something no automatic pass can fix", and two of the four gaps do not
+         * qualify: a generation with no coverage manifest gets one the next time
+         * it publishes, and a transiently failed unit is precisely what §9 of the
+         * season document argues is *not* permanent. Setting the flag for all
+         * four made the human renderer print "an operator: no automatic rebuild
+         * can widen this coverage" in two cases where a rebuild is exactly what
+         * would. */
+        out->operator_action_required =
+            out->coverage_gap != NULL &&
+            (strcmp(out->coverage_gap, ATLAS_SEM_UNK_COVERAGE) == 0 ||
+             strcmp(out->coverage_gap, ATLAS_SEM_UNK_DISCOVERY) == 0);
+        return ATLAS_OK;
+    }
+    if (out->activity == ATLAS_SEM_ACT_CURRENT) {
         out->hold_reason = ATLAS_SEM_HOLD_CURRENT;
         return ATLAS_OK;
     }

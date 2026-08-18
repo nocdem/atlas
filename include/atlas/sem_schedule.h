@@ -126,6 +126,23 @@ const char *atlas_sem_activity_name(atlas_sem_activity a);
 #define ATLAS_SEM_HOLD_FAILED_UNCHANGED "the_last_attempt_failed_and_the_source_has_not_changed_since"
 #define ATLAS_SEM_HOLD_NO_LIBCLANG "this_atlas_was_built_without_libclang"
 #define ATLAS_SEM_HOLD_CURRENT "the_published_generation_describes_the_current_source"
+/* A9.2.5. Source-current, coverage-incomplete — and **not** HOLD_CURRENT.
+ *
+ * Until this season an INCOMPLETE repository was held with HOLD_CURRENT, which
+ * is *true* and conceals the half that matters: the generation does describe the
+ * current source, and it describes a fraction of the repository, and the second
+ * fact is the one that decides whether any absence over it means anything. On
+ * the repository that produced this season the state was permanent and its only
+ * cause was the operator's own `--exclude`, so the one sentence anybody ever saw
+ * about it said the index was fine.
+ *
+ * It is still a hold rather than a rebuild trigger. Rebuilding cannot widen a
+ * compilation database and cannot make a unit that failed on these bytes succeed
+ * on them, so scheduling one would spin. `coverage_gap` on the plan names the
+ * dimension and `rebuild_due` says whether a rebuild would help — which together
+ * are what an operator needs and what a single boolean could never carry. */
+#define ATLAS_SEM_HOLD_COVERAGE_INCOMPLETE                                                         \
+    "the_published_generation_is_source_current_but_its_coverage_is_incomplete"
 /* The file index is what the source identity is computed from, so a semantic
  * generation built while it is behind describes hashes nobody can vouch for and
  * would be stale the moment it published. The reconciliation pass that fixes
@@ -148,6 +165,16 @@ typedef struct atlas_sem_plan {
      * UNKNOWN — three different problems that all mean the same thing about what
      * a negative conclusion may rest on. */
     bool coverage_complete;
+    /* A9.2.5. *Which* dimension is incomplete, from `atlas_sem_coverage_gap` —
+     * one of the ATLAS_SEM_UNK_* strings, or NULL when coverage is complete.
+     * The four are four different problems with four different remedies, and a
+     * boolean could only ever say "something". */
+    const char *coverage_gap;
+    /* A9.2.5. Whether an *operator* has to act for this to improve. True exactly
+     * when the repository is held on something no automatic pass can fix: a
+     * compilation database that names a strict subset of the sources, or a
+     * discovery walk an exclusion or an unreadable directory made PARTIAL. */
+    bool operator_action_required;
     atlas_sem_scope_discovery scope_discovery;
     int64_t scope_candidates;
     int64_t scope_covered;
@@ -226,6 +253,20 @@ atlas_status atlas_sem_plan_for(atlas_db *db, atlas_repo_info *repo, bool buildi
  * a bypass: the parameter is a boolean the caller must have obtained from
  * somewhere, and in the shipped binary every caller obtains it from
  * `atlas_syspolicy_semantic_auto_default`. */
+/* A9.2.5. The same computation when the caller has **already** gathered the trust
+ * facts, so freshness is taken from them rather than recomputed.
+ *
+ * `atlas_sem_freshness_now` and `atlas_sem_trust_now` both reach `live_facts`,
+ * which reads and SHA-256s every accepted compilation database and every source
+ * hash. A surface that needs both a plan and a trust block — `sem-status` is the
+ * only one — must not pay for that twice, and must not risk the two halves of one
+ * document disagreeing if the tree moves between them. `have_trust` may be NULL,
+ * which is the ordinary form. */
+atlas_status atlas_sem_plan_for_with_trust(atlas_db *db, atlas_repo_info *repo, bool building,
+                                           bool policy_default,
+                                           const struct atlas_sem_trust *have_trust,
+                                           atlas_sem_plan *out, atlas_err *err);
+
 atlas_status atlas_sem_plan_for_with_default(atlas_db *db, atlas_repo_info *repo, bool building,
                                              bool policy_default, atlas_sem_plan *out,
                                              atlas_err *err);

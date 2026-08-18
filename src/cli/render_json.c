@@ -1829,12 +1829,12 @@ static atlas_status j_sem_plan(atlas_renderer *r, const atlas_sem_plan *p, atlas
     TRY(atlas_json_key_str_opt(
         r->j, "hold_reason",
         atlas_sem_hold_reason_is_known(p->hold_reason) ? p->hold_reason : NULL, err));
-    TRY(atlas_json_key_bool(r->j, "coverage_complete", p->coverage_complete, err));
-    TRY(atlas_json_key_str(r->j, "scope_discovery",
-                           atlas_sem_scope_discovery_name(p->scope_discovery), err));
-    TRY(atlas_json_key_int(r->j, "scope_candidates", p->scope_candidates, err));
-    TRY(atlas_json_key_int(r->j, "scope_covered", p->scope_covered, err));
-    TRY(atlas_json_key_int(r->j, "scope_uncovered", p->scope_uncovered, err));
+    /* A9.2.5. Which dimension, and whether waiting will fix it. Checked against
+     * Atlas' closed set before it is emitted. */
+    TRY(atlas_json_key_str_opt(
+        r->j, "coverage_gap",
+        atlas_sem_unknown_reason_is_known(p->coverage_gap) ? p->coverage_gap : NULL, err));
+    TRY(atlas_json_key_bool(r->j, "operator_action_required", p->operator_action_required, err));
     TRY(atlas_json_key_bool(r->j, "configured", p->configured, err));
     TRY(atlas_json_key_bool(r->j, "auto_rebuild", p->auto_rebuild, err));
     TRY(atlas_json_key_bool(r->j, "rebuild_due", p->should_build, err));
@@ -1844,7 +1844,6 @@ static atlas_status j_sem_plan(atlas_renderer *r, const atlas_sem_plan *p, atlas
                                err));
     TRY(atlas_json_key_str_opt(r->j, "fail_at", p->fail_at, err));
     TRY(atlas_json_key_str_opt(r->j, "source_identity", p->source_identity, err));
-    TRY(atlas_json_key_str_opt(r->j, "generation_identity", p->generation_identity, err));
 
     /* --- A9.2.4 ---
      *
@@ -1856,13 +1855,8 @@ static atlas_status j_sem_plan(atlas_renderer *r, const atlas_sem_plan *p, atlas
     TRY(atlas_json_key_str(r->j, "auto_intent_by",
                            atlas_sem_intent_source_name(p->auto_intent_by), err));
     TRY(atlas_json_key_bool(r->j, "policy_default", p->policy_default, err));
-    TRY(atlas_json_key_str(r->j, "discovery", atlas_sem_discovery_name(p->discovery), err));
     TRY(atlas_json_key_str(r->j, "discovery_mode",
                            atlas_sem_discovery_mode_name(p->discovery_mode), err));
-    TRY(atlas_json_key_str(r->j, "generation_discovery",
-                           atlas_sem_discovery_name(p->generation_discovery), err));
-    TRY(atlas_json_key_int(r->j, "inputs_accepted", p->inputs_accepted, err));
-    TRY(atlas_json_key_int(r->j, "inputs_rejected", p->inputs_rejected, err));
     TRY(atlas_json_key_str_opt(r->j, "discovered_at", p->discovered_at, err));
     return atlas_json_key_str_opt(
         r->j, "discovery_limit",
@@ -1958,22 +1952,25 @@ static atlas_status j_sem_config(atlas_renderer *r, const atlas_sem_status_repor
     if (rep->have_generation) {
         TRY(j_sem_generation(r, &rep->generation, err));
     }
-    return ATLAS_OK;
+    TRY(ATLAS_OK);
+    /* A9.2.5. `sem-config` reports the same repository state `sem-status` does,
+     * so it carries the same trust block — and must, since the block is where
+     * the coverage and discovery fields now live. */
+    return atlas_sem_trust_write_json(r->j, &rep->trust, err);
 }
 
 static atlas_status j_sem_status(atlas_renderer *r, const atlas_sem_status_report *rep,
                                  atlas_err *err) {
     TRY(atlas_json_key_str(r->j, "repo", rep->repo.name, err));
-    TRY(atlas_json_key_bool(r->j, "libclang_available", rep->libclang_available, err));
+    /* A9.2.5. `libclang_available`, `freshness`, `stale_reason` and
+     * `have_generation` are **not** written here: the trust block at the end of
+     * this document carries them, and `j_sem_plan`'s own rule is that a document
+     * must not carry a key twice. Atlas' own remote parser reads the *first*
+     * occurrence (`yyjson_obj_get` is a linear scan) while `jq` and Python read
+     * the last, so a duplicated key is not merely untidy — it is two consumers
+     * disagreeing about one document. */
     TRY(atlas_json_key_str_opt(r->j, "compiler_id", rep->compiler_id, err));
     TRY(atlas_json_key_str_opt(r->j, "compiler_version", rep->compiler_version, err));
-    TRY(atlas_json_key_str(r->j, "freshness", atlas_sem_freshness_name(rep->freshness), err));
-    /* Checked against Atlas' own closed set before it is emitted, so a value
-     * from anywhere else becomes absent rather than being reproduced. */
-    TRY(atlas_json_key_str_opt(
-        r->j, "stale_reason",
-        atlas_sem_stale_reason_is_known(rep->stale_reason) ? rep->stale_reason : NULL, err));
-    TRY(atlas_json_key_bool(r->j, "have_generation", rep->have_generation, err));
     if (rep->have_generation) {
         TRY(j_sem_generation(r, &rep->generation, err));
     }
@@ -2009,22 +2006,31 @@ static atlas_status j_sem_status(atlas_renderer *r, const atlas_sem_status_repor
         TRY(atlas_json_key_int(r->j, "diagnostics_errors", u->diagnostics_errors, err));
         TRY(atlas_json_obj_end(r->j, err));
     }
-    return atlas_json_arr_end(r->j, err);
+    TRY(atlas_json_arr_end(r->j, err));
+    /* A9.2.5. `sem-status` carries the same block as every query answer, so one
+     * repository is described in one vocabulary wherever it is asked about. */
+    return atlas_sem_trust_write_json(r->j, &rep->trust, err);
 }
 
-static atlas_status j_sem_freshness(atlas_renderer *r, atlas_sem_freshness f, const char *reason,
-                                    const atlas_sem_generation *g, atlas_err *err) {
-    TRY(atlas_json_key_str(r->j, "freshness", atlas_sem_freshness_name(f), err));
-    TRY(atlas_json_key_str_opt(r->j, "stale_reason",
-                               atlas_sem_stale_reason_is_known(reason) ? reason : NULL, err));
-    TRY(atlas_json_key_int(r->j, "generation_id", g->id, err));
-    return atlas_json_key_str_opt(r->j, "indexed_commit", g->commit_id, err);
+/* A9.2.5. The trust block, from the one writer `src/ipc/server_sem.c` also
+ * calls. Every key this renderer used to write by hand — `freshness`,
+ * `stale_reason`, `generation_id`, `indexed_commit` — is still emitted, by that
+ * writer, so nothing public was removed; what changed is that there is one
+ * implementation instead of two that had already drifted apart over
+ * `have_generation`.
+ *
+ * It is written **after** the results rather than before them, and that is
+ * forced rather than chosen: the verdict is a statement about the result set, so
+ * it cannot precede it on a streaming writer. Key order is not a JSON contract
+ * and the guarantee that mattered — that no answer can be read without its
+ * currency — is unchanged, because the block is in the same document. */
+static atlas_status j_sem_trust(atlas_renderer *r, const atlas_sem_trust *t, atlas_err *err) {
+    return atlas_sem_trust_write_json(r->j, t, err);
 }
 
 static atlas_status j_sem_symbols(atlas_renderer *r, const atlas_sem_symbols_report *rep,
                                   atlas_err *err) {
     TRY(atlas_json_key_str(r->j, "repo", rep->repo.name, err));
-    TRY(j_sem_freshness(r, rep->freshness, rep->stale_reason, &rep->generation, err));
     TRY(json_safe(r->j, &r->safe, "query", rep->query, err));
     TRY(atlas_json_key_bool(r->j, "truncated", rep->truncated, err));
     TRY(atlas_json_key(r->j, "symbols", err));
@@ -2050,13 +2056,13 @@ static atlas_status j_sem_symbols(atlas_renderer *r, const atlas_sem_symbols_rep
         TRY(atlas_json_key_str(r->j, "evidence", s->evidence, err));
         TRY(atlas_json_obj_end(r->j, err));
     }
-    return atlas_json_arr_end(r->j, err);
+    TRY(atlas_json_arr_end(r->j, err));
+    return j_sem_trust(r, &rep->trust, err);
 }
 
 static atlas_status j_sem_graph(atlas_renderer *r, const atlas_sem_graph_report *rep,
                                 atlas_err *err) {
     TRY(atlas_json_key_str(r->j, "repo", rep->repo.name, err));
-    TRY(j_sem_freshness(r, rep->freshness, rep->stale_reason, &rep->generation, err));
     TRY(json_safe(r->j, &r->safe, "query", rep->query, err));
     TRY(atlas_json_key_str(r->j, "direction", rep->inbound ? "callers" : "callees", err));
     TRY(atlas_json_key(r->j, "nodes", err));
@@ -2096,7 +2102,8 @@ static atlas_status j_sem_graph(atlas_renderer *r, const atlas_sem_graph_report 
     TRY(atlas_json_key_str_opt(
         r->j, "truncated_reason",
         atlas_sem_trunc_reason_is_known(s->truncated_reason) ? s->truncated_reason : NULL, err));
-    return atlas_json_obj_end(r->j, err);
+    TRY(atlas_json_obj_end(r->j, err));
+    return j_sem_trust(r, &rep->trust, err);
 }
 
 static atlas_status j_sem_indexed(atlas_renderer *r, const atlas_sem_index_summary *sum,
@@ -2168,11 +2175,6 @@ static atlas_status j_sem_items(atlas_renderer *r, const atlas_sem_item *items, 
 static atlas_status j_sem_impact(atlas_renderer *r, const atlas_sem_impact_report *rep,
                                  atlas_err *err) {
     TRY(atlas_json_key_str(r->j, "repo", rep->repo.name, err));
-    TRY(atlas_json_key_str(r->j, "freshness", atlas_sem_freshness_name(rep->freshness), err));
-    TRY(atlas_json_key_str_opt(
-        r->j, "stale_reason",
-        atlas_sem_stale_reason_is_known(rep->stale_reason) ? rep->stale_reason : NULL, err));
-    TRY(atlas_json_key_int(r->j, "generation_id", rep->generation.id, err));
     TRY(json_safe(r->j, &r->safe, "subject", rep->query, err));
     TRY(atlas_json_key_str(r->j, "subject_kind", rep->subject_is_path ? "file" : "symbol", err));
     TRY(atlas_json_key_bool(r->j, "subject_found", rep->subject_found, err));
@@ -2183,21 +2185,17 @@ static atlas_status j_sem_impact(atlas_renderer *r, const atlas_sem_impact_repor
     TRY(atlas_json_key_int(r->j, "lexical", rep->lexical, err));
     TRY(atlas_json_key_int(r->j, "unresolved_indirect", rep->unresolved_indirect, err));
     TRY(atlas_json_key_bool(r->j, "truncated", rep->truncated, err));
-    return atlas_json_key_str_opt(
+    TRY(atlas_json_key_str_opt(
         r->j, "truncated_reason",
         atlas_sem_trunc_reason_is_known(rep->truncated_reason) ? rep->truncated_reason : NULL,
-        err);
+        err));
+    return j_sem_trust(r, &rep->trust, err);
 }
 
 static atlas_status j_sem_context(atlas_renderer *r, const atlas_sem_context_report *rep,
                                   atlas_err *err) {
     TRY(atlas_json_key_str(r->j, "repo", rep->repo.name, err));
     TRY(atlas_json_key_str_opt(r->j, "commit", rep->repo.scanned_head, err));
-    TRY(atlas_json_key_str(r->j, "freshness", atlas_sem_freshness_name(rep->freshness), err));
-    TRY(atlas_json_key_str_opt(
-        r->j, "stale_reason",
-        atlas_sem_stale_reason_is_known(rep->stale_reason) ? rep->stale_reason : NULL, err));
-    TRY(atlas_json_key_int(r->j, "generation_id", rep->generation.id, err));
     /* The task is the caller's own text and is echoed safe-encoded. It is not
      * an instruction Atlas acted on: it ranked evidence and nothing else. */
     TRY(json_safe(r->j, &r->safe, "task", rep->task, err));
@@ -2212,8 +2210,10 @@ static atlas_status j_sem_context(atlas_renderer *r, const atlas_sem_context_rep
     for (size_t i = 0; i < rep->missing_count; i++) {
         TRY(atlas_json_str(r->j, rep->missing[i], err));
     }
-    return atlas_json_arr_end(r->j, err);
+    TRY(atlas_json_arr_end(r->j, err));
+    return j_sem_trust(r, &rep->trust, err);
 }
+
 static atlas_status j_operation_status(atlas_renderer *r, const atlas_operation_report *rep,
                                        atlas_err *err) {
     atlas_json *j = r->j;

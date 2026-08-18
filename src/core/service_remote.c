@@ -2741,6 +2741,96 @@ atlas_status atlas_service_decision_links_remote(const char *repo, const char *u
  * index is 0700 `atlasd`, so an operator's account has no local handle at all
  * and every semantic read is a socket call. */
 
+/* A9.2.5. Reads the trust block back out of the response.
+ *
+ * **Every absent key leaves the conservative value**, and that is the whole
+ * compatibility story: a newer CLI talking to an older daemon finds no
+ * `result_verdict`, no coverage and no discovery, and reports UNKNOWN with
+ * `coverage_complete` false rather than erroring or — far worse — defaulting to
+ * ABSENT. A missing key is Atlas not having been told, which is exactly what
+ * UNKNOWN means. Nothing here refuses a response for lacking a field.
+ *
+ * Every string is parsed against Atlas' own closed set, so a value from anywhere
+ * else leaves the safe default rather than being believed — `take_freshness`'s
+ * rule, applied to four more vocabularies. */
+static void take_trust(const atlas_ipc_response *r, atlas_sem_trust *trust) {
+    const char *v = NULL;
+    int64_t t = 0;
+    bool b = false;
+    atlas_sem_trust_init(trust);
+    if (atlas_ipc_result_str(r, "result_verdict", &v)) {
+        atlas_sem_verdict parsed = ATLAS_SEM_VERDICT_UNKNOWN;
+        if (atlas_sem_verdict_parse(v, &parsed)) {
+            trust->verdict = parsed;
+        }
+    }
+    if (atlas_ipc_result_str(r, "unknown_reason", &v)) {
+        trust->unknown_reason = atlas_sem_unknown_reason_intern(v);
+    }
+    if (atlas_ipc_result_str(r, "freshness", &v)) {
+        for (int f = 0; f <= (int)ATLAS_SEM_FRESH_REBUILDING; f++) {
+            if (strcmp(v, atlas_sem_freshness_name((atlas_sem_freshness)f)) == 0) {
+                trust->freshness = (atlas_sem_freshness)f;
+                break;
+            }
+        }
+    }
+    if (atlas_ipc_result_str(r, "stale_reason", &v)) {
+        trust->stale_reason = atlas_sem_stale_reason_intern(v);
+    }
+    if (atlas_ipc_result_bool(r, "have_generation", &b)) {
+        trust->have_generation = b;
+    }
+    if (atlas_ipc_result_int(r, "generation_id", &t)) {
+        trust->generation_id = t;
+    }
+    if (atlas_ipc_result_str(r, "indexed_commit", &v)) {
+        copy_str(trust->indexed_commit, sizeof trust->indexed_commit, v);
+    }
+    if (atlas_ipc_result_str(r, "generation_identity", &v)) {
+        copy_str(trust->generation_identity, sizeof trust->generation_identity, v);
+    }
+    if (atlas_ipc_result_str(r, "live_identity", &v)) {
+        copy_str(trust->live_identity, sizeof trust->live_identity, v);
+    }
+    if (atlas_ipc_result_bool(r, "coverage_complete", &b)) {
+        trust->coverage_complete = b;
+    }
+    if (atlas_ipc_result_bool(r, "units_complete", &b)) {
+        trust->units_complete = b;
+    }
+    if (atlas_ipc_result_str(r, "scope_discovery", &v)) {
+        (void)atlas_sem_scope_discovery_parse(v, &trust->scope_discovery);
+    }
+    if (atlas_ipc_result_int(r, "scope_candidates", &t)) {
+        trust->scope_candidates = t;
+    }
+    if (atlas_ipc_result_int(r, "scope_covered", &t)) {
+        trust->scope_covered = t;
+    }
+    if (atlas_ipc_result_int(r, "scope_uncovered", &t)) {
+        trust->scope_uncovered = t;
+    }
+    if (atlas_ipc_result_str(r, "generation_discovery", &v)) {
+        (void)atlas_sem_discovery_parse(v, &trust->generation_discovery);
+    }
+    if (atlas_ipc_result_str(r, "discovery", &v)) {
+        (void)atlas_sem_discovery_parse(v, &trust->discovery);
+    }
+    if (atlas_ipc_result_int(r, "inputs_accepted", &t)) {
+        trust->inputs_accepted = t;
+    }
+    if (atlas_ipc_result_int(r, "inputs_rejected", &t)) {
+        trust->inputs_rejected = t;
+    }
+    if (atlas_ipc_result_bool(r, "auto_maintenance", &b)) {
+        trust->auto_maintenance = b;
+    }
+    if (atlas_ipc_result_bool(r, "libclang_available", &b)) {
+        trust->libclang_available = b;
+    }
+}
+
 static void take_freshness(const atlas_ipc_response *r, atlas_sem_generation *gen,
                            atlas_sem_freshness *fresh, const char **reason) {
     const char *v = NULL;
@@ -2811,6 +2901,12 @@ static void read_sem_plan(const atlas_ipc_response *r, atlas_sem_status_report *
     }
     if (atlas_ipc_result_bool(r, "coverage_complete", &b)) {
         p->coverage_complete = b;
+    }
+    if (atlas_ipc_result_str(r, "coverage_gap", &v)) {
+        p->coverage_gap = atlas_sem_unknown_reason_intern(v);
+    }
+    if (atlas_ipc_result_bool(r, "operator_action_required", &b)) {
+        p->operator_action_required = b;
     }
     if (atlas_ipc_result_str(r, "scope_discovery", &v)) {
         if (!atlas_sem_scope_discovery_parse(v, &p->scope_discovery)) {
@@ -3046,6 +3142,7 @@ atlas_status atlas_service_sem_status_remote(const char *name, atlas_sem_status_
         out->have_generation = b;
     }
     take_freshness(r, &out->generation, &out->freshness, &out->stale_reason);
+    take_trust(r, &out->trust);
 
     if (atlas_ipc_result_str(r, "compdb_digest", &v)) {
         copy_str(out->generation.compdb_digest, sizeof out->generation.compdb_digest, v);
@@ -3312,6 +3409,7 @@ atlas_status atlas_service_sem_symbol_remote(const char *name, const char *symbo
         copy_str(out->repo.name, sizeof out->repo.name, v);
     }
     take_freshness(r, &out->generation, &out->freshness, &out->stale_reason);
+    take_trust(r, &out->trust);
     copy_str(out->query, sizeof out->query, symbol);
     if (atlas_ipc_result_bool(r, "truncated", &b)) {
         out->truncated = b;
@@ -3386,6 +3484,7 @@ static void take_graph(const atlas_ipc_response *r, atlas_sem_graph_report *out)
         copy_str(out->repo.name, sizeof out->repo.name, v);
     }
     take_freshness(r, &out->generation, &out->freshness, &out->stale_reason);
+    take_trust(r, &out->trust);
     if (atlas_ipc_result_str(r, "direction", &v)) {
         out->inbound = strcmp(v, "callers") == 0;
     }
@@ -3698,6 +3797,7 @@ atlas_status atlas_service_sem_impact_remote(const char *name, const char *subje
         copy_str(out->repo.name, sizeof out->repo.name, v);
     }
     take_freshness(r, &out->generation, &out->freshness, &out->stale_reason);
+    take_trust(r, &out->trust);
     copy_str(out->query, sizeof out->query, subject);
     if (atlas_ipc_result_str(r, "subject_kind", &v)) {
         out->subject_is_path = strcmp(v, "file") == 0;
@@ -3778,6 +3878,7 @@ atlas_status atlas_service_sem_context_remote(const atlas_sem_context_req *req,
         copy_str(out->repo.scanned_head, sizeof out->repo.scanned_head, v);
     }
     take_freshness(r, &out->generation, &out->freshness, &out->stale_reason);
+    take_trust(r, &out->trust);
     copy_str(out->task, sizeof out->task, req->task);
     if (atlas_ipc_result_int(r, "budget_bytes", &t)) {
         out->budget_bytes = t;
@@ -3794,8 +3895,12 @@ atlas_status atlas_service_sem_context_remote(const atlas_sem_context_req *req,
     size_t n = 0;
     (void)atlas_ipc_result_arr_len(r, "not_included", &n);
     static const char *const MISSING[] = {
-        ATLAS_SEM_MISSING_INDEX, ATLAS_SEM_MISSING_STALE, ATLAS_SEM_MISSING_SEEDS,
-        ATLAS_SEM_MISSING_BUDGET, ATLAS_SEM_MISSING_DECISIONS,
+        ATLAS_SEM_MISSING_INDEX,    ATLAS_SEM_MISSING_STALE,     ATLAS_SEM_MISSING_SEEDS,
+        ATLAS_SEM_MISSING_BUDGET,   ATLAS_SEM_MISSING_DECISIONS,
+        /* A9.2.5. Added here as well as at the producer: a reason that is not in
+         * this set crosses the socket and becomes absent, so a note the daemon
+         * emits and this array does not know is a gap the CLI silently drops. */
+        ATLAS_SEM_MISSING_COVERAGE, ATLAS_SEM_MISSING_DISCOVERY,
     };
     for (size_t i = 0; i < n && out->missing_count < 8u; i++) {
         if (!atlas_ipc_result_arr_str(r, "not_included", i, &v)) {

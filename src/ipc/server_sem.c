@@ -40,8 +40,10 @@ static atlas_status write_sem_plan_fields(dispatch_state *ds, const atlas_sem_st
  * tell an answer about the current code from one about code that has since
  * changed, and those must never be indistinguishable. */
 static atlas_status open_generation(dispatch_state *ds, atlas_repo_info *info,
-                                    atlas_sem_generation *gen, bool *found, atlas_err *err) {
+                                    atlas_sem_generation *gen, bool *found,
+                                    atlas_sem_trust *trust, atlas_err *err) {
     atlas_sem_generation_init(gen);
+    atlas_sem_trust_init(trust);
     atlas_status st = atlas_db_sem_current(ds->db, info->id, gen, found, err);
     if (st != ATLAS_OK) {
         return st;
@@ -55,34 +57,27 @@ static atlas_status open_generation(dispatch_state *ds, atlas_repo_info *info,
     }
     bool running = have_latest && latest.status == ATLAS_SEM_GEN_RUNNING;
 
-    /* A9.2.3. One implementation of the freshness question, shared with the
-     * local CLI path: the daemon schedules a rebuild by noticing that a
-     * generation is stale, so a check that never fires is a repository that
-     * never rebuilds — and a check that fires on one surface and not the other
-     * is two answers to one question. */
-    const char *reason = NULL;
-    atlas_sem_freshness f = atlas_sem_freshness_now(ds->db, info, gen, *found, running, &reason);
+    /* A9.2.3's rule, A9.2.5's gatherer. One implementation of the freshness
+     * question, shared with the local CLI path — the daemon schedules a rebuild
+     * by noticing that a generation is stale, so a check that fires on one
+     * surface and not the other is two answers to one question. `trust` carries
+     * the rest of what that same pass already established, and the verdict is
+     * settled by the caller once it knows what it emitted. */
+    atlas_sem_trust_now(ds->db, info, gen, *found, running, trust);
 
-    st = atlas_json_key_str(ds->j, "repo", info->name, err);
-    if (st == ATLAS_OK) {
-        st = atlas_json_key_str(ds->j, "freshness", atlas_sem_freshness_name(f), err);
-    }
-    if (st == ATLAS_OK) {
-        /* Checked against Atlas' own closed set before it crosses the socket,
-         * so a value from anywhere else becomes absent rather than reproduced. */
-        st = atlas_json_key_str_opt(ds->j, "stale_reason",
-                                    atlas_sem_stale_reason_is_known(reason) ? reason : NULL, err);
-    }
-    if (st == ATLAS_OK) {
-        st = atlas_json_key_bool(ds->j, "have_generation", *found, err);
-    }
-    if (st == ATLAS_OK) {
-        st = atlas_json_key_int(ds->j, "generation_id", gen->id, err);
-    }
-    if (st == ATLAS_OK) {
-        st = atlas_json_key_str_opt(ds->j, "indexed_commit", gen->commit_id, err);
-    }
-    return st;
+    /* Only `repo` is written here now. The trust block — which still contains
+     * every key this function used to emit — is written at the end of the
+     * document by `close_generation`, because a verdict about a result set
+     * cannot precede the result set on a streaming writer. */
+    return atlas_json_key_str(ds->j, "repo", info->name, err);
+}
+
+/* Settles the verdict and writes the trust block, from the one writer the CLI
+ * renderer also calls. Every query method ends with this. */
+static atlas_status close_generation(dispatch_state *ds, atlas_sem_trust *trust,
+                                     int64_t rows_emitted, bool truncated, atlas_err *err) {
+    atlas_sem_trust_settle(trust, rows_emitted, truncated);
+    return atlas_sem_trust_write_json(ds->j, trust, err);
 }
 
 /* Shared preamble for the query methods: resolve the repository from the
@@ -90,14 +85,14 @@ static atlas_status open_generation(dispatch_state *ds, atlas_repo_info *info,
  * an empty result — "nobody has indexed this" and "this has no symbols" are
  * different answers. */
 static atlas_status begin(dispatch_state *ds, const atlas_ipc_request *req, atlas_repo_info *info,
-                          atlas_sem_generation *gen, atlas_err *err) {
+                          atlas_sem_generation *gen, atlas_sem_trust *trust, atlas_err *err) {
     atlas_repo_info_init(info);
     atlas_status st = atlas_server_require_repo(ds, req, info, err);
     if (st != ATLAS_OK) {
         return st;
     }
     bool found = false;
-    st = open_generation(ds, info, gen, &found, err);
+    st = open_generation(ds, info, gen, &found, trust, err);
     if (st != ATLAS_OK) {
         return st;
     }
@@ -147,11 +142,9 @@ static atlas_status method_sem_status(dispatch_state *ds, const atlas_ipc_reques
         return st;
     }
 
-    /* Whether this Atlas can build an index at all. Reported rather than
-     * discovered by a caller when indexing silently produces nothing. */
-    if (st == ATLAS_OK) {
-        st = atlas_json_key_bool(ds->j, "libclang_available", atlas_sem_available(), err);
-    }
+    /* A9.2.5. `libclang_available` used to be written here — "whether this Atlas
+     * can build an index at all". It is in the trust block at the end of the
+     * document now, because a document must not carry a key twice. */
     if (st == ATLAS_OK) {
         st = atlas_json_key_str_opt(ds->j, "compiler_version", atlas_sem_compiler_version(), err);
     }
@@ -181,27 +174,14 @@ static atlas_status method_sem_status(dispatch_state *ds, const atlas_ipc_reques
     const atlas_sem_generation gen = rep.generation;
     const bool found = rep.have_generation;
 
-    /* Freshness first, always. A caller that read the rows without it could not
-     * tell an answer about the current code from one about code that has since
-     * changed, and those must never be indistinguishable. */
+    /* A9.2.5. `freshness`, `stale_reason`, `have_generation` and `generation_id`
+     * are no longer written here. They are in the trust block this method now
+     * ends with, from the one writer the CLI renderer also calls, so
+     * `sem-status` describes a repository in the same vocabulary every query
+     * answer uses. Nothing was removed from the document; only its position
+     * moved, and key order is not a JSON contract. */
     if (st == ATLAS_OK) {
         st = atlas_json_key_str(ds->j, "repo", info.name, err);
-    }
-    if (st == ATLAS_OK) {
-        st = atlas_json_key_str(ds->j, "freshness", atlas_sem_freshness_name(rep.freshness), err);
-    }
-    if (st == ATLAS_OK) {
-        /* Checked against Atlas' own closed set before it crosses the socket,
-         * so a value from anywhere else becomes absent rather than reproduced. */
-        st = atlas_json_key_str_opt(
-            ds->j, "stale_reason",
-            atlas_sem_stale_reason_is_known(rep.stale_reason) ? rep.stale_reason : NULL, err);
-    }
-    if (st == ATLAS_OK) {
-        st = atlas_json_key_bool(ds->j, "have_generation", found, err);
-    }
-    if (st == ATLAS_OK) {
-        st = atlas_json_key_int(ds->j, "generation_id", gen.id, err);
     }
     if (st == ATLAS_OK) {
         st = atlas_json_key_str_opt(ds->j, "indexed_commit", gen.commit_id, err);
@@ -223,6 +203,17 @@ static atlas_status method_sem_status(dispatch_state *ds, const atlas_ipc_reques
     }
 
     if (st != ATLAS_OK || !found) {
+        /* A9.2.5. The trust block goes on **this** path too.
+         *
+         * A repository Atlas has never indexed is the case where a caller most
+         * needs to be told what the answer is worth, and it is the one an early
+         * return is most likely to skip — which it did: moving `freshness` and
+         * `generation_id` into the block left this branch emitting neither, so a
+         * fresh repository reported no currency at all over the socket. The same
+         * shape as the bug the comment above describes, one season later. */
+        if (st == ATLAS_OK) {
+            st = atlas_sem_trust_write_json(ds->j, &rep.trust, err);
+        }
         atlas_sem_status_report_free(&rep);
         atlas_repo_info_free(&info);
         return st;
@@ -356,6 +347,10 @@ static atlas_status method_sem_status(dispatch_state *ds, const atlas_ipc_reques
     if (st == ATLAS_OK) {
         st = atlas_json_arr_end(ds->j, err);
     }
+    if (st == ATLAS_OK) {
+        /* A9.2.5. The trust block, already settled by `atlas_sem_status_on`. */
+        st = atlas_sem_trust_write_json(ds->j, &rep.trust, err);
+    }
     atlas_sem_status_report_free(&rep);
     atlas_repo_info_free(&info);
     return st;
@@ -419,7 +414,8 @@ static atlas_status method_sem_symbol(dispatch_state *ds, const atlas_ipc_reques
                                       atlas_err *err) {
     atlas_repo_info info;
     atlas_sem_generation gen;
-    atlas_status st = begin(ds, req, &info, &gen, err);
+    atlas_sem_trust trust;
+    atlas_status st = begin(ds, req, &info, &gen, &trust, err);
     if (st != ATLAS_OK) {
         atlas_repo_info_free(&info);
         return st;
@@ -456,6 +452,9 @@ static atlas_status method_sem_symbol(dispatch_state *ds, const atlas_ipc_reques
     }
     if (st == ATLAS_OK) {
         st = atlas_json_key_bool(ds->j, "truncated", trunc, err);
+    }
+    if (st == ATLAS_OK) {
+        st = close_generation(ds, &trust, total, trunc, err);
     }
     atlas_repo_info_free(&info);
     return st;
@@ -571,7 +570,7 @@ static atlas_status write_walk_summary(dispatch_state *ds, const atlas_sem_walk_
  * given one of them silently. The refusal says how many there are so the caller
  * can disambiguate with `sem.symbol`. */
 static atlas_status one_usr(dispatch_state *ds, int64_t gen_id, const char *name,
-                            atlas_buf *usr_out, atlas_err *err);
+                            atlas_buf *usr_out, bool *found, atlas_err *err);
 
 typedef struct pick_sink {
     atlas_buf *usr;
@@ -600,8 +599,20 @@ static atlas_status pick_usr(const atlas_sem_symbol_row *row, void *ud, atlas_er
     return atlas_buf_append(&p->seen, row->usr, strlen(row->usr) + 1, err);
 }
 
+/* A9.2.5. `found` rather than a usage error for "no such symbol".
+ *
+ * The local twin `resolve_one` in `src/core/service_sem.c` was changed and this
+ * one was not, which made the season's headline rule — *a symbol that is not in
+ * the index is not a usage error* — true locally and false on the socket. Under
+ * A7.1 the socket is the operator's only path on a deployed machine, and MCP
+ * forwards `atlas_sem_callers`/`callees`/`trace` straight through here, so the
+ * surface where it was false is the surface every model and every deployed
+ * operator uses.
+ *
+ * **Ambiguity stays a usage error**: a name resolving to three symbols is a
+ * question Atlas cannot answer as asked. */
 static atlas_status one_usr(dispatch_state *ds, int64_t gen_id, const char *name,
-                            atlas_buf *usr_out, atlas_err *err) {
+                            atlas_buf *usr_out, bool *found, atlas_err *err) {
     pick_sink p;
     memset(&p, 0, sizeof(p));
     p.usr = usr_out;
@@ -617,14 +628,19 @@ static atlas_status one_usr(dispatch_state *ds, int64_t gen_id, const char *name
         return st;
     }
     if (distinct == 0) {
-        return atlas_err_set(err, ATLAS_ERR_USAGE,
-                             "no symbol by that name is in the semantic index");
+        if (found != NULL) {
+            *found = false;
+        }
+        return ATLAS_OK;
     }
     if (distinct > 1) {
         return atlas_err_set(err, ATLAS_ERR_USAGE,
                              "that name resolves to %zu distinct symbols; ask sem.symbol for the "
                              "candidates and pass an exact \"usr\"",
                              distinct);
+    }
+    if (found != NULL) {
+        *found = true;
     }
     return ATLAS_OK;
 }
@@ -634,31 +650,37 @@ static atlas_status one_usr(dispatch_state *ds, int64_t gen_id, const char *name
  * produced, not a path and not a name, so accepting one opens nothing. */
 static atlas_status target_usr(dispatch_state *ds, const atlas_ipc_request *req, int64_t gen_id,
                                const char *symbol_key, const char *usr_key, atlas_buf *out,
-                               atlas_err *err) {
+                               bool *found, atlas_err *err) {
+    if (found != NULL) {
+        *found = true;
+    }
     const char *usr = NULL;
     if (atlas_ipc_param_str(req, usr_key, &usr) && usr[0] != '\0') {
         return atlas_buf_set_str(out, usr, err);
     }
     const char *name = NULL;
     if (!atlas_ipc_param_str(req, symbol_key, &name) || name[0] == '\0') {
+        /* A malformed request, not an empty answer: exit 2 is right here. */
         return atlas_err_set(err, ATLAS_ERR_USAGE, "this method needs \"%s\" or \"%s\"",
                              symbol_key, usr_key);
     }
-    return one_usr(ds, gen_id, name, out, err);
+    return one_usr(ds, gen_id, name, out, found, err);
 }
 
 static atlas_status method_sem_graph(dispatch_state *ds, const atlas_ipc_request *req,
                                      atlas_err *err) {
     atlas_repo_info info;
     atlas_sem_generation gen;
-    atlas_status st = begin(ds, req, &info, &gen, err);
+    atlas_sem_trust trust;
+    atlas_status st = begin(ds, req, &info, &gen, &trust, err);
     if (st != ATLAS_OK) {
         atlas_repo_info_free(&info);
         return st;
     }
 
     atlas_buf usr = ATLAS_BUF_INIT;
-    st = target_usr(ds, req, gen.id, "symbol", "usr", &usr, err);
+    bool subject_found = false;
+    st = target_usr(ds, req, gen.id, "symbol", "usr", &usr, &subject_found, err);
     if (st != ATLAS_OK) {
         atlas_buf_free(&usr);
         atlas_repo_info_free(&info);
@@ -694,7 +716,10 @@ static atlas_status method_sem_graph(dispatch_state *ds, const atlas_ipc_request
     }
     atlas_sem_walk_summary sum;
     memset(&sum, 0, sizeof(sum));
-    if (st == ATLAS_OK) {
+    if (st == ATLAS_OK && subject_found) {
+        /* A subject this generation does not hold is an empty result set, not a
+         * refusal — and it settles like any other: ABSENT over a generation that
+         * read the whole tree, UNKNOWN over one that did not. */
         walk_sink sink = {ds};
         st = atlas_sem_walk(ds->db, gen.id, &o, write_walk, &sink, &sum, err);
     }
@@ -703,6 +728,9 @@ static atlas_status method_sem_graph(dispatch_state *ds, const atlas_ipc_request
     }
     if (st == ATLAS_OK) {
         st = write_walk_summary(ds, &sum, err);
+    }
+    if (st == ATLAS_OK) {
+        st = close_generation(ds, &trust, sum.emitted, sum.truncated, err);
     }
     atlas_buf_free(&usr);
     atlas_repo_info_free(&info);
@@ -713,7 +741,8 @@ static atlas_status method_sem_trace(dispatch_state *ds, const atlas_ipc_request
                                      atlas_err *err) {
     atlas_repo_info info;
     atlas_sem_generation gen;
-    atlas_status st = begin(ds, req, &info, &gen, err);
+    atlas_sem_trust trust;
+    atlas_status st = begin(ds, req, &info, &gen, &trust, err);
     if (st != ATLAS_OK) {
         atlas_repo_info_free(&info);
         return st;
@@ -721,9 +750,11 @@ static atlas_status method_sem_trace(dispatch_state *ds, const atlas_ipc_request
 
     atlas_buf from = ATLAS_BUF_INIT;
     atlas_buf to = ATLAS_BUF_INIT;
-    st = target_usr(ds, req, gen.id, "from", "from_usr", &from, err);
+    bool from_found = false;
+    bool to_found = false;
+    st = target_usr(ds, req, gen.id, "from", "from_usr", &from, &from_found, err);
     if (st == ATLAS_OK) {
-        st = target_usr(ds, req, gen.id, "to", "to_usr", &to, err);
+        st = target_usr(ds, req, gen.id, "to", "to_usr", &to, &to_found, err);
     }
     if (st != ATLAS_OK) {
         atlas_buf_free(&from);
@@ -743,7 +774,10 @@ static atlas_status method_sem_trace(dispatch_state *ds, const atlas_ipc_request
     }
     atlas_sem_walk_summary sum;
     memset(&sum, 0, sizeof(sum));
-    if (st == ATLAS_OK) {
+    if (st == ATLAS_OK && from_found && to_found) {
+        /* Either end missing is an empty path set. A trace between two symbols
+         * one of which this generation never read must not read as "there is no
+         * path". */
         walk_sink sink = {ds};
         st = atlas_sem_trace(ds->db, gen.id, atlas_buf_cstr(&from), atlas_buf_cstr(&to), depth, 1,
                              write_walk, &sink, &sum, err);
@@ -753,6 +787,9 @@ static atlas_status method_sem_trace(dispatch_state *ds, const atlas_ipc_request
     }
     if (st == ATLAS_OK) {
         st = write_walk_summary(ds, &sum, err);
+    }
+    if (st == ATLAS_OK) {
+        st = close_generation(ds, &trust, sum.emitted, sum.truncated, err);
     }
     atlas_buf_free(&from);
     atlas_buf_free(&to);
@@ -874,12 +911,11 @@ static atlas_status method_sem_impact(dispatch_state *ds, const atlas_ipc_reques
         st = atlas_json_key_str(ds->j, "repo", rep.repo.name, err);
     }
     if (st == ATLAS_OK) {
-        st = atlas_json_key_str(ds->j, "freshness", atlas_sem_freshness_name(rep.freshness), err);
-    }
-    if (st == ATLAS_OK) {
-        st = atlas_json_key_int(ds->j, "generation_id", rep.generation.id, err);
-    }
-    if (st == ATLAS_OK) {
+        /* A9.2.5. `freshness` and `generation_id` are no longer written here:
+         * they are in the trust block this method now ends with, from the one
+         * writer the CLI renderer also calls. Under A7.1 the socket is the only
+         * path on a deployed machine, so a surface that skipped the block would
+         * leave every remote reader at conservative UNKNOWN for ever. */
         st = atlas_json_key_str_opt(ds->j, "subject", atlas_safe(&ds->safe, rep.query), err);
     }
     if (st == ATLAS_OK) {
@@ -907,6 +943,11 @@ static atlas_status method_sem_impact(dispatch_state *ds, const atlas_ipc_reques
     }
     if (st == ATLAS_OK) {
         st = atlas_json_key_bool(ds->j, "truncated", rep.truncated, err);
+    }
+    if (st == ATLAS_OK) {
+        /* The verdict is already settled by `atlas_sem_impact_on`, which is the
+         * only place that knows what the report holds. */
+        st = atlas_sem_trust_write_json(ds->j, &rep.trust, err);
     }
     atlas_sem_impact_report_free(&rep);
     return st;
@@ -951,12 +992,7 @@ static atlas_status method_sem_context(dispatch_state *ds, const atlas_ipc_reque
         st = atlas_json_key_str_opt(ds->j, "commit", rep.repo.scanned_head, err);
     }
     if (st == ATLAS_OK) {
-        st = atlas_json_key_str(ds->j, "freshness", atlas_sem_freshness_name(rep.freshness), err);
-    }
-    if (st == ATLAS_OK) {
-        st = atlas_json_key_int(ds->j, "generation_id", rep.generation.id, err);
-    }
-    if (st == ATLAS_OK) {
+        /* A9.2.5. In the trust block at the end of this method — see sem.impact. */
         st = atlas_json_key_str_opt(ds->j, "task", atlas_safe(&ds->safe, rep.task), err);
     }
     if (st == ATLAS_OK) {
@@ -984,6 +1020,9 @@ static atlas_status method_sem_context(dispatch_state *ds, const atlas_ipc_reque
     }
     if (st == ATLAS_OK) {
         st = atlas_json_arr_end(ds->j, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_sem_trust_write_json(ds->j, &rep.trust, err);
     }
     atlas_sem_context_report_free(&rep);
     return st;
@@ -1037,7 +1076,13 @@ static atlas_status write_sem_plan_fields(dispatch_state *ds, const atlas_sem_st
             atlas_sem_hold_reason_is_known(p->hold_reason) ? p->hold_reason : NULL, err);
     }
     if (st == ATLAS_OK) {
-        st = atlas_json_key_bool(ds->j, "coverage_complete", p->coverage_complete, err);
+        st = atlas_json_key_str_opt(
+            ds->j, "coverage_gap",
+            atlas_sem_unknown_reason_is_known(p->coverage_gap) ? p->coverage_gap : NULL, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(ds->j, "operator_action_required", p->operator_action_required,
+                                 err);
     }
     if (st == ATLAS_OK) {
         st = atlas_json_key_bool(ds->j, "configured", p->configured, err);
@@ -1062,11 +1107,15 @@ static atlas_status write_sem_plan_fields(dispatch_state *ds, const atlas_sem_st
     if (st == ATLAS_OK) {
         st = atlas_json_key_str_opt(ds->j, "source_identity", p->source_identity, err);
     }
-    if (st == ATLAS_OK) {
-        st = atlas_json_key_str_opt(ds->j, "generation_identity", p->generation_identity, err);
-    }
 
-    /* --- A9.2.4 ---
+    /* A9.2.5. `coverage_complete`, `discovery`, `generation_discovery`,
+     * `inputs_accepted`, `inputs_rejected` and `generation_identity` are no
+     * longer written here: the trust block at the end of the document carries
+     * them, and a document must not carry a key twice. Atlas' own remote parser
+     * takes the *first* occurrence while jq and Python take the last, so a
+     * duplicate is two consumers disagreeing about one document.
+     *
+     * --- A9.2.4 ---
      *
      * The activation intent and its provenance travel beside the effective
      * boolean rather than instead of it, because `auto_rebuild = false` is one
@@ -1092,21 +1141,8 @@ static atlas_status write_sem_plan_fields(dispatch_state *ds, const atlas_sem_st
         st = atlas_json_key_bool(ds->j, "policy_default", p->policy_default, err);
     }
     if (st == ATLAS_OK) {
-        st = atlas_json_key_str(ds->j, "discovery", atlas_sem_discovery_name(p->discovery), err);
-    }
-    if (st == ATLAS_OK) {
         st = atlas_json_key_str(ds->j, "discovery_mode",
                                 atlas_sem_discovery_mode_name(p->discovery_mode), err);
-    }
-    if (st == ATLAS_OK) {
-        st = atlas_json_key_str(ds->j, "generation_discovery",
-                                atlas_sem_discovery_name(p->generation_discovery), err);
-    }
-    if (st == ATLAS_OK) {
-        st = atlas_json_key_int(ds->j, "inputs_accepted", p->inputs_accepted, err);
-    }
-    if (st == ATLAS_OK) {
-        st = atlas_json_key_int(ds->j, "inputs_rejected", p->inputs_rejected, err);
     }
     if (st == ATLAS_OK) {
         st = atlas_json_key_str_opt(ds->j, "discovered_at", p->discovered_at, err);
@@ -1243,20 +1279,21 @@ static atlas_status write_sem_plan_fields(dispatch_state *ds, const atlas_sem_st
 
 atlas_status atlas_server_write_sem_config(dispatch_state *ds, const atlas_sem_status_report *rep,
                                            atlas_err *err) {
-    const atlas_sem_plan *p = &rep->plan;
     atlas_status st = atlas_json_key_str(ds->j, "repo", rep->repo.name, err);
     if (st == ATLAS_OK) {
-        st = atlas_json_key_str(ds->j, "freshness", atlas_sem_freshness_name(p->freshness), err);
-    }
-    if (st == ATLAS_OK) {
-        /* Checked against Atlas' own closed set before it crosses the socket,
-         * so a value from anywhere else becomes absent rather than reproduced. */
-        st = atlas_json_key_str_opt(
-            ds->j, "stale_reason",
-            atlas_sem_stale_reason_is_known(p->stale_reason) ? p->stale_reason : NULL, err);
-    }
-    if (st == ATLAS_OK) {
         st = write_sem_plan_fields(ds, rep, err);
+    }
+    if (st == ATLAS_OK) {
+        /* A9.2.5. `sem-config` carries the trust block too.
+         *
+         * It reports the same repository state `sem-status` does, so it gets the
+         * same vocabulary — and it *must*, now that the block is where
+         * `coverage_complete`, `discovery`, `generation_discovery`,
+         * `inputs_accepted`, `inputs_rejected` and `generation_identity` live.
+         * Removing those from `write_sem_plan_fields` as duplicates of the block
+         * silently stripped them from this method, which has no block of its own;
+         * `tests/test_sem_auto.c` caught it by asserting on `inputs_accepted`. */
+        st = atlas_sem_trust_write_json(ds->j, &rep->trust, err);
     }
     return st;
 }

@@ -245,6 +245,26 @@ atlas_status atlas_db_sem_inputs_get(atlas_db *db, int64_t repo_id, struct atlas
  * `sem_repo_config`'s argument, and A4's before it. */
 atlas_status atlas_db_sem_inputs_forget(atlas_db *db, int64_t repo_id, atlas_err *err);
 
+/* --- A9.2.5: where a walk could not look ------------------------------------
+ *
+ * Replaced whole in the caller's transaction, for `atlas_db_sem_inputs_replace`'s
+ * reason: a row left behind describes a place Atlas is no longer asserting
+ * anything about, and the list must be able to shrink to nothing when a
+ * directory's permissions are repaired.
+ *
+ * The reason is interned on the way in *and* on the way out, so what reaches an
+ * operator is Atlas' own literal whatever the row holds. `truncated_out` is set
+ * when the store has more than the caller asked for, because a list trimmed
+ * without saying so is the invisible hole this table exists to close. */
+struct atlas_sem_obstacle;
+atlas_status atlas_db_sem_obstacles_replace(atlas_db *db, int64_t repo_id,
+                                            const struct atlas_sem_obstacle *obstacles,
+                                            size_t count, const char *discovered_at,
+                                            atlas_err *err);
+atlas_status atlas_db_sem_obstacles_get(atlas_db *db, int64_t repo_id,
+                                        struct atlas_sem_obstacle *out, size_t max,
+                                        size_t *count_out, bool *truncated_out, atlas_err *err);
+
 /* --- writing a generation's contents ---------------------------------------- */
 
 atlas_status atlas_db_sem_compdb_add(atlas_db *db, int64_t generation_id, const char *path_text,

@@ -456,6 +456,10 @@ atlas_status atlas_sem_discovery_run(atlas_db *db, atlas_repo_info *repo,
 
     st = atlas_db_begin(db, err);
     if (st == ATLAS_OK) {
+        st = atlas_db_sem_obstacles_replace(db, repo->id, out->obstacles, out->obstacle_count,
+                                            out->discovered_at, err);
+    }
+    if (st == ATLAS_OK) {
         st = atlas_db_sem_inputs_replace(db, repo->id, out->inputs, out->count, out->discovered_at,
                                          err);
     }

@@ -322,7 +322,11 @@ static void wind_back_to_schema_12(env *e, atlas_err *err) {
         /* A9.2.4's columns and its candidate table go for the same reason:
          * migration 19 adds them, so a database wound back past 19 must not
          * still hold them or the re-run fails on a duplicate column. */
-        "DROP TABLE sem_build_inputs;"
+        /* A9.2.5's table, dropped first: a rewind that leaves a later
+              * migration's table behind is not a database at the version it
+              * claims, and migration 20 would then fail to create it. */
+             "DROP TABLE sem_discovery_obstacles;"
+             "DROP TABLE sem_build_inputs;"
         "ALTER TABLE sem_generations DROP COLUMN discovery;"
         "ALTER TABLE sem_generations DROP COLUMN input_count;"
         "ALTER TABLE sem_generations DROP COLUMN scope_excluded;"

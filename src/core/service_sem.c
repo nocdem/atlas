@@ -121,6 +121,9 @@ void atlas_sem_status_report_free(atlas_sem_status_report *r) {
     free(r->inputs);
     r->inputs = NULL;
     r->input_count = 0;
+    free(r->obstacles);
+    r->obstacles = NULL;
+    r->obstacle_count = 0;
 }
 
 typedef struct unit_sink {
@@ -233,6 +236,24 @@ atlas_status atlas_sem_status_on(atlas_db *db, const char *name, atlas_sem_statu
     }
     st = atlas_db_sem_inputs_get(db, out->repo.id, out->inputs,
                                  ATLAS_SEM_DISCOVERY_MAX_CANDIDATES, &out->input_count, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+
+    /* A9.2.5. Every place the walk could not account for, with its exact path.
+     *
+     * The same argument as the rejected candidates one line above, applied to
+     * directories rather than files: an obstacle nobody is shown is
+     * indistinguishable from a subtree that holds nothing, and A9.2.4 kept only
+     * the first reason and no path at all. */
+    out->obstacles = calloc(ATLAS_SEM_DISCOVERY_MAX_OBSTACLES, sizeof(*out->obstacles));
+    if (out->obstacles == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                             "out of memory reading the discovery obstacles");
+    }
+    st = atlas_db_sem_obstacles_get(db, out->repo.id, out->obstacles,
+                                    ATLAS_SEM_DISCOVERY_MAX_OBSTACLES, &out->obstacle_count,
+                                    &out->obstacles_truncated, err);
     if (st != ATLAS_OK) {
         return st;
     }

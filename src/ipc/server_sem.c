@@ -1167,6 +1167,37 @@ static atlas_status write_sem_plan_fields(dispatch_state *ds, const atlas_sem_st
         st = atlas_json_arr_end(ds->j, err);
     }
 
+    /* A9.2.5. Where the walk could not look, with the exact path. Same shape and
+     * same key names as the CLI renderer, so one consumer reads both. */
+    if (st == ATLAS_OK) {
+        st = atlas_json_key(ds->j, "discovery_obstacles", err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_arr_begin(ds->j, err);
+    }
+    for (size_t i = 0; i < rep->obstacle_count && st == ATLAS_OK; i++) {
+        const struct atlas_sem_obstacle *ob = &rep->obstacles[i];
+        st = atlas_json_obj_begin(ds->j, err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(ds->j, "path", atlas_safe(&ds->safe, ob->path), err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str_opt(
+                ds->j, "reason",
+                atlas_sem_obstacle_reason_is_known(ob->reason) ? ob->reason : NULL, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_obj_end(ds->j, err);
+        }
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_arr_end(ds->j, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(ds->j, "discovery_obstacles_truncated",
+                                 rep->obstacles_truncated, err);
+    }
+
     /* The declared lists, each element its own string. Sent as arrays rather
      * than as the newline-joined storage form: a client must not have to parse
      * a separator to find out what an operator configured. */

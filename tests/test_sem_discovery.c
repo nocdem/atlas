@@ -345,6 +345,184 @@ static void test_a_malformed_database_is_visible_and_recovers(void) {
     env_close(&e);
 }
 
+/* --- A9.2.5 / GAP-3: every obstacle, with its exact path ---------------------
+ *
+ * A9.2.4 kept the *first* reason a walk fell short and no path at all, so one
+ * declared `--exclude` consumed the only slot and masked every unreadable
+ * directory for the rest of the walk. On `/opt/atlas` itself that is exactly
+ * what happened: `discovery_limit` read "an operator excluded a subtree from the
+ * search" and nothing could say what else had been missed. */
+
+static const atlas_sem_obstacle *find_obstacle(const atlas_sem_discovery_result *r,
+                                               const char *path) {
+    for (size_t i = 0; i < r->obstacle_count; i++) {
+        if (strcmp(r->obstacles[i].path, path) == 0) {
+            return &r->obstacles[i];
+        }
+    }
+    return NULL;
+}
+
+static void test_an_unreadable_directory_is_recorded_with_its_path(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    env e;
+    env_open(&e, &err);
+
+    T_OK(fx_mkdir(fx_repo(&e.fx), "secret", &err), &err);
+    T_OK(fx_write(fx_repo(&e.fx), "secret/compile_commands.json", "[]", &err), &err);
+    write_compdb_at(&e, "compile_commands.json", "src/a.c", &err);
+    /* Unreadable to this process. If the suite is running as root the mode is
+     * ignored, so the test skips rather than asserting something untrue. */
+    T_OK(fx_chmod(fx_repo(&e.fx), "secret", 0000, &err), &err);
+
+    atlas_sem_discovery_result r;
+    discover(&e, &r, &err);
+
+    if (geteuid() == 0) {
+        T_CHECK_MSG(true, "running as root: a 0000 directory is still readable, so skipped");
+    } else {
+        T_CHECK_MSG(r.state == ATLAS_SEM_DISC_PARTIAL,
+                    "a directory Atlas could not enter must make the search PARTIAL");
+        const atlas_sem_obstacle *ob = find_obstacle(&r, "secret");
+        T_CHECK_MSG(ob != NULL,
+                    "the unreadable directory must be recorded by its exact path, not merely "
+                    "counted (%zu obstacles recorded)",
+                    r.obstacle_count);
+        if (ob != NULL) {
+            T_CHECK_MSG(strcmp(ob->reason, ATLAS_SEM_OBSTACLE_UNREADABLE_DIR) == 0,
+                        "expected the unreadable-directory reason, got %s", ob->reason);
+            T_CHECK(atlas_sem_obstacle_reason_is_known(ob->reason));
+        }
+        /* The walk carries on: the readable database beside it is still found. */
+        T_CHECK_MSG(find_input(&r, "compile_commands.json") != NULL,
+                    "an unreadable directory must not abandon the rest of the walk");
+    }
+    /* Restore, so the fixture can be removed. */
+    (void)fx_chmod(fx_repo(&e.fx), "secret", 0755, &err);
+    env_close(&e);
+}
+
+static void test_an_exclusion_does_not_mask_a_later_obstacle(void) {
+    /* The defect this whole table exists for. Both obstacles must be present and
+     * neither may hide the other, whichever the walk met first. */
+    atlas_err err;
+    atlas_err_init(&err);
+    env e;
+    env_open(&e, &err);
+
+    T_OK(fx_mkdir(fx_repo(&e.fx), "vendor", &err), &err);
+    T_OK(fx_write(fx_repo(&e.fx), "vendor/compile_commands.json", "[]", &err), &err);
+    T_OK(fx_mkdir(fx_repo(&e.fx), "zlocked", &err), &err);
+    T_OK(fx_write(fx_repo(&e.fx), "zlocked/compile_commands.json", "[]", &err), &err);
+    write_compdb_at(&e, "compile_commands.json", "src/a.c", &err);
+    T_OK(fx_chmod(fx_repo(&e.fx), "zlocked", 0000, &err), &err);
+
+    const char *excl[] = {"vendor"};
+    configure(&e, excl, 1, ATLAS_SEM_DISCMODE_AUTOMATIC, &err);
+
+    atlas_sem_discovery_result r;
+    discover(&e, &r, &err);
+
+    const atlas_sem_obstacle *ex = find_obstacle(&r, "vendor");
+    T_CHECK_MSG(ex != NULL, "the excluded subtree must be recorded by path");
+    if (ex != NULL) {
+        T_CHECK(strcmp(ex->reason, ATLAS_SEM_OBSTACLE_EXCLUDED) == 0);
+    }
+    if (geteuid() != 0) {
+        const atlas_sem_obstacle *lk = find_obstacle(&r, "zlocked");
+        T_CHECK_MSG(lk != NULL,
+                    "an exclusion must not consume the only slot and hide an unreadable "
+                    "directory — the A9.2.4 defect (%zu obstacles recorded)",
+                    r.obstacle_count);
+        if (lk != NULL) {
+            T_CHECK(strcmp(lk->reason, ATLAS_SEM_OBSTACLE_UNREADABLE_DIR) == 0);
+        }
+    }
+    /* The one-line summary is still produced, because existing readers use it. */
+    T_CHECK(r.limit_reached && r.limit_detail[0] != '\0');
+
+    (void)fx_chmod(fx_repo(&e.fx), "zlocked", 0755, &err);
+    env_close(&e);
+}
+
+static void test_obstacles_are_persisted_and_deterministic(void) {
+    /* Persisted by the same transaction that records the candidates, read back
+     * in the walk's own order, and stable across two walks over an unchanged
+     * tree whatever order `readdir` returned entries in. */
+    atlas_err err;
+    atlas_err_init(&err);
+    env e;
+    env_open(&e, &err);
+
+    T_OK(fx_mkdir(fx_repo(&e.fx), "aaa", &err), &err);
+    T_OK(fx_mkdir(fx_repo(&e.fx), "mmm", &err), &err);
+    T_OK(fx_mkdir(fx_repo(&e.fx), "zzz", &err), &err);
+    write_compdb_at(&e, "compile_commands.json", "src/a.c", &err);
+    const char *excl[] = {"aaa", "mmm", "zzz"};
+    configure(&e, excl, 3, ATLAS_SEM_DISCMODE_AUTOMATIC, &err);
+
+    atlas_sem_discovery_result r1;
+    discover(&e, &r1, &err);
+    T_CHECK_MSG(r1.obstacle_count == 3, "expected three excluded subtrees, got %zu",
+                r1.obstacle_count);
+    /* Sorted by path, so the order does not depend on the filesystem. */
+    T_CHECK(strcmp(r1.obstacles[0].path, "aaa") == 0);
+    T_CHECK(strcmp(r1.obstacles[1].path, "mmm") == 0);
+    T_CHECK(strcmp(r1.obstacles[2].path, "zzz") == 0);
+
+    atlas_sem_obstacle stored[ATLAS_SEM_DISCOVERY_MAX_OBSTACLES];
+    size_t n = 0;
+    bool trunc = true;
+    T_OK(atlas_db_sem_obstacles_get(e.db, e.repo_id, stored,
+                                    ATLAS_SEM_DISCOVERY_MAX_OBSTACLES, &n, &trunc, &err),
+         &err);
+    T_CHECK_MSG(n == 3, "the obstacle list must be persisted, got %zu rows", n);
+    T_CHECK(!trunc);
+    for (size_t i = 0; i < n && i < 3; i++) {
+        T_CHECK(strcmp(stored[i].path, r1.obstacles[i].path) == 0);
+        T_CHECK(atlas_sem_obstacle_reason_is_known(stored[i].reason));
+    }
+
+    /* A second walk over the same tree produces the same list — and replaces
+     * rather than appends, which is what lets the list shrink to nothing when a
+     * directory's permissions are repaired. */
+    atlas_sem_discovery_result r2;
+    discover(&e, &r2, &err);
+    T_CHECK(r2.obstacle_count == r1.obstacle_count);
+    size_t n2 = 0;
+    T_OK(atlas_db_sem_obstacles_get(e.db, e.repo_id, stored,
+                                    ATLAS_SEM_DISCOVERY_MAX_OBSTACLES, &n2, NULL, &err),
+         &err);
+    T_CHECK_MSG(n2 == 3, "a second walk must replace the list, not append to it (got %zu)", n2);
+
+    /* Withdrawing the exclusions empties the list: "Atlas met no obstacle" is a
+     * statement it must be able to make, and the only honest record of a
+     * repaired directory is the row's absence. */
+    configure(&e, (const char *const *)NULL, 0, ATLAS_SEM_DISCMODE_AUTOMATIC, &err);
+    {
+        atlas_sem_config cfg;
+        atlas_sem_config_init(&cfg);
+        T_OK(atlas_db_sem_config_get(e.db, e.repo_id, &cfg, &err), &err);
+        cfg.repo_id = e.repo_id;
+        atlas_buf_reset(&cfg.excludes);
+        T_OK(atlas_db_sem_config_set(e.db, &cfg, &err), &err);
+        atlas_sem_config_free(&cfg);
+    }
+    atlas_sem_discovery_result r3;
+    discover(&e, &r3, &err);
+    size_t n3 = 1;
+    T_OK(atlas_db_sem_obstacles_get(e.db, e.repo_id, stored,
+                                    ATLAS_SEM_DISCOVERY_MAX_OBSTACLES, &n3, NULL, &err),
+         &err);
+    T_CHECK_MSG(n3 == 0, "withdrawing every exclusion must empty the obstacle list (got %zu)",
+                n3);
+    T_CHECK_MSG(r3.state == ATLAS_SEM_DISC_COMPLETE,
+                "a walk that met no obstacle must be COMPLETE");
+
+    env_close(&e);
+}
+
 /* --- §7: an excluded subtree is a hole in the universe, and it is shown ------- */
 
 static void test_an_exclusion_makes_the_search_partial(void) {
@@ -613,6 +791,12 @@ static const atlas_test TESTS[] = {
      test_a_symlinked_database_is_not_a_second_input},
     {"a malformed database is visible and recovers",
      test_a_malformed_database_is_visible_and_recovers},
+    {"an unreadable directory is recorded with its exact path",
+     test_an_unreadable_directory_is_recorded_with_its_path},
+    {"an exclusion does not mask a later obstacle",
+     test_an_exclusion_does_not_mask_a_later_obstacle},
+    {"obstacles are persisted, ordered and replaced whole",
+     test_obstacles_are_persisted_and_deterministic},
     {"an exclusion makes the search partial", test_an_exclusion_makes_the_search_partial},
     {"manual mode never claims a complete search",
      test_manual_mode_never_claims_a_complete_search},

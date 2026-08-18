@@ -175,6 +175,10 @@ static void build_schema6(const char *path, atlas_err *err) {
              /* Migration 11's tables, children before parents, and A9.2.3's row
               * with them: a rewind that leaves a later migration's table behind
               * is not a database at the version it claims. */
+             /* A9.2.5's table, dropped first: a rewind that leaves a later
+              * migration's table behind is not a database at the version it
+              * claims, and migration 20 would then fail to create it. */
+             "DROP TABLE sem_discovery_obstacles;"
              "DROP TABLE sem_build_inputs;"
              "DROP TABLE sem_repo_config;"
              "DROP TABLE sem_includes;"
@@ -234,7 +238,7 @@ static void test_a_populated_schema_six_database_reaches_seven_losslessly(void) 
      * table without renumbering a row — is asserted below and is unaffected by
      * later migrations running on top of it. */
     T_EQ_INT(atlas_db_schema_version(db, &err), ATLAS_SCHEMA_VERSION);
-    T_EQ_INT(ATLAS_SCHEMA_VERSION, 19);
+    T_EQ_INT(ATLAS_SCHEMA_VERSION, 20);
 
     atlas_buf after = ATLAS_BUF_INIT;
     text_of(db,

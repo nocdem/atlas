@@ -3617,6 +3617,54 @@ static const char M19_STATEMENTS_SQL[] =
 
 static const char *const M19_STATEMENTS[] = {M19_STATEMENTS_SQL, NULL};
 
+/* --- migration 20: where a discovery walk could not look ----------------------
+ *
+ * A9.2.4 recorded one reason a walk fell short, pathless, and only the first
+ * one. `sem_repo_config.discovery_limit` is that scalar. On the repository that
+ * produced A9.2.5 it read `an operator excluded a subtree from the search` —
+ * true, first, and therefore the only thing anybody could ever see: every
+ * directory the daemon's uid could not enter after that point was invisible.
+ *
+ * "Something was missed" without "what" is not something an operator can act on,
+ * and a hole nobody can see is precisely what A9.2.4 exists to end. So the
+ * obstacles get a table of their own, each with the exact path it is about.
+ *
+ * Additive: one new table and one index. Nothing is rebuilt, no column is
+ * dropped, no existing value is rewritten, and foreign keys stay enforced
+ * throughout — so this is rollback-safe in the only sense that matters, that an
+ * interrupted apply leaves a database migration 19 still describes. An older
+ * database opens with an empty obstacle list, which reads as *Atlas has not
+ * recorded any*, and the walk that runs next fills it.
+ *
+ * Not prunable by age, for the reason `sem_build_inputs` is not: a half-aged
+ * obstacle list is not a smaller search, it is a wrong one — and this table's
+ * whole purpose is to say what was *not* looked at. Dropping rows from it by age
+ * would silently restore the invisibility it removes. */
+static const char M20_STATEMENTS_SQL[] =
+    "CREATE TABLE sem_discovery_obstacles ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    /* Soft reference, like `sem_build_inputs.repo_id` and for the same reason:
+     * `repositories.id` is a reused rowid. Deleted on `repo remove`. */
+    "  repo_id INTEGER NOT NULL,"
+    /* The walk's own order, so a reader sees the list the walk produced rather
+     * than one a query planner chose. */
+    "  seq INTEGER NOT NULL,"
+    /* Repository-relative and `%XX`-encoded — the representation every path
+     * Atlas reports uses, and the answer to the objection that a
+     * repository-chosen path must not reach an operator. "." is the root. */
+    "  path_text TEXT NOT NULL,"
+    /* A fixed Atlas string from the ATLAS_SEM_OBSTACLE_* set, checked on the way
+     * in and on the way out. Never a strerror string, never a path, and never
+     * the two concatenated: a reason an operator reads must stay a value Atlas
+     * owns. */
+    "  reason TEXT NOT NULL,"
+    "  discovered_at TEXT NOT NULL DEFAULT '',"
+    "  UNIQUE(repo_id, seq)"
+    ");"
+    "CREATE INDEX idx_sem_discovery_obstacles_repo ON sem_discovery_obstacles(repo_id, seq);";
+
+static const char *const M20_STATEMENTS[] = {M20_STATEMENTS_SQL, NULL};
+
 static const atlas_migration MIGRATIONS[] = {
     {1, "initial schema", M1_STATEMENTS, false},
     {2, "worktree identity", M2_STATEMENTS, false},
@@ -3665,6 +3713,13 @@ static const atlas_migration MIGRATIONS[] = {
      * See the M19 comment for why a stored 0 becomes UNSET and never DISABLED. */
     {19, "build-input discovery, and an activation intent that records who expressed it",
      M19_STATEMENTS, false},
+    /* Additive: one new table and one index. No table is rebuilt, so foreign
+     * keys stay enforced and no pre-existing value is rewritten. An older
+     * database opens with an empty obstacle list, which reads as "Atlas has not
+     * recorded any" rather than "there were none" — the distinction this whole
+     * season is about. */
+    {20, "where a build-input discovery walk could not look, with the exact path",
+     M20_STATEMENTS, false},
 };
 
 const atlas_migration *atlas_migrations(size_t *count_out) {

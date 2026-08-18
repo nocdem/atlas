@@ -94,7 +94,7 @@ static void test_migration_creates_the_a2_tables(void) {
      * The A2 tables below
      * are asserted unchanged across all of them, which is the property this
      * test is really for. */
-    T_EQ_INT(ATLAS_SCHEMA_VERSION, 19);
+    T_EQ_INT(ATLAS_SCHEMA_VERSION, 20);
 
     static const char *const TABLES[] = {
         "ai_clients",       "ai_sessions",       "ai_session_repos",     "ai_session_events",

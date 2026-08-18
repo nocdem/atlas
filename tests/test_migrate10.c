@@ -142,6 +142,10 @@ static void test_a_schema_nine_database_reaches_ten_additively(void) {
              /* A9.2.3's row goes with the rest of the semantic layer: a rewind
               * that leaves a later migration's table behind is not a database at
               * the version it claims. */
+             /* A9.2.5's table, dropped first: a rewind that leaves a later
+              * migration's table behind is not a database at the version it
+              * claims, and migration 20 would then fail to create it. */
+             "DROP TABLE sem_discovery_obstacles;"
              "DROP TABLE sem_build_inputs;"
              "DROP TABLE sem_repo_config;"
              "DROP TABLE sem_includes;"

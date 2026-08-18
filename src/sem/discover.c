@@ -171,6 +171,59 @@ static void note_partial(walk_state *w, const char *detail) {
     (void)snprintf(w->out->limit_detail, sizeof w->out->limit_detail, "%s", detail);
 }
 
+/* A9.2.5. Records one obstacle **with the path it is about**.
+ *
+ * `note_partial` above keeps its one-line summary because existing readers
+ * consume it, and it is still the *first* reason — but it is no longer the only
+ * thing recorded, which is the defect. A single `--exclude` used to consume the
+ * one slot and mask every unreadable directory for the rest of the walk.
+ *
+ * The path is `%XX`-encoded, exactly as a rejected candidate's is: the argument
+ * that a repository-chosen path must not reach an operator was already answered
+ * by `encode_rel`, twelve lines from here, for files. The reason stays a
+ * separate column and is never concatenated into the path — a value an operator
+ * reads must stay one Atlas owns.
+ *
+ * Reaching the bound is itself reported. A list silently trimmed would recreate
+ * the invisible hole this exists to close. */
+static void note_obstacle(walk_state *w, const char *rel_text, const char *reason) {
+    w->out->state = ATLAS_SEM_DISC_PARTIAL;
+    const char *path = rel_text != NULL && rel_text[0] != '\0' ? rel_text : ".";
+
+    /* Deduplicated on `(path, reason)`, and that is not tidiness.
+     *
+     * Two of the call sites are inside the `readdir` loop and fire per *entry*:
+     * one directory holding forty unrepresentable names would otherwise consume
+     * all thirty-two slots with thirty-two byte-identical rows and hide every
+     * other obstacle in the tree. That is the A9.2.4 failure mode — one reason
+     * consuming the only slot — with the slot count raised from one to
+     * thirty-two rather than the masking removed. Bounded linear scan over at
+     * most `ATLAS_SEM_DISCOVERY_MAX_OBSTACLES` entries. */
+    for (size_t i = 0; i < w->out->obstacle_count; i++) {
+        if (strcmp(w->out->obstacles[i].path, path) == 0 &&
+            strcmp(w->out->obstacles[i].reason, reason) == 0) {
+            return;
+        }
+    }
+    if (w->out->obstacle_count >= ATLAS_SEM_DISCOVERY_MAX_OBSTACLES) {
+        w->out->obstacles_truncated = true;
+        return;
+    }
+    atlas_sem_obstacle *o = &w->out->obstacles[w->out->obstacle_count++];
+    /* The repository root itself is the empty relative path; naming it "." is
+     * what an operator would type. */
+    (void)snprintf(o->path, sizeof o->path, "%s", path);
+    (void)snprintf(o->reason, sizeof o->reason, "%s", reason);
+}
+
+/* Both, in the order a reader wants them: the exact place first, then the
+ * one-line summary that existing surfaces already print. */
+static void note_partial_at(walk_state *w, const char *rel_text, const char *reason,
+                            const char *detail) {
+    note_obstacle(w, rel_text, reason);
+    note_partial(w, detail);
+}
+
 /* Finds an existing candidate by reported path, or appends one.
  *
  * Returns NULL when the candidate ceiling is reached, having recorded the limit:
@@ -187,7 +240,7 @@ static atlas_sem_input *intern_path(walk_state *w, const char *path) {
         (void)snprintf(detail, sizeof detail,
                        "more than %d candidate compilation databases were found",
                        ATLAS_SEM_DISCOVERY_MAX_CANDIDATES);
-        note_partial(w, detail);
+        note_partial_at(w, path, ATLAS_SEM_OBSTACLE_CANDIDATES, detail);
         w->stop = true;
         return NULL;
     }
@@ -452,15 +505,32 @@ static bool encode_rel(const char *raw, size_t len, char out[ATLAS_SEM_MAX_PATH_
     return ok;
 }
 
-static void walk_dir(walk_state *w, int dir_fd, const char *rel, size_t rel_len, int depth);
+static void walk_dir(walk_state *w, int dir_fd, const char *rel, size_t rel_len,
+                     const char *rel_text, int depth);
 
 static void descend(walk_state *w, int dir_fd, const char *name, const char *rel, size_t rel_len,
-                    int depth) {
+                    const char *rel_text, int depth) {
+    /* The child's encoded path first, so every obstacle below can name the place
+     * it is about. A9.2.4 recorded these reasons without a path on the grounds
+     * that a path is bytes a repository chose — but `encode_rel` is the answer to
+     * that and every accepted and rejected candidate already carries one. */
+    char child[ATLAS_SEM_MAX_PATH_BYTES];
+    int n = rel_len == 0 ? snprintf(child, sizeof child, "%s", name)
+                         : snprintf(child, sizeof child, "%s/%s", rel, name);
+    char child_text[ATLAS_SEM_MAX_PATH_BYTES];
+    bool named = n > 0 && (size_t)n < sizeof child &&
+                 encode_rel(child, (size_t)n, child_text);
+
     if (depth + 1 > ATLAS_SEM_DISCOVERY_MAX_DEPTH) {
         char detail[128];
         (void)snprintf(detail, sizeof detail, "the directory walk reached its depth ceiling of %d",
                        ATLAS_SEM_DISCOVERY_MAX_DEPTH);
-        note_partial(w, detail);
+        note_partial_at(w, named ? child_text : rel_text, ATLAS_SEM_OBSTACLE_DEPTH, detail);
+        return;
+    }
+    if (!named) {
+        note_partial_at(w, rel_text, ATLAS_SEM_OBSTACLE_PATH_TOO_LONG,
+                        "a directory path exceeded the path ceiling");
         return;
     }
     /* `O_NOFOLLOW` on the descent is the whole traversal argument: a symlinked
@@ -470,22 +540,15 @@ static void descend(walk_state *w, int dir_fd, const char *name, const char *rel
     if (fd < 0) {
         /* Unreadable, a symlink, or not a directory after all. Atlas did not look
          * inside, so the universe it can vouch for is smaller than the one it set
-         * out to cover — which is exactly what PARTIAL means, and the reason is
-         * recorded because a hole nobody can see is the thing this season exists
-         * to end. Not the path: a path is bytes a repository chose, and this
-         * string reaches an operator and a model. */
-        note_partial(w, "a directory could not be entered, so its contents are unaccounted for");
+         * out to cover — which is exactly what PARTIAL means. **With the path**,
+         * since A9.2.5: "a directory could not be entered" without saying which
+         * is not something an operator can act on, and on the repository that
+         * produced this season it was masked entirely by an earlier reason. */
+        note_partial_at(w, child_text, ATLAS_SEM_OBSTACLE_UNREADABLE_DIR,
+                        "a directory could not be entered, so its contents are unaccounted for");
         return;
     }
-    char child[ATLAS_SEM_MAX_PATH_BYTES];
-    int n = rel_len == 0 ? snprintf(child, sizeof child, "%s", name)
-                         : snprintf(child, sizeof child, "%s/%s", rel, name);
-    if (n < 0 || (size_t)n >= sizeof child) {
-        (void)close(fd);
-        note_partial(w, "a directory path exceeded the path ceiling");
-        return;
-    }
-    walk_dir(w, fd, child, (size_t)n, depth + 1);
+    walk_dir(w, fd, child, (size_t)n, child_text, depth + 1);
     (void)close(fd);
 }
 
@@ -497,18 +560,21 @@ static void descend(walk_state *w, int dir_fd, const char *name, const char *rel
 #define WALK_MAX_SUBDIRS 256
 #define WALK_MAX_NAME 256
 
-static void walk_dir(walk_state *w, int dir_fd, const char *rel, size_t rel_len, int depth) {
+static void walk_dir(walk_state *w, int dir_fd, const char *rel, size_t rel_len,
+                     const char *rel_text, int depth) {
     /* `fdopendir` takes ownership of the descriptor it is given, so it gets a
      * duplicate and the caller's lifetime stays the caller's business. */
     int dup_fd = dup(dir_fd);
     if (dup_fd < 0) {
-        note_partial(w, "a directory could not be opened for reading");
+        note_partial_at(w, rel_text, ATLAS_SEM_OBSTACLE_UNREADABLE_DIR,
+                        "a directory could not be opened for reading");
         return;
     }
     DIR *d = fdopendir(dup_fd);
     if (d == NULL) {
         (void)close(dup_fd);
-        note_partial(w, "a directory could not be opened for reading");
+        note_partial_at(w, rel_text, ATLAS_SEM_OBSTACLE_UNREADABLE_DIR,
+                        "a directory could not be opened for reading");
         return;
     }
     w->out->dirs_visited++;
@@ -521,7 +587,8 @@ static void walk_dir(walk_state *w, int dir_fd, const char *rel, size_t rel_len,
     char(*names)[WALK_MAX_NAME] = malloc((size_t)WALK_MAX_SUBDIRS * WALK_MAX_NAME);
     if (names == NULL) {
         (void)closedir(d);
-        note_partial(w, "there was not enough memory to walk a directory");
+        note_partial_at(w, rel_text, ATLAS_SEM_OBSTACLE_MEMORY,
+                        "there was not enough memory to walk a directory");
         return;
     }
 
@@ -530,7 +597,8 @@ static void walk_dir(walk_state *w, int dir_fd, const char *rel, size_t rel_len,
         struct dirent *e = readdir(d);
         if (e == NULL) {
             if (errno != 0) {
-                note_partial(w, "a directory could not be read to the end");
+                note_partial_at(w, rel_text, ATLAS_SEM_OBSTACLE_UNREADABLE_ENTRIES,
+                                "a directory could not be read to the end");
             }
             break;
         }
@@ -543,7 +611,7 @@ static void walk_dir(walk_state *w, int dir_fd, const char *rel, size_t rel_len,
             char detail[128];
             (void)snprintf(detail, sizeof detail, "the directory walk read more than %d entries",
                            ATLAS_SEM_DISCOVERY_MAX_ENTRIES);
-            note_partial(w, detail);
+            note_partial_at(w, rel_text, ATLAS_SEM_OBSTACLE_ENTRIES, detail);
             w->stop = true;
             break;
         }
@@ -559,14 +627,16 @@ static void walk_dir(walk_state *w, int dir_fd, const char *rel, size_t rel_len,
         int n = rel_len == 0 ? snprintf(child_raw, sizeof child_raw, "%s", e->d_name)
                              : snprintf(child_raw, sizeof child_raw, "%s/%s", rel, e->d_name);
         if (n < 0 || (size_t)n >= sizeof child_raw) {
-            note_partial(w, "a path exceeded the path ceiling");
+            note_partial_at(w, rel_text, ATLAS_SEM_OBSTACLE_PATH_TOO_LONG,
+                            "a path exceeded the path ceiling");
             continue;
         }
         char child_text[ATLAS_SEM_MAX_PATH_BYTES];
         if (!encode_rel(child_raw, (size_t)n, child_text)) {
             /* A path Atlas cannot name is part of the universe it cannot account
              * for, so the walk is PARTIAL rather than silently smaller. */
-            note_partial(w, "a path could not be represented within the path ceiling");
+            note_partial_at(w, rel_text, ATLAS_SEM_OBSTACLE_UNREPRESENTABLE,
+                            "a path could not be represented within the path ceiling");
             continue;
         }
         if (atlas_sem_path_under_prefix(w->packed_excludes, child_text)) {
@@ -575,7 +645,8 @@ static void walk_dir(walk_state *w, int dir_fd, const char *rel, size_t rel_len,
              * instruction. It is *shown*, and it makes discovery PARTIAL rather
              * than COMPLETE: Atlas did not look there, and an operator saying
              * "do not look" is not the statement "there is nothing there". */
-            note_partial(w, "an operator excluded a subtree from the search");
+            note_partial_at(w, child_text, ATLAS_SEM_OBSTACLE_EXCLUDED,
+                            "an operator excluded a subtree from the search");
             continue;
         }
 
@@ -610,19 +681,31 @@ static void walk_dir(walk_state *w, int dir_fd, const char *rel, size_t rel_len,
     (void)closedir(d);
 
     if (sub_overflow) {
-        note_partial(w, "a directory held more subdirectories than one walk level may hold");
+        note_partial_at(w, rel_text, ATLAS_SEM_OBSTACLE_ENTRIES,
+                        "a directory held more subdirectories than one walk level may hold");
     }
 
     for (size_t i = 0; i < sub_count; i++) {
         if (w->stop) {
             break;
         }
-        descend(w, dir_fd, names[i], rel, rel_len, depth);
+        descend(w, dir_fd, names[i], rel, rel_len, rel_text, depth);
     }
     free(names);
 }
 
 /* --- ordering ---------------------------------------------------------------- */
+
+/* A9.2.5. Obstacles are sorted by path so two walks over an unchanged tree
+ * produce the same list whatever order `readdir` returned entries in. The same
+ * argument `cmp_input` makes below: a value an operator compares between runs
+ * must not depend on the filesystem's iteration order. */
+static int cmp_obstacle(const void *a, const void *b) {
+    const atlas_sem_obstacle *x = a;
+    const atlas_sem_obstacle *y = b;
+    int c = strcmp(x->path, y->path);
+    return c != 0 ? c : strcmp(x->reason, y->reason);
+}
 
 static int cmp_input(const void *a, const void *b) {
     const atlas_sem_input *x = a;
@@ -666,7 +749,7 @@ atlas_status atlas_sem_discover(const char *root, const atlas_sem_config *cfg,
      * makes the duplicate detection order-independent. */
     atlas_status st = ATLAS_OK;
     if (out->mode == ATLAS_SEM_DISCMODE_AUTOMATIC) {
-        walk_dir(&w, root_fd, "", 0, 0);
+        walk_dir(&w, root_fd, "", 0, "", 0);
         if (out->state != ATLAS_SEM_DISC_PARTIAL) {
             /* The walk covered the whole bounded universe. COMPLETE is asserted
              * here, deliberately and last — A6's discipline that a permissive
@@ -723,6 +806,9 @@ atlas_status atlas_sem_discover(const char *root, const atlas_sem_config *cfg,
      * produce the same list and the same identity whatever `readdir` did. */
     if (out->count > 1) {
         qsort(out->inputs, out->count, sizeof out->inputs[0], cmp_input);
+    }
+    if (out->obstacle_count > 1) {
+        qsort(out->obstacles, out->obstacle_count, sizeof out->obstacles[0], cmp_obstacle);
     }
     return ATLAS_OK;
 }

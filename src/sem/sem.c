@@ -12,6 +12,8 @@
 
 #include <string.h>
 
+#include "atlas/json.h"
+#include "atlas/sem_discover.h"
 #include "atlas/sha256.h"
 
 /* --- evidence -------------------------------------------------------------- */
@@ -316,6 +318,29 @@ bool atlas_sem_why_is_transient(const char *why) {
      * same answer, which is the storm this bound exists to prevent. */
     return strcmp(why, ATLAS_SEM_WHY_CHILD_FAILED) == 0 ||
            strcmp(why, ATLAS_SEM_WHY_TIMEOUT) == 0;
+}
+
+const char *atlas_sem_obstacle_intern(const char *reason) {
+    static const char *const REASONS[] = {
+        ATLAS_SEM_OBSTACLE_EXCLUDED,        ATLAS_SEM_OBSTACLE_UNREADABLE_DIR,
+        ATLAS_SEM_OBSTACLE_UNREADABLE_ENTRIES, ATLAS_SEM_OBSTACLE_DEPTH,
+        ATLAS_SEM_OBSTACLE_ENTRIES,         ATLAS_SEM_OBSTACLE_PATH_TOO_LONG,
+        ATLAS_SEM_OBSTACLE_UNREPRESENTABLE, ATLAS_SEM_OBSTACLE_CANDIDATES,
+        ATLAS_SEM_OBSTACLE_MEMORY,
+    };
+    if (reason == NULL) {
+        return NULL;
+    }
+    for (size_t i = 0; i < sizeof(REASONS) / sizeof(REASONS[0]); i++) {
+        if (strcmp(reason, REASONS[i]) == 0) {
+            return REASONS[i];
+        }
+    }
+    return NULL;
+}
+
+bool atlas_sem_obstacle_reason_is_known(const char *reason) {
+    return atlas_sem_obstacle_intern(reason) != NULL;
 }
 
 void atlas_sem_generation_init(atlas_sem_generation *g) {

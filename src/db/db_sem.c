@@ -1710,6 +1710,129 @@ atlas_status atlas_db_sem_inputs_replace(atlas_db *db, int64_t repo_id,
     return ATLAS_OK;
 }
 
+/* A9.2.5. The obstacle list, replaced whole, in the caller's transaction.
+ *
+ * Delete-then-insert for `atlas_db_sem_inputs_replace`'s reason: a row left
+ * behind from a previous walk would describe a place Atlas is no longer
+ * asserting anything about, sitting beside places it is, with nothing in the row
+ * saying which kind it was. And the list must be able to shrink to nothing —
+ * a directory whose permissions were repaired stops being an obstacle, and the
+ * only honest record of that is its absence.
+ *
+ * `seq` is the walk's own order, preserved so a reader sees the list the walk
+ * produced rather than one a query planner chose. */
+atlas_status atlas_db_sem_obstacles_replace(atlas_db *db, int64_t repo_id,
+                                            const struct atlas_sem_obstacle *obstacles,
+                                            size_t count, const char *discovered_at,
+                                            atlas_err *err) {
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(
+        db, "DELETE FROM sem_discovery_obstacles WHERE repo_id = ?1;", &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, repo_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind repository id");
+    }
+    st = atlas_db_step_done(db, stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        const atlas_sem_obstacle *ob = &obstacles[i];
+        /* Interned rather than stored as the caller gave it — the rule every
+         * reason column in this file follows. An unrecognised reason is dropped
+         * rather than written: a value an operator reads must be Atlas'. */
+        const char *reason = atlas_sem_obstacle_intern(ob->reason);
+        if (reason == NULL) {
+            continue;
+        }
+        stmt = NULL;
+        st = atlas_db_prepare(db,
+                              "INSERT INTO sem_discovery_obstacles(repo_id, seq, path_text,"
+                              "  reason, discovered_at) VALUES(?1,?2,?3,?4,?5);",
+                              &stmt, err);
+        if (st != ATLAS_OK) {
+            return st;
+        }
+        if (sqlite3_bind_int64(stmt, 1, repo_id) != SQLITE_OK ||
+            sqlite3_bind_int64(stmt, 2, (int64_t)i) != SQLITE_OK) {
+            atlas_db_finish(db, stmt);
+            return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind a discovery obstacle");
+        }
+        st = bind_text(db, stmt, 3, ob->path, err);
+        if (st == ATLAS_OK) {
+            st = bind_text(db, stmt, 4, reason, err);
+        }
+        if (st == ATLAS_OK) {
+            st = bind_text(db, stmt, 5, discovered_at != NULL ? discovered_at : "", err);
+        }
+        if (st != ATLAS_OK) {
+            atlas_db_finish(db, stmt);
+            return st;
+        }
+        st = atlas_db_step_done(db, stmt, err);
+        if (st != ATLAS_OK) {
+            return st;
+        }
+    }
+    return ATLAS_OK;
+}
+
+/* Reads them back in the walk's own order, bounded by `max`.
+ *
+ * `truncated_out` is set when the store holds more than the caller asked for,
+ * because a list trimmed without saying so is the invisible hole this table
+ * exists to close. */
+atlas_status atlas_db_sem_obstacles_get(atlas_db *db, int64_t repo_id,
+                                        struct atlas_sem_obstacle *out, size_t max,
+                                        size_t *count_out, bool *truncated_out, atlas_err *err) {
+    if (count_out != NULL) {
+        *count_out = 0;
+    }
+    if (truncated_out != NULL) {
+        *truncated_out = false;
+    }
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(db,
+                                       "SELECT path_text, reason FROM sem_discovery_obstacles"
+                                       " WHERE repo_id = ?1 ORDER BY seq;",
+                                       &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, repo_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind repository id");
+    }
+    size_t n = 0;
+    int rc = 0;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (n >= max) {
+            if (truncated_out != NULL) {
+                *truncated_out = true;
+            }
+            break;
+        }
+        memset(&out[n], 0, sizeof(out[n]));
+        copy_field(out[n].path, sizeof out[n].path, col_text(stmt, 0));
+        /* Interned on the way out as well as on the way in: the bytes that reach
+         * an operator are Atlas', whatever the row happens to hold. */
+        const char *reason = atlas_sem_obstacle_intern(col_text(stmt, 1));
+        if (reason != NULL) {
+            copy_field(out[n].reason, sizeof out[n].reason, reason);
+            n++;
+        }
+    }
+    atlas_db_finish(db, stmt);
+    if (count_out != NULL) {
+        *count_out = n;
+    }
+    return ATLAS_OK;
+}
+
 /* Records the verdict of one discovery pass.
  *
  * Upserts, because a repository with no build description still has a discovery
@@ -1798,6 +1921,22 @@ atlas_status atlas_db_sem_inputs_forget(atlas_db *db, int64_t repo_id, atlas_err
     sqlite3_stmt *stmt = NULL;
     atlas_status st =
         atlas_db_prepare(db, "DELETE FROM sem_build_inputs WHERE repo_id = ?1;", &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, repo_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind repository id");
+    }
+    st = atlas_db_step_done(db, stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    /* A9.2.5. The obstacle list is scoped to the repository exactly as the
+     * candidate list is, and is forgotten with it. */
+    stmt = NULL;
+    st = atlas_db_prepare(db, "DELETE FROM sem_discovery_obstacles WHERE repo_id = ?1;", &stmt,
+                          err);
     if (st != ATLAS_OK) {
         return st;
     }

@@ -323,6 +323,16 @@ static const retention_entry RETENTION[] = {
      "rejected, with the reason for each; reproduced by walking again, and never aged out because "
      "a partly-deleted candidate list is a search nobody performed"},
 
+    /* A9.2.5, and the same argument one step further: this table records where a
+     * walk could *not* look. Ageing rows out of it would silently restore the
+     * invisibility it exists to remove — a repository would look like one whose
+     * search met fewer obstacles than it did, which is the direction that lets a
+     * negative conclusion be believed when it should not be. */
+    {"sem_discovery_obstacles", ATLAS_RETAIN_DERIVED, false,
+     "the places one bounded discovery walk could not account for, each with its exact "
+     "repository-relative path and a fixed reason; reproduced by walking again, and never aged "
+     "out because a partly-deleted list of what was missed reads as a search that missed less"},
+
     /* --- full-text indexes -------------------------------------------------- */
     {"files_fts", ATLAS_RETAIN_DERIVED, false, "FTS5 index over files; rebuilt from files"},
     {"commits_fts", ATLAS_RETAIN_DERIVED, false, "FTS5 index over commits; rebuilt from commits"},

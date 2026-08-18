@@ -161,6 +161,11 @@ static const table_ref ALL_TABLES[] = {
     {"decision_events", "id"},
     {"decision_challenges", "id"},
     {"decision_search", "rowid"},
+    /* A9.2.4/A9.2.5. Derived, and in the round trip because their *absence*
+     * reads as a positive statement: a restored index with no obstacle rows
+     * looks like a repository whose search met no obstacle. */
+    {"sem_build_inputs", "id"},
+    {"sem_discovery_obstacles", "id"},
 };
 
 #define ALL_TABLE_COUNT (sizeof ALL_TABLES / sizeof ALL_TABLES[0])
@@ -252,9 +257,39 @@ static void seed(atlas_db *db, atlas_err *err) {
         "INSERT INTO code_unit_defines(id, unit_id, name) VALUES(1,1,'NDEBUG');"
         "INSERT INTO code_index_errors(id, repo_id, kind, created_at)"
         " VALUES(1,1,'parse_partial','2026-01-01T00:00:00Z');";
+
+    /* A9.2.4/A9.2.5. The two derived tables that record what Atlas found and
+     * what it could not look at.
+     *
+     * They are in the round trip because losing them is not visibly a loss: a
+     * restored index with no obstacle rows reads as a repository whose search
+     * met no obstacle, which is the direction that lets a negative conclusion be
+     * believed when it should not be. Migration 20 must therefore survive a
+     * backup and a restore like every other table, and the comparison below is
+     * what says so. */
+    static const char SEED_SEM[] =
+        "INSERT INTO sem_build_inputs(id, repo_id, path_text, origin, accepted,"
+        "  reject_reason, digest, unit_count, discovered_at)"
+        " VALUES(1,1,'compile_commands.json','DISCOVERED',1,'','abc',3,"
+        "        '2026-01-01T00:00:00Z');"
+        "INSERT INTO sem_build_inputs(id, repo_id, path_text, origin, accepted,"
+        "  reject_reason, digest, unit_count, discovered_at)"
+        " VALUES(2,1,'vendor/compile_commands.json','DISCOVERED',0,"
+        "        'a_symlinked_path_is_never_followed','',0,'2026-01-01T00:00:00Z');"
+        "INSERT INTO sem_discovery_obstacles(id, repo_id, seq, path_text, reason,"
+        "  discovered_at)"
+        " VALUES(1,1,0,'locked','this_directory_could_not_be_entered',"
+        "        '2026-01-01T00:00:00Z');"
+        "INSERT INTO sem_discovery_obstacles(id, repo_id, seq, path_text, reason,"
+        "  discovered_at)"
+        " VALUES(2,1,1,'vendor',"
+        "        'an_operator_excluded_this_subtree_from_the_search',"
+        "        '2026-01-01T00:00:00Z');";
+
     T_OK(atlas_db_exec_sql(db, SEED_A0_A1, err), err);
     T_OK(atlas_db_exec_sql(db, SEED_A2, err), err);
     T_OK(atlas_db_exec_sql(db, SEED_A3, err), err);
+    T_OK(atlas_db_exec_sql(db, SEED_SEM, err), err);
 }
 
 static void run_atlas(const char *const *argv, size_t n, atlas_err *err) {

@@ -643,6 +643,20 @@
  * PARTIAL. */
 #define ATLAS_SEM_DISCOVERY_MAX_CANDIDATES 128
 
+/* A9.2.5. Obstacles one discovery walk records with their exact path.
+ *
+ * Until this season the walk kept the **first** reason it fell short and no path
+ * at all, so a single declared `--exclude` consumed the one slot and masked
+ * every unreadable directory for the rest of the walk — which on `/opt/atlas`
+ * itself is precisely what happened. A bounded list replaces the scalar, and
+ * reaching this bound is itself reported rather than silently trimming: an
+ * obstacle list that was truncated without saying so would recreate the hole it
+ * exists to close.
+ *
+ * 32 rather than the candidate ceiling: an operator acts on the first few, and
+ * the list is a diagnostic rather than an inventory. */
+#define ATLAS_SEM_DISCOVERY_MAX_OBSTACLES 32
+
 /* Operator-declared exclusion prefixes, and vendor prefixes, per repository.
  * Bounded for the reason every stored list in Atlas is: a durable value an
  * operator reads back should not be able to grow without a stated ceiling. */

@@ -1891,7 +1891,25 @@ static atlas_status j_sem_inputs(atlas_renderer *r, const atlas_sem_status_repor
         TRY(atlas_json_key_int(r->j, "units", in->unit_count, err));
         TRY(atlas_json_obj_end(r->j, err));
     }
-    return atlas_json_arr_end(r->j, err);
+    TRY(atlas_json_arr_end(r->j, err));
+
+    /* A9.2.5. Where the walk could not look — the same argument as the rejected
+     * candidates above, applied to directories. Always emitted, so an empty
+     * array is a positive statement rather than a missing key. */
+    TRY(atlas_json_key(r->j, "discovery_obstacles", err));
+    TRY(atlas_json_arr_begin(r->j, err));
+    for (size_t i = 0; i < rep->obstacle_count; i++) {
+        const struct atlas_sem_obstacle *ob = &rep->obstacles[i];
+        TRY(atlas_json_obj_begin(r->j, err));
+        TRY(json_safe(r->j, &r->safe, "path", ob->path, err));
+        TRY(atlas_json_key_str_opt(
+            r->j, "reason",
+            atlas_sem_obstacle_reason_is_known(ob->reason) ? ob->reason : NULL, err));
+        TRY(atlas_json_obj_end(r->j, err));
+    }
+    TRY(atlas_json_arr_end(r->j, err));
+    return atlas_json_key_bool(r->j, "discovery_obstacles_truncated", rep->obstacles_truncated,
+                               err);
 }
 
 /* The declared lists, each element its own string rather than the newline-joined

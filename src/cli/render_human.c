@@ -2073,12 +2073,44 @@ static void h_sem_inputs(atlas_renderer *r, const atlas_sem_status_report *rep) 
     }
 }
 
+/* A9.2.5. Where the walk could not look, each with its exact path.
+ *
+ * Printed whenever there is one, because the alternative — which A9.2.4 shipped
+ * — is a PARTIAL verdict with one pathless sentence that names only whichever
+ * obstacle came first. On the repository that produced this season that sentence
+ * was "an operator excluded a subtree from the search", and every directory the
+ * daemon could not enter after it was invisible.
+ *
+ * The path is already `%XX`-encoded by the walk; it goes through `atlas_safe`
+ * anyway, because a value that reached this renderer over a socket is not one
+ * this renderer encoded. The reason is an Atlas literal and needs neither. */
+static void h_sem_obstacles(atlas_renderer *r, const atlas_sem_status_report *rep) {
+    FILE *o = r->out;
+    if (rep->obstacle_count == 0) {
+        return;
+    }
+    bool first = true;
+    for (size_t i = 0; i < rep->obstacle_count; i++) {
+        const struct atlas_sem_obstacle *ob = &rep->obstacles[i];
+        (void)fprintf(o, LABEL "%s  [%s]\n", first ? "not searched" : "",
+                      atlas_safe(&r->safe, ob->path), ob->reason);
+        first = false;
+    }
+    if (rep->obstacles_truncated) {
+        /* A list trimmed without saying so would recreate the invisible hole
+         * this block exists to close. */
+        (void)fprintf(o, LABEL "%s\n", "",
+                      "(more obstacles were found than this report may hold)");
+    }
+}
+
 static atlas_status h_sem_config(atlas_renderer *r, const atlas_sem_status_report *rep,
                                  atlas_err *err) {
     (void)err;
     FILE *o = r->out;
     (void)fprintf(o, LABEL "%s\n", "repo", rep->repo.name);
     h_sem_inputs(r, rep);
+    h_sem_obstacles(r, rep);
     h_sem_path_list(r, "pinned databases", &rep->compdbs);
     h_sem_path_list(r, "test roots", &rep->test_roots);
     h_sem_path_list(r, "discovery exclusions", &rep->excludes);
@@ -2149,6 +2181,7 @@ static atlas_status h_sem_status(atlas_renderer *r, const atlas_sem_status_repor
      * named, and the question underneath it is whether those were all the
      * databases. */
     h_sem_inputs(r, rep);
+    h_sem_obstacles(r, rep);
     h_sem_path_list(r, "discovery exclusions", &rep->excludes);
     h_sem_path_list(r, "vendor roots", &rep->vendor_roots);
 

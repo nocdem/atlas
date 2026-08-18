@@ -104,6 +104,57 @@ bool atlas_sem_input_origin_parse(const char *name, atlas_sem_input_origin *out)
 #define ATLAS_SEM_REJECT_TOO_MANY "more_compilation_databases_were_found_than_one_generation_may_hold"
 
 bool atlas_sem_reject_reason_is_known(const char *reason);
+
+/* --- A9.2.5: why the search fell short, and exactly where --------------------
+ *
+ * A9.2.4 recorded one reason, pathless, and only the first one. The header
+ * defended withholding the path on the grounds that "a path is bytes a
+ * repository chose" — but `atlas_sem_input.path` above already carries a
+ * repository-chosen path, `%XX`-encoded like every other path Atlas reports, and
+ * `encode_rel` is called a dozen lines from where the reason was recorded. The
+ * layer had already solved the problem for candidate *files* and declined to
+ * apply the solution to *directories*.
+ *
+ * The cost of that was measured rather than imagined. On the repository that
+ * produced this season, `discovery_limit` read `an operator excluded a subtree
+ * from the search` — true, and it was the *first* obstacle, so anything else the
+ * walk could not enter was invisible for ever. "Something was missed" without
+ * "what" is not something an operator can act on, and a hole nobody can see is
+ * exactly what A9.2.4 exists to end.
+ *
+ * These are fixed Atlas strings and the classes are kept apart deliberately: an
+ * operator's own exclusion, a directory the daemon's uid cannot enter, a
+ * directory that could not be read to the end, and a ceiling are four different
+ * situations with four different remedies, and folding them into "PARTIAL" is
+ * the conflation this season removes. */
+#define ATLAS_SEM_OBSTACLE_EXCLUDED "an_operator_excluded_this_subtree_from_the_search"
+#define ATLAS_SEM_OBSTACLE_UNREADABLE_DIR "this_directory_could_not_be_entered"
+#define ATLAS_SEM_OBSTACLE_UNREADABLE_ENTRIES "this_directory_could_not_be_read_to_the_end"
+#define ATLAS_SEM_OBSTACLE_DEPTH "the_walk_reached_its_depth_ceiling_below_this_directory"
+#define ATLAS_SEM_OBSTACLE_ENTRIES "the_walk_reached_its_entry_ceiling_at_this_directory"
+#define ATLAS_SEM_OBSTACLE_PATH_TOO_LONG "a_path_below_this_directory_exceeded_the_path_ceiling"
+#define ATLAS_SEM_OBSTACLE_UNREPRESENTABLE "a_path_below_this_directory_could_not_be_represented"
+#define ATLAS_SEM_OBSTACLE_CANDIDATES                                                              \
+    "more_compilation_databases_were_found_than_one_walk_may_hold"
+#define ATLAS_SEM_OBSTACLE_MEMORY "there_was_not_enough_memory_to_walk_this_directory"
+
+bool atlas_sem_obstacle_reason_is_known(const char *reason);
+/* Atlas' own copy of a known reason, or NULL. A value that arrived over a socket
+ * is a matching string, not Atlas' string. */
+const char *atlas_sem_obstacle_intern(const char *reason);
+
+/* One place the search could not account for.
+ *
+ * `path` is repository-relative and `%XX`-encoded, exactly as
+ * `atlas_sem_input.path` is, and it is the directory the obstacle is *about*:
+ * for a subtree that could not be entered, that subtree; for a ceiling, the
+ * directory the walk was in when it was reached. `reason` is one of the fixed
+ * strings above and is never concatenated with the path — a reason an operator
+ * reads must stay a value Atlas owns. */
+typedef struct atlas_sem_obstacle {
+    char path[ATLAS_SEM_MAX_PATH_BYTES];
+    char reason[96];
+} atlas_sem_obstacle;
 /* Atlas' own copy of a known reason, or NULL. A value that arrived over a socket
  * is a *matching* string, not Atlas' string — `atlas_sem_hold_intern`'s rule. */
 const char *atlas_sem_reject_intern(const char *reason);
@@ -145,6 +196,22 @@ typedef struct atlas_sem_discovery_result {
      * season exists to end. A fixed Atlas string, never a path. */
     bool limit_reached;
     char limit_detail[128];
+
+    /* A9.2.5. Every obstacle, with its path — not merely the first, and not
+     * merely a reason. `limit_detail` above is kept as the one-line summary an
+     * existing reader already consumes; this is what an operator acts on.
+     *
+     * Deterministic order: the list is **sorted by path** when the walk finishes
+     * (`cmp_obstacle` in `src/sem/discover.c`), because `readdir` order is not
+     * guaranteed and a value an operator compares between runs must not depend
+     * on the filesystem's iteration order. Entries are also deduplicated on
+     * `(path, reason)`, so one directory cannot fill the list with copies of one
+     * obstacle and hide every other. `obstacles_truncated` is reported
+     * because a list that was trimmed without saying so would recreate exactly
+     * the invisible hole this replaces. */
+    atlas_sem_obstacle obstacles[ATLAS_SEM_DISCOVERY_MAX_OBSTACLES];
+    size_t obstacle_count;
+    bool obstacles_truncated;
 
     /* What the walk actually looked at, so the universe can be reported beside
      * the verdict rather than assumed by a reader. */

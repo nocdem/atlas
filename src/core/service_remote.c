@@ -2941,6 +2941,48 @@ static void read_sem_plan(const atlas_ipc_response *r, atlas_sem_status_report *
         }
     }
 
+    /* A9.2.5. The obstacle list, read back so the socket path and the local path
+     * describe a repository identically. An older daemon sends no array and the
+     * list stays empty, which reads as "Atlas has not recorded any" — never as
+     * "there were none". */
+    size_t ob_n = 0;
+    (void)atlas_ipc_result_arr_len(r, "discovery_obstacles", &ob_n);
+    if (ob_n > 0) {
+        if (ob_n > (size_t)ATLAS_SEM_DISCOVERY_MAX_OBSTACLES) {
+            ob_n = (size_t)ATLAS_SEM_DISCOVERY_MAX_OBSTACLES;
+        }
+        out->obstacles = calloc((size_t)ATLAS_SEM_DISCOVERY_MAX_OBSTACLES,
+                                sizeof(*out->obstacles));
+        if (out->obstacles != NULL) {
+            size_t n = 0;
+            for (size_t i = 0; i < ob_n; i++) {
+                struct atlas_sem_obstacle *ob = &out->obstacles[n];
+                memset(ob, 0, sizeof(*ob));
+                if (atlas_ipc_result_arr_obj_str(r, "discovery_obstacles", i, "path", &v)) {
+                    copy_str(ob->path, sizeof ob->path, v);
+                }
+                if (atlas_ipc_result_arr_obj_str(r, "discovery_obstacles", i, "reason", &v)) {
+                    /* Interned: a reason that arrived over a socket is a matching
+                     * string, not Atlas' string. An unrecognised one drops the
+                     * row rather than reproducing bytes Atlas does not own. */
+                    const char *known = atlas_sem_obstacle_intern(v);
+                    if (known == NULL) {
+                        continue;
+                    }
+                    copy_str(ob->reason, sizeof ob->reason, known);
+                }
+                n++;
+            }
+            out->obstacle_count = n;
+        }
+    }
+    {
+        bool ob_trunc = false;
+        if (atlas_ipc_result_bool(r, "discovery_obstacles_truncated", &ob_trunc)) {
+            out->obstacles_truncated = ob_trunc;
+        }
+    }
+
     /* The declared lists, rejoined into the storage form the renderers read.
      * One representation past this point, so a renderer cannot be handed two. */
     static const char *const KEYS[4] = {"compdbs", "test_roots", "excludes", "vendor_roots"};

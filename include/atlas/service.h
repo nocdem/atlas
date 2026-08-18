@@ -1303,6 +1303,17 @@ typedef struct atlas_sem_status_report {
     atlas_buf vendor_roots;
     struct atlas_sem_input *inputs; /* owned; ATLAS_SEM_DISCOVERY_MAX_CANDIDATES */
     size_t input_count;
+
+    /* --- A9.2.5 -------------------------------------------------------------
+     *
+     * Every place the last walk could not account for, each with the exact
+     * repository-relative path it is about. A9.2.4 kept the *first* reason and
+     * no path, so one declared `--exclude` masked every unreadable directory for
+     * the rest of the walk. `plan.discovery_limit` is still the one-line summary;
+     * this is what an operator acts on. */
+    struct atlas_sem_obstacle *obstacles; /* owned; ATLAS_SEM_DISCOVERY_MAX_OBSTACLES */
+    size_t obstacle_count;
+    bool obstacles_truncated;
 } atlas_sem_status_report;
 
 void atlas_sem_status_report_init(atlas_sem_status_report *r);

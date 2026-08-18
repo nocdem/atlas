@@ -326,11 +326,16 @@ static atlas_status parse_args(cli_state *st, int argc, char **argv, bool *want_
                     return atlas_err_set(err, ATLAS_ERR_USAGE, "--repo needs a name");
                 }
                 st->opts.repo = argv[++i];
+                /* A8's `job submit` reads its own field. One flag fills both,
+                 * because this branch is reached first and the grouped A8 branch
+                 * below never sees `--repo` at all. */
+                st->opts.job.repo = st->opts.repo;
             } else if (strcmp(a, "--task") == 0) {
                 if (i + 1 >= argc) {
                     return atlas_err_set(err, ATLAS_ERR_USAGE, "--task needs a description");
                 }
                 st->opts.task = argv[++i];
+                st->opts.job.task = st->opts.task;
             } else if (strcmp(a, "--max-tokens") == 0) {
                 if (i + 1 >= argc) {
                     return atlas_err_set(err, ATLAS_ERR_USAGE, "--max-tokens needs a number");
@@ -473,22 +478,19 @@ static atlas_status parse_args(cli_state *st, int argc, char **argv, bool *want_
                 if (s != ATLAS_OK) {
                     return s;
                 }
-            } else if (strcmp(a, "--repo") == 0 || strcmp(a, "--task") == 0 ||
-                       strcmp(a, "--mode") == 0 || strcmp(a, "--driver") == 0 ||
+            } else if (strcmp(a, "--mode") == 0 || strcmp(a, "--driver") == 0 ||
                        strcmp(a, "--idempotency-key") == 0 || strcmp(a, "--wall-timeout-ms") == 0 ||
                        strcmp(a, "--idle-timeout-ms") == 0 || strcmp(a, "--attempts") == 0) {
                 /* A8 job options, grouped for the same reason the A4 ones are:
                  * the "a flag at the end of the line has no value" check lives
-                 * once rather than eight times. */
+                 * once rather than six times. `--repo` and `--task` are handled
+                 * above, where the general options are: this branch never saw
+                 * them, which is why `job submit` could not read either. */
                 if (i + 1 >= argc) {
                     return atlas_err_set(err, ATLAS_ERR_USAGE, "%s needs a value", a);
                 }
                 const char *v = argv[++i];
-                if (strcmp(a, "--repo") == 0) {
-                    st->opts.job.repo = v;
-                } else if (strcmp(a, "--task") == 0) {
-                    st->opts.job.task = v;
-                } else if (strcmp(a, "--mode") == 0) {
+                if (strcmp(a, "--mode") == 0) {
                     st->opts.job.mode = v;
                 } else if (strcmp(a, "--driver") == 0) {
                     st->opts.job.driver = v;

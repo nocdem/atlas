@@ -1,19 +1,31 @@
 # Atlas — working notes for Claude Code
 
 Atlas is a generic, headless engineering-memory and repository-intelligence CLI
-in C17. Phase **A11.0**: the durable single-worker run — a chain of tasks is now
-a fact about stored rows rather than a well-formed string. The sentence the
-season exists for is
+in C17. Phase **A11.1–A11.4**: the single-worker orchestrator loop — an operator
+can now start one worker in a registered repository, have Atlas gate its work,
+and reach `ACCEPTED` or `BLOCKED` within a bound. The sentence the season exists
+for is
+
+> **A RESOLVED CHAIN THAT NOBODY COULD CARRY WAS STILL A DESCRIPTION OF WORK,
+> NOT WORK.**
+
+A11.0 made a chain of tasks a fact about stored rows and settled nothing: who
+may decide a run was named as A11.1's question. The answer is a foreground run
+driver an operator starts, settlement that travels only on a task completion,
+gates fixed at the root task and inherited verbatim, and three worker starts per
+run counted in the ledger. **No migration; the schema stays at 21.** See the
+A11.1 section in `docs/roadmap.md`, `docs/orchestration.md` and
+`docs/engineering-rules.md`.
+
+The season before it, **A11.0**, was the durable single-worker run. Its sentence
+is
 
 > **A CHAIN OF TASKS WAS EXPRESSIBLE AND NOT ENFORCEABLE.**
 
 A8 gave `orch_jobs` a `parent_job_uid` and resolved it nowhere: the column was
-checked for shape and nothing asked whether the parent existed. A11.0 adds the
+checked for shape and nothing asked whether the parent existed. A11.0 added the
 run that makes it resolvable, four refusals at submission, and one active task
-per run enforced by a partial unique index. It starts no worker and settles no
-run: the run's status is its own axis, no task transition writes it, and nothing
-in production produces `ACCEPTED` or `BLOCKED`. See the A11.0 section in
-`docs/roadmap.md` and `docs/orchestration.md`.
+per run enforced by a partial unique index.
 
 The season before it, **O10**, was production evidence ingestion: the
 verification intake surface a real agent submits through is now proved, at that
@@ -84,6 +96,7 @@ document that carries it:
 
 | Season | What it added | Document |
 | --- | --- | --- |
+| A11.1–A11.4 | the run driver, the gates Atlas runs itself, one follow-up per failure, and the bound that ends the chain | `docs/orchestration.md` |
 | A11.0 | the run a chain of tasks belongs to; a parent that resolves, and one active task in it | `docs/orchestration.md` |
 | O10 | the intake surface proved at the boundary a client reaches; no line of `src/` changed | `docs/verification.md` |
 | A9.2.6 | a waiter that can stop waiting; one slow write no longer holds every client | `docs/daemon-and-ipc.md` |
@@ -227,7 +240,15 @@ streaming writer, so A0's escaping contract is the one the daemon speaks.
 
 ## Hard rules
 
-- **Never modify a registered target repository.** Read-only, always.
+- **Never modify a registered target repository from Atlas' own code.** Every
+  read — scan, the index passes, the watcher, every `src/git` invocation — is
+  read-only, always. The one exception is A11.1's run driver, which starts a
+  *worker process* whose purpose is to edit the tree, in a directory Atlas
+  resolved from its registry, under a driver
+  `atlas_orch_driver_is_repo_tree` names, that the lease asked for by name, and
+  that the root-owned policy lists. Three things must line up; removing any one
+  stops it. Nothing anywhere cleans, resets, checks out, stashes or reverts a
+  work tree, on any path.
 - **No shell.** No `system()`, `popen()`, or `/bin/sh -c`. Create processes only
   through `atlas_proc_run` with an explicit argv array and an absolute `argv[0]`.
 - **No commits, pushes, amends, rebases, resets, or checkouts** in this repo unless
@@ -617,6 +638,42 @@ is not written down is one somebody deletes.** Both halves are load-bearing.
   job would be migration 19's mistake.
 - **A11.0 starts no worker**, runs no driver, generates no follow-up task and
   makes no automatic decision. It builds the chain A11.1 will use.
+
+### A11.1–A11.4 — the single-worker orchestrator loop
+
+- **A RESOLVED CHAIN THAT NOBODY COULD CARRY WAS STILL A DESCRIPTION OF WORK,
+  NOT WORK.** A11.0 left a resolved chain and two statuses nothing produced.
+- **Every settlement travels on a COMPLETE.** There is no `job.run_settle`, no
+  MCP tool and no gateway route; `atlas_db_orch_run_set_status` still has no
+  caller outside `src/db/db_orch.c`. That is what keeps "a model payload cannot
+  settle a run" true by absence rather than by a check.
+- **The completion carries no claim the worker made.** `op->success` is Atlas'
+  exit classification and Atlas' own gate verdict. A zero exit is still not a
+  success claim: a worker that exits zero and fails its gate ends a task, and
+  the run is not accepted.
+- **The gates are fixed at the root task and inherited verbatim.** A follow-up
+  receives its parent's list, not one it was given. **A repo-tree task with no
+  gate is refused at the write point**, because such a task could only ever be
+  accepted on a process exit code.
+- **The bound is three worker starts per run, derived from the ledger.** RUNNING
+  is recorded before the exec, so a crash spends budget and a `BUSY` that never
+  reached a lease spends none.
+- **A crash is retried on the same task; a failed gate is answered with one
+  narrower task.** Cancellation and RECOVERY_REQUIRED are answered by neither and
+  block the run.
+- **Exactly one follow-up per failure**, three ways over: the transaction, the
+  one-active-task index, and the key `a11.<parent>.<attempt>`.
+- **A repo-tree driver is never granted to a lease that did not name it**, and
+  never appears on a background dispatcher's derived filter.
+- **The pinned commit is checked before the worker and again after it.** A moved
+  HEAD is refused rather than judged, and is the only part of the worker's
+  constraint list Atlas enforces rather than states.
+- **`BUSY` is retried and is never a BLOCKED run.** The run stays ACTIVE and
+  resumable; `ATLAS_IPC_BUSY_TOKEN` is the contract.
+- **The lease is renewed while the worker works**, by a heartbeat naming the
+  phase it is already in. A failed renewal never kills the child.
+- **The run driver starts nothing in the background** — no scheduler, no polling,
+  no timer, no model router, no second submit path.
 
 ### O10 — production evidence ingestion
 

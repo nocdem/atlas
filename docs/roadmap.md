@@ -641,13 +641,110 @@ rather than by a check, which is the house form of the claim.
 - **The run is per single worker, as the name says.** Nothing here makes two
   tasks in one run safe to run at once; the index makes it impossible instead.
 
-## Next: A11.1
+## A11.1–A11.4 — the single-worker orchestrator loop (CLOSED)
 
-A11.1 is the next milestone. Its scope is not written down in this repository,
-and it is named as next rather than described, because describing it would mean
-inventing it. What A11.0 leaves it is a resolved chain and two unproduced
-statuses, which is a smaller and more honest starting point than a phase that had
-guessed who was allowed to write them.
+A11.0 left a resolved chain and two statuses nothing produced. A11.1 through
+A11.4 were the milestone that carries it, and they closed together because they
+are one loop: there is no useful state in which Atlas can start a worker but not
+gate it, or gate it but not answer with a follow-up, or produce follow-ups
+without a bound that ends them.
+
+The sentence the milestone exists for is
+
+> **A RESOLVED CHAIN THAT NOBODY COULD CARRY WAS STILL A DESCRIPTION OF WORK,
+> NOT WORK.**
+
+**What was already there.** Almost all of the machinery. A8 shipped the job
+model, the canonical digest, the persisted state machine, the one write point,
+leases with a partial unique index, heartbeats, retry, cancellation, crash
+recovery, the root-owned policy, the two RPC groups, workspace provisioning,
+source snapshotting, bounded command execution with no shell anywhere, the driver
+interface, a Claude Code driver and a deterministic fake beside it, and the
+validation runner. A8.1 added the operator's own model dispatcher. A11.0 added
+the run, the resolved parent chain, and one active task per run. A9.2.6 added the
+`BUSY` refusal that says, in the message, that nothing was queued.
+
+**What A11.1 added**, and it is deliberately small against that list:
+
+- **A foreground run driver** (`src/orch/rundriver.c`), started by an operator
+  and by nothing else. It claims the run's active task *by name*, checks the
+  pinned commit before starting anything, records RUNNING before it execs,
+  starts one worker, checks the pinned commit again, runs the gates, and
+  reports. It polls no queue, schedules nothing and leaves nothing running.
+- **Two drivers that work in the registered repository's own tree**,
+  `claude-repo` and `fake-repo`, sharing A8's implementation and differing only
+  in where the child runs and where its log goes.
+- **Run settlement, inside `atlas_orch_apply_in_tx`**, derived from the state the
+  task machine reached and from the ledger's count of worker starts.
+- **One follow-up task per failed gate**, created through the same submit path
+  with a deterministic idempotency key.
+- **A bound of three worker starts per run**, counted in the ledger rather than
+  stored.
+- **`atlas job run`, `atlas job run --resume` and `atlas job run-status`** — the
+  whole new command surface, all of it under the existing `job` family.
+
+**No migration.** Schema stays at 21. Everything the milestone needed was
+already a column: the gates are `orch_jobs.validations`, the chain is
+`run_uid` and `parent_job_uid`, the evidence is `orch_artifacts`, and the budget
+is `orch_transitions`. A season that can be built without a migration should be.
+
+**Who may settle a run — A11.0's open question, answered.** The trusted
+in-process driver, and only through a completion. There is no `job.run_settle`,
+no MCP tool and no gateway route; `atlas_db_orch_run_set_status` still has no
+caller outside `src/db/db_orch.c`. The completion carries an exit classification
+Atlas computed and a gate verdict Atlas ran — never a claim the worker made, and
+there is no field on the wire through which one could arrive. A worker that exits
+zero and fails its gate ends a task and does not accept a run.
+
+**Invariant 5 is narrowed, precisely, and only here.** "No Atlas command modifies
+a target repository" was unqualified and is no longer true without a
+clause. Every Atlas *read* — `scan`, the index passes, the watcher, every
+`src/git` invocation — is still read-only and writes nothing. What changed is
+that an operator running `atlas job run` may start a child process whose purpose
+is to edit the tree, in a directory Atlas resolved from its own registry, under a
+driver the root-owned policy named. Three things must line up and removing any
+one stops it. The working tree is expected to be dirty afterwards: it is the
+first worker's output and the second worker's input, and nothing on any path
+cleans, resets, checks out, stashes or reverts it.
+
+**Residuals, written down rather than left to be discovered.**
+
+- **Nothing is enabled by installing the binary.** `/etc/atlas/orchestration.conf`
+  on this machine lists `driver = fake` and `driver = claude`, and A11.1 did not
+  add `claude-repo` to it. Until an operator does, `atlas job run` against the
+  real daemon is refused with "that driver is not configured". That is the first
+  step of the A11.5a pilot and it is deliberately not taken here.
+- **"Do not commit, do not push" is instruction, not a control.** What Atlas
+  enforces is that a run whose HEAD moved off its pinned commit is refused rather
+  than judged, and is never accepted. Everything else in the constraint list the
+  worker is given is a sentence to a model.
+- **The HEAD-moved-after-the-worker path is proved only for the before case.**
+  `fake-repo` cannot commit, so the second check is exercised by inspection and
+  by the first check's test rather than by its own.
+- **A run driver that is killed mid-attempt leaves the task claimed** until the
+  daemon's recovery timer frees it, which is about one lease. That is honest —
+  the attempt genuinely is of unknown fate — and a resume before then reports
+  `busy` rather than starting a second worker.
+- **Under `operator_session` the worker runs as the operator**, which is A8.1's
+  documented cost and is unchanged. Atlas does not claim OS isolation between the
+  run driver and the model it starts; what it claims is that no *output* of that
+  model reaches a decision.
+
+## Next: A11.5a — Atlas-on-Atlas pilot, cross-run memory off
+
+The next milestone is the first real pilot: one operator-supervised run against
+this repository, with `claude-repo` enabled in the root-owned policy, cross-run
+memory deliberately **off**.
+
+It is a pilot rather than a feature because what is unproven is not the
+machinery — that is what A11.1's fourteen acceptance cases are — but whether a
+task text, a gate list and a three-worker bound are enough structure for a real
+change to land. That question cannot be answered by a test.
+
+What A11.5a must not do: enable cross-run memory, add a second model role, run
+more than one worker at a time, or let anything it learns become an automatic
+input to a later run. Those are what the milestone is holding constant so that
+the one variable it is measuring stays readable.
 
 **A10 is not closed and is not cancelled**, and the ordering is deliberate rather
 than an oversight. A10 is the Experience Learning phase, and the contract it must
@@ -681,7 +778,11 @@ own. Nothing is deferred here.
 2. Git and repository contents are authoritative for source and history facts.
 3. Every result preserves provenance.
 4. Atlas never invents a reason. `UNKNOWN` is a valid, first-class answer.
-5. No Atlas command modifies a target repository.
+5. No Atlas *read* modifies a target repository, ever. Scanning, indexing,
+   watching and every `src/git` invocation are read-only. The one thing that
+   writes is a worker an operator started with `atlas job run`, under a driver
+   the root-owned policy named — see A11.1, which narrowed this line and says
+   exactly how far.
 6. Repository contents are untrusted input — as bytes reaching a terminal, and
    as prose reaching a model. Those are different defences.
 7. Human and machine output come from one service layer.

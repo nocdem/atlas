@@ -689,3 +689,43 @@ also recorded remains unexplained by anything found here.
 asserts liveness under exactly that load. It fails without the fix, with the
 figures above.
 
+
+## Migration wind-back fixtures are maintained by hand, and A11.0 proved it
+
+**Found during A11.1, fixed there, recorded here because the class outlives the
+instance.**
+
+`tests/test_decision_kind.c`'s `wind_back_to_schema_12` rewrites a live database
+back to schema 12 so that migration 13's rebuild can be measured against real
+rows. To do that it must drop every table and column that migrations 14 and
+later added — and it does so with a hand-written list, under a comment that says
+so: "A new table means a line here, which is the same 'nothing is globbed'
+discipline the source list follows."
+
+A11.0 added `orch_runs`, `orch_jobs.run_uid` and two indexes in migration 21 and
+did not add the lines. The result was not a subtle wrongness: the forward
+migration failed outright with `table orch_runs already exists`, so the case
+never reached a single one of migration 13's assertions. It was reproduced at
+`ee29f34` — the commit before A11.1 — from a clean `git archive` build, so it is
+established as pre-existing rather than inferred to be.
+
+**What is worth acting on is not the missing line.** It is that this fixture has
+no way to notice it is incomplete. The failure surfaced at the *next* season's
+full-suite run rather than at the one that caused it, and it surfaced as a
+migration error rather than as "the wind-back is out of date", which is a
+different thing to go looking for.
+
+Two shapes would end the class, and neither was in A11.1's scope:
+
+- **Assert the shape rather than the version.** The wind-back already checks
+  that the schema version reads 12 and that four A9.1 artefacts are gone. It
+  could instead compare the object list against migration 12's own expected set
+  and fail naming what is left over, which is a check that cannot go stale.
+- **Derive the drop list.** Every migration's statements are already data in
+  `MIGRATIONS[]`; a rewind that read them would be the same list rather than a
+  second one. That is a larger change and the usual argument applies — a derived
+  list is only better if the derivation is simpler than the list.
+
+Until one of them exists, **adding a table or a column in a migration means
+adding a line to `wind_back_to_schema_12`**, and the way you find out you forgot
+is a full-suite run.

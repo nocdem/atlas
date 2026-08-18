@@ -411,6 +411,111 @@ it belongs in the operator-uid method group, alongside `code.index` and
 | one root per run | `orch_runs.root_job_uid`, written once at creation | nothing rewrites it; a run has exactly one root |
 | a run's repository | `orch_runs.repo_identity_hash`, compared against every child | a child describing a different repository is refused |
 
+## A11.1 — the run driver, the repo-tree drivers, and the gates
+
+### Adding a driver that works in the registered repository's own tree
+
+This is the one extension in Atlas that widens where a child process may write,
+so it has the longest checklist and every item is a refusal that has to be
+opened deliberately.
+
+1. Add the entry to `DRIVERS[]` in `src/orch/driver.c`, with a `run` function
+   that **refuses without an absolute `work_dir` Atlas resolved**. A relative
+   path, the caller's cwd or a workspace is a different repository than the one
+   the job was authorised over.
+2. Add the name to `REPO_TREE[]` in `atlas_orch_driver_is_repo_tree`
+   (`src/orch/orch.c`). This is the one list; it is not a flag on
+   `atlas_driver`, because the daemon must answer it about a stored name before
+   granting a lease without linking the driver table into that decision.
+3. Update the count in `tests/test_a11_run.c`'s agreement case, which walks every
+   shipped driver.
+4. Handle `req->ws == NULL`: a repo-tree driver has no workspace, so its log goes
+   into `res->log` and it must not write into the repository.
+5. The operator must add `driver = <name>` to `/etc/atlas/orchestration.conf`
+   before anything can be submitted with it. **Do not add it for them.**
+
+What you get for free, and must not undo: `op_lease` refuses to grant it to a
+lease with an empty driver filter, `atlas_service_dispatcher_run` keeps it off
+every background dispatcher's derived filter, `op_submit` refuses it without a
+gate, and `settle_run_after_complete` settles the run its task belongs to.
+
+### Adding a program to the validation allowlist
+
+`ALLOWED[]` in `atlas_validation_program_allowed` (`src/orch/validate.c`). It is
+deliberately tiny and deliberately contains no shell.
+
+Before adding one, the question is not "is this program safe?" but "is this the
+operator's decision or the submitter's?" — the allowlist exists so that a job
+cannot name an arbitrary program and a planted `PATH` cannot select one.
+`argv[0]` is resolved against a fixed search path, never against the
+environment's.
+
+A program that reads its arguments as a script, or that can be made to execute
+one, does not belong here whatever it is called.
+
+### Changing the worker-start bound
+
+`ATLAS_ORCH_RUN_MAX_WORKER_STARTS` in `include/atlas/orch.h`. It is compiled in,
+has no policy key and no flag, because a bound a caller can raise is not a bound.
+
+It counts transitions to RUNNING in the ledger and is stored nowhere. If you ever
+find yourself adding a column for it, stop: the reason it is derived is that a
+process can die between incrementing a counter and using it, and the ledger row
+is written before the exec that it counts.
+
+`ATLAS_ORCH_MAX_ATTEMPTS` is a different bound with a different subject — per
+task, not per run. Both apply and the tighter wins; never compare them.
+
+### Adding a field to the completion's artifact manifest
+
+The wire form is `<name>\x1f<kind>\x1f<sha256>\x1f<size>` with an **optional
+fifth field**, the content as lowercase hex. Four fields and five are both valid,
+which is what keeps an A8 dispatcher speaking to an A11 daemon unchanged; a
+sixth must preserve that property the same way.
+
+The A8 dispatcher never sends content: its artifacts live in a workspace it owns
+and Atlas describes them. The run driver always does, because it has no workspace
+and an artifact it does not carry is one nobody can ever read. The daemon
+recomputes the digest from the bytes and refuses a manifest whose declared size
+or digest does not match what arrived — a record that describes one thing and
+carries another cannot be checked afterwards.
+
+### Adding a client method to the orchestration group
+
+`ORCH_CLIENT_METHODS[]` in `src/ipc/server_orch.c`. Two constraints
+`tests/test_orch_rpc.c` enforces and one that is not mechanical:
+
+1. The name must begin `job.` — which group a method is in is visible in the name
+   a caller types. (`job.run_status` is named that way for exactly this reason.)
+2. It must contain no verb from `VERBS[]`: approve, apply, commit, push, merge,
+   grant, restore and the rest.
+3. **A method that writes a run's status does not belong here at all.** A11.1's
+   settlement travels on `dispatch.complete`, in the transaction that justifies
+   it, which is what makes "a model payload cannot accept a run" true by absence.
+   Adding `job.run_settle` would undo that in one line.
+
+### Acting on the daemon's `BUSY` refusal
+
+`ATLAS_IPC_BUSY_TOKEN` and `atlas_ipc_message_is_busy` in
+`include/atlas/ipc.h`. The token is the contract; the prose after it is for a
+human.
+
+A caller may retry a `BUSY` refusal because the daemon took the write back out of
+the queue before anything looked at it. A caller may **not** retry a timeout the
+same way: that leaves the job queued and running, so the write does happen and
+the caller simply never hears the outcome. Same status, opposite facts. If you
+add a retry loop, gate it on this function and on nothing else, and bound it.
+
+### Bounds this season added
+
+| Bound | Where | What happens when it is reached |
+| --- | --- | --- |
+| three worker starts per run | `ATLAS_ORCH_RUN_MAX_WORKER_STARTS`, counted in the ledger | the run is BLOCKED |
+| at least one gate per repo-tree task | `op_submit` | the submission is refused |
+| eight gates per run | the CLI's `--gate` parser | the flag is refused, naming the bound |
+| 4 KiB of a failing gate's output | `ATLAS_ORCH_GATE_EXCERPT_MAX` | the excerpt says how much it did not show |
+| twelve `BUSY` retries per write | `RUN_BUSY_TRIES` | the invocation ends; the run stays ACTIVE and resumable |
+
 ## A9.2.5 — the semantic verdict, and where a walk could not look
 
 ### Adding a value to `atlas_sem_verdict`

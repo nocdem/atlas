@@ -2387,3 +2387,262 @@ environment, and not the author or the clock. The **evidence and attestation**
 keys do fold in the actor, because two actors having read the same file are two
 observations and two attestations are two votes. Do not "fix" the asymmetry: it
 is the design.
+
+## A11.1 layers — additions
+
+| File | What it owns |
+| --- | --- |
+| `include/atlas/rundriver.h` | what the foreground run driver is, and what it is not |
+| `src/orch/rundriver.c` | the loop: claim, pin-check, start one worker, gate, report |
+| `include/atlas/validate.h`, `src/orch/validate.c` | the one implementation of "run this job's declared verification commands" |
+| `src/orch/driver.c` | `claude-repo` and `fake-repo`, and the shared Claude Code execution |
+| `src/orch/orch.c` | `atlas_orch_driver_is_repo_tree` — the one list of drivers that work in the repository's own tree |
+| `src/db/db_orch.c` | run settlement and follow-up creation, inside `atlas_orch_apply_in_tx` |
+| `src/ipc/server_orch.c` | `job.run_status`, the lease's `job` narrowing, the completion's gate verdict |
+| `src/core/service_orch.c` | the socket transport for the driver, and `atlas job run` |
+
+## A11.1 rules — these are not negotiable
+
+### A chain of tasks was resolvable and nobody could carry it
+
+A11.0 made the chain a fact about stored rows: a parent that resolves, a run that
+groups, one active task enforced by a partial unique index. It started no worker,
+settled no run, and said so — `ACCEPTED` and `BLOCKED` had no producer in
+production code, and *who may decide* was named as A11.1's question rather than
+guessed at.
+
+A11.1 answers it, and the shape of the answer is the answer's content. Read the
+four rules below as one argument: settlement travels on a completion, the
+completion carries only facts Atlas computed, the gates are fixed before any
+worker runs and inherited unchanged, and the number of workers is bounded by the
+ledger rather than by a counter anybody writes.
+
+### Every settlement travels on a COMPLETE
+
+There is no `job.run_settle`, no `job.run_accept`, no `job.run_block`, no MCP
+tool and no gateway route. `atlas_db_orch_run_set_status` still has no caller
+outside `src/db/db_orch.c`, and the two callers it has there are
+`settle_run_after_complete` and `run_blocked_by_recovery` — both inside
+`atlas_orch_apply_in_tx`, both in the same transaction as the task transition
+that justifies them.
+
+That is what keeps "a model payload cannot accept a run" true **by absence**
+rather than by a check. A check can be reached and argued with; a method that
+does not exist cannot. If a run's acceptance ever needs its own surface, A11.0's
+entry in `docs/extending.md` still applies: it belongs in the operator-uid method
+group beside `code.index`, never in the ordinary group and never in `TOOLS[]`.
+
+### The completion carries no claim the worker made
+
+`op->success` is not the worker's opinion. It is the conjunction of two things
+Atlas did: the exit classification `atlas_driver` computed from the process's
+actual fate, and the verdict `atlas_validations_run` reached by running the
+job's own stored commands. The worker's stdout, its result document, its exit
+code and its prose are evidence *about a process* and are read by nothing that
+decides.
+
+**A zero exit is still not a success claim.** That is A8's rule and A11.1 does
+not weaken it: a worker that exits zero and fails its gate ends a task, and the
+run is not accepted. `tests/test_a11_run.c` submits a task whose text and whose
+output assert every authority word Atlas has — `ACCEPTED`, an actor of
+`LOCAL_OPERATOR_CONFIRMED`, `all gates passed` — alongside a gate that fails, and
+requires the run not to be accepted.
+
+The one piece of worker-adjacent text that survives is `op->failure_detail`, the
+bounded excerpt of what a *gate* printed. It reaches exactly one place: quoted,
+labelled, into a follow-up task's text, where it is untrusted data given to a
+model rather than an input to a decision.
+
+### The gates are fixed before any worker runs and inherited verbatim
+
+A run's verification commands are the root task's `validations`, written at
+submission by whoever created the run. A follow-up does not receive a list — it
+receives its *parent's*, decoded and re-encoded by the same canonical functions
+inside the same transaction. There is no field a worker can set, no message it
+can send and no file it can write that changes what runs.
+
+**A task that works in the repository's own tree must declare at least one gate,
+and that is checked at the write point.** `op_submit` refuses a repo-tree job
+with `validation_count == 0`. The reason is what acceptance would otherwise
+mean: a task with no gates succeeds on its process outcome alone, which this
+repository has said since A8 is not a success claim. Putting the check on the
+command that usually creates such a job would leave the side door open, so it is
+where the row is written — the placement `atlas_verify_intake_apply_in_tx` uses
+for the same reason.
+
+`argv[0]` is resolved against a fixed allowlist compiled into the binary, never
+against `PATH`. A gate command line is split on ASCII spaces by
+`split_words`, which is **not a shell and deliberately not shell-like**: no
+quoting, no escaping, no expansion, no glob. An argument containing a space
+cannot be expressed. That is a limitation rather than an oversight — the
+alternative is a miniature quoting language on the path to `execve`, which is how
+a gate eventually runs something other than what it reads like.
+
+### The bound counts worker starts, and it counts them in the ledger
+
+`ATLAS_ORCH_RUN_MAX_WORKER_STARTS` is three: the root task's worker and at most
+two follow-ups. It is compiled in, has no policy key and no flag, because a bound
+a caller can raise is not a bound.
+
+It is **derived, never stored**: `run_worker_starts` counts transitions to
+RUNNING across every task in the run. RUNNING is the state the driver records
+*immediately before it execs*, so the count is durable before the worker exists.
+Three consequences fall out rather than being arranged:
+
+- a crashed worker spends budget exactly as a finished one does;
+- a refusal that never reached a lease spends none, which is what makes retrying
+  a `BUSY` safe rather than merely probably safe;
+- there is no counter for a process to die between incrementing and using.
+
+`ATLAS_ORCH_MAX_ATTEMPTS` is a different bound with a different subject — how
+many attempts one *task* may make — and both apply, with the tighter one winning.
+They are never compared against each other.
+
+### A crash is retried; a failed gate is not
+
+The two failures are answered differently because they say different things. A
+worker that crashed or timed out has said nothing about the task, so the task is
+retried within its own attempt bound. A gate that failed has said something
+specific about it, and repeating the identical task over the identical tree
+would fail the identical gate — so the run's answer is a *different, narrower
+task*, with the original goal, the failing gate's name and a bounded excerpt of
+what it printed.
+
+Cancellation and `RECOVERY_REQUIRED` are answered by neither. Cancellation was
+asked for; `RECOVERY_REQUIRED` is Atlas saying it does not know what ran, and
+starting more work on top of that is the opposite of what the state means. Both
+block the run.
+
+### Exactly one follow-up per failure, three ways over
+
+The follow-up is created through `op_submit` — the same write point, the same
+canonical digest, the same A11.0 refusals — inside the completion transaction,
+with the parent already terminal. Three independent mechanisms would all have to
+fail together for a run to sprout two follow-ups for one failure:
+
+1. the transaction, which makes the completion and the creation one act;
+2. `idx_orch_jobs_one_active_per_run`, which permits one non-terminal task;
+3. the idempotency key `a11.<parent>.<attempt>`, derived from the failure it
+   answers, so a resumed or replayed completion resolves to the task that already
+   exists rather than making a second one.
+
+The follow-up quotes the **root** task's goal rather than its immediate parent's,
+so a third-generation task states the same objective as the first instead of a
+summary of a summary — and so its text is a function of (root, parent, attempt)
+and of nothing else, which is what lets the key be one too.
+
+### A repo-tree driver is never granted to a lease that did not name it
+
+`atlas_orch_driver_is_repo_tree` is one list, in `src/orch/orch.c`, and it is
+**not** a flag on `atlas_driver`: the daemon has to answer it about a stored name
+at the moment a lease would be granted, without linking the driver table's `run`
+functions into that decision.
+
+Two refusals follow, and both are needed:
+
+- **`op_lease` skips a repo-tree job for any lease with an empty driver filter.**
+  An empty filter means "any", and the A8 dispatcher polls exactly that way.
+- **`atlas_service_dispatcher_run` never puts one on a background dispatcher's
+  derived filter**, however the root-owned policy lists it. Without this the
+  first refusal is bypassed by a filter that names the driver because the policy
+  did.
+
+What both prevent is the same thing: a background dispatcher provisioning a
+workspace the driver does not use, running it somewhere it was not meant to run,
+and completing the task — settling a run with no gate having run where the
+changes are.
+
+**Settlement is scoped to these drivers too.** A run whose task ran under an A8
+workspace driver is not settled at all: nothing decided anything about it, and
+A11.0's statement that its status is its own axis still holds for it unchanged.
+
+### Atlas may now start a process that edits a registered repository
+
+This is the season's one reversal and it must be stated in full rather than
+softened.
+
+A8's worker runs on a snapshot in a worker-owned workspace and Atlas applies
+nothing it produces. A11.1's runs in the registered repository's **own tree**,
+because a chain of tasks that build on each other's changes cannot be built out
+of workers who cannot see them: a follow-up that could not see the first
+worker's work would be a follow-up to nothing.
+
+What is unchanged: every one of Atlas' own reads. `scan`, the index passes, the
+watcher, `src/git`'s every invocation and every command in `src/core` still open
+a registered repository read-only, and nothing in this milestone writes a byte
+into one. What changed is that an **operator running a foreground command** may
+now start a child process whose purpose is to edit the tree, in a directory Atlas
+resolved from its own registry.
+
+The scope is three things, all of which have to line up: the driver must be one
+`atlas_orch_driver_is_repo_tree` names, the lease must have asked for that driver
+by name, and the root-owned orchestration policy must list it. Remove any one and
+nothing starts.
+
+**The working tree is expected to be dirty afterwards.** It is the first worker's
+output and the second worker's input. Nothing in `src/orch/rundriver.c` cleans,
+resets, checks out, stashes or reverts anything, on any path including every
+failure path, and nothing should be added that does.
+
+### The pinned commit is checked twice, and a moved HEAD is refused rather than judged
+
+Before the worker starts: a tree that has moved off the task's pinned commit is
+not the tree the work was authorised over, and continuing would produce changes
+against something else. After it exits: a worker that committed, reset or checked
+out has invalidated everything a gate could tell us, so the gates are **not run
+at all**.
+
+Both refuse with `ATLAS_ORCH_REASON_POLICY_REFUSED`, which the daemon reads as
+non-retryable — no retry and no narrower task answers a moved HEAD — and the run
+is BLOCKED.
+
+This is also the only *enforceable* part of the constraint list the worker is
+given. "Do not commit, do not push, do not run a destructive git operation" is
+instruction, and instruction to a model is not a control. What Atlas actually
+holds is that a run whose HEAD moved is never accepted. Say it that way.
+
+### A `BUSY` refusal is retried, and it is not a `BLOCKED` run
+
+A9.2.6's refusal says, in the message itself, that nothing was queued and nothing
+will run. `ATLAS_IPC_BUSY_TOKEN` is the machine-readable half of that sentence
+and `atlas_ipc_message_is_busy` is the one reader of it.
+
+A11.1 is the first caller that must act on it, because a completion refused this
+way carries a worker's entire result: abandoning it means the lease expires, the
+task is requeued and a second worker does the same work. So every write the
+driver makes is retried under `BUSY`, boundedly. When the budget is spent the
+run stays **ACTIVE and resumable** and the invocation reports what happened — a
+lost invocation, never a lost run and never a `BLOCKED` one.
+
+The same distinction applies to a task another driver already holds. `busy` on
+the report is neither an acceptance nor a refusal: nothing was claimed, nothing
+was written, and repeating the command is safe.
+
+### The lease is renewed while the worker works
+
+`ATLAS_ORCH_LEASE_MS` is one minute and a real worker runs for many. A heartbeat
+that names the phase the attempt is **already in** renews the lease without
+transitioning, and `driver_should_stop` issues one from inside `atlas_proc_run`'s
+wait loop — for the worker and for every gate, because `make test` outlives a
+lease as readily as a model does.
+
+Without it the daemon's recovery timer reclaims the attempt underneath a healthy
+worker, marks it timed out, requeues the task, and refuses the completion as an
+unknown token. That is not a lost message; it is a second worker on the same
+task, which is the one thing this milestone must not do.
+
+A failed renewal does **not** stop the child. The attempt may already be lost,
+but killing a worker mid-edit on the strength of one unanswered call would leave
+the tree in a state nobody chose. Cancellation still arrives as the daemon's
+answer to a heartbeat and never as a signal: Atlas has no path into the worker's
+process tree and must not grow one.
+
+### The run driver starts nothing in the background
+
+No scheduler, no queue polling, no timer, no daemon loop, no provider router and
+no second submit path. `atlas job run` is a foreground command an operator typed,
+it drives one run, and when it returns nothing of it is still running.
+
+A11.1 also adds no model selection of any kind. There is one model driver,
+`claude-repo`, it executes the installed Claude Code CLI, and which model that
+CLI uses is the CLI's business and the operator's.

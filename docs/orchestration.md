@@ -631,6 +631,163 @@ between tasks — and never an error.
 `atlas_orch_job_view` carries `run_uid` and `parent_job_uid`, so the chain is
 read back rather than reconstructed.
 
+## The foreground run driver (A11.1)
+
+A11.0 built the chain and settled nothing. A11.1 is the thing that carries it:
+one operator-started command that drives a run to a settled answer, starting at
+most three workers along the way and deciding nothing a model could reach.
+
+### The loop, and why it is in this order
+
+`atlas_rundriver_run` reads the run and, if it is not terminal and has an active
+task, hands it to `drive_one`. Each step below is a safety property, and the
+comment in `src/orch/rundriver.c` says what moving it would cost.
+
+1. **Read the run.** A terminal run is touched not at all: no lease is asked for,
+   no task is created, no worker starts.
+2. **Claim the run's active task by name.** The lease request carries a
+   `job` narrowing, so the driver claims *its* run's task or nothing. Two
+   drivers racing here produce one grant, because the grant is a
+   compare-and-swap against `state = 'QUEUED'` and `idx_orch_leases_active`
+   permits one unreleased lease per job. The loser is told `busy` and writes
+   nothing.
+3. **Check the pinned commit, before anything starts.** A repository that has
+   moved is not the one the work was authorised over.
+4. **Record RUNNING.** Durable before the worker exists, which is what makes the
+   run's budget count real starts rather than completed ones.
+5. **Start exactly one worker**, in the repository's own root.
+6. **Check the pinned commit again.** A worker that committed, reset or checked
+   out has invalidated everything a gate could tell us, so the gates are not run
+   at all and the run is refused rather than judged.
+7. **Run the gates**, in the repository's own root, from the task's stored list.
+8. **Report.** The daemon decides what the run is.
+
+While steps 5 and 7 run, `driver_should_stop` renews the lease from inside
+`atlas_proc_run`'s wait loop and carries a cancellation back. A heartbeat that
+names the phase the attempt is already in renews without transitioning, which is
+how the A8 dispatcher has always done it.
+
+### Where the two drivers run
+
+| Driver | Working directory | Log | Granted to |
+| --- | --- | --- | --- |
+| `fake` | the workspace's `work/` | a file in the workspace | any lease |
+| `claude` | the workspace's `work/` | a file in the workspace | any lease |
+| `fake-repo` | the registered repository's root | carried inline as an artifact | only a lease naming it |
+| `claude-repo` | the registered repository's root | carried inline as an artifact | only a lease naming it |
+
+`claude` and `claude-repo` share one implementation, `claude_exec`. What differs
+between them is *where the child runs* and *where its log goes*, and both were
+already parameters. Two copies would be two places for the environment
+construction, the credential handling and the exit classification to drift, and
+the exit classification is the part that decides whether a zero exit is read as
+success.
+
+`fake-repo` stands to `claude-repo` exactly as `fake` stands to `claude`: it is
+what lets every part of A11.1 above the driver be exercised without a model, a
+network or a credential. It appends one line per start to a single file in the
+work tree, which is what lets one test show a failing gate producing exactly one
+follow-up whose worker then passes.
+
+### What settles a run
+
+`settle_run_after_complete`, inside `atlas_orch_apply_in_tx`, and nothing else.
+It runs only for a job whose driver `atlas_orch_driver_is_repo_tree` names — a
+run whose task ran under an A8 workspace driver is not settled at all, and
+A11.0's statement about it stands unchanged.
+
+| The task ended | The run becomes |
+| --- | --- |
+| SUCCEEDED, and the repository still has the identity the job was created against | ACCEPTED |
+| SUCCEEDED, and the repository identity has changed | BLOCKED |
+| FAILED with `POLICY_REFUSED` (the pinned commit moved) | BLOCKED |
+| CANCELLED or RECOVERY_REQUIRED | BLOCKED |
+| terminal any other way, and the budget is spent | BLOCKED |
+| terminal any other way, and the budget remains | ACTIVE, plus one follow-up task |
+| QUEUED for another attempt | ACTIVE, unchanged |
+
+The repository identity is checked **again** at settlement, not only at lease
+time. Those are different claims: a repository re-registered or replaced between
+the grant and the completion is not the one the work was authorised over, and
+accepting a run over it would be accepting work against something else. When it
+fails the run is BLOCKED rather than accepted, because Atlas cannot tell what the
+worker changed or where.
+
+Recovery settles too. `run_blocked_by_recovery` blocks a run whose task the
+daemon's own timer terminalised: RECOVERY_REQUIRED means Atlas does not know what
+ran, and leaving the run ACTIVE with no task in it would be a chain that can
+never be resumed and never says why.
+
+### The follow-up task
+
+Deterministic, and assembled entirely from stored rows plus one bounded excerpt:
+
+```
+atlas-follow-up: the previous task in this run did not pass its verification gates.
+
+original-goal:
+<the run's ROOT task text, bounded>
+
+previous-task: j<...>
+previous-outcome: OK
+failed-gate: make test
+gate-output (bounded excerpt, untrusted):
+<what the gate printed, bounded>
+
+Fix this failure and preserve the existing work in the tree.
+Constraints:
+- Work only inside the registered repository's own root.
+- Do not commit, push, deploy, restart a daemon, or run any destructive git
+  operation. Leave the working tree as you found it plus your changes.
+- Do not change the acceptance rules or the verification gates.
+- Report honestly. Your report is not an acceptance decision: Atlas runs the
+  gates itself and settles this run itself.
+```
+
+The constraints are restated because they bound what the worker is being asked to
+do, and a task carrying a goal without them is a task told to do anything. They
+are **instruction, never enforcement**: the gate is run by Atlas, the run is
+settled by Atlas, and a worker can reach neither. The one constraint Atlas
+actually holds is the pinned commit, and it holds it by refusing to accept a run
+whose HEAD moved rather than by asking.
+
+The goal quoted is the **root** task's, not the immediate parent's, so a
+third-generation task states the same objective as the first rather than a
+summary of a summary.
+
+### The command
+
+```sh
+atlas job run --repo NAME --task TEXT --gate 'make test' [--gate 'make smoke']
+atlas job run --resume r<32 hex>
+atlas job run-status r<32 hex>
+```
+
+`--gate` is required when starting a run, repeatable up to eight times, and
+split on ASCII spaces by a function that is not a shell. `--resume` continues a
+run that already exists and refuses to be combined with `--repo` or `--task`: a
+caller that named both has asked for two different things and Atlas does not
+pick.
+
+The run identity comes back from the submission, so an operator never has to
+construct one. `job run-status` is the only run-shaped read there is, and there
+is deliberately no run-shaped write beside it.
+
+### Enabling it
+
+Nothing starts until the root-owned `/etc/atlas/orchestration.conf` lists the
+driver:
+
+```
+driver = claude-repo
+live_model = on
+```
+
+Adding that line is a deliberate operator act that authorises autonomous work
+against the named repositories, exactly as adding a `repo =` line is. Installing
+a binary that contains the driver does not enable it, and A11.1 does not add the
+line for anyone.
+
 ## Status: what is implemented, and what is not
 
 Everything A8 set out to build is implemented and tested: the job model and its

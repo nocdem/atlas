@@ -43,6 +43,13 @@
 /* Bounds on what a driver may say about itself. */
 #define ATLAS_DRIVER_VERSION_MAX 128u
 
+/* The ref `fake-repo` points HEAD at when its task text asks it to move HEAD,
+ * which is what a worker that committed or checked out looks like from above.
+ * Named here rather than spelled twice, because the fixture that places the ref
+ * and the driver that points at it have to agree exactly; the behaviour itself
+ * is `fake:movehead` and is selected by nothing else. */
+#define ATLAS_FAKE_MOVED_BRANCH "atlas-fake-moved"
+
 typedef struct atlas_driver_req {
     /* The isolated workspace, when the caller provisioned one. A11.1's run
      * driver has none and passes NULL: it works in the registered repository's

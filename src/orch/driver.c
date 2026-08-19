@@ -806,6 +806,18 @@ static atlas_status fake_repo_run(const atlas_driver_req *req, atlas_driver_res 
     }
 
     bool fail = task_is(req->task, "fake:fail");
+    /* A worker that committed, reset or checked out — which is a thing a real
+     * `claude-repo` worker can do and the one thing the run driver re-checks
+     * after the child exits. Reproducing it needs no git process here: the
+     * caller has placed a ref at a second real commit, and pointing HEAD at that
+     * ref is exactly the state `git checkout` would leave. The name is an Atlas
+     * literal, so nothing else can select it.
+     *
+     * This assumes an ordinary repository whose git directory is `<root>/.git`,
+     * which is what the fixture that drives it builds. A linked worktree would
+     * need the git file read first, and this behaviour exists to be driven by
+     * tests rather than to be general. */
+    bool move_head = task_is(req->task, "fake:movehead");
 
     atlas_buf path = ATLAS_BUF_INIT;
     st = atlas_buf_appendf(&path, err, "%s/ATLAS_FAKE_DRIVER.txt", req->work_dir);
@@ -827,6 +839,33 @@ static atlas_status fake_repo_run(const atlas_driver_req *req, atlas_driver_res 
     if (st != ATLAS_OK) {
         return st;
     }
+
+    if (move_head) {
+        atlas_buf head = ATLAS_BUF_INIT;
+        st = atlas_buf_appendf(&head, err, "%s/.git/HEAD", req->work_dir);
+        if (st == ATLAS_OK) {
+            FILE *f = fopen(atlas_buf_cstr(&head), "we");
+            if (f == NULL) {
+                st = atlas_err_set_errno(err, ATLAS_ERR_INTERNAL, errno,
+                                         "cannot move the fake worker's HEAD");
+            } else {
+                static const char REF[] = "ref: refs/heads/" ATLAS_FAKE_MOVED_BRANCH "\n";
+                if (fwrite(REF, 1, sizeof REF - 1u, f) != sizeof REF - 1u) {
+                    st = atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                                       "cannot move the fake worker's HEAD");
+                }
+                if (fclose(f) != 0 && st == ATLAS_OK) {
+                    st = atlas_err_set_errno(err, ATLAS_ERR_INTERNAL, errno,
+                                             "cannot move the fake worker's HEAD");
+                }
+            }
+        }
+        atlas_buf_free(&head);
+        if (st != ATLAS_OK) {
+            return st;
+        }
+    }
+
     st = atlas_buf_appendf(&res->log, err, "fake-repo ran for job %s\n",
                            req->job_uid != NULL ? req->job_uid : "");
     res->stdout_bytes = (int64_t)res->log.len;

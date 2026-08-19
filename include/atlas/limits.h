@@ -71,6 +71,36 @@
  * for nothing. It is a responsiveness bound, never a correctness one: a waiter
  * that never woke early would still return the right answer, just later. */
 #define ATLAS_WRITER_WAIT_SLICE_MS 100
+/* How long a waiter gives an unbounded job to reach a yield point before it
+ * takes its own job back out of the queue and reports a refusal.
+ *
+ * A9.2.6 had no such grace: the slice above *was* the answer, so a write that
+ * arrived a millisecond into a semantic pass was refused a tenth of a second
+ * later and every one of them was, for minutes at a time. That was honest and it
+ * was also the whole cost — a recovery sweep that failed every twenty seconds
+ * for a pilot window, a submission that needed sixteen attempts across
+ * forty-seven seconds. The pass now yields between translation units and between
+ * chunks of a discovery walk, so the interesting question stopped being "is the
+ * writer busy?" and became "will it come back soon enough?".
+ *
+ * Measured from the waiter's **first observation** of an unbounded stretch, not
+ * from the moment its job was queued: a job queued a second before a pass starts
+ * has not yet been made to wait for anything, and charging it for that second
+ * would refuse writes that were about to be served.
+ *
+ * Two seconds because it must sit between two figures Atlas already holds. The
+ * gap between two yield points is one translation unit's parse — milliseconds
+ * for an ordinary unit — so a pass that is yielding at all comes back well
+ * inside it. And the smallest synchronous deadline on the writer path is a
+ * hook's `AI_WRITE_TIMEOUT_MS` of 4000 ms, so a waiter that spends its whole
+ * grace still backs out with time left to report the refusal rather than
+ * timing out — which matters because those two answers mean opposite things
+ * about whether the write is still on its way.
+ *
+ * The cost is stated rather than hidden: inside a non-yielding stretch — one
+ * unit that parses for up to `ATLAS_SEM_PARSE_TIMEOUT_MS` — a refusal now takes
+ * about this long instead of about a slice. */
+#define ATLAS_WRITER_YIELD_GRACE_MS 2000
 /* Hashing/stat worker threads. Clamped against the online CPU count. */
 #define ATLAS_WORKER_COUNT_MAX 8u
 #define ATLAS_WORKER_COUNT_DEFAULT 4u
@@ -649,6 +679,21 @@
  * The bound that actually protects the daemon: depth alone does not, because a
  * wide tree is expensive at depth one. Reached ⇒ PARTIAL. */
 #define ATLAS_SEM_DISCOVERY_MAX_ENTRIES 400000
+
+/* Directory entries the walk reads between two offers to yield the writer.
+ *
+ * The walk holds the writer thread for as long as it runs, and it runs entirely
+ * before any transaction opens — which is what makes it safe to hand the thread
+ * back mid-walk at all. It is asked per *entry* rather than per file opened,
+ * because a tree of empty directories reads entries and opens nothing, and a
+ * poll frequency that depended on candidates would never fire there.
+ *
+ * Compiled in rather than tuned: it is a responsiveness figure, not a
+ * correctness one — a walk that never offered would still produce the same
+ * candidate list, just with everything else waiting. Small enough that a
+ * `readdir` cadence keeps latency-critical writes moving, large enough that the
+ * offer is not made once per filename. */
+#define ATLAS_SEM_DISCOVER_YIELD_EVERY 256
 
 /* Candidate compilation databases one repository may hold.
  *

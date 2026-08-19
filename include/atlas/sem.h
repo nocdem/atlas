@@ -1008,6 +1008,29 @@ typedef struct atlas_sem_index_opts {
      * fails the generation rather than publishing a partial one. */
     bool (*cancel)(void *ud);
     void *cancel_ud;
+    /* Called between units so the thread running this pass can be lent to
+     * something short before the next one starts.
+     *
+     * A separate callback from `cancel` and never an overload of it, because
+     * they answer different questions and have opposite consequences: `cancel`
+     * asks whether to abandon the generation, and this one asks for nothing at
+     * all — it returns no value, this pass cannot fail because of it, and a
+     * caller that supplies neither behaves exactly as before.
+     *
+     * Every call site is **outside** any transaction, which is the whole
+     * contract. A1 forbids holding `BEGIN IMMEDIATE` across unbounded work, and
+     * a callback invoked inside one could reach a write, so it is offered
+     * between the chunks this pass already commits separately and nowhere else.
+     * In particular there is no yield *inside* a unit: the per-unit transaction
+     * deliberately spans the parse child, and that structure is not this
+     * mechanism's to change.
+     *
+     * What is on the other end is not this layer's business. It crosses as a
+     * bare function pointer and a `void *` for exactly that reason — the daemon
+     * puts its writer-queue drain there, a test can put a counter there, and
+     * `src/sem` names neither. */
+    void (*yield)(void *ud);
+    void *yield_ud;
 } atlas_sem_index_opts;
 
 void atlas_sem_index_opts_init(atlas_sem_index_opts *o);

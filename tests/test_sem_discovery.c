@@ -162,7 +162,7 @@ static void discover(env *e, atlas_sem_discovery_result *out, atlas_err *err) {
     atlas_repo_info info;
     repo_of(e, &info, err);
     atlas_sem_discovery_result_init(out);
-    T_OK(atlas_sem_discovery_run(e->db, &info, out, err), err);
+    T_OK(atlas_sem_discovery_run(e->db, &info, NULL, NULL, out, err), err);
     atlas_repo_info_free(&info);
 }
 

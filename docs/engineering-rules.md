@@ -2242,9 +2242,15 @@ reason and carry the same residual.
 1. During a semantic pass or a discovery walk, writer-bound ordinary writes are
    **refused, not deferred**, and hook session records for its duration are lost.
    That is the trade: a fast retryable refusal in place of a stalled daemon.
+   **A9.2.7 replaced this residual with a much smaller one** — the pass yields and
+   the latency-critical writes are served — and the refusal now happens only
+   inside a stretch with no yield in it. See the A9.2.7 section below; the
+   sentence above is left as it was written because the trade it describes was
+   real and the record of it is the point.
 2. A reconciliation, snapshot or maintenance job can still hold the serve loop up
    to the waiting caller's own timeout. Nothing here fixes that, and nothing here
-   pretends to.
+   pretends to. **Still true after A9.2.7**: none of those three is drainable
+   either, and reconciliation is still not unbounded.
 
 ### Backing out and timing out are different claims and never one message
 
@@ -2269,13 +2275,17 @@ has dequeued it and is running it: there is nothing to take back, and reporting 
 refusal would be reporting one for a write already in progress. Checking either
 half alone, or the two across separate lock holds, reintroduces exactly that.
 
-### Nothing overtakes anything
+### A job that gives up never overtakes anything
 
 `queue_remove` excises one never-started job and shifts the rest up by one. The
 queue stays first-in-first-out, and that is load-bearing well outside this file:
 the orchestration ledger and the decision lifecycle both depend on writes applying
 in the order they were accepted. A queue that let one job jump another to save a
 caller some latency would break them silently.
+
+**A9.2.7 narrowed which FIFO claim Atlas makes, in one direction and
+deliberately**, and the narrowing is stated under its own heading below rather
+than left to be inferred from this one. The excision rule here did not change.
 
 ### One implementation of "a caller waits for the writer"
 
@@ -2303,11 +2313,157 @@ returned and hand it the job to free.
 ### A gate that cannot fail is worse than no gate
 
 `tests/test_daemon_responsive.c` asserts that it observed a pass in flight and
-that at least one write actually met the busy path, and fails saying so if
+that at least one write reached the daemon during one, and fails saying so if
 neither happened. Without those two assertions a fixture that finished before
 anything could look at it would let every other assertion pass while testing
 nothing — which is precisely how the suite passed 79/79 while the daemon was
 unreachable for twenty-five minutes.
+
+A9.2.7 changed the second half of that pair rather than removing it: what has to
+be observed now is a write **served** during a pass, not one refused during one.
+Requiring a refusal would be requiring the residual, and a season whose gate
+depends on its own residual firing is one that breaks when the residual gets
+smaller.
+
+## A9.2.7 layers — additions
+
+| File | Owns |
+| --- | --- |
+| `src/daemon/writer.c` | `job_kind_is_drainable`, `writer_run_job`, `writer_yield`, `writer_yield_cb`, the grace in `writer_wait_locked` |
+| `include/atlas/limits.h` | `ATLAS_WRITER_YIELD_GRACE_MS`, `ATLAS_SEM_DISCOVER_YIELD_EVERY` |
+| `include/atlas/sem.h` | `atlas_sem_index_opts.yield` / `.yield_ud` |
+| `src/sem/index.c` | the three yield points in the pass, and carrying the pair into the walk |
+| `src/sem/discover.c` | the per-entry yield in `walk_dir` |
+| `src/db/db.c` | `atlas_db_in_transaction`, the drain's belt-and-braces guard |
+| `tests/test_daemon_responsive.c` | a write landing *during* a pass, and the two classifications compared over the enum |
+
+The serve loop in `src/ipc/server.c` is untouched again, and for the same reason
+it was untouched in A9.2.6: its serial dispatch is the design, and the cost of
+that design is what this season removes rather than the design itself.
+
+## A9.2.7 rules — these are not negotiable
+
+### A refusal a caller had to keep repeating was an answer, not a write
+
+A9.2.6 is a complete answer to "why is the daemon unreachable" and only half an
+answer to "why did my write not happen". For the length of a pass **nothing else
+was written at all**, and the bill is in `docs/backlog.md`: a recovery sweep
+refused every twenty seconds for a whole pilot window, a submission that needed
+sixteen attempts across forty-seven seconds, and an experiment arm that lost a
+finished worker's completion — so a tree the worker had correctly edited was
+evidence of work Atlas had no record of.
+
+This is the shape worth remembering: **a mechanism can be correct, honest, and
+well documented and still be the thing that is wrong.** Nothing about `BUSY:` was
+untrue. It was simply the only thing that ever happened.
+
+### The yield is offered where nothing is open, and nowhere else
+
+Three points in a semantic pass — between translation units, once before the
+generation is opened, once after the unit loop ends — and every
+`ATLAS_SEM_DISCOVER_YIELD_EVERY` directory entries in a walk. Every one of them
+is outside any transaction, which is the whole safety argument: A1 forbids
+holding `BEGIN IMMEDIATE` across unbounded work, and a callback offered from
+inside one could reach a write.
+
+**There is no yield inside a translation unit.** The per-unit transaction
+deliberately spans the parse child, and that structure is not this mechanism's to
+change — so the largest gap between two yields is one unit's parse, and that gap
+is the season's residual rather than something to engineer around.
+
+`atlas_db_in_transaction` is asked anyway at the top of the drain. It is belt and
+braces rather than a branch anybody expects to take: a yield point inside a
+transaction would already be a bug, and this turns it into a no-op instead of a
+nested write. It answers from Atlas' own nesting counter *and* from SQLite's
+autocommit flag, because either alone can miss and a false "no" here would be
+worse than not asking.
+
+### There is one implementation of the completion protocol
+
+`writer_run_job` claims the job, runs it, completes it and settles who frees it.
+The main loop calls it; so does the drain. A second copy of the ownership exit —
+`running` cleared, `wants_result` read and `done` set in one lock hold — is the
+defect this file's history predicts, and it would agree with the original until
+the day one of them was edited.
+
+It **saves and restores** the claim rather than setting and clearing it, and that
+is what makes the reuse honest rather than convenient. From the main loop the
+writer was idle, so the restore is identical to clearing. From a drain the writer
+was already inside an unbounded job, so `running_kind` truthfully names the
+bounded kind for the length of the drained job and the pass's kind is put back in
+the same hold that completes it. That is what keeps `writer_wait_locked` correct
+with no special case: mid-drain the running kind is bounded, so nothing backs
+out.
+
+One window follows and is not a defect: between two drained jobs the restored
+kind is the pass's, so a waiter whose grace has already expired can back out at
+the very moment the drain would have reached it. The refusal is still exactly
+true — its job is removed and never ran — so the cost is one retry, not a lost
+write.
+
+### The drainable set is decided per kind, with a reason at the case
+
+`job_kind_is_drainable` has **no `default:`**, like `job_kind_is_unbounded` beside
+it, so a new job kind does not compile until somebody has answered both
+questions. `true` requires two things together: the caller is latency-critical,
+and the tables the job writes are disjoint from everything a semantic pass or a
+discovery walk touches. Disjointness is what makes the interleave reasonable
+rather than merely tested — a drained job cannot see the half-built generation
+the pass is assembling, which is invisible until `atlas_db_sem_publish` in any
+case.
+
+`false` is not "unimportant" and every one of them carries its reason at the
+case. `tests/test_daemon_responsive.c` walks the whole enum and compares both
+answers against the documented sets, because a switch that compiles is not a
+switch anybody thought about, and asserts the one combination that can never be
+right: **an unbounded kind is never drainable.**
+
+### FIFO is narrowed in exactly one direction, and it is written down
+
+Preserved: first-in-first-out **among drainable kinds** — the drain scans the
+queue front to back — and **within every kind**. Given up: first-in-first-out
+between a drained bounded job and a *queued* unbounded one. A lease renewal that
+arrives behind a queued semantic pass is now served before it.
+
+Refusing that would reimpose the starvation the season exists to end, so it is a
+choice rather than an oversight. The two orderings that are load-bearing outside
+`writer.c` survive because both are per domain and every drained domain keeps its
+own order: the orchestration ledger still applies in acceptance order, and so
+does the decision lifecycle. **If a new kind's ordering against a queued semantic
+pass is load-bearing, it is not drainable.**
+
+### The grace is measured from the waiter's first observation
+
+Not from queue time. A job queued a second before a pass starts has not yet been
+made to wait for anything, and charging it for that second would refuse writes
+that were about to be served.
+
+It is a local in `writer_wait_locked`, set once and never cleared, so the grace
+is per waiter rather than per pass: a waiter that has already spent it does not
+earn a second one because a *new* pass started. What it protects against is its
+own latency, not the identity of what is holding the thread.
+
+`ATLAS_WRITER_YIELD_GRACE_MS` has to sit between two figures Atlas already holds:
+above the gap between two yield points, or a yielding pass is refused anyway, and
+below the smallest synchronous deadline on this path — a hook's
+`AI_WRITE_TIMEOUT_MS` of 4000 ms — so that a back-out still precedes a timeout.
+Those two answers mean opposite things about whether the write is on its way, and
+turning every refusal into a timeout would be a correctness bug in the caller.
+
+### The first observation must not remove the job
+
+`queue_remove` used to be the *test*: it asked "is this job still queued?" and
+answered by taking it out. That is exactly wrong once there is a grace to serve,
+because the whole point is that the drain may still reach the job. The
+observation and the removal are two steps now, and the queue is touched only once
+the grace has run out. The conjunction A9.2.6 wrote down is unchanged: a job that
+`queue_remove` cannot find is one the writer has already taken, and the waiter
+keeps waiting.
+
+### `WRITER_BUSY_MSG` did not change, because it is still exactly true
+
+A back-out is still the job being removed before anything looked at it. Nothing
+about what a refusal *means* moved; only how often a caller reaches one.
 
 ## O10 layers — additions
 

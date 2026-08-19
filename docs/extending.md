@@ -637,23 +637,55 @@ it with one that has to be reasoned about after a restart.
 
 ### Adding a job kind to `atlas_job_kind`
 
-`job_kind_is_unbounded` in `src/daemon/writer.c` has **no `default:`**, so the
-build fails until the new kind is placed on one side of it. That is the checklist
-entry: it is not optional and it cannot be skipped, by construction.
+There are **two** questions now, `job_kind_is_unbounded` and
+`job_kind_is_drainable`, both in `src/daemon/writer.c` and **neither with a
+`default:`** — so the build fails until the new kind is placed on one side of
+each. That is the checklist entry: it is not optional and it cannot be skipped,
+by construction. `tests/test_daemon_responsive.c` walks the whole enum and
+compares both answers against the documented sets, because a switch that
+compiles is not a switch anybody thought about.
 
-Answer `true` only if the job has no duration Atlas can state — it runs a
-compiler, walks a tree, or otherwise does work bounded by the repository rather
-than by a statement count. Everything else answers `false`.
+**Is it unbounded?** Answer `true` only if the job has no duration Atlas can
+state — it runs a compiler, walks a tree, or otherwise does work bounded by the
+repository rather than by a statement count. Everything else answers `false`.
 
-What answering `true` costs: for the whole time that job runs, **every**
-synchronous writer call is refused with `BUSY:` rather than queued. For a hook
-session write that means the record is *lost*, because hooks fail open. Answering
-`true` for a frequent job is therefore not a conservative choice — it is a
-data-loss choice, which is why reconciliation answers `false`. See the A9.2.6
-section of `docs/engineering-rules.md` for that argument in full.
+What answering `true` costs: a synchronous writer call that meets that job waits
+`ATLAS_WRITER_YIELD_GRACE_MS` for it to reach a yield point, and is refused with
+`BUSY:` if none comes. For a hook session write a refusal means the record is
+*lost*, because hooks fail open. Answering `true` for a frequent job is therefore
+not a conservative choice — it is a data-loss choice, which is why reconciliation
+answers `false`. See the A9.2.6 section of `docs/engineering-rules.md` for that
+argument in full.
 
 What answering `false` costs: a caller — and therefore every other client, since
 the serve loop dispatches serially — can wait up to that caller's own timeout.
+
+**May it be drained?** `job_kind_is_drainable` answers whether the kind may run
+*inside* a yield of an unbounded job. Answer `true` only when both hold: the
+caller is latency-critical, and the tables the job writes are disjoint from
+everything a semantic pass or a discovery walk touches. Every `false` gets its
+one-line reason written at the case; "not obviously safe" is a reason and is the
+right default.
+
+Answering `true` when it is unbounded is the one combination that is never
+correct — an unbounded job inside another one has no bound at all — and the
+agreement test asserts the implication rather than trusting it. Answering `true`
+also means the job may be applied **before** a queued unbounded job that was
+accepted earlier: first-in-first-out is preserved among drainable kinds and
+within every kind, and deliberately not between the two groups. If the new kind's
+ordering against a *queued semantic pass* is load-bearing, it is not drainable.
+
+**The branch that is deliberately untested, recorded rather than left to be
+discovered.** Grace-expiry `BUSY` under a *real* non-yielding pass is not
+deterministically reachable in a test: it needs a translation unit large enough
+to parse for longer than the grace on whatever machine is running the suite, and
+a fixture that has to be that big is a fixture that is one compiler upgrade away
+from never firing. A test that cannot fail is worse than none. The refusal
+contract stays covered by the transport-simulated `BUSY` cases in
+`tests/test_a11_run.c` and `tests/test_orch_lifecycle.c`, and by the
+refused-then-retried case in `tests/test_daemon_responsive.c`, which simulates
+the refusal by not reaching the write point at all — which is exactly what a
+back-out is.
 
 ### Adding a synchronous writer call
 
@@ -679,11 +711,23 @@ false for the deadline case, which is why the two messages are separate.
 | Bound | Where | Reached ⇒ |
 | --- | --- | --- |
 | `ATLAS_WRITER_WAIT_SLICE_MS` | `limits.h` | nothing; the waiter re-asks the busy question |
+| `ATLAS_WRITER_YIELD_GRACE_MS` | `limits.h` | the waiter backs out and reports `BUSY:` |
+| `ATLAS_SEM_DISCOVER_YIELD_EVERY` | `limits.h` | nothing; the walk offers the writer thread |
 
-It is a responsiveness bound, never a correctness one: a waiter that never woke
-early would still return the right answer, just later. Lowering it wakes an idle
-daemon more often for nothing; raising it lengthens the head-of-line stall before
-a waiter notices it should stop waiting.
+The slice and the yield interval are responsiveness bounds, never correctness
+ones: a waiter that never woke early would still return the right answer, just
+later, and a walk that never offered would produce the same candidate list.
+Lowering the slice wakes an idle daemon more often for nothing; raising it
+lengthens the head-of-line stall before a waiter notices it should stop waiting.
+
+The grace is the one to think about before moving. It is measured from a waiter's
+**first observation** of an unbounded stretch, never from queue time, and it has
+to stay between two figures Atlas already holds: above the gap between two yield
+points — one translation unit's parse — or a yielding pass is refused anyway, and
+below the smallest synchronous deadline on the writer path, which is a hook's
+`AI_WRITE_TIMEOUT_MS` of 4000 ms. Raising it past that would turn every refusal
+into a timeout, and those two answers mean opposite things about whether the
+write is still on its way.
 
 ## A10.1 — the bounded cross-run memory package
 

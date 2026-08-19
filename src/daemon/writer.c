@@ -282,8 +282,13 @@ static const char WRITER_BUSY_MSG[] =
  * failure, and it would be the frequent one.
  *
  * There is no `default:`, so adding a job kind will not compile until somebody
- * decides which side it is on. See `docs/extending.md`. */
-static bool job_kind_is_unbounded(atlas_job_kind kind) {
+ * decides which side it is on. See `docs/extending.md`.
+ *
+ * Not `static`, and it is declared in `daemon/daemon_internal.h` for one reason:
+ * the agreement test walks the whole `atlas_job_kind` enum and asks both this
+ * question and `job_kind_is_drainable` of every member. Two classifications of
+ * one vocabulary drift, and a drift nothing compares is one nobody sees. */
+bool job_kind_is_unbounded(atlas_job_kind kind) {
     switch (kind) {
     /* Runs a compiler over every translation unit the build describes. */
     case ATLAS_JOB_SEM_INDEX:
@@ -303,6 +308,81 @@ static bool job_kind_is_unbounded(atlas_job_kind kind) {
     case ATLAS_JOB_GW_AUDIT:
     case ATLAS_JOB_APIKEY:
     case ATLAS_JOB_VERIFY:
+    case ATLAS_JOB_SEM_CONFIG:
+        return false;
+    }
+    return false;
+}
+
+/* Whether a job of this kind may be run *inside* a yield of an unbounded one.
+ *
+ * **THE PASS HELD THE THREAD; NOBODY ELSE COULD REACH IT.** A9.2.6 let a waiter
+ * stop waiting, which stopped one slow write taking every client with it, and
+ * left the write itself refused. That was the honest answer and it was not the
+ * useful one: for as long as a semantic pass ran, *nothing else was written at
+ * all*, so a recovery sweep, a completion and a session record were all refused
+ * for minutes at a stretch and had to be sent again. The pass now hands the
+ * thread back between translation units, and this is the question asked of what
+ * is waiting there.
+ *
+ * `true` for the latency-critical writes whose tables are disjoint from
+ * everything a semantic pass or a discovery walk touches. Disjointness is why
+ * the interleave is safe to reason about: a drained job cannot see, and cannot
+ * be seen by, the half-built generation the pass is assembling — which is
+ * invisible until `atlas_db_sem_publish` in any case.
+ *
+ * `false` is not "unimportant". It means *not while a pass is in the middle of
+ * itself*, and each one has its own reason, written at the case rather than
+ * inferred from the list.
+ *
+ * The order of everything not drained is untouched: the drain scans front to
+ * back and removes only what it runs, so first-in-first-out holds among the
+ * drainable kinds and within every kind. What it deliberately gives up is
+ * first-in-first-out *between* a drained bounded job and a queued unbounded one:
+ * a bounded write may pass a queued pass. Refusing that would reimpose the
+ * starvation this exists to end, and the orderings that are load-bearing — the
+ * orchestration ledger's and the decision lifecycle's — are per domain and every
+ * drained domain keeps its own. See `docs/daemon-and-ipc.md`.
+ *
+ * There is no `default:` here either, for the reason there is none above: a new
+ * job kind must not compile until somebody has decided both questions about it.
+ * See `docs/extending.md`. */
+bool job_kind_is_drainable(atlas_job_kind kind) {
+    switch (kind) {
+    /* A lease, an attempt, a completion, a recovery sweep. The writes a worker
+     * and its driver are blocked on, and the ones whose refusal was measured. */
+    case ATLAS_JOB_ORCH:
+    /* A session record from a hook, which has four seconds and fails open. */
+    case ATLAS_JOB_AI:
+    /* A decision revision or a lifecycle transition; an operator is waiting. */
+    case ATLAS_JOB_DECISION:
+    /* A claim, its evidence, an attestation — records nothing rebuilds. */
+    case ATLAS_JOB_VERIFY:
+    /* One audit row for a request that has already been answered. */
+    case ATLAS_JOB_GW_AUDIT:
+    /* A credential change; revocation must not wait for a compiler. */
+    case ATLAS_JOB_APIKEY:
+        return true;
+    /* An unbounded job must never run inside another one. */
+    case ATLAS_JOB_SEM_INDEX:
+    case ATLAS_JOB_SEM_DISCOVER:
+    /* A first full pass can run for minutes. A yield is a pause, not a tunnel
+     * through which another long pass reaches the thread. */
+    case ATLAS_JOB_RECONCILE:
+    /* Reads a pinned commit's whole tree, up to its 120 s budget. */
+    case ATLAS_JOB_SNAPSHOT:
+    /* Deletes rows. A prune interleaved with a pass over the same database is a
+     * new argument nobody has written, and this is not the change to write it. */
+    case ATLAS_JOB_MAINTENANCE:
+    /* These mutate the ground the running pass is standing on. Today a removal
+     * cannot interleave with a pass, and that impossibility is worth keeping. */
+    case ATLAS_JOB_REPO_ADD:
+    case ATLAS_JOB_REPO_REMOVE:
+    /* Watcher bookkeeping, ordered against the reconcile submissions it
+     * accompanies. Nothing latency-critical is waiting on either. */
+    case ATLAS_JOB_MARK_GAP:
+    case ATLAS_JOB_SET_WATCH:
+    /* Reconfigures the very activity that is yielding. */
     case ATLAS_JOB_SEM_CONFIG:
         return false;
     }
@@ -338,8 +418,30 @@ static bool job_kind_is_unbounded(atlas_job_kind kind) {
  * as one already running, and a single `pthread_cond_timedwait` would sleep
  * straight through the difference. A slice expiring is not the timeout — only
  * the deadline is, which is why the slice is clamped to it rather than allowed
- * to overrun it. */
+ * to overrun it.
+ *
+ * What this season changes is *when* a waiter gives up, and nothing else. An
+ * unbounded job now hands the thread back between translation units, so
+ * observing one is no longer a reason to abandon a write — it is a reason to
+ * wait one grace and see whether the drain arrives. Only if it does not does the
+ * job come out of the queue. Both messages a caller can receive mean exactly
+ * what they meant before: `BUSY:` still says nothing ran and nothing will,
+ * because the job is still removed before the message is built, and the deadline
+ * still says the write is on its way. */
 static bool writer_wait_locked(atlas_writer *w, atlas_job *j, const struct timespec *deadline) {
+    /* When this waiter first saw the writer inside an unbounded job.
+     *
+     * Local, so the grace is per waiter rather than per pass, and it is set once
+     * and never cleared. Two consequences, both intended. A waiter that has
+     * already spent its grace does not earn a second one because a *new* pass
+     * started: what it is protecting against is its own latency, not the
+     * identity of what is holding the thread. And a waiter that arrives during a
+     * drain — when the running kind is momentarily the bounded job being served
+     * — starts its grace at the next observation rather than never, because the
+     * pass's kind is restored in the same lock hold that completes the drained
+     * job. */
+    struct timespec unbounded_seen_at;
+    bool unbounded_seen = false;
     while (!j->done) {
         struct timespec now;
         (void)clock_gettime(CLOCK_REALTIME, &now);
@@ -365,10 +467,27 @@ static bool writer_wait_locked(atlas_writer *w, atlas_job *j, const struct times
          * also still queued: if `queue_remove` cannot find it, the writer has
          * dequeued it and is running *this* job — there is nothing to take back,
          * and abandoning it would report a refusal for a write already in
-         * progress. Keep waiting instead, which is what the deadline is for. */
-        if (!j->done && w->running && job_kind_is_unbounded(w->running_kind) &&
-            queue_remove(w, j)) {
-            return true;
+         * progress. Keep waiting instead, which is what the deadline is for.
+         *
+         * The observation and the removal are two steps now, and the separation
+         * is the correctness detail. `queue_remove` used to be the *test*: it
+         * both asked "is this job still queued?" and answered by taking it out.
+         * With a grace to serve, the first observation must leave the job exactly
+         * where it is, because the whole point is that the drain may still reach
+         * it. So the queue is only touched once the grace has actually run out. */
+        if (!j->done && w->running && job_kind_is_unbounded(w->running_kind)) {
+            struct timespec seen;
+            (void)clock_gettime(CLOCK_REALTIME, &seen);
+            if (!unbounded_seen) {
+                unbounded_seen = true;
+                unbounded_seen_at = seen;
+            } else {
+                int64_t waited_ms = (int64_t)(seen.tv_sec - unbounded_seen_at.tv_sec) * 1000 +
+                                    (seen.tv_nsec - unbounded_seen_at.tv_nsec) / 1000000;
+                if (waited_ms >= (int64_t)ATLAS_WRITER_YIELD_GRACE_MS && queue_remove(w, j)) {
+                    return true;
+                }
+            }
         }
     }
     return false;
@@ -656,6 +775,15 @@ static void mark_all_repos_gapped(atlas_db *db, const char *detail) {
 }
 
 
+/* What an unbounded job calls to hand the writer thread back for a moment.
+ *
+ * Declared here and defined below, because the drain runs the very jobs the
+ * `run_*` functions below it are: the cycle is real and a forward declaration is
+ * the honest way to write it. It crosses into `src/sem` as a bare function
+ * pointer and a `void *`, exactly as `atlas_sem_index_opts.cancel` already does,
+ * so nothing in `src/sem` or `src/core` names a daemon type. */
+static void writer_yield_cb(void *ud);
+
 /* A8-CI closeout: build a semantic index on the writer thread.
  *
  * This is the serialized writer path the closeout requires, and putting it here
@@ -694,7 +822,10 @@ static void run_sem_discover(atlas_writer *w, atlas_job *j) {
     }
     atlas_sem_discovery_result res;
     atlas_sem_discovery_result_init(&res);
-    if (atlas_sem_discovery_run(w->db, &repo, &res, &err) != ATLAS_OK) {
+    /* The walk is handed the drain, so a repository with a large tree does not
+     * hold every other write for the length of it. The walk finishes before the
+     * transaction that records it opens, which is what makes that safe. */
+    if (atlas_sem_discovery_run(w->db, &repo, writer_yield_cb, w, &res, &err) != ATLAS_OK) {
         atlas_daemon_log(w->log, "warn",
                          "build-input discovery could not run for repository %lld: %s",
                          (long long)j->repo_id, atlas_err_msg(&err));
@@ -775,7 +906,12 @@ static void run_sem_index(atlas_writer *w, atlas_job *j) {
     }
 
     if (st == ATLAS_OK) {
-        st = atlas_sem_index_on(w->db, &repo, compdbs, n, j->sem_rebuild, &sum, &err);
+        /* The pass is handed the drain. This is the job the season is about: it
+         * runs a compiler over every unit the build describes, and until it
+         * offered the thread back between them nothing else in this daemon was
+         * written for as long as it took. */
+        st = atlas_sem_index_on(w->db, &repo, compdbs, n, j->sem_rebuild, writer_yield_cb, w, &sum,
+                                &err);
     }
 
     /* Only an *automatic* attempt feeds the governor, and `op_id == 0` is how
@@ -861,6 +997,226 @@ static void run_sem_index(atlas_writer *w, atlas_job *j) {
     (void)pthread_mutex_unlock(&w->lock);
 }
 
+
+/* Run exactly one job to completion, and settle who owns it afterwards.
+ *
+ * **There is one implementation of the completion protocol and this is it.** The
+ * main loop below calls it, and so does the yield drain, and a second copy of
+ * these rules is the defect this file's history predicts: the ownership exit is
+ * three lines that must all happen in one lock hold, and two copies of it would
+ * agree until the day one of them was edited.
+ *
+ * Called with the lock **not** held, and it takes the lock twice: once to claim
+ * the job before running it, once to complete it.
+ *
+ * The claim is saved and restored rather than set and cleared, which is what
+ * lets the drain reuse this untouched. From the main loop the writer was idle,
+ * so the restore puts it back to idle — byte for byte what the loop did before
+ * this function existed. From a drain the writer was already inside an unbounded
+ * job, so for the length of the drained job `running_kind` truthfully names the
+ * *bounded* kind being served, and the restore puts the pass's kind back in the
+ * same hold that completes the job. That is what keeps `writer_wait_locked`
+ * correct with no special case anywhere: mid-drain the running kind is bounded,
+ * so nothing backs out; the instant the drain ends it is unbounded again.
+ *
+ * One window falls out of that and is not a defect: between two drained jobs the
+ * restored kind is briefly the pass's, so a waiter whose grace has *already*
+ * expired can back out at the very moment the drain would have reached it. The
+ * refusal is still exactly true — its job is removed and never ran, and sending
+ * it again is safe — so what it costs is one retry, not a lost write.
+ *
+ * `wants_result` is read inside the completing hold rather than before it, and
+ * that is what decides who frees the job. A waiter that has given up clears it
+ * under this same lock, so reading it outside could see the waiter still there,
+ * hand it the job, and leak — the waiter has already returned. Whoever observes
+ * it last under the lock owns the answer. */
+static void writer_run_job(atlas_writer *w, atlas_job *j) {
+    (void)pthread_mutex_lock(&w->lock);
+    bool was_running = w->running;
+    atlas_job_kind was_kind = w->running_kind;
+    /* Claimed before the lock is released, so there is no instant in which this
+     * thread owns a job and reports itself idle. A waiter that saw that instant
+     * would conclude its own job could not be the one running. */
+    w->running = true;
+    w->running_kind = j->kind;
+    (void)pthread_mutex_unlock(&w->lock);
+
+    switch (j->kind) {
+    case ATLAS_JOB_RECONCILE: run_reconcile(w, j); break;
+    case ATLAS_JOB_REPO_ADD: run_repo_add(w, j); break;
+    case ATLAS_JOB_REPO_REMOVE: run_repo_remove(w, j); break;
+    case ATLAS_JOB_AI: run_ai(w, j); break;
+    case ATLAS_JOB_DECISION: run_decision(w, j); break;
+    case ATLAS_JOB_ORCH: run_orch(w, j); break;
+    case ATLAS_JOB_VERIFY: run_verify(w, j); break;
+    case ATLAS_JOB_SNAPSHOT: run_snapshot(w, j); break;
+    case ATLAS_JOB_SEM_INDEX: run_sem_index(w, j); break;
+    case ATLAS_JOB_SEM_DISCOVER: run_sem_discover(w, j); break;
+    case ATLAS_JOB_MAINTENANCE: {
+        /* Both pointers belong to a caller that may have stopped waiting;
+         * cleared under the lock in that case, so a NULL here means the
+         * result has nowhere to go. */
+        if (j->maint != NULL && j->maint_out != NULL) {
+            j->result = atlas_maintenance_on(w->db, j->maint, j->maint_out, &j->result_err);
+        }
+        break;
+    }
+    case ATLAS_JOB_SEM_CONFIG: {
+        if (j->sem_config != NULL && j->sem_config_out != NULL) {
+            j->result = atlas_sem_config_on(w->db, j->sem_config, j->sem_config_out,
+                                            &j->result_err);
+        }
+        break;
+    }
+    case ATLAS_JOB_APIKEY: {
+        /* Both pointers belong to a caller that may have stopped waiting;
+         * cleared under the lock in that case, so a NULL here means the
+         * result has nowhere to go — and in particular means a freshly
+         * minted plaintext is never written into a struct nobody owns. */
+        if (j->apikey != NULL && j->apikey_out != NULL) {
+            if (j->apikey->kind == ATLAS_APIKEY_JOB_REVOKE) {
+                j->result = atlas_apikey_revoke_on(w->db, j->apikey->key_id,
+                                                   &j->apikey_out->changed, &j->result_err);
+            } else {
+                atlas_apikey_create_opts co;
+                memset(&co, 0, sizeof co);
+                co.label = j->apikey->label;
+                co.scopes = j->apikey->scopes;
+                co.rotate_from = j->apikey->rotate_from[0] != '\0' ? j->apikey->rotate_from
+                                                                  : NULL;
+                j->result = atlas_apikey_create_on(w->db, &co, &j->apikey_out->created,
+                                                   &j->result_err);
+            }
+        }
+        break;
+    }
+    case ATLAS_JOB_GW_AUDIT: {
+        /* Nobody is waiting, so a failure is logged and dropped rather than
+         * reported: the request this describes has already been answered,
+         * and failing it retroactively is not something Atlas can do.
+         *
+         * The credential touch rides along because the gateway audits every
+         * request anyway, which makes `last_used_at` free rather than a
+         * second round trip on the path of every authenticated read. It is
+         * throttled in SQL, so two gateway processes cannot each decide it
+         * is their turn. */
+        if (j->gw_audit != NULL) {
+            atlas_err aerr;
+            atlas_err_init(&aerr);
+            if (atlas_db_gw_audit_append(w->db, j->gw_audit, &aerr) != ATLAS_OK) {
+                /* Logged and dropped. The request this row describes has
+                 * already been answered, and failing it retroactively is
+                 * not something Atlas can do. */
+                atlas_safe_pool safe;
+                atlas_safe_pool_init(&safe);
+                atlas_daemon_log(w->log, "warn", "gateway audit row not written: %s",
+                                 atlas_safe(&safe, atlas_err_msg(&aerr)));
+                atlas_safe_pool_free(&safe);
+            }
+            if (j->gw_audit->key_id[0] != '\0') {
+                atlas_err terr;
+                atlas_err_init(&terr);
+                (void)atlas_db_apikey_touch(w->db, j->gw_audit->key_id, &terr);
+            }
+        }
+        break;
+    }
+    case ATLAS_JOB_MARK_GAP: {
+        atlas_err ignore;
+        atlas_err_init(&ignore);
+        (void)atlas_db_index_state_mark_gap(w->db, j->repo_id, atlas_buf_cstr(&j->arg1),
+                                            &ignore);
+        break;
+    }
+    case ATLAS_JOB_SET_WATCH: {
+        atlas_err ignore;
+        atlas_err_init(&ignore);
+        (void)atlas_db_index_state_set_watch(w->db, j->repo_id,
+                                             (atlas_watch_state)j->watch_state,
+                                             j->arg1.len > 0 ? atlas_buf_cstr(&j->arg1) : NULL,
+                                             j->watched_dirs, &ignore);
+        break;
+    }
+    default: break;
+    }
+
+    /* One hold restores the claim, completes the job and wakes the waiters,
+     * because a waiter that saw the writer idle while its own job was still
+     * unfinished would take its job back out of a queue it is no longer in. */
+    (void)pthread_mutex_lock(&w->lock);
+    w->running = was_running;
+    w->running_kind = was_kind;
+    bool waited_on = j->wants_result;
+    if (waited_on) {
+        j->done = true;
+    }
+    (void)pthread_cond_broadcast(&w->job_done);
+    (void)pthread_mutex_unlock(&w->lock);
+    if (!waited_on) {
+        job_free(j);
+    }
+    /* Otherwise ownership stays with the waiter, which frees it. */
+}
+
+/* A pause in an unbounded job, long enough to serve what is waiting.
+ *
+ * **A RESOLVED QUEUE THAT NOBODY COULD REACH WAS STILL A BACKLOG, NOT WORK.**
+ * A9.2.4 put a minutes-long pass on the single writer thread, and from that
+ * moment every other write was refused for the duration — honestly, and
+ * uselessly. The pass already chunks its own work and already commits per batch;
+ * what it did not do was let anything else run between the chunks. This is that,
+ * and it is scheduling rather than state: it records nothing durable, and a
+ * daemon that never called it would produce the same rows, later.
+ *
+ * Called only from a point the pass has chosen — between translation units,
+ * between chunks of a directory walk — and every one of those points is outside
+ * any transaction. The guard below re-asks that anyway, and it is belt and
+ * braces rather than a real branch: A1 forbids holding `BEGIN IMMEDIATE` across
+ * unbounded work, so a yield point inside a transaction would already be a bug,
+ * and this turns it into a no-op instead of a nested write. It is cheap and it
+ * is checked at the one place where being wrong would corrupt something.
+ *
+ * Jobs enqueued while draining are picked up by this same loop or at the next
+ * yield; either is correct, and neither is a starvation risk, because the loop
+ * ends the moment nothing eligible is left. Everything ineligible keeps its
+ * position untouched. */
+static void writer_yield(atlas_writer *w) {
+    if (atlas_db_in_transaction(w->db)) {
+        return;
+    }
+    for (;;) {
+        (void)pthread_mutex_lock(&w->lock);
+        atlas_job *j = NULL;
+        /* Front to back, so first-in-first-out holds among the kinds that are
+         * eligible and within every one of them. The first eligible job wins;
+         * anything ahead of it that is not eligible simply stays where it is. */
+        for (size_t k = 0; j == NULL && k < w->count; k++) {
+            atlas_job *q = w->queue[(w->head + k) % ATLAS_WRITER_QUEUE_MAX];
+            if (job_kind_is_drainable(q->kind)) {
+                j = q;
+            }
+        }
+        if (j != NULL) {
+            /* The same excision a waiter that gave up performs, and the same
+             * shifting discipline: every other job keeps its position. */
+            (void)queue_remove(w, j);
+        }
+        (void)pthread_mutex_unlock(&w->lock);
+        if (j == NULL) {
+            return;
+        }
+        writer_run_job(w, j);
+    }
+}
+
+/* The `void *`-shaped face of the drain, which is how it crosses into `src/sem`.
+ *
+ * A bare function pointer and an opaque pointer, exactly as `cancel` already
+ * travels, so the semantic layer calls this without ever naming a writer, a job
+ * or a queue. */
+static void writer_yield_cb(void *ud) {
+    writer_yield((atlas_writer *)ud);
+}
 
 static void *writer_main(void *arg) {
     atlas_writer *w = (atlas_writer *)arg;
@@ -965,138 +1321,14 @@ static void *writer_main(void *arg) {
             break;
         }
         atlas_job *j = queue_pop(w);
-        /* Claimed in the hold that dequeued it, so there is no instant in which
-         * this thread owns a job and reports itself idle. A waiter that saw that
-         * instant would conclude its own job could not be the one running. */
-        if (j != NULL) {
-            w->running = true;
-            w->running_kind = j->kind;
-        }
         (void)pthread_mutex_unlock(&w->lock);
         if (j == NULL) {
             continue;
         }
-
-        switch (j->kind) {
-        case ATLAS_JOB_RECONCILE: run_reconcile(w, j); break;
-        case ATLAS_JOB_REPO_ADD: run_repo_add(w, j); break;
-        case ATLAS_JOB_REPO_REMOVE: run_repo_remove(w, j); break;
-        case ATLAS_JOB_AI: run_ai(w, j); break;
-        case ATLAS_JOB_DECISION: run_decision(w, j); break;
-        case ATLAS_JOB_ORCH: run_orch(w, j); break;
-        case ATLAS_JOB_VERIFY: run_verify(w, j); break;
-        case ATLAS_JOB_SNAPSHOT: run_snapshot(w, j); break;
-        case ATLAS_JOB_SEM_INDEX: run_sem_index(w, j); break;
-        case ATLAS_JOB_SEM_DISCOVER: run_sem_discover(w, j); break;
-        case ATLAS_JOB_MAINTENANCE: {
-            /* Both pointers belong to a caller that may have stopped waiting;
-             * cleared under the lock in that case, so a NULL here means the
-             * result has nowhere to go. */
-            if (j->maint != NULL && j->maint_out != NULL) {
-                j->result = atlas_maintenance_on(w->db, j->maint, j->maint_out, &j->result_err);
-            }
-            break;
-        }
-        case ATLAS_JOB_SEM_CONFIG: {
-            if (j->sem_config != NULL && j->sem_config_out != NULL) {
-                j->result = atlas_sem_config_on(w->db, j->sem_config, j->sem_config_out,
-                                                &j->result_err);
-            }
-            break;
-        }
-        case ATLAS_JOB_APIKEY: {
-            /* Both pointers belong to a caller that may have stopped waiting;
-             * cleared under the lock in that case, so a NULL here means the
-             * result has nowhere to go — and in particular means a freshly
-             * minted plaintext is never written into a struct nobody owns. */
-            if (j->apikey != NULL && j->apikey_out != NULL) {
-                if (j->apikey->kind == ATLAS_APIKEY_JOB_REVOKE) {
-                    j->result = atlas_apikey_revoke_on(w->db, j->apikey->key_id,
-                                                       &j->apikey_out->changed, &j->result_err);
-                } else {
-                    atlas_apikey_create_opts co;
-                    memset(&co, 0, sizeof co);
-                    co.label = j->apikey->label;
-                    co.scopes = j->apikey->scopes;
-                    co.rotate_from = j->apikey->rotate_from[0] != '\0' ? j->apikey->rotate_from
-                                                                      : NULL;
-                    j->result = atlas_apikey_create_on(w->db, &co, &j->apikey_out->created,
-                                                       &j->result_err);
-                }
-            }
-            break;
-        }
-        case ATLAS_JOB_GW_AUDIT: {
-            /* Nobody is waiting, so a failure is logged and dropped rather than
-             * reported: the request this describes has already been answered,
-             * and failing it retroactively is not something Atlas can do.
-             *
-             * The credential touch rides along because the gateway audits every
-             * request anyway, which makes `last_used_at` free rather than a
-             * second round trip on the path of every authenticated read. It is
-             * throttled in SQL, so two gateway processes cannot each decide it
-             * is their turn. */
-            if (j->gw_audit != NULL) {
-                atlas_err aerr;
-                atlas_err_init(&aerr);
-                if (atlas_db_gw_audit_append(w->db, j->gw_audit, &aerr) != ATLAS_OK) {
-                    /* Logged and dropped. The request this row describes has
-                     * already been answered, and failing it retroactively is
-                     * not something Atlas can do. */
-                    atlas_safe_pool safe;
-                    atlas_safe_pool_init(&safe);
-                    atlas_daemon_log(w->log, "warn", "gateway audit row not written: %s",
-                                     atlas_safe(&safe, atlas_err_msg(&aerr)));
-                    atlas_safe_pool_free(&safe);
-                }
-                if (j->gw_audit->key_id[0] != '\0') {
-                    atlas_err terr;
-                    atlas_err_init(&terr);
-                    (void)atlas_db_apikey_touch(w->db, j->gw_audit->key_id, &terr);
-                }
-            }
-            break;
-        }
-        case ATLAS_JOB_MARK_GAP: {
-            atlas_err ignore;
-            atlas_err_init(&ignore);
-            (void)atlas_db_index_state_mark_gap(w->db, j->repo_id, atlas_buf_cstr(&j->arg1),
-                                                &ignore);
-            break;
-        }
-        case ATLAS_JOB_SET_WATCH: {
-            atlas_err ignore;
-            atlas_err_init(&ignore);
-            (void)atlas_db_index_state_set_watch(w->db, j->repo_id,
-                                                 (atlas_watch_state)j->watch_state,
-                                                 j->arg1.len > 0 ? atlas_buf_cstr(&j->arg1) : NULL,
-                                                 j->watched_dirs, &ignore);
-            break;
-        }
-        default: break;
-        }
-
-        /* One hold clears the claim, completes the job and wakes the waiters,
-         * because a waiter that saw the writer idle while its own job was still
-         * unfinished would take its job back out of a queue it is no longer in.
-         *
-         * `wants_result` is read here rather than before the lock, and that is
-         * what decides who frees the job. A waiter that has given up clears it
-         * under this same lock, so reading it outside could see the waiter still
-         * present, hand the job to it, and leak — the waiter has already
-         * returned. Whoever observes it last under the lock owns the answer. */
-        (void)pthread_mutex_lock(&w->lock);
-        w->running = false;
-        bool waited_on = j->wants_result;
-        if (waited_on) {
-            j->done = true;
-        }
-        (void)pthread_cond_broadcast(&w->job_done);
-        (void)pthread_mutex_unlock(&w->lock);
-        if (!waited_on) {
-            job_free(j);
-        }
-        /* Otherwise ownership stays with the waiter, which frees it. */
+        /* Claiming the job, running it, completing it and settling who frees it
+         * are one sequence with one implementation — the same one the yield
+         * drain uses. See `writer_run_job`. */
+        writer_run_job(w, j);
     }
 
     atlas_err ignore;

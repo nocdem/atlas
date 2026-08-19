@@ -407,7 +407,7 @@ atlas_status atlas_sem_config_on(atlas_db *db, const atlas_sem_config_job *job,
         atlas_sem_discovery_result_init(&res);
         atlas_err ignored;
         atlas_err_init(&ignored);
-        (void)atlas_sem_discovery_run(db, &repo, &res, &ignored);
+        (void)atlas_sem_discovery_run(db, &repo, NULL, NULL, &res, &ignored);
     }
     atlas_repo_info_free(&repo);
     if (st != ATLAS_OK) {
@@ -813,7 +813,7 @@ atlas_status atlas_service_sem_index(atlas_ctx *ctx, const char *name, const cha
         atlas_err_init(&ignored);
         /* Walk first, so an operator who has just generated a build directory
          * gets an index of it rather than of what Atlas last happened to see. */
-        (void)atlas_sem_discovery_run(atlas_ctx_db(ctx), &repo, &res, &ignored);
+        (void)atlas_sem_discovery_run(atlas_ctx_db(ctx), &repo, NULL, NULL, &res, &ignored);
         st = atlas_sem_accepted_inputs(atlas_ctx_db(ctx), repo.id, &accepted, NULL, err);
         if (st == ATLAS_OK) {
             const char *p = (const char *)accepted.data;
@@ -831,8 +831,11 @@ atlas_status atlas_service_sem_index(atlas_ctx *ctx, const char *name, const cha
         }
     }
     if (st == ATLAS_OK) {
-        st = atlas_sem_index_on(atlas_ctx_db(ctx), &repo, compdbs, compdb_count, rebuild, out,
-                                err);
+        /* No yield: this is the local CLI path, where the process running the
+         * pass is the process that asked for it and there is nothing else on
+         * this thread to lend it to. */
+        st = atlas_sem_index_on(atlas_ctx_db(ctx), &repo, compdbs, compdb_count, rebuild, NULL,
+                                NULL, out, err);
     }
     atlas_buf_free(&accepted);
     atlas_repo_info_free(&repo);
@@ -853,6 +856,7 @@ atlas_status atlas_service_sem_index(atlas_ctx *ctx, const char *name, const cha
  * chunking its own work. */
 atlas_status atlas_sem_index_on(atlas_db *db, const atlas_repo_info *repo_in,
                                 const char *const *compdbs, size_t compdb_count, bool rebuild,
+                                void (*yield)(void *ud), void *yield_ud,
                                 atlas_sem_index_summary *out, atlas_err *err) {
     const atlas_repo_info repo = *repo_in;
     atlas_status st = ATLAS_OK;
@@ -925,6 +929,11 @@ atlas_status atlas_sem_index_on(atlas_db *db, const atlas_repo_info *repo_in,
         o.commit_id = repo.scanned_head;
         o.repo_identity_hash = atlas_buf_cstr(&identity);
         o.test_roots = atlas_buf_cstr(&cfg.test_roots);
+        /* Carried through untouched. This layer does not know what is on the
+         * other end of it and must not: the daemon puts its writer-queue drain
+         * there, and a CLI caller puts nothing there at all. */
+        o.yield = yield;
+        o.yield_ud = yield_ud;
         st = atlas_sem_index_run(db, repo.id, &o, out, err);
     }
 

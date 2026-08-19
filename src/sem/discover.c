@@ -133,6 +133,16 @@ typedef struct walk_state {
     cand_ident idents[ATLAS_SEM_DISCOVERY_MAX_CANDIDATES];
     const char *packed_excludes;
     const char *root;
+    /* A9.2.6 successor. Offered every `ATLAS_SEM_DISCOVER_YIELD_EVERY` entries
+     * so the thread running this walk can be lent to something short. NULL when
+     * nobody supplied one, which is every caller that is not the daemon's writer
+     * thread — a status command walks with nothing to lend the thread to.
+     *
+     * Safe here for the reason it is safe between translation units: the whole
+     * walk runs before any transaction opens. Nothing in this file touches a
+     * database. */
+    void (*yield)(void *ud);
+    void *yield_ud;
     int64_t entries;
     /* Abandon the rest of the walk. Set only by the two ceilings that bound
      * *total* work — entries read and candidates found — because those are the
@@ -607,6 +617,14 @@ static void walk_dir(walk_state *w, int dir_fd, const char *rel, size_t rel_len,
         }
         w->entries++;
         w->out->entries_seen++;
+        /* Counted in entries read rather than in candidates found or files
+         * opened: a tree of empty directories reads entries and opens nothing,
+         * and an offer that depended on either would never be made there — which
+         * is precisely the shape of the build directories this walk exists to
+         * find its way through. */
+        if (w->yield != NULL && w->entries % ATLAS_SEM_DISCOVER_YIELD_EVERY == 0) {
+            w->yield(w->yield_ud);
+        }
         if (w->entries > ATLAS_SEM_DISCOVERY_MAX_ENTRIES) {
             char detail[128];
             (void)snprintf(detail, sizeof detail, "the directory walk read more than %d entries",
@@ -716,6 +734,7 @@ static int cmp_input(const void *a, const void *b) {
 /* --- the entry point ---------------------------------------------------------- */
 
 atlas_status atlas_sem_discover(const char *root, const atlas_sem_config *cfg,
+                                void (*yield)(void *ud), void *yield_ud,
                                 atlas_sem_discovery_result *out, atlas_err *err) {
     atlas_sem_discovery_result_init(out);
     if (root == NULL || out == NULL) {
@@ -727,6 +746,8 @@ atlas_status atlas_sem_discover(const char *root, const atlas_sem_config *cfg,
     memset(&w, 0, sizeof w);
     w.out = out;
     w.root = root;
+    w.yield = yield;
+    w.yield_ud = yield_ud;
     w.packed_excludes =
         (cfg != NULL && cfg->excludes.len > 0) ? atlas_buf_cstr(&cfg->excludes) : "";
     out->mode = cfg != NULL ? cfg->discovery_mode : ATLAS_SEM_DISCMODE_AUTOMATIC;

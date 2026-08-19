@@ -1,4 +1,5 @@
-/* Atlas - A9.2.6: the daemon stays answerable while it is busy.
+/* Atlas - A9.2.6 and A9.2.7: the daemon stays answerable while it is busy, and
+ * a short write now lands while it is.
  * Copyright 2026 The Atlas Authors. Licensed under the Apache License 2.0.
  *
  * Driven against a live daemon, because the defect this closes is not in any
@@ -18,25 +19,39 @@
  * atlas_writer_ai -> pthread_cond_timedwait` on the main thread, and
  * `atlas_sem_index_on -> atlas_sem_parse_unit` on the writer.
  *
+ * A9.2.7 then closed the half A9.2.6 left open. Answering quickly is not the
+ * same as writing: for the whole of a pass *nothing else was written at all*,
+ * and the bill for that is in `docs/backlog.md` — a recovery sweep refused every
+ * twenty seconds for a pilot window, a submission that needed sixteen attempts
+ * across forty-seven seconds, and one finished worker's completion lost. The
+ * pass now hands the writer thread back between translation units and the
+ * waiting write is served before it resumes.
+ *
  * So what is asserted here is the join, not the parts:
  *
- *   1. **A write that arrives during a semantic pass is answered quickly**, with
- *      a refusal that says nothing was queued, rather than being made to wait.
- *      On a single-threaded serve loop the duration of that answer *is* the
- *      stall every other client suffers, which is why it is timed.
+ *   1. **A write that arrives during a semantic pass lands, during the pass.**
+ *      That is the season's proof, and it is asserted with the pass observed in
+ *      flight on both sides of the write rather than inferred from a timing.
  *   2. **Ping and an independent read stay fast while the pass runs**, including
- *      while a write is blocked concurrently — the head-of-line case, driven
+ *      while a write is outstanding concurrently — the head-of-line case, driven
  *      from a second process because that is the only way to have two clients.
- *   3. **The pass still completes**, the daemon is still serving afterwards, and
- *      the index it built is real. A daemon made responsive by breaking its own
- *      maintenance would pass 1 and 2.
- *   4. **A hook still fails open.** It is the caller that meets this refusal
- *      most often, and it must go on exiting 0 with an envelope.
+ *   3. **The pass still completes and the generation it publishes is intact.**
+ *      A daemon made responsive by breaking its own maintenance would pass 1 and
+ *      2, and so would one whose interleaved write corrupted a half-built
+ *      generation — which is why the unit accounting is read back afterwards
+ *      rather than trusted.
+ *   4. **A hook still fails open**, whatever answer it gets. It is the caller
+ *      that meets a busy daemon most often, and it must go on exiting 0 with an
+ *      envelope.
+ *   5. **A refusal still stores nothing, and a retry still makes one row.**
+ *      Driven in process, because a back-out is precisely "the write point was
+ *      never reached" and that is what a refusal must be simulated as.
+ *   6. **Both job classifications agree over the whole enum.**
  *
  * Every wait is for an observable outcome with a deadline, never a guessed
- * sleep. The one timing assertion is deliberately far looser than the figures
- * above: it must separate "answered" from "waited out a four-second budget" on a
- * loaded machine, and nothing finer than that is a property Atlas holds.
+ * sleep. The timing assertions are deliberately far looser than the figures
+ * above: they must separate "answered" from "waited out a four-second budget" on
+ * a loaded machine, and nothing finer than that is a property Atlas holds.
  */
 #include <stdio.h>
 #include <string.h>
@@ -46,9 +61,16 @@
 
 #include <sqlite3.h>
 
+#include "atlas/datadir.h"
+#include "atlas/db.h"
 #include "atlas/hook.h"
+#include "atlas/ipc.h"
 #include "atlas/limits.h"
+#include "atlas/verify.h"
+#include "atlas/verify_ops.h"
 #include "atlas_test.h"
+#include "daemon/daemon_internal.h"
+#include "db/db_internal.h"
 #include "support/fixture.h"
 
 /* Generous: a semantic index runs a compiler over every unit in the fixture,
@@ -62,6 +84,19 @@
  * client made to wait out `AI_WRITE_TIMEOUT_MS` — and tightening it towards the
  * observed milliseconds would turn a real regression gate into a flaky one. */
 #define RESPONSIVE_MS 2500
+
+/* What a *refused* write may cost, which is a different figure from what a
+ * served one may cost and must not be conflated with it.
+ *
+ * A waiter that meets a non-yielding stretch now spends
+ * `ATLAS_WRITER_YIELD_GRACE_MS` before it backs out — deliberately, because that
+ * is what buys every other write the chance to be served instead. So a refusal
+ * is bounded by the grace plus the same room for a loaded machine that
+ * `RESPONSIVE_MS` allows, and holding a refusal to `RESPONSIVE_MS` would be
+ * asserting the absence of the grace. What both bounds still exclude is the
+ * outcome this file exists to catch: a caller made to wait out its whole
+ * four-second budget. */
+#define REFUSAL_MS (ATLAS_WRITER_YIELD_GRACE_MS + RESPONSIVE_MS)
 
 /* Enough translation units that the pass is still running when the assertions
  * are made, each pulling in a header heavy enough that parsing it is real work.
@@ -250,7 +285,7 @@ static void test_a_semantic_pass_does_not_stall_the_serve_loop(void) {
     live L;
     live_start(&L, &err);
 
-    bool saw_busy = false;
+    bool saw_served_write = false;
     bool observed_building = false;
     int64_t worst_ping = 0;
     int64_t worst_read = 0;
@@ -295,9 +330,15 @@ static void test_a_semantic_pass_does_not_stall_the_serve_loop(void) {
         /* **A hook fails open, busy daemon or not.** */
         T_CHECK_MSG(hook_code == 0, "a hook did not fail open while the daemon was busy (exit %d)",
                     hook_code);
+        /* A9.2.7 flipped which of these two branches is the ordinary one. A hook
+         * write is `ATLAS_JOB_AI`, which a yield drains, so during a yielding
+         * pass it is *served*. A refusal is now the exceptional path — it means
+         * the waiter met a stretch with no yield in it, which is the residual
+         * this season states rather than solves — so a refusal is still checked
+         * for exactly what it must carry, and is no longer required to happen.
+         * Requiring it would be requiring the residual. */
         if (strstr(atlas_buf_cstr(&errout), "BUSY:") != NULL) {
-            saw_busy = true;
-            T_CHECK_MSG(wrote < RESPONSIVE_MS,
+            T_CHECK_MSG(wrote < REFUSAL_MS,
                         "a write refused as busy still took %lld ms, so the serve loop was held",
                         (long long)wrote);
             /* The refusal must carry the claim that makes retrying safe. A
@@ -306,6 +347,10 @@ static void test_a_semantic_pass_does_not_stall_the_serve_loop(void) {
             T_CHECK_MSG(strstr(atlas_buf_cstr(&errout), "Nothing was queued") != NULL,
                         "a busy refusal did not say the write had not been queued: %s",
                         atlas_buf_cstr(&errout));
+        } else if (building) {
+            saw_served_write = true;
+            T_CHECK_MSG(wrote < RESPONSIVE_MS,
+                        "a write served during a semantic pass took %lld ms", (long long)wrote);
         }
         atlas_buf_free(&errout);
 
@@ -332,15 +377,22 @@ static void test_a_semantic_pass_does_not_stall_the_serve_loop(void) {
      * a gate that cannot fail is worse than no gate. */
     T_CHECK_MSG(observed_building,
                 "the semantic pass was never observed in flight, so this test proved nothing");
-    T_CHECK_MSG(saw_busy,
-                "no write ever met the busy path, so this test did not exercise the defect");
+    /* A9.2.7's replacement for "a write met the busy path". What has to happen
+     * now is the opposite: at least one write reached the daemon while a pass
+     * was in flight and was *taken*. `saw_busy` is recorded and deliberately not
+     * required — a run in which no refusal occurred is a run in which the pass
+     * yielded every time, which is the outcome, not a gap in the test. */
+    T_CHECK_MSG(saw_served_write,
+                "no write was served during a semantic pass, so the yield was never exercised");
 
     T_CHECK_MSG(worst_ping < RESPONSIVE_MS, "the worst ping during a semantic pass was %lld ms",
                 (long long)worst_ping);
     T_CHECK_MSG(worst_read < RESPONSIVE_MS,
                 "the worst independent read during a semantic pass was %lld ms",
                 (long long)worst_read);
-    T_CHECK_MSG(worst_write < RESPONSIVE_MS,
+    /* Against the refusal bound rather than the served one, because this is the
+     * worst of both kinds of answer and a refusal is entitled to the grace. */
+    T_CHECK_MSG(worst_write < REFUSAL_MS,
                 "the worst write during a semantic pass was %lld ms", (long long)worst_write);
 
     /* **The pass still finishes.** A daemon kept responsive by abandoning its
@@ -376,12 +428,16 @@ static void test_a_semantic_pass_does_not_stall_the_serve_loop(void) {
 /* The head-of-line case, driven from two processes because one client cannot
  * demonstrate it.
  *
- * The child holds a write against the daemon while the parent pings. Before this
- * season the parent's pings queued behind the child's write for as long as that
- * write waited — measured at 3.9 s each — because the serve loop was inside the
- * wait rather than in `poll`. The child asserts nothing: a failure recorded in a
- * forked process is a failure nobody sees, so it reports only its exit status
- * and the parent decides. */
+ * The child issues a write against a daemon whose writer is occupied, while the
+ * parent pings. Before A9.2.6 the parent's pings queued behind the child's write
+ * for as long as that write waited — measured at 3.9 s each — because the serve
+ * loop was inside the wait rather than in `poll`. A9.2.7 changed what happens to
+ * the child's write, which is not what this case is about: whether the write is
+ * served at a yield, refused after the grace, or waits, the *second* client must
+ * keep being answered throughout. That is why the assertion here is about the
+ * parent's pings and the child's exit status and about nothing else. The child
+ * asserts nothing itself: a failure recorded in a forked process is a failure
+ * nobody sees. */
 static void test_one_blocked_write_does_not_hold_the_other_clients(void) {
     atlas_err err;
     atlas_err_init(&err);
@@ -498,7 +554,7 @@ static bool mcp_tool_ok(const atlas_buf *out, const char *id_marker) {
  * questions and only the second one is the one a client has. Reads do not touch
  * the writer, so this is answerable while a pass is running — which is the whole
  * reason the check can be made at the moment of the refusal rather than after. */
-static bool claim_is_listed(live *L, atlas_buf *out, atlas_err *err) {
+static bool claim_is_listed(live *L, const char *text, atlas_buf *out, atlas_err *err) {
     (void)run_mcp(L,
                   MCP_HANDSHAKE
                   "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":"
@@ -506,162 +562,438 @@ static bool claim_is_listed(live *L, atlas_buf *out, atlas_err *err) {
                   out, err);
     T_CHECK_MSG(mcp_tool_ok(out, "\"id\":9"), "the claims could not be listed: %s",
                 atlas_buf_cstr(out));
-    return strstr(atlas_buf_cstr(out), BUSY_CLAIM_TEXT) != NULL;
+    return strstr(atlas_buf_cstr(out), text) != NULL;
 }
 
-/* **A write refused because the daemon is busy wrote nothing.**
+/* How many rows one proposition produced, asked of the file after the daemon
+ * has stopped. Read-only and out of process on purpose: "what is stored" is a
+ * different question from "what a client can see", and this is the first one. */
+static int64_t stored_claim_rows(const char *data_dir, const char *text) {
+    atlas_buf db_path = ATLAS_BUF_INIT;
+    atlas_err err;
+    atlas_err_init(&err);
+    T_OK(atlas_buf_appendf(&db_path, &err, "%s/atlas.db", data_dir), &err);
+    sqlite3 *db = NULL;
+    T_REQUIRE(sqlite3_open_v2(atlas_buf_cstr(&db_path), &db, SQLITE_OPEN_READONLY, NULL) ==
+              SQLITE_OK);
+    sqlite3_stmt *st = NULL;
+    T_REQUIRE(sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM verify_claims WHERE text = ?1;", -1,
+                                 &st, NULL) == SQLITE_OK);
+    T_REQUIRE(sqlite3_bind_text(st, 1, text, -1, SQLITE_STATIC) == SQLITE_OK);
+    int64_t rows = sqlite3_step(st) == SQLITE_ROW ? sqlite3_column_int64(st, 0) : -1;
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    atlas_buf_free(&db_path);
+    return rows;
+}
+
+/* **A9.2.7: a write that arrives during a semantic pass lands, during the pass.**
  *
- * A9.2.6 made a caller stop waiting; it did not say what happens to the record
- * the caller was trying to make. For a hook that question has a written answer —
- * hooks fail open and the metadata is lost on purpose — but a verification
- * submission is not metadata. A claim, its evidence and its attestations exist
- * nowhere but here: git cannot be re-read to recover one, and no pass rebuilds
- * them. A refusal that half-wrote, or that wrote and reported failure, would be
- * a record whose existence nobody could determine from the answer they got.
+ * This is the season's proof and it is the inverse of what stood here before.
+ * A9.2.6 asserted that such a write was *refused* quickly, which was the whole
+ * answer then and only half of one: a refusal is an answer, not a write, and for
+ * the length of a pass every client got answers and nobody got a write. The
+ * measured bill is in `docs/backlog.md` — a recovery sweep refused every twenty
+ * seconds for a whole pilot window, a submission that needed sixteen attempts
+ * across forty-seven seconds, and one finished worker's completion lost outright
+ * because its driver ran out of retries against a walk that would not end.
  *
- * So the two halves are asserted at the moment they are true rather than
- * inferred at the end:
+ * A verification submission rather than a hook, for the reason O10 chose one: a
+ * hook record is metadata that fails open and is allowed to be lost, while a
+ * claim exists nowhere but here — git cannot be re-read to recover one and no
+ * pass rebuilds it. So it is the write for which "served or refused" actually
+ * matters.
  *
- *   - the refusal is explicit, says nothing was queued, and arrives quickly;
- *   - **at that instant the claim is not on the read surface**, which is what
- *     makes the advertised retry safe rather than a way to submit twice;
- *   - the retry that eventually lands produces exactly one row.
+ * Three things are asserted, and the third is the one that stops this being a
+ * responsiveness test wearing a correctness test's name:
  *
- * The last one alone would not discriminate: a refusal that silently stored the
- * row would still total one, because the retry would resolve to it by content
- * key. Checking at the refusal is what separates "nothing was written" from
- * "something was written and the idempotency machinery covered for it". */
-static void test_a_verification_write_refused_while_busy_stores_nothing(void) {
+ *   - the submission is **accepted**, with no `BUSY:` token anywhere in it;
+ *   - the pass was **in flight on both sides of it** — checked before and after
+ *     rather than assumed, because a submission accepted after the pass ended
+ *     would prove nothing at all;
+ *   - the pass then **publishes an intact generation**: every unit the fixture
+ *     describes is in it and none failed. A write interleaved into a half-built
+ *     generation is exactly the risk this mechanism takes, and the argument that
+ *     it is safe — a generation is invisible until `atlas_db_sem_publish` — is
+ *     asserted here rather than trusted. */
+static void test_a_verification_write_lands_during_a_semantic_pass(void) {
     atlas_err err;
     atlas_err_init(&err);
     live L;
     live_start(&L, &err);
 
-    static const char SUBMIT[] =
-        MCP_HANDSHAKE "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"tools/call\",\"params\":"
-                      "{\"name\":\"atlas_verify_claim_create\",\"arguments\":"
-                      "{\"repo\":\"fixture\",\"text\":\"" BUSY_CLAIM_TEXT "\","
-                      "\"domain\":\"code\",\"actor\":\"a-model\",\"run\":\"o10-busy\"}}}\n";
-
     bool observed_building = false;
-    bool saw_busy = false;
-    bool accepted = false;
-    /* True once a submission has been answered in a way that leaves a write
-     * possibly still on its way. Two outcomes do that and both are documented
-     * rather than defects: a repository the daemon has not finished indexing
-     * yet, and — the one A9.2.6 wrote down as a residual — a submission queued
-     * behind a *bounded* job, which `job_kind_is_unbounded` deliberately refuses
-     * to back out of, so the caller waits out its own timeout and the job still
-     * runs. After either, "the claim is not on the read surface" stops being a
-     * statement about the busy refusal and becomes a race with that write, so
-     * the check is not made again. */
-    bool write_may_be_in_flight = false;
+    bool landed_during_pass = false;
     int64_t worst_submit = 0;
     atlas_buf last_other = ATLAS_BUF_INIT;
+    /* The proposition that was accepted with the pass in flight on both sides of
+     * it. Read back afterwards, so what is verified at the end is the row this
+     * test actually caused rather than any row. */
+    atlas_buf landed_text = ATLAS_BUF_INIT;
 
     atlas_buf out = ATLAS_BUF_INIT;
+    atlas_buf script = ATLAS_BUF_INIT;
+    int attempt = 0;
     int64_t deadline = now_ms() + WAIT_MS;
-    while (now_ms() < deadline) {
-        bool building = false;
+    while (now_ms() < deadline && !landed_during_pass) {
+        bool building_before = false;
         bool current = false;
-        sem_status(&L, &building, &current, &err);
-        if (building) {
-            observed_building = true;
+        sem_status(&L, &building_before, &current, &err);
+        if (!building_before) {
+            /* Nothing to submit *during* yet. A submission to an idle writer
+             * would be accepted for reasons that have nothing to do with the
+             * yield, so it is not made: the only interesting submission is one a
+             * pass is holding the thread across. */
+            if (current) {
+                break; /* the pass ended; `observed_building` decides below */
+            }
+            continue;
         }
+        observed_building = true;
 
-        int64_t took = run_mcp(&L, SUBMIT, &out, &err);
-        if (building && took > worst_submit) {
+        /* A distinct proposition every attempt, and that is load-bearing rather
+         * than tidy. Intake is idempotent by content key, so resubmitting one
+         * text would be accepted from then on without writing anything — and
+         * "accepted" would stop being evidence that a write was served. */
+        attempt++;
+        char text[192];
+        (void)snprintf(text, sizeof text, "%s (attempt %d)", BUSY_CLAIM_TEXT, attempt);
+        atlas_buf_reset(&script);
+        T_OK(atlas_buf_appendf(&script, &err,
+                               MCP_HANDSHAKE
+                               "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"tools/call\",\"params\":"
+                               "{\"name\":\"atlas_verify_claim_create\",\"arguments\":"
+                               "{\"repo\":\"fixture\",\"text\":\"%s\","
+                               "\"domain\":\"code\",\"actor\":\"a-model\","
+                               "\"run\":\"a927-yield\"}}}\n",
+                               text),
+             &err);
+
+        int64_t took = run_mcp(&L, atlas_buf_cstr(&script), &out, &err);
+        if (took > worst_submit) {
             worst_submit = took;
         }
+        bool accepted = mcp_tool_ok(&out, "\"id\":8");
 
-        if (mcp_tool_ok(&out, "\"id\":8")) {
-            accepted = true;
+        bool building_after = false;
+        bool current_after = false;
+        sem_status(&L, &building_after, &current_after, &err);
+
+        if (accepted && building_after) {
+            /* The claim the season makes: taken, not refused, with the pass
+             * holding the writer on both sides of the submission. */
+            T_CHECK_MSG(strstr(atlas_buf_cstr(&out), "BUSY:") == NULL,
+                        "an accepted submission still carried a busy token: %s",
+                        atlas_buf_cstr(&out));
+            T_CHECK_MSG(took < RESPONSIVE_MS,
+                        "a submission served during a semantic pass took %lld ms",
+                        (long long)took);
+            T_OK(atlas_buf_set_str(&landed_text, text, &err), &err);
+            landed_during_pass = true;
         } else if (strstr(atlas_buf_cstr(&out), "BUSY:") != NULL) {
-            saw_busy = true;
-            /* The refusal must carry the claim that makes retrying safe: a
-             * caller cannot tell "nothing ran" from "the result was abandoned"
-             * by status, so the message is where the difference is stated. */
+            /* Still possible and still correct: a stretch with no yield in it —
+             * one large translation unit — is the residual this season states
+             * rather than solves. It is recorded, checked for the sentence that
+             * makes a retry safe, and retried. */
             T_CHECK_MSG(strstr(atlas_buf_cstr(&out), "Nothing was queued") != NULL,
                         "a busy refusal did not say the write had not been queued: %s",
                         atlas_buf_cstr(&out));
-            T_CHECK_MSG(took < RESPONSIVE_MS,
-                        "a submission refused as busy still took %lld ms", (long long)took);
-            /* The half that cannot be reconstructed afterwards: at this instant
-             * nothing was written, which is what makes the advertised retry safe
-             * rather than a way to submit twice. */
-            if (!accepted && !write_may_be_in_flight) {
-                atlas_buf listing = ATLAS_BUF_INIT;
-                bool listed = claim_is_listed(&L, &listing, &err);
-                T_CHECK_MSG(!listed,
-                            "a submission refused as busy is on the read surface, so a refusal "
-                            "wrote a row and the advertised retry would submit it twice: %s",
-                            atlas_buf_cstr(&listing));
-                atlas_buf_free(&listing);
-            }
-        } else {
-            /* Neither accepted nor refused as busy. This is **not** a failure
-             * here, and treating it as one was the first version's mistake: the
-             * two outcomes that land here are both documented behaviour, not
-             * defects, and both are transient. Failing on them would convert
-             * A9.2.6's written residual into a broken test, most often under a
-             * sanitiser where the window is widest.
-             *
-             * So it is recorded and retried. What decides the test is the pair
-             * of end conditions — a busy refusal was seen, and a retry was
-             * eventually accepted — and this text is carried so that a genuine
-             * refusal is reported instead of a bare "never accepted". */
-            write_may_be_in_flight = true;
+            T_CHECK_MSG(took < REFUSAL_MS, "a submission refused as busy took %lld ms",
+                        (long long)took);
+        } else if (!accepted) {
+            /* Neither accepted nor refused as busy — a repository the daemon has
+             * not finished indexing yet, most often. Documented behaviour rather
+             * than a defect, so it is recorded and retried, and carried so that a
+             * genuine refusal is reported instead of a bare "never accepted". */
             T_OK(atlas_buf_set(&last_other, out.data, out.len, &err), &err);
         }
-
-        if (accepted && current) {
-            break;
-        }
     }
+    atlas_buf_free(&script);
 
     /* A fixture that never made the daemon busy would let all of the above pass
      * without testing anything. */
     T_CHECK_MSG(observed_building,
                 "the semantic pass was never observed in flight, so this test proved nothing");
-    T_CHECK_MSG(saw_busy,
-                "no submission ever met the busy path, so this test did not exercise the refusal");
-    /* **The refusal was transient and the retry was safe.** A daemon that
-     * refused for ever would satisfy every assertion above. */
-    T_CHECK_MSG(accepted, "a submission was never accepted on a retry; last other answer: %s",
+    T_CHECK_MSG(landed_during_pass,
+                "no submission was accepted while a semantic pass held the writer; last other "
+                "answer: %s",
                 last_other.len > 0 ? atlas_buf_cstr(&last_other) : "(none)");
-    T_CHECK_MSG(worst_submit < RESPONSIVE_MS,
+    T_CHECK_MSG(worst_submit < REFUSAL_MS,
                 "the worst submission during a semantic pass was %lld ms",
                 (long long)worst_submit);
 
-    /* One proposition, however many times it was refused and resubmitted. */
+    /* **The pass still finishes.** A daemon kept responsive by abandoning its own
+     * maintenance would have satisfied everything above. */
+    const char *args[] = {"code", "sem-status", "fixture", "--json"};
+    bool found = false;
+    T_OK(fx_wait_for_substring(&L.fx, &L.d, args, 4u, "\"activity\":\"CURRENT\"", WAIT_MS, &found,
+                               &err),
+         &err);
+    T_CHECK_MSG(found, "the semantic pass never reached CURRENT");
+
+    /* **And the generation it published is whole.** The unit accounting is read
+     * back rather than trusted: this is where an interleaved write corrupting a
+     * half-built generation would show, and it is the only assertion here that
+     * would survive somebody deleting the yield and leaving the refusal. */
     {
-        bool listed = claim_is_listed(&L, &out, &err);
-        T_CHECK_MSG(listed, "the accepted claim is not on the read surface: %s",
+        atlas_buf status = ATLAS_BUF_INIT;
+        int code = 0;
+        T_OK(fx_atlas_with_runtime(&L.fx, &L.d, args, 4u, &status, NULL, &code, &err), &err);
+        char want_total[64];
+        (void)snprintf(want_total, sizeof want_total, "\"tu_total\":%d", (int)TU_COUNT);
+        T_CHECK_MSG(strstr(atlas_buf_cstr(&status), want_total) != NULL,
+                    "the published generation does not hold every unit the fixture describes "
+                    "(wanted %s): %s",
+                    want_total, atlas_buf_cstr(&status));
+        T_CHECK_MSG(strstr(atlas_buf_cstr(&status), "\"tu_failed\":0") != NULL,
+                    "the published generation holds failed units: %s", atlas_buf_cstr(&status));
+        atlas_buf_free(&status);
+    }
+
+    /* And the claim written mid-pass is where a client can find it, asked over
+     * the surface a client actually has rather than of the file. "It was
+     * accepted" and "a caller can read it back" are two claims and the second is
+     * the one that would fail if a mid-pass write were applied to something the
+     * publication then discarded. */
+    {
+        bool listed = claim_is_listed(&L, atlas_buf_cstr(&landed_text), &out, &err);
+        T_CHECK_MSG(listed, "the claim accepted during the pass is not on the read surface: %s",
                     atlas_buf_cstr(&out));
     }
+
+    /* And it is one row, asked of the file after the daemon has stopped. */
     fx_daemon_stop(&L.d, false);
     {
-        atlas_buf db_path = ATLAS_BUF_INIT;
-        T_OK(atlas_buf_appendf(&db_path, &err, "%s/atlas.db", fx_data_dir(&L.fx)), &err);
-        sqlite3 *db = NULL;
-        T_REQUIRE(sqlite3_open_v2(atlas_buf_cstr(&db_path), &db, SQLITE_OPEN_READONLY, NULL) ==
-                  SQLITE_OK);
-        sqlite3_stmt *st = NULL;
-        T_REQUIRE(sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM verify_claims WHERE text = ?1;", -1,
-                                     &st, NULL) == SQLITE_OK);
-        T_REQUIRE(sqlite3_bind_text(st, 1, BUSY_CLAIM_TEXT, -1, SQLITE_STATIC) == SQLITE_OK);
-        int64_t rows = sqlite3_step(st) == SQLITE_ROW ? sqlite3_column_int64(st, 0) : -1;
-        sqlite3_finalize(st);
-        sqlite3_close(db);
-        atlas_buf_free(&db_path);
-        T_CHECK_MSG(rows == 1,
-                    "one proposition, refused and resubmitted, produced %lld rows",
+        int64_t rows = stored_claim_rows(fx_data_dir(&L.fx), atlas_buf_cstr(&landed_text));
+        T_CHECK_MSG(rows == 1, "the proposition accepted during the pass produced %lld rows",
                     (long long)rows);
     }
 
+    atlas_buf_free(&landed_text);
     atlas_buf_free(&out);
     atlas_buf_free(&last_other);
     live_stop(&L);
+}
+
+/* --- O10, carried forward: a refusal stores nothing ----------------------- */
+
+/* A minimal database with one repository and one indexed head, which is all the
+ * intake write point needs to bind a claim to a source state. The same shape
+ * `tests/test_verify_intake.c` uses, kept small here because what is under test
+ * is not intake. */
+typedef struct intake_env {
+    fixture fx;
+    atlas_buf db_path;
+    atlas_db *db;
+    int64_t repo_id;
+} intake_env;
+
+#define INTAKE_COMMIT "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+static void intake_env_open(intake_env *e, atlas_err *err) {
+    memset(e, 0, sizeof *e);
+    atlas_buf_init(&e->db_path);
+    T_OK(fx_open(&e->fx, err), err);
+    T_OK(atlas_buf_appendf(&e->db_path, err, "%s/atlas.db", fx_data_dir(&e->fx)), err);
+    T_OK(atlas_datadir_ensure(fx_data_dir(&e->fx), err), err);
+    T_OK(atlas_db_open(atlas_buf_cstr(&e->db_path), &e->db, err), err);
+    T_OK(atlas_db_migrate(e->db, err), err);
+
+    atlas_repo_identity id;
+    memset(&id, 0, sizeof id);
+    id.root = "/tmp/atlas-yield-repo";
+    id.root_len = strlen(id.root);
+    id.common_dir = "/tmp/atlas-yield-repo/.git";
+    id.common_dir_len = strlen(id.common_dir);
+    id.git_dir = id.common_dir;
+    id.git_dir_len = id.common_dir_len;
+    id.object_format = "sha1";
+    T_OK(atlas_db_repo_add(e->db, "proj", &id, &e->repo_id, err), err);
+    T_OK(atlas_db_exec_sql(e->db,
+                           "INSERT INTO commits(repo_id, oid, parent_count, subject)"
+                           "  VALUES(1, '" INTAKE_COMMIT "', 0, 'a');"
+                           "UPDATE repositories SET scanned_head = '" INTAKE_COMMIT "';",
+                           err),
+         err);
+}
+
+static void intake_env_close(intake_env *e) {
+    atlas_db_close(e->db);
+    atlas_buf_free(&e->db_path);
+    fx_close(&e->fx);
+}
+
+static int64_t intake_claim_rows(intake_env *e) {
+    int64_t n = -1;
+    atlas_err err;
+    atlas_err_init(&err);
+    T_OK(atlas_db_query_int64(e->db,
+                              "SELECT count(*) FROM verify_claims WHERE text = '" BUSY_CLAIM_TEXT
+                              "';",
+                              &n, &err),
+         &err);
+    return n;
+}
+
+/* One submission, through a seam that either refuses it the way the writer does
+ * or lets it reach the write point.
+ *
+ * **A back-out is not an error the write point returns; it is the write point
+ * never being called.** `writer_wait_locked` takes the job out of the queue
+ * before anything looks at it, and that is precisely what makes the advertised
+ * retry safe. Simulating it any other way — a failure inside intake, a rolled
+ * back transaction — would be testing a different mechanism and would let a
+ * refusal that half-wrote pass. This is the `tests/test_a11_run.c` pattern
+ * applied to the intake surface, and it is in process because a *live* refusal
+ * is no longer deterministically reachable: the pass now yields, so a real
+ * daemon serves this write instead of refusing it, which is the season and is
+ * also why the refusal needs a home that does not depend on losing a race. */
+static atlas_status submit_claim(intake_env *e, int *refusals_left, int *refusals,
+                                 atlas_err *err) {
+    if (*refusals_left > 0) {
+        (*refusals_left)--;
+        (*refusals)++;
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "%s",
+                             ATLAS_IPC_BUSY_TOKEN
+                             " the Atlas daemon is performing semantic maintenance and cannot "
+                             "take this write yet. Nothing was queued and nothing will run, so "
+                             "the request may be sent again.");
+    }
+    atlas_verify_op op;
+    atlas_verify_op_init(&op);
+    op.kind = ATLAS_VERIFY_OP_CLAIM_CREATE;
+    op.channel = ATLAS_VERIFY_CHANNEL_MODEL;
+    atlas_status st = atlas_buf_set_str(&op.repo_name, "proj", err);
+    if (st == ATLAS_OK) {
+        st = atlas_buf_set_str(&op.domain, "code", err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_buf_set_str(&op.text, BUSY_CLAIM_TEXT, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_buf_set_str(&op.actor_name, "a-model", err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_buf_set_str(&op.actor_provider, "anthropic", err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_buf_set_str(&op.session_key, "a927", err);
+    }
+    atlas_verify_intake_result res;
+    atlas_verify_intake_result_init(&res);
+    if (st == ATLAS_OK) {
+        st = atlas_verify_intake_apply(e->db, &op, &res, err);
+    }
+    atlas_verify_intake_result_free(&res);
+    atlas_verify_op_free(&op);
+    return st;
+}
+
+/* **A submission refused because the daemon was busy wrote nothing, and the
+ * retry that lands makes one row.**
+ *
+ * The two halves are separate claims and only one of them survives being checked
+ * at the end. A refusal that silently stored the row would still total one row,
+ * because the retry resolves to it by content key — so the count *after* each
+ * refusal is the assertion that discriminates, and the total afterwards is the
+ * one that proves the retry was not a second submission. */
+static void test_a_refused_submission_stores_nothing_and_a_retry_makes_one_row(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    intake_env e;
+    intake_env_open(&e, &err);
+
+    int refusals_left = 3;
+    int refusals = 0;
+    for (int i = 0; i < 3; i++) {
+        atlas_err rerr;
+        atlas_err_init(&rerr);
+        atlas_status st = submit_claim(&e, &refusals_left, &refusals, &rerr);
+        T_CHECK_MSG(st != ATLAS_OK, "a simulated busy refusal reported success");
+        T_CHECK_MSG(strstr(atlas_err_msg(&rerr), ATLAS_IPC_BUSY_TOKEN) != NULL,
+                    "a busy refusal did not carry the token a client keys on: %s",
+                    atlas_err_msg(&rerr));
+        T_CHECK_MSG(strstr(atlas_err_msg(&rerr), "Nothing was queued") != NULL,
+                    "a busy refusal did not say the write had not been queued: %s",
+                    atlas_err_msg(&rerr));
+        /* Asserted here, at the instant it is true, rather than inferred from a
+         * total later. This is the half that cannot be reconstructed. */
+        T_CHECK_MSG(intake_claim_rows(&e) == 0,
+                    "a submission refused as busy left a row, so the advertised retry would "
+                    "submit it twice");
+    }
+    T_EQ_INT(refusals, 3);
+
+    /* The retry that reaches the write point. */
+    T_OK(submit_claim(&e, &refusals_left, &refusals, &err), &err);
+    T_CHECK_MSG(intake_claim_rows(&e) == 1, "the accepted submission produced %lld rows",
+                (long long)intake_claim_rows(&e));
+
+    /* And a retry after it lands is still not a second proposition — a retry is
+     * not a corroboration, which is the rule intake enforces by content key. */
+    T_OK(submit_claim(&e, &refusals_left, &refusals, &err), &err);
+    T_CHECK_MSG(intake_claim_rows(&e) == 1,
+                "one proposition, refused three times and submitted twice, produced %lld rows",
+                (long long)intake_claim_rows(&e));
+
+    intake_env_close(&e);
+}
+
+/* --- the two classifications, over the whole vocabulary ------------------- */
+
+/* **Both questions are asked of every job kind, and the answers are compared.**
+ *
+ * Neither switch has a `default:`, so a new kind does not compile until somebody
+ * places it on one side of each — but a switch that compiles is not a switch
+ * anybody thought about, and nothing in the build notices a kind placed on the
+ * wrong side. Two things are checked, both of which a compiler cannot:
+ *
+ *   1. **Unbounded implies not drainable.** An unbounded job running inside
+ *      another unbounded job has no bound at all, and that is the one
+ *      combination that can never be right.
+ *   2. **The drainable set is exactly the documented one.** Spelled out here as
+ *      a literal list, which is the two-spellings discipline `tests/test_orch_run.c`
+ *      uses for the same reason: a rule stated once in code and once in prose
+ *      drifts, and comparing them is what stops it.
+ *
+ * The loop walks the enum by ordinal rather than listing the members, so a kind
+ * added anywhere in it is covered without this test being edited. */
+static void test_the_two_job_classifications_agree_over_the_whole_enum(void) {
+    /* The documented drainable set. Adding a kind here is a deliberate act about
+     * what may run inside a semantic pass; see `docs/extending.md`. */
+    static const atlas_job_kind DRAINABLE[] = {
+        ATLAS_JOB_ORCH, ATLAS_JOB_AI,       ATLAS_JOB_DECISION,
+        ATLAS_JOB_VERIFY, ATLAS_JOB_GW_AUDIT, ATLAS_JOB_APIKEY,
+    };
+    /* The last member of the vocabulary. Named rather than counted, so that a
+     * kind appended after it makes this line wrong in a way somebody sees. */
+    const int last = (int)ATLAS_JOB_SEM_DISCOVER;
+
+    int drainable_seen = 0;
+    for (int i = 0; i <= last; i++) {
+        atlas_job_kind k = (atlas_job_kind)i;
+        bool expected = false;
+        for (size_t d = 0; d < sizeof DRAINABLE / sizeof DRAINABLE[0]; d++) {
+            if (DRAINABLE[d] == k) {
+                expected = true;
+            }
+        }
+        T_CHECK_MSG(job_kind_is_drainable(k) == expected,
+                    "job kind %d is %s drainable and the documented set says %s", i,
+                    job_kind_is_drainable(k) ? "" : "not", expected ? "it is" : "it is not");
+        if (job_kind_is_unbounded(k)) {
+            T_CHECK_MSG(!job_kind_is_drainable(k),
+                        "job kind %d is unbounded and drainable, so one unbounded job could run "
+                        "inside another",
+                        i);
+        }
+        if (expected) {
+            drainable_seen++;
+        }
+    }
+    /* Every documented member was actually reached by the walk: a set member
+     * outside the enum's range would otherwise be silently unchecked. */
+    T_EQ_INT(drainable_seen, (int)(sizeof DRAINABLE / sizeof DRAINABLE[0]));
 }
 
 static const atlas_test TESTS[] = {
@@ -669,8 +1001,12 @@ static const atlas_test TESTS[] = {
      test_a_semantic_pass_does_not_stall_the_serve_loop},
     {"one blocked write does not hold the other clients",
      test_one_blocked_write_does_not_hold_the_other_clients},
-    {"a verification write refused while busy stores nothing",
-     test_a_verification_write_refused_while_busy_stores_nothing},
+    {"a verification write lands during a semantic pass",
+     test_a_verification_write_lands_during_a_semantic_pass},
+    {"a refused submission stores nothing and a retry makes one row",
+     test_a_refused_submission_stores_nothing_and_a_retry_makes_one_row},
+    {"the two job classifications agree over the whole enum",
+     test_the_two_job_classifications_agree_over_the_whole_enum},
 };
 
 ATLAS_TEST_MAIN("daemon_responsive", TESTS)

@@ -472,10 +472,92 @@ Deliberately not done, and written down rather than discovered later:
   reason and with the same residual.
 - **Writes are refused, not deferred, for the duration of a pass.** That is the
   trade the season makes: a fast, retryable refusal in place of a stalled daemon.
+  **A9.2.7 replaced this trade** — the pass yields and the latency-critical
+  writes are served during it — leaving a much smaller residual, one translation
+  unit's parse. The sentence is left as written because the trade it describes
+  was real and what it cost is why the next section exists.
 
 `docs/engineering-rules.md` carries the rules and the full argument;
 `docs/daemon-and-ipc.md` carries the behaviour; `docs/backlog.md` carries the
 original incident with this resolution appended to it.
+
+## A9.2.7 — the writer yields (shipped)
+
+The sentence the season exists for:
+
+> **A REFUSAL A CALLER HAD TO KEEP REPEATING WAS AN ANSWER, NOT A WRITE.**
+
+A9.2.6 stopped one slow write taking every client with it, and left the write
+itself refused for the whole of a pass. That was honest and it was measured to be
+expensive. `docs/backlog.md` records the bill: Atlas' own recovery sweep failing
+every twenty seconds for a whole pilot window; a submission needing sixteen
+attempts across forty-seven seconds to land; and an A10.1 experiment arm losing a
+finished worker's completion outright, so that a correctly edited tree was
+evidence of work Atlas had no record of. The backlog also names the fix, in the
+A9.2.4 entry, in the words this season implements: *the pass already chunks its
+work and already commits per batch; what it does not do is let another writer job
+run between chunks.*
+
+**What was added.**
+
+- **Yield points, at the places where nothing is open.** `atlas_sem_index_opts`
+  gains `yield`/`yield_ud` beside the existing `cancel` pair, polled between
+  translation units, once before the generation is opened, and once after the
+  unit loop ends. The discovery walk gains the same pair, polled every
+  `ATLAS_SEM_DISCOVER_YIELD_EVERY` directory entries. It crosses layers as a bare
+  function pointer and a `void *`, so nothing in `src/sem` or `src/core` names a
+  daemon type.
+- **A drain.** `writer_yield` scans the queue front to back, takes the first
+  drain-eligible job, runs it, and repeats until none is left. It records nothing
+  durable: this is scheduling, not state.
+- **`job_kind_is_drainable`**, an explicit function with no `default:` and one
+  reason per exclusion. `true` for `ORCH`, `AI`, `DECISION`, `VERIFY`,
+  `GW_AUDIT`, `APIKEY` — the latency-critical writes whose tables are disjoint
+  from anything a pass or a walk touches.
+- **A grace.** `ATLAS_WRITER_YIELD_GRACE_MS` (2000). A waiter that observes an
+  unbounded job gives it that long to reach a yield point before backing out, and
+  the grace is measured from the waiter's *first observation*, never from queue
+  time.
+- **One shared job-execution helper.** `writer_run_job` is the single
+  implementation of claim → run → complete → settle ownership, used by the main
+  loop and by the drain. A second copy of the three-exit ownership contract is
+  the defect this file's history predicts.
+
+**What deliberately was not done.**
+
+- **No second writer, and A1's rule did not move.** There is still exactly one
+  writer thread, one writable handle, one process writing the index. The
+  backlog's second shape stays open.
+- **The serve loop is untouched.** `src/ipc/server.c` still dispatches one
+  request at a time; that serialism is design, and this season removes the reason
+  it hurt rather than the design.
+- **`job_kind_is_unbounded` still answers the same two kinds**, and
+  reconciliation is still `false` for A9.2.6's reason: a hook write refused
+  during an incremental pass would be *dropped*, and that is the worse failure.
+- **No yield inside a translation unit.** The per-unit transaction deliberately
+  spans the parse child, and this season does not touch the pass's transaction
+  structure — per-unit transaction, `batch_checkpoint` cadence, sealing,
+  publication, all unchanged.
+- **No schema change, no migration, no new thread, no timer, no RPC method, no
+  MCP tool, no gateway route**, and `WRITER_BUSY_MSG` is the same sentence it
+  was, because it is still exactly true.
+
+**The residual, stated rather than discovered.** A single translation unit that
+parses for up to `ATLAS_SEM_PARSE_TIMEOUT_MS` is a stretch with no yield in it. A
+write that arrives inside one is refused at grace expiry exactly as every write
+was refused before this change — and the refusal costs about two seconds now
+rather than about a tenth of one, which is the price of the grace and is paid
+only there. Every synchronous deadline on the writer path is at least 4000 ms, so
+the back-out still precedes the timeout and the two answers stay distinguishable.
+
+**Before, measured.** The figures above are `docs/backlog.md`'s, from the A11.5a
+pilot and the A10.1 experiment: a sweep refused every twenty seconds, a
+submission that took sixteen attempts and forty-seven seconds, and one lost
+completion. **After: not yet measured on a production workload.** The suite shows
+a verification write landing during a live pass over a 160-unit fixture without a
+`BUSY` token, which is the property rather than a figure; the operational
+before/after belongs to a smoke run on a real repository and is not filled in
+here from anything less.
 
 ## O10 — production evidence ingestion (CLOSED)
 

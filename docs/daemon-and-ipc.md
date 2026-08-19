@@ -70,8 +70,10 @@ failing after 4027 ms — and Claude Code fires a hook, and therefore a session
 write, on every event.
 
 A waiter now asks what the writer is doing. If the writer is inside a job with no
-statable duration *and* the waiter's job is still in the queue, the job is taken
-back out and the caller is answered at once:
+statable duration *and* the waiter's job is still in the queue, the waiter gives
+the pass `ATLAS_WRITER_YIELD_GRACE_MS` — two seconds — to reach a yield point and
+serve it. If none comes in that time, the job is taken back out and the caller is
+answered at once:
 
 ```
 BUSY: the Atlas daemon is performing semantic maintenance and cannot take this
@@ -93,14 +95,34 @@ What this does **not** cover, deliberately:
   every file change, and refusing writes during one would *drop* hook records
   rather than delay them, because hooks fail open. A first full pass over a large
   tree can therefore still hold the loop up to the waiting caller's timeout.
-- **Writes during a semantic pass are refused, not deferred.** Hook session
-  records for the duration of a pass are lost. That is the trade the season
-  makes: a fast, retryable refusal in place of a daemon that answers nothing.
+- **A write during a semantic pass is served at the pass's next yield point, and
+  refused only when none arrives within the waiter's grace.** An unbounded job
+  now hands the writer thread back at the points where nothing is open —
+  between translation units, once before the generation is opened and once after
+  the unit loop ends, and every
+  `ATLAS_SEM_DISCOVER_YIELD_EVERY` directory entries during a discovery walk —
+  and the thread is lent to whatever latency-critical writes are waiting before
+  the pass resumes. A hook session record that arrives during a *yielding* pass
+  now lands. During a non-yielding stretch it is still refused and, because
+  hooks fail open, still lost. **The stretch is bounded by one translation
+  unit's parse**, up to `ATLAS_SEM_PARSE_TIMEOUT_MS`; a single very large unit
+  is the residual this does not solve, and there is no yield inside a unit
+  because the per-unit transaction deliberately spans the parse child.
 
-Ordering is unchanged. A job that backs out is excised from the queue and the
-rest shift up by one; nothing overtakes anything, because the orchestration
-ledger and the decision lifecycle both depend on writes applying in the order they
-were accepted.
+Ordering is deliberately narrowed, in one direction, and this is the statement of
+it. First-in-first-out is preserved **among the kinds a yield may drain** (the
+drain scans the queue front to back), and **within every kind**. What a drained
+job may now do is pass a *queued unbounded* one: a lease renewal that arrives
+behind a queued semantic pass is served before it. Refusing that would reimpose
+the starvation the yield exists to end. The two orderings that are load-bearing
+outside this file survive untouched, because both are per domain and every
+drained domain keeps its own order: the orchestration ledger's writes stay in the
+order they were accepted, and so do the decision lifecycle's. A job that backs
+out is still excised with the same shifting discipline, and everything a yield
+does not drain keeps its position untouched.
+
+`job_kind_is_drainable` in `src/daemon/writer.c` is the whole answer to "which
+kinds", it has no `default:`, and every `false` carries its reason at the case.
 
 `docs/engineering-rules.md` carries the rules and the argument for each;
 `docs/extending.md` carries the checklist for adding a job kind or a new

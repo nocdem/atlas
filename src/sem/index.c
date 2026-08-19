@@ -547,6 +547,7 @@ atlas_status atlas_sem_source_identity(atlas_db *db, atlas_repo_info *repo, char
  * A1's rule that no file read happens inside a write transaction is why the walk
  * runs to completion *before* `atlas_db_begin`. */
 atlas_status atlas_sem_discovery_run(atlas_db *db, atlas_repo_info *repo,
+                                     void (*yield)(void *ud), void *yield_ud,
                                      atlas_sem_discovery_result *out, atlas_err *err) {
     if (db == NULL || repo == NULL || out == NULL) {
         return atlas_err_set(err, ATLAS_ERR_INTERNAL, "build-input discovery: bad request");
@@ -559,7 +560,11 @@ atlas_status atlas_sem_discovery_run(atlas_db *db, atlas_repo_info *repo,
         return st;
     }
 
-    st = atlas_sem_discover(atlas_buf_cstr(&repo->root_path), &cfg, out, err);
+    /* The walk, with whatever the caller gave it to lend its thread to. It runs
+     * to completion before `atlas_db_begin` below, so no yield it makes can
+     * happen inside a transaction — A1's rule, and the reason this ordering was
+     * already what it is. */
+    st = atlas_sem_discover(atlas_buf_cstr(&repo->root_path), &cfg, yield, yield_ud, out, err);
     if (st != ATLAS_OK) {
         /* Atlas could not look at all — an unreadable or replaced root. The
          * stored verdict is left alone rather than overwritten with UNKNOWN:
@@ -1318,6 +1323,16 @@ atlas_status atlas_sem_index_run(atlas_db *db, int64_t repo_id, const atlas_sem_
     }
 
     /* --- 3. open a generation --- */
+
+    /* The first yield point, and the reason it is here rather than only in the
+     * loop below: reading and parsing every compilation database in a repository
+     * is already work, and until this moment the pass has done all of it holding
+     * the thread. Offered before the transaction that opens the generation and
+     * writes the compilation-database rows, so nothing is open when it is made. */
+    if (opts->yield != NULL) {
+        opts->yield(opts->yield_ud);
+    }
+
     atlas_sem_generation gen;
     atlas_sem_generation_init(&gen);
     gen.repo_id = repo_id;
@@ -1371,6 +1386,16 @@ atlas_status atlas_sem_index_run(atlas_db *db, int64_t repo_id, const atlas_sem_
             if (opts->cancel != NULL && opts->cancel(opts->cancel_ud)) {
                 st = atlas_err_set(err, ATLAS_ERR_USAGE, "the semantic index was cancelled");
                 break;
+            }
+            /* The yield the season exists for, beside the cancel poll because
+             * this is the one place in the pass where nothing is open: the
+             * previous unit's transaction has committed and the next one has not
+             * begun. Asked between units and never inside one — a unit's
+             * transaction deliberately spans its parse child, and lending the
+             * thread out from inside it would put a second write in the middle
+             * of a transaction this pass is holding. */
+            if (opts->yield != NULL) {
+                opts->yield(opts->yield_ud);
             }
             sum->units_total++;
 
@@ -1714,6 +1739,15 @@ atlas_status atlas_sem_index_run(atlas_db *db, int64_t repo_id, const atlas_sem_
                 sum->truncated_reason = "a per-unit fact ceiling was reached";
             }
         }
+    }
+
+    /* The last yield point: the unit loop has ended and the sealing transaction
+     * has not opened. A pass whose final unit was the slow one would otherwise
+     * run sealing, candidates and publication back to back without offering the
+     * thread once more, and those are the seconds a caller waiting behind it
+     * feels last. */
+    if (opts->yield != NULL) {
+        opts->yield(opts->yield_ud);
     }
 
     /* --- 4b. seal every unit's input digest ---

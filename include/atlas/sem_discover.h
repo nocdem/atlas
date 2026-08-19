@@ -239,8 +239,17 @@ void atlas_sem_discovery_result_init(atlas_sem_discovery_result *r);
  * parse is *recorded as rejected with a reason* rather than failing the pass:
  * one unreadable file must not make a repository's whole build description
  * disappear, which is precisely how a coverage claim would silently become
- * wrong. */
+ * wrong.
+ *
+ * `yield`, when supplied, is called every `ATLAS_SEM_DISCOVER_YIELD_EVERY`
+ * directory entries so the thread running the walk can be lent to something
+ * short. It changes nothing this function produces — the candidate list, the
+ * obstacle list and the verdict are identical whether it is supplied or not —
+ * and it is safe here for the reason the walk itself is: no transaction is open
+ * anywhere in this file, because none is ever opened in it. NULL is the ordinary
+ * case; a status command has nothing to lend its thread to. */
 atlas_status atlas_sem_discover(const char *root, const atlas_sem_config *cfg,
+                                void (*yield)(void *ud), void *yield_ud,
                                 atlas_sem_discovery_result *out, atlas_err *err);
 
 /* The digest over the *input universe*, and where it is computed.
@@ -276,8 +285,13 @@ atlas_status atlas_sem_discover(const char *root, const atlas_sem_config *cfg,
  *
  * A root Atlas cannot open leaves the stored verdict alone rather than blanking
  * it: "I could not look this time" is not evidence that what was found last time
- * is wrong. */
+ * is wrong.
+ *
+ * `yield` is carried straight through to the walk and is never called once the
+ * transaction is open — which is the same statement as "the walk runs to
+ * completion before the transaction opens", said from the other side. */
 atlas_status atlas_sem_discovery_run(atlas_db *db, atlas_repo_info *repo,
+                                     void (*yield)(void *ud), void *yield_ud,
                                      atlas_sem_discovery_result *out, atlas_err *err);
 
 /* The accepted set as the indexer takes it: NUL-separated, repository-relative,

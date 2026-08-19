@@ -2127,6 +2127,14 @@ atlas_status atlas_db_gate_verify(atlas_db *db, atlas_buf *out, atlas_err *err);
 atlas_status atlas_db_begin(atlas_db *db, atlas_err *err);
 atlas_status atlas_db_commit(atlas_db *db, atlas_err *err);
 void atlas_db_rollback(atlas_db *db);
+/* Whether this handle is inside a write transaction right now.
+ *
+ * Asked by a caller that is about to hand its thread to other work and must not
+ * do so with a transaction open — A1's rule that `BEGIN IMMEDIATE` is never held
+ * across unbounded work, asked as a question rather than assumed. It answers
+ * from Atlas' own nesting counter *and* from what SQLite believes, because
+ * either alone can miss; a false "no" here would be worse than not asking. */
+bool atlas_db_in_transaction(const atlas_db *db);
 /* Opens the database read-only. Used by daemon reader threads and by CLI read
  * commands while a daemon owns the writer, so a reader can never take the write
  * lock by accident. */

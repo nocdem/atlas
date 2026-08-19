@@ -42,6 +42,17 @@ missing was evidence that a retry makes one row, that a record survives a
 restart, and that a submission refused while the daemon is busy wrote nothing.
 See `docs/verification.md`.
 
+**A9.2.7** is the writer's yield, and it is read together with A9.2.6 below
+rather than instead of it: an unbounded job now hands the writer thread back
+between translation units and between chunks of a discovery walk, so a
+latency-critical write lands *during* semantic maintenance instead of being
+refused for its duration. The sentence it exists for is
+
+> **A REFUSAL A CALLER HAD TO KEEP REPEATING WAS AN ANSWER, NOT A WRITE.**
+
+A9.2.6's refusal is still there and still means exactly what it said; what
+changed is when a caller reaches it. See `docs/daemon-and-ipc.md`.
+
 The season before it, **A9.2.6**, was daemon responsiveness: a caller waiting for
 the single writer thread can now stop waiting, so a semantic pass no longer takes
 every client with it. The sentence it exists for is
@@ -100,6 +111,7 @@ document that carries it:
 
 | Season | What it added | Document |
 | --- | --- | --- |
+| A9.2.7 | the yield: a short write now lands *during* semantic maintenance, and `BUSY` is the exception | `docs/daemon-and-ipc.md` |
 | A11.6 | bounded parallel tasks in a run; the repository's own tree kept exclusive, and settlement deferred to quiescence | `docs/orchestration.md` |
 | A10.1 | the bounded cross-run memory package, and the A/B experiment that found it USEFUL on time and not on cost | `docs/orchestration.md` |
 | A11.1–A11.4 | the run driver, the gates Atlas runs itself, one follow-up per failure, and the bound that ends the chain | `docs/orchestration.md` |
@@ -805,10 +817,49 @@ is not written down is one somebody deletes.** Both halves are load-bearing.
 - **Backing out and timing out are different claims and never one message.**
   `BUSY:` says nothing was queued and nothing will run, which is what makes a
   retry safe; the timeout means the write is still on its way.
-- **Nothing overtakes anything.** `queue_remove` excises one never-started job
-  and the queue stays first-in-first-out.
+- **A job that gives up never overtakes anything.** `queue_remove` excises one
+  never-started job and the rest shift up by one. A9.2.7 narrowed *which* FIFO
+  claim Atlas makes — see the next section — and did not change this one.
 - **Ownership is settled under the lock that completes a job**, because a waiter
   that has given up clears `wants_result` under that same lock.
+- **Observing an unbounded job is no longer on its own a reason to give up.**
+  A9.2.7 added the grace and the yield; the refusal is what happens when no yield
+  arrives within it, not what happens for the length of a pass. Read the two
+  sections together.
+
+### A9.2.7 — the writer yields
+
+- **A REFUSAL A CALLER HAD TO KEEP REPEATING WAS AN ANSWER, NOT A WRITE.**
+  A9.2.6 let a caller stop waiting and left the write refused for the whole of a
+  pass. Measured: a recovery sweep refused every 20 s for a pilot window, a
+  submission that needed sixteen attempts over forty-seven seconds, and one
+  finished worker's completion lost outright.
+- **An unbounded job hands the thread back where nothing is open**, and nowhere
+  else: between translation units, either side of the unit loop, and every
+  `ATLAS_SEM_DISCOVER_YIELD_EVERY` directory entries during a walk. **There is no
+  yield inside a unit** — the per-unit transaction deliberately spans the parse
+  child, and the pass's transaction structure did not move.
+- **`writer_run_job` is the one implementation of claim, run, complete and settle
+  ownership**, used by the main loop and by the drain. It saves and restores the
+  claim rather than setting and clearing it, which is what makes the drain reuse
+  the three-exit contract instead of copying it.
+- **`job_kind_is_drainable` is asked of the kind and has no `default:`**, like
+  `job_kind_is_unbounded` beside it. `true` for the six latency-critical kinds
+  whose tables are disjoint from a pass; every `false` carries its reason at the
+  case, and an unbounded kind is never drainable.
+- **FIFO is narrowed in exactly one direction and the docs say so.** It holds
+  among drainable kinds and within every kind; a drained bounded job may pass a
+  *queued* unbounded one. The orchestration ledger's and the decision lifecycle's
+  orderings are per domain and every drained domain keeps its own.
+- **The grace is measured from the waiter's first observation**, never from queue
+  time, and `ATLAS_WRITER_YIELD_GRACE_MS` sits below the smallest synchronous
+  deadline on this path, so a back-out still precedes a timeout.
+- **`WRITER_BUSY_MSG` is unchanged because it is still exactly true.** The
+  residual is stated rather than solved: one translation unit's parse is a
+  stretch with no yield in it, and a write arriving inside one is refused as
+  before.
+- **No second writer, no new thread, no timer, no schema change, no RPC method,
+  no MCP tool, no gateway route**, and the serve loop was not touched.
 
 ### A9.2.5 — semantic index trust closure
 

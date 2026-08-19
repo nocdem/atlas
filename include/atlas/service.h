@@ -1536,9 +1536,17 @@ atlas_status atlas_service_sem_index(atlas_ctx *ctx, const char *name, const cha
  * `atlas_sem_impact_on` and `atlas_sem_context_on` are one each.
  *
  * It creates git and parser processes, so it must never be called with a write
- * transaction open. */
+ * transaction open.
+ *
+ * `yield`, when supplied, is offered to the pass at the points where nothing is
+ * open — between translation units, and once either side of the unit loop — so
+ * the thread running it can be lent to something short. It changes nothing the
+ * pass produces: the generation is byte for byte what it would have been. NULL
+ * is the ordinary case, and is what the CLI passes: a local `code index` has one
+ * thread and nothing else waiting for it. */
 atlas_status atlas_sem_index_on(atlas_db *db, const atlas_repo_info *repo,
                                 const char *const *compdbs, size_t compdb_count, bool rebuild,
+                                void (*yield)(void *ud), void *yield_ud,
                                 atlas_sem_index_summary *out, atlas_err *err);
 
 /* The daemon-served form: queue the index on the writer thread and poll until

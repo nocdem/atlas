@@ -542,6 +542,15 @@ which belongs in a season about discovery:
    process writes the index", which is A1's rule and is not to be reopened
    casually.
 
+> **Shape 1 shipped in A9.2.7 (2026-08-19); shape 2 stays open.** The pass yields
+> at the points where nothing is open and the writer drains the latency-critical
+> kinds before resuming, on exactly the argument this entry gives: a half-built
+> generation means nothing to a concurrent write because it is invisible until
+> `atlas_db_sem_publish`. `job_kind_is_drainable` is where the list lives and
+> every exclusion carries its reason. **Shape 2 is untouched and A1's rule is
+> unmoved** — there is still exactly one writer thread, one writable handle and
+> no second process.
+
 Until then the honest statement is the one `docs/semantic-discovery.md` makes: a
 first automatic build of a large repository will make the daemon unresponsive to
 *writes* for its duration, reads are unaffected, and an operator who cannot
@@ -779,6 +788,25 @@ maintenance is per-daemon while repositories are many" is a scaling property
 nobody has written down, and the operator-visible symptom is that orchestration
 appears broken on a busy machine.
 
+> **ADDRESSED IN A9.2.7 (2026-08-19).** The mechanism is a yield, not a second
+> writer: an unbounded job now hands the writer thread back at the points where
+> nothing is open — between translation units, either side of the unit loop, and
+> every `ATLAS_SEM_DISCOVER_YIELD_EVERY` directory entries during a walk — and
+> the drain runs whatever latency-critical writes are queued before the pass
+> resumes. `ATLAS_JOB_ORCH` is on that list, so a recovery sweep, a lease and a
+> completion are served *during* a pass instead of being refused for its
+> duration. A waiter gives the pass `ATLAS_WRITER_YIELD_GRACE_MS` to reach a
+> yield point before it backs out, so `BUSY` is now the exception rather than the
+> rule.
+>
+> **The residual is stated rather than closed.** A single translation unit that
+> parses for up to `ATLAS_SEM_PARSE_TIMEOUT_MS` is a stretch with no yield in it,
+> and a write that arrives inside one is refused at grace expiry exactly as
+> before. The scaling property this entry names is *reduced*, not removed:
+> maintenance is still per daemon while repositories are many, and the thirteen
+> registered worktrees below would still spend more of the writer thread than one
+> would.
+
 ## A11.5a closed with two residuals, and both are about evidence
 
 The pilot reached `ACCEPTED`. These are what it could not close on the way, kept
@@ -875,6 +903,23 @@ milestone had no mandate for: a per-daemon budget for unbounded maintenance, a
 discovery interval that scales with the repository count, a second writer for
 maintenance, or making discovery bounded. A10.1 was an experiment, and an
 experiment that repairs the thing it is standing on stops being a measurement.
+
+> **ADDRESSED IN A9.2.7 (2026-08-19), by a fifth shape this entry did not list.**
+> The writer yields. A discovery walk offers the thread back every
+> `ATLAS_SEM_DISCOVER_YIELD_EVERY` directory entries and a semantic pass offers
+> it between translation units, and `ATLAS_JOB_ORCH` is one of the kinds the
+> drain serves — so the completion whose loss decided this experiment's verdict
+> would now be applied during the walk that refused it, and the arm would not
+> have lost a finished worker's attempt.
+>
+> **What is not fixed, and is the honest reading of this entry.** Nothing bounds
+> the *aggregate* yet: discovery is still per repository, its interval is still
+> per repository, and the writer thread is still per daemon. Thirteen
+> repositories still spend more of one thread than one does, and no surface says
+> so. What changed is that the cost is now latency inside a pass rather than a
+> window in which orchestration cannot be written at all. The residual is the
+> non-yielding stretch of a single large translation unit, and `BUSY` still means
+> exactly what it meant.
 
 ## A10.1 left the run driver's completion still unable to survive its own driver
 

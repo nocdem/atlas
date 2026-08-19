@@ -516,6 +516,27 @@ atlas_status atlas_db_commit(atlas_db *db, atlas_err *err) {
     return st;
 }
 
+/* Whether this handle is inside a write transaction right now.
+ *
+ * Both halves, because either alone can be wrong in the direction that matters.
+ * `tx_depth` is Atlas' own nesting counter and knows about a transaction opened
+ * through `atlas_db_begin` and not yet balanced; `sqlite3_get_autocommit` is
+ * what SQLite itself believes, and it is the one that would notice a `BEGIN`
+ * issued some other way or a transaction SQLite rolled back underneath us. The
+ * question is asked by a caller that is about to hand its thread to somebody
+ * else, so the conservative answer — "yes, something is open" — is the one that
+ * costs nothing, and a check that could answer "no" while a transaction was
+ * open would be worse than no check at all. */
+bool atlas_db_in_transaction(const atlas_db *db) {
+    if (db == NULL) {
+        return false;
+    }
+    if (db->tx_depth > 0) {
+        return true;
+    }
+    return db->h != NULL && sqlite3_get_autocommit(db->h) == 0;
+}
+
 void atlas_db_rollback(atlas_db *db) {
     if (db->tx_depth == 0) {
         return;

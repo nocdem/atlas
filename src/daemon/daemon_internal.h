@@ -411,6 +411,30 @@ atlas_status atlas_writer_submit_watch_state(atlas_writer *w, int64_t repo_id, i
                                              const char *detail, int64_t watched_dirs,
                                              atlas_err *err);
 
+/* --- how a job kind is classified ----------------------------------------
+ *
+ * Two questions, asked of the kind and never of elapsed time, and every member
+ * of `atlas_job_kind` has to answer both. Neither switch has a `default:`, so a
+ * new kind does not compile until somebody has decided.
+ *
+ * They are declared here rather than left file-static in `writer.c` because the
+ * agreement test walks the whole enum and asks both of every member: the two
+ * classifications must not overlap where they cannot — an unbounded job is never
+ * drainable — and the drainable set must be the one the documentation names. Two
+ * spellings of one rule drift, and a drift nothing compares is one nobody sees.
+ * The reasoning for each answer is written at its case in `writer.c`, and the
+ * checklist for adding a kind is in `docs/extending.md`. */
+
+/* Whether a job of this kind has a duration Atlas can state. `true` for the two
+ * that run a compiler or walk a whole tree; a waiter that observes one gives it
+ * `ATLAS_WRITER_YIELD_GRACE_MS` to yield and then reports a refusal. */
+bool job_kind_is_unbounded(atlas_job_kind kind);
+
+/* Whether a job of this kind may be run inside a yield of an unbounded one.
+ * `true` for the latency-critical writes whose tables are disjoint from what a
+ * semantic pass or a discovery walk touches. */
+bool job_kind_is_drainable(atlas_job_kind kind);
+
 /* Depth of the queue right now, for `daemon status`. */
 int64_t atlas_writer_queue_depth(atlas_writer *w);
 /* Reconciliation passes completed since start, for `daemon status`. */

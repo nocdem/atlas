@@ -128,6 +128,7 @@ guarantee:
 | A9.2.4 | build-input discovery, and an activation policy that does not depend on memory |
 | A9.2.5 | semantic trust closure: every load-bearing semantic answer carries its verdict |
 | A9.2.6 | daemon responsiveness: a waiter that can stop waiting, and the `BUSY` refusal |
+| A9.2.7 | the writer yields: a short write lands *during* semantic maintenance rather than being refused for its duration |
 | O10 | production evidence ingestion proved at the boundary a client reaches |
 | A11.0 | the durable run a chain of tasks belongs to; a parent that resolves |
 | A11.1–A11.4 | the foreground run driver, gates Atlas runs itself, one follow-up per failure, the bound |

@@ -96,7 +96,7 @@ document that carries it:
 
 | Season | What it added | Document |
 | --- | --- | --- |
-| A10.1 | the bounded cross-run memory package, and the A/B experiment that measured it | `docs/orchestration.md` |
+| A10.1 | the bounded cross-run memory package, and the A/B experiment that found it USEFUL on time and not on cost | `docs/orchestration.md` |
 | A11.1–A11.4 | the run driver, the gates Atlas runs itself, one follow-up per failure, and the bound that ends the chain | `docs/orchestration.md` |
 | A11.0 | the run a chain of tasks belongs to; a parent that resolves, and one active task in it | `docs/orchestration.md` |
 | O10 | the intake surface proved at the boundary a client reaches; no line of `src/` changed | `docs/verification.md` |
@@ -679,8 +679,9 @@ is not written down is one somebody deletes.** Both halves are load-bearing.
 ### A10.1 — bounded cross-run memory
 
 - **A MEMORY NOBODY MEASURED WAS A FEATURE, NOT A FINDING.** The package exists
-  so the question can be asked as an experiment; the default stays `OFF`
-  whatever the answer.
+  so the question can be asked as an experiment. It was measured: the verdict is
+  `USEFUL` on worker duration and turns, **not on cost**, and the default stays
+  `OFF` anyway — a proved benefit does not turn a default on.
 - **Nothing in the selection calls a model.** Deterministic lexical overlap,
   a total order ending in `run_uid`, and the same inputs give the same digest.
 - **The mode travels on `atlas_orch_op`, never on `atlas_orch_spec`.**

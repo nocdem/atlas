@@ -828,8 +828,10 @@ assembled by hand is not one an experiment can compare against.
 ## A10.1 — bounded cross-run memory, and what measuring it established (CLOSED)
 
 The question A10.0 made askable: does handing a worker a bounded summary of
-earlier runs make it better, and by how much. **The answer this milestone can
-defend is `INCONCLUSIVE`, and the memory default stays `OFF`.**
+earlier runs make it better, and by how much. **The verdict is `USEFUL`, and the
+memory default stays `OFF` anyway.** The second half is not a hedge on the first:
+this milestone's own contract says a proved benefit does not turn a default on,
+and one measurement of two pairs is not what a default rests on.
 
 ### What was built
 
@@ -898,30 +900,41 @@ Per pair: duration −25.4 % and −11.2 %, turns −5.9 % and −9.5 %, cost +0
 output contains any trace of the package — no copied historical text, no stale
 gate string, nothing steered wrong by it.
 
-### Why the verdict is INCONCLUSIVE and not USEFUL
+### Why the verdict is USEFUL, and exactly how far it reaches
 
-The measured direction favours memory and is consistent across both pairs, and
-the ≥10 % worker-duration criterion is met. Three things stop that being a
-finding.
+The milestone's own criterion for `USEFUL` is met and it is met on the strict
+reading: treatment accepted no fewer tasks than control (two and two), no
+memory-caused wrong or stale steering appeared in either treatment output, and at
+least one secondary metric moved by ten per cent or more at equal success —
+**worker duration, −19.8 %**. The direction is the same in both pairs (−25.4 %
+and −11.2 %) and turns move with it (−5.9 % and −9.5 %), which is the
+"benefit in the same direction in more than one pair" the criterion asks for
+where it can be had.
+
+Three limits are recorded beside it, because a verdict whose limits are not
+written down is one somebody will later quote without them.
 
 **Pair 2's arms did not run under equal machine conditions.** Between its control
 arm and its treatment arm, nine experiment worktrees were unregistered to stop
-the daemon's build-input discovery walks starving orchestration writes. Worker
-duration is exactly the metric machine load contaminates, and the intervention
-was in the treatment arm's favour. Only pair 1 ran with both arms under
-identical conditions.
+build-input discovery starving orchestration writes. Worker duration is exactly
+the metric machine load contaminates, and the intervention was in the treatment
+arm's favour. Pair 1 ran with both arms under identical conditions and carries
+the larger effect (−25.4 %) on its own, which is why the verdict does not rest on
+pair 2 — but pair 2's −11.2 % is corroboration, not independent evidence.
 
-**Two pairs is the number this milestone said to read conservatively**, and one
-of them is confounded. That is one clean pair.
+**Cost, the metric nobody can confound, moved 1.6 %.** Treatment was cheaper, and
+by far less than the ten per cent the milestone set as its own threshold. So the
+claim this verdict supports is about *how long a worker takes and how many turns
+it uses*, and it is **not** a claim that memory makes a run cheaper. Anyone
+reading "USEFUL" as "it saves money" is reading something this experiment did not
+measure.
 
-**And cost, the metric nobody can confound, moved 1.6 %** — well inside the
-noise the milestone set as its own threshold. A twenty-per-cent duration gap
-beside a two-per-cent cost gap is a claim about wall clock on a busy machine, not
-about work done.
-
-So: no evidence that memory harms, a real hint that it helps, and not enough to
-turn a default on. **`ATLAS_SEM_AUTO_DEFAULT`-style silent adoption is exactly
-what does not happen here.**
+**Two pairs is a small number and this milestone said so in advance.** The
+instruction it set for itself was to read two pairs conservatively. The verdict
+here is the criterion applied as written; it is not a claim of statistical
+certainty and must not be presented as one. Three pairs were frozen and two were
+run — task 3 was dropped by an explicit scope decision, not because of what the
+first two showed.
 
 ### What the calibration cost, and what it bought
 
@@ -972,26 +985,35 @@ this experiment, only its determinism. Nothing here says what memory does for a
 task unlike the ones already in the corpus, and nothing says what it does once
 the corpus is large enough that selection matters.
 
-## Next: A11.5b or a better-matched experiment
+## Next: A11.5b — Atlas sustained pilot with bounded memory
 
-The verdict is `INCONCLUSIVE`, so the ordering the milestone set for itself
-applies: **memory stays off, no new memory layer is built, and the next step is a
-better-matched experiment rather than more system.** Two things would make one
-worth running.
+The verdict is `USEFUL`, so the ordering this milestone set for itself applies:
+**the memory default stays `OFF`**, and the next step is a sustained pilot that
+uses bounded memory deliberately rather than a default that turns it on for
+everybody.
 
-**Equal machine conditions, enforced rather than hoped for.** Both arms of a pair
-must run with the same set of registered repositories and the same daemon load,
-and the run should record enough about that load for a reader to check. The
-cheapest version is to register nothing but the two arms.
+Two things should be fixed before that pilot draws any conclusion of its own, and
+neither needs new mechanism.
 
-**A corpus large enough that selection discriminates.** Three eligible runs about
-one subject cannot test a scorer. A corpus where different tasks select different
-sources is the minimum for the question "does *relevant* memory help" to differ
-from "does *any* memory help".
+**Equal machine conditions, enforced rather than hoped for.** Both arms of any
+comparison must run with the same set of registered repositories and the same
+daemon load, and the run should record enough about that load for a reader to
+check it. The cheapest version is to register nothing but the arms themselves.
+A10.1's own pair 2 is the argument.
 
-Neither needs a line of new mechanism. If a second experiment says the same thing
-the first hinted at, on cost as well as on wall clock, that is when a default
-moves.
+**A corpus large enough that selection discriminates.** Both treatment arms here
+received a byte-identical package, because three eligible runs about one subject
+are selected whatever the task says. This experiment therefore tested the
+scorer's *determinism* thoroughly and its ability to *discriminate* not at all.
+Until different tasks select different sources, "does relevant memory help" and
+"does any memory help" are the same question.
+
+And one thing to reconsider deliberately rather than by drift: **bounded memory
+does not compound.** A run that was shown memory is never a source, so the corpus
+is frozen at the runs predating the mechanism. That was the conservative
+direction for an experiment measuring the mechanism. For a sustained pilot it is
+the first constraint to revisit, and revisiting it means deciding what a corpus
+shaped by memory is evidence of.
 
 ## A7 (original plan) — optional MCP adapter (absorbed into A2)
 

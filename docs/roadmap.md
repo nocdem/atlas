@@ -730,21 +730,81 @@ cleans, resets, checks out, stashes or reverts it.
   run driver and the model it starts; what it claims is that no *output* of that
   model reaches a decision.
 
-## Next: A11.5a — Atlas-on-Atlas pilot, cross-run memory off
+## A11.5a — Atlas-on-Atlas pilot, cross-run memory off (CLOSED)
 
-The next milestone is the first real pilot: one operator-supervised run against
-this repository, with `claude-repo` enabled in the root-owned policy, cross-run
-memory deliberately **off**.
+The first real pilot: one operator-supervised run against this repository, with
+`claude-repo` enabled in the root-owned policy and cross-run memory deliberately
+**off**. A pilot rather than a feature, because what was unproven was not the
+machinery — A11.1's fourteen acceptance cases are that — but whether a task text,
+a gate list and a three-worker bound are enough structure for a real change to
+land. That question could not be answered by a test, and the answer is yes.
 
-It is a pilot rather than a feature because what is unproven is not the
-machinery — that is what A11.1's fourteen acceptance cases are — but whether a
-task text, a gate list and a three-worker bound are enough structure for a real
-change to land. That question cannot be answered by a test.
+**It took four runs, and the first three are the milestone's real content.**
+Every one of them was blocked by a defect in Atlas rather than by the model, and
+none of the three was visible to the suite that existed at the time.
 
-What A11.5a must not do: enable cross-run memory, add a second model role, run
-more than one worker at a time, or let anything it learns become an automatic
-input to a later run. Those are what the milestone is holding constant so that
-the one variable it is measuring stays readable.
+1. **Three `SPAWN_FAILED` in one second.** The worker executable is resolved
+   against a fixed `PATH`, deliberately, because the child's environment is
+   constructed rather than inherited. On this machine `claude` lived in a home
+   directory, so no worker could start and the run's whole budget was spent
+   inside a second. Deployment prerequisite, not a code defect; recorded in
+   `docs/backlog.md`.
+2. **Gates never reached the daemon intact.** The sender encoded each one as the
+   canonical single-command vector and the daemon wrapped it in a *second* count
+   before decoding, so the sender's count was read as the argument count.
+   `cmake --build build --target t -j 4` was stored as the one-element vector
+   `["5:cmake"]`; a one-word gate did not decode at all. Since a repository-tree
+   task must declare a gate and can only be accepted by passing one, **no run
+   submitted through the CLI could ever reach ACCEPTED.** It survived because
+   every A11 test builds its operation in process and none travelled the wire.
+   Fixed, with the wire form given one reader and a suite that fails against the
+   reintroduced wrapper.
+3. **A live worker judged for a silence that was Atlas' own.** A heartbeat is an
+   ordinary synchronous write and A9.2.6 refuses those for the whole of an
+   unbounded semantic pass. Measured here: passes over a second registered
+   repository ran 167–176 s with 14–20 s between them, so orchestration writes
+   were refused about ninety per cent of the time and a sixty-second lease could
+   not survive. Separately, a repository-tree attempt has no workspace, so a
+   refused completion destroyed the only copy of the result — one attempt left
+   `orch_events` empty for a worker that had run five minutes.
+4. **A worker killed at 301 s while working.** `--output-format json` says
+   nothing on stdout until it finishes, so an idle bound measured in bytes read
+   the format as idleness. The ceiling was not raised: idle is now measured in
+   recognised progress records, the worker runs under `--output-format
+   stream-json`, and every record is appended to a durable per-attempt log.
+
+**The run that closed it.** Run `r29b70dcfd7839a22ae36cba103a7dd25`, one worker
+start of three, eleven minutes twelve seconds, 215 progress events, longest
+genuine silence 173 s, both gates run by Atlas and passed, no follow-up, no
+duplicate attempt, HEAD unmoved, nothing committed by the worker. What it
+produced — `tests/test_a11_head_drift.c` — was reviewed before it was committed
+and verified to fail, on nine assertions, when the branch it covers is disabled.
+
+**What the pilot did not establish.** It is one task on one repository, and there
+is no baseline arm, so nothing here says what Atlas' orchestration costs or saves
+against a person or against an unorchestrated session. Token usage for the
+accepted run had to be recovered from the worker's own session transcript,
+because a worker log above the inline artifact ceiling is discarded once the
+completion lands — recorded as a residual in `docs/backlog.md`, and the thing to
+fix before any comparison is attempted.
+
+A11.5a held constant what it said it would: no cross-run memory, no second model
+role, one worker at a time, and nothing learned in a run became an input to a
+later one.
+
+## Next: A10 — cross-run memory A/B experiment
+
+With a pilot that can carry a real task to `ACCEPTED`, the question A10 exists to
+answer becomes askable: does cross-run memory make a worker better, and by how
+much. A11.5a is the memory-**off** baseline for it, and its numbers are the ones
+an A/B compares against.
+
+Two things are worth saying before that starts. The residual above — a large
+worker log discarded on the success path — should be closed first, because an
+experiment whose control arm cannot report its own token usage is not an
+experiment. And A11.5a's own history is the warning: three of its four runs were
+blocked by defects nothing in the suite could see, so an A/B that measures a
+difference must first establish that both arms ran at all.
 
 **A10 is not closed and is not cancelled**, and the ordering is deliberate rather
 than an oversight. A10 is the Experience Learning phase, and the contract it must

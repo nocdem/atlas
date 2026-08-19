@@ -778,3 +778,44 @@ contract is exactly what makes retrying safe — but "unbounded semantic
 maintenance is per-daemon while repositories are many" is a scaling property
 nobody has written down, and the operator-visible symptom is that orchestration
 appears broken on a busy machine.
+
+## A11.5a closed with two residuals, and both are about evidence
+
+The pilot reached `ACCEPTED`. These are what it could not close on the way, kept
+separate from the milestone because a measurement that quietly repairs what it
+measures is not one.
+
+**A large worker log is discarded on the success path.** `report()` attaches the
+worker's streams as inline artifacts and skips any body over
+`ATLAS_ORCH_ARTIFACT_INLINE_MAX`; the durable result spool is cleared once the
+daemon accepts the completion. Each half is right on its own and together they
+lose the whole log exactly when the run *worked*: a refused completion keeps
+everything, an accepted one keeps nothing above 256 KiB. The accepted pilot run
+produced a log well past that, so its token and cost figures — which the CLI puts
+in the result record inside that log — had to be recovered from the worker's own
+session transcript under the operator's home directory.
+
+That recovery is not a mechanism, it is a coincidence. It worked only because
+A8.1's model dispatcher runs the worker under the operator's session; a worker
+running as `atlas-worker` has a private home inside its workspace and leaves no
+such file. **So Atlas currently cannot report what a successful run cost**, and
+the next milestone is an A/B experiment whose control arm is exactly that. Two
+shapes would fix it and both are small: carry the usage fields out of the result
+document as completion metadata, or keep the spool when the log exceeded the
+inline ceiling rather than dropping both copies.
+
+**Cross-crash completion settlement is still not possible.** A driver that dies
+after its worker finished but before the daemon accepts the completion leaves a
+durable result that nothing can deliver: `op_complete` requires a lease token,
+and A8's rule is that a token is never stored, only a digest of it. The spool
+therefore guarantees the result still exists to be *read*, not that another
+process may present it.
+
+This was left alone deliberately rather than solved badly. Every cheap route runs
+through putting a bearer credential on disk, and the alternatives — a daemon-side
+predicate that accepts a late completion for an attempt no newer lease has
+superseded, or a resume that re-claims the same attempt and receives a fresh
+token — are changes to the lease model, not minimum fixes. A season that wants
+this should decide the authority question first and write it down; until then the
+honest statement is that a crashed driver costs an attempt, and the wall deadline
+bounds what that costs.

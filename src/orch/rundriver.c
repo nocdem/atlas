@@ -761,6 +761,9 @@ static atlas_status drive_one(const atlas_rundriver_opts *o, const atlas_orch_ru
             req.work_dir = atlas_buf_cstr(&c.repo_root);
             req.job_uid = atlas_buf_cstr(&c.job_uid);
             req.attempt_no = c.attempt_no;
+            /* Same directory the finished result is spooled to, so one attempt's
+             * evidence lives in one place and is named the same way. */
+            req.progress_dir = o->spool_dir;
             req.task = atlas_buf_cstr(&c.task);
             req.mode = atlas_buf_cstr(&c.mode);
             req.wall_timeout_ms = c.wall_timeout_ms;

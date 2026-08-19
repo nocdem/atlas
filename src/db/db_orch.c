@@ -552,10 +552,6 @@ static atlas_status require_lease(atlas_db *db, const atlas_orch_op *op, int64_t
         return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
                              "the presented lease is not valid for any active attempt");
     }
-    if (lr->expires_ms <= at_ms) {
-        return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
-                             "the presented lease is not valid for any active attempt");
-    }
     bool jfound = false;
     s = job_by_id(db, lr->job_id, j, &jfound, err);
     if (s != ATLAS_OK) {
@@ -563,6 +559,27 @@ static atlas_status require_lease(atlas_db *db, const atlas_orch_op *op, int64_t
     }
     if (!jfound) {
         return atlas_err_set(err, ATLAS_ERR_INTEGRITY, "the leased job no longer exists");
+    }
+    /* A11.5a-R2. The expiry is checked *after* the job is read, because whether
+     * an expired lease is still usable depends on the job's wall deadline and on
+     * whether Atlas was refusing writes.
+     *
+     * A released lease is refused above and unconditionally: release is what
+     * happens when the sweep reclaims an attempt, so a released lease may have
+     * been superseded by a newer one and a late completion under it could
+     * overwrite another worker's result. Grace applies only to a lease that has
+     * run out of time while nobody took it away — the case where the holder is
+     * still the rightful one and simply could not be heard.
+     *
+     * Without this, `op_recover`'s grace was worth nothing: the sweep would
+     * spare a worker and this function would reject the very heartbeat that
+     * proved it alive. Measured in pilot 3 — the completion of a five-minute
+     * worker was refused here as "not valid for any active attempt" after fifty
+     * seconds of correct retrying. */
+    if (lr->expires_ms <= at_ms &&
+        !atlas_orch_lease_in_grace(j->deadline_ms, at_ms, op->contended_until_ms)) {
+        return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                             "the presented lease is not valid for any active attempt");
     }
     /* The job may have moved on without the worker noticing — a retry after an
      * expiry, or a cancellation that completed. A message about an attempt that
@@ -2518,9 +2535,8 @@ static atlas_status op_recover(atlas_db *db, const atlas_orch_op *op, atlas_orch
          * finally stops a job" literally true. The honest cost is that under
          * unbroken contention a dead driver is not distinguished from a live one
          * until that deadline. */
-        if (op->contended_until_ms > 0 && !j.cancel_requested && j.deadline_ms > 0 &&
-            at_ms < j.deadline_ms &&
-            at_ms - op->contended_until_ms < ATLAS_ORCH_CONTENTION_GRACE_MS) {
+        if (!j.cancel_requested &&
+            atlas_orch_lease_in_grace(j.deadline_ms, at_ms, op->contended_until_ms)) {
             /* Deferring has to move the lease, not merely decline to reclaim it.
              * `require_lease` refuses an expired lease independently of this
              * sweep — that is what stops a zombie overwriting a newer attempt's

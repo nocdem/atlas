@@ -1074,7 +1074,107 @@ static void test_contention_never_extends_the_wall_deadline(void) {
     env_close(&e);
 }
 
+/* A11.5a-R. The half that `8c41245` was missing, and that pilot 3 proved was
+ * missing: sparing an attempt in the sweep is worthless if the write path still
+ * rejects its holder. A completion arriving after the lease ran out, from the
+ * worker that still holds it, on a machine that was refusing writes, is the
+ * exact shape of a five-minute worker's result and it must land. */
+static void test_a_completion_lands_after_contention_expired_the_lease(void) {
+    env e;
+    env_open(&e);
+    atlas_orch_result s, g;
+    apply_ok(&e, submit_op(&e, NULL, 3, 3600000), &s);
+    lease_one(&e, &g);
+    advance_to_running(&e, atlas_buf_cstr(&g.token));
+
+    int64_t late = g.expires_ms + ATLAS_ORCH_LEASE_MS * 2;
+    atlas_orch_op *op = worker_op(ATLAS_ORCH_OP_COMPLETE, atlas_buf_cstr(&g.token));
+    op->success = true;
+    op->now_ms = late;
+    op->contended_until_ms = late - 1;
+    atlas_orch_result r;
+    apply_ok(&e, op, &r);
+    T_EQ_INT((int)count_sql(e.db, "SELECT count(*) FROM orch_jobs WHERE state = 'SUCCEEDED';"), 1);
+    atlas_orch_result_free(&r);
+
+    atlas_orch_result_free(&s);
+    atlas_orch_result_free(&g);
+    env_close(&e);
+}
+
+/* And the boundary that keeps it safe. Contention forgives a lease that ran out
+ * of time; it never forgives one that was taken away. A released lease may have
+ * been superseded by a newer attempt, so honouring a late completion under it
+ * could overwrite another worker's result — which is the whole reason the check
+ * exists. */
+static void test_a_released_lease_is_refused_however_contended(void) {
+    env e;
+    env_open(&e);
+    atlas_orch_result s, g;
+    apply_ok(&e, submit_op(&e, NULL, 3, 3600000), &s);
+    lease_one(&e, &g);
+    advance_to_running(&e, atlas_buf_cstr(&g.token));
+
+    /* Reclaim it with no contention reported, exactly as a quiet machine would. */
+    int64_t late = g.expires_ms + ATLAS_ORCH_LEASE_MS * 2;
+    atlas_orch_op *rec = atlas_orch_op_new(ATLAS_ORCH_OP_RECOVER);
+    rec->actor = ATLAS_ORCH_ACTOR_ATLAS;
+    rec->now_ms = late;
+    atlas_orch_result rr;
+    apply_ok(&e, rec, &rr);
+    T_EQ_INT((int)rr.expired, 1);
+    atlas_orch_result_free(&rr);
+
+    /* Now the old worker comes back claiming the machine was busy. It was not
+     * its lease any more before it said a word. */
+    atlas_orch_op *op = worker_op(ATLAS_ORCH_OP_COMPLETE, atlas_buf_cstr(&g.token));
+    op->success = true;
+    op->now_ms = late + 1;
+    op->contended_until_ms = late;
+    apply_refused(&e, op, "a completion on a released lease during contention");
+
+    atlas_orch_result_free(&s);
+    atlas_orch_result_free(&g);
+    env_close(&e);
+}
+
+/* A daemon that has just started has no record of refusing anything, so no lease
+ * is in grace and every expiry is judged exactly as it was before this existed.
+ * That is the safe direction for a restart to fall in: an attempt whose driver
+ * died is reclaimable again, and a token from before the restart gains nothing
+ * from the gap. */
+static void test_a_restart_grants_no_grace(void) {
+    env e;
+    env_open(&e);
+    atlas_orch_result s, g;
+    apply_ok(&e, submit_op(&e, NULL, 3, 3600000), &s);
+    lease_one(&e, &g);
+    advance_to_running(&e, atlas_buf_cstr(&g.token));
+
+    /* `atlas_orch_contention_seen` is process state and a fresh process reads
+     * zero; the operation below carries what a restarted daemon would stamp. */
+    T_EQ_INT((int)atlas_orch_contention_seen(), 0);
+
+    atlas_orch_op *op = atlas_orch_op_new(ATLAS_ORCH_OP_RECOVER);
+    op->actor = ATLAS_ORCH_ACTOR_ATLAS;
+    op->now_ms = g.expires_ms + ATLAS_ORCH_LEASE_MS * 2;
+    op->contended_until_ms = atlas_orch_contention_seen();
+    atlas_orch_result r;
+    apply_ok(&e, op, &r);
+    T_EQ_INT((int)r.deferred, 0);
+    T_EQ_INT((int)r.expired, 1);
+    atlas_orch_result_free(&r);
+    atlas_orch_result_free(&s);
+    atlas_orch_result_free(&g);
+    env_close(&e);
+}
+
 static const atlas_test TESTS[] = {
+    {"a_completion_lands_after_contention_expired_the_lease",
+     test_a_completion_lands_after_contention_expired_the_lease},
+    {"a_released_lease_is_refused_however_contended",
+     test_a_released_lease_is_refused_however_contended},
+    {"a_restart_grants_no_grace", test_a_restart_grants_no_grace},
     {"contention_defers_an_expired_lease", test_contention_defers_an_expired_lease},
     {"without_contention_an_expired_lease_is_still_reclaimed",
      test_without_contention_an_expired_lease_is_still_reclaimed},

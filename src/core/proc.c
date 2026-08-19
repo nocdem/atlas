@@ -435,7 +435,16 @@ atlas_status atlas_proc_run(const atlas_proc_opts *opts, atlas_proc_sink sink, v
         if (out_idx >= 0 && fds[out_idx].revents != 0) {
             ssize_t n = read(out_pipe[0], chunk, ATLAS_PROC_READ_CHUNK);
             if (n > 0) {
-                last_output = now_ms();
+                /* A11.5a-R2. With an activity predicate, bytes are not evidence
+                 * of work on their own — only what the predicate recognises is.
+                 * Without one this is unchanged, which is what every git caller
+                 * relies on. The predicate is asked before the sink so that a
+                 * sink failure cannot swallow the observation. */
+                if (opts->activity == NULL) {
+                    last_output = now_ms();
+                } else if (opts->activity(chunk, (size_t)n, opts->activity_ud)) {
+                    last_output = now_ms();
+                }
                 local_res.stdout_bytes += (size_t)n;
                 if (local_res.stdout_bytes > max_stdout) {
                     local_res.stdout_truncated = true;
@@ -469,7 +478,13 @@ atlas_status atlas_proc_run(const atlas_proc_opts *opts, atlas_proc_sink sink, v
         if (err_idx >= 0 && fds[err_idx].revents != 0) {
             ssize_t n = read(err_pipe[0], chunk, ATLAS_PROC_READ_CHUNK);
             if (n > 0) {
-                last_output = now_ms();
+                /* A11.5a-R2. Stderr never refreshes the idle clock once a caller
+                 * has said what activity means. A worker that has stopped making
+                 * progress but keeps narrating on stderr is precisely the
+                 * failure the idle bound exists to end. */
+                if (opts->activity == NULL) {
+                    last_output = now_ms();
+                }
                 if (stderr_out != NULL && stderr_seen < max_stderr) {
                     size_t room = max_stderr - stderr_seen;
                     size_t take = ((size_t)n < room) ? (size_t)n : room;

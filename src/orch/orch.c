@@ -19,6 +19,7 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -743,6 +744,35 @@ atlas_status atlas_orch_validations_decode(const char *text, atlas_orch_argv *v,
     }
     *count_out = n;
     return ATLAS_OK;
+}
+
+/* A11.5a-R2. The daemon's record of its own unavailability. See atlas/orch.h. */
+static _Atomic int64_t g_contended_until_ms = 0;
+
+void atlas_orch_contention_note(int64_t at_ms) {
+    if (at_ms > 0) {
+        atomic_store_explicit(&g_contended_until_ms, at_ms, memory_order_relaxed);
+    }
+}
+
+int64_t atlas_orch_contention_seen(void) {
+    return atomic_load_explicit(&g_contended_until_ms, memory_order_relaxed);
+}
+
+bool atlas_orch_lease_in_grace(int64_t deadline_ms, int64_t at_ms, int64_t contended_until_ms) {
+    if (contended_until_ms <= 0 || deadline_ms <= 0) {
+        return false;
+    }
+    /* The wall deadline is the submitter's bound and outranks everything here. */
+    if (at_ms >= deadline_ms) {
+        return false;
+    }
+    int64_t since = at_ms - contended_until_ms;
+    /* A stamp from the future is a clock that moved, not evidence of anything. */
+    if (since < 0) {
+        return false;
+    }
+    return since < ATLAS_ORCH_CONTENTION_GRACE_MS;
 }
 
 atlas_status atlas_orch_validation_wire_decode(const char *enc, atlas_orch_argv *out,

@@ -467,7 +467,52 @@ static void test_output_beyond_the_bound_stops_the_child(void) {
     atlas_buf_free(&exe);
 }
 
+/* --- A11.5a-R2: what counts as a worker making progress ------------------- */
+
+/* The rule that replaced "were there any bytes?". Two real workers were killed
+ * at the 300 s idle bound while mid-turn, because `--output-format json` says
+ * nothing on stdout until it is finished: the silence was the format, not the
+ * worker. Idle is now measured in recognised records, so what does and does not
+ * count is worth asserting exactly. */
+static void test_a_streamed_record_is_recognised_and_prose_is_not(void) {
+    /* Shapes taken from the installed Claude Code 2.1.235, not invented. */
+    static const char *const REAL[] = {
+        "{\"type\":\"system\",\"subtype\":\"init\",\"cwd\":\"/opt/atlas\"}",
+        "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\","
+        "\"name\":\"Edit\"}]}}",
+        "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\"}]}}",
+        "{\"type\":\"rate_limit_event\",\"x\":1}",
+        "{\"type\":\"result\",\"is_error\":false}",
+    };
+    for (size_t i = 0; i < sizeof REAL / sizeof REAL[0]; i++) {
+        T_CHECK_MSG(atlas_driver_progress_line_is_event(REAL[i], strlen(REAL[i])),
+                    "a real streamed record was not recognised: %s", REAL[i]);
+    }
+
+    /* None of these may keep a worker alive. The first is the exact failure the
+     * bound exists to catch — a process that has stopped working and is still
+     * talking. */
+    static const char *const NOT[] = {
+        "still working, please wait",
+        "",
+        "{",
+        /* Well-formed prefix, no close: a record that never arrived. */
+        "{\"type\":\"assistant\",\"message\":{\"content\":[",
+        /* A type Atlas does not know is not a type Atlas accepts. */
+        "{\"type\":\"keepalive\"}",
+        /* Not at the start of the line. */
+        "  {\"type\":\"assistant\"}",
+        "[{\"type\":\"assistant\"}]",
+    };
+    for (size_t i = 0; i < sizeof NOT / sizeof NOT[0]; i++) {
+        T_CHECK_MSG(!atlas_driver_progress_line_is_event(NOT[i], strlen(NOT[i])),
+                    "output that is not a progress record was accepted as one: %s", NOT[i]);
+    }
+}
+
 static const atlas_test TESTS[] = {
+    {"a_streamed_record_is_recognised_and_prose_is_not",
+     test_a_streamed_record_is_recognised_and_prose_is_not},
     {"an unknown driver is refused and never defaulted",
      test_an_unknown_driver_is_refused_and_never_defaulted},
     {"the fake driver is deterministic in each behaviour",

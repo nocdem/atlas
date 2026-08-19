@@ -24,6 +24,12 @@ add_executable(atlas-marker tools/atlas_marker.c)
 target_compile_definitions(atlas-marker PRIVATE _POSIX_C_SOURCE=200809L)
 atlas_set_warnings(atlas-marker)
 
+# A11.5a-R2: a child that emits streamed progress records on a schedule, so the
+# activity-based idle bound can be proved without a real model worker.
+add_executable(atlas-streamer tools/atlas_streamer.c)
+target_compile_definitions(atlas-streamer PRIVATE _POSIX_C_SOURCE=200809L)
+atlas_set_warnings(atlas-streamer)
+
 # A9.2.5. A parse child that fails transiently before it succeeds, so the
 # per-unit retry can be tested end to end rather than recorded as untestable.
 # It uses `atlas_sem_index_opts.atlas_exe`, which has been the child's path since
@@ -42,6 +48,7 @@ target_compile_definitions(atlas_test_support PUBLIC
   ATLAS_MARKER_BIN="$<TARGET_FILE:atlas-marker>"
   ATLAS_SPAWNER_BIN="$<TARGET_FILE:atlas-spawner>"
   ATLAS_FLAKY_PARSE_BIN="$<TARGET_FILE:atlas-flaky-parse>"
+  ATLAS_STREAMER_BIN="$<TARGET_FILE:atlas-streamer>"
 )
 target_link_libraries(atlas_test_support PUBLIC atlas_core)
 atlas_set_warnings(atlas_test_support)

@@ -30,6 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "atlas/atlas.h"
@@ -72,7 +73,180 @@ typedef struct capture {
     atlas_buf out;
     int64_t max;
     bool truncated;
+
+    /* A11.5a-R2. The progress reader, riding on the same chunks the sink sees.
+     *
+     * `--output-format stream-json` emits one JSON object per line, so what
+     * arrives here is a byte stream that has to be reassembled into records
+     * before any of it means anything. `line` holds the partial tail between
+     * chunks and is bounded: a record longer than the cap is abandoned to the
+     * next newline and counts as nothing, because an unbounded accumulator is
+     * both a memory hole and a way to refresh the idle clock forever without
+     * ever completing a record. */
+    atlas_buf line;
+    bool line_overflow;
+    FILE *progress;
+    int64_t events;
+    int64_t event_bytes;
 } capture;
+
+/* The most a single streamed record may be before it is abandoned. Measured
+ * against Claude Code 2.1.235: the largest lines are assistant messages
+ * carrying a usage block, and those ran well under 4 KiB in the probe this was
+ * written from. The cap is far above that and far below anything that could
+ * matter, because its job is to bound a hostile or broken stream rather than to
+ * fit a real one exactly. */
+#define ATLAS_DRIVER_LINE_MAX 65536u
+/* Bounds on what one attempt may record, so a chatty worker cannot fill a disk
+ * to keep itself alive. Both refuse rather than trim: recording stops and the
+ * events already written stay true. */
+#define ATLAS_DRIVER_PROGRESS_MAX_EVENTS 5000
+#define ATLAS_DRIVER_PROGRESS_MAX_BYTES (1024 * 1024)
+
+/* The top-level record types Claude Code emits on a stream-json run, as
+ * observed from the installed 2.1.235 and from nothing else.
+ *
+ * This is a checked vocabulary, in the A2 sense, not a parser: a record counts
+ * as progress when it is a complete line that opens with `{"type":"` naming one
+ * of these and closes with `}`. Nothing inside is interpreted, and nothing here
+ * can produce authority — a progress record cannot accept a run, pass a gate or
+ * move a status, which is why recognising one loosely is safe. A crafted line
+ * buys a worker nothing except a refreshed idle clock, and the wall deadline is
+ * the bound that actually stops it. */
+static const char *const PROGRESS_TYPES[] = {"system", "assistant", "user", "result",
+                                             "rate_limit_event", "stream_event"};
+
+/* The tool names worth naming in the progress record. Anything else is recorded
+ * as a tool use without a name rather than with one Atlas did not expect. */
+static const char *const PROGRESS_TOOLS[] = {"Read", "Edit", "Write", "Bash", "Glob", "Grep",
+                                             "Task", "NotebookEdit", "MultiEdit"};
+
+/* Which vocabulary member this line announces itself as, or NULL. */
+static const char *progress_type_of(const char *line, size_t len) {
+    static const char PFX[] = "{\"type\":\"";
+    const size_t plen = sizeof PFX - 1u;
+    if (len < plen + 2u || memcmp(line, PFX, plen) != 0) {
+        return NULL;
+    }
+    /* A record is only complete if it closes. A truncated line that happens to
+     * start correctly is not evidence of anything. */
+    if (line[len - 1u] != '}') {
+        return NULL;
+    }
+    const char *name = line + plen;
+    size_t room = len - plen;
+    for (size_t i = 0; i < sizeof PROGRESS_TYPES / sizeof PROGRESS_TYPES[0]; i++) {
+        size_t tl = strlen(PROGRESS_TYPES[i]);
+        if (room > tl && memcmp(name, PROGRESS_TYPES[i], tl) == 0 && name[tl] == '"') {
+            return PROGRESS_TYPES[i];
+        }
+    }
+    return NULL;
+}
+
+bool atlas_driver_progress_line_is_event(const char *line, size_t len) {
+    return line != NULL && progress_type_of(line, len) != NULL;
+}
+
+/* The tool a record names, if it is one Atlas expects. Bounded substring search
+ * over the line, never an interpretation of the document. */
+static const char *progress_tool_of(const char *line, size_t len) {
+    static const char NEEDLE[] = "\"name\":\"";
+    const size_t nlen = sizeof NEEDLE - 1u;
+    if (len < nlen) {
+        return NULL;
+    }
+    for (size_t i = 0; i + nlen < len; i++) {
+        if (memcmp(line + i, NEEDLE, nlen) != 0) {
+            continue;
+        }
+        const char *v = line + i + nlen;
+        size_t room = len - (i + nlen);
+        for (size_t k = 0; k < sizeof PROGRESS_TOOLS / sizeof PROGRESS_TOOLS[0]; k++) {
+            size_t tl = strlen(PROGRESS_TOOLS[k]);
+            if (room > tl && memcmp(v, PROGRESS_TOOLS[k], tl) == 0 && v[tl] == '"') {
+                return PROGRESS_TOOLS[k];
+            }
+        }
+    }
+    return NULL;
+}
+
+/* One line of the progress log: when, what kind, which tool, how big.
+ *
+ * Metadata only, deliberately. A tool-use record carries the arguments the model
+ * chose — file contents for an edit, a command line for a shell call — and none
+ * of that belongs in a durable log Atlas keeps: it is repository content and
+ * model output at once, and the rule is that neither is stored beyond what an
+ * operator needs to see that work happened. */
+static void progress_note(capture *c, const char *line, size_t len) {
+    if (c->progress == NULL) {
+        return;
+    }
+    if (c->events >= ATLAS_DRIVER_PROGRESS_MAX_EVENTS ||
+        c->event_bytes >= ATLAS_DRIVER_PROGRESS_MAX_BYTES) {
+        return;
+    }
+    const char *kind = progress_type_of(line, len);
+    if (kind == NULL) {
+        return;
+    }
+    const char *tool = progress_tool_of(line, len);
+    bool tool_use = memmem(line, len, "\"tool_use\"", 10u) != NULL;
+    bool tool_result = memmem(line, len, "\"tool_result\"", 13u) != NULL;
+    struct timespec ts;
+    (void)clock_gettime(CLOCK_REALTIME, &ts);
+    int wrote = fprintf(c->progress, "%lld %s%s%s%s%s %zu\n", (long long)ts.tv_sec, kind,
+                        tool_use ? " tool_use" : (tool_result ? " tool_result" : ""),
+                        tool != NULL ? " " : "", tool != NULL ? tool : "", "", len);
+    if (wrote > 0) {
+        c->events++;
+        c->event_bytes += wrote;
+        (void)fflush(c->progress);
+    }
+}
+
+/* A11.5a-R2. Reassembles lines out of raw chunks and answers the one question
+ * `atlas_proc_run` asks: did this chunk contain evidence of work?
+ *
+ * Returns true as soon as one complete, recognised record lands. Everything
+ * else — a partial line, an overlong one, ordinary prose, malformed JSON — is
+ * not activity, which is the whole point: a worker that has stopped working
+ * cannot keep itself alive by printing. */
+static bool progress_activity(const char *chunk, size_t n, void *ud) {
+    capture *c = (capture *)ud;
+    bool saw = false;
+    atlas_err ignore;
+    atlas_err_init(&ignore);
+    for (size_t i = 0; i < n; i++) {
+        if (chunk[i] != '\n') {
+            if (c->line.len >= ATLAS_DRIVER_LINE_MAX) {
+                c->line_overflow = true;
+                atlas_buf_reset(&c->line);
+            }
+            if (!c->line_overflow) {
+                (void)atlas_buf_append(&c->line, &chunk[i], 1u, &ignore);
+            }
+            continue;
+        }
+        if (!c->line_overflow && c->line.len > 0) {
+            const char *line = c->line.data;
+            size_t len = c->line.len;
+            /* stream-json writes bare lines, but a stray carriage return must
+             * not be what decides a record is incomplete. */
+            while (len > 0 && (line[len - 1u] == '\r' || line[len - 1u] == ' ')) {
+                len--;
+            }
+            if (progress_type_of(line, len) != NULL) {
+                progress_note(c, line, len);
+                saw = true;
+            }
+        }
+        c->line_overflow = false;
+        atlas_buf_reset(&c->line);
+    }
+    return saw;
+}
 
 static atlas_status capture_sink(const char *chunk, size_t n, void *ud, atlas_err *err) {
     capture *c = (capture *)ud;
@@ -379,7 +553,28 @@ static atlas_status claude_exec(const atlas_driver_req *req, atlas_driver_res *r
     capture out;
     memset(&out, 0, sizeof(out));
     atlas_buf_init(&out.out);
+    atlas_buf_init(&out.line);
     out.max = req->max_output_bytes > 0 ? req->max_output_bytes : (1024 * 1024);
+
+    /* A11.5a-R2. The progress log, opened before the child so that a worker that
+     * dies in its first second still leaves a file saying it started.
+     *
+     * Appended to rather than written and renamed: this is a log that grows
+     * while the child runs, and the atomic-rename discipline the *result* spool
+     * uses answers a different question — there a reader must never see half a
+     * document, here a reader wants whatever has happened so far. O_APPEND plus
+     * a flush per record is the durability that fits. */
+    atlas_buf ppath = ATLAS_BUF_INIT;
+    if (st == ATLAS_OK && req->progress_dir != NULL && req->progress_dir[0] == '/' &&
+        req->job_uid != NULL) {
+        if (atlas_buf_appendf(&ppath, err, "%s/%s.%lld.progress", req->progress_dir, req->job_uid,
+                              (long long)req->attempt_no) == ATLAS_OK) {
+            out.progress = fopen(atlas_buf_cstr(&ppath), "ae");
+        }
+        /* A progress log that cannot be opened is not a reason to refuse to run
+         * the work; it costs visibility, not correctness. */
+        atlas_err_init(err);
+    }
     atlas_buf errbuf = ATLAS_BUF_INIT;
     atlas_proc_result pr;
     memset(&pr, 0, sizeof(pr));
@@ -394,7 +589,16 @@ static atlas_status claude_exec(const atlas_driver_req *req, atlas_driver_res *r
         const char *argv[] = {
             atlas_buf_cstr(&exe),
             "--print",
-            "--output-format", "json",
+            /* A11.5a-R2. Streamed, one JSON record per line, so Atlas can see
+             * the worker doing its work instead of inferring it from a silence
+             * that only ever ends. With the single-document format the CLI says
+             * nothing on stdout until it is finished, which made every long task
+             * look identical to a wedged one and killed two real workers at the
+             * idle bound while they were mid-turn. Verified against the
+             * installed 2.1.235: `stream-json` needs no other flag, and line one
+             * is still an object, so the malformed-result check below is
+             * unaffected. */
+            "--output-format", "stream-json",
             /* The workspace is the boundary, and it is enforced by the OS: the
              * dispatcher runs as `atlas-worker`, whose only writable path is its
              * own runtime root. Permission prompts cannot be answered in a
@@ -421,6 +625,9 @@ static atlas_status claude_exec(const atlas_driver_req *req, atlas_driver_res *r
         opts.max_stderr = 256u * 1024u;
         opts.cancel = req->cancel;
         opts.cancel_ud = req->cancel_ud;
+        /* Idleness now means "no recognised progress record", not "no bytes". */
+        opts.activity = progress_activity;
+        opts.activity_ud = &out;
         st = atlas_proc_run(&opts, capture_sink, &out, &errbuf, &pr, err);
     }
 
@@ -492,6 +699,13 @@ static atlas_status claude_exec(const atlas_driver_req *req, atlas_driver_res *r
         st = ATLAS_OK;
     }
 
+    if (out.progress != NULL) {
+        (void)fclose(out.progress);
+        out.progress = NULL;
+    }
+    res->events = out.events;
+    atlas_buf_free(&ppath);
+    atlas_buf_free(&out.line);
     atlas_buf_free(&out.out);
     atlas_buf_free(&errbuf);
     atlas_buf_free(&home_env);

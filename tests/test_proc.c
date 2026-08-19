@@ -244,7 +244,114 @@ static void test_stderr_is_bounded(void) {
     atlas_buf_free(&exe);
 }
 
+/* --- A11.5a-R2: idleness measured in activity, not in bytes ---------------- */
+
+/* Counts chunks the caller decides are progress. The predicate is the *shape*
+ * the driver uses — assembled lines checked against a vocabulary — reduced to
+ * what this layer is responsible for: `atlas_proc_run` must ask, and must
+ * believe the answer. */
+typedef struct act_state {
+    int64_t truthy;
+    int64_t asked;
+    bool answer;
+} act_state;
+
+static bool act_says(const char *chunk, size_t n, void *ud) {
+    act_state *a = (act_state *)ud;
+    a->asked++;
+    (void)chunk;
+    (void)n;
+    if (a->answer) {
+        a->truthy++;
+    }
+    return a->answer;
+}
+
+/* A worker that keeps producing progress outlives an idle bound shorter than
+ * its run. This is the case that killed two real workers at 301 s: they were
+ * working the whole time, and Atlas was measuring the wrong thing. */
+static void test_activity_keeps_a_working_child_alive(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    act_state a = {0, 0, true};
+
+    /* Twelve records, 120 ms apart: about 1.4 s of work under a 400 ms idle
+     * bound. Without the predicate this child is killed; with it, it finishes. */
+    const char *argv[] = {ATLAS_STREAMER_BIN, "events", "12", "120", NULL};
+    atlas_proc_opts o;
+    memset(&o, 0, sizeof o);
+    o.argv = argv;
+    o.timeout_ms = 20000;
+    o.idle_timeout_ms = 400;
+    o.activity = act_says;
+    o.activity_ud = &a;
+
+    atlas_buf outbuf = ATLAS_BUF_INIT;
+    atlas_proc_result r;
+    memset(&r, 0, sizeof r);
+    T_OK(atlas_proc_run(&o, atlas_proc_sink_buf, &outbuf, NULL, &r, &err), &err);
+
+    T_CHECK_MSG(!r.idle_timed_out, "a child producing progress was killed as idle");
+    T_CHECK(!r.timed_out);
+    T_EQ_INT(r.exit_code, 0);
+    T_CHECK_MSG(a.asked > 0, "the activity predicate was never consulted");
+    atlas_buf_free(&outbuf);
+}
+
+/* The other direction, and the reason the bound still exists: output that the
+ * caller does not accept as progress buys the child nothing. A worker that has
+ * stopped working and is still printing is exactly what must still be killed. */
+static void test_output_that_is_not_activity_does_not_keep_a_child_alive(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    act_state a = {0, 0, false};
+
+    const char *argv[] = {ATLAS_STREAMER_BIN, "prose", "40", "60", NULL};
+    atlas_proc_opts o;
+    memset(&o, 0, sizeof o);
+    o.argv = argv;
+    o.timeout_ms = 20000;
+    o.idle_timeout_ms = 300;
+    o.activity = act_says;
+    o.activity_ud = &a;
+
+    atlas_buf outbuf = ATLAS_BUF_INIT;
+    atlas_proc_result r;
+    memset(&r, 0, sizeof r);
+    (void)atlas_proc_run(&o, atlas_proc_sink_buf, &outbuf, NULL, &r, &err);
+
+    T_CHECK_MSG(r.idle_timed_out, "a chattering child was not stopped by the idle bound");
+    T_CHECK_MSG(a.asked > 0, "the activity predicate was never consulted");
+    T_EQ_INT((int)a.truthy, 0);
+    atlas_buf_free(&outbuf);
+}
+
+/* With no predicate every byte still counts, which is what every git invocation
+ * in this repository has always relied on. */
+static void test_without_a_predicate_bytes_still_count(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    const char *argv[] = {ATLAS_STREAMER_BIN, "prose", "10", "80", NULL};
+    atlas_proc_opts o;
+    memset(&o, 0, sizeof o);
+    o.argv = argv;
+    o.timeout_ms = 20000;
+    o.idle_timeout_ms = 400;
+    /* activity deliberately NULL */
+
+    atlas_buf outbuf = ATLAS_BUF_INIT;
+    atlas_proc_result r;
+    memset(&r, 0, sizeof r);
+    T_OK(atlas_proc_run(&o, atlas_proc_sink_buf, &outbuf, NULL, &r, &err), &err);
+    T_CHECK_MSG(!r.idle_timed_out, "plain output stopped refreshing the idle bound");
+    atlas_buf_free(&outbuf);
+}
+
 static const atlas_test TESTS[] = {
+    {"activity_keeps_a_working_child_alive", test_activity_keeps_a_working_child_alive},
+    {"output_that_is_not_activity_does_not_keep_a_child_alive",
+     test_output_that_is_not_activity_does_not_keep_a_child_alive},
+    {"without_a_predicate_bytes_still_count", test_without_a_predicate_bytes_still_count},
     {"PATH resolution", test_which},
     {"argv[0] must be absolute", test_requires_absolute_argv0},
     {"no shell interpretation of arguments", test_no_shell_interpretation},

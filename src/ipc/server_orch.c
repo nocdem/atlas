@@ -39,6 +39,8 @@
 #include "atlas/db.h"
 #include "atlas/git.h"
 #include "atlas/orch_ops.h"
+#include <time.h>
+
 #include "atlas/orchpolicy.h"
 #include "atlas/sha256.h"
 #include "atlas/snapshot.h"
@@ -54,6 +56,33 @@ static atlas_status orch_disabled(dispatch_state *ds, atlas_err *err) {
     return atlas_err_set(err, ATLAS_ERR_CONFIG,
                          "orchestration is not enabled on this Atlas (%s)",
                          atlas_orchpolicy_reason_name(p->reason));
+}
+
+/* A11.5a-R2. Every orchestration write the serve loop makes, stamped with what
+ * Atlas knows about its own recent unavailability and recording a fresh refusal
+ * when it gets one.
+ *
+ * Both halves matter and both belong here rather than at six call sites. The
+ * stamp is what lets `require_lease` tell "this worker went quiet" from "we
+ * stopped listening"; the record is what makes a refusal on *any* client path
+ * count as evidence, not just a refused recovery sweep — which is the gap that
+ * left `8c41245` deferring nothing in production, because the sweep was being
+ * refused too and so never ran to notice.
+ *
+ * `contended_until_ms` is set here and nowhere else on this path. No IPC
+ * parameter feeds it, deliberately: a client that could assert contention could
+ * extend its own lease, and a lease that can be extended by asking is not one. */
+static atlas_status orch_write(dispatch_state *ds, atlas_orch_op *op, int timeout_ms,
+                               atlas_orch_result *r, atlas_err *err) {
+    op->contended_until_ms = atlas_orch_contention_seen();
+    atlas_status st = atlas_writer_orch(ds->ctx->writer, op, timeout_ms, r, err);
+    if (st != ATLAS_OK && atlas_ipc_message_is_busy(atlas_err_msg(err))) {
+        struct timespec ts;
+        if (clock_gettime(CLOCK_REALTIME, &ts) == 0) {
+            atlas_orch_contention_note((int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+        }
+    }
+    return st;
 }
 
 static atlas_status require_submitter(dispatch_state *ds, atlas_err *err) {
@@ -323,7 +352,7 @@ static atlas_status method_job_submit(dispatch_state *ds, const atlas_ipc_reques
     atlas_orch_result r;
     atlas_orch_result_init(&r);
     /* Ownership of `op` passes to the writer unconditionally. */
-    st = atlas_writer_orch(ds->ctx->writer, op, 5000, &r, err);
+    st = orch_write(ds, op, 5000, &r, err);
     if (st == ATLAS_OK) {
         st = write_job_summary(ds, &r, err);
         if (st == ATLAS_OK) {
@@ -363,7 +392,7 @@ static atlas_status method_job_cancel(dispatch_state *ds, const atlas_ipc_reques
     }
     atlas_orch_result r;
     atlas_orch_result_init(&r);
-    st = atlas_writer_orch(ds->ctx->writer, op, 5000, &r, err);
+    st = orch_write(ds, op, 5000, &r, err);
     if (st == ATLAS_OK) {
         st = write_job_summary(ds, &r, err);
     }
@@ -775,7 +804,7 @@ static atlas_status method_dispatch_lease(dispatch_state *ds, const atlas_ipc_re
     }
     atlas_orch_result r;
     atlas_orch_result_init(&r);
-    st = atlas_writer_orch(ds->ctx->writer, op, 5000, &r, err);
+    st = orch_write(ds, op, 5000, &r, err);
     if (st == ATLAS_OK) {
         st = atlas_json_key_bool(ds->j, "granted", r.granted, err);
     }
@@ -870,7 +899,7 @@ static atlas_status method_dispatch_heartbeat(dispatch_state *ds, const atlas_ip
     }
     atlas_orch_result r;
     atlas_orch_result_init(&r);
-    st = atlas_writer_orch(ds->ctx->writer, op, 5000, &r, err);
+    st = orch_write(ds, op, 5000, &r, err);
     if (st == ATLAS_OK) {
         st = atlas_json_key_str(ds->j, "state", atlas_orch_state_name(r.state), err);
     }
@@ -920,7 +949,7 @@ static atlas_status method_dispatch_event(dispatch_state *ds, const atlas_ipc_re
     }
     atlas_orch_result r;
     atlas_orch_result_init(&r);
-    st = atlas_writer_orch(ds->ctx->writer, op, 5000, &r, err);
+    st = orch_write(ds, op, 5000, &r, err);
     if (st == ATLAS_OK) {
         st = atlas_json_key_bool(ds->j, "cancel_requested", r.cancel_requested, err);
     }
@@ -1144,7 +1173,7 @@ static atlas_status method_dispatch_complete(dispatch_state *ds, const atlas_ipc
 
     atlas_orch_result r;
     atlas_orch_result_init(&r);
-    st = atlas_writer_orch(ds->ctx->writer, op, 10000, &r, err);
+    st = orch_write(ds, op, 10000, &r, err);
     if (st == ATLAS_OK) {
         st = write_job_summary(ds, &r, err);
     }

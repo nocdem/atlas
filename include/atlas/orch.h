@@ -314,6 +314,35 @@ const char *atlas_orch_exit_kind_name(atlas_orch_exit_kind k);
  * is alive. */
 #define ATLAS_ORCH_CONTENTION_GRACE_MS (ATLAS_ORCH_LEASE_MS / 2)
 
+/* A11.5a-R2. When Atlas last refused an orchestration write because the writer
+ * was busy with something unbounded, on the same wall clock a lease expiry is
+ * stored on, or zero if it has not refused one since this daemon started.
+ *
+ * Daemon-wide because the refusals arrive on two threads — the serve loop
+ * answering clients and the watcher running its sweep — and either is equally
+ * good evidence that a heartbeat would have been refused too. Written only by
+ * the code that *receives* a refusal from the writer, so a client cannot
+ * manufacture one: `contended_until_ms` on an operation is stamped from here by
+ * the daemon and is never read from an IPC parameter. A9.2.6's contract is
+ * untouched — nothing here changes what the writer does or when it refuses.
+ *
+ * Resets to zero on restart, which is the safe direction: no grace, leases
+ * reclaimable exactly as before. */
+void atlas_orch_contention_note(int64_t at_ms);
+int64_t atlas_orch_contention_seen(void);
+
+/* Whether an expired lease should be left alone this time round, because Atlas
+ * was refusing writes recently enough that its holder may not have been able to
+ * renew it.
+ *
+ * The one implementation of the rule. `op_recover` asks it before reclaiming an
+ * attempt and `require_lease` asks it before refusing a heartbeat or a
+ * completion, and those two answers have to agree: a sweep that spares a worker
+ * while the write path still rejects it spares nothing. `deadline_ms` is checked
+ * by both callers first and is never extended here — contention forgives Atlas'
+ * own silence, not the submitter's bound. */
+bool atlas_orch_lease_in_grace(int64_t deadline_ms, int64_t at_ms, int64_t contended_until_ms);
+
 /* Structured worker events per attempt, and bytes per event. Both refuse rather
  * than trim: an event stream that silently stops recording looks like a job that
  * went quiet. */

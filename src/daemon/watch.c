@@ -233,10 +233,6 @@ struct atlas_watcher {
     /* A8: whether this daemon sweeps expired leases. */
     bool orch_enabled;
     int64_t last_recover_ms;
-    /* A11.5a-R. When the recovery sweep was last refused because the writer was
-     * busy with something unbounded. Passed to the next sweep that does run, so
-     * it can decline to judge a lease whose holder Atlas was not listening to. */
-    int64_t last_recover_refused_ms;
     /* A9.2.3. When the semantic freshness sweep last ran. */
     int64_t last_sem_sweep_ms;
     /* A9.2.4. The bounded walk runs on its own, much slower, timer. */
@@ -250,6 +246,26 @@ struct atlas_watcher {
 static int64_t now_ms(void) {
     struct timespec ts;
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0;
+    }
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* A11.5a-R2. The wall clock, for the one value that is compared against a
+ * *stored* one.
+ *
+ * `now_ms` above is monotonic and every other timer in this file wants that: an
+ * interval must not move when somebody sets the clock. The contention stamp is
+ * the exception, because `op_recover` and `require_lease` compare it against
+ * `orch_leases.expires_ms`, which is written from `CLOCK_REALTIME` in
+ * `src/db/db_orch.c`. Stamping it monotonically made the subtraction a
+ * difference between uptime and the epoch — a number in the decades — so the
+ * grace window could never be entered and the sweep that shipped in `8c41245`
+ * deferred exactly nothing in production. Same clock as the value it is
+ * compared with, or the comparison is not a comparison. */
+static int64_t wall_now_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
         return 0;
     }
     return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
@@ -928,7 +944,7 @@ static void recover_due(atlas_watcher *w) {
      * A refused sweep is the cheapest evidence there is that a heartbeat would
      * have been refused too: both are ordinary synchronous writes, and nothing
      * else in the daemon has to be instrumented to learn it. */
-    op->contended_until_ms = w->last_recover_refused_ms;
+    op->contended_until_ms = atlas_orch_contention_seen();
     atlas_orch_result r;
     atlas_orch_result_init(&r);
     atlas_err err;
@@ -936,7 +952,7 @@ static void recover_due(atlas_watcher *w) {
     /* `atlas_writer_orch` takes ownership of `op` on every path. */
     if (atlas_writer_orch(w->writer, op, 5000, &r, &err) != ATLAS_OK) {
         if (atlas_ipc_message_is_busy(atlas_err_msg(&err))) {
-            w->last_recover_refused_ms = t;
+            atlas_orch_contention_note(wall_now_ms());
         }
         atlas_daemon_log(w->log, "warn", "orchestration recovery sweep failed: %s",
                          atlas_err_msg(&err));

@@ -58,6 +58,11 @@ typedef struct atlas_driver_req {
     const char *work_dir;
     const char *job_uid;
     int64_t attempt_no;
+    /* A11.5a-R2. Where this attempt's streamed progress is recorded, or NULL to
+     * record none. Absolute, resolved by Atlas from the root-owned policy and
+     * never from the task text or the model — the same rule the result spool
+     * follows, and for the same reason. */
+    const char *progress_dir;
     /* UNTRUSTED_DATA: what a submitter typed. Handed to the driver because the
      * driver is what it is for; never interpreted by Atlas. */
     const char *task;
@@ -92,6 +97,11 @@ typedef struct atlas_driver_res {
     /* How many credential-shaped runs were removed from the captured logs.
      * Reported so an operator can see redaction happened rather than assume it. */
     int64_t redactions;
+    /* A11.5a-R2. Recognised progress records observed while the child ran. Zero
+     * for every driver that streams nothing, which is all of them but the two
+     * that call a live model. Reported, never interpreted: a count of events is
+     * evidence that work happened, not a claim about what it achieved. */
+    int64_t events;
     /* Model metadata when the driver can report it, and zero when it cannot.
      * Zero means "not reported", never "free". */
     int64_t input_tokens;
@@ -131,6 +141,18 @@ typedef struct atlas_driver {
 /* Resolves a driver by name. NULL for an unknown name — an unknown driver is a
  * refusal, never a default: silently substituting one would run something other
  * than what the job specified. */
+/* A11.5a-R2. Whether one complete line of a worker's stream is a progress
+ * record — the question the idle bound is now asked instead of "were there any
+ * bytes?".
+ *
+ * A checked vocabulary, not a parser: the line must open with `{"type":"` naming
+ * a type the installed Claude Code actually emits and must close with `}`.
+ * Nothing inside is interpreted and nothing here confers authority; recognising
+ * a record only refreshes an idle clock, and the wall deadline is what finally
+ * stops a worker. Exposed because it is the one implementation of the rule and
+ * a test that restated it would pass by agreeing with itself. */
+bool atlas_driver_progress_line_is_event(const char *line, size_t len);
+
 const atlas_driver *atlas_driver_find(const char *name);
 
 /* Every driver Atlas ships, for the policy check and for `atlas dispatcher

@@ -25,6 +25,13 @@
  * and terminates the child. */
 typedef atlas_status (*atlas_proc_sink)(const char *chunk, size_t n, void *ud, atlas_err *err);
 
+/* A11.5a-R2. True when this chunk carried evidence the child is doing work.
+ *
+ * Deliberately a *bool* and not a status: deciding "was that progress?" cannot
+ * fail the run. An implementation that cannot tell answers false, and the idle
+ * bound then does what it would have done anyway. */
+typedef bool (*atlas_proc_activity)(const char *chunk, size_t n, void *ud);
+
 /* Polled while a child runs. Returning true asks for the child to stop.
  *
  * A8 needs this because cancellation arrives over the socket at a heartbeat, not
@@ -75,6 +82,30 @@ typedef struct atlas_proc_opts {
      * which is the same reason A7.1 prefers a filesystem guarantee to a check in
      * C. */
     unsigned long long max_address_space;
+
+    /* A11.5a-R2. What counts as the child being *active*, when raw output is the
+     * wrong measure of it.
+     *
+     * `idle_timeout_ms` above treats any byte on either stream as a sign of
+     * life, and for every caller that existed before this that is exactly right:
+     * a git process that prints is a git process that is working. It is wrong
+     * for a model worker. Measured on this machine: a real Claude Code worker
+     * doing twelve turns of genuine work — reads, edits, shell commands — was
+     * killed twice at 301 s against a 300 s idle bound, because the CLI writes
+     * its result document at the end and says nothing on stdout until then.
+     * Silence was not idleness; it was the format.
+     *
+     * When `activity` is set, a stdout chunk refreshes the idle clock only if
+     * this returns true for it, and **stderr never refreshes it at all** — a
+     * stuck worker printing "still working" to stderr is the case the whole
+     * bound exists to catch. NULL keeps the old meaning, which is what leaves
+     * every git invocation in this repository untouched.
+     *
+     * The predicate sees raw chunks, not lines, so an implementation that needs
+     * whole records has to assemble them and must bound what it holds. It is
+     * called on the reader thread between polls and must not block. */
+    atlas_proc_activity activity;
+    void *activity_ud;
 } atlas_proc_opts;
 
 #define ATLAS_PROC_DEFAULT_TIMEOUT_MS 60000

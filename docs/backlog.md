@@ -841,3 +841,51 @@ accepted A11.5a pilot they ran twice; the wall clock covers them but no token or
 CPU figure does. That is fine for comparing model arms against each other, which
 is what A10.1 needs, and it would not be fine for a claim about what a run costs
 in total. Worth stating before somebody reads a run's usage as the whole bill.
+
+## A10.1 measured the starvation A11.5a described, and it is worse than stated
+
+A11.5a's fourth finding was that one repository's churn starves orchestration
+everywhere. A10.1 registered seven throwaway worktrees of this repository to run
+an A/B experiment in isolation, and turned that finding into the thing that
+decided the experiment's verdict.
+
+**What it looks like.** With thirteen registered repositories the daemon runs
+build-input discovery walks near-continuously. `ATLAS_JOB_SEM_DISCOVER` is one of
+the two job kinds `job_kind_is_unbounded` answers yes for, so every orchestration
+write during one is refused with `BUSY`. A worker that has finished its work and
+whose driver cannot land a completion loses the whole attempt: one experiment arm
+did exactly that, and the tree it had correctly edited was evidence of work Atlas
+had no record of.
+
+**Why it is not only an operator's problem.** Registering a repository is a
+deliberate act, so "do not register thirteen" is fair advice. But nothing in
+Atlas bounds the aggregate: discovery is per repository, its interval is per
+repository, and the writer thread is per daemon. The cost of one more registered
+repository is paid by every orchestration client of that daemon, and no surface
+says so. An operator who adds a tenth repository is not told they have made
+autonomous work less likely to complete.
+
+**What was measured.** Removing nine of the thirteen registrations changed a
+worker's observed duration by enough to confound a comparison between two arms
+of an experiment — which is how it was noticed. Numbers are in the A10.1 section
+of `docs/roadmap.md`.
+
+**Not fixed here, deliberately.** Every plausible fix is a design decision this
+milestone had no mandate for: a per-daemon budget for unbounded maintenance, a
+discovery interval that scales with the repository count, a second writer for
+maintenance, or making discovery bounded. A10.1 was an experiment, and an
+experiment that repairs the thing it is standing on stops being a measurement.
+
+## A10.1 left the run driver's completion still unable to survive its own driver
+
+A10.1 hit A11.5a's second residual twice, from two directions, and it is
+unchanged: a driver that dies after its worker finished leaves a durable result
+nothing can deliver, because `op_complete` requires a lease token and A8 never
+stores one.
+
+Both times the driver died for a reason outside Atlas — once killed by a test
+harness, once exiting after a `BUSY` window outlasted its retries — and both
+times a worker's completed work became an expired lease and a requeued task. The
+authority question that blocks a fix has not moved: every cheap route puts a
+bearer credential on disk. It is worth restating that the cost is not
+hypothetical and is measured in whole worker runs.

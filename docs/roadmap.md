@@ -825,33 +825,173 @@ Migration 22 is additive and backfills nothing, deliberately. A11.5a's runs are
 left without rows rather than reconstructed from a transcript: a baseline
 assembled by hand is not one an experiment can compare against.
 
-## Next: A10.1 — cross-run memory A/B experiment
+## A10.1 — bounded cross-run memory, and what measuring it established (CLOSED)
 
-With a pilot that can carry a real task to `ACCEPTED` and telemetry that can say
-what it cost, the question becomes askable: does cross-run memory make a worker
-better, and by how much.
+The question A10.0 made askable: does handing a worker a bounded summary of
+earlier runs make it better, and by how much. **The answer this milestone can
+defend is `INCONCLUSIVE`, and the memory default stays `OFF`.**
 
-One thing A10.0 does not give it. A11.5a's runs have no usage rows and will not
-be backfilled, so the memory-off arm has to be **re-run** under telemetry rather
-than compared against the pilot's figures. That is the honest ordering: A11.5a
-established that a real task can land, A10.0 established that a run can report
-its cost, and neither of those is a measurement of memory.
+### What was built
 
-And A11.5a's history is the standing warning: three of its four runs were blocked
-by defects nothing in the suite could see, so an A/B that measures a difference
-must first establish that both arms ran at all — which is exactly what
-`usage_status` is for. A `PARTIAL` arm is not a cheaper arm.
+An operator names a mode at submission; Atlas selects at most three earlier
+terminal runs by deterministic lexical overlap, renders them as at most twelve
+kibibytes of labelled text, freezes that against the run in the transaction that
+creates it, and appends it to the task once when a worker starts. No vector
+store, no embedding, no summariser, no ranker; nothing in the selection calls a
+model. `docs/orchestration.md` carries the contract and `docs/extending.md` the
+checklists.
 
-**A10 is not closed and is not cancelled**, and the ordering is deliberate rather
-than an oversight. A10 is the Experience Learning phase, and the contract it must
-satisfy is already written: `docs/verification.md` carries "The A10 prerequisite
-contract" — the table a reviewer of A10 checks against, whose load-bearing line
-is that **A10 must treat `UNKNOWN` as epistemic uncertainty and must never fold
-it into a negative fact.** Atlas can guarantee it never *produces* an unjustified
-`ABSENT`; it cannot guarantee a later phase reads `UNKNOWN` correctly, which is
-what makes that a contract on the consumer and not a property of this codebase.
-Nothing here weakens it, and a reader who arrives at A11.1 should not conclude
-that the phase before it was absorbed.
+Three decisions are worth repeating here because each one was forced.
+
+**The mode travels on `atlas_orch_op`, never on `atlas_orch_spec`.** Putting it
+in the specification would move `ATLAS_ORCH_SPEC_DOMAIN` and every stored
+`spec_digest` would silently mean something else.
+
+**`repo_identity_hash` could not be the selection key.** It is A4's
+*path-qualified* lineage fingerprint, so a repository and a linked worktree of it
+have different ones — and an isolated experiment runs in worktrees. Memory got
+its own value under its own domain, built from the object format and the sorted
+ingested root commits. Nothing is authorised, admitted or refused on it; it
+selects hints, and that is the only reason a second identity-shaped value is
+tolerable at all.
+
+**A run carrying a memory manifest is never a source.** Freezing at creation
+keeps two arms created before either runs from seeing each other, and that was
+the whole argument until the deadline arithmetic broke it: a task's wall
+deadline is `created_ms + wall_timeout_ms`, so several pairs cannot all be
+created up front, and a later pair is necessarily created after an earlier pair
+has ended. The exclusion is one predicate with no identifiers in it. **Its cost
+is stated rather than discovered later: bounded memory does not compound.** A run
+that was shown memory does not become memory, so the corpus stays the runs that
+predate the mechanism.
+
+### The experiment
+
+Base commit `65ad5a3`, one binary
+(`3fcfa0d68aa7a6ef398bd841b6fcb8dfb28dfb7001a170bf2433bdc5a05df0b9`), one model,
+fresh session per arm, three worker starts per run, isolated git worktrees of
+this repository, gates fixed at submission and identical across arms. Both arms
+of a pair were submitted before either was driven, so both manifests were frozen
+against the same world. Every task was a small real one drawn from an uncovered
+branch this repository actually has.
+
+| | pair 1 — the gate allowlist | pair 2 — the validation bounds |
+| --- | --- | --- |
+| treatment run | `r527bd9caa91e41ef281328cf1985dd2d` | `rc9417e37925a3fe00313207c48c9287a` |
+| control run | `rda50b67d74ae38df463a20545a6fb1fd` | `r0066c3faf5088d692ed3ae932f7f8ad1` |
+| memory digest | `5512e516…` — 2 832 bytes, 3 sources | `5512e516…` — the same |
+| verdict | ACCEPTED / ACCEPTED | ACCEPTED / ACCEPTED |
+
+| metric | treatment | control | delta |
+| --- | ---: | ---: | ---: |
+| ACCEPTED runs | 2 | 2 | 0 |
+| worker starts | 2 | 2 | 0 |
+| follow-ups | 0 | 0 | 0 |
+| provider cost | $10.253520 | $10.423908 | −1.6 % |
+| worker duration | 870 301 ms | 1 085 233 ms | −19.8 % |
+| turns | 51 | 55 | −7.3 % |
+| output tokens | 33 113 | 37 203 | −11.0 % |
+| cache read | 4 096 414 | 4 059 818 | +0.9 % |
+
+Per pair: duration −25.4 % and −11.2 %, turns −5.9 % and −9.5 %, cost +0.8 % and
+−4.5 %. Every arm's usage read `AVAILABLE`; none was `PARTIAL`. Neither treatment
+output contains any trace of the package — no copied historical text, no stale
+gate string, nothing steered wrong by it.
+
+### Why the verdict is INCONCLUSIVE and not USEFUL
+
+The measured direction favours memory and is consistent across both pairs, and
+the ≥10 % worker-duration criterion is met. Three things stop that being a
+finding.
+
+**Pair 2's arms did not run under equal machine conditions.** Between its control
+arm and its treatment arm, nine experiment worktrees were unregistered to stop
+the daemon's build-input discovery walks starving orchestration writes. Worker
+duration is exactly the metric machine load contaminates, and the intervention
+was in the treatment arm's favour. Only pair 1 ran with both arms under
+identical conditions.
+
+**Two pairs is the number this milestone said to read conservatively**, and one
+of them is confounded. That is one clean pair.
+
+**And cost, the metric nobody can confound, moved 1.6 %** — well inside the
+noise the milestone set as its own threshold. A twenty-per-cent duration gap
+beside a two-per-cent cost gap is a claim about wall clock on a busy machine, not
+about work done.
+
+So: no evidence that memory harms, a real hint that it helps, and not enough to
+turn a default on. **`ATLAS_SEM_AUTO_DEFAULT`-style silent adoption is exactly
+what does not happen here.**
+
+### What the calibration cost, and what it bought
+
+Four arms were run and discarded, and **all four failures were the measurement
+harness, not Atlas and not the model**. They are recorded because a milestone
+that reports only its successful runs is reporting a filtered sample.
+
+1. **A wall deadline consumed by the arm before it.** Both arms of a pair were
+   submitted together to freeze both manifests, and `deadline_ms` is computed
+   from *submission*. The second arm to run had already spent seven of its
+   fifteen minutes waiting. Fixed by raising the policy's wall ceiling so a pair
+   fits inside one budget.
+2. **The harness killed the run driver.** A driver that dies stops heartbeating,
+   the lease expires, and Atlas correctly reclaims an attempt whose worker was
+   alive and mid-edit. Fixed with `setsid`.
+3. **A `BUSY`-retry wrapper applied to `job run`.** That wrapper is right for
+   `job submit`, which an idempotency key resolves to one request. Re-invoking
+   `job run --resume` is not the same command twice; it is a second run driver
+   against a live attempt. Five re-invocations later the `dispatch.lease` call
+   timed out.
+4. **Build-input discovery over thirteen repositories.** Registering seven
+   worktrees turned A11.5a's fourth finding — "one repository's churn starves
+   orchestration everywhere" — into near-continuous unbounded writer jobs, and
+   an arm lost its completion to it. This is the one that is *not* only a harness
+   defect: the scaling property is real, it is in `docs/backlog.md`, and nothing
+   in Atlas bounds it.
+
+What they bought is worth stating. The **third** of them — a `fake-repo` dry run
+costing nothing — found a genuine production defect before a single token was
+spent on it: `atlas_writer_orch` copies the writer thread's result into the
+caller's field by field, by hand, and the memory fields were not on the list. The
+manifest was frozen correctly, the lease read it inside its own transaction, the
+daemon was ready to emit it, and **the worker was handed nothing**. Every
+in-process test passed, because every one of them applies the operation directly
+and none crosses that boundary. A11.5a lost most of a milestone to the same shape
+of defect in the gate encoding. The lesson is A11.5a's, unlearned once and now
+paid for twice: *a rule proved at the write point is not a property at the
+boundary a client reaches.*
+
+### What this did not establish
+
+One repository, one model, two tasks of one shape — "add a targeted regression
+test" — and a memory corpus of three runs that happened to be about a single
+subject. Both treatment arms received a byte-identical package, because the
+corpus was small enough that all three eligible runs were selected whatever the
+task said; the scorer's ability to *discriminate* was therefore never tested by
+this experiment, only its determinism. Nothing here says what memory does for a
+task unlike the ones already in the corpus, and nothing says what it does once
+the corpus is large enough that selection matters.
+
+## Next: A11.5b or a better-matched experiment
+
+The verdict is `INCONCLUSIVE`, so the ordering the milestone set for itself
+applies: **memory stays off, no new memory layer is built, and the next step is a
+better-matched experiment rather than more system.** Two things would make one
+worth running.
+
+**Equal machine conditions, enforced rather than hoped for.** Both arms of a pair
+must run with the same set of registered repositories and the same daemon load,
+and the run should record enough about that load for a reader to check. The
+cheapest version is to register nothing but the two arms.
+
+**A corpus large enough that selection discriminates.** Three eligible runs about
+one subject cannot test a scorer. A corpus where different tasks select different
+sources is the minimum for the question "does *relevant* memory help" to differ
+from "does *any* memory help".
+
+Neither needs a line of new mechanism. If a second experiment says the same thing
+the first hinted at, on cost as well as on wall clock, that is when a default
+moves.
 
 ## A7 (original plan) — optional MCP adapter (absorbed into A2)
 

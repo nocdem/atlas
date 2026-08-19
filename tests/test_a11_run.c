@@ -159,9 +159,41 @@ static atlas_status t_apply(void *ud, const atlas_orch_op *op, atlas_orch_result
     return atlas_orch_apply((atlas_db *)ud, op, out, err);
 }
 
+/* A11.5a-R. A daemon that takes everything except a completion.
+ *
+ * This is what a semantic pass looks like from the driver's side, without a
+ * semantic pass: A9.2.6 refuses an ordinary synchronous write for the whole of
+ * one, and `ATLAS_IPC_BUSY_TOKEN` is the contract that says so. Refusing exactly
+ * the completion is the case that used to lose a finished worker's entire
+ * result, because a repository-tree attempt has no workspace and the streams
+ * lived only in the driver's memory. */
+typedef struct refuse_complete {
+    atlas_db *db;
+    int64_t completes_seen;
+} refuse_complete;
+
+static atlas_status rc_apply(void *ud, const atlas_orch_op *op, atlas_orch_result *out,
+                             atlas_err *err) {
+    refuse_complete *b = (refuse_complete *)ud;
+    if (op->kind == ATLAS_ORCH_OP_COMPLETE) {
+        b->completes_seen++;
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "%s the writer is busy",
+                             ATLAS_IPC_BUSY_TOKEN);
+    }
+    return atlas_orch_apply(b->db, op, out, err);
+}
+
 static atlas_status t_run_get(void *ud, const char *run_uid, atlas_orch_run_view *out, bool *found,
                               atlas_err *err) {
     return atlas_db_orch_run_get((atlas_db *)ud, run_uid, out, found, err);
+}
+
+/* `run_get` shares the transport's user data, so it has to unwrap the same
+ * struct the apply hook does. Reading the run through a wrongly cast pointer is
+ * how the first version of this test claimed the worker never started. */
+static atlas_status rc_run_get(void *ud, const char *run_uid, atlas_orch_run_view *out,
+                               bool *found, atlas_err *err) {
+    return atlas_db_orch_run_get(((refuse_complete *)ud)->db, run_uid, out, found, err);
 }
 
 /* --- submitting a root task ----------------------------------------------- */
@@ -229,6 +261,53 @@ static void drive(env *e, const char *run_uid, int64_t max_tasks, atlas_rundrive
     o.transport.run_get = t_run_get;
     o.transport.ud = e->db;
     T_OK(atlas_rundriver_run(&o, rep, &err), &err);
+}
+
+/* Drives with a spool directory, and optionally with a transport that refuses
+ * the completion. Returns the driver's status rather than requiring success:
+ * losing a completion is the thing under test. */
+static atlas_status drive_spooled(env *e, const char *run_uid, const char *spool,
+                                  refuse_complete *busy, atlas_rundriver_report *rep) {
+    atlas_err err;
+    atlas_err_init(&err);
+    atlas_rundriver_report_init(rep);
+    atlas_rundriver_opts o;
+    memset(&o, 0, sizeof(o));
+    o.run_uid = run_uid;
+    o.dispatcher_id = "test-run";
+    o.max_tasks = 1;
+    o.spool_dir = spool;
+    o.complete_busy_ms = 1; /* one refusal is the whole point; do not wait out a real budget */
+    if (busy != NULL) {
+        o.transport.apply = rc_apply;
+        o.transport.ud = busy;
+    } else {
+        o.transport.apply = t_apply;
+        o.transport.ud = e->db;
+    }
+    o.transport.run_get = busy != NULL ? rc_run_get : t_run_get;
+    return atlas_rundriver_run(&o, rep, &err);
+}
+
+/* The spool file the driver would have written for a job's first attempt. */
+static bool spool_exists(const char *spool, const char *job_uid, atlas_buf *body) {
+    char path[4096];
+    (void)snprintf(path, sizeof path, "%s/%s.1.result", spool, job_uid);
+    FILE *f = fopen(path, "re");
+    if (f == NULL) {
+        return false;
+    }
+    if (body != NULL) {
+        int c;
+        atlas_err ignore;
+        atlas_err_init(&ignore);
+        while ((c = fgetc(f)) != EOF) {
+            char ch = (char)c;
+            (void)atlas_buf_append(body, &ch, 1u, &ignore);
+        }
+    }
+    (void)fclose(f);
+    return true;
 }
 
 static atlas_orch_run_status run_status(env *e, const char *run_uid) {
@@ -958,7 +1037,118 @@ static void test_a_busy_refusal_loses_nothing(void) {
     env_close(&e);
 }
 
+/* --- A11.5a-R: a finished worker's result outlives a refused completion ---- */
+
+/* The measured loss. Attempt 1 of the run that produced this change ran a real
+ * worker for five minutes; the completion was refused while a semantic pass held
+ * the writer, the driver ran out of retries, and `orch_events` ended up holding
+ * nothing at all. A repository-tree attempt has no workspace — that is the A11.1
+ * reversal — so there was no second copy anywhere. */
+static void test_a_refused_completion_leaves_the_result_on_disk(void) {
+    env e;
+    env_open(&e);
+    atlas_buf run = ATLAS_BUF_INIT, job = ATLAS_BUF_INIT;
+    start_run(&e, "write the thing", "pass", &run, &job);
+
+    refuse_complete b = {e.db, 0};
+    atlas_rundriver_report rep;
+    atlas_status st = drive_spooled(&e, atlas_buf_cstr(&run), fx_data_dir(&e.fx), &b, &rep);
+
+    /* The completion was offered and refused, so the invocation failed. */
+    T_CHECK(st != ATLAS_OK);
+    T_CHECK(b.completes_seen > 0);
+
+    /* The worker really ran, once. */
+    T_EQ_INT((int)worker_lines(&e), 1);
+
+    /* And its result is on disk, naming the attempt it belongs to so it can
+     * never be read as another's. */
+    atlas_buf body = ATLAS_BUF_INIT;
+    T_CHECK_MSG(spool_exists(fx_data_dir(&e.fx), atlas_buf_cstr(&job), &body),
+                "the worker's result was not spooled");
+    T_CHECK(strstr(atlas_buf_cstr(&body), "atlas-orch-result-1") != NULL);
+    T_CHECK(strstr(atlas_buf_cstr(&body), atlas_buf_cstr(&job)) != NULL);
+    T_CHECK(strstr(atlas_buf_cstr(&body), "attempt=1") != NULL);
+    T_CHECK(strstr(atlas_buf_cstr(&body), "sha256=") != NULL);
+
+    /* The token is a bearer credential and A8's rule is that it is never stored.
+     * A file that carried one would be a lease anybody who could read it could
+     * present. */
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&body), "token") == NULL,
+                "the result spool carries a lease token");
+
+    /* Nothing was settled and nothing was duplicated: the run is still ACTIVE
+     * and resumable, which is what makes losing an invocation survivable. */
+    T_CHECK(run_status(&e, atlas_buf_cstr(&run)) == ATLAS_ORCH_RUN_ACTIVE);
+    T_EQ_INT((int)count_sql(e.db, "SELECT count(*) FROM orch_jobs;"), 1);
+    T_EQ_INT((int)count_sql(e.db, "SELECT count(*) FROM orch_attempts;"), 1);
+
+    atlas_buf_free(&body);
+    atlas_rundriver_report_free(&rep);
+    atlas_buf_free(&run);
+    atlas_buf_free(&job);
+    env_close(&e);
+}
+
+/* The other half: once the daemon does hold the result, the file is not left
+ * behind. A spool that outlived its purpose would be indistinguishable from one
+ * whose completion never landed. */
+static void test_an_accepted_completion_clears_the_spool(void) {
+    env e;
+    env_open(&e);
+    atlas_buf run = ATLAS_BUF_INIT, job = ATLAS_BUF_INIT;
+    start_run(&e, "write the thing", "pass", &run, &job);
+
+    atlas_rundriver_report rep;
+    T_CHECK(drive_spooled(&e, atlas_buf_cstr(&run), fx_data_dir(&e.fx), NULL, &rep) == ATLAS_OK);
+
+    T_EQ_INT((int)worker_lines(&e), 1);
+    T_CHECK(run_status(&e, atlas_buf_cstr(&run)) == ATLAS_ORCH_RUN_ACCEPTED);
+    T_CHECK_MSG(!spool_exists(fx_data_dir(&e.fx), atlas_buf_cstr(&job), NULL),
+                "an accepted completion left its spool behind");
+
+    atlas_rundriver_report_free(&rep);
+    atlas_buf_free(&run);
+    atlas_buf_free(&job);
+    env_close(&e);
+}
+
+/* A completion is not replayable, and that is the property that makes offering
+ * one repeatedly safe. The lease is released when the attempt ends, so a second
+ * delivery of the same result is refused rather than applied twice. */
+static void test_the_same_completion_cannot_be_applied_twice(void) {
+    env e;
+    env_open(&e);
+    atlas_buf run = ATLAS_BUF_INIT, job = ATLAS_BUF_INIT;
+    start_run(&e, "write the thing", "pass", &run, &job);
+
+    atlas_rundriver_report rep;
+    T_CHECK(drive_spooled(&e, atlas_buf_cstr(&run), fx_data_dir(&e.fx), NULL, &rep) == ATLAS_OK);
+    int64_t attempts = count_sql(e.db, "SELECT count(*) FROM orch_attempts;");
+    int64_t jobs = count_sql(e.db, "SELECT count(*) FROM orch_jobs;");
+    int64_t arts = count_sql(e.db, "SELECT count(*) FROM orch_artifacts;");
+
+    /* Driving the settled run again claims nothing and completes nothing. */
+    atlas_rundriver_report rep2;
+    (void)drive_spooled(&e, atlas_buf_cstr(&run), fx_data_dir(&e.fx), NULL, &rep2);
+    T_EQ_INT((int)count_sql(e.db, "SELECT count(*) FROM orch_attempts;"), (int)attempts);
+    T_EQ_INT((int)count_sql(e.db, "SELECT count(*) FROM orch_jobs;"), (int)jobs);
+    T_EQ_INT((int)count_sql(e.db, "SELECT count(*) FROM orch_artifacts;"), (int)arts);
+    T_EQ_INT((int)worker_lines(&e), 1);
+
+    atlas_rundriver_report_free(&rep2);
+    atlas_rundriver_report_free(&rep);
+    atlas_buf_free(&run);
+    atlas_buf_free(&job);
+    env_close(&e);
+}
+
 static const atlas_test TESTS[] = {
+    {"a_refused_completion_leaves_the_result_on_disk",
+     test_a_refused_completion_leaves_the_result_on_disk},
+    {"an_accepted_completion_clears_the_spool", test_an_accepted_completion_clears_the_spool},
+    {"the_same_completion_cannot_be_applied_twice",
+     test_the_same_completion_cannot_be_applied_twice},
     {"a worker succeeds, its gate passes, and the run is accepted",
      test_success_and_gate_accepts_the_run},
     {"a failing gate produces exactly one follow-up, whose worker then passes",

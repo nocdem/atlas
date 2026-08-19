@@ -94,6 +94,27 @@ typedef struct atlas_rundriver_opts {
      * exactly one task without racing anything. The run's own worker-start
      * budget applies regardless and is the bound that matters. */
     int64_t max_tasks;
+    /* A11.5a-R. Where a finished worker's result is made durable *before* the
+     * completion is offered to the daemon, or NULL to keep the old behaviour of
+     * holding it only in memory.
+     *
+     * The completion is an ordinary synchronous write, so A9.2.6 refuses it for
+     * the whole of an unbounded semantic pass — and until this existed, a driver
+     * that ran out of retries lost the exit classification, the gate verdict and
+     * both logs together, because a repository-tree attempt has no workspace to
+     * have written them to. Measured: attempt 1 of the run this was found on
+     * left `orch_events` empty for a worker that had run for five minutes.
+     *
+     * Absolute, chosen by Atlas from the root-owned policy's model worker root,
+     * and never from the task text, the environment or anything the model
+     * produced. A test passes its fixture's own directory. */
+    const char *spool_dir;
+    /* How long a refused completion keeps being offered, in milliseconds, or
+     * zero for `RUN_COMPLETE_BUSY_MS`. Set by the caller that constructs this
+     * struct — the service layer in production, a fixture in a test — and never
+     * reachable from task text, a model payload or the environment, which is the
+     * same rule `max_tasks` follows and for the same reason. */
+    int64_t complete_busy_ms;
     FILE *log;
     atlas_rundriver_transport transport;
 } atlas_rundriver_opts;

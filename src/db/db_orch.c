@@ -2410,6 +2410,26 @@ static atlas_status op_complete(atlas_db *db, const atlas_orch_op *op, atlas_orc
  *   "this ran and failed" are different answers, and collapsing them is the
  *   mistake A6 refuses to make about ancestry.
  */
+/* The unreleased lease on an attempt, or zero. Used only by the contention
+ * grace below, which has an attempt id and needs the lease row it belongs to. */
+static int64_t lease_id_of(atlas_db *db, int64_t attempt_id) {
+    static const char SEL[] =
+        "SELECT id FROM orch_leases WHERE attempt_id = ?1 AND released_at IS NULL;";
+    sqlite3_stmt *q = NULL;
+    atlas_err ignore;
+    atlas_err_init(&ignore);
+    if (atlas_db_prepare(db, SEL, &q, &ignore) != ATLAS_OK) {
+        return 0;
+    }
+    (void)sqlite3_bind_int64(q, 1, attempt_id);
+    int64_t id = 0;
+    if (sqlite3_step(q) == SQLITE_ROW) {
+        id = sqlite3_column_int64(q, 0);
+    }
+    atlas_db_finish(db, q);
+    return id;
+}
+
 static atlas_status op_recover(atlas_db *db, const atlas_orch_op *op, atlas_orch_result *out,
                                atlas_err *err) {
     int64_t at_ms = op->now_ms > 0 ? op->now_ms : now_ms();
@@ -2469,6 +2489,68 @@ static atlas_status op_recover(atlas_db *db, const atlas_orch_op *op, atlas_orch
             if (s != ATLAS_OK) {
                 return s;
             }
+            continue;
+        }
+
+        /* A11.5a-R. The lease ran out, but did the holder fail to renew it, or
+         * was Atlas refusing to listen?
+         *
+         * A heartbeat is an ordinary synchronous write and A9.2.6 refuses those
+         * for the whole of an unbounded semantic pass. On the machine this was
+         * found on, passes over a second registered repository ran 167-176 s
+         * with 14-20 s between them, so writes were refused about ninety per
+         * cent of the time and a sixty-second lease could not survive. A worker
+         * that was alive, correct and ten minutes inside its wall deadline had
+         * its attempt requeued as LEASE_EXPIRED and its result thrown away.
+         *
+         * So an expired lease is not judged while Atlas' own refusals are
+         * recent. This sweep is itself a synchronous write, which is what makes
+         * the test cheap rather than delicate: it can only run in the gaps
+         * between passes, and a gap wide enough for it is wide enough for the
+         * heartbeat that follows.
+         *
+         * Deferring is not extending. The lease is left exactly as it is and the
+         * next sweep asks again, so a genuinely dead driver on a quiet machine
+         * is still reclaimed on the following tick. What contention buys is
+         * another question, never an answer. And it is checked *after* the wall
+         * deadline below is not: `j.deadline_ms` is the submitter's bound and no
+         * amount of contention moves it, which keeps "the wall clock is what
+         * finally stops a job" literally true. The honest cost is that under
+         * unbroken contention a dead driver is not distinguished from a live one
+         * until that deadline. */
+        if (op->contended_until_ms > 0 && !j.cancel_requested && j.deadline_ms > 0 &&
+            at_ms < j.deadline_ms &&
+            at_ms - op->contended_until_ms < ATLAS_ORCH_CONTENTION_GRACE_MS) {
+            /* Deferring has to move the lease, not merely decline to reclaim it.
+             * `require_lease` refuses an expired lease independently of this
+             * sweep — that is what stops a zombie overwriting a newer attempt's
+             * result — so a lease left expired would keep the attempt alive here
+             * and still refuse the very heartbeat that would prove it healthy.
+             * The worker would be spared and silenced in the same breath.
+             *
+             * So Atlas grants the time it cost the holder. The grant is decided
+             * here, from the daemon's own record of refusing writes, and never
+             * from anything the holder claims about itself — a lease that could
+             * be extended by asking is not a lease. It is bounded by the same
+             * wall deadline checked above, which is why repeating it under
+             * unbroken contention cannot run forever, and `renewals` is left
+             * alone because this is not one: the worker has not been heard from,
+             * and `ATLAS_ORCH_LEASE_MAX_RENEWALS` still counts only the times it
+             * has. */
+            static const char EXT[] =
+                "UPDATE orch_leases SET expires_ms = ?1 WHERE id = ?2 AND released_at IS NULL;";
+            sqlite3_stmt *q = NULL;
+            s = atlas_db_prepare(db, EXT, &q, err);
+            if (s != ATLAS_OK) {
+                return s;
+            }
+            (void)sqlite3_bind_int64(q, 1, at_ms + ATLAS_ORCH_CONTENTION_GRACE_MS);
+            (void)sqlite3_bind_int64(q, 2, lease_id_of(db, attempt_id));
+            s = atlas_db_step_done(db, q, err);
+            if (s != ATLAS_OK) {
+                return s;
+            }
+            out->deferred++;
             continue;
         }
 

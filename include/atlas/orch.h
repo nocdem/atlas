@@ -300,6 +300,20 @@ const char *atlas_orch_exit_kind_name(atlas_orch_exit_kind k);
 #define ATLAS_ORCH_RECOVER_INTERVAL_MS 20000
 #define ATLAS_ORCH_LEASE_MAX_RENEWALS 240
 
+/* A11.5a-R. How long after Atlas last refused a write it keeps declining to
+ * judge an expired lease.
+ *
+ * Half a lease. The run driver heartbeats every `ATLAS_ORCH_LEASE_MS / 4` and
+ * retries a refusal for a few seconds on top, so one grace window comfortably
+ * contains a full heartbeat cycle: if there is a gap between passes big enough
+ * for the sweep to run in, it is big enough for the heartbeat that follows it.
+ *
+ * It is deliberately not derived from how long the contention lasted. A grace
+ * that grew with the outage would eventually stop reclaiming anything, and the
+ * point is to forgive a worker for Atlas' silence, not to stop asking whether it
+ * is alive. */
+#define ATLAS_ORCH_CONTENTION_GRACE_MS (ATLAS_ORCH_LEASE_MS / 2)
+
 /* Structured worker events per attempt, and bytes per event. Both refuse rather
  * than trim: an event stream that silently stops recording looks like a job that
  * went quiet. */

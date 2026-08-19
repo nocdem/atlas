@@ -42,6 +42,7 @@
 
 #include "atlas/atlas.h"
 #include "atlas/git.h"
+#include "atlas/ipc.h"
 #include "atlas/safetext.h"
 #include "atlas/sem.h"
 #include "atlas/sem_discover.h"
@@ -232,6 +233,10 @@ struct atlas_watcher {
     /* A8: whether this daemon sweeps expired leases. */
     bool orch_enabled;
     int64_t last_recover_ms;
+    /* A11.5a-R. When the recovery sweep was last refused because the writer was
+     * busy with something unbounded. Passed to the next sweep that does run, so
+     * it can decline to judge a lease whose holder Atlas was not listening to. */
+    int64_t last_recover_refused_ms;
     /* A9.2.3. When the semantic freshness sweep last ran. */
     int64_t last_sem_sweep_ms;
     /* A9.2.4. The bounded walk runs on its own, much slower, timer. */
@@ -919,17 +924,33 @@ static void recover_due(atlas_watcher *w) {
         return;
     }
     op->actor = ATLAS_ORCH_ACTOR_ATLAS;
+    /* A11.5a-R. What this sweep knows about Atlas' own recent unavailability.
+     * A refused sweep is the cheapest evidence there is that a heartbeat would
+     * have been refused too: both are ordinary synchronous writes, and nothing
+     * else in the daemon has to be instrumented to learn it. */
+    op->contended_until_ms = w->last_recover_refused_ms;
     atlas_orch_result r;
     atlas_orch_result_init(&r);
     atlas_err err;
     atlas_err_init(&err);
     /* `atlas_writer_orch` takes ownership of `op` on every path. */
     if (atlas_writer_orch(w->writer, op, 5000, &r, &err) != ATLAS_OK) {
+        if (atlas_ipc_message_is_busy(atlas_err_msg(&err))) {
+            w->last_recover_refused_ms = t;
+        }
         atlas_daemon_log(w->log, "warn", "orchestration recovery sweep failed: %s",
                          atlas_err_msg(&err));
-    } else if (r.recovered > 0) {
-        atlas_daemon_log(w->log, "info", "orchestration recovery reclaimed %lld attempts",
-                         (long long)r.recovered);
+    } else {
+        if (r.recovered > 0) {
+            atlas_daemon_log(w->log, "info", "orchestration recovery reclaimed %lld attempts",
+                             (long long)r.recovered);
+        }
+        if (r.deferred > 0) {
+            atlas_daemon_log(w->log, "info",
+                             "orchestration recovery deferred %lld expired lease(s): the daemon "
+                             "was refusing writes and the holder may not have been able to renew",
+                             (long long)r.deferred);
+        }
     }
     atlas_orch_result_free(&r);
 }

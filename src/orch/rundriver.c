@@ -30,9 +30,12 @@
 
 #include "atlas/rundriver.h"
 
+#include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "atlas/atlas.h"
 #include "atlas/driver.h"
@@ -171,6 +174,49 @@ static void claimed_free(claimed *c) {
 #define RUN_BUSY_TRIES 12
 #define RUN_BUSY_PAUSE_MS 500
 
+/* A11.5a-R. The completion gets its own, much longer budget, because losing one
+ * is not the same kind of loss as losing a heartbeat.
+ *
+ * A refused heartbeat costs a renewal that the next one makes up, and an expired
+ * lease is now deferred while Atlas is the thing refusing writes. A refused
+ * completion costs the entire attempt: the exit classification, the gate
+ * verdict and both logs, none of which can be recomputed, and it hands the work
+ * to a second worker that will do it again. Measured on the run this was found
+ * on: twelve tries spanned about seven seconds against a semantic pass that ran
+ * for a hundred and seventy.
+ *
+ * So it retries for longer than a pass rather than longer than a stall, and it
+ * is still bounded — a loop with no end is a hang, and the spooled result below
+ * is what makes running out survivable rather than fatal. */
+#define RUN_COMPLETE_BUSY_MS 300000
+#define RUN_COMPLETE_PAUSE_MS 2000
+
+/* The completion's own retry. Same shape, a budget measured in time rather than
+ * in tries, and it says which one it is so an operator reading a long wait knows
+ * Atlas is protecting a finished worker's result rather than hanging. */
+static atlas_status apply_completion(const atlas_rundriver_opts *o, const atlas_orch_op *op,
+                                     atlas_orch_result *out, atlas_err *err) {
+    int64_t budget = o->complete_busy_ms > 0 ? o->complete_busy_ms : RUN_COMPLETE_BUSY_MS;
+    int64_t started = now_ms();
+    atlas_status st = ATLAS_OK;
+    for (;;) {
+        st = o->transport.apply(o->transport.ud, op, out, err);
+        if (st == ATLAS_OK || !atlas_ipc_message_is_busy(err->msg)) {
+            return st;
+        }
+        int64_t waited = now_ms() - started;
+        if (waited >= budget) {
+            return st;
+        }
+        say(o, "the daemon is busy; the worker's result is spooled and will be offered again "
+               "(%lld s of %lld)", (long long)(waited / 1000), (long long)(budget / 1000));
+        struct timespec ts = {RUN_COMPLETE_PAUSE_MS / 1000,
+                              (long)(RUN_COMPLETE_PAUSE_MS % 1000) * 1000000L};
+        (void)nanosleep(&ts, NULL);
+        atlas_err_init(err);
+    }
+}
+
 static atlas_status apply_op(const atlas_rundriver_opts *o, const atlas_orch_op *op,
                              atlas_orch_result *out, atlas_err *err) {
     atlas_status st = ATLAS_OK;
@@ -284,6 +330,127 @@ static void outcome_free(outcome *x) {
  * The artifacts carried here are the worker's redacted log and, when a gate
  * failed, that gate's redacted output. They are evidence, stored so a restart
  * can read what happened; nothing reads them to decide anything. */
+/* A11.5a-R. The finished worker's result, on disk, before anybody asks the
+ * daemon to accept it.
+ *
+ * The problem this solves is narrow and was measured rather than imagined. A
+ * repository-tree attempt has no workspace — that is the A11.1 reversal, the
+ * work happens in the registered repository's own tree — so `store_log` has
+ * nowhere to put the worker's streams and appends them to a buffer instead.
+ * Everything the attempt produced therefore lived in one process's memory until
+ * the completion was accepted, and the completion is an ordinary synchronous
+ * write that A9.2.6 refuses for the whole of a semantic pass. When the driver
+ * ran out of retries the run recorded a worker that had run for five minutes and
+ * `orch_events` held nothing at all.
+ *
+ * The file is written whole under a temporary name and renamed into place, so a
+ * reader never sees half of one. The identities are carried so a result can
+ * never be read as belonging to a different attempt, and the digest covers the
+ * bodies so a truncated file is detectable rather than plausible.
+ *
+ * **The lease token is not in it, and must never be.** A8's rule is that a token
+ * is never stored, only a digest of it, and a bearer credential sitting in a
+ * file is exactly what that rule exists to prevent. The consequence is
+ * deliberate and is the honest limit of this change: a *different* process
+ * cannot present this result, because it cannot prove it holds the attempt. What
+ * the spool guarantees is that the result still exists to be looked at, not that
+ * somebody else may deliver it. */
+static atlas_status spool_path(const atlas_rundriver_opts *o, const claimed *c, atlas_buf *out,
+                               atlas_err *err) {
+    return atlas_buf_appendf(out, err, "%s/%s.%lld.result", o->spool_dir,
+                             atlas_buf_cstr(&c->job_uid), (long long)c->attempt_no);
+}
+
+static atlas_status spool_write(const atlas_rundriver_opts *o, const claimed *c, const outcome *x,
+                                atlas_err *err) {
+    if (o->spool_dir == NULL || o->spool_dir[0] != '/') {
+        return ATLAS_OK;
+    }
+    atlas_buf body = ATLAS_BUF_INIT;
+    atlas_status st = atlas_buf_append(&body, x->worker_log.data, x->worker_log.len, err);
+    if (st == ATLAS_OK) {
+        st = atlas_buf_append(&body, x->detail.data, x->detail.len, err);
+    }
+    char hex[ATLAS_SHA256_HEX_LEN + 1u];
+    if (st == ATLAS_OK) {
+        atlas_sha256_hex(body.data != NULL ? body.data : "", body.len, hex);
+    }
+
+    atlas_buf doc = ATLAS_BUF_INIT;
+    if (st == ATLAS_OK) {
+        st = atlas_buf_appendf(&doc, err,
+                               "atlas-orch-result-1\njob=%s\nrun=%s\nattempt=%lld\n"
+                               "exit_kind=%s\nexit_code=%lld\nsuccess=%d\nreason=%s\n"
+                               "failed_gate=%lld\ndriver_version=%s\n"
+                               "worker_log_len=%zu\ngate_log_len=%zu\nsha256=%s\n--\n",
+                               atlas_buf_cstr(&c->job_uid), o->run_uid != NULL ? o->run_uid : "",
+                               (long long)c->attempt_no, atlas_orch_exit_kind_name(x->exit_kind),
+                               (long long)x->exit_code, x->success ? 1 : 0,
+                               atlas_orch_reason_name(x->reason), (long long)x->failed_gate,
+                               atlas_buf_cstr(&x->driver_version), x->worker_log.len,
+                               x->detail.len, hex);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_buf_append(&doc, body.data, body.len, err);
+    }
+
+    atlas_buf tmp = ATLAS_BUF_INIT, final = ATLAS_BUF_INIT;
+    if (st == ATLAS_OK) {
+        st = spool_path(o, c, &final, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_buf_appendf(&tmp, err, "%s.part", atlas_buf_cstr(&final));
+    }
+    if (st == ATLAS_OK) {
+        FILE *f = fopen(atlas_buf_cstr(&tmp), "wxe");
+        if (f == NULL && errno == EEXIST) {
+            (void)unlink(atlas_buf_cstr(&tmp));
+            f = fopen(atlas_buf_cstr(&tmp), "wxe");
+        }
+        if (f == NULL) {
+            st = atlas_err_set_errno(err, ATLAS_ERR_INTERNAL, errno,
+                                     "cannot open the result spool");
+        } else {
+            bool ok = doc.len == 0 || fwrite(doc.data, 1, doc.len, f) == doc.len;
+            if (ok) {
+                ok = fflush(f) == 0 && fsync(fileno(f)) == 0;
+            }
+            if (fclose(f) != 0) {
+                ok = false;
+            }
+            if (!ok) {
+                (void)unlink(atlas_buf_cstr(&tmp));
+                st = atlas_err_set_errno(err, ATLAS_ERR_INTERNAL, errno,
+                                         "cannot write the result spool");
+            } else if (rename(atlas_buf_cstr(&tmp), atlas_buf_cstr(&final)) != 0) {
+                (void)unlink(atlas_buf_cstr(&tmp));
+                st = atlas_err_set_errno(err, ATLAS_ERR_INTERNAL, errno,
+                                         "cannot publish the result spool");
+            }
+        }
+    }
+    atlas_buf_free(&tmp);
+    atlas_buf_free(&final);
+    atlas_buf_free(&doc);
+    atlas_buf_free(&body);
+    return st;
+}
+
+/* Dropped only once the daemon holds the result, because until then the file is
+ * the only copy that survives this process. */
+static void spool_clear(const atlas_rundriver_opts *o, const claimed *c) {
+    if (o->spool_dir == NULL || o->spool_dir[0] != '/') {
+        return;
+    }
+    atlas_err ignore;
+    atlas_err_init(&ignore);
+    atlas_buf path = ATLAS_BUF_INIT;
+    if (spool_path(o, c, &path, &ignore) == ATLAS_OK) {
+        (void)unlink(atlas_buf_cstr(&path));
+    }
+    atlas_buf_free(&path);
+}
+
 static atlas_status report(const atlas_rundriver_opts *o, const claimed *c, const outcome *x,
                            atlas_orch_result *res, atlas_err *err) {
     atlas_orch_op *op = atlas_orch_op_new(ATLAS_ORCH_OP_COMPLETE);
@@ -341,8 +508,24 @@ static atlas_status report(const atlas_rundriver_opts *o, const claimed *c, cons
         op->artifacts = arts;
         op->artifact_count = na;
     }
+    /* Durable before it is offered. If every retry below is refused the file is
+     * what is left, and it is the difference between "the daemon never took this
+     * result" and "this result no longer exists anywhere". */
     if (st == ATLAS_OK) {
-        st = apply_op(o, op, res, err);
+        atlas_status ss = spool_write(o, c, x, err);
+        if (ss != ATLAS_OK) {
+            /* A spool that cannot be written is reported and does not stop the
+             * completion: the in-memory result is still worth offering, and
+             * refusing to try would turn a storage problem into a lost attempt. */
+            say(o, "the worker's result could not be spooled: %s", atlas_err_msg(err));
+            atlas_err_init(err);
+        }
+    }
+    if (st == ATLAS_OK) {
+        st = apply_completion(o, op, res, err);
+        if (st == ATLAS_OK) {
+            spool_clear(o, c);
+        }
     }
     /* The artifacts are stack-owned here, so they are detached before the op is
      * freed rather than handed over. Freeing them twice is the alternative. */

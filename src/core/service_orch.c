@@ -842,6 +842,13 @@ atlas_status atlas_service_job_run(atlas_ctx *ctx, const atlas_job_run_opts *o,
         ro.live_model = pol.live_model;
         ro.operator_session = atlas_orchpolicy_is_model_dispatcher(&pol, (long long)getuid()) &&
                               pol.model_uses_operator_session;
+        /* A11.5a-R. Where a finished worker's result is made durable before the
+         * daemon is asked to accept it. The path comes from the root-owned
+         * policy — the same field that already says where this dispatcher owns
+         * its state — so it is a value the operator's machine configured and
+         * never one a task, an environment or a model chose. Empty in the policy
+         * means no spool, which is the behaviour that shipped before this. */
+        ro.spool_dir = pol.model_worker_root[0] != '\0' ? pol.model_worker_root : NULL;
         ro.log = o->log;
         ro.transport.apply = xport_apply;
         ro.transport.run_get = xport_run_get;

@@ -29,6 +29,7 @@
 
 #include "atlas/atlas.h"
 #include "atlas/db.h"
+#include "atlas/orch.h"
 #include "atlas/orch_ops.h"
 #include "atlas/sha256.h"
 #include "atlas_test.h"
@@ -934,7 +935,152 @@ static void test_a_patch_artifact_is_recorded_and_never_applied(void) {
     env_close(&e);
 }
 
+/* --- A11.5a-R: contention grace ------------------------------------------- */
+
+/* The failure this exists for was measured, not imagined. A semantic pass over a
+ * second registered repository ran 167-176 s with 14-20 s between passes, so
+ * A9.2.6 refused orchestration writes about ninety per cent of the time. A
+ * worker that was alive and ten minutes inside its wall deadline could not land
+ * a heartbeat, its sixty-second lease expired, and the sweep requeued its
+ * attempt as LEASE_EXPIRED and threw the result away.
+ *
+ * The sweep is itself a synchronous write, so it can only run in the gaps
+ * between passes — which is exactly what makes its own refusal usable as the
+ * signal that the holder was not being listened to. */
+static void test_contention_defers_an_expired_lease(void) {
+    env e;
+    env_open(&e);
+    atlas_orch_result s, g;
+    apply_ok(&e, submit_op(&e, NULL, 3, 3600000), &s);
+    lease_one(&e, &g);
+    advance_to_running(&e, atlas_buf_cstr(&g.token));
+
+    /* Past the lease, and Atlas refused a write moments ago. */
+    atlas_orch_op *op = atlas_orch_op_new(ATLAS_ORCH_OP_RECOVER);
+    op->actor = ATLAS_ORCH_ACTOR_ATLAS;
+    /* Past any expiry the heartbeats in `advance_to_running` renewed it to — the
+     * grant's own `expires_ms` is not that, and using it made this test depend on
+     * how fast the machine got here. */
+    int64_t late = g.expires_ms + ATLAS_ORCH_LEASE_MS * 2;
+    op->now_ms = late;
+    op->contended_until_ms = late - 1;
+    atlas_orch_result r;
+    apply_ok(&e, op, &r);
+
+    /* Nothing was judged: the lease is untouched, the attempt is still running,
+     * and no second attempt was queued for a second worker to pick up. */
+    T_EQ_INT((int)r.deferred, 1);
+    T_EQ_INT((int)r.expired, 0);
+    T_EQ_INT((int)r.retried, 0);
+    T_EQ_INT((int)count_sql(e.db, "SELECT count(*) FROM orch_leases WHERE released_at IS NULL;"),
+             1);
+    T_EQ_INT((int)count_sql(e.db, "SELECT count(*) FROM orch_attempts;"), 1);
+    T_EQ_INT((int)count_sql(e.db,
+                            "SELECT count(*) FROM orch_attempts WHERE state = 'TIMED_OUT';"),
+             0);
+    T_EQ_INT((int)count_sql(e.db, "SELECT count(*) FROM orch_jobs WHERE state = 'QUEUED';"), 0);
+    atlas_orch_result_free(&r);
+
+    /* And the heartbeat the worker was never able to send still renews it once
+     * the writer is free, which is the whole point of having waited. */
+    atlas_orch_op *hb = worker_op(ATLAS_ORCH_OP_HEARTBEAT, atlas_buf_cstr(&g.token));
+    hb->now_ms = late + 1;
+    atlas_orch_result hr;
+    apply_ok(&e, hb, &hr);
+    T_CHECK(hr.expires_ms > late);
+    atlas_orch_result_free(&hr);
+
+    atlas_orch_result_free(&s);
+    atlas_orch_result_free(&g);
+    env_close(&e);
+}
+
+/* Grace forgives Atlas' silence, not the worker's. With no contention reported
+ * the sweep behaves exactly as it always has — which is what makes the new field
+ * safe to add to an operation every existing caller already builds. */
+static void test_without_contention_an_expired_lease_is_still_reclaimed(void) {
+    env e;
+    env_open(&e);
+    atlas_orch_result s, g;
+    apply_ok(&e, submit_op(&e, NULL, 3, 3600000), &s);
+    lease_one(&e, &g);
+    advance_to_running(&e, atlas_buf_cstr(&g.token));
+
+    atlas_orch_op *op = atlas_orch_op_new(ATLAS_ORCH_OP_RECOVER);
+    op->actor = ATLAS_ORCH_ACTOR_ATLAS;
+    op->now_ms = g.expires_ms + ATLAS_ORCH_LEASE_MS * 2;
+    /* contended_until_ms left at zero: nobody said Atlas was busy. */
+    atlas_orch_result r;
+    apply_ok(&e, op, &r);
+    T_EQ_INT((int)r.deferred, 0);
+    T_EQ_INT((int)r.expired, 1);
+    T_EQ_INT((int)r.retried, 1);
+    atlas_orch_result_free(&r);
+
+    /* Stale contention is not contention. An outage half an hour ago says
+     * nothing about whether this worker could heartbeat a moment ago. */
+    env_close(&e);
+}
+
+static void test_stale_contention_does_not_defer(void) {
+    env e;
+    env_open(&e);
+    atlas_orch_result s, g;
+    apply_ok(&e, submit_op(&e, NULL, 3, 3600000), &s);
+    lease_one(&e, &g);
+    advance_to_running(&e, atlas_buf_cstr(&g.token));
+
+    atlas_orch_op *op = atlas_orch_op_new(ATLAS_ORCH_OP_RECOVER);
+    op->actor = ATLAS_ORCH_ACTOR_ATLAS;
+    int64_t late3 = g.expires_ms + ATLAS_ORCH_LEASE_MS * 2;
+    op->now_ms = late3;
+    op->contended_until_ms = late3 - (ATLAS_ORCH_CONTENTION_GRACE_MS * 4);
+    atlas_orch_result r;
+    apply_ok(&e, op, &r);
+    T_EQ_INT((int)r.deferred, 0);
+    T_EQ_INT((int)r.expired, 1);
+    atlas_orch_result_free(&r);
+    atlas_orch_result_free(&s);
+    atlas_orch_result_free(&g);
+    env_close(&e);
+}
+
+/* The one thing contention must never buy. A9.2.6's refusals are Atlas' fault
+ * and are forgiven; the wall clock is the submitter's bound and is not. */
+static void test_contention_never_extends_the_wall_deadline(void) {
+    env e;
+    env_open(&e);
+    atlas_orch_result s, g;
+    /* A deadline that falls well inside the lease, so the sweep meets both
+     * conditions at once and has to choose. */
+    apply_ok(&e, submit_op(&e, NULL, 3, 1000), &s);
+    lease_one(&e, &g);
+    advance_to_running(&e, atlas_buf_cstr(&g.token));
+
+    atlas_orch_op *op = atlas_orch_op_new(ATLAS_ORCH_OP_RECOVER);
+    op->actor = ATLAS_ORCH_ACTOR_ATLAS;
+    int64_t late4 = g.expires_ms + ATLAS_ORCH_LEASE_MS * 2;
+    op->now_ms = late4;
+    op->contended_until_ms = late4 - 1;
+    atlas_orch_result r;
+    apply_ok(&e, op, &r);
+
+    T_EQ_INT((int)r.deferred, 0);
+    T_EQ_INT((int)count_sql(e.db, "SELECT count(*) FROM orch_jobs WHERE state = 'TIMED_OUT';"),
+             1);
+    atlas_orch_result_free(&r);
+    atlas_orch_result_free(&s);
+    atlas_orch_result_free(&g);
+    env_close(&e);
+}
+
 static const atlas_test TESTS[] = {
+    {"contention_defers_an_expired_lease", test_contention_defers_an_expired_lease},
+    {"without_contention_an_expired_lease_is_still_reclaimed",
+     test_without_contention_an_expired_lease_is_still_reclaimed},
+    {"stale_contention_does_not_defer", test_stale_contention_does_not_defer},
+    {"contention_never_extends_the_wall_deadline",
+     test_contention_never_extends_the_wall_deadline},
     {"a job is persisted before anything is dispatched",
      test_a_job_is_persisted_before_anything_is_dispatched},
     {"submission is idempotent and a conflicting replay is refused",

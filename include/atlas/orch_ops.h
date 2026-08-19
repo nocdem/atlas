@@ -145,6 +145,20 @@ typedef struct atlas_orch_op {
      * than read here, so a test can drive expiry deterministically instead of
      * sleeping. Zero means "now". */
     int64_t now_ms;
+
+    /* A11.5a-R. RECOVER. The instant this caller was last refused a write
+     * because the daemon was busy with something unbounded, or zero if it has
+     * not been refused recently.
+     *
+     * A lease is a liveness proxy, and a heartbeat is an ordinary synchronous
+     * write. A9.2.6 refuses those for the whole of a semantic pass, so a worker
+     * that is alive and healthy can be unable to say so for minutes at a time —
+     * and then be judged for not having said so. This field is how the sweep
+     * learns that the silence was Atlas' own, not the worker's.
+     *
+     * Zero is the old behaviour exactly, which is why every existing caller and
+     * every existing test is unchanged by this field's existence. */
+    int64_t contended_until_ms;
 } atlas_orch_op;
 
 atlas_orch_op *atlas_orch_op_new(atlas_orch_op_kind kind);
@@ -220,6 +234,12 @@ typedef struct atlas_orch_result {
     int64_t retried;
     int64_t timed_out;
     int64_t recovered;
+    /* A11.5a-R. Expired leases this sweep declined to judge, because the daemon
+     * had recently refused writes and the holder may have been unable to
+     * heartbeat. Reported rather than silent: a sweep that keeps deferring is a
+     * machine under sustained contention, which an operator should be able to
+     * see without reading the lease table. */
+    int64_t deferred;
 } atlas_orch_result;
 
 void atlas_orch_result_init(atlas_orch_result *r);

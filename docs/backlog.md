@@ -983,3 +983,45 @@ whose one failure cannot be read is a test nobody can fix. Next time it fires,
 capture `Testing/Temporary/LastTest.log` before running anything else; if it
 does not fire again, this entry is the record that one failure on 2026-08-19 was
 observed under load and never explained.
+
+## The run driver dies on a transport timeout it could survive
+
+Found by pilot A11.6-P, twice — once in each of its runs. `apply_op` in
+`src/orch/rundriver.c` retries a call the daemon refused with `BUSY:` and treats
+every other failure as fatal to the invocation. A congested serve loop can time
+out one read ("timed out while reading a frame header") on a heartbeat or a
+phase call, and one such timeout kills the whole foreground driver: the worker
+keeps running, nobody heartbeats, the lease expires, the attempt is lost and the
+requeued task sits driverless until an operator resumes it — in pilot 1 it sat
+until its wall consumed it. The BUSY token was A9.2.6's contract for "nothing
+was queued"; a read timeout is the *other* claim, and the driver treats both as
+if they were a third thing.
+
+What a fix must keep straight: a timed-out **heartbeat** is already survivable
+(`driver_should_stop` ignores renewal failures) and a timed-out **completion**
+already has its own five-minute budget; the gap is the phase transitions and the
+lease claim between them. The operator-side mitigation that carried pilot 2 — a
+supervisor loop that re-runs `job run --resume` whenever the driver exits with
+the run still ACTIVE — is written in the pilot record and works, but it is a
+wrapper around a fragility, not an answer to it.
+
+## A workspace artifact's bytes do not survive the workspace
+
+Pilot A11.6-P2's sibling wrote a 4,385-byte review report to its workspace
+`artifacts/` directory. The completion recorded its name, size and digest;
+`content_stored` is 0; the dispatcher then removed the workspace, as it always
+does. The manifest therefore points at bytes that no longer exist anywhere. The
+root's `worker.log`, carried inline by the run driver's completion, survived
+fine — the asymmetry is between the two artifact paths, and whichever behaviour
+is intended, an artifact row whose bytes are unreachable an hour later is not
+what "collected artifacts" reads as promising.
+
+## A worker's model is the operator session's default, and nothing can choose it
+
+Both pilot workers ran on the operator session's default model — the most
+expensive one available — because the `claude` and `claude-repo` drivers invoke
+the CLI with no model argument and no surface (spec, policy or flag) selects
+one. Pilot 1's sibling spent $7.14 before its wall killed it. A model choice is
+an authority-relevant knob (the policy names which drivers may run at all), so
+it likely belongs in the root-owned policy rather than on the submission; that
+decision is deliberately not made here.

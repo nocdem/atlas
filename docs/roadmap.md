@@ -1161,7 +1161,45 @@ call `atlas_orch_driver_is_repo_tree`. `tests/test_orch_parallel.c` compares the
 two spellings in both directions over `atlas_drivers()`, so the obligation cannot
 be forgotten silently — only fixed deliberately.
 
-## A7 (original plan) — optional MCP adapter (absorbed into A2)
+### Pilot A11.6-P — one real two-worker run (CLOSED the season)
+
+One pilot, defined and frozen before launch: a real `claude-repo` root task in
+this repository's own tree (verify a unit test for `atlas_db_in_transaction`,
+gates `make` and `ctest -R test_db`) beside a real `claude` workspace sibling
+(a focused adversarial review of the writer-yield functions, reported as an
+artifact), both in one run with `--parallel 2`. Success required, among six
+criteria, that the two workers' attempt windows genuinely overlap in the ledger
+and that the run settle only at quiescence from Atlas' own gates.
+
+**It took two runs, and the first one's failure was the more valuable half.**
+Pilot 1 (run `rbbd47da…`) failed on three findings: the foreground run driver
+dies on an IPC frame-header read timeout — `apply_op` retries only `BUSY:`, so
+one congested read killed the invocation, the lease expired, and the requeued
+task then sat driverless past its wall; and the run it left behind exposed a
+shipped defect — **five terminal-state producers never settled their run**, so
+a sibling that hit its wall on a heartbeat left the run ACTIVE forever at zero
+active tasks. That defect was fixed the same evening (every terminal producer
+now settles; two regression cases; the fix commit names this pilot), and the
+worker's own product — the test it wrote — stayed in the tree, exactly as
+A11.1's tree semantics intend.
+
+Pilot 2 (run `r2ba3e8e…`) ran under an operator-side supervisor that re-resumes
+a dead driver, and **was ACCEPTED at 17:52:50Z**: the sibling ran from 17:44:58
+to 17:52:50 and the root's whole successful attempt (17:45:04 → 17:48:19,
+gates passed) sat strictly inside that window — two live model workers, one
+run, measured from `orch_transitions` and never from worker output. Zero
+unreleased leases at the end; the repo-tree chain spent two of its three
+worker starts (the first on the driver death, honestly); the root's accepted
+attempt recorded AVAILABLE usage ($3.00, 12 turns, 188 s); the sibling produced
+a 4 385-byte review report whose existence, size and digest are recorded.
+
+**Residual findings, recorded rather than argued away:** the driver's
+transport-timeout fragility killed an invocation in both pilots and is the
+next thing to harden (`docs/backlog.md`); a workspace artifact's bytes are not
+retrievable after the workspace is removed when the content was not inlined —
+the sibling's report manifest survives, its bytes do not; and a worker's model
+is the operator session's default with no selection surface, which made both
+pilots run on the most expensive model available.
 
 A7 was conditional: an MCP adapter only if a skill driving the CLI turned out to
 be insufficient. It turned out to be insufficient before it was written, for a

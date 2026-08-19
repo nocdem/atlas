@@ -204,6 +204,54 @@ static void test_migration_out_of_sequence(void) {
     db_env_close(&e);
 }
 
+/* --- transaction observation ---------------------------------------------- */
+
+static void test_in_transaction(void) {
+    db_env e;
+    memset(&e, 0, sizeof(e));
+    db_env_open(&e, false);
+    atlas_err err;
+    atlas_err_init(&err);
+
+    /* A NULL handle answers no rather than crashing. */
+    T_CHECK(!atlas_db_in_transaction(NULL));
+
+    /* A freshly opened handle is not in a transaction. */
+    T_CHECK(!atlas_db_in_transaction(e.db));
+
+    /* Inside atlas_db_begin the answer is yes. */
+    T_OK(atlas_db_begin(e.db, &err), &err);
+    T_CHECK(atlas_db_in_transaction(e.db));
+
+    /* And no again once the commit balances it. */
+    T_OK(atlas_db_commit(e.db, &err), &err);
+    T_CHECK(!atlas_db_in_transaction(e.db));
+
+    /* A rollback ends the transaction the same way. */
+    T_OK(atlas_db_begin(e.db, &err), &err);
+    T_CHECK(atlas_db_in_transaction(e.db));
+    atlas_db_rollback(e.db);
+    T_CHECK(!atlas_db_in_transaction(e.db));
+
+    /* A BEGIN issued behind atlas_db_begin's back leaves tx_depth at zero, so
+     * this is the sqlite3_get_autocommit half of the check answering. A failed
+     * raw statement would make every assertion after it noise, hence REQUIRE. */
+    T_REQUIRE(sqlite3_exec(e.db->h, "BEGIN;", NULL, NULL, NULL) == SQLITE_OK);
+    T_CHECK(atlas_db_in_transaction(e.db));
+    T_REQUIRE(sqlite3_exec(e.db->h, "COMMIT;", NULL, NULL, NULL) == SQLITE_OK);
+    T_CHECK(!atlas_db_in_transaction(e.db));
+
+    /* Nested begins stay open until the outermost commit balances them. */
+    T_OK(atlas_db_begin(e.db, &err), &err);
+    T_OK(atlas_db_begin(e.db, &err), &err);
+    T_OK(atlas_db_commit(e.db, &err), &err);
+    T_CHECK(atlas_db_in_transaction(e.db));
+    T_OK(atlas_db_commit(e.db, &err), &err);
+    T_CHECK(!atlas_db_in_transaction(e.db));
+
+    db_env_close(&e);
+}
+
 /* --- capabilities and checks -------------------------------------------- */
 
 static void test_caps_and_checks(void) {
@@ -547,6 +595,7 @@ static const atlas_test TESTS[] = {
     {"migrations are idempotent", test_migration_idempotency},
     {"a failed migration is rolled back whole", test_migration_rollback},
     {"out-of-sequence migrations are refused", test_migration_out_of_sequence},
+    {"transaction state tracks begin, commit, rollback and a raw BEGIN", test_in_transaction},
     {"capabilities, checks and cascade", test_caps_and_checks},
     {"repository name validation", test_repo_name_validation},
     {"repository create, read, list, remove", test_repo_crud},

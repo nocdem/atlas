@@ -36,6 +36,7 @@
 
 #include "atlas/buf.h"
 #include "atlas/error.h"
+#include "atlas/orch_usage.h"
 #include "atlas/orch.h"
 #include "atlas/proc.h"
 #include "atlas/workspace.h"
@@ -109,6 +110,11 @@ typedef struct atlas_driver_res {
      * that call a live model. Reported, never interpreted: a count of events is
      * evidence that work happened, not a claim about what it achieved. */
     int64_t events;
+    /* A10.0. What the attempt cost, read from the worker's final streamed
+     * record. `ATLAS_USAGE_UNKNOWN` for every driver that streams nothing and
+     * for any run whose final record never arrived — which is not the same as
+     * having cost nothing. */
+    atlas_usage usage;
     /* Model metadata when the driver can report it, and zero when it cannot.
      * Zero means "not reported", never "free". */
     int64_t input_tokens;

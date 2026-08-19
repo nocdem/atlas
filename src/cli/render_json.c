@@ -633,6 +633,50 @@ static atlas_status j_job_item(atlas_renderer *r, const atlas_job_render *jr, at
             st = atlas_json_key_int(j, "tasks_carried", jr->tasks, err);
         }
     }
+    if (st == ATLAS_OK && jr->usage_present) {
+        /* A10.0. One writer for the block, and the status is always present:
+         * an absent status means a daemon that does not report usage, which is
+         * a different fact from a run whose cost nobody observed. */
+        const atlas_usage_run *u = &jr->usage;
+        st = atlas_json_key_str(j, "usage_status", atlas_usage_status_name(u->status), err);
+        const struct {
+            const char *k;
+            int64_t v;
+        } A[] = {
+            {"usage_attempts_started", u->attempts_started},
+            {"usage_attempts_measured", u->attempts_with_usage},
+            {"usage_attempts_missing", u->attempts_missing_usage},
+        };
+        for (size_t i = 0; st == ATLAS_OK && i < sizeof A / sizeof A[0]; i++) {
+            st = atlas_json_key_int(j, A[i].k, A[i].v, err);
+        }
+        if (st == ATLAS_OK && u->status != ATLAS_USAGE_UNKNOWN) {
+            const struct {
+                const char *k;
+                int64_t v;
+            } T[] = {
+                {"usage_input_tokens", u->input_tokens},
+                {"usage_output_tokens", u->output_tokens},
+                {"usage_cache_creation_tokens", u->cache_creation_tokens},
+                {"usage_cache_read_tokens", u->cache_read_tokens},
+                {"usage_worker_duration_ms", u->worker_duration_ms},
+                {"usage_turns", u->turns},
+            };
+            for (size_t i = 0; st == ATLAS_OK && i < sizeof T / sizeof T[0]; i++) {
+                st = atlas_json_key_int(j, T[i].k, T[i].v, err);
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_bool(j, "usage_tokens_complete", u->tokens_complete, err);
+            }
+            if (st == ATLAS_OK && u->has_any_cost) {
+                st = atlas_json_key_int(j, "usage_cost_known_micro_usd", u->cost_known_micro_usd,
+                                        err);
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_bool(j, "usage_cost_complete", u->cost_complete, err);
+            }
+        }
+    }
     if (st == ATLAS_OK && jr->busy) {
         /* Present only when true, and named so it cannot be read as a verdict
          * about the run: nothing was started and nothing was written. */

@@ -306,6 +306,9 @@ typedef struct outcome {
     atlas_buf detail;
     atlas_buf worker_log;
     atlas_buf driver_version;
+    /* A10.0. Carried from the driver to the completion, and durable on disk
+     * before the completion is offered. */
+    atlas_usage usage;
 } outcome;
 
 static void outcome_init(outcome *x) {
@@ -436,6 +439,62 @@ static atlas_status spool_write(const atlas_rundriver_opts *o, const claimed *c,
     return st;
 }
 
+/* A10.0. The cost summary, written beside the result and kept when the result
+ * is not.
+ *
+ * The result spool is cleared once the daemon accepts a completion, and the
+ * worker log that carries a second copy of these numbers is dropped whenever it
+ * exceeds the inline artifact ceiling. Both of those are right, and together
+ * they threw away every figure on exactly the path where a run *worked* — which
+ * is the path an experiment compares. This file is small, bounded, and outlives
+ * both.
+ *
+ * It holds numbers and checked names. Not the final record's `result` text, not
+ * a session identifier, not a prompt, not a tool argument: a summary that
+ * quietly retained model output would be a transcript with a shorter name, and
+ * this one is meant to be kept. */
+static atlas_status usage_write(const atlas_rundriver_opts *o, const claimed *c,
+                                const outcome *x, atlas_err *err) {
+    if (o->spool_dir == NULL || o->spool_dir[0] != '/') {
+        return ATLAS_OK;
+    }
+    atlas_buf doc = ATLAS_BUF_INIT;
+    atlas_status st = atlas_usage_encode(&x->usage, &doc, err);
+
+    atlas_buf final = ATLAS_BUF_INIT, tmp = ATLAS_BUF_INIT;
+    if (st == ATLAS_OK) {
+        st = atlas_buf_appendf(&final, err, "%s/%s.%lld.usage", o->spool_dir,
+                               atlas_buf_cstr(&c->job_uid), (long long)c->attempt_no);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_buf_appendf(&tmp, err, "%s.part", atlas_buf_cstr(&final));
+    }
+    if (st == ATLAS_OK) {
+        FILE *f = fopen(atlas_buf_cstr(&tmp), "we");
+        if (f == NULL) {
+            st = atlas_err_set_errno(err, ATLAS_ERR_INTERNAL, errno,
+                                     "cannot open the usage summary");
+        } else {
+            bool ok = doc.len == 0 || fwrite(doc.data, 1, doc.len, f) == doc.len;
+            if (ok) {
+                ok = fflush(f) == 0 && fsync(fileno(f)) == 0;
+            }
+            if (fclose(f) != 0) {
+                ok = false;
+            }
+            if (!ok || rename(atlas_buf_cstr(&tmp), atlas_buf_cstr(&final)) != 0) {
+                (void)unlink(atlas_buf_cstr(&tmp));
+                st = atlas_err_set_errno(err, ATLAS_ERR_INTERNAL, errno,
+                                         "cannot publish the usage summary");
+            }
+        }
+    }
+    atlas_buf_free(&tmp);
+    atlas_buf_free(&final);
+    atlas_buf_free(&doc);
+    return st;
+}
+
 /* Dropped only once the daemon holds the result, because until then the file is
  * the only copy that survives this process. */
 static void spool_clear(const atlas_rundriver_opts *o, const claimed *c) {
@@ -463,6 +522,7 @@ static atlas_status report(const atlas_rundriver_opts *o, const claimed *c, cons
     op->exit_code = x->exit_code;
     op->failure_reason = x->reason;
     op->failed_gate = x->failed_gate;
+    op->usage = x->usage;
     atlas_status st = atlas_buf_set(&op->token, c->token.data, c->token.len, err);
     if (st == ATLAS_OK) {
         st = atlas_buf_set(&op->driver_version, x->driver_version.data, x->driver_version.len,
@@ -511,6 +571,13 @@ static atlas_status report(const atlas_rundriver_opts *o, const claimed *c, cons
     /* Durable before it is offered. If every retry below is refused the file is
      * what is left, and it is the difference between "the daemon never took this
      * result" and "this result no longer exists anywhere". */
+    if (st == ATLAS_OK) {
+        atlas_status us = usage_write(o, c, x, err);
+        if (us != ATLAS_OK) {
+            say(o, "the attempt's usage summary could not be written: %s", atlas_err_msg(err));
+            atlas_err_init(err);
+        }
+    }
     if (st == ATLAS_OK) {
         atlas_status ss = spool_write(o, c, x, err);
         if (ss != ATLAS_OK) {
@@ -790,6 +857,7 @@ static atlas_status drive_one(const atlas_rundriver_opts *o, const atlas_orch_ru
             }
             (void)atlas_buf_set(&x.worker_log, dr.log.data, dr.log.len, err);
             (void)atlas_buf_set(&x.driver_version, dr.version.data, dr.version.len, err);
+            x.usage = dr.usage;
             atlas_driver_res_free(&dr);
         }
     }

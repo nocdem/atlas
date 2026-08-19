@@ -16,6 +16,7 @@
 #include "atlas/authority.h"
 #include "atlas/backup.h"
 #include "atlas/code.h"
+#include "atlas/orch_usage.h"
 #include "atlas/sem.h"
 #include "atlas/sem_schedule.h"
 #include "atlas/datadir.h"
@@ -1062,6 +1063,12 @@ typedef struct atlas_job_render {
     /* The run's active task was already held, so nothing was started. Neither
      * an acceptance nor a refusal: the run stays ACTIVE and resumable. */
     bool busy;
+    /* A10.0. What the run cost, for `job run-status`. `usage_status` is
+     * `ATLAS_USAGE_UNKNOWN` when the daemon reported none — an older daemon
+     * against a newer CLI reads exactly that, which is the conservative value
+     * and never an error, following A9.2.5's rule for absent keys. */
+    atlas_usage_run usage;
+    bool usage_present;
     /* True for `job get`, which prints every field; false for a list row. */
     bool detail;
     /* True only when this row is being emitted inside a `jobs` array. The JSON

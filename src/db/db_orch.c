@@ -2198,6 +2198,98 @@ static atlas_status run_blocked_by_recovery(atlas_db *db, const job_row *j, atla
  *   A duplicated completion changes nothing the second time, because the first
  *   released the lease.
  */
+/* A10.0. Records what an attempt cost, once.
+ *
+ * `INSERT OR IGNORE` against `UNIQUE(attempt_id)` is the whole idempotency
+ * story, and it belongs to the schema rather than to this function: a completion
+ * delivered twice — retried through a `BUSY` window, or offered again after a
+ * driver lost its answer — leaves one row and does not double a total. It runs
+ * inside the completion's transaction, so a usage row exists exactly when the
+ * completion it describes does.
+ *
+ * Every count binds NULL when it was not observed. That is the point of the
+ * table: an attempt whose usage never arrived did not cost zero, and a reader
+ * adding a column of zeroes would produce a total that is confidently wrong. */
+static atlas_status write_usage(atlas_db *db, const atlas_orch_op *op, const job_row *j,
+                                int64_t attempt_id, int64_t attempt_no, atlas_err *err) {
+    static const char INS[] =
+        "INSERT OR IGNORE INTO orch_usage(attempt_id, job_id, run_uid, attempt_no, status,"
+        "  provider, model, input_tokens, output_tokens, cache_creation_tokens,"
+        "  cache_read_tokens, cost_micro_usd, duration_ms, api_duration_ms, turns,"
+        "  exit_kind, source, created_at, digest)"
+        " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19);";
+    sqlite3_stmt *q = NULL;
+    atlas_status s = atlas_db_prepare(db, INS, &q, err);
+    if (s != ATLAS_OK) {
+        return s;
+    }
+    const atlas_usage *u = &op->usage;
+    (void)sqlite3_bind_int64(q, 1, attempt_id);
+    (void)sqlite3_bind_int64(q, 2, j->id);
+    s = atlas_db_bind_text_opt(db, q, 3, j->run_uid, err);
+    if (s == ATLAS_OK) {
+        (void)sqlite3_bind_int64(q, 4, attempt_no);
+        s = atlas_db_bind_text_opt(db, q, 5, atlas_usage_status_name(u->status), err);
+    }
+    if (s == ATLAS_OK) {
+        s = atlas_db_bind_text_opt(db, q, 6, u->provider, err);
+    }
+    if (s == ATLAS_OK) {
+        s = atlas_db_bind_text_opt(db, q, 7, u->model, err);
+    }
+    if (s != ATLAS_OK) {
+        atlas_db_finish(db, q);
+        return s;
+    }
+    const struct {
+        int idx;
+        bool has;
+        int64_t v;
+    } N[] = {
+        {8, u->has_input, u->input_tokens},
+        {9, u->has_output, u->output_tokens},
+        {10, u->has_cache_creation, u->cache_creation_tokens},
+        {11, u->has_cache_read, u->cache_read_tokens},
+        {12, u->has_cost, u->cost_micro_usd},
+        {13, u->has_duration, u->duration_ms},
+        {14, u->has_api_duration, u->api_duration_ms},
+        {15, u->has_turns, u->turns},
+    };
+    for (size_t i = 0; i < sizeof N / sizeof N[0]; i++) {
+        if (N[i].has) {
+            (void)sqlite3_bind_int64(q, N[i].idx, N[i].v);
+        } else {
+            (void)sqlite3_bind_null(q, N[i].idx);
+        }
+    }
+    char at[ATLAS_TS_MAX];
+    atlas_now_iso8601(at, sizeof(at));
+    atlas_buf doc = ATLAS_BUF_INIT;
+    char digest[ATLAS_SHA256_HEX_LEN + 1u] = {0};
+    if (atlas_usage_encode(u, &doc, err) == ATLAS_OK) {
+        atlas_sha256_hex(doc.data != NULL ? doc.data : "", doc.len, digest);
+    } else {
+        atlas_err_init(err);
+    }
+    atlas_buf_free(&doc);
+    s = atlas_db_bind_text_opt(db, q, 16, atlas_orch_exit_kind_name(op->exit_kind), err);
+    if (s == ATLAS_OK) {
+        s = atlas_db_bind_text_opt(db, q, 17, "claude-stream-result", err);
+    }
+    if (s == ATLAS_OK) {
+        s = atlas_db_bind_text_opt(db, q, 18, at, err);
+    }
+    if (s == ATLAS_OK) {
+        s = atlas_db_bind_text_opt(db, q, 19, digest, err);
+    }
+    if (s == ATLAS_OK) {
+        s = atlas_db_step_done(db, q, err);
+    } else {
+        atlas_db_finish(db, q);
+    }
+    return s;
+}
+
 static atlas_status op_complete(atlas_db *db, const atlas_orch_op *op, atlas_orch_result *out,
                                 atlas_err *err) {
     int64_t at_ms = op->now_ms > 0 ? op->now_ms : now_ms();
@@ -2210,6 +2302,10 @@ static atlas_status op_complete(atlas_db *db, const atlas_orch_op *op, atlas_orc
     out->job_id = j.id;
     out->attempt_id = lr.attempt_id;
     out->attempt_no = lr.attempt_no;
+    s = write_usage(db, op, &j, lr.attempt_id, lr.attempt_no, err);
+    if (s != ATLAS_OK) {
+        return s;
+    }
     s = atlas_buf_set_str(&out->job_uid, j.uid, err);
     if (s != ATLAS_OK) {
         return s;
@@ -2782,6 +2878,89 @@ atlas_status atlas_db_orch_job_get(atlas_db *db, const char *uid, atlas_orch_job
 }
 
 /* --- the run, read and settled (A11.0) ------------------------------------ */
+
+/* A10.0. See atlas/orch_ops.h. Every started attempt of every job in the run is
+ * accounted for: the ones with a usage row are folded, and the ones without are
+ * counted as missing rather than skipped, which is what keeps a run whose worker
+ * never spawned from reporting a confident zero. */
+atlas_status atlas_db_orch_run_usage(atlas_db *db, const char *run_uid, atlas_usage_run *out,
+                                     atlas_err *err) {
+    atlas_usage_run_init(out);
+    if (run_uid == NULL || run_uid[0] == '\0') {
+        return ATLAS_OK;
+    }
+    {
+        static const char SEL[] =
+            "SELECT u.status, u.input_tokens, u.output_tokens, u.cache_creation_tokens,"
+            "       u.cache_read_tokens, u.cost_micro_usd, u.duration_ms, u.turns"
+            "  FROM orch_usage u WHERE u.run_uid = ?1 ORDER BY u.id;";
+        sqlite3_stmt *q = NULL;
+        atlas_status s = atlas_db_prepare(db, SEL, &q, err);
+        if (s != ATLAS_OK) {
+            return s;
+        }
+        s = atlas_db_bind_text_opt(db, q, 1, run_uid, err);
+        if (s != ATLAS_OK) {
+            atlas_db_finish(db, q);
+            return s;
+        }
+        while (sqlite3_step(q) == SQLITE_ROW) {
+            atlas_usage u;
+            atlas_usage_init(&u);
+            const char *st = atlas_db_col_text(q, 0);
+            if (!atlas_usage_status_parse(st != NULL ? st : "", &u.status)) {
+                u.status = ATLAS_USAGE_UNKNOWN;
+            }
+            const struct {
+                int col;
+                bool *has;
+                int64_t *v;
+            } N[] = {
+                {1, &u.has_input, &u.input_tokens},
+                {2, &u.has_output, &u.output_tokens},
+                {3, &u.has_cache_creation, &u.cache_creation_tokens},
+                {4, &u.has_cache_read, &u.cache_read_tokens},
+                {5, &u.has_cost, &u.cost_micro_usd},
+                {6, &u.has_duration, &u.duration_ms},
+                {7, &u.has_turns, &u.turns},
+            };
+            for (size_t i = 0; i < sizeof N / sizeof N[0]; i++) {
+                if (sqlite3_column_type(q, N[i].col) != SQLITE_NULL) {
+                    *N[i].has = true;
+                    *N[i].v = sqlite3_column_int64(q, N[i].col);
+                }
+            }
+            atlas_usage_run_fold(out, &u);
+        }
+        atlas_db_finish(db, q);
+    }
+
+    int64_t started = 0;
+    {
+        /* From the ledger, not from the usage rows: the denominator has to come
+         * from what Atlas recorded starting, or a run with no usage at all would
+         * divide by nothing and look complete. */
+        static const char CNT[] =
+            "SELECT count(*) FROM orch_attempts a JOIN orch_jobs j ON j.id = a.job_id"
+            " WHERE j.run_uid = ?1;";
+        sqlite3_stmt *q = NULL;
+        atlas_status s = atlas_db_prepare(db, CNT, &q, err);
+        if (s != ATLAS_OK) {
+            return s;
+        }
+        s = atlas_db_bind_text_opt(db, q, 1, run_uid, err);
+        if (s != ATLAS_OK) {
+            atlas_db_finish(db, q);
+            return s;
+        }
+        if (sqlite3_step(q) == SQLITE_ROW) {
+            started = sqlite3_column_int64(q, 0);
+        }
+        atlas_db_finish(db, q);
+    }
+    atlas_usage_run_settle(out, started, started);
+    return ATLAS_OK;
+}
 
 atlas_status atlas_db_orch_run_get(atlas_db *db, const char *run_uid, atlas_orch_run_view *out,
                                    bool *found, atlas_err *err) {

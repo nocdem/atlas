@@ -742,6 +742,45 @@ atlas_status atlas_service_job_run_status(atlas_ctx *ctx, const char *run, atlas
         (void)atlas_ipc_result_str(resp, "created_at", &jr.created_at);
         (void)atlas_ipc_result_str(resp, "active_state", &jr.state);
         (void)atlas_ipc_result_str(resp, "active", &jr.follow_up);
+        /* A10.0. Every absent key leaves the conservative value: a daemon that
+         * does not report usage is read as UNKNOWN, never as an error and never
+         * as a zero total. */
+        atlas_usage_run_init(&jr.usage);
+        const char *us = NULL;
+        if (atlas_ipc_result_str(resp, "usage_status", &us) && us != NULL &&
+            atlas_usage_status_parse(us, &jr.usage.status)) {
+            jr.usage_present = true;
+        }
+        const struct {
+            const char *k;
+            int64_t *v;
+        } U[] = {
+            {"usage_attempts_started", &jr.usage.attempts_started},
+            {"usage_attempts_measured", &jr.usage.attempts_with_usage},
+            {"usage_attempts_missing", &jr.usage.attempts_missing_usage},
+            {"usage_worker_starts", &jr.usage.worker_starts},
+            {"usage_input_tokens", &jr.usage.input_tokens},
+            {"usage_output_tokens", &jr.usage.output_tokens},
+            {"usage_cache_creation_tokens", &jr.usage.cache_creation_tokens},
+            {"usage_cache_read_tokens", &jr.usage.cache_read_tokens},
+            {"usage_worker_duration_ms", &jr.usage.worker_duration_ms},
+            {"usage_turns", &jr.usage.turns},
+            {"usage_cost_known_micro_usd", &jr.usage.cost_known_micro_usd},
+        };
+        for (size_t i = 0; i < sizeof U / sizeof U[0]; i++) {
+            int64_t v = 0;
+            if (atlas_ipc_result_int(resp, U[i].k, &v)) {
+                *U[i].v = v;
+            }
+        }
+        jr.usage.has_any_cost = jr.usage.cost_known_micro_usd > 0;
+        bool b = false;
+        if (atlas_ipc_result_bool(resp, "usage_tokens_complete", &b)) {
+            jr.usage.tokens_complete = b;
+        }
+        if (atlas_ipc_result_bool(resp, "usage_cost_complete", &b)) {
+            jr.usage.cost_complete = b;
+        }
         st = sink(&jr, ud, err);
     }
     atlas_ipc_response_free(resp);

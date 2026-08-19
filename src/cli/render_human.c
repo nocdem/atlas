@@ -587,6 +587,39 @@ static atlas_status h_job_item(atlas_renderer *r, const atlas_job_render *jr, at
                       (long long)jr->worker_starts,
                       (long long)ATLAS_ORCH_RUN_MAX_WORKER_STARTS, (long long)jr->tasks);
     }
+    if (jr->usage_present) {
+        /* A10.0. What the run cost. The status is printed first and always,
+         * because every number under it is meaningless without knowing whether
+         * anything was measured — and `UNKNOWN` here is an answer, not a gap. */
+        const atlas_usage_run *u = &jr->usage;
+        (void)fprintf(out, "usage         %s (%lld of %lld attempt(s) measured",
+                      atlas_usage_status_name(u->status), (long long)u->attempts_with_usage,
+                      (long long)u->attempts_started);
+        if (u->attempts_missing_usage > 0) {
+            (void)fprintf(out, ", %lld missing", (long long)u->attempts_missing_usage);
+        }
+        (void)fprintf(out, ")\n");
+        if (u->status != ATLAS_USAGE_UNKNOWN) {
+            (void)fprintf(out, "  tokens      in %lld out %lld cache %lld read %lld%s\n",
+                          (long long)u->input_tokens, (long long)u->output_tokens,
+                          (long long)u->cache_creation_tokens, (long long)u->cache_read_tokens,
+                          u->tokens_complete ? "" : " (incomplete)");
+            (void)fprintf(out, "  worker time %lld ms over %lld turn(s)\n",
+                          (long long)u->worker_duration_ms, (long long)u->turns);
+            if (u->has_any_cost) {
+                /* Named `known` rather than `total` whenever an attempt did not
+                 * report a price: the sum of what was reported is a real number
+                 * that answers a different question, and calling it a total
+                 * would be the lie. */
+                (void)fprintf(out, "  cost %s  %lld.%06lld USD\n",
+                              u->cost_complete ? "      " : "known",
+                              (long long)(u->cost_known_micro_usd / ATLAS_USAGE_COST_SCALE),
+                              (long long)(u->cost_known_micro_usd % ATLAS_USAGE_COST_SCALE));
+            } else {
+                (void)fprintf(out, "  cost        UNKNOWN (the provider reported none)\n");
+            }
+        }
+    }
     if (jr->follow_up != NULL && jr->follow_up[0] != '\0') {
         (void)fprintf(out, "next task     %s\n", jr->follow_up);
     }

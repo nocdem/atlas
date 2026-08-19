@@ -704,6 +704,9 @@ static atlas_status claude_exec(const atlas_driver_req *req, atlas_driver_res *r
         out.progress = NULL;
     }
     res->events = out.events;
+    /* A10.0. Read once, from the stream Atlas captured, and never from anything
+     * the worker asserted about itself in a separate document. */
+    atlas_usage_from_stream(out.out.data, out.out.len, &res->usage);
     atlas_buf_free(&ppath);
     atlas_buf_free(&out.line);
     atlas_buf_free(&out.out);

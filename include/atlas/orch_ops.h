@@ -24,6 +24,7 @@
 #include <stdint.h>
 
 #include "atlas/orch.h"
+#include "atlas/orch_usage.h"
 
 typedef struct atlas_db atlas_db;
 
@@ -159,6 +160,16 @@ typedef struct atlas_orch_op {
      * Zero is the old behaviour exactly, which is why every existing caller and
      * every existing test is unchanged by this field's existence. */
     int64_t contended_until_ms;
+
+    /* A10.0. COMPLETE. What the attempt cost, as the driver read it from the
+     * worker's final streamed record.
+     *
+     * Set by the dispatcher that ran the worker and by nothing else. No IPC
+     * parameter populates it: a client that could write usage could write a run
+     * a cost it never had, and the numbers exist to be compared between runs. A
+     * `status` of `ATLAS_USAGE_UNKNOWN` — the zero, so an unset operation says
+     * it — means no usable record arrived, which is not a cost of nothing. */
+    atlas_usage usage;
 } atlas_orch_op;
 
 atlas_orch_op *atlas_orch_op_new(atlas_orch_op_kind kind);
@@ -320,6 +331,15 @@ typedef struct atlas_orch_run_view {
     atlas_orch_state active_state;
     char created_at[ATLAS_ORCH_TS_MAX];
 } atlas_orch_run_view;
+
+/* A10.0. What a run cost, derived on every read from the per-attempt rows.
+ *
+ * Derived rather than stored, for the reason A6 gives about freshness: a cached
+ * total is a second answer that can disagree with the rows it came from, and the
+ * rows are the ones a later experiment will be asked to justify. Reading is
+ * cheap — one indexed scan of `orch_usage` and one count from the ledger. */
+atlas_status atlas_db_orch_run_usage(atlas_db *db, const char *run_uid, atlas_usage_run *out,
+                                     atlas_err *err);
 
 atlas_status atlas_db_orch_run_get(atlas_db *db, const char *run_uid, atlas_orch_run_view *out,
                                    bool *found, atlas_err *err);

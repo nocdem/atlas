@@ -3754,6 +3754,79 @@ static const char M21_ONE_ACTIVE[] =
 
 static const char *const M21_STATEMENTS[] = {M21_RUNS, M21_JOB_RUN, M21_ONE_ACTIVE, NULL};
 
+/* --- migration 22: what an attempt cost ------------------------------------
+ *
+ * A10.1 is an A/B experiment and its control arm is A11.5a, whose accepted run
+ * could not report its own cost: the worker log carrying the numbers was above
+ * the inline artifact ceiling and was dropped, and the result spool holding a
+ * second copy is cleared the moment a completion is accepted. The figures had to
+ * be recovered from the worker's session transcript under the operator's home
+ * directory — which exists only because A8.1's model dispatcher borrows the
+ * operator's login, and would not exist for a worker running as `atlas-worker`.
+ *
+ * **Why a table and not an artifact.** `orch_artifacts` could hold the bytes,
+ * and holding bytes is not the problem. Aggregating a run means adding counts
+ * across attempts and saying honestly when one of them is missing, and that
+ * needs two things a blob cannot give: typed integers to add with overflow
+ * checked, and a column that can be NULL. `UNKNOWN` and `0` are different
+ * answers — a worker whose usage was never observed did not cost nothing — and
+ * a summary parsed out of a blob at read time would have to invent one of them.
+ * So every count here is nullable and absence is stored as absence.
+ *
+ * Additive, and nothing is backfilled. There is no honest value to give an
+ * attempt that ran before this existed: its cost was observed by nobody, which
+ * is exactly what a missing row says. A11.5a's pilot runs are deliberately left
+ * without rows rather than reconstructed from a transcript, because a baseline
+ * assembled by hand is not a baseline an experiment can compare against.
+ *
+ * `UNIQUE(attempt_id)` is the idempotency. A completion that is delivered twice
+ * — retried through a `BUSY` window, or offered again from a spool — writes one
+ * row, and the second delivery neither duplicates nor doubles a total.
+ */
+static const char M22_USAGE[] =
+    "CREATE TABLE orch_usage ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    /* One row per attempt, and the constraint is what makes redelivery safe. */
+    "  attempt_id INTEGER NOT NULL UNIQUE"
+    "    REFERENCES orch_attempts(id) ON DELETE CASCADE,"
+    "  job_id INTEGER NOT NULL REFERENCES orch_jobs(id) ON DELETE CASCADE,"
+    /* Copied so a run total is one indexed read rather than a join through
+     * every job, and empty for a job that belongs to no run. */
+    "  run_uid TEXT NOT NULL DEFAULT '',"
+    "  attempt_no INTEGER NOT NULL,"
+    /* Atlas' classification of what it observed, never the worker's claim about
+     * itself. UNKNOWN is the zero and means no usable record arrived. */
+    "  status TEXT NOT NULL CHECK(status IN ('UNKNOWN','PARTIAL','AVAILABLE')),"
+    "  provider TEXT NOT NULL DEFAULT '',"
+    "  model TEXT NOT NULL DEFAULT '',"
+    /* Every count is nullable. NULL is 'not observed'; 0 is 'observed to be
+     * zero'. Collapsing the two is the one thing this table exists to prevent. */
+    "  input_tokens INTEGER,"
+    "  output_tokens INTEGER,"
+    "  cache_creation_tokens INTEGER,"
+    "  cache_read_tokens INTEGER,"
+    /* Provider-reported cost only, in integer micro-USD. Atlas never estimates
+     * a price from token counts: an estimate that reads like a measurement is
+     * worse than an absent one. Integer because a total summed in floating
+     * point is not reproducible. */
+    "  cost_micro_usd INTEGER,"
+    "  duration_ms INTEGER,"
+    "  api_duration_ms INTEGER,"
+    "  turns INTEGER,"
+    /* What Atlas decided the worker's exit was, carried beside the measurement
+     * so a reader can tell a cheap success from a cheap crash. */
+    "  exit_kind TEXT NOT NULL DEFAULT 'UNKNOWN',"
+    /* Where the numbers came from, so a later source can be told apart from
+     * this one rather than silently mixed with it. */
+    "  source TEXT NOT NULL DEFAULT 'claude-stream-result',"
+    "  created_at TEXT NOT NULL,"
+    "  digest TEXT NOT NULL DEFAULT ''"
+    ");"
+    "CREATE INDEX idx_orch_usage_run ON orch_usage(run_uid, id);"
+    "CREATE INDEX idx_orch_usage_job ON orch_usage(job_id, attempt_no);";
+
+static const char *const M22_STATEMENTS[] = {M22_USAGE, NULL};
+
 static const atlas_migration MIGRATIONS[] = {
     {1, "initial schema", M1_STATEMENTS, false},
     {2, "worktree identity", M2_STATEMENTS, false},
@@ -3815,6 +3888,7 @@ static const atlas_migration MIGRATIONS[] = {
      * empty `run_uid` and belongs to no run, because a parentless historical
      * job is not evidence that somebody intended a run. See the M21 comment. */
     {21, "the durable single-worker run, and one active task within it", M21_STATEMENTS, false},
+    {22, "what a worker attempt cost, per attempt and never estimated", M22_STATEMENTS, false},
 };
 
 const atlas_migration *atlas_migrations(size_t *count_out) {

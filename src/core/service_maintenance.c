@@ -233,6 +233,13 @@ static const retention_entry RETENTION[] = {
      "one row per execution attempt, holding the dispatcher that took it and how it ended; "
      "attempt numbers are monotonic per job and a missing row would make a later attempt look "
      "like an earlier one"},
+    {"orch_usage", ATLAS_RETAIN_CANONICAL, false,
+     "what one attempt cost, observed once from the worker's final record and never recomputable "
+     "afterwards: the stream it was read from is not retained, the worker log carrying a second "
+     "copy is dropped above the inline ceiling, and the model would have to be run again to "
+     "produce the numbers a second time; pruning by age would also make an experiment's older "
+     "arm look cheaper than its newer one, which is the one comparison this table exists to make "
+     "honest"},
     {"orch_leases", ATLAS_RETAIN_CANONICAL, false,
      "which attempt held the exclusive right to execute a job, and until when; the partial unique "
      "index over unreleased leases is what makes concurrent execution impossible, and a deleted "

@@ -47,6 +47,7 @@
 #include "atlas/driver.h"
 #include "atlas/ipc.h"
 #include "atlas/orch_ops.h"
+#include "atlas/orch_usage.h"
 #include "atlas/rundriver.h"
 #include "atlas_test.h"
 #include "db/db_internal.h"
@@ -1143,7 +1144,112 @@ static void test_the_same_completion_cannot_be_applied_twice(void) {
     env_close(&e);
 }
 
+/* --- A10.0: the cost row, written once and never invented ------------------ */
+
+/* The `fake-repo` driver streams nothing, so it reports no usage — and that is
+ * the case worth pinning first. A completion with nothing to measure still
+ * writes a row, and the row says UNKNOWN rather than leaving a reader to guess
+ * whether the attempt was free or unobserved. */
+static void test_an_attempt_with_no_stream_records_unknown_usage(void) {
+    env e;
+    env_open(&e);
+    atlas_buf run = ATLAS_BUF_INIT, job = ATLAS_BUF_INIT;
+    start_run(&e, "write the thing", "pass", &run, &job);
+
+    atlas_rundriver_report rep;
+    drive(&e, atlas_buf_cstr(&run), 1, &rep);
+
+    T_EQ_INT((int)count_sql(e.db, "SELECT count(*) FROM orch_usage;"), 1);
+    T_EQ_INT((int)count_sql(e.db, "SELECT count(*) FROM orch_usage WHERE status = 'UNKNOWN';"),
+             1);
+    /* Not observed is stored as not observed. A zero here would be a claim. */
+    T_EQ_INT((int)count_sql(e.db,
+                            "SELECT count(*) FROM orch_usage WHERE input_tokens IS NULL"
+                            "  AND output_tokens IS NULL AND cost_micro_usd IS NULL;"),
+             1);
+    /* And it is bound to the attempt it describes, not to the job in general. */
+    T_EQ_INT((int)count_sql(e.db,
+                            "SELECT count(*) FROM orch_usage u JOIN orch_attempts a"
+                            "  ON a.id = u.attempt_id WHERE u.attempt_no = a.attempt_no;"),
+             1);
+
+    atlas_rundriver_report_free(&rep);
+    atlas_buf_free(&run);
+    atlas_buf_free(&job);
+    env_close(&e);
+}
+
+/* A completion offered twice writes one row. The guarantee is the schema's —
+ * `UNIQUE(attempt_id)` — rather than a check somebody has to remember, which is
+ * what makes redelivery through a BUSY window safe rather than merely usual. */
+static void test_a_repeated_completion_writes_one_usage_row(void) {
+    env e;
+    env_open(&e);
+    atlas_buf run = ATLAS_BUF_INIT, job = ATLAS_BUF_INIT;
+    start_run(&e, "write the thing", "pass", &run, &job);
+
+    atlas_rundriver_report rep;
+    drive(&e, atlas_buf_cstr(&run), 1, &rep);
+    int64_t rows = count_sql(e.db, "SELECT count(*) FROM orch_usage;");
+    T_EQ_INT((int)rows, 1);
+
+    /* Driving the settled run again claims nothing and completes nothing, and
+     * the row count is what proves no second measurement was recorded. */
+    atlas_rundriver_report rep2;
+    drive(&e, atlas_buf_cstr(&run), 1, &rep2);
+    T_EQ_INT((int)count_sql(e.db, "SELECT count(*) FROM orch_usage;"), (int)rows);
+
+    atlas_rundriver_report_free(&rep2);
+    atlas_rundriver_report_free(&rep);
+    atlas_buf_free(&run);
+    atlas_buf_free(&job);
+    env_close(&e);
+}
+
+/* The row is in the database, so it is there after a restart for the same
+ * reason every other orchestration fact is: nothing about it lives in a process.
+ * A run total is derived from the rows on every read rather than cached, so the
+ * two readings cannot drift apart. */
+static void test_usage_survives_a_restart_and_totals_the_same(void) {
+    env e;
+    env_open(&e);
+    atlas_buf run = ATLAS_BUF_INIT, job = ATLAS_BUF_INIT;
+    start_run(&e, "write the thing", "pass", &run, &job);
+    atlas_rundriver_report rep;
+    drive(&e, atlas_buf_cstr(&run), 1, &rep);
+
+    atlas_err err;
+    atlas_err_init(&err);
+    atlas_usage_run before;
+    T_OK(atlas_db_orch_run_usage(e.db, atlas_buf_cstr(&run), &before, &err), &err);
+
+    env_restart(&e);
+
+    atlas_usage_run after;
+    T_OK(atlas_db_orch_run_usage(e.db, atlas_buf_cstr(&run), &after, &err), &err);
+    T_CHECK(after.status == before.status);
+    T_EQ_INT((int)after.attempts_started, (int)before.attempts_started);
+    T_EQ_INT((int)after.attempts_missing_usage, (int)before.attempts_missing_usage);
+
+    /* One attempt, and nothing measured about it, so the run is UNKNOWN — the
+     * honest answer for a driver that streams nothing, and the one an
+     * experiment must not read as "this arm was free". */
+    T_CHECK(after.status == ATLAS_USAGE_UNKNOWN);
+    T_EQ_INT((int)after.attempts_started, 1);
+
+    atlas_rundriver_report_free(&rep);
+    atlas_buf_free(&run);
+    atlas_buf_free(&job);
+    env_close(&e);
+}
+
 static const atlas_test TESTS[] = {
+    {"an_attempt_with_no_stream_records_unknown_usage",
+     test_an_attempt_with_no_stream_records_unknown_usage},
+    {"a_repeated_completion_writes_one_usage_row",
+     test_a_repeated_completion_writes_one_usage_row},
+    {"usage_survives_a_restart_and_totals_the_same",
+     test_usage_survives_a_restart_and_totals_the_same},
     {"a_refused_completion_leaves_the_result_on_disk",
      test_a_refused_completion_leaves_the_result_on_disk},
     {"an_accepted_completion_clears_the_spool", test_an_accepted_completion_clears_the_spool},

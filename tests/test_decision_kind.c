@@ -341,6 +341,11 @@ static void wind_back_to_schema_12(env *e, atlas_err *err) {
          * the case below could not reach migration 13's assertions at all. It is
          * the cost of the discipline the comment above states — a new table
          * means a line here — being obeyed by hand. */
+        /* A10.0's per-attempt cost, added by migration 22, for the same reason
+         * and added at the same time as the migration rather than after a
+         * full-suite run found it missing — which is exactly how the line above
+         * came to be written. */
+        "DROP TABLE orch_usage;"
         "DROP TABLE orch_runs;"
         "DROP INDEX idx_orch_jobs_one_active_per_run;"
         "DROP INDEX idx_orch_jobs_run;"

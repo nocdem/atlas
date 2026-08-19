@@ -742,6 +742,62 @@ static atlas_status method_run_get(dispatch_state *ds, const atlas_ipc_request *
                                     atlas_orch_state_name(rv.active_state), err);
         }
     }
+
+    /* A10.0. What the run cost, derived from its attempts on every read.
+     *
+     * `usage_status` is always emitted, including when it is UNKNOWN, because
+     * an absent status and a status of UNKNOWN would otherwise be the same
+     * document — and one of those means "this daemon does not report usage"
+     * while the other means "this run's cost was never observed". A count is
+     * emitted only when it is part of a total the reader may rely on; a
+     * `cost_known_micro_usd` appears beside `cost_complete` and never under a
+     * name claiming to be the whole. */
+    if (st == ATLAS_OK) {
+        atlas_usage_run ru;
+        if (atlas_db_orch_run_usage(ds->db, rv.run_uid, &ru, err) != ATLAS_OK) {
+            atlas_err_init(err);
+            atlas_usage_run_init(&ru);
+        }
+        st = atlas_json_key_str(ds->j, "usage_status", atlas_usage_status_name(ru.status), err);
+        const struct {
+            const char *k;
+            int64_t v;
+        } U[] = {
+            {"usage_attempts_started", ru.attempts_started},
+            {"usage_attempts_measured", ru.attempts_with_usage},
+            {"usage_attempts_missing", ru.attempts_missing_usage},
+            {"usage_worker_starts", ru.worker_starts},
+        };
+        for (size_t i = 0; st == ATLAS_OK && i < sizeof U / sizeof U[0]; i++) {
+            st = atlas_json_key_int(ds->j, U[i].k, U[i].v, err);
+        }
+        if (st == ATLAS_OK && ru.status != ATLAS_USAGE_UNKNOWN) {
+            const struct {
+                const char *k;
+                int64_t v;
+            } T[] = {
+                {"usage_input_tokens", ru.input_tokens},
+                {"usage_output_tokens", ru.output_tokens},
+                {"usage_cache_creation_tokens", ru.cache_creation_tokens},
+                {"usage_cache_read_tokens", ru.cache_read_tokens},
+                {"usage_worker_duration_ms", ru.worker_duration_ms},
+                {"usage_turns", ru.turns},
+            };
+            for (size_t i = 0; st == ATLAS_OK && i < sizeof T / sizeof T[0]; i++) {
+                st = atlas_json_key_int(ds->j, T[i].k, T[i].v, err);
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_bool(ds->j, "usage_tokens_complete", ru.tokens_complete, err);
+            }
+            if (st == ATLAS_OK && ru.has_any_cost) {
+                st = atlas_json_key_int(ds->j, "usage_cost_known_micro_usd",
+                                        ru.cost_known_micro_usd, err);
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_bool(ds->j, "usage_cost_complete", ru.cost_complete, err);
+            }
+        }
+    }
     return st;
 }
 

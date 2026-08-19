@@ -745,6 +745,16 @@ atlas_status atlas_orch_validations_decode(const char *text, atlas_orch_argv *v,
     return ATLAS_OK;
 }
 
+atlas_status atlas_orch_validation_wire_decode(const char *enc, atlas_orch_argv *out,
+                                               atlas_err *err) {
+    size_t got = 0;
+    atlas_status st = atlas_orch_validations_decode(enc, out, 1u, &got, err);
+    if (st == ATLAS_OK && got != 1u) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "a gate must encode exactly one command");
+    }
+    return st;
+}
+
 /* --- the canonical digest --------------------------------------------------
  *
  * Domain-separated and length-prefixed, never delimited. Every field is fed as

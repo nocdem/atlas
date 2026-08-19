@@ -250,13 +250,23 @@ static atlas_status method_job_submit(dispatch_state *ds, const atlas_ipc_reques
     }
 
     /* A validation command arrives as a *length-prefixed argv encoding*, one
-     * string per command — `4:make,4:test,` — and never as a shell string.
+     * string per command — `1:2:4:make,4:test,` — and never as a shell string.
      *
      * That is the same canonical encoding the database stores, so there is one
      * encoding in the system rather than a wire form and a storage form that can
      * disagree. It is also the point at which "A8 never passes untrusted text to
      * a shell" stops being a promise: there is no field here that could hold a
-     * shell fragment, because a command is a vector of counted arguments. */
+     * shell fragment, because a command is a vector of counted arguments.
+     *
+     * The element is decoded exactly as it arrived. It used to be wrapped in a
+     * further `1:` first, which made the claim above false: the sender already
+     * writes the leading count, so the wrapper made the decoder read that count
+     * as the argument count and the whole of `2:4:make,` as one argument. Every
+     * gate submitted through the CLI reached the database as a single argument
+     * holding a fragment of its own encoding — `make --target x` stored as the
+     * one-element vector `["2:make"]` — which no allowlist could pass. It
+     * survived because every A11 test builds the op in process and none of them
+     * travelled this path. `tests/test_orch_validation_wire.c` now does. */
     if (st == ATLAS_OK) {
         const atlas_ipc_array *arr = NULL;
         if (atlas_ipc_param_array(req, "validation", &arr)) {
@@ -272,27 +282,17 @@ static atlas_status method_job_submit(dispatch_state *ds, const atlas_ipc_reques
                     st = atlas_err_set(err, ATLAS_ERR_USAGE, "validation %zu is not a string", i);
                     break;
                 }
-                atlas_buf one = ATLAS_BUF_INIT;
-                st = atlas_buf_appendf(&one, err, "1:%s", enc);
+                atlas_orch_argv tmp[1];
+                atlas_orch_argv_init(&tmp[0]);
+                st = atlas_orch_validation_wire_decode(enc, tmp, err);
                 if (st == ATLAS_OK) {
-                    atlas_orch_argv tmp[1];
-                    atlas_orch_argv_init(&tmp[0]);
-                    size_t got = 0;
-                    st = atlas_orch_validations_decode(atlas_buf_cstr(&one), tmp, 1u, &got, err);
-                    if (st == ATLAS_OK && got == 1u) {
-                        for (size_t k = 0; st == ATLAS_OK && k < tmp[0].count; k++) {
-                            st = atlas_orch_argv_push(&op->spec.validations[i],
-                                                      tmp[0].args[k].data, tmp[0].args[k].len,
-                                                      err);
-                        }
-                        op->spec.validation_count = i + 1u;
-                    } else if (st == ATLAS_OK) {
-                        st = atlas_err_set(err, ATLAS_ERR_USAGE,
-                                           "validation %zu is not a length-prefixed argv", i);
+                    for (size_t k = 0; st == ATLAS_OK && k < tmp[0].count; k++) {
+                        st = atlas_orch_argv_push(&op->spec.validations[i], tmp[0].args[k].data,
+                                                  tmp[0].args[k].len, err);
                     }
-                    atlas_orch_argv_free(&tmp[0]);
+                    op->spec.validation_count = i + 1u;
                 }
-                atlas_buf_free(&one);
+                atlas_orch_argv_free(&tmp[0]);
             }
         }
     }

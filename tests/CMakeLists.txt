@@ -137,6 +137,7 @@ set(ATLAS_TESTS
   test_orch_lifecycle
   test_orch_run
   test_a11_run
+  test_orch_validation_wire
   test_orch_rpc
   test_orch_workspace
   test_orch_driver
@@ -301,6 +302,7 @@ set_tests_properties(test_a71_syspolicy PROPERTIES LABELS "daemon" TIMEOUT 900 R
 # policy loader are pure functions and real filesystem shapes, so this suite
 # needs no repository, no database and no daemon: it belongs in the fast subset.
 set_tests_properties(test_orch_model PROPERTIES LABELS "unit")
+set_tests_properties(test_orch_validation_wire PROPERTIES LABELS "unit")
 # The lifecycle suite builds a real fixture repository, registers it through the
 # CLI and drives the one write point against an isolated database, so it is an
 # integration test. It sleeps for nothing: expiry and deadlines are supplied.

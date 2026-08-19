@@ -436,6 +436,20 @@ atlas_status atlas_orch_validations_encode(const atlas_orch_argv *v, size_t coun
 atlas_status atlas_orch_validations_decode(const char *text, atlas_orch_argv *v, size_t cap,
                                            size_t *count_out, atlas_err *err);
 
+/* One gate as it travels from a client to the daemon: the canonical encoding of
+ * a *single* command, `1:<argc>:<len>:<arg>,...`, byte for byte what the sender
+ * wrote and what the database will store.
+ *
+ * This exists so the wire form has one reader. The daemon used to inline the
+ * decode and wrap the element in a second count first, which made the sender's
+ * count read as an argument count; a multi-word gate was reduced to a fragment
+ * of its own encoding and stored, and a gate whose digits did not line up was
+ * refused as malformed. Both faces of that are asserted in
+ * `tests/test_orch_validation_wire.c`, which is the only reason a caller should
+ * prefer this over calling the plural form with a capacity of one. */
+atlas_status atlas_orch_validation_wire_decode(const char *enc, atlas_orch_argv *out,
+                                               atlas_err *err);
+
 /* True when `path` is a safe repository-relative prefix: not absolute, no `..`
  * component, no `.` component, no NUL, no backslash, no leading or embedded
  * whitespace-only component, and printable. The one place this question is

@@ -120,6 +120,7 @@ void atlas_orch_result_init(atlas_orch_result *r) {
     atlas_buf_init(&r->allowed_paths);
     atlas_buf_init(&r->validations);
     atlas_buf_init(&r->follow_up_job_uid);
+    atlas_buf_init(&r->memory_package);
 }
 
 void atlas_orch_result_free(atlas_orch_result *r) {
@@ -138,6 +139,7 @@ void atlas_orch_result_free(atlas_orch_result *r) {
     atlas_buf_free(&r->allowed_paths);
     atlas_buf_free(&r->validations);
     atlas_buf_free(&r->follow_up_job_uid);
+    atlas_buf_free(&r->memory_package);
 }
 
 /* --- the job row ----------------------------------------------------------- */
@@ -716,8 +718,8 @@ static atlas_status run_active_job(atlas_db *db, const char *run_uid, char out[A
  * joins its parent's, and every one of the four conditions below is a refusal
  * rather than a repair. */
 static atlas_status submit_resolve_run(atlas_db *db, const atlas_orch_spec *s, const char *job_uid,
-                                       int64_t created_ms, atlas_buf *run_uid_out,
-                                       atlas_err *err) {
+                                       int64_t created_ms, atlas_orch_memory_mode mode,
+                                       int64_t repo_id, atlas_buf *run_uid_out, atlas_err *err) {
     if (s->parent_job_uid.len == 0) {
         atlas_status st = atlas_orch_new_run_uid(run_uid_out, err);
         if (st != ATLAS_OK) {
@@ -743,6 +745,26 @@ static atlas_status submit_resolve_run(atlas_db *db, const atlas_orch_spec *s, c
             st = atlas_db_step_done(db, q, err);
         } else {
             atlas_db_finish(db, q);
+        }
+        /* A10.1. The memory manifest is frozen here, in the transaction that
+         * creates the run and before any task in it can be leased. Two things
+         * follow, and both are the point:
+         *
+         *   - A submission that lands later cannot change what an already
+         *     created run will be shown, because the package is already bytes.
+         *   - A run that is still ACTIVE is not a candidate for any other run's
+         *     package, so two arms of a comparison created before either runs
+         *     cannot see each other however they are ordered afterwards.
+         *
+         * A follow-up task takes the branch below instead and freezes nothing:
+         * it inherits its parent's run, and therefore its parent's package. */
+        if (st == ATLAS_OK) {
+            atlas_orch_memory_package pkg;
+            atlas_orch_memory_package_init(&pkg);
+            st = atlas_db_orch_memory_freeze(db, atlas_buf_cstr(run_uid_out), mode, repo_id,
+                                             atlas_buf_cstr(&s->task_text),
+                                             atlas_buf_cstr(&s->source_commit), &pkg, err);
+            atlas_orch_memory_package_free(&pkg);
         }
         return st;
     }
@@ -920,7 +942,13 @@ static atlas_status op_submit(atlas_db *db, const atlas_orch_op *op, atlas_orch_
          * whole submission: a job whose run could not be settled is not stored
          * without one. */
         st = submit_resolve_run(db, s, atlas_buf_cstr(&uid), op->now_ms > 0 ? op->now_ms : now_ms(),
-                                &run_uid, err);
+                                /* UNKNOWN is the zero and is read as OFF. A default that
+                                 * quietly enabled memory is the one mistake this milestone
+                                 * cannot make. */
+                                op->memory_mode == ATLAS_ORCH_MEMORY_MODE_BOUNDED
+                                    ? ATLAS_ORCH_MEMORY_MODE_BOUNDED
+                                    : ATLAS_ORCH_MEMORY_MODE_OFF,
+                                op->repo_id, &run_uid, err);
     }
     if (st != ATLAS_OK) {
         goto done;
@@ -1467,6 +1495,26 @@ static atlas_status op_lease(atlas_db *db, const atlas_orch_op *op, atlas_orch_r
             }
             atlas_db_finish(db, q);
         }
+    }
+    /* A10.1. The run's frozen memory package, read in the same transaction as
+     * the grant so that the bytes and the attempt they belong to are settled
+     * together. A job that belongs to no run, or a run with no manifest, leaves
+     * this empty — which is what every job submitted before migration 23 does,
+     * and it is the conservative answer rather than an error. */
+    if (s == ATLAS_OK && j.run_uid[0] != '\0') {
+        atlas_orch_memory_package pkg;
+        atlas_orch_memory_package_init(&pkg);
+        bool have = false;
+        atlas_orch_memory_mode mm = ATLAS_ORCH_MEMORY_MODE_UNKNOWN;
+        s = atlas_db_orch_memory_get(db, j.run_uid, &pkg, &have, &mm, err);
+        if (s == ATLAS_OK && have) {
+            out->memory_mode = mm;
+            memcpy(out->memory_digest, pkg.digest, sizeof(out->memory_digest));
+            if (mm == ATLAS_ORCH_MEMORY_MODE_BOUNDED) {
+                s = atlas_buf_set(&out->memory_package, pkg.package.data, pkg.package.len, err);
+            }
+        }
+        atlas_orch_memory_package_free(&pkg);
     }
 
 fail:

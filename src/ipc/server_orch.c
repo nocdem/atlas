@@ -255,6 +255,29 @@ static atlas_status method_job_submit(dispatch_state *ds, const atlas_ipc_reques
         st = atlas_buf_set_str(&op->spec.parent_job_uid, parent, err);
     }
 
+    /* A10.1. The cross-run memory mode.
+     *
+     * Absent means OFF, and an unrecognised spelling is an error rather than a
+     * value that is skipped — the A7.1 rule for a policy key, applied here for
+     * the same reason: a caller who believes they configured something Atlas
+     * never read is worse off than one who was refused.
+     *
+     * This is `job.submit`, which is in the submitter group and reachable only
+     * by a uid the root-owned policy names. There is no MCP tool and no gateway
+     * route that reaches this method, so a model payload has no surface on
+     * which to turn memory on, turn it off, or name a source. */
+    if (st == ATLAS_OK) {
+        const char *mem = NULL;
+        if (atlas_ipc_param_str(req, "memory", &mem) && mem != NULL && mem[0] != '\0') {
+            if (!atlas_orch_memory_mode_parse(mem, &op->memory_mode)) {
+                st = atlas_err_set(err, ATLAS_ERR_USAGE,
+                                   "cross-run memory is off or bounded, and nothing else");
+            }
+        } else {
+            op->memory_mode = ATLAS_ORCH_MEMORY_MODE_OFF;
+        }
+    }
+
     /* The one aggregate the protocol accepts is an array of strings, so the
      * declared path set arrives as one directly. */
     if (st == ATLAS_OK) {
@@ -798,6 +821,67 @@ static atlas_status method_run_get(dispatch_state *ds, const atlas_ipc_request *
             }
         }
     }
+
+    /* A10.1. What this run was shown of earlier runs, from the frozen manifest.
+     *
+     * Additive, and every key is absent for a run created before migration 23 —
+     * which is the honest answer for a run that was never part of a memory arm,
+     * and is not the same as a run that ran with memory OFF. A newer CLI
+     * against an older daemon reads no keys and reports UNKNOWN, following
+     * A9.2.5's rule for an absent key.
+     *
+     * The package's *bytes* are deliberately not emitted here. This is a status
+     * read, the package is up to twelve kibibytes of untrusted historical
+     * output, and a reader who wants to know what a worker was shown is asking
+     * a different question than a reader checking that two arms differed. The
+     * digest is what makes the second question answerable. */
+    if (st == ATLAS_OK) {
+        atlas_orch_memory_package pkg;
+        atlas_orch_memory_package_init(&pkg);
+        bool have = false;
+        atlas_orch_memory_mode mm = ATLAS_ORCH_MEMORY_MODE_UNKNOWN;
+        if (atlas_db_orch_memory_get(ds->db, rv.run_uid, &pkg, &have, &mm, err) != ATLAS_OK) {
+            atlas_err_init(err);
+            have = false;
+        }
+        if (have) {
+            st = atlas_json_key_str(ds->j, "memory_mode", atlas_orch_memory_mode_name(mm), err);
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_str(ds->j, "memory_package_status",
+                                        atlas_orch_memory_status_name(pkg.status), err);
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_str(ds->j, "memory_package_digest", pkg.digest, err);
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_int(ds->j, "memory_package_bytes", (int64_t)pkg.bytes, err);
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_int(ds->j, "memory_source_count", (int64_t)pkg.source_count,
+                                        err);
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_bool(ds->j, "memory_candidates_truncated",
+                                         pkg.candidates_truncated, err);
+            }
+            /* The selected run identifiers, as an array. Atlas-chosen values —
+             * a run uid is 'r' plus 32 hex — so there is nothing untrusted to
+             * encode here and nothing a caller supplied. */
+            if (st == ATLAS_OK && pkg.source_count > 0) {
+                st = atlas_json_key(ds->j, "memory_sources", err);
+                if (st == ATLAS_OK) {
+                    st = atlas_json_arr_begin(ds->j, err);
+                }
+                for (size_t i = 0; st == ATLAS_OK && i < pkg.source_count; i++) {
+                    st = atlas_json_str(ds->j, pkg.sources[i], err);
+                }
+                if (st == ATLAS_OK) {
+                    st = atlas_json_arr_end(ds->j, err);
+                }
+            }
+        }
+        atlas_orch_memory_package_free(&pkg);
+    }
     return st;
 }
 
@@ -907,6 +991,28 @@ static atlas_status method_dispatch_lease(dispatch_state *ds, const atlas_ipc_re
         }
         if (st == ATLAS_OK) {
             st = atlas_json_key_str(ds->j, "task", atlas_buf_cstr(&r.task_text), err);
+        }
+        /* A10.1. The run's frozen memory package, and what it is. The mode and
+         * the digest are always present when the run has a manifest; the bytes
+         * only when the mode is BOUNDED, so an OFF arm carries none of it over
+         * the wire at all rather than carrying an empty field.
+         *
+         * Labelled exactly as the task is, and for the same reason: the
+         * dispatcher needs the bytes, and the label is what tells it how to
+         * treat them. Nothing inside is parsed here or anywhere else. */
+        if (st == ATLAS_OK && r.memory_mode != ATLAS_ORCH_MEMORY_MODE_UNKNOWN) {
+            st = atlas_json_key_str(ds->j, "memory_mode",
+                                    atlas_orch_memory_mode_name(r.memory_mode), err);
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_str(ds->j, "memory_digest", r.memory_digest, err);
+            }
+            if (st == ATLAS_OK && r.memory_package.len > 0) {
+                st = atlas_json_key_str(ds->j, "memory_provenance",
+                                        "UNTRUSTED_HISTORICAL_OUTPUT", err);
+            }
+            if (st == ATLAS_OK && r.memory_package.len > 0) {
+                st = atlas_json_key_str(ds->j, "memory", atlas_buf_cstr(&r.memory_package), err);
+            }
         }
     }
     atlas_orch_result_free(&r);

@@ -286,10 +286,12 @@ add_library(atlas_core STATIC
   src/orch/validate.c
   src/orch/rundriver.c
   src/orch/usage.c
+  src/orch/memory.c
   src/orch/dispatch.c
   src/orch/snapshot.c
   src/core/service_orch.c
   src/db/db_orch.c
+  src/db/db_orch_memory.c
   src/ipc/server_orch.c
   # --- A9: remote access, API credentials and the web control plane -------
   #

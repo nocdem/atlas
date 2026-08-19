@@ -14,6 +14,7 @@
  */
 #define _GNU_SOURCE 1
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -159,6 +160,9 @@ static atlas_status build_submit(atlas_json *j, void *ud, atlas_err *err) {
         {"driver", o->driver},
         {"idempotency_key", o->idempotency_key},
         {"correlation", o->correlation},
+        /* A10.1. Absent means off at the daemon, so an empty value is simply
+         * not sent rather than sent as "off" — one spelling of the default. */
+        {"memory", o->memory},
     };
     for (size_t i = 0; st == ATLAS_OK && i < sizeof opt / sizeof opt[0]; i++) {
         if (opt[i].v != NULL && opt[i].v[0] != '\0') {
@@ -653,11 +657,23 @@ static atlas_status xport_apply(void *ud, const atlas_orch_op *op, atlas_orch_re
             {&out->mode, "mode"},          {&out->driver, "driver"},
             {&out->task_text, "task"},     {&out->validations, "validations"},
             {&out->run_uid, "run"},        {&out->follow_up_job_uid, "follow_up"},
+            {&out->memory_package, "memory"},
         };
         for (size_t i = 0; st == ATLAS_OK && i < sizeof strs / sizeof strs[0]; i++) {
             if (atlas_ipc_result_str(resp, strs[i].key, &v) && v != NULL) {
                 st = atlas_buf_set_str(strs[i].dst, v, err);
             }
+        }
+        /* A10.1. An unrecognised or absent mode leaves UNKNOWN, and an absent
+         * package leaves empty. An older daemon answering a newer CLI therefore
+         * produces a run with no memory rather than an error — A9.2.5's rule for
+         * an absent key, and the conservative value in this direction is "the
+         * worker was shown nothing". */
+        if (st == ATLAS_OK && atlas_ipc_result_str(resp, "memory_mode", &v) && v != NULL) {
+            (void)atlas_orch_memory_mode_parse(v, &out->memory_mode);
+        }
+        if (st == ATLAS_OK && atlas_ipc_result_str(resp, "memory_digest", &v) && v != NULL) {
+            (void)snprintf(out->memory_digest, sizeof out->memory_digest, "%s", v);
         }
         if (st == ATLAS_OK && atlas_ipc_result_str(resp, "state", &v) && v != NULL) {
             (void)atlas_orch_state_parse(v, &out->state);
@@ -800,6 +816,33 @@ atlas_status atlas_service_job_run_status(atlas_ctx *ctx, const char *run, atlas
         if (atlas_ipc_result_bool(resp, "usage_cost_complete", &b)) {
             jr.usage.cost_complete = b;
         }
+        /* A10.1. The memory block, present only for a run that has a frozen
+         * manifest. `memory_present` is what a renderer branches on, so a run
+         * from before migration 23 prints nothing rather than printing OFF —
+         * "this run was never part of a memory arm" and "this run ran with
+         * memory off" are different facts and must not share a line. */
+        if (atlas_ipc_result_str(resp, "memory_mode", &jr.memory_mode) &&
+            jr.memory_mode != NULL) {
+            jr.memory_present = true;
+            (void)atlas_ipc_result_str(resp, "memory_package_status",
+                                       &jr.memory_package_status);
+            (void)atlas_ipc_result_str(resp, "memory_package_digest",
+                                       &jr.memory_package_digest);
+            (void)atlas_ipc_result_int(resp, "memory_source_count", &jr.memory_source_count);
+            (void)atlas_ipc_result_int(resp, "memory_package_bytes", &jr.memory_package_bytes);
+            if (atlas_ipc_result_bool(resp, "memory_candidates_truncated", &b)) {
+                jr.memory_candidates_truncated = b;
+            }
+            size_t n = 0;
+            if (atlas_ipc_result_arr_len(resp, "memory_sources", &n)) {
+                for (size_t i = 0; i < n && i < 3u; i++) {
+                    const char *sv = NULL;
+                    if (atlas_ipc_result_arr_str(resp, "memory_sources", i, &sv) && sv != NULL) {
+                        jr.memory_sources[jr.memory_source_listed++] = sv;
+                    }
+                }
+            }
+        }
         st = sink(&jr, ud, err);
     }
     atlas_ipc_response_free(resp);
@@ -814,6 +857,15 @@ atlas_status atlas_service_job_run(atlas_ctx *ctx, const atlas_job_run_opts *o,
                       o->task[0] == '\0')) {
         return atlas_err_set(err, ATLAS_ERR_USAGE,
                              "atlas job run needs --repo and --task, or --resume RUN");
+    }
+    if (resuming && o->memory != NULL && o->memory[0] != '\0') {
+        /* A10.1. Refused rather than ignored. The package is frozen against the
+         * run at the moment it was created, so a resume cannot change what the
+         * worker is shown — and a flag that is silently dropped reads, in a
+         * transcript of an experiment, exactly like one that was honoured. */
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "--memory applies when a run is created; the package a run was "
+                             "frozen with cannot be changed by resuming it");
     }
     if (resuming && (o->repo != NULL || o->task != NULL)) {
         /* Refused rather than silently preferring one. A caller that named both
@@ -861,6 +913,7 @@ atlas_status atlas_service_job_run(atlas_ctx *ctx, const atlas_job_run_opts *o,
         so.wall_timeout_ms = o->wall_timeout_ms;
         so.idle_timeout_ms = o->idle_timeout_ms;
         so.max_attempts = ATLAS_ORCH_RUN_MAX_WORKER_STARTS;
+        so.memory = o->memory;
         for (size_t i = 0; i < o->gate_count && i < 8u; i++) {
             so.gates[so.gate_count++] = o->gates[i];
         }

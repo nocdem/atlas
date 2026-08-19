@@ -240,6 +240,11 @@ static const retention_entry RETENTION[] = {
      "produce the numbers a second time; pruning by age would also make an experiment's older "
      "arm look cheaper than its newer one, which is the one comparison this table exists to make "
      "honest"},
+    {"orch_run_memory", ATLAS_RETAIN_CANONICAL, false,
+     "what one run's worker was shown of earlier runs, and which runs those were, frozen in the "
+     "transaction that created the run; the candidates it was rendered from move as later runs "
+     "land, so a pruned package cannot be reproduced and an arm of a comparison would stop being "
+     "able to say what it was given"},
     {"orch_leases", ATLAS_RETAIN_CANONICAL, false,
      "which attempt held the exclusive right to execute a job, and until when; the partial unique "
      "index over unreleased leases is what makes concurrent execution impossible, and a deleted "

@@ -56,8 +56,10 @@ void atlas_cli_print_help(FILE *out) {
         "\n"
         "commands:\n"
         "  job submit --repo NAME --task TEXT [--driver D] [--mode M]\n"
+        "                            [--gate CMD]... [--memory off|bounded]\n"
         "                            [--idempotency-key K] [--attempts N]\n"
         "  job run --repo NAME --task TEXT --gate CMD [--gate CMD]...\n"
+        "                            [--memory off|bounded]\n"
         "                            start one run and drive it in the foreground\n"
         "  job run --resume RUN      continue a run that already exists\n"
         "  job run-status RUN        what a run is waiting on, and how it ended\n"
@@ -520,6 +522,12 @@ static atlas_status parse_args(cli_state *st, int argc, char **argv, bool *want_
                                          "a run may declare at most 8 gates");
                 }
                 st->opts.job.gates[st->opts.job.gate_count++] = argv[++i];
+            } else if (strcmp(a, "--memory") == 0) {
+                if (i + 1 >= argc) {
+                    return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                         "--memory needs off or bounded");
+                }
+                st->opts.job.memory = argv[++i];
             } else if (strcmp(a, "--resume") == 0) {
                 if (i + 1 >= argc) {
                     return atlas_err_set(err, ATLAS_ERR_USAGE, "--resume needs a run identifier");
@@ -3201,6 +3209,17 @@ static atlas_status run_job(cli_state *st, atlas_renderer *r, int64_t limit, atl
         o.wall_timeout_ms = st->opts.job.wall_ms;
         o.idle_timeout_ms = st->opts.job.idle_ms;
         o.max_attempts = st->opts.job.attempts;
+        /* A11.5a recorded that this arm filled eight fields and dropped
+         * `gates`, so an operator watching their own `--gate` flags was told
+         * the submission declared no verification command. It is fixed here
+         * rather than left recorded because A10.1 needs it: freezing a memory
+         * package before either arm of a comparison runs means creating both
+         * runs first and driving them afterwards, and a repository-tree task
+         * with no gate cannot be created at all. */
+        for (size_t g = 0; g < st->opts.job.gate_count; g++) {
+            o.gates[o.gate_count++] = st->opts.job.gates[g];
+        }
+        o.memory = st->opts.job.memory;
         result = renderer_open(r, st->opts.json, st->out, "job submit", err);
         if (result == ATLAS_OK) {
             result = atlas_service_job_submit(NULL, &o, emit_job, &jc, err);
@@ -3234,6 +3253,7 @@ static atlas_status run_job(cli_state *st, atlas_renderer *r, int64_t limit, atl
         for (size_t g = 0; g < st->opts.job.gate_count; g++) {
             o.gates[o.gate_count++] = st->opts.job.gates[g];
         }
+        o.memory = st->opts.job.memory;
         /* The narration goes to stderr, so `--json` still puts exactly one
          * document on stdout. */
         o.log = st->opts.json ? stderr : st->out;

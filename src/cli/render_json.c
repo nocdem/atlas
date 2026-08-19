@@ -677,6 +677,46 @@ static atlas_status j_job_item(atlas_renderer *r, const atlas_job_render *jr, at
             }
         }
     }
+    if (st == ATLAS_OK && jr->memory_present) {
+        /* A10.1. The same block the human renderer prints, from the same
+         * fields: one service result, two presentations. Absent entirely for a
+         * run with no frozen manifest, which is deliberately not the same
+         * document as a run that ran with memory OFF. */
+        st = atlas_json_key_str(j, "memory_mode",
+                                jr->memory_mode != NULL ? jr->memory_mode : "UNKNOWN", err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(
+                j, "memory_package_status",
+                jr->memory_package_status != NULL ? jr->memory_package_status : "UNKNOWN", err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(
+                j, "memory_package_digest",
+                jr->memory_package_digest != NULL ? jr->memory_package_digest : "", err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_int(j, "memory_package_bytes", jr->memory_package_bytes, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_int(j, "memory_source_count", jr->memory_source_count, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_bool(j, "memory_candidates_truncated",
+                                     jr->memory_candidates_truncated, err);
+        }
+        if (st == ATLAS_OK && jr->memory_source_listed > 0) {
+            st = atlas_json_key(j, "memory_sources", err);
+            if (st == ATLAS_OK) {
+                st = atlas_json_arr_begin(j, err);
+            }
+            for (size_t i = 0; st == ATLAS_OK && i < jr->memory_source_listed; i++) {
+                st = atlas_json_str(j, jr->memory_sources[i], err);
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_arr_end(j, err);
+            }
+        }
+    }
     if (st == ATLAS_OK && jr->busy) {
         /* Present only when true, and named so it cannot be read as a verdict
          * about the run: nothing was started and nothing was written. */

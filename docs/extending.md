@@ -643,3 +643,94 @@ It is a responsiveness bound, never a correctness one: a waiter that never woke
 early would still return the right answer, just later. Lowering it wakes an idle
 daemon more often for nothing; raising it lengthens the head-of-line stall before
 a waiter notices it should stop waiting.
+
+## A10.1 — the bounded cross-run memory package
+
+### Adding a value to `atlas_orch_memory_mode`
+
+There are two, and `UNKNOWN` is the zero. Before adding a third:
+
+1. Say what it means for *a package's bytes*, not for a policy. `OFF` produces
+   no bytes; `BOUNDED` produces at most 12 KiB from at most three runs. A mode
+   that does not answer "what does a worker see" is a policy question wearing a
+   mode's name.
+2. Add it to `atlas_orch_memory_mode_name`, to `atlas_orch_memory_mode_parse`
+   and to the `CHECK(mode IN ...)` in `M23_MEMORY` — the switch has no
+   `default:`, so the first two stop compiling and the third refuses the write.
+   **Do not make `UNKNOWN` parse.** It is the zero and means "nobody filled this
+   in"; a stored manifest may never hold it.
+3. Decide what an unset operation does. Today `UNKNOWN` is read as `OFF` at the
+   write point, and a new mode must not change that: a default that quietly
+   enabled memory is the one mistake this milestone cannot make.
+4. Extend `tests/test_orch_memory.c` with the OFF/BOUNDED difference case for
+   the new mode. "Differs by exactly the package's bytes" is the property, and
+   it is the only one an A/B arm rests on.
+
+### Adding a field to a memory record
+
+Every field is either an Atlas-chosen number, a name from a checked vocabulary,
+or a bounded excerpt of untrusted text. Before adding one, answer all four:
+
+1. **Could it carry a prompt, a tool argument, a session identifier, a
+   credential or a full diff or log?** If it could, the answer is no. The
+   guarantee is that `atlas_orch_memory_cand` has no member for those, not that
+   something filters them — a filter is a thing that can be wrong.
+2. **What is its per-field ceiling, and is truncation announced?** Add an
+   `ATLAS_ORCH_MEMORY_*_MAX` beside the others and render through
+   `put_untrusted` or `put_untrusted_flat`, which truncate the *encoded* output
+   and say that they did.
+3. **Does it stay on one line?** A field that can span lines lets a past record
+   forge the separators of the ones after it. Use `put_untrusted_flat`.
+4. **Does it change the digest?** It does. Say so in the milestone's notes: a
+   package rendered by a newer Atlas will not match a digest frozen by an older
+   one, which is correct and is why the bytes are stored rather than re-derived.
+
+### Reading the memory package anywhere
+
+Don't. There is exactly one consumer and it is `atlas_orch_memory_compose`,
+called once by the run driver to append the package to a task. Nothing branches
+on its contents.
+
+That absence is the whole safety argument. The preamble labels the records and
+the encoding makes them terminal- and structure-safe, but neither makes
+printable prose model-safe — A2 is explicit about that. What makes the package
+harmless to Atlas is that no code reads it. A single `strstr` over it, anywhere,
+would end that and would not be recoverable by adding a check.
+
+### Changing which runs are candidates
+
+`atlas_orch_memory_lineage` — the object format plus the sorted ingested root
+commits, under `atlas.orch.memory.lineage.v1` — is the equivalence. Before
+widening it:
+
+1. It is **not** `repo_identity_hash` and must never be described as a half of
+   it. A4's rule stands: a path hash is not a repository identity, and
+   `repo_identity_hash` is the path-qualified fingerprint, whole.
+2. Nothing may ever be authorised, admitted or refused on the lineage value. It
+   selects hints. If a change would make it decide something, it is the wrong
+   value for that decision.
+3. A candidate whose identity resolves to no live registry row stays absent
+   rather than being matched approximately.
+
+### Changing the ordering
+
+`cand_cmp` must stay a **total** order over any input. The last level is
+`run_uid`, which is unique, and removing it would make the digest depend on the
+order rows were gathered in — which is not a property of the data. Any new level
+goes *above* `run_uid`, never below it, and
+`test_selection_is_deterministic` must still pass with the candidates reversed.
+
+### Bounds this season added
+
+| Bound | Where | Reached ⇒ |
+| --- | --- | --- |
+| three source runs per package | `ATLAS_ORCH_MEMORY_MAX_SOURCES` | later candidates are not rendered |
+| 12 KiB per package | `ATLAS_ORCH_MEMORY_MAX_BYTES` | the entry that would exceed it is not committed |
+| 64 terminal runs examined | `ATLAS_ORCH_MEMORY_MAX_CANDIDATES` | `memory_candidates_truncated` is reported true |
+| 320 bytes of a goal | `ATLAS_ORCH_MEMORY_GOAL_MAX` | the excerpt says Atlas truncated it |
+| 480 bytes of a proved failure | `ATLAS_ORCH_MEMORY_DETAIL_MAX` | the excerpt says Atlas truncated it |
+| 320 bytes of changed paths | `ATLAS_ORCH_MEMORY_FILES_MAX` | the excerpt says Atlas truncated it |
+| 256 distinct tokens per text | `TOKEN_MAX` in `src/orch/memory.c` | scoring uses the first 256; the ceiling is constant so candidates stay comparable |
+
+Every one of them is compile-time. There is no timer anywhere in this season and
+no bound derived from elapsed time.

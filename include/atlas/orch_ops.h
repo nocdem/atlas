@@ -24,6 +24,7 @@
 #include <stdint.h>
 
 #include "atlas/orch.h"
+#include "atlas/orch_memory.h"
 #include "atlas/orch_usage.h"
 
 typedef struct atlas_db atlas_db;
@@ -170,6 +171,20 @@ typedef struct atlas_orch_op {
      * `status` of `ATLAS_USAGE_UNKNOWN` — the zero, so an unset operation says
      * it — means no usable record arrived, which is not a cost of nothing. */
     atlas_usage usage;
+
+    /* A10.1. SUBMIT. Which cross-run memory mode this run is created in.
+     *
+     * On the operation and never on `atlas_orch_spec`, deliberately: adding it
+     * to the specification would move `ATLAS_ORCH_SPEC_DOMAIN`, and every
+     * `spec_digest` already stored would then mean something different than it
+     * did. It sits here beside `peer_uid` and `actor` — facts about the act of
+     * submitting rather than about the work requested — and is bound durably to
+     * the run by the manifest, which is where a reader asks what an arm did.
+     *
+     * `ATLAS_ORCH_MEMORY_MODE_UNKNOWN` — the zero, so an unset operation says
+     * it — is read as OFF at the write point. A default that quietly enabled
+     * memory would be the one mistake this milestone cannot make. */
+    atlas_orch_memory_mode memory_mode;
 } atlas_orch_op;
 
 atlas_orch_op *atlas_orch_op_new(atlas_orch_op_kind kind);
@@ -238,6 +253,18 @@ typedef struct atlas_orch_result {
     int64_t max_artifact_bytes;
     int64_t max_artifact_count;
     char spec_digest[65];
+
+    /* LEASE, A10.1. The run's frozen memory package, or empty. It is appended
+     * to the task text by the driver that starts the worker and by nothing
+     * else; no branch in Atlas reads its contents.
+     *
+     * It travels on the grant rather than being fetched separately so that the
+     * bytes a worker is shown and the attempt it is shown for are decided in
+     * one transaction — two reads could disagree across a resume, which is
+     * exactly the disagreement a frozen package exists to prevent. */
+    atlas_buf memory_package;
+    atlas_orch_memory_mode memory_mode;
+    char memory_digest[65];
 
     /* RECOVER: how many jobs each outcome applied to, for the daemon log and
      * for `atlas job recover`. */
@@ -362,6 +389,29 @@ atlas_status atlas_db_orch_run_get(atlas_db *db, const char *run_uid, atlas_orch
 atlas_status atlas_db_orch_run_set_status(atlas_db *db, const char *run_uid,
                                           atlas_orch_run_status observed,
                                           atlas_orch_run_status want, atlas_err *err);
+
+/* --- the frozen memory manifest (A10.1) -------------------------------------
+ *
+ * `freeze` is called exactly once per run, from inside the transaction that
+ * creates it, and `UNIQUE(run_uid)` means a second call fails rather than
+ * replaces. That is what makes the package immutable for the life of the run:
+ * a retry, a resume and every follow-up read the same bytes back through `get`,
+ * so an arm of a comparison cannot quietly change what it was shown.
+ *
+ * Neither has an RPC method, an MCP tool or a gateway route of its own. The
+ * mode arrives on a submission an operator made and the package leaves on a
+ * lease Atlas granted; there is no surface on which a model payload can select
+ * a source, change a mode or reach either function. That is the same shape
+ * `atlas_db_orch_run_set_status` uses, and for the same reason.
+ */
+atlas_status atlas_db_orch_memory_freeze(atlas_db *db, const char *run_uid,
+                                         atlas_orch_memory_mode mode, int64_t repo_id,
+                                         const char *task_text, const char *current_commit,
+                                         atlas_orch_memory_package *out, atlas_err *err);
+
+atlas_status atlas_db_orch_memory_get(atlas_db *db, const char *run_uid,
+                                      atlas_orch_memory_package *out, bool *found,
+                                      atlas_orch_memory_mode *mode_out, atlas_err *err);
 
 typedef struct atlas_orch_list_row {
     int64_t id;

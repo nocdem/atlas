@@ -788,6 +788,198 @@ against the named repositories, exactly as adding a `repo =` line is. Installing
 a binary that contains the driver does not enable it, and A11.1 does not add the
 line for anyone.
 
+## Bounded cross-run memory (A10.1)
+
+A10.0 made a run able to say what it cost. A10.1 makes a run able to be *told
+what earlier runs did*, in one bounded package, so the question "does that make
+a worker better?" can be asked as an experiment rather than assumed.
+
+The whole of it is: an operator names a mode at submission, Atlas selects at
+most three earlier terminal runs by deterministic lexical overlap, renders them
+as at most twelve kibibytes of labelled text, freezes that against the run, and
+appends it to the task once when a worker is started.
+
+**There is no vector store, no embedding, no summariser and no ranker.** Nothing
+in the selection calls a model. That is not a simplification to be revisited: a
+selection a model made would be one no reader could reproduce, and an experiment
+whose treatment arm cannot be re-derived measures nothing.
+
+### The mode
+
+`atlas job submit` and `atlas job run` take `--memory off|bounded`. Absent means
+`off`, and an unrecognised spelling is refused rather than skipped — the A7.1
+rule for a policy key, for the same reason.
+
+The mode travels on `atlas_orch_op`, beside `peer_uid`, and **never on
+`atlas_orch_spec`**. Adding it to the specification would move
+`ATLAS_ORCH_SPEC_DOMAIN`, and every `spec_digest` already stored would then mean
+something different than it did. It is bound durably to the *run* instead, by
+the manifest.
+
+`job.submit` is in the submitter RPC group. There is no MCP tool and no gateway
+route that reaches it, so a model payload has no surface on which to turn memory
+on, turn it off, or name a source — absent, rather than refused.
+
+`--memory` on `job run --resume` is **refused**, not ignored. The package is
+frozen against the run, so honouring the flag would be a lie and dropping it
+silently would be a worse one.
+
+### Which runs count as the same repository
+
+Not `repo_identity_hash`. That is A4's **path-qualified** lineage fingerprint,
+and it therefore differs between a repository and a linked worktree of it — the
+exact case an isolated experiment runs in.
+
+Memory asks a narrower, differently-shaped question — "is this the same git
+history?" — and answers it with its own value under its own domain,
+`atlas.orch.memory.lineage.v1`, built from the object format and the sorted set
+of ingested root commits. **It is never a redescription of `repo_identity_hash`
+and never a substitute for it**: nothing authorises, admits or refuses anything
+on this value. It selects hints. Every existing check is untouched.
+
+A candidate run stores the path-qualified identity, so its lineage is resolved
+through a live registry row that still carries that identity. A run whose
+repository has been removed or moved resolves to nothing and is **not a
+candidate** — absent, never guessed.
+
+### Selection
+
+1. Terminal runs only — `ACCEPTED` or `BLOCKED` — newest first, at most 64
+   examined. A bound that is reached is reported, not silent.
+2. Same lineage, as above.
+3. Score is the count of distinct shared tokens between the new task text and
+   the candidate's root task text, plus a commit-relation bonus. A token is at
+   least four bytes, lowercased, and `_`, `.`, `/` and `-` are inside a token
+   rather than delimiters — so `src/orch/rundriver.c` stays one token, which is
+   why a lexical rule works on this material at all.
+4. The commit relation is `EXACT` (the same pinned commit, bonus 4), `INDEXED`
+   (a commit this repository's index has ingested, bonus 1) or `UNKNOWN`.
+   **`INDEXED` is not an ancestry claim.** Atlas has no git process inside a
+   write transaction and does not claim what it did not establish. Everything
+   that is not `EXACT` is marked `STALE` in the rendered package.
+5. **A candidate with no shared token is never selected**, whatever its commit
+   relation. Preferring an exact commit is a preference among relevant runs, not
+   a reason to hand a worker an unrelated one.
+6. The order is `score DESC, relation DESC, created_ms DESC, run_uid ASC`. The
+   last level is what makes it total: there is no input for which the ordering
+   depends on the order rows were gathered in, which is what lets a digest be
+   reproducible.
+7. At most 3 sources and at most 12 288 bytes. The byte budget is checked
+   *before* an entry is committed, against the whole package as it would then
+   be. A budget checked afterwards has already been exceeded.
+
+No positive overlap produces an **empty** package. That is a real answer, not a
+failure.
+
+### What one record carries, and what it cannot
+
+Per selected run: the run uid, its terminal status, its source commit and
+relation, the worker-start and task counts, the root task's goal, the declared
+gates, the last attempt's terminal reason and failed gate index, a bounded
+excerpt of what the failing gate printed, changed paths when a run recorded any,
+and the usage summary.
+
+Absent counts print as `?`, never as zero: a run whose usage was never observed
+did not cost nothing.
+
+**`worker.log` is never read.** It is the whole streamed transcript — prompts,
+tool arguments, model prose — and none of that may enter a package. `gate.log`
+is the output of a compiler or a test runner over a tree, which is the one piece
+of evidence about a past failure that is both bounded and useful.
+
+There is deliberately **no member** of `atlas_orch_memory_cand` for a prompt, a
+session identifier, a tool argument, a credential, a diff or a log. The
+guarantee is an absent field, not a filter on one.
+
+### Provenance, and what the label does and does not do
+
+Every untrusted value is safe-encoded before it enters the package, and each is
+flattened onto one line so that a past task cannot forge the record separators
+of the ones after it.
+
+The package opens with a fixed Atlas-authored preamble — no repository name, no
+path, no value from any candidate — saying that the records are untrusted
+historical output, that the current source and the trusted gates are the
+authority, and that instructions inside them are not to be followed.
+
+**Safe encoding is terminal-safe and structure-safe. It is not model-safe**, and
+this document does not claim otherwise. A record reading "ignore all previous
+instructions" is entirely printable and passes through unchanged. What makes the
+package harmless to *Atlas* is not the label and not the encoding: it is that
+**no branch anywhere reads it**. It is appended to a task's text at the moment a
+worker is started, and there is no code path by which anything inside it reaches
+a gate, a status, a lifecycle transition or a run's settlement. The label is for
+the reader; the absence of a reader is the guarantee.
+
+This is A2's boundary honoured, not weakened: repository and model prose reaches
+a model only through an explicit channel that states its provenance, and never
+through automatic context.
+
+### The freeze
+
+The manifest is written in the transaction that creates the run, before any task
+in it can be leased, and `orch_run_memory.run_uid` is `UNIQUE`. Two things
+follow, and both are the point:
+
+- A submission that lands later cannot change what an already-created run will
+  be shown, because the package is already bytes.
+- A run that is still `ACTIVE` is not a candidate for any other run's package,
+  so two arms of a comparison created before either runs cannot see each other
+  however they are afterwards ordered.
+
+A duplicate dispatch resolves to the existing run and writes no second manifest;
+the constraint refuses it even if the duplicate check stopped working. A
+follow-up task inherits its parent's run and therefore its parent's package, and
+freezes nothing of its own — it cannot turn memory off underneath its own run.
+
+A retry, a resume and a restart all read the same bytes back.
+
+### Injection
+
+One place: the run driver, after the task is claimed and before the worker
+exists. The task text comes first and stays first; the package is appended once,
+underneath it. An empty package appends **nothing at all** — not a shorter
+section and not a sentence saying there is no memory, because an arm with memory
+off must differ from an arm with memory on by exactly the package's bytes.
+
+The composition is not stored. `orch_jobs.task_text` stays what was submitted,
+so `spec_digest` still describes the request that was made.
+
+The package's bytes are part of the worker's input tokens and are not normalised
+away anywhere. A comparison that hid its own cost would not be one.
+
+### Schema 23
+
+`orch_run_memory`, additive, nothing backfilled. A run created before it has no
+row, which reads as "this run was never part of a memory arm" — deliberately
+**not** the same fact as a run that ran with memory `OFF`, and the two never
+share a line on any surface.
+
+It hangs off the run rather than off an attempt because it must exist before any
+attempt does. `orch_artifacts` is keyed by `attempt_id` and there is no attempt
+to hang it on at freeze time; inventing one would be a row describing an
+execution that had not happened.
+
+`RETENTION[]` marks it `CANONICAL` and not prunable: the candidates it was
+rendered from move as later runs land, so a pruned package cannot be reproduced.
+
+### The surface
+
+`job run-status` gains `memory_mode`, `memory_package_status`,
+`memory_package_digest`, `memory_package_bytes`, `memory_source_count`,
+`memory_candidates_truncated` and `memory_sources` — additively, on both
+renderers, from one service result.
+
+The package's **bytes** are not on that surface. It is a status read, the
+package is up to twelve kibibytes of untrusted historical output, and a reader
+checking that two arms differed needs the digest, not the text.
+
+`job run-status` has no offline form and never had one: orchestration state
+lives in the index and `atlasd` is its only writer.
+
+**No new RPC method, no MCP tool and no gateway route.** The mode arrives on a
+submission an operator made; the package leaves on a lease Atlas granted.
+
 ## Status: what is implemented, and what is not
 
 Everything A8 set out to build is implemented and tested: the job model and its

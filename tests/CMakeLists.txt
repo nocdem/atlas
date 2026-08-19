@@ -147,6 +147,7 @@ set(ATLAS_TESTS
   test_a11_head_drift
   test_orch_validation_wire
   test_orch_usage
+  test_orch_memory
   test_orch_rpc
   test_orch_workspace
   test_orch_driver
@@ -318,6 +319,8 @@ set_tests_properties(test_orch_usage PROPERTIES LABELS "unit")
 # integration test. It sleeps for nothing: expiry and deadlines are supplied.
 set_tests_properties(test_orch_lifecycle PROPERTIES LABELS "integration")
 set_tests_properties(test_orch_run PROPERTIES LABELS "integration")
+set_tests_properties(test_orch_memory PROPERTIES LABELS "integration")
+target_compile_definitions(test_orch_memory PRIVATE ATLAS_SRC_DIR="${CMAKE_SOURCE_DIR}")
 set_tests_properties(test_a11_run PROPERTIES LABELS "integration")
 # The step 6 suite builds a real fixture repository with a second real commit,
 # drives one worker that moves HEAD onto it, and proves the gates never ran.

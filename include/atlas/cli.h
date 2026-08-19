@@ -180,6 +180,10 @@ typedef struct atlas_cli_opts {
         const char *gates[8];
         size_t gate_count;
         const char *resume;
+        /* A10.1. `--memory off|bounded`. Absent means off; the value is checked
+         * by the daemon, which refuses a spelling it does not know rather than
+         * skipping it. */
+        const char *memory;
     } job;
     /* A9.2.1. The verification-intake fields, grouped for the reason the A4
      * ones are: there are a dozen and a half of them, six subcommands use

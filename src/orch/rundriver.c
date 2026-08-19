@@ -42,6 +42,7 @@
 #include "atlas/validate.h"
 #include "atlas/ipc.h"
 #include "atlas/git.h"
+#include "atlas/orch_memory.h"
 #include "atlas/sha256.h"
 
 void atlas_rundriver_report_init(atlas_rundriver_report *r) {
@@ -112,6 +113,11 @@ typedef struct claimed {
     atlas_buf driver;
     atlas_buf task;
     atlas_buf validations;
+    /* A10.1. The run's frozen memory package, exactly as the daemon granted it.
+     * Read nowhere in this file except where it is appended to the task; no
+     * branch depends on its contents, and there is no path by which anything
+     * inside it reaches a gate, a status or a decision. */
+    atlas_buf memory;
     int64_t attempt_no;
     int64_t wall_timeout_ms;
     int64_t idle_timeout_ms;
@@ -134,6 +140,7 @@ typedef struct claimed {
 static void claimed_init(claimed *c) {
     memset(c, 0, sizeof(*c));
     atlas_buf_init(&c->job_uid);
+    atlas_buf_init(&c->memory);
     atlas_buf_init(&c->token);
     atlas_buf_init(&c->repo_root);
     atlas_buf_init(&c->commit);
@@ -157,6 +164,7 @@ static void claimed_free(claimed *c) {
     atlas_buf_free(&c->driver);
     atlas_buf_free(&c->task);
     atlas_buf_free(&c->validations);
+    atlas_buf_free(&c->memory);
 }
 
 /* One operation, retried while the daemon says it took nothing.
@@ -714,6 +722,7 @@ static atlas_status claim(const atlas_rundriver_opts *o, const atlas_orch_run_vi
             {&c->repo_root, &r.repo_root}, {&c->commit, &r.source_commit},
             {&c->mode, &r.mode},         {&c->driver, &r.driver},
             {&c->task, &r.task_text},    {&c->validations, &r.validations},
+            {&c->memory, &r.memory_package},
         };
         for (size_t i = 0; st == ATLAS_OK && i < sizeof copy / sizeof copy[0]; i++) {
             st = atlas_buf_set(copy[i].dst, copy[i].src->data, copy[i].src->len, err);
@@ -785,6 +794,11 @@ static atlas_status drive_one(const atlas_rundriver_opts *o, const atlas_orch_ru
     atlas_orch_result res;
     atlas_orch_result_init(&res);
     atlas_buf live = ATLAS_BUF_INIT;
+    /* A10.1. Declared with `live` rather than beside its use, so that every
+     * `goto done` below releases it: the refusal paths jump from inside the
+     * worker block, and a buffer declared there would be leaked by two of
+     * them and indeterminate at the label for the rest. */
+    atlas_buf composed = ATLAS_BUF_INIT;
 
     /* Step 3. Before anything is started. */
     st = phase(o, &c, ATLAS_ORCH_STATE_PREPARING, NULL, err);
@@ -813,6 +827,29 @@ static atlas_status drive_one(const atlas_rundriver_opts *o, const atlas_orch_ru
         goto done;
     }
 
+    /* A10.1. The one place a memory package is ever injected, and it happens
+     * before the worker exists.
+     *
+     * The task comes first and stays first: the operator's words, the
+     * repository's own instructions and every safety bound sit above the memory
+     * section, and the section's own preamble says so. `atlas_orch_memory_compose`
+     * appends the package once and appends nothing at all when it is empty,
+     * which is what makes a memory-off arm differ from a memory-on one by
+     * exactly the package's bytes and by nothing else.
+     *
+     * The composition is not stored. `orch_jobs.task_text` stays what was
+     * submitted, so `spec_digest` still describes the request that was made,
+     * and the package stays where a reader looks for it -- on the run. */
+    st = atlas_orch_memory_compose(atlas_buf_cstr(&c.task), atlas_buf_cstr(&c.memory), &composed,
+                                   err);
+    if (st != ATLAS_OK) {
+        goto done;
+    }
+    if (c.memory.len > 0) {
+        say(o, "the run's frozen memory package was appended to the task: %zu bytes",
+            c.memory.len);
+    }
+
     outcome x;
     outcome_init(&x);
     {
@@ -831,7 +868,7 @@ static atlas_status drive_one(const atlas_rundriver_opts *o, const atlas_orch_ru
             /* Same directory the finished result is spooled to, so one attempt's
              * evidence lives in one place and is named the same way. */
             req.progress_dir = o->spool_dir;
-            req.task = atlas_buf_cstr(&c.task);
+            req.task = atlas_buf_cstr(&composed);
             req.mode = atlas_buf_cstr(&c.mode);
             req.wall_timeout_ms = c.wall_timeout_ms;
             req.idle_timeout_ms = c.idle_timeout_ms;
@@ -898,6 +935,7 @@ done:
         }
     }
     atlas_buf_free(&live);
+    atlas_buf_free(&composed);
     atlas_orch_result_free(&res);
     claimed_free(&c);
     return st;

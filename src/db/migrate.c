@@ -3827,6 +3827,71 @@ static const char M22_USAGE[] =
 
 static const char *const M22_STATEMENTS[] = {M22_USAGE, NULL};
 
+/* --- migration 23: the frozen cross-run memory manifest ---------------------
+ *
+ * A10.1 asks whether handing a worker a bounded summary of earlier runs makes
+ * it better. To answer that with two arms, three things have to be durable and
+ * immutable: which mode the arm ran in, exactly which earlier runs it was shown,
+ * and the bytes it was shown — because a resume, a retry or a follow-up must be
+ * given the same package or the two arms stop being one comparison each.
+ *
+ * **Why a table and not an artifact.** `orch_artifacts` is keyed by
+ * `attempt_id`, and the package must exist *before* any attempt does: it is
+ * frozen in the transaction that creates the run, so that a second submission
+ * cannot change what an already-created run will be shown. There is no attempt
+ * to hang it on at that moment, and inventing one would be a row describing an
+ * execution that had not happened. So it hangs off the run, which is the thing
+ * it is a property of.
+ *
+ * `UNIQUE(run_uid)` is the freeze, and it is the whole of it. A duplicate
+ * dispatch resolves to the existing run and its insert is refused by the
+ * constraint rather than by a check — the schema is the guarantee, and the C
+ * code checks first only so the caller gets a sentence instead of a constraint
+ * violation. This is `M8_LEASES`' shape and `M21_ONE_ACTIVE`'s, for the reason
+ * both give.
+ *
+ * Additive, and nothing is backfilled. Every run that existed before this has
+ * no row, which reads as "this run was not part of a memory arm" — the truth.
+ * Writing `OFF` for them would be inventing an intent nobody expressed, which
+ * is migration 19's mistake and is not repeated here.
+ *
+ * `mode` and `status` omit 'UNKNOWN' from their CHECKs for the reason every
+ * state column in this schema does: UNKNOWN is the zero of its enum and means
+ * "nobody filled this in", so a persisted manifest may never hold it.
+ *
+ * The package bytes are stored. They are bounded at 12 KiB by
+ * ATLAS_ORCH_MEMORY_MAX_BYTES and they are the only copy: the candidates they
+ * were rendered from keep changing as later runs land, so a package that was
+ * not kept could not be reproduced, and a manifest listing sources without the
+ * text it produced would not answer "what was this worker actually shown".
+ */
+static const char M23_MEMORY[] =
+    "CREATE TABLE orch_run_memory ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    /* One manifest per run. The constraint is the freeze. */
+    "  run_uid TEXT NOT NULL UNIQUE,"
+    /* Chosen by the operator at submission and carried on the operation, never
+     * on the specification: `ATLAS_ORCH_SPEC_DOMAIN` did not move, so every
+     * `spec_digest` already stored still means exactly what it did. */
+    "  mode TEXT NOT NULL CHECK(mode IN ('OFF','BOUNDED')),"
+    "  status TEXT NOT NULL CHECK(status IN ('EMPTY','PRESENT')),"
+    "  digest TEXT NOT NULL DEFAULT '',"
+    "  bytes INTEGER NOT NULL DEFAULT 0,"
+    "  source_count INTEGER NOT NULL DEFAULT 0,"
+    /* Netstring-encoded: run uid, run status, source commit, commit relation,
+     * score and overlap for each selected run, in the order they were rendered. */
+    "  manifest TEXT NOT NULL DEFAULT '',"
+    /* True when the candidate scan reached its ceiling, so the search was
+     * bounded rather than exhaustive. A bound that is reached is reported. */
+    "  candidates_truncated INTEGER NOT NULL DEFAULT 0"
+    "    CHECK(candidates_truncated IN (0,1)),"
+    "  package BLOB,"
+    "  created_at TEXT NOT NULL"
+    ");"
+    "CREATE INDEX idx_orch_run_memory_run ON orch_run_memory(run_uid);";
+
+static const char *const M23_STATEMENTS[] = {M23_MEMORY, NULL};
+
 static const atlas_migration MIGRATIONS[] = {
     {1, "initial schema", M1_STATEMENTS, false},
     {2, "worktree identity", M2_STATEMENTS, false},
@@ -3889,6 +3954,7 @@ static const atlas_migration MIGRATIONS[] = {
      * job is not evidence that somebody intended a run. See the M21 comment. */
     {21, "the durable single-worker run, and one active task within it", M21_STATEMENTS, false},
     {22, "what a worker attempt cost, per attempt and never estimated", M22_STATEMENTS, false},
+    {23, "the frozen cross-run memory manifest one run was shown", M23_STATEMENTS, false},
 };
 
 const atlas_migration *atlas_migrations(size_t *count_out) {

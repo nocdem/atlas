@@ -620,6 +620,34 @@ static atlas_status h_job_item(atlas_renderer *r, const atlas_job_render *jr, at
             }
         }
     }
+    if (jr->memory_present) {
+        /* A10.1. Printed only for a run that has a frozen manifest. A run from
+         * before migration 23 prints nothing here, which is not the same thing
+         * as a run that ran with memory OFF and must not share a line with it.
+         *
+         * The package's own bytes are never printed. This says what the arm was
+         * given and lets a reader check that two arms differed; reading twelve
+         * kibibytes of untrusted historical output is a different question. */
+        (void)fprintf(out, "memory        %s (%s)\n",
+                      jr->memory_mode != NULL ? jr->memory_mode : "UNKNOWN",
+                      jr->memory_package_status != NULL ? jr->memory_package_status : "UNKNOWN");
+        if (jr->memory_package_digest != NULL && jr->memory_package_digest[0] != '\0') {
+            (void)fprintf(out, "  package     %lld bytes from %lld run(s), sha256 %s\n",
+                          (long long)jr->memory_package_bytes,
+                          (long long)jr->memory_source_count, jr->memory_package_digest);
+        }
+        for (size_t i = 0; i < jr->memory_source_listed; i++) {
+            (void)fprintf(out, "  source      %s\n", jr->memory_sources[i]);
+        }
+        if (jr->memory_candidates_truncated) {
+            /* A bound that was reached is reported. Without this line a
+             * selection over the newest sixty-four terminal runs reads as a
+             * selection over all of them. */
+            (void)fprintf(out,
+                          "  note        the candidate scan reached its ceiling, so the search\n"
+                          "              was bounded rather than exhaustive\n");
+        }
+    }
     if (jr->follow_up != NULL && jr->follow_up[0] != '\0') {
         (void)fprintf(out, "next task     %s\n", jr->follow_up);
     }

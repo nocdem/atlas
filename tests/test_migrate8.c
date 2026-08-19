@@ -146,6 +146,10 @@ static void build_schema7(const char *path, atlas_err *err) {
      * references `orch_attempts`, and with foreign keys on — which is the whole
      * point of doing this in dependency order rather than disabling the pragma —
      * dropping the parent first fails outright. */
+    /* A10.1's table goes with A10.0's, and for the same reason: a rewind that
+     * leaves a later migration's table behind is not a database at the version
+     * it claims, and migration 23 would then fail to create it. */
+    T_OK(atlas_buf_append_str(&drop, "DROP TABLE orch_run_memory;", err), err);
     T_OK(atlas_buf_append_str(&drop, "DROP TABLE orch_usage;", err), err);
     for (size_t i = sizeof A8_TABLES / sizeof A8_TABLES[0]; i > 0; i--) {
         T_OK(atlas_buf_appendf(&drop, err, "DROP TABLE %s;", A8_TABLES[i - 1u]), err);
@@ -214,7 +218,7 @@ static void test_a_schema_seven_database_reaches_eight_losslessly(void) {
 
     T_OK(atlas_db_migrate(db, &err), &err);
     T_EQ_INT(atlas_db_schema_version(db, &err), ATLAS_SCHEMA_VERSION);
-    T_EQ_INT(ATLAS_SCHEMA_VERSION, 22);
+    T_EQ_INT(ATLAS_SCHEMA_VERSION, 23);
 
     for (size_t i = 0; i < sizeof A8_TABLES / sizeof A8_TABLES[0]; i++) {
         T_CHECK_MSG(table_exists(db, A8_TABLES[i]), "migration 8 did not create %s",

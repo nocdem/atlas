@@ -13,7 +13,7 @@ A11.0 made a chain of tasks a fact about stored rows and settled nothing: who
 may decide a run was named as A11.1's question. The answer is a foreground run
 driver an operator starts, settlement that travels only on a task completion,
 gates fixed at the root task and inherited verbatim, and three worker starts per
-run counted in the ledger. **No migration; the schema stays at 21.** See the
+run counted in the ledger. **A11.1 added no migration; A10.0 added 22 and A10.1 added 23.** See the
 A11.1 section in `docs/roadmap.md`, `docs/orchestration.md` and
 `docs/engineering-rules.md`.
 
@@ -96,6 +96,7 @@ document that carries it:
 
 | Season | What it added | Document |
 | --- | --- | --- |
+| A10.1 | the bounded cross-run memory package, and the A/B experiment that measured it | `docs/orchestration.md` |
 | A11.1–A11.4 | the run driver, the gates Atlas runs itself, one follow-up per failure, and the bound that ends the chain | `docs/orchestration.md` |
 | A11.0 | the run a chain of tasks belongs to; a parent that resolves, and one active task in it | `docs/orchestration.md` |
 | O10 | the intake surface proved at the boundary a client reaches; no line of `src/` changed | `docs/verification.md` |
@@ -674,6 +675,38 @@ is not written down is one somebody deletes.** Both halves are load-bearing.
   phase it is already in. A failed renewal never kills the child.
 - **The run driver starts nothing in the background** — no scheduler, no polling,
   no timer, no model router, no second submit path.
+
+### A10.1 — bounded cross-run memory
+
+- **A MEMORY NOBODY MEASURED WAS A FEATURE, NOT A FINDING.** The package exists
+  so the question can be asked as an experiment; the default stays `OFF`
+  whatever the answer.
+- **Nothing in the selection calls a model.** Deterministic lexical overlap,
+  a total order ending in `run_uid`, and the same inputs give the same digest.
+- **The mode travels on `atlas_orch_op`, never on `atlas_orch_spec`.**
+  `ATLAS_ORCH_SPEC_DOMAIN` did not move, so no stored `spec_digest` means
+  anything different than it did.
+- **`atlas_orch_memory_lineage` is not `repo_identity_hash` and never a half of
+  it.** It answers "the same git history?" so a worktree counts; nothing is
+  authorised, admitted or refused on it.
+- **`INDEXED` is not an ancestry claim**, and everything that is not `EXACT` is
+  marked `STALE`. Atlas has no git process inside a write transaction and does
+  not claim what it did not establish.
+- **A candidate with no shared token is never selected**, whatever its commit
+  relation. No positive overlap means an empty package, which is an answer.
+- **The manifest is frozen in the transaction that creates the run**, and
+  `UNIQUE(run_uid)` is the freeze. An `ACTIVE` run is never a candidate, so two
+  arms created before either runs cannot see each other.
+- **`OFF` appends nothing at all** — not a shorter section, not a sentence
+  saying there is no memory. The two arms differ by exactly the package's bytes.
+- **`worker.log` is never read**, and there is no member of
+  `atlas_orch_memory_cand` for a prompt, a tool argument, a session, a
+  credential, a diff or a log. The guarantee is an absent field.
+- **What makes the package harmless is that no branch reads it.** The label is
+  for the reader; safe encoding is terminal- and structure-safe and is still not
+  model-safe. One `strstr` over it anywhere would end the argument.
+- **No new RPC method, no MCP tool, no gateway route.** `--memory` on `--resume`
+  is refused, not ignored.
 
 ### O10 — production evidence ingestion
 

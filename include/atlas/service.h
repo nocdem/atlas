@@ -1069,6 +1069,19 @@ typedef struct atlas_job_render {
      * and never an error, following A9.2.5's rule for absent keys. */
     atlas_usage_run usage;
     bool usage_present;
+    /* A10.1. What this run was shown of earlier runs, for `job run-status`.
+     * Every one is absent — NULL, zero, or false — for a run created before
+     * migration 23, which reads as "this run was never part of a memory arm"
+     * and is deliberately not the same as a run that ran with memory OFF. */
+    const char *memory_mode;
+    const char *memory_package_status;
+    const char *memory_package_digest;
+    int64_t memory_source_count;
+    int64_t memory_package_bytes;
+    bool memory_candidates_truncated;
+    bool memory_present;
+    const char *memory_sources[3];
+    size_t memory_source_listed;
     /* True for `job get`, which prints every field; false for a list row. */
     bool detail;
     /* True only when this row is being emitted inside a `jobs` array. The JSON
@@ -1100,6 +1113,12 @@ typedef struct atlas_job_submit_opts {
      * is copied from its parent's rather than supplied. */
     const char *gates[8];
     size_t gate_count;
+    /* A10.1. The cross-run memory mode this run is created in: "off" or
+     * "bounded". NULL and empty both mean off. Chosen by the operator invoking
+     * the CLI, sent on the submission, and frozen against the run it creates;
+     * no model payload reaches this field, because no MCP tool and no gateway
+     * route reaches `job.submit`. */
+    const char *memory;
 } atlas_job_submit_opts;
 
 /* A11.1. `atlas job run`: submit a root task and drive its run to a settled
@@ -1119,6 +1138,11 @@ typedef struct atlas_job_run_opts {
     int64_t idle_timeout_ms;
     const char *gates[8];
     size_t gate_count;
+    /* A10.1. As `atlas_job_submit_opts::memory`, and it applies only to the
+     * start form. Naming it while resuming is refused rather than ignored: the
+     * package is frozen against the run, so honouring the flag would be a lie
+     * and dropping it silently would be a worse one. */
+    const char *memory;
     /* Where the driver narrates what it is doing. NULL is silent. */
     FILE *log;
 } atlas_job_run_opts;

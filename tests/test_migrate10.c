@@ -136,6 +136,8 @@ static void test_a_schema_nine_database_reaches_ten_additively(void) {
     exec(db, "DROP INDEX idx_orch_jobs_one_active_per_run;"
              "DROP INDEX idx_orch_jobs_run;"
              "ALTER TABLE orch_jobs DROP COLUMN run_uid;"
+             /* A10.1's table, with A10.0's and for the same reason. */
+             "DROP TABLE orch_run_memory;"
              "DROP TABLE orch_usage;"
         "DROP TABLE orch_runs;");
     exec(db, "DROP TABLE verify_lifecycle_audit;"

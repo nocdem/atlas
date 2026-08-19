@@ -706,6 +706,21 @@ settles by scanning its tasks:
 - **BLOCKED** otherwise: anything CANCELLED, TIMED_OUT, RECOVERY_REQUIRED, or a
   FAILED task nobody answered.
 
+**Every terminal producer settles.** A task reaches a terminal state at eight
+places, not one: a completion, the recovery sweep's two, a heartbeat that runs
+out of renewals, a heartbeat past its wall deadline, a cancellation of a task
+that was never leased, and the two refusals a lease can make — a repository whose
+identity moved, and a task whose attempts are gone. Only three of the eight
+checked for quiescence at first — the completion and recovery's two — so a run
+whose *last* task ended at one of the other five stayed ACTIVE with nothing in it
+— permanently, because the only event that would have settled it had already
+happened. Pilot A11.6-P found it in production: a sibling hit its wall on a
+heartbeat, the run had no other active task, and it was still ACTIVE hours
+afterwards with an operator waiting on it. All eight now call the same
+settlement, and the seven that carry no completion take the `op`-less form, which
+spawns no follow-up: a task that ended without being answered leaves the run
+BLOCKED rather than unsettled.
+
 Two consequences are worth stating outright, because they are the shape of the
 design rather than accidents of it:
 

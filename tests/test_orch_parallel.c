@@ -184,6 +184,22 @@ static int64_t ledger_id(env *e, const char *job_uid, const char *to) {
     return v;
 }
 
+/* The wall deadline a submission computed for itself. Read back rather than
+ * recomputed, so a case about the wall clock states the moment the write point
+ * stored instead of one it assumed. */
+static int64_t job_deadline_ms(env *e, const char *job_uid) {
+    atlas_err err;
+    atlas_err_init(&err);
+    atlas_buf sql = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_appendf(&sql, &err,
+                           "SELECT COALESCE(deadline_ms, 0) FROM orch_jobs WHERE job_uid = '%s';",
+                           job_uid),
+         &err);
+    int64_t v = count_sql(e->db, atlas_buf_cstr(&sql));
+    atlas_buf_free(&sql);
+    return v;
+}
+
 /* --- building operations -------------------------------------------------- */
 
 /* Everything a submission in this file varies. A struct rather than eight
@@ -197,6 +213,7 @@ typedef struct sub {
     const char *commit; /* NULL is the fixture's pinned head */
     int64_t attempts;   /* 0 is 1 */
     int64_t parallel;   /* 0 is "not stated" */
+    int64_t wall_ms;    /* 0 is an hour */
 } sub;
 
 static atlas_orch_op *submit_op(env *e, const sub *s) {
@@ -232,8 +249,14 @@ static atlas_orch_op *submit_op(env *e, const sub *s) {
         T_OK(atlas_orch_argv_push(&op->spec.validations[0], "pass", 4u, &err), &err);
         op->spec.validation_count = 1;
     }
-    op->spec.wall_timeout_ms = 3600000;
+    /* An hour unless a case needs a wall bound it can reach, and the idle bound
+     * follows it down: the spec validator asks only that idle never exceeds
+     * wall, and a case shortening one should not have to remember the other. */
+    op->spec.wall_timeout_ms = s->wall_ms > 0 ? s->wall_ms : 3600000;
     op->spec.idle_timeout_ms = 900000;
+    if (op->spec.idle_timeout_ms > op->spec.wall_timeout_ms) {
+        op->spec.idle_timeout_ms = op->spec.wall_timeout_ms;
+    }
     op->spec.max_attempts = s->attempts > 0 ? s->attempts : 1;
     op->spec.max_output_bytes = 65536;
     op->spec.max_artifact_bytes = 65536;
@@ -353,6 +376,25 @@ static void advance_to_running(env *e, const char *token) {
         apply_ok(e, op, &r);
         atlas_orch_result_free(&r);
     }
+}
+
+/* One heartbeat with the clock supplied, and the job state it answered with.
+ *
+ * Every decision `op_heartbeat` makes — the renewal bound, the wall deadline and
+ * whether the lease is still live — is made against this one value, so a case
+ * about any of them states the moment rather than waiting for it. A phase of
+ * UNKNOWN is a bare renewal, which is what a run driver sends while a worker is
+ * already in the phase it reported. */
+static atlas_orch_state heartbeat_at(env *e, const char *token, atlas_orch_state phase,
+                                     int64_t at_ms) {
+    atlas_orch_op *op = worker_op(ATLAS_ORCH_OP_HEARTBEAT, token);
+    op->phase = phase;
+    op->now_ms = at_ms;
+    atlas_orch_result r;
+    apply_ok(e, op, &r);
+    atlas_orch_state s = r.state;
+    atlas_orch_result_free(&r);
+    return s;
 }
 
 /* Completes an attempt and returns the run's status afterwards, which is the
@@ -1186,6 +1228,131 @@ static void test_the_run_view_names_the_claim_target_and_counts_the_rest(void) {
     env_close(&e);
 }
 
+/* --- 14: every terminal producer settles ----------------------------------
+ *
+ * A11.6 says a run settles exactly when its last task goes terminal, and for a
+ * season only three paths honoured it: a completion, and recovery's two sweeps.
+ * Five others wrote a terminal state and settled nothing, so a run whose last
+ * task ended on one of them stayed ACTIVE with nothing in it — forever, because
+ * the only thing that would ever have settled it was a task that had already
+ * ended.
+ *
+ * Pilot A11.6-P is where that stopped being theoretical: a sibling reached its
+ * wall deadline on a heartbeat, the run had no other active task, and it was
+ * still ACTIVE hours later with an operator waiting on it. The two cases below
+ * are the two producers a run driver meets in ordinary use — the wall deadline
+ * on a check-in, and a cancellation of a task that was never leased — and both
+ * assert the run's verdict rather than only the task's, because the task's was
+ * already right.
+ */
+static void test_a_task_that_hits_its_wall_on_a_heartbeat_blocks_its_run(void) {
+    env e;
+    env_open(&e);
+
+    atlas_buf run = ATLAS_BUF_INIT, root = ATLAS_BUF_INIT, sib = ATLAS_BUF_INIT;
+    sub root_s = {.driver = "fake-repo", .parallel = 2, .attempts = 3};
+    submit(&e, &root_s, &run, &root);
+    /* A wall bound short enough to fall inside one lease, so every clock this
+     * case depends on is a value it states and none of it is waited for. */
+    sub sib_s = {.parent = atlas_buf_cstr(&root), .wall_ms = 30000};
+    submit(&e, &sib_s, NULL, &sib);
+
+    /* The chain finishes well, and the run does not settle: the sibling has not
+     * said what it did. */
+    T_CHECK(run_one(&e, atlas_buf_cstr(&root), "fake-repo", true, ATLAS_ORCH_REASON_UNKNOWN) ==
+            ATLAS_ORCH_RUN_ACTIVE);
+    T_CHECK(job_state(&e, atlas_buf_cstr(&root)) == ATLAS_ORCH_STATE_SUCCEEDED);
+    T_EQ_INT((int)run_view(&e, atlas_buf_cstr(&run)).active_count, 1);
+
+    /* The sibling runs, one heartbeat short of its wall each time. */
+    atlas_buf sib_tok = ATLAS_BUF_INIT;
+    (void)lease(&e, NULL, "fake", &sib_tok, NULL);
+    int64_t wall = job_deadline_ms(&e, atlas_buf_cstr(&sib));
+    T_REQUIRE(wall > 0);
+    (void)heartbeat_at(&e, atlas_buf_cstr(&sib_tok), ATLAS_ORCH_STATE_PREPARING, wall - 2);
+    (void)heartbeat_at(&e, atlas_buf_cstr(&sib_tok), ATLAS_ORCH_STATE_RUNNING, wall - 1);
+    T_CHECK(job_state(&e, atlas_buf_cstr(&sib)) == ATLAS_ORCH_STATE_RUNNING);
+    T_CHECK(run_view(&e, atlas_buf_cstr(&run)).status == ATLAS_ORCH_RUN_ACTIVE);
+
+    /* And the next one arrives past it. The wall clock is what finally stops a
+     * job, and it stops this one without any completion ever being sent. */
+    T_CHECK(heartbeat_at(&e, atlas_buf_cstr(&sib_tok), ATLAS_ORCH_STATE_UNKNOWN, wall + 1) ==
+            ATLAS_ORCH_STATE_TIMED_OUT);
+    T_CHECK(job_state(&e, atlas_buf_cstr(&sib)) == ATLAS_ORCH_STATE_TIMED_OUT);
+    /* The wall branch and not the renewal bound, which ends a task the same way
+     * for a different reason and would prove the wrong thing here. */
+    T_EQ_INT((int)count_sql(e.db,
+                            "SELECT count(*) FROM orch_transitions"
+                            "  WHERE to_state = 'TIMED_OUT' AND reason = 'WALL_TIMEOUT';"),
+             1);
+    T_EQ_INT((int)count_sql(e.db, "SELECT count(*) FROM orch_leases WHERE released_at IS NULL;"),
+             0);
+
+    /* The run is BLOCKED, and this is the assertion the pilot was missing: with
+     * nothing active left, a run that stayed ACTIVE here would stay ACTIVE for
+     * good — a timed-out task is one nobody answered. */
+    atlas_orch_run_view rv = run_view(&e, atlas_buf_cstr(&run));
+    T_EQ_INT((int)rv.active_count, 0);
+    T_CHECK_MSG(rv.status == ATLAS_ORCH_RUN_BLOCKED,
+                "the run is %s with no active task in it",
+                atlas_orch_run_status_name(rv.status));
+
+    atlas_buf_free(&sib_tok);
+    atlas_buf_free(&sib);
+    atlas_buf_free(&root);
+    atlas_buf_free(&run);
+    env_close(&e);
+}
+
+static void test_a_cancelled_queued_task_settles_its_run_at_quiescence(void) {
+    env e;
+    env_open(&e);
+
+    atlas_buf run = ATLAS_BUF_INIT, root = ATLAS_BUF_INIT, sib = ATLAS_BUF_INIT;
+    sub root_s = {.driver = "fake-repo", .parallel = 2, .attempts = 3};
+    submit(&e, &root_s, &run, &root);
+    sub sib_s = {.parent = atlas_buf_cstr(&root)};
+    submit(&e, &sib_s, NULL, &sib);
+
+    /* The chain finishes well while the sibling is still queued. Nothing has
+     * ever leased it, so no worker will ever complete it. */
+    T_CHECK(run_one(&e, atlas_buf_cstr(&root), "fake-repo", true, ATLAS_ORCH_REASON_UNKNOWN) ==
+            ATLAS_ORCH_RUN_ACTIVE);
+    T_CHECK(job_state(&e, atlas_buf_cstr(&sib)) == ATLAS_ORCH_STATE_QUEUED);
+    T_EQ_INT((int)count_sql(e.db, "SELECT count(*) FROM orch_attempts;"), 1);
+
+    /* Cancelling a queued task is the whole of its ending: there is nothing
+     * running to ask to stop, so it goes straight to CANCELLED. */
+    {
+        atlas_err err;
+        atlas_err_init(&err);
+        atlas_orch_op *op = atlas_orch_op_new(ATLAS_ORCH_OP_CANCEL);
+        T_REQUIRE(op != NULL);
+        op->peer_uid = 1000;
+        op->actor = ATLAS_ORCH_ACTOR_CLIENT;
+        T_OK(atlas_buf_set(&op->job_uid, sib.data, sib.len, &err), &err);
+        atlas_orch_result r;
+        apply_ok(&e, op, &r);
+        T_CHECK(r.state == ATLAS_ORCH_STATE_CANCELLED);
+        atlas_orch_result_free(&r);
+    }
+    T_CHECK(job_state(&e, atlas_buf_cstr(&sib)) == ATLAS_ORCH_STATE_CANCELLED);
+
+    /* Immediately, in the cancellation's own transaction: the run is at
+     * quiescence the moment that row is written, and a cancelled task is an
+     * unanswered one. */
+    atlas_orch_run_view rv = run_view(&e, atlas_buf_cstr(&run));
+    T_EQ_INT((int)rv.active_count, 0);
+    T_CHECK_MSG(rv.status == ATLAS_ORCH_RUN_BLOCKED,
+                "the run is %s with no active task in it",
+                atlas_orch_run_status_name(rv.status));
+
+    atlas_buf_free(&sib);
+    atlas_buf_free(&root);
+    atlas_buf_free(&run);
+    env_close(&e);
+}
+
 static const atlas_test TESTS[] = {
     {"a run admits siblings up to its bound and no further",
      test_a_run_admits_siblings_up_to_its_bound_and_no_further},
@@ -1219,6 +1386,10 @@ static const atlas_test TESTS[] = {
      test_the_index_predicates_match_the_c_predicates},
     {"the run view names the claim target and counts the rest",
      test_the_run_view_names_the_claim_target_and_counts_the_rest},
+    {"a task that hits its wall on a heartbeat blocks its run",
+     test_a_task_that_hits_its_wall_on_a_heartbeat_blocks_its_run},
+    {"a cancelled queued task settles its run at quiescence",
+     test_a_cancelled_queued_task_settles_its_run_at_quiescence},
 };
 
 ATLAS_TEST_MAIN("orch_parallel", TESTS)

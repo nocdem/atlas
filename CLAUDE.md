@@ -713,11 +713,17 @@ is not written down is one somebody deletes.** Both halves are load-bearing.
 - **A run holds one pin.** A child's `source_commit` is compared against the
   **root's**, because two pins would make ACCEPTED ambiguous and comparing
   against the parent would let a chain drift a commit at a time.
-- **A run settles only at quiescence.** Nothing is ACCEPTED or BLOCKED while any
-  task is non-terminal. At zero active tasks the verdict is a scan: ACCEPTED iff
-  every task SUCCEEDED or FAILED-with-a-child, plus the repository-identity
-  re-check from the root; otherwise BLOCKED. Settle-eligibility is the **root**
-  task's driver, asked in C and never in SQL.
+- **A run settles only at quiescence, and every terminal producer settles.**
+  Nothing is ACCEPTED or BLOCKED while any task is non-terminal. At zero active
+  tasks the verdict is a scan: ACCEPTED iff every task SUCCEEDED or
+  FAILED-with-a-child, plus the repository-identity re-check from the root;
+  otherwise BLOCKED. Settle-eligibility is the **root** task's driver, asked in C
+  and never in SQL. A completion is not the only way a task ends — recovery's two
+  sweeps, an expired heartbeat, a cancelled queued task and a refusing lease all
+  end one, and a run whose last task ended at one of the five that settled
+  nothing stayed ACTIVE forever; **found by pilot A11.6-P**. Every producer
+  without a completion op — recovery's two and those five — settles through
+  `run_settle_without_op`, which settles and spawns nothing.
 - **A gateless workspace sibling can veto acceptance and can never grant it**,
   and **a doomed run does not stop the chain mid-run** — one task's failure must
   not break another task's execution, so the run spends at most its bounded

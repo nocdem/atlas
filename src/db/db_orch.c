@@ -1349,6 +1349,19 @@ done:
     return st;
 }
 
+/* A11.6. Settlement for a terminal state nobody completed, declared here and
+ * defined below.
+ *
+ * It belongs beside the settlement machinery it wraps — the quiescence scan, the
+ * follow-up and the run's status are one argument and are written as one — and
+ * five of its callers are the operations below this line: a heartbeat that runs
+ * out of renewals or of wall clock, a cancellation of a queued task, and a lease
+ * that refuses to grant. A forward declaration is the honest way to write that;
+ * moving the definition up here would put the smallest part of the argument
+ * first and the reasoning nine hundred lines away from it. */
+static atlas_status run_settle_without_op(atlas_db *db, const job_row *j, atlas_orch_state to,
+                                          atlas_err *err);
+
 /* --- CANCEL -----------------------------------------------------------------
  *
  * Race-safe by construction rather than by locking. A queued job is cancelled
@@ -1405,6 +1418,14 @@ static atlas_status op_cancel(atlas_db *db, const atlas_orch_op *op, atlas_orch_
     if (j.state == ATLAS_ORCH_STATE_QUEUED) {
         s = transition(db, &j, 0, ATLAS_ORCH_STATE_CANCELLED, ATLAS_ORCH_REASON_CANCEL_CONFIRMED,
                        ATLAS_ORCH_ACTOR_CLIENT, op->peer_uid, "", &out->seq, err);
+        if (s == ATLAS_OK) {
+            /* A queued task cancelled here may have been the last one its run
+             * was waiting for, and a run whose last task ends on this path must
+             * not stay ACTIVE forever. Quiescence is A11.6's contract and every
+             * terminal producer owes it a check; a cancelled task is one nobody
+             * answered, so the scan blocks the run. */
+            s = run_settle_without_op(db, &j, ATLAS_ORCH_STATE_CANCELLED, err);
+        }
         out->state = ATLAS_ORCH_STATE_CANCELLED;
         return s;
     }
@@ -1569,6 +1590,15 @@ static atlas_status op_lease(atlas_db *db, const atlas_orch_op *op, atlas_orch_r
                        "the registered repository no longer has the identity this job was "
                        "created against",
                        &out->seq, err);
+        if (s == ATLAS_OK) {
+            /* A grant that refused ends the task, and a run whose last task ends
+             * on this path must not stay ACTIVE forever: quiescence is A11.6's
+             * contract and every terminal producer owes it a check. Nothing
+             * narrower answers a tree that is not the one the work was
+             * authorised over, so this failure is unanswered and the run
+             * blocks. */
+            s = run_settle_without_op(db, &j, ATLAS_ORCH_STATE_FAILED, err);
+        }
         atlas_buf_free(&identity);
         atlas_repo_info_free(&ri);
         if (s != ATLAS_OK) {
@@ -1586,6 +1616,14 @@ static atlas_status op_lease(atlas_db *db, const atlas_orch_op *op, atlas_orch_r
         s = transition(db, &j, 0, ATLAS_ORCH_STATE_FAILED,
                        ATLAS_ORCH_REASON_ATTEMPTS_EXHAUSTED, ATLAS_ORCH_ACTOR_ATLAS, 0, "",
                        &out->seq, err);
+        if (s == ATLAS_OK) {
+            /* The same obligation: a task whose attempts ran out at the grant
+             * has ended, and a run whose last task ends here must not stay
+             * ACTIVE forever. No completion arrived, so there is nothing to
+             * build a follow-up from and the exhausted task is one nobody
+             * answered — the scan blocks the run. */
+            s = run_settle_without_op(db, &j, ATLAS_ORCH_STATE_FAILED, err);
+        }
         atlas_buf_free(&identity);
         atlas_repo_info_free(&ri);
         if (s != ATLAS_OK) {
@@ -1809,6 +1847,13 @@ static atlas_status op_heartbeat(atlas_db *db, const atlas_orch_op *op, atlas_or
         if (s == ATLAS_OK) {
             s = release_lease(db, lr.attempt_id, "RENEWAL_BOUND", err);
         }
+        if (s == ATLAS_OK) {
+            /* The task ended here, on a check-in, and no completion will ever
+             * arrive for it. A run whose last task ends this way must not stay
+             * ACTIVE forever — quiescence is A11.6's contract and every terminal
+             * producer owes it a check. */
+            s = run_settle_without_op(db, &j, ATLAS_ORCH_STATE_TIMED_OUT, err);
+        }
         out->state = ATLAS_ORCH_STATE_TIMED_OUT;
         return s;
     }
@@ -1821,6 +1866,13 @@ static atlas_status op_heartbeat(atlas_db *db, const atlas_orch_op *op, atlas_or
         }
         if (s == ATLAS_OK) {
             s = release_lease(db, lr.attempt_id, "WALL_TIMEOUT", err);
+        }
+        if (s == ATLAS_OK) {
+            /* The wall clock is what finally stops a job, and stopping it is
+             * also the end of a task nobody will complete. Pilot A11.6-P is why
+             * this line is here: a sibling hit its wall on a heartbeat, the run
+             * had nothing else active, and it was still ACTIVE hours later. */
+            s = run_settle_without_op(db, &j, ATLAS_ORCH_STATE_TIMED_OUT, err);
         }
         out->state = ATLAS_ORCH_STATE_TIMED_OUT;
         return s;
@@ -2461,11 +2513,13 @@ static atlas_status run_every_task_ended_well(atlas_db *db, const char *run_uid,
  * model wrote is read here, and there is no field on the operation through which
  * it could be.
  *
- * `op` and `out` are both NULL exactly when this is called from recovery, and
- * that is the single discriminator: recovery spawns nothing (step 4 is skipped),
- * reports nothing on a result it does not own, and treats a missing run row as
- * nothing to do rather than as corruption — a sweep that failed hard on one
- * inconsistent row would stop reclaiming every other job in the pass. */
+ * `op` and `out` are both NULL exactly when the terminal state was produced by
+ * something that carries no completion — recovery, an expired heartbeat, a
+ * cancelled queued task, a lease that refused to grant — and that is the single
+ * discriminator: such a caller spawns nothing (step 4 is skipped), reports
+ * nothing on a result it does not own, and treats a missing run row as nothing
+ * to do rather than as corruption — a sweep that failed hard on one inconsistent
+ * row would stop reclaiming every other job in the pass. */
 static atlas_status settle_run_at_quiescence(atlas_db *db, const atlas_orch_op *op,
                                              const job_row *j, atlas_orch_state to,
                                              int64_t attempt_no, int64_t starts,
@@ -2575,22 +2629,32 @@ static atlas_status settle_run_at_quiescence(atlas_db *db, const atlas_orch_op *
     return s;
 }
 
-/* A11.1. What recovery does to a run.
+/* A11.1. Settlement for every terminal producer that has no completion op.
  *
- * Recovery is Atlas saying, in the state's own words, that it does not know
- * what ran. A task that ends that way did not end well, so the run it belongs to
- * cannot be accepted: starting a fresh worker on top of a tree an unknown
- * process may have been half-way through editing is the opposite of what
- * RECOVERY_REQUIRED means, and leaving the run ACTIVE with no task in it would
- * be a chain that can never be resumed and never says why.
+ * Recovery was the first of them and named the helper for a season. It is Atlas
+ * saying, in the state's own words, that it does not know what ran: a task that
+ * ends that way did not end well, so the run it belongs to cannot be accepted —
+ * starting a fresh worker on top of a tree an unknown process may have been
+ * half-way through editing is the opposite of what RECOVERY_REQUIRED means, and
+ * leaving the run ACTIVE with no task in it would be a chain that can never be
+ * resumed and never says why.
  *
- * A11.6 routes it through the same settlement helper rather than blocking
+ * It is not the only one. A heartbeat that reaches its renewal bound or its wall
+ * deadline, a cancellation of a queued task, and a lease that refuses to grant
+ * all end a task without a worker having reported anything, and a run whose last
+ * task ended on one of those paths stays ACTIVE forever unless it settles here.
+ * None of them carries an operation a follow-up could be built from, which is
+ * exactly why they share this entry point and not `op_complete`'s: `op` and
+ * `out` are NULL, so nothing is spawned and nothing is reported on a result this
+ * caller does not own.
+ *
+ * A11.6 routes all of it through the same settlement helper rather than blocking
  * outright, which changes nothing at a bound of one and is what makes the run
  * wait for its other tasks when there are any. A recovery that merely re-queued
  * the task settles nothing either way — the run still has an active task and the
  * ordinary path will reach it. */
-static atlas_status run_settle_after_recovery(atlas_db *db, const job_row *j, atlas_orch_state to,
-                                              atlas_err *err) {
+static atlas_status run_settle_without_op(atlas_db *db, const job_row *j, atlas_orch_state to,
+                                          atlas_err *err) {
     return settle_run_at_quiescence(db, NULL, j, to, 0, 0, NULL, err);
 }
 
@@ -3115,7 +3179,7 @@ static atlas_status op_recover(atlas_db *db, const atlas_orch_op *op, atlas_orch
         if (s != ATLAS_OK) {
             return s;
         }
-        s = run_settle_after_recovery(db, &j, to, err);
+        s = run_settle_without_op(db, &j, to, err);
         if (s != ATLAS_OK) {
             return s;
         }
@@ -3162,7 +3226,7 @@ static atlas_status op_recover(atlas_db *db, const atlas_orch_op *op, atlas_orch
             if (s != ATLAS_OK) {
                 return s;
             }
-            s = run_settle_after_recovery(db, &j, ATLAS_ORCH_STATE_TIMED_OUT, err);
+            s = run_settle_without_op(db, &j, ATLAS_ORCH_STATE_TIMED_OUT, err);
             if (s != ATLAS_OK) {
                 return s;
             }

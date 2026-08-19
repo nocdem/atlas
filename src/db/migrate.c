@@ -3746,7 +3746,13 @@ static const char M21_JOB_RUN[] =
  * `tests/test_orch_run.c` asserts the two agree rather than trusting that they
  * were kept in step by hand. CANCEL_REQUESTED is deliberately *not* terminal on
  * either side — an attempt that has been asked to stop has not stopped, and a
- * run that admitted a second task at that moment would have two. */
+ * run that admitted a second task at that moment would have two.
+ *
+ * **Migration 24 drops this index and replaces it with two**, and a reader of
+ * a current database will not find it. It is left here in full because a
+ * migration describes what happened at its own version and rewriting history to
+ * match the present would make the sequence unreadable; what M24 changed and
+ * why the backfill it does cannot collide are in the M24 comment below. */
 static const char M21_ONE_ACTIVE[] =
     "CREATE UNIQUE INDEX idx_orch_jobs_one_active_per_run ON orch_jobs(run_uid)"
     "  WHERE run_uid <> '' AND state NOT IN"
@@ -3892,6 +3898,82 @@ static const char M23_MEMORY[] =
 
 static const char *const M23_STATEMENTS[] = {M23_MEMORY, NULL};
 
+/* --- migration 24: bounded parallel tasks in one run ------------------------
+ *
+ * Migration 21 made "one active task per run" a fact about stored rows, and
+ * that was the right guarantee for a season whose whole subject was a single
+ * worker. It is the wrong guarantee for a run that wants a second task doing
+ * something else at the same time, and the difference is not a matter of
+ * degree: a partial unique index on `run_uid` alone cannot be talked into
+ * admitting two rows.
+ *
+ * So the guarantee is *narrowed*, not removed, and it is narrowed in two
+ * directions at once:
+ *
+ *   * **At most `max_parallel` active tasks per run**, held by a unique index on
+ *     `(run_uid, run_slot)`. Every active task occupies a distinct slot, and the
+ *     C write point assigns the lowest free one inside the submit transaction.
+ *     This is M21's philosophy carried forward rather than replaced — the
+ *     schema is what makes the bound true, and the check in C exists only so a
+ *     caller gets a sentence naming the tasks in the way instead of a constraint
+ *     violation nobody can act on.
+ *   * **At most one active repo-tree task per run, always**, held by a second
+ *     partial unique index on `run_uid` restricted to the repo-tree drivers. The
+ *     registered repository's own working tree is the one resource no bound may
+ *     widen access to: two workers editing it at once is not slower or riskier,
+ *     it is incoherent. A parallel sibling is a workspace task under A8's
+ *     isolation, and this index is what makes that a schema fact rather than a
+ *     convention.
+ *
+ * **The backfill is collision-free, and only because M21 held.** Every existing
+ * row takes `run_slot = 0`, and two rows in one run could collide on the new
+ * slot index only if both were active — which is exactly what
+ * `idx_orch_jobs_one_active_per_run` has made impossible for every row this
+ * migration can find. A legacy job with `run_uid = ''` is outside both new
+ * predicates for the reason it was outside M21's: without the `run_uid <> ''`
+ * half every pre-migration row would collide with every other on the empty
+ * string.
+ *
+ * **The 8 in the two CHECKs is `ATLAS_ORCH_RUN_MAX_PARALLEL`**, written out
+ * because SQLite cannot read a C macro. It is the schema's absolute ceiling and
+ * says nothing about what a particular run allows: a run created with
+ * `max_parallel = 2` is held to two by `submit_resolve_run`, which refuses a
+ * third with a sentence, and the slot index is what stops anything from getting
+ * past that check into a state the bound describes wrongly.
+ * `tests/test_orch_parallel.c` asserts the constant and the CHECK agree.
+ *
+ * **The driver list in the second index duplicates
+ * `atlas_orch_driver_is_repo_tree`**, for the same reason M21's terminal-state
+ * list duplicates `atlas_orch_state_is_terminal`: SQLite cannot call the C
+ * function, and two spellings of one rule drift. `tests/test_orch_parallel.c`
+ * compares them in both directions over `atlas_drivers()`. The cost is stated
+ * rather than hidden: **adding a repo-tree driver now requires a migration**,
+ * because a driver that edits the repository's tree and is absent from this
+ * predicate would be one the schema does not keep exclusive.
+ *
+ * Additive plus an index swap. No table is rebuilt, so foreign keys stay
+ * enforced throughout and no pre-existing row is rewritten. It changes no
+ * behaviour on its own: `max_parallel` defaults to 1, which is what every run
+ * already was.
+ */
+static const char M24_RUN_PARALLEL[] =
+    "ALTER TABLE orch_runs ADD COLUMN max_parallel INTEGER NOT NULL DEFAULT 1"
+    "  CHECK(max_parallel >= 1 AND max_parallel <= 8);"
+    "ALTER TABLE orch_jobs ADD COLUMN run_slot INTEGER NOT NULL DEFAULT 0"
+    "  CHECK(run_slot >= 0 AND run_slot < 8);";
+
+static const char M24_SLOT_INDEX[] =
+    "DROP INDEX idx_orch_jobs_one_active_per_run;"
+    "CREATE UNIQUE INDEX idx_orch_jobs_active_slot ON orch_jobs(run_uid, run_slot)"
+    "  WHERE run_uid <> '' AND state NOT IN"
+    "    ('SUCCEEDED','FAILED','CANCELLED','TIMED_OUT','RECOVERY_REQUIRED');"
+    "CREATE UNIQUE INDEX idx_orch_jobs_one_active_repo_tree ON orch_jobs(run_uid)"
+    "  WHERE run_uid <> '' AND state NOT IN"
+    "    ('SUCCEEDED','FAILED','CANCELLED','TIMED_OUT','RECOVERY_REQUIRED')"
+    "    AND driver IN ('claude-repo','fake-repo');";
+
+static const char *const M24_STATEMENTS[] = {M24_RUN_PARALLEL, M24_SLOT_INDEX, NULL};
+
 static const atlas_migration MIGRATIONS[] = {
     {1, "initial schema", M1_STATEMENTS, false},
     {2, "worktree identity", M2_STATEMENTS, false},
@@ -3955,6 +4037,13 @@ static const atlas_migration MIGRATIONS[] = {
     {21, "the durable single-worker run, and one active task within it", M21_STATEMENTS, false},
     {22, "what a worker attempt cost, per attempt and never estimated", M22_STATEMENTS, false},
     {23, "the frozen cross-run memory manifest one run was shown", M23_STATEMENTS, false},
+    /* Additive plus an index swap: two columns, one index dropped and two
+     * created. No table is rebuilt, so foreign keys stay enforced and no
+     * pre-existing row is rewritten. `max_parallel` defaults to 1 and
+     * `run_slot` to 0, so every migrated run keeps exactly the behaviour it
+     * had. See the M24 comment for why the slot backfill cannot collide. */
+    {24, "bounded parallel tasks in a run, and the repository's tree kept exclusive",
+     M24_STATEMENTS, false},
 };
 
 const atlas_migration *atlas_migrations(size_t *count_out) {

@@ -143,6 +143,7 @@ set(ATLAS_TESTS
   test_orch_model
   test_orch_lifecycle
   test_orch_run
+  test_orch_parallel
   test_a11_run
   test_a11_head_drift
   test_orch_validation_wire
@@ -319,6 +320,12 @@ set_tests_properties(test_orch_usage PROPERTIES LABELS "unit")
 # integration test. It sleeps for nothing: expiry and deadlines are supplied.
 set_tests_properties(test_orch_lifecycle PROPERTIES LABELS "integration")
 set_tests_properties(test_orch_run PROPERTIES LABELS "integration")
+# A11.6's bounded parallelism, against a real fixture database. It builds a
+# repository, registers it through the CLI and drives the one write point, so it
+# is an integration test. It creates no worker, opens no socket and sleeps for
+# nothing: every interleaving is issued in an order the test chose and every
+# expiry is supplied to the operation.
+set_tests_properties(test_orch_parallel PROPERTIES LABELS "integration" TIMEOUT 120)
 set_tests_properties(test_orch_memory PROPERTIES LABELS "integration")
 target_compile_definitions(test_orch_memory PRIVATE ATLAS_SRC_DIR="${CMAKE_SOURCE_DIR}")
 set_tests_properties(test_a11_run PROPERTIES LABELS "integration")

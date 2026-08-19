@@ -572,20 +572,25 @@ the whole submission; none repairs anything.
 
 ### One active task per run
 
-This is a partial unique index on `orch_jobs(run_uid)` over the non-terminal
-states, not only a checked `SELECT`. It follows `M8_LEASES`' precedent for "at
-most one unreleased lease per job", and it is load-bearing rather than
-decorative: with the C check disabled the submission is still refused, by the
-constraint. The check in `submit_resolve_run` exists so the caller gets a
-sentence naming the task in the way instead of a constraint violation it cannot
-act on.
+This is a partial unique index over the non-terminal states, not only a checked
+`SELECT`. It follows `M8_LEASES`' precedent for "at most one unreleased lease per
+job", and it is load-bearing rather than decorative: with the C check disabled
+the submission is still refused, by the constraint. The check in
+`submit_resolve_run` exists so the caller gets a sentence naming the task in the
+way instead of a constraint violation it cannot act on.
+
+Migration 24 **narrowed** this rather than removing it, and the narrowing is
+described under "Bounded parallel tasks (A11.6)" below: a run allows up to its
+own `max_parallel` active tasks, and **at most one of them may work in the
+registered repository's own tree, always**. A run created without asking for
+anything allows one task, which is what every run allowed before.
 
 **CANCEL_REQUESTED is deliberately not terminal**, on either side. A task that
 has been asked to stop has not stopped, and a run that admitted a second task at
-that moment would have two. The index predicate spells the terminal set out in
+that moment would have two. The index predicates spell the terminal set out in
 SQL because SQLite cannot call `atlas_orch_state_is_terminal`;
-`tests/test_orch_run.c` compares the two over the whole vocabulary rather than
-trusting they were kept in step by hand.
+`tests/test_orch_run.c` and `tests/test_orch_parallel.c` compare the spellings
+over the whole vocabulary rather than trusting they were kept in step by hand.
 
 ### The run's status is its own axis
 
@@ -630,6 +635,142 @@ between tasks — and never an error.
 
 `atlas_orch_job_view` carries `run_uid` and `parent_job_uid`, so the chain is
 read back rather than reconstructed.
+
+## Bounded parallel tasks (A11.6)
+
+A11.0's "one active task per run" was the right guarantee for a season whose
+whole subject was a single worker, and the wrong one for a run that wants a
+second task doing something else at the same time. A11.6 replaces it with two
+guarantees rather than with none.
+
+### The bound is fixed at the root and is never clamped
+
+`orch_runs.max_parallel` is written once, in the transaction that creates the
+run, from `--parallel N` on `atlas job submit` or `atlas job run`. It defaults
+to **1**, which is exactly what every run was before it existed. Naming it on a
+task that *joins* a run is refused, not ignored — a run's parallelism is a
+property of the run — and so is naming it on `--resume`. A value outside
+`1..ATLAS_ORCH_RUN_MAX_PARALLEL` is refused with the bound named rather than
+reduced, which is this file's rule for every bound since A8: a number quietly
+lowered is a run that behaves differently from the one that was asked for and
+nobody is told.
+
+It travels on `atlas_orch_op`, never on `atlas_orch_spec`. `ATLAS_ORCH_SPEC_DOMAIN`
+did not move and no stored `spec_digest` means anything different than it did —
+A10.1's arrangement for `memory_mode`, for A10.1's reason.
+
+### The repository's own tree stays exclusive
+
+A run may hold up to `max_parallel` active tasks and **at most one active
+repo-tree task, whatever that bound says**. Two workers editing the registered
+repository's one working tree at the same time is not a faster run, it is an
+incoherent one, and no bound may widen access to it. Parallel siblings are
+workspace-driver tasks — `fake`, `claude` — which already run in isolated A8
+snapshot workspaces provisioned by the existing dispatchers. **A11.6 adds no
+isolation mechanism and no execution machinery**, and creates no thread, process
+or background loop anywhere.
+
+Both rules are in the schema, which is what makes them true:
+
+| Guarantee | Where |
+| --- | --- |
+| at most `max_parallel` active tasks per run | `idx_orch_jobs_active_slot`, unique over `(run_uid, run_slot)` for non-terminal rows; the slot is assigned in the submit transaction |
+| at most one active repo-tree task per run | `idx_orch_jobs_one_active_repo_tree`, unique over `run_uid` for non-terminal rows whose driver is a repo-tree one |
+| the compiled ceiling | `CHECK(max_parallel >= 1 AND max_parallel <= 8)` and `CHECK(run_slot >= 0 AND run_slot < 8)` |
+
+The driver list in the second index duplicates `atlas_orch_driver_is_repo_tree`
+because SQLite cannot call C. `tests/test_orch_parallel.c` compares them in both
+directions over `atlas_drivers()`, and the cost is stated rather than hidden:
+**adding a repo-tree driver now requires a migration.**
+
+### A run holds one pin
+
+Every task in a run is authorised over the same tree, so a child's
+`source_commit` must equal the **root** task's. Two pins would make ACCEPTED
+ambiguous — it would mean "the gates passed over this tree" for one task and over
+a different one for another, and no reader could tell which. Compared against the
+root rather than the immediate parent, so a chain cannot drift a commit at a
+time.
+
+### Settlement waits for quiescence
+
+A run is **never** ACCEPTED or BLOCKED while any task in it is non-terminal. A
+task that has not ended has not said what it did, and a verdict over it would be
+a verdict on work nobody has seen the end of. When the last task ends, the run
+settles by scanning its tasks:
+
+- **ACCEPTED** when every task either SUCCEEDED, or FAILED **and has a child in
+  the same run** — a failure that was answered — *and* the repository still has
+  the identity the run was created against, re-checked from the root task at the
+  moment of settlement.
+- **BLOCKED** otherwise: anything CANCELLED, TIMED_OUT, RECOVERY_REQUIRED, or a
+  FAILED task nobody answered.
+
+Two consequences are worth stating outright, because they are the shape of the
+design rather than accidents of it:
+
+- **A gateless workspace sibling can veto acceptance and can never grant it.**
+  ACCEPTED still flows only from the gated repo-tree chain succeeding; a sibling
+  adds the requirement that it too ended well, and adds nothing else. A run whose
+  repo-tree chain never passed a gate cannot be accepted by siblings, however
+  many of them succeeded.
+- **A doomed run does not stop the chain mid-run.** A cancelled or failed sibling
+  does not interrupt the repo-tree task that is running beside it; the run spends
+  at most its bounded budget and then settles BLOCKED. One task's failure must
+  not break another task's execution, and a run that killed work in flight to
+  reach a verdict a few seconds earlier would be doing exactly that.
+
+### Whose budget is three
+
+`ATLAS_ORCH_RUN_MAX_WORKER_STARTS` stays 3 and now names its subject explicitly:
+**worker starts of the run's repo-tree chain**, counted from the ledger's
+transitions into RUNNING for the run's repo-tree jobs. A workspace sibling spends
+none of it and is bounded by its own `max_attempts`, which is A8's semantics
+untouched. Letting a sibling eat the chain's budget would mean a run could be
+denied the follow-up its gate failure had earned because something else was busy.
+
+This changes no existing run's count: before parallelism every job in a
+repo-tree run was a repo-tree job, because a follow-up inherits its parent's
+driver.
+
+### What the run view reports
+
+`atlas_db_orch_run_get` gains two fields, and `job.run_status` gains the two
+keys `active_count` and `max_parallel` to carry them.
+
+`active_job_uid` is the task a **run driver may claim**. For a run whose root
+works in the repository's own tree that is the active repo-tree task — there is
+at most one by construction — and it is empty when the chain is done while a
+sibling is still going. That is now an ordinary mid-run answer rather than an
+ending, which is why `active_count` exists beside it: a reader that inferred one
+from the other would read such a run as idle. For every other run
+`active_job_uid` is the run's first active task, exactly as it has been since
+A11.0.
+
+Both keys are **absent from an older daemon**, and the CLI leaves both at zero
+when it does not receive them — A9.2.5's rule for an absent key. Zero is the
+conservative value in both directions: it is never a claim that a run has no
+active task, and never a claim that its bound is nothing, because a stored run's
+bound is at least one. The renderers print the line only when the bound is
+present, so an absent key never renders as a claim.
+
+### What A11.6 deliberately does not do
+
+- **No general task DAG.** A run is still a chain plus siblings; there is no
+  dependency edge between two tasks beyond `parent_job_uid`.
+- **No N-way concurrency in the repository's tree.** That is the one thing the
+  second index exists to make impossible.
+- **No new isolation mechanism.** Siblings run under A8's existing workspace
+  isolation, provisioned by the existing dispatchers.
+- **No new RPC method, MCP tool or gateway route**, and no second submit path.
+  `atlas_db_orch_run_set_status` still has no caller outside `src/db/db_orch.c`.
+- **No thread, process, timer or background loop.**
+
+A residual worth knowing: a single dispatcher process runs one workspace attempt
+at a time, so N siblings genuinely overlapping needs N dispatcher processes. That
+is already safe — the lease compare-and-swap is what makes two dispatchers unable
+to take one job — and dispatcher-internal concurrency slots are recorded in
+`docs/backlog.md` as a non-goal of this change rather than as an oversight.
 
 ## The foreground run driver (A11.1)
 

@@ -133,8 +133,14 @@ static void test_a_schema_nine_database_reaches_ten_additively(void) {
      * `orch_jobs` itself survives and migration 21 would meet its own column
      * again; the indexes go first because SQLite refuses to drop an indexed
      * column. Undoing a migration means undoing all of it, not the table half. */
-    exec(db, "DROP INDEX idx_orch_jobs_one_active_per_run;"
+    /* A11.6 replaced migration 21's single index with two and added a second
+     * column, so undoing 21 now means undoing 24 first: the indexes go before
+     * the columns because SQLite refuses to drop an indexed one, and
+     * `idx_orch_jobs_one_active_per_run` is not in a current database at all. */
+    exec(db, "DROP INDEX idx_orch_jobs_one_active_repo_tree;"
+             "DROP INDEX idx_orch_jobs_active_slot;"
              "DROP INDEX idx_orch_jobs_run;"
+             "ALTER TABLE orch_jobs DROP COLUMN run_slot;"
              "ALTER TABLE orch_jobs DROP COLUMN run_uid;"
              /* A10.1's table, with A10.0's and for the same reason. */
              "DROP TABLE orch_run_memory;"

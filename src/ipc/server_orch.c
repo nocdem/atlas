@@ -278,6 +278,27 @@ static atlas_status method_job_submit(dispatch_state *ds, const atlas_ipc_reques
         }
     }
 
+    /* A11.6. How many tasks the run this submission creates may hold active at
+     * once.
+     *
+     * Absent means "not stated", which the write point resolves to one — the
+     * behaviour every run had before this key existed. It is carried on the
+     * operation rather than folded into the specification, so
+     * `ATLAS_ORCH_SPEC_DOMAIN` did not move and no stored `spec_digest` means
+     * anything different than it did.
+     *
+     * A value that is not an integer, or is outside the compiled ceiling, or is
+     * given on a submission that names a parent, is refused at the write point
+     * with the bound named. Nothing is clamped here and nothing is skipped: a
+     * caller who believes they asked for four parallel tasks and silently got
+     * one is worse off than one who was told no. */
+    if (st == ATLAS_OK) {
+        int64_t par = 0;
+        if (atlas_ipc_param_int(req, "parallel", &par)) {
+            op->run_max_parallel = par;
+        }
+    }
+
     /* The one aggregate the protocol accepts is an array of strings, so the
      * declared path set arrives as one directly. */
     if (st == ATLAS_OK) {
@@ -764,6 +785,25 @@ static atlas_status method_run_get(dispatch_state *ds, const atlas_ipc_request *
             st = atlas_json_key_str(ds->j, "active_state",
                                     atlas_orch_state_name(rv.active_state), err);
         }
+    }
+
+    /* A11.6. How many tasks are active and how many the run allows.
+     *
+     * Both are emitted always, including a count of zero, because a count and
+     * `active` answer different questions now: `active` names the task a run
+     * driver may claim, and there are runs where it is absent while
+     * `active_count` is not zero — a repo-tree chain that has finished while a
+     * workspace sibling is still going. A reader that inferred one from the
+     * other would read that run as idle.
+     *
+     * An older daemon emits neither, and A9.2.5's rule decides what that means
+     * on the other side: the conservative value, which here is zero, and zero is
+     * never a claim that a run is idle or that its bound is nothing. */
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "active_count", rv.active_count, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "max_parallel", rv.max_parallel, err);
     }
 
     /* A10.0. What the run cost, derived from its attempts on every read.

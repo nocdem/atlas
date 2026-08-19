@@ -633,6 +633,17 @@ static atlas_status j_job_item(atlas_renderer *r, const atlas_job_render *jr, at
             st = atlas_json_key_int(j, "tasks_carried", jr->tasks, err);
         }
     }
+    /* A11.6. Both keys, or neither. They are emitted only when the bound is
+     * present — a daemon that predates them reports nothing, and an emitted
+     * `max_parallel` of 0 would be a claim about a run made from a key that
+     * never arrived. `active_count` travels with it because the two answer one
+     * question together and a count with no bound beside it is not an answer. */
+    if (st == ATLAS_OK && jr->max_parallel > 0) {
+        st = atlas_json_key_int(j, "active_count", jr->active_count, err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_int(j, "max_parallel", jr->max_parallel, err);
+        }
+    }
     if (st == ATLAS_OK && jr->usage_present) {
         /* A10.0. One writer for the block, and the status is always present:
          * an absent status means a daemon that does not report usage, which is

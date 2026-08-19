@@ -386,12 +386,17 @@ named constants.
 ### Adding a state to `atlas_orch_state`
 
 A8's checklist still applies, and A11.0 adds one obligation: **the partial unique
-index `idx_orch_jobs_one_active_per_run` spells the terminal set out in SQL**,
-because SQLite cannot call `atlas_orch_state_is_terminal`. A new terminal state
-must be added to that predicate in a new migration that drops and recreates the
-index. `tests/test_orch_run.c` compares the two spellings over the whole
-vocabulary and fails if they disagree, so this cannot be forgotten silently — but
-it can only be *fixed* in a migration, not by editing migration 21.
+indexes spell the terminal set out in SQL**, because SQLite cannot call
+`atlas_orch_state_is_terminal`. A new terminal state must be added to those
+predicates in a new migration that drops and recreates the indexes.
+
+Since migration 24 there are **two** of them —
+`idx_orch_jobs_active_slot` and `idx_orch_jobs_one_active_repo_tree`; migration
+21's `idx_orch_jobs_one_active_per_run` no longer exists.
+`tests/test_orch_run.c` compares the terminal set against the C predicate and
+`tests/test_orch_parallel.c` compares both index predicates over the whole
+vocabulary, so this cannot be forgotten silently — but it can only be *fixed* in
+a migration, not by editing an old one.
 
 ### Who may settle a run
 
@@ -407,9 +412,36 @@ it belongs in the operator-uid method group, alongside `code.index` and
 
 | Bound | Where | What happens when it is reached |
 | --- | --- | --- |
-| one active task per run | `idx_orch_jobs_one_active_per_run` and `submit_resolve_run` | the submission is refused, naming the task in the way |
+| a run's active tasks | `orch_runs.max_parallel` (default 1), `idx_orch_jobs_active_slot` and `submit_resolve_run` | the submission is refused, naming the count, the bound and a task in the way |
+| one active repo-tree task per run | `idx_orch_jobs_one_active_repo_tree` and `submit_resolve_run` | the submission is refused, naming the task holding the tree |
 | one root per run | `orch_runs.root_job_uid`, written once at creation | nothing rewrites it; a run has exactly one root |
 | a run's repository | `orch_runs.repo_identity_hash`, compared against every child | a child describing a different repository is refused |
+| a run's pinned commit | the root task's `source_commit`, compared against every child | a child pinned elsewhere is refused, naming both commits |
+
+### `ATLAS_ORCH_RUN_MAX_PARALLEL`
+
+The absolute ceiling on how many tasks one run may hold active at once, in
+`include/atlas/orch.h`. A run's own bound is fixed at its root task and may be
+anything from 1 to this; the default is 1.
+
+Raising it means changing **four** things together, and none of them can be
+skipped:
+
+1. the constant itself;
+2. `CHECK(max_parallel >= 1 AND max_parallel <= N)` on `orch_runs`, in a **new
+   migration** — a CHECK cannot be edited in place;
+3. `CHECK(run_slot >= 0 AND run_slot < N)` on `orch_jobs`, in the same migration;
+4. nothing in `run_pick_slot`, which reads the constant — but check that the slot
+   bitmask type still holds `N` bits.
+
+`tests/test_orch_parallel.c` reads both CHECKs out of `sqlite_master` and
+compares them against the constant, so a raise that forgets the migration fails
+rather than silently keeping the old ceiling. It also proves both indexes refuse
+what the C checks would have, with the write point bypassed entirely.
+
+Lowering it is a different question and is not covered here: stored runs may
+already hold a higher bound, and a ceiling that a persisted row violates is a
+migration problem rather than a constant change.
 
 ## A11.1 — the run driver, the repo-tree drivers, and the gates
 
@@ -429,6 +461,15 @@ opened deliberately.
    granting a lease without linking the driver table into that decision.
 3. Update the count in `tests/test_a11_run.c`'s agreement case, which walks every
    shipped driver.
+3a. **Add the name to `ORCH_SQL_REPO_TREE_DRIVER` in `src/db/db_orch.c` and to
+   `idx_orch_jobs_one_active_repo_tree` — the latter in a new migration**, because
+   an index predicate cannot be edited in place. Since A11.6 the schema is what
+   keeps the registered repository's tree exclusive, and a repo-tree driver
+   missing from that predicate is one two tasks of a run could hold at once. It
+   also feeds the repo-tree worker-start budget. `tests/test_orch_parallel.c`
+   compares the SQL list against `atlas_orch_driver_is_repo_tree` over
+   `atlas_drivers()` in both directions and fails if they disagree, so this
+   cannot be forgotten silently — but it can only be fixed in a migration.
 4. Handle `req->ws == NULL`: a repo-tree driver has no workspace, so its log goes
    into `res->log` and it must not write into the repository.
 5. The operator must add `driver = <name>` to `/etc/atlas/orchestration.conf`

@@ -1015,6 +1015,70 @@ direction for an experiment measuring the mechanism. For a sustained pilot it is
 the first constraint to revisit, and revisiting it means deciding what a corpus
 shaped by memory is evidence of.
 
+## A11.6 — bounded parallel tasks in a run (shipped)
+
+A11.0 made "one active task per run" a fact about stored rows, and it was the
+right guarantee for a season whose whole subject was a single worker. It was
+carrying two arguments at once, though, and only one of them survives inspection.
+
+The first is about the repository: the registered tree is one resource, and two
+workers editing it at the same time is not a faster run, it is an incoherent one.
+That argument is unanswerable and A11.6 makes it *stricter* — it now names the
+repo-tree drivers specifically, in `idx_orch_jobs_one_active_repo_tree`, and no
+bound may widen it.
+
+The second is about how much a run may have in flight, and one is not a
+principled answer to that. It becomes `orch_runs.max_parallel`: fixed at the root
+task, defaulting to 1, refused rather than clamped outside `1..8`, and held by a
+unique index on `(run_uid, run_slot)`. A run created without asking for anything
+behaves exactly as every run behaved before.
+
+**What was added.** Migration 24 — two columns, one index dropped, two created,
+no table rebuilt. Bounded admission of sibling tasks at the submit transaction,
+with the four A11.0 refusals joined by three more: a run holds one pin, the run's
+bound is not exceeded, and the tree stays exclusive. Settlement generalised from
+"the task succeeded" to **quiescence plus a scan**: a run is never ACCEPTED or
+BLOCKED while anything in it is unfinished, and when nothing is left it is
+ACCEPTED iff every task SUCCEEDED or FAILED-with-a-child, plus the existing
+repository-identity re-check. `ATLAS_ORCH_RUN_MAX_WORKER_STARTS` stays 3 and now
+counts the repo-tree chain's starts specifically. `--parent` and `--parallel` on
+`atlas job submit`, `--parallel` on `atlas job run`, and `active_count` /
+`max_parallel` on `job.run_status`.
+
+**What was deliberately not added.** No general task DAG — a run is a chain plus
+siblings, and there is no dependency edge beyond `parent_job_uid`. No N-way
+concurrency in the repository's own tree; that is the one thing the second index
+exists to make impossible. No new isolation mechanism: a sibling is a workspace
+task under A8's existing isolation, provisioned by the dispatchers that already
+exist. No thread, process, timer or background loop; no new RPC method, MCP tool
+or gateway route; no second submit path, and `atlas_db_orch_run_set_status` still
+has no caller outside `src/db/db_orch.c`.
+
+**Two properties stated rather than discovered later.** A gateless workspace
+sibling can **veto** acceptance and can never **grant** it — ACCEPTED still flows
+only from the gated repo-tree chain succeeding, and a sibling only adds the
+requirement that it too ended well. And a doomed run does not stop the chain
+mid-run: a cancelled or failed sibling does not interrupt the repo-tree task
+beside it, so the run spends at most its bounded budget before settling BLOCKED.
+One task's failure must not break another task's execution, and killing work in
+flight to reach a verdict a few seconds sooner would be doing exactly that.
+
+**The residual, and it is a real one.** A single dispatcher process runs one
+workspace attempt at a time, so N siblings genuinely overlapping needs N
+dispatcher processes. That is already safe — the lease compare-and-swap is what
+makes two dispatchers unable to take one job, and
+`tests/test_orch_parallel.c` proves two tasks of one run holding two unreleased
+leases simultaneously — but it means the *bound* a run carries is an admission
+limit rather than a promise of throughput. Dispatcher-internal concurrency slots
+are recorded in `docs/backlog.md` as a non-goal of this change rather than as an
+oversight.
+
+**The cost that was accepted.** Adding a repo-tree driver now requires a
+migration, because the index predicate carries the driver list and SQLite cannot
+call `atlas_orch_driver_is_repo_tree`. `tests/test_orch_parallel.c` compares the
+two spellings in both directions over `atlas_drivers()`, so the obligation cannot
+be forgotten silently — only fixed deliberately.
+
 ## A7 (original plan) — optional MCP adapter (absorbed into A2)
 
 A7 was conditional: an MCP adapter only if a skill driving the CLI turned out to

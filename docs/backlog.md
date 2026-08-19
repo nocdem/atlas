@@ -889,3 +889,52 @@ times a worker's completed work became an expired lease and a requeued task. The
 authority question that blocks a fix has not moved: every cheap route puts a
 bearer credential on disk. It is worth restating that the cost is not
 hypothetical and is measured in whole worker runs.
+
+## Dispatcher-internal concurrency slots
+
+**Recorded as a non-goal of A11.6, not as an oversight.**
+
+A11.6 lets a run hold up to `max_parallel` active tasks and proves two of them
+genuinely overlap — two unreleased leases, two RUNNING rows, one run, with the
+interleaving visible in the ledger. What it does not change is the *dispatcher*:
+`atlas_service_dispatcher_run` takes one job, provisions one workspace, runs one
+attempt and completes it before asking for another. N siblings actually executing
+at once therefore needs N dispatcher processes.
+
+That is already safe rather than merely usual: the lease is a compare-and-swap
+and the partial unique index permits one unreleased lease per job, so two
+dispatchers polling the same queue cannot take the same task. Running several is
+an operator decision with no code change behind it.
+
+What a fix would be is the reason it is not here. "One dispatcher process running
+K attempts concurrently" means K workspaces, K child processes and K live leases
+inside one process, and every one of those is a resource the A7.1 boundary
+currently accounts for per process: the workspace root, the byte budget, the
+model dispatcher's session, and the log redaction path. Deciding K, deciding who
+sets it, and deciding what a partially-failed slot does to the others are three
+design questions A11.6 had no mandate for — and a bound whose enforcement lives
+in a loop counter rather than in the schema is the shape this repository has
+spent two seasons moving away from.
+
+The honest reading of the current state: **`max_parallel` is an admission limit,
+not a throughput promise.** A run may hold four tasks; whether four workers exist
+to run them is the operator's arrangement of dispatchers.
+
+## `test_apikey` failed once under full-suite load, and its output was lost
+
+During A11.6's one full-suite run, `test_apikey` failed while 88 tests shared a
+machine that was also running the production daemon and a semantic pass. It then
+passed thirteen consecutive re-runs — twelve of them started concurrently, plus
+one beside three live-daemon suites — with all six of its cases green each time,
+on the same binary and the same schema. Nothing A11.6 touched is on its path:
+the suite exercises A9's credential surface, and the only shared code is the
+core library and the migration chain, which those thirteen runs applied every
+time.
+
+The finding worth keeping is not the flake, it is that **the failure text was
+lost**: the suite's output travelled through a `tail` pipe and the re-run
+overwrote `LastTest.log`, so what actually failed is unrecoverable. A flaky test
+whose one failure cannot be read is a test nobody can fix. Next time it fires,
+capture `Testing/Temporary/LastTest.log` before running anything else; if it
+does not fire again, this entry is the record that one failure on 2026-08-19 was
+observed under load and never explained.

@@ -1063,6 +1063,13 @@ typedef struct atlas_job_render {
     /* The run's active task was already held, so nothing was started. Neither
      * an acceptance nor a refusal: the run stays ACTIVE and resumable. */
     bool busy;
+    /* A11.6. For `job run-status`: how many tasks in the run are non-terminal,
+     * and how many it may hold. Both are zero when the daemon did not report
+     * them — an older daemon against a newer CLI — and a renderer prints the
+     * line only when the bound is present, because zero is not a claim that a
+     * run allows nothing. */
+    int64_t active_count;
+    int64_t max_parallel;
     /* A10.0. What the run cost, for `job run-status`. `usage_status` is
      * `ATLAS_USAGE_UNKNOWN` when the daemon reported none — an older daemon
      * against a newer CLI reads exactly that, which is the conservative value
@@ -1119,6 +1126,18 @@ typedef struct atlas_job_submit_opts {
      * no model payload reaches this field, because no MCP tool and no gateway
      * route reaches `job.submit`. */
     const char *memory;
+    /* A11.6. The task this submission follows, which is what puts it in that
+     * task's run. NULL or empty means this is a root task and creates its own
+     * run. The daemon resolves it against stored rows — it must exist, describe
+     * the same repository, be pinned to the run's commit, and leave the run with
+     * room — and refuses rather than repairs on every one of those. */
+    const char *parent;
+    /* A11.6. How many tasks the run this submission creates may hold active at
+     * once. Zero means "not stated" and resolves to one, which is what every run
+     * did before this existed; anything outside `1..ATLAS_ORCH_RUN_MAX_PARALLEL`
+     * is refused rather than reduced, and naming it together with `parent` is
+     * refused too — a run's bound is fixed at its root. */
+    int64_t max_parallel;
 } atlas_job_submit_opts;
 
 /* A11.1. `atlas job run`: submit a root task and drive its run to a settled
@@ -1143,6 +1162,12 @@ typedef struct atlas_job_run_opts {
      * package is frozen against the run, so honouring the flag would be a lie
      * and dropping it silently would be a worse one. */
     const char *memory;
+    /* A11.6. As `atlas_job_submit_opts::max_parallel`, and it applies only to
+     * the start form. Naming it while resuming is refused rather than ignored,
+     * for the reason `memory` is: the bound is fixed against the run when the
+     * run is created, so honouring the flag would be a lie and dropping it
+     * silently would be a worse one. */
+    int64_t max_parallel;
     /* Where the driver narrates what it is doing. NULL is silent. */
     FILE *log;
 } atlas_job_run_opts;

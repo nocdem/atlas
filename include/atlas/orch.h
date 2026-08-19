@@ -372,8 +372,36 @@ bool atlas_orch_lease_in_grace(int64_t deadline_ms, int64_t at_ms, int64_t conte
  *
  * `ATLAS_ORCH_MAX_ATTEMPTS` is a different bound with a different subject: how
  * many attempts one *task* may make. Both apply, and the tighter one wins,
- * which is why this is never compared against it. */
+ * which is why this is never compared against it.
+ *
+ * A11.6 narrows the *subject* without moving the number: it counts the worker
+ * starts of the run's **repo-tree chain**, and a parallel workspace sibling
+ * spends none of it. A sibling runs in an A8 snapshot workspace and is bounded
+ * by its own `max_attempts`; letting it eat the chain's budget would mean a run
+ * could be denied the follow-up its gate failure earned because something else
+ * was busy. Every run that predates parallelism has only repo-tree tasks in it,
+ * so no existing count moves. */
 #define ATLAS_ORCH_RUN_MAX_WORKER_STARTS 3
+
+/* --- A11.6: how many tasks may be active in one run at once -----------------
+ *
+ * The absolute ceiling, and a refusal point rather than a trimming point: a
+ * submission asking for more is refused with the bound named, exactly as every
+ * other bound in this file is. A run's *own* limit is fixed at its root task and
+ * may be anything from 1 to this; the default is 1, which is the behaviour every
+ * run had before this constant existed.
+ *
+ * The schema duplicates the value twice — a `CHECK` on `orch_runs.max_parallel`
+ * and a `CHECK` on `orch_jobs.run_slot` — because SQLite cannot read a C macro,
+ * and `tests/test_orch_parallel.c` asserts the two agree over the boundary
+ * rather than trusting that they were kept in step by hand. Raising it means
+ * raising it in three places and in a migration, which is deliberate: the slot
+ * index is what makes "at most this many active tasks" a fact about stored rows.
+ *
+ * It bounds *tasks*, not repo-tree tasks. At most one task per run may work in
+ * the registered repository's own tree whatever this says — that exclusivity is
+ * a separate partial unique index and is not something a bound can widen. */
+#define ATLAS_ORCH_RUN_MAX_PARALLEL 8
 
 /* How much of a failing gate's real output travels into the follow-up task's
  * text. Bounded because it is UNTRUSTED_DATA a compiler or a test runner

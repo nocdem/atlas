@@ -2406,7 +2406,11 @@ is the design.
 ### A chain of tasks was resolvable and nobody could carry it
 
 A11.0 made the chain a fact about stored rows: a parent that resolves, a run that
-groups, one active task enforced by a partial unique index. It started no worker,
+groups, one active task enforced by a partial unique index. (A11.6 narrowed that
+last one rather than removing it — **one active *repo-tree* task per run** in the
+schema, with the run's total active tasks bounded by its own `max_parallel`,
+slots in the schema and the bound checked in C. See the A11.6 rules below.) It
+started no worker,
 settled no run, and said so — `ACCEPTED` and `BLOCKED` had no producer in
 production code, and *who may decide* was named as A11.1's question rather than
 guessed at.
@@ -2521,7 +2525,11 @@ with the parent already terminal. Three independent mechanisms would all have to
 fail together for a run to sprout two follow-ups for one failure:
 
 1. the transaction, which makes the completion and the creation one act;
-2. `idx_orch_jobs_one_active_per_run`, which permits one non-terminal task;
+2. `idx_orch_jobs_one_active_repo_tree`, which permits one non-terminal task in
+   the repository's own tree (before A11.6 this was
+   `idx_orch_jobs_one_active_per_run`, which permitted one non-terminal task of
+   any kind; the guarantee a follow-up rests on is the repo-tree half and that
+   half is unchanged);
 3. the idempotency key `a11.<parent>.<attempt>`, derived from the failure it
    answers, so a resumed or replayed completion resolves to the task that already
    exists rather than making a second one.
@@ -2646,3 +2654,115 @@ it drives one run, and when it returns nothing of it is still running.
 A11.1 also adds no model selection of any kind. There is one model driver,
 `claude-repo`, it executes the installed Claude Code CLI, and which model that
 CLI uses is the CLI's business and the operator's.
+
+## A11.6 layers — additions
+
+| File | What it owns |
+| --- | --- |
+| `src/db/migrate.c` | migration 24: `orch_runs.max_parallel`, `orch_jobs.run_slot`, and the two partial unique indexes that replace M21's one |
+| `src/db/db_orch.c` | slot assignment, the admission refusals, the repo-tree budget filter, and settlement at quiescence |
+| `src/ipc/server_orch.c` | the `parallel` submit parameter, and the `active_count`/`max_parallel` keys on `job.run_status` |
+| `src/core/service_orch.c` | `--parent`/`--parallel` on the wire, the resume refusal, and the conservative remote parse |
+
+## A11.6 rules — these are not negotiable
+
+### One active task per run was a bound on the wrong thing
+
+A11.0 bounded a run at one active task, and that bound was carrying two different
+arguments at once. One of them is about the *repository*: the registered tree is
+a single resource and two workers editing it at the same time is incoherent, not
+merely slow. The other is about *how much a run may have in flight*, which is a
+resource question with no principled answer of one.
+
+A11.6 separates them. The repository argument keeps a partial unique index and
+becomes stricter in what it names — `idx_orch_jobs_one_active_repo_tree`, over
+the repo-tree drivers only, and no bound may widen it. The in-flight argument
+becomes `orch_runs.max_parallel`, fixed at the root task, defaulting to 1, and
+held by a unique index on `(run_uid, run_slot)`.
+
+**Both live in the schema.** The checks in `submit_resolve_run` exist so a caller
+gets a sentence naming the task in the way rather than a constraint violation it
+cannot act on, which is M21's arrangement and `M8_LEASES`' before it. With the C
+checks disabled the submissions are still refused; `tests/test_orch_parallel.c`
+proves that by bypassing the write point entirely.
+
+### The bound is refused, never clamped, and never on a child
+
+Outside `1..ATLAS_ORCH_RUN_MAX_PARALLEL` is a refusal with the bound named — A5's
+rule about `--older-than`, which A8 already applies to every other bound in
+`orch.h`. Zero means "not stated" and resolves to one.
+
+Naming it on a task that joins a run is refused, and so is naming it on
+`--resume`. That is A10.1's `--memory --resume` rule and its reason: a run's
+parallelism is frozen when the run is created, so honouring the flag afterwards
+would be a lie and dropping it silently would be worse — a dropped flag reads, in
+a transcript, exactly like an honoured one.
+
+It travels on `atlas_orch_op` and never on `atlas_orch_spec`, so
+`ATLAS_ORCH_SPEC_DOMAIN` did not move and no stored `spec_digest` means anything
+different than it did.
+
+### A run holds one pin
+
+A child's `source_commit` must equal the **root's**, not its immediate parent's.
+Two pins in one run would make ACCEPTED ambiguous — the gates passed over *which*
+tree? — and comparing against the parent would let a chain drift a commit at a
+time until nothing in it shared a tree with anything else.
+
+### A run settles only at quiescence, and the scan is the verdict
+
+Nothing is ACCEPTED or BLOCKED while any task in the run is non-terminal: a task
+that has not ended has not said what it did. At zero active tasks the run settles
+by scanning every task in it — SUCCEEDED, or FAILED with a child in the same run
+(a failure that was answered) — and by re-checking the repository identity from
+the root, at the moment of settlement, because it was checked at lease time and
+that is not the same claim.
+
+Settle-eligibility is the **root** task's driver, asked in C and never in SQL. It
+is the root's rather than the completing task's because a workspace sibling's
+completion must be able to bring its run to quiescence, while a plain A8
+workspace run must still settle nothing at all — A11.0's answer for those runs is
+unchanged.
+
+Two consequences, both deliberate:
+
+- **A gateless workspace sibling can veto acceptance and can never grant it.**
+  ACCEPTED still flows only from the gated repo-tree chain succeeding.
+- **A doomed run does not stop the chain mid-run.** A cancelled or failed sibling
+  does not interrupt the repo-tree task beside it; the run spends at most its
+  bounded budget and then settles BLOCKED. One task's failure must not break
+  another task's execution.
+
+### Three worker starts is the chain's budget, not the run's
+
+`ATLAS_ORCH_RUN_MAX_WORKER_STARTS` is unchanged at 3 and now says what it counts:
+transitions into RUNNING for the run's **repo-tree** jobs. A workspace sibling
+spends none of it and is bounded by its own `max_attempts` — A8's semantics,
+untouched. A sibling that could eat the chain's budget would let a run be denied
+the follow-up its gate failure had earned because something else happened to be
+busy.
+
+No existing count moves: before parallelism every job in a repo-tree run was a
+repo-tree job, because a follow-up inherits its parent's driver.
+
+### The view's active task is a claim target, not a census
+
+`active_job_uid` names the task a run driver may claim, and for a repo-tree run
+that is the repo-tree task specifically. It is empty while the chain is done and
+a sibling is still going, which is an ordinary mid-run answer rather than an
+ending — so `active_count` travels beside it, and a reader that inferred one from
+the other would read such a run as idle.
+
+Both new keys are absent from an older daemon and both parse to zero, which is
+the conservative value in either direction: zero is never a claim that a run is
+idle and never a claim that its bound is nothing. A9.2.5's rule for an absent
+key, and the renderers print the line only when the bound is present.
+
+### A11.6 adds no mechanism
+
+No thread, no process, no timer, no background loop, no scheduler. No new RPC
+method, MCP tool or gateway route, and no second submit path;
+`atlas_db_orch_run_set_status` still has no caller outside `src/db/db_orch.c`. No
+new isolation: a parallel sibling is a workspace task under A8's existing
+isolation, provisioned by the dispatchers that already exist. What A11.6 changed
+is which submissions are admitted and when a run is allowed to decide.

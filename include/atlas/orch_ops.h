@@ -185,6 +185,23 @@ typedef struct atlas_orch_op {
      * it — is read as OFF at the write point. A default that quietly enabled
      * memory would be the one mistake this milestone cannot make. */
     atlas_orch_memory_mode memory_mode;
+
+    /* A11.6. SUBMIT. How many tasks this run may hold active at once.
+     *
+     * On the operation and never on `atlas_orch_spec`, for A10.1's reason
+     * exactly: `memory_mode` sits here because putting it on the specification
+     * would move `ATLAS_ORCH_SPEC_DOMAIN` and every stored `spec_digest` would
+     * then mean something different than it did. This is the same kind of value
+     * — a property of the *run* being created, decided by the act of submitting
+     * rather than by the work requested — and it goes in the same place.
+     *
+     * Zero — the zero, so an unset operation says it — means "not stated" and
+     * resolves to 1, which is what every run did before this field existed. A
+     * value outside `[0, ATLAS_ORCH_RUN_MAX_PARALLEL]` is refused rather than
+     * clamped, and naming it on a *child* submission is refused too: a run's
+     * parallelism is fixed at its root, and a flag that was quietly dropped
+     * reads exactly like one that was honoured. */
+    int64_t run_max_parallel;
 } atlas_orch_op;
 
 atlas_orch_op *atlas_orch_op_new(atlas_orch_op_kind kind);
@@ -352,11 +369,30 @@ typedef struct atlas_orch_run_view {
     char root_job_uid[ATLAS_ORCH_UID_MAX];
     char repo_identity_hash[65];
     atlas_orch_run_status status;
-    /* The run's single non-terminal task, or empty when it has none. Empty is
-     * an ordinary answer — a run between tasks — and never an error. */
+    /* The non-terminal task the run driver may claim, or empty when it has
+     * none. Empty is an ordinary answer — a run between tasks, or a run whose
+     * repo-tree chain is done while a workspace sibling is still going — and
+     * never an error.
+     *
+     * For a run whose root works in the repository's own tree this names the
+     * active **repo-tree** task specifically, because that is the one a run
+     * driver can claim and there is at most one of them by construction. For
+     * every other run it names the run's first active task, which is what it has
+     * always named. */
     char active_job_uid[ATLAS_ORCH_UID_MAX];
     atlas_orch_state active_state;
     char created_at[ATLAS_ORCH_TS_MAX];
+    /* A11.6. Every non-terminal task in the run, and the bound the run was
+     * created with. `active_count` counts workspace siblings as well as the
+     * repo-tree task, so it is the number `max_parallel` bounds and is not
+     * derivable from `active_job_uid`.
+     *
+     * Both are zero when they are unknown, which is what a reader sees from a
+     * daemon that predates them: zero is never a claim that a run has no active
+     * task and never a claim that its bound is zero, because a stored run's
+     * bound is at least one. A11.5a's remote parser rule, one layer out. */
+    int64_t active_count;
+    int64_t max_parallel;
 } atlas_orch_run_view;
 
 /* A10.0. What a run cost, derived on every read from the per-attempt rows.

@@ -587,6 +587,14 @@ static atlas_status h_job_item(atlas_renderer *r, const atlas_job_render *jr, at
                       (long long)jr->worker_starts,
                       (long long)ATLAS_ORCH_RUN_MAX_WORKER_STARTS, (long long)jr->tasks);
     }
+    /* A11.6. Printed only when the bound is present, which it is not from a
+     * daemon that predates it. An absent bound must never render as "0", which
+     * would read as a run that may hold no tasks at all — a claim Atlas would be
+     * making from a key it never received. */
+    if (jr->max_parallel > 0) {
+        (void)fprintf(out, "active tasks  %lld of %lld allowed at once\n",
+                      (long long)jr->active_count, (long long)jr->max_parallel);
+    }
     if (jr->usage_present) {
         /* A10.0. What the run cost. The status is printed first and always,
          * because every number under it is meaningless without knowing whether

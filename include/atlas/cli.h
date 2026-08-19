@@ -184,6 +184,14 @@ typedef struct atlas_cli_opts {
          * by the daemon, which refuses a spelling it does not know rather than
          * skipping it. */
         const char *memory;
+        /* A11.6. `--parent JOB` on `job submit`: the task this one follows, and
+         * therefore the run it joins. `--parallel N` on `job submit` and
+         * `job run`: how many tasks the run being created may hold active at
+         * once. Zero is "not stated" and means one; the daemon refuses anything
+         * outside its bound rather than reducing it, and refuses the two
+         * together — a run's bound is fixed at its root. */
+        const char *parent;
+        long parallel;
     } job;
     /* A9.2.1. The verification-intake fields, grouped for the reason the A4
      * ones are: there are a dozen and a half of them, six subcommands use

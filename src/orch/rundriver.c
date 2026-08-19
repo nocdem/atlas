@@ -979,10 +979,24 @@ atlas_status atlas_rundriver_run(const atlas_rundriver_opts *o, atlas_rundriver_
             return ATLAS_OK;
         }
         if (rv.active_job_uid[0] == '\0') {
-            /* ACTIVE with nothing to do. Left exactly as it is: it is resumable,
-             * and inventing a task for it here would be this milestone deciding
-             * something it was not asked to decide. */
-            say(o, "run %s is active with no task to claim", o->run_uid);
+            /* ACTIVE with nothing for *this* driver to do. Left exactly as it
+             * is: it is resumable, and inventing a task for it here would be
+             * this milestone deciding something it was not asked to decide.
+             *
+             * A11.6 makes that two different situations, and they are said
+             * differently because an operator would act differently on them. A
+             * run with nothing active is between tasks. A run whose repo-tree
+             * chain is finished while workspace siblings are still going has
+             * work in flight that this driver cannot claim — the run will settle
+             * when they end, and running this command again now would still find
+             * nothing. */
+            if (rv.active_count > 0) {
+                say(o, "run %s has no task in the repository's tree to claim; %lld other "
+                       "task(s) are still running and the run settles when they end",
+                    o->run_uid, (long long)rv.active_count);
+            } else {
+                say(o, "run %s is active with no task to claim", o->run_uid);
+            }
             return ATLAS_OK;
         }
         bool did = false;

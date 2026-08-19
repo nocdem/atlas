@@ -349,11 +349,17 @@ static void wind_back_to_schema_12(env *e, atlas_err *err) {
          * list exists: a rewind that leaves a later migration's table behind is
          * not a database at the version it claims, and migration 23 would then
          * fail to create it. */
+        /* A11.6's two indexes and its column on `orch_jobs`, for the same
+         * reason: migration 24 replaced migration 21's single index with two,
+         * so undoing 21 means undoing 24 first, and the indexes go before the
+         * columns because SQLite refuses to drop an indexed one. */
         "DROP TABLE orch_run_memory;"
         "DROP TABLE orch_usage;"
         "DROP TABLE orch_runs;"
-        "DROP INDEX idx_orch_jobs_one_active_per_run;"
+        "DROP INDEX idx_orch_jobs_one_active_repo_tree;"
+        "DROP INDEX idx_orch_jobs_active_slot;"
         "DROP INDEX idx_orch_jobs_run;"
+        "ALTER TABLE orch_jobs DROP COLUMN run_slot;"
         "ALTER TABLE orch_jobs DROP COLUMN run_uid;"
         "DELETE FROM schema_migrations WHERE version >= 13;";
 

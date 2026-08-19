@@ -13,7 +13,8 @@ A11.0 made a chain of tasks a fact about stored rows and settled nothing: who
 may decide a run was named as A11.1's question. The answer is a foreground run
 driver an operator starts, settlement that travels only on a task completion,
 gates fixed at the root task and inherited verbatim, and three worker starts per
-run counted in the ledger. **A11.1 added no migration; A10.0 added 22 and A10.1 added 23.** See the
+run counted in the ledger. **A11.1 added no migration; A10.0 added 22, A10.1
+added 23 and A11.6 added 24.** See the
 A11.1 section in `docs/roadmap.md`, `docs/orchestration.md` and
 `docs/engineering-rules.md`.
 
@@ -96,6 +97,7 @@ document that carries it:
 
 | Season | What it added | Document |
 | --- | --- | --- |
+| A11.6 | bounded parallel tasks in a run; the repository's own tree kept exclusive, and settlement deferred to quiescence | `docs/orchestration.md` |
 | A10.1 | the bounded cross-run memory package, and the A/B experiment that found it USEFUL on time and not on cost | `docs/orchestration.md` |
 | A11.1–A11.4 | the run driver, the gates Atlas runs itself, one follow-up per failure, and the bound that ends the chain | `docs/orchestration.md` |
 | A11.0 | the run a chain of tasks belongs to; a parent that resolves, and one active task in it | `docs/orchestration.md` |
@@ -618,7 +620,10 @@ is not written down is one somebody deletes.** Both halves are load-bearing.
 - **"One active task per run" is a partial unique index**, following `M8_LEASES`'
   precedent. With the C check disabled the submission is still refused, by the
   constraint: the schema is the guarantee and the check is there to name the task
-  in the way instead of raising a constraint violation nobody can act on.
+  in the way instead of raising a constraint violation nobody can act on. A11.6
+  narrowed this to **one active *repo-tree* task per run** and added a second
+  index for the run's own bound; both are still in the schema and for this
+  reason.
 - **CANCEL_REQUESTED is not terminal on either side.** A task asked to stop has
   not stopped, and a run that admitted a second task at that moment would have
   two. The SQL predicate and `atlas_orch_state_is_terminal` are compared over the
@@ -675,6 +680,43 @@ is not written down is one somebody deletes.** Both halves are load-bearing.
   phase it is already in. A failed renewal never kills the child.
 - **The run driver starts nothing in the background** — no scheduler, no polling,
   no timer, no model router, no second submit path.
+
+### A11.6 — bounded parallel tasks in a run
+
+- **ONE ACTIVE TASK PER RUN WAS A BOUND ON TWO DIFFERENT THINGS.** The
+  repository's own tree is a single resource; how much a run may have in flight
+  is a resource question with no principled answer of one. Migration 24 separates
+  them: **at most one active repo-tree task per run, always**, and up to
+  `orch_runs.max_parallel` active tasks in total.
+- **Both bounds are in the schema.** `idx_orch_jobs_one_active_repo_tree` and
+  `idx_orch_jobs_active_slot` over `(run_uid, run_slot)`; the C checks exist so a
+  caller gets a sentence, exactly as M21 arranged it.
+- **The bound is fixed at the root, defaults to 1, and is refused rather than
+  clamped.** Naming it on a child or on `--resume` is refused, not ignored —
+  A10.1's `--memory --resume` rule. It travels on `atlas_orch_op`, never on
+  `atlas_orch_spec`, so `ATLAS_ORCH_SPEC_DOMAIN` did not move.
+- **A run holds one pin.** A child's `source_commit` is compared against the
+  **root's**, because two pins would make ACCEPTED ambiguous and comparing
+  against the parent would let a chain drift a commit at a time.
+- **A run settles only at quiescence.** Nothing is ACCEPTED or BLOCKED while any
+  task is non-terminal. At zero active tasks the verdict is a scan: ACCEPTED iff
+  every task SUCCEEDED or FAILED-with-a-child, plus the repository-identity
+  re-check from the root; otherwise BLOCKED. Settle-eligibility is the **root**
+  task's driver, asked in C and never in SQL.
+- **A gateless workspace sibling can veto acceptance and can never grant it**,
+  and **a doomed run does not stop the chain mid-run** — one task's failure must
+  not break another task's execution, so the run spends at most its bounded
+  budget before the final BLOCKED.
+- **Three worker starts is the repo-tree chain's budget, not the run's.** A
+  sibling spends none of it and is bounded by its own `max_attempts`. No existing
+  count moves: before parallelism every job in a repo-tree run was repo-tree.
+- **`active_job_uid` is a claim target, not a census.** Empty while the chain is
+  done and a sibling still runs; `active_count` is what says whether anything is
+  left. Both new keys parse to zero when absent, and zero is never a claim.
+- **No thread, no process, no timer, no background loop, no new isolation, no new
+  RPC method, MCP tool, gateway route or second submit path.** Adding a repo-tree
+  driver now also requires a migration, because an index predicate carries the
+  list.
 
 ### A10.1 — bounded cross-run memory
 

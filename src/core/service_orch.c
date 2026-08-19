@@ -163,6 +163,10 @@ static atlas_status build_submit(atlas_json *j, void *ud, atlas_err *err) {
         /* A10.1. Absent means off at the daemon, so an empty value is simply
          * not sent rather than sent as "off" — one spelling of the default. */
         {"memory", o->memory},
+        /* A11.6. The task this one follows, which is what puts it in that task's
+         * run. Absent means "this is a root task", so an empty value is not
+         * sent: an empty identifier reads like an identifier. */
+        {"parent", o->parent},
     };
     for (size_t i = 0; st == ATLAS_OK && i < sizeof opt / sizeof opt[0]; i++) {
         if (opt[i].v != NULL && opt[i].v[0] != '\0') {
@@ -176,6 +180,9 @@ static atlas_status build_submit(atlas_json *j, void *ud, atlas_err *err) {
         {"wall_timeout_ms", o->wall_timeout_ms},
         {"idle_timeout_ms", o->idle_timeout_ms},
         {"max_attempts", o->max_attempts},
+        /* A11.6. Absent means "not stated", which the daemon resolves to one.
+         * Zero is therefore not sent — it is the same request as not asking. */
+        {"parallel", o->max_parallel},
     };
     for (size_t i = 0; st == ATLAS_OK && i < sizeof nums / sizeof nums[0]; i++) {
         if (nums[i].v > 0) {
@@ -219,6 +226,15 @@ atlas_status atlas_service_job_submit(atlas_ctx *ctx, const atlas_job_submit_opt
     }
     if (o->task == NULL || o->task[0] == '\0') {
         return atlas_err_set(err, ATLAS_ERR_USAGE, "a job needs task text");
+    }
+    if (o->max_parallel != 0 && o->parent != NULL && o->parent[0] != '\0') {
+        /* A11.6. The same refusal the daemon gives, given here too so an
+         * operator who typed both learns it without a round trip. It is stated
+         * in the same words deliberately: two spellings of one rule read as two
+         * rules. */
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "how many tasks a run may hold active is fixed when the run is "
+                             "created, so it cannot be named on a task that joins one");
     }
     /* Copied rather than const-cast: a cast that discards a qualifier is right
      * today and wrong after one edit. */
@@ -752,6 +768,19 @@ static atlas_status xport_run_get(void *ud, const char *run_uid, atlas_orch_run_
         if (atlas_ipc_result_str(resp, "active_state", &v) && v != NULL) {
             (void)atlas_orch_state_parse(v, &out->active_state);
         }
+        /* A11.6. Both keys are left at zero when they are absent, which is what
+         * a newer CLI reads from a daemon that predates them. Zero is the
+         * conservative value in both directions — it is never a claim that a run
+         * has no active task, and never a claim that its bound is nothing,
+         * because a stored run's bound is at least one. A9.2.5's rule for an
+         * absent key, and never an error. */
+        int64_t n = 0;
+        if (atlas_ipc_result_int(resp, "active_count", &n)) {
+            out->active_count = n;
+        }
+        if (atlas_ipc_result_int(resp, "max_parallel", &n)) {
+            out->max_parallel = n;
+        }
     }
     atlas_ipc_response_free(resp);
     atlas_buf_free(&raw);
@@ -777,6 +806,19 @@ atlas_status atlas_service_job_run_status(atlas_ctx *ctx, const char *run, atlas
         (void)atlas_ipc_result_str(resp, "created_at", &jr.created_at);
         (void)atlas_ipc_result_str(resp, "active_state", &jr.state);
         (void)atlas_ipc_result_str(resp, "active", &jr.follow_up);
+        /* A11.6. How many tasks are running and how many the run allows. Both
+         * stay zero when the daemon does not report them, and the renderers
+         * print the line only when the bound is present — an absent key must not
+         * render as a claim that a run allows nothing. */
+        {
+            int64_t n = 0;
+            if (atlas_ipc_result_int(resp, "active_count", &n)) {
+                jr.active_count = n;
+            }
+            if (atlas_ipc_result_int(resp, "max_parallel", &n)) {
+                jr.max_parallel = n;
+            }
+        }
         /* A10.0. Every absent key leaves the conservative value: a daemon that
          * does not report usage is read as UNKNOWN, never as an error and never
          * as a zero total. */
@@ -867,6 +909,15 @@ atlas_status atlas_service_job_run(atlas_ctx *ctx, const atlas_job_run_opts *o,
                              "--memory applies when a run is created; the package a run was "
                              "frozen with cannot be changed by resuming it");
     }
+    if (resuming && o->max_parallel != 0) {
+        /* A11.6. Refused rather than ignored, for A10.1's reason exactly: how
+         * many tasks a run may hold active is fixed when the run is created, so
+         * a resume cannot change it — and a flag that is silently dropped reads,
+         * afterwards, exactly like one that was honoured. */
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "--parallel applies when a run is created; the bound a run was "
+                             "created with cannot be changed by resuming it");
+    }
     if (resuming && (o->repo != NULL || o->task != NULL)) {
         /* Refused rather than silently preferring one. A caller that named both
          * a new task and a run to resume has asked for two different things and
@@ -914,6 +965,7 @@ atlas_status atlas_service_job_run(atlas_ctx *ctx, const atlas_job_run_opts *o,
         so.idle_timeout_ms = o->idle_timeout_ms;
         so.max_attempts = ATLAS_ORCH_RUN_MAX_WORKER_STARTS;
         so.memory = o->memory;
+        so.max_parallel = o->max_parallel;
         for (size_t i = 0; i < o->gate_count && i < 8u; i++) {
             so.gates[so.gate_count++] = o->gates[i];
         }

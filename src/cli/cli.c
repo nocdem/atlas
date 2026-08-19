@@ -58,8 +58,11 @@ void atlas_cli_print_help(FILE *out) {
         "  job submit --repo NAME --task TEXT [--driver D] [--mode M]\n"
         "                            [--gate CMD]... [--memory off|bounded]\n"
         "                            [--idempotency-key K] [--attempts N]\n"
+        "                            [--parent JOB] join that task's run\n"
+        "                            [--parallel N] tasks the new run may hold\n"
+        "                                           active at once (default 1)\n"
         "  job run --repo NAME --task TEXT --gate CMD [--gate CMD]...\n"
-        "                            [--memory off|bounded]\n"
+        "                            [--memory off|bounded] [--parallel N]\n"
         "                            start one run and drive it in the foreground\n"
         "  job run --resume RUN      continue a run that already exists\n"
         "  job run-status RUN        what a run is waiting on, and how it ended\n"
@@ -109,11 +112,18 @@ void atlas_cli_print_help(FILE *out) {
         "  decision link remove REPO SOURCE TARGET  withdraw a relation (--why required)\n"
         "  decision link note REPO SOURCE TARGET    record why, without changing links\n"
         "  decision links REPO ID     one decision's relations, with why each exists\n"
-        "  decision orphaned          decisions attached to no registered repository\n"
-        "  decision legacy NAME       A2 decision proposals, and which were promoted\n"
-        "  decision promote NAME ID   make an A4 document from an A2 proposal\n"
         ,
         ATLAS_VERSION_STRING, ATLAS_PHASE);
+    /* A11.6. A fourth split, for the reason the three below exist and by the
+     * same mechanism: `job submit --parent/--parallel` pushed the first literal
+     * past the length ISO C99 guarantees. The three lines moved here print in
+     * the same place they always did — this is where the first block ends, not a
+     * reordering. */
+    (void)fprintf(
+        out,
+        "  decision orphaned          decisions attached to no registered repository\n"
+        "  decision legacy NAME       A2 decision proposals, and which were promoted\n"
+        "  decision promote NAME ID   make an A4 document from an A2 proposal\n");
     /* A9.2.5. A third split, for the reason the second exists: the eight
      * semantic commands below pushed the first literal past the length ISO C99
      * guarantees.
@@ -528,6 +538,23 @@ static atlas_status parse_args(cli_state *st, int argc, char **argv, bool *want_
                                          "--memory needs off or bounded");
                 }
                 st->opts.job.memory = argv[++i];
+            } else if (strcmp(a, "--parent") == 0) {
+                if (i + 1 >= argc) {
+                    return atlas_err_set(err, ATLAS_ERR_USAGE, "--parent needs a job identifier");
+                }
+                st->opts.job.parent = argv[++i];
+            } else if (strcmp(a, "--parallel") == 0) {
+                if (i + 1 >= argc) {
+                    return atlas_err_set(err, ATLAS_ERR_USAGE, "--parallel needs a number");
+                }
+                /* Parsed rather than `strtol`ed, unlike the A8 group above:
+                 * `--parallel nonsense` becoming zero would resolve to one at
+                 * the daemon, which is a clamp wearing a default's clothes and
+                 * the one thing this bound must not do. */
+                atlas_status ps = parse_long(argv[++i], "--parallel", &st->opts.job.parallel, err);
+                if (ps != ATLAS_OK) {
+                    return ps;
+                }
             } else if (strcmp(a, "--resume") == 0) {
                 if (i + 1 >= argc) {
                     return atlas_err_set(err, ATLAS_ERR_USAGE, "--resume needs a run identifier");
@@ -3220,6 +3247,8 @@ static atlas_status run_job(cli_state *st, atlas_renderer *r, int64_t limit, atl
             o.gates[o.gate_count++] = st->opts.job.gates[g];
         }
         o.memory = st->opts.job.memory;
+        o.parent = st->opts.job.parent;
+        o.max_parallel = st->opts.job.parallel;
         result = renderer_open(r, st->opts.json, st->out, "job submit", err);
         if (result == ATLAS_OK) {
             result = atlas_service_job_submit(NULL, &o, emit_job, &jc, err);
@@ -3254,6 +3283,7 @@ static atlas_status run_job(cli_state *st, atlas_renderer *r, int64_t limit, atl
             o.gates[o.gate_count++] = st->opts.job.gates[g];
         }
         o.memory = st->opts.job.memory;
+        o.max_parallel = st->opts.job.parallel;
         /* The narration goes to stderr, so `--json` still puts exactly one
          * document on stdout. */
         o.log = st->opts.json ? stderr : st->out;

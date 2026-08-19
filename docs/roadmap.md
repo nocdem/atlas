@@ -792,19 +792,55 @@ A11.5a held constant what it said it would: no cross-run memory, no second model
 role, one worker at a time, and nothing learned in a run became an input to a
 later one.
 
-## Next: A10 — cross-run memory A/B experiment
+## A10.0 — durable run usage telemetry (CLOSED)
 
-With a pilot that can carry a real task to `ACCEPTED`, the question A10 exists to
-answer becomes askable: does cross-run memory make a worker better, and by how
-much. A11.5a is the memory-**off** baseline for it, and its numbers are the ones
-an A/B compares against.
+A11.5a closed with a residual that made the milestone after it impossible: Atlas
+could not report what a successful run cost. The worker log carrying the figures
+is dropped above the inline artifact ceiling, the result spool holding a second
+copy is cleared the moment a completion is accepted, and the numbers for the
+accepted pilot survived only in the worker's own session transcript — a file that
+exists because A8.1's model dispatcher borrows the operator's login and would not
+exist for a worker running as `atlas-worker`.
 
-Two things are worth saying before that starts. The residual above — a large
-worker log discarded on the success path — should be closed first, because an
-experiment whose control arm cannot report its own token usage is not an
-experiment. And A11.5a's own history is the warning: three of its four runs were
-blocked by defects nothing in the suite could see, so an A/B that measures a
-difference must first establish that both arms ran at all.
+**What was established before anything was written.** The canonical source is the
+final `result` record of a `stream-json` run and nothing else: its `usage` block
+is the attempt total already. A real twelve-turn run reported 7 275 output tokens
+there while the per-message records in the same stream summed to 274, which
+settles the double-counting question by measurement rather than by argument. The
+record is present on failures too — an interrupted run still carried its turn
+count, its cost and a full usage block — so a failed attempt can still say what
+it spent.
+
+**The three states are the milestone.** `UNKNOWN` is not zero: an attempt whose
+usage was never observed did not cost nothing, and every count is stored
+nullable so absence stays absence. `PARTIAL` is a record that arrived with
+something missing or refused. Cost is provider-reported or nothing at all —
+Atlas estimates no price from token counts, because an estimate that reads like a
+measurement is worse than an absent one. A run total is derived on every read
+with the denominator taken from the ledger, so a run whose worker never spawned
+reads `UNKNOWN` rather than a tidy zero, and there is no field called
+`total_cost` for a run one of whose attempts reported no price.
+
+Migration 22 is additive and backfills nothing, deliberately. A11.5a's runs are
+left without rows rather than reconstructed from a transcript: a baseline
+assembled by hand is not one an experiment can compare against.
+
+## Next: A10.1 — cross-run memory A/B experiment
+
+With a pilot that can carry a real task to `ACCEPTED` and telemetry that can say
+what it cost, the question becomes askable: does cross-run memory make a worker
+better, and by how much.
+
+One thing A10.0 does not give it. A11.5a's runs have no usage rows and will not
+be backfilled, so the memory-off arm has to be **re-run** under telemetry rather
+than compared against the pilot's figures. That is the honest ordering: A11.5a
+established that a real task can land, A10.0 established that a run can report
+its cost, and neither of those is a measurement of memory.
+
+And A11.5a's history is the standing warning: three of its four runs were blocked
+by defects nothing in the suite could see, so an A/B that measures a difference
+must first establish that both arms ran at all — which is exactly what
+`usage_status` is for. A `PARTIAL` arm is not a cheaper arm.
 
 **A10 is not closed and is not cancelled**, and the ordering is deliberate rather
 than an oversight. A10 is the Experience Learning phase, and the contract it must

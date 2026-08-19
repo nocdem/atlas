@@ -819,3 +819,25 @@ token — are changes to the lease model, not minimum fixes. A season that wants
 this should decide the authority question first and write it down; until then the
 honest statement is that a crashed driver costs an attempt, and the wall deadline
 bounds what that costs.
+
+## A10.0 closed one of A11.5a's two residuals
+
+The usage residual is gone: an attempt's cost is now read from the worker's final
+streamed record, made durable before the completion is offered, and stored per
+attempt in a table whose counts are nullable so that `UNKNOWN` and `0` stay
+different answers. A large worker log being dropped no longer takes the figures
+with it.
+
+**The second residual is unchanged.** Cross-crash completion settlement is still
+impossible without putting a bearer token on disk, and A10.0 did not touch it.
+Note that a usage row is written *inside* the completion transaction, so an
+attempt whose completion never lands has a durable `.usage` file and no row —
+which is the correct shape, and the same authority question decides whether
+anything may ever deliver it.
+
+**One thing A10.0 did not fix, and did not try to.** Atlas still records nothing
+about what a *gate* cost. Gates run real builds and test suites, and on the
+accepted A11.5a pilot they ran twice; the wall clock covers them but no token or
+CPU figure does. That is fine for comparing model arms against each other, which
+is what A10.1 needs, and it would not be fine for a claim about what a run costs
+in total. Worth stating before somebody reads a run's usage as the whole bill.

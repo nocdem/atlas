@@ -1053,6 +1053,26 @@ static atlas_status method_dispatch_complete(dispatch_state *ds, const atlas_ipc
     }
     op->peer_uid = ds->peer_uid;
     op->actor = ATLAS_ORCH_ACTOR_DISPATCHER;
+    /* A10.0. The attempt's cost, decoded through the same function that wrote
+     * it. Anything that does not decode leaves the operation at
+     * `ATLAS_USAGE_UNKNOWN`, which is the honest answer and never an error: a
+     * completion is not refused because its measurement was unreadable, because
+     * refusing it would lose the outcome as well as the number.
+     *
+     * This method is reachable only by the dispatcher uid — the group is
+     * disjoint from the client group and selected by `SO_PEERCRED` — so a model
+     * payload cannot send it, and no client-group method reads this key at
+     * all. */
+    {
+        const char *u = NULL;
+        if (atlas_ipc_param_str(req, "usage", &u) && u != NULL) {
+            atlas_err ignore;
+            atlas_err_init(&ignore);
+            if (atlas_usage_decode(u, &op->usage, &ignore) != ATLAS_OK) {
+                atlas_usage_init(&op->usage);
+            }
+        }
+    }
     st = take_token(req, op, err);
     if (st == ATLAS_OK) {
         (void)atlas_ipc_param_bool(req, "success", &op->success);

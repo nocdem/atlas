@@ -276,7 +276,64 @@ static void test_overflow_makes_a_total_incomplete(void) {
     T_CHECK_MSG(!atlas_usage_add(-1, 1, &out), "a negative addend was accepted");
 }
 
+/* --- 8: the wire form is the file form ------------------------------------- */
+
+/* The measurement is produced in the driver and stored by the daemon, and those
+ * are different processes. A completion carries it as one encoded summary, so
+ * the bytes on the wire and the bytes in the durable file are the same bytes and
+ * cannot disagree about what a field is called.
+ *
+ * This is asserted because the alternative has already happened twice in this
+ * repository: a gate list and then this measurement both reached the daemon
+ * wrong while every in-process test passed, because nothing exercised the
+ * composition the two sides actually use. Here it is, exercised. */
+static void test_the_wire_form_and_the_stored_form_are_one(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    atlas_usage u;
+    atlas_usage_from_stream(REAL_OK, strlen(REAL_OK), &u);
+
+    /* What the sender puts on the completion. */
+    atlas_buf wire = ATLAS_BUF_INIT;
+    T_OK(atlas_usage_encode(&u, &wire, &err), &err);
+
+    /* What the daemon makes of it. */
+    atlas_usage got;
+    T_OK(atlas_usage_decode(atlas_buf_cstr(&wire), &got, &err), &err);
+
+    T_CHECK(got.status == ATLAS_USAGE_AVAILABLE);
+    T_EQ_INT((int)got.input_tokens, (int)u.input_tokens);
+    T_EQ_INT((int)got.output_tokens, (int)u.output_tokens);
+    T_EQ_INT((int)got.cache_creation_tokens, (int)u.cache_creation_tokens);
+    T_EQ_INT((int)got.cache_read_tokens, (int)u.cache_read_tokens);
+    T_EQ_INT((int)got.cost_micro_usd, (int)u.cost_micro_usd);
+    T_EQ_INT((int)got.turns, (int)u.turns);
+    T_EQ_INT((int)got.duration_ms, (int)u.duration_ms);
+    T_CHECK(strcmp(got.model, u.model) == 0);
+    T_CHECK(strcmp(got.provider, u.provider) == 0);
+    atlas_buf_free(&wire);
+
+    /* A sender with nothing to report omits the key, and an absent key decodes
+     * to the same UNKNOWN it would have encoded — so the two ways of saying
+     * "nothing was measured" cannot be told apart, which is the point. */
+    atlas_usage none;
+    atlas_usage_init(&none);
+    atlas_usage absent;
+    atlas_usage_init(&absent);
+    T_CHECK(none.status == ATLAS_USAGE_UNKNOWN && absent.status == ATLAS_USAGE_UNKNOWN);
+
+    /* And anything that is not an Atlas summary is refused rather than
+     * half-read: a completion whose measurement is unreadable still completes,
+     * carrying UNKNOWN. */
+    atlas_usage junk;
+    T_CHECK(atlas_usage_decode("{\"input_tokens\":9999}", &junk, &err) != ATLAS_OK);
+    atlas_err_init(&err);
+    T_CHECK(atlas_usage_decode("atlas-usage-1\nstatus=WISHFUL\n", &junk, &err) != ATLAS_OK);
+}
+
 static const atlas_test TESTS[] = {
+    {"the_wire_form_and_the_stored_form_are_one",
+     test_the_wire_form_and_the_stored_form_are_one},
     {"a_real_final_record_is_read_exactly", test_a_real_final_record_is_read_exactly},
     {"an_interrupted_run_still_reports_what_it_spent",
      test_an_interrupted_run_still_reports_what_it_spent},

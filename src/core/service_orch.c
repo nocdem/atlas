@@ -525,6 +525,25 @@ static atlas_status build_run_complete(atlas_json *j, void *ud, atlas_err *err) 
     if (st == ATLAS_OK && op->driver_version.len > 0) {
         st = atlas_json_key_str(j, "driver_version", atlas_buf_cstr(&op->driver_version), err);
     }
+    /* A10.0. What the attempt cost, as one encoded summary rather than a dozen
+     * loose numbers, so the wire form and the durable file are the same bytes
+     * and cannot disagree about what a field is called.
+     *
+     * `dispatch.complete` is in the dispatcher-only method group, selected by
+     * `SO_PEERCRED` and disjoint from the client group, so this travels on a
+     * message a model payload cannot send at all — which is what keeps "a
+     * worker cannot write its own cost" true by the transport rather than by a
+     * check. Omitted entirely when nothing was measured: an absent key reads as
+     * UNKNOWN on the far side, which is the same answer and one fewer thing to
+     * get wrong. */
+    if (st == ATLAS_OK && op->usage.status != ATLAS_USAGE_UNKNOWN) {
+        atlas_buf enc = ATLAS_BUF_INIT;
+        st = atlas_usage_encode(&op->usage, &enc, err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "usage", atlas_buf_cstr(&enc), err);
+        }
+        atlas_buf_free(&enc);
+    }
     if (st == ATLAS_OK && op->artifact_count > 0) {
         st = atlas_json_key(j, "artifact", err);
         if (st == ATLAS_OK) {

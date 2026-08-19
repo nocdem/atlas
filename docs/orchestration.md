@@ -847,6 +847,25 @@ candidate** — absent, never guessed.
 1. Terminal runs only — `ACCEPTED` or `BLOCKED` — newest first, at most 64
    examined. A bound that is reached is reported, not silent.
 2. Same lineage, as above.
+2b. **Never a run that carries a memory manifest of its own.** A run with a
+   manifest was created by an invocation that made a deliberate choice about
+   memory, so it was part of a memory arm — either arm. This is one predicate
+   with no list of identifiers in it, and it is what makes "the runs an
+   experiment created are not candidates" a property of the query rather than of
+   the order somebody ran things in.
+
+   Freeze ordering alone cannot do this across several pairs. A task's wall
+   deadline is `created_ms + wall_timeout_ms`, capped by the policy, so a run
+   left queued past it is timed out and its run blocked — several pairs
+   therefore cannot all be created before any of them runs, and a later pair is
+   necessarily created after an earlier pair has ended.
+
+   **The cost is stated rather than hidden: bounded memory does not compound.** A
+   run that was shown memory does not itself become memory, so the candidate
+   universe stays the runs that predate this mechanism. For a milestone whose
+   purpose is to measure the mechanism that is the conservative direction — a
+   corpus already shaped by memory cannot measure memory — and it is the first
+   thing to revisit if the answer turns out to be that memory helps.
 3. Score is the count of distinct shared tokens between the new task text and
    the candidate's root task text, plus a commit-relation bonus. A token is at
    least four bytes, lowercased, and `_`, `.`, `/` and `-` are inside a token

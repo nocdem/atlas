@@ -220,11 +220,33 @@ static atlas_status detail_of(atlas_db *db, const char *run_uid, atlas_buf *out,
 /* Gathers at most ATLAS_ORCH_MEMORY_MAX_CANDIDATES terminal runs sharing the
  * requesting repository's lineage, newest first.
  *
- * Only runs that were *already terminal* when this ran are candidates, which is
- * the whole of what keeps one arm of a comparison out of the other's package: a
- * run created and not yet finished is ACTIVE, and an ACTIVE run is invisible
- * here whatever it later becomes. Combined with freezing at run creation, a
- * package cannot contain a result that did not exist when it was frozen. */
+ * Two exclusions, and they answer different halves of the same worry.
+ *
+ * **Only runs that were already terminal when this ran.** A run created and not
+ * yet finished is ACTIVE, and an ACTIVE run is invisible here whatever it later
+ * becomes. Combined with freezing at run creation, a package cannot contain a
+ * result that did not exist when it was frozen.
+ *
+ * **And never a run that carries a memory manifest of its own.** The freeze
+ * ordering above is only enough while every arm is created before any arm runs,
+ * and a comparison of several pairs cannot do that: a task's wall deadline is
+ * `created_ms + wall_timeout_ms`, so a run submitted and left queued past it is
+ * timed out and its run blocked. A later pair therefore has to be created after
+ * an earlier pair has finished — at which point the earlier pair's runs are
+ * terminal, share the lineage, and share most of their vocabulary.
+ *
+ * A run with a manifest was created by an invocation that made a deliberate
+ * choice about memory, so it is part of a memory arm — either arm. Excluding it
+ * is one predicate with no list of identifiers in it, and it is what makes "the
+ * runs this experiment created are not candidates" a property of the query
+ * rather than of the order somebody ran things in.
+ *
+ * The cost is stated rather than hidden: **bounded memory does not compound.**
+ * A run that was shown memory does not itself become memory, so the candidate
+ * universe stays the runs that predate this mechanism. For a milestone whose
+ * whole purpose is to measure the mechanism that is the conservative direction
+ * — a corpus already shaped by memory cannot measure memory — and it is the
+ * first thing to revisit if the answer turns out to be that memory helps. */
 static atlas_status gather(atlas_db *db, const char *lineage, const char *exclude_run,
                            atlas_orch_memory_cand *out, size_t max, size_t *n_out,
                            bool *truncated, atlas_err *err) {
@@ -235,6 +257,7 @@ static atlas_status gather(atlas_db *db, const char *lineage, const char *exclud
         "       j.source_commit, j.task_text, j.validations"
         "  FROM orch_runs r JOIN orch_jobs j ON j.job_uid = r.root_job_uid"
         " WHERE r.status IN ('ACCEPTED','BLOCKED') AND r.run_uid <> ?1"
+        "   AND NOT EXISTS (SELECT 1 FROM orch_run_memory m WHERE m.run_uid = r.run_uid)"
         " ORDER BY r.id DESC LIMIT ?2;";
     sqlite3_stmt *s = NULL;
     atlas_status st = atlas_db_prepare(db, SQL, &s, err);

@@ -697,6 +697,11 @@ is not written down is one somebody deletes.** Both halves are load-bearing.
 - **The manifest is frozen in the transaction that creates the run**, and
   `UNIQUE(run_uid)` is the freeze. An `ACTIVE` run is never a candidate, so two
   arms created before either runs cannot see each other.
+- **A run carrying a manifest is never a source**, which is what keeps an
+  earlier pair out of a later one's memory once a wall deadline has forced them
+  to run in sequence. The stated cost: **bounded memory does not compound** —
+  a run shown memory does not become memory, and the corpus stays the runs that
+  predate the mechanism.
 - **`OFF` appends nothing at all** — not a shorter section, not a sentence
   saying there is no memory. The two arms differ by exactly the package's bytes.
 - **`worker.log` is never read**, and there is no member of

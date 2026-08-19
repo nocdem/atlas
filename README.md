@@ -75,7 +75,16 @@ call labelled `untrusted_data: true`. See
 leases, crash recovery, an unprivileged dispatcher, isolated per-attempt
 workspaces and bounded command execution. A completed job is not an authority:
 its patch is an artifact with a recorded digest, and no code path applies it to
-a registered repository. See [docs/orchestration.md](docs/orchestration.md).
+a registered repository. On top of it, an operator-started run loop: `atlas job
+run` starts one worker in a registered repository's own tree, checks the pinned
+commit before and after, runs the declared verification gates itself, answers a
+failure with exactly one follow-up task, and settles the run `ACCEPTED` or
+`BLOCKED` within a bound of three worker starts. A run may hold up to a
+configurable number of tasks active at once (`--parallel`, default 1, ceiling
+8); parallel siblings are workspace tasks under the existing isolation, **at
+most one active task per run ever works in the repository's own tree**, and a
+run settles only when every task in it is terminal. See
+[docs/orchestration.md](docs/orchestration.md).
 
 **Remote access.** An HTTP gateway that authenticates a bearer credential,
 checks scopes and forwards only explicitly supported reads to the daemon;
@@ -94,7 +103,7 @@ from a model. See [docs/operations.md](docs/operations.md).
 
 ## Status
 
-Atlas is at phase **A9.2.2**. Each phase built on the last and none removed a
+Atlas is at phase **A11.6**. Each phase built on the last and none removed a
 guarantee:
 
 | Phase | What it added |
@@ -113,7 +122,18 @@ guarantee:
 | A9 | secure remote access: gateway, API keys, remote MCP, web API, GUI |
 | A9.1 | knowledge kinds and the `RESOLVED` lifecycle state |
 | A9.2 | evidence, verification and policy-authorised automatic lifecycle |
+| A9.2.1 | the verification intake surface and the channel ceiling |
 | A9.2.2 | epistemic absence: the truth axis, first-class coverage, and the absence-proof rule |
+| A9.2.3 | semantic freshness and coverage the daemon maintains itself |
+| A9.2.4 | build-input discovery, and an activation policy that does not depend on memory |
+| A9.2.5 | semantic trust closure: every load-bearing semantic answer carries its verdict |
+| A9.2.6 | daemon responsiveness: a waiter that can stop waiting, and the `BUSY` refusal |
+| O10 | production evidence ingestion proved at the boundary a client reaches |
+| A11.0 | the durable run a chain of tasks belongs to; a parent that resolves |
+| A11.1–A11.4 | the foreground run driver, gates Atlas runs itself, one follow-up per failure, the bound |
+| A10.0 | what a worker attempt cost, per attempt and never estimated |
+| A10.1 | the bounded cross-run memory package, measured in an A/B experiment |
+| A11.6 | bounded parallel tasks in a run; the repository's tree kept exclusive, settlement deferred to quiescence |
 
 ## Requirements
 
@@ -247,7 +267,10 @@ atlas maintenance plan | maintenance prune --apply
 atlas operation status ID
 
 # orchestration
-atlas job submit|get|cancel|list ...
+atlas job submit|get|cancel|list ...      # submit takes --parent JOB and --parallel N
+atlas job run --repo NAME --task TEXT --gate CMD [--gate CMD]... [--parallel N]
+atlas job run --resume RUN
+atlas job run-status RUN
 atlas dispatcher run [--once]
 
 # remote access

@@ -1,9 +1,12 @@
 # Atlas — working notes for Claude Code
 
 Atlas is a generic, headless engineering-memory and repository-intelligence CLI
-in C17. Phase **A11.1–A11.4**: the single-worker orchestrator loop — an operator
-can now start one worker in a registered repository, have Atlas gate its work,
-and reach `ACCEPTED` or `BLOCKED` within a bound. The sentence the season exists
+in C17. Phase **A11.6**: bounded parallel tasks in a run — a run may now hold up
+to `max_parallel` active tasks (default 1, ceiling 8), at most one of them ever
+in the repository's own tree, with settlement deferred until every task is
+terminal. The season before it, **A11.1–A11.4**, was the single-worker
+orchestrator loop — an operator can start one worker in a registered repository,
+have Atlas gate its work, and reach `ACCEPTED` or `BLOCKED` within a bound. The sentence the season exists
 for is
 
 > **A RESOLVED CHAIN THAT NOBODY COULD CARRY WAS STILL A DESCRIPTION OF WORK,

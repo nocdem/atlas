@@ -729,3 +729,52 @@ Two shapes would end the class, and neither was in A11.1's scope:
 Until one of them exists, **adding a table or a column in a migration means
 adding a line to `wind_back_to_schema_12`**, and the way you find out you forgot
 is a full-suite run.
+
+## A11.5a found four things it deliberately did not fix
+
+The A11.5a pilot — the first attempt to run a real Claude worker against Atlas'
+own tree — found one defect that blocked it outright and four that did not. The
+blocker (the gate wire encoding, `4f796a2`) was fixed under the pilot's own
+defect procedure. These four were left alone, because a pilot that repairs
+everything it trips over stops being a measurement.
+
+**`job submit` accepts `--gate` and drops it.** The argument parser fills
+`st->opts.job.gates`, and the `submit` arm of `src/cli/cli.c` copies eight
+fields into `atlas_job_submit_opts` without copying `gates` or `gate_count` —
+though the struct carries both and `service_orch.c` knows how to encode them.
+The `run` arm, twenty lines below, does copy them. The symptom is a submission
+refused for declaring no verification command while the operator is looking at
+the `--gate` flags they typed. This is the fifth-wiring-place failure `CLAUDE.md`
+describes, and the fix is three lines; it is recorded rather than made because
+`job run` is A11.1's surface and was not affected.
+
+**A failed spawn spends a worker start.** A11.1 records RUNNING before the exec
+so that a crash cannot be retried for free, and a process that never existed is
+classified the same way. When the worker executable could not be resolved, all
+three starts of run `re74398e9147dd6ae42ed10ef2102f9c5` were spent inside one
+second and the run was BLOCKED. That is the documented behaviour working as
+written, and it is still worth asking whether `SPAWN_FAILED` — which establishes
+that no worker ran, wrote or observed anything — belongs in the same class as a
+worker that died halfway. The answer is not obviously "no": an executable that
+disappears mid-run is indistinguishable from one that was never there, and a
+budget that refills on a spawn failure is a retry loop with no bound.
+
+**The worker executable is resolved against a fixed PATH.** `claude_exec` uses
+`atlas_proc_which("claude", "/usr/local/bin:/usr/bin:/bin")`, deliberately: the
+child's environment is constructed rather than inherited, for the reason
+`src/git` constructs its own. The consequence is a deployment prerequisite
+nothing states — a machine whose `claude` lives in a home directory cannot start
+a worker, and the failure arrives as `SPAWN_FAILED` with no path in it. Either
+the requirement belongs in `docs/orchestration.md`, or the refusal should name
+the program it looked for and where.
+
+**One repository's churn starves orchestration everywhere.** Throughout the
+pilot a second registered repository was being edited continuously; every change
+scheduled a semantic pass, and a semantic pass answers every orchestration write
+with `BUSY`. Atlas' own recovery sweep failed on that basis every twenty seconds
+for the whole window, and the pilot's first submission needed sixteen attempts
+over forty-seven seconds to land. Nothing here is incorrect — A9.2.6's `BUSY`
+contract is exactly what makes retrying safe — but "unbounded semantic
+maintenance is per-daemon while repositories are many" is a scaling property
+nobody has written down, and the operator-visible symptom is that orchestration
+appears broken on a busy machine.

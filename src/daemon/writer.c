@@ -1828,6 +1828,15 @@ atlas_status atlas_writer_orch(atlas_writer *w, atlas_orch_op *op, int timeout_m
         result->recovered = j->orch_result.recovered;
         result->run_status = j->orch_result.run_status;
         result->worker_starts = j->orch_result.worker_starts;
+        /* A10.1. The run's frozen memory mode and the digest of what it was
+         * shown. On this list for the reason the block below says: a field
+         * missing from it reaches a socket client as an absent key however
+         * carefully the write point filled it in, and this one did exactly that
+         * until a fake-driver dry run noticed the worker was never handed its
+         * package. */
+        result->memory_mode = j->orch_result.memory_mode;
+        memcpy(result->memory_digest, j->orch_result.memory_digest,
+               sizeof(result->memory_digest));
         memcpy(result->spec_digest, j->orch_result.spec_digest, sizeof(result->spec_digest));
         struct {
             atlas_buf *to;
@@ -1851,6 +1860,9 @@ atlas_status atlas_writer_orch(atlas_writer *w, atlas_orch_op *op, int timeout_m
              * write point filled it in. */
             {&result->run_uid, &j->orch_result.run_uid},
             {&result->follow_up_job_uid, &j->orch_result.follow_up_job_uid},
+            /* A10.1's package. The bytes a worker is shown travel this way and
+             * no other. */
+            {&result->memory_package, &j->orch_result.memory_package},
         };
         for (size_t i = 0; st == ATLAS_OK && i < sizeof copies / sizeof copies[0]; i++) {
             st = atlas_buf_set(copies[i].to, copies[i].from->data, copies[i].from->len, err);

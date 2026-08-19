@@ -150,9 +150,12 @@ static atlas_status gates_render(const char *encoded, atlas_buf *out, atlas_err 
     atlas_status st = atlas_orch_validations_decode(encoded != NULL ? encoded : "", cmds,
                                                     ATLAS_ORCH_MAX_VALIDATIONS, &n, err);
     for (size_t i = 0; st == ATLAS_OK && i < n; i++) {
-        if (i > 0) {
-            st = atlas_buf_append_str(out, "\n", err);
-        }
+        /* Indexed rather than newline-separated. The renderer flattens a field
+         * onto one line, so two adjacent gates would otherwise read as a single
+         * command line — and the index is the same one `failed_gate` carries,
+         * so a record saying "gate 1 failed" names something the reader can
+         * find. */
+        st = atlas_buf_appendf(out, err, "%s[%zu] ", i > 0 ? "  " : "", i);
         for (size_t k = 0; st == ATLAS_OK && k < cmds[i].count; k++) {
             if (k > 0) {
                 st = atlas_buf_append_str(out, " ", err);
@@ -341,9 +344,20 @@ static atlas_status enrich(atlas_db *db, atlas_orch_memory_cand *c, const char *
     }
     atlas_db_finish(db, s);
 
+    /* How the run's last task ended, read from the ledger rather than from an
+     * attempt's cached column.
+     *
+     * `orch_attempts.failure_reason` is UNKNOWN for a task Atlas itself ended —
+     * a wall timeout, a recovery sweep — because no dispatcher was there to
+     * report one, and "UNKNOWN" is exactly the least useful thing a memory
+     * record can say about why an earlier run was blocked. The ledger has the
+     * answer: `orch_transitions` is the ordering authority and its last row for
+     * the run carries both the terminal state and a reason from a closed
+     * vocabulary. Neither is free text and neither is a worker's wording. */
     static const char LAST[] =
-        "SELECT a.failure_reason FROM orch_attempts a JOIN orch_jobs j ON j.id = a.job_id"
-        " WHERE j.run_uid = ?1 ORDER BY a.id DESC LIMIT 1;";
+        "SELECT t.to_state, t.reason FROM orch_transitions t"
+        "  JOIN orch_jobs j ON j.id = t.job_id"
+        " WHERE j.run_uid = ?1 ORDER BY t.id DESC LIMIT 1;";
     if (st == ATLAS_OK) {
         sqlite3_stmt *q = NULL;
         st = atlas_db_prepare(db, LAST, &q, err);
@@ -352,7 +366,9 @@ static atlas_status enrich(atlas_db *db, atlas_orch_memory_cand *c, const char *
         }
         if (st == ATLAS_OK) {
             if (sqlite3_step(q) == SQLITE_ROW) {
-                st = set_from_col(&c->terminal_reason, q, 0, err);
+                const char *to = atlas_db_col_text(q, 0);
+                const char *why = atlas_db_col_text(q, 1);
+                st = atlas_buf_appendf(&c->terminal_reason, err, "%s (%s)", to, why);
             }
             atlas_db_finish(db, q);
         }

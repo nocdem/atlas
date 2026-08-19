@@ -1077,6 +1077,31 @@ static void test_both_renderers_carry_every_memory_field(void) {
     }
     free(server);
     free(client);
+
+    /* And the *other* boundary, which is the one that actually broke.
+     *
+     * `atlas_writer_orch` copies the writer thread's result into the caller's
+     * field by field, by hand. Its own comment says what a missing line costs —
+     * "a field that is not on this list reaches a socket client as an absent key
+     * however carefully the write point filled it in" — and A10.1 proved it: the
+     * lease carried the package correctly out of the transaction, the daemon was
+     * ready to emit it, and the worker was handed nothing, because three lines
+     * were missing here. A fake-driver dry run found it; no in-process test
+     * could have, because every one of them applies the operation directly.
+     *
+     * This is a name scan and it is enough for that failure: the fields are
+     * either mentioned in the copy block or they are not. */
+    char *writer = slurp(ATLAS_SRC_DIR "/src/daemon/writer.c");
+    T_REQUIRE(writer != NULL);
+    static const char *const CARRIED[] = {"memory_package", "memory_mode", "memory_digest",
+                                          NULL};
+    for (size_t i = 0; CARRIED[i] != NULL; i++) {
+        T_CHECK_MSG(strstr(writer, CARRIED[i]) != NULL,
+                    "the writer thread's result copy never carries %s, so a socket client sees "
+                    "it as absent whatever the write point stored",
+                    CARRIED[i]);
+    }
+    free(writer);
 }
 
 static const atlas_test TESTS[] = {
@@ -1106,7 +1131,7 @@ static const atlas_test TESTS[] = {
      test_an_unset_operation_is_memory_off},
     {"a follow-up inherits its run's frozen package and freezes none of its own",
      test_a_follow_up_inherits_the_frozen_package},
-    {"both renderers and both sides of the wire carry every memory field",
+    {"every boundary a memory field crosses carries it",
      test_both_renderers_carry_every_memory_field},
 };
 

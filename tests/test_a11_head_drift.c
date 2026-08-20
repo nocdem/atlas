@@ -166,6 +166,13 @@ static atlas_status t_run_get(void *ud, const char *run_uid, atlas_orch_run_view
     return atlas_db_orch_run_get((atlas_db *)ud, run_uid, out, found, err);
 }
 
+/* A12.0. Part of the transport's contract; nothing here loses an answer, so it
+ * is never consulted. `tests/test_orch_transport.c` is where it is exercised. */
+static atlas_status t_job_get(void *ud, const char *job_uid, atlas_orch_job_view *out, bool *found,
+                              atlas_err *err) {
+    return atlas_db_orch_job_get((atlas_db *)ud, job_uid, out, found, err);
+}
+
 /* --- submitting a root task ----------------------------------------------- */
 
 static void start_run(env *e, const char *task, const char *gate, atlas_buf *run_out,
@@ -219,6 +226,7 @@ static void drive(env *e, const char *run_uid, atlas_rundriver_report *rep) {
     o.max_tasks = 0;
     o.transport.apply = t_apply;
     o.transport.run_get = t_run_get;
+    o.transport.job_get = t_job_get;
     o.transport.ud = e->db;
     T_OK(atlas_rundriver_run(&o, rep, &err), &err);
 }

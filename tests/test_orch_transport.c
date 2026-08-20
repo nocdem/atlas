@@ -36,10 +36,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <time.h>
+#include <unistd.h>
 
 #include "atlas/atlas.h"
 #include "atlas/db.h"
 #include "atlas/driver.h"
+#include "atlas/ipc.h"
 #include "atlas/orch_ops.h"
 #include "atlas/rundriver.h"
 #include "atlas_test.h"
@@ -153,6 +158,19 @@ static bool spool_exists(const char *spool, const char *job_uid) {
     return f != NULL;
 }
 
+static atlas_orch_state job_state(env *e, const char *job_uid) {
+    atlas_err err;
+    atlas_err_init(&err);
+    atlas_orch_job_view v;
+    atlas_orch_job_view_init(&v);
+    bool found = false;
+    T_OK(atlas_db_orch_job_get(e->db, job_uid, &v, &found, &err), &err);
+    T_REQUIRE(found);
+    atlas_orch_state s = v.state;
+    atlas_orch_job_view_free(&v);
+    return s;
+}
+
 static atlas_orch_run_status run_status(env *e, const char *run_uid) {
     atlas_err err;
     atlas_err_init(&err);
@@ -215,6 +233,11 @@ static atlas_status lossy_run_get(void *ud, const char *run_uid, atlas_orch_run_
     return atlas_db_orch_run_get(x->db, run_uid, out, found, err);
 }
 
+static atlas_status lossy_job_get(void *ud, const char *job_uid, atlas_orch_job_view *out,
+                                     bool *found, atlas_err *err) {
+    return atlas_db_orch_job_get(((lossy *)ud)->db, job_uid, out, found, err);
+}
+
 /* A daemon that refuses. Not `BUSY:`, not a lost answer: an answer, of the kind
  * that says the same thing however many times it is asked. */
 typedef struct refuser {
@@ -237,6 +260,11 @@ static atlas_status refuser_run_get(void *ud, const char *run_uid, atlas_orch_ru
     return atlas_db_orch_run_get(((refuser *)ud)->db, run_uid, out, found, err);
 }
 
+static atlas_status refuser_job_get(void *ud, const char *job_uid, atlas_orch_job_view *out,
+                                     bool *found, atlas_err *err) {
+    return atlas_db_orch_job_get(((refuser *)ud)->db, job_uid, out, found, err);
+}
+
 /* A daemon that is simply gone: every answer is lost, forever. */
 typedef struct gone {
     atlas_db *db;
@@ -255,6 +283,11 @@ static atlas_status gone_apply(void *ud, const atlas_orch_op *op, atlas_orch_res
 static atlas_status gone_run_get(void *ud, const char *run_uid, atlas_orch_run_view *out,
                                  bool *found, atlas_err *err) {
     return atlas_db_orch_run_get(((gone *)ud)->db, run_uid, out, found, err);
+}
+
+static atlas_status gone_job_get(void *ud, const char *job_uid, atlas_orch_job_view *out,
+                                     bool *found, atlas_err *err) {
+    return atlas_db_orch_job_get(((gone *)ud)->db, job_uid, out, found, err);
 }
 
 /* The completion, and the two ways its delivery is lost sight of.
@@ -302,6 +335,65 @@ static atlas_status lost_ack_run_get(void *ud, const char *run_uid, atlas_orch_r
     return atlas_db_orch_run_get(((lost_ack *)ud)->db, run_uid, out, found, err);
 }
 
+static atlas_status lost_ack_job_get(void *ud, const char *job_uid, atlas_orch_job_view *out,
+                                     bool *found, atlas_err *err) {
+    return atlas_db_orch_job_get(((lost_ack *)ud)->db, job_uid, out, found, err);
+}
+
+/* Recovery ends the task while this completion is in the air.
+ *
+ * Not a remote possibility: a lease is a minute and a refused completion is
+ * offered for five, so the sweep can reclaim an attempt well inside the window
+ * the driver is still retrying in. The completion here is never applied — the
+ * daemon never took it — and the task ends TIMED_OUT because its lease expired
+ * and its wall bound is past. The run therefore no longer holds the task open,
+ * which is exactly the picture a delivered completion also produces, and is why
+ * the driver asks the *task* what its ending was rather than asking the run
+ * whether it still has one. */
+typedef struct swept {
+    atlas_db *db;
+    int completes;
+} swept;
+
+static atlas_status swept_apply(void *ud, const atlas_orch_op *op, atlas_orch_result *out,
+                                atlas_err *err) {
+    swept *x = (swept *)ud;
+    if (op->kind != ATLAS_ORCH_OP_COMPLETE) {
+        return atlas_orch_apply(x->db, op, out, err);
+    }
+    x->completes++;
+    if (x->completes == 1) {
+        atlas_orch_op *rec = atlas_orch_op_new(ATLAS_ORCH_OP_RECOVER);
+        T_CHECK_MSG(rec != NULL, "out of memory building the sweep");
+        if (rec != NULL) {
+            rec->actor = ATLAS_ORCH_ACTOR_ATLAS;
+            /* An hour on, so the lease has expired and the wall bound is past.
+             * Supplied rather than waited for, like every other expiry in this
+             * suite. */
+            rec->now_ms = (int64_t)time(NULL) * 1000 + 3600000;
+            atlas_orch_result rr;
+            atlas_orch_result_init(&rr);
+            T_CHECK_MSG(atlas_orch_apply(x->db, rec, &rr, err) == ATLAS_OK,
+                        "the fixture's recovery sweep did not run");
+            T_CHECK_MSG(rr.expired == 1, "the sweep reclaimed no attempt");
+            atlas_orch_result_free(&rr);
+            atlas_orch_op_free(rec);
+            free(rec);
+        }
+    }
+    return answer_lost(err);
+}
+
+static atlas_status swept_run_get(void *ud, const char *run_uid, atlas_orch_run_view *out,
+                                  bool *found, atlas_err *err) {
+    return atlas_db_orch_run_get(((swept *)ud)->db, run_uid, out, found, err);
+}
+
+static atlas_status swept_job_get(void *ud, const char *job_uid, atlas_orch_job_view *out,
+                                  bool *found, atlas_err *err) {
+    return atlas_db_orch_job_get(((swept *)ud)->db, job_uid, out, found, err);
+}
+
 /* A daemon that grants a lease and loses the answer. The grant is real and the
  * driver never heard it, which is the residual this milestone states rather than
  * removes: the invocation is lost, the run is not. */
@@ -328,6 +420,11 @@ static atlas_status lost_grant_apply(void *ud, const atlas_orch_op *op, atlas_or
 static atlas_status lost_grant_run_get(void *ud, const char *run_uid, atlas_orch_run_view *out,
                                        bool *found, atlas_err *err) {
     return atlas_db_orch_run_get(((lost_grant *)ud)->db, run_uid, out, found, err);
+}
+
+static atlas_status lost_grant_job_get(void *ud, const char *job_uid, atlas_orch_job_view *out,
+                                     bool *found, atlas_err *err) {
+    return atlas_db_orch_job_get(((lost_grant *)ud)->db, job_uid, out, found, err);
 }
 
 /* --- submitting a root task ----------------------------------------------- */
@@ -405,7 +502,7 @@ static void test_a_lost_answer_is_asked_for_again(void) {
      * over in one invocation, on every call the driver makes before the worker
      * exists. */
     lossy x = {e.db, 1, 1, 2, 0};
-    atlas_rundriver_transport t = {lossy_apply, lossy_run_get, &x};
+    atlas_rundriver_transport t = {lossy_apply, lossy_run_get, lossy_job_get, &x};
     atlas_rundriver_report rep;
     T_CHECK(drive(atlas_buf_cstr(&run), t, NULL, &rep) == ATLAS_OK);
 
@@ -434,7 +531,7 @@ static void test_a_refusal_is_not_retried(void) {
     start_run(&e, "write the thing", &run, &job);
 
     refuser x = {e.db, 0};
-    atlas_rundriver_transport t = {refuser_apply, refuser_run_get, &x};
+    atlas_rundriver_transport t = {refuser_apply, refuser_run_get, refuser_job_get, &x};
     atlas_rundriver_report rep;
     T_CHECK(drive(atlas_buf_cstr(&run), t, NULL, &rep) != ATLAS_OK);
 
@@ -460,7 +557,7 @@ static void test_the_retry_is_bounded(void) {
     start_run(&e, "write the thing", &run, &job);
 
     gone x = {e.db, 0};
-    atlas_rundriver_transport t = {gone_apply, gone_run_get, &x};
+    atlas_rundriver_transport t = {gone_apply, gone_run_get, gone_job_get, &x};
     atlas_rundriver_report rep;
     T_CHECK(drive(atlas_buf_cstr(&run), t, NULL, &rep) != ATLAS_OK);
 
@@ -488,7 +585,7 @@ static void check_completion_lands(env *e, ack_mode mode, int expect_completes) 
     start_run(e, "write the thing", &run, &job);
 
     lost_ack x = {e->db, mode, 0};
-    atlas_rundriver_transport t = {lost_ack_apply, lost_ack_run_get, &x};
+    atlas_rundriver_transport t = {lost_ack_apply, lost_ack_run_get, lost_ack_job_get, &x};
     atlas_rundriver_report rep;
     T_CHECK_MSG(drive(atlas_buf_cstr(&run), t, fx_data_dir(&e->fx), &rep) == ATLAS_OK,
                 "a delivered completion was reported as a failed invocation");
@@ -527,7 +624,48 @@ static void test_a_refusal_after_a_lost_answer_is_a_delivery(void) {
     env_close(&e);
 }
 
-/* --- 5: the grant nobody heard -------------------------------------------- */
+/* --- 5: a task somebody else ended is not this completion's delivery ------- */
+
+static void test_a_swept_task_is_not_a_delivery(void) {
+    env e;
+    env_open(&e);
+    atlas_buf run = ATLAS_BUF_INIT, job = ATLAS_BUF_INIT;
+    start_run(&e, "write the thing", &run, &job);
+
+    swept x = {e.db, 0};
+    atlas_rundriver_transport t = {swept_apply, swept_run_get, swept_job_get, &x};
+    atlas_rundriver_report rep;
+    atlas_status st = drive(atlas_buf_cstr(&run), t, fx_data_dir(&e.fx), &rep);
+
+    /* The daemon never took this result and nothing can take it now, so the
+     * invocation reports the loss. Claiming delivery here — which reading the
+     * run alone would have done, because the run no longer holds the task open
+     * — would be Atlas asserting that a worker's five minutes were recorded
+     * when they were not. */
+    T_CHECK_MSG(st != ATLAS_OK, "a completion the daemon never took was reported as delivered");
+    T_CHECK(rep.status != ATLAS_ORCH_RUN_ACCEPTED);
+    /* And it is not offered again once the task has ended some other way: there
+     * is nothing left that could accept it. */
+    T_EQ_INT(x.completes, 1);
+
+    /* The task ended the sweep's way, not this completion's. */
+    T_CHECK(job_state(&e, atlas_buf_cstr(&job)) == ATLAS_ORCH_STATE_TIMED_OUT);
+    T_EQ_INT((int)count_sql(e.db, "SELECT count(*) FROM orch_jobs WHERE state = 'SUCCEEDED';"), 0);
+    T_CHECK(run_status(&e, atlas_buf_cstr(&run)) != ATLAS_ORCH_RUN_ACCEPTED);
+
+    /* The worker really ran, and its result is on disk — the only copy there
+     * is, which is the whole reason it is kept. */
+    T_EQ_INT((int)worker_lines(&e), 1);
+    T_CHECK_MSG(spool_exists(fx_data_dir(&e.fx), atlas_buf_cstr(&job)),
+                "a lost result was not left in its spool");
+
+    atlas_rundriver_report_free(&rep);
+    atlas_buf_free(&run);
+    atlas_buf_free(&job);
+    env_close(&e);
+}
+
+/* --- 6: the grant nobody heard -------------------------------------------- */
 
 /* The stated residual. A lease is a compare-and-swap against `state = 'QUEUED'`,
  * so a grant that was made and whose answer was lost cannot be re-granted: the
@@ -543,7 +681,7 @@ static void test_a_grant_that_was_never_heard_costs_the_invocation(void) {
     start_run(&e, "write the thing", &run, &job);
 
     lost_grant x = {e.db, 0};
-    atlas_rundriver_transport t = {lost_grant_apply, lost_grant_run_get, &x};
+    atlas_rundriver_transport t = {lost_grant_apply, lost_grant_run_get, lost_grant_job_get, &x};
     atlas_rundriver_report rep;
     T_CHECK(drive(atlas_buf_cstr(&run), t, NULL, &rep) == ATLAS_OK);
 
@@ -562,7 +700,61 @@ static void test_a_grant_that_was_never_heard_costs_the_invocation(void) {
     env_close(&e);
 }
 
-/* --- 6: the mark is the classification, and it cannot be spoken ----------- */
+/* --- 7: the mark, stamped by the real client layer ------------------------
+ *
+ * Every case above builds its own marked error, so all of them would still pass
+ * if every `atlas_err_mark_transport` call in `src/ipc/client.c` were deleted.
+ * These two would not: they go through `atlas_ipc_call` itself, over a real
+ * socket, and ask what came back. No daemon is started and none is needed —
+ * what is under test is the client's own account of a round trip that failed. */
+static void test_the_client_layer_marks_a_real_failure(void) {
+    env e;
+    env_open(&e);
+    atlas_err err;
+    atlas_err_init(&err);
+    atlas_buf resp = ATLAS_BUF_INIT;
+
+    /* Nothing listening. The request was never carried, and a caller that
+     * treated this as a refusal would never retry a daemon that had merely
+     * restarted. */
+    char dead[sizeof(((struct sockaddr_un *)0)->sun_path)];
+    T_REQUIRE(snprintf(dead, sizeof dead, "%s/nothing.sock", fx_data_dir(&e.fx)) <
+              (int)sizeof dead);
+    T_CHECK(atlas_ipc_call(dead, "daemon.ping", "{}", &resp, &err) != ATLAS_OK);
+    T_CHECK_MSG(atlas_err_is_transport(&err), "a failed connect was not marked as a transport "
+                                              "failure by the client layer");
+
+    /* Listening, and never accepting. The connect and the send both succeed and
+     * the reply does not come: "timed out while reading a frame header", which
+     * is the sentence both pilots died on, produced here by the real client
+     * against a real socket. The message is asserted as documentation of *which*
+     * failure this is — the classification is the mark beside it, never the
+     * text. */
+    char quiet[sizeof(((struct sockaddr_un *)0)->sun_path)];
+    T_REQUIRE(snprintf(quiet, sizeof quiet, "%s/quiet.sock", fx_data_dir(&e.fx)) <
+              (int)sizeof quiet);
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    T_REQUIRE(fd >= 0);
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    (void)snprintf(addr.sun_path, sizeof addr.sun_path, "%s", quiet);
+    T_REQUIRE(bind(fd, (const struct sockaddr *)&addr, sizeof(addr)) == 0);
+    T_REQUIRE(listen(fd, 1) == 0);
+
+    atlas_err_init(&err);
+    T_CHECK(atlas_ipc_call_timeout(quiet, "daemon.ping", "{}", 200, &resp, &err) != ATLAS_OK);
+    T_CHECK_MSG(atlas_err_is_transport(&err),
+                "a read that timed out was not marked as a transport failure");
+    T_CHECK(strstr(atlas_err_msg(&err), "reading a frame header") != NULL);
+
+    (void)close(fd);
+    (void)unlink(quiet);
+    atlas_buf_free(&resp);
+    env_close(&e);
+}
+
+/* --- 8: the mark is the classification, and it cannot be spoken ----------- */
 
 /* The predicate the whole file rests on is not a substring of anybody's prose.
  * A daemon's refusal can quote a repository, a task or a model, and none of that
@@ -590,6 +782,8 @@ static void test_a_refusal_can_never_speak_the_mark(void) {
 
 static const atlas_test TESTS[] = {
     {"a refusal can never speak the transport mark", test_a_refusal_can_never_speak_the_mark},
+    {"the client layer marks a real connect failure and a real read timeout",
+     test_the_client_layer_marks_a_real_failure},
     {"a lost answer on a lease or a phase call is asked for again",
      test_a_lost_answer_is_asked_for_again},
     {"a daemon refusal is an answer and is never asked twice", test_a_refusal_is_not_retried},
@@ -599,6 +793,8 @@ static const atlas_test TESTS[] = {
      test_a_completion_whose_answer_was_lost_is_not_mourned},
     {"a refusal arriving after a lost answer is a delivery, not a loss",
      test_a_refusal_after_a_lost_answer_is_a_delivery},
+    {"a task a recovery sweep ended is not this completion's delivery",
+     test_a_swept_task_is_not_a_delivery},
     {"a lease grant nobody heard costs the invocation and not the run",
      test_a_grant_that_was_never_heard_costs_the_invocation},
 };

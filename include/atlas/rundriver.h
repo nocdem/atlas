@@ -71,6 +71,20 @@ typedef struct atlas_rundriver_transport {
                           atlas_err *err);
     atlas_status (*run_get)(void *ud, const char *run_uid, atlas_orch_run_view *out, bool *found,
                             atlas_err *err);
+    /* A12.0. One task, by uid, because a completion whose answer was lost is
+     * only *delivered* if the task ended in the way that completion asked for.
+     *
+     * The run cannot say that. "This run no longer holds this task open" is also
+     * what an expired lease, a cancellation and a recovery sweep produce — and
+     * a lease is a minute while a refused completion is offered for five, so a
+     * driver that read only the run would report a genuinely lost result as
+     * delivered exactly when a recovery had just thrown it away.
+     *
+     * Not optional. A transport without it cannot answer the question this
+     * driver has to ask, and the alternative to refusing one at construction is
+     * a check that silently degrades into a guess. */
+    atlas_status (*job_get)(void *ud, const char *job_uid, atlas_orch_job_view *out, bool *found,
+                            atlas_err *err);
     void *ud;
 } atlas_rundriver_transport;
 

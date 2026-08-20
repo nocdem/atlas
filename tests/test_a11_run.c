@@ -189,12 +189,26 @@ static atlas_status t_run_get(void *ud, const char *run_uid, atlas_orch_run_view
     return atlas_db_orch_run_get((atlas_db *)ud, run_uid, out, found, err);
 }
 
+/* A12.0. The task read the driver uses to find out what became of a completion
+ * whose answer never arrived. Nothing in this file loses one, so it is here to
+ * satisfy the transport's contract rather than to be exercised;
+ * `tests/test_orch_transport.c` is where it is. */
+static atlas_status t_job_get(void *ud, const char *job_uid, atlas_orch_job_view *out, bool *found,
+                              atlas_err *err) {
+    return atlas_db_orch_job_get((atlas_db *)ud, job_uid, out, found, err);
+}
+
 /* `run_get` shares the transport's user data, so it has to unwrap the same
  * struct the apply hook does. Reading the run through a wrongly cast pointer is
  * how the first version of this test claimed the worker never started. */
 static atlas_status rc_run_get(void *ud, const char *run_uid, atlas_orch_run_view *out,
                                bool *found, atlas_err *err) {
     return atlas_db_orch_run_get(((refuse_complete *)ud)->db, run_uid, out, found, err);
+}
+
+static atlas_status rc_job_get(void *ud, const char *job_uid, atlas_orch_job_view *out,
+                               bool *found, atlas_err *err) {
+    return atlas_db_orch_job_get(((refuse_complete *)ud)->db, job_uid, out, found, err);
 }
 
 /* --- submitting a root task ----------------------------------------------- */
@@ -260,6 +274,7 @@ static void drive(env *e, const char *run_uid, int64_t max_tasks, atlas_rundrive
     o.max_tasks = max_tasks;
     o.transport.apply = t_apply;
     o.transport.run_get = t_run_get;
+    o.transport.job_get = t_job_get;
     o.transport.ud = e->db;
     T_OK(atlas_rundriver_run(&o, rep, &err), &err);
 }
@@ -287,6 +302,7 @@ static atlas_status drive_spooled(env *e, const char *run_uid, const char *spool
         o.transport.ud = e->db;
     }
     o.transport.run_get = busy != NULL ? rc_run_get : t_run_get;
+    o.transport.job_get = busy != NULL ? rc_job_get : t_job_get;
     return atlas_rundriver_run(&o, rep, &err);
 }
 
@@ -1005,6 +1021,11 @@ static atlas_status busy_run_get(void *ud, const char *run_uid, atlas_orch_run_v
     return atlas_db_orch_run_get(((busy_xport *)ud)->db, run_uid, out, found, err);
 }
 
+static atlas_status busy_job_get(void *ud, const char *job_uid, atlas_orch_job_view *out,
+                                 bool *found, atlas_err *err) {
+    return atlas_db_orch_job_get(((busy_xport *)ud)->db, job_uid, out, found, err);
+}
+
 static void test_a_busy_refusal_loses_nothing(void) {
     env e;
     env_open(&e);
@@ -1022,6 +1043,7 @@ static void test_a_busy_refusal_loses_nothing(void) {
     o.dispatcher_id = "busy";
     o.transport.apply = busy_apply;
     o.transport.run_get = busy_run_get;
+    o.transport.job_get = busy_job_get;
     o.transport.ud = &b;
     T_OK(atlas_rundriver_run(&o, &rep, &err), &err);
 

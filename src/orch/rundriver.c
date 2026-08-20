@@ -233,7 +233,7 @@ static int64_t xport_pause(const atlas_rundriver_opts *o) {
 #define RUN_COMPLETE_BUSY_MS 300000
 #define RUN_COMPLETE_PAUSE_MS 2000
 
-/* A12.0. Is the daemon still waiting for this completion?
+/* A12.0. What became of a completion whose answer never arrived.
  *
  * Asked only once a delivery has failed in a way that does not say whether it
  * landed. A read that times out leaves the request queued and running — ipc.h
@@ -242,33 +242,98 @@ static int64_t xport_pause(const atlas_rundriver_opts *o) {
  * simply be offered again: the token it carries is consumed by the delivery that
  * landed, and the redelivery is refused as an unknown one.
  *
- * The run is the place that says. A run driver's task is the run's active
- * repo-tree task, and `idx_orch_jobs_one_active_repo_tree` means there is at
- * most one; a run that no longer names this task holds a terminal record for it,
- * so nothing is owed and re-offering can only be refused. What it does *not*
- * establish is that this particular delivery is the one the daemon recorded —
- * recovery could have ended the attempt instead — which is exactly why the
- * caller keeps the spooled result rather than clearing it.
+ * Three answers, because there are three situations and they are acted on
+ * differently. `OWED` is zero and is what every failure to establish anything
+ * reads as. */
+typedef enum delivery {
+    DELIVERY_OWED = 0, /* the daemon can still take it; keep offering. */
+    DELIVERY_LANDED,   /* it ended the task in the way this completion asked. */
+    DELIVERY_LOST      /* the task ended some other way; nothing will take it. */
+} delivery;
+
+/* Whether an ending is *this completion's own*.
  *
- * Conservative in both directions it can be: a read that fails leaves the
- * completion owed, and so does a run that still names the task. One attempt, and
- * no retry of its own: the caller's loop is the budget. */
-static bool completion_owed(const atlas_rundriver_opts *o, const char *job_uid,
-                            atlas_orch_run_status *settled_out) {
+ * The reason a task's state can answer that at all is that a leased task reaches
+ * SUCCEEDED and FAILED through exactly one door. `op_complete` is the only
+ * writer of either: success there is SUCCEEDED, and a failure is FAILED when the
+ * gate failed, when the driver refused, or when the attempts are spent. Every
+ * other ending a leased task can have belongs to somebody else — the two
+ * recovery sweeps write CANCELLED, TIMED_OUT, RECOVERY_REQUIRED or QUEUED and
+ * never these two, and the FAILED a lease request can write is written to a
+ * QUEUED task, which by construction is not one this driver holds.
+ *
+ * CANCELLED is deliberately not ours even though a completion can produce it:
+ * cancellation wins over the result, so the task ends the same way whether this
+ * delivery arrived or not, and claiming it would be claiming the one thing the
+ * state cannot distinguish. The switch has no `default:` — a new state must be
+ * classified here rather than silently read as somebody else's. */
+static bool ending_is_ours(atlas_orch_state ended, bool success) {
+    switch (ended) {
+    case ATLAS_ORCH_STATE_SUCCEEDED: return success;
+    case ATLAS_ORCH_STATE_FAILED: return !success;
+    case ATLAS_ORCH_STATE_UNKNOWN:
+    case ATLAS_ORCH_STATE_QUEUED:
+    case ATLAS_ORCH_STATE_LEASED:
+    case ATLAS_ORCH_STATE_PREPARING:
+    case ATLAS_ORCH_STATE_RUNNING:
+    case ATLAS_ORCH_STATE_VALIDATING:
+    case ATLAS_ORCH_STATE_CANCEL_REQUESTED:
+    case ATLAS_ORCH_STATE_CANCELLED:
+    case ATLAS_ORCH_STATE_TIMED_OUT:
+    case ATLAS_ORCH_STATE_RECOVERY_REQUIRED: break;
+    }
+    return false;
+}
+
+/* The task itself, read by uid, and never the run.
+ *
+ * A run that no longer names this task is the same picture whether the daemon
+ * recorded this result, an expired lease was swept, or a cancellation landed —
+ * and the lease is one minute while a refused completion is offered for five,
+ * so those are not remote possibilities inside the window this is asked in.
+ *
+ * A task that is still non-terminal is still owed one, which includes the case
+ * where this completion *did* land and was retried back onto the queue: the
+ * conservative reading there costs an invocation and never claims a delivery
+ * that did not happen. One read, and no retry of its own: the caller's loop is
+ * the budget, and a read that fails leaves the completion owed. */
+static delivery delivery_of(const atlas_rundriver_opts *o, const char *job_uid,
+                            const atlas_orch_op *op, atlas_orch_state *ended_out) {
+    atlas_err ignore;
+    atlas_err_init(&ignore);
+    atlas_orch_job_view v;
+    atlas_orch_job_view_init(&v);
+    bool found = false;
+    delivery d = DELIVERY_OWED;
+    if (o->transport.job_get(o->transport.ud, job_uid, &v, &found, &ignore) == ATLAS_OK && found) {
+        if (ending_is_ours(v.state, op->success)) {
+            d = DELIVERY_LANDED;
+        } else if (atlas_orch_state_is_terminal(v.state)) {
+            d = DELIVERY_LOST;
+        }
+        if (ended_out != NULL) {
+            *ended_out = v.state;
+        }
+    }
+    atlas_orch_job_view_free(&v);
+    return d;
+}
+
+/* The run's status, best effort, for a completion whose reply never carried it.
+ * A read that fails leaves UNKNOWN, which the report deliberately does not
+ * overwrite a known status with. */
+static atlas_orch_run_status run_status_now(const atlas_rundriver_opts *o) {
     atlas_err ignore;
     atlas_err_init(&ignore);
     atlas_orch_run_view rv;
     memset(&rv, 0, sizeof(rv));
     bool found = false;
-    bool owed = true;
+    atlas_orch_run_status st = ATLAS_ORCH_RUN_UNKNOWN;
     if (o->transport.run_get(o->transport.ud, o->run_uid, &rv, &found, &ignore) == ATLAS_OK &&
         found) {
-        owed = strcmp(rv.active_job_uid, job_uid) == 0;
-        if (!owed && settled_out != NULL) {
-            *settled_out = rv.status;
-        }
+        st = rv.status;
     }
-    return owed;
+    return st;
 }
 
 /* The completion's own retry. Same shape, a budget measured in time rather than
@@ -277,9 +342,9 @@ static bool completion_owed(const atlas_rundriver_opts *o, const char *job_uid,
  *
  * `acked` is what the daemon itself answered, and it is not the same claim as
  * the status: a completion can be delivered without being acknowledged, which is
- * what the run check below settles and what keeps the spooled copy in place.
+ * what the task check below settles and what keeps the spooled copy in place.
  *
- * The run check answers two failures, not one. A refusal is ordinarily final,
+ * The task check answers two failures, not one. A refusal is ordinarily final,
  * but a refusal that *follows* a lost answer is the daemon's account of the
  * delivery this driver already made — the token was consumed by it — and
  * mourning the result there would be the pilots' loss with one step in front. */
@@ -313,14 +378,26 @@ static atlas_status apply_completion(const atlas_rundriver_opts *o, const char *
         if (!lost && !lost_one) {
             break; /* a refusal this driver never disturbed: an answer. */
         }
-        atlas_orch_run_status settled = ATLAS_ORCH_RUN_UNKNOWN;
-        if (!completion_owed(o, job_uid, &settled)) {
-            say(o, "the answer to this completion did not arrive, and the run no longer holds "
-                   "task %s open: the daemon has it. The spooled result is left in place, "
-                   "because this delivery was never acknowledged.", job_uid);
-            out->run_status = settled;
+        atlas_orch_state ended = ATLAS_ORCH_STATE_UNKNOWN;
+        delivery d = delivery_of(o, job_uid, op, &ended);
+        if (d == DELIVERY_LANDED) {
+            say(o, "the answer to this completion did not arrive, and the daemon has ended task "
+                   "%s in %s, which is this completion's own ending: it was delivered. The "
+                   "spooled result is left in place, because this delivery was never "
+                   "acknowledged.", job_uid, atlas_orch_state_name(ended));
+            out->run_status = run_status_now(o);
             atlas_err_init(err);
             st = ATLAS_OK;
+            break;
+        }
+        if (d == DELIVERY_LOST) {
+            /* Nothing can take this result now, so it is not offered again and
+             * the loss is reported rather than dressed up: the task ended some
+             * other way while this delivery was in the air. The spooled copy is
+             * what is left of the attempt, and it is left. */
+            say(o, "task %s ended in %s, which is not this completion's ending: this result was "
+                   "not recorded and the spooled copy is the only one that exists.", job_uid,
+                atlas_orch_state_name(ended));
             break;
         }
         if (!lost) {
@@ -1122,7 +1199,8 @@ atlas_status atlas_rundriver_run(const atlas_rundriver_opts *o, atlas_rundriver_
     if (o->run_uid == NULL || o->run_uid[0] == '\0') {
         return atlas_err_set(err, ATLAS_ERR_USAGE, "no run was named");
     }
-    if (o->transport.apply == NULL || o->transport.run_get == NULL) {
+    if (o->transport.apply == NULL || o->transport.run_get == NULL ||
+        o->transport.job_get == NULL) {
         return atlas_err_set(err, ATLAS_ERR_INTERNAL, "the run driver has no transport");
     }
     atlas_status st = atlas_buf_set_str(&rep->run_uid, o->run_uid, err);

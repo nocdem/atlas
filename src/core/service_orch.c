@@ -798,6 +798,81 @@ static atlas_status xport_run_get(void *ud, const char *run_uid, atlas_orch_run_
     return st;
 }
 
+typedef struct job_get_req {
+    const char *job;
+} job_get_req;
+
+static atlas_status build_job_get(atlas_json *j, void *ud, atlas_err *err) {
+    return atlas_json_key_str(j, "job", ((const job_get_req *)ud)->job, err);
+}
+
+/* A12.0. One task, read by uid, over the method that already exists for it.
+ *
+ * `job.get` is in the client group beside `job.run_status`, which this transport
+ * has always used, and it carries the same guard — the connection may read a
+ * task it submitted. A run driver's tasks are its operator's own, and a
+ * follow-up keeps its parent's `submitter_uid`, so both resolve.
+ *
+ * Only the members the run driver reads are filled. A caller that needs more
+ * adds it here, deliberately, rather than finding a half-populated view and
+ * assuming the rest. An unrecognised or absent state stays UNKNOWN, which is not
+ * terminal and settles nothing — A9.2.5's rule for an absent key, and the
+ * conservative value on this path. */
+static atlas_status xport_job_get(void *ud, const char *job_uid, atlas_orch_job_view *out,
+                                  bool *found, atlas_err *err) {
+    run_xport *x = (run_xport *)ud;
+    *found = false;
+    job_get_req rq = {job_uid};
+    atlas_ipc_params *p = NULL;
+    atlas_json *j = NULL;
+    atlas_status st = atlas_ipc_params_begin(&p, &j, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    st = build_job_get(j, &rq, err);
+    atlas_buf params = ATLAS_BUF_INIT;
+    if (st == ATLAS_OK) {
+        st = atlas_ipc_params_finish(p, &params, err);
+    } else {
+        atlas_ipc_params_abort(p);
+    }
+    atlas_buf raw = ATLAS_BUF_INIT;
+    if (st == ATLAS_OK) {
+        st = atlas_ipc_call(atlas_buf_cstr(&x->sock), "job.get", atlas_buf_cstr(&params), &raw,
+                            err);
+    }
+    atlas_buf_free(&params);
+    atlas_ipc_response *resp = NULL;
+    if (st == ATLAS_OK) {
+        st = atlas_ipc_response_parse(raw.data, raw.len, &resp, err);
+        if (st != ATLAS_OK) {
+            atlas_err_mark_transport(err);
+        }
+    }
+    if (st == ATLAS_OK && !atlas_ipc_response_ok(resp)) {
+        st = atlas_err_set(err, atlas_ipc_response_status(resp), "%s",
+                           atlas_ipc_response_message(resp));
+    }
+    if (st == ATLAS_OK) {
+        const char *v = NULL;
+        if (atlas_ipc_result_str(resp, "job", &v) && v != NULL) {
+            (void)snprintf(out->job_uid, sizeof(out->job_uid), "%s", v);
+            *found = true;
+        }
+        if (atlas_ipc_result_str(resp, "state", &v) && v != NULL) {
+            (void)atlas_orch_state_parse(v, &out->state);
+        }
+        int64_t n = 0;
+        if (atlas_ipc_result_int(resp, "attempts", &n)) {
+            out->attempts_started = n;
+        }
+        (void)atlas_ipc_result_bool(resp, "cancel_requested", &out->cancel_requested);
+    }
+    atlas_ipc_response_free(resp);
+    atlas_buf_free(&raw);
+    return st;
+}
+
 atlas_status atlas_service_job_run_status(atlas_ctx *ctx, const char *run, atlas_job_sink sink,
                                           void *ud, atlas_err *err) {
     if (run == NULL || run[0] == '\0') {
@@ -1026,6 +1101,7 @@ atlas_status atlas_service_job_run(atlas_ctx *ctx, const atlas_job_run_opts *o,
         ro.log = o->log;
         ro.transport.apply = xport_apply;
         ro.transport.run_get = xport_run_get;
+        ro.transport.job_get = xport_job_get;
         ro.transport.ud = &x;
         st = atlas_rundriver_run(&ro, &rep, err);
     }

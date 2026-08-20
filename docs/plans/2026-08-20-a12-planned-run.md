@@ -226,9 +226,15 @@ RPC, no job_uid column updates:
 
 | job | correlation | idempotency key |
 | --- | --- | --- |
-| planner job k (k = 1..5) | `plan:<plan_uid>:planner:<k>` | `plan.<plan_uid>.planner.<k>` |
-| tree task of stage S, revision R | `plan:<plan_uid>:r<R>:<task_key>` | `plan.<plan_uid>.r<R>.<task_key>` |
-| side task, revision R | `plan:<plan_uid>:r<R>:<task_key>` | `plan.<plan_uid>.r<R>.<task_key>` |
+| planner job k (k = 1..5) | `plan.<uid21>.planner.<k>` | same string |
+| tree task of stage S, revision R | `plan.<uid21>.r<R>.<task_key>` | same string |
+| side task, revision R | `plan.<uid21>.r<R>.<task_key>` | same string |
+
+(Ruling 5, execution: `uid21` = `'p'` + the first 20 hex chars of the plan uid.
+The original colon/full-uid forms violated `is_name` and the 64-byte
+`ATLAS_ORCH_NAME_MAX`; the two builders in `db_plan.c`
+(`atlas_plan_correlation_planner` / `atlas_plan_correlation_task`) are the only
+legal producers of these strings — T5/T6 call them, never format by hand.)
 
 A crashed driver resumed at any point re-issues the same submissions; the
 idempotency table returns the existing job. `idx_orch_jobs_correlation` (M25)

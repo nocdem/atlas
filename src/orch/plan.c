@@ -138,8 +138,10 @@ static bool eat(const char *line, const char *prefix, const char **rest) {
 }
 
 /* `[a-z0-9-]{1,32}`. Narrow on purpose: a key is concatenated into a
- * correlation string and an idempotency key, and a key that could contain a
- * colon could impersonate another plan's job. */
+ * correlation string and an idempotency key, both dot-separated, and a key that
+ * could contain a dot could spell another plan's revision. Anything outside this
+ * set could also make the finished correlation fail `is_name`, which is checked
+ * again on the follow-up that inherits it. */
 static bool key_is_well_formed(const char *k, size_t n) {
     if (n == 0 || n > 32u) {
         return false;

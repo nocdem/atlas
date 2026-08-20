@@ -117,13 +117,65 @@ void atlas_plan_result_free(atlas_plan_result *r) {
     memset(r, 0, sizeof(*r));
 }
 
-/* --- the correlation, which is the whole plan-to-job mapping ---------------- */
+/* --- the correlation, which is the whole plan-to-job mapping ----------------
+ *
+ * **The string has to fit inside what a job specification may carry**, and that
+ * is a harder constraint than it looks. `atlas_orch_spec_validate` holds both
+ * `correlation` and `idempotency_key` to `is_name`: `[a-z0-9._-]`, at most
+ * `ATLAS_ORCH_NAME_MAX` (64) bytes. A colon is not in that set at all, and a
+ * 33-byte plan uid beside a 32-byte task key cannot fit in 64 with any
+ * separators whatever — the arithmetic is 5 + 33 + 4 + 32 = 74.
+ *
+ * So the plan uid is *shortened where it is spelled into a name*, and only
+ * there: `ATLAS_PLAN_CORR_UID_LEN` characters — the `'p'` and the first 20 hex
+ * digits, 80 bits. The stored `orch_plans.plan_uid` is still the full 33, and
+ * every other surface still uses it whole.
+ *
+ *   planner  `plan.<uid21>.planner.<k>`      5 + 21 + 9 + 1        = 36
+ *   task     `plan.<uid21>.r<R>.<key>`       5 + 21 + 3 + 1 + 32   = 62
+ *
+ * 62 is the worst case and it is two under the bound, which
+ * `tests/test_plan_db.c` pins by building that exact string and running it
+ * through `atlas_orch_spec_validate`. The bound is what a *stored* correlation
+ * must satisfy rather than merely what a client may send, because
+ * `spawn_follow_up` validates the correlation a follow-up inherits from its
+ * parent: a repo-tree plan task whose gate fails would otherwise be unable to
+ * create the one follow-up it earned.
+ *
+ * 80 bits is unguessable for the thing this identifier has to be unguessable
+ * for. The correlation is not a capability — presenting one authorises nothing,
+ * and `plan.revision_add` still requires the named job to *hold* it — but a
+ * plan whose correlations could be predicted would be a plan whose jobs another
+ * local process could name before they existed.
+ */
+#define ATLAS_PLAN_CORR_UID_LEN 21u
+
+/* The plan identifier as it is spelled into a name. Checked rather than
+ * assumed, because this is the one place the shortening happens and a uid that
+ * is not `'p'` plus hex would put something else entirely into a job's stored
+ * correlation. */
+static bool plan_uid_prefix(const char *plan_uid, char out[ATLAS_PLAN_CORR_UID_LEN + 1u]) {
+    if (plan_uid == NULL || strlen(plan_uid) < ATLAS_PLAN_CORR_UID_LEN || plan_uid[0] != 'p') {
+        return false;
+    }
+    for (size_t i = 1; i < ATLAS_PLAN_CORR_UID_LEN; i++) {
+        char c = plan_uid[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+            return false;
+        }
+    }
+    memcpy(out, plan_uid, ATLAS_PLAN_CORR_UID_LEN);
+    out[ATLAS_PLAN_CORR_UID_LEN] = '\0';
+    return true;
+}
 
 /* Nothing about a task key is trusted here even though the parser has already
- * checked it. The key travels into this string, and a key holding a colon would
- * be a key that could name a different plan's job — so the one place the string
- * is built refuses the character that would make that possible, rather than
- * relying on having been called in the right order. */
+ * checked it. The key travels into this string as its last field, and the
+ * separator is now a dot — so a key holding a dot would be a key that could
+ * spell a different plan's revision, and one holding anything outside
+ * `[a-z0-9-]` would be a key that could make the whole correlation fail
+ * `is_name` after it had been stored. The one place the string is built refuses
+ * both, rather than relying on having been called in the right order. */
 static bool key_is_safe(const char *key, size_t len) {
     if (key == NULL || len == 0 || len > 32u) {
         return false;
@@ -139,8 +191,12 @@ static bool key_is_safe(const char *key, size_t len) {
 
 atlas_status atlas_plan_correlation_planner(const char *plan_uid, int k, atlas_buf *out,
                                             atlas_err *err) {
-    if (plan_uid == NULL || plan_uid[0] == '\0') {
-        return atlas_err_set(err, ATLAS_ERR_USAGE, "a plan correlation needs a plan");
+    char uid[ATLAS_PLAN_CORR_UID_LEN + 1u];
+    if (!plan_uid_prefix(plan_uid, uid)) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "a plan correlation needs a plan identifier: 'p' and at least %u "
+                             "lowercase hex characters",
+                             (unsigned)(ATLAS_PLAN_CORR_UID_LEN - 1u));
     }
     if (k < 1 || k > ATLAS_PLAN_MAX_PLANNER_JOBS) {
         return atlas_err_set(err, ATLAS_ERR_USAGE,
@@ -148,13 +204,17 @@ atlas_status atlas_plan_correlation_planner(const char *plan_uid, int k, atlas_b
                              ATLAS_PLAN_MAX_PLANNER_JOBS, k);
     }
     atlas_buf_reset(out);
-    return atlas_buf_appendf(out, err, "plan:%s:planner:%d", plan_uid, k);
+    return atlas_buf_appendf(out, err, "plan.%s.planner.%d", uid, k);
 }
 
 atlas_status atlas_plan_correlation_task(const char *plan_uid, int rev_no, const char *task_key,
                                          atlas_buf *out, atlas_err *err) {
-    if (plan_uid == NULL || plan_uid[0] == '\0') {
-        return atlas_err_set(err, ATLAS_ERR_USAGE, "a plan correlation needs a plan");
+    char uid[ATLAS_PLAN_CORR_UID_LEN + 1u];
+    if (!plan_uid_prefix(plan_uid, uid)) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "a plan correlation needs a plan identifier: 'p' and at least %u "
+                             "lowercase hex characters",
+                             (unsigned)(ATLAS_PLAN_CORR_UID_LEN - 1u));
     }
     if (rev_no < 1 || rev_no > ATLAS_PLAN_MAX_REVISIONS) {
         return atlas_err_set(err, ATLAS_ERR_USAGE,
@@ -166,7 +226,7 @@ atlas_status atlas_plan_correlation_task(const char *plan_uid, int rev_no, const
                              "a task key is 1 to 32 characters of [a-z0-9-]");
     }
     atlas_buf_reset(out);
-    return atlas_buf_appendf(out, err, "plan:%s:r%d:%s", plan_uid, rev_no, task_key);
+    return atlas_buf_appendf(out, err, "plan.%s.r%d.%s", uid, rev_no, task_key);
 }
 
 /* --- the plan identifier ---------------------------------------------------
@@ -680,11 +740,19 @@ static atlas_status op_revision_add(atlas_db *db, const atlas_plan_op *op, atlas
         }
         atlas_buf_free(&want);
         if (st == ATLAS_OK && !bound) {
+            /* The expected shape, spelled with this plan's own shortened
+             * identifier, so an operator can compare it against the job's stored
+             * correlation instead of deriving it. The job's actual correlation is
+             * deliberately not echoed: it is a value a client chose, and this
+             * sentence reaches a terminal. */
+            char short_uid[ATLAS_PLAN_CORR_UID_LEN + 1u];
+            if (!plan_uid_prefix(plan.plan_uid, short_uid)) {
+                short_uid[0] = '\0';
+            }
             st = atlas_err_set(err, ATLAS_ERR_USAGE,
-                               "job %s is not a planner job of plan %s; a planner job carries the "
-                               "correlation plan:%s:planner:<k> for k in 1..%d",
-                               job_uid, plan.plan_uid, plan.plan_uid,
-                               ATLAS_PLAN_MAX_PLANNER_JOBS);
+                               "job %s is not a planner job of plan %s; a planner job of this plan "
+                               "carries the correlation plan.%s.planner.<k> for k in 1..%d",
+                               job_uid, plan.plan_uid, short_uid, ATLAS_PLAN_MAX_PLANNER_JOBS);
         }
     }
 

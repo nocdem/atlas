@@ -130,9 +130,11 @@ const char *atlas_plan_status_name(atlas_plan_status s);
  */
 typedef struct atlas_plan_doc_task {
     /* `[a-z0-9-]{1,32}`, unique across the whole plan. Deliberately narrow: a
-     * key travels into an idempotency key and a correlation string, and a key
-     * that could contain a colon would be a key that could impersonate a
-     * different plan's job. */
+     * key travels into an idempotency key and a correlation string, both of
+     * which are dot-separated and both of which must satisfy `is_name` after
+     * they are stored. A key holding a dot could spell a different plan's
+     * revision; a key holding anything outside this set could make the whole
+     * correlation fail validation on the follow-up that inherits it. */
     char key[33];
     int stage_no;
     /* True for the stage's single repository-tree task; false for a workspace
@@ -461,13 +463,33 @@ atlas_status atlas_db_plan_state_derive(atlas_db *db, const char *plan_uid, atla
 
 /* The correlation that binds one job to one plan, which is the whole of the
  * plan↔job mapping: there is no bind RPC, no `plan_id` column on `orch_jobs` and
- * no update after submission. `plan:<plan_uid>:planner:<k>` for planner job k,
- * and `plan:<plan_uid>:r<rev>:<task_key>` for a revision's task.
+ * no update after submission.
+ *
+ *   `plan.<uid21>.planner.<k>`   for planner job k        (36 bytes)
+ *   `plan.<uid21>.r<rev>.<key>`  for a revision's task    (62 bytes at worst)
+ *
+ * `<uid21>` is the plan identifier **shortened for this purpose only**: the
+ * `'p'` and the first 20 hex digits, 80 bits. The full 33-character uid is what
+ * `orch_plans` stores and what every other surface uses; it is shortened here
+ * because a correlation has to fit inside what a job specification may carry.
+ * `atlas_orch_spec_validate` holds `correlation` and `idempotency_key` to
+ * `is_name` — `[a-z0-9._-]`, at most `ATLAS_ORCH_NAME_MAX` — and a full uid
+ * beside a 32-byte task key does not fit in 64 bytes with any separators.
+ *
+ * That bound is a constraint on the *stored* value and not merely on what a
+ * client may send: `spawn_follow_up` validates the correlation a follow-up
+ * inherits from its parent, so a correlation that would not validate is one
+ * whose repo-tree task could not create the follow-up a failed gate earned.
+ *
+ * Both refuse a `plan_uid` that is not `'p'` followed by hex, and the task form
+ * refuses a key outside `[a-z0-9-]{1,32}`: this is the one place either is
+ * spelled into a name, so it is the one place that has to check.
  *
  * Exposed because three layers build the same string — the write point checking
  * a planner job's binding, the derived reader finding a plan's jobs, and the
  * driver submitting them — and a second spelling of one format is a second
- * answer to "is this job this plan's". `out` is set, not appended to. */
+ * answer to "is this job this plan's". They serve the idempotency keys too, for
+ * the same reason. `out` is set, not appended to. */
 atlas_status atlas_plan_correlation_planner(const char *plan_uid, int k, atlas_buf *out,
                                             atlas_err *err);
 atlas_status atlas_plan_correlation_task(const char *plan_uid, int rev_no, const char *task_key,

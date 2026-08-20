@@ -4085,8 +4085,10 @@ static const char M25_TASKS[] =
     "  plan_id INTEGER NOT NULL REFERENCES orch_plans(id) ON DELETE CASCADE,"
     "  stage_no INTEGER NOT NULL CHECK(stage_no >= 1 AND stage_no <= 4),"
     /* `[a-z0-9-]{1,32}`, unique within the revision. Narrow deliberately: the
-     * key travels into a correlation and an idempotency key, and a key that
-     * could contain a colon could impersonate another plan's job. */
+     * key travels into a correlation and an idempotency key, both dot-separated
+     * and both bounded by `is_name`, so a key holding a dot could spell another
+     * plan's revision and a key holding anything else could make the finished
+     * correlation fail validation. */
     "  task_key TEXT NOT NULL,"
     "  kind TEXT NOT NULL CHECK(kind IN ('TREE','SIDE')),"
     /* UNTRUSTED_DATA, both of them: a model wrote them. Bounded, stored, and

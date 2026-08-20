@@ -24,16 +24,19 @@
  * socket, the real index or a registered repository. Every interleaving is
  * produced by issuing operations in an order this thread chose.
  *
- * **One deliberate omission.** The submit helper below does not call
- * `atlas_orch_spec_validate` on a plan-correlated specification, because the
- * correlation format A12.0's design fixes — `plan:<plan_uid>:...` — does not
- * pass it: `is_name` admits no colon, and the task form is 74 bytes against a
- * bound of 64. `op_submit` does not validate, so these rows are exactly the rows
- * the write point would store; the T3 report carries the arithmetic and the
- * decision it needs. Every correlation in this file is built through
- * `atlas_plan_correlation_planner` / `atlas_plan_correlation_task`, never
- * written out, so a ruling on the format changes those two functions and no
- * test.
+ * **Every specification built here is validated.** The submit helper calls
+ * `atlas_orch_spec_validate` on every plan-correlated specification, which is
+ * the check a real submission meets at the IPC edge *and* the check
+ * `spawn_follow_up` applies to the correlation a follow-up inherits. A
+ * correlation this suite can store is therefore one a repo-tree plan task could
+ * carry into the follow-up a failed gate earns. The worst case — the full
+ * identifier, the last revision and a 32-character key, 62 bytes — has a case of
+ * its own.
+ *
+ * Every correlation in this file is built through
+ * `atlas_plan_correlation_planner` / `atlas_plan_correlation_task` and never
+ * written out, so the format has exactly one spelling and moving it moves those
+ * two functions and no test.
  */
 #define _GNU_SOURCE 1
 
@@ -325,10 +328,87 @@ static atlas_orch_op *submit_op(env *e, const sub *s) {
         T_OK(atlas_buf_set_str(&op->spec.correlation, s->correlation, &err), &err);
     }
     T_OK(atlas_orch_spec_canonicalise(&op->spec, &err), &err);
-    /* `atlas_orch_spec_validate` is deliberately not called — see the file
-     * header. `op_submit` does not call it either, so what lands is what the
-     * write point stores. */
+    /* The check a real submission meets at the IPC edge, and the same one
+     * `spawn_follow_up` applies to a correlation a follow-up inherits. Asserted
+     * on every specification this file builds, so a plan correlation that could
+     * not survive a gate failure could not be stored here either. */
+    T_OK(atlas_orch_spec_validate(&op->spec, &err), &err);
     return op;
+}
+
+/* The correlation format has to fit inside what a job specification may carry:
+ * `is_name`, at most `ATLAS_ORCH_NAME_MAX`. This is the worst case the builders
+ * can produce — the full plan identifier, the last revision, and a task key at
+ * the parser's own ceiling — and it is asserted against the validator rather
+ * than against a number this test chose. */
+static void test_the_worst_case_correlation_fits_a_specification(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+
+    static const char UID[] = "p0123456789abcdef0123456789abcdef";
+    static const char KEY[] = "abcdefghij-klmnopqrst-uvwxyz0123"; /* exactly 32 */
+    T_EQ_INT((int)strlen(UID), 33);
+    T_EQ_INT((int)strlen(KEY), 32);
+
+    atlas_buf corr = ATLAS_BUF_INIT;
+    T_OK(atlas_plan_correlation_task(UID, ATLAS_PLAN_MAX_REVISIONS, KEY, &corr, &err), &err);
+    T_EQ_STR(atlas_buf_cstr(&corr), "plan.p0123456789abcdef0123.r3.abcdefghij-klmnopqrst-uvwxyz0123");
+    T_EQ_INT((int)corr.len, 62);
+    T_CHECK_MSG(corr.len <= ATLAS_ORCH_NAME_MAX, "the worst-case correlation is %zu bytes against "
+                                                 "a bound of %u",
+                corr.len, (unsigned)ATLAS_ORCH_NAME_MAX);
+
+    /* Against the validator itself, not against the arithmetic above: the bound
+     * and the charset are its rules, and a test that restated them would pass by
+     * agreeing with itself. */
+    {
+        atlas_orch_spec s;
+        atlas_orch_spec_init(&s);
+        s.spec_version = ATLAS_ORCH_SPEC_VERSION;
+        s.submitter_uid = 1000;
+        T_OK(atlas_buf_set_str(&s.repo_name, "proj", &err), &err);
+        T_OK(atlas_buf_set_str(&s.repo_identity_hash,
+                               "0123456789abcdef0123456789abcdef"
+                               "0123456789abcdef0123456789abcdef",
+                               &err),
+             &err);
+        T_OK(atlas_buf_set_str(&s.source_commit, "0123456789abcdef0123456789abcdef01234567", &err),
+             &err);
+        T_OK(atlas_buf_set_str(&s.mode, "patch", &err), &err);
+        T_OK(atlas_buf_set_str(&s.driver, "fake", &err), &err);
+        T_OK(atlas_buf_set_str(&s.task_text, "do the thing", &err), &err);
+        s.wall_timeout_ms = 3600000;
+        s.idle_timeout_ms = 900000;
+        s.max_attempts = 1;
+        s.max_output_bytes = 65536;
+        s.max_artifact_bytes = 65536;
+        s.max_artifact_count = 8;
+        T_OK(atlas_buf_set(&s.correlation, corr.data, corr.len, &err), &err);
+        /* The same string serves the idempotency key, which carries the same
+         * bound and the same charset. */
+        T_OK(atlas_buf_set(&s.idempotency_key, corr.data, corr.len, &err), &err);
+        T_OK(atlas_orch_spec_validate(&s, &err), &err);
+        atlas_orch_spec_free(&s);
+    }
+
+    /* The planner form, and the guard both builders share: the identifier is
+     * spelled into a name here and nowhere else, so this is where a uid that is
+     * not `'p'` plus hex has to be refused. */
+    T_OK(atlas_plan_correlation_planner(UID, ATLAS_PLAN_MAX_PLANNER_JOBS, &corr, &err), &err);
+    T_EQ_STR(atlas_buf_cstr(&corr), "plan.p0123456789abcdef0123.planner.5");
+    T_EQ_INT((int)corr.len, 36);
+
+    T_FAILS_WITH(atlas_plan_correlation_planner("p0123", 1, &corr, &err), ATLAS_ERR_USAGE, &err);
+    T_FAILS_WITH(atlas_plan_correlation_planner("r0123456789abcdef0123456789abcdef", 1, &corr,
+                                                &err),
+                 ATLAS_ERR_USAGE, &err);
+    T_FAILS_WITH(atlas_plan_correlation_task("p0123456789abcdefzzzz", 1, "k", &corr, &err),
+                 ATLAS_ERR_USAGE, &err);
+    T_FAILS_WITH(atlas_plan_correlation_task(UID, 1, "has.a.dot", &corr, &err), ATLAS_ERR_USAGE,
+                 &err);
+    T_FAILS_WITH(atlas_plan_correlation_task(UID, ATLAS_PLAN_MAX_REVISIONS + 1, "k", &corr, &err),
+                 ATLAS_ERR_USAGE, &err);
+    atlas_buf_free(&corr);
 }
 
 static void apply_ok(env *e, atlas_orch_op *op, atlas_orch_result *out) {
@@ -1299,6 +1379,59 @@ static void test_a_spent_planner_budget_with_nothing_compiled_is_blocked(void) {
     env_close(&e);
 }
 
+/* The companion to the case above, and the one that pins the `planner_budget`
+ * guard on rule 5 specifically.
+ *
+ * The last planner job **SUCCEEDED** and its document was refused, so there is
+ * an artifact sitting there that no revision names. With budget left that is
+ * PLANNING and `replan_wanted` — the driver re-asks. With the budget spent there
+ * is nothing left to ask for, and the answer has to be BLOCKED: a plan that
+ * reported PLANNING here would report it for ever, because nothing can move it.
+ *
+ * BLOCKED is derived rather than stored, so it is still not a trap: if that
+ * outstanding document is somehow ingested afterwards, the next read changes. */
+static void test_a_spent_planner_budget_with_a_refused_artifact_is_blocked(void) {
+    env e;
+    env_open(&e);
+
+    atlas_buf plan = ATLAS_BUF_INIT;
+    plan_req r = {.gates = 1, .parallel = 2};
+    plan_create(&e, &r, &plan);
+
+    /* The first four fail, which spends budget without producing anything. */
+    for (int k = 1; k < ATLAS_PLAN_MAX_PLANNER_JOBS; k++) {
+        planner p = {.k = k, .succeed = false};
+        planner_job(&e, atlas_buf_cstr(&plan), &p, NULL);
+    }
+    atlas_plan_state st;
+    T_EQ_INT((int)derive(&e, atlas_buf_cstr(&plan), &st), (int)ATLAS_PLAN_STATUS_PLANNING);
+    T_EQ_INT(st.planner_jobs_seen, ATLAS_PLAN_MAX_PLANNER_JOBS - 1);
+
+    /* The last one succeeds and writes a document Atlas refuses. */
+    art bad = {.name = ATLAS_PLAN_ARTIFACT_NAME, .bytes = PLAN_REFUSED, .stored = true};
+    planner last = {.k = ATLAS_PLAN_MAX_PLANNER_JOBS, .succeed = true, .artifact = &bad};
+    atlas_buf job = ATLAS_BUF_INIT;
+    planner_job(&e, atlas_buf_cstr(&plan), &last, &job);
+    revision_refused(&e, atlas_buf_cstr(&plan), atlas_buf_cstr(&job), 1,
+                     ATLAS_PLAN_REVISION_INITIAL, true, "the last planner job's document", NULL,
+                     NULL);
+
+    T_EQ_INT(st.rev_no, 0);
+    T_CHECK_MSG(derive(&e, atlas_buf_cstr(&plan), &st) == ATLAS_PLAN_STATUS_BLOCKED,
+                "a spent planner budget with a refused artifact derived %s",
+                atlas_plan_status_name(st.status));
+    T_EQ_INT(st.planner_jobs_seen, ATLAS_PLAN_MAX_PLANNER_JOBS);
+    T_EQ_INT((int)st.planner_job_state, (int)ATLAS_ORCH_STATE_SUCCEEDED);
+    T_EQ_STR(st.planner_job_uid, atlas_buf_cstr(&job));
+    T_EQ_INT(st.rev_no, 0);
+    T_CHECK_MSG(!st.replan_wanted,
+                "a plan with no planner budget asked for a replan it cannot have");
+
+    atlas_buf_free(&job);
+    atlas_buf_free(&plan);
+    env_close(&e);
+}
+
 static void test_a_compiled_revision_executes_completes_and_says_which(void) {
     env e;
     env_open(&e);
@@ -1601,6 +1734,8 @@ static void test_only_the_write_point_writes_the_plan_tables(void) {
 static const atlas_test TESTS[] = {
     {"migration 25 adds its tables and the correlation index",
      test_migration_25_adds_its_tables_and_the_correlation_index},
+    {"the worst-case correlation fits a specification",
+     test_the_worst_case_correlation_fits_a_specification},
     {"the compiled constants and the schema's CHECKs agree",
      test_the_constants_and_the_checks_agree},
     {"a plan stores what the operator brought", test_a_plan_stores_what_the_operator_brought},
@@ -1625,6 +1760,8 @@ static const atlas_test TESTS[] = {
      test_a_planner_job_no_revision_names_wants_the_driver},
     {"a spent planner budget with nothing compiled is blocked",
      test_a_spent_planner_budget_with_nothing_compiled_is_blocked},
+    {"a spent planner budget with a refused artifact is blocked, not planning",
+     test_a_spent_planner_budget_with_a_refused_artifact_is_blocked},
     {"a compiled revision executes, completes and says which",
      test_a_compiled_revision_executes_completes_and_says_which},
     {"a blocked stage-run asks for a replan and waits for quiescence",

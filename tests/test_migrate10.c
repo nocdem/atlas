@@ -137,7 +137,14 @@ static void test_a_schema_nine_database_reaches_ten_additively(void) {
      * column, so undoing 21 now means undoing 24 first: the indexes go before
      * the columns because SQLite refuses to drop an indexed one, and
      * `idx_orch_jobs_one_active_per_run` is not in a current database at all. */
-    exec(db, "DROP INDEX idx_orch_jobs_one_active_repo_tree;"
+    /* A12.0's three tables and the index migration 25 put on `orch_jobs`. This
+     * rewind stops at 9, so `orch_jobs` survives and would meet its own index
+     * again; undoing a migration means undoing all of it. */
+    exec(db, "DROP TABLE orch_plan_tasks;"
+             "DROP TABLE orch_plan_revisions;"
+             "DROP TABLE orch_plans;"
+             "DROP INDEX idx_orch_jobs_correlation;"
+             "DROP INDEX idx_orch_jobs_one_active_repo_tree;"
              "DROP INDEX idx_orch_jobs_active_slot;"
              "DROP INDEX idx_orch_jobs_run;"
              "ALTER TABLE orch_jobs DROP COLUMN run_slot;"

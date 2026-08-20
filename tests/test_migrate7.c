@@ -170,6 +170,15 @@ static void build_schema6(const char *path, atlas_err *err) {
               * dropped at all: a rewind that leaves a later migration's table
               * behind is not a database at the version it claims, and migration
               * 23 would then fail to create it. */
+             /* A12.0's three tables, children before parents, and the index
+              * migration 25 put on `orch_jobs` before the table it is on: a
+              * rewind that leaves a later migration's object behind is not a
+              * database at the version it claims, and migration 25 would then
+              * fail to create it. */
+             "DROP TABLE orch_plan_tasks;"
+             "DROP TABLE orch_plan_revisions;"
+             "DROP TABLE orch_plans;"
+             "DROP INDEX idx_orch_jobs_correlation;"
              "DROP TABLE orch_run_memory;"
              "DROP TABLE orch_usage;"
         "DROP TABLE orch_runs;"
@@ -249,7 +258,7 @@ static void test_a_populated_schema_six_database_reaches_seven_losslessly(void) 
      * table without renumbering a row — is asserted below and is unaffected by
      * later migrations running on top of it. */
     T_EQ_INT(atlas_db_schema_version(db, &err), ATLAS_SCHEMA_VERSION);
-    T_EQ_INT(ATLAS_SCHEMA_VERSION, 24);
+    T_EQ_INT(ATLAS_SCHEMA_VERSION, 25);
 
     atlas_buf after = ATLAS_BUF_INIT;
     text_of(db,

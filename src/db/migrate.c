@@ -3974,6 +3974,140 @@ static const char M24_SLOT_INDEX[] =
 
 static const char *const M24_STATEMENTS[] = {M24_RUN_PARALLEL, M24_SLOT_INDEX, NULL};
 
+/* --- migration 25: the planned run --------------------------------------------
+ *
+ * A12.0. A **plan** is what an operator brings when the work is bigger than one
+ * task: a goal, a gate floor, and a bound on how much may run at once. A planner
+ * worker proposes how to divide it; Atlas parses that proposal, refuses it or
+ * compiles it into a *revision*, and every task the revision names then runs
+ * under exactly the submit refusals, budgets, leases, gates and settlement that
+ * were already there. Three tables, and every one of them holds a proposal.
+ *
+ * **There is no status column, and that is the season's whole authority
+ * argument.** A plan's status is derived on every read from rows the plan
+ * vocabulary cannot write — the revisions that compiled, the jobs their
+ * correlations name, the runs those jobs settled. There is no `plan.settle`, no
+ * CAS to win and no column to set, so "a model payload cannot declare a plan
+ * complete" is true by absence rather than by a check. That is A11.0's shape for
+ * `orch_runs`, which had a status nothing produced, carried one layer further:
+ * here there is not even a status to produce.
+ *
+ * **What the operator brings is stored once, on the plan, and never on a
+ * revision.** `goal_text` and `gate_floor` are the operator's; a revision is the
+ * planner's. The floor is prepended verbatim to every tree task's validations at
+ * the write point and the merged list is bounded again there, so a planner can
+ * add gates and can never remove, replace or reorder one. A schema in which the
+ * floor lived beside the planner's additions would be a schema in which the
+ * difference between them could be lost.
+ *
+ * **A revision keeps the artifact's bytes verbatim.** `content` is exactly what
+ * the planner wrote, with its digest beside it, because the compiled task rows
+ * are a *reading* of those bytes and a reading cannot be re-checked against
+ * something nobody kept. It is bounded at ATLAS_PLAN_MAX_BYTES (64 KiB) by the
+ * write point, and it is UNTRUSTED_DATA wherever it is shown.
+ *
+ * **The literals 3, 4 and 8 are `ATLAS_PLAN_MAX_REVISIONS`,
+ * `ATLAS_PLAN_MAX_STAGES` and `ATLAS_ORCH_RUN_MAX_PARALLEL`**, written out
+ * because SQLite cannot read a C macro — M24's arrangement exactly, and
+ * `tests/test_plan_db.c` asserts each constant and its CHECK agree by driving a
+ * value one past the bound straight at the schema with the C write point
+ * bypassed. Raising one means raising it in two places and in a migration, which
+ * is deliberate.
+ *
+ * `reason` admits `INITIAL` and `REPLAN` and nothing else. A refused parse
+ * aborts its transaction and writes no row, so there is no third value for one:
+ * a `PARSE_REFUSED` revision would be a row describing a revision that does not
+ * exist, and the refused state is derived instead from a planner job whose uid
+ * no revision names.
+ *
+ * `idx_orch_jobs_correlation` is on `orch_jobs` and is the only thing this
+ * migration adds outside its own tables. It is what makes the plan↔job mapping a
+ * cheap *derived* read rather than a stored one: every job a plan submits
+ * carries a correlation naming the plan, so a crashed driver resumed at any
+ * point re-derives what it had submitted instead of consulting a binding table
+ * that could disagree with the jobs themselves.
+ *
+ * Additive: three new tables and one new index, no table rebuilt, so foreign
+ * keys stay enforced throughout and no pre-existing row is rewritten. Nothing is
+ * backfilled and nothing could be — no job that predates this migration belongs
+ * to a plan, and inventing one for it would be migration 19's mistake. It starts
+ * nothing: a migrated machine has no plans, and a plan is created only by an
+ * operator.
+ */
+static const char M25_PLANS[] =
+    "CREATE TABLE orch_plans ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    /* The external identifier: 'p' plus 32 lowercase hex, from the kernel's
+     * random source. Unguessable for the reason a job uid is — and here it
+     * carries a second weight, because the correlation that binds a job to this
+     * plan is built out of it. */
+    "  plan_uid TEXT NOT NULL UNIQUE,"
+    "  repo_name TEXT NOT NULL,"
+    "  repo_identity_hash TEXT NOT NULL,"
+    /* The operator's own words, bounded at ATLAS_PLAN_GOAL_MAX. Handed to a
+     * planner as raw bytes under the existing lease contract; safe-encoded on
+     * every read-back surface. */
+    "  goal_text TEXT NOT NULL,"
+    /* The operator's gate floor, netstring-encoded exactly as `orch_jobs`
+     * stores validations, and never empty: the write point refuses a plan with
+     * no gate. */
+    "  gate_floor TEXT NOT NULL,"
+    "  max_parallel INTEGER NOT NULL DEFAULT 2"
+    "    CHECK(max_parallel >= 1 AND max_parallel <= 8),"
+    /* From SO_PEERCRED at creation, never from a request body. */
+    "  submitter_uid INTEGER NOT NULL,"
+    "  created_at TEXT NOT NULL,"
+    "  created_ms INTEGER NOT NULL"
+    ");"
+    "CREATE INDEX idx_orch_plans_repo ON orch_plans(repo_identity_hash, id);";
+
+static const char M25_REVISIONS[] =
+    "CREATE TABLE orch_plan_revisions ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  plan_id INTEGER NOT NULL REFERENCES orch_plans(id) ON DELETE CASCADE,"
+    "  rev_no INTEGER NOT NULL CHECK(rev_no >= 1 AND rev_no <= 3),"
+    /* The planner job whose stored artifact this revision was compiled from.
+     * The join that makes "this planner job's document was never turned into a
+     * revision" a fact about rows rather than a guess. */
+    "  planner_job_uid TEXT NOT NULL,"
+    "  reason TEXT NOT NULL CHECK(reason IN ('INITIAL','REPLAN')),"
+    /* The planner's bytes, verbatim, with their digest beside them. */
+    "  content BLOB NOT NULL,"
+    "  content_sha256 TEXT NOT NULL,"
+    "  created_at TEXT NOT NULL,"
+    "  UNIQUE(plan_id, rev_no)"
+    ");";
+
+static const char M25_TASKS[] =
+    "CREATE TABLE orch_plan_tasks ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  revision_id INTEGER NOT NULL REFERENCES orch_plan_revisions(id) ON DELETE CASCADE,"
+    "  plan_id INTEGER NOT NULL REFERENCES orch_plans(id) ON DELETE CASCADE,"
+    "  stage_no INTEGER NOT NULL CHECK(stage_no >= 1 AND stage_no <= 4),"
+    /* `[a-z0-9-]{1,32}`, unique within the revision. Narrow deliberately: the
+     * key travels into a correlation and an idempotency key, and a key that
+     * could contain a colon could impersonate another plan's job. */
+    "  task_key TEXT NOT NULL,"
+    "  kind TEXT NOT NULL CHECK(kind IN ('TREE','SIDE')),"
+    /* UNTRUSTED_DATA, both of them: a model wrote them. Bounded, stored, and
+     * never interpreted as an instruction to Atlas. */
+    "  title TEXT NOT NULL,"
+    "  prompt TEXT NOT NULL,"
+    /* The **merged** list for a TREE task — the operator's floor verbatim and
+     * first, then the planner's additions in order — in the same netstring
+     * encoding `orch_jobs.validations` uses, and empty for a SIDE task, which
+     * declares no gate and is a workspace job under A8's isolation. */
+    "  validations TEXT NOT NULL,"
+    "  UNIQUE(revision_id, task_key)"
+    ");"
+    "CREATE INDEX idx_orch_plan_tasks_rev ON orch_plan_tasks(revision_id, stage_no, id);";
+
+static const char M25_JOB_CORRELATION[] =
+    "CREATE INDEX idx_orch_jobs_correlation ON orch_jobs(correlation, id);";
+
+static const char *const M25_STATEMENTS[] = {M25_PLANS, M25_REVISIONS, M25_TASKS,
+                                             M25_JOB_CORRELATION, NULL};
+
 static const atlas_migration MIGRATIONS[] = {
     {1, "initial schema", M1_STATEMENTS, false},
     {2, "worktree identity", M2_STATEMENTS, false},
@@ -4044,6 +4178,13 @@ static const atlas_migration MIGRATIONS[] = {
      * had. See the M24 comment for why the slot backfill cannot collide. */
     {24, "bounded parallel tasks in a run, and the repository's tree kept exclusive",
      M24_STATEMENTS, false},
+    /* Additive: three new tables and one new index on an existing one. No table
+     * is rebuilt, so foreign keys stay enforced and no pre-existing row is
+     * rewritten. Nothing is backfilled — no job that predates this belongs to a
+     * plan — and it starts nothing: a migrated machine has no plans, and only an
+     * operator creates one. See the M25 comment for why there is no status
+     * column. */
+    {25, "the planned run: plans, revisions, plan tasks", M25_STATEMENTS, false},
 };
 
 const atlas_migration *atlas_migrations(size_t *count_out) {

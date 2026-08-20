@@ -295,6 +295,9 @@ add_library(atlas_core STATIC
   src/core/service_orch.c
   src/db/db_orch.c
   src/db/db_orch_memory.c
+  # A12.0: migration 25's three tables, their one write point, and the plan
+  # status that is derived on every read because nothing writes one.
+  src/db/db_plan.c
   src/ipc/server_orch.c
   # --- A9: remote access, API credentials and the web control plane -------
   #

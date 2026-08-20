@@ -294,4 +294,183 @@ atlas_status atlas_plan_compose_executor(const char *plan_uid, int rev_no,
  * `src/orch/plan.c` must stay free of a database handle.
  * ------------------------------------------------------------------------ */
 
+/* Declared rather than included, exactly as `atlas/orch_ops.h` declares it: a
+ * database handle is opaque everywhere outside `src/db`, and pulling `atlas/db.h`
+ * in here would give the pure format layer a reason to see it. */
+typedef struct atlas_db atlas_db;
+
+/* --- the plan domain's one write point -------------------------------------
+ *
+ * `atlas_plan_apply_in_tx` is the only function that writes `orch_plans`,
+ * `orch_plan_revisions` or `orch_plan_tasks`, and it is the whole of what may
+ * write them. This mirrors `atlas_orch_apply_in_tx` and `atlas_decision_apply_in_tx`
+ * for the reason both give: every binding check a forger would want somewhere
+ * else — the correlation, the driver's role, the job's state, the artifact's
+ * name and bounds, and the format itself — lives behind this one call, and a
+ * second implementation reaching the tables would bypass all of them at once.
+ * `tests/test_plan_db.c` asserts the count of files that write these tables.
+ *
+ * Two operations, and deliberately no third. **There is no operation that writes
+ * a plan's status**, because no plan has one: the status is derived on every
+ * read by `atlas_db_plan_state_derive` from rows nothing in this vocabulary can
+ * reach. That is A11.0's authority-by-absence one layer up — there is no CAS to
+ * win, no column to set and no method to call, so "a model payload cannot
+ * declare a plan complete" is true because the verb does not exist.
+ */
+typedef enum atlas_plan_op_kind {
+    /* Zero is not an operation. A zeroed op applies nothing. */
+    ATLAS_PLAN_OP_NONE = 0,
+    /* An operator creates a plan: the goal, the immutable gate floor and the
+     * parallelism the stages will run under. Creates no job and starts nothing. */
+    ATLAS_PLAN_OP_CREATE,
+    /* A planner job's own stored artifact becomes a revision, if — and only if —
+     * every binding check below passes. */
+    ATLAS_PLAN_OP_REVISION_ADD
+} atlas_plan_op_kind;
+
+/* Why a revision exists. A closed two-member vocabulary, stored, with UNKNOWN
+ * as the zero that no stored row may hold.
+ *
+ * There is deliberately no `PARSE_REFUSED` member. A refused parse aborts the
+ * transaction and writes **no row at all**, so a reason describing one would be
+ * a reason for a revision that does not exist; the refused-artifact state is
+ * derived instead, from a planner job whose uid no revision names. */
+typedef enum atlas_plan_revision_reason {
+    ATLAS_PLAN_REVISION_UNKNOWN = 0,
+    ATLAS_PLAN_REVISION_INITIAL,
+    ATLAS_PLAN_REVISION_REPLAN
+} atlas_plan_revision_reason;
+
+const char *atlas_plan_revision_reason_name(atlas_plan_revision_reason r);
+
+typedef struct atlas_plan_op {
+    atlas_plan_op_kind kind;
+
+    /* A trusted connection fact, filled from `SO_PEERCRED` at the IPC edge and
+     * from nowhere else. A request body that carried a uid would be a caller
+     * describing itself to a field Atlas does not have. */
+    long long submitter_uid;
+
+    /* CREATE. Resolved from the registry by the caller, never supplied by a
+     * model or read out of a plan document. */
+    atlas_buf repo_name;
+    atlas_buf repo_identity_hash;
+    /* CREATE. The operator's own words. Bounded at ATLAS_PLAN_GOAL_MAX. */
+    atlas_buf goal_text;
+    /* CREATE. The operator's gate floor, in the canonical netstring encoding
+     * `atlas_orch_validations_encode` produces, and at least one command. A
+     * plan with no operator gate could only ever be accepted on a model's word,
+     * so an empty floor is a refusal rather than a default. */
+    atlas_buf gate_floor;
+    /* CREATE. 1..ATLAS_ORCH_RUN_MAX_PARALLEL; 0 means "not stated" and resolves
+     * to ATLAS_PLAN_DEFAULT_PARALLEL. Anything else is refused, never clamped. */
+    int max_parallel;
+
+    /* REVISION_ADD. */
+    atlas_buf plan_uid;
+    atlas_buf planner_job_uid;
+    atlas_plan_revision_reason reason;
+    /* The revision number the caller believes this will be. Compared against the
+     * plan's stored maximum plus one inside the transaction, for the reason every
+     * check here is inside it: a number that was right when it was read and wrong
+     * when it was written is not a check. */
+    int rev_no;
+} atlas_plan_op;
+
+void atlas_plan_op_init(atlas_plan_op *op, atlas_plan_op_kind kind);
+void atlas_plan_op_free(atlas_plan_op *op);
+
+/* What a plan without a stated bound runs its stages under.
+ *
+ * Two rather than one, because a plan exists to describe work that has a
+ * workspace sibling beside the stage's repository task; a default of one would
+ * make every plan's `side` tasks refusable by arithmetic the operator never saw.
+ * It is still a *default*: a plan may name anything from 1 to
+ * ATLAS_ORCH_RUN_MAX_PARALLEL, and a value outside that is refused. */
+#define ATLAS_PLAN_DEFAULT_PARALLEL 2
+
+/* What an applied operation reports back.
+ *
+ * The two refusal members are the reason this is a typed result rather than an
+ * `atlas_err` alone. A planner document that fails to parse is not a caller's
+ * mistake — it is a *model's* mistake, and the driver answers it by composing a
+ * retry prompt out of Atlas' own refusal sentence and the line it happened on.
+ * Folding the line into the sentence would make the driver parse Atlas' prose to
+ * recover it, so the two travel apart.
+ *
+ * **A non-empty `refusal` is the discriminator.** Every refusal that came from
+ * the document — a parse refusal from `atlas_plan_parse`, or the merged-gate
+ * bound this layer applies on top of it — sets it, always to a non-empty
+ * sentence. Every other refusal (the plan does not exist, the job is not a
+ * planner job, the artifact is missing) leaves it empty and is a caller's
+ * problem, not a planner's. Both return a non-OK status and both leave the
+ * transaction rolled back with no row written; the members survive the rollback
+ * because nothing on the failure path resets them. */
+typedef struct atlas_plan_result {
+    /* CREATE: the identifier Atlas generated. REVISION_ADD: the plan named. */
+    atlas_buf plan_uid;
+    int64_t plan_id;
+    /* REVISION_ADD: the revision written, and how many task rows it holds. */
+    int rev_no;
+    int task_count;
+
+    /* The refused document's sentence, or empty. UNTRUSTED_DATA it is not — it
+     * is Atlas' own prose about untrusted bytes, and it quotes none of them. */
+    atlas_buf refusal;
+    /* The 1-based line the refusal is about, or 0 for a refusal about the
+     * document as a whole. Zero is also what an un-refused result carries, which
+     * is why `refusal` and not this is the discriminator. */
+    int refusal_line;
+} atlas_plan_result;
+
+void atlas_plan_result_init(atlas_plan_result *r);
+void atlas_plan_result_free(atlas_plan_result *r);
+
+/* Begin, apply, commit, with rollback on failure. Call with no transaction
+ * open. */
+atlas_status atlas_plan_apply(atlas_db *db, const atlas_plan_op *op, atlas_plan_result *out,
+                              atlas_err *err);
+
+/* The single write point. Assumes the caller owns a transaction, and has exactly
+ * one caller — `atlas_plan_apply`. Adding a second means arguing that it owns a
+ * genuinely wider unit of work, which is the argument A4 requires for
+ * `atlas_decision_apply_in_tx`; adding a second *implementation* is what the
+ * rule forbids. */
+atlas_status atlas_plan_apply_in_tx(atlas_db *db, const atlas_plan_op *op, atlas_plan_result *out,
+                                    atlas_err *err);
+
+/* --- the derived state, read ------------------------------------------------
+ *
+ * The one implementation of "what is this plan doing?". `plan.get`, the plan
+ * driver's loop and the replan composer all ask this function, because three
+ * derivations of one status are three answers that can disagree about whether a
+ * plan is finished.
+ *
+ * Read-only and pure with respect to the database: it writes nothing, takes no
+ * lock and creates no process, and the same rows give the same answer on every
+ * call. Every rule it applies is documented beside the code with the row shape
+ * it reads.
+ *
+ * A plan that does not exist is a refusal, not an UNKNOWN status: UNKNOWN is the
+ * vocabulary's zero and means "nobody derived this", so returning it for a plan
+ * Atlas looked for and did not find would make a missing plan indistinguishable
+ * from an unfilled struct. Every plan that *does* exist derives one of the five
+ * real statuses. */
+atlas_status atlas_db_plan_state_derive(atlas_db *db, const char *plan_uid, atlas_plan_state *out,
+                                        atlas_err *err);
+
+/* The correlation that binds one job to one plan, which is the whole of the
+ * plan↔job mapping: there is no bind RPC, no `plan_id` column on `orch_jobs` and
+ * no update after submission. `plan:<plan_uid>:planner:<k>` for planner job k,
+ * and `plan:<plan_uid>:r<rev>:<task_key>` for a revision's task.
+ *
+ * Exposed because three layers build the same string — the write point checking
+ * a planner job's binding, the derived reader finding a plan's jobs, and the
+ * driver submitting them — and a second spelling of one format is a second
+ * answer to "is this job this plan's". `out` is set, not appended to. */
+atlas_status atlas_plan_correlation_planner(const char *plan_uid, int k, atlas_buf *out,
+                                            atlas_err *err);
+atlas_status atlas_plan_correlation_task(const char *plan_uid, int rev_no, const char *task_key,
+                                         atlas_buf *out, atlas_err *err);
+
 #endif /* ATLAS_PLAN_H */

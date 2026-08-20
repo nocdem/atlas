@@ -156,6 +156,7 @@ set(ATLAS_TESTS
   test_orch_snapshot
   # --- A12.0: the planned run ---
   test_plan_format
+  test_plan_db
   test_remote_equivalence
   test_operator_peer
   # The A8 operator-boundary fix: decision links over the socket, and the
@@ -322,6 +323,14 @@ set_tests_properties(test_orch_usage PROPERTIES LABELS "unit")
 # functions — untrusted bytes in, a document or a refusal out — so this suite
 # needs no repository, no database and no daemon either.
 set_tests_properties(test_plan_format PROPERTIES LABELS "unit")
+# A12.0. Migration 25, the plan's one write point and the derived status. It
+# builds a real fixture repository, registers it through the CLI and drives both
+# write points against an isolated database, so it is an integration test. It
+# creates no worker, opens no socket and sleeps for nothing. It also scans
+# `src/` for a second writer of the plan tables, which is what
+# `ATLAS_SRC_DIR` is for.
+set_tests_properties(test_plan_db PROPERTIES LABELS "integration" TIMEOUT 120)
+target_compile_definitions(test_plan_db PRIVATE ATLAS_SRC_DIR="${CMAKE_SOURCE_DIR}")
 # The lifecycle suite builds a real fixture repository, registers it through the
 # CLI and drives the one write point against an isolated database, so it is an
 # integration test. It sleeps for nothing: expiry and deadlines are supplied.

@@ -353,6 +353,13 @@ static void wind_back_to_schema_12(env *e, atlas_err *err) {
          * reason: migration 24 replaced migration 21's single index with two,
          * so undoing 21 means undoing 24 first, and the indexes go before the
          * columns because SQLite refuses to drop an indexed one. */
+        /* A12.0's three tables and migration 25's index on `orch_jobs`, for the
+         * reason every drop in this list exists: this rewind stops at 12, so
+         * migration 25 runs again and would meet its own objects. */
+        "DROP TABLE orch_plan_tasks;"
+        "DROP TABLE orch_plan_revisions;"
+        "DROP TABLE orch_plans;"
+        "DROP INDEX idx_orch_jobs_correlation;"
         "DROP TABLE orch_run_memory;"
         "DROP TABLE orch_usage;"
         "DROP TABLE orch_runs;"

@@ -276,6 +276,25 @@ static const retention_entry RETENTION[] = {
      "rather than per heartbeat so the row count is bounded by the state machine; it is what "
      "distinguishes a worker that died silently from one that never started"},
 
+    /* --- A12.0: the planned run ----------------------------------------------
+     *
+     * All three are CANONICAL for one reason with three faces: a plan's status
+     * is *derived* from these rows on every read, so deleting one does not make
+     * the record smaller, it makes the answer different. A pruned revision would
+     * turn a completed plan into one that never planned anything. */
+    {"orch_plans", ATLAS_RETAIN_CANONICAL, false,
+     "the goal an operator brought, the gate floor they fixed and the parallelism they chose; it "
+     "is the only record of what was asked for and of the floor every task in the plan was held "
+     "to, and no revision, job or run can be interpreted without it"},
+    {"orch_plan_revisions", ATLAS_RETAIN_CANONICAL, false,
+     "the planner's own bytes, verbatim, with the job that produced them and the digest of them; "
+     "the compiled task rows are a reading of those bytes and a reading nobody kept the original "
+     "of cannot be disputed, and the model run that wrote them is gone"},
+    {"orch_plan_tasks", ATLAS_RETAIN_CANONICAL, false,
+     "what each task of a revision was asked to do and the merged gate list it would be held to; "
+     "the plan's status is derived by joining these rows to the jobs their correlations name, so a "
+     "pruned task is not a shorter history, it is a plan that reads as though it had fewer stages"},
+
     /* --- A8-CI: the compiler-derived semantic index --------------------------
      *
      * Every one of these is DERIVED, and that classification is the whole

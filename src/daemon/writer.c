@@ -152,6 +152,14 @@ static void job_free(atlas_job *j) {
         atlas_verify_intake_result_free(j->verify_result);
         free(j->verify_result);
     }
+    if (j->plan != NULL) {
+        atlas_plan_op_free(j->plan);
+        free(j->plan);
+    }
+    if (j->plan_result != NULL) {
+        atlas_plan_result_free(j->plan_result);
+        free(j->plan_result);
+    }
     free(j->gw_audit);
     free(j);
 }
@@ -309,6 +317,7 @@ bool job_kind_is_unbounded(atlas_job_kind kind) {
     case ATLAS_JOB_APIKEY:
     case ATLAS_JOB_VERIFY:
     case ATLAS_JOB_SEM_CONFIG:
+    case ATLAS_JOB_PLAN:
         return false;
     }
     return false;
@@ -358,6 +367,12 @@ bool job_kind_is_drainable(atlas_job_kind kind) {
     case ATLAS_JOB_DECISION:
     /* A claim, its evidence, an attestation — records nothing rebuilds. */
     case ATLAS_JOB_VERIFY:
+    /* A12.0. A plan's creation or one revision of it. Three small tables of its
+     * own — `orch_plans`, `orch_plan_revisions`, `orch_plan_tasks` — disjoint
+     * from everything a semantic pass or a discovery walk touches, and an
+     * operator's foreground plan driver is blocked on it, which is the same
+     * latency argument the orchestration writes above make. */
+    case ATLAS_JOB_PLAN:
     /* One audit row for a request that has already been answered. */
     case ATLAS_JOB_GW_AUDIT:
     /* A credential change; revocation must not wait for a compiler. */
@@ -736,6 +751,24 @@ static void run_orch(atlas_writer *w, atlas_job *j) {
     j->result = atlas_orch_apply(w->db, j->orch, &j->orch_result, &j->result_err);
 }
 
+/* A12.0. `atlas_plan_apply` owns its own transaction, exactly like the four
+ * above, and is called with none open — so an operation is whole or nothing, and
+ * a revision row without the task rows it compiled to cannot be committed.
+ *
+ * A refusal here is not always a failure of the caller's request: a planner
+ * document that does not parse fills the result's `refusal` and `refusal_line`
+ * and returns non-OK, and the rollback deliberately leaves those alone. They are
+ * carried back to the caller by `atlas_writer_plan` on that path as well as on
+ * the successful one. */
+static void run_plan(atlas_writer *w, atlas_job *j) {
+    if (j->plan == NULL || j->plan_result == NULL) {
+        j->result = atlas_err_set(&j->result_err, ATLAS_ERR_INTERNAL,
+                                  "a plan job arrived with no operation attached");
+        return;
+    }
+    j->result = atlas_plan_apply(w->db, j->plan, j->plan_result, &j->result_err);
+}
+
 static void run_snapshot(atlas_writer *w, atlas_job *j) {
     if (j->snapshot_meta == NULL) {
         j->result = atlas_err_set(&j->result_err, ATLAS_ERR_INTERNAL,
@@ -1049,6 +1082,7 @@ static void writer_run_job(atlas_writer *w, atlas_job *j) {
     case ATLAS_JOB_DECISION: run_decision(w, j); break;
     case ATLAS_JOB_ORCH: run_orch(w, j); break;
     case ATLAS_JOB_VERIFY: run_verify(w, j); break;
+    case ATLAS_JOB_PLAN: run_plan(w, j); break;
     case ATLAS_JOB_SNAPSHOT: run_snapshot(w, j); break;
     case ATLAS_JOB_SEM_INDEX: run_sem_index(w, j); break;
     case ATLAS_JOB_SEM_DISCOVER: run_sem_discover(w, j); break;
@@ -1976,6 +2010,93 @@ atlas_status atlas_writer_verify(atlas_writer *w, atlas_verify_op *op, int timeo
         *result = *j->verify_result;
         memset(j->verify_result, 0, sizeof *j->verify_result);
     } else {
+        *err = j->result_err;
+    }
+    job_free(j);
+    return st;
+}
+
+/* A12.0. The same shape as `atlas_writer_verify` — the job owns the operation
+ * and the result slot, the wait is bounded, and a request that times out is
+ * detached rather than freed — with one deliberate difference.
+ *
+ * **The result is moved on the failure path too.** Every other wrapper in this
+ * file hands the caller a result only when the operation succeeded, because for
+ * every other domain a failure is entirely described by `atlas_err`. A plan
+ * operation has a second kind of failure: a planner's document that does not
+ * parse. That is a *model's* mistake rather than a caller's, and the answer to it
+ * is the refusal sentence and the line it happened on, which
+ * `atlas_plan_apply` fills in and the rollback leaves alone. Moving the result
+ * only on success would leave those on the writer thread to be freed, and the
+ * driver with Atlas' prose to parse for a line number.
+ *
+ * The status still says what happened; the result carries what to do about it. */
+atlas_status atlas_writer_plan(atlas_writer *w, atlas_plan_op *op, int timeout_ms,
+                               atlas_plan_result *result, atlas_err *err) {
+    atlas_job *j = job_new(ATLAS_JOB_PLAN);
+    atlas_plan_result *slot = calloc(1u, sizeof *slot);
+    if (j == NULL || slot == NULL) {
+        /* Ownership is taken unconditionally, here as everywhere. */
+        atlas_plan_op_free(op);
+        free(op);
+        free(slot);
+        job_free(j);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory queueing a plan request");
+    }
+    atlas_plan_result_init(slot);
+    j->plan = op;
+    j->plan_result = slot;
+    j->wants_result = true;
+
+    (void)pthread_mutex_lock(&w->lock);
+    if (w->stopping || !queue_push(w, j)) {
+        bool stopping = w->stopping;
+        (void)pthread_mutex_unlock(&w->lock);
+        job_free(j);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                             stopping ? "the Atlas daemon is shutting down"
+                                      : "the Atlas daemon's write queue is full");
+    }
+    (void)pthread_cond_signal(&w->not_empty);
+
+    struct timespec deadline;
+    (void)clock_gettime(CLOCK_REALTIME, &deadline);
+    int ms = timeout_ms > 0 ? timeout_ms : 5000;
+    deadline.tv_sec += ms / 1000;
+    deadline.tv_nsec += (long)(ms % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    bool backed_out = writer_wait_locked(w, j, &deadline);
+    bool done = j->done;
+    (void)pthread_mutex_unlock(&w->lock);
+
+    /* Taken back out of the queue before anything looked at it, so this reports
+     * a refusal rather than a failure: the write did not happen and asking again
+     * is safe. Freed here because the writer never saw it. */
+    if (backed_out) {
+        job_free(j);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "%s", WRITER_BUSY_MSG);
+    }
+
+    if (!done) {
+        /* Detached rather than freed: the job is still the writer's, and the
+         * writer frees it when it finishes. */
+        (void)pthread_mutex_lock(&w->lock);
+        j->wants_result = false;
+        (void)pthread_mutex_unlock(&w->lock);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                             "the Atlas daemon did not complete the request within %d ms", ms);
+    }
+
+    atlas_status st = j->result;
+    /* Move, on both paths. The job's slot is emptied so `job_free` releases
+     * nothing twice. */
+    atlas_plan_result_free(result);
+    *result = *j->plan_result;
+    memset(j->plan_result, 0, sizeof *j->plan_result);
+    if (st != ATLAS_OK) {
         *err = j->result_err;
     }
     job_free(j);

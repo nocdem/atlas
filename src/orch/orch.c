@@ -465,6 +465,15 @@ static bool is_lower_hex(const char *s, size_t len, size_t want) {
     return true;
 }
 
+/* The one implementation of "is this a job identifier?". See `atlas/orch.h`:
+ * `atlas_orch_spec_validate` asks it of a submitted parent and A12.0's
+ * `plan.revision_add` asks it at the IPC edge, and a second spelling would be a
+ * second answer. */
+bool atlas_orch_is_job_uid(const char *s, size_t len) {
+    return s != NULL && len == ATLAS_ORCH_UID_HEX + 1u && s[0] == 'j' &&
+           is_lower_hex(s + 1, len - 1u, ATLAS_ORCH_UID_HEX);
+}
+
 /* A vocabulary name the policy supplies: short, lowercase, and from a set the
  * operator wrote. Checked here so a name can never carry a byte that would need
  * escaping anywhere it is later reported. */
@@ -600,9 +609,7 @@ atlas_status atlas_orch_spec_validate(const atlas_orch_spec *s, atlas_err *err) 
         return atlas_err_set(err, ATLAS_ERR_USAGE, "the correlation id is not a valid name");
     }
     if (s->parent_job_uid.len > 0 &&
-        (s->parent_job_uid.len != ATLAS_ORCH_UID_HEX + 1u || s->parent_job_uid.data[0] != 'j' ||
-         !is_lower_hex(atlas_buf_cstr(&s->parent_job_uid) + 1, s->parent_job_uid.len - 1,
-                       ATLAS_ORCH_UID_HEX))) {
+        !atlas_orch_is_job_uid(atlas_buf_cstr(&s->parent_job_uid), s->parent_job_uid.len)) {
         return atlas_err_set(err, ATLAS_ERR_USAGE, "the parent job id is not a job identifier");
     }
     if (s->idempotency_key.len > ATLAS_ORCH_NAME_MAX ||

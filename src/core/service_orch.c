@@ -30,12 +30,16 @@
 #include "atlas/syspolicy.h"
 #include "service_internal.h"
 
-/* --- talking to the daemon -------------------------------------------------- */
+/* --- talking to the daemon --------------------------------------------------
+ *
+ * A12.0 moved this out of `static` and into `service_internal.h`, unchanged, so
+ * `src/core/service_plan.c` speaks the protocol through the same function rather
+ * than through a second copy of it. The declaration carries the contract; this
+ * is still its one implementation. */
 
-typedef atlas_status (*orch_build_fn)(atlas_json *j, void *ud, atlas_err *err);
-
-static atlas_status orch_call(atlas_ctx *ctx, const char *method, orch_build_fn build, void *ud,
-                              atlas_ipc_response **out, atlas_buf *raw, atlas_err *err) {
+atlas_status atlas_service_orch_call(atlas_ctx *ctx, const char *method,
+                                     atlas_service_build_fn build, void *ud,
+                                     atlas_ipc_response **out, atlas_buf *raw, atlas_err *err) {
     *out = NULL;
     (void)ctx;
     atlas_buf sock = ATLAS_BUF_INIT;
@@ -215,7 +219,7 @@ atlas_status atlas_service_job_submit(atlas_ctx *ctx, const atlas_job_submit_opt
     atlas_job_submit_opts local = *o;
     atlas_ipc_response *resp = NULL;
     atlas_buf raw = ATLAS_BUF_INIT;
-    atlas_status st = orch_call(ctx, "job.submit", build_submit, &local, &resp, &raw, err);
+    atlas_status st = atlas_service_orch_call(ctx, "job.submit", build_submit, &local, &resp, &raw, err);
     if (st == ATLAS_OK && sink != NULL) {
         atlas_job_render jr;
         fill_render(resp, &jr, false);
@@ -240,7 +244,7 @@ static atlas_status one_job(atlas_ctx *ctx, const char *method, const char *job,
     const char *job_copy = job;
     atlas_ipc_response *resp = NULL;
     atlas_buf raw = ATLAS_BUF_INIT;
-    atlas_status st = orch_call(ctx, method, build_job, &job_copy, &resp, &raw, err);
+    atlas_status st = atlas_service_orch_call(ctx, method, build_job, &job_copy, &resp, &raw, err);
     if (st == ATLAS_OK && sink != NULL) {
         atlas_job_render jr;
         fill_render(resp, &jr, detail);
@@ -294,7 +298,7 @@ atlas_status atlas_service_job_list(atlas_ctx *ctx, int64_t after, int64_t limit
     list_args a = {after, limit};
     atlas_ipc_response *resp = NULL;
     atlas_buf raw = ATLAS_BUF_INIT;
-    atlas_status st = orch_call(ctx, "job.list", build_list, &a, &resp, &raw, err);
+    atlas_status st = atlas_service_orch_call(ctx, "job.list", build_list, &a, &resp, &raw, err);
     if (st == ATLAS_OK) {
         int64_t n = 0;
         (void)atlas_ipc_result_int(resp, "count", &n);
@@ -579,7 +583,7 @@ static atlas_status xport_apply(void *ud, const atlas_orch_op *op, atlas_orch_re
                                 atlas_err *err) {
     run_xport *x = (run_xport *)ud;
     const char *method = NULL;
-    orch_build_fn build = NULL;
+    atlas_service_build_fn build = NULL;
     switch (op->kind) {
     case ATLAS_ORCH_OP_LEASE:
         method = "dispatch.lease";
@@ -860,7 +864,7 @@ atlas_status atlas_service_job_run_status(atlas_ctx *ctx, const char *run, atlas
     run_get_req rq = {run};
     atlas_ipc_response *resp = NULL;
     atlas_buf raw = ATLAS_BUF_INIT;
-    atlas_status st = orch_call(ctx, "job.run_status", build_run_get, &rq, &resp, &raw, err);
+    atlas_status st = atlas_service_orch_call(ctx, "job.run_status", build_run_get, &rq, &resp, &raw, err);
     if (st == ATLAS_OK && sink != NULL) {
         atlas_job_render jr;
         memset(&jr, 0, sizeof(jr));
@@ -1036,7 +1040,7 @@ atlas_status atlas_service_job_run(atlas_ctx *ctx, const atlas_job_run_opts *o,
         }
         atlas_ipc_response *resp = NULL;
         atlas_buf raw = ATLAS_BUF_INIT;
-        st = orch_call(ctx, "job.submit", build_submit, &so, &resp, &raw, err);
+        st = atlas_service_orch_call(ctx, "job.submit", build_submit, &so, &resp, &raw, err);
         if (st == ATLAS_OK) {
             const char *v = NULL;
             if (!atlas_ipc_result_str(resp, "run", &v) || v == NULL) {

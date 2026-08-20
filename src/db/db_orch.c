@@ -3444,6 +3444,57 @@ atlas_status atlas_db_orch_run_usage(atlas_db *db, const char *run_uid, atlas_us
     return ATLAS_OK;
 }
 
+/* A12.0. One job's cost, for a plan task's rollup. See `atlas/orch_ops.h`.
+ *
+ * Every attempt's row is folded, newest last, so `model` ends up being the one
+ * the most recent attempt that named a model named. Cost and turns are summed
+ * over the attempts that reported them and left absent when none did — the
+ * distinction A10.0's nullable columns exist for, carried out to the reader
+ * rather than collapsed into a zero here. */
+atlas_status atlas_db_orch_job_usage(atlas_db *db, const char *job_uid,
+                                     atlas_orch_job_usage *out, atlas_err *err) {
+    memset(out, 0, sizeof(*out));
+    if (job_uid == NULL || job_uid[0] == '\0') {
+        return ATLAS_OK;
+    }
+    static const char SQL[] = "SELECT u.model, u.cost_micro_usd, u.turns FROM orch_usage u"
+                              "  JOIN orch_jobs j ON j.id = u.job_id"
+                              " WHERE j.job_uid = ?1 ORDER BY u.attempt_no, u.id;";
+    sqlite3_stmt *q = NULL;
+    atlas_status s = atlas_db_prepare(db, SQL, &q, err);
+    if (s != ATLAS_OK) {
+        return s;
+    }
+    s = atlas_db_bind_text_opt(db, q, 1, job_uid, err);
+    if (s != ATLAS_OK) {
+        atlas_db_finish(db, q);
+        return s;
+    }
+    while (s == ATLAS_OK && sqlite3_step(q) == SQLITE_ROW) {
+        out->present = true;
+        const char *model = atlas_db_col_text(q, 0);
+        if (model != NULL && model[0] != '\0') {
+            s = copy_fixed(out->model, sizeof(out->model), model, "model", err);
+        }
+        if (s == ATLAS_OK && sqlite3_column_type(q, 1) != SQLITE_NULL) {
+            int64_t sum = 0;
+            if (atlas_usage_add(out->cost_micro_usd, sqlite3_column_int64(q, 1), &sum)) {
+                out->cost_micro_usd = sum;
+                out->has_cost = true;
+            }
+        }
+        if (s == ATLAS_OK && sqlite3_column_type(q, 2) != SQLITE_NULL) {
+            int64_t sum = 0;
+            if (atlas_usage_add(out->turns, sqlite3_column_int64(q, 2), &sum)) {
+                out->turns = sum;
+                out->has_turns = true;
+            }
+        }
+    }
+    atlas_db_finish(db, q);
+    return s;
+}
+
 atlas_status atlas_db_orch_run_get(atlas_db *db, const char *run_uid, atlas_orch_run_view *out,
                                    bool *found, atlas_err *err) {
     *found = false;

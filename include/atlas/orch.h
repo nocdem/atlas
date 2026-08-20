@@ -579,6 +579,18 @@ bool atlas_orch_driver_is_repo_tree(const char *name);
  * falling back to anything weaker: a predictable job id is a job another local
  * process can name before it exists. */
 atlas_status atlas_orch_new_uid(atlas_buf *out, atlas_err *err);
+
+/* Whether `s` has the shape `atlas_orch_new_uid` produces: `'j'` followed by
+ * exactly `ATLAS_ORCH_UID_HEX` lowercase hex digits, and nothing else.
+ *
+ * The one implementation of that question. `atlas_orch_spec_validate` asks it of
+ * a submitted parent, and A12.0's `plan.revision_add` asks it of the planner job
+ * it is offered — at the IPC edge, before the identifier reaches a refusal
+ * sentence that would otherwise quote a caller's bytes back into a terminal. Two
+ * spellings of one format are two answers to "is this a job identifier", and the
+ * second one is always the lenient one. */
+bool atlas_orch_is_job_uid(const char *s, size_t len);
+
 /* A fresh lease token, 32 random bytes as 64 hex characters. */
 atlas_status atlas_orch_new_token(atlas_buf *out, atlas_err *err);
 /* The stored form of a token. The token itself is never written to the

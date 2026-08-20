@@ -157,6 +157,7 @@ set(ATLAS_TESTS
   # --- A12.0: the planned run ---
   test_plan_format
   test_plan_db
+  test_plan_rpc
   test_remote_equivalence
   test_operator_peer
   # The A8 operator-boundary fix: decision links over the socket, and the
@@ -331,6 +332,13 @@ set_tests_properties(test_plan_format PROPERTIES LABELS "unit")
 # `ATLAS_SRC_DIR` is for.
 set_tests_properties(test_plan_db PROPERTIES LABELS "integration" TIMEOUT 120)
 target_compile_definitions(test_plan_db PRIVATE ATLAS_SRC_DIR="${CMAKE_SOURCE_DIR}")
+# A12.0. The four `plan.` methods, at the edge. One case forks a live fixture
+# daemon to ask what the protocol offers and what it must not, so the suite
+# carries the daemon label and its serialisation for the reason every other
+# daemon suite does: parallel daemons compete for the machine's inotify budget.
+# The remaining cases drive `atlas_server_dispatch` in process against a real
+# writer thread, which needs no socket and no second daemon.
+set_tests_properties(test_plan_rpc PROPERTIES LABELS "daemon" TIMEOUT 900 RUN_SERIAL TRUE)
 # The lifecycle suite builds a real fixture repository, registers it through the
 # CLI and drives the one write point against an isolated database, so it is an
 # integration test. It sleeps for nothing: expiry and deadlines are supplied.

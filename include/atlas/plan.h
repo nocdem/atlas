@@ -35,7 +35,9 @@
 
 #include "atlas/buf.h"
 #include "atlas/error.h"
+#include "atlas/limits.h"
 #include "atlas/orch.h"
+#include "atlas/sha256.h"
 
 /* --- bounds ---------------------------------------------------------------
  *
@@ -460,6 +462,106 @@ atlas_status atlas_plan_apply_in_tx(atlas_db *db, const atlas_plan_op *op, atlas
  * real statuses. */
 atlas_status atlas_db_plan_state_derive(atlas_db *db, const char *plan_uid, atlas_plan_state *out,
                                         atlas_err *err);
+
+/* --- reading a plan, its revisions and its page -----------------------------
+ *
+ * A12.0 T5 exposed these. T3 kept the plan row behind a static reader because
+ * nothing outside the write point needed it; `plan.get` and `plan.list` do, and
+ * a second `SELECT` over `orch_plans` in the IPC layer would be a second reader
+ * of one row shape — which is how two surfaces come to describe one plan
+ * differently. These are the deliberate seam, and `db_plan.c` uses them itself
+ * rather than keeping a private copy beside them.
+ *
+ * Every one of them is a **read**: no transaction, no lock, no process, and
+ * nothing here can write. The status is not among them, because a plan has none
+ * to read — `atlas_db_plan_state_derive` above derives it, and it is the one
+ * implementation.
+ *
+ * Scoping is the caller's. `submitter_uid` is returned rather than compared,
+ * because the principal to compare it against is a connection fact the database
+ * layer does not have; the IPC edge holds `SO_PEERCRED` and does the comparison
+ * there, exactly as `job.get` does. */
+typedef struct atlas_plan_view {
+    /* The row identifier, which the revision readers take. Internal to Atlas and
+     * never a wire value: a plan is named by its `plan_uid` everywhere a caller
+     * can see. */
+    int64_t id;
+    char plan_uid[ATLAS_ORCH_RUN_UID_MAX];
+    char repo_name[ATLAS_ORCH_NAME_MAX + 1u];
+    char repo_identity_hash[ATLAS_SHA256_HEX_LEN + 1u];
+    int max_parallel;
+    /* From `SO_PEERCRED` when the plan was created. */
+    long long submitter_uid;
+    char created_at[ATLAS_TS_MAX];
+    /* The operator's own words, verbatim. Owned. Not a model's bytes — but it is
+     * still text a person typed, so every surface that shows it safe-encodes it
+     * and says so. */
+    atlas_buf goal_text;
+    /* The operator's gate floor in the stored netstring encoding. Owned. */
+    atlas_buf gate_floor;
+} atlas_plan_view;
+
+void atlas_plan_view_init(atlas_plan_view *v);
+void atlas_plan_view_free(atlas_plan_view *v);
+
+/* One plan by its identifier. `*found` is false for a plan that does not exist,
+ * which is not an error: whether the caller may be told it exists is a question
+ * about the caller, and answering it here would decide it in the wrong place. */
+atlas_status atlas_db_plan_get(atlas_db *db, const char *plan_uid, atlas_plan_view *out,
+                               bool *found, atlas_err *err);
+
+/* One revision's metadata. The content is deliberately absent: a plan document
+ * is up to 64 KiB of a model's bytes, and a list of five revisions is not the
+ * place to carry five of them. `atlas_db_plan_revision_content` fetches one when
+ * a caller asks for one by number. */
+typedef struct atlas_plan_revision_row {
+    int rev_no;
+    char reason[16];
+    char planner_job_uid[36];
+    char sha256[ATLAS_SHA256_HEX_LEN + 1u];
+    char created_at[ATLAS_TS_MAX];
+    int64_t bytes;
+} atlas_plan_revision_row;
+
+typedef atlas_status (*atlas_plan_revision_cb)(const atlas_plan_revision_row *row, void *ud,
+                                               atlas_err *err);
+
+/* Every revision of one plan, oldest first. */
+atlas_status atlas_db_plan_revisions(atlas_db *db, int64_t plan_id, atlas_plan_revision_cb cb,
+                                     void *ud, atlas_err *err);
+
+/* One revision's bytes, exactly as the planner wrote them. UNTRUSTED_DATA:
+ * safe-encoded and labelled by every surface that shows them, and parsed by
+ * `atlas_plan_parse` and by nothing else. */
+atlas_status atlas_db_plan_revision_content(atlas_db *db, int64_t plan_id, int rev_no,
+                                            atlas_buf *out, bool *found, atlas_err *err);
+
+/* One page of one principal's plans. */
+typedef struct atlas_plan_list_row {
+    int64_t id;
+    char plan_uid[ATLAS_ORCH_RUN_UID_MAX];
+    char repo_name[ATLAS_ORCH_NAME_MAX + 1u];
+    char created_at[ATLAS_TS_MAX];
+} atlas_plan_list_row;
+
+typedef atlas_status (*atlas_plan_list_cb)(const atlas_plan_list_row *row, void *ud,
+                                           atlas_err *err);
+
+/* Plans belonging to `submitter_uid`, oldest first, after `after_id`, at most
+ * `limit` (0 or an over-large value takes `ATLAS_ORCH_LIST_MAX`). `*more_out`
+ * says whether the page ended early, because a page that silently ends is
+ * indistinguishable from the end of the list.
+ *
+ * **The page is read whole before the first callback runs.** Every other list in
+ * Atlas calls back from inside its own statement, and this one must not: its
+ * caller derives each plan's status, which is a dozen further reads, and running
+ * one plan's whole derivation inside another plan's open cursor is a nesting
+ * nobody has argued for. The cost is one bounded page held in memory, which is
+ * what `ATLAS_ORCH_LIST_MAX` already bounds. */
+atlas_status atlas_db_plan_list(atlas_db *db, long long submitter_uid, int64_t after_id,
+                                int64_t limit, atlas_plan_list_cb cb, void *ud,
+                                int64_t *count_out, int64_t *cursor_out, bool *more_out,
+                                atlas_err *err);
 
 /* The correlation that binds one job to one plan, which is the whole of the
  * plan↔job mapping: there is no bind RPC, no `plan_id` column on `orch_jobs` and

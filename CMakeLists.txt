@@ -293,6 +293,9 @@ add_library(atlas_core STATIC
   # clock — and it compiles a proposal into nothing more than task rows.
   src/orch/plan.c
   src/core/service_orch.c
+  # A12.0: the four `plan.` calls a client makes. No offline path, no second
+  # derivation of a plan's status, and no formatting.
+  src/core/service_plan.c
   src/db/db_orch.c
   src/db/db_orch_memory.c
   # A12.0: migration 25's three tables, their one write point, and the plan

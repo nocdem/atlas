@@ -53,6 +53,30 @@ typedef struct dispatch_state {
      * `tests/test_orch_rpc.c` assert that from both directions. */
     int64_t peer_uid;
     int64_t peer_pid;
+
+    /* A12.0. A typed refusal a method may leave for the error document.
+     *
+     * An error document carries a status, a code and a sentence, and for every
+     * refusal in Atlas before this one that was the whole answer. A12.0's
+     * `plan.revision_add` has one that is not: a planner's document that does not
+     * parse is refused with a sentence *and* the line it happened on, and the
+     * plan driver composes a retry prompt out of both. Folding the number into
+     * the sentence would make the driver parse Atlas' prose to recover it, so
+     * they travel apart — which means they travel in the document rather than
+     * only in `atlas_err`.
+     *
+     * A fixed buffer rather than an `atlas_buf`, because this is set on a path
+     * that is already failing: an allocation there is one more thing that can go
+     * wrong while reporting that something went wrong, and the dispatch loop
+     * would have to free it on both exits. The sentence is Atlas' own prose about
+     * untrusted bytes and quotes none of them; it is safe-encoded on the way out
+     * regardless, exactly as `message` is.
+     *
+     * `has_detail` is the discriminator, not `detail_line`: line 0 is a real
+     * value meaning "about the document as a whole". */
+    bool has_detail;
+    char detail_refusal[ATLAS_ERR_MSG_MAX];
+    int detail_line;
 } dispatch_state;
 
 typedef atlas_status (*atlas_method_fn)(dispatch_state *ds, const atlas_ipc_request *req,

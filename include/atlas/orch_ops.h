@@ -404,6 +404,35 @@ typedef struct atlas_orch_run_view {
 atlas_status atlas_db_orch_run_usage(atlas_db *db, const char *run_uid, atlas_usage_run *out,
                                      atlas_err *err);
 
+/* A12.0. What one *job* cost, over the attempts that reported anything.
+ *
+ * The narrow read a plan's task rollup needs: which model ran the work, what the
+ * provider charged for it and how many turns it took. It is deliberately not
+ * `atlas_usage_run` — a task is not a run, and folding one job's attempts into
+ * the run shape would produce a struct whose `attempts_started` denominator
+ * described something the caller did not ask about.
+ *
+ * `present` is false when the job has no `orch_usage` row at all, and then every
+ * other member is zero and means nothing. **Absent is not zero**: a job whose
+ * worker never produced a final record spent something Atlas cannot name, and
+ * `has_cost` and `has_turns` keep that separable from a measured zero — A10.0's
+ * rule, which is the whole reason that table has nullable counts.
+ *
+ * `model` is the model named by the newest attempt that named one. It is a
+ * worker-derived string: bounded when it was stored, and safe-encoded by every
+ * surface that shows it. */
+typedef struct atlas_orch_job_usage {
+    bool present;
+    char model[128];
+    bool has_cost;
+    int64_t cost_micro_usd;
+    bool has_turns;
+    int64_t turns;
+} atlas_orch_job_usage;
+
+atlas_status atlas_db_orch_job_usage(atlas_db *db, const char *job_uid,
+                                     atlas_orch_job_usage *out, atlas_err *err);
+
 atlas_status atlas_db_orch_run_get(atlas_db *db, const char *run_uid, atlas_orch_run_view *out,
                                    bool *found, atlas_err *err);
 

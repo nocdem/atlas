@@ -44,6 +44,7 @@
 
 #include <sqlite3.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -262,54 +263,69 @@ static atlas_status plan_new_uid(atlas_buf *out, atlas_err *err) {
     return st;
 }
 
-/* --- the plan row ----------------------------------------------------------- */
+/* --- the plan row -----------------------------------------------------------
+ *
+ * One reader, and it is the public one. T3 kept this static because nothing
+ * outside the write point needed a plan row; `plan.get` and `plan.list` do, and
+ * a second `SELECT` over `orch_plans` in the IPC layer would be a second reader
+ * of one row shape. The write point and the derived state below call it too,
+ * rather than keeping a private copy beside it. */
 
-typedef struct plan_row {
-    int64_t id;
-    char plan_uid[ATLAS_ORCH_RUN_UID_MAX];
-    char repo_name[ATLAS_ORCH_NAME_MAX + 1u];
-    char repo_identity_hash[ATLAS_SHA256_HEX_LEN + 1u];
-    int64_t max_parallel;
-    /* The operator's floor, in the stored netstring encoding. Owned. */
-    atlas_buf gate_floor;
-} plan_row;
-
-static void plan_row_init(plan_row *r) {
-    memset(r, 0, sizeof(*r));
-    atlas_buf_init(&r->gate_floor);
+void atlas_plan_view_init(atlas_plan_view *v) {
+    memset(v, 0, sizeof(*v));
+    atlas_buf_init(&v->goal_text);
+    atlas_buf_init(&v->gate_floor);
 }
 
-static void plan_row_free(plan_row *r) {
-    atlas_buf_free(&r->gate_floor);
-    memset(r, 0, sizeof(*r));
+void atlas_plan_view_free(atlas_plan_view *v) {
+    if (v == NULL) {
+        return;
+    }
+    atlas_buf_free(&v->goal_text);
+    atlas_buf_free(&v->gate_floor);
+    memset(v, 0, sizeof(*v));
 }
 
-static atlas_status plan_by_uid(atlas_db *db, const char *uid, plan_row *r, bool *found,
-                                atlas_err *err) {
+atlas_status atlas_db_plan_get(atlas_db *db, const char *plan_uid, atlas_plan_view *out,
+                               bool *found, atlas_err *err) {
     static const char SQL[] = "SELECT id, plan_uid, repo_name, repo_identity_hash, max_parallel,"
-                              "       gate_floor FROM orch_plans WHERE plan_uid = ?1;";
+                              "       gate_floor, goal_text, submitter_uid, created_at"
+                              "  FROM orch_plans WHERE plan_uid = ?1;";
     *found = false;
     sqlite3_stmt *st = NULL;
     atlas_status s = atlas_db_prepare(db, SQL, &st, err);
     if (s != ATLAS_OK) {
         return s;
     }
-    s = atlas_db_bind_text_opt(db, st, 1, uid, err);
+    s = atlas_db_bind_text_opt(db, st, 1, plan_uid, err);
     if (s == ATLAS_OK) {
         int rc = sqlite3_step(st);
         if (rc == SQLITE_ROW) {
-            r->id = sqlite3_column_int64(st, 0);
-            s = atlas_db_col_copy(st, 1, r->plan_uid, sizeof(r->plan_uid), "plan_uid", err);
+            out->id = sqlite3_column_int64(st, 0);
+            s = atlas_db_col_copy(st, 1, out->plan_uid, sizeof(out->plan_uid), "plan_uid", err);
             if (s == ATLAS_OK) {
-                s = atlas_db_col_copy(st, 2, r->repo_name, sizeof(r->repo_name), "repo_name", err);
+                s = atlas_db_col_copy(st, 2, out->repo_name, sizeof(out->repo_name), "repo_name",
+                                      err);
             }
             if (s == ATLAS_OK) {
-                s = atlas_db_col_copy(st, 3, r->repo_identity_hash, sizeof(r->repo_identity_hash),
-                                      "repo_identity_hash", err);
+                s = atlas_db_col_copy(st, 3, out->repo_identity_hash,
+                                      sizeof(out->repo_identity_hash), "repo_identity_hash", err);
             }
             if (s == ATLAS_OK) {
-                r->max_parallel = sqlite3_column_int64(st, 4);
-                s = atlas_buf_set_str(&r->gate_floor, atlas_db_col_text(st, 5), err);
+                out->max_parallel = (int)sqlite3_column_int64(st, 4);
+                s = atlas_buf_set_str(&out->gate_floor, atlas_db_col_text(st, 5), err);
+            }
+            if (s == ATLAS_OK) {
+                /* The goal is stored as text and read back by length, because a
+                 * goal an operator typed is bytes: it is bounded and free of NUL
+                 * at the write point, and nothing here re-interprets it. */
+                const char *g = atlas_db_col_text(st, 6);
+                s = atlas_buf_set(&out->goal_text, g, g != NULL ? strlen(g) : 0u, err);
+            }
+            if (s == ATLAS_OK) {
+                out->submitter_uid = (long long)sqlite3_column_int64(st, 7);
+                s = atlas_db_col_copy(st, 8, out->created_at, sizeof(out->created_at),
+                                      "created_at", err);
             }
             *found = (s == ATLAS_OK);
         } else if (rc != SQLITE_DONE) {
@@ -317,6 +333,141 @@ static atlas_status plan_by_uid(atlas_db *db, const char *uid, plan_row *r, bool
         }
     }
     atlas_db_finish(db, st);
+    return s;
+}
+
+atlas_status atlas_db_plan_revisions(atlas_db *db, int64_t plan_id, atlas_plan_revision_cb cb,
+                                     void *ud, atlas_err *err) {
+    static const char SQL[] =
+        "SELECT rev_no, reason, planner_job_uid, content_sha256, created_at, length(content)"
+        "  FROM orch_plan_revisions WHERE plan_id = ?1 ORDER BY rev_no;";
+    sqlite3_stmt *st = NULL;
+    atlas_status s = atlas_db_prepare(db, SQL, &st, err);
+    if (s != ATLAS_OK) {
+        return s;
+    }
+    (void)sqlite3_bind_int64(st, 1, plan_id);
+    int rc = SQLITE_DONE;
+    while (s == ATLAS_OK && (rc = sqlite3_step(st)) == SQLITE_ROW) {
+        atlas_plan_revision_row row;
+        memset(&row, 0, sizeof(row));
+        row.rev_no = (int)sqlite3_column_int64(st, 0);
+        s = atlas_db_col_copy(st, 1, row.reason, sizeof(row.reason), "reason", err);
+        if (s == ATLAS_OK) {
+            s = atlas_db_col_copy(st, 2, row.planner_job_uid, sizeof(row.planner_job_uid),
+                                  "planner_job_uid", err);
+        }
+        if (s == ATLAS_OK) {
+            s = atlas_db_col_copy(st, 3, row.sha256, sizeof(row.sha256), "content_sha256", err);
+        }
+        if (s == ATLAS_OK) {
+            s = atlas_db_col_copy(st, 4, row.created_at, sizeof(row.created_at), "created_at",
+                                  err);
+        }
+        if (s == ATLAS_OK) {
+            row.bytes = sqlite3_column_int64(st, 5);
+            if (cb != NULL) {
+                s = cb(&row, ud, err);
+            }
+        }
+    }
+    if (s == ATLAS_OK && rc != SQLITE_DONE && rc != SQLITE_ROW) {
+        s = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot read a plan's revisions");
+    }
+    atlas_db_finish(db, st);
+    return s;
+}
+
+atlas_status atlas_db_plan_revision_content(atlas_db *db, int64_t plan_id, int rev_no,
+                                            atlas_buf *out, bool *found, atlas_err *err) {
+    static const char SQL[] =
+        "SELECT content FROM orch_plan_revisions WHERE plan_id = ?1 AND rev_no = ?2;";
+    *found = false;
+    sqlite3_stmt *st = NULL;
+    atlas_status s = atlas_db_prepare(db, SQL, &st, err);
+    if (s != ATLAS_OK) {
+        return s;
+    }
+    (void)sqlite3_bind_int64(st, 1, plan_id);
+    (void)sqlite3_bind_int64(st, 2, rev_no);
+    int rc = sqlite3_step(st);
+    if (rc == SQLITE_ROW) {
+        const void *blob = sqlite3_column_blob(st, 0);
+        int n = sqlite3_column_bytes(st, 0);
+        /* Copied out before the statement is released: the pointer is borrowed
+         * for the length of the step, which is every row callback's rule here. */
+        s = atlas_buf_set(out, blob != NULL ? blob : "", n > 0 ? (size_t)n : 0u, err);
+        *found = (s == ATLAS_OK);
+    } else if (rc != SQLITE_DONE) {
+        s = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot read a plan revision");
+    }
+    atlas_db_finish(db, st);
+    return s;
+}
+
+atlas_status atlas_db_plan_list(atlas_db *db, long long submitter_uid, int64_t after_id,
+                                int64_t limit, atlas_plan_list_cb cb, void *ud,
+                                int64_t *count_out, int64_t *cursor_out, bool *more_out,
+                                atlas_err *err) {
+    if (limit <= 0 || limit > ATLAS_ORCH_LIST_MAX) {
+        limit = ATLAS_ORCH_LIST_MAX;
+    }
+    /* The whole page, read before the first callback runs. See `atlas/plan.h`:
+     * the caller derives each plan's status, and that derivation must not run
+     * inside this statement's cursor. */
+    atlas_plan_list_row *page = calloc((size_t)limit, sizeof(*page));
+    if (page == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory listing plans");
+    }
+    static const char SQL[] = "SELECT id, plan_uid, repo_name, created_at FROM orch_plans"
+                              "  WHERE submitter_uid = ?1 AND id > ?2 ORDER BY id LIMIT ?3;";
+    sqlite3_stmt *st = NULL;
+    atlas_status s = atlas_db_prepare(db, SQL, &st, err);
+    if (s != ATLAS_OK) {
+        free(page);
+        return s;
+    }
+    (void)sqlite3_bind_int64(st, 1, submitter_uid);
+    (void)sqlite3_bind_int64(st, 2, after_id);
+    (void)sqlite3_bind_int64(st, 3, limit + 1);
+    int64_t n = 0;
+    int64_t cursor = after_id;
+    bool more = false;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        if (n == limit) {
+            more = true;
+            break;
+        }
+        atlas_plan_list_row *row = &page[n];
+        row->id = sqlite3_column_int64(st, 0);
+        s = atlas_db_col_copy(st, 1, row->plan_uid, sizeof(row->plan_uid), "plan_uid", err);
+        if (s == ATLAS_OK) {
+            s = atlas_db_col_copy(st, 2, row->repo_name, sizeof(row->repo_name), "repo_name", err);
+        }
+        if (s == ATLAS_OK) {
+            s = atlas_db_col_copy(st, 3, row->created_at, sizeof(row->created_at), "created_at",
+                                  err);
+        }
+        if (s != ATLAS_OK) {
+            break;
+        }
+        cursor = row->id;
+        n++;
+    }
+    atlas_db_finish(db, st);
+    for (int64_t i = 0; s == ATLAS_OK && cb != NULL && i < n; i++) {
+        s = cb(&page[i], ud, err);
+    }
+    free(page);
+    if (count_out != NULL) {
+        *count_out = n;
+    }
+    if (cursor_out != NULL) {
+        *cursor_out = cursor;
+    }
+    if (more_out != NULL) {
+        *more_out = more;
+    }
     return s;
 }
 
@@ -676,15 +827,15 @@ static atlas_status op_revision_add(atlas_db *db, const atlas_plan_op *op, atlas
      * check and the insert. That is A11.0's rule for a run's submit path, and it
      * is this file's for the same reason. */
     const char *uid = atlas_buf_cstr(&op->plan_uid);
-    plan_row plan;
-    plan_row_init(&plan);
+    atlas_plan_view plan;
+    atlas_plan_view_init(&plan);
     bool found = false;
-    atlas_status st = plan_by_uid(db, uid, &plan, &found, err);
+    atlas_status st = atlas_db_plan_get(db, uid, &plan, &found, err);
     if (st == ATLAS_OK && !found) {
         st = atlas_err_set(err, ATLAS_ERR_USAGE, "no plan named %s exists", uid);
     }
     if (st != ATLAS_OK) {
-        plan_row_free(&plan);
+        atlas_plan_view_free(&plan);
         return st;
     }
     st = atlas_buf_set_str(&out->plan_uid, plan.plan_uid, err);
@@ -713,7 +864,7 @@ static atlas_status op_revision_add(atlas_db *db, const atlas_plan_op *op, atlas
         st = atlas_err_set(err, ATLAS_ERR_USAGE, "a revision records why it exists");
     }
     if (st != ATLAS_OK) {
-        plan_row_free(&plan);
+        atlas_plan_view_free(&plan);
         return st;
     }
 
@@ -809,7 +960,7 @@ static atlas_status op_revision_add(atlas_db *db, const atlas_plan_op *op, atlas
     }
     if (st != ATLAS_OK) {
         atlas_buf_free(&bytes);
-        plan_row_free(&plan);
+        atlas_plan_view_free(&plan);
         return st;
     }
 
@@ -824,7 +975,7 @@ static atlas_status op_revision_add(atlas_db *db, const atlas_plan_op *op, atlas
     if (st != ATLAS_OK) {
         carry_refusal(out, line, err);
         atlas_buf_free(&bytes);
-        plan_row_free(&plan);
+        atlas_plan_view_free(&plan);
         return st;
     }
 
@@ -907,7 +1058,7 @@ static atlas_status op_revision_add(atlas_db *db, const atlas_plan_op *op, atlas
     }
     atlas_plan_doc_free(&doc);
     atlas_buf_free(&bytes);
-    plan_row_free(&plan);
+    atlas_plan_view_free(&plan);
     return st;
 }
 
@@ -1037,7 +1188,7 @@ static atlas_status revision_names_job(atlas_db *db, int64_t plan_id, const char
  * how a field-by-field transfer loses something, which is A1's ctime lesson in
  * miniature. `job_by_correlation` writes nothing when it finds nothing, so the
  * highest k that resolves is the one left standing. */
-static atlas_status read_planner_facts(atlas_db *db, const plan_row *plan, atlas_plan_state *state,
+static atlas_status read_planner_facts(atlas_db *db, const atlas_plan_view *plan, atlas_plan_state *state,
                                        planner_facts *out, atlas_err *err) {
     memset(out, 0, sizeof(*out));
     atlas_buf corr = ATLAS_BUF_INIT;
@@ -1096,7 +1247,7 @@ static atlas_status run_status_of(atlas_db *db, const char *run_uid, atlas_orch_
  * within a stage. The replan composer renders completed work in array order, so
  * a read that came back in a different order on a different day would compose a
  * different prompt from the same rows. */
-static atlas_status read_tasks(atlas_db *db, const plan_row *plan, int rev_no, int64_t revision_id,
+static atlas_status read_tasks(atlas_db *db, const atlas_plan_view *plan, int rev_no, int64_t revision_id,
                                atlas_plan_state *out, atlas_err *err) {
     static const char SQL[] = "SELECT task_key, stage_no, kind, title FROM orch_plan_tasks"
                               "  WHERE revision_id = ?1 ORDER BY stage_no, id;";
@@ -1176,15 +1327,15 @@ atlas_status atlas_db_plan_state_derive(atlas_db *db, const char *plan_uid, atla
                                         atlas_err *err) {
     memset(out, 0, sizeof(*out));
 
-    plan_row plan;
-    plan_row_init(&plan);
+    atlas_plan_view plan;
+    atlas_plan_view_init(&plan);
     bool found = false;
-    atlas_status st = plan_by_uid(db, plan_uid, &plan, &found, err);
+    atlas_status st = atlas_db_plan_get(db, plan_uid, &plan, &found, err);
     if (st == ATLAS_OK && !found) {
         st = atlas_err_set(err, ATLAS_ERR_USAGE, "no plan named %s exists", plan_uid);
     }
     if (st != ATLAS_OK) {
-        plan_row_free(&plan);
+        atlas_plan_view_free(&plan);
         return st;
     }
 
@@ -1218,7 +1369,7 @@ atlas_status atlas_db_plan_state_derive(atlas_db *db, const char *plan_uid, atla
         st = read_tasks(db, &plan, out->rev_no, revision_id, out, err);
     }
     if (st != ATLAS_OK) {
-        plan_row_free(&plan);
+        atlas_plan_view_free(&plan);
         return st;
     }
 
@@ -1317,6 +1468,6 @@ atlas_status atlas_db_plan_state_derive(atlas_db *db, const char *plan_uid, atla
         out->status = ATLAS_PLAN_STATUS_BLOCKED;
     }
 
-    plan_row_free(&plan);
+    atlas_plan_view_free(&plan);
     return ATLAS_OK;
 }

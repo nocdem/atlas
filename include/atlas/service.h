@@ -28,6 +28,7 @@
 #include "atlas/verify_ops.h"
 #include "atlas/verifypolicy.h"
 #include "atlas/git.h"
+#include "atlas/ipc.h"
 #include "atlas/limits.h"
 #include "atlas/reconcile.h"
 #include "atlas/scan.h"
@@ -1206,6 +1207,75 @@ atlas_status atlas_service_job_run_status(atlas_ctx *ctx, const char *run, atlas
  * start when orchestration is disabled — a disabled policy is a refusal to
  * start, not a loop that idles. */
 atlas_status atlas_service_dispatcher_run(bool once, FILE *log, atlas_err *err);
+
+/* --- A12.0: the plan domain's four calls ------------------------------------
+ *
+ * The wire half of the plan commands, in `src/core/service_plan.c`. Like every
+ * orchestration command there is deliberately **no offline path**: plan state
+ * lives in the index, `atlasd` is the only writer of it, and a CLI that opened
+ * the database itself would be a second writer.
+ *
+ * These are the calls; the commands come later. `plan run` composes them into a
+ * foreground loop and `plan status|show|list` render what they return, and both
+ * of those are built on top of these rather than beside them, so there is one
+ * spelling of each request in the binary.
+ *
+ * Two of them hand back the parsed response rather than a filled struct. A plan
+ * is a wide document — a goal, a floor, a revision list, a task list with job
+ * and run states and a usage rollup — and the shape a renderer wants is a
+ * question for the renderer. `atlas_ipc_response_free` releases it, and `raw`
+ * holds the bytes every returned string borrows from, so it must outlive the
+ * response.
+ */
+typedef struct atlas_plan_create_opts {
+    const char *repo;
+    /* The operator's own words, sent verbatim: bounded and stored as they were
+     * typed, and safe-encoded on every surface that reads them back. */
+    const char *goal;
+    /* The operator's gate floor, one command line per element, split on spaces
+     * by `atlas_orch_gate_split` exactly as `--gate` is for a job. At least one
+     * is required by the daemon: a plan with no operator gate could only ever be
+     * accepted on a model's word. */
+    const char *gates[8];
+    size_t gate_count;
+    /* 0 is "not stated", which the daemon resolves to its own default. A value
+     * outside the range is refused with the bound named, never clamped. */
+    int64_t max_parallel;
+} atlas_plan_create_opts;
+
+atlas_status atlas_plan_wire_create(atlas_ctx *ctx, const atlas_plan_create_opts *o,
+                                    atlas_buf *plan_uid_out, atlas_err *err);
+
+typedef struct atlas_plan_revision_opts {
+    const char *plan;
+    /* The planner job whose own stored artifact becomes the revision. The
+     * document itself never travels this call: there is no member here that
+     * could carry one. */
+    const char *planner_job;
+    /* `INITIAL` or `REPLAN`, from `atlas_plan_revision_reason_name`. */
+    const char *reason;
+    int rev_no;
+} atlas_plan_revision_opts;
+
+/* Ingests one planner job's document.
+ *
+ * A refusal that came from the *document* fills `refusal_out` and `line_out` —
+ * Atlas' own sentence and the line it is about — which is what a plan driver
+ * composes a retry prompt from. Every other refusal leaves them untouched, so a
+ * non-empty `refusal_out` is the discriminator between a planner's mistake and
+ * the caller's, exactly as it is at the write point. Both are optional. */
+atlas_status atlas_plan_wire_revision_add(atlas_ctx *ctx, const atlas_plan_revision_opts *o,
+                                          int *rev_no_out, atlas_buf *refusal_out,
+                                          int *line_out, atlas_err *err);
+
+/* Reads one plan. `rev_no` above zero also asks for that revision's document,
+ * which comes back safe-encoded and labelled UNTRUSTED_DATA. */
+atlas_status atlas_plan_wire_get(atlas_ctx *ctx, const char *plan, int rev_no,
+                                 atlas_ipc_response **out, atlas_buf *raw, atlas_err *err);
+
+/* One page of this principal's plans. */
+atlas_status atlas_plan_wire_list(atlas_ctx *ctx, int64_t after, int64_t limit,
+                                  atlas_ipc_response **out, atlas_buf *raw, atlas_err *err);
 
 /* --- A7.1: the remaining read commands, answered by the daemon --------------
  *

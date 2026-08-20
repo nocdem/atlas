@@ -280,6 +280,22 @@ atlas_status atlas_ipc_response_status(const atlas_ipc_response *r);
 /* The error message, already safe-encoded by the daemon. "" when there is none. */
 const char *atlas_ipc_response_message(const atlas_ipc_response *r);
 
+/* A12.0. The error document's optional `detail` object.
+ *
+ * One refusal in Atlas carries more than a sentence: a planner document that
+ * does not parse is refused with the sentence *and* the line it happened on, and
+ * the plan driver needs both to compose a retry prompt. They travel apart so a
+ * caller never has to read Atlas' prose to recover a number.
+ *
+ * Both answer false when the response is a success, when it carries no detail —
+ * which is every other refusal Atlas produces — or when the member is not of the
+ * asked-for type. A caller that reads false leaves its own value alone, which is
+ * A9.2.5's rule for an absent key: the conservative reading, never an invented
+ * one. The string is borrowed from the parsed response and is valid only until
+ * it is freed. */
+bool atlas_ipc_error_detail_str(const atlas_ipc_response *r, const char *key, const char **out);
+bool atlas_ipc_error_detail_int(const atlas_ipc_response *r, const char *key, int64_t *out);
+
 bool atlas_ipc_result_str(const atlas_ipc_response *r, const char *key, const char **out);
 bool atlas_ipc_result_int(const atlas_ipc_response *r, const char *key, int64_t *out);
 bool atlas_ipc_result_bool(const atlas_ipc_response *r, const char *key, bool *out);

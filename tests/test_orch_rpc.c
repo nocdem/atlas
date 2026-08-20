@@ -234,10 +234,13 @@ static void test_the_two_method_groups_are_disjoint_and_carry_no_verb(void) {
         }
     }
     /* Each group's names are prefixed by its own namespace, so which group a
-     * method is in is visible in the name a caller types. */
+     * method is in is visible in the name a caller types. The client group holds
+     * two namespaces since A12.0 — `job.` and `plan.` — and both are the same
+     * principal's surface: an operator's own. The dispatcher group holds neither,
+     * which is asserted below and again in `tests/test_plan_rpc.c`. */
     for (size_t i = 0; i < nc; i++) {
-        T_CHECK_MSG(strncmp(c[i].name, "job.", 4u) == 0, "client method \"%s\" is misnamed",
-                    c[i].name);
+        T_CHECK_MSG(strncmp(c[i].name, "job.", 4u) == 0 || strncmp(c[i].name, "plan.", 5u) == 0,
+                    "client method \"%s\" is misnamed", c[i].name);
     }
     for (size_t k = 0; k < nd; k++) {
         T_CHECK_MSG(strncmp(d[k].name, "dispatch.", 9u) == 0,

@@ -42,6 +42,7 @@
 #include <time.h>
 
 #include "atlas/orchpolicy.h"
+#include "atlas/plan.h"
 #include "atlas/sha256.h"
 #include "atlas/snapshot.h"
 #include "server_internal.h"
@@ -925,6 +926,710 @@ static atlas_status method_run_get(dispatch_state *ds, const atlas_ipc_request *
     return st;
 }
 
+/* --- A12.0: the plan domain, on the surface the client group already is -------
+ *
+ * Four names — `plan.create`, `plan.revision_add`, `plan.get`, `plan.list` —
+ * in the table below, beside `job.`. There is no fifth group, no operator-uid
+ * entry, no MCP tool and no gateway route, and the dispatcher group is untouched.
+ * Each one calls `require_submitter` for itself, so reaching a name is still not
+ * the same as being allowed to use it, and a machine with no orchestration policy
+ * refuses all four with the sentence every client method refuses with.
+ *
+ * **There is no method here that settles a plan**, and there is nothing for one
+ * to call: a plan has no status column, `atlas_plan_apply_in_tx` has two
+ * operations and neither writes one, and what a plan is doing is derived on
+ * every read from stored rows. A11.0 left `ACCEPTED` and `BLOCKED` with no
+ * producer so that "who may decide" could be answered later; here the question
+ * does not arise, because the verb does not exist. `tests/test_plan_rpc.c` asks
+ * a live daemon for every name such a method would plausibly have.
+ *
+ * **The planner's bytes never travel this surface.** `plan.revision_add` names a
+ * job; the document comes from that job's own stored `orch_artifacts` row, read
+ * inside the write transaction. There is no parameter here that could carry a
+ * plan document, so "a caller cannot offer a document the job did not produce"
+ * is a property of the signature rather than a check.
+ *
+ * **Reads are scoped to the calling principal**, exactly as `job.get` is: a plan
+ * another uid created answers "no such plan", never "forbidden", because whether
+ * it exists is itself information. `orch_plans.submitter_uid` is written from
+ * `SO_PEERCRED` at creation and is immutable, so the comparison is sound outside
+ * the transaction.
+ */
+
+/* The operator's gate floor, as it arrives.
+ *
+ * The same length-prefixed argv encoding `job.submit` accepts for `validation`,
+ * decoded by the same one function, and for the same reason: there is one wire
+ * form in the system rather than a plan form and a job form that can disagree.
+ * The element is decoded exactly as it arrived — wrapping it in a further count
+ * first is the defect `atlas_orch_validation_wire_decode` exists to have fixed
+ * once.
+ *
+ * An absent or empty floor is not refused here. A plan with no operator gate
+ * could only ever be accepted on a model's word, and that refusal is the write
+ * point's — stated once, in the layer that also states it to the planner. */
+static atlas_status take_gate_floor(const atlas_ipc_request *req, atlas_plan_op *op,
+                                    atlas_err *err) {
+    const atlas_ipc_array *arr = NULL;
+    if (!atlas_ipc_param_array(req, "gate_floor", &arr)) {
+        return ATLAS_OK;
+    }
+    size_t n = atlas_ipc_array_len(arr);
+    if (n > ATLAS_ORCH_MAX_VALIDATIONS) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "a plan's gate floor holds at most %u commands",
+                             (unsigned)ATLAS_ORCH_MAX_VALIDATIONS);
+    }
+    atlas_orch_argv gates[ATLAS_ORCH_MAX_VALIDATIONS];
+    memset(gates, 0, sizeof gates);
+    atlas_status st = ATLAS_OK;
+    for (size_t i = 0; st == ATLAS_OK && i < n; i++) {
+        const char *enc = NULL;
+        if (!atlas_ipc_array_str(arr, i, &enc) || enc == NULL) {
+            st = atlas_err_set(err, ATLAS_ERR_USAGE, "gate %zu is not a string", i);
+            break;
+        }
+        st = atlas_orch_validation_wire_decode(enc, &gates[i], err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_orch_validations_encode(gates, n, &op->gate_floor, err);
+    }
+    for (size_t i = 0; i < ATLAS_ORCH_MAX_VALIDATIONS; i++) {
+        atlas_orch_argv_free(&gates[i]);
+    }
+    return st;
+}
+
+/* Queues one plan operation and reports what came back.
+ *
+ * A refused *document* is a typed answer rather than only an error: the sentence
+ * and the line it happened on are left on the dispatch state, which is where the
+ * error document picks them up. Both travel apart so the plan driver never has
+ * to read Atlas' prose to recover a number.
+ *
+ * Ownership of `op` passes to the writer unconditionally. */
+static atlas_status plan_write(dispatch_state *ds, atlas_plan_op *op, atlas_plan_result *r,
+                               atlas_err *err) {
+    atlas_status st = atlas_writer_plan(ds->ctx->writer, op, 5000, r, err);
+    if (st != ATLAS_OK && r->refusal.len > 0) {
+        ds->has_detail = true;
+        ds->detail_line = r->refusal_line;
+        (void)snprintf(ds->detail_refusal, sizeof(ds->detail_refusal), "%s",
+                       atlas_buf_cstr(&r->refusal));
+    }
+    return st;
+}
+
+/* --- plan.create -------------------------------------------------------------
+ *
+ * The operator brings the goal and the gate floor. The repository is resolved
+ * through the policy and then the registry, exactly as `job.submit` resolves it,
+ * so an unregistered directory cannot be reached and a client never supplies a
+ * filesystem location.
+ *
+ * There is deliberately **no pinned commit here**. A job pins the commit its
+ * specification describes; a plan describes work that will become several runs,
+ * each pinning its own root task's commit when it is submitted, so pinning one
+ * at creation would be recording a fact about a tree no task is going to run
+ * against. What a plan does carry is the repository's durable identity, which is
+ * what a stage-run is later compared against.
+ *
+ * It creates no job and starts nothing.
+ */
+static atlas_status method_plan_create(dispatch_state *ds, const atlas_ipc_request *req,
+                                       atlas_err *err) {
+    atlas_status st = require_submitter(ds, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    const atlas_orchpolicy *policy = &ds->ctx->orchpolicy;
+
+    const char *repo = NULL, *goal = NULL;
+    if (!atlas_ipc_param_str(req, "repo", &repo) || repo == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "a plan names the repository it is for");
+    }
+    if (!atlas_ipc_param_str(req, "goal", &goal) || goal == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "a plan needs a goal");
+    }
+    /* A repository the policy does not list is refused before the registry is
+     * consulted, for `job.submit`'s reason: which directories Atlas will run work
+     * against is an operator's decision, not a submitter's. */
+    if (!atlas_orchpolicy_permits_repo(policy, repo)) {
+        return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                             "the orchestration policy does not permit jobs against that "
+                             "repository");
+    }
+
+    atlas_repo_info ri;
+    atlas_repo_info_init(&ri);
+    bool found = false;
+    st = atlas_db_repo_get(ds->db, repo, &ri, &found, err);
+    if (st == ATLAS_OK && !found) {
+        st = atlas_err_set(err, ATLAS_ERR_REPO, "no repository named that is registered");
+    }
+    if (st != ATLAS_OK) {
+        atlas_repo_info_free(&ri);
+        return st;
+    }
+
+    atlas_plan_op *op = calloc(1u, sizeof(*op));
+    if (op == NULL) {
+        atlas_repo_info_free(&ri);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory building a plan");
+    }
+    atlas_plan_op_init(op, ATLAS_PLAN_OP_CREATE);
+    /* From the kernel, never from the document. */
+    op->submitter_uid = ds->peer_uid;
+
+    atlas_buf identity = ATLAS_BUF_INIT;
+    st = atlas_db_repo_identity_hash(ds->db, ri.id, &identity, err);
+    if (st == ATLAS_OK) {
+        st = atlas_buf_set(&op->repo_identity_hash, identity.data, identity.len, err);
+    }
+    atlas_buf_free(&identity);
+    if (st == ATLAS_OK) {
+        st = atlas_buf_set_str(&op->repo_name, ri.name, err);
+    }
+    atlas_repo_info_free(&ri);
+    if (st == ATLAS_OK) {
+        st = atlas_buf_set_str(&op->goal_text, goal, err);
+    }
+    if (st == ATLAS_OK) {
+        st = take_gate_floor(req, op, err);
+    }
+    if (st == ATLAS_OK) {
+        /* Absent means "not stated", which the write point resolves to the
+         * compiled-in default. A value outside the range is refused there with
+         * the bound named, never clamped. */
+        int64_t parallel = 0;
+        if (atlas_ipc_param_int(req, "parallel", &parallel)) {
+            op->max_parallel = (int)parallel;
+            if ((int64_t)op->max_parallel != parallel) {
+                st = atlas_err_set(err, ATLAS_ERR_USAGE,
+                                   "a plan runs between 1 and %d tasks at once",
+                                   ATLAS_ORCH_RUN_MAX_PARALLEL);
+            }
+        }
+    }
+    if (st != ATLAS_OK) {
+        atlas_plan_op_free(op);
+        free(op);
+        return st;
+    }
+
+    atlas_plan_result r;
+    atlas_plan_result_init(&r);
+    st = plan_write(ds, op, &r, err);
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "plan", atlas_buf_cstr(&r.plan_uid), err);
+    }
+    atlas_plan_result_free(&r);
+    return st;
+}
+
+/* --- plan.revision_add -------------------------------------------------------
+ *
+ * A named job's own stored artifact becomes a revision, if — and only if — every
+ * binding check inside the write transaction passes: the correlation binds the
+ * job to this plan as planner job k, its driver's role is PLANNER, it SUCCEEDED,
+ * and the artifact is stored, within bounds and parses.
+ *
+ * Two checks happen here rather than there, and both are about what a *caller*
+ * sent.
+ *
+ *   **The job identifier's shape**, asked before it reaches the write point.
+ *   A refusal there names the job it refused, which is right when the identifier
+ *   is one Atlas generated and wrong when it is arbitrary bytes a client chose:
+ *   that sentence reaches a terminal. `atlas_orch_is_job_uid` is the one
+ *   implementation of the shape, the same one `atlas_orch_spec_validate` asks
+ *   about a parent.
+ *
+ *   **The plan belongs to this principal**, which is the scoping every client
+ *   read does. `submitter_uid` is written from `SO_PEERCRED` at creation and is
+ *   immutable, so a check outside the transaction is sound.
+ */
+static atlas_status method_plan_revision_add(dispatch_state *ds, const atlas_ipc_request *req,
+                                             atlas_err *err) {
+    atlas_status st = require_submitter(ds, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    const char *plan_uid = NULL, *job_uid = NULL, *reason = NULL;
+    if (!atlas_ipc_param_str(req, "plan", &plan_uid) || plan_uid == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "which plan?");
+    }
+    if (!atlas_ipc_param_str(req, "planner_job", &job_uid) || job_uid == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "which planner job?");
+    }
+    if (!atlas_orch_is_job_uid(job_uid, strlen(job_uid))) {
+        /* Deliberately does not echo what was sent. */
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "that is not a job identifier: a job identifier is 'j' and %u "
+                             "lowercase hex characters",
+                             (unsigned)ATLAS_ORCH_UID_HEX);
+    }
+    if (!atlas_ipc_param_str(req, "reason", &reason) || reason == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "a revision records why it exists");
+    }
+    /* A closed two-member vocabulary, matched exactly against its own names. An
+     * unrecognised spelling is refused rather than left at the zero: UNKNOWN is
+     * "nobody filled this in", and storing it for "a word Atlas did not
+     * recognise" would be inventing an answer. */
+    atlas_plan_revision_reason why = ATLAS_PLAN_REVISION_UNKNOWN;
+    static const atlas_plan_revision_reason REASONS[] = {ATLAS_PLAN_REVISION_INITIAL,
+                                                         ATLAS_PLAN_REVISION_REPLAN};
+    for (size_t i = 0; i < sizeof REASONS / sizeof REASONS[0]; i++) {
+        if (strcmp(reason, atlas_plan_revision_reason_name(REASONS[i])) == 0) {
+            why = REASONS[i];
+            break;
+        }
+    }
+    if (why == ATLAS_PLAN_REVISION_UNKNOWN) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "a revision exists because it is the %s plan or a %s, and for no "
+                             "other reason",
+                             atlas_plan_revision_reason_name(ATLAS_PLAN_REVISION_INITIAL),
+                             atlas_plan_revision_reason_name(ATLAS_PLAN_REVISION_REPLAN));
+    }
+    int64_t rev_no = 0;
+    if (!atlas_ipc_param_int(req, "rev_no", &rev_no) || rev_no < 1 ||
+        rev_no > ATLAS_PLAN_MAX_REVISIONS) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "a revision is numbered 1 to %d, and the number is compared against "
+                             "what the plan holds",
+                             ATLAS_PLAN_MAX_REVISIONS);
+    }
+
+    atlas_plan_view v;
+    atlas_plan_view_init(&v);
+    bool found = false;
+    st = atlas_db_plan_get(ds->db, plan_uid, &v, &found, err);
+    long long owner = v.submitter_uid;
+    atlas_plan_view_free(&v);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (!found || owner != ds->peer_uid) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "no such plan");
+    }
+
+    atlas_plan_op *op = calloc(1u, sizeof(*op));
+    if (op == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory building a plan revision");
+    }
+    atlas_plan_op_init(op, ATLAS_PLAN_OP_REVISION_ADD);
+    op->submitter_uid = ds->peer_uid;
+    op->reason = why;
+    op->rev_no = (int)rev_no;
+    st = atlas_buf_set_str(&op->plan_uid, plan_uid, err);
+    if (st == ATLAS_OK) {
+        st = atlas_buf_set_str(&op->planner_job_uid, job_uid, err);
+    }
+    if (st != ATLAS_OK) {
+        atlas_plan_op_free(op);
+        free(op);
+        return st;
+    }
+
+    atlas_plan_result r;
+    atlas_plan_result_init(&r);
+    st = plan_write(ds, op, &r, err);
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "plan", atlas_buf_cstr(&r.plan_uid), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "rev_no", r.rev_no, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "tasks", r.task_count, err);
+    }
+    atlas_plan_result_free(&r);
+    return st;
+}
+
+/* --- plan.get and plan.list --------------------------------------------------
+ *
+ * Reads, and only reads. The status they report is derived by
+ * `atlas_db_plan_state_derive` on every call, from rows nothing in the plan
+ * vocabulary can reach; this layer neither re-derives it nor caches it, because
+ * two derivations of one status are two answers that can disagree about whether
+ * a plan is finished.
+ */
+
+/* The gate floor as one block of text, one command per line, arguments joined by
+ * a single space.
+ *
+ * Lossless, because a gate's arguments are split on spaces in the first place —
+ * `atlas_orch_gate_split` is not a shell and has no quoting, so no argument can
+ * contain one. The block is safe-encoded like every other value that reaches a
+ * terminal, and it is what a renderer prints. */
+static atlas_status write_gate_floor(dispatch_state *ds, const atlas_buf *encoded,
+                                     atlas_err *err) {
+    atlas_orch_argv gates[ATLAS_ORCH_MAX_VALIDATIONS];
+    memset(gates, 0, sizeof gates);
+    size_t n = 0;
+    atlas_buf text = ATLAS_BUF_INIT;
+    atlas_status st =
+        atlas_orch_validations_decode(atlas_buf_cstr(encoded), gates, ATLAS_ORCH_MAX_VALIDATIONS,
+                                      &n, err);
+    for (size_t i = 0; st == ATLAS_OK && i < n; i++) {
+        for (size_t k = 0; st == ATLAS_OK && k < gates[i].count; k++) {
+            if (k > 0) {
+                st = atlas_buf_append(&text, " ", 1u, err);
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_buf_append(&text, gates[i].args[k].data, gates[i].args[k].len, err);
+            }
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_buf_append(&text, "\n", 1u, err);
+        }
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "gate_floor_count", (int64_t)n, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "gate_floor_encoding", "atlas-safe-1", err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "gate_floor_text",
+                                atlas_safe(&ds->safe, atlas_buf_cstr(&text)), err);
+    }
+    for (size_t i = 0; i < ATLAS_ORCH_MAX_VALIDATIONS; i++) {
+        atlas_orch_argv_free(&gates[i]);
+    }
+    atlas_buf_free(&text);
+    return st;
+}
+
+static atlas_status emit_revision(const atlas_plan_revision_row *row, void *ud, atlas_err *err) {
+    dispatch_state *ds = (dispatch_state *)ud;
+    atlas_status st = atlas_json_obj_begin(ds->j, err);
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "rev_no", row->rev_no, err);
+    }
+    /* Atlas' own values throughout: a stored vocabulary name, an Atlas-generated
+     * job identifier, a digest and a timestamp Atlas wrote. Nothing here is a
+     * planner's bytes — the document itself is served only when a caller asks for
+     * one revision by number, and then it is labelled. */
+    struct {
+        const char *k;
+        const char *v;
+    } strs[] = {
+        {"reason", row->reason},
+        {"planner_job", row->planner_job_uid},
+        {"sha256", row->sha256},
+        {"created_at", row->created_at},
+    };
+    for (size_t i = 0; st == ATLAS_OK && i < sizeof strs / sizeof strs[0]; i++) {
+        st = atlas_json_key_str(ds->j, strs[i].k, strs[i].v, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "bytes", row->bytes, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_obj_end(ds->j, err);
+    }
+    return st;
+}
+
+/* One task of the latest revision, with what Atlas knows about the job it became.
+ *
+ * A tree task's outcome is its stage-run's status and a side task's is its job's
+ * state — the distinction `atlas_db_plan_state_derive` draws and the reason it
+ * clears a side task's run identifier. Both are emitted as they are stored; the
+ * *plan's* status is the derived one, above, and is not recomputed from these. */
+static atlas_status emit_task(dispatch_state *ds, const atlas_plan_task_view *t,
+                              atlas_err *err) {
+    atlas_status st = atlas_json_obj_begin(ds->j, err);
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "key", t->task_key, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "stage", t->stage_no, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "kind", t->is_tree ? "TREE" : "SIDE", err);
+    }
+    /* A model wrote the title. Safe-encoded here; the label for the whole array
+     * is emitted once, beside it. */
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "title", atlas_safe(&ds->safe, t->title), err);
+    }
+    /* The job is emitted only when the task has become one. An empty
+     * job-uid-shaped string would read as an identifier; an absent key reads as
+     * what it is — not submitted yet. */
+    if (st == ATLAS_OK && t->job_uid[0] != '\0') {
+        st = atlas_json_key_str(ds->j, "job", t->job_uid, err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(ds->j, "job_state", atlas_orch_state_name(t->job_state), err);
+        }
+    }
+    if (st == ATLAS_OK && t->run_uid[0] != '\0') {
+        st = atlas_json_key_str(ds->j, "run", t->run_uid, err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(ds->j, "run_status",
+                                    atlas_orch_run_status_name(t->run_status), err);
+        }
+    }
+    /* A10.0's per-attempt measurement, rolled up over this task's job.
+     *
+     * Emitted only when `orch_usage` holds a row for it, because an absent
+     * measurement is not a zero: a worker that never produced a final record
+     * spent something Atlas cannot name, and reporting that as 0 would turn "we
+     * do not know" into "it was free". Each figure is emitted only if it was
+     * observed, for the same reason. */
+    if (st == ATLAS_OK && t->job_uid[0] != '\0') {
+        atlas_orch_job_usage u;
+        if (atlas_db_orch_job_usage(ds->db, t->job_uid, &u, err) != ATLAS_OK) {
+            atlas_err_init(err);
+            memset(&u, 0, sizeof(u));
+        }
+        if (u.present) {
+            if (st == ATLAS_OK && u.model[0] != '\0') {
+                /* Worker-derived text: bounded when it was stored, encoded
+                 * here. */
+                st = atlas_json_key_str(ds->j, "usage_model", atlas_safe(&ds->safe, u.model), err);
+            }
+            if (st == ATLAS_OK && u.has_cost) {
+                st = atlas_json_key_int(ds->j, "usage_cost_micro_usd", u.cost_micro_usd, err);
+            }
+            if (st == ATLAS_OK && u.has_turns) {
+                st = atlas_json_key_int(ds->j, "usage_turns", u.turns, err);
+            }
+        }
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_obj_end(ds->j, err);
+    }
+    return st;
+}
+
+static atlas_status method_plan_get(dispatch_state *ds, const atlas_ipc_request *req,
+                                    atlas_err *err) {
+    atlas_status st = require_submitter(ds, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    const char *uid = NULL;
+    if (!atlas_ipc_param_str(req, "plan", &uid) || uid == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "which plan?");
+    }
+    int64_t want_rev = 0;
+    bool with_content = atlas_ipc_param_int(req, "rev_no", &want_rev);
+
+    atlas_plan_view v;
+    atlas_plan_view_init(&v);
+    bool found = false;
+    st = atlas_db_plan_get(ds->db, uid, &v, &found, err);
+    if (st == ATLAS_OK && (!found || v.submitter_uid != ds->peer_uid)) {
+        st = atlas_err_set(err, ATLAS_ERR_USAGE, "no such plan");
+    }
+    if (st != ATLAS_OK) {
+        atlas_plan_view_free(&v);
+        return st;
+    }
+
+    /* The one implementation of "what is this plan doing?". Asked here and
+     * nowhere else on this path. */
+    atlas_plan_state state;
+    memset(&state, 0, sizeof(state));
+    st = atlas_db_plan_state_derive(ds->db, v.plan_uid, &state, err);
+
+    struct {
+        const char *k;
+        const char *val;
+    } strs[] = {
+        {"plan", v.plan_uid},
+        {"repo", v.repo_name},
+        {"created_at", v.created_at},
+        {"status", atlas_plan_status_name(state.status)},
+    };
+    for (size_t i = 0; st == ATLAS_OK && i < sizeof strs / sizeof strs[0]; i++) {
+        st = atlas_json_key_str(ds->j, strs[i].k, strs[i].val, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "max_parallel", v.max_parallel, err);
+    }
+    /* The operator's own words, safe-encoded and labelled. Not a model's bytes —
+     * but still text a person typed, and every surface that shows it says how it
+     * was encoded so a reader can decode it back. */
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "goal_encoding", "atlas-safe-1", err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "goal", atlas_safe(&ds->safe, atlas_buf_cstr(&v.goal_text)),
+                                err);
+    }
+    if (st == ATLAS_OK) {
+        st = write_gate_floor(ds, &v.gate_floor, err);
+    }
+    /* The derived state's own figures. `rev_no` is the latest compiled revision,
+     * or 0 when none has compiled — which is not the same as a plan with no
+     * planner job, and `planner_jobs_seen` is what separates them. */
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "rev_no", state.rev_no, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "planner_jobs_seen", state.planner_jobs_seen, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "stages_accepted", state.stages_accepted, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(ds->j, "replan_wanted", state.replan_wanted, err);
+    }
+    if (st == ATLAS_OK && state.planner_job_uid[0] != '\0') {
+        st = atlas_json_key_str(ds->j, "planner_job", state.planner_job_uid, err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(ds->j, "planner_job_state",
+                                    atlas_orch_state_name(state.planner_job_state), err);
+        }
+    }
+
+    if (st == ATLAS_OK) {
+        st = atlas_json_key(ds->j, "revisions", err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_arr_begin(ds->j, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_db_plan_revisions(ds->db, v.id, emit_revision, ds, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_arr_end(ds->j, err);
+    }
+
+    /* One label for the array rather than one per row: every `title` below is a
+     * planner's bytes, encoded the same way, and repeating the statement on each
+     * row would say nothing more. */
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "task_title_encoding", "atlas-safe-1", err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "task_title_provenance", "UNTRUSTED_DATA", err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key(ds->j, "tasks", err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_arr_begin(ds->j, err);
+    }
+    for (int i = 0; st == ATLAS_OK && i < state.task_count; i++) {
+        st = emit_task(ds, &state.tasks[i], err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_arr_end(ds->j, err);
+    }
+
+    /* The document itself, when a caller asked for one revision by number.
+     *
+     * A planner's bytes, labelled and safe-encoded exactly as `job.artifact`
+     * labels and encodes an artifact's — which is where they came from. A
+     * revision's content is always stored, because a revision only exists if the
+     * artifact's bytes were stored and parsed, so there is no "unavailable"
+     * branch here for there to be. */
+    if (st == ATLAS_OK && with_content) {
+        atlas_buf content = ATLAS_BUF_INIT;
+        bool have = false;
+        st = atlas_db_plan_revision_content(ds->db, v.id, (int)want_rev, &content, &have, err);
+        if (st == ATLAS_OK && !have) {
+            st = atlas_err_set(err, ATLAS_ERR_USAGE, "plan %s holds no revision %lld", v.plan_uid,
+                               (long long)want_rev);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_int(ds->j, "content_rev_no", want_rev, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(ds->j, "content_encoding", "atlas-safe-1", err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(ds->j, "content_provenance", "UNTRUSTED_DATA", err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(ds->j, "content",
+                                    atlas_safe(&ds->safe, atlas_buf_cstr(&content)), err);
+        }
+        atlas_buf_free(&content);
+    }
+
+    atlas_plan_view_free(&v);
+    return st;
+}
+
+typedef struct plan_list_ctx {
+    dispatch_state *ds;
+    atlas_err *err;
+} plan_list_ctx;
+
+/* Called after the page's statement is finished — see `atlas_db_plan_list` —
+ * which is what makes it safe to derive a status from inside here. */
+static atlas_status emit_plan(const atlas_plan_list_row *row, void *ud, atlas_err *err) {
+    plan_list_ctx *lc = (plan_list_ctx *)ud;
+    dispatch_state *ds = lc->ds;
+    atlas_plan_state state;
+    memset(&state, 0, sizeof(state));
+    atlas_status st = atlas_db_plan_state_derive(ds->db, row->plan_uid, &state, err);
+    if (st == ATLAS_OK) {
+        st = atlas_json_obj_begin(ds->j, err);
+    }
+    struct {
+        const char *k;
+        const char *v;
+    } strs[] = {
+        {"plan", row->plan_uid},
+        {"repo", row->repo_name},
+        {"status", atlas_plan_status_name(state.status)},
+        {"created_at", row->created_at},
+    };
+    for (size_t i = 0; st == ATLAS_OK && i < sizeof strs / sizeof strs[0]; i++) {
+        st = atlas_json_key_str(ds->j, strs[i].k, strs[i].v, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_obj_end(ds->j, err);
+    }
+    return st;
+}
+
+static atlas_status method_plan_list(dispatch_state *ds, const atlas_ipc_request *req,
+                                     atlas_err *err) {
+    atlas_status st = require_submitter(ds, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    int64_t after = 0, limit = 0;
+    (void)atlas_ipc_param_int(req, "after", &after);
+    (void)atlas_ipc_param_int(req, "limit", &limit);
+    if (after < 0) {
+        after = 0;
+    }
+    st = atlas_json_key(ds->j, "plans", err);
+    if (st == ATLAS_OK) {
+        st = atlas_json_arr_begin(ds->j, err);
+    }
+    plan_list_ctx lc = {ds, err};
+    int64_t count = 0, cursor = after;
+    bool more = false;
+    if (st == ATLAS_OK) {
+        st = atlas_db_plan_list(ds->db, ds->peer_uid, after, limit, emit_plan, &lc, &count,
+                                &cursor, &more, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_arr_end(ds->j, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "count", count, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "cursor", cursor, err);
+    }
+    if (st == ATLAS_OK) {
+        /* Explicit, for A1's reason: a page that silently ends is
+         * indistinguishable from the end of the list. */
+        st = atlas_json_key_bool(ds->j, "more", more, err);
+    }
+    return st;
+}
+
 /* --- dispatch.lease ---------------------------------------------------------- */
 
 static atlas_status method_dispatch_lease(dispatch_state *ds, const atlas_ipc_request *req,
@@ -1572,6 +2277,13 @@ static const atlas_method_entry ORCH_CLIENT_METHODS[] = {
     {"job.cancel", method_job_cancel},
     {"job.artifact", method_job_artifact},
     {"job.run_status", method_run_get},
+    /* A12.0. The plan domain, in the group it belongs to: an operator's own
+     * client surface. Create, read, list, and turn one planner job's own stored
+     * artifact into a revision — and deliberately nothing that settles one. */
+    {"plan.create", method_plan_create},
+    {"plan.revision_add", method_plan_revision_add},
+    {"plan.get", method_plan_get},
+    {"plan.list", method_plan_list},
 };
 
 static const atlas_method_entry ORCH_DISPATCH_METHODS[] = {

@@ -962,12 +962,16 @@ static void test_the_two_job_classifications_agree_over_the_whole_enum(void) {
     /* The documented drainable set. Adding a kind here is a deliberate act about
      * what may run inside a semantic pass; see `docs/extending.md`. */
     static const atlas_job_kind DRAINABLE[] = {
-        ATLAS_JOB_ORCH, ATLAS_JOB_AI,       ATLAS_JOB_DECISION,
-        ATLAS_JOB_VERIFY, ATLAS_JOB_GW_AUDIT, ATLAS_JOB_APIKEY,
+        ATLAS_JOB_ORCH,     ATLAS_JOB_AI,     ATLAS_JOB_DECISION,
+        ATLAS_JOB_VERIFY,   ATLAS_JOB_GW_AUDIT, ATLAS_JOB_APIKEY,
+        /* A12.0. A plan's creation or one revision of it: three small tables of
+         * its own, disjoint from anything a semantic pass touches, with an
+         * operator's foreground plan driver blocked on the answer. */
+        ATLAS_JOB_PLAN,
     };
     /* The last member of the vocabulary. Named rather than counted, so that a
      * kind appended after it makes this line wrong in a way somebody sees. */
-    const int last = (int)ATLAS_JOB_SEM_DISCOVER;
+    const int last = (int)ATLAS_JOB_PLAN;
 
     int drainable_seen = 0;
     for (int i = 0; i <= last; i++) {

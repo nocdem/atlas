@@ -23,6 +23,7 @@
 #include "atlas/gw.h"
 #include "atlas/gwpolicy.h"
 #include "atlas/orchpolicy.h"
+#include "atlas/plan.h"
 #include "atlas/snapshot.h"
 #include "atlas/syspolicy.h"
 #include "atlas/verify_ops.h"
@@ -155,7 +156,26 @@ typedef enum atlas_job_kind {
      * On the writer thread because it writes, and because exactly one thread in
      * this daemon writes. The walk itself runs before the transaction opens,
      * which is A1's rule about file reads. */
-    ATLAS_JOB_SEM_DISCOVER
+    ATLAS_JOB_SEM_DISCOVER,
+    /* A12.0. One job kind carrying one typed plan operation, for exactly the
+     * reasons ATLAS_JOB_AI, ATLAS_JOB_DECISION, ATLAS_JOB_ORCH and
+     * ATLAS_JOB_VERIFY are one each: validation and policy happen at the IPC
+     * edge before anything is queued, and the writer's switch stays a switch
+     * rather than becoming a second dispatch table that can drift from the
+     * first.
+     *
+     * It is a kind of its own rather than a member of ATLAS_JOB_ORCH because
+     * `atlas_plan_apply_in_tx` is the plan domain's single write point and has
+     * exactly one caller. Reaching it through the orchestration operation would
+     * either put plan kinds in `atlas_orch_op_kind` — a second entry into that
+     * write point — or add a discriminator to the ORCH case, which is the
+     * second dispatch table the comments above exist to prevent.
+     *
+     * Pure database work, which is what makes it legal here: A1 forbids
+     * creating a process or reading a file inside a write transaction, and a
+     * plan operation does neither. The planner's bytes come from the job's own
+     * stored artifact row, so nothing here opens anything. */
+    ATLAS_JOB_PLAN
 } atlas_job_kind;
 
 
@@ -266,6 +286,15 @@ struct atlas_job {
      * fragment. */
     atlas_verify_op *verify;
     atlas_verify_intake_result *verify_result;
+
+    /* A12.0. Same ownership rule again: the job owns the operation and the
+     * result slot and frees both, and the result is typed rather than a JSON
+     * fragment. The result is handed back on the **failure** path too, which is
+     * this pair's one difference from the four above it: a refused planner
+     * document is a typed answer, and the sentence and line that describe it are
+     * exactly what the caller came for. */
+    atlas_plan_op *plan;
+    atlas_plan_result *plan_result;
 
     /* A8 snapshot enumeration. */
     int64_t snapshot_attempt_id;
@@ -392,6 +421,20 @@ atlas_status atlas_writer_orch(atlas_writer *w, atlas_orch_op *op, int timeout_m
  * rather than remembers to avoid. */
 atlas_status atlas_writer_verify(atlas_writer *w, atlas_verify_op *op, int timeout_ms,
                                  atlas_verify_intake_result *result, atlas_err *err);
+
+/* A12.0. Ownership of `op` is taken unconditionally, as everywhere else, and the
+ * result is moved rather than copied field by field for `atlas_writer_verify`'s
+ * reason.
+ *
+ * **The result is handed back on the failure path too**, which is what makes it
+ * different from every other wrapper here. A refused planner document returns a
+ * non-OK status *and* fills `refusal` and `refusal_line`, and those are the
+ * whole answer: the driver composes a retry prompt out of Atlas' own refusal
+ * sentence and the line it happened on. A wrapper that moved the result only on
+ * success would drop them on the writer thread and leave the caller with prose
+ * to parse. */
+atlas_status atlas_writer_plan(atlas_writer *w, atlas_plan_op *op, int timeout_ms,
+                               atlas_plan_result *result, atlas_err *err);
 
 /* A8. Enumerates and persists one attempt's snapshot manifest on the writer
  * thread. Idempotent per attempt. */

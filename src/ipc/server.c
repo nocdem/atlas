@@ -96,9 +96,17 @@ static void rb_abort(response_builder *rb) {
  * Written from scratch rather than appended to a half-built success document:
  * a response that is partly one answer and partly another is worse than a plain
  * failure. `status` is the same code the CLI exits with, so a caller has one
- * vocabulary rather than two. */
-static atlas_status build_error(const char *id, const atlas_err *err, atlas_buf *out,
-                                atlas_err *werr) {
+ * vocabulary rather than two.
+ *
+ * A12.0 adds an optional `detail` object, and only one method fills it. See
+ * `dispatch_state.has_detail`: a refused planner document is answered with a
+ * sentence *and* the line it happened on, and the two travel apart so the plan
+ * driver never has to read Atlas' prose to recover a number. `refusal` is NULL
+ * for every other refusal in Atlas, which is every refusal whose sentence is the
+ * whole answer, and then the document is byte-for-byte what it was before. */
+static atlas_status build_error_with_detail(const char *id, const atlas_err *err,
+                                            const char *refusal, int line, atlas_buf *out,
+                                            atlas_err *werr) {
     response_builder rb;
     atlas_status st = rb_open(&rb, werr);
     if (st != ATLAS_OK) {
@@ -130,6 +138,27 @@ static atlas_status build_error(const char *id, const atlas_err *err, atlas_buf 
          * are untrusted, so it is safe-encoded on the way out. */
         st = atlas_json_key_str(rb.j, "message", atlas_safe(&safe, atlas_err_msg(err)), werr);
     }
+    if (st == ATLAS_OK && refusal != NULL) {
+        st = atlas_json_key(rb.j, "detail", werr);
+        if (st == ATLAS_OK) {
+            st = atlas_json_obj_begin(rb.j, werr);
+        }
+        if (st == ATLAS_OK) {
+            /* Atlas' own sentence about a planner's bytes. It quotes none of
+             * them and is safe-encoded anyway: one discipline for everything
+             * that leaves this function. */
+            st = atlas_json_key_str(rb.j, "refusal", atlas_safe(&safe, refusal), werr);
+        }
+        if (st == ATLAS_OK) {
+            /* The 1-based line the refusal is about, or 0 for a refusal about the
+             * document as a whole. Emitted always, including zero, because an
+             * absent key and a zero would otherwise be the same document. */
+            st = atlas_json_key_int(rb.j, "line", (int64_t)line, werr);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_obj_end(rb.j, werr);
+        }
+    }
     if (st == ATLAS_OK) {
         st = atlas_json_obj_end(rb.j, werr);
     }
@@ -142,6 +171,11 @@ static atlas_status build_error(const char *id, const atlas_err *err, atlas_buf 
         return st;
     }
     return rb_finish(&rb, out, werr);
+}
+
+static atlas_status build_error(const char *id, const atlas_err *err, atlas_buf *out,
+                                atlas_err *werr) {
+    return build_error_with_detail(id, err, NULL, 0, out, werr);
 }
 
 /* --- method implementations ---------------------------------------------- */
@@ -1130,9 +1164,15 @@ atlas_status atlas_server_dispatch(atlas_server_ctx *ctx, const void *payload, s
 
     if (mst != ATLAS_OK) {
         /* The partial document is discarded rather than patched: half a success
-         * document followed by an error object would be neither. */
+         * document followed by an error object would be neither.
+         *
+         * A12.0. Whatever typed detail the method left behind travels with it.
+         * `has_detail` is false for every method that did not set one, and then
+         * this is the call it always was. */
         rb_abort(&rb);
-        atlas_status st2 = build_error(atlas_ipc_request_id(req), &merr, response, err);
+        atlas_status st2 = build_error_with_detail(atlas_ipc_request_id(req), &merr,
+                                                   ds.has_detail ? ds.detail_refusal : NULL,
+                                                   ds.detail_line, response, err);
         atlas_ipc_request_free(req);
         return st2;
     }

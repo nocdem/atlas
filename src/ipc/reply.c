@@ -217,6 +217,51 @@ const char *atlas_ipc_response_message(const atlas_ipc_response *r) {
     return r != NULL ? r->message : "";
 }
 
+/* A12.0. The error document's optional `detail` object, reached from the root
+ * rather than from `result` — a refusal has no result, which is why the two
+ * accessor families are separate rather than one with a flag. */
+static yyjson_val *error_detail(const atlas_ipc_response *r) {
+    if (r == NULL || r->ok || r->root == NULL) {
+        return NULL;
+    }
+    yyjson_val *e = yyjson_obj_get(r->root, "error");
+    if (e == NULL || !yyjson_is_obj(e)) {
+        return NULL;
+    }
+    yyjson_val *d = yyjson_obj_get(e, "detail");
+    return (d != NULL && yyjson_is_obj(d)) ? d : NULL;
+}
+
+bool atlas_ipc_error_detail_str(const atlas_ipc_response *r, const char *key, const char **out) {
+    yyjson_val *d = error_detail(r);
+    if (d == NULL) {
+        return false;
+    }
+    yyjson_val *v = yyjson_obj_get(d, key);
+    if (v == NULL || !yyjson_is_str(v)) {
+        return false;
+    }
+    const char *s = yyjson_get_str(v);
+    if (s == NULL || strlen(s) != yyjson_get_len(v)) {
+        return false; /* an embedded NUL would make the two halves disagree */
+    }
+    *out = s;
+    return true;
+}
+
+bool atlas_ipc_error_detail_int(const atlas_ipc_response *r, const char *key, int64_t *out) {
+    yyjson_val *d = error_detail(r);
+    if (d == NULL) {
+        return false;
+    }
+    yyjson_val *v = yyjson_obj_get(d, key);
+    if (v == NULL || !yyjson_is_int(v)) {
+        return false;
+    }
+    *out = yyjson_get_sint(v);
+    return true;
+}
+
 bool atlas_ipc_result_str(const atlas_ipc_response *r, const char *key, const char **out) {
     *out = NULL;
     if (r == NULL || r->result == NULL) {

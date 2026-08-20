@@ -965,6 +965,28 @@ static atlas_status method_run_get(dispatch_state *ds, const atlas_ipc_request *
  * first is the defect `atlas_orch_validation_wire_decode` exists to have fixed
  * once.
  *
+ * **One wire form carries one strictness.** The decoder is a reader of *stored*
+ * text: it takes each argument with `atlas_buf_set` and checks nothing about it,
+ * because what it reads was checked when it was written. So every decoded
+ * argument is pushed back through `atlas_orch_argv_push` — the emptiness, the
+ * length, the NUL and the printable-ASCII rules — and each command is then held
+ * to the two `atlas_orch_spec_validate` applies to a job's validations: it has an
+ * argv, and its program is a bare name rather than a path. Every sentence here is
+ * the one those functions already produce.
+ *
+ * That is `job.submit`'s own discipline at the validation loop above, and it is
+ * not belt and braces. A floor is stored on the plan row and prepended verbatim
+ * to every tree task's validations, so a floor Atlas accepted here and the submit
+ * path later refuses is a plan whose every stage-run is refused at submission —
+ * with nobody watching. Refusing it at `plan.create`, in the operator's own
+ * words, costs one round trip instead.
+ *
+ * The program *allowlist* is deliberately not applied here, exactly as it is not
+ * applied at `job.submit`: `argv[0]` is resolved against
+ * `atlas_validation_program_allowed` by the executor. A planner's *additions* are
+ * checked against it at parse time because a model chose them; an operator's
+ * floor is checked where every other operator's gate is.
+ *
  * An absent or empty floor is not refused here. A plan with no operator gate
  * could only ever be accepted on a model's word, and that refusal is the write
  * point's — stated once, in the layer that also states it to the planner. */
@@ -988,7 +1010,30 @@ static atlas_status take_gate_floor(const atlas_ipc_request *req, atlas_plan_op 
             st = atlas_err_set(err, ATLAS_ERR_USAGE, "gate %zu is not a string", i);
             break;
         }
-        st = atlas_orch_validation_wire_decode(enc, &gates[i], err);
+        atlas_orch_argv tmp[1];
+        atlas_orch_argv_init(&tmp[0]);
+        st = atlas_orch_validation_wire_decode(enc, tmp, err);
+        for (size_t k = 0; st == ATLAS_OK && k < tmp[0].count; k++) {
+            st = atlas_orch_argv_push(&gates[i], tmp[0].args[k].data, tmp[0].args[k].len, err);
+        }
+        atlas_orch_argv_free(&tmp[0]);
+        if (st != ATLAS_OK) {
+            break;
+        }
+        /* The two command-level rules a job's validations meet before anything is
+         * queued, in the same words `atlas_orch_spec_validate` uses. */
+        if (gates[i].count == 0) {
+            st = atlas_err_set(err, ATLAS_ERR_USAGE, "validation %zu has no argv", i);
+            break;
+        }
+        const atlas_buf *a0 = &gates[i].args[0];
+        if (memchr(a0->data, '/', a0->len) != NULL) {
+            st = atlas_err_set(err, ATLAS_ERR_USAGE,
+                               "validation %zu names a program by path; A8 accepts a bare "
+                               "program name resolved against its own allowlist",
+                               i);
+            break;
+        }
     }
     if (st == ATLAS_OK) {
         st = atlas_orch_validations_encode(gates, n, &op->gate_floor, err);

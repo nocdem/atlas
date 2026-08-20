@@ -1015,6 +1015,89 @@ static void test_only_a_planner_jobs_own_artifact_can_become_a_revision(void) {
     edge_close(&g);
 }
 
+/* **A gate floor is held to exactly the strictness the submit path holds.**
+ *
+ * The wire form is `job.submit`'s, and its decoder is a reader of *stored* text:
+ * it checks nothing about an argument, because what it reads was checked when it
+ * was written. So a floor that arrived over the wire has to be pushed back
+ * through `atlas_orch_argv_push` and held to the two command-level rules
+ * `atlas_orch_spec_validate` applies, or a plan could carry a floor that every
+ * one of its stage-run submissions would later refuse — with nobody watching.
+ * Each case below is a floor a job submission would refuse. */
+static void test_a_gate_floor_is_held_to_the_submit_paths_strictness(void) {
+    edge g;
+    edge_open(&g);
+    atlas_err err;
+    atlas_err_init(&err);
+
+    static const struct {
+        const char *floor; /* the `gate_floor` array, as JSON */
+        const char *needle;
+    } BAD[] = {
+        /* A control byte inside an argument. `pass` is five bytes. */
+        {"[\"1:2:4:make,5:pa\\u0001ss,\"]", "must be printable ASCII"},
+        /* An empty argument. */
+        {"[\"1:2:4:make,0:,\"]", "may not be empty"},
+        /* A command with no argv at all. */
+        {"[\"1:0:\"]", "has no argv"},
+        /* A program named by path. The allowlist is the executor's; this is the
+         * shape rule, and it is the one a job submission applies. */
+        {"[\"1:1:7:/bin/sh,\"]", "names a program by path"},
+        /* And a floor of more commands than a task may hold. */
+        {"[\"1:1:4:make,\",\"1:1:4:make,\",\"1:1:4:make,\",\"1:1:4:make,\",\"1:1:4:make,\","
+         "\"1:1:4:make,\",\"1:1:4:make,\",\"1:1:4:make,\",\"1:1:4:make,\"]",
+         "at most 8 commands"},
+    };
+    for (size_t i = 0; i < sizeof BAD / sizeof BAD[0]; i++) {
+        atlas_buf p = ATLAS_BUF_INIT;
+        T_OK(atlas_buf_appendf(&p, &err,
+                               "{\"repo\":\"proj\",\"goal\":\"g\",\"gate_floor\":%s}",
+                               BAD[i].floor),
+             &err);
+        call_refused(&g, g.owner, "plan.create", atlas_buf_cstr(&p), BAD[i].needle);
+        atlas_buf_free(&p);
+    }
+
+    /* An argument one byte past the bound. Built rather than written out, so the
+     * case moves with `ATLAS_ORCH_ARG_MAX` instead of pinning today's number. */
+    {
+        size_t over = (size_t)ATLAS_ORCH_ARG_MAX + 1u;
+        char *arg = (char *)malloc(over + 1u);
+        T_REQUIRE(arg != NULL);
+        memset(arg, 'x', over);
+        arg[over] = '\0';
+        atlas_buf p = ATLAS_BUF_INIT;
+        T_OK(atlas_buf_appendf(&p, &err,
+                               "{\"repo\":\"proj\",\"goal\":\"g\",\"gate_floor\":"
+                               "[\"1:2:4:make,%zu:%s,\"]}",
+                               over, arg),
+             &err);
+        call_refused(&g, g.owner, "plan.create", atlas_buf_cstr(&p), "may be at most");
+        atlas_buf_free(&p);
+        free(arg);
+    }
+
+    /* Nothing above created a plan: a refused floor is refused before anything is
+     * queued, so the writer never saw one of them. */
+    atlas_buf raw = ATLAS_BUF_INIT;
+    atlas_ipc_response *r = call_ok(&g, g.owner, "plan.list", "{}", &raw);
+    int64_t n = -1;
+    T_CHECK_MSG(atlas_ipc_result_int(r, "count", &n) && n == 0,
+                "a refused gate floor left %lld plan(s) behind", (long long)n);
+    atlas_ipc_response_free(r);
+    atlas_buf_free(&raw);
+
+    /* And the floor that is accepted is the one a job submission would accept,
+     * which is the point: the two paths hold one wire form to one strictness. */
+    {
+        atlas_buf uid = ATLAS_BUF_INIT;
+        create_plan(&g, &uid);
+        T_CHECK(uid.len == 33);
+        atlas_buf_free(&uid);
+    }
+    edge_close(&g);
+}
+
 /* A task that has become a job carries what it cost — and a task that has not
  * carries nothing at all, because an absent measurement is not a zero. */
 static void test_a_task_that_became_a_job_reports_what_it_cost(void) {
@@ -1175,6 +1258,8 @@ static const atlas_test TESTS[] = {
      test_a_planner_jobs_artifact_becomes_a_revision},
     {"only a planner job's own artifact can become a revision",
      test_only_a_planner_jobs_own_artifact_can_become_a_revision},
+    {"a gate floor is held to the submit path's strictness",
+     test_a_gate_floor_is_held_to_the_submit_paths_strictness},
     {"a task that became a job reports what it cost",
      test_a_task_that_became_a_job_reports_what_it_cost},
     {"a refused document travels as a sentence and a line",

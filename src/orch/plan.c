@@ -330,6 +330,12 @@ static atlas_status parse_gate(plan_parse *c, const char *rest, int lineno, int 
     }
     atlas_plan_doc_task *t = &c->doc.tasks[c->cur];
     if (t->gate_count >= ATLAS_ORCH_MAX_VALIDATIONS) {
+        /* Additions only. This layer is pure and does not know the operator's
+         * floor, so it cannot check the merged list; the compile point does,
+         * and PLAN_FORMAT_SPEC tells the planner so rather than letting it
+         * discover the arithmetic in a refusal it was given no way to predict.
+         * Eight is still the right cap here: with a floor of one or more, no
+         * plan needing a ninth addition could ever merge within the bound. */
         return refuse(line_out, lineno, err, "a task may add at most %u gates",
                       (unsigned)ATLAS_ORCH_MAX_VALIDATIONS);
     }
@@ -543,7 +549,8 @@ static const char PLAN_FORMAT_SPEC[] =
     "title: <one line, at most 200 bytes>\n"
     "gate: <cmd>            # tree only, 0..n; appended AFTER the operator floor;\n"
     "                       # same parsing as --gate (space-split argv, allowlist\n"
-    "                       # make/ctest/cmake/true/false)\n"
+    "                       # make/ctest/cmake/true/false); the floor and these\n"
+    "                       # together are at most 8\n"
     "prompt<<\n"
     "<free text for the executor, at most 16384 bytes>\n"
     ">>\n"
@@ -566,9 +573,12 @@ static const char PLAN_FORMAT_SPEC[] =
     "  all four of `task`, `kind`, `title` and `prompt`;\n"
     "- `gate:` under `kind: side` is a refusal, and so is a `gate:` line this\n"
     "  task's `kind: tree` line has not yet been reached;\n"
-    "- a gate program outside the allowlist is a refusal; a tree task may add at\n"
-    "  most 8 gates, and the operator floor is prepended to them, never replaced\n"
-    "  by them;\n"
+    "- a gate program outside the allowlist is a refusal;\n"
+    "- the operator's immutable gate floor listed above is prepended, verbatim and\n"
+    "  first, to every tree task's gates; it is never replaced by them. The floor\n"
+    "  count plus your additions for one tree task must total at most 8. The floor\n"
+    "  is listed above, so count it: a plan whose merged list exceeds 8 is refused\n"
+    "  when it is compiled, even though the additions alone were within bounds;\n"
     "- `title:`, `gate:` and `prompt<<` before this task's `task:` line are\n"
     "  refusals;\n"
     "- a repeated `kind:`, `title:` or `prompt<<` inside one task is a refusal;\n"

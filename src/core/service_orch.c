@@ -112,36 +112,10 @@ static void fill_render(const atlas_ipc_response *r, atlas_job_render *jr, bool 
 
 /* --- job submit -------------------------------------------------------------- */
 
-/* Splits a gate command line into an argv vector on ASCII spaces and tabs.
- *
- * Not a shell, and deliberately not shell-like: no quoting, no escaping, no
- * expansion, no variable, no glob. An argument containing a space cannot be
- * expressed, which is a limitation rather than an oversight — the alternative
- * is a miniature quoting language, and a miniature quoting language on the path
- * to `execve` is how a gate eventually runs something other than what it reads
- * like. `argv[0]` is checked against the binary's own allowlist later. */
-static atlas_status split_words(const char *line, atlas_orch_argv *out, atlas_err *err) {
-    const char *p = line;
-    while (*p != '\0') {
-        while (*p == ' ' || *p == '\t') {
-            p++;
-        }
-        const char *start = p;
-        while (*p != '\0' && *p != ' ' && *p != '\t') {
-            p++;
-        }
-        if (p > start) {
-            atlas_status st = atlas_orch_argv_push(out, start, (size_t)(p - start), err);
-            if (st != ATLAS_OK) {
-                return st;
-            }
-        }
-    }
-    if (out->count == 0) {
-        return atlas_err_set(err, ATLAS_ERR_USAGE, "a gate needs a command");
-    }
-    return ATLAS_OK;
-}
+/* A12.0 moved the gate split to `atlas_orch_gate_split` in `src/orch/orch.c`,
+ * unchanged, so the `atlas-plan-1` parser splits a planner's `gate:` line the
+ * way this splits an operator's `--gate`. The comment explaining why it is not
+ * shell-like moved with it. */
 
 static atlas_status build_submit(atlas_json *j, void *ud, atlas_err *err) {
     const atlas_job_submit_opts *o = (const atlas_job_submit_opts *)ud;
@@ -201,7 +175,7 @@ static atlas_status build_submit(atlas_json *j, void *ud, atlas_err *err) {
         for (size_t i = 0; st == ATLAS_OK && i < o->gate_count; i++) {
             atlas_orch_argv one;
             atlas_orch_argv_init(&one);
-            st = split_words(o->gates[i], &one, err);
+            st = atlas_orch_gate_split(o->gates[i], &one, err);
             atlas_buf enc = ATLAS_BUF_INIT;
             if (st == ATLAS_OK) {
                 st = atlas_orch_validations_encode(&one, 1u, &enc, err);

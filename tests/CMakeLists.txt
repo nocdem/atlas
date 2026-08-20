@@ -154,6 +154,8 @@ set(ATLAS_TESTS
   test_orch_workspace
   test_orch_driver
   test_orch_snapshot
+  # --- A12.0: the planned run ---
+  test_plan_format
   test_remote_equivalence
   test_operator_peer
   # The A8 operator-boundary fix: decision links over the socket, and the
@@ -316,6 +318,10 @@ set_tests_properties(test_a71_syspolicy PROPERTIES LABELS "daemon" TIMEOUT 900 R
 set_tests_properties(test_orch_model PROPERTIES LABELS "unit")
 set_tests_properties(test_orch_validation_wire PROPERTIES LABELS "unit")
 set_tests_properties(test_orch_usage PROPERTIES LABELS "unit")
+# A12.0. The `atlas-plan-1` parser and the five prompt composers are pure
+# functions — untrusted bytes in, a document or a refusal out — so this suite
+# needs no repository, no database and no daemon either.
+set_tests_properties(test_plan_format PROPERTIES LABELS "unit")
 # The lifecycle suite builds a real fixture repository, registers it through the
 # CLI and drives the one write point against an isolated database, so it is an
 # integration test. It sleeps for nothing: expiry and deadlines are supplied.

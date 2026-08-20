@@ -472,6 +472,24 @@ void atlas_orch_argv_free(atlas_orch_argv *a);
 atlas_status atlas_orch_argv_push(atlas_orch_argv *a, const char *arg, size_t len,
                                   atlas_err *err);
 
+/* Splits one gate command line into an argv vector on ASCII spaces and tabs.
+ *
+ * Not a shell, and deliberately not shell-like: no quoting, no escaping, no
+ * expansion, no variable, no glob. An argument containing a space cannot be
+ * expressed, which is a limitation rather than an oversight — the alternative
+ * is a miniature quoting language, and a miniature quoting language on the path
+ * to `execve` is how a gate eventually runs something other than what it reads
+ * like. `argv[0]` is checked against the binary's own allowlist later, by
+ * `atlas_validation_program_allowed`.
+ *
+ * A12.0 moved this out of `src/core/service_orch.c`, where `--gate` was split,
+ * so the `atlas-plan-1` parser's `gate:` line and an operator's `--gate` flag
+ * are split by one implementation. Two splitters would be two answers to "what
+ * is argv[0] here", and the allowlist is applied to argv[0].
+ *
+ * `out` must be initialised. An empty line is refused: a gate needs a command. */
+atlas_status atlas_orch_gate_split(const char *line, atlas_orch_argv *out, atlas_err *err);
+
 /* Canonicalises in place: sorts and deduplicates the allowed-path set, and
  * rejects anything that is not a safe repository-relative prefix. Called before
  * the digest so that the same set submitted in a different order is the same

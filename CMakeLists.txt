@@ -289,6 +289,9 @@ add_library(atlas_core STATIC
   src/orch/memory.c
   src/orch/dispatch.c
   src/orch/snapshot.c
+  # A12.0: the `atlas-plan-1` format. Pure — no database handle, no process, no
+  # clock — and it compiles a proposal into nothing more than task rows.
+  src/orch/plan.c
   src/core/service_orch.c
   src/db/db_orch.c
   src/db/db_orch_memory.c

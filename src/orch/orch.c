@@ -289,6 +289,34 @@ atlas_status atlas_orch_argv_push(atlas_orch_argv *a, const char *arg, size_t le
     return ATLAS_OK;
 }
 
+/* See atlas/orch.h. A12.0 lifted this verbatim out of `split_words` in
+ * `src/core/service_orch.c`, which is now a caller: the `atlas-plan-1` parser
+ * needs the same split for its `gate:` lines, and a planner's gate must be
+ * split exactly as an operator's `--gate` is or the allowlist is applied to a
+ * different argv[0] than the one that runs. */
+atlas_status atlas_orch_gate_split(const char *line, atlas_orch_argv *out, atlas_err *err) {
+    const char *p = line;
+    while (*p != '\0') {
+        while (*p == ' ' || *p == '\t') {
+            p++;
+        }
+        const char *start = p;
+        while (*p != '\0' && *p != ' ' && *p != '\t') {
+            p++;
+        }
+        if (p > start) {
+            atlas_status st = atlas_orch_argv_push(out, start, (size_t)(p - start), err);
+            if (st != ATLAS_OK) {
+                return st;
+            }
+        }
+    }
+    if (out->count == 0) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "a gate needs a command");
+    }
+    return ATLAS_OK;
+}
+
 /* --- the specification ---------------------------------------------------- */
 
 void atlas_orch_spec_init(atlas_orch_spec *s) {

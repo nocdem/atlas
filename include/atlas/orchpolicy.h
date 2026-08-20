@@ -155,6 +155,23 @@ typedef struct atlas_orchpolicy {
      * root-installed credential file and refuses without it. */
     bool model_uses_operator_session;
 
+    /* --- A12.0: which model each role runs under ----------------------------
+     *
+     * Until this season a worker ran on whatever the account's own session
+     * defaulted to, and nothing could choose otherwise — recorded as a residual
+     * and closed here. The choice lives in the root-owned policy rather than in
+     * `src/` or in a submission, for the reason every other model decision does:
+     * the principal it constrains is the worker, and a value a submitter could
+     * name would let a task choose what it is judged by.
+     *
+     * A *role* is a property of the driver — `atlas_driver.role` — so the policy
+     * names a model per role and never per job. Empty is unset and is the
+     * ordinary state: no flag is passed and the behaviour is what shipped
+     * before. Both keys are optional, so a policy written before A12.0 is still
+     * a complete policy. */
+    char planner_model[ATLAS_ORCH_NAME_MAX + 1u];
+    char executor_model[ATLAS_ORCH_NAME_MAX + 1u];
+
     char detail[256];
 } atlas_orchpolicy;
 

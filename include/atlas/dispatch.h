@@ -16,6 +16,7 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#include "atlas/driver.h"
 #include "atlas/error.h"
 
 typedef struct atlas_dispatch_opts {
@@ -43,6 +44,11 @@ typedef struct atlas_dispatch_opts {
      * session already logged in under its HOME. From the policy, never inferred
      * from the process's uid. */
     bool operator_session;
+    /* A12.0. The model name each role runs under, from the root-owned policy.
+     * Which of them an attempt uses is decided by the driver's role and by
+     * nothing else — `atlas_driver_model_for`. Both empty is the ordinary state
+     * and passes no flag. */
+    atlas_driver_models models;
     /* Comma-separated driver names this dispatcher will run. NULL means any.
      * Sent with each lease request and matched against the job's stored
      * driver. */

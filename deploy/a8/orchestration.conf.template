@@ -52,3 +52,12 @@ worker_root = /var/lib/atlas-worker
 # enabling live model execution is a deliberate act, not a consequence of
 # installing a policy.
 live_model = off
+
+# Which model each role runs under, named here because a worker must not choose
+# what it is judged by. A role is a property of the driver — a planner writes
+# plans, an executor changes a tree — so the choice is per role and never per
+# job. Both keys are optional; unset passes no model flag at all and leaves the
+# worker on the account's own default, which is what every run before A12.0 did.
+# The value is one token of [a-z0-9._-], at most 64 characters.
+#planner_model = fable
+#executor_model = opus

@@ -44,6 +44,37 @@
 /* Bounds on what a driver may say about itself. */
 #define ATLAS_DRIVER_VERSION_MAX 128u
 
+/* The size an argument vector for the Claude Code CLI has to have room for:
+ * every fixed flag, the optional model pair, the task, and the NULL. */
+#define ATLAS_DRIVER_CLAUDE_ARGV_MAX 10u
+
+/* A12.0. What a driver is *for*, which is not the same question as where it
+ * works or whether it needs a model.
+ *
+ * The role exists because two decisions have to be made about a driver by name:
+ * which model the operator's policy runs it under, and — from a later part of
+ * this season — whether a job's output may be read as a plan revision. Both are
+ * properties of the work, so both hang off one declared value rather than off a
+ * name comparison somewhere.
+ *
+ * NONE is zero: a driver that declares nothing has no role, rather than a
+ * plausible one. */
+typedef enum atlas_driver_role {
+    ATLAS_DRIVER_ROLE_NONE = 0,
+    ATLAS_DRIVER_ROLE_PLANNER,
+    ATLAS_DRIVER_ROLE_EXECUTOR
+} atlas_driver_role;
+
+/* The model name each role runs under, as the root-owned orchestration policy
+ * named it. Empty or NULL is unset, and unset means no model flag is passed at
+ * all — the account's own default, which is the behaviour that shipped before
+ * A12.0. Carried as pointers into the caller's loaded policy, which outlives the
+ * synchronous driver call. */
+typedef struct atlas_driver_models {
+    const char *planner;
+    const char *executor;
+} atlas_driver_models;
+
 /* The ref `fake-repo` points HEAD at when its task text asks it to move HEAD,
  * which is what a worker that committed or checked out looks like from above.
  * Named here rather than spelled twice, because the fixture that places the ref
@@ -75,6 +106,16 @@ typedef struct atlas_driver_req {
      * driver is what it is for; never interpreted by Atlas. */
     const char *task;
     const char *mode;
+    /* A12.0. Which model this attempt runs under, or NULL/empty for none —
+     * which passes no flag and leaves the CLI on its own default.
+     *
+     * Resolved by the caller from the root-owned policy and the driver's role,
+     * through `atlas_driver_model_for`. It is never taken from the task text, a
+     * submission, the environment or anything a model produced: a worker that
+     * could choose its own model could choose the one that judges it most
+     * kindly. The value is a checked policy token, and it reaches the child as
+     * its own argv element. */
+    const char *model;
     int64_t wall_timeout_ms;
     int64_t idle_timeout_ms;
     int64_t max_output_bytes;
@@ -141,8 +182,22 @@ typedef struct atlas_driver {
     /* True when this driver calls a live model, and so needs `live_model` in
      * the policy. */
     bool needs_live_model;
+    /* A12.0. What this driver is for, and so which of the policy's model names
+     * it runs under. Stated on every entry, including the ones whose role is
+     * NONE: the table is where a reader learns what a driver is, and a value
+     * arrived at by leaving a field out is one nobody decided. */
+    atlas_driver_role role;
     atlas_status (*run)(const atlas_driver_req *req, atlas_driver_res *res, atlas_err *err);
 } atlas_driver;
+
+/* The one implementation of "which model does this driver run under?".
+ *
+ * PLANNER takes the policy's planner name, EXECUTOR its executor name, and NONE
+ * takes nothing. Never NULL: the answer for "no model was named" is the empty
+ * string, so no caller has to decide what an absence dereferences to. Two call
+ * sites fill `atlas_driver_req.model` — the foreground run driver and the
+ * background dispatcher — and one function is what keeps them from drifting. */
+const char *atlas_driver_model_for(const atlas_driver *d, const atlas_driver_models *m);
 
 /* Whether a driver works in the registered repository's own tree is **not** a
  * member of this struct. It is `atlas_orch_driver_is_repo_tree`, in the
@@ -165,6 +220,25 @@ typedef struct atlas_driver {
  * stops a worker. Exposed because it is the one implementation of the rule and
  * a test that restated it would pass by agreeing with itself. */
 bool atlas_driver_progress_line_is_event(const char *line, size_t len);
+
+/* A12.0. The argument vector the Claude Code drivers execute, built where a
+ * test can read it.
+ *
+ * Pure: it allocates nothing, copies nothing and reads only `req->task` and
+ * `req->model`. Exposed for the reason `atlas_driver_progress_line_is_event` is
+ * — it is the one implementation of a rule worth asserting exactly, and a test
+ * that restated the vector would pass by agreeing with itself. The rule is that
+ * the task is the **last** element and stays one element, and that `--model`
+ * appears only when the policy named a model.
+ *
+ * Fills `argv_out[0..n-1]` with pointers borrowed from `exe` and `req`, writes
+ * a NULL at `argv_out[n]`, and returns `n`. Returns 0 — leaving `argv_out[0]`
+ * NULL when there is room for it — when it cannot build a complete vector: no
+ * executable, no task, or a capacity below what this vector needs. A short
+ * vector is refused rather than truncated, because a truncated one would run a
+ * worker with no task. */
+size_t atlas_driver_claude_build_argv(const atlas_driver_req *req, const char *exe,
+                                      const char **argv_out, size_t cap);
 
 const atlas_driver *atlas_driver_find(const char *name);
 

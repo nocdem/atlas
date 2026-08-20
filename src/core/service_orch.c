@@ -460,6 +460,11 @@ atlas_status atlas_service_dispatcher_run(bool once, FILE *log, atlas_err *err) 
      * lease while working. */
     o.heartbeat_ms = ATLAS_ORCH_LEASE_MS / 4;
     o.live_model = op.live_model;
+    /* A12.0. Which model each role runs under. Read from the root-owned policy
+     * here and carried unchanged; the driver's role picks one of the two at the
+     * attempt. Empty is unset and passes no flag at all. */
+    o.models.planner = op.planner_model;
+    o.models.executor = op.executor_model;
     o.max_iterations = once ? 1 : 0;
     o.log = log;
     return atlas_dispatch_run(&o, err);
@@ -1091,6 +1096,10 @@ atlas_status atlas_service_job_run(atlas_ctx *ctx, const atlas_job_run_opts *o,
         ro.live_model = pol.live_model;
         ro.operator_session = atlas_orchpolicy_is_model_dispatcher(&pol, (long long)getuid()) &&
                               pol.model_uses_operator_session;
+        /* A12.0. The same two names the background dispatcher is given, from the
+         * same root-owned policy. `pol` outlives this synchronous call. */
+        ro.models.planner = pol.planner_model;
+        ro.models.executor = pol.executor_model;
         /* A11.5a-R. Where a finished worker's result is made durable before the
          * daemon is asked to accept it. The path comes from the root-owned
          * policy — the same field that already says where this dispatcher owns

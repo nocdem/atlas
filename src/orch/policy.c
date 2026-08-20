@@ -7,6 +7,13 @@
  * assignment, it is the last statement of the loader, and every path that does
  * not reach it leaves the struct as `memset` left it — which is disabled,
  * because disabled is zero. That is A7.1's shape and it is deliberate.
+ *
+ * A12.0 split the *reading* of the keys out of the loader as
+ * `atlas_orchpolicy_parse_bytes` (`policy_internal.h`), so the key rules can be
+ * tested by a process that is not root and therefore cannot write a file the
+ * path walk would accept. The split moved nothing: the parse function never
+ * touches `state`, so the assignment above is still the only one and is still
+ * reached only after the walk.
  */
 #define _GNU_SOURCE 1
 
@@ -18,6 +25,7 @@
 #include <unistd.h>
 
 #include "atlas/rootpath.h"
+#include "policy_internal.h"
 
 #define ORCHPOLICY_MAX_BYTES 8192u
 
@@ -181,53 +189,14 @@ static bool push_name(char table[][ATLAS_ORCH_NAME_MAX + 1u], size_t cap, size_t
     return true;
 }
 
-void atlas_orchpolicy_load_at(const char *path, atlas_orchpolicy *out) {
-    memset(out, 0, sizeof(*out));
-    out->state = ATLAS_ORCHPOLICY_DISABLED;
-    out->reason = ATLAS_ORCHPOLICY_REASON_ABSENT;
-
-    atlas_rootpath_result rr = ATLAS_ROOTPATH_UNKNOWN;
-    int fd = atlas_rootpath_open(path, false, &rr, out->detail, sizeof(out->detail));
-    if (fd < 0) {
-        switch (rr) {
-        case ATLAS_ROOTPATH_MISSING: out->reason = ATLAS_ORCHPOLICY_REASON_ABSENT; break;
-        case ATLAS_ROOTPATH_SYMLINK:
-        case ATLAS_ROOTPATH_BAD_PATH: out->reason = ATLAS_ORCHPOLICY_REASON_PATH_UNSAFE; break;
-        case ATLAS_ROOTPATH_NOT_REGULAR:
-        case ATLAS_ROOTPATH_NOT_DIRECTORY:
-            out->reason = ATLAS_ORCHPOLICY_REASON_MALFORMED;
-            break;
-        case ATLAS_ROOTPATH_UNKNOWN:
-        case ATLAS_ROOTPATH_OK:
-        case ATLAS_ROOTPATH_WRITABLE: out->reason = ATLAS_ORCHPOLICY_REASON_WRITABLE; break;
-        }
-        return;
-    }
-
-    char buf[ORCHPOLICY_MAX_BYTES];
-    size_t total = 0;
-    while (total < sizeof(buf)) {
-        ssize_t got = read(fd, buf + total, sizeof(buf) - total);
-        if (got < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            (void)close(fd);
-            out->reason = ATLAS_ORCHPOLICY_REASON_MALFORMED;
-            return;
-        }
-        if (got == 0) {
-            break;
-        }
-        total += (size_t)got;
-    }
-    (void)close(fd);
-    if (total == sizeof(buf)) {
-        out->reason = ATLAS_ORCHPOLICY_REASON_MALFORMED;
-        return;
-    }
-
+atlas_orchpolicy_reason atlas_orchpolicy_parse_bytes(const char *buf, size_t total,
+                                                     atlas_orchpolicy *out) {
     bool have_dispatcher = false;
+    /* A12.0. The two model keys are singletons for `dispatcher_uid`'s reason:
+     * which of two values Atlas would use is not a question a policy may leave
+     * to the order its lines happen to be in. */
+    bool have_planner_model = false;
+    bool have_executor_model = false;
     size_t i = 0;
     while (i < total) {
         size_t start = i;
@@ -249,10 +218,9 @@ void atlas_orchpolicy_load_at(const char *path, atlas_orchpolicy *out) {
         const char *val = NULL;
         size_t vlen = 0;
 
-#define BAD()                                              \
-    do {                                                   \
-        out->reason = ATLAS_ORCHPOLICY_REASON_MALFORMED;   \
-        return;                                            \
+#define BAD()                                          \
+    do {                                               \
+        return ATLAS_ORCHPOLICY_REASON_MALFORMED;      \
     } while (0)
 
         if (take_value(line, len, "dispatcher_uid", &val, &vlen)) {
@@ -331,6 +299,22 @@ void atlas_orchpolicy_load_at(const char *path, atlas_orchpolicy *out) {
                  * this key decides whose credentials a model process uses. */
                 BAD();
             }
+        } else if (take_value(line, len, "planner_model", &val, &vlen)) {
+            /* Held to the same token shape a specification's names are, so a
+             * policy can never introduce a value a job could not legally carry
+             * — and so the value that reaches a child's argument vector is one
+             * Atlas has already checked, rather than one it merely quoted. */
+            if (have_planner_model || !is_name(val, vlen) ||
+                !copy_value(out->planner_model, sizeof(out->planner_model), val, vlen)) {
+                BAD();
+            }
+            have_planner_model = true;
+        } else if (take_value(line, len, "executor_model", &val, &vlen)) {
+            if (have_executor_model || !is_name(val, vlen) ||
+                !copy_value(out->executor_model, sizeof(out->executor_model), val, vlen)) {
+                BAD();
+            }
+            have_executor_model = true;
         } else if (take_value(line, len, "live_model", &val, &vlen)) {
             if (vlen == 2u && strncmp(val, "on", 2u) == 0) {
                 out->live_model = true;
@@ -357,8 +341,7 @@ void atlas_orchpolicy_load_at(const char *path, atlas_orchpolicy *out) {
      * leave a decision to a default nobody wrote down. */
     if (!have_dispatcher || out->submitter_count == 0 || out->repo_count == 0 ||
         out->mode_count == 0 || out->driver_count == 0 || out->worker_root[0] == '\0') {
-        out->reason = ATLAS_ORCHPOLICY_REASON_MALFORMED;
-        return;
+        return ATLAS_ORCHPOLICY_REASON_MALFORMED;
     }
     /* The *worker* dispatcher may not also be a submitter. Keeping those two
      * disjoint is what makes "an ordinary client cannot forge a dispatcher
@@ -372,8 +355,7 @@ void atlas_orchpolicy_load_at(const char *path, atlas_orchpolicy *out) {
      * would only stop the operator submitting the jobs they intend to run. */
     for (size_t k = 0; k < out->submitter_count; k++) {
         if (out->submitter_uids[k] == out->dispatcher_uid) {
-            out->reason = ATLAS_ORCHPOLICY_REASON_MALFORMED;
-            return;
+            return ATLAS_ORCHPOLICY_REASON_MALFORMED;
         }
     }
     if (out->model_dispatcher_uid != 0) {
@@ -381,14 +363,12 @@ void atlas_orchpolicy_load_at(const char *path, atlas_orchpolicy *out) {
          * write, and it must not be the worker's root. */
         if (out->model_worker_root[0] == '\0' ||
             strcmp(out->model_worker_root, out->worker_root) == 0) {
-            out->reason = ATLAS_ORCHPOLICY_REASON_MALFORMED;
-            return;
+            return ATLAS_ORCHPOLICY_REASON_MALFORMED;
         }
         if (out->model_dispatcher_uid == out->dispatcher_uid) {
             /* One uid cannot be both, or the driver filter would be the only
              * thing keeping model work off the untrusted account. */
-            out->reason = ATLAS_ORCHPOLICY_REASON_MALFORMED;
-            return;
+            return ATLAS_ORCHPOLICY_REASON_MALFORMED;
         }
     }
     /* Ceilings default to the compiled-in absolutes when unset, and may only
@@ -410,17 +390,70 @@ void atlas_orchpolicy_load_at(const char *path, atlas_orchpolicy *out) {
         if (*caps[k].field == 0) {
             *caps[k].field = caps[k].absolute;
         } else if (*caps[k].field > caps[k].absolute) {
-            out->reason = ATLAS_ORCHPOLICY_REASON_MALFORMED;
-            return;
+            return ATLAS_ORCHPOLICY_REASON_MALFORMED;
         }
     }
     if (out->max_idle_timeout_ms > out->max_wall_timeout_ms) {
+        return ATLAS_ORCHPOLICY_REASON_MALFORMED;
+    }
+
+    return ATLAS_ORCHPOLICY_REASON_ACTIVE;
+}
+
+void atlas_orchpolicy_load_at(const char *path, atlas_orchpolicy *out) {
+    memset(out, 0, sizeof(*out));
+    out->state = ATLAS_ORCHPOLICY_DISABLED;
+    out->reason = ATLAS_ORCHPOLICY_REASON_ABSENT;
+
+    atlas_rootpath_result rr = ATLAS_ROOTPATH_UNKNOWN;
+    int fd = atlas_rootpath_open(path, false, &rr, out->detail, sizeof(out->detail));
+    if (fd < 0) {
+        switch (rr) {
+        case ATLAS_ROOTPATH_MISSING: out->reason = ATLAS_ORCHPOLICY_REASON_ABSENT; break;
+        case ATLAS_ROOTPATH_SYMLINK:
+        case ATLAS_ROOTPATH_BAD_PATH: out->reason = ATLAS_ORCHPOLICY_REASON_PATH_UNSAFE; break;
+        case ATLAS_ROOTPATH_NOT_REGULAR:
+        case ATLAS_ROOTPATH_NOT_DIRECTORY:
+            out->reason = ATLAS_ORCHPOLICY_REASON_MALFORMED;
+            break;
+        case ATLAS_ROOTPATH_UNKNOWN:
+        case ATLAS_ROOTPATH_OK:
+        case ATLAS_ROOTPATH_WRITABLE: out->reason = ATLAS_ORCHPOLICY_REASON_WRITABLE; break;
+        }
+        return;
+    }
+
+    char buf[ORCHPOLICY_MAX_BYTES];
+    size_t total = 0;
+    while (total < sizeof(buf)) {
+        ssize_t got = read(fd, buf + total, sizeof(buf) - total);
+        if (got < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            (void)close(fd);
+            out->reason = ATLAS_ORCHPOLICY_REASON_MALFORMED;
+            return;
+        }
+        if (got == 0) {
+            break;
+        }
+        total += (size_t)got;
+    }
+    (void)close(fd);
+    if (total == sizeof(buf)) {
+        /* A policy that filled the buffer is one Atlas may have read only part
+         * of, and half a policy is not a smaller policy. */
         out->reason = ATLAS_ORCHPOLICY_REASON_MALFORMED;
         return;
     }
 
-    out->reason = ATLAS_ORCHPOLICY_REASON_ACTIVE;
-    out->state = ATLAS_ORCHPOLICY_ENABLED;
+    /* The keys are read only now, after the walk has established that nobody
+     * but root could have written them. */
+    out->reason = atlas_orchpolicy_parse_bytes(buf, total, out);
+    if (out->reason == ATLAS_ORCHPOLICY_REASON_ACTIVE) {
+        out->state = ATLAS_ORCHPOLICY_ENABLED;
+    }
 }
 
 void atlas_orchpolicy_load(atlas_orchpolicy *out) {

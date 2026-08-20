@@ -794,6 +794,9 @@ static atlas_status run_attempt(attempt *a, atlas_err *err) {
         req.cancel_ud = a;
         req.live_model = o->live_model;
         req.operator_session = o->operator_session;
+        /* A12.0. The same helper the foreground run driver uses, so the two
+         * paths cannot disagree about which model a role runs under. */
+        req.model = atlas_driver_model_for(drv, &o->models);
         st = drv->run(&req, &dr, err);
     }
 

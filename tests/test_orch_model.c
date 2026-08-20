@@ -25,6 +25,7 @@
 #include "atlas/orch_ops.h"
 #include "atlas/orchpolicy.h"
 #include "atlas_test.h"
+#include "orch/policy_internal.h"
 #include "support/fixture.h"
 
 /* --- the vocabularies ------------------------------------------------------ */
@@ -732,6 +733,106 @@ static void test_no_unprivileged_shape_enables_orchestration(void) {
     fx_close(&fx);
 }
 
+/* --- A12.0: the model each role runs under ----------------------------------
+ *
+ * The key rules — one occurrence, a checked token, absent means unset — are
+ * asked of the parser directly, through `src/orch/policy_internal.h`.
+ *
+ * `atlas_orchpolicy_load_at` cannot reach them from here and that is not a gap
+ * in the test: this process is not root, so the path walk refuses every file it
+ * can create before a byte is parsed, which is exactly the property the case
+ * above proves. The parse seam is internal, sets no state, and enables nothing;
+ * only the loader may do that, and only after the file's provenance is
+ * established.
+ */
+#define POLICY_BASE                                                             \
+    "dispatcher_uid = 993\nsubmitter_uid = 1000\nrepo = proj\nmode = patch\n"    \
+    "driver = fake\nworker_root = /var/lib/atlas-worker\n"
+
+static atlas_orchpolicy_reason parse_policy(const char *text, atlas_orchpolicy *out) {
+    memset(out, 0, sizeof(*out));
+    return atlas_orchpolicy_parse_bytes(text, strlen(text), out);
+}
+
+static void test_a_policy_may_name_one_model_per_role(void) {
+    atlas_orchpolicy p;
+
+    /* Absent is the ordinary state: a policy written before this season parses
+     * exactly as it did, and both names read empty — which is "whatever the
+     * worker's own session defaults to", the behaviour that shipped. */
+    T_CHECK(parse_policy(POLICY_BASE, &p) == ATLAS_ORCHPOLICY_REASON_ACTIVE);
+    T_CHECK_MSG(p.planner_model[0] == '\0', "an absent planner_model parsed as \"%s\"",
+                p.planner_model);
+    T_CHECK_MSG(p.executor_model[0] == '\0', "an absent executor_model parsed as \"%s\"",
+                p.executor_model);
+    /* The parser never enables anything. The one `ENABLED` assignment is the
+     * loader's last statement, after the root-owned path walk. */
+    T_CHECK_MSG(p.state == ATLAS_ORCHPOLICY_DISABLED, "the parser enabled orchestration by itself");
+
+    T_CHECK(parse_policy(POLICY_BASE "planner_model = fable\nexecutor_model = opus-4-5\n", &p) ==
+            ATLAS_ORCHPOLICY_REASON_ACTIVE);
+    T_CHECK(strcmp(p.planner_model, "fable") == 0);
+    T_CHECK(strcmp(p.executor_model, "opus-4-5") == 0);
+
+    /* Each is independent of the other: naming one leaves the other unset
+     * rather than making the policy incomplete. */
+    T_CHECK(parse_policy(POLICY_BASE "planner_model = fable\n", &p) ==
+            ATLAS_ORCHPOLICY_REASON_ACTIVE);
+    T_CHECK(strcmp(p.planner_model, "fable") == 0);
+    T_CHECK(p.executor_model[0] == '\0');
+    T_CHECK(parse_policy(POLICY_BASE "executor_model = claude-opus-4-5-20251101\n", &p) ==
+            ATLAS_ORCHPOLICY_REASON_ACTIVE);
+    T_CHECK(strcmp(p.executor_model, "claude-opus-4-5-20251101") == 0);
+    T_CHECK(p.planner_model[0] == '\0');
+
+    /* The longest accepted name, exactly at the bound. */
+    char body[512];
+    char name[65];
+    memset(name, 'a', 64);
+    name[64] = '\0';
+    (void)snprintf(body, sizeof body, "%splanner_model = %s\n", POLICY_BASE, name);
+    T_CHECK_MSG(parse_policy(body, &p) == ATLAS_ORCHPOLICY_REASON_ACTIVE,
+                "a 64-character model name was refused");
+    T_CHECK(strcmp(p.planner_model, name) == 0);
+}
+
+static void test_a_model_name_atlas_half_understands_is_malformed(void) {
+    char over[512];
+    char toolong[66];
+    memset(toolong, 'a', 65);
+    toolong[65] = '\0';
+    (void)snprintf(over, sizeof over, "%splanner_model = %s\n", POLICY_BASE, toolong);
+
+    const char *const BAD[] = {
+        /* Twice is not once. Which of the two Atlas would use is a question a
+         * policy must never leave open — `dispatcher_uid`'s rule. */
+        POLICY_BASE "planner_model = fable\nplanner_model = opus\n",
+        POLICY_BASE "executor_model = fable\nexecutor_model = opus\n",
+        POLICY_BASE "planner_model = fable\nplanner_model = fable\n",
+        /* Outside the token shape a specification could legally carry. */
+        POLICY_BASE "planner_model = Opus\n",
+        POLICY_BASE "planner_model = opus 4\n",
+        POLICY_BASE "planner_model = ../opus\n",
+        POLICY_BASE "planner_model = opus/4\n",
+        POLICY_BASE "executor_model = opus\t4\n",
+        /* No value at all is not "unset"; it is a line whose author meant
+         * something Atlas cannot read. */
+        POLICY_BASE "planner_model =\n",
+        POLICY_BASE "planner_model = \n",
+        /* And a neighbouring key Atlas does not know is still an error. */
+        POLICY_BASE "planner_models = opus\n",
+        POLICY_BASE "model = opus\n",
+        POLICY_BASE "planner = opus\n",
+        over,
+    };
+    for (size_t i = 0; i < sizeof BAD / sizeof BAD[0]; i++) {
+        atlas_orchpolicy p;
+        T_CHECK_MSG(parse_policy(BAD[i], &p) == ATLAS_ORCHPOLICY_REASON_MALFORMED,
+                    "shape %zu was not refused", i);
+        T_CHECK_MSG(p.state == ATLAS_ORCHPOLICY_DISABLED, "shape %zu enabled orchestration", i);
+    }
+}
+
 static void test_a_zeroed_policy_permits_nothing(void) {
     atlas_orchpolicy p;
     memset(&p, 0, sizeof(p));
@@ -779,6 +880,9 @@ static const atlas_test TESTS[] = {
     {"no unprivileged shape enables orchestration",
      test_no_unprivileged_shape_enables_orchestration},
     {"a zeroed policy permits nothing", test_a_zeroed_policy_permits_nothing},
+    {"a policy may name one model per role", test_a_policy_may_name_one_model_per_role},
+    {"a model name Atlas half understands is malformed",
+     test_a_model_name_atlas_half_understands_is_malformed},
 };
 
 ATLAS_TEST_MAIN("orch_model", TESTS)

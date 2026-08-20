@@ -48,6 +48,7 @@
 #include <stdio.h>
 
 #include "atlas/buf.h"
+#include "atlas/driver.h"
 #include "atlas/error.h"
 #include "atlas/orch.h"
 #include "atlas/orch_ops.h"
@@ -103,6 +104,12 @@ typedef struct atlas_rundriver_opts {
      * orchestration policy and neither is inferred from the process's uid. */
     bool live_model;
     bool operator_session;
+    /* A12.0. The model name each role runs under, from the root-owned policy.
+     * The driver's role selects which one an attempt is started with, through
+     * the one helper both this loop and the background dispatcher use. Both
+     * empty is the ordinary state: no flag is passed and the worker runs on the
+     * account's own default, which is every run that predates this season. */
+    atlas_driver_models models;
     /* Stop after this many claimed tasks. Zero means "until the run settles",
      * which is what the command does; a positive value is how a test drives
      * exactly one task without racing anything. The run's own worker-start

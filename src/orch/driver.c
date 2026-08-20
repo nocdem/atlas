@@ -3,7 +3,8 @@
  *
  * See atlas/driver.h for what a driver may and may not decide.
  *
- * Four drivers ship, in two pairs.
+ * Six drivers ship, in three pairs, and every pair is a real driver beside a
+ * deterministic double that stands exactly where it stands.
  *
  * A8's pair works inside an isolated job workspace: a deterministic `fake` that
  * runs entirely in process, and `claude`, which executes the installed Claude
@@ -19,6 +20,13 @@
  * foreground run driver is the only thing in Atlas that asks. `fake-repo`
  * stands in the same relation to `claude-repo` that `fake` does to `claude`,
  * and for the same reason.
+ *
+ * A12.0's pair, `claude-plan` and `fake-plan`, works in a job workspace like
+ * A8's and produces a plan artifact rather than a change. What separates it
+ * from A8's pair is not where it runs but what it is *for*: `atlas_driver.role`
+ * says so, the root-owned policy names a model per role, and — from a later part
+ * of this season — a plan revision may only come from a job whose driver holds
+ * the planner role.
  */
 #define _GNU_SOURCE 1
 
@@ -443,6 +451,60 @@ static atlas_status read_service_credential(atlas_buf *out, bool *present_out, a
     return ATLAS_OK;
 }
 
+size_t atlas_driver_claude_build_argv(const atlas_driver_req *req, const char *exe,
+                                      const char **argv_out, size_t cap) {
+    if (argv_out == NULL || cap == 0) {
+        return 0;
+    }
+    argv_out[0] = NULL;
+    if (req == NULL || exe == NULL || exe[0] == '\0' || req->task == NULL) {
+        /* Refused rather than approximated. A vector without a task would run a
+         * worker with no instructions, and a vector without an executable is
+         * not a vector. */
+        return 0;
+    }
+    const bool with_model = req->model != NULL && req->model[0] != '\0';
+    const size_t n = with_model ? 9u : 7u;
+    if (cap < n + 1u) {
+        return 0;
+    }
+    size_t k = 0;
+    argv_out[k++] = exe;
+    /* Noninteractive. `--print` is Claude Code's documented noninteractive
+     * mode. */
+    argv_out[k++] = "--print";
+    /* A11.5a-R2. Streamed, one JSON record per line, so Atlas can see the
+     * worker doing its work instead of inferring it from a silence that only
+     * ever ends. With the single-document format the CLI says nothing on stdout
+     * until it is finished, which made every long task look identical to a
+     * wedged one and killed two real workers at the idle bound while they were
+     * mid-turn. Verified against the installed 2.1.235: `stream-json` needs no
+     * other flag, and line one is still an object, so the malformed-result
+     * check in `claude_exec` is unaffected. */
+    argv_out[k++] = "--output-format";
+    argv_out[k++] = "stream-json";
+    /* The workspace is the boundary, and it is enforced by the OS: the
+     * dispatcher runs as `atlas-worker`, whose only writable path is its own
+     * runtime root. Permission prompts cannot be answered in a noninteractive
+     * run, so they are skipped here and the isolation is left to the account and
+     * the service sandbox — never to the model's cooperation. */
+    argv_out[k++] = "--permission-mode";
+    argv_out[k++] = "acceptEdits";
+    if (with_model) {
+        /* A12.0. The operator's choice, from the root-owned policy, as its own
+         * argv element. Absent entirely when no model was named, so a machine
+         * that configured none runs exactly the command that shipped before. */
+        argv_out[k++] = "--model";
+        argv_out[k++] = req->model;
+    }
+    /* Last, always. The task text is passed as a single argv element: it is
+     * never concatenated into a command line and never reaches a shell, so
+     * shell syntax inside it is inert — which is why A8 accepts it at all. */
+    argv_out[k++] = req->task;
+    argv_out[k] = NULL;
+    return k;
+}
+
 /* The Claude Code CLI, executed once, noninteractively.
  *
  * One implementation for both drivers that use it. What differs between them is
@@ -579,36 +641,23 @@ static atlas_status claude_exec(const atlas_driver_req *req, atlas_driver_res *r
     atlas_proc_result pr;
     memset(&pr, 0, sizeof(pr));
 
+    /* The vector is built by one pure function, so what a worker is actually
+     * executed with is a thing a test can read rather than a thing this
+     * function alone knows. */
+    const char *argv[ATLAS_DRIVER_CLAUDE_ARGV_MAX];
+    if (st == ATLAS_OK &&
+        atlas_driver_claude_build_argv(req, atlas_buf_cstr(&exe), argv,
+                                       ATLAS_DRIVER_CLAUDE_ARGV_MAX) == 0) {
+        st = atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                           "the driver's command line could not be built");
+        /* Classified below as a run that never started, which is what it is,
+         * and which is the one exit kind that keeps its status rather than
+         * being reported as an ordinary failed attempt. */
+        pr.exit_code = -1;
+    }
     if (st == ATLAS_OK) {
         /* Noninteractive, with the working directory set to the job's writable
-         * tree. `--print` is Claude Code's documented noninteractive mode.
-         *
-         * The task text is passed as a single argv element. It is never
-         * concatenated into a command line and never reaches a shell, so shell
-         * syntax inside it is inert — which is why A8 accepts it. */
-        const char *argv[] = {
-            atlas_buf_cstr(&exe),
-            "--print",
-            /* A11.5a-R2. Streamed, one JSON record per line, so Atlas can see
-             * the worker doing its work instead of inferring it from a silence
-             * that only ever ends. With the single-document format the CLI says
-             * nothing on stdout until it is finished, which made every long task
-             * look identical to a wedged one and killed two real workers at the
-             * idle bound while they were mid-turn. Verified against the
-             * installed 2.1.235: `stream-json` needs no other flag, and line one
-             * is still an object, so the malformed-result check below is
-             * unaffected. */
-            "--output-format", "stream-json",
-            /* The workspace is the boundary, and it is enforced by the OS: the
-             * dispatcher runs as `atlas-worker`, whose only writable path is its
-             * own runtime root. Permission prompts cannot be answered in a
-             * noninteractive run, so they are skipped here and the isolation is
-             * left to the account and the service sandbox — never to the
-             * model's cooperation. */
-            "--permission-mode", "acceptEdits",
-            req->task,
-            NULL,
-        };
+         * tree. */
         atlas_proc_opts opts;
         memset(&opts, 0, sizeof(opts));
         opts.argv = argv;
@@ -877,23 +926,139 @@ static atlas_status fake_repo_run(const atlas_driver_req *req, atlas_driver_res 
     return st;
 }
 
+/* --- A12.0: the two that produce a plan --------------------------------------
+ *
+ * Both work in an isolated workspace, like A8's pair and unlike A11.1's: a
+ * planner reads and writes a plan, and nothing about planning needs the
+ * registered repository's own tree. That is why neither name is in
+ * `atlas_orch_driver_is_repo_tree` and why this season adds no migration.
+ *
+ * What is new is the *role*. A plan revision may only come from a job whose
+ * driver is a planner, so `fake-plan` holds that role even though it needs no
+ * model — it is the test vehicle for exactly that path, and a double that could
+ * not stand where the real one stands would prove nothing about it.
+ */
+static atlas_status claude_plan_run(const atlas_driver_req *req, atlas_driver_res *res,
+                                    atlas_err *err) {
+    atlas_status st = atlas_buf_set_str(&res->version, "claude-plan/1", err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (req->ws == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "the claude-plan driver runs in an isolated workspace and was given "
+                             "none");
+    }
+    return claude_exec(req, res, err);
+}
+
+/* The line that selects `fake-plan`'s behaviour, matched as a whole line and as
+ * an Atlas literal, so a real task text cannot select it by accident — the same
+ * arrangement `fake:` prefixes have. */
+#define FAKE_PLAN_MARKER "fake-plan-artifact:"
+
+/* Everything after the marker line, or NULL when there is no such line. An
+ * empty tail is a plan of no bytes and not a missing one: the rule is
+ * "everything after the line", and whether an empty plan is acceptable is a
+ * question for the layer that reads plans, not for a fixture. */
+static const char *fake_plan_body(const char *task) {
+    const size_t n = sizeof FAKE_PLAN_MARKER - 1u;
+    const char *line = task;
+    while (line != NULL) {
+        const char *nl = strchr(line, '\n');
+        size_t len = nl != NULL ? (size_t)(nl - line) : strlen(line);
+        if (len == n && strncmp(line, FAKE_PLAN_MARKER, n) == 0) {
+            return nl != NULL ? nl + 1u : line + len;
+        }
+        line = nl != NULL ? nl + 1u : NULL;
+    }
+    return NULL;
+}
+
+static atlas_status fake_plan_run(const atlas_driver_req *req, atlas_driver_res *res,
+                                  atlas_err *err) {
+    atlas_status st = atlas_buf_set_str(&res->version, "fake-plan/1", err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (req->ws == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "the fake-plan driver runs in an isolated workspace and was given "
+                             "none");
+    }
+    if (req->cancel != NULL && req->cancel(req->cancel_ud)) {
+        res->exit_kind = ATLAS_ORCH_EXIT_CANCELLED;
+        res->exit_code = -1;
+        return ATLAS_OK;
+    }
+
+    const char *body = fake_plan_body(req->task);
+    atlas_buf log = ATLAS_BUF_INIT;
+    if (body == NULL) {
+        /* No plan, and none invented. It ends as an ordinary failed attempt —
+         * a nonzero exit the layers above classify — rather than as an Atlas
+         * error, because a planner that produced nothing is a job that failed
+         * and not a daemon that broke. */
+        res->exit_kind = ATLAS_ORCH_EXIT_NONZERO;
+        res->exit_code = 1;
+        st = atlas_buf_set_str(&log, "fake-plan: the task carried no plan\n", err);
+    } else {
+        st = atlas_ws_write(req->ws, "artifacts/plan.atlas-plan", body, strlen(body), err);
+        if (st == ATLAS_OK) {
+            res->exit_kind = ATLAS_ORCH_EXIT_OK;
+            res->exit_code = 0;
+            res->stdout_bytes = (int64_t)strlen(body);
+            st = atlas_buf_appendf(&log, err, "fake-plan wrote %zu bytes of plan for job %s\n",
+                                   strlen(body), req->job_uid != NULL ? req->job_uid : "");
+        }
+    }
+    if (st == ATLAS_OK) {
+        st = store_log(req->ws, "logs/stdout.log", &log, &res->log, &res->redactions, err);
+    }
+    atlas_buf_free(&log);
+    return st;
+}
+
 /* --- the registry ----------------------------------------------------------- */
 
 static const atlas_driver DRIVER_FAKE = {
     .name = "fake", .version = "1", .needs_live_model = false,
-    .run = fake_run};
+    .role = ATLAS_DRIVER_ROLE_NONE, .run = fake_run};
 static const atlas_driver DRIVER_CLAUDE = {
     .name = "claude", .version = "1", .needs_live_model = true,
-    .run = claude_run};
+    .role = ATLAS_DRIVER_ROLE_EXECUTOR, .run = claude_run};
 static const atlas_driver DRIVER_CLAUDE_REPO = {
     .name = "claude-repo", .version = "1", .needs_live_model = true,
-    .run = claude_repo_run};
+    .role = ATLAS_DRIVER_ROLE_EXECUTOR, .run = claude_repo_run};
 static const atlas_driver DRIVER_FAKE_REPO = {
     .name = "fake-repo", .version = "1", .needs_live_model = false,
-    .run = fake_repo_run};
+    .role = ATLAS_DRIVER_ROLE_NONE, .run = fake_repo_run};
+static const atlas_driver DRIVER_CLAUDE_PLAN = {
+    .name = "claude-plan", .version = "1", .needs_live_model = true,
+    .role = ATLAS_DRIVER_ROLE_PLANNER, .run = claude_plan_run};
+static const atlas_driver DRIVER_FAKE_PLAN = {
+    .name = "fake-plan", .version = "1", .needs_live_model = false,
+    .role = ATLAS_DRIVER_ROLE_PLANNER, .run = fake_plan_run};
 
-static const atlas_driver *const DRIVERS[] = {&DRIVER_FAKE, &DRIVER_CLAUDE, &DRIVER_CLAUDE_REPO,
-                                              &DRIVER_FAKE_REPO};
+static const atlas_driver *const DRIVERS[] = {&DRIVER_FAKE,      &DRIVER_CLAUDE,
+                                              &DRIVER_CLAUDE_REPO, &DRIVER_FAKE_REPO,
+                                              &DRIVER_CLAUDE_PLAN, &DRIVER_FAKE_PLAN};
+
+const char *atlas_driver_model_for(const atlas_driver *d, const atlas_driver_models *m) {
+    const char *name = NULL;
+    if (d != NULL && m != NULL) {
+        /* No `default:`, deliberately: a role added later is a compile error
+         * here rather than a driver that silently runs on no model. */
+        switch (d->role) {
+        case ATLAS_DRIVER_ROLE_PLANNER: name = m->planner; break;
+        case ATLAS_DRIVER_ROLE_EXECUTOR: name = m->executor; break;
+        case ATLAS_DRIVER_ROLE_NONE: name = NULL; break;
+        }
+    }
+    /* Empty, never NULL. "No model was named" is an answer every caller can
+     * pass along without deciding what an absence dereferences to. */
+    return name != NULL ? name : "";
+}
 
 const atlas_driver *const *atlas_drivers(size_t *count_out) {
     if (count_out != NULL) {

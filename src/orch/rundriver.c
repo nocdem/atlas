@@ -1118,6 +1118,10 @@ static atlas_status drive_one(const atlas_rundriver_opts *o, const atlas_orch_ru
             req.max_output_bytes = c.max_output_bytes;
             req.live_model = o->live_model;
             req.operator_session = o->operator_session;
+            /* A12.0. Which model this worker runs under, decided by the
+             * driver's role and the root-owned policy — never by the task, the
+             * chain, or anything the previous worker said. */
+            req.model = atlas_driver_model_for(d, &o->models);
             /* Polled while the child runs: it renews the lease and is how the
              * child learns of a cancellation. Without it a worker that takes
              * longer than one lease loses the attempt underneath itself. */

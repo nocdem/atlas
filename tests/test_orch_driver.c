@@ -243,6 +243,279 @@ static void test_the_claude_driver_refuses_without_policy_or_credential(void) {
     denv_close(&e);
 }
 
+/* --- A12.0: the role a driver has, and the model that follows from it --------
+ *
+ * A role is a property of the driver, and the *name* of the model each role runs
+ * under comes from the root-owned policy. No model name appears in `src/`, so
+ * what is asserted here is the mapping and never a value.
+ */
+static void test_every_driver_declares_the_role_it_works_in(void) {
+    struct {
+        const char *name;
+        atlas_driver_role role;
+        bool live;
+    } WANT[] = {
+        {"fake", ATLAS_DRIVER_ROLE_NONE, false},
+        {"claude", ATLAS_DRIVER_ROLE_EXECUTOR, true},
+        {"claude-repo", ATLAS_DRIVER_ROLE_EXECUTOR, true},
+        {"fake-repo", ATLAS_DRIVER_ROLE_NONE, false},
+        {"claude-plan", ATLAS_DRIVER_ROLE_PLANNER, true},
+        /* The no-model test double for the planner path: it produces a plan
+         * artifact, so it has to hold the role a revision will be required to
+         * come from, and it needs no model to do it. */
+        {"fake-plan", ATLAS_DRIVER_ROLE_PLANNER, false},
+    };
+    /* NONE is zero, so a driver that never states a role has no role rather
+     * than a plausible one. */
+    T_EQ_INT((int)ATLAS_DRIVER_ROLE_NONE, 0);
+    for (size_t i = 0; i < sizeof WANT / sizeof WANT[0]; i++) {
+        const atlas_driver *d = atlas_driver_find(WANT[i].name);
+        T_REQUIRE(d != NULL);
+        T_CHECK_MSG(d->role == WANT[i].role, "%s declares role %d, wanted %d", WANT[i].name,
+                    (int)d->role, (int)WANT[i].role);
+        T_CHECK_MSG(d->needs_live_model == WANT[i].live, "%s declares the wrong model need",
+                    WANT[i].name);
+    }
+    /* Neither new driver works in the registered repository's own tree. That is
+     * the one list, it did not move, and nothing here may widen it. */
+    T_CHECK(!atlas_orch_driver_is_repo_tree("claude-plan"));
+    T_CHECK(!atlas_orch_driver_is_repo_tree("fake-plan"));
+}
+
+static void test_the_model_a_driver_runs_under_follows_its_role(void) {
+    atlas_driver_models m;
+    m.planner = "plan-model";
+    m.executor = "exec-model";
+    struct {
+        const char *name;
+        const char *want;
+    } CASES[] = {
+        {"claude-plan", "plan-model"}, {"fake-plan", "plan-model"},
+        {"claude", "exec-model"},      {"claude-repo", "exec-model"},
+        {"fake", ""},                  {"fake-repo", ""},
+    };
+    for (size_t i = 0; i < sizeof CASES / sizeof CASES[0]; i++) {
+        const atlas_driver *d = atlas_driver_find(CASES[i].name);
+        T_REQUIRE(d != NULL);
+        const char *got = atlas_driver_model_for(d, &m);
+        T_REQUIRE(got != NULL);
+        T_CHECK_MSG(strcmp(got, CASES[i].want) == 0, "%s would run under \"%s\", wanted \"%s\"",
+                    CASES[i].name, got, CASES[i].want);
+    }
+    /* A policy that named no model leaves every driver where it was: on
+     * whatever the account's own session defaults to. Empty, never NULL, so a
+     * caller cannot dereference the absence. */
+    atlas_driver_models none;
+    memset(&none, 0, sizeof(none));
+    T_CHECK(strcmp(atlas_driver_model_for(atlas_driver_find("claude"), &none), "") == 0);
+    T_CHECK(strcmp(atlas_driver_model_for(atlas_driver_find("claude-plan"), NULL), "") == 0);
+    T_CHECK(strcmp(atlas_driver_model_for(NULL, &m), "") == 0);
+}
+
+static void test_the_model_flag_is_absent_unless_the_policy_named_one(void) {
+    /* The argument vector is built where a test can see it, because the whole
+     * of "a worker runs under the model the operator chose" is one element pair
+     * in a vector that must otherwise not move — the task stays last, and it is
+     * still one element that never reaches a shell. */
+    denv e;
+    denv_open(&e);
+    static const char *const TASK = "$(id); do the thing";
+    const char *argv[ATLAS_DRIVER_CLAUDE_ARGV_MAX];
+    atlas_driver_req req;
+    fill_req(&e, &req, TASK);
+
+    size_t n = atlas_driver_claude_build_argv(&req, "/usr/bin/claude", argv,
+                                              ATLAS_DRIVER_CLAUDE_ARGV_MAX);
+    T_REQUIRE(n >= 2u && n < ATLAS_DRIVER_CLAUDE_ARGV_MAX);
+    T_CHECK(argv[n] == NULL);
+    T_CHECK(strcmp(argv[0], "/usr/bin/claude") == 0);
+    T_CHECK_MSG(argv[n - 1u] == TASK, "the task is not the last argument");
+    for (size_t i = 0; i < n; i++) {
+        T_CHECK_MSG(strcmp(argv[i], "--model") != 0,
+                    "a model flag appeared although the policy named none");
+    }
+    size_t plain = n;
+
+    /* With a model named, exactly two elements are added: the flag and its
+     * value, in that order, before the task — which is still last. */
+    req.model = "fable";
+    n = atlas_driver_claude_build_argv(&req, "/usr/bin/claude", argv,
+                                       ATLAS_DRIVER_CLAUDE_ARGV_MAX);
+    T_CHECK_MSG(n == plain + 2u, "naming a model changed the vector by %zu elements",
+                n - plain);
+    T_CHECK(argv[n] == NULL);
+    T_CHECK_MSG(argv[n - 1u] == TASK, "the task is no longer the last argument");
+    size_t flag = 0;
+    size_t seen = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (strcmp(argv[i], "--model") == 0) {
+            flag = i;
+            seen++;
+        }
+    }
+    T_CHECK_MSG(seen == 1u, "the model flag appeared %zu times", seen);
+    T_REQUIRE(flag + 1u < n);
+    T_CHECK(strcmp(argv[flag + 1u], "fable") == 0);
+    T_CHECK_MSG(flag + 2u == n - 1u, "the model flag is not immediately before the task");
+
+    /* An empty name is not a model. It is a policy that named none. */
+    req.model = "";
+    n = atlas_driver_claude_build_argv(&req, "/usr/bin/claude", argv,
+                                       ATLAS_DRIVER_CLAUDE_ARGV_MAX);
+    T_CHECK(n == plain);
+    for (size_t i = 0; i < n; i++) {
+        T_CHECK(strcmp(argv[i], "--model") != 0);
+    }
+
+    /* A vector that cannot be built is refused rather than truncated: a short
+     * buffer would otherwise produce a run without its task. */
+    req.model = "fable";
+    T_CHECK(atlas_driver_claude_build_argv(&req, "/usr/bin/claude", argv, plain + 1u) == 0);
+    req.task = NULL;
+    T_CHECK(atlas_driver_claude_build_argv(&req, "/usr/bin/claude", argv,
+                                           ATLAS_DRIVER_CLAUDE_ARGV_MAX) == 0);
+    denv_close(&e);
+}
+
+/* --- A12.0: the planner's test double --------------------------------------- */
+
+static void read_artifact(denv *e, const char *rel, atlas_buf *out, bool *found) {
+    char path[4096];
+    (void)snprintf(path, sizeof path, "%s/%s", atlas_buf_cstr(&e->ws.artifacts), rel);
+    *found = false;
+    atlas_buf_reset(out);
+    FILE *f = fopen(path, "re");
+    if (f == NULL) {
+        return;
+    }
+    *found = true;
+    char chunk[1024];
+    size_t got = 0;
+    atlas_err err;
+    atlas_err_init(&err);
+    while ((got = fread(chunk, 1, sizeof chunk, f)) > 0) {
+        T_OK(atlas_buf_append(out, chunk, got, &err), &err);
+    }
+    (void)fclose(f);
+}
+
+static atlas_status run_fake_plan(denv *e, const char *task, atlas_driver_res *res,
+                                  atlas_err *err) {
+    atlas_driver_req req;
+    fill_req(e, &req, task);
+    atlas_driver_res_init(res);
+    const atlas_driver *d = atlas_driver_find("fake-plan");
+    T_REQUIRE(d != NULL);
+    return d->run(&req, res, err);
+}
+
+static void test_the_fake_plan_driver_emits_the_plan_it_was_given(void) {
+    /* Everything after the marker line, verbatim — including the bytes that
+     * would matter if anything ever parsed this, which nothing does here. The
+     * driver is a fixture: it exists so the plan pipeline can be driven with no
+     * model, no network and no credential. */
+    static const char TASK[] =
+        "write a plan for the thing\n"
+        "fake-plan-artifact:\n"
+        "stage 1\n  task: do the first thing\nstage 2\n";
+    static const char WANT[] = "stage 1\n  task: do the first thing\nstage 2\n";
+
+    denv e;
+    denv_open(&e);
+    atlas_err err;
+    atlas_err_init(&err);
+    atlas_driver_res res;
+    T_OK(run_fake_plan(&e, TASK, &res, &err), &err);
+    T_CHECK_MSG(res.exit_kind == ATLAS_ORCH_EXIT_OK, "the fake planner reported %s",
+                atlas_orch_exit_kind_name(res.exit_kind));
+    T_EQ_INT((int)res.exit_code, 0);
+    T_CHECK(strcmp(atlas_buf_cstr(&res.version), "fake-plan/1") == 0);
+
+    atlas_buf got = ATLAS_BUF_INIT;
+    bool found = false;
+    read_artifact(&e, "plan.atlas-plan", &got, &found);
+    T_CHECK_MSG(found, "the fake planner wrote no plan artifact");
+    T_CHECK_MSG(got.len == sizeof WANT - 1u && memcmp(got.data, WANT, got.len) == 0,
+                "the plan artifact is not what the task carried: \"%s\"", atlas_buf_cstr(&got));
+    atlas_buf_free(&got);
+    atlas_driver_res_free(&res);
+    denv_close(&e);
+}
+
+static void test_the_fake_plan_driver_fails_rather_than_inventing_a_plan(void) {
+    /* No marker, no plan. It fails as an ordinary job failure — a nonzero exit
+     * the layers above classify — rather than as an Atlas error, because a
+     * planner that produced nothing is a failed attempt and not a broken
+     * daemon. */
+    denv e;
+    denv_open(&e);
+    atlas_err err;
+    atlas_err_init(&err);
+    atlas_driver_res res;
+    T_OK(run_fake_plan(&e, "write a plan and say nothing useful", &res, &err), &err);
+    T_CHECK_MSG(res.exit_kind == ATLAS_ORCH_EXIT_NONZERO, "a planner with no plan reported %s",
+                atlas_orch_exit_kind_name(res.exit_kind));
+    atlas_buf got = ATLAS_BUF_INIT;
+    bool found = false;
+    read_artifact(&e, "plan.atlas-plan", &got, &found);
+    T_CHECK_MSG(!found, "a planner that produced no plan still wrote one");
+    atlas_buf_free(&got);
+    atlas_driver_res_free(&res);
+    denv_close(&e);
+
+    /* A marker with nothing after it is an empty plan, not a missing one: the
+     * rule is "everything after the line", and everything after it is nothing.
+     * Whether an empty plan is acceptable is the plan layer's question. */
+    denv e2;
+    denv_open(&e2);
+    atlas_driver_res res2;
+    T_OK(run_fake_plan(&e2, "here it is\nfake-plan-artifact:\n", &res2, &err), &err);
+    T_CHECK(res2.exit_kind == ATLAS_ORCH_EXIT_OK);
+    atlas_buf empty = ATLAS_BUF_INIT;
+    found = false;
+    read_artifact(&e2, "plan.atlas-plan", &empty, &found);
+    T_CHECK_MSG(found && empty.len == 0, "a bare marker did not produce an empty plan");
+    atlas_buf_free(&empty);
+    atlas_driver_res_free(&res2);
+    denv_close(&e2);
+
+    /* The marker is a line of its own, matched exactly. A mention of it inside
+     * the prose is prose. */
+    denv e3;
+    denv_open(&e3);
+    atlas_driver_res res3;
+    T_OK(run_fake_plan(&e3, "do not write fake-plan-artifact: here\n", &res3, &err), &err);
+    T_CHECK_MSG(res3.exit_kind == ATLAS_ORCH_EXIT_NONZERO,
+                "a mention of the marker inside a line selected the behaviour");
+    atlas_driver_res_free(&res3);
+    denv_close(&e3);
+}
+
+static void test_the_workspace_planners_refuse_without_a_workspace(void) {
+    /* Both plan drivers work in an isolated workspace. Given none, they refuse
+     * rather than falling back to a directory nobody chose — the rule A8's
+     * `claude` driver follows, and the reason neither is a repo-tree driver. */
+    atlas_driver_req req;
+    memset(&req, 0, sizeof(req));
+    req.job_uid = JOB_D;
+    req.attempt_no = 1;
+    req.task = "fake-plan-artifact:\nstage 1\n";
+    req.mode = "patch";
+    req.live_model = true;
+    static const char *const NAMES[] = {"fake-plan", "claude-plan"};
+    for (size_t i = 0; i < sizeof NAMES / sizeof NAMES[0]; i++) {
+        const atlas_driver *d = atlas_driver_find(NAMES[i]);
+        T_REQUIRE(d != NULL);
+        atlas_driver_res res;
+        atlas_driver_res_init(&res);
+        atlas_err err;
+        atlas_err_init(&err);
+        T_CHECK_MSG(d->run(&req, &res, &err) != ATLAS_OK, "%s ran without a workspace",
+                    NAMES[i]);
+        atlas_driver_res_free(&res);
+    }
+}
+
 /* --- the execution boundary ---------------------------------------------------- */
 
 static void test_structured_argv_reaches_a_child_unchanged(void) {
@@ -522,6 +795,18 @@ static const atlas_test TESTS[] = {
     {"cancellation is asked for, not signalled", test_cancellation_is_asked_for_not_signalled},
     {"the claude driver refuses without policy or credential",
      test_the_claude_driver_refuses_without_policy_or_credential},
+    {"every driver declares the role it works in",
+     test_every_driver_declares_the_role_it_works_in},
+    {"the model a driver runs under follows its role",
+     test_the_model_a_driver_runs_under_follows_its_role},
+    {"the model flag is absent unless the policy named one",
+     test_the_model_flag_is_absent_unless_the_policy_named_one},
+    {"the fake plan driver emits the plan it was given",
+     test_the_fake_plan_driver_emits_the_plan_it_was_given},
+    {"the fake plan driver fails rather than inventing a plan",
+     test_the_fake_plan_driver_fails_rather_than_inventing_a_plan},
+    {"the workspace planners refuse without a workspace",
+     test_the_workspace_planners_refuse_without_a_workspace},
     {"structured argv reaches a child unchanged",
      test_structured_argv_reaches_a_child_unchanged},
     {"the child environment is only what Atlas built",

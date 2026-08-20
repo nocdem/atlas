@@ -650,6 +650,14 @@ static atlas_status xport_apply(void *ud, const atlas_orch_op *op, atlas_orch_re
     atlas_ipc_response *resp = NULL;
     if (st == ATLAS_OK) {
         st = atlas_ipc_response_parse(raw.data, raw.len, &resp, err);
+        if (st != ATLAS_OK) {
+            /* A12.0. Bytes that are not a response document are not an answer,
+             * whatever else they are: the request may have been applied and this
+             * caller cannot tell. Same claim as a read that timed out, so the
+             * same mark — and never the mark on the line below, which is the
+             * daemon answering. */
+            atlas_err_mark_transport(err);
+        }
     }
     if (st == ATLAS_OK && !atlas_ipc_response_ok(resp)) {
         st = atlas_err_set(err, atlas_ipc_response_status(resp), "%s: %s", method,
@@ -742,6 +750,9 @@ static atlas_status xport_run_get(void *ud, const char *run_uid, atlas_orch_run_
     atlas_ipc_response *resp = NULL;
     if (st == ATLAS_OK) {
         st = atlas_ipc_response_parse(raw.data, raw.len, &resp, err);
+        if (st != ATLAS_OK) {
+            atlas_err_mark_transport(err);
+        }
     }
     if (st == ATLAS_OK && !atlas_ipc_response_ok(resp)) {
         st = atlas_err_set(err, atlas_ipc_response_status(resp), "%s",

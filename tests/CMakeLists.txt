@@ -146,6 +146,7 @@ set(ATLAS_TESTS
   test_orch_parallel
   test_a11_run
   test_a11_head_drift
+  test_orch_transport
   test_orch_validation_wire
   test_orch_usage
   test_orch_memory
@@ -332,6 +333,11 @@ set_tests_properties(test_a11_run PROPERTIES LABELS "integration")
 # The step 6 suite builds a real fixture repository with a second real commit,
 # drives one worker that moves HEAD onto it, and proves the gates never ran.
 set_tests_properties(test_a11_head_drift PROPERTIES LABELS "integration")
+# A12.0's transport recovery. Real repository, real worker, real settlement, and
+# a fixture transport that loses selected answers on purpose. It waits a
+# millisecond between attempts rather than the compiled two seconds, so the
+# recovery is what is measured and not the pause.
+set_tests_properties(test_orch_transport PROPERTIES LABELS "integration")
 # The RPC suite drives a live daemon to prove the negative enumeration still
 # holds and that a dispatcher method is unreachable from a client connection.
 set_tests_properties(test_orch_rpc PROPERTIES LABELS "daemon" TIMEOUT 900 RUN_SERIAL TRUE)

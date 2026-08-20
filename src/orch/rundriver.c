@@ -182,6 +182,40 @@ static void claimed_free(claimed *c) {
 #define RUN_BUSY_TRIES 12
 #define RUN_BUSY_PAUSE_MS 500
 
+/* A12.0. The other way a call fails, and the other claim it makes.
+ *
+ * `BUSY:` is the daemon saying it took nothing. A transport failure — the
+ * connect, the send, the read, a reply that was never a reply — says nothing at
+ * all about whether the request was processed, and A11.1 treated it as fatal to
+ * the invocation. Pilot A11.6-P lost a run to that twice: a congested serve loop
+ * timed out one frame-header read on a phase call, the foreground driver exited,
+ * the worker kept working, nobody renewed the lease, and the attempt was
+ * reclaimed underneath a process that was still editing the tree.
+ *
+ * So a lost answer is asked for again, on its own budget, and is never confused
+ * with a refusal — a refusal is an answer, and asking again gets the same one.
+ * The classification is `atlas_err_is_transport`, stamped by the client layer
+ * that held the file descriptor. It cannot travel the socket, so nothing a
+ * daemon says, or quotes back from a repository, a task or a model, can produce
+ * one; that is the whole difference between this and matching text.
+ *
+ * Bounded, for the reason the BUSY budget is: a loop with no end is a hang. When
+ * it is spent the error is returned unchanged and the run stays ACTIVE and
+ * resumable — the caller has lost this invocation, not the run. */
+#define RUN_XPORT_TRIES 5
+#define RUN_XPORT_PAUSE_MS 2000
+
+static void nap(int64_t ms) {
+    if (ms > 0) {
+        struct timespec ts = {(time_t)(ms / 1000), (long)(ms % 1000) * 1000000L};
+        (void)nanosleep(&ts, NULL);
+    }
+}
+
+static int64_t xport_pause(const atlas_rundriver_opts *o) {
+    return o->xport_pause_ms > 0 ? o->xport_pause_ms : RUN_XPORT_PAUSE_MS;
+}
+
 /* A11.5a-R. The completion gets its own, much longer budget, because losing one
  * is not the same kind of loss as losing a heartbeat.
  *
@@ -199,47 +233,152 @@ static void claimed_free(claimed *c) {
 #define RUN_COMPLETE_BUSY_MS 300000
 #define RUN_COMPLETE_PAUSE_MS 2000
 
+/* A12.0. Is the daemon still waiting for this completion?
+ *
+ * Asked only once a delivery has failed in a way that does not say whether it
+ * landed. A read that times out leaves the request queued and running — ipc.h
+ * says so in as many words — so the write may well have happened with nobody
+ * left to hear the outcome, and the completion is the one operation that cannot
+ * simply be offered again: the token it carries is consumed by the delivery that
+ * landed, and the redelivery is refused as an unknown one.
+ *
+ * The run is the place that says. A run driver's task is the run's active
+ * repo-tree task, and `idx_orch_jobs_one_active_repo_tree` means there is at
+ * most one; a run that no longer names this task holds a terminal record for it,
+ * so nothing is owed and re-offering can only be refused. What it does *not*
+ * establish is that this particular delivery is the one the daemon recorded —
+ * recovery could have ended the attempt instead — which is exactly why the
+ * caller keeps the spooled result rather than clearing it.
+ *
+ * Conservative in both directions it can be: a read that fails leaves the
+ * completion owed, and so does a run that still names the task. One attempt, and
+ * no retry of its own: the caller's loop is the budget. */
+static bool completion_owed(const atlas_rundriver_opts *o, const char *job_uid,
+                            atlas_orch_run_status *settled_out) {
+    atlas_err ignore;
+    atlas_err_init(&ignore);
+    atlas_orch_run_view rv;
+    memset(&rv, 0, sizeof(rv));
+    bool found = false;
+    bool owed = true;
+    if (o->transport.run_get(o->transport.ud, o->run_uid, &rv, &found, &ignore) == ATLAS_OK &&
+        found) {
+        owed = strcmp(rv.active_job_uid, job_uid) == 0;
+        if (!owed && settled_out != NULL) {
+            *settled_out = rv.status;
+        }
+    }
+    return owed;
+}
+
 /* The completion's own retry. Same shape, a budget measured in time rather than
  * in tries, and it says which one it is so an operator reading a long wait knows
- * Atlas is protecting a finished worker's result rather than hanging. */
-static atlas_status apply_completion(const atlas_rundriver_opts *o, const atlas_orch_op *op,
-                                     atlas_orch_result *out, atlas_err *err) {
+ * Atlas is protecting a finished worker's result rather than hanging.
+ *
+ * `acked` is what the daemon itself answered, and it is not the same claim as
+ * the status: a completion can be delivered without being acknowledged, which is
+ * what the run check below settles and what keeps the spooled copy in place.
+ *
+ * The run check answers two failures, not one. A refusal is ordinarily final,
+ * but a refusal that *follows* a lost answer is the daemon's account of the
+ * delivery this driver already made — the token was consumed by it — and
+ * mourning the result there would be the pilots' loss with one step in front. */
+static atlas_status apply_completion(const atlas_rundriver_opts *o, const char *job_uid,
+                                     const atlas_orch_op *op, atlas_orch_result *out, bool *acked,
+                                     atlas_err *err) {
     int64_t budget = o->complete_busy_ms > 0 ? o->complete_busy_ms : RUN_COMPLETE_BUSY_MS;
     int64_t started = now_ms();
+    int xport = 0;
+    bool lost_one = false;
+    atlas_status st = ATLAS_OK;
+    *acked = false;
+    for (;;) {
+        st = o->transport.apply(o->transport.ud, op, out, err);
+        if (st == ATLAS_OK) {
+            *acked = true;
+            break;
+        }
+        if (atlas_ipc_message_is_busy(err->msg)) {
+            int64_t waited = now_ms() - started;
+            if (waited >= budget) {
+                break;
+            }
+            say(o, "the daemon is busy; the worker's result is spooled and will be offered again "
+                   "(%lld s of %lld)", (long long)(waited / 1000), (long long)(budget / 1000));
+            nap(RUN_COMPLETE_PAUSE_MS);
+            atlas_err_init(err);
+            continue;
+        }
+        bool lost = atlas_err_is_transport(err);
+        if (!lost && !lost_one) {
+            break; /* a refusal this driver never disturbed: an answer. */
+        }
+        atlas_orch_run_status settled = ATLAS_ORCH_RUN_UNKNOWN;
+        if (!completion_owed(o, job_uid, &settled)) {
+            say(o, "the answer to this completion did not arrive, and the run no longer holds "
+                   "task %s open: the daemon has it. The spooled result is left in place, "
+                   "because this delivery was never acknowledged.", job_uid);
+            out->run_status = settled;
+            atlas_err_init(err);
+            st = ATLAS_OK;
+            break;
+        }
+        if (!lost) {
+            break; /* a refusal, and the task really is still waiting for one. */
+        }
+        lost_one = true;
+        if (xport++ >= RUN_XPORT_TRIES) {
+            break;
+        }
+        say(o, "the completion's answer did not arrive (%s); the worker's result is spooled and "
+               "will be offered again (%d/%d)", atlas_err_msg(err), xport, RUN_XPORT_TRIES);
+        nap(xport_pause(o));
+        atlas_err_init(err);
+    }
+    return st;
+}
+
+/* One operation, asked again while the daemon says it took nothing and while the
+ * answer does not arrive, and never once it has answered.
+ *
+ * Both retries are safe for every operation that reaches here, and for different
+ * reasons. A lease is a compare-and-swap against `state = 'QUEUED'`, so a
+ * re-request after a grant nobody heard is answered "not granted" rather than
+ * granted twice — costing the invocation, not the run. A heartbeat that names
+ * the phase the attempt is already in renews without transitioning, which is
+ * what makes re-asking one uninteresting. The completion is the operation this
+ * is not true of, and it has its own function above. */
+static atlas_status apply_op(const atlas_rundriver_opts *o, const atlas_orch_op *op,
+                             atlas_orch_result *out, atlas_err *err) {
+    int busy = 0;
+    int xport = 0;
     atlas_status st = ATLAS_OK;
     for (;;) {
         st = o->transport.apply(o->transport.ud, op, out, err);
-        if (st == ATLAS_OK || !atlas_ipc_message_is_busy(err->msg)) {
-            return st;
+        if (st == ATLAS_OK) {
+            break;
         }
-        int64_t waited = now_ms() - started;
-        if (waited >= budget) {
-            return st;
+        int64_t pause = 0;
+        if (atlas_ipc_message_is_busy(err->msg)) {
+            if (busy++ >= RUN_BUSY_TRIES) {
+                break;
+            }
+            say(o, "the daemon is busy and took nothing; retrying (%d/%d)", busy, RUN_BUSY_TRIES);
+            pause = RUN_BUSY_PAUSE_MS;
+        } else if (atlas_err_is_transport(err)) {
+            if (xport++ >= RUN_XPORT_TRIES) {
+                break;
+            }
+            say(o, "the answer did not arrive (%s); asking again (%d/%d)", atlas_err_msg(err),
+                xport, RUN_XPORT_TRIES);
+            pause = xport_pause(o);
+        } else {
+            break; /* an answer. Asking again would get the same one. */
         }
-        say(o, "the daemon is busy; the worker's result is spooled and will be offered again "
-               "(%lld s of %lld)", (long long)(waited / 1000), (long long)(budget / 1000));
-        struct timespec ts = {RUN_COMPLETE_PAUSE_MS / 1000,
-                              (long)(RUN_COMPLETE_PAUSE_MS % 1000) * 1000000L};
-        (void)nanosleep(&ts, NULL);
+        nap(pause);
         atlas_err_init(err);
     }
-}
-
-static atlas_status apply_op(const atlas_rundriver_opts *o, const atlas_orch_op *op,
-                             atlas_orch_result *out, atlas_err *err) {
-    atlas_status st = ATLAS_OK;
-    for (int i = 0; i < RUN_BUSY_TRIES; i++) {
-        st = o->transport.apply(o->transport.ud, op, out, err);
-        if (st == ATLAS_OK || !atlas_ipc_message_is_busy(err->msg)) {
-            return st;
-        }
-        say(o, "the daemon is busy and took nothing; retrying (%d/%d)", i + 1, RUN_BUSY_TRIES);
-        struct timespec ts = {RUN_BUSY_PAUSE_MS / 1000,
-                              (long)(RUN_BUSY_PAUSE_MS % 1000) * 1000000L};
-        (void)nanosleep(&ts, NULL);
-        atlas_err_init(err);
-    }
-    return o->transport.apply(o->transport.ud, op, out, err);
+    return st;
 }
 
 /* Moves the attempt one step along the pipeline. The transition table is the
@@ -597,8 +736,14 @@ static atlas_status report(const atlas_rundriver_opts *o, const claimed *c, cons
         }
     }
     if (st == ATLAS_OK) {
-        st = apply_completion(o, op, res, err);
-        if (st == ATLAS_OK) {
+        /* Cleared on the daemon's own acknowledgement and on nothing else. A
+         * completion the run says was settled without this reply being heard is
+         * delivered enough to stop offering and not enough to destroy the only
+         * copy: whether the daemon recorded *this* result or recovery ended the
+         * attempt some other way is precisely what a lost answer does not say. */
+        bool acked = false;
+        st = apply_completion(o, atlas_buf_cstr(&c->job_uid), op, res, &acked, err);
+        if (st == ATLAS_OK && acked) {
             spool_clear(o, c);
         }
     }
@@ -765,6 +910,27 @@ static atlas_status refuse(const atlas_rundriver_opts *o, const claimed *c, cons
     return st;
 }
 
+/* The run, read with the same tolerance for an answer that did not arrive.
+ *
+ * A read changes nothing, so asking again is uninteresting except that not
+ * asking again ends the invocation — which is the whole of A11.1's defect, and
+ * this is the first call the driver makes. */
+static atlas_status read_run(const atlas_rundriver_opts *o, atlas_orch_run_view *rv, bool *found,
+                             atlas_err *err) {
+    atlas_status st = ATLAS_OK;
+    for (int i = 0;; i++) {
+        st = o->transport.run_get(o->transport.ud, o->run_uid, rv, found, err);
+        if (st == ATLAS_OK || !atlas_err_is_transport(err) || i >= RUN_XPORT_TRIES) {
+            break;
+        }
+        say(o, "the run could not be read (%s); asking again (%d/%d)", atlas_err_msg(err), i + 1,
+            RUN_XPORT_TRIES);
+        nap(xport_pause(o));
+        atlas_err_init(err);
+    }
+    return st;
+}
+
 /* One task, start to reported finish. */
 static atlas_status drive_one(const atlas_rundriver_opts *o, const atlas_orch_run_view *rv,
                               atlas_rundriver_report *rep, bool *did_work, atlas_err *err) {
@@ -928,8 +1094,18 @@ static atlas_status drive_one(const atlas_rundriver_opts *o, const atlas_orch_ru
 
 done:
     if (st == ATLAS_OK) {
-        rep->status = res.run_status;
-        rep->worker_starts = res.worker_starts;
+        /* A12.0. A completion whose answer was lost fills neither, because the
+         * reply that carries them never arrived; the run check recovers the
+         * status and nothing else. Neither is overwritten with the value that
+         * means "nobody said": the loop above read the status from the run
+         * before this task started, and a count from an earlier task in the
+         * chain is a fact where a zero here would be a claim. */
+        if (res.run_status != ATLAS_ORCH_RUN_UNKNOWN) {
+            rep->status = res.run_status;
+        }
+        if (res.worker_starts > 0) {
+            rep->worker_starts = res.worker_starts;
+        }
         if (res.follow_up_job_uid.len > 0) {
             say(o, "one follow-up task was created: %s", atlas_buf_cstr(&res.follow_up_job_uid));
         }
@@ -963,7 +1139,7 @@ atlas_status atlas_rundriver_run(const atlas_rundriver_opts *o, atlas_rundriver_
         atlas_orch_run_view rv;
         memset(&rv, 0, sizeof(rv));
         bool found = false;
-        st = o->transport.run_get(o->transport.ud, o->run_uid, &rv, &found, err);
+        st = read_run(o, &rv, &found, err);
         if (st != ATLAS_OK) {
             return st;
         }

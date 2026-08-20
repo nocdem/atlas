@@ -29,6 +29,7 @@ void atlas_err_init(atlas_err *err) {
     err->msg[0] = '\0';
     err->sys_errno = 0;
     err->exit_code = -1;
+    err->transport = false;
 }
 
 atlas_status atlas_err_setv(atlas_err *err, atlas_status st, const char *fmt, va_list ap) {
@@ -36,6 +37,10 @@ atlas_status atlas_err_setv(atlas_err *err, atlas_status st, const char *fmt, va
         return st;
     }
     err->status = st;
+    /* Cleared here rather than only in `atlas_err_init`, so that a failure is an
+     * answer unless the layer that carried it marks it — and so that a mark can
+     * never survive into the next, unrelated error set on the same carrier. */
+    err->transport = false;
     if (fmt == NULL) {
         err->msg[0] = '\0';
     } else {
@@ -76,4 +81,14 @@ const char *atlas_err_msg(const atlas_err *err) {
         return "";
     }
     return err->msg;
+}
+
+void atlas_err_mark_transport(atlas_err *err) {
+    if (err != NULL) {
+        err->transport = true;
+    }
+}
+
+bool atlas_err_is_transport(const atlas_err *err) {
+    return err != NULL && err->transport;
 }

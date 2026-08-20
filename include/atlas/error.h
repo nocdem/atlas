@@ -5,6 +5,7 @@
 #define ATLAS_ERROR_H
 
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stddef.h>
 
 /* Status codes. The numeric values are the process exit codes and are part of
@@ -33,6 +34,10 @@ typedef struct atlas_err {
     /* Optional machine-readable context filled in by some subsystems. */
     int sys_errno;   /* errno value, or 0 */
     int exit_code;   /* child process exit code, or -1 */
+    /* A12.0. Whether this failure was the *carriage* of a request rather than an
+     * answer to it: the connect, the send, the read, or a reply that was never
+     * a reply. See atlas_err_mark_transport. */
+    bool transport;
 } atlas_err;
 
 /* Reset to a clean, successful state. Safe on any non-NULL pointer. */
@@ -53,5 +58,30 @@ atlas_status atlas_err_set_errno(atlas_err *err, atlas_status st, int errnum,
 
 /* Message text, or "" when unset. Never NULL. */
 const char *atlas_err_msg(const atlas_err *err);
+
+/* --- A12.0: a failure of the carriage is not a refusal ----------------------
+ *
+ * A client that sent a request and did not get an answer, and a client that was
+ * answered "no", hold opposite facts. The refusal is final: asking again gets
+ * the same answer. The lost answer says nothing at all about whether the
+ * request was processed, so it is worth asking again — and, for a request that
+ * cannot be applied twice, worth finding out about before it is mourned.
+ *
+ * Both arrive as an `atlas_status` and a sentence, and no status separates them:
+ * a daemon refusal carries whatever code the daemon chose, and a read timeout
+ * carries `ATLAS_ERR_INTERNAL`, which a refusal may carry too. So the layer that
+ * *experienced* the failure marks it, and a caller asks the mark rather than the
+ * prose.
+ *
+ * **The mark cannot travel a socket.** Only a status and a message cross it, so
+ * nothing a daemon says — or quotes back from a repository, a task or a model —
+ * can produce one; it is stamped locally by the code that owned the file
+ * descriptor. That is the whole difference between this and matching text.
+ *
+ * Every `atlas_err_set*` clears it, so a fresh error is an answer until the
+ * layer that carried it says otherwise, and the mark is applied after the
+ * message rather than before it. */
+void atlas_err_mark_transport(atlas_err *err);
+bool atlas_err_is_transport(const atlas_err *err);
 
 #endif /* ATLAS_ERROR_H */

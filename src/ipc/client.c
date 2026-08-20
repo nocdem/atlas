@@ -60,14 +60,24 @@ atlas_status atlas_ipc_call_timeout(const char *socket_path, const char *method,
         return st;
     }
     if (req.len > ATLAS_IPC_MAX_REQUEST_BYTES) {
+        /* Not marked as a transport failure: nothing was carried and nothing
+         * will be. This is Atlas refusing its own document, and it fails the
+         * same way every time it is retried. */
         atlas_buf_free(&req);
         return atlas_err_set(err, ATLAS_ERR_INTERNAL,
                              "refusing to send a %zu byte request, above the limit", req.len);
     }
 
+    /* A12.0. Everything below this line is the carriage of one request, and
+     * every failure of it leaves the caller without an answer rather than with
+     * a refusal — a connect that found nothing listening, a send that failed
+     * part way, a read that timed out with the request already queued and
+     * running, a peer that closed without answering. The caller is told which
+     * kind of failure it has here, at the only place that knows. */
     int fd = -1;
     st = atlas_ipc_connect(socket_path, timeout_ms, &fd, err);
     if (st != ATLAS_OK) {
+        atlas_err_mark_transport(err);
         atlas_buf_free(&req);
         return st;
     }
@@ -82,6 +92,9 @@ atlas_status atlas_ipc_call_timeout(const char *socket_path, const char *method,
             st = atlas_err_set(err, ATLAS_ERR_INTERNAL,
                                "the Atlas daemon closed the connection without answering");
         }
+    }
+    if (st != ATLAS_OK) {
+        atlas_err_mark_transport(err);
     }
     (void)close(fd);
     return st;

@@ -115,6 +115,13 @@ typedef struct atlas_rundriver_opts {
      * reachable from task text, a model payload or the environment, which is the
      * same rule `max_tasks` follows and for the same reason. */
     int64_t complete_busy_ms;
+    /* A12.0. How long the driver waits between two attempts at a call whose
+     * answer never arrived, in milliseconds, or zero for `RUN_XPORT_PAUSE_MS`.
+     * The number of attempts is compiled in and is not settable: a bound a
+     * caller can widen is not a bound. Same rule as `complete_busy_ms` — the
+     * struct's builder sets it, and nothing in task text, a model payload or the
+     * environment reaches it. */
+    int64_t xport_pause_ms;
     FILE *log;
     atlas_rundriver_transport transport;
 } atlas_rundriver_opts;

@@ -1441,12 +1441,27 @@ atlas_status atlas_db_plan_state_derive(atlas_db *db, const char *plan_uid, atla
         /* PLANNING. A planner job is in flight — either the first, or the replan
          * this revision's failure already earned. Asked, not yet answered. */
         out->status = ATLAS_PLAN_STATUS_PLANNING;
-    } else if (planner_ready && rev_budget && planner_budget) {
+    } else if (planner_ready && rev_budget) {
         /* PLANNING, and `replan_wanted`. The newest planner job SUCCEEDED and no
          * revision names it: either its document was refused, or the driver has
          * not offered it yet. The rows cannot distinguish those and do not have
          * to — the driver re-runs `plan.revision_add`, which either compiles the
-         * document or reproduces the same refusal from the same stored bytes. */
+         * document or reproduces the same refusal from the same stored bytes.
+         *
+         * **This is deliberately not conditioned on the planner budget, and the
+         * fifth planner job is exactly why.** Ingesting a document that has
+         * already been produced costs no planner start: the bytes are stored on
+         * the job's own artifact row and the ingest is a pure function of them.
+         * A budget that closed this branch would mean a paid-for and perfectly
+         * valid fifth document could never be compiled — the plan would answer
+         * BLOCKED while holding the plan that would have unblocked it. What the
+         * spent budget forbids is *asking for another one*, which is the branch
+         * below, not reading the one already bought.
+         *
+         * `rev_budget` stays, and is a different bound with a different subject:
+         * `REVISION_ADD` refuses a revision past `ATLAS_PLAN_MAX_REVISIONS`
+         * whatever this says, so PLANNING there would be a door that is shut on
+         * the other side. */
         out->status = ATLAS_PLAN_STATUS_PLANNING;
         out->replan_wanted = true;
     } else if (rev_budget && planner_budget) {

@@ -218,14 +218,25 @@ typedef struct atlas_plan_state {
     int task_count;
     atlas_plan_task_view tasks[ATLAS_PLAN_MAX_TASKS];
     int stages_accepted; /* runs of the latest revision that are ACCEPTED */
-    /* A BLOCKED stage-run, or a refused planner artifact, with budget left.
+    /* There is something for the plan driver to do at the planner: either a
+     * stage-run settled BLOCKED and a replan would answer it, or a planner job's
+     * document is sitting unconsumed and wants ingesting.
      *
-     * The refused-artifact half has no row of its own: a refused parse aborts
+     * The unconsumed-document half has no row of its own: a refused parse aborts
      * the transaction, so *no* revision row exists. It is derived as "the latest
-     * planner job SUCCEEDED and no matching revision exists". The driver either
-     * still holds the refusal it was handed synchronously, or re-runs
-     * `plan.revision_add` on resume and obtains the same deterministic refusal
-     * from the same stored bytes. */
+     * planner job SUCCEEDED and no matching revision exists", which is also what
+     * a valid document nobody has offered yet looks like — the rows cannot tell
+     * the two apart and do not need to. The driver either still holds the
+     * refusal it was handed synchronously, or re-runs `plan.revision_add` on
+     * resume and obtains the same deterministic answer from the same stored
+     * bytes: the revision, or the same refusal.
+     *
+     * **The two halves carry different budgets.** A replan needs a planner start
+     * and a revision, so it wants both budgets. Ingesting an already-written
+     * document costs no planner start — it is a pure function of bytes that were
+     * already paid for — so it survives a spent start budget, and the *last*
+     * planner job's valid plan is still compilable. Only the revision bound
+     * applies to it. */
     bool replan_wanted;
 } atlas_plan_state;
 

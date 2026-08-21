@@ -1379,18 +1379,27 @@ static void test_a_spent_planner_budget_with_nothing_compiled_is_blocked(void) {
     env_close(&e);
 }
 
-/* The companion to the case above, and the one that pins the `planner_budget`
- * guard on rule 5 specifically.
+/* The companion to the case above, and the one that pins what the *last* planner
+ * job's document leaves behind.
  *
- * The last planner job **SUCCEEDED** and its document was refused, so there is
- * an artifact sitting there that no revision names. With budget left that is
- * PLANNING and `replan_wanted` — the driver re-asks. With the budget spent there
- * is nothing left to ask for, and the answer has to be BLOCKED: a plan that
- * reported PLANNING here would report it for ever, because nothing can move it.
+ * **A format-refused fifth document leaves the plan PLANNING durably, and that is
+ * a stated cost rather than a defect.** A refusal writes no row — the transaction
+ * that would have written the revision is rolled back — so a refused document is
+ * only ever visible as a planner job no revision names. At k < 5 the *next*
+ * planner job is the durable evidence that the previous one was refused: the
+ * count moves, and the plan progresses. At k = 5 there is no next job, so nothing
+ * durable records that the last document was read and rejected, and the plan
+ * keeps answering PLANNING with an unconsumed artifact behind it. The driver
+ * re-runs the ingest on every resume and re-prints the same deterministic refusal
+ * from the same stored bytes.
  *
- * BLOCKED is derived rather than stored, so it is still not a trap: if that
- * outstanding document is somehow ingested afterwards, the next read changes. */
-static void test_a_spent_planner_budget_with_a_refused_artifact_is_blocked(void) {
+ * The alternative — a refusal row — would give a model's rejected output a
+ * durable record of its own, and the season's documents record this as a stated
+ * cost instead. What the plan must *not* do here is answer BLOCKED, which is the
+ * case below: the derive cannot tell a refused fifth document from a valid one
+ * nobody has offered yet, and closing the door on the second would strand a
+ * paid-for plan. */
+static void test_the_last_planner_jobs_refused_document_leaves_the_plan_planning(void) {
     env e;
     env_open(&e);
 
@@ -1416,16 +1425,86 @@ static void test_a_spent_planner_budget_with_a_refused_artifact_is_blocked(void)
                      ATLAS_PLAN_REVISION_INITIAL, true, "the last planner job's document", NULL,
                      NULL);
 
-    T_EQ_INT(st.rev_no, 0);
-    T_CHECK_MSG(derive(&e, atlas_buf_cstr(&plan), &st) == ATLAS_PLAN_STATUS_BLOCKED,
-                "a spent planner budget with a refused artifact derived %s",
+    T_CHECK_MSG(derive(&e, atlas_buf_cstr(&plan), &st) == ATLAS_PLAN_STATUS_PLANNING,
+                "the last planner job's refused document derived %s",
                 atlas_plan_status_name(st.status));
     T_EQ_INT(st.planner_jobs_seen, ATLAS_PLAN_MAX_PLANNER_JOBS);
     T_EQ_INT((int)st.planner_job_state, (int)ATLAS_ORCH_STATE_SUCCEEDED);
     T_EQ_STR(st.planner_job_uid, atlas_buf_cstr(&job));
     T_EQ_INT(st.rev_no, 0);
-    T_CHECK_MSG(!st.replan_wanted,
-                "a plan with no planner budget asked for a replan it cannot have");
+    /* The ingest gate. The driver reads this to decide whether there is a stored
+     * document to offer, and the answer has to be yes here for the same reason
+     * the status is PLANNING: the rows cannot tell this artifact from a valid one
+     * nobody has offered yet. */
+    T_CHECK_MSG(st.replan_wanted, "the unconsumed artifact is not offered to the driver");
+
+    /* Durable: the same answer on every read, because nothing recorded the
+     * refusal and nothing was going to. */
+    T_CHECK_MSG(derive(&e, atlas_buf_cstr(&plan), &st) == ATLAS_PLAN_STATUS_PLANNING,
+                "the second read derived %s", atlas_plan_status_name(st.status));
+
+    atlas_buf_free(&job);
+    atlas_buf_free(&plan);
+    env_close(&e);
+}
+
+/* The dead end T6's review found, driven end to end.
+ *
+ * The fifth planner job is the last one this plan may ever start, and it wrote a
+ * **valid** plan. Its bytes are already on its artifact row and were already paid
+ * for. Compiling them costs no planner start — the ingest is a pure function of
+ * stored bytes — so the spent start budget has nothing to say about whether they
+ * may be read.
+ *
+ * Until this case existed the derive answered BLOCKED here, the driver's ingest
+ * gate requires PLANNING, and the plan therefore stranded holding the very
+ * document that would have moved it. */
+static void test_the_last_planner_jobs_valid_document_is_still_ingestible(void) {
+    env e;
+    env_open(&e);
+
+    atlas_buf plan = ATLAS_BUF_INIT;
+    plan_req r = {.gates = 1, .parallel = 2};
+    plan_create(&e, &r, &plan);
+
+    /* Four starts spent on nothing. */
+    for (int k = 1; k < ATLAS_PLAN_MAX_PLANNER_JOBS; k++) {
+        planner p = {.k = k, .succeed = false};
+        planner_job(&e, atlas_buf_cstr(&plan), &p, NULL);
+    }
+
+    /* The fifth succeeds and writes a plan Atlas accepts. */
+    art good = {.name = ATLAS_PLAN_ARTIFACT_NAME, .bytes = PLAN_ONE_STAGE, .stored = true};
+    planner last = {.k = ATLAS_PLAN_MAX_PLANNER_JOBS, .succeed = true, .artifact = &good};
+    atlas_buf job = ATLAS_BUF_INIT;
+    planner_job(&e, atlas_buf_cstr(&plan), &last, &job);
+
+    /* PLANNING, not BLOCKED: there is a document here to read. */
+    atlas_plan_state st;
+    T_CHECK_MSG(derive(&e, atlas_buf_cstr(&plan), &st) == ATLAS_PLAN_STATUS_PLANNING,
+                "a valid document from the last planner job derived %s",
+                atlas_plan_status_name(st.status));
+    T_EQ_INT(st.planner_jobs_seen, ATLAS_PLAN_MAX_PLANNER_JOBS);
+    T_EQ_INT(st.rev_no, 0);
+    T_CHECK_MSG(st.replan_wanted, "the last planner job's document is not offered to the driver");
+
+    /* And it compiles. The start budget is spent and the revision budget is not,
+     * which are different bounds with different subjects. */
+    atlas_plan_result res;
+    revision_add(&e, atlas_buf_cstr(&plan), atlas_buf_cstr(&job), 1,
+                 ATLAS_PLAN_REVISION_INITIAL, &res);
+    T_EQ_INT(res.rev_no, 1);
+    T_EQ_INT(res.task_count, 2);
+    atlas_plan_result_free(&res);
+
+    /* The door is open: the plan now holds the revision it paid for and has work
+     * to do. */
+    T_CHECK_MSG(derive(&e, atlas_buf_cstr(&plan), &st) == ATLAS_PLAN_STATUS_EXECUTING,
+                "the compiled revision left the plan %s", atlas_plan_status_name(st.status));
+    T_EQ_INT(st.rev_no, 1);
+    T_EQ_INT(st.task_count, 2);
+    T_EQ_STR(st.tasks[0].task_key, "build");
+    T_CHECK_MSG(!st.replan_wanted, "an ingested document is still being offered");
 
     atlas_buf_free(&job);
     atlas_buf_free(&plan);
@@ -1760,8 +1839,10 @@ static const atlas_test TESTS[] = {
      test_a_planner_job_no_revision_names_wants_the_driver},
     {"a spent planner budget with nothing compiled is blocked",
      test_a_spent_planner_budget_with_nothing_compiled_is_blocked},
-    {"a spent planner budget with a refused artifact is blocked, not planning",
-     test_a_spent_planner_budget_with_a_refused_artifact_is_blocked},
+    {"the last planner job's refused document leaves the plan planning",
+     test_the_last_planner_jobs_refused_document_leaves_the_plan_planning},
+    {"the last planner job's valid document is still ingestible",
+     test_the_last_planner_jobs_valid_document_is_still_ingestible},
     {"a compiled revision executes, completes and says which",
      test_a_compiled_revision_executes_completes_and_says_which},
     {"a blocked stage-run asks for a replan and waits for quiescence",

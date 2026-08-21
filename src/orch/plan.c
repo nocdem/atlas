@@ -736,15 +736,29 @@ static atlas_status compose_head(const char *goal, const char *gate_floor_text, 
     return s;
 }
 
-/* What must be produced, and the frozen format it must be produced in. */
+/* What must be produced, and the frozen format it must be produced in.
+ *
+ * **The path is stated from the worker's seat, not from Atlas'.** A planner runs
+ * with its working directory set to the workspace's writable `work/` copy —
+ * `atlas_orch_driver_run` passes `ws->work` as the child's `cwd` — while the
+ * collector reads the *sibling* `artifacts/` directory. A bare `artifacts/...`
+ * resolves against the working directory, so a planner that followed it wrote a
+ * plan into `work/artifacts/`, which nothing collects: a live pilot paid for a
+ * planner run that SUCCEEDED with zero artifacts on its completion. The relative
+ * path and the sentence naming the same place twice are both deliberate. */
 static atlas_status compose_required(atlas_buf *out, atlas_err *err) {
-    atlas_status s = atlas_buf_appendf(out, err,
-                                       "required-output:\n"
-                                       "Write exactly one file, artifacts/%s, in the format\n"
-                                       "atlas-plan-1 specified below. Write no other plan, in no "
-                                       "other place, in no\nother format.\n"
-                                       "\n",
-                                       ATLAS_PLAN_ARTIFACT_NAME);
+    atlas_status s =
+        atlas_buf_appendf(out, err,
+                          "required-output:\n"
+                          "Your working directory is the writable work/ copy of the repository\n"
+                          "snapshot, and the artifacts directory sits beside it rather than "
+                          "inside it.\n"
+                          "Write exactly one file, ../artifacts/%s, relative to that\n"
+                          "working directory: %s in the artifacts/ directory next to your\n"
+                          "work directory. Write no other plan, in no other place, in no other "
+                          "format.\n"
+                          "\n",
+                          ATLAS_PLAN_ARTIFACT_NAME, ATLAS_PLAN_ARTIFACT_NAME);
     if (s == ATLAS_OK) {
         s = atlas_buf_append_str(out, PLAN_FORMAT_SPEC, err);
     }

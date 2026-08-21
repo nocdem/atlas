@@ -1092,7 +1092,13 @@ static void test_only_a_planner_jobs_own_artifact_can_become_a_revision(void) {
          &err);
     call_refused(&g, g.owner, "plan.revision_add", atlas_buf_cstr(&params), "is not a planner");
 
-    /* A planner job that produced no artifact at all. */
+    /* A planner job that produced no artifact at all.
+     *
+     * Refused, and refused *typed*: the sentence and a line 0 travel in the
+     * error document's `detail` object exactly as a parse refusal's do, because
+     * this is the planner's mistake and the plan driver answers it with one more
+     * planner rather than by ending the plan. A live pilot lost a paid-for
+     * planner run to this being an untyped error. */
     atlas_buf_reset(&job);
     planner_job(&g, atlas_buf_cstr(&uid), 2, "fake-plan", NULL, "", true, &job);
     atlas_buf_reset(&params);
@@ -1102,6 +1108,27 @@ static void test_only_a_planner_jobs_own_artifact_can_become_a_revision(void) {
                            atlas_buf_cstr(&uid), atlas_buf_cstr(&job)),
          &err);
     call_refused(&g, g.owner, "plan.revision_add", atlas_buf_cstr(&params), "produced no artifact");
+    {
+        atlas_buf raw = ATLAS_BUF_INIT;
+        atlas_ipc_response *r =
+            call(&g, g.owner, "plan.revision_add", atlas_buf_cstr(&params), &raw);
+        const char *sentence = NULL;
+        int64_t line = -1;
+        T_CHECK_MSG(!atlas_ipc_response_ok(r), "a planner job with no artifact was accepted: %s",
+                    atlas_buf_cstr(&raw));
+        T_CHECK_MSG(atlas_ipc_error_detail_str(r, "refusal", &sentence),
+                    "the missing artifact carried no typed sentence: %s", atlas_buf_cstr(&raw));
+        T_CHECK_MSG(sentence != NULL && strstr(sentence, "produced no artifact named") != NULL,
+                    "the typed sentence did not name the missing artifact: %s",
+                    sentence != NULL ? sentence : "(none)");
+        T_CHECK_MSG(atlas_ipc_error_detail_int(r, "line", &line),
+                    "the missing artifact carried no line: %s", atlas_buf_cstr(&raw));
+        /* Zero, because this is about the document as a whole and there is no
+         * document. */
+        T_CHECK_MSG(line == 0, "the missing artifact named line %lld", (long long)line);
+        atlas_ipc_response_free(r);
+        atlas_buf_free(&raw);
+    }
 
     /* A planner job of a *different* plan, offered to this one. The correlation
      * is the whole of the binding, and it is not a capability: presenting one
@@ -1138,6 +1165,20 @@ static void test_only_a_planner_jobs_own_artifact_can_become_a_revision(void) {
                            atlas_buf_cstr(&uid), atlas_buf_cstr(&job)),
          &err);
     call_refused(&g, g.owner, "plan.revision_add", atlas_buf_cstr(&params), "only a job that");
+    {
+        /* And this one is **not** typed. A job that did not SUCCEED is a
+         * caller's mistake, and answering it with another planner would ask the
+         * wrong question — the missing artifact is the only one of these
+         * refusals that moved across the line. */
+        atlas_buf raw = ATLAS_BUF_INIT;
+        atlas_ipc_response *r =
+            call(&g, g.owner, "plan.revision_add", atlas_buf_cstr(&params), &raw);
+        const char *sentence = NULL;
+        T_CHECK_MSG(!atlas_ipc_error_detail_str(r, "refusal", &sentence),
+                    "a job that FAILED carried a planner's refusal: %s", atlas_buf_cstr(&raw));
+        atlas_ipc_response_free(r);
+        atlas_buf_free(&raw);
+    }
 
     atlas_buf_free(&params);
     atlas_buf_free(&job);

@@ -436,12 +436,16 @@ void atlas_plan_op_free(atlas_plan_op *op);
  * Folding the line into the sentence would make the driver parse Atlas' prose to
  * recover it, so the two travel apart.
  *
- * **A non-empty `refusal` is the discriminator.** Every refusal that came from
- * the document — a parse refusal from `atlas_plan_parse`, or the merged-gate
- * bound this layer applies on top of it — sets it, always to a non-empty
- * sentence. Every other refusal (the plan does not exist, the job is not a
- * planner job, the artifact is missing) leaves it empty and is a caller's
- * problem, not a planner's. Both return a non-OK status and both leave the
+ * **A non-empty `refusal` is the discriminator.** Every refusal that is the
+ * *planner's* to answer sets it, always to a non-empty sentence: a parse refusal
+ * from `atlas_plan_parse`, the merged-gate bound this layer applies on top of
+ * it, and the missing artifact — a planner that wrote its plan somewhere Atlas
+ * does not collect failed at producing the one file it was asked for, which is
+ * the same failure an unparseable document is, and it is answered with a retry
+ * rather than an ended plan. Every other refusal (the plan does not exist, the
+ * job is not a planner job, the job did not SUCCEED, the artifact's bytes were
+ * not kept) leaves it empty and is a caller's problem, not a planner's. All of
+ * them return a non-OK status and all of them leave the
  * transaction rolled back with no row written; the members survive the rollback
  * because nothing on the failure path resets them. */
 typedef struct atlas_plan_result {

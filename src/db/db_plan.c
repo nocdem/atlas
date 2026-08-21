@@ -561,7 +561,9 @@ static atlas_status plan_max_rev(atlas_db *db, int64_t plan_id, int *out, atlas_
  *
  * Two shapes, one destination. `carry_refusal` propagates what
  * `atlas_plan_parse` already decided; `refuse_document` states a refusal this
- * layer applies on top of the parse. Both fill the typed members and both return
+ * layer reaches on its own — the merged gate bound, and the artifact the planner
+ * never wrote, which is a refusal about a document that does not exist rather
+ * than about one that does. Both fill the typed members and both return
  * a non-OK status, so the transaction is rolled back and no row is written —
  * which is what makes "a refused parse leaves no revision" a fact rather than a
  * convention, and is why the refused state has to be *derived* from a planner
@@ -1003,9 +1005,26 @@ static atlas_status op_revision_add(atlas_db *db, const atlas_plan_op *op, atlas
         int64_t size = 0;
         st = planner_artifact(db, job_uid, &bytes, &size, &art_found, &stored, err);
         if (st == ATLAS_OK && !art_found) {
-            st = atlas_err_set(err, ATLAS_ERR_USAGE,
-                               "job %s produced no artifact named %s on its successful attempt",
-                               job_uid, ATLAS_PLAN_ARTIFACT_NAME);
+            /* **A planner's mistake, and typed like one.** A worker that wrote
+             * its plan somewhere Atlas does not collect — or wrote none at all —
+             * has failed at the same thing an unparseable document failed at:
+             * producing the one file it was asked for. Answering that with an
+             * untyped error ended the plan and threw away a paid-for planner run
+             * with no feedback loop, which is what a live pilot did. The
+             * sentence travels typed so the driver quotes it back to planner
+             * k+1, exactly as it quotes a parse refusal.
+             *
+             * Line 0: this is about the document as a whole, and there is no
+             * document. The three refusals around it stay untyped on purpose —
+             * a job that is not a planner job, a job that did not SUCCEED and an
+             * artifact whose bytes were not kept are all a *caller's* problem,
+             * and asking a planner to try again would answer the wrong
+             * question. */
+            char msg[256];
+            (void)snprintf(msg, sizeof msg,
+                           "job %s produced no artifact named %s on its successful attempt",
+                           job_uid, ATLAS_PLAN_ARTIFACT_NAME);
+            st = refuse_document(out, 0, err, msg);
         }
         if (st == ATLAS_OK && !stored) {
             /* Described but not kept, which is what happens above the inline

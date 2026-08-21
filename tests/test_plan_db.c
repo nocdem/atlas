@@ -1048,25 +1048,33 @@ static void test_the_artifact_must_be_present_stored_and_within_bounds(void) {
     plan_req r = {.gates = 1, .parallel = 2};
     plan_create(&e, &r, &plan);
 
-    /* (a) No artifact at all. */
+    /* (a) No artifact at all. **Typed**, because it is the planner that failed
+     * to produce the file it was asked for, and the driver answers a typed
+     * refusal with one more planner rather than by ending the plan. */
     {
         atlas_buf job = ATLAS_BUF_INIT;
         planner p = {.k = 1, .succeed = true};
         planner_job(&e, atlas_buf_cstr(&plan), &p, &job);
+        atlas_plan_result res;
         revision_refused(&e, atlas_buf_cstr(&plan), atlas_buf_cstr(&job), 1,
-                         ATLAS_PLAN_REVISION_INITIAL, false, "a planner job with no artifact",
-                         "produced no artifact named", NULL);
+                         ATLAS_PLAN_REVISION_INITIAL, true, "a planner job with no artifact",
+                         "produced no artifact named", &res);
+        T_CHECK_MSG(res.refusal_line == 0, "the missing artifact named line %d", res.refusal_line);
+        T_CHECK(strstr(atlas_buf_cstr(&res.refusal), "produced no artifact named") != NULL);
+        atlas_plan_result_free(&res);
         atlas_buf_free(&job);
     }
 
-    /* (b) An artifact under a different name. Only one name is read. */
+    /* (b) An artifact under a different name. Only one name is read, and a plan
+     * written *anywhere* but the collected one reads exactly like this: it is
+     * the shape the live pilot produced, and it is the planner's to answer. */
     {
         atlas_buf job = ATLAS_BUF_INIT;
         art wrong = {.name = "notes.txt", .bytes = PLAN_ONE_STAGE, .stored = true};
         planner p = {.k = 2, .succeed = true, .artifact = &wrong};
         planner_job(&e, atlas_buf_cstr(&plan), &p, &job);
         revision_refused(&e, atlas_buf_cstr(&plan), atlas_buf_cstr(&job), 1,
-                         ATLAS_PLAN_REVISION_INITIAL, false, "an artifact under another name",
+                         ATLAS_PLAN_REVISION_INITIAL, true, "an artifact under another name",
                          "produced no artifact named", NULL);
         atlas_buf_free(&job);
     }

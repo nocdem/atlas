@@ -60,9 +60,11 @@
  * Two values rather than one sentence, because the driver renders them back to a
  * planner as `line %d: %s` and folding the number into Atlas' prose would make
  * the driver parse that prose to recover it. `sentence[0] == '\0'` is the
- * discriminator: every refusal that came from the *document* fills it, and every
- * other refusal — the plan does not exist, the job is not a planner job, the
- * artifact is missing — leaves it empty, exactly as `atlas_plan_result` does. */
+ * discriminator: every refusal that is the *planner's* to answer fills it — an
+ * unparseable document, a merged gate list past the bound, and an artifact the
+ * planner never produced under the name it was given — and every other refusal
+ * — the plan does not exist, the job is not a planner job, it did not SUCCEED —
+ * leaves it empty, exactly as `atlas_plan_result` does. */
 typedef struct atlas_plan_refusal {
     char sentence[256];
     /* The 1-based line the refusal is about, or 0 for a refusal about the
@@ -241,9 +243,10 @@ typedef struct atlas_plandriver_transport {
     /* One task row of one revision, by key. */
     atlas_status (*plan_task)(void *ctx, const char *plan_uid, int rev_no, const char *task_key,
                               atlas_plandriver_task *out, atlas_err *err);
-    /* Turns a planner job's own stored artifact into a revision. A document
-     * refusal fills `ref` and returns non-OK; every other refusal leaves `ref`
-     * as the caller left it. */
+    /* Turns a planner job's own stored artifact into a revision. A refusal the
+     * planner is the one to answer — including an artifact it never wrote —
+     * fills `ref` and returns non-OK; every other refusal leaves `ref` as the
+     * caller left it. */
     atlas_status (*plan_revision_add)(void *ctx, const char *plan_uid, const char *planner_job,
                                       int rev_no, const char *reason, atlas_plan_refusal *ref,
                                       atlas_err *err);

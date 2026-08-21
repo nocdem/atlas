@@ -564,9 +564,13 @@ static atlas_status step_planning(const atlas_plandriver_opts *o,
             return ATLAS_OK;
         }
         if (ref.sentence[0] == '\0') {
-            /* Not the document's fault: the plan does not exist, the job is not
-             * a planner job, the artifact is missing. A caller's problem, and
-             * asking a planner to try again would answer the wrong question. */
+            /* Not the planner's to answer: the plan does not exist, the job is
+             * not a planner job, it did not SUCCEED. A caller's problem, and
+             * asking a planner to try again would answer the wrong question.
+             *
+             * An artifact the planner never wrote is on the *other* side of this
+             * line and arrives typed, because it is the planner that failed to
+             * produce the file it was asked for. */
             return is;
         }
         say(o, "the planner's document was refused at line %d: %s", ref.line, ref.sentence);

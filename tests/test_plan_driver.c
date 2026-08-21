@@ -93,6 +93,18 @@ typedef struct fake {
     fake_task tasks[ATLAS_PLAN_MAX_TASKS];
     int task_count;
 
+    /* The planner job the derived state names, and whether its document is
+     * sitting unconsumed. Zeroed by default, which is "no planner job yet". */
+    char planner_job[36];
+    atlas_orch_state planner_job_state;
+    bool replan_wanted;
+
+    /* What `plan_revision_add` answers. An empty sentence keeps the default: no
+     * case may reach a real ingest by omission. */
+    char rev_refusal[256];
+    int rev_refusal_line;
+    int rev_add_calls;
+
     /* Recorded work. */
     int create_calls;
     int submit_calls;
@@ -173,6 +185,9 @@ static atlas_status fk_plan_state(void *ctx, const char *plan_uid, atlas_plan_st
     out->rev_no = f->rev_no;
     out->stages_accepted = f->stages_accepted;
     out->planner_jobs_seen = f->planner_jobs_seen;
+    out->replan_wanted = f->replan_wanted;
+    (void)snprintf(out->planner_job_uid, sizeof out->planner_job_uid, "%s", f->planner_job);
+    out->planner_job_state = f->planner_job_state;
     out->task_count = f->task_count;
     for (int k = 0; k < f->task_count; k++) {
         const fake_task *t = &f->tasks[k];
@@ -218,13 +233,21 @@ static atlas_status fk_plan_task(void *ctx, const char *plan_uid, int rev_no,
 static atlas_status fk_plan_revision_add(void *ctx, const char *plan_uid, const char *planner_job,
                                          int rev_no, const char *reason, atlas_plan_refusal *ref,
                                          atlas_err *err) {
-    (void)ctx;
+    fake *f = (fake *)ctx;
     (void)plan_uid;
     (void)planner_job;
     (void)rev_no;
     (void)reason;
-    (void)ref;
-    return atlas_err_set(err, ATLAS_ERR_USAGE, "no case here drives an ingest");
+    f->rev_add_calls++;
+    if (f->rev_refusal[0] == '\0') {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "no case here drives an ingest");
+    }
+    /* A refusal the *planner* is the one to answer, in the shape the daemon
+     * hands back: the sentence and the line travel apart, and `ATLAS_ERR_USAGE`
+     * is deliberately not a transport error, so `xport_again` does not eat it. */
+    (void)snprintf(ref->sentence, sizeof ref->sentence, "%s", f->rev_refusal);
+    ref->line = f->rev_refusal_line;
+    return atlas_err_set(err, ATLAS_ERR_USAGE, "%s", f->rev_refusal);
 }
 
 static atlas_status fk_job_submit(void *ctx, const atlas_plan_job_req *req,
@@ -522,6 +545,80 @@ static void test_planning_submits_one_planner_job(void) {
     fake_free(&f);
 }
 
+/* **A plan the planner wrote nowhere collectible earns a retry, not a funeral.**
+ *
+ * A live pilot ran a real planner that SUCCEEDED and wrote its document into its
+ * own working directory rather than the workspace's sibling `artifacts/`. The
+ * ingest was refused with "produced no artifact named ...", the driver read an
+ * untyped error, and it exited — the paid-for run wasted with no feedback loop.
+ *
+ * The refusal is typed now, so this arm is the parse-retry arm exactly: the
+ * driver quotes Atlas' own sentence back to planner k+1. This case asserts the
+ * *driver's* half — the transport refuses the way the daemon now refuses, and
+ * the next planner is submitted carrying the sentence.
+ */
+static void test_a_refused_ingest_is_answered_with_one_more_planner(void) {
+    fake f;
+    fake_init(&f);
+    f.script[0] = ATLAS_PLAN_STATUS_PLANNING;
+    f.script[1] = ATLAS_PLAN_STATUS_COMPLETED;
+    f.script_len = 2;
+    /* One planner start already spent, its job SUCCEEDED, and its document is
+     * sitting unconsumed — which is what `replan_wanted` says. */
+    f.planner_jobs_seen = 1;
+    (void)snprintf(f.planner_job, sizeof f.planner_job, "%s", "j00000000000000000000000000000009");
+    f.planner_job_state = ATLAS_ORCH_STATE_SUCCEEDED;
+    f.replan_wanted = true;
+    (void)snprintf(f.rev_refusal, sizeof f.rev_refusal, "%s",
+                   "job j00000000000000000000000000000009 produced no artifact named "
+                   "plan.atlas-plan on its successful attempt");
+    /* Zero: about the document as a whole, because there is no document. */
+    f.rev_refusal_line = 0;
+
+    atlas_plandriver_opts o;
+    wire(&o, &f);
+    creating(&o);
+
+    atlas_err err;
+    atlas_err_init(&err);
+    atlas_plandriver_report rep;
+    atlas_plandriver_report_init(&rep);
+    T_OK(atlas_plandriver_run(&o, &rep, &err), &err);
+
+    /* The ingest was attempted once and refused, and the refusal was not treated
+     * as a transport failure to be repeated. */
+    T_EQ_INT(f.rev_add_calls, 1);
+
+    /* Planner k+1, by the one correlation builder rather than a second spelling
+     * of the format. */
+    T_REQUIRE(f.submit_calls == 1);
+    atlas_buf want = ATLAS_BUF_INIT;
+    T_OK(atlas_plan_correlation_planner(FAKE_PLAN_UID, 2, &want, &err), &err);
+    T_EQ_STR(f.subs[0].correlation, atlas_buf_cstr(&want));
+    atlas_buf_free(&want);
+    T_EQ_STR(f.subs[0].driver, "fake-plan");
+    T_EQ_INT(f.subs[0].max_attempts, 1);
+
+    /* And it carries Atlas' own sentence, so the next planner is told what went
+     * wrong instead of being asked the same question again. */
+    const char *task = atlas_buf_cstr(&f.subs[0].task);
+    T_CHECK_MSG(strstr(task, "previous-plan-refused:") != NULL,
+                "the retry prompt did not name a previous refusal: %.64s", task);
+    T_CHECK_MSG(strstr(task, "produced no artifact named plan.atlas-plan") != NULL,
+                "the retry prompt did not carry the refusal sentence: %.256s", task);
+    /* The line travels as a number the composer renders, never as prose the
+     * driver had to parse back out. */
+    T_CHECK_MSG(strstr(task, "line 0: job") != NULL,
+                "the retry prompt did not render the refusal's line: %.256s", task);
+    /* And the prompt tells this planner where the file actually goes. */
+    T_CHECK_MSG(strstr(task, "../artifacts/plan.atlas-plan") != NULL,
+                "the retry prompt did not name the collected path");
+
+    T_EQ_INT(rep.status, ATLAS_PLAN_STATUS_COMPLETED);
+    atlas_plandriver_report_free(&rep);
+    fake_free(&f);
+}
+
 /* One iteration of the loop's EXECUTING arm.
  *
  * A stage is admitted whole and then driven: the tree task first, as the root of
@@ -713,6 +810,8 @@ static const atlas_test TESTS[] = {
     {"a plan needs a goal and a gate floor", test_a_plan_needs_a_goal_and_a_floor},
     {"a completed plan is reported and starts nothing", test_a_completed_plan_starts_nothing},
     {"planning submits and drives one planner job", test_planning_submits_one_planner_job},
+    {"a refused ingest is answered with one more planner",
+     test_a_refused_ingest_is_answered_with_one_more_planner},
     {"a stage is submitted whole then driven", test_a_stage_is_submitted_whole_then_driven},
     {"a busy daemon is reported and is not a verdict", test_busy_is_reported_and_is_not_a_verdict},
     {"a recovered stage is completed work, not the blocker",

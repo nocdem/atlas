@@ -899,11 +899,19 @@ static const char G_HEAD[] =
     "- side tasks per stage: at most 1\n"
     "\n";
 
+/* The required-output section, byte for byte.
+ *
+ * The relative path is the whole point of this golden. A planner's working
+ * directory is the workspace's `work/` copy and the collector reads the sibling
+ * `artifacts/`, so a bare `artifacts/...` names a place nothing collects — which
+ * is exactly what a live pilot paid for and lost. */
 static const char G_REQUIRED[] =
     "required-output:\n"
-    "Write exactly one file, artifacts/plan.atlas-plan, in the format\n"
-    "atlas-plan-1 specified below. Write no other plan, in no other place, in no\n"
-    "other format.\n"
+    "Your working directory is the writable work/ copy of the repository\n"
+    "snapshot, and the artifacts directory sits beside it rather than inside it.\n"
+    "Write exactly one file, ../artifacts/plan.atlas-plan, relative to that\n"
+    "working directory: plan.atlas-plan in the artifacts/ directory next to your\n"
+    "work directory. Write no other plan, in no other place, in no other format.\n"
     "\n";
 
 static const char GOAL[] = "make the widget green";

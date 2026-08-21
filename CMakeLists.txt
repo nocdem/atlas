@@ -292,6 +292,10 @@ add_library(atlas_core STATIC
   # A12.0: the `atlas-plan-1` format. Pure — no database handle, no process, no
   # clock — and it compiles a proposal into nothing more than task rows.
   src/orch/plan.c
+  # A12.0: the foreground plan driver. One loop an operator starts, above the
+  # same transport the run driver uses. No thread, no timer, no polling, no
+  # scheduler, and no state that must survive a crash.
+  src/orch/plandriver.c
   src/core/service_orch.c
   # A12.0: the four `plan.` calls a client makes. No offline path, no second
   # derivation of a plan's status, and no formatting.

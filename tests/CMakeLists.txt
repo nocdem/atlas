@@ -158,6 +158,7 @@ set(ATLAS_TESTS
   test_plan_format
   test_plan_db
   test_plan_rpc
+  test_plan_driver
   test_remote_equivalence
   test_operator_peer
   # The A8 operator-boundary fix: decision links over the socket, and the
@@ -339,6 +340,12 @@ target_compile_definitions(test_plan_db PRIVATE ATLAS_SRC_DIR="${CMAKE_SOURCE_DI
 # The remaining cases drive `atlas_server_dispatch` in process against a real
 # writer thread, which needs no socket and no second daemon.
 set_tests_properties(test_plan_rpc PROPERTIES LABELS "daemon" TIMEOUT 900 RUN_SERIAL TRUE)
+# A12.0's plan driver, hosted on a transport faked entirely in memory: no
+# database, no repository, no socket and no process. It proves the loop's own
+# refusals and one iteration of it; the full lifecycle against real runs is
+# T8's. Labelled integration because it links the whole service layer, not
+# because it touches anything outside its own process.
+set_tests_properties(test_plan_driver PROPERTIES LABELS "integration")
 # The lifecycle suite builds a real fixture repository, registers it through the
 # CLI and drives the one write point against an isolated database, so it is an
 # integration test. It sleeps for nothing: expiry and deadlines are supplied.

@@ -69,4 +69,24 @@ typedef struct atlas_dispatch_opts {
  * graceful stop; a failure to reach the daemon is not a failure of the loop. */
 atlas_status atlas_dispatch_run(const atlas_dispatch_opts *o, atlas_err *err);
 
+/* A12.0. Exactly one *named* job's attempt, carried in this process, once.
+ *
+ * The same targeted lease A11.1's run driver makes, the same workspace, the same
+ * driver, the same gates and the same completion — it is `run_attempt` shared,
+ * not a second implementation of it. There is no loop, no poll, no backoff and
+ * no signal handler: this is one call inside somebody else's foreground process,
+ * and A12.0's plan driver is the caller.
+ *
+ * `*ran` is false, with `ATLAS_OK`, when the lease was **not granted** — the job
+ * is held elsewhere, or its stored driver is outside this process's `drivers`
+ * filter, which is how the model dispatcher's partition and the untrusted
+ * `atlas-worker` one stay apart. That is an ordinary answer meaning "an
+ * operator's dispatcher will carry this", never a failure of the job.
+ *
+ * It decides nothing the poll loop does not decide: which repository, which
+ * commit, which driver, how many attempts and whether the work succeeded all
+ * arrive in the grant or are settled by the daemon when the completion lands. */
+atlas_status atlas_dispatch_run_one(const atlas_dispatch_opts *o, const char *job_uid, bool *ran,
+                                    atlas_err *err);
+
 #endif /* ATLAS_DISPATCH_H */

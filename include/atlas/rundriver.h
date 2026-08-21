@@ -89,6 +89,30 @@ typedef struct atlas_rundriver_transport {
     void *ud;
 } atlas_rundriver_transport;
 
+/* A12.0. How a driver answers a call whose answer never arrived.
+ *
+ * `BUSY:` is the daemon saying it took nothing. A transport failure — the
+ * connect, the send, the read, a reply that was never a reply — says nothing at
+ * all about whether the request was processed, and A11.1 treated it as fatal to
+ * the invocation. Pilot A11.6-P lost a run to that twice: a congested serve loop
+ * timed out one frame-header read on a phase call, the foreground driver exited,
+ * the worker kept working, nobody renewed the lease, and the attempt was
+ * reclaimed underneath a process that was still editing the tree.
+ *
+ * So a lost answer is asked for again, on its own budget, and is never confused
+ * with a refusal — a refusal is an answer, and asking again gets the same one.
+ * The classification is `atlas_err_is_transport`, stamped by the client layer
+ * that held the file descriptor; it cannot travel the socket, so nothing a
+ * daemon says, or quotes back from a repository, a task or a model, can produce
+ * one.
+ *
+ * Bounded, because a retry loop with no end is a hang. They live in the header
+ * rather than beside the loop because A12.0's plan driver sits above the same
+ * transport and answers the same failure the same way — and two spellings of one
+ * budget are two budgets. */
+#define ATLAS_RUN_XPORT_TRIES 5
+#define ATLAS_RUN_XPORT_PAUSE_MS 2000
+
 typedef struct atlas_rundriver_opts {
     /* The chain to drive. Always a run: a caller that has just submitted a root
      * task got the run back from the submission, and a caller resuming was

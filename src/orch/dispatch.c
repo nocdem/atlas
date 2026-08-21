@@ -204,9 +204,26 @@ static void attempt_free(attempt *a) {
     atlas_buf_free(&a->validations);
 }
 
+/* What a lease asks for: this dispatcher's name, its driver filter, and — A12.0
+ * — optionally the one job it wants.
+ *
+ * A named job is a *narrowing*, never a permission: the daemon still decides
+ * whether that job is grantable, and it still applies the driver filter to the
+ * job's stored driver. A11.1's run driver has always named the task it claims;
+ * this is the same request from the plan driver's side. */
+typedef struct lease_args {
+    const atlas_dispatch_opts *o;
+    /* NULL or empty is A8's "give me whatever is next". */
+    const char *job_uid;
+} lease_args;
+
 static atlas_status build_lease(atlas_json *j, void *ud, atlas_err *err) {
-    const atlas_dispatch_opts *o = (const atlas_dispatch_opts *)ud;
+    const lease_args *la = (const lease_args *)ud;
+    const atlas_dispatch_opts *o = la->o;
     atlas_status st = atlas_json_key_str(j, "dispatcher", o->dispatcher_id, err);
+    if (st == ATLAS_OK && la->job_uid != NULL && la->job_uid[0] != '\0') {
+        st = atlas_json_key_str(j, "job", la->job_uid, err);
+    }
     if (st == ATLAS_OK && o->drivers != NULL && o->drivers[0] != '\0') {
         /* Which drivers this dispatcher will run. The daemon matches it against
          * the job's *stored* driver, so this narrows what we are offered and can
@@ -870,6 +887,111 @@ static atlas_status run_attempt(attempt *a, atlas_err *err) {
     return st;
 }
 
+/* --- a granted lease, as an attempt ---------------------------------------------
+ *
+ * Written once, here, because there are two callers of it — the poll loop below
+ * and A12.0's one-job entry point — and a second copy of a field-by-field
+ * transfer is exactly how a field goes missing between two of them. Every value
+ * comes from the grant the daemon composed from trusted state; nothing is echoed
+ * back from anything the worker sent.
+ *
+ * A key the grant did not carry leaves its buffer as `attempt_init` left it,
+ * which is empty. That is deliberate: an absent value is empty, never invented. */
+static atlas_status take_grant(const rpc *r, attempt *a, atlas_err *err) {
+    struct {
+        atlas_buf *to;
+        const char *key;
+    } strs[] = {
+        {&a->job_uid, "job"},        {&a->token, "token"},
+        {&a->repo_root, "repo_root"}, {&a->commit, "commit"},
+        {&a->mode, "mode"},          {&a->driver, "driver"},
+        {&a->task, "task"},          {&a->allowed_paths, "allowed_paths"},
+        {&a->validations, "validations"},
+    };
+    atlas_status st = ATLAS_OK;
+    for (size_t i = 0; st == ATLAS_OK && i < sizeof strs / sizeof strs[0]; i++) {
+        const char *v = NULL;
+        if (atlas_ipc_result_str(r->resp, strs[i].key, &v) && v != NULL) {
+            st = atlas_buf_set_str(strs[i].to, v, err);
+        }
+    }
+    (void)atlas_ipc_result_int(r->resp, "attempt", &a->attempt_no);
+    (void)atlas_ipc_result_int(r->resp, "wall_timeout_ms", &a->wall_timeout_ms);
+    (void)atlas_ipc_result_int(r->resp, "idle_timeout_ms", &a->idle_timeout_ms);
+    (void)atlas_ipc_result_int(r->resp, "max_output_bytes", &a->max_output_bytes);
+    (void)atlas_ipc_result_int(r->resp, "max_artifact_bytes", &a->max_artifact_bytes);
+    (void)atlas_ipc_result_int(r->resp, "max_artifact_count", &a->max_artifact_count);
+    return st;
+}
+
+/* A12.0. Exactly one named job's attempt, carried in this process, once.
+ *
+ * The whole of what it adds to the loop below is that the lease names a job and
+ * there is no loop: the same targeted lease A11.1's run driver has always made,
+ * the same workspace, the same driver, the same gates in the workspace's own
+ * working directory, and the same completion — `run_attempt`, unchanged and
+ * shared rather than copied.
+ *
+ * **A lease that is not granted is a clean refusal, not a failure.** The daemon
+ * matches this process's driver filter against the job's *stored* driver, so a
+ * job that belongs to a different partition — the untrusted `atlas-worker`
+ * dispatcher's, or an operator's model dispatcher when this is not it — is
+ * simply not offered, and so is a job somebody else already holds. `*ran` is how
+ * the caller tells "this process carried an attempt" from "an operator's
+ * dispatcher will"; the plan driver waits rather than treating it as an error,
+ * which is A11.6's architecture unchanged: a single process gives a sequential
+ * progress guarantee, and genuine overlap comes from dispatcher processes an
+ * operator started.
+ *
+ * It installs no signal handler and starts nothing in the background. The poll
+ * loop's `SIGTERM`/`SIGINT`/`SIGPIPE` dispositions are that loop's, because it
+ * is a service; this is one call inside somebody else's foreground process and
+ * changing that process's signal dispositions underneath it would be a side
+ * effect nobody asked for. Nothing on this path needs `SIGPIPE` ignored — every
+ * socket write in `src/ipc` uses `MSG_NOSIGNAL`. */
+atlas_status atlas_dispatch_run_one(const atlas_dispatch_opts *o, const char *job_uid, bool *ran,
+                                    atlas_err *err) {
+    *ran = false;
+    if (job_uid == NULL || job_uid[0] == '\0') {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "no job was named");
+    }
+    lease_args la = {o, job_uid};
+    rpc r;
+    atlas_status st = rpc_call(o, "dispatch.lease", build_lease, &la, &r, err);
+    if (st != ATLAS_OK) {
+        rpc_free(&r);
+        return st;
+    }
+    bool granted = false;
+    (void)atlas_ipc_result_bool(r.resp, "granted", &granted);
+    if (!granted) {
+        rpc_free(&r);
+        say(o, "job %s was not granted to this process; it is held elsewhere or belongs to "
+               "another dispatcher's drivers", job_uid);
+        return ATLAS_OK;
+    }
+
+    attempt a;
+    attempt_init(&a);
+    a.opts = o;
+    a.started_ms = now_ms();
+    a.last_heartbeat_ms = a.started_ms;
+    st = take_grant(&r, &a, err);
+    rpc_free(&r);
+    if (st == ATLAS_OK) {
+        say(o, "leased %s attempt %lld (%s)", atlas_buf_cstr(&a.job_uid), (long long)a.attempt_no,
+            atlas_buf_cstr(&a.driver));
+        /* Set before the attempt rather than after it: the attempt exists in the
+         * ledger from the moment the lease was granted, and a caller that read
+         * `false` because the work failed would go looking for a dispatcher that
+         * has nothing to take. */
+        *ran = true;
+        st = run_attempt(&a, err);
+    }
+    attempt_free(&a);
+    return st;
+}
+
 /* --- the loop ------------------------------------------------------------------ */
 
 atlas_status atlas_dispatch_run(const atlas_dispatch_opts *o, atlas_err *err) {
@@ -898,10 +1020,9 @@ atlas_status atlas_dispatch_run(const atlas_dispatch_opts *o, atlas_err *err) {
         rpc r;
         atlas_err lerr;
         atlas_err_init(&lerr);
-        /* A non-const alias rather than casting away const: the builder only
-         * reads it, and a cast that discards a qualifier is the kind of thing
-         * that is right today and wrong after one edit. */
-        atlas_dispatch_opts lease_ud = *o;
+        /* No job is named: this is A8's "give me whatever is next", and the
+         * driver filter is the only narrowing this dispatcher applies. */
+        lease_args lease_ud = {o, NULL};
         atlas_status st = rpc_call(o, "dispatch.lease", build_lease, &lease_ud, &r, &lerr);
         if (st != ATLAS_OK) {
             /* A daemon that is not answering is an ordinary condition — it may
@@ -933,29 +1054,7 @@ atlas_status atlas_dispatch_run(const atlas_dispatch_opts *o, atlas_err *err) {
         a.opts = o;
         a.started_ms = now_ms();
         a.last_heartbeat_ms = a.started_ms;
-        struct {
-            atlas_buf *to;
-            const char *key;
-        } strs[] = {
-            {&a.job_uid, "job"},        {&a.token, "token"},
-            {&a.repo_root, "repo_root"}, {&a.commit, "commit"},
-            {&a.mode, "mode"},          {&a.driver, "driver"},
-            {&a.task, "task"},          {&a.allowed_paths, "allowed_paths"},
-            {&a.validations, "validations"},
-        };
-        atlas_status gs = ATLAS_OK;
-        for (size_t i = 0; gs == ATLAS_OK && i < sizeof strs / sizeof strs[0]; i++) {
-            const char *v = NULL;
-            if (atlas_ipc_result_str(r.resp, strs[i].key, &v) && v != NULL) {
-                gs = atlas_buf_set_str(strs[i].to, v, &lerr);
-            }
-        }
-        (void)atlas_ipc_result_int(r.resp, "attempt", &a.attempt_no);
-        (void)atlas_ipc_result_int(r.resp, "wall_timeout_ms", &a.wall_timeout_ms);
-        (void)atlas_ipc_result_int(r.resp, "idle_timeout_ms", &a.idle_timeout_ms);
-        (void)atlas_ipc_result_int(r.resp, "max_output_bytes", &a.max_output_bytes);
-        (void)atlas_ipc_result_int(r.resp, "max_artifact_bytes", &a.max_artifact_bytes);
-        (void)atlas_ipc_result_int(r.resp, "max_artifact_count", &a.max_artifact_count);
+        atlas_status gs = take_grant(&r, &a, &lerr);
         rpc_free(&r);
 
         if (gs == ATLAS_OK) {

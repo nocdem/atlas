@@ -184,26 +184,15 @@ static void claimed_free(claimed *c) {
 
 /* A12.0. The other way a call fails, and the other claim it makes.
  *
- * `BUSY:` is the daemon saying it took nothing. A transport failure — the
- * connect, the send, the read, a reply that was never a reply — says nothing at
- * all about whether the request was processed, and A11.1 treated it as fatal to
- * the invocation. Pilot A11.6-P lost a run to that twice: a congested serve loop
- * timed out one frame-header read on a phase call, the foreground driver exited,
- * the worker kept working, nobody renewed the lease, and the attempt was
- * reclaimed underneath a process that was still editing the tree.
+ * The budget and the pause are `ATLAS_RUN_XPORT_TRIES` and
+ * `ATLAS_RUN_XPORT_PAUSE_MS` in `atlas/rundriver.h`, which carries the whole
+ * argument: a lost answer is asked for again on its own budget, and a refusal is
+ * an answer and is never asked for twice. They are in the header because A12.0's
+ * plan driver answers the same failure the same way, and two spellings of one
+ * budget are two budgets.
  *
- * So a lost answer is asked for again, on its own budget, and is never confused
- * with a refusal — a refusal is an answer, and asking again gets the same one.
- * The classification is `atlas_err_is_transport`, stamped by the client layer
- * that held the file descriptor. It cannot travel the socket, so nothing a
- * daemon says, or quotes back from a repository, a task or a model, can produce
- * one; that is the whole difference between this and matching text.
- *
- * Bounded, for the reason the BUSY budget is: a loop with no end is a hang. When
- * it is spent the error is returned unchanged and the run stays ACTIVE and
- * resumable — the caller has lost this invocation, not the run. */
-#define RUN_XPORT_TRIES 5
-#define RUN_XPORT_PAUSE_MS 2000
+ * When the budget is spent the error is returned unchanged and the run stays
+ * ACTIVE and resumable — the caller has lost this invocation, not the run. */
 
 static void nap(int64_t ms) {
     if (ms > 0) {
@@ -213,7 +202,7 @@ static void nap(int64_t ms) {
 }
 
 static int64_t xport_pause(const atlas_rundriver_opts *o) {
-    return o->xport_pause_ms > 0 ? o->xport_pause_ms : RUN_XPORT_PAUSE_MS;
+    return o->xport_pause_ms > 0 ? o->xport_pause_ms : ATLAS_RUN_XPORT_PAUSE_MS;
 }
 
 /* A11.5a-R. The completion gets its own, much longer budget, because losing one
@@ -404,11 +393,11 @@ static atlas_status apply_completion(const atlas_rundriver_opts *o, const char *
             break; /* a refusal, and the task really is still waiting for one. */
         }
         lost_one = true;
-        if (xport++ >= RUN_XPORT_TRIES) {
+        if (xport++ >= ATLAS_RUN_XPORT_TRIES) {
             break;
         }
         say(o, "the completion's answer did not arrive (%s); the worker's result is spooled and "
-               "will be offered again (%d/%d)", atlas_err_msg(err), xport, RUN_XPORT_TRIES);
+               "will be offered again (%d/%d)", atlas_err_msg(err), xport, ATLAS_RUN_XPORT_TRIES);
         nap(xport_pause(o));
         atlas_err_init(err);
     }
@@ -443,11 +432,11 @@ static atlas_status apply_op(const atlas_rundriver_opts *o, const atlas_orch_op 
             say(o, "the daemon is busy and took nothing; retrying (%d/%d)", busy, RUN_BUSY_TRIES);
             pause = RUN_BUSY_PAUSE_MS;
         } else if (atlas_err_is_transport(err)) {
-            if (xport++ >= RUN_XPORT_TRIES) {
+            if (xport++ >= ATLAS_RUN_XPORT_TRIES) {
                 break;
             }
             say(o, "the answer did not arrive (%s); asking again (%d/%d)", atlas_err_msg(err),
-                xport, RUN_XPORT_TRIES);
+                xport, ATLAS_RUN_XPORT_TRIES);
             pause = xport_pause(o);
         } else {
             break; /* an answer. Asking again would get the same one. */
@@ -997,11 +986,11 @@ static atlas_status read_run(const atlas_rundriver_opts *o, atlas_orch_run_view 
     atlas_status st = ATLAS_OK;
     for (int i = 0;; i++) {
         st = o->transport.run_get(o->transport.ud, o->run_uid, rv, found, err);
-        if (st == ATLAS_OK || !atlas_err_is_transport(err) || i >= RUN_XPORT_TRIES) {
+        if (st == ATLAS_OK || !atlas_err_is_transport(err) || i >= ATLAS_RUN_XPORT_TRIES) {
             break;
         }
         say(o, "the run could not be read (%s); asking again (%d/%d)", atlas_err_msg(err), i + 1,
-            RUN_XPORT_TRIES);
+            ATLAS_RUN_XPORT_TRIES);
         nap(xport_pause(o));
         atlas_err_init(err);
     }

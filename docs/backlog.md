@@ -1139,3 +1139,25 @@ A caller parsing `--json` from any of these commands has to tolerate two
 documents or check the exit code first. Whichever way it is fixed, it should be
 fixed for the whole family in one change rather than for `plan` alone, which is
 why A12.0 left it.
+
+## A12-P pilot residuals (2026-08-21)
+
+- **The background dispatcher's completion deserves the run driver's
+  discipline.** Revision 1's sibling finished its work and offered its
+  completion during post-restart semantic maintenance; `dispatch.c`'s
+  completion retry gave up where `rundriver.c`'s 300 s budget (A12's T1)
+  would have carried it, the lease expired under sustained `BUSY`, and a
+  finished attempt died as RECOVERY_REQUIRED. The fix is the same shape T1
+  already built: classify, retry within a budget, and after a lost answer ask
+  whether the job ended with this result before mourning it.
+- **`blocking_task` misattributes a RECOVERY_REQUIRED blocker.** The replan
+  prompt named the SUCCEEDED tree task because the sibling ended
+  RECOVERY_REQUIRED, which the FAILED-selection branch does not match, and the
+  fallback picked the tree task of the blocked run. Same family as the final
+  review's Finding 1, one state wider. Money, never authority: the planner
+  re-planned work that stood, and the second stage-run's gates passed over it.
+- **Post-restart semantic maintenance collides with pilots.** Two daemon
+  restarts in one hour queued semantic rebuilds exactly when the pilot's
+  completions arrived. An operator running a planned run right after a deploy
+  should expect `BUSY`-shaped friction; the writer's yield (A9.2.7) bounds it
+  but does not remove it.

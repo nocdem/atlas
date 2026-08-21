@@ -1284,12 +1284,44 @@ and the general case of pilot A11.6-P2's finding — a workspace artifact's byte
 not surviving the workspace — is closed only for PLANNER-role drivers. All are in
 `docs/backlog.md`.
 
-### Pilot A12-P: pending
+### Pilot A12-P — one real planned run, planner and executor as different models (CLOSED the season)
 
-A live pilot with `planner_model` and `executor_model` chosen by policy, on a
-small real goal, with restart-survival and parallel-overlap evidence, has not
-been run. Until it has, every figure in this section is a bound Atlas enforces
-rather than a cost anybody has observed.
+Frozen before launch: repo `atlas`, goal "add focused unit tests for
+`atlas_buf_appendf` edge cases to `tests/test_core.c` … at most one stage, one
+tree task, at most one side task", floor gates `make` and
+`ctest --test-dir build -R test_core --no-tests=error`, `--parallel 2`,
+`planner_model = fable`, `executor_model = opus` in the root-owned policy, and
+one deliberate driver kill mid-planner as the restart protocol.
+
+**The run that closed it.** Plan `pa6d5f55…`, ACTIVE 03:28:14Z → COMPLETED
+~04:33Z, four planner jobs of five, two revisions of three, one stage of one
+ACCEPTED. The planner ran with `--model fable` (observed in the worker argv);
+the accepted tree attempt recorded `claude-opus-5`, $5.31, 34 turns in
+`orch_usage` — two roles, two models, both chosen by the policy and neither
+named in `src/`. Both stage runs held a tree task and a workspace sibling
+RUNNING concurrently. The driver was killed at 03:30:24 mid-planner and
+`--resume` re-derived everything from rows and submitted planner k=2 — nothing
+was lost. The accepted product — three `atlas_buf_appendf` edge-case tests —
+was reviewed and committed after Atlas' own gates passed it.
+
+**What the pilot found, fixed forward the same hour:** the composed planner
+prompt said `artifacts/plan.atlas-plan` while the worker's cwd is the sibling
+`work/`, so a real planner's plan landed where nothing collects — the suite
+never saw it because `fake-plan` writes through `atlas_ws_write` directly. The
+prompt now states the path from the worker's seat and a missing plan file earns
+a typed, budgeted retry instead of a dead invocation; planner k=3 compiled
+revision 1 on the corrected instruction with the refusal quoted in its prompt.
+
+**What the pilot found and left honest:** revision 1's sibling finished its
+work but its completion arrived during post-restart semantic maintenance; the
+background dispatcher's completion retry is shorter than the run driver's T1
+budget, the lease expired under sustained `BUSY`, recovery wrote
+RECOVERY_REQUIRED, and the sibling veto settled the run BLOCKED with the tree
+task SUCCEEDED and its gates passed — after which the driver asked for a replan
+and revision 2 completed cleanly. Two residuals filed in `docs/backlog.md`:
+the dispatcher's completion deserves the run driver's 300 s discipline, and
+`blocking_task` names the wrong task when the blocker ended
+RECOVERY_REQUIRED rather than FAILED (money, never authority).
 
 ## Invariants that outlive every phase
 

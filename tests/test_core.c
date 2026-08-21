@@ -50,6 +50,158 @@ static void test_buf_basics(void) {
     atlas_buf_free(&b);
 }
 
+/* The expected content is built from literals so each length can be taken from
+ * the literal itself with sizeof: a hand-counted number could otherwise make the
+ * test assert against the wrong boundary. */
+#define BUF_TEN "0123456789"
+/* 63 bytes exactly fill the initial 64-byte capacity: 63 content plus the
+ * implicit NUL. */
+#define BUF_EXPECT_63 BUF_TEN BUF_TEN BUF_TEN BUF_TEN BUF_TEN BUF_TEN "123"
+/* One more byte is all it takes to force the first reallocation. */
+#define BUF_EXPECT_64 BUF_EXPECT_63 "#"
+/* And 64 more cross the second boundary. */
+#define BUF_EXPECT_128 \
+    BUF_EXPECT_64 BUF_TEN BUF_TEN BUF_TEN BUF_TEN BUF_TEN BUF_TEN "0007"
+/* 200 bytes: more than one doubling away from a fresh buffer's first 64, so a
+ * single append has to walk the growth loop rather than take one step. */
+#define BUF_TEN_X5 BUF_TEN BUF_TEN BUF_TEN BUF_TEN BUF_TEN
+#define BUF_EXPECT_200 BUF_TEN_X5 BUF_TEN_X5 BUF_TEN_X5 BUF_TEN_X5
+
+/* A formatted append that crosses a growth boundary must reallocate under the
+ * caller's feet and keep every byte already written. The capacities asserted
+ * below are the documented policy — start at 64, double until it covers
+ * len + extra + 1 — and the content and length assertions are what the test is
+ * really about. */
+static void test_buf_appendf_growth_boundaries(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    atlas_buf b = ATLAS_BUF_INIT;
+
+    T_EQ_INT(sizeof(BUF_EXPECT_63) - 1u, 63);
+    T_EQ_INT(sizeof(BUF_EXPECT_64) - 1u, 64);
+    T_EQ_INT(sizeof(BUF_EXPECT_128) - 1u, 128);
+    T_EQ_INT(sizeof(BUF_EXPECT_200) - 1u, 200);
+
+    for (int i = 0; i < 6; i++) {
+        T_OK(atlas_buf_appendf(&b, &err, "%s", BUF_TEN), &err);
+    }
+    T_OK(atlas_buf_appendf(&b, &err, "%d%d%d", 1, 2, 3), &err);
+    T_EQ_STR(atlas_buf_cstr(&b), BUF_EXPECT_63);
+    T_EQ_INT(b.len, sizeof(BUF_EXPECT_63) - 1u);
+    T_EQ_INT(b.cap, 64);
+
+    /* The formatted write itself is what forces the growth. */
+    T_OK(atlas_buf_appendf(&b, &err, "%c", '#'), &err);
+    T_EQ_STR(atlas_buf_cstr(&b), BUF_EXPECT_64);
+    T_EQ_INT(b.len, sizeof(BUF_EXPECT_64) - 1u);
+    T_EQ_INT(b.cap, 128);
+    /* Byte-for-byte, not just as a C string: the realloc must have carried the
+     * whole prior content, and the terminator must sit one past the length. */
+    T_EQ_MEM(b.data, b.len, BUF_EXPECT_64, sizeof(BUF_EXPECT_64) - 1u);
+    T_CHECK(b.data[b.len] == '\0');
+
+    for (int i = 0; i < 6; i++) {
+        T_OK(atlas_buf_appendf(&b, &err, "%s", BUF_TEN), &err);
+    }
+    T_EQ_INT(b.cap, 128); /* still inside the second capacity */
+    T_OK(atlas_buf_appendf(&b, &err, "%04d", 7), &err);
+    T_EQ_STR(atlas_buf_cstr(&b), BUF_EXPECT_128);
+    T_EQ_INT(b.len, sizeof(BUF_EXPECT_128) - 1u);
+    T_EQ_INT(b.cap, 256);
+
+    atlas_buf_free(&b);
+
+    /* The march above crosses one boundary per append. A single append that is
+     * larger than the whole current capacity must instead run the doubling loop
+     * to completion inside one reserve: 64 -> 128 -> 256 for 200 bytes plus the
+     * NUL, with no intermediate state a caller could observe. */
+    atlas_buf big = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_appendf(&big, &err, "%s", BUF_EXPECT_200), &err);
+    T_EQ_STR(atlas_buf_cstr(&big), BUF_EXPECT_200);
+    T_EQ_INT(big.len, sizeof(BUF_EXPECT_200) - 1u);
+    T_EQ_INT(big.cap, 256);
+    T_CHECK(big.data[big.len] == '\0');
+    atlas_buf_free(&big);
+}
+
+/* Detaching hands the allocation to the caller and must leave the buffer
+ * indistinguishable from a freshly initialised one, so the next append starts
+ * from nothing rather than from a dangling pointer. */
+static void test_buf_appendf_after_detach(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    atlas_buf b = ATLAS_BUF_INIT;
+
+    static const char EXPECT_FIRST[] = "detached-7";
+    static const char EXPECT_SECOND[] = "reused-42";
+
+    T_OK(atlas_buf_appendf(&b, &err, "%s-%d", "detached", 7), &err);
+    size_t len_out = 0;
+    char *p = atlas_buf_detach(&b, &len_out);
+    T_REQUIRE(p != NULL);
+    T_EQ_STR(p, EXPECT_FIRST);
+    T_EQ_INT(len_out, sizeof(EXPECT_FIRST) - 1u);
+    free(p); /* the caller owns it now */
+
+    T_CHECK(b.data == NULL);
+    T_EQ_INT(b.len, 0);
+    T_EQ_INT(b.cap, 0);
+    T_EQ_STR(atlas_buf_cstr(&b), "");
+
+    T_OK(atlas_buf_appendf(&b, &err, "%s-%d", "reused", 42), &err);
+    T_EQ_STR(atlas_buf_cstr(&b), EXPECT_SECOND);
+    T_EQ_INT(b.len, sizeof(EXPECT_SECOND) - 1u);
+    atlas_buf_free(&b);
+}
+
+#define BUF_KEPT "keep/1"
+#define BUF_KEPT_PLUS BUF_KEPT "-more"
+
+/* atlas_buf_appendf measures with vsnprintf(NULL, 0, ...) before it reserves
+ * anything, so a measuring failure must leave the buffer exactly as it was —
+ * not merely consistent, but byte-identical and still usable.
+ *
+ * The failure is forced with a wide string whose first element is not a valid
+ * wide character. glibc's %ls converts to the locale's multibyte encoding, and
+ * 0x7fffffff is unencodable in both the C locale (ASCII) and any UTF-8 one (it
+ * is above U+10FFFF), so vsnprintf returns -1 with EILSEQ either way. A huge
+ * field width would be the other route to a negative return and is not usable
+ * here: GCC's -Wformat-truncation/-Wformat-overflow family rejects one at
+ * compile time, and warnings are errors in this tree.
+ *
+ * The T_FAILS_WITH below is what keeps this honest. If %ls ever stops failing on
+ * some machine the test fails there rather than quietly asserting nothing. */
+static void test_buf_appendf_failure_leaves_buffer_usable(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    atlas_buf b = ATLAS_BUF_INIT;
+
+    /* wchar_t arrives with <stdlib.h>; nothing here needs <wchar.h>. */
+    static const wchar_t UNENCODABLE[] = {(wchar_t)0x7fffffff, 0};
+
+    T_OK(atlas_buf_appendf(&b, &err, "%s/%d", "keep", 1), &err);
+    T_EQ_STR(atlas_buf_cstr(&b), BUF_KEPT);
+    T_EQ_INT(b.len, sizeof(BUF_KEPT) - 1u);
+    size_t len_before = b.len;
+    size_t cap_before = b.cap;
+
+    T_FAILS_WITH(atlas_buf_appendf(&b, &err, "%ls", UNENCODABLE), ATLAS_ERR_INTERNAL, &err);
+
+    /* The measuring call fails before the buffer is touched at all, so this is
+     * the strong invariant rather than merely "still parseable". */
+    T_EQ_INT(b.len, len_before);
+    T_EQ_INT(b.cap, cap_before);
+    T_EQ_MEM(b.data, b.len, BUF_KEPT, sizeof(BUF_KEPT) - 1u);
+    T_EQ_STR(atlas_buf_cstr(&b), BUF_KEPT);
+
+    /* And an ordinary append afterwards produces exactly old-plus-new: the
+     * refusal left no partial write for it to build on. */
+    T_OK(atlas_buf_appendf(&b, &err, "-%s", "more"), &err);
+    T_EQ_STR(atlas_buf_cstr(&b), BUF_KEPT_PLUS);
+    T_EQ_INT(b.len, sizeof(BUF_KEPT_PLUS) - 1u);
+    atlas_buf_free(&b);
+}
+
 /* --- SHA-256 known-answer tests (required test 31) ----------------------- */
 
 static void check_kat(const char *input, size_t len, const char *expected) {
@@ -419,6 +571,9 @@ static void test_status_names_and_errors(void) {
 
 static const atlas_test TESTS[] = {
     {"buf basics", test_buf_basics},
+    {"buf appendf across growth boundaries", test_buf_appendf_growth_boundaries},
+    {"buf appendf after detach", test_buf_appendf_after_detach},
+    {"buf appendf failure leaves the buffer usable", test_buf_appendf_failure_leaves_buffer_usable},
     {"sha256 known-answer vectors", test_sha256_vectors},
     {"sha256 chunking independence", test_sha256_streaming},
     {"sha256 one million a", test_sha256_million_a},

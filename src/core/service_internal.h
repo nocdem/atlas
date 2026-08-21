@@ -108,4 +108,34 @@ atlas_status atlas_plan_read_task(const atlas_ipc_response *r, const char *plan_
                                   const char *task_key, atlas_plandriver_task *out,
                                   atlas_err *err);
 
+/* --- A12.0: constructing the production plan transport ----------------------
+ *
+ * `atlas_service_plan_run` builds one of these and hands it to
+ * `atlas_plandriver_run`. It is exposed here so that the *shipped* transport —
+ * every request builder, every response reader, the single `atlas-safe-1`
+ * decode, the opaque carriage of a merged gate list, both drives and the `BUSY:`
+ * mapping — is the one an end-to-end test hosts, rather than a second one
+ * written beside it that could agree with the driver and disagree with the
+ * daemon.
+ *
+ * The one thing that is *not* compiled in is the policy, and that is the whole
+ * reason for the seam: `atlas_orchpolicy_load` walks a root-owned path with no
+ * override, so a suite running as an ordinary uid cannot install one, and
+ * `tests/test_plan_rpc.c` already establishes the substitution — a policy parsed
+ * through `atlas_orchpolicy_parse_bytes`, whose provenance is the test's and
+ * whose *content* is checked by the same parser a real deployment's is.
+ *
+ * `*out` is owned by the caller and released with the matching `_free`, which
+ * accepts NULL. `_wire` fills a transport whose `ctx` is the handle, so the
+ * handle must outlive every call made through it. `_saw_busy` reports whether
+ * the daemon answered `BUSY:` to anything — a report about the invocation, never
+ * a verdict about the plan. */
+typedef struct plan_xport plan_xport;
+
+atlas_status atlas_service_plan_xport_new(const atlas_orchpolicy *pol, FILE *log, plan_xport **out,
+                                          atlas_err *err);
+void atlas_service_plan_xport_free(plan_xport *x);
+void atlas_service_plan_xport_wire(plan_xport *x, atlas_plandriver_transport *t);
+bool atlas_service_plan_xport_saw_busy(const plan_xport *x);
+
 #endif /* ATLAS_SERVICE_INTERNAL_H */

@@ -957,22 +957,49 @@ static atlas_status claude_plan_run(const atlas_driver_req *req, atlas_driver_re
  * arrangement `fake:` prefixes have. */
 #define FAKE_PLAN_MARKER "fake-plan-artifact:"
 
-/* Everything after the marker line, or NULL when there is no such line. An
- * empty tail is a plan of no bytes and not a missing one: the rule is
- * "everything after the line", and whether an empty plan is acceptable is a
- * question for the layer that reads plans, not for a fixture. */
-static const char *fake_plan_body(const char *task) {
+/* The optional closing line, matched the same way and for a reason A12.0's own
+ * composers created.
+ *
+ * "Everything after the marker" is the whole plan only while the marker is last
+ * in the task text, which is true of a hand-written fixture task and false of
+ * every prompt the plan driver composes: `atlas_plan_compose_planner` embeds the
+ * operator's goal — the only place a fixture can put a marker — in the *middle*
+ * of a document that continues with the gate floor, the bounds and the frozen
+ * format specification. A fake that could only stand where the real planner
+ * stands when nothing followed it would prove nothing about the real one, so the
+ * body may be closed explicitly. Found by the A12.0 end-to-end test.
+ *
+ * Absent, the rule is exactly what it was, byte for byte. */
+#define FAKE_PLAN_END_MARKER "fake-plan-artifact-end:"
+
+/* Everything after the marker line, up to a closing line if there is one and to
+ * the end of the task text otherwise; NULL when there is no marker line at all.
+ * An empty tail is a plan of no bytes and not a missing one: whether an empty
+ * plan is acceptable is a question for the layer that reads plans, not for a
+ * fixture. */
+static const char *fake_plan_body(const char *task, size_t *len_out) {
     const size_t n = sizeof FAKE_PLAN_MARKER - 1u;
+    const size_t e = sizeof FAKE_PLAN_END_MARKER - 1u;
     const char *line = task;
+    const char *body = NULL;
+    *len_out = 0u;
     while (line != NULL) {
         const char *nl = strchr(line, '\n');
         size_t len = nl != NULL ? (size_t)(nl - line) : strlen(line);
-        if (len == n && strncmp(line, FAKE_PLAN_MARKER, n) == 0) {
-            return nl != NULL ? nl + 1u : line + len;
+        if (body == NULL) {
+            if (len == n && strncmp(line, FAKE_PLAN_MARKER, n) == 0) {
+                body = nl != NULL ? nl + 1u : line + len;
+            }
+        } else if (len == e && strncmp(line, FAKE_PLAN_END_MARKER, e) == 0) {
+            *len_out = (size_t)(line - body);
+            return body;
         }
         line = nl != NULL ? nl + 1u : NULL;
     }
-    return NULL;
+    if (body != NULL) {
+        *len_out = strlen(body);
+    }
+    return body;
 }
 
 static atlas_status fake_plan_run(const atlas_driver_req *req, atlas_driver_res *res,
@@ -992,7 +1019,8 @@ static atlas_status fake_plan_run(const atlas_driver_req *req, atlas_driver_res 
         return ATLAS_OK;
     }
 
-    const char *body = fake_plan_body(req->task);
+    size_t body_len = 0u;
+    const char *body = fake_plan_body(req->task, &body_len);
     atlas_buf log = ATLAS_BUF_INIT;
     if (body == NULL) {
         /* No plan, and none invented. It ends as an ordinary failed attempt —
@@ -1003,13 +1031,13 @@ static atlas_status fake_plan_run(const atlas_driver_req *req, atlas_driver_res 
         res->exit_code = 1;
         st = atlas_buf_set_str(&log, "fake-plan: the task carried no plan\n", err);
     } else {
-        st = atlas_ws_write(req->ws, "artifacts/plan.atlas-plan", body, strlen(body), err);
+        st = atlas_ws_write(req->ws, "artifacts/plan.atlas-plan", body, body_len, err);
         if (st == ATLAS_OK) {
             res->exit_kind = ATLAS_ORCH_EXIT_OK;
             res->exit_code = 0;
-            res->stdout_bytes = (int64_t)strlen(body);
+            res->stdout_bytes = (int64_t)body_len;
             st = atlas_buf_appendf(&log, err, "fake-plan wrote %zu bytes of plan for job %s\n",
-                                   strlen(body), req->job_uid != NULL ? req->job_uid : "");
+                                   body_len, req->job_uid != NULL ? req->job_uid : "");
         }
     }
     if (st == ATLAS_OK) {

@@ -26,6 +26,7 @@
 
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -913,7 +914,56 @@ static atlas_status x_drive_workspace_job(void *ctx, const char *job_uid, atlas_
     return st;
 }
 
-static void plan_xport_wire(plan_xport *x, atlas_plandriver_transport *t) {
+/* --- the transport as a handle ----------------------------------------------
+ *
+ * One construction, used by `atlas_service_plan_run` and by the end-to-end test
+ * that hosts the shipped driver against a real socket. See
+ * `service_internal.h` for why the seam exists and for the one substitution it
+ * permits, which is the policy's provenance and nothing else. */
+atlas_status atlas_service_plan_xport_new(const atlas_orchpolicy *pol, FILE *log, plan_xport **out,
+                                          atlas_err *err) {
+    *out = NULL;
+    plan_xport *x = calloc(1u, sizeof(*x));
+    atlas_status st = ATLAS_OK;
+    if (x == NULL) {
+        st = atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory");
+    } else {
+        atlas_buf_init(&x->sock);
+        x->pol = pol;
+        x->log = log;
+        st = atlas_ipc_socket_path(&x->sock, err);
+        if (st == ATLAS_OK) {
+            /* The partition this process may carry a workspace job in, derived by
+             * the one derivation. A uid the policy names no model driver for
+             * simply carries none — its planner jobs and siblings wait for an
+             * operator's dispatcher, which is an answer and not a failure — so
+             * the refusal that derivation gives a *dispatcher* is not one here. */
+            atlas_err scratch;
+            atlas_err_init(&scratch);
+            const bool is_model = atlas_orchpolicy_is_model_dispatcher(pol, (long long)getuid());
+            x->have_filter =
+                is_model && atlas_service_orch_driver_filter(pol, true, x->filter,
+                                                             sizeof x->filter, &scratch) == ATLAS_OK;
+            *out = x;
+        } else {
+            atlas_service_plan_xport_free(x);
+        }
+    }
+    return st;
+}
+
+void atlas_service_plan_xport_free(plan_xport *x) {
+    if (x != NULL) {
+        atlas_buf_free(&x->sock);
+        free(x);
+    }
+}
+
+bool atlas_service_plan_xport_saw_busy(const plan_xport *x) {
+    return x != NULL && x->saw_busy;
+}
+
+void atlas_service_plan_xport_wire(plan_xport *x, atlas_plandriver_transport *t) {
     memset(t, 0, sizeof(*t));
     t->ctx = x;
     t->plan_create = x_plan_create;
@@ -1125,33 +1175,15 @@ atlas_status atlas_service_plan_run(atlas_ctx *ctx, const atlas_plan_run_opts *o
                              atlas_orchpolicy_reason_explain(pol.reason));
     }
 
-    plan_xport x;
-    memset(&x, 0, sizeof(x));
-    atlas_buf_init(&x.sock);
-    x.pol = &pol;
-    x.log = o->log;
-    atlas_status st = atlas_ipc_socket_path(&x.sock, err);
-
-    if (st == ATLAS_OK) {
-        /* The partition this process may carry a workspace job in, derived by the
-         * one derivation. A uid the policy names no model driver for simply
-         * carries none — its planner jobs and siblings wait for an operator's
-         * dispatcher, which is an answer and not a failure — so the refusal that
-         * derivation gives a *dispatcher* is not one here. */
-        atlas_err scratch;
-        atlas_err_init(&scratch);
-        const bool is_model = atlas_orchpolicy_is_model_dispatcher(&pol, (long long)getuid());
-        x.have_filter =
-            is_model && atlas_service_orch_driver_filter(&pol, true, x.filter, sizeof x.filter,
-                                                         &scratch) == ATLAS_OK;
-    }
+    plan_xport *x = NULL;
+    atlas_status st = atlas_service_plan_xport_new(&pol, o->log, &x, err);
 
     atlas_plandriver_report rep;
     atlas_plandriver_report_init(&rep);
     if (st == ATLAS_OK) {
         atlas_plandriver_opts po;
         memset(&po, 0, sizeof(po));
-        plan_xport_wire(&x, &po.transport);
+        atlas_service_plan_xport_wire(x, &po.transport);
         po.plan_uid = o->resume;
         po.repo = o->repo;
         po.goal = o->goal;
@@ -1176,7 +1208,7 @@ atlas_status atlas_service_plan_run(atlas_ctx *ctx, const atlas_plan_run_opts *o
      * with the invocation's own two facts — busy, and this process's own view of
      * it — laid over the top. */
     if (st == ATLAS_OK && sink != NULL) {
-        const bool busy = rep.busy || x.saw_busy;
+        const bool busy = rep.busy || atlas_service_plan_xport_saw_busy(x);
         if (rep.plan_uid.len == 0) {
             /* No plan exists to read: a creation that the daemon was too busy to
              * take. Said plainly rather than with an empty document. */
@@ -1202,6 +1234,6 @@ atlas_status atlas_service_plan_run(atlas_ctx *ctx, const atlas_plan_run_opts *o
     }
 
     atlas_plandriver_report_free(&rep);
-    atlas_buf_free(&x.sock);
+    atlas_service_plan_xport_free(x);
     return st;
 }

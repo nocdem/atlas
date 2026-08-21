@@ -682,8 +682,38 @@ typedef struct done_args {
     bool success;
 } done_args;
 
+/* A12.0. Whether this attempt's artifacts must be carried to the daemon rather
+ * than merely described to it.
+ *
+ * A8's rule is unchanged for every other driver and is stated where the
+ * completion is parsed: a dispatcher's artifacts live in a workspace it owns,
+ * Atlas describes them, and an operator collects them from the workspace. That
+ * rule assumes the *reader* is a person with access to that directory.
+ *
+ * A planner's output is the one artifact **Atlas itself** has to read: a plan
+ * revision is compiled from the stored bytes of `plan.atlas-plan` and from
+ * nothing else, deliberately, so that a model's document never travels a second
+ * path into the write point. The workspace it was written in belongs to a
+ * dispatcher process that may run under another uid, and is removed when the
+ * attempt succeeds — so an artifact only described is a plan nobody can ever
+ * compile. A11.1 added the fifth manifest field for exactly this shape of
+ * problem on the run driver, which has no workspace at all; this is the same
+ * argument for the same field.
+ *
+ * Asked of the driver's **role**, not of an artifact's name, because "a planner
+ * produces documents Atlas compiles" is the property that makes it true, and a
+ * name test would silently stop applying the moment the plan layer named a
+ * second file. Everything else about the bound is unchanged: `atlas_ws_collect`
+ * has already refused content above `ATLAS_ORCH_ARTIFACT_INLINE_MAX`, and the
+ * job's own artifact count and byte ceilings still apply. */
+static bool artifacts_travel_inline(const attempt *a) {
+    const atlas_driver *d = atlas_driver_find(atlas_buf_cstr(&a->driver));
+    return d != NULL && d->role == ATLAS_DRIVER_ROLE_PLANNER;
+}
+
 static atlas_status build_complete(atlas_json *j, void *ud, atlas_err *err) {
     done_args *d = (done_args *)ud;
+    const bool inline_content = artifacts_travel_inline(d->a);
     atlas_status st = atlas_json_key_str(j, "token", atlas_buf_cstr(&d->a->token), err);
     if (st == ATLAS_OK) {
         st = atlas_json_key_bool(j, "success", d->success, err);
@@ -714,6 +744,19 @@ static atlas_status build_complete(atlas_json *j, void *ud, atlas_err *err) {
                                    atlas_buf_cstr(&d->arts[i].name), "artifact",
                                    atlas_buf_cstr(&d->arts[i].sha256),
                                    (long long)d->arts[i].size_bytes);
+            /* The optional fifth field, as lowercase hex, spelled the way the
+             * run driver spells it. The daemon re-digests what arrives and
+             * refuses a manifest that describes one thing and carries another,
+             * so this is a carriage and never a claim. */
+            if (st == ATLAS_OK && inline_content && d->arts[i].content_stored) {
+                st = atlas_buf_append(&ent, "\x1f", 1u, err);
+                static const char HEX[] = "0123456789abcdef";
+                for (size_t k = 0; st == ATLAS_OK && k < d->arts[i].content.len; k++) {
+                    unsigned char c = (unsigned char)d->arts[i].content.data[k];
+                    char pair[2] = {HEX[c >> 4], HEX[c & 0x0fu]};
+                    st = atlas_buf_append(&ent, pair, 2u, err);
+                }
+            }
             if (st == ATLAS_OK) {
                 st = atlas_json_str(j, atlas_buf_cstr(&ent), err);
             }

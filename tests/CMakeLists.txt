@@ -161,6 +161,7 @@ set(ATLAS_TESTS
   test_plan_driver
   test_plan_render
   test_plan_xport
+  test_plan_e2e
   test_remote_equivalence
   test_operator_peer
   # The A8 operator-boundary fix: decision links over the socket, and the
@@ -361,6 +362,14 @@ set_tests_properties(test_plan_render PROPERTIES LABELS "unit")
 # unreachable from this suite, and the half that carries the decode-once and
 # gates-verbatim obligations is not.
 set_tests_properties(test_plan_xport PROPERTIES LABELS "unit")
+# A12.0. The whole planned run, end to end, over a real Unix socket: the
+# production plan transport speaking to `atlas_server_serve` on a thread of the
+# test's own process, with a real writer thread, a real index and a real
+# registered repository. It carries the daemon label and its serialisation
+# because it binds a socket and runs a serve loop, which is exactly what the
+# label is for; the timeout is generous because three plans run three chains of
+# workers and gates.
+set_tests_properties(test_plan_e2e PROPERTIES LABELS "daemon" TIMEOUT 900 RUN_SERIAL TRUE)
 # The lifecycle suite builds a real fixture repository, registers it through the
 # CLI and drives the one write point against an isolated database, so it is an
 # integration test. It sleeps for nothing: expiry and deadlines are supplied.

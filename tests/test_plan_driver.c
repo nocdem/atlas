@@ -23,6 +23,8 @@
  *     and whatever is still queued afterwards carried here in key order;
  *   - a daemon that took nothing is reported as busy, with nothing else
  *     attempted;
+ *   - a replan reads a stage by its run, so one that failed and was recovered is
+ *     completed work rather than the blocked task;
  *   - and an iteration that moves nothing ends the invocation instead of
  *     spending the defect guard.
  *
@@ -611,6 +613,70 @@ static void test_busy_is_reported_and_is_not_a_verdict(void) {
     fake_free(&f);
 }
 
+/* A stage Atlas accepted is completed work, whatever its first job says.
+ *
+ * A follow-up inherits its parent's correlation verbatim, and the derived view
+ * carries the *first* job of the chain that correlation names. So a tree task
+ * that failed its gate and was recovered by its follow-up presents as
+ * `job_state == FAILED` beside `run_status == ACCEPTED`, and a driver that read
+ * the job would tell the next planner two false things at once: that the
+ * accepted stage is the one blocking the plan, and that it is not among the work
+ * that stands. Both are keyed on the run here, exactly as the derivation and
+ * `lowest_open_tree` key a stage. Money, never authority — the prompt routes no
+ * control flow — but a planner invited to redo an accepted stage spends a
+ * revision and a stage-run finding that out. */
+static void test_a_recovered_stage_is_completed_work_not_the_blocker(void) {
+    fake f;
+    fake_init(&f);
+    f.rev_no = 1;
+    f.planner_jobs_seen = 1;
+    f.script[0] = ATLAS_PLAN_STATUS_NEEDS_REPLAN;
+    f.script[1] = ATLAS_PLAN_STATUS_COMPLETED;
+    f.script_len = 2;
+    fake_add_task(&f, "build", 1, true);
+    fake_add_task(&f, "verify", 2, true);
+
+    /* Stage 1: the first job failed its gate, the follow-up that inherited its
+     * correlation carried the chain, and the run settled ACCEPTED. */
+    (void)snprintf(f.tasks[0].job, sizeof f.tasks[0].job, "%s",
+                   "j00000000000000000000000000000007");
+    f.tasks[0].job_state = ATLAS_ORCH_STATE_FAILED;
+    (void)snprintf(f.tasks[0].run, sizeof f.tasks[0].run, "%s", FAKE_RUN_UID);
+    f.tasks[0].run_status = ATLAS_ORCH_RUN_ACCEPTED;
+    /* Stage 2: failed, its run settled BLOCKED, and it is what the replan is
+     * about. */
+    (void)snprintf(f.tasks[1].job, sizeof f.tasks[1].job, "%s",
+                   "j00000000000000000000000000000008");
+    f.tasks[1].job_state = ATLAS_ORCH_STATE_FAILED;
+    (void)snprintf(f.tasks[1].run, sizeof f.tasks[1].run, "%s",
+                   "r1111111111111111111111111111111f");
+    f.tasks[1].run_status = ATLAS_ORCH_RUN_BLOCKED;
+
+    atlas_plandriver_opts o;
+    wire(&o, &f);
+    creating(&o);
+
+    atlas_err err;
+    atlas_err_init(&err);
+    atlas_plandriver_report rep;
+    atlas_plandriver_report_init(&rep);
+    T_OK(atlas_plandriver_run(&o, &rep, &err), &err);
+
+    /* One planner job, carrying the replan prompt. */
+    T_REQUIRE(f.submit_calls == 1);
+    T_EQ_STR(f.subs[0].driver, "fake-plan");
+    const char *task = atlas_buf_cstr(&f.subs[0].task);
+    T_CHECK_MSG(strstr(task, "- stage 1 task build: ACCEPTED") != NULL,
+                "the accepted stage is missing from completed-work: %s", task);
+    T_CHECK_MSG(strstr(task, "blocked-task: verify\n") != NULL,
+                "the replan does not name the stage that blocked: %s", task);
+    T_CHECK_MSG(strstr(task, "blocked-task: build\n") == NULL,
+                "the replan names an accepted stage as the blocked task: %s", task);
+
+    atlas_plandriver_report_free(&rep);
+    fake_free(&f);
+}
+
 /* An iteration that moves nothing ends the invocation.
  *
  * Here the fake daemon never records the planner job it was handed, so the
@@ -649,6 +715,8 @@ static const atlas_test TESTS[] = {
     {"planning submits and drives one planner job", test_planning_submits_one_planner_job},
     {"a stage is submitted whole then driven", test_a_stage_is_submitted_whole_then_driven},
     {"a busy daemon is reported and is not a verdict", test_busy_is_reported_and_is_not_a_verdict},
+    {"a recovered stage is completed work, not the blocker",
+     test_a_recovered_stage_is_completed_work_not_the_blocker},
     {"a stalled iteration ends the invocation", test_a_stalled_iteration_ends_the_invocation},
 };
 

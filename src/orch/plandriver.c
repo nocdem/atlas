@@ -221,12 +221,23 @@ static const atlas_plan_task_view *tree_of_stage(const atlas_plan_state *st, int
  * naming the tree task there would point a planner at work that went fine. When
  * nothing failed outright — a cancelled task, a recovery — the first task the
  * revision holds that is neither running nor successful is named instead.
- * Deterministic either way: the state's tasks are ordered by `(stage_no, id)`. */
+ * Deterministic either way: the state's tasks are ordered by `(stage_no, id)`.
+ *
+ * A **tree** task whose run settled ACCEPTED is never named, whatever its job
+ * says. The view carries the *first* job of the task's chain — a follow-up
+ * inherits its parent's correlation verbatim — so a stage that failed its gate
+ * and was recovered by that follow-up still reads FAILED here while Atlas has
+ * accepted it. Naming it would point the planner at work that stands, which is
+ * the same mistake as naming a tree task a sibling vetoed. `lowest_open_tree`
+ * already reads a stage this way; so does the derivation. */
 static const atlas_plan_task_view *blocking_task(const atlas_plan_state *st) {
     const atlas_plan_task_view *first_bad = NULL;
     for (int i = 0; i < st->task_count; i++) {
         const atlas_plan_task_view *v = &st->tasks[i];
         if (v->job_uid[0] == '\0') {
+            continue;
+        }
+        if (v->is_tree && v->run_status == ATLAS_ORCH_RUN_ACCEPTED) {
             continue;
         }
         if (v->job_state == ATLAS_ORCH_STATE_FAILED) {

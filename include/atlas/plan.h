@@ -104,18 +104,30 @@ typedef enum atlas_plan_status {
     /* Zero. Never stored, never parsed, never a claim. A zeroed state struct
      * reads UNKNOWN, which is what "nobody derived this" should look like. */
     ATLAS_PLAN_STATUS_UNKNOWN = 0,
-    /* No usable revision yet, and planner budget remains. */
+    /* A planner document is what would move this plan, and one is either on its
+     * way or already written. Three shapes reach here: no revision compiled yet
+     * and budgets remain; a planner job in flight, initial or replan; and a
+     * planner job that SUCCEEDED whose document no revision names, which wants
+     * ingesting and is what `replan_wanted` says. The third holds at every `k`,
+     * the fifth included — a document already paid for costs no planner start to
+     * compile. Its stated cost: a fifth document Atlas keeps refusing leaves the
+     * plan durably PLANNING, resumable and re-printing the same refusal on every
+     * resume, rather than BLOCKED while holding a plan that might still compile. */
     ATLAS_PLAN_STATUS_PLANNING,
     /* The latest revision has work that is not terminal. */
     ATLAS_PLAN_STATUS_EXECUTING,
-    /* A stage-run of the latest revision settled BLOCKED, or a planner artifact
-     * was refused, and budgets remain. The driver acts on this. */
+    /* A stage-run of the latest revision settled BLOCKED or a side job of it
+     * failed, no work is left running, and both budgets remain. The driver acts
+     * on this. */
     ATLAS_PLAN_STATUS_NEEDS_REPLAN,
     /* Every stage-run of the latest revision ACCEPTED and every side job of it
      * SUCCEEDED. */
     ATLAS_PLAN_STATUS_COMPLETED,
-    /* A budget is exhausted, or the planner's last job failed terminally with
-     * no budget left. */
+    /* A replan is what this plan needs and no budget remains to produce one:
+     * the three revisions are spent, or the five planner jobs are — the latest
+     * planner job having FAILED at `k = 5` is the ordinary way there. Derived
+     * like every other status, so a document that is later ingested moves the
+     * very next read off it. */
     ATLAS_PLAN_STATUS_BLOCKED
 } atlas_plan_status;
 
@@ -289,10 +301,11 @@ atlas_status atlas_plan_compose_planner_retry(const char *goal, const char *gate
                                               const void *refused, size_t refused_len,
                                               atlas_buf *out, atlas_err *err);
 
-/* The replan request. What Atlas established — which tasks SUCCEEDED — is
- * stated as fact; the blocked task, the gate that failed and a bounded excerpt
- * of its output are stated beside it; and the instruction is a complete new
- * plan for the *remaining* work, with the completed work standing.
+/* The replan request. What Atlas established — which stage-runs were ACCEPTED
+ * and which side tasks SUCCEEDED — is stated as fact; the blocked task, the gate
+ * that failed and a bounded excerpt of its output are stated beside it; and the
+ * instruction is a complete new plan for the *remaining* work, with the
+ * completed work standing.
  *
  * The trigger is never a sentence a worker wrote. A replan happens because a
  * stage-run settled BLOCKED, which is Atlas' own verdict. */

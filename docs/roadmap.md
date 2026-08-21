@@ -782,9 +782,10 @@ zero and fails its gate ends a task and does not accept a run.
 a target repository" was unqualified and is no longer true without a
 clause. Every Atlas *read* — `scan`, the index passes, the watcher, every
 `src/git` invocation — is still read-only and writes nothing. What changed is
-that an operator running `atlas job run` may start a child process whose purpose
-is to edit the tree, in a directory Atlas resolved from its own registry, under a
-driver the root-owned policy named. Three things must line up and removing any
+that an operator running `atlas job run` — or, since A12.0, `atlas plan run`,
+which starts its workers through exactly the same machinery — may start a child
+process whose purpose is to edit the tree, in a directory Atlas resolved from its
+own registry, under a driver the root-owned policy named. Three things must line up and removing any
 one stops it. The working tree is expected to be dirty afterwards: it is the
 first worker's output and the second worker's input, and nothing on any path
 cleans, resets, checks out, stashes or reverts it.

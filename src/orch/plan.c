@@ -828,10 +828,23 @@ atlas_status atlas_plan_compose_replan(const char *goal, const char *gate_floor_
     }
     /* What Atlas established, in the order the tasks are held. A task's title
      * is the planner's own words and is labelled as such even here, where the
-     * verdict beside it is Atlas'. */
+     * verdict beside it is Atlas'.
+     *
+     * A **tree** task is completed when its stage-run settled ACCEPTED, and a
+     * **side** task when its job SUCCEEDED — the derivation's split, and the
+     * same one `lowest_open_tree` reads a stage with. The view holds the first
+     * job of a tree task's chain and a follow-up inherits its parent's
+     * correlation, so a stage that failed its gate and was recovered still
+     * reads FAILED there: keying this section on the job would drop an accepted
+     * stage out of it and invite a planner to plan work that stands. The verdict
+     * printed is the one that was asked for, because a run that was ACCEPTED
+     * after a failed first job did not "succeed" and Atlas does not say it did. */
     int shown = 0;
     for (int i = 0; s == ATLAS_OK && i < st->task_count && i < ATLAS_PLAN_MAX_TASKS; i++) {
-        if (st->tasks[i].job_state != ATLAS_ORCH_STATE_SUCCEEDED) {
+        const bool done = st->tasks[i].is_tree
+                              ? (st->tasks[i].run_status == ATLAS_ORCH_RUN_ACCEPTED)
+                              : (st->tasks[i].job_state == ATLAS_ORCH_STATE_SUCCEEDED);
+        if (!done) {
             continue;
         }
         shown++;
@@ -840,7 +853,10 @@ atlas_status atlas_plan_compose_replan(const char *goal, const char *gate_floor_
             s = append_bounded(out, st->tasks[i].task_key, strlen(st->tasks[i].task_key), 32u, err);
         }
         if (s == ATLAS_OK) {
-            s = atlas_buf_append_str(out, ": SUCCEEDED  title (untrusted): ", err);
+            s = atlas_buf_append_str(
+                out, st->tasks[i].is_tree ? ": ACCEPTED  title (untrusted): "
+                                          : ": SUCCEEDED  title (untrusted): ",
+                err);
         }
         if (s == ATLAS_OK) {
             s = append_bounded(out, st->tasks[i].title, strlen(st->tasks[i].title),

@@ -1291,8 +1291,11 @@ Unchanged in A1, and the IPC error document uses the same numbering in its
 
 `atlas daemon ping` exits `3` when the daemon is not answering, after printing a
 complete document. That is the one place a non-zero exit accompanies valid
-output; `cli_state.rendered` suppresses the error document so `--json` never puts
-two documents on stdout.
+output, and `cli_state.rendered` suppresses the error document there so that path
+puts one document on stdout; the orchestration family was never generalised to
+it, so a `--json` list run against an absent daemon — `job list`, `plan list` —
+emits its error document inside the result document it had already started, which
+`docs/backlog.md` carries as a family-wide fix nobody has made.
 
 ## Where things are documented
 

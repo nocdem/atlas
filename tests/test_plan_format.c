@@ -1006,7 +1006,11 @@ static void test_replan_prompt_is_byte_exact(void) {
     snprintf(st.tasks[0].task_key, sizeof st.tasks[0].task_key, "%s", "groundwork");
     st.tasks[0].stage_no = 1;
     st.tasks[0].is_tree = true;
-    st.tasks[0].job_state = ATLAS_ORCH_STATE_SUCCEEDED;
+    /* A tree task is completed by its **run**, so this one carries the failed
+     * first job of a chain its follow-up recovered — exactly the shape that used
+     * to drop an accepted stage out of this section. */
+    st.tasks[0].job_state = ATLAS_ORCH_STATE_FAILED;
+    st.tasks[0].run_status = ATLAS_ORCH_RUN_ACCEPTED;
     snprintf(st.tasks[0].title, sizeof st.tasks[0].title, "%s", "Lay the groundwork");
     snprintf(st.tasks[1].task_key, sizeof st.tasks[1].task_key, "%s", "notes");
     st.tasks[1].stage_no = 1;
@@ -1028,7 +1032,7 @@ static void test_replan_prompt_is_byte_exact(void) {
          &err);
     char *want = cat(G_HEAD,
                      "completed-work (Atlas facts):\n"
-                     "- stage 1 task groundwork: SUCCEEDED  title (untrusted): "
+                     "- stage 1 task groundwork: ACCEPTED  title (untrusted): "
                      "Lay the groundwork\n"
                      "- stage 1 task notes: SUCCEEDED  title (untrusted): Collect notes\n"
                      "\n"

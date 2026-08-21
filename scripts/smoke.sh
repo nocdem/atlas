@@ -174,6 +174,38 @@ else
     bad "repository state changed by read commands"
 fi
 
+echo "== A12.0: the plan command exists in this binary"
+# The A9.2 lesson, checked against the shipped binary rather than the service
+# layer: a command can be wired everywhere except the argument parser and answer
+# `unknown command` while every test that calls the service layer passes. These
+# refusals are all local — no daemon, no policy, no socket — so they run here.
+plan_usage() {
+    label="$1"
+    want="$2"
+    shift 2
+    # `rc=$?` sits inside the `else`, not after the `fi`: after a `fi` with no
+    # else branch `$?` is the *if statement's* status, which is zero, and every
+    # one of these would then report "exited 0" about a command that exited 2.
+    if $A "$@" > /dev/null 2> "$WORK/stderr.txt"; then
+        bad "$label: exited 0"
+    else
+        rc=$?
+        msg="$(cat "$WORK/stderr.txt")"
+        if [ "$rc" -eq 2 ] && [ "${msg#*"$want"}" != "$msg" ]; then
+            ok "$label"
+        else
+            bad "$label: exit $rc, said: $msg"
+        fi
+    fi
+}
+plan_usage "atlas plan prints its own usage (exit 2)" "run|status|show|list" plan
+plan_usage "atlas plan run needs a repository and a goal" "--repo and --goal" plan run
+plan_usage "a plan needs the operator's gate floor" "at least one gate" \
+    plan run --repo smoke --goal "make it work"
+plan_usage "a resume names the plan and nothing else" "do not apply" \
+    plan run --resume p1 --goal "make it work"
+plan_usage "atlas plan show needs a revision" "--rev" plan show p1
+
 echo "== A5: backup, verification, restore and maintenance"
 
 capture --json backup create "$WORK/smoke.db" \

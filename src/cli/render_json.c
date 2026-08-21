@@ -2371,6 +2371,163 @@ static atlas_status j_operation_status(atlas_renderer *r, const atlas_operation_
     return st;
 }
 
+/* --- A12.0: plans ---------------------------------------------------------
+ *
+ * Same note as `j_job_item`: these strings are already safe-encoded by the
+ * daemon and are emitted through the JSON writer, which escapes for JSON
+ * structure. Neither step is the other, and neither is applied twice.
+ *
+ * The same fields the human renderer prints, from the same struct: one service
+ * result, two presentations. Every run and job field is emitted only when
+ * present — there is deliberately no empty-string spelling of "not submitted
+ * yet", because an empty identifier reads like an identifier. */
+static atlas_status j_plan_item(atlas_renderer *r, const atlas_plan_render *pr, atlas_err *err) {
+    atlas_json *j = r->j;
+    /* Inside the `plans` array this is an anonymous object; on its own it is a
+     * set of members on the document. The writer refuses an unkeyed object at
+     * the top level, which is the correct refusal and is why this branch
+     * exists. */
+    atlas_status st = pr->in_list ? atlas_json_obj_begin(j, err) : ATLAS_OK;
+    const struct {
+        const char *k;
+        const char *v;
+    } strs[] = {
+        {"plan", pr->plan},
+        {"repo", pr->repo},
+        {"status", pr->status},
+        {"created_at", pr->created_at},
+    };
+    for (size_t i = 0; st == ATLAS_OK && i < sizeof strs / sizeof strs[0]; i++) {
+        if (strs[i].v != NULL && strs[i].v[0] != '\0') {
+            st = atlas_json_key_str(j, strs[i].k, strs[i].v, err);
+        }
+    }
+    if (st == ATLAS_OK && pr->in_list) {
+        return atlas_json_obj_end(j, err);
+    }
+    if (st != ATLAS_OK || !pr->detail) {
+        return st;
+    }
+
+    /* The counts, each beside its compiled-in ceiling: a count with no bound
+     * next to it does not say whether the plan has budget left. */
+    const struct {
+        const char *k;
+        int64_t v;
+    } nums[] = {
+        {"rev_no", pr->rev_no},
+        {"revision_limit", ATLAS_PLAN_MAX_REVISIONS},
+        {"planner_jobs_seen", pr->planner_jobs_seen},
+        {"planner_job_limit", ATLAS_PLAN_MAX_PLANNER_JOBS},
+        {"stages_accepted", pr->stages_accepted},
+        {"revisions", pr->revision_count},
+    };
+    for (size_t i = 0; st == ATLAS_OK && i < sizeof nums / sizeof nums[0]; i++) {
+        st = atlas_json_key_int(j, nums[i].k, nums[i].v, err);
+    }
+    if (st == ATLAS_OK && pr->max_parallel > 0) {
+        st = atlas_json_key_int(j, "max_parallel", pr->max_parallel, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(j, "replan_wanted", pr->replan_wanted, err);
+    }
+    if (st == ATLAS_OK && pr->planner_job != NULL && pr->planner_job[0] != '\0') {
+        st = atlas_json_key_str(j, "planner_job", pr->planner_job, err);
+        if (st == ATLAS_OK && pr->planner_job_state != NULL) {
+            st = atlas_json_key_str(j, "planner_job_state", pr->planner_job_state, err);
+        }
+    }
+    /* The operator's own words and the operator's own commands, each with the
+     * encoding it arrived in stated beside it so a reader can decode it back. */
+    if (st == ATLAS_OK && pr->goal != NULL) {
+        st = atlas_json_key_str(j, "goal_encoding", "atlas-safe-1", err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "goal", pr->goal, err);
+        }
+    }
+    if (st == ATLAS_OK && pr->gate_floor_text != NULL) {
+        st = atlas_json_key_int(j, "gate_floor_count", pr->gate_floor_count, err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "gate_floor_encoding", "atlas-safe-1", err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "gate_floor_text", pr->gate_floor_text, err);
+        }
+    }
+
+    /* One label for the array rather than one per row: every `title` below is a
+     * planner's bytes, encoded the same way. */
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(j, "task_title_encoding", "atlas-safe-1", err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(j, "task_title_provenance", "UNTRUSTED_DATA", err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key(j, "tasks", err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_arr_begin(j, err);
+    }
+    for (size_t i = 0; st == ATLAS_OK && i < pr->task_count; i++) {
+        const atlas_plan_task_render *t = &pr->tasks[i];
+        st = atlas_json_obj_begin(j, err);
+        const struct {
+            const char *k;
+            const char *v;
+        } tf[] = {
+            {"key", t->key},   {"kind", t->kind}, {"title", t->title},
+            {"job", t->job},   {"job_state", t->job_state},
+            {"run", t->run},   {"run_status", t->run_status},
+            {"usage_model", t->usage_model},
+        };
+        for (size_t k = 0; st == ATLAS_OK && k < sizeof tf / sizeof tf[0]; k++) {
+            if (tf[k].v != NULL && tf[k].v[0] != '\0') {
+                st = atlas_json_key_str(j, tf[k].k, tf[k].v, err);
+            }
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_int(j, "stage", t->stage, err);
+        }
+        /* A10.0. Emitted only when observed. An absent measurement is not a
+         * zero: a worker that never reported a price spent something Atlas
+         * cannot name, and reporting that as 0 would be the lie. */
+        if (st == ATLAS_OK && t->has_cost) {
+            st = atlas_json_key_int(j, "usage_cost_micro_usd", t->usage_cost_micro_usd, err);
+        }
+        if (st == ATLAS_OK && t->has_turns) {
+            st = atlas_json_key_int(j, "usage_turns", t->usage_turns, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_obj_end(j, err);
+        }
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_arr_end(j, err);
+    }
+
+    if (st == ATLAS_OK && pr->content != NULL) {
+        /* A planner's bytes, labelled exactly as `job.artifact` labels the
+         * artifact they came from. */
+        st = atlas_json_key_int(j, "content_rev_no", pr->content_rev_no, err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "content_encoding", "atlas-safe-1", err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "content_provenance", "UNTRUSTED_DATA", err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "content", pr->content, err);
+        }
+    }
+    if (st == ATLAS_OK && pr->busy) {
+        /* Present only when true, and named so it cannot be read as a verdict
+         * about the plan: nothing was written and the plan is resumable. */
+        st = atlas_json_key_bool(j, "busy", true, err);
+    }
+    return st;
+}
+
 const atlas_renderer_vtbl ATLAS_RENDERER_JSON = {
     j_begin,      j_end,          j_note_repo,    j_note_query,   j_list_begin,
     j_list_end,   j_doctor,       j_version,      j_repo_item,    j_repo_added,
@@ -2398,6 +2555,8 @@ const atlas_renderer_vtbl ATLAS_RENDERER_JSON = {
     j_verify_intake,
     /* --- A9 --- */
     j_apikey_created, j_apikey_listed, j_apikey_revoked,
+    /* --- A12.0 --- */
+    j_plan_item,
 };
 
 void atlas_render_error(FILE *out, FILE *errout, bool json, const char *command,

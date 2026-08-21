@@ -8,6 +8,9 @@
 #define ATLAS_SERVICE_INTERNAL_H
 
 #include "atlas/ipc.h"
+#include "atlas/orchpolicy.h"
+#include "atlas/plandriver.h"
+#include "atlas/rundriver.h"
 #include "atlas/service.h"
 
 /* Loads a registered repository by name, or fails with a message naming it. */
@@ -47,5 +50,62 @@ typedef atlas_status (*atlas_service_build_fn)(atlas_json *j, void *ud, atlas_er
 atlas_status atlas_service_orch_call(atlas_ctx *ctx, const char *method,
                                      atlas_service_build_fn build, void *ud,
                                      atlas_ipc_response **out, atlas_buf *raw, atlas_err *err);
+
+/* --- A12.0: what `plan run` shares with `job run` and `dispatcher run` -------
+ *
+ * Two seams, both factored rather than copied, and for the same reason in both
+ * cases: a second implementation would be a second answer to a question the
+ * whole deployment has to agree on.
+ *
+ * `atlas_service_orch_driver_filter` writes this uid's driver partition as the
+ * comma-separated list a lease request carries — the model drivers when
+ * `model_partition`, the rest otherwise, and a repo-tree driver on neither. It
+ * refuses with a sentence when the policy configures no driver in that
+ * partition.
+ *
+ * `atlas_service_run_drive` runs A11.1's run driver on one run over this
+ * process's socket transport, with the run driver's options assembled from the
+ * caller's already-loaded, already-ENABLED root-owned policy. A run that ended
+ * BLOCKED is an answer: `ATLAS_OK`, with the status in `rep`. */
+atlas_status atlas_service_orch_driver_filter(const atlas_orchpolicy *pol, bool model_partition,
+                                              char *out, size_t out_size, atlas_err *err);
+
+atlas_status atlas_service_run_drive(const atlas_orchpolicy *pol, const char *run_uid, FILE *log,
+                                     atlas_rundriver_report *rep, atlas_err *err);
+
+/* --- A12.0: the plan transport's response readers ---------------------------
+ *
+ * Separated from the calls that fetch them so they can be proved without a
+ * daemon, exactly as `daemon_internal.h` exposes `atlas_server_dispatch` so the
+ * protocol can be tested without a socket. A plan read is gated by
+ * `require_submitter`, which reads the **root-owned** orchestration policy, and
+ * an unprivileged uid cannot create one anywhere — so the socket half of these
+ * is unreachable from the suite and the interesting half is not.
+ *
+ * Each is a pure function of one parsed `plan.get` response. Between them they
+ * carry the three obligations the plan transport has and nothing below it does:
+ *
+ *   - **the single `atlas-safe-1` decode** — the goal, the gate floor block, a
+ *     title and a prompt are decoded here and nowhere else, so the driver never
+ *     decodes and never re-encodes;
+ *   - **the merged gate list carried verbatim** — Atlas' own canonical
+ *     netstring, never decoded, never re-merged, byte-identical from the task
+ *     row to the submission;
+ *   - **the conservative value for every absent key** — an absent status stays
+ *     UNKNOWN, an absent job is an empty uid, and nothing is an error.
+ *
+ * `atlas_plan_read_task` additionally refuses a response describing a revision
+ * other than the one that was asked for: `plan.get` serves the *latest*
+ * revision's tasks, and a driver that submitted a superseded revision's stage
+ * would be running work the plan no longer holds.
+ *
+ * Every `out` is caller-initialised and is set, not appended to. */
+atlas_status atlas_plan_read_plan(const atlas_ipc_response *r, atlas_plandriver_plan *out,
+                                  atlas_err *err);
+atlas_status atlas_plan_read_state(const atlas_ipc_response *r, atlas_plan_state *out,
+                                   atlas_err *err);
+atlas_status atlas_plan_read_task(const atlas_ipc_response *r, const char *plan_uid, int rev_no,
+                                  const char *task_key, atlas_plandriver_task *out,
+                                  atlas_err *err);
 
 #endif /* ATLAS_SERVICE_INTERNAL_H */

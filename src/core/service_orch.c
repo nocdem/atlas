@@ -342,6 +342,55 @@ static atlas_status forward_row(const atlas_ipc_response *r, size_t index, void 
 
 /* --- the dispatcher -------------------------------------------------------------- */
 
+/* The driver filter is derived from the policy's own driver list rather than
+ * from a flag, so the two dispatchers partition the queue by construction:
+ * whatever needs a model goes to the operator's, everything else to the
+ * worker's. A driver added to the policy lands on exactly one of them.
+ *
+ * A12.0 shared it. The plan driver carries a planner job and a workspace sibling
+ * in its own foreground process, which means asking for the *same* partition
+ * this uid's background dispatcher would ask for — and a second derivation of
+ * "which drivers are mine" is a second answer to which process may run what. */
+atlas_status atlas_service_orch_driver_filter(const atlas_orchpolicy *pol, bool model_partition,
+                                              char *out, size_t out_size, atlas_err *err) {
+    size_t flen = 0;
+    out[0] = '\0';
+    for (size_t i = 0; i < pol->driver_count; i++) {
+        const atlas_driver *d = atlas_driver_find(pol->drivers[i]);
+        bool wants_model = (d != NULL && d->needs_live_model);
+        if (wants_model != model_partition) {
+            continue;
+        }
+        /* A11.1. A driver that works in the registered repository's own tree is
+         * never on a *dispatched* filter, however the policy lists it. A
+         * dispatcher provisions a workspace and would run the driver somewhere
+         * it was not meant to run, then complete the task — settling a run with
+         * no gate having run where the changes are.
+         *
+         * The daemon refuses such a grant to an unfiltered lease as well, and
+         * both checks are needed: that one catches "give me anything", this one
+         * catches a filter that names the driver because the policy did. Only
+         * the operator's foreground run driver asks for these by name — which is
+         * still true under A12.0, because the plan driver reaches a repo-tree
+         * task through `atlas_rundriver_run` and never through this filter. */
+        if (atlas_orch_driver_is_repo_tree(pol->drivers[i])) {
+            continue;
+        }
+        int n = snprintf(out + flen, out_size - flen, "%s%s", flen > 0 ? "," : "",
+                         pol->drivers[i]);
+        if (n > 0 && (size_t)n < out_size - flen) {
+            flen += (size_t)n;
+        }
+    }
+    if (out[0] == '\0') {
+        return atlas_err_set(err, ATLAS_ERR_CONFIG,
+                             "the orchestration policy configures no %s driver for this "
+                             "dispatcher to run",
+                             model_partition ? "model" : "non-model");
+    }
+    return ATLAS_OK;
+}
+
 atlas_status atlas_service_dispatcher_run(bool once, FILE *log, atlas_err *err) {
     /* Both policies are read here, from their compiled-in root-owned paths, and
      * neither can be overridden by an environment variable or a flag. A
@@ -383,43 +432,10 @@ atlas_status atlas_service_dispatcher_run(bool once, FILE *log, atlas_err *err) 
                              (long long)getuid());
     }
 
-    /* The driver filter is derived from the policy's own driver list rather than
-     * from a flag, so the two dispatchers partition the queue by construction:
-     * whatever needs a model goes to the operator's, everything else to the
-     * worker's. A driver added to the policy lands on exactly one of them. */
     char filter[256];
-    size_t flen = 0;
-    filter[0] = '\0';
-    for (size_t i = 0; i < op.driver_count; i++) {
-        const atlas_driver *d = atlas_driver_find(op.drivers[i]);
-        bool wants_model = (d != NULL && d->needs_live_model);
-        if (wants_model != is_model) {
-            continue;
-        }
-        /* A11.1. A driver that works in the registered repository's own tree is
-         * never on a *background* dispatcher's filter, however the policy lists
-         * it. This dispatcher provisions a workspace and would run the driver
-         * somewhere it was not meant to run, then complete the task — settling a
-         * run with no gate having run where the changes are.
-         *
-         * The daemon refuses such a grant to an unfiltered lease as well, and
-         * both checks are needed: that one catches "give me anything", this one
-         * catches a filter that names the driver because the policy did. Only
-         * the operator's foreground run driver asks for these by name. */
-        if (atlas_orch_driver_is_repo_tree(op.drivers[i])) {
-            continue;
-        }
-        int n = snprintf(filter + flen, sizeof(filter) - flen, "%s%s", flen > 0 ? "," : "",
-                         op.drivers[i]);
-        if (n > 0 && (size_t)n < sizeof(filter) - flen) {
-            flen += (size_t)n;
-        }
-    }
-    if (filter[0] == '\0') {
-        return atlas_err_set(err, ATLAS_ERR_CONFIG,
-                             "the orchestration policy configures no %s driver for this "
-                             "dispatcher to run",
-                             is_model ? "model" : "non-model");
+    atlas_status fs = atlas_service_orch_driver_filter(&op, is_model, filter, sizeof filter, err);
+    if (fs != ATLAS_OK) {
+        return fs;
     }
 
     char id[128];
@@ -961,6 +977,55 @@ atlas_status atlas_service_job_run_status(atlas_ctx *ctx, const char *run, atlas
     return st;
 }
 
+/* A11.1's run driver on one run, over this process's socket transport.
+ *
+ * A12.0 factored it out of `atlas_service_job_run` unchanged. `atlas plan run`
+ * drives each stage as an ordinary run, and it must do so through exactly this
+ * wiring — the same socket, the same policy fields, the same spool — because a
+ * second assembly of the run driver's options would be a second answer to what a
+ * stage of a plan runs under, and the difference would show up as a run that
+ * behaved differently depending on which command started it.
+ *
+ * `pol` is the caller's, already loaded from its compiled-in root-owned path and
+ * already checked ENABLED; it must outlive this synchronous call. A run that
+ * ended BLOCKED is an *answer* and returns ATLAS_OK with the status in `rep`. */
+atlas_status atlas_service_run_drive(const atlas_orchpolicy *pol, const char *run_uid, FILE *log,
+                                     atlas_rundriver_report *rep, atlas_err *err) {
+    run_xport x;
+    atlas_buf_init(&x.sock);
+    atlas_status st = atlas_ipc_socket_path(&x.sock, err);
+    if (st == ATLAS_OK) {
+        char id[128];
+        (void)snprintf(id, sizeof id, "atlas-run/%lld", (long long)getpid());
+        atlas_rundriver_opts ro;
+        memset(&ro, 0, sizeof(ro));
+        ro.run_uid = run_uid;
+        ro.dispatcher_id = id;
+        ro.live_model = pol->live_model;
+        ro.operator_session = atlas_orchpolicy_is_model_dispatcher(pol, (long long)getuid()) &&
+                              pol->model_uses_operator_session;
+        /* A12.0. The same two names the background dispatcher is given, from the
+         * same root-owned policy. */
+        ro.models.planner = pol->planner_model;
+        ro.models.executor = pol->executor_model;
+        /* A11.5a-R. Where a finished worker's result is made durable before the
+         * daemon is asked to accept it. The path comes from the root-owned
+         * policy — the same field that already says where this dispatcher owns
+         * its state — so it is a value the operator's machine configured and
+         * never one a task, an environment or a model chose. Empty in the policy
+         * means no spool, which is the behaviour that shipped before this. */
+        ro.spool_dir = pol->model_worker_root[0] != '\0' ? pol->model_worker_root : NULL;
+        ro.log = log;
+        ro.transport.apply = xport_apply;
+        ro.transport.run_get = xport_run_get;
+        ro.transport.job_get = xport_job_get;
+        ro.transport.ud = &x;
+        st = atlas_rundriver_run(&ro, rep, err);
+    }
+    atlas_buf_free(&x.sock);
+    return st;
+}
+
 atlas_status atlas_service_job_run(atlas_ctx *ctx, const atlas_job_run_opts *o,
                                    atlas_job_sink sink, void *ud, atlas_err *err) {
     const bool resuming = o->resume != NULL && o->resume[0] != '\0';
@@ -1058,40 +1123,9 @@ atlas_status atlas_service_job_run(atlas_ctx *ctx, const atlas_job_run_opts *o,
         return st;
     }
 
-    run_xport x;
-    atlas_buf_init(&x.sock);
-    st = atlas_ipc_socket_path(&x.sock, err);
-
     atlas_rundriver_report rep;
     atlas_rundriver_report_init(&rep);
-    if (st == ATLAS_OK) {
-        char id[128];
-        (void)snprintf(id, sizeof id, "atlas-run/%lld", (long long)getpid());
-        atlas_rundriver_opts ro;
-        memset(&ro, 0, sizeof(ro));
-        ro.run_uid = atlas_buf_cstr(&run_uid);
-        ro.dispatcher_id = id;
-        ro.live_model = pol.live_model;
-        ro.operator_session = atlas_orchpolicy_is_model_dispatcher(&pol, (long long)getuid()) &&
-                              pol.model_uses_operator_session;
-        /* A12.0. The same two names the background dispatcher is given, from the
-         * same root-owned policy. `pol` outlives this synchronous call. */
-        ro.models.planner = pol.planner_model;
-        ro.models.executor = pol.executor_model;
-        /* A11.5a-R. Where a finished worker's result is made durable before the
-         * daemon is asked to accept it. The path comes from the root-owned
-         * policy — the same field that already says where this dispatcher owns
-         * its state — so it is a value the operator's machine configured and
-         * never one a task, an environment or a model chose. Empty in the policy
-         * means no spool, which is the behaviour that shipped before this. */
-        ro.spool_dir = pol.model_worker_root[0] != '\0' ? pol.model_worker_root : NULL;
-        ro.log = o->log;
-        ro.transport.apply = xport_apply;
-        ro.transport.run_get = xport_run_get;
-        ro.transport.job_get = xport_job_get;
-        ro.transport.ud = &x;
-        st = atlas_rundriver_run(&ro, &rep, err);
-    }
+    st = atlas_service_run_drive(&pol, atlas_buf_cstr(&run_uid), o->log, &rep, err);
     if (st == ATLAS_OK && sink != NULL) {
         atlas_job_render jr;
         memset(&jr, 0, sizeof(jr));
@@ -1105,7 +1139,6 @@ atlas_status atlas_service_job_run(atlas_ctx *ctx, const atlas_job_run_opts *o,
         st = sink(&jr, ud, err);
     }
     atlas_rundriver_report_free(&rep);
-    atlas_buf_free(&x.sock);
     atlas_buf_free(&run_uid);
     return st;
 }

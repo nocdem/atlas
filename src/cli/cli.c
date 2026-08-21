@@ -69,6 +69,21 @@ void atlas_cli_print_help(FILE *out) {
         "  job get|cancel JOB        read or cancel one job\n"
         "  job list                  jobs this principal submitted\n"
         "  dispatcher run [--once]   run the job dispatcher (as atlas-worker)\n"
+        ,
+        ATLAS_VERSION_STRING, ATLAS_PHASE);
+    /* A12.0. A fifth split, for the reason the four below exist and by the same
+     * mechanism: the seven `plan` lines pushed the first literal past the length
+     * ISO C99 guarantees. Everything here prints exactly where it always did —
+     * this is where the first literal ends, not a reordering. */
+    (void)fprintf(
+        out,
+        "  plan run --repo NAME --goal TEXT --gate CMD [--gate CMD]...\n"
+        "                            [--parallel N] plan the goal, then drive every\n"
+        "                            stage as an ordinary run, in the foreground\n"
+        "  plan run --resume PLAN    carry on a plan that already exists\n"
+        "  plan status PLAN          what a plan is doing, derived on this read\n"
+        "  plan show PLAN --rev N    one revision's plan document (untrusted)\n"
+        "  plan list                 plans this principal created\n"
         "  doctor                     check the environment, database and search backend\n"
         "  repo add PATH [--name N]   register a git repository (read-only)\n"
         "  repo list                  list registered repositories\n"
@@ -111,9 +126,7 @@ void atlas_cli_print_help(FILE *out) {
         "  decision link add REPO SOURCE TARGET   relate one decision to another\n"
         "  decision link remove REPO SOURCE TARGET  withdraw a relation (--why required)\n"
         "  decision link note REPO SOURCE TARGET    record why, without changing links\n"
-        "  decision links REPO ID     one decision's relations, with why each exists\n"
-        ,
-        ATLAS_VERSION_STRING, ATLAS_PHASE);
+        "  decision links REPO ID     one decision's relations, with why each exists\n");
     /* A11.6. A fourth split, for the reason the three below exist and by the
      * same mechanism: `job submit --parent/--parallel` pushed the first literal
      * past the length ISO C99 guarantees. The three lines moved here print in
@@ -555,9 +568,29 @@ static atlas_status parse_args(cli_state *st, int argc, char **argv, bool *want_
                 if (ps != ATLAS_OK) {
                     return ps;
                 }
+            } else if (strcmp(a, "--goal") == 0) {
+                /* A12.0. `atlas plan run --goal TEXT`. The operator's own words,
+                 * sent verbatim; the service layer refuses one past the bound
+                 * rather than shortening it. */
+                if (i + 1 >= argc) {
+                    return atlas_err_set(err, ATLAS_ERR_USAGE, "--goal needs a description");
+                }
+                st->opts.plan.goal = argv[++i];
+            } else if (strcmp(a, "--rev") == 0) {
+                /* A12.0. `atlas plan show P --rev N`. Parsed rather than
+                 * `strtol`ed, for `--parallel`'s reason: `--rev nonsense`
+                 * becoming zero would silently ask for a different thing. */
+                if (i + 1 >= argc) {
+                    return atlas_err_set(err, ATLAS_ERR_USAGE, "--rev needs a revision number");
+                }
+                atlas_status rs = parse_long(argv[++i], "--rev", &st->opts.plan.rev, err);
+                if (rs != ATLAS_OK) {
+                    return rs;
+                }
             } else if (strcmp(a, "--resume") == 0) {
                 if (i + 1 >= argc) {
-                    return atlas_err_set(err, ATLAS_ERR_USAGE, "--resume needs a run identifier");
+                    return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                         "--resume needs a run or plan identifier");
                 }
                 st->opts.job.resume = argv[++i];
             } else if (strcmp(a, "--once") == 0) {
@@ -2509,7 +2542,7 @@ static bool is_a_command(const char *cmd) {
         "diff",    "daemon",  "sync",      "events",  "code",    "decision", "gate",
         "job",     "dispatcher", "backup", "maintenance", "service", "mcp",  "hook",
         "integrate", "version", "help", "context", "operation", "api-key", "gateway",
-        "verify",
+        "verify",   "plan",
     };
     for (size_t i = 0; i < sizeof COMMANDS / sizeof COMMANDS[0]; i++) {
         if (strcmp(cmd, COMMANDS[i]) == 0) {
@@ -3322,6 +3355,100 @@ static atlas_status run_job(cli_state *st, atlas_renderer *r, int64_t limit, atl
     return result;
 }
 
+/* --- A12.0: `atlas plan` --------------------------------------------------- */
+
+typedef struct plan_render_ctx {
+    atlas_renderer *r;
+} plan_render_ctx;
+
+static atlas_status emit_plan(const atlas_plan_render *pr, void *ud, atlas_err *err) {
+    plan_render_ctx *pc = (plan_render_ctx *)ud;
+    return pc->r->v->plan_item(pc->r, pr, err);
+}
+
+/* No `atlas_ctx`, deliberately, and for `run_job`'s reason exactly: a plan
+ * command speaks only to the daemon. Plan state lives in the index, `atlasd` is
+ * the only writer of it, and on a separated deployment no other account can open
+ * the file at all. These are dispatched before any context is opened, alongside
+ * `job` and `dispatcher`. */
+static atlas_status run_plan(cli_state *st, atlas_renderer *r, int64_t limit, atlas_err *err) {
+    const char *sub = st->operand_count > 0 ? st->operands[0] : NULL;
+    if (sub == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "atlas plan <run|status|show|list> (try: atlas help)");
+    }
+    plan_render_ctx pc = {r};
+    atlas_status result;
+
+    if (strcmp(sub, "run") == 0) {
+        /* A12.0. The one surface that starts a planner, and it is in the
+         * foreground because an operator asked for it in this terminal. It
+         * schedules nothing and leaves nothing running behind it. */
+        atlas_plan_run_opts o;
+        memset(&o, 0, sizeof(o));
+        o.repo = st->opts.job.repo;
+        o.goal = st->opts.plan.goal;
+        o.resume = st->opts.job.resume;
+        for (size_t g = 0; g < st->opts.job.gate_count; g++) {
+            o.gates[o.gate_count++] = st->opts.job.gates[g];
+        }
+        o.max_parallel = st->opts.job.parallel;
+        /* The narration goes to stderr, so `--json` still puts exactly one
+         * document on stdout. */
+        o.log = st->opts.json ? stderr : st->out;
+        result = renderer_open(r, st->opts.json, st->out, "plan run", err);
+        if (result == ATLAS_OK) {
+            result = atlas_service_plan_run(NULL, &o, emit_plan, &pc, err);
+        }
+    } else if (strcmp(sub, "status") == 0) {
+        const char *plan = st->operand_count > 1 ? st->operands[1] : NULL;
+        if (plan == NULL) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE, "usage: atlas plan status PLAN");
+        }
+        result = renderer_open(r, st->opts.json, st->out, "plan status", err);
+        if (result == ATLAS_OK) {
+            result = atlas_service_plan_status(NULL, plan, emit_plan, &pc, err);
+        }
+    } else if (strcmp(sub, "show") == 0) {
+        const char *plan = st->operand_count > 1 ? st->operands[1] : NULL;
+        if (plan == NULL || st->opts.plan.rev <= 0) {
+            /* Refused here, before a renderer is opened, so `--json` puts one
+             * document on stdout rather than a partial one and an error. The
+             * service layer refuses the same thing for any other caller — it is
+             * the contract — and this is the same arrangement `job submit` has
+             * with the daemon's own refusals. */
+            return atlas_err_set(err, ATLAS_ERR_USAGE, "usage: atlas plan show PLAN --rev N");
+        }
+        result = renderer_open(r, st->opts.json, st->out, "plan show", err);
+        if (result == ATLAS_OK) {
+            result = atlas_service_plan_show(NULL, plan, (int)st->opts.plan.rev, emit_plan, &pc,
+                                             err);
+        }
+    } else if (strcmp(sub, "list") == 0) {
+        result = renderer_open(r, st->opts.json, st->out, "plan list", err);
+        int64_t count = 0;
+        bool more = false;
+        if (result == ATLAS_OK) {
+            result = r->v->list_begin(r, "plans", err);
+        }
+        if (result == ATLAS_OK) {
+            result = atlas_service_plan_list(NULL, 0, limit, emit_plan, &pc, &count, &more, err);
+        }
+        if (result == ATLAS_OK) {
+            result = r->v->list_end(r, "plan", "plans", count, err);
+        }
+    } else {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "unknown plan subcommand \"%s\"", sub);
+    }
+
+    if (result == ATLAS_OK) {
+        result = renderer_close(r, err);
+    } else {
+        renderer_abort(r);
+    }
+    return result;
+}
+
 /* Whether the index this invocation names belongs to another account.
  *
  * Keyed on the data directory's *source* plus its ownership rather than on the
@@ -3577,6 +3704,16 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
         memset(&jr, 0, sizeof(jr));
         int64_t limit = st->opts.limit > 0 ? st->opts.limit : ATLAS_DEFAULT_LIMIT;
         return run_job(st, &jr, limit, err);
+    }
+
+    /* A12.0. Dispatched here, beside `job`, for the same reason: everything a
+     * plan command acts on arrives over the socket, and opening a context would
+     * try to prepare a data directory this uid may not own. */
+    if (strcmp(cmd, "plan") == 0) {
+        atlas_renderer pr;
+        memset(&pr, 0, sizeof(pr));
+        int64_t limit = st->opts.limit > 0 ? st->opts.limit : ATLAS_DEFAULT_LIMIT;
+        return run_plan(st, &pr, limit, err);
     }
 
     if (strcmp(cmd, "dispatcher") == 0) {

@@ -124,6 +124,16 @@ typedef enum atlas_plan_status {
  * "UNKNOWN" on a surface somebody trusts. */
 const char *atlas_plan_status_name(atlas_plan_status s);
 
+/* The reverse, for a client reading a status name off the wire. `false` leaves
+ * `*out` untouched, which is what an older daemon's unrecognised word and a
+ * missing key both have to mean: the caller's conservative value, never a guess.
+ *
+ * "UNKNOWN" is deliberately absent from the table, exactly as it is from
+ * `atlas_orch_run_status_parse`. It is the vocabulary's zero and no derivation
+ * of an existing plan produces it, so a daemon presenting it is reporting a
+ * defect and must not parse cleanly. */
+bool atlas_plan_status_parse(const char *name, atlas_plan_status *out);
+
 /* --- the parsed document ---------------------------------------------------
  *
  * What a planner proposed, after every bound and every shape check. Not yet
@@ -546,6 +556,46 @@ atlas_status atlas_db_plan_revisions(atlas_db *db, int64_t plan_id, atlas_plan_r
  * `atlas_plan_parse` and by nothing else. */
 atlas_status atlas_db_plan_revision_content(atlas_db *db, int64_t plan_id, int rev_no,
                                             atlas_buf *out, bool *found, atlas_err *err);
+
+/* --- one task row, whole -----------------------------------------------------
+ *
+ * `atlas_plan_task_view` above is the *derived state's* view of a task: what it
+ * is and what became of it. This is the stored row, including the two members
+ * that view deliberately does not carry — the executor's prompt and the merged
+ * gate list — because a driver about to submit a stage needs exactly those and
+ * nothing else does.
+ *
+ * They are read here rather than added to `atlas_plan_task_view` for a reason
+ * that is about ownership and not about size: `atlas_plan_state` is created by
+ * `memset` and abandoned by three callers and a test, and giving it owned
+ * buffers would give every one of them a leak to remember. A row read by key
+ * has one owner and one `_free`.
+ *
+ * **`validations` is Atlas' own canonical netstring and is never decoded here.**
+ * It is the bytes `orch_plan_tasks.validations` holds, which are the bytes
+ * `orch_jobs.validations` must come to hold, and a layer that split and re-merged
+ * them would be a second answer to what an accepted stage was gated on. */
+typedef struct atlas_plan_task_row {
+    char task_key[33];
+    int stage_no;
+    bool is_tree;
+    /* UNTRUSTED_DATA, both: a model wrote them. */
+    char title[ATLAS_PLAN_TITLE_MAX + 1];
+    atlas_buf prompt;
+    /* The merged list for a TREE task — the operator's floor verbatim and first,
+     * then the planner's additions — and empty for a SIDE task, which declares
+     * no gate. Owned; carried opaquely. */
+    atlas_buf validations;
+} atlas_plan_task_row;
+
+void atlas_plan_task_row_init(atlas_plan_task_row *t);
+void atlas_plan_task_row_free(atlas_plan_task_row *t);
+
+/* One task of one revision, by key. `*found` is false when the plan holds no
+ * such revision or the revision holds no such key, which is not an error for the
+ * same reason `atlas_db_plan_get`'s is not. */
+atlas_status atlas_db_plan_task(atlas_db *db, int64_t plan_id, int rev_no, const char *task_key,
+                                atlas_plan_task_row *out, bool *found, atlas_err *err);
 
 /* One page of one principal's plans. */
 typedef struct atlas_plan_list_row {

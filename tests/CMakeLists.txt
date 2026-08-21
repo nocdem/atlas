@@ -159,6 +159,8 @@ set(ATLAS_TESTS
   test_plan_db
   test_plan_rpc
   test_plan_driver
+  test_plan_render
+  test_plan_xport
   test_remote_equivalence
   test_operator_peer
   # The A8 operator-boundary fix: decision links over the socket, and the
@@ -346,6 +348,19 @@ set_tests_properties(test_plan_rpc PROPERTIES LABELS "daemon" TIMEOUT 900 RUN_SE
 # T8's. Labelled integration because it links the whole service layer, not
 # because it touches anything outside its own process.
 set_tests_properties(test_plan_driver PROPERTIES LABELS "integration")
+# A12.0. Both renderers for a plan, driven through the vtbl over a hand-built
+# service result. A unit test: no repository, no database, no socket and no
+# process. It exists because a plan read is gated by the root-owned
+# orchestration policy, so no fixture daemon this suite can start will ever
+# answer one — and because the two positional initializer lists have drifted
+# in this repository before.
+set_tests_properties(test_plan_render PROPERTIES LABELS "unit")
+# A12.0. The production plan transport's response readers, over documents the
+# real response parser parsed. A unit test for the same reason the renderer one
+# is: the socket half is gated by the root-owned orchestration policy and is
+# unreachable from this suite, and the half that carries the decode-once and
+# gates-verbatim obligations is not.
+set_tests_properties(test_plan_xport PROPERTIES LABELS "unit")
 # The lifecycle suite builds a real fixture repository, registers it through the
 # CLI and drives the one write point against an isolated database, so it is an
 # integration test. It sleeps for nothing: expiry and deadlines are supplied.

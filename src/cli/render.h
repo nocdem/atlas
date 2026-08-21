@@ -251,6 +251,25 @@ typedef struct atlas_renderer_vtbl {
                                   atlas_err *err);
     atlas_status (*apikey_revoked)(atlas_renderer *r, const char *key_id, bool changed,
                                    atlas_err *err);
+
+    /* --- A12.0: plans -----------------------------------------------------
+     *
+     * One method for a list row and for a detail view, exactly as `job_item`
+     * is one method for both: the fields are the same and only the depth
+     * differs, so two methods would be two places to forget a field.
+     *
+     * **Appended at the end of the struct on purpose.** Both positional
+     * initializer lists carry the same members in the same order, and this
+     * repository has already shipped a drift between them; adding a member in
+     * the middle shifts every offset after it, and adjacent entries with
+     * compatible signatures would misalign without a diagnostic. Added last, a
+     * missing implementation is a short initializer rather than a silently
+     * wrong one.
+     *
+     * Every untrusted string in `atlas_plan_render` — the goal, the gate floor
+     * block, a task title, a revision's document — arrived safe-encoded from
+     * the daemon and is printed as-is, like `job_item`'s task text. */
+    atlas_status (*plan_item)(atlas_renderer *r, const atlas_plan_render *pr, atlas_err *err);
 } atlas_renderer_vtbl;
 
 struct atlas_renderer {

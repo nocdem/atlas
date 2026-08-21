@@ -405,6 +405,71 @@ atlas_status atlas_db_plan_revision_content(atlas_db *db, int64_t plan_id, int r
     return s;
 }
 
+/* One stored task row, by key. See `atlas/plan.h` for why the prompt and the
+ * merged gate list are read here rather than carried on `atlas_plan_task_view`.
+ *
+ * The join is on `orch_plan_revisions` rather than on a revision id the caller
+ * held, because a caller that already resolved the revision would be a second
+ * place that decides which revision a `rev_no` means. */
+void atlas_plan_task_row_init(atlas_plan_task_row *t) {
+    memset(t, 0, sizeof(*t));
+    atlas_buf_init(&t->prompt);
+    atlas_buf_init(&t->validations);
+}
+
+void atlas_plan_task_row_free(atlas_plan_task_row *t) {
+    if (t == NULL) {
+        return;
+    }
+    atlas_buf_free(&t->prompt);
+    atlas_buf_free(&t->validations);
+    memset(t, 0, sizeof(*t));
+}
+
+atlas_status atlas_db_plan_task(atlas_db *db, int64_t plan_id, int rev_no, const char *task_key,
+                                atlas_plan_task_row *out, bool *found, atlas_err *err) {
+    static const char SQL[] =
+        "SELECT t.task_key, t.stage_no, t.kind, t.title, t.prompt, t.validations"
+        "  FROM orch_plan_tasks t"
+        "  JOIN orch_plan_revisions r ON r.id = t.revision_id"
+        "  WHERE r.plan_id = ?1 AND r.rev_no = ?2 AND t.task_key = ?3;";
+    *found = false;
+    sqlite3_stmt *st = NULL;
+    atlas_status s = atlas_db_prepare(db, SQL, &st, err);
+    if (s != ATLAS_OK) {
+        return s;
+    }
+    (void)sqlite3_bind_int64(st, 1, plan_id);
+    (void)sqlite3_bind_int64(st, 2, rev_no);
+    s = atlas_db_bind_text_opt(db, st, 3, task_key, err);
+    if (s == ATLAS_OK) {
+        int rc = sqlite3_step(st);
+        if (rc == SQLITE_ROW) {
+            s = atlas_db_col_copy(st, 0, out->task_key, sizeof(out->task_key), "task_key", err);
+            if (s == ATLAS_OK) {
+                out->stage_no = (int)sqlite3_column_int64(st, 1);
+                out->is_tree = strcmp(atlas_db_col_text(st, 2), "TREE") == 0;
+                s = atlas_db_col_copy(st, 3, out->title, sizeof(out->title), "title", err);
+            }
+            if (s == ATLAS_OK) {
+                /* Read by length, because a prompt is bytes: it was bounded and
+                 * checked free of NUL at the write point, and nothing here
+                 * re-interprets it. */
+                const char *p = atlas_db_col_text(st, 4);
+                s = atlas_buf_set(&out->prompt, p, p != NULL ? strlen(p) : 0u, err);
+            }
+            if (s == ATLAS_OK) {
+                s = atlas_buf_set_str(&out->validations, atlas_db_col_text(st, 5), err);
+            }
+            *found = (s == ATLAS_OK);
+        } else if (rc != SQLITE_DONE) {
+            s = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot read a plan task");
+        }
+    }
+    atlas_db_finish(db, st);
+    return s;
+}
+
 atlas_status atlas_db_plan_list(atlas_db *db, long long submitter_uid, int64_t after_id,
                                 int64_t limit, atlas_plan_list_cb cb, void *ud,
                                 int64_t *count_out, int64_t *cursor_out, bool *more_out,

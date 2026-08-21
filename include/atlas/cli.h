@@ -193,6 +193,23 @@ typedef struct atlas_cli_opts {
         const char *parent;
         long parallel;
     } job;
+    /* A12.0. `atlas plan run|status|show|list`. Only the two fields the plan
+     * commands do not already share with `job`: everything else a plan is given
+     * — `--repo`, `--gate`, `--parallel`, `--resume` — is the same flag with the
+     * same meaning, and giving it a second field would be a second place for
+     * the two to drift.
+     *
+     * There is deliberately no field here for a driver, a model, a stage or a
+     * task: what runs a plan's jobs is the root-owned policy's business and the
+     * plan driver's defaults, and a flag that chose one would be a way to ask
+     * for a worker the policy did not authorise. */
+    struct {
+        /* The operator's own words, ≤ ATLAS_PLAN_GOAL_MAX bytes, refused rather
+         * than truncated: a goal Atlas shortened is a goal nobody wrote. */
+        const char *goal;
+        /* `plan show P --rev N`: which revision's document to print. */
+        long rev;
+    } plan;
     /* A9.2.1. The verification-intake fields, grouped for the reason the A4
      * ones are: there are a dozen and a half of them, six subcommands use
      * them, and mixing them into the flat set would make every other command's

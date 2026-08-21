@@ -887,6 +887,136 @@ static void test_a_planner_jobs_artifact_becomes_a_revision(void) {
     edge_close(&g);
 }
 
+/* A12.0 T7. The two members of a stored task row a *driver* submits from, which
+ * `plan.get` carries only when a caller asks for them.
+ *
+ * The claim that matters is byte-identity of the merged gate list. The plan
+ * driver carries it opaquely from this response into `job.submit`, so if this
+ * round trip lost a byte an accepted stage would have been gated on something
+ * other than what the revision compiled — and nothing downstream could notice,
+ * because both ends would agree with themselves. The expectation is therefore
+ * built with the same encoder the write point merged with, never spelled out. */
+static void test_a_task_carries_its_prompt_and_merged_gates_when_asked(void) {
+    edge g;
+    edge_open(&g);
+    atlas_err err;
+    atlas_err_init(&err);
+    atlas_buf uid = ATLAS_BUF_INIT;
+    create_plan(&g, &uid);
+
+    /* `PLAN_ONE_STAGE` with one deliberate change: the planner's added gate
+     * carries a per cent escape. `%41` is exactly the sequence a stray
+     * safe-encode or safe-decode would rewrite, and a gate list of ordinary
+     * words survives either unchanged — so a test built only from those would
+     * pass whether or not the rule holds. `%` is printable ASCII, so the parser
+     * accepts it and a real operator could type it. */
+    static const char PLAN_ESCAPED_GATE[] = "atlas-plan-1\n"
+                                            "stage: 1\n"
+                                            "task: build\n"
+                                            "kind: tree\n"
+                                            "title: Build the thing\n"
+                                            "gate: make cover-%41\n"
+                                            "prompt<<\n"
+                                            "do the work\n"
+                                            ">>\n"
+                                            "task: notes\n"
+                                            "kind: side\n"
+                                            "title: Take notes\n"
+                                            "prompt<<\n"
+                                            "write it down\n"
+                                            ">>\n";
+    atlas_buf job = ATLAS_BUF_INIT;
+    planner_job(&g, atlas_buf_cstr(&uid), 1, "fake-plan", ATLAS_PLAN_ARTIFACT_NAME,
+                PLAN_ESCAPED_GATE, true, &job);
+    atlas_buf params = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_appendf(&params, &err,
+                           "{\"plan\":\"%s\",\"planner_job\":\"%s\",\"reason\":\"INITIAL\","
+                           "\"rev_no\":1}",
+                           atlas_buf_cstr(&uid), atlas_buf_cstr(&job)),
+         &err);
+    atlas_buf raw = ATLAS_BUF_INIT;
+    atlas_ipc_response *r = call_ok(&g, g.owner, "plan.revision_add", atlas_buf_cstr(&params),
+                                    &raw);
+    atlas_ipc_response_free(r);
+
+    const char *v = NULL;
+
+    /* Not asked for: absent. An operator's read of a plan carries no prompts,
+     * which is what keeps `plan status` the same size it was. */
+    atlas_buf plain = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_appendf(&plain, &err, "{\"plan\":\"%s\"}", atlas_buf_cstr(&uid)), &err);
+    r = call_ok(&g, g.owner, "plan.get", atlas_buf_cstr(&plain), &raw);
+    T_CHECK_MSG(!atlas_ipc_result_arr_obj_str(r, "tasks", 0, "prompt", &v),
+                "an unasked-for prompt travelled anyway");
+    T_CHECK_MSG(!atlas_ipc_result_arr_obj_str(r, "tasks", 0, "validations", &v),
+                "an unasked-for gate list travelled anyway");
+    atlas_ipc_response_free(r);
+
+    /* Asked for: both, on the tree task. */
+    atlas_buf want = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_appendf(&want, &err, "{\"plan\":\"%s\",\"task_detail\":true}",
+                           atlas_buf_cstr(&uid)),
+         &err);
+    r = call_ok(&g, g.owner, "plan.get", atlas_buf_cstr(&want), &raw);
+
+    T_CHECK(atlas_ipc_result_arr_obj_str(r, "tasks", 0, "key", &v) && strcmp(v, "build") == 0);
+    T_CHECK(atlas_ipc_result_arr_obj_str(r, "tasks", 0, "prompt_encoding", &v) &&
+            strcmp(v, "atlas-safe-1") == 0);
+    T_CHECK(atlas_ipc_result_arr_obj_str(r, "tasks", 0, "prompt", &v));
+    {
+        atlas_buf decoded = ATLAS_BUF_INIT;
+        T_OK(atlas_text_decode_safe(v, strlen(v), &decoded, &err), &err);
+        T_CHECK_MSG(strcmp(atlas_buf_cstr(&decoded), "do the work\n") == 0,
+                    "the tree task's prompt decoded to \"%s\"", atlas_buf_cstr(&decoded));
+        atlas_buf_free(&decoded);
+    }
+    /* The operator's floor verbatim and first, then the planner's addition —
+     * built here with the same encoder rather than written out, so this test
+     * cannot pass by agreeing with a respelling of the format. */
+    {
+        atlas_orch_argv merged[2];
+        atlas_orch_argv_init(&merged[0]);
+        atlas_orch_argv_init(&merged[1]);
+        T_OK(atlas_orch_gate_split("make pass", &merged[0], &err), &err);
+        T_OK(atlas_orch_gate_split("make cover-%41", &merged[1], &err), &err);
+        atlas_buf want_enc = ATLAS_BUF_INIT;
+        T_OK(atlas_orch_validations_encode(merged, 2u, &want_enc, &err), &err);
+        T_CHECK_MSG(strstr(atlas_buf_cstr(&want_enc), "%41") != NULL,
+                    "the expectation lost its escape: %s", atlas_buf_cstr(&want_enc));
+        T_CHECK(atlas_ipc_result_arr_obj_str(r, "tasks", 0, "validations", &v));
+        T_CHECK_MSG(v != NULL && strcmp(v, atlas_buf_cstr(&want_enc)) == 0,
+                    "the merged gate list came back as \"%s\", not \"%s\"",
+                    v != NULL ? v : "(absent)", atlas_buf_cstr(&want_enc));
+        atlas_buf_free(&want_enc);
+        atlas_orch_argv_free(&merged[0]);
+        atlas_orch_argv_free(&merged[1]);
+    }
+
+    /* The workspace sibling has a prompt and no gate list: a side task declares
+     * none, and an empty key would read as an empty list rather than as the
+     * absence of one. */
+    T_CHECK(atlas_ipc_result_arr_obj_str(r, "tasks", 1, "key", &v) && strcmp(v, "notes") == 0);
+    T_CHECK(atlas_ipc_result_arr_obj_str(r, "tasks", 1, "prompt", &v));
+    {
+        atlas_buf decoded = ATLAS_BUF_INIT;
+        T_OK(atlas_text_decode_safe(v, strlen(v), &decoded, &err), &err);
+        T_CHECK_MSG(strcmp(atlas_buf_cstr(&decoded), "write it down\n") == 0,
+                    "the side task's prompt decoded to \"%s\"", atlas_buf_cstr(&decoded));
+        atlas_buf_free(&decoded);
+    }
+    T_CHECK_MSG(!atlas_ipc_result_arr_obj_str(r, "tasks", 1, "validations", &v),
+                "a workspace sibling reported a gate list");
+    atlas_ipc_response_free(r);
+
+    atlas_buf_free(&want);
+    atlas_buf_free(&plain);
+    atlas_buf_free(&raw);
+    atlas_buf_free(&params);
+    atlas_buf_free(&job);
+    atlas_buf_free(&uid);
+    edge_close(&g);
+}
+
 /* Every binding refusal, driven through the edge. */
 static void test_only_a_planner_jobs_own_artifact_can_become_a_revision(void) {
     edge g;
@@ -1256,6 +1386,8 @@ static const atlas_test TESTS[] = {
      test_a_plan_creation_is_refused_rather_than_adjusted},
     {"a planner job's artifact becomes a revision",
      test_a_planner_jobs_artifact_becomes_a_revision},
+    {"a task carries its prompt and merged gates when asked",
+     test_a_task_carries_its_prompt_and_merged_gates_when_asked},
     {"only a planner job's own artifact can become a revision",
      test_only_a_planner_jobs_own_artifact_can_become_a_revision},
     {"a gate floor is held to the submit path's strictness",

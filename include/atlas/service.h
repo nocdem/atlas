@@ -17,6 +17,7 @@
 #include "atlas/backup.h"
 #include "atlas/code.h"
 #include "atlas/orch_usage.h"
+#include "atlas/plan.h"
 #include "atlas/sem.h"
 #include "atlas/sem_schedule.h"
 #include "atlas/datadir.h"
@@ -1269,13 +1270,141 @@ atlas_status atlas_plan_wire_revision_add(atlas_ctx *ctx, const atlas_plan_revis
                                           int *line_out, atlas_err *err);
 
 /* Reads one plan. `rev_no` above zero also asks for that revision's document,
- * which comes back safe-encoded and labelled UNTRUSTED_DATA. */
-atlas_status atlas_plan_wire_get(atlas_ctx *ctx, const char *plan, int rev_no,
+ * which comes back safe-encoded and labelled UNTRUSTED_DATA.
+ *
+ * `task_detail` additionally asks each task for the two members a driver submits
+ * from — the executor prompt and the merged gate list. It is off for every
+ * operator-facing surface: those two are the wide part of the document and
+ * nothing an operator reads needs them. */
+atlas_status atlas_plan_wire_get(atlas_ctx *ctx, const char *plan, int rev_no, bool task_detail,
                                  atlas_ipc_response **out, atlas_buf *raw, atlas_err *err);
 
 /* One page of this principal's plans. */
 atlas_status atlas_plan_wire_list(atlas_ctx *ctx, int64_t after, int64_t limit,
                                   atlas_ipc_response **out, atlas_buf *raw, atlas_err *err);
+
+/* --- A12.0: the four plan commands ------------------------------------------
+ *
+ * `atlas plan run|status|show|list`. One service result and two renderers, as
+ * every command in this binary has been since A0.
+ *
+ * **Every string in the render structs is borrowed** — from the parsed response
+ * these were filled from, which the service layer keeps alive across the sink
+ * call and frees afterwards, exactly as `atlas_job_render` borrows from
+ * `job.get`'s. A renderer copies nothing and must not retain anything.
+ *
+ * Every untrusted value — the goal, the gate floor block, a task title, a
+ * revision's document — arrived **already safe-encoded from the daemon**, so a
+ * renderer prints it as-is and labels it. Encoding it a second time is how `%2F`
+ * becomes `%252F`; both renderers say so at the top of the file. */
+typedef struct atlas_plan_task_render {
+    const char *key;
+    const char *kind; /* "TREE" or "SIDE" — Atlas' own vocabulary */
+    const char *title; /* already in the safe text encoding */
+    /* NULL until the task has been submitted. An absent job is an absent line,
+     * never an empty identifier: the two read differently and only one is
+     * true. */
+    const char *job;
+    const char *job_state;
+    /* Tree tasks only: the run the task's stage became, and how it settled. */
+    const char *run;
+    const char *run_status;
+    /* A10.0's per-attempt measurement, rolled up over this task's job. Present
+     * only when something was measured — an absent measurement is not a zero,
+     * and printing one as 0 would turn "we do not know" into "it was free". */
+    const char *usage_model; /* already in the safe text encoding */
+    int64_t usage_cost_micro_usd;
+    int64_t usage_turns;
+    bool has_cost;
+    bool has_turns;
+    int64_t stage;
+} atlas_plan_task_render;
+
+typedef struct atlas_plan_render {
+    const char *plan;
+    const char *repo;
+    /* The derived status, from `atlas_plan_status_name`. Derived by the daemon
+     * on the read that produced it and never stored anywhere. */
+    const char *status;
+    const char *created_at;
+    /* The operator's own words and the operator's own commands, both already in
+     * the safe text encoding. The floor is one command per line, so its newlines
+     * are escaped like every other C0 byte. */
+    const char *goal;
+    const char *gate_floor_text;
+    /* The plan's latest planner job, when it has one. */
+    const char *planner_job;
+    const char *planner_job_state;
+    /* `plan show P --rev N` only: that revision's document, a planner's bytes,
+     * already safe-encoded and labelled UNTRUSTED_DATA. NULL otherwise. */
+    const char *content;
+    int64_t content_rev_no;
+    int64_t max_parallel;
+    int64_t gate_floor_count;
+    int64_t rev_no;
+    int64_t planner_jobs_seen;
+    int64_t stages_accepted;
+    int64_t revision_count;
+    bool replan_wanted;
+    /* `plan run` only: the daemon was busy and took nothing. Neither an
+     * acceptance nor a refusal — the plan is untouched and resumable, and the
+     * same invocation may simply be repeated. */
+    bool busy;
+    atlas_plan_task_render tasks[ATLAS_PLAN_MAX_TASKS];
+    size_t task_count;
+    /* True for `plan run|status|show`, which print every field; false for a list
+     * row. One method, two depths — `job_item`'s shape, for its reason. */
+    bool detail;
+    /* True only inside a `plans` array, where a row is an anonymous object. A
+     * single result is a set of members on the document itself, and the JSON
+     * writer refuses an unkeyed object at the top level. */
+    bool in_list;
+} atlas_plan_render;
+
+typedef atlas_status (*atlas_plan_sink)(const atlas_plan_render *pr, void *ud, atlas_err *err);
+
+/* What `atlas plan run` was asked for. Mirrors `atlas_job_run_opts`: a goal and
+ * a gate floor create a plan, or `resume` carries an existing one and nothing
+ * else may be named beside it. */
+typedef struct atlas_plan_run_opts {
+    const char *repo;
+    const char *goal;
+    /* An existing plan to carry on. Naming a goal, a gate or a parallelism
+     * beside it is refused rather than ignored — A10.1's `--memory --resume`
+     * rule: a flag that was quietly dropped reads exactly like one that was
+     * honoured. */
+    const char *resume;
+    const char *gates[8];
+    size_t gate_count;
+    /* 0 is "not stated", which the daemon resolves to its own default. Outside
+     * `1..ATLAS_ORCH_RUN_MAX_PARALLEL` it is refused with the bound named,
+     * never clamped. */
+    int64_t max_parallel;
+    /* Where the loop narrates. `stderr` under `--json`, so exactly one document
+     * reaches stdout. */
+    FILE *log;
+} atlas_plan_run_opts;
+
+/* Creates or resumes a plan and drives it in the foreground until it is
+ * COMPLETED or BLOCKED, until nothing this process can do would move it, or
+ * until the driver's own defect guard. Reads the root-owned orchestration policy
+ * itself and refuses to start when orchestration is disabled.
+ *
+ * A plan that ended BLOCKED is an *answer*, reported through the sink exactly as
+ * a BLOCKED run is, and not an error. */
+atlas_status atlas_service_plan_run(atlas_ctx *ctx, const atlas_plan_run_opts *o,
+                                    atlas_plan_sink sink, void *ud, atlas_err *err);
+
+/* One plan, read. `rev_no` above zero also asks for that revision's document. */
+atlas_status atlas_service_plan_status(atlas_ctx *ctx, const char *plan, atlas_plan_sink sink,
+                                       void *ud, atlas_err *err);
+atlas_status atlas_service_plan_show(atlas_ctx *ctx, const char *plan, int rev_no,
+                                     atlas_plan_sink sink, void *ud, atlas_err *err);
+
+/* One page of this principal's plans. */
+atlas_status atlas_service_plan_list(atlas_ctx *ctx, int64_t after, int64_t limit,
+                                     atlas_plan_sink sink, void *ud, int64_t *count_out,
+                                     bool *more_out, atlas_err *err);
 
 /* --- A7.1: the remaining read commands, answered by the daemon --------------
  *

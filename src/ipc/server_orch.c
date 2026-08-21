@@ -1383,8 +1383,8 @@ static atlas_status emit_revision(const atlas_plan_revision_row *row, void *ud, 
  * state — the distinction `atlas_db_plan_state_derive` draws and the reason it
  * clears a side task's run identifier. Both are emitted as they are stored; the
  * *plan's* status is the derived one, above, and is not recomputed from these. */
-static atlas_status emit_task(dispatch_state *ds, const atlas_plan_task_view *t,
-                              atlas_err *err) {
+static atlas_status emit_task(dispatch_state *ds, int64_t plan_id, int rev_no,
+                              const atlas_plan_task_view *t, bool with_detail, atlas_err *err) {
     atlas_status st = atlas_json_obj_begin(ds->j, err);
     if (st == ATLAS_OK) {
         st = atlas_json_key_str(ds->j, "key", t->task_key, err);
@@ -1399,6 +1399,44 @@ static atlas_status emit_task(dispatch_state *ds, const atlas_plan_task_view *t,
      * is emitted once, beside it. */
     if (st == ATLAS_OK) {
         st = atlas_json_key_str(ds->j, "title", atlas_safe(&ds->safe, t->title), err);
+    }
+    /* A12.0 T7. The two members of the stored row a *driver* needs and a reader
+     * does not: the executor's prompt and the merged gate list.
+     *
+     * Asked for rather than always sent, because they are the wide part of this
+     * document — eight prompts of up to 16 KiB each, safe-encoded — and the plan
+     * driver re-reads the derived state at the top of every iteration. `plan
+     * status`, `plan show` and `plan list` never ask, so the surface an operator
+     * reads did not grow at all.
+     *
+     * The prompt is a planner's bytes and is encoded and labelled here like every
+     * other one. The merged list is **Atlas' own canonical netstring**, emitted
+     * exactly as `dispatch.lease` emits a job's, and is deliberately not encoded:
+     * it must reach `job.submit` byte-identical or an accepted stage would have
+     * been gated on something other than what the revision compiled. */
+    if (st == ATLAS_OK && with_detail) {
+        atlas_plan_task_row row;
+        atlas_plan_task_row_init(&row);
+        bool have = false;
+        st = atlas_db_plan_task(ds->db, plan_id, rev_no, t->task_key, &row, &have, err);
+        if (st == ATLAS_OK && !have) {
+            /* The derived state named this task, so the row exists. Its absence
+             * here is a defect in Atlas rather than an answer about the plan. */
+            st = atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                               "revision %d names task %s and holds no row for it", rev_no,
+                               t->task_key);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(ds->j, "prompt_encoding", "atlas-safe-1", err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(ds->j, "prompt",
+                                    atlas_safe(&ds->safe, atlas_buf_cstr(&row.prompt)), err);
+        }
+        if (st == ATLAS_OK && row.validations.len > 0) {
+            st = atlas_json_key_str(ds->j, "validations", atlas_buf_cstr(&row.validations), err);
+        }
+        atlas_plan_task_row_free(&row);
     }
     /* The job is emitted only when the task has become one. An empty
      * job-uid-shaped string would read as an identifier; an absent key reads as
@@ -1461,6 +1499,11 @@ static atlas_status method_plan_get(dispatch_state *ds, const atlas_ipc_request 
     }
     int64_t want_rev = 0;
     bool with_content = atlas_ipc_param_int(req, "rev_no", &want_rev);
+    /* A12.0 T7. Whether each task also carries the two members a driver submits
+     * from. Absent is false, which is what every operator-facing surface sends
+     * and what an older client sends. */
+    bool with_task_detail = false;
+    (void)atlas_ipc_param_bool(req, "task_detail", &with_task_detail);
 
     atlas_plan_view v;
     atlas_plan_view_init(&v);
@@ -1560,7 +1603,7 @@ static atlas_status method_plan_get(dispatch_state *ds, const atlas_ipc_request 
         st = atlas_json_arr_begin(ds->j, err);
     }
     for (int i = 0; st == ATLAS_OK && i < state.task_count; i++) {
-        st = emit_task(ds, &state.tasks[i], err);
+        st = emit_task(ds, v.id, state.rev_no, &state.tasks[i], with_task_detail, err);
     }
     if (st == ATLAS_OK) {
         st = atlas_json_arr_end(ds->j, err);

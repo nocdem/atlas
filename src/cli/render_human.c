@@ -2630,6 +2630,131 @@ static atlas_status h_operation_status(atlas_renderer *r, const atlas_operation_
     return ATLAS_OK;
 }
 
+/* --- A12.0: plans ---------------------------------------------------------
+ *
+ * Same note as `h_job_item`: every untrusted string here reached the CLI already
+ * safe-encoded by the daemon — the goal, the gate floor block, a task title and
+ * a revision's document — so each is printed as-is and labelled rather than
+ * encoded a second time. Double encoding is how `%2F` becomes `%252F`.
+ *
+ * One method, two depths. A list row is four columns; a detail view is the plan,
+ * what it is doing, what the operator asked for, and one line per task. */
+static atlas_status h_plan_item(atlas_renderer *r, const atlas_plan_render *pr, atlas_err *err) {
+    (void)err;
+    FILE *out = r->out;
+    if (!pr->detail) {
+        (void)fprintf(out, "%-34s %-13s %-10s %s\n", dash_if_empty(pr->plan),
+                      dash_if_empty(pr->status), dash_if_empty(pr->repo),
+                      dash_if_empty(pr->created_at));
+        return ATLAS_OK;
+    }
+    if (pr->plan != NULL && pr->plan[0] != '\0') {
+        (void)fprintf(out, "plan          %s\n", pr->plan);
+    }
+    if (pr->repo != NULL && pr->repo[0] != '\0') {
+        (void)fprintf(out, "repository    %s\n", pr->repo);
+    }
+    /* Derived by the daemon on the read that produced it. There is no status
+     * column, so this is not a value anybody wrote. */
+    (void)fprintf(out, "status        %s\n", dash_if_empty(pr->status));
+    if (pr->created_at != NULL && pr->created_at[0] != '\0') {
+        (void)fprintf(out, "created       %s\n", pr->created_at);
+    }
+    if (pr->plan != NULL && pr->plan[0] != '\0') {
+        /* Both bounds are stated beside both counts, because a number with no
+         * ceiling beside it does not say whether a plan has budget left. */
+        (void)fprintf(out, "revision      %lld of %d\n", (long long)pr->rev_no,
+                      ATLAS_PLAN_MAX_REVISIONS);
+        (void)fprintf(out, "planner jobs  %lld of %d\n", (long long)pr->planner_jobs_seen,
+                      ATLAS_PLAN_MAX_PLANNER_JOBS);
+        /* How many of this revision's stages Atlas accepted. The denominator is
+         * the revision's own tree tasks — one per stage, by construction — and
+         * is counted from what arrived rather than assumed, so a plan with no
+         * compiled revision prints "0 of 0" rather than a bound it does not
+         * have. */
+        int64_t stages = 0;
+        for (size_t i = 0; i < pr->task_count; i++) {
+            if (pr->tasks[i].kind != NULL && strcmp(pr->tasks[i].kind, "TREE") == 0) {
+                stages++;
+            }
+        }
+        (void)fprintf(out, "stages        %lld of %lld accepted\n",
+                      (long long)pr->stages_accepted, (long long)stages);
+    }
+    if (pr->max_parallel > 0) {
+        (void)fprintf(out, "parallel      %lld task(s) at once\n", (long long)pr->max_parallel);
+    }
+    if (pr->planner_job != NULL && pr->planner_job[0] != '\0') {
+        (void)fprintf(out, "planner job   %s (%s)\n", pr->planner_job,
+                      dash_if_empty(pr->planner_job_state));
+    }
+    if (pr->replan_wanted) {
+        (void)fprintf(out, "replan        wanted\n");
+    }
+    if (pr->goal != NULL && pr->goal[0] != '\0') {
+        /* Labelled, because they are an operator's words rather than Atlas'. */
+        (void)fprintf(out, "goal (untrusted, atlas-safe-1)\n  %s\n", pr->goal);
+    }
+    if (pr->gate_floor_text != NULL && pr->gate_floor_text[0] != '\0') {
+        /* The floor as the daemon rendered it: one command per line, and the
+         * line separators are escaped like every other C0 byte, which is what
+         * `atlas-safe-1` beside it means. */
+        (void)fprintf(out, "gate floor    %lld command(s), atlas-safe-1\n  %s\n",
+                      (long long)pr->gate_floor_count, pr->gate_floor_text);
+    }
+    for (size_t i = 0; i < pr->task_count; i++) {
+        const atlas_plan_task_render *t = &pr->tasks[i];
+        (void)fprintf(out, "stage %lld task %s [%s]", (long long)t->stage, dash_if_empty(t->key),
+                      t->kind != NULL && strcmp(t->kind, "TREE") == 0 ? "tree" : "side");
+        /* Printed only when present. A task nobody has submitted is an absent
+         * state, never an empty one. */
+        if (t->job_state != NULL && t->job_state[0] != '\0') {
+            (void)fprintf(out, " %s", t->job_state);
+        }
+        if (t->run != NULL && t->run[0] != '\0') {
+            (void)fprintf(out, " run %s", t->run);
+            if (t->run_status != NULL && t->run_status[0] != '\0') {
+                (void)fprintf(out, " %s", t->run_status);
+            }
+        }
+        (void)fprintf(out, "\n");
+        if (t->title != NULL && t->title[0] != '\0') {
+            (void)fprintf(out, "  title (untrusted, atlas-safe-1)  %s\n", t->title);
+        }
+        /* A10.0. What the attempt cost, and only when something was measured: an
+         * absent measurement is not a zero, and printing one as 0 would turn "we
+         * do not know" into "it was free". */
+        if (t->usage_model != NULL || t->has_cost || t->has_turns) {
+            (void)fprintf(out, "  model %s", dash_if_empty(t->usage_model));
+            if (t->has_cost) {
+                (void)fprintf(out, ", cost %lld.%06lld USD",
+                              (long long)(t->usage_cost_micro_usd / ATLAS_USAGE_COST_SCALE),
+                              (long long)(t->usage_cost_micro_usd % ATLAS_USAGE_COST_SCALE));
+            }
+            if (t->has_turns) {
+                (void)fprintf(out, ", %lld turn(s)", (long long)t->usage_turns);
+            }
+            (void)fprintf(out, "\n");
+        }
+    }
+    if (pr->content != NULL) {
+        /* A planner's bytes, labelled exactly as `job.artifact` labels the
+         * artifact they came from — which is where they came from. */
+        (void)fprintf(out, "plan document r%lld (untrusted, atlas-safe-1)\n  %s\n",
+                      (long long)pr->content_rev_no, pr->content);
+    }
+    if (pr->busy) {
+        /* Said in full, because the short version of it reads like a refusal.
+         * Nothing was written, the plan is untouched, and repeating the command
+         * is safe. */
+        (void)fprintf(out,
+                      "\nThe Atlas daemon was busy and took nothing, so this invocation started\n"
+                      "less than it could have and wrote nothing extra. The plan is untouched\n"
+                      "and this command can simply be run again.\n");
+    }
+    return ATLAS_OK;
+}
+
 const atlas_renderer_vtbl ATLAS_RENDERER_HUMAN = {
     h_begin,      h_end,          h_note_repo,    h_note_query,   h_list_begin,
     h_list_end,   h_doctor,       h_version,      h_repo_item,    h_repo_added,
@@ -2657,4 +2782,6 @@ const atlas_renderer_vtbl ATLAS_RENDERER_HUMAN = {
     h_verify_intake,
     /* --- A9 --- */
     h_apikey_created, h_apikey_listed, h_apikey_revoked,
+    /* --- A12.0 --- */
+    h_plan_item,
 };

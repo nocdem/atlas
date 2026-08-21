@@ -11,6 +11,7 @@
 #include <string.h>
 
 #include "atlas/atlas.h"
+#include "atlas/plan.h"
 #include "atlas_test.h"
 #include "support/fixture.h"
 #include "support/jsoncheck.h"
@@ -638,6 +639,137 @@ static void test_unscanned_repo_reports_clearly(void) {
     env_close(&e);
 }
 
+/* A12.0. The `plan` command, through the built binary and nothing else.
+ *
+ * This is the A9.2 lesson written as a test. A command can be wired everywhere
+ * except the argument parser and the dispatch chain — service function, both
+ * renderers, help text — and every test that calls the service layer will pass
+ * while the binary answers `unknown command`, because nothing else in the suite
+ * drives the argument parser for a command that does not exist yet. `verify`
+ * shipped into a real deployment that way. So each case here runs the real argv
+ * path and asserts on the *sentence*, which is what distinguishes "the command
+ * exists and refused" from "there is no such command".
+ *
+ * **What this cannot reach is `COMMANDS[]`.** `plan` is dispatched before any
+ * context is opened, exactly as `job` is, and `is_a_command` is consulted only
+ * further down, on the foreign-index path a system deployment takes. Its entry
+ * is still required — without it a client on a system deployment is told the
+ * index is daemon-owned rather than that it mistyped — and it is still a place
+ * this suite cannot check, which is what CLAUDE.md says about it. The flags,
+ * the dispatch, the refusals and the help text are what is proved here.
+ *
+ * Every case is reachable with no daemon: each refusal is a local one, made
+ * before the socket is opened and before the root-owned policy is read, because
+ * a caller who typed a contradiction should learn it whether or not this machine
+ * runs orchestration at all. */
+static void test_the_plan_command_is_wired(void) {
+    cli_env e;
+    env_open(&e);
+    run_result r;
+
+    /* The command exists. Its own usage sentence, not `unknown command` — which
+     * is what an unwired command answers. */
+    const char *bare[] = {"plan"};
+    run_atlas(&e, &r, bare, 1u);
+    T_EQ_INT(r.exit_code, ATLAS_ERR_USAGE);
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&r.errout), "run|status|show|list") != NULL,
+                "atlas plan said: %s", atlas_buf_cstr(&r.errout));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&r.errout), "unknown command") == NULL,
+                "atlas plan is not dispatched at all: %s", atlas_buf_cstr(&r.errout));
+    result_free(&r);
+
+    /* And the refusal is one valid JSON document, because this one is made
+     * before a renderer is opened. */
+    const char *bare_json[] = {"--json", "plan"};
+    run_atlas(&e, &r, bare_json, 2u);
+    T_EQ_INT(r.exit_code, ATLAS_ERR_USAGE);
+    expect_json(&r);
+    expect_json_raw(&r, "ok", "false");
+    expect_json_string(&r, "command", "plan");
+    result_free(&r);
+
+    const char *bogus[] = {"plan", "definitely-not-a-subcommand"};
+    run_atlas(&e, &r, bogus, 2u);
+    T_EQ_INT(r.exit_code, ATLAS_ERR_USAGE);
+    T_CHECK(strstr(atlas_buf_cstr(&r.errout), "unknown plan subcommand") != NULL);
+    result_free(&r);
+
+    /* The local refusals, each mirroring `job run`'s. */
+    struct {
+        const char *args[8];
+        size_t n;
+        const char *expect;
+    } cases[] = {
+        {{"plan", "run"}, 2u, "--repo and --goal"},
+        /* A plan with no operator gate could only ever be accepted on a model's
+         * word, so it is refused at the only moment it can still be fixed. */
+        {{"plan", "run", "--repo", "r", "--goal", "g"}, 6u, "at least one gate"},
+        /* Refused rather than ignored, A10.1's `--memory --resume` rule: a flag
+         * that was quietly dropped reads exactly like one that was honoured. */
+        {{"plan", "run", "--resume", "p1", "--goal", "g"}, 6u, "do not apply"},
+        {{"plan", "run", "--resume", "p1", "--gate", "make test"}, 6u, "cannot be changed"},
+        {{"plan", "run", "--resume", "p1", "--parallel", "2"}, 6u, "cannot be changed"},
+        /* Refused with the bound named, never clamped. */
+        {{"plan", "run", "--repo", "r", "--goal", "g", "--gate", "make test"}, 8u, NULL},
+        {{"plan", "show", "p1"}, 3u, "--rev"},
+        {{"plan", "status"}, 2u, "usage: atlas plan status"},
+        {{"plan", "show"}, 2u, "usage: atlas plan show"},
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        if (cases[i].expect == NULL) {
+            continue; /* the well-formed line; it needs a daemon and is not run here */
+        }
+        run_atlas(&e, &r, cases[i].args, cases[i].n);
+        T_EQ_INT(r.exit_code, ATLAS_ERR_USAGE);
+        T_CHECK_MSG(strstr(atlas_buf_cstr(&r.errout), cases[i].expect) != NULL,
+                    "atlas %s %s said: %s", cases[i].args[0], cases[i].args[1],
+                    atlas_buf_cstr(&r.errout));
+        result_free(&r);
+    }
+
+    /* A parallelism outside the bound is refused with the bound named. */
+    const char *wide[] = {"plan",   "run",  "--repo",     "r", "--goal",
+                          "g",      "--gate", "make test", "--parallel", "9"};
+    run_atlas(&e, &r, wide, 10u);
+    T_EQ_INT(r.exit_code, ATLAS_ERR_USAGE);
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&r.errout), "between 1 and") != NULL,
+                "a parallelism of 9 said: %s", atlas_buf_cstr(&r.errout));
+    result_free(&r);
+
+    /* A goal past the bound is refused, not truncated: a goal Atlas shortened is
+     * a goal nobody wrote, and the planner would be answering it. Built from the
+     * macro rather than written out, so moving the bound moves the test. */
+    {
+        atlas_err err;
+        atlas_err_init(&err);
+        atlas_buf big = ATLAS_BUF_INIT;
+        for (int i = 0; i <= ATLAS_PLAN_GOAL_MAX; i++) {
+            T_OK(atlas_buf_append(&big, "g", 1u, &err), &err);
+        }
+        const char *over[] = {"plan", "run", "--repo", "r", "--goal", atlas_buf_cstr(&big),
+                              "--gate", "make test"};
+        run_atlas(&e, &r, over, 8u);
+        T_EQ_INT(r.exit_code, ATLAS_ERR_USAGE);
+        T_CHECK_MSG(strstr(atlas_buf_cstr(&r.errout), "at most") != NULL,
+                    "an over-long goal said: %s", atlas_buf_cstr(&r.errout));
+        result_free(&r);
+        atlas_buf_free(&big);
+    }
+
+    /* And it is in the help text, which is the sixth wiring place A9.2.5
+     * recorded: a command nobody can find works and is not shipped. */
+    const char *help[] = {"help"};
+    run_atlas(&e, &r, help, 1u);
+    T_EQ_INT(r.exit_code, 0);
+    T_CHECK(strstr(atlas_buf_cstr(&r.out), "plan run --repo NAME --goal TEXT") != NULL);
+    T_CHECK(strstr(atlas_buf_cstr(&r.out), "plan status PLAN") != NULL);
+    T_CHECK(strstr(atlas_buf_cstr(&r.out), "plan show PLAN --rev N") != NULL);
+    T_CHECK(strstr(atlas_buf_cstr(&r.out), "plan list") != NULL);
+    result_free(&r);
+
+    env_close(&e);
+}
+
 static const atlas_test TESTS[] = {
     {"human output", test_human_output},
     {"stable JSON output and escaping", test_json_output},
@@ -648,6 +780,7 @@ static const atlas_test TESTS[] = {
     {"diff reports working-tree changes", test_diff_reports_worktree_changes},
     {"repo add derives a name and refuses duplicates", test_repo_add_derives_a_name},
     {"an unscanned repository reports clearly", test_unscanned_repo_reports_clearly},
+    {"the plan command is wired into the binary", test_the_plan_command_is_wired},
 };
 
 ATLAS_TEST_MAIN("cli", TESTS)

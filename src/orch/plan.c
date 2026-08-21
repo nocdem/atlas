@@ -64,6 +64,32 @@ const char *atlas_plan_status_name(atlas_plan_status s) {
     return "UNKNOWN";
 }
 
+bool atlas_plan_status_parse(const char *name, atlas_plan_status *out) {
+    if (name == NULL || out == NULL) {
+        return false;
+    }
+    static const struct {
+        const char *name;
+        atlas_plan_status value;
+    } TABLE[] = {
+        {"PLANNING", ATLAS_PLAN_STATUS_PLANNING},
+        {"EXECUTING", ATLAS_PLAN_STATUS_EXECUTING},
+        {"NEEDS_REPLAN", ATLAS_PLAN_STATUS_NEEDS_REPLAN},
+        {"COMPLETED", ATLAS_PLAN_STATUS_COMPLETED},
+        {"BLOCKED", ATLAS_PLAN_STATUS_BLOCKED},
+    };
+    for (size_t i = 0; i < sizeof TABLE / sizeof TABLE[0]; i++) {
+        if (strcmp(name, TABLE[i].name) == 0) {
+            *out = TABLE[i].value;
+            return true;
+        }
+    }
+    /* "UNKNOWN" is deliberately absent: it is the vocabulary's zero, no
+     * derivation of an existing plan produces it, and a daemon presenting it is
+     * reporting a defect rather than a status. */
+    return false;
+}
+
 void atlas_plan_doc_free(atlas_plan_doc *d) {
     if (d == NULL) {
         return;

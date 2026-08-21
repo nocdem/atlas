@@ -8,7 +8,7 @@
 #define ATLAS_VERSION_MINOR 1
 #define ATLAS_VERSION_PATCH 0
 #define ATLAS_VERSION_STRING "0.1.0"
-#define ATLAS_PHASE "A11.6"
+#define ATLAS_PHASE "A12.0"
 
 #include <stddef.h>
 #include <stdint.h>

@@ -1194,3 +1194,304 @@ stores either.
 Deferred here too, and for the same reason: A8.1 changes which OS principal a
 model driver runs as, and nothing else. It applies no patch, mints no lifecycle
 capability, adds no RPC method and adds no schema migration.
+
+## A12.0 — the planned run
+
+A11.6 could carry a chain of tasks an operator wrote. A12.0 is the season where
+the *chain itself* is proposed by a model — and the whole design exists to make
+that proposal harmless.
+
+> **A PLAN A MODEL WROTE IS A PROPOSAL, NOT A VERDICT.**
+
+Nothing about compiling a plan grants anything. Every task a plan produces is
+submitted through the one submit path, runs under the same refusals, the same
+lease exclusivity, the same worker-start budget, the same gates and the same
+settlement as a task an operator typed. What a plan changes is *who suggested the
+work*, and that is deliberately the only thing it changes.
+
+### The flow
+
+```
+atlas plan run --repo NAME --goal TEXT --gate CMD [--gate CMD]... [--parallel N]
+
+  goal + gate floor            → plan.create        → orch_plans row
+  composed planner prompt      → job.submit         → planner job k (workspace)
+  planner writes one artifact  → dispatch.complete  → plan.atlas-plan, stored
+  the job's own stored bytes   → plan.revision_add  → orch_plan_revisions + tasks
+  stage S: tree task + siblings → job.submit ×n     → one ordinary A11.6 run
+  the run driver               → drives the run     → ACCEPTED or BLOCKED
+  a BLOCKED stage-run          → one more planner job with reason REPLAN
+  every stage-run ACCEPTED     → the plan derives COMPLETED
+```
+
+`atlas plan run` is a **foreground command an operator started**, exactly as
+`atlas job run` is. It starts no thread, no timer, no scheduler and no background
+loop, it polls nothing, and it holds no state that must survive a crash: the
+plan's state is re-derived at the top of every iteration and every write it makes
+is idempotent.
+
+### Plan status is derived, and has no writer
+
+There is no status column on `orch_plans`. `atlas_db_plan_state_derive` computes
+the answer on every read from stored rows — the revisions, the correlations, the
+job states and the run statuses — and both `plan.get` and the plan driver ask
+that one function.
+
+| Status | What it means |
+| --- | --- |
+| `PLANNING` | no usable revision yet, and planner budget remains |
+| `EXECUTING` | the latest revision has non-terminal work |
+| `NEEDS_REPLAN` | a stage-run of the latest revision settled BLOCKED, and budgets remain |
+| `COMPLETED` | every stage-run of the latest revision ACCEPTED and every side job SUCCEEDED |
+| `BLOCKED` | a budget is exhausted, or the last planner job failed terminally with none left |
+
+`UNKNOWN` is zero, is never stored and does not parse. A plan that derives it is
+reporting a defect in the derivation rather than an answer about the plan.
+
+This is A11.0's authority-by-absence, one layer up: there is no `plan.settle`, no
+status to compare-and-swap, no MCP tool and no gateway route, so **"a model
+payload cannot declare a plan complete" is true because the verb does not
+exist**, not because a check refuses it.
+
+### The authority argument
+
+- **The operator brings the goal and the gate floor. The planner may only add.**
+  `plan run` requires at least one `--gate`, refused locally before the policy is
+  even read. The floor is stored on the plan row and is prepended verbatim and
+  first to every tree task's merged validations; a planner's `gate:` lines are
+  appended after it and can never replace it. Floor plus additions is at most
+  `ATLAS_ORCH_MAX_VALIDATIONS` (8) and a plan whose merged list exceeds it is
+  refused when it is compiled, even though the additions alone were in bounds. A
+  plan with no operator gate could only ever be accepted on a model's word.
+- **Only a planner-role job can produce a revision.** `plan.revision_add`
+  verifies, inside the write transaction, that the named job's `correlation`
+  binds it to *this* plan as planner job k, that its driver's role is PLANNER,
+  that it SUCCEEDED, and that its successful attempt stored an artifact named
+  `plan.atlas-plan` inline and within bounds. The bytes are read from
+  `orch_artifacts` and from nowhere else: the model's document never travels a
+  second path into the write point.
+- **A role is a property of the driver, never of a job.** `claude-plan` and
+  `fake-plan` are PLANNER; `claude` and `claude-repo` are EXECUTOR; `fake` and
+  `fake-repo` are NONE. A submitter cannot assert a role.
+- **Model prose never routes control flow.** The replan trigger is Atlas' own
+  verdict — a stage-run that settled BLOCKED — and never a sentence a worker
+  wrote. There is no `strstr` over a plan document, a worker log or an artifact
+  anywhere on that path. A blocker-artifact fast-path is recorded in
+  `docs/backlog.md` as a residual, and could only ever veto earlier, never grant.
+- **Which model each role runs under is the operator's, in the root-owned
+  policy.** `planner_model` and `executor_model` are optional keys in
+  `/etc/atlas/orchestration.conf`; unset passes no model flag at all and leaves a
+  worker on the account's own default, which is what every run before A12.0 did.
+  **No model name appears in `src/`.**
+
+### The `atlas-plan-1` format
+
+The planner writes exactly one artifact, `artifacts/plan.atlas-plan`, at most
+`ATLAS_PLAN_MAX_BYTES` (65536) bytes. The specification below is
+`PLAN_FORMAT_SPEC` in `src/orch/plan.c`, quoted verbatim — it is the text the
+planner is shown and the rules the parser enforces, and the numbers in it are
+pinned to the constants by `_Static_assert`.
+
+```
+plan-format: atlas-plan-1
+
+The document is line-based. Lines are at most 4096 bytes. One trailing
+carriage return per line is stripped. UTF-8 is not assumed. Any line the
+parser does not recognise is a refusal naming the line number.
+
+atlas-plan-1
+stage: 1
+task: <key>            # [a-z0-9-]{1,32}, unique across the whole plan
+kind: tree             # exactly one tree task per stage
+title: <one line, at most 200 bytes>
+gate: <cmd>            # tree only, 0..n; appended AFTER the operator floor;
+                       # same parsing as --gate (space-split argv, allowlist
+                       # make/ctest/cmake/true/false); the floor and these
+                       # together are at most 8
+prompt<<
+<free text for the executor, at most 16384 bytes>
+>>
+task: <key2>
+kind: side             # 0..3 per stage; no gate: lines allowed on side tasks
+title: ...
+prompt<<
+...
+>>
+stage: 2
+...
+
+Every refusal names what and where:
+- the header line is exactly `atlas-plan-1`;
+- stages are numbered 1..N ascending with no gaps, N at most 4, and there is
+  at least one;
+- exactly one `kind: tree` per stage; side tasks per stage at most 3 and at
+  most (max_parallel - 1), which for this plan is the bound stated above;
+- at most 8 tasks in total; keys unique across the plan; every task carries
+  all four of `task`, `kind`, `title` and `prompt`;
+- `gate:` under `kind: side` is a refusal, and so is a `gate:` line this
+  task's `kind: tree` line has not yet been reached;
+- a gate program outside the allowlist is a refusal;
+- the operator's immutable gate floor listed above is prepended, verbatim and
+  first, to every tree task's gates; it is never replaced by them. The floor
+  count plus your additions for one tree task must total at most 8. The floor
+  is listed above, so count it: a plan whose merged list exceeds 8 is refused
+  when it is compiled, even though the additions alone were within bounds;
+- `title:`, `gate:` and `prompt<<` before this task's `task:` line are
+  refusals;
+- a repeated `kind:`, `title:` or `prompt<<` inside one task is a refusal;
+- a field line's prefix is exactly `stage: `, `task: `, `kind: `, `title: `
+  or `gate: `, and a heredoc opens on the whole line `prompt<<`;
+- outside a heredoc, a blank line is a refusal, as is any other
+  unrecognised line;
+- the heredoc terminator is the line `>>` exactly: `>> ` with a trailing
+  space is prompt content, and a heredoc that is never terminated is a
+  refusal;
+- a prompt is required and is at most 16384 bytes; each body line
+  contributes its own bytes and one newline;
+- a NUL byte anywhere in the document is a refusal;
+- the whole document is at most 65536 bytes.
+```
+
+A refusal travels as **a sentence and a line number**, apart rather than folded
+together, so the driver renders `line %d: %s` back to the next planner without
+parsing Atlas' own prose to recover the number.
+
+### Correlation and idempotency
+
+Every job the plan layer submits carries a `correlation` that is *also* its
+idempotency key, and the plan-to-jobs mapping is derived from it. There is no
+bind RPC, no `plan_id` column on `orch_jobs` and no update.
+
+| job | correlation, and idempotency key |
+| --- | --- |
+| planner job k (k = 1..5) | `plan.<uid21>.planner.<k>` |
+| task `<key>` of revision R | `plan.<uid21>.r<R>.<key>` |
+
+`<uid21>` is `'p'` plus the first 20 hex characters of the plan uid — 80 bits.
+The full uid would not fit: a correlation is bounded at 64 bytes and validated by
+`is_name`, which admits `[a-z0-9._-]` and therefore no colon. The worst case is
+62 bytes. `atlas_plan_correlation_planner` and `atlas_plan_correlation_task` are
+the **only** producers of either string, because three layers build it — the
+write point checking a planner job's binding, the derived reader finding a plan's
+jobs, and the driver submitting them — and two spellings of one format are two
+answers to "is this job this plan's".
+
+A driver killed at any point and started again re-issues the same submissions and
+is handed the same jobs back. `idx_orch_jobs_correlation` (migration 25) makes
+the derived read cheap.
+
+### The budgets, and the worst case
+
+Every bound is compiled in; none has a flag or a policy key.
+
+| Bound | Constant | Value |
+| --- | --- | --- |
+| planner jobs per plan | `ATLAS_PLAN_MAX_PLANNER_JOBS` | 5 |
+| compiled revisions per plan | `ATLAS_PLAN_MAX_REVISIONS` | 3 |
+| stages per revision | `ATLAS_PLAN_MAX_STAGES` | 4 |
+| tasks per revision | `ATLAS_PLAN_MAX_TASKS` | 8 |
+| side tasks per stage | `ATLAS_PLAN_MAX_SIDE_PER_STAGE` | 3, and at most `max_parallel − 1` |
+| plan document bytes | `ATLAS_PLAN_MAX_BYTES` | 65536 |
+| goal bytes | `ATLAS_PLAN_GOAL_MAX` | 16384 |
+| repo-tree worker starts per stage-run | `ATLAS_ORCH_RUN_MAX_WORKER_STARTS` | 3 |
+
+Model-worker starts per plan, worst case: at most 5 planner jobs, each with
+`max_attempts = 1`; then per compiled revision at most 4 stage-runs, each costing
+at most 3 repo-tree starts plus at most 3 siblings at one attempt each.
+
+**5 + 3 × 4 × (3 + 3) = 77 worker starts.**
+
+Completed stages are never re-run and a revision that never compiled spends no
+stage budget, so the practical small-goal case is one revision and one or two
+stages — roughly four to eight starts. The stated ceiling ignores both. The
+number exists so that nobody discovers it in a bill.
+
+### The commands
+
+```sh
+atlas plan run --repo NAME --goal TEXT --gate CMD [--gate CMD]... [--parallel N]
+atlas plan run --resume PLAN
+atlas plan status PLAN
+atlas plan show PLAN --rev N
+atlas plan list
+```
+
+`--resume` names an existing plan **and nothing else**: naming a goal, a gate or
+a parallelism beside it is refused rather than ignored, which is A10.1's
+`--memory --resume` rule and A11.6's `--parallel --resume` rule for the same
+reason — a flag that was quietly dropped reads, afterwards, exactly like one that
+was honoured. `plan show` prints the planner's document labelled
+`UNTRUSTED_DATA`; every read-back surface safe-encodes a goal, a title and a
+prompt.
+
+### The run driver's transport, and the task-level owed-check (A12.0/T1)
+
+The plan driver sits above the same transport `atlas job run` uses, and both
+pilots of A11.6 died on its fragility: `apply_op` retried only `BUSY:` and treated
+every other failure as fatal, so one timed-out frame-header read killed a
+foreground driver while its worker kept editing the tree.
+
+A12.0 separates the two claims. `BUSY:` is the daemon saying it took nothing — an
+answer, and asking again gets the same one. A *transport* failure says nothing at
+all about whether the request was processed, so it is retried on its own bounded
+budget: `ATLAS_RUN_XPORT_TRIES` (5) attempts, `ATLAS_RUN_XPORT_PAUSE_MS` (2000)
+apart. The classification is `atlas_err_is_transport`, stamped by the client layer
+that held the file descriptor; it cannot travel the socket, so nothing a daemon
+says — or quotes back from a repository, a task or a model — can produce one.
+
+`atlas_rundriver_transport` therefore has **three** members rather than two:
+`apply`, `run_get` and, new in A12.0, `job_get`. `job_get` is not optional,
+because a completion whose answer was lost is only *delivered* if the task ended
+in the way that completion asked for, and the **run** cannot say that: "this run
+no longer holds this task open" is equally what an expired lease, a cancellation
+and a recovery sweep produce. A lease is a minute and a refused completion is
+offered for five, so a driver that read only the run would report a genuinely lost
+result as delivered exactly when a recovery had just thrown it away. A transport
+without `job_get` cannot answer the question, and the alternative to refusing one
+at construction is a check that silently degrades into a guess.
+
+The owed-check establishes **"nothing is owed"**, not "recorded with our result".
+That distinction is stated rather than closed: a completion that landed and
+*requeued* the task is read as still owed, which is the pessimistic direction.
+
+### What A12.0 deliberately does not do
+
+- **No thread, no process, no timer, no background loop.** `atlas plan run` is a
+  foreground command and stops when nothing it can do would move the plan.
+- **No new method group, no MCP tool, no gateway route, no second submit path.**
+  The four `plan.` methods live in the existing orchestration *client* group,
+  gated by `require_submitter` like `job.submit`, and none of them carries an
+  authority verb. `tests/test_plan_rpc.c` asks a live daemon for every name a
+  deciding method would plausibly have and requires `unknown method`.
+- **No `plan.settle`, and no status column.** See above.
+- **No general task DAG.** A revision is stages in order, each a chain plus
+  siblings — A11.6's shape, chosen by a planner instead of by an operator.
+- **No automatic anything.** Nothing runs a plan that an operator did not start.
+
+### Stated costs and residuals
+
+- **A planner job's own run stays ACTIVE forever.** A planner job is a workspace
+  job, so it is the root of a workspace-rooted run, and a workspace-rooted run
+  never settles — pre-existing A11.6 semantics, now produced on purpose. `plan
+  status` names the planner job and its state, and says how many of the five have
+  been spent; the run it roots is not surfaced at all, and a `job list` will show
+  one ACTIVE run per planner job forever. `docs/backlog.md` carries it.
+- **A plan whose fifth planner document is format-refused stays PLANNING
+  durably.** A refusal leaves no row: at k < 5 the *next* planner job is the
+  durable evidence that a refusal happened, and at k = 5 there is no next job. The
+  plan is resumable and every resume re-prints the same refusal, deterministically,
+  because it is recomputed from the same stored bytes. Documented rather than
+  solved: the alternative is a status that says BLOCKED about a plan whose paid,
+  valid document could still be ingested.
+- **A failed gate's name does not reach a replan prompt.** `job.get` exposes no
+  failed-gate index, so `atlas_plan_compose_replan` writes `failed-gate: (none
+  recorded)` rather than naming a gate nobody established, and carries an excerpt
+  only when a `gate.log` artifact was stored inline.
+- **A refused-document retry loses the completed-work section.** There are five
+  composers, and the parse-retry form is not the replan form; a plan that both
+  needs a replan *and* had its replacement document refused is asked again with
+  the refusal but without the list of what already succeeded.
+- **`plan.revision_add` does not compare the planner job's `repo_identity_hash`
+  to the plan's.** The correlation binds the job to the plan and the submit path
+  already refuses a repository the policy does not permit, so this is a narrowing
+  that is not yet made rather than a hole; it is recorded in `docs/backlog.md`.

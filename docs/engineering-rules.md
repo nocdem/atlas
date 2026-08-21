@@ -2922,3 +2922,269 @@ method, MCP tool or gateway route, and no second submit path;
 new isolation: a parallel sibling is a workspace task under A8's existing
 isolation, provisioned by the dispatchers that already exist. What A11.6 changed
 is which submissions are admitted and when a run is allowed to decide.
+
+## A12.0 layers — additions
+
+| File | What it owns |
+| --- | --- |
+| `src/db/migrate.c` | migration 25: `orch_plans`, `orch_plan_revisions`, `orch_plan_tasks`, and `idx_orch_jobs_correlation` |
+| `src/db/db_plan.c` | the plan write point, the correlation builders, the per-plan readers, and `atlas_db_plan_state_derive` |
+| `src/orch/plan.c` | the `atlas-plan-1` parser and validator, and the five prompt composers — pure: no DB, no process, no clock |
+| `include/atlas/plan.h` | the format bounds, `atlas_plan_status`, the document structs, the composer API, the derived-state structs |
+| `src/orch/plandriver.c` | the foreground loop: submit a planner job, ingest its revision, walk the stages, answer one BLOCKED stage-run |
+| `src/orch/driver.c` | `claude-plan` and `fake-plan`, `atlas_driver_role`, and `--model` from the policy's per-role names |
+| `src/orch/policy.c` | `planner_model` and `executor_model`, optional, one token each |
+| `src/orch/dispatch.c` | `atlas_dispatch_run_one`, and `artifacts_travel_inline` — a planner's artifacts are carried, not described |
+| `src/orch/rundriver.c` | the transport's third member `job_get`, and the retry that separates a lost answer from a refusal |
+| `src/ipc/server_orch.c` | the four `plan.` methods, in the existing client group, and the typed refusal detail a document earns |
+| `src/core/service_plan.c` | the four wire calls, the production plan transport, and `plan run|status|show|list` |
+
+## A12.0 rules — these are not negotiable
+
+### A plan a model wrote is a proposal, not a verdict
+
+This is the whole season in one line, and everything below is a consequence of
+it. A12.0 is the first thing in Atlas where the *shape of the work* is proposed
+by a model rather than typed by an operator, and the design exists so that the
+proposal changes exactly one thing: who suggested it.
+
+Compiling a plan grants nothing. Every task a revision produces is submitted
+through the one submit path, admitted by the same A11.6 refusals, leased under
+the same exclusivity, bounded by the same worker-start budget, gated by the same
+`atlas_validations_run` and settled by the same `settle_run_at_quiescence` as a
+task an operator typed. There is no code path anywhere that a plan reaches and a
+hand-written job does not.
+
+### The operator brings the gate floor, and the planner may only add to it
+
+`plan run` requires at least one `--gate`, refused locally before the policy is
+even read, in the same words `job run` refuses it in — two spellings of one rule
+read as two rules. The floor is stored on `orch_plans.gate_floor` in the same
+netstring encoding `orch_jobs.validations` uses, and is prepended **verbatim and
+first** to every tree task's merged list at the moment a revision compiles. A
+planner's `gate:` lines are appended after it and can never replace, reorder or
+remove one.
+
+Floor plus additions is at most `ATLAS_ORCH_MAX_VALIDATIONS` (8), refused at
+compile time — and the specification says so to the planner, including the
+instruction to *count the floor*, because a document whose additions alone were
+in bounds can still exceed the merged bound and the planner is the only party
+that can avoid that.
+
+A plan with no operator gate could only ever be accepted on a model's word, which
+is the one thing this season exists to keep impossible.
+
+### The merged list is built once and carried opaquely thereafter
+
+`orch_plan_tasks.validations` is the merge, performed at the write point when the
+revision compiled. The plan driver reads it out of the row and hands it to
+`job.submit` without splitting, merging, decoding, re-encoding or displaying it.
+A second implementation of the merge in a driver would be a second answer to
+what an accepted stage was gated on.
+
+`tests/test_plan_e2e.c` pins it byte for byte through the production transport
+with a `%` inside a gate argument, because `%` is the one byte `atlas-safe-1`
+rewrites and ordinary words cannot distinguish a correct round trip from an
+encode that was never undone.
+
+### Plan status has no writer, and that is the authority argument
+
+There is no status column on `orch_plans`, no `plan.settle`, no MCP tool and no
+gateway route. `atlas_db_plan_state_derive` computes the answer on every read
+from stored rows — revisions, correlations, job states, run statuses — and both
+`plan.get` and the driver's loop ask that one function, so the surface an
+operator sees and the value the loop acts on cannot disagree.
+
+This is A11.0's pattern one layer up: "a model payload cannot declare a plan
+complete" is true **because the verb does not exist**, not because a check
+refuses it. `UNKNOWN` is zero, is never stored and does not parse; a plan that
+derives it is reporting a defect in the derivation rather than an answer.
+
+`PLANNING` at every k, including k = 5, for a planner job that SUCCEEDED and that
+no revision names. Ingesting a stored document spends no planner start, so a paid
+valid document must stay ingestible; `BLOCKED` requires the last planner job to
+have failed terminally with no budget left. The cost of that choice is stated
+below.
+
+### Only a planner-role job can produce a revision
+
+`plan.revision_add` verifies four things **inside the write transaction**, for the
+reason every A11.0 admission check is inside one: a check is worthless if a
+second call can land between it and the insert.
+
+1. The named job's `correlation` binds it to *this* plan as planner job k.
+2. Its driver's role is `ATLAS_DRIVER_ROLE_PLANNER`.
+3. It SUCCEEDED.
+4. Its successful attempt stored an artifact named `plan.atlas-plan` **inline**
+   and within `ATLAS_PLAN_MAX_BYTES`.
+
+The bytes come from `orch_artifacts` and from nowhere else. There is no parameter
+carrying a document, which is what makes "a model's plan never travels a second
+path into the write point" an absent field rather than a check on one. An
+executor job's artifact can never become a plan.
+
+A role is a property of the **driver**, never of a job: a submitter that could
+assert a role could assert its way into the answer. There is no
+`atlas_driver_role_name`, because a role is never rendered, never sent and never
+parsed.
+
+### Model prose never routes control flow
+
+The replan trigger is Atlas' own verdict — a stage-run that settled `BLOCKED` —
+and never a sentence a worker wrote. There is no `strstr` over a plan document, a
+worker log or an artifact anywhere on that path, and `atlas_plandriver_run`
+branches on nothing but `atlas_plan_state`.
+
+A planner's title and prompt travel from a stored row into a composer that
+labels them and into a lease that delivers them, and are compared with nothing on
+the way. A gate excerpt travels from `job.get`'s stored `gate.log` into a composer
+that bounds and labels it. One `strstr` over any of them would end this argument,
+which is A10.1's rule about the memory package, restated where it now also
+applies.
+
+A blocker-artifact fast-path is a backlog residual rather than a refused feature:
+it could only ever veto a stage earlier and could never grant anything, so it is
+compatible with the rule — and it is still a path from model prose into control
+flow, which is why A12.0 has none.
+
+### Roles and models are the operator's, in the root-owned policy
+
+`planner_model` and `executor_model` are optional keys in
+`/etc/atlas/orchestration.conf`, each one token of `[a-z0-9._-]` at most 64
+characters, reached through the compiled-in root-owned path with no override.
+Which of the two an attempt uses is decided by `atlas_driver_model_for` from the
+driver's role and by nothing else. Unset passes no flag at all, which is what
+every run before A12.0 did.
+
+**No model name appears in `src/`.** `planner_model = fable` and
+`executor_model = opus` are one machine's current choices, not Atlas'.
+
+### One builder for a correlation, and the mapping is derived
+
+`atlas_plan_correlation_planner` and `atlas_plan_correlation_task` are the only
+producers of `plan.<uid21>.planner.<k>` and `plan.<uid21>.r<R>.<key>`, and the
+same string is both the correlation and the idempotency key. Three layers build
+it — the write point checking a planner job's binding, the derived reader finding
+a plan's jobs, and the driver submitting them — and two spellings of one format
+are two answers to "is this job this plan's".
+
+The plan-to-jobs mapping is therefore **derived**: no bind RPC, no column on
+`orch_jobs`, no update. `idx_orch_jobs_correlation` makes the read cheap.
+
+`<uid21>` is `'p'` plus the first 20 hex characters of the plan uid, and the
+truncation is forced rather than chosen: a correlation is bounded at 64 bytes and
+validated by `is_name`, which admits `[a-z0-9._-]` and therefore no colon. The
+worst case is 62 bytes and the collision probability is 2⁻⁸⁰.
+
+### The loop keeps no state that must survive a crash
+
+Everything `atlas_plandriver_run` acts on is re-derived from `plan_state` at the
+top of every iteration. Every submission is idempotent by key, so a re-issued one
+is handed the job that already exists. Ingesting a revision is deterministic over
+stored bytes, so a re-run either compiles the same revision or reproduces the
+same refusal — which is why a document's refusal is obtained inside the iteration
+that answers it rather than remembered from the one that earned it.
+
+An iteration that leaves the derived state byte-for-byte identical to the
+previous one ends the invocation: whatever remains belongs to a dispatcher this
+process is not, or to a driver that already holds the task, and going round again
+would be this process pretending to make progress.
+
+### A refusal names what and where, and the two travel apart
+
+A document refusal is a sentence *and* a 1-based line number, carried as separate
+members through `atlas_plan_refusal` and as a typed detail on the error document.
+Folding the number into Atlas' prose would make the driver parse that prose to
+recover it.
+
+### A lost answer and a refusal are different claims
+
+`BUSY:` is the daemon saying it took nothing: an answer, and asking again gets
+the same one. A transport failure — the connect, the send, the read, a reply that
+was never a reply — says nothing at all about whether the request was processed,
+so it is retried on its own bounded budget of `ATLAS_RUN_XPORT_TRIES` attempts
+`ATLAS_RUN_XPORT_PAUSE_MS` apart. `atlas_err_is_transport` is stamped by the
+client layer that held the file descriptor and cannot travel the socket, so
+nothing a daemon says — or quotes back from a repository, a task or a model —
+can produce one.
+
+`atlas_rundriver_transport` has a third member, `job_get`, and it is **not
+optional**. A completion whose answer was lost is only delivered if the task
+ended in the way that completion asked for, and the run cannot say that: "this
+run no longer holds this task open" is equally what an expired lease, a
+cancellation and a recovery sweep produce. A transport without `job_get` cannot
+answer the question, and the alternative to refusing one at construction is a
+check that silently degrades into a guess. The owed-check establishes **"nothing
+is owed"** and not "recorded with our result"; a completion that landed and
+requeued the task reads as still owed, which is the pessimistic direction.
+
+### A planner's artifact is carried, not described
+
+`artifacts_travel_inline` (`src/orch/dispatch.c`) sends the completion manifest's
+optional fifth field for a PLANNER-role driver's artifacts and for nothing else.
+A8's rule is unchanged everywhere else — a dispatcher's artifacts live in a
+workspace it owns and Atlas describes them — and it assumes the reader is a
+person with access to that directory. A plan revision is compiled from stored
+bytes, and the workspace is removed when the attempt succeeds, so a planner's
+document only described is a plan nobody can ever compile.
+
+Asked of the **role** rather than of an artifact's name, because "a planner
+produces documents Atlas compiles" is the property that makes it true and a name
+test would stop applying the moment the plan layer named a second file. The
+daemon still re-digests what arrives and refuses a manifest that describes one
+thing and carries another.
+
+Found by `tests/test_plan_e2e.c`, and reachable by nothing smaller: every unit
+and edge test in the season built its artifact rows directly.
+
+### The bounds are compiled in and the worst case is written down
+
+Five planner jobs, three compiled revisions, four stages, eight tasks, three side
+tasks per stage, 65536 bytes of document, 16384 of goal, and each stage-run's
+existing three repo-tree worker starts. None has a flag, a policy key or a wire
+parameter, because a bound a caller can raise is not a bound; `rev_no` and
+`stage_no` are additionally bounded by `CHECK`s in migration 25, following M21's
+arrangement — the schema is the guarantee and the C check is there so a caller
+gets a sentence.
+
+**5 + 3 × 4 × (3 + 3) = 77 worker starts** is the stated worst case per plan. It
+ignores that completed stages are never re-run and that a revision which never
+compiled spends no stage budget, both of which make the real figure far smaller.
+The number exists so that nobody discovers it in a bill.
+
+`PLAN_ITERATION_CEILING` is derived from the same constants plus a margin. It is
+a **defect guard and not a budget** — the planner-job ceiling, the revision
+ceiling and each run's own worker-start budget are the bounds that matter and the
+daemon enforces all three — and it exists so that a defect below cannot become an
+unbounded loop.
+
+### The stated costs
+
+Two, and both are documented rather than solved, because every way of solving
+them is worse.
+
+**A planner job's own run stays ACTIVE forever.** A planner job is a workspace
+job and therefore the root of a workspace-rooted run, and A11.6's settlement asks
+the *root* task's driver and refuses to settle a run with no repo-tree root. That
+is pre-existing behaviour; A12.0 is the first thing that produces it deliberately
+and at a rate of up to five per plan. Letting a gateless run settle would mean a
+run reaching ACCEPTED with no gate having run anywhere, which is a far worse
+answer than an untidy `job list`.
+
+**A plan whose fifth planner document is format-refused stays PLANNING durably.**
+A refusal leaves no row: at k < 5 the next planner job is the durable evidence
+that one happened, and at k = 5 there is no next job to be it. The plan is
+resumable, and every resume recomputes the same refusal from the same stored
+bytes and re-prints it. The alternative — deriving BLOCKED — would say a plan is
+finished while a paid, valid document of it could still be ingested.
+
+### A12.0 adds no mechanism
+
+No thread, no process, no timer, no background loop, no scheduler, no signal
+handler. No new method group: the four `plan.` names live in the existing
+orchestration *client* group, gated by the same `require_submitter` as
+`job.submit`, and none of them carries a verb from `VERBS[]`. No MCP tool, no
+gateway route, no second submit path. No new isolation: a planner job and a side
+task are workspace jobs under A8's existing isolation, and a stage's tree task is
+an ordinary A11.1 repo-tree task. No repo-tree driver was added, which is why the
+index predicate that keeps the registered tree exclusive did not have to move.

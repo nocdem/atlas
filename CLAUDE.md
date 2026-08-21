@@ -1,10 +1,22 @@
 # Atlas — working notes for Claude Code
 
 Atlas is a generic, headless engineering-memory and repository-intelligence CLI
-in C17. Phase **A11.6**: bounded parallel tasks in a run — a run may now hold up
-to `max_parallel` active tasks (default 1, ceiling 8), at most one of them ever
-in the repository's own tree, with settlement deferred until every task is
-terminal. The season before it, **A11.1–A11.4**, was the single-worker
+in C17. Phase **A12.0**: the planned run — an operator brings a goal and a gate
+floor, a planner-role worker writes one bounded `atlas-plan-1` document, Atlas
+compiles it into stages, and each stage is driven as an ordinary A11.6 run. The
+plan's status has no writer at all: it is derived on every read from stored rows.
+The sentence the season exists for is
+
+> **A PLAN A MODEL WROTE IS A PROPOSAL, NOT A VERDICT.**
+
+**A12.0 added migration 25**; A10.0 added 22, A10.1 added 23 and A11.6 added 24.
+See the A12.0 sections in `docs/orchestration.md`, `docs/engineering-rules.md`,
+`docs/extending.md` and `docs/roadmap.md`.
+
+The season before it, **A11.6**, was bounded parallel tasks in a run — a run may
+hold up to `max_parallel` active tasks (default 1, ceiling 8), at most one of them
+ever in the repository's own tree, with settlement deferred until every task is
+terminal. The season before that, **A11.1–A11.4**, was the single-worker
 orchestrator loop — an operator can start one worker in a registered repository,
 have Atlas gate its work, and reach `ACCEPTED` or `BLOCKED` within a bound. The sentence the season exists
 for is
@@ -111,6 +123,7 @@ document that carries it:
 
 | Season | What it added | Document |
 | --- | --- | --- |
+| A12.0 | the planned run: a goal becomes one bounded plan document, and each stage is an ordinary run | `docs/orchestration.md` |
 | A9.2.7 | the yield: a short write now lands *during* semantic maintenance, and `BUSY` is the exception | `docs/daemon-and-ipc.md` |
 | A11.6 | bounded parallel tasks in a run; the repository's own tree kept exclusive, and settlement deferred to quiescence | `docs/orchestration.md` |
 | A10.1 | the bounded cross-run memory package, and the A/B experiment that found it USEFUL on time and not on cost | `docs/orchestration.md` |
@@ -695,6 +708,60 @@ is not written down is one somebody deletes.** Both halves are load-bearing.
   phase it is already in. A failed renewal never kills the child.
 - **The run driver starts nothing in the background** — no scheduler, no polling,
   no timer, no model router, no second submit path.
+
+### A12.0 — the planned run
+
+- **A PLAN A MODEL WROTE IS A PROPOSAL, NOT A VERDICT.** Compiling a plan grants
+  nothing: every task still runs under the existing submit refusals, budgets,
+  leases, gates and settlement, and planner and executor prose is
+  `UNTRUSTED_DATA` end to end.
+- **The operator brings the goal and the gate floor; the planner may only add.**
+  `plan run` requires at least one `--gate` exactly as `job run` does; the floor
+  is stored on the plan row and prepended **verbatim and first** to every tree
+  task's validations. Floor plus additions is at most
+  `ATLAS_ORCH_MAX_VALIDATIONS` (8), refused at compile time. A model choosing
+  its own verification would be acceptance on the model's word.
+- **Plan status has no writer.** There is no status column, no
+  `plan.settle`, no CAS to win. `atlas_db_plan_state_derive` computes it on every
+  read from stored rows, which is A11.0's authority-by-absence one layer up.
+  UNKNOWN is zero, is never stored and never parses.
+- **Only a planner-role job can produce a revision.** `plan.revision_add` checks,
+  inside the write transaction: the named job's `correlation` binds it to this
+  plan as planner job k, its driver's role is PLANNER, it SUCCEEDED, and its
+  successful attempt stored `plan.atlas-plan` inline and within bounds. An
+  executor job's artifact can never become a plan.
+- **Model prose never routes control flow.** The replan trigger is Atlas' own
+  verdict — a stage-run that settled BLOCKED — never a sentence a worker wrote.
+  There is no `strstr` over a plan, a log or an artifact anywhere on that path.
+- **Roles and models live in the root-owned policy, not in code.** No model name
+  appears in `src/`; `planner_model` and `executor_model` are optional keys, and
+  a role is a property of the *driver* (`claude-plan`/`fake-plan` → PLANNER,
+  `claude`/`claude-repo` → EXECUTOR), never of a job.
+- **A correlation and an idempotency key are one string from one builder.**
+  `atlas_plan_correlation_planner` / `_task` are the only producers —
+  `plan.<uid21>.planner.<k>` and `plan.<uid21>.r<R>.<key>` — because two
+  spellings of one format are two answers to "is this job this plan's". The
+  plan-to-jobs mapping is *derived* from them: no bind call, no column, no update.
+- **A driver killed anywhere and started again reaches the same place.** The loop
+  keeps no state that must survive a crash; every submission is idempotent by key
+  and ingesting a revision is deterministic over stored bytes.
+- **The budgets are compiled in and the worst case is stated**: 5 planner jobs, 3
+  revisions, 4 stages, 8 tasks, 3 side tasks per stage, 65536-byte document —
+  worst case **5 + 3 × 4 × (3 + 3) = 77 worker starts** per plan. The number
+  exists so nobody discovers it in a bill.
+- **A planner's artifact is carried to the daemon, not merely described to it.**
+  A dispatcher's artifacts normally live in a workspace it owns; a plan revision
+  is compiled from stored bytes and the workspace is removed on success, so a
+  PLANNER-role attempt sends the manifest's optional fifth field. Everything else
+  about A8's artifact contract is unchanged.
+- **Stated costs, documented rather than solved:** a planner job's own run is
+  workspace-rooted and never settles, so it stays ACTIVE forever (pre-existing
+  semantics, now produced on purpose); a plan whose *fifth* planner document is
+  format-refused stays PLANNING durably, because a refusal leaves no row and at
+  k=5 there is no next planner job to be the evidence of one.
+- **No thread, process, timer or background loop; no new method group, MCP tool,
+  gateway route or second submit path.** The four `plan.` methods are in the
+  existing orchestration client group and none of them carries an authority verb.
 
 ### A11.6 — bounded parallel tasks in a run
 

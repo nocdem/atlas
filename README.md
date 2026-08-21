@@ -83,7 +83,19 @@ failure with exactly one follow-up task, and settles the run `ACCEPTED` or
 configurable number of tasks active at once (`--parallel`, default 1, ceiling
 8); parallel siblings are workspace tasks under the existing isolation, **at
 most one active task per run ever works in the repository's own tree**, and a
-run settles only when every task in it is terminal. See
+run settles only when every task in it is terminal.
+
+**Planned runs.** `atlas plan run --repo NAME --goal TEXT --gate CMD` takes an
+operator's goal and an operator's verification gates, has a planner-role worker
+write one bounded `atlas-plan-1` document, compiles it into at most four stages,
+and drives each stage as an ordinary run. **The plan is a proposal, never a
+verdict**: the operator's gates are prepended verbatim to every task and a
+planner may only add to them; a plan's status has no writer at all and is derived
+on every read from stored rows; only a planner-role job's own stored artifact can
+become a revision; and the trigger for a replan is Atlas' own verdict that a
+stage-run settled `BLOCKED`, never a sentence a worker wrote. Every bound is
+compiled in and the worst case is written down — 5 planner jobs, 3 revisions, 4
+stages, 8 tasks, at most 77 worker starts per plan. See
 [docs/orchestration.md](docs/orchestration.md).
 
 **Remote access.** An HTTP gateway that authenticates a bearer credential,
@@ -103,7 +115,7 @@ from a model. See [docs/operations.md](docs/operations.md).
 
 ## Status
 
-Atlas is at phase **A11.6**. Each phase built on the last and none removed a
+Atlas is at phase **A12.0**. Each phase built on the last and none removed a
 guarantee:
 
 | Phase | What it added |
@@ -135,6 +147,7 @@ guarantee:
 | A10.0 | what a worker attempt cost, per attempt and never estimated |
 | A10.1 | the bounded cross-run memory package, measured in an A/B experiment |
 | A11.6 | bounded parallel tasks in a run; the repository's tree kept exclusive, settlement deferred to quiescence |
+| A12.0 | the planned run: a goal becomes one bounded plan document, and each stage is an ordinary run |
 
 ## Requirements
 
@@ -273,6 +286,11 @@ atlas job run --repo NAME --task TEXT --gate CMD [--gate CMD]... [--parallel N]
 atlas job run --resume RUN
 atlas job run-status RUN
 atlas dispatcher run [--once]
+
+# planned runs (A12.0)
+atlas plan run --repo NAME --goal TEXT --gate CMD [--gate CMD]... [--parallel N]
+atlas plan run --resume PLAN
+atlas plan status PLAN | plan show PLAN --rev N | plan list
 
 # remote access
 atlas api-key create|list|revoke|rotate ...

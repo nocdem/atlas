@@ -514,12 +514,24 @@ fifth field**, the content as lowercase hex. Four fields and five are both valid
 which is what keeps an A8 dispatcher speaking to an A11 daemon unchanged; a
 sixth must preserve that property the same way.
 
-The A8 dispatcher never sends content: its artifacts live in a workspace it owns
-and Atlas describes them. The run driver always does, because it has no workspace
-and an artifact it does not carry is one nobody can ever read. The daemon
-recomputes the digest from the bytes and refuses a manifest whose declared size
-or digest does not match what arrived — a record that describes one thing and
-carries another cannot be checked afterwards.
+Who sends the fifth field, and why each one does:
+
+- **The A8 dispatcher does not**, for an executor driver: its artifacts live in a
+  workspace it owns and Atlas describes them.
+- **The run driver always does**, because it has no workspace at all and an
+  artifact it does not carry is one nobody can ever read.
+- **The dispatcher does, for a PLANNER-role driver** (A12.0,
+  `artifacts_travel_inline` in `src/orch/dispatch.c`). A plan revision is compiled
+  from stored bytes and from nothing else, deliberately, and the workspace is
+  removed when the attempt succeeds — so a planner's document only described is a
+  plan nobody can ever compile. Asked of the **role**, not of an artifact's name,
+  because "a planner produces documents Atlas compiles" is the property that makes
+  it true and a name test would stop applying the moment the plan layer named a
+  second file.
+
+The daemon recomputes the digest from the bytes and refuses a manifest whose
+declared size or digest does not match what arrived — a record that describes one
+thing and carries another cannot be checked afterwards.
 
 ### Adding a client method to the orchestration group
 
@@ -819,3 +831,150 @@ goes *above* `run_uid`, never below it, and
 
 Every one of them is compile-time. There is no timer anywhere in this season and
 no bound derived from elapsed time.
+
+## A12.0 — the planned run
+
+### Adding a driver role
+
+`atlas_driver_role` in `include/atlas/driver.h`, and the `.role` field on every
+entry in `DRIVERS[]` (`src/orch/driver.c`).
+
+`ATLAS_DRIVER_ROLE_NONE` is zero and means "no model, no role" — the fakes that
+need neither. Before adding a member, answer the question the vocabulary exists
+to answer: **which model does this run under, and what may its output become?**
+A role is a property of the *driver* and never of a job, because a submitter that
+could assert a role could assert its way into the answer.
+
+1. Add the member. `ATLAS_DRIVER_ROLE_NONE` stays zero, and there is deliberately
+   no `_name` function: a role is never rendered, never sent over the wire and
+   never parsed from one, so nothing can assert its way into holding one.
+2. Decide whether the root-owned policy needs a `<role>_model` key beside
+   `planner_model` and `executor_model` — see the next checklist but one — and
+   whether `atlas_driver_model_for` should return it.
+3. **Decide what a job of this role may produce.** PLANNER is the only role whose
+   artifact Atlas itself reads: `plan.revision_add` requires it, and
+   `artifacts_travel_inline` (`src/orch/dispatch.c`) carries its artifacts to the
+   daemon rather than describing them. If the new role's output is something
+   Atlas will compile, it needs both; if it is something a person collects, it
+   needs neither.
+4. A role is **not** an authorisation. Which drivers may run at all is still the
+   policy's `driver =` list, and which one a lease may be granted is still the
+   dispatcher's filter. Never write a check that reads a role as permission.
+
+### Adding a field to the `atlas-plan-1` format
+
+**You cannot.** Adding, removing or reinterpreting a field is a **new format
+version**, `atlas-plan-2`, and the header line is what makes that enforceable: the
+parser requires exactly `atlas-plan-1` and refuses anything else by name.
+
+The reason is not caution about parsers. A planner is *shown* the specification —
+`PLAN_FORMAT_SPEC` in `src/orch/plan.c` is quoted verbatim into every planner
+prompt — so the format is part of the prompt a model answered, and a stored
+revision is a document somebody was asked for in a particular vocabulary. A
+field added in place would make an old revision and a new one two different
+documents that claim to be the same kind of thing.
+
+If you are adding a version:
+
+1. Add the new header literal and keep the old one parsing. A stored revision is
+   immutable and is re-read by `plan show` forever.
+2. `PLAN_FORMAT_SPEC` is pinned to the constants by `_Static_assert`s at the top
+   of `src/orch/plan.c`. Every number in the prose has one. Add yours.
+3. Quote the new spec verbatim into `docs/orchestration.md`'s A12.0 section, the
+   same way the current one is. Two copies of a specification that can drift are
+   two specifications.
+4. Every refusal names **what and where**: a sentence and a 1-based line number,
+   travelling apart, so the driver renders `line %d: %s` without parsing Atlas'
+   prose to recover the number.
+
+### Changing a plan bound
+
+Every one is a compile-time constant in `include/atlas/plan.h` with no flag, no
+policy key and no wire parameter, because a bound a caller can raise is not a
+bound.
+
+| Bound | Constant | Reached ⇒ |
+| --- | --- | --- |
+| planner jobs per plan | `ATLAS_PLAN_MAX_PLANNER_JOBS` (5) | the driver stops; the plan derives BLOCKED once the last one failed terminally |
+| compiled revisions per plan | `ATLAS_PLAN_MAX_REVISIONS` (3) | `plan.revision_add` refuses; `rev_no <= 3` is also a `CHECK` in migration 25 |
+| stages per revision | `ATLAS_PLAN_MAX_STAGES` (4) | the document is refused, naming the line; `stage_no <= 4` is also a `CHECK` |
+| tasks per revision | `ATLAS_PLAN_MAX_TASKS` (8) | the document is refused, naming the line |
+| side tasks per stage | `ATLAS_PLAN_MAX_SIDE_PER_STAGE` (3) | the document is refused; the effective bound is `min(3, max_parallel - 1)` |
+| plan document bytes | `ATLAS_PLAN_MAX_BYTES` (65536) | `plan.revision_add` refuses the artifact |
+| one prompt's bytes | `ATLAS_PLAN_TASK_PROMPT_MAX` (16384) | the document is refused |
+| one title's bytes | `ATLAS_PLAN_TITLE_MAX` (200) | the document is refused |
+| one line's bytes | `ATLAS_PLAN_MAX_LINE` (4096) | the document is refused |
+| goal bytes | `ATLAS_PLAN_GOAL_MAX` (16384) | `plan run` refuses locally, rather than truncating a goal nobody wrote |
+| default parallelism | `ATLAS_PLAN_DEFAULT_PARALLEL` (2) | what an unstated `--parallel` resolves to |
+
+Three things to keep straight when you move one:
+
+1. **`_Static_assert` and `PLAN_FORMAT_SPEC`.** The specification a planner is
+   shown states these as digits. Moving a constant without moving the prose makes
+   the build fail, which is the point; moving the prose without moving the
+   `_Static_assert` is how they drift.
+2. **Migration 25's `CHECK`s.** `rev_no` and `stage_no` are bounded in the schema
+   as well as in C, following M21's precedent: the schema is the guarantee and
+   the C check is there so a caller gets a sentence instead of a constraint
+   violation. Widening either needs a migration, because a `CHECK` cannot be
+   edited in place.
+3. **The worst case is documented arithmetic.** `5 + 3 × 4 × (3 + 3) = 77` worker
+   starts appears in `CLAUDE.md`, `README.md`, `docs/roadmap.md` and
+   `docs/orchestration.md`. If you move a factor, move the product everywhere,
+   and remember that `PLAN_ITERATION_CEILING` in `src/orch/plandriver.c` is
+   derived from the same constants — it is a defect guard, not a budget, and it
+   must stay above the real bounds.
+
+### Adding a `plan.*` method
+
+`ORCH_CLIENT_METHODS[]` in `src/ipc/server_orch.c` — the same table `job.*` lives
+in, gated by the same `require_submitter`. There is deliberately no plan method
+group: a second group would be a second answer to "who may reach this".
+
+`tests/test_plan_rpc.c` enforces three things and asks a live daemon about a
+fourth:
+
+1. The name is in the **client** group and in neither the dispatcher group nor
+   the operator-uid table.
+2. It contains no verb from `VERBS[]` — settle, accept, block, approve, apply,
+   commit, push, authorize, grant, resolve. The existing four are create, add,
+   get and list, and none of them decides anything.
+3. A machine with no orchestration policy refuses it with a sentence that says so
+   rather than pretending the method is missing.
+4. Every name a *deciding* plan method would plausibly have —
+   `FORBIDDEN_PLAN_METHODS[]`, twenty-four of them — must answer `unknown
+   method` from a live daemon. Add yours to that list if it is one you are
+   choosing not to build.
+
+**A method that writes a plan's status does not belong here at all**, and neither
+does one that writes a run's. A plan's status is derived on every read by
+`atlas_db_plan_state_derive` from stored rows; there is no column and no
+compare-and-swap, which is what makes "a model payload cannot declare a plan
+complete" true because the verb does not exist. Adding `plan.settle` would undo
+that in one line, exactly as `job.run_settle` would undo A11.1's.
+
+Two further rules for a method that writes anything:
+
+- **Every binding check happens inside the write transaction.** A check that a
+  job is this plan's planner job k is worthless if a second call can land between
+  the check and the insert. `plan.revision_add` is the model: correlation, role,
+  state and artifact, all inside `atlas_plan_apply_in_tx`.
+- **A correlation or an idempotency key is built by
+  `atlas_plan_correlation_planner` / `_task` and by nothing else.** Three layers
+  build the same string, and two spellings of one format are two answers to "is
+  this job this plan's".
+
+### Bounds this season added
+
+| Bound | Where | Reached ⇒ |
+| --- | --- | --- |
+| five planner jobs per plan | `ATLAS_PLAN_MAX_PLANNER_JOBS` | the driver stops asking; BLOCKED once the last failed terminally |
+| three compiled revisions | `ATLAS_PLAN_MAX_REVISIONS` | `plan.revision_add` refuses, and so does migration 25's `CHECK` |
+| four stages, eight tasks, three side tasks per stage | `ATLAS_PLAN_MAX_STAGES` / `_TASKS` / `_SIDE_PER_STAGE` | the document is refused, naming the line |
+| 65536-byte document, 16384-byte prompt, 4096-byte line, 200-byte title | `ATLAS_PLAN_MAX_BYTES` and friends | the document is refused, naming what and where |
+| 16384-byte goal | `ATLAS_PLAN_GOAL_MAX` | `plan run` refuses rather than truncating |
+| 85 driver iterations | `PLAN_ITERATION_CEILING` | the invocation ends; the plan is untouched and resumable |
+| five transport attempts, 2 s apart | `ATLAS_RUN_XPORT_TRIES` / `_PAUSE_MS` | the invocation ends; nothing was decided |
+
+Every one is compile-time. There is no timer anywhere in this season, no bound
+derived from elapsed time, and no policy key or flag that widens any of them.

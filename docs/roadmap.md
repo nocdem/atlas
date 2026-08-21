@@ -1214,6 +1214,82 @@ So MCP shipped in A2, and it obeys the constraint A7 set for it: it reuses the
 service layer through the existing IPC methods and contains no query logic of its
 own. Nothing is deferred here.
 
+## A12.0 — the planned run (shipped)
+
+Every season up to A11.6 could carry a chain of tasks *an operator wrote*. A12.0
+is the season where the chain itself is proposed by a model, and the whole design
+exists so that the proposal changes nothing about who decides.
+
+> **A PLAN A MODEL WROTE IS A PROPOSAL, NOT A VERDICT.**
+
+**What was added.** Migration 25 — `orch_plans`, `orch_plan_revisions`,
+`orch_plan_tasks` and `idx_orch_jobs_correlation`; three new tables, no table
+rebuilt. The `atlas-plan-1` document format, with a first-party bounded parser
+whose every refusal names a sentence and a line. Two drivers, `claude-plan` and
+`fake-plan`, both workspace and both PLANNER-role — so no repo-tree driver was
+added and the index predicate that keeps the registered tree exclusive did not
+have to move. A `role` on `atlas_driver`, and `planner_model` / `executor_model`
+in the root-owned policy, so which model a role runs under is the operator's
+choice and no model name appears in `src/`. Four RPC methods in the existing
+orchestration client group: `plan.create`, `plan.revision_add`, `plan.get`,
+`plan.list`. `atlas_plandriver_run`, a foreground loop that submits a planner
+job, ingests the revision its artifact compiles to, walks the revision's stages
+as ordinary A11.6 runs, and answers a stage-run that settled BLOCKED with one
+bounded replan. `atlas plan run|status|show|list` on both renderers. And, out of
+T1, the run driver's transport recovery: a lost answer is retried on its own
+bounded budget and is never confused with a refusal, with a third transport
+member `job_get` so a lost completion can be asked about the *task* rather than
+the run.
+
+**What was deliberately not added.** No status column and no `plan.settle` — a
+plan's status is derived on every read by `atlas_db_plan_state_derive`, so there
+is no CAS to win and no verb to reach, which is A11.0's authority-by-absence one
+layer up. No general task DAG: a revision is stages in order, each a chain plus
+siblings, which is A11.6's shape chosen by a planner instead of by an operator.
+No blocker-artifact fast-path: the replan trigger is Atlas' own verdict about a
+run and never a sentence a worker wrote. No thread, process, timer or background
+loop; no new method group, MCP tool, gateway route or second submit path; no
+model name in code; and nothing automatic — a plan runs because an operator ran
+`atlas plan run`.
+
+**The stated ceiling.** 5 planner jobs, 3 compiled revisions, 4 stages, 8 tasks,
+3 side tasks per stage, and each stage-run's existing 3 repo-tree worker starts:
+worst case **5 + 3 × 4 × (3 + 3) = 77 worker starts per plan**. The practical
+small-goal case is one revision and one or two stages, roughly four to eight. The
+number is written down so that nobody discovers it in a bill.
+
+**What the end-to-end test found, and it is the reason the test exists.** Two
+blocking defects that every unit and edge test in the season passed straight
+over. A planner's artifact was *described* to the daemon and never carried to it
+— the A8 dispatcher sends a four-field manifest, so `content_stored` was 0 for
+every workspace artifact, and `plan.revision_add` compiles from stored bytes and
+from nothing else; every production plan would have refused every document it
+paid for and burned all five planner jobs doing it. And `fake-plan` could not
+stand where `claude-plan` stands: it wrote everything after its marker line,
+which is the whole document only while the marker is last, and a composed planner
+prompt embeds the operator's goal in the middle. Both are fixed; neither was
+reachable without running a goal through to a settled plan over a real socket.
+
+**Residual findings, recorded rather than argued away:** a planner job's own run
+is workspace-rooted and never settles, so it stays ACTIVE forever — pre-existing
+semantics, now produced on purpose; a plan whose *fifth* planner document is
+format-refused stays PLANNING durably, because a refusal leaves no row and at
+k = 5 there is no next planner job to be the evidence of one; a failed gate's
+name does not reach a replan prompt, which therefore says `(none recorded)`; a
+refused-document retry loses the completed-work section; `plan.revision_add` does
+not compare the planner job's `repo_identity_hash` to the plan's; a background
+dispatcher reads the policy once at start, so the new model keys need a restart;
+and the general case of pilot A11.6-P2's finding — a workspace artifact's bytes
+not surviving the workspace — is closed only for PLANNER-role drivers. All are in
+`docs/backlog.md`.
+
+### Pilot A12-P: pending
+
+A live pilot with `planner_model` and `executor_model` chosen by policy, on a
+small real goal, with restart-survival and parallel-overlap evidence, has not
+been run. Until it has, every figure in this section is a bound Atlas enforces
+rather than a cost anybody has observed.
+
 ## Invariants that outlive every phase
 
 1. SQLite is a rebuildable index, never the canonical record of history.

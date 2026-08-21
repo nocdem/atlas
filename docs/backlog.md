@@ -984,7 +984,25 @@ capture `Testing/Temporary/LastTest.log` before running anything else; if it
 does not fire again, this entry is the record that one failure on 2026-08-19 was
 observed under load and never explained.
 
-## The run driver dies on a transport timeout it could survive
+## The run driver dies on a transport timeout it could survive (CLOSED in A12.0)
+
+**Closed by A12.0's T1.** A lost answer and a refusal are now different claims:
+`BUSY:` still means the daemon took nothing and asking again gets the same
+answer, while a transport failure — the connect, the send, the read, a reply that
+was never a reply — is retried on its own bounded budget of
+`ATLAS_RUN_XPORT_TRIES` (5) attempts `ATLAS_RUN_XPORT_PAUSE_MS` (2000) apart. The
+classification is `atlas_err_is_transport`, stamped by the client layer that held
+the file descriptor, so it cannot travel the socket and nothing a daemon says can
+produce one. A completion whose answer was lost is additionally owed-checked
+against the **task** — the new third transport member `job_get` — because "this
+run no longer holds this task open" is equally what an expired lease, a
+cancellation and a recovery sweep produce. `tests/test_orch_transport.c` is the
+evidence; `docs/orchestration.md`'s A12.0 section states what the owed-check does
+and does not establish. Two residuals carried forward from the fix: a lost lease
+*grant* costs the invocation (busy, resumable), and a completion that landed and
+requeued the task reads as still owed, which is the pessimistic direction.
+
+The original finding, kept for the record:
 
 Found by pilot A11.6-P, twice — once in each of its runs. `apply_op` in
 `src/orch/rundriver.c` retries a call the daemon refused with `BUSY:` and treats
@@ -1005,7 +1023,22 @@ supervisor loop that re-runs `job run --resume` whenever the driver exits with
 the run still ACTIVE — is written in the pilot record and works, but it is a
 wrapper around a fragility, not an answer to it.
 
-## A workspace artifact's bytes do not survive the workspace
+## A workspace artifact's bytes do not survive the workspace (NARROWED in A12.0)
+
+**A12.0 closed one slice of this and left the rest open**, and the slice is worth
+naming because the general case is unchanged. A PLANNER-role driver's artifacts
+are now carried inline on the completion — the manifest's optional fifth field,
+the same lowercase hex the run driver has always sent — because a plan revision is
+compiled from stored bytes and from nothing else, and the workspace is removed
+when the attempt succeeds. Asked of the driver's **role** rather than of an
+artifact's name, in `artifacts_travel_inline` (`src/orch/dispatch.c`).
+
+Everything below still holds for `fake`, `claude` and every future executor
+driver: their artifacts are described and not kept, and an artifact row whose
+bytes are unreachable an hour later is not what "collected artifacts" reads as
+promising. Whichever behaviour is intended for those, it is still undecided.
+
+The original finding:
 
 Pilot A11.6-P2's sibling wrote a 4,385-byte review report to its workspace
 `artifacts/` directory. The completion recorded its name, size and digest;
@@ -1016,7 +1049,20 @@ fine — the asymmetry is between the two artifact paths, and whichever behaviou
 is intended, an artifact row whose bytes are unreachable an hour later is not
 what "collected artifacts" reads as promising.
 
-## A worker's model is the operator session's default, and nothing can choose it
+## A worker's model is the operator session's default, and nothing can choose it (CLOSED in A12.0)
+
+**Closed by A12.0's T2**, and closed where the finding said it belonged: in the
+root-owned policy. `planner_model` and `executor_model` are optional keys in
+`/etc/atlas/orchestration.conf`, each one token of `[a-z0-9._-]` at most 64
+characters, and which of the two an attempt uses is decided by the **driver's
+role** and by nothing else — `atlas_driver_model_for`. A submitter cannot name a
+model, a job does not carry one, and **no model name appears in `src/`**: unset
+passes no flag at all and leaves a worker on the account's own default, which is
+what every run before A12.0 did. `deploy/a8/orchestration.conf.template` carries
+both keys, commented.
+
+The original finding:
+
 
 Both pilot workers ran on the operator session's default model — the most
 expensive one available — because the `claude` and `claude-repo` drivers invoke
@@ -1025,3 +1071,71 @@ one. Pilot 1's sibling spent $7.14 before its wall killed it. A model choice is
 an authority-relevant knob (the policy names which drivers may run at all), so
 it likely belongs in the root-owned policy rather than on the submission; that
 decision is deliberately not made here.
+
+## A12.0 left seven residuals, and none of them is a surprise
+
+Each is a thing the season chose not to do, stated where the choice was made.
+
+**A planner job's own run stays ACTIVE forever.** A planner job is a workspace
+job, so it is the root of a workspace-rooted run, and a workspace-rooted run
+never settles — A11.6's `settle_run_at_quiescence` asks the *root* task's driver
+and refuses to settle a run with no repo-tree root. That is pre-existing
+behaviour, but A12.0 is the first thing that produces it on purpose and at a rate
+of up to five per plan. `job list` will show them; nothing cleans them up, and
+letting a gateless run settle would be a worse answer than an untidy list.
+
+**A `k = 5` refused document leaves the plan PLANNING durably.** A format refusal
+leaves no row anywhere: at k < 5 the *next* planner job is the durable evidence
+that a refusal happened, and at k = 5 there is no next job to be it. The plan is
+resumable and every resume recomputes the same refusal from the same stored
+bytes, deterministically, and re-prints it. Ruling 6 of the season made this
+choice on purpose — the alternative was a status reading BLOCKED about a plan
+whose paid, valid document could still be ingested — and one pathological corner
+reads non-terminal forever.
+
+**A failed gate's name does not reach a replan prompt.** `job.get` exposes no
+failed-gate index and no failure detail, so `atlas_plan_compose_replan` writes
+`failed-gate: (none recorded)` rather than naming a gate nobody established, and
+carries an excerpt only when a `gate.log` artifact was stored inline. The fix is
+a `failed_gate` field on `job.get`; it is optional and was not in the season.
+
+**A refused-REPLAN retry loses the completed-work section.** There are five
+composers and the parse-retry form is not the replan form, so a plan that both
+needs a replan *and* had its replacement document format-refused is asked again
+with the refusal but without the list of what already succeeded. A design gap
+rather than a defect: nothing is lost from the plan, only from one prompt.
+
+**`plan.revision_add` does not compare the planner job's `repo_identity_hash` to
+the plan's.** The correlation already binds the job to the plan, and the submit
+path already refuses a repository the orchestration policy does not permit, so
+this is a narrowing that has not been made rather than a hole. Carried from T3,
+T5, T6 and T7 unchanged.
+
+**A background dispatcher reads the policy once at start.** Adding
+`planner_model` or `executor_model` to `/etc/atlas/orchestration.conf` therefore
+needs a dispatcher restart before a workspace attempt runs under it. That is the
+same rule the daemon follows for the same reason — a policy edit takes effect on
+restart, which is a fact an operator can reason about — and it is stated here
+because a key that appears to have been ignored reads exactly like one that was.
+
+**No blocker-artifact fast-path.** A worker that discovers mid-task that the plan
+cannot work has no way to say so: the replan trigger is a stage-run that settled
+BLOCKED, which costs the stage its whole three-start budget first. A blocker
+artifact could only ever *veto* earlier and could never grant anything, so it is
+compatible with the season's rules — but it is a path from model prose into
+control flow, and A12.0 deliberately has none of those.
+
+## Two documents on stdout when the daemon is absent, for the whole orchestration family
+
+`atlas plan list --json` against an absent daemon prints the empty result
+document and then the error document, and `atlas plan run`'s local refusals do
+the same. This is not new and is not A12.0's: `atlas job list` and `atlas job
+run` have always behaved this way, and `plan` was deliberately not diverged from
+the family it belongs to. `cli_state.rendered` suppresses the second document on
+the one path that was fixed for it — `atlas daemon ping` — and the pattern was
+never generalised.
+
+A caller parsing `--json` from any of these commands has to tolerate two
+documents or check the exit code first. Whichever way it is fixed, it should be
+fixed for the whole family in one change rather than for `plan` alone, which is
+why A12.0 left it.

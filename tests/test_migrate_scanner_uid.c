@@ -9,6 +9,7 @@
 
 #include "atlas/datadir.h"
 #include "atlas/db.h"
+#include "atlas/service.h"
 #include "db/db_internal.h"
 #include "support/fixture.h"
 
@@ -64,9 +65,56 @@ static void test_migration_27_adds_scanner_uid_defaulting_to_unset(void) {
     fx_close(&fx);
 }
 
+/* The uid round-trips through the typed operations and reaches the struct every
+ * read path fills. Zero clears an assignment rather than naming root: the
+ * column cannot express both, which is why root is refused as a scanner uid. */
+static void test_scanner_uid_round_trips_and_zero_clears(void) {
+    fixture fx;
+    atlas_err err;
+    atlas_err_init(&err);
+    T_OK(fx_open(&fx, &err), &err);
+    T_OK(fx_init_repo(&fx, fx_repo(&fx), "sha1", &err), &err);
+
+    atlas_db *db = NULL;
+    T_OK(open_migrated(&fx, &db, &err), &err);
+
+    atlas_repo_info reg;
+    atlas_repo_info_init(&reg);
+    T_OK(atlas_service_repo_add_db(db, fx_repo(&fx), "r", false, &reg, &err), &err);
+    int64_t repo_id = reg.id;
+    /* Registration assigns nothing yet — Task 4 is what does. */
+    T_EQ_INT((int)reg.scanner_uid, 0);
+    atlas_repo_info_free(&reg);
+
+    int64_t got = -1;
+    T_OK(atlas_db_repo_scanner_uid(db, repo_id, &got, &err), &err);
+    T_EQ_INT((int)got, 0);
+
+    T_OK(atlas_db_repo_set_scanner_uid(db, repo_id, 1000, &err), &err);
+    T_OK(atlas_db_repo_scanner_uid(db, repo_id, &got, &err), &err);
+    T_EQ_INT((int)got, 1000);
+
+    atlas_repo_info back;
+    atlas_repo_info_init(&back);
+    bool found = false;
+    T_OK(atlas_db_repo_get(db, "r", &back, &found, &err), &err);
+    T_CHECK(found);
+    T_EQ_INT((int)back.scanner_uid, 1000);
+    atlas_repo_info_free(&back);
+
+    T_OK(atlas_db_repo_set_scanner_uid(db, repo_id, 0, &err), &err);
+    T_OK(atlas_db_repo_scanner_uid(db, repo_id, &got, &err), &err);
+    T_EQ_INT((int)got, 0);
+
+    atlas_db_close(db);
+    fx_close(&fx);
+}
+
 static const atlas_test TESTS[] = {
     {"migration 27 adds a scanner uid that defaults to unassigned",
      test_migration_27_adds_scanner_uid_defaulting_to_unset},
+    {"the scanner uid round-trips and zero clears it",
+     test_scanner_uid_round_trips_and_zero_clears},
 };
 
 ATLAS_TEST_MAIN("migrate_scanner_uid", TESTS)

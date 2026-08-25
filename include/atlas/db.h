@@ -68,6 +68,10 @@ typedef struct atlas_repo_info {
     int dirty_unstaged;
     int dirty_untracked;
     int dirty_unmerged;
+    /* A13. Which uid's scanner may report facts about this repository, or 0 when
+     * none is assigned. Zero is never "uid 0": root is refused as a scanner uid
+     * precisely so that an assignment and its absence stay distinguishable. */
+    int64_t scanner_uid;
 } atlas_repo_info;
 
 void atlas_repo_info_init(atlas_repo_info *ri);
@@ -326,6 +330,18 @@ atlas_status atlas_db_repo_get_containing(atlas_db *db, const void *path, size_t
  * to a different repository. */
 atlas_status atlas_db_repo_get_by_id(atlas_db *db, int64_t repo_id, atlas_repo_info *out,
                                      bool *found, atlas_err *err);
+/* A13. Which uid's scanner may report facts about `repo_id`.
+ *
+ * `atlas_db_repo_set_scanner_uid` writes what it is given and refuses nothing:
+ * which uids may never scan is a policy question, answered by
+ * `atlas_scanner_uid_refusal` in the layer above, because it depends on a
+ * root-owned policy this layer does not read. A `uid` of 0 clears the
+ * assignment. `atlas_db_repo_scanner_uid` reports 0 when none is assigned. */
+atlas_status atlas_db_repo_set_scanner_uid(atlas_db *db, int64_t repo_id, int64_t uid,
+                                           atlas_err *err);
+atlas_status atlas_db_repo_scanner_uid(atlas_db *db, int64_t repo_id, int64_t *out,
+                                       atlas_err *err);
+
 atlas_status atlas_db_repo_list(atlas_db *db, atlas_repo_cb cb, void *ud, atlas_err *err);
 atlas_status atlas_db_repo_remove(atlas_db *db, const char *name, bool *removed, atlas_err *err);
 atlas_status atlas_db_repo_counts(atlas_db *db, int64_t repo_id, atlas_repo_counts *out,

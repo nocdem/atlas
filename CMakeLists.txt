@@ -298,6 +298,7 @@ add_library(atlas_core STATIC
   # scheduler, and no state that must survive a crash.
   src/orch/plandriver.c
   src/core/service_orch.c
+  src/core/service_scanner.c
   # A12.0: the four `plan.` calls a client makes. No offline path, no second
   # derivation of a plan's status, and no formatting.
   src/core/service_plan.c

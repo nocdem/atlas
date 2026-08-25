@@ -1255,6 +1255,16 @@ atlas_status atlas_service_job_run_status(atlas_ctx *ctx, const char *run, atlas
  * start, not a loop that idles. */
 atlas_status atlas_service_dispatcher_run(bool once, FILE *log, atlas_err *err);
 
+/* A13. Asks the daemon which repositories this uid may scan.
+ *
+ * Opens no index, takes no lock and holds no database handle: every answer
+ * comes over the socket, which is why the CLI dispatches it before any
+ * `atlas_ctx` exists. `once` asks a single time and returns; without it the
+ * command refuses, because the polling loop is a later plan and a process that
+ * idled instead of saying so would look healthy while doing nothing. Logs to
+ * `log` so a systemd user unit captures them in the journal. */
+atlas_status atlas_service_scanner_run(bool once, FILE *log, atlas_err *err);
+
 /* --- A12.0: the plan domain's four calls ------------------------------------
  *
  * The wire half of the plan commands, in `src/core/service_plan.c`. Like every

@@ -188,9 +188,30 @@ static void test_uid_zero_is_never_a_scanner(void) {
     env_close(&e);
 }
 
+/* `atlas scanner run` without `--once` refuses instead of idling.
+ *
+ * Asserted through the built binary because that is where it would break: the
+ * flag has to be admitted by the argument parser, reach the dispatch, and be
+ * read from the field the parser actually sets. Needs no socket and no daemon,
+ * so it is deterministic wherever it runs. */
+static void test_the_scanner_refuses_to_run_without_once(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    atlas_buf out = ATLAS_BUF_INIT, errout = ATLAS_BUF_INIT;
+    int code = -1;
+    const char *args[] = {"scanner", "run"};
+    T_OK(fx_atlas(args, 2u, &out, &errout, &code, &err), &err);
+    T_CHECK_MSG(code != 0, "a scanner with no --once exited 0");
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&errout), "--once") != NULL,
+                "the refusal does not name the flag: %s", atlas_buf_cstr(&errout));
+    atlas_buf_free(&out);
+    atlas_buf_free(&errout);
+}
+
 static const atlas_test TESTS[] = {
     {"a scanner is told its own repositories and no others",
      test_a_scanner_is_told_its_own_repositories_and_no_others},
+    {"the scanner refuses to run without --once", test_the_scanner_refuses_to_run_without_once},
     {"a uid that owns nothing is refused and names no repository",
      test_a_uid_that_owns_nothing_is_refused_and_names_no_repository},
     {"uid zero is never a scanner", test_uid_zero_is_never_a_scanner},

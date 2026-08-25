@@ -69,6 +69,7 @@ void atlas_cli_print_help(FILE *out) {
         "  job run-status RUN        what a run is waiting on, and how it ended\n"
         "  job get|cancel JOB        read or cancel one job\n"
         "  job list                  jobs this principal submitted\n"
+        "  scanner run --once         ask the daemon which repositories this uid may scan\n"
         "  dispatcher run [--once]   run the job dispatcher (as atlas-worker)\n"
         ,
         ATLAS_VERSION_STRING, ATLAS_PHASE);
@@ -2599,7 +2600,7 @@ static bool is_a_command(const char *cmd) {
     static const char *const COMMANDS[] = {
         "doctor",  "repo",    "scan",      "status",  "search",  "file",     "history",
         "diff",    "daemon",  "sync",      "events",  "code",    "decision", "gate",
-        "job",     "dispatcher", "backup", "maintenance", "service", "mcp",  "hook",
+        "job",     "dispatcher", "scanner", "backup", "maintenance", "service", "mcp", "hook",
         "integrate", "version", "help", "context", "operation", "api-key", "gateway",
         "verify",   "plan",
     };
@@ -3781,6 +3782,23 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
         memset(&pr, 0, sizeof(pr));
         int64_t limit = st->opts.limit > 0 ? st->opts.limit : ATLAS_DEFAULT_LIMIT;
         return run_plan(st, &pr, limit, err);
+    }
+
+    /* A13. The scanner, dispatched here — before any `atlas_ctx` is opened —
+     * for the reason `gateway run` is: it opens no index at all, and every
+     * answer it gives comes over the daemon socket. A context in AUTO mode
+     * would take the writer lock when it is free, which a scanner must never
+     * do: the daemon owns the writer and the scanner is one of its clients. */
+    if (strcmp(cmd, "scanner") == 0) {
+        const char *sub = st->operand_count > 0 ? st->operands[0] : NULL;
+        if (sub == NULL || strcmp(sub, "run") != 0) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE, "usage: atlas scanner run --once");
+        }
+        /* `--once` sets `opts.run_once`: it is matched by the first of two
+         * branches for that flag in the parser's else-if chain, and the second
+         * (`opts.job.once`) is unreachable. Verified by running the built
+         * binary, which is the only way this kind of thing surfaces. */
+        return atlas_service_scanner_run(st->opts.run_once, st->errout, err);
     }
 
     if (strcmp(cmd, "dispatcher") == 0) {

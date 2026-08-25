@@ -257,7 +257,23 @@ typedef struct atlas_daemon_status_report {
     int64_t repo_count;
     int64_t watched_repos;
     int64_t degraded_repos;   /* degraded, incomplete or error */
+    /* P0. Watches are still being installed. Neither watched nor degraded: not
+     * the first because part of the tree is not yet observed, not the second
+     * because nothing is wrong. Counting it as either would make one of the two
+     * numbers a lie during every ordinary startup. */
+    int64_t priming_repos;
     int64_t repos_with_gap;   /* an unresolved event gap: NOT current */
+    /* P0. The watch budget and the arithmetic that produced it, so an operator
+     * looking at a degraded repository can see whether Atlas chose the limit or
+     * the kernel did. Zero means the daemon did not report them — an older
+     * daemon, or a local read with no daemon running — never that they are zero. */
+    int64_t watches;              /* physical inotify descriptors */
+    int64_t watch_subscriptions;  /* (repository, descriptor) pairs; >= watches */
+    int64_t watch_budget_total;
+    int64_t watch_budget_repo;
+    int64_t kernel_max_user_watches;
+    bool watch_budget_from_policy;
+    bool priming_complete;
     int protocol_version;
     atlas_buf atlas_version;
 } atlas_daemon_status_report;

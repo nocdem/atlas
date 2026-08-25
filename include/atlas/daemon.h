@@ -29,6 +29,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 
 #include "atlas/error.h"
@@ -37,6 +38,16 @@ typedef struct atlas_daemon_opts {
     const char *data_dir_override; /* --data-dir */
     size_t worker_count;           /* 0 selects the default */
     int reconcile_interval_ms;     /* 0 selects ATLAS_WATCH_RECONCILE_INTERVAL_MS */
+    /* P0. Test hook: the daemon-wide inotify watch budget. 0 resolves it from
+     * the root-owned policy and the kernel, which is what production does.
+     *
+     * Never set by the CLI, and deliberately not settable from one: a boundary
+     * test needs a small budget, and a public flag for it would be a second way
+     * to configure a resource that `/etc/atlas/system.conf` owns — reachable by
+     * anyone who can start a daemon, which is not the same set of people. A
+     * positive value replaces the resolved total and changes nothing else, so
+     * the comparison, allocation and accounting code under test is production's. */
+    int64_t watch_budget_total;
     /* Test hook: reconcile every registered repository once, serve until the
      * queue is empty, then exit 0. Never set by the CLI. */
     bool run_once;

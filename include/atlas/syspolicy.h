@@ -138,6 +138,23 @@ typedef struct atlas_syspolicy {
      * it resolves to is a constant with its argument written beside it rather
      * than a value buried in a struct. */
     atlas_syspolicy_semauto semantic_auto_default;
+    /* P0. How many inotify watches this daemon may hold across every repository
+     * it observes, or 0 for "the policy says nothing".
+     *
+     * Zero is unset and resolves to a value derived from the kernel's own
+     * `fs.inotify.max_user_watches` — see `atlas_syspolicy_watch_max_dirs_total`
+     * — because a watch budget picked in a header is a guess about a machine the
+     * author never saw. How much of a machine's kernel memory a daemon may pin
+     * is a resource decision, and it belongs to the one principal Atlas already
+     * trusts by design and that `atlas-worker` cannot influence.
+     *
+     * A value outside [ATLAS_WATCH_TOTAL_MIN, ATLAS_WATCH_DIRS_HARD_CEILING] is
+     * MALFORMED, not clamped: an operator who wrote a number Atlas silently
+     * changed has configured something they cannot read back. A value above what
+     * the kernel will actually grant is permitted — root may also raise the
+     * sysctl — and the kernel then refuses with ENOSPC, which is reported as
+     * itself rather than as an Atlas budget. */
+    long long watch_max_dirs_total;
     char detail[256];
 } atlas_syspolicy;
 
@@ -170,5 +187,48 @@ bool atlas_syspolicy_permits(const atlas_syspolicy *p, long long uid);
  * every ordinary per-user install — gets the documented default rather than a
  * silent no. */
 bool atlas_syspolicy_semantic_auto_default(const atlas_syspolicy *p);
+
+/* P0. The daemon-wide watch budget this policy states, or 0 where it states
+ * none and the caller should derive one from the kernel.
+ *
+ * Deliberately not sensitive to `state`, for `atlas_syspolicy_semantic_auto_default`'s
+ * reason: an absent or legacy policy is the ordinary condition of a per-user
+ * install, and it is the absence of a statement rather than a statement of
+ * zero. */
+long long atlas_syspolicy_watch_max_dirs_total(const atlas_syspolicy *p);
+
+/* The same value, but only from a policy that actually parsed.
+ *
+ * The parser assigns each key as it reads it and returns on the first malformed
+ * line, so a well-formed `watch_max_dirs_total` followed by a bad line leaves
+ * the field set on a struct whose `state` is LEGACY. Every other consumer treats
+ * that policy as absent; the watcher must too, or it would honour half a policy
+ * nobody can read back. */
+long long atlas_syspolicy_watch_max_dirs_total_checked(const atlas_syspolicy *p);
+
+/* P0. What share of the kernel's per-uid inotify budget the derived default
+ * claims, as a percentage.
+ *
+ * A system deployment runs the daemon as its own uid with no other consumer of
+ * that budget; a per-user install shares the uid with every other watcher the
+ * operator runs. The policy is what already knows which of the two this is, so
+ * the answer is read from it rather than from a new setting nobody would set. */
+unsigned atlas_syspolicy_watch_kernel_share_pct(const atlas_syspolicy *p);
+
+/* P0. Whether a policy may state this watch budget.
+ *
+ * The predicate the parser asks, exposed so it can be tested. It is **not** a
+ * bypass and grants nothing: it answers a question about a number, and every
+ * check that decides whether a policy is honoured at all — root ownership, no
+ * symlink, no non-root writable component — is unchanged and unreachable from
+ * here.
+ *
+ * It is separate because it is otherwise untestable. No unprivileged uid can
+ * produce a root-owned policy at any path on the filesystem, which is the whole
+ * point of `atlas_syspolicy_load_at`; so a test that wants to prove an
+ * out-of-range budget is *refused rather than clamped* cannot get far enough
+ * into the parser to find out. Asking the predicate directly is the only way to
+ * assert that property without weakening the thing it is asserted about. */
+bool atlas_syspolicy_watch_budget_in_range(long long v);
 
 #endif /* ATLAS_SYSPOLICY_H */

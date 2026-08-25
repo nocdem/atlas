@@ -87,6 +87,21 @@ typedef struct atlas_reconcile_opts {
      * transaction discipline. */
     bool skip_code;    /* index files and history only */
     bool code_rebuild; /* drop every structural row first and reindex */
+
+    /* P0. A test barrier, called once on the pass's own thread **after hashing
+     * and before the staleness check re-reads HEAD**.
+     *
+     * That window is the one the abandon rule exists for, and it is otherwise
+     * unreachable from a test: a branch switch has to land inside it, and racing
+     * a real daemon into a few microseconds is not a test, it is a coin toss.
+     *
+     * NULL in production, and set by nothing a user can reach — no CLI flag, no
+     * environment variable, no IPC field, no policy key. Its only caller is
+     * `tests/test_branch_switch.c`. With it NULL the pass is byte-for-byte the
+     * shipped one; the hook adds no branch that changes what a pass decides,
+     * only a point at which a test may act. */
+    void (*before_head_recheck)(void *ud);
+    void *before_head_recheck_ud;
 } atlas_reconcile_opts;
 
 void atlas_reconcile_opts_init(atlas_reconcile_opts *o);

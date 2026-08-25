@@ -21,7 +21,7 @@
 #include "atlas/error.h"
 #include "atlas/limits.h"
 
-#define ATLAS_SCHEMA_VERSION 25
+#define ATLAS_SCHEMA_VERSION 26
 
 typedef struct atlas_db atlas_db;
 
@@ -458,11 +458,72 @@ typedef enum atlas_watch_state {
     ATLAS_WATCH_WATCHING,      /* watches installed and complete */
     ATLAS_WATCH_DEGRADED,      /* watching, but with a known blind spot */
     ATLAS_WATCH_INCOMPLETE,    /* an event gap is unresolved; a full pass is due */
-    ATLAS_WATCH_ERROR          /* the watcher failed and is not observing */
+    ATLAS_WATCH_ERROR,         /* the watcher failed and is not observing */
+    /* P0. Appended rather than inserted, so no existing member's value moves.
+     *
+     * The watch set is still being installed: a priming frontier is not empty, a
+     * directory is waiting for an ignore decision, or the metadata phase has not
+     * finished. It is not WATCHING, because a partly installed watch set does
+     * not observe the whole tree; and it is not DEGRADED, because nothing has
+     * gone wrong. Before P0 there was no way to say this, so a repository being
+     * primed was reported as though it were already watched. */
+    ATLAS_WATCH_PRIMING
 } atlas_watch_state;
 
 const char *atlas_watch_state_name(atlas_watch_state s);
 atlas_watch_state atlas_watch_state_parse(const char *name);
+
+/* P0. Why a repository is not fully watched, as a closed vocabulary rather than
+ * as prose.
+ *
+ * Before P0 the reason lived only in `watch_detail`, a sentence, and three
+ * genuinely different causes shared two spellings of it — so a caller could not
+ * tell "raise fs.inotify.max_user_watches" from "this daemon's own budget is
+ * spent" from "this walk hit its visit bound", and Atlas itself could not tell
+ * them apart either, because both budget causes set one boolean.
+ *
+ * UNKNOWN is zero and is what a row written before P0 reads as: it means the
+ * writer did not state a reason, never that there is none. NONE is the positive
+ * statement that nothing is wrong, and only a complete watch set may carry it. */
+typedef enum atlas_watch_reason {
+    ATLAS_WATCH_REASON_UNKNOWN = 0,
+    ATLAS_WATCH_REASON_NONE,
+    /* The kernel refused: ENOSPC from inotify_add_watch, i.e. this uid's
+     * fs.inotify.max_user_watches. Not an Atlas budget, and the remedy is not
+     * an Atlas setting. */
+    ATLAS_WATCH_REASON_KERNEL_LIMIT,
+    /* This repository reached its own share of the daemon's budget for this
+     * allocation round; other repositories are still being served. */
+    ATLAS_WATCH_REASON_REPO_BUDGET,
+    /* The daemon-wide budget is spent. Distinct from REPO_BUDGET because the
+     * operator's remedy is different, and because reporting one as the other is
+     * how a repository late in `ORDER BY name` used to be told it was too big. */
+    ATLAS_WATCH_REASON_TOTAL_BUDGET,
+    /* Metadata alone exceeded ATLAS_WATCH_META_MAX_PER_REPO or the total. */
+    ATLAS_WATCH_REASON_META_BUDGET,
+    /* The priming walk hit its visit bound: a bound on work, not on watches. */
+    ATLAS_WATCH_REASON_DISCOVERY_BOUND,
+    /* More ignored directory entries than Atlas will hold. Fails closed: the
+     * surplus is no longer watched, because watching it spent the budget on
+     * exactly the trees the ignore set exists to skip. */
+    ATLAS_WATCH_REASON_IGNORE_OVERFLOW,
+    /* More directories awaiting an ignore decision than Atlas will queue. */
+    ATLAS_WATCH_REASON_PENDING_IGNORE_OVERFLOW,
+    /* The depth-first priming frontier exceeded its byte bound — a very wide
+     * directory, reported rather than truncated. */
+    ATLAS_WATCH_REASON_FRONTIER_OVERFLOW,
+    /* More registered repositories than this watcher will observe. */
+    ATLAS_WATCH_REASON_REPO_LIMIT,
+    /* The walk failed for a reason that is none of the above; `watch_detail`
+     * carries the message. */
+    ATLAS_WATCH_REASON_ERROR
+} atlas_watch_reason;
+
+const char *atlas_watch_reason_name(atlas_watch_reason r);
+atlas_watch_reason atlas_watch_reason_parse(const char *name);
+/* The fixed Atlas-owned sentence for a reason. Never assembled from anything a
+ * repository can influence, because it reaches a model through ai.context. */
+const char *atlas_watch_reason_explain(atlas_watch_reason r);
 
 typedef struct atlas_index_state {
     int64_t repo_id;
@@ -472,7 +533,25 @@ typedef struct atlas_index_state {
     char last_complete_at[ATLAS_TS_MAX];
     atlas_watch_state watch_state;
     atlas_buf watch_detail;
+    /* P0. `watched_dirs` is this repository's *logical subscriptions*: source
+     * plus metadata, counted once per (repository, watch descriptor) pair.
+     *
+     * It is not the number of kernel watch descriptors, and the two are only
+     * equal when nothing is shared. Two registered worktrees of one repository
+     * subscribe to the same physical descriptor on the common git directory, so
+     * both count it and the kernel holds one. `watched_shared` says how much of
+     * this repository's count is in that situation, which is what makes the
+     * difference readable instead of looking like an accounting error.
+     *
+     * Before P0 this field counted a repeated `inotify_add_watch` of an
+     * already-watched path as a new watch, and was not written at all on the
+     * degraded path — so it was inflated when shared and stale exactly when a
+     * reader most needed it. */
     int64_t watched_dirs;
+    int64_t watched_source;
+    int64_t watched_meta;
+    int64_t watched_shared;
+    atlas_watch_reason watch_reason;
     bool event_gap;
     bool pending_full_reconcile;
     atlas_buf last_error;
@@ -511,9 +590,28 @@ atlas_status atlas_db_generation_begin(atlas_db *db, int64_t repo_id, int64_t *g
  * outstanding event gap, which only a full reconciliation may do. */
 atlas_status atlas_db_generation_complete(atlas_db *db, int64_t repo_id, int64_t generation,
                                           bool clear_gap, int64_t sync_seq, atlas_err *err);
-atlas_status atlas_db_index_state_set_watch(atlas_db *db, int64_t repo_id, atlas_watch_state st,
-                                            const char *detail, int64_t watched_dirs,
-                                            atlas_err *err);
+/* P0. Everything one watch build establishes about a repository, carried as a
+ * struct so the counts cannot drift apart.
+ *
+ * Before P0 the state, the detail and the count were three arguments written by
+ * one function on the healthy path and by a *different* statement on the
+ * degraded path — and that second statement did not write the count at all, so
+ * a degraded repository reported whatever it had been watching the last time
+ * things went well. Making the outcome one value means there is one place to
+ * add a field to and one place that can forget it. */
+typedef struct atlas_watch_outcome {
+    atlas_watch_state state;
+    atlas_watch_reason reason;
+    const char *detail; /* borrowed for the call; NULL when there is nothing to say */
+    int64_t source_dirs;
+    int64_t meta_dirs;
+    int64_t shared_dirs; /* of source+meta, how many are on a shared descriptor */
+} atlas_watch_outcome;
+
+void atlas_watch_outcome_init(atlas_watch_outcome *o);
+
+atlas_status atlas_db_index_state_set_watch(atlas_db *db, int64_t repo_id,
+                                            const atlas_watch_outcome *outcome, atlas_err *err);
 /* Records that Atlas may have missed changes. Sets `event_gap` and schedules a
  * full reconciliation; both survive a restart. */
 atlas_status atlas_db_index_state_mark_gap(atlas_db *db, int64_t repo_id, const char *detail,

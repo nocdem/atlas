@@ -762,7 +762,31 @@ static atlas_status j_daemon_status(atlas_renderer *r, const atlas_daemon_status
     TRY(atlas_json_key_int(j, "repositories", rep->repo_count, err));
     TRY(atlas_json_key_int(j, "watching", rep->watched_repos, err));
     TRY(atlas_json_key_int(j, "degraded", rep->degraded_repos, err));
-    return atlas_json_key_int(j, "repositories_with_event_gap", rep->repos_with_gap, err);
+    TRY(atlas_json_key_int(j, "priming", rep->priming_repos, err));
+    TRY(atlas_json_key_int(j, "repositories_with_event_gap", rep->repos_with_gap, err));
+    /* P0. `watches` is physical descriptors, `watch_subscriptions` is
+     * (repository, descriptor) pairs, and the second is >= the first whenever
+     * worktrees share a git directory. Both are emitted so nothing downstream
+     * has to guess which one it is looking at.
+     *
+     * Emitted **only when the daemon reported them**. These come from the live
+     * watcher, which exists in the daemon's process and nowhere else, so the
+     * local path — a CLI that could open the data directory and answered from
+     * the database — has nothing to say about them. Writing zeros there would be
+     * a claim rather than a silence, and "the daemon holds no watches" is a very
+     * different statement from "this process cannot see how many it holds". The
+     * human renderer omits the same block for the same reason. */
+    if (rep->watch_budget_total > 0) {
+        TRY(atlas_json_key_int(j, "watches", rep->watches, err));
+        TRY(atlas_json_key_int(j, "watch_subscriptions", rep->watch_subscriptions, err));
+        TRY(atlas_json_key_int(j, "watch_budget_total", rep->watch_budget_total, err));
+        TRY(atlas_json_key_int(j, "watch_budget_repo", rep->watch_budget_repo, err));
+        TRY(atlas_json_key_int(j, "kernel_max_user_watches", rep->kernel_max_user_watches, err));
+        TRY(atlas_json_key_str(j, "watch_budget_source",
+                               rep->watch_budget_from_policy ? "policy" : "kernel", err));
+        TRY(atlas_json_key_bool(j, "priming_complete", rep->priming_complete, err));
+    }
+    return ATLAS_OK;
 }
 
 static atlas_status j_daemon_ping(atlas_renderer *r, bool reachable, const char *socket_path,
@@ -783,6 +807,11 @@ static atlas_status j_repo_state(atlas_renderer *r, const atlas_repo_state_repor
     TRY(atlas_json_key_str(j, "root", atlas_buf_cstr(&rep->repo.root_path_text), err));
     TRY(atlas_json_key_str(j, "watch_state", atlas_watch_state_name(rep->state.watch_state), err));
     TRY(atlas_json_key_int(j, "watched_directories", rep->state.watched_dirs, err));
+    TRY(atlas_json_key_int(j, "watched_source", rep->state.watched_source, err));
+    TRY(atlas_json_key_int(j, "watched_meta", rep->state.watched_meta, err));
+    TRY(atlas_json_key_int(j, "watched_shared", rep->state.watched_shared, err));
+    TRY(atlas_json_key_str(j, "watch_reason", atlas_watch_reason_name(rep->state.watch_reason),
+                           err));
     TRY(atlas_json_key_int(j, "generation", rep->state.generation, err));
     TRY(atlas_json_key_int(j, "last_complete_generation", rep->state.last_complete_generation,
                            err));

@@ -57,6 +57,14 @@ static atlas_status tally_repo(const atlas_repo_info *ri, void *ud, atlas_err *e
         case ATLAS_WATCH_DEGRADED:
         case ATLAS_WATCH_INCOMPLETE:
         case ATLAS_WATCH_ERROR: t->rep->degraded_repos++; break;
+        /* P0. Priming counts as neither, and that is the point of having it.
+         *
+         * It is not `watching`, because the watch set is not fully installed and
+         * a repository counted there would let `watching == repositories` be
+         * true while part of a tree was unobserved. It is not degraded either,
+         * because nothing has gone wrong — so counting it there would make an
+         * ordinary startup look like a fault. It is reported on its own. */
+        case ATLAS_WATCH_PRIMING: t->rep->priming_repos++; break;
         case ATLAS_WATCH_UNWATCHED:
         default: break;
         }
@@ -155,6 +163,13 @@ static void derive_index_current(atlas_repo_state_report *out) {
         out->not_current_reason = "the watcher failed and is not observing this repository";
     } else if (out->state.watch_state == ATLAS_WATCH_DEGRADED) {
         out->not_current_reason = "the watcher is degraded and may not observe every change";
+    } else if (out->state.watch_state == ATLAS_WATCH_PRIMING) {
+        /* P0. Watches are still being installed, or a directory is waiting for
+         * git to say whether it is ignored. Either way there is a part of this
+         * tree producing events nobody is receiving, which is the same claim an
+         * event gap makes and gets the same answer. */
+        out->not_current_reason = "the watcher has not finished installing this repository's "
+                                  "watches";
     } else {
         out->index_current = true;
     }
@@ -714,6 +729,22 @@ atlas_status atlas_service_repo_state_remote(const char *name, atlas_repo_state_
     }
     if (atlas_ipc_result_int(r, "watched_directories", &n)) {
         out->state.watched_dirs = n;
+    }
+    /* P0. Absent keys keep the initialised zero, so a new CLI against an older
+     * daemon reads "not reported" rather than a confident zero, and
+     * `watch_reason` stays UNKNOWN rather than being rendered as the nearest
+     * match. */
+    if (atlas_ipc_result_int(r, "watched_source", &n)) {
+        out->state.watched_source = n;
+    }
+    if (atlas_ipc_result_int(r, "watched_meta", &n)) {
+        out->state.watched_meta = n;
+    }
+    if (atlas_ipc_result_int(r, "watched_shared", &n)) {
+        out->state.watched_shared = n;
+    }
+    if (atlas_ipc_result_str(r, "watch_reason", &v)) {
+        out->state.watch_reason = atlas_watch_reason_parse(v);
     }
     if (atlas_ipc_result_int(r, "event_cursor", &n)) {
         out->event_cursor = n;

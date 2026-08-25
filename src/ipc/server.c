@@ -225,6 +225,7 @@ typedef struct status_tally {
     int64_t repos;
     int64_t watching;
     int64_t degraded;
+    int64_t priming;
     int64_t gaps;
 } status_tally;
 
@@ -237,6 +238,12 @@ static atlas_status tally(const atlas_repo_info *ri, void *ud, atlas_err *err) {
     if (st == ATLAS_OK && s.present) {
         if (s.watch_state == ATLAS_WATCH_WATCHING) {
             t->watching++;
+        } else if (s.watch_state == ATLAS_WATCH_PRIMING) {
+            /* P0. Counted on its own. Adding it to `degraded` would make an
+             * ordinary startup look like a fault, and adding it to `watching`
+             * would let `watching == repositories` be true while part of a tree
+             * was still unobserved. */
+            t->priming++;
         } else if (s.watch_state != ATLAS_WATCH_UNWATCHED) {
             t->degraded++;
         }
@@ -251,7 +258,7 @@ static atlas_status tally(const atlas_repo_info *ri, void *ud, atlas_err *err) {
 static atlas_status method_status(dispatch_state *ds, const atlas_ipc_request *req,
                                   atlas_err *err) {
     (void)req;
-    status_tally t = {ds->db, 0, 0, 0, 0};
+    status_tally t = {ds->db, 0, 0, 0, 0, 0};
     atlas_status st = atlas_db_repo_list(ds->db, tally, &t, err);
     if (st != ATLAS_OK) {
         return st;
@@ -286,7 +293,43 @@ static atlas_status method_status(dispatch_state *ds, const atlas_ipc_request *r
         st = atlas_json_key_int(ds->j, "repositories_with_event_gap", t.gaps, err);
     }
     if (st == ATLAS_OK) {
-        st = atlas_json_key_int(ds->j, "watches", atlas_watcher_watch_count(ds->ctx->watcher), err);
+        st = atlas_json_key_int(ds->j, "priming", t.priming, err);
+    }
+    if (st == ATLAS_OK) {
+        /* P0. `watches` keeps its meaning exactly: physical inotify descriptors,
+         * which is what the kernel holds and what it counts against
+         * `fs.inotify.max_user_watches`.
+         *
+         * `watch_subscriptions` is the new number, and it is deliberately not
+         * the same one. Two registered worktrees of a repository subscribe to
+         * the same descriptor on their shared git directory, so the
+         * per-repository figures sum to the subscription count and **exceed**
+         * the descriptor count. Any surface that treated them as one number
+         * would be wrong for exactly the case worktrees create. */
+        atlas_watch_stats ws;
+        atlas_watcher_stats(ds->ctx->watcher, &ws);
+        st = atlas_json_key_int(ds->j, "watches", ws.watches, err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_int(ds->j, "watch_subscriptions", ws.subscriptions, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_int(ds->j, "watch_budget_total", ws.budget_total, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_int(ds->j, "watch_budget_repo", ws.budget_repo, err);
+        }
+        if (st == ATLAS_OK) {
+            /* The kernel's own number, reported beside Atlas' budget so an
+             * operator can see which of the two is binding rather than guess. */
+            st = atlas_json_key_int(ds->j, "kernel_max_user_watches", ws.kernel_max, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(ds->j, "watch_budget_source",
+                                    ws.budget_from_policy ? "policy" : "kernel", err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_bool(ds->j, "priming_complete", ws.priming_complete, err);
+        }
     }
     if (st == ATLAS_OK) {
         st = atlas_json_key_int(ds->j, "write_queue_depth",
@@ -356,7 +399,30 @@ atlas_status atlas_server_write_repo_state(dispatch_state *ds, const atlas_repo_
         st = atlas_json_key_str(ds->j, "watch_state", atlas_watch_state_name(s.watch_state), err);
     }
     if (st == ATLAS_OK) {
+        /* P0. Still this repository's own count, and still the same field — but
+         * it is now the number of *subscriptions* it holds, counted once per
+         * (repository, descriptor) pair and written on every path including the
+         * degraded one. Before P0 it double-counted a descriptor shared with
+         * another worktree and was not written at all when a repository
+         * degraded, so it reported whatever had been true the last time things
+         * went well. The split below says where the number comes from. */
         st = atlas_json_key_int(ds->j, "watched_directories", s.watched_dirs, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "watched_source", s.watched_source, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "watched_meta", s.watched_meta, err);
+    }
+    if (st == ATLAS_OK) {
+        /* How many of the above are on a descriptor another repository also
+         * subscribes to. Non-zero is why the per-repository counts can sum to
+         * more than the daemon's physical `watches`. */
+        st = atlas_json_key_int(ds->j, "watched_shared", s.watched_shared, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "watch_reason", atlas_watch_reason_name(s.watch_reason),
+                                err);
     }
     if (st == ATLAS_OK) {
         st = atlas_json_key_bool(ds->j, "event_gap", s.event_gap, err);

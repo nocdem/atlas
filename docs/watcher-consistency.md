@@ -38,9 +38,18 @@ every change:
 | cause | detected by |
 | --- | --- |
 | inotify queue overflow | `IN_Q_OVERFLOW`, which is global to the instance — the kernel does not say what was lost, so every watched repository is marked |
-| watch limit reached | `ENOSPC` from `inotify_add_watch`, i.e. `fs.inotify.max_user_watches` |
-| Atlas' own watch budget reached | more directories than `ATLAS_WATCH_MAX_DIRS` |
+| watch limit reached | `ENOSPC` from `inotify_add_watch`, i.e. `fs.inotify.max_user_watches` — reason `kernel_limit` |
+| Atlas' own watch budget reached | reason `total_budget`, or `repo_budget` while other repositories are still being served |
 | a new directory that could not be fully watched | the same, mid-flight |
+| the watch set was rebuilt | P0: a rebuild drops every watch and reinstalls it, and events in that window are gone. Every repository is owed a full pass afterwards. |
+| a subtree was watched late | P0: a directory that appeared while the daemon ran was not watched until git had been asked whether it is ignored, so events inside it during that interval were not observed |
+| the ignore rules changed | P0: a `.gitignore`, `info/exclude` or branch change re-primes the repository, which is another such window |
+
+Since P0 the cause is also recorded as a **reason code** on the repository —
+`watch_reason`, a closed vocabulary — rather than only as prose. Three genuinely
+different causes used to share two sentences between them, so an operator could
+not tell "raise the sysctl" from "this daemon's budget is spent" from "this walk
+hit its visit bound", and neither could Atlas: two of them set one boolean.
 | a reconciliation pass that failed | any error from the pass |
 | a pass repeatedly abandoned because HEAD kept moving | `ATLAS_RECONCILE_MAX_ATTEMPTS` exhausted |
 
@@ -100,6 +109,88 @@ Ignored directories are skipped because a `node_modules` or `build/` tree would
 otherwise consume the entire watch budget for changes Atlas will not index. The
 set comes from `git ls-files --others --ignored --exclude-standard --directory`,
 so there is no second implementation of ignore semantics to drift from git's.
+
+### What the ignore inventory is, and what it is not
+
+**It is an inventory of ignored paths that existed when git was last asked. It is
+never the authority on a path that did not exist then.**
+
+`git ls-files` enumerates the filesystem. A `.gitignore` containing `build/` with
+no `build/` on disk produces no entry at all — so an inventory built while
+priming has nothing to say about a directory created afterwards, which is exactly
+the directory the watcher needs an answer about. Consulting it would return "not
+ignored", confidently, for the one case the mechanism exists to handle.
+
+Before P0 the situation was worse still: the inventory was built on the stack
+inside the priming function and freed when it returned, and the handler for "a
+directory appeared" built its context with `memset`, leaving the pointer NULL. A
+directory created while the daemon ran was watched **recursively, whatever git
+thought of it** — every rebuilt `build/`, for as long as the daemon lived.
+
+So a directory Atlas has not seen before is **not watched and not descended
+into**. It waits in a bounded queue, and on the next debounce tick **one**
+`git ls-files` invocation per repository answers for the whole queue at once.
+Because the directory now exists on disk, that answer is correct — including for
+an empty directory, and including a deep subtree, which `--directory` collapses
+to its topmost ignored entry.
+
+The cost of waiting is recorded rather than hidden. Nothing under the directory
+is watched until the answer arrives, so events inside it in the meantime are
+missed. While anything is queued the repository is `priming` and its index is
+**not current**; when a queued directory turns out to be visible, the repository
+is marked with an event gap and owes a content-verifying pass before it may be
+described as current again.
+
+### Ignore rules that change
+
+Any `.gitignore` at any depth, `info/exclude`, and a HEAD move — because a branch
+switch swaps one branch's ignore rules for another's without touching a file the
+watcher would otherwise care about. Each marks the inventory stale, and the
+repository is re-primed against a fresh one at repository scope: newly ignored
+subtrees lose their watches and newly visible ones gain them, by construction
+rather than by a diff. The re-prime is a window in which events are not observed,
+so it too marks a gap and takes a full pass.
+
+`info/exclude` needs its own subscription and does not come free with the git
+directory. An inotify directory watch reports its **direct children only**:
+watching `.git` produces events for `.git/config` and `.git/HEAD` and **nothing
+at all** for `.git/info/exclude`. Verified by experiment, not assumed. It
+resolves to the *common* directory even from a linked worktree, so one descriptor
+serves every worktree sharing it.
+
+**A stated gap:** `core.excludesFile` normally lives outside the repository root,
+and Atlas never watches outside a repository root. A change to it is picked up by
+the periodic pass rather than immediately.
+
+### The inventory is a snapshot, and the walk re-checks itself
+
+The priming walk asks git once, at the start, and judges every directory it
+discovers against that answer. On a large repository the walk takes tens of
+seconds, and a build running in that window can create an ignored tree the
+snapshot has never heard of — which the walk would then watch, arriving at
+exactly the outcome the inventory exists to prevent from the other direction.
+
+So when the frontier empties, the inventory is read once more and any watch the
+repository holds beneath a now-ignored path is released. One git invocation and
+one pass over the watch map, once per priming run. It only ever *releases*
+watches: a subtree that stopped being ignored is the `ignore_stale` path's
+business.
+
+The residual is stated rather than solved: between the snapshot and that
+re-check, an ignored tree created mid-walk does hold watches. They are released
+when priming ends, and nothing is ever indexed from them, because indexing asks
+git separately.
+
+### What a repository is told while it primes
+
+`priming` sets the event gap, and not only because this Atlas would refuse to
+call a priming repository current anyway. `atlas_watch_state_parse` maps any
+state it does not recognise to `unwatched`, and the currency rule falls through
+`unwatched` to *current* — so a client older than P0 reading `"priming"` over the
+socket would re-derive `index_current: true` for a tree whose watches are still
+going in. The gap is a field every such client already understands, and setting
+it makes the honest answer the one they compute. A content-verifying pass clears
+it, as it does every other gap.
 
 `.git` is watched for metadata and **never indexed as source**. Those are
 different things and the code keeps them apart: metadata watches are flagged

@@ -226,9 +226,16 @@ atlas_status atlas_daemon_run(const atlas_daemon_opts *opts, FILE *log, atlas_er
         memset(&gwpolicy, 0, sizeof(gwpolicy));
     }
 
-    st = atlas_watcher_start(atlas_buf_cstr(&db_path), writer, log,
-                             orchpolicy.state == ATLAS_ORCHPOLICY_ENABLED,
-                             opts->reconcile_interval_ms, &watcher, err);
+    atlas_watcher_opts wopts;
+    atlas_watcher_opts_init(&wopts);
+    wopts.orch_enabled = orchpolicy.state == ATLAS_ORCHPOLICY_ENABLED;
+    wopts.system_deployment = serving_system_index;
+    wopts.reconcile_interval_ms = opts->reconcile_interval_ms;
+    /* The only production route to an injected bound, and it is set by no CLI
+     * flag: `atlas_daemon_opts.watch_budget_total` exists for the acceptance
+     * harness in `tests/tools/atlas_watch_daemon.c`. */
+    wopts.inject_budget_total = opts->watch_budget_total;
+    st = atlas_watcher_start(atlas_buf_cstr(&db_path), writer, log, &wopts, &watcher, err);
     if (st != ATLAS_OK) {
         goto done;
     }

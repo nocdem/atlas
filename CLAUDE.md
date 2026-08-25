@@ -1,7 +1,23 @@
 # Atlas — working notes for Claude Code
 
 Atlas is a generic, headless engineering-memory and repository-intelligence CLI
-in C17. Phase **A12.0**: the planned run — an operator brings a goal and a gate
+in C17. The current work is **P0**: the large-repository watcher — the watch
+budget is derived from the kernel instead of guessed, a physical inotify
+descriptor and a repository's subscription to it are finally different things,
+and a directory that appears while the daemon runs is not watched until git has
+been asked whether it is ignored. **P0 added migration 26.** The sentence it
+exists for is
+
+> **A DOCUMENTED BOUND THAT IS NOT THE IMPLEMENTED BOUND IS WORSE THAN NO
+> BOUND.**
+
+`ATLAS_WATCH_MAX_DIRS` said 8192 per repository and was enforced as
+`map.count + 1 >= 8192` against the *daemon-global* count — so it was 8191,
+daemon-wide, and which repository was left permanently degraded was decided by
+`ORDER BY name`. See the P0 sections in `docs/watcher-consistency.md`,
+`docs/daemon-and-ipc.md`, `docs/engineering-rules.md` and `docs/extending.md`.
+
+The season before it, **A12.0**, was the planned run — an operator brings a goal and a gate
 floor, a planner-role worker writes one bounded `atlas-plan-1` document, Atlas
 compiles it into stages, and each stage is driven as an ordinary A11.6 run. The
 plan's status has no writer at all: it is derived on every read from stored rows.
@@ -123,6 +139,7 @@ document that carries it:
 
 | Season | What it added | Document |
 | --- | --- | --- |
+| P0 | the watch budget derived from the kernel; a descriptor and a subscription made different things; an ignore answer nobody had for a path that did not exist yet | `docs/watcher-consistency.md` |
 | A12.0 | the planned run: a goal becomes one bounded plan document, and each stage is an ordinary run | `docs/orchestration.md` |
 | A9.2.7 | the yield: a short write now lands *during* semantic maintenance, and `BUSY` is the exception | `docs/daemon-and-ipc.md` |
 | A11.6 | bounded parallel tasks in a run; the repository's own tree kept exclusive, and settlement deferred to quiescence | `docs/orchestration.md` |
@@ -708,6 +725,48 @@ is not written down is one somebody deletes.** Both halves are load-bearing.
   phase it is already in. A failed renewal never kills the child.
 - **The run driver starts nothing in the background** — no scheduler, no polling,
   no timer, no model router, no second submit path.
+
+### P0 — the large-repository watcher
+
+- **A DOCUMENTED BOUND THAT IS NOT THE IMPLEMENTED BOUND IS WORSE THAN NO
+  BOUND.** 8192 "per repository" was `map.count + 1 >= 8192` daemon-wide, so it
+  was 8191, and `ORDER BY name` picked the loser. Compare with `>=`, never
+  `+ 1 >=`.
+- **The budget is derived from the kernel, not compiled.** Half of
+  `max_user_watches` under a root-owned system policy, a fifth otherwise, because
+  a dedicated `atlasd` has no other consumer of that uid's budget. A policy may
+  state `watch_max_dirs_total`; out of range is **MALFORMED, never clamped**, and
+  a malformed policy drops to legacy mode — so the binary is installed before the
+  key.
+- **Metadata watches go in first, for every repository, before any source tree**,
+  out of a reserve that is a floor and not a cap. Branch correctness must never
+  be contingent on the source tree fitting.
+- **There is no fixed per-repository cap and allocation is order-independent.**
+  Rounds divide the remaining pool among the repositories that still want
+  watches; one alone gets everything.
+- **A physical descriptor and a logical subscription are different things.**
+  Charge on a new subscription, release at the last one, fan out to every
+  subscriber, and **never claim `sum(per-repo) == total`** — it is `>=`, and
+  `watched_shared` is why.
+- **The ignore inventory is not an authority on a path that did not exist when it
+  was read.** A new directory is not watched and not descended into; it waits for
+  one bounded `git ls-files` per debounce tick. `check-ignore` is not used and is
+  not on the allowlist.
+- **Waiting is an event gap.** A queued directory, a rebuilt watch set and an
+  ignore-rule change are all windows in which events were missed. None may end in
+  `watching`, `event_gap=false` or `index_current=true` until a content-verifying
+  pass has completed.
+- **`info/exclude` needs its own subscription**: an inotify directory watch
+  reports direct children only, so a watch on `.git` sees nothing of it. Verified
+  by experiment. `core.excludesFile` is a stated cost, not a solved problem.
+- **Priming is resumable and yields between chunks**, because the watcher does
+  not poll inotify while it walks and `IN_Q_OVERFLOW` is global to the instance.
+  A walk that completes inside one call gets its **own** frontier.
+- **`priming` is neither watched nor degraded**, and **the proven envelope
+  (65536) is not the hard ceiling (262144)** — only the first may be claimed, and
+  only where the resolved budget reaches it.
+- **The test channel is not a public surface**: the budget travels on
+  `atlas_daemon_opts`, never a flag or an environment variable.
 
 ### A12.0 — the planned run
 

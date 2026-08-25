@@ -978,3 +978,98 @@ Two further rules for a method that writes anything:
 
 Every one is compile-time. There is no timer anywhere in this season, no bound
 derived from elapsed time, and no policy key or flag that widens any of them.
+
+## Extending the P0 watcher safely
+
+### A new watch reason
+
+`atlas_watch_reason` is a stored vocabulary, so adding a member touches four
+places and only one of them is a compile error:
+
+1. The enum in `include/atlas/db.h`, keeping `UNKNOWN` at zero. `UNKNOWN` means
+   *the writer stated no reason*, never *there is none* — `NONE` is the positive
+   statement and only a complete watch set may carry it.
+2. `atlas_watch_reason_name`, `_parse` and `_explain` in `src/db/db_state.c`.
+   The two switches have no `default:`, so the compiler finds them; `_parse`'s
+   table does not, which is why the round-trip is asserted in
+   `tests/test_watch_budget.c`.
+3. **A new migration widening the `CHECK` on `repo_index_state.watch_reason`.**
+   A member the enum knows and the schema does not is refused at the first write,
+   in production, by a constraint violation nobody can act on.
+4. One sentence in `_explain`. It reaches an operator and, through `ai.context`,
+   a model — so it is a fixed Atlas string and never assembled from anything a
+   repository can influence. The `kernel_limit` sentence is the one that must not
+   send an operator to an Atlas setting: its remedy is a sysctl.
+
+### A new watch state
+
+`atlas_watch_state` is CHECK-constrained too, so a member needs a
+**table-rebuild migration** — SQLite cannot widen a CHECK in place — and that
+migration verifies its own row preservation before it commits, migration 13's
+discipline. Migration 26 is the worked example.
+
+Then find every consumer, because `-Werror=switch-enum` finds the switches and
+nothing finds the comparison chains:
+
+- `atlas_index_state_is_current` in `src/db/db_state.c` — the authority on
+  whether an index is current. Decide explicitly whether the new state is.
+- `derive_index_current` in `src/core/service_daemon.c`, the remote path's copy
+  of the same question.
+- `tally_repo` in `src/core/service_daemon.c` and `tally` in `src/ipc/server.c`,
+  which count repositories by state. A state counted as neither watched nor
+  degraded needs its own counter, or one of those numbers becomes a lie.
+- Both renderers, and `docs/watcher-consistency.md`.
+
+`src/core/service_gate.c` used to hold a *second* copy of the currency
+predicate — under a comment saying two answers to one question is one too many —
+and P0 removed it by delegating. Do not reintroduce one.
+
+### A new watch budget or bound
+
+Every bound goes in the P0 block of `include/atlas/limits.h` with its reason
+beside it, and **is reported when reached** rather than silently trimming a tree.
+That means a reason code, which means the checklist above.
+
+Two rules that are easy to get wrong and were both got wrong before P0:
+
+- **Compare with `>=`, never `+ 1 >=`.** The old check refused the Nth watch at a
+  budget of N, so a documented 8192 was in fact 8191 — and the daemon reported
+  exactly that for weeks.
+- **A bound on work and a bound on a resource are different bounds.** The walk's
+  visit ceiling and the watch budget shared one flag and produced one sentence,
+  so "this repository is too big" and "this daemon is out of watches" were
+  indistinguishable to an operator *and* to Atlas.
+
+### Adding anything that counts watches
+
+Physical descriptors and logical subscriptions are different numbers.
+`inotify_add_watch` on an already-watched path returns the **same** descriptor,
+and two registered worktrees of one repository share every descriptor on their
+common git directory. So:
+
+- charge a repository only when `wd_map_put` reports a **new subscription**;
+- release the kernel descriptor only when the **last** subscriber leaves;
+- fan an event out to **every** subscriber;
+- and never write `sum(per-repo) == total`. The relation is `>=`, and
+  `watched_shared` is what explains it.
+
+### The proven envelope is not the ceiling
+
+`ATLAS_WATCH_DIRS_HARD_CEILING` is where a configured value is refused.
+`ATLAS_WATCH_PROVEN_ENVELOPE_DIRS` is what `scripts/perf-watch.sh` actually
+measured, in a deep and a wide tree shape, and it is the only figure
+documentation may claim. Raising the second needs a measurement, not an edit.
+
+### Bounds this season added
+
+| Bound | Where | Reached ⇒ |
+| --- | --- | --- |
+| daemon-wide watches | derived; `watch_max_dirs_total` may state it | `total_budget` |
+| one repository's share of a round | `remaining pool / repositories still wanting` | `repo_budget`, and the next round may give more |
+| git metadata per repository | `ATLAS_WATCH_META_RESERVE_PER_REPO` (a floor) / `_MAX_PER_REPO` (a ceiling) | `meta_budget` |
+| repositories observed | `ATLAS_WATCH_MAX_REPOS` | `repo_limit`; registration is unchanged |
+| priming frontier | `ATLAS_WATCH_FRONTIER_MAX_BYTES` | `frontier_overflow` |
+| directories awaiting an ignore decision | `ATLAS_WATCH_MAX_PENDING_IGNORE` / `_BYTES` | `pending_ignore_overflow` |
+| ignored entries per repository | `ATLAS_WATCH_MAX_IGNORED_DIRS` / `_BYTES` | `ignore_overflow` — fails closed |
+| directories visited per priming pass | `budget x ATLAS_WATCH_DISCOVER_FACTOR` | `discovery_bound` |
+| kernel refusal | `fs.inotify.max_user_watches` | `kernel_limit` — not an Atlas setting |

@@ -111,12 +111,151 @@
 #define ATLAS_DB_BATCH_MAX 256
 
 /* Watcher ---------------------------------------------------------------- */
-/* Inotify watches Atlas will install for one repository. Exceeding it is a
- * degraded state, reported, not a silent partial watch. */
-#define ATLAS_WATCH_MAX_DIRS 8192u
-/* Directories descended during one recursive discovery pass. */
-#define ATLAS_WATCH_MAX_DISCOVER_DIRS 8192u
-/* Files recorded by one recursive discovery pass. */
+/* P0. The watch budget, in four separate constants, because `ATLAS_WATCH_MAX_DIRS`
+ * was one number answering four different questions and getting three of them
+ * wrong.
+ *
+ * It was documented as a per-repository ceiling and enforced against the
+ * *daemon-global* map count, with a `+1 >=` comparison that made the real
+ * ceiling 8191. On a machine with `fs.inotify.max_user_watches` at 122910 and
+ * two registered repositories, the second repository — chosen by `ORDER BY
+ * name`, not by need — was permanently degraded and its index permanently not
+ * current, while Atlas used 6.7% of the watches the kernel would have given it.
+ *
+ * The replacement separates the resource question (how many watches may this
+ * machine spend?) from the correctness question (which watches must exist for a
+ * branch switch to be observed?), and derives the default from the kernel
+ * rather than from a number somebody picked.
+ *
+ * Every figure below rests on a measurement taken on the machine this was
+ * written for: 60000 fresh directories, then 60000 inotify watches with Atlas'
+ * exact mask, `/proc/meminfo` Slab deltas in two phases — 1452 B per directory
+ * for the inode and dentry a watch then *pins* against reclaim, plus 67 B for
+ * the mark itself. **1519 B, call it 1.5 KiB, per watched directory.** The
+ * widely repeated "about a kilobyte per watch" is an under-estimate, and a
+ * budget built on it would be half again as expensive as advertised. */
+
+/* The compiled refusal ceiling. A root-owned policy may not exceed it.
+ *
+ * This is NOT a support claim and must never be quoted as one: it is the point
+ * past which Atlas refuses a configured value, nothing more. What Atlas has
+ * actually been measured to do is `ATLAS_WATCH_PROVEN_ENVELOPE_DIRS` below, and
+ * the two are reported as separate fields for exactly that reason. */
+#define ATLAS_WATCH_DIRS_HARD_CEILING 262144u
+
+/* The acceptance-proven product envelope: what `scripts/perf-watch.sh` asserts,
+ * in both a deep and a wide tree shape, and the only figure documentation may
+ * claim.
+ *
+ * It is a claim about a *runtime* condition, not about the binary: it holds only
+ * where the resolved `effective_total` actually reaches it. On a machine whose
+ * kernel or policy budget resolves lower, Atlas reports the effective envelope
+ * it really has and claims nothing beyond it. */
+#define ATLAS_WATCH_PROVEN_ENVELOPE_DIRS 65536u
+
+/* Floor and ceiling for the kernel-derived default, before policy.
+ *
+ * MIN so that a tiny or unreadable `max_user_watches` still yields a working
+ * watcher — the kernel then refuses with ENOSPC, which is reported as itself.
+ * SOFT_MAX so that a machine with a very large limit does not have Atlas
+ * silently claim a quarter of a million watches (384 MiB pinned) because nobody
+ * said otherwise. A default is what Atlas chooses unasked, and choosing large
+ * unasked is how a resource decision becomes a surprise. */
+#define ATLAS_WATCH_TOTAL_MIN 1024u
+#define ATLAS_WATCH_TOTAL_SOFT_MAX 262144u
+
+/* The share of `fs.inotify.max_user_watches` the derived default claims,
+ * expressed as a percentage so the arithmetic stays in integers.
+ *
+ * Two values, because the uid means two different things. Under A7.1 a system
+ * deployment runs the daemon as its own `atlasd`, which has no other consumer of
+ * its inotify budget, so claiming half of it costs nobody anything. A per-user
+ * install shares the uid with the operator's editor, IDE, language servers and
+ * file manager — all of which watch trees too — so it claims a fifth. The
+ * distinction is read from the root-owned policy Atlas already loads, not from
+ * a new setting. */
+#define ATLAS_WATCH_KERNEL_SHARE_PCT_SYSTEM 50u
+#define ATLAS_WATCH_KERNEL_SHARE_PCT_USER 20u
+
+/* Metadata watches: the reserve is a floor, not a cap, and they are different
+ * numbers on purpose.
+ *
+ * RESERVE is held back from the source pool so that HEAD, the index, `refs/` and
+ * `info/exclude` can always be watched: a repository whose source tree exhausts
+ * the budget must still observe its own branch switches. Before P0 the metadata
+ * watches were installed *after* the unbounded source walk, so a large
+ * repository silently stopped watching HEAD — branch correctness was contingent
+ * on the source tree fitting.
+ *
+ * MAX is the separate explicit ceiling. A repository needing more than this many
+ * metadata directories has a pathological ref layout and is told so by name;
+ * at the measured cost that is 24 MiB of metadata watches for one repository. */
+#define ATLAS_WATCH_META_RESERVE_PER_REPO 256u
+#define ATLAS_WATCH_META_MAX_PER_REPO 16384u
+
+/* Repositories this watcher will observe.
+ *
+ * 256 and not more because every product of the bounds has to stay inside the
+ * hard ceiling with no arithmetic edge: 256 x ATLAS_WATCH_META_RESERVE_PER_REPO
+ * is 65536, comfortably below ATLAS_WATCH_DIRS_HARD_CEILING, whereas 1024 would
+ * make the reserve exactly the ceiling and the source pool exactly zero. It is
+ * also the value `wd_slot.sub_count` must be able to represent, which is checked
+ * against its type in `tests/test_watch_budget.c` rather than assumed.
+ *
+ * Registration is not given a new refusal surface: a repository past this bound
+ * is registered as before and reported degraded by the watcher, because losing
+ * observation is a watcher fact and refusing `repo add` would be a change to a
+ * different contract. */
+#define ATLAS_WATCH_MAX_REPOS 256u
+
+/* Directories the resumable priming walk advances per watcher-loop tick.
+ *
+ * The watcher does not poll inotify while it primes, and the kernel queue holds
+ * ATLAS_WATCH_EVENT_QUEUE_MAX events before it overflows — an overflow being
+ * global to the instance, so it gaps every repository at once. Chunking is what
+ * bounds the drain interval, and it is a correctness measure rather than a
+ * performance one: a faster walk would not remove the queue. */
+#define ATLAS_WATCH_PRIME_CHUNK_DIRS 512u
+
+/* The depth-first priming frontier, in bytes of pending path.
+ *
+ * Depth-first rather than breadth-first so that popping truncates the buffer and
+ * reclaims as it goes; the old walk kept every consumed path for the length of
+ * the traversal. The bound is still stated because a very wide directory puts
+ * every sibling on the frontier at once, and a bound that is reached must report
+ * itself rather than truncate a tree silently. */
+#define ATLAS_WATCH_FRONTIER_MAX_BYTES (32u * 1024u * 1024u)
+
+/* Directories waiting for an ignore decision, and the bytes of their names.
+ *
+ * A directory that appears while the daemon runs cannot be judged against the
+ * ignore inventory, because that inventory lists paths that *existed* when it
+ * was built and this one did not. It waits here until one bounded `git ls-files`
+ * per debounce tick answers for the whole queue at once. While anything is in
+ * it the repository is priming and its index is not current: a watch that has
+ * not been installed yet is a subtree whose events are being missed. */
+#define ATLAS_WATCH_MAX_PENDING_IGNORE 4096u
+#define ATLAS_WATCH_MAX_PENDING_IGNORE_BYTES (1024u * 1024u)
+
+/* Ignored directory entries held per repository, and their bytes.
+ *
+ * `git ls-files --directory` collapses an ignored tree to a single entry, so
+ * this is roughly 1770x what the repository that motivated P0 actually reports.
+ * Past it the repository is degraded and says so: the previous behaviour was to
+ * watch the surplus, which spent the watch budget on exactly the trees the
+ * ignore set exists to skip. */
+#define ATLAS_WATCH_MAX_IGNORED_DIRS 65536u
+#define ATLAS_WATCH_MAX_IGNORED_BYTES (8u * 1024u * 1024u)
+
+/* Directories visited by one priming walk, as a multiple of the repository's
+ * own share. Separate from the watch budget because they answer different
+ * questions: one bounds work, the other bounds a resource, and before P0 both
+ * set the same flag and produced the same sentence. */
+#define ATLAS_WATCH_DISCOVER_FACTOR 2u
+/* Files recorded by one recursive discovery pass. This is the reconciliation
+ * pass's default `max_untracked`, and it is not a limit on how many files a
+ * repository may hold — a distinction the P0 review had to make explicitly
+ * because the two are easy to confuse and only one of them is a watcher bound. */
 #define ATLAS_WATCH_MAX_DISCOVER_FILES 20000
 /* Raw inotify events buffered between drains. */
 #define ATLAS_WATCH_EVENT_QUEUE_MAX 16384u

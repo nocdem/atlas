@@ -74,6 +74,16 @@ target_link_libraries(atlas-gen-decisions PRIVATE atlas_core)
 target_compile_definitions(atlas-gen-decisions PRIVATE _POSIX_C_SOURCE=200809L)
 atlas_set_warnings(atlas-gen-decisions)
 
+# P0. The watcher acceptance daemon: the real `atlas_daemon_run` with the watch
+# budget injected. It links atlas_core for the reason atlas-gen-decisions does —
+# a fixture driven by a second code path measures a shape the real one never
+# produces — and it exists at all because the budget is deliberately not settable
+# from a flag or an environment variable. See tools/atlas_watch_daemon.c.
+add_executable(atlas-watch-daemon tools/atlas_watch_daemon.c)
+target_link_libraries(atlas-watch-daemon PRIVATE atlas_core)
+target_compile_definitions(atlas-watch-daemon PRIVATE _POSIX_C_SOURCE=200809L)
+atlas_set_warnings(atlas-watch-daemon)
+
 set(ATLAS_TESTS
   # The fixture's own hygiene, asserted from outside a process that used it.
   test_fixture
@@ -162,6 +172,16 @@ set(ATLAS_TESTS
   test_plan_render
   test_plan_xport
   test_plan_e2e
+  # --- P0: the large-repository watcher ---
+  #
+  # The budget, its accounting and the bound each refusal names, driven against a
+  # live writer and watcher in process because the watch budget is injectable
+  # only there -- there is deliberately no CLI flag or environment variable for
+  # it, since that would be a second answer to a question the root-owned policy
+  # owns.
+  test_watch_budget
+  test_watch_ignore
+  test_branch_switch
   test_remote_equivalence
   test_operator_peer
   # The A8 operator-boundary fix: decision links over the socket, and the
@@ -370,6 +390,13 @@ set_tests_properties(test_plan_xport PROPERTIES LABELS "unit")
 # label is for; the timeout is generous because three plans run three chains of
 # workers and gates.
 set_tests_properties(test_plan_e2e PROPERTIES LABELS "daemon" TIMEOUT 900 RUN_SERIAL TRUE)
+# P0. Runs a real inotify watcher and consumes this uid's watch budget, so it is
+# serialised against the other daemon tests for the reason they are serialised
+# against each other: parallel watchers compete for the machine's inotify budget,
+# and a test about exhausting a budget is the worst possible one to run beside
+# another that needs it.
+set_tests_properties(test_watch_budget test_watch_ignore test_branch_switch
+  PROPERTIES LABELS "daemon" TIMEOUT 900 RUN_SERIAL TRUE)
 # The lifecycle suite builds a real fixture repository, registers it through the
 # CLI and drives the one write point against an isolated database, so it is an
 # integration test. It sleeps for nothing: expiry and deadlines are supplied.

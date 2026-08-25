@@ -56,11 +56,13 @@ static int64_t count_of(atlas_db *db, const char *sql, atlas_err *err) {
  * A count would pass a migration that rewrote a value; this would not. The
  * column separator is 0x1F so that two adjacent columns cannot be confused with
  * one column containing the separator's spelling. */
-static void table_digest(atlas_db *db, const char *table, const char *order, char *out) {
+static void table_digest(atlas_db *db, const char *table, const char *order, const char *cols,
+                         char *out) {
     atlas_err err;
     atlas_err_init(&err);
     char sql[256];
-    (void)snprintf(sql, sizeof(sql), "SELECT * FROM %s ORDER BY %s;", table, order);
+    (void)snprintf(sql, sizeof(sql), "SELECT %s FROM %s ORDER BY %s;",
+                   cols != NULL ? cols : "*", table, order);
     /* Not the cached prepare: the SQL is constructed, so the pointer-keyed cache
      * would miss anyway and this keeps the intent obvious. */
     sqlite3_stmt *s = NULL;
@@ -99,48 +101,68 @@ static void table_digest(atlas_db *db, const char *table, const char *order, cha
 typedef struct table_ref {
     const char *name;
     const char *order;
+    /* P0. The columns to compare, or NULL for every column.
+     *
+     * `SELECT *` is the right default and the right assertion for almost every
+     * table here: it catches a reordered column, a renamed one and a changed
+     * value all at once. It is the wrong assertion for a table a later migration
+     * legitimately *extends*, because adding a column with a default damages no
+     * pre-existing row and yet changes the digest.
+     *
+     * Naming the columns keeps the property this test is for — every pre-A4
+     * value survives, in the same column, in the same order — while letting an
+     * additive migration be additive. The list is the table as the migration
+     * that created it defined it, so a later migration that dropped or renamed
+     * one of these still fails, which is what matters. */
+    const char *cols;
 } table_ref;
 
 static const table_ref PRE_A4_TABLES[] = {
-    {"repositories", "id"},
-    {"scans", "id"},
-    {"files", "id"},
-    {"commits", "id"},
-    {"file_changes", "id"},
-    {"compile_databases", "id"},
-    {"evidence", "id"},
+    {"repositories", "id", NULL},
+    {"scans", "id", NULL},
+    {"files", "id", NULL},
+    {"commits", "id", NULL},
+    {"file_changes", "id", NULL},
+    {"compile_databases", "id", NULL},
+    {"evidence", "id", NULL},
     /* A1 */
-    {"repo_index_state", "repo_id"},
-    {"repo_events", "id"},
-    {"repo_commit_tips", "repo_id, ref_name"},
-    {"daemon_state", "id"},
+    {"repo_index_state", "repo_id",
+     /* Migration 26 adds four columns to this table and widens a CHECK. The
+      * twelve below are exactly what migration 3 created, and every one of them
+      * must still hold its original value in its original position. */
+     "repo_id, generation, last_complete_generation, last_reconcile_at, last_complete_at,"
+     " watch_state, watch_detail, watched_dirs, event_gap, pending_full_reconcile,"
+     " last_error, last_sync_seq"},
+    {"repo_events", "id", NULL},
+    {"repo_commit_tips", "repo_id, ref_name", NULL},
+    {"daemon_state", "id", NULL},
     /* A2 */
-    {"ai_clients", "id"},
-    {"ai_sessions", "id"},
-    {"ai_session_repos", "session_id, repo_id"},
-    {"ai_session_events", "id"},
-    {"ai_change_sets", "id"},
-    {"ai_changed_paths", "id"},
-    {"ai_reasons", "id"},
-    {"ai_reason_paths", "reason_id, path_raw"},
-    {"ai_decisions", "id"},
-    {"ai_decision_paths", "decision_id, path_raw"},
-    {"ai_evidence_links", "id"},
-    {"ai_checkpoints", "id"},
-    {"repo_worktree_changes", "id"},
+    {"ai_clients", "id", NULL},
+    {"ai_sessions", "id", NULL},
+    {"ai_session_repos", "session_id, repo_id", NULL},
+    {"ai_session_events", "id", NULL},
+    {"ai_change_sets", "id", NULL},
+    {"ai_changed_paths", "id", NULL},
+    {"ai_reasons", "id", NULL},
+    {"ai_reason_paths", "reason_id, path_raw", NULL},
+    {"ai_decisions", "id", NULL},
+    {"ai_decision_paths", "decision_id, path_raw", NULL},
+    {"ai_evidence_links", "id", NULL},
+    {"ai_checkpoints", "id", NULL},
+    {"repo_worktree_changes", "id", NULL},
     /* A3 */
-    {"code_analyzers", "id"},
-    {"code_index_state", "repo_id"},
-    {"code_files", "id"},
-    {"code_file_roles", "id"},
-    {"code_symbols", "id"},
-    {"code_occurrences", "id"},
-    {"code_relations", "id"},
-    {"code_candidates", "id"},
-    {"code_units", "id"},
-    {"code_unit_includes", "id"},
-    {"code_unit_defines", "id"},
-    {"code_index_errors", "id"},
+    {"code_analyzers", "id", NULL},
+    {"code_index_state", "repo_id", NULL},
+    {"code_files", "id", NULL},
+    {"code_file_roles", "id", NULL},
+    {"code_symbols", "id", NULL},
+    {"code_occurrences", "id", NULL},
+    {"code_relations", "id", NULL},
+    {"code_candidates", "id", NULL},
+    {"code_units", "id", NULL},
+    {"code_unit_includes", "id", NULL},
+    {"code_unit_defines", "id", NULL},
+    {"code_index_errors", "id", NULL},
 };
 
 #define PRE_A4_TABLE_COUNT (sizeof(PRE_A4_TABLES) / sizeof(PRE_A4_TABLES[0]))
@@ -265,7 +287,8 @@ static void test_a_populated_pre_a4_database_migrates_losslessly(void) {
 
     char before[PRE_A4_TABLE_COUNT][ATLAS_SHA256_HEX_LEN + 1u];
     for (size_t i = 0; i < PRE_A4_TABLE_COUNT; i++) {
-        table_digest(db, PRE_A4_TABLES[i].name, PRE_A4_TABLES[i].order, before[i]);
+        table_digest(db, PRE_A4_TABLES[i].name, PRE_A4_TABLES[i].order, PRE_A4_TABLES[i].cols,
+                     before[i]);
     }
 
     /* The migration under test. */
@@ -279,7 +302,8 @@ static void test_a_populated_pre_a4_database_migrates_losslessly(void) {
     /* Row for row, column for column, name for name. */
     for (size_t i = 0; i < PRE_A4_TABLE_COUNT; i++) {
         char after[ATLAS_SHA256_HEX_LEN + 1u];
-        table_digest(db, PRE_A4_TABLES[i].name, PRE_A4_TABLES[i].order, after);
+        table_digest(db, PRE_A4_TABLES[i].name, PRE_A4_TABLES[i].order, PRE_A4_TABLES[i].cols,
+                     after);
         T_CHECK_MSG(strcmp(before[i], after) == 0,
                     "migration 6 changed table %s, which it must not touch at all",
                     PRE_A4_TABLES[i].name);
@@ -370,8 +394,8 @@ static void test_migration_is_idempotent(void) {
 
     char schema_before[ATLAS_SHA256_HEX_LEN + 1u];
     char applied_before[ATLAS_SHA256_HEX_LEN + 1u];
-    table_digest(db, "sqlite_master", "type, name", schema_before);
-    table_digest(db, "schema_migrations", "version", applied_before);
+    table_digest(db, "sqlite_master", "type, name", NULL, schema_before);
+    table_digest(db, "schema_migrations", "version", NULL, applied_before);
 
     for (int again = 0; again < 3; again++) {
         T_OK(atlas_db_migrate(db, &err), &err);
@@ -380,8 +404,8 @@ static void test_migration_is_idempotent(void) {
 
     char schema_after[ATLAS_SHA256_HEX_LEN + 1u];
     char applied_after[ATLAS_SHA256_HEX_LEN + 1u];
-    table_digest(db, "sqlite_master", "type, name", schema_after);
-    table_digest(db, "schema_migrations", "version", applied_after);
+    table_digest(db, "sqlite_master", "type, name", NULL, schema_after);
+    table_digest(db, "schema_migrations", "version", NULL, applied_after);
     T_CHECK_MSG(strcmp(schema_before, schema_after) == 0,
                 "repeated migration must not change the schema");
     T_CHECK_MSG(strcmp(applied_before, applied_after) == 0,

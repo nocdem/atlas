@@ -1288,6 +1288,13 @@ atlas_status atlas_reconcile_run(atlas_db *db, atlas_git *g, int64_t repo_id,
      * mixture of two branches, which is worse than being briefly out of date.
      * Abandon instead, and let the caller run another pass. */
     {
+        /* P0. The test barrier, if one was installed. Production leaves it NULL.
+         * Placed here deliberately: after every hash, before HEAD is re-read, so
+         * a test can move the branch inside the exact window the abandon rule
+         * protects. */
+        if (opts->before_head_recheck != NULL) {
+            opts->before_head_recheck(opts->before_head_recheck_ud);
+        }
         atlas_git_head now;
         st = atlas_git_read_head(g, &now, err);
         if (st != ATLAS_OK) {

@@ -797,11 +797,30 @@ atlas_status atlas_service_daemon_status_remote(atlas_daemon_status_report *out,
         {"repositories", &out->repo_count},
         {"watching", &out->watched_repos},
         {"degraded", &out->degraded_repos},
+        {"priming", &out->priming_repos},
         {"repositories_with_event_gap", &out->repos_with_gap},
+        /* P0. Absent keys keep the struct's initialised zero, which is what an
+         * older daemon leaves and what the renderer reads as "not reported"
+         * rather than as a budget of zero. A9.2.5's rule: the conservative value
+         * is the one that claims least. */
+        {"watches", &out->watches},
+        {"watch_subscriptions", &out->watch_subscriptions},
+        {"watch_budget_total", &out->watch_budget_total},
+        {"watch_budget_repo", &out->watch_budget_repo},
+        {"kernel_max_user_watches", &out->kernel_max_user_watches},
     };
     for (size_t i = 0; i < sizeof cs / sizeof cs[0]; i++) {
         if (atlas_ipc_result_int(r, cs[i].k, &t)) {
             *cs[i].dst = t;
+        }
+    }
+    if (atlas_ipc_result_str(r, "watch_budget_source", &v)) {
+        out->watch_budget_from_policy = strcmp(v, "policy") == 0;
+    }
+    {
+        bool b = false;
+        if (atlas_ipc_result_bool(r, "priming_complete", &b)) {
+            out->priming_complete = b;
         }
     }
     atlas_ipc_response_free(r);

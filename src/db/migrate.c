@@ -4110,6 +4110,130 @@ static const char M25_JOB_CORRELATION[] =
 static const char *const M25_STATEMENTS[] = {M25_PLANS, M25_REVISIONS, M25_TASKS,
                                              M25_JOB_CORRELATION, NULL};
 
+/* --- migration 26: the watch budget says which bound it reached -------------
+ *
+ * ## Why this rebuilds a table
+ *
+ * `repo_index_state.watch_state` is a stored vocabulary with a CHECK, and P0
+ * adds `'priming'` to it — the state a repository is in while its watch set is
+ * still being installed. SQLite cannot widen a CHECK in place, so the table is
+ * rebuilt. That is the whole reason; the four new columns beside it are
+ * additive and would not have needed one.
+ *
+ * `foreign_keys_off` is **false**, and this is not an oversight. Migration 13
+ * carries that flag because the tables it rebuilt were referenced by children
+ * declaring `ON DELETE CASCADE`, so the implicit DELETE inside `DROP TABLE`
+ * would have silently emptied them. Nothing in the schema references
+ * `repo_index_state` — it is a child of `repositories` and a parent of nothing —
+ * so dropping it cascades to no row anywhere, and the migration runs with
+ * foreign keys enforced like every other one. `pragma_foreign_key_check` is
+ * asserted at the end regardless, because "nothing references it" is a claim
+ * about today's schema and the check costs nothing.
+ *
+ * ## What the new columns mean, and what their defaults mean
+ *
+ * `watch_reason` defaults to `'unknown'`, and that is the honest value rather
+ * than a fallback: a row written before this migration was written by a watcher
+ * that had no reasons to give. Reading it as `NONE` would invent the claim that
+ * nothing was wrong, which is exactly the claim the repository that motivated P0
+ * would have been making falsely for weeks.
+ *
+ * `watched_source`, `watched_meta` and `watched_shared` default to 0 meaning
+ * "the writer of this row did not report a split", not "there were none". The
+ * pre-existing `watched_dirs` is carried across unchanged; it is not
+ * back-derived into the new columns, because the number it holds was counted by
+ * the accounting P0 replaces — it double-counted a shared descriptor and was not
+ * written at all on the degraded path — and splitting an unreliable total into
+ * two unreliable halves would dress it up rather than fix it. The next watch
+ * build writes all four together.
+ *
+ * ## What it does not do
+ *
+ * It starts nothing, watches nothing and changes no repository's observed state.
+ * A migrated daemon comes up, primes as it always did, and writes the new
+ * columns on its first watch build. */
+static const char M26_SNAPSHOT[] =
+    /* Taken before anything is touched, and dropped before the migration ends,
+     * so a completed schema 26 contains neither helper. */
+    "CREATE TABLE m26_counts(t TEXT PRIMARY KEY, n INTEGER NOT NULL);"
+    "INSERT INTO m26_counts(t, n) SELECT 'rows', count(*) FROM repo_index_state;"
+    /* Identity, not just arithmetic. A rebuild that preserved the row count and
+     * renumbered `repo_id` would pass a count check and detach every index state
+     * from the repository it describes — and because `repo_id` is the primary
+     * key and a foreign key at once, the result would still satisfy the schema.
+     * The generation pair is carried too, because it is the value A1's
+     * "never move the published generation backwards" rule depends on. */
+    "CREATE TABLE m26_rows(repo_id INTEGER PRIMARY KEY, gen INTEGER NOT NULL,"
+    "  cgen INTEGER NOT NULL, ws TEXT NOT NULL, gap INTEGER NOT NULL, dirs INTEGER NOT NULL);"
+    "INSERT INTO m26_rows(repo_id, gen, cgen, ws, gap, dirs)"
+    "  SELECT repo_id, generation, last_complete_generation, watch_state, event_gap, watched_dirs"
+    "  FROM repo_index_state;";
+
+static const char M26_STATE[] =
+    "CREATE TABLE repo_index_state_new ("
+    "  repo_id INTEGER PRIMARY KEY REFERENCES repositories(id) ON DELETE CASCADE,"
+    "  generation INTEGER NOT NULL DEFAULT 0,"
+    "  last_complete_generation INTEGER NOT NULL DEFAULT 0,"
+    "  last_reconcile_at TEXT,"
+    "  last_complete_at TEXT,"
+    /* 'priming' is the member this rebuild exists for. */
+    "  watch_state TEXT NOT NULL DEFAULT 'unwatched' CHECK(watch_state IN"
+    "    ('unwatched','watching','degraded','incomplete','error','priming')),"
+    "  watch_detail TEXT,"
+    "  watched_dirs INTEGER NOT NULL DEFAULT 0,"
+    "  watched_source INTEGER NOT NULL DEFAULT 0,"
+    "  watched_meta INTEGER NOT NULL DEFAULT 0,"
+    "  watched_shared INTEGER NOT NULL DEFAULT 0,"
+    "  watch_reason TEXT NOT NULL DEFAULT 'unknown' CHECK(watch_reason IN"
+    "    ('unknown','none','kernel_limit','repo_budget','total_budget','meta_budget',"
+    "     'discovery_bound','ignore_overflow','pending_ignore_overflow','frontier_overflow',"
+    "     'repo_limit','error')),"
+    "  event_gap INTEGER NOT NULL DEFAULT 0,"
+    "  pending_full_reconcile INTEGER NOT NULL DEFAULT 0,"
+    "  last_error TEXT,"
+    "  last_sync_seq INTEGER NOT NULL DEFAULT 0"
+    ");"
+    "INSERT INTO repo_index_state_new"
+    "  (repo_id, generation, last_complete_generation, last_reconcile_at, last_complete_at,"
+    "   watch_state, watch_detail, watched_dirs, event_gap, pending_full_reconcile,"
+    "   last_error, last_sync_seq)"
+    "  SELECT repo_id, generation, last_complete_generation, last_reconcile_at, last_complete_at,"
+    "         watch_state, watch_detail, watched_dirs, event_gap, pending_full_reconcile,"
+    "         last_error, last_sync_seq"
+    "  FROM repo_index_state;"
+    "DROP TABLE repo_index_state;"
+    "ALTER TABLE repo_index_state_new RENAME TO repo_index_state;";
+
+/* The rebuild verifies its own row preservation before it commits, migration
+ * 13's discipline and for its reason. The named CHECK is the error message: a
+ * failure reports `no_index_state_row_may_be_lost_in_migration_26`, the runner
+ * wraps it as "migration 26 ... failed and was rolled back", and nothing is
+ * written. */
+static const char M26_VERIFY[] =
+    "CREATE TABLE m26_verify(ok INTEGER NOT NULL,"
+    "  CONSTRAINT no_index_state_row_may_be_lost_in_migration_26 CHECK(ok = 1));"
+    "INSERT INTO m26_verify(ok) SELECT CASE WHEN"
+    "     (SELECT n FROM m26_counts WHERE t='rows') = (SELECT count(*) FROM repo_index_state)"
+    /* Every row came across attached to the same repository, with the same
+     * generations, the same watch state, the same gap and the same count. */
+    " AND (SELECT count(*) FROM m26_rows h JOIN repo_index_state s"
+    "        ON s.repo_id = h.repo_id AND s.generation = h.gen"
+    "       AND s.last_complete_generation = h.cgen AND s.watch_state = h.ws"
+    "       AND s.event_gap = h.gap AND s.watched_dirs = h.dirs)"
+    "       = (SELECT n FROM m26_counts WHERE t='rows')"
+    /* No migrated row claims a reason nobody recorded. */
+    " AND (SELECT count(*) FROM repo_index_state WHERE watch_reason <> 'unknown') = 0"
+    /* And nothing dangles: every index state still names a repository that
+     * exists. Cheap, and it is the check that says the schema is consistent
+     * again before the commit that makes it visible. */
+    " AND (SELECT count(*) FROM pragma_foreign_key_check) = 0"
+    "  THEN 1 ELSE 0 END;"
+    "DROP TABLE m26_verify;"
+    "DROP TABLE m26_counts;"
+    "DROP TABLE m26_rows;";
+
+static const char *const M26_STATEMENTS[] = {M26_SNAPSHOT, M26_STATE, M26_VERIFY, NULL};
+
 static const atlas_migration MIGRATIONS[] = {
     {1, "initial schema", M1_STATEMENTS, false},
     {2, "worktree identity", M2_STATEMENTS, false},
@@ -4187,6 +4311,17 @@ static const atlas_migration MIGRATIONS[] = {
      * operator creates one. See the M25 comment for why there is no status
      * column. */
     {25, "the planned run: plans, revisions, plan tasks", M25_STATEMENTS, false},
+    /* A rebuild, because SQLite cannot widen a CHECK in place and `'priming'` is
+     * a new member of a stored vocabulary. `foreign_keys_off` is false and stays
+     * false: nothing references `repo_index_state`, so the implicit DELETE in
+     * `DROP TABLE` cascades to nothing, and migration 13 remains the only
+     * migration in Atlas that runs with foreign keys disabled. The rebuild
+     * verifies its own row preservation before it commits. Four columns are
+     * added; `watch_reason` defaults to 'unknown' because a row written before
+     * this migration was written by a watcher that had no reasons to give, and
+     * the three counts default to 0 meaning "not reported", never "none". */
+    {26, "the watch budget names the bound it reached, and priming is a state",
+     M26_STATEMENTS, false},
 };
 
 const atlas_migration *atlas_migrations(size_t *count_out) {

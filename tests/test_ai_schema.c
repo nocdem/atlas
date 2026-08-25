@@ -91,11 +91,12 @@ static void test_migration_creates_the_a2_tables(void) {
      * make here as well. A4 added migration 6, A6 added migration 7, A8 added
      * migration 8, A8-CI added migration 11 and A9 added migration 12; A9.2
      * added 14 and 15, A9.2.1 added 16, A9.2.2 added 17 and A9.2.3 added 18;
-     * A11.0 added 21, A10.0 added 22, A10.1 added 23 and A11.6 added 24.
+     * A11.0 added 21, A10.0 added 22, A10.1 added 23, A11.6 added 24, A12.0 added
+     * 25 and P0 added 26.
      * The A2 tables below
      * are asserted unchanged across all of them, which is the property this
      * test is really for. */
-    T_EQ_INT(ATLAS_SCHEMA_VERSION, 25);
+    T_EQ_INT(ATLAS_SCHEMA_VERSION, 26);
 
     static const char *const TABLES[] = {
         "ai_clients",       "ai_sessions",       "ai_session_repos",     "ai_session_events",

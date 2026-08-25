@@ -22,6 +22,7 @@ const char *atlas_watch_state_name(atlas_watch_state s) {
     case ATLAS_WATCH_DEGRADED: return "degraded";
     case ATLAS_WATCH_INCOMPLETE: return "incomplete";
     case ATLAS_WATCH_ERROR: return "error";
+    case ATLAS_WATCH_PRIMING: return "priming";
     }
     return "unwatched";
 }
@@ -42,7 +43,111 @@ atlas_watch_state atlas_watch_state_parse(const char *name) {
     if (strcmp(name, "error") == 0) {
         return ATLAS_WATCH_ERROR;
     }
+    if (strcmp(name, "priming") == 0) {
+        return ATLAS_WATCH_PRIMING;
+    }
     return ATLAS_WATCH_UNWATCHED;
+}
+
+/* P0. The watch reason vocabulary.
+ *
+ * One table, three functions over it, and the names are the stored spelling —
+ * they are what migration 26's CHECK lists, so a member added here and not
+ * there is refused by the database rather than written and forgotten. The
+ * switches have no `default:`, so adding a member is a compile error at every
+ * one of them; that is the half the compiler can find, and `docs/extending.md`
+ * carries the half it cannot. */
+const char *atlas_watch_reason_name(atlas_watch_reason r) {
+    switch (r) {
+    case ATLAS_WATCH_REASON_UNKNOWN: return "unknown";
+    case ATLAS_WATCH_REASON_NONE: return "none";
+    case ATLAS_WATCH_REASON_KERNEL_LIMIT: return "kernel_limit";
+    case ATLAS_WATCH_REASON_REPO_BUDGET: return "repo_budget";
+    case ATLAS_WATCH_REASON_TOTAL_BUDGET: return "total_budget";
+    case ATLAS_WATCH_REASON_META_BUDGET: return "meta_budget";
+    case ATLAS_WATCH_REASON_DISCOVERY_BOUND: return "discovery_bound";
+    case ATLAS_WATCH_REASON_IGNORE_OVERFLOW: return "ignore_overflow";
+    case ATLAS_WATCH_REASON_PENDING_IGNORE_OVERFLOW: return "pending_ignore_overflow";
+    case ATLAS_WATCH_REASON_FRONTIER_OVERFLOW: return "frontier_overflow";
+    case ATLAS_WATCH_REASON_REPO_LIMIT: return "repo_limit";
+    case ATLAS_WATCH_REASON_ERROR: return "error";
+    }
+    return "unknown";
+}
+
+atlas_watch_reason atlas_watch_reason_parse(const char *name) {
+    if (name == NULL) {
+        return ATLAS_WATCH_REASON_UNKNOWN;
+    }
+    static const struct {
+        const char *name;
+        atlas_watch_reason reason;
+    } TABLE[] = {
+        {"none", ATLAS_WATCH_REASON_NONE},
+        {"kernel_limit", ATLAS_WATCH_REASON_KERNEL_LIMIT},
+        {"repo_budget", ATLAS_WATCH_REASON_REPO_BUDGET},
+        {"total_budget", ATLAS_WATCH_REASON_TOTAL_BUDGET},
+        {"meta_budget", ATLAS_WATCH_REASON_META_BUDGET},
+        {"discovery_bound", ATLAS_WATCH_REASON_DISCOVERY_BOUND},
+        {"ignore_overflow", ATLAS_WATCH_REASON_IGNORE_OVERFLOW},
+        {"pending_ignore_overflow", ATLAS_WATCH_REASON_PENDING_IGNORE_OVERFLOW},
+        {"frontier_overflow", ATLAS_WATCH_REASON_FRONTIER_OVERFLOW},
+        {"repo_limit", ATLAS_WATCH_REASON_REPO_LIMIT},
+        {"error", ATLAS_WATCH_REASON_ERROR},
+    };
+    for (size_t i = 0; i < sizeof TABLE / sizeof TABLE[0]; i++) {
+        if (strcmp(name, TABLE[i].name) == 0) {
+            return TABLE[i].reason;
+        }
+    }
+    /* An unrecognised spelling reads as UNKNOWN, never as the nearest match. A
+     * newer daemon's reason arriving at an older client must not be silently
+     * rendered as a different one — A9.2.5's rule for the remote parser, and the
+     * conservative value is the one that claims least. */
+    return ATLAS_WATCH_REASON_UNKNOWN;
+}
+
+const char *atlas_watch_reason_explain(atlas_watch_reason r) {
+    switch (r) {
+    case ATLAS_WATCH_REASON_UNKNOWN:
+        return "no reason was recorded for this repository's watch state";
+    case ATLAS_WATCH_REASON_NONE: return "the watch set is complete";
+    case ATLAS_WATCH_REASON_KERNEL_LIMIT:
+        /* The one reason whose remedy is not an Atlas setting, so it is the one
+         * message that must not send an operator to an Atlas setting. */
+        return "the kernel refused another inotify watch for this user; raise "
+               "fs.inotify.max_user_watches, or expect the unwatched parts to be covered only by "
+               "periodic reconciliation";
+    case ATLAS_WATCH_REASON_REPO_BUDGET:
+        return "this repository reached its share of the daemon's watch budget for this round";
+    case ATLAS_WATCH_REASON_TOTAL_BUDGET:
+        return "the daemon's total watch budget is spent across every repository it observes";
+    case ATLAS_WATCH_REASON_META_BUDGET:
+        return "this repository needs more git metadata watches than Atlas will install";
+    case ATLAS_WATCH_REASON_DISCOVERY_BOUND:
+        return "the watch installer reached its bound on directories visited in one pass";
+    case ATLAS_WATCH_REASON_IGNORE_OVERFLOW:
+        return "this repository reports more ignored directories than Atlas will hold, so the "
+               "surplus cannot be distinguished from directories that should be watched";
+    case ATLAS_WATCH_REASON_PENDING_IGNORE_OVERFLOW:
+        return "more directories appeared at once than Atlas will hold while it decides whether "
+               "git ignores them";
+    case ATLAS_WATCH_REASON_FRONTIER_OVERFLOW:
+        return "a directory in this repository has more entries than the watch installer will "
+               "hold pending at once";
+    case ATLAS_WATCH_REASON_REPO_LIMIT:
+        return "more repositories are registered than this watcher will observe";
+    case ATLAS_WATCH_REASON_ERROR:
+        return "the watch installer failed for this repository";
+    }
+    return "no reason was recorded for this repository's watch state";
+}
+
+void atlas_watch_outcome_init(atlas_watch_outcome *o) {
+    memset(o, 0, sizeof(*o));
+    /* Both zeros are the conservative value: unwatched, and no reason stated. */
+    o->state = ATLAS_WATCH_UNWATCHED;
+    o->reason = ATLAS_WATCH_REASON_UNKNOWN;
 }
 
 void atlas_index_state_init(atlas_index_state *s) {
@@ -100,6 +205,17 @@ bool atlas_index_state_is_current(const atlas_index_state *s, const char **reaso
         reason = "the filesystem watcher failed and is not observing this repository";
     } else if (s->watch_state == ATLAS_WATCH_DEGRADED) {
         reason = "the filesystem watcher is running with a known blind spot";
+    } else if (s->watch_state == ATLAS_WATCH_PRIMING) {
+        /* P0. A watch set that is still being installed is a tree Atlas is not
+         * yet observing all of, and the parts it has not reached are producing
+         * events nobody is receiving. That is the same claim an event gap makes,
+         * so it gets the same answer.
+         *
+         * It is listed after the gap and the owed-pass checks deliberately: a
+         * repository that is priming *and* owes a full pass should be told about
+         * the pass, which is the condition an operator can act on and the one
+         * that has to clear before anything is current again. */
+        reason = "the filesystem watcher has not finished installing this repository's watches";
     } else {
         current = true;
     }
@@ -118,7 +234,9 @@ atlas_status atlas_db_index_state_get(atlas_db *db, int64_t repo_id, atlas_index
                                        "SELECT generation, last_complete_generation,"
                                        " last_reconcile_at, last_complete_at, watch_state,"
                                        " watch_detail, watched_dirs, event_gap,"
-                                       " pending_full_reconcile, last_error, last_sync_seq"
+                                       " pending_full_reconcile, last_error, last_sync_seq,"
+                                       " watched_source, watched_meta, watched_shared,"
+                                       " watch_reason"
                                        " FROM repo_index_state WHERE repo_id=?1;",
                                        &stmt, err);
     if (st != ATLAS_OK) {
@@ -151,6 +269,10 @@ atlas_status atlas_db_index_state_get(atlas_db *db, int64_t repo_id, atlas_index
         }
         if (st == ATLAS_OK) {
             out->last_sync_seq = sqlite3_column_int64(stmt, 10);
+            out->watched_source = sqlite3_column_int64(stmt, 11);
+            out->watched_meta = sqlite3_column_int64(stmt, 12);
+            out->watched_shared = sqlite3_column_int64(stmt, 13);
+            out->watch_reason = atlas_watch_reason_parse(atlas_db_col_text(stmt, 14));
         }
     } else if (rc != SQLITE_DONE) {
         st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot read index state");
@@ -258,9 +380,21 @@ atlas_status atlas_db_generation_complete(atlas_db *db, int64_t repo_id, int64_t
     return atlas_db_step_done(db, stmt, err);
 }
 
-atlas_status atlas_db_index_state_set_watch(atlas_db *db, int64_t repo_id, atlas_watch_state ws,
-                                            const char *detail, int64_t watched_dirs,
-                                            atlas_err *err) {
+/* P0. The one writer of everything a watch build establishes.
+ *
+ * Before P0 the healthy path wrote state, detail and a count here while the
+ * degraded path wrote state and detail through `mark_gap` and left the count
+ * alone — so a repository that had been watching 7440 directories and then
+ * degraded went on reporting 7440 indefinitely, and the number a reader saw was
+ * from the last time things had gone well. Every caller now goes through this
+ * function with a complete outcome, so there is one place to add a field to and
+ * one place that can forget it.
+ *
+ * `watched_dirs` is written as source + meta rather than taken as its own
+ * argument: two numbers and their sum are three chances to disagree, and the
+ * sum is the one that can be derived. */
+atlas_status atlas_db_index_state_set_watch(atlas_db *db, int64_t repo_id,
+                                            const atlas_watch_outcome *outcome, atlas_err *err) {
     atlas_status st = atlas_db_index_state_ensure(db, repo_id, err);
     if (st != ATLAS_OK) {
         return st;
@@ -268,19 +402,26 @@ atlas_status atlas_db_index_state_set_watch(atlas_db *db, int64_t repo_id, atlas
     sqlite3_stmt *stmt = NULL;
     st = atlas_db_prepare(db,
                           "UPDATE repo_index_state SET watch_state=?2, watch_detail=?3,"
-                          " watched_dirs=?4 WHERE repo_id=?1;",
+                          " watched_dirs=?4, watched_source=?5, watched_meta=?6,"
+                          " watched_shared=?7, watch_reason=?8 WHERE repo_id=?1;",
                           &stmt, err);
     if (st != ATLAS_OK) {
         return st;
     }
     if (sqlite3_bind_int64(stmt, 1, repo_id) != SQLITE_OK ||
-        sqlite3_bind_int64(stmt, 4, watched_dirs) != SQLITE_OK) {
+        sqlite3_bind_int64(stmt, 4, outcome->source_dirs + outcome->meta_dirs) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 5, outcome->source_dirs) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 6, outcome->meta_dirs) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 7, outcome->shared_dirs) != SQLITE_OK) {
         atlas_db_finish(db, stmt);
         return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind watch fields");
     }
-    st = atlas_db_bind_text_opt(db, stmt, 2, atlas_watch_state_name(ws), err);
+    st = atlas_db_bind_text_opt(db, stmt, 2, atlas_watch_state_name(outcome->state), err);
     if (st == ATLAS_OK) {
-        st = atlas_db_bind_text_opt(db, stmt, 3, detail, err);
+        st = atlas_db_bind_text_opt(db, stmt, 3, outcome->detail, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_db_bind_text_opt(db, stmt, 8, atlas_watch_reason_name(outcome->reason), err);
     }
     if (st != ATLAS_OK) {
         atlas_db_finish(db, stmt);

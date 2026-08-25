@@ -40,13 +40,18 @@
 #include "core/service_internal.h"
 #include "gate/gate_internal.h"
 
-/* Mirrors the file index's own currency check. Same shape and same strings as
- * `atlas_server_index_current`, for the reason A3's copy gives: two answers to
- * one question is one answer too many, and this one decides a gate. */
+/* The file index's own currency check — asked of the authority rather than
+ * reimplemented beside it.
+ *
+ * This used to be a second copy of the predicate, under a comment saying that
+ * two answers to one question is one answer too many. P0 added a watch state
+ * (`priming`) that makes an index not current, and the copy here did not know
+ * about it: a gate would have been evaluated against a repository whose watches
+ * were still being installed and called its index current. `-Werror=switch-enum`
+ * cannot catch a chain of `!=` comparisons, so the only durable fix is to stop
+ * having a second one. */
 static bool file_index_current(const atlas_index_state *s) {
-    return s->present && s->last_complete_generation > 0 && !s->event_gap &&
-           !s->pending_full_reconcile && s->watch_state != ATLAS_WATCH_ERROR &&
-           s->watch_state != ATLAS_WATCH_DEGRADED;
+    return atlas_index_state_is_current(s, NULL);
 }
 
 /* --- collecting the decisions --------------------------------------------- */

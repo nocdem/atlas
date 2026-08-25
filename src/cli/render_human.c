@@ -699,7 +699,22 @@ static atlas_status h_daemon_status(atlas_renderer *r, const atlas_daemon_status
     (void)fprintf(o, LABEL "%" PRId64 "\n", "repositories", rep->repo_count);
     (void)fprintf(o, LABEL "%" PRId64 "\n", "watching", rep->watched_repos);
     (void)fprintf(o, LABEL "%" PRId64 "\n", "degraded", rep->degraded_repos);
+    (void)fprintf(o, LABEL "%" PRId64 "\n", "priming", rep->priming_repos);
     (void)fprintf(o, LABEL "%" PRId64 "\n", "event gaps", rep->repos_with_gap);
+    if (rep->watch_budget_total > 0) {
+        /* Zero means the daemon did not report a budget — an older daemon, or a
+         * read with none running — so the whole block is omitted rather than
+         * printed as a row of zeros that would read as a real answer. */
+        (void)fprintf(o, LABEL "%" PRId64 " physical, %" PRId64 " subscriptions\n", "watches",
+                      rep->watches, rep->watch_subscriptions);
+        (void)fprintf(o, LABEL "%" PRId64 " (%s), kernel allows %" PRId64 "\n", "watch budget",
+                      rep->watch_budget_total,
+                      rep->watch_budget_from_policy ? "policy" : "derived from the kernel",
+                      rep->kernel_max_user_watches);
+        if (!rep->priming_complete) {
+            (void)fprintf(o, LABEL "%s\n", "priming", "in progress");
+        }
+    }
     if (rep->repos_with_gap > 0) {
         (void)fprintf(o,
                       "\n%" PRId64
@@ -729,7 +744,21 @@ static atlas_status h_repo_state(atlas_renderer *r, const atlas_repo_state_repor
     (void)fprintf(o, LABEL "%s\n", "repository", rep->repo.name);
     (void)fprintf(o, LABEL "%s\n", "root", atlas_buf_cstr(&rep->repo.root_path_text));
     (void)fprintf(o, LABEL "%s\n", "watch state", atlas_watch_state_name(rep->state.watch_state));
-    (void)fprintf(o, LABEL "%" PRId64 "\n", "watched dirs", rep->state.watched_dirs);
+    (void)fprintf(o, LABEL "%" PRId64 " (source %" PRId64 ", metadata %" PRId64 ")\n",
+                  "watched dirs", rep->state.watched_dirs, rep->state.watched_source,
+                  rep->state.watched_meta);
+    if (rep->state.watched_shared > 0) {
+        /* Only shown when it is non-zero, because it is only interesting then:
+         * it is the reason this repository's count and the daemon's physical
+         * total do not have to agree. */
+        (void)fprintf(o, LABEL "%" PRId64 " (also watched by another repository)\n",
+                      "shared watches", rep->state.watched_shared);
+    }
+    if (rep->state.watch_reason != ATLAS_WATCH_REASON_NONE &&
+        rep->state.watch_reason != ATLAS_WATCH_REASON_UNKNOWN) {
+        (void)fprintf(o, LABEL "%s\n", "watch reason",
+                      atlas_watch_reason_name(rep->state.watch_reason));
+    }
     (void)fprintf(o, LABEL "%" PRId64 " (in flight %" PRId64 ")\n", "generation",
                   rep->state.last_complete_generation, rep->state.generation);
     (void)fprintf(o, LABEL "%s\n", "last complete", dash_if_empty(rep->state.last_complete_at));

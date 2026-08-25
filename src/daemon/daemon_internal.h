@@ -213,8 +213,23 @@ struct atlas_job {
      * own flag rather than being implied by one. */
     bool code_rebuild;
     int64_t sync_seq;  /* echoed into the published state */
+    /* P0. The whole outcome of one watch build, carried as one job.
+     *
+     * It used to be two jobs — a gap note and a state note — and the watcher
+     * submitted whichever applied. That was already fragile and A9.2.7 made it
+     * unsafe to reason about: FIFO holds within a kind and among drainable
+     * kinds, not between two arbitrary kinds, so "the state note lands after the
+     * gap note" was an assumption rather than a guarantee. One job writes both,
+     * in order, on the writer thread, and the question does not arise. */
     int watch_state;   /* set watch: an atlas_watch_state */
-    int64_t watched_dirs;
+    int watch_reason;  /* set watch: an atlas_watch_reason */
+    int64_t watched_source;
+    int64_t watched_meta;
+    int64_t watched_shared;
+    /* Mark an event gap in the same step. The watcher's own state and reason are
+     * written *after* the gap flags, so a degraded repository reports why it is
+     * degraded rather than the generic 'incomplete' the gap writer would leave. */
+    bool watch_mark_gap;
     atlas_buf arg1;    /* repo add: path, repo remove: name, gap/watch: detail */
     atlas_buf arg2;    /* repo add: name (may be empty) */
     /* repo add: refuse unless `arg1` is itself the worktree root. Set by the
@@ -449,10 +464,15 @@ atlas_status atlas_writer_decision(atlas_writer *w, atlas_decision_op *op, int t
  * full pass covers the case where the flag did not get written. */
 atlas_status atlas_writer_submit_gap(atlas_writer *w, int64_t repo_id, const char *detail,
                                      atlas_err *err);
-/* Records the watcher's own state for a repository. */
-atlas_status atlas_writer_submit_watch_state(atlas_writer *w, int64_t repo_id, int watch_state,
-                                             const char *detail, int64_t watched_dirs,
-                                             atlas_err *err);
+/* P0. Records everything one watch build established for a repository, and
+ * optionally marks an event gap in the same step.
+ *
+ * `mark_gap` is not a convenience: a watch set that could not be installed
+ * completely is a tree whose events are being missed, which is the definition of
+ * a gap, and writing the two facts separately is how they used to disagree. */
+atlas_status atlas_writer_submit_watch_outcome(atlas_writer *w, int64_t repo_id,
+                                               const atlas_watch_outcome *outcome, bool mark_gap,
+                                               atlas_err *err);
 
 /* --- how a job kind is classified ----------------------------------------
  *
@@ -494,15 +514,64 @@ typedef struct atlas_watcher atlas_watcher;
 
 /* Starts the inotify watcher. It opens its own read-only database handle to
  * enumerate repositories, and submits reconciliations through `writer`. */
-/* `orch_enabled` arms the orchestration recovery sweep on the watcher's timer.
- * False on every daemon that is not serving the system index under an active
- * policy, so a fixture or ad-hoc daemon never sweeps. */
+/* P0. Everything the watcher is started with, as a struct rather than six
+ * positional arguments.
+ *
+ * The four `inject_` fields are the **test channel**, and they are deliberately
+ * not reachable from anywhere a user is: no CLI flag, no environment variable,
+ * no RPC method, no policy key. A public way to lower a watch budget or a
+ * repository ceiling would be a second answer to questions
+ * `/etc/atlas/system.conf` and `include/atlas/limits.h` already own, reachable
+ * by anyone who can start a daemon — which is not the same set of people who
+ * can edit a root-owned file.
+ *
+ * Zero means "use the production value" for every one of them, so a caller that
+ * memsets the struct gets production behaviour exactly. A non-zero value
+ * replaces the resolved bound **and nothing else**: the comparison, the
+ * allocation rounds, the accounting and the reason codes are the shipped ones.
+ * That is what makes a boundary test evidence about production rather than
+ * about a test-only path. */
+typedef struct atlas_watcher_opts {
+    /* Arms the orchestration recovery sweep on the watcher's timer. False on
+     * every daemon that is not serving the system index under an active policy,
+     * so a fixture or ad-hoc daemon never sweeps. */
+    bool orch_enabled;
+    /* Whether this daemon serves the system index, which decides its share of
+     * the kernel's per-uid inotify budget. */
+    bool system_deployment;
+    int reconcile_interval_ms; /* 0 selects ATLAS_WATCH_RECONCILE_INTERVAL_MS */
+
+    int64_t inject_budget_total;         /* 0 -> resolved from policy and kernel */
+    size_t inject_max_repos;             /* 0 -> ATLAS_WATCH_MAX_REPOS */
+    size_t inject_max_pending_ignore;    /* 0 -> ATLAS_WATCH_MAX_PENDING_IGNORE */
+    size_t inject_max_pending_ignore_bytes; /* 0 -> ..._BYTES */
+} atlas_watcher_opts;
+
+void atlas_watcher_opts_init(atlas_watcher_opts *o);
+
 atlas_status atlas_watcher_start(const char *db_path, atlas_writer *writer, FILE *log,
-                                 bool orch_enabled,
-                                 int reconcile_interval_ms, atlas_watcher **out, atlas_err *err);
+                                 const atlas_watcher_opts *opts, atlas_watcher **out,
+                                 atlas_err *err);
 void atlas_watcher_stop(atlas_watcher *w);
-/* Total inotify watches currently installed, for `daemon status`. */
-int64_t atlas_watcher_watch_count(atlas_watcher *w);
+/* P0. What `daemon status` reports about the watch set.
+ *
+ * `watches` counts **physical** inotify descriptors and is what the kernel
+ * holds. `subscriptions` counts (repository, descriptor) pairs and is what the
+ * per-repository figures sum to. They are equal only when nothing is shared, and
+ * two registered worktrees of one repository share every descriptor on their
+ * common git directory — so `subscriptions >= watches` is the relation, and any
+ * surface that claims equality is wrong for exactly the case worktrees create. */
+typedef struct atlas_watch_stats {
+    int64_t watches;       /* physical descriptors */
+    int64_t subscriptions; /* logical (repo, descriptor) pairs */
+    int64_t budget_total;
+    int64_t budget_repo;
+    int64_t kernel_max;
+    bool budget_from_policy;
+    bool priming_complete;
+} atlas_watch_stats;
+
+void atlas_watcher_stats(atlas_watcher *w, atlas_watch_stats *out);
 /* True once the initial reconciliation of every repository has been submitted. */
 bool atlas_watcher_primed(atlas_watcher *w);
 

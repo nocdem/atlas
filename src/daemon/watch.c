@@ -67,18 +67,135 @@
  * events against thousands of watches. Open addressing on the wd keeps it O(1);
  * wds are small dense integers, so the hash is trivially good. */
 
+/* P0. A slot is one *physical* watch descriptor and the set of repositories
+ * subscribed to it, which are two different things and used to be one.
+ *
+ * `inotify_add_watch` on a path already watched by this instance returns the
+ * *same* descriptor — verified, not assumed. The old map stored a single
+ * `repo_id` per slot and overwrote it on a repeated add, so when two linked
+ * worktrees of one repository were both registered, the second one to be
+ * installed silently took over every watch on the shared git common directory
+ * and on `refs/`. From then on a branch update reached exactly one of the two,
+ * and the other's `watched_dirs` counted watches that no longer pointed at it.
+ * Removing either repository then called `inotify_rm_watch` on a descriptor the
+ * survivor was still relying on.
+ *
+ * So: the descriptor is shared, the subscription is per repository, an event
+ * fans out to every subscriber, and the descriptor is released when the last
+ * subscriber leaves. The single-subscriber case — every source directory in
+ * every ordinary repository — stays inline and allocates nothing. */
 typedef struct wd_slot {
     int wd; /* 0 = empty, -1 = tombstone */
-    int64_t repo_id;
     atlas_buf path; /* absolute path of the watched directory */
     bool is_meta;   /* a git metadata directory, not indexable source */
+    int64_t sub_inline; /* the first subscriber; meaningful when sub_count > 0 */
+    int64_t *subs;      /* subscribers beyond the first; NULL unless shared */
+    uint16_t sub_count;
+    uint16_t sub_cap;
 } wd_slot;
 
 typedef struct wd_map {
     wd_slot *slots;
     size_t cap;
-    size_t count;
+    size_t count; /* physical descriptors held, never subscriptions */
 } wd_map;
+
+/* True when `repo_id` is already subscribed to this descriptor. Linear over
+ * `sub_count`, which is bounded by ATLAS_WATCH_MAX_REPOS and is 1 for every
+ * unshared watch — which is almost all of them. */
+static bool slot_has_sub(const wd_slot *s, int64_t repo_id) {
+    if (s->sub_count == 0) {
+        return false;
+    }
+    if (s->sub_inline == repo_id) {
+        return true;
+    }
+    for (uint16_t i = 0; i + 1u < s->sub_count; i++) {
+        if (s->subs[i] == repo_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Adds a subscription. `*added` says whether this call created one, which is
+ * what the caller charges a budget against: subscribing twice must not cost
+ * twice, and that double count is exactly what P0 found in the old code. */
+static atlas_status slot_add_sub(wd_slot *s, int64_t repo_id, bool *added, atlas_err *err) {
+    *added = false;
+    if (slot_has_sub(s, repo_id)) {
+        return ATLAS_OK;
+    }
+    if (s->sub_count == 0) {
+        s->sub_inline = repo_id;
+        s->sub_count = 1;
+        *added = true;
+        return ATLAS_OK;
+    }
+    if (s->sub_count >= ATLAS_WATCH_MAX_REPOS) {
+        /* Cannot happen while the watcher refuses to observe more repositories
+         * than this, and it is checked anyway: the bound that makes it
+         * impossible lives in another function, and a bound enforced somewhere
+         * else is a bound this code cannot see. */
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                             "more repositories subscribed to one watch than Atlas allows");
+    }
+    uint16_t need = (uint16_t)(s->sub_count); /* subs[] holds sub_count-1, so we need one more */
+    if (need > s->sub_cap) {
+        uint16_t next = s->sub_cap == 0 ? 2u : (uint16_t)(s->sub_cap * 2u);
+        if (next > ATLAS_WATCH_MAX_REPOS) {
+            next = (uint16_t)ATLAS_WATCH_MAX_REPOS;
+        }
+        int64_t *grown = realloc(s->subs, (size_t)next * sizeof(*grown));
+        if (grown == NULL) {
+            return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory sharing a watch");
+        }
+        s->subs = grown;
+        s->sub_cap = next;
+    }
+    s->subs[s->sub_count - 1u] = repo_id;
+    s->sub_count++;
+    *added = true;
+    return ATLAS_OK;
+}
+
+/* Drops one subscription and reports how many remain. The caller releases the
+ * kernel descriptor only at zero — which is what keeps a surviving worktree
+ * watching the common directory after its sibling is removed. */
+static uint16_t slot_remove_sub(wd_slot *s, int64_t repo_id) {
+    if (s->sub_count == 0) {
+        return 0;
+    }
+    if (s->sub_inline == repo_id) {
+        if (s->sub_count > 1u) {
+            s->sub_inline = s->subs[0];
+            for (uint16_t i = 0; i + 2u < s->sub_count; i++) {
+                s->subs[i] = s->subs[i + 1u];
+            }
+        }
+        s->sub_count--;
+        return s->sub_count;
+    }
+    for (uint16_t i = 0; i + 1u < s->sub_count; i++) {
+        if (s->subs[i] != repo_id) {
+            continue;
+        }
+        for (uint16_t k = i; k + 2u < s->sub_count; k++) {
+            s->subs[k] = s->subs[k + 1u];
+        }
+        s->sub_count--;
+        return s->sub_count;
+    }
+    return s->sub_count;
+}
+
+static void slot_free_subs(wd_slot *s) {
+    free(s->subs);
+    s->subs = NULL;
+    s->sub_cap = 0;
+    s->sub_count = 0;
+    s->sub_inline = 0;
+}
 
 static atlas_status wd_map_init(wd_map *m, size_t cap, atlas_err *err) {
     memset(m, 0, sizeof(*m));
@@ -99,9 +216,27 @@ static void wd_map_free(wd_map *m) {
     }
     for (size_t i = 0; i < m->cap; i++) {
         atlas_buf_free(&m->slots[i].path);
+        slot_free_subs(&m->slots[i]);
     }
     free(m->slots);
     memset(m, 0, sizeof(*m));
+}
+
+/* Empties the map without giving back its allocation.
+ *
+ * A rebuild drops every watch, and doing that by tombstoning each slot left the
+ * table full of tombstones: they do not terminate a probe chain, so chains grew
+ * with every rebuild and never shrank. Clearing outright is both cheaper and the
+ * only way `wd_map_put`'s tombstone reuse stays a rare path rather than the
+ * normal one. */
+static void wd_map_clear(wd_map *m) {
+    for (size_t i = 0; i < m->cap; i++) {
+        m->slots[i].wd = 0;
+        m->slots[i].is_meta = false;
+        atlas_buf_reset(&m->slots[i].path);
+        slot_free_subs(&m->slots[i]);
+    }
+    m->count = 0;
 }
 
 static size_t wd_hash(int wd, size_t cap) {
@@ -125,28 +260,119 @@ static wd_slot *wd_map_find(wd_map *m, int wd) {
     return NULL;
 }
 
-static atlas_status wd_map_put(wd_map *m, int wd, int64_t repo_id, const char *path, bool is_meta,
-                               atlas_err *err) {
-    if (m->count + 1u > m->cap / 2u) {
-        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "the watch map is full");
+/* Finds the slot for `wd`, creating it if this descriptor is new to the map.
+ *
+ * `*created` distinguishes "this is a new physical watch" from "this descriptor
+ * is already held and another repository is about to subscribe", which is the
+ * distinction the budget is spent on.
+ *
+ * The probe loop searches the **whole** chain for an existing `wd` before it
+ * falls back to the first tombstone it passed. Inserting at the tombstone
+ * immediately — which is what the old code did — could put a second slot for a
+ * descriptor that already lived further down the chain, and then `wd_map_find`
+ * would return whichever came first and the other would be unreachable and
+ * unreleasable. */
+/* Grows the table and rehashes, keeping every slot's owned members by moving the
+ * structs whole.
+ *
+ * The map used to be sized once, in `atlas_watcher_start`, from the budget
+ * resolved at that moment — while `rebuild_watches` re-resolves the budget on
+ * every repository-set change. An operator who followed Atlas' own remedy for
+ * `kernel_limit` ("raise fs.inotify.max_user_watches") and then ran `repo add`
+ * got a budget an order of magnitude larger against a table that had not moved,
+ * and the watcher failed with the internal error "the watch map is full" —
+ * after `inotify_add_watch` had already succeeded, so the descriptor was held by
+ * the kernel, absent from the map, and never released.
+ *
+ * Growing on demand also lets the table start small. Sizing it for the whole
+ * budget up front cost 33 MiB of resident memory on a machine with a large
+ * sysctl and *no repositories registered*, and made `remove_watch_tree`'s full
+ * scan proportional to the budget rather than to the watches actually held. */
+static atlas_status wd_map_grow(wd_map *m, atlas_err *err) {
+    size_t next = m->cap * 2u;
+    if (next <= m->cap) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "the watch map cannot grow further");
     }
+    wd_slot *slots = calloc(next, sizeof(*slots));
+    if (slots == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory growing the watch map");
+    }
+    for (size_t i = 0; i < next; i++) {
+        atlas_buf_init(&slots[i].path);
+    }
+    for (size_t i = 0; i < m->cap; i++) {
+        wd_slot *old = &m->slots[i];
+        if (old->wd <= 0) {
+            atlas_buf_free(&old->path);
+            slot_free_subs(old);
+            continue;
+        }
+        size_t h = wd_hash(old->wd, next);
+        for (size_t probe = 0; probe < next; probe++) {
+            wd_slot *dst = &slots[(h + probe) % next];
+            if (dst->wd == 0) {
+                atlas_buf_free(&dst->path);
+                *dst = *old; /* moves the path buffer and the subscriber array */
+                break;
+            }
+        }
+    }
+    free(m->slots);
+    m->slots = slots;
+    m->cap = next;
+    return ATLAS_OK;
+}
+
+static atlas_status wd_map_put(wd_map *m, int wd, const char *path, bool is_meta,
+                               wd_slot **slot_out, bool *created, atlas_err *err) {
+    *slot_out = NULL;
+    *created = false;
     size_t i = wd_hash(wd, m->cap);
+    wd_slot *reuse = NULL;
     for (size_t probe = 0; probe < m->cap; probe++) {
         wd_slot *s = &m->slots[(i + probe) % m->cap];
         if (s->wd == wd) {
-            s->repo_id = repo_id;
             s->is_meta = is_meta;
+            *slot_out = s;
             return atlas_buf_set_str(&s->path, path, err);
         }
-        if (s->wd == 0 || s->wd == -1) {
-            s->wd = wd;
-            s->repo_id = repo_id;
-            s->is_meta = is_meta;
-            m->count++;
-            return atlas_buf_set_str(&s->path, path, err);
+        if (s->wd == -1 && reuse == NULL) {
+            reuse = s; /* remembered, not taken: the chain may still hold `wd` */
+        }
+        if (s->wd == 0) {
+            break; /* an empty slot ends the chain, so `wd` is definitely absent */
         }
     }
-    return atlas_err_set(err, ATLAS_ERR_INTERNAL, "the watch map is full");
+    if (m->count + 1u > m->cap / 2u) {
+        atlas_status gst = wd_map_grow(m, err);
+        if (gst != ATLAS_OK) {
+            return gst;
+        }
+        /* The table moved, so the remembered tombstone is gone with it and the
+         * chain has to be walked again in the new table. */
+        reuse = NULL;
+        i = wd_hash(wd, m->cap);
+    }
+    wd_slot *dst = reuse;
+    if (dst == NULL) {
+        for (size_t probe = 0; probe < m->cap; probe++) {
+            wd_slot *s = &m->slots[(i + probe) % m->cap];
+            if (s->wd == 0 || s->wd == -1) {
+                dst = s;
+                break;
+            }
+        }
+    }
+    if (dst == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "the watch map is full");
+    }
+    dst->wd = wd;
+    dst->is_meta = is_meta;
+    slot_free_subs(dst);
+    m->count++;
+    *created = true;
+    *slot_out = dst;
+    return atlas_buf_set_str(&dst->path, path, err);
 }
 
 static void wd_map_remove(wd_map *m, int wd) {
@@ -157,13 +383,56 @@ static void wd_map_remove(wd_map *m, int wd) {
     /* Tombstone rather than clear: clearing would break the probe chain of any
      * other key that hashed to this slot. */
     s->wd = -1;
-    s->repo_id = 0;
     s->is_meta = false;
     atlas_buf_reset(&s->path);
+    slot_free_subs(s);
     m->count--;
 }
 
 /* --- per-repository watch state ------------------------------------------ */
+
+/* P0. The ignored-directory inventory, owned by the repository it describes.
+ *
+ * It used to be built on the stack inside the priming function and freed when
+ * that function returned, which meant it did not exist at the moment the
+ * watcher most needed it: when a directory appeared while the daemon was
+ * running. That path built its context with `memset` and left the ignore set
+ * NULL, so **a directory created after priming was watched recursively whatever
+ * git thought of it** — every build tree, every `node_modules`, every
+ * `.dart_tool`, for as long as the daemon ran.
+ *
+ * What it is, stated precisely because the distinction is the whole of P0's
+ * first review blocker: it is an **inventory of ignored paths that existed when
+ * `git ls-files` was last run**. It is never the authority on a path that did
+ * not exist then — `git ls-files` enumerates the filesystem, so a `build/` rule
+ * with no `build/` directory yet produces no entry at all. A path Atlas has not
+ * seen before goes to `pending_ignore` and waits for a fresh inventory instead
+ * of being judged against a stale one.
+ *
+ * Entries are NUL-separated relative directory paths, each with a trailing '/',
+ * and `offsets` indexes them in sorted order so membership is a binary search
+ * rather than a scan of the whole set. */
+typedef struct ignore_set {
+    atlas_buf bytes;
+    size_t *offsets; /* into `bytes`, sorted by the entry they point at */
+    size_t count;
+    size_t cap;
+    bool overflow; /* the bound was reached; the inventory is not complete */
+} ignore_set;
+
+static void ignore_set_init(ignore_set *set) {
+    memset(set, 0, sizeof(*set));
+    atlas_buf_init(&set->bytes);
+}
+
+static void ignore_set_free(ignore_set *set) {
+    atlas_buf_free(&set->bytes);
+    free(set->offsets);
+    set->offsets = NULL;
+    set->count = 0;
+    set->cap = 0;
+    set->overflow = false;
+}
 
 typedef struct repo_watch {
     int64_t repo_id;
@@ -171,9 +440,71 @@ typedef struct repo_watch {
     atlas_buf root;
     atlas_buf git_dir;
     atlas_buf common_dir;
-    int64_t dirs;
+    /* P0. Subscriptions this repository holds, split because they answer
+     * different questions and because their sum is the only number that used to
+     * exist. `shared` counts those whose descriptor another repository is also
+     * subscribed to, which is what makes the per-repo totals legitimately
+     * exceed the daemon's physical count instead of looking like an error. */
+    int64_t source_dirs;
+    int64_t meta_dirs;
+    int64_t shared_dirs;
     bool degraded;
+    atlas_watch_reason reason;
     atlas_buf degraded_detail;
+
+    /* P0. The ignored-path inventory, and whether it needs rebuilding.
+     *
+     * `ignore_stale` is set by an event that could have changed what git
+     * ignores: any `.gitignore` at any depth, `info/exclude`, or a HEAD move
+     * that swaps one branch's ignore rules for another's. */
+    ignore_set ignored;
+    bool ignore_stale;
+
+    /* P0. The depth-first priming frontier: absolute paths still to visit, NUL
+     * separated, consumed from the end.
+     *
+     * Depth-first and popped by truncation, so the buffer shrinks as the walk
+     * proceeds. The old walk was a queue with a cursor that only ever advanced,
+     * so it held every path it had already visited until the traversal ended.
+     * Non-empty means this repository is still priming. */
+    atlas_buf frontier;
+    size_t frontier_count;
+    int64_t primed_this_round; /* watches installed since the round's share was set */
+    int64_t visits;            /* directories entered by this priming pass */
+    bool prime_started;
+    /* P0. Set when a source walk begins and cleared when the sweep below has
+     * run. The walk judges children against an inventory captured once at its
+     * start; on a large tree that walk takes tens of seconds, and a directory
+     * created inside that window is absent from the inventory and therefore
+     * watched. One re-check at the end closes it. */
+    bool prime_sweep_owed;
+
+    /* P0. Directories seen for the first time, waiting for a fresh inventory to
+     * say whether git ignores them. Absolute paths, NUL separated.
+     *
+     * Nothing under them is watched while they wait, so their contents are
+     * producing events nobody receives — which is why a non-empty queue keeps
+     * the repository out of `watching` and its index out of `current`. */
+    atlas_buf pending_ignore;
+    size_t pending_ignore_count;
+    bool pending_ignore_overflow;
+
+    /* P0. A subtree that turned out to be visible was watched late, so events
+     * inside it between its creation and its watch were missed. That is an
+     * event gap, and it is owed a content-verifying pass before this repository
+     * can be described as current again. */
+    bool owes_gap;
+    atlas_buf owes_gap_detail;
+
+    /* What was last written for this repository, so the watcher can publish on
+     * change rather than on every tick. Priming advances continuously and would
+     * otherwise queue a write per chunk, which is a lot of writes to say the
+     * same thing. */
+    atlas_watch_state published_state;
+    atlas_watch_reason published_reason;
+    int64_t published_source;
+    int64_t published_meta;
+    bool published_valid;
 
     /* Debounce. `first_dirty_ms` bounds how long continued activity can defer a
      * pass; without it, a process writing continuously would defer indexing for
@@ -238,10 +569,143 @@ struct atlas_watcher {
     /* A9.2.4. The bounded walk runs on its own, much slower, timer. */
     int64_t last_discovery_sweep_ms;
 
+    /* P0. The resolved watch budget, and the arithmetic behind it.
+     *
+     * `budget_total` is what this daemon may hold across every repository, and
+     * `budget_repo` is the ceiling any one repository can reach — which is the
+     * whole pool, because a single large repository should be able to use it.
+     * `round_share` is this allocation round's per-repository allowance, and it
+     * is recomputed each round over the repositories that still want more, so a
+     * repository that finishes under its share hands the remainder back and no
+     * repository's completeness depends on where its name sorts.
+     *
+     * `kernel_max` and `budget_from_policy` are carried so status can show the
+     * arithmetic rather than a bare number: an operator looking at a degraded
+     * repository needs to know whether Atlas chose the limit or the kernel did. */
+    int64_t budget_total;
+    int64_t budget_repo;
+    int64_t round_share;
+    int64_t kernel_max;
+    bool budget_from_policy;
+    /* P0. The test channel, and deliberately not a CLI flag or an environment
+     * variable: a boundary test needs a small budget, and a *public* way to set
+     * one would be a second, undocumented way to configure a resource the
+     * root-owned policy is supposed to own. Non-zero replaces the resolved total
+     * and nothing else, so an injected limit runs the identical comparison,
+     * allocation and accounting code as production. */
+    int64_t budget_injected;
+    /* Whether this daemon serves the system index, which is what decides its
+     * share of the kernel's per-uid inotify budget. Supplied by `daemon.c` from
+     * the same guard it uses for the orchestration and gateway policies. */
+    bool system_deployment;
+    /* P0. The resolved bounds. Each is the compiled constant unless a test
+     * injected one; nothing else reads the constants, so the comparison under
+     * test is the comparison production runs. */
+    size_t max_repos;
+    size_t max_pending_ignore;
+    size_t max_pending_ignore_bytes;
+
     pthread_mutex_t stat_lock;
-    int64_t watch_count; /* guarded by stat_lock */
+    int64_t watch_count; /* physical descriptors; guarded by stat_lock */
+    int64_t sub_count;   /* logical subscriptions; guarded by stat_lock */
+    /* A copy of the resolved budget, published under `stat_lock` so the serve
+     * loop can read it without racing the watcher thread's rebuild. The
+     * originals above are the watcher thread's own working values. */
+    int64_t stat_budget_total;
+    int64_t stat_budget_repo;
+    int64_t stat_kernel_max;
+    bool stat_budget_from_policy;
     bool primed;         /* guarded by stat_lock */
+    bool priming_complete; /* every repository's watch set is fully installed */
 };
+
+/* P0. Reads this uid's inotify ceiling.
+ *
+ * Unreadable is not fatal and not zero: a machine that will not say gets the
+ * documented minimum, the watcher installs what it can, and the kernel refuses
+ * the rest with ENOSPC — which is reported as itself. Guessing high here would
+ * turn a missing file into a repository nobody can explain. */
+static int64_t read_kernel_watch_max(void) {
+    FILE *f = fopen("/proc/sys/fs/inotify/max_user_watches", "re");
+    if (f == NULL) {
+        return (int64_t)ATLAS_WATCH_TOTAL_MIN;
+    }
+    long long v = 0;
+    int n = fscanf(f, "%lld", &v);
+    (void)fclose(f);
+    if (n != 1 || v <= 0) {
+        return (int64_t)ATLAS_WATCH_TOTAL_MIN;
+    }
+    return (int64_t)v;
+}
+
+/* P0. Resolves the budget: policy where it states one, otherwise a share of the
+ * kernel's own limit.
+ *
+ * Derived rather than compiled because a watch budget written into a header is a
+ * guess about a machine the author never saw — and the guess Atlas shipped with
+ * was 8192, on a machine whose kernel offered 122910.
+ *
+ * `injected` is the test channel: a non-zero value replaces the resolved total
+ * and nothing else changes, so a boundary test runs the same comparison,
+ * allocation and accounting code as production. */
+static void resolve_budget(atlas_watcher *w, int64_t injected) {
+    w->kernel_max = read_kernel_watch_max();
+
+    atlas_syspolicy pol;
+    atlas_syspolicy_load(&pol);
+    long long stated = 0;
+    unsigned share = ATLAS_WATCH_KERNEL_SHARE_PCT_USER;
+    /* The larger share belongs to a daemon that *is* the system deployment, not
+     * to any daemon on a machine where a system policy happens to exist.
+     *
+     * `atlas_syspolicy_load` answers "is there a valid root-owned policy here?",
+     * which on a deployed machine is true for every daemon any user starts —
+     * including a fixture one. Claiming half the uid's inotify budget on that
+     * basis would contradict the reason the two shares exist: a dedicated
+     * `atlasd` has no other consumer of its budget, and a per-user daemon shares
+     * the uid with every editor the operator runs. So the answer comes from
+     * whether *this* daemon serves the system index, which is the same guard
+     * `daemon.c` already applies to the orchestration and gateway policies. */
+    if (w->system_deployment) {
+        stated = atlas_syspolicy_watch_max_dirs_total_checked(&pol);
+        share = atlas_syspolicy_watch_kernel_share_pct(&pol);
+    }
+
+    int64_t derived = w->kernel_max / 100 * (int64_t)share;
+    if (derived < (int64_t)ATLAS_WATCH_TOTAL_MIN) {
+        derived = (int64_t)ATLAS_WATCH_TOTAL_MIN;
+    }
+    if (derived > (int64_t)ATLAS_WATCH_TOTAL_SOFT_MAX) {
+        derived = (int64_t)ATLAS_WATCH_TOTAL_SOFT_MAX;
+    }
+
+    if (injected > 0) {
+        w->budget_total = injected;
+        w->budget_from_policy = false;
+    } else if (stated > 0) {
+        w->budget_total = (int64_t)stated;
+        w->budget_from_policy = true;
+    } else {
+        w->budget_total = derived;
+        w->budget_from_policy = false;
+    }
+    if (w->budget_total > (int64_t)ATLAS_WATCH_DIRS_HARD_CEILING) {
+        w->budget_total = (int64_t)ATLAS_WATCH_DIRS_HARD_CEILING;
+    }
+    /* One repository may use the whole pool. There is deliberately no smaller
+     * per-repository cap: the review that produced this rejected one, because a
+     * fixed per-repo ceiling stops a single large repository from using a budget
+     * nobody else wants. Sharing between repositories is done by the round,
+     * below, not by a constant. */
+    w->budget_repo = w->budget_total;
+    w->round_share = w->budget_total;
+}
+
+/* Defined below, beside the loop stages that own them; declared here because the
+ * priming and ignore-resolution stages need them and sit earlier in the file. */
+static void mark_dirty(atlas_watcher *w, int64_t repo_id);
+static bool prime_round(atlas_watcher *w);
 
 static int64_t now_ms(void) {
     struct timespec ts;
@@ -287,6 +751,10 @@ static void repo_watch_free(repo_watch *r) {
     atlas_buf_free(&r->common_dir);
     atlas_buf_free(&r->degraded_detail);
     atlas_buf_free(&r->dirty_paths);
+    ignore_set_free(&r->ignored);
+    atlas_buf_free(&r->frontier);
+    atlas_buf_free(&r->pending_ignore);
+    atlas_buf_free(&r->owes_gap_detail);
 }
 
 /* Records a repository-relative path the watcher saw an event for.
@@ -347,41 +815,135 @@ static void clear_repos(atlas_watcher *w) {
  * its answer means there is no second implementation of ignore semantics to
  * drift from the first. */
 
-typedef struct ignore_set {
-    atlas_buf bytes; /* NUL-separated relative directory paths, each with a trailing '/' */
-    size_t count;
-} ignore_set;
-
 static atlas_status collect_ignored(const void *path, size_t path_len, void *ud, atlas_err *err) {
     ignore_set *set = (ignore_set *)ud;
     if (path_len == 0 || ((const char *)path)[path_len - 1u] != '/') {
         return ATLAS_OK; /* an ignored file, not a directory: watches are per-directory */
     }
-    if (set->count >= ATLAS_WATCH_MAX_DISCOVER_DIRS) {
-        return ATLAS_OK; /* bounded; the surplus is simply watched, not skipped */
+    if (set->count >= ATLAS_WATCH_MAX_IGNORED_DIRS ||
+        set->bytes.len + path_len + 1u > ATLAS_WATCH_MAX_IGNORED_BYTES) {
+        /* P0. Fails closed, where it used to fail open.
+         *
+         * The old comment read "the surplus is simply watched, not skipped",
+         * which inverts the purpose of the set on exactly the repositories that
+         * need it: past the bound, watches were spent on the trees the
+         * inventory exists to skip. An inventory Atlas knows to be incomplete
+         * cannot distinguish "not ignored" from "ignored but not recorded", so
+         * it says so and the repository is degraded with a reason. */
+        set->overflow = true;
+        return ATLAS_OK;
     }
+    if (set->count + 1u > set->cap) {
+        size_t next = set->cap == 0 ? 64u : set->cap * 2u;
+        size_t *grown = realloc(set->offsets, next * sizeof(*grown));
+        if (grown == NULL) {
+            return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory recording ignored paths");
+        }
+        set->offsets = grown;
+        set->cap = next;
+    }
+    size_t at = set->bytes.len;
     atlas_status st = atlas_buf_append(&set->bytes, path, path_len, err);
     if (st == ATLAS_OK) {
         st = atlas_buf_append_ch(&set->bytes, '\0', err);
     }
     if (st == ATLAS_OK) {
-        set->count++;
+        set->offsets[set->count++] = at;
     }
     return st;
 }
 
-static bool is_ignored_dir(const ignore_set *set, const char *rel, size_t rel_len) {
-    size_t off = 0;
-    while (off < set->bytes.len) {
-        const char *entry = set->bytes.data + off;
+static int ignore_cmp(const void *a, const void *b, void *ud) {
+    const ignore_set *set = (const ignore_set *)ud;
+    return strcmp(set->bytes.data + *(const size_t *)a, set->bytes.data + *(const size_t *)b);
+}
+
+/* Sorts the offsets so membership can binary-search. Insertion sort would be
+ * quadratic on a repository with tens of thousands of ignored trees, and
+ * `qsort_r`'s comparator needs the buffer, so the set is passed through. */
+static void ignore_set_sort(ignore_set *set) {
+    if (set->count > 1u) {
+        qsort_r(set->offsets, set->count, sizeof(*set->offsets), ignore_cmp, set);
+    }
+}
+
+/* Exact membership: is `rel` itself an entry?
+ *
+ * This is the hot path, and it is complete **only under the descent invariant**
+ * that every ancestor of `rel` has already been tested and cleared — which the
+ * priming walk guarantees, because it filters a child before pushing it and so
+ * never reaches a directory beneath an ignored one. Where that invariant does
+ * not hold, callers use `ignore_set_covers` below instead.
+ *
+ * The tempting shortcut of "binary search for the greatest entry <= rel, then
+ * test whether it is a prefix" is **wrong**, and the counterexample is small
+ * enough to keep here: with entries {"a/", "a/b/"} and candidate "a/z/", the
+ * greatest entry not exceeding "a/z/" is "a/b/", which is not a prefix — so the
+ * test answers "not ignored" while "a/" plainly covers it. */
+static bool ignore_set_has_exact(const ignore_set *set, const char *rel, size_t rel_len) {
+    if (set->count == 0) {
+        return false;
+    }
+    size_t lo = 0;
+    size_t hi = set->count;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2u;
+        const char *entry = set->bytes.data + set->offsets[mid];
         size_t elen = strlen(entry);
-        /* An entry is "dir/"; a path matches when it is that directory or lives
-         * under it. */
-        if (elen > 0 && rel_len + 1u >= elen && memcmp(rel, entry, elen - 1u) == 0 &&
-            (rel_len == elen - 1u || rel[elen - 1u] == '/')) {
+        size_t n = rel_len < elen ? rel_len : elen;
+        int c = memcmp(rel, entry, n);
+        if (c == 0) {
+            c = rel_len < elen ? -1 : (rel_len > elen ? 1 : 0);
+        }
+        if (c == 0) {
             return true;
         }
-        off += elen + 1u;
+        if (c < 0) {
+            hi = mid;
+        } else {
+            lo = mid + 1u;
+        }
+    }
+    return false;
+}
+
+/* Is `rel` an entry, or beneath one?
+ *
+ * Correct without any descent invariant, and bounded: it tests each of `rel`'s
+ * own ancestor prefixes for exact membership, so it is O(components x log n)
+ * rather than O(n), and the component count is bounded by the path length the
+ * walk already accepts. Used where a walk *starts* — the repository root, and
+ * every directory that appears while the daemon runs — because those are exactly
+ * the places where nothing has cleared the ancestors. */
+static bool ignore_set_covers(const ignore_set *set, const char *rel, size_t rel_len) {
+    if (set->count == 0) {
+        return false;
+    }
+    for (size_t i = 0; i < rel_len; i++) {
+        if (rel[i] == '/' && ignore_set_has_exact(set, rel, i + 1u)) {
+            return true;
+        }
+    }
+    /* And the path itself, which the loop above only reaches when it already
+     * ends in a separator. Entries always carry a trailing '/', so the candidate
+     * is given one to compare against. */
+    if (rel_len > 0 && rel[rel_len - 1u] != '/') {
+        char stack_buf[512];
+        if (rel_len + 1u <= sizeof(stack_buf)) {
+            memcpy(stack_buf, rel, rel_len);
+            stack_buf[rel_len] = '/';
+            return ignore_set_has_exact(set, stack_buf, rel_len + 1u);
+        }
+        /* A path longer than the small buffer is rare enough to pay for. */
+        char *heap = malloc(rel_len + 1u);
+        if (heap == NULL) {
+            return false; /* fail open: watching it costs a watch, skipping it costs a file */
+        }
+        memcpy(heap, rel, rel_len);
+        heap[rel_len] = '/';
+        bool hit = ignore_set_has_exact(set, heap, rel_len + 1u);
+        free(heap);
+        return hit;
     }
     return false;
 }
@@ -394,23 +956,56 @@ typedef struct add_ctx {
     const ignore_set *ignored;
     size_t root_len; /* prefix length to strip when forming a relative path */
     bool is_meta;
-    bool limit_hit;
-    bool budget_hit;
+    /* P0. Which bound stopped this installer, as a reason rather than a
+     * boolean. Before P0 the kernel's refusal and two different Atlas bounds set
+     * one of two flags between them and produced one of two sentences, so a
+     * caller could not tell "raise the sysctl" from "this daemon's budget is
+     * spent" — and neither could Atlas. */
+    atlas_watch_reason stop;
 } add_ctx;
 
+static bool ac_stopped(const add_ctx *ac) { return ac->stop != ATLAS_WATCH_REASON_NONE; }
+
+/* Installs one watch and subscribes this repository to it.
+ *
+ * Three budgets are checked, in the order that makes the message useful: the
+ * repository's share of this allocation round, then the daemon's physical total,
+ * then the kernel's own limit — which is not checked at all but reported when
+ * `inotify_add_watch` refuses.
+ *
+ * The comparison is `>=`, not the old `+ 1 >=`. With a budget of N the old form
+ * refused the Nth watch, so a documented ceiling of 8192 was in fact 8191 and
+ * the daemon reported exactly that number for weeks. */
 static atlas_status add_watch(add_ctx *ac, const char *abs_path, atlas_err *err) {
     atlas_watcher *w = ac->w;
-    if (w->map.count + 1u >= ATLAS_WATCH_MAX_DIRS) {
-        ac->budget_hit = true;
+    repo_watch *rw = ac->rw;
+
+    if (ac->is_meta) {
+        if (rw->meta_dirs >= (int64_t)ATLAS_WATCH_META_MAX_PER_REPO) {
+            ac->stop = ATLAS_WATCH_REASON_META_BUDGET;
+            return ATLAS_OK;
+        }
+    } else if (rw->primed_this_round >= w->round_share) {
+        /* This repository has taken its share for this round. Another round
+         * gives it more if the pool still holds any, so this is not a verdict —
+         * it just ends this repository's turn. */
+        ac->stop = ATLAS_WATCH_REASON_REPO_BUDGET;
         return ATLAS_OK;
     }
+    if ((int64_t)w->map.count >= w->budget_total) {
+        ac->stop = ATLAS_WATCH_REASON_TOTAL_BUDGET;
+        return ATLAS_OK;
+    }
+
     int wd = inotify_add_watch(w->inotify_fd, abs_path, ATLAS_INOTIFY_MASK);
     if (wd < 0) {
         if (errno == ENOSPC) {
             /* The kernel's per-user watch limit. This is the single most common
              * way a watcher silently stops seeing changes, so it is a reported
-             * degraded state rather than a warning nobody reads. */
-            ac->limit_hit = true;
+             * degraded state rather than a warning nobody reads — and it is kept
+             * distinct from Atlas' own budgets because the remedy is a sysctl,
+             * not an Atlas setting. */
+            ac->stop = ATLAS_WATCH_REASON_KERNEL_LIMIT;
             return ATLAS_OK;
         }
         if (errno == ENOENT || errno == ENOTDIR || errno == EACCES || errno == ELOOP) {
@@ -418,68 +1013,190 @@ static atlas_status add_watch(add_ctx *ac, const char *abs_path, atlas_err *err)
         }
         return atlas_err_set_errno(err, ATLAS_ERR_INTERNAL, errno, "cannot watch a directory");
     }
-    atlas_status st = wd_map_put(&w->map, wd, ac->rw->repo_id, abs_path, ac->is_meta, err);
+
+    wd_slot *slot = NULL;
+    bool created = false;
+    atlas_status st = wd_map_put(&w->map, wd, abs_path, ac->is_meta, &slot, &created, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    bool added = false;
+    st = slot_add_sub(slot, rw->repo_id, &added, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (!added) {
+        /* Already subscribed. The descriptor is held and this repository already
+         * counts it; charging again is the double count P0 removed. */
+        return ATLAS_OK;
+    }
+    if (ac->is_meta) {
+        rw->meta_dirs++;
+    } else {
+        rw->source_dirs++;
+        rw->primed_this_round++;
+    }
+    if (slot->sub_count == 2u) {
+        /* The descriptor has just become shared, so *both* parties start
+         * counting it: this repository, and the one that was already here.
+         *
+         * Incrementing only the joiner was asymmetric against the decrement in
+         * `remove_watch_tree`, which fires for whichever subscriber leaves a
+         * shared descriptor — so the first subscriber could be decremented for a
+         * descriptor it had never counted. The figure is display-only, but a
+         * displayed number that drifts is worse than none. */
+        atlas_err serr;
+        atlas_err_init(&serr);
+        (void)serr;
+        rw->shared_dirs++;
+        repo_watch *first = find_repo(w, slot->sub_inline);
+        if (first != NULL && first != rw) {
+            first->shared_dirs++;
+        }
+    } else if (slot->sub_count > 2u) {
+        rw->shared_dirs++;
+    }
+    return ATLAS_OK;
+}
+
+/* --- the resumable priming frontier ---------------------------------------
+ *
+ * The walk used to run to completion inside one call, and three separate things
+ * were wrong with that.
+ *
+ * It did not poll inotify while it ran, so on a large tree the kernel's event
+ * queue could overflow — and `IN_Q_OVERFLOW` is global to the instance, so one
+ * repository's priming could gap every repository at once. It could not stop at
+ * a budget share and resume later, which is what fair allocation between
+ * repositories needs. And its pending list was a queue with a cursor that only
+ * advanced, so it held every path it had already visited for the length of the
+ * traversal instead of only the ones still owed.
+ *
+ * The frontier is therefore depth-first and popped by truncation: memory tracks
+ * the frontier rather than the tree, and a chunk of it can be walked per
+ * watcher tick with the event drain in between. */
+
+/* A frontier is a buffer and a count, and it is passed explicitly rather than
+ * reached through the repository.
+ *
+ * That matters: source priming is resumable and holds its frontier across ticks
+ * on `repo_watch`, while the metadata walk and the walk of a subtree that
+ * appeared while the daemon ran both run to completion inside one call. If those
+ * shared the repository's frontier they would clobber a suspended source walk —
+ * which is not hypothetical, it is what the first version of this did, and the
+ * symptom was a repository reporting zero watched directories in the middle of
+ * priming. */
+static void frontier_clear(atlas_buf *buf, size_t *count) {
+    atlas_buf_reset(buf);
+    *count = 0;
+}
+
+static atlas_status frontier_push(atlas_buf *buf, size_t *count, const char *abs_path, size_t len,
+                                  atlas_err *err) {
+    if (buf->len + len + 1u > ATLAS_WATCH_FRONTIER_MAX_BYTES) {
+        /* A directory wide enough to overrun the frontier. Reported rather than
+         * truncated: the alternative is a silently unwatched subtree, which is
+         * exactly the failure class P0 exists to end. */
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "the watch frontier is full");
+    }
+    atlas_status st = atlas_buf_append(buf, abs_path, len, err);
     if (st == ATLAS_OK) {
-        ac->rw->dirs++;
+        st = atlas_buf_append_ch(buf, '\0', err);
+    }
+    if (st == ATLAS_OK) {
+        (*count)++;
     }
     return st;
 }
 
-/* Recursively installs watches under `abs_path`.
- *
- * Iterative, with an explicit bounded stack: recursing on a directory tree whose
- * depth is controlled by the repository is a stack-exhaustion primitive. Never
- * follows a symlink, so a link pointing outside the repository cannot pull the
- * watcher out of it. */
-static atlas_status add_watch_tree(add_ctx *ac, const char *abs_root, atlas_err *err) {
-    atlas_buf stack = ATLAS_BUF_INIT; /* NUL-separated absolute paths still to visit */
-    /* The directory currently being read is copied out of the stack before it is
-     * used. It must be: appending a child re-allocates the stack, and a pointer
-     * into it taken beforehand would dangle. Reading through that pointer walked
-     * a truncated tree — most of a repository silently unwatched — which is the
-     * kind of failure that looks like "the watcher is a bit slow" rather than
-     * like a bug. */
-    atlas_buf current = ATLAS_BUF_INIT;
-    size_t pending = 0;
-    size_t visited = 0;
-
-    atlas_status st = atlas_buf_append_str(&stack, abs_root, err);
-    if (st == ATLAS_OK) {
-        st = atlas_buf_append_ch(&stack, '\0', err);
-        pending = 1;
+/* Pops the last path. Depth-first, so the buffer truncates and the memory comes
+ * back without a compaction step. */
+static bool frontier_pop(atlas_buf *buf, size_t *count, atlas_buf *out, atlas_err *err) {
+    if (*count == 0 || buf->len == 0) {
+        return false;
     }
-    size_t cursor = 0;
-    while (st == ATLAS_OK && pending > 0) {
-        size_t dlen = strlen(stack.data + cursor);
-        st = atlas_buf_set(&current, stack.data + cursor, dlen, err);
-        if (st != ATLAS_OK) {
+    size_t end = buf->len - 1u; /* the NUL of the last entry */
+    size_t start = end;
+    while (start > 0 && buf->data[start - 1u] != '\0') {
+        start--;
+    }
+    if (atlas_buf_set(out, buf->data + start, end - start, err) != ATLAS_OK) {
+        return false;
+    }
+    buf->len = start;
+    (*count)--;
+    return true;
+}
+
+/* Advances one repository's priming by at most `max_dirs` directories.
+ *
+ * Returns with the frontier non-empty when it stopped early, which is what the
+ * caller reads as "still priming". Never follows a symlink, so a link pointing
+ * outside the repository cannot pull the watcher out of it, and never descends
+ * into `.git`, which is watched separately and never indexed as source. */
+static atlas_status prime_chunk(add_ctx *ac, atlas_buf *fbuf, size_t *fcount, size_t max_dirs,
+                                atlas_err *err) {
+    repo_watch *rw = ac->rw;
+    atlas_buf current = ATLAS_BUF_INIT;
+    atlas_status st = ATLAS_OK;
+    size_t done = 0;
+
+    while (st == ATLAS_OK && done < max_dirs && !ac_stopped(ac)) {
+        if (!frontier_pop(fbuf, fcount, &current, err)) {
             break;
         }
+        done++;
         const char *dir = atlas_buf_cstr(&current);
-        cursor += dlen + 1u;
-        pending--;
 
-        if (++visited > ATLAS_WATCH_MAX_DISCOVER_DIRS) {
-            ac->budget_hit = true;
+        if (++rw->visits > (int64_t)(ac->w->budget_repo * ATLAS_WATCH_DISCOVER_FACTOR)) {
+            /* A bound on work, kept separate from the bound on watches. Before
+             * P0 both set one flag and produced one sentence, so a repository
+             * that had walked too far and one that had run out of budget were
+             * told the same thing. */
+            ac->stop = ATLAS_WATCH_REASON_DISCOVERY_BOUND;
             break;
         }
+
         st = add_watch(ac, dir, err);
-        if (st != ATLAS_OK || ac->limit_hit || ac->budget_hit) {
+        if (st != ATLAS_OK || ac_stopped(ac)) {
+            if (ac_stopped(ac)) {
+                /* Put it back: the budget may return next round, and a directory
+                 * dropped here would never be walked at all. */
+                atlas_err perr;
+                atlas_err_init(&perr);
+                (void)frontier_push(fbuf, fcount, current.data, current.len, &perr);
+            }
             break;
         }
 
-        DIR *d = opendir(dir);
+        /* Opened with O_NOFOLLOW, not plain `opendir`.
+         *
+         * The child was validated with `lstat` in its parent's `readdir` loop,
+         * but it is only *entered* here — and with a resumable frontier the gap
+         * between those two moments is no longer a few instructions, it is up to
+         * the whole remaining priming pass. Repository contents are untrusted
+         * input (invariant 6), so anything with write access to the tree could
+         * replace the validated directory with a symlink to `/` in that window
+         * and have the walk enumerate the filesystem. `IN_DONT_FOLLOW` does not
+         * help: by the time `inotify_add_watch` sees the path, the traversal has
+         * already happened.
+         *
+         * O_NOFOLLOW refuses the swapped final component with ELOOP, which lands
+         * in the same "raced away" path as any other disappearance. */
+        int dfd = open(dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (dfd < 0) {
+            continue; /* raced away, replaced by a symlink, or unreadable */
+        }
+        DIR *d = fdopendir(dfd);
         if (d == NULL) {
-            continue; /* raced away or unreadable; the pass will notice */
+            (void)close(dfd);
+            continue;
         }
         struct dirent *e;
         while ((e = readdir(d)) != NULL) {
             if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) {
                 continue;
             }
-            /* .git holds metadata, watched separately and never indexed as
-             * source. Descending into it here would both waste watches and blur
-             * that distinction. */
             if (!ac->is_meta && strcmp(e->d_name, ".git") == 0) {
                 continue;
             }
@@ -502,32 +1219,76 @@ static atlas_status add_watch_tree(add_ctx *ac, const char *abs_root, atlas_err 
                 atlas_buf_free(&child);
                 continue;
             }
+            /* Exact membership is complete here: this walk filters a child
+             * before pushing it, so every directory it reaches has had all of
+             * its ancestors tested and cleared. `ignore_set_covers` is for the
+             * places where that is not true — see its comment. */
             if (ac->ignored != NULL && child.len > ac->root_len + 1u) {
                 const char *rel = atlas_buf_cstr(&child) + ac->root_len + 1u;
-                if (is_ignored_dir(ac->ignored, rel, child.len - ac->root_len - 1u)) {
+                size_t rel_len = child.len - ac->root_len - 1u;
+                char sep[1024];
+                bool ignored = false;
+                if (rel_len + 2u <= sizeof(sep)) {
+                    memcpy(sep, rel, rel_len);
+                    sep[rel_len] = '/';
+                    ignored = ignore_set_has_exact(ac->ignored, sep, rel_len + 1u);
+                } else {
+                    ignored = ignore_set_covers(ac->ignored, rel, rel_len);
+                }
+                if (ignored) {
                     atlas_buf_free(&child);
                     continue;
                 }
             }
-            st = atlas_buf_append(&stack, child.data, child.len, err);
-            if (st == ATLAS_OK) {
-                st = atlas_buf_append_ch(&stack, '\0', err);
-                pending++;
-            }
+            st = frontier_push(fbuf, fcount, child.data, child.len, err);
             atlas_buf_free(&child);
             if (st != ATLAS_OK) {
+                ac->stop = ATLAS_WATCH_REASON_FRONTIER_OVERFLOW;
+                st = ATLAS_OK; /* reported as a degraded state, not as a failure */
                 break;
             }
         }
         (void)closedir(d);
     }
-    atlas_buf_free(&stack);
     atlas_buf_free(&current);
     return st;
 }
 
-/* Removes every watch whose path is `prefix` or lives under it. */
-static void remove_watch_tree(atlas_watcher *w, const char *prefix) {
+/* Seeds a walk at `abs_root` and runs it to completion within this call.
+ *
+ * Used for the metadata phase, which is small and bounded by
+ * ATLAS_WATCH_META_MAX_PER_REPO, and for a subtree that appeared while the
+ * daemon was running. Source priming does not use it: that goes through the
+ * frontier so it can be interleaved with the event drain. */
+static atlas_status add_watch_tree(add_ctx *ac, const char *abs_root, atlas_err *err) {
+    /* Its own frontier, not the repository's. A source walk may be suspended
+     * mid-tree with its frontier held on `repo_watch`, and borrowing it here
+     * would discard the rest of that walk — silently, and with the repository
+     * still reporting itself as watched. */
+    atlas_buf fbuf = ATLAS_BUF_INIT;
+    size_t fcount = 0;
+    atlas_status st = frontier_push(&fbuf, &fcount, abs_root, strlen(abs_root), err);
+    if (st != ATLAS_OK) {
+        ac->stop = ATLAS_WATCH_REASON_FRONTIER_OVERFLOW;
+        atlas_buf_free(&fbuf);
+        return ATLAS_OK;
+    }
+    while (st == ATLAS_OK && fcount > 0 && !ac_stopped(ac)) {
+        st = prime_chunk(ac, &fbuf, &fcount, ATLAS_WATCH_PRIME_CHUNK_DIRS, err);
+    }
+    atlas_buf_free(&fbuf);
+    return st;
+}
+
+/* Drops `repo_id`'s subscription to every watch at `prefix` or beneath it, and
+ * releases the kernel descriptor only when the last subscriber has gone.
+ *
+ * That last clause is the fix for a real defect: two registered worktrees of one
+ * repository subscribe to the same descriptor on the shared git directory, and
+ * the old code called `inotify_rm_watch` on behalf of whichever repository asked
+ * first — leaving the survivor believing it was watching a descriptor the kernel
+ * had already released, and silently missing every branch update from then on. */
+static void remove_watch_tree(atlas_watcher *w, int64_t repo_id, const char *prefix) {
     size_t plen = strlen(prefix);
     for (size_t i = 0; i < w->map.cap; i++) {
         wd_slot *s = &w->map.slots[i];
@@ -542,12 +1303,28 @@ static void remove_watch_tree(atlas_watcher *w, const char *prefix) {
         if (len != plen && p[plen] != '/') {
             continue;
         }
-        (void)inotify_rm_watch(w->inotify_fd, s->wd);
-        repo_watch *rw = find_repo(w, s->repo_id);
-        if (rw != NULL && rw->dirs > 0) {
-            rw->dirs--;
+        if (!slot_has_sub(s, repo_id)) {
+            continue;
         }
-        wd_map_remove(&w->map, s->wd);
+        bool was_shared = s->sub_count > 1u;
+        uint16_t left = slot_remove_sub(s, repo_id);
+        repo_watch *rw = find_repo(w, repo_id);
+        if (rw != NULL) {
+            if (s->is_meta) {
+                if (rw->meta_dirs > 0) {
+                    rw->meta_dirs--;
+                }
+            } else if (rw->source_dirs > 0) {
+                rw->source_dirs--;
+            }
+            if (was_shared && rw->shared_dirs > 0) {
+                rw->shared_dirs--;
+            }
+        }
+        if (left == 0) {
+            (void)inotify_rm_watch(w->inotify_fd, s->wd);
+            wd_map_remove(&w->map, s->wd);
+        }
     }
 }
 
@@ -580,6 +1357,11 @@ static atlas_status add_repo(const atlas_repo_info *ri, void *ud, atlas_err *err
     atlas_buf_init(&rw->common_dir);
     atlas_buf_init(&rw->degraded_detail);
     atlas_buf_init(&rw->dirty_paths);
+    ignore_set_init(&rw->ignored);
+    atlas_buf_init(&rw->frontier);
+    atlas_buf_init(&rw->pending_ignore);
+    atlas_buf_init(&rw->owes_gap_detail);
+    rw->reason = ATLAS_WATCH_REASON_NONE;
     rw->repo_id = ri->id;
     atlas_status st = atlas_buf_set_str(&rw->name, ri->name, err);
     if (st == ATLAS_OK) {
@@ -599,130 +1381,826 @@ static atlas_status add_repo(const atlas_repo_info *ri, void *ud, atlas_err *err
     return ATLAS_OK;
 }
 
-/* Installs every watch for one repository and records the resulting state. */
-static void watch_repository(atlas_watcher *w, repo_watch *rw) {
-    atlas_safe_pool safe;
-    atlas_safe_pool_init(&safe);
+/* Refreshes one repository's ignored-path inventory from git.
+ *
+ * A failure is not fatal and does not clear what is already held: an inventory
+ * Atlas cannot refresh is stale, and a stale inventory still describes trees
+ * that were ignored a moment ago far better than an empty one does. What it must
+ * not do is silently pass for complete, which is what `overflow` records. */
+static bool refresh_ignored(atlas_watcher *w, repo_watch *rw) {
+    (void)w;
+    /* The staleness signal is consumed **here**, on every path, before anything
+     * can fail.
+     *
+     * It used to be cleared only on the success path, which made a persistent
+     * git failure a livelock rather than an error: an unlinked `.gitignore` in a
+     * repository whose working tree had gone set `ignore_stale`, every failing
+     * refresh left it set, and `resolve_pending_ignores` therefore re-primed the
+     * repository on *every* watcher tick — a git process every 200 ms, a writer
+     * job every tick, a full reconciliation every debounce ceiling, and a
+     * repository permanently in `priming` with zero source watches. A promisor
+     * repository, which `atlas_git_open` refuses by design, reproduces it
+     * without deleting anything.
+     *
+     * One event, one attempt. A failure is reported to the caller, which
+     * degrades the repository rather than asking again immediately. */
+    rw->ignore_stale = false;
+    atlas_err err;
+    atlas_err_init(&err);
+    atlas_git *g = NULL;
+    if (atlas_git_open(atlas_buf_cstr(&rw->root), &g, &err) != ATLAS_OK) {
+        return false;
+    }
+    ignore_set fresh;
+    ignore_set_init(&fresh);
+    atlas_err ignore_err;
+    atlas_err_init(&ignore_err);
+    atlas_status st = atlas_git_ls_ignored(g, collect_ignored, &fresh, &ignore_err);
+    atlas_git_close(g);
+    if (st != ATLAS_OK) {
+        ignore_set_free(&fresh);
+        return false;
+    }
+    ignore_set_sort(&fresh);
+    ignore_set_free(&rw->ignored);
+    rw->ignored = fresh;
+    return true;
+}
+
+/* Degrades a repository whose ignore inventory could not be read.
+ *
+ * Not a retry: `prime_round` and `continue_priming` both skip a degraded
+ * repository, so this is what stops the loop. The periodic reconciliation still
+ * covers the repository, and the next ignore-rule event will try again. */
+static void degrade_on_ignore_failure(repo_watch *rw) {
+    atlas_err err;
+    atlas_err_init(&err);
+    rw->degraded = true;
+    rw->reason = ATLAS_WATCH_REASON_ERROR;
+    (void)atlas_buf_set_str(&rw->degraded_detail,
+                            "git could not be asked which directories this repository ignores, "
+                            "so the watch set cannot be established; the periodic pass still "
+                            "covers it",
+                            &err);
+}
+
+/* P0. Phase one: the watches a branch switch depends on.
+ *
+ * Installed for every repository before any source tree is walked, and drawing
+ * from a reserve held back for exactly this. Before P0 these went in *after* the
+ * recursive source walk, so a repository large enough to exhaust the budget
+ * stopped watching its own HEAD — branch correctness was contingent on the
+ * source tree fitting, which is the wrong thing to make it contingent on.
+ *
+ * `info/` is subscribed explicitly because an inotify watch is not recursive: a
+ * watch on the git directory reports `config` and `HEAD`, which are its direct
+ * children, and reports **nothing at all** for `info/exclude`. That was verified
+ * rather than assumed. `info/exclude` resolves to the *common* directory even
+ * from a linked worktree, so one descriptor serves every worktree that shares
+ * it — which the subscriber set now makes safe. */
+static void watch_repository_meta(atlas_watcher *w, repo_watch *rw) {
     atlas_err err;
     atlas_err_init(&err);
 
-    ignore_set ignored;
-    memset(&ignored, 0, sizeof(ignored));
-    atlas_buf_init(&ignored.bytes);
+    add_ctx ac;
+    memset(&ac, 0, sizeof(ac));
+    ac.w = w;
+    ac.rw = rw;
+    ac.root_len = rw->root.len;
+    ac.is_meta = true;
+    ac.stop = ATLAS_WATCH_REASON_NONE;
 
-    /* Ask git which directories to skip. A failure here is not fatal: watching
-     * an ignored tree wastes watches but indexes nothing wrong, so the watcher
-     * carries on with an empty skip set. */
-    atlas_git *g = NULL;
-    if (atlas_git_open(atlas_buf_cstr(&rw->root), &g, &err) == ATLAS_OK) {
-        atlas_err ignore_err;
-        atlas_err_init(&ignore_err);
-        (void)atlas_git_ls_ignored(g, collect_ignored, &ignored, &ignore_err);
-        atlas_git_close(g);
+    atlas_status st = ATLAS_OK;
+    if (rw->git_dir.len > 0) {
+        st = add_watch(&ac, atlas_buf_cstr(&rw->git_dir), &err);
+    }
+    bool distinct_common = rw->common_dir.len > 0 &&
+                           (rw->common_dir.len != rw->git_dir.len ||
+                            memcmp(rw->common_dir.data, rw->git_dir.data, rw->common_dir.len) != 0);
+    if (st == ATLAS_OK && distinct_common) {
+        st = add_watch(&ac, atlas_buf_cstr(&rw->common_dir), &err);
+    }
+    /* `info/` under both, where they differ. Absent is not an error: the
+     * directory is a direct child of a watched one, so its later creation
+     * arrives as an ordinary event and subscribes it then. */
+    for (int which = 0; st == ATLAS_OK && which < 2; which++) {
+        const atlas_buf *base = which == 0 ? &rw->common_dir : &rw->git_dir;
+        if (base->len == 0 || (which == 1 && !distinct_common)) {
+            continue;
+        }
+        atlas_buf info = ATLAS_BUF_INIT;
+        if (atlas_buf_set(&info, base->data, base->len, &err) == ATLAS_OK &&
+            atlas_buf_append_str(&info, "/info", &err) == ATLAS_OK) {
+            st = add_watch(&ac, atlas_buf_cstr(&info), &err);
+        }
+        atlas_buf_free(&info);
+    }
+    if (st == ATLAS_OK && rw->common_dir.len > 0) {
+        atlas_buf refs = ATLAS_BUF_INIT;
+        if (atlas_buf_set(&refs, rw->common_dir.data, rw->common_dir.len, &err) == ATLAS_OK &&
+            atlas_buf_append_str(&refs, "/refs", &err) == ATLAS_OK) {
+            st = add_watch_tree(&ac, atlas_buf_cstr(&refs), &err);
+        }
+        atlas_buf_free(&refs);
+    }
+    if (st != ATLAS_OK) {
+        rw->degraded = true;
+        rw->reason = ATLAS_WATCH_REASON_ERROR;
+        (void)atlas_buf_set_str(&rw->degraded_detail, atlas_err_msg(&err), &err);
+    } else if (ac_stopped(&ac)) {
+        rw->degraded = true;
+        rw->reason = ac.stop;
+        (void)atlas_buf_set_str(&rw->degraded_detail, atlas_watch_reason_explain(ac.stop), &err);
+    }
+}
+
+/* P0. Phase two, one round's worth: walk this repository's source tree until its
+ * share of the round is spent, the frontier empties, or a bound is reached.
+ *
+ * Returns with a non-empty frontier when there is more to do. */
+static void prime_repository_source(atlas_watcher *w, repo_watch *rw, size_t max_dirs) {
+    atlas_err err;
+    atlas_err_init(&err);
+
+    if (!rw->prime_started) {
+        if ((rw->ignore_stale || rw->ignored.count == 0) && !refresh_ignored(w, rw)) {
+            degrade_on_ignore_failure(rw);
+            return;
+        }
+        rw->prime_started = true;
+        rw->prime_sweep_owed = true;
+        rw->visits = 0;
+        if (frontier_push(&rw->frontier, &rw->frontier_count, rw->root.data, rw->root.len,
+                          &err) != ATLAS_OK) {
+            rw->degraded = true;
+            rw->reason = ATLAS_WATCH_REASON_FRONTIER_OVERFLOW;
+            (void)atlas_buf_set_str(&rw->degraded_detail,
+                                    atlas_watch_reason_explain(rw->reason), &err);
+            return;
+        }
+    }
+    if (rw->ignored.overflow && !rw->degraded) {
+        rw->degraded = true;
+        rw->reason = ATLAS_WATCH_REASON_IGNORE_OVERFLOW;
+        (void)atlas_buf_set_str(&rw->degraded_detail, atlas_watch_reason_explain(rw->reason),
+                                &err);
     }
 
     add_ctx ac;
     memset(&ac, 0, sizeof(ac));
     ac.w = w;
     ac.rw = rw;
-    ac.ignored = &ignored;
+    ac.ignored = &rw->ignored;
     ac.root_len = rw->root.len;
+    ac.is_meta = false;
+    ac.stop = ATLAS_WATCH_REASON_NONE;
 
-    atlas_err add_err;
-    atlas_err_init(&add_err);
-    atlas_status st = add_watch_tree(&ac, atlas_buf_cstr(&rw->root), &add_err);
-
-    /* Git metadata: this worktree's git dir and the shared common dir. HEAD, the
-     * index and refs all live in one of the two, and a linked worktree's HEAD is
-     * in its own git dir while the branch it points at is in the common one. */
-    if (st == ATLAS_OK) {
-        ac.is_meta = true;
-        ac.ignored = NULL;
-        if (rw->git_dir.len > 0) {
-            st = add_watch(&ac, atlas_buf_cstr(&rw->git_dir), &add_err);
-        }
-        if (st == ATLAS_OK && rw->common_dir.len > 0 &&
-            (rw->common_dir.len != rw->git_dir.len ||
-             memcmp(rw->common_dir.data, rw->git_dir.data, rw->common_dir.len) != 0)) {
-            st = add_watch(&ac, atlas_buf_cstr(&rw->common_dir), &add_err);
-        }
-        if (st == ATLAS_OK && rw->common_dir.len > 0) {
-            atlas_buf refs = ATLAS_BUF_INIT;
-            if (atlas_buf_set(&refs, rw->common_dir.data, rw->common_dir.len, &add_err) ==
-                    ATLAS_OK &&
-                atlas_buf_append_str(&refs, "/refs", &add_err) == ATLAS_OK) {
-                st = add_watch_tree(&ac, atlas_buf_cstr(&refs), &add_err);
-            }
-            atlas_buf_free(&refs);
-        }
-    }
-
-    rw->degraded = false;
-    atlas_buf_reset(&rw->degraded_detail);
+    atlas_status st = prime_chunk(&ac, &rw->frontier, &rw->frontier_count, max_dirs, &err);
     if (st != ATLAS_OK) {
         rw->degraded = true;
-        (void)atlas_buf_set_str(&rw->degraded_detail, atlas_err_msg(&add_err), &err);
-    } else if (ac.limit_hit) {
-        rw->degraded = true;
-        (void)atlas_buf_set_str(
-            &rw->degraded_detail,
-            "the kernel's inotify watch limit was reached, so some directories are not being "
-            "observed. Raise fs.inotify.max_user_watches, or expect to rely on periodic "
-            "reconciliation for the unwatched parts.",
-            &err);
-    } else if (ac.budget_hit) {
-        rw->degraded = true;
-        (void)atlas_buf_set_str(&rw->degraded_detail,
-                                "this repository has more directories than Atlas will watch, so "
-                                "some are not being observed and are covered only by periodic "
-                                "reconciliation",
-                                &err);
+        rw->reason = ATLAS_WATCH_REASON_ERROR;
+        (void)atlas_buf_set_str(&rw->degraded_detail, atlas_err_msg(&err), &err);
+        /* The walk is abandoned but not restarted: `prime_started` stays set, so
+         * the next round does not begin it again from the root. */
+        frontier_clear(&rw->frontier, &rw->frontier_count);
+        return;
     }
+    /* REPO_BUDGET means "this round is spent", which is not a degradation: the
+     * next round may hand out more. Every other stop is one. */
+    if (ac_stopped(&ac) && ac.stop != ATLAS_WATCH_REASON_REPO_BUDGET) {
+        rw->degraded = true;
+        rw->reason = ac.stop;
+        (void)atlas_buf_set_str(&rw->degraded_detail, atlas_watch_reason_explain(ac.stop), &err);
+        /* Nothing more will fit, so stop asking. The unwatched remainder is
+         * covered by periodic reconciliation, which is what the reason says. */
+        frontier_clear(&rw->frontier, &rw->frontier_count);
+    }
+}
 
+/* True while anything about this repository's observation is still incomplete.
+ *
+ * All three conditions mean the same thing to a reader — there is a part of this
+ * tree Atlas is not receiving events for — so all three keep it out of
+ * `watching` and out of `index_current`. */
+static bool repo_is_priming(const repo_watch *rw) {
+    /* `!prime_started` is the third condition and it is not redundant.
+     *
+     * A repository whose source walk has not begun has an *empty* frontier, so
+     * the first two conditions are both false and it would be published as
+     * `watching` with whatever count it happened to hold — zero, immediately
+     * after a re-prime dropped its source watches. That is precisely the claim
+     * P0 exists to stop Atlas making: watched, complete, current, with nothing
+     * actually installed. Caught by `test_watch_ignore`, which asserted the
+     * count and found it reading 0. */
+    return !rw->prime_started || rw->frontier_count > 0 || rw->pending_ignore_count > 0;
+}
+
+/* Publishes what this repository's watch build established. */
+static void publish_repo_state(atlas_watcher *w, repo_watch *rw) {
+    atlas_safe_pool safe;
+    atlas_safe_pool_init(&safe);
+    atlas_err err;
+    atlas_err_init(&err);
+
+    atlas_watch_outcome o;
+    atlas_watch_outcome_init(&o);
+    o.source_dirs = rw->source_dirs;
+    o.meta_dirs = rw->meta_dirs;
+    o.shared_dirs = rw->shared_dirs;
+
+    bool mark_gap = false;
     if (rw->degraded) {
+        o.state = ATLAS_WATCH_DEGRADED;
+        o.reason = rw->reason;
+        o.detail = atlas_buf_cstr(&rw->degraded_detail);
+        /* A degraded watcher may miss changes, which is exactly an event gap:
+         * the index must not be described as current until a full pass runs. */
+        mark_gap = true;
         atlas_daemon_log(w->log, "warn", "watcher degraded for %s: %s",
                          atlas_safe(&safe, atlas_buf_cstr(&rw->name)),
                          atlas_safe(&safe, atlas_buf_cstr(&rw->degraded_detail)));
-        /* A degraded watcher may miss changes, which is exactly an event gap:
-         * the index must not be described as current until a full pass runs. */
-        (void)atlas_writer_submit_gap(w->writer, rw->repo_id,
-                                      atlas_buf_cstr(&rw->degraded_detail), &err);
+    } else if (repo_is_priming(rw)) {
+        o.state = ATLAS_WATCH_PRIMING;
+        o.reason = ATLAS_WATCH_REASON_NONE;
+        o.detail = "the watch set for this repository is still being installed, so parts of it "
+                   "are not yet observed";
+        /* Priming marks the gap, and not only because this Atlas would refuse to
+         * call it current anyway.
+         *
+         * `atlas_watch_state_parse` maps any unrecognised state to UNWATCHED,
+         * and `derive_index_current` falls through UNWATCHED to *current* — so a
+         * pre-P0 client reading `"priming"` over the socket re-derives
+         * `index_current: true` for a tree whose watches are still going in.
+         * The gap is a field every such client already understands, and setting
+         * it makes the honest answer the one they compute. It is exactly what
+         * priming means: a part of this tree is producing events nobody is
+         * receiving. A content-verifying pass clears it, as it does every
+         * other gap. */
+        mark_gap = true;
     } else {
-        atlas_daemon_log(w->log, "info", "watching %s (%lld directories)",
-                         atlas_safe(&safe, atlas_buf_cstr(&rw->name)), (long long)rw->dirs);
-        (void)atlas_writer_submit_watch_state(w->writer, rw->repo_id, ATLAS_WATCH_WATCHING, NULL,
-                                              rw->dirs, &err);
+        o.state = ATLAS_WATCH_WATCHING;
+        o.reason = ATLAS_WATCH_REASON_NONE;
+        o.detail = NULL;
+        atlas_daemon_log(w->log, "info",
+                         "watching %s (%lld source, %lld metadata, %lld shared)",
+                         atlas_safe(&safe, atlas_buf_cstr(&rw->name)),
+                         (long long)rw->source_dirs, (long long)rw->meta_dirs,
+                         (long long)rw->shared_dirs);
     }
-
-    atlas_buf_free(&ignored.bytes);
+    /* An owed gap is independent of the state: a subtree that was watched late
+     * missed events whether or not anything else went wrong, and the obligation
+     * has to survive into the row. */
+    if (rw->owes_gap) {
+        mark_gap = true;
+        if (o.detail == NULL) {
+            o.detail = atlas_buf_cstr(&rw->owes_gap_detail);
+        }
+    }
+    /* The obligation is discharged **only if the writer accepted it**.
+     *
+     * The comment here used to claim exactly that and the code did the opposite:
+     * it cast the result away and cleared `owes_gap` unconditionally. The writer
+     * queue is bounded at ATLAS_WRITER_QUEUE_MAX and a submission is refused
+     * when it is full or when the writer is stopping — and A9.2.6 documents that
+     * an unbounded semantic pass can occupy the writer for minutes while jobs
+     * accumulate behind it. So the refusal is not hypothetical, and dropping a
+     * gap on it reinstates the precise false claim this season exists to end: a
+     * repository reported `watching` and `index_current` over a subtree whose
+     * events were provably missed. A fixture never fills the queue, so no test
+     * would have caught it.
+     *
+     * On failure nothing is recorded as published either, so
+     * `maybe_publish_repo_state` sees a stale cache and tries again next tick. */
+    if (atlas_writer_submit_watch_outcome(w->writer, rw->repo_id, &o, mark_gap, &err) !=
+        ATLAS_OK) {
+        atlas_daemon_log(w->log, "warn",
+                         "could not record the watch state for %s; it stays owed and will be "
+                         "retried: %s",
+                         atlas_safe(&safe, atlas_buf_cstr(&rw->name)), atlas_err_msg(&err));
+        atlas_safe_pool_free(&safe);
+        return;
+    }
+    rw->owes_gap = false;
+    rw->published_state = o.state;
+    rw->published_reason = o.reason;
+    rw->published_source = rw->source_dirs;
+    rw->published_meta = rw->meta_dirs;
+    rw->published_valid = true;
     atlas_safe_pool_free(&safe);
 }
 
+/* Publishes only when something a reader would notice has changed.
+ *
+ * Priming advances every tick, so publishing unconditionally would put a write
+ * on the queue for each chunk to say the same thing — and the writer queue is
+ * shared with everything else the daemon does. An owed gap always publishes,
+ * because it is an obligation rather than a description. */
+static void maybe_publish_repo_state(atlas_watcher *w, repo_watch *rw) {
+    atlas_watch_state now = rw->degraded ? ATLAS_WATCH_DEGRADED
+                            : repo_is_priming(rw) ? ATLAS_WATCH_PRIMING
+                                                  : ATLAS_WATCH_WATCHING;
+    atlas_watch_reason reason = rw->degraded ? rw->reason : ATLAS_WATCH_REASON_NONE;
+    if (rw->published_valid && !rw->owes_gap && rw->published_state == now &&
+        rw->published_reason == reason && rw->published_source == rw->source_dirs &&
+        rw->published_meta == rw->meta_dirs) {
+        return;
+    }
+    publish_repo_state(w, rw);
+}
+
+/* Drops this repository's *source* subscriptions, keeping its metadata ones.
+ *
+ * `remove_watch_tree` on the repository root would take the metadata watches
+ * too — `.git` lives under the root — and metadata is what a branch switch
+ * depends on. A re-prime that dropped it would make the repository blind to the
+ * very event that most often triggers the re-prime. */
+static void remove_repo_source_watches(atlas_watcher *w, repo_watch *rw) {
+    for (size_t i = 0; i < w->map.cap; i++) {
+        wd_slot *s = &w->map.slots[i];
+        if (s->wd <= 0 || s->is_meta || !slot_has_sub(s, rw->repo_id)) {
+            continue;
+        }
+        bool was_shared = s->sub_count > 1u;
+        uint16_t left = slot_remove_sub(s, rw->repo_id);
+        if (rw->source_dirs > 0) {
+            rw->source_dirs--;
+        }
+        if (was_shared && rw->shared_dirs > 0) {
+            rw->shared_dirs--;
+        }
+        if (left == 0) {
+            (void)inotify_rm_watch(w->inotify_fd, s->wd);
+            wd_map_remove(&w->map, s->wd);
+        }
+    }
+}
+
+/* P0. One re-check of the finished watch set against a freshly read inventory.
+ *
+ * The priming walk asks `git ls-files` once, at the start, and then judges every
+ * directory it discovers against that answer. That is correct for a tree that
+ * does not change under it — and a walk of a large repository takes tens of
+ * seconds, during which a build can create an ignored tree the inventory has
+ * never heard of. Those directories are not in the inventory, so the walk
+ * watches them: exactly the outcome the inventory exists to prevent, arrived at
+ * from the other direction.
+ *
+ * So when the frontier empties, the inventory is read once more and any watch
+ * this repository holds beneath a now-ignored path is released. Bounded: one git
+ * invocation and one pass over the map, once per priming run — not per round and
+ * not per directory.
+ *
+ * It releases watches and never installs any, so it cannot miss an event that
+ * was not already going to be missed; a subtree that stopped being ignored is
+ * the `ignore_stale` path's business, not this one. */
+static void sweep_newly_ignored(atlas_watcher *w, repo_watch *rw) {
+    rw->prime_sweep_owed = false;
+    if (!refresh_ignored(w, rw)) {
+        degrade_on_ignore_failure(rw);
+        return;
+    }
+    if (rw->ignored.count == 0) {
+        return;
+    }
+    size_t released = 0;
+    for (size_t i = 0; i < w->map.cap; i++) {
+        wd_slot *sl = &w->map.slots[i];
+        if (sl->wd <= 0 || sl->is_meta || !slot_has_sub(sl, rw->repo_id)) {
+            continue;
+        }
+        if (sl->path.len <= rw->root.len + 1u ||
+            memcmp(sl->path.data, rw->root.data, rw->root.len) != 0) {
+            continue;
+        }
+        const char *rel = atlas_buf_cstr(&sl->path) + rw->root.len + 1u;
+        size_t rel_len = sl->path.len - rw->root.len - 1u;
+        if (!ignore_set_covers(&rw->ignored, rel, rel_len)) {
+            continue;
+        }
+        bool was_shared = sl->sub_count > 1u;
+        uint16_t left = slot_remove_sub(sl, rw->repo_id);
+        if (rw->source_dirs > 0) {
+            rw->source_dirs--;
+        }
+        if (was_shared && rw->shared_dirs > 0) {
+            rw->shared_dirs--;
+        }
+        if (left == 0) {
+            (void)inotify_rm_watch(w->inotify_fd, sl->wd);
+            wd_map_remove(&w->map, sl->wd);
+        }
+        released++;
+    }
+    if (released > 0) {
+        atlas_safe_pool safe;
+        atlas_safe_pool_init(&safe);
+        atlas_daemon_log(w->log, "info",
+                         "released %zu watch(es) on %s that became ignored while it was being "
+                         "primed",
+                         released, atlas_safe(&safe, atlas_buf_cstr(&rw->name)));
+        atlas_safe_pool_free(&safe);
+    }
+}
+
+/* P0. Re-primes one repository against a freshly read ignore inventory.
+ *
+ * Repository-scoped, so an unrelated repository is not disturbed, and honest
+ * about its own cost: dropping and reinstalling this repository's source watches
+ * is a window in which its events are not observed, which is an event gap and is
+ * recorded as one. */
+static void reprime_repository(atlas_watcher *w, repo_watch *rw, const char *why) {
+    atlas_err err;
+    atlas_err_init(&err);
+    remove_repo_source_watches(w, rw);
+    atlas_buf_reset(&rw->pending_ignore);
+    rw->pending_ignore_count = 0;
+    rw->pending_ignore_overflow = false;
+    /* A deliberate restart, so `prime_started` is cleared too: the next round
+     * walks this repository from its root against the fresh inventory. */
+    frontier_clear(&rw->frontier, &rw->frontier_count);
+    rw->prime_started = false;
+    rw->visits = 0;
+    rw->degraded = false;
+    rw->reason = ATLAS_WATCH_REASON_NONE;
+    atlas_buf_reset(&rw->degraded_detail);
+    if (!refresh_ignored(w, rw)) {
+        degrade_on_ignore_failure(rw);
+    }
+    rw->owes_gap = true;
+    (void)atlas_buf_set_str(&rw->owes_gap_detail, why, &err);
+    mark_dirty(w, rw->repo_id);
+}
+
+/* P0. Answers, for every repository that has queued directories or whose ignore
+ * rules moved, with **one** `git ls-files` invocation per repository per tick.
+ *
+ * That bound is the whole reason this is a queue rather than a question asked
+ * per directory: an unpacked archive or a build that creates a thousand
+ * directories in a burst would otherwise mean a thousand git processes. The
+ * inventory is re-read once and the entire queue is resolved against it.
+ *
+ * Re-reading is what makes the answer correct for a path that did not exist
+ * before. `git ls-files --others --ignored --directory` enumerates the
+ * filesystem, so a directory created a moment ago is now reported — including an
+ * empty one, and including a whole freshly created subtree collapsed to its
+ * topmost ignored directory. */
+static void resolve_pending_ignores(atlas_watcher *w) {
+    for (size_t i = 0; i < w->repo_count && i < w->max_repos; i++) {
+        repo_watch *rw = &w->repos[i];
+        if (rw->pending_ignore_count == 0 && !rw->ignore_stale && !rw->pending_ignore_overflow) {
+            continue;
+        }
+        if (rw->pending_ignore_overflow) {
+            /* More appeared at once than Atlas will hold. It cannot say which of
+             * them git ignores, so it says so and takes a full pass rather than
+             * guessing in either direction. */
+            atlas_err err;
+            atlas_err_init(&err);
+            rw->degraded = true;
+            rw->reason = ATLAS_WATCH_REASON_PENDING_IGNORE_OVERFLOW;
+            (void)atlas_buf_set_str(&rw->degraded_detail,
+                                    atlas_watch_reason_explain(rw->reason), &err);
+            reprime_repository(w, rw, atlas_watch_reason_explain(rw->reason));
+            rw->degraded = true;
+            rw->reason = ATLAS_WATCH_REASON_PENDING_IGNORE_OVERFLOW;
+            (void)atlas_buf_set_str(&rw->degraded_detail,
+                                    atlas_watch_reason_explain(rw->reason), &err);
+            maybe_publish_repo_state(w, rw);
+            continue;
+        }
+        if (rw->ignore_stale) {
+            /* The rules themselves moved — a `.gitignore` edit, an
+             * `info/exclude` write, or a branch switch that swapped one
+             * branch's rules for another's. Which directories are affected is
+             * not derivable from the event, so the repository is re-primed
+             * against the fresh inventory: newly ignored subtrees lose their
+             * watches, newly visible ones gain them, by construction. */
+            reprime_repository(w, rw,
+                               "this repository's git ignore rules changed, so its watch set was "
+                               "rebuilt and events during the rebuild were not observed");
+            maybe_publish_repo_state(w, rw);
+            continue;
+        }
+
+        if (!refresh_ignored(w, rw)) {
+            /* Without a fresh inventory these directories cannot be judged, and
+             * judging them against a stale one is the defect this queue exists
+             * to prevent. They stay unwatched and the repository says why. */
+            degrade_on_ignore_failure(rw);
+            maybe_publish_repo_state(w, rw);
+            continue;
+        }
+        if (rw->ignored.overflow) {
+            /* The inventory is known incomplete, so "not ignored" is not an
+             * answer Atlas can give about these directories. `collect_ignored`
+             * fails closed and so does this: the refresh path used to skip the
+             * check that `prime_repository_source` makes. */
+            atlas_err oerr;
+            atlas_err_init(&oerr);
+            rw->degraded = true;
+            rw->reason = ATLAS_WATCH_REASON_IGNORE_OVERFLOW;
+            (void)atlas_buf_set_str(&rw->degraded_detail,
+                                    atlas_watch_reason_explain(rw->reason), &oerr);
+            maybe_publish_repo_state(w, rw);
+            continue;
+        }
+
+        atlas_buf queued = ATLAS_BUF_INIT;
+        atlas_err err;
+        atlas_err_init(&err);
+        if (atlas_buf_set(&queued, rw->pending_ignore.data, rw->pending_ignore.len, &err) !=
+            ATLAS_OK) {
+            continue;
+        }
+        atlas_buf_reset(&rw->pending_ignore);
+        rw->pending_ignore_count = 0;
+
+        size_t off = 0;
+        bool watched_any = false;
+        while (off < queued.len) {
+            const char *abs = queued.data + off;
+            size_t alen = strlen(abs);
+            off += alen + 1u;
+            if (alen <= rw->root.len + 1u) {
+                continue;
+            }
+            const char *rel = abs + rw->root.len + 1u;
+            size_t rel_len = alen - rw->root.len - 1u;
+            /* `covers`, not `has_exact`: this directory is a walk *entry point*,
+             * so nothing has cleared its ancestors and only the bounded ancestor
+             * test is complete here. */
+            if (ignore_set_covers(&rw->ignored, rel, rel_len)) {
+                continue; /* ignored: no watch, nothing owed, nothing to report */
+            }
+            add_ctx ac;
+            memset(&ac, 0, sizeof(ac));
+            ac.w = w;
+            ac.rw = rw;
+            ac.ignored = &rw->ignored;
+            ac.root_len = rw->root.len;
+            ac.is_meta = false;
+            ac.stop = ATLAS_WATCH_REASON_NONE;
+            w->round_share = w->budget_total; /* a late subtree is not rationed by round */
+            rw->primed_this_round = 0;
+            atlas_err aerr;
+            atlas_err_init(&aerr);
+            (void)add_watch_tree(&ac, abs, &aerr);
+            watched_any = true;
+            if (ac_stopped(&ac) && ac.stop != ATLAS_WATCH_REASON_REPO_BUDGET) {
+                rw->degraded = true;
+                rw->reason = ac.stop;
+                (void)atlas_buf_set_str(&rw->degraded_detail,
+                                        atlas_watch_reason_explain(ac.stop), &aerr);
+            }
+        }
+        atlas_buf_free(&queued);
+
+        if (watched_any) {
+            /* The decision took a debounce interval, and this subtree was not
+             * watched for the whole of it — anything created inside it in the
+             * meantime produced no event. That is an event gap, and the
+             * repository owes a content-verifying pass before it may be
+             * described as current again. */
+            rw->owes_gap = true;
+            (void)atlas_buf_set_str(
+                &rw->owes_gap_detail,
+                "a directory appeared and was not watched until git had been asked whether it is "
+                "ignored, so events inside it during that interval were not observed", &err);
+            mark_dirty(w, rw->repo_id);
+        }
+        maybe_publish_repo_state(w, rw);
+    }
+}
+
+/* P0. Advances source priming by one round, then publishes what changed. */
+static void continue_priming(atlas_watcher *w) {
+    bool any = false;
+    for (size_t i = 0; i < w->repo_count && i < w->max_repos; i++) {
+        const repo_watch *rw = &w->repos[i];
+        /* A non-empty frontier means a walk is suspended mid-tree; `!prime_started`
+         * means one has not begun. Both need a round, and testing only the first
+         * left a repository that had just been re-primed — frontier deliberately
+         * emptied, `prime_started` deliberately cleared — sitting in `priming`
+         * with zero source watches forever, because nothing ever asked it to
+         * start. A repository that is degraded has already given up and is not
+         * asked again. */
+        if (!rw->degraded && (rw->frontier_count > 0 || !rw->prime_started)) {
+            any = true;
+            break;
+        }
+    }
+    if (any) {
+        (void)prime_round(w);
+    }
+    for (size_t i = 0; i < w->repo_count && i < w->max_repos; i++) {
+        maybe_publish_repo_state(w, &w->repos[i]);
+    }
+}
+
+/* P0. One allocation round over the repositories that still want watches.
+ *
+ * The share is recomputed every round over the repositories whose frontier is
+ * still non-empty, so a repository that finishes under its share returns the
+ * remainder to the pool automatically and a single large repository alone gets
+ * the whole budget. Nothing here reads a repository's position in the list, so
+ * the outcome does not depend on `ORDER BY name` — which is what used to decide,
+ * silently, which repository was left permanently degraded.
+ *
+ * Returns true while any repository is still priming. */
+static bool prime_round(atlas_watcher *w) {
+    size_t wanting = 0;
+    for (size_t i = 0; i < w->repo_count && i < w->max_repos; i++) {
+        /* A degraded repository has already been told why it stopped and is not
+         * asked again this build; including it would divide the pool with a
+         * claimant that cannot use it. */
+        if (w->repos[i].degraded) {
+            continue;
+        }
+        if (w->repos[i].frontier_count > 0 || !w->repos[i].prime_started) {
+            wanting++;
+        }
+    }
+    if (wanting == 0) {
+        return false;
+    }
+    /* P0. Hold back what every repository still owes its metadata reserve.
+     *
+     * Meta-first ordering covers the initial build and nothing else: without
+     * this, a source round spends the whole pool, and metadata that appears
+     * *later* — `.git/info` created live, a new `refs/` subdirectory after a
+     * branch is pushed — has nothing left and reports `meta_budget`. The reserve
+     * is what makes "branch correctness does not depend on the source tree
+     * fitting" true after the first minute as well as during it.
+     *
+     * A repository that has already installed its reserve owes nothing, so a
+     * daemon watching ordinary repositories holds back almost nothing. */
+    int64_t reserved = 0;
+    for (size_t i = 0; i < w->repo_count && i < w->max_repos; i++) {
+        if (w->repos[i].degraded) {
+            continue;
+        }
+        int64_t owed = (int64_t)ATLAS_WATCH_META_RESERVE_PER_REPO - w->repos[i].meta_dirs;
+        if (owed > 0) {
+            reserved += owed;
+        }
+    }
+    int64_t pool = w->budget_total - (int64_t)w->map.count - reserved;
+    if (pool <= 0) {
+        /* Nothing left for source once metadata's reserve is set aside.
+         *
+         * The repositories that still want watches are told `total_budget` and
+         * stop asking. A floor of one watch per round was the first attempt and
+         * was wrong in a way worth recording: it kept the loop making progress,
+         * and the progress it made was source watches eating the reserve one per
+         * tick — which is precisely what the reserve exists to prevent. A bound
+         * that yields under pressure is not a bound. */
+        atlas_err err;
+        atlas_err_init(&err);
+        for (size_t i = 0; i < w->repo_count && i < w->max_repos; i++) {
+            repo_watch *rw = &w->repos[i];
+            if (rw->degraded || (rw->frontier_count == 0 && rw->prime_started)) {
+                continue;
+            }
+            rw->degraded = true;
+            rw->reason = ATLAS_WATCH_REASON_TOTAL_BUDGET;
+            (void)atlas_buf_set_str(&rw->degraded_detail,
+                                    atlas_watch_reason_explain(rw->reason), &err);
+            frontier_clear(&rw->frontier, &rw->frontier_count);
+            rw->prime_started = true;
+        }
+        return false;
+    }
+    int64_t share = pool / (int64_t)wanting;
+    if (share < 1) {
+        share = 1; /* the pool is positive, so somebody can still make progress */
+    }
+    w->round_share = share;
+
+    bool more = false;
+    for (size_t i = 0; i < w->repo_count && i < w->max_repos; i++) {
+        repo_watch *rw = &w->repos[i];
+        if (rw->degraded || (rw->frontier_count == 0 && rw->prime_started)) {
+            continue;
+        }
+        rw->primed_this_round = 0;
+        prime_repository_source(w, rw, ATLAS_WATCH_PRIME_CHUNK_DIRS);
+        if (rw->frontier_count == 0 && rw->prime_sweep_owed && !rw->degraded) {
+            sweep_newly_ignored(w, rw);
+        }
+        if (rw->frontier_count > 0) {
+            more = true;
+        }
+    }
+    return more;
+}
+
+static void refresh_stats(atlas_watcher *w) {
+    int64_t subs = 0;
+    bool complete = true;
+    for (size_t i = 0; i < w->repo_count; i++) {
+        subs += w->repos[i].source_dirs + w->repos[i].meta_dirs;
+        /* A degraded repository has stopped: it is not priming and never will
+         * without another rebuild, so counting it as incomplete would pin
+         * `priming_complete` false for the life of the daemon. Registering more
+         * repositories than the watcher observes did exactly that. */
+        if (!w->repos[i].degraded && repo_is_priming(&w->repos[i])) {
+            complete = false;
+        }
+    }
+    (void)pthread_mutex_lock(&w->stat_lock);
+    w->watch_count = (int64_t)w->map.count;
+    w->sub_count = subs;
+    w->priming_complete = complete;
+    w->stat_budget_total = w->budget_total;
+    w->stat_budget_repo = w->budget_repo;
+    w->stat_kernel_max = w->kernel_max;
+    w->stat_budget_from_policy = w->budget_from_policy;
+    (void)pthread_mutex_unlock(&w->stat_lock);
+}
+
 /* Rebuilds the whole watch set. Called at startup and whenever the repository
- * set changes, so `repo add` takes effect without restarting the daemon. */
+ * set changes, so `repo add` takes effect without restarting the daemon.
+ *
+ * P0 splits it into two phases across *all* repositories: every repository's
+ * git metadata first, then source trees by fair-share rounds. The ordering is
+ * the correctness argument — a repository must observe its own HEAD whether or
+ * not the machine has budget left for its source tree.
+ *
+ * Source priming is only *started* here. It continues on the watcher loop in
+ * chunks, so a large tree does not stop the loop draining inotify — an overflow
+ * there is global to the instance and would gap every repository at once. */
 static atlas_status rebuild_watches(atlas_watcher *w, atlas_err *err) {
     /* Drop every existing watch first. Rebuilding from scratch is O(watches) and
      * happens only on a repository-set change; getting incremental watch
-     * bookkeeping subtly wrong would be far more expensive than that. */
+     * bookkeeping subtly wrong would be far more expensive than that.
+     *
+     * Cleared rather than tombstoned one by one: tombstones do not terminate a
+     * probe chain, so rebuilding by removal made every chain longer and never
+     * shorter. */
     for (size_t i = 0; i < w->map.cap; i++) {
         if (w->map.slots[i].wd > 0) {
             (void)inotify_rm_watch(w->inotify_fd, w->map.slots[i].wd);
-            wd_map_remove(&w->map, w->map.slots[i].wd);
         }
     }
+    wd_map_clear(&w->map);
     clear_repos(w);
+
+    resolve_budget(w, w->budget_injected);
 
     build_ctx bc = {w, ATLAS_OK, err};
     atlas_status st = atlas_db_repo_list(w->db, add_repo, &bc, err);
     if (st != ATLAS_OK) {
         return st;
     }
-    for (size_t i = 0; i < w->repo_count; i++) {
-        watch_repository(w, &w->repos[i]);
+    /* P0. Checked before anything is installed: can the metadata reserve for
+     * every repository even fit inside the budget?
+     *
+     * `repo_count` is bounded by ATLAS_WATCH_MAX_REPOS and the reserve is a
+     * small constant, so the product cannot overflow — asserted by
+     * `tests/test_watch_budget.c` against the hard ceiling rather than left to
+     * be re-derived here. What can happen is a budget so small that the reserve
+     * exhausts it, and the honest answer to that is to say so with both numbers
+     * rather than to prime a repository whose metadata will not fit. */
+    {
+        size_t counted = w->repo_count < w->max_repos ? w->repo_count : w->max_repos;
+        int64_t need = (int64_t)counted * (int64_t)ATLAS_WATCH_META_RESERVE_PER_REPO;
+        if (counted > 0 && need >= w->budget_total) {
+            /* Said once, with both numbers, and then the build proceeds.
+             *
+             * An earlier version degraded every repository here without
+             * installing anything, which was wrong: metadata is what a branch
+             * switch depends on, and a budget too small for the *reserve* is
+             * still large enough to watch some of it. The reserve is a target
+             * for what source may not take, not a precondition for starting —
+             * so the honest response is to warn and then install what fits,
+             * reporting `total_budget` to whatever does not. */
+            atlas_daemon_log(w->log, "warn",
+                             "the watch budget is %lld, below the metadata reserve of %lld for "
+                             "%zu repositories; source directories will not be watched. Raise "
+                             "fs.inotify.max_user_watches or watch_max_dirs_total.",
+                             (long long)w->budget_total, (long long)need, counted);
+        }
     }
-    (void)pthread_mutex_lock(&w->stat_lock);
-    w->watch_count = (int64_t)w->map.count;
-    (void)pthread_mutex_unlock(&w->stat_lock);
+
+    for (size_t i = 0; i < w->repo_count; i++) {
+        repo_watch *rw = &w->repos[i];
+        if (i >= w->max_repos) {
+            /* Observed by nobody, and said so. Registration is unchanged: losing
+             * observation is a watcher fact, and refusing `repo add` would be a
+             * change to a different contract. */
+            rw->degraded = true;
+            rw->reason = ATLAS_WATCH_REASON_REPO_LIMIT;
+            (void)atlas_buf_set_str(&rw->degraded_detail,
+                                    atlas_watch_reason_explain(rw->reason), err);
+            continue;
+        }
+        watch_repository_meta(w, rw);
+    }
+    (void)prime_round(w);
+    for (size_t i = 0; i < w->repo_count; i++) {
+        publish_repo_state(w, &w->repos[i]);
+    }
+    refresh_stats(w);
     return ATLAS_OK;
 }
 
@@ -811,6 +2289,66 @@ static pending_move *take_move(atlas_watcher *w, uint32_t cookie) {
     return NULL;
 }
 
+/* P0. Queues a directory Atlas has not judged yet.
+ *
+ * Deliberately installs no watch and descends nowhere. The ignored-path
+ * inventory lists paths that *existed* when `git ls-files` last ran, and this
+ * one did not, so the inventory has nothing to say about it — a `build/` rule
+ * with no `build/` on disk produces no entry at all. Judging it against the
+ * stale inventory is what made every freshly created build tree get watched in
+ * full, whatever `.gitignore` said.
+ *
+ * The cost of waiting is stated rather than hidden: nothing under this directory
+ * is watched until the decision arrives, so events inside it are being missed.
+ * `repo_is_priming` therefore keeps the repository out of `watching` and out of
+ * `index_current` for as long as the queue is non-empty. */
+static void queue_pending_ignore(atlas_watcher *w, repo_watch *rw, const char *abs_path,
+                                 size_t len) {
+    if (rw->pending_ignore_overflow) {
+        return;
+    }
+    if (rw->pending_ignore_count >= w->max_pending_ignore ||
+        rw->pending_ignore.len + len + 1u > w->max_pending_ignore_bytes) {
+        rw->pending_ignore_overflow = true;
+        return;
+    }
+    atlas_err ignore;
+    atlas_err_init(&ignore);
+    if (atlas_buf_append(&rw->pending_ignore, abs_path, len, &ignore) != ATLAS_OK ||
+        atlas_buf_append_ch(&rw->pending_ignore, '\0', &ignore) != ATLAS_OK) {
+        rw->pending_ignore_overflow = true;
+    } else {
+        rw->pending_ignore_count++;
+    }
+    /* Deliberately does **not** set `ignore_stale`. A new directory means the
+     * inventory is *incomplete* for that path, which is answered by re-reading
+     * it and resolving the queue. `ignore_stale` means the *rules* changed,
+     * which is answered by re-priming the whole repository — a far heavier
+     * thing, and setting it here made every `mkdir` trigger one. */
+}
+
+/* Does this event name something that could change what git ignores?
+ *
+ * Any `.gitignore` at any depth, `info/exclude` under a git directory, and a
+ * HEAD move — because switching branches swaps one branch's ignore rules for
+ * another's without touching a file in the working tree. Each sets
+ * `ignore_stale`, and the next tick re-primes the repository against a fresh
+ * inventory.
+ *
+ * `core.excludesFile` is a stated gap: it normally lives outside the repository
+ * root, and Atlas never watches outside a repository root. A change to it is
+ * picked up by the periodic pass, not immediately. */
+static bool names_ignore_rules(const char *name, bool is_meta) {
+    if (name == NULL) {
+        return false;
+    }
+    if (!is_meta) {
+        return strcmp(name, ".gitignore") == 0;
+    }
+    return strcmp(name, "exclude") == 0 || strcmp(name, "HEAD") == 0 ||
+           strcmp(name, "info") == 0;
+}
+
 static void handle_event(atlas_watcher *w, const struct inotify_event *ev) {
     if ((ev->mask & IN_Q_OVERFLOW) != 0) {
         handle_overflow(w);
@@ -820,17 +2358,70 @@ static void handle_event(atlas_watcher *w, const struct inotify_event *ev) {
     if (s == NULL) {
         return; /* a watch we have already dropped */
     }
-    int64_t repo_id = s->repo_id;
+
+    /* P0. Every subscriber, not one owner.
+     *
+     * A descriptor on a shared git common directory belongs to every worktree
+     * registered against it. The old code stored one `repo_id` per descriptor
+     * and the last installer overwrote it, so a branch update reached exactly
+     * one of two worktrees and the other silently stopped seeing its own refs.
+     * The subscriber list is bounded by the repository count, so this loop is
+     * short and its length is a bound Atlas enforces elsewhere. */
+    int64_t subs[ATLAS_WATCH_MAX_REPOS];
+    uint16_t nsubs = 0;
+    if (s->sub_count > 0) {
+        subs[nsubs++] = s->sub_inline;
+        for (uint16_t i = 0; i + 1u < s->sub_count && nsubs < ATLAS_WATCH_MAX_REPOS; i++) {
+            subs[nsubs++] = s->subs[i];
+        }
+    }
+    if (nsubs == 0) {
+        return;
+    }
+    int64_t repo_id = subs[0];
+    /* Everything else this function needs from the slot, taken now.
+     *
+     * `s` must not be read again after this point. Two things can invalidate it:
+     * `remove_watch_tree` can release the descriptor and reset the slot when
+     * this repository is its last subscriber, and `add_watch_tree` can grow the
+     * map and move every slot to a new allocation. `is_meta` in particular was
+     * read at the end of the function after both had had a chance to run — on a
+     * released slot it reads back false, which would have made a metadata path
+     * be recorded as an indexable one. */
+    const bool slot_is_meta = s->is_meta;
+    const bool slot_shared = s->sub_count > 1u;
+    atlas_buf slot_path = ATLAS_BUF_INIT;
+    {
+        atlas_err perr;
+        atlas_err_init(&perr);
+        if (atlas_buf_set(&slot_path, s->path.data, s->path.len, &perr) != ATLAS_OK) {
+            return;
+        }
+    }
+    s = NULL;
 
     /* IN_IGNORED means the kernel dropped the watch, normally because the
      * directory was deleted. Forget it so the map does not fill with dead wds. */
     if ((ev->mask & IN_IGNORED) != 0) {
-        repo_watch *rw = find_repo(w, repo_id);
-        if (rw != NULL && rw->dirs > 0) {
-            rw->dirs--;
+        const bool shared = slot_shared;
+        for (uint16_t i = 0; i < nsubs; i++) {
+            repo_watch *rw = find_repo(w, subs[i]);
+            if (rw != NULL) {
+                if (slot_is_meta) {
+                    if (rw->meta_dirs > 0) {
+                        rw->meta_dirs--;
+                    }
+                } else if (rw->source_dirs > 0) {
+                    rw->source_dirs--;
+                }
+                if (shared && rw->shared_dirs > 0) {
+                    rw->shared_dirs--;
+                }
+            }
+            mark_dirty(w, subs[i]);
         }
         wd_map_remove(&w->map, ev->wd);
-        mark_dirty(w, repo_id);
+        atlas_buf_free(&slot_path);
         return;
     }
 
@@ -839,40 +2430,62 @@ static void handle_event(atlas_watcher *w, const struct inotify_event *ev) {
     atlas_err ignore;
     atlas_err_init(&ignore);
     if (ev->len > 0) {
-        if (atlas_buf_set(&full, s->path.data, s->path.len, &ignore) == ATLAS_OK &&
+        if (atlas_buf_set(&full, slot_path.data, slot_path.len, &ignore) == ATLAS_OK &&
             atlas_buf_append_ch(&full, '/', &ignore) == ATLAS_OK) {
             (void)atlas_buf_append_str(&full, ev->name, &ignore);
         }
     } else {
-        (void)atlas_buf_set(&full, s->path.data, s->path.len, &ignore);
+        (void)atlas_buf_set(&full, slot_path.data, slot_path.len, &ignore);
     }
 
-    /* Keep the watch set accurate. A directory created or moved in is watched
-     * recursively — otherwise the files inside a directory that appears while
-     * the daemon runs would be invisible until the next periodic pass, which is
-     * exactly the "new work appears in a new directory" case. */
+    /* A directory that appears while the daemon runs is *queued*, not watched.
+     * See `queue_pending_ignore`: the inventory cannot answer for a path that
+     * did not exist when it was built, and watching first would spend the budget
+     * on exactly the trees the inventory exists to skip. Metadata directories —
+     * `info/` appearing under a git dir — are watched straight away, because git
+     * ignore rules have nothing to say about them. */
     if (is_dir && (ev->mask & (IN_CREATE | IN_MOVED_TO)) != 0 && full.len > 0) {
-        repo_watch *rw = find_repo(w, repo_id);
-        if (rw != NULL) {
-            add_ctx ac;
-            memset(&ac, 0, sizeof(ac));
-            ac.w = w;
-            ac.rw = rw;
-            ac.root_len = rw->root.len;
-            ac.is_meta = s->is_meta;
-            atlas_err aerr;
-            atlas_err_init(&aerr);
-            (void)add_watch_tree(&ac, atlas_buf_cstr(&full), &aerr);
-            if (ac.limit_hit || ac.budget_hit) {
-                (void)atlas_writer_submit_gap(
-                    w->writer, repo_id,
-                    "a new directory could not be fully watched because a watch limit was reached",
-                    &aerr);
+        for (uint16_t i = 0; i < nsubs; i++) {
+            repo_watch *rw = find_repo(w, subs[i]);
+            if (rw == NULL) {
+                continue;
+            }
+            if (slot_is_meta) {
+                add_ctx ac;
+                memset(&ac, 0, sizeof(ac));
+                ac.w = w;
+                ac.rw = rw;
+                ac.root_len = rw->root.len;
+                ac.is_meta = true;
+                ac.stop = ATLAS_WATCH_REASON_NONE;
+                atlas_err aerr;
+                atlas_err_init(&aerr);
+                (void)add_watch_tree(&ac, atlas_buf_cstr(&full), &aerr);
+                if (ac_stopped(&ac)) {
+                    rw->degraded = true;
+                    rw->reason = ac.stop;
+                    (void)atlas_buf_set_str(&rw->degraded_detail,
+                                            atlas_watch_reason_explain(ac.stop), &aerr);
+                }
+            } else {
+                queue_pending_ignore(w, rw, atlas_buf_cstr(&full), full.len);
             }
         }
     }
-    if (is_dir && (ev->mask & (IN_DELETE | IN_MOVED_FROM)) != 0 && full.len > 0) {
-        remove_watch_tree(w, atlas_buf_cstr(&full));
+    /* A directory moved *out* of the tree keeps its watches — the kernel sends no
+     * IN_IGNORED, because the descriptors are still valid; they now point
+     * somewhere Atlas does not index. So a move needs the prefix scan.
+     *
+     * A delete does not. The kernel drops every watch under a deleted tree and
+     * reports each one with IN_IGNORED, which the branch above handles in O(1)
+     * through `wd_map_find`. Scanning as well made `rm -rf` of a 5000-directory
+     * subtree cost 5000 full passes over the slot table while the watcher was
+     * not reading from the inotify fd — which is how a queue overflow gets
+     * manufactured, and an overflow gaps *every* repository at once. */
+    if (is_dir && (ev->mask & IN_MOVED_FROM) != 0 && full.len > 0) {
+        for (uint16_t i = 0; i < nsubs; i++) {
+            remove_watch_tree(w, subs[i], atlas_buf_cstr(&full));
+        }
     }
 
     /* Cookie pairing. Both halves already mark the repository dirty, so this is
@@ -889,24 +2502,53 @@ static void handle_event(atlas_watcher *w, const struct inotify_event *ev) {
         }
     }
 
-    /* A move of the watched directory itself invalidates every path below it. */
+    /* A move of the watched directory itself invalidates every path below it.
+     *
+     * The prefix is copied out of the slot before the loop, and it has to be:
+     * the first subscriber to leave may be the last one, in which case
+     * `remove_watch_tree` releases the descriptor and resets `s->path` — so the
+     * next iteration would pass an **empty** prefix, which matches every watch
+     * in the map and would unsubscribe that repository from all of them. */
     if ((ev->mask & (IN_MOVE_SELF | IN_DELETE_SELF)) != 0) {
-        remove_watch_tree(w, atlas_buf_cstr(&s->path));
+        atlas_buf self = ATLAS_BUF_INIT;
+        if (atlas_buf_set(&self, slot_path.data, slot_path.len, &ignore) == ATLAS_OK &&
+            self.len > 0) {
+            for (uint16_t i = 0; i < nsubs; i++) {
+                remove_watch_tree(w, subs[i], atlas_buf_cstr(&self));
+            }
+        }
+        atlas_buf_free(&self);
+    }
+
+    /* P0. Did this event change what git ignores? If so the inventory is stale
+     * and the repository is re-primed against a fresh one on the next tick. */
+    if (ev->len > 0 && names_ignore_rules(ev->name, slot_is_meta)) {
+        for (uint16_t i = 0; i < nsubs; i++) {
+            repo_watch *rw = find_repo(w, subs[i]);
+            if (rw != NULL) {
+                rw->ignore_stale = true;
+            }
+        }
     }
 
     /* Name the path, so the pass hashes it whatever its metadata says. Only for
      * working-tree watches: a change under .git is a reason to reconcile, but it
      * is not itself an indexable path. A directory event names no file — the
      * files inside it are found by the pass. */
-    if (!s->is_meta && !is_dir && full.len > 0) {
-        repo_watch *rw = find_repo(w, repo_id);
-        if (rw != NULL) {
-            note_dirty_path(rw, atlas_buf_cstr(&full), full.len);
+    if (!slot_is_meta && !is_dir && full.len > 0) {
+        for (uint16_t i = 0; i < nsubs; i++) {
+            repo_watch *rw = find_repo(w, subs[i]);
+            if (rw != NULL) {
+                note_dirty_path(rw, atlas_buf_cstr(&full), full.len);
+            }
         }
     }
 
-    mark_dirty(w, repo_id);
+    for (uint16_t i = 0; i < nsubs; i++) {
+        mark_dirty(w, subs[i]);
+    }
     atlas_buf_free(&full);
+    atlas_buf_free(&slot_path);
 }
 
 /* --- the loop ------------------------------------------------------------ */
@@ -1302,11 +2944,38 @@ static void *watcher_main(void *arg) {
         if (atlas_writer_take_watch_dirty(w->writer)) {
             atlas_err rerr;
             atlas_err_init(&rerr);
+            /* P0. A rebuild drops every watch and reinstalls it, and events that
+             * land in that window are gone: the kernel had no descriptor to
+             * report them on. Nothing used to record that, so a repository came
+             * out of a rebuild reported as `watching` with a hole in its
+             * history that no later pass had any reason to look for.
+             *
+             * Every repository is therefore owed a content-verifying pass after
+             * a rebuild. It is charged before `rebuild_watches` runs, so the
+             * obligation exists even if the rebuild itself fails. */
+            for (size_t i = 0; i < w->repo_count; i++) {
+                atlas_err gerr;
+                atlas_err_init(&gerr);
+                (void)atlas_writer_submit_gap(
+                    w->writer, w->repos[i].repo_id,
+                    "the watch set was rebuilt after a repository-set change, so events during "
+                    "the rebuild were not observed and a full reconciliation is required",
+                    &gerr);
+            }
             if (rebuild_watches(w, &rerr) != ATLAS_OK) {
                 atlas_daemon_log(w->log, "error", "cannot rebuild the watch set: %s",
                                  atlas_err_msg(&rerr));
             }
+            for (size_t i = 0; i < w->repo_count; i++) {
+                atlas_err serr;
+                atlas_err_init(&serr);
+                (void)atlas_writer_submit_reconcile(w->writer, w->repos[i].repo_id, true, false,
+                                                    NULL, 0u, NULL, &serr);
+                w->repos[i].last_submit_ms = now_ms();
+            }
         }
+        resolve_pending_ignores(w);
+        continue_priming(w);
         submit_due(w);
         recover_due(w);
         /* After `submit_due`, deliberately: the semantic sweep holds while the
@@ -1314,9 +2983,7 @@ static void *watcher_main(void *arg) {
          * even been queued would only ever produce that hold. */
         discovery_sweep(w);
         sem_sweep(w);
-        (void)pthread_mutex_lock(&w->stat_lock);
-        w->watch_count = (int64_t)w->map.count;
-        (void)pthread_mutex_unlock(&w->stat_lock);
+        refresh_stats(w);
     }
 
     free(buf);
@@ -1327,9 +2994,16 @@ static void *watcher_main(void *arg) {
 
 /* --- lifecycle ----------------------------------------------------------- */
 
+void atlas_watcher_opts_init(atlas_watcher_opts *o) { memset(o, 0, sizeof(*o)); }
+
 atlas_status atlas_watcher_start(const char *db_path, atlas_writer *writer, FILE *log,
-                                 bool orch_enabled, int reconcile_interval_ms,
-                                 atlas_watcher **out, atlas_err *err) {
+                                 const atlas_watcher_opts *opts, atlas_watcher **out,
+                                 atlas_err *err) {
+    atlas_watcher_opts defaults;
+    atlas_watcher_opts_init(&defaults);
+    if (opts == NULL) {
+        opts = &defaults;
+    }
     *out = NULL;
     atlas_watcher *w = calloc(1u, sizeof(*w));
     if (w == NULL) {
@@ -1341,18 +3015,54 @@ atlas_status atlas_watcher_start(const char *db_path, atlas_writer *writer, FILE
     w->wake_fd[1] = -1;
     w->writer = writer;
     w->log = log;
-    w->orch_enabled = orch_enabled;
-    w->reconcile_interval_ms =
-        reconcile_interval_ms > 0 ? reconcile_interval_ms : ATLAS_WATCH_RECONCILE_INTERVAL_MS;
+    w->orch_enabled = opts->orch_enabled;
+    w->system_deployment = opts->system_deployment;
+    w->reconcile_interval_ms = opts->reconcile_interval_ms > 0
+                                   ? opts->reconcile_interval_ms
+                                   : ATLAS_WATCH_RECONCILE_INTERVAL_MS;
+    /* Zero means the compiled bound, for every one of these. */
+    w->max_repos =
+        opts->inject_max_repos > 0 ? opts->inject_max_repos : (size_t)ATLAS_WATCH_MAX_REPOS;
+    if (w->max_repos > (size_t)ATLAS_WATCH_MAX_REPOS) {
+        /* Clamped, because `handle_event` snapshots subscribers into a stack
+         * array sized by the *compiled* ceiling. Injection exists to make a
+         * bound smaller and reachable in a test; letting it make one larger
+         * would turn a test channel into a buffer overflow. */
+        w->max_repos = (size_t)ATLAS_WATCH_MAX_REPOS;
+    }
+    w->max_pending_ignore = opts->inject_max_pending_ignore > 0
+                                ? opts->inject_max_pending_ignore
+                                : (size_t)ATLAS_WATCH_MAX_PENDING_IGNORE;
+    w->max_pending_ignore_bytes = opts->inject_max_pending_ignore_bytes > 0
+                                      ? opts->inject_max_pending_ignore_bytes
+                                      : (size_t)ATLAS_WATCH_MAX_PENDING_IGNORE_BYTES;
     atomic_init(&w->stop, false);
     if (pthread_mutex_init(&w->stat_lock, NULL) != 0) {
         free(w);
         return atlas_err_set(err, ATLAS_ERR_INTERNAL, "cannot create the watcher mutex");
     }
 
+    /* P0. The budget is resolved here and re-resolved on every rebuild, because
+     * `fs.inotify.max_user_watches` and the root-owned policy can both change
+     * under a running daemon. The map does not depend on it: it grows on demand,
+     * so a raised budget can never turn into "the watch map is full". */
+    resolve_budget(w, opts->inject_budget_total);
+    w->budget_injected = opts->inject_budget_total;
+    /* Published before the thread exists, so a status call that arrives before
+     * the first rebuild reports the real budget rather than zero. */
+    w->stat_budget_total = w->budget_total;
+    w->stat_budget_repo = w->budget_repo;
+    w->stat_kernel_max = w->kernel_max;
+    w->stat_budget_from_policy = w->budget_from_policy;
+
     atlas_status st = atlas_buf_set_str(&w->db_path, db_path, err);
     if (st == ATLAS_OK) {
-        st = wd_map_init(&w->map, (size_t)ATLAS_WATCH_MAX_DIRS * 4u, err);
+        /* Small, and grown on demand by `wd_map_grow`. Sizing it for the whole
+         * resolved budget up front made a daemon with no repositories resident
+         * for tens of megabytes on any machine with a large sysctl, and made
+         * every `remove_watch_tree` scan proportional to the budget rather than
+         * to the watches actually held. */
+        st = wd_map_init(&w->map, 4096u, err);
     }
     if (st == ATLAS_OK) {
         w->inotify_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
@@ -1413,14 +3123,23 @@ void atlas_watcher_stop(atlas_watcher *w) {
     free(w);
 }
 
-int64_t atlas_watcher_watch_count(atlas_watcher *w) {
+void atlas_watcher_stats(atlas_watcher *w, atlas_watch_stats *out) {
+    memset(out, 0, sizeof(*out));
     if (w == NULL) {
-        return 0;
+        return;
     }
+    /* Every field here is written on the watcher thread and read from the serve
+     * loop, so all of them are taken under the one lock — including the budget,
+     * which a rebuild recomputes. */
     (void)pthread_mutex_lock(&w->stat_lock);
-    int64_t n = w->watch_count;
+    out->watches = w->watch_count;
+    out->subscriptions = w->sub_count;
+    out->priming_complete = w->priming_complete;
+    out->budget_total = w->stat_budget_total;
+    out->budget_repo = w->stat_budget_repo;
+    out->kernel_max = w->stat_kernel_max;
+    out->budget_from_policy = w->stat_budget_from_policy;
     (void)pthread_mutex_unlock(&w->stat_lock);
-    return n;
 }
 
 bool atlas_watcher_primed(atlas_watcher *w) {

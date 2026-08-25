@@ -1165,10 +1165,27 @@ static void writer_run_job(atlas_writer *w, atlas_job *j) {
     case ATLAS_JOB_SET_WATCH: {
         atlas_err ignore;
         atlas_err_init(&ignore);
-        (void)atlas_db_index_state_set_watch(w->db, j->repo_id,
-                                             (atlas_watch_state)j->watch_state,
-                                             j->arg1.len > 0 ? atlas_buf_cstr(&j->arg1) : NULL,
-                                             j->watched_dirs, &ignore);
+        const char *detail = j->arg1.len > 0 ? atlas_buf_cstr(&j->arg1) : NULL;
+        /* P0. Gap flags first, then the outcome, and the order is the point.
+         *
+         * `mark_gap` also sets `watch_state='incomplete'`, which is right for
+         * its other callers — a queue overflow, a failed pass — and wrong here,
+         * because the watcher knows something more specific and has a reason
+         * code for it. Writing the outcome second lets the gap flags stand while
+         * the state and the reason are the watcher's. Both statements run on
+         * this thread inside one job, so nothing can interleave between them. */
+        if (j->watch_mark_gap) {
+            (void)atlas_db_index_state_mark_gap(w->db, j->repo_id, detail, &ignore);
+        }
+        atlas_watch_outcome outcome;
+        atlas_watch_outcome_init(&outcome);
+        outcome.state = (atlas_watch_state)j->watch_state;
+        outcome.reason = (atlas_watch_reason)j->watch_reason;
+        outcome.detail = detail;
+        outcome.source_dirs = j->watched_source;
+        outcome.meta_dirs = j->watched_meta;
+        outcome.shared_dirs = j->watched_shared;
+        (void)atlas_db_index_state_set_watch(w->db, j->repo_id, &outcome, &ignore);
         break;
     }
     default: break;
@@ -1569,15 +1586,21 @@ atlas_status atlas_writer_submit_reconcile(atlas_writer *w, int64_t repo_id, boo
  * blocked on the writer would stop draining inotify, which is how a queue
  * overflow gets manufactured. */
 static atlas_status submit_note(atlas_writer *w, atlas_job_kind kind, int64_t repo_id,
-                                const char *detail, int watch_state, int64_t watched_dirs,
-                                atlas_err *err) {
+                                const char *detail, const atlas_watch_outcome *outcome,
+                                bool mark_gap, atlas_err *err) {
     atlas_job *j = job_new(kind);
     if (j == NULL) {
         return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory queueing a watcher note");
     }
     j->repo_id = repo_id;
-    j->watch_state = watch_state;
-    j->watched_dirs = watched_dirs;
+    if (outcome != NULL) {
+        j->watch_state = (int)outcome->state;
+        j->watch_reason = (int)outcome->reason;
+        j->watched_source = outcome->source_dirs;
+        j->watched_meta = outcome->meta_dirs;
+        j->watched_shared = outcome->shared_dirs;
+    }
+    j->watch_mark_gap = mark_gap;
     atlas_status st = atlas_buf_set_str(&j->arg1, detail != NULL ? detail : "", err);
     if (st != ATLAS_OK) {
         job_free(j);
@@ -1598,13 +1621,13 @@ static atlas_status submit_note(atlas_writer *w, atlas_job_kind kind, int64_t re
 
 atlas_status atlas_writer_submit_gap(atlas_writer *w, int64_t repo_id, const char *detail,
                                      atlas_err *err) {
-    return submit_note(w, ATLAS_JOB_MARK_GAP, repo_id, detail, 0, 0, err);
+    return submit_note(w, ATLAS_JOB_MARK_GAP, repo_id, detail, NULL, false, err);
 }
 
-atlas_status atlas_writer_submit_watch_state(atlas_writer *w, int64_t repo_id, int watch_state,
-                                             const char *detail, int64_t watched_dirs,
-                                             atlas_err *err) {
-    return submit_note(w, ATLAS_JOB_SET_WATCH, repo_id, detail, watch_state, watched_dirs, err);
+atlas_status atlas_writer_submit_watch_outcome(atlas_writer *w, int64_t repo_id,
+                                               const atlas_watch_outcome *outcome, bool mark_gap,
+                                               atlas_err *err) {
+    return submit_note(w, ATLAS_JOB_SET_WATCH, repo_id, outcome->detail, outcome, mark_gap, err);
 }
 
 static atlas_status writer_call_impl(atlas_writer *w, atlas_job_kind kind, const char *arg1,

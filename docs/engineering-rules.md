@@ -3188,3 +3188,129 @@ gateway route, no second submit path. No new isolation: a planner job and a side
 task are workspace jobs under A8's existing isolation, and a stage's tree task is
 an ordinary A11.1 repo-tree task. No repo-tree driver was added, which is why the
 index predicate that keeps the registered tree exclusive did not have to move.
+
+## P0 layers — additions
+
+```
+src/daemon/watch.c      the whole of it: the subscriber-set watch map, the budget
+                        resolution, the two-phase build, the resumable frontier,
+                        the ignore inventory and the pending-decision queue
+src/db/db_state.c       the watch reason vocabulary, and the one writer of a
+                        watch outcome
+src/db/migrate.c        migration 26: `priming`, `watch_reason`, and the split
+                        counts, by table rebuild with row-preservation verified
+src/core/syspolicy.c    `watch_max_dirs_total`, and the kernel share the
+                        deployment shape implies
+```
+
+Nothing outside `src/daemon/watch.c` decides how many watches exist. The policy
+states a number, the kernel enforces its own, and the watcher does the
+arithmetic in one place.
+
+## P0 rules — these are not negotiable
+
+- **A DOCUMENTED BOUND THAT IS NOT THE IMPLEMENTED BOUND IS WORSE THAN NO
+  BOUND.** `ATLAS_WATCH_MAX_DIRS` was documented as 8192 per repository and
+  enforced as `w->map.count + 1 >= 8192` against the *daemon-global* count. It
+  was therefore 8191, daemon-wide, and the repository that lost was chosen by
+  `ORDER BY name`. On a machine offering 122,910 watches Atlas stopped at 8,191
+  and told the losing repository it had more directories than Atlas will watch —
+  a sentence with no true clause in it. The number was in `daemon status` the
+  whole time and read as a configuration, not as a defect.
+- **Compare with `>=`, never `+ 1 >=`.** Exactly N watches install at a budget of
+  N. `tests/test_watch_budget.c` asserts the equality rather than a bound,
+  because `<= N` would have passed against the defect.
+- **A bound on work and a bound on a resource are different bounds, and each
+  says which it is.** The walk's visit ceiling and the watch budget shared one
+  boolean and produced one sentence. `atlas_watch_reason` is a closed vocabulary
+  precisely so "raise the sysctl", "this daemon is out of budget" and "this walk
+  went too far" can never again be the same answer. `UNKNOWN` is zero and means
+  *no reason was stated*; `NONE` is the positive claim and only a complete watch
+  set may carry it.
+- **The budget is derived from the kernel, not compiled.** A watch budget written
+  into a header is a guess about a machine its author never saw, and the guess
+  Atlas shipped was 8192. The share is 50% under a root-owned system policy and
+  20% otherwise, because A7.1's `atlasd` has no other consumer of its inotify
+  budget and a per-user daemon shares the uid with every editor the operator
+  runs. A policy may state a total; out of range is **MALFORMED, never clamped**,
+  and a malformed policy falls back to legacy mode — which removes every
+  `client_uid` from the socket, so the binary is installed before the key.
+- **Correctness-critical watches are installed first, for every repository,
+  before any source tree.** Metadata went in *after* the recursive source walk,
+  so a repository large enough to exhaust the budget stopped watching its own
+  `HEAD`. Branch correctness must not be contingent on the source tree fitting.
+  The reserve is a floor and `ATLAS_WATCH_META_MAX_PER_REPO` is the ceiling;
+  making the reserve the cap would recreate 8192 one layer down.
+- **There is no fixed per-repository cap, and allocation is order-independent.**
+  Each round divides the remaining pool among the repositories that still want
+  watches, and one that finishes under its share returns the remainder. A single
+  large repository alone gets the whole budget; several large ones share it
+  without any of them being told it is too big.
+- **A physical watch descriptor and a logical subscription are different things.**
+  `inotify_add_watch` on an already-watched path returns the same descriptor. The
+  old map stored one `repo_id` per descriptor and the last installer overwrote
+  it, so of two registered worktrees of one repository only one ever received a
+  shared-ref event, and removing either released a descriptor the survivor was
+  relying on. Charge on a new subscription, release at the last one, fan out to
+  all of them, and **never claim `sum(per-repo) == total`** — the relation is
+  `>=` and `watched_shared` is what explains it.
+- **THE IGNORE INVENTORY IS NOT AN AUTHORITY ON A PATH THAT DID NOT EXIST WHEN IT
+  WAS READ.** `git ls-files` enumerates the filesystem, so a `build/` rule with
+  no `build/` on disk produces no entry. Carrying the inventory forward — the
+  obvious fix, and the one the first review caught — would have answered "not
+  ignored" with confidence for exactly the case the mechanism exists to handle.
+  A directory Atlas has not seen is not watched and not descended into; it waits
+  in a bounded queue while **one** `git ls-files` per debounce tick answers for
+  the whole queue. `git check-ignore` is not used and is not on the allowlist:
+  its `-z` requires `--stdin`, and `atlas_proc` gives every child `/dev/null` for
+  stdin.
+- **Waiting is an event gap, and it is recorded as one.** Nothing under a queued
+  directory is watched while it waits. While the queue is non-empty the
+  repository is `priming` and its index is **not current**; a directory that
+  turns out to be visible leaves the repository owing a content-verifying pass.
+  The same applies to every window in which the watch set is being rebuilt — a
+  repository-set change, an ignore-rule change — and none of them may end in
+  `watching`, `event_gap=false` or `index_current=true` until a full pass has
+  actually completed.
+- **`info/exclude` needs its own subscription.** An inotify directory watch
+  reports its direct children only: watching `.git` produces events for
+  `.git/config` and **nothing at all** for `.git/info/exclude`. Verified by
+  experiment before the code was written, because the opposite was assumed in a
+  draft of this plan and was wrong. It resolves to the *common* directory even
+  from a linked worktree, so one descriptor serves every worktree sharing it —
+  which the subscriber set makes safe.
+- **`core.excludesFile` is a stated cost, not a solved problem.** It normally
+  lives outside the repository root and Atlas never watches outside a repository
+  root. A change to it is picked up by the periodic pass.
+- **Priming is resumable and yields.** The watcher does not poll inotify while it
+  walks, and `IN_Q_OVERFLOW` is global to the instance — one repository's priming
+  could gap every repository at once. The frontier is depth-first so popping
+  truncates and reclaims, and it lives on the repository so a walk can be
+  suspended; a walk that runs to completion inside one call gets its **own**
+  frontier, because borrowing the repository's would silently discard a suspended
+  one. The measured 0.15 s walk of a 31,611-directory tree is **not** the reason
+  this is safe; chunking is.
+- **`priming` is neither watched nor degraded.** Counting it as watched would let
+  `watching == repositories` be true with part of a tree unobserved; counting it
+  as degraded would make every ordinary startup look like a fault.
+- **The proven envelope and the hard ceiling are different fields.**
+  `ATLAS_WATCH_DIRS_HARD_CEILING` is where a configured value is refused;
+  `ATLAS_WATCH_PROVEN_ENVELOPE_DIRS` is what was measured, and it is the only
+  figure documentation may claim — and only where the resolved budget actually
+  reaches it. A machine whose kernel or policy resolves lower reports its own
+  effective envelope and claims nothing beyond it.
+- **The test channel is not a public surface.** A boundary test needs a small
+  budget, and a CLI flag or environment variable for it would be a second answer
+  to a question `/etc/atlas/system.conf` owns, reachable by anyone who can start
+  a daemon. It travels on `atlas_daemon_opts` and reaches the watcher's own
+  parameter; an injected value replaces the resolved total and nothing else, so
+  the comparison, allocation and accounting under test are production's.
+- **One writer for a watch outcome.** The healthy path wrote a count and the
+  degraded path did not, so a degraded repository reported whatever it held the
+  last time things went well. State, reason, detail and all three counts travel
+  as one struct through one function, and the gap flags are written in the same
+  job so they cannot reorder against it.
+- **No new thread, process, timer or background loop; no new RPC method, MCP tool
+  or gateway route.** Every new field is additive on the wire except
+  `watched_directories`, whose *value* semantics changed — and that is recorded
+  as a compatibility change rather than described as additive.

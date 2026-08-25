@@ -18,6 +18,7 @@
 #include <unistd.h>
 
 #include "atlas/atlas.h"
+#include "atlas/limits.h"
 #include "atlas/rootpath.h"
 
 /* A policy is a handful of `key = value` lines. The bound is small because the
@@ -91,6 +92,42 @@ bool atlas_syspolicy_semantic_auto_default(const atlas_syspolicy *p) {
         break;
     }
     return ATLAS_SEM_AUTO_DEFAULT;
+}
+
+/* P0. Same shape and the same argument as the accessor above: the policy's
+ * answer where it gives one, and "no statement" where it does not. The caller
+ * turns a zero into a kernel-derived default, because that derivation needs a
+ * runtime value this struct has no business holding. */
+long long atlas_syspolicy_watch_max_dirs_total(const atlas_syspolicy *p) {
+    if (p == NULL) {
+        return 0;
+    }
+    return p->watch_max_dirs_total;
+}
+
+/* A9.2.4's accessor is deliberately insensitive to `state`; this one is not.
+ *
+ * A budget is only ever consulted for a daemon that serves the system index, and
+ * a policy that failed to parse is one whose author configured something Atlas
+ * did not read — A7's rule. Returning a value taken from a line before the
+ * malformed one would honour half a policy every other consumer treats as
+ * absent. */
+long long atlas_syspolicy_watch_max_dirs_total_checked(const atlas_syspolicy *p) {
+    if (p == NULL || p->state != ATLAS_SYSPOLICY_SYSTEM) {
+        return 0;
+    }
+    return p->watch_max_dirs_total;
+}
+
+bool atlas_syspolicy_watch_budget_in_range(long long v) {
+    return v >= (long long)ATLAS_WATCH_TOTAL_MIN && v <= (long long)ATLAS_WATCH_DIRS_HARD_CEILING;
+}
+
+unsigned atlas_syspolicy_watch_kernel_share_pct(const atlas_syspolicy *p) {
+    if (p != NULL && p->state == ATLAS_SYSPOLICY_SYSTEM) {
+        return ATLAS_WATCH_KERNEL_SHARE_PCT_SYSTEM;
+    }
+    return ATLAS_WATCH_KERNEL_SHARE_PCT_USER;
 }
 
 /* --- parsing ---------------------------------------------------------------
@@ -287,6 +324,19 @@ void atlas_syspolicy_load_at(const char *path, atlas_syspolicy *out) {
                 out->reason = ATLAS_SYSPOLICY_REASON_MALFORMED;
                 return;
             }
+        } else if (take_value(line, len, "watch_max_dirs_total", &val, &vlen)) {
+            /* P0. Range-checked and refused, never clamped — `client_uid`'s rule
+             * one line up, for the same reason. An operator who asked for a
+             * budget Atlas quietly replaced with a different one cannot read
+             * back what they configured, and a watch budget is exactly the sort
+             * of number somebody sets once and then reasons from for a year. */
+            long long v = 0;
+            if (!parse_uid(val, vlen, &v) || v < (long long)ATLAS_WATCH_TOTAL_MIN ||
+                v > (long long)ATLAS_WATCH_DIRS_HARD_CEILING) {
+                out->reason = ATLAS_SYSPOLICY_REASON_MALFORMED;
+                return;
+            }
+            out->watch_max_dirs_total = v;
         } else {
             /* An unrecognised key is malformed rather than ignored. A policy
              * Atlas half-understands is one whose author believes they

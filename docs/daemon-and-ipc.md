@@ -441,7 +441,12 @@ one place, `include/atlas/limits.h`.
 | writer queue | 4096 jobs | submission refused, with backpressure reported |
 | worker threads | min(4, cores), max 8 | — |
 | rows per write transaction | 256 | the transaction commits and a new one begins |
-| inotify watches per repository | 8192 | degraded state, full reconciliation scheduled |
+| inotify watches, daemon-wide | derived; see below | degraded state with a reason code, full reconciliation scheduled |
+| git metadata watches per repository | 256 reserved, 16384 maximum | `meta_budget` |
+| directories awaiting an ignore decision | 4096 / 1 MiB | `pending_ignore_overflow` |
+| ignored directory entries per repository | 65536 / 8 MiB | `ignore_overflow` |
+| repositories one watcher observes | 256 | `repo_limit` |
+| priming frontier | 32 MiB of pending path | `frontier_overflow` |
 | discovered files per pass | 20000 | `truncated` with a reason |
 | candidate paths per pass | 250000 | `truncated` with a reason |
 | debounce window | 400 ms, capped at 5 s | — |
@@ -449,6 +454,116 @@ one place, `include/atlas/limits.h`.
 | retained raw events per repository | 20000 | oldest pruned; **evidence is never pruned** |
 | bytes hashed per file | 256 MiB | recorded with `truncated` and a reason |
 | git output / timeout | 64 MiB / 120 s | the pass fails and is retried |
+
+## The watch budget
+
+Until P0 this table said **"inotify watches per repository — 8192"**. It was
+wrong in three ways at once, and the wrongness was visible in production for
+weeks without reading as a bug.
+
+The check was `w->map.count + 1 >= ATLAS_WATCH_MAX_DIRS`, and `map.count` is the
+**daemon-global** watch count. So the bound was not per repository; and `+ 1 >=`
+made the real ceiling 8191, which is exactly the number `daemon status` reported.
+Repositories were served in `ORDER BY name`, so which repository was left
+degraded was decided by its name. On a machine whose kernel offered 122,910
+watches, Atlas stopped at 8,191 and told the losing repository it had *more
+directories than Atlas will watch* — a sentence in which nothing was true.
+
+### How the budget is resolved
+
+```
+K              = fs.inotify.max_user_watches       (read at startup and on each rebuild)
+share          = 50%  when the root-owned policy puts this daemon in system mode
+                 20%  otherwise
+kernel_derived = clamp(K * share, ATLAS_WATCH_TOTAL_MIN, ATLAS_WATCH_TOTAL_SOFT_MAX)
+effective      = min(policy watch_max_dirs_total OR kernel_derived,
+                     ATLAS_WATCH_DIRS_HARD_CEILING)
+```
+
+Derived rather than compiled, because a watch budget written into a header is a
+guess about a machine its author never saw. The two shares are the deployment
+distinction Atlas already knows: under A7.1 a system daemon runs as its own
+`atlasd` with no other consumer of that uid's inotify budget, while a per-user
+daemon shares the uid with the operator's editor, IDE and language servers.
+
+A root-owned `/etc/atlas/system.conf` may state `watch_max_dirs_total`. A value
+outside `[1024, 262144]` is **MALFORMED, not clamped** — and a malformed policy
+falls back to legacy mode entirely, which on a system deployment removes every
+`client_uid` from the socket. Install a new binary before adding the key.
+
+A policy value above what the kernel will grant is allowed: root may also raise
+the sysctl, and the kernel then refuses with `ENOSPC`, which is reported as
+`kernel_limit` rather than as an Atlas budget.
+
+### Allocation between repositories
+
+Two phases, across every repository:
+
+1. **Metadata first.** Every repository's git directory, common directory,
+   `info/` and `refs/` tree, drawing on a reserve of 256 held back for it. Before
+   P0 these went in *after* the source walk, so a repository whose tree exhausted
+   the budget stopped watching its own `HEAD` — branch correctness was contingent
+   on the source tree fitting.
+2. **Source trees, by rounds.** Each round divides the remaining pool among the
+   repositories that still want watches, **after setting aside what each of them
+   still owes its metadata reserve**. A repository that finishes under its share
+   returns the remainder automatically, so a single large repository alone
+   receives the whole budget and no repository's completeness depends on where
+   its name sorts.
+
+The reserve is held back on *every* round, not only the first. Meta-first
+ordering alone covers the initial build and nothing after it: a `.git/info`
+created live, or a new `refs/` subdirectory after a branch is pushed, would find
+the budget already spent. Without the reserve, "branch correctness does not
+depend on the source tree fitting" would be true for the first minute and false
+afterwards.
+
+When the whole budget is smaller than the reserve — a badly under-provisioned
+machine — Atlas says so once, with both numbers, and then installs what fits:
+metadata takes what there is and source is told `total_budget`. The reserve is a
+target for what source may not take, not a precondition for starting. An earlier
+draft degraded every repository in that situation without installing anything,
+which threw away the metadata watches that were still affordable and were the
+ones that mattered most.
+
+### The supported scale, and the ceiling, are different numbers
+
+| Field | Value | What it is |
+| --- | --- | --- |
+| `ATLAS_WATCH_DIRS_HARD_CEILING` | 262144 | the compiled point past which a configured value is **refused**. Not a support claim. |
+| `ATLAS_WATCH_PROVEN_ENVELOPE_DIRS` | 65536 | the acceptance-measured envelope, in a deep and a wide tree shape |
+
+**Documentation may claim the envelope and nothing more**, and the claim holds
+only where the resolved `effective_total` actually reaches it. On a machine whose
+kernel or policy budget resolves lower, `daemon status` reports the effective
+figure and Atlas claims nothing beyond it. Raising the envelope needs an isolated
+acceptance environment and a re-run of `scripts/perf-watch.sh`, not an edit here.
+
+### The cost, measured
+
+60,000 fresh directories, then 60,000 watches with Atlas' exact mask, taken from
+`/proc/meminfo` Slab deltas in two phases: **1452 B** per directory for the inode
+and dentry a watch then *pins* against reclaim, plus **67 B** for the mark
+itself — **about 1.5 KiB per watched directory**. The commonly repeated figure of
+one kilobyte is an under-estimate, and a budget built on it costs half again what
+it advertises. Userspace adds roughly 218 B per watch.
+
+### Watches and subscriptions are different numbers
+
+`watches` counts **physical** inotify descriptors — what the kernel holds and
+what it charges against `max_user_watches`. `watch_subscriptions` counts
+`(repository, descriptor)` pairs.
+
+They are equal only when nothing is shared, and two registered worktrees of one
+repository share every descriptor on their common git directory. So:
+
+```
+sum(per-repository watched_directories) == watch_subscriptions >= watches
+```
+
+The `>=` is not a hedge. Any surface that treats the two as one number is wrong
+for exactly the case linked worktrees create, and `watched_shared` is reported
+per repository so the difference is readable rather than looking like an error.
 
 ## Client fallback
 

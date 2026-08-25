@@ -158,6 +158,7 @@ add_custom_command(
 add_library(atlas_core STATIC
   src/core/error.c
   src/core/buf.c
+  src/core/scanner_uid.c
   src/core/sha256.c
   src/core/hmac.c
   src/core/util.c

@@ -365,8 +365,15 @@ static atlas_orch_op *worker_op(atlas_orch_op_kind kind, const char *token) {
 }
 
 /* A job may not succeed straight out of LEASED — the transition table has no
- * such edge — so every attempt walks the phases a real dispatcher walks. */
-static void advance_to_running(env *e, const char *token) {
+ * such edge — so every attempt walks the phases a real dispatcher walks.
+ *
+ * `expires_out`, when given, receives the expiry the **last** of those
+ * heartbeats stored. A case that wants a moment after a lease has run out has to
+ * ask the renewal rather than the grant: every heartbeat renews, writing
+ * `expires_ms = at_ms + ATLAS_ORCH_LEASE_MS` from the wall clock, so the expiry
+ * a lease was granted with is already stale by the time the worker reports
+ * RUNNING. */
+static void advance_to_running_exp(env *e, const char *token, int64_t *expires_out) {
     static const atlas_orch_state FORWARD[] = {ATLAS_ORCH_STATE_PREPARING,
                                                ATLAS_ORCH_STATE_RUNNING};
     for (size_t i = 0; i < sizeof FORWARD / sizeof FORWARD[0]; i++) {
@@ -374,8 +381,15 @@ static void advance_to_running(env *e, const char *token) {
         op->phase = FORWARD[i];
         atlas_orch_result r;
         apply_ok(e, op, &r);
+        if (expires_out != NULL) {
+            *expires_out = r.expires_ms;
+        }
         atlas_orch_result_free(&r);
     }
+}
+
+static void advance_to_running(env *e, const char *token) {
+    advance_to_running_exp(e, token, NULL);
 }
 
 /* One heartbeat with the clock supplied, and the job state it answered with.
@@ -916,11 +930,26 @@ static void test_recovery_judges_each_task_by_its_own_rules_and_waits_for_the_re
     submit(&e, &sib_s, NULL, &sib);
 
     atlas_buf root_tok = ATLAS_BUF_INIT, sib_tok = ATLAS_BUF_INIT;
+    /* The expiry each lease *ends up with*, read back from the last heartbeat of
+     * its phase walk — not the one it was granted with. Walking the phases
+     * renews the lease twice against the wall clock, so a grant-time expiry is
+     * an expiry no row holds any more: the sibling is leased last, and its two
+     * renewals push its stored expiry past `max(grants) + 1`, so the sweep below
+     * would find only the chain's lease expired. Measured under
+     * ThreadSanitizer, where a renewal costs a whole millisecond: grants at
+     * ...983, stored expiry ...986, `now_ms` ...984 — `expired` 1 rather than 2,
+     * and three further assertions failing behind it. On the release build the
+     * renewals land inside the grant's own millisecond and it passed, which is
+     * what made this look like a sanitizer problem rather than a stale read. */
     int64_t root_exp = 0, sib_exp = 0;
-    (void)lease(&e, atlas_buf_cstr(&root), "fake-repo", &root_tok, &root_exp);
-    advance_to_running(&e, atlas_buf_cstr(&root_tok));
-    (void)lease(&e, NULL, "fake", &sib_tok, &sib_exp);
-    advance_to_running(&e, atlas_buf_cstr(&sib_tok));
+    (void)lease(&e, atlas_buf_cstr(&root), "fake-repo", &root_tok, NULL);
+    advance_to_running_exp(&e, atlas_buf_cstr(&root_tok), &root_exp);
+    (void)lease(&e, NULL, "fake", &sib_tok, NULL);
+    advance_to_running_exp(&e, atlas_buf_cstr(&sib_tok), &sib_exp);
+    /* A renewal that did not report one would leave a zero here and the sweep
+     * would then be asked about a moment before either lease existed, which is a
+     * different case that happens to fail the same assertions. */
+    T_REQUIRE(root_exp > 0 && sib_exp > 0);
 
     {
         atlas_orch_op *op = atlas_orch_op_new(ATLAS_ORCH_OP_RECOVER);

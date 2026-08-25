@@ -1,153 +1,99 @@
 # Atlas
 
-Atlas is a headless engineering-memory and repository-intelligence application
-written in C17. It indexes Git repositories into a local SQLite database and
-answers questions about them from the command line, over a local daemon socket,
-through a Model Context Protocol server, or through an authenticated HTTP
-gateway — in human-readable text or in stable JSON.
+> Evidence-backed engineering memory and repository intelligence for
+> AI-assisted software development.
 
-Atlas is generic. It knows nothing about any particular project; a repository
-becomes interesting to Atlas only when an operator registers it.
+Atlas is a local, headless C17 application that indexes Git repositories into a
+rebuildable SQLite database. It gives developers and AI tools a shared view of
+code, history, decisions, evidence, coverage and staleness through a CLI, local
+daemon, MCP server and authenticated HTTP gateway.
 
-**Atlas never modifies a repository you register.** Every Git command it runs is
-checked against a read-only allowlist before the process is created, hooks and
-external diff drivers are disabled, and the working tree and index are only ever
-read. The test suite hashes the entire repository tree, including `.git`, before
-and after every command and requires the digest to be unchanged. See
-[docs/git-safety.md](docs/git-safety.md).
+Atlas is experimental software at **v0.1.0 / phase A12.0**. It currently targets
+Linux. It does not apply patches, commit, push or perform GitHub actions.
 
-## What Atlas does
+## Why Atlas exists
 
-**Repository index.** Registered Git worktrees are scanned into a local SQLite
-index: tracked files with content hashes, commit history with per-commit file
-changes, and the complete working-tree change state — staged, unstaged,
-untracked and unmerged, each reported separately. SQLite is a rebuildable index;
-Git and the repository contents stay authoritative, and every result preserves
-its provenance.
+Long-running AI coding sessions lose context, repeat rejected approaches and
+turn old conclusions into current facts. Ordinary text memory can preserve a
+sentence, but it cannot by itself establish which repository state supported
+that sentence or whether the relevant code has since changed.
 
-**A daemon that keeps the index current.** After a one-time registration,
-filesystem and Git changes are detected with inotify and indexed without running
-`atlas scan` by hand. A pass over an unchanged repository reads no file content
-at all. When Atlas cannot prove it observed every change, it says so rather than
-describing the index as current — see
-[docs/watcher-consistency.md](docs/watcher-consistency.md).
+Atlas keeps those questions separate:
 
-**Code intelligence, twice, and honestly labelled.** A first-party bounded
-lexical C indexer records symbols, includes and call candidates, with a
-resolution class on every fact — `identifier(` is a call *candidate*, two
-definitions of one name stay `AMBIGUOUS`, and Atlas never picks between them.
-Beside it, an optional semantic index built with libclang records what the
-compiler proved: `PROVEN` means exactly that, a call through a function pointer
-is capped at `CANDIDATE`, and a path is as strong as its weakest edge. The two
-layers never merge and neither promotes the other. See
-[docs/code-intelligence.md](docs/code-intelligence.md).
-
-**Engineering memory.** Durable knowledge records with immutable revisions, an
-append-only lifecycle ledger, and links to the code they concern. A record says
-three orthogonal things, and no code path derives one from another: what sort of
-knowledge it is (`DECISION`, `POLICY`, `INVARIANT`, `OPERATIONAL_FACT`,
-`ACCEPTED_RISK`, `OBLIGATION`, `PARKED`, `REJECTED_ALTERNATIVE`), how far
-through the approval workflow it got (`PROPOSED`, `APPROVED`, `REJECTED`,
-`SUPERSEDED`, `RESOLVED`), and what evidence bears on whether it holds. A fourth
-axis says whether the thing the record is about is actually **there** —
-`PRESENT`, `ABSENT`, `UNKNOWN` or `NOT_VERIFIABLE`. Asked
-why something changed with nothing recorded, Atlas answers `UNKNOWN` — it never
-invents a historical reason. See
-[docs/decision-lifecycle.md](docs/decision-lifecycle.md) and
-[docs/verification.md](docs/verification.md).
-
-**Impact gates.** Every approved decision can be assessed against one exact
-repository state: `FRESH`, `STALE`, `IMPACTED` or `UNKNOWN`, folding to `PASS`,
-`REVIEW_REQUIRED` or `BLOCKED` with distinct exit codes an automation can act
-on. `STALE` means the anchors moved and a human has to look again; it does not
-mean the decision is wrong. `UNKNOWN` fails closed. See
-[docs/impact-gates.md](docs/impact-gates.md).
-
-**AI integration with an implemented trust boundary.** Claude Code hooks and an
-MCP server let a model query the index and record reasons and decisions — as
-proposals, never as approvals. Automatic model context contains no repository
-prose at all, and repository prose reaches a model only through an explicit tool
-call labelled `untrusted_data: true`. See
-[docs/ai-trust-boundary.md](docs/ai-trust-boundary.md) and
-[docs/claude-integration.md](docs/claude-integration.md).
-
-**Orchestration.** A durable job queue with an explicit state machine, expiring
-leases, crash recovery, an unprivileged dispatcher, isolated per-attempt
-workspaces and bounded command execution. A completed job is not an authority:
-its patch is an artifact with a recorded digest, and no code path applies it to
-a registered repository. On top of it, an operator-started run loop: `atlas job
-run` starts one worker in a registered repository's own tree, checks the pinned
-commit before and after, runs the declared verification gates itself, answers a
-failure with exactly one follow-up task, and settles the run `ACCEPTED` or
-`BLOCKED` within a bound of three worker starts. A run may hold up to a
-configurable number of tasks active at once (`--parallel`, default 1, ceiling
-8); parallel siblings are workspace tasks under the existing isolation, **at
-most one active task per run ever works in the repository's own tree**, and a
-run settles only when every task in it is terminal.
-
-**Planned runs.** `atlas plan run --repo NAME --goal TEXT --gate CMD` takes an
-operator's goal and an operator's verification gates, has a planner-role worker
-write one bounded `atlas-plan-1` document, compiles it into at most four stages,
-and drives each stage as an ordinary run. **The plan is a proposal, never a
-verdict**: the operator's gates are prepended verbatim to every task and a
-planner may only add to them; a plan's status has no writer at all and is derived
-on every read from stored rows; only a planner-role job's own stored artifact can
-become a revision; and the trigger for a replan is Atlas' own verdict that a
-stage-run settled `BLOCKED`, never a sentence a worker wrote. Every bound is
-compiled in and the worst case is written down — 5 planner jobs, 3 revisions, 4
-stages, 8 tasks, at most 77 worker starts per plan. See
-[docs/orchestration.md](docs/orchestration.md).
-
-**Remote access.** An HTTP gateway that authenticates a bearer credential,
-checks scopes and forwards only explicitly supported reads to the daemon;
-remote MCP over the same tool implementations the stdio adapter uses; a
-versioned read-only web API; and an embedded Mission Control page. Credentials
-are minted locally by the operator and the plaintext is shown once — after
-that, no copy exists anywhere. **Atlas terminates no TLS**; it is designed to
-sit behind a reverse proxy that does. No remote caller can create, rotate or
-revoke a credential, and no remote credential can hold a write scope. See
-[docs/remote-access.md](docs/remote-access.md).
-
-**Operations.** Verified online backups taken through SQLite's backup API while
-the daemon keeps writing, an atomic restore that keeps what it displaced, and a
-written retention policy for every table in the schema. None of it is reachable
-from a model. See [docs/operations.md](docs/operations.md).
-
-## Status
-
-Atlas is at phase **A12.0**. Each phase built on the last and none removed a
-guarantee:
-
-| Phase | What it added |
+| Ordinary text memory | Atlas |
 | --- | --- |
-| A0 | the read-only foundation: registration, scanning, history, search |
-| A1 | the daemon: inotify watching, incremental indexing, local IPC |
-| A2 | AI integration: hooks, MCP, sessions, the model-context trust boundary |
-| A3 | lexical code intelligence with resolution classes |
-| A4 | decision documents, immutable revisions, the operator approval channel |
-| A5 | verified backups, atomic restore, the written retention policy |
-| A6 | deterministic impact gates and stale-decision detection |
-| A7 | trust-boundary hardening; the model-facing surface reduced to reads and proposals |
-| A7.1 | OS authority separation: the daemon, the worker and the operator as distinct principals |
-| A8 | the orchestration control plane: jobs, leases, dispatcher, workspaces |
-| A8-CI | the semantic index (libclang), the proven call graph, task context |
-| A9 | secure remote access: gateway, API keys, remote MCP, web API, GUI |
-| A9.1 | knowledge kinds and the `RESOLVED` lifecycle state |
-| A9.2 | evidence, verification and policy-authorised automatic lifecycle |
-| A9.2.1 | the verification intake surface and the channel ceiling |
-| A9.2.2 | epistemic absence: the truth axis, first-class coverage, and the absence-proof rule |
-| A9.2.3 | semantic freshness and coverage the daemon maintains itself |
-| A9.2.4 | build-input discovery, and an activation policy that does not depend on memory |
-| A9.2.5 | semantic trust closure: every load-bearing semantic answer carries its verdict |
-| A9.2.6 | daemon responsiveness: a waiter that can stop waiting, and the `BUSY` refusal |
-| A9.2.7 | the writer yields: a short write lands *during* semantic maintenance rather than being refused for its duration |
-| O10 | production evidence ingestion proved at the boundary a client reaches |
-| A11.0 | the durable run a chain of tasks belongs to; a parent that resolves |
-| A11.1–A11.4 | the foreground run driver, gates Atlas runs itself, one follow-up per failure, the bound |
-| A10.0 | what a worker attempt cost, per attempt and never estimated |
-| A10.1 | the bounded cross-run memory package, measured in an A/B experiment |
-| A11.6 | bounded parallel tasks in a run; the repository's tree kept exclusive, settlement deferred to quiescence |
-| A12.0 | the planned run: a goal becomes one bounded plan document, and each stage is an ordinary run |
+| Stores a useful statement | Stores the statement, its kind, provenance and immutable revisions |
+| May reuse an old conclusion | Assesses it against an exact repository state as `FRESH`, `STALE`, `IMPACTED` or `UNKNOWN` |
+| A missing result can look negative | Requires sufficient coverage before reporting `ABSENT`; otherwise reports `UNKNOWN` |
+| Model output may look authoritative | Model-written records remain proposals; approval is a separate operator capability |
+
+Atlas is not a replacement for a model or an IDE. It is the evidence and
+control layer beside them.
+
+## What works today
+
+- **Read-only repository intelligence:** tracked files, hashes, commit history,
+  staged and unstaged changes, untracked files and provenance. Git and repository
+  contents remain authoritative.
+- **Continuously maintained indexes:** an inotify daemon keeps the repository
+  index current and reports when observation or coverage was incomplete.
+- **Two code-intelligence layers:** a bounded lexical C index records candidates
+  and ambiguity; an optional libclang index records compiler-proven facts. The
+  layers remain separate and every result carries its resolution strength.
+- **Engineering memory and impact gates:** decisions, policies, invariants,
+  accepted risks and obligations have immutable revisions, evidence, lifecycle
+  state and deterministic stale/impact assessment.
+- **AI integration:** Claude Code hooks and MCP tools expose bounded reads and
+  proposal-only writes. Repository prose is labelled as untrusted data.
+- **Bounded orchestration:** durable jobs, leases, crash recovery, isolated
+  workspaces, operator-supplied gates, bounded parallel tasks and multi-stage
+  planned runs. A worker result is an artifact, not authority.
+- **Remote read access:** scoped one-time credentials, remote MCP, a read-only
+  web API and Mission Control.
+- **Local operations:** verified online backups, atomic restore and explicit
+  retention policy. These operations are not exposed to a model or remote API.
+
+## A five-minute local start
+
+With the requirements below installed:
+
+```sh
+make
+make install PREFIX="$HOME/.local"
+export PATH="$HOME/.local/bin:$PATH"
+
+atlas doctor
+atlas repo add /srv/project --name project
+atlas scan project
+atlas status project
+atlas search project QUERY
+atlas code status project
+```
+
+The daemon and Claude integration are optional. Start with a local repository
+index; add the service, semantic index or MCP integration only when needed.
+
+## Trust boundary and evidence
+
+**Atlas never modifies a repository it indexes.** Git commands pass a read-only
+allowlist, executable hooks and external diff drivers are disabled, paths are
+opened without following symlinks, and tests compare the entire repository tree
+including `.git` before and after Atlas commands.
+
+The repository includes its threat model, known limitations, security reviews,
+full test suite and the reports from bounded live pilots. These are engineering
+artifacts, not a claim of independent third-party certification:
+
+- [Security model](SECURITY.md)
+- [Read-only Git design](docs/git-safety.md)
+- [AI trust boundary](docs/ai-trust-boundary.md)
+- [Code-intelligence evidence classes](docs/code-intelligence.md)
+- [Known backlog and residuals](docs/backlog.md)
+- [Development phases and measured pilots](docs/roadmap.md)
+- [Orchestration bounds](docs/orchestration.md)
+
+The full A0–A12 development history is kept in the roadmap rather than used as
+the product explanation.
 
 ## Requirements
 

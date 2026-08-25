@@ -565,6 +565,28 @@ The `>=` is not a hedge. Any surface that treats the two as one number is wrong
 for exactly the case linked worktrees create, and `watched_shared` is reported
 per repository so the difference is readable rather than looking like an error.
 
+### A status read never waits for the writer, and never speaks for it
+
+Everything the previous section reports comes from the watcher's own counters, so
+none of it depends on the writer thread. The *watch state* did: it is published
+as a `SET_WATCH` job on the writer's queue, and the section above on what happens
+to a write while the writer is busy says how long that queue can be.
+
+`repo.state` and `status` therefore overlay the watcher's live view — priming,
+degraded, owes a gap — onto the stored row before deriving `index_current`, so a
+repository is never reported current on the strength of a publication that has
+not landed. The overlay costs one mutex in the watcher, involves no writer and
+does no I/O, so the read stays answerable while the writer is held. It can only
+ever claim *less* than the row it was given. `docs/watcher-consistency.md` has
+the full contract; the fields it can change are `watch_state` and
+`pending_full_reconcile`, and through them `index_current` and
+`not_current_reason`.
+
+`watch_owed_gaps` in `status` is the daemon-wide count of obligations the watcher
+holds and has not yet seen recorded. `repositories_with_event_gap` beside it
+still counts stored rows, which is what its name says; when the writer is held it
+is `watch_owed_gaps` that moves.
+
 ## Client fallback
 
 `atlas_ipc_daemon_reachable()` answers one question — should this invocation take

@@ -765,8 +765,21 @@ is not written down is one somebody deletes.** Both halves are load-bearing.
 - **`priming` is neither watched nor degraded**, and **the proven envelope
   (65536) is not the hard ceiling (262144)** — only the first may be claimed, and
   only where the resolved budget reaches it.
+- **Enqueueing is not persistence.** A watch state reaches the database through
+  the single writer, which A9.2.6 says an unbounded job may own for minutes, and
+  a `SET_WATCH` that fails at the statement tells nobody. So `repo.state` and
+  `status` overlay the watcher's live view — priming, degraded, owes a gap — onto
+  the stored row **before** asking `atlas_index_state_is_current`. It adjusts the
+  rule's input rather than second-guessing its output, so there is still one
+  currency rule; it **only ever subtracts**, so a stored `error` or `incomplete`
+  survives it and an unknown repository is untouched; and it costs one mutex, no
+  writer and no I/O. A daemonless local read has no watcher and answers from the
+  row — inherent, and written down rather than implied.
 - **The test channel is not a public surface**: the budget travels on
-  `atlas_daemon_opts`, never a flag or an environment variable.
+  `atlas_daemon_opts`, and the writer's stall and discarded-write injections live
+  in `daemon_internal.h`. Never a flag, an environment variable, a policy key, an
+  RPC method or an MCP tool — a way to stall the writer, reachable by anyone who
+  can start a daemon, is a denial of service with a nicer name.
 
 ### A12.0 — the planned run
 

@@ -368,10 +368,77 @@ True only when **all** of:
 - a completed generation exists (`last_complete_generation > 0`)
 - `event_gap` is clear
 - `pending_full_reconcile` is clear
-- the watch state is not `error` and not `degraded`
+- the watch state is not `error`, not `degraded` and not `priming`
 
 Otherwise it is false and `not_current_reason` says which of those failed. There
 is no state in which Atlas reports `index_current: true` alongside a known gap.
+
+### The live overlay: a claim the writer has not written down yet
+
+Every field above is read from `repo_index_state`, and every field above reaches
+that table through the **single writer thread**. Publishing a watch state is a
+`SET_WATCH` job on that thread's queue, and `docs/daemon-and-ipc.md` records that
+an unbounded job — a compiler pass, a discovery walk — can own it for minutes.
+
+**Enqueueing is not persistence.** For the length of such a stretch the stored
+row still says whatever was last written. A repository that has just started
+priming a late subtree, or that has decided it owes a content-verifying pass,
+would be reported `watching` and `index_current: true` for as long as the writer
+was busy — which is exactly the window in which Atlas knows it is not observing
+the whole tree. The same is true of a `SET_WATCH` that reaches the database and
+*fails* there: nobody waits for that job and it carries no result, so its
+submitter never learns, and the row keeps its previous contents.
+
+So the daemon does not answer from the row alone. `atlas_watcher_repo_live`
+returns the watcher's own view of one repository — is it priming, is it degraded,
+does it owe a gap — under the same mutex every other watcher statistic uses, with
+no writer involvement and no I/O. `atlas_server_overlay_live` applies it to the
+`atlas_index_state` **before** the currency rule is asked, and both
+`atlas_server_write_repo_state` and the `status` summary tally call it.
+
+Four properties, and they are the whole contract:
+
+- **It only ever subtracts.** Nothing in it clears an event gap, retires an owed
+  pass, or promotes a recorded state: a stored `error` or `incomplete` stays what
+  it is whatever the watcher currently believes. The worst a stale live view can
+  do is force a full pass that was not needed.
+- **The rule is not duplicated.** The overlay adjusts the *input* to
+  `atlas_index_state_is_current` rather than second-guessing its output, which is
+  what keeps A9.2.2's "one implementation of the currency question" true and
+  keeps the reported `watch_state` and `pending_full_reconcile` agreeing with the
+  `index_current` derived from them.
+- **An unknown repository is left exactly as stored.** A watcher with nothing to
+  say about a repository is not a watcher saying it is fine.
+- **Staleness is bounded by one watcher tick.** The live view is refreshed
+  alongside every other statistic, so it lags the watcher's own decision by at
+  most one pass round the loop — and it lags in the direction that claims less.
+
+The summary is overlaid the same way, so `atlas status` cannot report
+`watching: 1, priming: 0` beside a repository document that reads `priming` and
+not current. `repositories_with_event_gap` still counts *stored* rows, because
+that is what its name says; `watch_owed_gaps` beside it is the watcher's own
+count of obligations it has not yet seen recorded, and is the number that moves
+first when the writer is held.
+
+**This applies to the daemon only, and that is inherent rather than an
+oversight.** `atlas status` run with no daemon reachable reads the database
+directly through `atlas_service_repo_state`; there is no watcher in that process
+and therefore no live view to overlay, so it answers from the row. The remote
+path is unaffected: it re-derives currency from the `watch_state`,
+`event_gap` and `pending_full_reconcile` the daemon sent, and those are the
+overlaid values.
+
+### Reaching those states in a test
+
+Neither condition can be produced from outside a process: there is no way to ask
+a running daemon to hold its writer, and no way to make one database write fail.
+`atlas_writer_test_stall` / `_release` and `atlas_writer_test_fail_watch_writes`
+are that channel. They are declared in `src/daemon/daemon_internal.h` and nowhere
+else — **no command-line flag, no environment variable, no policy key, no RPC
+method, no MCP tool, and no caller outside `tests/`** — for the reason the
+watcher's `inject_` fields carry: a way to stall the writer or discard its
+writes, reachable by anyone who can start a daemon, would be a denial of service
+with a nicer name.
 
 ## Known limits of the model
 

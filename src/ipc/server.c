@@ -222,6 +222,12 @@ static atlas_status method_ping(dispatch_state *ds, const atlas_ipc_request *req
 
 typedef struct status_tally {
     atlas_db *db;
+    /* P0. The same live view `atlas_server_write_repo_state` overlays, so the
+     * summary and the per-repository documents cannot disagree. Without it a
+     * blocked writer produced exactly that disagreement: `watching: 1,
+     * priming: 0` beside a repository document reading `priming` and not
+     * current, in the same family of commands and about the same instant. */
+    atlas_watcher *watcher;
     int64_t repos;
     int64_t watching;
     int64_t degraded;
@@ -236,6 +242,9 @@ static atlas_status tally(const atlas_repo_info *ri, void *ud, atlas_err *err) {
     atlas_index_state_init(&s);
     atlas_status st = atlas_db_index_state_get(t->db, ri->id, &s, err);
     if (st == ATLAS_OK && s.present) {
+        atlas_watch_live live;
+        atlas_watcher_repo_live(t->watcher, ri->id, &live);
+        atlas_server_overlay_live(&s, &live);
         if (s.watch_state == ATLAS_WATCH_WATCHING) {
             t->watching++;
         } else if (s.watch_state == ATLAS_WATCH_PRIMING) {
@@ -258,7 +267,7 @@ static atlas_status tally(const atlas_repo_info *ri, void *ud, atlas_err *err) {
 static atlas_status method_status(dispatch_state *ds, const atlas_ipc_request *req,
                                   atlas_err *err) {
     (void)req;
-    status_tally t = {ds->db, 0, 0, 0, 0, 0};
+    status_tally t = {ds->db, ds->ctx != NULL ? ds->ctx->watcher : NULL, 0, 0, 0, 0, 0};
     atlas_status st = atlas_db_repo_list(ds->db, tally, &t, err);
     if (st != ATLAS_OK) {
         return st;
@@ -289,7 +298,12 @@ static atlas_status method_status(dispatch_state *ds, const atlas_ipc_request *r
         st = atlas_json_key_int(ds->j, "degraded", t.degraded, err);
     }
     if (st == ATLAS_OK) {
-        /* The number that decides whether Atlas may call itself current. */
+        /* Repositories whose *stored row* records an event gap. It is not on
+         * its own the number that decides whether Atlas may call itself
+         * current: `priming` and `degraded` beside it, and
+         * `watch_owed_gaps` below, each also make a repository not current, and
+         * the per-repository document's `index_current` is the claim a caller
+         * acts on. */
         st = atlas_json_key_int(ds->j, "repositories_with_event_gap", t.gaps, err);
     }
     if (st == ATLAS_OK) {
@@ -329,6 +343,18 @@ static atlas_status method_status(dispatch_state *ds, const atlas_ipc_request *r
         }
         if (st == ATLAS_OK) {
             st = atlas_json_key_bool(ds->j, "priming_complete", ws.priming_complete, err);
+        }
+        if (st == ATLAS_OK) {
+            /* P0. Obligations the watcher holds and has not yet seen recorded.
+             *
+             * `repositories_with_event_gap` counts stored rows, so a repository
+             * whose publication is still on the writer's queue contributes to
+             * neither it nor `degraded` — and while the writer is held by an
+             * unbounded job that is every obligation the watcher has. This is
+             * the summary counterpart of the per-repository overlay: the number
+             * is the watcher's own, costs one mutex, and does not wait for the
+             * writer. */
+            st = atlas_json_key_int(ds->j, "watch_owed_gaps", ws.owed_gaps, err);
         }
     }
     if (st == ATLAS_OK) {

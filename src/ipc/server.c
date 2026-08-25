@@ -361,6 +361,51 @@ bool atlas_server_index_current(const atlas_index_state *s, const char **reason_
     return atlas_index_state_is_current(s, reason_out);
 }
 
+/* P0. Overlay the watcher's live view onto the row it has not managed to write
+ * yet.
+ *
+ * Publishing a watch state is asynchronous: `SET_WATCH` goes on the single
+ * writer's queue, and A9.2.6 documents that an unbounded semantic pass can own
+ * that thread for minutes. Enqueueing is not persistence. Without this, a
+ * repository that started priming — or that has decided it owes a full
+ * content-verifying pass — is reported from the previous row, which says
+ * `watching` and `index_current: true`, for as long as the writer is busy.
+ * Atlas would be claiming it observed every change during exactly the window in
+ * which it knows it did not.
+ *
+ * The overlay is applied to the *state struct*, before the currency rule is
+ * asked, rather than to the boolean afterwards. That is deliberate: A9.2.2 made
+ * `atlas_index_state_is_current` the one implementation of "is the index
+ * current?", and a second condition applied to its output would be a second copy
+ * of the rule. Adjusting its input keeps one rule, and keeps the reported
+ * `watch_state` and `pending_full_reconcile` agreeing with the `index_current`
+ * derived from them instead of contradicting it.
+ *
+ * It can only ever make Atlas *less* confident. Nothing here clears a gap,
+ * clears an owed pass, or promotes a state — a stored ERROR or INCOMPLETE stays
+ * what it is whatever the watcher currently believes — so the worst a stale live
+ * view can do is force an unnecessary full pass, which is the direction every
+ * other watcher rule already fails in.
+ *
+ * Non-blocking by construction: the live view costs one short mutex in the
+ * watcher, no writer involvement and no I/O, so a status read stays answerable
+ * while the writer thread is held. */
+void atlas_server_overlay_live(atlas_index_state *s, const atlas_watch_live *live) {
+    if (!live->known) {
+        return;
+    }
+    if (live->owes_gap) {
+        s->pending_full_reconcile = true;
+    }
+    if (s->watch_state == ATLAS_WATCH_WATCHING || s->watch_state == ATLAS_WATCH_UNWATCHED) {
+        if (live->degraded) {
+            s->watch_state = ATLAS_WATCH_DEGRADED;
+        } else if (live->priming) {
+            s->watch_state = ATLAS_WATCH_PRIMING;
+        }
+    }
+}
+
 atlas_status atlas_server_write_repo_state(dispatch_state *ds, const atlas_repo_info *ri,
                                            atlas_err *err) {
     atlas_index_state s;
@@ -373,6 +418,13 @@ atlas_status atlas_server_write_repo_state(dispatch_state *ds, const atlas_repo_
     if (st != ATLAS_OK) {
         atlas_index_state_free(&s);
         return st;
+    }
+
+    /* P0. Downgrade the stored row to what the watcher believes right now. */
+    if (ds->ctx != NULL) {
+        atlas_watch_live live;
+        atlas_watcher_repo_live(ds->ctx->watcher, ri->id, &live);
+        atlas_server_overlay_live(&s, &live);
     }
 
     /* `name` is validated on registration and `root_path_text` is already in the

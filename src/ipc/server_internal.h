@@ -138,6 +138,14 @@ atlas_status atlas_server_require_repo(dispatch_state *ds, const atlas_ipc_reque
 /* Writes one repository's index state as a set of object members. Shared by
  * repo.list, repo.state and the A2 context builder so the three cannot describe
  * the same repository differently. */
+/* P0. Downgrades a stored index state to the watcher's live view of the same
+ * repository, so a claim that depends on a row the blocked writer has not
+ * written yet is never made. One implementation, called by
+ * `atlas_server_write_repo_state`; separate so it can be asserted directly
+ * against a deliberately stalled writer, which is the only condition it exists
+ * for. It never upgrades. */
+void atlas_server_overlay_live(atlas_index_state *s, const atlas_watch_live *live);
+
 atlas_status atlas_server_write_repo_state(dispatch_state *ds, const atlas_repo_info *ri,
                                            atlas_err *err);
 

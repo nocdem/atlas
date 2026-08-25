@@ -40,6 +40,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <limits.h>
 #include <sys/inotify.h>
 #include <unistd.h>
 
@@ -50,6 +51,7 @@
 #include "atlas/syspolicy.h"
 #include "atlas_test.h"
 #include "daemon/daemon_internal.h"
+#include "ipc/server_internal.h"
 #include "support/fixture.h"
 
 #define WAIT_MS 20000
@@ -88,10 +90,21 @@ static void rig_open(rig *r, atlas_err *err) {
  * whatever policy happens to exist on the machine running the tests. Every
  * `inject_` field left at zero is the production bound, so a test that sets one
  * differs from production in exactly that number. */
-static void rig_start_opts(rig *r, const atlas_watcher_opts *o, atlas_err *err) {
+static void rig_start_writer(rig *r, atlas_err *err) {
     T_OK(atlas_writer_start(atlas_buf_cstr(&r->db_path), "", NULL, r->log, &r->writer, err), err);
+}
+
+static void rig_start_watcher(rig *r, const atlas_watcher_opts *o, atlas_err *err) {
     T_OK(atlas_watcher_start(atlas_buf_cstr(&r->db_path), r->writer, r->log, o, &r->watcher, err),
          err);
+}
+
+/* Split in two so a test can arm the writer's test channel in the gap between
+ * them. Arming afterwards races the watcher's first publication, which is
+ * exactly the publication some of these tests need to see fail. */
+static void rig_start_opts(rig *r, const atlas_watcher_opts *o, atlas_err *err) {
+    rig_start_writer(r, err);
+    rig_start_watcher(r, o, err);
 }
 
 static void rig_start(rig *r, int64_t budget, atlas_err *err) {
@@ -136,6 +149,26 @@ static void rig_close(rig *r) {
 }
 
 /* Registers a repository through the CLI, which is the only thing that may. */
+/* Holds the writer thread inside a reconciliation and waits until it is really
+ * held. Arming alone blocks nothing — the stalled kind still has to be dequeued
+ * — so a test that armed and then acted would be racing the very window it wants
+ * to keep empty. One reconciliation is submitted explicitly rather than waiting
+ * for the watcher to want one, because a quiescent repository may not ask for a
+ * pass at all. */
+static bool engage_writer_stall(rig *r) {
+    atlas_err err;
+    atlas_err_init(&err);
+    atlas_writer_test_stall(r->writer, ATLAS_JOB_RECONCILE);
+    (void)atlas_writer_submit_reconcile(r->writer, 1, false, false, NULL, 0, NULL, &err);
+    for (int i = 0; i < WAIT_MS / 20; i++) {
+        if (atlas_writer_test_stalled(r->writer)) {
+            return true;
+        }
+        usleep(20000);
+    }
+    return false;
+}
+
 static void register_repo(rig *r, const char *path, const char *name, atlas_err *err) {
     const char *argv[] = {"--data-dir", fx_data_dir(&r->fx), "repo", "add", path, "--name", name};
     int code = -1;
@@ -1286,16 +1319,29 @@ static void test_metadata_is_allocated_fairly_across_repositories(void) {
     rig_close(&r);
 }
 
-/* A repository subscribes to a descriptor it already holds even at a full
- * budget.
+/* P0. A shared descriptor is granted at a budget that is *exactly* full, and
+ * granting it does not increase the physical count.
  *
  * Two linked worktrees share every descriptor on their common git directory. The
  * budget check used to run *before* `inotify_add_watch`, so at exactly the
  * budget the second worktree was refused a subscription that would have cost the
  * kernel nothing — the budget counts physical watches, and this is not one.
  *
- * The exact boundary is asserted from both sides: the shared subscription is
- * granted, and the physical count still never exceeds the budget. */
+ * An earlier version of this test set the budget to what the *pair* needs, which
+ * left room for the second worktree and so never reached the boundary it claimed
+ * to test. This one measures what the **first** worktree alone occupies, sets the
+ * budget to exactly that, and then asks the second to install its metadata into a
+ * completely full map. Both sides of the boundary are then asserted at the same
+ * instant:
+ *
+ *   - the shared descriptors are granted, and `watches` does not move — an
+ *     already-held descriptor costs nothing and is not refused;
+ *   - the descriptors that are genuinely new *are* refused, and the second
+ *     worktree is told `total_budget`.
+ *
+ * The metadata is what makes this measurable: it is installed before any source
+ * walk, so the map is at its budget from the first worktree's metadata alone and
+ * the second worktree meets a full map on its very first `add_watch`. */
 static void test_a_shared_descriptor_is_granted_at_a_full_budget(void) {
     rig r;
     atlas_err err;
@@ -1314,22 +1360,30 @@ static void test_a_shared_descriptor_is_granted_at_a_full_budget(void) {
         rig_close(&r);
         return;
     }
-    register_repo(&r, fx_repo(&r.fx), "wt-a", &err);
-    register_repo(&r, atlas_buf_cstr(&wt), "wt-b", &err);
 
-    /* First pass: learn how many physical descriptors the pair actually needs. */
+    /* First pass, first worktree only: how many physical descriptors does its
+     * metadata actually occupy? With one repository registered nothing is
+     * shared, so its subscription count and the kernel's descriptor count are
+     * the same number — which is what makes it usable as a budget. */
+    register_repo(&r, fx_repo(&r.fx), "wt-a", &err);
     rig_start_opts_default(&r, &err);
     T_CHECK(wait_primed(&r, 0));
-    atlas_watch_stats full;
-    atlas_watcher_stats(r.watcher, &full);
-    int64_t need = full.watches;
-    T_REQUIRE(need > 0);
+    atlas_index_state solo;
+    atlas_index_state_init(&solo);
+    T_CHECK(wait_repo_settled(&r, 1, &solo));
+    int64_t meta_only = solo.watched_meta;
+    T_CHECK_MSG(solo.watched_shared == 0,
+                "with one repository registered nothing can be shared, got %lld",
+                (long long)solo.watched_shared);
+    atlas_index_state_free(&solo);
+    T_REQUIRE(meta_only > 0);
     rig_stop(&r);
 
-    /* Second pass with the budget set to exactly what the *first* worktree's own
-     * descriptors occupy, so the second worktree meets a full budget and can
-     * only proceed by sharing. */
-    rig_start_opts_budget(&r, need, &err);
+    /* Second pass: both worktrees, and a budget of exactly the first one's
+     * metadata. The first worktree fills the map to the last descriptor; the
+     * second meets a map with no room in it at all. */
+    register_repo(&r, atlas_buf_cstr(&wt), "wt-b", &err);
+    rig_start_opts_budget(&r, meta_only, &err);
     T_CHECK(wait_primed(&r, 0));
 
     atlas_index_state a;
@@ -1341,19 +1395,321 @@ static void test_a_shared_descriptor_is_granted_at_a_full_budget(void) {
 
     atlas_watch_stats ws;
     atlas_watcher_stats(r.watcher, &ws);
-    T_CHECK_MSG(ws.watches <= need,
-                "the physical count must never exceed the budget: %lld > %lld",
-                (long long)ws.watches, (long long)need);
-    T_CHECK_MSG(a.watched_shared > 0 || b.watched_shared > 0,
-                "at a full budget the worktrees must still share descriptors: %lld / %lld",
-                (long long)a.watched_shared, (long long)b.watched_shared);
+    /* Exactly full, not merely within the budget: if this were `<` the rest of
+     * the test would be asserting the easy case. */
+    T_CHECK_MSG(ws.watches == meta_only,
+                "the map must be exactly full at the boundary: watches=%lld budget=%lld",
+                (long long)ws.watches, (long long)meta_only);
+    /* The grant. The second worktree holds metadata subscriptions it could only
+     * have obtained by sharing, because there was no room for a new one. */
     T_CHECK_MSG(b.watched_meta > 0,
-                "the second worktree must hold metadata subscriptions even at a full budget");
+                "the second worktree must hold metadata subscriptions at a full budget");
+    T_CHECK_MSG(b.watched_shared > 0,
+                "those subscriptions must be on descriptors already held: shared=%lld",
+                (long long)b.watched_shared);
+    T_CHECK_MSG(ws.subscriptions > ws.watches,
+                "sharing must be visible as more subscriptions than descriptors: %lld <= %lld",
+                (long long)ws.subscriptions, (long long)ws.watches);
+    /* The refusal, at the same instant and from the same walk: the second
+     * worktree's own git directory is not shared with anything, so it is a new
+     * descriptor meeting a full map, and it is named as such. */
+    T_CHECK_MSG(b.watch_reason == ATLAS_WATCH_REASON_TOTAL_BUDGET,
+                "a new descriptor at a full budget must be refused with total_budget, got %s",
+                atlas_watch_reason_name(b.watch_reason));
+    /* And the first worktree kept everything it had: the second one's arrival
+     * cost it nothing. */
+    T_CHECK_MSG(a.watched_meta == meta_only,
+                "the first worktree must keep its metadata: %lld of %lld",
+                (long long)a.watched_meta, (long long)meta_only);
 
     atlas_index_state_free(&a);
     atlas_index_state_free(&b);
     atlas_buf_free(&wt);
     rig_close(&r);
+}
+
+/* P0. A blocked writer never lets Atlas claim the index is current.
+ *
+ * Publishing a watch state is asynchronous, and A9.2.6 documents that an
+ * unbounded job can hold the single writer thread for minutes. During such a
+ * stretch the stored row is frozen at whatever was last written — `watching`,
+ * no gap, `index_current: true` — while the watcher has already established that
+ * a subtree appeared late and a content-verifying pass is owed.
+ *
+ * Enqueueing is not persistence. The test therefore holds the writer inside a
+ * reconciliation on purpose, so that *nothing* the watcher decides afterwards
+ * can reach the database, and then asserts the two halves separately:
+ *
+ *   - the stored row, read on its own, still says the index is current — which
+ *     is the premise, and a test that could not show it would prove nothing;
+ *   - the same row overlaid with the watcher's live view says it is not, and
+ *     names the owed pass.
+ *
+ * `atlas_server_overlay_live` is the production path: `atlas_server_write_repo_state`
+ * calls it on every `status` and every `ai.context`. */
+static void test_a_blocked_writer_never_reports_the_index_current(void) {
+    rig r;
+    atlas_err err;
+    atlas_err_init(&err);
+    rig_open(&r, &err);
+    build_tree(&r, fx_repo(&r.fx), 2, &err);
+    register_repo(&r, fx_repo(&r.fx), "blocked", &err);
+    rig_start_opts_default(&r, &err);
+
+    /* Start from a state the row itself calls current, or the assertion below is
+     * vacuous. */
+    atlas_index_state before;
+    atlas_index_state_init(&before);
+    bool clean = false;
+    for (int i = 0; i < WAIT_MS / 50; i++) {
+        atlas_watch_stats ws;
+        atlas_watcher_stats(r.watcher, &ws);
+        atlas_index_state_free(&before);
+        atlas_index_state_init(&before);
+        atlas_err rerr;
+        atlas_err_init(&rerr);
+        read_state(&r, 1, &before, &rerr);
+        clean = ws.priming_complete && atlas_watcher_primed(r.watcher) &&
+                atlas_index_state_is_current(&before, NULL);
+        if (clean) {
+            break;
+        }
+        usleep(50000);
+    }
+    T_REQUIRE(clean);
+    atlas_index_state_free(&before);
+
+    /* From here the writer is held inside a reconciliation and never leaves it,
+     * so every later job — the watch publication and its gap flags among them —
+     * sits in the queue behind it. Engaged *before* the directory appears: a
+     * stall armed but not yet reached would let the first publication through,
+     * and that publication is exactly what must not reach the database. */
+    T_REQUIRE(engage_writer_stall(&r));
+
+    T_OK(fx_mkdir(fx_repo(&r.fx), "late", &err), &err);
+    T_OK(fx_write(fx_repo(&r.fx), "late/f.c", "int f;\n", &err), &err);
+
+    /* Wait for the watcher to establish the obligation. It cannot be discharged
+     * while the writer is held: `settle_owed_gaps` discharges only on a
+     * *completed* pass newer than the obligation, and no pass can complete. */
+    bool owed = false;
+    for (int i = 0; i < WAIT_MS / 20; i++) {
+        atlas_watch_stats ws;
+        atlas_watcher_stats(r.watcher, &ws);
+        if (ws.owed_gaps > 0) {
+            owed = true;
+            break;
+        }
+        usleep(20000);
+    }
+    T_CHECK_MSG(owed, "the watcher never recorded the obligation the late subtree creates");
+
+    atlas_index_state s;
+    atlas_index_state_init(&s);
+    atlas_err rerr;
+    atlas_err_init(&rerr);
+    read_state(&r, 1, &s, &rerr);
+
+    /* The premise: nothing reached the database, so the row still says current. */
+    const char *stored_reason = NULL;
+    T_CHECK_MSG(atlas_index_state_is_current(&s, &stored_reason),
+                "the stored row should still read current while the writer is blocked, but says "
+                "%s",
+                stored_reason == NULL ? "(no reason)" : stored_reason);
+
+    /* The property: the answer a client is given is not the row. */
+    atlas_watch_live live;
+    atlas_watcher_repo_live(r.watcher, 1, &live);
+    T_CHECK_MSG(live.known, "the watcher must have a live view of a repository it observes");
+    T_CHECK_MSG(live.owes_gap, "the live view must carry the obligation the row does not");
+
+    atlas_server_overlay_live(&s, &live);
+    const char *reason = NULL;
+    T_CHECK_MSG(!atlas_index_state_is_current(&s, &reason),
+                "a repository owing a content-verifying pass must never be reported current, "
+                "however busy the writer is");
+    T_CHECK_MSG(reason != NULL && strstr(reason, "full content verification") != NULL,
+                "the reason must name the owed pass, got %s",
+                reason == NULL ? "(none)" : reason);
+    T_CHECK(s.pending_full_reconcile);
+    atlas_index_state_free(&s);
+
+    /* Released before teardown so the writer drains rather than being joined out
+     * of a stall — the shutdown path handles that too, but a test that never
+     * exercised the ordinary release would not notice it breaking. */
+    atlas_writer_test_release(r.writer);
+    rig_close(&r);
+}
+
+/* P0. A watch publication that fails **inside the database write** does not
+ * leave Atlas reporting a blind-spotted repository as current.
+ *
+ * `inject_publish_failures` refuses the submission, which proves that a full
+ * writer queue is handled. It proves nothing about the other failure, and the
+ * other failure is the one with no feedback path: `SET_WATCH` carries no result
+ * and nobody waits for it, so a job that is dequeued, reaches
+ * `atlas_db_index_state_set_watch` and fails there is invisible to its
+ * submitter. The row keeps its previous contents; in a fresh database that is
+ * `watch_state = 'unwatched'`, which the currency rule does not treat as a
+ * blind spot — so once a reconciliation completes, the row on its own reads
+ * `index_current: true` for a repository the watcher has already given up on.
+ *
+ * The fault is injected in the writer, after the dequeue, at the statement — and
+ * the counter proves it fired there rather than at the submission. The budget is
+ * squeezed so the repository degrades, because degradation is terminal for the
+ * run and makes the assertion a property rather than a race. */
+static void test_a_watch_write_that_fails_in_the_database_is_not_a_current_index(void) {
+    rig r;
+    atlas_err err;
+    atlas_err_init(&err);
+    rig_open(&r, &err);
+    build_tree(&r, fx_repo(&r.fx), 40, &err);
+    register_repo(&r, fx_repo(&r.fx), "discarded", &err);
+
+    /* Armed between the writer starting and the watcher starting, so not one
+     * publication in this test's life reaches the database. */
+    rig_start_writer(&r, &err);
+    atlas_writer_test_fail_watch_writes(r.writer, 1000000);
+    atlas_watcher_opts o;
+    atlas_watcher_opts_init(&o);
+    o.reconcile_interval_ms = 3600000;
+    /* Small enough that the source tree cannot be watched, which is the
+     * degradation this test wants to be unreportable. */
+    o.inject_budget_total = 6;
+    rig_start_watcher(&r, &o, &err);
+
+    /* Wait until three things hold at once: a publication was discarded inside
+     * the writer, the watcher has settled on degraded, and a pass has completed
+     * leaving the row with nothing outstanding. */
+    atlas_index_state s;
+    atlas_index_state_init(&s);
+    atlas_watch_live live;
+    memset(&live, 0, sizeof live);
+    bool ready = false;
+    for (int i = 0; i < WAIT_MS / 50; i++) {
+        atlas_watcher_repo_live(r.watcher, 1, &live);
+        atlas_index_state_free(&s);
+        atlas_index_state_init(&s);
+        atlas_err rerr;
+        atlas_err_init(&rerr);
+        read_state(&r, 1, &s, &rerr);
+        if (atlas_writer_test_watch_writes_failed(r.writer) > 0 && live.known && live.degraded &&
+            atlas_index_state_is_current(&s, NULL)) {
+            ready = true;
+            break;
+        }
+        usleep(50000);
+    }
+    if (!ready) {
+        T_CHECK_MSG(false,
+                    "never reached the state under test (discarded=%lld known=%d degraded=%d "
+                    "state=%s gap=%d pending=%d gen=%lld)",
+                    (long long)atlas_writer_test_watch_writes_failed(r.writer), (int)live.known,
+                    (int)live.degraded, atlas_watch_state_name(s.watch_state), (int)s.event_gap,
+                    (int)s.pending_full_reconcile, (long long)s.last_complete_generation);
+    }
+
+    /* The write really was discarded: the row never learned what the watcher
+     * published. */
+    T_CHECK_MSG(s.watch_state != ATLAS_WATCH_DEGRADED,
+                "the premise fails if the degraded state reached the row anyway");
+    T_CHECK_MSG(atlas_writer_test_watch_writes_failed(r.writer) > 0,
+                "the fault must fire inside the writer, not at the submission");
+
+    /* The property. */
+    atlas_server_overlay_live(&s, &live);
+    const char *reason = NULL;
+    T_CHECK_MSG(!atlas_index_state_is_current(&s, &reason),
+                "a degraded repository must never be reported current because its publication "
+                "failed in the database");
+    T_CHECK_MSG(s.watch_state == ATLAS_WATCH_DEGRADED,
+                "the overlaid state must say degraded, got %s",
+                atlas_watch_state_name(s.watch_state));
+    T_CHECK_MSG(reason != NULL && strstr(reason, "blind spot") != NULL,
+                "the reason must name the blind spot, got %s", reason == NULL ? "(none)" : reason);
+    atlas_index_state_free(&s);
+    rig_close(&r);
+}
+
+/* The overlay never makes Atlas *more* confident than the row it was given.
+ *
+ * That is the only direction in which it could turn a durable fact into a
+ * transient opinion: a watcher that believes everything is fine must not be able
+ * to clear a recorded gap, retire an owed pass, or promote a recorded failure.
+ * Asserted against the function directly, over every stored state, because the
+ * shapes that matter are cheap to enumerate and expensive to reach through a
+ * daemon. */
+static void test_the_live_overlay_only_ever_subtracts(void) {
+    static const atlas_watch_state STATES[] = {
+        ATLAS_WATCH_UNWATCHED,  ATLAS_WATCH_WATCHING, ATLAS_WATCH_DEGRADED,
+        ATLAS_WATCH_INCOMPLETE, ATLAS_WATCH_ERROR,    ATLAS_WATCH_PRIMING};
+    atlas_watch_live healthy;
+    memset(&healthy, 0, sizeof healthy);
+    healthy.known = true;
+
+    for (size_t i = 0; i < sizeof STATES / sizeof STATES[0]; i++) {
+        for (int gap = 0; gap < 2; gap++) {
+            for (int pending = 0; pending < 2; pending++) {
+                atlas_index_state s;
+                atlas_index_state_init(&s);
+                s.present = true;
+                s.last_complete_generation = 7;
+                s.watch_state = STATES[i];
+                s.event_gap = gap != 0;
+                s.pending_full_reconcile = pending != 0;
+                bool was_current = atlas_index_state_is_current(&s, NULL);
+
+                atlas_server_overlay_live(&s, &healthy);
+                T_CHECK_MSG(s.event_gap == (gap != 0), "the overlay cleared an event gap");
+                T_CHECK_MSG(s.pending_full_reconcile == (pending != 0),
+                            "the overlay cleared an owed pass");
+                T_CHECK_MSG(s.watch_state == STATES[i],
+                            "a healthy live view changed the stored state from %s to %s",
+                            atlas_watch_state_name(STATES[i]),
+                            atlas_watch_state_name(s.watch_state));
+                T_CHECK_MSG(atlas_index_state_is_current(&s, NULL) == was_current,
+                            "a healthy live view changed the currency of %s",
+                            atlas_watch_state_name(STATES[i]));
+
+                /* And a live view that is worse never promotes a worse row. */
+                atlas_watch_live worse;
+                memset(&worse, 0, sizeof worse);
+                worse.known = true;
+                worse.priming = true;
+                worse.degraded = true;
+                worse.owes_gap = true;
+                atlas_server_overlay_live(&s, &worse);
+                T_CHECK_MSG(!atlas_index_state_is_current(&s, NULL),
+                            "a priming, degraded, gap-owing watcher must never read current");
+                if (STATES[i] == ATLAS_WATCH_ERROR || STATES[i] == ATLAS_WATCH_INCOMPLETE) {
+                    T_CHECK_MSG(s.watch_state == STATES[i],
+                                "the overlay downgraded %s to %s, which is a promotion in the "
+                                "other direction",
+                                atlas_watch_state_name(STATES[i]),
+                                atlas_watch_state_name(s.watch_state));
+                }
+                atlas_index_state_free(&s);
+            }
+        }
+    }
+
+    /* An unknown repository is left entirely alone: the watcher has nothing to
+     * say about it, which is not the same as saying it is fine. */
+    atlas_index_state s;
+    atlas_index_state_init(&s);
+    s.present = true;
+    s.last_complete_generation = 3;
+    s.watch_state = ATLAS_WATCH_WATCHING;
+    atlas_watch_live unknown;
+    memset(&unknown, 0, sizeof unknown);
+    unknown.priming = true;
+    unknown.degraded = true;
+    unknown.owes_gap = true;
+    atlas_server_overlay_live(&s, &unknown);
+    T_CHECK(s.watch_state == ATLAS_WATCH_WATCHING);
+    T_CHECK(!s.pending_full_reconcile);
+    T_CHECK(atlas_index_state_is_current(&s, NULL));
+    atlas_index_state_free(&s);
 }
 
 /* A persistently failing ignore refresh is asked a bounded number of times.
@@ -1474,6 +1830,16 @@ static void test_an_owed_gap_survives_a_failed_publication(void) {
     }
     T_CHECK_MSG(clean, "the repository never reached a primed, clean state to start from");
 
+    /* The writer is held from here on. Without it this test asserted something
+     * stronger than the design: `settle_owed_gaps` discharges on a *completed
+     * pass newer than the obligation*, which is a legitimate discharge — the
+     * content verification really did happen — and a fixture's passes complete in
+     * milliseconds, so "it stays owed" was true only for as long as the machine
+     * was slow. Holding the writer removes the legitimate discharge and leaves
+     * exactly the illegitimate one under test: a submission that succeeded while
+     * its write never landed. */
+    T_REQUIRE(engage_writer_stall(&r));
+
     /* A directory appears: it is queued, resolved, watched late, and therefore
      * owes a content-verifying pass. Every publication is refused. */
     T_OK(fx_mkdir(fx_repo(&r.fx), "late", &err), &err);
@@ -1525,6 +1891,7 @@ static void test_an_owed_gap_survives_a_failed_publication(void) {
         }
         usleep(20000);
     }
+    atlas_writer_test_release(r.writer);
     rig_close(&r);
 
     /* The other half: with publication working, the same scenario records the
@@ -1562,6 +1929,228 @@ static void test_an_owed_gap_survives_a_failed_publication(void) {
     rig_close(&r2);
 }
 
+
+/* P0. A temporary ignore failure is recovered from, not survived.
+ *
+ * The backoff above stops a broken repository from running one git process per
+ * tick. A backoff that never expires is a different failure with the same
+ * symptom: the repository sits degraded for the life of the daemon while the
+ * condition that degraded it is long gone, and nothing brings it back because
+ * `reprime_repository` cleared the queue that used to be the only way in.
+ *
+ * So the whole cycle is asserted here, and the recovery half is the point: git
+ * is broken, the repository degrades with `error`, git is restored, and the
+ * repository must return to `watching` and to a current index on its own —
+ * without a repository-set change, a restart, or anything else asking it to. */
+static void test_a_temporary_ignore_failure_recovers(void) {
+    rig r;
+    atlas_err err;
+    atlas_err_init(&err);
+    rig_open(&r, &err);
+    build_tree(&r, fx_repo(&r.fx), 2, &err);
+    register_repo(&r, fx_repo(&r.fx), "recovering", &err);
+    rig_start(&r, 0, &err);
+
+    atlas_index_state s;
+    atlas_index_state_init(&s);
+    T_CHECK(wait_repo_settled(&r, 1, &s));
+    atlas_index_state_free(&s);
+
+    /* Git is broken by making its directory unreadable, not by moving it aside.
+     *
+     * Both break `atlas_git_open`; only one of them can be *undone* without the
+     * watcher noticing. Moving `.git` back produces an `IN_MOVED_TO` for a
+     * directory in the watched root, which the watcher queues as a
+     * pending-ignore decision — and a non-empty queue is itself a way back into
+     * `resolve_pending_ignores`. The repository would then recover whether or
+     * not the retry timer existed, which is a test that cannot fail. A mode
+     * change produces `IN_ATTRIB` on a name that is neither a new directory nor
+     * an ignore-rule file, so nothing is queued and nothing is marked stale.
+     *
+     * The mode is restored in every exit path below, so the fixture can still be
+     * torn down. */
+    T_OK(fx_chmod(fx_repo(&r.fx), ".git", 0000, &err), &err);
+
+    /* The failure is provoked by an ignore-rule change rather than by a new
+     * directory, and that choice is the second half of the isolation.
+     *
+     * A rule change re-primes the repository, and re-priming **empties the
+     * pending-ignore queue**. So when the refresh then fails, the repository is
+     * left degraded with nothing queued — which is the state in which the retry
+     * timer is the only thing left that can bring it back.
+     *
+     * The file is written directly: git is broken, so nothing is committed. */
+    T_OK(fx_write(fx_repo(&r.fx), ".gitignore", "build/\n", &err), &err);
+
+    /* Wait for the verdict. `error` specifically: a repository that degraded for
+     * a budget reason would not be recovered by a working git, and asserting the
+     * wrong reason here would let that confusion through. */
+    bool degraded = false;
+    for (int i = 0; i < WAIT_MS / 50 && !degraded; i++) {
+        atlas_watch_live live;
+        atlas_watcher_repo_live(r.watcher, 1, &live);
+        degraded = live.known && live.degraded;
+        if (!degraded) {
+            usleep(50000);
+        }
+    }
+    T_CHECK_MSG(degraded, "a repository whose git cannot be opened must degrade");
+
+    atlas_index_state broken;
+    atlas_index_state_init(&broken);
+    T_CHECK(wait_repo_settled(&r, 1, &broken));
+    T_CHECK_MSG(broken.watch_reason == ATLAS_WATCH_REASON_ERROR,
+                "the reason must name the failure, got %s",
+                atlas_watch_reason_name(broken.watch_reason));
+    T_CHECK_MSG(!atlas_index_state_is_current(&broken, NULL),
+                "a repository whose ignore rules could not be read is not a current index");
+    atlas_index_state_free(&broken);
+
+    /* Restore git and then ask for nothing at all: no directory is created, no
+     * rule is edited, no repository is added or removed. The retry timer is the
+     * only thing left that can bring it back. */
+    T_OK(fx_chmod(fx_repo(&r.fx), ".git", 0700, &err), &err);
+
+    bool recovered = false;
+    atlas_index_state good;
+    atlas_index_state_init(&good);
+    for (int i = 0; i < WAIT_MS / 100; i++) {
+        atlas_index_state_free(&good);
+        atlas_index_state_init(&good);
+        atlas_err rerr;
+        atlas_err_init(&rerr);
+        read_state(&r, 1, &good, &rerr);
+        atlas_watch_live live;
+        atlas_watcher_repo_live(r.watcher, 1, &live);
+        atlas_server_overlay_live(&good, &live);
+        if (good.present && good.watch_state == ATLAS_WATCH_WATCHING &&
+            atlas_index_state_is_current(&good, NULL)) {
+            recovered = true;
+            break;
+        }
+        usleep(100000);
+    }
+    if (!recovered) {
+        T_CHECK_MSG(false,
+                    "a repository whose git recovered must return to watching and current on its "
+                    "own (state=%s reason=%s gap=%d pending=%d)",
+                    atlas_watch_state_name(good.watch_state),
+                    atlas_watch_reason_name(good.watch_reason), (int)good.event_gap,
+                    (int)good.pending_full_reconcile);
+    }
+    /* And it did not come back on a stale watch set: recovery re-primes from the
+     * root, so the source watches are the ones a fresh walk installed. */
+    T_CHECK_MSG(good.watched_source > 0,
+                "a recovered repository must hold source watches again, got %lld",
+                (long long)good.watched_source);
+    atlas_index_state_free(&good);
+    rig_close(&r);
+}
+
+/* P0. Late batches, one after another, never accumulate into a false
+ * `discovery_bound`.
+ *
+ * `visits` bounds the *work* one priming pass may do, separately from the bound
+ * on how many watches it may hold — a repository that has walked too far and one
+ * that has run out of budget are different findings. The counter was reset when
+ * a priming pass began and nowhere else, so every directory a running daemon
+ * ever queued added to the same total: a repository receiving a few new
+ * directories at a time would, after enough hours, be told it had exceeded a
+ * discovery bound it had never come near.
+ *
+ * A late subtree begins a new pass over new ground, so it resets the counter.
+ * The test walks past the bound in batches, and the directories are removed
+ * between batches so the *watch* budget is never the thing that stops it —
+ * otherwise a `total_budget` refusal would mask the reason under test.
+ *
+ * The budget is injected small so the bound (`budget_repo * 2`) is reachable in
+ * a test rather than after a day of production. Nothing else differs from
+ * production: the same counter, the same comparison, the same reset. */
+static void test_repeated_late_batches_never_report_a_false_discovery_bound(void) {
+    rig r;
+    atlas_err err;
+    atlas_err_init(&err);
+    rig_open(&r, &err);
+    build_tree(&r, fx_repo(&r.fx), 2, &err);
+    register_repo(&r, fx_repo(&r.fx), "batched", &err);
+
+    /* 500 leaves room for the metadata reserve and roughly 240 source watches,
+     * and puts the discovery bound at 1000 visits. */
+    const int64_t budget = 500;
+    rig_start_opts_budget(&r, budget, &err);
+    T_CHECK(wait_primed(&r, 0));
+    atlas_index_state s;
+    atlas_index_state_init(&s);
+    T_CHECK(wait_repo_settled(&r, 1, &s));
+    int64_t base = s.watched_source;
+    atlas_index_state_free(&s);
+
+    const int ROUNDS = 5;
+    const int PER_ROUND = 220; /* 5 x 220 = 1100 visits, past a bound of 1000 */
+    for (int round = 0; round < ROUNDS; round++) {
+        for (int i = 0; i < PER_ROUND; i++) {
+            char d[64];
+            (void)snprintf(d, sizeof(d), "b%d_%03d", round, i);
+            T_OK(fx_mkdir(fx_repo(&r.fx), d, &err), &err);
+        }
+        /* Wait for the batch to be walked, sampling the reason throughout: the
+         * defect shows up *during* a walk, not only at the end of one. */
+        bool walked = false;
+        for (int t = 0; t < WAIT_MS / 50 && !walked; t++) {
+            atlas_index_state g;
+            atlas_index_state_init(&g);
+            atlas_err rerr;
+            atlas_err_init(&rerr);
+            read_state(&r, 1, &g, &rerr);
+            T_CHECK_MSG(g.watch_reason != ATLAS_WATCH_REASON_DISCOVERY_BOUND,
+                        "round %d: a repository walking %d directories at a time reported a "
+                        "discovery bound it never reached", round, PER_ROUND);
+            atlas_watch_stats ws;
+            atlas_watcher_stats(r.watcher, &ws);
+            walked = ws.priming_complete && g.watched_source >= base + PER_ROUND;
+            atlas_index_state_free(&g);
+            if (!walked) {
+                usleep(50000);
+            }
+        }
+        T_CHECK_MSG(walked, "round %d: the batch was never fully watched", round);
+
+        /* Removed again, so the next round's visits are not paid for out of the
+         * watch budget as well. */
+        for (int i = 0; i < PER_ROUND; i++) {
+            char p[PATH_MAX];
+            (void)snprintf(p, sizeof(p), "%s/b%d_%03d", fx_repo(&r.fx), round, i);
+            (void)rmdir(p);
+        }
+        for (int t = 0; t < WAIT_MS / 50; t++) {
+            atlas_index_state g;
+            atlas_index_state_init(&g);
+            atlas_err rerr;
+            atlas_err_init(&rerr);
+            read_state(&r, 1, &g, &rerr);
+            bool dropped = g.watched_source <= base + 8;
+            atlas_index_state_free(&g);
+            if (dropped) {
+                break;
+            }
+            usleep(50000);
+        }
+    }
+
+    /* Total visits across the run are 1100 against a bound of 1000. The final
+     * verdict must still be a repository that walked what it was asked to. */
+    atlas_index_state end;
+    atlas_index_state_init(&end);
+    atlas_err rerr;
+    atlas_err_init(&rerr);
+    read_state(&r, 1, &end, &rerr);
+    T_CHECK_MSG(end.watch_reason != ATLAS_WATCH_REASON_DISCOVERY_BOUND,
+                "%d rounds of %d directories must not accumulate into a discovery bound of %lld",
+                ROUNDS, PER_ROUND, (long long)(budget * ATLAS_WATCH_DISCOVER_FACTOR));
+    atlas_index_state_free(&end);
+    rig_close(&r);
+}
+
 static const atlas_test TESTS[] = {
     {"the watch reason vocabulary round-trips and is distinct",
      test_reason_vocabulary_round_trips},
@@ -1593,10 +2182,20 @@ static const atlas_test TESTS[] = {
      test_the_pending_ignore_queue_is_bounded_from_both_sides},
     {"metadata is allocated fairly: every repository's reserve before any excess",
      test_metadata_is_allocated_fairly_across_repositories},
-    {"a shared descriptor is granted even at a full physical budget",
+    {"a shared descriptor is granted at an exactly full budget, and a new one is not",
      test_a_shared_descriptor_is_granted_at_a_full_budget},
+    {"a blocked writer never lets Atlas report the index current",
+     test_a_blocked_writer_never_reports_the_index_current},
+    {"a watch write that fails in the database is not a current index",
+     test_a_watch_write_that_fails_in_the_database_is_not_a_current_index},
+    {"the live overlay only ever subtracts confidence",
+     test_the_live_overlay_only_ever_subtracts},
     {"a failing ignore refresh is frozen, not retried every tick",
      test_a_failing_ignore_refresh_is_not_retried_every_tick},
+    {"a temporary ignore failure recovers to watching and current on its own",
+     test_a_temporary_ignore_failure_recovers},
+    {"repeated late batches never accumulate into a false discovery bound",
+     test_repeated_late_batches_never_report_a_false_discovery_bound},
     {"an owed gap survives a failed publication and still forces a full pass",
      test_an_owed_gap_survives_a_failed_publication},
     {"a repository-set change gaps every repository, not only the new one",

@@ -499,6 +499,27 @@ bool job_kind_is_unbounded(atlas_job_kind kind);
 bool job_kind_is_drainable(atlas_job_kind kind);
 
 /* Depth of the queue right now, for `daemon status`. */
+/* P0. The writer's test channel. Declared here and nowhere else: no CLI flag,
+ * no environment variable, no RPC method, no MCP tool, no policy key, and no
+ * caller outside `tests/`. See the block comment on the fields in `writer.c`
+ * for why the two properties it exists for cannot be asserted without it.
+ *
+ * `atlas_writer_test_stall` holds the writer thread *inside* a job of the named
+ * kind — the claim taken, the queue behind it untouched — until
+ * `atlas_writer_test_release`, which is what "the writer is busy with a
+ * long-running job" looks like from every other thread's point of view.
+ * `atlas_writer_test_fail_watch_writes` makes the next `n` `SET_WATCH` jobs
+ * reach the database write and not perform it. */
+void atlas_writer_test_stall(atlas_writer *w, atlas_job_kind kind);
+void atlas_writer_test_release(atlas_writer *w);
+/* True while the writer thread is actually being held. A test that only armed
+ * the stall has not yet blocked anything: the job it stalls has to be dequeued
+ * first, and everything a test wants to keep out of the database has to happen
+ * after that, not after the arming. */
+bool atlas_writer_test_stalled(atlas_writer *w);
+void atlas_writer_test_fail_watch_writes(atlas_writer *w, int64_t n);
+int64_t atlas_writer_test_watch_writes_failed(atlas_writer *w);
+
 int64_t atlas_writer_queue_depth(atlas_writer *w);
 /* Reconciliation passes completed since start, for `daemon status`. */
 int64_t atlas_writer_passes(atlas_writer *w);
@@ -577,6 +598,20 @@ typedef struct atlas_watch_stats {
     /* Repositories owing an event gap not yet observed in the database. */
     int64_t owed_gaps;
 } atlas_watch_stats;
+
+/* P0. What the watcher believes about one repository *now*, as opposed to what
+ * the database was last told.
+ *
+ * `known` is false for a repository this watcher does not observe, in which case
+ * the caller has nothing to overlay and uses the stored row unchanged. */
+typedef struct atlas_watch_live {
+    bool known;
+    bool priming;
+    bool degraded;
+    bool owes_gap;
+} atlas_watch_live;
+
+void atlas_watcher_repo_live(atlas_watcher *w, int64_t repo_id, atlas_watch_live *out);
 
 void atlas_watcher_stats(atlas_watcher *w, atlas_watch_stats *out);
 /* True once the initial reconciliation of every repository has been submitted. */

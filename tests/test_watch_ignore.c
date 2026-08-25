@@ -522,6 +522,103 @@ static void test_a_late_subtree_is_reported_priming_and_walked_in_chunks(void) {
     live_stop(&L);
 }
 
+
+/* P0. A directory that becomes ignored **while a late subtree is being walked**
+ * keeps no watch.
+ *
+ * The post-walk sweep exists because a walk is not instantaneous. It is judged
+ * against an ignore inventory read before it started, and spends several ticks
+ * installing watches; a directory created during those ticks is being judged
+ * against an inventory that predates it. For the *initial* prime that was
+ * already covered. A late subtree is pushed onto the frontier by the event
+ * handler — a different entry point — and it did not ask for the sweep, so an
+ * ignored directory that appeared mid-walk kept the watches the walk gave it
+ * until the next repository-set change. On a repository whose build output is
+ * ignored, that is the entire defect P0 exists to fix, arrived at through a door
+ * nobody had closed.
+ *
+ * Reaching it takes some care, because two other mechanisms cover most of the
+ * ground and would make a careless test unable to fail:
+ *
+ *   - a directory whose parent is already watched produces an `IN_CREATE`, goes
+ *     into the pending-ignore queue and is judged against a *fresh* inventory;
+ *   - and that queue's refresh re-reads the inventory for the rest of the walk,
+ *     so a single event anywhere covers every directory the walk has not reached
+ *     yet.
+ *
+ * So the subtree here is one deep chain and the ignored directory is created at
+ * the very bottom of it, below the depth the first chunk of the walk can reach.
+ * Nothing is watching its parent, so no event is produced, nothing is queued,
+ * no refresh happens, and the walk installs a watch on a directory git ignores.
+ * Only a sweep taken after the walk finishes can release it. */
+static void test_a_directory_ignored_during_a_late_walk_keeps_no_watch(void) {
+    live L;
+    atlas_err err;
+    atlas_err_init(&err);
+    live_start(&L, &err);
+    T_CHECK(wait_events(&L, "\"kind\":\"reconciled\"", &err));
+
+    atlas_buf doc = ATLAS_BUF_INIT;
+    T_CHECK(wait_current(&L, &doc, &err));
+    long before = state_int(&doc, "watched_source");
+
+    /* Deeper than ATLAS_WATCH_PRIME_CHUNK_DIRS (512), so the first chunk cannot
+     * reach the bottom, and short enough that the whole path stays well inside
+     * PATH_MAX. */
+    const int DEPTH = 600;
+    atlas_buf chain = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_set_str(&chain, "bulk", &err), &err);
+    T_OK(fx_mkdir(fx_repo(&L.fx), "bulk", &err), &err);
+    for (int i = 0; i < DEPTH; i++) {
+        char seg[8];
+        (void)snprintf(seg, sizeof(seg), "/c%03d", i);
+        T_OK(atlas_buf_append_str(&chain, seg, &err), &err);
+        T_OK(fx_mkdir(fx_repo(&L.fx), atlas_buf_cstr(&chain), &err), &err);
+    }
+    /* A visible file at the bottom, so that git does not report the bottom
+     * directory itself as entirely ignored once `build` appears inside it —
+     * which would be git's correct answer and would release a watch this test
+     * expects to survive. */
+    atlas_buf keep = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_set(&keep, chain.data, chain.len, &err), &err);
+    T_OK(atlas_buf_append_str(&keep, "/keep.c", &err), &err);
+    T_OK(fx_write(fx_repo(&L.fx), atlas_buf_cstr(&keep), "int k;\n", &err), &err);
+    atlas_buf_free(&keep);
+
+    /* The moment the walk publishes any progress it has started and cannot yet
+     * have reached the bottom. Create the ignored directory there. */
+    bool started = false;
+    for (int i = 0; i < WAIT_MS / 10 && !started; i++) {
+        repo_state(&L, &doc, &err);
+        started = state_int(&doc, "watched_source") > before;
+        if (!started) {
+            usleep(10000);
+        }
+    }
+    T_CHECK_MSG(started, "the late subtree's walk never started");
+    atlas_buf deep = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_set(&deep, chain.data, chain.len, &err), &err);
+    T_OK(atlas_buf_append_str(&deep, "/build", &err), &err);
+    T_OK(fx_mkdir(fx_repo(&L.fx), atlas_buf_cstr(&deep), &err), &err);
+    atlas_buf_free(&deep);
+    atlas_buf_free(&chain);
+
+    /* It settles: the chain is watched, the ignored directory at its bottom is
+     * not, and the repository is current again. */
+    T_CHECK_MSG(wait_current(&L, &doc, &err),
+                "the repository must return to current after the late subtree is walked");
+    long after = state_int(&doc, "watched_source");
+    T_CHECK_MSG(after == before + DEPTH + 1,
+                "expected %ld watches for a chain of %d plus its root and none for the ignored "
+                "directory created during the walk, got %ld",
+                before + DEPTH + 1, DEPTH, after);
+    T_CHECK_MSG(!state_says(&doc, "\"watch_state\":\"degraded\""),
+                "an ignored directory appearing mid-walk must not degrade the repository");
+
+    atlas_buf_free(&doc);
+    live_stop(&L);
+}
+
 static const atlas_test TESTS[] = {
     {"an ignored directory created empty after priming consumes no watch",
      test_future_ignored_directory_empty},
@@ -538,6 +635,8 @@ static const atlas_test TESTS[] = {
      test_a_late_subtree_is_reported_priming_and_walked_in_chunks},
     {"a burst of new directories resolves and every one is watched",
      test_a_burst_of_new_directories_resolves},
+    {"a directory ignored during a late walk keeps no watch",
+     test_a_directory_ignored_during_a_late_walk_keeps_no_watch},
 };
 
 ATLAS_TEST_MAIN("watch_ignore", TESTS)

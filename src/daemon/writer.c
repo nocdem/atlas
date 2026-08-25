@@ -74,6 +74,30 @@ struct atlas_writer {
     bool running;
     atlas_job_kind running_kind;
 
+    /* P0. The writer's test channel, guarded by `lock`.
+     *
+     * Two properties are otherwise unassertable. The first is that a watch
+     * state Atlas has decided on but not yet persisted still reads fail-closed
+     * — which only bites while the single writer thread is held by a long job,
+     * and there is no way to hold it on demand from outside. The second is that
+     * a `SET_WATCH` job which *reaches the database and fails there* leaves the
+     * obligation outstanding; a refusal at the submit call proves only that a
+     * full queue is handled, which is a different claim about a different code
+     * path.
+     *
+     * It lives in this internal header and nowhere else: no CLI flag, no
+     * environment variable, no RPC method, no MCP tool, no policy key. Nothing
+     * parses a string into it and nothing outside `tests/` calls it, for the
+     * reason the watcher's `inject_` fields carry — a way to stall the writer
+     * or discard its writes, reachable by anyone who can start a daemon, would
+     * be a denial of service with a nicer name. */
+    bool test_stall_armed;
+    atlas_job_kind test_stall_kind;
+    pthread_cond_t test_release_cv;
+    int64_t test_fail_set_watch;
+    int64_t test_set_watch_failed;
+    bool test_stall_active; /* a job of the stalled kind is being held right now */
+
     atlas_workers *workers;
     FILE *log;
     atlas_buf db_path;
@@ -1072,6 +1096,14 @@ static void writer_run_job(atlas_writer *w, atlas_job *j) {
      * would conclude its own job could not be the one running. */
     w->running = true;
     w->running_kind = j->kind;
+    /* P0. The test channel's stall, taken while the claim is held, because that
+     * is precisely the state being modelled: the writer owns a job and is inside
+     * it. `stopping` releases it, so a stalled writer is still joinable. */
+    while (w->test_stall_armed && w->test_stall_kind == j->kind && !w->stopping) {
+        w->test_stall_active = true;
+        (void)pthread_cond_wait(&w->test_release_cv, &w->lock);
+    }
+    w->test_stall_active = false;
     (void)pthread_mutex_unlock(&w->lock);
 
     switch (j->kind) {
@@ -1165,6 +1197,23 @@ static void writer_run_job(atlas_writer *w, atlas_job *j) {
     case ATLAS_JOB_SET_WATCH: {
         atlas_err ignore;
         atlas_err_init(&ignore);
+        /* P0. The test channel's write fault. Injected here — after the dequeue,
+         * at the point the row would change — because that is the failure the
+         * watcher has to survive: the job ran, the database refused it, and
+         * nothing is coming back to say so. A `SET_WATCH` carries no result and
+         * nobody waits for it, so the only correct response is for the watcher
+         * to still believe it owes the publication. */
+        bool test_fail = false;
+        (void)pthread_mutex_lock(&w->lock);
+        if (w->test_fail_set_watch > 0) {
+            w->test_fail_set_watch--;
+            w->test_set_watch_failed++;
+            test_fail = true;
+        }
+        (void)pthread_mutex_unlock(&w->lock);
+        if (test_fail) {
+            break;
+        }
         const char *detail = j->arg1.len > 0 ? atlas_buf_cstr(&j->arg1) : NULL;
         /* P0. Gap flags first, then the outcome, and the order is the point.
          *
@@ -1406,7 +1455,8 @@ atlas_status atlas_writer_start(const char *db_path, const char *socket_path,
     w->log = log;
     atlas_err_init(&w->ready_err);
     if (pthread_mutex_init(&w->lock, NULL) != 0 || pthread_cond_init(&w->not_empty, NULL) != 0 ||
-        pthread_cond_init(&w->job_done, NULL) != 0 || pthread_cond_init(&w->ready_cv, NULL) != 0) {
+        pthread_cond_init(&w->job_done, NULL) != 0 || pthread_cond_init(&w->ready_cv, NULL) != 0 ||
+        pthread_cond_init(&w->test_release_cv, NULL) != 0) {
         free(w);
         return atlas_err_set(err, ATLAS_ERR_INTERNAL, "cannot create writer synchronisation");
     }
@@ -1472,6 +1522,9 @@ void atlas_writer_stop(atlas_writer *w) {
         (void)pthread_mutex_lock(&w->lock);
         w->stopping = true;
         (void)pthread_cond_broadcast(&w->not_empty);
+        /* A thread held by the test channel's stall waits on its own condition,
+         * so shutting down has to wake that one too or the join never returns. */
+        (void)pthread_cond_broadcast(&w->test_release_cv);
         (void)pthread_mutex_unlock(&w->lock);
         (void)pthread_join(w->thread, NULL);
     }
@@ -1484,6 +1537,7 @@ void atlas_writer_stop(atlas_writer *w) {
     (void)pthread_cond_destroy(&w->not_empty);
     (void)pthread_cond_destroy(&w->job_done);
     (void)pthread_cond_destroy(&w->ready_cv);
+    (void)pthread_cond_destroy(&w->test_release_cv);
     (void)pthread_mutex_destroy(&w->lock);
     atlas_buf_free(&w->db_path);
     atlas_buf_free(&w->socket_path);
@@ -1819,6 +1873,40 @@ atlas_status atlas_writer_call_repo_add(atlas_writer *w, const char *path, const
                                         atlas_writer_result *result, atlas_err *err) {
     return writer_call_impl(w, ATLAS_JOB_REPO_ADD, path, name, exact_root, timeout_ms, result,
                             err);
+}
+
+void atlas_writer_test_stall(atlas_writer *w, atlas_job_kind kind) {
+    (void)pthread_mutex_lock(&w->lock);
+    w->test_stall_armed = true;
+    w->test_stall_kind = kind;
+    (void)pthread_mutex_unlock(&w->lock);
+}
+
+void atlas_writer_test_release(atlas_writer *w) {
+    (void)pthread_mutex_lock(&w->lock);
+    w->test_stall_armed = false;
+    (void)pthread_cond_broadcast(&w->test_release_cv);
+    (void)pthread_mutex_unlock(&w->lock);
+}
+
+void atlas_writer_test_fail_watch_writes(atlas_writer *w, int64_t n) {
+    (void)pthread_mutex_lock(&w->lock);
+    w->test_fail_set_watch = n;
+    (void)pthread_mutex_unlock(&w->lock);
+}
+
+bool atlas_writer_test_stalled(atlas_writer *w) {
+    (void)pthread_mutex_lock(&w->lock);
+    bool held = w->test_stall_active;
+    (void)pthread_mutex_unlock(&w->lock);
+    return held;
+}
+
+int64_t atlas_writer_test_watch_writes_failed(atlas_writer *w) {
+    (void)pthread_mutex_lock(&w->lock);
+    int64_t n = w->test_set_watch_failed;
+    (void)pthread_mutex_unlock(&w->lock);
+    return n;
 }
 
 int64_t atlas_writer_queue_depth(atlas_writer *w) {

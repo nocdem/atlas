@@ -513,6 +513,18 @@ typedef struct repo_watch {
      * verified it. Discharging on such a gap would be unsound, and it also made
      * the failure path untestable. */
     bool owes_gap_submitted;
+    /* The published generation at the moment this obligation was created.
+     *
+     * What discharges it is a *completed pass newer than that* — a full-reconcile
+     * acknowledgement — not the presence of an `event_gap` bit. A bit already set
+     * when the obligation was created belongs to some earlier cause and may have
+     * been satisfied by a pass that ran before the subtree this obligation is
+     * about even existed; discharging on it would retire a newer obligation on
+     * older evidence. And because `submit_due` forces the pass full while
+     * anything is owed, a newer completed generation *is* the content
+     * verification the obligation asked for, whether or not the bit ever
+     * reached the row. */
+    int64_t owes_gap_at_gen;
     atlas_buf owes_gap_detail;
 
     /* What was last written for this repository, so the watcher can publish on
@@ -649,6 +661,15 @@ struct atlas_watcher {
      * across a failed publication rather than inferring it from an end state a
      * reconciliation may already have cleared. */
     int64_t stat_owed_gaps;
+    /* Per-repository live view, guarded by `stat_lock`. Small and fixed: the
+     * watcher never observes more repositories than the compiled ceiling. */
+    struct {
+        int64_t repo_id;
+        bool priming;
+        bool degraded;
+        bool owes_gap;
+    } live[ATLAS_WATCH_MAX_REPOS];
+    size_t live_count;
     bool primed;         /* guarded by stat_lock */
     bool priming_complete; /* every repository's watch set is fully installed */
 };
@@ -740,6 +761,7 @@ static void resolve_budget(atlas_watcher *w, int64_t injected) {
  * priming and ignore-resolution stages need them and sit earlier in the file. */
 static void mark_dirty(atlas_watcher *w, int64_t repo_id);
 static bool prime_round(atlas_watcher *w);
+static void owe_gap(atlas_watcher *w, repo_watch *rw, const char *why);
 
 static int64_t now_ms(void) {
     struct timespec ts;
@@ -1493,6 +1515,27 @@ static bool refresh_ignored(atlas_watcher *w, repo_watch *rw) {
     rw->ignored = fresh;
     rw->ignore_backoff_ms = 0;
     rw->ignore_retry_at_ms = 0;
+    /* Recovery. A repository degraded *because* the ignore inventory could not be
+     * read has no reason to stay degraded once it can: the condition that
+     * produced the verdict is gone. Priming restarts from the root, because the
+     * watch set it holds was built against whatever inventory it had before the
+     * failure — or was torn down by the re-prime that accompanied it.
+     *
+     * Only that reason is lifted. A repository degraded for a budget or a kernel
+     * refusal is not made well by a working `git ls-files`. */
+    if (rw->degraded && rw->reason == ATLAS_WATCH_REASON_ERROR) {
+        rw->degraded = false;
+        rw->reason = ATLAS_WATCH_REASON_NONE;
+        atlas_buf_reset(&rw->degraded_detail);
+        frontier_clear(&rw->frontier, &rw->frontier_count);
+        rw->prime_started = false;
+        rw->visits = 0;
+        rw->prime_sweep_owed = false;
+        owe_gap(w, rw,
+                "this repository's ignore rules could not be read for a time, so its watch set "
+                "was incomplete and events may have been missed");
+        mark_dirty(w, rw->repo_id);
+    }
     return true;
 }
 
@@ -1799,6 +1842,25 @@ static void publish_repo_state(atlas_watcher *w, repo_watch *rw) {
     atlas_safe_pool_free(&safe);
 }
 
+/* Records that this repository owes a content-verifying pass, stamping the
+ * published generation the obligation is measured against. */
+static void owe_gap(atlas_watcher *w, repo_watch *rw, const char *why) {
+    atlas_err err;
+    atlas_err_init(&err);
+    rw->owes_gap = true;
+    rw->owes_gap_submitted = false;
+    rw->owes_gap_at_gen = 0;
+    if (w->db != NULL) {
+        atlas_index_state st;
+        atlas_index_state_init(&st);
+        if (atlas_db_index_state_get(w->db, rw->repo_id, &st, &err) == ATLAS_OK && st.present) {
+            rw->owes_gap_at_gen = st.last_complete_generation;
+        }
+        atlas_index_state_free(&st);
+    }
+    (void)atlas_buf_set_str(&rw->owes_gap_detail, why, &err);
+}
+
 /* P0. Discharges an owed gap only once it is visible in the database.
  *
  * The watcher holds a read-only handle of its own, created on its own thread, so
@@ -1813,7 +1875,7 @@ static void settle_owed_gaps(atlas_watcher *w) {
     }
     for (size_t i = 0; i < w->repo_count && i < w->max_repos; i++) {
         repo_watch *rw = &w->repos[i];
-        if (!rw->owes_gap || !rw->owes_gap_submitted) {
+        if (!rw->owes_gap) {
             continue;
         }
         atlas_index_state st;
@@ -1821,7 +1883,12 @@ static void settle_owed_gaps(atlas_watcher *w) {
         atlas_err err;
         atlas_err_init(&err);
         if (atlas_db_index_state_get(w->db, rw->repo_id, &st, &err) == ATLAS_OK && st.present &&
-            (st.event_gap || st.pending_full_reconcile)) {
+            st.last_complete_generation > rw->owes_gap_at_gen && !st.event_gap &&
+            !st.pending_full_reconcile) {
+            /* A pass completed after this obligation was created and left
+             * nothing outstanding. That pass was full — `submit_due` forces it
+             * while anything is owed — so the content verification this
+             * obligation demanded has happened. */
             rw->owes_gap = false;
             rw->owes_gap_submitted = false;
         }
@@ -1840,7 +1907,13 @@ static void maybe_publish_repo_state(atlas_watcher *w, repo_watch *rw) {
                             : repo_is_priming(rw) ? ATLAS_WATCH_PRIMING
                                                   : ATLAS_WATCH_WATCHING;
     atlas_watch_reason reason = rw->degraded ? rw->reason : ATLAS_WATCH_REASON_NONE;
-    if (rw->published_valid && !rw->owes_gap && rw->published_state == now &&
+    /* An outstanding obligation is a reason to publish **once**, not on every
+     * tick. Gating on `owes_gap` alone re-enqueued a SET_WATCH job five times a
+     * second for as long as the obligation lasted, which on a busy writer is a
+     * queue full of identical jobs ahead of everything else. `owes_gap_submitted`
+     * is the difference between "still owed" and "not yet told". */
+    bool owed_and_untold = rw->owes_gap && !rw->owes_gap_submitted;
+    if (rw->published_valid && !owed_and_untold && rw->published_state == now &&
         rw->published_reason == reason && rw->published_source == rw->source_dirs &&
         rw->published_meta == rw->meta_dirs) {
         return;
@@ -1966,9 +2039,7 @@ static void reprime_repository(atlas_watcher *w, repo_watch *rw, const char *why
     if (!refresh_ignored(w, rw)) {
         degrade_on_ignore_failure(rw);
     }
-    rw->owes_gap = true;
-    rw->owes_gap_submitted = false;
-    (void)atlas_buf_set_str(&rw->owes_gap_detail, why, &err);
+    owe_gap(w, rw, why);
     mark_dirty(w, rw->repo_id);
 }
 
@@ -1988,14 +2059,22 @@ static void reprime_repository(atlas_watcher *w, repo_watch *rw, const char *why
 static void resolve_pending_ignores(atlas_watcher *w) {
     for (size_t i = 0; i < w->repo_count && i < w->max_repos; i++) {
         repo_watch *rw = &w->repos[i];
-        if (rw->pending_ignore_count == 0 && !rw->ignore_stale && !rw->pending_ignore_overflow) {
+        /* A pending retry is a reason to come back on its own.
+         *
+         * The queue is not the only way a repository gets here, and after a
+         * failure it may well be empty — `reprime_repository` clears it. Gating
+         * entry on the queue alone meant a repository whose git had recovered sat
+         * degraded forever with nothing left to bring it back. The timer is that
+         * something. */
+        bool retry_due = rw->ignore_retry_at_ms > 0 && now_ms() >= rw->ignore_retry_at_ms;
+        if (rw->pending_ignore_count == 0 && !rw->ignore_stale && !rw->pending_ignore_overflow &&
+            !retry_due) {
             continue;
         }
         /* Frozen after a failure. `ignore_stale` is the defined new trigger: an
          * actual ignore-rule event is a fresh reason to ask, and it clears the
          * wait. Everything else waits out the backoff. */
-        if (!rw->ignore_stale && rw->ignore_retry_at_ms > 0 &&
-            now_ms() < rw->ignore_retry_at_ms) {
+        if (!rw->ignore_stale && !retry_due && rw->ignore_retry_at_ms > 0) {
             continue;
         }
         if (rw->pending_ignore_overflow) {
@@ -2093,6 +2172,17 @@ static void resolve_pending_ignores(atlas_watcher *w) {
              * `continue_priming` advance it a chunk per tick. */
             atlas_err aerr;
             atlas_err_init(&aerr);
+            /* A late subtree begins a *new* pass over new ground, so the pass
+             * accounting starts again and the post-walk sweep is owed once more.
+             *
+             * Without the reset, `visits` accumulated across every late batch a
+             * repository ever received and eventually crossed the discovery
+             * bound — reporting `discovery_bound` on a repository that had
+             * walked a few directories at a time for hours. And without
+             * `prime_sweep_owed`, a directory that became ignored while the late
+             * walk was running would keep the watches the walk gave it. */
+            rw->visits = 0;
+            rw->prime_sweep_owed = true;
             if (frontier_push(&rw->frontier, &rw->frontier_count, abs, alen, &aerr) != ATLAS_OK) {
                 rw->degraded = true;
                 rw->reason = ATLAS_WATCH_REASON_FRONTIER_OVERFLOW;
@@ -2109,12 +2199,9 @@ static void resolve_pending_ignores(atlas_watcher *w) {
              * meantime produced no event. That is an event gap, and the
              * repository owes a content-verifying pass before it may be
              * described as current again. */
-            rw->owes_gap = true;
-            rw->owes_gap_submitted = false;
-            (void)atlas_buf_set_str(
-                &rw->owes_gap_detail,
-                "a directory appeared and was not watched until git had been asked whether it is "
-                "ignored, so events inside it during that interval were not observed", &err);
+            owe_gap(w, rw,
+                    "a directory appeared and was not watched until git had been asked whether "
+                    "it is ignored, so events inside it during that interval were not observed");
             mark_dirty(w, rw->repo_id);
         }
         maybe_publish_repo_state(w, rw);
@@ -2273,6 +2360,16 @@ static void refresh_stats(atlas_watcher *w) {
             }
         }
         w->stat_owed_gaps = owed;
+    }
+    /* The live view, refreshed with everything else and read by the serve loop
+     * without touching the writer. */
+    w->live_count = 0;
+    for (size_t k = 0; k < w->repo_count && k < w->max_repos && k < ATLAS_WATCH_MAX_REPOS; k++) {
+        w->live[w->live_count].repo_id = w->repos[k].repo_id;
+        w->live[w->live_count].priming = repo_is_priming(&w->repos[k]) && !w->repos[k].degraded;
+        w->live[w->live_count].degraded = w->repos[k].degraded;
+        w->live[w->live_count].owes_gap = w->repos[k].owes_gap;
+        w->live_count++;
     }
     (void)pthread_mutex_unlock(&w->stat_lock);
 }
@@ -3317,6 +3414,44 @@ void atlas_watcher_stop(atlas_watcher *w) {
     atlas_buf_free(&w->db_path);
     (void)pthread_mutex_destroy(&w->stat_lock);
     free(w);
+}
+
+/* P0. The watcher's own live view of one repository, for a reader that must not
+ * be told something the database has not caught up with yet.
+ *
+ * Publishing a watch state is asynchronous: the job goes on the single writer's
+ * queue, and A9.2.6 documents that an unbounded semantic pass can hold that
+ * thread for minutes. During such a stretch the stored row still says whatever
+ * was true before — so a repository that started priming, or that owes a
+ * content-verifying pass, would be reported `watching` and `index_current`
+ * for as long as the writer was busy. Enqueueing is not persistence, and a
+ * claim that is true only once a queue drains is not a claim Atlas may make.
+ *
+ * This is the overlay that closes it: the serve loop asks the watcher directly,
+ * under the same `stat_lock` every other statistic uses, and downgrades the
+ * answer when the live view is worse than the stored one. It never upgrades —
+ * a stored gap stays a gap whatever the watcher thinks — so it can only ever
+ * make Atlas less confident, which is the only safe direction.
+ *
+ * Non-blocking by construction: one mutex the watcher holds for a few
+ * assignments, no writer involvement, no I/O. */
+void atlas_watcher_repo_live(atlas_watcher *w, int64_t repo_id, atlas_watch_live *out) {
+    memset(out, 0, sizeof(*out));
+    if (w == NULL) {
+        return;
+    }
+    (void)pthread_mutex_lock(&w->stat_lock);
+    for (size_t i = 0; i < w->live_count && i < ATLAS_WATCH_MAX_REPOS; i++) {
+        if (w->live[i].repo_id != repo_id) {
+            continue;
+        }
+        out->known = true;
+        out->priming = w->live[i].priming;
+        out->degraded = w->live[i].degraded;
+        out->owes_gap = w->live[i].owes_gap;
+        break;
+    }
+    (void)pthread_mutex_unlock(&w->stat_lock);
 }
 
 void atlas_watcher_stats(atlas_watcher *w, atlas_watch_stats *out) {

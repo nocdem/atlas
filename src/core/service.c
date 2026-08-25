@@ -652,6 +652,58 @@ atlas_status atlas_service_repo_add_db(atlas_db *db, const char *path, const cha
     return ATLAS_OK;
 }
 
+atlas_status atlas_service_repo_set_scanner(atlas_ctx *ctx, const char *name, bool uid_given,
+                                            int64_t uid, atlas_repo_info *out, atlas_err *err) {
+    return atlas_service_repo_set_scanner_db(ctx->db, name, uid_given, uid, out, err);
+}
+
+atlas_status atlas_service_repo_set_scanner_db(atlas_db *db, const char *name, bool uid_given,
+                                               int64_t uid, atlas_repo_info *out,
+                                               atlas_err *err) {
+    atlas_repo_info found_info;
+    atlas_repo_info_init(&found_info);
+    bool found = false;
+    atlas_status st = atlas_db_repo_get(db, name, &found_info, &found, err);
+    if (st == ATLAS_OK && !found) {
+        st = atlas_err_set(err, ATLAS_ERR_REPO, "no repository named \"%s\" is registered", name);
+    }
+    if (st != ATLAS_OK) {
+        atlas_repo_info_free(&found_info);
+        return st;
+    }
+    int64_t id = found_info.id;
+
+    int64_t suid = uid;
+    if (!uid_given) {
+        st = atlas_scanner_uid_of_root(atlas_buf_cstr(&found_info.root_path), &suid, err);
+    }
+    if (st == ATLAS_OK) {
+        const char *why = atlas_scanner_uid_refusal(suid);
+        if (why != NULL) {
+            /* The stored value is left alone. A repository that had a working
+             * scanner must not lose one because a later command named something
+             * impossible. */
+            st = atlas_err_set(err, ATLAS_ERR_USAGE,
+                               "uid %lld cannot be this repository's scanner: %s", (long long)suid,
+                               why);
+        }
+    }
+    atlas_repo_info_free(&found_info);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+
+    st = atlas_db_repo_set_scanner_uid(db, id, suid, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (out != NULL) {
+        bool again = false;
+        return atlas_db_repo_get(db, name, out, &again, err);
+    }
+    return ATLAS_OK;
+}
+
 typedef struct repo_list_ctx {
     atlas_repo_cb cb;
     void *ud;

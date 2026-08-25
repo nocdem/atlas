@@ -89,6 +89,8 @@ void atlas_cli_print_help(FILE *out) {
         "  repo add PATH [--name N] [--scanner-uid UID]\n"
         "                             register a git repository (read-only)\n"
         "  repo list                  list registered repositories\n"
+        "  repo scanner NAME [--scanner-uid UID]\n"
+        "                             which uid's scanner may read this repository\n"
         "  repo remove NAME --yes     forget a repository; never touches the repository\n"
         "  scan NAME                  index tracked files and git history\n"
         "  status NAME                show indexed state next to live git state\n"
@@ -1312,7 +1314,8 @@ static atlas_ctx_mode mode_for(const cli_state *st) {
         return ATLAS_CTX_READ;
     }
     if (strcmp(cmd, "repo") == 0 && st->operand_count > 0 &&
-        (strcmp(st->operands[0], "add") == 0 || strcmp(st->operands[0], "remove") == 0)) {
+        (strcmp(st->operands[0], "add") == 0 || strcmp(st->operands[0], "remove") == 0 ||
+         strcmp(st->operands[0], "scanner") == 0)) {
         return ATLAS_CTX_WRITE;
     }
     return ATLAS_CTX_AUTO;
@@ -3672,7 +3675,8 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
          * applied to the registry for the same reason: "the daemon must be
          * stopped" is then enforced by the kernel rather than promised in a
          * manual. */
-        if (strcmp(st->operands[0], "add") == 0 || strcmp(st->operands[0], "remove") == 0) {
+        if (strcmp(st->operands[0], "add") == 0 || strcmp(st->operands[0], "remove") == 0 ||
+            strcmp(st->operands[0], "scanner") == 0) {
             /* One line, and no embedded newlines.
              *
              * An error message is untrusted-text-encoded on its way to the
@@ -4217,7 +4221,7 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
     } else if (strcmp(cmd, "repo") == 0) {
         if (st->operand_count == 0) {
             result = atlas_err_set(err, ATLAS_ERR_USAGE,
-                                   "usage: atlas repo add|list|remove ...");
+                                   "usage: atlas repo add|list|remove|scanner ...");
         /* A7 removed every model-reachable route into the registry — there is
          * no `repo.add`, `repo.ensure` or `repo.remove` RPC method, no MCP
          * tool, and no hook that registers. What is left is this local command,
@@ -4238,6 +4242,29 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
                     result = renderer_open(&r, st->opts.json, st->out, "repo add", err);
                     if (result == ATLAS_OK) {
                         result = r.v->repo_added(&r, &info, err);
+                    }
+                    if (result == ATLAS_OK) {
+                        result = renderer_close(&r, err);
+                    } else {
+                        renderer_abort(&r);
+                    }
+                }
+                atlas_repo_info_free(&info);
+            }
+        } else if (strcmp(st->operands[0], "scanner") == 0) {
+            if (st->operand_count != 2u) {
+                result = atlas_err_set(err, ATLAS_ERR_USAGE,
+                                       "usage: atlas repo scanner NAME [--scanner-uid UID]");
+            } else {
+                atlas_repo_info info;
+                atlas_repo_info_init(&info);
+                result = atlas_service_repo_set_scanner(ctx, st->operands[1],
+                                                        repo_scanner_uid_given, repo_scanner_uid,
+                                                        &info, err);
+                if (result == ATLAS_OK) {
+                    result = renderer_open(&r, st->opts.json, st->out, "repo scanner", err);
+                    if (result == ATLAS_OK) {
+                        result = r.v->repo_scanner_set(&r, &info, err);
                     }
                     if (result == ATLAS_OK) {
                         result = renderer_close(&r, err);

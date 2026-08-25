@@ -227,6 +227,16 @@ static atlas_status h_repo_item(atlas_renderer *r, const atlas_repo_info *ri, at
     return ok();
 }
 
+/* A13. `repo scanner`. One line: the assignment is the whole result, and
+ * repeating the repository's identity would bury it. `ri->name` is a checked
+ * Atlas name, not repository prose, so it is printed as-is. */
+static atlas_status h_repo_scanner_set(atlas_renderer *r, const atlas_repo_info *ri,
+                                       atlas_err *err) {
+    (void)err;
+    (void)fprintf(r->out, "%s: scanner uid %lld\n", ri->name, (long long)ri->scanner_uid);
+    return ATLAS_OK;
+}
+
 static atlas_status h_repo_added(atlas_renderer *r, const atlas_repo_info *ri, atlas_err *err) {
     (void)err;
     (void)fprintf(r->out, "registered %s\n", ri->name);
@@ -2794,6 +2804,7 @@ static atlas_status h_plan_item(atlas_renderer *r, const atlas_plan_render *pr, 
 const atlas_renderer_vtbl ATLAS_RENDERER_HUMAN = {
     h_begin,      h_end,          h_note_repo,    h_note_query,   h_list_begin,
     h_list_end,   h_doctor,       h_version,      h_repo_item,    h_repo_added,
+    h_repo_scanner_set,
     h_repo_removed, h_scan,       h_status,       h_search_item,  h_file,
     h_history_item, h_diff_begin, h_diff_item,    h_diff_end,
     h_job_item,

@@ -108,8 +108,96 @@ static void test_a_refused_uid_fails_registration_with_a_reason(void) {
     fx_close(&fx);
 }
 
+/* A repository registered before A13 carries 0. The command is how an operator
+ * assigns one without re-registering, which is the only path such a repository
+ * has — a migration cannot `stat` a root, so it left them all unassigned. */
+static void test_the_command_assigns_a_uid_to_an_existing_repository(void) {
+    fixture fx;
+    atlas_err err;
+    atlas_err_init(&err);
+    atlas_db *db = NULL;
+    open_repo(&fx, &db, &err);
+
+    atlas_repo_info info;
+    atlas_repo_info_init(&info);
+    T_OK(atlas_service_repo_add_db(db, fx_repo(&fx), "r", false, false, 0, &info, &err), &err);
+    int64_t id = info.id;
+    atlas_repo_info_free(&info);
+    /* Simulate a pre-A13 row. */
+    T_OK(atlas_db_repo_set_scanner_uid(db, id, 0, &err), &err);
+
+    atlas_repo_info after;
+    atlas_repo_info_init(&after);
+    T_OK(atlas_service_repo_set_scanner_db(db, "r", false, 0, &after, &err), &err);
+    T_EQ_INT((int)after.scanner_uid, (int)getuid());
+    atlas_repo_info_free(&after);
+
+    /* And an explicit uid replaces it. */
+    atlas_repo_info named;
+    atlas_repo_info_init(&named);
+    T_OK(atlas_service_repo_set_scanner_db(db, "r", true, 4242, &named, &err), &err);
+    T_EQ_INT((int)named.scanner_uid, 4242);
+    atlas_repo_info_free(&named);
+
+    atlas_db_close(db);
+    fx_close(&fx);
+}
+
+/* The same refusals apply, and a refusal leaves the stored value alone rather
+ * than clearing it — a repository that had a working scanner must not lose one
+ * because a later command named something impossible. */
+static void test_the_command_refuses_and_leaves_the_old_value(void) {
+    fixture fx;
+    atlas_err err;
+    atlas_err_init(&err);
+    atlas_db *db = NULL;
+    open_repo(&fx, &db, &err);
+
+    atlas_repo_info info;
+    atlas_repo_info_init(&info);
+    T_OK(atlas_service_repo_add_db(db, fx_repo(&fx), "r", false, true, 4242, &info, &err), &err);
+    int64_t id = info.id;
+    atlas_repo_info_free(&info);
+
+    atlas_repo_info bad;
+    atlas_repo_info_init(&bad);
+    T_CHECK(atlas_service_repo_set_scanner_db(db, "r", true, 0, &bad, &err) != ATLAS_OK);
+    T_CHECK(err.msg[0] != '\0');
+    atlas_repo_info_free(&bad);
+
+    int64_t still = -1;
+    T_OK(atlas_db_repo_scanner_uid(db, id, &still, &err), &err);
+    T_EQ_INT((int)still, 4242);
+
+    atlas_db_close(db);
+    fx_close(&fx);
+}
+
+/* A name nobody registered is an error that says so, not a silent success. */
+static void test_an_unknown_repository_is_an_error(void) {
+    fixture fx;
+    atlas_err err;
+    atlas_err_init(&err);
+    atlas_db *db = NULL;
+    open_repo(&fx, &db, &err);
+
+    atlas_repo_info out;
+    atlas_repo_info_init(&out);
+    T_CHECK(atlas_service_repo_set_scanner_db(db, "nosuch", false, 0, &out, &err) != ATLAS_OK);
+    T_CHECK(err.msg[0] != '\0');
+    atlas_repo_info_free(&out);
+
+    atlas_db_close(db);
+    fx_close(&fx);
+}
+
 static const atlas_test TESTS[] = {
     {"registration derives the uid from the root", test_registration_derives_the_uid_from_the_root},
+    {"the command assigns a uid to an existing repository",
+     test_the_command_assigns_a_uid_to_an_existing_repository},
+    {"the command refuses and leaves the old value",
+     test_the_command_refuses_and_leaves_the_old_value},
+    {"an unknown repository is an error", test_an_unknown_repository_is_an_error},
     {"an explicit uid overrides the derived one", test_an_explicit_uid_overrides_the_derived_one},
     {"a refused uid fails registration with a reason",
      test_a_refused_uid_fails_registration_with_a_reason},

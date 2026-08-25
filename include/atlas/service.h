@@ -259,6 +259,20 @@ atlas_status atlas_service_repo_add_db(atlas_db *db, const char *path, const cha
 atlas_status atlas_service_repo_remove_db(atlas_db *db, const char *name, atlas_repo_info *removed,
                                           atlas_err *err);
 
+/* A13. Assigns `name`'s scanner uid without re-registering it, which is the
+ * only path a repository registered before A13 has: migration 27 could not
+ * `stat` a root, so it left every existing repository unassigned.
+ *
+ * Derives from the repository root's owner when `uid_given` is false. The same
+ * refusals apply as at registration, and a refusal leaves the stored value
+ * alone — a repository that had a working scanner must not lose one because a
+ * later command named something impossible. `out` is filled by re-reading the
+ * row, so the caller sees what is stored rather than what was asked for. */
+atlas_status atlas_service_repo_set_scanner(atlas_ctx *ctx, const char *name, bool uid_given,
+                                            int64_t uid, atlas_repo_info *out, atlas_err *err);
+atlas_status atlas_service_repo_set_scanner_db(atlas_db *db, const char *name, bool uid_given,
+                                               int64_t uid, atlas_repo_info *out, atlas_err *err);
+
 /* --- A1: daemon-facing reports ------------------------------------------ */
 
 typedef struct atlas_daemon_status_report {

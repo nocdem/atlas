@@ -107,6 +107,7 @@ set(ATLAS_TESTS
   test_migrate_scanner_uid
   test_scanner_uid
   test_repo_scanner
+  test_scanner_rpc
   test_unit
   test_reconcile
   test_daemon
@@ -248,7 +249,7 @@ set_tests_properties(test_sem_trust PROPERTIES LABELS "integration")
 set_tests_properties(test_registry PROPERTIES LABELS "daemon")
 set_tests_properties(test_ops PROPERTIES LABELS "daemon")
 set_tests_properties(test_scan test_search test_diff test_worktree test_cli test_terminal test_code_graph test_code_compdb
-  test_code_analyzer test_git_hardening test_reconcile test_repo_scanner
+  test_code_analyzer test_git_hardening test_reconcile test_repo_scanner test_scanner_rpc
   PROPERTIES LABELS "integration")
 set_tests_properties(test_core test_safetext test_proc test_git_parse test_db test_datadir
   test_lock test_ipc test_migrate3 test_migrate_scanner_uid test_scanner_uid test_unit

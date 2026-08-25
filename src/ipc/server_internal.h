@@ -130,6 +130,18 @@ const atlas_method_entry *atlas_server_verify_methods(size_t *count_out);
 const atlas_method_entry *atlas_server_orch_client_methods(size_t *count_out);
 const atlas_method_entry *atlas_server_orch_dispatch_methods(size_t *count_out);
 
+/* A13. The scanner group.
+ *
+ * Consulted with no `peer_uid` predicate, unlike the dispatcher, operator and
+ * gateway groups. Those are hidden because a root-owned policy already in
+ * memory can answer "is this peer one of ours?" before the method lookup runs.
+ * A scanner's identity is `repositories.scanner_uid` — a column, and the
+ * database is not open until after the lookup. So the group is dispatchable by
+ * name and each method checks the peer for itself, which is the orchestration
+ * *client* group's arrangement and for the same reason: the refusal leaks
+ * nothing a caller did not already know about its own uid. */
+const atlas_method_entry *atlas_server_scanner_methods(size_t *count_out);
+
 /* Resolves the `repo` parameter with the CLI's error text. Shared because two
  * groups need it and two copies would answer differently. */
 atlas_status atlas_server_require_repo(dispatch_state *ds, const atlas_ipc_request *req,

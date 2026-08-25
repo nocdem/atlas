@@ -545,6 +545,7 @@ typedef struct atlas_watcher_opts {
     size_t inject_max_repos;             /* 0 -> ATLAS_WATCH_MAX_REPOS */
     size_t inject_max_pending_ignore;    /* 0 -> ATLAS_WATCH_MAX_PENDING_IGNORE */
     size_t inject_max_pending_ignore_bytes; /* 0 -> ..._BYTES */
+    int64_t inject_publish_failures;        /* refuse this many watch-state publications */
 } atlas_watcher_opts;
 
 void atlas_watcher_opts_init(atlas_watcher_opts *o);
@@ -569,6 +570,12 @@ typedef struct atlas_watch_stats {
     int64_t kernel_max;
     bool budget_from_policy;
     bool priming_complete;
+    /* P0. Cumulative `git ls-files --ignored` invocations across all
+     * repositories. A backoff is only real if something counts the attempts it
+     * is meant to prevent. */
+    int64_t ignore_refresh_attempts;
+    /* Repositories owing an event gap not yet observed in the database. */
+    int64_t owed_gaps;
 } atlas_watch_stats;
 
 void atlas_watcher_stats(atlas_watcher *w, atlas_watch_stats *out);

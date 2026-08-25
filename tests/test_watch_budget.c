@@ -39,6 +39,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include <sys/inotify.h>
 #include <unistd.h>
 
@@ -99,6 +100,25 @@ static void rig_start(rig *r, int64_t budget, atlas_err *err) {
     o.reconcile_interval_ms = 3600000;
     o.inject_budget_total = budget;
     rig_start_opts(r, &o, err);
+}
+
+static void rig_start_opts_default(rig *r, atlas_err *err) { rig_start(r, 0, err); }
+
+static void rig_start_opts_budget(rig *r, int64_t budget, atlas_err *err) {
+    rig_start(r, budget, err);
+}
+
+/* Stops the watcher and writer but keeps the fixture, so a test can re-start
+ * against the same repositories with different bounds. */
+static void rig_stop(rig *r) {
+    if (r->watcher != NULL) {
+        atlas_watcher_stop(r->watcher);
+        r->watcher = NULL;
+    }
+    if (r->writer != NULL) {
+        atlas_writer_stop(r->writer);
+        r->writer = NULL;
+    }
 }
 
 static void rig_close(rig *r) {
@@ -1178,6 +1198,370 @@ static void test_the_pending_ignore_queue_is_bounded_from_both_sides(void) {
     }
 }
 
+/* --- review round 3: the five properties the last review required ---------- */
+
+/* Every repository gets its essential metadata before any repository gets more
+ * than its reserve.
+ *
+ * Adversarial by construction: the repository that sorts first has far more refs
+ * than the reserve, so under a single-pass allocation it would take the whole
+ * metadata allowance and the second repository would be unable to watch its own
+ * HEAD — which is the starvation the source rounds were restructured to prevent,
+ * one resource over. The budget is injected just large enough that a greedy
+ * first repository would exhaust it. */
+static void test_metadata_is_allocated_fairly_across_repositories(void) {
+    rig r;
+    atlas_err err;
+    atlas_err_init(&err);
+    rig_open(&r, &err);
+
+    atlas_buf second = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_appendf(&second, &err, "%s/second", atlas_buf_cstr(&r.fx.root)), &err);
+    T_OK(fx_mkdir(atlas_buf_cstr(&r.fx.root), "second", &err), &err);
+
+    /* **Both** repositories want far more metadata than the reserve, which is
+     * what makes the reserve bind at all. With only one greedy repository the
+     * other's whole need fits in the remainder and nothing is proved: the first
+     * may legitimately take everything left over once its neighbour is
+     * satisfied. "aaa" sorts first, so under a single-pass allocation it would
+     * take the entire budget and "zzz" would hold nothing. */
+    const int REFS = (int)ATLAS_WATCH_META_RESERVE_PER_REPO * 3;
+    build_tree(&r, fx_repo(&r.fx), 2, &err);
+    for (int i = 0; i < REFS; i++) {
+        char d[128];
+        (void)snprintf(d, sizeof(d), ".git/refs/heads/p%05d", i);
+        T_OK(fx_mkdir(fx_repo(&r.fx), d, &err), &err);
+    }
+    build_tree(&r, atlas_buf_cstr(&second), 2, &err);
+    for (int i = 0; i < REFS; i++) {
+        char d[128];
+        (void)snprintf(d, sizeof(d), ".git/refs/heads/q%05d", i);
+        T_OK(fx_mkdir(atlas_buf_cstr(&second), d, &err), &err);
+    }
+    register_repo(&r, fx_repo(&r.fx), "aaa-greedy", &err);
+    register_repo(&r, atlas_buf_cstr(&second), "zzz-starved", &err);
+
+    /* Deliberately tight: barely more than one reserve. Under a single-pass
+     * allocation the greedy repository would take all of it and the second would
+     * hold nothing. */
+    atlas_watcher_opts o;
+    atlas_watcher_opts_init(&o);
+    o.reconcile_interval_ms = 3600000;
+    /* Room for both reserves and almost nothing else. */
+    o.inject_budget_total = (int64_t)ATLAS_WATCH_META_RESERVE_PER_REPO * 2 + 16;
+    rig_start_opts(&r, &o, &err);
+
+    atlas_index_state a;
+    atlas_index_state b;
+    atlas_index_state_init(&a);
+    atlas_index_state_init(&b);
+    T_CHECK(wait_repo_settled(&r, 1, &a));
+    T_CHECK(wait_repo_settled(&r, 2, &b));
+
+    /* The starved repository must hold its essential metadata: its git dir, the
+     * common dir's `info/`, and at least one `refs/` directory. A repository
+     * that cannot watch those cannot see its own branch switches. */
+    T_CHECK_MSG(b.watched_meta >= (int64_t)ATLAS_WATCH_META_RESERVE_PER_REPO,
+                "the second repository got only %lld metadata watches of its reserve of %u, "
+                "while the first holds %lld — the reserve pass must complete for every "
+                "repository before any of them takes more",
+                (long long)b.watched_meta, ATLAS_WATCH_META_RESERVE_PER_REPO,
+                (long long)a.watched_meta);
+    /* The greedy repository is capped at its reserve while the budget is this
+     * tight — it may not spend into the second repository's essential capacity.
+     *
+     * It is *not* an error for it to exceed the reserve once every other
+     * repository is satisfied: the reserve is a floor on what each repository is
+     * guaranteed, not a ceiling on what any one may hold. That is why the
+     * assertion is conditioned on the budget being tight rather than stated
+     * unconditionally. */
+    T_CHECK_MSG(a.watched_meta <= (int64_t)ATLAS_WATCH_META_RESERVE_PER_REPO + 16,
+                "the greedy repository took %lld metadata watches; with both reserves owed it "
+                "may take its own plus only the remainder",
+                (long long)a.watched_meta);
+
+    atlas_index_state_free(&a);
+    atlas_index_state_free(&b);
+    atlas_buf_free(&second);
+    rig_close(&r);
+}
+
+/* A repository subscribes to a descriptor it already holds even at a full
+ * budget.
+ *
+ * Two linked worktrees share every descriptor on their common git directory. The
+ * budget check used to run *before* `inotify_add_watch`, so at exactly the
+ * budget the second worktree was refused a subscription that would have cost the
+ * kernel nothing — the budget counts physical watches, and this is not one.
+ *
+ * The exact boundary is asserted from both sides: the shared subscription is
+ * granted, and the physical count still never exceeds the budget. */
+static void test_a_shared_descriptor_is_granted_at_a_full_budget(void) {
+    rig r;
+    atlas_err err;
+    atlas_err_init(&err);
+    rig_open(&r, &err);
+
+    build_tree(&r, fx_repo(&r.fx), 3, &err);
+    atlas_buf wt = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_appendf(&wt, &err, "%s/wt2", atlas_buf_cstr(&r.fx.root)), &err);
+    const char *addwt[] = {"worktree", "add", "-b", "second", atlas_buf_cstr(&wt)};
+    atlas_err werr;
+    atlas_err_init(&werr);
+    if (fx_git_ok(&r.fx, fx_repo(&r.fx), addwt, 5u, &werr) != ATLAS_OK) {
+        atlas_test_note("this git cannot create a linked worktree; skipping");
+        atlas_buf_free(&wt);
+        rig_close(&r);
+        return;
+    }
+    register_repo(&r, fx_repo(&r.fx), "wt-a", &err);
+    register_repo(&r, atlas_buf_cstr(&wt), "wt-b", &err);
+
+    /* First pass: learn how many physical descriptors the pair actually needs. */
+    rig_start_opts_default(&r, &err);
+    T_CHECK(wait_primed(&r, 0));
+    atlas_watch_stats full;
+    atlas_watcher_stats(r.watcher, &full);
+    int64_t need = full.watches;
+    T_REQUIRE(need > 0);
+    rig_stop(&r);
+
+    /* Second pass with the budget set to exactly what the *first* worktree's own
+     * descriptors occupy, so the second worktree meets a full budget and can
+     * only proceed by sharing. */
+    rig_start_opts_budget(&r, need, &err);
+    T_CHECK(wait_primed(&r, 0));
+
+    atlas_index_state a;
+    atlas_index_state b;
+    atlas_index_state_init(&a);
+    atlas_index_state_init(&b);
+    T_CHECK(wait_repo_settled(&r, 1, &a));
+    T_CHECK(wait_repo_settled(&r, 2, &b));
+
+    atlas_watch_stats ws;
+    atlas_watcher_stats(r.watcher, &ws);
+    T_CHECK_MSG(ws.watches <= need,
+                "the physical count must never exceed the budget: %lld > %lld",
+                (long long)ws.watches, (long long)need);
+    T_CHECK_MSG(a.watched_shared > 0 || b.watched_shared > 0,
+                "at a full budget the worktrees must still share descriptors: %lld / %lld",
+                (long long)a.watched_shared, (long long)b.watched_shared);
+    T_CHECK_MSG(b.watched_meta > 0,
+                "the second worktree must hold metadata subscriptions even at a full budget");
+
+    atlas_index_state_free(&a);
+    atlas_index_state_free(&b);
+    atlas_buf_free(&wt);
+    rig_close(&r);
+}
+
+/* A persistently failing ignore refresh is asked a bounded number of times.
+ *
+ * The repository's working tree is removed under the daemon, so every
+ * `atlas_git_open` fails. Without a backoff the pending queue and the staleness
+ * flag would each bring the repository back to `refresh_ignored` on every
+ * watcher tick — one git process every 200 ms for as long as the condition
+ * lasts. The counter is what makes the bound checkable: a bound nothing counts
+ * is a claim. */
+static void test_a_failing_ignore_refresh_is_not_retried_every_tick(void) {
+    rig r;
+    atlas_err err;
+    atlas_err_init(&err);
+    rig_open(&r, &err);
+    build_tree(&r, fx_repo(&r.fx), 2, &err);
+    register_repo(&r, fx_repo(&r.fx), "vanishing", &err);
+    rig_start(&r, 0, &err);
+
+    atlas_index_state s;
+    atlas_index_state_init(&s);
+    T_CHECK(wait_repo_settled(&r, 1, &s));
+
+    /* Break git for this repository, then give it a reason to ask. */
+    atlas_buf gitdir = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_appendf(&gitdir, &err, "%s/.git", fx_repo(&r.fx)), &err);
+    atlas_buf moved = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_appendf(&moved, &err, "%s/.git-moved", fx_repo(&r.fx)), &err);
+    T_REQUIRE(rename(atlas_buf_cstr(&gitdir), atlas_buf_cstr(&moved)) == 0);
+
+    atlas_watch_stats base;
+    atlas_watcher_stats(r.watcher, &base);
+
+    /* Several seconds of ticks. At ~200 ms per tick that is tens of
+     * opportunities to run git; the backoff starts at one second and doubles. */
+    for (int i = 0; i < 60; i++) {
+        char d[64];
+        (void)snprintf(d, sizeof(d), "poke%02d", i);
+        (void)fx_mkdir(fx_repo(&r.fx), d, &err);
+        usleep(50000);
+    }
+    atlas_watch_stats after;
+    atlas_watcher_stats(r.watcher, &after);
+    int64_t attempts = after.ignore_refresh_attempts - base.ignore_refresh_attempts;
+
+    /* Three seconds of backoff starting at one second and doubling admits at
+     * most a handful. The ceiling is deliberately loose — what it must exclude
+     * is one-per-tick, which over this window would be dozens. */
+    T_CHECK_MSG(attempts <= 8,
+                "a persistently failing ignore refresh ran git %lld times in ~3 s; the backoff "
+                "must freeze the attempt rather than retry every tick",
+                (long long)attempts);
+
+    /* Put it back so the fixture can be torn down cleanly. */
+    (void)rename(atlas_buf_cstr(&moved), atlas_buf_cstr(&gitdir));
+    atlas_buf_free(&gitdir);
+    atlas_buf_free(&moved);
+    atlas_index_state_free(&s);
+    rig_close(&r);
+}
+
+/* An owed gap survives a failed publication, and the pass it forces stays full.
+ *
+ * A successful submission means the job reached the writer queue, not that the
+ * row was written. Clearing the obligation on enqueue is the same class of
+ * mistake as clearing it on a dropped submission: in both cases a repository can
+ * end up reported current over a subtree whose events were missed. The
+ * injection makes the failure deterministic, because a fixture's writer queue is
+ * never full. */
+static void test_an_owed_gap_survives_a_failed_publication(void) {
+    rig r;
+    atlas_err err;
+    atlas_err_init(&err);
+    rig_open(&r, &err);
+    build_tree(&r, fx_repo(&r.fx), 2, &err);
+    register_repo(&r, fx_repo(&r.fx), "faulty", &err);
+
+    atlas_watcher_opts o;
+    atlas_watcher_opts_init(&o);
+    o.reconcile_interval_ms = 3600000;
+    /* Refused for the whole test. Six was not enough: the startup transitions
+     * consume them before the late directory even appears, so publication had
+     * recovered by the time an obligation existed and the window in which one
+     * was outstanding was too short to observe. The property under test is that
+     * the obligation is *retained* while publication fails, so publication must
+     * fail throughout. */
+    o.inject_publish_failures = 1000000;
+    rig_start_opts(&r, &o, &err);
+
+    /* Wait for a genuinely clean recorded state first.
+     *
+     * `settle_owed_gaps` discharges an obligation when a gap is already visible
+     * in the database — correctly, because the obligation is "a gap is recorded"
+     * and one already is. Starting the test with a gap left over from startup
+     * would therefore discharge the new obligation for a legitimate reason and
+     * prove nothing about the failure path. */
+    bool clean = false;
+    for (int i = 0; i < WAIT_MS / 50; i++) {
+        atlas_watch_stats ws;
+        atlas_watcher_stats(r.watcher, &ws);
+        atlas_index_state g;
+        atlas_index_state_init(&g);
+        atlas_err rerr;
+        atlas_err_init(&rerr);
+        read_state(&r, 1, &g, &rerr);
+        /* Priming must be *finished* as well as the record clean. A directory
+         * created while the walk is still running is discovered by `readdir`,
+         * not by an inotify event, so it never enters the pending-ignore queue
+         * and never creates the obligation this test is about — it would be
+         * watched perfectly correctly and prove nothing. */
+        clean = ws.priming_complete && atlas_watcher_primed(r.watcher) && g.present &&
+                !g.event_gap && !g.pending_full_reconcile;
+        atlas_index_state_free(&g);
+        if (clean) {
+            break;
+        }
+        usleep(50000);
+    }
+    T_CHECK_MSG(clean, "the repository never reached a primed, clean state to start from");
+
+    /* A directory appears: it is queued, resolved, watched late, and therefore
+     * owes a content-verifying pass. Every publication is refused. */
+    T_OK(fx_mkdir(fx_repo(&r.fx), "late", &err), &err);
+    T_OK(fx_write(fx_repo(&r.fx), "late/f.c", "int f;\n", &err), &err);
+
+    /* The obligation is asserted directly rather than through the database's
+     * `event_gap` bit, because a full pass can clear that bit between two polls
+     * — which would make this test pass or fail on timing rather than on the
+     * property. `owed_gaps` is what the watcher still believes it owes. */
+    bool retained = false;
+    for (int i = 0; i < WAIT_MS / 20; i++) {
+        atlas_watch_stats ws;
+        atlas_watcher_stats(r.watcher, &ws);
+        if (ws.owed_gaps > 0) {
+            retained = true;
+            break;
+        }
+        usleep(20000);
+    }
+    if (!retained) {
+        atlas_watch_stats ws;
+        atlas_watcher_stats(r.watcher, &ws);
+        T_CHECK_MSG(false,
+                    "an obligation whose publication was refused must be retained, not "
+                    "discharged because a job was queued (watches=%lld subs=%lld primed=%d "
+                    "owed=%lld)",
+                    (long long)ws.watches, (long long)ws.subscriptions,
+                    (int)ws.priming_complete, (long long)ws.owed_gaps);
+    }
+
+    /* It stays owed: nothing discharges it while publication keeps failing. */
+    for (int i = 0; i < 20; i++) {
+        atlas_watch_stats ws;
+        atlas_watcher_stats(r.watcher, &ws);
+        if (ws.owed_gaps <= 0) {
+            atlas_index_state g;
+            atlas_index_state_init(&g);
+            atlas_err rerr;
+            atlas_err_init(&rerr);
+            read_state(&r, 1, &g, &rerr);
+            T_CHECK_MSG(false,
+                        "the obligation was discharged while publication was still failing "
+                        "(db: present=%d gap=%d pending=%d state=%s reason=%s)",
+                        (int)g.present, (int)g.event_gap, (int)g.pending_full_reconcile,
+                        atlas_watch_state_name(g.watch_state),
+                        atlas_watch_reason_name(g.watch_reason));
+            atlas_index_state_free(&g);
+            break;
+        }
+        usleep(20000);
+    }
+    rig_close(&r);
+
+    /* The other half: with publication working, the same scenario records the
+     * gap in the database. */
+    rig r2;
+    atlas_err e2;
+    atlas_err_init(&e2);
+    rig_open(&r2, &e2);
+    build_tree(&r2, fx_repo(&r2.fx), 2, &e2);
+    register_repo(&r2, fx_repo(&r2.fx), "healthy", &e2);
+    rig_start(&r2, 0, &e2);
+    atlas_index_state s2;
+    atlas_index_state_init(&s2);
+    T_CHECK(wait_repo_settled(&r2, 1, &s2));
+    T_OK(fx_mkdir(fx_repo(&r2.fx), "late", &e2), &e2);
+    T_OK(fx_write(fx_repo(&r2.fx), "late/f.c", "int f;\n", &e2), &e2);
+    bool landed = false;
+    for (int i = 0; i < WAIT_MS / 50; i++) {
+        atlas_index_state g;
+        atlas_index_state_init(&g);
+        atlas_err rerr;
+        atlas_err_init(&rerr);
+        read_state(&r2, 1, &g, &rerr);
+        if (g.present && (g.event_gap || g.pending_full_reconcile)) {
+            landed = true;
+        }
+        atlas_index_state_free(&g);
+        if (landed) {
+            break;
+        }
+        usleep(50000);
+    }
+    T_CHECK_MSG(landed, "with publication working the gap must reach the database");
+    atlas_index_state_free(&s2);
+    rig_close(&r2);
+}
+
 static const atlas_test TESTS[] = {
     {"the watch reason vocabulary round-trips and is distinct",
      test_reason_vocabulary_round_trips},
@@ -1207,6 +1591,14 @@ static const atlas_test TESTS[] = {
      test_exact_boundary_at_the_repository_ceiling},
     {"the pending-ignore queue holds N, overflows beyond it, and watches neither",
      test_the_pending_ignore_queue_is_bounded_from_both_sides},
+    {"metadata is allocated fairly: every repository's reserve before any excess",
+     test_metadata_is_allocated_fairly_across_repositories},
+    {"a shared descriptor is granted even at a full physical budget",
+     test_a_shared_descriptor_is_granted_at_a_full_budget},
+    {"a failing ignore refresh is frozen, not retried every tick",
+     test_a_failing_ignore_refresh_is_not_retried_every_tick},
+    {"an owed gap survives a failed publication and still forces a full pass",
+     test_an_owed_gap_survives_a_failed_publication},
     {"a repository-set change gaps every repository, not only the new one",
      test_a_repo_set_change_gaps_every_repository},
 };

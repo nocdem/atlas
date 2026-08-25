@@ -432,6 +432,96 @@ static void test_a_burst_of_new_directories_resolves(void) {
     live_stop(&L);
 }
 
+/* The intermediate state is observed, not inferred from the end state.
+ *
+ * A large visible subtree appears at once. Two things must be true *while* it is
+ * being dealt with, and neither is implied by eventual convergence:
+ *
+ *   1. The repository is persisted as `priming` and NOT current **before** the
+ *      ignore decision or the walk begins. A directory that has just appeared is
+ *      already an unobserved subtree; a reader arriving in that window must not
+ *      be told `watching`.
+ *   2. The walk is chunked. A 65 000-entry tree walked synchronously inside one
+ *      watcher tick would drain no inotify events for its duration, which is how
+ *      a queue overflow is manufactured — and an overflow gaps every repository
+ *      at once. The test asserts the daemon keeps answering throughout and that
+ *      the watch count climbs rather than jumping in one step.
+ *
+ * This is the case that distinguishes "it got there in the end" from "it never
+ * claimed something untrue on the way". */
+static void test_a_late_subtree_is_reported_priming_and_walked_in_chunks(void) {
+    live L;
+    atlas_err err;
+    atlas_err_init(&err);
+    live_start(&L, &err);
+    T_CHECK(wait_events(&L, "\"kind\":\"reconciled\"", &err));
+
+    atlas_buf doc = ATLAS_BUF_INIT;
+    T_CHECK(wait_current(&L, &doc, &err));
+    long before = state_int(&doc, "watched_source");
+
+    /* A visible tree large enough that a synchronous walk would be visible as a
+     * stall, created as one burst. */
+    /* Comfortably more than ATLAS_WATCH_PRIME_CHUNK_DIRS (512), so the walk
+     * must span several ticks and an intermediate count is observable — and
+     * small enough that the full content-verifying pass it owes afterwards
+     * finishes inside the deadline. */
+    const int N = 1500;
+    T_OK(fx_mkdir(fx_repo(&L.fx), "bulk", &err), &err);
+    for (int i = 0; i < N; i++) {
+        char d[64];
+        (void)snprintf(d, sizeof(d), "bulk/d%04d", i);
+        T_OK(fx_mkdir(fx_repo(&L.fx), d, &err), &err);
+    }
+
+    /* Sample the *persisted* state repeatedly while it settles. */
+    bool saw_priming_not_current = false;
+    bool saw_intermediate_count = false;
+    long last = before;
+    for (int i = 0; i < WAIT_MS / 50; i++) {
+        repo_state(&L, &doc, &err);
+        bool priming = state_says(&doc, "\"watch_state\":\"priming\"");
+        bool current = state_says(&doc, "\"index_current\":true");
+        if (priming) {
+            T_CHECK_MSG(!current,
+                        "a repository reported `priming` must never also be reported current");
+            saw_priming_not_current = true;
+        }
+        long now = state_int(&doc, "watched_source");
+        if (now > last && now < before + N) {
+            /* A count strictly between the start and the end is proof the walk
+             * was published in pieces rather than in one step. */
+            saw_intermediate_count = true;
+        }
+        if (now > last) {
+            last = now;
+        }
+        if (state_says(&doc, "\"watch_state\":\"watching\"") && now >= before + N) {
+            break;
+        }
+        usleep(50000);
+    }
+
+    T_CHECK_MSG(saw_priming_not_current,
+                "the repository must be persisted as priming and not current while a newly "
+                "appeared subtree is being resolved and walked");
+    T_CHECK_MSG(saw_intermediate_count,
+                "the walk must be chunked: an intermediate watch count between %ld and %ld was "
+                "never observed, which is what a single synchronous walk looks like",
+                before, before + N);
+
+    /* And it converges: everything watched, gap closed, current again. */
+    T_CHECK_MSG(wait_current(&L, &doc, &err),
+                "the repository must return to current once the subtree is watched");
+    long after = state_int(&doc, "watched_source");
+    T_CHECK_MSG(after == before + N + 1,
+                "expected %ld watches for %d new directories plus their parent, got %ld",
+                before + N + 1, N, after);
+
+    atlas_buf_free(&doc);
+    live_stop(&L);
+}
+
 static const atlas_test TESTS[] = {
     {"an ignored directory created empty after priming consumes no watch",
      test_future_ignored_directory_empty},
@@ -444,6 +534,8 @@ static const atlas_test TESTS[] = {
     {"a .gitignore edit takes effect without a repository-set change",
      test_gitignore_edit_takes_effect_without_a_repo_set_change},
     {"a .git/info/exclude change reaches the watcher", test_info_exclude_change_takes_effect},
+    {"a late subtree is reported priming and not current, and walked in chunks",
+     test_a_late_subtree_is_reported_priming_and_walked_in_chunks},
     {"a burst of new directories resolves and every one is watched",
      test_a_burst_of_new_directories_resolves},
 };

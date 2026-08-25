@@ -226,6 +226,22 @@
  * itself rather than truncate a tree silently. */
 #define ATLAS_WATCH_FRONTIER_MAX_BYTES (32u * 1024u * 1024u)
 
+/* P0. How long a repository waits before Atlas asks git about its ignore rules
+ * again, after the last attempt failed.
+ *
+ * Degrading the repository does not on its own stop the asking: a repository is
+ * reached through its pending-ignore queue as well as through the staleness
+ * flag, and a failure empties neither. Without a wait, a repository whose git
+ * invocation keeps failing -- a deleted working tree, a promisor repository that
+ * `atlas_git_open` refuses by design -- costs one process every watcher tick for
+ * as long as the condition lasts.
+ *
+ * Exponential between these two, and reset on any success. A genuine ignore-rule
+ * event clears the wait immediately, because that is new information rather than
+ * the same question asked again. */
+#define ATLAS_WATCH_IGNORE_RETRY_MIN_MS 1000
+#define ATLAS_WATCH_IGNORE_RETRY_MAX_MS 60000
+
 /* Directories waiting for an ignore decision, and the bytes of their names.
  *
  * A directory that appears while the daemon runs cannot be judged against the

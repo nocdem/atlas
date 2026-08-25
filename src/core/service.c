@@ -16,6 +16,7 @@
 #include "atlas/atlas.h"
 #include "atlas/lock.h"
 #include "atlas/pathrep.h"
+#include "atlas/scanner_uid.h"
 #include "core/service_internal.h"
 
 struct atlas_ctx {
@@ -533,11 +534,19 @@ static atlas_status derive_name(const char *root, char *out, size_t out_size, at
 
 atlas_status atlas_service_repo_add(atlas_ctx *ctx, const char *path, const char *name,
                                     atlas_repo_info *out, atlas_err *err) {
-    return atlas_service_repo_add_db(ctx->db, path, name, false, out, err);
+    return atlas_service_repo_add_db(ctx->db, path, name, false, false, 0, out, err);
+}
+
+atlas_status atlas_service_repo_add_as(atlas_ctx *ctx, const char *path, const char *name,
+                                       bool scanner_uid_given, int64_t scanner_uid,
+                                       atlas_repo_info *out, atlas_err *err) {
+    return atlas_service_repo_add_db(ctx->db, path, name, false, scanner_uid_given, scanner_uid,
+                                     out, err);
 }
 
 atlas_status atlas_service_repo_add_db(atlas_db *db, const char *path, const char *name,
-                                       bool exact_root, atlas_repo_info *out, atlas_err *err) {
+                                       bool exact_root, bool scanner_uid_given,
+                                       int64_t scanner_uid, atlas_repo_info *out, atlas_err *err) {
     atlas_git *g = NULL;
     atlas_status st = atlas_git_open(path, &g, err);
     if (st != ATLAS_OK) {
@@ -597,9 +606,37 @@ atlas_status atlas_service_repo_add_db(atlas_db *db, const char *path, const cha
     ident.is_linked_worktree = atlas_git_is_linked_worktree(g);
     ident.object_format = atlas_git_object_format(g);
 
+    /* A13. Which uid's scanner may read this tree, settled *before* anything is
+     * inserted. A refused uid must leave no repository behind: 0 is how the
+     * column records "no scanner assigned", so a registration that stored it
+     * after a refusal would make the refusal indistinguishable from an absence. */
+    int64_t suid = scanner_uid;
+    if (!scanner_uid_given) {
+        st = atlas_scanner_uid_of_root(root, &suid, err);
+        if (st != ATLAS_OK) {
+            atlas_git_close(g);
+            return st;
+        }
+    }
+    {
+        const char *why = atlas_scanner_uid_refusal(suid);
+        if (why != NULL) {
+            atlas_status refuse =
+                atlas_err_set(err, ATLAS_ERR_USAGE,
+                              "uid %lld cannot be this repository's scanner: %s", (long long)suid,
+                              why);
+            atlas_git_close(g);
+            return refuse;
+        }
+    }
+
     int64_t id = 0;
     st = atlas_db_repo_add(db, effective, &ident, &id, err);
     atlas_git_close(g);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    st = atlas_db_repo_set_scanner_uid(db, id, suid, err);
     if (st != ATLAS_OK) {
         return st;
     }

@@ -13,6 +13,8 @@
 #include "db/db_internal.h"
 #include "support/fixture.h"
 
+#include <unistd.h>
+
 /* Opens the fixture's index and brings it to the current schema.
  * `atlas_db_open` takes the database *file*, which `atlas_datadir_db_path`
  * derives from the data directory, and it creates that file without applying a
@@ -80,15 +82,15 @@ static void test_scanner_uid_round_trips_and_zero_clears(void) {
 
     atlas_repo_info reg;
     atlas_repo_info_init(&reg);
-    T_OK(atlas_service_repo_add_db(db, fx_repo(&fx), "r", false, &reg, &err), &err);
+    T_OK(atlas_service_repo_add_db(db, fx_repo(&fx), "r", false, false, 0, &reg, &err), &err);
     int64_t repo_id = reg.id;
-    /* Registration assigns nothing yet — Task 4 is what does. */
-    T_EQ_INT((int)reg.scanner_uid, 0);
+    /* Registration now derives it from the root's owner (Task 4). */
+    T_EQ_INT((int)reg.scanner_uid, (int)getuid());
     atlas_repo_info_free(&reg);
 
     int64_t got = -1;
     T_OK(atlas_db_repo_scanner_uid(db, repo_id, &got, &err), &err);
-    T_EQ_INT((int)got, 0);
+    T_EQ_INT((int)got, (int)getuid());
 
     T_OK(atlas_db_repo_set_scanner_uid(db, repo_id, 1000, &err), &err);
     T_OK(atlas_db_repo_scanner_uid(db, repo_id, &got, &err), &err);

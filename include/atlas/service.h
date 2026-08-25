@@ -154,8 +154,14 @@ atlas_status atlas_service_doctor(atlas_ctx *ctx, atlas_doctor_report *out, atla
 
 /* --- repositories ------------------------------------------------------- */
 
+/* Derives the scanner uid from the repository root's owner. Use
+ * `atlas_service_repo_add_as` to name one instead. */
 atlas_status atlas_service_repo_add(atlas_ctx *ctx, const char *path, const char *name,
                                     atlas_repo_info *out, atlas_err *err);
+/* As above, but with the operator's own choice of scanner uid. */
+atlas_status atlas_service_repo_add_as(atlas_ctx *ctx, const char *path, const char *name,
+                                       bool scanner_uid_given, int64_t scanner_uid,
+                                       atlas_repo_info *out, atlas_err *err);
 atlas_status atlas_service_repo_list(atlas_ctx *ctx, atlas_repo_cb cb, void *ud, int64_t *count_out,
                                      atlas_err *err);
 /* Removes Atlas metadata only. The target repository is never touched. */
@@ -241,8 +247,15 @@ atlas_status atlas_service_history(atlas_ctx *ctx, const char *name, const char 
  * root means something narrower — *this* directory — so registering its parent
  * would index files outside what was granted. The MCP adapter therefore asks for
  * the exact form; the CLI and the session-start hook do not. */
+/* A13. `scanner_uid_given` false derives the scanner uid from the repository
+ * root's owner; true takes `scanner_uid` as the operator's own choice. The flag
+ * is separate from the value because 0 already means "no scanner assigned" in
+ * the column and cannot also mean "derive one". A uid that may never scan fails
+ * the registration rather than being stored, so a refusal never reads as an
+ * absence. `out->scanner_uid` carries what was stored. */
 atlas_status atlas_service_repo_add_db(atlas_db *db, const char *path, const char *name,
-                                       bool exact_root, atlas_repo_info *out, atlas_err *err);
+                                       bool exact_root, bool scanner_uid_given,
+                                       int64_t scanner_uid, atlas_repo_info *out, atlas_err *err);
 atlas_status atlas_service_repo_remove_db(atlas_db *db, const char *name, atlas_repo_info *removed,
                                           atlas_err *err);
 

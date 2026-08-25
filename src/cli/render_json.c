@@ -206,6 +206,7 @@ static atlas_status repo_body(atlas_renderer *r, const atlas_repo_info *ri, atla
     TRY(json_safe_bytes(j, p, "git_dir", ri->git_dir.data, ri->git_dir.len, err));
     TRY(atlas_json_key_bool(j, "is_linked_worktree", ri->is_linked_worktree, err));
     TRY(atlas_json_key_str(j, "object_format", ri->object_format, err));
+    TRY(atlas_json_key_int(j, "scanner_uid", ri->scanner_uid, err));
     TRY(atlas_json_key_str(j, "registered_at", ri->registered_at, err));
     TRY(atlas_json_key_str_opt(j, "last_scan_at",
                                ri->last_scan_at[0] != '\0' ? ri->last_scan_at : NULL, err));

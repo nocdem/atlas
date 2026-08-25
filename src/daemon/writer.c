@@ -656,8 +656,10 @@ static void run_repo_add(atlas_writer *w, atlas_job *j) {
     atlas_repo_info info;
     atlas_repo_info_init(&info);
     const char *name = j->arg2.len > 0 ? atlas_buf_cstr(&j->arg2) : NULL;
+    /* A13: derive the scanner uid from the root's owner. This path has no
+     * operator to name one — it is the daemon acting on a queued job. */
     atlas_status st = atlas_service_repo_add_db(w->db, atlas_buf_cstr(&j->arg1), name,
-                                                j->exact_root, &info, &j->result_err);
+                                                j->exact_root, false, 0, &info, &j->result_err);
     if (st == ATLAS_OK) {
         atlas_err ignore;
         atlas_err_init(&ignore);

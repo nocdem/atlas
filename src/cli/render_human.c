@@ -238,6 +238,13 @@ static atlas_status h_repo_added(atlas_renderer *r, const atlas_repo_info *ri, a
     (void)fprintf(r->out, LABEL "%s\n", "worktree",
                   ri->is_linked_worktree ? "linked worktree" : "main worktree");
     (void)fprintf(r->out, LABEL "%s\n", "object format", ri->object_format);
+    /* A13. An Atlas integer, not repository text, so it is printed as-is. 0 is
+     * shown as "-" because it means no scanner is assigned, not uid 0. */
+    if (ri->scanner_uid > 0) {
+        (void)fprintf(r->out, LABEL "%lld\n", "scanner uid", (long long)ri->scanner_uid);
+    } else {
+        (void)fprintf(r->out, LABEL "%s\n", "scanner uid", "- (none assigned)");
+    }
     (void)fprintf(r->out, LABEL "%s\n", "registered at", ri->registered_at);
     (void)fprintf(r->out, "next: atlas scan %s\n", ri->name);
     return ok();

@@ -7,6 +7,7 @@
 #include "atlas/cli.h"
 
 #include <stdio.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -85,7 +86,8 @@ void atlas_cli_print_help(FILE *out) {
         "  plan show PLAN --rev N    one revision's plan document (untrusted)\n"
         "  plan list                 plans this principal created\n"
         "  doctor                     check the environment, database and search backend\n"
-        "  repo add PATH [--name N]   register a git repository (read-only)\n"
+        "  repo add PATH [--name N] [--scanner-uid UID]\n"
+        "                             register a git repository (read-only)\n"
         "  repo list                  list registered repositories\n"
         "  repo remove NAME --yes     forget a repository; never touches the repository\n"
         "  scan NAME                  index tracked files and git history\n"
@@ -815,6 +817,24 @@ static atlas_status parse_args(cli_state *st, int argc, char **argv, bool *want_
                 }
                 st->operands[st->operand_count++] = "--name";
                 st->operands[st->operand_count++] = a + 7;
+            } else if (strcmp(a, "--scanner-uid") == 0) {
+                /* A13. Belongs to `repo add` and `repo scanner`; collected as an
+                 * operand so the command validates its placement, exactly as
+                 * `--name` is. */
+                if (i + 1 >= argc) {
+                    return atlas_err_set(err, ATLAS_ERR_USAGE, "--scanner-uid needs a value");
+                }
+                if (st->operand_count + 2u > sizeof(st->operands) / sizeof(st->operands[0])) {
+                    return atlas_err_set(err, ATLAS_ERR_USAGE, "too many arguments");
+                }
+                st->operands[st->operand_count++] = a;
+                st->operands[st->operand_count++] = argv[++i];
+            } else if (strncmp(a, "--scanner-uid=", 14u) == 0) {
+                if (st->operand_count + 2u > sizeof(st->operands) / sizeof(st->operands[0])) {
+                    return atlas_err_set(err, ATLAS_ERR_USAGE, "too many arguments");
+                }
+                st->operands[st->operand_count++] = "--scanner-uid";
+                st->operands[st->operand_count++] = a + 14;
             } else if (strcmp(a, "--limit") == 0) {
                 if (i + 1 >= argc) {
                     return atlas_err_set(err, ATLAS_ERR_USAGE, "--limit needs a number");
@@ -868,6 +888,42 @@ static atlas_status take_name(cli_state *st, const char **name_out, atlas_err *e
                 return atlas_err_set(err, ATLAS_ERR_USAGE, "--name needs a value");
             }
             *name_out = st->operands[i + 1u];
+            i++;
+            continue;
+        }
+        st->operands[w++] = st->operands[i];
+    }
+    st->operand_count = w;
+    return ATLAS_OK;
+}
+
+/* A13. `--scanner-uid N`, for `repo add` and `repo scanner`.
+ *
+ * `*given_out` stays false when the flag is absent, which is what selects
+ * "derive from the repository root's owner". The flag is separate from the
+ * value because 0 already means "no scanner assigned" and cannot also mean
+ * "derive one". A value that is not a plain non-negative integer is a usage
+ * error rather than a silent 0. */
+static atlas_status take_scanner_uid(cli_state *st, bool *given_out, int64_t *uid_out,
+                                     atlas_err *err) {
+    *given_out = false;
+    *uid_out = 0;
+    size_t w = 0;
+    for (size_t i = 0; i < st->operand_count; i++) {
+        if (strcmp(st->operands[i], "--scanner-uid") == 0) {
+            if (i + 1u >= st->operand_count) {
+                return atlas_err_set(err, ATLAS_ERR_USAGE, "--scanner-uid needs a value");
+            }
+            const char *v = st->operands[i + 1u];
+            char *end = NULL;
+            errno = 0;
+            long long parsed = strtoll(v, &end, 10);
+            if (errno != 0 || end == v || *end != '\0' || parsed < 0) {
+                return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                     "--scanner-uid takes a non-negative integer uid");
+            }
+            *given_out = true;
+            *uid_out = (int64_t)parsed;
             i++;
             continue;
         }
@@ -3531,6 +3587,13 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
         return s;
     }
 
+    bool repo_scanner_uid_given = false;
+    int64_t repo_scanner_uid = 0;
+    s = take_scanner_uid(st, &repo_scanner_uid_given, &repo_scanner_uid, err);
+    if (s != ATLAS_OK) {
+        return s;
+    }
+
     /* Commands that own their own lifecycle, before any context is opened. */
     if (strcmp(cmd, "daemon") == 0 && st->operand_count > 0 &&
         strcmp(st->operands[0], "run") == 0) {
@@ -4164,11 +4227,13 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
         } else if (strcmp(st->operands[0], "add") == 0) {
             if (st->operand_count != 2u) {
                 result = atlas_err_set(err, ATLAS_ERR_USAGE,
-                                       "usage: atlas repo add PATH [--name NAME]");
+                                       "usage: atlas repo add PATH [--name NAME] [--scanner-uid UID]");
             } else {
                 atlas_repo_info info;
                 atlas_repo_info_init(&info);
-                result = atlas_service_repo_add(ctx, st->operands[1], repo_arg_name, &info, err);
+                result = atlas_service_repo_add_as(ctx, st->operands[1], repo_arg_name,
+                                                   repo_scanner_uid_given, repo_scanner_uid, &info,
+                                                   err);
                 if (result == ATLAS_OK) {
                     result = renderer_open(&r, st->opts.json, st->out, "repo add", err);
                     if (result == ATLAS_OK) {

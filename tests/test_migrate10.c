@@ -182,6 +182,11 @@ static void test_a_schema_nine_database_reaches_ten_additively(void) {
              "DROP TABLE sem_current;"
              "DROP TABLE sem_generations;"
              "DROP TABLE decision_edge_events;"
+             /* Migration 27 added a column to `repositories`. A rewind that leaves a
+              * later migration's *column* behind is no more a schema-N database than
+              * one that leaves its table behind, and re-running the chain would
+              * fail with "duplicate column name". */
+             "ALTER TABLE repositories DROP COLUMN scanner_uid;"
              "DELETE FROM schema_migrations WHERE version >= 10;");
     T_EQ_INT(schema_of(db), 9);
     T_CHECK(!table_exists(db, "decision_edge_events"));

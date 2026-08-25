@@ -1017,6 +1017,12 @@ static void test_without_contention_an_expired_lease_is_still_reclaimed(void) {
     T_EQ_INT((int)r.retried, 1);
     atlas_orch_result_free(&r);
 
+    /* The submit and lease results own buffers, and every sibling case in this
+     * file frees them. This one did not — 832 bytes in 12 allocations, reported
+     * by the ASan/LSan gate. Pre-existing and unrelated to what surfaced it. */
+    atlas_orch_result_free(&s);
+    atlas_orch_result_free(&g);
+
     /* Stale contention is not contention. An outage half an hour ago says
      * nothing about whether this worker could heartbeat a moment ago. */
     env_close(&e);

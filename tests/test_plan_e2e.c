@@ -470,6 +470,15 @@ static atlas_status drive(e2e *g, const drive_opts *d, atlas_plandriver_report *
 /* The plan as a client reads it: one `plan.get` with the per-task detail, parsed
  * by the production readers. */
 static void read_state(const char *plan_uid, atlas_plan_state *out) {
+    /* Zeroed first, which is the contract every production caller honours —
+     * `plandriver.c`'s `read_state` and `server_orch.c` both `memset` before
+     * asking. `atlas_plan_read_state` *fills* a state rather than resetting one,
+     * and its task loop guards on `out->task_count < ATLAS_PLAN_MAX_TASKS`; with
+     * an uninitialised struct that count can start above the bound, so the loop
+     * never runs and the caller then iterates a garbage count off the end of a
+     * fixed eight-element array. Found by the UBSan gate, which reported
+     * `index 8 out of bounds for type 'atlas_plan_task_view [8]'`. */
+    memset(out, 0, sizeof(*out));
     atlas_err err;
     atlas_err_init(&err);
     atlas_ipc_response *r = NULL;

@@ -127,7 +127,15 @@ static void test_an_attempt_gets_its_own_validated_tree(void) {
     {
         atlas_buf open_root = ATLAS_BUF_INIT;
         T_OK(atlas_buf_appendf(&open_root, &err, "%s/open", fx_data_dir(&e.fx)), &err);
+        /* `chmod` after `mkdir`, because `mkdir`'s mode is masked by the
+         * process umask and this test's whole premise is that the directory is
+         * group-writable. Under the umask of 0077 this machine uses,
+         * `mkdir(..., 0777)` produces 0700 — so the refusal under test was never
+         * exercised and the assertion failed for the opposite of the reason it
+         * describes. Pre-existing and unrelated to the watcher; found by running
+         * the suite. */
         T_REQUIRE(mkdir(atlas_buf_cstr(&open_root), 0777) == 0);
+        T_REQUIRE(chmod(atlas_buf_cstr(&open_root), 0777) == 0);
         atlas_ws bad;
         atlas_err e2;
         atlas_err_init(&e2);

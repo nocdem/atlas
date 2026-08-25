@@ -191,8 +191,59 @@ static void test_an_unknown_repository_is_an_error(void) {
     fx_close(&fx);
 }
 
+/* A repository with no scanner is a finding, never silence.
+ *
+ * Every repository that predates A13 is in this state, and after later plans it
+ * will also be a repository that never reports as current. An operator must be
+ * able to learn that from `atlas doctor` alone, with the repository named — a
+ * count nobody can act on is not a diagnosis. */
+static void test_doctor_names_a_repository_with_no_scanner(void) {
+    fixture fx;
+    atlas_err err;
+    atlas_err_init(&err);
+    T_OK(fx_open(&fx, &err), &err);
+    T_OK(fx_init_repo(&fx, fx_repo(&fx), "sha1", &err), &err);
+    T_OK(fx_write(fx_repo(&fx), "a.txt", "x\n", &err), &err);
+    T_OK(fx_add_all(&fx, fx_repo(&fx), &err), &err);
+    T_OK(fx_commit(&fx, fx_repo(&fx), "first", &err), &err);
+
+    atlas_ctx_opts opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.data_dir_override = fx_data_dir(&fx);
+    atlas_ctx *ctx = NULL;
+    T_OK(atlas_ctx_open(&opts, &ctx, &err), &err);
+
+    atlas_repo_info info;
+    atlas_repo_info_init(&info);
+    T_OK(atlas_service_repo_add(ctx, fx_repo(&fx), "r", &info, &err), &err);
+    int64_t id = info.id;
+    atlas_repo_info_free(&info);
+
+    /* Clean first: a repository that has one is not a finding. */
+    atlas_doctor_report clean;
+    atlas_doctor_report_init(&clean);
+    T_OK(atlas_service_doctor(ctx, &clean, &err), &err);
+    T_EQ_INT(clean.repos_without_scanner, 0);
+    atlas_doctor_report_free(&clean);
+
+    /* Now a pre-A13 row. */
+    T_OK(atlas_db_repo_set_scanner_uid(atlas_ctx_db(ctx), id, 0, &err), &err);
+
+    atlas_doctor_report rep;
+    atlas_doctor_report_init(&rep);
+    T_OK(atlas_service_doctor(ctx, &rep, &err), &err);
+    T_EQ_INT(rep.repos_without_scanner, 1);
+    /* Named, not merely counted. */
+    T_CHECK(strstr(atlas_buf_cstr(&rep.problems), "\"r\"") != NULL);
+    atlas_doctor_report_free(&rep);
+
+    atlas_ctx_close(ctx);
+    fx_close(&fx);
+}
+
 static const atlas_test TESTS[] = {
     {"registration derives the uid from the root", test_registration_derives_the_uid_from_the_root},
+    {"doctor names a repository with no scanner", test_doctor_names_a_repository_with_no_scanner},
     {"the command assigns a uid to an existing repository",
      test_the_command_assigns_a_uid_to_an_existing_repository},
     {"the command refuses and leaves the old value",

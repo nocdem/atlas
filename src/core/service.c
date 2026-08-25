@@ -298,10 +298,39 @@ static atlas_status add_problem(atlas_doctor_report *r, atlas_err *err, const ch
     return atlas_buf_append_str(&r->problems, text, err);
 }
 
-static atlas_status count_repos_cb(const atlas_repo_info *ri, void *ud, atlas_err *err) {
-    (void)ri;
+
+/* A13. Counts repositories and names the ones with no scanner uid, in one walk.
+ *
+ * The row callback receives borrowed pointers valid only for the call, so the
+ * name is formatted into the report here rather than kept. `status` carries a
+ * failure out because the callback's own error return would abandon the walk
+ * and lose the count. */
+typedef struct doctor_repo_scan {
+    atlas_doctor_report *report;
+    atlas_err *err;
+    atlas_status status;
+} doctor_repo_scan;
+
+static atlas_status doctor_repo_cb(const atlas_repo_info *ri, void *ud, atlas_err *err) {
+    doctor_repo_scan *s = (doctor_repo_scan *)ud;
     (void)err;
-    (*(int64_t *)ud)++;
+    s->report->repo_count++;
+    if (ri->scanner_uid != 0 || s->status != ATLAS_OK) {
+        return ATLAS_OK;
+    }
+    s->report->repos_without_scanner++;
+    /* A repository name is a checked Atlas name, not repository prose, but it
+     * reaches a terminal through `problems`, so it is encoded like every other
+     * untrusted value on that path. */
+    atlas_safe_pool safe;
+    atlas_safe_pool_init(&safe);
+    char line[256];
+    (void)snprintf(line, sizeof(line),
+                   "repository \"%s\" has no scanner uid, so nothing may report about it "
+                   "(try: atlas repo scanner %s)",
+                   atlas_safe(&safe, ri->name), atlas_safe(&safe, ri->name));
+    s->status = add_problem(s->report, s->err, line);
+    atlas_safe_pool_free(&safe);
     return ATLAS_OK;
 }
 
@@ -506,7 +535,24 @@ atlas_status atlas_service_doctor(atlas_ctx *ctx, atlas_doctor_report *out, atla
     }
 
     out->repo_count = 0;
-    return atlas_db_repo_list(ctx->db, count_repos_cb, &out->repo_count, err);
+    {
+        /* A13. Counted and *named* in the same walk that counts repositories.
+         *
+         * Every repository registered before migration 27 is in this state:
+         * the migration could not `stat` a root, so it assigned nothing rather
+         * than inventing an intent nobody expressed. Naming them is the point —
+         * a count nobody can act on is not a diagnosis, and the remedy is one
+         * command. */
+        doctor_repo_scan scan;
+        memset(&scan, 0, sizeof(scan));
+        scan.report = out;
+        scan.err = err;
+        atlas_status walk = atlas_db_repo_list(ctx->db, doctor_repo_cb, &scan, err);
+        if (walk != ATLAS_OK) {
+            return walk;
+        }
+        return scan.status;
+    }
 }
 
 /* --- repositories -------------------------------------------------------- */

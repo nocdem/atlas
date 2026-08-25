@@ -144,6 +144,9 @@ typedef struct atlas_doctor_report {
      * that silently fell back to per-user mode would otherwise look identical. */
     atlas_syspolicy_state deployment_state;
     atlas_syspolicy_reason deployment_reason;
+    /* A13. How many registered repositories have no scanner uid. Each is named
+     * in `problems`: a count nobody can act on is not a diagnosis. */
+    int repos_without_scanner;
     bool ok;                  /* no blocking problem found */
     atlas_buf problems;       /* newline-separated, empty when ok */
 } atlas_doctor_report;

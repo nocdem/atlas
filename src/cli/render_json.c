@@ -151,6 +151,7 @@ static atlas_status j_doctor(atlas_renderer *r, const atlas_doctor_report *rep, 
     TRY(json_safe(j, p, "integrity_check", atlas_buf_cstr(&rep->integrity), err));
     TRY(json_safe(j, p, "foreign_key_check", atlas_buf_cstr(&rep->foreign_key_check), err));
     TRY(atlas_json_key_int(j, "repositories", rep->repo_count, err));
+    TRY(atlas_json_key_int(j, "repositories_without_scanner", rep->repos_without_scanner, err));
     /* A7. Closed vocabularies, so no encoding is needed or wanted. */
     TRY(atlas_json_key_str(j, "operator_authority",
                            rep->authority_state == ATLAS_AUTHORITY_GRANTED ? "granted" : "locked",

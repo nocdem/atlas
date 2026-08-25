@@ -183,6 +183,9 @@ static atlas_status h_doctor(atlas_renderer *r, const atlas_doctor_report *rep, 
                   atlas_safe(&r->safe, atlas_buf_cstr(&rep->foreign_key_check)));
     (void)fprintf(o, LABEL "%s\n", "text encoding", ATLAS_TEXT_ENCODING_NAME);
     (void)fprintf(o, LABEL "%" PRId64 "\n", "repositories", rep->repo_count);
+    if (rep->repos_without_scanner > 0) {
+        (void)fprintf(o, LABEL "%d\n", "without scanner", rep->repos_without_scanner);
+    }
 
     if (rep->problems.len > 0) {
         (void)fprintf(o, "problems:\n");

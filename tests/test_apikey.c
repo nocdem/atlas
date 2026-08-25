@@ -164,10 +164,20 @@ static void test_a_created_key_is_shown_once_and_never_again(void) {
                 "the plaintext token is in the database file");
     {
         /* And neither is the secret half on its own, in case a prefix was
-         * stripped somewhere on the way in. */
-        const char *body = strrchr(token, '_');
-        T_REQUIRE(body != NULL);
-        T_CHECK_MSG(!file_contains(atlas_buf_cstr(&db_path), body + 1),
+         * stripped somewhere on the way in.
+         *
+         * Split at the **known offset**, never at the last `_`. base64url's
+         * alphabet ends `...789-_`, so about one secret in twenty contains an
+         * underscore in its last two characters and `strrchr` then returns a
+         * tail of one or two bytes — which is present in a file of any size, so
+         * the assertion failed for a reason with nothing to do with what it was
+         * asserting. Measured at 1 failure in 120 release runs before this
+         * change; found by the P0 gate matrix, present since A9. */
+        const char *body = token + strlen(ATLAS_APIKEY_PREFIX) + ATLAS_APIKEY_SELECTOR_HEX + 1u;
+        T_CHECK_MSG(strlen(body) == ATLAS_APIKEY_SECRET_B64,
+                    "the token's secret half is %zu characters, expected %u", strlen(body),
+                    (unsigned)ATLAS_APIKEY_SECRET_B64);
+        T_CHECK_MSG(!file_contains(atlas_buf_cstr(&db_path), body),
                     "the secret half of the token is in the database file");
     }
 

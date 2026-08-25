@@ -60,7 +60,9 @@ static void table_digest(atlas_db *db, const char *table, const char *order, con
                          char *out) {
     atlas_err err;
     atlas_err_init(&err);
-    char sql[256];
+    /* Large enough for the longest explicit column list above; a truncated
+     * statement would fail with a confusing "no such column". */
+    char sql[512];
     (void)snprintf(sql, sizeof(sql), "SELECT %s FROM %s ORDER BY %s;",
                    cols != NULL ? cols : "*", table, order);
     /* Not the cached prepare: the SQL is constructed, so the pointer-keyed cache
@@ -118,7 +120,16 @@ typedef struct table_ref {
 } table_ref;
 
 static const table_ref PRE_A4_TABLES[] = {
-    {"repositories", "id", NULL},
+    {"repositories", "id",
+     /* Migration 27 adds `scanner_uid` to this table. The twenty-one below are
+      * exactly what migrations 1 and 2 created, and every one of them must still
+      * hold its original value in its original position — which is the property
+      * this test is for. Listed explicitly for the same reason `repo_index_state`
+      * is: `SELECT *` would make any later addition look like damage. */
+     "id, name, root_path, root_path_text, git_common_dir, git_common_dir_text, object_format, "
+     "registered_at, last_scan_at, last_scan_id, scanned_head, current_branch, head_state, dirty, "
+     "dirty_staged, dirty_unstaged, dirty_untracked, dirty_unmerged, git_dir, git_dir_text, "
+     "is_linked_worktree"},
     {"scans", "id", NULL},
     {"files", "id", NULL},
     {"commits", "id", NULL},

@@ -336,6 +336,7 @@ bool job_kind_is_unbounded(atlas_job_kind kind) {
     case ATLAS_JOB_RECONCILE:
     case ATLAS_JOB_REPO_ADD:
     case ATLAS_JOB_REPO_REMOVE:
+    case ATLAS_JOB_REPO_SCANNER:
     case ATLAS_JOB_MARK_GAP:
     case ATLAS_JOB_SET_WATCH:
     case ATLAS_JOB_AI:
@@ -423,6 +424,10 @@ bool job_kind_is_drainable(atlas_job_kind kind) {
      * cannot interleave with a pass, and that impossibility is worth keeping. */
     case ATLAS_JOB_REPO_ADD:
     case ATLAS_JOB_REPO_REMOVE:
+    /* One row, one statement, and it changes which principal may report about a
+     * repository -- not what a running pass is reading. It is here rather than
+     * among the drainable kinds because it shares `repositories` with them. */
+    case ATLAS_JOB_REPO_SCANNER:
     /* Watcher bookkeeping, ordered against the reconcile submissions it
      * accompanies. Nothing latency-critical is waiting on either. */
     case ATLAS_JOB_MARK_GAP:
@@ -667,6 +672,49 @@ static void run_reconcile(atlas_writer *w, atlas_job *j) {
 
 /* Registers a repository. Runs here rather than on the IPC thread because it
  * writes, and every write in the daemon is this thread's. */
+/* A13. Names the uid whose scanner may report about one repository.
+ *
+ * The write goes through `atlas_service_repo_set_scanner_db`, which is the same
+ * function the local path calls: there is one write point, and this is a second
+ * *route* to it rather than a second implementation of it.
+ *
+ * `arg1` is the repository name and `arg2` carries the uid as text, empty when
+ * the operator named none and the owner of the root is to be derived. The job
+ * shape already provides two strings; adding an integer field for one caller
+ * would be a wider change than encoding a number the way every other argument
+ * on this path is already encoded. */
+static void run_repo_scanner(atlas_writer *w, atlas_job *j) {
+    atlas_repo_info info;
+    atlas_repo_info_init(&info);
+    const char *uid_text = atlas_buf_cstr(&j->arg2);
+    bool uid_given = uid_text[0] != '\0';
+    int64_t uid = 0;
+    if (uid_given) {
+        char *end = NULL;
+        long long v = strtoll(uid_text, &end, 10);
+        if (end == uid_text || *end != '\0') {
+            j->result = atlas_err_set(&j->result_err, ATLAS_ERR_USAGE,
+                                      "a scanner uid must be a decimal number");
+            atlas_repo_info_free(&info);
+            return;
+        }
+        uid = (int64_t)v;
+    }
+    atlas_status st = atlas_service_repo_set_scanner_db(w->db, atlas_buf_cstr(&j->arg1), uid_given,
+                                                        uid, &info, &j->result_err);
+    if (st == ATLAS_OK) {
+        st = job_set_result(j, &info, &j->result_err);
+    }
+    j->result = st;
+    if (st == ATLAS_OK) {
+        /* Which tree this repository is read from has just changed, so the watch
+         * set is no longer derived from current facts. The watcher re-derives it
+         * rather than being handed one. */
+        atlas_writer_set_watch_dirty(w);
+    }
+    atlas_repo_info_free(&info);
+}
+
 static void run_repo_add(atlas_writer *w, atlas_job *j) {
     atlas_repo_info info;
     atlas_repo_info_init(&info);
@@ -1128,6 +1176,7 @@ static void writer_run_job(atlas_writer *w, atlas_job *j) {
     case ATLAS_JOB_RECONCILE: run_reconcile(w, j); break;
     case ATLAS_JOB_REPO_ADD: run_repo_add(w, j); break;
     case ATLAS_JOB_REPO_REMOVE: run_repo_remove(w, j); break;
+    case ATLAS_JOB_REPO_SCANNER: run_repo_scanner(w, j); break;
     case ATLAS_JOB_AI: run_ai(w, j); break;
     case ATLAS_JOB_DECISION: run_decision(w, j); break;
     case ATLAS_JOB_ORCH: run_orch(w, j); break;
@@ -1895,6 +1944,18 @@ atlas_status atlas_writer_call_repo_add(atlas_writer *w, const char *path, const
                                         bool exact_root, int timeout_ms,
                                         atlas_writer_result *result, atlas_err *err) {
     return writer_call_impl(w, ATLAS_JOB_REPO_ADD, path, name, exact_root, timeout_ms, result,
+                            err);
+}
+
+/* A13. Names a repository's scanner uid, while the daemon runs.
+ *
+ * `uid_text` is empty when the operator named none, which asks the write point
+ * to derive it from the root's owner -- the same defaulting the local path
+ * performs, because it is the same function. */
+atlas_status atlas_writer_call_repo_scanner(atlas_writer *w, const char *name,
+                                            const char *uid_text, int timeout_ms,
+                                            atlas_writer_result *result, atlas_err *err) {
+    return writer_call_impl(w, ATLAS_JOB_REPO_SCANNER, name, uid_text, false, timeout_ms, result,
                             err);
 }
 

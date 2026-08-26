@@ -48,6 +48,16 @@ typedef enum atlas_job_kind {
     ATLAS_JOB_RECONCILE = 0,
     ATLAS_JOB_REPO_ADD,
     ATLAS_JOB_REPO_REMOVE,
+    /* A13. Assigning a repository's scanner uid while the daemon runs.
+     *
+     * A7 made the registry local-only because "the socket carries no authority:
+     * every peer on it is the same uid as the daemon". A7.1 ended that premise
+     * by splitting the principals, and the operator group this method sits in
+     * is selected by SO_PEERCRED against the root-owned policy — the same door
+     * `code.index` and `backup.create` already use. So the refusal that made an
+     * operator stop the daemon to name a scanner is answered by the mechanism
+     * A7.1 built, not by weakening what A7 established. */
+    ATLAS_JOB_REPO_SCANNER,
     /* The watcher observes the conditions that produce these but holds a
      * read-only handle, so it hands them to the writer rather than acquiring a
      * second write path into the index. */
@@ -406,6 +416,11 @@ atlas_status atlas_writer_call(atlas_writer *w, atlas_job_kind kind, const char 
 atlas_status atlas_writer_call_repo_add(atlas_writer *w, const char *path, const char *name,
                                         bool exact_root, int timeout_ms,
                                         atlas_writer_result *result, atlas_err *err);
+/* A13. Names a repository's scanner uid while the daemon runs. `uid_text` empty
+ * derives it from the root's owner. */
+atlas_status atlas_writer_call_repo_scanner(atlas_writer *w, const char *name,
+                                            const char *uid_text, int timeout_ms,
+                                            atlas_writer_result *result, atlas_err *err);
 
 /* Queues one AI-session operation and waits for it, bounded by `timeout_ms`.
  *

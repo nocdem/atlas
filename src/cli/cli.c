@@ -3661,6 +3661,34 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
             atlas_buf_free(&params);
             return vst;
         }
+        /* A13. `repo scanner` routes, because A7.1 gave it somewhere to route
+         * to: `repo.scanner` is in the operator-uid group, selected by
+         * `SO_PEERCRED` against the root-owned policy. See the comment on
+         * `method_repo_scanner`. */
+        if (strcmp(cmd, "repo") == 0 && st->operand_count == 2u &&
+            strcmp(st->operands[0], "scanner") == 0) {
+            atlas_buf params = ATLAS_BUF_INIT;
+            atlas_status vst = atlas_db_check_repo_name(st->operands[1], err);
+            if (vst == ATLAS_OK) {
+                vst = atlas_buf_appendf(&params, err, "{\"repo\":\"%s\"", st->operands[1]);
+            }
+            if (vst == ATLAS_OK && repo_scanner_uid_given) {
+                /* Sent only when the operator named one. Absent means "derive it
+                 * from the root's owner", and a key carrying a default would
+                 * make those two indistinguishable at the write point. */
+                vst = atlas_buf_appendf(&params, err, ",\"scanner_uid\":\"%lld\"",
+                                        (long long)repo_scanner_uid);
+            }
+            if (vst == ATLAS_OK) {
+                vst = atlas_buf_appendf(&params, err, "}");
+            }
+            if (vst == ATLAS_OK) {
+                vst = call_daemon_mutation(st, st->operands[1], "repo.scanner",
+                                           atlas_buf_cstr(&params), "repo", err);
+            }
+            atlas_buf_free(&params);
+            return vst;
+        }
         /* **A7: the registry is not routed, because it has nowhere to route
          * to.**
          *
@@ -3676,8 +3704,13 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
          * applied to the registry for the same reason: "the daemon must be
          * stopped" is then enforced by the kernel rather than promised in a
          * manual. */
-        if (strcmp(st->operands[0], "add") == 0 || strcmp(st->operands[0], "remove") == 0 ||
-            strcmp(st->operands[0], "scanner") == 0) {
+        /* A13. `scanner` is no longer among these. `repo.scanner` is an operator-uid
+         * RPC method, so a running daemon is the ordinary way to name a scanner
+         * rather than the obstacle to it -- see the comment on `method_repo_scanner`
+         * for why that reverses A7's refusal without weakening it. `add` and
+         * `remove` are unchanged, and deliberately: they decide which directories
+         * Atlas will read at all. */
+        if (strcmp(st->operands[0], "add") == 0 || strcmp(st->operands[0], "remove") == 0) {
             /* One line, and no embedded newlines.
              *
              * An error message is untrusted-text-encoded on its way to the

@@ -3314,3 +3314,83 @@ arithmetic in one place.
   or gateway route.** Every new field is additive on the wire except
   `watched_directories`, whose *value* semantics changed — and that is recorded
   as a compatibility change rather than described as additive.
+
+## A13 layers — additions
+
+```
+include/atlas/mirror.h    the read side's answer to "which bytes is this
+                          repository read from?"
+include/atlas/scanner_uid.h  who may be a scanner, and who may never be
+src/core/mirror_open.c    atlas_repo_open_git — real root first, mirror second
+src/core/scanner_uid.c    the owner of the root, and the refusals
+src/core/service_scanner.c the scanner's walk: the tracked tree and .git
+src/daemon/mirror.c       the write side: openat, O_NOFOLLOW, one repo at a time
+src/ipc/server_scanner.c  scanner.poll and scanner.put, and peer_owns
+```
+
+`src/db/migrate.c` gains migration 27, which adds `repositories.scanner_uid`
+with `DEFAULT 0`. It is **the first migration since 2 to alter `repositories`**,
+which is why four test helpers that wind the schema back needed
+`ALTER TABLE repositories DROP COLUMN scanner_uid` and four schema-version
+tripwires fired exactly as designed.
+
+## A13 rules — these are not negotiable
+
+The one-line forms are in `CLAUDE.md`. The reasoning that is not obvious from
+the code, and that a later reader is most likely to undo:
+
+**Why the mirror is a whole git repository rather than an observation stream.**
+The spec had the scanner report observations — file identities, hashes, status
+entries — and the daemon rebuild the index from them. Counting before
+implementing settled it: `src/core/reconcile.c` calls **twenty distinct git
+operations**. Reproducing them over a socket does not move data; it moves the
+*execution of A1's cache-hit rules* — the ones this document marks "do not
+weaken these" — into a process the daemon cannot audit. The eight-field
+filesystem identity, the "a path the watcher named is always hashed" rule and
+the `content_verified` gate would all have become claims a client makes rather
+than facts the daemon establishes.
+
+Measured instead: git works unchanged on a copied `.git`. `rev-parse HEAD`
+returns the same commit, `ls-files` the same 410 paths, and `status` reports
+zero changes — that last one mattered, because an index carrying the *source*
+worktree's stat data could have made every file read as dirty. The cost is
+256 MB against a 3.0 GB index, about 8 %.
+
+**Why the real root is tried first rather than the mirror being preferred for
+repositories that have one.** Reading the thing itself is better evidence than
+reading a copy of it. A preference for the mirror would also make the daemon's
+answer depend on whether a scanner had run recently, which is a freshness
+property, rather than on what the repository contains.
+
+**Why `data_dir == NULL` is the guarantee.** A boolean parameter would have to
+be passed correctly at every call site to preserve pre-A13 behaviour; an absent
+argument preserves it by default. The three readers that pass NULL do so for
+reasons that differ and are each written at their call site.
+
+**Why the two identity checks are skipped rather than adapted.** They assert
+that the registered root still resolves to itself. When the mirror answered, the
+registered root was not opened, so the assertion has no subject — it is unasked,
+not failed. Adapting them to compare against the mirror's path would assert
+something trivially true (Atlas built that path) and would read like a check.
+
+**Why orchestration never reads a mirror, in the terms A11.1 uses.** A repo-tree
+worker edits the real tree. `head_commit` is what makes "the pinned commit is
+checked before the worker and again after it" enforceable. Reading a mirror
+there would compare the worker's real work against a copy taken before it, so a
+HEAD that moved underneath the worker would compare equal — the guarantee would
+not fail loudly, it would **silently always pass**. A snapshot built from a
+mirror would hand a worker a lagging base and make every downstream gate verdict
+describe work done against the wrong tree.
+
+**Why a mirror-backed watch owes an event gap on every build.** The watch set is
+rebuilt from scratch and keeps no memory of which tree answered last time, so
+"only on a change of source" is not a question this code can ask. Owing one
+unconditionally is the conservative direction and is the obligation P0 already
+takes for a rebuilt watch set.
+
+**What is not solved, stated so nobody discovers it as a surprise.** A scanner
+that stops running leaves a frozen mirror, and nothing bounds its age: the
+daemon keeps indexing it and keeps reporting the index current. Closing it needs
+a recorded observation time and a staleness rule. The stored record also does
+not say which principal produced a repository's facts — it is logged, not
+stored, and storing it needs a column and therefore a migration.

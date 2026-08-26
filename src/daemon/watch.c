@@ -49,7 +49,6 @@
 #include "atlas/sem_ops.h"
 #include "atlas/sem_schedule.h"
 #include "atlas/syspolicy.h"
-#include "atlas/mirror.h"
 #include "daemon/daemon_internal.h"
 
 /* The events Atlas cares about.
@@ -507,12 +506,6 @@ typedef struct repo_watch {
      * event gap, and it is owed a content-verifying pass before this repository
      * can be described as current again. */
     bool owes_gap;
-    /* A13. Whether this watch is over the scanner's mirror rather than the
-     * repository's own tree. Recorded because the two make different claims:
-     * a mirror reports a change when the *scanner writes it*, not when the
-     * developer saves the file, so the index is current as of the scanner's
-     * last pass and no sooner. */
-    bool from_mirror;
     /* Whether the publication carrying this obligation has actually been
      * accepted by the writer. Until it has, a gap already in the database says
      * nothing about *this* obligation — it may predate the subtree that created
@@ -597,10 +590,6 @@ struct atlas_watcher {
     atlas_writer *writer;
     FILE *log;
     atlas_buf db_path;
-    /* A13. Where a mirror lives, for a repository whose own tree this process
-     * cannot open. Set once at start and never mutated, so the watcher thread
-     * reads it without a lock. */
-    atlas_buf data_dir;
     atlas_db *db; /* read-only, owned by this thread */
     int reconcile_interval_ms;
     /* A8: whether this daemon sweeps expired leases. */
@@ -1462,73 +1451,21 @@ static atlas_status add_repo(const atlas_repo_info *ri, void *ud, atlas_err *err
     atlas_buf_init(&rw->owes_gap_detail);
     rw->reason = ATLAS_WATCH_REASON_NONE;
     rw->repo_id = ri->id;
-    /* A13. Which tree this watch is over.
-     *
-     * The three paths below used to come straight from the row. They still do
-     * for a repository this process can open — but a tree belonging to another
-     * principal cannot be watched by opening it, and P0's metadata watches are
-     * built from `git_dir` and `common_dir`, so all three must describe the
-     * same repository or branch correctness rests on one tree while the source
-     * walk covers another.
-     *
-     * So when the mirror answers they are taken from the adapter's own report
-     * about what it opened, rather than from this code repeating the choice.
-     * A repository neither path can open keeps the row's values and is watched
-     * exactly as before. */
-    atlas_git *g = NULL;
-    bool from_mirror = false;
-    atlas_err open_err;
-    atlas_err_init(&open_err);
-    const char *dd = w->data_dir.len > 0 ? atlas_buf_cstr(&w->data_dir) : NULL;
-    atlas_buf mirror_root = ATLAS_BUF_INIT;
-    atlas_buf mirror_gitdir = ATLAS_BUF_INIT;
-    atlas_status st = ATLAS_OK;
-    if (atlas_repo_open_git(ri, dd, &g, &from_mirror, &open_err) == ATLAS_OK) {
-        if (from_mirror) {
-            st = atlas_buf_set_str(&mirror_root, atlas_git_root(g), err);
-            if (st == ATLAS_OK) {
-                st = atlas_buf_set_str(&mirror_gitdir, atlas_git_dir(g), err);
-            }
-        }
-        atlas_git_close(g);
-    }
-    rw->from_mirror = from_mirror;
+    atlas_status st = atlas_buf_set_str(&rw->name, ri->name, err);
     if (st == ATLAS_OK) {
-        st = atlas_buf_set_str(&rw->name, ri->name, err);
+        st = atlas_buf_set(&rw->root, ri->root_path.data, ri->root_path.len, err);
     }
     if (st == ATLAS_OK) {
-        st = from_mirror ? atlas_buf_set(&rw->root, mirror_root.data, mirror_root.len, err)
-                         : atlas_buf_set(&rw->root, ri->root_path.data, ri->root_path.len, err);
+        st = atlas_buf_set(&rw->git_dir, ri->git_dir.data, ri->git_dir.len, err);
     }
     if (st == ATLAS_OK) {
-        st = from_mirror ? atlas_buf_set(&rw->git_dir, mirror_gitdir.data, mirror_gitdir.len, err)
-                         : atlas_buf_set(&rw->git_dir, ri->git_dir.data, ri->git_dir.len, err);
+        st = atlas_buf_set(&rw->common_dir, ri->git_common_dir.data, ri->git_common_dir.len, err);
     }
-    if (st == ATLAS_OK) {
-        /* A mirror is a repository of its own: no linked worktrees, nothing
-         * shared, so its common dir is its git dir. */
-        st = from_mirror
-                 ? atlas_buf_set(&rw->common_dir, mirror_gitdir.data, mirror_gitdir.len, err)
-                 : atlas_buf_set(&rw->common_dir, ri->git_common_dir.data,
-                                 ri->git_common_dir.len, err);
-    }
-    atlas_buf_free(&mirror_root);
-    atlas_buf_free(&mirror_gitdir);
     if (st != ATLAS_OK) {
         repo_watch_free(rw);
         return st;
     }
     w->repo_count++;
-    if (from_mirror) {
-        /* Waiting is an event gap -- P0's rule, and a mirror is the same kind of
-         * window. Whatever the scanner has not yet written is a change this
-         * watch cannot have seen, so the repository owes a content-verifying
-         * pass before it may be described as current. Owed on every build, as
-         * P0 owes one for a rebuilt watch set, rather than only on a change of
-         * source: the watch set is rebuilt from scratch and has no memory of
-         * which tree answered last time. */
-        owe_gap(w, rw, "watching a mirror");
-    }
     return ATLAS_OK;
 }
 
@@ -3351,8 +3288,7 @@ static void *watcher_main(void *arg) {
 
 void atlas_watcher_opts_init(atlas_watcher_opts *o) { memset(o, 0, sizeof(*o)); }
 
-atlas_status atlas_watcher_start(const char *db_path, const char *data_dir,
-                                 atlas_writer *writer, FILE *log,
+atlas_status atlas_watcher_start(const char *db_path, atlas_writer *writer, FILE *log,
                                  const atlas_watcher_opts *opts, atlas_watcher **out,
                                  atlas_err *err) {
     atlas_watcher_opts defaults;
@@ -3366,7 +3302,6 @@ atlas_status atlas_watcher_start(const char *db_path, const char *data_dir,
         return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory starting the watcher");
     }
     atlas_buf_init(&w->db_path);
-    atlas_buf_init(&w->data_dir);
     w->inotify_fd = -1;
     w->wake_fd[0] = -1;
     w->wake_fd[1] = -1;
@@ -3414,9 +3349,6 @@ atlas_status atlas_watcher_start(const char *db_path, const char *data_dir,
     w->stat_budget_from_policy = w->budget_from_policy;
 
     atlas_status st = atlas_buf_set_str(&w->db_path, db_path, err);
-    if (st == ATLAS_OK) {
-        st = atlas_buf_set_str(&w->data_dir, data_dir != NULL ? data_dir : "", err);
-    }
     if (st == ATLAS_OK) {
         /* Small, and grown on demand by `wd_map_grow`. Sizing it for the whole
          * resolved budget up front made a daemon with no repositories resident
@@ -3480,7 +3412,6 @@ void atlas_watcher_stop(atlas_watcher *w) {
     free(w->repos);
     wd_map_free(&w->map);
     atlas_buf_free(&w->db_path);
-    atlas_buf_free(&w->data_dir);
     (void)pthread_mutex_destroy(&w->stat_lock);
     free(w);
 }

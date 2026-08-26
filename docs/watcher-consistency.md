@@ -457,3 +457,47 @@ Stated rather than implied:
 - inotify does not report changes made through a bind mount or on a network
   filesystem that does not implement it. Those repositories are covered only by
   periodic reconciliation, and Atlas has no way to detect that in advance.
+
+## A13 — the watcher was not moved to the mirror, and why
+
+A13 lets the daemon *index* a repository it cannot open, from the scanner's
+mirror. It does **not** let it *watch* one. `add_repo` still takes `root`,
+`git_dir` and `common_dir` from the repository's row, exactly as P0 left them.
+
+This was attempted and reverted, and the evidence is recorded here rather than
+the attempt being quietly dropped.
+
+The change was one substitution: ask `atlas_repo_open_git` which tree answered
+and take all three paths from `atlas_git_root`/`atlas_git_dir` rather than from
+the row. All three have to move together — P0 builds metadata watches from the
+latter two, and a root from one repository with metadata from another would rest
+branch correctness on a tree the source walk never covers.
+
+It passed the release suite, the daemon suite and 105/105 twice. **Under ASan it
+failed `test_watch_budget` deterministically, three times out of three:** *a
+temporary ignore failure recovers to watching and current on its own* — the
+repository degraded as it should, but settled with `watch_reason` NONE where the
+test requires ERROR. Disabling only the new `atlas_git_open` in `add_repo` and
+rebuilding restored 24/24, which identifies the cause without explaining the
+mechanism.
+
+That is the reason for the revert. `rebuild_watches` is reached from
+`mark_dirty` on the same recovery path the test exercises, so a git open added
+to the watch-set build sits inside P0's degrade-and-recover cycle rather than
+beside it. **A change to that cycle whose effect cannot be explained does not
+belong in it**, however green the release gate is, and the ASan run is the one
+that found it.
+
+So the watcher keeps its pre-A13 behaviour: a repository whose tree this process
+cannot open is not watched, is degraded with `error`, and owes an event gap. It
+is now *indexed* from its mirror on the daemon's own reconcile schedule, which
+is what A13 delivers. Watching one is future work, along with the larger move of
+`src/daemon/watch.c` into the scanner so that inotify is opened by the principal
+that owns the tree — 3,486 lines, P0's budget arithmetic re-derived per uid, and
+`IN_Q_OVERFLOW` handling duplicated.
+
+**The largest thing A13 leaves open** is unrelated to the watcher: a scanner that
+stops running leaves a frozen mirror, and nothing bounds its age. The daemon
+keeps indexing it and keeps reporting the index current. Closing that needs a
+recorded observation time and a staleness rule, and it is a freshness question
+rather than an authority one.

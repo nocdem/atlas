@@ -35,7 +35,21 @@
  * over. A file above the bound is reported and skipped rather than truncated:
  * half a source file in the mirror would be a file that never existed, and a
  * consumer could not tell it from a real one. */
-#define SCANNER_MAX_FILE_BYTES (8u * 1024u * 1024u)
+/* The largest file the scanner will mirror.
+ *
+ * Raised from 8 MiB once the transfer was chunked, because the bound no longer
+ * has anything to do with what one request can carry. What it bounds now is how
+ * much of one file a failed run can have written, and how much of the operator's
+ * disk one repository's mirror can take.
+ *
+ * **A skipped file makes the mirror something other than the repository**, and
+ * the daemon reads the mirror as the repository: on the first live run seven
+ * files over the old bound, plus a tracked set mirrored without its untracked
+ * half, made the daemon record 20000 deletions. So this is set high enough that
+ * skipping is rare rather than routine -- and the run still counts and reports
+ * every skip, because a mirror that quietly differs from its tree is the one
+ * failure this design cannot tolerate. */
+#define SCANNER_MAX_FILE_BYTES (64u * 1024u * 1024u)
 
 /* One chunk of a file, in bytes before hex encoding.
  *
@@ -269,6 +283,17 @@ static void mirror_dir(walk_ctx *w, atlas_buf *rel, int dir_fd) {
     (void)closedir(d);
 }
 
+/* The untracked half of the same walk. `ls_untracked` reports a path and
+ * nothing else, so this is a second callback rather than a second walk: it
+ * lands in the same `mirror_one`, with the same nofollow open, the same size
+ * bound and the same skip accounting. */
+static atlas_status untracked_cb(const void *path, size_t path_len, void *ud, atlas_err *err) {
+    walk_ctx *w = (walk_ctx *)ud;
+    (void)err;
+    mirror_one(w, path, path_len);
+    return ATLAS_OK;
+}
+
 static atlas_status walk_cb(const atlas_git_index_entry *e, void *ud, atlas_err *err) {
     walk_ctx *w = (walk_ctx *)ud;
     (void)err;
@@ -380,7 +405,20 @@ atlas_status atlas_service_scanner_run(bool once, FILE *log, atlas_err *err) {
             continue;
         }
 
+        /* Tracked **and** untracked, because that is exactly what reconcile
+         * indexes: `atlas_git_ls_files` then `atlas_git_ls_untracked`, at
+         * `src/core/reconcile.c:1211` and `:1218`. Mirroring only the tracked
+         * set made the mirror a strict subset of the repository the daemon
+         * believes it is reading, and the daemon recorded the difference as
+         * deletions -- measured on the first live run: `-20000` against a tree
+         * with 2012 tracked files and 22012 indexed ones.
+         *
+         * Ignored paths are not walked, for the same reason reconcile does not
+         * index them. */
         atlas_status walked = atlas_git_ls_files(g, walk_cb, &w, err);
+        if (walked == ATLAS_OK && w.status == ATLAS_OK) {
+            walked = atlas_git_ls_untracked(g, untracked_cb, &w, err);
+        }
 
         /* And `.git`, so the mirror is a repository the daemon can open rather
          * than a bag of files. That is what lets reconcile, A3, the semantic

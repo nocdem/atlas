@@ -8,6 +8,7 @@
 #include "atlas/mirror.h"
 
 #include <stdio.h>
+#include <unistd.h>
 
 atlas_status atlas_mirror_repo_path(const char *data_dir, int64_t repo_id, atlas_buf *out,
                                     atlas_err *err) {
@@ -28,66 +29,94 @@ atlas_status atlas_repo_open_git(const atlas_repo_info *info, const char *data_d
         *from_mirror = false;
     }
 
-    atlas_git *g = NULL;
-    atlas_err direct;
-    atlas_err_init(&direct);
-    /* The status is kept, not only the message. `atlas_git_open` refuses a
-     * partial (promisor) repository with an integrity status, and a caller that
-     * saw that collapsed into a plain repository error would read "not found"
-     * where Atlas meant "refused, and deliberately". Measured: flattening it
-     * turned `test_git_hardening`'s rescan case from 7 into 4. */
-    atlas_status direct_st = atlas_git_open(atlas_buf_cstr(&info->root_path), &g, &direct);
-    if (direct_st == ATLAS_OK) {
-        *out = g;
-        return ATLAS_OK;
-    }
-
-    /* The tree did not answer. It may be gone, it may be broken, or it may
-     * simply belong to a principal this process is not — the three are
-     * indistinguishable from here, and the mirror answers the third without
-     * needing to tell them apart. */
-    if (data_dir == NULL) {
-        *err = direct;
-        return direct_st;
-    }
-
-    /* A repository whose row names no scanner has no writer for its mirror, so
-     * there is nothing there this process should trust.
+    /* A13. **The row decides the source, not a failure.**
      *
-     * No reachable path produces such a mirror today: `atlas_scanner_uid_refusal`
-     * refuses uid 0 at assignment, and `peer_owns` admits no peer without a
-     * non-zero `scanner_uid`, so a mirror cannot be written for a row that
-     * names none. The check is here so that "the row still names this writer"
-     * — the warrant that replaces the canonical-root check in
-     * `atlas_service_open_repo_git` — is true because this code asks, and not
-     * because a refusal in another file makes the alternative unreachable. */
-    if (info->scanner_uid == 0) {
-        *err = direct;
-        return direct_st;
-    }
-
-    atlas_buf path = ATLAS_BUF_INIT;
-    atlas_status st = atlas_mirror_repo_path(data_dir, info->id, &path, err);
-    if (st != ATLAS_OK) {
+     * A repository that names a scanner is read from its mirror and from
+     * nothing else. This process does not open its tree, does not stat it and
+     * does not fall back to it — not when the mirror is missing, not when it is
+     * stale, not when the tree is right there and readable.
+     *
+     * The first design had this the other way round: try the tree, use the
+     * mirror when the tree refuses. It was wrong, and the machine this season
+     * was built on is what showed it. Both failures there were *partial*: a
+     * repository whose 100 loose objects were mode 0400, so `atlas_git_open`
+     * succeeded and `git log` failed three calls later; and one whose 50
+     * private directories could not be entered, so every pass completed and
+     * covered less than the tree. A fallback keyed on "could not open" answers
+     * neither. Keyed on the row, both stop being this process's problem: it
+     * never touches the tree at all.
+     *
+     * The cost is stated rather than hidden. A repository whose scanner has not
+     * run has no mirror, and it is **refused rather than read from its tree** —
+     * because reading the tree is exactly the thing the operator asked Atlas to
+     * stop doing when they named a scanner. */
+    /* The scanner uid names the principal that may read the tree. A process
+     * running as it — the scanner itself, and the operator's own CLI — reads the
+     * tree, because it can and because reading a copy of what you can read
+     * directly is worse evidence. Every other principal, the daemon above all,
+     * reads the mirror and never the tree.
+     *
+     * `geteuid` is a capability question here, not an authority one: it asks
+     * "can this process read that tree", which is a fact about the filesystem,
+     * and it grants nothing. A7's rule is about deciding *permission* from
+     * process properties, and no permission is decided here. */
+    if (info->scanner_uid != 0 && (int64_t)geteuid() != info->scanner_uid) {
+        if (data_dir == NULL) {
+            /* A caller that may not consult a mirror asked about a repository
+             * that may only be read through one. `rundriver` and `snapshot`
+             * pass NULL and must see the worker's real tree, so this is not
+             * reachable from them for any repository they drive; it is a
+             * programming error everywhere else. */
+            return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                                 "repository %lld names a scanner, so it has no readable tree "
+                                 "for a caller that may not use the mirror",
+                                 (long long)info->id);
+        }
+        /* An incomplete mirror is not a repository, and the daemon reads it as
+         * one. Measured on the first live run: a mirror carrying 2007 of a
+         * tree's 22012 files made the daemon record 20000 deletions, because
+         * every file the mirror does not hold is a file that no longer exists.
+         *
+         * So a mirror is read only when the run that wrote it said it finished
+         * and skipped nothing. Anything else is refused, exactly as a missing
+         * mirror is: waiting is the correct answer, and the tree is never the
+         * fallback. */
+        if (!info->mirror_complete) {
+            return atlas_err_set(err, ATLAS_ERR_REPO,
+                                 "repository %lld has no complete mirror yet, so there is "
+                                 "nothing for this process to read",
+                                 (long long)info->id);
+        }
+        atlas_buf path = ATLAS_BUF_INIT;
+        atlas_status st = atlas_mirror_repo_path(data_dir, info->id, &path, err);
+        if (st != ATLAS_OK) {
+            atlas_buf_free(&path);
+            return st;
+        }
+        atlas_git *mg = NULL;
+        st = atlas_git_open(atlas_buf_cstr(&path), &mg, err);
         atlas_buf_free(&path);
-        return st;
-    }
-
-    atlas_err from_copy;
-    atlas_err_init(&from_copy);
-    bool opened = atlas_git_open(atlas_buf_cstr(&path), &g, &from_copy) == ATLAS_OK;
-    atlas_buf_free(&path);
-    if (opened) {
-        *out = g;
+        if (st != ATLAS_OK) {
+            return st;
+        }
+        *out = mg;
         if (from_mirror != NULL) {
             *from_mirror = true;
         }
         return ATLAS_OK;
     }
 
-    /* Neither answered. The error reported is the *real* root's: an operator
-     * acts on the repository, and "the mirror is not a git repository" would
-     * send them to a directory Atlas owns and they never created. */
-    *err = direct;
-    return direct_st;
+    /* No scanner named: this process reads the tree itself, as it always has.
+     *
+     * The status is kept, not only the message. `atlas_git_open` refuses a
+     * partial (promisor) repository with an integrity status, and a caller that
+     * saw that collapsed into a plain repository error would read "not found"
+     * where Atlas meant "refused, and deliberately". Measured: flattening it
+     * turned `test_git_hardening`'s rescan case from 7 into 4. */
+    atlas_git *g = NULL;
+    atlas_status st = atlas_git_open(atlas_buf_cstr(&info->root_path), &g, err);
+    if (st == ATLAS_OK) {
+        *out = g;
+    }
+    return st;
 }

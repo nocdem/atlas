@@ -20,6 +20,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <stdlib.h>
 #include <unistd.h>
 
 /* The longest single path component this will create. A name longer than this
@@ -75,8 +76,15 @@ atlas_status atlas_mirror_open_repo(const char *data_dir, int64_t repo_id, int *
     return ATLAS_OK;
 }
 
-atlas_status atlas_mirror_put(int root_fd, const void *rel, size_t rel_len, bool first,
-                              const void *data, size_t len, atlas_err *err) {
+/* Walks `rel` to its leaf's parent, creating directories on the way, and copies
+ * the leaf's name into `comp`.
+ *
+ * Shared by the two writers so there is one implementation of "where does this
+ * path land in the mirror": a file and a symlink differ in what is created at
+ * the leaf, in nothing before it. */
+static atlas_status walk_to_parent(int root_fd, const void *rel, size_t rel_len, int *parent_out,
+                                   char *comp, atlas_err *err) {
+    *parent_out = -1;
     if (root_fd < 0) {
         return atlas_err_set(err, ATLAS_ERR_USAGE, "a mirror root is required");
     }
@@ -89,13 +97,11 @@ atlas_status atlas_mirror_put(int root_fd, const void *rel, size_t rel_len, bool
     }
 
     const char *p = (const char *)rel;
-    /* Walk to the leaf's parent, creating directories on the way. */
     int parent = dup(root_fd);
     if (parent < 0) {
         return atlas_err_set_errno(err, ATLAS_ERR_INTERNAL, errno, "cannot hold the mirror root");
     }
     size_t start = 0;
-    char comp[MIRROR_COMP_MAX + 1u];
     for (size_t i = 0; i < rel_len; i++) {
         if (p[i] != '/') {
             continue;
@@ -123,6 +129,69 @@ atlas_status atlas_mirror_put(int root_fd, const void *rel, size_t rel_len, bool
     }
     memcpy(comp, p + start, leaf_len);
     comp[leaf_len] = '\0';
+    *parent_out = parent;
+    return ATLAS_OK;
+}
+
+/* A13. Recreates a symlink in the mirror, with the link text the tree holds.
+ *
+ * **The link text is the content.** Atlas hashes a tracked symlink's text and
+ * never opens its target — `reconcile.c`'s `ENTRY_SYMLINK`, "link text hashed;
+ * the target was never opened". So a mirror that dropped symlinks was missing
+ * files the index holds, and every one of them read as a deletion.
+ *
+ * Creating symlinks in the mirror is safe for the same reason the tree's are:
+ * nothing follows them. Every descent in this file and in `reconcile.c` is
+ * `O_NOFOLLOW`, so a link text pointing anywhere at all is a string that gets
+ * hashed and never a path that gets opened. The target is not resolved, not
+ * checked and not required to exist — it is data. */
+atlas_status atlas_mirror_put_symlink(int root_fd, const void *rel, size_t rel_len,
+                                      const void *target, size_t target_len, atlas_err *err) {
+    if (target_len == 0 || memchr(target, '\0', target_len) != NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                             "a symlink's text must be non-empty and hold no NUL");
+    }
+    char *text = malloc(target_len + 1u);
+    if (text == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory mirroring a symlink");
+    }
+    memcpy(text, target, target_len);
+    text[target_len] = '\0';
+
+    int parent = -1;
+    char comp[MIRROR_COMP_MAX + 1u];
+    atlas_status st = walk_to_parent(root_fd, rel, rel_len, &parent, comp, err);
+    if (st != ATLAS_OK) {
+        free(text);
+        return st;
+    }
+    /* Replace rather than accumulate, exactly as a rescanned file does. */
+    if (unlinkat(parent, comp, 0) != 0 && errno != ENOENT) {
+        int saved = errno;
+        (void)close(parent);
+        free(text);
+        return atlas_err_set_errno(err, ATLAS_ERR_INTEGRITY, saved,
+                                   "cannot replace \"%s\" in the mirror", comp);
+    }
+    int rc = symlinkat(text, parent, comp);
+    int saved = errno;
+    (void)close(parent);
+    free(text);
+    if (rc != 0) {
+        return atlas_err_set_errno(err, ATLAS_ERR_INTEGRITY, saved,
+                                   "cannot create the symlink \"%s\" in the mirror", comp);
+    }
+    return ATLAS_OK;
+}
+
+atlas_status atlas_mirror_put(int root_fd, const void *rel, size_t rel_len, bool first,
+                              const void *data, size_t len, atlas_err *err) {
+    int parent = -1;
+    char comp[MIRROR_COMP_MAX + 1u];
+    atlas_status walk = walk_to_parent(root_fd, rel, rel_len, &parent, comp, err);
+    if (walk != ATLAS_OK) {
+        return walk;
+    }
 
     int fd = -1;
     if (first) {

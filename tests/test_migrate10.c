@@ -187,6 +187,8 @@ static void test_a_schema_nine_database_reaches_ten_additively(void) {
               * one that leaves its table behind, and re-running the chain would
               * fail with "duplicate column name". */
              "ALTER TABLE repositories DROP COLUMN scanner_uid;"
+             "ALTER TABLE repositories DROP COLUMN mirror_complete;"
+             "ALTER TABLE repositories DROP COLUMN mirror_at;"
              "DELETE FROM schema_migrations WHERE version >= 10;");
     T_EQ_INT(schema_of(db), 9);
     T_CHECK(!table_exists(db, "decision_edge_events"));

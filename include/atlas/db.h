@@ -21,7 +21,7 @@
 #include "atlas/error.h"
 #include "atlas/limits.h"
 
-#define ATLAS_SCHEMA_VERSION 27
+#define ATLAS_SCHEMA_VERSION 28
 
 typedef struct atlas_db atlas_db;
 
@@ -72,6 +72,18 @@ typedef struct atlas_repo_info {
      * none is assigned. Zero is never "uid 0": root is refused as a scanner uid
      * precisely so that an assignment and its absence stay distinguishable. */
     int64_t scanner_uid;
+    /* A13. The mirror's own state, as opposed to its contents.
+     *
+     * `mirror_complete` is the scanner's claim about the run that wrote what is
+     * there now: every file it enumerated was written and none was skipped. It
+     * is cleared when a run starts and set only when one finishes, so a crash
+     * leaves it false -- the safe direction, because false costs a refusal and
+     * true would cost a delete sweep against a half-written tree.
+     *
+     * `mirror_at` is when that run finished, so staleness is a question anyone
+     * can ask. Empty means no run has ever finished. */
+    bool mirror_complete;
+    char mirror_at[32];
 } atlas_repo_info;
 
 void atlas_repo_info_init(atlas_repo_info *ri);
@@ -339,6 +351,10 @@ atlas_status atlas_db_repo_get_by_id(atlas_db *db, int64_t repo_id, atlas_repo_i
  * assignment. `atlas_db_repo_scanner_uid` reports 0 when none is assigned. */
 atlas_status atlas_db_repo_set_scanner_uid(atlas_db *db, int64_t repo_id, int64_t uid,
                                            atlas_err *err);
+/* A13. Records what a mirroring run claims about what it left behind: cleared
+ * when a run starts, set when one finishes. See the definition. */
+atlas_status atlas_db_repo_set_mirror_state(atlas_db *db, int64_t repo_id, bool complete,
+                                            const char *at, atlas_err *err);
 atlas_status atlas_db_repo_scanner_uid(atlas_db *db, int64_t repo_id, int64_t *out,
                                        atlas_err *err);
 

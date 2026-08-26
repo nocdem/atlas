@@ -48,6 +48,16 @@ typedef enum atlas_job_kind {
     ATLAS_JOB_RECONCILE = 0,
     ATLAS_JOB_REPO_ADD,
     ATLAS_JOB_REPO_REMOVE,
+    /* A13. Assigning a repository's scanner uid while the daemon runs.
+     *
+     * A7 made the registry local-only because "the socket carries no authority:
+     * every peer on it is the same uid as the daemon". A7.1 ended that premise
+     * by splitting the principals, and the operator group this method sits in
+     * is selected by SO_PEERCRED against the root-owned policy — the same door
+     * `code.index` and `backup.create` already use. So the refusal that made an
+     * operator stop the daemon to name a scanner is answered by the mechanism
+     * A7.1 built, not by weakening what A7 established. */
+    ATLAS_JOB_REPO_SCANNER,
     /* The watcher observes the conditions that produce these but holds a
      * read-only handle, so it hands them to the writer rather than acquiring a
      * second write path into the index. */
@@ -326,6 +336,26 @@ typedef struct atlas_writer_result {
 
 void atlas_writer_result_init(atlas_writer_result *r);
 void atlas_writer_result_free(atlas_writer_result *r);
+/* A13. When each repository's scanner was last heard from.
+ *
+ * **In memory, not in the index.** A heartbeat is liveness, not a durable fact:
+ * a daemon that has just started has heard from nobody, which is exactly the
+ * conservative answer, and persisting one would let a restarted daemon trust a
+ * scanner that died before it. It also keeps `scanner.poll` a read — the method
+ * runs on a read-only handle, and writing from there is what the suite caught.
+ *
+ * One mutex, no writer and no I/O, exactly like the watcher's live view.
+ * Bounded: repositories a daemon serves are few, and an unknown one reads as
+ * "never heard from", which only ever subtracts. */
+typedef struct atlas_scanner_seen atlas_scanner_seen;
+
+atlas_scanner_seen *atlas_scanner_seen_new(void);
+void atlas_scanner_seen_free(atlas_scanner_seen *s);
+/* Records that `repo_id`'s scanner asked what is owed, now. */
+void atlas_scanner_seen_touch(atlas_scanner_seen *s, int64_t repo_id);
+/* Milliseconds since it last did, or a negative value when it never has. */
+int64_t atlas_scanner_seen_age_ms(atlas_scanner_seen *s, int64_t repo_id);
+
 typedef struct atlas_writer atlas_writer;
 
 /* Starts the writer thread. It opens its own writable database handle from
@@ -406,6 +436,11 @@ atlas_status atlas_writer_call(atlas_writer *w, atlas_job_kind kind, const char 
 atlas_status atlas_writer_call_repo_add(atlas_writer *w, const char *path, const char *name,
                                         bool exact_root, int timeout_ms,
                                         atlas_writer_result *result, atlas_err *err);
+/* A13. Names a repository's scanner uid while the daemon runs. `uid_text` empty
+ * derives it from the root's owner. */
+atlas_status atlas_writer_call_repo_scanner(atlas_writer *w, const char *name,
+                                            const char *uid_text, int timeout_ms,
+                                            atlas_writer_result *result, atlas_err *err);
 
 /* Queues one AI-session operation and waits for it, bounded by `timeout_ms`.
  *
@@ -626,6 +661,8 @@ typedef struct atlas_server_ctx {
     const char *socket_path;
     atlas_writer *writer;
     atlas_watcher *watcher;
+    /* A13. Scanner liveness, in memory. See `atlas_scanner_seen`. */
+    atlas_scanner_seen *scanner_seen;
     atlas_workers *workers;
     /* Long-running operations that must not run inside the serve loop. See
      * atlas/ops.h: a backup or a semantic index takes longer than a client will

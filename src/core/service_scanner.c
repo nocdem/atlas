@@ -21,6 +21,7 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -35,7 +36,31 @@
  * over. A file above the bound is reported and skipped rather than truncated:
  * half a source file in the mirror would be a file that never existed, and a
  * consumer could not tell it from a real one. */
-#define SCANNER_MAX_FILE_BYTES (8u * 1024u * 1024u)
+/* The largest file the scanner will mirror.
+ *
+ * Raised from 8 MiB once the transfer was chunked, because the bound no longer
+ * has anything to do with what one request can carry. What it bounds now is how
+ * much of one file a failed run can have written, and how much of the operator's
+ * disk one repository's mirror can take.
+ *
+ * **A skipped file makes the mirror something other than the repository**, and
+ * the daemon reads the mirror as the repository: on the first live run seven
+ * files over the old bound, plus a tracked set mirrored without its untracked
+ * half, made the daemon record 20000 deletions. So this is set high enough that
+ * skipping is rare rather than routine -- and the run still counts and reports
+ * every skip, because a mirror that quietly differs from its tree is the one
+ * failure this design cannot tolerate. */
+#define SCANNER_MAX_FILE_BYTES (64u * 1024u * 1024u)
+
+/* One chunk of a file, in bytes before hex encoding.
+ *
+ * Derived from the transport rather than guessed: hex doubles it, and the
+ * request also carries a method name, a repository id and a `%XX`-encoded path
+ * that can itself be long. A quarter of `ATLAS_IPC_MAX_REQUEST_BYTES` leaves
+ * half the limit for the encoded bytes and half again for everything else,
+ * which is margin rather than arithmetic on the exact overhead -- the exact
+ * overhead depends on a path this code does not choose. */
+#define SCANNER_CHUNK_BYTES (ATLAS_IPC_MAX_REQUEST_BYTES / 4u)
 
 typedef struct walk_ctx {
     const char *socket_path;
@@ -50,17 +75,113 @@ typedef struct walk_ctx {
     int64_t skipped_unreadable;
 } walk_ctx;
 
-/* Sends one file's bytes as hex. The wire carries bytes, not text: a source
- * file may hold a quote, a newline, a C0 control or a sequence that is not
- * valid UTF-8, and a JSON string carries none of them unchanged. */
+/* A13. Tells the daemon a run is starting, which clears `mirror_complete`.
+ *
+ * Before the first byte, so a crash anywhere in the walk leaves the mirror
+ * refused rather than read as whole. */
+static atlas_status say_state(walk_ctx *w, bool complete) {
+    atlas_buf params = ATLAS_BUF_INIT;
+    atlas_status st = atlas_buf_appendf(&params, w->err, "{\"repo\":%lld,\"complete\":%s}",
+                                        (long long)w->repo_id, complete ? "true" : "false");
+    atlas_buf raw = ATLAS_BUF_INIT;
+    if (st == ATLAS_OK) {
+        st = atlas_ipc_call(w->socket_path, "scanner.state", atlas_buf_cstr(&params), &raw,
+                            w->err);
+    }
+    atlas_buf_free(&raw);
+    atlas_buf_free(&params);
+    return st;
+}
+
+/* Sends one file's bytes as hex, in chunks the transport can carry.
+ *
+ * The wire carries bytes, not text: a source file may hold a quote, a newline,
+ * a C0 control or a sequence that is not valid UTF-8, and a JSON string carries
+ * none of them unchanged.
+ *
+ * **Hex doubles the size, and the transport has its own ceiling.** A whole file
+ * per request was refused for anything over about half of
+ * `ATLAS_IPC_MAX_REQUEST_BYTES` — measured on the repository this season was
+ * built for, which stopped at `dna`'s first large object with "refusing to send
+ * a request, above the limit". `SCANNER_CHUNK_BYTES` is picked against that
+ * ceiling rather than against a file size, so raising the file bound never
+ * reopens this: one chunk becomes two.
+ *
+ * `first` distinguishes the chunk that creates the mirrored file from the ones
+ * that extend it. `atlas_mirror_put` unlinks and `O_EXCL`-creates on the first
+ * and appends with no `O_CREAT` on the rest, so a partial transfer leaves a
+ * short file rather than a mixture of two versions. */
 static atlas_status put_file(walk_ctx *w, const void *rel, size_t rel_len, const void *data,
                              size_t len) {
+    atlas_buf enc = ATLAS_BUF_INIT;
+    /* The path is sent as the raw bytes git gave, %XX-encoded so it survives a
+     * JSON string. Repository paths are bytes, not text. */
+    atlas_status st = atlas_path_text_encode(rel, rel_len, &enc, w->err);
+
+    const unsigned char *b = (const unsigned char *)data;
+    size_t sent = 0;
+    bool first = true;
+    /* An empty file still needs one request, or it would never be created. */
+    while (st == ATLAS_OK && (sent < len || first)) {
+        size_t take = len - sent;
+        if (take > SCANNER_CHUNK_BYTES) {
+            take = SCANNER_CHUNK_BYTES;
+        }
+
+        atlas_buf hex = ATLAS_BUF_INIT;
+        st = atlas_buf_reserve(&hex, take * 2u + 1u, w->err);
+        if (st == ATLAS_OK) {
+            static const char DIGITS[] = "0123456789abcdef";
+            for (size_t i = 0; i < take && st == ATLAS_OK; i++) {
+                unsigned char c = b[sent + i];
+                char pair[2] = {DIGITS[c >> 4], DIGITS[c & 0x0fu]};
+                st = atlas_buf_append(&hex, pair, 2u, w->err);
+            }
+        }
+
+        atlas_buf params = ATLAS_BUF_INIT;
+        if (st == ATLAS_OK) {
+            st = atlas_buf_appendf(&params, w->err,
+                                   "{\"repo\":%lld,\"path\":\"%s\",\"first\":%s,\"data\":\"%s\"}",
+                                   (long long)w->repo_id, atlas_buf_cstr(&enc),
+                                   first ? "true" : "false",
+                                   take == 0 ? "" : atlas_buf_cstr(&hex));
+        }
+        atlas_buf raw = ATLAS_BUF_INIT;
+        if (st == ATLAS_OK) {
+            st = atlas_ipc_call(w->socket_path, "scanner.put", atlas_buf_cstr(&params), &raw,
+                                w->err);
+        }
+        atlas_buf_free(&raw);
+        atlas_buf_free(&params);
+        atlas_buf_free(&hex);
+
+        sent += take;
+        first = false;
+    }
+    atlas_buf_free(&enc);
+    return st;
+}
+
+/* A13. Sends one symlink's text.
+ *
+ * The same wire shape as a file chunk, with `symlink` set: a link text is bytes
+ * too, and it travels as hex for the same reason a file's content does. One
+ * request always suffices — a link text is bounded by the filesystem far below
+ * `SCANNER_CHUNK_BYTES`, so there is no chunking here and no `first` to carry. */
+static atlas_status put_symlink(walk_ctx *w, const void *rel, size_t rel_len, const void *target,
+                                size_t target_len) {
+    atlas_buf enc = ATLAS_BUF_INIT;
+    atlas_status st = atlas_path_text_encode(rel, rel_len, &enc, w->err);
+
     atlas_buf hex = ATLAS_BUF_INIT;
-    atlas_status st = atlas_buf_reserve(&hex, len * 2u + 1u, w->err);
+    if (st == ATLAS_OK) {
+        st = atlas_buf_reserve(&hex, target_len * 2u + 1u, w->err);
+    }
     if (st == ATLAS_OK) {
         static const char DIGITS[] = "0123456789abcdef";
-        const unsigned char *b = (const unsigned char *)data;
-        for (size_t i = 0; i < len && st == ATLAS_OK; i++) {
+        const unsigned char *b = (const unsigned char *)target;
+        for (size_t i = 0; i < target_len && st == ATLAS_OK; i++) {
             char pair[2] = {DIGITS[b[i] >> 4], DIGITS[b[i] & 0x0fu]};
             st = atlas_buf_append(&hex, pair, 2u, w->err);
         }
@@ -68,19 +189,11 @@ static atlas_status put_file(walk_ctx *w, const void *rel, size_t rel_len, const
 
     atlas_buf params = ATLAS_BUF_INIT;
     if (st == ATLAS_OK) {
-        /* The path is sent as the raw bytes git gave, %XX-encoded so it
-         * survives a JSON string. Repository paths are bytes, not text. */
-        atlas_buf enc = ATLAS_BUF_INIT;
-        st = atlas_path_text_encode(rel, rel_len, &enc, w->err);
-        if (st == ATLAS_OK) {
-            st = atlas_buf_appendf(&params, w->err,
-                                   "{\"repo\":%lld,\"path\":\"%s\",\"first\":true,\"data\":\"%s\"}",
-                                   (long long)w->repo_id, atlas_buf_cstr(&enc),
-                                   len == 0 ? "" : atlas_buf_cstr(&hex));
-        }
-        atlas_buf_free(&enc);
+        st = atlas_buf_appendf(
+            &params, w->err,
+            "{\"repo\":%lld,\"path\":\"%s\",\"first\":true,\"symlink\":true,\"data\":\"%s\"}",
+            (long long)w->repo_id, atlas_buf_cstr(&enc), atlas_buf_cstr(&hex));
     }
-
     atlas_buf raw = ATLAS_BUF_INIT;
     if (st == ATLAS_OK) {
         st = atlas_ipc_call(w->socket_path, "scanner.put", atlas_buf_cstr(&params), &raw, w->err);
@@ -88,6 +201,7 @@ static atlas_status put_file(walk_ctx *w, const void *rel, size_t rel_len, const
     atlas_buf_free(&raw);
     atlas_buf_free(&params);
     atlas_buf_free(&hex);
+    atlas_buf_free(&enc);
     return st;
 }
 
@@ -112,7 +226,31 @@ static void mirror_one(walk_ctx *w, const void *rel, size_t rel_len) {
         if (fd >= 0) {
             (void)close(fd);
         }
-        if (res == ATLAS_PATH_OPEN_SYMLINK || res == ATLAS_PATH_OPEN_UNSAFE) {
+        if (res == ATLAS_PATH_OPEN_SYMLINK) {
+            /* **The link text is the file.** Atlas hashes a tracked symlink's
+             * text and never opens its target, so a mirror that dropped them was
+             * missing files the index holds -- and the daemon read every one as a
+             * deletion. `readlinkat` reads the text without following it. */
+            /* `rel` is raw bytes and is not NUL-terminated; `readlinkat` needs a
+             * C string, so the name is copied rather than assumed. */
+            char name[4096];
+            char target[4096];
+            ssize_t n = -1;
+            if (rel_len < sizeof(name)) {
+                memcpy(name, rel, rel_len);
+                name[rel_len] = '\0';
+                n = readlinkat(w->root_fd, name, target, sizeof(target));
+            }
+            if (n > 0 && (size_t)n < sizeof(target)) {
+                if (put_symlink(w, rel, rel_len, target, (size_t)n) == ATLAS_OK) {
+                    w->mirrored++;
+                    return;
+                }
+            }
+            /* Unreadable, empty, or longer than this buffer. Counted as a skip,
+             * which is what stops the run claiming the mirror is complete. */
+            w->skipped_symlink++;
+        } else if (res == ATLAS_PATH_OPEN_UNSAFE) {
             w->skipped_symlink++;
         } else {
             w->skipped_unreadable++;
@@ -230,6 +368,17 @@ static void mirror_dir(walk_ctx *w, atlas_buf *rel, int dir_fd) {
     (void)closedir(d);
 }
 
+/* The untracked half of the same walk. `ls_untracked` reports a path and
+ * nothing else, so this is a second callback rather than a second walk: it
+ * lands in the same `mirror_one`, with the same nofollow open, the same size
+ * bound and the same skip accounting. */
+static atlas_status untracked_cb(const void *path, size_t path_len, void *ud, atlas_err *err) {
+    walk_ctx *w = (walk_ctx *)ud;
+    (void)err;
+    mirror_one(w, path, path_len);
+    return ATLAS_OK;
+}
+
 static atlas_status walk_cb(const atlas_git_index_entry *e, void *ud, atlas_err *err) {
     walk_ctx *w = (walk_ctx *)ud;
     (void)err;
@@ -241,13 +390,14 @@ static atlas_status walk_cb(const atlas_git_index_entry *e, void *ud, atlas_err 
     return ATLAS_OK;
 }
 
-atlas_status atlas_service_scanner_run(bool once, FILE *log, atlas_err *err) {
-    if (!once) {
-        return atlas_err_set(err, ATLAS_ERR_USAGE,
-                             "atlas scanner run needs --once: the polling loop is not implemented "
-                             "yet, and a process that idled instead of saying so would look "
-                             "healthy while doing nothing");
-    }
+/* One pass: ask what is owed, mirror it, report what was left behind.
+ *
+ * `*poll_within_ms` receives the cadence the daemon asked for, so the loop
+ * sleeps for a time Atlas chose rather than one this process invented. The spec
+ * has no `hello` for the same reason: the scanner asks what is owed, and asking
+ * is what proves it is alive. */
+static atlas_status scan_pass(int64_t *poll_within_ms, FILE *log, atlas_err *err) {
+    *poll_within_ms = ATLAS_SCANNER_POLL_INTERVAL_MS;
 
     atlas_buf socket_path = ATLAS_BUF_INIT;
     atlas_status st = atlas_ipc_socket_path(&socket_path, err);
@@ -279,6 +429,16 @@ atlas_status atlas_service_scanner_run(bool once, FILE *log, atlas_err *err) {
         atlas_ipc_response_free(resp);
         atlas_buf_free(&socket_path);
         return refused;
+    }
+
+    /* Read only from an answer that succeeded. The daemon says how soon it wants
+     * to be asked again; an older one that does not say leaves the compiled
+     * default, which is the same number its own freshness rule uses. */
+    {
+        int64_t within = 0;
+        if (atlas_ipc_result_int(resp, "poll_within_ms", &within) && within > 0) {
+            *poll_within_ms = within;
+        }
     }
 
     size_t n = 0;
@@ -331,6 +491,14 @@ atlas_status atlas_service_scanner_run(bool once, FILE *log, atlas_err *err) {
         w.log = log;
         w.err = err;
         w.status = ATLAS_OK;
+        /* Cleared before anything is written, so a crash leaves the mirror
+         * refused rather than trusted. */
+        if (say_state(&w, false) != ATLAS_OK) {
+            st = w.err != NULL ? ATLAS_ERR_INTERNAL : ATLAS_ERR_INTERNAL;
+            atlas_git_close(g);
+            atlas_buf_free(&root_raw);
+            continue;
+        }
         w.root_fd = open(atlas_buf_cstr(&root_raw), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
         if (w.root_fd < 0) {
             if (log != NULL) {
@@ -341,7 +509,20 @@ atlas_status atlas_service_scanner_run(bool once, FILE *log, atlas_err *err) {
             continue;
         }
 
+        /* Tracked **and** untracked, because that is exactly what reconcile
+         * indexes: `atlas_git_ls_files` then `atlas_git_ls_untracked`, at
+         * `src/core/reconcile.c:1211` and `:1218`. Mirroring only the tracked
+         * set made the mirror a strict subset of the repository the daemon
+         * believes it is reading, and the daemon recorded the difference as
+         * deletions -- measured on the first live run: `-20000` against a tree
+         * with 2012 tracked files and 22012 indexed ones.
+         *
+         * Ignored paths are not walked, for the same reason reconcile does not
+         * index them. */
         atlas_status walked = atlas_git_ls_files(g, walk_cb, &w, err);
+        if (walked == ATLAS_OK && w.status == ATLAS_OK) {
+            walked = atlas_git_ls_untracked(g, untracked_cb, &w, err);
+        }
 
         /* And `.git`, so the mirror is a repository the daemon can open rather
          * than a bag of files. That is what lets reconcile, A3, the semantic
@@ -372,6 +553,18 @@ atlas_status atlas_service_scanner_run(bool once, FILE *log, atlas_err *err) {
         atlas_git_close(g);
         atlas_buf_free(&root_raw);
 
+        /* Complete means every file this run enumerated reached the mirror. Any
+         * skip at all leaves it false, including a symlink: the daemon reads the
+         * mirror as the repository, so a file the mirror does not hold is a file
+         * that no longer exists, and there is no such thing as a small delete
+         * sweep. A skipped symlink is a real gap rather than a rounding error --
+         * Atlas indexes a tracked symlink's link text, so the mirror is missing
+         * something the index would otherwise hold. */
+        bool complete = walked == ATLAS_OK && w.status == ATLAS_OK &&
+                        w.skipped_symlink == 0 && w.skipped_large == 0 &&
+                        w.skipped_unreadable == 0;
+        (void)say_state(&w, complete);
+
         if (log != NULL) {
             (void)fprintf(log,
                           "  %s  mirrored %lld, skipped %lld symlink, %lld too large, "
@@ -389,4 +582,53 @@ atlas_status atlas_service_scanner_run(bool once, FILE *log, atlas_err *err) {
     atlas_ipc_response_free(resp);
     atlas_buf_free(&socket_path);
     return st;
+}
+
+/* A13. The scanner's loop.
+ *
+ * A repository read from a mirror is only as current as the last run that wrote
+ * it, and the daemon watches the mirror rather than the tree — so if this
+ * process stops, nothing observes the repository. `atlas_server_overlay_mirror`
+ * is what stops claiming currency once the polling stops, and this is the
+ * process whose polling it is.
+ *
+ * **The cadence is the daemon's.** Each pass is told how soon to ask again, and
+ * that is the same number the freshness rule judges by, so what Atlas requests
+ * and what it holds a scanner to cannot drift apart. This process invents no
+ * schedule and promises nothing: it asks, and asking is the evidence.
+ *
+ * `--once` is a snapshot — one pass, after which nothing is polling and the
+ * daemon will not call an index built from it current. That is not a limitation
+ * to route around; one pass establishes what the tree was, not what it is.
+ *
+ * The sleep is between passes rather than on a timer, so a pass that runs long
+ * delays the next one instead of overlapping it. */
+atlas_status atlas_service_scanner_run(bool once, FILE *log, atlas_err *err) {
+    int64_t within = ATLAS_SCANNER_POLL_INTERVAL_MS;
+    if (once) {
+        return scan_pass(&within, log, err);
+    }
+    for (;;) {
+        atlas_err pass_err;
+        atlas_err_init(&pass_err);
+        atlas_status st = scan_pass(&within, log, &pass_err);
+        if (st != ATLAS_OK && log != NULL) {
+            /* Reported and survived. A repository that could not be mirrored
+             * this time keeps whatever the last successful pass left, and the
+             * daemon already refuses to call that current once the polling
+             * cadence has lapsed. Exiting here would turn one repository's
+             * problem into every repository's. */
+            (void)fprintf(log, "scanner: pass failed: %s\n", atlas_err_msg(&pass_err));
+        }
+        if (within < ATLAS_SCANNER_POLL_MIN_MS) {
+            within = ATLAS_SCANNER_POLL_MIN_MS;
+        }
+        struct timespec ts;
+        ts.tv_sec = (time_t)(within / 1000);
+        ts.tv_nsec = (long)((within % 1000) * 1000000);
+        while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {
+            /* Interrupted by a signal: finish the remaining time rather than
+             * treating the wake-up as the interval having elapsed. */
+        }
+    }
 }

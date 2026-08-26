@@ -23,6 +23,7 @@
  * authorisation, and reaching a name is never the same as being allowed to use
  * it.
  */
+#include "atlas/atlas.h"
 #include "atlas/db.h"
 #include "atlas/ipc.h"
 #include "atlas/safetext.h"
@@ -104,7 +105,31 @@ static atlas_status emit_cb(const atlas_repo_info *ri, void *ud, atlas_err *err)
         st = atlas_json_key_str(j, "root", atlas_buf_cstr(&ri->root_path_text), s->err);
     }
     if (st == ATLAS_OK) {
+        /* The directive. `full` while no complete mirror exists, because a
+         * partial one is refused by `atlas_repo_open_git` and the way out of
+         * that is a whole pass; `incremental` once one does. The decision is
+         * the daemon's because the daemon is what knows the index's state -- the
+         * spec's shape, where the scanner asks what is owed rather than
+         * deciding it. */
+        st = atlas_json_key_str(j, "directive", ri->mirror_complete ? "incremental" : "full",
+                                s->err);
+    }
+    if (st == ATLAS_OK) {
         st = atlas_json_obj_end(j, s->err);
+    }
+    /* **Asking is the evidence.** `scanner.poll` doubles as the heartbeat, which
+     * is why the spec has no `hello`: nothing is claimed by the caller, and what
+     * is recorded is that a request arrived from the uid this row names. A
+     * scanner that stops polling stops being heard, and
+     * `atlas_server_overlay_mirror` stops calling the index current.
+     *
+     * In memory, not in the index. This method runs on a read-only handle --
+     * writing here failed with "attempt to write a readonly database", which
+     * `test_scanner_rpc` caught -- and a heartbeat is liveness rather than a
+     * durable fact anyway: a restarted daemon has heard from nobody, which is
+     * the answer that refuses rather than the one that trusts. */
+    if (s->ds->ctx != NULL) {
+        atlas_scanner_seen_touch(s->ds->ctx->scanner_seen, ri->id);
     }
     s->status = st;
     return ATLAS_OK;
@@ -139,6 +164,12 @@ static atlas_status method_scanner_poll(dispatch_state *ds, const atlas_ipc_requ
     }
     if (st == ATLAS_OK) {
         st = atlas_json_key_int(ds->j, "scanner_uid", ds->peer_uid, err);
+    }
+    if (st == ATLAS_OK) {
+        /* How soon Atlas expects to be asked again. The cadence is Atlas', not
+         * the scanner's: it is the same number the freshness rule holds a
+         * scanner to, so the promise and the judgement cannot drift apart. */
+        st = atlas_json_key_int(ds->j, "poll_within_ms", ATLAS_SCANNER_POLL_INTERVAL_MS, err);
     }
     return st;
 }
@@ -222,6 +253,12 @@ static atlas_status method_scanner_put(dispatch_state *ds, const atlas_ipc_reque
     }
     bool first = true;
     (void)atlas_ipc_param_bool(req, "first", &first);
+    /* A13. A symlink's text is its content: Atlas hashes the text and never
+     * opens the target, so the mirror holds a symlink rather than a file whose
+     * bytes happen to be a path. Nothing follows it -- every descent here and in
+     * `reconcile.c` is `O_NOFOLLOW` -- so the text is data and never a route. */
+    bool is_symlink = false;
+    (void)atlas_ipc_param_bool(req, "symlink", &is_symlink);
 
     atlas_repo_info ri;
     atlas_repo_info_init(&ri);
@@ -254,7 +291,10 @@ static atlas_status method_scanner_put(dispatch_state *ds, const atlas_ipc_reque
         atlas_buf_free(&content);
         return st;
     }
-    st = atlas_mirror_put(root, path, strlen(path), first, content.data, content.len, err);
+    st = is_symlink ? atlas_mirror_put_symlink(root, path, strlen(path), content.data, content.len,
+                                               err)
+                    : atlas_mirror_put(root, path, strlen(path), first, content.data, content.len,
+                                       err);
     (void)close(root);
     size_t written = content.len;
     atlas_buf_free(&content);
@@ -266,9 +306,59 @@ static atlas_status method_scanner_put(dispatch_state *ds, const atlas_ipc_reque
     return atlas_json_key_int(ds->j, "written", (int64_t)written, err);
 }
 
+/* A13. Tells the daemon what a run claims about the mirror it just wrote.
+ *
+ * Two calls per repository per run. `complete=false` at the start is what makes
+ * a crash leave the mirror refused rather than trusted: the value that survives
+ * a failure is the one that costs a refusal, never the one that costs a delete
+ * sweep against a half-written tree.
+ *
+ * The peer is checked exactly as `scanner.put` checks it — being some
+ * repository's scanner is not being *this* repository's. */
+static atlas_status method_scanner_state(dispatch_state *ds, const atlas_ipc_request *req,
+                                         atlas_err *err) {
+    atlas_status st = require_scanner(ds, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    int64_t repo_id = 0;
+    if (!atlas_ipc_param_int(req, "repo", &repo_id)) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "a mirror state needs a repository id");
+    }
+    bool complete = false;
+    (void)atlas_ipc_param_bool(req, "complete", &complete);
+
+    atlas_repo_info ri;
+    atlas_repo_info_init(&ri);
+    bool found = false;
+    st = atlas_db_repo_get_by_id(ds->db, repo_id, &ri, &found, err);
+    if (st == ATLAS_OK && !found) {
+        st = atlas_err_set(err, ATLAS_ERR_REPO, "no repository has that id");
+    }
+    if (st == ATLAS_OK && !peer_owns(ds, &ri)) {
+        st = atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                           "uid %lld is not this repository's scanner", (long long)ds->peer_uid);
+    }
+    atlas_repo_info_free(&ri);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+
+    /* The time is Atlas', not the caller's. A scanner reporting when it thinks
+     * it finished would let a clock decide whether an index is current. */
+    char now[32];
+    atlas_now_iso8601(now, sizeof(now));
+    st = atlas_db_repo_set_mirror_state(ds->db, repo_id, complete, now, err);
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(ds->j, "complete", complete, err);
+    }
+    return st;
+}
+
 static const atlas_method_entry SCANNER_METHODS[] = {
     {"scanner.poll", method_scanner_poll},
     {"scanner.put", method_scanner_put},
+    {"scanner.state", method_scanner_state},
 };
 
 const atlas_method_entry *atlas_server_scanner_methods(size_t *count_out) {

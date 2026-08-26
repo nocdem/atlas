@@ -228,6 +228,9 @@ typedef struct status_tally {
      * priming: 0` beside a repository document reading `priming` and not
      * current, in the same family of commands and about the same instant. */
     atlas_watcher *watcher;
+    /* A13. Read for the same reason the watcher is: the tally must agree with
+     * the per-repository documents about the same instant. */
+    atlas_scanner_seen *scanner_seen;
     int64_t repos;
     int64_t watching;
     int64_t degraded;
@@ -245,6 +248,7 @@ static atlas_status tally(const atlas_repo_info *ri, void *ud, atlas_err *err) {
         atlas_watch_live live;
         atlas_watcher_repo_live(t->watcher, ri->id, &live);
         atlas_server_overlay_live(&s, &live);
+        atlas_server_overlay_mirror(&s, ri, t->scanner_seen);
         if (s.watch_state == ATLAS_WATCH_WATCHING) {
             t->watching++;
         } else if (s.watch_state == ATLAS_WATCH_PRIMING) {
@@ -267,7 +271,8 @@ static atlas_status tally(const atlas_repo_info *ri, void *ud, atlas_err *err) {
 static atlas_status method_status(dispatch_state *ds, const atlas_ipc_request *req,
                                   atlas_err *err) {
     (void)req;
-    status_tally t = {ds->db, ds->ctx != NULL ? ds->ctx->watcher : NULL, 0, 0, 0, 0, 0};
+    status_tally t = {ds->db, ds->ctx != NULL ? ds->ctx->watcher : NULL,
+                      ds->ctx != NULL ? ds->ctx->scanner_seen : NULL, 0, 0, 0, 0, 0};
     atlas_status st = atlas_db_repo_list(ds->db, tally, &t, err);
     if (st != ATLAS_OK) {
         return st;
@@ -416,6 +421,48 @@ bool atlas_server_index_current(const atlas_index_state *s, const char **reason_
  * Non-blocking by construction: the live view costs one short mutex in the
  * watcher, no writer involvement and no I/O, so a status read stays answerable
  * while the writer thread is held. */
+/* A13. Subtracts the scanner's silence from what Atlas is willing to claim.
+ *
+ * A scanner-backed repository is indexed from a mirror, and the daemon watches
+ * that mirror rather than the tree. So it learns of a change when the scanner
+ * writes one — and if the scanner stops, nothing tells it. The index then stays
+ * perfectly consistent with a mirror that is arbitrarily old, and
+ * `index_current` would go on saying the index reflects the repository.
+ * Invariant 12 forbids exactly that.
+ *
+ * **The evidence is that the scanner asked.** `scanner.poll` doubles as the
+ * heartbeat — the spec's design, and the reason there is no `hello`. A scanner
+ * that declared a cadence and then died would leave its promise standing; one
+ * that stops polling simply stops being heard, with nothing to outlive it.
+ *
+ * The cadence is Atlas' — the same `ATLAS_SCANNER_POLL_INTERVAL_MS` the poll
+ * answer asks for, so what Atlas requests and what it judges by cannot drift
+ * apart. Twice it, so one missed poll does not flap the verdict.
+ *
+ * Like `atlas_server_overlay_live`, this only ever subtracts: it can force a
+ * full pass, never clear one.
+ */
+void atlas_server_overlay_mirror(atlas_index_state *s, const atlas_repo_info *ri,
+                                 atlas_scanner_seen *seen) {
+    if (ri->scanner_uid == 0) {
+        return;
+    }
+    if (!ri->mirror_complete || ri->mirror_at[0] == '\0') {
+        /* No run has vouched for what is there. `atlas_repo_open_git` refuses to
+         * read it at all, so nothing indexed from it can be current. */
+        s->pending_full_reconcile = true;
+        return;
+    }
+    /* Twice the cadence Atlas asked for, so one missed poll does not flap the
+     * verdict. A negative age means never heard from -- a daemon that has just
+     * started, or a scanner that has not run -- and both mean nothing is
+     * observing the tree. */
+    int64_t age = atlas_scanner_seen_age_ms(seen, ri->id);
+    if (age < 0 || age > ATLAS_SCANNER_POLL_INTERVAL_MS * 2) {
+        s->pending_full_reconcile = true;
+    }
+}
+
 void atlas_server_overlay_live(atlas_index_state *s, const atlas_watch_live *live) {
     if (!live->known) {
         return;
@@ -452,6 +499,9 @@ atlas_status atlas_server_write_repo_state(dispatch_state *ds, const atlas_repo_
         atlas_watcher_repo_live(ds->ctx->watcher, ri->id, &live);
         atlas_server_overlay_live(&s, &live);
     }
+    /* Applied whether or not a watcher answered: the scanner's silence is a fact
+     * about the row, not about the watcher's live view. */
+    atlas_server_overlay_mirror(&s, ri, ds->ctx != NULL ? ds->ctx->scanner_seen : NULL);
 
     /* `name` is validated on registration and `root_path_text` is already in the
      * safe encoding, so neither is re-encoded — double-encoding would make a
@@ -597,6 +647,26 @@ static atlas_status write_repo_registration(dispatch_state *ds, const atlas_repo
         st = atlas_json_key_str(ds->j, "git_dir", atlas_buf_cstr(&enc), err);
     }
     atlas_buf_free(&enc);
+    /* A13. The mirror's own state travels with the row it describes: whether the
+     * run that wrote it finished without skipping anything, and when. A reader
+     * that cannot name when a mirror was last whole cannot honestly call an
+     * index built from it current. */
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(ds->j, "mirror_complete", ri->mirror_complete, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "mirror_at", ri->mirror_at, err);
+    }
+    /* A13. Which uid's scanner may report about this repository, and therefore
+     * which tree the daemon is reading. It was on the row and in the local
+     * renderer from the first commit of the season and **not on the wire**, so
+     * `atlas status` against a running daemon reported 0 for a repository the
+     * daemon was plainly treating as scanner-backed -- it looks for a mirror in
+     * the log and reports no scanner in the same breath. A field a caller reads
+     * as a default when the answer exists is worse than an absent field. */
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "scanner_uid", ri->scanner_uid, err);
+    }
     return st;
 }
 

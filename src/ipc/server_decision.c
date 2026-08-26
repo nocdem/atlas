@@ -2660,6 +2660,51 @@ static atlas_status method_resolve(dispatch_state *ds, const atlas_ipc_request *
  * reason: a name in a group a peer is not in answers `unknown method`, the same
  * as a name that does not exist, because a refusal that distinguished "you may
  * not" from "there is no such thing" would tell a caller what to try next. */
+/* repo.scanner — names the uid whose scanner may report about one repository.
+ *
+ * **This reverses an A7 refusal, and the reversal is A7.1's rather than a
+ * weakening of A7's.** A7 removed `repo.add` and `repo.remove` from the socket
+ * because "the socket carries no authority: every peer on it is the same uid as
+ * the daemon". That premise ended when A7.1 split the principals: this group is
+ * offered only to the peer the *root-owned* policy names, proved by
+ * `SO_PEERCRED`, and `backup.create`, `code.index` and every `dispatch.` method
+ * already sit behind exactly that door. An operator having to stop the daemon to
+ * name a scanner was the old premise outliving itself.
+ *
+ * The write is queued on the writer and reaches the same
+ * `atlas_service_repo_set_scanner_db` the local path calls. There is one write
+ * point; this is a second route to it, not a second implementation. */
+static atlas_status method_repo_scanner(dispatch_state *ds, const atlas_ipc_request *req,
+                                        atlas_err *err) {
+    const char *name = NULL;
+    if (!atlas_ipc_param_str(req, "repo", &name) || name == NULL || name[0] == '\0') {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "a scanner assignment needs a repository");
+    }
+    /* Absent means "derive it from the root's owner", which is what the local
+     * path does with no `--scanner-uid`. The uid travels as text so that absent
+     * and zero stay different: zero is a value the write point refuses, and a
+     * missing key must not arrive looking like it. */
+    const char *uid_text = "";
+    (void)atlas_ipc_param_str(req, "scanner_uid", &uid_text);
+    if (uid_text == NULL) {
+        uid_text = "";
+    }
+
+    atlas_writer_result result;
+    atlas_writer_result_init(&result);
+    atlas_status st = atlas_writer_call_repo_scanner(ds->ctx->writer, name, uid_text,
+                                                     ATLAS_IPC_WRITE_TIMEOUT_MS, &result, err);
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "id", result.id, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "name", atlas_safe(&ds->safe, atlas_buf_cstr(&result.name)),
+                                err);
+    }
+    atlas_writer_result_free(&result);
+    return st;
+}
+
 static const atlas_method_entry OPERATOR_METHODS[] = {
     {"decision.challenge", method_challenge},
     {"decision.approve", method_approve},
@@ -2667,6 +2712,7 @@ static const atlas_method_entry OPERATOR_METHODS[] = {
     {"decision.supersede", method_supersede},
     {"decision.revalidate", method_revalidate},
     {"decision.resolve", method_resolve},
+    {"repo.scanner", method_repo_scanner},
 };
 
 const atlas_method_entry *atlas_server_operator_methods(size_t *count_out) {

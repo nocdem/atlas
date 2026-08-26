@@ -458,46 +458,57 @@ Stated rather than implied:
   filesystem that does not implement it. Those repositories are covered only by
   periodic reconciliation, and Atlas has no way to detect that in advance.
 
-## A13 — the watcher was not moved to the mirror, and why
+## A13 — watching a mirror
 
-A13 lets the daemon *index* a repository it cannot open, from the scanner's
-mirror. It does **not** let it *watch* one. `add_repo` still takes `root`,
-`git_dir` and `common_dir` from the repository's row, exactly as P0 left them.
+A repository the daemon cannot open is watched over the scanner's mirror rather
+than over its own tree. `add_repo` asks `atlas_repo_open_git`, which prefers the
+real root, and takes `root`, `git_dir` and `common_dir` from the adapter's report
+of whatever it opened. All three move together or none does: P0 builds metadata
+watches from the latter two, and a root from one repository with metadata from
+another would rest branch correctness on a tree the source walk never covers.
 
-This was attempted and reverted, and the evidence is recorded here rather than
-the attempt being quietly dropped.
+**A mirror-backed watch makes a weaker claim, and the difference is not a
+detail.** A watch over a readable tree reports a change when the change lands in
+the tree. A watch over a mirror reports it when *the scanner writes it*. The
+index is therefore current as of the scanner's last pass and no sooner, and that
+is what `index_current` means for such a repository. It must never be described
+as equivalent to watching the tree, because it is not.
 
-The change was one substitution: ask `atlas_repo_open_git` which tree answered
-and take all three paths from `atlas_git_root`/`atlas_git_dir` rather than from
-the row. All three have to move together — P0 builds metadata watches from the
-latter two, and a root from one repository with metadata from another would rest
-branch correctness on a tree the source walk never covers.
+`repo_watch.from_mirror` records which it is, and every mirror-backed watch owes
+an event gap at build time. Waiting is an event gap — P0's rule — and whatever
+the scanner has not yet written is a change the watch cannot have seen. The gap
+is owed on every build rather than only when the answering source changes: the
+watch set is rebuilt from scratch and has no memory of which tree answered last
+time, so owing one unconditionally is the conservative direction and matches the
+obligation P0 already takes for a rebuilt watch set.
 
-It passed the release suite, the daemon suite and 105/105 twice. **Under ASan it
-failed `test_watch_budget` deterministically, three times out of three:** *a
-temporary ignore failure recovers to watching and current on its own* — the
-repository degraded as it should, but settled with `watch_reason` NONE where the
-test requires ERROR. Disabling only the new `atlas_git_open` in `add_repo` and
-rebuilding restored 24/24, which identifies the cause without explaining the
-mechanism.
+### The measurement this section exists because of
 
-That is the reason for the revert. `rebuild_watches` is reached from
-`mark_dirty` on the same recovery path the test exercises, so a git open added
-to the watch-set build sits inside P0's degrade-and-recover cycle rather than
-beside it. **A change to that cycle whose effect cannot be explained does not
-belong in it**, however green the release gate is, and the ASan run is the one
-that found it.
+`test_watch_budget`'s case *a temporary ignore failure recovers to watching and
+current on its own* **is flaky under ASan, and was so before A13**. Measured on
+this machine, standalone, unloaded:
 
-So the watcher keeps its pre-A13 behaviour: a repository whose tree this process
-cannot open is not watched, is degraded with `error`, and owes an event gap. It
-is now *indexed* from its mirror on the daemon's own reconcile schedule, which
-is what A13 delivers. Watching one is future work, along with the larger move of
-`src/daemon/watch.c` into the scanner so that inotify is opened by the principal
-that owns the tree — 3,486 lines, P0's budget arithmetic re-derived per uid, and
-`IN_Q_OVERFLOW` handling duplicated.
+| Tree | Passed / failed |
+| --- | --- |
+| `origin/main` (2a80327, pre-A13) | 4 / 2 over 6 runs |
+| A13 without this change | 2 / 2 over 4 runs |
+| A13 with this change | 6 / 4 over 10 runs |
 
-**The largest thing A13 leaves open** is unrelated to the watcher: a scanner that
-stops running leaves a frozen mirror, and nothing bounds its age. The daemon
-keeps indexing it and keeps reporting the index current. Closing that needs a
-recorded observation time and a staleness rule, and it is a freshness question
-rather than an authority one.
+All three sit in the same band. **The change does not make it worse.** This is
+recorded because the change was once reverted on the opposite conclusion, drawn
+from a single passing baseline run and three failing runs taken while a full
+gate matrix was competing for the machine. One passing run is not a baseline for
+a flaky test — which is A9.2.2's own rule, applied to a measurement rather than
+to a claim about a repository.
+
+**What A13 does not do here.** `src/daemon/watch.c` still runs in the daemon.
+Moving it into the scanner, so that inotify is opened by the principal that owns
+the tree, would remove the scanner's write cycle from the latency path entirely.
+It is 3,486 lines, it re-derives P0's budget arithmetic per uid, and it
+duplicates `IN_Q_OVERFLOW` handling — a season of its own, and named here so the
+current bound is not mistaken for the intended one.
+
+**The largest thing A13 leaves open.** A scanner that stops running leaves a
+frozen mirror, and nothing bounds its age: the daemon keeps indexing it and keeps
+reporting the index current. Closing that needs a recorded observation time and a
+staleness rule, and it is a freshness question rather than an authority one.

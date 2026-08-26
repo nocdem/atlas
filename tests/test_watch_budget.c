@@ -96,7 +96,8 @@ static void rig_start_writer(rig *r, atlas_err *err) {
 }
 
 static void rig_start_watcher(rig *r, const atlas_watcher_opts *o, atlas_err *err) {
-    T_OK(atlas_watcher_start(atlas_buf_cstr(&r->db_path), r->writer, r->log, o, &r->watcher, err),
+    T_OK(atlas_watcher_start(atlas_buf_cstr(&r->db_path), fx_data_dir(&r->fx), r->writer, r->log, o,
+                              &r->watcher, err),
          err);
 }
 

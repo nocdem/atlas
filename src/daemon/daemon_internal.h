@@ -571,7 +571,8 @@ typedef struct atlas_watcher_opts {
 
 void atlas_watcher_opts_init(atlas_watcher_opts *o);
 
-atlas_status atlas_watcher_start(const char *db_path, atlas_writer *writer, FILE *log,
+atlas_status atlas_watcher_start(const char *db_path, const char *data_dir,
+                                 atlas_writer *writer, FILE *log,
                                  const atlas_watcher_opts *opts, atlas_watcher **out,
                                  atlas_err *err);
 void atlas_watcher_stop(atlas_watcher *w);

@@ -796,16 +796,17 @@ is not written down is one somebody deletes.** Both halves are load-bearing.
   "the path still resolves here" to "the row still names this writer", and it
   is written at the skip because neither half is inferable from the code below
   it.
-- **The watcher was not moved and the attempt is recorded rather than dropped.**
-  A13 lets the daemon *index* a tree it cannot open; it does not let it *watch*
-  one. Repointing `add_repo` at the answering tree passed release and the daemon
-  suite and **failed `test_watch_budget` under ASan three times out of three** —
-  the repository degraded but settled with `watch_reason` NONE where ERROR is
-  required. Disabling only the new `atlas_git_open` restored 24/24, which
-  identifies the cause without explaining it. `rebuild_watches` is reached from
-  `mark_dirty` on the same recovery path, so the open sat inside P0's
-  degrade-and-recover cycle rather than beside it. **A change to that cycle whose
-  effect cannot be explained does not belong in it.**
+- **The watcher's three paths move together or none does.** P0 builds metadata
+  watches from `git_dir` and `common_dir`; a root from one repository with
+  metadata from another rests branch correctness on a tree the source walk never
+  covers. They come from `atlas_git_root`/`atlas_git_dir` — the adapter's own
+  report of what it opened — rather than from code repeating the choice.
+- **A mirror-backed watch makes a weaker claim and owes an event gap.** It
+  reports a change when *the scanner writes it*, not when the developer saves
+  the file, so the index is current as of the scanner's last pass and no sooner.
+  Never describe it as equivalent to watching the tree. The gap is owed on every
+  build, because the watch set is rebuilt from scratch and has no memory of which
+  tree answered last time.
 - **Orchestration never reads a mirror.** `src/orch/rundriver.c`'s
   pinned-commit check and `src/orch/snapshot.c`'s workspace must see the tree a
   worker edits: comparing work against a copy taken before it would make A11.1's

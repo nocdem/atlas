@@ -62,14 +62,6 @@
  * overhead depends on a path this code does not choose. */
 #define SCANNER_CHUNK_BYTES (ATLAS_IPC_MAX_REQUEST_BYTES / 4u)
 
-/* The shortest cadence a scanner may promise.
- *
- * A walk costs a `git ls-files`, a `git ls-untracked` and a stat of every file;
- * below this the scanner would spend more time walking than the daemon spends
- * indexing what it produced. It bounds the promise, not the work: a pass that
- * takes longer simply delays the next one. */
-#define ATLAS_SCANNER_MIN_INTERVAL_MS 5000
-
 typedef struct walk_ctx {
     const char *socket_path;
     int64_t repo_id;
@@ -87,13 +79,10 @@ typedef struct walk_ctx {
  *
  * Before the first byte, so a crash anywhere in the walk leaves the mirror
  * refused rather than read as whole. */
-static atlas_status say_state(walk_ctx *w, bool complete, int64_t interval_ms) {
+static atlas_status say_state(walk_ctx *w, bool complete) {
     atlas_buf params = ATLAS_BUF_INIT;
-    atlas_status st =
-        atlas_buf_appendf(&params, w->err,
-                          "{\"repo\":%lld,\"complete\":%s,\"interval_ms\":%lld}",
-                          (long long)w->repo_id, complete ? "true" : "false",
-                          (long long)interval_ms);
+    atlas_status st = atlas_buf_appendf(&params, w->err, "{\"repo\":%lld,\"complete\":%s}",
+                                        (long long)w->repo_id, complete ? "true" : "false");
     atlas_buf raw = ATLAS_BUF_INIT;
     if (st == ATLAS_OK) {
         st = atlas_ipc_call(w->socket_path, "scanner.state", atlas_buf_cstr(&params), &raw,
@@ -401,13 +390,14 @@ static atlas_status walk_cb(const atlas_git_index_entry *e, void *ud, atlas_err 
     return ATLAS_OK;
 }
 
-/* One pass over every repository this uid may scan.
+/* One pass: ask what is owed, mirror it, report what was left behind.
  *
- * `interval_ms` is what the run promises about the next one, and it is reported
- * to the daemon alongside completeness: zero for a one-shot run, which promises
- * nothing. See migration 29 -- the party that knows the cadence is the one that
- * states it. */
-static atlas_status scan_pass(int64_t interval_ms, FILE *log, atlas_err *err) {
+ * `*poll_within_ms` receives the cadence the daemon asked for, so the loop
+ * sleeps for a time Atlas chose rather than one this process invented. The spec
+ * has no `hello` for the same reason: the scanner asks what is owed, and asking
+ * is what proves it is alive. */
+static atlas_status scan_pass(int64_t *poll_within_ms, FILE *log, atlas_err *err) {
+    *poll_within_ms = ATLAS_SCANNER_POLL_INTERVAL_MS;
 
     atlas_buf socket_path = ATLAS_BUF_INIT;
     atlas_status st = atlas_ipc_socket_path(&socket_path, err);
@@ -439,6 +429,16 @@ static atlas_status scan_pass(int64_t interval_ms, FILE *log, atlas_err *err) {
         atlas_ipc_response_free(resp);
         atlas_buf_free(&socket_path);
         return refused;
+    }
+
+    /* Read only from an answer that succeeded. The daemon says how soon it wants
+     * to be asked again; an older one that does not say leaves the compiled
+     * default, which is the same number its own freshness rule uses. */
+    {
+        int64_t within = 0;
+        if (atlas_ipc_result_int(resp, "poll_within_ms", &within) && within > 0) {
+            *poll_within_ms = within;
+        }
     }
 
     size_t n = 0;
@@ -493,7 +493,7 @@ static atlas_status scan_pass(int64_t interval_ms, FILE *log, atlas_err *err) {
         w.status = ATLAS_OK;
         /* Cleared before anything is written, so a crash leaves the mirror
          * refused rather than trusted. */
-        if (say_state(&w, false, interval_ms) != ATLAS_OK) {
+        if (say_state(&w, false) != ATLAS_OK) {
             st = w.err != NULL ? ATLAS_ERR_INTERNAL : ATLAS_ERR_INTERNAL;
             atlas_git_close(g);
             atlas_buf_free(&root_raw);
@@ -563,7 +563,7 @@ static atlas_status scan_pass(int64_t interval_ms, FILE *log, atlas_err *err) {
         bool complete = walked == ATLAS_OK && w.status == ATLAS_OK &&
                         w.skipped_symlink == 0 && w.skipped_large == 0 &&
                         w.skipped_unreadable == 0;
-        (void)say_state(&w, complete, interval_ms);
+        (void)say_state(&w, complete);
 
         if (log != NULL) {
             (void)fprintf(log,
@@ -584,48 +584,48 @@ static atlas_status scan_pass(int64_t interval_ms, FILE *log, atlas_err *err) {
     return st;
 }
 
-/* A13. The scanner's own loop.
+/* A13. The scanner's loop.
  *
  * A repository read from a mirror is only as current as the last run that wrote
  * it, and the daemon watches the mirror rather than the tree — so if this
- * process stops, nothing tells the daemon and nothing observes the repository.
- * `atlas_server_overlay_mirror` is what refuses to claim currency past the
- * promised cadence, and this is the process that keeps the promise.
+ * process stops, nothing observes the repository. `atlas_server_overlay_mirror`
+ * is what stops claiming currency once the polling stops, and this is the
+ * process whose polling it is.
  *
- * `--once` is a snapshot: one pass, promising nothing, and the daemon will not
- * call an index built from it current. That is not a limitation to work around;
- * it is what a single pass actually establishes.
+ * **The cadence is the daemon's.** Each pass is told how soon to ask again, and
+ * that is the same number the freshness rule judges by, so what Atlas requests
+ * and what it holds a scanner to cannot drift apart. This process invents no
+ * schedule and promises nothing: it asks, and asking is the evidence.
+ *
+ * `--once` is a snapshot — one pass, after which nothing is polling and the
+ * daemon will not call an index built from it current. That is not a limitation
+ * to route around; one pass establishes what the tree was, not what it is.
  *
  * The sleep is between passes rather than on a timer, so a pass that runs long
- * delays the next one instead of overlapping it. Nothing here is concurrent:
- * one repository at a time, one file at a time, and the daemon's own write
- * ordering does the rest. */
-atlas_status atlas_service_scanner_run(bool once, int64_t interval_ms, FILE *log,
-                                       atlas_err *err) {
+ * delays the next one instead of overlapping it. */
+atlas_status atlas_service_scanner_run(bool once, FILE *log, atlas_err *err) {
+    int64_t within = ATLAS_SCANNER_POLL_INTERVAL_MS;
     if (once) {
-        return scan_pass(0, log, err);
-    }
-    if (interval_ms < ATLAS_SCANNER_MIN_INTERVAL_MS) {
-        return atlas_err_set(err, ATLAS_ERR_USAGE,
-                             "a scanner interval below %lld ms would spend more time walking "
-                             "than the daemon spends indexing",
-                             (long long)ATLAS_SCANNER_MIN_INTERVAL_MS);
+        return scan_pass(&within, log, err);
     }
     for (;;) {
         atlas_err pass_err;
         atlas_err_init(&pass_err);
-        atlas_status st = scan_pass(interval_ms, log, &pass_err);
+        atlas_status st = scan_pass(&within, log, &pass_err);
         if (st != ATLAS_OK && log != NULL) {
             /* Reported and survived. A repository that could not be mirrored
-             * this time is one whose mirror keeps the state the last successful
-             * pass left, and the daemon already refuses to call that current
-             * once the promised interval has passed. Exiting here would turn one
-             * repository's problem into every repository's. */
+             * this time keeps whatever the last successful pass left, and the
+             * daemon already refuses to call that current once the polling
+             * cadence has lapsed. Exiting here would turn one repository's
+             * problem into every repository's. */
             (void)fprintf(log, "scanner: pass failed: %s\n", atlas_err_msg(&pass_err));
         }
+        if (within < ATLAS_SCANNER_POLL_MIN_MS) {
+            within = ATLAS_SCANNER_POLL_MIN_MS;
+        }
         struct timespec ts;
-        ts.tv_sec = (time_t)(interval_ms / 1000);
-        ts.tv_nsec = (long)((interval_ms % 1000) * 1000000);
+        ts.tv_sec = (time_t)(within / 1000);
+        ts.tv_nsec = (long)((within % 1000) * 1000000);
         while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {
             /* Interrupted by a signal: finish the remaining time rather than
              * treating the wake-up as the interval having elapsed. */

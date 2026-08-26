@@ -4283,27 +4283,6 @@ static const char M28_MIRROR_AT[] =
 
 static const char *const M28_STATEMENTS[] = {M28_MIRROR_COMPLETE, M28_MIRROR_AT, NULL};
 
-/* A13. How long the scanner that wrote this mirror promised to keep writing it.
- *
- * The daemon watches the mirror, not the tree, so it learns of a change when the
- * scanner writes one — and if the scanner stops, nothing tells it. `mirror_at`
- * says when the mirror was last whole and answers "how old"; it cannot answer
- * "too old", because the daemon has no idea how often this repository's scanner
- * is meant to run.
- *
- * **The party that knows states the bound.** A scanner reports its own cadence
- * when it reports completeness, exactly as P0 derives its watch budget from the
- * kernel rather than from a number in a header: a staleness bound compiled in
- * here would be a guess about somebody else's schedule.
- *
- * Zero means no cadence was promised — a one-shot run. That is not a defect and
- * not a default: `atlas scanner run --once` is a snapshot tool, and after it
- * nothing is observing the tree, so Atlas cannot claim the index reflects it. */
-static const char M29_MIRROR_INTERVAL[] =
-    "ALTER TABLE repositories ADD COLUMN mirror_interval_ms INTEGER NOT NULL DEFAULT 0;";
-
-static const char *const M29_STATEMENTS[] = {M29_MIRROR_INTERVAL, NULL};
-
 static const atlas_migration MIGRATIONS[] = {
     {1, "initial schema", M1_STATEMENTS, false},
     {2, "worktree identity", M2_STATEMENTS, false},
@@ -4398,7 +4377,6 @@ static const atlas_migration MIGRATIONS[] = {
     {27, "which uid's scanner may report about a repository", M27_STATEMENTS, false},
     {28, "whether a repository's mirror is complete, and when it was written",
      M28_STATEMENTS, false},
-    {29, "the cadence the scanner that writes a mirror promised", M29_STATEMENTS, false},
 };
 
 const atlas_migration *atlas_migrations(size_t *count_out) {

@@ -336,6 +336,26 @@ typedef struct atlas_writer_result {
 
 void atlas_writer_result_init(atlas_writer_result *r);
 void atlas_writer_result_free(atlas_writer_result *r);
+/* A13. When each repository's scanner was last heard from.
+ *
+ * **In memory, not in the index.** A heartbeat is liveness, not a durable fact:
+ * a daemon that has just started has heard from nobody, which is exactly the
+ * conservative answer, and persisting one would let a restarted daemon trust a
+ * scanner that died before it. It also keeps `scanner.poll` a read — the method
+ * runs on a read-only handle, and writing from there is what the suite caught.
+ *
+ * One mutex, no writer and no I/O, exactly like the watcher's live view.
+ * Bounded: repositories a daemon serves are few, and an unknown one reads as
+ * "never heard from", which only ever subtracts. */
+typedef struct atlas_scanner_seen atlas_scanner_seen;
+
+atlas_scanner_seen *atlas_scanner_seen_new(void);
+void atlas_scanner_seen_free(atlas_scanner_seen *s);
+/* Records that `repo_id`'s scanner asked what is owed, now. */
+void atlas_scanner_seen_touch(atlas_scanner_seen *s, int64_t repo_id);
+/* Milliseconds since it last did, or a negative value when it never has. */
+int64_t atlas_scanner_seen_age_ms(atlas_scanner_seen *s, int64_t repo_id);
+
 typedef struct atlas_writer atlas_writer;
 
 /* Starts the writer thread. It opens its own writable database handle from
@@ -641,6 +661,8 @@ typedef struct atlas_server_ctx {
     const char *socket_path;
     atlas_writer *writer;
     atlas_watcher *watcher;
+    /* A13. Scanner liveness, in memory. See `atlas_scanner_seen`. */
+    atlas_scanner_seen *scanner_seen;
     atlas_workers *workers;
     /* Long-running operations that must not run inside the serve loop. See
      * atlas/ops.h: a backup or a semantic index takes longer than a client will

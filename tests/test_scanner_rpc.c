@@ -188,24 +188,29 @@ static void test_uid_zero_is_never_a_scanner(void) {
     env_close(&e);
 }
 
-/* `atlas scanner run` without `--once` refuses instead of idling.
+/* The poll answer carries the cadence Atlas will hold a scanner to.
  *
- * Asserted through the built binary because that is where it would break: the
- * flag has to be admitted by the argument parser, reach the dispatch, and be
- * read from the field the parser actually sets. Needs no socket and no daemon,
- * so it is deterministic wherever it runs. */
-static void test_the_scanner_refuses_to_run_without_once(void) {
-    atlas_err err;
-    atlas_err_init(&err);
-    atlas_buf out = ATLAS_BUF_INIT, errout = ATLAS_BUF_INIT;
-    int code = -1;
-    const char *args[] = {"scanner", "run"};
-    T_OK(fx_atlas(args, 2u, &out, &errout, &code, &err), &err);
-    T_CHECK_MSG(code != 0, "a scanner with no --once exited 0");
-    T_CHECK_MSG(strstr(atlas_buf_cstr(&errout), "--once") != NULL,
-                "the refusal does not name the flag: %s", atlas_buf_cstr(&errout));
-    atlas_buf_free(&out);
-    atlas_buf_free(&errout);
+ * **The cadence is Atlas', not the scanner's.** `scanner.poll` doubles as the
+ * heartbeat — the spec's design, and why there is no `hello` — so the number in
+ * the answer and the number the freshness rule judges by have to be one number.
+ * A scanner that declared its own would leave a promise standing after it died;
+ * one that stops polling simply stops being heard.
+ *
+ * Asserted at the boundary a scanner reaches, because that is where a drift
+ * between the two would show. */
+static void test_the_poll_answer_carries_the_cadence(void) {
+    env e;
+    env_open(&e);
+
+    atlas_buf raw = ATLAS_BUF_INIT;
+    atlas_ipc_response *r = call(&e, (long long)getuid(), "scanner.poll", "{}", &raw);
+    T_CHECK_MSG(atlas_ipc_response_ok(r), "scanner.poll failed: %s", atlas_buf_cstr(&raw));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&raw), "\"poll_within_ms\"") != NULL,
+                "the poll answer does not say when to ask again: %s", atlas_buf_cstr(&raw));
+    atlas_ipc_response_free(r);
+    atlas_buf_free(&raw);
+
+    env_close(&e);
 }
 
 /* True when `<data-dir>/mirror/<repo>/<rel>` exists. */
@@ -336,7 +341,7 @@ static const atlas_test TESTS[] = {
      test_a_scanner_writes_into_its_own_repositorys_mirror},
     {"a scanner may not write into another repository's mirror",
      test_a_scanner_may_not_write_into_another_repositorys_mirror},
-    {"the scanner refuses to run without --once", test_the_scanner_refuses_to_run_without_once},
+    {"the poll answer carries the cadence", test_the_poll_answer_carries_the_cadence},
     {"a uid that owns nothing is refused and names no repository",
      test_a_uid_that_owns_nothing_is_refused_and_names_no_repository},
     {"uid zero is never a scanner", test_uid_zero_is_never_a_scanner},

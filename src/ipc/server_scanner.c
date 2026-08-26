@@ -105,7 +105,31 @@ static atlas_status emit_cb(const atlas_repo_info *ri, void *ud, atlas_err *err)
         st = atlas_json_key_str(j, "root", atlas_buf_cstr(&ri->root_path_text), s->err);
     }
     if (st == ATLAS_OK) {
+        /* The directive. `full` while no complete mirror exists, because a
+         * partial one is refused by `atlas_repo_open_git` and the way out of
+         * that is a whole pass; `incremental` once one does. The decision is
+         * the daemon's because the daemon is what knows the index's state -- the
+         * spec's shape, where the scanner asks what is owed rather than
+         * deciding it. */
+        st = atlas_json_key_str(j, "directive", ri->mirror_complete ? "incremental" : "full",
+                                s->err);
+    }
+    if (st == ATLAS_OK) {
         st = atlas_json_obj_end(j, s->err);
+    }
+    /* **Asking is the evidence.** `scanner.poll` doubles as the heartbeat, which
+     * is why the spec has no `hello`: nothing is claimed by the caller, and what
+     * is recorded is that a request arrived from the uid this row names. A
+     * scanner that stops polling stops being heard, and
+     * `atlas_server_overlay_mirror` stops calling the index current.
+     *
+     * In memory, not in the index. This method runs on a read-only handle --
+     * writing here failed with "attempt to write a readonly database", which
+     * `test_scanner_rpc` caught -- and a heartbeat is liveness rather than a
+     * durable fact anyway: a restarted daemon has heard from nobody, which is
+     * the answer that refuses rather than the one that trusts. */
+    if (s->ds->ctx != NULL) {
+        atlas_scanner_seen_touch(s->ds->ctx->scanner_seen, ri->id);
     }
     s->status = st;
     return ATLAS_OK;
@@ -140,6 +164,12 @@ static atlas_status method_scanner_poll(dispatch_state *ds, const atlas_ipc_requ
     }
     if (st == ATLAS_OK) {
         st = atlas_json_key_int(ds->j, "scanner_uid", ds->peer_uid, err);
+    }
+    if (st == ATLAS_OK) {
+        /* How soon Atlas expects to be asked again. The cadence is Atlas', not
+         * the scanner's: it is the same number the freshness rule holds a
+         * scanner to, so the promise and the judgement cannot drift apart. */
+        st = atlas_json_key_int(ds->j, "poll_within_ms", ATLAS_SCANNER_POLL_INTERVAL_MS, err);
     }
     return st;
 }
@@ -297,15 +327,6 @@ static atlas_status method_scanner_state(dispatch_state *ds, const atlas_ipc_req
     }
     bool complete = false;
     (void)atlas_ipc_param_bool(req, "complete", &complete);
-    /* The cadence this scanner promises to keep. Absent is zero, which is a
-     * one-shot run promising nothing -- see migration 29. Atlas stores what the
-     * scanner claims and never invents one: a bound compiled in here would be a
-     * guess about somebody else's schedule. */
-    int64_t interval_ms = 0;
-    (void)atlas_ipc_param_int(req, "interval_ms", &interval_ms);
-    if (interval_ms < 0) {
-        interval_ms = 0;
-    }
 
     atlas_repo_info ri;
     atlas_repo_info_init(&ri);
@@ -327,7 +348,7 @@ static atlas_status method_scanner_state(dispatch_state *ds, const atlas_ipc_req
      * it finished would let a clock decide whether an index is current. */
     char now[32];
     atlas_now_iso8601(now, sizeof(now));
-    st = atlas_db_repo_set_mirror_state(ds->db, repo_id, complete, now, interval_ms, err);
+    st = atlas_db_repo_set_mirror_state(ds->db, repo_id, complete, now, err);
     if (st == ATLAS_OK) {
         st = atlas_json_key_bool(ds->j, "complete", complete, err);
     }

@@ -260,6 +260,10 @@ atlas_status atlas_daemon_run(const atlas_daemon_opts *opts, FILE *log, atlas_er
     sctx.socket_path = atlas_buf_cstr(&socket_path);
     sctx.writer = writer;
     sctx.watcher = watcher;
+    /* A13. Scanner liveness. NULL is survivable and reads as "never heard from",
+     * which only ever subtracts -- so a failed allocation costs conservatism
+     * rather than the daemon. */
+    sctx.scanner_seen = atlas_scanner_seen_new();
     sctx.workers = workers;
     sctx.ops = ops;
     sctx.log = log;
@@ -315,6 +319,7 @@ done:
      * its handle; the workers are last because the writer may still be using
      * them as it drains. */
     atlas_watcher_stop(watcher);
+    atlas_scanner_seen_free(sctx.scanner_seen);
     /* Before the writer: an operation in flight is a backup being verified or a
      * semantic generation being written, and both must reach a decision point
      * rather than stop half-way. Waiting here is what makes "a failed or

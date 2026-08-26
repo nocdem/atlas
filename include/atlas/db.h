@@ -21,7 +21,7 @@
 #include "atlas/error.h"
 #include "atlas/limits.h"
 
-#define ATLAS_SCHEMA_VERSION 29
+#define ATLAS_SCHEMA_VERSION 28
 
 typedef struct atlas_db atlas_db;
 
@@ -84,10 +84,6 @@ typedef struct atlas_repo_info {
      * can ask. Empty means no run has ever finished. */
     bool mirror_complete;
     char mirror_at[32];
-    /* A13. The cadence the scanner promised when it reported completeness, in
-     * milliseconds. Zero means none was promised -- a one-shot run -- and after
-     * one of those nothing is observing the tree. */
-    int64_t mirror_interval_ms;
 } atlas_repo_info;
 
 void atlas_repo_info_init(atlas_repo_info *ri);
@@ -358,7 +354,7 @@ atlas_status atlas_db_repo_set_scanner_uid(atlas_db *db, int64_t repo_id, int64_
 /* A13. Records what a mirroring run claims about what it left behind: cleared
  * when a run starts, set when one finishes. See the definition. */
 atlas_status atlas_db_repo_set_mirror_state(atlas_db *db, int64_t repo_id, bool complete,
-                                            const char *at, int64_t interval_ms, atlas_err *err);
+                                            const char *at, atlas_err *err);
 atlas_status atlas_db_repo_scanner_uid(atlas_db *db, int64_t repo_id, int64_t *out,
                                        atlas_err *err);
 

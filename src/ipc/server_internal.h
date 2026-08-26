@@ -157,9 +157,10 @@ atlas_status atlas_server_require_repo(dispatch_state *ds, const atlas_ipc_reque
  * against a deliberately stalled writer, which is the only condition it exists
  * for. It never upgrades. */
 void atlas_server_overlay_live(atlas_index_state *s, const atlas_watch_live *live);
-/* A13. Subtracts the mirror's own age from what Atlas will claim. See the
+/* A13. Subtracts the scanner's silence from what Atlas will claim. See the
  * definition; like the live overlay, it only ever subtracts. */
-void atlas_server_overlay_mirror(atlas_index_state *s, const atlas_repo_info *ri);
+void atlas_server_overlay_mirror(atlas_index_state *s, const atlas_repo_info *ri,
+                                 atlas_scanner_seen *seen);
 
 atlas_status atlas_server_write_repo_state(dispatch_state *ds, const atlas_repo_info *ri,
                                            atlas_err *err);

@@ -26,9 +26,12 @@
 #include "atlas/db.h"
 #include "atlas/ipc.h"
 #include "atlas/safetext.h"
+#include "daemon/daemon_internal.h"
+#include "daemon/mirror.h"
 #include "ipc/server_internal.h"
 
 #include <string.h>
+#include <unistd.h>
 
 typedef struct scanner_scan {
     dispatch_state *ds;
@@ -140,8 +143,71 @@ static atlas_status method_scanner_poll(dispatch_state *ds, const atlas_ipc_requ
     return st;
 }
 
+/* Hands one file's bytes to the mirror.
+ *
+ * The order of the checks is the design. Everything that can refuse happens
+ * before any descriptor is opened, so a refused call leaves nothing behind —
+ * and the third check is the load-bearing one: `require_scanner` only asks
+ * whether this peer scans *something*, and without `peer_owns` on the named
+ * repository a scanner could write into a mirror belonging to a repository it
+ * does not own. */
+static atlas_status method_scanner_put(dispatch_state *ds, const atlas_ipc_request *req,
+                                       atlas_err *err) {
+    atlas_status st = require_scanner(ds, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+
+    int64_t repo_id = 0;
+    if (!atlas_ipc_param_int(req, "repo", &repo_id)) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "a put needs a repository id");
+    }
+    const char *path = NULL;
+    if (!atlas_ipc_param_str(req, "path", &path) || path == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "a put needs a path");
+    }
+    const char *data = NULL;
+    if (!atlas_ipc_param_str(req, "data", &data) || data == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "a put needs its content");
+    }
+    bool first = true;
+    (void)atlas_ipc_param_bool(req, "first", &first);
+
+    atlas_repo_info ri;
+    atlas_repo_info_init(&ri);
+    bool found = false;
+    st = atlas_db_repo_get_by_id(ds->db, repo_id, &ri, &found, err);
+    if (st == ATLAS_OK && !found) {
+        /* The id is one the caller supplied, so the refusal says only that it
+         * resolved to nothing — it does not describe the registry. */
+        st = atlas_err_set(err, ATLAS_ERR_REPO, "no repository has that id");
+    }
+    if (st == ATLAS_OK && !peer_owns(ds, &ri)) {
+        st = atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                           "uid %lld is not this repository's scanner", (long long)ds->peer_uid);
+    }
+    atlas_repo_info_free(&ri);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+
+    int root = -1;
+    st = atlas_mirror_open_repo(ds->ctx->data_dir, repo_id, &root, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    size_t len = strlen(data);
+    st = atlas_mirror_put(root, path, strlen(path), first, data, len, err);
+    (void)close(root);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    return atlas_json_key_int(ds->j, "written", (int64_t)len, err);
+}
+
 static const atlas_method_entry SCANNER_METHODS[] = {
     {"scanner.poll", method_scanner_poll},
+    {"scanner.put", method_scanner_put},
 };
 
 const atlas_method_entry *atlas_server_scanner_methods(size_t *count_out) {

@@ -208,9 +208,78 @@ static void test_the_scanner_refuses_to_run_without_once(void) {
     atlas_buf_free(&errout);
 }
 
+/* True when `<data-dir>/mirror/<repo>/<rel>` exists. */
+static bool mirrored(env *e, int64_t repo, const char *rel) {
+    atlas_buf p = ATLAS_BUF_INIT;
+    atlas_err err;
+    atlas_err_init(&err);
+    (void)atlas_buf_appendf(&p, &err, "%s/mirror/%lld/%s", fx_data_dir(&e->fx), (long long)repo,
+                            rel);
+    bool there = access(atlas_buf_cstr(&p), F_OK) == 0;
+    atlas_buf_free(&p);
+    return there;
+}
+
+static void test_a_scanner_writes_into_its_own_repositorys_mirror(void) {
+    env e;
+    env_open(&e);
+
+    atlas_buf raw = ATLAS_BUF_INIT;
+    atlas_buf params = ATLAS_BUF_INIT;
+    atlas_err err;
+    atlas_err_init(&err);
+    T_OK(atlas_buf_appendf(&params, &err,
+                           "{\"repo\":%lld,\"path\":\"src/a.c\",\"first\":true,\"data\":\"int "
+                           "x;\"}",
+                           (long long)e.mine),
+         &err);
+    atlas_ipc_response *r =
+        call(&e, (long long)getuid(), "scanner.put", atlas_buf_cstr(&params), &raw);
+    T_CHECK_MSG(atlas_ipc_response_ok(r), "scanner.put failed: %s", atlas_buf_cstr(&raw));
+    T_CHECK_MSG(mirrored(&e, e.mine, "src/a.c"), "the bytes did not reach the mirror");
+
+    atlas_ipc_response_free(r);
+    atlas_buf_free(&params);
+    atlas_buf_free(&raw);
+    env_close(&e);
+}
+
+/* The load-bearing refusal. `require_scanner` only asks whether this peer scans
+ * *something*; without the per-repository check a scanner could write into a
+ * mirror belonging to a repository it does not own. The absence on disk is
+ * asserted as well as the refusal: a refusal that had already written would be
+ * the whole design failing quietly. */
+static void test_a_scanner_may_not_write_into_another_repositorys_mirror(void) {
+    env e;
+    env_open(&e);
+
+    atlas_buf raw = ATLAS_BUF_INIT;
+    atlas_buf params = ATLAS_BUF_INIT;
+    atlas_err err;
+    atlas_err_init(&err);
+    T_OK(atlas_buf_appendf(&params, &err,
+                           "{\"repo\":%lld,\"path\":\"stolen.c\",\"first\":true,\"data\":\"x\"}",
+                           (long long)e.theirs),
+         &err);
+    atlas_ipc_response *r =
+        call(&e, (long long)getuid(), "scanner.put", atlas_buf_cstr(&params), &raw);
+    T_CHECK_MSG(!atlas_ipc_response_ok(r), "a scanner wrote into another repository's mirror: %s",
+                atlas_buf_cstr(&raw));
+    T_CHECK_MSG(!mirrored(&e, e.theirs, "stolen.c"), "the refused write still created a file");
+
+    atlas_ipc_response_free(r);
+    atlas_buf_free(&params);
+    atlas_buf_free(&raw);
+    env_close(&e);
+}
+
 static const atlas_test TESTS[] = {
     {"a scanner is told its own repositories and no others",
      test_a_scanner_is_told_its_own_repositories_and_no_others},
+    {"a scanner writes into its own repository's mirror",
+     test_a_scanner_writes_into_its_own_repositorys_mirror},
+    {"a scanner may not write into another repository's mirror",
+     test_a_scanner_may_not_write_into_another_repositorys_mirror},
     {"the scanner refuses to run without --once", test_the_scanner_refuses_to_run_without_once},
     {"a uid that owns nothing is refused and names no repository",
      test_a_uid_that_owns_nothing_is_refused_and_names_no_repository},

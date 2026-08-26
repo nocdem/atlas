@@ -1799,7 +1799,10 @@ atlas_status atlas_service_sem_index(atlas_ctx *ctx, const char *name, const cha
  * pass produces: the generation is byte for byte what it would have been. NULL
  * is the ordinary case, and is what the CLI passes: a local `code index` has one
  * thread and nothing else waiting for it. */
-atlas_status atlas_sem_index_on(atlas_db *db, const atlas_repo_info *repo,
+/* A13: `data_dir` is where a mirror lives, or NULL for the tree itself -- see
+ * `atlas_repo_open_git`. A semantic pass reads sources, so a repository the
+ * daemon cannot open is one it can never index. */
+atlas_status atlas_sem_index_on(atlas_db *db, const char *data_dir, const atlas_repo_info *repo,
                                 const char *const *compdbs, size_t compdb_count, bool rebuild,
                                 void (*yield)(void *ud), void *yield_ud,
                                 atlas_sem_index_summary *out, atlas_err *err);

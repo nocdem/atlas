@@ -339,7 +339,7 @@ static atlas_status sync_offline(atlas_ctx *ctx, const char *name, bool full,
         return st;
     }
     atlas_git *g = NULL;
-    st = atlas_service_open_repo_git(&info, &g, err);
+    st = atlas_service_open_repo_git(&info, atlas_ctx_data_dir(ctx), &g, err);
     if (st == ATLAS_OK) {
         atlas_reconcile_opts opts;
         atlas_reconcile_opts_init(&opts);
@@ -666,7 +666,10 @@ atlas_status atlas_service_status_remote(const char *name, atlas_status_report *
 
     out->never_scanned = (out->repo.last_scan_id == 0);
     out->scanned = !out->never_scanned;
-    return atlas_service_status_observe_live(out, err);
+    /* A13: the remote path. The index facts arrived over the socket; the live
+     * HEAD is observed here, in the client, which runs as the operator and can
+     * read the tree. NULL is the correct answer rather than a limitation. */
+    return atlas_service_status_observe_live(out, NULL, err);
 }
 
 atlas_status atlas_service_repo_state_remote(const char *name, atlas_repo_state_report *out,

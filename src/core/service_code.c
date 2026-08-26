@@ -535,7 +535,7 @@ atlas_status atlas_service_code_sync(atlas_ctx *ctx, const char *name, bool rebu
     atlas_status st = atlas_service_require_repo(ctx, name, &info, err);
     atlas_git *g = NULL;
     if (st == ATLAS_OK) {
-        st = atlas_service_open_repo_git(&info, &g, err);
+        st = atlas_service_open_repo_git(&info, atlas_ctx_data_dir(ctx), &g, err);
     }
     if (st == ATLAS_OK) {
         atlas_reconcile_opts opts;

@@ -984,7 +984,8 @@ static void run_sem_index(atlas_writer *w, atlas_job *j) {
          * runs a compiler over every unit the build describes, and until it
          * offered the thread back between them nothing else in this daemon was
          * written for as long as it took. */
-        st = atlas_sem_index_on(w->db, &repo, compdbs, n, j->sem_rebuild, writer_yield_cb, w, &sum,
+        st = atlas_sem_index_on(w->db, atlas_buf_cstr(&w->data_dir), &repo, compdbs, n,
+                                j->sem_rebuild, writer_yield_cb, w, &sum,
                                 &err);
     }
 

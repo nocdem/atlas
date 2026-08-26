@@ -14,6 +14,7 @@
 #include "atlas/error.h"
 #include "atlas/git.h"
 #include "atlas/mirror.h"
+#include "core/service_internal.h"
 #include "atlas_test.h"
 #include "support/fixture.h"
 
@@ -212,12 +213,86 @@ static void test_no_mirror_still_fails(void) {
     fx_close(&fx);
 }
 
+/* The shared helper enforces two identity checks after opening: the registered
+ * root must still resolve to itself, and the git dir must be the one recorded.
+ * A mirror fails both by construction. Those checks are claims about the real
+ * tree, and when the mirror answered the real tree was not opened -- so the
+ * claim is not false, it is unasked, and asserting it would refuse a correct
+ * answer. This asserts the *status*, because ATLAS_ERR_INTEGRITY is exactly
+ * what the bug looks like. */
+static void test_shared_helper_accepts_a_mirror(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    fixture fx;
+    T_REQUIRE(fx_open(&fx, &err) == ATLAS_OK);
+
+    char want[ATLAS_OID_HEX_MAX_INCL];
+    T_OK(build_mirror(&fx, 7, want, &err), &err);
+
+    atlas_repo_info info;
+    make_info(&info, 7, fx_repo(&fx), 1000, &err);
+
+    atlas_git *g = NULL;
+    atlas_status st = atlas_service_open_repo_git(&info, fx_data_dir(&fx), &g, &err);
+    T_CHECK_MSG(st != ATLAS_ERR_INTEGRITY,
+                "the canonical-root check is unasked when the mirror answered");
+    T_OK(st, &err);
+    T_REQUIRE(g != NULL);
+
+    atlas_git_head h;
+    memset(&h, 0, sizeof(h));
+    T_OK(atlas_git_read_head(g, &h, &err), &err);
+    T_CHECK_MSG(strcmp(h.oid, want) == 0, "and the mirror is what it opened");
+    atlas_git_close(g);
+
+    atlas_repo_info_free(&info);
+    fx_close(&fx);
+}
+
+/* The real root's *status* survives, not only its message.
+ *
+ * `atlas_git_open` refuses a partial (promisor) repository with an integrity
+ * status, and a caller that saw that collapsed into a plain repository error
+ * would read "not found" where Atlas meant "refused, and deliberately". This
+ * is a regression test: flattening the status turned `test_git_hardening`'s
+ * rescan case from 7 into 4, and that suite caught it when this one did not. */
+static void test_the_real_roots_status_survives(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    fixture fx;
+    T_REQUIRE(fx_open(&fx, &err) == ATLAS_OK);
+
+    /* A path that does not exist at all, so `atlas_git_open` fails with its own
+     * status rather than one this test chose. */
+    char missing[2048];
+    (void)snprintf(missing, sizeof(missing), "%s/nowhere", fx_repo(&fx));
+
+    atlas_git *probe = NULL;
+    atlas_err direct;
+    atlas_err_init(&direct);
+    atlas_status want = atlas_git_open(missing, &probe, &direct);
+    T_REQUIRE(want != ATLAS_OK);
+
+    atlas_repo_info info;
+    make_info(&info, 7, missing, 1000, &err);
+
+    atlas_git *g = NULL;
+    atlas_status got = atlas_repo_open_git(&info, fx_data_dir(&fx), &g, NULL, &err);
+    T_CHECK_MSG(got == want, "the fallback reports the real root's own status");
+    T_CHECK_MSG(g == NULL, "and nothing is handed back to close");
+
+    atlas_repo_info_free(&info);
+    fx_close(&fx);
+}
+
 static const atlas_test TESTS[] = {
     {"falls back to the mirror", test_falls_back_to_the_mirror},
     {"a readable root is preferred", test_a_readable_root_is_preferred},
     {"no scanner means no mirror", test_no_scanner_means_no_mirror},
     {"a NULL data dir never consults a mirror", test_null_data_dir_never_consults_a_mirror},
     {"no mirror still fails", test_no_mirror_still_fails},
+    {"the shared helper accepts a mirror", test_shared_helper_accepts_a_mirror},
+    {"the real root's status survives", test_the_real_roots_status_survives},
 };
 
 ATLAS_TEST_MAIN("mirror_fallback", TESTS)

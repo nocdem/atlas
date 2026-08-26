@@ -17,6 +17,7 @@
 #include "atlas/lock.h"
 #include "atlas/pathrep.h"
 #include "atlas/scanner_uid.h"
+#include "atlas/mirror.h"
 #include "core/service_internal.h"
 
 struct atlas_ctx {
@@ -223,11 +224,28 @@ atlas_status atlas_service_require_repo(atlas_ctx *ctx, const char *name, atlas_
     return ATLAS_OK;
 }
 
-atlas_status atlas_service_open_repo_git(const atlas_repo_info *info, atlas_git **out,
-                                         atlas_err *err) {
-    atlas_status st = atlas_git_open(atlas_buf_cstr(&info->root_path), out, err);
+atlas_status atlas_service_open_repo_git(const atlas_repo_info *info, const char *data_dir,
+                                         atlas_git **out, atlas_err *err) {
+    bool from_mirror = false;
+    atlas_status st = atlas_repo_open_git(info, data_dir, out, &from_mirror, err);
     if (st != ATLAS_OK) {
         return st;
+    }
+    if (from_mirror) {
+        /* The two checks below assert that *the registered root still resolves
+         * to itself*. That is a claim about the real tree, and the real tree
+         * was not opened — so the claim is not false, it is **unasked**, and
+         * asserting it against the mirror would refuse a correct answer.
+         *
+         * What stands in its place is not nothing. The mirror is at a path
+         * Atlas derives from `repo_id` inside its own data directory, and only
+         * a uid this repository's row names may write there — one comparison,
+         * `peer_owns` in `src/ipc/server_scanner.c`, and `atlas_repo_open_git`
+         * refuses a mirror for a row naming no scanner at all. The warrant
+         * moved from "the path still resolves here" to "the row still names
+         * this writer". It did not disappear, and neither half of this is
+         * inferable from the code below, which is why it is written here. */
+        return ATLAS_OK;
     }
     /* The registered root must still be the canonical root. If the path now
      * resolves elsewhere the registration is stale, and proceeding would report
@@ -825,7 +843,7 @@ atlas_status atlas_service_scan(atlas_ctx *ctx, const char *name, const atlas_sc
     }
 
     atlas_git *g = NULL;
-    st = atlas_service_open_repo_git(&info, &g, err);
+    st = atlas_service_open_repo_git(&info, atlas_ctx_data_dir(ctx), &g, err);
     if (st == ATLAS_OK) {
         st = atlas_scan_run(ctx->db, g, info.id, opts, summary, err);
     }
@@ -857,11 +875,12 @@ void atlas_status_report_free(atlas_status_report *r) {
  * implementation of "what git says right now" and one definition of head drift.
  * It needs nothing but the report's own `root_path`, which is why the remote
  * path can perform it after fetching the index facts over the socket. */
-atlas_status atlas_service_status_observe_live(atlas_status_report *out, atlas_err *err) {
+atlas_status atlas_service_status_observe_live(atlas_status_report *out, const char *data_dir,
+                                              atlas_err *err) {
     atlas_git *g = NULL;
     atlas_err git_err;
     atlas_err_init(&git_err);
-    atlas_status gst = atlas_git_open(atlas_buf_cstr(&out->repo.root_path), &g, &git_err);
+    atlas_status gst = atlas_repo_open_git(&out->repo, data_dir, &g, NULL, &git_err);
     if (gst == ATLAS_OK) {
         gst = atlas_git_read_head(g, &out->live_head, &git_err);
     }
@@ -902,7 +921,7 @@ atlas_status atlas_service_status(atlas_ctx *ctx, const char *name, atlas_status
         return st;
     }
 
-    return atlas_service_status_observe_live(out, err);
+    return atlas_service_status_observe_live(out, atlas_ctx_data_dir(ctx), err);
 }
 
 /* --- search -------------------------------------------------------------- */

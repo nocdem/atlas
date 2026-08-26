@@ -31,7 +31,13 @@ atlas_status atlas_repo_open_git(const atlas_repo_info *info, const char *data_d
     atlas_git *g = NULL;
     atlas_err direct;
     atlas_err_init(&direct);
-    if (atlas_git_open(atlas_buf_cstr(&info->root_path), &g, &direct) == ATLAS_OK) {
+    /* The status is kept, not only the message. `atlas_git_open` refuses a
+     * partial (promisor) repository with an integrity status, and a caller that
+     * saw that collapsed into a plain repository error would read "not found"
+     * where Atlas meant "refused, and deliberately". Measured: flattening it
+     * turned `test_git_hardening`'s rescan case from 7 into 4. */
+    atlas_status direct_st = atlas_git_open(atlas_buf_cstr(&info->root_path), &g, &direct);
+    if (direct_st == ATLAS_OK) {
         *out = g;
         return ATLAS_OK;
     }
@@ -42,7 +48,7 @@ atlas_status atlas_repo_open_git(const atlas_repo_info *info, const char *data_d
      * needing to tell them apart. */
     if (data_dir == NULL) {
         *err = direct;
-        return ATLAS_ERR_REPO;
+        return direct_st;
     }
 
     /* A repository whose row names no scanner has no writer for its mirror, so
@@ -57,7 +63,7 @@ atlas_status atlas_repo_open_git(const atlas_repo_info *info, const char *data_d
      * because a refusal in another file makes the alternative unreachable. */
     if (info->scanner_uid == 0) {
         *err = direct;
-        return ATLAS_ERR_REPO;
+        return direct_st;
     }
 
     atlas_buf path = ATLAS_BUF_INIT;
@@ -83,5 +89,5 @@ atlas_status atlas_repo_open_git(const atlas_repo_info *info, const char *data_d
      * acts on the repository, and "the mirror is not a git repository" would
      * send them to a directory Atlas owns and they never created. */
     *err = direct;
-    return ATLAS_ERR_REPO;
+    return direct_st;
 }

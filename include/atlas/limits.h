@@ -282,25 +282,25 @@
 /* Periodic reconciliation, whether or not any event arrived. */
 #define ATLAS_WATCH_RECONCILE_INTERVAL_MS 300000
 
-/* A13. How often Atlas expects a scanner to ask what is owed.
+/* A13. How long a mirror may go unrefreshed before Atlas stops calling an
+ * index built from it current.
  *
- * Sent in every `scanner.poll` answer and used by the freshness rule, so the
- * cadence Atlas asks for and the cadence it judges against are one number and
- * cannot drift apart.
- *
- * It is Atlas' own number rather than the scanner's, and that is the
- * distinction that matters: a bound on how current Atlas is willing to *claim*
- * an index is belongs to the party making the claim. P0's watch budget is
- * derived from the kernel because the kernel owns that limit; this one is not
- * derived from anything because nobody else owns it. */
-#define ATLAS_SCANNER_POLL_INTERVAL_MS 20000
+ * **Derived, not chosen.** `ATLAS_WATCH_RECONCILE_INTERVAL_MS` is already
+ * Atlas' answer to "how long may a repository go without being re-examined" --
+ * the watcher re-reconciles every repository at that cadence whether or not any
+ * event arrived. A mirror older than that is older than Atlas' own
+ * re-examination period, so the bound is the same number rather than a second
+ * opinion about the same question. */
+#define ATLAS_SCANNER_MIRROR_MAX_AGE_MS ATLAS_WATCH_RECONCILE_INTERVAL_MS
 
-/* The floor a scanner applies to whatever cadence it is told.
+/* How often Atlas asks a scanner to come back.
  *
- * The daemon's number arrives over a socket, and a scanner that obeyed a zero
- * would spin. This bounds the client against a malformed or hostile answer;
- * it is not a policy about how often mirroring should happen. */
-#define ATLAS_SCANNER_POLL_MIN_MS 1000
+ * Half the bound, so a scanner keeping the cadence has one whole missed poll of
+ * margin before the mirror is called stale. That is the only content of the
+ * number: it is not a guess about how often a tree changes, and nothing here
+ * decides how much work a scanner does -- a pass that takes longer simply
+ * delays the next one. */
+#define ATLAS_SCANNER_POLL_INTERVAL_MS (ATLAS_SCANNER_MIRROR_MAX_AGE_MS / 2)
 /* Unpaired IN_MOVED_FROM cookies held while waiting for their IN_MOVED_TO. */
 #define ATLAS_WATCH_MAX_PENDING_MOVES 1024u
 /* Paths the watcher will name individually when it asks for a reconciliation.

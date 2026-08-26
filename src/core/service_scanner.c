@@ -36,22 +36,6 @@
  * over. A file above the bound is reported and skipped rather than truncated:
  * half a source file in the mirror would be a file that never existed, and a
  * consumer could not tell it from a real one. */
-/* The largest file the scanner will mirror.
- *
- * Raised from 8 MiB once the transfer was chunked, because the bound no longer
- * has anything to do with what one request can carry. What it bounds now is how
- * much of one file a failed run can have written, and how much of the operator's
- * disk one repository's mirror can take.
- *
- * **A skipped file makes the mirror something other than the repository**, and
- * the daemon reads the mirror as the repository: on the first live run seven
- * files over the old bound, plus a tracked set mirrored without its untracked
- * half, made the daemon record 20000 deletions. So this is set high enough that
- * skipping is rare rather than routine -- and the run still counts and reports
- * every skip, because a mirror that quietly differs from its tree is the one
- * failure this design cannot tolerate. */
-#define SCANNER_MAX_FILE_BYTES (64u * 1024u * 1024u)
-
 /* One chunk of a file, in bytes before hex encoding.
  *
  * Derived from the transport rather than guessed: hex doubles it, and the
@@ -71,7 +55,6 @@ typedef struct walk_ctx {
     atlas_status status;
     int64_t mirrored;
     int64_t skipped_symlink;
-    int64_t skipped_large;
     int64_t skipped_unreadable;
 } walk_ctx;
 
@@ -257,9 +240,23 @@ static void mirror_one(walk_ctx *w, const void *rel, size_t rel_len) {
         }
         return;
     }
-    if (sb.st_size < 0 || (uint64_t)sb.st_size > SCANNER_MAX_FILE_BYTES) {
+    /* **No size bound.** The mirror's job is to be the tree, and the daemon reads
+     * it as the tree -- so a file the mirror does not hold is a file that no
+     * longer exists. A bound here protects nothing; it turns a large file into a
+     * repository that cannot be indexed at all.
+     *
+     * There was one, and I invented it rather than derived it: 8 MiB, then
+     * 64 MiB. Both sat below Atlas' own `ATLAS_HASH_MAX_FILE_BYTES` of 256 MiB,
+     * so the scanner refused to mirror files Atlas would have indexed -- and one
+     * of the two it refused on the first live run was a 91 MiB pack, which left
+     * the mirror's `.git` incomplete and therefore not a repository at all.
+     *
+     * Atlas' bound is on *hashing*, not on existing: above it reconcile records
+     * `ENTRY_TOO_LARGE` and the file is still there. The mirror has to be there
+     * too. */
+    if (sb.st_size < 0) {
         (void)close(fd);
-        w->skipped_large++;
+        w->skipped_unreadable++;
         return;
     }
 
@@ -280,11 +277,6 @@ static void mirror_one(walk_ctx *w, const void *rel, size_t rel_len) {
         }
         st = atlas_buf_append(&content, chunk, (size_t)n, w->err);
         if (st != ATLAS_OK) {
-            break;
-        }
-        if (content.len > SCANNER_MAX_FILE_BYTES) {
-            st = ATLAS_ERR_REPO;
-            w->skipped_large++;
             break;
         }
     }
@@ -561,7 +553,7 @@ static atlas_status scan_pass(int64_t *poll_within_ms, FILE *log, atlas_err *err
          * Atlas indexes a tracked symlink's link text, so the mirror is missing
          * something the index would otherwise hold. */
         bool complete = walked == ATLAS_OK && w.status == ATLAS_OK &&
-                        w.skipped_symlink == 0 && w.skipped_large == 0 &&
+                        w.skipped_symlink == 0 &&
                         w.skipped_unreadable == 0;
         /* Not ignored. A state report that did not land means the daemon still
          * refuses to read this mirror, and a run that reported "mirrored 4685,
@@ -575,10 +567,9 @@ static atlas_status scan_pass(int64_t *poll_within_ms, FILE *log, atlas_err *err
 
         if (log != NULL) {
             (void)fprintf(log,
-                          "  %s  mirrored %lld, skipped %lld symlink, %lld too large, "
-                          "%lld unreadable\n",
-                          name, (long long)w.mirrored, (long long)w.skipped_symlink,
-                          (long long)w.skipped_large, (long long)w.skipped_unreadable);
+                          "  %s  mirrored %lld, skipped %lld symlink, %lld unreadable\n", name,
+                          (long long)w.mirrored, (long long)w.skipped_symlink,
+                          (long long)w.skipped_unreadable);
         }
         if (walked != ATLAS_OK) {
             st = walked;
@@ -628,8 +619,11 @@ atlas_status atlas_service_scanner_run(bool once, FILE *log, atlas_err *err) {
              * problem into every repository's. */
             (void)fprintf(log, "scanner: pass failed: %s\n", atlas_err_msg(&pass_err));
         }
-        if (within < ATLAS_SCANNER_POLL_MIN_MS) {
-            within = ATLAS_SCANNER_POLL_MIN_MS;
+        if (within <= 0) {
+            /* A daemon that answered with nothing usable. The compiled cadence is
+             * the same number that daemon's own freshness rule uses, so falling
+             * back to it cannot put this scanner outside the bound. */
+            within = ATLAS_SCANNER_POLL_INTERVAL_MS;
         }
         struct timespec ts;
         ts.tv_sec = (time_t)(within / 1000);

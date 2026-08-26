@@ -453,12 +453,16 @@ void atlas_server_overlay_mirror(atlas_index_state *s, const atlas_repo_info *ri
         s->pending_full_reconcile = true;
         return;
     }
-    /* Twice the cadence Atlas asked for, so one missed poll does not flap the
-     * verdict. A negative age means never heard from -- a daemon that has just
-     * started, or a scanner that has not run -- and both mean nothing is
-     * observing the tree. */
+    /* The bound is `ATLAS_SCANNER_MIRROR_MAX_AGE_MS`, which is Atlas' own
+     * re-examination period rather than a second opinion about it. A scanner
+     * keeping the cadence it is asked for polls twice inside it, so one missed
+     * poll costs nothing and two mean nobody is there.
+     *
+     * A negative age means never heard from -- a daemon that has just started,
+     * or a scanner that has not run -- and both mean nothing is observing the
+     * tree. */
     int64_t age = atlas_scanner_seen_age_ms(seen, ri->id);
-    if (age < 0 || age > ATLAS_SCANNER_POLL_INTERVAL_MS * 2) {
+    if (age < 0 || age > ATLAS_SCANNER_MIRROR_MAX_AGE_MS) {
         s->pending_full_reconcile = true;
     }
 }

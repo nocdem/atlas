@@ -17,7 +17,6 @@
  * full the oldest entry is reused, and an evicted repository reads as "never
  * heard from" — which only ever subtracts, so the failure direction is the safe
  * one. */
-#define SEEN_MAX 64u
 
 typedef struct {
     int64_t repo_id; /* 0 when the slot is unused */
@@ -26,7 +25,9 @@ typedef struct {
 
 struct atlas_scanner_seen {
     pthread_mutex_t lock;
-    seen_slot slots[SEEN_MAX];
+    seen_slot *slots;
+    size_t count;
+    size_t cap;
 };
 
 static int64_t now_ms(void) {
@@ -54,6 +55,7 @@ void atlas_scanner_seen_free(atlas_scanner_seen *s) {
         return;
     }
     (void)pthread_mutex_destroy(&s->lock);
+    free(s->slots);
     free(s);
 }
 
@@ -63,25 +65,28 @@ void atlas_scanner_seen_touch(atlas_scanner_seen *s, int64_t repo_id) {
     }
     int64_t t = now_ms();
     (void)pthread_mutex_lock(&s->lock);
-    size_t oldest = 0;
-    for (size_t i = 0; i < SEEN_MAX; i++) {
+    for (size_t i = 0; i < s->count; i++) {
         if (s->slots[i].repo_id == repo_id) {
             s->slots[i].at_ms = t;
             (void)pthread_mutex_unlock(&s->lock);
             return;
         }
-        if (s->slots[i].repo_id == 0) {
-            s->slots[i].repo_id = repo_id;
-            s->slots[i].at_ms = t;
+    }
+    if (s->count == s->cap) {
+        size_t next = s->cap == 0 ? 8u : s->cap * 2u;
+        seen_slot *grown = realloc(s->slots, next * sizeof(*grown));
+        if (grown == NULL) {
+            /* The repository keeps reading as "never heard from", which only
+             * ever subtracts -- so a failed allocation costs conservatism. */
             (void)pthread_mutex_unlock(&s->lock);
             return;
         }
-        if (s->slots[i].at_ms < s->slots[oldest].at_ms) {
-            oldest = i;
-        }
+        s->slots = grown;
+        s->cap = next;
     }
-    s->slots[oldest].repo_id = repo_id;
-    s->slots[oldest].at_ms = t;
+    s->slots[s->count].repo_id = repo_id;
+    s->slots[s->count].at_ms = t;
+    s->count++;
     (void)pthread_mutex_unlock(&s->lock);
 }
 
@@ -92,7 +97,7 @@ int64_t atlas_scanner_seen_age_ms(atlas_scanner_seen *s, int64_t repo_id) {
     int64_t age = -1;
     int64_t t = now_ms();
     (void)pthread_mutex_lock(&s->lock);
-    for (size_t i = 0; i < SEEN_MAX; i++) {
+    for (size_t i = 0; i < s->count; i++) {
         if (s->slots[i].repo_id == repo_id) {
             age = t - s->slots[i].at_ms;
             break;

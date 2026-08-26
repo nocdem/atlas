@@ -531,3 +531,110 @@ in `repo list` so an operator can correct it before the first pass.
 - Any change to `atlas.service`'s sandbox, to `ProcSubset`, or to any sysctl.
 - Any repair of the `umask 0077` that produced the measured damage. There is
   no configuration source to repair (§1).
+
+---
+
+## What implementation changed, and why
+
+This section is written *after* the season shipped, from what the first live
+runs proved. It is not a revision of the argument above; it records where the
+built thing differs from the design and what forced each difference. Where the
+two disagree, this section is what the code does.
+
+### The scanner ships bytes, not observations
+
+The design had `scanner.observe` carry file identities, hashes and status
+entries, and had `atlasd` rebuild the index from them. The operator chose bytes
+instead, and counting settled it: `src/core/reconcile.c` calls **twenty**
+distinct git operations. Reproducing them over a socket does not move data — it
+moves the *execution* of A1's cache-hit rules, the ones `CLAUDE.md` marks "do
+not weaken these", into a process the daemon cannot audit.
+
+So the scanner writes a **mirror**: the tracked tree, the untracked tree, and
+`.git`, at `<data_dir>/mirror/<repo_id>`. The daemon opens it with
+`atlas_git_open` and asks it every question it asks a real repository. Measured:
+git works unchanged on a copied `.git` — `rev-parse HEAD` returns the same
+commit, `ls-files` the same paths, `status` reports zero changes. A3, the
+semantic layer, snapshots and gates were not touched.
+
+`scanner.observe` therefore does not exist. `scanner.put` carries one chunk of
+one file, hex-encoded because a JSON string carries neither invalid UTF-8 nor a
+C0 control unchanged — measured, a twelve-byte file arrived as twenty-four.
+
+**Stated cost:** the daemon holds a copy of the whole history, not only current
+content. §5.2 already recorded that owner-private content enters the index;
+this widens it from the working tree to the object store.
+
+### The row decides the source, and there is no fallback
+
+The design left "which tree does the daemon read" implicit. The first
+implementation tried the real root and used the mirror when the root refused,
+and that was wrong: both real failures on the machine this season was built for
+were **partial**. A hundred loose objects at mode 0400, so `atlas_git_open`
+succeeded and `git log` failed three calls later; and fifty private directories
+that could not be entered, so every pass completed and covered less than the
+tree. A rule keyed on "could not open" answers neither.
+
+So: a repository naming a scanner is read from its mirror and from **nothing
+else**. No mirror is a refusal, an incomplete mirror is a refusal, and the tree
+is never the way out of either. A process running *as* the scanner uid still
+reads the tree — that is a capability question, not an authority one.
+
+### `scanner.state`, `mirror_complete` and `mirror_at`
+
+Not in the design, added because the daemon reads the mirror *as* the
+repository: every file the mirror does not hold is a file that no longer
+exists. Measured on the first live run — a mirror carrying 2007 of a tree's
+22012 files made the daemon record **20000 deletions**.
+
+`mirror_complete` is the run's own claim: every file it enumerated was written
+and none was skipped. Cleared when a run starts, set only when one finishes, so
+a crash leaves it false. The asymmetry is the design: false costs a refusal,
+true would cost a delete sweep against a half-written tree.
+
+`mirror_at` is when that run finished. The write goes through the writer thread,
+because every dispatch handle is read-only — doing it on the dispatch handle
+failed on every call with "attempt to write a readonly database", silently,
+because the scanner ignored the result.
+
+### `repo.scanner` is an RPC
+
+The design assumed A7's rule that the registry is local-only, because "the
+socket carries no authority: every peer on it is the same uid as the daemon".
+**A7.1 ended that premise** by splitting the principals. `repo.scanner` is in
+the operator-uid group — selected by `SO_PEERCRED` against the root-owned
+policy — where `backup.create`, `code.index` and every `dispatch.` method
+already sit. `repo add` and `repo remove` are deliberately unchanged: they
+decide which directories Atlas will read at all.
+
+### `poll` is the heartbeat, and the cadence is Atlas'
+
+The design says `scanner.poll` "doubles as heartbeat", and an implementation
+that had the scanner declare its own cadence was written and reverted. The
+reason it is wrong: a scanner that declares a cadence and then dies leaves its
+promise standing, and the daemon goes on trusting the mirror because a dead
+process said it would be back. A scanner that stops polling simply stops being
+heard.
+
+The heartbeat is held in memory rather than in the index. A daemon that has
+just started has heard from nobody, which is the conservative answer; a
+persisted heartbeat would let it trust a scanner that died before it.
+
+Both numbers are **derived from `ATLAS_WATCH_RECONCILE_INTERVAL_MS`**, which is
+already Atlas' answer to "how long may a repository go without being
+re-examined". The staleness bound is that period; the poll cadence is half of
+it, so a scanner keeping the cadence has one whole missed poll of margin.
+Neither is a guess about how often anybody's tree changes.
+
+### There is no file size bound
+
+There was one, twice — 8 MiB, then 64 MiB — and both were invented rather than
+derived. Both sat below Atlas' own `ATLAS_HASH_MAX_FILE_BYTES` of 256 MiB, so
+the scanner refused to mirror files Atlas would have indexed. On the first live
+run one of the two files it refused was a **91 MiB pack**, which left the
+mirror's `.git` incomplete and therefore not a repository at all.
+
+Atlas' bound is on *hashing*, not on *existing*: above it reconcile records
+`ENTRY_TOO_LARGE` and the file is still there. The mirror has to be there too.
+A bound here protects nothing and converts a large file into a repository that
+cannot be indexed. With it removed, both repositories mirror with zero skips.

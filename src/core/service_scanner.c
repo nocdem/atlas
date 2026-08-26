@@ -16,6 +16,7 @@
  */
 #include "atlas/service.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -90,42 +91,38 @@ static atlas_status put_file(walk_ctx *w, const void *rel, size_t rel_len, const
     return st;
 }
 
-static atlas_status walk_cb(const atlas_git_index_entry *e, void *ud, atlas_err *err) {
-    walk_ctx *w = (walk_ctx *)ud;
-    (void)err;
+/* Mirrors one regular file at `rel` beneath the repository root.
+ *
+ * Shared by the tracked walk and the `.git` walk, so both get the same
+ * nofollow open, the same size bound and the same skip accounting. */
+static void mirror_one(walk_ctx *w, const void *rel, size_t rel_len) {
     if (w->status != ATLAS_OK) {
-        return ATLAS_OK;
+        return;
     }
-
     atlas_path_open_result res = ATLAS_PATH_OPEN_OK;
     int fd = -1;
     struct stat sb;
     memset(&sb, 0, sizeof(sb));
-    /* Never follows a symlink at any component: a repository that plants one
-     * cannot make the scanner read a file outside itself. */
-    if (atlas_path_open_nofollow(w->root_fd, (const char *)e->path, e->path_len, &res, &fd, &sb,
-                                 NULL, w->err) != ATLAS_OK) {
+    if (atlas_path_open_nofollow(w->root_fd, (const char *)rel, rel_len, &res, &fd, &sb, NULL,
+                                 w->err) != ATLAS_OK) {
         w->skipped_unreadable++;
-        return ATLAS_OK;
+        return;
     }
     if (res != ATLAS_PATH_OPEN_OK) {
         if (fd >= 0) {
             (void)close(fd);
         }
-        /* A tracked symlink's content is its link text, not its target's
-         * bytes. Mirroring the target would import a file from outside the
-         * repository, which is exactly what the nofollow open prevented. */
         if (res == ATLAS_PATH_OPEN_SYMLINK || res == ATLAS_PATH_OPEN_UNSAFE) {
             w->skipped_symlink++;
         } else {
             w->skipped_unreadable++;
         }
-        return ATLAS_OK;
+        return;
     }
     if (sb.st_size < 0 || (uint64_t)sb.st_size > SCANNER_MAX_FILE_BYTES) {
         (void)close(fd);
         w->skipped_large++;
-        return ATLAS_OK;
+        return;
     }
 
     atlas_buf content = ATLAS_BUF_INIT;
@@ -137,7 +134,7 @@ static atlas_status walk_cb(const atlas_git_index_entry *e, void *ud, atlas_err 
             if (errno == EINTR) {
                 continue;
             }
-            st = atlas_err_set_errno(w->err, ATLAS_ERR_REPO, errno, "cannot read a tracked file");
+            st = atlas_err_set_errno(w->err, ATLAS_ERR_REPO, errno, "cannot read a mirrored file");
             break;
         }
         if (n == 0) {
@@ -148,7 +145,6 @@ static atlas_status walk_cb(const atlas_git_index_entry *e, void *ud, atlas_err 
             break;
         }
         if (content.len > SCANNER_MAX_FILE_BYTES) {
-            /* Grew past the bound between the stat and the read. */
             st = ATLAS_ERR_REPO;
             w->skipped_large++;
             break;
@@ -157,19 +153,91 @@ static atlas_status walk_cb(const atlas_git_index_entry *e, void *ud, atlas_err 
     (void)close(fd);
 
     if (st == ATLAS_OK) {
-        st = put_file(w, e->path, e->path_len, content.data, content.len);
+        st = put_file(w, rel, rel_len, content.data, content.len);
         if (st == ATLAS_OK) {
             w->mirrored++;
         } else {
-            /* One file that could not be sent stops the walk: the mirror would
-             * otherwise be silently partial, and a partial mirror that reported
-             * success is the failure this refuses to produce. */
             w->status = st;
         }
-    } else if (w->status == ATLAS_OK && st != ATLAS_ERR_REPO) {
+    } else if (st != ATLAS_ERR_REPO) {
         w->status = st;
     }
     atlas_buf_free(&content);
+}
+
+/* Mirrors `.git` as an ordinary directory tree, so the daemon can open the
+ * mirror with `atlas_git_open` and ask it every question it asks a real
+ * repository — which is what lets reconcile, A3, the semantic layer, snapshots
+ * and gates keep working unchanged rather than having twenty git operations
+ * reproduced over a socket.
+ *
+ * Walked as directories rather than through git, because git is what the
+ * mirror is *for*: asking the source repository to enumerate its own object
+ * store would work, but every answer would then have to be turned back into
+ * files, and the files are already there.
+ *
+ * `.git/index` is mirrored rather than skipped. It records the *source*
+ * worktree's stat data, which will not match the mirrored files, so git
+ * re-hashes on the mirror — correct but slower. Skipping it would make git
+ * rebuild the index from scratch instead, which is not cheaper and loses the
+ * recorded staging state. */
+static void mirror_dir(walk_ctx *w, atlas_buf *rel, int dir_fd) {
+    if (w->status != ATLAS_OK) {
+        return;
+    }
+    DIR *d = fdopendir(dir_fd);
+    if (d == NULL) {
+        (void)close(dir_fd);
+        w->skipped_unreadable++;
+        return;
+    }
+    size_t base = rel->len;
+    struct dirent *ent = NULL;
+    while (w->status == ATLAS_OK && (ent = readdir(d)) != NULL) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
+            continue;
+        }
+        /* Rewind to the parent's prefix. `len` is public and the buffer keeps
+         * its capacity, so this is the cheap way back up the tree. */
+        rel->len = base;
+        if (rel->data != NULL) {
+            rel->data[base] = '\0';
+        }
+        if (rel->len > 0) {
+            if (atlas_buf_append(rel, "/", 1u, w->err) != ATLAS_OK) {
+                w->status = ATLAS_ERR_INTERNAL;
+                break;
+            }
+        }
+        if (atlas_buf_append(rel, ent->d_name, strlen(ent->d_name), w->err) != ATLAS_OK) {
+            w->status = ATLAS_ERR_INTERNAL;
+            break;
+        }
+
+        int sub = openat(dirfd(d), ent->d_name, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        if (sub >= 0) {
+            mirror_dir(w, rel, sub);
+            continue;
+        }
+        /* Not a directory, or a symlink we will not follow. `mirror_one`
+         * re-opens through the validated root and decides which it was. */
+        mirror_one(w, rel->data, rel->len);
+    }
+    rel->len = base;
+    if (rel->data != NULL) {
+        rel->data[base] = '\0';
+    }
+    (void)closedir(d);
+}
+
+static atlas_status walk_cb(const atlas_git_index_entry *e, void *ud, atlas_err *err) {
+    walk_ctx *w = (walk_ctx *)ud;
+    (void)err;
+    /* The tracked walk and the `.git` walk mirror a file the same way, so they
+     * share one implementation: the same nofollow open, the same size bound and
+     * the same skip accounting. `e->path` is raw bytes of `e->path_len` and is
+     * not NUL-terminated. */
+    mirror_one(w, e->path, e->path_len);
     return ATLAS_OK;
 }
 
@@ -274,6 +342,32 @@ atlas_status atlas_service_scanner_run(bool once, FILE *log, atlas_err *err) {
         }
 
         atlas_status walked = atlas_git_ls_files(g, walk_cb, &w, err);
+
+        /* And `.git`, so the mirror is a repository the daemon can open rather
+         * than a bag of files. That is what lets reconcile, A3, the semantic
+         * layer, snapshots and gates keep working unchanged. */
+        if (walked == ATLAS_OK && w.status == ATLAS_OK) {
+            int git_fd = openat(w.root_fd, ".git", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+            if (git_fd >= 0) {
+                atlas_buf rel = ATLAS_BUF_INIT;
+                if (atlas_buf_append(&rel, ".git", 4u, err) == ATLAS_OK) {
+                    mirror_dir(&w, &rel, git_fd);
+                } else {
+                    (void)close(git_fd);
+                    w.status = ATLAS_ERR_INTERNAL;
+                }
+                atlas_buf_free(&rel);
+            } else if (log != NULL) {
+                /* A linked worktree's `.git` is a file, not a directory. It is
+                 * reported rather than silently skipped: such a repository's
+                 * mirror is not openable by git and a later plan will need to
+                 * know. */
+                (void)fprintf(log, "  %s: .git is not a directory, mirror will not be a git "
+                                   "repository\n",
+                              name);
+            }
+        }
+
         (void)close(w.root_fd);
         atlas_git_close(g);
         atlas_buf_free(&root_raw);

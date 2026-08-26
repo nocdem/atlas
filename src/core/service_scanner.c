@@ -16,9 +16,162 @@
  */
 #include "atlas/service.h"
 
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
+#include "atlas/git.h"
 #include "atlas/ipc.h"
+#include "atlas/pathrep.h"
+
+/* The largest file this will mirror.
+ *
+ * A scanner reads a repository it does not control the contents of, so an
+ * unbounded read is an unbounded allocation in a process that must not fall
+ * over. A file above the bound is reported and skipped rather than truncated:
+ * half a source file in the mirror would be a file that never existed, and a
+ * consumer could not tell it from a real one. */
+#define SCANNER_MAX_FILE_BYTES (8u * 1024u * 1024u)
+
+typedef struct walk_ctx {
+    const char *socket_path;
+    int64_t repo_id;
+    int root_fd;
+    FILE *log;
+    atlas_err *err;
+    atlas_status status;
+    int64_t mirrored;
+    int64_t skipped_symlink;
+    int64_t skipped_large;
+    int64_t skipped_unreadable;
+} walk_ctx;
+
+/* Sends one file's bytes as hex. The wire carries bytes, not text: a source
+ * file may hold a quote, a newline, a C0 control or a sequence that is not
+ * valid UTF-8, and a JSON string carries none of them unchanged. */
+static atlas_status put_file(walk_ctx *w, const void *rel, size_t rel_len, const void *data,
+                             size_t len) {
+    atlas_buf hex = ATLAS_BUF_INIT;
+    atlas_status st = atlas_buf_reserve(&hex, len * 2u + 1u, w->err);
+    if (st == ATLAS_OK) {
+        static const char DIGITS[] = "0123456789abcdef";
+        const unsigned char *b = (const unsigned char *)data;
+        for (size_t i = 0; i < len && st == ATLAS_OK; i++) {
+            char pair[2] = {DIGITS[b[i] >> 4], DIGITS[b[i] & 0x0fu]};
+            st = atlas_buf_append(&hex, pair, 2u, w->err);
+        }
+    }
+
+    atlas_buf params = ATLAS_BUF_INIT;
+    if (st == ATLAS_OK) {
+        /* The path is sent as the raw bytes git gave, %XX-encoded so it
+         * survives a JSON string. Repository paths are bytes, not text. */
+        atlas_buf enc = ATLAS_BUF_INIT;
+        st = atlas_path_text_encode(rel, rel_len, &enc, w->err);
+        if (st == ATLAS_OK) {
+            st = atlas_buf_appendf(&params, w->err,
+                                   "{\"repo\":%lld,\"path\":\"%s\",\"first\":true,\"data\":\"%s\"}",
+                                   (long long)w->repo_id, atlas_buf_cstr(&enc),
+                                   len == 0 ? "" : atlas_buf_cstr(&hex));
+        }
+        atlas_buf_free(&enc);
+    }
+
+    atlas_buf raw = ATLAS_BUF_INIT;
+    if (st == ATLAS_OK) {
+        st = atlas_ipc_call(w->socket_path, "scanner.put", atlas_buf_cstr(&params), &raw, w->err);
+    }
+    atlas_buf_free(&raw);
+    atlas_buf_free(&params);
+    atlas_buf_free(&hex);
+    return st;
+}
+
+static atlas_status walk_cb(const atlas_git_index_entry *e, void *ud, atlas_err *err) {
+    walk_ctx *w = (walk_ctx *)ud;
+    (void)err;
+    if (w->status != ATLAS_OK) {
+        return ATLAS_OK;
+    }
+
+    atlas_path_open_result res = ATLAS_PATH_OPEN_OK;
+    int fd = -1;
+    struct stat sb;
+    memset(&sb, 0, sizeof(sb));
+    /* Never follows a symlink at any component: a repository that plants one
+     * cannot make the scanner read a file outside itself. */
+    if (atlas_path_open_nofollow(w->root_fd, (const char *)e->path, e->path_len, &res, &fd, &sb,
+                                 NULL, w->err) != ATLAS_OK) {
+        w->skipped_unreadable++;
+        return ATLAS_OK;
+    }
+    if (res != ATLAS_PATH_OPEN_OK) {
+        if (fd >= 0) {
+            (void)close(fd);
+        }
+        /* A tracked symlink's content is its link text, not its target's
+         * bytes. Mirroring the target would import a file from outside the
+         * repository, which is exactly what the nofollow open prevented. */
+        if (res == ATLAS_PATH_OPEN_SYMLINK || res == ATLAS_PATH_OPEN_UNSAFE) {
+            w->skipped_symlink++;
+        } else {
+            w->skipped_unreadable++;
+        }
+        return ATLAS_OK;
+    }
+    if (sb.st_size < 0 || (uint64_t)sb.st_size > SCANNER_MAX_FILE_BYTES) {
+        (void)close(fd);
+        w->skipped_large++;
+        return ATLAS_OK;
+    }
+
+    atlas_buf content = ATLAS_BUF_INIT;
+    atlas_status st = ATLAS_OK;
+    char chunk[64u * 1024u];
+    for (;;) {
+        ssize_t n = read(fd, chunk, sizeof chunk);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            st = atlas_err_set_errno(w->err, ATLAS_ERR_REPO, errno, "cannot read a tracked file");
+            break;
+        }
+        if (n == 0) {
+            break;
+        }
+        st = atlas_buf_append(&content, chunk, (size_t)n, w->err);
+        if (st != ATLAS_OK) {
+            break;
+        }
+        if (content.len > SCANNER_MAX_FILE_BYTES) {
+            /* Grew past the bound between the stat and the read. */
+            st = ATLAS_ERR_REPO;
+            w->skipped_large++;
+            break;
+        }
+    }
+    (void)close(fd);
+
+    if (st == ATLAS_OK) {
+        st = put_file(w, e->path, e->path_len, content.data, content.len);
+        if (st == ATLAS_OK) {
+            w->mirrored++;
+        } else {
+            /* One file that could not be sent stops the walk: the mirror would
+             * otherwise be silently partial, and a partial mirror that reported
+             * success is the failure this refuses to produce. */
+            w->status = st;
+        }
+    } else if (w->status == ATLAS_OK && st != ATLAS_ERR_REPO) {
+        w->status = st;
+    }
+    atlas_buf_free(&content);
+    return ATLAS_OK;
+}
 
 atlas_status atlas_service_scanner_run(bool once, FILE *log, atlas_err *err) {
     if (!once) {
@@ -66,22 +219,80 @@ atlas_status atlas_service_scanner_run(bool once, FILE *log, atlas_err *err) {
     }
     if (log != NULL) {
         (void)fprintf(log, "scanner: %zu repository/repositories for this uid\n", n);
-        for (size_t i = 0; i < n; i++) {
-            const char *name = NULL;
-            const char *root = NULL;
-            if (!atlas_ipc_result_arr_obj_str(resp, "repositories", i, "name", &name)) {
-                name = "";
+    }
+
+    for (size_t i = 0; i < n && st == ATLAS_OK; i++) {
+        const char *name = NULL;
+        const char *root = NULL;
+        int64_t id = 0;
+        if (!atlas_ipc_result_arr_obj_str(resp, "repositories", i, "name", &name)) {
+            name = "";
+        }
+        if (!atlas_ipc_result_arr_obj_str(resp, "repositories", i, "root", &root)) {
+            root = "";
+        }
+        if (!atlas_ipc_result_arr_obj_int(resp, "repositories", i, "id", &id) || id <= 0) {
+            continue;
+        }
+
+        /* The root arrives %XX-encoded, which is how the database holds it.
+         * Opening it needs the raw bytes back. */
+        atlas_buf root_raw = ATLAS_BUF_INIT;
+        if (atlas_path_text_decode(root, strlen(root), &root_raw, err) != ATLAS_OK) {
+            atlas_buf_free(&root_raw);
+            continue;
+        }
+
+        atlas_git *g = NULL;
+        atlas_err open_err;
+        atlas_err_init(&open_err);
+        if (atlas_git_open(atlas_buf_cstr(&root_raw), &g, &open_err) != ATLAS_OK) {
+            /* One repository that cannot be opened must not stop the others,
+             * and the reason belongs where an operator will look for it. */
+            if (log != NULL) {
+                (void)fprintf(log, "  %s: skipped, %s\n", name, open_err.msg);
             }
-            if (!atlas_ipc_result_arr_obj_str(resp, "repositories", i, "root", &root)) {
-                root = "";
+            atlas_buf_free(&root_raw);
+            continue;
+        }
+
+        walk_ctx w;
+        memset(&w, 0, sizeof(w));
+        w.socket_path = atlas_buf_cstr(&socket_path);
+        w.repo_id = id;
+        w.log = log;
+        w.err = err;
+        w.status = ATLAS_OK;
+        w.root_fd = open(atlas_buf_cstr(&root_raw), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        if (w.root_fd < 0) {
+            if (log != NULL) {
+                (void)fprintf(log, "  %s: skipped, cannot open its root\n", name);
             }
-            /* Both were encoded by the daemon on the way out; printing them
-             * again through the encoder would double-encode. */
-            (void)fprintf(log, "  %s  %s\n", name, root);
+            atlas_git_close(g);
+            atlas_buf_free(&root_raw);
+            continue;
+        }
+
+        atlas_status walked = atlas_git_ls_files(g, walk_cb, &w, err);
+        (void)close(w.root_fd);
+        atlas_git_close(g);
+        atlas_buf_free(&root_raw);
+
+        if (log != NULL) {
+            (void)fprintf(log,
+                          "  %s  mirrored %lld, skipped %lld symlink, %lld too large, "
+                          "%lld unreadable\n",
+                          name, (long long)w.mirrored, (long long)w.skipped_symlink,
+                          (long long)w.skipped_large, (long long)w.skipped_unreadable);
+        }
+        if (walked != ATLAS_OK) {
+            st = walked;
+        } else if (w.status != ATLAS_OK) {
+            st = w.status;
         }
     }
 
     atlas_ipc_response_free(resp);
     atlas_buf_free(&socket_path);
-    return ATLAS_OK;
+    return st;
 }

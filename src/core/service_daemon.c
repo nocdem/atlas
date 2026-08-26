@@ -524,6 +524,11 @@ static void repo_item_from_response(const atlas_ipc_response *r, size_t i, atlas
     if (atlas_ipc_result_arr_obj_bool(r, "repositories", i, "linked_worktree", &b)) {
         ri->is_linked_worktree = b;
     }
+    /* A13. Absent leaves 0, which reads as "no scanner named" -- the conservative
+     * value, and the right one against a daemon older than this field. */
+    if (atlas_ipc_result_arr_obj_int(r, "repositories", i, "scanner_uid", &n)) {
+        ri->scanner_uid = n;
+    }
 }
 
 atlas_status atlas_service_repo_list_remote(atlas_repo_cb cb, void *ud, int64_t *count_out,
@@ -594,6 +599,15 @@ atlas_status atlas_service_status_remote(const char *name, atlas_status_report *
              * because a path is bytes and may not be UTF-8. */
             atlas_buf_reset(&out->repo.root_path);
             st = atlas_path_text_decode(v, strlen(v), &out->repo.root_path, err);
+        }
+    }
+    /* A13. Which uid's scanner may report about this repository. Absent leaves
+     * 0 -- "no scanner named" -- which is the conservative reading and the right
+     * one against a daemon older than the field. */
+    {
+        int64_t suid = 0;
+        if (atlas_ipc_result_int(r, "scanner_uid", &suid)) {
+            out->repo.scanner_uid = suid;
         }
     }
     if (atlas_ipc_result_str(r, "last_scan_at", &v)) {

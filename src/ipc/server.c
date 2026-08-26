@@ -597,6 +597,16 @@ static atlas_status write_repo_registration(dispatch_state *ds, const atlas_repo
         st = atlas_json_key_str(ds->j, "git_dir", atlas_buf_cstr(&enc), err);
     }
     atlas_buf_free(&enc);
+    /* A13. Which uid's scanner may report about this repository, and therefore
+     * which tree the daemon is reading. It was on the row and in the local
+     * renderer from the first commit of the season and **not on the wire**, so
+     * `atlas status` against a running daemon reported 0 for a repository the
+     * daemon was plainly treating as scanner-backed -- it looks for a mirror in
+     * the log and reports no scanner in the same breath. A field a caller reads
+     * as a default when the answer exists is worse than an absent field. */
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "scanner_uid", ri->scanner_uid, err);
+    }
     return st;
 }
 

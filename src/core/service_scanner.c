@@ -37,6 +37,16 @@
  * consumer could not tell it from a real one. */
 #define SCANNER_MAX_FILE_BYTES (8u * 1024u * 1024u)
 
+/* One chunk of a file, in bytes before hex encoding.
+ *
+ * Derived from the transport rather than guessed: hex doubles it, and the
+ * request also carries a method name, a repository id and a `%XX`-encoded path
+ * that can itself be long. A quarter of `ATLAS_IPC_MAX_REQUEST_BYTES` leaves
+ * half the limit for the encoded bytes and half again for everything else,
+ * which is margin rather than arithmetic on the exact overhead -- the exact
+ * overhead depends on a path this code does not choose. */
+#define SCANNER_CHUNK_BYTES (ATLAS_IPC_MAX_REQUEST_BYTES / 4u)
+
 typedef struct walk_ctx {
     const char *socket_path;
     int64_t repo_id;
@@ -50,44 +60,73 @@ typedef struct walk_ctx {
     int64_t skipped_unreadable;
 } walk_ctx;
 
-/* Sends one file's bytes as hex. The wire carries bytes, not text: a source
- * file may hold a quote, a newline, a C0 control or a sequence that is not
- * valid UTF-8, and a JSON string carries none of them unchanged. */
+/* Sends one file's bytes as hex, in chunks the transport can carry.
+ *
+ * The wire carries bytes, not text: a source file may hold a quote, a newline,
+ * a C0 control or a sequence that is not valid UTF-8, and a JSON string carries
+ * none of them unchanged.
+ *
+ * **Hex doubles the size, and the transport has its own ceiling.** A whole file
+ * per request was refused for anything over about half of
+ * `ATLAS_IPC_MAX_REQUEST_BYTES` — measured on the repository this season was
+ * built for, which stopped at `dna`'s first large object with "refusing to send
+ * a request, above the limit". `SCANNER_CHUNK_BYTES` is picked against that
+ * ceiling rather than against a file size, so raising the file bound never
+ * reopens this: one chunk becomes two.
+ *
+ * `first` distinguishes the chunk that creates the mirrored file from the ones
+ * that extend it. `atlas_mirror_put` unlinks and `O_EXCL`-creates on the first
+ * and appends with no `O_CREAT` on the rest, so a partial transfer leaves a
+ * short file rather than a mixture of two versions. */
 static atlas_status put_file(walk_ctx *w, const void *rel, size_t rel_len, const void *data,
                              size_t len) {
-    atlas_buf hex = ATLAS_BUF_INIT;
-    atlas_status st = atlas_buf_reserve(&hex, len * 2u + 1u, w->err);
-    if (st == ATLAS_OK) {
-        static const char DIGITS[] = "0123456789abcdef";
-        const unsigned char *b = (const unsigned char *)data;
-        for (size_t i = 0; i < len && st == ATLAS_OK; i++) {
-            char pair[2] = {DIGITS[b[i] >> 4], DIGITS[b[i] & 0x0fu]};
-            st = atlas_buf_append(&hex, pair, 2u, w->err);
-        }
-    }
+    atlas_buf enc = ATLAS_BUF_INIT;
+    /* The path is sent as the raw bytes git gave, %XX-encoded so it survives a
+     * JSON string. Repository paths are bytes, not text. */
+    atlas_status st = atlas_path_text_encode(rel, rel_len, &enc, w->err);
 
-    atlas_buf params = ATLAS_BUF_INIT;
-    if (st == ATLAS_OK) {
-        /* The path is sent as the raw bytes git gave, %XX-encoded so it
-         * survives a JSON string. Repository paths are bytes, not text. */
-        atlas_buf enc = ATLAS_BUF_INIT;
-        st = atlas_path_text_encode(rel, rel_len, &enc, w->err);
+    const unsigned char *b = (const unsigned char *)data;
+    size_t sent = 0;
+    bool first = true;
+    /* An empty file still needs one request, or it would never be created. */
+    while (st == ATLAS_OK && (sent < len || first)) {
+        size_t take = len - sent;
+        if (take > SCANNER_CHUNK_BYTES) {
+            take = SCANNER_CHUNK_BYTES;
+        }
+
+        atlas_buf hex = ATLAS_BUF_INIT;
+        st = atlas_buf_reserve(&hex, take * 2u + 1u, w->err);
+        if (st == ATLAS_OK) {
+            static const char DIGITS[] = "0123456789abcdef";
+            for (size_t i = 0; i < take && st == ATLAS_OK; i++) {
+                unsigned char c = b[sent + i];
+                char pair[2] = {DIGITS[c >> 4], DIGITS[c & 0x0fu]};
+                st = atlas_buf_append(&hex, pair, 2u, w->err);
+            }
+        }
+
+        atlas_buf params = ATLAS_BUF_INIT;
         if (st == ATLAS_OK) {
             st = atlas_buf_appendf(&params, w->err,
-                                   "{\"repo\":%lld,\"path\":\"%s\",\"first\":true,\"data\":\"%s\"}",
+                                   "{\"repo\":%lld,\"path\":\"%s\",\"first\":%s,\"data\":\"%s\"}",
                                    (long long)w->repo_id, atlas_buf_cstr(&enc),
-                                   len == 0 ? "" : atlas_buf_cstr(&hex));
+                                   first ? "true" : "false",
+                                   take == 0 ? "" : atlas_buf_cstr(&hex));
         }
-        atlas_buf_free(&enc);
-    }
+        atlas_buf raw = ATLAS_BUF_INIT;
+        if (st == ATLAS_OK) {
+            st = atlas_ipc_call(w->socket_path, "scanner.put", atlas_buf_cstr(&params), &raw,
+                                w->err);
+        }
+        atlas_buf_free(&raw);
+        atlas_buf_free(&params);
+        atlas_buf_free(&hex);
 
-    atlas_buf raw = ATLAS_BUF_INIT;
-    if (st == ATLAS_OK) {
-        st = atlas_ipc_call(w->socket_path, "scanner.put", atlas_buf_cstr(&params), &raw, w->err);
+        sent += take;
+        first = false;
     }
-    atlas_buf_free(&raw);
-    atlas_buf_free(&params);
-    atlas_buf_free(&hex);
+    atlas_buf_free(&enc);
     return st;
 }
 

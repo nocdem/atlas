@@ -1263,7 +1263,7 @@ atlas_status atlas_service_dispatcher_run(bool once, FILE *log, atlas_err *err);
  * command refuses, because the polling loop is a later plan and a process that
  * idled instead of saying so would look healthy while doing nothing. Logs to
  * `log` so a systemd user unit captures them in the journal. */
-atlas_status atlas_service_scanner_run(bool once, FILE *log, atlas_err *err);
+atlas_status atlas_service_scanner_run(bool once, int64_t interval_ms, FILE *log, atlas_err *err);
 
 /* --- A12.0: the plan domain's four calls ------------------------------------
  *

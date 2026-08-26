@@ -245,6 +245,7 @@ static atlas_status tally(const atlas_repo_info *ri, void *ud, atlas_err *err) {
         atlas_watch_live live;
         atlas_watcher_repo_live(t->watcher, ri->id, &live);
         atlas_server_overlay_live(&s, &live);
+        atlas_server_overlay_mirror(&s, ri);
         if (s.watch_state == ATLAS_WATCH_WATCHING) {
             t->watching++;
         } else if (s.watch_state == ATLAS_WATCH_PRIMING) {
@@ -416,6 +417,53 @@ bool atlas_server_index_current(const atlas_index_state *s, const char **reason_
  * Non-blocking by construction: the live view costs one short mutex in the
  * watcher, no writer involvement and no I/O, so a status read stays answerable
  * while the writer thread is held. */
+/* A13. Subtracts the mirror's own age from what Atlas is willing to claim.
+ *
+ * A scanner-backed repository is indexed from a mirror, and the daemon watches
+ * that mirror rather than the tree. So it learns of a change when the scanner
+ * writes one — and if the scanner stops, nothing tells it. The index then stays
+ * perfectly consistent with a mirror that is arbitrarily old, and
+ * `index_current` would keep saying the index reflects the repository.
+ * Invariant 12 forbids exactly that: Atlas never claims the index is current
+ * when it cannot prove it.
+ *
+ * **The bound is the scanner's, not Atlas'.** `mirror_interval_ms` is what the
+ * scanner promised when it reported completeness; a number compiled in here
+ * would be a guess about somebody else's schedule, which is the mistake P0's
+ * watch budget exists to correct. One interval of grace is allowed on top, so a
+ * run that is merely late does not flap the verdict.
+ *
+ * Zero means nothing was promised — `--once`. Nothing is observing the tree
+ * after such a run, so the index is current as of `mirror_at` and cannot be
+ * claimed current now. That makes `--once` a snapshot tool, which is what it is.
+ *
+ * Like `atlas_server_overlay_live`, this only ever subtracts: it can force a
+ * full pass, never clear one, so the worst it does is ask for work that was not
+ * needed. */
+void atlas_server_overlay_mirror(atlas_index_state *s, const atlas_repo_info *ri) {
+    if (ri->scanner_uid == 0) {
+        return;
+    }
+    if (!ri->mirror_complete || ri->mirror_at[0] == '\0') {
+        /* No run has vouched for what is there. `atlas_repo_open_git` refuses to
+         * read it at all, so nothing indexed from it can be current. */
+        s->pending_full_reconcile = true;
+        return;
+    }
+    if (ri->mirror_interval_ms <= 0) {
+        s->pending_full_reconcile = true;
+        return;
+    }
+    /* Compared as text rather than parsed: both are Atlas' own UTC ISO-8601, so
+     * lexicographic order is chronological order — the comparison A2's session
+     * expiry and A9's key touch already use. */
+    char cutoff[32];
+    atlas_iso8601_before_now(cutoff, sizeof(cutoff), ri->mirror_interval_ms * 2);
+    if (strcmp(ri->mirror_at, cutoff) < 0) {
+        s->pending_full_reconcile = true;
+    }
+}
+
 void atlas_server_overlay_live(atlas_index_state *s, const atlas_watch_live *live) {
     if (!live->known) {
         return;
@@ -452,6 +500,10 @@ atlas_status atlas_server_write_repo_state(dispatch_state *ds, const atlas_repo_
         atlas_watcher_repo_live(ds->ctx->watcher, ri->id, &live);
         atlas_server_overlay_live(&s, &live);
     }
+    /* Applied whether or not a watcher answered: the mirror's age is a fact about
+     * the row, not about the watcher's live view, and a daemonless local read
+     * needs it just as much. */
+    atlas_server_overlay_mirror(&s, ri);
 
     /* `name` is validated on registration and `root_path_text` is already in the
      * safe encoding, so neither is re-encoded — double-encoding would make a

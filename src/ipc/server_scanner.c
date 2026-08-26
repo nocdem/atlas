@@ -297,6 +297,15 @@ static atlas_status method_scanner_state(dispatch_state *ds, const atlas_ipc_req
     }
     bool complete = false;
     (void)atlas_ipc_param_bool(req, "complete", &complete);
+    /* The cadence this scanner promises to keep. Absent is zero, which is a
+     * one-shot run promising nothing -- see migration 29. Atlas stores what the
+     * scanner claims and never invents one: a bound compiled in here would be a
+     * guess about somebody else's schedule. */
+    int64_t interval_ms = 0;
+    (void)atlas_ipc_param_int(req, "interval_ms", &interval_ms);
+    if (interval_ms < 0) {
+        interval_ms = 0;
+    }
 
     atlas_repo_info ri;
     atlas_repo_info_init(&ri);
@@ -318,7 +327,7 @@ static atlas_status method_scanner_state(dispatch_state *ds, const atlas_ipc_req
      * it finished would let a clock decide whether an index is current. */
     char now[32];
     atlas_now_iso8601(now, sizeof(now));
-    st = atlas_db_repo_set_mirror_state(ds->db, repo_id, complete, now, err);
+    st = atlas_db_repo_set_mirror_state(ds->db, repo_id, complete, now, interval_ms, err);
     if (st == ATLAS_OK) {
         st = atlas_json_key_bool(ds->j, "complete", complete, err);
     }

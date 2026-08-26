@@ -69,7 +69,8 @@ void atlas_cli_print_help(FILE *out) {
         "  job run-status RUN        what a run is waiting on, and how it ended\n"
         "  job get|cancel JOB        read or cancel one job\n"
         "  job list                  jobs this principal submitted\n"
-        "  scanner run --once         ask the daemon which repositories this uid may scan\n"
+        "  scanner run --once | --interval SECONDS\n"
+        "                             mirror this uid's repositories for the daemon\n"
         "  dispatcher run [--once]   run the job dispatcher (as atlas-worker)\n"
         ,
         ATLAS_VERSION_STRING, ATLAS_PHASE);
@@ -820,6 +821,20 @@ static atlas_status parse_args(cli_state *st, int argc, char **argv, bool *want_
                 }
                 st->operands[st->operand_count++] = "--name";
                 st->operands[st->operand_count++] = a + 7;
+            } else if (strcmp(a, "--interval") == 0) {
+                /* A13. Belongs to `scanner run`; collected as an operand so the
+                 * command validates its placement, exactly as `--scanner-uid`
+                 * is. Found by running the built binary -- the parser's allowlist
+                 * is the fifth place a new option has to reach, and nothing in
+                 * the suite drives it. */
+                if (i + 1 >= argc) {
+                    return atlas_err_set(err, ATLAS_ERR_USAGE, "--interval needs a value");
+                }
+                if (st->operand_count + 2u > sizeof(st->operands) / sizeof(st->operands[0])) {
+                    return atlas_err_set(err, ATLAS_ERR_USAGE, "too many arguments");
+                }
+                st->operands[st->operand_count++] = a;
+                st->operands[st->operand_count++] = argv[++i];
             } else if (strcmp(a, "--scanner-uid") == 0) {
                 /* A13. Belongs to `repo add` and `repo scanner`; collected as an
                  * operand so the command validates its placement, exactly as
@@ -927,6 +942,37 @@ static atlas_status take_scanner_uid(cli_state *st, bool *given_out, int64_t *ui
             }
             *given_out = true;
             *uid_out = (int64_t)parsed;
+            i++;
+            continue;
+        }
+        st->operands[w++] = st->operands[i];
+    }
+    st->operand_count = w;
+    return ATLAS_OK;
+}
+
+/* A13. `--interval SECONDS`, for `atlas scanner run`.
+ *
+ * Zero when absent, which the dispatcher refuses alongside a missing `--once`:
+ * a cadence Atlas chose would be a promise the daemon then holds this process
+ * to, and only the operator knows how often their tree changes. */
+static atlas_status take_scanner_interval(cli_state *st, int64_t *seconds_out, atlas_err *err) {
+    *seconds_out = 0;
+    size_t w = 0;
+    for (size_t i = 0; i < st->operand_count; i++) {
+        if (strcmp(st->operands[i], "--interval") == 0) {
+            if (i + 1u >= st->operand_count) {
+                return atlas_err_set(err, ATLAS_ERR_USAGE, "--interval needs a value in seconds");
+            }
+            const char *v = st->operands[i + 1u];
+            char *end = NULL;
+            errno = 0;
+            long long parsed = strtoll(v, &end, 10);
+            if (errno != 0 || end == v || *end != '\0' || parsed <= 0) {
+                return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                     "--interval takes a positive number of seconds");
+            }
+            *seconds_out = (int64_t)parsed;
             i++;
             continue;
         }
@@ -3598,6 +3644,12 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
         return s;
     }
 
+    int64_t scanner_interval_s = 0;
+    s = take_scanner_interval(st, &scanner_interval_s, err);
+    if (s != ATLAS_OK) {
+        return s;
+    }
+
     /* Commands that own their own lifecycle, before any context is opened. */
     if (strcmp(cmd, "daemon") == 0 && st->operand_count > 0 &&
         strcmp(st->operands[0], "run") == 0) {
@@ -3825,13 +3877,24 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
     if (strcmp(cmd, "scanner") == 0) {
         const char *sub = st->operand_count > 0 ? st->operands[0] : NULL;
         if (sub == NULL || strcmp(sub, "run") != 0) {
-            return atlas_err_set(err, ATLAS_ERR_USAGE, "usage: atlas scanner run --once");
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "usage: atlas scanner run --once | --interval SECONDS");
+        }
+        if (!st->opts.run_once && scanner_interval_s <= 0) {
+            /* Neither named. Refused rather than defaulted: a cadence Atlas chose
+             * would be a promise the daemon then holds this process to, and the
+             * operator is the one who knows how often their tree changes. */
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "atlas scanner run needs --once for a single pass, or "
+                                 "--interval SECONDS to keep the mirror fresh; a repository read "
+                                 "from a mirror is only as current as the last run that wrote it");
         }
         /* `--once` sets `opts.run_once`: it is matched by the first of two
          * branches for that flag in the parser's else-if chain, and the second
          * (`opts.job.once`) is unreachable. Verified by running the built
          * binary, which is the only way this kind of thing surfaces. */
-        return atlas_service_scanner_run(st->opts.run_once, st->errout, err);
+        return atlas_service_scanner_run(st->opts.run_once, (int64_t)scanner_interval_s * 1000,
+                                         st->errout, err);
     }
 
     if (strcmp(cmd, "dispatcher") == 0) {

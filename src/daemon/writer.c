@@ -101,6 +101,11 @@ struct atlas_writer {
     atlas_workers *workers;
     FILE *log;
     atlas_buf db_path;
+    /* A13. Where the mirror lives, for a repository whose own tree this process
+     * cannot open. The writer is handed it rather than deriving it from
+     * `db_path`, because stripping a filename to recover a directory is a guess
+     * about a path the caller already knows exactly. */
+    atlas_buf data_dir;
     atlas_buf socket_path;
     atlas_db *db; /* owned by the writer thread only */
     /* Where a semantic-index job records its outcome. Not owned. */
@@ -558,7 +563,10 @@ static void run_reconcile(atlas_writer *w, atlas_job *j) {
     }
 
     atlas_git *g = NULL;
-    if (atlas_git_open(atlas_buf_cstr(&info.root_path), &g, &err) != ATLAS_OK) {
+    bool from_mirror = false;
+    if (atlas_daemon_open_index_root(atlas_buf_cstr(&w->data_dir), j->repo_id,
+                                     atlas_buf_cstr(&info.root_path), &g, &from_mirror,
+                                     &err) != ATLAS_OK) {
         atlas_daemon_log(w->log, "warn", "repository %s cannot be opened: %s",
                          atlas_safe(&safe, info.name), atlas_safe(&safe, atlas_err_msg(&err)));
         atlas_err ignore;
@@ -567,6 +575,13 @@ static void run_reconcile(atlas_writer *w, atlas_job *j) {
         atlas_repo_info_free(&info);
         atlas_safe_pool_free(&safe);
         return;
+    }
+    if (from_mirror) {
+        /* Info, not warn: a repository indexed from its mirror is working as
+         * designed. The line exists because "which bytes did this pass read"
+         * is a question an operator must be able to answer from the log. */
+        atlas_daemon_log(w->log, "info", "repository %s indexed from its mirror",
+                         atlas_safe(&safe, info.name));
     }
 
     /* An outstanding event gap can only be cleared by a pass that actually read
@@ -1443,15 +1458,16 @@ static void *writer_main(void *arg) {
 
 /* --- lifecycle ----------------------------------------------------------- */
 
-atlas_status atlas_writer_start(const char *db_path, const char *socket_path,
-                                atlas_workers *workers, FILE *log, atlas_writer **out,
-                                atlas_err *err) {
+atlas_status atlas_writer_start(const char *db_path, const char *data_dir,
+                                const char *socket_path, atlas_workers *workers, FILE *log,
+                                atlas_writer **out, atlas_err *err) {
     *out = NULL;
     atlas_writer *w = calloc(1u, sizeof(*w));
     if (w == NULL) {
         return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory starting the writer");
     }
     atlas_buf_init(&w->db_path);
+    atlas_buf_init(&w->data_dir);
     atlas_buf_init(&w->socket_path);
     w->workers = workers;
     w->log = log;
@@ -1463,6 +1479,9 @@ atlas_status atlas_writer_start(const char *db_path, const char *socket_path,
         return atlas_err_set(err, ATLAS_ERR_INTERNAL, "cannot create writer synchronisation");
     }
     atlas_status st = atlas_buf_set_str(&w->db_path, db_path, err);
+    if (st == ATLAS_OK) {
+        st = atlas_buf_set_str(&w->data_dir, data_dir != NULL ? data_dir : "", err);
+    }
     if (st == ATLAS_OK) {
         st = atlas_buf_set_str(&w->socket_path, socket_path != NULL ? socket_path : "", err);
     }
@@ -1542,6 +1561,7 @@ void atlas_writer_stop(atlas_writer *w) {
     (void)pthread_cond_destroy(&w->test_release_cv);
     (void)pthread_mutex_destroy(&w->lock);
     atlas_buf_free(&w->db_path);
+    atlas_buf_free(&w->data_dir);
     atlas_buf_free(&w->socket_path);
     free(w);
 }

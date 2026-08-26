@@ -91,7 +91,8 @@ static void rig_open(rig *r, atlas_err *err) {
  * `inject_` field left at zero is the production bound, so a test that sets one
  * differs from production in exactly that number. */
 static void rig_start_writer(rig *r, atlas_err *err) {
-    T_OK(atlas_writer_start(atlas_buf_cstr(&r->db_path), "", NULL, r->log, &r->writer, err), err);
+    T_OK(atlas_writer_start(atlas_buf_cstr(&r->db_path), fx_data_dir(&r->fx), "", NULL, r->log,
+                           &r->writer, err), err);
 }
 
 static void rig_start_watcher(rig *r, const atlas_watcher_opts *o, atlas_err *err) {

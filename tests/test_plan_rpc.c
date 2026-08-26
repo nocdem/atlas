@@ -351,7 +351,8 @@ static void edge_open(edge *g) {
     /* A real writer thread with its own writable handle, which is the only thing
      * that writes through these methods. Nothing listens on the socket path; the
      * writer records it in the daemon's own liveness row and never opens it. */
-    T_OK(atlas_writer_start(atlas_buf_cstr(&g->e.db_path), atlas_buf_cstr(&g->socket_path),
+    T_OK(atlas_writer_start(atlas_buf_cstr(&g->e.db_path), fx_data_dir(&g->e.fx),
+                            atlas_buf_cstr(&g->socket_path),
                             g->workers, NULL, &g->writer, &err),
          &err);
 

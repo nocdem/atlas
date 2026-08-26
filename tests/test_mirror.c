@@ -205,6 +205,40 @@ static void test_a_symlink_is_mirrored_as_one(void) {
     fx_close(&fx);
 }
 
+/* A13. A **broken** symlink is mirrored like any other.
+ *
+ * Atlas hashes a symlink's text and never opens its target, so whether the
+ * target exists has nothing to do with whether the entry belongs in the mirror.
+ * Found on the live tree: one link into a directory that no longer existed was
+ * counted unreadable, which left the whole repository's mirror incomplete and
+ * therefore refused -- a repository kept out of the index by a dangling link in
+ * a docs folder. */
+static void test_a_broken_symlink_is_mirrored_too(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    fixture fx;
+    T_REQUIRE(fx_open(&fx, &err) == ATLAS_OK);
+
+    int root = -1;
+    T_OK(atlas_mirror_open_repo(fx_data_dir(&fx), 4, &root, &err), &err);
+    T_REQUIRE(root >= 0);
+
+    /* A target that does not exist and never will. */
+    static const char GONE[] = "/opt/nothing-here/at/all";
+    T_OK(atlas_mirror_put_symlink(root, "dangling", 8u, GONE, sizeof(GONE) - 1u, &err), &err);
+
+    char back[256];
+    ssize_t n = readlinkat(root, "dangling", back, sizeof(back));
+    T_CHECK_MSG(n == (ssize_t)(sizeof(GONE) - 1u), "a broken link is still a link");
+    if (n > 0) {
+        back[n] = '\0';
+        T_CHECK_MSG(strcmp(back, GONE) == 0, "and it carries the text the tree held");
+    }
+
+    (void)close(root);
+    fx_close(&fx);
+}
+
 static const atlas_test TESTS[] = {
     {"a file round-trips and a second start replaces",
      test_a_file_round_trips_and_a_second_start_replaces},
@@ -213,6 +247,7 @@ static const atlas_test TESTS[] = {
     {"a symlinked component refuses", test_a_symlinked_component_refuses},
     {"an append to an unstarted file refuses", test_an_append_to_an_unstarted_file_refuses},
     {"a symlink is mirrored as one", test_a_symlink_is_mirrored_as_one},
+    {"a broken symlink is mirrored too", test_a_broken_symlink_is_mirrored_too},
 };
 
 ATLAS_TEST_MAIN("mirror", TESTS)

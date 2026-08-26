@@ -192,6 +192,22 @@ static atlas_status put_symlink(walk_ctx *w, const void *rel, size_t rel_len, co
  *
  * Shared by the tracked walk and the `.git` walk, so both get the same
  * nofollow open, the same size bound and the same skip accounting. */
+/* Extracts a symlink's text into `target`, or returns a negative length.
+ *
+ * `rel` is raw bytes and is not NUL-terminated; `readlinkat` needs a C string,
+ * so the name is copied rather than assumed. */
+static ssize_t read_link_text(walk_ctx *w, const void *rel, size_t rel_len, char *target,
+                              size_t target_cap) {
+    char name[4096];
+    if (rel_len >= sizeof(name)) {
+        return -1;
+    }
+    memcpy(name, rel, rel_len);
+    name[rel_len] = '\0';
+    ssize_t n = readlinkat(w->root_fd, name, target, target_cap);
+    return (n > 0 && (size_t)n < target_cap) ? n : -1;
+}
+
 static void mirror_one(walk_ctx *w, const void *rel, size_t rel_len) {
     if (w->status != ATLAS_OK) {
         return;
@@ -202,6 +218,22 @@ static void mirror_one(walk_ctx *w, const void *rel, size_t rel_len) {
     memset(&sb, 0, sizeof(sb));
     if (atlas_path_open_nofollow(w->root_fd, (const char *)rel, rel_len, &res, &fd, &sb, NULL,
                                  w->err) != ATLAS_OK) {
+        /* **A symlink is never opened, so a failed open says nothing about one.**
+         * A broken link -- one whose target does not exist -- fails here with the
+         * open's own error, and counting it unreadable made the mirror
+         * permanently incomplete for a file Atlas indexes perfectly well: what
+         * Atlas hashes is the link *text*, and the target's existence has
+         * nothing to do with it. Found on the live tree, where one link into a
+         * directory that no longer exists kept a whole repository refused.
+         *
+         * `readlinkat` answers without following, so it answers for a broken
+         * link exactly as it does for a whole one. */
+        char target[4096];
+        ssize_t n = read_link_text(w, rel, rel_len, target, sizeof(target));
+        if (n > 0 && put_symlink(w, rel, rel_len, target, (size_t)n) == ATLAS_OK) {
+            w->mirrored++;
+            return;
+        }
         w->skipped_unreadable++;
         return;
     }
@@ -214,21 +246,11 @@ static void mirror_one(walk_ctx *w, const void *rel, size_t rel_len) {
              * text and never opens its target, so a mirror that dropped them was
              * missing files the index holds -- and the daemon read every one as a
              * deletion. `readlinkat` reads the text without following it. */
-            /* `rel` is raw bytes and is not NUL-terminated; `readlinkat` needs a
-             * C string, so the name is copied rather than assumed. */
-            char name[4096];
             char target[4096];
-            ssize_t n = -1;
-            if (rel_len < sizeof(name)) {
-                memcpy(name, rel, rel_len);
-                name[rel_len] = '\0';
-                n = readlinkat(w->root_fd, name, target, sizeof(target));
-            }
-            if (n > 0 && (size_t)n < sizeof(target)) {
-                if (put_symlink(w, rel, rel_len, target, (size_t)n) == ATLAS_OK) {
-                    w->mirrored++;
-                    return;
-                }
+            ssize_t n = read_link_text(w, rel, rel_len, target, sizeof(target));
+            if (n > 0 && put_symlink(w, rel, rel_len, target, (size_t)n) == ATLAS_OK) {
+                w->mirrored++;
+                return;
             }
             /* Unreadable, empty, or longer than this buffer. Counted as a skip,
              * which is what stops the run claiming the mirror is complete. */

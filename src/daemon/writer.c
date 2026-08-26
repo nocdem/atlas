@@ -337,6 +337,7 @@ bool job_kind_is_unbounded(atlas_job_kind kind) {
     case ATLAS_JOB_REPO_ADD:
     case ATLAS_JOB_REPO_REMOVE:
     case ATLAS_JOB_REPO_SCANNER:
+    case ATLAS_JOB_MIRROR_STATE:
     case ATLAS_JOB_MARK_GAP:
     case ATLAS_JOB_SET_WATCH:
     case ATLAS_JOB_AI:
@@ -428,6 +429,9 @@ bool job_kind_is_drainable(atlas_job_kind kind) {
      * repository -- not what a running pass is reading. It is here rather than
      * among the drainable kinds because it shares `repositories` with them. */
     case ATLAS_JOB_REPO_SCANNER:
+    /* One row, one statement, and what it changes is whether a mirror may be
+     * read at all. */
+    case ATLAS_JOB_MIRROR_STATE:
     /* Watcher bookkeeping, ordered against the reconcile submissions it
      * accompanies. Nothing latency-critical is waiting on either. */
     case ATLAS_JOB_MARK_GAP:
@@ -683,6 +687,33 @@ static void run_reconcile(atlas_writer *w, atlas_job *j) {
  * shape already provides two strings; adding an integer field for one caller
  * would be a wider change than encoding a number the way every other argument
  * on this path is already encoded. */
+/* A13. Records what a mirroring run left behind.
+ *
+ * `repo_id` names the repository, `exact_root` carries "the run finished and
+ * skipped nothing", and Atlas supplies the time — a scanner's clock must not
+ * decide when a mirror was last whole. The job shape already provides both
+ * fields; adding one for this caller would be a wider change than reusing what
+ * is there. */
+static void run_mirror_state(atlas_writer *w, atlas_job *j) {
+    const char *id_text = atlas_buf_cstr(&j->arg1);
+    char *end = NULL;
+    long long id = strtoll(id_text, &end, 10);
+    if (end == id_text || *end != '\0' || id <= 0) {
+        j->result = atlas_err_set(&j->result_err, ATLAS_ERR_USAGE,
+                                  "a mirror state needs a repository id");
+        return;
+    }
+    char now[32];
+    atlas_now_iso8601(now, sizeof(now));
+    j->result = atlas_db_repo_set_mirror_state(w->db, (int64_t)id, j->exact_root, now,
+                                               &j->result_err);
+    if (j->result == ATLAS_OK && j->exact_root) {
+        /* A repository that has just become readable is one the watcher's view
+         * of was built when it was not. */
+        atlas_writer_set_watch_dirty(w);
+    }
+}
+
 static void run_repo_scanner(atlas_writer *w, atlas_job *j) {
     atlas_repo_info info;
     atlas_repo_info_init(&info);
@@ -1177,6 +1208,7 @@ static void writer_run_job(atlas_writer *w, atlas_job *j) {
     case ATLAS_JOB_REPO_ADD: run_repo_add(w, j); break;
     case ATLAS_JOB_REPO_REMOVE: run_repo_remove(w, j); break;
     case ATLAS_JOB_REPO_SCANNER: run_repo_scanner(w, j); break;
+    case ATLAS_JOB_MIRROR_STATE: run_mirror_state(w, j); break;
     case ATLAS_JOB_AI: run_ai(w, j); break;
     case ATLAS_JOB_DECISION: run_decision(w, j); break;
     case ATLAS_JOB_ORCH: run_orch(w, j); break;
@@ -1957,6 +1989,20 @@ atlas_status atlas_writer_call_repo_scanner(atlas_writer *w, const char *name,
                                             atlas_writer_result *result, atlas_err *err) {
     return writer_call_impl(w, ATLAS_JOB_REPO_SCANNER, name, uid_text, false, timeout_ms, result,
                             err);
+}
+
+/* A13. Records a mirroring run's verdict, through the writer.
+ *
+ * The repository id travels as text in `arg1` and `complete` in `exact_root`,
+ * because a job carries no field of its own for either; see `run_mirror_state`.
+ * It goes through the writer because it is a write: `scanner.state` first did it
+ * on the dispatch handle, which is read-only, and failed every time. */
+atlas_status atlas_writer_call_mirror_state(atlas_writer *w, int64_t repo_id, bool complete,
+                                            int timeout_ms, atlas_writer_result *result,
+                                            atlas_err *err) {
+    char id[32];
+    (void)snprintf(id, sizeof(id), "%lld", (long long)repo_id);
+    return writer_call_impl(w, ATLAS_JOB_MIRROR_STATE, id, "", complete, timeout_ms, result, err);
 }
 
 void atlas_writer_test_stall(atlas_writer *w, atlas_job_kind kind) {

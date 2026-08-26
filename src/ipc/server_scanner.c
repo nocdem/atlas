@@ -344,11 +344,21 @@ static atlas_status method_scanner_state(dispatch_state *ds, const atlas_ipc_req
         return st;
     }
 
-    /* The time is Atlas', not the caller's. A scanner reporting when it thinks
-     * it finished would let a clock decide whether an index is current. */
-    char now[32];
-    atlas_now_iso8601(now, sizeof(now));
-    st = atlas_db_repo_set_mirror_state(ds->db, repo_id, complete, now, err);
+    /* Through the writer, because this is a write and every dispatch handle is
+     * read-only. Doing it here failed with "attempt to write a readonly
+     * database" on every call, and silently, because the scanner ignored the
+     * result -- so a mirror was never marked complete and no repository could
+     * ever be read. The time is Atlas', set by the writer: a scanner reporting
+     * when it thinks it finished would let a client's clock decide whether an
+     * index is current. */
+    if (ds->ctx == NULL || ds->ctx->writer == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "no writer to record a mirror state");
+    }
+    atlas_writer_result wr;
+    atlas_writer_result_init(&wr);
+    st = atlas_writer_call_mirror_state(ds->ctx->writer, repo_id, complete,
+                                        ATLAS_IPC_WRITE_TIMEOUT_MS, &wr, err);
+    atlas_writer_result_free(&wr);
     if (st == ATLAS_OK) {
         st = atlas_json_key_bool(ds->j, "complete", complete, err);
     }

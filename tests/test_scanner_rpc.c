@@ -228,9 +228,10 @@ static void test_a_scanner_writes_into_its_own_repositorys_mirror(void) {
     atlas_buf params = ATLAS_BUF_INIT;
     atlas_err err;
     atlas_err_init(&err);
+    /* "int x;" as hex — the wire carries bytes, not text. */
     T_OK(atlas_buf_appendf(&params, &err,
-                           "{\"repo\":%lld,\"path\":\"src/a.c\",\"first\":true,\"data\":\"int "
-                           "x;\"}",
+                           "{\"repo\":%lld,\"path\":\"src/a.c\",\"first\":true,"
+                           "\"data\":\"696e7420783b\"}",
                            (long long)e.mine),
          &err);
     atlas_ipc_response *r =
@@ -258,7 +259,7 @@ static void test_a_scanner_may_not_write_into_another_repositorys_mirror(void) {
     atlas_err err;
     atlas_err_init(&err);
     T_OK(atlas_buf_appendf(&params, &err,
-                           "{\"repo\":%lld,\"path\":\"stolen.c\",\"first\":true,\"data\":\"x\"}",
+                           "{\"repo\":%lld,\"path\":\"stolen.c\",\"first\":true,\"data\":\"78\"}",
                            (long long)e.theirs),
          &err);
     atlas_ipc_response *r =
@@ -273,9 +274,64 @@ static void test_a_scanner_may_not_write_into_another_repositorys_mirror(void) {
     env_close(&e);
 }
 
+/* A source file is arbitrary bytes. A quote, a backslash, a newline, a C0
+ * control and a sequence that is not valid UTF-8 are all legal in one, and all
+ * of them are what a JSON string will not carry unchanged. If the wire cannot
+ * carry them the mirror is a copy of something else, so this is asserted before
+ * anything is written on top of the format. */
+static void test_the_wire_carries_arbitrary_bytes(void) {
+    env e;
+    env_open(&e);
+
+    static const unsigned char HOSTILE[] = {'a', '"', 'b', '\\', 'c', '\n', 'd',
+                                            '\t', 'e', 0x01, 0xff, 0xfe};
+    atlas_err err;
+    atlas_err_init(&err);
+
+    /* Hex on the wire: two lowercase digits per byte. */
+    atlas_buf hex = ATLAS_BUF_INIT;
+    for (size_t i = 0; i < sizeof HOSTILE; i++) {
+        T_OK(atlas_buf_appendf(&hex, &err, "%02x", HOSTILE[i]), &err);
+    }
+
+    atlas_buf params = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_appendf(&params, &err,
+                           "{\"repo\":%lld,\"path\":\"hostile.bin\",\"first\":true,\"data\":"
+                           "\"%s\"}",
+                           (long long)e.mine, atlas_buf_cstr(&hex)),
+         &err);
+
+    atlas_buf raw = ATLAS_BUF_INIT;
+    atlas_ipc_response *r =
+        call(&e, (long long)getuid(), "scanner.put", atlas_buf_cstr(&params), &raw);
+    T_CHECK_MSG(atlas_ipc_response_ok(r), "scanner.put refused hostile bytes: %s",
+                atlas_buf_cstr(&raw));
+
+    /* Read it back from the filesystem and compare byte for byte. */
+    atlas_buf path = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_appendf(&path, &err, "%s/mirror/%lld/hostile.bin", fx_data_dir(&e.fx),
+                           (long long)e.mine),
+         &err);
+    FILE *f = fopen(atlas_buf_cstr(&path), "rb");
+    T_REQUIRE(f != NULL);
+    unsigned char got[64];
+    size_t n = fread(got, 1u, sizeof got, f);
+    (void)fclose(f);
+    T_CHECK_MSG(n == sizeof HOSTILE, "mirrored %zu bytes, sent %zu", n, sizeof HOSTILE);
+    T_CHECK_MSG(n == sizeof HOSTILE && memcmp(got, HOSTILE, n) == 0, "the bytes changed in transit");
+
+    atlas_ipc_response_free(r);
+    atlas_buf_free(&path);
+    atlas_buf_free(&params);
+    atlas_buf_free(&hex);
+    atlas_buf_free(&raw);
+    env_close(&e);
+}
+
 static const atlas_test TESTS[] = {
     {"a scanner is told its own repositories and no others",
      test_a_scanner_is_told_its_own_repositories_and_no_others},
+    {"the wire carries arbitrary bytes", test_the_wire_carries_arbitrary_bytes},
     {"a scanner writes into its own repository's mirror",
      test_a_scanner_writes_into_its_own_repositorys_mirror},
     {"a scanner may not write into another repository's mirror",

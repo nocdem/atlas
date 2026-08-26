@@ -143,6 +143,56 @@ static atlas_status method_scanner_poll(dispatch_state *ds, const atlas_ipc_requ
     return st;
 }
 
+/* One hex digit, or -1.
+ *
+ * Uppercase is refused rather than accepted. Two spellings of one byte would
+ * mean two wire forms for one file, and a format with a choice in it is a
+ * format two implementations will disagree about. */
+static int hex_digit(char c) {
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return 10 + (c - 'a');
+    }
+    return -1;
+}
+
+/* Decodes `hex` into `out`.
+ *
+ * **A source file is arbitrary bytes** — a quote, a backslash, a newline, a C0
+ * control and a sequence that is not valid UTF-8 are all legal in one, and a
+ * JSON string carries none of them unchanged. Measured before this existed: a
+ * twelve-byte file arrived as twenty-four, because the wire value was stored
+ * verbatim. So the content travels as hex and the mirror holds what the
+ * repository holds.
+ *
+ * An odd length or a digit that is not hex is refused rather than guessed at:
+ * a truncated file that reported success would be the worst of the three
+ * possible failures. */
+static atlas_status hex_decode(const char *hex, atlas_buf *out, atlas_err *err) {
+    size_t n = strlen(hex);
+    if ((n % 2u) != 0u) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "file content must be an even number of hex digits");
+    }
+    atlas_buf_reset(out);
+    for (size_t i = 0; i < n; i += 2u) {
+        int hi = hex_digit(hex[i]);
+        int lo = hex_digit(hex[i + 1u]);
+        if (hi < 0 || lo < 0) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "file content must be lowercase hex digits");
+        }
+        char b = (char)((hi << 4) | lo);
+        atlas_status st = atlas_buf_append(out, &b, 1u, err);
+        if (st != ATLAS_OK) {
+            return st;
+        }
+    }
+    return ATLAS_OK;
+}
+
 /* Hands one file's bytes to the mirror.
  *
  * The order of the checks is the design. Everything that can refuse happens
@@ -191,18 +241,29 @@ static atlas_status method_scanner_put(dispatch_state *ds, const atlas_ipc_reque
         return st;
     }
 
+    atlas_buf content = ATLAS_BUF_INIT;
+    st = hex_decode(data, &content, err);
+    if (st != ATLAS_OK) {
+        atlas_buf_free(&content);
+        return st;
+    }
+
     int root = -1;
     st = atlas_mirror_open_repo(ds->ctx->data_dir, repo_id, &root, err);
     if (st != ATLAS_OK) {
+        atlas_buf_free(&content);
         return st;
     }
-    size_t len = strlen(data);
-    st = atlas_mirror_put(root, path, strlen(path), first, data, len, err);
+    st = atlas_mirror_put(root, path, strlen(path), first, content.data, content.len, err);
     (void)close(root);
+    size_t written = content.len;
+    atlas_buf_free(&content);
     if (st != ATLAS_OK) {
         return st;
     }
-    return atlas_json_key_int(ds->j, "written", (int64_t)len, err);
+    /* The decoded byte count, so a caller can tell a short write from a
+     * successful one rather than inferring it from the hex length. */
+    return atlas_json_key_int(ds->j, "written", (int64_t)written, err);
 }
 
 static const atlas_method_entry SCANNER_METHODS[] = {

@@ -563,7 +563,15 @@ static atlas_status scan_pass(int64_t *poll_within_ms, FILE *log, atlas_err *err
         bool complete = walked == ATLAS_OK && w.status == ATLAS_OK &&
                         w.skipped_symlink == 0 && w.skipped_large == 0 &&
                         w.skipped_unreadable == 0;
-        (void)say_state(&w, complete);
+        /* Not ignored. A state report that did not land means the daemon still
+         * refuses to read this mirror, and a run that reported "mirrored 4685,
+         * skipped 0" while the daemon went on saying "no complete mirror yet"
+         * is exactly the silence this run has to break. */
+        atlas_status said = say_state(&w, complete);
+        if (said != ATLAS_OK && log != NULL) {
+            (void)fprintf(log, "  %s  WARNING: the daemon did not record this run: %s\n", name,
+                          atlas_err_msg(err));
+        }
 
         if (log != NULL) {
             (void)fprintf(log,

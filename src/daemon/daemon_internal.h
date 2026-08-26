@@ -58,6 +58,14 @@ typedef enum atlas_job_kind {
      * operator stop the daemon to name a scanner is answered by the mechanism
      * A7.1 built, not by weakening what A7 established. */
     ATLAS_JOB_REPO_SCANNER,
+    /* A13. Recording what a mirroring run left behind.
+     *
+     * A write, so it belongs to the writer thread. `scanner.state` first did it
+     * on the dispatch handle and failed every time with "attempt to write a
+     * readonly database" -- silently, because the scanner ignored the result.
+     * Every dispatch opens `atlas_db_open_readonly`; there is one writable
+     * handle and the writer owns it. */
+    ATLAS_JOB_MIRROR_STATE,
     /* The watcher observes the conditions that produce these but holds a
      * read-only handle, so it hands them to the writer rather than acquiring a
      * second write path into the index. */
@@ -441,6 +449,10 @@ atlas_status atlas_writer_call_repo_add(atlas_writer *w, const char *path, const
 atlas_status atlas_writer_call_repo_scanner(atlas_writer *w, const char *name,
                                             const char *uid_text, int timeout_ms,
                                             atlas_writer_result *result, atlas_err *err);
+/* A13. Records a mirroring run's verdict, through the writer. */
+atlas_status atlas_writer_call_mirror_state(atlas_writer *w, int64_t repo_id, bool complete,
+                                            int timeout_ms, atlas_writer_result *result,
+                                            atlas_err *err);
 
 /* Queues one AI-session operation and waits for it, bounded by `timeout_ms`.
  *

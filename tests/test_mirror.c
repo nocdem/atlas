@@ -161,6 +161,50 @@ static void test_an_append_to_an_unstarted_file_refuses(void) {
     fx_close(&fx);
 }
 
+/* A13. A symlink is mirrored as a symlink, with the tree's link text.
+ *
+ * **The link text is the content.** Atlas hashes a tracked symlink's text and
+ * never opens its target, so a mirror that wrote a regular file holding the
+ * path — or skipped the entry — would differ from the tree in a way the daemon
+ * reads as a deletion. Measured before this existed: one symlink in /opt/dna
+ * was enough to leave that repository's mirror permanently incomplete.
+ *
+ * The target here does not exist, deliberately: nothing is required to resolve,
+ * because nothing follows it. */
+static void test_a_symlink_is_mirrored_as_one(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    fixture fx;
+    T_REQUIRE(fx_open(&fx, &err) == ATLAS_OK);
+
+    int root = -1;
+    T_OK(atlas_mirror_open_repo(fx_data_dir(&fx), 3, &root, &err), &err);
+    T_REQUIRE(root >= 0);
+
+    static const char TARGET[] = "../nowhere/at/all";
+    T_OK(atlas_mirror_put_symlink(root, "link", 4u, TARGET, sizeof(TARGET) - 1u, &err), &err);
+
+    char back[256];
+    ssize_t n = readlinkat(root, "link", back, sizeof(back));
+    T_CHECK_MSG(n == (ssize_t)(sizeof(TARGET) - 1u), "it is a symlink, not a file");
+    if (n > 0) {
+        back[n] = '\0';
+        T_CHECK_MSG(strcmp(back, TARGET) == 0, "and it carries the tree's link text");
+    }
+
+    /* Replacing it works the same way a rescanned file does. */
+    static const char OTHER[] = "elsewhere";
+    T_OK(atlas_mirror_put_symlink(root, "link", 4u, OTHER, sizeof(OTHER) - 1u, &err), &err);
+    n = readlinkat(root, "link", back, sizeof(back));
+    if (n > 0) {
+        back[n] = '\0';
+        T_CHECK_MSG(strcmp(back, OTHER) == 0, "a rescan replaces the link text");
+    }
+
+    (void)close(root);
+    fx_close(&fx);
+}
+
 static const atlas_test TESTS[] = {
     {"a file round-trips and a second start replaces",
      test_a_file_round_trips_and_a_second_start_replaces},
@@ -168,6 +212,8 @@ static const atlas_test TESTS[] = {
      test_unsafe_names_are_refused_and_create_nothing},
     {"a symlinked component refuses", test_a_symlinked_component_refuses},
     {"an append to an unstarted file refuses", test_an_append_to_an_unstarted_file_refuses},
+    {"a symlink is mirrored as one", test_a_symlink_is_mirrored_as_one},
 };
 
 ATLAS_TEST_MAIN("mirror", TESTS)
+

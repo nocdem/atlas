@@ -40,4 +40,10 @@ atlas_status atlas_mirror_open_repo(const char *data_dir, int64_t repo_id, int *
 atlas_status atlas_mirror_put(int root_fd, const void *rel, size_t rel_len, bool first,
                               const void *data, size_t len, atlas_err *err);
 
+/* A13. Recreates a symlink in the mirror, with the link text the tree holds.
+ * The link text is the content Atlas hashes, and nothing follows it. See the
+ * definition. */
+atlas_status atlas_mirror_put_symlink(int root_fd, const void *rel, size_t rel_len,
+                                      const void *target, size_t target_len, atlas_err *err);
+
 #endif /* ATLAS_MIRROR_H */

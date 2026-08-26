@@ -162,6 +162,48 @@ static atlas_status put_file(walk_ctx *w, const void *rel, size_t rel_len, const
     return st;
 }
 
+/* A13. Sends one symlink's text.
+ *
+ * The same wire shape as a file chunk, with `symlink` set: a link text is bytes
+ * too, and it travels as hex for the same reason a file's content does. One
+ * request always suffices — a link text is bounded by the filesystem far below
+ * `SCANNER_CHUNK_BYTES`, so there is no chunking here and no `first` to carry. */
+static atlas_status put_symlink(walk_ctx *w, const void *rel, size_t rel_len, const void *target,
+                                size_t target_len) {
+    atlas_buf enc = ATLAS_BUF_INIT;
+    atlas_status st = atlas_path_text_encode(rel, rel_len, &enc, w->err);
+
+    atlas_buf hex = ATLAS_BUF_INIT;
+    if (st == ATLAS_OK) {
+        st = atlas_buf_reserve(&hex, target_len * 2u + 1u, w->err);
+    }
+    if (st == ATLAS_OK) {
+        static const char DIGITS[] = "0123456789abcdef";
+        const unsigned char *b = (const unsigned char *)target;
+        for (size_t i = 0; i < target_len && st == ATLAS_OK; i++) {
+            char pair[2] = {DIGITS[b[i] >> 4], DIGITS[b[i] & 0x0fu]};
+            st = atlas_buf_append(&hex, pair, 2u, w->err);
+        }
+    }
+
+    atlas_buf params = ATLAS_BUF_INIT;
+    if (st == ATLAS_OK) {
+        st = atlas_buf_appendf(
+            &params, w->err,
+            "{\"repo\":%lld,\"path\":\"%s\",\"first\":true,\"symlink\":true,\"data\":\"%s\"}",
+            (long long)w->repo_id, atlas_buf_cstr(&enc), atlas_buf_cstr(&hex));
+    }
+    atlas_buf raw = ATLAS_BUF_INIT;
+    if (st == ATLAS_OK) {
+        st = atlas_ipc_call(w->socket_path, "scanner.put", atlas_buf_cstr(&params), &raw, w->err);
+    }
+    atlas_buf_free(&raw);
+    atlas_buf_free(&params);
+    atlas_buf_free(&hex);
+    atlas_buf_free(&enc);
+    return st;
+}
+
 /* Mirrors one regular file at `rel` beneath the repository root.
  *
  * Shared by the tracked walk and the `.git` walk, so both get the same
@@ -183,7 +225,31 @@ static void mirror_one(walk_ctx *w, const void *rel, size_t rel_len) {
         if (fd >= 0) {
             (void)close(fd);
         }
-        if (res == ATLAS_PATH_OPEN_SYMLINK || res == ATLAS_PATH_OPEN_UNSAFE) {
+        if (res == ATLAS_PATH_OPEN_SYMLINK) {
+            /* **The link text is the file.** Atlas hashes a tracked symlink's
+             * text and never opens its target, so a mirror that dropped them was
+             * missing files the index holds -- and the daemon read every one as a
+             * deletion. `readlinkat` reads the text without following it. */
+            /* `rel` is raw bytes and is not NUL-terminated; `readlinkat` needs a
+             * C string, so the name is copied rather than assumed. */
+            char name[4096];
+            char target[4096];
+            ssize_t n = -1;
+            if (rel_len < sizeof(name)) {
+                memcpy(name, rel, rel_len);
+                name[rel_len] = '\0';
+                n = readlinkat(w->root_fd, name, target, sizeof(target));
+            }
+            if (n > 0 && (size_t)n < sizeof(target)) {
+                if (put_symlink(w, rel, rel_len, target, (size_t)n) == ATLAS_OK) {
+                    w->mirrored++;
+                    return;
+                }
+            }
+            /* Unreadable, empty, or longer than this buffer. Counted as a skip,
+             * which is what stops the run claiming the mirror is complete. */
+            w->skipped_symlink++;
+        } else if (res == ATLAS_PATH_OPEN_UNSAFE) {
             w->skipped_symlink++;
         } else {
             w->skipped_unreadable++;

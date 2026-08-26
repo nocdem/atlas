@@ -223,6 +223,12 @@ static atlas_status method_scanner_put(dispatch_state *ds, const atlas_ipc_reque
     }
     bool first = true;
     (void)atlas_ipc_param_bool(req, "first", &first);
+    /* A13. A symlink's text is its content: Atlas hashes the text and never
+     * opens the target, so the mirror holds a symlink rather than a file whose
+     * bytes happen to be a path. Nothing follows it -- every descent here and in
+     * `reconcile.c` is `O_NOFOLLOW` -- so the text is data and never a route. */
+    bool is_symlink = false;
+    (void)atlas_ipc_param_bool(req, "symlink", &is_symlink);
 
     atlas_repo_info ri;
     atlas_repo_info_init(&ri);
@@ -255,7 +261,10 @@ static atlas_status method_scanner_put(dispatch_state *ds, const atlas_ipc_reque
         atlas_buf_free(&content);
         return st;
     }
-    st = atlas_mirror_put(root, path, strlen(path), first, content.data, content.len, err);
+    st = is_symlink ? atlas_mirror_put_symlink(root, path, strlen(path), content.data, content.len,
+                                               err)
+                    : atlas_mirror_put(root, path, strlen(path), first, content.data, content.len,
+                                       err);
     (void)close(root);
     size_t written = content.len;
     atlas_buf_free(&content);

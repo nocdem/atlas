@@ -158,6 +158,8 @@ add_custom_command(
 add_library(atlas_core STATIC
   src/core/error.c
   src/core/buf.c
+  src/core/scanner_uid.c
+  src/core/mirror_open.c
   src/core/sha256.c
   src/core/hmac.c
   src/core/util.c
@@ -195,6 +197,7 @@ add_library(atlas_core STATIC
   src/daemon/writer.c
   src/daemon/workers.c
   src/daemon/watch.c
+  src/daemon/mirror.c
   src/daemon/daemon.c
   src/core/service_daemon.c
     src/core/service_remote.c
@@ -297,6 +300,7 @@ add_library(atlas_core STATIC
   # scheduler, and no state that must survive a crash.
   src/orch/plandriver.c
   src/core/service_orch.c
+  src/core/service_scanner.c
   # A12.0: the four `plan.` calls a client makes. No offline path, no second
   # derivation of a plan's status, and no formatting.
   src/core/service_plan.c
@@ -306,6 +310,7 @@ add_library(atlas_core STATIC
   # status that is derived on every read because nothing writes one.
   src/db/db_plan.c
   src/ipc/server_orch.c
+  src/ipc/server_scanner.c
   # --- A9: remote access, API credentials and the web control plane -------
   #
   # The gateway is a *client* of the daemon, structurally the same shape as

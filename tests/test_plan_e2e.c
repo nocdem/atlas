@@ -253,7 +253,8 @@ static void e2e_open(e2e *g) {
     T_OK(atlas_db_migrate(g->db, &err), &err);
 
     T_OK(atlas_workers_start(2u, &g->workers, &err), &err);
-    T_OK(atlas_writer_start(atlas_buf_cstr(&g->db_path), atlas_buf_cstr(&g->sock), g->workers,
+    T_OK(atlas_writer_start(atlas_buf_cstr(&g->db_path), fx_data_dir(&g->fx),
+                            atlas_buf_cstr(&g->sock), g->workers,
                             NULL, &g->writer, &err),
          &err);
 

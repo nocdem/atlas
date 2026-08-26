@@ -183,6 +183,9 @@ static atlas_status h_doctor(atlas_renderer *r, const atlas_doctor_report *rep, 
                   atlas_safe(&r->safe, atlas_buf_cstr(&rep->foreign_key_check)));
     (void)fprintf(o, LABEL "%s\n", "text encoding", ATLAS_TEXT_ENCODING_NAME);
     (void)fprintf(o, LABEL "%" PRId64 "\n", "repositories", rep->repo_count);
+    if (rep->repos_without_scanner > 0) {
+        (void)fprintf(o, LABEL "%d\n", "without scanner", rep->repos_without_scanner);
+    }
 
     if (rep->problems.len > 0) {
         (void)fprintf(o, "problems:\n");
@@ -227,6 +230,16 @@ static atlas_status h_repo_item(atlas_renderer *r, const atlas_repo_info *ri, at
     return ok();
 }
 
+/* A13. `repo scanner`. One line: the assignment is the whole result, and
+ * repeating the repository's identity would bury it. `ri->name` is a checked
+ * Atlas name, not repository prose, so it is printed as-is. */
+static atlas_status h_repo_scanner_set(atlas_renderer *r, const atlas_repo_info *ri,
+                                       atlas_err *err) {
+    (void)err;
+    (void)fprintf(r->out, "%s: scanner uid %lld\n", ri->name, (long long)ri->scanner_uid);
+    return ATLAS_OK;
+}
+
 static atlas_status h_repo_added(atlas_renderer *r, const atlas_repo_info *ri, atlas_err *err) {
     (void)err;
     (void)fprintf(r->out, "registered %s\n", ri->name);
@@ -238,6 +251,13 @@ static atlas_status h_repo_added(atlas_renderer *r, const atlas_repo_info *ri, a
     (void)fprintf(r->out, LABEL "%s\n", "worktree",
                   ri->is_linked_worktree ? "linked worktree" : "main worktree");
     (void)fprintf(r->out, LABEL "%s\n", "object format", ri->object_format);
+    /* A13. An Atlas integer, not repository text, so it is printed as-is. 0 is
+     * shown as "-" because it means no scanner is assigned, not uid 0. */
+    if (ri->scanner_uid > 0) {
+        (void)fprintf(r->out, LABEL "%lld\n", "scanner uid", (long long)ri->scanner_uid);
+    } else {
+        (void)fprintf(r->out, LABEL "%s\n", "scanner uid", "- (none assigned)");
+    }
     (void)fprintf(r->out, LABEL "%s\n", "registered at", ri->registered_at);
     (void)fprintf(r->out, "next: atlas scan %s\n", ri->name);
     return ok();
@@ -2787,6 +2807,7 @@ static atlas_status h_plan_item(atlas_renderer *r, const atlas_plan_render *pr, 
 const atlas_renderer_vtbl ATLAS_RENDERER_HUMAN = {
     h_begin,      h_end,          h_note_repo,    h_note_query,   h_list_begin,
     h_list_end,   h_doctor,       h_version,      h_repo_item,    h_repo_added,
+    h_repo_scanner_set,
     h_repo_removed, h_scan,       h_status,       h_search_item,  h_file,
     h_history_item, h_diff_begin, h_diff_item,    h_diff_end,
     h_job_item,

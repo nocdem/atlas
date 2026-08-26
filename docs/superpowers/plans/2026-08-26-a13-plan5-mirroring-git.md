@@ -1,0 +1,148 @@
+# A13 Plan 5 — mirroring `.git`
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** The mirror becomes a repository the daemon can open with `atlas_git_open`
+and ask every question it asks of a real one.
+
+**Architecture:** The scanner mirrors `.git` alongside the tracked worktree. The
+daemon then opens the mirror as an ordinary git repository, so reconcile, A3,
+the semantic layer, snapshots and gates need **no change at all** — only a
+different root. A1's cache-hit rules keep operating on real files rather than on
+facts reproduced over a wire.
+
+**Tech Stack:** C17, CMake ≥ 3.16, `tests/atlas_test.h`. No new dependencies.
+
+**Spec:** `docs/superpowers/specs/2026-08-26-per-user-scanner-design.md`
+**Builds on:** Plans 1–4.
+
+## Global Constraints
+
+Same as Plan 1 — see
+`docs/superpowers/plans/2026-08-26-a13-plan1-record-and-identity.md`.
+
+## Why this replaces the spec's observation stream
+
+The spec had the scanner report observations and the daemon rebuild the index
+from them. Verifying the code before writing this plan showed what that costs.
+
+`src/core/reconcile.c` calls **twenty distinct git operations**: `head`,
+`read_head`, `read_status`, `status_entry`, `worktree_state`,
+`read_worktree_state`, `tip_is_stale`, `log_since`, `commit`, `change`,
+`change_type_name`, `ls_files`, `ls_untracked`, `ls_ignored`, `object_format`,
+`root`, `root_fd`, `index_entry`, `set_timeout_ms`, `set_max_output`. Counted
+with `grep -oE "atlas_git_[a-z_]+" src/core/reconcile.c | sort | uniq -c`.
+
+Reproducing all twenty over a socket means moving the execution of A1's
+cache-hit rules — the ones `CLAUDE.md` marks *"do not weaken these"* — into a
+process the daemon cannot audit.
+
+Measured instead: **git works unchanged on a copied `.git`.**
+`cp -r /opt/atlas/.git /tmp/gitcopy/.git` then `git -C /tmp/gitcopy rev-parse
+HEAD` returned the current commit and `git ls-files` returned 410 paths. The
+cost is 40 MB for `/opt/atlas` and 216 MB for `/opt/dna` — 256 MB against a
+3.0 GB index, about 8 %.
+
+So the mirror becomes a real repository and nothing above it changes. The
+operator chose this path over the observation stream with those numbers in
+front of them.
+
+**What it costs, stated:** the daemon holds a copy of the whole history, not
+only current content. §5.2 of the spec already records that owner-private
+content enters the index; this widens it from the working tree to the object
+store, and that is a larger surface rather than a new kind of one.
+
+## Verified surface
+
+Read from the tree at `4eb8795`.
+
+| Fact | Where |
+| --- | --- |
+| `atlas_status atlas_git_open(const char *path, atlas_git **out, atlas_err *err)` | `include/atlas/git.h:34` |
+| Reconcile takes its root descriptor from `atlas_git_root_fd(g)` | `src/core/reconcile.c:1247, 1258, 1452` |
+| git operates correctly on a copied `.git` | measured, above |
+| `atlas_mirror_put(int root_fd, const void *rel, size_t rel_len, bool first, const void *data, size_t len, atlas_err *err)` | `src/daemon/mirror.h` (Plan 3) |
+| `atlas_snapshot_path_ok` rejects `..`, absolute, empty, NUL | `src/orch/snapshot.c:38-60` — note it does **not** reject a leading `.`, so `.git/...` passes |
+| The scanner's walk and `put_file` | `src/core/service_scanner.c` (Plan 4) |
+| `atlas_path_open_nofollow` results include `ATLAS_PATH_OPEN_SYMLINK` and `_UNSAFE` | `include/atlas/pathrep.h:40-47` |
+
+**Confirm before implementing** that `atlas_snapshot_path_ok` accepts a path
+whose first component is `.git`. The plan depends on it; a single-component `.`
+is rejected and `.git` is not the same string, but assert it in a test rather
+than reasoning about it.
+
+---
+
+### Task 1: The scanner mirrors `.git`
+
+**Files:**
+- Modify: `src/core/service_scanner.c`
+- Test: `tests/test_scanner_rpc.c` or a new end-to-end case
+
+**Interfaces:**
+- Consumes: Plan 3's mirror, Plan 4's walk.
+- Produces: after a run, `<data-dir>/mirror/<id>/.git` is a directory
+  `atlas_git_open` accepts.
+
+- [ ] **Step 1: Write the failing test**
+
+The claim: after `atlas scanner run --once` against a live fixture daemon,
+`atlas_git_open` on `<data-dir>/mirror/<id>` succeeds and `atlas_git_head`
+reports the same commit as the source repository.
+
+This needs a live daemon, so it belongs in the `daemon` label. Read
+`tests/support/fixture.h` for `fx_daemon_start` and `fx_daemon_wait_ready`
+before writing the call, and follow an existing daemon test's shape.
+
+- [ ] **Step 2: Run it and watch it fail**
+
+Expected: FAIL — the mirror has no `.git`.
+
+- [ ] **Step 3: Implement**
+
+Walk `.git` as an ordinary directory tree, not through git. Every entry is
+opened with the same `O_NOFOLLOW` discipline the tracked walk uses.
+
+Three things to decide and write down at the call site:
+
+1. **What is skipped.** `.git/index` reflects the *source* worktree's stat data
+   and is regenerated by git on demand; mirroring it makes git re-hash on the
+   mirror, which is correct but slow. Mirror it anyway or skip it — pick one,
+   say which, and say why. Do not leave it to chance.
+2. **Sockets, fifos and anything not a regular file** are skipped and counted.
+   `atlas_path_open_nofollow` already reports `ATLAS_PATH_OPEN_NOT_REGULAR`.
+3. **The size bound still applies.** A pack file can exceed
+   `SCANNER_MAX_FILE_BYTES`; if it does, the mirror is incomplete and the run
+   must say so rather than reporting success. Consider whether the bound needs
+   to be larger for `.git` and state the number you choose.
+
+- [ ] **Step 4: Run it, then drive it end to end by hand**
+
+```sh
+# a fixture repo, a fixture daemon, one scanner run, then:
+git -C <data-dir>/mirror/<id> rev-parse HEAD
+git -C <data-dir>/mirror/<id> ls-files | wc -l
+```
+
+Both must match the source repository.
+
+- [ ] **Step 5: Commit**
+
+---
+
+### Task 2: The gates
+
+- [ ] `make test && make asan && make ubsan && make tsan && make adversarial`
+- [ ] Record a change reason, then report.
+
+---
+
+## What this plan deliberately does not do
+
+- The daemon does not yet *use* the mirror. Reconcile still opens the real
+  repository root, and a repository the daemon cannot read is still not
+  current. Repointing it is Plan 6.
+- No incremental sync. Every run re-mirrors what it walks. Git objects are
+  immutable so an incremental sync is tractable, but it is not this plan and a
+  bound nobody implemented would be worse than none.
+- No deletion. An object removed by a gc stays in the mirror.

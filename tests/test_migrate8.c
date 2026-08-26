@@ -61,13 +61,38 @@ static bool table_exists(atlas_db *db, const char *name) {
     return n > 0;
 }
 
+/* The columns to compare for a table a *later* migration legitimately extends,
+ * or NULL for every column.
+ *
+ * `SELECT *` is the right assertion almost everywhere here: it catches a
+ * reordered column, a renamed one and a changed value at once. It is the wrong
+ * assertion for `repositories`, because the digests are taken at schema 7 and
+ * again at head, and migration 27 adds `scanner_uid` in between — an addition
+ * with a default damages no pre-existing row and yet changes the digest.
+ *
+ * Naming the columns keeps the property this test is for — every schema-7 value
+ * survives, in the same column, in the same order — while letting an additive
+ * migration be additive. A later migration that dropped or renamed one of these
+ * still fails, which is what matters. */
+static const char *preserved_cols(const char *table) {
+    if (strcmp(table, "repositories") == 0) {
+        return "id, name, root_path, root_path_text, git_common_dir, git_common_dir_text,"
+               " object_format, registered_at, last_scan_at, last_scan_id, scanned_head,"
+               " current_branch, head_state, dirty, dirty_staged, dirty_unstaged,"
+               " dirty_untracked, dirty_unmerged, git_dir, git_dir_text, is_linked_worktree";
+    }
+    return NULL;
+}
+
 /* A digest over every column of every row, in rowid order, including column
  * names — so a reordered, renamed or retyped column is a difference too. */
 static void table_digest(atlas_db *db, const char *table, char *out) {
+    const char *cols = preserved_cols(table);
     atlas_err err;
     atlas_err_init(&err);
-    char sql[256];
-    (void)snprintf(sql, sizeof sql, "SELECT * FROM %s ORDER BY rowid;", table);
+    char sql[512];
+    (void)snprintf(sql, sizeof sql, "SELECT %s FROM %s ORDER BY rowid;", cols != NULL ? cols : "*",
+                   table);
     sqlite3_stmt *s = NULL;
     T_OK(atlas_db_prepare(db, sql, &s, &err), &err);
     atlas_sha256 ctx;
@@ -195,6 +220,12 @@ static void build_schema7(const char *path, atlas_err *err) {
                               err),
          err);
     T_OK(atlas_buf_append_str(&drop, "DROP TABLE decision_edge_events;", err), err);
+    /* Migration 27 added a column to `repositories`. A rewind that leaves a
+     * later migration's *column* behind is no more a schema-8 database than one
+     * that leaves its table behind, and re-running the chain would fail with
+     * "duplicate column name". */
+    T_OK(atlas_buf_append_str(&drop, "ALTER TABLE repositories DROP COLUMN scanner_uid;", err),
+         err);
     T_OK(atlas_buf_append_str(&drop, "DELETE FROM schema_migrations WHERE version >= 8;", err),
          err);
     T_OK(atlas_db_exec_sql(db, atlas_buf_cstr(&drop), err), err);
@@ -226,7 +257,7 @@ static void test_a_schema_seven_database_reaches_eight_losslessly(void) {
 
     T_OK(atlas_db_migrate(db, &err), &err);
     T_EQ_INT(atlas_db_schema_version(db, &err), ATLAS_SCHEMA_VERSION);
-    T_EQ_INT(ATLAS_SCHEMA_VERSION, 26);
+    T_EQ_INT(ATLAS_SCHEMA_VERSION, 27);
 
     for (size_t i = 0; i < sizeof A8_TABLES / sizeof A8_TABLES[0]; i++) {
         T_CHECK_MSG(table_exists(db, A8_TABLES[i]), "migration 8 did not create %s",

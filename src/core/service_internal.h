@@ -18,14 +18,20 @@ atlas_status atlas_service_require_repo(atlas_ctx *ctx, const char *name, atlas_
                                         atlas_err *err);
 
 /* Opens the git adapter for a registered repository and verifies that its
- * canonical root has not moved since registration. */
-atlas_status atlas_service_open_repo_git(const atlas_repo_info *info, atlas_git **out,
-                                         atlas_err *err);
+ * canonical root has not moved since registration.
+ *
+ * A13. `data_dir` is where the scanner's mirror lives, and passing NULL means
+ * the tree itself is the only acceptable source -- see `atlas_repo_open_git`.
+ * When the mirror answered, the two identity checks are skipped, because they
+ * are claims about the real tree and the real tree was not opened. */
+atlas_status atlas_service_open_repo_git(const atlas_repo_info *info, const char *data_dir,
+                                         atlas_git **out, atlas_err *err);
 
 /* The fresh git observation behind `atlas status NAME`, shared by the local
  * read and the daemon-served one. Fills `live_head`, `live_state`, `git_ok`,
  * `git_error` and `head_drift` from `out->repo.root_path` and `out->scanned`. */
-atlas_status atlas_service_status_observe_live(atlas_status_report *out, atlas_err *err);
+atlas_status atlas_service_status_observe_live(atlas_status_report *out, const char *data_dir,
+                                              atlas_err *err);
 
 /* --- talking to the daemon --------------------------------------------------
  *

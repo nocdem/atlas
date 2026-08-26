@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "atlas/mirror.h"
 #include "atlas/atlas.h"
 #include "atlas/sem.h"
 #include "atlas/sem_discover.h"
@@ -834,7 +835,8 @@ atlas_status atlas_service_sem_index(atlas_ctx *ctx, const char *name, const cha
         /* No yield: this is the local CLI path, where the process running the
          * pass is the process that asked for it and there is nothing else on
          * this thread to lend it to. */
-        st = atlas_sem_index_on(atlas_ctx_db(ctx), &repo, compdbs, compdb_count, rebuild, NULL,
+        st = atlas_sem_index_on(atlas_ctx_db(ctx), atlas_ctx_data_dir(ctx), &repo, compdbs,
+                                compdb_count, rebuild, NULL,
                                 NULL, out, err);
     }
     atlas_buf_free(&accepted);
@@ -854,7 +856,7 @@ atlas_status atlas_service_sem_index(atlas_ctx *ctx, const char *name, const cha
  * It creates git and parser processes and must therefore never be called with a
  * write transaction open — A1's rule, which `atlas_sem_index_run` observes by
  * chunking its own work. */
-atlas_status atlas_sem_index_on(atlas_db *db, const atlas_repo_info *repo_in,
+atlas_status atlas_sem_index_on(atlas_db *db, const char *data_dir, const atlas_repo_info *repo_in,
                                 const char *const *compdbs, size_t compdb_count, bool rebuild,
                                 void (*yield)(void *ud), void *yield_ud,
                                 atlas_sem_index_summary *out, atlas_err *err) {
@@ -878,7 +880,7 @@ atlas_status atlas_sem_index_on(atlas_db *db, const atlas_repo_info *repo_in,
      * never re-resolves a path from a string — A8's workspace rule, applied to
      * reading a repository. */
     atlas_git *g = NULL;
-    st = atlas_git_open(atlas_buf_cstr(&repo.root_path), &g, err);
+    st = atlas_repo_open_git(&repo, data_dir, &g, NULL, err);
     if (st != ATLAS_OK) {
         atlas_buf_free(&list);
         return st;

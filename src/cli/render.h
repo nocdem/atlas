@@ -41,6 +41,8 @@ typedef struct atlas_renderer_vtbl {
     atlas_status (*version)(atlas_renderer *r, atlas_err *err);
     atlas_status (*repo_item)(atlas_renderer *r, const atlas_repo_info *ri, atlas_err *err);
     atlas_status (*repo_added)(atlas_renderer *r, const atlas_repo_info *ri, atlas_err *err);
+    /* A13. `repo scanner` — the repository as stored after the assignment. */
+    atlas_status (*repo_scanner_set)(atlas_renderer *r, const atlas_repo_info *ri, atlas_err *err);
     atlas_status (*repo_removed)(atlas_renderer *r, const atlas_repo_info *ri, atlas_err *err);
     atlas_status (*scan)(atlas_renderer *r, const char *repo, const atlas_scan_summary *s,
                          atlas_err *err);

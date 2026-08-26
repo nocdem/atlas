@@ -16,6 +16,8 @@
 #include "atlas/atlas.h"
 #include "atlas/lock.h"
 #include "atlas/pathrep.h"
+#include "atlas/scanner_uid.h"
+#include "atlas/mirror.h"
 #include "core/service_internal.h"
 
 struct atlas_ctx {
@@ -222,11 +224,28 @@ atlas_status atlas_service_require_repo(atlas_ctx *ctx, const char *name, atlas_
     return ATLAS_OK;
 }
 
-atlas_status atlas_service_open_repo_git(const atlas_repo_info *info, atlas_git **out,
-                                         atlas_err *err) {
-    atlas_status st = atlas_git_open(atlas_buf_cstr(&info->root_path), out, err);
+atlas_status atlas_service_open_repo_git(const atlas_repo_info *info, const char *data_dir,
+                                         atlas_git **out, atlas_err *err) {
+    bool from_mirror = false;
+    atlas_status st = atlas_repo_open_git(info, data_dir, out, &from_mirror, err);
     if (st != ATLAS_OK) {
         return st;
+    }
+    if (from_mirror) {
+        /* The two checks below assert that *the registered root still resolves
+         * to itself*. That is a claim about the real tree, and the real tree
+         * was not opened — so the claim is not false, it is **unasked**, and
+         * asserting it against the mirror would refuse a correct answer.
+         *
+         * What stands in its place is not nothing. The mirror is at a path
+         * Atlas derives from `repo_id` inside its own data directory, and only
+         * a uid this repository's row names may write there — one comparison,
+         * `peer_owns` in `src/ipc/server_scanner.c`, and `atlas_repo_open_git`
+         * refuses a mirror for a row naming no scanner at all. The warrant
+         * moved from "the path still resolves here" to "the row still names
+         * this writer". It did not disappear, and neither half of this is
+         * inferable from the code below, which is why it is written here. */
+        return ATLAS_OK;
     }
     /* The registered root must still be the canonical root. If the path now
      * resolves elsewhere the registration is stale, and proceeding would report
@@ -297,10 +316,39 @@ static atlas_status add_problem(atlas_doctor_report *r, atlas_err *err, const ch
     return atlas_buf_append_str(&r->problems, text, err);
 }
 
-static atlas_status count_repos_cb(const atlas_repo_info *ri, void *ud, atlas_err *err) {
-    (void)ri;
+
+/* A13. Counts repositories and names the ones with no scanner uid, in one walk.
+ *
+ * The row callback receives borrowed pointers valid only for the call, so the
+ * name is formatted into the report here rather than kept. `status` carries a
+ * failure out because the callback's own error return would abandon the walk
+ * and lose the count. */
+typedef struct doctor_repo_scan {
+    atlas_doctor_report *report;
+    atlas_err *err;
+    atlas_status status;
+} doctor_repo_scan;
+
+static atlas_status doctor_repo_cb(const atlas_repo_info *ri, void *ud, atlas_err *err) {
+    doctor_repo_scan *s = (doctor_repo_scan *)ud;
     (void)err;
-    (*(int64_t *)ud)++;
+    s->report->repo_count++;
+    if (ri->scanner_uid != 0 || s->status != ATLAS_OK) {
+        return ATLAS_OK;
+    }
+    s->report->repos_without_scanner++;
+    /* A repository name is a checked Atlas name, not repository prose, but it
+     * reaches a terminal through `problems`, so it is encoded like every other
+     * untrusted value on that path. */
+    atlas_safe_pool safe;
+    atlas_safe_pool_init(&safe);
+    char line[256];
+    (void)snprintf(line, sizeof(line),
+                   "repository \"%s\" has no scanner uid, so nothing may report about it "
+                   "(try: atlas repo scanner %s)",
+                   atlas_safe(&safe, ri->name), atlas_safe(&safe, ri->name));
+    s->status = add_problem(s->report, s->err, line);
+    atlas_safe_pool_free(&safe);
     return ATLAS_OK;
 }
 
@@ -505,7 +553,24 @@ atlas_status atlas_service_doctor(atlas_ctx *ctx, atlas_doctor_report *out, atla
     }
 
     out->repo_count = 0;
-    return atlas_db_repo_list(ctx->db, count_repos_cb, &out->repo_count, err);
+    {
+        /* A13. Counted and *named* in the same walk that counts repositories.
+         *
+         * Every repository registered before migration 27 is in this state:
+         * the migration could not `stat` a root, so it assigned nothing rather
+         * than inventing an intent nobody expressed. Naming them is the point —
+         * a count nobody can act on is not a diagnosis, and the remedy is one
+         * command. */
+        doctor_repo_scan scan;
+        memset(&scan, 0, sizeof(scan));
+        scan.report = out;
+        scan.err = err;
+        atlas_status walk = atlas_db_repo_list(ctx->db, doctor_repo_cb, &scan, err);
+        if (walk != ATLAS_OK) {
+            return walk;
+        }
+        return scan.status;
+    }
 }
 
 /* --- repositories -------------------------------------------------------- */
@@ -533,11 +598,19 @@ static atlas_status derive_name(const char *root, char *out, size_t out_size, at
 
 atlas_status atlas_service_repo_add(atlas_ctx *ctx, const char *path, const char *name,
                                     atlas_repo_info *out, atlas_err *err) {
-    return atlas_service_repo_add_db(ctx->db, path, name, false, out, err);
+    return atlas_service_repo_add_db(ctx->db, path, name, false, false, 0, out, err);
+}
+
+atlas_status atlas_service_repo_add_as(atlas_ctx *ctx, const char *path, const char *name,
+                                       bool scanner_uid_given, int64_t scanner_uid,
+                                       atlas_repo_info *out, atlas_err *err) {
+    return atlas_service_repo_add_db(ctx->db, path, name, false, scanner_uid_given, scanner_uid,
+                                     out, err);
 }
 
 atlas_status atlas_service_repo_add_db(atlas_db *db, const char *path, const char *name,
-                                       bool exact_root, atlas_repo_info *out, atlas_err *err) {
+                                       bool exact_root, bool scanner_uid_given,
+                                       int64_t scanner_uid, atlas_repo_info *out, atlas_err *err) {
     atlas_git *g = NULL;
     atlas_status st = atlas_git_open(path, &g, err);
     if (st != ATLAS_OK) {
@@ -597,9 +670,37 @@ atlas_status atlas_service_repo_add_db(atlas_db *db, const char *path, const cha
     ident.is_linked_worktree = atlas_git_is_linked_worktree(g);
     ident.object_format = atlas_git_object_format(g);
 
+    /* A13. Which uid's scanner may read this tree, settled *before* anything is
+     * inserted. A refused uid must leave no repository behind: 0 is how the
+     * column records "no scanner assigned", so a registration that stored it
+     * after a refusal would make the refusal indistinguishable from an absence. */
+    int64_t suid = scanner_uid;
+    if (!scanner_uid_given) {
+        st = atlas_scanner_uid_of_root(root, &suid, err);
+        if (st != ATLAS_OK) {
+            atlas_git_close(g);
+            return st;
+        }
+    }
+    {
+        const char *why = atlas_scanner_uid_refusal(suid);
+        if (why != NULL) {
+            atlas_status refuse =
+                atlas_err_set(err, ATLAS_ERR_USAGE,
+                              "uid %lld cannot be this repository's scanner: %s", (long long)suid,
+                              why);
+            atlas_git_close(g);
+            return refuse;
+        }
+    }
+
     int64_t id = 0;
     st = atlas_db_repo_add(db, effective, &ident, &id, err);
     atlas_git_close(g);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    st = atlas_db_repo_set_scanner_uid(db, id, suid, err);
     if (st != ATLAS_OK) {
         return st;
     }
@@ -611,6 +712,58 @@ atlas_status atlas_service_repo_add_db(atlas_db *db, const char *path, const cha
     if (out != NULL) {
         bool found = false;
         return atlas_db_repo_get(db, effective, out, &found, err);
+    }
+    return ATLAS_OK;
+}
+
+atlas_status atlas_service_repo_set_scanner(atlas_ctx *ctx, const char *name, bool uid_given,
+                                            int64_t uid, atlas_repo_info *out, atlas_err *err) {
+    return atlas_service_repo_set_scanner_db(ctx->db, name, uid_given, uid, out, err);
+}
+
+atlas_status atlas_service_repo_set_scanner_db(atlas_db *db, const char *name, bool uid_given,
+                                               int64_t uid, atlas_repo_info *out,
+                                               atlas_err *err) {
+    atlas_repo_info found_info;
+    atlas_repo_info_init(&found_info);
+    bool found = false;
+    atlas_status st = atlas_db_repo_get(db, name, &found_info, &found, err);
+    if (st == ATLAS_OK && !found) {
+        st = atlas_err_set(err, ATLAS_ERR_REPO, "no repository named \"%s\" is registered", name);
+    }
+    if (st != ATLAS_OK) {
+        atlas_repo_info_free(&found_info);
+        return st;
+    }
+    int64_t id = found_info.id;
+
+    int64_t suid = uid;
+    if (!uid_given) {
+        st = atlas_scanner_uid_of_root(atlas_buf_cstr(&found_info.root_path), &suid, err);
+    }
+    if (st == ATLAS_OK) {
+        const char *why = atlas_scanner_uid_refusal(suid);
+        if (why != NULL) {
+            /* The stored value is left alone. A repository that had a working
+             * scanner must not lose one because a later command named something
+             * impossible. */
+            st = atlas_err_set(err, ATLAS_ERR_USAGE,
+                               "uid %lld cannot be this repository's scanner: %s", (long long)suid,
+                               why);
+        }
+    }
+    atlas_repo_info_free(&found_info);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+
+    st = atlas_db_repo_set_scanner_uid(db, id, suid, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (out != NULL) {
+        bool again = false;
+        return atlas_db_repo_get(db, name, out, &again, err);
     }
     return ATLAS_OK;
 }
@@ -690,7 +843,7 @@ atlas_status atlas_service_scan(atlas_ctx *ctx, const char *name, const atlas_sc
     }
 
     atlas_git *g = NULL;
-    st = atlas_service_open_repo_git(&info, &g, err);
+    st = atlas_service_open_repo_git(&info, atlas_ctx_data_dir(ctx), &g, err);
     if (st == ATLAS_OK) {
         st = atlas_scan_run(ctx->db, g, info.id, opts, summary, err);
     }
@@ -722,11 +875,12 @@ void atlas_status_report_free(atlas_status_report *r) {
  * implementation of "what git says right now" and one definition of head drift.
  * It needs nothing but the report's own `root_path`, which is why the remote
  * path can perform it after fetching the index facts over the socket. */
-atlas_status atlas_service_status_observe_live(atlas_status_report *out, atlas_err *err) {
+atlas_status atlas_service_status_observe_live(atlas_status_report *out, const char *data_dir,
+                                              atlas_err *err) {
     atlas_git *g = NULL;
     atlas_err git_err;
     atlas_err_init(&git_err);
-    atlas_status gst = atlas_git_open(atlas_buf_cstr(&out->repo.root_path), &g, &git_err);
+    atlas_status gst = atlas_repo_open_git(&out->repo, data_dir, &g, NULL, &git_err);
     if (gst == ATLAS_OK) {
         gst = atlas_git_read_head(g, &out->live_head, &git_err);
     }
@@ -767,7 +921,7 @@ atlas_status atlas_service_status(atlas_ctx *ctx, const char *name, atlas_status
         return st;
     }
 
-    return atlas_service_status_observe_live(out, err);
+    return atlas_service_status_observe_live(out, atlas_ctx_data_dir(ctx), err);
 }
 
 /* --- search -------------------------------------------------------------- */

@@ -457,3 +457,58 @@ Stated rather than implied:
 - inotify does not report changes made through a bind mount or on a network
   filesystem that does not implement it. Those repositories are covered only by
   periodic reconciliation, and Atlas has no way to detect that in advance.
+
+## A13 — watching a mirror
+
+A repository the daemon cannot open is watched over the scanner's mirror rather
+than over its own tree. `add_repo` asks `atlas_repo_open_git`, which prefers the
+real root, and takes `root`, `git_dir` and `common_dir` from the adapter's report
+of whatever it opened. All three move together or none does: P0 builds metadata
+watches from the latter two, and a root from one repository with metadata from
+another would rest branch correctness on a tree the source walk never covers.
+
+**A mirror-backed watch makes a weaker claim, and the difference is not a
+detail.** A watch over a readable tree reports a change when the change lands in
+the tree. A watch over a mirror reports it when *the scanner writes it*. The
+index is therefore current as of the scanner's last pass and no sooner, and that
+is what `index_current` means for such a repository. It must never be described
+as equivalent to watching the tree, because it is not.
+
+`repo_watch.from_mirror` records which it is, and every mirror-backed watch owes
+an event gap at build time. Waiting is an event gap — P0's rule — and whatever
+the scanner has not yet written is a change the watch cannot have seen. The gap
+is owed on every build rather than only when the answering source changes: the
+watch set is rebuilt from scratch and has no memory of which tree answered last
+time, so owing one unconditionally is the conservative direction and matches the
+obligation P0 already takes for a rebuilt watch set.
+
+### The measurement this section exists because of
+
+`test_watch_budget`'s case *a temporary ignore failure recovers to watching and
+current on its own* **is flaky under ASan, and was so before A13**. Measured on
+this machine, standalone, unloaded:
+
+| Tree | Passed / failed |
+| --- | --- |
+| `origin/main` (2a80327, pre-A13) | 4 / 2 over 6 runs |
+| A13 without this change | 2 / 2 over 4 runs |
+| A13 with this change | 6 / 4 over 10 runs |
+
+All three sit in the same band. **The change does not make it worse.** This is
+recorded because the change was once reverted on the opposite conclusion, drawn
+from a single passing baseline run and three failing runs taken while a full
+gate matrix was competing for the machine. One passing run is not a baseline for
+a flaky test — which is A9.2.2's own rule, applied to a measurement rather than
+to a claim about a repository.
+
+**What A13 does not do here.** `src/daemon/watch.c` still runs in the daemon.
+Moving it into the scanner, so that inotify is opened by the principal that owns
+the tree, would remove the scanner's write cycle from the latency path entirely.
+It is 3,486 lines, it re-derives P0's budget arithmetic per uid, and it
+duplicates `IN_Q_OVERFLOW` handling — a season of its own, and named here so the
+current bound is not mistaken for the intended one.
+
+**The largest thing A13 leaves open.** A scanner that stops running leaves a
+frozen mirror, and nothing bounds its age: the daemon keeps indexing it and keeps
+reporting the index current. Closing that needs a recorded observation time and a
+staleness rule, and it is a freshness question rather than an authority one.

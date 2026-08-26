@@ -488,7 +488,9 @@ atlas_status atlas_service_diff_repo(const atlas_repo_info *info, const atlas_di
                                      atlas_diff_entry_cb cb, void *ud, atlas_diff_report *report,
                                      atlas_err *err) {
     atlas_git *g = NULL;
-    atlas_status st = atlas_service_open_repo_git(info, &g, err);
+    /* A13: no `ctx` anywhere in this chain, and this is a read an operator
+     * runs against their own tree. NULL means the tree itself. */
+    atlas_status st = atlas_service_open_repo_git(info, NULL, &g, err);
     if (st == ATLAS_OK) {
         st = diff_from_git(g, opts, cb, ud, report, err);
     }

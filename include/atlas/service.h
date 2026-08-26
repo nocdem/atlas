@@ -144,6 +144,9 @@ typedef struct atlas_doctor_report {
      * that silently fell back to per-user mode would otherwise look identical. */
     atlas_syspolicy_state deployment_state;
     atlas_syspolicy_reason deployment_reason;
+    /* A13. How many registered repositories have no scanner uid. Each is named
+     * in `problems`: a count nobody can act on is not a diagnosis. */
+    int repos_without_scanner;
     bool ok;                  /* no blocking problem found */
     atlas_buf problems;       /* newline-separated, empty when ok */
 } atlas_doctor_report;
@@ -154,8 +157,14 @@ atlas_status atlas_service_doctor(atlas_ctx *ctx, atlas_doctor_report *out, atla
 
 /* --- repositories ------------------------------------------------------- */
 
+/* Derives the scanner uid from the repository root's owner. Use
+ * `atlas_service_repo_add_as` to name one instead. */
 atlas_status atlas_service_repo_add(atlas_ctx *ctx, const char *path, const char *name,
                                     atlas_repo_info *out, atlas_err *err);
+/* As above, but with the operator's own choice of scanner uid. */
+atlas_status atlas_service_repo_add_as(atlas_ctx *ctx, const char *path, const char *name,
+                                       bool scanner_uid_given, int64_t scanner_uid,
+                                       atlas_repo_info *out, atlas_err *err);
 atlas_status atlas_service_repo_list(atlas_ctx *ctx, atlas_repo_cb cb, void *ud, int64_t *count_out,
                                      atlas_err *err);
 /* Removes Atlas metadata only. The target repository is never touched. */
@@ -241,10 +250,31 @@ atlas_status atlas_service_history(atlas_ctx *ctx, const char *name, const char 
  * root means something narrower — *this* directory — so registering its parent
  * would index files outside what was granted. The MCP adapter therefore asks for
  * the exact form; the CLI and the session-start hook do not. */
+/* A13. `scanner_uid_given` false derives the scanner uid from the repository
+ * root's owner; true takes `scanner_uid` as the operator's own choice. The flag
+ * is separate from the value because 0 already means "no scanner assigned" in
+ * the column and cannot also mean "derive one". A uid that may never scan fails
+ * the registration rather than being stored, so a refusal never reads as an
+ * absence. `out->scanner_uid` carries what was stored. */
 atlas_status atlas_service_repo_add_db(atlas_db *db, const char *path, const char *name,
-                                       bool exact_root, atlas_repo_info *out, atlas_err *err);
+                                       bool exact_root, bool scanner_uid_given,
+                                       int64_t scanner_uid, atlas_repo_info *out, atlas_err *err);
 atlas_status atlas_service_repo_remove_db(atlas_db *db, const char *name, atlas_repo_info *removed,
                                           atlas_err *err);
+
+/* A13. Assigns `name`'s scanner uid without re-registering it, which is the
+ * only path a repository registered before A13 has: migration 27 could not
+ * `stat` a root, so it left every existing repository unassigned.
+ *
+ * Derives from the repository root's owner when `uid_given` is false. The same
+ * refusals apply as at registration, and a refusal leaves the stored value
+ * alone — a repository that had a working scanner must not lose one because a
+ * later command named something impossible. `out` is filled by re-reading the
+ * row, so the caller sees what is stored rather than what was asked for. */
+atlas_status atlas_service_repo_set_scanner(atlas_ctx *ctx, const char *name, bool uid_given,
+                                            int64_t uid, atlas_repo_info *out, atlas_err *err);
+atlas_status atlas_service_repo_set_scanner_db(atlas_db *db, const char *name, bool uid_given,
+                                               int64_t uid, atlas_repo_info *out, atlas_err *err);
 
 /* --- A1: daemon-facing reports ------------------------------------------ */
 
@@ -1225,6 +1255,16 @@ atlas_status atlas_service_job_run_status(atlas_ctx *ctx, const char *run, atlas
  * start, not a loop that idles. */
 atlas_status atlas_service_dispatcher_run(bool once, FILE *log, atlas_err *err);
 
+/* A13. Asks the daemon which repositories this uid may scan.
+ *
+ * Opens no index, takes no lock and holds no database handle: every answer
+ * comes over the socket, which is why the CLI dispatches it before any
+ * `atlas_ctx` exists. `once` asks a single time and returns; without it the
+ * command refuses, because the polling loop is a later plan and a process that
+ * idled instead of saying so would look healthy while doing nothing. Logs to
+ * `log` so a systemd user unit captures them in the journal. */
+atlas_status atlas_service_scanner_run(bool once, FILE *log, atlas_err *err);
+
 /* --- A12.0: the plan domain's four calls ------------------------------------
  *
  * The wire half of the plan commands, in `src/core/service_plan.c`. Like every
@@ -1759,7 +1799,10 @@ atlas_status atlas_service_sem_index(atlas_ctx *ctx, const char *name, const cha
  * pass produces: the generation is byte for byte what it would have been. NULL
  * is the ordinary case, and is what the CLI passes: a local `code index` has one
  * thread and nothing else waiting for it. */
-atlas_status atlas_sem_index_on(atlas_db *db, const atlas_repo_info *repo,
+/* A13: `data_dir` is where a mirror lives, or NULL for the tree itself -- see
+ * `atlas_repo_open_git`. A semantic pass reads sources, so a repository the
+ * daemon cannot open is one it can never index. */
+atlas_status atlas_sem_index_on(atlas_db *db, const char *data_dir, const atlas_repo_info *repo,
                                 const char *const *compdbs, size_t compdb_count, bool rebuild,
                                 void (*yield)(void *ud), void *yield_ud,
                                 atlas_sem_index_summary *out, atlas_err *err);

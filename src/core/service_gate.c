@@ -242,7 +242,11 @@ static atlas_status build_env(atlas_db *db, const atlas_repo_info *info,
     atlas_git *g = NULL;
     atlas_err probe;
     atlas_err_init(&probe);
-    if (atlas_service_open_repo_git(info, &g, &probe) != ATLAS_OK) {
+    /* A13: `atlas_gate_run` takes a database and no context, so there is no
+     * data directory to pass. A daemon-side gate against a tree the daemon
+     * cannot read fails closed, which is the direction A6 requires but is
+     * still a failure; widening the gate contract belongs in its own change. */
+    if (atlas_service_open_repo_git(info, NULL, &g, &probe) != ATLAS_OK) {
         atlas_gate_env_note(env, ATLAS_GATE_REASON_INDEX_LAG);
         return ATLAS_OK;
     }

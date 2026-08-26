@@ -4234,6 +4234,27 @@ static const char M26_VERIFY[] =
 
 static const char *const M26_STATEMENTS[] = {M26_SNAPSHOT, M26_STATE, M26_VERIFY, NULL};
 
+/* A13. Which uid's scanner may report facts about this repository.
+ *
+ * The daemon cannot read a tree it does not own — measured on the machine that
+ * produced this season: 112 unreadable files under one repository's `.git` and
+ * 59 unenterable directories under another's worktree, so one repository could
+ * not be opened at all and the other could never clear an event gap. A scanner
+ * running as the tree's owner is the answer, and this column is which uid that
+ * is.
+ *
+ * The default is 0 and 0 means **unassigned**, never "uid 0": root is refused
+ * as a scanner uid in `atlas_scanner_uid_refusal`, precisely so that the two
+ * cannot be confused. A repository registered before A13 therefore has no
+ * scanner and is not given one here. A migration cannot `stat` a root, and
+ * inventing an assignment nobody expressed is migration 19's mistake — a
+ * default carries no information. `atlas repo scanner` is how an operator
+ * assigns one, and `atlas doctor` names every repository still waiting. */
+static const char M27_SCANNER_UID[] =
+    "ALTER TABLE repositories ADD COLUMN scanner_uid INTEGER NOT NULL DEFAULT 0;";
+
+static const char *const M27_STATEMENTS[] = {M27_SCANNER_UID, NULL};
+
 static const atlas_migration MIGRATIONS[] = {
     {1, "initial schema", M1_STATEMENTS, false},
     {2, "worktree identity", M2_STATEMENTS, false},
@@ -4322,6 +4343,10 @@ static const atlas_migration MIGRATIONS[] = {
      * the three counts default to 0 meaning "not reported", never "none". */
     {26, "the watch budget names the bound it reached, and priming is a state",
      M26_STATEMENTS, false},
+    /* Additive: one column, no table rebuilt, so foreign keys stay enforced and
+     * no existing row is rewritten. See the M27 comment for why the default is
+     * 0-meaning-unassigned rather than a derived uid. */
+    {27, "which uid's scanner may report about a repository", M27_STATEMENTS, false},
 };
 
 const atlas_migration *atlas_migrations(size_t *count_out) {

@@ -151,6 +151,7 @@ static atlas_status j_doctor(atlas_renderer *r, const atlas_doctor_report *rep, 
     TRY(json_safe(j, p, "integrity_check", atlas_buf_cstr(&rep->integrity), err));
     TRY(json_safe(j, p, "foreign_key_check", atlas_buf_cstr(&rep->foreign_key_check), err));
     TRY(atlas_json_key_int(j, "repositories", rep->repo_count, err));
+    TRY(atlas_json_key_int(j, "repositories_without_scanner", rep->repos_without_scanner, err));
     /* A7. Closed vocabularies, so no encoding is needed or wanted. */
     TRY(atlas_json_key_str(j, "operator_authority",
                            rep->authority_state == ATLAS_AUTHORITY_GRANTED ? "granted" : "locked",
@@ -206,6 +207,7 @@ static atlas_status repo_body(atlas_renderer *r, const atlas_repo_info *ri, atla
     TRY(json_safe_bytes(j, p, "git_dir", ri->git_dir.data, ri->git_dir.len, err));
     TRY(atlas_json_key_bool(j, "is_linked_worktree", ri->is_linked_worktree, err));
     TRY(atlas_json_key_str(j, "object_format", ri->object_format, err));
+    TRY(atlas_json_key_int(j, "scanner_uid", ri->scanner_uid, err));
     TRY(atlas_json_key_str(j, "registered_at", ri->registered_at, err));
     TRY(atlas_json_key_str_opt(j, "last_scan_at",
                                ri->last_scan_at[0] != '\0' ? ri->last_scan_at : NULL, err));
@@ -227,6 +229,14 @@ static atlas_status j_repo_item(atlas_renderer *r, const atlas_repo_info *ri, at
     TRY(repo_body(r, ri, err));
     return atlas_json_obj_end(r->j, err);
 }
+/* A13. `repo scanner`. The whole result is the assignment; the repository body
+ * would bury it and `repo list` already carries the rest. */
+static atlas_status j_repo_scanner_set(atlas_renderer *r, const atlas_repo_info *ri,
+                                       atlas_err *err) {
+    TRY(atlas_json_key_str(r->j, "repo", ri->name, err));
+    return atlas_json_key_int(r->j, "scanner_uid", ri->scanner_uid, err);
+}
+
 
 static atlas_status j_repo_added(atlas_renderer *r, const atlas_repo_info *ri, atlas_err *err) {
     TRY(atlas_json_key(r->j, "repository", err));
@@ -2560,6 +2570,7 @@ static atlas_status j_plan_item(atlas_renderer *r, const atlas_plan_render *pr, 
 const atlas_renderer_vtbl ATLAS_RENDERER_JSON = {
     j_begin,      j_end,          j_note_repo,    j_note_query,   j_list_begin,
     j_list_end,   j_doctor,       j_version,      j_repo_item,    j_repo_added,
+    j_repo_scanner_set,
     j_repo_removed, j_scan,       j_status,       j_search_item,  j_file,
     j_history_item, j_diff_begin, j_diff_item,    j_diff_end,
     j_job_item,

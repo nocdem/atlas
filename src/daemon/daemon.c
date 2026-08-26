@@ -198,8 +198,8 @@ atlas_status atlas_daemon_run(const atlas_daemon_opts *opts, FILE *log, atlas_er
          * the only writable handle. That row is diagnostic only: the lock, not
          * the row, is what proves a daemon is running, since a killed daemon
          * leaves the row behind and the released lock is what disproves it. */
-        st = atlas_writer_start(atlas_buf_cstr(&db_path), atlas_buf_cstr(&socket_path), workers,
-                                log, &writer, err);
+        st = atlas_writer_start(atlas_buf_cstr(&db_path), atlas_buf_cstr(&data_dir),
+                                atlas_buf_cstr(&socket_path), workers, log, &writer, err);
     }
     if (st != ATLAS_OK) {
         goto done;
@@ -235,7 +235,8 @@ atlas_status atlas_daemon_run(const atlas_daemon_opts *opts, FILE *log, atlas_er
      * flag: `atlas_daemon_opts.watch_budget_total` exists for the acceptance
      * harness in `tests/tools/atlas_watch_daemon.c`. */
     wopts.inject_budget_total = opts->watch_budget_total;
-    st = atlas_watcher_start(atlas_buf_cstr(&db_path), writer, log, &wopts, &watcher, err);
+    st = atlas_watcher_start(atlas_buf_cstr(&db_path), atlas_buf_cstr(&data_dir), writer, log,
+                             &wopts, &watcher, err);
     if (st != ATLAS_OK) {
         goto done;
     }

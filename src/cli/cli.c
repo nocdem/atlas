@@ -7,6 +7,7 @@
 #include "atlas/cli.h"
 
 #include <stdio.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -68,6 +69,7 @@ void atlas_cli_print_help(FILE *out) {
         "  job run-status RUN        what a run is waiting on, and how it ended\n"
         "  job get|cancel JOB        read or cancel one job\n"
         "  job list                  jobs this principal submitted\n"
+        "  scanner run --once         ask the daemon which repositories this uid may scan\n"
         "  dispatcher run [--once]   run the job dispatcher (as atlas-worker)\n"
         ,
         ATLAS_VERSION_STRING, ATLAS_PHASE);
@@ -85,8 +87,11 @@ void atlas_cli_print_help(FILE *out) {
         "  plan show PLAN --rev N    one revision's plan document (untrusted)\n"
         "  plan list                 plans this principal created\n"
         "  doctor                     check the environment, database and search backend\n"
-        "  repo add PATH [--name N]   register a git repository (read-only)\n"
+        "  repo add PATH [--name N] [--scanner-uid UID]\n"
+        "                             register a git repository (read-only)\n"
         "  repo list                  list registered repositories\n"
+        "  repo scanner NAME [--scanner-uid UID]\n"
+        "                             which uid's scanner may read this repository\n"
         "  repo remove NAME --yes     forget a repository; never touches the repository\n"
         "  scan NAME                  index tracked files and git history\n"
         "  status NAME                show indexed state next to live git state\n"
@@ -815,6 +820,24 @@ static atlas_status parse_args(cli_state *st, int argc, char **argv, bool *want_
                 }
                 st->operands[st->operand_count++] = "--name";
                 st->operands[st->operand_count++] = a + 7;
+            } else if (strcmp(a, "--scanner-uid") == 0) {
+                /* A13. Belongs to `repo add` and `repo scanner`; collected as an
+                 * operand so the command validates its placement, exactly as
+                 * `--name` is. */
+                if (i + 1 >= argc) {
+                    return atlas_err_set(err, ATLAS_ERR_USAGE, "--scanner-uid needs a value");
+                }
+                if (st->operand_count + 2u > sizeof(st->operands) / sizeof(st->operands[0])) {
+                    return atlas_err_set(err, ATLAS_ERR_USAGE, "too many arguments");
+                }
+                st->operands[st->operand_count++] = a;
+                st->operands[st->operand_count++] = argv[++i];
+            } else if (strncmp(a, "--scanner-uid=", 14u) == 0) {
+                if (st->operand_count + 2u > sizeof(st->operands) / sizeof(st->operands[0])) {
+                    return atlas_err_set(err, ATLAS_ERR_USAGE, "too many arguments");
+                }
+                st->operands[st->operand_count++] = "--scanner-uid";
+                st->operands[st->operand_count++] = a + 14;
             } else if (strcmp(a, "--limit") == 0) {
                 if (i + 1 >= argc) {
                     return atlas_err_set(err, ATLAS_ERR_USAGE, "--limit needs a number");
@@ -868,6 +891,42 @@ static atlas_status take_name(cli_state *st, const char **name_out, atlas_err *e
                 return atlas_err_set(err, ATLAS_ERR_USAGE, "--name needs a value");
             }
             *name_out = st->operands[i + 1u];
+            i++;
+            continue;
+        }
+        st->operands[w++] = st->operands[i];
+    }
+    st->operand_count = w;
+    return ATLAS_OK;
+}
+
+/* A13. `--scanner-uid N`, for `repo add` and `repo scanner`.
+ *
+ * `*given_out` stays false when the flag is absent, which is what selects
+ * "derive from the repository root's owner". The flag is separate from the
+ * value because 0 already means "no scanner assigned" and cannot also mean
+ * "derive one". A value that is not a plain non-negative integer is a usage
+ * error rather than a silent 0. */
+static atlas_status take_scanner_uid(cli_state *st, bool *given_out, int64_t *uid_out,
+                                     atlas_err *err) {
+    *given_out = false;
+    *uid_out = 0;
+    size_t w = 0;
+    for (size_t i = 0; i < st->operand_count; i++) {
+        if (strcmp(st->operands[i], "--scanner-uid") == 0) {
+            if (i + 1u >= st->operand_count) {
+                return atlas_err_set(err, ATLAS_ERR_USAGE, "--scanner-uid needs a value");
+            }
+            const char *v = st->operands[i + 1u];
+            char *end = NULL;
+            errno = 0;
+            long long parsed = strtoll(v, &end, 10);
+            if (errno != 0 || end == v || *end != '\0' || parsed < 0) {
+                return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                     "--scanner-uid takes a non-negative integer uid");
+            }
+            *given_out = true;
+            *uid_out = (int64_t)parsed;
             i++;
             continue;
         }
@@ -1256,7 +1315,8 @@ static atlas_ctx_mode mode_for(const cli_state *st) {
         return ATLAS_CTX_READ;
     }
     if (strcmp(cmd, "repo") == 0 && st->operand_count > 0 &&
-        (strcmp(st->operands[0], "add") == 0 || strcmp(st->operands[0], "remove") == 0)) {
+        (strcmp(st->operands[0], "add") == 0 || strcmp(st->operands[0], "remove") == 0 ||
+         strcmp(st->operands[0], "scanner") == 0)) {
         return ATLAS_CTX_WRITE;
     }
     return ATLAS_CTX_AUTO;
@@ -2540,7 +2600,7 @@ static bool is_a_command(const char *cmd) {
     static const char *const COMMANDS[] = {
         "doctor",  "repo",    "scan",      "status",  "search",  "file",     "history",
         "diff",    "daemon",  "sync",      "events",  "code",    "decision", "gate",
-        "job",     "dispatcher", "backup", "maintenance", "service", "mcp",  "hook",
+        "job",     "dispatcher", "scanner", "backup", "maintenance", "service", "mcp", "hook",
         "integrate", "version", "help", "context", "operation", "api-key", "gateway",
         "verify",   "plan",
     };
@@ -3531,6 +3591,13 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
         return s;
     }
 
+    bool repo_scanner_uid_given = false;
+    int64_t repo_scanner_uid = 0;
+    s = take_scanner_uid(st, &repo_scanner_uid_given, &repo_scanner_uid, err);
+    if (s != ATLAS_OK) {
+        return s;
+    }
+
     /* Commands that own their own lifecycle, before any context is opened. */
     if (strcmp(cmd, "daemon") == 0 && st->operand_count > 0 &&
         strcmp(st->operands[0], "run") == 0) {
@@ -3609,7 +3676,8 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
          * applied to the registry for the same reason: "the daemon must be
          * stopped" is then enforced by the kernel rather than promised in a
          * manual. */
-        if (strcmp(st->operands[0], "add") == 0 || strcmp(st->operands[0], "remove") == 0) {
+        if (strcmp(st->operands[0], "add") == 0 || strcmp(st->operands[0], "remove") == 0 ||
+            strcmp(st->operands[0], "scanner") == 0) {
             /* One line, and no embedded newlines.
              *
              * An error message is untrusted-text-encoded on its way to the
@@ -3714,6 +3782,23 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
         memset(&pr, 0, sizeof(pr));
         int64_t limit = st->opts.limit > 0 ? st->opts.limit : ATLAS_DEFAULT_LIMIT;
         return run_plan(st, &pr, limit, err);
+    }
+
+    /* A13. The scanner, dispatched here — before any `atlas_ctx` is opened —
+     * for the reason `gateway run` is: it opens no index at all, and every
+     * answer it gives comes over the daemon socket. A context in AUTO mode
+     * would take the writer lock when it is free, which a scanner must never
+     * do: the daemon owns the writer and the scanner is one of its clients. */
+    if (strcmp(cmd, "scanner") == 0) {
+        const char *sub = st->operand_count > 0 ? st->operands[0] : NULL;
+        if (sub == NULL || strcmp(sub, "run") != 0) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE, "usage: atlas scanner run --once");
+        }
+        /* `--once` sets `opts.run_once`: it is matched by the first of two
+         * branches for that flag in the parser's else-if chain, and the second
+         * (`opts.job.once`) is unreachable. Verified by running the built
+         * binary, which is the only way this kind of thing surfaces. */
+        return atlas_service_scanner_run(st->opts.run_once, st->errout, err);
     }
 
     if (strcmp(cmd, "dispatcher") == 0) {
@@ -4154,7 +4239,7 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
     } else if (strcmp(cmd, "repo") == 0) {
         if (st->operand_count == 0) {
             result = atlas_err_set(err, ATLAS_ERR_USAGE,
-                                   "usage: atlas repo add|list|remove ...");
+                                   "usage: atlas repo add|list|remove|scanner ...");
         /* A7 removed every model-reachable route into the registry — there is
          * no `repo.add`, `repo.ensure` or `repo.remove` RPC method, no MCP
          * tool, and no hook that registers. What is left is this local command,
@@ -4164,15 +4249,40 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
         } else if (strcmp(st->operands[0], "add") == 0) {
             if (st->operand_count != 2u) {
                 result = atlas_err_set(err, ATLAS_ERR_USAGE,
-                                       "usage: atlas repo add PATH [--name NAME]");
+                                       "usage: atlas repo add PATH [--name NAME] [--scanner-uid UID]");
             } else {
                 atlas_repo_info info;
                 atlas_repo_info_init(&info);
-                result = atlas_service_repo_add(ctx, st->operands[1], repo_arg_name, &info, err);
+                result = atlas_service_repo_add_as(ctx, st->operands[1], repo_arg_name,
+                                                   repo_scanner_uid_given, repo_scanner_uid, &info,
+                                                   err);
                 if (result == ATLAS_OK) {
                     result = renderer_open(&r, st->opts.json, st->out, "repo add", err);
                     if (result == ATLAS_OK) {
                         result = r.v->repo_added(&r, &info, err);
+                    }
+                    if (result == ATLAS_OK) {
+                        result = renderer_close(&r, err);
+                    } else {
+                        renderer_abort(&r);
+                    }
+                }
+                atlas_repo_info_free(&info);
+            }
+        } else if (strcmp(st->operands[0], "scanner") == 0) {
+            if (st->operand_count != 2u) {
+                result = atlas_err_set(err, ATLAS_ERR_USAGE,
+                                       "usage: atlas repo scanner NAME [--scanner-uid UID]");
+            } else {
+                atlas_repo_info info;
+                atlas_repo_info_init(&info);
+                result = atlas_service_repo_set_scanner(ctx, st->operands[1],
+                                                        repo_scanner_uid_given, repo_scanner_uid,
+                                                        &info, err);
+                if (result == ATLAS_OK) {
+                    result = renderer_open(&r, st->opts.json, st->out, "repo scanner", err);
+                    if (result == ATLAS_OK) {
+                        result = r.v->repo_scanner_set(&r, &info, err);
                     }
                     if (result == ATLAS_OK) {
                         result = renderer_close(&r, err);

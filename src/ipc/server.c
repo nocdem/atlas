@@ -1237,6 +1237,24 @@ atlas_status atlas_server_dispatch(atlas_server_ctx *ctx, const void *payload, s
             }
         }
     }
+    /* A13. The scanner group, consulted with no uid predicate.
+     *
+     * Every group above is offered only to a peer some root-owned policy names,
+     * and each of those policies is in memory here. A scanner's identity is
+     * not: it is `repositories.scanner_uid`, and the database is opened below,
+     * after this lookup. So the name is dispatchable and `require_scanner`
+     * makes the real check where the database exists — the orchestration client
+     * group's arrangement, and the same reasoning as the comment above it. */
+    if (fn == NULL) {
+        size_t n = 0;
+        const atlas_method_entry *g = atlas_server_scanner_methods(&n);
+        for (size_t i = 0; i < n; i++) {
+            if (strcmp(atlas_ipc_request_method(req), g[i].name) == 0) {
+                fn = g[i].fn;
+                break;
+            }
+        }
+    }
     if (fn == NULL) {
         atlas_err merr;
         atlas_err_init(&merr);

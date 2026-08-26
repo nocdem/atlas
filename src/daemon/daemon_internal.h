@@ -17,6 +17,7 @@
 #include "atlas/daemon.h"
 #include "atlas/db.h"
 #include "atlas/decision_ops.h"
+#include "atlas/git.h"
 #include "atlas/maintenance.h"
 #include "atlas/ops.h"
 #include "atlas/orch_ops.h"
@@ -325,15 +326,14 @@ typedef struct atlas_writer_result {
 
 void atlas_writer_result_init(atlas_writer_result *r);
 void atlas_writer_result_free(atlas_writer_result *r);
-
 typedef struct atlas_writer atlas_writer;
 
 /* Starts the writer thread. It opens its own writable database handle from
  * `db_path`; no handle is passed in, because a handle created on another thread
  * and used here is exactly the sharing the model forbids. */
-atlas_status atlas_writer_start(const char *db_path, const char *socket_path,
-                                atlas_workers *workers, FILE *log, atlas_writer **out,
-                                atlas_err *err);
+atlas_status atlas_writer_start(const char *db_path, const char *data_dir,
+                                const char *socket_path, atlas_workers *workers, FILE *log,
+                                atlas_writer **out, atlas_err *err);
 void atlas_writer_stop(atlas_writer *w);
 
 /* Queues a reconciliation. Coalesces with an already-pending pass for the same
@@ -571,7 +571,8 @@ typedef struct atlas_watcher_opts {
 
 void atlas_watcher_opts_init(atlas_watcher_opts *o);
 
-atlas_status atlas_watcher_start(const char *db_path, atlas_writer *writer, FILE *log,
+atlas_status atlas_watcher_start(const char *db_path, const char *data_dir,
+                                 atlas_writer *writer, FILE *log,
                                  const atlas_watcher_opts *opts, atlas_watcher **out,
                                  atlas_err *err);
 void atlas_watcher_stop(atlas_watcher *w);

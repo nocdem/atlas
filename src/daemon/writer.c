@@ -28,6 +28,7 @@
 #include "atlas/sem.h"
 #include "atlas/sem_ops.h"
 #include "atlas/service.h"
+#include "atlas/mirror.h"
 #include "daemon/daemon_internal.h"
 
 struct atlas_writer {
@@ -564,9 +565,8 @@ static void run_reconcile(atlas_writer *w, atlas_job *j) {
 
     atlas_git *g = NULL;
     bool from_mirror = false;
-    if (atlas_daemon_open_index_root(atlas_buf_cstr(&w->data_dir), j->repo_id,
-                                     atlas_buf_cstr(&info.root_path), &g, &from_mirror,
-                                     &err) != ATLAS_OK) {
+    if (atlas_repo_open_git(&info, atlas_buf_cstr(&w->data_dir), &g, &from_mirror, &err) !=
+        ATLAS_OK) {
         atlas_daemon_log(w->log, "warn", "repository %s cannot be opened: %s",
                          atlas_safe(&safe, info.name), atlas_safe(&safe, atlas_err_msg(&err)));
         atlas_err ignore;

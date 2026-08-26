@@ -326,26 +326,6 @@ typedef struct atlas_writer_result {
 
 void atlas_writer_result_init(atlas_writer_result *r);
 void atlas_writer_result_free(atlas_writer_result *r);
-
-/* Opens the repository a pass should index, preferring the tree itself.
- *
- * A13. `atlasd` is its own principal, so a registered tree it cannot read is
- * one it can never index — measured on a live machine, where the daemon logged
- * "repository ... cannot be opened" every ten seconds against a repository that
- * was perfectly intact. The scanner's mirror is the answer, and Plan 5 made it
- * a real repository precisely so that this is a different root and nothing
- * else: reconcile, A3, the semantic layer, snapshots and gates are unchanged
- * and never learn which one they were handed.
- *
- * The real root is tried first and the mirror only on its failure. Reading the
- * thing itself is better evidence than reading a copy of it, so the fallback
- * must never quietly become the preference. `from_mirror` reports which
- * answered; on failure `*out` is NULL and the error is the *real* root's,
- * because that is the one an operator has to act on.
- */
-atlas_status atlas_daemon_open_index_root(const char *data_dir, int64_t repo_id,
-                                          const char *root_path, atlas_git **out,
-                                          bool *from_mirror, atlas_err *err);
 typedef struct atlas_writer atlas_writer;
 
 /* Starts the writer thread. It opens its own writable database handle from

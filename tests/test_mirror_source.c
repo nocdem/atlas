@@ -39,6 +39,9 @@ static void make_info(atlas_repo_info *info, int64_t id, const char *root, int64
     atlas_repo_info_init(info);
     info->id = id;
     info->scanner_uid = scanner_uid;
+    /* The ordinary case: a run finished and skipped nothing. The test that
+     * asserts an incomplete mirror is refused clears this deliberately. */
+    info->mirror_complete = true;
     T_OK(atlas_buf_set_str(&info->root_path, root, err), err);
 }
 
@@ -307,12 +310,43 @@ static void test_the_real_roots_status_survives(void) {
     fx_close(&fx);
 }
 
+/* **An incomplete mirror is refused, not read.**
+ *
+ * The daemon reads the mirror as the repository, so every file the mirror does
+ * not hold is a file that no longer exists. Measured on the first live run: a
+ * mirror carrying 2007 of a tree's 22012 files produced 20000 deletions. The
+ * mirror here is a perfectly good git repository -- it is the *claim about it*
+ * that is missing, and that alone must be enough to refuse. */
+static void test_an_incomplete_mirror_is_refused(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    fixture fx;
+    T_REQUIRE(fx_open(&fx, &err) == ATLAS_OK);
+
+    char oid[ATLAS_OID_HEX_MAX_INCL];
+    T_OK(build_mirror(&fx, 7, oid, &err), &err);
+
+    atlas_repo_info info;
+    make_info(&info, 7, fx_repo(&fx), not_me(), &err);
+    info.mirror_complete = false;
+
+    atlas_git *g = NULL;
+    bool from_mirror = false;
+    atlas_status st = atlas_repo_open_git(&info, fx_data_dir(&fx), &g, &from_mirror, &err);
+    T_CHECK_MSG(st != ATLAS_OK, "a mirror no run has vouched for is not read");
+    T_CHECK_MSG(g == NULL, "and nothing is handed back to close");
+
+    atlas_repo_info_free(&info);
+    fx_close(&fx);
+}
+
 static const atlas_test TESTS[] = {
     {"a scanner-backed repo reads its mirror", test_a_scanner_backed_repo_reads_its_mirror},
     {"a readable root is ignored", test_a_readable_root_is_ignored},
     {"no scanner means no mirror", test_no_scanner_means_no_mirror},
     {"a NULL data dir never consults a mirror", test_null_data_dir_never_consults_a_mirror},
     {"a named scanner without a mirror refuses", test_a_named_scanner_without_a_mirror_refuses},
+    {"an incomplete mirror is refused", test_an_incomplete_mirror_is_refused},
     {"the shared helper accepts a mirror", test_shared_helper_accepts_a_mirror},
     {"the real root's status survives", test_the_real_roots_status_survives},
 };

@@ -72,6 +72,21 @@ atlas_status atlas_repo_open_git(const atlas_repo_info *info, const char *data_d
                                  "for a caller that may not use the mirror",
                                  (long long)info->id);
         }
+        /* An incomplete mirror is not a repository, and the daemon reads it as
+         * one. Measured on the first live run: a mirror carrying 2007 of a
+         * tree's 22012 files made the daemon record 20000 deletions, because
+         * every file the mirror does not hold is a file that no longer exists.
+         *
+         * So a mirror is read only when the run that wrote it said it finished
+         * and skipped nothing. Anything else is refused, exactly as a missing
+         * mirror is: waiting is the correct answer, and the tree is never the
+         * fallback. */
+        if (!info->mirror_complete) {
+            return atlas_err_set(err, ATLAS_ERR_REPO,
+                                 "repository %lld has no complete mirror yet, so there is "
+                                 "nothing for this process to read",
+                                 (long long)info->id);
+        }
         atlas_buf path = ATLAS_BUF_INIT;
         atlas_status st = atlas_mirror_repo_path(data_dir, info->id, &path, err);
         if (st != ATLAS_OK) {

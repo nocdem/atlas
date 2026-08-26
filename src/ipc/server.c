@@ -597,6 +597,16 @@ static atlas_status write_repo_registration(dispatch_state *ds, const atlas_repo
         st = atlas_json_key_str(ds->j, "git_dir", atlas_buf_cstr(&enc), err);
     }
     atlas_buf_free(&enc);
+    /* A13. The mirror's own state travels with the row it describes: whether the
+     * run that wrote it finished without skipping anything, and when. A reader
+     * that cannot name when a mirror was last whole cannot honestly call an
+     * index built from it current. */
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(ds->j, "mirror_complete", ri->mirror_complete, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "mirror_at", ri->mirror_at, err);
+    }
     /* A13. Which uid's scanner may report about this repository, and therefore
      * which tree the daemon is reading. It was on the row and in the local
      * renderer from the first commit of the season and **not on the wire**, so

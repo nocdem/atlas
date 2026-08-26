@@ -23,6 +23,7 @@
  * authorisation, and reaching a name is never the same as being allowed to use
  * it.
  */
+#include "atlas/atlas.h"
 #include "atlas/db.h"
 #include "atlas/ipc.h"
 #include "atlas/safetext.h"
@@ -266,9 +267,59 @@ static atlas_status method_scanner_put(dispatch_state *ds, const atlas_ipc_reque
     return atlas_json_key_int(ds->j, "written", (int64_t)written, err);
 }
 
+/* A13. Tells the daemon what a run claims about the mirror it just wrote.
+ *
+ * Two calls per repository per run. `complete=false` at the start is what makes
+ * a crash leave the mirror refused rather than trusted: the value that survives
+ * a failure is the one that costs a refusal, never the one that costs a delete
+ * sweep against a half-written tree.
+ *
+ * The peer is checked exactly as `scanner.put` checks it — being some
+ * repository's scanner is not being *this* repository's. */
+static atlas_status method_scanner_state(dispatch_state *ds, const atlas_ipc_request *req,
+                                         atlas_err *err) {
+    atlas_status st = require_scanner(ds, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    int64_t repo_id = 0;
+    if (!atlas_ipc_param_int(req, "repo", &repo_id)) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "a mirror state needs a repository id");
+    }
+    bool complete = false;
+    (void)atlas_ipc_param_bool(req, "complete", &complete);
+
+    atlas_repo_info ri;
+    atlas_repo_info_init(&ri);
+    bool found = false;
+    st = atlas_db_repo_get_by_id(ds->db, repo_id, &ri, &found, err);
+    if (st == ATLAS_OK && !found) {
+        st = atlas_err_set(err, ATLAS_ERR_REPO, "no repository has that id");
+    }
+    if (st == ATLAS_OK && !peer_owns(ds, &ri)) {
+        st = atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                           "uid %lld is not this repository's scanner", (long long)ds->peer_uid);
+    }
+    atlas_repo_info_free(&ri);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+
+    /* The time is Atlas', not the caller's. A scanner reporting when it thinks
+     * it finished would let a clock decide whether an index is current. */
+    char now[32];
+    atlas_now_iso8601(now, sizeof(now));
+    st = atlas_db_repo_set_mirror_state(ds->db, repo_id, complete, now, err);
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(ds->j, "complete", complete, err);
+    }
+    return st;
+}
+
 static const atlas_method_entry SCANNER_METHODS[] = {
     {"scanner.poll", method_scanner_poll},
     {"scanner.put", method_scanner_put},
+    {"scanner.state", method_scanner_state},
 };
 
 const atlas_method_entry *atlas_server_scanner_methods(size_t *count_out) {

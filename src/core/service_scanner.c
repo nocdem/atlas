@@ -74,6 +74,24 @@ typedef struct walk_ctx {
     int64_t skipped_unreadable;
 } walk_ctx;
 
+/* A13. Tells the daemon a run is starting, which clears `mirror_complete`.
+ *
+ * Before the first byte, so a crash anywhere in the walk leaves the mirror
+ * refused rather than read as whole. */
+static atlas_status say_state(walk_ctx *w, bool complete) {
+    atlas_buf params = ATLAS_BUF_INIT;
+    atlas_status st = atlas_buf_appendf(&params, w->err, "{\"repo\":%lld,\"complete\":%s}",
+                                        (long long)w->repo_id, complete ? "true" : "false");
+    atlas_buf raw = ATLAS_BUF_INIT;
+    if (st == ATLAS_OK) {
+        st = atlas_ipc_call(w->socket_path, "scanner.state", atlas_buf_cstr(&params), &raw,
+                            w->err);
+    }
+    atlas_buf_free(&raw);
+    atlas_buf_free(&params);
+    return st;
+}
+
 /* Sends one file's bytes as hex, in chunks the transport can carry.
  *
  * The wire carries bytes, not text: a source file may hold a quote, a newline,
@@ -395,6 +413,14 @@ atlas_status atlas_service_scanner_run(bool once, FILE *log, atlas_err *err) {
         w.log = log;
         w.err = err;
         w.status = ATLAS_OK;
+        /* Cleared before anything is written, so a crash leaves the mirror
+         * refused rather than trusted. */
+        if (say_state(&w, false) != ATLAS_OK) {
+            st = w.err != NULL ? ATLAS_ERR_INTERNAL : ATLAS_ERR_INTERNAL;
+            atlas_git_close(g);
+            atlas_buf_free(&root_raw);
+            continue;
+        }
         w.root_fd = open(atlas_buf_cstr(&root_raw), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
         if (w.root_fd < 0) {
             if (log != NULL) {
@@ -448,6 +474,18 @@ atlas_status atlas_service_scanner_run(bool once, FILE *log, atlas_err *err) {
         (void)close(w.root_fd);
         atlas_git_close(g);
         atlas_buf_free(&root_raw);
+
+        /* Complete means every file this run enumerated reached the mirror. Any
+         * skip at all leaves it false, including a symlink: the daemon reads the
+         * mirror as the repository, so a file the mirror does not hold is a file
+         * that no longer exists, and there is no such thing as a small delete
+         * sweep. A skipped symlink is a real gap rather than a rounding error --
+         * Atlas indexes a tracked symlink's link text, so the mirror is missing
+         * something the index would otherwise hold. */
+        bool complete = walked == ATLAS_OK && w.status == ATLAS_OK &&
+                        w.skipped_symlink == 0 && w.skipped_large == 0 &&
+                        w.skipped_unreadable == 0;
+        (void)say_state(&w, complete);
 
         if (log != NULL) {
             (void)fprintf(log,

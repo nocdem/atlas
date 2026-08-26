@@ -4255,6 +4255,34 @@ static const char M27_SCANNER_UID[] =
 
 static const char *const M27_STATEMENTS[] = {M27_SCANNER_UID, NULL};
 
+/* A13. What the mirror is, as opposed to what it contains.
+ *
+ * Two failures on the first live run share one cause: nothing recorded the
+ * mirror's own state, so the daemon could not tell a finished mirror from a
+ * half-written one, nor a fresh one from a frozen one. It read whatever was
+ * there as the repository. Measured: an incomplete mirror produced 20000
+ * deletions, and a scanner that stops leaves an index reported as current
+ * against bytes of any age.
+ *
+ * `mirror_complete` is the scanner's own claim about the run that produced the
+ * current contents: every file it enumerated was written, and none was skipped.
+ * It is cleared when a run starts and set only when one finishes, so a crash
+ * mid-run leaves it false rather than stale-true — the safe direction, because
+ * false costs a refusal and true would cost a delete sweep.
+ *
+ * `mirror_at` is when that run finished. It exists so staleness is a question
+ * anyone can ask: a mirror is current as of a time, and a reader that cannot
+ * name the time cannot claim the index is current.
+ *
+ * Both default to "no mirror has ever been written", which is what every
+ * existing row means. */
+static const char M28_MIRROR_COMPLETE[] =
+    "ALTER TABLE repositories ADD COLUMN mirror_complete INTEGER NOT NULL DEFAULT 0;";
+static const char M28_MIRROR_AT[] =
+    "ALTER TABLE repositories ADD COLUMN mirror_at TEXT NOT NULL DEFAULT '';";
+
+static const char *const M28_STATEMENTS[] = {M28_MIRROR_COMPLETE, M28_MIRROR_AT, NULL};
+
 static const atlas_migration MIGRATIONS[] = {
     {1, "initial schema", M1_STATEMENTS, false},
     {2, "worktree identity", M2_STATEMENTS, false},
@@ -4347,6 +4375,8 @@ static const atlas_migration MIGRATIONS[] = {
      * no existing row is rewritten. See the M27 comment for why the default is
      * 0-meaning-unassigned rather than a derived uid. */
     {27, "which uid's scanner may report about a repository", M27_STATEMENTS, false},
+    {28, "whether a repository's mirror is complete, and when it was written",
+     M28_STATEMENTS, false},
 };
 
 const atlas_migration *atlas_migrations(size_t *count_out) {

@@ -17,7 +17,8 @@
     "id, name, root_path, root_path_text, git_common_dir, object_format, registered_at," \
     " last_scan_at, last_scan_id, scanned_head, current_branch, head_state, dirty,"      \
     " dirty_staged, dirty_unstaged, dirty_untracked, dirty_unmerged" \
-    ", git_dir, is_linked_worktree, scanner_uid"
+    ", git_dir, is_linked_worktree, scanner_uid"                                         \
+    ", mirror_complete, mirror_at"
 
 void atlas_repo_info_init(atlas_repo_info *ri) {
     memset(ri, 0, sizeof(*ri));
@@ -130,6 +131,11 @@ static atlas_status load_repo(sqlite3_stmt *stmt, atlas_repo_info *ri, atlas_err
     ri->dirty_unmerged = sqlite3_column_int(stmt, 16);
     ri->is_linked_worktree = sqlite3_column_int(stmt, 18) != 0;
     ri->scanner_uid = sqlite3_column_int64(stmt, 19);
+    ri->mirror_complete = sqlite3_column_int(stmt, 20) != 0;
+    {
+        const unsigned char *t = sqlite3_column_text(stmt, 21);
+        (void)snprintf(ri->mirror_at, sizeof(ri->mirror_at), "%s", t != NULL ? (const char *)t : "");
+    }
     return ATLAS_OK;
 }
 
@@ -454,6 +460,37 @@ atlas_status atlas_db_repo_set_scanner_uid(atlas_db *db, int64_t repo_id, int64_
         sqlite3_bind_int64(stmt, 2, repo_id) != SQLITE_OK) {
         atlas_db_finish(db, stmt);
         return atlas_err_set(err, ATLAS_ERR_DB, "cannot bind the scanner uid");
+    }
+    return atlas_db_step_done(db, stmt, err);
+}
+
+/* A13. Records what a mirroring run claims about what it left behind.
+ *
+ * Called twice per repository per run: once at the start with `complete` false,
+ * which is what makes a crash leave the mirror marked incomplete rather than
+ * stale-complete; and once at the end with the run's own verdict. The
+ * asymmetry is the point — false costs a refusal, true would cost a delete
+ * sweep against a half-written tree, so the value that survives a failure is
+ * the one that refuses.
+ *
+ * `at` is written only alongside a `complete` of true. A time on an incomplete
+ * mirror would say when it was last *touched*, and every reader of it wants to
+ * know when it was last *whole*. */
+atlas_status atlas_db_repo_set_mirror_state(atlas_db *db, int64_t repo_id, bool complete,
+                                            const char *at, atlas_err *err) {
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(
+        db, "UPDATE repositories SET mirror_complete = ?1, mirror_at = ?2 WHERE id = ?3;", &stmt,
+        err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    const char *when = complete && at != NULL ? at : "";
+    if (sqlite3_bind_int(stmt, 1, complete ? 1 : 0) != SQLITE_OK ||
+        sqlite3_bind_text(stmt, 2, when, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 3, repo_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_err_set(err, ATLAS_ERR_DB, "cannot bind the mirror state");
     }
     return atlas_db_step_done(db, stmt, err);
 }

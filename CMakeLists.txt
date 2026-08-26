@@ -196,6 +196,7 @@ add_library(atlas_core STATIC
   src/daemon/writer.c
   src/daemon/workers.c
   src/daemon/watch.c
+  src/daemon/mirror.c
   src/daemon/daemon.c
   src/core/service_daemon.c
     src/core/service_remote.c

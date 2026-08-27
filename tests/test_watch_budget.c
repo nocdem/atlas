@@ -235,6 +235,39 @@ static bool wait_repo_settled(rig *r, int64_t repo_id, atlas_index_state *out) {
     return false;
 }
 
+/* Waits until the *stored* state carries `reason`.
+ *
+ * `wait_repo_settled` answers "has this repository reached some settled watch
+ * state", which is the right question after a startup and the wrong one after a
+ * transition: a repository that was already `watching` satisfies it on the first
+ * read, before the degradation it is being watched for has reached the
+ * database. The watcher publishes through the writer, so there is always a
+ * window — and a test that read the row inside it got the state from before the
+ * event and asserted against it.
+ *
+ * That is why `a temporary ignore failure recovers ...` failed about half the
+ * time under ASan and passed under load-free release runs: it was a race the
+ * test created, not one the watcher has. Measured before this existed: 3 of 6
+ * standalone runs, and 3 of 3 while a full gate matrix competed for the machine.
+ *
+ * Returns false on timeout, so a reason that never arrives still fails the test
+ * rather than passing it quietly. */
+static bool wait_repo_reason(rig *r, int64_t repo_id, atlas_watch_reason reason,
+                             atlas_index_state *out) {
+    for (int i = 0; i < WAIT_MS / 20; i++) {
+        atlas_err err;
+        atlas_err_init(&err);
+        atlas_index_state_free(out);
+        atlas_index_state_init(out);
+        read_state(r, repo_id, out, &err);
+        if (out->present && out->watch_reason == reason) {
+            return true;
+        }
+        usleep(20000);
+    }
+    return false;
+}
+
 /* --- the vocabulary and the bounds ---------------------------------------- */
 
 /* Every reason round-trips through its stored spelling, and no two share one.
@@ -2000,7 +2033,11 @@ static void test_a_temporary_ignore_failure_recovers(void) {
 
     atlas_index_state broken;
     atlas_index_state_init(&broken);
-    T_CHECK(wait_repo_settled(&r, 1, &broken));
+    /* The *reason*, not merely a settled state: this repository was already
+     * `watching`, so waiting for "settled" is satisfied by the row from before
+     * the failure and the assertion below then reads it. */
+    T_CHECK_MSG(wait_repo_reason(&r, 1, ATLAS_WATCH_REASON_ERROR, &broken),
+                "the failure never reached the stored state");
     T_CHECK_MSG(broken.watch_reason == ATLAS_WATCH_REASON_ERROR,
                 "the reason must name the failure, got %s",
                 atlas_watch_reason_name(broken.watch_reason));

@@ -561,14 +561,18 @@ static atlas_status scan_pass(int64_t *poll_within_ms, FILE *log, atlas_err *err
         w.log = log;
         w.err = err;
         w.status = ATLAS_OK;
-        /* Cleared before anything is written, so a crash leaves the mirror
-         * refused rather than trusted. */
-        if (say_state(&w, false) != ATLAS_OK) {
-            st = w.err != NULL ? ATLAS_ERR_INTERNAL : ATLAS_ERR_INTERNAL;
-            atlas_git_close(g);
-            atlas_buf_free(&root_raw);
-            continue;
-        }
+        /* **Nothing is cleared here, deliberately.** The first design reported
+         * `complete=false` before writing anything, so a crash left the mirror
+         * refused rather than trusted -- and made a repository unreadable for the
+         * whole of every pass. Measured: seven minutes of every ten for
+         * /opt/dna, refused seventy per cent of the time while nothing was
+         * wrong with it.
+         *
+         * A pass now writes into a staging generation and the finished mirror
+         * stays where readers look, so the crash this protected against cannot
+         * touch what they read: a scanner killed mid-pass leaves `<id>.next`
+         * half-written and `<id>` exactly as it was. The verdict is reported
+         * once, at the end, and publishing is what makes it visible. */
         w.root_fd = open(atlas_buf_cstr(&root_raw), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
         if (w.root_fd < 0) {
             if (log != NULL) {

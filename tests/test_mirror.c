@@ -273,6 +273,58 @@ static void test_the_executable_bit_survives(void) {
     fx_close(&fx);
 }
 
+/* A13. A pass writes into a staging generation, and the finished mirror stays
+ * readable throughout.
+ *
+ * **This is the case that made /opt/dna unreadable seventy per cent of the
+ * time.** The first design reported the mirror incomplete before writing
+ * anything, which is right for crash safety and wrong for everything else: a
+ * pass over that repository takes seven minutes on a ten-minute cycle, so the
+ * daemon refused it for almost the whole cycle while nothing was wrong.
+ *
+ * What the staging generation buys is that both claims can be true at once -- a
+ * pass is running, and the mirror readers see is complete. */
+static void test_a_pass_does_not_disturb_the_published_mirror(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    fixture fx;
+    T_REQUIRE(fx_open(&fx, &err) == ATLAS_OK);
+
+    /* A published generation holding one file. */
+    int staged = -1;
+    T_OK(atlas_mirror_open_staging(fx_data_dir(&fx), 9, &staged, &err), &err);
+    T_OK(atlas_mirror_put(staged, "a.txt", 5u, true, false, "first\n", 6u, &err), &err);
+    (void)close(staged);
+    T_OK(atlas_mirror_publish(fx_data_dir(&fx), 9, &err), &err);
+
+    /* A second pass begins and writes a different file into staging. */
+    T_OK(atlas_mirror_open_staging(fx_data_dir(&fx), 9, &staged, &err), &err);
+    T_OK(atlas_mirror_put(staged, "b.txt", 5u, true, false, "second\n", 7u, &err), &err);
+    (void)close(staged);
+
+    /* Mid-pass, the published generation is untouched: `a.txt` is there and
+     * `b.txt` is not. A reader sees a whole generation, never a mixture. */
+    int cur = -1;
+    T_OK(atlas_mirror_open_repo(fx_data_dir(&fx), 9, &cur, &err), &err);
+    struct stat sb;
+    T_CHECK_MSG(fstatat(cur, "a.txt", &sb, AT_SYMLINK_NOFOLLOW) == 0,
+                "the published generation lost a file while a pass was running");
+    T_CHECK_MSG(fstatat(cur, "b.txt", &sb, AT_SYMLINK_NOFOLLOW) != 0,
+                "a half-written pass leaked into what readers see");
+    (void)close(cur);
+
+    /* Publishing swaps it. */
+    T_OK(atlas_mirror_publish(fx_data_dir(&fx), 9, &err), &err);
+    T_OK(atlas_mirror_open_repo(fx_data_dir(&fx), 9, &cur, &err), &err);
+    T_CHECK_MSG(fstatat(cur, "b.txt", &sb, AT_SYMLINK_NOFOLLOW) == 0,
+                "publishing did not make the staged generation visible");
+    T_CHECK_MSG(fstatat(cur, "a.txt", &sb, AT_SYMLINK_NOFOLLOW) != 0,
+                "the previous generation survived its replacement");
+    (void)close(cur);
+
+    fx_close(&fx);
+}
+
 static const atlas_test TESTS[] = {
     {"a file round-trips and a second start replaces",
      test_a_file_round_trips_and_a_second_start_replaces},
@@ -283,6 +335,8 @@ static const atlas_test TESTS[] = {
     {"a symlink is mirrored as one", test_a_symlink_is_mirrored_as_one},
     {"a broken symlink is mirrored too", test_a_broken_symlink_is_mirrored_too},
     {"the executable bit survives", test_the_executable_bit_survives},
+    {"a pass does not disturb the published mirror",
+     test_a_pass_does_not_disturb_the_published_mirror},
 };
 
 ATLAS_TEST_MAIN("mirror", TESTS)

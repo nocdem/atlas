@@ -18,6 +18,7 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
+#include <dirent.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <stdlib.h>
@@ -44,8 +45,24 @@ static int make_dir(int parent, const char *name, atlas_err *err) {
     return fd;
 }
 
-atlas_status atlas_mirror_open_repo(const char *data_dir, int64_t repo_id, int *fd_out,
-                                    atlas_err *err) {
+/* A13. The directory a pass writes into, as opposed to the one readers use.
+ *
+ * **A refresh must not make a finished mirror unreadable.** The first design
+ * cleared `mirror_complete` at the start of every pass, which is right for crash
+ * safety and wrong for everything else: a pass over /opt/dna takes seven minutes
+ * on a ten-minute cycle, so that repository was refused seventy per cent of the
+ * time. "A pass is running" and "the mirror cannot be trusted" are different
+ * claims, and I had conflated them.
+ *
+ * So a pass writes into `<id>.next` and the finished mirror stays at `<id>`,
+ * readable and complete throughout. `atlas_mirror_publish` swaps them with
+ * `rename`, which is atomic within a directory: a reader sees the old generation
+ * or the new one and never a mixture, and a scanner killed mid-pass leaves
+ * `<id>.next` half-written and `<id>` exactly as it was.
+ *
+ * `staging` selects which one. Readers never pass true. */
+static atlas_status open_repo_dir(const char *data_dir, int64_t repo_id, bool staging, int *fd_out,
+                                  atlas_err *err) {
     if (data_dir == NULL || data_dir[0] == '\0' || fd_out == NULL) {
         return atlas_err_set(err, ATLAS_ERR_USAGE, "a data directory is required");
     }
@@ -65,8 +82,8 @@ atlas_status atlas_mirror_open_repo(const char *data_dir, int64_t repo_id, int *
         return ATLAS_ERR_INTEGRITY;
     }
 
-    char name[32];
-    (void)snprintf(name, sizeof(name), "%lld", (long long)repo_id);
+    char name[48];
+    (void)snprintf(name, sizeof(name), "%lld%s", (long long)repo_id, staging ? ".next" : "");
     int repo = make_dir(mirror, name, err);
     (void)close(mirror);
     if (repo < 0) {
@@ -74,6 +91,16 @@ atlas_status atlas_mirror_open_repo(const char *data_dir, int64_t repo_id, int *
     }
     *fd_out = repo;
     return ATLAS_OK;
+}
+
+atlas_status atlas_mirror_open_repo(const char *data_dir, int64_t repo_id, int *fd_out,
+                                    atlas_err *err) {
+    return open_repo_dir(data_dir, repo_id, false, fd_out, err);
+}
+
+atlas_status atlas_mirror_open_staging(const char *data_dir, int64_t repo_id, int *fd_out,
+                                       atlas_err *err) {
+    return open_repo_dir(data_dir, repo_id, true, fd_out, err);
 }
 
 /* Walks `rel` to its leaf's parent, creating directories on the way, and copies
@@ -245,4 +272,92 @@ atlas_status atlas_mirror_put(int root_fd, const void *rel, size_t rel_len, bool
     }
     (void)close(fd);
     return st;
+}
+
+/* Removes a directory tree beneath `parent`, by name.
+ *
+ * Only ever called on a mirror generation this process created, and every
+ * descent is `openat` with `O_NOFOLLOW`, so a symlink planted inside a
+ * generation cannot make this delete anything outside it. */
+static void remove_tree(int parent, const char *name) {
+    int fd = openat(parent, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) {
+        (void)unlinkat(parent, name, 0);
+        return;
+    }
+    DIR *d = fdopendir(fd);
+    if (d == NULL) {
+        (void)close(fd);
+        return;
+    }
+    struct dirent *e = NULL;
+    while ((e = readdir(d)) != NULL) {
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) {
+            continue;
+        }
+        struct stat sb;
+        if (fstatat(dirfd(d), e->d_name, &sb, AT_SYMLINK_NOFOLLOW) == 0 && S_ISDIR(sb.st_mode)) {
+            remove_tree(dirfd(d), e->d_name);
+        } else {
+            (void)unlinkat(dirfd(d), e->d_name, 0);
+        }
+    }
+    (void)closedir(d);
+    (void)unlinkat(parent, name, AT_REMOVEDIR);
+}
+
+atlas_status atlas_mirror_publish(const char *data_dir, int64_t repo_id, atlas_err *err) {
+    if (data_dir == NULL || data_dir[0] == '\0') {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "a data directory is required");
+    }
+    int base = open(data_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (base < 0) {
+        return atlas_err_set_errno(err, ATLAS_ERR_CONFIG, errno,
+                                   "cannot open the data directory to reach the mirror");
+    }
+    int mirror = make_dir(base, "mirror", err);
+    (void)close(base);
+    if (mirror < 0) {
+        return ATLAS_ERR_INTEGRITY;
+    }
+
+    char cur[48], next[48], old[48];
+    (void)snprintf(cur, sizeof(cur), "%lld", (long long)repo_id);
+    (void)snprintf(next, sizeof(next), "%lld.next", (long long)repo_id);
+    (void)snprintf(old, sizeof(old), "%lld.old", (long long)repo_id);
+
+    /* A leftover from a publish that died between the two renames. */
+    remove_tree(mirror, old);
+
+    /* Nothing staged means nothing to publish, which is not an error: a pass
+     * that mirrored no files at all still reports its verdict. */
+    struct stat sb;
+    if (fstatat(mirror, next, &sb, AT_SYMLINK_NOFOLLOW) != 0) {
+        (void)close(mirror);
+        return ATLAS_OK;
+    }
+
+    /* Move the current generation aside, then the staged one into place. A
+     * reader between the two finds no mirror and refuses, which is correct and
+     * two syscalls wide. */
+    bool had_current = fstatat(mirror, cur, &sb, AT_SYMLINK_NOFOLLOW) == 0;
+    if (had_current && renameat(mirror, cur, mirror, old) != 0) {
+        int saved = errno;
+        (void)close(mirror);
+        return atlas_err_set_errno(err, ATLAS_ERR_INTEGRITY, saved,
+                                   "cannot move the current mirror aside");
+    }
+    if (renameat(mirror, next, mirror, cur) != 0) {
+        int saved = errno;
+        /* Put the old one back rather than leaving the repository with none. */
+        if (had_current) {
+            (void)renameat(mirror, old, mirror, cur);
+        }
+        (void)close(mirror);
+        return atlas_err_set_errno(err, ATLAS_ERR_INTEGRITY, saved,
+                                   "cannot publish the staged mirror");
+    }
+    remove_tree(mirror, old);
+    (void)close(mirror);
+    return ATLAS_OK;
 }

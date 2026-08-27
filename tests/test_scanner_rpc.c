@@ -214,6 +214,25 @@ static void test_the_poll_answer_carries_the_cadence(void) {
 }
 
 /* True when `<data-dir>/mirror/<repo>/<rel>` exists. */
+/* A13. Reports the run finished, which is what publishes the staged generation.
+ *
+ * A pass writes into `<id>.next` so a refresh cannot make a finished mirror
+ * unreadable; nothing a scanner puts is visible to a reader until it says the
+ * run is complete. Tests that check the mirror have to complete the cycle,
+ * because that is the cycle a scanner performs. */
+static void finish(env *e, int64_t repo) {
+    atlas_buf raw = ATLAS_BUF_INIT;
+    atlas_buf params = ATLAS_BUF_INIT;
+    atlas_err err;
+    atlas_err_init(&err);
+    (void)atlas_buf_appendf(&params, &err, "{\"repo\":%lld,\"complete\":true}", (long long)repo);
+    atlas_ipc_response *r =
+        call(e, (long long)getuid(), "scanner.state", atlas_buf_cstr(&params), &raw);
+    atlas_ipc_response_free(r);
+    atlas_buf_free(&params);
+    atlas_buf_free(&raw);
+}
+
 static bool mirrored(env *e, int64_t repo, const char *rel) {
     atlas_buf p = ATLAS_BUF_INIT;
     atlas_err err;
@@ -242,6 +261,7 @@ static void test_a_scanner_writes_into_its_own_repositorys_mirror(void) {
     atlas_ipc_response *r =
         call(&e, (long long)getuid(), "scanner.put", atlas_buf_cstr(&params), &raw);
     T_CHECK_MSG(atlas_ipc_response_ok(r), "scanner.put failed: %s", atlas_buf_cstr(&raw));
+    finish(&e, e.mine);
     T_CHECK_MSG(mirrored(&e, e.mine, "src/a.c"), "the bytes did not reach the mirror");
 
     atlas_ipc_response_free(r);
@@ -312,7 +332,10 @@ static void test_the_wire_carries_arbitrary_bytes(void) {
     T_CHECK_MSG(atlas_ipc_response_ok(r), "scanner.put refused hostile bytes: %s",
                 atlas_buf_cstr(&raw));
 
-    /* Read it back from the filesystem and compare byte for byte. */
+    /* Read it back from the filesystem and compare byte for byte. The run has to
+     * say it finished first: a pass writes into a staging generation and
+     * nothing is visible to a reader until it is published. */
+    finish(&e, e.mine);
     atlas_buf path = ATLAS_BUF_INIT;
     T_OK(atlas_buf_appendf(&path, &err, "%s/mirror/%lld/hostile.bin", fx_data_dir(&e.fx),
                            (long long)e.mine),
@@ -362,6 +385,7 @@ static void test_the_exec_bit_crosses_the_wire(void) {
         call(&e, (long long)getuid(), "scanner.put", atlas_buf_cstr(&params), &raw);
     T_CHECK_MSG(atlas_ipc_response_ok(r), "scanner.put failed: %s", atlas_buf_cstr(&raw));
 
+    finish(&e, e.mine);
     atlas_buf p = ATLAS_BUF_INIT;
     T_OK(atlas_buf_appendf(&p, &err, "%s/mirror/%lld/run.sh", fx_data_dir(&e.fx),
                            (long long)e.mine),

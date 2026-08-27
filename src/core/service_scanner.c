@@ -598,6 +598,36 @@ static atlas_status scan_pass(int64_t *poll_within_ms, FILE *log, atlas_err *err
             walked = atlas_git_ls_untracked(g, untracked_cb, &w, err);
         }
 
+        /* A13. The build inputs the daemon named in its poll answer.
+         *
+         * **Ignored files the mirror carries anyway.** A compilation database is
+         * a build artefact, so the tracked-and-untracked walk skips it — and
+         * without it in the mirror the semantic pass fails with "the named
+         * compilation database is not a readable regular file inside the
+         * repository", the retry governor holds on "the last attempt failed and
+         * the source has not changed since", and the semantic index stops for
+         * good. Measured: both repositories were a day stale that way.
+         *
+         * The daemon names them because what belongs here is what *discovery
+         * accepted*, which is a fact it holds and this process cannot derive. */
+        size_t bi_n = 0;
+        if (walked == ATLAS_OK && w.status == ATLAS_OK &&
+            atlas_ipc_result_arr_obj_arr_len(resp, "repositories", i, "build_inputs", &bi_n)) {
+            for (size_t k = 0; k < bi_n; k++) {
+                const char *enc = NULL;
+                if (!atlas_ipc_result_arr_obj_arr_str(resp, "repositories", i, "build_inputs", k,
+                                                      &enc) ||
+                    enc == NULL) {
+                    continue;
+                }
+                atlas_buf rel = ATLAS_BUF_INIT;
+                if (atlas_path_text_decode(enc, strlen(enc), &rel, err) == ATLAS_OK) {
+                    mirror_one(&w, rel.data, rel.len);
+                }
+                atlas_buf_free(&rel);
+            }
+        }
+
         /* And `.git`, so the mirror is a repository the daemon can open rather
          * than a bag of files. That is what lets reconcile, A3, the semantic
          * layer, snapshots and gates keep working unchanged. */

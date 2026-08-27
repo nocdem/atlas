@@ -25,6 +25,7 @@
  */
 #include "atlas/atlas.h"
 #include "atlas/db.h"
+#include "atlas/sem_discover.h"
 #include "atlas/ipc.h"
 #include "atlas/safetext.h"
 #include "daemon/daemon_internal.h"
@@ -113,6 +114,53 @@ static atlas_status emit_cb(const atlas_repo_info *ri, void *ud, atlas_err *err)
          * deciding it. */
         st = atlas_json_key_str(j, "directive", ri->mirror_complete ? "incremental" : "full",
                                 s->err);
+    }
+    if (st == ATLAS_OK) {
+        /* A13. The build inputs this repository's semantic index needs.
+         *
+         * **They are ignored files, and the mirror carries them anyway.** A
+         * compilation database is a build artefact — `.gitignore` names it, and
+         * the walk that mirrors tracked and untracked paths deliberately skips
+         * ignored ones, because otherwise every object file would be copied.
+         * But it is also an *input* Atlas cannot index without: with it absent
+         * from the mirror the semantic pass failed with "the named compilation
+         * database is not a readable regular file inside the repository", the
+         * retry governor held on "the last attempt failed and the source has not
+         * changed since", and both repositories' semantic indexes stopped a day
+         * ago and stayed stopped.
+         *
+         * The daemon names them rather than the scanner guessing: what belongs
+         * here is what *discovery accepted*, which is a fact the daemon holds
+         * and the scanner has no way to derive. */
+        st = atlas_json_key(j, "build_inputs", s->err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_arr_begin(j, s->err);
+        }
+        atlas_buf inputs = ATLAS_BUF_INIT;
+        if (st == ATLAS_OK) {
+            atlas_err ignore;
+            atlas_err_init(&ignore);
+            /* Absent or unreadable is an empty list, not a failure: a repository
+             * with no accepted build inputs is an ordinary one. */
+            if (atlas_sem_accepted_inputs(s->ds->db, ri->id, &inputs, NULL, &ignore) == ATLAS_OK) {
+                /* NUL-separated, repository-relative. */
+                const char *p = inputs.data;
+                const char *end = p != NULL ? p + inputs.len : NULL;
+                while (st == ATLAS_OK && p != NULL && p < end && *p != '\0') {
+                    size_t n = strlen(p);
+                    atlas_buf enc = ATLAS_BUF_INIT;
+                    if (atlas_path_text_encode(p, n, &enc, s->err) == ATLAS_OK) {
+                        st = atlas_json_str(j, atlas_buf_cstr(&enc), s->err);
+                    }
+                    atlas_buf_free(&enc);
+                    p += n + 1u;
+                }
+            }
+        }
+        atlas_buf_free(&inputs);
+        if (st == ATLAS_OK) {
+            st = atlas_json_arr_end(j, s->err);
+        }
     }
     if (st == ATLAS_OK) {
         st = atlas_json_obj_end(j, s->err);

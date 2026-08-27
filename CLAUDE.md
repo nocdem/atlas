@@ -12,10 +12,17 @@ for is
 
 That is measured rather than supposed: with `atlasd` as its own principal under
 A7.1, the daemon logged `repository ... cannot be opened` every ten seconds
-against a repository that was perfectly intact. See the A13 sections in
-`docs/watcher-consistency.md` and `docs/engineering-rules.md`, and the season
-rules below — in particular the two orchestration readers that must **never**
-see a mirror.
+against a repository that was perfectly intact -- a hundred loose objects at mode
+0400, written by something whose umask was 077.
+
+**The daemon does not read the tree.** A repository naming a scanner is read from
+its mirror and from nothing else; no mirror and an incomplete mirror are both
+refusals, and the tree is never the way out of either. `scanner.poll` doubles as
+the heartbeat, so a scanner that stops is a repository Atlas stops calling
+current. See the A13 sections in `docs/watcher-consistency.md` and
+`docs/engineering-rules.md`, the "What implementation changed, and why" section
+of the spec, and the season rules below -- in particular the two orchestration
+readers that must **never** see a mirror.
 
 The season before it, **P0**, was the large-repository watcher — the watch
 budget is derived from the kernel instead of guessed, a physical inotify
@@ -748,80 +755,101 @@ is not written down is one somebody deletes.** Both halves are load-bearing.
 - **A PROCESS CANNOT INDEX A TREE IT CANNOT READ, AND NO AMOUNT OF RETRYING
   CHANGES WHICH UID IT IS.** Measured, not supposed: with `atlasd` as its own
   principal under A7.1, the daemon logged `repository ... cannot be opened`
-  every ten seconds against a repository that was perfectly intact.
+  every ten seconds against a repository that was perfectly intact — a hundred
+  loose objects at mode 0400, written by something whose umask was 077.
+- **THE ROW DECIDES THE SOURCE, NOT A FAILURE.** A repository naming a scanner
+  is read from its mirror and from **nothing else**: no mirror is a refusal, an
+  incomplete mirror is a refusal, and the tree is never the way out of either.
+  The first design tried the tree and fell back, and answered neither real
+  failure — both were *partial*, an open that succeeded and a `git log` that
+  failed three calls later, and a walk that completed while covering less than
+  the tree. A rule keyed on "could not open" catches neither.
+- **A process running as the scanner uid still reads the tree.**
+  `geteuid() == scanner_uid` reads directly — the scanner itself, and the
+  operator's own CLI. That is a capability question, not an authority one: it
+  asks whether this process can read those bytes and grants nothing.
 - **The scanner's identity is the owner of the repository root, and nothing
   cleverer.** `atlas_scanner_uid_of_root` lstats it. **Uid 0 is refused**,
   because 0 is how `repositories.scanner_uid` records "no scanner assigned" and
   one value cannot mean both; `atlas-worker` and the gateway uid are refused in
-  system scope. **Migration 27 defaults the column to 0**, so every
-  pre-existing repository names no scanner — a default carries no information
-  and inventing an intent nobody expressed is what migration 19 must not do.
+  system scope. **Migration 27 defaults the column to 0**, so every pre-existing
+  repository names no scanner — a default carries no information, and inventing
+  an intent nobody expressed is migration 19's mistake.
 - **`peer_owns` is one comparison and it is the whole authorisation.**
-  `SO_PEERCRED` against the row, in `src/ipc/server_scanner.c`. The scanner
-  method group is **dispatchable by name rather than hidden**, because hiding a
-  group needs a predicate answerable *before* the method lookup and this one is
-  a column — `dispatch()` does not open the database until after. A refusal
-  speaks only about the caller's own uid and names no repository: an inventory
-  handed to whoever asked is not a refusal.
+  `SO_PEERCRED` against the row. The scanner method group is **dispatchable by
+  name rather than hidden**: hiding a group needs a predicate answerable
+  *before* the method lookup and this one is a column, and `dispatch()` does not
+  open the database until after. A refusal speaks only about the caller's own
+  uid and names no repository — an inventory handed to whoever asked is not a
+  refusal.
 - **The mirror is a real git repository, and that is what keeps A13 small.**
-  The scanner mirrors `.git` beside the tracked tree, so the daemon opens a
-  different root and nothing else changes. `src/core/reconcile.c` calls twenty
+  `.git` is mirrored beside the tracked and untracked trees, so the daemon opens
+  a different root and nothing else changes. `src/core/reconcile.c` calls twenty
   distinct git operations; reproducing them over a socket would have moved the
   *execution* of A1's cache-hit rules into a process the daemon cannot audit.
-  Measured cost: 256 MB against a 3.0 GB index. **Stated cost:** the daemon now
-  holds a copy of the whole history, not only current content.
-- **Content travels as hex.** A source file is arbitrary bytes and a JSON string
-  carries none of them unchanged — measured before the encoding existed, a
-  twelve-byte file arrived as twenty-four. An odd length or a non-hex digit is
-  refused rather than guessed at.
-- **The real root is tried first, always.** Reading the thing itself is better
-  evidence than reading a copy of it, so the fallback never becomes the
-  preference, and a test asserts it rather than leaving it to inspection.
-  **`data_dir == NULL` means the tree itself is the only acceptable source** —
-  the guarantee is the absent argument, so a caller that supplies nothing gets
-  pre-A13 behaviour rather than a surprise.
-- **`atlas_repo_open_git` reports the real root's *status*, not only its
-  message.** `atlas_git_open` refuses a partial repository with an integrity
-  status, and flattening that into a plain repository error reads as "not
-  found" where Atlas meant "refused, and deliberately". Caught by
-  `test_git_hardening`, which turned 7 into 4.
-- **A mirror is refused for a row that names no scanner.** This closes no
-  reachable path — uid 0 is refused at assignment and `peer_owns` admits no
-  peer without a non-zero uid — and it is there so the warrant is true because
-  the code asks, not because a refusal elsewhere makes the alternative
-  unreachable.
-- **When the mirror answered, the canonical-root check is unasked, not
-  skipped.** It asserts that the registered root still resolves to itself,
-  which is a claim about a tree that was not opened. The warrant moved from
-  "the path still resolves here" to "the row still names this writer", and it
-  is written at the skip because neither half is inferable from the code below
-  it.
-- **The watcher's three paths move together or none does.** P0 builds metadata
-  watches from `git_dir` and `common_dir`; a root from one repository with
-  metadata from another rests branch correctness on a tree the source walk never
-  covers. They come from `atlas_git_root`/`atlas_git_dir` — the adapter's own
-  report of what it opened — rather than from code repeating the choice.
-- **A mirror-backed watch makes a weaker claim and owes an event gap.** It
-  reports a change when *the scanner writes it*, not when the developer saves
-  the file, so the index is current as of the scanner's last pass and no sooner.
-  Never describe it as equivalent to watching the tree. The gap is owed on every
-  build, because the watch set is rebuilt from scratch and has no memory of which
-  tree answered last time.
+  **Stated cost:** the daemon holds a copy of the whole history.
+- **The mirror carries what reconcile indexes, which is tracked *and*
+  untracked.** Mirroring only the tracked set made the mirror a strict subset of
+  the repository the daemon believes it is reading, and the daemon recorded the
+  difference as deletions — measured, `-20000` on a tree with 2012 tracked files
+  and 22012 indexed ones. A symlink is mirrored as a symlink, **including a
+  broken one**: Atlas hashes the link text and never opens the target, so a
+  dangling link is a file the index holds like any other. One in a docs folder
+  kept a 77 000-file repository out of the index entirely.
+- **There is no file size bound, and there must not be one.** Two were invented
+  — 8 MiB, then 64 MiB — and both sat below Atlas' own
+  `ATLAS_HASH_MAX_FILE_BYTES`, so the scanner refused files Atlas would have
+  indexed. One was a 91 MiB pack, which left the mirror's `.git` incomplete and
+  therefore not a repository at all. **Atlas' bound is on hashing, not on
+  existing**: above it reconcile records `ENTRY_TOO_LARGE` and the file is still
+  there, so the mirror needs it too.
+- **Content travels as hex, in chunks derived from the transport.** A source
+  file is arbitrary bytes and a JSON string carries none of them unchanged —
+  measured, a twelve-byte file arrived as twenty-four. `SCANNER_CHUNK_BYTES` is
+  a quarter of `ATLAS_IPC_MAX_REQUEST_BYTES` because hex doubles it, so raising
+  any file bound turns one chunk into two rather than reopening a refusal.
+- **The mirror records its own state, and the write order is the design.**
+  `mirror_complete` is cleared when a run starts and set only when one finishes,
+  so a crash leaves it false: false costs a refusal, true would cost a delete
+  sweep against a half-written tree, and there is no such thing as a small
+  delete sweep. It is a **write**, so it goes through the writer thread — doing
+  it on a dispatch handle failed on every call with "attempt to write a readonly
+  database", silently, because the scanner ignored the result.
+- **`scanner.poll` is the heartbeat, and the cadence is Atlas'.** Asking what is
+  owed is the evidence of being alive, which is why the spec has no `hello`. An
+  implementation where the scanner declared its own cadence was written and
+  reverted: a scanner that promises and then dies leaves the promise standing,
+  and the daemon goes on trusting a mirror because a dead process said it would
+  be back. The bound is `ATLAS_WATCH_RECONCILE_INTERVAL_MS` — already Atlas'
+  answer to how long a repository may go unexamined — and the poll cadence is
+  half of it, so a scanner keeping it has one whole missed poll of margin.
+  Neither number is a guess about how often anybody's tree changes.
+- **The heartbeat is in memory, not in the index.** A daemon that has just
+  started has heard from nobody, which is the conservative answer; a persisted
+  heartbeat would let it trust a scanner that died before it. One mutex, no
+  writer, no I/O — the watcher's live view, applied to liveness.
+- **`repo.scanner` is an operator-uid RPC, and that reverses A7 without
+  weakening it.** A7 removed the registry from the socket because "every peer on
+  it is the same uid as the daemon"; A7.1 ended that premise, and this group is
+  selected by `SO_PEERCRED` against the root-owned policy, where
+  `backup.create` and `code.index` already sit. `repo add` and `repo remove` are
+  deliberately unchanged: they decide which directories Atlas will read at all.
+- **The watcher watches whichever tree answered, and all three paths move
+  together.** P0 builds metadata watches from `git_dir` and `common_dir`; a root
+  from one repository with metadata from another would rest branch correctness
+  on a tree the source walk never covers. A mirror-backed watch **owes an event
+  gap** and makes a weaker claim: it reports a change when the *scanner* writes
+  it, so the index is current as of the scanner's last pass and no sooner.
 - **Orchestration never reads a mirror.** `src/orch/rundriver.c`'s
   pinned-commit check and `src/orch/snapshot.c`'s workspace must see the tree a
-  worker edits: comparing work against a copy taken before it would make A11.1's
-  moved-HEAD guarantee **silently always pass**, which is worse than failing.
-  Registration passes NULL too — no row exists, so no mirror can. These are the
-  point of the design, not omissions from it.
-- **Stated costs, documented rather than solved:** `watch.c` still runs in the
-  daemon (3,486 lines, P0's budget arithmetic per uid, `IN_Q_OVERFLOW` — a
-  season of its own); a daemon-side gate against an unreadable tree fails
-  closed, because `atlas_gate_run` takes a database and no context; the stored
-  record does not yet say which principal produced the facts; and **a scanner
-  that stops running leaves a frozen mirror nothing bounds the age of** — the
-  largest thing A13 leaves open, and a freshness question rather than an
-  authority one.
-
+  worker edits: comparing work against a copy taken before it would make
+  A11.1's moved-HEAD guarantee **silently always pass**. Registration passes
+  NULL too — no row exists, so no mirror can. These are the point of the design,
+  not omissions from it.
+- **Stated costs, documented rather than solved:** a daemon-side gate against an
+  unreadable tree fails closed, because `atlas_gate_run` takes a database and no
+  context; and the stored record does not say which principal produced a
+  repository's facts — it is logged, not stored, and storing it needs a column.
 
 ### P0 — the large-repository watcher
 

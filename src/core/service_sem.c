@@ -1014,5 +1014,7 @@ atlas_status atlas_sem_index_on(atlas_db *db, const char *data_dir, const atlas_
     atlas_buf_free(&exe);
     atlas_git_close(g);
     atlas_buf_free(&list);
+    atlas_buf_free(&repo.root_path);
+    atlas_buf_free(&origin_root);
     return st;
 }

@@ -49,4 +49,13 @@ atlas_status atlas_mirror_put(int root_fd, const void *rel, size_t rel_len, bool
 atlas_status atlas_mirror_put_symlink(int root_fd, const void *rel, size_t rel_len,
                                       const void *target, size_t target_len, atlas_err *err);
 
+/* A13. Opens the directory a pass writes into, rather than the one readers use.
+ * A refresh must not make a finished mirror unreadable; see the definition. */
+atlas_status atlas_mirror_open_staging(const char *data_dir, int64_t repo_id, int *fd_out,
+                                       atlas_err *err);
+
+/* A13. Makes the staged generation the one readers see, by rename. See the
+ * definition. */
+atlas_status atlas_mirror_publish(const char *data_dir, int64_t repo_id, atlas_err *err);
+
 #endif /* ATLAS_MIRROR_H */

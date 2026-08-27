@@ -292,7 +292,10 @@ static atlas_status method_scanner_put(dispatch_state *ds, const atlas_ipc_reque
     }
 
     int root = -1;
-    st = atlas_mirror_open_repo(ds->ctx->data_dir, repo_id, &root, err);
+    /* Into the staging generation, never the one readers use: a refresh must not
+     * make a finished mirror unreadable. `scanner.state` with `complete` true
+     * publishes it. */
+    st = atlas_mirror_open_staging(ds->ctx->data_dir, repo_id, &root, err);
     if (st != ATLAS_OK) {
         atlas_buf_free(&content);
         return st;
@@ -357,7 +360,24 @@ static atlas_status method_scanner_state(dispatch_state *ds, const atlas_ipc_req
      * ever be read. The time is Atlas', set by the writer: a scanner reporting
      * when it thinks it finished would let a client's clock decide whether an
      * index is current. */
-    if (ds->ctx == NULL || ds->ctx->writer == NULL) {
+    if (ds->ctx == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "no context to record a mirror state");
+    }
+    /* Publish before recording, so a crash between the two leaves a readable
+     * mirror the row does not yet vouch for -- which costs a refusal -- rather
+     * than a row vouching for a generation that was never published. */
+    /* Publishing is a filesystem operation and the recording is a database
+     * write, so they are ordered rather than combined: publish first, so a
+     * crash between them leaves a readable mirror the row does not yet vouch
+     * for -- which costs a refusal -- rather than a row vouching for a generation
+     * that was never published. */
+    if (complete) {
+        st = atlas_mirror_publish(ds->ctx->data_dir, repo_id, err);
+        if (st != ATLAS_OK) {
+            return st;
+        }
+    }
+    if (ds->ctx->writer == NULL) {
         return atlas_err_set(err, ATLAS_ERR_INTERNAL, "no writer to record a mirror state");
     }
     atlas_writer_result wr;

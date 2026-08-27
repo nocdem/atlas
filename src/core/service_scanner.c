@@ -95,7 +95,7 @@ static atlas_status say_state(walk_ctx *w, bool complete) {
  * and appends with no `O_CREAT` on the rest, so a partial transfer leaves a
  * short file rather than a mixture of two versions. */
 static atlas_status put_file(walk_ctx *w, const void *rel, size_t rel_len, const void *data,
-                             size_t len) {
+                             size_t len, bool exec) {
     atlas_buf enc = ATLAS_BUF_INIT;
     /* The path is sent as the raw bytes git gave, %XX-encoded so it survives a
      * JSON string. Repository paths are bytes, not text. */
@@ -125,9 +125,10 @@ static atlas_status put_file(walk_ctx *w, const void *rel, size_t rel_len, const
         atlas_buf params = ATLAS_BUF_INIT;
         if (st == ATLAS_OK) {
             st = atlas_buf_appendf(&params, w->err,
-                                   "{\"repo\":%lld,\"path\":\"%s\",\"first\":%s,\"data\":\"%s\"}",
+                                   "{\"repo\":%lld,\"path\":\"%s\",\"first\":%s,\"exec\":%s,"
+                                   "\"data\":\"%s\"}",
                                    (long long)w->repo_id, atlas_buf_cstr(&enc),
-                                   first ? "true" : "false",
+                                   first ? "true" : "false", exec ? "true" : "false",
                                    take == 0 ? "" : atlas_buf_cstr(&hex));
         }
         atlas_buf raw = ATLAS_BUF_INIT;
@@ -305,7 +306,7 @@ static void mirror_one(walk_ctx *w, const void *rel, size_t rel_len) {
     (void)close(fd);
 
     if (st == ATLAS_OK) {
-        st = put_file(w, rel, rel_len, content.data, content.len);
+        st = put_file(w, rel, rel_len, content.data, content.len, (sb.st_mode & S_IXUSR) != 0);
         if (st == ATLAS_OK) {
             w->mirrored++;
         } else {

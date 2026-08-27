@@ -333,6 +333,53 @@ static void test_the_wire_carries_arbitrary_bytes(void) {
     env_close(&e);
 }
 
+/* A13. `"exec":true` on the wire produces an executable file in the mirror.
+ *
+ * Git tracks exactly one mode bit, and the mirror carries the mirrored index
+ * beside the files -- so a script written 0600 compares `100644` against an
+ * index holding `100755`, and git calls that a modification. Measured on the
+ * live tree: a clean repository read as dirty with 24 files changed, every one
+ * a script, not one differing by a byte.
+ *
+ * Asserted at the boundary because the mode has to survive the whole hop: the
+ * scanner reads it from its own `stat`, the wire carries it, and the mirror
+ * applies it. A unit test of the writer alone would have passed while the
+ * repository still read dirty. */
+static void test_the_exec_bit_crosses_the_wire(void) {
+    env e;
+    env_open(&e);
+
+    atlas_buf raw = ATLAS_BUF_INIT;
+    atlas_buf params = ATLAS_BUF_INIT;
+    atlas_err err;
+    atlas_err_init(&err);
+    T_OK(atlas_buf_appendf(&params, &err,
+                           "{\"repo\":%lld,\"path\":\"run.sh\",\"first\":true,\"exec\":true,"
+                           "\"data\":\"23212f62696e2f7368\"}",
+                           (long long)e.mine),
+         &err);
+    atlas_ipc_response *r =
+        call(&e, (long long)getuid(), "scanner.put", atlas_buf_cstr(&params), &raw);
+    T_CHECK_MSG(atlas_ipc_response_ok(r), "scanner.put failed: %s", atlas_buf_cstr(&raw));
+
+    atlas_buf p = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_appendf(&p, &err, "%s/mirror/%lld/run.sh", fx_data_dir(&e.fx),
+                           (long long)e.mine),
+         &err);
+    struct stat sb;
+    memset(&sb, 0, sizeof(sb));
+    T_REQUIRE(lstat(atlas_buf_cstr(&p), &sb) == 0);
+    T_CHECK_MSG((sb.st_mode & S_IXUSR) != 0,
+                "the mirror wrote mode %o; git will read this as a modification",
+                (unsigned)(sb.st_mode & 07777));
+
+    atlas_buf_free(&p);
+    atlas_ipc_response_free(r);
+    atlas_buf_free(&params);
+    atlas_buf_free(&raw);
+    env_close(&e);
+}
+
 static const atlas_test TESTS[] = {
     {"a scanner is told its own repositories and no others",
      test_a_scanner_is_told_its_own_repositories_and_no_others},
@@ -342,6 +389,7 @@ static const atlas_test TESTS[] = {
     {"a scanner may not write into another repository's mirror",
      test_a_scanner_may_not_write_into_another_repositorys_mirror},
     {"the poll answer carries the cadence", test_the_poll_answer_carries_the_cadence},
+    {"the exec bit crosses the wire", test_the_exec_bit_crosses_the_wire},
     {"a uid that owns nothing is refused and names no repository",
      test_a_uid_that_owns_nothing_is_refused_and_names_no_repository},
     {"uid zero is never a scanner", test_uid_zero_is_never_a_scanner},

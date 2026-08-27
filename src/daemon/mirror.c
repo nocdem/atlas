@@ -184,7 +184,7 @@ atlas_status atlas_mirror_put_symlink(int root_fd, const void *rel, size_t rel_l
     return ATLAS_OK;
 }
 
-atlas_status atlas_mirror_put(int root_fd, const void *rel, size_t rel_len, bool first,
+atlas_status atlas_mirror_put(int root_fd, const void *rel, size_t rel_len, bool first, bool exec,
                               const void *data, size_t len, atlas_err *err) {
     int parent = -1;
     char comp[MIRROR_COMP_MAX + 1u];
@@ -204,7 +204,14 @@ atlas_status atlas_mirror_put(int root_fd, const void *rel, size_t rel_len, bool
             return atlas_err_set_errno(err, ATLAS_ERR_INTEGRITY, saved,
                                        "cannot replace \"%s\" in the mirror", comp);
         }
-        fd = openat(parent, comp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+        /* **Git tracks one mode bit and the mirror has to carry it.** A tree's
+         * executable file mirrored 0600 compares 100644 against the mirrored
+         * index's 100755, and git calls that a modification -- so a clean
+         * repository read as dirty with 24 files changed, none of which
+         * differed by a byte. Owner-only either way: the daemon's files describe
+         * private repositories, and git only asks whether the bit is set. */
+        fd = openat(parent, comp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                    exec ? 0700 : 0600);
     } else {
         /* No O_CREAT. A chunk for a file that was never started means the
          * stream broke, and creating one here would turn a detectable failure

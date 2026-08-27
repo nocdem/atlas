@@ -2327,6 +2327,53 @@ atlas_status atlas_db_sem_source_identity_set(atlas_db *db, int64_t generation_i
     return atlas_db_step_done(db, stmt, err);
 }
 
+/* A9.2.3/A9.2.4: everything a no-change pass re-measured, written back onto the
+ * generation it decided to keep.
+ *
+ * The source identity was the first of these and shipped alone; the commit, the
+ * build-input discovery verdict and the number of accepted inputs were the same
+ * defect in three more columns. A pass that has found every input identical has
+ * established that the generation describes the tree it just measured exactly as
+ * well as it described the one before — so all four are facts about *this*
+ * generation, and leaving any one behind makes freshness read STALE for ever
+ * against a pass that will never change it.
+ *
+ * `repo_identity_hash` is deliberately not here. It answers which repository
+ * rather than which state of one, and no comparison of content supports
+ * carrying it forward: a moved lineage never reaches this function, because it
+ * takes the ordinary path and seals a generation of its own. */
+atlas_status atlas_db_sem_generation_restamp(atlas_db *db, int64_t generation_id,
+                                             const char *identity, const char *commit_id,
+                                             atlas_sem_discovery discovery, int64_t input_count,
+                                             atlas_err *err) {
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(db,
+                                       "UPDATE sem_generations SET source_identity = ?2,"
+                                       "  commit_id = ?3, discovery = ?4, input_count = ?5"
+                                       " WHERE id = ?1;",
+                                       &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, generation_id) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 5, input_count) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind generation id");
+    }
+    st = bind_text(db, stmt, 2, identity, err);
+    if (st == ATLAS_OK) {
+        st = bind_text(db, stmt, 3, commit_id, err);
+    }
+    if (st == ATLAS_OK) {
+        st = bind_text(db, stmt, 4, atlas_sem_discovery_name(discovery), err);
+    }
+    if (st != ATLAS_OK) {
+        atlas_db_finish(db, stmt);
+        return st;
+    }
+    return atlas_db_step_done(db, stmt, err);
+}
+
 atlas_status atlas_db_sem_reap_running(atlas_db *db, int64_t *reaped_out, atlas_err *err) {
     if (reaped_out != NULL) {
         *reaped_out = 0;

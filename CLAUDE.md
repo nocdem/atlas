@@ -663,6 +663,11 @@ is not written down is one somebody deletes.** Both halves are load-bearing.
   path component boundary.
 - **A pass that finds nothing to do still records that it looked**, and the
   identity is measured after the pass and before the publishing transaction.
+  It records **four** values, not one — the identity, the commit, the discovery
+  verdict and the accepted-input count — because freshness compares all four and
+  re-measuring one left an ordinary merge rebuilding every sweep for ever. The
+  lineage is never re-stamped: a moved `repo_identity_hash` seals a generation of
+  its own.
 - **The retry governor compares identities, never elapsed time.**
 - **A scheduler must not derive its own liveness from a value it supplied.**
 - **Coalescing falls out of the derivation**; correctness never depends on

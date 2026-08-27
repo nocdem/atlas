@@ -1802,6 +1802,17 @@ atlas_status atlas_service_sem_index(atlas_ctx *ctx, const char *name, const cha
 /* A13: `data_dir` is where a mirror lives, or NULL for the tree itself -- see
  * `atlas_repo_open_git`. A semantic pass reads sources, so a repository the
  * daemon cannot open is one it can never index. */
+/* A13. Points a repository row at the tree this process actually reads: the
+ * mirror for a scanner-backed repository, the registered root otherwise.
+ *
+ * **One question, asked in every place that reads.** The semantic layer takes a
+ * path from the row in three places -- the discovery walk, the `root_fd` behind
+ * `live_facts`, and the index pass -- and each meant the registered root when it
+ * was written. Correcting them one at a time is how this season spent four
+ * days. */
+atlas_status atlas_sem_repo_read_root(atlas_repo_info *repo, const char *data_dir,
+                                      atlas_err *err);
+
 atlas_status atlas_sem_index_on(atlas_db *db, const char *data_dir, const atlas_repo_info *repo,
                                 const char *const *compdbs, size_t compdb_count, bool rebuild,
                                 void (*yield)(void *ud), void *yield_ud,

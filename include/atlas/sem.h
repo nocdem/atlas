@@ -995,6 +995,20 @@ typedef struct atlas_sem_index_opts {
     const char *atlas_exe;
     int root_fd;
     const char *root; /* canonical repository root, absolute */
+    /* A13. The root the *compilation database* was written against, which is the
+     * repository's registered root even when `root` is a mirror.
+     *
+     * A compile database holds absolute paths into the tree that produced it.
+     * Reading one through a mirror means the paths are checked against the
+     * wrong root, every `file` falls outside it and is dropped, and the pass
+     * ends "the named compilation databases describe no translation unit that
+     * Atlas can read" -- measured, with the database sitting in the mirror and
+     * readable.
+     *
+     * So the two roots are separate: this one interprets what the database
+     * says, `root` and `root_fd` are where the bytes actually are. NULL means
+     * they are the same, which is every non-mirrored repository. */
+    const char *origin_root;
     const char *commit_id;
     const char *repo_identity_hash;
     /* A9.2.3. Newline-separated, repository-relative prefixes an operator

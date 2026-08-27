@@ -428,8 +428,8 @@ static atlas_status read_bounded(int root_fd, const char *rel, size_t max, atlas
     return st;
 }
 
-static atlas_status load_compdb(int root_fd, const char *root, const char *rel, compdb_slot *slot,
-                                atlas_err *err) {
+static atlas_status load_compdb(int root_fd, const char *origin, const char *rel,
+                                compdb_slot *slot, atlas_err *err) {
     atlas_buf_init(&slot->rel);
     atlas_buf_init(&slot->data);
     atlas_code_compdb_init(&slot->parsed);
@@ -444,7 +444,9 @@ static atlas_status load_compdb(int root_fd, const char *root, const char *rel, 
         return st;
     }
     atlas_sha256_hex(slot->data.data, slot->data.len, slot->digest);
-    return atlas_code_compdb_parse(slot->data.data, slot->data.len, root, strlen(root),
+    /* Parsed against the root the database was written for, not the root its
+     * bytes were read from. See `origin_root`. */
+    return atlas_code_compdb_parse(slot->data.data, slot->data.len, origin, strlen(origin),
                                    &slot->parsed, err);
 }
 
@@ -1101,7 +1103,9 @@ atlas_status atlas_sem_index_run(atlas_db *db, int64_t repo_id, const atlas_sem_
                                ATLAS_SEM_MAX_COMPDBS);
             break;
         }
-        st = load_compdb(opts->root_fd, opts->root, p, &slots[slot_count], err);
+        st = load_compdb(opts->root_fd,
+                         opts->origin_root != NULL ? opts->origin_root : opts->root, p,
+                         &slots[slot_count], err);
         if (st == ATLAS_OK) {
             slot_count++;
         }

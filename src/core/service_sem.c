@@ -856,11 +856,70 @@ atlas_status atlas_service_sem_index(atlas_ctx *ctx, const char *name, const cha
  * It creates git and parser processes and must therefore never be called with a
  * write transaction open — A1's rule, which `atlas_sem_index_run` observes by
  * chunking its own work. */
+/* A13. Points a repository row at the tree the daemon actually reads.
+ *
+ * **One substitution, because "where the files are" has one answer.** The
+ * semantic layer asks the row for a path in three places — the discovery walk,
+ * the `root_fd` it opens for `live_facts`, and the index pass — and each of
+ * them meant the registered root when it was written. For a repository read
+ * through a mirror that is the wrong tree, and fixing them one at a time is how
+ * this season spent four days: the daemon's root changed meaning and every
+ * consumer of it broke in turn, each one only visible under load.
+ *
+ * So the row is corrected once, here, before anything reads it. The registered
+ * root is handed back in `origin_out` because a compilation database holds
+ * absolute paths into the tree that produced it and has to be read against that
+ * one — the two roots are different questions and this is where they part.
+ *
+ * `data_dir` NULL, or a repository naming no scanner, leaves the row alone. */
+atlas_status atlas_sem_repo_read_root(atlas_repo_info *repo, const char *data_dir,
+                                      atlas_err *err) {
+    if (data_dir == NULL || data_dir[0] == '\0' || repo->scanner_uid == 0) {
+        return ATLAS_OK;
+    }
+    atlas_status st = ATLAS_OK;
+    atlas_git *g = NULL;
+    bool from_mirror = false;
+    atlas_err probe;
+    atlas_err_init(&probe);
+    if (atlas_repo_open_git(repo, data_dir, &g, &from_mirror, &probe) != ATLAS_OK) {
+        /* Unreadable either way. The caller's own open will fail and say so;
+         * leaving the row alone keeps that error the one an operator sees. */
+        return ATLAS_OK;
+    }
+    if (from_mirror) {
+        st = atlas_buf_set_str(&repo->root_path, atlas_git_root(g), err);
+    }
+    atlas_git_close(g);
+    return st;
+}
+
+static atlas_status point_at_read_root(atlas_repo_info *repo, const char *data_dir,
+                                       atlas_buf *origin_out, atlas_err *err) {
+    atlas_status st = atlas_buf_set(origin_out, repo->root_path.data, repo->root_path.len, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    return atlas_sem_repo_read_root(repo, data_dir, err);
+}
+
 atlas_status atlas_sem_index_on(atlas_db *db, const char *data_dir, const atlas_repo_info *repo_in,
                                 const char *const *compdbs, size_t compdb_count, bool rebuild,
                                 void (*yield)(void *ud), void *yield_ud,
                                 atlas_sem_index_summary *out, atlas_err *err) {
-    const atlas_repo_info repo = *repo_in;
+    /* Mutable, because `point_at_read_root` corrects where the files are. The
+     * buffers are shared with the caller's row, so only `root_path` is
+     * reassigned and it owns its own storage from that point. */
+    atlas_repo_info repo = *repo_in;
+    atlas_buf_init(&repo.root_path);
+    atlas_buf origin_root = ATLAS_BUF_INIT;
+    if (atlas_buf_set(&repo.root_path, repo_in->root_path.data, repo_in->root_path.len, err) !=
+            ATLAS_OK ||
+        point_at_read_root(&repo, data_dir, &origin_root, err) != ATLAS_OK) {
+        atlas_buf_free(&repo.root_path);
+        atlas_buf_free(&origin_root);
+        return err->status;
+    }
     atlas_status st = ATLAS_OK;
 
     /* A NUL-separated list, which is how every bounded path list in Atlas is
@@ -870,6 +929,8 @@ atlas_status atlas_sem_index_on(atlas_db *db, const char *data_dir, const atlas_
         st = atlas_buf_append(&list, compdbs[i], strlen(compdbs[i]) + 1, err);
     }
     if (st != ATLAS_OK) {
+        atlas_buf_free(&repo.root_path);
+        atlas_buf_free(&origin_root);
         atlas_buf_free(&list);
         return st;
     }
@@ -882,6 +943,8 @@ atlas_status atlas_sem_index_on(atlas_db *db, const char *data_dir, const atlas_
     atlas_git *g = NULL;
     st = atlas_repo_open_git(&repo, data_dir, &g, NULL, err);
     if (st != ATLAS_OK) {
+        atlas_buf_free(&repo.root_path);
+        atlas_buf_free(&origin_root);
         atlas_buf_free(&list);
         return st;
     }
@@ -926,8 +989,15 @@ atlas_status atlas_sem_index_on(atlas_db *db, const char *data_dir, const atlas_
         o.compdbs_len = list.len;
         o.rebuild = rebuild;
         o.atlas_exe = atlas_buf_cstr(&exe);
+        /* A13. Two roots, deliberately. `root` and `root_fd` are where the bytes
+         * are -- the mirror, for a repository the daemon reads through one -- and
+         * `origin_root` is the root the compilation database was written
+         * against, which is the registered one. Passing the mirror to both
+         * dropped every translation unit as "outside the root" while the
+         * database sat in the mirror, readable. */
         o.root = atlas_git_root(g);
         o.root_fd = atlas_git_root_fd(g);
+        o.origin_root = atlas_buf_cstr(&origin_root);
         o.commit_id = repo.scanned_head;
         o.repo_identity_hash = atlas_buf_cstr(&identity);
         o.test_roots = atlas_buf_cstr(&cfg.test_roots);

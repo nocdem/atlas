@@ -973,6 +973,15 @@ static void run_sem_discover(atlas_writer *w, atlas_job *j) {
         atlas_repo_info_free(&repo);
         return;
     }
+    /* A13. The walk reads files, so it walks the tree this process can read.
+     * `atlas_sem_repo_read_root` answers with the mirror for a scanner-backed
+     * repository and with the registered root otherwise -- the same question
+     * `atlas_sem_index_on` asks, asked in the other place that reads. */
+    {
+        atlas_err rr;
+        atlas_err_init(&rr);
+        (void)atlas_sem_repo_read_root(&repo, atlas_buf_cstr(&w->data_dir), &rr);
+    }
     atlas_sem_discovery_result res;
     atlas_sem_discovery_result_init(&res);
     /* The walk is handed the drain, so a repository with a large tree does not

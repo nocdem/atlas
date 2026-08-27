@@ -121,16 +121,17 @@ static void write_compdb(env *e, const char *const *sources, size_t n, atlas_err
     atlas_buf_free(&doc);
 }
 
-static void index_once(env *e, const char *test_roots, atlas_sem_index_summary *sum,
-                       atlas_err *err) {
+static void index_once_at(env *e, const char *test_roots, const char *commit_id,
+                          const char *repo_identity, atlas_sem_index_summary *sum,
+                          atlas_err *err) {
     atlas_sem_index_opts o;
     atlas_sem_index_opts_init(&o);
     o.compdbs = "compile_commands.json";
     o.compdbs_len = strlen("compile_commands.json") + 1u;
     o.atlas_exe = atlas_buf_cstr(&e->exe);
     o.root = atlas_git_root(e->g);
-    o.commit_id = "";
-    o.repo_identity_hash = "";
+    o.commit_id = commit_id;
+    o.repo_identity_hash = repo_identity;
     o.test_roots = test_roots;
     int fd = open(atlas_git_root(e->g), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     T_REQUIRE_MSG(fd >= 0, "cannot open the fixture repository root");
@@ -139,6 +140,15 @@ static void index_once(env *e, const char *test_roots, atlas_sem_index_summary *
     atlas_status st = atlas_sem_index_run(e->db, e->repo_id, &o, sum, err);
     (void)close(fd);
     T_OK(st, err);
+}
+
+/* Every test that predates the commit axis passes an empty commit and an empty
+ * lineage, and an empty stored value never makes a generation stale — which is
+ * exactly why the commit regression below went unnoticed for as long as it
+ * did. New tests that care about either axis call `index_once_at`. */
+static void index_once(env *e, const char *test_roots, atlas_sem_index_summary *sum,
+                       atlas_err *err) {
+    index_once_at(e, test_roots, "", "", sum, err);
 }
 
 static void repo_of(env *e, atlas_repo_info *out, atlas_err *err) {
@@ -478,6 +488,124 @@ static void test_a_no_change_pass_records_that_it_looked(void) {
     T_CHECK_MSG(p.freshness == ATLAS_SEM_FRESH_CURRENT,
                 "a no-change pass left the repository stale, so it would rebuild for ever");
     T_EQ_INT(p.generation_id, first_gen);
+
+    env_close(&e);
+}
+
+static void test_a_no_change_pass_records_the_commit_it_looked_at(void) {
+    /* The loop the test above ends, on the axis it did not cover.
+     *
+     * A commit that changes no compiled source — a merge, a documentation
+     * change, an empty commit — moves `scanned_head` and moves no unit digest,
+     * no compilation-database digest and no scope count. The pass finds nothing
+     * to do; before this regression was fixed it re-stamped the source identity
+     * and left the stored commit alone. Freshness compares the stored commit
+     * against the live one, reads STALE, schedules a build, which finds nothing
+     * to do, which leaves the commit alone... for ever.
+     *
+     * Measured on a live daemon before the fix: 247 translation units
+     * re-examined every 15 seconds against a generation that never advanced,
+     * triggered by an ordinary merge commit. */
+    atlas_err err;
+    atlas_err_init(&err);
+    env e;
+    env_open(&e, &err);
+
+    T_OK(fx_mkdir(fx_repo(&e.fx), "include", &err), &err);
+    T_OK(fx_write(fx_repo(&e.fx), "include/api.h", "int f(int);\n", &err), &err);
+    T_OK(fx_write(fx_repo(&e.fx), "a.c", "#include \"api.h\"\nint f(int x){return x;}\n", &err),
+         &err);
+    const char *srcs[] = {"a.c"};
+    write_compdb(&e, srcs, 1, &err);
+    T_OK(fx_commit(&e.fx, fx_repo(&e.fx), "the sources", &err), &err);
+    run_file_pass(&e, &err);
+
+    atlas_repo_info ri;
+    repo_of(&e, &ri, &err);
+    char first_commit[ATLAS_OID_HEX_MAX + 1];
+    (void)snprintf(first_commit, sizeof first_commit, "%s", ri.scanned_head);
+    atlas_repo_info_free(&ri);
+    T_REQUIRE_MSG(first_commit[0] != '\0', "the fixture repository was never scanned");
+
+    atlas_sem_index_summary sum;
+    index_once_at(&e, NULL, first_commit, "", &sum, &err);
+    T_CHECK(sum.published);
+    const int64_t first_gen = sum.generation_id;
+
+    atlas_sem_plan p;
+    plan_of(&e, &p, &err);
+    T_CHECK_MSG(p.freshness == ATLAS_SEM_FRESH_CURRENT,
+                "a generation indexed at the scanned head did not read current");
+
+    /* A commit that touches no file at all, so the content axis cannot move and
+     * only the commit can explain anything that follows. */
+    const char *commit_argv[] = {"commit", "--allow-empty", "-m", "nothing at all"};
+    T_OK(fx_git_ok(&e.fx, fx_repo(&e.fx), commit_argv, 4, &err), &err);
+    run_file_pass(&e, &err);
+
+    repo_of(&e, &ri, &err);
+    char second_commit[ATLAS_OID_HEX_MAX + 1];
+    (void)snprintf(second_commit, sizeof second_commit, "%s", ri.scanned_head);
+    atlas_repo_info_free(&ri);
+    T_CHECK_MSG(strcmp(first_commit, second_commit) != 0,
+                "the empty commit did not move the scanned head");
+
+    plan_of(&e, &p, &err);
+    T_CHECK_MSG(p.freshness == ATLAS_SEM_FRESH_STALE,
+                "a moved commit left the semantic index reporting itself current");
+
+    /* One pass, which does no work and publishes no new generation. */
+    index_once_at(&e, NULL, second_commit, "", &sum, &err);
+    T_CHECK_MSG(sum.no_change, "the pass rebuilt a generation whose every input was unchanged");
+    T_EQ_INT(sum.generation_id, first_gen);
+
+    /* The assertion this test exists for. */
+    plan_of(&e, &p, &err);
+    T_CHECK_MSG(p.freshness == ATLAS_SEM_FRESH_CURRENT,
+                "a no-change pass left the stored commit behind, so it would rebuild for ever");
+    T_EQ_INT(p.generation_id, first_gen);
+
+    env_close(&e);
+}
+
+static void test_a_moved_repository_lineage_is_never_re_stamped(void) {
+    /* The one axis the no-change path must refuse.
+     *
+     * `repo_identity_hash` is A4's path-qualified lineage fingerprint: it
+     * answers *which repository*, not *which state of it*. Every unit digest
+     * being identical is evidence about content and no evidence at all that a
+     * generation built for one repository describes another, so re-stamping it
+     * would be the one restamp this pass cannot support. A moved lineage takes
+     * the ordinary path instead and seals a generation that records it — which
+     * costs a copy of every unit rather than a reparse, exactly as a moved scope
+     * already does. */
+    atlas_err err;
+    atlas_err_init(&err);
+    env e;
+    env_open(&e, &err);
+
+    T_OK(fx_mkdir(fx_repo(&e.fx), "include", &err), &err);
+    T_OK(fx_write(fx_repo(&e.fx), "include/api.h", "int f(int);\n", &err), &err);
+    T_OK(fx_write(fx_repo(&e.fx), "a.c", "#include \"api.h\"\nint f(int x){return x;}\n", &err),
+         &err);
+    const char *srcs[] = {"a.c"};
+    write_compdb(&e, srcs, 1, &err);
+    run_file_pass(&e, &err);
+
+    const char *lineage_a = "1111111111111111111111111111111111111111111111111111111111111111";
+    const char *lineage_b = "2222222222222222222222222222222222222222222222222222222222222222";
+
+    atlas_sem_index_summary sum;
+    index_once_at(&e, NULL, "", lineage_a, &sum, &err);
+    T_CHECK(sum.published);
+    const int64_t first_gen = sum.generation_id;
+
+    /* Not one byte of the tree moved: only the answer to "which repository". */
+    index_once_at(&e, NULL, "", lineage_b, &sum, &err);
+    T_CHECK_MSG(!sum.no_change,
+                "a moved repository lineage was re-stamped onto the previous generation");
+    T_CHECK_MSG(sum.generation_id != first_gen,
+                "a moved repository lineage did not seal a generation of its own");
 
     env_close(&e);
 }
@@ -1243,6 +1371,10 @@ static const atlas_test TESTS[] = {
      test_an_uncommitted_edit_makes_the_index_stale},
     {"a pass that finds nothing to do still records that it looked",
      test_a_no_change_pass_records_that_it_looked},
+    {"a no-change pass records the commit it looked at",
+     test_a_no_change_pass_records_the_commit_it_looked_at},
+    {"a moved repository lineage is never re-stamped",
+     test_a_moved_repository_lineage_is_never_re_stamped},
     {"coverage is measured against the tree, not the build description",
      test_coverage_is_measured_against_the_tree_not_the_build_description},
     {"without declared test roots the unit scope is unknown",

@@ -191,6 +191,18 @@ atlas_status atlas_db_sem_source_content_digest(atlas_db *db, int64_t repo_id, c
 atlas_status atlas_db_sem_source_identity_set(atlas_db *db, int64_t generation_id,
                                               const char *identity, atlas_err *err);
 
+/* Re-stamps what a no-change pass re-measured onto the generation it kept: the
+ * source identity, the commit, the build-input discovery verdict and the number
+ * of accepted inputs. Its own small transaction, outside the publishing one,
+ * because a no-change pass publishes nothing.
+ *
+ * The lineage is not among them, and that is the contract: a generation whose
+ * `repo_identity_hash` no longer matches is never re-stamped. */
+atlas_status atlas_db_sem_generation_restamp(atlas_db *db, int64_t generation_id,
+                                             const char *identity, const char *commit_id,
+                                             atlas_sem_discovery discovery, int64_t input_count,
+                                             atlas_err *err);
+
 /* Writes the manifest into the generation row. Called inside the publishing
  * transaction, so the manifest and the generation become visible together: a
  * reader must never see a published generation whose coverage is still zero and

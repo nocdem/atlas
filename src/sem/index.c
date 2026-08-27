@@ -1179,8 +1179,22 @@ atlas_status atlas_sem_index_run(atlas_db *db, int64_t repo_id, const atlas_sem_
      * *without creating a generation at all*, which is both cheaper than
      * copying every row forward and more honest: the state Atlas is serving
      * genuinely is the state that was measured. */
+    /* A generation's lineage is not a statement about content, so no comparison
+     * of content may carry it forward. `repo_identity_hash` moving means the row
+     * now describes a different repository — A4's path-qualified fingerprint —
+     * and a generation that recorded the old one must be sealed again rather
+     * than re-stamped. That costs a copy of every unit, not a reparse, which is
+     * exactly what a moved scope already costs.
+     *
+     * Compared only when both sides state one, which is the guard freshness
+     * itself applies: an empty value is no claim, and every pre-A9.2.5
+     * generation holds one. */
+    const bool lineage_moved = have_prev && opts->repo_identity_hash != NULL &&
+                               opts->repo_identity_hash[0] != '\0' &&
+                               prev.repo_identity_hash[0] != '\0' &&
+                               strcmp(opts->repo_identity_hash, prev.repo_identity_hash) != 0;
     bool prereqs_match =
-        !opts->rebuild && have_prev && prev.status == ATLAS_SEM_GEN_COMPLETE &&
+        !opts->rebuild && have_prev && !lineage_moved && prev.status == ATLAS_SEM_GEN_COMPLETE &&
         strcmp(prev.compdb_digest, all_digest) == 0 &&
         strcmp(prev.compiler_version, atlas_sem_compiler_version()) == 0 &&
         strcmp(prev.analyzer_id, ATLAS_SEM_ANALYZER_ID) == 0 &&
@@ -1294,13 +1308,48 @@ atlas_status atlas_sem_index_run(atlas_db *db, int64_t repo_id, const atlas_sem_
                 st = atlas_sem_source_identity(db, &ri, ident, err);
             }
             atlas_repo_info_free(&ri);
-            if (st == ATLAS_OK && strcmp(ident, prev.source_identity) != 0) {
+            /* A9.2.3 shipped the identity alone, and the commit, the discovery
+             * verdict and the accepted-input count were the same defect in three
+             * more columns. Freshness compares all four; this path re-measured
+             * one. So an ordinary merge — which moves the commit and no file
+             * content — left the stored commit behind, freshness read STALE, the
+             * scheduler queued a build, the build took this path, and the commit
+             * stayed behind. Measured on a live daemon before the fix: 247
+             * translation units re-examined every 15 seconds against a
+             * generation that never advanced.
+             *
+             * An absent commit stamps the stored one rather than erasing it. A
+             * caller that supplies none is making no claim about which commit
+             * this tree is at, and "" is not that claim — it is the claim that
+             * it is at none, which is what an unscanned repository says. */
+            const char *stamp_commit = (opts->commit_id != NULL && opts->commit_id[0] != '\0')
+                                           ? opts->commit_id
+                                           : prev.commit_id;
+            atlas_sem_discovery stamp_discovery = prev.discovery;
+            if (st == ATLAS_OK) {
+                /* The stored verdict, not a fresh walk — the same choice the
+                 * seal makes, and for the same reason: it must describe the
+                 * inputs this generation was built from. */
+                atlas_sem_config dcfg;
+                atlas_sem_config_init(&dcfg);
+                if (atlas_db_sem_config_get(db, repo_id, &dcfg, err) == ATLAS_OK) {
+                    stamp_discovery = dcfg.discovery_state;
+                }
+                atlas_sem_config_free(&dcfg);
+            }
+            const int64_t stamp_inputs = (int64_t)slot_count;
+            const bool moved = strcmp(ident, prev.source_identity) != 0 ||
+                               strcmp(stamp_commit, prev.commit_id) != 0 ||
+                               stamp_discovery != prev.discovery ||
+                               stamp_inputs != prev.input_count;
+            if (st == ATLAS_OK && moved) {
                 /* Its own small transaction: nothing else is being written, and
-                 * the identity is measured before it opens — A1's rule that no
-                 * file read happens inside a write transaction. */
+                 * every value it writes was measured before it opens — A1's rule
+                 * that no file read happens inside a write transaction. */
                 st = atlas_db_begin(db, err);
                 if (st == ATLAS_OK) {
-                    st = atlas_db_sem_source_identity_set(db, prev.id, ident, err);
+                    st = atlas_db_sem_generation_restamp(db, prev.id, ident, stamp_commit,
+                                                         stamp_discovery, stamp_inputs, err);
                 }
                 if (st == ATLAS_OK) {
                     st = atlas_db_commit(db, err);

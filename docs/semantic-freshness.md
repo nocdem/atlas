@@ -322,6 +322,29 @@ therefore describes the new tree to exactly the same extent it described the old
 one. It is the same move as sealing a unit's input digest at the end of a pass —
 recording what was measured, once the measurement is complete.
 
+**Four columns, not one.** The identity shipped alone, and the commit, the
+build-input discovery verdict and the accepted-input count were the same defect
+in three more columns: `atlas_sem_freshness_of` compares all four, and this path
+re-measured one. An ordinary merge moves the commit and no file content, so the
+pass found nothing to do, left the stored commit behind, and freshness read
+`the_repository_moved_since_this_index_was_built` — which scheduled a build,
+which took this path, which left the commit behind. Measured on a live daemon
+before the fix: **247 translation units re-examined every 15 seconds against a
+generation that never advanced**, on a repository nobody was editing.
+
+`atlas_db_sem_generation_restamp` writes all four together. An absent commit
+stamps the stored one rather than erasing it: a caller supplying none is making
+no claim about which commit the tree is at, and `""` is not that claim — it is
+the claim that it is at none, which is what an unscanned repository says.
+
+**The lineage is the one value that is never re-stamped.** `repo_identity_hash`
+answers *which repository*, not *which state of one*, and every unit digest
+being identical is evidence about content and no evidence at all that a
+generation built for one repository describes another. A moved lineage does not
+reach the re-stamp: it fails the no-change prerequisites and takes the ordinary
+path, sealing a generation that records it. That costs a copy of every unit
+rather than a reparse — the same price a moved scope already pays.
+
 ## 9. Source changes during a build
 
 The identity is measured **after** the pass and before the publishing

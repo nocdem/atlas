@@ -1117,6 +1117,24 @@ static void run_sem_index(atlas_writer *w, atlas_job *j) {
                                                  why, &rerr);
     }
 
+    /* **A failed pass says so.** The reason was recorded and never logged, so a
+     * daemon rebuilding nothing looked exactly like a daemon with nothing to
+     * rebuild: "semantic index scheduled" every fifteen seconds, no generation
+     * for ninety minutes, and no line anywhere saying why. Measured on this
+     * machine, and it cost most of a day of looking in the wrong places.
+     *
+     * The message is Atlas' own fixed string plus the error text, which is
+     * safe-encoded like every other untrusted value on this path -- a compiler
+     * diagnostic or a path can appear in it. */
+    if (st != ATLAS_OK) {
+        atlas_safe_pool safe;
+        atlas_safe_pool_init(&safe);
+        atlas_daemon_log(w->log, "warn", "semantic index for %s failed: %s",
+                         atlas_safe(&safe, atlas_buf_cstr(&j->arg1)),
+                         atlas_safe(&safe, atlas_err_msg(&err)));
+        atlas_safe_pool_free(&safe);
+    }
+
     atlas_buf detail = ATLAS_BUF_INIT;
     atlas_err derr;
     atlas_err_init(&derr);
@@ -1143,6 +1161,25 @@ static void run_sem_index(atlas_writer *w, atlas_job *j) {
                                 (long long)sum.symbols, (long long)sum.edges,
                                 (long long)sum.units_parsed, (long long)sum.units_reused,
                                 (long long)sum.units_retried);
+    }
+    /* **An automatic pass says what it did.** The summary went only to
+     * `atlas_ops_finish`, and an automatic sweep has no operation -- `op_id` is
+     * zero -- so the daemon rebuilt, or did not rebuild, and told nobody. What
+     * that looked like from outside: "semantic index scheduled" every fifteen
+     * seconds, the generation unchanged for ninety minutes, no error anywhere,
+     * and no way to tell a pass that failed from one that decided there was
+     * nothing to do. Reconcile has logged its own line since A1 for the same
+     * reason. */
+    if (j->op_id == 0 && st == ATLAS_OK) {
+        atlas_safe_pool safe;
+        atlas_safe_pool_init(&safe);
+        atlas_daemon_log(w->log, "info",
+                         "semantic index for %s generation %lld: %lld units, %lld complete, "
+                         "%lld failed",
+                         atlas_safe(&safe, atlas_buf_cstr(&j->arg1)),
+                         (long long)sum.generation_id, (long long)sum.units_total,
+                         (long long)sum.units_complete, (long long)sum.units_failed);
+        atlas_safe_pool_free(&safe);
     }
     atlas_ops_finish(w->ops, j->op_id, st,
                      st == ATLAS_OK ? "semantic index published" : atlas_err_msg(&err),

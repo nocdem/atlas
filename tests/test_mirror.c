@@ -55,20 +55,20 @@ static void test_a_file_round_trips_and_a_second_start_replaces(void) {
     T_REQUIRE(root >= 0);
 
     static const char REL[] = "a/b/c.txt";
-    T_OK(atlas_mirror_put(root, REL, strlen(REL), true, "hello", 5u, &err), &err);
+    T_OK(atlas_mirror_put(root, REL, strlen(REL), true, false, "hello", 5u, &err), &err);
 
     atlas_buf got = ATLAS_BUF_INIT;
     T_CHECK(mirror_read(fx_data_dir(&fx), 7, REL, &got));
     T_CHECK_MSG(got.len == 5u && memcmp(got.data, "hello", 5u) == 0, "round trip lost bytes");
 
     /* Two chunks concatenate. */
-    T_OK(atlas_mirror_put(root, REL, strlen(REL), false, " there", 6u, &err), &err);
+    T_OK(atlas_mirror_put(root, REL, strlen(REL), false, false, " there", 6u, &err), &err);
     T_CHECK(mirror_read(fx_data_dir(&fx), 7, REL, &got));
     T_CHECK_MSG(got.len == 11u && memcmp(got.data, "hello there", 11u) == 0,
                 "append did not concatenate");
 
     /* A second start replaces: a rescanned file must not accumulate. */
-    T_OK(atlas_mirror_put(root, REL, strlen(REL), true, "new", 3u, &err), &err);
+    T_OK(atlas_mirror_put(root, REL, strlen(REL), true, false, "new", 3u, &err), &err);
     T_CHECK(mirror_read(fx_data_dir(&fx), 7, REL, &got));
     T_CHECK_MSG(got.len == 3u && memcmp(got.data, "new", 3u) == 0,
                 "a restarted file accumulated instead of replacing");
@@ -92,7 +92,7 @@ static void test_unsafe_names_are_refused_and_create_nothing(void) {
     for (size_t i = 0; i < sizeof BAD / sizeof BAD[0]; i++) {
         atlas_err e;
         atlas_err_init(&e);
-        T_CHECK_MSG(atlas_mirror_put(root, BAD[i], strlen(BAD[i]), true, "x", 1u, &e) != ATLAS_OK,
+        T_CHECK_MSG(atlas_mirror_put(root, BAD[i], strlen(BAD[i]), true, false, "x", 1u, &e) != ATLAS_OK,
                     "accepted an unsafe path: \"%s\"", BAD[i]);
     }
     /* An embedded NUL, which strlen would not see. */
@@ -100,7 +100,7 @@ static void test_unsafe_names_are_refused_and_create_nothing(void) {
         atlas_err e;
         atlas_err_init(&e);
         static const char NUL_PATH[] = "a\0b";
-        T_CHECK(atlas_mirror_put(root, NUL_PATH, sizeof NUL_PATH - 1u, true, "x", 1u, &e) !=
+        T_CHECK(atlas_mirror_put(root, NUL_PATH, sizeof NUL_PATH - 1u, true, false, "x", 1u, &e) !=
                 ATLAS_OK);
     }
 
@@ -130,7 +130,7 @@ static void test_a_symlinked_component_refuses(void) {
     static const char REL[] = "a/x";
     atlas_err e;
     atlas_err_init(&e);
-    T_CHECK_MSG(atlas_mirror_put(root, REL, strlen(REL), true, "x", 1u, &e) != ATLAS_OK,
+    T_CHECK_MSG(atlas_mirror_put(root, REL, strlen(REL), true, false, "x", 1u, &e) != ATLAS_OK,
                 "a write followed a symlinked component");
 
     (void)close(root);
@@ -151,7 +151,7 @@ static void test_an_append_to_an_unstarted_file_refuses(void) {
     static const char REL[] = "never/started.txt";
     atlas_err e;
     atlas_err_init(&e);
-    T_CHECK(atlas_mirror_put(root, REL, strlen(REL), false, "x", 1u, &e) != ATLAS_OK);
+    T_CHECK(atlas_mirror_put(root, REL, strlen(REL), false, false, "x", 1u, &e) != ATLAS_OK);
 
     atlas_buf probe = ATLAS_BUF_INIT;
     T_CHECK_MSG(!mirror_read(fx_data_dir(&fx), 7, REL, &probe), "an append created a file");
@@ -239,6 +239,40 @@ static void test_a_broken_symlink_is_mirrored_too(void) {
     fx_close(&fx);
 }
 
+/* A13. The executable bit survives the mirror.
+ *
+ * **Git tracks exactly one mode bit**, and the mirror carries the mirrored
+ * index alongside the files -- so a tree's executable file written 0600 compares
+ * `100644` against an index holding `100755`, and git calls that a
+ * modification. Measured on the live tree: a clean repository read as dirty
+ * with 24 files changed, not one of which differed by a byte. Every one was a
+ * script. */
+static void test_the_executable_bit_survives(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    fixture fx;
+    T_REQUIRE(fx_open(&fx, &err) == ATLAS_OK);
+
+    int root = -1;
+    T_OK(atlas_mirror_open_repo(fx_data_dir(&fx), 5, &root, &err), &err);
+    T_REQUIRE(root >= 0);
+
+    T_OK(atlas_mirror_put(root, "script.sh", 9u, true, true, "#!/bin/sh\n", 10u, &err), &err);
+    T_OK(atlas_mirror_put(root, "plain.txt", 9u, true, false, "text\n", 5u, &err), &err);
+
+    struct stat sb;
+    memset(&sb, 0, sizeof(sb));
+    T_REQUIRE(fstatat(root, "script.sh", &sb, AT_SYMLINK_NOFOLLOW) == 0);
+    T_CHECK_MSG((sb.st_mode & S_IXUSR) != 0, "an executable file lost its bit in the mirror");
+
+    memset(&sb, 0, sizeof(sb));
+    T_REQUIRE(fstatat(root, "plain.txt", &sb, AT_SYMLINK_NOFOLLOW) == 0);
+    T_CHECK_MSG((sb.st_mode & S_IXUSR) == 0, "a plain file gained one");
+
+    (void)close(root);
+    fx_close(&fx);
+}
+
 static const atlas_test TESTS[] = {
     {"a file round-trips and a second start replaces",
      test_a_file_round_trips_and_a_second_start_replaces},
@@ -248,6 +282,7 @@ static const atlas_test TESTS[] = {
     {"an append to an unstarted file refuses", test_an_append_to_an_unstarted_file_refuses},
     {"a symlink is mirrored as one", test_a_symlink_is_mirrored_as_one},
     {"a broken symlink is mirrored too", test_a_broken_symlink_is_mirrored_too},
+    {"the executable bit survives", test_the_executable_bit_survives},
 };
 
 ATLAS_TEST_MAIN("mirror", TESTS)

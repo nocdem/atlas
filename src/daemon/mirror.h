@@ -37,7 +37,10 @@ atlas_status atlas_mirror_open_repo(const char *data_dir, int64_t repo_id, int *
  *
  * `rel` must satisfy `atlas_snapshot_path_ok`. One that does not is refused
  * before any descriptor is opened. */
-atlas_status atlas_mirror_put(int root_fd, const void *rel, size_t rel_len, bool first,
+/* `exec` sets the one mode bit git tracks. A file mirrored without it reads as
+ * modified against the mirrored index, because git compares 100755 with 100644
+ * and calls the difference a change. */
+atlas_status atlas_mirror_put(int root_fd, const void *rel, size_t rel_len, bool first, bool exec,
                               const void *data, size_t len, atlas_err *err);
 
 /* A13. Recreates a symlink in the mirror, with the link text the tree holds.

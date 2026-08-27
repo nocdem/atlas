@@ -259,6 +259,12 @@ static atlas_status method_scanner_put(dispatch_state *ds, const atlas_ipc_reque
      * `reconcile.c` is `O_NOFOLLOW` -- so the text is data and never a route. */
     bool is_symlink = false;
     (void)atlas_ipc_param_bool(req, "symlink", &is_symlink);
+    /* The one mode bit git tracks. Absent is false, which is the ordinary file
+     * and the conservative answer: a file wrongly marked executable would show
+     * as modified, and so would one wrongly left plain, but only the second is
+     * what an absent key can produce. */
+    bool is_exec = false;
+    (void)atlas_ipc_param_bool(req, "exec", &is_exec);
 
     atlas_repo_info ri;
     atlas_repo_info_init(&ri);
@@ -293,8 +299,8 @@ static atlas_status method_scanner_put(dispatch_state *ds, const atlas_ipc_reque
     }
     st = is_symlink ? atlas_mirror_put_symlink(root, path, strlen(path), content.data, content.len,
                                                err)
-                    : atlas_mirror_put(root, path, strlen(path), first, content.data, content.len,
-                                       err);
+                    : atlas_mirror_put(root, path, strlen(path), first, is_exec, content.data,
+                                       content.len, err);
     (void)close(root);
     size_t written = content.len;
     atlas_buf_free(&content);

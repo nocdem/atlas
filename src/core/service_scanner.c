@@ -56,6 +56,13 @@ typedef struct walk_ctx {
     int64_t mirrored;
     int64_t skipped_symlink;
     int64_t skipped_unreadable;
+    /* A13. When this walk last told the daemon it is alive.
+     *
+     * The heartbeat is `scanner.poll`, and one poll per pass is not enough: a
+     * pass over 80000 files takes twelve minutes and the staleness bound is
+     * five, so a scanner doing exactly its job would have the repository called
+     * stale for most of every pass. Measured on /opt/dna. */
+    int64_t last_beat_ms;
 } walk_ctx;
 
 /* A13. Tells the daemon a run is starting, which clears `mirror_complete`.
@@ -189,6 +196,38 @@ static atlas_status put_symlink(walk_ctx *w, const void *rel, size_t rel_len, co
     return st;
 }
 
+/* Monotonic milliseconds, for pacing the heartbeat inside a long walk. */
+static int64_t beat_now_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0;
+    }
+    return (int64_t)ts.tv_sec * 1000 + (int64_t)(ts.tv_nsec / 1000000);
+}
+
+/* Tells the daemon this scanner is still working, if enough time has passed.
+ *
+ * `scanner.poll` is the heartbeat — asking what is owed is the evidence of being
+ * alive — and a pass long enough to outlast the staleness bound has to say so
+ * more than once. Half the cadence, so two beats fit inside every bound.
+ *
+ * The answer is discarded: what this call establishes is that the request
+ * arrived, and a directive read mid-walk would change what the walk is already
+ * doing. A failure is ignored for the same reason a failed pass is survived —
+ * the daemon simply stops hearing, which is what it should conclude. */
+static void beat(walk_ctx *w) {
+    int64_t now = beat_now_ms();
+    if (w->last_beat_ms != 0 && now - w->last_beat_ms < ATLAS_SCANNER_POLL_INTERVAL_MS / 2) {
+        return;
+    }
+    w->last_beat_ms = now;
+    atlas_buf raw = ATLAS_BUF_INIT;
+    atlas_err beat_err;
+    atlas_err_init(&beat_err);
+    (void)atlas_ipc_call(w->socket_path, "scanner.poll", "{}", &raw, &beat_err);
+    atlas_buf_free(&raw);
+}
+
 /* Mirrors one regular file at `rel` beneath the repository root.
  *
  * Shared by the tracked walk and the `.git` walk, so both get the same
@@ -213,6 +252,7 @@ static void mirror_one(walk_ctx *w, const void *rel, size_t rel_len) {
     if (w->status != ATLAS_OK) {
         return;
     }
+    beat(w);
     atlas_path_open_result res = ATLAS_PATH_OPEN_OK;
     int fd = -1;
     struct stat sb;
@@ -258,6 +298,21 @@ static void mirror_one(walk_ctx *w, const void *rel, size_t rel_len) {
             w->skipped_symlink++;
         } else if (res == ATLAS_PATH_OPEN_UNSAFE) {
             w->skipped_symlink++;
+        } else if (res == ATLAS_PATH_OPEN_MISSING) {
+            /* **A file that is gone is not a gap.** `git ls-files` listed it and
+             * it went away before this walk reached it -- a race, not a failure,
+             * and the mirror not holding it is the correct outcome rather than
+             * an incomplete one.
+             *
+             * Counting it as a skip made an actively-built repository
+             * permanently unindexable: a pass over `/opt/dna` takes twelve
+             * minutes, build outputs come and go inside that window, and every
+             * pass therefore ended with "9 unreadable" and refused to claim
+             * completeness. Three hours of no indexing, with nothing wrong.
+             *
+             * Not counted at all, deliberately. A counter that rises for a file
+             * that does not exist would report a problem nobody can act on. */
+            (void)0;
         } else {
             w->skipped_unreadable++;
         }

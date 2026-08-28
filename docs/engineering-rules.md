@@ -23,6 +23,82 @@ Read the section for the layer you are about to change. The rules are cumulative
 a later season's rules do not repeal an earlier season's unless they say so in
 those words, and every deliberate reversal in Atlas is written down as one.
 
+## Reporting rules — these are not negotiable
+
+These two are older than any season and apply to every one of them, which is why
+they sit above the season sections rather than inside one. They govern how a
+finding reaches a reader: a question, a report, a commit message, a note file, a
+code comment. They are not style preferences. Each exists because breaking it
+produced a **wrong answer that survived review**, and each was measured on this
+project rather than reasoned about.
+
+### A LABEL YOU COINED IS NOT VOCABULARY
+
+**Never ask a question, or state a finding, in an identifier you invented.**
+`RC-A`, `F-10`, `DG-3`, `Faz 4b` are search keys — useful for finding a passage
+again, worthless for communicating one. The reader has no way to decode such a
+label and, more importantly, **no way to check it**: a sentence whose subject is
+an opaque token cannot be disagreed with, so it passes review by being
+unreviewable.
+
+A label may *index* an explanation. It may never *replace* one. The first time it
+appears in any message, the thing it names is stated in full, in the reader's
+terms. After that it is shorthand for something the reader now holds.
+
+**A citation is not an explanation either.** "See `docs/watcher-consistency.md`"
+names where an argument lives; it does not make the argument. A reader who has to
+go and find it has been handed a lookup instead of an answer, and the writer has
+been spared the one step — restating the claim in their own words — where an
+error in it would have shown. Cite *after* explaining, as the source, never
+instead of explaining.
+
+**Measured.** In the 2026-08-28 session the label `RC-A` was defined once and
+then used a dozen times across reports and questions — "RC-A kapandı", "RC-A'nın
+nüksü değil", "bugs.md 9", "#8". The operator read *that something closed* and
+could not read *what*. The finding underneath was correct; the reporting made it
+uncheckable, which for a reader is the same as not having it. The remedy is
+mechanical: state the mechanism, then the tag.
+
+### EVERY EVENT GETS ITS CAUSAL CHAIN, WRITTEN OUT
+
+**No event happens without a cause, so the cause chain is written.** Not to
+lengthen a report — length is a cost, and this rule pays it for one reason:
+**the chain is the instrument that catches the writer's own error.** Prose can
+assert an outcome with no mechanism behind it and read perfectly well. A chain
+cannot: every link has to name a thing that acts on the next one, and a missing
+link is visible as a gap rather than hidden as a smooth sentence.
+
+From which the operative half follows: **if you cannot write the cause, the
+scenario is not real.** An unwritten chain is not a chain the writer has and
+chose to omit; it is a chain the writer does not have. Reporting such a scenario
+as real is the defect — not the omission of detail, but the claim itself. Write
+the chain first, then decide whether the finding survives it. Findings that do
+not survive are the point of the exercise.
+
+This is the same discipline the A9.2.2 rules apply to absence, one level up: **no
+evidence of a mechanism is not evidence of a mechanism.** A verdict with no chain
+under it is an inference presented as an observation.
+
+**Measured, twice, in the 2026-08-28 session.**
+
+A fix to `/opt/dna/.gitignore` was reported as having "broken the root cause at
+its source". The measurement behind that was sound — 75,887 untracked files fell
+to 275, and a `git ls-files --others` that had been exceeding a 60-second timeout
+returned in 12 ms. The *permanence* half was asserted without a chain. Writing
+one would have taken four links — `.gitignore` is a tracked file → the repository
+had concurrent uncommitted work → an ordinary `git checkout` restores tracked
+files → an uncommitted rule does not survive one — and the fourth link is the
+refutation. It was not written, so the claim shipped. Twenty minutes later the
+rule was gone and a scanner pass mirrored the full 98,992 files again. The
+measurement was right; the unwritten chain is what made the conclusion wrong.
+
+The same session's first deploy script asserted a failed installation from a
+digest mismatch. The chain was never written, because writing it would have
+required naming what `cmake --install` does to a binary — it strips the RPATH —
+at which point the mismatch is the expected result of a *successful* install. The
+script reported a failure that had not happened, and the operator would have
+started debugging a working system.
+
 ## A1 layers — additions
 
 ```

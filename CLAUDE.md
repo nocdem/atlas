@@ -133,6 +133,7 @@ See `docs/semantic-trust.md`.
 apply from the first turn and nothing else:
 
 - the hard rules and the architecture invariants;
+- the reporting rules, which govern how any finding here is stated;
 - the concurrency, safety and untrusted-input contracts;
 - the build, test and wiring facts you need to change anything;
 - a one-line statement of every season's non-negotiable rules, and where the
@@ -337,6 +338,30 @@ streaming writer, so A0's escaping contract is the one the daemon speaks.
 - **Never install, enable or start a real systemd service** from code or from a
   test. `atlas service install` writes a unit and does nothing else; the suite
   exercises it against temporary XDG fixtures only.
+
+## Reporting rules — these are not negotiable
+
+How a finding reaches a reader — a question, a report, a commit message, a note,
+a code comment. Not style: each one exists because breaking it produced a wrong
+answer that survived review, and both were measured on this project. The
+argument for each is in `docs/engineering-rules.md` under the same heading.
+
+- **A label you coined is not vocabulary.** Never ask a question or state a
+  finding in an identifier you invented — `RC-A`, `F-10`, `DG-3`, `Faz 4b` are
+  search keys, and a sentence whose subject is an opaque token cannot be
+  disagreed with, so it passes review by being unreviewable. A label may
+  **index** an explanation and may never **replace** one: the first time it
+  appears in a message, state in full what it names. **A citation is not an
+  explanation either** — "see `docs/x.md`" names where the argument lives
+  instead of making it, and spares the writer the one step where an error in it
+  would have shown. Cite after explaining, as the source, never instead.
+- **Every event gets its causal chain, written out.** No event happens without a
+  cause, so the cause is written — not to lengthen the report, but because **the
+  chain is the instrument that catches your own error**: prose can assert an
+  outcome with no mechanism and read perfectly well, while a chain shows a
+  missing link as a gap. From which the operative half follows: **if you cannot
+  write the cause, the scenario is not real**, and reporting it as real is the
+  defect. Write the chain first, then decide whether the finding survives it.
 
 ## Architecture invariants
 

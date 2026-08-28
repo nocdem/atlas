@@ -21,3 +21,8 @@ compile_commands.json
 # Site-local deployment reports: they name a specific machine, its indexed
 # repositories and its backup digests, none of which belong in a public repo.
 *.local.md
+
+# Site-local deployment scripts, for the same reason: deploy.local.sh names
+# this machine's service unit, its install prefix and its build-directory
+# owner. The procedure is general; every value in it is not.
+*.local.sh

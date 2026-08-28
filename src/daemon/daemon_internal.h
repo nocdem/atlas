@@ -449,10 +449,12 @@ atlas_status atlas_writer_call_repo_add(atlas_writer *w, const char *path, const
 atlas_status atlas_writer_call_repo_scanner(atlas_writer *w, const char *name,
                                             const char *uid_text, int timeout_ms,
                                             atlas_writer_result *result, atlas_err *err);
-/* A13. Records a mirroring run's verdict, through the writer. */
-atlas_status atlas_writer_call_mirror_state(atlas_writer *w, int64_t repo_id, bool complete,
-                                            int timeout_ms, atlas_writer_result *result,
-                                            atlas_err *err);
+/* A13. Queues a mirroring run's verdict and does not wait for it: the caller is
+ * answered when the work is accepted, and `scanner.poll` carries the outcome.
+ * There is no waiting form, deliberately — a caller that waited would need a
+ * bound on how long the writer may be busy, and Atlas has none. */
+atlas_status atlas_writer_submit_mirror_state(atlas_writer *w, int64_t repo_id, bool complete,
+                                              atlas_err *err);
 
 /* Queues one AI-session operation and waits for it, bounded by `timeout_ms`.
  *

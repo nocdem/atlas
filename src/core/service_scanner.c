@@ -670,11 +670,22 @@ static atlas_status scan_pass(int64_t *poll_within_ms, FILE *log, atlas_err *err
         /* Not ignored. A state report that did not land means the daemon still
          * refuses to read this mirror, and a run that reported "mirrored 4685,
          * skipped 0" while the daemon went on saying "no complete mirror yet"
-         * is exactly the silence this run has to break. */
+         * is exactly the silence this run has to break.
+         *
+         * What it may claim, though, is only that the daemon did not *confirm*
+         * the run. `scanner.state` is answered when the write is accepted, so a
+         * failure here is a refusal or a lost answer, and a lost answer is not
+         * evidence that nothing was recorded — A9.2.6's rule that backing out
+         * and timing out are different claims. The earlier wording said the
+         * daemon "did not record this run" and was measured saying it about a
+         * run the daemon had recorded. The next poll settles it either way: its
+         * directive asks for a full mirror again while none is complete. */
         atlas_status said = say_state(&w, complete);
         if (said != ATLAS_OK && log != NULL) {
-            (void)fprintf(log, "  %s  WARNING: the daemon did not record this run: %s\n", name,
-                          atlas_err_msg(err));
+            (void)fprintf(log,
+                          "  %s  WARNING: the daemon did not confirm this run, so the next poll "
+                          "will ask for it again: %s\n",
+                          name, atlas_err_msg(err));
         }
 
         if (log != NULL) {

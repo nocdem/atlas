@@ -19,6 +19,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "atlas/atlas.h"
@@ -404,6 +405,116 @@ static void test_the_exec_bit_crosses_the_wire(void) {
     env_close(&e);
 }
 
+
+/* --- A13: a mirror state is answered when it is accepted -------------------- */
+
+/* Polls until the directive for this uid's repositories carries `want`, which is
+ * how a scanner learns what the daemon recorded: the poll is the confirmation
+ * channel, so nothing goes silent when the response to `scanner.state` stops
+ * carrying the outcome. */
+static bool wait_for_directive(env *e, const char *want) {
+    for (int i = 0; i < 250; i++) {
+        atlas_buf raw = ATLAS_BUF_INIT;
+        atlas_ipc_response *r = call(e, (long long)getuid(), "scanner.poll", "{}", &raw);
+        const bool got = atlas_ipc_response_ok(r) && strstr(atlas_buf_cstr(&raw), want) != NULL;
+        atlas_ipc_response_free(r);
+        atlas_buf_free(&raw);
+        if (got) {
+            return true;
+        }
+        usleep(20000);
+    }
+    return false;
+}
+
+static void test_a_mirror_state_is_answered_when_it_is_accepted(void) {
+    /* A8-CI's rule, one layer down: an operation that can outlast a client's
+     * patience does not run in the serve loop, and the client is answered when
+     * the work is *accepted*.
+     *
+     * Measured on a live daemon: a scanner's `scanner.state` arrived while the
+     * writer was 19,864 ms into a full reconciliation of the same repository —
+     * every one of 21,996 files re-hashed, because publishing a mirror
+     * generation replaces every inode and no stored filesystem identity
+     * survives it — and the call timed out reading its response frame. The
+     * write had been queued and did land, so the scanner's warning that the
+     * daemon "did not record this run" was false. A9.2.6 already says why that
+     * is the wrong claim: backing out and timing out are different, and only
+     * one of them means nothing was queued.
+     *
+     * Raising the scanner's deadline instead would have needed a bound on how
+     * long a reconciliation may take, and there is no such bound in Atlas to
+     * derive one from. */
+    env e;
+    env_open(&e);
+    atlas_err err;
+    atlas_err_init(&err);
+
+    FILE *log = fopen("/dev/null", "we");
+    T_REQUIRE_MSG(log != NULL, "cannot open a log sink");
+    atlas_writer *w = NULL;
+    T_OK(atlas_writer_start(atlas_buf_cstr(&e.db_path), fx_data_dir(&e.fx), "", NULL, log, &w,
+                            &err),
+         &err);
+    e.ctx.writer = w;
+
+    /* One file, so the run has something to publish. */
+    atlas_buf raw = ATLAS_BUF_INIT;
+    atlas_buf params = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_appendf(&params, &err,
+                           "{\"repo\":%lld,\"path\":\"src/a.c\",\"first\":true,"
+                           "\"data\":\"696e7420783b\"}",
+                           (long long)e.mine),
+         &err);
+    atlas_ipc_response *pr =
+        call(&e, (long long)getuid(), "scanner.put", atlas_buf_cstr(&params), &raw);
+    T_CHECK_MSG(atlas_ipc_response_ok(pr), "scanner.put failed: %s", atlas_buf_cstr(&raw));
+    atlas_ipc_response_free(pr);
+    atlas_buf_reset(&params);
+    atlas_buf_reset(&raw);
+
+    /* Hold the writer inside a reconciliation, which is exactly what it was
+     * doing when this failed in production. */
+    atlas_writer_test_stall(w, ATLAS_JOB_RECONCILE);
+    (void)atlas_writer_submit_reconcile(w, e.mine, false, false, NULL, 0, NULL, &err);
+    bool stalled = false;
+    for (int i = 0; i < 250 && !stalled; i++) {
+        stalled = atlas_writer_test_stalled(w);
+        if (!stalled) {
+            usleep(20000);
+        }
+    }
+    T_REQUIRE_MSG(stalled, "the writer never entered the stall");
+
+    struct timespec t0;
+    struct timespec t1;
+    (void)clock_gettime(CLOCK_MONOTONIC, &t0);
+    T_OK(atlas_buf_appendf(&params, &err, "{\"repo\":%lld,\"complete\":true}", (long long)e.mine),
+         &err);
+    atlas_ipc_response *r =
+        call(&e, (long long)getuid(), "scanner.state", atlas_buf_cstr(&params), &raw);
+    (void)clock_gettime(CLOCK_MONOTONIC, &t1);
+    const long long took_ms = (long long)((t1.tv_sec - t0.tv_sec) * 1000) +
+                              (long long)((t1.tv_nsec - t0.tv_nsec) / 1000000);
+
+    T_CHECK_MSG(atlas_ipc_response_ok(r),
+                "a mirror state was refused while the writer was busy: %s", atlas_buf_cstr(&raw));
+    T_CHECK_MSG(took_ms < 1000, "a mirror state waited %lld ms for a busy writer", took_ms);
+    atlas_ipc_response_free(r);
+    atlas_buf_free(&params);
+    atlas_buf_free(&raw);
+
+    /* Accepted is not lost. Once the writer is free the record lands, and the
+     * poll stops asking for a full mirror — which is what makes answering early
+     * safe rather than merely quick. */
+    atlas_writer_test_release(w);
+    T_CHECK_MSG(wait_for_directive(&e, "\"incremental\""),
+                "an accepted mirror state never reached the row");
+
+    atlas_writer_stop(w);
+    (void)fclose(log);
+    env_close(&e);
+}
 static const atlas_test TESTS[] = {
     {"a scanner is told its own repositories and no others",
      test_a_scanner_is_told_its_own_repositories_and_no_others},
@@ -417,6 +528,8 @@ static const atlas_test TESTS[] = {
     {"a uid that owns nothing is refused and names no repository",
      test_a_uid_that_owns_nothing_is_refused_and_names_no_repository},
     {"uid zero is never a scanner", test_uid_zero_is_never_a_scanner},
+    {"a mirror state is answered when it is accepted",
+     test_a_mirror_state_is_answered_when_it_is_accepted},
 };
 
 ATLAS_TEST_MAIN("scanner_rpc", TESTS)

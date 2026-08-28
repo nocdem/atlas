@@ -1783,6 +1783,66 @@ atlas_status atlas_writer_submit_reconcile(atlas_writer *w, int64_t repo_id, boo
     return ATLAS_OK;
 }
 
+/* A13. Queues a mirror state and does not wait for it.
+ *
+ * A8-CI's rule, one layer down: an operation that can outlast a client's
+ * patience does not run in the serve loop, and the client is answered when the
+ * work is *accepted*. Measured on a live daemon: a scanner's `scanner.state`
+ * arrived while the writer was 19,864 ms into a full reconciliation of the same
+ * repository — every one of 21,996 files re-hashed, because publishing a mirror
+ * generation replaces every inode and no stored filesystem identity survives it
+ * — and the call timed out reading its response frame. The write had been queued
+ * and did land, so the warning the scanner printed was false.
+ *
+ * Nothing goes silent. `scanner.poll` answers `full` while no complete mirror
+ * exists, so a job that fails is answered by the next poll asking for the
+ * mirror again — the poll is the confirmation channel, exactly as it is the
+ * heartbeat. Raising the scanner's deadline instead would have needed a bound
+ * on how long a reconciliation may take, and Atlas has no such bound to derive
+ * one from.
+ *
+ * Not coalesced, unlike a reconciliation: two states for one repository are two
+ * different assertions about it, and the later one is not a repetition of the
+ * earlier. */
+atlas_status atlas_writer_submit_mirror_state(atlas_writer *w, int64_t repo_id, bool complete,
+                                              atlas_err *err) {
+    if (w == NULL || repo_id <= 0) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "a mirror state needs a repository id");
+    }
+    atlas_job *j = job_new(ATLAS_JOB_MIRROR_STATE);
+    if (j == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory queueing a mirror state");
+    }
+    char id[32];
+    (void)snprintf(id, sizeof(id), "%lld", (long long)repo_id);
+    atlas_status st = atlas_buf_set_str(&j->arg1, id, err);
+    if (st != ATLAS_OK) {
+        job_free(j);
+        return st;
+    }
+    j->repo_id = repo_id;
+    j->exact_root = complete;
+
+    (void)pthread_mutex_lock(&w->lock);
+    if (w->stopping) {
+        (void)pthread_mutex_unlock(&w->lock);
+        job_free(j);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "the Atlas daemon is shutting down");
+    }
+    j->sync_seq = ++w->next_sync_seq;
+    if (!queue_push(w, j)) {
+        (void)pthread_mutex_unlock(&w->lock);
+        job_free(j);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                             "the Atlas daemon's write queue is full (%u pending); the request was "
+                             "refused rather than dropped",
+                             (unsigned)ATLAS_WRITER_QUEUE_MAX);
+    }
+    (void)pthread_cond_signal(&w->not_empty);
+    (void)pthread_mutex_unlock(&w->lock);
+    return ATLAS_OK;
+}
+
 /* Fire-and-forget notification jobs from the watcher.
  *
  * A full queue drops these rather than blocking the watcher: the flags they
@@ -2043,13 +2103,6 @@ atlas_status atlas_writer_call_repo_scanner(atlas_writer *w, const char *name,
  * because a job carries no field of its own for either; see `run_mirror_state`.
  * It goes through the writer because it is a write: `scanner.state` first did it
  * on the dispatch handle, which is read-only, and failed every time. */
-atlas_status atlas_writer_call_mirror_state(atlas_writer *w, int64_t repo_id, bool complete,
-                                            int timeout_ms, atlas_writer_result *result,
-                                            atlas_err *err) {
-    char id[32];
-    (void)snprintf(id, sizeof(id), "%lld", (long long)repo_id);
-    return writer_call_impl(w, ATLAS_JOB_MIRROR_STATE, id, "", complete, timeout_ms, result, err);
-}
 
 void atlas_writer_test_stall(atlas_writer *w, atlas_job_kind kind) {
     (void)pthread_mutex_lock(&w->lock);

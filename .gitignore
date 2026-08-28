@@ -26,3 +26,4 @@ compile_commands.json
 # this machine's service unit, its install prefix and its build-directory
 # owner. The procedure is general; every value in it is not.
 *.local.sh
+*.local.service

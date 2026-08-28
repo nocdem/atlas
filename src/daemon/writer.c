@@ -937,6 +937,17 @@ static void mark_all_repos_gapped(atlas_db *db, const char *detail) {
  * so nothing in `src/sem` or `src/core` names a daemon type. */
 static void writer_yield_cb(void *ud);
 
+/* What an unbounded job calls to learn that the daemon is stopping, and the
+ * record of whether it ever answered yes. Declared here and defined beside the
+ * drain, because it is the same shape and answers from the same flag; the
+ * reasoning is at the definition. */
+typedef struct writer_cancel_state {
+    atlas_writer *w;
+    bool fired;
+} writer_cancel_state;
+
+static bool writer_cancel_cb(void *ud);
+
 /* A8-CI closeout: build a semantic index on the writer thread.
  *
  * This is the serialized writer path the closeout requires, and putting it here
@@ -1067,14 +1078,23 @@ static void run_sem_index(atlas_writer *w, atlas_job *j) {
         (void)atlas_sem_source_identity(w->db, &repo, attempt_identity, &ignored);
     }
 
+    /* Whether this pass was stopped by us rather than by anything about the
+     * repository. It has to be remembered rather than re-derived, because
+     * `stopping` can become true in the moment after a pass finished normally,
+     * and that is a different fact from "this pass was cut short". */
+    writer_cancel_state cancel_state = {w, false};
+
     if (st == ATLAS_OK) {
         /* The pass is handed the drain. This is the job the season is about: it
          * runs a compiler over every unit the build describes, and until it
          * offered the thread back between them nothing else in this daemon was
-         * written for as long as it took. */
+         * written for as long as it took.
+         *
+         * It is handed the cancel beside it so that shutting down does not have
+         * to wait for the whole of it; see `writer_cancel_cb`. */
         st = atlas_sem_index_on(w->db, atlas_buf_cstr(&w->data_dir), &repo, compdbs, n,
-                                j->sem_rebuild, writer_yield_cb, w, &sum,
-                                &err);
+                                j->sem_rebuild, writer_yield_cb, w, writer_cancel_cb,
+                                &cancel_state, &sum, &err);
     }
 
     /* Only an *automatic* attempt feeds the governor, and `op_id == 0` is how
@@ -1085,7 +1105,26 @@ static void run_sem_index(atlas_writer *w, atlas_job *j) {
      * than be told the governor is holding — and their attempt must not be able
      * to clear a governor record either, which is why success only clears it on
      * this path. */
-    if (j->op_id == 0) {
+    /* **A pass Atlas stopped is not evidence about the repository.**
+     *
+     * Cancellation surfaces as `ATLAS_ERR_USAGE`, which the classification below
+     * reads as `ATLAS_SEM_WHY_BUILD_DESCRIPTION` — the build description is
+     * broken, go and fix your compilation database. That would be false, and it
+     * would not merely mislead: that reason holds the governor while the source
+     * identity is unchanged, so a shutdown landing mid-pass would leave the
+     * repository refusing to rebuild until somebody happened to edit a file.
+     *
+     * So the attempt is not recorded at all. Not recorded is the truthful state:
+     * Atlas learned nothing about this repository, and the governor keeps
+     * whatever it already held. The next daemon derives freshness from the
+     * stored generation exactly as it would have, finds it stale, and schedules
+     * the pass again. */
+    if (cancel_state.fired && j->op_id == 0) {
+        atlas_daemon_log(w->log, "info",
+                         "semantic index for repository %lld was cancelled because the daemon is "
+                         "stopping; nothing was published and no attempt was recorded",
+                         (long long)j->repo_id);
+    } else if (j->op_id == 0) {
         atlas_err rerr;
         atlas_err_init(&rerr);
         /* The reason stored is a fixed Atlas string, never the error text: an
@@ -1126,7 +1165,7 @@ static void run_sem_index(atlas_writer *w, atlas_job *j) {
      * The message is Atlas' own fixed string plus the error text, which is
      * safe-encoded like every other untrusted value on this path -- a compiler
      * diagnostic or a path can appear in it. */
-    if (st != ATLAS_OK) {
+    if (st != ATLAS_OK && !cancel_state.fired) {
         atlas_safe_pool safe;
         atlas_safe_pool_init(&safe);
         atlas_daemon_log(w->log, "warn", "semantic index for %s failed: %s",
@@ -1461,6 +1500,46 @@ static void writer_yield(atlas_writer *w) {
  * or a queue. */
 static void writer_yield_cb(void *ud) {
     writer_yield((atlas_writer *)ud);
+}
+
+/* Whether an unbounded pass should abandon what it is building because the
+ * daemon is stopping.
+ *
+ * `stopping` was read at every submission point and in the idle wait, and
+ * nowhere inside a running job — so `atlas_writer_stop` set it, broadcast, and
+ * then joined a thread that still had a compiler pass over every translation
+ * unit ahead of it. Measured on this machine 2026-08-28: two consecutive
+ * shutdowns exceeded `TimeoutStopSec=30`, both with semantic maintenance live,
+ * and systemd killed the daemon with SIGKILL. The next start then logged that
+ * the previous one had not shut down cleanly and marked every repository
+ * incomplete, which is a full pass owed for a shutdown that was orderly right
+ * up to the point nobody told the pass about it.
+ *
+ * The test channel already worked this way and is the evidence the shape was
+ * understood: the stall in `writer_run_job` releases on `stopping`, "so a
+ * stalled writer is still joinable". A real pass had no equivalent.
+ *
+ * Answering true fails the generation rather than publishing a partial one,
+ * which is the contract `atlas_sem_index_opts.cancel` already states — and it is
+ * the right answer here, because A9.2.5's rule is that an interrupted index
+ * never replaces the last valid generation. A shutdown costs the work done so
+ * far and nothing else: the next daemon finds the stored generation stale and
+ * schedules the pass again.
+ *
+ * The lock is taken because `stopping` is written under it. This runs on the
+ * writer thread between units, where no lock is held and no transaction is
+ * open, so there is nothing here to deadlock against. */
+static bool writer_cancel_cb(void *ud) {
+    writer_cancel_state *cs = (writer_cancel_state *)ud;
+    (void)pthread_mutex_lock(&cs->w->lock);
+    const bool stopping = cs->w->stopping;
+    (void)pthread_mutex_unlock(&cs->w->lock);
+    if (stopping) {
+        /* Written on the writer thread and read on the writer thread, after the
+         * pass has returned. No other thread touches it. */
+        cs->fired = true;
+    }
+    return stopping;
 }
 
 static void *writer_main(void *arg) {

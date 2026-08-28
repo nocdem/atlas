@@ -1813,9 +1813,22 @@ atlas_status atlas_service_sem_index(atlas_ctx *ctx, const char *name, const cha
 atlas_status atlas_sem_repo_read_root(atlas_repo_info *repo, const char *data_dir,
                                       atlas_err *err);
 
+/* `cancel` is polled between translation units and, when it answers true, the
+ * generation is abandoned rather than published — `atlas_sem_index_opts.cancel`,
+ * carried through untouched. It is separate from `yield` because the two answer
+ * opposite questions: `yield` lends the thread and cannot fail the pass, and
+ * this one ends it.
+ *
+ * The daemon supplies it so that shutting down does not have to wait for a pass
+ * over every unit the build describes. Without it `atlas_writer_stop` set
+ * `stopping`, which is read at every submission point and in the idle wait and
+ * nowhere inside a running job, and then joined a thread that had minutes of
+ * work left. A CLI caller passes NULL: the process running the pass is the
+ * process that asked for it, and it has no shutdown of its own to observe. */
 atlas_status atlas_sem_index_on(atlas_db *db, const char *data_dir, const atlas_repo_info *repo,
                                 const char *const *compdbs, size_t compdb_count, bool rebuild,
                                 void (*yield)(void *ud), void *yield_ud,
+                                bool (*cancel)(void *ud), void *cancel_ud,
                                 atlas_sem_index_summary *out, atlas_err *err);
 
 /* The daemon-served form: queue the index on the writer thread and poll until

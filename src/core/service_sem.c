@@ -834,10 +834,13 @@ atlas_status atlas_service_sem_index(atlas_ctx *ctx, const char *name, const cha
     if (st == ATLAS_OK) {
         /* No yield: this is the local CLI path, where the process running the
          * pass is the process that asked for it and there is nothing else on
-         * this thread to lend it to. */
+         * this thread to lend it to. No cancel either, and for the mirror of
+         * that reason: there is no shutdown for this pass to observe, because
+         * the only thing that could ask it to stop is the operator's own signal
+         * ending the whole process. */
         st = atlas_sem_index_on(atlas_ctx_db(ctx), atlas_ctx_data_dir(ctx), &repo, compdbs,
                                 compdb_count, rebuild, NULL,
-                                NULL, out, err);
+                                NULL, NULL, NULL, out, err);
     }
     atlas_buf_free(&accepted);
     atlas_repo_info_free(&repo);
@@ -906,6 +909,7 @@ static atlas_status point_at_read_root(atlas_repo_info *repo, const char *data_d
 atlas_status atlas_sem_index_on(atlas_db *db, const char *data_dir, const atlas_repo_info *repo_in,
                                 const char *const *compdbs, size_t compdb_count, bool rebuild,
                                 void (*yield)(void *ud), void *yield_ud,
+                                bool (*cancel)(void *ud), void *cancel_ud,
                                 atlas_sem_index_summary *out, atlas_err *err) {
     /* Mutable, because `point_at_read_root` corrects where the files are. The
      * buffers are shared with the caller's row, so only `root_path` is
@@ -1006,6 +1010,13 @@ atlas_status atlas_sem_index_on(atlas_db *db, const char *data_dir, const atlas_
          * there, and a CLI caller puts nothing there at all. */
         o.yield = yield;
         o.yield_ud = yield_ud;
+        /* Carried through untouched for the same reason and to the same place.
+         * The two are deliberately not one callback: `yield` returns nothing and
+         * this pass cannot fail because of it, while `cancel` answering true
+         * abandons the generation — and abandoning it is what keeps a partial
+         * index from ever replacing the last valid one. */
+        o.cancel = cancel;
+        o.cancel_ud = cancel_ud;
         st = atlas_sem_index_run(db, repo.id, &o, out, err);
     }
 

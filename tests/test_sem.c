@@ -149,6 +149,42 @@ static void index_once(env *e, bool rebuild, atlas_sem_index_summary *sum, atlas
     T_OK(st, err);
 }
 
+/* The same pass, told to stop, and the status returned rather than asserted —
+ * abandoning is the expected outcome here, not a failure of the fixture. */
+static atlas_status index_once_cancelling(env *e, bool rebuild, bool (*cancel)(void *ud),
+                                          void *cancel_ud, atlas_sem_index_summary *sum,
+                                          atlas_err *err) {
+    atlas_sem_index_opts o;
+    atlas_sem_index_opts_init(&o);
+    o.compdbs = "compile_commands.json";
+    o.compdbs_len = strlen("compile_commands.json") + 1u;
+    o.rebuild = rebuild;
+    o.atlas_exe = atlas_buf_cstr(&e->exe);
+    o.root = atlas_git_root(e->g);
+    o.commit_id = "";
+    o.repo_identity_hash = "";
+    o.root_fd = -1;
+    o.cancel = cancel;
+    o.cancel_ud = cancel_ud;
+
+    int fd = open(atlas_git_root(e->g), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    T_REQUIRE_MSG(fd >= 0, "cannot open the fixture repository root");
+    o.root_fd = fd;
+
+    atlas_sem_index_summary_init(sum);
+    atlas_status st = atlas_sem_index_run(e->db, e->repo_id, &o, sum, err);
+    (void)close(fd);
+    return st;
+}
+
+/* What a daemon shutting down looks like to a pass: a flag `atlas_writer_stop`
+ * has already set, read between units. The count is so the test can tell "the
+ * pass stopped because it was asked" from "the pass never got that far". */
+static bool cancel_and_count(void *ud) {
+    (*(int *)ud)++;
+    return true;
+}
+
 /* --- collectors ------------------------------------------------------------- */
 
 typedef struct symbol_hit {
@@ -1255,12 +1291,75 @@ static void test_imperative_task_prose_changes_nothing(void) {
     env_close(&e);
 }
 
+/* A pass that is asked to stop abandons what it was building, and the last
+ * valid generation is still the one a reader gets.
+ *
+ * This is the shutdown path, tested where the mechanism is rather than through
+ * a daemon. `stopping` was read at every submission point and in the idle wait
+ * and nowhere inside a running job, so `atlas_writer_stop` set it and then
+ * joined a thread with a compiler pass over every unit still ahead of it.
+ * Measured 2026-08-28: two consecutive shutdowns exceeded systemd's 30-second
+ * stop timeout, both with semantic maintenance live, and the daemon was killed
+ * — after which the next start marked every repository incomplete, which is a
+ * full pass owed for a shutdown that was orderly until nobody told the pass.
+ *
+ * The half that matters is the second assertion. Stopping early is only safe
+ * because an abandoned generation is never published: A9.2.5's rule is that an
+ * interrupted index does not replace the last valid one, so a shutdown costs
+ * the work done so far and never the index. */
+static void test_a_cancelled_pass_preserves_the_last_valid_generation(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    env e;
+    env_open(&e, &err);
+    env_index(&e, &err);
+    seed_repo(&e, &err);
+    run_file_pass(&e, &err);
+
+    atlas_sem_index_summary first;
+    index_once(&e, false, &first, &err);
+    T_CHECK(first.published);
+
+    atlas_sem_generation g;
+    bool found = false;
+    T_OK(atlas_db_sem_current(e.db, e.repo_id, &g, &found, &err), &err);
+    T_REQUIRE_MSG(found, "the first generation is not current");
+    const int64_t before = g.id;
+
+    /* Asked from the first unit, which is where the poll sits — before the
+     * yield and before the unit is counted. */
+    int asked = 0;
+    atlas_sem_index_summary stopped;
+    atlas_err cancel_err;
+    atlas_err_init(&cancel_err);
+    const atlas_status st =
+        index_once_cancelling(&e, true, cancel_and_count, &asked, &stopped, &cancel_err);
+
+    T_CHECK_MSG(asked > 0, "the pass never asked whether it should stop");
+    T_CHECK_MSG(st != ATLAS_OK, "a cancelled pass reported success");
+    T_CHECK_MSG(!stopped.published, "a cancelled pass published a generation");
+
+    /* The pointer did not move, and what it names is still complete. A reader
+     * arriving after an interrupted shutdown gets the previous index, not a
+     * partial one and not none. */
+    found = false;
+    T_OK(atlas_db_sem_current(e.db, e.repo_id, &g, &found, &err), &err);
+    T_REQUIRE_MSG(found, "cancelling a pass left the repository with no current generation");
+    T_CHECK_MSG(g.id == before, "the current pointer moved to a cancelled generation: %lld -> %lld",
+                (long long)before, (long long)g.id);
+    T_CHECK(g.status == ATLAS_SEM_GEN_COMPLETE);
+
+    env_close(&e);
+}
+
 static const atlas_test TESTS[] = {
     {"identity distinguishes what C distinguishes",
      test_identity_distinguishes_what_c_distinguishes},
     {"PROVEN means the compiler proved it", test_proven_means_the_compiler_proved_it},
     {"replacement is atomic and a failure preserves the last valid generation",
      test_replacement_is_atomic_and_failure_preserves},
+    {"a cancelled pass preserves the last valid generation",
+     test_a_cancelled_pass_preserves_the_last_valid_generation},
     {"incremental indexing notices a deeply nested header",
      test_incremental_notices_a_deeply_nested_header},
     {"a compilation database is data and never a command",

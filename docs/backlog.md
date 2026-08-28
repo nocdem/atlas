@@ -1152,20 +1152,54 @@ artifact could only ever *veto* earlier and could never grant anything, so it is
 compatible with the season's rules — but it is a path from model prose into
 control flow, and A12.0 deliberately has none of those.
 
-## Two documents on stdout when the daemon is absent, for the whole orchestration family
+## Two documents on stdout when the daemon is absent — CLOSED, and it was worse than this said
 
+**The original entry, kept because its understatement is the lesson.** It read:
 `atlas plan list --json` against an absent daemon prints the empty result
 document and then the error document, and `atlas plan run`'s local refusals do
-the same. This is not new and is not A12.0's: `atlas job list` and `atlas job
-run` have always behaved this way, and `plan` was deliberately not diverged from
-the family it belongs to. `cli_state.rendered` suppresses the second document on
-the one path that was fixed for it — `atlas daemon ping` — and the pattern was
-never generalised.
+the same; `atlas job list` and `atlas job run` have always behaved this way;
+`cli_state.rendered` suppresses the second document on the one path that was
+fixed for it — `atlas daemon ping` — and the pattern was never generalised. A
+caller had to tolerate two documents or check the exit code first.
 
-A caller parsing `--json` from any of these commands has to tolerate two
-documents or check the exit code first. Whichever way it is fixed, it should be
-fixed for the whole family in one change rather than for `plan` alone, which is
-why A12.0 left it.
+**Measured 2026-08-28, and it was not two documents.** Run against a data
+directory with no daemon, `job list`, `job get`, `job cancel`, `plan list` and
+`plan status` each emitted output that is **not JSON at all**. The suite's own
+validator rejects every one of them, at the byte where the second document
+starts. What was actually produced was one *unclosed* document carrying
+`"ok":true`, with the error document written inside its open array and no
+closing bracket or brace anywhere:
+
+```
+{"command":"job list","ok":true,...,"jobs":[{"command":"job","ok":false,...,"error":{...}}
+```
+
+The difference matters: two documents can be read one after the other, and this
+cannot be read at all. A caller "tolerating two documents" would not have
+worked.
+
+**The chain.** `renderer_open` writes the header, `"ok":true` included, and a
+list arm then opens its array — all before the daemon has been reached. The JSON
+writer emits straight to the `FILE*` and buffers nothing, so those bytes cannot
+be taken back; `renderer_abort` cannot unwrite them. `main` then finds a non-OK
+status with `cli_state.rendered` false and writes a complete error document into
+the stream, landing inside the open array, and nothing closes the outer
+document.
+
+**The fix, and why it is cheap.** None of these calls streams: the service layer
+completes the whole IPC round trip and only then forwards rows out of the
+response it already holds. So a connection failure is known before any row
+exists. The renderer is now opened at the *first row* instead of before the
+call, and a list arm opens it explicitly afterwards when there were no rows, so
+an empty list is still an answer. When the call fails first, nothing was
+written, and the one error document `main` already produces is the whole output.
+The rows could not be buffered instead: `atlas_job_render` is borrowed pointers
+into the live response.
+
+`tests/test_cli.c` asserts the contract for all five commands with no daemon
+running, using `tjson_valid` — which is true only when the *whole* input is
+exactly one well-formed value, so it fails both on a truncated document and on a
+second one appended.
 
 ## A12-P pilot residuals (2026-08-21)
 

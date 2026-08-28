@@ -770,8 +770,74 @@ static void test_the_plan_command_is_wired(void) {
     env_close(&e);
 }
 
+/* The orchestration family puts exactly one document on stdout when the daemon
+ * is not there.
+ *
+ * These commands opened a renderer before the call and a list arm then opened
+ * its array, so the header — `"ok":true` included — and the array were written
+ * before the daemon had been reached. The writer emits straight to the `FILE*`
+ * and buffers nothing, so when the call failed those bytes could not be taken
+ * back: `main` wrote its error document *inside* the open array and nothing
+ * closed the outer one. Measured 2026-08-28 with this file's own validator:
+ * `job list`, `job get`, `job cancel`, `plan list` and `plan status` each
+ * emitted output that is not JSON at all. `docs/backlog.md` recorded it as "two
+ * documents on stdout", which understated it — two documents can at least be
+ * read one after the other.
+ *
+ * `tjson_valid` is the assertion that matters, and it is stronger than counting
+ * documents: it is true only when the *whole* input is exactly one well-formed
+ * value, so it fails both on a truncated document and on a second one appended.
+ *
+ * No daemon is started here, deliberately. The absent daemon is the condition
+ * under test, and it is also why this costs nothing to run. */
+static void test_the_orchestration_family_emits_one_document_with_no_daemon(void) {
+    cli_env e;
+    env_open(&e);
+
+    static const struct {
+        const char *args[4];
+        size_t n;
+    } CASES[] = {
+        {{"--json", "job", "list"}, 3u},
+        {{"--json", "job", "get", "j1"}, 4u},
+        {{"--json", "job", "cancel", "j1"}, 4u},
+        {{"--json", "plan", "list"}, 3u},
+        {{"--json", "plan", "status", "p1"}, 4u},
+    };
+
+    for (size_t i = 0; i < sizeof CASES / sizeof CASES[0]; i++) {
+        run_result r;
+        run_atlas(&e, &r, CASES[i].args, CASES[i].n);
+
+        size_t bad = 0;
+        const bool one = tjson_valid(r.out.data, r.out.len, &bad);
+        T_CHECK_MSG(one, "atlas %s %s --json wrote something that is not one JSON value (at byte %zu): %s",
+                    CASES[i].args[1], CASES[i].args[2], bad, atlas_buf_cstr(&r.out));
+
+        /* And it is the error, not a hollow success. A document saying
+         * `"ok":true` about a call that never reached the daemon would be the
+         * same defect wearing valid syntax. */
+        atlas_buf ok = ATLAS_BUF_INIT;
+        if (tjson_get_raw(r.out.data, r.out.len, "ok", &ok)) {
+            T_CHECK_MSG(strcmp(atlas_buf_cstr(&ok), "false") == 0,
+                        "atlas %s %s --json claimed ok=%s with no daemon", CASES[i].args[1],
+                        CASES[i].args[2], atlas_buf_cstr(&ok));
+        }
+        atlas_buf_free(&ok);
+
+        T_CHECK_MSG(r.exit_code == ATLAS_ERR_CONFIG,
+                    "atlas %s %s --json exited %d, not %d", CASES[i].args[1], CASES[i].args[2],
+                    r.exit_code, (int)ATLAS_ERR_CONFIG);
+        result_free(&r);
+    }
+
+    env_close(&e);
+}
+
 static const atlas_test TESTS[] = {
     {"human output", test_human_output},
+    {"the orchestration family emits one document with no daemon",
+     test_the_orchestration_family_emits_one_document_with_no_daemon},
     {"stable JSON output and escaping", test_json_output},
     {"JSON errors are valid documents", test_json_errors_are_documents},
     {"exit codes", test_exit_codes},

@@ -70,8 +70,25 @@ atlas_status atlas_mirror_open_staging(const char *data_dir, int64_t repo_id, in
  * outlived the mirror corrects itself: it sends the bytes instead. Nothing here
  * trusts the caller's belief about the file. The link is made without following
  * symlinks, so a mirrored symlink is carried as a symlink. */
-atlas_status atlas_mirror_keep(const char *data_dir, int64_t repo_id, const void *rel,
-                               size_t rel_len, bool *kept_out, atlas_err *err);
+/* One repository-relative path, as bytes. Paths are bytes, so a length travels
+ * with every one of them. */
+typedef struct atlas_mirror_path {
+    const void *rel;
+    size_t rel_len;
+} atlas_mirror_path;
+
+/* Carries a batch, answering per path into `kept_out[i]`.
+ *
+ * **A batch, because the cost was the request and not the bytes.** Sending one
+ * request per file replaced the file's content with its name and left the count
+ * alone — measured 2026-08-29, the daemon still spent a full core for half of
+ * every cycle, at roughly eight `openat` and nine `pread64` per request, each
+ * request also opening its own read-only database handle. The batch opens both
+ * generations once and authorises once; what the daemon decides per path does
+ * not change. */
+atlas_status atlas_mirror_keep_many(const char *data_dir, int64_t repo_id,
+                                    const atlas_mirror_path *paths, size_t n, bool *kept_out,
+                                    atlas_err *err);
 
 atlas_status atlas_mirror_publish(const char *data_dir, int64_t repo_id, atlas_err *err);
 

@@ -531,8 +531,21 @@ of which essentially none had changed, at a sustained 7.1% of a core in the
 scanner alone and a fresh read-only database connection per request in the
 daemon.
 
-`scanner.keep` names a path instead of carrying its bytes, and the daemon
-hard-links it out of the published generation into the staging one.
+`scanner.keep` names paths instead of carrying their bytes, and the daemon
+hard-links each out of the published generation into the staging one.
+
+**It is a batch, and that half was learned the hard way.** The first version sent
+one request per file, which replaced the content with the name and left the count
+alone. Measured 2026-08-29, after that change was already deployed: the daemon
+still pinned a core for about seventy-five seconds out of every hundred and
+fifty, and a syscall profile during the burst showed 21,282 `openat`, 25,237
+`pread64` and 24,270 `newfstatat` in six seconds against 2,671 accepted requests
+— roughly eight opens and nine page reads each, because `src/ipc/server.c` opens
+a read-only handle per request for a reason that does not stop being true just
+because a caller is chatty. Batching `ATLAS_SCANNER_KEEP_MAX_PATHS` paths into
+one request took the daemon from 47.4% of a core to 4.1% over the same window,
+and a dna incremental pass from about 80 s to 3 s. The response names the paths
+that were **not** carried, so a caller never infers what to send from a count.
 
 **The scanner's memory decides only whether to ask.** It is not evidence and the
 daemon does not act on it: what the daemon links is whatever *its own* published

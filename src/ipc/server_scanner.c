@@ -481,9 +481,15 @@ static atlas_status method_scanner_keep(dispatch_state *ds, const atlas_ipc_requ
     if (!atlas_ipc_param_int(req, "repo", &repo_id)) {
         return atlas_err_set(err, ATLAS_ERR_USAGE, "a keep needs a repository id");
     }
-    const char *path = NULL;
-    if (!atlas_ipc_param_str(req, "path", &path) || path == NULL) {
-        return atlas_err_set(err, ATLAS_ERR_USAGE, "a keep needs a path");
+    const atlas_ipc_array *arr = NULL;
+    if (!atlas_ipc_param_array(req, "paths", &arr)) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "a keep needs a \"paths\" array");
+    }
+    const size_t n = atlas_ipc_array_len(arr);
+    if (n == 0 || n > ATLAS_SCANNER_KEEP_MAX_PATHS) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "\"paths\" holds %zu entries; the bound is 1..%d", n,
+                             ATLAS_SCANNER_KEEP_MAX_PATHS);
     }
 
     atlas_repo_info ri;
@@ -502,10 +508,44 @@ static atlas_status method_scanner_keep(dispatch_state *ds, const atlas_ipc_requ
         return st;
     }
 
-    bool kept = false;
-    st = atlas_mirror_keep(ds->ctx->data_dir, repo_id, path, strlen(path), &kept, err);
+    /* Bounded by the parameter check above, so this is a fixed frame rather than
+     * an allocation sized by a caller. */
+    atlas_mirror_path paths[ATLAS_SCANNER_KEEP_MAX_PATHS];
+    bool kept[ATLAS_SCANNER_KEEP_MAX_PATHS];
+    for (size_t i = 0; i < n; i++) {
+        const char *p = NULL;
+        if (!atlas_ipc_array_str(arr, i, &p) || p == NULL) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE, "every entry of \"paths\" is a string");
+        }
+        paths[i].rel = p;
+        paths[i].rel_len = strlen(p);
+    }
+
+    st = atlas_mirror_keep_many(ds->ctx->data_dir, repo_id, paths, n, kept, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+
+    /* The paths that were **not** carried, so the caller knows exactly what to
+     * send rather than inferring it from a count. An empty array is the ordinary
+     * answer and means everything was carried. */
+    int64_t carried = 0;
+    st = atlas_json_key(ds->j, "resend", err);
     if (st == ATLAS_OK) {
-        st = atlas_json_key_bool(ds->j, "kept", kept, err);
+        st = atlas_json_arr_begin(ds->j, err);
+    }
+    for (size_t i = 0; i < n && st == ATLAS_OK; i++) {
+        if (kept[i]) {
+            carried++;
+        } else {
+            st = atlas_json_str(ds->j, (const char *)paths[i].rel, err);
+        }
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_arr_end(ds->j, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "carried", carried, err);
     }
     return st;
 }

@@ -361,45 +361,22 @@ static atlas_status walk_to_parent_ro(int root_fd, const void *rel, size_t rel_l
     return ATLAS_OK;
 }
 
-atlas_status atlas_mirror_keep(const char *data_dir, int64_t repo_id, const void *rel,
-                               size_t rel_len, bool *kept_out, atlas_err *err) {
-    if (kept_out == NULL) {
-        return atlas_err_set(err, ATLAS_ERR_USAGE, "a keep needs somewhere to report its verdict");
-    }
+/* One path, against roots the caller has already opened. */
+static atlas_status keep_one(int cur, int stage, const void *rel, size_t rel_len, bool *kept_out,
+                             atlas_err *err) {
     *kept_out = false;
-
-    /* The published generation may simply not be there — a daemon that has never
-     * mirrored this repository, or one whose mirror was removed. Not an error:
-     * the caller answers it by sending the bytes. */
-    int cur = -1;
-    atlas_err ignored;
-    atlas_err_init(&ignored);
-    if (atlas_mirror_open_repo(data_dir, repo_id, &cur, &ignored) != ATLAS_OK) {
-        return ATLAS_OK;
-    }
 
     char src_comp[MIRROR_COMP_MAX + 1];
     int src_parent = -1;
     bool missing = false;
     atlas_status st = walk_to_parent_ro(cur, rel, rel_len, &src_parent, src_comp, &missing, err);
-    (void)close(cur);
-    if (st != ATLAS_OK) {
+    if (st != ATLAS_OK || missing) {
         return st;
-    }
-    if (missing) {
-        return ATLAS_OK;
     }
 
-    int stage = -1;
-    st = atlas_mirror_open_staging(data_dir, repo_id, &stage, err);
-    if (st != ATLAS_OK) {
-        (void)close(src_parent);
-        return st;
-    }
     char dst_comp[MIRROR_COMP_MAX + 1];
     int dst_parent = -1;
     st = walk_to_parent(stage, rel, rel_len, &dst_parent, dst_comp, err);
-    (void)close(stage);
     if (st != ATLAS_OK) {
         (void)close(src_parent);
         return st;
@@ -423,6 +400,49 @@ atlas_status atlas_mirror_keep(const char *data_dir, int64_t repo_id, const void
     (void)close(src_parent);
     (void)close(dst_parent);
     return ATLAS_OK;
+}
+
+atlas_status atlas_mirror_keep_many(const char *data_dir, int64_t repo_id,
+                                    const atlas_mirror_path *paths, size_t n, bool *kept_out,
+                                    atlas_err *err) {
+    if (kept_out == NULL || (paths == NULL && n > 0)) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "a keep needs paths and somewhere to answer");
+    }
+    for (size_t i = 0; i < n; i++) {
+        kept_out[i] = false;
+    }
+    if (n == 0) {
+        return ATLAS_OK;
+    }
+
+    /* The published generation may simply not be there — a daemon that has never
+     * mirrored this repository, or one whose mirror was removed. Not an error:
+     * every path answers false and the caller sends the bytes. */
+    int cur = -1;
+    atlas_err ignored;
+    atlas_err_init(&ignored);
+    if (atlas_mirror_open_repo(data_dir, repo_id, &cur, &ignored) != ATLAS_OK) {
+        return ATLAS_OK;
+    }
+    int stage = -1;
+    atlas_status st = atlas_mirror_open_staging(data_dir, repo_id, &stage, err);
+    if (st != ATLAS_OK) {
+        (void)close(cur);
+        return st;
+    }
+
+    /* Both roots opened once for the whole batch, which is the point of the
+     * batch: measured 2026-08-29, serving one request per file cost the daemon a
+     * full core for half of every cycle, at about eight `openat` and nine
+     * `pread64` per request — and the per-request read-only database handle,
+     * which `src/ipc/server.c` opens for a reason that does not stop being true
+     * just because a caller is chatty. Fewer requests, not a weaker snapshot. */
+    for (size_t i = 0; i < n && st == ATLAS_OK; i++) {
+        st = keep_one(cur, stage, paths[i].rel, paths[i].rel_len, &kept_out[i], err);
+    }
+    (void)close(stage);
+    (void)close(cur);
+    return st;
 }
 
 atlas_status atlas_mirror_publish(const char *data_dir, int64_t repo_id, atlas_err *err) {

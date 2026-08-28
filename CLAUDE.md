@@ -830,10 +830,18 @@ is not written down is one somebody deletes.** Both halves are load-bearing.
   publish renames the staging directory into place, so the next pass starts from
   an empty one and every file was re-read, hex-encoded and sent again — measured
   2026-08-28, 28 450 files across two repositories every five minutes, of which
-  essentially none had changed. `scanner.keep` names a path instead, and the
-  daemon hard-links it out of the published generation. **The scanner's memory
+  essentially none had changed. `scanner.keep` names paths instead — a
+  batch of them in one request — and the daemon hard-links each out of the
+  published generation. **The batch is the fix, and naming was only half of it.**
+  Replacing a file's bytes with its name left the request count alone, and the
+  count was the cost: measured 2026-08-29, the daemon still held a full core for
+  half of every cycle, at about eight `openat` and nine `pread64` per request,
+  every one opening its own read-only handle on a 3.96 GB database. Batching
+  `ATLAS_SCANNER_KEEP_MAX_PATHS` paths took it from 47.4% of a core to 4.1% and a
+  dna pass from 80 s to 3 s. **The scanner's memory
   decides only whether to ask.** The daemon links what its own generation holds
-  and answers `kept: false` when it holds nothing, so a memory that has outlived
+  and names in `resend` exactly what it did not carry, so a caller never infers
+  what to send from a count; so a memory that has outlived
   the mirror costs a resend and can never produce a wrong mirror. The memory is
   **in the process, never on disk**: a manifest that outlived the process would
   be a promise about a mirror it did not build, which is the shape of the cadence

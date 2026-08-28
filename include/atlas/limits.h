@@ -301,6 +301,20 @@
  * decides how much work a scanner does -- a pass that takes longer simply
  * delays the next one. */
 #define ATLAS_SCANNER_POLL_INTERVAL_MS (ATLAS_SCANNER_MIRROR_MAX_AGE_MS / 2)
+
+/* How many paths one `scanner.keep` may name.
+ *
+ * **The request was the cost, not the bytes.** Replacing a file.s content with
+ * its name left the request count alone: measured 2026-08-29, the daemon still
+ * spent a full core for half of every cycle serving one request per file, at
+ * roughly eight `openat` and nine `pread64` each, every one of them also
+ * opening its own read-only handle on a 3.96 GB database.
+ *
+ * Sized so a full batch of the longest paths Atlas accepts still fits inside
+ * `ATLAS_IPC_MAX_REQUEST_BYTES` with room for the method, the repository id and
+ * the JSON frame -- the same arithmetic `SCANNER_CHUNK_BYTES` does, from the
+ * other direction. */
+#define ATLAS_SCANNER_KEEP_MAX_PATHS 512
 /* Unpaired IN_MOVED_FROM cookies held while waiting for their IN_MOVED_TO. */
 #define ATLAS_WATCH_MAX_PENDING_MOVES 1024u
 /* Paths the watcher will name individually when it asks for a reconciliation.

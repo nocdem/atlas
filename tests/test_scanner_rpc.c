@@ -578,31 +578,40 @@ static void test_a_kept_path_is_carried_and_a_path_the_daemon_lacks_is_refused(v
     T_REQUIRE_MSG(mirrored(&e, e.mine, "src/a.c"), "the first pass did not publish the file");
 
     /* A path the published generation holds is carried. */
-    T_OK(atlas_buf_appendf(&params, &err, "{\"repo\":%lld,\"path\":\"src/a.c\"}",
+    T_OK(atlas_buf_appendf(&params, &err, "{\"repo\":%lld,\"paths\":[\"src/a.c\"]}",
                            (long long)e.mine),
          &err);
     atlas_ipc_response *kr =
         call(&e, (long long)getuid(), "scanner.keep", atlas_buf_cstr(&params), &raw);
     T_CHECK_MSG(atlas_ipc_response_ok(kr), "scanner.keep failed: %s", atlas_buf_cstr(&raw));
-    bool kept = false;
-    T_CHECK_MSG(atlas_ipc_result_bool(kr, "kept", &kept) && kept,
+    int64_t carried = 0;
+    size_t resend_n = 1;
+    T_CHECK_MSG(atlas_ipc_result_int(kr, "carried", &carried) && carried == 1,
                 "a path the daemon holds was not carried: %s", atlas_buf_cstr(&raw));
+    T_CHECK_MSG(atlas_ipc_result_arr_len(kr, "resend", &resend_n) && resend_n == 0,
+                "a carried path was named for resending: %s", atlas_buf_cstr(&raw));
     atlas_ipc_response_free(kr);
     atlas_buf_reset(&params);
     atlas_buf_reset(&raw);
 
     /* A path it does not hold is refused, and refused as an answer rather than
      * an error: the scanner's next step is to send the bytes. */
-    T_OK(atlas_buf_appendf(&params, &err, "{\"repo\":%lld,\"path\":\"src/never-sent.c\"}",
+    T_OK(atlas_buf_appendf(&params, &err,
+                           "{\"repo\":%lld,\"paths\":[\"src/never-sent.c\"]}",
                            (long long)e.mine),
          &err);
     atlas_ipc_response *mr =
         call(&e, (long long)getuid(), "scanner.keep", atlas_buf_cstr(&params), &raw);
     T_CHECK_MSG(atlas_ipc_response_ok(mr), "a keep for an absent path errored: %s",
                 atlas_buf_cstr(&raw));
-    bool missing_kept = true;
-    T_CHECK_MSG(atlas_ipc_result_bool(mr, "kept", &missing_kept) && !missing_kept,
+    int64_t missing_carried = 1;
+    size_t missing_resend = 0;
+    T_CHECK_MSG(atlas_ipc_result_int(mr, "carried", &missing_carried) && missing_carried == 0,
                 "the daemon claimed to carry a path it never had: %s", atlas_buf_cstr(&raw));
+    /* Named for resending, so the caller knows exactly what to send rather than
+     * inferring it from a count. */
+    T_CHECK_MSG(atlas_ipc_result_arr_len(mr, "resend", &missing_resend) && missing_resend == 1,
+                "an uncarried path was not named for resending: %s", atlas_buf_cstr(&raw));
     atlas_ipc_response_free(mr);
     atlas_buf_reset(&params);
     atlas_buf_reset(&raw);

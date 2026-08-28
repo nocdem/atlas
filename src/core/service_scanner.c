@@ -105,6 +105,20 @@ typedef struct walk_ctx {
     sent_map *mem;
     /* When this pass started looking, for A1's raciness rule. */
     struct timespec observed_at;
+    /* Paths waiting to be carried, sent as one request.
+     *
+     * **The request was the cost, not the bytes.** Naming a file instead of
+     * sending it left the request count alone, and the count is what the daemon
+     * pays for: measured 2026-08-29, one request per file kept it at a full core
+     * for half of every cycle, at roughly eight `openat` and nine `pread64`
+     * each, every one also opening its own read-only handle on a 3.96 GB
+     * database. */
+    char *batch[ATLAS_SCANNER_KEEP_MAX_PATHS];
+    size_t batch_len[ATLAS_SCANNER_KEEP_MAX_PATHS];
+    size_t batch_n;
+    /* Set while re-sending what the daemon could not carry, so the resend does
+     * not offer the same path back to the batch it just came out of. */
+    bool no_keep;
     /* A13. When this walk last told the daemon it is alive.
      *
      * The heartbeat is `scanner.poll`, and one poll per pass is not enough: a
@@ -404,43 +418,113 @@ static atlas_status put_file(walk_ctx *w, const void *rel, size_t rel_len, const
     return st;
 }
 
-/* A13. Asks the daemon to carry a path forward instead of sending its bytes.
+static void mirror_one(walk_ctx *w, const void *rel, size_t rel_len);
+
+/* A13. Asks the daemon to carry a batch of paths forward instead of sending
+ * their bytes, and sends whatever it would not carry.
  *
- * `*kept_out` is the daemon's answer, not this process's belief: false means the
- * published generation does not hold that path, and the caller sends the bytes.
- * A failed call is reported the same way — false — because "I could not find out"
- * and "it is not there" call for the same next step, and the difference would
- * only ever be used to skip work on a guess. */
-static atlas_status keep_file(walk_ctx *w, const void *rel, size_t rel_len, bool *kept_out) {
-    *kept_out = false;
-    atlas_buf enc = ATLAS_BUF_INIT;
-    atlas_status st = atlas_path_text_encode(rel, rel_len, &enc, w->err);
+ * The answer is the daemon's, not this process's belief: `resend` names exactly
+ * the paths its published generation does not hold, and each of those goes
+ * through `mirror_one` again — re-opened and re-stated, because the file may
+ * have changed since it was looked at. A failed call resends everything, since
+ * "I could not find out" and "it is not there" call for the same next step. */
+static void batch_flush(walk_ctx *w) {
+    if (w->batch_n == 0) {
+        return;
+    }
+    const size_t n = w->batch_n;
+    w->batch_n = 0; /* cleared first, so a resend cannot re-enter this batch */
 
     atlas_buf params = ATLAS_BUF_INIT;
-    if (st == ATLAS_OK) {
-        st = atlas_buf_appendf(&params, w->err, "{\"repo\":%lld,\"path\":\"%s\"}",
-                               (long long)w->repo_id, atlas_buf_cstr(&enc));
+    atlas_status st = atlas_buf_appendf(&params, w->err, "{\"repo\":%lld,\"paths\":[",
+                                        (long long)w->repo_id);
+    for (size_t i = 0; i < n && st == ATLAS_OK; i++) {
+        atlas_buf enc = ATLAS_BUF_INIT;
+        st = atlas_path_text_encode(w->batch[i], w->batch_len[i], &enc, w->err);
+        if (st == ATLAS_OK) {
+            st = atlas_buf_appendf(&params, w->err, "%s\"%s\"", i == 0 ? "" : ",",
+                                   atlas_buf_cstr(&enc));
+        }
+        atlas_buf_free(&enc);
     }
+    if (st == ATLAS_OK) {
+        st = atlas_buf_append_str(&params, "]}", w->err);
+    }
+
+    /* Every path is resent unless the daemon says it carried it. */
+    bool resend_all = true;
     atlas_buf raw = ATLAS_BUF_INIT;
     if (st == ATLAS_OK) {
         st = atlas_ipc_call(w->socket_path, "scanner.keep", atlas_buf_cstr(&params), &raw, w->err);
     }
+    atlas_ipc_response *resp = NULL;
     if (st == ATLAS_OK) {
-        atlas_ipc_response *resp = NULL;
         atlas_err perr;
         atlas_err_init(&perr);
-        if (atlas_ipc_response_parse(raw.data, raw.len, &resp, &perr) == ATLAS_OK) {
-            bool kept = false;
-            if (atlas_ipc_response_ok(resp) && atlas_ipc_result_bool(resp, "kept", &kept)) {
-                *kept_out = kept;
+        if (atlas_ipc_response_parse(raw.data, raw.len, &resp, &perr) == ATLAS_OK &&
+            atlas_ipc_response_ok(resp)) {
+            resend_all = false;
+        }
+    }
+
+    w->no_keep = true;
+    for (size_t i = 0; i < n; i++) {
+        bool carried = !resend_all;
+        if (carried) {
+            /* Named in `resend` means the daemon does not hold it. */
+            size_t rn = 0;
+            if (atlas_ipc_result_arr_len(resp, "resend", &rn)) {
+                atlas_buf enc = ATLAS_BUF_INIT;
+                if (atlas_path_text_encode(w->batch[i], w->batch_len[i], &enc, w->err) ==
+                    ATLAS_OK) {
+                    for (size_t k = 0; k < rn; k++) {
+                        const char *p = NULL;
+                        if (atlas_ipc_result_arr_str(resp, "resend", k, &p) && p != NULL &&
+                            strcmp(p, atlas_buf_cstr(&enc)) == 0) {
+                            carried = false;
+                            break;
+                        }
+                    }
+                }
+                atlas_buf_free(&enc);
             }
         }
-        atlas_ipc_response_free(resp);
+        if (carried) {
+            w->mirrored++;
+            w->kept++;
+        } else {
+            mirror_one(w, w->batch[i], w->batch_len[i]);
+        }
+        free(w->batch[i]);
+        w->batch[i] = NULL;
     }
+    w->no_keep = false;
+
+    atlas_ipc_response_free(resp);
     atlas_buf_free(&raw);
     atlas_buf_free(&params);
-    atlas_buf_free(&enc);
-    return st;
+    if (st != ATLAS_OK) {
+        /* Reported, not fatal: every path was resent. */
+        atlas_err_init(w->err);
+    }
+}
+
+/* Queues one unchanged path. Flushes when the batch is full, so the buffer is a
+ * fixed frame and never grows with the tree. */
+static void batch_add(walk_ctx *w, const void *rel, size_t rel_len) {
+    char *copy = (char *)malloc(rel_len + 1u);
+    if (copy == NULL) {
+        mirror_one(w, rel, rel_len); /* forgetting costs a send, never a gap */
+        return;
+    }
+    memcpy(copy, rel, rel_len);
+    copy[rel_len] = '\0';
+    w->batch[w->batch_n] = copy;
+    w->batch_len[w->batch_n] = rel_len;
+    w->batch_n++;
+    if (w->batch_n == ATLAS_SCANNER_KEEP_MAX_PATHS) {
+        batch_flush(w);
+    }
 }
 
 /* A13. Sends one symlink's text.
@@ -635,17 +719,13 @@ static void mirror_one(walk_ctx *w, const void *rel, size_t rel_len) {
     atlas_fs_identity now;
     memset(&now, 0, sizeof(now));
     scanner_identity_from_stat(&now, &sb);
-    if (w->mem != NULL) {
+    if (w->mem != NULL && !w->no_keep) {
         const sent_entry *e = sent_map_find(w->mem, rel, rel_len);
         if (e != NULL && atlas_fs_identity_same(&e->id, &now)) {
-            bool kept = false;
-            if (keep_file(w, rel, rel_len, &kept) == ATLAS_OK && kept) {
-                (void)close(fd);
-                sent_map_put(w->mem, rel, rel_len, &now);
-                w->mirrored++;
-                w->kept++;
-                return;
-            }
+            (void)close(fd);
+            sent_map_put(w->mem, rel, rel_len, &now);
+            batch_add(w, rel, rel_len);
+            return;
         }
     }
 
@@ -992,6 +1072,14 @@ static atlas_status scan_pass(int64_t *poll_within_ms, scanner_memory *mem, FILE
                               name);
             }
         }
+
+        /* Anything still queued is carried before anything else looks at the
+         * result. A path left in the batch is one the staging generation does
+         * not hold, so flushing after `say_state` — which is what publishes —
+         * would rename the generation into place without it, and the daemon
+         * would read the absence as a deletion. It also has to precede
+         * `complete`, which is a claim about what reached the mirror. */
+        batch_flush(&w);
 
         (void)close(w.root_fd);
         atlas_git_close(g);

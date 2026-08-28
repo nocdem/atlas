@@ -820,6 +820,16 @@ is not written down is one somebody deletes.** Both halves are load-bearing.
   delete sweep. It is a **write**, so it goes through the writer thread — doing
   it on a dispatch handle failed on every call with "attempt to write a readonly
   database", silently, because the scanner ignored the result.
+  It is answered when the write is **accepted**, not when it completes — A8-CI's
+  rule, and the reason is measured: the writer was 19,864 ms inside a full
+  reconciliation, because publishing a generation replaces every inode and the
+  whole repository is re-hashed, so the scanner timed out reading its response
+  while the write it asked for was still on its way, and then reported a run as
+  unrecorded that had been recorded. There is no waiting form: a caller that
+  waited would need a bound on how long the writer may be busy, and Atlas has
+  none. `scanner.poll` is the confirmation channel — its directive is `full`
+  while no complete mirror exists, so a job that fails is answered by being
+  asked for again.
 - **`scanner.poll` is the heartbeat, and the cadence is Atlas'.** Asking what is
   owed is the evidence of being alive, which is why the spec has no `hello`. An
   implementation where the scanner declared its own cadence was written and

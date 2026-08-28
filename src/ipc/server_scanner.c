@@ -428,13 +428,26 @@ static atlas_status method_scanner_state(dispatch_state *ds, const atlas_ipc_req
     if (ds->ctx->writer == NULL) {
         return atlas_err_set(err, ATLAS_ERR_INTERNAL, "no writer to record a mirror state");
     }
-    atlas_writer_result wr;
-    atlas_writer_result_init(&wr);
-    st = atlas_writer_call_mirror_state(ds->ctx->writer, repo_id, complete,
-                                        ATLAS_IPC_WRITE_TIMEOUT_MS, &wr, err);
-    atlas_writer_result_free(&wr);
+    /* Accepted, not completed, and that is A8-CI's rule rather than a shortcut:
+     * an operation that can outlast a client's patience does not run in the
+     * serve loop, and the client is answered when the work is accepted.
+     *
+     * The writer may legitimately be minutes inside an unbounded job — and on a
+     * mirror-backed repository it is routinely twenty seconds inside a bounded
+     * one, because publishing a generation replaces every inode and the whole
+     * repository is re-hashed. A scanner that waited timed out reading its
+     * response while the write it asked for was still on its way, and then
+     * reported a run as unrecorded that had in fact been recorded.
+     *
+     * The next `scanner.poll` carries the outcome: its directive is `full`
+     * while no complete mirror exists, so a job that fails is answered by being
+     * asked for again. */
+    st = atlas_writer_submit_mirror_state(ds->ctx->writer, repo_id, complete, err);
     if (st == ATLAS_OK) {
         st = atlas_json_key_bool(ds->j, "complete", complete, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(ds->j, "accepted", true, err);
     }
     return st;
 }

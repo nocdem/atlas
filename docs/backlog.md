@@ -747,15 +747,42 @@ blocker (the gate wire encoding, `4f796a2`) was fixed under the pilot's own
 defect procedure. These four were left alone, because a pilot that repairs
 everything it trips over stops being a measurement.
 
-**`job submit` accepts `--gate` and drops it.** The argument parser fills
-`st->opts.job.gates`, and the `submit` arm of `src/cli/cli.c` copies eight
-fields into `atlas_job_submit_opts` without copying `gates` or `gate_count` —
-though the struct carries both and `service_orch.c` knows how to encode them.
-The `run` arm, twenty lines below, does copy them. The symptom is a submission
-refused for declaring no verification command while the operator is looking at
-the `--gate` flags they typed. This is the fifth-wiring-place failure `CLAUDE.md`
-describes, and the fix is three lines; it is recorded rather than made because
-`job run` is A11.1's surface and was not affected.
+**`job submit` accepted `--gate` and dropped it — CLOSED the same day, and this
+entry stood stale for nine.** The argument parser filled `st->opts.job.gates`,
+and the `submit` arm of `src/cli/cli.c` copied eight fields into
+`atlas_job_submit_opts` without copying `gates` or `gate_count` — though the
+struct carried both and `service_orch.c` knew how to encode them. The `run` arm,
+twenty lines below, did copy them. The symptom was a submission refused for
+declaring no verification command while the operator was looking at the `--gate`
+flags they had typed. That is the fifth-wiring-place failure `CLAUDE.md`
+describes.
+
+It was recorded here at 05:56 on 2026-08-19 (`b3a9c5f`) as deliberately not
+fixed, because `job run` was A11.1's surface and was unaffected. It was fixed at
+13:48 the same day, in `88e7472`, because A10.1 could not proceed without it:
+freezing a memory package before either arm of a comparison runs means creating
+both runs first and driving them afterwards, and a repository-tree task with no
+gate cannot be created at all. `src/cli/cli.c` carries the copy in all three
+arms — submit, run and plan — and the comment at the submit arm says why it was
+made rather than left here. The bound is safe on both sides: the parser refuses
+a ninth gate and both arrays are `[8]`.
+
+**Nobody updated this paragraph, and that is the part worth keeping.** For nine
+days it told a reader to make a three-line change that already existed. A
+backlog that records a fix and not its closing is a backlog that costs a second
+investigation to answer a question already answered — which is what happened on
+2026-08-28, when it was re-opened, re-read and closed again from the commits.
+
+**The residual is real and is not the code.** Nothing in the suite drives the
+argument parser for this path, which is the same absence that let the defect
+exist: `tests/test_orch_parallel.c` and its neighbours call the service layer
+directly, so they would pass with the arm still dropping the field. Closing that
+needs a decision rather than a test. `job.submit` is refused outright on a
+machine with no orchestration policy, the policy path is a compiled-in constant
+with no override, and a test may not install a root-owned file — so an
+end-to-end CLI assertion would need a test channel into the policy, which is
+exactly the shape P0's rule forbids for the watcher's budget and forbids here
+for a stronger reason: this one is a security boundary.
 
 **A failed spawn spends a worker start.** A11.1 records RUNNING before the exec
 so that a crash cannot be retried for free, and a process that never existed is

@@ -452,9 +452,68 @@ static atlas_status method_scanner_state(dispatch_state *ds, const atlas_ipc_req
     return st;
 }
 
+/* A13. "This path has not changed since I last sent it; carry it forward."
+ *
+ * A separate method from `scanner.put` and never a flag on it, for the reason
+ * `cancel` is separate from `yield`: they are different assertions. A put says
+ * "here are the bytes"; this says "you already have them", and only one of the
+ * two can be refused by the daemon simply not having the file.
+ *
+ * **It carries no claim the daemon acts on.** The scanner's belief that a file
+ * is unchanged decides nothing here: the daemon links whatever its own published
+ * generation holds at that path, or answers `kept: false` and waits to be sent
+ * the bytes. So a scanner whose memory has outlived the mirror — a daemon
+ * restarted, a mirror removed, a generation this scanner never built — corrects
+ * itself on the next call rather than producing a wrong mirror.
+ *
+ * What the scanner's belief *does* decide is whether the source file changed,
+ * and that is A1's eight-field identity with ctime in it, which is the same
+ * evidence a reconciliation already uses to skip hashing when no event named the
+ * path. This does not weaken that rule; it applies it one process further out. */
+static atlas_status method_scanner_keep(dispatch_state *ds, const atlas_ipc_request *req,
+                                        atlas_err *err) {
+    atlas_status st = require_scanner(ds, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+
+    int64_t repo_id = 0;
+    if (!atlas_ipc_param_int(req, "repo", &repo_id)) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "a keep needs a repository id");
+    }
+    const char *path = NULL;
+    if (!atlas_ipc_param_str(req, "path", &path) || path == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "a keep needs a path");
+    }
+
+    atlas_repo_info ri;
+    atlas_repo_info_init(&ri);
+    bool found = false;
+    st = atlas_db_repo_get_by_id(ds->db, repo_id, &ri, &found, err);
+    if (st == ATLAS_OK && !found) {
+        st = atlas_err_set(err, ATLAS_ERR_REPO, "no repository has that id");
+    }
+    if (st == ATLAS_OK && !peer_owns(ds, &ri)) {
+        st = atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                           "uid %lld is not this repository's scanner", (long long)ds->peer_uid);
+    }
+    atlas_repo_info_free(&ri);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+
+    bool kept = false;
+    st = atlas_mirror_keep(ds->ctx->data_dir, repo_id, path, strlen(path), &kept, err);
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(ds->j, "kept", kept, err);
+    }
+    return st;
+}
+
 static const atlas_method_entry SCANNER_METHODS[] = {
     {"scanner.poll", method_scanner_poll},
     {"scanner.put", method_scanner_put},
+    {"scanner.keep", method_scanner_keep},
     {"scanner.state", method_scanner_state},
 };
 

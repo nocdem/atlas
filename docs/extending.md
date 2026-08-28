@@ -1073,3 +1073,53 @@ documentation may claim. Raising the second needs a measurement, not an edit.
 | ignored entries per repository | `ATLAS_WATCH_MAX_IGNORED_DIRS` / `_BYTES` | `ignore_overflow` — fails closed |
 | directories visited per priming pass | `budget x ATLAS_WATCH_DISCOVER_FACTOR` | `discovery_bound` |
 | kernel refusal | `fs.inotify.max_user_watches` | `kernel_limit` — not an Atlas setting |
+
+## A13 — the scanner channel, and what a new method there costs
+
+The scanner method group is small on purpose: `scanner.poll`, `scanner.put`,
+`scanner.keep`, `scanner.state`. Adding to it touches more than the table.
+
+**Every method authorises the same way, and none of them may skip it.** The
+first thing each does is `require_scanner`, and the second is resolve the named
+repository and check `peer_owns` — `SO_PEERCRED` against
+`repositories.scanner_uid`, one comparison, and that is the whole
+authorisation. A method that takes a `repo` and does not do both is a method
+that lets one uid's scanner write into another's mirror. The group is
+dispatchable by name rather than hidden, so being in the table is not a
+permission.
+
+**A refusal must not become an inventory.** `require_scanner` answers about the
+caller's own uid and names no repository, because a list of what exists handed to
+whoever asked is not a refusal. Keep new refusals to that shape.
+
+**Ask what the method asserts, and refuse to overload an existing one.**
+`scanner.keep` is not a flag on `scanner.put` for the reason `cancel` is not an
+overload of `yield`: a put says "here are the bytes" and a keep says "you already
+have them", and only the second can be answered by the daemon simply not having
+the file. Two assertions, two methods.
+
+**A method that takes the client's word for something about the daemon's own
+state is the defect to look for.** `scanner.keep` is the shape to copy: the
+scanner's memory decides only whether to *ask*, and the daemon answers from what
+its own published generation holds — `kept: false` when it holds nothing. Written
+the other way round, with the daemon trusting that the caller's file is unchanged,
+the same feature would let a stale client produce a mirror whose contents nobody
+put there.
+
+**A filesystem operation and a database write are ordered, never combined.**
+`scanner.state` publishes the generation and *then* queues the row, so a crash
+between them leaves a readable mirror the row does not vouch for — which costs a
+refusal — rather than a row vouching for a generation that was never published.
+Anything new that touches both belongs on the same side of that order.
+
+**The client is answered when the write is accepted.** Do not add a waiting form
+of anything here: a caller that waited would need a bound on how long the writer
+may be busy, and Atlas has none. `scanner.poll` is the confirmation channel,
+because its directive is `full` while no complete mirror exists — so a job that
+failed is answered by being asked for again.
+
+**Anything the scanner remembers between passes stays in the process.** A
+manifest on disk would be a promise about a mirror this process did not build,
+which is the shape of the cadence the scanner was once allowed to declare and
+which was written and reverted. Losing in-process memory must cost a full pass
+and nothing else, and a `full` directive must drop it.

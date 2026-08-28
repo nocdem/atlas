@@ -508,7 +508,57 @@ It is 3,486 lines, it re-derives P0's budget arithmetic per uid, and it
 duplicates `IN_Q_OVERFLOW` handling — a season of its own, and named here so the
 current bound is not mistaken for the intended one.
 
-**The largest thing A13 leaves open.** A scanner that stops running leaves a
-frozen mirror, and nothing bounds its age: the daemon keeps indexing it and keeps
-reporting the index current. Closing that needs a recorded observation time and a
-staleness rule, and it is a freshness question rather than an authority one.
+**What A13 left open here, and what closed it.** A scanner that stops running
+leaves a frozen mirror. This paragraph used to end by saying nothing bounds its
+age and the daemon keeps reporting the index current; that is no longer true.
+`atlas_server_overlay_mirror` subtracts the scanner's silence from what Atlas is
+willing to claim: `scanner.poll` doubles as the heartbeat, and a repository whose
+scanner has not been heard from within `ATLAS_SCANNER_MIRROR_MAX_AGE_MS` — five
+minutes, Atlas' own re-examination period, with the poll cadence at half of it —
+stops being called current. Measured 2026-08-28: after two one-shot passes both
+repositories read `event_gap: false, pending_full_reconcile: true,
+index_current: false` within five minutes, which is the rule doing exactly what
+it exists for. The overlay only ever subtracts, so it can force a full pass and
+never clear one.
+
+## A13 — a pass sends what changed
+
+Publishing renames the staging generation into place, so the next pass starts
+from a directory that does not exist yet and `make_dir` creates an empty one.
+Every file was therefore re-read, hex-encoded and sent again on every pass —
+measured 2026-08-28, **28 450 files across two repositories every five minutes**,
+of which essentially none had changed, at a sustained 7.1% of a core in the
+scanner alone and a fresh read-only database connection per request in the
+daemon.
+
+`scanner.keep` names a path instead of carrying its bytes, and the daemon
+hard-links it out of the published generation into the staging one.
+
+**The scanner's memory decides only whether to ask.** It is not evidence and the
+daemon does not act on it: what the daemon links is whatever *its own* published
+generation holds at that path, and when it holds nothing the answer is
+`kept: false` and the scanner sends the bytes. That is what makes a memory which
+has outlived the mirror — a daemon restarted, a mirror removed, a generation this
+scanner never built — cost a resend rather than produce a mirror whose contents
+nobody put there.
+
+**The memory is in the process and never on disk.** A manifest that outlived the
+process would be a promise about a mirror it did not build, which is the shape of
+the cadence the scanner was once allowed to declare and which was written and
+reverted for the same reason. Losing it costs one full pass, which is what a
+scanner that has just started does anyway. A `full` directive drops it outright,
+because there is then no published generation to carry anything out of.
+
+**What it compares is A1's identity, not a weaker one.** All eight fields through
+`atlas_fs_identity_same`, ctime included — the same evidence a reconciliation
+already uses to decide it need not re-hash a path no event named, applied one
+process further out. A racy observation is not remembered at all, which is A1's
+rule that a racy observation is stored as unknown rather than as a value; the
+cost is one resend on the next pass.
+
+**What this does not fix.** The daemon still re-hashes what it receives. A hard
+link updates the inode's ctime, so the carried file's identity does not match the
+one the index stored either, and `link()` was already tried and eliminated for
+that reason. The cost is now bounded by the tree rather than by the send: dna
+re-hashes 2 271 files in about 1.3 s, where before the discovery ceiling was
+lifted it re-hashed 21 996 in 19.9 s.

@@ -56,6 +56,23 @@ atlas_status atlas_mirror_open_staging(const char *data_dir, int64_t repo_id, in
 
 /* A13. Makes the staged generation the one readers see, by rename. See the
  * definition. */
+/* A13. Carries one path from the published generation into the staging one
+ * without its bytes crossing the socket again.
+ *
+ * A mirroring pass used to re-read, hex-encode and send every file every time,
+ * because `atlas_mirror_publish` renames the staging directory into place and
+ * the next pass therefore starts from an empty one. Measured 2026-08-28: 28,450
+ * files across two repositories, every five minutes, of which essentially none
+ * had changed.
+ *
+ * `*kept_out` is false — not an error — when the published generation does not
+ * hold that path, which is how a scanner whose memory of what it sent has
+ * outlived the mirror corrects itself: it sends the bytes instead. Nothing here
+ * trusts the caller's belief about the file. The link is made without following
+ * symlinks, so a mirrored symlink is carried as a symlink. */
+atlas_status atlas_mirror_keep(const char *data_dir, int64_t repo_id, const void *rel,
+                               size_t rel_len, bool *kept_out, atlas_err *err);
+
 atlas_status atlas_mirror_publish(const char *data_dir, int64_t repo_id, atlas_err *err);
 
 #endif /* ATLAS_MIRROR_H */

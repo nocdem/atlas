@@ -826,6 +826,24 @@ is not written down is one somebody deletes.** Both halves are load-bearing.
   broken one**: Atlas hashes the link text and never opens the target, so a
   dangling link is a file the index holds like any other. One in a docs folder
   kept a 77 000-file repository out of the index entirely.
+- **A pass sends what changed, and the daemon carries the rest forward.** The
+  publish renames the staging directory into place, so the next pass starts from
+  an empty one and every file was re-read, hex-encoded and sent again — measured
+  2026-08-28, 28 450 files across two repositories every five minutes, of which
+  essentially none had changed. `scanner.keep` names a path instead, and the
+  daemon hard-links it out of the published generation. **The scanner's memory
+  decides only whether to ask.** The daemon links what its own generation holds
+  and answers `kept: false` when it holds nothing, so a memory that has outlived
+  the mirror costs a resend and can never produce a wrong mirror. The memory is
+  **in the process, never on disk**: a manifest that outlived the process would
+  be a promise about a mirror it did not build, which is the shape of the cadence
+  the scanner was once allowed to declare and which was reverted. What it
+  compares is `atlas_fs_identity` through `atlas_fs_identity_same` — all eight
+  fields, ctime included — which is the same evidence a reconciliation already
+  uses to skip hashing a path no event named, one process further out; and a
+  racy observation is not remembered at all, exactly as A1 requires. A `full`
+  directive drops the memory, because there is then no generation to carry
+  anything out of.
 - **There is no file size bound, and there must not be one.** Two were invented
   — 8 MiB, then 64 MiB — and both sat below Atlas' own
   `ATLAS_HASH_MAX_FILE_BYTES`, so the scanner refused files Atlas would have

@@ -515,6 +515,116 @@ static void test_a_mirror_state_is_answered_when_it_is_accepted(void) {
     (void)fclose(log);
     env_close(&e);
 }
+/* Reads a mirrored file's bytes, so a test can say the content survived rather
+ * than only that a name did. */
+static bool mirrored_content(env *e, int64_t repo, const char *rel, atlas_buf *out) {
+    atlas_buf p = ATLAS_BUF_INIT;
+    atlas_err err;
+    atlas_err_init(&err);
+    (void)atlas_buf_appendf(&p, &err, "%s/mirror/%lld/%s", fx_data_dir(&e->fx), (long long)repo,
+                            rel);
+    FILE *f = fopen(atlas_buf_cstr(&p), "rbe");
+    atlas_buf_free(&p);
+    if (f == NULL) {
+        return false;
+    }
+    char buf[512];
+    size_t n = 0;
+    while ((n = fread(buf, 1u, sizeof buf, f)) > 0) {
+        (void)atlas_buf_append(out, buf, n, &err);
+    }
+    (void)fclose(f);
+    return true;
+}
+
+/* --- A13: a path is carried forward instead of being sent again ------------ */
+
+static void test_a_kept_path_is_carried_and_a_path_the_daemon_lacks_is_refused(void) {
+    /* A mirroring pass re-read, hex-encoded and sent every file every time,
+     * because publishing renames the staging directory into place and the next
+     * pass therefore starts from an empty one. Measured 2026-08-28: 28,450 files
+     * across two repositories every five minutes, of which essentially none had
+     * changed.
+     *
+     * The half that has to be right is the second assertion. A scanner asks to
+     * carry a path forward on the strength of its own memory, and a memory can
+     * outlive the mirror it describes — a daemon restarted, a mirror removed, a
+     * generation this scanner never built. So the daemon decides: it links what
+     * its published generation actually holds, and answers `kept: false` when it
+     * holds nothing, which is what makes a stale memory cost a resend instead of
+     * a wrong mirror. Nothing here takes the caller's word for anything. */
+    env e;
+    env_open(&e);
+    atlas_err err;
+    atlas_err_init(&err);
+
+    atlas_buf raw = ATLAS_BUF_INIT;
+    atlas_buf params = ATLAS_BUF_INIT;
+
+    /* "int x;" — sent once, and never again in this test. */
+    T_OK(atlas_buf_appendf(&params, &err,
+                           "{\"repo\":%lld,\"path\":\"src/a.c\",\"first\":true,"
+                           "\"data\":\"696e7420783b\"}",
+                           (long long)e.mine),
+         &err);
+    atlas_ipc_response *pr =
+        call(&e, (long long)getuid(), "scanner.put", atlas_buf_cstr(&params), &raw);
+    T_CHECK_MSG(atlas_ipc_response_ok(pr), "scanner.put failed: %s", atlas_buf_cstr(&raw));
+    atlas_ipc_response_free(pr);
+    atlas_buf_reset(&params);
+    atlas_buf_reset(&raw);
+
+    finish(&e, e.mine);
+    T_REQUIRE_MSG(mirrored(&e, e.mine, "src/a.c"), "the first pass did not publish the file");
+
+    /* A path the published generation holds is carried. */
+    T_OK(atlas_buf_appendf(&params, &err, "{\"repo\":%lld,\"path\":\"src/a.c\"}",
+                           (long long)e.mine),
+         &err);
+    atlas_ipc_response *kr =
+        call(&e, (long long)getuid(), "scanner.keep", atlas_buf_cstr(&params), &raw);
+    T_CHECK_MSG(atlas_ipc_response_ok(kr), "scanner.keep failed: %s", atlas_buf_cstr(&raw));
+    bool kept = false;
+    T_CHECK_MSG(atlas_ipc_result_bool(kr, "kept", &kept) && kept,
+                "a path the daemon holds was not carried: %s", atlas_buf_cstr(&raw));
+    atlas_ipc_response_free(kr);
+    atlas_buf_reset(&params);
+    atlas_buf_reset(&raw);
+
+    /* A path it does not hold is refused, and refused as an answer rather than
+     * an error: the scanner's next step is to send the bytes. */
+    T_OK(atlas_buf_appendf(&params, &err, "{\"repo\":%lld,\"path\":\"src/never-sent.c\"}",
+                           (long long)e.mine),
+         &err);
+    atlas_ipc_response *mr =
+        call(&e, (long long)getuid(), "scanner.keep", atlas_buf_cstr(&params), &raw);
+    T_CHECK_MSG(atlas_ipc_response_ok(mr), "a keep for an absent path errored: %s",
+                atlas_buf_cstr(&raw));
+    bool missing_kept = true;
+    T_CHECK_MSG(atlas_ipc_result_bool(mr, "kept", &missing_kept) && !missing_kept,
+                "the daemon claimed to carry a path it never had: %s", atlas_buf_cstr(&raw));
+    atlas_ipc_response_free(mr);
+    atlas_buf_reset(&params);
+    atlas_buf_reset(&raw);
+
+    /* Publishing the second generation makes the carried file the live one. Its
+     * bytes are the bytes of the first pass, which is the whole point: they did
+     * not cross the socket again. */
+    finish(&e, e.mine);
+    atlas_buf content = ATLAS_BUF_INIT;
+    T_CHECK_MSG(mirrored_content(&e, e.mine, "src/a.c", &content),
+                "the carried file is not in the published generation");
+    T_CHECK_MSG(content.len == 6u && memcmp(content.data, "int x;", 6u) == 0,
+                "the carried file's content changed: %zu bytes", content.len);
+    T_CHECK_MSG(!mirrored(&e, e.mine, "src/never-sent.c"),
+                "a path the daemon refused to carry appeared anyway");
+    atlas_buf_free(&content);
+
+    atlas_buf_free(&params);
+    atlas_buf_free(&raw);
+    env_close(&e);
+}
+
 static const atlas_test TESTS[] = {
     {"a scanner is told its own repositories and no others",
      test_a_scanner_is_told_its_own_repositories_and_no_others},
@@ -530,6 +640,8 @@ static const atlas_test TESTS[] = {
     {"uid zero is never a scanner", test_uid_zero_is_never_a_scanner},
     {"a mirror state is answered when it is accepted",
      test_a_mirror_state_is_answered_when_it_is_accepted},
+    {"a kept path is carried and a path the daemon lacks is refused",
+     test_a_kept_path_is_carried_and_a_path_the_daemon_lacks_is_refused},
 };
 
 ATLAS_TEST_MAIN("scanner_rpc", TESTS)

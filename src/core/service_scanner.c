@@ -20,11 +20,13 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "atlas/db.h"
 #include "atlas/git.h"
 #include "atlas/ipc.h"
 #include "atlas/pathrep.h"
@@ -46,6 +48,46 @@
  * overhead depends on a path this code does not choose. */
 #define SCANNER_CHUNK_BYTES (ATLAS_IPC_MAX_REQUEST_BYTES / 4u)
 
+/* --- what this process has already sent ------------------------------------
+ *
+ * A mirroring pass used to re-read, hex-encode and send every file every time.
+ * `atlas_mirror_publish` renames the staging directory into place, so the next
+ * pass starts from an empty one and `put_file` was called unconditionally.
+ * Measured 2026-08-28 on this machine: 28,450 files across two repositories,
+ * every five minutes, of which essentially none had changed.
+ *
+ * **In memory, and deliberately not on disk.** A manifest that outlived the
+ * process would be a promise about a mirror this process did not build — the
+ * same shape as the cadence the scanner was once allowed to declare, and
+ * reverted for the same reason. Losing it costs one full pass, which is what a
+ * scanner that has just started does anyway.
+ *
+ * **It is never trusted, only used.** What it decides is whether to *ask*; the
+ * daemon decides what to do, by linking whatever its published generation holds
+ * at that path and answering `kept: false` when it holds nothing. So a memory
+ * that has outlived the mirror corrects itself on the next call instead of
+ * producing a wrong mirror.
+ *
+ * What it compares is `atlas_fs_identity` — all eight fields, ctime included —
+ * through `atlas_fs_identity_same`. That is not a new kind of trust: it is the
+ * same evidence a reconciliation already uses to skip hashing a path no event
+ * named, applied one process further out. A racy observation is not remembered
+ * at all, which A1 requires and which costs one resend. */
+typedef struct sent_entry {
+    char *path; /* owned, NUL-terminated; NULL is an empty slot */
+    size_t path_len;
+    atlas_fs_identity id;
+    uint64_t seen; /* the pass that last visited this path */
+} sent_entry;
+
+typedef struct sent_map {
+    int64_t repo_id;
+    sent_entry *slots;
+    size_t cap; /* a power of two, or zero when nothing is held */
+    size_t count;
+    uint64_t pass;
+} sent_map;
+
 typedef struct walk_ctx {
     const char *socket_path;
     int64_t repo_id;
@@ -56,6 +98,13 @@ typedef struct walk_ctx {
     int64_t mirrored;
     int64_t skipped_symlink;
     int64_t skipped_unreadable;
+    /* How many paths this pass carried forward instead of sending. */
+    int64_t kept;
+    /* This repository's memory of what was sent, or NULL when the daemon asked
+     * for a full mirror. */
+    sent_map *mem;
+    /* When this pass started looking, for A1's raciness rule. */
+    struct timespec observed_at;
     /* A13. When this walk last told the daemon it is alive.
      *
      * The heartbeat is `scanner.poll`, and one poll per pass is not enough: a
@@ -64,6 +113,207 @@ typedef struct walk_ctx {
      * stale for most of every pass. Measured on /opt/dna. */
     int64_t last_beat_ms;
 } walk_ctx;
+
+/* FNV-1a over the raw path bytes. Paths are bytes, so this hashes bytes. */
+static uint64_t path_hash(const void *p, size_t n) {
+    const unsigned char *b = (const unsigned char *)p;
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; i++) {
+        h ^= b[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+static void sent_map_free(sent_map *m) {
+    if (m->slots != NULL) {
+        for (size_t i = 0; i < m->cap; i++) {
+            free(m->slots[i].path);
+        }
+        free(m->slots);
+    }
+    m->slots = NULL;
+    m->cap = 0;
+    m->count = 0;
+}
+
+static sent_entry *sent_map_find(sent_map *m, const void *path, size_t len) {
+    if (m == NULL || m->cap == 0) {
+        return NULL;
+    }
+    size_t mask = m->cap - 1u;
+    size_t i = (size_t)path_hash(path, len) & mask;
+    for (size_t probe = 0; probe < m->cap; probe++) {
+        sent_entry *e = &m->slots[i];
+        if (e->path == NULL) {
+            return NULL;
+        }
+        if (e->path_len == len && memcmp(e->path, path, len) == 0) {
+            return e;
+        }
+        i = (i + 1u) & mask;
+    }
+    return NULL;
+}
+
+static bool sent_map_grow(sent_map *m) {
+    size_t want = m->cap == 0 ? 1024u : m->cap * 2u;
+    sent_entry *slots = (sent_entry *)calloc(want, sizeof(*slots));
+    if (slots == NULL) {
+        return false;
+    }
+    sent_entry *old = m->slots;
+    size_t old_cap = m->cap;
+    m->slots = slots;
+    m->cap = want;
+    size_t mask = want - 1u;
+    for (size_t k = 0; k < old_cap; k++) {
+        if (old[k].path == NULL) {
+            continue;
+        }
+        size_t i = (size_t)path_hash(old[k].path, old[k].path_len) & mask;
+        while (m->slots[i].path != NULL) {
+            i = (i + 1u) & mask;
+        }
+        m->slots[i] = old[k];
+    }
+    free(old);
+    return true;
+}
+
+/* Remembers one path's identity. A failure to allocate is not an error the pass
+ * reports: forgetting costs a resend next time and nothing else. */
+static void sent_map_put(sent_map *m, const void *path, size_t len, const atlas_fs_identity *id) {
+    if (m == NULL) {
+        return;
+    }
+    sent_entry *e = sent_map_find(m, path, len);
+    if (e != NULL) {
+        e->id = *id;
+        e->seen = m->pass;
+        return;
+    }
+    /* Half full at most, so probing stays short. */
+    if (m->cap == 0 || (m->count + 1u) * 2u > m->cap) {
+        if (!sent_map_grow(m)) {
+            return;
+        }
+    }
+    size_t mask = m->cap - 1u;
+    size_t i = (size_t)path_hash(path, len) & mask;
+    while (m->slots[i].path != NULL) {
+        i = (i + 1u) & mask;
+    }
+    char *copy = (char *)malloc(len + 1u);
+    if (copy == NULL) {
+        return;
+    }
+    memcpy(copy, path, len);
+    copy[len] = '\0';
+    m->slots[i].path = copy;
+    m->slots[i].path_len = len;
+    m->slots[i].id = *id;
+    m->slots[i].seen = m->pass;
+    m->count++;
+}
+
+/* Drops what this pass did not visit, so the memory tracks the tree rather than
+ * growing with everything the repository has ever held. Rebuilt rather than
+ * tombstoned, because a deletion in an open-addressing table has to be, and a
+ * pass is already the natural point to do it. */
+static void sent_map_sweep(sent_map *m) {
+    if (m == NULL || m->cap == 0) {
+        return;
+    }
+    sent_entry *old = m->slots;
+    size_t old_cap = m->cap;
+    m->slots = NULL;
+    m->cap = 0;
+    m->count = 0;
+    for (size_t k = 0; k < old_cap; k++) {
+        if (old[k].path == NULL) {
+            continue;
+        }
+        if (old[k].seen == m->pass) {
+            sent_map_put(m, old[k].path, old[k].path_len, &old[k].id);
+        }
+        free(old[k].path);
+    }
+    free(old);
+}
+
+/* One memory per repository, held by the loop and never by a pass: a pass is
+ * the thing being made cheaper, so it cannot be what owns the saving. */
+typedef struct scanner_memory {
+    sent_map *repos;
+    size_t count;
+    size_t cap;
+} scanner_memory;
+
+static void memory_free(scanner_memory *m) {
+    for (size_t i = 0; i < m->count; i++) {
+        sent_map_free(&m->repos[i]);
+    }
+    free(m->repos);
+    m->repos = NULL;
+    m->count = 0;
+    m->cap = 0;
+}
+
+/* The memory for one repository, created on first sight. NULL when it cannot be
+ * created, which turns this pass into the full one it would have been anyway. */
+static sent_map *memory_for(scanner_memory *m, int64_t repo_id) {
+    for (size_t i = 0; i < m->count; i++) {
+        if (m->repos[i].repo_id == repo_id) {
+            return &m->repos[i];
+        }
+    }
+    if (m->count == m->cap) {
+        size_t want = m->cap == 0 ? 4u : m->cap * 2u;
+        sent_map *grown = (sent_map *)realloc(m->repos, want * sizeof(*grown));
+        if (grown == NULL) {
+            return NULL;
+        }
+        m->repos = grown;
+        m->cap = want;
+    }
+    sent_map *s = &m->repos[m->count++];
+    memset(s, 0, sizeof(*s));
+    s->repo_id = repo_id;
+    return s;
+}
+
+/* Fills an identity from a stat, the same eight fields `reconcile.c` records. */
+static void scanner_identity_from_stat(atlas_fs_identity *out, const struct stat *sb) {
+    out->known = true;
+    out->dev = (int64_t)sb->st_dev;
+    out->ino = (int64_t)sb->st_ino;
+    out->size = (int64_t)sb->st_size;
+    out->mtime_sec = (int64_t)sb->st_mtim.tv_sec;
+    out->mtime_nsec = (int64_t)sb->st_mtim.tv_nsec;
+    out->ctime_sec = (int64_t)sb->st_ctim.tv_sec;
+    out->ctime_nsec = (int64_t)sb->st_ctim.tv_nsec;
+    out->mode = (int64_t)sb->st_mode;
+}
+
+/* A1's raciness rule, applied to what this process is willing to remember: an
+ * observation whose timestamps sit inside the open tick describes a file that
+ * may still be being written, so it is not recorded as a value. Costs one
+ * resend on the next pass, which is the safe direction. */
+static bool scanner_stamp_racy(int64_t sec, int64_t nsec, const struct timespec *at) {
+    if (sec > (int64_t)at->tv_sec) {
+        return true;
+    }
+    if (sec == (int64_t)at->tv_sec) {
+        return nsec >= (int64_t)at->tv_nsec || nsec == 0;
+    }
+    return false;
+}
+
+static bool scanner_identity_stable(const atlas_fs_identity *id, const struct timespec *at) {
+    return !scanner_stamp_racy(id->mtime_sec, id->mtime_nsec, at) &&
+           !scanner_stamp_racy(id->ctime_sec, id->ctime_nsec, at);
+}
 
 /* A13. Tells the daemon a run is starting, which clears `mirror_complete`.
  *
@@ -150,6 +400,45 @@ static atlas_status put_file(walk_ctx *w, const void *rel, size_t rel_len, const
         sent += take;
         first = false;
     }
+    atlas_buf_free(&enc);
+    return st;
+}
+
+/* A13. Asks the daemon to carry a path forward instead of sending its bytes.
+ *
+ * `*kept_out` is the daemon's answer, not this process's belief: false means the
+ * published generation does not hold that path, and the caller sends the bytes.
+ * A failed call is reported the same way — false — because "I could not find out"
+ * and "it is not there" call for the same next step, and the difference would
+ * only ever be used to skip work on a guess. */
+static atlas_status keep_file(walk_ctx *w, const void *rel, size_t rel_len, bool *kept_out) {
+    *kept_out = false;
+    atlas_buf enc = ATLAS_BUF_INIT;
+    atlas_status st = atlas_path_text_encode(rel, rel_len, &enc, w->err);
+
+    atlas_buf params = ATLAS_BUF_INIT;
+    if (st == ATLAS_OK) {
+        st = atlas_buf_appendf(&params, w->err, "{\"repo\":%lld,\"path\":\"%s\"}",
+                               (long long)w->repo_id, atlas_buf_cstr(&enc));
+    }
+    atlas_buf raw = ATLAS_BUF_INIT;
+    if (st == ATLAS_OK) {
+        st = atlas_ipc_call(w->socket_path, "scanner.keep", atlas_buf_cstr(&params), &raw, w->err);
+    }
+    if (st == ATLAS_OK) {
+        atlas_ipc_response *resp = NULL;
+        atlas_err perr;
+        atlas_err_init(&perr);
+        if (atlas_ipc_response_parse(raw.data, raw.len, &resp, &perr) == ATLAS_OK) {
+            bool kept = false;
+            if (atlas_ipc_response_ok(resp) && atlas_ipc_result_bool(resp, "kept", &kept)) {
+                *kept_out = kept;
+            }
+        }
+        atlas_ipc_response_free(resp);
+    }
+    atlas_buf_free(&raw);
+    atlas_buf_free(&params);
     atlas_buf_free(&enc);
     return st;
 }
@@ -338,6 +627,28 @@ static void mirror_one(walk_ctx *w, const void *rel, size_t rel_len) {
         return;
     }
 
+    /* Unchanged since this process sent it? Then ask the daemon to carry it
+     * forward rather than reading, hex-encoding and sending it again. The
+     * identity was taken by the open above, so this costs no extra syscall on
+     * the tree — and when the daemon says it does not hold the path, the code
+     * below sends it exactly as it always did. */
+    atlas_fs_identity now;
+    memset(&now, 0, sizeof(now));
+    scanner_identity_from_stat(&now, &sb);
+    if (w->mem != NULL) {
+        const sent_entry *e = sent_map_find(w->mem, rel, rel_len);
+        if (e != NULL && atlas_fs_identity_same(&e->id, &now)) {
+            bool kept = false;
+            if (keep_file(w, rel, rel_len, &kept) == ATLAS_OK && kept) {
+                (void)close(fd);
+                sent_map_put(w->mem, rel, rel_len, &now);
+                w->mirrored++;
+                w->kept++;
+                return;
+            }
+        }
+    }
+
     atlas_buf content = ATLAS_BUF_INIT;
     atlas_status st = ATLAS_OK;
     char chunk[64u * 1024u];
@@ -364,6 +675,13 @@ static void mirror_one(walk_ctx *w, const void *rel, size_t rel_len) {
         st = put_file(w, rel, rel_len, content.data, content.len, (sb.st_mode & S_IXUSR) != 0);
         if (st == ATLAS_OK) {
             w->mirrored++;
+            /* Remembered only now, and only when the observation is not racy: a
+             * file whose timestamps sit inside the open tick may still be being
+             * written, and A1 stores such an observation as unknown rather than
+             * as a value. Not remembering costs one resend next pass. */
+            if (w->mem != NULL && scanner_identity_stable(&now, &w->observed_at)) {
+                sent_map_put(w->mem, rel, rel_len, &now);
+            }
         } else {
             w->status = st;
         }
@@ -466,7 +784,8 @@ static atlas_status walk_cb(const atlas_git_index_entry *e, void *ud, atlas_err 
  * sleeps for a time Atlas chose rather than one this process invented. The spec
  * has no `hello` for the same reason: the scanner asks what is owed, and asking
  * is what proves it is alive. */
-static atlas_status scan_pass(int64_t *poll_within_ms, FILE *log, atlas_err *err) {
+static atlas_status scan_pass(int64_t *poll_within_ms, scanner_memory *mem, FILE *log,
+                              atlas_err *err) {
     *poll_within_ms = ATLAS_SCANNER_POLL_INTERVAL_MS;
 
     atlas_buf socket_path = ATLAS_BUF_INIT;
@@ -561,6 +880,27 @@ static atlas_status scan_pass(int64_t *poll_within_ms, FILE *log, atlas_err *err
         w.log = log;
         w.err = err;
         w.status = ATLAS_OK;
+        (void)clock_gettime(CLOCK_REALTIME, &w.observed_at);
+        /* **The directive decides whether this pass may remember anything.**
+         * `full` means the daemon holds no complete mirror, so there is nothing
+         * to carry forward and anything this process still remembers describes
+         * a generation that is gone. Dropped rather than ignored: a memory kept
+         * across a `full` would make the next pass ask about files the daemon
+         * cannot have. */
+        {
+            const char *directive = NULL;
+            const bool incremental =
+                atlas_ipc_result_arr_obj_str(resp, "repositories", i, "directive", &directive) &&
+                directive != NULL && strcmp(directive, "incremental") == 0;
+            sent_map *m = mem != NULL ? memory_for(mem, id) : NULL;
+            if (m != NULL && !incremental) {
+                sent_map_free(m);
+            }
+            if (m != NULL && incremental) {
+                m->pass++;
+                w.mem = m;
+            }
+        }
         /* **Nothing is cleared here, deliberately.** The first design reported
          * `complete=false` before writing anything, so a crash left the mirror
          * refused rather than trusted -- and made a repository unreadable for the
@@ -688,11 +1028,18 @@ static atlas_status scan_pass(int64_t *poll_within_ms, FILE *log, atlas_err *err
                           name, atlas_err_msg(err));
         }
 
+        /* Forget what this pass did not visit, so the memory tracks the tree
+         * rather than everything the repository has ever held. */
+        if (w.mem != NULL) {
+            sent_map_sweep(w.mem);
+        }
+
         if (log != NULL) {
             (void)fprintf(log,
-                          "  %s  mirrored %lld, skipped %lld symlink, %lld unreadable\n", name,
-                          (long long)w.mirrored, (long long)w.skipped_symlink,
-                          (long long)w.skipped_unreadable);
+                          "  %s  mirrored %lld (%lld carried), skipped %lld symlink, "
+                          "%lld unreadable\n",
+                          name, (long long)w.mirrored, (long long)w.kept,
+                          (long long)w.skipped_symlink, (long long)w.skipped_unreadable);
         }
         if (walked != ATLAS_OK) {
             st = walked;
@@ -727,13 +1074,20 @@ static atlas_status scan_pass(int64_t *poll_within_ms, FILE *log, atlas_err *err
  * delays the next one instead of overlapping it. */
 atlas_status atlas_service_scanner_run(bool once, FILE *log, atlas_err *err) {
     int64_t within = ATLAS_SCANNER_POLL_INTERVAL_MS;
+    /* Held by the loop, so it survives a pass and nothing else. `--once` gets one
+     * too and drops it on return: a single pass has nothing to remember from,
+     * and giving it the same structure keeps one code path rather than two. */
+    scanner_memory mem;
+    memset(&mem, 0, sizeof(mem));
     if (once) {
-        return scan_pass(&within, log, err);
+        atlas_status one = scan_pass(&within, &mem, log, err);
+        memory_free(&mem);
+        return one;
     }
     for (;;) {
         atlas_err pass_err;
         atlas_err_init(&pass_err);
-        atlas_status st = scan_pass(&within, log, &pass_err);
+        atlas_status st = scan_pass(&within, &mem, log, &pass_err);
         if (st != ATLAS_OK && log != NULL) {
             /* Reported and survived. A repository that could not be mirrored
              * this time keeps whatever the last successful pass left, and the

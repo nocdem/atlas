@@ -306,6 +306,125 @@ static void remove_tree(int parent, const char *name) {
     (void)unlinkat(parent, name, AT_REMOVEDIR);
 }
 
+/* `walk_to_parent`'s read-only twin: descends an existing generation and creates
+ * nothing. A missing component is an ordinary answer here rather than a failure
+ * — it means the published generation does not hold this path — so it reports
+ * through `*missing_out` and leaves `err` untouched. */
+static atlas_status walk_to_parent_ro(int root_fd, const void *rel, size_t rel_len,
+                                      int *parent_out, char *comp, bool *missing_out,
+                                      atlas_err *err) {
+    *parent_out = -1;
+    *missing_out = false;
+    if (root_fd < 0) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "a mirror root is required");
+    }
+    if (!atlas_snapshot_path_ok(rel, rel_len)) {
+        return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                             "a mirror path must be a safe relative path");
+    }
+
+    const char *p = (const char *)rel;
+    int parent = dup(root_fd);
+    if (parent < 0) {
+        return atlas_err_set_errno(err, ATLAS_ERR_INTERNAL, errno, "cannot hold the mirror root");
+    }
+    size_t start = 0;
+    for (size_t i = 0; i < rel_len; i++) {
+        if (p[i] != '/') {
+            continue;
+        }
+        size_t n = i - start;
+        if (n > MIRROR_COMP_MAX) {
+            (void)close(parent);
+            return atlas_err_set(err, ATLAS_ERR_INTEGRITY, "a mirror path component is too long");
+        }
+        memcpy(comp, p + start, n);
+        comp[n] = '\0';
+        int next = openat(parent, comp, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        (void)close(parent);
+        if (next < 0) {
+            *missing_out = true;
+            return ATLAS_OK;
+        }
+        parent = next;
+        start = i + 1u;
+    }
+
+    size_t leaf_len = rel_len - start;
+    if (leaf_len == 0 || leaf_len > MIRROR_COMP_MAX) {
+        (void)close(parent);
+        return atlas_err_set(err, ATLAS_ERR_INTEGRITY, "a mirror path leaf is empty or too long");
+    }
+    memcpy(comp, p + start, leaf_len);
+    comp[leaf_len] = '\0';
+    *parent_out = parent;
+    return ATLAS_OK;
+}
+
+atlas_status atlas_mirror_keep(const char *data_dir, int64_t repo_id, const void *rel,
+                               size_t rel_len, bool *kept_out, atlas_err *err) {
+    if (kept_out == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "a keep needs somewhere to report its verdict");
+    }
+    *kept_out = false;
+
+    /* The published generation may simply not be there — a daemon that has never
+     * mirrored this repository, or one whose mirror was removed. Not an error:
+     * the caller answers it by sending the bytes. */
+    int cur = -1;
+    atlas_err ignored;
+    atlas_err_init(&ignored);
+    if (atlas_mirror_open_repo(data_dir, repo_id, &cur, &ignored) != ATLAS_OK) {
+        return ATLAS_OK;
+    }
+
+    char src_comp[MIRROR_COMP_MAX + 1];
+    int src_parent = -1;
+    bool missing = false;
+    atlas_status st = walk_to_parent_ro(cur, rel, rel_len, &src_parent, src_comp, &missing, err);
+    (void)close(cur);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (missing) {
+        return ATLAS_OK;
+    }
+
+    int stage = -1;
+    st = atlas_mirror_open_staging(data_dir, repo_id, &stage, err);
+    if (st != ATLAS_OK) {
+        (void)close(src_parent);
+        return st;
+    }
+    char dst_comp[MIRROR_COMP_MAX + 1];
+    int dst_parent = -1;
+    st = walk_to_parent(stage, rel, rel_len, &dst_parent, dst_comp, err);
+    (void)close(stage);
+    if (st != ATLAS_OK) {
+        (void)close(src_parent);
+        return st;
+    }
+
+    /* Flags zero, so a symlink is linked as itself rather than followed. A
+     * mirrored symlink is a file the index holds like any other. */
+    if (linkat(src_parent, src_comp, dst_parent, dst_comp, 0) == 0) {
+        *kept_out = true;
+    } else if (errno == EEXIST) {
+        /* Already staged — this pass sent it, or a previous one did and died
+         * after. Either way the staged generation holds the path. */
+        *kept_out = true;
+    } else if (errno != ENOENT) {
+        int saved = errno;
+        (void)close(src_parent);
+        (void)close(dst_parent);
+        return atlas_err_set_errno(err, ATLAS_ERR_INTEGRITY, saved,
+                                   "cannot carry a mirrored file into the staging generation");
+    }
+    (void)close(src_parent);
+    (void)close(dst_parent);
+    return ATLAS_OK;
+}
+
 atlas_status atlas_mirror_publish(const char *data_dir, int64_t repo_id, atlas_err *err) {
     if (data_dir == NULL || data_dir[0] == '\0') {
         return atlas_err_set(err, ATLAS_ERR_USAGE, "a data directory is required");

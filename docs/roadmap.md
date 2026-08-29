@@ -1068,7 +1068,7 @@ this experiment, only its determinism. Nothing here says what memory does for a
 task unlike the ones already in the corpus, and nothing says what it does once
 the corpus is large enough that selection matters.
 
-## Next: A11.5b — Atlas sustained pilot with bounded memory
+## After A12.1: A11.5b — Atlas sustained pilot with bounded memory
 
 The verdict is `USEFUL`, so the ordering this milestone set for itself applies:
 **the memory default stays `OFF`**, and the next step is a sustained pilot that
@@ -1322,6 +1322,103 @@ and revision 2 completed cleanly. Two residuals filed in `docs/backlog.md`:
 the dispatcher's completion deserves the run driver's 300 s discipline, and
 `blocking_task` names the wrong task when the blocker ended
 RECOVERY_REQUIRED rather than FAILED (money, never authority).
+
+## Next, P0: A12.1 — reconciled model memory and revision-bound task context
+
+A12.0 proved that Atlas can ask one model for a plan and another to execute it,
+while keeping acceptance in Atlas' gates and the operator's policy. It did not
+prove that either model entered the run with a coherent account of the project.
+Claude Code project memory, user memory, generated context and copied notes can
+all preserve different revisions of the same assertion. More memory in that
+state is not more context; it is a larger unlabelled conflict.
+
+This is the urgent prerequisite to A11.5b. The bounded cross-run memory default
+remains `OFF` until this season closes and the sustained pilot can consume
+reconciled rather than merely retrieved memory.
+
+> **MODEL MEMORY IS AN ATTESTATION, NOT PROJECT TRUTH.**
+
+**The job.** Add one dedicated `CONTEXT_RECONCILE` path. Root-owned policy
+explicitly registers the memory sources it may read: Claude Code repository,
+project and user memory first, with later adapters using the same contract.
+Every source is preserved with origin, scope, observed time and content hash.
+A Git-tracked source is bound to its commit and blob and its textual history is
+read from Git rather than copied into a second diff store. A registered source
+outside Git receives an Atlas-owned snapshot/version chain. Hidden provider
+memory that Atlas cannot read is outside the claim.
+
+The reconciler extracts discrete propositions into the existing A9.2 claim and
+attestation model; it must not create a competing truth database. It evaluates
+each proposition according to what the proposition means: current source,
+build wiring and tests describe implementation; the effective approved decision
+revision describes authorized intent; revision-bound runtime evidence describes
+a deployment. If code and an approved decision disagree, the result is
+implementation drift. It is never resolved by silently rewriting the decision,
+and a later timestamp alone never supersedes anything.
+
+Every observed working-tree change makes the affected memory view dirty. Every
+accepted source revision, effective decision revision or registered-memory
+revision produces a new monotonic `memory_generation`, incrementally
+re-evaluates the affected claims and records a semantic diff: claims added,
+changed, supported, contradicted, made stale or impacted, superseded with
+provenance, or left `UNKNOWN`. Git remains canonical for the textual source
+diff; Atlas records what that diff changed in project knowledge and why the
+conclusion follows.
+
+Before a planner or executor starts, Atlas emits a bounded Canonical Context
+Pack pinned to at least:
+
+- repository identity and exact commit or candidate-tree digest;
+- the effective decision revisions it depends on;
+- `memory_generation` and the registered source versions;
+- included claims, supporting and contradicting evidence, freshness and gaps.
+
+The same pinned inputs must reproduce the same pack. A pack whose repository,
+decision or memory generation has moved is not reported as current. Relevant
+unresolved disagreement is exposed as `CONTEXT_CONFLICT`; unrelated stale
+material is reported and excluded rather than turning every run into a gate.
+The worker's output is checked after the run for reliance on a claim that the
+pack identified as stale, contradicted or unknown.
+
+**What may update automatically.** Atlas-owned derived memory projections and
+task packs may be regenerated mechanically after their inputs move. Human- or
+operator-authored memory receives a proposed patch and a diff; it is never
+silently rewritten. The reconciler cannot approve, reject or supersede a
+decision, modify root-owned policy, upgrade its own trust, or treat a model's
+summary as evidence merely because that model produced it.
+
+**Acceptance is evidence, not a demo.** Close the season only when a controlled
+repository proves all of the following:
+
+1. three copies of one assertion, including an older stale version and a genuine
+   contradiction, retain their individual provenance and cannot collapse into
+   one confidence score;
+2. a source commit invalidates only the claims in its bounded impact set, emits
+   both the Git reference and the semantic memory diff, and leaves unrelated
+   claims byte-for-byte stable;
+3. a code/decision mismatch is reported as implementation drift, while an
+   implementation fact and a normative decision can both remain accurately
+   represented;
+4. Git-tracked Claude memory survives history reconstruction from commit/blob
+   identity, and a non-Git registered memory source survives restart with its
+   snapshot and diff chain intact;
+5. an Atlas-owned projection updates mechanically, while an equivalent
+   hand-authored memory file produces only a proposed patch;
+6. a task cannot receive a pack falsely labelled current after any pinned input
+   moves, and unresolved material is `UNKNOWN` or `CONTEXT_CONFLICT`, never
+   silently selected by recency;
+7. an adversarial memory file cannot smuggle instructions into policy, approve
+   itself, alter a decision or cause a read/reconciliation pass to write source;
+8. one frozen pilot compares the same real task with the existing bounded-memory
+   retrieval and with the reconciled Context Pack, recording correctness,
+   contradictions caught, omissions, token cost and model usage without calling
+   one successful run a general result.
+
+**Deliberate non-goals for this season.** Reading a model provider's hidden
+internal memory; mass-rewriting every note on every keystroke; using GitHub as a
+second source of Git truth; automatically adopting a design because current code
+implements it; and blocking unrelated work merely because some historical
+memory remains stale.
 
 ## Invariants that outlive every phase
 

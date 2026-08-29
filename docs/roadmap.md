@@ -1365,6 +1365,27 @@ provenance, or left `UNKNOWN`. Git remains canonical for the textual source
 diff; Atlas records what that diff changed in project knowledge and why the
 conclusion follows.
 
+**Commit provenance.** When Atlas prepares a commit, it appends a compact,
+machine-readable Git trailer block rather than expanding the prose subject. The
+root-owned policy chooses the public fields; the baseline is:
+
+```text
+Atlas-Provenance: v1
+Atlas-Run: <run uid>
+Atlas-Memory-Generation: <generation>
+Atlas-Context-Digest: sha256:<digest>
+Atlas-Decision-Set-Digest: sha256:<digest>
+Atlas-Change-Reason: <record uid>
+```
+
+A trailer is a pointer, never proof and never authority. On ingestion Atlas
+resolves every referenced record, verifies each digest and binds the association
+to the commit tree. Missing, unknown or tampered references remain `UNKNOWN`;
+they cannot manufacture an approval or gate result. Prompts, memory bodies,
+credentials, secrets, model names and costs never enter a public commit message.
+A normal commit without Atlas trailers remains valid Git history, merely without
+this additional provenance.
+
 Before a planner or executor starts, Atlas emits a bounded Canonical Context
 Pack pinned to at least:
 
@@ -1412,7 +1433,10 @@ repository proves all of the following:
 8. one frozen pilot compares the same real task with the existing bounded-memory
    retrieval and with the reconciled Context Pack, recording correctness,
    contradictions caught, omissions, token cost and model usage without calling
-   one successful run a general result.
+   one successful run a general result;
+9. rebuilding from Git trailers recovers the same run, memory and decision-set
+   associations, while malformed, unknown and deliberately altered trailers add
+   no authority and produce explicit `UNKNOWN`.
 
 **Deliberate non-goals for this season.** Reading a model provider's hidden
 internal memory; mass-rewriting every note on every keystroke; using GitHub as a

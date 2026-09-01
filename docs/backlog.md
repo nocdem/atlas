@@ -1222,3 +1222,75 @@ second one appended.
   completions arrived. An operator running a planned run right after a deploy
   should expect `BUSY`-shaped friction; the writer's yield (A9.2.7) bounds it
   but does not remove it.
+
+## Atlas instruments writes and not reads, so it cannot see whether it was consulted (2026-09-01)
+
+Measured in a session, not supposed. The Atlas plugin's hook registration
+(`integrations/claude/atlas/hooks/hooks.json`, and the installed copy under the
+marketplace directory) matches writes and only writes:
+
+```json
+"PreToolUse":  [ { "matcher": "Edit|Write|MultiEdit|NotebookEdit", ... } ],
+"PostToolUse": [ { "matcher": "Edit|Write|MultiEdit|NotebookEdit", ... } ]
+```
+
+`Grep`, `Read` and `Bash` appear in no matcher. The consequence is exact: an
+agent that reads the whole tree with `grep` and writes one file is, to Atlas,
+**indistinguishable** from one that queried the index thoroughly first. Both
+produce the same change set, the same session row and the same context block.
+
+`CLAUDE.md` tells a reader to ask Atlas "before changing unfamiliar code", and
+that sentence has the same shape as the matcher — it names the write. The
+failure it leaves open is the read: on 2026-09-01 a session opened the A12.1
+season, read a dozen unfamiliar files in `src/verify`, `src/orch`, `src/db` and
+`src/ipc` to pin interfaces into a plan, and queried the index **zero** times.
+Nothing in Atlas, the hooks or the context block registered that, because
+nothing is watching for it.
+
+**Why the omission survives, and why it is this project's own failure class.**
+A skipped read has no visible failure mode. What Atlas offers a reader —
+recorded reasons, impact candidates, the decisions that govern a path — is
+invisible to whoever never asks, so the omission produces plausible output and
+no error signal at all. That is the shape of `ATLAS_SEM_ANALYZER_VERSION`'s
+bumps being no-ops for every repository nobody rebuilt by hand, and of the call
+graph decaying from 475,741 edges to 10,631 with the symbol count untouched
+throughout: in both, what was produced looked right, and the missing part was
+unobservable from inside.
+
+**It was not harmless in the measured case.** Two facts arrived only after the
+index was finally asked, both of which the tree had held all along:
+`derive_actor` has exactly two call sites, one of which (`src/verify/intake.c:873`)
+is an already-reviewed precedent for constructing a synthetic ATLAS-channel op to
+derive an actor of a chosen class; and the forgery guard on `verify_actors` —
+`CHECK(class NOT IN ('TOOL','TEST','RUNTIME_OBSERVATION','ATLAS_VERIFIER') OR
+identity = 'ATLAS_ATTESTED')` — does **not** cover `DOCUMENT`, so a
+DOCUMENT/SELF_DECLARED actor is already insertable. The second removed a
+migration from A12.1's plan while it was still being written.
+
+**The symmetric gap, stated because A12.1 is next to it and deliberately does
+not close it.** A12.1 pins what a *worker was shown*: a Context Pack bound to a
+commit, a decision set and a memory generation, frozen per run. Nothing pins
+what a *reader consulted*. "This plan was written without consulting the index"
+is exactly the sort of absence the season stack exists to make positively
+establishable, and today it is not recorded anywhere. The operator's decision on
+2026-09-01 was to keep this out of A12.1's scope — the season already carries
+nine acceptance items — and to record it here instead.
+
+**Candidate fixes, none implemented.**
+
+1. Widen the plugin's `PreToolUse` matcher so Atlas can *observe* reads. Cheap,
+   and it makes the fact recordable rather than merely true.
+2. Surface consultation in the context block the `UserPromptSubmit` hook already
+   injects — a session that has asked the index nothing would say so, next to
+   the change count it already reports. **Whether the daemon currently records
+   which read methods a session called is not established here**; it is on the
+   path of every MCP call, so the fact is reachable, but this entry does not
+   claim the row exists.
+3. Let a change reason carry a digest of the index facts its author consulted,
+   which is the Context Pack pointed at the reader instead of the worker.
+
+**What must not be done.** Not a reminder that fires on every read — a warning
+everyone learns to skip past is the conflict list A9.2.5 warns about, one layer
+out. And not a permission gate: refusing a read until the index has been
+consulted would block the one operation Atlas guarantees is safe, and it is a
+check an adversary — or an impatient operator — walks around in one step.

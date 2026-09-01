@@ -1444,6 +1444,91 @@ second source of Git truth; automatically adopting a design because current code
 implements it; and blocking unrelated work merely because some historical
 memory remains stale.
 
+## Later: the review surface, and where a proposal is disposed of
+
+A4 gave Atlas a lifecycle and one channel that may move it. A9 gave it a web
+surface that may only read. Today those two facts meet at an inconvenience an
+operator feels on every proposal: the record is written by a model over MCP, and
+the only way to look at it properly is a terminal, while the only surface that
+renders it well can do nothing about it.
+
+> **A PROPOSAL NOBODY CAN REVIEW COMFORTABLY IS A PROPOSAL NOBODY REVIEWS.**
+
+**The job.** Make Mission Control the place a proposal is *read* — every revision,
+its evidence and counter-evidence, the aggregate and the reasons behind it, the
+gate results, the impact set, and A12.1's drift finding where there is one — and
+then decide, deliberately, how far it may go towards disposing of one.
+
+**What is true today, measured rather than assumed** (2026-09-01). The gateway
+serves 26 routes and **not one of them mutates**: no `decision.approve`,
+`decision.reject` or `decision.supersede` appears in `API_ROUTES[]`. MCP tool
+names are scanned against a forbidden-verb list — `approve`, `approval`, `reject`,
+`supersede`, `confirm`, `sign`, `resolve`, `revalidate` — in
+`tests/test_decision_mcp.c`, so a lifecycle transition is not reachable from a
+model by name. And the same test scans `CLAUDE.md` itself against a second list,
+which forbids Atlas from ever claiming that its local channel *proves a person*.
+
+That second list is the one that decides the shape of this season, and it points
+the opposite way from the intuition. **There is no human-proof gate to weaken.**
+`LOCAL_OPERATOR_CONFIRMED` identifies a channel, not a person, and A7.1 states
+plainly that a same-uid process driving a pseudo-terminal — an AI agent with a
+shell included — reaches it exactly as a person does. What the local channel
+actually buys is narrower and worth naming precisely: the caller must be a
+*local process running as the operator's own uid*, holding a single-use capability
+bound to that revision's content hash. Every honest comparison in this season is
+against that sentence and not against a stronger one nobody ever had.
+
+**The concrete risk, which is deployment-specific and current.** This machine's
+gateway listens on one address and carries two surfaces at once —
+`remote_mcp=yes web_gui=yes` — and the MCP half is connected to an external model
+through a tunnel. Any approval capability placed on that listener is one scope
+check away from the model that proposed the record. A9 already holds the
+precedent for the answer rather than for the prohibition: `memory:write` is *in
+the vocabulary and is not grantable*.
+
+**Three tiers, in increasing order of what they cost the threat model. The choice
+between them is the season's opening decision and is deliberately not made here.**
+
+1. **The UI reviews; the terminal disposes.** Mission Control renders everything
+   needed to decide and maintains a queue — "I would approve this" — that stores
+   no authority at all. One local command walks the queue and confirms each
+   through the existing content-hash capability. The threat model does not move
+   by one line, nothing is added to the listener the model reaches, and the
+   expensive half of the work — reading — moves to the surface that is good at it.
+2. **The UI drives the challenge; the operator completes it locally.** Tier 1,
+   plus the UI showing the single-use capability so the flow is led from the
+   browser and finished in the terminal.
+3. **A genuine remote operator channel.** If this is chosen, six requirements are
+   not negotiable, and a design missing any one of them should be refused rather
+   than shipped:
+   - **Its own channel identity** — `REMOTE_OPERATOR_CONFIRMED` or similar,
+     **never** `LOCAL_OPERATOR_CONFIRMED`. Reusing the local name would make every
+     audit row ever written ambiguous in retrospect, which is the one cost that
+     cannot be paid back later.
+   - **Its own credential scope, ungrantable to any model credential**, on the
+     `memory:write` precedent.
+   - **Absent from the MCP surface entirely**, so the two halves of the listener
+     do not share a door.
+   - **TLS in front.** Atlas terminates none and must never be described as
+     providing it; today this listener is cleartext.
+   - **Replay protection bound to the revision's content hash**, reusing A4's
+     existing shape rather than inventing a second one.
+   - **A root-owned policy deciding which `kind`s it may act on at all.** A
+     defensible default: `OPERATIONAL_FACT` and `PARKED` remotely, with `POLICY`,
+     `INVARIANT` and `ACCEPTED_RISK` staying local-only.
+
+**What must not happen, whichever tier is chosen.** No approval verb appears in
+an MCP tool name, ever — the scanner enforces it and the scanner is right. No
+route gains the ability to mutate a lifecycle without its own channel identity in
+the audit row. And nothing written in `CLAUDE.md` or in the UI may claim that any
+channel proves a person; the honest sentence names the channel and its
+reachability, and `tests/test_decision_mcp.c` already fails a build that forgets.
+
+**Deliberate non-goals.** Approving from a model surface under any framing;
+a shared credential that reads and disposes; and describing tier 3 as equivalent
+in strength to the local channel — it is weaker by construction, and the season
+that ships it says so in the same paragraph that announces it.
+
 ## Invariants that outlive every phase
 
 1. SQLite is a rebuildable index, never the canonical record of history.

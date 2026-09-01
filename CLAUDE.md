@@ -4,8 +4,8 @@ Atlas is a generic, headless engineering-memory and repository-intelligence CLI
 in C17. The current work is **A13**: the per-user scanner — a repository records
 which uid's scanner may report about it, a scanner running as the tree's owner
 hands its bytes to the daemon, and the daemon indexes a tree it cannot open from
-the mirror those bytes build. **A13 added migration 27.** The sentence it exists
-for is
+the mirror those bytes build. **A13 added migrations 27 and 28.** The sentence
+it exists for is
 
 > **A PROCESS CANNOT INDEX A TREE IT CANNOT READ, AND NO AMOUNT OF RETRYING
 > CHANGES WHICH UID IT IS.**

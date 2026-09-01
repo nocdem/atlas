@@ -1294,3 +1294,41 @@ everyone learns to skip past is the conflict list A9.2.5 warns about, one layer
 out. And not a permission gate: refusing a read until the index has been
 consulted would block the one operation Atlas guarantees is safe, and it is a
 check an adversary — or an impatient operator — walks around in one step.
+
+## The CLI's local `--json` hand-builds a document the daemon's writer already builds (2026-09-01)
+
+Found while fixing an unencoded untrusted field during A12.1, and recorded because
+the class outlives the instance.
+
+`src/ipc/server_verify.c:505` answers the socket with
+`atlas_service_verify_write_report`, the shared writer in `src/core/service_verify.c`
+that encodes every untrusted field at the point of output. The CLI's local `--json`
+path does **not** use it for the report: `j_verify` in `src/cli/render_json.c` is 242
+lines that build the same document by hand. The same function *does* call
+`atlas_service_verify_write_detail` for the detail block, so one JSON document is
+half shared and half copied.
+
+**The instance this produced.** `claim_text` existed only in the inline copy, and it
+was the one field emitted without `atlas_safe()` — through `atlas_json_key_str`,
+which gives A0's structure escaping and nothing more. `src/cli/render_human.c` had
+the same field, plus `evidence.observed` and `attestation.actor_name`, printed to a
+terminal with a bare `fprintf` under a `"(untrusted project text)"` label. A label is
+not an encoding. `include/atlas/safetext.h` names what was uncovered: C0 and C1
+control bytes, DEL, line and paragraph separators, bidirectional controls, invalid
+UTF-8. Fixed at all four sites in `08eaa75`, with a CLI-level test that submits a
+claim carrying U+0085 and U+202E and asserts both surfaces arrive percent-encoded —
+proved by reverting the fix and watching it fail with the raw bytes found verbatim.
+
+**Why the class is the finding.** `CLAUDE.md` states that human and JSON output
+consume identical service results, and that a missing per-renderer implementation is
+how the two drift apart. Here they did not drift by omission but by duplication: two
+implementations of one document, and the field that escaped review was precisely the
+one that existed in only one of them. Every future field added to the verification
+report has to be added twice and encoded twice, and nothing fails when it is not.
+
+**Candidate fix, not implemented.** Have `j_verify` call
+`atlas_service_verify_write_report` the way it already calls `..._write_detail`, so
+the local and socket paths emit one document from one writer. That is a larger change
+than the defect that exposed it and it was deliberately not attempted mid-season;
+the usual argument applies — a shared writer is only better if the sharing is
+genuinely the same document, and establishing that is the work.

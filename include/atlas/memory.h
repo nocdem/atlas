@@ -492,7 +492,10 @@ typedef struct atlas_memory_proposition {
     atlas_memory_anchor anchors[ATLAS_MEMORY_MAX_ANCHORS_PER_PROPOSITION];
     size_t anchor_count;
     atlas_verify_claim_semantics semantics; /* set by resolve, per Decision 4 */
-    atlas_verify_verifier verifier;         /* NONE when nothing mechanical applies */
+    /* NONE means either that no mechanical check applies to this proposition or
+     * that one applied and was withheld. `verifier_withheld_reason` below is
+     * what tells the two apart, and they are different facts. */
+    atlas_verify_verifier verifier;
     atlas_buf verifier_input;
     atlas_buf decision_uid; /* the DECISION anchor's document, when one resolved */
     bool truncated;         /* over ATLAS_MEMORY_MAX_PROPOSITION_BYTES; never trimmed */

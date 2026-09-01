@@ -686,3 +686,57 @@ yürüyüşü yalnızca tanımı ve o tek sarmalayıcı adlandırabiliyor,
 `tests/test_sem_discovery.c` bunu `src/` tarayarak koruyor. Testin dişi
 kanıtlandı: üst commit'te üç dosya adlandırıyordu, iddia iki. Kapılar:
 release derleme `ATLAS_WERROR` altında temiz, ctest **105/105**.
+
+---
+
+## B uygulandı ve canlıda ölçüldü — 2026-09-01 14:20
+
+`13d0694`, kuruldu ve `atlas.service` yeniden başlatıldı (14:03:40).
+
+### Tetiklendiği kanıtlandı
+
+Ayna kök inode'ları, üç ardışık geçiş boyunca:
+
+| Saat | atlas (`mirror/2`) | dna (`mirror/1`) |
+| --- | --- | --- |
+| 14:08:57 | 13893634 | 13893639 |
+| 14:10:53 | **13893634** | 13893633 |
+| 14:13:23 | **13893634** | 13893639 |
+
+atlas üç geçişte de `mirrored 5162 (5162 carried)` — hiç put yok — ve **kök
+inode hiç değişmedi**, yani yayım atlandı. dna 1, 6, 1 dosya put etti ve her
+seferinde yayımladı. İkisi de doğru davranış.
+
+### Ölçülen kazanç — gerçek ama mütevazı
+
+| | Baseline (30 dk, deploy öncesi) | Sonrası (~11 dk) |
+| --- | --- | --- |
+| atlas tam geçiş oranı | %60 | **%38** |
+| dna tam geçiş oranı | %100 | %100 |
+| reconcile işi | 1361 ms/dk | **~970 ms/dk** |
+| rebuild sıklığı | 1,07/dk | **0,64/dk** |
+| daemon CPU (boşta) | %1,4 | %1,2 |
+
+Pencere kısa, sayılar ön ölçüm.
+
+### Tavanı P2a, ve bu bir tahmin değil
+
+atlas'ın kalan %38 tam geçişinin sebebi kendi yayımı değil — **dna'nın**
+yayımı. `watch_dirty` bayrağı ve `rebuild_watches` daemon-geneli, dolayısıyla
+bir deponun sıradan geçişi diğerine olay boşluğu yazdırmaya devam ediyor.
+Ölçülen örnek, 14:08:17: atlas o turda PUT 0 yapmıştı ve yine
+`420 examined, 420 hashed` aldı, çünkü rebuild'i dna tetikledi.
+
+**Boşta bir depo hâlâ meşgul bir deponun bedelini ödüyor.** A (boşluğu ve
+rebuild'i depo başına yapmak) bunu açar.
+
+### dna'nın %100'ü doğru, ve bu P1
+
+dna gerçekten her birkaç dakikada bir dosya put ediyor, çünkü `.git`'i
+gerçekten değişiyor: ağaçtaki `.git/index` ve gevşek nesneler 14:16:08
+damgasını taşıyor, aynadaki kopyaları 14:18:27. Yani kendi yayımı kendi
+izlemelerini haklı olarak geçersizleştiriyor. Bu kaçınılmaz kısım; B'nin
+görevi değil.
+
+**Sonuç:** B, boşta olan bir depoyu kurtarır ve bunu yaptığı kanıtlandı. Meşgul
+bir depoyu kurtarmaz ve kurtarmaması doğru. Asıl kilidi açan A.

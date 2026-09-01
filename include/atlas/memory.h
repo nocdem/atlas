@@ -244,7 +244,7 @@ void atlas_memory_version_row_free(atlas_memory_version_row *r);
  * resolves nothing is `*found_out = false` and ATLAS_OK — the caller decides
  * what an absent row means, exactly as `atlas_db_verify_file_hash` leaves that
  * decision to its caller. Lives in `src/db/db_memory.c`, whose functions are
- * the only code that touches the `memory_*` tables. */
+ * the only production writers of the `memory_*` tables. */
 atlas_status atlas_db_memory_version_by_uid(atlas_db *db, const char *uid,
                                             atlas_memory_version_row *out, bool *found_out,
                                             atlas_err *err);

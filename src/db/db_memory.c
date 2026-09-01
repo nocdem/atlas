@@ -2,9 +2,12 @@
  * Copyright 2026 The Atlas Authors. Licensed under the Apache License 2.0.
  *
  * The reconciled-memory layer's database surface, and deliberately the only
- * one: nothing outside this file touches a `memory_*` table, for the reason
- * `db_verify.c` is the single write point over the verification tables — a
- * second path would bypass whatever rule the first one carries.
+ * one: this file's functions are the only production writers of the
+ * `memory_*` tables — T17 greps `src/memory/` for INSERTs to prove it — for
+ * the reason `db_verify.c` is the single write point over the verification
+ * tables: a second path would bypass whatever rule the first one carries.
+ * Migration 29 creates the tables and the retention scanner reads their
+ * rows, which is every table's lot and no exception to the rule.
  *
  * T4 creates this file with exactly one function, the version lookup the
  * verification write point resolves a snapshot reference through. An external

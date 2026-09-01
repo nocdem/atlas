@@ -370,11 +370,26 @@ void atlas_memory_read_item_free(atlas_memory_read_item *it);
  * gitignored, or there genuinely are none), and an empty result has no item
  * of its own to stamp -- exactly where atlas_memory_read_item's own
  * `from_mirror` runs out of room to carry the fact. Set as soon as
- * atlas_repo_open_git answers, so it is `false` only for NOT_OURS, NO_MIRROR
- * and a caller supplying NULL/invalid arguments -- conditions under which
- * nothing was read from anywhere. A caller must treat `*from_mirror_out ==
- * true` exactly as atlas_memory_read_item's own comment describes: this
- * source's completeness, empty result included, is not established. */
+ * atlas_repo_open_git answers -- true for a mirror-backed read whatever it
+ * finds, `false` for a tree-direct one and for every case where nothing was
+ * read from anywhere at all (NOT_OURS, NO_MIRROR, a caller's own invalid
+ * arguments). A caller must treat `*from_mirror_out == true` exactly as
+ * atlas_memory_read_item's own comment describes: this source's
+ * completeness, empty result included, is not established.
+ *
+ * **For a `REPO_DIR` read, `from_mirror_out` must not be NULL, and the call
+ * is refused outright if it is.** A caller may decline to look at the flag's
+ * value; it may not decline to be given it, because an empty or fully
+ * filtered mirror-backed listing has no item of its own to fall back to --
+ * the caller that skips this parameter on such a read reconstructs exactly
+ * the defect this parameter exists to close, silently, on every empty
+ * result. A `REPO_FILE` read imposes no such requirement: it always yields
+ * exactly one item, and that item's own `from_mirror` field already carries
+ * the fact with no result shape that can lose it, so the out-param is a
+ * convenience there rather than the only carrier. `EXTERNAL_FILE`/
+ * `EXTERNAL_DIR` impose no requirement either, through this function: both
+ * return `NOT_OURS` without reading anything, so `from_mirror_out` is always
+ * `false` and declining it costs nothing. */
 atlas_status atlas_memory_read_source(const atlas_repo_info *repo, const char *data_dir,
                                       atlas_memory_source_class cls, const void *path_raw,
                                       size_t path_len, atlas_memory_read_item *items,
@@ -384,7 +399,10 @@ atlas_status atlas_memory_read_source(const atlas_repo_info *repo, const char *d
 /* Reads one absolute external path as the invoking principal (the CLI's scan).
  * O_NOFOLLOW at every step; a symlink is SYMLINK, never followed. Same output
  * contract as atlas_memory_read_source, `from_mirror_out` included -- always
- * `false` here, since no mirror is ever consulted for an external path. */
+ * `false` here and left optional for both FILE and DIR, since no mirror is
+ * ever consulted for an external path: there is no result shape on this path
+ * for which the answer could be anything but `false`, so nothing is lost by
+ * declining it. */
 atlas_status atlas_memory_read_external(const void *path_raw, size_t path_len, bool is_dir,
                                         atlas_memory_read_item *items, size_t cap,
                                         size_t *count_out, bool *from_mirror_out,

@@ -512,6 +512,18 @@ atlas_status atlas_memory_read_source(const atlas_repo_info *repo, const char *d
     if (cls == ATLAS_MEMORY_SOURCE_UNKNOWN) {
         return atlas_err_set(err, ATLAS_ERR_INTERNAL, "a memory source class is required");
     }
+    if (cls == ATLAS_MEMORY_SOURCE_REPO_DIR && from_mirror_out == NULL) {
+        /* Refused, not merely documented: an empty or fully filtered
+         * mirror-backed listing has no item of its own to carry whether it
+         * came from a mirror, so a caller that declines this parameter on a
+         * REPO_DIR read reconstructs the exact defect it exists to close --
+         * silently, on every listing that happens to come back empty. A
+         * REPO_FILE read carries no such requirement: see this function's
+         * own header comment for why. */
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                             "a REPO_DIR read must accept from_mirror_out: an empty or filtered "
+                             "listing has no item of its own to carry it");
+    }
     if (!atlas_memory_source_class_is_repo(cls)) {
         /* EXTERNAL_*: a different principal reads it, through
          * atlas_memory_read_external -- never this one, and never the tree

@@ -560,6 +560,60 @@ static void test_repo_dir_skips_and_sorts(void) {
     fx_close(&fx);
 }
 
+/* NF4: from_mirror_out is declinable, and a REPO_DIR caller that declines it
+ * on a mirror-backed read recreates NF3 exactly -- silently, on any listing
+ * that happens to come back empty. Refused outright instead: driven end to
+ * end against the exact NF3 fixture (a tracked non-.md file, an empty
+ * matching set), passing NULL where every other REPO_DIR test in this file
+ * passes &from_mirror. */
+static void test_repo_dir_requires_from_mirror_out(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    fixture fx;
+    T_REQUIRE(fx_open(&fx, &err) == ATLAS_OK);
+
+    const char *repo = fx_repo(&fx);
+    T_OK(fx_init_repo(&fx, repo, NULL, &err), &err);
+    T_OK(fx_write(repo, "CLAUDE.md", "tracked memory\n", &err), &err);
+    T_OK(fx_mkdir(repo, ".claude", &err), &err);
+    T_OK(fx_mkdir(repo, ".claude/memories", &err), &err);
+    T_OK(fx_write(repo, ".claude/memories/index.json", "{}\n", &err), &err);
+    T_OK(fx_add_all(&fx, repo, &err), &err);
+    T_OK(fx_commit(&fx, repo, "initial commit", &err), &err);
+
+    char before[ATLAS_SHA256_HEX_LEN + 1u];
+    T_OK(fx_tree_digest(repo, before, &err), &err);
+
+    atlas_repo_info info;
+    make_info(&info, repo, &err);
+    /* scanner_uid stays 0 -- a tree-direct read. The refusal must fire before
+     * atlas_repo_open_git is ever asked, whether or not a mirror is even in
+     * play: a REPO_DIR caller cannot buy its way out of carrying
+     * from_mirror_out by reading a repository that happens not to need one
+     * today. */
+
+    atlas_memory_read_item items[8];
+    size_t count = 0;
+    atlas_status st = atlas_memory_read_source(&info, fx_data_dir(&fx),
+                                               ATLAS_MEMORY_SOURCE_REPO_DIR, ".claude/memories",
+                                               strlen(".claude/memories"), items, 8u, &count, NULL,
+                                               &err);
+    T_CHECK_MSG(st == ATLAS_ERR_INTERNAL, "expected ATLAS_ERR_INTERNAL, got %s: %s",
+                atlas_status_name(st), atlas_err_msg(&err));
+    T_CHECK_MSG(count == 0u,
+                "a refused call reports zero items -- there is no result for the caller to "
+                "misread as a complete listing");
+
+    atlas_repo_info_free(&info);
+
+    char after[ATLAS_SHA256_HEX_LEN + 1u];
+    T_OK(fx_tree_digest(repo, after, &err), &err);
+    T_CHECK_MSG(strcmp(before, after) == 0,
+               "a refused read modified the repository");
+
+    fx_close(&fx);
+}
+
 /* --- EXTERNAL_* through atlas_memory_read_source ------------------------------ */
 
 static void test_external_file_via_read_source_is_not_ours(void) {
@@ -649,6 +703,7 @@ static const atlas_test TESTS[] = {
     {"REPO_DIR empty mirror listing reports from_mirror", test_repo_dir_empty_mirror_listing_reports_from_mirror},
     {"REPO_DIR finds untracked .md", test_repo_dir_finds_untracked_md},
     {"REPO_DIR skips and sorts", test_repo_dir_skips_and_sorts},
+    {"REPO_DIR requires from_mirror_out", test_repo_dir_requires_from_mirror_out},
     {"EXTERNAL_FILE via read_source is NOT_OURS",
      test_external_file_via_read_source_is_not_ours},
     {"read_external refuses a symlink", test_read_external_refuses_a_symlink},

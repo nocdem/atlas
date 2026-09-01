@@ -270,12 +270,33 @@ atlas_status atlas_db_memory_version_by_uid(atlas_db *db, const char *uid,
 typedef enum atlas_memory_read_outcome {
     ATLAS_MEMORY_READ_UNKNOWN = 0,
     ATLAS_MEMORY_READ_OK,
-    ATLAS_MEMORY_READ_ABSENT,       /* the path is not there. Not an error. */
+    ATLAS_MEMORY_READ_ABSENT,       /* the path is not there. Not an error. Produced only when
+                                       this process looked at the real thing -- the tree itself,
+                                       or a mirror's tracked content, both of which are complete
+                                       for what they cover -- and found nothing. */
     ATLAS_MEMORY_READ_TOO_LARGE,    /* over ATLAS_MEMORY_MAX_SOURCE_BYTES; no bytes returned */
     ATLAS_MEMORY_READ_NOT_OURS,     /* EXTERNAL_*: another principal reads it; caller
                                        uses the latest stored version instead */
     ATLAS_MEMORY_READ_NO_MIRROR,    /* A13: a scanner is named and no complete mirror exists */
-    ATLAS_MEMORY_READ_SYMLINK       /* the registered path is a symlink; refused, never followed */
+    ATLAS_MEMORY_READ_SYMLINK,      /* the registered path is a symlink; refused, never followed */
+    /* A13. Read from a mirror, and the path is not there in it -- but a
+     * mirror's untracked content is built from `git ls-files --others
+     * --exclude-standard` (src/git/git.c), which never lists a gitignored
+     * path, so the mirror can be missing a path the real tree still holds.
+     * ABSENT is a claim this process looked and found nothing; a mirror
+     * cannot make that claim about an untracked, ignored path, because it
+     * never looked there at all -- A9.2.2's rule, one layer out: no evidence
+     * of X is not evidence of no X.
+     *
+     * A caller MUST NOT treat this as evidence the path was removed, and must
+     * not retract, supersede or diff away a claim anchored to it on this
+     * outcome alone. T8's reconciliation pass should carry the prior
+     * generation's claims for such a path forward undetermined rather than
+     * concluding they no longer apply -- the same posture UNDETERMINED
+     * already gives a claim this pass could not settle. Never produced for a
+     * tree-direct read, and never for a tracked path (a mirror always carries
+     * every tracked path, gitignore or not). */
+    ATLAS_MEMORY_READ_NOT_MIRRORED
 } atlas_memory_read_outcome;
 
 /* One entry read from one registered source. A REPO_FILE/EXTERNAL_FILE source
@@ -288,6 +309,15 @@ typedef enum atlas_memory_read_outcome {
  * consistent with the FILE case rather than a second contract next to it. */
 typedef struct atlas_memory_read_item {
     atlas_buf rel_path;      /* the child name for a *_DIR source; empty for *_FILE */
+    /* The HEAD-blob contract: for a REPO_FILE that is tracked, `bytes` is
+     * HEAD's blob content, read through `git cat-file` against the resolved
+     * oid -- never the working tree's own copy of the file, even though that
+     * copy is what was just opened and size-checked. An uncommitted edit to a
+     * tracked memory source is therefore invisible to this read: the caller
+     * sees the last committed version until the edit is committed. A REPO_DIR
+     * entry, tracked or not, is always the plain filesystem bytes (never
+     * checked against a tree at all -- see the class comment above), so this
+     * contract binds REPO_FILE only. */
     atlas_buf bytes;
     atlas_buf blob_oid;      /* empty when untracked or external */
     atlas_buf commit_oid;    /* empty when untracked or external */

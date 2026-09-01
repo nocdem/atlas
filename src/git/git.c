@@ -1509,22 +1509,56 @@ atlas_status atlas_git_blob_oid_at(atlas_git *g, const char *commit, const void 
 
     /* `--quiet` so a path this commit does not resolve is a clean "not found"
      * rather than stderr noise -- the same shape as `atlas_git_read_head`'s
-     * probe of `HEAD` on an unborn branch. `--end-of-options` so a path that
-     * happens to start with '-' is never read as a flag, `atlas_git_commit_tree`'s
-     * precedent for the same spec shape. */
+     * probe of `HEAD` on an unborn branch. `--end-of-options` is
+     * `atlas_git_commit_tree`'s precedent for this spec shape, kept for the
+     * same uniform practice rather than because this call needs it: `spec`
+     * always begins with an exact hex commit id, so the whole token can never
+     * itself start with '-' regardless of what bytes `path` holds, and the
+     * flag is inert here for exactly the reason it is inert there. */
     int code = 0;
     const char *sub[] = {"rev-parse", "--verify", "--quiet", "--end-of-options",
                          atlas_buf_cstr(&spec)};
     st = git_capture(g, sub, 5u, oid_out, &code, err);
-    atlas_buf_free(&spec);
     if (st != ATLAS_OK) {
+        atlas_buf_free(&spec);
         return st;
     }
-    if (code == 0 && is_exact_oid(atlas_buf_cstr(oid_out))) {
-        *found_out = true;
-    } else {
+    if (code != 0 || !is_exact_oid(atlas_buf_cstr(oid_out))) {
         atlas_buf_reset(oid_out);
+        atlas_buf_free(&spec);
+        return ATLAS_OK;
     }
+
+    /* The spec resolved to *something* at this commit, but not necessarily a
+     * blob: the same path can be a directory at one commit and a file at
+     * another, and if HEAD moves between an earlier filesystem check of this
+     * path and this call, "<commit>:<path>" can resolve cleanly to a tree.
+     * `atlas_git_cat_blob`'s `cat-file blob <oid>` refuses a tree object with
+     * a hard exit-128 failure -- measured -- which would turn a legitimate
+     * history move into an unexplained refusal rather than the ordinary
+     * "not tracked, read the filesystem instead" this function exists to
+     * report. Checked with the same allowlisted subcommand, one more
+     * invocation, `--quiet`'s tolerance for a bad rev not needed here since
+     * `oid_out` is already a resolved object id. */
+    const char *tsub[] = {"cat-file", "-t", atlas_buf_cstr(oid_out)};
+    atlas_buf type = ATLAS_BUF_INIT;
+    int tcode = 0;
+    st = git_capture(g, tsub, 3u, &type, &tcode, err);
+    bool is_blob = (st == ATLAS_OK && tcode == 0 && strcmp(atlas_buf_cstr(&type), "blob") == 0);
+    atlas_buf_free(&type);
+    atlas_buf_free(&spec);
+    if (st != ATLAS_OK) {
+        atlas_buf_reset(oid_out);
+        return st;
+    }
+    if (!is_blob) {
+        /* Not a blob at this commit: reported exactly as "not tracked",
+         * because from this function's caller's point of view that is what it
+         * is -- there is no usable blob for read_repo_file to read. */
+        atlas_buf_reset(oid_out);
+        return ATLAS_OK;
+    }
+    *found_out = true;
     return ATLAS_OK;
 }
 

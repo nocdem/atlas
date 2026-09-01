@@ -13,12 +13,14 @@
  * that modifies what it reads is the one failure this codebase will not
  * tolerate (CLAUDE.md, "Hard rules").
  */
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
 #include "atlas/atlas.h"
 #include "atlas/memory.h"
+#include "atlas/mirror.h"
 #include "atlas_test.h"
 #include "support/fixture.h"
 
@@ -208,6 +210,84 @@ static void test_repo_file_no_mirror_reports_the_outcome(void) {
 
 /* --- REPO_DIR ----------------------------------------------------------------- */
 
+/* A13, driven end to end rather than asserted: a mirror's untracked content
+ * comes from `git ls-files --others --exclude-standard` (src/git/git.c),
+ * which never lists a gitignored path, so a memory directory made entirely of
+ * gitignored, untracked notes is never written into the mirror at all. This
+ * builds the mirror a real scanner pass would leave for exactly that
+ * repository -- the tracked commit, and no `.claude/memories` anywhere in it
+ * -- and reads the directory source against it. If the reader still said
+ * ABSENT here, it would be claiming to have looked and found nothing, when it
+ * never had a way to look at all. */
+static void test_repo_dir_gitignored_is_not_mirrored(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    fixture fx;
+    T_REQUIRE(fx_open(&fx, &err) == ATLAS_OK);
+
+    const char *repo = fx_repo(&fx);
+    T_OK(fx_init_repo(&fx, repo, NULL, &err), &err);
+    T_OK(fx_write(repo, "CLAUDE.md", "tracked memory\n", &err), &err);
+    T_OK(fx_write(repo, ".gitignore", ".claude/memories/\n", &err), &err);
+    T_OK(fx_add_all(&fx, repo, &err), &err);
+    T_OK(fx_commit(&fx, repo, "initial commit", &err), &err);
+    /* Present on the real tree, registered, and entirely gitignored: an
+     * operator's own working notes, exactly what this class exists for. */
+    T_OK(fx_mkdir(repo, ".claude", &err), &err);
+    T_OK(fx_mkdir(repo, ".claude/memories", &err), &err);
+    T_OK(fx_write(repo, ".claude/memories/a.md", "an operator's own note\n", &err), &err);
+
+    char before[ATLAS_SHA256_HEX_LEN + 1u];
+    T_OK(fx_tree_digest(repo, before, &err), &err);
+
+    /* The mirror a real scanner pass would leave: the same tracked commit,
+     * with no .claude/memories anywhere -- its untracked walk never saw a
+     * gitignored path to write. Built by hand at the fixed layout
+     * atlas_mirror_repo_path names, exactly test_mirror_source.c's own
+     * shape. */
+    atlas_buf mirror_path = ATLAS_BUF_INIT;
+    T_OK(atlas_mirror_repo_path(fx_data_dir(&fx), 1, &mirror_path, &err), &err);
+    char mirror_parent[2048];
+    (void)snprintf(mirror_parent, sizeof(mirror_parent), "%s/mirror", fx_data_dir(&fx));
+    T_OK(fx_mkdir(fx_data_dir(&fx), "mirror", &err), &err);
+    T_OK(fx_mkdir(mirror_parent, atlas_buf_cstr(&mirror_path) + strlen(mirror_parent) + 1u, &err),
+         &err);
+    T_OK(fx_init_repo(&fx, atlas_buf_cstr(&mirror_path), NULL, &err), &err);
+    T_OK(fx_write(atlas_buf_cstr(&mirror_path), "CLAUDE.md", "tracked memory\n", &err), &err);
+    T_OK(fx_write(atlas_buf_cstr(&mirror_path), ".gitignore", ".claude/memories/\n", &err), &err);
+    T_OK(fx_add_all(&fx, atlas_buf_cstr(&mirror_path), &err), &err);
+    T_OK(fx_commit(&fx, atlas_buf_cstr(&mirror_path), "initial commit", &err), &err);
+
+    atlas_repo_info info;
+    make_info(&info, repo, &err);
+    info.scanner_uid = (int64_t)geteuid() + 1; /* deliberately not this process */
+    info.mirror_complete = true;
+
+    atlas_memory_read_item items[8];
+    size_t count = 0;
+    T_OK(atlas_memory_read_source(&info, fx_data_dir(&fx), ATLAS_MEMORY_SOURCE_REPO_DIR,
+                                  ".claude/memories", strlen(".claude/memories"), items, 8u,
+                                  &count, &err),
+         &err);
+    T_REQUIRE(count == 1u);
+    T_CHECK_MSG(items[0].outcome == ATLAS_MEMORY_READ_NOT_MIRRORED,
+                "expected NOT_MIRRORED, got %d -- a gitignored directory must never read as "
+                "ABSENT",
+                (int)items[0].outcome);
+    T_CHECK_MSG(items[0].bytes.len == 0, "a NOT_MIRRORED outcome returned bytes");
+
+    atlas_memory_read_item_free(&items[0]);
+    atlas_repo_info_free(&info);
+    atlas_buf_free(&mirror_path);
+
+    char after[ATLAS_SHA256_HEX_LEN + 1u];
+    T_OK(fx_tree_digest(repo, after, &err), &err);
+    T_CHECK_MSG(strcmp(before, after) == 0,
+               "reading the gitignored directory modified the repository");
+
+    fx_close(&fx);
+}
+
 static void test_repo_dir_finds_untracked_md(void) {
     atlas_err err;
     atlas_err_init(&err);
@@ -376,6 +456,7 @@ static const atlas_test TESTS[] = {
     {"REPO_FILE missing path is ABSENT", test_repo_file_missing_path_is_absent},
     {"REPO_FILE over the bound is TOO_LARGE", test_repo_file_over_the_bound_is_too_large},
     {"REPO_FILE with no mirror reports NO_MIRROR", test_repo_file_no_mirror_reports_the_outcome},
+    {"REPO_DIR gitignored is NOT_MIRRORED", test_repo_dir_gitignored_is_not_mirrored},
     {"REPO_DIR finds untracked .md", test_repo_dir_finds_untracked_md},
     {"REPO_DIR skips and sorts", test_repo_dir_skips_and_sorts},
     {"EXTERNAL_FILE via read_source is NOT_OURS",

@@ -981,13 +981,24 @@ static void test_a8_snapshot_reads_run_no_helper(void) {
  *
  * `atlas_git_blob_oid_at` (src/git/git.c) is the first call site that builds a
  * `"<commit>:<path>"` revision spec from a path this process did not choose --
- * a registered memory source's own bytes, which may be anything but NUL. The
- * commit half is always an exact hex object id, so it can never itself hold
- * the colon that separates the two, but `path` could plausibly start with '-'
- * and be read as a flag rather than an operand. `--end-of-options` is the
- * defence already used by `atlas_git_commit_tree`'s own `<oid>^{tree}` spec;
- * this proves it holds for an operand git would otherwise have to guess about,
- * not only for one Atlas built entirely from an object id. */
+ * a registered memory source's own bytes, which may be anything but NUL.
+ *
+ * This is NOT a test that `--end-of-options` is doing load-bearing work: it
+ * is not, here. `spec` is always `<exact hex commit>:<path>`, so the whole
+ * argv token necessarily begins with a hex digit, never `-`, whatever bytes
+ * `path` holds -- git's own "is this argument a flag" check looks only at the
+ * token's first byte, so a dash anywhere *inside* `path` is never reachable as
+ * the start of the argument. Removing `--end-of-options` from the call and
+ * rerunning this test (measured, git 2.39.5) leaves it passing, because the
+ * vector it exists to close is unreachable in this spec's shape -- the same
+ * is true of `atlas_git_commit_tree`'s `<oid>^{tree}`, which is why the flag
+ * is carried here too: uniform practice against a future spec shape that
+ * might not share this guarantee, not a defence this call site needs today.
+ *
+ * What this test does establish, and the reason it earns its place: a path
+ * that is itself shaped like a command-line flag is looked up and read back
+ * as an ordinary tracked file, end to end through the real spec-construction
+ * and resolution code -- not merely asserted about the argv in isolation. */
 static void test_blob_oid_at_a_dash_prefixed_path(void) {
     harden_env e;
     atlas_err err;

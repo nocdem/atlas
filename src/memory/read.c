@@ -96,13 +96,22 @@ static atlas_status read_fd_into_buf(int fd, atlas_buf *out, atlas_err *err) {
  * bound -- the two checks every source, tracked or not, must pass before its
  * content is worth reading at all.
  *
+ * `from_mirror` distinguishes what a not-found path means. A tree-direct read
+ * that finds nothing has looked at the real thing and may say ABSENT. A
+ * mirror's untracked content is built from `git ls-files --others
+ * --exclude-standard` (src/git/git.c), which never lists a gitignored path --
+ * so a mirror missing a path has not established the path is not in the tree,
+ * and NOT_MIRRORED says so instead. A path that exists but is the wrong type
+ * (a directory, a device) is a positive fact either way, whatever the mirror
+ * captured it accurately, so that case stays ABSENT regardless of the source.
+ *
  * On `ATLAS_MEMORY_READ_OK` the caller owns `*fd_out` (a validated, in-bound
  * regular file) and must close() it. Every other outcome has already closed
  * anything it opened and left `*fd_out == -1`; there is nothing left for the
  * caller to do but record the outcome. */
 static atlas_status open_fs_file(int root_fd, const void *path, size_t path_len,
-                                 atlas_memory_read_outcome *outcome_out, int *fd_out,
-                                 atlas_err *err) {
+                                 bool from_mirror, atlas_memory_read_outcome *outcome_out,
+                                 int *fd_out, atlas_err *err) {
     *fd_out = -1;
     *outcome_out = ATLAS_MEMORY_READ_UNKNOWN;
 
@@ -121,14 +130,18 @@ static atlas_status open_fs_file(int root_fd, const void *path, size_t path_len,
     case ATLAS_PATH_OPEN_UNSAFE:
         /* The final component is a symlink, or a component before it is: both
          * are "a symlink stood in this path", refused rather than followed
-         * either way. */
+         * either way. A mirror carries a tracked or untracked symlink exactly
+         * as A13 mirrors it, so this is a positive fact regardless of source. */
         *outcome_out = ATLAS_MEMORY_READ_SYMLINK;
         return ATLAS_OK;
     case ATLAS_PATH_OPEN_MISSING:
+        *outcome_out = from_mirror ? ATLAS_MEMORY_READ_NOT_MIRRORED : ATLAS_MEMORY_READ_ABSENT;
+        return ATLAS_OK;
     case ATLAS_PATH_OPEN_NOT_REGULAR:
-        /* Not there, or there but not a file this layer reads (a directory
-         * masquerading as a FILE source, a device, a fifo): both report as
-         * "nothing to read", not as an error. */
+        /* There, but not a file this layer reads (a directory masquerading
+         * as a FILE source, a device, a fifo): a positive fact about what
+         * occupies the path, not a claim about absence, so gitignore cannot
+         * have hidden it -- ABSENT regardless of source. */
         *outcome_out = ATLAS_MEMORY_READ_ABSENT;
         return ATLAS_OK;
     case ATLAS_PATH_OPEN_DENIED:
@@ -158,12 +171,19 @@ static atlas_status open_fs_file(int root_fd, const void *path, size_t path_len,
  * and commit_oid left empty. Used for EXTERNAL_* sources and for every entry
  * of a REPO_DIR/EXTERNAL_DIR listing -- a directory source is a filesystem
  * convenience, not a git operation, so its children are never checked against
- * a tree. */
+ * a tree.
+ *
+ * Always passes `from_mirror = false` to open_fs_file: a directory entry this
+ * function reads was named by a readdir() this same process just performed,
+ * so a MISSING here is a race against a path already known to exist, not a
+ * mirror's gitignore blind spot -- the NOT_MIRRORED question is about the
+ * *directory's own* path, which read_dir_entries answers before this
+ * function is ever called for one of its children. */
 static atlas_status read_fs_file(int root_fd, const void *path, size_t path_len,
                                  atlas_memory_read_item *item, atlas_err *err) {
     int fd = -1;
     atlas_memory_read_outcome outcome = ATLAS_MEMORY_READ_UNKNOWN;
-    atlas_status st = open_fs_file(root_fd, path, path_len, &outcome, &fd, err);
+    atlas_status st = open_fs_file(root_fd, path, path_len, false, &outcome, &fd, err);
     if (st != ATLAS_OK) {
         return st;
     }
@@ -189,12 +209,20 @@ static atlas_status read_fs_file(int root_fd, const void *path, size_t path_len,
  * filesystem handle already open on it, so blob_oid and commit_oid describe
  * exactly the bytes returned. An untracked path -- including one that exists
  * only because nobody has committed it yet -- falls back to that same open
- * handle, with both oids left empty. */
+ * handle, with both oids left empty.
+ *
+ * `from_mirror` says whether the root came from A13's mirror rather than the
+ * tree itself, and is threaded straight into open_fs_file: a REPO_FILE this
+ * path names is the source's own path, exactly the case a mirror's untracked
+ * walk can be blind to. See atlas_memory_read_outcome's own comment on
+ * ATLAS_MEMORY_READ_NOT_MIRRORED for what that means for a caller. */
 static atlas_status read_repo_file(atlas_git *g, const void *path_raw, size_t path_len,
-                                   atlas_memory_read_item *item, atlas_err *err) {
+                                   bool from_mirror, atlas_memory_read_item *item,
+                                   atlas_err *err) {
     int fd = -1;
     atlas_memory_read_outcome outcome = ATLAS_MEMORY_READ_UNKNOWN;
-    atlas_status st = open_fs_file(atlas_git_root_fd(g), path_raw, path_len, &outcome, &fd, err);
+    atlas_status st =
+        open_fs_file(atlas_git_root_fd(g), path_raw, path_len, from_mirror, &outcome, &fd, err);
     if (st != ATLAS_OK) {
         return st;
     }
@@ -280,10 +308,29 @@ static int cmp_name(const void *a, const void *b) {
  * (ATLAS_MEMORY_MAX_DIR_ENTRIES' own "refused, never trimmed" rule): keeping
  * the alphabetically-first `cap` of them would make which files count depend
  * on how many other files happen to sit beside them, silently, on every
- * pass. */
+ * pass. `cap` itself is refused above ATLAS_MEMORY_MAX_DIR_ENTRIES rather than
+ * silently honoured -- a caller cannot make this layer's own documented
+ * ceiling larger just by asking for more room, which is what keeps the
+ * constant a real bound rather than a number only ever read in a comment; it
+ * is also what keeps the entry-name allocation below bounded regardless of
+ * what a caller passes.
+ *
+ * `from_mirror` is the same A13 question read_repo_file answers: a mirror's
+ * untracked walk excludes gitignored paths, so a *directory* the mirror never
+ * created at all (every file inside it happened to be gitignored) is not
+ * evidence the tree lacks it either -- ATLAS_MEMORY_READ_NOT_MIRRORED, not
+ * ABSENT, for exactly the same reason and at exactly the same place in the
+ * walk. A directory present but of the wrong type (NOT_REGULAR) is, again, a
+ * positive fact the mirror captured accurately, so that case stays ABSENT. */
 static atlas_status read_dir_entries(int root_fd, const void *path_raw, size_t path_len,
-                                     atlas_memory_read_item *items, size_t cap,
+                                     bool from_mirror, atlas_memory_read_item *items, size_t cap,
                                      size_t *count_out, atlas_err *err) {
+    if (cap > ATLAS_MEMORY_MAX_DIR_ENTRIES) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                             "a memory directory read may not ask for more than %u entries",
+                             ATLAS_MEMORY_MAX_DIR_ENTRIES);
+    }
+
     atlas_path_open_result res = ATLAS_PATH_OPEN_MISSING;
     int dir_fd = -1;
     int open_errno = 0;
@@ -300,6 +347,11 @@ static atlas_status read_dir_entries(int root_fd, const void *path_raw, size_t p
         *count_out = 1;
         return ATLAS_OK;
     case ATLAS_PATH_OPEN_MISSING:
+        atlas_memory_read_item_init(&items[0]);
+        items[0].outcome =
+            from_mirror ? ATLAS_MEMORY_READ_NOT_MIRRORED : ATLAS_MEMORY_READ_ABSENT;
+        *count_out = 1;
+        return ATLAS_OK;
     case ATLAS_PATH_OPEN_NOT_REGULAR:
         atlas_memory_read_item_init(&items[0]);
         items[0].outcome = ATLAS_MEMORY_READ_ABSENT;
@@ -321,7 +373,9 @@ static atlas_status read_dir_entries(int root_fd, const void *path_raw, size_t p
 
     /* Heap rather than a stack array of unknown size: `cap` is a caller
      * parameter, not a compile-time constant, and a VLA is refused outright by
-     * this project's own warning policy (-Wvla). */
+     * this project's own warning policy (-Wvla). The multiplication cannot
+     * overflow: the ATLAS_MEMORY_MAX_DIR_ENTRIES check above already bounds
+     * `cap` to a two-digit number before this line is reached. */
     char(*names)[MEMDIR_NAME_MAX] = malloc((cap == 0 ? 1u : cap) * sizeof(*names));
     if (names == NULL) {
         (void)closedir(d);
@@ -455,15 +509,24 @@ atlas_status atlas_memory_read_source(const atlas_repo_info *repo, const char *d
     bool from_mirror = false;
     atlas_status st = atlas_repo_open_git(repo, data_dir, &g, &from_mirror, err);
     if (st != ATLAS_OK) {
-        /* A13's own refusal, read from the same row fields
-         * atlas_repo_open_git already consulted, and reported through this
-         * vocabulary's own outcome instead of a status failure: a scanner is
-         * named, this process is not it, and no complete mirror exists yet.
+        /* A13's own refusal, reported through this vocabulary's own outcome
+         * instead of a status failure -- but only the *specific* refusal this
+         * predicate names, never a stand-in for whatever atlas_repo_open_git
+         * decided. `data_dir != NULL` matters here: passed NULL, that function
+         * returns an INTERNAL "no readable tree for a caller that may not use
+         * the mirror" *before it ever looks at* `mirror_complete`, which is a
+         * caller's own programming error, not "wait for the scanner" -- the
+         * two are different conditions with different remedies, and treating
+         * every failure alongside a false `mirror_complete` as the second one
+         * would answer a bug in this process with advice about someone
+         * else's. `st == ATLAS_ERR_REPO` is what atlas_repo_open_git itself
+         * actually returns for the mirror-incomplete case (mirror_open.c),
+         * asked for directly rather than re-derived, so an unrelated failure
+         * with a different status past this point is never relabelled either.
          * atlas_repo_open_git remains the one place that decides *where* a
-         * repository is read from -- this only names why it just refused, so
-         * a caller sees "wait for the scanner" rather than a bare error. */
-        if (repo->scanner_uid != 0 && (int64_t)geteuid() != repo->scanner_uid &&
-            !repo->mirror_complete) {
+         * repository is read from; this only names why it just refused. */
+        if (data_dir != NULL && st == ATLAS_ERR_REPO && repo->scanner_uid != 0 &&
+            (int64_t)geteuid() != repo->scanner_uid && !repo->mirror_complete) {
             atlas_err_init(err);
             atlas_memory_read_item_init(&items[0]);
             items[0].outcome = ATLAS_MEMORY_READ_NO_MIRROR;
@@ -477,7 +540,7 @@ atlas_status atlas_memory_read_source(const atlas_repo_info *repo, const char *d
 
     if (cls == ATLAS_MEMORY_SOURCE_REPO_FILE) {
         atlas_memory_read_item_init(&items[0]);
-        st = read_repo_file(g, path_raw, path_len, &items[0], err);
+        st = read_repo_file(g, path_raw, path_len, from_mirror, &items[0], err);
         if (st == ATLAS_OK) {
             if (count_out != NULL) {
                 *count_out = 1;
@@ -487,8 +550,8 @@ atlas_status atlas_memory_read_source(const atlas_repo_info *repo, const char *d
         }
     } else {
         size_t produced = 0;
-        st = read_dir_entries(atlas_git_root_fd(g), path_raw, path_len, items, cap, &produced,
-                              err);
+        st = read_dir_entries(atlas_git_root_fd(g), path_raw, path_len, from_mirror, items, cap,
+                              &produced, err);
         if (st == ATLAS_OK && count_out != NULL) {
             *count_out = produced;
         }
@@ -525,7 +588,7 @@ atlas_status atlas_memory_read_external(const void *path_raw, size_t path_len, b
     atlas_status st;
     if (is_dir) {
         size_t produced = 0;
-        st = read_dir_entries(root_fd, rel, rel_len, items, cap, &produced, err);
+        st = read_dir_entries(root_fd, rel, rel_len, false, items, cap, &produced, err);
         if (st == ATLAS_OK && count_out != NULL) {
             *count_out = produced;
         }

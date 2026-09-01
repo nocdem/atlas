@@ -65,10 +65,13 @@ static void test_repo_file_reads_tracked_bytes(void) {
 
     atlas_memory_read_item item;
     size_t count = 0;
+    bool from_mirror = true;
     T_OK(atlas_memory_read_source(&info, fx_data_dir(&fx), ATLAS_MEMORY_SOURCE_REPO_FILE,
-                                  "CLAUDE.md", strlen("CLAUDE.md"), &item, 1u, &count, &err),
+                                  "CLAUDE.md", strlen("CLAUDE.md"), &item, 1u, &count,
+                                  &from_mirror, &err),
          &err);
     T_CHECK_MSG(count == 1u, "expected exactly one item, got %zu", count);
+    T_CHECK_MSG(!from_mirror, "a tree-direct read must not report from_mirror");
     T_CHECK_MSG(item.outcome == ATLAS_MEMORY_READ_OK, "expected OK, got %d", (int)item.outcome);
     T_CHECK_MSG(item.bytes.len == strlen("tracked memory\n") &&
                     memcmp(item.bytes.data, "tracked memory\n", item.bytes.len) == 0,
@@ -102,11 +105,13 @@ static void test_repo_file_missing_path_is_absent(void) {
 
     atlas_memory_read_item item;
     size_t count = 0;
+    bool from_mirror = true;
     T_OK(atlas_memory_read_source(&info, fx_data_dir(&fx), ATLAS_MEMORY_SOURCE_REPO_FILE,
                                   "no-such-file.md", strlen("no-such-file.md"), &item, 1u, &count,
-                                  &err),
+                                  &from_mirror, &err),
          &err);
     T_CHECK_MSG(count == 1u, "expected exactly one item, got %zu", count);
+    T_CHECK_MSG(!from_mirror, "a tree-direct read must not report from_mirror");
     T_CHECK_MSG(item.outcome == ATLAS_MEMORY_READ_ABSENT, "expected ABSENT, got %d",
                 (int)item.outcome);
     T_CHECK_MSG(item.bytes.len == 0, "an absent path returned bytes");
@@ -145,10 +150,12 @@ static void test_repo_file_over_the_bound_is_too_large(void) {
 
     atlas_memory_read_item item;
     size_t count = 0;
+    bool from_mirror = true;
     T_OK(atlas_memory_read_source(&info, fx_data_dir(&fx), ATLAS_MEMORY_SOURCE_REPO_FILE, "big.md",
-                                  strlen("big.md"), &item, 1u, &count, &err),
+                                  strlen("big.md"), &item, 1u, &count, &from_mirror, &err),
          &err);
     T_CHECK_MSG(count == 1u, "expected exactly one item, got %zu", count);
+    T_CHECK_MSG(!from_mirror, "a tree-direct read must not report from_mirror");
     T_CHECK_MSG(item.outcome == ATLAS_MEMORY_READ_TOO_LARGE, "expected TOO_LARGE, got %d",
                 (int)item.outcome);
     T_CHECK_MSG(item.bytes.len == 0, "an oversized source returned bytes");
@@ -187,12 +194,15 @@ static void test_repo_file_no_mirror_reports_the_outcome(void) {
 
     atlas_memory_read_item item;
     size_t count = 0;
+    bool from_mirror = true;
     atlas_status st = atlas_memory_read_source(&info, fx_data_dir(&fx),
                                                ATLAS_MEMORY_SOURCE_REPO_FILE, "CLAUDE.md",
-                                               strlen("CLAUDE.md"), &item, 1u, &count, &err);
+                                               strlen("CLAUDE.md"), &item, 1u, &count,
+                                               &from_mirror, &err);
     T_CHECK_MSG(st == ATLAS_OK, "expected ATLAS_OK even with no mirror, got %s: %s",
                 atlas_status_name(st), atlas_err_msg(&err));
     T_CHECK_MSG(count == 1u, "expected exactly one item, got %zu", count);
+    T_CHECK_MSG(!from_mirror, "nothing was read, so from_mirror must stay false");
     T_CHECK_MSG(item.outcome == ATLAS_MEMORY_READ_NO_MIRROR, "expected NO_MIRROR, got %d",
                 (int)item.outcome);
     T_CHECK_MSG(item.bytes.len == 0, "a NO_MIRROR outcome returned bytes");
@@ -265,11 +275,13 @@ static void test_repo_dir_gitignored_is_not_mirrored(void) {
 
     atlas_memory_read_item items[8];
     size_t count = 0;
+    bool from_mirror = false;
     T_OK(atlas_memory_read_source(&info, fx_data_dir(&fx), ATLAS_MEMORY_SOURCE_REPO_DIR,
                                   ".claude/memories", strlen(".claude/memories"), items, 8u,
-                                  &count, &err),
+                                  &count, &from_mirror, &err),
          &err);
     T_REQUIRE(count == 1u);
+    T_CHECK_MSG(from_mirror, "a mirror-backed read must report from_mirror at the call level too");
     T_CHECK_MSG(items[0].outcome == ATLAS_MEMORY_READ_NOT_MIRRORED,
                 "expected NOT_MIRRORED, got %d -- a gitignored directory must never read as "
                 "ABSENT",
@@ -347,15 +359,17 @@ static void test_repo_dir_mixed_tracked_and_gitignored_children(void) {
 
     atlas_memory_read_item items[8];
     size_t count = 0;
+    bool from_mirror = false;
     T_OK(atlas_memory_read_source(&info, fx_data_dir(&fx), ATLAS_MEMORY_SOURCE_REPO_DIR,
                                   ".claude/memories", strlen(".claude/memories"), items, 8u,
-                                  &count, &err),
+                                  &count, &from_mirror, &err),
          &err);
     /* Driven, not asserted: the listing opens cleanly and silently omits the
      * gitignored sibling -- exactly the shape that makes from_mirror load-
      * bearing, since nothing else here would tell a caller a second file
      * ever existed. */
     T_REQUIRE(count == 1u);
+    T_CHECK_MSG(from_mirror, "a mirror-backed read must report from_mirror at the call level too");
     T_CHECK_MSG(strcmp(atlas_buf_cstr(&items[0].rel_path), "tracked.md") == 0,
                 "expected the one visible child to be \"tracked.md\", got \"%s\"",
                 atlas_buf_cstr(&items[0].rel_path));
@@ -377,6 +391,83 @@ static void test_repo_dir_mixed_tracked_and_gitignored_children(void) {
     fx_close(&fx);
 }
 
+/* NF3: the directory opens, and finds nothing to keep. A tracked non-`.md`
+ * file is enough to make atlas_mirror_put create the directory in the mirror
+ * (src/daemon/mirror.c) with no `.md` sibling ever mirrored alongside it --
+ * simulated here the same way every other mirror in this file is, by hand,
+ * at the layout a real scanner pass would leave. The suffix filter and the
+ * per-item stamping loop both have nothing to run against: zero items come
+ * back, so nothing on any item can carry the fact that this came from a
+ * mirror. Driven end to end, not asserted: the only place left to carry that
+ * fact is the call itself. */
+static void test_repo_dir_empty_mirror_listing_reports_from_mirror(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    fixture fx;
+    T_REQUIRE(fx_open(&fx, &err) == ATLAS_OK);
+
+    const char *repo = fx_repo(&fx);
+    T_OK(fx_init_repo(&fx, repo, NULL, &err), &err);
+    T_OK(fx_write(repo, "CLAUDE.md", "tracked memory\n", &err), &err);
+    T_OK(fx_mkdir(repo, ".claude", &err), &err);
+    T_OK(fx_mkdir(repo, ".claude/memories", &err), &err);
+    /* Tracked, and not a `.md` name: it is what makes the directory exist in
+     * the mirror at all, and it is filtered out of every listing either way. */
+    T_OK(fx_write(repo, ".claude/memories/index.json", "{}\n", &err), &err);
+    T_OK(fx_add_all(&fx, repo, &err), &err);
+    T_OK(fx_commit(&fx, repo, "initial commit", &err), &err);
+
+    char before[ATLAS_SHA256_HEX_LEN + 1u];
+    T_OK(fx_tree_digest(repo, before, &err), &err);
+
+    /* The mirror a real scanner pass would leave: the tracked commit,
+     * including .claude/memories/index.json (tracked, so mirrored regardless
+     * of its name), and nothing else in that directory -- there is no
+     * untracked `.md` to mirror alongside it. */
+    atlas_buf mirror_path = ATLAS_BUF_INIT;
+    T_OK(atlas_mirror_repo_path(fx_data_dir(&fx), 1, &mirror_path, &err), &err);
+    char mirror_parent[2048];
+    (void)snprintf(mirror_parent, sizeof(mirror_parent), "%s/mirror", fx_data_dir(&fx));
+    T_OK(fx_mkdir(fx_data_dir(&fx), "mirror", &err), &err);
+    T_OK(fx_mkdir(mirror_parent, atlas_buf_cstr(&mirror_path) + strlen(mirror_parent) + 1u, &err),
+         &err);
+    T_OK(fx_init_repo(&fx, atlas_buf_cstr(&mirror_path), NULL, &err), &err);
+    T_OK(fx_write(atlas_buf_cstr(&mirror_path), "CLAUDE.md", "tracked memory\n", &err), &err);
+    T_OK(fx_mkdir(atlas_buf_cstr(&mirror_path), ".claude", &err), &err);
+    T_OK(fx_mkdir(atlas_buf_cstr(&mirror_path), ".claude/memories", &err), &err);
+    T_OK(fx_write(atlas_buf_cstr(&mirror_path), ".claude/memories/index.json", "{}\n", &err),
+         &err);
+    T_OK(fx_add_all(&fx, atlas_buf_cstr(&mirror_path), &err), &err);
+    T_OK(fx_commit(&fx, atlas_buf_cstr(&mirror_path), "initial commit", &err), &err);
+
+    atlas_repo_info info;
+    make_info(&info, repo, &err);
+    info.scanner_uid = (int64_t)geteuid() + 1; /* deliberately not this process */
+    info.mirror_complete = true;
+
+    atlas_memory_read_item items[8];
+    size_t count = 0;
+    bool from_mirror = false;
+    T_OK(atlas_memory_read_source(&info, fx_data_dir(&fx), ATLAS_MEMORY_SOURCE_REPO_DIR,
+                                  ".claude/memories", strlen(".claude/memories"), items, 8u,
+                                  &count, &from_mirror, &err),
+         &err);
+    T_CHECK_MSG(count == 0u, "expected zero items, got %zu", count);
+    T_CHECK_MSG(from_mirror,
+                "an empty mirror-backed listing must still report from_mirror at the call "
+                "level -- no item exists to carry it");
+
+    atlas_repo_info_free(&info);
+    atlas_buf_free(&mirror_path);
+
+    char after[ATLAS_SHA256_HEX_LEN + 1u];
+    T_OK(fx_tree_digest(repo, after, &err), &err);
+    T_CHECK_MSG(strcmp(before, after) == 0,
+               "reading the empty mirror-backed directory modified the repository");
+
+    fx_close(&fx);
+}
+
 static void test_repo_dir_finds_untracked_md(void) {
     atlas_err err;
     atlas_err_init(&err);
@@ -392,11 +483,13 @@ static void test_repo_dir_finds_untracked_md(void) {
 
     atlas_memory_read_item items[8];
     size_t count = 0;
+    bool from_mirror = true;
     T_OK(atlas_memory_read_source(&info, fx_data_dir(&fx), ATLAS_MEMORY_SOURCE_REPO_DIR,
                                   ".claude/memories", strlen(".claude/memories"), items, 8u,
-                                  &count, &err),
+                                  &count, &from_mirror, &err),
          &err);
     T_REQUIRE(count == 1u);
+    T_CHECK_MSG(!from_mirror, "a tree-direct read must not report from_mirror");
     T_CHECK_MSG(items[0].outcome == ATLAS_MEMORY_READ_OK, "expected OK, got %d",
                 (int)items[0].outcome);
     T_CHECK_MSG(strcmp(atlas_buf_cstr(&items[0].rel_path), "a.md") == 0,
@@ -441,10 +534,12 @@ static void test_repo_dir_skips_and_sorts(void) {
 
     atlas_memory_read_item items[8];
     size_t count = 0;
+    bool from_mirror = true;
     T_OK(atlas_memory_read_source(&info, fx_data_dir(&fx), ATLAS_MEMORY_SOURCE_REPO_DIR,
                                   ".claude/memories", strlen(".claude/memories"), items, 8u,
-                                  &count, &err),
+                                  &count, &from_mirror, &err),
          &err);
+    T_CHECK_MSG(!from_mirror, "a tree-direct read must not report from_mirror");
     /* a.md (from build_repo) and z.md: notes.txt and sub/ are skipped. */
     T_REQUIRE(count == 2u);
     T_CHECK_MSG(strcmp(atlas_buf_cstr(&items[0].rel_path), "a.md") == 0,
@@ -482,11 +577,13 @@ static void test_external_file_via_read_source_is_not_ours(void) {
 
     atlas_memory_read_item item;
     size_t count = 0;
+    bool from_mirror = true;
     T_OK(atlas_memory_read_source(&info, fx_data_dir(&fx), ATLAS_MEMORY_SOURCE_EXTERNAL_FILE,
                                   "/etc/some-notes.md", strlen("/etc/some-notes.md"), &item, 1u,
-                                  &count, &err),
+                                  &count, &from_mirror, &err),
          &err);
     T_CHECK_MSG(count == 1u, "expected exactly one item, got %zu", count);
+    T_CHECK_MSG(!from_mirror, "nothing was read, so from_mirror must stay false");
     T_CHECK_MSG(item.outcome == ATLAS_MEMORY_READ_NOT_OURS, "expected NOT_OURS, got %d",
                 (int)item.outcome);
     T_CHECK_MSG(item.bytes.len == 0, "an EXTERNAL_FILE source through read_source read bytes");
@@ -521,10 +618,12 @@ static void test_read_external_refuses_a_symlink(void) {
 
     atlas_memory_read_item item;
     size_t count = 0;
+    bool from_mirror = true;
     T_OK(atlas_memory_read_external(atlas_buf_cstr(&path), path.len, false, &item, 1u, &count,
-                                    &err),
+                                    &from_mirror, &err),
          &err);
     T_CHECK_MSG(count == 1u, "expected exactly one item, got %zu", count);
+    T_CHECK_MSG(!from_mirror, "an external read must never report from_mirror");
     T_CHECK_MSG(item.outcome == ATLAS_MEMORY_READ_SYMLINK, "expected SYMLINK, got %d",
                 (int)item.outcome);
     T_CHECK_MSG(item.bytes.len == 0, "a symlinked source returned bytes");
@@ -547,6 +646,7 @@ static const atlas_test TESTS[] = {
     {"REPO_FILE with no mirror reports NO_MIRROR", test_repo_file_no_mirror_reports_the_outcome},
     {"REPO_DIR gitignored is NOT_MIRRORED", test_repo_dir_gitignored_is_not_mirrored},
     {"REPO_DIR mixed tracked/gitignored children", test_repo_dir_mixed_tracked_and_gitignored_children},
+    {"REPO_DIR empty mirror listing reports from_mirror", test_repo_dir_empty_mirror_listing_reports_from_mirror},
     {"REPO_DIR finds untracked .md", test_repo_dir_finds_untracked_md},
     {"REPO_DIR skips and sorts", test_repo_dir_skips_and_sorts},
     {"EXTERNAL_FILE via read_source is NOT_OURS",

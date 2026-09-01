@@ -359,17 +359,35 @@ void atlas_memory_read_item_free(atlas_memory_read_item *it);
  * listing, not merely a buffer size a caller happens to have chosen. On
  * ATLAS_OK, `*count_out` items were written (each already initialised) and
  * the caller frees each with atlas_memory_read_item_free; on any other status
- * nothing was left for the caller to free. */
+ * nothing was left for the caller to free.
+ *
+ * `from_mirror_out`, when not NULL, is set to whether this call read a
+ * scanner's mirror rather than the repository's own tree -- the same fact
+ * every produced item's own `from_mirror` carries, but available even when
+ * `*count_out` is zero. A DIR source can open a mirror-backed directory
+ * cleanly and find no matching entries at all (a tracked non-`.md` file is
+ * enough to make the directory exist there; every `.md` in it happened to be
+ * gitignored, or there genuinely are none), and an empty result has no item
+ * of its own to stamp -- exactly where atlas_memory_read_item's own
+ * `from_mirror` runs out of room to carry the fact. Set as soon as
+ * atlas_repo_open_git answers, so it is `false` only for NOT_OURS, NO_MIRROR
+ * and a caller supplying NULL/invalid arguments -- conditions under which
+ * nothing was read from anywhere. A caller must treat `*from_mirror_out ==
+ * true` exactly as atlas_memory_read_item's own comment describes: this
+ * source's completeness, empty result included, is not established. */
 atlas_status atlas_memory_read_source(const atlas_repo_info *repo, const char *data_dir,
                                       atlas_memory_source_class cls, const void *path_raw,
                                       size_t path_len, atlas_memory_read_item *items,
-                                      size_t cap, size_t *count_out, atlas_err *err);
+                                      size_t cap, size_t *count_out, bool *from_mirror_out,
+                                      atlas_err *err);
 
 /* Reads one absolute external path as the invoking principal (the CLI's scan).
  * O_NOFOLLOW at every step; a symlink is SYMLINK, never followed. Same output
- * contract as atlas_memory_read_source. */
+ * contract as atlas_memory_read_source, `from_mirror_out` included -- always
+ * `false` here, since no mirror is ever consulted for an external path. */
 atlas_status atlas_memory_read_external(const void *path_raw, size_t path_len, bool is_dir,
                                         atlas_memory_read_item *items, size_t cap,
-                                        size_t *count_out, atlas_err *err);
+                                        size_t *count_out, bool *from_mirror_out,
+                                        atlas_err *err);
 
 #endif /* ATLAS_MEMORY_H */

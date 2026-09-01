@@ -496,9 +496,13 @@ static atlas_status read_dir_entries(int root_fd, const void *path_raw, size_t p
 atlas_status atlas_memory_read_source(const atlas_repo_info *repo, const char *data_dir,
                                       atlas_memory_source_class cls, const void *path_raw,
                                       size_t path_len, atlas_memory_read_item *items,
-                                      size_t cap, size_t *count_out, atlas_err *err) {
+                                      size_t cap, size_t *count_out, bool *from_mirror_out,
+                                      atlas_err *err) {
     if (count_out != NULL) {
         *count_out = 0;
+    }
+    if (from_mirror_out != NULL) {
+        *from_mirror_out = false;
     }
     if (repo == NULL || path_raw == NULL || path_len == 0 || items == NULL || cap == 0) {
         return atlas_err_set(err, ATLAS_ERR_INTERNAL,
@@ -511,7 +515,8 @@ atlas_status atlas_memory_read_source(const atlas_repo_info *repo, const char *d
     if (!atlas_memory_source_class_is_repo(cls)) {
         /* EXTERNAL_*: a different principal reads it, through
          * atlas_memory_read_external -- never this one, and never the tree
-         * this process happens to be able to see. */
+         * this process happens to be able to see. Nothing was read from any
+         * root, so from_mirror_out stays false. */
         atlas_memory_read_item_init(&items[0]);
         items[0].outcome = ATLAS_MEMORY_READ_NOT_OURS;
         if (count_out != NULL) {
@@ -553,6 +558,18 @@ atlas_status atlas_memory_read_source(const atlas_repo_info *repo, const char *d
         return st;
     }
 
+    /* Known the moment atlas_repo_open_git answers, and true regardless of
+     * what the read below finds -- in particular regardless of whether a DIR
+     * listing comes back with any items at all. An empty listing (every entry
+     * filtered out, or none present) carries no item of its own to stamp,
+     * which is exactly the gap a per-item flag alone cannot close: nothing
+     * would otherwise distinguish it from a genuinely empty tree-direct
+     * listing, and a caller would have no way to know this source's
+     * completeness is unproven rather than confirmed. */
+    if (from_mirror_out != NULL) {
+        *from_mirror_out = from_mirror;
+    }
+
     if (cls == ATLAS_MEMORY_SOURCE_REPO_FILE) {
         atlas_memory_read_item_init(&items[0]);
         st = read_repo_file(g, path_raw, path_len, from_mirror, &items[0], err);
@@ -577,9 +594,17 @@ atlas_status atlas_memory_read_source(const atlas_repo_info *repo, const char *d
 
 atlas_status atlas_memory_read_external(const void *path_raw, size_t path_len, bool is_dir,
                                         atlas_memory_read_item *items, size_t cap,
-                                        size_t *count_out, atlas_err *err) {
+                                        size_t *count_out, bool *from_mirror_out,
+                                        atlas_err *err) {
     if (count_out != NULL) {
         *count_out = 0;
+    }
+    if (from_mirror_out != NULL) {
+        /* Never true here: no mirror is ever consulted for an external path,
+         * whatever it contains or how many items come back. Signature
+         * symmetry with atlas_memory_read_source, for the "same output
+         * contract" this function's own doc already claims. */
+        *from_mirror_out = false;
     }
     if (path_raw == NULL || path_len < 2u || ((const char *)path_raw)[0] != '/' ||
         items == NULL || cap == 0) {

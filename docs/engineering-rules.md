@@ -626,12 +626,15 @@ table. That absence is the A5 guarantee, not an omission.
   is the deliverable: a classification without one is a label, and a label is
   what lets a later phase quietly reclassify a table because deleting from it
   would have been convenient.
-- **Exactly one table is prunable, and widening that needs an argument.**
-  `repo_events`, because it already carried a documented per-repository ceiling,
+- **Exactly two tables are prunable, and widening that needs an argument.**
+  `repo_events` since A5, because it already carried a documented per-repository ceiling,
   its `id` is `AUTOINCREMENT` so no cursor can be re-pointed by a deletion, and
-  the durable evidence lives elsewhere. `scans` is *not* prunable and the reason
-  is A4's: `files.first_seen_scan_id` and friends hold `scans.id`, a plain rowid
-  SQLite reuses. Derived tables are not prunable by age either — a half-aged
+  the durable evidence lives elsewhere. `gw_audit` since A9, because nothing holds
+  a rowid into it, its `id` is `AUTOINCREMENT` so a deleted row can never hand its
+  id to a later one, and every fact a request produced — a decision, a revision, a
+  job, a reason — lives in a canonical table that is not prunable. `scans` is
+  *not* prunable and the reason is A4's: `files.first_seen_scan_id` and friends
+  hold `scans.id`, a plain rowid SQLite reuses. Derived tables are not prunable by age either — a half-aged
   derived table is not a smaller index, it is a wrong one, and nothing in it
   records that rows are missing.
 - **There is no background deleter, and A5 must not grow one.** Nothing prunes

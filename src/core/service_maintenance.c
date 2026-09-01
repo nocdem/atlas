@@ -127,7 +127,7 @@ static const retention_entry RETENTION[] = {
     {"daemon_state", ATLAS_RETAIN_OPERATIONAL, false,
      "a single liveness row bounded by its own CHECK"},
 
-    /* --- the one prunable table -------------------------------------------- */
+    /* --- the first prunable table; `gw_audit` below is the second --------- */
     {"repo_events", ATLAS_RETAIN_OPERATIONAL, true,
      "a bounded stream of observations that already carries a documented per-repository ceiling; "
      "consumers hold an id cursor and the durable SOURCE and GIT evidence is in `evidence`, which "

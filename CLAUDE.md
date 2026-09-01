@@ -506,7 +506,8 @@ is not written down is one somebody deletes.** Both halves are load-bearing.
   flipped byte inside a value is undetectable. Decision revisions are the
   exception, because every one is rehashed.
 - **`RETENTION[]` is the whole retention policy**, every table has a row with a
-  written reason, and **exactly one table is prunable**.
+  written reason, and **exactly two tables are prunable** — `repo_events` since
+  A5 and `gw_audit` since A9, each with its argument written at its row.
 - **There is no background deleter**, bounds are checked and never clamped, and
   the delete is per batch.
 

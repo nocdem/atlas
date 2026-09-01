@@ -20,10 +20,13 @@
  *
  * ## What is in this header
  *
- * The five closed vocabularies the layer is built from, and nothing else. They
- * are here rather than beside their consumers because a vocabulary with two
- * homes is a vocabulary with two spellings, and every one of these is stored in
- * a column with a `CHECK` constraint that has to agree with it exactly.
+ * The five closed vocabularies the layer is built from, the policy value
+ * grammar, and the typed reads over migration 29's tables that other layers
+ * need — today exactly one, the version lookup the verification write point
+ * resolves a snapshot reference through. The vocabularies are here rather than
+ * beside their consumers because a vocabulary with two homes is a vocabulary
+ * with two spellings, and every one of these is stored in a column with a
+ * `CHECK` constraint that has to agree with it exactly.
  *
  * ## The house rules that govern all five
  *
@@ -48,6 +51,14 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
+
+#include "atlas/buf.h"
+#include "atlas/error.h"
+
+/* Forward-declared, `verify.h`'s precedent: this header needs only a pointer,
+ * and declaring it here keeps the dependency one-way. */
+typedef struct atlas_db atlas_db;
 
 /* Forward-declared rather than included, and the direction is the whole point.
  *
@@ -201,5 +212,41 @@ bool atlas_memory_gen_cause_parse(const char *name, atlas_memory_gen_cause *out)
  * `ATLAS_MEMORY_SOURCE_UNKNOWN` rather than a half-filled source. */
 bool atlas_memory_source_value_parse(const char *val, size_t len,
                                      atlas_syspolicy_memory_source *out);
+
+/* --- the stored snapshot, resolved for the write point ---------------------
+ *
+ * One `memory_source_versions` row joined with the `memory_sources` row that
+ * owns it — the shape `op_evidence_add` needs when an op names a snapshot
+ * instead of an indexed path: everything the evidence will assert about the
+ * bytes comes from this row, which Atlas wrote when it read them, and nothing
+ * comes from the request. Owned buffers; `_init`/`_free` pair. */
+typedef struct atlas_memory_version_row {
+    int64_t id;
+    int64_t source_id;
+    int64_t repo_id;          /* the source's repository — a plain id on the
+                               * row, because registry churn deletes no memory
+                               * history and a join through `repositories`
+                               * would */
+    atlas_buf version_uid;    /* 'v' + 32 lowercase hex */
+    atlas_buf commit_oid;     /* empty when the version was not git-bound;
+                               * "this had no blob" and "nobody looked" are
+                               * different facts and both are stored */
+    atlas_buf content_sha256; /* the hash Atlas computed when it read the bytes */
+    int64_t content_bytes;
+    atlas_buf path_text;      /* the source's stored %XX-encoded path */
+    atlas_buf observed_at;    /* when the bytes described, not when recorded */
+} atlas_memory_version_row;
+
+void atlas_memory_version_row_init(atlas_memory_version_row *r);
+void atlas_memory_version_row_free(atlas_memory_version_row *r);
+
+/* Resolves one stored memory source version by its public uid. A uid that
+ * resolves nothing is `*found_out = false` and ATLAS_OK — the caller decides
+ * what an absent row means, exactly as `atlas_db_verify_file_hash` leaves that
+ * decision to its caller. Lives in `src/db/db_memory.c`, whose functions are
+ * the only code that touches the `memory_*` tables. */
+atlas_status atlas_db_memory_version_by_uid(atlas_db *db, const char *uid,
+                                            atlas_memory_version_row *out, bool *found_out,
+                                            atlas_err *err);
 
 #endif /* ATLAS_MEMORY_H */

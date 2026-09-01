@@ -29,6 +29,7 @@
 
 #include "atlas/atlas.h"
 #include "atlas/buf.h"
+#include "atlas/ipc.h"
 #include "atlas/jsonread.h"
 #include "atlas/mcp.h"
 #include "atlas_test.h"
@@ -882,9 +883,76 @@ static void test_a_recorded_claim_survives_a_daemon_restart(void) {
     env_stop(&e);
 }
 
+/* --- A12.1: no socket request reaches an internal channel by naming it ----- */
+
+/* `speaking_for: "DOCUMENT"` and `speaking_for: "ATLAS"`, sent as raw JSON over
+ * the live daemon's socket — below MCP, which pins its own `speaking_for` and
+ * so cannot carry these spellings at all. "Refused exactly as ATLAS is" means
+ * the name is not honoured rather than that the call errors: `channel_for`
+ * falls back to the peer's own channel and the claim is created as the peer.
+ *
+ * Every peer of a fixture daemon is a *model* peer, deterministically:
+ * `atlas_server_peer_is_operator` probes the root-owned authority policy, and
+ * the probe refuses a binary the running uid can replace — the same fact the
+ * §10 test above leans on when it declines to assert a HUMAN row. So this test
+ * covers the model-peer half of the four-case negative through the real
+ * transport; the operator-peer half runs against the same two public functions
+ * in `tests/test_verify_intake.c`, where the composition is transcribed. */
+static void test_naming_an_internal_channel_over_the_socket_speaks_as_the_peer(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    env e;
+    env_start(&e, &err);
+
+    static const struct {
+        const char *spelling;
+        const char *actor;
+    } CASES[] = {
+        {"DOCUMENT", "spoke-for-document"},
+        {"ATLAS", "spoke-for-atlas"},
+    };
+    for (size_t i = 0; i < sizeof CASES / sizeof CASES[0]; i++) {
+        char params[256];
+        (void)snprintf(params, sizeof params,
+                       "{\"repo\":\"subject\",\"text\":\"named %s over the socket\","
+                       "\"actor\":\"%s\",\"speaking_for\":\"%s\"}",
+                       CASES[i].spelling, CASES[i].actor, CASES[i].spelling);
+        atlas_buf resp = ATLAS_BUF_INIT;
+        T_OK(atlas_ipc_call(atlas_buf_cstr(&e.d.socket), "verify.claim_create", params, &resp,
+                            &err),
+             &err);
+        T_CHECK_MSG(strstr(atlas_buf_cstr(&resp), "uid") != NULL,
+                    "the claim was not created; naming an unselectable channel must be ignored, "
+                    "not an error: %s",
+                    atlas_buf_cstr(&resp));
+        atlas_buf_free(&resp);
+    }
+
+    fx_daemon_stop(&e.d, false);
+    for (size_t i = 0; i < sizeof CASES / sizeof CASES[0]; i++) {
+        int64_t own = count_in_db(&e,
+                                  "SELECT COUNT(*) FROM verify_actors WHERE name = ?1"
+                                  "  AND class = 'AI_AGENT' AND identity = 'SELF_DECLARED';",
+                                  CASES[i].actor, &err);
+        T_CHECK_MSG(own == 1, "speaking_for %s did not land as the peer's own actor (%lld rows)",
+                    CASES[i].spelling, (long long)own);
+    }
+    int64_t forged = count_in_db(&e,
+                                 "SELECT COUNT(*) FROM verify_actors WHERE class = 'DOCUMENT'"
+                                 "  OR class = 'ATLAS_VERIFIER' OR identity = 'ATLAS_ATTESTED';",
+                                 NULL, &err);
+    T_CHECK_MSG(forged == 0,
+                "%lld actor rows carry a class or identity no socket request may produce",
+                (long long)forged);
+
+    env_stop(&e);
+}
+
 static const atlas_test TESTS[] = {
     {"an MCP call speaks as a model whatever uid carries it",
      test_an_mcp_call_speaks_as_a_model_whatever_uid_carries_it},
+    {"naming an internal channel over the socket speaks as the peer",
+     test_naming_an_internal_channel_over_the_socket_speaks_as_the_peer},
     {"a model cannot produce evidence only Atlas could have",
      test_a_model_cannot_produce_evidence_only_atlas_could_have},
     {"no MCP call can assert truth or coverage",

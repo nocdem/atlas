@@ -222,6 +222,8 @@ static void test_no_transport_can_name_the_atlas_channel(void) {
     atlas_verify_channel c = ATLAS_VERIFY_CHANNEL_MODEL;
     T_CHECK_MSG(!atlas_verify_channel_parse("ATLAS", &c),
                 "no transport may select the channel that makes evidence Atlas-attested");
+    T_CHECK_MSG(!atlas_verify_channel_parse("DOCUMENT", &c),
+                "no transport may select the channel that mints one speaker per pasted file");
     T_CHECK_MSG(!atlas_verify_channel_parse("UNKNOWN", &c), "UNKNOWN is not selectable either");
     T_CHECK(atlas_verify_channel_parse("MODEL", &c) && c == ATLAS_VERIFY_CHANNEL_MODEL);
     T_CHECK(atlas_verify_channel_parse("OPERATOR", &c) && c == ATLAS_VERIFY_CHANNEL_OPERATOR);
@@ -235,6 +237,187 @@ static void test_no_transport_can_name_the_atlas_channel(void) {
             ATLAS_ACTOR_IDENTITY_SELF_DECLARED);
     T_CHECK(atlas_verify_channel_actor_identity(ATLAS_VERIFY_CHANNEL_ATLAS) ==
             ATLAS_ACTOR_IDENTITY_ATLAS_ATTESTED);
+}
+
+/* --- A12.1: transport-selectability is the predicate, not a comment -------- */
+
+static void test_the_selectable_set_is_the_predicate_and_the_parse_cannot_drift(void) {
+    /* The whole vocabulary. A member added to the enum without joining this
+     * walk still fails the predicate's own switch at compile time, so the walk
+     * cannot silently narrow. */
+    static const atlas_verify_channel ALL[] = {
+        ATLAS_VERIFY_CHANNEL_UNKNOWN, ATLAS_VERIFY_CHANNEL_MODEL,
+        ATLAS_VERIFY_CHANNEL_OPERATOR, ATLAS_VERIFY_CHANNEL_ATLAS,
+        ATLAS_VERIFY_CHANNEL_DOCUMENT,
+    };
+    for (size_t i = 0; i < sizeof ALL / sizeof ALL[0]; i++) {
+        atlas_verify_channel c = ALL[i];
+        bool want = c == ATLAS_VERIFY_CHANNEL_MODEL || c == ATLAS_VERIFY_CHANNEL_OPERATOR;
+        T_CHECK_MSG(atlas_verify_channel_is_transport_selectable(c) == want,
+                    "%s must%s be transport-selectable", atlas_verify_channel_name(c),
+                    want ? "" : " not");
+
+        /* The accept-list and the predicate are one definition: `_parse`
+         * accepts a channel's own spelling exactly when the predicate accepts
+         * the channel. */
+        atlas_verify_channel got = ATLAS_VERIFY_CHANNEL_UNKNOWN;
+        bool parsed = atlas_verify_channel_parse(atlas_verify_channel_name(c), &got);
+        T_CHECK_MSG(parsed == want, "the parse and the predicate disagree about %s",
+                    atlas_verify_channel_name(c));
+        if (parsed) {
+            T_CHECK(got == c);
+        }
+    }
+}
+
+/* --- A12.1: a document Atlas read can speak, and only Atlas can let it ----- */
+
+static void test_the_document_channel_derives_a_document_actor_that_only_lowers(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    env e;
+    env_open(&e, &err);
+
+    atlas_buf claim = ATLAS_BUF_INIT;
+    make_claim(&e, "the build needs no network", NULL, NULL, &claim, &err);
+
+    /* Built directly, as internal code does — the `intake.c` synthetic-op
+     * shape. No transport can construct this op, which the parse-refusal tests
+     * above and the four-case test below are about. */
+    atlas_verify_op a;
+    op_init(&a, ATLAS_VERIFY_OP_ATTESTATION_ADD);
+    a.channel = ATLAS_VERIFY_CHANNEL_DOCUMENT;
+    T_OK(atlas_buf_set(&a.claim_uid, claim.data, claim.len, &err), &err);
+    T_OK(atlas_buf_set_str(&a.actor_name, "m0123456789abcdef0123456789abcdef", &err), &err);
+    T_OK(atlas_buf_set_str(&a.actor_provider, "memory", &err), &err);
+    a.verdict = ATLAS_ATTEST_SUPPORT;
+    atlas_verify_intake_result res;
+    T_OK(apply(&e, &a, &res, &err), &err);
+
+    atlas_verify_actor actor;
+    atlas_verify_actor_init(&actor);
+    bool found = false;
+    T_OK(atlas_db_verify_actor_get(e.db, res.actor_id, &actor, &found, &err), &err);
+    T_CHECK_MSG(found, "the document actor was recorded");
+    T_CHECK_MSG(actor.cls == ATLAS_ACTOR_DOCUMENT,
+                "the DOCUMENT channel produces a DOCUMENT actor and nothing stronger");
+    T_CHECK_MSG(actor.identity == ATLAS_ACTOR_IDENTITY_SELF_DECLARED,
+                "prose in a file is asserted by whoever wrote the file; nothing authenticates "
+                "the writer");
+    T_CHECK(atlas_verify_channel_actor_class(ATLAS_VERIFY_CHANNEL_DOCUMENT) ==
+            ATLAS_ACTOR_DOCUMENT);
+    T_CHECK(atlas_verify_channel_actor_identity(ATLAS_VERIFY_CHANNEL_DOCUMENT) ==
+            ATLAS_ACTOR_IDENTITY_SELF_DECLARED);
+
+    /* The number, stated so a later change to the prior table must change this
+     * test deliberately. 350 is min(DOCUMENT 400, SELF_DECLARED 350): at
+     * ATLAS_ATTESTED a memory file would weigh 400, above the self-declared
+     * model that wrote it, and a sentence anybody types into a memory file
+     * would outweigh the model speaking directly. */
+    T_CHECK_MSG(atlas_verify_prior_reliability(ATLAS_ACTOR_DOCUMENT,
+                                               ATLAS_ACTOR_IDENTITY_SELF_DECLARED) == 350,
+                "a memory file's prior is capped by its self-declared identity");
+
+    atlas_verify_actor_free(&actor);
+    atlas_verify_intake_result_free(&res);
+    atlas_verify_op_free(&a);
+    atlas_buf_free(&claim);
+    env_close(&e);
+}
+
+/* --- A12.1: the four-case negative — the peer's own channel always stands -- */
+
+/* `speaking_for: "DOCUMENT"` and `"ATLAS"`, from a model peer and from an
+ * operator peer, must leave the peer's own channel standing in all four cases.
+ *
+ * The operator half cannot be driven through a live socket by any test in this
+ * suite, on any machine: `atlas_server_peer_is_operator` probes the root-owned
+ * authority policy, and the probe refuses a binary the running uid can replace
+ * — so every peer of a fixture daemon resolves to MODEL, deterministically
+ * (`tests/test_verify_product.c`'s §10 test states the same). So this test
+ * drives the exact composition `channel_for` (src/ipc/server_verify.c:81-93)
+ * makes of the two public functions — the parse, then the strict authority
+ * comparison — and pushes the resolved channel through the real write point,
+ * reading the stored actor class back. The model-peer half is additionally
+ * driven through a live daemon socket in `tests/test_verify_product.c`. The
+ * residual is stated rather than solved: an edit confined to `channel_for`
+ * itself that misbehaves only for an operator peer is unobservable by any
+ * unprivileged test. */
+static void test_speaking_for_an_internal_channel_leaves_the_peer_standing(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    env e;
+    env_open(&e, &err);
+
+    atlas_buf claim = ATLAS_BUF_INIT;
+    make_claim(&e, "the four-case negative", NULL, NULL, &claim, &err);
+
+    static const struct {
+        atlas_verify_channel peer;
+        atlas_verify_actor_class cls;
+        atlas_verify_actor_identity identity;
+        const char *actor;
+    } PEERS[] = {
+        {ATLAS_VERIFY_CHANNEL_MODEL, ATLAS_ACTOR_AI_AGENT, ATLAS_ACTOR_IDENTITY_SELF_DECLARED,
+         "neg-model"},
+        {ATLAS_VERIFY_CHANNEL_OPERATOR, ATLAS_ACTOR_HUMAN,
+         ATLAS_ACTOR_IDENTITY_PEER_AUTHENTICATED, "neg-operator"},
+    };
+    static const char *const ASKED[] = {"DOCUMENT", "ATLAS"};
+
+    for (size_t p = 0; p < sizeof PEERS / sizeof PEERS[0]; p++) {
+        for (size_t s = 0; s < sizeof ASKED / sizeof ASKED[0]; s++) {
+            /* `channel_for`'s composition, transcribed: the name is honoured
+             * only when it parses and asserts strictly less than the peer. */
+            atlas_verify_channel want = ATLAS_VERIFY_CHANNEL_UNKNOWN;
+            atlas_verify_channel got = PEERS[p].peer;
+            if (atlas_verify_channel_parse(ASKED[s], &want) &&
+                atlas_verify_channel_authority(want) <
+                    atlas_verify_channel_authority(PEERS[p].peer)) {
+                got = want;
+            }
+            T_CHECK_MSG(got == PEERS[p].peer,
+                        "speaking_for %s from a %s peer must leave the peer standing", ASKED[s],
+                        atlas_verify_channel_name(PEERS[p].peer));
+
+            /* And through the real write point: the stored actor class is the
+             * peer's own, never DOCUMENT and never ATLAS_VERIFIER. */
+            atlas_verify_op a;
+            op_init(&a, ATLAS_VERIFY_OP_ATTESTATION_ADD);
+            a.channel = got;
+            T_OK(atlas_buf_set(&a.claim_uid, claim.data, claim.len, &err), &err);
+            T_OK(atlas_buf_set_str(&a.actor_name, PEERS[p].actor, &err), &err);
+            T_OK(atlas_buf_set_str(&a.session_key, ASKED[s], &err), &err);
+            a.verdict = ATLAS_ATTEST_SUPPORT;
+            atlas_verify_intake_result res;
+            T_OK(apply(&e, &a, &res, &err), &err);
+            atlas_verify_actor actor;
+            atlas_verify_actor_init(&actor);
+            bool found = false;
+            T_OK(atlas_db_verify_actor_get(e.db, res.actor_id, &actor, &found, &err), &err);
+            T_CHECK_MSG(found && actor.cls == PEERS[p].cls &&
+                            actor.identity == PEERS[p].identity,
+                        "the stored actor must be the peer's own, never the named channel's");
+            T_CHECK(actor.cls != ATLAS_ACTOR_DOCUMENT && actor.cls != ATLAS_ACTOR_ATLAS_VERIFIER);
+            atlas_verify_actor_free(&actor);
+            atlas_verify_intake_result_free(&res);
+            atlas_verify_op_free(&a);
+        }
+    }
+
+    /* The sharp fact, asserted directly rather than resting on the refusal
+     * alone: DOCUMENT ranks *below* OPERATOR, so for an operator peer the
+     * strict `<` would admit `speaking_for: "DOCUMENT"` as a legitimate
+     * weakening the moment the parse accepted the name. The rank is not a
+     * second guard there — the parse refusal is the whole of it, which is why
+     * the refusal lives in a predicate the compiler enforces. */
+    T_CHECK(atlas_verify_channel_authority(ATLAS_VERIFY_CHANNEL_DOCUMENT) <
+            atlas_verify_channel_authority(ATLAS_VERIFY_CHANNEL_OPERATOR));
+    atlas_verify_channel c = ATLAS_VERIFY_CHANNEL_UNKNOWN;
+    T_CHECK(!atlas_verify_channel_parse("DOCUMENT", &c));
+
+    atlas_buf_free(&claim);
+    env_close(&e);
 }
 
 static void test_a_zeroed_operation_cannot_write(void) {
@@ -661,12 +844,167 @@ static void test_bounds_refuse_rather_than_shorten(void) {
     env_close(&e);
 }
 
+/* --- A12.1: a memory snapshot reference is internal, and Atlas binds it ---- */
+
+#define MEM_VERSION_UID "v0123456789abcdef0123456789abcdef"
+#define MEM_SHA "1111111111111111111111111111111111111111111111111111111111111111"
+
+/* One registered external memory source with one stored version, inserted the
+ * way the fixture inserts commits: directly, because this suite is about the
+ * write point and not about the pass that will populate these tables (T8). */
+static void insert_memory_version(env *e, atlas_err *err) {
+    atlas_buf sql = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_appendf(
+             &sql, err,
+             "INSERT INTO memory_sources(repo_id, source_uid, cls, path_raw, path_text,"
+             "  registered_at) VALUES(%lld, 'm0123456789abcdef0123456789abcdef',"
+             "  'EXTERNAL_FILE', '/home/u/notes.md', '/home/u/notes.md', 't0');"
+             "INSERT INTO memory_source_versions(source_id, version_uid, commit_oid, blob_oid,"
+             "  content_sha256, content_bytes, content, observed_at, recorded_at, read_by_uid)"
+             " VALUES(last_insert_rowid(), '%s', '', '', '%s', 5, X'6e6f746573', 't1', 't1', 0);",
+             (long long)e->repo_id, MEM_VERSION_UID, MEM_SHA),
+         err);
+    T_OK(atlas_db_exec_sql(e->db, atlas_buf_cstr(&sql), err), err);
+    atlas_buf_free(&sql);
+}
+
+static void mem_evidence_op(atlas_verify_op *op, const atlas_buf *claim, const char *version_uid,
+                            atlas_err *err) {
+    op_init(op, ATLAS_VERIFY_OP_EVIDENCE_ADD);
+    op->evidence_class = ATLAS_EVIDENCE_DOCUMENT;
+    T_OK(atlas_buf_set(&op->claim_uid, claim->data, claim->len, err), err);
+    T_OK(atlas_buf_set_str(&op->memory_version_uid, version_uid, err), err);
+}
+
+static void test_a_memory_snapshot_reference_is_refused_on_every_transport_channel(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    env e;
+    env_open(&e, &err);
+
+    atlas_buf claim = ATLAS_BUF_INIT;
+    make_claim(&e, "the notes say so", NULL, NULL, &claim, &err);
+    insert_memory_version(&e, &err);
+
+    /* Refused on both transport-selectable channels with the pinned sentence,
+     * so no transport gains a byte of new surface — even naming a row that
+     * exists. */
+    static const atlas_verify_channel TRANSPORT[] = {ATLAS_VERIFY_CHANNEL_MODEL,
+                                                     ATLAS_VERIFY_CHANNEL_OPERATOR};
+    for (size_t i = 0; i < sizeof TRANSPORT / sizeof TRANSPORT[0]; i++) {
+        atlas_verify_op op;
+        mem_evidence_op(&op, &claim, MEM_VERSION_UID, &err);
+        op.channel = TRANSPORT[i];
+        atlas_verify_intake_result res;
+        atlas_status st = apply(&e, &op, &res, &err);
+        T_CHECK_MSG(st != ATLAS_OK, "a %s-channel caller may not name a memory snapshot",
+                    atlas_verify_channel_name(TRANSPORT[i]));
+        T_CHECK_MSG(strstr(err.msg, "a memory snapshot is bound by the pass that read it") != NULL,
+                    "the refusal names the rule; it said: %s", err.msg);
+        atlas_verify_intake_result_free(&res);
+        atlas_verify_op_free(&op);
+    }
+
+    /* A reference to a version that is not there is a reference to nothing,
+     * exactly as a path or a commit is. */
+    atlas_verify_op op;
+    mem_evidence_op(&op, &claim, "vffffffffffffffffffffffffffffffff", &err);
+    op.channel = ATLAS_VERIFY_CHANNEL_ATLAS;
+    atlas_verify_intake_result res;
+    T_CHECK_MSG(apply(&e, &op, &res, &err) != ATLAS_OK,
+                "a memory version that does not exist cannot be referred to");
+    T_CHECK_MSG(strstr(err.msg, "no memory source version by that id exists") != NULL,
+                "the refusal says what was missing; it said: %s", err.msg);
+    atlas_verify_intake_result_free(&res);
+    atlas_verify_op_free(&op);
+
+    /* And nothing landed. */
+    sqlite3_stmt *stmt = NULL;
+    T_CHECK(sqlite3_prepare_v2(e.db->h, "SELECT COUNT(*) FROM verify_evidence;", -1, &stmt,
+                               NULL) == SQLITE_OK);
+    T_CHECK(sqlite3_step(stmt) == SQLITE_ROW);
+    T_CHECK_MSG(sqlite3_column_int(stmt, 0) == 0, "no refused reference stored a row");
+    sqlite3_finalize(stmt);
+
+    atlas_buf_free(&claim);
+    env_close(&e);
+}
+
+static void test_a_memory_snapshot_reference_takes_the_hash_from_atlas_own_row(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    env e;
+    env_open(&e, &err);
+
+    atlas_buf claim = ATLAS_BUF_INIT;
+    make_claim(&e, "the notes say so", NULL, NULL, &claim, &err);
+    insert_memory_version(&e, &err);
+
+    /* On the internal channel the reference resolves, and every fact on the
+     * stored evidence is Atlas' own: the hash from the version row, the path
+     * from the source row, the commit from the claim's binding because this
+     * version recorded none. The op has no content-hash field to lie in —
+     * deliberately — so what is asserted is equality with the fixture row. */
+    atlas_verify_op op;
+    mem_evidence_op(&op, &claim, MEM_VERSION_UID, &err);
+    op.channel = ATLAS_VERIFY_CHANNEL_ATLAS;
+    atlas_verify_intake_result res;
+    T_OK(apply(&e, &op, &res, &err), &err);
+    T_CHECK_MSG(!res.duplicate, "the first reference is a new row");
+    atlas_verify_op_free(&op);
+
+    sqlite3_stmt *stmt = NULL;
+    T_CHECK(sqlite3_prepare_v2(e.db->h,
+                               "SELECT content_hash, path_text, commit_oid FROM verify_evidence"
+                               " ORDER BY id DESC LIMIT 1;",
+                               -1, &stmt, NULL) == SQLITE_OK);
+    T_CHECK(sqlite3_step(stmt) == SQLITE_ROW);
+    T_CHECK_MSG(strcmp((const char *)sqlite3_column_text(stmt, 0), MEM_SHA) == 0,
+                "the content hash is the one Atlas' own row holds");
+    T_CHECK_MSG(strcmp((const char *)sqlite3_column_text(stmt, 1), "/home/u/notes.md") == 0,
+                "the path is the source's stored path_text");
+    T_CHECK_MSG(strcmp((const char *)sqlite3_column_text(stmt, 2), COMMIT_A) == 0,
+                "an unbound version leaves the claim's own commit binding standing");
+    sqlite3_finalize(stmt);
+
+    /* §27: the same snapshot reference twice is one row. */
+    atlas_verify_op again;
+    mem_evidence_op(&again, &claim, MEM_VERSION_UID, &err);
+    again.channel = ATLAS_VERIFY_CHANNEL_ATLAS;
+    atlas_verify_intake_result res2;
+    T_OK(apply(&e, &again, &res2, &err), &err);
+    T_CHECK_MSG(res2.duplicate, "a repeated snapshot reference resolves to the row it made");
+    T_CHECK_MSG(res2.evidence_id == res.evidence_id, "and to the same row");
+    atlas_verify_intake_result_free(&res2);
+    atlas_verify_op_free(&again);
+
+    T_CHECK(sqlite3_prepare_v2(e.db->h, "SELECT COUNT(*) FROM verify_evidence;", -1, &stmt,
+                               NULL) == SQLITE_OK);
+    T_CHECK(sqlite3_step(stmt) == SQLITE_ROW);
+    T_CHECK_MSG(sqlite3_column_int(stmt, 0) == 1, "two identical references are one row");
+    sqlite3_finalize(stmt);
+
+    atlas_verify_intake_result_free(&res);
+    atlas_buf_free(&claim);
+    env_close(&e);
+}
+
 static const atlas_test TESTS[] = {
     {"a model can create a claim and it binds to a source state",
      test_a_model_can_create_a_claim_and_it_binds_to_a_source_state},
     {"a model cannot submit evidence only Atlas could have produced",
      test_a_model_cannot_submit_evidence_only_atlas_could_have_produced},
     {"no transport can name the Atlas channel", test_no_transport_can_name_the_atlas_channel},
+    {"the selectable set is the predicate, and the parse cannot drift",
+     test_the_selectable_set_is_the_predicate_and_the_parse_cannot_drift},
+    {"the DOCUMENT channel derives a DOCUMENT actor that only lowers",
+     test_the_document_channel_derives_a_document_actor_that_only_lowers},
+    {"speaking for an internal channel leaves the peer standing",
+     test_speaking_for_an_internal_channel_leaves_the_peer_standing},
+    {"a memory snapshot reference is refused on every transport channel",
+     test_a_memory_snapshot_reference_is_refused_on_every_transport_channel},
+    {"a memory snapshot reference takes the hash from Atlas' own row",
+     test_a_memory_snapshot_reference_takes_the_hash_from_atlas_own_row},
     {"a zeroed operation cannot write", test_a_zeroed_operation_cannot_write},
     {"a reference to something that is not there is refused",
      test_a_reference_to_something_that_is_not_there_is_refused},

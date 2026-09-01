@@ -93,17 +93,45 @@ typedef enum atlas_verify_channel {
      * It is unreachable from every transport: no request parser sets it, and
      * `atlas_verify_channel_parse` does not accept its name. It is set only by
      * Atlas' own code, in the same call in which Atlas did the thing. */
-    ATLAS_VERIFY_CHANNEL_ATLAS
+    ATLAS_VERIFY_CHANNEL_ATLAS,
+    /* A12.1: a document Atlas read is the speaker — a memory file's own
+     * assertions, attested by the file rather than by whoever pasted it.
+     * Produces a DOCUMENT actor with SELF_DECLARED identity, always: prose in
+     * a file is a statement by whoever wrote the file, and nothing about
+     * writing bytes to a memory file authenticates the writer.
+     *
+     * Internal-only, like ATLAS and for a different forgery. ATLAS is refused
+     * so a request cannot make its own evidence authentic; DOCUMENT is refused
+     * so a request cannot *mint speakers*. The independence fold treats two
+     * DOCUMENT-class attestations with no declared derivation edge as two
+     * independent groups, so a caller that could reach this channel could turn
+     * N pasted files into N independent corroborations — §12 inflation, the
+     * most attractive mistake available to a system that counts agreement. It
+     * is set only by Atlas' own code, constructing an op no transport can
+     * construct, in the same call in which Atlas read the document. */
+    ATLAS_VERIFY_CHANNEL_DOCUMENT
 } atlas_verify_channel;
 
 const char *atlas_verify_channel_name(atlas_verify_channel c);
-/* Parses the two channels a *transport* may select between. Deliberately
- * refuses `ATLAS` and `UNKNOWN`: a request that could name its own channel
- * could name the one that makes its evidence authentic. */
+
+/* True for exactly the channels a *transport* may select between: MODEL and
+ * OPERATOR. The one definition of transport-selectability, asked by
+ * `atlas_verify_channel_parse` for every name it matches — so the accept-list
+ * and the predicate cannot drift apart, and a channel added to the vocabulary
+ * without deciding this question does not compile. The switch has no
+ * `default:` and every `false` carries its reason at the case. */
+bool atlas_verify_channel_is_transport_selectable(atlas_verify_channel c);
+
+/* Parses the channels a *transport* may select between — exactly those the
+ * predicate above answers true for. Deliberately refuses `ATLAS`, `DOCUMENT`
+ * and `UNKNOWN`: a request that could name its own channel could name the one
+ * that makes its evidence authentic, or the one that mints a new independent
+ * speaker per pasted file. */
 bool atlas_verify_channel_parse(const char *name, atlas_verify_channel *out);
 
-/* How much a channel asserts, as a total order: UNKNOWN 0 < MODEL 1 <
- * OPERATOR 2 < ATLAS 3.
+/* How much a channel asserts — a total order among the transport-selectable
+ * channels, MODEL 1 < OPERATOR 2, with UNKNOWN at 0 below everything, ATLAS
+ * at 3 above everything, and DOCUMENT at 1 beside MODEL.
  *
  * It exists so a transport can let a caller **weaken** its own channel and
  * never raise it, and that asymmetry is the whole point.
@@ -119,9 +147,21 @@ bool atlas_verify_channel_parse(const char *name, atlas_verify_channel *out);
  * So the MCP adapter says so, and the write point believes it only downwards.
  * Claiming less authority than you hold is never a forgery; it is the accurate
  * statement. Claiming more is refused by comparing ranks, and `..._parse`
- * additionally refuses ATLAS and UNKNOWN by name — so no request can reach the
- * channel that makes evidence authentic, whatever it sends and whatever uid it
- * sends it from. */
+ * refuses ATLAS, DOCUMENT and UNKNOWN by name — so no request can reach a
+ * channel the transport may not select, whatever it sends and whatever uid it
+ * sends it from.
+ *
+ * **No rank comparison may ever admit DOCUMENT: the parse refusal is the
+ * guard, and the rank is inert.** For an operator peer the rank alone is no
+ * guard at all — DOCUMENT's 1 sits *below* OPERATOR's 2, so the strict
+ * weakening comparison would read the name as a legitimate weakening the
+ * moment a parse accepted it. What that would hand out is speaker-minting: the
+ * union-find treats two DOCUMENT-class attestations as independent absent a
+ * declared derivation edge, so a caller reaching this channel could turn N
+ * pasted files into N independent evidence groups — §12 inflation, the
+ * specific forgery the refusal closes. A future comparison over this
+ * vocabulary must ask `atlas_verify_channel_is_transport_selectable` first,
+ * never trust the rank to exclude what only the parse excludes. */
 int atlas_verify_channel_authority(atlas_verify_channel c);
 
 /* The actor class and identity this channel produces. Functions rather than a
@@ -228,6 +268,13 @@ typedef struct atlas_verify_op {
     atlas_buf probe;
     atlas_buf observed;
     atlas_buf observed_at;
+    /* A12.1, EVIDENCE_ADD on the internal channels only. Names a stored
+     * `memory_source_versions` row by uid — a reference, not a description:
+     * intake resolves the row and copies the content hash *Atlas' own row*
+     * holds, never anything the request carried, which is §8 for a file the
+     * index cannot hold. Refused on every transport-selectable channel, so no
+     * transport gains a byte of new surface. */
+    atlas_buf memory_version_uid;
 
     /* --- ATTESTATION_ADD -------------------------------------------------- */
     atlas_verify_verdict verdict;

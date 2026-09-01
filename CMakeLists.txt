@@ -363,7 +363,11 @@ add_library(atlas_core STATIC
   # registers a memory source. Pure: no database handle, no process, no file and
   # no clock, which is what lets the whole grammar be enumerated by a unit test
   # rather than only through a root-owned file no test process can create.
+  # `db_memory.c` is the one surface over migration 29's tables — nothing else
+  # touches a `memory_*` table, `db_verify.c`'s shape for `db_verify.c`'s
+  # reason.
   src/memory/source.c
+  src/db/db_memory.c
   ${ATLAS_UI_GEN}
 )
 

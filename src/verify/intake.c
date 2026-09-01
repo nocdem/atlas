@@ -36,11 +36,12 @@
 #include "atlas/atlas.h"
 #include "atlas/decision.h"
 #include "atlas/limits.h"
+#include "atlas/memory.h"
 #include "atlas/sha256.h"
 
 /* --- the channel ----------------------------------------------------------- */
 
-static const char *const CHANNEL_NAMES[] = {"UNKNOWN", "MODEL", "OPERATOR", "ATLAS"};
+static const char *const CHANNEL_NAMES[] = {"UNKNOWN", "MODEL", "OPERATOR", "ATLAS", "DOCUMENT"};
 
 const char *atlas_verify_channel_name(atlas_verify_channel c) {
     if ((size_t)c < sizeof CHANNEL_NAMES / sizeof CHANNEL_NAMES[0]) {
@@ -49,21 +50,49 @@ const char *atlas_verify_channel_name(atlas_verify_channel c) {
     return "UNKNOWN";
 }
 
+bool atlas_verify_channel_is_transport_selectable(atlas_verify_channel c) {
+    switch (c) {
+    case ATLAS_VERIFY_CHANNEL_MODEL:
+        /* The channel every MCP tool call and ordinary RPC peer speaks on. */
+        return true;
+    case ATLAS_VERIFY_CHANNEL_OPERATOR:
+        /* Nameable, and honoured only downwards: the transport edge's strict
+         * rank comparison refuses every raise. */
+        return true;
+    case ATLAS_VERIFY_CHANNEL_UNKNOWN:
+        /* Zero means nothing established the caller, and a request cannot
+         * establish that nothing established it. */
+        return false;
+    case ATLAS_VERIFY_CHANNEL_ATLAS:
+        /* A request that could name this channel could make its own evidence
+         * authentic. */
+        return false;
+    case ATLAS_VERIFY_CHANNEL_DOCUMENT:
+        /* A request that could name this channel could mint one independent
+         * speaker per pasted file — §12 inflation. */
+        return false;
+    }
+    return false;
+}
+
 bool atlas_verify_channel_parse(const char *name, atlas_verify_channel *out) {
     if (name == NULL) {
         return false;
     }
-    /* MODEL and OPERATOR only. `ATLAS` is deliberately unparseable: a request
-     * that could name its own channel could name the one that makes its
-     * evidence authentic, and every check in this file would then be arguing
-     * with a string somebody typed. */
-    if (strcmp(name, "MODEL") == 0) {
-        *out = ATLAS_VERIFY_CHANNEL_MODEL;
-        return true;
-    }
-    if (strcmp(name, "OPERATOR") == 0) {
-        *out = ATLAS_VERIFY_CHANNEL_OPERATOR;
-        return true;
+    /* One walk over the vocabulary, gated on the one definition of
+     * transport-selectability. ATLAS, DOCUMENT and UNKNOWN are refused by the
+     * predicate rather than by absence from a hand-kept list: the predicate is
+     * a switch with no `default:`, so a channel added to the vocabulary
+     * without deciding whether a transport may name it does not compile — and
+     * a request that could name its own channel could name the one that makes
+     * its evidence authentic, or the one that mints a speaker per file. */
+    for (size_t i = 0; i < sizeof CHANNEL_NAMES / sizeof CHANNEL_NAMES[0]; i++) {
+        atlas_verify_channel c = (atlas_verify_channel)i;
+        if (atlas_verify_channel_is_transport_selectable(c) &&
+            strcmp(name, CHANNEL_NAMES[i]) == 0) {
+            *out = c;
+            return true;
+        }
     }
     return false;
 }
@@ -76,6 +105,14 @@ int atlas_verify_channel_authority(atlas_verify_channel c) {
         return 2;
     case ATLAS_VERIFY_CHANNEL_ATLAS:
         return 3;
+    case ATLAS_VERIFY_CHANNEL_DOCUMENT:
+        /* Beside MODEL, and inert: the parse never yields DOCUMENT, so no rank
+         * comparison ever sees it. The rank exists so this switch stays total
+         * and nobody reads an unranked member as outranking anything — it must
+         * never become a guard, because for an operator peer it is none: 1 < 2,
+         * so the strict weakening comparison would admit the name the moment a
+         * parse accepted it. See the header on `atlas_verify_channel_authority`. */
+        return 1;
     case ATLAS_VERIFY_CHANNEL_UNKNOWN:
         break;
     }
@@ -92,6 +129,10 @@ atlas_verify_actor_class atlas_verify_channel_actor_class(atlas_verify_channel c
         return ATLAS_ACTOR_HUMAN;
     case ATLAS_VERIFY_CHANNEL_ATLAS:
         return ATLAS_ACTOR_ATLAS_VERIFIER;
+    case ATLAS_VERIFY_CHANNEL_DOCUMENT:
+        /* The document itself is the speaker — never the model that pasted it
+         * and never Atlas, which only read it. */
+        return ATLAS_ACTOR_DOCUMENT;
     case ATLAS_VERIFY_CHANNEL_UNKNOWN:
         break;
     }
@@ -109,6 +150,15 @@ atlas_verify_actor_identity atlas_verify_channel_actor_identity(atlas_verify_cha
         return ATLAS_ACTOR_IDENTITY_PEER_AUTHENTICATED;
     case ATLAS_VERIFY_CHANNEL_ATLAS:
         return ATLAS_ACTOR_IDENTITY_ATLAS_ATTESTED;
+    case ATLAS_VERIFY_CHANNEL_DOCUMENT:
+        /* Prose in a file is asserted by whoever wrote the file, and nothing
+         * authenticates the writer. The cap this imposes is the season's
+         * sentence as an integer: min(DOCUMENT 400, SELF_DECLARED 350) = 350.
+         * At ATLAS_ATTESTED a memory file would weigh 400 — above the
+         * self-declared model that wrote it and second only to a human — so a
+         * sentence anybody types into a memory file would outweigh the model
+         * speaking directly, arriving as a number nobody chose. */
+        return ATLAS_ACTOR_IDENTITY_SELF_DECLARED;
     case ATLAS_VERIFY_CHANNEL_UNKNOWN:
         break;
     }
@@ -164,7 +214,8 @@ bool atlas_verify_op_is_evaluation(atlas_verify_op_kind k) {
     X(actor_role) X(session_key) X(run_id) X(parent_actor_uid) X(document_uid) X(domain) X(text)   \
     X(scope_note) X(verifier) X(verifier_input) X(basis_commit) X(environment) X(claim_uid)        \
     X(commit_oid) X(path_text) X(symbol) X(target) X(probe) X(observed) X(observed_at)             \
-    X(method) X(supersedes_uid) X(evidence_uids) X(derived_uid) X(source_uid)
+    X(memory_version_uid) X(method) X(supersedes_uid) X(evidence_uids) X(derived_uid)              \
+    X(source_uid)
 
 void atlas_verify_op_init(atlas_verify_op *op) {
     if (op == NULL) {
@@ -665,6 +716,26 @@ static atlas_status op_evidence_add(atlas_db *db, const atlas_verify_op *op, con
             "produce it, or record what you read as AI_ANALYSIS declaring its source",
             atlas_verify_evidence_class_name(op->evidence_class));
     }
+    /* A12.1. A memory snapshot reference is internal: Atlas' own pass read the
+     * bytes and stored the row this uid names, so on a transport-selectable
+     * channel the field is refused and no transport gains a byte of new
+     * surface. Asked of the predicate rather than of two named channels, so a
+     * future selectable channel cannot inherit the field by omission. */
+    if (op->memory_version_uid.len > 0 &&
+        atlas_verify_channel_is_transport_selectable(op->channel)) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "a memory snapshot is bound by the pass that read it; name a path "
+                             "Atlas has indexed instead");
+    }
+    /* One reference per row. Only Atlas' own code can construct an op carrying
+     * this field, so both set at once is a defect in that code — refused
+     * rather than resolved by a silent precedence, which would store evidence
+     * about which bytes nobody could say. */
+    if (op->memory_version_uid.len > 0 && op->path_text.len > 0) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                             "evidence refers to an indexed path or to a stored memory snapshot, "
+                             "never both at once");
+    }
 
     atlas_verify_claim claim;
     atlas_verify_claim_init(&claim);
@@ -719,6 +790,38 @@ static atlas_status op_evidence_add(atlas_db *db, const atlas_verify_op *op, con
             }
         }
     }
+
+    /* A12.1 — §8 for a file the index cannot hold. An external memory source's
+     * absolute path can never pass the lookup above, so the internal caller
+     * names a stored `memory_source_versions` row instead, and every fact the
+     * evidence takes from it is Atlas' own: the content hash the pass computed
+     * when it read the bytes, the source's stored path, and — when the version
+     * was git-bound — the commit *it* recorded, overriding the claim's default
+     * binding above. Nothing here is taken from the request; the op has no
+     * content-hash field to take it from, deliberately. */
+    if (st == ATLAS_OK && op->memory_version_uid.len > 0) {
+        atlas_memory_version_row mv;
+        atlas_memory_version_row_init(&mv);
+        bool found = false;
+        st = atlas_db_memory_version_by_uid(db, atlas_buf_cstr(&op->memory_version_uid), &mv,
+                                            &found, err);
+        if (st == ATLAS_OK && !found) {
+            st = atlas_err_set(err, ATLAS_ERR_CONFIG,
+                               "no memory source version by that id exists, so there is nothing "
+                               "for this evidence to refer to");
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_buf_set(&e.content_hash, mv.content_sha256.data, mv.content_sha256.len,
+                               err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_buf_set(&e.path_text, mv.path_text.data, mv.path_text.len, err);
+        }
+        if (st == ATLAS_OK && mv.commit_oid.len > 0) {
+            st = atlas_buf_set(&e.commit_oid, mv.commit_oid.data, mv.commit_oid.len, err);
+        }
+        atlas_memory_version_row_free(&mv);
+    }
     if (st == ATLAS_OK) {
         struct {
             atlas_buf *to;
@@ -757,6 +860,17 @@ static atlas_status op_evidence_add(atlas_db *db, const atlas_verify_op *op, con
         key_buf(&h, &e.observed);
         key_buf(&h, &e.observed_at);
         key_i64(&h, e.actor_id);
+        /* A12.1. In the key only when it is set: the same snapshot reference
+         * is one row and a different snapshot is another, which is the whole
+         * job. Unconditional inclusion would append the empty field's length
+         * prefix and silently re-key every evidence row A9.2.1 has already
+         * stored — after which a retry of a pre-A12.1 submission would miss
+         * its own row and land as a second one, §27's forgery arriving as an
+         * upgrade. Fields are length-prefixed, so a stream carrying the field
+         * and a stream without it cannot encode the same reference. */
+        if (op->memory_version_uid.len > 0) {
+            key_buf(&h, &op->memory_version_uid);
+        }
         st = key_finish(&h, &e.content_key, err);
     }
     if (st == ATLAS_OK) {

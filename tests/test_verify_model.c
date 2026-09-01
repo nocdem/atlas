@@ -16,6 +16,7 @@
 #include <string.h>
 
 #include "atlas/verify.h"
+#include "atlas/verify_ops.h"
 #include "atlas/verifypolicy.h"
 #include "atlas_test.h"
 
@@ -629,8 +630,46 @@ static void test_a_policy_may_not_name_a_transition_the_state_machine_refuses(vo
                                                      ATLAS_DECISION_RESOLVED, &why));
 }
 
+/* --- A12.1: the channel vocabulary, every member visited ------------------- */
+
+static void test_only_model_and_operator_are_transport_selectable(void) {
+    /* The one definition of transport-selectability, walked over the whole
+     * enum with the expectations written out rather than derived — the shape
+     * every vocabulary test in this file uses. The predicate is what
+     * `atlas_verify_channel_parse` matches names against, so this walk is also
+     * the accept-list: ATLAS cannot make a request's evidence authentic,
+     * DOCUMENT cannot mint one speaker per pasted file, and UNKNOWN cannot be
+     * asserted into existence. */
+    static const struct {
+        atlas_verify_channel c;
+        bool selectable;
+    } WALK[] = {
+        {ATLAS_VERIFY_CHANNEL_UNKNOWN, false}, {ATLAS_VERIFY_CHANNEL_MODEL, true},
+        {ATLAS_VERIFY_CHANNEL_OPERATOR, true}, {ATLAS_VERIFY_CHANNEL_ATLAS, false},
+        {ATLAS_VERIFY_CHANNEL_DOCUMENT, false},
+    };
+    for (size_t i = 0; i < sizeof WALK / sizeof WALK[0]; i++) {
+        T_CHECK_MSG(atlas_verify_channel_is_transport_selectable(WALK[i].c) == WALK[i].selectable,
+                    "%s must%s be transport-selectable", atlas_verify_channel_name(WALK[i].c),
+                    WALK[i].selectable ? "" : " not");
+        atlas_verify_channel got = ATLAS_VERIFY_CHANNEL_UNKNOWN;
+        bool parsed = atlas_verify_channel_parse(atlas_verify_channel_name(WALK[i].c), &got);
+        T_CHECK_MSG(parsed == WALK[i].selectable,
+                    "the parse and the predicate disagree about %s",
+                    atlas_verify_channel_name(WALK[i].c));
+    }
+    /* The rank is inert for DOCUMENT and must stay so: it sits below OPERATOR,
+     * so the transport edge's strict weakening comparison would admit the name
+     * for an operator peer the moment a parse accepted it. The parse refusal
+     * is the whole guard on that path. */
+    T_CHECK(atlas_verify_channel_authority(ATLAS_VERIFY_CHANNEL_DOCUMENT) <
+            atlas_verify_channel_authority(ATLAS_VERIFY_CHANNEL_OPERATOR));
+}
+
 static const atlas_test TESTS[] = {
     {"every zero is the safe reading", test_every_zero_is_the_safe_reading},
+    {"only MODEL and OPERATOR are transport-selectable",
+     test_only_model_and_operator_are_transport_selectable},
     {"every name round-trips", test_every_name_round_trips},
     {"every reason has a row and a written meaning",
      test_every_reason_has_a_row_and_a_written_meaning},

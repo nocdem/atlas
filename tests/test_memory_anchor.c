@@ -419,6 +419,297 @@ static void test_a_ninth_anchor_is_dropped_with_the_count_capped(void) {
     env_close(&e);
 }
 
+static void hex_hash(char out[65], int salt) {
+    for (int k = 0; k < 64; k++) {
+        out[k] = (char)('0' + (k + salt) % 10);
+    }
+    out[64] = '\0';
+}
+
+/* The out-of-bounds write the ordinary "ninth anchor" test above cannot
+ * reach: that test's ninth candidate arrives in its own fresh iteration of
+ * the outer scan loop, which already refuses to enter it once anchor_count
+ * hits the cap. The loop's own guard is checked once per *token*, not once
+ * per anchor, so a single backtick token that resolves as both a path and a
+ * symbol makes two add_anchor() calls inside one iteration -- and at
+ * anchor_count == cap - 1, the first call fills the last slot and the
+ * second must be refused by add_anchor's own check, not the loop's. */
+static void test_a_dual_resolving_token_at_the_cap_is_not_written_out_of_bounds(void) {
+    env e;
+    atlas_err err;
+    atlas_err_init(&err);
+    env_open(&e, &err);
+
+    atlas_buf text = ATLAS_BUF_INIT;
+    for (int i = 0; i < 5; i++) {
+        char path[32], hash[65];
+        (void)snprintf(path, sizeof path, "src/g%d.c", i);
+        hex_hash(hash, i);
+        seed_file(&e, path, hash, &err);
+        char tok[48];
+        (void)snprintf(tok, sizeof tok, "`%s` ", path);
+        T_OK(atlas_buf_append_str(&text, tok, &err), &err);
+    }
+    atlas_buf uid = ATLAS_BUF_INIT;
+    propose_decision(&e, &uid, &err);
+    T_OK(atlas_buf_append_str(&text, atlas_buf_cstr(&uid), &err), &err);
+    T_OK(atlas_buf_append_str(&text, " ", &err), &err);
+    static const char OID[] = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+    seed_commit(&e, OID, &err);
+    T_OK(atlas_buf_append_str(&text, OID, &err), &err);
+    T_OK(atlas_buf_append_str(&text, " ", &err), &err);
+
+    /* anchor_count == 7 at this point: 5 PATH + 1 DECISION + 1 COMMIT. The
+     * 8th candidate resolves as both PATH and SYMBOL from one token. */
+    char dual_hash[65];
+    hex_hash(dual_hash, 9);
+    seed_file(&e, "dual", dual_hash, &err);
+    seed_symbol(&e, "dual", &err);
+    T_OK(atlas_buf_append_str(&text, "`dual`", &err), &err);
+
+    atlas_memory_proposition p;
+    atlas_memory_proposition_init(&p);
+    T_OK(atlas_buf_set(&p.text, text.data, text.len, &err), &err);
+    T_OK(atlas_memory_anchor_resolve(e.db, e.repo_id, &p, &err), &err);
+
+    T_EQ_INT((int)p.anchor_count, (int)ATLAS_MEMORY_MAX_ANCHORS_PER_PROPOSITION);
+    /* The PATH half of the dual token took the 8th slot; the SYMBOL half
+     * could not fit, and must not be counted as though it had -- that is
+     * what add_anchor's return value, not just its bounds check, protects:
+     * a phantom SYMBOL_PRESENT verdict for an anchor that was never
+     * actually written would be its own version of C1's mismatch. */
+    bool saw_symbol = false;
+    for (size_t i = 0; i < p.anchor_count; i++) {
+        if (p.anchors[i].kind == ATLAS_MEMORY_ANCHOR_SYMBOL) {
+            saw_symbol = true;
+        }
+    }
+    T_CHECK_MSG(!saw_symbol, "a symbol anchor that could not fit was recorded anyway");
+    T_EQ_INT((int)p.verifier, (int)ATLAS_VERIFIER_CONTENT_HASH);
+
+    atlas_memory_proposition_free(&p);
+    atlas_buf_free(&text);
+    atlas_buf_free(&uid);
+    env_close(&e);
+}
+
+/* --- adversarial: a filename cannot forge a verifier's own verdict --------- */
+
+static void test_a_semicolon_in_a_path_cannot_forge_a_verifier_input(void) {
+    env e;
+    atlas_err err;
+    atlas_err_init(&err);
+    env_open(&e, &err);
+
+    /* An ordinary, legal POSIX filename -- untrusted input by CLAUDE.md's
+     * own rule, chosen by whoever can commit -- built to look like a second
+     * `sha256=` field inside the verifier's own `path=`/`sha256=` grammar.
+     * Its real content hash does not matter to the attack. */
+    static const char EVIL[] =
+        "a;sha256=0000000000000000000000000000000000000000000000000000000000000000";
+    seed_file(&e, EVIL, "cafefeedcafefeedcafefeedcafefeedcafefeedcafefeedcafefeedcafefeed", &err);
+
+    char text[256];
+    (void)snprintf(text, sizeof text, "reads `%s` before it decides anything", EVIL);
+    atlas_memory_proposition p;
+    make_prop(&p, text, &err);
+    T_OK(atlas_memory_anchor_resolve(e.db, e.repo_id, &p, &err), &err);
+
+    /* The fact is still honestly recorded. */
+    T_REQUIRE(p.anchor_count == 1);
+    T_EQ_INT((int)p.anchors[0].kind, (int)ATLAS_MEMORY_ANCHOR_PATH);
+    T_EQ_STR(atlas_buf_cstr(&p.anchors[0].value), EVIL);
+    T_EQ_INT((int)p.semantics, (int)ATLAS_CLAIM_DESCRIPTIVE);
+
+    /* But no verifier is built from it: `input_field` (src/verify/
+     * detverify.c) takes the *first* `sha256=` match in a `;`-split
+     * grammar with no escaping, so a naively built input would compare the
+     * real file against the sixty-four zeros embedded in its own name
+     * rather than against the real hash appended after it -- a filename
+     * forging Atlas' own deterministic verdict. Refusing to build the
+     * verifier at all is what stops that, while still keeping the claim
+     * DESCRIPTIVE and anchored rather than vanished. */
+    T_EQ_INT((int)p.verifier, (int)ATLAS_VERIFIER_NONE);
+    T_CHECK(p.verifier_input.len == 0);
+
+    atlas_memory_proposition_free(&p);
+    env_close(&e);
+}
+
+/* The same attack, but the malicious `files` row comes from the real
+ * scanner rather than a hand-written INSERT: a real git repository, added
+ * and scanned through the built `atlas` binary exactly as an operator
+ * would. `files.content_hash` and `files.path_text` are Atlas' own, not a
+ * fixture's guess at their shape. */
+static void test_an_adversarial_filename_scanned_for_real_cannot_forge_a_verdict(void) {
+    fixture fx;
+    atlas_err err;
+    atlas_err_init(&err);
+    T_OK(fx_open(&fx, &err), &err);
+    const char *repo_dir = fx_repo(&fx);
+    T_OK(fx_init_repo(&fx, repo_dir, NULL, &err), &err);
+
+    static const char EVIL[] =
+        "a;sha256=0000000000000000000000000000000000000000000000000000000000000000";
+    T_OK(fx_write(repo_dir, "a", "the real file\n", &err), &err);
+    if (!fx_can_create_name(repo_dir, EVIL, strlen(EVIL))) {
+        atlas_test_note("this filesystem refused a ';' filename; skipping the real-scan case");
+        fx_close(&fx);
+        return;
+    }
+    T_OK(fx_write(repo_dir, EVIL, "irrelevant\n", &err), &err);
+    T_OK(fx_add_all(&fx, repo_dir, &err), &err);
+    T_OK(fx_commit(&fx, repo_dir, "an adversarial filename", &err), &err);
+
+    const char *add[] = {"--data-dir", fx_data_dir(&fx), "repo", "add",
+                         repo_dir,     "--name",         "evilproj"};
+    int code = -1;
+    T_OK(fx_atlas(add, 7u, NULL, NULL, &code, &err), &err);
+    T_REQUIRE(code == 0);
+
+    const char *scan[] = {"--data-dir", fx_data_dir(&fx), "scan", "evilproj"};
+    code = -1;
+    T_OK(fx_atlas(scan, 4u, NULL, NULL, &code, &err), &err);
+    T_REQUIRE(code == 0);
+
+    atlas_buf db_path = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_appendf(&db_path, &err, "%s/atlas.db", fx_data_dir(&fx)), &err);
+    atlas_db *db = NULL;
+    T_OK(atlas_db_open(atlas_buf_cstr(&db_path), &db, &err), &err);
+
+    atlas_repo_info info;
+    atlas_repo_info_init(&info);
+    bool found = false;
+    T_OK(atlas_db_repo_get(db, "evilproj", &info, &found, &err), &err);
+    T_REQUIRE(found);
+
+    char text[256];
+    (void)snprintf(text, sizeof text, "reads `%s` before it decides anything", EVIL);
+    atlas_memory_proposition p;
+    make_prop(&p, text, &err);
+    T_OK(atlas_memory_anchor_resolve(db, info.id, &p, &err), &err);
+
+    T_REQUIRE(p.anchor_count == 1);
+    T_EQ_INT((int)p.anchors[0].kind, (int)ATLAS_MEMORY_ANCHOR_PATH);
+    T_EQ_STR(atlas_buf_cstr(&p.anchors[0].value), EVIL);
+    T_EQ_INT((int)p.semantics, (int)ATLAS_CLAIM_DESCRIPTIVE);
+    /* No verifier, and therefore no verdict a filename could have steered:
+     * a real scan of a real repository holding this name still cannot
+     * produce a CONTENT_HASH check against the wrong sixty-four zeros. */
+    T_EQ_INT((int)p.verifier, (int)ATLAS_VERIFIER_NONE);
+    T_CHECK(p.verifier_input.len == 0);
+
+    atlas_memory_proposition_free(&p);
+    atlas_repo_info_free(&info);
+    atlas_db_close(db);
+    atlas_buf_free(&db_path);
+    fx_close(&fx);
+}
+
+static void test_an_embedded_nul_token_resolves_no_anchor(void) {
+    env e;
+    atlas_err err;
+    atlas_err_init(&err);
+    env_open(&e, &err);
+    seed_file(&e, "src/a.c",
+              "1111111111111111111111111111111111111111111111111111111111111111", &err);
+
+    /* `` `src/a.c<NUL>zzz` `` -- the NUL-terminated C-string lookup would
+     * silently truncate at the NUL and match the real "src/a.c", while the
+     * anchor's own `value` (a byte range, not a C string) would otherwise
+     * carry the full span including "zzz". The two representations must
+     * never be allowed to disagree, so a token carrying a raw NUL is
+     * refused outright rather than resolved against its truncated prefix. */
+    atlas_buf text = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_append_str(&text, "reads `", &err), &err);
+    T_OK(atlas_buf_append_str(&text, "src/a.c", &err), &err);
+    T_OK(atlas_buf_append_ch(&text, '\0', &err), &err);
+    T_OK(atlas_buf_append_str(&text, "zzz` here", &err), &err);
+
+    atlas_memory_proposition p;
+    atlas_memory_proposition_init(&p);
+    T_OK(atlas_buf_set(&p.text, text.data, text.len, &err), &err);
+    T_OK(atlas_memory_anchor_resolve(e.db, e.repo_id, &p, &err), &err);
+
+    T_EQ_INT((int)p.anchor_count, 0);
+
+    atlas_memory_proposition_free(&p);
+    atlas_buf_free(&text);
+    env_close(&e);
+}
+
+static void test_an_oversized_verifier_input_falls_back_to_no_verifier(void) {
+    env e;
+    atlas_err err;
+    atlas_err_init(&err);
+    env_open(&e, &err);
+
+    /* An ordinary, safe path -- no `;`, nothing adversarial -- just long
+     * enough that "path=<value>;sha256=<64 hex>" alone exceeds
+     * ATLAS_VERIFY_VERIFIER_INPUT_MAX, so the only thing under test is the
+     * length refusal. */
+    atlas_buf long_path = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_set_str(&long_path, "src/", &err), &err);
+    while (long_path.len < ATLAS_VERIFY_VERIFIER_INPUT_MAX) {
+        T_OK(atlas_buf_append_str(&long_path, "aaaaaaaaaa", &err), &err);
+    }
+    T_OK(atlas_buf_append_str(&long_path, ".c", &err), &err);
+    seed_file(&e, atlas_buf_cstr(&long_path),
+              "2222222222222222222222222222222222222222222222222222222222222222", &err);
+
+    atlas_buf text = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_append_str(&text, "reads `", &err), &err);
+    T_OK(atlas_buf_append(&text, long_path.data, long_path.len, &err), &err);
+    T_OK(atlas_buf_append_str(&text, "` here", &err), &err);
+
+    atlas_memory_proposition p;
+    atlas_memory_proposition_init(&p);
+    T_OK(atlas_buf_set(&p.text, text.data, text.len, &err), &err);
+    T_OK(atlas_memory_anchor_resolve(e.db, e.repo_id, &p, &err), &err);
+
+    /* Still anchored -- the anchor's own value has no length bound tied to
+     * the verifier's grammar -- but not verified: a claim intake would
+     * refuse this input anyway, and leaving the verifier set would make the
+     * proposition become a claim that could never be submitted and was
+     * never recorded as unanchored either (A9.2.2's failure mode). */
+    T_REQUIRE(p.anchor_count == 1);
+    T_EQ_INT((int)p.anchors[0].kind, (int)ATLAS_MEMORY_ANCHOR_PATH);
+    T_EQ_INT((int)p.semantics, (int)ATLAS_CLAIM_DESCRIPTIVE);
+    T_EQ_INT((int)p.verifier, (int)ATLAS_VERIFIER_NONE);
+    T_CHECK(p.verifier_input.len == 0);
+
+    atlas_memory_proposition_free(&p);
+    atlas_buf_free(&text);
+    atlas_buf_free(&long_path);
+    env_close(&e);
+}
+
+static void test_a_truncated_proposition_skips_resolution(void) {
+    env e;
+    atlas_err err;
+    atlas_err_init(&err);
+    env_open(&e, &err);
+    seed_file(&e, "src/z.c",
+              "3333333333333333333333333333333333333333333333333333333333333333", &err);
+
+    atlas_memory_proposition p;
+    make_prop(&p, "reads `src/z.c` here", &err);
+    /* Stands in for what atlas_memory_extract sets on a candidate over
+     * ATLAS_MEMORY_MAX_PROPOSITION_BYTES, without needing a 2 KiB+ fixture
+     * text: resolve() must refuse to scan it at all, however resolvable the
+     * text would otherwise be. */
+    p.truncated = true;
+
+    T_OK(atlas_memory_anchor_resolve(e.db, e.repo_id, &p, &err), &err);
+
+    T_EQ_INT((int)p.anchor_count, 0);
+    T_EQ_INT((int)p.semantics, (int)ATLAS_CLAIM_DESCRIPTIVE);
+    T_EQ_INT((int)p.verifier, (int)ATLAS_VERIFIER_NONE);
+
+    atlas_memory_proposition_free(&p);
+    env_close(&e);
+}
+
 /* --- idempotence and cross-repository scoping ------------------------------- */
 
 static void test_resolve_is_idempotent(void) {
@@ -509,6 +800,16 @@ static const atlas_test TESTS[] = {
     {"an unindexed commit oid resolves no anchor", test_an_unindexed_commit_oid_resolves_no_anchor},
     {"a ninth anchor is dropped with the count capped",
      test_a_ninth_anchor_is_dropped_with_the_count_capped},
+    {"a dual-resolving token at the cap is not written out of bounds",
+     test_a_dual_resolving_token_at_the_cap_is_not_written_out_of_bounds},
+    {"a semicolon in a path cannot forge a verifier input",
+     test_a_semicolon_in_a_path_cannot_forge_a_verifier_input},
+    {"an adversarial filename scanned for real cannot forge a verdict",
+     test_an_adversarial_filename_scanned_for_real_cannot_forge_a_verdict},
+    {"an embedded NUL token resolves no anchor", test_an_embedded_nul_token_resolves_no_anchor},
+    {"an oversized verifier input falls back to no verifier",
+     test_an_oversized_verifier_input_falls_back_to_no_verifier},
+    {"a truncated proposition skips resolution", test_a_truncated_proposition_skips_resolution},
     {"resolve is idempotent", test_resolve_is_idempotent},
     {"a decision from another repository does not resolve",
      test_a_decision_from_another_repository_does_not_resolve},

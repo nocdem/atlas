@@ -376,29 +376,49 @@ atlas_status atlas_memory_extract(const atlas_buf *bytes, atlas_memory_propositi
  * later `atlas.symbol_present`/`atlas.content_hash` run are looking at the
  * same fact. */
 
-/* Adds one anchor if there is room and it is not already present (by kind and
- * exact value) -- a token repeated twice in one candidate's text must not
- * spend two of the eight slots on the same fact. A no-op once `p->anchor_count`
- * has reached the cap; the caller's own loop condition is what actually stops
- * scanning once that happens, this is just the last line of defence against
- * writing a ninth. */
-static void add_anchor(atlas_memory_proposition *p, atlas_memory_anchor_kind kind,
+/* Adds one anchor if it is not already present (by kind and exact value) and
+ * there is room -- a token repeated twice in one candidate's text must not
+ * spend two of the eight slots on the same fact. Returns whether the anchor
+ * is now represented in `p->anchors[]` -- true whether it was already there
+ * or was just written, false when `*st` was already bad or the cap refused
+ * it. **The caller must use this return value**, not merely the outer scan
+ * loop's own `anchor_count < cap` guard, to decide whether a fact may
+ * contribute to the claim's semantics or verifier: the outer guard is
+ * checked once per *token*, and a single backtick token that resolves as
+ * both PATH and SYMBOL makes two calls here inside one token, so at
+ * `anchor_count == cap - 1` the first call fills the last slot and the
+ * second must still be refused *inside this function* -- the bound is on
+ * `anchors[]`, not on tokens, and it is enforced here, not by the caller's
+ * loop. Without this check the second call would write `anchors[cap]`, out
+ * of bounds; `tests/test_memory_anchor.c` builds exactly that case. */
+static bool add_anchor(atlas_memory_proposition *p, atlas_memory_anchor_kind kind,
                        const char *value, size_t value_len, atlas_status *st, atlas_err *err) {
-    if (*st != ATLAS_OK || p->anchor_count >= ATLAS_MEMORY_MAX_ANCHORS_PER_PROPOSITION) {
-        return;
+    if (*st != ATLAS_OK) {
+        return false;
     }
     for (size_t k = 0; k < p->anchor_count; k++) {
         if (p->anchors[k].kind == kind && p->anchors[k].value.len == value_len &&
             memcmp(p->anchors[k].value.data, value, value_len) == 0) {
-            return;
+            return true;
         }
+    }
+    if (p->anchor_count >= ATLAS_MEMORY_MAX_ANCHORS_PER_PROPOSITION) {
+        return false;
     }
     atlas_memory_anchor *a = &p->anchors[p->anchor_count];
     a->kind = kind;
     *st = atlas_buf_set(&a->value, value, value_len, err);
-    if (*st == ATLAS_OK) {
-        p->anchor_count++;
+    if (*st != ATLAS_OK) {
+        return false;
     }
+    p->anchor_count++;
+    return true;
+}
+
+/* True when `b` contains the given byte. Used to refuse a value the
+ * verifier's own grammar cannot represent, rather than filter it. */
+static bool has_byte(const atlas_buf *b, char c) {
+    return b->len > 0 && memchr(b->data, c, b->len) != NULL;
 }
 
 atlas_status atlas_memory_anchor_resolve(atlas_db *db, int64_t repo_id, atlas_memory_proposition *p,
@@ -418,6 +438,17 @@ atlas_status atlas_memory_anchor_resolve(atlas_db *db, int64_t repo_id, atlas_me
     p->verifier = ATLAS_VERIFIER_NONE;
     atlas_buf_reset(&p->verifier_input);
     atlas_buf_reset(&p->decision_uid);
+
+    /* A truncated candidate is already over ATLAS_MEMORY_MAX_PROPOSITION_BYTES
+     * -- past "a single discrete assertion" by that constant's own comment --
+     * and is never trimmed, so its `text` can be the whole 256 KiB source.
+     * Scanning it here would mean up to roughly one indexed read per
+     * anchor-shaped byte run, inside T8's write transaction on the single
+     * writer thread A9.2.6 exists to keep responsive. It is left exactly as
+     * an unanchored proposition: recorded, reported, resolved into nothing. */
+    if (p->truncated) {
+        return ATLAS_OK;
+    }
 
     const char *data = p->text.data != NULL ? p->text.data : "";
     size_t len = p->text.len;
@@ -446,7 +477,20 @@ atlas_status atlas_memory_anchor_resolve(atlas_db *db, int64_t repo_id, atlas_me
                 continue;
             }
             size_t tok_len = j - (i + 1);
-            if (tok_len > 0) {
+            /* A raw NUL inside the span cannot be part of any legitimate
+             * value here -- path_text encodes a NUL byte as `%00` and never
+             * carries one literally, and a symbol name is a source
+             * identifier -- but atlas_buf_cstr's NUL-terminated form is what
+             * every lookup below binds (atlas_db_bind_text_opt: strlen(s)),
+             * so it would silently look up only the prefix before the NUL
+             * while the anchor's own `value` (a byte range, not a C string)
+             * stored the full span including whatever follows it. That gap
+             * -- one representation truncated at the NUL, the other not --
+             * is exactly what let `src/a.c<NUL>zzz` resolve `src/a.c` and
+             * record an anchor naming a path that does not exist. Refused
+             * outright rather than truncated to match the lookup: the two
+             * representations must never be allowed to disagree. */
+            if (tok_len > 0 && memchr(data + i + 1, '\0', tok_len) == NULL) {
                 st = atlas_buf_set(&token, data + i + 1, tok_len, err);
                 if (st == ATLAS_OK) {
                     const char *tok_c = atlas_buf_cstr(&token);
@@ -455,8 +499,8 @@ atlas_status atlas_memory_anchor_resolve(atlas_db *db, int64_t repo_id, atlas_me
                     atlas_buf hash = ATLAS_BUF_INIT;
                     st = atlas_db_verify_file_hash(db, repo_id, tok_c, &hash, &found_path, err);
                     if (st == ATLAS_OK && found_path) {
-                        add_anchor(p, ATLAS_MEMORY_ANCHOR_PATH, tok_c, tok_len, &st, err);
-                        if (st == ATLAS_OK && !has_path) {
+                        bool added = add_anchor(p, ATLAS_MEMORY_ANCHOR_PATH, tok_c, tok_len, &st, err);
+                        if (st == ATLAS_OK && added && !has_path) {
                             has_path = true;
                             st = atlas_buf_set(&path_val, tok_c, tok_len, err);
                             if (st == ATLAS_OK) {
@@ -470,8 +514,9 @@ atlas_status atlas_memory_anchor_resolve(atlas_db *db, int64_t repo_id, atlas_me
                         int64_t count = 0;
                         st = atlas_db_verify_sem_symbol(db, repo_id, tok_c, &count, NULL, NULL, err);
                         if (st == ATLAS_OK && count > 0) {
-                            add_anchor(p, ATLAS_MEMORY_ANCHOR_SYMBOL, tok_c, tok_len, &st, err);
-                            if (st == ATLAS_OK && !has_symbol) {
+                            bool added =
+                                add_anchor(p, ATLAS_MEMORY_ANCHOR_SYMBOL, tok_c, tok_len, &st, err);
+                            if (st == ATLAS_OK && added && !has_symbol) {
                                 has_symbol = true;
                                 st = atlas_buf_set(&symbol_val, tok_c, tok_len, err);
                             }
@@ -497,8 +542,9 @@ atlas_status atlas_memory_anchor_resolve(atlas_db *db, int64_t repo_id, atlas_me
                     bool found = false;
                     st = atlas_db_decision_find_uid(db, tok_c, &doc_id, &doc_repo_id, &found, err);
                     if (st == ATLAS_OK && found && doc_repo_id == repo_id) {
-                        add_anchor(p, ATLAS_MEMORY_ANCHOR_DECISION, tok_c, tok_len, &st, err);
-                        if (st == ATLAS_OK && !has_decision) {
+                        bool added =
+                            add_anchor(p, ATLAS_MEMORY_ANCHOR_DECISION, tok_c, tok_len, &st, err);
+                        if (st == ATLAS_OK && added && !has_decision) {
                             has_decision = true;
                             st = atlas_buf_set(&decision_val, tok_c, tok_len, err);
                         }
@@ -515,7 +561,7 @@ atlas_status atlas_memory_anchor_resolve(atlas_db *db, int64_t repo_id, atlas_me
                         bool found = false;
                         st = atlas_db_verify_commit_exists(db, repo_id, tok_c, &found, err);
                         if (st == ATLAS_OK && found) {
-                            add_anchor(p, ATLAS_MEMORY_ANCHOR_COMMIT, tok_c, tok_len, &st, err);
+                            (void)add_anchor(p, ATLAS_MEMORY_ANCHOR_COMMIT, tok_c, tok_len, &st, err);
                         }
                     }
                 }
@@ -529,27 +575,64 @@ atlas_status atlas_memory_anchor_resolve(atlas_db *db, int64_t repo_id, atlas_me
     atlas_buf_free(&token);
 
     if (st == ATLAS_OK) {
-        /* §Decision 4. SYMBOL takes precedence over PATH when both resolved
-         * (a token can be both, and per-anchor both are still recorded above
-         * -- this only decides the *claim's* semantics and verifier); a
-         * DECISION anchor never changes which of the two applies, it only
+        /* §Decision 4. Semantics follow which *kind* of anchor resolved,
+         * independent of whether that anchor's value can be turned into a
+         * mechanical verifier: a path or symbol that cannot be safely
+         * represented in the verifier's grammar still describes a real path
+         * or symbol, it is just not machine-checkable. SYMBOL takes
+         * precedence over PATH when both resolved and both are usable (a
+         * token can be both, and per-anchor both are still recorded above);
+         * a DECISION anchor never changes which of the two applies, it only
          * adds `decision_uid`. */
-        if (has_symbol) {
+        if (has_symbol || has_path) {
             p->semantics = ATLAS_CLAIM_DESCRIPTIVE;
-            p->verifier = ATLAS_VERIFIER_SYMBOL_PRESENT;
-            st = atlas_buf_appendf(&p->verifier_input, err, "symbol=%s", atlas_buf_cstr(&symbol_val));
-        } else if (has_path) {
-            p->semantics = ATLAS_CLAIM_DESCRIPTIVE;
-            p->verifier = ATLAS_VERIFIER_CONTENT_HASH;
-            st = atlas_buf_appendf(&p->verifier_input, err, "path=%s;sha256=%s",
-                                   atlas_buf_cstr(&path_val), atlas_buf_cstr(&path_hash));
         } else if (has_decision) {
             p->semantics = ATLAS_CLAIM_NORMATIVE;
-            p->verifier = ATLAS_VERIFIER_NONE;
         } else {
             p->semantics = ATLAS_CLAIM_DESCRIPTIVE;
-            p->verifier = ATLAS_VERIFIER_NONE;
         }
+        p->verifier = ATLAS_VERIFIER_NONE;
+
+        /* The verifier's own grammar is `key=value;key2=value2`, parsed by
+         * atlas_verify_run_verifier's `input_field` (src/verify/detverify.c)
+         * with no escaping and no quoting -- a value containing `;` is
+         * refused there, never reinterpreted, because an escape mechanism is
+         * itself something a crafted value could exploit. A path or symbol
+         * name is untrusted, attacker-chosen text (CLAUDE.md: repository
+         * content is untrusted input; a filename is chosen by whoever can
+         * commit), so a value that cannot survive this grammar unambiguously
+         * is refused here too -- rather than filtered, which would only
+         * relocate the ambiguity, not remove it: stripping the `;` from
+         * `a;sha256=<64 zeros>` still leaves a value the verifier cannot
+         * tell apart from a legitimate `path=` field followed by a second,
+         * attacker-supplied `sha256=`. The same refusal covers a value that
+         * would push the built input over ATLAS_VERIFY_VERIFIER_INPUT_MAX --
+         * intake would refuse a claim built from it anyway, and refusing the
+         * verifier here rather than leaving it set is what keeps the
+         * proposition anchored and DESCRIPTIVE instead of becoming
+         * unsubmittable and unrecorded (A9.2.2's failure mode, one layer
+         * up). */
+        if (has_symbol && !has_byte(&symbol_val, ';')) {
+            atlas_buf tmp = ATLAS_BUF_INIT;
+            st = atlas_buf_appendf(&tmp, err, "symbol=%s", atlas_buf_cstr(&symbol_val));
+            if (st == ATLAS_OK && tmp.len <= ATLAS_VERIFY_VERIFIER_INPUT_MAX) {
+                p->verifier = ATLAS_VERIFIER_SYMBOL_PRESENT;
+                st = atlas_buf_set(&p->verifier_input, tmp.data, tmp.len, err);
+            }
+            atlas_buf_free(&tmp);
+        }
+        if (st == ATLAS_OK && p->verifier == ATLAS_VERIFIER_NONE && has_path &&
+            !has_byte(&path_val, ';') && !has_byte(&path_hash, ';')) {
+            atlas_buf tmp = ATLAS_BUF_INIT;
+            st = atlas_buf_appendf(&tmp, err, "path=%s;sha256=%s", atlas_buf_cstr(&path_val),
+                                   atlas_buf_cstr(&path_hash));
+            if (st == ATLAS_OK && tmp.len <= ATLAS_VERIFY_VERIFIER_INPUT_MAX) {
+                p->verifier = ATLAS_VERIFIER_CONTENT_HASH;
+                st = atlas_buf_set(&p->verifier_input, tmp.data, tmp.len, err);
+            }
+            atlas_buf_free(&tmp);
+        }
+
         if (st == ATLAS_OK && has_decision) {
             st = atlas_buf_set(&p->decision_uid, decision_val.data, decision_val.len, err);
         }

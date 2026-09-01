@@ -575,3 +575,44 @@ deliberately not allowed to fail the write" — yani A13'ün var olma sebebi ola
 izinlerde (mod 0400, umask 077) **sessizce** başarısız olur ve operatörün kendi
 config değişikliğinden sonra kabul edilen girdi kümesi bayat kalır. Gürültülü
 hâlinden kötüdür.
+
+---
+
+## Düzeltmenin düzeltmesi — 2026-09-01 13:25
+
+Yukarıda 7a'da iki kez atıf yaptım ve ikisi de eksikti. Doğrusu, iki ucu da
+kodla kapatılmış hâliyle:
+
+**Dışlama gerçekten sebepti, ama düşündüğüm mekanizmayla değil.**
+`src/ipc/server_scanner.c:146` `scanner.poll` cevabının `build_inputs` alanını
+`atlas_sem_accepted_inputs`'ten dolduruyor, ve `src/core/service_scanner.c:1032`
+scanner'ın aynaya tam olarak o listeyi eklediğini söylüyor — yorumuyla birlikte:
+*"The daemon names them because what belongs here is what discovery accepted,
+which is a fact it holds and this process cannot derive."* Derleme veritabanları
+yok sayılan dosyalardır, yani tracked+untracked yürüyüşü onları atlar; aynaya
+girmelerinin **tek** yolu bu listedir.
+
+Zincir:
+
+1. `--exclude nodus/build-o15e-act` yazıldı → kabul edilen küme 4'ten 3'e indi
+2. `scanner.poll` artık o veritabanını adlandırmıyor
+3. Scanner onu aynalamayı bıraktı
+4. Bir sonraki yayımda **dizin aynadan tamamen çıktı** — bugün doğrulandı:
+   `/var/lib/atlas/mirror/1/nodus/` altında `build-o15e-act` yok, ağaçta duruyor
+5. Dolayısıyla 5 `FAILED` + 1 `PARTIAL` birim gitti ve birim sayısı 1223'ten
+   838'e indi
+
+**Geçici PARTIAL de dışlamanındı, ve kendi kendini sildi.** 09:27'de dizin hâlâ
+aynadaydı, dışlama ona denk geldi ve arama doğru biçimde PARTIAL oldu — bu zaten
+`tests/test_sem_discovery.c`'deki `test_an_exclusion_makes_the_search_partial`'ın
+şart koştuğu davranış. Dizin aynadan çıkınca dışlama yürünen ağaçta hiçbir şeye
+denk gelmez oldu ve verdikt COMPLETE'e döndü. Şu an dışlama yapılandırılmış ve
+ayna yürüyüşüne karşı **etkisiz**; `build-input discovery COMPLETE`, 3 aday.
+
+**28 `.claude/worktrees` engeli ise ayrı bir sebepti** ve o kısım doğruydu:
+madde 10'un düzeltilmemiş okuma kökü. Kanıtı, o yolların aynada bulunmamasıdır —
+ayna `.claude/`'u hiç taşımıyor.
+
+**Ders, yazılıyor çünkü bugün iki kez tekrarlandı:** bir etkiyi kendi eylemime
+bağlamadan önce mekanizmayı koddan kurmadım. İki kez de "ölçtüm" dediğim şey
+eşzamanlılıktı, zincir değildi.

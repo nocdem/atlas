@@ -449,6 +449,37 @@ typedef struct atlas_memory_anchor {
 void atlas_memory_anchor_init(atlas_memory_anchor *a);
 void atlas_memory_anchor_free(atlas_memory_anchor *a);
 
+/* Why `atlas_memory_anchor_resolve` left `verifier` at `ATLAS_VERIFIER_NONE`
+ * even though a PATH or SYMBOL anchor resolved -- the anchor's own value
+ * exists, but could not be turned into a verifier input Atlas will run.
+ * That is a different fact from "no mechanical check applies to this
+ * proposition" (no PATH or SYMBOL resolved at all, or only DECISION did), and
+ * before a value could be refused this way the two were indistinguishable
+ * once `verifier` was `NONE` -- A9.2.4's rule one layer down: a candidate
+ * that cannot be used is recorded with a reason, never skipped, because a
+ * rejected candidate nobody is shown is indistinguishable from one that does
+ * not exist. UNKNOWN means "nothing was withheld", not "a reason exists but
+ * nobody recorded it" -- it is what every DECISION-only, unanchored or
+ * ordinarily-verified proposition carries. */
+typedef enum atlas_memory_verifier_withhold_reason {
+    ATLAS_MEMORY_WITHHOLD_UNKNOWN = 0,
+    /* The anchor's value contains a byte the verifier's `key=value;`
+     * grammar cannot represent without ambiguity -- today, `;`, the
+     * grammar's only segment delimiter (`src/verify/detverify.c`'s
+     * `input_field`). Filtering the byte out would only relocate the
+     * ambiguity; refusing the verifier is what keeps the anchor honestly
+     * recorded instead. */
+    ATLAS_MEMORY_WITHHOLD_GRAMMAR,
+    /* The built input (`path=...;sha256=...` or `symbol=...`) would exceed
+     * `ATLAS_VERIFY_VERIFIER_INPUT_MAX`. The anchor's own value has no
+     * length bound tied to the verifier's grammar. */
+    ATLAS_MEMORY_WITHHOLD_TOO_LONG
+} atlas_memory_verifier_withhold_reason;
+
+const char *atlas_memory_verifier_withhold_reason_name(atlas_memory_verifier_withhold_reason r);
+bool atlas_memory_verifier_withhold_reason_parse(const char *name,
+                                                 atlas_memory_verifier_withhold_reason *out);
+
 /* One candidate assertion, split from a source's bytes in document order and
  * -- once `atlas_memory_anchor_resolve` has run -- resolved against the index.
  * Owns its buffers; `_init`/`_free` pair, in the shape every owned-buffer
@@ -465,6 +496,12 @@ typedef struct atlas_memory_proposition {
     atlas_buf verifier_input;
     atlas_buf decision_uid; /* the DECISION anchor's document, when one resolved */
     bool truncated;         /* over ATLAS_MEMORY_MAX_PROPOSITION_BYTES; never trimmed */
+    /* UNKNOWN unless `verifier == ATLAS_VERIFIER_NONE` because a resolved
+     * PATH or SYMBOL anchor's value was refused rather than used -- see the
+     * type's own comment. Never set when no such anchor resolved: that case
+     * is "no mechanical check applies" and carries UNKNOWN like every other
+     * unwithheld proposition. */
+    atlas_memory_verifier_withhold_reason verifier_withheld_reason;
 } atlas_memory_proposition;
 
 void atlas_memory_proposition_init(atlas_memory_proposition *p);
@@ -490,28 +527,37 @@ void atlas_memory_proposition_free(atlas_memory_proposition *p);
  * is written in full (nothing is ever silently trimmed) with `truncated` set.
  *
  * `normalized`, `text_sha256` and `anchor_count` (zero) are set here;
- * `semantics`, `verifier`, `verifier_input` and `decision_uid` are left at
- * their zero defaults until `atlas_memory_anchor_resolve` runs. */
+ * `semantics`, `verifier`, `verifier_input`, `decision_uid` and
+ * `verifier_withheld_reason` are left at their zero defaults until
+ * `atlas_memory_anchor_resolve` runs. */
 atlas_status atlas_memory_extract(const atlas_buf *bytes, atlas_memory_proposition *out,
                                   size_t cap, size_t *count_out, bool *bound_reached_out,
                                   atlas_err *err);
 
-/* Resolves anchors against the index and assigns semantics and verifier.
- * Separate from the split precisely because the split is pure and this is
- * not: this reads `files` (via `atlas_db_verify_file_hash`, `path_text`
- * compared exactly), the compiler-derived semantic index (via
- * `atlas_db_verify_sem_symbol` -- the same read `atlas.symbol_present` itself
- * runs, which is what keeps extraction-time resolution and later
- * verification looking at the same fact), the decision store (via
- * `atlas_db_decision_find_uid`, scoped to `repo_id`) and `commits` (via
- * `atlas_db_verify_commit_exists`). Index reads only, never git.
+/* Resolves anchors against the index and assigns semantics, verifier and --
+ * when a resolved PATH or SYMBOL anchor's value could not be turned into one
+ * -- the reason the verifier was withheld. Separate from the split precisely
+ * because the split is pure and this is not: this reads `files` (via
+ * `atlas_db_verify_file_hash`, `path_text` compared exactly), the compiler-
+ * derived semantic index (via `atlas_db_verify_sem_symbol` -- the same read
+ * `atlas.symbol_present` itself runs, which is what keeps extraction-time
+ * resolution and later verification looking at the same fact), the decision
+ * store (via `atlas_db_decision_find_uid`, scoped to `repo_id`) and `commits`
+ * (via `atlas_db_verify_commit_exists`). Index reads only, never git.
+ *
+ * A proposition already over `ATLAS_MEMORY_MAX_PROPOSITION_BYTES`
+ * (`p->truncated`) is returned unscanned, resolved into nothing: it is left
+ * exactly as an unanchored proposition, because scanning up to 256 KiB of
+ * text for anchor-shaped byte runs would cost roughly one indexed read per
+ * such run inside the write transaction this is called from.
  *
  * Idempotent: it resets `p`'s anchors, `semantics`, `verifier`,
- * `verifier_input` and `decision_uid` before scanning `p->text`, so calling it
- * twice on the same proposition against the same index produces the same
- * result. A ninth resolving anchor is dropped; `anchor_count` never exceeds
- * `ATLAS_MEMORY_MAX_ANCHORS_PER_PROPOSITION` and that is the report -- nothing
- * else names the drop because the field already carries it. */
+ * `verifier_input`, `decision_uid` and `verifier_withheld_reason` before
+ * scanning `p->text`, so calling it twice on the same proposition against the
+ * same index produces the same result. A ninth resolving anchor is dropped;
+ * `anchor_count` never exceeds `ATLAS_MEMORY_MAX_ANCHORS_PER_PROPOSITION` and
+ * that is the report -- nothing else names the drop because the field already
+ * carries it. */
 atlas_status atlas_memory_anchor_resolve(atlas_db *db, int64_t repo_id, atlas_memory_proposition *p,
                                          atlas_err *err);
 

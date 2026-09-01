@@ -92,9 +92,20 @@
 
 /* The verifier input is a bounded, structured argument Atlas parses, never a
  * command and never a pattern. Its grammar is `key=value` pairs separated by
- * semicolons, with no escaping and no quoting: a value containing a semicolon
- * is refused rather than interpreted, because an escape mechanism is the
- * beginning of a parser somebody can surprise.
+ * semicolons, with no escaping and no quoting: `;` is the sole segment
+ * delimiter (`strchr(p, ';')` below) and there is no way to place one inside
+ * a value. This parser does not refuse a value containing `;` -- it silently
+ * ends that value's segment at the first one and parses whatever follows as
+ * a further `key=value` segment, so a value can forge a second field
+ * (`a;sha256=<64 zeros>` reads as `path=a` followed by an attacker-supplied
+ * `sha256=`). This function does not defend against that. The
+ * repository-fed producer, `src/memory/extract.c`, refuses to build a
+ * verifier input from a value carrying `;` at all, because relying on this
+ * parser to reject it would have been relying on behaviour it does not
+ * have -- but that refusal lives at that one producer, not here: a
+ * client-supplied input reaching `verify.claim_create` (`src/ipc/
+ * server_verify.c`) is the client's own assertion and is not defended
+ * against this grammar anywhere.
  *
  * Values are bounded and are compared, never executed and never used to build a
  * path. */

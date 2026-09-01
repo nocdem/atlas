@@ -238,6 +238,42 @@ static void test_a_known_symbol_resolves_to_symbol_present(void) {
     env_close(&e);
 }
 
+/* The same forging attack as `test_a_semicolon_in_a_path_cannot_forge_a_
+ * verifier_input` below, but through the SYMBOL branch: a symbol name is
+ * exactly as untrusted as a filename (CLAUDE.md makes no exception for the
+ * structural index), and the SYMBOL and PATH branches build their verifier
+ * inputs through separate code paths that must each refuse independently. */
+static void test_a_semicolon_in_a_symbol_cannot_forge_a_verifier_input(void) {
+    env e;
+    atlas_err err;
+    atlas_err_init(&err);
+    env_open(&e, &err);
+
+    static const char EVIL[] =
+        "helper;sha256=0000000000000000000000000000000000000000000000000000000000000000";
+    seed_symbol(&e, EVIL, &err);
+
+    char text[256];
+    (void)snprintf(text, sizeof text, "call `%s` before anything else", EVIL);
+    atlas_memory_proposition p;
+    make_prop(&p, text, &err);
+    T_OK(atlas_memory_anchor_resolve(e.db, e.repo_id, &p, &err), &err);
+
+    /* The fact is still honestly recorded. */
+    T_REQUIRE(p.anchor_count == 1);
+    T_EQ_INT((int)p.anchors[0].kind, (int)ATLAS_MEMORY_ANCHOR_SYMBOL);
+    T_EQ_STR(atlas_buf_cstr(&p.anchors[0].value), EVIL);
+    T_EQ_INT((int)p.semantics, (int)ATLAS_CLAIM_DESCRIPTIVE);
+
+    /* But no verifier is built from it, and the reason is recorded. */
+    T_EQ_INT((int)p.verifier, (int)ATLAS_VERIFIER_NONE);
+    T_CHECK(p.verifier_input.len == 0);
+    T_EQ_INT((int)p.verifier_withheld_reason, (int)ATLAS_MEMORY_WITHHOLD_GRAMMAR);
+
+    atlas_memory_proposition_free(&p);
+    env_close(&e);
+}
+
 static void test_a_token_that_is_both_path_and_symbol_gets_both_anchors(void) {
     env e;
     atlas_err err;
@@ -260,6 +296,52 @@ static void test_a_token_that_is_both_path_and_symbol_gets_both_anchors(void) {
     T_CHECK(saw_symbol);
     /* Decision 4: SYMBOL present wins the claim's own semantics/verifier. */
     T_EQ_INT((int)p.verifier, (int)ATLAS_VERIFIER_SYMBOL_PRESENT);
+
+    atlas_memory_proposition_free(&p);
+    env_close(&e);
+}
+
+/* A withheld SYMBOL that is then superseded by a working PATH verifier is not
+ * "withheld" from `verifier_withheld_reason`'s point of view -- the
+ * proposition still got a mechanical check, just not the one SYMBOL would
+ * have used. Two distinct tokens, one resolving only as SYMBOL (`;`-carrying,
+ * so it cannot become a verifier input) and one resolving only as PATH (clean),
+ * pins the precedence rule this fix's restructuring depends on: SYMBOL's
+ * refusal must not stop PATH's branch from running. */
+static void test_a_withheld_symbol_does_not_block_a_working_path_verifier(void) {
+    env e;
+    atlas_err err;
+    atlas_err_init(&err);
+    env_open(&e, &err);
+
+    static const char EVIL_SYMBOL[] =
+        "bad;sha256=0000000000000000000000000000000000000000000000000000000000000000";
+    seed_symbol(&e, EVIL_SYMBOL, &err);
+    seed_file(&e, "clean/path.c",
+              "4444444444444444444444444444444444444444444444444444444444444444", &err);
+
+    char text[320];
+    (void)snprintf(text, sizeof text, "reads `%s` and then `clean/path.c`", EVIL_SYMBOL);
+    atlas_memory_proposition p;
+    make_prop(&p, text, &err);
+    T_OK(atlas_memory_anchor_resolve(e.db, e.repo_id, &p, &err), &err);
+
+    T_REQUIRE(p.anchor_count == 2);
+    bool saw_path = false, saw_symbol = false;
+    for (size_t i = 0; i < p.anchor_count; i++) {
+        if (p.anchors[i].kind == ATLAS_MEMORY_ANCHOR_PATH) saw_path = true;
+        if (p.anchors[i].kind == ATLAS_MEMORY_ANCHOR_SYMBOL) saw_symbol = true;
+    }
+    T_CHECK(saw_path);
+    T_CHECK(saw_symbol);
+
+    /* SYMBOL was withheld, but PATH still built a real verifier -- so the
+     * proposition is not left without a mechanical check, and
+     * verifier_withheld_reason stays UNKNOWN because *a* verifier applies,
+     * even though it is not the one SYMBOL would have used. */
+    T_EQ_INT((int)p.verifier, (int)ATLAS_VERIFIER_CONTENT_HASH);
+    T_CHECK(p.verifier_input.len > 0);
+    T_EQ_INT((int)p.verifier_withheld_reason, (int)ATLAS_MEMORY_WITHHOLD_UNKNOWN);
 
     atlas_memory_proposition_free(&p);
     env_close(&e);
@@ -531,6 +613,11 @@ static void test_a_semicolon_in_a_path_cannot_forge_a_verifier_input(void) {
      * DESCRIPTIVE and anchored rather than vanished. */
     T_EQ_INT((int)p.verifier, (int)ATLAS_VERIFIER_NONE);
     T_CHECK(p.verifier_input.len == 0);
+    /* The reason is recorded, not merely derivable: "no mechanical check
+     * applies" and "Atlas declined to run one because the path's own bytes
+     * could have steered it" are different facts, and before this fix
+     * nothing distinguished them once verifier == NONE. */
+    T_EQ_INT((int)p.verifier_withheld_reason, (int)ATLAS_MEMORY_WITHHOLD_GRAMMAR);
 
     atlas_memory_proposition_free(&p);
     env_close(&e);
@@ -598,6 +685,7 @@ static void test_an_adversarial_filename_scanned_for_real_cannot_forge_a_verdict
      * produce a CONTENT_HASH check against the wrong sixty-four zeros. */
     T_EQ_INT((int)p.verifier, (int)ATLAS_VERIFIER_NONE);
     T_CHECK(p.verifier_input.len == 0);
+    T_EQ_INT((int)p.verifier_withheld_reason, (int)ATLAS_MEMORY_WITHHOLD_GRAMMAR);
 
     atlas_memory_proposition_free(&p);
     atlas_repo_info_free(&info);
@@ -677,6 +765,11 @@ static void test_an_oversized_verifier_input_falls_back_to_no_verifier(void) {
     T_EQ_INT((int)p.semantics, (int)ATLAS_CLAIM_DESCRIPTIVE);
     T_EQ_INT((int)p.verifier, (int)ATLAS_VERIFIER_NONE);
     T_CHECK(p.verifier_input.len == 0);
+    /* The length refusal and the grammar refusal are different reasons and
+     * must not be conflated: this proposition's path carries no `;`
+     * anywhere, so the recorded reason must be the length one, not the one
+     * the semicolon tests above exercise. */
+    T_EQ_INT((int)p.verifier_withheld_reason, (int)ATLAS_MEMORY_WITHHOLD_TOO_LONG);
 
     atlas_memory_proposition_free(&p);
     atlas_buf_free(&text);
@@ -705,6 +798,10 @@ static void test_a_truncated_proposition_skips_resolution(void) {
     T_EQ_INT((int)p.anchor_count, 0);
     T_EQ_INT((int)p.semantics, (int)ATLAS_CLAIM_DESCRIPTIVE);
     T_EQ_INT((int)p.verifier, (int)ATLAS_VERIFIER_NONE);
+    /* Nothing was withheld here -- resolution never ran at all, so this is
+     * "no mechanical check applies", not a refusal, and must not carry a
+     * reason meant for the other case. */
+    T_EQ_INT((int)p.verifier_withheld_reason, (int)ATLAS_MEMORY_WITHHOLD_UNKNOWN);
 
     atlas_memory_proposition_free(&p);
     env_close(&e);
@@ -791,8 +888,12 @@ static const atlas_test TESTS[] = {
     {"a nonexistent path resolves no anchor", test_a_nonexistent_path_resolves_no_anchor},
     {"pure prose resolves no anchor", test_pure_prose_resolves_no_anchor},
     {"a known symbol resolves to SYMBOL_PRESENT", test_a_known_symbol_resolves_to_symbol_present},
+    {"a semicolon in a symbol cannot forge a verifier input",
+     test_a_semicolon_in_a_symbol_cannot_forge_a_verifier_input},
     {"a token that is both a path and a symbol gets both anchors",
      test_a_token_that_is_both_path_and_symbol_gets_both_anchors},
+    {"a withheld symbol does not block a working path verifier",
+     test_a_withheld_symbol_does_not_block_a_working_path_verifier},
     {"a decision uid alone is NORMATIVE", test_a_decision_uid_alone_is_normative},
     {"a decision plus a path is DESCRIPTIVE with decision_uid set",
      test_a_decision_plus_a_path_is_descriptive_with_decision_uid_set},

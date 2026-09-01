@@ -36,6 +36,7 @@ static void test_unknown_is_zero_in_every_vocabulary(void) {
     T_EQ_INT((int)ATLAS_MEMORY_ANCHOR_UNKNOWN, 0);
     T_EQ_INT((int)ATLAS_MEMORY_PACK_UNKNOWN, 0);
     T_EQ_INT((int)ATLAS_MEMORY_CAUSE_UNKNOWN, 0);
+    T_EQ_INT((int)ATLAS_MEMORY_WITHHOLD_UNKNOWN, 0);
 }
 
 static void test_the_zero_member_is_named_unknown_and_never_parses(void) {
@@ -50,12 +51,14 @@ static void test_the_zero_member_is_named_unknown_and_never_parses(void) {
     T_EQ_STR(atlas_memory_anchor_kind_name(ATLAS_MEMORY_ANCHOR_UNKNOWN), "UNKNOWN");
     T_EQ_STR(atlas_memory_pack_status_name(ATLAS_MEMORY_PACK_UNKNOWN), "UNKNOWN");
     T_EQ_STR(atlas_memory_gen_cause_name(ATLAS_MEMORY_CAUSE_UNKNOWN), "UNKNOWN");
+    T_EQ_STR(atlas_memory_verifier_withhold_reason_name(ATLAS_MEMORY_WITHHOLD_UNKNOWN), "UNKNOWN");
 
     atlas_memory_source_class cls = ATLAS_MEMORY_SOURCE_REPO_FILE;
     atlas_memory_diff_kind diff = ATLAS_MEMORY_DIFF_ADDED;
     atlas_memory_anchor_kind anchor = ATLAS_MEMORY_ANCHOR_PATH;
     atlas_memory_pack_status pack = ATLAS_MEMORY_PACK_CURRENT;
     atlas_memory_gen_cause cause = ATLAS_MEMORY_CAUSE_COMMIT;
+    atlas_memory_verifier_withhold_reason withhold = ATLAS_MEMORY_WITHHOLD_GRAMMAR;
 
     T_CHECK_MSG(!atlas_memory_source_class_parse("UNKNOWN", &cls),
                 "the source class parser accepted the zero member's name");
@@ -67,6 +70,8 @@ static void test_the_zero_member_is_named_unknown_and_never_parses(void) {
                 "the pack status parser accepted the zero member's name");
     T_CHECK_MSG(!atlas_memory_gen_cause_parse("UNKNOWN", &cause),
                 "the gen cause parser accepted the zero member's name");
+    T_CHECK_MSG(!atlas_memory_verifier_withhold_reason_parse("UNKNOWN", &withhold),
+                "the withhold reason parser accepted the zero member's name");
 
     /* A refused parse leaves the caller's variable alone, so a caller that
      * ignored the return value is not handed a member it never asked for. */
@@ -75,6 +80,7 @@ static void test_the_zero_member_is_named_unknown_and_never_parses(void) {
     T_EQ_INT((int)anchor, (int)ATLAS_MEMORY_ANCHOR_PATH);
     T_EQ_INT((int)pack, (int)ATLAS_MEMORY_PACK_CURRENT);
     T_EQ_INT((int)cause, (int)ATLAS_MEMORY_CAUSE_COMMIT);
+    T_EQ_INT((int)withhold, (int)ATLAS_MEMORY_WITHHOLD_GRAMMAR);
 }
 
 /* --- round trips ---------------------------------------------------------- */
@@ -194,6 +200,27 @@ static void test_every_gen_cause_round_trips(void) {
     atlas_memory_gen_cause got = ATLAS_MEMORY_CAUSE_UNKNOWN;
     T_CHECK(!atlas_memory_gen_cause_parse("commit", &got));
     T_CHECK(!atlas_memory_gen_cause_parse(NULL, &got));
+}
+
+static void test_every_verifier_withhold_reason_round_trips(void) {
+    static const struct {
+        atlas_memory_verifier_withhold_reason r;
+        const char *name;
+    } CASES[] = {
+        {ATLAS_MEMORY_WITHHOLD_GRAMMAR, "GRAMMAR"},
+        {ATLAS_MEMORY_WITHHOLD_TOO_LONG, "TOO_LONG"},
+    };
+    for (size_t i = 0; i < sizeof CASES / sizeof CASES[0]; i++) {
+        T_EQ_STR(atlas_memory_verifier_withhold_reason_name(CASES[i].r), CASES[i].name);
+        atlas_memory_verifier_withhold_reason got = ATLAS_MEMORY_WITHHOLD_UNKNOWN;
+        T_CHECK_MSG(atlas_memory_verifier_withhold_reason_parse(CASES[i].name, &got),
+                    "\"%s\" did not parse", CASES[i].name);
+        T_EQ_INT((int)got, (int)CASES[i].r);
+        T_EQ_STR(atlas_memory_verifier_withhold_reason_name(got), CASES[i].name);
+    }
+    atlas_memory_verifier_withhold_reason got = ATLAS_MEMORY_WITHHOLD_UNKNOWN;
+    T_CHECK(!atlas_memory_verifier_withhold_reason_parse("grammar", &got));
+    T_CHECK(!atlas_memory_verifier_withhold_reason_parse(NULL, &got));
 }
 
 /* --- who reads the bytes -------------------------------------------------- */
@@ -638,6 +665,8 @@ static const atlas_test TESTS[] = {
     {"every anchor kind round trips", test_every_anchor_kind_round_trips},
     {"every pack status round trips", test_every_pack_status_round_trips},
     {"every generation cause round trips", test_every_gen_cause_round_trips},
+    {"every verifier withhold reason round trips",
+     test_every_verifier_withhold_reason_round_trips},
     {"is_repo is true for exactly the two repository classes",
      test_is_repo_is_true_for_exactly_the_two_repo_classes},
     {"the value grammar accepts exactly what it should",

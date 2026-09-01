@@ -175,6 +175,33 @@ bool atlas_memory_anchor_kind_parse(const char *name, atlas_memory_anchor_kind *
     return false;
 }
 
+/* --- why a mechanical verifier was withheld from an anchored proposition --- */
+
+const char *atlas_memory_verifier_withhold_reason_name(atlas_memory_verifier_withhold_reason r) {
+    switch (r) {
+    case ATLAS_MEMORY_WITHHOLD_GRAMMAR: return "GRAMMAR";
+    case ATLAS_MEMORY_WITHHOLD_TOO_LONG: return "TOO_LONG";
+    case ATLAS_MEMORY_WITHHOLD_UNKNOWN: break;
+    }
+    return "UNKNOWN";
+}
+
+bool atlas_memory_verifier_withhold_reason_parse(const char *name,
+                                                 atlas_memory_verifier_withhold_reason *out) {
+    if (name == NULL) {
+        return false;
+    }
+    if (strcmp(name, "GRAMMAR") == 0) {
+        *out = ATLAS_MEMORY_WITHHOLD_GRAMMAR;
+        return true;
+    }
+    if (strcmp(name, "TOO_LONG") == 0) {
+        *out = ATLAS_MEMORY_WITHHOLD_TOO_LONG;
+        return true;
+    }
+    return false;
+}
+
 /* --- whether a frozen pack still describes the world ----------------------- */
 
 const char *atlas_memory_pack_status_name(atlas_memory_pack_status s) {

@@ -76,8 +76,10 @@ void atlas_memory_proposition_init(atlas_memory_proposition *p) {
     }
     atlas_buf_init(&p->verifier_input);
     atlas_buf_init(&p->decision_uid);
-    /* semantics == ATLAS_CLAIM_DESCRIPTIVE and verifier == ATLAS_VERIFIER_NONE
-     * fall out of the memset above -- both are zero, per the house rule. */
+    /* semantics == ATLAS_CLAIM_DESCRIPTIVE, verifier == ATLAS_VERIFIER_NONE
+     * and verifier_withheld_reason == ATLAS_MEMORY_WITHHOLD_UNKNOWN all fall
+     * out of the memset above -- every one of them is zero, per the house
+     * rule. */
 }
 
 void atlas_memory_proposition_free(atlas_memory_proposition *p) {
@@ -436,6 +438,7 @@ atlas_status atlas_memory_anchor_resolve(atlas_db *db, int64_t repo_id, atlas_me
     p->anchor_count = 0;
     p->semantics = ATLAS_CLAIM_DESCRIPTIVE;
     p->verifier = ATLAS_VERIFIER_NONE;
+    p->verifier_withheld_reason = ATLAS_MEMORY_WITHHOLD_UNKNOWN;
     atlas_buf_reset(&p->verifier_input);
     atlas_buf_reset(&p->decision_uid);
 
@@ -595,42 +598,109 @@ atlas_status atlas_memory_anchor_resolve(atlas_db *db, int64_t repo_id, atlas_me
 
         /* The verifier's own grammar is `key=value;key2=value2`, parsed by
          * atlas_verify_run_verifier's `input_field` (src/verify/detverify.c)
-         * with no escaping and no quoting -- a value containing `;` is
-         * refused there, never reinterpreted, because an escape mechanism is
-         * itself something a crafted value could exploit. A path or symbol
-         * name is untrusted, attacker-chosen text (CLAUDE.md: repository
-         * content is untrusted input; a filename is chosen by whoever can
-         * commit), so a value that cannot survive this grammar unambiguously
-         * is refused here too -- rather than filtered, which would only
-         * relocate the ambiguity, not remove it: stripping the `;` from
+         * with no escaping and no quoting: `;` is the grammar's sole segment
+         * delimiter, and `input_field` does not refuse a value that contains
+         * one -- it silently ends that value's segment early and starts
+         * parsing a new `key=value` pair from whatever follows, which is
+         * exactly how `a;sha256=<64 zeros>` would read as `path=a` followed
+         * by an attacker-supplied `sha256=`. A path or symbol name is
+         * untrusted, attacker-chosen text (CLAUDE.md: repository content is
+         * untrusted input; a filename is chosen by whoever can commit), so a
+         * value that cannot survive this grammar unambiguously is refused
+         * here -- rather than filtered, which would only relocate the
+         * ambiguity, not remove it: stripping the `;` from
          * `a;sha256=<64 zeros>` still leaves a value the verifier cannot
          * tell apart from a legitimate `path=` field followed by a second,
-         * attacker-supplied `sha256=`. The same refusal covers a value that
-         * would push the built input over ATLAS_VERIFY_VERIFIER_INPUT_MAX --
-         * intake would refuse a claim built from it anyway, and refusing the
-         * verifier here rather than leaving it set is what keeps the
-         * proposition anchored and DESCRIPTIVE instead of becoming
-         * unsubmittable and unrecorded (A9.2.2's failure mode, one layer
-         * up). */
-        if (has_symbol && !has_byte(&symbol_val, ';')) {
-            atlas_buf tmp = ATLAS_BUF_INIT;
-            st = atlas_buf_appendf(&tmp, err, "symbol=%s", atlas_buf_cstr(&symbol_val));
-            if (st == ATLAS_OK && tmp.len <= ATLAS_VERIFY_VERIFIER_INPUT_MAX) {
-                p->verifier = ATLAS_VERIFIER_SYMBOL_PRESENT;
-                st = atlas_buf_set(&p->verifier_input, tmp.data, tmp.len, err);
+         * attacker-supplied `sha256=`.
+         *
+         * The same refusal covers a value that would push the built input
+         * over ATLAS_VERIFY_VERIFIER_INPUT_MAX. Nothing downstream of this
+         * function enforces that bound on this path: `src/verify/intake.c`
+         * -- which T8 calls directly, not through MCP -- never checks
+         * `verifier_input`'s length; the 2048-byte check in
+         * `src/mcp/mcp_tools.c` guards only the MCP argument parser, which
+         * this path does not go through. Left unchecked here, an over-long
+         * input would be stored and would then fail at verification time
+         * inside `input_field` itself, reporting UNAVAILABLE with nothing
+         * saying length was the reason.
+         *
+         * ATLAS_VERIFY_VERIFIER_INPUT_MAX (2048) is necessary here but not
+         * sufficient: the constant this check compares against is not the
+         * constant that actually bites at verification time. `input_field`'s
+         * real consumer is `char arg_a[512]` (`detverify.c`), and
+         * `input_field` refuses rather than truncates at `vlen >= out_size`
+         * -- so a resolving path between roughly 500 and 1970 bytes still
+         * passes this 2048 check, is stored, and is then permanently
+         * UNAVAILABLE with "supplies neither completely" rather than
+         * anything naming its length. That gap is not closed here (it
+         * predates this fix and this task does not change verifier
+         * behaviour); a caller of this field should not read
+         * `verifier != NONE` as proof the stored input is one
+         * `atlas_verify_run_verifier` can actually consume.
+         *
+         * Refusing the verifier here rather than leaving it set is what
+         * keeps the proposition anchored and DESCRIPTIVE instead of
+         * becoming unsubmittable and unrecorded (A9.2.2's failure mode, one
+         * layer up) -- and which of the two refusals applied is recorded in
+         * `verifier_withheld_reason` rather than left for a reader to
+         * re-derive from `anchor_count > 0 && verifier == NONE`, which
+         * cannot tell this refusal apart from "no mechanical check applies
+         * at all" (A9.2.4's rule one layer down: a candidate that cannot be
+         * used is recorded with a reason, never skipped). */
+        atlas_memory_verifier_withhold_reason symbol_withhold = ATLAS_MEMORY_WITHHOLD_UNKNOWN;
+        atlas_memory_verifier_withhold_reason path_withhold = ATLAS_MEMORY_WITHHOLD_UNKNOWN;
+
+        if (has_symbol) {
+            if (has_byte(&symbol_val, ';')) {
+                symbol_withhold = ATLAS_MEMORY_WITHHOLD_GRAMMAR;
+            } else {
+                atlas_buf tmp = ATLAS_BUF_INIT;
+                st = atlas_buf_appendf(&tmp, err, "symbol=%s", atlas_buf_cstr(&symbol_val));
+                if (st == ATLAS_OK) {
+                    if (tmp.len <= ATLAS_VERIFY_VERIFIER_INPUT_MAX) {
+                        p->verifier = ATLAS_VERIFIER_SYMBOL_PRESENT;
+                        st = atlas_buf_set(&p->verifier_input, tmp.data, tmp.len, err);
+                    } else {
+                        symbol_withhold = ATLAS_MEMORY_WITHHOLD_TOO_LONG;
+                    }
+                }
+                atlas_buf_free(&tmp);
             }
-            atlas_buf_free(&tmp);
         }
-        if (st == ATLAS_OK && p->verifier == ATLAS_VERIFIER_NONE && has_path &&
-            !has_byte(&path_val, ';') && !has_byte(&path_hash, ';')) {
-            atlas_buf tmp = ATLAS_BUF_INIT;
-            st = atlas_buf_appendf(&tmp, err, "path=%s;sha256=%s", atlas_buf_cstr(&path_val),
-                                   atlas_buf_cstr(&path_hash));
-            if (st == ATLAS_OK && tmp.len <= ATLAS_VERIFY_VERIFIER_INPUT_MAX) {
-                p->verifier = ATLAS_VERIFIER_CONTENT_HASH;
-                st = atlas_buf_set(&p->verifier_input, tmp.data, tmp.len, err);
+        if (st == ATLAS_OK && p->verifier == ATLAS_VERIFIER_NONE && has_path) {
+            if (has_byte(&path_val, ';') || has_byte(&path_hash, ';')) {
+                path_withhold = ATLAS_MEMORY_WITHHOLD_GRAMMAR;
+            } else {
+                atlas_buf tmp = ATLAS_BUF_INIT;
+                st = atlas_buf_appendf(&tmp, err, "path=%s;sha256=%s", atlas_buf_cstr(&path_val),
+                                       atlas_buf_cstr(&path_hash));
+                if (st == ATLAS_OK) {
+                    if (tmp.len <= ATLAS_VERIFY_VERIFIER_INPUT_MAX) {
+                        p->verifier = ATLAS_VERIFIER_CONTENT_HASH;
+                        st = atlas_buf_set(&p->verifier_input, tmp.data, tmp.len, err);
+                    } else {
+                        path_withhold = ATLAS_MEMORY_WITHHOLD_TOO_LONG;
+                    }
+                }
+                atlas_buf_free(&tmp);
             }
-            atlas_buf_free(&tmp);
+        }
+
+        /* SYMBOL takes precedence for the reason exactly as it does for
+         * which verifier gets built: when both anchors resolved and both
+         * were withheld, the recorded reason is the one that applied to the
+         * higher-precedence check. A SYMBOL withheld and then superseded by
+         * a PATH anchor that *did* build a verifier is not withholding at
+         * all from this field's point of view -- the proposition got a
+         * mechanical check, just not the one SYMBOL would have used, which
+         * the T7 re-review records as a documented residual rather than
+         * something this field represents. */
+        if (st == ATLAS_OK && p->verifier == ATLAS_VERIFIER_NONE) {
+            if (has_symbol && symbol_withhold != ATLAS_MEMORY_WITHHOLD_UNKNOWN) {
+                p->verifier_withheld_reason = symbol_withhold;
+            } else if (has_path && path_withhold != ATLAS_MEMORY_WITHHOLD_UNKNOWN) {
+                p->verifier_withheld_reason = path_withhold;
+            }
         }
 
         if (st == ATLAS_OK && has_decision) {

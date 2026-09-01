@@ -347,3 +347,171 @@ değiştirir). Ölçek gönderimden ağaca indi: dna 2.271 dosya / ~1,3 sn.
 **Ölçülmedi:** uçtan uca tasarruf, iki ardışık geçiş gerektirdiği için ancak
 kurulumdan sonra görülür. `bash /opt/atlas/deploy.local.sh`, sonra scanner
 günlüğünde `mirrored 23435 (23400 carried)` biçiminde bir satır beklenir.
+
+---
+
+## Durum — 2026-09-01 12:30
+
+Dokuz maddenin hepsi canlı duruma karşı yeniden ölçüldü. Gövdeler silinmedi;
+aşağısı o gövdelerin bugünkü karşılığıdır. Bir de yeni bir madde açıldı (10).
+
+### Uçtan uca tasarruf ölçüldü — 28 Ağustos'un "ölçülmedi" notu kapandı
+
+`60756e5` + `d258f69` kurulu (`/usr/local/bin/atlas`, Build ID `77e74763…`,
+`build/atlas` ile aynı; tek fark install sırasında çıkarılan RPATH).
+
+| | Önce (28 Ağu) | Şimdi (ömür ort., 82,6 sa) |
+| --- | --- | --- |
+| daemon | %69,5 | **%7,9** |
+| scanner | %7,6 | **%0,65** |
+
+Beklenen günlük satırı geldi: `atlas mirrored 5104 (5104 carried)`,
+`dna mirrored 23425 (23424 carried)`.
+
+Ömür ortalaması bu sabahki ~30 dakikalık yeniden kurulum bloğunu **içerir**.
+Kararlı hâl ondan düşük: 5 dakikalık örneklemde %3,2 (94 örneğin 90'ı %15 altı),
+tek nokta ölçümlerde %1,5.
+
+### Madde madde
+
+| # | Bugünkü hâl | Kanıt |
+| --- | --- | --- |
+| 1 | **Kapandı** | Scanner ömür ort. %0,65. Gövdedeki kod iddiası ("kuşak her geçişte boş başlıyor, `put_file` koşulsuz") `60756e5`+`d258f69` ile geçersizleşti |
+| 2 | Kapandı (28 Ağu) | `bb5df17` kurulu |
+| 3 | **Açık, bugün yeniden ölçüldü** | Aşağıya bakın |
+| 4 | Kapandı (28 Ağu) | Kök neden keşif tavanıydı |
+| 5 | **Açık ve ilk kez anlamlı** | Aşağıya bakın |
+| 6 | Açık, üçü de | Şemada principal kolonu hâlâ yok |
+| 7a | **Yeri bulundu, Atlas tarafı kapatıldı** | Aşağıya bakın |
+| 7b | Kapandı (28 Ağu) | İki ayrı sayaç, gerileme değil |
+| 8 | **Kapandı** | `0db5387` çalışan binary'de. Gövde hâlâ "çözülmedi" diyor; onu düzelten şey bu nottur. Canlı `systemctl stop` denenmedi |
+| 9 | **Kapandı** | `atlas-scanner.service` kurulu, `enabled`, 3 gündür `active (running)` |
+
+### 3 — hâlâ açık, mekanizma değişmedi
+
+```
+reconciled dna generation 24827: 2274 examined, 2274 hashed,
+0 unchanged by identity, +0 ~0 -0, 0 commits, 1343 ms
+```
+
+Ayna yayımlanmayan turlarda aynı depo `420 examined, 0 hashed, 420 unchanged by
+identity` veriyor — yani neden tam da gövdede yazdığı gibi: yayım her dosyanın
+inode'unu değiştiriyor. Gövdenin "sabit bağ bunu çözmez, `link()` ctime'ı
+değiştirir" öngörüsü **doğrulandı**: `d258f69` sabit bağ kullanıyor ve
+`0 unchanged by identity` duruyor.
+
+Bedel 19 864 ms → ~1 350 ms indi, sıfırlanmadı: her ~2,5 dakikada 2 694 dosya
+(atlas 420 + dna 2274).
+
+### 5 — bugün ilk kez gerçekten açıldı
+
+Gövde "1 numara çözülmeden watcher'ı taşımak anlamsız" diyordu. 1 numara
+çözüldü. Değerlendirme artık geçerli değil; madde yeniden değerlendirilmeyi
+hak ediyor.
+
+### 7a — yeri tam olarak bulundu, Atlas tarafı kapatıldı
+
+`nodus/build-o15e-act/compile_commands.json` (20 Ağustos'tan kalma bayat build
+ağacı) artık var olmayan **beş** dosya adlandırıyor:
+
+```
+nodus/src/witness/nodus_witness_v2_activation.c
+nodus/src/witness/nodus_witness_v2_seam.c
+nodus/tests/test_v2_activation.c
+nodus/tests/test_v2_seam.c
+shared/dnac/activation_wire.c
+```
+
+Bunlar dna'nın semantik indeksindeki tam olarak o beş `FAILED` birim
+(`compiler_produced_no_translation_unit`). Diğer üç veritabanı temiz:
+dnac 61/0, messenger 373/0, nodus/build 404/0 (girdi/eksik).
+
+**Dışlamadan önce ölçüldü — kapsam kaybı sıfır.** `build-o15e-act` 366 ayrı
+dosya adlandırıyor, diğer üçü 616. Yalnızca `build-o15e-act`'te olan dosya
+sayısı **beş**, ve beşinin de var olanı **sıfır**.
+
+Uygulandı: `atlas code sem-config dna --exclude nodus/build-o15e-act`.
+Yazma iki kez `BUSY` aldı (A9.2.6 sözleşmesi: hiçbir şey kuyruğa girmedi),
+üçüncüde kabul edildi. Geri okundu: pinlenen iki veritabanı ve `messenger/tests`
+test kökü **korundu** (`--exclude` yalnızca kendi listesini yazıyor;
+`cli.c`'deki `*_given` bayrakları).
+
+**Sonuç ölçüldü, kuşak 615.** Yazmadan önceki tahminim "altıncı birim
+(`PARTIAL nodus/tests/test_v2_restart_gate.c`) etkilenmez" idi; **yanlıştı**.
+
+| | Kuşak 614 (önce) | Kuşak 615 (sonra) |
+| --- | --- | --- |
+| çeviri birimi | 1223 | **838** |
+| complete | 1217 | **838** |
+| failed | 5 | **0** |
+| partial | 1 | **0** |
+
+Birim sayısındaki 385'lik düşüş `build-o15e-act`'in girdi sayısıdır: birim
+`(dosya, veritabanı)` çiftidir, dosya değil, yani 380 dosya iki kez değil bir kez
+derleniyor. Her geçiş yaklaşık **%31 ucuzladı** — daemon'un en büyük tekrarlayan
+masrafı bu.
+
+**Ama bir boşluk diğeriyle takas edildi ve bu iddia edilmemelidir.**
+`build-input discovery` **COMPLETE** iken **PARTIAL** oldu:
+`incomplete because an operator excluded a subtree from the search`. A9.2.4'ün
+disiplini bu — sınırlı arama evreni verdiktin yanında raporlanır — ama
+`ATLAS_COVDIM_BUILD_INPUT_DISCOVERY` her olumsuz doğrulayıcının dayanağıdır, yani
+`supports an absence` **yine `no`**, bu sefer başka sebeple ve sebep **operatörün
+kendi tercihi**.
+
+**Temiz çözüm, uygulanmadı çünkü operatör kararı:** dışlamayı geri al
+(`--no-excludes`) ve bayat `/opt/dna/nodus/build-o15e-act/` dizinini sil. O zaman
+hem beş hayalet birim gider hem keşif COMPLETE kalır. Silme `/opt/dna` tarafında
+bir karardır ve Atlas hiçbir hedef depoyu değiştirmez.
+
+**Yeniden okunmayı bekleyen bir değer.** Kuşak 615 `scope discovery UNKNOWN` ve
+`gap: the_generation_recorded_no_coverage_manifest` diyor; kuşak 614 `DECLARED`
+ve `616 of 813` diyordu. Yayımı yeni bitmiş bir kuşağın geçici hâli gibi duruyor
+(`holding: a_generation_is_already_being_built`), ama **doğrulanmadı**: /opt/dna
+üzerinde eşzamanlı çalışma sürdüğü için oturmuş bir kuşak beklenemedi. dna
+sakinleştiğinde `code sem-status dna` bir kez daha okunmalı.
+
+---
+
+## 10. Semantik katman aynayı hiç bilmiyor — YENİ, 2026-09-01
+
+**Ölçüldü.** `dna` için `code sem-config` çıktısı, keşif yürüyüşünün derinlik
+tavanına çarptığı 28 dizin adlandırıyor, hepsi şu biçimde:
+
+```
+.claude/worktrees/agent-<id>/messenger/dna_messenger_flutter/android/app/src/
+  main/kotlin/io/cpunk/dna_connect  [the_walk_reached_its_depth_ceiling_below_this_directory]
+```
+
+artı girilemeyen üç dizin (`Testing/stress_wallets`, `nodus/.cache`,
+`nodus/build/.cache`). `last walked` o okumadan iki dakika önce.
+
+**Zincir.** `.claude/` `/opt/dna/.gitignore:86`'da yok sayılıyor, dolayısıyla
+aynada **yok** — aynanın `.git` dışı dosya kümesini git'in tracked+untracked
+kümesiyle karşılaştırdım: 2278'e 2274, fark tam olarak dört `compile_commands.json`,
+`.claude` altında tek dosya yok. O hâlde bu engelleri üreten yürüyüş
+`/opt/dna`'yı okudu, aynayı değil. `/opt/dna` `drwxrwxr-x nocdem:cpunk-team`,
+yani `o+rx`; daemon `uid=994(atlasd)` ve `cpunk-team`'de değil ama dünya izniyle
+okuyabiliyor. Kaynak tarafı doğruluyor: **`src/sem/` içinde "mirror" dizesi hiç
+geçmiyor**, ve `src/sem/index.c` derleme veritabanlarını `repo->root_path`
+üzerinden `open` ediyor.
+
+**Neden önemli.** CLAUDE.md'nin A13 kuralı "daemon ağacı okumaz; scanner
+adlandıran bir depo aynasından ve **başka hiçbir şeyden** okunur" diyor ve
+yalnızca iki istisna adlandırıyor: `src/orch/rundriver.c` ile
+`src/orch/snapshot.c`. `src/sem/` bu listede yok. Burada çalışıyor olmasının
+sebebi `/opt/dna`'nın dünyaya okunur olması — yani A13'ün var olma sebebi olan
+senaryoda (mod 0400 nesneler, umask 077) reconcile başarılı olurken semantik
+katman başarısız olurdu.
+
+**Bugün gözlenen ikinci dereceden bedeli.** `/opt/dna/.claude/worktrees` altında
+42 ajan worktree'si var: **87 140 dosya, 7,0 GB**. Ayna bunları bilerek dışarıda
+bırakıyor; keşif yürüyüşü ise her turda içlerinde geziniyor ve derinlik tavanını
+onlara harcıyor.
+
+**Ölçülmedi:** bu, sabahki `a_compilation_database_changed` tekrarlarına katkıda
+bulunuyor mu. Ayrım şu testle gelir: iki ayna yayımı arasında `compdb digest`
+değişiyor mu.
+
+**Düzeltme yazılmadı.** Semantik katmanı aynaya bağlamak A13'ün kapsamını
+genişletir ve kendi tasarımını hak ediyor; burada yalnızca ölçüm var.

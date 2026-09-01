@@ -193,6 +193,14 @@ set(ATLAS_TESTS
   # and the filesystem, so it is "integration" beside test_mirror_source
   # rather than "unit" beside the two pure-function suites above.
   test_memory_reconcile
+  # T7's split: bytes in, propositions out, nothing that moves consulted --
+  # pure, so it belongs in the fast subset beside test_memory_source.
+  test_memory_extract
+  # T7's anchor resolution reads a real index (files, the semantic index, the
+  # decision store, commits), so it needs a fixture database and is
+  # "integration" beside test_verify_engine, which builds its fixtures the
+  # same way.
+  test_memory_anchor
   # --- P0: the large-repository watcher ---
   #
   # The budget, its accounting and the bound each refusal names, driven against a
@@ -272,11 +280,11 @@ set_tests_properties(test_registry PROPERTIES LABELS "daemon")
 set_tests_properties(test_ops PROPERTIES LABELS "daemon")
 set_tests_properties(test_scan test_search test_diff test_worktree test_cli test_terminal test_code_graph test_code_compdb
   test_code_analyzer test_git_hardening test_reconcile test_repo_scanner test_scanner_rpc test_mirror_source
-  test_memory_reconcile
+  test_memory_reconcile test_memory_anchor
   PROPERTIES LABELS "integration")
 set_tests_properties(test_core test_safetext test_proc test_git_parse test_db test_datadir
   test_lock test_ipc test_migrate3 test_migrate_scanner_uid test_scanner_uid test_mirror test_unit
-  test_memory_source test_migrate29
+  test_memory_source test_migrate29 test_memory_extract
   PROPERTIES LABELS "unit")
 # The fixture suite forks children that run the binary, but needs no repository,
 # no database and no daemon.

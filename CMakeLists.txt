@@ -372,6 +372,10 @@ add_library(atlas_core STATIC
   # asking A13's own routing (atlas_repo_open_git) rather than restating it —
   # it never opens a registered tree itself and never falls back to one.
   src/memory/read.c
+  # `extract.c` (T7) splits a source's bytes into candidate propositions —
+  # pure, `src/orch/memory.c`'s discipline — and resolves their anchors
+  # against the index, which is the impure half T8's write transaction calls.
+  src/memory/extract.c
   ${ATLAS_UI_GEN}
 )
 

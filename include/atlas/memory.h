@@ -55,6 +55,11 @@
 
 #include "atlas/buf.h"
 #include "atlas/error.h"
+#include "atlas/limits.h"
+/* For atlas_verify_claim_semantics and atlas_verify_verifier -- T7's
+ * proposition carries both, set by resolve() per Decision 4. verify.h does not
+ * include this header (checked), so the dependency still runs one way. */
+#include "atlas/verify.h"
 
 /* Forward-declared, `verify.h`'s precedent: this header needs only a pointer,
  * and declaring it here keeps the dependency one-way. */
@@ -407,5 +412,107 @@ atlas_status atlas_memory_read_external(const void *path_raw, size_t path_len, b
                                         atlas_memory_read_item *items, size_t cap,
                                         size_t *count_out, bool *from_mirror_out,
                                         atlas_err *err);
+
+/* --- T7: the deterministic extractor and its anchors -----------------------
+ *
+ * A registered source's bytes are prose. Most of a memory file is not a
+ * checkable assertion at all, so this layer's first job is deciding what even
+ * *is* a candidate proposition, before anything asks whether it is true.
+ *
+ * The split (`atlas_memory_extract`) is pure -- no database handle, no
+ * process, no file, no clock -- for `src/orch/memory.c`'s reason: a frozen
+ * result a reader can re-derive from stored bytes is only checkable if the
+ * derivation consulted nothing that moves. Anchor resolution
+ * (`atlas_memory_anchor_resolve`) is the impure half and is a separate
+ * function for exactly that reason: it reads the index, and it is what T8's
+ * apply phase calls from inside the write transaction, where A1 already
+ * forbids a git process or a file read. It must never ask git -- every
+ * reference is validated against what Atlas has already indexed, the same
+ * discipline `src/verify/intake.c` states for the same reason.
+ *
+ * Normalisation and the anchor syntax are frozen: a change to either bumps
+ * `ATLAS_MEMORY_EXTRACTOR_VERSION`, exactly as a change to A3's lexical rules
+ * bumps `ATLAS_CODE_ANALYZER_VERSION`. **A candidate that resolves no anchor
+ * does not become a claim** -- it is stored as an unanchored proposition and
+ * reported, never dropped. Did-not-extract is not proven-to-contain-nothing,
+ * A9.2.2's rule one layer out. */
+
+/* What in the repository one proposition is anchored to. `value` is compared
+ * exactly, in whichever form the kind's own store uses: `path_text` for PATH,
+ * the symbol name for SYMBOL, the public decision uid for DECISION, and the
+ * 40-lowercase-hex oid for COMMIT. */
+typedef struct atlas_memory_anchor {
+    atlas_memory_anchor_kind kind;
+    atlas_buf value; /* path_text form, symbol, decision uid, or 40-hex oid */
+} atlas_memory_anchor;
+
+void atlas_memory_anchor_init(atlas_memory_anchor *a);
+void atlas_memory_anchor_free(atlas_memory_anchor *a);
+
+/* One candidate assertion, split from a source's bytes in document order and
+ * -- once `atlas_memory_anchor_resolve` has run -- resolved against the index.
+ * Owns its buffers; `_init`/`_free` pair, in the shape every owned-buffer
+ * struct in this codebase has. */
+typedef struct atlas_memory_proposition {
+    size_t ordinal; /* position within the source item; stable across a pass */
+    atlas_buf text; /* verbatim bytes, UNTRUSTED_DATA; never normalised */
+    atlas_buf normalized; /* for the content key and for Decision 2's edge */
+    atlas_buf text_sha256; /* lowercase hex, of `text` */
+    atlas_memory_anchor anchors[ATLAS_MEMORY_MAX_ANCHORS_PER_PROPOSITION];
+    size_t anchor_count;
+    atlas_verify_claim_semantics semantics; /* set by resolve, per Decision 4 */
+    atlas_verify_verifier verifier;         /* NONE when nothing mechanical applies */
+    atlas_buf verifier_input;
+    atlas_buf decision_uid; /* the DECISION anchor's document, when one resolved */
+    bool truncated;         /* over ATLAS_MEMORY_MAX_PROPOSITION_BYTES; never trimmed */
+} atlas_memory_proposition;
+
+void atlas_memory_proposition_init(atlas_memory_proposition *p);
+void atlas_memory_proposition_free(atlas_memory_proposition *p);
+
+/* Pure split: no database, no process, no clock, no file (A10.1's memory.c
+ * discipline). Candidates are list items and paragraphs, in document order --
+ * a line starting with `-`, `*`, `+` or digits-then-`.`, each followed by
+ * whitespace, is its own single-line candidate; a run of other non-blank
+ * lines between blank lines (or a list item) is one paragraph candidate,
+ * its internal line breaks normalised to `\n` regardless of whether the
+ * source used LF or CRLF -- which is what makes CRLF input split identically
+ * to LF rather than merely "equivalently".
+ *
+ * `out` must hold at least `cap` slots; on ATLAS_OK, `*count_out` of them were
+ * written (each already initialised, per `atlas_memory_read_source`'s
+ * contract) and the caller frees each with `atlas_memory_proposition_free`.
+ * The effective limit is `min(cap, ATLAS_MEMORY_MAX_PROPOSITIONS)` -- the
+ * policy ceiling is enforced here regardless of how large a buffer a caller
+ * happens to pass, because A5's rule governs this bound too: refused, never
+ * silently exceeded. A candidate beyond the limit sets `*bound_reached_out`
+ * and is not written; a candidate over `ATLAS_MEMORY_MAX_PROPOSITION_BYTES`
+ * is written in full (nothing is ever silently trimmed) with `truncated` set.
+ *
+ * `normalized`, `text_sha256` and `anchor_count` (zero) are set here;
+ * `semantics`, `verifier`, `verifier_input` and `decision_uid` are left at
+ * their zero defaults until `atlas_memory_anchor_resolve` runs. */
+atlas_status atlas_memory_extract(const atlas_buf *bytes, atlas_memory_proposition *out,
+                                  size_t cap, size_t *count_out, bool *bound_reached_out,
+                                  atlas_err *err);
+
+/* Resolves anchors against the index and assigns semantics and verifier.
+ * Separate from the split precisely because the split is pure and this is
+ * not: this reads `files` (via `atlas_db_verify_file_hash`, `path_text`
+ * compared exactly), the compiler-derived semantic index (via
+ * `atlas_db_verify_sem_symbol` -- the same read `atlas.symbol_present` itself
+ * runs, which is what keeps extraction-time resolution and later
+ * verification looking at the same fact), the decision store (via
+ * `atlas_db_decision_find_uid`, scoped to `repo_id`) and `commits` (via
+ * `atlas_db_verify_commit_exists`). Index reads only, never git.
+ *
+ * Idempotent: it resets `p`'s anchors, `semantics`, `verifier`,
+ * `verifier_input` and `decision_uid` before scanning `p->text`, so calling it
+ * twice on the same proposition against the same index produces the same
+ * result. A ninth resolving anchor is dropped; `anchor_count` never exceeds
+ * `ATLAS_MEMORY_MAX_ANCHORS_PER_PROPOSITION` and that is the report -- nothing
+ * else names the drop because the field already carries it. */
+atlas_status atlas_memory_anchor_resolve(atlas_db *db, int64_t repo_id, atlas_memory_proposition *p,
+                                         atlas_err *err);
 
 #endif /* ATLAS_MEMORY_H */

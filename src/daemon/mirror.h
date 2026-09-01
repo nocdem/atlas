@@ -90,6 +90,15 @@ atlas_status atlas_mirror_keep_many(const char *data_dir, int64_t repo_id,
                                     const atlas_mirror_path *paths, size_t n, bool *kept_out,
                                     atlas_err *err);
 
-atlas_status atlas_mirror_publish(const char *data_dir, int64_t repo_id, atlas_err *err);
+/* Publishes the staged generation, or discards it when it is the published one.
+ *
+ * `*published_out` says which happened: true when `<id>` was replaced, false
+ * when the staged twin held exactly the same files as the same inodes and was
+ * removed instead. A caller needs the difference because replacing `<id>`
+ * unlinks every directory the watcher has an inotify watch on, and that -- not
+ * the mirror's contents -- is what obliges a watch rebuild and the event gap
+ * behind it. NULL is accepted for a caller that does not care. */
+atlas_status atlas_mirror_publish(const char *data_dir, int64_t repo_id, bool *published_out,
+                                  atlas_err *err);
 
 #endif /* ATLAS_MIRROR_H */

@@ -445,7 +445,111 @@ atlas_status atlas_mirror_keep_many(const char *data_dir, int64_t repo_id,
     return st;
 }
 
-atlas_status atlas_mirror_publish(const char *data_dir, int64_t repo_id, atlas_err *err) {
+/* A13.1. Counts the files in one generation, and -- when `twin` is given --
+ * proves every one of them is the same inode as the file at the same path
+ * there. Returns false the moment either fails, so an ordinary changed pass
+ * stops early rather than paying for a whole comparison it cannot pass.
+ *
+ * Inode equality is the whole test, and it is exact rather than heuristic: the
+ * only thing that creates an entry in a staging generation without writing
+ * bytes is `keep_one`'s `linkat`, which produces a second name for the *same*
+ * inode. `atlas_mirror_put` and `atlas_mirror_put_symlink` always create a new
+ * one. So "every staged file shares its inode with the published file at that
+ * path" is precisely "this pass wrote nothing", with no flag to keep in sync
+ * and nothing for a caller to get wrong.
+ *
+ * Symlinks are compared as themselves: `keep_one` links a symlink with flags
+ * zero and `fstatat` is asked with `AT_SYMLINK_NOFOLLOW`, so a mirrored link
+ * answers for its own inode and never its target's. */
+static bool count_and_match(int dir_fd, int twin_fd, size_t *count_out) {
+    DIR *d = fdopendir(dir_fd);
+    if (d == NULL) {
+        (void)close(dir_fd);
+        return false;
+    }
+    bool ok = true;
+    struct dirent *e = NULL;
+    while (ok && (e = readdir(d)) != NULL) {
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) {
+            continue;
+        }
+        struct stat sb;
+        if (fstatat(dirfd(d), e->d_name, &sb, AT_SYMLINK_NOFOLLOW) != 0) {
+            ok = false;
+            break;
+        }
+        if (S_ISDIR(sb.st_mode)) {
+            int sub = openat(dirfd(d), e->d_name, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+            if (sub < 0) {
+                ok = false;
+                break;
+            }
+            int twin_sub = -1;
+            if (twin_fd >= 0) {
+                twin_sub = openat(twin_fd, e->d_name, O_RDONLY | O_DIRECTORY | O_CLOEXEC |
+                                                          O_NOFOLLOW);
+                if (twin_sub < 0) {
+                    (void)close(sub);
+                    ok = false;
+                    break;
+                }
+            }
+            ok = count_and_match(sub, twin_sub, count_out);
+            continue;
+        }
+        if (twin_fd >= 0) {
+            struct stat tb;
+            if (fstatat(twin_fd, e->d_name, &tb, AT_SYMLINK_NOFOLLOW) != 0 ||
+                tb.st_ino != sb.st_ino || tb.st_dev != sb.st_dev) {
+                ok = false;
+                break;
+            }
+        }
+        (*count_out)++;
+    }
+    (void)closedir(d);
+    if (twin_fd >= 0) {
+        (void)close(twin_fd);
+    }
+    return ok;
+}
+
+/* True when publishing `next` would put back exactly what `cur` already holds.
+ *
+ * Two questions, and both are needed. Inode equality proves the staged
+ * generation wrote nothing *new*; equal file counts prove it dropped nothing.
+ * Without the second a pass that deleted a file would compare identical and the
+ * deletion would never reach the index. */
+static bool staged_is_the_published_one(int mirror, const char *cur, const char *next) {
+    int next_fd = openat(mirror, next, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (next_fd < 0) {
+        return false;
+    }
+    int cur_fd = openat(mirror, cur, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (cur_fd < 0) {
+        (void)close(next_fd);
+        return false;
+    }
+    size_t staged = 0;
+    if (!count_and_match(next_fd, cur_fd, &staged)) {
+        return false;
+    }
+    int cur_again = openat(mirror, cur, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (cur_again < 0) {
+        return false;
+    }
+    size_t published = 0;
+    if (!count_and_match(cur_again, -1, &published)) {
+        return false;
+    }
+    return staged == published;
+}
+
+atlas_status atlas_mirror_publish(const char *data_dir, int64_t repo_id, bool *published_out,
+                                  atlas_err *err) {
+    if (published_out != NULL) {
+        *published_out = false;
+    }
     if (data_dir == NULL || data_dir[0] == '\0') {
         return atlas_err_set(err, ATLAS_ERR_USAGE, "a data directory is required");
     }
@@ -476,10 +580,35 @@ atlas_status atlas_mirror_publish(const char *data_dir, int64_t repo_id, atlas_e
         return ATLAS_OK;
     }
 
+    bool had_current = fstatat(mirror, cur, &sb, AT_SYMLINK_NOFOLLOW) == 0;
+
+    /* A13.1. A pass that changed nothing publishes nothing.
+     *
+     * The swap is not free the way it looks. `remove_tree` unlinks the outgoing
+     * generation, so every directory the watcher holds an inotify watch on is
+     * gone -- a watch is on an inode, not on a path -- and the watcher must drop
+     * and rebuild every watch. P0 says a rebuild owes every repository an event
+     * gap, an event gap makes the next pass `full`, and `reconcile.c` sets
+     * `need_hash` for a full pass before it looks at any stored identity. So an
+     * unchanged repository was re-hashed end to end every few minutes, and the
+     * cache could not prevent it because it was never consulted.
+     *
+     * Discarding the staged twin instead costs the same syscalls -- the same
+     * number of unlinks, on the other tree -- and keeps the published inodes
+     * alive, which is the entire difference. Nothing about generation atomicity
+     * moves: `<id>` is never partially written either way, and there is still no
+     * delete sweep anywhere.
+     *
+     * The identity is proved, not assumed. See `staged_is_the_published_one`. */
+    if (had_current && staged_is_the_published_one(mirror, cur, next)) {
+        remove_tree(mirror, next);
+        (void)close(mirror);
+        return ATLAS_OK;
+    }
+
     /* Move the current generation aside, then the staged one into place. A
      * reader between the two finds no mirror and refuses, which is correct and
      * two syscalls wide. */
-    bool had_current = fstatat(mirror, cur, &sb, AT_SYMLINK_NOFOLLOW) == 0;
     if (had_current && renameat(mirror, cur, mirror, old) != 0) {
         int saved = errno;
         (void)close(mirror);
@@ -498,5 +627,8 @@ atlas_status atlas_mirror_publish(const char *data_dir, int64_t repo_id, atlas_e
     }
     remove_tree(mirror, old);
     (void)close(mirror);
+    if (published_out != NULL) {
+        *published_out = true;
+    }
     return ATLAS_OK;
 }

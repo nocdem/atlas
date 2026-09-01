@@ -419,8 +419,13 @@ static atlas_status method_scanner_state(dispatch_state *ds, const atlas_ipc_req
      * crash between them leaves a readable mirror the row does not yet vouch
      * for -- which costs a refusal -- rather than a row vouching for a generation
      * that was never published. */
+    /* A13.1. Whether the generation was actually replaced, which is a different
+     * question from whether the run finished. A pass that changed nothing
+     * discards its staged twin instead of swapping, and then the published
+     * inodes are still the ones the watcher is watching. */
+    bool published = false;
     if (complete) {
-        st = atlas_mirror_publish(ds->ctx->data_dir, repo_id, err);
+        st = atlas_mirror_publish(ds->ctx->data_dir, repo_id, &published, err);
         if (st != ATLAS_OK) {
             return st;
         }
@@ -442,7 +447,7 @@ static atlas_status method_scanner_state(dispatch_state *ds, const atlas_ipc_req
      * The next `scanner.poll` carries the outcome: its directive is `full`
      * while no complete mirror exists, so a job that fails is answered by being
      * asked for again. */
-    st = atlas_writer_submit_mirror_state(ds->ctx->writer, repo_id, complete, err);
+    st = atlas_writer_submit_mirror_state(ds->ctx->writer, repo_id, complete, published, err);
     if (st == ATLAS_OK) {
         st = atlas_json_key_bool(ds->j, "complete", complete, err);
     }

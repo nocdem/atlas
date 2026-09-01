@@ -255,6 +255,11 @@ struct atlas_job {
      * MCP path, where the caller granted one directory and registering its
      * parent would index what was not granted. */
     bool exact_root;
+    /* Mirror state: the staged generation actually replaced the published one.
+     * A field of its own rather than another meaning for `exact_root`, because
+     * this one decides whether the watch set is rebuilt and a reader must be
+     * able to see which question is being asked. */
+    bool mirror_published;
     /* Reconcile: repository-relative paths the watcher saw an event for, NUL
      * separated. Each is hashed regardless of its metadata. */
     atlas_buf dirty_paths;
@@ -454,6 +459,7 @@ atlas_status atlas_writer_call_repo_scanner(atlas_writer *w, const char *name,
  * There is no waiting form, deliberately — a caller that waited would need a
  * bound on how long the writer may be busy, and Atlas has none. */
 atlas_status atlas_writer_submit_mirror_state(atlas_writer *w, int64_t repo_id, bool complete,
+                                              bool published,
                                               atlas_err *err);
 
 /* Queues one AI-session operation and waits for it, bounded by `timeout_ms`.

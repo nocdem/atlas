@@ -707,9 +707,18 @@ static void run_mirror_state(atlas_writer *w, atlas_job *j) {
     atlas_now_iso8601(now, sizeof(now));
     j->result = atlas_db_repo_set_mirror_state(w->db, (int64_t)id, j->exact_root, now,
                                                &j->result_err);
-    if (j->result == ATLAS_OK && j->exact_root) {
+    if (j->result == ATLAS_OK && j->exact_root && j->mirror_published) {
         /* A repository that has just become readable is one the watcher's view
-         * of was built when it was not. */
+         * of was built when it was not.
+         *
+         * A13.1. `mirror_published` narrows this to the case it was written for.
+         * A run that changed nothing discards its staged generation instead of
+         * swapping, so `<id>`'s directories keep the inodes the watcher already
+         * holds watches on and the view built while the mirror was incomplete is
+         * still the right one. Rebuilding anyway cost every *other* repository
+         * an event gap too -- the flag and the rebuild are daemon-wide -- and an
+         * event gap makes the next pass full, which re-hashes a repository whose
+         * files nothing had touched. */
         atlas_writer_set_watch_dirty(w);
     }
 }
@@ -1881,7 +1890,7 @@ atlas_status atlas_writer_submit_reconcile(atlas_writer *w, int64_t repo_id, boo
  * different assertions about it, and the later one is not a repetition of the
  * earlier. */
 atlas_status atlas_writer_submit_mirror_state(atlas_writer *w, int64_t repo_id, bool complete,
-                                              atlas_err *err) {
+                                              bool published, atlas_err *err) {
     if (w == NULL || repo_id <= 0) {
         return atlas_err_set(err, ATLAS_ERR_USAGE, "a mirror state needs a repository id");
     }
@@ -1898,6 +1907,7 @@ atlas_status atlas_writer_submit_mirror_state(atlas_writer *w, int64_t repo_id, 
     }
     j->repo_id = repo_id;
     j->exact_root = complete;
+    j->mirror_published = published;
 
     (void)pthread_mutex_lock(&w->lock);
     if (w->stopping) {

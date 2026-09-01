@@ -295,7 +295,9 @@ static void test_a_pass_does_not_disturb_the_published_mirror(void) {
     T_OK(atlas_mirror_open_staging(fx_data_dir(&fx), 9, &staged, &err), &err);
     T_OK(atlas_mirror_put(staged, "a.txt", 5u, true, false, "first\n", 6u, &err), &err);
     (void)close(staged);
-    T_OK(atlas_mirror_publish(fx_data_dir(&fx), 9, &err), &err);
+    bool published = false;
+    T_OK(atlas_mirror_publish(fx_data_dir(&fx), 9, &published, &err), &err);
+    T_CHECK_MSG(published, "the first generation was not published");
 
     /* A second pass begins and writes a different file into staging. */
     T_OK(atlas_mirror_open_staging(fx_data_dir(&fx), 9, &staged, &err), &err);
@@ -314,12 +316,126 @@ static void test_a_pass_does_not_disturb_the_published_mirror(void) {
     (void)close(cur);
 
     /* Publishing swaps it. */
-    T_OK(atlas_mirror_publish(fx_data_dir(&fx), 9, &err), &err);
+    T_OK(atlas_mirror_publish(fx_data_dir(&fx), 9, &published, &err), &err);
+    T_CHECK_MSG(published, "a pass that replaced every file reported no publish");
     T_OK(atlas_mirror_open_repo(fx_data_dir(&fx), 9, &cur, &err), &err);
     T_CHECK_MSG(fstatat(cur, "b.txt", &sb, AT_SYMLINK_NOFOLLOW) == 0,
                 "publishing did not make the staged generation visible");
     T_CHECK_MSG(fstatat(cur, "a.txt", &sb, AT_SYMLINK_NOFOLLOW) != 0,
                 "the previous generation survived its replacement");
+    (void)close(cur);
+
+    fx_close(&fx);
+}
+
+/* A13.1. A pass that carried everything and wrote nothing must not replace the
+ * published generation.
+ *
+ * The cost of replacing it is not the two renames; it is `remove_tree` on the
+ * outgoing generation. An inotify watch is on an inode, so unlinking those
+ * directories invalidates every watch the daemon holds, P0 owes every
+ * repository an event gap for the rebuild that follows, and a pass carrying an
+ * event gap is `full` -- which `reconcile.c` answers by hashing every file
+ * before it consults a single stored identity. Measured on the live daemon
+ * before this: `dna` reported `2274 examined, 2274 hashed, 0 unchanged by
+ * identity` every few minutes with nothing in the tree having changed, while
+ * between publishes the same repository reported `420 examined, 0 hashed, 420
+ * unchanged by identity`. The cache was never broken; it was never asked. */
+static void test_an_unchanged_pass_publishes_nothing(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    fixture fx;
+    T_REQUIRE(fx_open(&fx, &err) == ATLAS_OK);
+
+    int staged = -1;
+    T_OK(atlas_mirror_open_staging(fx_data_dir(&fx), 7, &staged, &err), &err);
+    T_OK(atlas_mirror_put(staged, "a.txt", 5u, true, false, "one\n", 4u, &err), &err);
+    T_OK(atlas_mirror_put(staged, "d/b.txt", 7u, true, false, "two\n", 4u, &err), &err);
+    T_OK(atlas_mirror_put_symlink(staged, "l", 1u, "a.txt", 5u, &err), &err);
+    (void)close(staged);
+    bool published = false;
+    T_OK(atlas_mirror_publish(fx_data_dir(&fx), 7, &published, &err), &err);
+    T_CHECK(published);
+
+    /* The inodes a watcher would be holding watches on. */
+    int cur = -1;
+    T_OK(atlas_mirror_open_repo(fx_data_dir(&fx), 7, &cur, &err), &err);
+    struct stat before_dir;
+    struct stat before_file;
+    T_CHECK(fstatat(cur, "d", &before_dir, AT_SYMLINK_NOFOLLOW) == 0);
+    T_CHECK(fstatat(cur, "a.txt", &before_file, AT_SYMLINK_NOFOLLOW) == 0);
+    (void)close(cur);
+
+    /* A pass that carries every path and writes none. */
+    const atlas_mirror_path paths[] = {
+        {"a.txt", 5u}, {"d/b.txt", 7u}, {"l", 1u}};
+    bool kept[3] = {false, false, false};
+    T_OK(atlas_mirror_keep_many(fx_data_dir(&fx), 7, paths, 3u, kept, &err), &err);
+    T_CHECK_MSG(kept[0] && kept[1] && kept[2], "the published generation did not carry its own files");
+
+    T_OK(atlas_mirror_publish(fx_data_dir(&fx), 7, &published, &err), &err);
+    T_CHECK_MSG(!published, "a pass that changed nothing replaced the published generation");
+
+    /* And what a watcher holds is still valid: same directory inode, same file
+     * inode, same contents. */
+    T_OK(atlas_mirror_open_repo(fx_data_dir(&fx), 7, &cur, &err), &err);
+    struct stat after_dir;
+    struct stat after_file;
+    T_CHECK(fstatat(cur, "d", &after_dir, AT_SYMLINK_NOFOLLOW) == 0);
+    T_CHECK(fstatat(cur, "a.txt", &after_file, AT_SYMLINK_NOFOLLOW) == 0);
+    T_CHECK_MSG(after_dir.st_ino == before_dir.st_ino,
+                "an unchanged pass replaced a directory inode, so every watch under it is gone");
+    T_CHECK_MSG(after_file.st_ino == before_file.st_ino,
+                "an unchanged pass replaced a file inode, so its stored identity no longer matches");
+    struct stat sb;
+    T_CHECK(fstatat(cur, "d/b.txt", &sb, AT_SYMLINK_NOFOLLOW) == 0);
+    T_CHECK(fstatat(cur, "l", &sb, AT_SYMLINK_NOFOLLOW) == 0);
+    (void)close(cur);
+
+    /* The staged generation is gone rather than left behind, so the next pass
+     * starts from an empty one exactly as it would have after a swap. */
+    T_OK(atlas_mirror_open_staging(fx_data_dir(&fx), 7, &staged, &err), &err);
+    T_CHECK_MSG(fstatat(staged, "a.txt", &sb, AT_SYMLINK_NOFOLLOW) != 0,
+                "the discarded staging generation survived into the next pass");
+    (void)close(staged);
+
+    fx_close(&fx);
+}
+
+/* The other half of the same rule, and the one that makes it safe: a pass that
+ * carried *most* of the generation still publishes, because the paths it did
+ * not name are deletions. Inode equality alone would call this identical --
+ * every file it staged is a hard link -- so the file counts are what catch it. */
+static void test_a_deletion_still_publishes(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    fixture fx;
+    T_REQUIRE(fx_open(&fx, &err) == ATLAS_OK);
+
+    int staged = -1;
+    T_OK(atlas_mirror_open_staging(fx_data_dir(&fx), 8, &staged, &err), &err);
+    T_OK(atlas_mirror_put(staged, "keep.txt", 8u, true, false, "one\n", 4u, &err), &err);
+    T_OK(atlas_mirror_put(staged, "gone.txt", 8u, true, false, "two\n", 4u, &err), &err);
+    (void)close(staged);
+    bool published = false;
+    T_OK(atlas_mirror_publish(fx_data_dir(&fx), 8, &published, &err), &err);
+    T_CHECK(published);
+
+    /* The next pass names only one of the two. */
+    const atlas_mirror_path paths[] = {{"keep.txt", 8u}};
+    bool kept[1] = {false};
+    T_OK(atlas_mirror_keep_many(fx_data_dir(&fx), 8, paths, 1u, kept, &err), &err);
+    T_CHECK(kept[0]);
+
+    T_OK(atlas_mirror_publish(fx_data_dir(&fx), 8, &published, &err), &err);
+    T_CHECK_MSG(published, "a pass that dropped a file did not publish, so the deletion was lost");
+
+    int cur = -1;
+    T_OK(atlas_mirror_open_repo(fx_data_dir(&fx), 8, &cur, &err), &err);
+    struct stat sb;
+    T_CHECK(fstatat(cur, "keep.txt", &sb, AT_SYMLINK_NOFOLLOW) == 0);
+    T_CHECK_MSG(fstatat(cur, "gone.txt", &sb, AT_SYMLINK_NOFOLLOW) != 0,
+                "a deleted file survived the generation that dropped it");
     (void)close(cur);
 
     fx_close(&fx);
@@ -337,6 +453,8 @@ static const atlas_test TESTS[] = {
     {"the executable bit survives", test_the_executable_bit_survives},
     {"a pass does not disturb the published mirror",
      test_a_pass_does_not_disturb_the_published_mirror},
+    {"an unchanged pass publishes nothing", test_an_unchanged_pass_publishes_nothing},
+    {"a deletion still publishes", test_a_deletion_still_publishes},
 };
 
 ATLAS_TEST_MAIN("mirror", TESTS)

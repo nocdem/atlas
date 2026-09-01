@@ -686,9 +686,15 @@ transport edge sets.
 | `MODEL` | `AI_AGENT` | `SELF_DECLARED` | an MCP tool, or an ordinary RPC peer |
 | `OPERATOR` | `HUMAN` | `PEER_AUTHENTICATED` | a peer whose uid the root-owned policy names |
 | `ATLAS` | `ATLAS_VERIFIER` etc. | `ATLAS_ATTESTED` | Atlas' own code, having performed the act |
+| `DOCUMENT` | `DOCUMENT` | `SELF_DECLARED` | Atlas' own code, when a document Atlas read is the speaker (A12.1) |
 
-`ATLAS` is unreachable from every transport: no request parser sets it and
-`atlas_verify_channel_parse` does not accept its name.
+`ATLAS` and `DOCUMENT` are unreachable from every transport: no request parser
+sets them and `atlas_verify_channel_parse` does not accept their names.
+Transport-selectability is a predicate rather than a list —
+`atlas_verify_channel_is_transport_selectable`, a switch with no `default:`,
+true for exactly `MODEL` and `OPERATOR` — and the parse matches names only
+among channels it accepts, so a channel added to the vocabulary without
+deciding the question does not compile.
 
 **The uid is a ceiling, not the answer.** Deriving the channel from `SO_PEERCRED`
 alone was right about forgery and wrong about the ordinary case. A7.1 permits a
@@ -699,12 +705,17 @@ with `PEER_AUTHENTICATED` identity. Atlas was minting the forged-human rows this
 season exists to refuse.
 
 A request may therefore name its channel, and the name is honoured **only when it
-asserts less** than the uid would. The two failure directions are closed by
-different mechanisms: a caller cannot become Atlas by naming it (the parser
-refuses the name), and cannot become the operator by out-ranking the kernel (the
-rank comparison refuses every raise). Claiming less authority than you hold is
-never a forgery — it is the accurate statement, and the only one a model is
-entitled to make.
+asserts less** than the uid would. The two mechanisms do not overlap, and which
+one guards what matters: the rank comparison closes only the upward direction —
+a caller cannot become the operator by out-ranking the kernel — while **the
+parse refusal is the whole guard for the internal channels**, and it has to be.
+The rank admits any below-rank name, and `DOCUMENT` ranks below `OPERATOR`, so
+a parse that accepted the name would hand an operator peer a channel that mints
+one independent speaker per pasted file — §12 inflation, the specific forgery
+A12.1 closes. Do not add an internal channel ranked below `OPERATOR` on the
+assumption that the rank excludes it; only the parse does. Claiming less
+authority than you hold is never a forgery — it is the accurate statement, and
+the only one a model is entitled to make.
 
 Everything else a speaker says about itself — name, provider, family, version,
 role, run, orchestrator — is **asserted metadata**, stored as asserted. The

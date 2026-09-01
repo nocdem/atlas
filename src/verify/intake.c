@@ -810,6 +810,17 @@ static atlas_status op_evidence_add(atlas_db *db, const atlas_verify_op *op, con
                                "no memory source version by that id exists, so there is nothing "
                                "for this evidence to refer to");
         }
+        /* The version uid resolves globally, so the scope check the path
+         * branch gets by construction — its lookup is keyed on the claim's
+         * repository — has to be made here, or one repository's snapshot
+         * could carry another repository's evidence: the row would land with
+         * the claim's repo_id and the snapshot's hash and path, a
+         * cross-repository provenance leak nothing downstream could see. */
+        if (st == ATLAS_OK && mv.repo_id != claim.repo_id) {
+            st = atlas_err_set(err, ATLAS_ERR_CONFIG,
+                               "that memory snapshot belongs to a different repository than this "
+                               "claim, so it cannot be what the evidence refers to");
+        }
         if (st == ATLAS_OK) {
             st = atlas_buf_set(&e.content_hash, mv.content_sha256.data, mv.content_sha256.len,
                                err);

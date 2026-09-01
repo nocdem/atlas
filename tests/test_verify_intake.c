@@ -989,6 +989,92 @@ static void test_a_memory_snapshot_reference_takes_the_hash_from_atlas_own_row(v
     env_close(&e);
 }
 
+static void test_a_memory_snapshot_from_another_repository_is_refused(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    env e;
+    env_open(&e, &err);
+
+    /* The snapshot lives under "proj". The claim lives under a second
+     * registered repository, with its own ingested commit and scanned head. */
+    insert_memory_version(&e, &err);
+
+    atlas_repo_identity id;
+    memset(&id, 0, sizeof id);
+    id.root = "/tmp/atlas-intake-other";
+    id.root_len = strlen(id.root);
+    id.common_dir = "/tmp/atlas-intake-other/.git";
+    id.common_dir_len = strlen(id.common_dir);
+    id.git_dir = id.common_dir;
+    id.git_dir_len = id.common_dir_len;
+    id.object_format = "sha1";
+    int64_t other_id = 0;
+    T_OK(atlas_db_repo_add(e.db, "other", &id, &other_id, &err), &err);
+    atlas_buf sql = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_appendf(&sql, &err,
+                           "INSERT INTO commits(repo_id, oid, parent_count, subject)"
+                           "  VALUES(%lld, '%s', 0, 'o');"
+                           "UPDATE repositories SET scanned_head = '%s' WHERE id = %lld;",
+                           (long long)other_id, COMMIT_B, COMMIT_B, (long long)other_id),
+         &err);
+    T_OK(atlas_db_exec_sql(e.db, atlas_buf_cstr(&sql), &err), &err);
+    atlas_buf_free(&sql);
+
+    atlas_verify_op c;
+    op_init(&c, ATLAS_VERIFY_OP_CLAIM_CREATE);
+    T_OK(atlas_buf_set_str(&c.repo_name, "other", &err), &err);
+    T_OK(atlas_buf_set_str(&c.text, "the other tree's claim", &err), &err);
+    atlas_verify_intake_result cres;
+    T_OK(apply(&e, &c, &cres, &err), &err);
+    atlas_buf claim = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_set(&claim, cres.uid.data, cres.uid.len, &err), &err);
+    atlas_verify_intake_result_free(&cres);
+    atlas_verify_op_free(&c);
+
+    /* Repository A's snapshot named on repository B's claim: refused, with a
+     * sentence that says the snapshot belongs elsewhere — the evidence row
+     * would otherwise land with B's repo_id and A's hash and path, a
+     * cross-repository provenance leak at the one write point. Asserted as
+     * the exact sentence, so the observed refusal is the reported one. */
+    atlas_verify_op op;
+    mem_evidence_op(&op, &claim, MEM_VERSION_UID, &err);
+    op.channel = ATLAS_VERIFY_CHANNEL_ATLAS;
+    atlas_verify_intake_result res;
+    T_CHECK_MSG(apply(&e, &op, &res, &err) != ATLAS_OK,
+                "another repository's snapshot must not carry this claim's evidence");
+    T_CHECK_MSG(strcmp(err.msg,
+                       "that memory snapshot belongs to a different repository than this claim, "
+                       "so it cannot be what the evidence refers to") == 0,
+                "the refusal must say the snapshot belongs elsewhere; it said: %s", err.msg);
+    atlas_verify_intake_result_free(&res);
+    atlas_verify_op_free(&op);
+
+    /* And it wrote nothing. */
+    sqlite3_stmt *stmt = NULL;
+    T_CHECK(sqlite3_prepare_v2(e.db->h, "SELECT COUNT(*) FROM verify_evidence;", -1, &stmt,
+                               NULL) == SQLITE_OK);
+    T_CHECK(sqlite3_step(stmt) == SQLITE_ROW);
+    T_CHECK_MSG(sqlite3_column_int(stmt, 0) == 0, "the refused cross-repository reference stored "
+                                                  "a row");
+    sqlite3_finalize(stmt);
+
+    /* The same uid on the repository that owns it still resolves — the check
+     * refuses the mismatch, not the mechanism. */
+    atlas_buf own = ATLAS_BUF_INIT;
+    make_claim(&e, "the owning tree's claim", NULL, NULL, &own, &err);
+    atlas_verify_op ok;
+    mem_evidence_op(&ok, &own, MEM_VERSION_UID, &err);
+    ok.channel = ATLAS_VERIFY_CHANNEL_ATLAS;
+    atlas_verify_intake_result okres;
+    T_OK(apply(&e, &ok, &okres, &err), &err);
+    atlas_verify_intake_result_free(&okres);
+    atlas_verify_op_free(&ok);
+    atlas_buf_free(&own);
+
+    atlas_buf_free(&claim);
+    env_close(&e);
+}
+
 static const atlas_test TESTS[] = {
     {"a model can create a claim and it binds to a source state",
      test_a_model_can_create_a_claim_and_it_binds_to_a_source_state},
@@ -1005,6 +1091,8 @@ static const atlas_test TESTS[] = {
      test_a_memory_snapshot_reference_is_refused_on_every_transport_channel},
     {"a memory snapshot reference takes the hash from Atlas' own row",
      test_a_memory_snapshot_reference_takes_the_hash_from_atlas_own_row},
+    {"a memory snapshot from another repository is refused",
+     test_a_memory_snapshot_from_another_repository_is_refused},
     {"a zeroed operation cannot write", test_a_zeroed_operation_cannot_write},
     {"a reference to something that is not there is refused",
      test_a_reference_to_something_that_is_not_there_is_refused},

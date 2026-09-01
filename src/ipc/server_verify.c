@@ -73,10 +73,17 @@
  * The transport knows something the kernel does not: an MCP tool call is a
  * model speaking, whatever uid carried it. So a request may name its channel,
  * and the name is honoured **only when it asserts less** than the uid would.
- * `..._parse` refuses ATLAS and UNKNOWN outright, and the rank comparison
- * refuses every raise, so the two failure directions are closed by different
- * mechanisms: a caller cannot become Atlas by naming it, and cannot become the
- * operator by out-ranking the kernel. Claiming less is not a forgery — it is
+ * `..._parse` accepts only the transport-selectable channels — refusing
+ * ATLAS, DOCUMENT and UNKNOWN by name — and the rank comparison refuses every
+ * raise. Those are not two guards over one set, and which one guards what is
+ * load-bearing: the rank closes only the upward direction — a caller cannot
+ * become the operator by out-ranking the kernel — and for a below-rank
+ * internal channel it is no guard at all. DOCUMENT ranks 1, below OPERATOR's
+ * 2, so this strict `<` would admit the name from an operator peer the moment
+ * a parse accepted it; the parse refusal is the whole guard for every
+ * internal channel, which is why it is a predicate
+ * (`atlas_verify_channel_is_transport_selectable`) the compiler forces a
+ * decision through rather than a list. Claiming less is not a forgery — it is
  * the accurate statement, and the only one a model is entitled to make. */
 static atlas_verify_channel channel_for(dispatch_state *ds, const atlas_ipc_request *req) {
     atlas_verify_channel peer = atlas_server_peer_is_operator((long long)ds->peer_uid)

@@ -383,10 +383,98 @@ static void test_error_messages_are_safe(void) {
     fx_close(&e.fx);
 }
 
+/* A claim's `text` is UNTRUSTED_DATA "wherever it is reported" — see
+ * `include/atlas/verify.h` — because it is prose whoever submitted the claim
+ * wrote, not Atlas' own sentence. Unlike the payloads above it never touches
+ * git: it arrives through `verify claim --text`, so it needs its own fixture
+ * rather than build_hostile()'s repository. A well-behaved string would pass
+ * even with no encoding at all, so the payload here is exactly the class of
+ * byte `atlas_safe()` exists to catch: a C1 control (U+0085 NEL) and a bidi
+ * override (U+202E RLO, the same `BIDI_OVERRIDE` used above). */
+#define C1_CONTROL "\xc2\x85"
+
+static void test_verify_claim_text_is_terminal_safe(void) {
+    term_env e;
+    atlas_err err;
+    atlas_err_init(&err);
+    memset(&e, 0, sizeof(e));
+    T_OK(fx_open(&e.fx, &err), &err);
+    T_OK(fx_init_repo(&e.fx, fx_repo(&e.fx), NULL, &err), &err);
+    T_OK(fx_write(fx_repo(&e.fx), "plain.c", "int main(void){return 0;}\n", &err), &err);
+    T_OK(fx_add_all(&e.fx, fx_repo(&e.fx), &err), &err);
+    T_OK(fx_commit(&e.fx, fx_repo(&e.fx), "initial", &err), &err);
+
+    run_result r;
+    const char *add[] = {"repo", "add", fx_repo(&e.fx), "--name", REPO_NAME};
+    run_atlas(&e, &r, add, 5u);
+    T_CHECK_MSG(r.exit_code == 0, "repo add failed: %s", atlas_buf_cstr(&r.errout));
+    result_free(&r);
+    const char *scan[] = {"scan", REPO_NAME};
+    run_atlas(&e, &r, scan, 2u);
+    T_CHECK_MSG(r.exit_code == 0, "scan failed: %s", atlas_buf_cstr(&r.errout));
+    result_free(&r);
+
+    static const char claim_text[] =
+        "the parser keeps the reviewed hash" C1_CONTROL "as claimed" BIDI_OVERRIDE "here";
+    const char *claim_args[] = {"verify", "claim", "--repo", REPO_NAME, "--text", claim_text};
+    run_atlas(&e, &r, claim_args, 6u);
+    T_CHECK_MSG(r.exit_code == 0, "verify claim failed: %s", atlas_buf_cstr(&r.errout));
+    char claim_uid[128];
+    claim_uid[0] = '\0';
+    {
+        const char *s = strstr(atlas_buf_cstr(&r.out), "atlas-claim-");
+        T_REQUIRE_MSG(s != NULL, "no claim uid in: %s", atlas_buf_cstr(&r.out));
+        size_t n = 0;
+        while (s[n] != '\0' && s[n] != '\n' && s[n] != ' ' && n + 1 < sizeof claim_uid) {
+            n++;
+        }
+        memcpy(claim_uid, s, n);
+        claim_uid[n] = '\0';
+    }
+    result_free(&r);
+
+    /* The human path: render_human.c's h_verify() used to print this value
+     * with only a "(untrusted project text)" label and a bare fprintf — a
+     * label is not an encoding. */
+    const char *show[] = {"verify", "show", claim_uid};
+    run_atlas(&e, &r, show, 3u);
+    T_CHECK_MSG(r.exit_code == 0, "verify show failed: %s", atlas_buf_cstr(&r.errout));
+    expect_terminal_safe(&r.out, "verify show");
+    expect_absent_raw(&r.out, C1_CONTROL, sizeof(C1_CONTROL) - 1u, "verify show");
+    expect_absent_raw(&r.out, BIDI_OVERRIDE, sizeof(BIDI_OVERRIDE) - 1u, "verify show");
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&r.out), "%C2%85") != NULL,
+                "the C1 control should arrive percent-escaped: %s", atlas_buf_cstr(&r.out));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&r.out), "%E2%80%AE") != NULL,
+                "the bidi override should arrive percent-escaped: %s", atlas_buf_cstr(&r.out));
+    result_free(&r);
+
+    /* The JSON path: render_json.c's j_verify() assembles this document itself
+     * rather than calling the shared atlas_service_verify_write_report() the
+     * daemon's socket reply uses — a second implementation of the same field
+     * is a second place the encoding can be missing. */
+    const char *jshow[] = {"--json", "verify", "show", claim_uid};
+    run_atlas(&e, &r, jshow, 4u);
+    T_CHECK_MSG(r.exit_code == 0, "verify show --json failed: %s", atlas_buf_cstr(&r.errout));
+    size_t bad = 0;
+    T_CHECK_MSG(tjson_valid(r.out.data, r.out.len, &bad), "invalid JSON at offset %zu", bad);
+    expect_terminal_safe(&r.out, "verify show --json");
+    expect_absent_raw(&r.out, C1_CONTROL, sizeof(C1_CONTROL) - 1u, "verify show --json");
+    expect_absent_raw(&r.out, BIDI_OVERRIDE, sizeof(BIDI_OVERRIDE) - 1u, "verify show --json");
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&r.out), "%C2%85") != NULL,
+                "the C1 control should arrive percent-escaped: %s", atlas_buf_cstr(&r.out));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&r.out), "%E2%80%AE") != NULL,
+                "the bidi override should arrive percent-escaped: %s", atlas_buf_cstr(&r.out));
+    result_free(&r);
+
+    fx_close(&e.fx);
+}
+
 static const atlas_test TESTS[] = {
     {"human output is terminal safe", test_human_output_is_terminal_safe},
     {"json output is safe and reversible", test_json_output_is_safe_and_reversible},
     {"error messages are terminal safe", test_error_messages_are_safe},
+    {"a claim's text is terminal safe on both renderers",
+     test_verify_claim_text_is_terminal_safe},
 };
 
 ATLAS_TEST_MAIN("terminal", TESTS)

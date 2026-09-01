@@ -1325,6 +1325,20 @@ static void test_a_source_drift_demotes_the_conflict_axis_too(void) {
     propose_decision(&e, "the parser must keep the reviewed hash", &doc_uid, &err);
     approve_decision(&e, atlas_buf_cstr(&doc_uid), &err);
 
+    /* Pins this test's own `decision_effective` precondition rather than
+     * borrowing the sibling test's above: without this, a regression that
+     * left the approval without an effective revision would still pass here,
+     * and this test is sound only as a pair with that one. */
+    int64_t document_id = 0, doc_repo = 0;
+    bool doc_found = false;
+    T_OK(atlas_db_decision_find_uid(e.db, atlas_buf_cstr(&doc_uid), &document_id, &doc_repo,
+                                    &doc_found, &err),
+         &err);
+    T_REQUIRE_MSG(doc_found, "the proposed and approved record did not resolve by uid");
+    int64_t revision_before = 0;
+    T_OK(atlas_db_decision_approved_revision(e.db, document_id, &revision_before, &err), &err);
+    T_REQUIRE_MSG(revision_before > 0, "the approval did not leave an effective revision");
+
     /* Bound while the repository is still at COMMIT_A — env_open's own
      * scanned head — exactly as the non-drifted fixture above. */
     atlas_buf claim = ATLAS_BUF_INIT;

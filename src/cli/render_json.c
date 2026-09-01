@@ -1735,7 +1735,13 @@ static atlas_status j_verify(atlas_renderer *r, const atlas_verify_report *rep, 
     TRY(atlas_json_key(j, "verification", err));
     TRY(atlas_json_obj_begin(j, err));
     TRY(atlas_json_key_str(j, "claim", atlas_buf_cstr(&rep->claim_uid), err));
-    TRY(atlas_json_key_str(j, "claim_text", atlas_buf_cstr(&rep->claim_text), err));
+    /* UNTRUSTED_DATA: written by whoever submitted the claim. Encoded here for
+     * the same reason `atlas_service_verify_write_report` encodes it at
+     * service_verify.c:751 for the daemon's socket reply — this function is
+     * the CLI's own, separate JSON assembly for `atlas verify show --json` run
+     * without a daemon, and it must not answer differently. */
+    TRY(atlas_json_key_str(j, "claim_text", atlas_safe(&r->safe, atlas_buf_cstr(&rep->claim_text)),
+                           err));
     /* Labelled, exactly as A4's decision documents are. Verification changes a
      * status; it does not make prose trustworthy. */
     TRY(atlas_json_key_str(j, "trust", "UNTRUSTED_DATA", err));

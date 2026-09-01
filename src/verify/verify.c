@@ -1034,7 +1034,7 @@ int atlas_verify_independent_groups(atlas_verify_input *inputs, size_t count,
 
 /* --- the algorithm --------------------------------------------------------
  *
- * `atlas-reliability-v1`. Integer, bounded, and short enough that a reviewer
+ * `atlas-reliability-v2`. Integer, bounded, and short enough that a reviewer
  * can hold all of it at once — which is the property that matters most, because
  * an unauditable scorer is one nobody can challenge.
  */

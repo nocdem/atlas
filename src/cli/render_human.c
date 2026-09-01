@@ -1727,7 +1727,8 @@ static atlas_status h_verify(atlas_renderer *r, const atlas_verify_report *rep, 
         return ATLAS_OK;
     }
     (void)fprintf(o, "claim:        %s\n", atlas_buf_cstr(&rep->claim_uid));
-    (void)fprintf(o, "  text (untrusted project text): %s\n", atlas_buf_cstr(&rep->claim_text));
+    (void)fprintf(o, "  text (untrusted project text): %s\n",
+                  atlas_safe(&r->safe, atlas_buf_cstr(&rep->claim_text)));
     if (rep->record_uid.len > 0) {
         (void)fprintf(o, "record:       %s  [%s / %s]\n", atlas_buf_cstr(&rep->record_uid),
                       atlas_decision_kind_name(a->kind), atlas_decision_state_name(a->from));
@@ -1874,7 +1875,7 @@ static atlas_status h_verify(atlas_renderer *r, const atlas_verify_report *rep, 
             }
             if (e->observed.len > 0) {
                 (void)fprintf(o, "    observed (untrusted project text): %s\n",
-                              atlas_buf_cstr(&e->observed));
+                              atlas_safe(&r->safe, atlas_buf_cstr(&e->observed)));
             }
         }
     }
@@ -1895,7 +1896,7 @@ static atlas_status h_verify(atlas_renderer *r, const atlas_verify_report *rep, 
             (void)fprintf(o, "\n");
             if (t->actor_name.len > 0) {
                 (void)fprintf(o, "    actor (untrusted, as asserted): %s\n",
-                              atlas_buf_cstr(&t->actor_name));
+                              atlas_safe(&r->safe, atlas_buf_cstr(&t->actor_name)));
             }
         }
     }

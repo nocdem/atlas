@@ -1332,3 +1332,55 @@ the local and socket paths emit one document from one writer. That is a larger c
 than the defect that exposed it and it was deliberately not attempted mid-season;
 the usual argument applies — a shared writer is only better if the sharing is
 genuinely the same document, and establishing that is the work.
+
+## `verifier_input` is unvalidated at the write point, and A12.1 gave that a new consequence (2026-09-02)
+
+Found while closing A12.1's T7, whose Critical was the same grammar reached from a
+different direction, and recorded because the surface is pre-existing while one of its
+consequences is not.
+
+**What is verified.** `src/verify/intake.c` copies `verifier_input` from the request
+into the stored claim (`:613`) and hashes it into the content key (`:642`). It is
+bounded for length and **nothing checks its grammar**. Meanwhile `input_field`
+(`src/verify/detverify.c:101`) splits that string on `;` and takes the **first** match
+per key. And `op->document_uid` (`include/atlas/verify_ops.h:248`) lets a submitter
+bind its claim to an existing knowledge record, resolved at `intake.c:571-575`.
+
+**The chain, written out.** A model reaching `verify.claim_create` supplies both the
+`verifier` and the `verifier_input`. It can therefore submit
+`path=<a real file>;sha256=<a value it chose>;sha256=<anything>`, and the deterministic
+verifier will compare that real file against the chosen value and store a **FAIL**.
+Because the same call may bind `document_uid`, the claim can be attached to an
+**approved** decision — and with A12.1's T5, `atlas_verify_conflict_settle`'s first
+rule then reads `deterministic_fail && decision_bound && decision_effective` and
+produces `ATLAS_CONFLICT_IMPLEMENTATION`. A model can thus manufacture *implementation
+drift against a decision it did not like*, out of a claim it wrote itself.
+
+**What this is not, stated so the finding is not read as worse than it is.** The
+verdict lands on the model's **own** claim; no other claim's aggregate moves. Nothing
+transitions a lifecycle on it — `autolifecycle.c`'s Gate 3 keys on `deterministic_fail`
+and folds to BLOCKED, which is the conservative direction, and
+`ATLAS_CONFLICT_IMPLEMENTATION` has no automatic consumer today. A9.2 already says a
+model's submission is an attestation and never authority. So this is a way to put a
+misleading row on a surface an operator reads, not a way to move a decision.
+
+**Why it is worth an entry anyway.** The surface has been open since A9.2.1 and cost
+nothing while the conflict axis had no producer — every claim reported `CONFLICT_NONE`
+regardless. T5 gave the axis its first producer, so a stored row that reads
+`IMPLEMENTATION` is now a thing an operator can be shown, and its most direct producer
+is an unvalidated request field. **A pre-existing surface whose consequence is new is
+exactly the shape that outlives the season that created it**, which is why it is here
+rather than in a task's report.
+
+**Candidate fixes, none implemented.** Validate `verifier_input` at the write point
+against the grammar its consumers parse — the check A12.1's extractor now performs for
+itself (`src/memory/extract.c`, refusing rather than filtering, with the reason
+recorded on the proposition). Or give the verifier input a structured representation
+that has no in-band separator to confuse. The second is larger and closes the class;
+the first closes the instance and matches what the tree already does elsewhere.
+
+**Related and separate:** the length bound that actually bites a CONTENT_HASH input is
+`arg_a[512]` in `detverify.c`, refused rather than truncated, while the extractor
+checks against `ATLAS_VERIFY_VERIFIER_INPUT_MAX` (2048). A path of roughly 500 to 1970
+bytes therefore passes every check, is stored, and is permanently UNAVAILABLE with
+nothing recording that its length was the cause.

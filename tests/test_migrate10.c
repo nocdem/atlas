@@ -189,6 +189,18 @@ static void test_a_schema_nine_database_reaches_ten_additively(void) {
              "ALTER TABLE repositories DROP COLUMN scanner_uid;"
              "ALTER TABLE repositories DROP COLUMN mirror_complete;"
              "ALTER TABLE repositories DROP COLUMN mirror_at;"
+             /* A12.1's eight tables, children before parents: migration 29
+              * runs again on top of this rewind, and a rewind that leaves a
+              * later migration's table behind is not a database at the
+              * version it claims. */
+             "DROP TABLE memory_unanchored;"
+             "DROP TABLE memory_claim_diffs;"
+             "DROP TABLE memory_source_versions;"
+             "DROP TABLE memory_generations;"
+             "DROP TABLE memory_sources;"
+             "DROP TABLE memory_claim_anchors;"
+             "DROP TABLE memory_context_packs;"
+             "DROP TABLE memory_trailer_bindings;"
              "DELETE FROM schema_migrations WHERE version >= 10;");
     T_EQ_INT(schema_of(db), 9);
     T_CHECK(!table_exists(db, "decision_edge_events"));

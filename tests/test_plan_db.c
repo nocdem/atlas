@@ -673,7 +673,7 @@ static void test_migration_25_adds_its_tables_and_the_correlation_index(void) {
     atlas_err err;
     atlas_err_init(&err);
     T_EQ_INT(atlas_db_schema_version(e.db, &err), ATLAS_SCHEMA_VERSION);
-    T_EQ_INT(ATLAS_SCHEMA_VERSION, 28);
+    T_EQ_INT(ATLAS_SCHEMA_VERSION, 29);
 
     T_CHECK(object_exists(e.db, "table", "orch_plans"));
     T_CHECK(object_exists(e.db, "table", "orch_plan_revisions"));

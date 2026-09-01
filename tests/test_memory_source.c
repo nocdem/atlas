@@ -115,6 +115,7 @@ static void test_every_diff_kind_round_trips(void) {
         {ATLAS_MEMORY_DIFF_STALE, "STALE"},
         {ATLAS_MEMORY_DIFF_IMPACTED, "IMPACTED"},
         {ATLAS_MEMORY_DIFF_SUPERSEDED, "SUPERSEDED"},
+        {ATLAS_MEMORY_DIFF_UNDETERMINED, "UNDETERMINED"},
     };
     for (size_t i = 0; i < sizeof CASES / sizeof CASES[0]; i++) {
         T_EQ_STR(atlas_memory_diff_kind_name(CASES[i].k), CASES[i].name);

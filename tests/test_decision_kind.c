@@ -379,6 +379,19 @@ static void wind_back_to_schema_12(env *e, atlas_err *err) {
         "DROP INDEX idx_orch_jobs_run;"
         "ALTER TABLE orch_jobs DROP COLUMN run_slot;"
         "ALTER TABLE orch_jobs DROP COLUMN run_uid;"
+        /* A12.1's eight tables, children before parents: migration 29 runs
+         * again on top of this rewind, and a rewind that leaves a later
+         * migration's table behind is not a database at the version it
+         * claims. Foreign keys are off for this whole block, but the order is
+         * kept anyway rather than relied on being irrelevant. */
+        "DROP TABLE memory_unanchored;"
+        "DROP TABLE memory_claim_diffs;"
+        "DROP TABLE memory_source_versions;"
+        "DROP TABLE memory_generations;"
+        "DROP TABLE memory_sources;"
+        "DROP TABLE memory_claim_anchors;"
+        "DROP TABLE memory_context_packs;"
+        "DROP TABLE memory_trailer_bindings;"
         "DELETE FROM schema_migrations WHERE version >= 13;";
 
     T_OK(atlas_db_exec_sql(e->db, BACK_DOCUMENTS, err), err);

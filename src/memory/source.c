@@ -94,6 +94,7 @@ const char *atlas_memory_diff_kind_name(atlas_memory_diff_kind k) {
     case ATLAS_MEMORY_DIFF_STALE: return "STALE";
     case ATLAS_MEMORY_DIFF_IMPACTED: return "IMPACTED";
     case ATLAS_MEMORY_DIFF_SUPERSEDED: return "SUPERSEDED";
+    case ATLAS_MEMORY_DIFF_UNDETERMINED: return "UNDETERMINED";
     case ATLAS_MEMORY_DIFF_UNKNOWN: break;
     }
     return "UNKNOWN";
@@ -129,6 +130,10 @@ bool atlas_memory_diff_kind_parse(const char *name, atlas_memory_diff_kind *out)
     }
     if (strcmp(name, "SUPERSEDED") == 0) {
         *out = ATLAS_MEMORY_DIFF_SUPERSEDED;
+        return true;
+    }
+    if (strcmp(name, "UNDETERMINED") == 0) {
+        *out = ATLAS_MEMORY_DIFF_UNDETERMINED;
         return true;
     }
     return false;

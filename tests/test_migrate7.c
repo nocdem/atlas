@@ -219,6 +219,18 @@ static void build_schema6(const char *path, atlas_err *err) {
              "ALTER TABLE repositories DROP COLUMN scanner_uid;"
              "ALTER TABLE repositories DROP COLUMN mirror_complete;"
              "ALTER TABLE repositories DROP COLUMN mirror_at;"
+             /* A12.1's eight tables, children before parents: migration 29
+              * runs again on top of this rewind, and a rewind that leaves a
+              * later migration's table behind is not a database at the
+              * version it claims. */
+             "DROP TABLE memory_unanchored;"
+             "DROP TABLE memory_claim_diffs;"
+             "DROP TABLE memory_source_versions;"
+             "DROP TABLE memory_generations;"
+             "DROP TABLE memory_sources;"
+             "DROP TABLE memory_claim_anchors;"
+             "DROP TABLE memory_context_packs;"
+             "DROP TABLE memory_trailer_bindings;"
              "DELETE FROM schema_migrations WHERE version >= 7;",
              err),
          err);
@@ -265,7 +277,7 @@ static void test_a_populated_schema_six_database_reaches_seven_losslessly(void) 
      * table without renumbering a row — is asserted below and is unaffected by
      * later migrations running on top of it. */
     T_EQ_INT(atlas_db_schema_version(db, &err), ATLAS_SCHEMA_VERSION);
-    T_EQ_INT(ATLAS_SCHEMA_VERSION, 28);
+    T_EQ_INT(ATLAS_SCHEMA_VERSION, 29);
 
     atlas_buf after = ATLAS_BUF_INIT;
     text_of(db,

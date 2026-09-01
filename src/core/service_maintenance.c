@@ -480,6 +480,49 @@ static const retention_entry RETENTION[] = {
      "justified it; this is the record that makes automatic transitions auditable at all, and an "
      "automatic transition whose justification had been pruned is indistinguishable from one that "
      "never had a justification"},
+
+    /* --- A12.1: registered memory sources, their versions, the generations a
+     * reconciliation produces, the diffs and unanchored candidates within one,
+     * the frozen context pack a run was shown, and the trailer bindings a
+     * commit's block resolved to.
+     *
+     * None of these eight is prunable. The count of prunable tables in Atlas
+     * stays exactly what it was before this migration -- `repo_events` and
+     * `gw_audit`, each argued at its own row above. */
+    {"memory_sources", ATLAS_RETAIN_CANONICAL, false,
+     "what was registered as a memory source and for which repository; the record of what somebody "
+     "pointed Atlas at, and a repository predating A12.1 has none, by design rather than by gap"},
+    {"memory_source_versions", ATLAS_RETAIN_CANONICAL, false,
+     "a snapshot-chained version of a memory source's bytes; a version with no blob is Atlas' only "
+     "copy of what was read, and O10's argument for orch_artifacts holds here without change: the "
+     "read that produced it is gone and the bytes are not rebuildable from anything else"},
+    {"memory_claim_anchors", ATLAS_RETAIN_DERIVED, false,
+     "what a proposition resolved to in the tree -- a path, a symbol, a decision, a commit; rebuilt "
+     "by re-running resolution over a source version, so it is DERIVED, and A9.2.5's obstacle-table "
+     "rule applies: a half-aged inventory of anchors is not a smaller record, it is a wrong one, so "
+     "it is never prunable by age"},
+    {"memory_generations", ATLAS_RETAIN_CANONICAL, false,
+     "the ledger a reconciliation pass produces, one row per generation; what a diff or a pack "
+     "points at, and pruning a generation would make every diff and pack naming it describe a "
+     "generation nobody can look up"},
+    {"memory_claim_diffs", ATLAS_RETAIN_CANONICAL, false,
+     "what one generation found had happened to one claim since the last; this is the change "
+     "history a worker's context pack is built from, and it cascades from memory_generations "
+     "rather than aging independently, because a diff without its generation means nothing"},
+    {"memory_unanchored", ATLAS_RETAIN_DERIVED, false,
+     "a candidate that resolved no anchor in a given source version; rebuilt by re-running "
+     "extraction over the version, so it is DERIVED, and A9.2.5's rule applies here too -- never "
+     "prunable by age, because a half-aged list of what could not be anchored is not smaller, it is "
+     "wrong"},
+    {"memory_context_packs", ATLAS_RETAIN_CANONICAL, false,
+     "the frozen Canonical Context Pack one run was actually shown, exactly as orch_run_memory "
+     "freezes A10.1's manifest; the model run that was given it is gone, so the pack is the only "
+     "record of what a worker read"},
+    {"memory_trailer_bindings", ATLAS_RETAIN_DERIVED, false,
+     "what one commit's trailer block resolved to, with the fields that did not verify named "
+     "rather than silently dropped; DERIVED because it is rebuilt by re-reading the commit and its "
+     "trailer, and never prunable by age for A9.2.5's reason -- a half-aged binding record is not a "
+     "smaller record of trailer verification, it is a wrong one"},
 };
 
 #define RETENTION_COUNT (sizeof RETENTION / sizeof RETENTION[0])

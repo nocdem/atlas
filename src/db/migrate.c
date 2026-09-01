@@ -4283,6 +4283,195 @@ static const char M28_MIRROR_AT[] =
 
 static const char *const M28_STATEMENTS[] = {M28_MIRROR_COMPLETE, M28_MIRROR_AT, NULL};
 
+/* A12.1. Registered memory sources, the versions read from them, the
+ * generations a reconciliation produces, the diffs and unanchored candidates
+ * within one, the frozen context pack a run was shown, and the trailer
+ * bindings a commit's block resolved to.
+ *
+ * Eight tables, all additive; nothing rebuilt, so foreign keys stay enforced
+ * and no pre-existing row is rewritten; nothing backfilled -- no repository
+ * that predates this migration has a registered source, and inventing one is
+ * migration 19's mistake.
+ *
+ * No memory table references `repositories`, and that is a decision with the
+ * tree's own precedent, not an omission. The two domains this layer annotates
+ * both made the call already: `verify_claims.repo_id` is a plain `INTEGER NOT
+ * NULL DEFAULT 0` with no foreign key, and no `orch_*` table carries a
+ * `REFERENCES repositories` clause at all -- verified by grep during planning.
+ * A4 states the rule those shapes follow: registry churn must not delete
+ * history, because a `repositories` row is a mutable operational fact and the
+ * record outlives it. The memory rows are that kind of record -- snapshot
+ * versions nothing can rebuild, the generation ledger, the semantic diff, the
+ * pack a worker was shown, the bindings trailers verified against -- and a
+ * cascade here would have deleted the diff history while the `verify_claims`
+ * rows it describes survived: a half-deleted history, worse than either whole
+ * choice. So `repo_id` is a plain column on every memory table, exactly
+ * `verify_claims`' shape. Intra-domain foreign keys (versions to sources,
+ * diffs to generations, unanchored to versions) keep their cascades for
+ * referential hygiene; nothing in this season deletes a `memory_sources` row,
+ * and the season rule says so.
+ *
+ * Stated cost: a repository removed and registered again gets a new
+ * `repositories` id and starts a fresh generation chain; the old rows remain
+ * readable history keyed by the old id and by `repo_identity_hash` on the
+ * generation rows, and re-attaching them is A4-grade detach/attach machinery
+ * this season deliberately does not build -- a backlog entry, not a silent
+ * behaviour.
+ *
+ * `memory_claim_diffs.kind` does not carry `'UNKNOWN'`, unlike every other
+ * vocabulary CHECK in this migration. UNKNOWN is the vocabulary's zero and the
+ * house rule is that a zero never parses (`atlas_memory_diff_kind_parse`
+ * refuses the spelling) -- a CHECK admitting it would permit a row nothing can
+ * read back. The positive finding the roadmap called "left UNKNOWN" -- Atlas
+ * evaluated a claim this generation and could not settle what changed -- is a
+ * different thing and gets a name that parses: `'UNDETERMINED'`, carried by
+ * `ATLAS_MEMORY_DIFF_UNDETERMINED`, added after the seven existing non-zero
+ * members so no stored ordinal moves. It is also distinct from no diff row at
+ * all, which is reserved for a claim no event in the generation touched. */
+static const char M29_SOURCES[] =
+    "CREATE TABLE memory_sources ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    /* Plain on purpose, verify_claims' shape: registry churn deletes no memory
+     * history. The argument is in the migration comment above. */
+    "  repo_id INTEGER NOT NULL,"
+    "  source_uid TEXT NOT NULL UNIQUE,"        /* 'm' + 32 lowercase hex */
+    "  cls TEXT NOT NULL CHECK(cls IN"
+    "    ('REPO_FILE','REPO_DIR','EXTERNAL_FILE','EXTERNAL_DIR')),"
+    "  path_raw BLOB NOT NULL,"                 /* exact bytes; paths are not text */
+    "  path_text TEXT NOT NULL,"                /* lossless %XX encoding, for display */
+    "  registered_at TEXT NOT NULL,"
+    "  UNIQUE(repo_id, cls, path_raw)"
+    ");"
+    "CREATE INDEX idx_memory_src_repo ON memory_sources(repo_id, id);";
+
+static const char M29_SOURCE_VERSIONS[] =
+    "CREATE TABLE memory_source_versions ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  source_id INTEGER NOT NULL REFERENCES memory_sources(id) ON DELETE CASCADE,"
+    "  version_uid TEXT NOT NULL UNIQUE,"       /* 'v' + 32 lowercase hex */
+    /* Git binding where there is one; both recorded rather than one derived:
+     * 'this had no blob' and 'nobody looked' are different facts. */
+    "  commit_oid TEXT NOT NULL DEFAULT '',"
+    "  blob_oid TEXT NOT NULL DEFAULT '',"
+    "  content_sha256 TEXT NOT NULL,"
+    "  content_bytes INTEGER NOT NULL,"
+    /* Git is canonical for a blob-bound version; Atlas is canonical otherwise,
+     * so exactly the versions with no blob carry their bytes. */
+    "  content BLOB,"
+    "  observed_at TEXT NOT NULL,"              /* when the bytes described */
+    "  recorded_at TEXT NOT NULL,"              /* when Atlas wrote the row */
+    "  read_by_uid INTEGER NOT NULL,"           /* which principal read them */
+    "  UNIQUE(source_id, content_sha256, observed_at),"
+    "  CHECK(blob_oid <> '' OR content IS NOT NULL)"
+    ");"
+    "CREATE INDEX idx_memory_ver_source ON memory_source_versions(source_id, id DESC);";
+
+static const char M29_CLAIM_ANCHORS[] =
+    "CREATE TABLE memory_claim_anchors ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  repo_id INTEGER NOT NULL,"        /* plain by the same rule: churn deletes no history */
+    "  claim_uid TEXT NOT NULL,"
+    "  kind TEXT NOT NULL CHECK(kind IN ('PATH','SYMBOL','DECISION','COMMIT')),"
+    "  value TEXT NOT NULL,"                    /* resolved reference; PATH values are path_text form */
+    "  UNIQUE(claim_uid, kind, value)"
+    ");"
+    "CREATE INDEX idx_memory_anchor_lookup ON memory_claim_anchors(repo_id, kind, value);";
+
+static const char M29_GENERATIONS[] =
+    "CREATE TABLE memory_generations ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  repo_id INTEGER NOT NULL,"        /* plain by the same rule: churn deletes no history */
+    "  generation INTEGER NOT NULL,"
+    "  cause TEXT NOT NULL CHECK(cause IN ('SOURCE_REVISION','DECISION_REVISION','COMMIT')),"
+    "  repo_identity_hash TEXT NOT NULL,"
+    "  head_commit TEXT NOT NULL DEFAULT '',"
+    "  decision_set_digest TEXT NOT NULL,"
+    "  source_set_digest TEXT NOT NULL,"
+    "  trailer_scan_high INTEGER NOT NULL DEFAULT 0," /* highest commits.id examined for trailers */
+    "  created_at TEXT NOT NULL,"
+    "  UNIQUE(repo_id, generation)"
+    ");"
+    "CREATE INDEX idx_memory_gen_repo ON memory_generations(repo_id, generation DESC);";
+
+static const char M29_CLAIM_DIFFS[] =
+    "CREATE TABLE memory_claim_diffs ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  generation_id INTEGER NOT NULL REFERENCES memory_generations(id) ON DELETE CASCADE,"
+    "  claim_uid TEXT NOT NULL,"
+    "  kind TEXT NOT NULL CHECK(kind IN"
+    "    ('ADDED','CHANGED','SUPPORTED','CONTRADICTED','STALE','IMPACTED','SUPERSEDED',"
+    "     'UNDETERMINED')),"
+    /* Atlas' own token from a closed vocabulary, optionally followed by one uid.
+     * Never model prose. */
+    "  reason TEXT NOT NULL DEFAULT '',"
+    "  UNIQUE(generation_id, claim_uid)"
+    ");";
+
+static const char M29_UNANCHORED[] =
+    /* A candidate that resolved no anchor. Stored, reported, never a claim. */
+    "CREATE TABLE memory_unanchored ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  source_version_id INTEGER NOT NULL"
+    "    REFERENCES memory_source_versions(id) ON DELETE CASCADE,"
+    "  ordinal INTEGER NOT NULL,"
+    "  text_sha256 TEXT NOT NULL,"
+    "  text TEXT NOT NULL,"                     /* UNTRUSTED_DATA, bounded */
+    "  UNIQUE(source_version_id, ordinal)"
+    ");";
+
+static const char M29_CONTEXT_PACKS[] =
+    /* One frozen Canonical Context Pack per run. The UNIQUE is the freeze
+     * (M23's rule). */
+    "CREATE TABLE memory_context_packs ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  run_uid TEXT NOT NULL UNIQUE,"
+    /* Plain by the same rule; the pack belongs to the run ledger, which carries
+     * no repositories reference of its own. */
+    "  repo_id INTEGER NOT NULL,"
+    "  repo_identity_hash TEXT NOT NULL,"
+    "  pinned_commit TEXT NOT NULL DEFAULT '',"
+    "  source_identity TEXT NOT NULL DEFAULT '',"  /* non-empty only when frozen over a dirty index */
+    "  memory_generation INTEGER NOT NULL,"
+    "  decision_set_digest TEXT NOT NULL,"
+    "  source_set_digest TEXT NOT NULL,"
+    "  pack_digest TEXT NOT NULL,"               /* sha256 of `rendered`; the trailer's Atlas-Context-Digest */
+    "  rendered BLOB NOT NULL,"                  /* the body, without the status line */
+    "  claim_count INTEGER NOT NULL,"
+    "  excluded_count INTEGER NOT NULL,"
+    "  unanchored_count INTEGER NOT NULL,"
+    "  claims_manifest TEXT NOT NULL DEFAULT '',"  /* netstrings: claim uid, verdict, flagged, per claim */
+    "  flagged_anchors TEXT NOT NULL DEFAULT '',"  /* netstrings: claim uid, kind, value, per flagged anchor */
+    "  reliance_checked INTEGER NOT NULL DEFAULT 0 CHECK(reliance_checked IN (0,1)),"
+    "  reliance_complete INTEGER NOT NULL DEFAULT 1 CHECK(reliance_complete IN (0,1)),"
+    "  reliance_claim_uids TEXT NOT NULL DEFAULT '',"
+    "  created_at TEXT NOT NULL"
+    ");";
+
+static const char M29_TRAILER_BINDINGS[] =
+    /* What one commit's trailer block resolved to. A value is stored only when
+     * it verified; a field that did not verify contributes its name to
+     * unknown_fields and stores nothing -- it binds nothing. */
+    "CREATE TABLE memory_trailer_bindings ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  repo_id INTEGER NOT NULL,"        /* plain by the same rule: churn deletes no history */
+    "  commit_oid TEXT NOT NULL,"
+    "  has_block INTEGER NOT NULL CHECK(has_block IN (0,1)),"
+    "  run_uid TEXT NOT NULL DEFAULT '',"
+    "  memory_generation INTEGER NOT NULL DEFAULT 0,"
+    "  context_digest_ok INTEGER NOT NULL DEFAULT 0 CHECK(context_digest_ok IN (0,1)),"
+    "  decision_set_ok INTEGER NOT NULL DEFAULT 0 CHECK(decision_set_ok IN (0,1)),"
+    "  change_reason_uid TEXT NOT NULL DEFAULT '',"
+    "  unknown_fields TEXT NOT NULL DEFAULT '',"   /* netstring field names */
+    "  recorded_at TEXT NOT NULL,"
+    "  UNIQUE(repo_id, commit_oid)"
+    ");";
+
+static const char *const M29_STATEMENTS[] = {
+    M29_SOURCES,       M29_SOURCE_VERSIONS,  M29_CLAIM_ANCHORS,    M29_GENERATIONS,
+    M29_CLAIM_DIFFS,   M29_UNANCHORED,       M29_CONTEXT_PACKS,    M29_TRAILER_BINDINGS,
+    NULL,
+};
+
 static const atlas_migration MIGRATIONS[] = {
     {1, "initial schema", M1_STATEMENTS, false},
     {2, "worktree identity", M2_STATEMENTS, false},
@@ -4377,6 +4566,18 @@ static const atlas_migration MIGRATIONS[] = {
     {27, "which uid's scanner may report about a repository", M27_STATEMENTS, false},
     {28, "whether a repository's mirror is complete, and when it was written",
      M28_STATEMENTS, false},
+    /* Additive: eight new tables, no existing table altered, so no content hash
+     * moves and foreign keys stay enforced throughout. Nothing is rebuilt and
+     * nothing is backfilled: a repository registered before this migration has
+     * no memory source, and starting a generation chain for it here would be
+     * inventing an intent nobody expressed. It starts nothing either -- no
+     * pass, no thread, no job: a migrated machine has no memory sources and
+     * only an operator or a later season's pass registers one. See the M29
+     * comment. */
+    {29,
+     "registered memory sources, their versions, the generations a reconciliation produces, and "
+     "the frozen context pack",
+     M29_STATEMENTS, false},
 };
 
 const atlas_migration *atlas_migrations(size_t *count_out) {

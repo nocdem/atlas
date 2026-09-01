@@ -41,7 +41,7 @@ static void test_migration_27_adds_scanner_uid_defaulting_to_unset(void) {
     atlas_err_init(&err);
     T_OK(fx_open(&fx, &err), &err);
 
-    T_EQ_INT((int)ATLAS_SCHEMA_VERSION, 28);
+    T_EQ_INT((int)ATLAS_SCHEMA_VERSION, 29);
 
     atlas_db *db = NULL;
     T_OK(open_migrated(&fx, &db, &err), &err);

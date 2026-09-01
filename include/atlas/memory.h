@@ -90,12 +90,19 @@ bool atlas_memory_source_class_is_repo(atlas_memory_source_class c);
 /* What a reconciliation pass found had happened to one remembered assertion
  * since the last generation.
  *
- * Two of these are about the *text* and five are about the *world*, and the
+ * Two of these are about the *text* and six are about the *world*, and the
  * split is the point. ADDED and CHANGED say the memory file itself moved.
  * SUPPORTED, CONTRADICTED, STALE, IMPACTED and SUPERSEDED say the tree moved
  * underneath an assertion whose text did not -- which is exactly the condition a
  * model reading a memory file cannot detect for itself, and the reason this
- * season exists. */
+ * season exists.
+ *
+ * UNDETERMINED is none of those five and is not the zero either. It is a
+ * positive finding: Atlas evaluated this claim in this generation and could
+ * not settle what changed. The zero, ATLAS_MEMORY_DIFF_UNKNOWN, means "nobody
+ * filled this in" and must never parse; UNDETERMINED means somebody looked and
+ * came back with no verdict, and it parses like every other member. Placed
+ * after the seven existing non-zero members so no stored ordinal moves. */
 typedef enum atlas_memory_diff_kind {
     ATLAS_MEMORY_DIFF_UNKNOWN = 0,
     ATLAS_MEMORY_DIFF_ADDED,
@@ -104,7 +111,8 @@ typedef enum atlas_memory_diff_kind {
     ATLAS_MEMORY_DIFF_CONTRADICTED,
     ATLAS_MEMORY_DIFF_STALE,
     ATLAS_MEMORY_DIFF_IMPACTED,
-    ATLAS_MEMORY_DIFF_SUPERSEDED
+    ATLAS_MEMORY_DIFF_SUPERSEDED,
+    ATLAS_MEMORY_DIFF_UNDETERMINED
 } atlas_memory_diff_kind;
 
 const char *atlas_memory_diff_kind_name(atlas_memory_diff_kind k);

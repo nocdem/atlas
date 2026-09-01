@@ -229,6 +229,17 @@ static void build_schema7(const char *path, atlas_err *err) {
          err);
     T_OK(atlas_buf_append_str(&drop, "ALTER TABLE repositories DROP COLUMN scanner_uid;", err),
          err);
+    /* A12.1's eight tables, children before parents: migration 29 runs again
+     * on top of this rewind, and a rewind that leaves a later migration's
+     * table behind is not a database at the version it claims. */
+    T_OK(atlas_buf_append_str(&drop, "DROP TABLE memory_unanchored;", err), err);
+    T_OK(atlas_buf_append_str(&drop, "DROP TABLE memory_claim_diffs;", err), err);
+    T_OK(atlas_buf_append_str(&drop, "DROP TABLE memory_source_versions;", err), err);
+    T_OK(atlas_buf_append_str(&drop, "DROP TABLE memory_generations;", err), err);
+    T_OK(atlas_buf_append_str(&drop, "DROP TABLE memory_sources;", err), err);
+    T_OK(atlas_buf_append_str(&drop, "DROP TABLE memory_claim_anchors;", err), err);
+    T_OK(atlas_buf_append_str(&drop, "DROP TABLE memory_context_packs;", err), err);
+    T_OK(atlas_buf_append_str(&drop, "DROP TABLE memory_trailer_bindings;", err), err);
     T_OK(atlas_buf_append_str(&drop, "DELETE FROM schema_migrations WHERE version >= 8;", err),
          err);
     T_OK(atlas_db_exec_sql(db, atlas_buf_cstr(&drop), err), err);
@@ -260,7 +271,7 @@ static void test_a_schema_seven_database_reaches_eight_losslessly(void) {
 
     T_OK(atlas_db_migrate(db, &err), &err);
     T_EQ_INT(atlas_db_schema_version(db, &err), ATLAS_SCHEMA_VERSION);
-    T_EQ_INT(ATLAS_SCHEMA_VERSION, 28);
+    T_EQ_INT(ATLAS_SCHEMA_VERSION, 29);
 
     for (size_t i = 0; i < sizeof A8_TABLES / sizeof A8_TABLES[0]; i++) {
         T_CHECK_MSG(table_exists(db, A8_TABLES[i]), "migration 8 did not create %s",

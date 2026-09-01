@@ -219,6 +219,11 @@ static atlas_status read_fs_file(int root_fd, const void *path, size_t path_len,
 static atlas_status read_repo_file(atlas_git *g, const void *path_raw, size_t path_len,
                                    bool from_mirror, atlas_memory_read_item *item,
                                    atlas_err *err) {
+    /* Set unconditionally, before any outcome is known: whatever this read
+     * concludes, it concluded it by looking at the mirror rather than the
+     * tree, or it did not, and that fact does not depend on what it found. */
+    item->from_mirror = from_mirror;
+
     int fd = -1;
     atlas_memory_read_outcome outcome = ATLAS_MEMORY_READ_UNKNOWN;
     atlas_status st =
@@ -343,17 +348,20 @@ static atlas_status read_dir_entries(int root_fd, const void *path_raw, size_t p
     case ATLAS_PATH_OPEN_SYMLINK:
     case ATLAS_PATH_OPEN_UNSAFE:
         atlas_memory_read_item_init(&items[0]);
+        items[0].from_mirror = from_mirror;
         items[0].outcome = ATLAS_MEMORY_READ_SYMLINK;
         *count_out = 1;
         return ATLAS_OK;
     case ATLAS_PATH_OPEN_MISSING:
         atlas_memory_read_item_init(&items[0]);
+        items[0].from_mirror = from_mirror;
         items[0].outcome =
             from_mirror ? ATLAS_MEMORY_READ_NOT_MIRRORED : ATLAS_MEMORY_READ_ABSENT;
         *count_out = 1;
         return ATLAS_OK;
     case ATLAS_PATH_OPEN_NOT_REGULAR:
         atlas_memory_read_item_init(&items[0]);
+        items[0].from_mirror = from_mirror;
         items[0].outcome = ATLAS_MEMORY_READ_ABSENT;
         *count_out = 1;
         return ATLAS_OK;
@@ -449,6 +457,13 @@ static atlas_status read_dir_entries(int root_fd, const void *path_raw, size_t p
     for (size_t i = 0; i < count; i++) {
         atlas_memory_read_item *it = &items[i];
         atlas_memory_read_item_init(it);
+        /* Every child of a mirror-backed listing is stamped, whatever its own
+         * outcome: the byte content of a child that *is* here is exactly
+         * right, but the read that found it happened over a copy whose
+         * contents were decided by --exclude-standard, not by what the
+         * directory actually holds. See the struct comment on `from_mirror`
+         * for what a caller must -- and must not -- conclude from that. */
+        it->from_mirror = from_mirror;
         size_t nlen = strlen(names[i]);
         rst = atlas_buf_set(&it->rel_path, names[i], nlen, err);
         if (rst == ATLAS_OK) {

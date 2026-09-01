@@ -306,7 +306,21 @@ typedef enum atlas_memory_read_outcome {
  * yields up to ATLAS_MEMORY_MAX_DIR_ENTRIES of these, sorted by name, when its
  * own path opens as a directory; when it does not (absent, a symlink, or
  * behind an A13 refusal), it too yields exactly one item describing that,
- * consistent with the FILE case rather than a second contract next to it. */
+ * consistent with the FILE case rather than a second contract next to it.
+ *
+ * **A DIR listing where any item's `from_mirror` is true is not a claim of
+ * completeness.** A mirror's untracked content is built from `git ls-files
+ * --others --exclude-standard` (src/git/git.c), which never lists a
+ * gitignored path, so a sibling the tree still holds can be entirely absent
+ * from a listing that otherwise opened and read cleanly — with no item at all
+ * describing it, unlike the source's own path going missing (which reports
+ * ATLAS_MEMORY_READ_NOT_MIRRORED). Every item this reads through one call
+ * shares one `from_mirror` value, because the root is one root for the whole
+ * listing. A caller — T8 above all — MUST NOT conclude that a remembered
+ * child no longer exists solely because it is absent from a mirror-backed
+ * listing; the same UNDETERMINED posture ATLAS_MEMORY_READ_NOT_MIRRORED's
+ * comment describes applies here; only a listing where `from_mirror` is false
+ * (a tree-direct read) may be treated as the complete set. */
 typedef struct atlas_memory_read_item {
     atlas_buf rel_path;      /* the child name for a *_DIR source; empty for *_FILE */
     /* The HEAD-blob contract: for a REPO_FILE that is tracked, `bytes` is
@@ -322,6 +336,13 @@ typedef struct atlas_memory_read_item {
     atlas_buf blob_oid;      /* empty when untracked or external */
     atlas_buf commit_oid;    /* empty when untracked or external */
     atlas_memory_read_outcome outcome;
+    /* A13. True when this item's determination -- whatever its outcome --
+     * came from reading a scanner's mirror rather than the repository's own
+     * tree. False for EXTERNAL_*, for NOT_OURS/NO_MIRROR (nothing was read),
+     * and for every atlas_memory_read_external result (no mirror is ever
+     * consulted there). See the struct comment above for what this means for
+     * a DIR listing specifically. */
+    bool from_mirror;
 } atlas_memory_read_item;
 
 void atlas_memory_read_item_init(atlas_memory_read_item *it);
@@ -332,10 +353,13 @@ void atlas_memory_read_item_free(atlas_memory_read_item *it);
  * and reads nothing. Never called inside a transaction.
  *
  * `items` must hold at least `cap` slots and `cap` must be at least 1 — even a
- * FILE source's single result needs a slot. On ATLAS_OK, `*count_out` items
- * were written (each already initialised) and the caller frees each with
- * atlas_memory_read_item_free; on any other status nothing was left for the
- * caller to free. */
+ * FILE source's single result needs a slot. For a REPO_DIR/EXTERNAL_DIR read,
+ * `cap` must not exceed ATLAS_MEMORY_MAX_DIR_ENTRIES either, or the call is
+ * refused outright: that constant is this layer's own ceiling on a directory
+ * listing, not merely a buffer size a caller happens to have chosen. On
+ * ATLAS_OK, `*count_out` items were written (each already initialised) and
+ * the caller frees each with atlas_memory_read_item_free; on any other status
+ * nothing was left for the caller to free. */
 atlas_status atlas_memory_read_source(const atlas_repo_info *repo, const char *data_dir,
                                       atlas_memory_source_class cls, const void *path_raw,
                                       size_t path_len, atlas_memory_read_item *items,

@@ -20,7 +20,8 @@
 atlas_status atlas_mirror_repo_path(const char *data_dir, int64_t repo_id, atlas_buf *out,
                                     atlas_err *err);
 
-/* Opens the repository a reader should use, preferring the tree itself.
+/* Opens the repository a reader should use, chosen by the row rather than by a
+ * failure.
  *
  * A13. A registered tree a process cannot read is one it can never index —
  * measured, with `atlasd` as its own principal, as "repository ... cannot be

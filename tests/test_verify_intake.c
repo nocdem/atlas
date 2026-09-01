@@ -128,6 +128,121 @@ static void make_claim(env *e, const char *text, const char *verifier, const cha
     atlas_verify_op_free(&op);
 }
 
+/* A9.2.1/A12.1, T5: a claim naming a knowledge record by `document_uid`, and
+ * carrying a deterministic verifier — the one shape whose failure can be
+ * implementation drift. */
+static void make_bound_claim(env *e, const char *text, const char *document_uid,
+                             const char *verifier, const char *vinput, atlas_buf *uid_out,
+                             atlas_err *err) {
+    atlas_verify_op op;
+    op_init(&op, ATLAS_VERIFY_OP_CLAIM_CREATE);
+    T_OK(atlas_buf_set_str(&op.repo_name, "proj", err), err);
+    T_OK(atlas_buf_set_str(&op.domain, "control-flow", err), err);
+    T_OK(atlas_buf_set_str(&op.text, text, err), err);
+    T_OK(atlas_buf_set_str(&op.actor_name, "claude", err), err);
+    T_OK(atlas_buf_set_str(&op.actor_provider, "anthropic", err), err);
+    T_OK(atlas_buf_set_str(&op.session_key, "s1", err), err);
+    T_OK(atlas_buf_set_str(&op.document_uid, document_uid, err), err);
+    T_OK(atlas_buf_set_str(&op.verifier, verifier, err), err);
+    T_OK(atlas_buf_set_str(&op.verifier_input, vinput, err), err);
+    atlas_verify_intake_result res;
+    T_OK(apply(e, &op, &res, err), err);
+    if (uid_out != NULL) {
+        T_OK(atlas_buf_set(uid_out, res.uid.data, res.uid.len, err), err);
+    }
+    atlas_verify_intake_result_free(&res);
+    atlas_verify_op_free(&op);
+}
+
+/* A file in the index with a stated content hash, so `atlas.content_hash` has
+ * something to read and something to disagree with. */
+static void seed_file(env *e, const char *path, const char *hash, atlas_err *err) {
+    atlas_buf sql = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_appendf(&sql, err,
+                           "INSERT INTO scans(repo_id, started_at, status)"
+                           "  VALUES(%lld, '2026-01-01T00:00:00Z', 'ok');"
+                           "INSERT INTO files(repo_id, path_raw, path_text, file_type,"
+                           "  content_hash, first_seen_scan_id, last_seen_scan_id,"
+                           "  first_seen_at, last_seen_at)"
+                           "  VALUES(%lld, CAST('%s' AS BLOB), '%s', 'regular', '%s',"
+                           "         last_insert_rowid(), last_insert_rowid(),"
+                           "         '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');",
+                           (long long)e->repo_id, (long long)e->repo_id, path, path, hash),
+         err);
+    T_OK(atlas_db_exec_sql(e->db, atlas_buf_cstr(&sql), err), err);
+    atlas_buf_free(&sql);
+}
+
+/* Makes the file index current, which `ATLAS_COVDIM_REPOSITORY_SNAPSHOT` reads.
+ * Without this, `atlas.content_hash`'s negative conclusion is demoted to
+ * UNAVAILABLE rather than reported as FAIL — A9.2.2's coverage gate, correctly
+ * applied to a verifier whose failing answer is a claim of absence. */
+static void seed_index_current(env *e, atlas_err *err) {
+    T_OK(atlas_db_index_state_ensure(e->db, e->repo_id, err), err);
+    atlas_buf sql = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_appendf(&sql, err,
+                           "UPDATE repo_index_state SET generation = 1, last_complete_generation = 1,"
+                           "  watch_state = 'watching', event_gap = 0, pending_full_reconcile = 0"
+                           " WHERE repo_id = %lld;",
+                           (long long)e->repo_id),
+         err);
+    T_OK(atlas_db_exec_sql(e->db, atlas_buf_cstr(&sql), err), err);
+    atlas_buf_free(&sql);
+}
+
+/* A DECISION-kind knowledge record, proposed and then approved through the
+ * real operator channel — challenge, then spend — so its current revision is
+ * genuinely APPROVED and genuinely effective. */
+static void propose_decision(env *e, const char *title, atlas_buf *uid_out, atlas_err *err) {
+    atlas_decision_op op;
+    atlas_decision_op_init(&op, ATLAS_DECISION_OP_PROPOSE);
+    atlas_decision_result res;
+    atlas_decision_result_init(&res);
+    T_OK(atlas_buf_set_str(&op.repo_name, "proj", err), err);
+    op.knowledge_kind = ATLAS_DECISION_KIND_DECISION;
+    op.knowledge_kind_given = true;
+    T_OK(atlas_buf_set_str(&op.revision.title, title, err), err);
+    T_OK(atlas_buf_set_str(&op.revision.decision_text, "a body for the fixture", err), err);
+    op.revision.proposed_by = ATLAS_DECISION_ACTOR_MODEL_PROPOSAL;
+    T_OK(atlas_decision_apply(e->db, &op, &res, err), err);
+    if (uid_out != NULL) {
+        T_OK(atlas_buf_set(uid_out, res.uid.data, res.uid.len, err), err);
+    }
+    atlas_decision_op_free(&op);
+    atlas_decision_result_free(&res);
+}
+
+static void approve_decision(env *e, const char *uid, atlas_err *err) {
+    atlas_decision_op cop;
+    atlas_decision_op_init(&cop, ATLAS_DECISION_OP_CHALLENGE);
+    T_OK(atlas_buf_set_str(&cop.repo_name, "proj", err), err);
+    T_OK(atlas_buf_set_str(&cop.uid, uid, err), err);
+    cop.intent = ATLAS_DECISION_INTENT_APPROVE;
+    atlas_decision_result cres;
+    atlas_decision_result_init(&cres);
+    T_OK(atlas_decision_apply(e->db, &cop, &cres, err), err);
+    atlas_buf token = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_set(&token, cres.token.data, cres.token.len, err), err);
+    char confirm[ATLAS_DECISION_CONFIRM_MAX];
+    (void)snprintf(confirm, sizeof confirm, "%s", cres.confirm);
+    atlas_decision_op_free(&cop);
+    atlas_decision_result_free(&cres);
+
+    atlas_decision_op aop;
+    atlas_decision_op_init(&aop, ATLAS_DECISION_OP_APPROVE);
+    T_OK(atlas_buf_set_str(&aop.repo_name, "proj", err), err);
+    T_OK(atlas_buf_set_str(&aop.uid, uid, err), err);
+    T_OK(atlas_buf_set(&aop.token, token.data, token.len, err), err);
+    T_OK(atlas_buf_set_str(&aop.confirmation, confirm, err), err);
+    atlas_decision_result ares;
+    atlas_decision_result_init(&ares);
+    T_OK(atlas_decision_apply(e->db, &aop, &ares, err), err);
+    T_CHECK(ares.state == ATLAS_DECISION_APPROVED);
+    atlas_decision_op_free(&aop);
+    atlas_decision_result_free(&ares);
+    atlas_buf_free(&token);
+}
+
 /* --- the happy path -------------------------------------------------------- */
 
 static void test_a_model_can_create_a_claim_and_it_binds_to_a_source_state(void) {
@@ -1075,6 +1190,120 @@ static void test_a_memory_snapshot_from_another_repository_is_refused(void) {
     env_close(&e);
 }
 
+/* --- A12.1, T5: implementation drift, through the write point ------------- */
+
+#define DRIFT_STORED_HASH \
+    "1111111111111111111111111111111111111111111111111111111111111111"
+#define DRIFT_CLAIMED_HASH \
+    "2222222222222222222222222222222222222222222222222222222222222222"
+
+static void test_a_deterministic_fail_against_an_effective_decision_is_implementation_drift(
+    void) {
+    /* §Decision 4, end to end: `atlas_verify_conflict_settle`'s rule 1. An
+     * approved DECISION stands, a claim binds to it by `document_uid` and
+     * names `atlas.content_hash`, and the recorded content disagrees with what
+     * the claim says it is — a deterministic FAIL produced through
+     * EVIDENCE_PRODUCE and folded by EVALUATE. The claim is against the
+     * *implementation*, and the approved record must be untouched by it: that
+     * is acceptance item 3's actual content, and it is a claim about what does
+     * **not** happen. */
+    atlas_err err;
+    atlas_err_init(&err);
+    env e;
+    env_open(&e, &err);
+
+    seed_file(&e, "src/parser.c", DRIFT_STORED_HASH, &err);
+    seed_index_current(&e, &err);
+
+    atlas_buf doc_uid = ATLAS_BUF_INIT;
+    propose_decision(&e, "the parser must keep the reviewed hash", &doc_uid, &err);
+    approve_decision(&e, atlas_buf_cstr(&doc_uid), &err);
+
+    int64_t document_id = 0, doc_repo = 0;
+    bool doc_found = false;
+    T_OK(atlas_db_decision_find_uid(e.db, atlas_buf_cstr(&doc_uid), &document_id, &doc_repo,
+                                    &doc_found, &err),
+         &err);
+    T_REQUIRE_MSG(doc_found, "the proposed and approved record did not resolve by uid");
+
+    /* Captured before EVALUATE runs, so "unchanged" is asserted against the
+     * real pre-state rather than assumed from having just approved it. */
+    char status_before[24];
+    T_OK(atlas_db_decision_document_status(e.db, document_id, status_before, sizeof status_before,
+                                           &err),
+         &err);
+    int64_t revision_before = 0;
+    T_OK(atlas_db_decision_approved_revision(e.db, document_id, &revision_before, &err), &err);
+    T_REQUIRE_MSG(revision_before > 0, "the approval did not leave an effective revision");
+    T_CHECK(strcmp(status_before, "APPROVED") == 0);
+
+    atlas_buf claim = ATLAS_BUF_INIT;
+    make_bound_claim(&e, "src/parser.c has the reviewed content", atlas_buf_cstr(&doc_uid),
+                     "atlas.content_hash", "path=src/parser.c;sha256=" DRIFT_CLAIMED_HASH, &claim,
+                     &err);
+
+    atlas_verify_op produce;
+    op_init(&produce, ATLAS_VERIFY_OP_EVIDENCE_PRODUCE);
+    T_OK(atlas_buf_set(&produce.claim_uid, claim.data, claim.len, &err), &err);
+    atlas_verify_intake_result pres;
+    T_OK(apply(&e, &produce, &pres, &err), &err);
+    T_CHECK_MSG(pres.check == ATLAS_CHECK_FAIL,
+                "the mismatched hash did not produce a deterministic FAIL");
+    atlas_verify_intake_result_free(&pres);
+    atlas_verify_op_free(&produce);
+
+    atlas_verify_op eval;
+    op_init(&eval, ATLAS_VERIFY_OP_EVALUATE);
+    T_OK(atlas_buf_set(&eval.claim_uid, claim.data, claim.len, &err), &err);
+    atlas_verify_intake_result eres;
+    T_OK(apply(&e, &eval, &eres, &err), &err);
+
+    T_CHECK(eres.assessment.aggregate.deterministic_fail);
+    T_CHECK_MSG((int)eres.assessment.aggregate.conflict == (int)ATLAS_CONFLICT_IMPLEMENTATION,
+                "got conflict %s, want IMPLEMENTATION",
+                atlas_verify_conflict_name(eres.assessment.aggregate.conflict));
+    T_CHECK_MSG(!eres.assessment.transitioned,
+                "a DESCRIPTIVE finding against the implementation moved a lifecycle state");
+
+    /* The stored row, read back rather than trusted from the in-memory
+     * assessment: this is "the stored result's conflict", not merely "what the
+     * function returned". */
+    sqlite3_stmt *stmt = NULL;
+    T_CHECK(sqlite3_prepare_v2(e.db->h,
+                               "SELECT conflict, algorithm FROM verify_results"
+                               " ORDER BY id DESC LIMIT 1;",
+                               -1, &stmt, NULL) == SQLITE_OK);
+    T_CHECK(sqlite3_step(stmt) == SQLITE_ROW);
+    T_CHECK_MSG(strcmp((const char *)sqlite3_column_text(stmt, 0), "IMPLEMENTATION") == 0,
+                "the stored row does not record IMPLEMENTATION");
+    T_CHECK_MSG(strcmp((const char *)sqlite3_column_text(stmt, 1), "atlas-reliability-v2") == 0,
+                "the stored row's algorithm is not the bumped one");
+    sqlite3_finalize(stmt);
+
+    /* **The claim this test exists for.** A finding against the
+     * implementation does not falsify the approved record — asserted directly
+     * against the database rather than inferred from `!transitioned`, because
+     * that flag being false could also mean the write point refused for some
+     * unrelated reason. */
+    char status_after[24];
+    T_OK(atlas_db_decision_document_status(e.db, document_id, status_after, sizeof status_after,
+                                           &err),
+         &err);
+    int64_t revision_after = 0;
+    T_OK(atlas_db_decision_approved_revision(e.db, document_id, &revision_after, &err), &err);
+    T_CHECK_MSG(strcmp(status_before, status_after) == 0,
+                "the decision's status moved: %s -> %s", status_before, status_after);
+    T_CHECK_MSG(revision_before == revision_after,
+                "the decision's effective revision moved: %lld -> %lld",
+                (long long)revision_before, (long long)revision_after);
+
+    atlas_verify_intake_result_free(&eres);
+    atlas_verify_op_free(&eval);
+    atlas_buf_free(&claim);
+    atlas_buf_free(&doc_uid);
+    env_close(&e);
+}
+
 static const atlas_test TESTS[] = {
     {"a model can create a claim and it binds to a source state",
      test_a_model_can_create_a_claim_and_it_binds_to_a_source_state},
@@ -1108,6 +1337,8 @@ static const atlas_test TESTS[] = {
     {"Atlas-produced evidence carries an Atlas-attested actor",
      test_atlas_produced_evidence_carries_an_atlas_attested_actor},
     {"bounds refuse rather than shorten", test_bounds_refuse_rather_than_shorten},
+    {"a deterministic fail against an effective decision is implementation drift",
+     test_a_deterministic_fail_against_an_effective_decision_is_implementation_drift},
 };
 
 ATLAS_TEST_MAIN("verify_intake", TESTS)

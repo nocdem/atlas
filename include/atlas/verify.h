@@ -630,8 +630,31 @@ atlas_verify_policy_verdict atlas_verify_verdict_fold(atlas_verify_policy_verdic
  *
  * What it deliberately does not do: majority vote, arithmetic means of
  * self-reported model confidence, or treating differently-named sources as
- * independent. Its limitations are written in `docs/verification.md`. */
-#define ATLAS_VERIFY_ALGORITHM "atlas-reliability-v1"
+ * independent. Its limitations are written in `docs/verification.md`.
+ *
+ * V2 (A12.1, T5) adds nothing to the score, the state or the weights above —
+ * it adds the first producer of `atlas_verify_aggregate.conflict`, an axis
+ * that had been stored, transported and rendered since A9.2 without ever
+ * being assigned. See `atlas_verify_conflict_settle`. The bump is required
+ * because rule (3) there newly reports `ATLAS_CONFLICT_CONTRADICTION` for a
+ * support/contradict shape V1 would have left at `CONFLICT_NONE`, and
+ * `docs/extending.md` requires a new string whenever the aggregation changes
+ * so a stored V1 result is never reinterpreted under V2's rules.
+ *
+ * **A consequence this bump has beyond the aggregation, noted rather than
+ * designed around:** `src/verify/intake.c` also uses this constant as the
+ * synthetic ATLAS_VERIFIER actor's `actor_version` and as produced evidence's
+ * `tool_version`, and the actor uid is a hash that includes `actor_version`
+ * (`derive_actor`). So this bump mints a *new* ATLAS_VERIFIER actor row rather
+ * than reusing the one V1 wrote to, and every attestation and reliability
+ * figure accumulated under the old actor stays where it is, addressed by the
+ * old uid. On a machine with no calibrated history yet — every deployment
+ * today — this costs nothing observable. It is still a coupling nobody chose
+ * on purpose: the algorithm version is not otherwise a property of *who*
+ * produced deterministic evidence, only of *how the aggregation reads it*,
+ * and conflating the two is a candidate for the backlog rather than for this
+ * fix. */
+#define ATLAS_VERIFY_ALGORITHM "atlas-reliability-v2"
 
 /* The fixed-point scale for internal weights. Weights are integers in units of
  * 1/1000, so a "full strength" attestation is 1000. Nothing here is a
@@ -956,6 +979,48 @@ int atlas_verify_independent_groups(atlas_verify_input *inputs, size_t count,
  * the same aggregate. */
 void atlas_verify_aggregate_compute(atlas_verify_aggregate *out, atlas_verify_input *inputs,
                                     size_t count, atlas_verify_basis basis);
+
+/* --- the conflict axis's one producer --------------------------------------
+ *
+ * A12.1, T5. `atlas_verify_aggregate.conflict` (the vocabulary is above, with
+ * `atlas_verify_conflict_name`/`_parse`) had no producer from A9.2 through
+ * A12.0: every stored, transported and rendered `conflict` was the constant
+ * `ATLAS_CONFLICT_NONE`. This is the first one, and — like
+ * `atlas_verify_aggregate_compute` beside it — it is pure: no database handle,
+ * no clock, no process, no file, no repository prose compared, and it does not
+ * touch the decision it reads about. `atlas_verify_assess` is its only caller,
+ * with `decision_bound` and `decision_effective` derived there from stored
+ * rows: the claim's own `document_id` resolving to a decision-lifecycle
+ * document, and `atlas_db_decision_approved_revision` finding an approved
+ * revision of it.
+ *
+ * Rules, in order — first match wins, because (1) and (2) can both hold and
+ * (1) is the more specific finding:
+ *
+ *   1. deterministic_fail && decision_bound && decision_effective
+ *        -> ATLAS_CONFLICT_IMPLEMENTATION. Atlas mechanically established that
+ *           the implementation-side fact is false while the named decision's
+ *           effective approved revision stands. This is "approved knowledge
+ *           says one thing and the implementation does another" exactly, and
+ *           it is a finding *against the implementation* — see the comment on
+ *           `ATLAS_CONFLICT_IMPLEMENTATION` above, which this must not
+ *           weaken: the decision's status and its effective revision are
+ *           never touched by this function or by its caller.
+ *   2. deterministic_fail && support_count > 0
+ *        -> ATLAS_CONFLICT_CONTRADICTION. A mechanical fail against evidence
+ *           that supported the claim, with no decision in the picture (or one
+ *           that is bound but no longer effective — rule 1 already covers the
+ *           case where it is).
+ *   3. support_count > 0 && contradict_count > 0
+ *        -> ATLAS_CONFLICT_CONTRADICTION. Ordinary attestation disagreement,
+ *           independent of any deterministic verdict.
+ *   4. otherwise -> ATLAS_CONFLICT_NONE.
+ *
+ * The four conflicts this leaves without a producer — SUPERSESSION,
+ * SCOPE_MISMATCH, STALE_EVIDENCE, COMPETING_NORMATIVE — are exactly that: a
+ * documented gap, not something this function reaches for on the way past. */
+atlas_verify_conflict atlas_verify_conflict_settle(const atlas_verify_aggregate *a,
+                                                   bool decision_bound, bool decision_effective);
 
 /* --- conservative priors --------------------------------------------------
  *

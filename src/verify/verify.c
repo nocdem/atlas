@@ -346,6 +346,27 @@ bool atlas_verify_conflict_parse(const char *name, atlas_verify_conflict *out) {
     return false;
 }
 
+/* The one producer of a non-NONE conflict. Pure: an aggregate plus two facts
+ * the caller established from stored rows. First match wins — see the
+ * ordered rules on the declaration in verify.h, which this mirrors exactly
+ * and does not re-derive. */
+atlas_verify_conflict atlas_verify_conflict_settle(const atlas_verify_aggregate *a,
+                                                   bool decision_bound, bool decision_effective) {
+    if (a == NULL) {
+        return ATLAS_CONFLICT_NONE;
+    }
+    if (a->deterministic_fail && decision_bound && decision_effective) {
+        return ATLAS_CONFLICT_IMPLEMENTATION;
+    }
+    if (a->deterministic_fail && a->support_count > 0) {
+        return ATLAS_CONFLICT_CONTRADICTION;
+    }
+    if (a->support_count > 0 && a->contradict_count > 0) {
+        return ATLAS_CONFLICT_CONTRADICTION;
+    }
+    return ATLAS_CONFLICT_NONE;
+}
+
 /* --- policy verdicts and reasons ------------------------------------------ */
 
 static const char *const POLICY_VERDICT_NAMES[] = {"NEEDS_REVIEW", "AUTO", "SHADOW", "BLOCKED",

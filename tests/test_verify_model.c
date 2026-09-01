@@ -528,6 +528,101 @@ static void test_no_attestation_is_unverified_not_inconclusive(void) {
     T_EQ_INT((int)b.state, (int)ATLAS_VERIFY_INCONCLUSIVE);
 }
 
+/* --- A12.1, T5: the conflict axis's one producer --------------------------- */
+
+/* Builds an aggregate carrying exactly the four counted facts the settlement
+ * rules read, and nothing else — `atlas_verify_conflict_settle` is pure, so a
+ * hand-built aggregate exercises it as completely as one built by
+ * `atlas_verify_aggregate_compute` would. */
+static atlas_verify_aggregate conflict_agg(bool deterministic_fail, int support_count,
+                                           int contradict_count) {
+    atlas_verify_aggregate a;
+    atlas_verify_aggregate_init(&a);
+    a.deterministic_fail = deterministic_fail;
+    a.support_count = support_count;
+    a.contradict_count = contradict_count;
+    return a;
+}
+
+static void test_the_conflict_settlement_follows_its_rule_order(void) {
+    /* Table over `{deterministic_fail, decision_bound, decision_effective,
+     * support_count, contradict_count}`, exactly as pinned in the plan's
+     * §Decision 4. Each rule below is exercised both where it fires and where
+     * an adjacent case must **not** fire it — a table that only ever hits the
+     * positive case cannot tell a correct rule order from a wrong one. */
+    static const struct {
+        const char *label;
+        bool deterministic_fail;
+        bool decision_bound;
+        bool decision_effective;
+        int support_count;
+        int contradict_count;
+        atlas_verify_conflict want;
+    } CASES[] = {
+        /* Rule 1: deterministic_fail && decision_bound && decision_effective
+         * -> IMPLEMENTATION, whatever support/contradict say — including a
+         * shape that would otherwise satisfy rules 2 and 3 both, which is the
+         * direct test that rule 1 is asked first. */
+        {"rule 1 fires with no other evidence at all", true, true, true, 0, 0,
+         ATLAS_CONFLICT_IMPLEMENTATION},
+        {"rule 1 outranks rules 2 and 3 when all three could match", true, true, true, 1, 1,
+         ATLAS_CONFLICT_IMPLEMENTATION},
+
+        /* Rule 1 does not fire when any one of its three conditions is false —
+         * each checked with the other two held true, so the case isolates the
+         * one condition that is missing. */
+        {"rule 1 does not fire without decision_bound", true, false, true, 0, 0,
+         ATLAS_CONFLICT_NONE},
+        {"rule 1 does not fire without decision_effective", true, true, false, 0, 0,
+         ATLAS_CONFLICT_NONE},
+        {"rule 1 does not fire without deterministic_fail", false, true, true, 0, 0,
+         ATLAS_CONFLICT_NONE},
+
+        /* Rule 2: deterministic_fail && support_count > 0 -> CONTRADICTION,
+         * reached only once rule 1 has already failed to match. Exercised both
+         * unbound and bound-but-no-longer-effective — the brief's own
+         * parametrised row — so the "decision that is no longer effective
+         * cannot make drift" claim is checked with support present and
+         * with it absent. */
+        {"rule 2 fires: deterministic fail with support, no decision", true, false, false, 1, 0,
+         ATLAS_CONFLICT_CONTRADICTION},
+        {"rule 2 does not fire with no support at all", true, false, false, 0, 0,
+         ATLAS_CONFLICT_NONE},
+        {"rule 2 fires past a decision that is bound but not effective", true, true, false, 1, 0,
+         ATLAS_CONFLICT_CONTRADICTION},
+        {"a decision bound but not effective, with no support, makes no conflict", true, true,
+         false, 0, 0, ATLAS_CONFLICT_NONE},
+
+        /* Rule 3: support_count > 0 && contradict_count > 0 -> CONTRADICTION,
+         * independent of any deterministic verdict. Checked against both
+         * halves of the conjunction missing, not only both present. */
+        {"rule 3 fires: support and contradiction, no deterministic verdict", false, false, false,
+         2, 1, ATLAS_CONFLICT_CONTRADICTION},
+        {"rule 3 does not fire on support alone", false, false, false, 3, 0, ATLAS_CONFLICT_NONE},
+        {"rule 3 does not fire on contradiction alone", false, false, false, 0, 2,
+         ATLAS_CONFLICT_NONE},
+
+        /* Rule 4: the default when nothing above matched. */
+        {"rule 4: nothing established, nothing to report", false, false, false, 0, 0,
+         ATLAS_CONFLICT_NONE},
+    };
+    for (size_t i = 0; i < sizeof CASES / sizeof CASES[0]; i++) {
+        atlas_verify_aggregate a =
+            conflict_agg(CASES[i].deterministic_fail, CASES[i].support_count,
+                        CASES[i].contradict_count);
+        atlas_verify_conflict got =
+            atlas_verify_conflict_settle(&a, CASES[i].decision_bound, CASES[i].decision_effective);
+        T_CHECK_MSG(got == CASES[i].want, "%s: got %s, want %s", CASES[i].label,
+                    atlas_verify_conflict_name(got), atlas_verify_conflict_name(CASES[i].want));
+    }
+}
+
+static void test_a_null_aggregate_settles_to_no_conflict(void) {
+    /* Defensive, not load-bearing: nothing in `atlas_verify_assess` passes a
+     * NULL aggregate. UNKNOWN-shaped zero rather than a crash. */
+    T_EQ_INT((int)atlas_verify_conflict_settle(NULL, true, true), (int)ATLAS_CONFLICT_NONE);
+}
+
 static void test_the_algorithm_is_reproducible(void) {
     /* Integer throughout and no floating point anywhere, so "the same inputs
      * produce the same result" is a property of the code rather than a hope
@@ -706,6 +801,9 @@ static const atlas_test TESTS[] = {
      test_stale_evidence_loses_current_force_and_keeps_its_record},
     {"no attestation is unverified, not inconclusive",
      test_no_attestation_is_unverified_not_inconclusive},
+    {"the conflict settlement follows its rule order",
+     test_the_conflict_settlement_follows_its_rule_order},
+    {"a null aggregate settles to no conflict", test_a_null_aggregate_settles_to_no_conflict},
     {"the algorithm is reproducible", test_the_algorithm_is_reproducible},
     {"no score is ever a calibrated probability without calibration",
      test_no_score_is_ever_a_calibrated_probability_without_calibration},

@@ -337,19 +337,32 @@ atlas_status atlas_verify_assess(atlas_db *db, const atlas_verifypolicy *policy,
 
     /* --- the gates, in order --------------------------------------------- */
 
-    /* The record's own state and kind, read from the document. */
+    /* The record's own state and kind, read from the document. Also what the
+     * conflict settlement below needs and nothing more: whether `document_id`
+     * resolves to a decision-lifecycle document at all (`decision_bound`), and
+     * whether it currently has an approved, effective revision
+     * (`decision_effective`). Both are read here rather than re-derived,
+     * because this is already the one place `atlas_verify_assess` resolves the
+     * claim's document. */
     atlas_decision_kind kind = ATLAS_DECISION_KIND_DECISION;
     atlas_decision_state current = ATLAS_DECISION_PROPOSED;
+    bool decision_bound = false;
+    int64_t decision_approved_revision_id = 0;
     if (claim.document_id > 0) {
         bool kfound = false;
         st = atlas_db_decision_kind_of(db, claim.document_id, &kind, &kfound, err);
         if (st == ATLAS_OK) {
+            decision_bound = kfound;
             char status[24];
             st = atlas_db_decision_document_status(db, claim.document_id, status, sizeof status,
                                                    err);
             if (st == ATLAS_OK) {
                 (void)atlas_decision_state_parse(status, &current);
             }
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_db_decision_approved_revision(db, claim.document_id,
+                                                     &decision_approved_revision_id, err);
         }
         if (st != ATLAS_OK) {
             atlas_verify_claim_free(&claim);
@@ -358,6 +371,13 @@ atlas_status atlas_verify_assess(atlas_db *db, const atlas_verifypolicy *policy,
     }
     out->kind = kind;
     out->from = current;
+
+    /* A9.2.1, §28: the conflict axis. Pure and computed from what is already
+     * known — `deterministic_fail` from the fold above, `decision_bound` and
+     * `decision_effective` from the document just read. Reads no memory table,
+     * compares no prose, and does not write or touch the decision itself. */
+    out->aggregate.conflict = atlas_verify_conflict_settle(&out->aggregate, decision_bound,
+                                                           decision_approved_revision_id != 0);
 
     atlas_decision_state from = current, to = current;
     atlas_decision_op_kind opk = ATLAS_DECISION_OP_AUTO_APPROVE;

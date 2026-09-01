@@ -1304,6 +1304,96 @@ static void test_a_deterministic_fail_against_an_effective_decision_is_implement
     env_close(&e);
 }
 
+/* A round-1 review finding on T5: `out->aggregate.conflict` was computed
+ * unconditionally, so a claim demoted to `truth = UNKNOWN` / `SOURCE_DRIFT`
+ * could still store `conflict = IMPLEMENTATION` beside it — a confident
+ * finding about a tree the check did not actually run against. This drives
+ * that exact scenario end to end: the same bound claim and mismatched hash as
+ * above, except the repository's scanned head moves between claim creation
+ * and evaluation, and the stored row must report the demotion on both axes
+ * rather than only on `truth`. */
+static void test_a_source_drift_demotes_the_conflict_axis_too(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    env e;
+    env_open(&e, &err);
+
+    seed_file(&e, "src/parser.c", DRIFT_STORED_HASH, &err);
+    seed_index_current(&e, &err);
+
+    atlas_buf doc_uid = ATLAS_BUF_INIT;
+    propose_decision(&e, "the parser must keep the reviewed hash", &doc_uid, &err);
+    approve_decision(&e, atlas_buf_cstr(&doc_uid), &err);
+
+    /* Bound while the repository is still at COMMIT_A — env_open's own
+     * scanned head — exactly as the non-drifted fixture above. */
+    atlas_buf claim = ATLAS_BUF_INIT;
+    make_bound_claim(&e, "src/parser.c has the reviewed content", atlas_buf_cstr(&doc_uid),
+                     "atlas.content_hash", "path=src/parser.c;sha256=" DRIFT_CLAIMED_HASH, &claim,
+                     &err);
+
+    /* The repository moves on. The claim is still bound to COMMIT_A. */
+    set_head(&e, COMMIT_B, &err);
+
+    atlas_verify_op produce;
+    op_init(&produce, ATLAS_VERIFY_OP_EVIDENCE_PRODUCE);
+    T_OK(atlas_buf_set(&produce.claim_uid, claim.data, claim.len, &err), &err);
+    atlas_verify_intake_result pres;
+    T_OK(apply(&e, &produce, &pres, &err), &err);
+    T_CHECK_MSG(pres.check == ATLAS_CHECK_FAIL,
+                "the mismatched hash did not produce a deterministic FAIL");
+    atlas_verify_intake_result_free(&pres);
+    atlas_verify_op_free(&produce);
+
+    atlas_verify_op eval;
+    op_init(&eval, ATLAS_VERIFY_OP_EVALUATE);
+    T_OK(atlas_buf_set(&eval.claim_uid, claim.data, claim.len, &err), &err);
+    atlas_verify_intake_result eres;
+    T_OK(apply(&e, &eval, &eres, &err), &err);
+
+    /* The in-memory assessment: the deterministic fail is still real, drift is
+     * detected, and the conflict axis must not assert drift over a tree the
+     * check did not run against. */
+    T_CHECK(eres.assessment.aggregate.deterministic_fail);
+    T_CHECK_MSG(eres.assessment.source_drift, "the moved head was not detected as drift");
+    T_CHECK_MSG((int)eres.assessment.truth == (int)ATLAS_TRUTH_UNKNOWN,
+                "got truth %s, want UNKNOWN", atlas_verify_truth_name(eres.assessment.truth));
+    T_CHECK_MSG((int)eres.assessment.truth_reason == (int)ATLAS_TREASON_SOURCE_DRIFT,
+                "got truth_reason %s, want SOURCE_DRIFT",
+                atlas_verify_truth_reason_name(eres.assessment.truth_reason));
+    T_CHECK_MSG((int)eres.assessment.aggregate.conflict == (int)ATLAS_CONFLICT_NONE,
+                "got conflict %s, want NONE: a drifted check must not assert drift",
+                atlas_verify_conflict_name(eres.assessment.aggregate.conflict));
+
+    /* The stored row, read back: both axes together, so a reader years later
+     * cannot see `IMPLEMENTATION` beside `SOURCE_DRIFT` and be misled into
+     * thinking Atlas found disagreement it did not establish. */
+    sqlite3_stmt *stmt = NULL;
+    T_CHECK(sqlite3_prepare_v2(e.db->h,
+                               "SELECT conflict, truth, truth_reason, claim_commit,"
+                               " evaluated_commit, source_drift FROM verify_results"
+                               " ORDER BY id DESC LIMIT 1;",
+                               -1, &stmt, NULL) == SQLITE_OK);
+    T_CHECK(sqlite3_step(stmt) == SQLITE_ROW);
+    T_CHECK_MSG(strcmp((const char *)sqlite3_column_text(stmt, 0), "NONE") == 0,
+                "stored conflict is not NONE: %s", (const char *)sqlite3_column_text(stmt, 0));
+    T_CHECK_MSG(strcmp((const char *)sqlite3_column_text(stmt, 1), "UNKNOWN") == 0,
+                "stored truth is not UNKNOWN: %s", (const char *)sqlite3_column_text(stmt, 1));
+    T_CHECK_MSG(strcmp((const char *)sqlite3_column_text(stmt, 2), "SOURCE_DRIFT") == 0,
+                "stored truth_reason is not SOURCE_DRIFT: %s",
+                (const char *)sqlite3_column_text(stmt, 2));
+    T_CHECK(strcmp((const char *)sqlite3_column_text(stmt, 3), COMMIT_A) == 0);
+    T_CHECK(strcmp((const char *)sqlite3_column_text(stmt, 4), COMMIT_B) == 0);
+    T_CHECK_MSG(sqlite3_column_int(stmt, 5) == 1, "the stored row does not record the drift");
+    sqlite3_finalize(stmt);
+
+    atlas_verify_intake_result_free(&eres);
+    atlas_verify_op_free(&eval);
+    atlas_buf_free(&claim);
+    atlas_buf_free(&doc_uid);
+    env_close(&e);
+}
+
 static const atlas_test TESTS[] = {
     {"a model can create a claim and it binds to a source state",
      test_a_model_can_create_a_claim_and_it_binds_to_a_source_state},
@@ -1339,6 +1429,8 @@ static const atlas_test TESTS[] = {
     {"bounds refuse rather than shorten", test_bounds_refuse_rather_than_shorten},
     {"a deterministic fail against an effective decision is implementation drift",
      test_a_deterministic_fail_against_an_effective_decision_is_implementation_drift},
+    {"a source drift demotes the conflict axis too",
+     test_a_source_drift_demotes_the_conflict_axis_too},
 };
 
 ATLAS_TEST_MAIN("verify_intake", TESTS)

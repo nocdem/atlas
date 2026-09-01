@@ -1804,6 +1804,19 @@ static atlas_status h_verify(atlas_renderer *r, const atlas_verify_report *rep, 
     if (a->aggregate.stale) {
         (void)fprintf(o, "freshness:    some evidence is older than policy allows\n");
     }
+    /* A12.1, T5. Printed only when there is something to say, matching
+     * `freshness` and `limit` above: `ATLAS_CONFLICT_NONE` is the ordinary
+     * case and a badge that appeared on every read would train a reader to
+     * skip it. `atlas_verify_conflict_name` returns a fixed Atlas-owned
+     * string, so it needs no `atlas_safe()` encoding, unlike the `untrusted
+     * project text` fields elsewhere in this function. Kept beside the JSON
+     * renderer's `conflict` key at render_json.c:1814 so a terminal reader
+     * and a JSON reader are told the same thing: an operator seeing `CONFLICT`
+     * in the `automatic:` reasons below previously had no way to tell
+     * implementation drift from ordinary attestation disagreement. */
+    if (a->aggregate.conflict != ATLAS_CONFLICT_NONE) {
+        (void)fprintf(o, "conflict:     %s\n", atlas_verify_conflict_name(a->aggregate.conflict));
+    }
 
     (void)fprintf(o, "policy:       %s", atlas_verifypolicy_state_name(rep->policy_state));
     if (rep->policy_state == ATLAS_VERIFYPOLICY_ENABLED) {

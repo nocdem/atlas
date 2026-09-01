@@ -235,10 +235,14 @@ never silently reinterpreted under a new taxonomy.
 
 ## The aggregation algorithm
 
-`atlas-reliability-v1`. Integer throughout — there is no floating point anywhere
+`atlas-reliability-v2`. Integer throughout — there is no floating point anywhere
 in `src/verify/verify.c` — so "the same inputs produce the same result" is a
 property of the code rather than a hope about rounding. A machine transition has
 to be reproducible from its audit row years later on a different machine.
+
+v2 (A12.1) changes nothing about the score, the state or the weights below; it
+is the version bump that comes with the *Conflicts* section's first producer,
+below. A stored `v1` result is never reinterpreted under `v2`'s rules.
 
 1. every attestation gets a weight from actor class, identity authenticity,
    measured reliability (or the documented prior), freshness and scope match;
@@ -539,6 +543,15 @@ somebody has to remember.
 against the implementation, and under policy it opens an obligation. Collapsing
 it into `CONTRADICTION` would let a broken implementation retract the design it
 violates, which is exactly backwards.
+
+**A12.1 gave `CONTRADICTION` and `IMPLEMENTATION` their first producer,
+`atlas_verify_conflict_settle`** — a pure function of the aggregate plus whether
+the claim is bound to a decision with an effective approved revision. It is
+gated by source drift: where a claim's check ran against a tree it is no longer
+bound to (`truth = UNKNOWN` / `SOURCE_DRIFT`), the conflict is reported as
+`NONE` rather than as a disagreement Atlas has not actually established.
+`SUPERSESSION`, `SCOPE_MISMATCH`, `STALE_EVIDENCE` and `COMPETING_NORMATIVE`
+remain unproduced.
 
 ## Freshness
 

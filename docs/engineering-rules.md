@@ -1543,7 +1543,9 @@ include/atlas/verify.h        the vocabularies, the claim/actor/evidence/
                               attestation model, the aggregate and the db API
 include/atlas/verifypolicy.h  the root-owned policy and the assessment
 src/verify/verify.c           the vocabularies, the priors, the union-find and
-                              `atlas-reliability-v1`; touches no database
+                              `atlas-reliability-v2`; touches no database.
+                              A12.1, T5 added `atlas_verify_conflict_settle`,
+                              the conflict axis's first producer, here
 src/verify/policy.c           the root-owned policy loader
 src/verify/detverify.c        the four deterministic verifiers, every one a read
 src/verify/autolifecycle.c    the one place a verification result becomes a

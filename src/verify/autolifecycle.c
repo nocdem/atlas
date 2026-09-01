@@ -379,6 +379,22 @@ atlas_status atlas_verify_assess(atlas_db *db, const atlas_verifypolicy *policy,
     out->aggregate.conflict = atlas_verify_conflict_settle(&out->aggregate, decision_bound,
                                                            decision_approved_revision_id != 0);
 
+    /* §19, one axis over. `truth_reason == SOURCE_DRIFT` above means the
+     * check just run was against a tree the claim is no longer bound to —
+     * detverify.c's own comment on index currency says that is independent of
+     * whether the recorded content is current, so a deterministic FAIL here can
+     * be a stale read rather than a real disagreement. A conflict verdict
+     * computed from it would assert something Atlas has not established: the
+     * exact failure SOURCE_DRIFT exists to prevent, one axis over. So the
+     * demotion reaches this axis too — NONE, not a new "would have been
+     * drift" member; a stored row must never read `truth = UNKNOWN /
+     * SOURCE_DRIFT` beside `conflict = IMPLEMENTATION` or `CONTRADICTION`,
+     * because the first already says Atlas cannot establish the proposition the
+     * second claims to have found disagreement over. */
+    if (out->truth_reason == ATLAS_TREASON_SOURCE_DRIFT) {
+        out->aggregate.conflict = ATLAS_CONFLICT_NONE;
+    }
+
     atlas_decision_state from = current, to = current;
     atlas_decision_op_kind opk = ATLAS_DECISION_OP_AUTO_APPROVE;
     bool have_candidate = claim.document_id > 0 &&

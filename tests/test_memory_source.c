@@ -16,7 +16,6 @@
  */
 #include <stdio.h>
 #include <string.h>
-#include <unistd.h>
 
 #include "atlas/error.h"
 #include "atlas/limits.h"
@@ -427,25 +426,34 @@ static void test_a_policy_atlas_could_not_read_registers_nothing(void) {
 
 /* --- through the loader ----------------------------------------------------
  *
- * What this half can and cannot establish, stated rather than implied.
+ * **Reachability is observed, never assumed, and it is not a question about the
+ * uid.** `atlas_syspolicy_load_at` reaches its file through
+ * `atlas_rootpath_open`, which walks from `/` and requires every component to be
+ * owned by uid 0 and writable by nobody else (`src/core/rootpath.c:43`). What
+ * gates the parser loop is therefore *that walk succeeding*, which is a property
+ * of the path — not of `geteuid()`. Running as root does not by itself open the
+ * loop: root with `TMPDIR=/tmp` still fails at `/tmp`, which is mode 1777.
+ * Conversely a root-anchored `TMPDIR` opens it, and then a policy that parses is
+ * a policy that parses, whatever it says.
  *
- * `atlas_syspolicy_load_at` reaches the file through `atlas_rootpath_open`,
- * which walks from `/` and requires **every** component to be owned by uid 0
- * and writable by nobody else (`src/core/rootpath.c:43`). A fixture lives under
- * `TMPDIR`, which is `/tmp` at mode 1777 — other-writable — so the walk refuses
- * at the first component and the file is never opened. The `key = value` loop is
- * therefore unreachable from a test process that is not root, and no body below
- * can be observed to produce `ATLAS_SYSPOLICY_REASON_MALFORMED`: the reason is
- * WRITABLE, decided before a byte is read.
+ * So this asks the loader itself. A control policy — complete, well formed, and
+ * saying nothing about memory — is loaded first. If it comes back SYSTEM, the
+ * loop was entered and every case below is asserted for its **content**: the
+ * brief's full matrix, which is what gives the wiring in `src/core/syspolicy.c`
+ * its regression cover. If it comes back anything else, the loop was never
+ * entered, and what is asserted instead is the security property that is
+ * provable without privilege — that no shape an unprivileged uid can construct
+ * anywhere registers a source or turns the sweep on.
  *
- * So this asserts what is provable without privilege, which is the property
- * that matters: **no shape an unprivileged uid can construct anywhere on the
- * filesystem registers a memory source or turns the sweep on.** That is
- * `tests/test_watch_budget.c`'s answer to the identical wall for P0's
- * `watch_max_dirs_total`, and `tests/test_a71_syspolicy.c`'s header states the
- * split. The grammar itself is proved above, against
- * `atlas_memory_source_value_parse` — which is exactly why that function is
- * exposed rather than being a static inside the loader. */
+ * The content half runs whenever the suite is given a root-anchored temporary
+ * directory, e.g.
+ *
+ *     sudo env TMPDIR=/root/atlas-fixtures ./build/tests/test_memory_source
+ *
+ * where `/root` is root-owned and mode 700. Reverting either key branch in the
+ * loader turns that half red; the note below says which half ran, so a run with
+ * no content coverage says so rather than looking complete.
+ */
 
 static void load_body(const fixture *fx, const char *name, const char *body, atlas_syspolicy *out,
                       atlas_err *err) {
@@ -455,66 +463,170 @@ static void load_body(const fixture *fx, const char *name, const char *body, atl
     atlas_syspolicy_load_at(path, out);
 }
 
-static void test_no_unprivileged_policy_registers_a_memory_source(void) {
+#define HEAD "socket_path = /run/atlas/atlas.sock\ndata_dir = /var/lib/atlas\n"
+
+/* Every body the brief names, plus the two the bound turns on. `want_active` is
+ * what the *loader* should make of it once the loop is reachable. */
+typedef struct {
+    const char *body;
+    bool want_active;
+    const char *what;
+} policy_case;
+
+static void check_content(const policy_case *c, const atlas_syspolicy *p, size_t i) {
+    if (c->want_active) {
+        T_CHECK_MSG(p->state == ATLAS_SYSPOLICY_SYSTEM,
+                    "case %zu (%s) should have parsed, got reason %s", i, c->what,
+                    atlas_syspolicy_reason_name(p->reason));
+    } else {
+        T_CHECK_MSG(p->reason == ATLAS_SYSPOLICY_REASON_MALFORMED,
+                    "case %zu (%s) should have been MALFORMED, got %s", i, c->what,
+                    atlas_syspolicy_reason_name(p->reason));
+        T_CHECK_MSG(p->state == ATLAS_SYSPOLICY_LEGACY,
+                    "case %zu (%s) was MALFORMED and not legacy", i, c->what);
+        /* A12.1's fail-closed rule, end to end: whatever the malformed policy
+         * left in the fields, nothing may be read out of it. */
+        T_CHECK_MSG(atlas_syspolicy_memory_source_count_checked(p) == 0,
+                    "case %zu (%s) registered a source from a policy that did not parse", i,
+                    c->what);
+        T_CHECK_MSG(!atlas_syspolicy_memory_reconcile_effective_checked(p),
+                    "case %zu (%s) turned the sweep on from a policy that did not parse", i,
+                    c->what);
+    }
+}
+
+static void test_the_loader_matrix(void) {
     atlas_err err;
     atlas_err_init(&err);
     fixture fx;
     T_OK(fx_open(&fx, &err), &err);
 
-    /* One more `memory_source` line than the bound admits. Refused rather than
-     * truncated — `client_uid`'s rule — because a silently shortened list is one
-     * whose author and reader disagree about what is on it. */
-    char overflow[8192];
-    size_t used = (size_t)snprintf(overflow, sizeof overflow,
-                                   "socket_path = /run/atlas/atlas.sock\n"
-                                   "data_dir = /var/lib/atlas\n");
+    /* One source more than the bound admits, and exactly as many as it does.
+     * The pair is the `>=`-not-`+ 1 >=` check: sixteen must parse and seventeen
+     * must be refused, which is P0's season sentence measured rather than
+     * asserted. */
+    char over[8192];
+    char exact[8192];
+    size_t uo = (size_t)snprintf(over, sizeof over, HEAD);
+    size_t ue = (size_t)snprintf(exact, sizeof exact, HEAD);
     for (unsigned i = 0; i < ATLAS_MEMORY_MAX_SOURCES + 1u; i++) {
-        used += (size_t)snprintf(overflow + used, sizeof overflow - used,
-                                 "memory_source = REPO_FILE:m%u.md\n", i);
-        T_REQUIRE(used < sizeof overflow);
+        uo += (size_t)snprintf(over + uo, sizeof over - uo, "memory_source = REPO_FILE:m%u.md\n",
+                               i);
+        T_REQUIRE(uo < sizeof over);
+        if (i < ATLAS_MEMORY_MAX_SOURCES) {
+            ue += (size_t)snprintf(exact + ue, sizeof exact - ue,
+                                   "memory_source = REPO_FILE:m%u.md\n", i);
+            T_REQUIRE(ue < sizeof exact);
+        }
     }
 
-#define HEAD "socket_path = /run/atlas/atlas.sock\ndata_dir = /var/lib/atlas\n"
-    const char *const bodies[] = {
-        overflow,
-        /* An unrecognised sweep spelling; the two recognised ones; the key
-         * stated twice; neither key at all; a well-formed source -- the file an
-         * unprivileged attacker would write; and a source the grammar refuses. */
-        HEAD "memory_reconcile = yes\n",
-        HEAD "memory_reconcile = ENABLED\n",
-        HEAD "memory_reconcile = DISABLED\n",
-        HEAD "memory_reconcile = ENABLED\nmemory_reconcile = DISABLED\n",
-        HEAD,
-        HEAD "memory_source = REPO_FILE:CLAUDE.md\n",
-        HEAD "memory_source = REPO_FILE:../escape\n",
+    const policy_case CASES[] = {
+        {HEAD, true, "neither key, and otherwise complete"},
+        {HEAD "memory_reconcile = ENABLED\n", true, "the sweep enabled"},
+        {HEAD "memory_reconcile = DISABLED\n", true, "the sweep disabled"},
+        {HEAD "memory_reconcile = yes\n", false, "an unrecognised sweep spelling"},
+        {HEAD "memory_reconcile = ENABLED\nmemory_reconcile = DISABLED\n", false,
+         "the sweep key stated twice"},
+        {HEAD "memory_source = REPO_FILE:CLAUDE.md\n", true, "one repository file"},
+        {HEAD "memory_source = REPO_DIR@atlas:.claude/memories\n", true,
+         "a directory scoped to one repository"},
+        {HEAD "memory_source = EXTERNAL_DIR:/srv/mem\n", true, "an external directory"},
+        {HEAD "memory_source = REPO_FILE:a..b.md\n", true,
+         "two dots inside a component are a filename"},
+        {HEAD "memory_source = REPO_FILE:a/../b\n", false, "a `..` component"},
+        {HEAD "memory_source = REPO_FILE:.git/config\n", false, "the repository's own metadata"},
+        {HEAD "memory_source = REPO_FILE:/absolute\n", false, "an absolute repository path"},
+        {HEAD "memory_source = EXTERNAL_FILE:relative\n", false, "a relative external path"},
+        {HEAD "memory_source = FOO:x\n", false, "an unrecognised class"},
+        {exact, true, "exactly the bound: sixteen sources"},
+        {over, false, "one over the bound: seventeen sources"},
     };
-#undef HEAD
 
-    for (size_t i = 0; i < sizeof bodies / sizeof bodies[0]; i++) {
+    /* Ask the loader whether its parser loop is reachable here, rather than
+     * guessing from the uid. Case 0 is the control: complete, well formed, and
+     * silent about memory. */
+    atlas_syspolicy probe;
+    load_body(&fx, "probe.conf", CASES[0].body, &probe, &err);
+    bool reachable = probe.state == ATLAS_SYSPOLICY_SYSTEM;
+
+    for (size_t i = 0; i < sizeof CASES / sizeof CASES[0]; i++) {
         char name[64];
         (void)snprintf(name, sizeof name, "memory-%zu.conf", i);
         atlas_syspolicy p;
-        load_body(&fx, name, bodies[i], &p, &err);
-        T_CHECK_MSG(p.state != ATLAS_SYSPOLICY_SYSTEM,
-                    "a policy written by this uid reached system mode (case %zu)", i);
-        T_CHECK_MSG(p.memory_source_count == 0,
-                    "a policy written by this uid registered a memory source (case %zu)", i);
-        T_CHECK_MSG(p.memory_reconcile == 0,
-                    "a policy written by this uid stated a sweep intent (case %zu)", i);
-        T_CHECK_MSG(!atlas_syspolicy_memory_reconcile_effective(&p),
-                    "a policy written by this uid turned the sweep on (case %zu)", i);
+        load_body(&fx, name, CASES[i].body, &p, &err);
+        if (reachable) {
+            check_content(&CASES[i], &p, i);
+        } else {
+            /* The loop was never entered, so nothing here is a statement about
+             * the grammar — it is the security property, and it holds for every
+             * body including the well-formed ones. */
+            T_CHECK_MSG(p.state != ATLAS_SYSPOLICY_SYSTEM,
+                        "a policy written by this uid reached system mode (case %zu)", i);
+            T_CHECK_MSG(atlas_syspolicy_memory_source_count_checked(&p) == 0,
+                        "a policy written by this uid registered a memory source (case %zu)", i);
+            T_CHECK_MSG(!atlas_syspolicy_memory_reconcile_effective_checked(&p),
+                        "a policy written by this uid turned the sweep on (case %zu)", i);
+        }
     }
 
-    /* Case 5 has neither key and is otherwise a complete policy: it must not be
-     * the *grammar* that refused the ones above. Recorded rather than asserted
-     * either way, for `test_a71_syspolicy.c`'s reason — on this machine it fails
-     * the ownership walk like every other fixture file. */
-    atlas_test_note("the loader ran as %s, so the parser loop was %s",
-                    geteuid() == 0 ? "root" : "an unprivileged uid",
-                    geteuid() == 0 ? "reachable" : "never entered");
+    if (reachable) {
+        /* The fields themselves, for the cases that parsed. This is what a
+         * deleted key branch or a reintroduced `+ 1 >=` turns red. */
+        atlas_syspolicy p;
+        load_body(&fx, "one.conf", CASES[5].body, &p, &err);
+        T_REQUIRE(atlas_syspolicy_memory_source_count_checked(&p) == 1);
+        const struct atlas_syspolicy_memory_source *s =
+            atlas_syspolicy_memory_source_at_checked(&p, 0);
+        T_REQUIRE(s != NULL);
+        T_EQ_INT((int)s->cls, (int)ATLAS_MEMORY_SOURCE_REPO_FILE);
+        T_EQ_STR(s->repo_name, "");
+        T_EQ_STR(s->path, "CLAUDE.md");
+
+        load_body(&fx, "scoped.conf", CASES[6].body, &p, &err);
+        T_REQUIRE(atlas_syspolicy_memory_source_count_checked(&p) == 1);
+        s = atlas_syspolicy_memory_source_at_checked(&p, 0);
+        T_REQUIRE(s != NULL);
+        T_EQ_INT((int)s->cls, (int)ATLAS_MEMORY_SOURCE_REPO_DIR);
+        T_EQ_STR(s->repo_name, "atlas");
+        T_EQ_STR(s->path, ".claude/memories");
+
+        load_body(&fx, "dots.conf", CASES[8].body, &p, &err);
+        T_REQUIRE(atlas_syspolicy_memory_source_count_checked(&p) == 1);
+        s = atlas_syspolicy_memory_source_at_checked(&p, 0);
+        T_REQUIRE(s != NULL);
+        T_EQ_STR(s->path, "a..b.md");
+
+        /* The bound, from both sides. */
+        load_body(&fx, "exact.conf", exact, &p, &err);
+        T_CHECK_MSG(atlas_syspolicy_memory_source_count_checked(&p) == ATLAS_MEMORY_MAX_SOURCES,
+                    "exactly the bound did not parse: %zu of %u",
+                    atlas_syspolicy_memory_source_count_checked(&p),
+                    (unsigned)ATLAS_MEMORY_MAX_SOURCES);
+
+        /* And the sweep, read through the accessor a consumer uses. */
+        load_body(&fx, "on.conf", CASES[1].body, &p, &err);
+        T_CHECK_MSG(atlas_syspolicy_memory_reconcile_effective_checked(&p),
+                    "ENABLED did not reach the sweep gate");
+        load_body(&fx, "off.conf", CASES[2].body, &p, &err);
+        T_CHECK_MSG(!atlas_syspolicy_memory_reconcile_effective_checked(&p),
+                    "DISABLED did not reach the sweep gate");
+        load_body(&fx, "none.conf", CASES[0].body, &p, &err);
+        T_CHECK_MSG(atlas_syspolicy_memory_reconcile_effective_checked(&p) ==
+                        ATLAS_MEMORY_RECONCILE_DEFAULT,
+                    "a policy silent about the sweep did not fall to the named default");
+    }
+
+    atlas_test_note(reachable
+                        ? "the fixture path is root-anchored, so the parser loop ran and the "
+                          "content matrix was asserted"
+                        : "the fixture path is not root-anchored, so the parser loop was never "
+                          "entered and ONLY the fail-closed matrix ran; the loader wiring has no "
+                          "regression cover in this run");
 
     fx_close(&fx);
 }
+
+#undef HEAD
 
 static const atlas_test TESTS[] = {
     {"UNKNOWN is zero in every vocabulary", test_unknown_is_zero_in_every_vocabulary},
@@ -535,8 +647,8 @@ static const atlas_test TESTS[] = {
      test_the_sweep_gate_resolves_unset_to_the_named_default},
     {"a policy Atlas could not read registers nothing",
      test_a_policy_atlas_could_not_read_registers_nothing},
-    {"no unprivileged policy registers a memory source",
-     test_no_unprivileged_policy_registers_a_memory_source},
+    {"the loader matrix, asserted for content where the loop is reachable",
+     test_the_loader_matrix},
 };
 
 ATLAS_TEST_MAIN("memory_source", TESTS)

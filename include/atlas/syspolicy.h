@@ -235,24 +235,52 @@ bool atlas_syspolicy_permits(const atlas_syspolicy *p, long long uid);
  * silent no. */
 bool atlas_syspolicy_semantic_auto_default(const atlas_syspolicy *p);
 
-/* A12.1. Whether the memory reconciliation sweep runs on this machine: ENABLED
- * is true, DISABLED is false, and UNSET is the named compiled-in
+/* A12.1. What this policy *says* about the memory sweep: ENABLED is true,
+ * DISABLED is false, and UNSET is the named compiled-in
  * `ATLAS_MEMORY_RECONCILE_DEFAULT`.
  *
- * The same shape as `atlas_syspolicy_semantic_auto_default` above and
- * deliberately not sensitive to `state`, for that function's reason: an absent
- * or legacy policy is the ordinary condition of a per-user install, and it is
- * the absence of a statement rather than a statement of "no".
- *
- * The residual is A9.2.4's and is stated rather than solved. The parser assigns
- * each key as it reads it and returns on the first malformed line, so a
- * well-formed `memory_reconcile` followed by a bad line leaves the field set on
- * a struct whose `state` is LEGACY — exactly the condition P0 answered for the
- * watch budget with a second `_checked` accessor. A consumer that must honour
- * only a policy which parsed in full checks `state` itself; there is no
- * `_checked` form here because nothing yet needs one, and adding an accessor
- * with no caller would be a second answer to a question nobody has asked. */
+ * This reads the field alone and does not consult `state`, so it answers "what
+ * is written here" rather than "what should Atlas do". **It is not the one a
+ * consumer wants**: use `atlas_syspolicy_memory_reconcile_effective_checked`
+ * below. This form is kept because it is the mapping the season specified and
+ * because reporting a policy's stated content is a real question, exactly as
+ * `atlas_syspolicy_watch_max_dirs_total` is kept beside its `_checked` form. */
 bool atlas_syspolicy_memory_reconcile_effective(const atlas_syspolicy *p);
+
+/* A12.1. The same answer, but only from a policy that actually parsed — P0's
+ * `atlas_syspolicy_watch_max_dirs_total_checked`, and the same argument.
+ *
+ * The parser assigns each key as it reads it and returns on the first malformed
+ * line, so a well-formed `memory_reconcile = ENABLED` followed later by a bad
+ * line leaves the field set on a struct whose `state` is LEGACY. Every other
+ * consumer treats such a policy as absent; this must too, or Atlas would honour
+ * half a policy nobody can read back — and here the half it honoured would start
+ * a pass that reads documents and writes stored claims.
+ *
+ * `atlas_syspolicy_semantic_auto_default`'s state-insensitivity is deliberately
+ * **not** the precedent followed. That accessor can ignore `state` because doing
+ * so changes no intended answer: it falls back to its own default either way, so
+ * it fails *toward* it. This one would fail *away* from a default the season set
+ * to false on purpose, which is the opposite direction and the reason the check
+ * belongs here rather than in a comment telling each caller to remember it.
+ *
+ * An absent or legacy policy — the ordinary per-user install — is the absence of
+ * a statement and resolves to `ATLAS_MEMORY_RECONCILE_DEFAULT`, which is what a
+ * machine nobody has configured gets. */
+bool atlas_syspolicy_memory_reconcile_effective_checked(const atlas_syspolicy *p);
+
+/* A12.1. How many memory sources a policy that parsed registers, and the one at
+ * `i`, or NULL past the end.
+ *
+ * The array has no unchecked accessor on purpose. A source list read from a
+ * policy Atlas declared unreadable would name the documents that describe a
+ * repository to every later reader, taken from a file whose author cannot read
+ * back what it says — so there is deliberately no form of this call that can
+ * return one. Zero and NULL are what a legacy, absent or malformed policy
+ * yields, which is the same answer as a policy that registered nothing. */
+size_t atlas_syspolicy_memory_source_count_checked(const atlas_syspolicy *p);
+const struct atlas_syspolicy_memory_source *
+atlas_syspolicy_memory_source_at_checked(const atlas_syspolicy *p, size_t i);
 
 /* P0. The daemon-wide watch budget this policy states, or 0 where it states
  * none and the caller should derive one from the kernel.

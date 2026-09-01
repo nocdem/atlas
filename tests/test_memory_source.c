@@ -357,6 +357,74 @@ static void test_the_sweep_gate_resolves_unset_to_the_named_default(void) {
                 "the reconcile default changed; that is a decision, not a constant");
 }
 
+static void test_a_policy_atlas_could_not_read_registers_nothing(void) {
+    /* The parser assigns each key as it reads it and returns on the first
+     * malformed line -- `client_uid`'s established shape. So a policy carrying a
+     * well-formed `memory_reconcile = ENABLED` and two good `memory_source`
+     * lines, followed later by a typo'd key, ends with `state` LEGACY and both
+     * fields *populated*. Reading them then would honour half a policy nobody
+     * can read back, and the direction is the dangerous one: the sweep would run
+     * off a file Atlas has declared unreadable.
+     *
+     * This is not `semantic_auto_default`'s situation and its justification does
+     * not transfer. That accessor is insensitive to `state` because gating it
+     * changes no intended answer -- it fails *toward* its own default. This one
+     * would fail *away* from a default the season deliberately set to false. The
+     * precedent that fits is P0's `atlas_syspolicy_watch_max_dirs_total_checked`.
+     */
+    atlas_syspolicy p;
+    memset(&p, 0, sizeof p);
+    p.state = ATLAS_SYSPOLICY_LEGACY;
+    p.reason = ATLAS_SYSPOLICY_REASON_MALFORMED;
+    p.memory_reconcile = 1;
+    p.memory_source_count = 2;
+    p.memory_sources[0].cls = ATLAS_MEMORY_SOURCE_REPO_FILE;
+    (void)snprintf(p.memory_sources[0].path, sizeof p.memory_sources[0].path, "CLAUDE.md");
+    p.memory_sources[1].cls = ATLAS_MEMORY_SOURCE_EXTERNAL_DIR;
+    (void)snprintf(p.memory_sources[1].path, sizeof p.memory_sources[1].path, "/srv/mem");
+
+    T_CHECK_MSG(atlas_syspolicy_memory_reconcile_effective_checked(&p) ==
+                    ATLAS_MEMORY_RECONCILE_DEFAULT,
+                "a policy that did not parse turned the sweep on");
+    T_CHECK_MSG(atlas_syspolicy_memory_source_count_checked(&p) == 0,
+                "a policy that did not parse registered a memory source");
+    T_CHECK_MSG(atlas_syspolicy_memory_source_at_checked(&p, 0) == NULL,
+                "a policy that did not parse handed out a memory source");
+
+    /* The unchecked flag accessor keeps the brief's semantics and is what shows
+     * the difference: it still answers from the field alone. */
+    T_CHECK(atlas_syspolicy_memory_reconcile_effective(&p));
+
+    /* The same struct, once it is a policy that parsed. Nothing about the fields
+     * changed; what changed is that Atlas can now read the file back. */
+    p.state = ATLAS_SYSPOLICY_SYSTEM;
+    p.reason = ATLAS_SYSPOLICY_REASON_ACTIVE;
+    T_CHECK(atlas_syspolicy_memory_reconcile_effective_checked(&p));
+    T_CHECK(atlas_syspolicy_memory_source_count_checked(&p) == 2);
+    const struct atlas_syspolicy_memory_source *s = atlas_syspolicy_memory_source_at_checked(&p, 0);
+    T_REQUIRE(s != NULL);
+    T_EQ_INT((int)s->cls, (int)ATLAS_MEMORY_SOURCE_REPO_FILE);
+    T_EQ_STR(s->path, "CLAUDE.md");
+    s = atlas_syspolicy_memory_source_at_checked(&p, 1);
+    T_REQUIRE(s != NULL);
+    T_EQ_STR(s->path, "/srv/mem");
+    /* Past the count is refused rather than read out of the tail of the array,
+     * which is still full of whatever the parser left there. */
+    T_CHECK(atlas_syspolicy_memory_source_at_checked(&p, 2) == NULL);
+    T_CHECK(atlas_syspolicy_memory_source_at_checked(&p, ATLAS_MEMORY_MAX_SOURCES) == NULL);
+
+    /* DISABLED on a policy that parsed is still DISABLED. */
+    p.memory_reconcile = 2;
+    T_CHECK(!atlas_syspolicy_memory_reconcile_effective_checked(&p));
+
+    /* No policy at all is the ordinary per-user install: no statement, so the
+     * named default, and nothing registered. */
+    T_CHECK(atlas_syspolicy_memory_reconcile_effective_checked(NULL) ==
+            ATLAS_MEMORY_RECONCILE_DEFAULT);
+    T_CHECK(atlas_syspolicy_memory_source_count_checked(NULL) == 0);
+    T_CHECK(atlas_syspolicy_memory_source_at_checked(NULL, 0) == NULL);
+}
+
 /* --- through the loader ----------------------------------------------------
  *
  * What this half can and cannot establish, stated rather than implied.
@@ -465,6 +533,8 @@ static const atlas_test TESTS[] = {
      test_the_value_grammar_refuses_rather_than_repairs},
     {"the sweep gate resolves UNSET to the named default",
      test_the_sweep_gate_resolves_unset_to_the_named_default},
+    {"a policy Atlas could not read registers nothing",
+     test_a_policy_atlas_could_not_read_registers_nothing},
     {"no unprivileged policy registers a memory source",
      test_no_unprivileged_policy_registers_a_memory_source},
 };

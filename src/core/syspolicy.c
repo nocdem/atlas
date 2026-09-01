@@ -94,15 +94,16 @@ bool atlas_syspolicy_semantic_auto_default(const atlas_syspolicy *p) {
     return ATLAS_SEM_AUTO_DEFAULT;
 }
 
-/* A12.1. The policy's answer where it gives one, and the named compiled-in
- * default where it does not -- `atlas_syspolicy_semantic_auto_default`'s shape
- * and its argument, including being insensitive to `state`.
+/* A12.1. What the policy *says*: the field alone, with the named compiled-in
+ * default where it says nothing.
  *
- * The default it resolves to is `false` rather than that function's `true`, and
- * the difference is the point: A9.2.4 could reverse its default because libclang
+ * The default is `false` rather than `ATLAS_SEM_AUTO_DEFAULT`'s `true`, and the
+ * difference is the point: A9.2.4 could reverse its default because libclang
  * only ever *parses* and what was being weighed was compute, whereas this pass
  * reads documents an operator named and turns them into stored claims. The
- * absence of a statement is not consent to start doing that. */
+ * absence of a statement is not consent to start doing that.
+ *
+ * Not the accessor a consumer wants -- see the `_checked` form below. */
 bool atlas_syspolicy_memory_reconcile_effective(const atlas_syspolicy *p) {
     if (p == NULL) {
         return ATLAS_MEMORY_RECONCILE_DEFAULT;
@@ -114,6 +115,52 @@ bool atlas_syspolicy_memory_reconcile_effective(const atlas_syspolicy *p) {
         return false;
     }
     return ATLAS_MEMORY_RECONCILE_DEFAULT;
+}
+
+/* A12.1. The same answer, but only from a policy that actually parsed.
+ *
+ * `atlas_syspolicy_watch_max_dirs_total_checked`'s shape and its argument. The
+ * parser assigns each key as it reads it and returns on the first malformed
+ * line, so a well-formed `memory_reconcile = ENABLED` followed later by a bad
+ * line leaves the field set on a struct whose `state` is LEGACY. Every other
+ * consumer treats that policy as absent, and this must too, or the sweep would
+ * run off a file Atlas has itself declared unreadable.
+ *
+ * A9.2.4's accessor is deliberately insensitive to `state` and that is **not**
+ * the precedent here: it can ignore `state` because doing so changes no intended
+ * answer -- it falls back toward its own default either way. This one would fall
+ * *away* from a default the season set to false on purpose, which is the
+ * opposite direction. */
+bool atlas_syspolicy_memory_reconcile_effective_checked(const atlas_syspolicy *p) {
+    if (p == NULL || p->state != ATLAS_SYSPOLICY_SYSTEM) {
+        return ATLAS_MEMORY_RECONCILE_DEFAULT;
+    }
+    return atlas_syspolicy_memory_reconcile_effective(p);
+}
+
+/* A12.1. The registered sources, and only from a policy that parsed.
+ *
+ * There is deliberately no unchecked form: a source list read from a policy
+ * Atlas declared unreadable would name the documents that describe a repository
+ * to every later reader, taken from a file whose author cannot read back what it
+ * says. The count is also clamped against the array rather than trusted, because
+ * it is read here through a struct any caller may have built. */
+size_t atlas_syspolicy_memory_source_count_checked(const atlas_syspolicy *p) {
+    if (p == NULL || p->state != ATLAS_SYSPOLICY_SYSTEM) {
+        return 0;
+    }
+    if (p->memory_source_count > ATLAS_MEMORY_MAX_SOURCES) {
+        return ATLAS_MEMORY_MAX_SOURCES;
+    }
+    return p->memory_source_count;
+}
+
+const struct atlas_syspolicy_memory_source *
+atlas_syspolicy_memory_source_at_checked(const atlas_syspolicy *p, size_t i) {
+    if (i >= atlas_syspolicy_memory_source_count_checked(p)) {
+        return NULL;
+    }
+    return &p->memory_sources[i];
 }
 
 /* P0. Same shape and the same argument as the accessor above: the policy's

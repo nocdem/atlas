@@ -616,3 +616,73 @@ ayna `.claude/`'u hiç taşımıyor.
 **Ders, yazılıyor çünkü bugün iki kez tekrarlandı:** bir etkiyi kendi eylemime
 bağlamadan önce mekanizmayı koddan kurmadım. İki kez de "ölçtüm" dediğim şey
 eşzamanlılıktı, zincir değildi.
+
+---
+
+## (b) Doğrulanmamış üç iddianın denetimi — 2026-09-01 13:55
+
+Üçü de kodla sınandı. Biri çürüdü, biri doğrulandı, biri doğrulandı **ve madde
+3'ün teşhisini değiştirdi**.
+
+### İddia 6 — "put ∪ keep = tam küme" — ÇÜRÜDÜ
+
+`mirror_one` (`src/core/service_scanner.c`) okunamayan bir yolda
+`skipped_unreadable++` deyip döner: o yol ne `put` edilir ne `keep`. Tam küme
+put ∪ keep ∪ **skipped**'tır. Bir silme süpürmesi için bu fark belirleyicidir —
+o geçişte geçici olarak okunamayan bir dosya silinmiş sayılırdı. A13'ün
+"küçük silme süpürmesi diye bir şey yoktur" cümlesi bu yüzden yazılmış, ve bu
+tek başına önerdiğim yerinde-güncelleme tasarımını bitirir.
+
+### İddia 7 — "`mirror_complete` okumayı kapılıyor" — DOĞRULANDI
+
+`src/core/mirror_open.c:84`: `if (!info->mirror_complete)` ile reddediyor.
+`tests/test_mirror_source.c`'deki `test_an_incomplete_mirror_is_refused` de
+kapsıyor.
+
+### İddia 8 — DOĞRULANDI, ve madde 3'ün sebebi bu
+
+Yayım (rename) izlemeleri yıkmıyor. Yıkan şey `mirror_complete`:
+
+1. `mirror_complete`, bir scanner koşusu **başlarken** temizleniyor (tasarım)
+2. Temizken `atlas_repo_open_git` depoyu reddediyor → depo okunamaz
+3. `run_mirror_state` (`src/daemon/writer.c:713`) bunu görüp watch'ları
+   kirletiyor — yorumu: *"A repository that has just become readable is one the
+   watcher's view of was built when it was not."*
+4. `watch.c:3284`: bir rebuild **her** izlemeyi düşürüp yeniden kuruyor ve
+   **her depoya bir olay boşluğu borçlandırıyor**
+5. Olay boşluğu geçişi `full` yapıyor
+6. `src/core/reconcile.c:564`: `if (full) { e->need_hash = true; continue; }` —
+   **tam geçiş kimlik karşılaştırmasını hiç çalıştırmaz**
+
+Yani günlükteki `0 unchanged by identity`, ctime'ın bozulduğunu **göstermiyor**;
+karşılaştırmanın hiç yapılmadığını gösteriyor. Canlı zincir, 10:26–10:32:
+
+```
+10:26:51  watching atlas (0 source, 0 metadata, 0 shared)     <- kosu basladi
+10:31:19  reconciled atlas 25598: 420 examined, 420 hashed, 0 unchanged
+10:31:20  watching atlas (51 source, 11 metadata, 0 shared)   <- kosu bitti
+10:32:06  watching atlas (0 source, 0 metadata, 0 shared)     <- sonraki kosu
+```
+
+**Bu, madde 3'ün gövdesindeki teşhisi de benim akıl yürütmemi de düzeltir.**
+Gövde "yayım her dosyanın inode'unu değiştiriyor, A1'in kimlik önbelleği tasarım
+gereği işe yaramıyor" diyor. `link()`'in ctime'ı oynattığı doğru — deneyle
+ölçtüm — ama **operatif sebep o değil**: ara turlarda (yayım yokken) aynı depo
+`420 examined, 0 hashed, 420 unchanged by identity` veriyor, yani taşınmış
+dosyaların kimliği pekâlâ tutuyor.
+
+**Madde 3 ile madde 5 gerçekten tek şey, ama düşündüğüm şey değil.** Bağlayan
+halka inode değişimi değil, `mirror_complete`'in her geçişte okunabilirliği
+false→true çevirmesi.
+
+**Düzeltme yazılmadı ve burada tasarlanmıyor.** Yönü belli — sıradan bir scanner
+koşusunun başlaması "kaynak değişti" ile aynı şey değil — ama bu, bugün iki kez
+yaptığım hatayı tekrarlamamak için kendi ölçümünü ve kendi tasarımını hak ediyor.
+
+### Madde 10 — ÇÖZÜLDÜ
+
+`d4d0670`. `atlas_sem_discovery_run_on` okuma kökünü düzeltip yürüyor; ham
+yürüyüşü yalnızca tanımı ve o tek sarmalayıcı adlandırabiliyor,
+`tests/test_sem_discovery.c` bunu `src/` tarayarak koruyor. Testin dişi
+kanıtlandı: üst commit'te üç dosya adlandırıyordu, iddia iki. Kapılar:
+release derleme `ATLAS_WERROR` altında temiz, ctest **105/105**.

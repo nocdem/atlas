@@ -47,6 +47,17 @@
 #define ATLAS_MEMORY_H
 
 #include <stdbool.h>
+#include <stddef.h>
+
+/* Forward-declared rather than included, and the direction is the whole point.
+ *
+ * `syspolicy.h` needs the **complete** `atlas_memory_source_class` for a struct
+ * member, so it includes this header. This header needs only a pointer to the
+ * struct that header defines, so an incomplete type is enough — and declaring it
+ * here is what keeps the dependency one-way instead of a cycle. `verify.h` does
+ * the same for `atlas_db`, for the same reason. The struct is defined once, in
+ * `syspolicy.h`, because that is where a policy's parsed shape lives. */
+typedef struct atlas_syspolicy_memory_source atlas_syspolicy_memory_source;
 
 /* What a registered memory source is, and -- the load-bearing half -- **who can
  * read it**.
@@ -144,5 +155,42 @@ typedef enum atlas_memory_gen_cause {
 
 const char *atlas_memory_gen_cause_name(atlas_memory_gen_cause c);
 bool atlas_memory_gen_cause_parse(const char *name, atlas_memory_gen_cause *out);
+
+/* --- the policy value grammar ---------------------------------------------
+ *
+ * One `memory_source` line's value, which is
+ *
+ *     CLASS[@repository]:path
+ *
+ * Split at the first `:`; the head is split at the first `@`. `repository` is a
+ * registered repository's name and its absence means *every* registered
+ * repository, which is the ordinary case: an operator naming `CLAUDE.md` means
+ * the one in whichever tree is being reconciled.
+ *
+ * **Refused rather than repaired, everywhere.** A repository path is relative
+ * and an external path is absolute; a `..` component is refused; the
+ * repository's own `.git` is not a memory source; a value that does not fit the
+ * fields is refused rather than truncated, because a silently shortened path
+ * names a different file and nothing downstream could tell. The `..` rule is
+ * about a path **component**, so `a..b.md` is an ordinary filename and is
+ * accepted — a parser reaching for `strstr` there is the obvious bug and the
+ * suite has the case for it.
+ *
+ * Exposed rather than hidden inside the loader **so it can be tested at all**.
+ * `atlas_syspolicy_load_at` reaches its file through `atlas_rootpath_open`,
+ * which requires every path component from `/` to be root-owned; no test process
+ * that is not root can construct such a file anywhere, so a grammar reachable
+ * only through the loader would be a grammar no test could enumerate. This is
+ * the shape P0 used for `atlas_syspolicy_watch_budget_in_range`.
+ *
+ * `val` is `len` raw bytes and is **not** required to be NUL-terminated. Paths
+ * are bytes, not text: nothing here assumes UTF-8 and nothing splits on
+ * whitespace. A value carrying a NUL byte is refused, because storing it would
+ * silently shorten the path to the NUL.
+ *
+ * On refusal `*out` is zeroed, so a caller that ignored the return value holds
+ * `ATLAS_MEMORY_SOURCE_UNKNOWN` rather than a half-filled source. */
+bool atlas_memory_source_value_parse(const char *val, size_t len,
+                                     atlas_syspolicy_memory_source *out);
 
 #endif /* ATLAS_MEMORY_H */

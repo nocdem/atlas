@@ -14,10 +14,16 @@
  * `atlas_memory_source_value_parse` is exposed: a grammar that could only be
  * exercised through a root-owned file on disk could not be enumerated at all.
  */
+#include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
+#include "atlas/error.h"
+#include "atlas/limits.h"
 #include "atlas/memory.h"
+#include "atlas/syspolicy.h"
 #include "atlas_test.h"
+#include "support/fixture.h"
 
 /* --- zeros ---------------------------------------------------------------- */
 
@@ -208,6 +214,240 @@ static void test_is_repo_is_true_for_exactly_the_two_repo_classes(void) {
     T_CHECK(!atlas_memory_source_class_is_repo(ATLAS_MEMORY_SOURCE_UNKNOWN));
 }
 
+/* --- the policy value grammar --------------------------------------------- */
+
+static void test_the_value_grammar_accepts_exactly_what_it_should(void) {
+    /* `CLASS[@repo]:path`. Split at the first `:`, split the head at the first
+     * `@`. Every field is written out here rather than derived from the parser,
+     * because a test that agreed with a second copy of the rules would pass
+     * while the rules were wrong. */
+    static const struct {
+        const char *val;
+        atlas_memory_source_class cls;
+        const char *repo;
+        const char *path;
+        const char *what;
+    } OK[] = {
+        {"REPO_FILE:CLAUDE.md", ATLAS_MEMORY_SOURCE_REPO_FILE, "", "CLAUDE.md",
+         "a repository file"},
+        {"REPO_DIR:.claude/memories", ATLAS_MEMORY_SOURCE_REPO_DIR, "", ".claude/memories",
+         "a repository directory"},
+        {"EXTERNAL_FILE:/x/y.md", ATLAS_MEMORY_SOURCE_EXTERNAL_FILE, "", "/x/y.md",
+         "an external file"},
+        {"EXTERNAL_DIR:/x/mem", ATLAS_MEMORY_SOURCE_EXTERNAL_DIR, "", "/x/mem",
+         "an external directory"},
+        {"REPO_FILE@atlas:CLAUDE.md", ATLAS_MEMORY_SOURCE_REPO_FILE, "atlas", "CLAUDE.md",
+         "a source scoped to one named repository"},
+        {"EXTERNAL_DIR@atlas:/x/mem", ATLAS_MEMORY_SOURCE_EXTERNAL_DIR, "atlas", "/x/mem",
+         "an external directory scoped to one named repository"},
+        /* The `..` rule is about a path *component*, not a substring. This is a
+         * perfectly ordinary filename and refusing it would be the obvious bug
+         * in a parser that reached for `strstr`. */
+        {"REPO_FILE:a..b.md", ATLAS_MEMORY_SOURCE_REPO_FILE, "", "a..b.md",
+         "two dots inside a component are part of a filename"},
+    };
+    for (size_t i = 0; i < sizeof OK / sizeof OK[0]; i++) {
+        atlas_syspolicy_memory_source s;
+        memset(&s, 0xff, sizeof s);
+        T_CHECK_MSG(atlas_memory_source_value_parse(OK[i].val, strlen(OK[i].val), &s),
+                    "\"%s\" was refused (%s)", OK[i].val, OK[i].what);
+        T_EQ_INT((int)s.cls, (int)OK[i].cls);
+        T_EQ_STR(s.repo_name, OK[i].repo);
+        T_EQ_STR(s.path, OK[i].path);
+    }
+}
+
+static void test_the_value_grammar_refuses_rather_than_repairs(void) {
+    static const struct {
+        const char *val;
+        const char *why;
+    } BAD[] = {
+        {"REPO_FILE", "no colon at all, so nothing names a path"},
+        {"FOO:x", "an unrecognised class"},
+        {"REPO_FILE:/absolute", "a repository path is relative to the repository root"},
+        {"REPO_FILE:a/../b", "a `..` component leaves the repository"},
+        {"REPO_FILE:.git/config", "the repository's own metadata is not a memory source"},
+        {"EXTERNAL_FILE:relative", "an external path is absolute or it is not external"},
+        {"REPO_FILE:", "an empty path"},
+        {"REPO_FILE@:CLAUDE.md", "an empty repository name after `@`"},
+        {"REPO_FILE@a/b:CLAUDE.md", "a repository name is a registry name, never a path"},
+        {"REPO_FILE@..:CLAUDE.md", "a repository name that is a path component"},
+        {"", "nothing at all"},
+    };
+    for (size_t i = 0; i < sizeof BAD / sizeof BAD[0]; i++) {
+        atlas_syspolicy_memory_source s;
+        memset(&s, 0xff, sizeof s);
+        T_CHECK_MSG(!atlas_memory_source_value_parse(BAD[i].val, strlen(BAD[i].val), &s),
+                    "\"%s\" was accepted; %s", BAD[i].val, BAD[i].why);
+        /* A refusal leaves the zero, not a half-filled source: a caller that
+         * ignored the return value must not be handed a class that asserts
+         * something. */
+        T_EQ_INT((int)s.cls, (int)ATLAS_MEMORY_SOURCE_UNKNOWN);
+    }
+
+    /* A path longer than the field is refused, not truncated. Exactly at the
+     * field's capacity is accepted, so the boundary is a boundary and not a
+     * fence post nobody checked. */
+    char val[1024];
+    atlas_syspolicy_memory_source s;
+    memset(&s, 0, sizeof s);
+    size_t fits = sizeof s.path - 1u;
+    int n = snprintf(val, sizeof val, "REPO_FILE:");
+    T_REQUIRE(n > 0);
+    memset(val + n, 'a', fits);
+    val[(size_t)n + fits] = '\0';
+    T_CHECK_MSG(atlas_memory_source_value_parse(val, strlen(val), &s),
+                "a path of exactly the field's capacity was refused");
+    T_CHECK(strlen(s.path) == fits);
+
+    memset(&s, 0xff, sizeof s);
+    val[(size_t)n + fits] = 'a';
+    val[(size_t)n + fits + 1u] = '\0';
+    T_CHECK_MSG(!atlas_memory_source_value_parse(val, strlen(val), &s),
+                "a path one byte over the field was accepted");
+    T_EQ_INT((int)s.cls, (int)ATLAS_MEMORY_SOURCE_UNKNOWN);
+
+    /* And the same for the repository name. */
+    memset(&s, 0xff, sizeof s);
+    char big[256];
+    n = snprintf(big, sizeof big, "REPO_FILE@");
+    T_REQUIRE(n > 0);
+    memset(big + n, 'r', sizeof s.repo_name);
+    (void)snprintf(big + (size_t)n + sizeof s.repo_name,
+                   sizeof big - (size_t)n - sizeof s.repo_name, ":CLAUDE.md");
+    T_CHECK_MSG(!atlas_memory_source_value_parse(big, strlen(big), &s),
+                "a repository name one byte over the field was accepted");
+    T_EQ_INT((int)s.cls, (int)ATLAS_MEMORY_SOURCE_UNKNOWN);
+
+    /* A NUL inside the value would silently shorten whatever was stored, which
+     * is the one failure this grammar exists to avoid. Refused. */
+    memset(&s, 0xff, sizeof s);
+    static const char embedded[] = "REPO_FILE:CLA\0UDE.md";
+    T_CHECK_MSG(!atlas_memory_source_value_parse(embedded, sizeof embedded - 1u, &s),
+                "a value carrying a NUL byte was accepted");
+    T_EQ_INT((int)s.cls, (int)ATLAS_MEMORY_SOURCE_UNKNOWN);
+
+    T_CHECK(!atlas_memory_source_value_parse(NULL, 0, &s));
+}
+
+/* --- the effective sweep gate ---------------------------------------------- */
+
+static void test_the_sweep_gate_resolves_unset_to_the_named_default(void) {
+    atlas_syspolicy p;
+    memset(&p, 0, sizeof p);
+
+    /* Zero is UNSET, and UNSET is the absence of a statement rather than a
+     * statement of "no". What it resolves to is the named compiled-in constant,
+     * so a `memset` produces "the policy says nothing" instead of a value that
+     * happens to start a pass. */
+    T_EQ_INT((int)p.memory_reconcile, 0);
+    T_CHECK(atlas_syspolicy_memory_reconcile_effective(&p) == ATLAS_MEMORY_RECONCILE_DEFAULT);
+    T_CHECK(atlas_syspolicy_memory_reconcile_effective(NULL) == ATLAS_MEMORY_RECONCILE_DEFAULT);
+
+    p.memory_reconcile = 1;
+    T_CHECK_MSG(atlas_syspolicy_memory_reconcile_effective(&p), "ENABLED did not enable the sweep");
+    p.memory_reconcile = 2;
+    T_CHECK_MSG(!atlas_syspolicy_memory_reconcile_effective(&p),
+                "DISABLED did not disable the sweep");
+
+    /* The compiled-in default is `false`: reading documents an operator named
+     * and storing claims from them is not something the absence of a statement
+     * consents to. Asserted as a value so a change to it has to be deliberate. */
+    T_CHECK_MSG(ATLAS_MEMORY_RECONCILE_DEFAULT == false,
+                "the reconcile default changed; that is a decision, not a constant");
+}
+
+/* --- through the loader ----------------------------------------------------
+ *
+ * What this half can and cannot establish, stated rather than implied.
+ *
+ * `atlas_syspolicy_load_at` reaches the file through `atlas_rootpath_open`,
+ * which walks from `/` and requires **every** component to be owned by uid 0
+ * and writable by nobody else (`src/core/rootpath.c:43`). A fixture lives under
+ * `TMPDIR`, which is `/tmp` at mode 1777 — other-writable — so the walk refuses
+ * at the first component and the file is never opened. The `key = value` loop is
+ * therefore unreachable from a test process that is not root, and no body below
+ * can be observed to produce `ATLAS_SYSPOLICY_REASON_MALFORMED`: the reason is
+ * WRITABLE, decided before a byte is read.
+ *
+ * So this asserts what is provable without privilege, which is the property
+ * that matters: **no shape an unprivileged uid can construct anywhere on the
+ * filesystem registers a memory source or turns the sweep on.** That is
+ * `tests/test_watch_budget.c`'s answer to the identical wall for P0's
+ * `watch_max_dirs_total`, and `tests/test_a71_syspolicy.c`'s header states the
+ * split. The grammar itself is proved above, against
+ * `atlas_memory_source_value_parse` — which is exactly why that function is
+ * exposed rather than being a static inside the loader. */
+
+static void load_body(const fixture *fx, const char *name, const char *body, atlas_syspolicy *out,
+                      atlas_err *err) {
+    T_OK(fx_write(fx_data_dir(fx), name, body, err), err);
+    char path[1024];
+    (void)snprintf(path, sizeof(path), "%s/%s", fx_data_dir(fx), name);
+    atlas_syspolicy_load_at(path, out);
+}
+
+static void test_no_unprivileged_policy_registers_a_memory_source(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    fixture fx;
+    T_OK(fx_open(&fx, &err), &err);
+
+    /* One more `memory_source` line than the bound admits. Refused rather than
+     * truncated — `client_uid`'s rule — because a silently shortened list is one
+     * whose author and reader disagree about what is on it. */
+    char overflow[8192];
+    size_t used = (size_t)snprintf(overflow, sizeof overflow,
+                                   "socket_path = /run/atlas/atlas.sock\n"
+                                   "data_dir = /var/lib/atlas\n");
+    for (unsigned i = 0; i < ATLAS_MEMORY_MAX_SOURCES + 1u; i++) {
+        used += (size_t)snprintf(overflow + used, sizeof overflow - used,
+                                 "memory_source = REPO_FILE:m%u.md\n", i);
+        T_REQUIRE(used < sizeof overflow);
+    }
+
+#define HEAD "socket_path = /run/atlas/atlas.sock\ndata_dir = /var/lib/atlas\n"
+    const char *const bodies[] = {
+        overflow,
+        /* An unrecognised sweep spelling; the two recognised ones; the key
+         * stated twice; neither key at all; a well-formed source -- the file an
+         * unprivileged attacker would write; and a source the grammar refuses. */
+        HEAD "memory_reconcile = yes\n",
+        HEAD "memory_reconcile = ENABLED\n",
+        HEAD "memory_reconcile = DISABLED\n",
+        HEAD "memory_reconcile = ENABLED\nmemory_reconcile = DISABLED\n",
+        HEAD,
+        HEAD "memory_source = REPO_FILE:CLAUDE.md\n",
+        HEAD "memory_source = REPO_FILE:../escape\n",
+    };
+#undef HEAD
+
+    for (size_t i = 0; i < sizeof bodies / sizeof bodies[0]; i++) {
+        char name[64];
+        (void)snprintf(name, sizeof name, "memory-%zu.conf", i);
+        atlas_syspolicy p;
+        load_body(&fx, name, bodies[i], &p, &err);
+        T_CHECK_MSG(p.state != ATLAS_SYSPOLICY_SYSTEM,
+                    "a policy written by this uid reached system mode (case %zu)", i);
+        T_CHECK_MSG(p.memory_source_count == 0,
+                    "a policy written by this uid registered a memory source (case %zu)", i);
+        T_CHECK_MSG(p.memory_reconcile == 0,
+                    "a policy written by this uid stated a sweep intent (case %zu)", i);
+        T_CHECK_MSG(!atlas_syspolicy_memory_reconcile_effective(&p),
+                    "a policy written by this uid turned the sweep on (case %zu)", i);
+    }
+
+    /* Case 5 has neither key and is otherwise a complete policy: it must not be
+     * the *grammar* that refused the ones above. Recorded rather than asserted
+     * either way, for `test_a71_syspolicy.c`'s reason — on this machine it fails
+     * the ownership walk like every other fixture file. */
+    atlas_test_note("the loader ran as %s, so the parser loop was %s",
+                    geteuid() == 0 ? "root" : "an unprivileged uid",
+                    geteuid() == 0 ? "reachable" : "never entered");
+
+    fx_close(&fx);
+}
+
 static const atlas_test TESTS[] = {
     {"UNKNOWN is zero in every vocabulary", test_unknown_is_zero_in_every_vocabulary},
     {"the zero member is named UNKNOWN and never parses",
@@ -219,6 +459,14 @@ static const atlas_test TESTS[] = {
     {"every generation cause round trips", test_every_gen_cause_round_trips},
     {"is_repo is true for exactly the two repository classes",
      test_is_repo_is_true_for_exactly_the_two_repo_classes},
+    {"the value grammar accepts exactly what it should",
+     test_the_value_grammar_accepts_exactly_what_it_should},
+    {"the value grammar refuses rather than repairs",
+     test_the_value_grammar_refuses_rather_than_repairs},
+    {"the sweep gate resolves UNSET to the named default",
+     test_the_sweep_gate_resolves_unset_to_the_named_default},
+    {"no unprivileged policy registers a memory source",
+     test_no_unprivileged_policy_registers_a_memory_source},
 };
 
 ATLAS_TEST_MAIN("memory_source", TESTS)

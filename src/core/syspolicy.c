@@ -94,6 +94,28 @@ bool atlas_syspolicy_semantic_auto_default(const atlas_syspolicy *p) {
     return ATLAS_SEM_AUTO_DEFAULT;
 }
 
+/* A12.1. The policy's answer where it gives one, and the named compiled-in
+ * default where it does not -- `atlas_syspolicy_semantic_auto_default`'s shape
+ * and its argument, including being insensitive to `state`.
+ *
+ * The default it resolves to is `false` rather than that function's `true`, and
+ * the difference is the point: A9.2.4 could reverse its default because libclang
+ * only ever *parses* and what was being weighed was compute, whereas this pass
+ * reads documents an operator named and turns them into stored claims. The
+ * absence of a statement is not consent to start doing that. */
+bool atlas_syspolicy_memory_reconcile_effective(const atlas_syspolicy *p) {
+    if (p == NULL) {
+        return ATLAS_MEMORY_RECONCILE_DEFAULT;
+    }
+    if (p->memory_reconcile == 1) {
+        return true;
+    }
+    if (p->memory_reconcile == 2) {
+        return false;
+    }
+    return ATLAS_MEMORY_RECONCILE_DEFAULT;
+}
+
 /* P0. Same shape and the same argument as the accessor above: the policy's
  * answer where it gives one, and "no statement" where it does not. The caller
  * turns a zero into a kernel-derived default, because that derivation needs a
@@ -337,6 +359,53 @@ void atlas_syspolicy_load_at(const char *path, atlas_syspolicy *out) {
                 return;
             }
             out->watch_max_dirs_total = v;
+        } else if (take_value(line, len, "memory_source", &val, &vlen)) {
+            /* A12.1. `client_uid`'s rule, in both halves. The bound is checked
+             * with `>=` rather than `+ 1 >=` -- P0's season sentence, measured:
+             * the watch budget documented as 8192 was enforced as `count + 1 >=
+             * 8192` and was therefore 8191, and nobody could see it. And the
+             * seventeenth source is refused rather than dropped, because a
+             * silently shortened list of the documents that describe a
+             * repository is one whose author and reader disagree about what is
+             * on it. */
+            if (out->memory_source_count >= ATLAS_MEMORY_MAX_SOURCES) {
+                out->reason = ATLAS_SYSPOLICY_REASON_MALFORMED;
+                return;
+            }
+            /* The grammar itself lives in `src/memory/source.c`, which holds no
+             * file and no handle, so it can be enumerated by a unit test. A
+             * grammar reachable only through this loader could not be: reaching
+             * this line needs a root-owned file, which no test process that is
+             * not root can construct anywhere on the filesystem. */
+            if (!atlas_memory_source_value_parse(val, vlen,
+                                                 &out->memory_sources[out->memory_source_count])) {
+                out->reason = ATLAS_SYSPOLICY_REASON_MALFORMED;
+                return;
+            }
+            out->memory_source_count++;
+        } else if (take_value(line, len, "memory_reconcile", &val, &vlen)) {
+            /* A12.1. Two spellings and nothing else, exactly as
+             * `semantic_auto_default` above -- an unrecognised value is
+             * malformed rather than quietly read as one of them.
+             *
+             * Stated twice is malformed too, which is stricter than the key
+             * above it and deliberately so: two lines disagreeing about whether
+             * a pass runs is a file whose author cannot read back what they
+             * configured, and last-wins would make which line won depend on
+             * their order. Zero already means UNSET, so the repeat is detectable
+             * without a second field. */
+            if (out->memory_reconcile != 0) {
+                out->reason = ATLAS_SYSPOLICY_REASON_MALFORMED;
+                return;
+            }
+            if (vlen == 7 && strncmp(val, "ENABLED", 7) == 0) {
+                out->memory_reconcile = 1;
+            } else if (vlen == 8 && strncmp(val, "DISABLED", 8) == 0) {
+                out->memory_reconcile = 2;
+            } else {
+                out->reason = ATLAS_SYSPOLICY_REASON_MALFORMED;
+                return;
+            }
         } else {
             /* An unrecognised key is malformed rather than ignored. A policy
              * Atlas half-understands is one whose author believes they

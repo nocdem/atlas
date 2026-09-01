@@ -60,6 +60,9 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+#include "atlas/limits.h"
+#include "atlas/memory.h"
+
 /* Compiled-in, absolute, and with no environment override or command-line flag
  * on purpose — the A7 rule about `ATLAS_AUTHORITY_POLICY_PATH`, for the same
  * reason. A caller that can point Atlas at a different policy has written the
@@ -112,6 +115,32 @@ typedef enum atlas_syspolicy_semauto {
  * place to be found, argued about and changed. */
 #define ATLAS_SEM_AUTO_DEFAULT true
 
+/* A12.1. One memory source a root-owned policy registers: which files a model is
+ * given, so that Atlas can reconcile what they assert against the tree.
+ *
+ * It is in the root-owned policy for A7's reason and not for convenience. A
+ * memory source is a set of documents Atlas *reads and then stores claims from*,
+ * and a principal that could name its own memory sources would be choosing the
+ * documents that describe the repository to every later reader. `atlas-worker`
+ * cannot write this file, and neither can `atlasd`.
+ *
+ * The typedef for this struct lives in `atlas/memory.h`, which declares it
+ * incomplete so that the value parser can take a pointer to it without including
+ * this header back. See the note there. */
+struct atlas_syspolicy_memory_source {
+    atlas_memory_source_class cls;
+    /* Empty means every registered repository, which is the ordinary case.
+     * `ATLAS_NAME_MAX` is 128, and this is deliberately smaller: a policy naming
+     * a repository is naming one an operator registered by hand. Refused rather
+     * than truncated, so a name that does not fit is a malformed policy and not
+     * a policy about a different repository. */
+    char repo_name[65];
+    /* Raw bytes as the policy wrote them. Repository-relative for a REPO_ class,
+     * absolute for an EXTERNAL_ one — which is checked rather than inferred, so
+     * the class and the path can never disagree about what is being named. */
+    char path[512];
+};
+
 typedef struct atlas_syspolicy {
     atlas_syspolicy_state state;
     atlas_syspolicy_reason reason;
@@ -155,6 +184,24 @@ typedef struct atlas_syspolicy {
      * sysctl — and the kernel then refuses with ENOSPC, which is reported as
      * itself rather than as an Atlas budget. */
     long long watch_max_dirs_total;
+    /* A12.1. The memory sources this policy registers, in the order it wrote
+     * them. The seventeenth is refused rather than dropped — `client_uid`'s rule
+     * — because a silently shortened list is one whose author and reader
+     * disagree about what is on it, and neither end can see the disagreement. */
+    struct atlas_syspolicy_memory_source memory_sources[ATLAS_MEMORY_MAX_SOURCES];
+    size_t memory_source_count;
+    /* A12.1. Whether this daemon may reconcile registered memory sources on its
+     * own initiative. `0` is UNSET and means the policy says nothing; `1` is
+     * ENABLED and `2` is DISABLED. What UNSET resolves to is the named
+     * compiled-in `ATLAS_MEMORY_RECONCILE_DEFAULT`, so a `memset` produces "no
+     * statement" rather than a zero that happens to start a pass.
+     *
+     * Stated twice in one policy is MALFORMED rather than last-wins, which is
+     * stricter than `semantic_auto_default` beside it and deliberately so: two
+     * lines disagreeing about whether a pass runs is a file whose author cannot
+     * read back what they configured, and zero already means UNSET so the repeat
+     * is detectable without a second field. */
+    int memory_reconcile;
     char detail[256];
 } atlas_syspolicy;
 
@@ -187,6 +234,25 @@ bool atlas_syspolicy_permits(const atlas_syspolicy *p, long long uid);
  * every ordinary per-user install — gets the documented default rather than a
  * silent no. */
 bool atlas_syspolicy_semantic_auto_default(const atlas_syspolicy *p);
+
+/* A12.1. Whether the memory reconciliation sweep runs on this machine: ENABLED
+ * is true, DISABLED is false, and UNSET is the named compiled-in
+ * `ATLAS_MEMORY_RECONCILE_DEFAULT`.
+ *
+ * The same shape as `atlas_syspolicy_semantic_auto_default` above and
+ * deliberately not sensitive to `state`, for that function's reason: an absent
+ * or legacy policy is the ordinary condition of a per-user install, and it is
+ * the absence of a statement rather than a statement of "no".
+ *
+ * The residual is A9.2.4's and is stated rather than solved. The parser assigns
+ * each key as it reads it and returns on the first malformed line, so a
+ * well-formed `memory_reconcile` followed by a bad line leaves the field set on
+ * a struct whose `state` is LEGACY — exactly the condition P0 answered for the
+ * watch budget with a second `_checked` accessor. A consumer that must honour
+ * only a policy which parsed in full checks `state` itself; there is no
+ * `_checked` form here because nothing yet needs one, and adding an accessor
+ * with no caller would be a second answer to a question nobody has asked. */
+bool atlas_syspolicy_memory_reconcile_effective(const atlas_syspolicy *p);
 
 /* P0. The daemon-wide watch budget this policy states, or 0 where it states
  * none and the caller should derive one from the kernel.

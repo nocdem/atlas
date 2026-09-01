@@ -81,6 +81,28 @@ static void test_no_unprivileged_shape_enables_system_mode(void) {
     T_CHECK_MSG(p.state == ATLAS_SYSPOLICY_LEGACY,
                 "a policy written by an unprivileged uid enabled system mode");
 
+    /* A12.1 adds two keys, and they are the ones worth trying: a memory source
+     * names the documents that describe a repository to every later reader, and
+     * the sweep gate decides whether Atlas reads them unasked. A principal that
+     * could register either would be choosing what the project is said to be.
+     * Neither survives being written by this uid, for the same reason as
+     * everything above — the walk refuses before the file is opened, so the
+     * key is never even parsed. */
+    write_policy(&fx, "memory.conf",
+                 "socket_path = /run/atlas/atlas.sock\n"
+                 "data_dir = /var/lib/atlas\n"
+                 "memory_source = REPO_FILE:CLAUDE.md\n"
+                 "memory_source = EXTERNAL_DIR:/srv/mem\n"
+                 "memory_reconcile = ENABLED\n",
+                 &err);
+    load(&fx, "memory.conf", &p);
+    T_CHECK_MSG(p.state == ATLAS_SYSPOLICY_LEGACY,
+                "a policy written by an unprivileged uid enabled system mode");
+    T_CHECK_MSG(p.memory_source_count == 0,
+                "a policy written by an unprivileged uid registered a memory source");
+    T_CHECK_MSG(!atlas_syspolicy_memory_reconcile_effective(&p),
+                "a policy written by an unprivileged uid turned the memory sweep on");
+
     /* A symlink pointing at something root-owned gains nothing: the walk
      * refuses to traverse it rather than resolving it. */
     T_OK(fx_symlink(fx_data_dir(&fx), "/etc/hostname", "link.conf", &err), &err);

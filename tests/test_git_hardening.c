@@ -977,6 +977,57 @@ static void test_a8_snapshot_reads_run_no_helper(void) {
     env_close(&e);
 }
 
+/* --- A12.1: a memory source's path, embedded in a revision spec ----------
+ *
+ * `atlas_git_blob_oid_at` (src/git/git.c) is the first call site that builds a
+ * `"<commit>:<path>"` revision spec from a path this process did not choose --
+ * a registered memory source's own bytes, which may be anything but NUL. The
+ * commit half is always an exact hex object id, so it can never itself hold
+ * the colon that separates the two, but `path` could plausibly start with '-'
+ * and be read as a flag rather than an operand. `--end-of-options` is the
+ * defence already used by `atlas_git_commit_tree`'s own `<oid>^{tree}` spec;
+ * this proves it holds for an operand git would otherwise have to guess about,
+ * not only for one Atlas built entirely from an object id. */
+static void test_blob_oid_at_a_dash_prefixed_path(void) {
+    harden_env e;
+    atlas_err err;
+    atlas_err_init(&err);
+    env_open(&e);
+    const char *repo = fx_repo(&e.fx);
+    T_OK(fx_init_repo(&e.fx, repo, NULL, &err), &err);
+    /* A tracked file named as though it were a flag. Plain git would refuse to
+     * treat "-rf" as a pathspec on its own command line without "--" first;
+     * the point here is that Atlas' own spec construction sidesteps the
+     * question entirely rather than needing every caller to remember it. */
+    T_OK(fx_write(repo, "-rf", "not a flag, a memory source\n", &err), &err);
+    T_OK(fx_add_all(&e.fx, repo, &err), &err);
+    T_OK(fx_commit(&e.fx, repo, "initial commit", &err), &err);
+
+    atlas_git *g = NULL;
+    T_OK(atlas_git_open(repo, &g, &err), &err);
+    atlas_git_head h;
+    memset(&h, 0, sizeof(h));
+    T_OK(atlas_git_read_head(g, &h, &err), &err);
+
+    atlas_buf oid = ATLAS_BUF_INIT;
+    bool found = false;
+    T_OK(atlas_git_blob_oid_at(g, h.oid, "-rf", 3u, &oid, &found, &err), &err);
+    T_CHECK_MSG(found, "a dash-prefixed tracked path was not resolved");
+    T_CHECK_MSG(oid.len > 0, "no blob id came back for it");
+
+    /* And a path that simply is not there is a clean not-found, not an error
+     * and not a hostile flag misparsed as a hit. */
+    atlas_buf_reset(&oid);
+    found = true;
+    T_OK(atlas_git_blob_oid_at(g, h.oid, "--force", 7u, &oid, &found, &err), &err);
+    T_CHECK_MSG(!found, "an untracked, flag-shaped path was reported as found");
+    T_CHECK_MSG(oid.len == 0, "a not-found lookup returned bytes");
+
+    atlas_buf_free(&oid);
+    atlas_git_close(g);
+    env_close(&e);
+}
+
 static const atlas_test TESTS[] = {
     {"A8 snapshot reads run no helper", test_a8_snapshot_reads_run_no_helper},
     {"environment policy", test_env_policy},
@@ -1001,6 +1052,7 @@ static const atlas_test TESTS[] = {
     {"an innocent mention is not over-refused", test_innocent_mention_is_not_refused},
     {"a repository that becomes partial fails closed", test_repository_becoming_partial_fails_closed},
     {"no prompt and no network helper runs", test_no_prompt_and_no_network},
+    {"blob oid lookup on a dash-prefixed path", test_blob_oid_at_a_dash_prefixed_path},
 };
 
 ATLAS_TEST_MAIN("git-hardening", TESTS)

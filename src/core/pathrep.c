@@ -204,6 +204,71 @@ atlas_status atlas_path_open_nofollow(int root_fd, const char *rel, size_t rel_l
     return ATLAS_OK;
 }
 
+atlas_status atlas_path_opendir_nofollow(int root_fd, const char *rel, size_t rel_len,
+                                         atlas_path_open_result *result_out, int *fd_out,
+                                         struct stat *st_out, int *errno_out, atlas_err *err) {
+    if (fd_out != NULL) {
+        *fd_out = -1;
+    }
+    int dirfd = -1;
+    const char *last = NULL;
+    size_t last_len = 0;
+    atlas_status st =
+        walk_to_parent(root_fd, rel, rel_len, &dirfd, &last, &last_len, result_out, errno_out, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (*result_out != ATLAS_PATH_OPEN_OK) {
+        return ATLAS_OK;
+    }
+
+    char comp[ATLAS_COMPONENT_MAX + 1u];
+    memcpy(comp, last, last_len);
+    comp[last_len] = '\0';
+
+    struct stat lst;
+    if (fstatat(dirfd, comp, &lst, AT_SYMLINK_NOFOLLOW) != 0) {
+        int e = errno;
+        (void)close(dirfd);
+        if (errno_out != NULL) {
+            *errno_out = e;
+        }
+        *result_out =
+            (e == ENOENT || e == ENOTDIR) ? ATLAS_PATH_OPEN_MISSING : ATLAS_PATH_OPEN_DENIED;
+        return ATLAS_OK;
+    }
+    if (st_out != NULL) {
+        *st_out = lst;
+    }
+    if (S_ISLNK(lst.st_mode)) {
+        (void)close(dirfd);
+        *result_out = ATLAS_PATH_OPEN_SYMLINK;
+        return ATLAS_OK;
+    }
+    if (!S_ISDIR(lst.st_mode)) {
+        (void)close(dirfd);
+        *result_out = ATLAS_PATH_OPEN_NOT_REGULAR;
+        return ATLAS_OK;
+    }
+    int fd = openat(dirfd, comp, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    int e = errno;
+    (void)close(dirfd);
+    if (fd < 0) {
+        if (errno_out != NULL) {
+            *errno_out = e;
+        }
+        *result_out = (e == ELOOP) ? ATLAS_PATH_OPEN_UNSAFE : ATLAS_PATH_OPEN_DENIED;
+        return ATLAS_OK;
+    }
+    if (fd_out != NULL) {
+        *fd_out = fd;
+    } else {
+        (void)close(fd);
+    }
+    *result_out = ATLAS_PATH_OPEN_OK;
+    return ATLAS_OK;
+}
+
 atlas_status atlas_path_readlink_at(int root_fd, const char *rel, size_t rel_len,
                                     atlas_buf *target_out, atlas_path_open_result *result_out,
                                     atlas_err *err) {

@@ -1473,6 +1473,61 @@ atlas_status atlas_git_cat_blob(atlas_git *g, const char *oid, atlas_proc_sink s
                            err);
 }
 
+atlas_status atlas_git_blob_oid_at(atlas_git *g, const char *commit, const void *path,
+                                   size_t path_len, atlas_buf *oid_out, bool *found_out,
+                                   atlas_err *err) {
+    if (oid_out == NULL || found_out == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "no destination for a blob lookup");
+    }
+    atlas_buf_reset(oid_out);
+    *found_out = false;
+    if (!is_exact_oid(commit)) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "a blob lookup needs an exact commit id, not a reference");
+    }
+    if (path == NULL || path_len == 0) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "a blob lookup needs a path");
+    }
+
+    /* "<commit>:<path>", built by hand rather than with a formatter: `path` is
+     * raw bytes that may hold any byte but NUL, and a formatter that treats it
+     * as a C string would stop at the first embedded byte that looked like
+     * one. `commit` is exact hex, so it can never itself contain the colon
+     * that separates the two halves. */
+    atlas_buf spec = ATLAS_BUF_INIT;
+    atlas_status st = atlas_buf_append(&spec, commit, strlen(commit), err);
+    if (st == ATLAS_OK) {
+        st = atlas_buf_append_ch(&spec, ':', err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_buf_append(&spec, path, path_len, err);
+    }
+    if (st != ATLAS_OK) {
+        atlas_buf_free(&spec);
+        return st;
+    }
+
+    /* `--quiet` so a path this commit does not resolve is a clean "not found"
+     * rather than stderr noise -- the same shape as `atlas_git_read_head`'s
+     * probe of `HEAD` on an unborn branch. `--end-of-options` so a path that
+     * happens to start with '-' is never read as a flag, `atlas_git_commit_tree`'s
+     * precedent for the same spec shape. */
+    int code = 0;
+    const char *sub[] = {"rev-parse", "--verify", "--quiet", "--end-of-options",
+                         atlas_buf_cstr(&spec)};
+    st = git_capture(g, sub, 5u, oid_out, &code, err);
+    atlas_buf_free(&spec);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (code == 0 && is_exact_oid(atlas_buf_cstr(oid_out))) {
+        *found_out = true;
+    } else {
+        atlas_buf_reset(oid_out);
+    }
+    return ATLAS_OK;
+}
+
 atlas_status atlas_git_diff_no_index(const char *a, const char *b, atlas_proc_sink sink,
                                      void *sink_ud, size_t max, bool *differed_out,
                                      atlas_err *err) {

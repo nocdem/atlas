@@ -70,6 +70,13 @@ typedef struct atlas_db atlas_db;
  * `syspolicy.h`, because that is where a policy's parsed shape lives. */
 typedef struct atlas_syspolicy_memory_source atlas_syspolicy_memory_source;
 
+/* Forward-declared for the same reason and by the same rule: T6's reader needs
+ * only a pointer to a repository row, so an incomplete type keeps this header's
+ * dependency on `db.h` one-way. `src/memory/read.c` includes `atlas/db.h` for
+ * the complete definition, exactly as it includes `atlas/mirror.h` for the A13
+ * routing it never restates. */
+typedef struct atlas_repo_info atlas_repo_info;
+
 /* What a registered memory source is, and -- the load-bearing half -- **who can
  * read it**.
  *
@@ -248,5 +255,67 @@ void atlas_memory_version_row_free(atlas_memory_version_row *r);
 atlas_status atlas_db_memory_version_by_uid(atlas_db *db, const char *uid,
                                             atlas_memory_version_row *out, bool *found_out,
                                             atlas_err *err);
+
+/* --- T6: reading a source, by the principal that can read it ---------------
+ *
+ * A registered source names bytes; it does not hand them over. `src/memory/
+ * read.c` is the one place that turns a source into the bytes it names, and
+ * it does so by asking A13's own routing (`atlas_repo_open_git`) rather than
+ * restating it: every principal but a named scanner reads a `REPO_*` source
+ * from the mirror A13 already decided on, and this layer never opens the tree
+ * itself or falls back to it.
+ *
+ * `ATLAS_MEMORY_READ_UNKNOWN` is the zero, asserts nothing, and is never the
+ * outcome of a completed read. */
+typedef enum atlas_memory_read_outcome {
+    ATLAS_MEMORY_READ_UNKNOWN = 0,
+    ATLAS_MEMORY_READ_OK,
+    ATLAS_MEMORY_READ_ABSENT,       /* the path is not there. Not an error. */
+    ATLAS_MEMORY_READ_TOO_LARGE,    /* over ATLAS_MEMORY_MAX_SOURCE_BYTES; no bytes returned */
+    ATLAS_MEMORY_READ_NOT_OURS,     /* EXTERNAL_*: another principal reads it; caller
+                                       uses the latest stored version instead */
+    ATLAS_MEMORY_READ_NO_MIRROR,    /* A13: a scanner is named and no complete mirror exists */
+    ATLAS_MEMORY_READ_SYMLINK       /* the registered path is a symlink; refused, never followed */
+} atlas_memory_read_outcome;
+
+/* One entry read from one registered source. A REPO_FILE/EXTERNAL_FILE source
+ * yields exactly one of these, whatever its outcome — a missing, oversized or
+ * symlinked path is still a fact about that one source and is reported as one
+ * item rather than as a silent empty result. A REPO_DIR/EXTERNAL_DIR source
+ * yields up to ATLAS_MEMORY_MAX_DIR_ENTRIES of these, sorted by name, when its
+ * own path opens as a directory; when it does not (absent, a symlink, or
+ * behind an A13 refusal), it too yields exactly one item describing that,
+ * consistent with the FILE case rather than a second contract next to it. */
+typedef struct atlas_memory_read_item {
+    atlas_buf rel_path;      /* the child name for a *_DIR source; empty for *_FILE */
+    atlas_buf bytes;
+    atlas_buf blob_oid;      /* empty when untracked or external */
+    atlas_buf commit_oid;    /* empty when untracked or external */
+    atlas_memory_read_outcome outcome;
+} atlas_memory_read_item;
+
+void atlas_memory_read_item_init(atlas_memory_read_item *it);
+void atlas_memory_read_item_free(atlas_memory_read_item *it);
+
+/* Reads a REPO_* source's current bytes through atlas_repo_open_git, so A13's
+ * routing applies without this file restating it. EXTERNAL_* returns NOT_OURS
+ * and reads nothing. Never called inside a transaction.
+ *
+ * `items` must hold at least `cap` slots and `cap` must be at least 1 — even a
+ * FILE source's single result needs a slot. On ATLAS_OK, `*count_out` items
+ * were written (each already initialised) and the caller frees each with
+ * atlas_memory_read_item_free; on any other status nothing was left for the
+ * caller to free. */
+atlas_status atlas_memory_read_source(const atlas_repo_info *repo, const char *data_dir,
+                                      atlas_memory_source_class cls, const void *path_raw,
+                                      size_t path_len, atlas_memory_read_item *items,
+                                      size_t cap, size_t *count_out, atlas_err *err);
+
+/* Reads one absolute external path as the invoking principal (the CLI's scan).
+ * O_NOFOLLOW at every step; a symlink is SYMLINK, never followed. Same output
+ * contract as atlas_memory_read_source. */
+atlas_status atlas_memory_read_external(const void *path_raw, size_t path_len, bool is_dir,
+                                        atlas_memory_read_item *items, size_t cap,
+                                        size_t *count_out, atlas_err *err);
 
 #endif /* ATLAS_MEMORY_H */

@@ -299,6 +299,21 @@ atlas_status atlas_git_commit_tree(atlas_git *g, const char *commit, atlas_buf *
 atlas_status atlas_git_cat_blob(atlas_git *g, const char *oid, atlas_proc_sink sink,
                                 void *sink_ud, size_t max, atlas_err *err);
 
+/* Resolves the blob object id of one path within an exact commit's tree.
+ * `path` is raw bytes and need not be NUL-terminated or valid UTF-8; `commit`
+ * is required to be an exact hex object id first, which is what makes the two
+ * halves of the "<commit>:<path>" spec unambiguous at the colon however many
+ * colons `path` itself contains -- a hex id cannot.
+ *
+ * A path git does not resolve at that commit -- untracked, renamed away, or
+ * the commit has no such tree entry -- is `*found_out = false`, `ATLAS_OK`,
+ * never an error: not tracked is a fact about the tree, not a failure to read
+ * it. Precedent is `atlas_git_read_head`'s own tolerant `--quiet` probe of
+ * `HEAD` on an unborn branch. */
+atlas_status atlas_git_blob_oid_at(atlas_git *g, const char *commit, const void *path,
+                                   size_t path_len, atlas_buf *oid_out, bool *found_out,
+                                   atlas_err *err);
+
 /* `git diff --no-index` between two directories, with no repository context at
  * all — this is how a patch is produced from a pristine snapshot and a modified
  * worktree without ever creating a repository inside the workspace.

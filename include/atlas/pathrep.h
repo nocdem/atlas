@@ -54,6 +54,17 @@ atlas_status atlas_path_open_nofollow(int root_fd, const char *rel, size_t rel_l
                                       atlas_path_open_result *result_out, int *fd_out,
                                       struct stat *st_out, int *errno_out, atlas_err *err);
 
+/* Same walk and the same refusal, for the one case atlas_path_open_nofollow
+ * exists to refuse: a directory rather than a regular file. Every component,
+ * including the last, is refused rather than traversed if it is a symlink
+ * (ATLAS_PATH_OPEN_SYMLINK); the last must be a directory or the walk reports
+ * ATLAS_PATH_OPEN_NOT_REGULAR. On ATLAS_PATH_OPEN_OK the caller owns *fd_out
+ * (opened O_DIRECTORY|O_NOFOLLOW) and must close() it. `st_out` is filled from
+ * an lstat of the final component whenever it exists. */
+atlas_status atlas_path_opendir_nofollow(int root_fd, const char *rel, size_t rel_len,
+                                         atlas_path_open_result *result_out, int *fd_out,
+                                         struct stat *st_out, int *errno_out, atlas_err *err);
+
 /* Read the target text of a tracked symlink without following it. */
 atlas_status atlas_path_readlink_at(int root_fd, const char *rel, size_t rel_len,
                                     atlas_buf *target_out, atlas_path_open_result *result_out,

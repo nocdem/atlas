@@ -368,6 +368,10 @@ add_library(atlas_core STATIC
   # `db_verify.c`'s shape for `db_verify.c`'s reason.
   src/memory/source.c
   src/db/db_memory.c
+  # `read.c` (T6) turns a registered source into the bytes it names, by
+  # asking A13's own routing (atlas_repo_open_git) rather than restating it —
+  # it never opens a registered tree itself and never falls back to one.
+  src/memory/read.c
   ${ATLAS_UI_GEN}
 )
 

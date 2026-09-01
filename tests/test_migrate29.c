@@ -16,7 +16,12 @@
  *     memory table by design (the migration comment's argument), while
  *     deleting a `memory_generations` row cascades its `memory_claim_diffs`
  *     children, because that foreign key is real;
- *   - a database stopped at 28 reaches 29 with no pre-existing row rewritten.
+ *   - a database stopped at 28 reaches 29 with no pre-existing row rewritten
+ *     (every column of every row, not merely an id that survived);
+ *   - every CHECK vocabulary this migration declares -- `memory_sources.cls`,
+ *     `memory_claim_anchors.kind`, `memory_generations.cause` and
+ *     `memory_claim_diffs.kind` -- accepts every one of its C enum's current
+ *     spellings and refuses the zero member's name.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,6 +31,8 @@
 
 #include "atlas/datadir.h"
 #include "atlas/db.h"
+#include "atlas/memory.h"
+#include "atlas/sha256.h"
 #include "atlas_test.h"
 #include "db/db_internal.h"
 #include "support/fixture.h"
@@ -92,6 +99,44 @@ static bool ddl_mentions(atlas_db *db, const char *table, const char *needle) {
     }
     atlas_db_finish(db, q);
     return found;
+}
+
+/* A digest over every column of every row, in rowid order, including column
+ * names -- so a reordered, renamed, retyped or rewritten column is a
+ * difference too. `test_migrate8.c`'s shape, for the same reason: a count or
+ * an id comparison would not notice a row whose other columns were rewritten
+ * in place by an `UPDATE` this migration should never contain. Migration 29
+ * declares no `ALTER TABLE` on `repositories` at all, so `SELECT *` is the
+ * right query here -- unlike `test_migrate8.c`, which has to name columns
+ * because migration 27 widens that same table between the two snapshots it
+ * compares. */
+static void table_digest(atlas_db *db, const char *table, char *out) {
+    atlas_err err;
+    atlas_err_init(&err);
+    char sql[256];
+    (void)snprintf(sql, sizeof sql, "SELECT * FROM %s ORDER BY rowid;", table);
+    sqlite3_stmt *s = NULL;
+    T_OK(atlas_db_prepare(db, sql, &s, &err), &err);
+    atlas_sha256 ctx;
+    atlas_sha256_init(&ctx);
+    while (sqlite3_step(s) == SQLITE_ROW) {
+        for (int c = 0; c < sqlite3_column_count(s); c++) {
+            const char *name = sqlite3_column_name(s, c);
+            atlas_sha256_update(&ctx, name != NULL ? name : "", name != NULL ? strlen(name) : 0u);
+            if (sqlite3_column_type(s, c) == SQLITE_NULL) {
+                atlas_sha256_update(&ctx, "\x00NULL", 5u);
+            } else {
+                const unsigned char *t = sqlite3_column_text(s, c);
+                int n = sqlite3_column_bytes(s, c);
+                atlas_sha256_update(&ctx, t != NULL ? (const char *)t : "", n > 0 ? (size_t)n : 0u);
+            }
+        }
+        atlas_sha256_update(&ctx, "\x01", 1u);
+    }
+    atlas_db_finish(db, s);
+    unsigned char d[ATLAS_SHA256_DIGEST_LEN];
+    atlas_sha256_final(&ctx, d);
+    atlas_hex_encode(d, sizeof d, out);
 }
 
 static atlas_status open_fresh(fixture *fx, atlas_db **out, atlas_err *err) {
@@ -372,14 +417,21 @@ static void test_a_database_stopped_at_28_reaches_29_losslessly(void) {
     T_OK(atlas_db_migrate_list(db, all, 28u, &err), &err);
     T_EQ_INT(schema_of(db), 28);
 
-    /* A real row, so "nothing pre-existing was rewritten" is a claim about a
-     * row rather than about one empty table agreeing with another. */
+    /* Real rows, so "nothing pre-existing was rewritten" is a claim about
+     * every column of every row rather than about one empty table agreeing
+     * with another, or about one id surviving while every other column beside
+     * it was rewritten. A digest taken before and compared after is what
+     * catches that second failure; an id comparison alone does not. */
     int64_t repo_id = 0;
+    int64_t repo2_id = 0;
     insert_repo(db, "proj", &repo_id);
+    insert_repo(db, "proj2", &repo2_id);
     for (size_t i = 0; i < sizeof TABLES / sizeof TABLES[0]; i++) {
         T_CHECK_MSG(!table_exists(db, TABLES[i]), "%s exists before migration 29 ran",
                     TABLES[i]);
     }
+    char repos_before[ATLAS_SHA256_HEX_LEN + 1u];
+    table_digest(db, "repositories", repos_before);
 
     T_OK(atlas_db_migrate(db, &err), &err);
     T_EQ_INT(schema_of(db), 29);
@@ -392,7 +444,14 @@ static void test_a_database_stopped_at_28_reaches_29_losslessly(void) {
         T_EQ_INT((int)count_sql(db, sql), 0);
     }
 
-    /* The pre-existing repositories row is untouched. */
+    /* The pre-existing repositories rows are untouched -- not merely present
+     * under the same id, but byte-for-byte identical in every column. */
+    char repos_after[ATLAS_SHA256_HEX_LEN + 1u];
+    table_digest(db, "repositories", repos_after);
+    T_CHECK_MSG(strcmp(repos_before, repos_after) == 0,
+                "migration 29 rewrote a repositories row:\nbefore: %s\nafter:  %s", repos_before,
+                repos_after);
+
     atlas_repo_info info;
     atlas_repo_info_init(&info);
     bool found = false;
@@ -400,8 +459,189 @@ static void test_a_database_stopped_at_28_reaches_29_losslessly(void) {
     T_CHECK(found);
     T_EQ_INT((int)info.id, (int)repo_id);
     atlas_repo_info_free(&info);
+    (void)repo2_id;
 
     T_EQ_INT((int)count_sql(db, "SELECT COUNT(*) FROM pragma_foreign_key_check;"), 0);
+
+    atlas_db_close(db);
+    fx_close(&fx);
+}
+
+/* --- 5: every CHECK vocabulary in this migration agrees with its C enum --- */
+
+/* Proves a stored CHECK vocabulary agrees with its C enum: every non-zero
+ * member's exact `_name()` spelling is accepted by an INSERT against the real
+ * schema, and the zero member's own name -- which every `_parse` already
+ * refuses -- is refused by the schema too.
+ *
+ * This is the failure the project cares about most: add a member to a C
+ * vocabulary and add its case to `_name`/`_parse` (`-Wswitch-enum` forces
+ * that much), and the build and every unit test over the enum stay green
+ * while the widening migration was never written -- until the first real
+ * insert using the new spelling fails on the writer thread, at runtime, in a
+ * daemon. An INSERT against the real schema proves the *behaviour*; a DDL
+ * substring match (test 1's `ddl_mentions`, kept for the diff kind because it
+ * also proves the controller ruling's exact wording) only proves a word
+ * appears somewhere in a stored string.
+ *
+ * `insert_tmpl` has every column but the vocabulary one already filled in,
+ * with exactly one literal `%s` left as the splice point for the spelling
+ * under test. It is split around that marker with `strstr` rather than handed
+ * to `snprintf` as the format string itself -- passing a runtime string as a
+ * format argument is `-Wformat-nonliteral`, which `ATLAS_WERROR` turns into a
+ * build failure, and rightly so for any caller-supplied string; the splice
+ * here is always this function's own literal marker, but the compiler cannot
+ * tell that from the call site, so the splice is done by hand instead. The
+ * row is deleted after every attempt -- accepted or refused -- so repeated
+ * calls, and the different vocabularies sharing one table's uniqueness rules,
+ * never collide. */
+static void check_vocab_matches_schema(atlas_db *db, const char *table, const char *insert_tmpl,
+                                       const char *const *member_names, size_t member_count,
+                                       const char *zero_name) {
+    atlas_err err;
+    atlas_err_init(&err);
+    const char *marker = strstr(insert_tmpl, "%s");
+    T_REQUIRE_MSG(marker != NULL, "insert_tmpl for %s has no %%s splice point", table);
+    int prefix_len = (int)(marker - insert_tmpl);
+    const char *suffix = marker + 2;
+
+    char sql[1024];
+    char cleanup[64];
+    (void)snprintf(cleanup, sizeof cleanup, "DELETE FROM %s;", table);
+
+    for (size_t i = 0; i < member_count; i++) {
+        (void)snprintf(sql, sizeof sql, "%.*s%s%s", prefix_len, insert_tmpl, member_names[i],
+                       suffix);
+        atlas_status st = atlas_db_exec_sql(db, sql, &err);
+        T_CHECK_MSG(st == ATLAS_OK, "%s: '%s' was refused by the schema (%s)", table,
+                    member_names[i], atlas_err_msg(&err));
+        T_OK(atlas_db_exec_sql(db, cleanup, &err), &err);
+    }
+
+    (void)snprintf(sql, sizeof sql, "%.*s%s%s", prefix_len, insert_tmpl, zero_name, suffix);
+    atlas_status st = atlas_db_exec_sql(db, sql, &err);
+    T_CHECK_MSG(st != ATLAS_OK, "%s: the zero member's name '%s' was accepted by the schema",
+                table, zero_name);
+    T_OK(atlas_db_exec_sql(db, cleanup, &err), &err);
+}
+
+static void test_vocabulary_checks_agree_with_their_c_enum(void) {
+    fixture fx;
+    atlas_err err;
+    atlas_err_init(&err);
+    T_OK(fx_open(&fx, &err), &err);
+
+    atlas_db *db = NULL;
+    T_OK(open_fresh(&fx, &db, &err), &err);
+    T_OK(atlas_db_migrate(db, &err), &err);
+
+    int64_t repo_id = 0;
+    insert_repo(db, "proj", &repo_id);
+
+    /* memory_sources.cls <-> atlas_memory_source_class */
+    {
+        char fmt[512];
+        (void)snprintf(fmt, sizeof fmt,
+                      "INSERT INTO memory_sources"
+                      "  (repo_id, source_uid, cls, path_raw, path_text, registered_at)"
+                      "  VALUES (%lld, 'm-vocab-test', '%%s', x'2e2f412e6d64', './A.md',"
+                      "          '2026-09-01T00:00:00Z');",
+                      (long long)repo_id);
+        static const atlas_memory_source_class MEMBERS[] = {
+            ATLAS_MEMORY_SOURCE_REPO_FILE,
+            ATLAS_MEMORY_SOURCE_REPO_DIR,
+            ATLAS_MEMORY_SOURCE_EXTERNAL_FILE,
+            ATLAS_MEMORY_SOURCE_EXTERNAL_DIR,
+        };
+        const char *names[sizeof MEMBERS / sizeof MEMBERS[0]];
+        for (size_t i = 0; i < sizeof MEMBERS / sizeof MEMBERS[0]; i++) {
+            names[i] = atlas_memory_source_class_name(MEMBERS[i]);
+        }
+        check_vocab_matches_schema(db, "memory_sources", fmt, names,
+                                   sizeof names / sizeof names[0],
+                                   atlas_memory_source_class_name(ATLAS_MEMORY_SOURCE_UNKNOWN));
+    }
+
+    /* memory_claim_anchors.kind <-> atlas_memory_anchor_kind */
+    {
+        char fmt[512];
+        (void)snprintf(fmt, sizeof fmt,
+                      "INSERT INTO memory_claim_anchors (repo_id, claim_uid, kind, value)"
+                      "  VALUES (%lld, 'claim-vocab-test', '%%s', 'v');",
+                      (long long)repo_id);
+        static const atlas_memory_anchor_kind MEMBERS[] = {
+            ATLAS_MEMORY_ANCHOR_PATH,
+            ATLAS_MEMORY_ANCHOR_SYMBOL,
+            ATLAS_MEMORY_ANCHOR_DECISION,
+            ATLAS_MEMORY_ANCHOR_COMMIT,
+        };
+        const char *names[sizeof MEMBERS / sizeof MEMBERS[0]];
+        for (size_t i = 0; i < sizeof MEMBERS / sizeof MEMBERS[0]; i++) {
+            names[i] = atlas_memory_anchor_kind_name(MEMBERS[i]);
+        }
+        check_vocab_matches_schema(db, "memory_claim_anchors", fmt, names,
+                                   sizeof names / sizeof names[0],
+                                   atlas_memory_anchor_kind_name(ATLAS_MEMORY_ANCHOR_UNKNOWN));
+    }
+
+    /* memory_generations.cause <-> atlas_memory_gen_cause */
+    {
+        char fmt[512];
+        (void)snprintf(fmt, sizeof fmt,
+                      "INSERT INTO memory_generations"
+                      "  (repo_id, generation, cause, repo_identity_hash, decision_set_digest,"
+                      "   source_set_digest, created_at)"
+                      "  VALUES (%lld, 1, '%%s', 'h', 'd', 's', '2026-09-01T00:00:00Z');",
+                      (long long)repo_id);
+        static const atlas_memory_gen_cause MEMBERS[] = {
+            ATLAS_MEMORY_CAUSE_SOURCE_REVISION,
+            ATLAS_MEMORY_CAUSE_DECISION_REVISION,
+            ATLAS_MEMORY_CAUSE_COMMIT,
+        };
+        const char *names[sizeof MEMBERS / sizeof MEMBERS[0]];
+        for (size_t i = 0; i < sizeof MEMBERS / sizeof MEMBERS[0]; i++) {
+            names[i] = atlas_memory_gen_cause_name(MEMBERS[i]);
+        }
+        check_vocab_matches_schema(db, "memory_generations", fmt, names,
+                                   sizeof names / sizeof names[0],
+                                   atlas_memory_gen_cause_name(ATLAS_MEMORY_CAUSE_UNKNOWN));
+    }
+
+    /* memory_claim_diffs.kind <-> atlas_memory_diff_kind, asserted the same
+     * way as the other three, for parity -- test 1's DDL substring check
+     * proves the controller ruling's exact wording and stays alongside this. */
+    {
+        char sql[512];
+        (void)snprintf(sql, sizeof sql,
+                      "INSERT INTO memory_generations"
+                      "  (repo_id, generation, cause, repo_identity_hash, decision_set_digest,"
+                      "   source_set_digest, created_at)"
+                      "  VALUES (%lld, 2, 'COMMIT', 'h', 'd', 's', '2026-09-01T00:00:00Z');",
+                      (long long)repo_id);
+        T_OK(atlas_db_exec_sql(db, sql, &err), &err);
+        int64_t generation_id =
+            count_sql(db, "SELECT id FROM memory_generations ORDER BY id DESC LIMIT 1;");
+        T_REQUIRE(generation_id > 0);
+
+        char fmt[512];
+        (void)snprintf(fmt, sizeof fmt,
+                      "INSERT INTO memory_claim_diffs (generation_id, claim_uid, kind)"
+                      "  VALUES (%lld, 'diff-vocab-test', '%%s');",
+                      (long long)generation_id);
+        static const atlas_memory_diff_kind MEMBERS[] = {
+            ATLAS_MEMORY_DIFF_ADDED,      ATLAS_MEMORY_DIFF_CHANGED,
+            ATLAS_MEMORY_DIFF_SUPPORTED,  ATLAS_MEMORY_DIFF_CONTRADICTED,
+            ATLAS_MEMORY_DIFF_STALE,      ATLAS_MEMORY_DIFF_IMPACTED,
+            ATLAS_MEMORY_DIFF_SUPERSEDED, ATLAS_MEMORY_DIFF_UNDETERMINED,
+        };
+        const char *names[sizeof MEMBERS / sizeof MEMBERS[0]];
+        for (size_t i = 0; i < sizeof MEMBERS / sizeof MEMBERS[0]; i++) {
+            names[i] = atlas_memory_diff_kind_name(MEMBERS[i]);
+        }
+        check_vocab_matches_schema(db, "memory_claim_diffs", fmt, names,
+                                   sizeof names / sizeof names[0],
+                                   atlas_memory_diff_kind_name(ATLAS_MEMORY_DIFF_UNKNOWN));
+    }
 
     atlas_db_close(db);
     fx_close(&fx);
@@ -416,6 +656,8 @@ static const atlas_test TESTS[] = {
      test_repo_delete_leaves_memory_rows_generation_delete_cascades_diffs},
     {"a database stopped at 28 reaches 29 with nothing pre-existing rewritten",
      test_a_database_stopped_at_28_reaches_29_losslessly},
+    {"every CHECK vocabulary in migration 29 agrees with its C enum",
+     test_vocabulary_checks_agree_with_their_c_enum},
 };
 
 ATLAS_TEST_MAIN("migrate29", TESTS)

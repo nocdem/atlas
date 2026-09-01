@@ -90,19 +90,20 @@ bool atlas_memory_source_class_is_repo(atlas_memory_source_class c);
 /* What a reconciliation pass found had happened to one remembered assertion
  * since the last generation.
  *
- * Two of these are about the *text* and six are about the *world*, and the
- * split is the point. ADDED and CHANGED say the memory file itself moved.
- * SUPPORTED, CONTRADICTED, STALE, IMPACTED and SUPERSEDED say the tree moved
- * underneath an assertion whose text did not -- which is exactly the condition a
- * model reading a memory file cannot detect for itself, and the reason this
- * season exists.
+ * Two of these are about the *text*, five are about the *world*, and one is
+ * neither -- the split is the point. ADDED and CHANGED say the memory file
+ * itself moved. SUPPORTED, CONTRADICTED, STALE, IMPACTED and SUPERSEDED say
+ * the tree moved underneath an assertion whose text did not -- which is
+ * exactly the condition a model reading a memory file cannot detect for
+ * itself, and the reason this season exists.
  *
- * UNDETERMINED is none of those five and is not the zero either. It is a
- * positive finding: Atlas evaluated this claim in this generation and could
- * not settle what changed. The zero, ATLAS_MEMORY_DIFF_UNKNOWN, means "nobody
- * filled this in" and must never parse; UNDETERMINED means somebody looked and
- * came back with no verdict, and it parses like every other member. Placed
- * after the seven existing non-zero members so no stored ordinal moves. */
+ * UNDETERMINED is the one that is neither, and is not the zero either. It
+ * sits outside both groups: it is not a claim about the text or a claim about
+ * the world, it is Atlas having looked in this generation and not settled
+ * which. The zero, ATLAS_MEMORY_DIFF_UNKNOWN, means "nobody filled this in"
+ * and must never parse; UNDETERMINED means somebody looked and came back with
+ * no verdict, and it parses like every other member. Placed after the seven
+ * existing non-zero members so no stored ordinal moves. */
 typedef enum atlas_memory_diff_kind {
     ATLAS_MEMORY_DIFF_UNKNOWN = 0,
     ATLAS_MEMORY_DIFF_ADDED,

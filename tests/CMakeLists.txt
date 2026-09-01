@@ -184,6 +184,9 @@ set(ATLAS_TESTS
   # enum in and a name out, or a byte range in and a verdict out. No database,
   # no daemon, no repository, so this belongs in the fast subset.
   test_memory_source
+  # Migration 29 against a fixture database, no daemon -- the same shape as
+  # test_migrate3 and test_migrate_scanner_uid below, which is why it sits in
+  # the same "unit" label with them rather than beside test_migrate7/8/9/10.
   test_migrate29
   # --- P0: the large-repository watcher ---
   #

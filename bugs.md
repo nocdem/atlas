@@ -464,12 +464,30 @@ kendi tercihi**.
 hem beş hayalet birim gider hem keşif COMPLETE kalır. Silme `/opt/dna` tarafında
 bir karardır ve Atlas hiçbir hedef depoyu değiştirmez.
 
-**Yeniden okunmayı bekleyen bir değer.** Kuşak 615 `scope discovery UNKNOWN` ve
-`gap: the_generation_recorded_no_coverage_manifest` diyor; kuşak 614 `DECLARED`
-ve `616 of 813` diyordu. Yayımı yeni bitmiş bir kuşağın geçici hâli gibi duruyor
-(`holding: a_generation_is_already_being_built`), ama **doğrulanmadı**: /opt/dna
-üzerinde eşzamanlı çalışma sürdüğü için oturmuş bir kuşak beklenemedi. dna
-sakinleştiğinde `code sem-status dna` bir kez daha okunmalı.
+**Düzeltme — kuşak 616, dna sakinleştikten sonra ölçüldü.** Yukarıda bildirdiğim
+"COMPLETE'ten PARTIAL'a düştü" bedeli **dışlamanın bedeli değildi** — nedeni
+madde 10'daki hatadır: dışlama yazımı `service_sem.c:411`'i tetikledi, o da
+düzeltilmemiş kökle `/opt/dna`'yı yürüyüp derinlik tavanına çarptı. Writer'ın
+ayna tabanlı yürüyüşü satırları değiştirince COMPLETE'e döndü. Oturmuş kuşakta:
+
+| | 614 (dışlamadan önce) | 616 (oturmuş) |
+| --- | --- | --- |
+| çeviri birimi | 1223 | **838** |
+| failed / partial | 5 / 1 | **0 / 0** |
+| build-input discovery | COMPLETE | **COMPLETE** |
+| scope discovery | DECLARED | **DECLARED** |
+| semantik indeks | — | **CURRENT** |
+
+`scope discovery UNKNOWN` ve `the_generation_recorded_no_coverage_manifest` de
+aynı şekilde geçiciydi. **Dışlamanın ölçülmüş kalıcı bedeli yoktur**; geri
+almak için bir sebep kalmadı.
+
+**Kalan boşluk artık başka bir şey.** `supports an absence` hâlâ `no`, ama gerekçe
+`a_translation_unit_was_not_fully_described` değil, **`the_generation_did_not_cover
+_every_candidate_source`**: 813 aday kaynağın 616'sı kapsanıyor. Kapsanmayan 196
+izlenen `.c` dosyasının dağılımı — `shared/` **126**, `messenger/` 66, `dnac/` 2,
+`nodus/` 2. Bunlar hiçbir derleme veritabanında adlandırılmıyor, yani düzeltme
+`/opt/dna`'nın derleme tarifinde; Atlas tarafında yapılacak bir şey yok.
 
 ---
 
@@ -515,3 +533,45 @@ değişiyor mu.
 
 **Düzeltme yazılmadı.** Semantik katmanı aynaya bağlamak A13'ün kapsamını
 genişletir ve kendi tasarımını hak ediyor; burada yalnızca ölçüm var.
+
+**DURUM (2026-09-01 13:10). Teşhis yanlıştı; hata gerçek ama çok daha dar.**
+
+Yukarıdaki "semantik katman aynayı hiç bilmiyor" ifadesi **yanlış**. A13 bunu
+zaten ele almış: `atlas_sem_repo_read_root` (`src/core/service_sem.c:878`) tam
+bu iş için var, ve başlığındaki yorum üç okuma noktasını adıyla sayıyor —
+"the discovery walk, the `root_fd` behind `live_facts`, and the index pass" —
+ekleyerek: *"Correcting them one at a time is how this season spent four days."*
+Düzeltme `src/sem/` içinde değil, çağıranındadır; benim gördüğüm "`src/sem/`
+içinde mirror geçmiyor" doğru ama yanıltıcı bir gözlemdi.
+
+**Gerçek hata:** `atlas_sem_discovery_run`'un üç çağıranından **ikisi** okuma
+kökünü düzeltmiyor.
+
+| Çağıran | Düzeltiyor mu |
+| --- | --- |
+| `src/daemon/writer.c:1001` — periyodik yürüyüş | evet |
+| `src/core/service_sem.c:411` — `sem-config` yazımından sonraki yeniden yürüyüş | **hayır** |
+| `src/core/service_sem.c:817` — `code index`, veritabanı adlandırılmamışsa | **hayır** |
+
+Doğrulandı: `require_repo_on` (`service_sem.c:165`) ve
+`atlas_service_require_repo` (`service.c:212`) ikisi de yalnızca
+`atlas_db_repo_get` artı bir not-found hatası; `atlas_sem_discovery_run`
+(`src/sem/index.c:551`) da içeride düzeltmiyor, `repo->root_path`'i doğrudan
+`atlas_sem_discover`'a veriyor.
+
+**Zincir, bugün ölçüldü.** `code sem-config dna --exclude nodus/build-o15e-act`
+çalıştırıldı → `service_sem.c:411` düzeltilmemiş kökle `/opt/dna`'yı yürüdü →
+`.claude/worktrees` altındaki 42 worktree'de derinlik tavanına çarptı → 28 engel
+satırı yazıldı → `build-input discovery` **PARTIAL** oldu → writer'ın periyodik
+(ayna tabanlı) yürüyüşü 09:56:41'de satırları değiştirdi → **COMPLETE**, 0 engel.
+
+**Bu, 7a'daki bir atfı da düzeltiyor.** Orada bildirilen "dışlama discovery'yi
+COMPLETE'ten PARTIAL'a düşürdü" **yanlış**: PARTIAL'ı düşüren şey dışlama değil,
+dışlamanın tetiklediği düzeltilmemiş yürüyüştü. Dışlamanın ölçülmüş kalıcı
+maliyeti yoktur.
+
+**Sessiz olan tarafı daha kötü.** `service_sem.c:411`'deki çağrı "best effort and
+deliberately not allowed to fail the write" — yani A13'ün var olma sebebi olan
+izinlerde (mod 0400, umask 077) **sessizce** başarısız olur ve operatörün kendi
+config değişikliğinden sonra kabul edilen girdi kümesi bayat kalır. Gürültülü
+hâlinden kötüdür.

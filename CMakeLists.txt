@@ -356,6 +356,14 @@ add_library(atlas_core STATIC
   # reference validation and the content-key idempotency all live behind it.
   src/verify/intake.c
   src/ipc/server_verify.c
+
+  # --- A12.1: reconciled model memory ---------------------------------------
+  #
+  # `source.c` is the five vocabularies and the policy value grammar that
+  # registers a memory source. Pure: no database handle, no process, no file and
+  # no clock, which is what lets the whole grammar be enumerated by a unit test
+  # rather than only through a root-owned file no test process can create.
+  src/memory/source.c
   ${ATLAS_UI_GEN}
 )
 

@@ -178,6 +178,12 @@ set(ATLAS_TESTS
   test_plan_render
   test_plan_xport
   test_plan_e2e
+  # --- A12.1: reconciled memory ---
+  #
+  # The five vocabularies and the policy value grammar are pure functions -- an
+  # enum in and a name out, or a byte range in and a verdict out. No database,
+  # no daemon, no repository, so this belongs in the fast subset.
+  test_memory_source
   # --- P0: the large-repository watcher ---
   #
   # The budget, its accounting and the bound each refusal names, driven against a
@@ -260,6 +266,7 @@ set_tests_properties(test_scan test_search test_diff test_worktree test_cli test
   PROPERTIES LABELS "integration")
 set_tests_properties(test_core test_safetext test_proc test_git_parse test_db test_datadir
   test_lock test_ipc test_migrate3 test_migrate_scanner_uid test_scanner_uid test_mirror test_unit
+  test_memory_source
   PROPERTIES LABELS "unit")
 # The fixture suite forks children that run the binary, but needs no repository,
 # no database and no daemon.

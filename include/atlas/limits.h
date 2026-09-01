@@ -1078,4 +1078,87 @@
  * this is what applies when policy says nothing. */
 #define ATLAS_VERIFY_DEFAULT_MAX_EVIDENCE_AGE 86400
 
+/* --- A12.1: reconciled model memory ---------------------------------------
+ *
+ * A5's rule governs every bound here, and A9.2's beside it: a bound that is
+ * reached is **refused, never trimmed**. A memory file silently read to half its
+ * length, a proposition list silently shortened, or a pack silently missing the
+ * claim that mattered would each be an attestation about a document nobody has
+ * -- and the whole season rests on a remembered assertion being traceable to the
+ * bytes it came from. */
+
+/* Memory sources one root-owned policy may register. Small on purpose: this is
+ * an operator naming the handful of files a model is actually given, not a
+ * search path. The seventeenth is refused rather than dropped, `client_uid`'s
+ * rule, because a silently shortened list is one whose author and reader
+ * disagree about what is on it and neither can see the disagreement. */
+#define ATLAS_MEMORY_MAX_SOURCES 16u
+
+/* Bytes of one memory file Atlas will read. A quarter of a megabyte is far more
+ * prose than anybody maintains by hand; a file past it is a corpus rather than a
+ * memory, and reading a prefix of it would extract propositions from a document
+ * that does not exist. */
+#define ATLAS_MEMORY_MAX_SOURCE_BYTES (256u * 1024u)
+
+/* Propositions extracted from one source in one pass, and bytes of one of them.
+ * A proposition is a single discrete assertion: past this it is a topic, and
+ * splitting it is the fix -- `ATLAS_VERIFY_CLAIM_TEXT_MAX`'s argument, and these
+ * become A9.2 claims, so it is the same argument rather than a second one. */
+#define ATLAS_MEMORY_MAX_PROPOSITIONS 128u            /* per source, per pass */
+#define ATLAS_MEMORY_MAX_PROPOSITION_BYTES 2048u
+
+/* Repository anchors one proposition may carry. An assertion tied to more things
+ * than this is not anchored, it is a summary, and every anchor is a thing whose
+ * movement has to be checked on every pass. */
+#define ATLAS_MEMORY_MAX_ANCHORS_PER_PROPOSITION 8u
+
+/* Entries read from a registered memory *directory*, and the suffix that makes
+ * one of them a memory file. A directory source is a convenience for an operator
+ * who keeps notes in several files; it is not a tree walk, so it is one level
+ * deep and bounded, and everything that is not `.md` is simply not a memory. */
+#define ATLAS_MEMORY_MAX_DIR_ENTRIES 64u
+#define ATLAS_MEMORY_DIR_SUFFIX ".md"
+
+/* What the sweep does for a machine whose policy says nothing.
+ *
+ * `false`, and the direction is deliberate: A9.2.4 could reverse its default
+ * because libclang only ever *parses*, and the thing being weighed was compute.
+ * Here the pass reads documents an operator has named and turns them into stored
+ * claims, so the absence of a statement is not consent to start. Named rather
+ * than inlined so the default has one place to be found and argued about --
+ * `ATLAS_SEM_AUTO_DEFAULT`'s shape, with the opposite value and the reason for
+ * it written down. */
+#define ATLAS_MEMORY_RECONCILE_DEFAULT false
+
+/* The Context Pack handed to a worker: claims in it, and bytes of it.
+ * Bounded for A10.1's reason -- a package that grows with the corpus stops
+ * being a package -- and refused rather than trimmed, so a worker is never shown
+ * a pack that silently omits the claim its task turned on. */
+#define ATLAS_MEMORY_PACK_MAX_CLAIMS 64u
+#define ATLAS_MEMORY_PACK_MAX_BYTES (64u * 1024u)
+
+/* Paths one reconciliation pass will attribute movement to. Past this the pass
+ * cannot enumerate what moved, so it must not pretend it can --
+ * `ATLAS_WATCH_MAX_DIRTY_PATHS`' rule, one layer out. */
+#define ATLAS_MEMORY_MAX_TOUCHED_PATHS 256u
+
+/* Trailing lines of a commit message scanned for a binding trailer. A trailer
+ * block lives at the end of a message by construction; scanning further would
+ * make an arbitrarily long body an arbitrarily long parse, over bytes whose
+ * author is untrusted. */
+#define ATLAS_MEMORY_TRAILER_SCAN_MAX 512u
+
+/* How often the sweep asks whether any registered source has moved. Chosen to be
+ * far below `ATLAS_WATCH_RECONCILE_INTERVAL_MS` -- a memory file is a small
+ * document an operator edits by hand and then immediately expects to matter,
+ * which is a different cadence question from re-examining a whole tree. */
+#define ATLAS_MEMORY_SWEEP_INTERVAL_MS 60000
+
+/* The extractor epoch. Bump it whenever identical bytes would produce different
+ * propositions: `ATLAS_CODE_ANALYZER_VERSION`'s contract, for the same reason
+ * and with the same obligation. A stored generation records the epoch that
+ * produced it, so a bump makes every generation stale rather than leaving two
+ * incompatible readings of one document indistinguishable. */
+#define ATLAS_MEMORY_EXTRACTOR_VERSION 1
+
 #endif /* ATLAS_LIMITS_H */

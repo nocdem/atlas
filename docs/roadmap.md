@@ -1466,7 +1466,8 @@ names are scanned against a forbidden-verb list — `approve`, `approval`, `reje
 `supersede`, `confirm`, `sign`, `resolve`, `revalidate` — in
 `tests/test_decision_mcp.c`, so a lifecycle transition is not reachable from a
 model by name. And the same test scans `CLAUDE.md` itself against a second list,
-which forbids Atlas from ever claiming that its local channel *proves a person*.
+which forbids Atlas from ever claiming that its local channel establishes that a
+natural person is present.
 
 That second list is the one that decides the shape of this season, and it points
 the opposite way from the intuition. **There is no human-proof gate to weaken.**
@@ -1521,8 +1522,9 @@ between them is the season's opening decision and is deliberately not made here.
 an MCP tool name, ever — the scanner enforces it and the scanner is right. No
 route gains the ability to mutate a lifecycle without its own channel identity in
 the audit row. And nothing written in `CLAUDE.md` or in the UI may claim that any
-channel proves a person; the honest sentence names the channel and its
-reachability, and `tests/test_decision_mcp.c` already fails a build that forgets.
+channel establishes that a natural person acted; the honest sentence names the
+channel and its reachability, and `tests/test_decision_mcp.c` already fails a
+build that forgets.
 
 **Deliberate non-goals.** Approving from a model surface under any framing;
 a shared credential that reads and disposes; and describing tier 3 as equivalent

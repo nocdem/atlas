@@ -1683,10 +1683,15 @@ src/gw/ui/mission-control.html  the Verification view
   attestations as `HUMAN` / `PEER_AUTHENTICATED`, because A7.1 permits running a
   model from the operator's account and on an unseparated machine there is no
   other account — so Atlas was minting the forged-human rows this season exists
-  to refuse. The two failure directions are closed by different mechanisms:
-  `atlas_verify_channel_parse` refuses the `ATLAS` name, and
-  `atlas_verify_channel_authority` refuses every raise. Claiming less authority
-  than you hold is never a forgery; it is the accurate statement.
+  to refuse. The two mechanisms guard different things and neither covers the
+  other: `atlas_verify_channel_authority` refuses every raise, and
+  `atlas_verify_channel_parse` — accepting a name exactly when
+  `atlas_verify_channel_is_transport_selectable` accepts the channel — is the
+  **whole** guard for the internal channels, because the rank admits any
+  below-rank name and A12.1's `DOCUMENT` ranks below `OPERATOR`. Never add an
+  internal channel expecting the rank to exclude it; only the parse does.
+  Claiming less authority than you hold is never a forgery; it is the accurate
+  statement.
 - **A locked authority profile costs a label, never the ability to record.** The
   local CLI asks `atlas_authority_probe` rather than assuming it is the operator,
   so a profile that grants nothing produces a `MODEL` actor instead of an

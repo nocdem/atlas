@@ -320,7 +320,8 @@ atlas_status atlas_service_sem_status(atlas_ctx *ctx, const char *name,
  * action and has no model-facing surface at all. Reading it back into the
  * status report afterwards means one command shows the operator exactly what
  * their change did, including the state it moved the repository into. */
-atlas_status atlas_sem_config_on(atlas_db *db, const atlas_sem_config_job *job,
+atlas_status atlas_sem_config_on(atlas_db *db, const char *data_dir,
+                                 const atlas_sem_config_job *job,
                                  atlas_sem_status_report *out, atlas_err *err) {
     if (job == NULL || job->repo_name == NULL) {
         return atlas_err_set(err, ATLAS_ERR_INTERNAL, "semantic configuration: bad request");
@@ -408,7 +409,7 @@ atlas_status atlas_sem_config_on(atlas_db *db, const atlas_sem_config_job *job,
         atlas_sem_discovery_result_init(&res);
         atlas_err ignored;
         atlas_err_init(&ignored);
-        (void)atlas_sem_discovery_run(db, &repo, NULL, NULL, &res, &ignored);
+        (void)atlas_sem_discovery_run_on(db, data_dir, &repo, NULL, NULL, &res, &ignored);
     }
     atlas_repo_info_free(&repo);
     if (st != ATLAS_OK) {
@@ -475,7 +476,7 @@ atlas_status atlas_service_sem_config_set(atlas_ctx *ctx, const atlas_sem_config
         job.vendor_roots_len = given[3] ? packed[3].len : 0;
         job.auto_rebuild = req->auto_rebuild;
         job.discovery_mode = req->discovery_mode;
-        st = atlas_sem_config_on(atlas_ctx_db(ctx), &job, out, err);
+        st = atlas_sem_config_on(atlas_ctx_db(ctx), atlas_ctx_data_dir(ctx), &job, out, err);
     }
     for (size_t i = 0; i < 4; i++) {
         atlas_buf_free(&packed[i]);
@@ -814,7 +815,8 @@ atlas_status atlas_service_sem_index(atlas_ctx *ctx, const char *name, const cha
         atlas_err_init(&ignored);
         /* Walk first, so an operator who has just generated a build directory
          * gets an index of it rather than of what Atlas last happened to see. */
-        (void)atlas_sem_discovery_run(atlas_ctx_db(ctx), &repo, NULL, NULL, &res, &ignored);
+        (void)atlas_sem_discovery_run_on(atlas_ctx_db(ctx), atlas_ctx_data_dir(ctx), &repo,
+                                         NULL, NULL, &res, &ignored);
         st = atlas_sem_accepted_inputs(atlas_ctx_db(ctx), repo.id, &accepted, NULL, err);
         if (st == ATLAS_OK) {
             const char *p = (const char *)accepted.data;
@@ -895,6 +897,43 @@ atlas_status atlas_sem_repo_read_root(atlas_repo_info *repo, const char *data_di
     }
     atlas_git_close(g);
     return st;
+}
+
+/* A13.1. The one way to run build-input discovery, and the reason it exists is
+ * written one function up: correcting the read root at each call site "one at a
+ * time is how this season spent four days". Three call sites reached
+ * `atlas_sem_discovery_run` directly and only the daemon's periodic job
+ * corrected the row first, so the walk after a `sem-config` write and the walk
+ * `code index` runs when no database was named both searched the registered
+ * root -- the tree A13 exists to stop the daemon reading.
+ *
+ * It failed loudly here only because the tree happened to be world-readable.
+ * Under the permissions the season was built for it fails quietly, because that
+ * call is best effort and deliberately cannot fail the write, and what it leaves
+ * behind is an accepted-input set that is stale immediately after an operator
+ * changed it.
+ *
+ * Correcting the root is deliberately *not* moved into `src/sem`: which tree a
+ * row is read from is a service-layer question, which is what the comment on
+ * `atlas_sem_repo_read_root` means by "the two roots are different questions and
+ * this is where they part". So the correction stays here and the call sites are
+ * given one door instead. `tests/test_sem_discovery.c` scans `src/` to keep that
+ * door the only one. */
+atlas_status atlas_sem_discovery_run_on(atlas_db *db, const char *data_dir, atlas_repo_info *repo,
+                                        void (*yield)(void *ud), void *yield_ud,
+                                        atlas_sem_discovery_result *out, atlas_err *err) {
+    if (repo == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "build-input discovery: bad request");
+    }
+    /* Best effort, exactly as the daemon's own job treats it: a row that cannot
+     * be pointed at a mirror is left alone so the walk's own failure is the
+     * error an operator sees, rather than one invented here. */
+    {
+        atlas_err rr;
+        atlas_err_init(&rr);
+        (void)atlas_sem_repo_read_root(repo, data_dir, &rr);
+    }
+    return atlas_sem_discovery_run(db, repo, yield, yield_ud, out, err);
 }
 
 static atlas_status point_at_read_root(atlas_repo_info *repo, const char *data_dir,

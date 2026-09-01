@@ -54,6 +54,9 @@
 #include "atlas/sem_ops.h"
 #include "atlas/sem_schedule.h"
 #include "atlas_test.h"
+
+#include <dirent.h>
+#include <sys/stat.h>
 #include "db/db_internal.h"
 #include "support/fixture.h"
 
@@ -785,6 +788,93 @@ static void test_incomplete_discovery_refuses_coverage(void) {
     env_close(&e);
 }
 
+/* --- A13.1: the raw walk has one door --------------------------------------- */
+
+typedef struct caller_scan {
+    size_t files;
+    atlas_buf names;
+} caller_scan;
+
+static void scan_one(const char *path, caller_scan *sc) {
+    atlas_buf text = ATLAS_BUF_INIT;
+    atlas_err err;
+    atlas_err_init(&err);
+    T_OK(atlas_buf_set_str(&text, "", &err), &err);
+    FILE *fp = fopen(path, "rb");
+    if (fp == NULL) {
+        atlas_buf_free(&text);
+        return;
+    }
+    char chunk[8192];
+    size_t n;
+    while ((n = fread(chunk, 1u, sizeof chunk, fp)) > 0) {
+        T_OK(atlas_buf_append(&text, chunk, n, &err), &err);
+    }
+    (void)fclose(fp);
+    /* The paren matters: `atlas_sem_discovery_run_on(` contains the shorter name
+     * and is exactly what this test wants callers to be using. */
+    if (strstr(atlas_buf_cstr(&text), "atlas_sem_discovery_run(") != NULL) {
+        sc->files++;
+        T_OK(atlas_buf_appendf(&sc->names, &err, "%s ", path), &err);
+    }
+    atlas_buf_free(&text);
+}
+
+static void scan_tree(const char *dir, caller_scan *sc) {
+    DIR *d = opendir(dir);
+    if (d == NULL) {
+        return;
+    }
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
+            continue;
+        }
+        char path[4096];
+        (void)snprintf(path, sizeof path, "%s/%s", dir, ent->d_name);
+        struct stat sb;
+        if (stat(path, &sb) != 0) {
+            continue;
+        }
+        if (S_ISDIR(sb.st_mode)) {
+            scan_tree(path, sc);
+            continue;
+        }
+        size_t len = strlen(path);
+        if (len > 2u && path[len - 2u] == '.' && (path[len - 1u] == 'c' || path[len - 1u] == 'h')) {
+            scan_one(path, sc);
+        }
+    }
+    (void)closedir(d);
+}
+
+/* A13.1. `atlas_sem_discovery_run` walks whatever `repo->root_path` holds, and
+ * a row holds the *registered* root until somebody corrects it. Three call sites
+ * reached it directly and only the daemon's periodic job corrected the row
+ * first, so the re-walk after a `sem-config` write and the walk `code index`
+ * runs when no database was named both searched the tree A13 exists to stop the
+ * daemon reading -- silently, because that call is best effort and deliberately
+ * cannot fail the write.
+ *
+ * `atlas_sem_repo_read_root`'s own comment says correcting these one at a time
+ * is how A13 spent four days, so the guard is structural rather than a fourth
+ * correction: only the definition and the single wrapper may name the raw walk.
+ * Scanning the tree rather than a fixed list is the point -- a fixed list is
+ * satisfied by a new file it does not name. */
+static void test_the_raw_walk_has_one_door(void) {
+    caller_scan sc = {0u, ATLAS_BUF_INIT};
+    scan_tree(ATLAS_SRC_DIR "/src", &sc);
+    T_CHECK_MSG(sc.files == 2u,
+                "expected 2 file(s) in src/ to name atlas_sem_discovery_run(), found %zu: %s",
+                sc.files, atlas_buf_cstr(&sc.names));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&sc.names), "/src/sem/index.c") != NULL,
+                "the definition moved out of src/sem/index.c: %s", atlas_buf_cstr(&sc.names));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&sc.names), "/src/core/service_sem.c") != NULL,
+                "the raw walk is reached from outside its one wrapper: %s",
+                atlas_buf_cstr(&sc.names));
+    atlas_buf_free(&sc.names);
+}
+
 static const atlas_test TESTS[] = {
     {"discovery scales from zero to many databases", test_discovery_scales_from_zero_to_many},
     {"a symlinked database is not a second input",
@@ -804,6 +894,7 @@ static const atlas_test TESTS[] = {
     {"the scheduler builds when inputs appear", test_the_scheduler_builds_when_inputs_appear},
     {"the walk stays inside the repository", test_the_walk_stays_inside_the_repository},
     {"incomplete discovery refuses coverage", test_incomplete_discovery_refuses_coverage},
+    {"the raw walk has one door", test_the_raw_walk_has_one_door},
 };
 
 ATLAS_TEST_MAIN("sem_discovery", TESTS)

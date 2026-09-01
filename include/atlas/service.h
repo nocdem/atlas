@@ -19,6 +19,7 @@
 #include "atlas/orch_usage.h"
 #include "atlas/plan.h"
 #include "atlas/sem.h"
+#include "atlas/sem_discover.h"
 #include "atlas/sem_schedule.h"
 #include "atlas/datadir.h"
 #include "atlas/db.h"
@@ -1813,6 +1814,16 @@ atlas_status atlas_service_sem_index(atlas_ctx *ctx, const char *name, const cha
 atlas_status atlas_sem_repo_read_root(atlas_repo_info *repo, const char *data_dir,
                                       atlas_err *err);
 
+/* A13.1. Build-input discovery on the tree this process reads: corrects `repo`'s
+ * root with `atlas_sem_repo_read_root`, then runs the walk. Every caller outside
+ * `src/sem` uses this rather than `atlas_sem_discovery_run`, because three call
+ * sites reached the raw walk and only one of them remembered to correct the row
+ * first -- see the comment at the definition. `repo` is mutated in place, the
+ * way `atlas_sem_repo_read_root` mutates it. */
+atlas_status atlas_sem_discovery_run_on(atlas_db *db, const char *data_dir, atlas_repo_info *repo,
+                                        void (*yield)(void *ud), void *yield_ud,
+                                        atlas_sem_discovery_result *out, atlas_err *err);
+
 /* `cancel` is polled between translation units and, when it answers true, the
  * generation is abandoned rather than published — `atlas_sem_index_opts.cancel`,
  * carried through untouched. It is separate from `yield` because the two answer
@@ -1920,7 +1931,8 @@ typedef struct atlas_sem_config_job {
  * `atlas_sem_impact_on` exist: the daemon's writer thread has a handle and no
  * `atlas_ctx`, and one implementation is what makes the two surfaces agree by
  * construction rather than by being kept in step. */
-atlas_status atlas_sem_config_on(atlas_db *db, const atlas_sem_config_job *job,
+atlas_status atlas_sem_config_on(atlas_db *db, const char *data_dir,
+                                 const atlas_sem_config_job *job,
                                  atlas_sem_status_report *out, atlas_err *err);
 atlas_status atlas_sem_status_on(atlas_db *db, const char *name, atlas_sem_status_report *out,
                                  atlas_err *err);

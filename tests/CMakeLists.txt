@@ -246,6 +246,11 @@ endforeach()
 set_tests_properties(test_sem PROPERTIES LABELS "integration")
 set_tests_properties(test_sem_freshness PROPERTIES LABELS "integration")
 set_tests_properties(test_sem_discovery PROPERTIES LABELS "integration")
+# A13.1. It also scans `src/` for a second caller of the raw build-input walk,
+# which is what `ATLAS_SRC_DIR` is for: `atlas_sem_discovery_run` searches
+# whatever `repo->root_path` holds, and only one of its three call sites used to
+# correct that row first.
+target_compile_definitions(test_sem_discovery PRIVATE ATLAS_SRC_DIR="${CMAKE_SOURCE_DIR}")
 set_tests_properties(test_sem_trust PROPERTIES LABELS "integration")
 # A live daemon and real MCP sessions, so it belongs to the serialised group.
 set_tests_properties(test_registry PROPERTIES LABELS "daemon")

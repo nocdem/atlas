@@ -984,21 +984,17 @@ static void run_sem_discover(atlas_writer *w, atlas_job *j) {
         atlas_repo_info_free(&repo);
         return;
     }
-    /* A13. The walk reads files, so it walks the tree this process can read.
-     * `atlas_sem_repo_read_root` answers with the mirror for a scanner-backed
-     * repository and with the registered root otherwise -- the same question
-     * `atlas_sem_index_on` asks, asked in the other place that reads. */
-    {
-        atlas_err rr;
-        atlas_err_init(&rr);
-        (void)atlas_sem_repo_read_root(&repo, atlas_buf_cstr(&w->data_dir), &rr);
-    }
     atlas_sem_discovery_result res;
     atlas_sem_discovery_result_init(&res);
     /* The walk is handed the drain, so a repository with a large tree does not
      * hold every other write for the length of it. The walk finishes before the
      * transaction that records it opens, which is what makes that safe. */
-    if (atlas_sem_discovery_run(w->db, &repo, writer_yield_cb, w, &res, &err) != ATLAS_OK) {
+    /* A13.1. `_run_on` corrects the read root before walking: the mirror for a
+     * scanner-backed repository, the registered root otherwise. This job used to
+     * do that itself, which is why the two service-layer walks could be written
+     * without it and nothing said so. One door now. */
+    if (atlas_sem_discovery_run_on(w->db, atlas_buf_cstr(&w->data_dir), &repo, writer_yield_cb, w,
+                                   &res, &err) != ATLAS_OK) {
         atlas_daemon_log(w->log, "warn",
                          "build-input discovery could not run for repository %lld: %s",
                          (long long)j->repo_id, atlas_err_msg(&err));
@@ -1313,7 +1309,8 @@ static void writer_run_job(atlas_writer *w, atlas_job *j) {
     }
     case ATLAS_JOB_SEM_CONFIG: {
         if (j->sem_config != NULL && j->sem_config_out != NULL) {
-            j->result = atlas_sem_config_on(w->db, j->sem_config, j->sem_config_out,
+            j->result = atlas_sem_config_on(w->db, atlas_buf_cstr(&w->data_dir), j->sem_config,
+                                            j->sem_config_out,
                                             &j->result_err);
         }
         break;

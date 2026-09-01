@@ -15,6 +15,7 @@
  */
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "atlas/atlas.h"
 #include "atlas/memory.h"
@@ -156,6 +157,51 @@ static void test_repo_file_over_the_bound_is_too_large(void) {
     char after[ATLAS_SHA256_HEX_LEN + 1u];
     T_OK(fx_tree_digest(fx_repo(&fx), after, &err), &err);
     T_CHECK_MSG(strcmp(before, after) == 0, "reading an oversized path modified the repository");
+
+    fx_close(&fx);
+}
+
+/* A row naming a scanner that is not this process, with no mirror vouched for
+ * -- test_mirror_source.c's own "an incomplete mirror is refused" shape, one
+ * layer up. atlas_repo_open_git refuses this outright; atlas_memory_read_source
+ * must turn that refusal into ATLAS_MEMORY_READ_NO_MIRROR rather than propagate
+ * it as a status failure, and must leave `err` clean when it does -- this is
+ * the one outcome that converts an error into a result rather than reading it
+ * off a filesystem check, so it earns its own test. */
+static void test_repo_file_no_mirror_reports_the_outcome(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    fixture fx;
+    T_REQUIRE(fx_open(&fx, &err) == ATLAS_OK);
+    build_repo(&fx, &err);
+
+    char before[ATLAS_SHA256_HEX_LEN + 1u];
+    T_OK(fx_tree_digest(fx_repo(&fx), before, &err), &err);
+
+    atlas_repo_info info;
+    make_info(&info, fx_repo(&fx), &err);
+    info.scanner_uid = (int64_t)geteuid() + 1; /* deliberately not this process */
+    info.mirror_complete = false;
+
+    atlas_memory_read_item item;
+    size_t count = 0;
+    atlas_status st = atlas_memory_read_source(&info, fx_data_dir(&fx),
+                                               ATLAS_MEMORY_SOURCE_REPO_FILE, "CLAUDE.md",
+                                               strlen("CLAUDE.md"), &item, 1u, &count, &err);
+    T_CHECK_MSG(st == ATLAS_OK, "expected ATLAS_OK even with no mirror, got %s: %s",
+                atlas_status_name(st), atlas_err_msg(&err));
+    T_CHECK_MSG(count == 1u, "expected exactly one item, got %zu", count);
+    T_CHECK_MSG(item.outcome == ATLAS_MEMORY_READ_NO_MIRROR, "expected NO_MIRROR, got %d",
+                (int)item.outcome);
+    T_CHECK_MSG(item.bytes.len == 0, "a NO_MIRROR outcome returned bytes");
+    T_CHECK_MSG(err.status == ATLAS_OK, "err was left dirty: %s", atlas_err_msg(&err));
+
+    atlas_memory_read_item_free(&item);
+    atlas_repo_info_free(&info);
+
+    char after[ATLAS_SHA256_HEX_LEN + 1u];
+    T_OK(fx_tree_digest(fx_repo(&fx), after, &err), &err);
+    T_CHECK_MSG(strcmp(before, after) == 0, "a refused mirror read modified the repository");
 
     fx_close(&fx);
 }
@@ -329,6 +375,7 @@ static const atlas_test TESTS[] = {
     {"REPO_FILE reads tracked bytes", test_repo_file_reads_tracked_bytes},
     {"REPO_FILE missing path is ABSENT", test_repo_file_missing_path_is_absent},
     {"REPO_FILE over the bound is TOO_LARGE", test_repo_file_over_the_bound_is_too_large},
+    {"REPO_FILE with no mirror reports NO_MIRROR", test_repo_file_no_mirror_reports_the_outcome},
     {"REPO_DIR finds untracked .md", test_repo_dir_finds_untracked_md},
     {"REPO_DIR skips and sorts", test_repo_dir_skips_and_sorts},
     {"EXTERNAL_FILE via read_source is NOT_OURS",

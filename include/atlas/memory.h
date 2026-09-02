@@ -821,6 +821,15 @@ typedef struct atlas_memory_pass_result {
      * one this pass could not fully look at -- and before this field they
      * read identically. */
     size_t read_obstacles;
+    /* Review round 2, I1's residual. `read_obstacles` on its own is a count
+     * with no path and no reason -- A9.2.5's own rule is that an obstacle is
+     * recorded with its exact cause, not the first reason and no path. This
+     * is not the full per-obstacle table that rule ultimately wants (a
+     * stated cost, not solved this round); it carries the most recent
+     * obstacle's own source path and outcome, e.g. "note.md: NO_MIRROR", so
+     * a caller reading a nonzero `read_obstacles` has at least one concrete
+     * example rather than only a number. */
+    char last_read_obstacle[256];
     /* Review round 1, I4. How many registered sources this pass could not
      * finish processing because a write-point call refused for a reason
      * this pass did not itself provoke by construction (not the compiled

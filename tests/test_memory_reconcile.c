@@ -1849,6 +1849,12 @@ static void test_one_source_obstacle_does_not_discard_the_rest(void) {
     T_CHECK_MSG(strstr(result.last_obstacle, "I4 test") != NULL,
                 "expected last_obstacle to carry the injected failure's own message, got \"%s\"",
                 result.last_obstacle);
+    /* Round 2, New-I2: sources_seen is an observation (both sources were
+     * attempted), not a write -- it must not be rolled back along with the
+     * poisoned source's SQL. */
+    T_CHECK_MSG(result.sources_seen == 2,
+                "expected both sources counted as seen despite one failing, got %zu",
+                result.sources_seen);
 
     char sql[256];
     (void)snprintf(sql, sizeof sql,
@@ -1862,6 +1868,86 @@ static void test_one_source_obstacle_does_not_discard_the_rest(void) {
                 "expected exactly the healthy source's one claim to survive");
 
     T_OK(atlas_db_exec_sql(e.db, "DROP TRIGGER t8_poison;", &err), &err);
+    t8_env_close(&e);
+}
+
+
+/* A scalar SQL function whose only job is to interrupt the connection it is
+ * registered on -- `sqlite3_user_data` carries the handle. Used to construct
+ * a *real* SQLITE_INTERRUPT rather than a RAISE(ABORT): per SQLite's own
+ * documented behaviour for sqlite3_interrupt(), "if the interrupted SQL
+ * statement is inside an explicit transaction, then the entire transaction
+ * is rolled back automatically" -- exactly the outer-transaction-ending
+ * case RAISE(ABORT) cannot reach, because RAISE(ABORT) only ever unwinds to
+ * the nearest savepoint. */
+static void t8_interrupt_fn(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    (void)argc;
+    (void)argv;
+    sqlite3 *h = (sqlite3 *)sqlite3_user_data(ctx);
+    sqlite3_interrupt(h);
+    sqlite3_result_null(ctx);
+}
+
+/* New-C1 (review round 2): a SQLite error that ends the *outer* transaction,
+ * not merely a savepoint, must not be treated as "this source failed, the
+ * others are fine". Driven with the real fault above rather than asserted:
+ * two sources, the poisoned one's own CLAIM_CREATE insert triggers a real
+ * interrupt, and the whole transaction goes with it. */
+static void test_outer_transaction_ending_fault_abandons_the_pass(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    t8env e;
+    t8_env_open(&e, &err);
+
+    const char *repo = fx_repo(&e.fx);
+    T_OK(fx_mkdir(repo, "src", &err), &err);
+    T_OK(fx_mkdir(repo, "src/db", &err), &err);
+    T_OK(fx_write(repo, "src/db/db_orch.c", "int x;\n", &err), &err);
+    T_OK(fx_write(repo, "note-a.md", "the daemon reads `src/db/db_orch.c`", &err), &err);
+    T_OK(fx_write(repo, "note-poison.md", "POISON the daemon reads `src/db/db_orch.c`", &err), &err);
+    T_OK(fx_add_all(&e.fx, repo, &err), &err);
+    T_OK(fx_commit(&e.fx, repo, "seed", &err), &err);
+    t8_bind_head(&e, &err);
+    t8_seed_file(&e, "src/db/db_orch.c", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                &err);
+    t8_seed_file(&e, "note-a.md", "1111111111111111111111111111111111111111111111111111111111111111",
+                &err);
+    t8_seed_file(&e, "note-poison.md",
+                "2222222222222222222222222222222222222222222222222222222222222222", &err);
+
+    T_REQUIRE(sqlite3_create_function_v2(e.db->h, "t8_interrupt", 0, SQLITE_UTF8, e.db->h,
+                                        t8_interrupt_fn, NULL, NULL, NULL) == SQLITE_OK);
+    T_OK(atlas_db_exec_sql(e.db,
+                           "CREATE TEMP TRIGGER t8_boom BEFORE INSERT ON verify_claims"
+                           " WHEN NEW.text LIKE 'POISON%'"
+                           " BEGIN SELECT t8_interrupt(); END;",
+                           &err),
+         &err);
+
+    const char *paths[] = {"note-a.md", "note-poison.md"};
+    atlas_syspolicy pol;
+    t8_policy(&pol, ATLAS_MEMORY_SOURCE_REPO_FILE, paths, 2);
+
+    char now[64];
+    atlas_now_iso8601(now, sizeof now);
+    atlas_memory_observation *obs = malloc(sizeof *obs);
+    T_REQUIRE(obs != NULL);
+    T_OK(atlas_memory_observe(e.db, &e.repo, fx_data_dir(&e.fx), &pol, obs, &err), &err);
+
+    T_OK(atlas_db_begin(e.db, &err), &err);
+    atlas_memory_pass_result result;
+    memset(&result, 0, sizeof result);
+    atlas_status st = atlas_memory_apply_in_tx(e.db, &e.repo, obs, &pol, now, &result, &err);
+
+    T_CHECK_MSG(st != ATLAS_OK,
+                "expected the pass to report failure once the outer transaction ended, got %s",
+                atlas_status_name(st));
+    T_CHECK_MSG(!atlas_db_in_transaction(e.db),
+                "expected Atlas' own tx_depth to be resynchronised once SQLite ended the "
+                "transaction, but atlas_db_in_transaction still reports true");
+
+    atlas_memory_observation_free(obs);
+    free(obs);
     t8_env_close(&e);
 }
 
@@ -1907,6 +1993,8 @@ static const atlas_test TESTS[] = {
      test_read_obstacle_is_distinguishable_from_unchanged},
     {"I4: one source's obstacle does not discard the other sources",
      test_one_source_obstacle_does_not_discard_the_rest},
+    {"New-C1: an outer-transaction-ending fault abandons the pass",
+     test_outer_transaction_ending_fault_abandons_the_pass},
 };
 
 ATLAS_TEST_MAIN("memory_reconcile", TESTS)

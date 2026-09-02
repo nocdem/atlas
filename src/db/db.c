@@ -547,19 +547,56 @@ void atlas_db_rollback(atlas_db *db) {
 
 /* --- savepoints: a sub-unit of an open transaction ------------------------ */
 
+/* A savepoint outside an already-open transaction is not a sub-unit of
+ * anything -- SQLite would silently start an implicit transaction of its
+ * own, one `tx_depth` never learns about, which is exactly what leaves
+ * `atlas_db_rollback` unable to close it afterwards (review round 2, New-I1).
+ * Required rather than merely documented, the same discipline every other
+ * refusal in this file follows. */
+static atlas_status require_open_transaction(const atlas_db *db, atlas_err *err) {
+    if (!atlas_db_in_transaction(db)) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                             "a savepoint requires an already-open transaction");
+    }
+    return ATLAS_OK;
+}
+
 atlas_status atlas_db_savepoint(atlas_db *db, const char *name, atlas_err *err) {
+    if (db == NULL || name == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "no savepoint to open");
+    }
+    atlas_status st = require_open_transaction(db, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
     char sql[96];
     (void)snprintf(sql, sizeof sql, "SAVEPOINT %s;", name);
     return atlas_db_exec_sql(db, sql, err);
 }
 
 atlas_status atlas_db_savepoint_release(atlas_db *db, const char *name, atlas_err *err) {
+    if (db == NULL || name == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "no savepoint to release");
+    }
+    atlas_status st = require_open_transaction(db, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
     char sql[96];
     (void)snprintf(sql, sizeof sql, "RELEASE %s;", name);
     return atlas_db_exec_sql(db, sql, err);
 }
 
 atlas_status atlas_db_savepoint_rollback(atlas_db *db, const char *name, atlas_err *err) {
+    if (db == NULL || name == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "no savepoint to roll back to");
+    }
+    /* Deliberately not gated on require_open_transaction: this is the one
+     * call a caller makes precisely because it suspects the transaction may
+     * already be gone (review round 2, New-C1) -- refusing it here would
+     * remove the only way to find out via its own return status. A
+     * genuinely absent transaction still fails, just from SQLite itself
+     * ("no such savepoint") rather than from a redundant guard. */
     char sql[96];
     (void)snprintf(sql, sizeof sql, "ROLLBACK TO %s;", name);
     return atlas_db_exec_sql(db, sql, err);

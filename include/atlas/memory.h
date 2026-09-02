@@ -874,8 +874,9 @@ typedef struct atlas_memory_pass_result {
      * outcome first is what guarantees *it* always survives even when the
      * path does not, since a truncated path is still informative but a
      * truncated-away outcome would leave a reader with nothing that
-     * classifies the obstacle at all. Measured, not merely reasoned about:
-     * the longest outcome label this field ever carries is
+     * classifies the obstacle at all. Read off the literals rather than
+     * measured, which is the weaker claim and the true one: the longest
+     * outcome label this field ever carries is
      * "EMPTY_MIRROR_LISTING: " at 22 bytes into 256, so the outcome always
      * survives regardless of what the path segment costs.
      *

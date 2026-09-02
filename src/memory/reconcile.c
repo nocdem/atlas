@@ -902,8 +902,8 @@ atlas_status atlas_memory_apply_in_tx(atlas_db *db, const atlas_repo_info *repo,
      * transaction is still perfectly alive (`db.c`'s `atlas_db_exec_sql`),
      * so this is one likely explanation, not the only possible one. What
      * makes the inference safe without being certain is that the response
-     * is fail-closed either way: `atlas_db_rollback` forces the connection
-     * to a known, closed state and the whole pass is abandoned, whether the
+     * is fail-closed either way: `atlas_db_rollback` is called
+     * unconditionally and the whole pass is abandoned, whether the
      * transaction was actually gone already or merely could not be trusted
      * to isolate anything further. Decided from the failure itself, not
      * from asking `atlas_db_in_transaction` first -- inside this function

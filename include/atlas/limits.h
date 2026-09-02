@@ -1156,9 +1156,25 @@
 
 /* The extractor epoch. Bump it whenever identical bytes would produce different
  * propositions: `ATLAS_CODE_ANALYZER_VERSION`'s contract, for the same reason
- * and with the same obligation. A stored generation records the epoch that
- * produced it, so a bump makes every generation stale rather than leaving two
- * incompatible readings of one document indistinguishable. */
+ * and with the same obligation.
+ *
+ * **Where it lands, because a constant nothing derives from does not work.** The
+ * pass stringifies it into the `EVIDENCE_ADD` op's `actor_version`, and
+ * `derive_actor` hashes `actor_version` into the evidence actor's uid. So a bump
+ * mints a **new reconciler actor**: propositions read under the old epoch keep
+ * their old speaker, propositions read under the new one get a new speaker, and
+ * the two readings of one document are distinguishable by who said them.
+ *
+ * It does **not** make stored generations stale, and this comment said it did
+ * until A12.1's T8 established otherwise -- `memory_generations` has no epoch
+ * column and never had one. The distinction matters: staleness would force a
+ * rebuild, while a new actor leaves both readings standing and separately
+ * attributed, which is what an append-only evidence store should do.
+ *
+ * `ATLAS_SEM_ANALYZER_VERSION` is the precedent for why this paragraph exists at
+ * all. It was enforceable only once a unit's input digest covered the producer;
+ * before that, every bump in Atlas' history was a silent no-op for any
+ * repository nobody rebuilt by hand. */
 #define ATLAS_MEMORY_EXTRACTOR_VERSION 1
 
 #endif /* ATLAS_LIMITS_H */

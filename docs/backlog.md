@@ -1468,3 +1468,44 @@ remove the column and its three filters, and say in the header that a claim is n
 superseded, which is what the code actually does today. The first is more work and
 matches the header's stated intent; the second is honest about the present. **What must
 not happen is a third season reading it as meaningful.**
+
+## `atlas_db_rollback` is not depth-aware while `begin` and `commit` are (2026-09-02)
+
+Found while A12.1's T9 added the first in-transaction `EVALUATE` in Atlas, and verified
+by reading all three functions.
+
+`atlas_db_begin` counts nesting — `tx_depth > 0` increments rather than issuing a second
+`BEGIN` (`src/db/db.c:493-499`). `atlas_db_commit` mirrors it: at depth greater than one
+it decrements and returns OK, and only the outermost call issues `COMMIT` (`:505-514`).
+**`atlas_db_rollback` does neither.** At any depth it issues one `ROLLBACK` and sets
+`tx_depth = 0` (`:540-546`).
+
+So an inner caller that rolls back destroys the outer transaction as well. The outer
+caller's later commit then finds `tx_depth == 0` and returns `ATLAS_ERR_INTERNAL`,
+"commit without an open transaction" — **fail-closed, and nothing believes it committed**,
+which is the important half and is why this is a design asymmetry rather than a
+corruption bug.
+
+**What it costs, concretely, and why A12.1 is where it shows.** T8 spent a fix round
+giving the reconciliation pass per-source isolation: each source runs inside a named SQL
+`SAVEPOINT` so one poisoned source rolls back alone and the other fifteen survive. T9
+then added the first in-transaction `EVALUATE`, which reaches
+`atlas_verify_autolifecycle_run` — and that function has seven rollback sites. Any of
+them firing discards the **whole pass**, not the one source, and the savepoint rollback
+that follows then fails naming a savepoint whose transaction is already gone. The
+isolation is still in the code and no longer does anything on that path.
+
+**Why it was not fixed in the season that found it.** It is cross-cutting: every caller
+that nests transactions is affected, not only the memory pass, and `atlas_db_rollback`'s
+current shape may well be deliberate for callers that want a hard reset. Deciding that
+needs a wider look than a task with four pinned files can give it, and T9 reported it
+rather than reaching outside its scope — which was the right call.
+
+**Candidate fixes, none implemented.** Make rollback depth-aware to match its siblings,
+so an inner rollback unwinds one level and only the outermost issues `ROLLBACK` — and
+then decide what an inner rollback *means*, since a partial rollback is not what most of
+today's seven autolifecycle sites intend. Or keep the hard reset and give it a name that
+says so, adding a separate depth-aware form for callers that nest. The first is more
+faithful to `begin`/`commit`; the second is more honest about what today's callers want.
+**What must not happen is a caller building isolation on top of it without knowing**,
+which is exactly what T8 did.

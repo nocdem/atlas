@@ -1421,12 +1421,46 @@ transaction. That exceeds both figures, which is what made the question worth as
 all: while every unbounded job on that thread yielded within milliseconds, nothing had
 tested the boundary.
 
-**Candidate fixes, none implemented.** Correct the comment to name
-`ATLAS_HOOK_IPC_TIMEOUT_MS` as the deadline that actually binds a hook's write, and
-re-derive whether 2000 is still the right grace against it — the honest answer may be
-that the grace must be meaningfully below the hook's give-up rather than equal to it.
-Separately, A12.1's T10 must classify its reconciliation job against the *measured*
-2429.9 ms rather than against either comment.
+**Where the sentence lives, because a fix that lands on one of them leaves six.** The
+claim was recorded above against `limits.h:95` alone, which understates it. It has
+**seven** homes in first-party text, four of them repeating the misattribution verbatim
+and three of them in code comments a reader reaches without opening a document:
+
+- `include/atlas/limits.h:95` — "a hook's `AI_WRITE_TIMEOUT_MS` of 4000 ms"
+- `src/daemon/writer.c:303` and `:456` — "A hook's session write ... sits out its whole
+  four seconds and *then* fails"
+- `src/daemon/writer.c:396` — the `ATLAS_JOB_AI` drainable case: "a hook, which has four
+  seconds and fails open"
+- `docs/engineering-rules.md:2535` — the rule's own statement of the derivation
+- `docs/extending.md:740` — the checklist consulted *before moving the grace*, which is
+  the one place the wrong figure would be read at the moment it decides something
+- `docs/roadmap.md:550` — "**Every** synchronous deadline on the writer path is at least
+  4000 ms"
+
+**The roadmap's form is the one that is false rather than merely misattributed.**
+`ATLAS_HOOK_TEARDOWN_TIMEOUT_MS` is **700 ms** (`limits.h:416`): a `SessionEnd` hook
+gives up at 700 ms, so it does not merely race the back-out — it is gone before a third
+of the grace has elapsed, on every refusal, always. Nothing in that path is at least
+4000 ms.
+
+**What is actually wrong is an attribution, not a number.** Every *daemon-side* deadline
+on the writer path is indeed ≥ 4000 ms — 4000 (`ai.*`), 5000 (`decision`), 10000 (one
+decision path via `ATLAS_IPC_WRITE_TIMEOUT_MS`), 15000 (`verify`), 30000 (`ai.register`)
+— so each sentence is true of the side it was written from. `AI_WRITE_TIMEOUT_MS` is not
+"a hook's" anything; it is the daemon's wait on its own writer. Naming it as the hook's
+is what carries the true half across the socket and makes the conclusion false, because
+the entity that must receive the refusal is on the other side.
+
+**Candidate fixes, none implemented.** In all seven homes, say which side each figure is
+on: `AI_WRITE_TIMEOUT_MS` (4000 ms) is the daemon's wait on the writer;
+`ATLAS_HOOK_IPC_TIMEOUT_MS` (2000 ms, and `ATLAS_HOOK_TEARDOWN_TIMEOUT_MS` 700 ms at
+`SessionEnd`) is the hook's wait on the daemon; and the grace must sit below the smaller
+of the two for a back-out to reach the caller that asked for it. Then re-derive whether
+2000 is still the right grace — the honest answer may be that it must be meaningfully
+below the hook's give-up rather than equal to it, and that no single value clears 700 ms
+and the yield-point gap at once, which would make the residual a stated cost rather than
+a solved problem. Separately, A12.1's T10 must classify its reconciliation job against
+the *measured* 2429.9 ms rather than against any of these comments.
 
 ## `verify_claims.superseded_by_claim_id` is read, filtered three times, and never written (2026-09-02)
 

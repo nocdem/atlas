@@ -8,6 +8,12 @@ add_library(atlas_test_support STATIC
   support/harness.c
   support/fixture.c
   support/jsoncheck.c
+  # A12.1 T11 fix round: the T8/T11 reconciliation-pass fixture, hoisted out of
+  # test_memory_reconcile.c so test_memory_reconcile_live.c's two daemon-forking
+  # cases and the fifty-odd in-process cases that stayed behind share one
+  # implementation rather than two copies to keep in step. See
+  # support/reconcile_env.h.
+  support/reconcile_env.c
 )
 target_include_directories(atlas_test_support PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}
@@ -193,6 +199,14 @@ set(ATLAS_TESTS
   # and the filesystem, so it is "integration" beside test_mirror_source
   # rather than "unit" beside the two pure-function suites above.
   test_memory_reconcile
+  # T11 fix round, item 6: the two cases that fork a real daemon
+  # (test_memory_reconcile.c originally carried both, and both are here now --
+  # see test_memory_reconcile_live.c's own header for why the commit message,
+  # the review and the fix-round brief all undercounted this at one). Needs
+  # its own "daemon" label and RUN_SERIAL for the reason every other live-
+  # daemon suite does: parallel daemons compete for the machine's inotify
+  # watch budget.
+  test_memory_reconcile_live
   # T7's split: bytes in, propositions out, nothing that moves consulted --
   # pure, so it belongs in the fast subset beside test_memory_source.
   test_memory_extract
@@ -286,15 +300,22 @@ set_tests_properties(test_ops PROPERTIES LABELS "daemon")
 set_tests_properties(test_scan test_search test_diff test_worktree test_cli test_terminal test_code_graph test_code_compdb
   test_code_analyzer test_git_hardening test_reconcile test_repo_scanner test_scanner_rpc test_mirror_source
   test_memory_anchor test_memory_pack
+  # T11 fix round, item 6: test_memory_reconcile is back here, plain
+  # "integration" with no RUN_SERIAL and no explicit TIMEOUT (the default 300 s
+  # the foreach above already gives it). T11 originally labelled it
+  # "integration;daemon" with RUN_SERIAL TRUE and TIMEOUT 900 for two cases
+  # that fork a real daemon; both moved to test_memory_reconcile_live below, so
+  # every case left in this file is a plain in-process one, like every other
+  # suite on this line.
+  test_memory_reconcile
   PROPERTIES LABELS "integration")
-# A12.1 T11 added a case that forks a real daemon (the restart-survival test),
-# so this suite is no longer daemon-free like its siblings above -- "daemon" is
-# added to its labels rather than replacing "integration", because every other
-# case in the file is still a plain in-process one. `ctest -LE daemon` and
-# `ctest -L unit` must both still skip it; `ctest -L daemon` and a bare `ctest`
-# still find it, and it is serialised against the other live-daemon suites for
-# the same inotify-budget reason they are.
-set_tests_properties(test_memory_reconcile PROPERTIES LABELS "integration;daemon" TIMEOUT 900
+# The two daemon-forking cases test_memory_reconcile used to carry --
+# memory.put/status/reconcile refused for a non-operator peer, and reconciled
+# memory surviving a restart -- in their own binary now, so the daemon label
+# and its serialisation apply to exactly the two cases that need a real fork
+# rather than to the fifty-odd that do not. Serialised against the other
+# live-daemon suites for the same inotify-budget reason they are.
+set_tests_properties(test_memory_reconcile_live PROPERTIES LABELS "daemon" TIMEOUT 900
   RUN_SERIAL TRUE)
 set_tests_properties(test_core test_safetext test_proc test_git_parse test_db test_datadir
   test_lock test_ipc test_migrate3 test_migrate_scanner_uid test_scanner_uid test_mirror test_unit

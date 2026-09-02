@@ -539,6 +539,71 @@ atlas_status atlas_db_memory_version_latest(atlas_db *db, int64_t source_id,
     return st;
 }
 
+/* T11 fix round (Important 1). Exactly `atlas_db_memory_version_latest`'s own
+ * SELECT with `v.content` dropped from the column list -- a caller that never
+ * reads the bytes must never pay to fetch and copy them. `out->content` is
+ * left as `_init` left it (empty), matching `atlas_db_memory_version_by_uid`'s
+ * own contract.
+ *
+ * Also closes T11 fix round Important 2's other half at the source: unlike
+ * `atlas_db_memory_version_latest` above, a `sqlite3_step` result that is
+ * neither `SQLITE_ROW` nor `SQLITE_DONE` is reported as the database failure
+ * it is, rather than silently read as "no such version" -- the distinction
+ * `memory.status`'s caller (`emit_source`, `src/ipc/server_memory.c`) depends
+ * on to stop conflating a failed read with a genuine absence. */
+atlas_status atlas_db_memory_version_latest_meta(atlas_db *db, int64_t source_id,
+                                                 atlas_memory_version_row *out, bool *found_out,
+                                                 atlas_err *err) {
+    if (found_out != NULL) {
+        *found_out = false;
+    }
+    if (db == NULL || out == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "no memory version lookup to run");
+    }
+    static const char SQL[] =
+        "SELECT v.id, v.source_id, s.repo_id, v.version_uid, v.commit_oid,"
+        "  v.content_sha256, v.content_bytes, s.path_text, v.observed_at"
+        " FROM memory_source_versions v"
+        " JOIN memory_sources s ON s.id = v.source_id"
+        " WHERE v.source_id = ?1 ORDER BY v.id DESC LIMIT 1;";
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(db, SQL, &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, source_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the source id");
+    }
+    int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        out->id = sqlite3_column_int64(stmt, 0);
+        out->source_id = sqlite3_column_int64(stmt, 1);
+        out->repo_id = sqlite3_column_int64(stmt, 2);
+        st = take_col(&out->version_uid, stmt, 3, err);
+        if (st == ATLAS_OK) {
+            st = take_col(&out->commit_oid, stmt, 4, err);
+        }
+        if (st == ATLAS_OK) {
+            st = take_col(&out->content_sha256, stmt, 5, err);
+        }
+        out->content_bytes = sqlite3_column_int64(stmt, 6);
+        if (st == ATLAS_OK) {
+            st = take_col(&out->path_text, stmt, 7, err);
+        }
+        if (st == ATLAS_OK) {
+            st = take_col(&out->observed_at, stmt, 8, err);
+        }
+        if (st == ATLAS_OK && found_out != NULL) {
+            *found_out = true;
+        }
+    } else if (rc != SQLITE_DONE) {
+        st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot read the memory source's latest version");
+    }
+    atlas_db_finish(db, stmt);
+    return st;
+}
+
 atlas_status atlas_db_memory_anchor_add(atlas_db *db, int64_t repo_id, const char *claim_uid,
                                         atlas_memory_anchor_kind kind, const char *value,
                                         atlas_err *err) {

@@ -58,6 +58,19 @@ static atlas_status hex_decode(const char *hex, atlas_buf *out, atlas_err *err) 
         return atlas_err_set(err, ATLAS_ERR_USAGE, "content must be an even number of hex digits");
     }
     atlas_buf_reset(out);
+    /* Fix round Minor 2: a zero-length blob and a NULL blob are different
+     * facts to SQLite -- `sqlite3_bind_blob` with a NULL pointer binds NULL
+     * regardless of length, and `atlas_buf_reset` alone leaves `out->data`
+     * NULL when nothing has ever been appended to it, which is exactly what
+     * `n == 0` leaves untouched below. Reserving zero bytes forces a real,
+     * non-NULL, zero-length allocation -- what `atlas_buf_append`'s own
+     * `n == 0` branch already guarantees for every other caller -- so an
+     * emptied external file is stored as an empty blob and satisfies
+     * migration 29's `CHECK(blob_oid <> '' OR content IS NOT NULL)`, rather
+     * than being read as NULL and refused. */
+    if (n == 0u) {
+        return atlas_buf_reserve(out, 0, err);
+    }
     for (size_t i = 0; i < n; i += 2u) {
         int hi = hex_digit(hex[i]);
         int lo = hex_digit(hex[i + 1u]);
@@ -108,6 +121,24 @@ atlas_status atlas_server_memory_put(dispatch_state *ds, const atlas_ipc_request
     if (!atlas_ipc_param_str(req, "observed_at", &observed_at) || observed_at == NULL ||
         observed_at[0] == '\0') {
         return atlas_err_set(err, ATLAS_ERR_USAGE, "a put needs observed_at");
+    }
+    /* Fix round Minor 4: invariant 7 says every parser is bounded, and this was
+     * the one caller-supplied string on this path with no ceiling at all --
+     * `content` is bounded at the writer (`ATLAS_MEMORY_MAX_SOURCE_BYTES`) and
+     * `source`/`rel_path` are register-row lengths the writer resolves
+     * against. This one lands durably in `memory_source_versions.observed_at`
+     * and is folded into the reconciliation pass's own evidence content key
+     * (`src/memory/reconcile.c:1169`), so the transport frame
+     * (`ATLAS_IPC_MAX_REQUEST_BYTES`) was its only ceiling before this. Decided
+     * from the request alone, before anything reaches the writer, and refused
+     * rather than truncated -- the MCP verify path's own `observed_at`
+     * (`src/mcp/mcp_tools.c:3151`) is bounded at the same named constant for
+     * the identical reason: an operator-supplied stamp, not file content. */
+    if (strlen(observed_at) > ATLAS_VERIFY_NAME_MAX) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "observed_at is longer than %u bytes; it was refused rather than "
+                             "truncated",
+                             ATLAS_VERIFY_NAME_MAX);
     }
 
     if (ds->ctx == NULL || ds->ctx->writer == NULL) {
@@ -199,11 +230,19 @@ static atlas_status emit_source(int64_t id, const char *source_uid, atlas_memory
     atlas_memory_version_row_init(&row);
     bool found = false;
     if (st == ATLAS_OK) {
-        atlas_err verr;
-        atlas_err_init(&verr);
-        if (atlas_db_memory_version_latest(ds->db, id, &row, &found, &verr) != ATLAS_OK) {
-            found = false;
-        }
+        /* Fix round Important 1: the metadata-only projection, so a poll of
+         * every registered source's latest version never reads and discards
+         * up to `ATLAS_MEMORY_MAX_SOURCE_BYTES` of content per source.
+         *
+         * Fix round Important 2: `err` is the same `atlas_err` the caller
+         * (`atlas_server_memory_status`) will report, threaded straight
+         * through rather than caught in a local and swallowed -- a failed
+         * read is `st != ATLAS_OK`, propagated below, and is never folded
+         * into `found = false`. The comment at this function's own header
+         * defines `latest_version: null` as "never put, or not yet
+         * reconciled" -- a database read that failed is neither, and must
+         * not answer the same as either. */
+        st = atlas_db_memory_version_latest_meta(ds->db, id, &row, &found, err);
     }
     if (st == ATLAS_OK) {
         st = atlas_json_key(ds->j, "latest_version", err);

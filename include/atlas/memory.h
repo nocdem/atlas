@@ -277,10 +277,11 @@ typedef struct atlas_memory_version_row {
      * to extract propositions from -- a different principal (T11's
      * `memory.put`, not yet built) writes that row, and this is how the pass
      * reads it back. Left unset (empty) by `atlas_db_memory_version_by_uid`'s
-     * ordinary callers is fine: an empty buffer for a row that has content is
-     * indistinguishable from a row that has none only if a caller conflates
-     * "empty" with "absent", which nothing here does -- `content_bytes` is the
-     * length that decides that question, not this buffer's own `.len`. */
+     * and `atlas_db_memory_version_latest_meta`'s ordinary callers is fine: an
+     * empty buffer for a row that has content is indistinguishable from a row
+     * that has none only if a caller conflates "empty" with "absent", which
+     * nothing here does -- `content_bytes` is the length that decides that
+     * question, not this buffer's own `.len`. */
     atlas_buf content;
 } atlas_memory_version_row;
 
@@ -375,6 +376,22 @@ atlas_status atlas_db_memory_version_insert(atlas_db *db, int64_t source_id, con
 atlas_status atlas_db_memory_version_latest(atlas_db *db, int64_t source_id,
                                             atlas_memory_version_row *out, bool *found_out,
                                             atlas_err *err);
+
+/* A12.1 T11 fix round (Important 1). `atlas_db_memory_version_latest`'s own
+ * SELECT with `v.content` projected out -- a metadata-only read for a caller
+ * that never uses the bytes. `memory.status` polls every registered source's
+ * latest version on every call, and nothing ever deletes a `memory_sources`
+ * row, so a caller reusing `atlas_db_memory_version_latest` and discarding
+ * `.content` still pays for reading and copying up to
+ * `ATLAS_MEMORY_MAX_SOURCE_BYTES` off disk per source, every poll, for the
+ * life of the repository. `.content` is left empty on `*out`, exactly as
+ * `atlas_db_memory_version_by_uid` already leaves it for its own callers.
+ * `*found_out` is false when the source has no version yet, and a *read
+ * failure* is neither -- it is `atlas_status != ATLAS_OK`, which is the
+ * distinction `memory.status`'s own fix round exists for (Important 2). */
+atlas_status atlas_db_memory_version_latest_meta(atlas_db *db, int64_t source_id,
+                                                 atlas_memory_version_row *out, bool *found_out,
+                                                 atlas_err *err);
 
 /* Records one resolved anchor for one claim. `INSERT OR IGNORE`: the same
  * anchor recorded again by an unchanged re-run is not a second row --

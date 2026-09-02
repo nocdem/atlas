@@ -804,3 +804,165 @@ atlas_status atlas_memory_pack_compose(const char *task, const char *memory_pack
     }
     return st;
 }
+
+/* --- T13: the reliance check -------------------------------------------------
+ *
+ * `flagged_anchors` is netstring triples with a leading count, this file's own
+ * shape (`<count>:` then `count` groups of three `ns_put` elements) -- the same
+ * discipline as `atlas_orch_paths_encode`'s single-element list one layer over,
+ * reimplemented here rather than shared for the reason the tokenizer's own
+ * comment gives: two small, closed-form codecs in different layers over
+ * different vocabularies, not a cross-layer dependency for one that rarely
+ * changes. `ns_take` mirrors `src/orch/orch.c`'s function of the same name and
+ * the same contract: `*pos` advances past one decoded element, and a malformed
+ * length or a missing delimiter is refused rather than guessed at. */
+static bool ns_take(const char *text, size_t total, size_t *pos, const char **out, size_t *len) {
+    size_t i = *pos;
+    size_t n = 0;
+    size_t digits = 0;
+    while (i < total && text[i] >= '0' && text[i] <= '9') {
+        if (digits > 9) {
+            return false; /* a length nobody could mean */
+        }
+        n = n * 10u + (size_t)(text[i] - '0');
+        i++;
+        digits++;
+    }
+    if (digits == 0 || i >= total || text[i] != ':') {
+        return false;
+    }
+    i++;
+    if (n > total - i) {
+        return false;
+    }
+    *out = text + i;
+    *len = n;
+    i += n;
+    if (i >= total || text[i] != ',') {
+        return false;
+    }
+    *pos = i + 1u;
+    return true;
+}
+
+/* The leading `<count>:` that both of this file's own netstring lists carry.
+ * `*count_out` is the number of *records*, not the number of underlying
+ * netstring elements -- the caller knows how many elements make up one record
+ * (three, for `flagged_anchors`). */
+static bool ns_take_count(const char *text, size_t total, size_t *pos, size_t *count_out) {
+    size_t i = *pos;
+    size_t n = 0;
+    size_t digits = 0;
+    while (i < total && text[i] >= '0' && text[i] <= '9') {
+        if (digits > 9) {
+            return false;
+        }
+        n = n * 10u + (size_t)(text[i] - '0');
+        i++;
+        digits++;
+    }
+    if (digits == 0 || i >= total || text[i] != ':') {
+        return false;
+    }
+    *pos = i + 1u;
+    *count_out = n;
+    return true;
+}
+
+atlas_status atlas_memory_pack_reliance_match(const atlas_memory_pack *p,
+                                              const atlas_buf *touched_paths, size_t touched_count,
+                                              atlas_buf *matched_out, bool *any_out, atlas_err *err) {
+    if (any_out != NULL) {
+        *any_out = false;
+    }
+    if (p == NULL || matched_out == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "no pack or destination for a reliance check");
+    }
+    atlas_buf_reset(matched_out);
+    if (touched_count == 0 || p->flagged_anchors.len == 0) {
+        /* Nothing observed, or nothing flagged: an empty result either way,
+         * and neither is an error -- a run with no flagged anchors is the
+         * ordinary case, and a completion with nothing touched is honest. */
+        return atlas_buf_append_str(matched_out, "0:", err);
+    }
+
+    const char *text = atlas_buf_cstr(&p->flagged_anchors);
+    size_t total = p->flagged_anchors.len;
+    size_t pos = 0;
+    size_t records = 0;
+    if (!ns_take_count(text, total, &pos, &records)) {
+        return atlas_err_set(err, ATLAS_ERR_DB, "the frozen pack's flagged anchors are malformed");
+    }
+
+    /* Distinct matched claim uids, in the order `flagged_anchors` names them,
+     * bounded by the pack's own claim cap: a flagged claim is a subset of the
+     * relevant set, which `atlas_memory_pack_build` already refuses past
+     * `ATLAS_MEMORY_PACK_MAX_CLAIMS`. */
+    atlas_buf matched[ATLAS_MEMORY_PACK_MAX_CLAIMS];
+    size_t matched_n = 0;
+    for (size_t i = 0; i < ATLAS_MEMORY_PACK_MAX_CLAIMS; i++) {
+        atlas_buf_init(&matched[i]);
+    }
+    atlas_status st = ATLAS_OK;
+
+    for (size_t r = 0; st == ATLAS_OK && r < records; r++) {
+        const char *uid_p = NULL, *kind_p = NULL, *val_p = NULL;
+        size_t uid_len = 0, kind_len = 0, val_len = 0;
+        if (!ns_take(text, total, &pos, &uid_p, &uid_len) ||
+            !ns_take(text, total, &pos, &kind_p, &kind_len) ||
+            !ns_take(text, total, &pos, &val_p, &val_len)) {
+            st = atlas_err_set(err, ATLAS_ERR_DB, "the frozen pack's flagged anchors are malformed");
+            break;
+        }
+        if (kind_len != 4u || memcmp(kind_p, "PATH", 4u) != 0) {
+            continue; /* T13's reliance input is PATH anchors only */
+        }
+        bool touched = false;
+        for (size_t t = 0; !touched && t < touched_count; t++) {
+            if (touched_paths[t].len == val_len &&
+               (val_len == 0 || memcmp(touched_paths[t].data, val_p, val_len) == 0)) {
+                touched = true;
+            }
+        }
+        if (!touched) {
+            continue;
+        }
+        bool already = false;
+        for (size_t m = 0; !already && m < matched_n; m++) {
+            already = matched[m].len == uid_len &&
+                     (uid_len == 0 || memcmp(matched[m].data, uid_p, uid_len) == 0);
+        }
+        if (already) {
+            continue;
+        }
+        if (matched_n >= ATLAS_MEMORY_PACK_MAX_CLAIMS) {
+            /* Unreachable in practice -- see the bound above -- refused rather
+             * than silently dropped, the same discipline as every other bound
+             * in this file. */
+            st = atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                               "more distinct claims matched a reliance check than the pack could "
+                               "ever have flagged");
+            break;
+        }
+        st = atlas_buf_set(&matched[matched_n], uid_p, uid_len, err);
+        if (st == ATLAS_OK) {
+            matched_n++;
+        }
+    }
+
+    if (st == ATLAS_OK) {
+        st = atlas_buf_appendf(matched_out, err, "%zu:", matched_n);
+    }
+    for (size_t m = 0; st == ATLAS_OK && m < matched_n; m++) {
+        st = ns_put(matched_out, atlas_buf_cstr(&matched[m]), err);
+    }
+    for (size_t i = 0; i < ATLAS_MEMORY_PACK_MAX_CLAIMS; i++) {
+        atlas_buf_free(&matched[i]);
+    }
+    if (st != ATLAS_OK) {
+        atlas_buf_reset(matched_out);
+    } else if (any_out != NULL) {
+        *any_out = matched_n > 0;
+    }
+    return st;
+}

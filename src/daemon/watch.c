@@ -2924,8 +2924,9 @@ static void recover_due(atlas_watcher *w) {
     atlas_orch_result_init(&r);
     atlas_err err;
     atlas_err_init(&err);
-    /* `atlas_writer_orch` takes ownership of `op` on every path. */
-    if (atlas_writer_orch(w->writer, op, 5000, &r, &err) != ATLAS_OK) {
+    /* `atlas_writer_orch` takes ownership of `op` on every path. RECOVER never
+     * reaches `run_orch`'s pack-related branches, so no policy is needed. */
+    if (atlas_writer_orch(w->writer, op, 5000, NULL, &r, &err) != ATLAS_OK) {
         if (atlas_ipc_message_is_busy(atlas_err_msg(&err))) {
             atlas_orch_contention_note(wall_now_ms());
         }

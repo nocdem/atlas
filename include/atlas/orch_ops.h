@@ -16,6 +16,23 @@
  * touch any table outside the eight `orch_*` ones. That is not a promise about
  * the code; it is the whole content of the file, and `tests/test_orch_trust.c`
  * asserts it against a real database after a full job lifecycle.
+ *
+ * **That file does not exist in this tree** -- found while wiring A12.1 T13,
+ * pre-existing and not introduced by it: `tests/test_orch_lifecycle.c` cites
+ * the same path for the same claim, and neither reference resolves. Reported
+ * rather than invented, per this codebase's own reporting rule; creating it is
+ * out of T13's scope.
+ *
+ * **T13 adds one deliberate, disclosed exception to "eight `orch_*` ones."**
+ * A root-task SUBMIT freezes a `memory_context_packs` row (Decision 8,
+ * `docs/plans/2026-09-01-a12.1-reconciled-memory.md`) and a COMPLETE may update
+ * one's reliance columns, both inside `atlas_orch_apply_in_tx`'s own
+ * transaction. Neither writes that table's SQL directly: both call into
+ * `src/memory/pack.c` and `src/db/db_memory.c`, which `db_memory.c`'s own file
+ * header states is the only production writer of a `memory_*` table -- the
+ * same delegation `atlas_db_orch_memory_freeze` (`src/db/db_orch_memory.c`)
+ * already uses for `orch_run_memory`, one layer removed because the target
+ * table is outside the `orch_` namespace this time.
  */
 #ifndef ATLAS_ORCH_OPS_H
 #define ATLAS_ORCH_OPS_H
@@ -23,6 +40,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "atlas/memory.h"
 #include "atlas/orch.h"
 #include "atlas/orch_memory.h"
 #include "atlas/orch_usage.h"
@@ -89,6 +107,26 @@ typedef struct atlas_orch_op {
     int64_t repo_id;
     atlas_buf repo_root;
 
+    /* A12.1 T13. SUBMIT, root task only. Already built by `run_orch`
+     * (`src/daemon/writer.c`) before this op reaches `atlas_orch_apply` --
+     * `atlas_memory_pack_build` may open the tree (`atlas_sem_source_identity`
+     * over a dirty repository) and so must run with no transaction open, the
+     * same seam A1 already requires of `atlas_memory_observe`. Threading a
+     * built struct down beats threading a builder down: a builder called from
+     * inside `submit_resolve_run`'s transaction is exactly the defect this
+     * split exists to avoid.
+     *
+     * `has_context_pack` is false for a child task (it inherits its parent's
+     * run and freezes nothing) and for a root task over a repository with no
+     * registered source or no generation yet -- `atlas_memory_pack_build`
+     * still succeeds in that case, pinning empty-but-meaningful digests, but
+     * freezing an all-but-empty pack for every future run would freeze
+     * something to compare staleness against forever. `context_pack` is
+     * always initialised (`atlas_memory_pack_init`) whether or not it is used,
+     * so `atlas_orch_op_free` has one thing to do regardless of the flag. */
+    atlas_memory_pack context_pack;
+    bool has_context_pack;
+
     /* CANCEL, and every read that names a job. */
     atlas_buf job_uid;
 
@@ -127,6 +165,29 @@ typedef struct atlas_orch_op {
     int64_t exit_code;
     atlas_orch_reason failure_reason;
     atlas_buf driver_version;
+
+    /* A12.1 T13. COMPLETE. The driver's own observation of what changed in the
+     * repository's tree, gathered after the worker and the existing HEAD
+     * re-check (Decision 8): `git status --porcelain -z`, already allowlisted,
+     * over the tree the run driver already holds. Netstring-encoded
+     * (`atlas_orch_paths_encode`'s own shape, a leading `<count>:` then that
+     * many `path_text`-encoded entries), bounded by
+     * `ATLAS_MEMORY_MAX_TOUCHED_PATHS`; past the bound the first that many are
+     * sent and `touched_complete` is false. Empty and `touched_complete = true`
+     * for every completion that never reaches that gather step -- a refusal
+     * before the worker ran, a moved HEAD, or a job with no run at all -- which
+     * is the conservative reading: an absent observation contributes nothing to
+     * the reliance check rather than a guess.
+     *
+     * This is the driver's own trust class, `op->success`'s own: Atlas'
+     * classification of what it saw, never the worker's claim. The daemon
+     * intersects it against the run's frozen pack (`flagged_anchors`) inside
+     * the completion transaction and the result **settles nothing** -- no gate
+     * fails, no run blocks, no verdict moves; it is recorded on the pack row
+     * and reported, exactly as `docs/plans/2026-09-01-a12.1-reconciled-
+     * memory.md`'s Decision 8 requires. */
+    atlas_buf touched_paths;
+    bool touched_complete;
 
     /* COMPLETE, A11.1. Which of the job's **stored** validation commands failed,
      * as a zero-based index into them, or -1 when none did. An index rather
@@ -282,6 +343,27 @@ typedef struct atlas_orch_result {
     atlas_buf memory_package;
     atlas_orch_memory_mode memory_mode;
     char memory_digest[65];
+
+    /* A12.1 T13. LEASE. The run's frozen Canonical Context Pack, or empty when
+     * the run has none -- a repository with no registered source, no
+     * generation yet, or a job submitted before this migration. Read in the
+     * same transaction as the grant (`op_lease`, `src/db/db_orch.c`), beside
+     * the A10.1 package above and for the same reason: the bytes a worker is
+     * shown and the attempt it is shown for must be decided together.
+     *
+     * `context_pack` is `p->rendered` verbatim -- already `atlas_safe()`-
+     * encoded, `pack_put_flat`'s own doing -- and `context_pack_status` is the
+     * delivery-time freshness line (`atlas_memory_pack_status_name` plus, on
+     * STALE, the fixed `STALE:<WHICH>` spelling), computed by `run_orch`
+     * (`src/daemon/writer.c`) **after** this transaction commits: freshness may
+     * open the tree (`atlas_memory_pack_freshness`, gated on a non-empty pinned
+     * `source_identity`) and so must run with none open, the same rule that
+     * splits `atlas_memory_pack_build` from `_freeze_in_tx`. A worker is never
+     * told a moved pack is current: if the post-commit freshness read itself
+     * fails, `context_pack` is cleared rather than delivered with an empty
+     * status, because an unlabelled body would read as silently CURRENT. */
+    atlas_buf context_pack;
+    atlas_buf context_pack_status;
 
     /* RECOVER: how many jobs each outcome applied to, for the daemon log and
      * for `atlas job recover`. */

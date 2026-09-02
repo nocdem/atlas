@@ -592,6 +592,17 @@ static atlas_status build_run_complete(atlas_json *j, void *ud, atlas_err *err) 
             st = atlas_json_arr_end(j, err);
         }
     }
+    /* A12.1 T13. The run driver's own touched-paths observation. Omitted
+     * entirely when it gathered nothing (a refusal before the worker ran, a
+     * moved HEAD) -- the same "absent key, conservative reading" contract as
+     * `usage` above, and `op->touched_complete`'s own default (`true`) is what
+     * the far side reads for an absent `touched_complete` too. */
+    if (st == ATLAS_OK && op->touched_paths.len > 0) {
+        st = atlas_json_key_str(j, "touched_paths", atlas_buf_cstr(&op->touched_paths), err);
+        if (st == ATLAS_OK && !op->touched_complete) {
+            st = atlas_json_key_bool(j, "touched_complete", op->touched_complete, err);
+        }
+    }
     return st;
 }
 
@@ -681,6 +692,9 @@ static atlas_status xport_apply(void *ud, const atlas_orch_op *op, atlas_orch_re
             {&out->task_text, "task"},     {&out->validations, "validations"},
             {&out->run_uid, "run"},        {&out->follow_up_job_uid, "follow_up"},
             {&out->memory_package, "memory"},
+            /* A12.1 T13. */
+            {&out->context_pack, "context_pack"},
+            {&out->context_pack_status, "context_pack_status"},
         };
         for (size_t i = 0; st == ATLAS_OK && i < sizeof strs / sizeof strs[0]; i++) {
             if (atlas_ipc_result_str(resp, strs[i].key, &v) && v != NULL) {

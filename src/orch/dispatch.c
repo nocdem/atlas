@@ -37,6 +37,7 @@
 #include "atlas/driver.h"
 #include "atlas/validate.h"
 #include "atlas/ipc.h"
+#include "atlas/memory.h"
 #include "atlas/orch.h"
 #include "atlas/orchpolicy.h"
 #include "atlas/safetext.h"
@@ -159,6 +160,16 @@ typedef struct attempt {
     atlas_buf task;
     atlas_buf allowed_paths;
     atlas_buf validations;
+    /* A12.1 T13. The run's frozen A10.1 memory package and Canonical Context
+     * Pack, exactly as the daemon granted them -- not read by anything in
+     * this file except where they are appended to the task, the same rule
+     * `src/orch/rundriver.c`'s `claimed.memory` carries. Both are empty for a
+     * job with no run, or a run with no package/pack, which is the ordinary
+     * case for a workspace attempt (A11.6 gives most runs a repo-tree root and
+     * no sibling), and appends nothing at all. */
+    atlas_buf memory;
+    atlas_buf context_pack;
+    atlas_buf context_pack_status;
     int64_t attempt_no;
     int64_t wall_timeout_ms;
     int64_t idle_timeout_ms;
@@ -185,6 +196,9 @@ static void attempt_init(attempt *a) {
     atlas_buf_init(&a->task);
     atlas_buf_init(&a->allowed_paths);
     atlas_buf_init(&a->validations);
+    atlas_buf_init(&a->memory);
+    atlas_buf_init(&a->context_pack);
+    atlas_buf_init(&a->context_pack_status);
 }
 
 static void attempt_free(attempt *a) {
@@ -202,6 +216,9 @@ static void attempt_free(attempt *a) {
     atlas_buf_free(&a->task);
     atlas_buf_free(&a->allowed_paths);
     atlas_buf_free(&a->validations);
+    atlas_buf_free(&a->memory);
+    atlas_buf_free(&a->context_pack);
+    atlas_buf_free(&a->context_pack_status);
 }
 
 /* What a lease asks for: this dispatcher's name, its driver filter, and — A12.0
@@ -839,13 +856,25 @@ static atlas_status run_attempt(attempt *a, atlas_err *err) {
                                atlas_buf_cstr(&a->driver));
         }
     }
+    atlas_buf composed = ATLAS_BUF_INIT;
+    if (st == ATLAS_OK) {
+        /* A12.1 T13. `atlas_memory_pack_compose` is the one implementation of
+         * appending run context to a task, and this is its second call site --
+         * `src/orch/rundriver.c`'s `drive_one` is the first. Appends nothing at
+         * all when a sibling's run carries no package and no pack, which is
+         * the ordinary case (A11.6 pins memory and the pack to the run's
+         * repo-tree root). */
+        st = atlas_memory_pack_compose(atlas_buf_cstr(&a->task), atlas_buf_cstr(&a->memory),
+                                       atlas_buf_cstr(&a->context_pack_status),
+                                       atlas_buf_cstr(&a->context_pack), &composed, err);
+    }
     if (st == ATLAS_OK) {
         atlas_driver_req req;
         memset(&req, 0, sizeof(req));
         req.ws = &ws;
         req.job_uid = atlas_buf_cstr(&a->job_uid);
         req.attempt_no = a->attempt_no;
-        req.task = atlas_buf_cstr(&a->task);
+        req.task = atlas_buf_cstr(&composed);
         req.mode = atlas_buf_cstr(&a->mode);
         req.wall_timeout_ms = a->wall_timeout_ms;
         req.idle_timeout_ms = a->idle_timeout_ms;
@@ -859,6 +888,7 @@ static atlas_status run_attempt(attempt *a, atlas_err *err) {
         req.model = atlas_driver_model_for(drv, &o->models);
         st = drv->run(&req, &dr, err);
     }
+    atlas_buf_free(&composed);
 
     /* Whatever the driver did, the patch and the artifacts are produced from
      * what is on disk rather than from what the driver said it did. */
@@ -950,6 +980,16 @@ static atlas_status take_grant(const rpc *r, attempt *a, atlas_err *err) {
         {&a->mode, "mode"},          {&a->driver, "driver"},
         {&a->task, "task"},          {&a->allowed_paths, "allowed_paths"},
         {&a->validations, "validations"},
+        /* A12.1 T13. This dispatcher's workspace attempt path never read
+         * "memory" before this fix: the A10.1 package was appended to a
+         * repo-tree task by `src/orch/rundriver.c` alone, and a workspace
+         * sibling's task never carried it at all. Closed here as a side
+         * effect of wiring the one composer into this attempt path too --
+         * disclosed as a pre-existing gap, not a new capability this task
+         * invents. */
+        {&a->memory, "memory"},
+        {&a->context_pack, "context_pack"},
+        {&a->context_pack_status, "context_pack_status"},
     };
     atlas_status st = ATLAS_OK;
     for (size_t i = 0; st == ATLAS_OK && i < sizeof strs / sizeof strs[0]; i++) {

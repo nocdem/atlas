@@ -31,6 +31,7 @@
 #include "atlas/atlas.h"
 #include "atlas/db.h"
 #include "atlas/limits.h"
+#include "atlas/memory.h"
 #include "atlas/orch_ops.h"
 #include "atlas/sha256.h"
 #include "atlas/snapshot.h"
@@ -81,6 +82,12 @@ atlas_orch_op *atlas_orch_op_new(atlas_orch_op_kind kind) {
     atlas_buf_init(&op->driver_version);
     atlas_buf_init(&op->failure_detail);
     op->failed_gate = -1;
+    /* A12.1 T13. Always initialised whether or not this op ever becomes a
+     * root-task SUBMIT: `atlas_orch_op_free` has one thing to do regardless of
+     * `has_context_pack`. */
+    atlas_memory_pack_init(&op->context_pack);
+    atlas_buf_init(&op->touched_paths);
+    op->touched_complete = true;
     return op;
 }
 
@@ -98,6 +105,8 @@ void atlas_orch_op_free(atlas_orch_op *op) {
     atlas_buf_free(&op->event_payload);
     atlas_buf_free(&op->driver_version);
     atlas_buf_free(&op->failure_detail);
+    atlas_memory_pack_free(&op->context_pack);
+    atlas_buf_free(&op->touched_paths);
     for (size_t i = 0; i < op->artifact_count; i++) {
         atlas_orch_artifact_free(&op->artifacts[i]);
     }
@@ -121,6 +130,8 @@ void atlas_orch_result_init(atlas_orch_result *r) {
     atlas_buf_init(&r->validations);
     atlas_buf_init(&r->follow_up_job_uid);
     atlas_buf_init(&r->memory_package);
+    atlas_buf_init(&r->context_pack);
+    atlas_buf_init(&r->context_pack_status);
 }
 
 void atlas_orch_result_free(atlas_orch_result *r) {
@@ -140,6 +151,8 @@ void atlas_orch_result_free(atlas_orch_result *r) {
     atlas_buf_free(&r->validations);
     atlas_buf_free(&r->follow_up_job_uid);
     atlas_buf_free(&r->memory_package);
+    atlas_buf_free(&r->context_pack);
+    atlas_buf_free(&r->context_pack_status);
 }
 
 /* --- the job row ----------------------------------------------------------- */
@@ -861,6 +874,7 @@ static atlas_status run_pick_slot(atlas_db *db, const char *run_uid, int64_t max
 static atlas_status submit_resolve_run(atlas_db *db, const atlas_orch_spec *s, const char *job_uid,
                                        int64_t created_ms, atlas_orch_memory_mode mode,
                                        int64_t repo_id, int64_t max_parallel,
+                                       bool has_context_pack, const atlas_memory_pack *context_pack,
                                        atlas_buf *run_uid_out, int64_t *slot_out, atlas_err *err) {
     *slot_out = 0;
     if (s->parent_job_uid.len == 0) {
@@ -913,6 +927,18 @@ static atlas_status submit_resolve_run(atlas_db *db, const atlas_orch_spec *s, c
                                              atlas_buf_cstr(&s->task_text),
                                              atlas_buf_cstr(&s->source_commit), &pkg, err);
             atlas_orch_memory_package_free(&pkg);
+        }
+        /* A12.1 T13, Decision 8. The Canonical Context Pack is frozen the same
+         * way and for the same two reasons, in its own table under
+         * `UNIQUE(run_uid)`: `atlas_memory_pack_freeze_in_tx` reads nothing and
+         * writes one row, so it belongs here beside the freeze above rather
+         * than after this transaction commits. `has_context_pack` is false for
+         * a repository with no registered source or no generation yet
+         * (`run_orch`, `src/daemon/writer.c`, decides this before building);
+         * such a run gets no row, and delivery later appends nothing at all --
+         * not a shorter section, not a sentence saying there is none. */
+        if (st == ATLAS_OK && has_context_pack) {
+            st = atlas_memory_pack_freeze_in_tx(db, atlas_buf_cstr(run_uid_out), context_pack, err);
         }
         return st;
     }
@@ -1193,7 +1219,11 @@ static atlas_status op_submit(atlas_db *db, const atlas_orch_op *op, atlas_orch_
                                  * which is what every run was before the column
                                  * existed. Out-of-range was refused above. */
                                 op->repo_id, op->run_max_parallel > 0 ? op->run_max_parallel : 1,
-                                &run_uid, &run_slot, err);
+                                /* A12.1 T13. Built by `run_orch` before this op ever
+                                 * reached the transaction; a child submission always
+                                 * carries `has_context_pack == false` because
+                                 * `run_orch` only builds one for a root task. */
+                                op->has_context_pack, &op->context_pack, &run_uid, &run_slot, err);
     }
     if (st != ATLAS_OK) {
         goto done;
@@ -1758,6 +1788,12 @@ static atlas_status op_lease(atlas_db *db, const atlas_orch_op *op, atlas_orch_r
         {&out->source_commit, j.source_commit},
         {&out->mode, j.mode},
         {&out->driver, j.driver},
+        /* A12.1 T13. Not read anywhere else in this function, but `run_orch`
+         * (`src/daemon/writer.c`) needs it after this transaction commits, to
+         * re-read the pack row and compute its delivery-time freshness with no
+         * transaction open. Empty for a job that belongs to no run, same as
+         * every field below that is conditioned on one. */
+        {&out->run_uid, j.run_uid},
     };
     for (size_t i = 0; s == ATLAS_OK && i < sizeof copies / sizeof copies[0]; i++) {
         s = atlas_buf_set_str(copies[i].to, copies[i].from, err);
@@ -1804,6 +1840,31 @@ static atlas_status op_lease(atlas_db *db, const atlas_orch_op *op, atlas_orch_r
             }
         }
         atlas_orch_memory_package_free(&pkg);
+    }
+    /* A12.1 T13, Decision 8. The run's frozen Canonical Context Pack row,
+     * read in the same transaction as the grant for the same reason the A10.1
+     * package is: the bytes a worker may be shown and the attempt they belong
+     * to must be settled together, not across two reads that could disagree
+     * on a resume.
+     *
+     * Only the stored row -- `atlas_db_memory_pack_get` reads `memory_context_
+     * packs` and nothing else, no process, no file. `context_pack` is `p->
+     * rendered` verbatim, already `atlas_safe()`-encoded. `context_pack_status`
+     * is deliberately **not** set here: freshness may open the tree
+     * (`atlas_memory_pack_freshness`, gated on a non-empty pinned
+     * `source_identity`) and A1 forbids that inside this transaction, so
+     * `run_orch` computes it after this call returns and this commits. An
+     * empty `context_pack` here (no row, or a job with no run) is what tells
+     * `run_orch` there is nothing to compute freshness for at all. */
+    if (s == ATLAS_OK && j.run_uid[0] != '\0') {
+        atlas_memory_pack pack;
+        atlas_memory_pack_init(&pack);
+        bool pack_found = false;
+        s = atlas_db_memory_pack_get(db, j.run_uid, &pack, &pack_found, err);
+        if (s == ATLAS_OK && pack_found) {
+            s = atlas_buf_set(&out->context_pack, pack.rendered.data, pack.rendered.len, err);
+        }
+        atlas_memory_pack_free(&pack);
     }
 
 fail:
@@ -2520,6 +2581,62 @@ static atlas_status run_every_task_ended_well(atlas_db *db, const char *run_uid,
  * nothing on a result it does not own, and treats a missing run row as nothing
  * to do rather than as corruption — a sweep that failed hard on one inconsistent
  * row would stop reclaiming every other job in the pass. */
+
+/* A12.1 T13, Decision 8. The reliance check: intersects a completing job's
+ * run's frozen pack against the driver's own touched-paths observation, and
+ * records the result on the pack row.
+ *
+ * Silent -- and no query at all beyond the one pack read -- for a job that
+ * belongs to no run, a run with no frozen pack, and a pack with no flagged
+ * anchor: "when the run's pack has flagged anchors" is the plan's own gate,
+ * and none of those three cases has anything for this check to say.
+ *
+ * **This function writes to `memory_context_packs` and to nothing
+ * `settle_run_at_quiescence` or `run_every_task_ended_well` reads.** It is
+ * called from `op_complete` beside, never inside, the settlement call below,
+ * and either order of the two calls would produce the same run status: a
+ * reliance finding never gates, blocks or otherwise moves a verdict. Anchors,
+ * never prose: `atlas_memory_pack_reliance_match` compares two lists of
+ * `path_text` values and nothing it touches is read by a branch. */
+static atlas_status reliance_check(atlas_db *db, const atlas_orch_op *op, const char *run_uid,
+                                   atlas_err *err) {
+    if (run_uid == NULL || run_uid[0] == '\0') {
+        return ATLAS_OK;
+    }
+    atlas_memory_pack pack;
+    atlas_memory_pack_init(&pack);
+    bool found = false;
+    atlas_status st = atlas_db_memory_pack_get(db, run_uid, &pack, &found, err);
+    if (st != ATLAS_OK || !found || pack.flagged_anchors.len == 0) {
+        atlas_memory_pack_free(&pack);
+        return st;
+    }
+
+    atlas_buf touched[ATLAS_MEMORY_MAX_TOUCHED_PATHS];
+    for (size_t i = 0; i < ATLAS_MEMORY_MAX_TOUCHED_PATHS; i++) {
+        atlas_buf_init(&touched[i]);
+    }
+    size_t touched_n = 0;
+    if (st == ATLAS_OK && op->touched_paths.len > 0) {
+        st = atlas_orch_paths_decode(atlas_buf_cstr(&op->touched_paths), touched,
+                                     ATLAS_MEMORY_MAX_TOUCHED_PATHS, &touched_n, err);
+    }
+    atlas_buf matched = ATLAS_BUF_INIT;
+    if (st == ATLAS_OK) {
+        st = atlas_memory_pack_reliance_match(&pack, touched, touched_n, &matched, NULL, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_db_memory_pack_reliance_set(db, run_uid, op->touched_complete,
+                                               atlas_buf_cstr(&matched), err);
+    }
+    atlas_buf_free(&matched);
+    for (size_t i = 0; i < ATLAS_MEMORY_MAX_TOUCHED_PATHS; i++) {
+        atlas_buf_free(&touched[i]);
+    }
+    atlas_memory_pack_free(&pack);
+    return st;
+}
+
 static atlas_status settle_run_at_quiescence(atlas_db *db, const atlas_orch_op *op,
                                              const job_row *j, atlas_orch_state to,
                                              int64_t attempt_no, int64_t starts,
@@ -2970,6 +3087,12 @@ static atlas_status op_complete(atlas_db *db, const atlas_orch_op *op, atlas_orc
         s = release_lease(db, lr.attempt_id, atlas_orch_reason_name(reason), err);
     }
     out->state = to;
+    if (s == ATLAS_OK) {
+        /* A12.1 T13. Beside, never inside, settlement -- see `reliance_check`'s
+         * own comment for why the order of these two calls cannot change what
+         * either produces. */
+        s = reliance_check(db, op, j.run_uid, err);
+    }
     if (s == ATLAS_OK) {
         /* A11.6. Every job that belongs to a run, not only a repo-tree one. The
          * helper decides settle-eligibility from the run's *root*, so a workspace

@@ -404,14 +404,20 @@ struct atlas_job {
     atlas_plan_op *plan;
     atlas_plan_result *plan_result;
 
-    /* A12.1. `ATLAS_JOB_MEMORY_RECONCILE`'s own policy, as
+    /* A12.1. Originally `ATLAS_JOB_MEMORY_RECONCILE`'s own policy, as
      * `atlas_writer_submit_memory_reconcile`'s caller already loaded it --
      * carried rather than reloaded so the pass acts on exactly the policy
      * that decided it is owed, the same reason `ATLAS_JOB_SEM_INDEX` is
      * handed its compilation databases instead of re-deriving them on this
-     * thread. `atlas_syspolicy` is plain data (fixed-size arrays and
-     * integers, no owned buffer), so a `malloc` and a struct copy are the
-     * whole of its ownership: freed with a bare `free`, no `_free` pair. */
+     * thread. T13 reuses this same field for `ATLAS_JOB_ORCH`: `run_orch`
+     * needs a policy for a root-task SUBMIT's `atlas_memory_pack_build` and
+     * for a pack-delivering LEASE's post-commit `atlas_memory_pack_freshness`,
+     * and a job is exactly one kind at a time, so one field serves both rather
+     * than a second one drifting from this one's ownership rule. NULL for
+     * every other op kind, which needs no policy at all. `atlas_syspolicy` is
+     * plain data (fixed-size arrays and integers, no owned buffer), so a
+     * `malloc` and a struct copy are the whole of its ownership: freed with a
+     * bare `free`, no `_free` pair. */
     atlas_syspolicy *memory_pol;
 
     /* A12.1 T11. `ATLAS_JOB_MEMORY`'s one typed write, and where the writer
@@ -637,9 +643,26 @@ atlas_status atlas_writer_ai(atlas_writer *w, atlas_ai_op *op, int timeout_ms,
  * depends on the outcome is one that leaks on the path nobody tests. */
 /* A8. Ownership of `op` is taken unconditionally, as everywhere else: a caller
  * that has to free the operation on some paths and not others eventually frees
- * it on the wrong one. */
+ * it on the wrong one.
+ *
+ * A12.1 T13. `pol` is the caller's already-loaded system policy, needed only
+ * for a root-task SUBMIT (`atlas_memory_pack_build` pins `source_set_digest`
+ * from it) and for a LEASE that delivers a pack (`atlas_memory_pack_freshness`
+ * needs the same registered source list to recompute it). Every other op kind
+ * needs no policy at all, so a caller may pass NULL for CANCEL, HEARTBEAT,
+ * EVENT, COMPLETE and RECOVER without the cost of a load nothing on that path
+ * would use. `pol` is copied onto the job (`atlas_writer_submit_memory_
+ * reconcile`'s own contract, `j->memory_pol`, reused here for the same
+ * reason) rather than referenced, because a NULL is common and a
+ * non-NULL one is very often the caller's own stack variable that would not
+ * outlive the queue. `run_orch` (`src/daemon/writer.c`) is what reads it: it
+ * must be a policy the caller loaded through `atlas_syspolicy_load`, never one
+ * built from a request body or a parameter a client influences -- nothing at
+ * `run_orch` can check that, exactly as `atlas_memory_pack_build`'s own
+ * comment says. */
 atlas_status atlas_writer_orch(atlas_writer *w, atlas_orch_op *op, int timeout_ms,
-                               atlas_orch_result *result, atlas_err *err);
+                               const atlas_syspolicy *pol, atlas_orch_result *result,
+                               atlas_err *err);
 
 /* A9.2.1. Ownership of `op` is taken unconditionally, as everywhere else. The
  * result is moved rather than copied field by field, so a field added to

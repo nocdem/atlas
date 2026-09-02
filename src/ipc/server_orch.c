@@ -45,6 +45,7 @@
 #include "atlas/plan.h"
 #include "atlas/sha256.h"
 #include "atlas/snapshot.h"
+#include "atlas/syspolicy.h"
 #include "server_internal.h"
 
 /* --- shared refusals -------------------------------------------------------
@@ -72,11 +73,18 @@ static atlas_status orch_disabled(dispatch_state *ds, atlas_err *err) {
  *
  * `contended_until_ms` is set here and nowhere else on this path. No IPC
  * parameter feeds it, deliberately: a client that could assert contention could
- * extend its own lease, and a lease that can be extended by asking is not one. */
+ * extend its own lease, and a lease that can be extended by asking is not one.
+ *
+ * A12.1 T13. `pol` is NULL for every call but SUBMIT's and LEASE's, the only
+ * two `run_orch` (`src/daemon/writer.c`) ever consults it for -- see
+ * `atlas_writer_orch`'s own comment. Loaded fresh by the two callers that pass
+ * one, never here: this function is the one write point for six different
+ * request shapes and loading unconditionally would cost a file read on every
+ * HEARTBEAT and EVENT, which never needs one. */
 static atlas_status orch_write(dispatch_state *ds, atlas_orch_op *op, int timeout_ms,
-                               atlas_orch_result *r, atlas_err *err) {
+                               const atlas_syspolicy *pol, atlas_orch_result *r, atlas_err *err) {
     op->contended_until_ms = atlas_orch_contention_seen();
-    atlas_status st = atlas_writer_orch(ds->ctx->writer, op, timeout_ms, r, err);
+    atlas_status st = atlas_writer_orch(ds->ctx->writer, op, timeout_ms, pol, r, err);
     if (st != ATLAS_OK && atlas_ipc_message_is_busy(atlas_err_msg(err))) {
         struct timespec ts;
         if (clock_gettime(CLOCK_REALTIME, &ts) == 0) {
@@ -396,8 +404,21 @@ static atlas_status method_job_submit(dispatch_state *ds, const atlas_ipc_reques
 
     atlas_orch_result r;
     atlas_orch_result_init(&r);
-    /* Ownership of `op` passes to the writer unconditionally. */
-    st = orch_write(ds, op, 5000, &r, err);
+    /* A12.1 T13. Loaded fresh, exactly as `memory_sweep` and `memory.reconcile`
+     * (T11) already do, and for the same reason stated at `atlas_memory_pack_
+     * build`'s own declaration: a root-task SUBMIT freezes `source_set_digest`
+     * over this policy's registered memory sources, and a LEASE later
+     * recomputes the same digest to check staleness. Both must see the same
+     * kind of read -- a policy this process loaded through `atlas_syspolicy_
+     * load`, never a cached one from daemon start-up -- or a source list that
+     * moved between the two would go unnoticed. `atlas_writer_orch` reads it
+     * only when this op is a root-task SUBMIT; every other submission pays for
+     * the load and uses none of it, which is cheaper than a second entry point
+     * for "a SUBMIT that is also a root". Ownership of `op` passes to the
+     * writer unconditionally. */
+    atlas_syspolicy pol;
+    atlas_syspolicy_load(&pol);
+    st = orch_write(ds, op, 5000, &pol, &r, err);
     if (st == ATLAS_OK) {
         st = write_job_summary(ds, &r, err);
         if (st == ATLAS_OK) {
@@ -437,7 +458,8 @@ static atlas_status method_job_cancel(dispatch_state *ds, const atlas_ipc_reques
     }
     atlas_orch_result r;
     atlas_orch_result_init(&r);
-    st = orch_write(ds, op, 5000, &r, err);
+    /* CANCEL never reaches `run_orch`'s pack-related branches. */
+    st = orch_write(ds, op, 5000, NULL, &r, err);
     if (st == ATLAS_OK) {
         st = write_job_summary(ds, &r, err);
     }
@@ -1777,7 +1799,13 @@ static atlas_status method_dispatch_lease(dispatch_state *ds, const atlas_ipc_re
     }
     atlas_orch_result r;
     atlas_orch_result_init(&r);
-    st = orch_write(ds, op, 5000, &r, err);
+    /* A12.1 T13. Loaded fresh, for the reason `method_job_submit`'s own comment
+     * gives: a LEASE that delivers a pack recomputes freshness over exactly the
+     * same kind of policy read a SUBMIT pinned it against, never a cached one.
+     * `atlas_writer_orch` reads it only when this grant carries a pack. */
+    atlas_syspolicy pol;
+    atlas_syspolicy_load(&pol);
+    st = orch_write(ds, op, 5000, &pol, &r, err);
     if (st == ATLAS_OK) {
         st = atlas_json_key_bool(ds->j, "granted", r.granted, err);
     }
@@ -1847,6 +1875,25 @@ static atlas_status method_dispatch_lease(dispatch_state *ds, const atlas_ipc_re
                 st = atlas_json_key_str(ds->j, "memory", atlas_buf_cstr(&r.memory_package), err);
             }
         }
+        /* A12.1 T13. The run's frozen Canonical Context Pack, and its
+         * delivery-time freshness. `context_pack` is already `atlas_safe()`-
+         * encoded (`pack_put_flat`, `src/memory/pack.c`) and carries claim text
+         * a memory document wrote, so it is labelled the same way `memory` is
+         * above; `context_pack_status` is Atlas' own fixed vocabulary
+         * (`CURRENT` or `STALE:<WHICH>`) and needs no provenance key, exactly
+         * as `memory_mode` and `memory_digest` above carry none. Both are
+         * absent from the wire together when there is no pack at all -- an
+         * older CLI reads that exactly as it reads an absent `memory` key. */
+        if (st == ATLAS_OK && r.context_pack.len > 0) {
+            st = atlas_json_key_str(ds->j, "context_pack_provenance", "UNTRUSTED_DATA", err);
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_str(ds->j, "context_pack", atlas_buf_cstr(&r.context_pack), err);
+            }
+            if (st == ATLAS_OK && r.context_pack_status.len > 0) {
+                st = atlas_json_key_str(ds->j, "context_pack_status",
+                                        atlas_buf_cstr(&r.context_pack_status), err);
+            }
+        }
     }
     atlas_orch_result_free(&r);
     return st;
@@ -1894,7 +1941,8 @@ static atlas_status method_dispatch_heartbeat(dispatch_state *ds, const atlas_ip
     }
     atlas_orch_result r;
     atlas_orch_result_init(&r);
-    st = orch_write(ds, op, 5000, &r, err);
+    /* HEARTBEAT never reaches `run_orch`'s pack-related branches. */
+    st = orch_write(ds, op, 5000, NULL, &r, err);
     if (st == ATLAS_OK) {
         st = atlas_json_key_str(ds->j, "state", atlas_orch_state_name(r.state), err);
     }
@@ -1944,7 +1992,8 @@ static atlas_status method_dispatch_event(dispatch_state *ds, const atlas_ipc_re
     }
     atlas_orch_result r;
     atlas_orch_result_init(&r);
-    st = orch_write(ds, op, 5000, &r, err);
+    /* EVENT never reaches `run_orch`'s pack-related branches. */
+    st = orch_write(ds, op, 5000, NULL, &r, err);
     if (st == ATLAS_OK) {
         st = atlas_json_key_bool(ds->j, "cancel_requested", r.cancel_requested, err);
     }
@@ -2180,6 +2229,31 @@ static atlas_status method_dispatch_complete(dispatch_state *ds, const atlas_ipc
             }
         }
     }
+    /* A12.1 T13. The driver's own `git status --porcelain -z` observation,
+     * netstring-encoded (`atlas_orch_paths_encode`'s own shape). Absent means
+     * exactly what the field's own default means: nothing was gathered, and
+     * `touched_complete` stays true -- the conservative reading for a
+     * completion that never reached that step (a refusal before the worker
+     * ran, a moved HEAD). This is the driver's own trust class, `op->success`'s
+     * own: Atlas' account of what it saw, never a value the worker supplied
+     * about itself -- there is no `worker_*` key this method reads for it. */
+    if (st == ATLAS_OK) {
+        const char *tp = NULL;
+        if (atlas_ipc_param_str(req, "touched_paths", &tp) && tp != NULL) {
+            st = atlas_buf_set_str(&op->touched_paths, tp, err);
+        }
+    }
+    if (st == ATLAS_OK) {
+        /* `atlas_ipc_param_bool` writes `false` into its destination whether or
+         * not the key was present, so it is asked into a local rather than
+         * `op->touched_complete` directly -- an absent key must leave the op's
+         * own default (`true`, set in `atlas_orch_op_new`) alone, never read as
+         * an incomplete observation nobody made. */
+        bool tc = true;
+        if (atlas_ipc_param_bool(req, "touched_complete", &tc)) {
+            op->touched_complete = tc;
+        }
+    }
     if (st != ATLAS_OK) {
         atlas_orch_op_free(op);
         free(op);
@@ -2188,7 +2262,9 @@ static atlas_status method_dispatch_complete(dispatch_state *ds, const atlas_ipc
 
     atlas_orch_result r;
     atlas_orch_result_init(&r);
-    st = orch_write(ds, op, 10000, &r, err);
+    /* COMPLETE never needs a policy: the reliance check reads a stored pack
+     * row, never anything a live syspolicy would answer differently. */
+    st = orch_write(ds, op, 10000, NULL, &r, err);
     if (st == ATLAS_OK) {
         st = write_job_summary(ds, &r, err);
     }

@@ -220,6 +220,18 @@ set(ATLAS_TESTS
   # in turn), relevance that is never recency, and the two refusal bounds.
   # "integration" beside test_memory_anchor, for the same reason.
   test_memory_pack
+  # T13: delivery, injection and the reliance check, against a real writer
+  # thread (`run_orch`'s own seam -- build before the transaction, freeze
+  # inside it, freshness after it commits -- is unreachable through
+  # atlas_orch_apply called directly, which is what every other orchestration
+  # test in this tree does). Split from test_memory_pack.c rather than added to
+  # it, 36b7509's own precedent: one CTest name carries one set of labels, and
+  # test_memory_pack.c's T12 cases stay in the fast "integration" subset.
+  # "daemon" for the same reason test_registry and test_ops are: it starts real
+  # daemon internals (atlas_writer_start, atlas_workers_start), never a forked
+  # atlasd and never a watcher, so it needs neither RUN_SERIAL nor a long
+  # TIMEOUT -- nothing here contends for the machine's inotify budget.
+  test_memory_pack_live
   # --- P0: the large-repository watcher ---
   #
   # The budget, its accounting and the bound each refusal names, driven against a
@@ -297,6 +309,11 @@ set_tests_properties(test_sem_trust PROPERTIES LABELS "integration")
 # A live daemon and real MCP sessions, so it belongs to the serialised group.
 set_tests_properties(test_registry PROPERTIES LABELS "daemon")
 set_tests_properties(test_ops PROPERTIES LABELS "daemon")
+# T13: a real writer thread and workers pool, never a forked atlasd and never a
+# watcher -- "daemon" for what it starts, no RUN_SERIAL because nothing here
+# contends for the machine's inotify budget, the same shape test_registry and
+# test_ops above have for their own reasons.
+set_tests_properties(test_memory_pack_live PROPERTIES LABELS "daemon")
 set_tests_properties(test_scan test_search test_diff test_worktree test_cli test_terminal test_code_graph test_code_compdb
   test_code_analyzer test_git_hardening test_reconcile test_repo_scanner test_scanner_rpc test_mirror_source
   test_memory_anchor test_memory_pack

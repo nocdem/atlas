@@ -1192,17 +1192,116 @@ static void run_verify(atlas_writer *w, atlas_job *j) {
     j->result = atlas_verify_intake_apply(w->db, j->verify, j->verify_result, &j->result_err);
 }
 
+/* A12.1 T13. Builds the Canonical Context Pack for a root-task SUBMIT, before
+ * `atlas_orch_apply` ever opens a transaction. `atlas_memory_pack_build` may
+ * open the tree (`atlas_sem_source_identity`, gated on the repository row
+ * saying dirty) and A1 forbids that inside a write transaction -- the same
+ * seam `atlas_memory_observe` already uses one layer over. See `include/atlas/
+ * memory.h`'s T12 section comment for the full derivation; this is where it
+ * said T13's task would land.
+ *
+ * A child submission never reaches here (`op_submit`'s own branch does not
+ * call `submit_resolve_run`'s root path for one), and a repository with no
+ * generation yet builds successfully but is not frozen -- `has_context_pack`
+ * says so, and `submit_resolve_run` reads it.
+ *
+ * A build failure is logged and answered packless, never by refusing the
+ * whole submission: the memory layer vetoing a run's *creation* would be the
+ * same coupling this season already refuses for a run's *acceptance*
+ * (Decision 8's reliance check settles nothing, for the identical reason). */
+static void run_orch_build_pack(atlas_writer *w, atlas_job *j) {
+    atlas_orch_op *op = j->orch;
+    if (op->kind != ATLAS_ORCH_OP_SUBMIT || op->spec.parent_job_uid.len > 0 ||
+       j->memory_pol == NULL) {
+        return;
+    }
+    atlas_err berr;
+    atlas_err_init(&berr);
+    atlas_status bs = atlas_memory_pack_build(w->db, op->repo_id, j->memory_pol,
+                                              atlas_buf_cstr(&op->spec.task_text),
+                                              &op->context_pack, &berr);
+    if (bs != ATLAS_OK) {
+        atlas_daemon_log(w->log, "warn",
+                         "a context pack could not be built for repository %lld: %s",
+                         (long long)op->repo_id, atlas_err_msg(&berr));
+        return;
+    }
+    /* Zero means no generation exists yet -- a repository with no registered
+     * source ever having produced one, T13's own reading of Decision 8's "no
+     * repository with no sources or no generation gets a row". Freezing an
+     * all-but-empty pack here would freeze something to compare every future
+     * staleness read against forever, for a repository that has said nothing
+     * yet. */
+    op->has_context_pack = op->context_pack.memory_generation > 0;
+}
+
+/* A12.1 T13. Computes a granted LEASE's pack delivery-time freshness, after
+ * `atlas_orch_apply`'s transaction has committed. `atlas_memory_pack_freshness`
+ * may open the tree (gated on a non-empty pinned `source_identity`) and must
+ * therefore run with none open, `atlas_memory_pack_build`'s own rule one
+ * transaction later.
+ *
+ * A worker is never told a moved pack is current: if freshness cannot be
+ * established at all -- no policy to compute it with, the row vanished
+ * between the grant and now, or the read itself failed -- `context_pack` is
+ * cleared rather than delivered with an empty status, because an unlabelled
+ * body reads as silently CURRENT to anything that composes it. */
+static void run_orch_lease_freshness(atlas_writer *w, atlas_job *j) {
+    atlas_orch_result *r = &j->orch_result;
+    if (j->orch->kind != ATLAS_ORCH_OP_LEASE || !r->granted || r->context_pack.len == 0) {
+        return;
+    }
+    bool ok = false;
+    if (j->memory_pol != NULL && r->run_uid.len > 0) {
+        atlas_err ferr;
+        atlas_err_init(&ferr);
+        atlas_memory_pack pack;
+        atlas_memory_pack_init(&pack);
+        bool found = false;
+        atlas_status fs = atlas_db_memory_pack_get(w->db, atlas_buf_cstr(&r->run_uid), &pack,
+                                                   &found, &ferr);
+        if (fs == ATLAS_OK && found) {
+            atlas_memory_pack_status status = ATLAS_MEMORY_PACK_UNKNOWN;
+            atlas_buf which_moved = ATLAS_BUF_INIT;
+            fs = atlas_memory_pack_freshness(w->db, j->memory_pol, &pack, &status, &which_moved,
+                                             &ferr);
+            if (fs == ATLAS_OK) {
+                const char *line = status == ATLAS_MEMORY_PACK_CURRENT
+                                       ? atlas_memory_pack_status_name(status)
+                                       : atlas_buf_cstr(&which_moved);
+                ok = atlas_buf_set_str(&r->context_pack_status, line, &ferr) == ATLAS_OK;
+            }
+            atlas_buf_free(&which_moved);
+        }
+        if (!ok) {
+            atlas_daemon_log(w->log, "warn",
+                             "a delivered context pack's freshness could not be established for "
+                             "run %s: %s",
+                             atlas_buf_cstr(&r->run_uid), atlas_err_msg(&ferr));
+        }
+        atlas_memory_pack_free(&pack);
+    }
+    if (!ok) {
+        atlas_buf_reset(&r->context_pack);
+        atlas_buf_reset(&r->context_pack_status);
+    }
+}
+
 static void run_orch(atlas_writer *w, atlas_job *j) {
     if (j->orch == NULL) {
         j->result = atlas_err_set(&j->result_err, ATLAS_ERR_INTERNAL,
                                   "an orchestration job arrived with no operation attached");
         return;
     }
+    run_orch_build_pack(w, j);
     /* `atlas_orch_apply` owns its own transaction, exactly like
      * `atlas_ai_apply` and `atlas_decision_apply`, and is called with none
      * open — so an operation is whole or nothing, and a granted lease without
      * the attempt it belongs to cannot be committed. */
     j->result = atlas_orch_apply(w->db, j->orch, &j->orch_result, &j->result_err);
+    if (j->result == ATLAS_OK) {
+        run_orch_lease_freshness(w, j);
+    }
 }
 
 /* A12.0. `atlas_plan_apply` owns its own transaction, exactly like the four
@@ -2866,7 +2965,8 @@ atlas_status atlas_writer_plan(atlas_writer *w, atlas_plan_op *op, int timeout_m
  * that times out is detached rather than freed — it is still the writer's, and
  * the writer frees it when it finishes. */
 atlas_status atlas_writer_orch(atlas_writer *w, atlas_orch_op *op, int timeout_ms,
-                               atlas_orch_result *result, atlas_err *err) {
+                               const atlas_syspolicy *pol, atlas_orch_result *result,
+                               atlas_err *err) {
     atlas_job *j = job_new(ATLAS_JOB_ORCH);
     if (j == NULL) {
         atlas_orch_op_free(op);
@@ -2876,6 +2976,19 @@ atlas_status atlas_writer_orch(atlas_writer *w, atlas_orch_op *op, int timeout_m
     }
     j->orch = op;
     j->wants_result = true;
+    /* A12.1 T13. Copied rather than referenced, `atlas_writer_submit_memory_
+     * reconcile`'s own reason: `pol` is very often the caller's own stack
+     * variable, and this job can outlive that frame by as long as the queue is
+     * deep. NULL for every op kind `run_orch` never consults it for. */
+    if (pol != NULL) {
+        j->memory_pol = malloc(sizeof *j->memory_pol);
+        if (j->memory_pol == NULL) {
+            job_free(j);
+            return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                                 "out of memory queueing an orchestration request");
+        }
+        *j->memory_pol = *pol;
+    }
 
     (void)pthread_mutex_lock(&w->lock);
     if (w->stopping || !queue_push(w, j)) {
@@ -2974,6 +3087,13 @@ atlas_status atlas_writer_orch(atlas_writer *w, atlas_orch_op *op, int timeout_m
             /* A10.1's package. The bytes a worker is shown travel this way and
              * no other. */
             {&result->memory_package, &j->orch_result.memory_package},
+            /* A12.1 T13. The pack body and its post-commit freshness line,
+             * computed by `run_orch_lease_freshness` above before this copy
+             * ever runs. A field missing from this list is a pack the daemon
+             * built and the caller never sees -- `rundriver.c:936`'s own
+             * lesson, one layer out. */
+            {&result->context_pack, &j->orch_result.context_pack},
+            {&result->context_pack_status, &j->orch_result.context_pack_status},
         };
         for (size_t i = 0; st == ATLAS_OK && i < sizeof copies / sizeof copies[0]; i++) {
             st = atlas_buf_set(copies[i].to, copies[i].from->data, copies[i].from->len, err);

@@ -1253,6 +1253,223 @@ atlas_status atlas_db_memory_pack_get(atlas_db *db, const char *run_uid, atlas_m
     return st;
 }
 
+/* --- T13: the reliance check's one write -------------------------------------
+ *
+ * A tiny, file-local netstring reader for the one-element-per-record shape
+ * `atlas_memory_pack_reliance_match` (`src/memory/pack.c`) produces and this
+ * column stores: `<count>:` then that many single elements. A second, private
+ * copy rather than a shared one, for the reason `src/memory/pack.c`'s own
+ * tokenizer comment gives: a small, closed-form codec used by one layer, not a
+ * cross-layer dependency for something this file would otherwise have no
+ * reason to import. */
+static bool reliance_ns_take(const char *text, size_t total, size_t *pos, const char **out,
+                             size_t *len) {
+    size_t i = *pos;
+    size_t n = 0;
+    size_t digits = 0;
+    while (i < total && text[i] >= '0' && text[i] <= '9') {
+        if (digits > 9) {
+            return false;
+        }
+        n = n * 10u + (size_t)(text[i] - '0');
+        i++;
+        digits++;
+    }
+    if (digits == 0 || i >= total || text[i] != ':') {
+        return false;
+    }
+    i++;
+    if (n > total - i) {
+        return false;
+    }
+    *out = text + i;
+    *len = n;
+    i += n;
+    if (i >= total || text[i] != ',') {
+        return false;
+    }
+    *pos = i + 1u;
+    return true;
+}
+
+static atlas_status reliance_decode_into(const char *text, atlas_buf *out, size_t cap,
+                                         size_t *n_out, atlas_err *err) {
+    *n_out = 0;
+    size_t total = text != NULL ? strlen(text) : 0u;
+    if (total == 0) {
+        return ATLAS_OK;
+    }
+    size_t pos = 0;
+    size_t n = 0;
+    size_t digits = 0;
+    while (pos < total && text[pos] >= '0' && text[pos] <= '9') {
+        n = n * 10u + (size_t)(text[pos] - '0');
+        pos++;
+        digits++;
+        if (digits > 6) {
+            return atlas_err_set(err, ATLAS_ERR_DB, "malformed stored reliance claim list");
+        }
+    }
+    if (digits == 0 || pos >= total || text[pos] != ':') {
+        return atlas_err_set(err, ATLAS_ERR_DB, "malformed stored reliance claim list");
+    }
+    pos++;
+    if (n > cap) {
+        return atlas_err_set(err, ATLAS_ERR_DB,
+                             "a stored reliance claim list holds %zu entries, cap is %zu", n, cap);
+    }
+    for (size_t i = 0; i < n; i++) {
+        const char *p = NULL;
+        size_t len = 0;
+        if (!reliance_ns_take(text, total, &pos, &p, &len)) {
+            return atlas_err_set(err, ATLAS_ERR_DB, "malformed stored reliance claim list");
+        }
+        atlas_status st = atlas_buf_set(&out[i], p, len, err);
+        if (st != ATLAS_OK) {
+            return st;
+        }
+    }
+    *n_out = n;
+    return ATLAS_OK;
+}
+
+/* T13, Decision 8. Called once per completion whose run's frozen pack has at
+ * least one flagged PATH anchor (`src/db/db_orch.c`'s `reliance_check`, inside
+ * `op_complete`'s own transaction) -- never for a run with no pack, and never
+ * for a pack with nothing flagged, both of which have nothing for this check
+ * to say.
+ *
+ * A11.6 makes a run's repo-tree chain more than one completion in general (a
+ * retry, a narrower follow-up after a failed gate), so this merges rather than
+ * replaces: `reliance_checked` is sticky (once 1, stays 1), `reliance_complete`
+ * is the AND of every completion's own observation (one incomplete touched-
+ * paths view makes the run's overall finding incomplete, and nothing makes it
+ * complete again), and `reliance_claim_uids` is the union, deduplicated, of
+ * every completion's matched set, in the order a uid was first seen. This is
+ * the one write to `memory_context_packs.reliance_*`, and the row must already
+ * exist -- freezing it is `atlas_memory_pack_freeze_in_tx`'s job, not this
+ * one's, so a missing row is reported rather than created. */
+atlas_status atlas_db_memory_pack_reliance_set(atlas_db *db, const char *run_uid, bool complete,
+                                               const char *matched_claim_uids, atlas_err *err) {
+    if (db == NULL || run_uid == NULL || run_uid[0] == '\0') {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "no run to record a reliance check for");
+    }
+    static const char SEL[] =
+        "SELECT reliance_complete, reliance_claim_uids FROM memory_context_packs"
+        " WHERE run_uid = ?1;";
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(db, SEL, &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    st = atlas_db_bind_text_opt(db, stmt, 1, run_uid, err);
+    if (st != ATLAS_OK) {
+        atlas_db_finish(db, stmt);
+        return st;
+    }
+    int rc = sqlite3_step(stmt);
+    bool found = rc == SQLITE_ROW;
+    bool old_complete = true;
+    atlas_buf old_uids = ATLAS_BUF_INIT;
+    if (found) {
+        old_complete = sqlite3_column_int64(stmt, 0) != 0;
+        st = atlas_buf_set_str(&old_uids, atlas_db_col_text(stmt, 1), err);
+    } else if (rc != SQLITE_DONE) {
+        st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot read the pack row to record reliance");
+    }
+    atlas_db_finish(db, stmt);
+    if (st != ATLAS_OK) {
+        atlas_buf_free(&old_uids);
+        return st;
+    }
+    if (!found) {
+        atlas_buf_free(&old_uids);
+        return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                             "run %s has no frozen context pack to record a reliance check on",
+                             run_uid);
+    }
+
+    atlas_buf merged[ATLAS_MEMORY_PACK_MAX_CLAIMS];
+    for (size_t i = 0; i < ATLAS_MEMORY_PACK_MAX_CLAIMS; i++) {
+        atlas_buf_init(&merged[i]);
+    }
+    size_t merged_n = 0;
+    struct {
+        const char *text;
+    } sources[] = {{atlas_buf_cstr(&old_uids)}, {matched_claim_uids}};
+    for (size_t s = 0; st == ATLAS_OK && s < 2u; s++) {
+        atlas_buf batch[ATLAS_MEMORY_PACK_MAX_CLAIMS];
+        for (size_t i = 0; i < ATLAS_MEMORY_PACK_MAX_CLAIMS; i++) {
+            atlas_buf_init(&batch[i]);
+        }
+        size_t batch_n = 0;
+        st = reliance_decode_into(sources[s].text, batch, ATLAS_MEMORY_PACK_MAX_CLAIMS, &batch_n,
+                                  err);
+        for (size_t i = 0; st == ATLAS_OK && i < batch_n; i++) {
+            bool already = false;
+            for (size_t m = 0; !already && m < merged_n; m++) {
+                already = merged[m].len == batch[i].len &&
+                         (batch[i].len == 0 ||
+                          memcmp(merged[m].data, batch[i].data, batch[i].len) == 0);
+            }
+            if (!already && merged_n < ATLAS_MEMORY_PACK_MAX_CLAIMS) {
+                st = atlas_buf_set(&merged[merged_n], batch[i].data, batch[i].len, err);
+                if (st == ATLAS_OK) {
+                    merged_n++;
+                }
+            }
+        }
+        for (size_t i = 0; i < ATLAS_MEMORY_PACK_MAX_CLAIMS; i++) {
+            atlas_buf_free(&batch[i]);
+        }
+    }
+    atlas_buf_free(&old_uids);
+
+    atlas_buf encoded = ATLAS_BUF_INIT;
+    if (st == ATLAS_OK) {
+        st = atlas_buf_appendf(&encoded, err, "%zu:", merged_n);
+    }
+    for (size_t i = 0; st == ATLAS_OK && i < merged_n; i++) {
+        size_t n = merged[i].len;
+        st = atlas_buf_appendf(&encoded, err, "%zu:", n);
+        if (st == ATLAS_OK && n > 0) {
+            st = atlas_buf_append(&encoded, merged[i].data, n, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_buf_append_ch(&encoded, ',', err);
+        }
+    }
+    for (size_t i = 0; i < ATLAS_MEMORY_PACK_MAX_CLAIMS; i++) {
+        atlas_buf_free(&merged[i]);
+    }
+    if (st != ATLAS_OK) {
+        atlas_buf_free(&encoded);
+        return st;
+    }
+
+    static const char UPD[] =
+        "UPDATE memory_context_packs SET reliance_checked = 1, reliance_complete = ?1,"
+        "  reliance_claim_uids = ?2 WHERE run_uid = ?3;";
+    sqlite3_stmt *q = NULL;
+    st = atlas_db_prepare(db, UPD, &q, err);
+    if (st != ATLAS_OK) {
+        atlas_buf_free(&encoded);
+        return st;
+    }
+    (void)sqlite3_bind_int64(q, 1, (old_complete && complete) ? 1 : 0);
+    st = atlas_db_bind_text_n(db, q, 2, atlas_buf_cstr(&encoded), encoded.len, err);
+    if (st == ATLAS_OK) {
+        st = atlas_db_bind_text_opt(db, q, 3, run_uid, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_db_step_done(db, q, err);
+    } else {
+        atlas_db_finish(db, q);
+    }
+    atlas_buf_free(&encoded);
+    return st;
+}
+
 atlas_status atlas_db_memory_claim_diff_last_kind(atlas_db *db, int64_t repo_id, const char *claim_uid,
                                                   atlas_memory_diff_kind *kind_out, bool *found_out,
                                                   atlas_err *err) {

@@ -1310,6 +1310,19 @@ atlas_status atlas_db_memory_pack_insert(atlas_db *db, const char *run_uid,
 atlas_status atlas_db_memory_pack_get(atlas_db *db, const char *run_uid, atlas_memory_pack *out,
                                       bool *found_out, atlas_err *err);
 
+/* T13. Records one completion's reliance finding on an already-frozen pack
+ * row -- refused, not created, when no such row exists. Merges rather than
+ * replaces, because a run's repo-tree chain may complete more than once
+ * (A11.6): `reliance_checked` becomes sticky-true, `reliance_complete` is
+ * ANDed with whatever was already stored, and `matched_claim_uids` (the
+ * netstring-encoded set `atlas_memory_pack_reliance_match` produces) is
+ * unioned with whatever was already stored, deduplicated. See the in-code
+ * comment at the call site (`src/db/db_orch.c`'s `reliance_check`, inside
+ * `op_complete`) for why this write settles nothing: it touches this table
+ * and no column any settlement scan reads. */
+atlas_status atlas_db_memory_pack_reliance_set(atlas_db *db, const char *run_uid, bool complete,
+                                               const char *matched_claim_uids, atlas_err *err);
+
 /* Builds a pack for the given repository's *current* state, deterministically:
  * the same stored rows and the same live reads (an unmoved dirty flag, an
  * unmoved `files` table) produce byte-identical `rendered` and an equal
@@ -1431,5 +1444,31 @@ atlas_status atlas_memory_pack_render(const atlas_memory_pack *p, atlas_buf *out
 atlas_status atlas_memory_pack_compose(const char *task, const char *memory_package,
                                        const char *status_line, const char *pack_body,
                                        atlas_buf *out, atlas_err *err);
+
+/* --- T13: the reliance check ------------------------------------------------
+ *
+ * Decision 8's rule: the reliance check reads anchors, never prose. This is the
+ * one function that ever compares a pack's `flagged_anchors` against a driver's
+ * observed touched-paths list, so it is the one place that rule can be checked
+ * once rather than re-argued at every call site.
+ *
+ * `touched_paths` is already decoded -- an array of `path_text`-encoded buffers,
+ * the caller's own `atlas_orch_paths_decode` of `atlas_orch_op.touched_paths` --
+ * because this file issues no SQL and depends on no `src/orch` header; decoding
+ * that wire format is `src/db/db_orch.c`'s job, exactly as it already decodes
+ * `lease_drivers`. A `flagged_anchors` PATH value and a touched path are both
+ * `path_text`, so the comparison is an exact byte match, never a normalisation.
+ *
+ * `*matched_out` is reset and filled with the netstring-encoded (M23's shape:
+ * `<count>:` then that many elements) set of distinct claim uids that had at
+ * least one PATH anchor equal to some entry of `touched_paths` -- empty, never
+ * NULL, when nothing matched. `*any_out` is `*matched_out` non-empty, spelled
+ * out separately so a caller never has to re-parse the netstring just to ask
+ * "did anything match". Deterministic: the matched set is a function of the two
+ * inputs alone, in `flagged_anchors`' own stored order with duplicates
+ * collapsed, never of iteration order or of anything read live. */
+atlas_status atlas_memory_pack_reliance_match(const atlas_memory_pack *p,
+                                              const atlas_buf *touched_paths, size_t touched_count,
+                                              atlas_buf *matched_out, bool *any_out, atlas_err *err);
 
 #endif /* ATLAS_MEMORY_H */

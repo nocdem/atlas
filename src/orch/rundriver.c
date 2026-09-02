@@ -42,7 +42,9 @@
 #include "atlas/validate.h"
 #include "atlas/ipc.h"
 #include "atlas/git.h"
+#include "atlas/memory.h"
 #include "atlas/orch_memory.h"
+#include "atlas/pathrep.h"
 #include "atlas/sha256.h"
 
 void atlas_rundriver_report_init(atlas_rundriver_report *r) {
@@ -102,6 +104,97 @@ static atlas_status head_commit(const char *root, atlas_buf *out, atlas_err *err
     return st;
 }
 
+/* A12.1 T13, Decision 8. The driver's own observation of what changed in the
+ * tree, gathered after the worker and the existing HEAD re-check -- `git
+ * status --porcelain -z`, already allowlisted (`atlas_git_read_status`,
+ * `src/git/git.c`), over the tree this driver already holds open.
+ *
+ * `path` and, for a rename or copy, `old_path` both go in: a stale claim's
+ * PATH anchor could name either. Encoded `path_text` (`atlas_path_text_
+ * encode`), the same representation a PATH anchor's own value is stored in
+ * (`atlas_db_verify_file_hash`'s own parameter name), so the daemon's
+ * intersection is an exact byte comparison and never a normalisation.
+ *
+ * Bounded at `ATLAS_MEMORY_MAX_TOUCHED_PATHS`: past it, entries are silently
+ * not added -- never an error, `*complete_out` says so instead -- because a
+ * completion this driver cannot always deliver must never turn into a
+ * completion that fails outright. */
+typedef struct touched_ctx {
+    atlas_buf *paths;
+    size_t cap;
+    size_t n;
+    bool truncated;
+    atlas_status st;
+    atlas_err *err;
+} touched_ctx;
+
+static atlas_status touched_add(touched_ctx *tc, const void *raw, size_t raw_len) {
+    if (tc->st != ATLAS_OK) {
+        return ATLAS_OK;
+    }
+    if (raw == NULL || raw_len == 0) {
+        return ATLAS_OK;
+    }
+    if (tc->n >= tc->cap) {
+        tc->truncated = true;
+        return ATLAS_OK;
+    }
+    tc->st = atlas_path_text_encode(raw, raw_len, &tc->paths[tc->n], tc->err);
+    if (tc->st == ATLAS_OK) {
+        tc->n++;
+    }
+    return ATLAS_OK;
+}
+
+static atlas_status touched_cb(const atlas_git_status_entry *e, void *ud, atlas_err *err) {
+    (void)err;
+    touched_ctx *tc = (touched_ctx *)ud;
+    atlas_status st = touched_add(tc, e->path, e->path_len);
+    if (st == ATLAS_OK && e->old_path != NULL) {
+        st = touched_add(tc, e->old_path, e->old_path_len);
+    }
+    return st;
+}
+
+static atlas_status gather_touched_paths(const char *root, atlas_buf *touched_paths,
+                                         bool *complete_out, atlas_err *err) {
+    *complete_out = true;
+    atlas_buf_reset(touched_paths);
+    atlas_git *g = NULL;
+    atlas_status st = atlas_git_open(root, &g, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    atlas_buf *paths = calloc(ATLAS_MEMORY_MAX_TOUCHED_PATHS, sizeof *paths);
+    if (paths == NULL) {
+        atlas_git_close(g);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory gathering touched paths");
+    }
+    for (size_t i = 0; i < ATLAS_MEMORY_MAX_TOUCHED_PATHS; i++) {
+        atlas_buf_init(&paths[i]);
+    }
+    touched_ctx tc = {.paths = paths, .cap = ATLAS_MEMORY_MAX_TOUCHED_PATHS, .n = 0,
+                      .truncated = false, .st = ATLAS_OK, .err = err};
+    atlas_git_worktree_state wt;
+    memset(&wt, 0, sizeof(wt));
+    st = atlas_git_read_status(g, &wt, touched_cb, &tc, err);
+    atlas_git_close(g);
+    if (st == ATLAS_OK) {
+        st = tc.st;
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_orch_paths_encode(paths, tc.n, touched_paths, err);
+    }
+    if (st == ATLAS_OK) {
+        *complete_out = !tc.truncated;
+    }
+    for (size_t i = 0; i < ATLAS_MEMORY_MAX_TOUCHED_PATHS; i++) {
+        atlas_buf_free(&paths[i]);
+    }
+    free(paths);
+    return st;
+}
+
 /* --- one claimed task ------------------------------------------------------ */
 
 typedef struct claimed {
@@ -118,6 +211,12 @@ typedef struct claimed {
      * branch depends on its contents, and there is no path by which anything
      * inside it reaches a gate, a status or a decision. */
     atlas_buf memory;
+    /* A12.1 T13. The run's frozen Canonical Context Pack body and its
+     * delivery-time freshness line, exactly as the daemon granted them. Read
+     * nowhere in this file except where they are appended to the task -- the
+     * same rule `memory` above carries, for the same reason. */
+    atlas_buf context_pack;
+    atlas_buf context_pack_status;
     int64_t attempt_no;
     int64_t wall_timeout_ms;
     int64_t idle_timeout_ms;
@@ -141,6 +240,8 @@ static void claimed_init(claimed *c) {
     memset(c, 0, sizeof(*c));
     atlas_buf_init(&c->job_uid);
     atlas_buf_init(&c->memory);
+    atlas_buf_init(&c->context_pack);
+    atlas_buf_init(&c->context_pack_status);
     atlas_buf_init(&c->token);
     atlas_buf_init(&c->repo_root);
     atlas_buf_init(&c->commit);
@@ -165,6 +266,8 @@ static void claimed_free(claimed *c) {
     atlas_buf_free(&c->task);
     atlas_buf_free(&c->validations);
     atlas_buf_free(&c->memory);
+    atlas_buf_free(&c->context_pack);
+    atlas_buf_free(&c->context_pack_status);
 }
 
 /* One operation, retried while the daemon says it took nothing.
@@ -522,10 +625,19 @@ typedef struct outcome {
     /* A10.0. Carried from the driver to the completion, and durable on disk
      * before the completion is offered. */
     atlas_usage usage;
+    /* A12.1 T13, Decision 8. This driver's own `git status --porcelain -z`
+     * observation, gathered after the worker and the existing HEAD re-check
+     * (step 6) -- netstring-encoded, `atlas_orch_paths_encode`'s own shape.
+     * Empty and `touched_complete` true for every path that never reaches the
+     * gather step, which is the conservative reading: an absent observation
+     * contributes nothing to the reliance check rather than a guess. */
+    atlas_buf touched_paths;
+    bool touched_complete;
 } outcome;
 
 static void outcome_init(outcome *x) {
     memset(x, 0, sizeof(*x));
+    x->touched_complete = true;
     x->exit_kind = ATLAS_ORCH_EXIT_UNKNOWN;
     x->exit_code = -1;
     x->reason = ATLAS_ORCH_REASON_UNKNOWN;
@@ -533,11 +645,13 @@ static void outcome_init(outcome *x) {
     atlas_buf_init(&x->detail);
     atlas_buf_init(&x->worker_log);
     atlas_buf_init(&x->driver_version);
+    atlas_buf_init(&x->touched_paths);
 }
 
 static void outcome_free(outcome *x) {
     atlas_buf_free(&x->detail);
     atlas_buf_free(&x->worker_log);
+    atlas_buf_free(&x->touched_paths);
     atlas_buf_free(&x->driver_version);
 }
 
@@ -736,7 +850,12 @@ static atlas_status report(const atlas_rundriver_opts *o, const claimed *c, cons
     op->failure_reason = x->reason;
     op->failed_gate = x->failed_gate;
     op->usage = x->usage;
-    atlas_status st = atlas_buf_set(&op->token, c->token.data, c->token.len, err);
+    op->touched_complete = x->touched_complete;
+    atlas_status st = atlas_buf_set(&op->touched_paths, x->touched_paths.data,
+                                    x->touched_paths.len, err);
+    if (st == ATLAS_OK) {
+        st = atlas_buf_set(&op->token, c->token.data, c->token.len, err);
+    }
     if (st == ATLAS_OK) {
         st = atlas_buf_set(&op->driver_version, x->driver_version.data, x->driver_version.len,
                            err);
@@ -934,6 +1053,11 @@ static atlas_status claim(const atlas_rundriver_opts *o, const atlas_orch_run_vi
             {&c->mode, &r.mode},         {&c->driver, &r.driver},
             {&c->task, &r.task_text},    {&c->validations, &r.validations},
             {&c->memory, &r.memory_package},
+            /* A12.1 T13. Added to this table, not beside it: an entry missing
+             * here is a pack the daemon built and the worker never sees, with
+             * nothing failing to say so -- `rundriver.c:936`'s own lesson. */
+            {&c->context_pack, &r.context_pack},
+            {&c->context_pack_status, &r.context_pack_status},
         };
         for (size_t i = 0; st == ATLAS_OK && i < sizeof copy / sizeof copy[0]; i++) {
             st = atlas_buf_set(copy[i].dst, copy[i].src->data, copy[i].src->len, err);
@@ -1059,27 +1183,38 @@ static atlas_status drive_one(const atlas_rundriver_opts *o, const atlas_orch_ru
         goto done;
     }
 
-    /* A10.1. The one place a memory package is ever injected, and it happens
-     * before the worker exists.
+    /* A10.1 / A12.1 T13. `atlas_memory_pack_compose` is the one implementation
+     * of appending run context to a task, and injection happens before the
+     * worker exists, in both of its call sites: here, and the workspace
+     * attempt path (`run_attempt`, `src/orch/dispatch.c`) for a sibling task in
+     * the same run. Restated from the single-piece claim this comment used to
+     * make, because after T13 there are two pieces and this is the composer
+     * for both of them together, not one call per piece.
      *
      * The task comes first and stays first: the operator's words, the
-     * repository's own instructions and every safety bound sit above the memory
-     * section, and the section's own preamble says so. `atlas_orch_memory_compose`
-     * appends the package once and appends nothing at all when it is empty,
-     * which is what makes a memory-off arm differ from a memory-on one by
-     * exactly the package's bytes and by nothing else.
+     * repository's own instructions and every safety bound sit above either
+     * section, and each section's own preamble says so. The composer appends
+     * a piece once and appends nothing at all when it is absent, which is what
+     * makes a memory-off, pack-less arm differ from one with either or both by
+     * exactly their bytes and by nothing else -- A10.1's `OFF` rule, T12's
+     * test (f) one layer down, and T13's own test (b) at this surface.
      *
      * The composition is not stored. `orch_jobs.task_text` stays what was
      * submitted, so `spec_digest` still describes the request that was made,
-     * and the package stays where a reader looks for it -- on the run. */
-    st = atlas_orch_memory_compose(atlas_buf_cstr(&c.task), atlas_buf_cstr(&c.memory), &composed,
-                                   err);
+     * and both pieces stay where a reader looks for them -- on the run. */
+    st = atlas_memory_pack_compose(atlas_buf_cstr(&c.task), atlas_buf_cstr(&c.memory),
+                                   atlas_buf_cstr(&c.context_pack_status),
+                                   atlas_buf_cstr(&c.context_pack), &composed, err);
     if (st != ATLAS_OK) {
         goto done;
     }
     if (c.memory.len > 0) {
         say(o, "the run's frozen memory package was appended to the task: %zu bytes",
             c.memory.len);
+    }
+    if (c.context_pack.len > 0) {
+        say(o, "the run's frozen context pack was appended to the task: %zu bytes (%s)",
+            c.context_pack.len, atlas_buf_cstr(&c.context_pack_status));
     }
 
     outcome x;
@@ -1147,6 +1282,24 @@ static atlas_status drive_one(const atlas_rundriver_opts *o, const atlas_orch_ru
             outcome_free(&x);
             st = refuse(o, &c, "the worker moved the repository off its pinned commit", &res, err);
             goto done;
+        }
+        /* A12.1 T13, Decision 8. Gathered here, after the worker and this HEAD
+         * re-check and before the gates run: the tree is in its final state
+         * and confirmed to still be the pinned one. A failure to gather is
+         * this driver's own -- never the worker's fault and never a reason to
+         * refuse the whole completion -- so it is logged and answered with an
+         * honest "nothing observed, incomplete" rather than propagated. */
+        {
+            atlas_status ts = gather_touched_paths(atlas_buf_cstr(&c.repo_root), &x.touched_paths,
+                                                   &x.touched_complete, err);
+            if (ts != ATLAS_OK) {
+                say(o, "the tree's changed paths could not be listed (%s); the reliance check "
+                       "will see an incomplete observation",
+                    atlas_err_msg(err));
+                atlas_err_init(err);
+                atlas_buf_reset(&x.touched_paths);
+                x.touched_complete = false;
+            }
         }
         st = phase(o, &c, ATLAS_ORCH_STATE_VALIDATING, NULL, err);
         if (st == ATLAS_OK) {

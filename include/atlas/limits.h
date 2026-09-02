@@ -1171,7 +1171,16 @@
 
 /* Paths one reconciliation pass will attribute movement to. Past this the pass
  * cannot enumerate what moved, so it must not pretend it can --
- * `ATLAS_WATCH_MAX_DIRTY_PATHS`' rule, one layer out. */
+ * `ATLAS_WATCH_MAX_DIRTY_PATHS`' rule, one layer out.
+ *
+ * T13 reuses this same bound for its own, unrelated list of changed paths: the
+ * run driver's completion-time `git status --porcelain -z` observation, sent on
+ * `atlas_orch_op.touched_paths` and intersected against a run's frozen pack for
+ * the reliance check (`src/orch/rundriver.c`'s `report`, `src/db/db_orch.c`'s
+ * `op_complete`). Both are "a bounded list of changed repository paths, plus a
+ * complete flag when the bound was reached" -- the same shape, not two
+ * coincidentally equal numbers -- so one constant serves both rather than a
+ * second definition drifting from this one. */
 #define ATLAS_MEMORY_MAX_TOUCHED_PATHS 256u
 
 /* Commits one reconciliation pass will walk to build the touched-paths set

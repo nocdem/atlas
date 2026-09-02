@@ -1123,40 +1123,55 @@ atlas_status atlas_db_memory_dir_hash_mismatch(atlas_db *db, int64_t repo_id, in
      * two places answering one question cannot drift on which column they
      * consult if that ever stops being true.
      *
-     * The `LIMIT ?3` below has no `ORDER BY`, and that is safe -- not merely
-     * untested -- because of the predicate directly above it plus one more
-     * fact about who ever writes a version: a `memory_source_versions` row
-     * for this `source_id` is written only by the pass itself, which reaches
-     * a `REPO_DIR` child through `read.c`, and `read.c` refuses a directory
-     * whose *live* matching children exceed `ATLAS_MEMORY_MAX_DIR_ENTRIES`
-     * outright rather than versioning the first 64 of them (`read.c:441-448`,
-     * "refused rather than trimmed"). So at most `ATLAS_MEMORY_MAX_DIR_ENTRIES`
-     * live rows of any one source can ever have been versioned, by anything.
-     * Now that `deleted_scan_id IS NULL` keeps a dead row from ever occupying
-     * one of the 65 slots, a directory with more than 64 live matching rows
-     * must return, in whatever order SQLite chooses, at least one row from
-     * beyond that already-fully-versioned set of 64 -- and that row, by
-     * construction, has no version. `found` is false for it, `changed_out` is
-     * set, the pass runs, reaches the same directory through `read.c`, and is
-     * refused at the same ceiling: the obstacle is surfaced, not hidden, and
-     * this holds for whichever 65-of-N rows SQLite happens to return. That is
-     * what the `+ 1` is for -- `LIMIT ?3` binds
-     * `ATLAS_MEMORY_MAX_DIR_ENTRIES + 1` precisely so one of the rows
-     * returned is guaranteed to fall outside the fully-versioned set whenever
-     * one exists. A directory within bound has at most
-     * `ATLAS_MEMORY_MAX_DIR_ENTRIES` live rows to return in the first place,
-     * so `LIMIT ?3` never truncates it either -- `deleted_scan_id IS NULL` is
-     * what makes "live rows" and "rows this query can see" the same number,
-     * which is what closes the second, more dangerous consequence of the
-     * fifth door: before this round, an unbounded run of deleted rows could
-     * occupy the 65 slots and push the one live, genuinely-changed file out
-     * of the result window with no `ORDER BY` to say which 65 of a larger set
-     * came back -- a permanent silent miss, the more dangerous direction,
-     * rather than the permanent false alarm the other four doors produce. One
-     * pass's own staleness -- the index recorded 70 live children a moment
-     * ago, the directory holds 60 now -- is the same snapshot posture the
-     * paragraph below already accepts for size and type; the `LIMIT`
-     * inherits it and nothing more.
+     * The `LIMIT ?3` below has no `ORDER BY`. One thing about that is proved
+     * and one is not, and they are kept apart here because an earlier round
+     * of this comment ran them together and got a safety argument out of it
+     * that does not hold.
+     *
+     * **Proved: a directory within bound is never truncated.** `read.c`
+     * refuses a directory whose live matching children exceed
+     * `ATLAS_MEMORY_MAX_DIR_ENTRIES` outright rather than versioning the
+     * first 64 of them (`read.c:425-431,441-448`, "refused rather than
+     * trimmed"), so a source this function can say anything useful about has
+     * at most `ATLAS_MEMORY_MAX_DIR_ENTRIES` live matching rows -- and now
+     * that `deleted_scan_id IS NULL` keeps a dead row from occupying one of
+     * the slots, "live rows" and "rows this query can see" are the same
+     * number. `LIMIT ?3` binds `ATLAS_MEMORY_MAX_DIR_ENTRIES + 1`, so every
+     * such directory is returned whole and the order it comes back in cannot
+     * matter. That is also what closes the fifth door's more dangerous
+     * second consequence: before `deleted_scan_id IS NULL`, an unbounded run
+     * of dead rows could fill the window and push the one live, genuinely
+     * changed file out of it, with no `ORDER BY` to say which 65 of a larger
+     * set came back -- a permanent silent miss rather than the permanent
+     * false alarm the other doors produce.
+     *
+     * **Not proved, and stated rather than argued away: this function does
+     * not detect a directory that has grown past the ceiling.** An earlier
+     * round claimed it did, by counting: at most 64 rows are ever versioned,
+     * so a 65th must be unversioned and the pass must run. The count is
+     * wrong twice over. Versions are keyed by content, not by path --
+     * `atlas_db_memory_version_exists` matches on `(source_id,
+     * content_sha256)` alone -- so N live rows collapse to however many
+     * distinct hashes they carry, and two empty files carry one. And the
+     * version set is cumulative: nothing prunes `memory_source_versions`, so
+     * "at most 64" is true of a single pass and false of the table, which
+     * after twenty passes holds hundreds of hashes to match against. There
+     * is no bounded set to count against, and no finite `LIMIT` recovers the
+     * argument. `cp a.md a-copy.md` in a 64-file source is the whole repro:
+     * 65 live rows, 64 hashes, every one already versioned, `changed_out`
+     * false.
+     *
+     * That answer is the honest one for the question *this* function owns --
+     * no content appeared that Atlas has not already seen, so there is no
+     * source revision -- and it is recorded here because the cost lands
+     * elsewhere. `atlas_memory_plan_for`'s only caller submits a pass just
+     * when it derives a cause, so nothing schedules an unconditional
+     * periodic pass, and a source directory that crosses the ceiling by
+     * copying a file it already holds is not examined again until some other
+     * signal moves. When one does, the pass does not report the ceiling as a
+     * per-item obstacle either: `read.c` returns `ATLAS_ERR_CONFIG` for the
+     * whole listing, so the pass fails rather than recording an item nobody
+     * could read.
      *
      * Both sides of every one of these comparisons are snapshots taken at
      * different times: `files.size_bytes`, `files.file_type` and

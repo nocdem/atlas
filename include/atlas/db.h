@@ -2275,13 +2275,34 @@ bool atlas_db_in_transaction(const atlas_db *db);
  * constructs it, so this does not sanitise it. Used by a pass that processes
  * several independent units inside one transaction and must not let one
  * unit's own obstacle discard every other unit's work (A12.1 T8's
- * reconciliation pass, one source per savepoint). */
+ * reconciliation pass, one source per savepoint).
+ *
+ * Refused with no transaction already open (`ATLAS_ERR_INTERNAL`): a bare
+ * `SAVEPOINT` can silently open an implicit transaction of its own that
+ * `tx_depth` never learns about, which is exactly what left
+ * `atlas_db_rollback` unable to close it afterwards in an earlier draft of
+ * the caller above. `atlas_db_savepoint_release` carries the same refusal,
+ * since it is only ever meaningful once `atlas_db_savepoint` has already
+ * succeeded. */
 atlas_status atlas_db_savepoint(atlas_db *db, const char *name, atlas_err *err);
-/* Releases a savepoint, keeping everything written since it was taken. */
+/* Releases a savepoint, keeping everything written since it was taken.
+ * Refused with no transaction open, the same reason as `atlas_db_savepoint`
+ * above. */
 atlas_status atlas_db_savepoint_release(atlas_db *db, const char *name, atlas_err *err);
 /* Rolls back to a savepoint, undoing everything written since it was taken,
  * without ending the enclosing transaction. The savepoint itself is still
- * open afterwards and must still be released (or rolled back again). */
+ * open afterwards and must still be released (or rolled back again).
+ *
+ * Deliberately **not** refused when no transaction is open, unlike the two
+ * functions above -- and safe for a structural reason rather than merely a
+ * permissive one: `ROLLBACK TO` can only narrow or end a transaction that is
+ * already open, it can never *start* one, so calling it with none open
+ * cannot recreate the untracked-transaction problem `atlas_db_savepoint`'s
+ * own refusal exists to prevent. That is what lets a caller use this call's
+ * own return status to find out whether the transaction survived a severe
+ * error (SQLITE_FULL, IOERR, NOMEM, BUSY, INTERRUPT can end the whole
+ * transaction, not just a savepoint) instead of being refused before it can
+ * ask. */
 atlas_status atlas_db_savepoint_rollback(atlas_db *db, const char *name, atlas_err *err);
 /* Opens the database read-only. Used by daemon reader threads and by CLI read
  * commands while a daemon owns the writer, so a reader can never take the write

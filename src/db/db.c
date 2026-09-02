@@ -591,12 +591,16 @@ atlas_status atlas_db_savepoint_rollback(atlas_db *db, const char *name, atlas_e
     if (db == NULL || name == NULL) {
         return atlas_err_set(err, ATLAS_ERR_INTERNAL, "no savepoint to roll back to");
     }
-    /* Deliberately not gated on require_open_transaction: this is the one
-     * call a caller makes precisely because it suspects the transaction may
-     * already be gone (review round 2, New-C1) -- refusing it here would
-     * remove the only way to find out via its own return status. A
-     * genuinely absent transaction still fails, just from SQLite itself
-     * ("no such savepoint") rather than from a redundant guard. */
+    /* Deliberately not gated on require_open_transaction, and safe for a
+     * stronger reason than "this is how a caller finds out" (review round 2's
+     * own comment, corrected in round 3): `SAVEPOINT` can implicitly open a
+     * transaction nothing tracks, which is New-I1's whole problem, but
+     * `ROLLBACK TO` cannot -- it only ever narrows or ends one that is
+     * already open, never starts one. So gating it here would buy nothing
+     * `require_open_transaction` does not already buy by gating `SAVEPOINT`
+     * itself, and *not* gating it is what lets a caller that suspects the
+     * transaction is already gone find out from this call's own return
+     * status, rather than being refused before it can ask. */
     char sql[96];
     (void)snprintf(sql, sizeof sql, "ROLLBACK TO %s;", name);
     return atlas_db_exec_sql(db, sql, err);

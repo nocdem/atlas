@@ -806,38 +806,87 @@ atlas_status atlas_memory_observe(atlas_db *db, const atlas_repo_info *repo,
                                   const char *data_dir, const atlas_syspolicy *pol,
                                   atlas_memory_observation *out, atlas_err *err);
 
+/* Round 3's own rule, stated here rather than only at the loop that
+ * enforces it (`atlas_memory_apply_in_tx`, `reconcile.c`): every field below
+ * is either **write-side** or an **observation**, and the two are restored
+ * differently when one source's own obstacle rolls back its savepoint.
+ *
+ * A write-side field describes rows this pass actually committed --
+ * `versions_added`, `claims_created`, `claims_resolved`, `unanchored`,
+ * `intake_bound_hits`, and (set once, after the per-source loop)
+ * `generation`/`diff_rows`. A SQL rollback undoing a source's rows must undo
+ * its share of these too, so they are snapshotted before each source and
+ * restored on that source's own failure -- the count must never claim a row
+ * exists that the rollback just removed.
+ *
+ * An observation field describes what the *observe* phase saw, before any
+ * transaction existed: `sources_seen`, `read_obstacles` and
+ * `sources_bound_hit`. These are never snapshotted or restored. Rolling one
+ * back on a write failure would erase the fact that this pass looked at the
+ * source at all -- exactly the distinction round 1's I1 was raised to
+ * create, and round 2's I2 had to correct once already because the earlier
+ * loop restored the whole struct wholesale rather than by field. */
 typedef struct atlas_memory_pass_result {
-    int64_t generation;          /* 0 = nothing changed, no generation appended */
-    size_t sources_seen, versions_added, claims_created, claims_resolved;
-    size_t unanchored, diff_rows, intake_bound_hits;
-    bool sources_bound_hit;      /* a bound was reached; reported, never silent */
-    /* Review round 1, I1. Every item this pass could not read as a positive
-     * fact -- ABSENT is not one of these (that is a real look that found
-     * nothing); NO_MIRROR, NOT_MIRRORED, TOO_LARGE, SYMLINK, and an empty
-     * mirror-backed `*_DIR` listing are, because each says this process did
-     * not see what is actually there. `sources_seen 1, generation 0,
-     * read_obstacles 0` and `sources_seen 1, generation 0, read_obstacles 1`
-     * are two different repositories -- a healthy one with nothing new, and
-     * one this pass could not fully look at -- and before this field they
-     * read identically. */
+    int64_t generation;          /* write-side; 0 = nothing changed, no generation appended */
+    size_t sources_seen;         /* observation */
+    size_t versions_added, claims_created, claims_resolved; /* write-side */
+    size_t unanchored;           /* write-side */
+    size_t diff_rows;            /* write-side */
+    size_t intake_bound_hits;    /* write-side -- see the struct comment above */
+    bool sources_bound_hit;      /* observation; a bound was reached, reported never silent */
+    /* Observation. Review round 1, I1. Every item this pass could not read
+     * as a positive fact -- ABSENT is not one of these (that is a real look
+     * that found nothing); NO_MIRROR, NOT_MIRRORED, TOO_LARGE, SYMLINK, and
+     * an empty mirror-backed `*_DIR` listing are, because each says this
+     * process did not see what is actually there. `sources_seen 1,
+     * generation 0, read_obstacles 0` and `sources_seen 1, generation 0,
+     * read_obstacles 1` are two different repositories -- a healthy one
+     * with nothing new, and one this pass could not fully look at -- and
+     * before this field they read identically. */
     size_t read_obstacles;
-    /* Review round 2, I1's residual. `read_obstacles` on its own is a count
-     * with no path and no reason -- A9.2.5's own rule is that an obstacle is
-     * recorded with its exact cause, not the first reason and no path. This
-     * is not the full per-obstacle table that rule ultimately wants (a
-     * stated cost, not solved this round); it carries the most recent
-     * obstacle's own source path and outcome, e.g. "note.md: NO_MIRROR", so
-     * a caller reading a nonzero `read_obstacles` has at least one concrete
-     * example rather than only a number. */
+    /* Observation, alongside `read_obstacles` above. Review round 2, I1's
+     * residual. `read_obstacles` on its own is a count with no path and no
+     * reason -- A9.2.5's own rule is that an obstacle is recorded with its
+     * exact cause, not the first reason and no path. This is not the full
+     * per-obstacle table that rule ultimately wants (a stated cost, not
+     * solved this round); it carries the most recent obstacle's own outcome
+     * and source path, so a caller reading a nonzero `read_obstacles` has at
+     * least one concrete example rather than only a number.
+     *
+     * Round 3: the **outcome comes first**, deliberately, and this field can
+     * silently truncate -- `snprintf` never overflows the buffer, but a
+     * registered path can be up to 512 raw bytes and `%XX`-encoding can
+     * triple that (`atlas_syspolicy_memory_source.path`, `syspolicy.h`), so
+     * a long path can consume the whole 256 bytes on its own. Ordering the
+     * outcome first is what guarantees *it* always survives even when the
+     * path does not, since a truncated path is still informative but a
+     * truncated-away outcome would leave a reader with nothing that
+     * classifies the obstacle at all.
+     *
+     * Both halves are already safe to print or store as-is: the outcome is
+     * one of a fixed set of literal C strings (`read_outcome_label`,
+     * `reconcile.c`), never repository content, and the path segment is
+     * `path_text` -- already `%XX`-encoded by `atlas_path_text_encode`, this
+     * codebase's own "safe to print" form for a path. Neither half needs a
+     * further `atlas_safe()` pass, and this field's own encoding is
+     * satisfied by construction rather than left for a renderer to
+     * discover. */
     char last_read_obstacle[256];
-    /* Review round 1, I4. How many registered sources this pass could not
-     * finish processing because a write-point call refused for a reason
-     * this pass did not itself provoke by construction (not the compiled
-     * text-length bound above, which stays counted here too but is
+    /* Write-side. Review round 1, I4. How many registered sources this pass
+     * could not finish processing because a write-point call refused for a
+     * reason this pass did not itself provoke by construction (not the
+     * compiled text-length bound above, which stays counted here too but is
      * unreachable today) -- each rolled back to the savepoint taken before
      * it, so the other sources' work this pass still stands. `last_obstacle`
      * carries the most recent one's own message: a count without a cause is
-     * "something happened", which A9.2.5 does not accept as a report. */
+     * "something happened", which A9.2.5 does not accept as a report.
+     *
+     * Unlike `last_read_obstacle` above, this field carries raw
+     * `sqlite3_errmsg`/`atlas_err` text (`reconcile.c`), which is Atlas' own
+     * diagnostic prose, not repository content -- but it is not
+     * `atlas_safe()`-encoded either, and a caller that renders it to a
+     * terminal or a JSON document must not assume it already is. Left as a
+     * stated gap rather than solved this round. */
     char last_obstacle[256];
 } atlas_memory_pass_result;
 

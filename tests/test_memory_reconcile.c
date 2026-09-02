@@ -1472,7 +1472,10 @@ static void test_cost_debt_apply_duration_at_compiled_worst_case(void) {
  * `basis_commit` (`intake.c:643`), so every head move re-mints every claim;
  * production's steady state after any commit is precisely the *all-
  * resolving* case, and that is the one T10 needs timed before it can weigh
- * this job against a hook's 4000 ms deadline. This builds Decision 10's full
+ * this job against the real 2000 ms deadline (ATLAS_HOOK_IPC_TIMEOUT_MS /
+ * ATLAS_WRITER_YIELD_GRACE_MS, not the 4000 ms an earlier review round
+ * carried into the season ledger before correcting it). This builds
+ * Decision 10's full
  * stated worst case -- 16 sources, each with 128 candidates that *do*
  * resolve a PATH anchor and run CLAIM_CREATE, EVIDENCE_ADD, ATTESTATION_ADD
  * and the DEPENDENCY_ADD check for real -- and times the same one write
@@ -1555,7 +1558,8 @@ static void test_cost_debt_all_resolving_case_at_compiled_worst_case(void) {
         "ATTESTATION_ADD+DEPENDENCY_ADD for real -- cost %.1f ms inside atlas_memory_apply_in_tx's "
         "one write transaction (claims_created=%zu). This is production's steady state after any "
         "commit, since the claim content key hashes basis_commit. See the T8 report for what T10 "
-        "should do with this number against a hook's 4000 ms deadline.",
+        "should do with this number against the real 2000 ms deadline (ATLAS_HOOK_IPC_TIMEOUT_MS "
+        "/ ATLAS_WRITER_YIELD_GRACE_MS).",
         ms, result.claims_created);
 
     atlas_memory_observation_free(obs);
@@ -1793,6 +1797,11 @@ static void test_read_obstacle_is_distinguishable_from_unchanged(void) {
     T_CHECK_MSG(blind.read_obstacles == 1,
                 "expected the NO_MIRROR outcome to be counted as a read obstacle, got %zu",
                 blind.read_obstacles);
+    /* Round 3: the outcome comes first in last_read_obstacle, so it survives
+     * even a long path being truncated away. */
+    T_CHECK_MSG(strncmp(blind.last_read_obstacle, "NO_MIRROR", strlen("NO_MIRROR")) == 0,
+                "expected last_read_obstacle to lead with the outcome, got \"%s\"",
+                blind.last_read_obstacle);
 
     t8_env_close(&e);
 }
@@ -1945,6 +1954,17 @@ static void test_outer_transaction_ending_fault_abandons_the_pass(void) {
     T_CHECK_MSG(!atlas_db_in_transaction(e.db),
                 "expected Atlas' own tx_depth to be resynchronised once SQLite ended the "
                 "transaction, but atlas_db_in_transaction still reports true");
+
+    /* "The pass failed" and "the pass left nothing behind" are different
+     * claims -- assert the second too. The whole outer transaction ended,
+     * so even note-a.md's own already-released, healthy work never
+     * committed: nothing was ever persisted, not merely nothing usable. */
+    char sql[256];
+    (void)snprintf(sql, sizeof sql, "SELECT COUNT(*) FROM verify_claims WHERE repo_id = %lld;",
+                  (long long)e.repo_id);
+    T_CHECK_MSG(t8_scalar(&e, sql, &err) == 0,
+                "expected the whole transaction's work, including the healthy source's, to be "
+                "gone -- not merely the poisoned source's");
 
     atlas_memory_observation_free(obs);
     free(obs);

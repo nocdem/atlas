@@ -662,8 +662,14 @@ static atlas_status apply_one_source(apply_ctx *ctx, const atlas_memory_observed
      * false`) is a real look that found nothing and is not one of these. */
     if (src->item_count == 0 && src->from_mirror) {
         ctx->out->read_obstacles++;
+        /* Outcome first, deliberately -- see the struct's own comment in
+         * memory.h: a long %XX-encoded path can consume the whole buffer,
+         * and the outcome is what must survive that. There is no single
+         * ATLAS_MEMORY_READ_* member for "empty mirror-backed listing" (no
+         * item exists to carry one), so this is the one obstacle
+         * description not built from read_outcome_label. */
         (void)snprintf(ctx->out->last_read_obstacle, sizeof ctx->out->last_read_obstacle,
-                      "%s: empty mirror-backed listing", atlas_buf_cstr(&src->path_text));
+                      "EMPTY_MIRROR_LISTING: %s", atlas_buf_cstr(&src->path_text));
     }
 
     for (size_t i = 0; st == ATLAS_OK && i < src->item_count; i++) {
@@ -675,9 +681,12 @@ static atlas_status apply_one_source(apply_ctx *ctx, const atlas_memory_observed
              * actually there, and must not read the same as "unchanged". */
             if (it->outcome != ATLAS_MEMORY_READ_ABSENT) {
                 ctx->out->read_obstacles++;
+                /* Outcome first -- see the struct's own comment in memory.h:
+                 * a long %XX-encoded path can consume the whole buffer, and
+                 * the outcome is what must survive that. */
                 (void)snprintf(ctx->out->last_read_obstacle, sizeof ctx->out->last_read_obstacle,
-                              "%s: %s", atlas_buf_cstr(&src->path_text),
-                              read_outcome_label(it->outcome));
+                              "%s: %s", read_outcome_label(it->outcome),
+                              atlas_buf_cstr(&src->path_text));
             }
             continue;
         }
@@ -877,34 +886,33 @@ atlas_status atlas_memory_apply_in_tx(atlas_db *db, const atlas_repo_info *repo,
      * sources' work this pass: each gets its own SAVEPOINT, taken before
      * `apply_one_source` runs and released on success. On failure, this
      * source's *SQL* writes are undone by rolling back to the savepoint,
-     * and this source's share of the pass-wide *write-side* bookkeeping
-     * (`ctx.dep`, `ctx.added_claims`, and `out`'s counters of what was
-     * actually written) is undone right alongside it, from a snapshot
-     * taken at the same point the savepoint was.
+     * and this source's share of the pass-wide *write-side* bookkeeping is
+     * undone right alongside it -- see `atlas_memory_pass_result`'s own
+     * comment in `memory.h` for exactly which fields that is and why; this
+     * loop is what enforces the split, not what defines it.
      *
-     * Round 2, New-I2: `sources_seen`, `read_obstacles` and
-     * `sources_bound_hit` are **not** snapshotted or restored here.
-     * Observations are not writes -- they describe what the observe phase
-     * saw before any transaction existed, and a SQL rollback undoing this
-     * source's *writes* has nothing to say about whether this pass *looked
-     * at* it. Rolling those three back on a write failure would erase
-     * exactly the distinction round 1's I1 was raised to create.
-     *
-     * Round 2, New-C1: certain SQLite errors (SQLITE_FULL, IOERR, NOMEM,
-     * BUSY, INTERRUPT) can end the *outer* transaction, not merely the
-     * savepoint -- documented SQLite behaviour, not a defect in the
-     * primitives above. Every savepoint result is checked, never `(void)`d,
-     * and `atlas_db_in_transaction` is asked after each one: if the
-     * transaction is gone, there is nothing left to isolate a source
-     * within, so the whole pass is abandoned rather than continuing in
-     * autocommit while this pass's own bookkeeping still describes rows
-     * that no longer exist. */
+     * Round 2, New-C1 / round 3 correction: certain SQLite errors
+     * (SQLITE_FULL, IOERR, NOMEM, BUSY, INTERRUPT) can end the *outer*
+     * transaction, not merely the savepoint -- documented SQLite behaviour,
+     * not a defect in the primitives above. The savepoint this loop opened
+     * is released or rolled back by this same loop and nothing else, so
+     * `ROLLBACK TO` failing has exactly one honest explanation: the
+     * transaction it named is no longer there to roll back within. That is
+     * inferred from the failure itself, not from asking
+     * `atlas_db_in_transaction` first -- inside this function `tx_depth` is
+     * always >= 1 (the caller opened the transaction before calling in),
+     * so that question would answer `true` from its own short-circuit
+     * without ever reaching `sqlite3_get_autocommit`, which an earlier
+     * draft of this comment wrongly credited with an answer it was never
+     * asked for. `atlas_db_rollback` is called unconditionally on this
+     * path precisely because the answer is already known. */
     atlas_status st = ATLAS_OK;
     for (size_t i = 0; st == ATLAS_OK && i < obs->source_count; i++) {
         size_t versions_added_snap = out->versions_added;
         size_t claims_created_snap = out->claims_created;
         size_t claims_resolved_snap = out->claims_resolved;
         size_t unanchored_snap = out->unanchored;
+        size_t intake_bound_hits_snap = out->intake_bound_hits;
         size_t dep_snapshot = ctx.dep_count;
         size_t added_snapshot = ctx.added_count;
         bool any_change_snapshot = ctx.any_change;
@@ -932,23 +940,18 @@ atlas_status atlas_memory_apply_in_tx(atlas_db *db, const atlas_repo_info *repo,
             st = ATLAS_OK;
         }
 
-        if (!atlas_db_in_transaction(db)) {
-            /* The transaction is already gone -- SQLite rolled back
-             * everything this pass wrote, including sources already
-             * released as "successful". A ROLLBACK TO or RELEASE issued now
-             * would only fail again; there is no savepoint left to address.
-             * Resynchronise Atlas' own tx_depth to what SQLite already did,
-             * so the caller's own commit/rollback does not compound the
-             * confusion, and abandon the whole pass -- continuing would run
-             * every remaining source as an independent autocommit
-             * statement outside any transaction at all. */
-            atlas_db_rollback(db);
-            st = atlas_err_set(err, ATLAS_ERR_DB,
-                               "the write transaction ended while processing source %zu; the "
-                               "whole pass is abandoned rather than continuing outside one",
-                               i);
-            break;
-        }
+        /* The original failure's own message, preserved before anything
+         * below overwrites `err` with the rollback attempt's own -- "the
+         * pass failed" and "why" are two different things a caller reading
+         * `last_obstacle` needs, and losing the first to the second was
+         * round 2's own residual (`reconcile.c:977`, named in review). */
+        /* Sized with room to spare under "source %zu: " (`last_obstacle`'s
+         * own destination is 256 bytes; %zu's worst case is 20 digits, so
+         * this is capped well below what the prefix could ever need,
+         * satisfying -Wformat-truncation rather than merely being correct
+         * at runtime). */
+        char original_msg[200];
+        (void)snprintf(original_msg, sizeof original_msg, "%s", atlas_err_msg(err));
 
         atlas_err rollback_err;
         atlas_err_init(&rollback_err);
@@ -958,27 +961,18 @@ atlas_status atlas_memory_apply_in_tx(atlas_db *db, const atlas_repo_info *repo,
             rel_st = atlas_db_savepoint_release(db, sp_name, &rollback_err);
         }
         if (rb_st != ATLAS_OK || rel_st != ATLAS_OK) {
-            /* The savepoint itself would not roll back or would not
-             * release. Measured, not assumed: `sqlite3_get_autocommit`
-             * alone is not sufficient to detect this -- a connection left
-             * needing an explicit ROLLBACK by a severe error (a real
-             * SQLITE_INTERRUPT mid-statement, driven end to end in
-             * `test_outer_transaction_ending_fault_abandons_the_pass`)
-             * keeps reporting "in a transaction" until that ROLLBACK
-             * actually runs, so `atlas_db_in_transaction` still answers
-             * true here even though nothing further can be trusted. A
-             * failed `ROLLBACK TO` or `RELEASE` is itself sufficient
-             * evidence, so the transaction is forced closed
-             * unconditionally rather than asked about again -- a rollback
-             * that itself fails is what turns a bad source into a bad
-             * database, and asking a question already known to answer
-             * "yes" is not a check. */
+            /* `ROLLBACK TO`/`RELEASE` named a savepoint this same loop just
+             * opened and has not yet released -- the one call that can fail
+             * it is the transaction it lived in ending from under it. Forced
+             * closed unconditionally rather than asked about again: a
+             * rollback that itself fails is what turns a bad source into a
+             * bad database. */
             atlas_db_rollback(db);
             st = atlas_err_set(err, ATLAS_ERR_DB,
-                               "could not roll back source %zu's own savepoint (%s); the pass is "
-                               "abandoned and the transaction forced closed rather than risk a "
-                               "database in a state nothing checked",
-                               i, atlas_err_msg(&rollback_err));
+                               "the write transaction ended while processing source %zu (%s); "
+                               "the pass is abandoned rather than risk a database in a state "
+                               "nothing checked -- original failure: %s",
+                               i, atlas_err_msg(&rollback_err), original_msg);
             break;
         }
 
@@ -986,13 +980,14 @@ atlas_status atlas_memory_apply_in_tx(atlas_db *db, const atlas_repo_info *repo,
         out->claims_created = claims_created_snap;
         out->claims_resolved = claims_resolved_snap;
         out->unanchored = unanchored_snap;
+        out->intake_bound_hits = intake_bound_hits_snap;
         ctx.dep_count = dep_snapshot;
         ctx.added_count = added_snapshot;
         ctx.any_change = any_change_snapshot;
 
         out->intake_bound_hits++;
         (void)snprintf(out->last_obstacle, sizeof out->last_obstacle, "source %zu: %s", i,
-                      atlas_err_msg(err));
+                      original_msg);
         atlas_err_init(err);
         /* st stays ATLAS_OK: recorded, not fatal to the rest of the pass. */
     }

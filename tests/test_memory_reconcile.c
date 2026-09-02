@@ -745,16 +745,25 @@ static void t8_head(t8env *e, atlas_buf *out, atlas_err *err) {
  * lets a backtick token resolve as a PATH anchor and what lets a memory
  * source's own path pass EVIDENCE_ADD's index lookup. The hash is never
  * checked against real content anywhere T8's own pass runs (T8 never asks
- * `atlas.content_hash` to verify), so an arbitrary hex string is honest. */
+ * `atlas.content_hash` to verify), so an arbitrary hex string is honest.
+ *
+ * T9 fix-round-3 (C3, door 4): `size_bytes` is now set to a small,
+ * comfortably-in-bound value rather than left unset (NULL). Round 3 added
+ * `size_bytes IS NOT NULL AND size_bytes <= ?4` to
+ * `atlas_db_memory_dir_hash_mismatch`'s own predicate list -- a row this
+ * function seeds is meant to be a `read.c`-ingestible `.md` child, and a
+ * NULL `size_bytes` no longer reads as one. Every existing caller of this
+ * helper that exercises `atlas_memory_plan_for`'s SOURCE_REVISION path
+ * depends on the row it seeds being seen as a real, ingestible file. */
 static void t8_seed_file(t8env *e, const char *path, const char *hash, atlas_err *err) {
     atlas_buf sql = ATLAS_BUF_INIT;
     T_OK(atlas_buf_appendf(&sql, err,
                            "INSERT INTO scans(repo_id, started_at, status)"
                            "  VALUES(%lld, '2026-01-01T00:00:00Z', 'ok');"
                            "INSERT INTO files(repo_id, path_raw, path_text, file_type,"
-                           "  content_hash, first_seen_scan_id, last_seen_scan_id,"
+                           "  content_hash, size_bytes, first_seen_scan_id, last_seen_scan_id,"
                            "  first_seen_at, last_seen_at)"
-                           "  VALUES(%lld, CAST('%s' AS BLOB), '%s', 'regular', '%s',"
+                           "  VALUES(%lld, CAST('%s' AS BLOB), '%s', 'regular', '%s', 128,"
                            "         last_insert_rowid(), last_insert_rowid(),"
                            "         '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');",
                            (long long)e->repo_id, (long long)e->repo_id, path, path, hash),
@@ -2621,6 +2630,139 @@ static void test_source_revision_reverification_is_supported_not_impacted(void) 
     t8_env_close(&e);
 }
 
+/* T9 fix-round-3 (Minor, filed against round 2's own comment at what is now
+ * `reconcile.c:1004-1032`): `IMPACTED`'s own definition is positional --
+ * "the anchor intersects the commit range's changed paths" -- not "this pass
+ * happened to be `COMMIT`-caused". The two readings agree whenever the
+ * proposition's own PATH anchor is what a commit touched (the test just
+ * above this one, and `test_commit_impacts_only_its_anchored_claim`, both
+ * drive that case) and disagree in exactly one situation: a genuine
+ * `COMMIT`-caused pass (HEAD really did move) whose commit range does *not*
+ * happen to include this proposition's own anchor, while the anchor's
+ * verifier input still moved for an unrelated, uncommitted reason. The old,
+ * pre-round-1 `head_moved ? IMPACTED : SUPPORTED` would answer IMPACTED
+ * here; the current, positional `commit_touched ? IMPACTED : SUPPORTED`
+ * answers SUPPORTED -- and that half is what no test pinned before this one.
+ *
+ * Both readings are driven back to back against the *same* claim (`the file
+ * `src/lib.c` is present`, a plain PATH/CONTENT_HASH claim, so `check ==
+ * PASS` is unconditional the way New-2's own SOURCE_REVISION test above
+ * established -- no CONTRADICTED/PASS ambiguity to hedge, unlike a claim
+ * that asserts specific content): first a `COMMIT` pass whose commit range
+ * is an unrelated file while `src/lib.c` changes only on disk (SUPPORTED),
+ * then a second `COMMIT` pass whose commit range *is* `src/lib.c` itself
+ * (IMPACTED) -- proving the ternary is keyed on this proposition's own
+ * anchor membership, not merely on which cause produced the pass. */
+static void test_impacted_is_positional_not_pass_wide(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    t8env e;
+    t8_env_open(&e, &err);
+
+    const char *repo = fx_repo(&e.fx);
+    T_OK(fx_mkdir(repo, "src", &err), &err);
+    T_OK(fx_write(repo, "src/lib.c", "int lib_v1;\n", &err), &err);
+    T_OK(fx_write(repo, "note.md", "the file `src/lib.c` is present", &err), &err);
+    T_OK(fx_add_all(&e.fx, repo, &err), &err);
+    T_OK(fx_commit(&e.fx, repo, "seed", &err), &err);
+    t8_bind_head(&e, &err);
+    t8_seed_file(&e, "src/lib.c", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", &err);
+    t8_seed_file(&e, "note.md", "1111111111111111111111111111111111111111111111111111111111111111",
+                &err);
+
+    const char *paths[] = {"note.md"};
+    atlas_syspolicy pol;
+    t8_policy(&pol, ATLAS_MEMORY_SOURCE_REPO_FILE, paths, 1);
+
+    atlas_memory_pass_result r1;
+    t8_run_pass(&e, &pol, &r1, &err);
+    T_REQUIRE(r1.generation != 0);
+
+    /* Phase A: a real commit moves HEAD (cause COMMIT), but it commits an
+     * *unrelated* file. `fx_add_all` stages every working-tree change, so the
+     * commit naming only unrelated.c has to be made -- and HEAD bound to it
+     * -- *before* src/lib.c is ever touched; only then is src/lib.c's own
+     * content changed, on disk only, never committed, so the claim's
+     * verifier input still moves (CONTENT_HASH reads the file fresh every
+     * pass), but the commit range this pass observes is {unrelated.c}, not
+     * {src/lib.c}. */
+    T_OK(fx_write(repo, "unrelated.c", "int u;\n", &err), &err);
+    T_OK(fx_add_all(&e.fx, repo, &err), &err);
+    T_OK(fx_commit(&e.fx, repo, "unrelated", &err), &err);
+    t8_bind_head(&e, &err);
+    t8_seed_file(&e, "unrelated.c", "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                &err);
+
+    T_OK(fx_write(repo, "src/lib.c", "int lib_v2;\n", &err), &err);
+    t9_update_file_hash(&e, "src/lib.c", "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                        &err);
+
+    atlas_memory_pass_result r2;
+    t8_run_pass(&e, &pol, &r2, &err);
+    T_CHECK_MSG(r2.generation == r1.generation + 1,
+               "expected exactly one generation bump, got %lld after %lld", (long long)r2.generation,
+               (long long)r1.generation);
+
+    atlas_buf cause2 = ATLAS_BUF_INIT;
+    int64_t gen2 = 0;
+    t9_generation_latest(&e, &cause2, NULL, &gen2, &err);
+    T_CHECK_MSG(strcmp(atlas_buf_cstr(&cause2), "COMMIT") == 0,
+               "expected cause COMMIT (HEAD moved on an unrelated commit), got %s",
+               atlas_buf_cstr(&cause2));
+
+    atlas_buf uid2 = ATLAS_BUF_INIT;
+    t9_claim_uid_for_text(&e, "the file `src/lib.c` is present", &uid2, &err);
+    atlas_buf kind2 = ATLAS_BUF_INIT;
+    bool found2 = false;
+    t9_diff_kind_for(&e, gen2, atlas_buf_cstr(&uid2), &kind2, NULL, &found2, &err);
+    T_CHECK_MSG(found2 && strcmp(atlas_buf_cstr(&kind2), "SUPPORTED") == 0,
+               "phase A: a COMMIT pass whose commit range does not include this claim's own PATH "
+               "anchor must report SUPPORTED, not IMPACTED -- found=%d kind=%s (the pre-round-1 "
+               "head_moved-based rule would have answered IMPACTED here)",
+               found2, found2 ? atlas_buf_cstr(&kind2) : "(none)");
+
+    /* Phase B, the contrast: this time the commit *is* the change to
+     * src/lib.c, so the same claim's own PATH anchor is exactly what the
+     * commit range touched. */
+    T_OK(fx_write(repo, "src/lib.c", "int lib_v3;\n", &err), &err);
+    T_OK(fx_add_all(&e.fx, repo, &err), &err);
+    T_OK(fx_commit(&e.fx, repo, "touch lib.c", &err), &err);
+    t8_bind_head(&e, &err);
+    t9_update_file_hash(&e, "src/lib.c", "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                        &err);
+
+    atlas_memory_pass_result r3;
+    t8_run_pass(&e, &pol, &r3, &err);
+    T_CHECK_MSG(r3.generation == r2.generation + 1,
+               "expected exactly one generation bump, got %lld after %lld", (long long)r3.generation,
+               (long long)r2.generation);
+
+    atlas_buf cause3 = ATLAS_BUF_INIT;
+    int64_t gen3 = 0;
+    t9_generation_latest(&e, &cause3, NULL, &gen3, &err);
+    T_CHECK_MSG(strcmp(atlas_buf_cstr(&cause3), "COMMIT") == 0,
+               "expected cause COMMIT (HEAD moved touching src/lib.c itself), got %s",
+               atlas_buf_cstr(&cause3));
+
+    atlas_buf uid3 = ATLAS_BUF_INIT;
+    t9_claim_uid_for_text(&e, "the file `src/lib.c` is present", &uid3, &err);
+    atlas_buf kind3 = ATLAS_BUF_INIT;
+    bool found3 = false;
+    t9_diff_kind_for(&e, gen3, atlas_buf_cstr(&uid3), &kind3, NULL, &found3, &err);
+    T_CHECK_MSG(found3 && strcmp(atlas_buf_cstr(&kind3), "IMPACTED") == 0,
+               "phase B: a COMMIT pass whose commit range does include this claim's own PATH anchor "
+               "must report IMPACTED, found=%d kind=%s",
+               found3, found3 ? atlas_buf_cstr(&kind3) : "(none)");
+
+    atlas_buf_free(&cause2);
+    atlas_buf_free(&uid2);
+    atlas_buf_free(&kind2);
+    atlas_buf_free(&cause3);
+    atlas_buf_free(&uid3);
+    atlas_buf_free(&kind3);
+    t8_env_close(&e);
+}
+
 /* fix-round-1, C2: a bullet naming both a SYMBOL and a PATH gets a `symbol=`
  * verifier input (Decision 4's own precedence, `src/memory/extract.c`),
  * which does not move when the file changes and the symbol does not. Before
@@ -3476,7 +3618,29 @@ static void test_dir_hash_mismatch_matches_read_c_exactly(void) {
  * raw-passthrough convention does not encode, so this test builds its
  * `files` row directly rather than through that helper) — a raw `%` byte in
  * the source directory's own name encodes to the literal three characters
- * `%25`, which is exactly the escaping this round's fix has to survive. */
+ * `%25`, which is exactly the escaping this round's fix has to survive.
+ *
+ * fix-round-3 (Important): as filed in the round-2 re-review, this test
+ * could not fail. It seeded exactly one `files` row, and both the escaped
+ * pattern (`.claude/mem\%25o/%` ESCAPE '\\') and the unescaped one
+ * (`.claude/mem%25o/%`, its stray `%` read as a wildcard matching the empty
+ * string) matched that same row -- deleting `like_escape` entirely would
+ * have left every assertion below green. A second, decoy `files` row closes
+ * that: `.claude/memZZ25o/b.md` is reached only by the *unescaped* reading.
+ * There, the pattern's own `%` (from the un-escaped literal `%` in
+ * `.claude/mem%25o`) is a wildcard matching "ZZ", then the literal "25o/"
+ * matches, then the trailing `%` matches "b.md" -- so the unescaped pattern
+ * pulls this row in. The escaped pattern requires a literal `%` character
+ * right after "mem" (from `\%`), which "ZZ" is not, so it never matches.
+ * Only the real row's own version is ever inserted; the decoy is never
+ * given one. With `like_escape` in place (as below), the escaped query
+ * never selects the decoy in the first place, so its missing version is
+ * irrelevant and `changed` correctly reads false once the real row's
+ * version lands -- with the escaping removed, the unescaped query would
+ * also select the decoy, find it has no version, and `changed` would flip
+ * back to true. Verified by hand: commenting out the backslash-escaping
+ * loop in `like_escape` (`src/db/db_memory.c`) turns the second
+ * `T_CHECK_MSG` below red; restoring it turns the suite green again. */
 static void test_dir_hash_mismatch_escapes_a_literal_percent_in_its_own_path(void) {
     atlas_err err;
     atlas_err_init(&err);
@@ -3489,6 +3653,11 @@ static void test_dir_hash_mismatch_escapes_a_literal_percent_in_its_own_path(voi
     T_OK(atlas_path_text_encode(".claude/mem%o/a.md", strlen(".claude/mem%o/a.md"), &child_encoded,
                                 &err),
          &err);
+    /* Not `%XX`-encoded: it contains no byte `atlas_path_text_encode` would
+     * ever escape, so its raw and encoded forms are identical, and writing
+     * it raw keeps this literal readable as the "only the unescaped LIKE
+     * pattern reaches this" argument above. */
+    const char *decoy_path = ".claude/memZZ25o/b.md";
 
     int64_t source_id = 0;
     T_OK(atlas_db_memory_source_upsert(e.db, e.repo_id, ATLAS_MEMORY_SOURCE_REPO_DIR, ".claude/mem%o",
@@ -3501,14 +3670,21 @@ static void test_dir_hash_mismatch_escapes_a_literal_percent_in_its_own_path(voi
                            "INSERT INTO scans(repo_id, started_at, status)"
                            "  VALUES(%lld, '2026-01-01T00:00:00Z', 'ok');"
                            "INSERT INTO files(repo_id, path_raw, path_text, file_type,"
-                           "  content_hash, first_seen_scan_id, last_seen_scan_id,"
+                           "  content_hash, size_bytes, first_seen_scan_id, last_seen_scan_id,"
                            "  first_seen_at, last_seen_at)"
                            "  VALUES(%lld, CAST('%s' AS BLOB), '%s', 'regular',"
                            "         '1111111111111111111111111111111111111111111111111111111111111111',"
-                           "         last_insert_rowid(), last_insert_rowid(),"
+                           "         128, last_insert_rowid(), last_insert_rowid(),"
+                           "         '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');"
+                           "INSERT INTO files(repo_id, path_raw, path_text, file_type,"
+                           "  content_hash, size_bytes, first_seen_scan_id, last_seen_scan_id,"
+                           "  first_seen_at, last_seen_at)"
+                           "  VALUES(%lld, CAST('%s' AS BLOB), '%s', 'regular',"
+                           "         '2222222222222222222222222222222222222222222222222222222222222222',"
+                           "         128, last_insert_rowid(), last_insert_rowid(),"
                            "         '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');",
                            (long long)e.repo_id, (long long)e.repo_id, atlas_buf_cstr(&child_encoded),
-                           atlas_buf_cstr(&child_encoded)),
+                           atlas_buf_cstr(&child_encoded), (long long)e.repo_id, decoy_path, decoy_path),
          &err);
     T_OK(atlas_db_exec_sql(e.db, atlas_buf_cstr(&sql), &err), &err);
     atlas_buf_free(&sql);
@@ -3536,6 +3712,214 @@ static void test_dir_hash_mismatch_escapes_a_literal_percent_in_its_own_path(voi
 
     atlas_buf_free(&dir_encoded);
     atlas_buf_free(&child_encoded);
+    t8_env_close(&e);
+}
+
+/* T9 fix-round-3 (C3, still-open finding): `atlas_db_memory_dir_hash_mismatch`
+ * had no `file_type` or size predicate at all, so it treated every `files`
+ * row one level under a REPO_DIR source's own path as a candidate memory
+ * file regardless of what `src/memory/read.c` would actually do with it.
+ * Four kinds of row pass every predicate the query had before this round --
+ * right source, right depth, a literal `.md` suffix -- and are never given a
+ * `memory_source_versions` row by `read.c`, so each reported
+ * `changed_out = true` for ever, the same permanent-`SOURCE_REVISION` loop
+ * the depth fix (round 1) and the case fix (round 2) each closed one door of:
+ *
+ *  1. a symlink named `x.md` -- `read.c`'s listing filter excludes only
+ *     `S_ISDIR` (`read.c:414-421`), so a symlink is listed, then refused by
+ *     `open_fs_file` with outcome `ATLAS_MEMORY_READ_SYMLINK`
+ *     (`read.c:129-135`); a real scan still gives it `file_type = 'symlink'`
+ *     with `content_hash` = the hash of its link text, A13's own rule
+ *     (`src/core/scan.c:329-341`).
+ *  2. a fifo/socket/device named `x.md` -- refused with outcome `ABSENT`
+ *     (`read.c:140-146`); a real scan gives it `file_type = 'other'`.
+ *  3. a `files` row recorded `file_type = 'missing'` -- the fourth member of
+ *     the CHECK'd vocabulary (`src/db/migrate.c:85`), equally unfiltered
+ *     before this round.
+ *  4. a real, regular `.md` file over `ATLAS_MEMORY_MAX_SOURCE_BYTES` --
+ *     `read.c:158-163` refuses it with outcome `TOO_LARGE` and no bytes,
+ *     this season's own "a bound that is reached is refused, never
+ *     trimmed", so `file_type = 'regular'` alone does not exclude it. A
+ *     `size_bytes` of NULL -- a row this pass cannot even ask the question
+ *     of -- must be excluded on the same footing, never read as "small
+ *     enough": added as a fifth row alongside door 4 rather than a fifth
+ *     door of its own, since it is the same predicate's other edge.
+ *
+ * Every row below has no `memory_source_versions` row recorded for it, and
+ * every one must report no mismatch -- before this round's fix, each did. */
+/* One door's own row, inserted directly (the existing tests' own convention
+ * for this function -- `t8_seed_file` always writes `file_type = 'regular'`,
+ * so it cannot build any of these). `size_bytes` is a `const char *` (rather
+ * than a bound parameter) so `NULL` -- door 4's other edge -- can be spelled
+ * as the SQL literal instead of a sentinel int64_t. */
+static void t9_seed_door_file(t8env *e, const char *path, const char *file_type, const char *hash,
+                              const char *size_bytes_literal, atlas_err *err) {
+    atlas_buf sql = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_appendf(&sql, err,
+                           "INSERT INTO scans(repo_id, started_at, status)"
+                           "  VALUES(%lld, '2026-01-01T00:00:00Z', 'ok');"
+                           "INSERT INTO files(repo_id, path_raw, path_text, file_type,"
+                           "  content_hash, size_bytes, first_seen_scan_id, last_seen_scan_id,"
+                           "  first_seen_at, last_seen_at)"
+                           "  VALUES(%lld, CAST('%s' AS BLOB), '%s', '%s', '%s', %s,"
+                           "         last_insert_rowid(), last_insert_rowid(),"
+                           "         '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');",
+                           (long long)e->repo_id, (long long)e->repo_id, path, path, file_type, hash,
+                           size_bytes_literal),
+         err);
+    T_OK(atlas_db_exec_sql(e->db, atlas_buf_cstr(&sql), err), err);
+    atlas_buf_free(&sql);
+}
+
+/* T9 fix-round-3 (C3, still-open finding): `atlas_db_memory_dir_hash_mismatch`
+ * had no `file_type` or size predicate at all, so it treated every `files`
+ * row one level under a REPO_DIR source's own path as a candidate memory
+ * file regardless of what `src/memory/read.c` would actually do with it.
+ * Four kinds of row pass every predicate the query had before this round --
+ * right source, right depth, a literal `.md` suffix -- and are never given a
+ * `memory_source_versions` row by `read.c`, so each reported
+ * `changed_out = true` for ever, the same permanent-`SOURCE_REVISION` loop
+ * the depth fix (round 1) and the case fix (round 2) each closed one door of.
+ * One case per door, added one row at a time so a failing assertion names
+ * which door regressed rather than only that some row among five did:
+ *
+ *  1. a symlink named `x.md` -- `read.c`'s listing filter excludes only
+ *     `S_ISDIR` (`read.c:414-421`), so a symlink is listed, then refused by
+ *     `open_fs_file` with outcome `ATLAS_MEMORY_READ_SYMLINK`
+ *     (`read.c:129-135`); a real scan still gives it `file_type = 'symlink'`
+ *     with `content_hash` = the hash of its link text, A13's own rule
+ *     (`src/core/scan.c:329-341`).
+ *  2. a fifo/socket/device named `x.md` -- refused with outcome `ABSENT`
+ *     (`read.c:140-146`); a real scan gives it `file_type = 'other'`.
+ *  3. a `files` row recorded `file_type = 'missing'` -- the fourth member of
+ *     the CHECK'd vocabulary (`src/db/migrate.c:85`), equally unfiltered
+ *     before this round.
+ *  4. a real, regular `.md` file over `ATLAS_MEMORY_MAX_SOURCE_BYTES` --
+ *     `read.c:158-163` refuses it with outcome `TOO_LARGE` and no bytes,
+ *     this season's own "a bound that is reached is refused, never
+ *     trimmed", so `file_type = 'regular'` alone does not exclude it. A
+ *     `size_bytes` of NULL -- a row this pass cannot even ask the question
+ *     of -- is checked as door 4's own other edge, on the same footing:
+ *     never read as "small enough".
+ *
+ * Every row below has no `memory_source_versions` row recorded for it, and
+ * every one must report no mismatch -- before this round's fix, each did. */
+static void test_dir_hash_mismatch_excludes_the_four_unreadable_doors(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    t8env e;
+    t8_env_open(&e, &err);
+
+    atlas_buf dir_encoded = ATLAS_BUF_INIT;
+    T_OK(atlas_path_text_encode(".claude/memories", strlen(".claude/memories"), &dir_encoded, &err),
+         &err);
+    int64_t source_id = 0;
+    T_OK(atlas_db_memory_source_upsert(e.db, e.repo_id, ATLAS_MEMORY_SOURCE_REPO_DIR,
+                                       ".claude/memories", strlen(".claude/memories"),
+                                       atlas_buf_cstr(&dir_encoded), "2026-01-01T00:00:00Z",
+                                       &source_id, NULL, &err),
+         &err);
+
+    bool changed = true;
+
+    /* Positive control, added per review: every assertion below this point is
+     * `!changed`, and a query broken in a way that selects nothing --
+     * `?2`'s binding, a `path_text` encoding mismatch, a typo in a column
+     * name -- would report `!changed` for every one of them just as
+     * correctly-excluded rows would, for the wrong reason. One ordinary,
+     * real memory file proves the query is still live before any door is
+     * added: unversioned, it must report a mismatch; versioned, it must
+     * not. */
+    t9_seed_door_file(&e, ".claude/memories/ordinary.md", "regular",
+                      "2222222222222222222222222222222222222222222222222222222222222222", "128",
+                      &err);
+    changed = false;
+    T_OK(atlas_db_memory_dir_hash_mismatch(e.db, e.repo_id, source_id, atlas_buf_cstr(&dir_encoded),
+                                           &changed, &err),
+         &err);
+    T_CHECK_MSG(changed,
+               "positive control: an ordinary regular .md file with no memory_source_versions row "
+               "must report a mismatch -- if this is false, the query below is not actually "
+               "selecting anything and every door assertion that follows is vacuous");
+    T_OK(atlas_db_memory_version_insert(
+             e.db, source_id, "", "",
+             "2222222222222222222222222222222222222222222222222222222222222222", 1, "x", 1,
+             "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", (int64_t)geteuid(), NULL, NULL, &err),
+         &err);
+    changed = true;
+    T_OK(atlas_db_memory_dir_hash_mismatch(e.db, e.repo_id, source_id, atlas_buf_cstr(&dir_encoded),
+                                           &changed, &err),
+         &err);
+    T_CHECK_MSG(!changed,
+               "positive control: once the ordinary file's version is recorded, it must no longer "
+               "report a mismatch");
+
+    /* Door 1: a symlink. */
+    t9_seed_door_file(&e, ".claude/memories/link.md", "symlink",
+                      "3333333333333333333333333333333333333333333333333333333333333333", "12",
+                      &err);
+    changed = true;
+    T_OK(atlas_db_memory_dir_hash_mismatch(e.db, e.repo_id, source_id, atlas_buf_cstr(&dir_encoded),
+                                           &changed, &err),
+         &err);
+    T_CHECK_MSG(!changed,
+               "door 1: a symlink named x.md is refused by read.c (outcome SYMLINK) and never "
+               "versioned -- it must not report a mismatch");
+
+    /* Door 2: a fifo/socket/device. */
+    t9_seed_door_file(&e, ".claude/memories/pipe.md", "other",
+                      "4444444444444444444444444444444444444444444444444444444444444444", "0",
+                      &err);
+    changed = true;
+    T_OK(atlas_db_memory_dir_hash_mismatch(e.db, e.repo_id, source_id, atlas_buf_cstr(&dir_encoded),
+                                           &changed, &err),
+         &err);
+    T_CHECK_MSG(!changed,
+               "door 2: a fifo/socket/device named x.md is refused by read.c (outcome ABSENT) and "
+               "never versioned -- it must not report a mismatch");
+
+    /* Door 3: file_type = 'missing'. */
+    t9_seed_door_file(&e, ".claude/memories/gone.md", "missing",
+                      "5555555555555555555555555555555555555555555555555555555555555555", "40",
+                      &err);
+    changed = true;
+    T_OK(atlas_db_memory_dir_hash_mismatch(e.db, e.repo_id, source_id, atlas_buf_cstr(&dir_encoded),
+                                           &changed, &err),
+         &err);
+    T_CHECK_MSG(!changed,
+               "door 3: a files row recorded file_type = 'missing' is never given a listing entry "
+               "by read.c -- it must not report a mismatch");
+
+    /* Door 4: regular, over ATLAS_MEMORY_MAX_SOURCE_BYTES. */
+    char over_limit[32];
+    (void)snprintf(over_limit, sizeof over_limit, "%lld",
+                  (long long)ATLAS_MEMORY_MAX_SOURCE_BYTES + 1);
+    t9_seed_door_file(&e, ".claude/memories/huge.md", "regular",
+                      "6666666666666666666666666666666666666666666666666666666666666666", over_limit,
+                      &err);
+    changed = true;
+    T_OK(atlas_db_memory_dir_hash_mismatch(e.db, e.repo_id, source_id, atlas_buf_cstr(&dir_encoded),
+                                           &changed, &err),
+         &err);
+    T_CHECK_MSG(!changed,
+               "door 4: a regular .md file over ATLAS_MEMORY_MAX_SOURCE_BYTES is refused by "
+               "read.c (outcome TOO_LARGE) and never versioned -- it must not report a mismatch");
+
+    /* Door 4's other edge: regular, size_bytes NULL -- a row this check
+     * cannot establish is in bound, so it must be excluded on the same
+     * footing as one it can establish is over it. */
+    t9_seed_door_file(&e, ".claude/memories/unknown-size.md", "regular",
+                      "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", "NULL",
+                      &err);
+    changed = true;
+    T_OK(atlas_db_memory_dir_hash_mismatch(e.db, e.repo_id, source_id, atlas_buf_cstr(&dir_encoded),
+                                           &changed, &err),
+         &err);
+    T_CHECK_MSG(!changed,
+               "door 4's other edge: a regular .md file with size_bytes NULL cannot be shown to be "
+               "in bound -- it must not report a mismatch either");
+
+    atlas_buf_free(&dir_encoded);
     t8_env_close(&e);
 }
 
@@ -3592,6 +3976,8 @@ static const atlas_test TESTS[] = {
      test_two_propositions_sharing_one_anchor_both_remint_cleanly},
     {"New Important 2: a SOURCE_REVISION re-verification is SUPPORTED, not IMPACTED",
      test_source_revision_reverification_is_supported_not_impacted},
+    {"T9 fix-round-3 Minor: IMPACTED is positional, not pass-wide",
+     test_impacted_is_positional_not_pass_wide},
     {"C2: a commit behind a SYMBOL verifier still produces a diff row",
      test_commit_rewrites_file_behind_a_symbol_verifier},
     {"New Important 3: touched_bound_hit is reported on the pass result",
@@ -3614,6 +4000,8 @@ static const atlas_test TESTS[] = {
      test_dir_hash_mismatch_matches_read_c_exactly},
     {"C3: dir_hash_mismatch escapes a literal '%' in its own path",
      test_dir_hash_mismatch_escapes_a_literal_percent_in_its_own_path},
+    {"C3 fix-round-3: dir_hash_mismatch excludes the four unreadable doors",
+     test_dir_hash_mismatch_excludes_the_four_unreadable_doors},
 };
 
 ATLAS_TEST_MAIN("memory_reconcile", TESTS)

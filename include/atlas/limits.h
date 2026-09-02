@@ -1142,6 +1142,19 @@
  * `ATLAS_WATCH_MAX_DIRTY_PATHS`' rule, one layer out. */
 #define ATLAS_MEMORY_MAX_TOUCHED_PATHS 256u
 
+/* Commits one reconciliation pass will walk to build the touched-paths set
+ * above. T9 fix-round-2 (New Important 4): this was a file-local #define in
+ * `src/memory/reconcile.c`, the one bound on this mechanism not living beside
+ * its sibling -- moved here in fix-round-3 so a reader looking for what this
+ * pass costs finds both in one place, `docs/extending.md`'s own checklist
+ * point. A different dimension from `ATLAS_MEMORY_MAX_TOUCHED_PATHS`
+ * deliberately: a single commit can touch thousands of paths, or thousands of
+ * commits can each touch one, so a bound on one says nothing about the other
+ * and each gets its own. Reaching it is read as "this commit range could not
+ * be fully walked" -- the same conservative `bound_hit` meaning the paths
+ * bound carries, not a hard refusal. */
+#define ATLAS_MEMORY_MAX_TOUCHED_COMMITS 4096u
+
 /* Trailing lines of a commit message scanned for a binding trailer. A trailer
  * block lives at the end of a message by construction; scanning further would
  * make an arbitrarily long body an arbitrarily long parse, over bytes whose

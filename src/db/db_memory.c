@@ -875,18 +875,32 @@ atlas_status atlas_db_memory_claim_diff_last_kind(atlas_db *db, int64_t repo_id,
     return st;
 }
 
-/* T9 fix-round-2 (C3, second half): `?2` is spliced into a `LIKE` pattern
- * (`?2 || '/%'`) so that a literal `%` or `_` *inside the source's own
- * path_text* -- which `path_text`'s own `%XX` encoding produces on every
- * escaped byte, so any path containing a space, a non-ASCII byte or another
- * `%` guarantees one -- would otherwise be read as a wildcard rather than a
- * literal character, matching more (or, with `_`, subtly different) rows
- * than the source's own path names. The `ESCAPE '\\'` clause already in the
- * SQL only ever meant "a backslash before a wildcard in the *pattern* is
- * literal"; nothing inserted a backslash into `?2`'s own bound value, so it
- * was inert for exactly the content it needed to guard. Backslash-escapes
- * `\`, `%` and `_` (in that order, so an existing backslash is not
- * double-escaped) before binding. */
+/* T9 fix-round-2 (C3, second half), comment corrected in fix-round-3: `?2` is
+ * spliced into a `LIKE` pattern (`?2 || '/%'`) so that a literal `%` or `_`
+ * *inside the source's own path_text* would otherwise be read as a wildcard
+ * rather than a literal character, matching more (or, with `_`, subtly
+ * different) rows than the source's own path names.
+ *
+ * Round 2's comment overstated how often that literal character occurs: it
+ * claimed "any path containing a space, a non-ASCII byte or another `%`
+ * guarantees" one, but `atlas_codepoint_is_unsafe`
+ * (`src/core/safetext.c:50-75`) does not list a space (0x20 is not `< 0x20`),
+ * and a valid non-ASCII UTF-8 codepoint passes `atlas_text_encode_safe`
+ * verbatim unless it is on that same unsafe list -- neither is escaped, so
+ * neither produces a `%` or `_` on its own. Only three things do: a literal
+ * `%` byte (escaped so the `%XX` encoding stays reversible), a codepoint
+ * `atlas_codepoint_is_unsafe` actually flags (C0/C1 controls, DEL, line and
+ * paragraph separators, the bidi override ranges), or invalid UTF-8 (escaped
+ * byte for byte). The code guards against all three regardless of how often
+ * any one of them occurs; this paragraph is only correcting how wide a net
+ * the justification claimed, which is the sort of sentence a later reader
+ * takes as established without checking.
+ *
+ * The `ESCAPE '\\'` clause already in the SQL only ever meant "a backslash
+ * before a wildcard in the *pattern* is literal"; nothing inserted a
+ * backslash into `?2`'s own bound value, so it was inert for exactly the
+ * content it needed to guard. Backslash-escapes `\`, `%` and `_` (in that
+ * order, so an existing backslash is not double-escaped) before binding. */
 static atlas_status like_escape(const char *raw, atlas_buf *out, atlas_err *err) {
     atlas_buf_reset(out);
     if (raw == NULL) {
@@ -913,28 +927,65 @@ atlas_status atlas_db_memory_dir_hash_mismatch(atlas_db *db, int64_t repo_id, in
     if (db == NULL || path_text == NULL) {
         return atlas_err_set(err, ATLAS_ERR_INTERNAL, "no directory source to check");
     }
-    /* T9 fix-round-1 (C3), corrected in fix-round-2: matched to what
-     * `src/memory/read.c` actually ingests for a `REPO_DIR` source -- one
-     * level below the source's own path, filtered to a literal `.md` name
-     * suffix -- not to a plausible-sounding approximation of it. Round 1
-     * fixed the *depth* (unbounded descent) and added a suffix filter, but
-     * used `LIKE '%.md'`, which SQLite folds ASCII case on by default; a
-     * file named `NOTES.MD` matched this check (`changed_out = true` for
-     * ever, the exact permanent-`SOURCE_REVISION` loop round 1 set out to
-     * close) while `read.c:410-413`'s own `memcmp` against `.md` -- case-
-     * sensitive, no folding -- never ingests it. Two places deciding "is
-     * this a memory file?" with different case rules is the defect, not
-     * only the depth mismatch was. Fixed with `substr(path_text, -3) = '.md'`:
-     * plain `=` on a `TEXT` column with no declared collation is `BINARY` --
-     * SQLite's own default -- so this is exactly `read.c`'s comparison, byte
-     * for byte, and takes no `ESCAPE` clause because it is not a pattern.
+    /* T9 fix-round-1 (C3), corrected in fix-round-2 and again in fix-round-3.
+     * The whole predicate list below answers exactly one question -- "would
+     * `src/memory/read.c` ingest this `files` row as a memory file?" -- and
+     * every clause exists because round 1 or round 2 or round 3 asked that
+     * question in a way this query did not yet agree with. Two places
+     * deciding "is this a memory file?" independently is the recurring
+     * defect; this comment is the running ledger of where they diverged.
      *
-     * "One level below `?2`, no further slash after that" is unchanged:
+     * Depth (round 1): one level below `?2`, no further slash after that --
      * `path_text LIKE ?2 || '/%'` minus `path_text LIKE ?2 || '/%/%'`. `?2`
-     * itself is now escaped by `like_escape` before binding (see its own
+     * itself is escaped by `like_escape` before binding (see its own
      * comment) so a literal `%` or `_` inside the source's own path can no
      * longer act as a wildcard. Still bounded at one more than
-     * `ATLAS_MEMORY_MAX_DIR_ENTRIES` files examined. */
+     * `ATLAS_MEMORY_MAX_DIR_ENTRIES` files examined.
+     *
+     * Suffix case (round 2): `read.c:410-413`'s own `memcmp` against `.md`
+     * is case-sensitive, no folding, so `LIKE '%.md'` -- which SQLite folds
+     * ASCII case on by default -- matched `NOTES.MD` forever
+     * (`changed_out = true` for ever, the permanent-`SOURCE_REVISION` loop
+     * round 1 set out to close) though `read.c` never ingests it. Fixed with
+     * `substr(path_text, -3) = '.md'`: plain `=` on a `TEXT` column with no
+     * declared collation is `BINARY` -- SQLite's own default -- so this is
+     * exactly `read.c`'s comparison, byte for byte, and takes no `ESCAPE`
+     * clause because it is not a pattern.
+     *
+     * Entry type (round 3, doors 1-3): `read.c:414-421`'s listing filter
+     * excludes only `S_ISDIR`, so a symlink, a fifo/socket/device, or a row
+     * a scan could not classify at all reaches `open_fs_file` and is refused
+     * there -- `ATLAS_MEMORY_READ_SYMLINK` for a symlink
+     * (`read.c:129-135`), `ABSENT` for anything else not a regular file
+     * (`read.c:140-146`) -- so none of them is ever given a
+     * `memory_source_versions` row. A real scan still gives each of them a
+     * `files` row: `file_type = 'symlink'` with `content_hash` = the hash of
+     * the link text (A13's own rule, `src/core/scan.c:329-341`),
+     * `file_type = 'other'` for a fifo/socket/device, or `file_type =
+     * 'missing'` for the fourth member of the CHECK'd vocabulary
+     * (`src/db/migrate.c:85`). Without a type filter this query matched all
+     * three and reported a mismatch it could never close. `file_type =
+     * 'regular'` is `read.c`'s own dividing line, restated as a predicate.
+     *
+     * Size bound (round 3, door 4): a `file_type = 'regular'` `.md` file
+     * over `ATLAS_MEMORY_MAX_SOURCE_BYTES` still has a real content hash --
+     * `file_type = 'regular'` alone does not exclude it -- but
+     * `read.c:158-163` refuses it with outcome `TOO_LARGE` and no bytes,
+     * this season's own "a bound that is reached is refused, never
+     * trimmed", so it too is never versioned. `size_bytes <= ?4` restates
+     * that bound; `size_bytes IS NOT NULL AND size_bytes >= 0` excludes a
+     * row this pass cannot even ask the question of, on the same footing --
+     * a row `read.c` cannot be shown to ingest is not evidence of a
+     * mismatch either, exactly the posture `size_bytes IS NULL` already
+     * gets from every other reader of this column.
+     *
+     * Both sides of every one of these comparisons are snapshots taken at
+     * different times: `files.size_bytes` and `files.file_type` are from
+     * the last scan, `read.c` stats and classifies again at read time. A
+     * file that changed kind or crossed the size bound between the two is
+     * judged on stale data for one pass -- convergence, not correctness,
+     * the same posture the rest of this check already has (the case and
+     * depth fixes above carry no re-stat either). Do not add one here. */
     static const char SQL[] =
         "SELECT content_hash FROM files"
         " WHERE repo_id = ?1"
@@ -942,6 +993,10 @@ atlas_status atlas_db_memory_dir_hash_mismatch(atlas_db *db, int64_t repo_id, in
         "   AND path_text NOT LIKE ?2 || '/%/%' ESCAPE '\\'"
         "   AND length(path_text) > 3"
         "   AND substr(path_text, -3) = '.md'"
+        "   AND file_type = 'regular'"
+        "   AND size_bytes IS NOT NULL"
+        "   AND size_bytes >= 0"
+        "   AND size_bytes <= ?4"
         " LIMIT ?3;";
     atlas_buf escaped = ATLAS_BUF_INIT;
     atlas_status st = like_escape(path_text, &escaped, err);
@@ -965,6 +1020,10 @@ atlas_status atlas_db_memory_dir_hash_mismatch(atlas_db *db, int64_t repo_id, in
     if (st == ATLAS_OK && sqlite3_bind_int64(stmt, 3, (int64_t)ATLAS_MEMORY_MAX_DIR_ENTRIES + 1) !=
                               SQLITE_OK) {
         st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the row limit");
+    }
+    if (st == ATLAS_OK &&
+        sqlite3_bind_int64(stmt, 4, (int64_t)ATLAS_MEMORY_MAX_SOURCE_BYTES) != SQLITE_OK) {
+        st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the size bound");
     }
     for (; st == ATLAS_OK;) {
         int rc = sqlite3_step(stmt);

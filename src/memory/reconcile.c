@@ -297,8 +297,15 @@ static atlas_status observe_external_source(atlas_db *db, int64_t repo_id,
  * itself reports no "did this stop early" signal -- `--max-count` simply
  * stops the child process -- so `touched_commit_cb` counts commits itself
  * and reaching the bound is read as "this range could not be fully walked",
- * `bound_hit`'s own meaning. */
-#define TOUCHED_MAX_COMMITS 4096
+ * `bound_hit`'s own meaning.
+ *
+ * T9 fix-round-3 (Minor): this bound moved to
+ * `ATLAS_MEMORY_MAX_TOUCHED_COMMITS` in `include/atlas/limits.h`, beside its
+ * sibling `ATLAS_MEMORY_MAX_TOUCHED_PATHS` -- a file-local #define was the
+ * one bound on this mechanism not living where every other one does,
+ * `docs/extending.md`'s own checklist point, and P0's own shape one size
+ * down (a bound that lives apart from the others is one nobody finds when
+ * they go looking for what this pass costs). */
 
 typedef struct touched_ctx {
     atlas_memory_touched *out;
@@ -412,9 +419,9 @@ static atlas_status observe_touched_paths(atlas_db *db, const atlas_repo_info *r
     tc.out = out;
     tc.commits_seen = 0;
     out->available = true;
-    st = atlas_git_log_since(g, atlas_buf_cstr(&last_head), TOUCHED_MAX_COMMITS, touched_commit_cb,
-                             touched_change_cb, &tc, err);
-    if (st == ATLAS_OK && tc.commits_seen >= TOUCHED_MAX_COMMITS) {
+    st = atlas_git_log_since(g, atlas_buf_cstr(&last_head), ATLAS_MEMORY_MAX_TOUCHED_COMMITS,
+                             touched_commit_cb, touched_change_cb, &tc, err);
+    if (st == ATLAS_OK && tc.commits_seen >= ATLAS_MEMORY_MAX_TOUCHED_COMMITS) {
         /* Reached the cap: cannot tell whether the range held exactly this
          * many commits or more, so it is not provably fully walked. */
         out->bound_hit = true;
@@ -1002,11 +1009,51 @@ static atlas_status classify_candidate(apply_ctx *ctx, const atlas_memory_propos
         return ctx_add_diff(ctx, claim_uid, ATLAS_MEMORY_DIFF_CONTRADICTED, "", err);
     }
     if (check == ATLAS_CHECK_PASS) {
-        /* The brief's own split: IMPACTED when the commit range is what
-         * brought us here (whether or not verifier_input also moved --
-         * SYMBOL+PATH's own case), SUPPORTED when it is not (a
+        /* The brief's own split, and it is positional, not "was this a
+         * COMMIT pass": IMPACTED when *this proposition's own anchor* is
+         * what the commit range touched, SUPPORTED when it is not (a
          * SOURCE_REVISION/DECISION_REVISION pass re-verifying a fact that
-         * changed for a reason other than a commit, and still holds). */
+         * changed for a reason other than a commit, and still holds). T9
+         * fix-round-3 (Minor, filed against round 2's own comment here):
+         * `tests/test_memory_reconcile.c`'s
+         * `test_impacted_is_positional_not_pass_wide` drives both readings
+         * of the *same* claim back to back -- a COMMIT pass whose commit
+         * range excludes this proposition's own anchor (SUPPORTED) and one
+         * whose commit range includes it (IMPACTED) -- against a plain
+         * PATH/CONTENT_HASH claim, the one real verifier whose input can
+         * change independently of `commit_touched`.
+         *
+         * `commit_touched` (set above, this function) is derived only from
+         * `ATLAS_MEMORY_ANCHOR_PATH` anchors -- `atlas_memory_touched`
+         * answers "did the commit range touch this *path*", and a SYMBOL
+         * anchor names no path for it to answer about. A claim anchored to
+         * a SYMBOL alone would, on the same reasoning, report SUPPORTED
+         * rather than IMPACTED when its symbol's underlying file is
+         * rewritten by a commit that is not in its own touched-path check.
+         * That combination has no test here, and not for want of trying:
+         * `ATLAS_VERIFIER_SYMBOL_PRESENT`'s own verifier input is
+         * `symbol=<name>` (`src/memory/extract.c`), a pure function of the
+         * proposition's own immutable text, so for a persisting SYMBOL
+         * anchor it is byte-identical across every remint of the same
+         * bullet. With `commit_touched` false by construction (no PATH
+         * anchor to check) and `verifier_input_changed` therefore false too,
+         * *neither* gate this function tests (:951, :962 above) is ever
+         * true for a SYMBOL-only claim on a real pass, so `evaluate_claim`
+         * -- and with it this whole PASS/FAIL branch -- is never reached for
+         * one. The scenario the finding named is real about the code's
+         * *shape* (the ternary would answer SUPPORTED if it were ever
+         * reached) and not reachable from any proposition this extractor
+         * can produce today; a test forcing it would have to hand-fabricate
+         * a `verify_claims.verifier_input` no real pass could write, which
+         * is the "test that cannot fail for the claimed reason" this same
+         * round's Important finding is about. Deliberate, not a gap:
+         * "the anchor intersects the commit range's changed paths" is a
+         * claim about this proposition's own anchors, and a SYMBOL anchor
+         * intersects no path, so it has nothing to be IMPACTED *by* in this
+         * sense even when a commit is why the pass ran at all. Widening
+         * `commit_touched` to also ask a SYMBOL anchor's own resolved
+         * location would be a real feature, not a comment fix, and is not
+         * this round's business. */
         return ctx_add_diff(ctx, claim_uid,
                             commit_touched ? ATLAS_MEMORY_DIFF_IMPACTED : ATLAS_MEMORY_DIFF_SUPPORTED,
                             "", err);

@@ -733,6 +733,27 @@ atlas_status atlas_db_memory_generation_latest(atlas_db *db, int64_t repo_id, in
     return st;
 }
 
+/* T9 fix-round-1 added `ORDER BY kind, value` here so `compute_decision_set_
+ * digest` (`src/memory/reconcile.c`) folds DECISION tuples in a stable order
+ * -- without it, two runs over the exact same tuple set could concatenate
+ * them in a different order and hash to a different digest with nothing
+ * about a decision having actually moved.
+ *
+ * fix-round-2 (Minor, disclosed rather than silently accepted): a
+ * repository whose `decision_set_digest` was computed and stored *before*
+ * this ordering existed reads a digest built from whatever order SQLite
+ * happened to return then; the first pass after upgrading to this ordering
+ * recomputes the same tuple set in the now-guaranteed order and can get a
+ * *different* digest string for an unchanged decision set, which
+ * `determine_cause` reads as `DECISION_REVISION` once, spuriously. This is
+ * not fixed here: reverting the ordering reopens the flip-flopping risk it
+ * was added to close (a real, unbounded, per-pass risk) in exchange for
+ * avoiding a one-time, self-correcting transition (the stored digest is
+ * stable again from the very next pass, and the spurious cause produces a
+ * real, harmless generation -- not a wrong diff, only an imprecise label
+ * for one pass). Closing it correctly needs the digest format itself to be
+ * versioned so an old digest can be recognised as old, which is a schema
+ * question outside a fix round's four files. */
 atlas_status atlas_db_memory_anchor_distinct(atlas_db *db, int64_t repo_id,
                                              atlas_memory_anchor_tuple_cb cb, void *ctx,
                                              atlas_err *err) {
@@ -854,6 +875,35 @@ atlas_status atlas_db_memory_claim_diff_last_kind(atlas_db *db, int64_t repo_id,
     return st;
 }
 
+/* T9 fix-round-2 (C3, second half): `?2` is spliced into a `LIKE` pattern
+ * (`?2 || '/%'`) so that a literal `%` or `_` *inside the source's own
+ * path_text* -- which `path_text`'s own `%XX` encoding produces on every
+ * escaped byte, so any path containing a space, a non-ASCII byte or another
+ * `%` guarantees one -- would otherwise be read as a wildcard rather than a
+ * literal character, matching more (or, with `_`, subtly different) rows
+ * than the source's own path names. The `ESCAPE '\\'` clause already in the
+ * SQL only ever meant "a backslash before a wildcard in the *pattern* is
+ * literal"; nothing inserted a backslash into `?2`'s own bound value, so it
+ * was inert for exactly the content it needed to guard. Backslash-escapes
+ * `\`, `%` and `_` (in that order, so an existing backslash is not
+ * double-escaped) before binding. */
+static atlas_status like_escape(const char *raw, atlas_buf *out, atlas_err *err) {
+    atlas_buf_reset(out);
+    if (raw == NULL) {
+        return ATLAS_OK;
+    }
+    atlas_status st = ATLAS_OK;
+    for (const unsigned char *p = (const unsigned char *)raw; *p != '\0' && st == ATLAS_OK; p++) {
+        if (*p == '\\' || *p == '%' || *p == '_') {
+            st = atlas_buf_append_ch(out, '\\', err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_buf_append_ch(out, (char)*p, err);
+        }
+    }
+    return st;
+}
+
 atlas_status atlas_db_memory_dir_hash_mismatch(atlas_db *db, int64_t repo_id, int64_t source_id,
                                                const char *path_text, bool *changed_out,
                                                atlas_err *err) {
@@ -863,47 +913,55 @@ atlas_status atlas_db_memory_dir_hash_mismatch(atlas_db *db, int64_t repo_id, in
     if (db == NULL || path_text == NULL) {
         return atlas_err_set(err, ATLAS_ERR_INTERNAL, "no directory source to check");
     }
-    /* T9 fix-round-1 (C3): matched to what `src/memory/read.c` actually
-     * ingests for a `REPO_DIR` source, not to a plausible-sounding
-     * approximation of it -- `readdir` on the source directory itself, no
-     * recursion into any child directory, filtered to a literal `.md` name
-     * suffix. The prior form matched `path_text LIKE ?2 || '/%'` with no
-     * depth or suffix filter, so a `README.txt` (any extension but `.md`) or
-     * any file nested two or more levels down (a subdirectory `read.c` never
-     * descends into) matched, could never gain a `memory_source_versions` row
-     * (T7 never extracts from it), and answered `changed_out = true` for
-     * ever: `atlas_memory_plan_for` reported `SOURCE_REVISION` on every call
-     * and T10's own scheduler would have driven a pass every tick that
-     * appends no generation -- an unbounded no-op loop on the single writer
-     * thread that nothing reports.
+    /* T9 fix-round-1 (C3), corrected in fix-round-2: matched to what
+     * `src/memory/read.c` actually ingests for a `REPO_DIR` source -- one
+     * level below the source's own path, filtered to a literal `.md` name
+     * suffix -- not to a plausible-sounding approximation of it. Round 1
+     * fixed the *depth* (unbounded descent) and added a suffix filter, but
+     * used `LIKE '%.md'`, which SQLite folds ASCII case on by default; a
+     * file named `NOTES.MD` matched this check (`changed_out = true` for
+     * ever, the exact permanent-`SOURCE_REVISION` loop round 1 set out to
+     * close) while `read.c:410-413`'s own `memcmp` against `.md` -- case-
+     * sensitive, no folding -- never ingests it. Two places deciding "is
+     * this a memory file?" with different case rules is the defect, not
+     * only the depth mismatch was. Fixed with `substr(path_text, -3) = '.md'`:
+     * plain `=` on a `TEXT` column with no declared collation is `BINARY` --
+     * SQLite's own default -- so this is exactly `read.c`'s comparison, byte
+     * for byte, and takes no `ESCAPE` clause because it is not a pattern.
      *
-     * "One level below `?2`, no further slash after that" is
-     * `path_text LIKE ?2 || '/%'` minus `path_text LIKE ?2 || '/%/%'`: the
-     * first admits every descendant, the second is every descendant with at
-     * least one slash *after* the first path component below `?2`, and the
-     * difference is exactly the immediate children. `.md` is plain ASCII and
-     * `atlas_text_encode_safe` never escapes a plain ASCII byte, so the
-     * suffix survives `path_text`'s own encoding unchanged and a literal
-     * `LIKE '%.md'` is the right test on the encoded column. Still bounded at
-     * one more than `ATLAS_MEMORY_MAX_DIR_ENTRIES` files examined -- the same
-     * ceiling the pass itself reads a directory source under. */
+     * "One level below `?2`, no further slash after that" is unchanged:
+     * `path_text LIKE ?2 || '/%'` minus `path_text LIKE ?2 || '/%/%'`. `?2`
+     * itself is now escaped by `like_escape` before binding (see its own
+     * comment) so a literal `%` or `_` inside the source's own path can no
+     * longer act as a wildcard. Still bounded at one more than
+     * `ATLAS_MEMORY_MAX_DIR_ENTRIES` files examined. */
     static const char SQL[] =
         "SELECT content_hash FROM files"
         " WHERE repo_id = ?1"
         "   AND path_text LIKE ?2 || '/%' ESCAPE '\\'"
         "   AND path_text NOT LIKE ?2 || '/%/%' ESCAPE '\\'"
-        "   AND path_text LIKE '%.md' ESCAPE '\\'"
+        "   AND length(path_text) > 3"
+        "   AND substr(path_text, -3) = '.md'"
         " LIMIT ?3;";
-    sqlite3_stmt *stmt = NULL;
-    atlas_status st = atlas_db_prepare(db, SQL, &stmt, err);
+    atlas_buf escaped = ATLAS_BUF_INIT;
+    atlas_status st = like_escape(path_text, &escaped, err);
     if (st != ATLAS_OK) {
+        atlas_buf_free(&escaped);
+        return st;
+    }
+    sqlite3_stmt *stmt = NULL;
+    st = atlas_db_prepare(db, SQL, &stmt, err);
+    if (st != ATLAS_OK) {
+        atlas_buf_free(&escaped);
         return st;
     }
     if (sqlite3_bind_int64(stmt, 1, repo_id) != SQLITE_OK) {
         atlas_db_finish(db, stmt);
+        atlas_buf_free(&escaped);
         return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the repository id");
     }
-    st = atlas_db_bind_text_opt(db, stmt, 2, path_text, err);
+    st = atlas_db_bind_text_opt(db, stmt, 2, atlas_buf_cstr(&escaped), err);
+    atlas_buf_free(&escaped);
     if (st == ATLAS_OK && sqlite3_bind_int64(stmt, 3, (int64_t)ATLAS_MEMORY_MAX_DIR_ENTRIES + 1) !=
                               SQLITE_OK) {
         st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the row limit");

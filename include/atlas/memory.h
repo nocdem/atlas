@@ -1037,6 +1037,19 @@ typedef struct atlas_memory_pass_result {
      * terminal or a JSON document must not assume it already is. Left as a
      * stated gap rather than solved this round. */
     char last_obstacle[256];
+    /* Observation, `sources_bound_hit`'s own shape. T9 fix-round-2 (New
+     * Important 3): `atlas_memory_touched.bound_hit` was set at three call
+     * sites in `observe_touched_paths` and read only by
+     * `atlas_memory_touched_contains`, with a comment claiming it is
+     * "reported, never silent" while nothing outside `reconcile.c` could
+     * ever see it -- A8-CI's rule ("every bound that is reached is
+     * reported") stated but not done. True when the pass could not prove
+     * which paths a commit range did *not* touch (the walk's own
+     * `ATLAS_MEMORY_MAX_TOUCHED_PATHS` bound, a stale or unknown recorded
+     * tip, or the repository could not be opened at all) and therefore
+     * treated every `PATH`-anchored claim as conservatively `IMPACTED` this
+     * pass rather than checking each one against the set. */
+    bool touched_bound_hit;
 } atlas_memory_pass_result;
 
 /* Phase 2. Inside the caller's transaction: database work only. Materialises

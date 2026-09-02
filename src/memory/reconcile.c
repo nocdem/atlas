@@ -286,9 +286,32 @@ static atlas_status observe_external_source(atlas_db *db, int64_t repo_id,
  * incremental-history reader, the same one `src/core/reconcile.c` uses for
  * the tracked-file index itself. Runs here, in observe, because both are git
  * work and A1 forbids either inside the write transaction apply holds. */
+/* T9 fix-round-2 (New Important 4): the walk itself was unbounded
+ * (`max_commits = 0`, meaning unlimited -- `atlas_git_log_since`'s own
+ * contract), so a repository with a long history between two memory passes
+ * walked all of it inside the pass whose measured worst case already sits
+ * against a hook's give-up deadline. A commit count is a different
+ * dimension from `ATLAS_MEMORY_MAX_TOUCHED_PATHS` (a single commit can touch
+ * thousands of paths, or thousands of commits can each touch one), so it
+ * gets its own bound rather than reusing that one. `atlas_git_log_since`
+ * itself reports no "did this stop early" signal -- `--max-count` simply
+ * stops the child process -- so `touched_commit_cb` counts commits itself
+ * and reaching the bound is read as "this range could not be fully walked",
+ * `bound_hit`'s own meaning. */
+#define TOUCHED_MAX_COMMITS 4096
+
 typedef struct touched_ctx {
     atlas_memory_touched *out;
+    int64_t commits_seen;
 } touched_ctx;
+
+static atlas_status touched_commit_cb(const atlas_git_commit *c, void *ud, atlas_err *err) {
+    (void)c;
+    (void)err;
+    touched_ctx *tc = ud;
+    tc->commits_seen++;
+    return ATLAS_OK;
+}
 
 static atlas_status touched_add_one(atlas_memory_touched *t, const void *bytes, size_t len,
                                     atlas_err *err) {
@@ -387,8 +410,15 @@ static atlas_status observe_touched_paths(atlas_db *db, const atlas_repo_info *r
 
     touched_ctx tc;
     tc.out = out;
+    tc.commits_seen = 0;
     out->available = true;
-    st = atlas_git_log_since(g, atlas_buf_cstr(&last_head), 0, NULL, touched_change_cb, &tc, err);
+    st = atlas_git_log_since(g, atlas_buf_cstr(&last_head), TOUCHED_MAX_COMMITS, touched_commit_cb,
+                             touched_change_cb, &tc, err);
+    if (st == ATLAS_OK && tc.commits_seen >= TOUCHED_MAX_COMMITS) {
+        /* Reached the cap: cannot tell whether the range held exactly this
+         * many commits or more, so it is not provably fully walked. */
+        out->bound_hit = true;
+    }
     atlas_git_close(g);
     atlas_buf_free(&last_head);
     return st;
@@ -805,17 +835,30 @@ static atlas_status classify_candidate(apply_ctx *ctx, const atlas_memory_propos
         return ctx_add_diff(ctx, claim_uid, ATLAS_MEMORY_DIFF_ADDED, "", err);
     }
 
-    /* `claim_uid` now carries this one (anchors[0].kind, anchors[0].value)
-     * tuple forward from `fc.uid` -- true regardless of which diff kind this
-     * function goes on to choose below, so pruned once, here, rather than
-     * once per branch. Only this one tuple: `fc.uid` may carry other anchors
-     * this candidate does not (a DECISION anchor beside a SYMBOL one, say),
-     * and those are exactly what the vanished-anchor sweep still needs to
-     * see if nothing else confirms them this pass. */
-    st = atlas_db_memory_anchor_prune_one(ctx->db, ctx->repo->id, fc.uid, p->anchors[0].kind,
-                                          atlas_buf_cstr(&p->anchors[0].value), err);
-    if (st != ATLAS_OK) {
-        return st;
+    /* T9 fix-round-1 pruned only `anchors[0]` -- the one tuple used to find
+     * `fc.uid` -- which round 2's I7 flagged as slower, not bounded: a
+     * SYMBOL+PATH bullet's *other* anchor was never pruned even when the
+     * fresh candidate carries it forward unchanged, so a permanently-
+     * reminting-without-vanishing multi-anchor bullet still grew
+     * `memory_claim_anchors` by one row per `COMMIT` pass, for ever, and
+     * every later `find_prior_cb` lookup on that tuple got one row slower.
+     *
+     * Fixed by pruning every one of `fc.uid`'s anchors that `p` itself also
+     * carries -- not only `anchors[0]`. This is safe for the same reason
+     * pruning `anchors[0]` alone was: `claim_uid` already has its own fresh
+     * row for each of `p->anchors[]` (written before this function runs), so
+     * removing `fc.uid`'s copy of the *same* tuple never touches a tuple the
+     * vanished-anchor sweep still needs -- it only ever removes a row this
+     * pass's own extraction just re-confirmed under a new claim uid. An
+     * anchor `fc.uid` had that `p` does *not* (the vanish scenario, a SYMBOL
+     * that stopped resolving) is never in `p->anchors[]` and is therefore
+     * never touched here, exactly as round 1 established. */
+    for (size_t i = 0; i < p->anchor_count; i++) {
+        st = atlas_db_memory_anchor_prune_one(ctx->db, ctx->repo->id, fc.uid, p->anchors[i].kind,
+                                              atlas_buf_cstr(&p->anchors[i].value), err);
+        if (st != ATLAS_OK) {
+            return st;
+        }
     }
 
     atlas_verify_claim prior;
@@ -844,7 +887,24 @@ static atlas_status classify_candidate(apply_ctx *ctx, const atlas_memory_propos
                p->verifier_input.data != NULL ? p->verifier_input.data : "", p->verifier_input.len) ==
             0;
     bool decision_equal = prior.document_id == doc_id && prior.revision_id == rev_id;
-    bool semantics_equal = prior.semantics == p->semantics;
+    /* `semantics` genuinely varies per proposition (Decision 4, from `p`
+     * itself); `domain`, `scope_note` and `environment` are in the content
+     * key (S27) but this file only ever produces the same three literals
+     * for every claim it creates -- `op1.domain = "memory"` unconditionally,
+     * `scope_note`/`environment` never assigned at all
+     * (`emit_candidate`, `reconcile.c`) -- so comparing them against a fresh
+     * proposition's implicit values is a no-op today by construction, not
+     * an oversight left uncompared: there is nothing on `p` to compare
+     * against, because this file never derives either field from a
+     * proposition. Compared anyway, against the literals this file itself
+     * always writes, so a future change that starts varying one of them
+     * here does not silently bypass this function's own remint detection --
+     * round 2's own review flagged the omission twice, and a comparison
+     * against a hardcoded constant is cheaper than leaving it unstated a
+     * third time. */
+    bool metadata_equal = strcmp(atlas_buf_cstr(&prior.domain), "memory") == 0 &&
+                          prior.scope_note.len == 0 && prior.environment.len == 0;
+    bool semantics_equal = prior.semantics == p->semantics && metadata_equal;
 
     if (!decision_equal) {
         /* The revision bound to this claim moved (a `DECISION_REVISION`
@@ -864,17 +924,31 @@ static atlas_status classify_candidate(apply_ctx *ctx, const atlas_memory_propos
      * observe, never here); a PATH anchor found in it means the commit range
      * that produced this remint touched this proposition's own referent,
      * whatever the SYMBOL-derived verifier input says. `available == false`
-     * (no `COMMIT` cause is even possible this pass) leaves `path_touched`
-     * false, so a `SOURCE_REVISION`/`DECISION_REVISION` pass is unaffected. */
-    bool path_touched = false;
-    for (size_t i = 0; i < p->anchor_count && !path_touched; i++) {
+     * (no `COMMIT` cause is even possible this pass) leaves `commit_touched`
+     * false, so a `SOURCE_REVISION`/`DECISION_REVISION` pass is unaffected.
+     *
+     * `commit_touched` is kept apart from `!verifier_input_equal` from here
+     * on, rather than folded into one "something changed" boolean the way
+     * fix-round-1 did (`fact_touched`) -- that folding was an undisclosed
+     * deviation from the brief round 2 caught: the brief's own `IMPACTED`
+     * is "the anchor intersects the commit range's changed paths", not
+     * "evaluate ran and passed for any reason", and round 1's version
+     * answered `IMPACTED` on a plain `SOURCE_REVISION` pass whenever a
+     * `REPO_DIR` child's own content changed on disk with no commit
+     * involved at all -- reachable, untested, and wrong on the brief's own
+     * definition. `SUPPORTED` (the brief: "the stored assessment's
+     * deterministic pass/fail... moved to that state this pass") had no
+     * producer left at all once that folding always chose `IMPACTED`. */
+    bool commit_touched = false;
+    for (size_t i = 0; i < p->anchor_count && !commit_touched; i++) {
         if (p->anchors[i].kind == ATLAS_MEMORY_ANCHOR_PATH) {
-            path_touched = atlas_memory_touched_contains(ctx->touched, atlas_buf_cstr(&p->anchors[i].value));
+            commit_touched =
+                atlas_memory_touched_contains(ctx->touched, atlas_buf_cstr(&p->anchors[i].value));
         }
     }
-    bool fact_touched = !verifier_input_equal || path_touched;
+    bool verifier_input_changed = !verifier_input_equal;
 
-    if (!fact_touched && semantics_equal) {
+    if (!verifier_input_changed && !commit_touched && semantics_equal) {
         /* The item-2 settlement: same proposition, same checkable fact, same
          * classification -- only `basis_commit` moved. A new claim row
          * exists (a head move re-mints unconditionally, T8's own measured
@@ -885,16 +959,28 @@ static atlas_status classify_candidate(apply_ctx *ctx, const atlas_memory_propos
         return ATLAS_OK;
     }
 
-    if (!fact_touched) {
+    if (!verifier_input_changed && !commit_touched) {
         /* Only Decision 4's own classification moved (semantics), with no
-         * mechanical fact to re-check. */
+         * mechanical fact to re-check and no commit range to have touched
+         * anything either. */
         atlas_verify_claim_free(&prior);
         return ctx_add_diff(ctx, claim_uid, ATLAS_MEMORY_DIFF_CHANGED, "", err);
     }
     atlas_verify_claim_free(&prior);
 
     if (p->verifier == ATLAS_VERIFIER_NONE) {
-        return ctx_add_diff(ctx, claim_uid, ATLAS_MEMORY_DIFF_CHANGED, "", err);
+        /* `commit_touched` with no mechanical way to check it is the brief's
+         * own "over the bound, every anchored claim is conservatively
+         * IMPACTED" case generalised: a commit range touching this
+         * proposition's own PATH anchor is `IMPACTED` whether or not there
+         * is a verifier to double-check it, because IMPACTED is a
+         * positional fact about the commit range, not a verification
+         * outcome. `verifier_input_changed` alone (no commit involved) has
+         * nothing mechanical to report and stays CHANGED, unchanged from
+         * round 1. */
+        return ctx_add_diff(ctx, claim_uid,
+                            commit_touched ? ATLAS_MEMORY_DIFF_IMPACTED : ATLAS_MEMORY_DIFF_CHANGED, "",
+                            err);
     }
 
     /* The fresh claim already carries the current input (anchor_resolve just
@@ -916,7 +1002,14 @@ static atlas_status classify_candidate(apply_ctx *ctx, const atlas_memory_propos
         return ctx_add_diff(ctx, claim_uid, ATLAS_MEMORY_DIFF_CONTRADICTED, "", err);
     }
     if (check == ATLAS_CHECK_PASS) {
-        return ctx_add_diff(ctx, claim_uid, ATLAS_MEMORY_DIFF_IMPACTED, "", err);
+        /* The brief's own split: IMPACTED when the commit range is what
+         * brought us here (whether or not verifier_input also moved --
+         * SYMBOL+PATH's own case), SUPPORTED when it is not (a
+         * SOURCE_REVISION/DECISION_REVISION pass re-verifying a fact that
+         * changed for a reason other than a commit, and still holds). */
+        return ctx_add_diff(ctx, claim_uid,
+                            commit_touched ? ATLAS_MEMORY_DIFF_IMPACTED : ATLAS_MEMORY_DIFF_SUPPORTED,
+                            "", err);
     }
     return ctx_add_diff(ctx, claim_uid, ATLAS_MEMORY_DIFF_UNDETERMINED, "", err);
 }
@@ -1680,7 +1773,33 @@ static atlas_status vanish_tuple_cb(atlas_memory_anchor_kind kind, const char *v
      * routed through `classify_candidate` instead of here. Bounded, and
      * measured: before this, `verify_results` grew by one row per pass, per
      * permanently-vanished referent, for ever -- a table `RETENTION[]`
-     * cannot prune. */
+     * cannot prune.
+     *
+     * T9 fix-round-2 (New Important 1): `UNDETERMINED` was in this list in
+     * round 1 and is wrong on a different axis than the one that argument
+     * covers. `CONTRADICTED`/`SUPPORTED`/`STALE` are stable because the
+     * *claim* cannot change without a remint -- but `UNDETERMINED` is not a
+     * fact about the claim at all; it is what `evaluate_claim` returns when
+     * the verifier answered `UNAVAILABLE`, which A9.2.2 defines as
+     * insufficient *coverage* -- an incomplete semantic generation reporting
+     * zero symbols is indistinguishable, from here, from a genuinely deleted
+     * one. The axis that can still move is coverage, not the claim: when the
+     * semantic index finishes catching up, the same vanished-looking anchor
+     * can resolve to a real `CONTRADICTED` or a real drift, and skipping
+     * `evaluate_claim` here would freeze the honest verdict behind the
+     * stale one for ever -- "a state reached because Atlas could not see
+     * something is not a settled answer about the thing," A9.2.2's own
+     * rule, one layer over. Dropped from the skip set rather than gated on a
+     * stored semantic-generation id: `memory_claim_diffs` has no such column
+     * (migration 29) and adding one is a schema change outside this round's
+     * four files. The accepted cost is real and stated rather than hidden:
+     * a claim that stays `UNDETERMINED` because the index never completes is
+     * re-evaluated every pass, for as long as that stays true -- the same
+     * shape of cost the `verify_results` bound above exists to prevent, but
+     * here it cannot be closed without either the coverage the index owes
+     * or a migration, and pretending otherwise would be exactly the "state
+     * reached because Atlas could not look" failure this fix exists to
+     * correct. */
     atlas_memory_diff_kind last_kind = ATLAS_MEMORY_DIFF_UNKNOWN;
     bool last_found = false;
     st = atlas_db_memory_claim_diff_last_kind(ctx->db, ctx->repo->id, fc.uid, &last_kind, &last_found,
@@ -1691,10 +1810,10 @@ static atlas_status vanish_tuple_cb(atlas_memory_anchor_kind kind, const char *v
     }
     if (last_found && (last_kind == ATLAS_MEMORY_DIFF_CONTRADICTED ||
                        last_kind == ATLAS_MEMORY_DIFF_SUPPORTED ||
-                       last_kind == ATLAS_MEMORY_DIFF_UNDETERMINED ||
                        last_kind == ATLAS_MEMORY_DIFF_STALE)) {
         /* Already reported once for this exact vanished condition; nothing
-         * has changed that could change the verdict. */
+         * has changed that could change the verdict. UNDETERMINED is
+         * deliberately absent from this list -- see the comment above. */
         atlas_verify_claim_free(&claim);
         return ATLAS_OK;
     }
@@ -1752,6 +1871,10 @@ atlas_status atlas_memory_apply_in_tx(atlas_db *db, const atlas_repo_info *repo,
                              "place to write its result");
     }
     memset(out, 0, sizeof *out);
+    /* T9 fix-round-2 (New Important 3): reported unconditionally, not only
+     * when a generation is appended -- this is an observation about what the
+     * pass could see, independent of whether anything ended up written. */
+    out->touched_bound_hit = obs->touched.bound_hit;
 
     size_t cap = ATLAS_MEMORY_MAX_SOURCES * ATLAS_MEMORY_MAX_PROPOSITIONS;
     size_t confirmed_cap = cap * ATLAS_MEMORY_MAX_ANCHORS_PER_PROPOSITION;

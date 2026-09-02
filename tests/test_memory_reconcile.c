@@ -28,6 +28,7 @@
 #include "atlas/decision_ops.h"
 #include "atlas/memory.h"
 #include "atlas/mirror.h"
+#include "atlas/pathrep.h"
 #include "atlas/sem.h"
 #include "atlas/sha256.h"
 #include "atlas/syspolicy.h"
@@ -2188,6 +2189,46 @@ static int64_t t9_seed_sem_generation(t8env *e, bool has_symbol, const char *sym
     return gen;
 }
 
+/* fix-round-2, New Important 1's own fixture: an *incomplete* generation --
+ * `tu_failed = 1` makes `sem_state`'s own `units_complete` false
+ * (`src/verify/detverify.c:252-254`), which is what `sem_coverage` folds
+ * into `ATLAS_COVDIM_SEMANTIC_GENERATION`/`GENERATED_SOURCE` being PARTIAL
+ * rather than COMPLETE -- insufficient for `SYMBOL_PRESENT`'s own coverage
+ * requirement (`DIMS_SYMBOL`), so a negative raw result settles
+ * `UNAVAILABLE` (`settle()`) rather than a genuine `FAIL`. No `sem_symbols`
+ * row either way: this is never about whether the symbol is there, only
+ * about whether Atlas could tell. `sem_current` still points at it, so it is
+ * the generation every read in this pass sees. */
+static int64_t t9_seed_incomplete_sem_generation(t8env *e, atlas_err *err) {
+    char sql[1024];
+    (void)snprintf(sql, sizeof sql,
+                  "INSERT INTO repo_index_state(repo_id, generation, last_complete_generation,"
+                  "  last_reconcile_at, last_complete_at, event_gap, pending_full_reconcile)"
+                  "  VALUES(%lld, 1, 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 0, 0)"
+                  "  ON CONFLICT(repo_id) DO UPDATE SET last_complete_generation = 1,"
+                  "    event_gap = 0, pending_full_reconcile = 0;",
+                  (long long)e->repo_id);
+    T_OK(atlas_db_exec_sql(e->db, sql, err), err);
+    (void)snprintf(sql, sizeof sql,
+                  "INSERT INTO sem_generations(repo_id, commit_id, status, started_at, completed_at,"
+                  "  tu_total, tu_complete, tu_partial, tu_failed, tu_unsupported,"
+                  "  analyzer_id, analyzer_version,"
+                  "  scope_discovery, scope_candidates, scope_covered, scope_uncovered,"
+                  "  discovery, input_count)"
+                  "  VALUES(%lld, '%s', 'COMPLETE', '2026-01-01T00:00:00Z', '2026-01-01T00:01:00Z',"
+                  "         2, 1, 0, 1, 0, '%s', %d, 'DECLARED', 2, 1, 1, 'COMPLETE', 2);",
+                  (long long)e->repo_id, e->repo.scanned_head, ATLAS_SEM_ANALYZER_ID,
+                  (int)ATLAS_SEM_ANALYZER_VERSION);
+    T_OK(atlas_db_exec_sql(e->db, sql, err), err);
+    int64_t gen = t8_scalar(e, "SELECT COALESCE(MAX(id), 0) FROM sem_generations;", err);
+    (void)snprintf(sql, sizeof sql,
+                  "INSERT INTO sem_current(repo_id, generation_id) VALUES(%lld, %lld)"
+                  "  ON CONFLICT(repo_id) DO UPDATE SET generation_id = %lld;",
+                  (long long)e->repo_id, (long long)gen, (long long)gen);
+    T_OK(atlas_db_exec_sql(e->db, sql, err), err);
+    return gen;
+}
+
 /* (a) acceptance item 2, the `SOURCE_REVISION` half: editing one `REPO_DIR`
  * child bumps the generation by exactly one with cause `SOURCE_REVISION`,
  * writes a diff row only for the touched claim, and the untouched claim's
@@ -2498,6 +2539,88 @@ static void test_two_propositions_sharing_one_anchor_both_remint_cleanly(void) {
     t8_env_close(&e);
 }
 
+/* fix-round-2, New Important 2: `SUPPORTED`'s own producer, and `IMPACTED`
+ * gated on an actual commit range rather than on "evaluate ran and passed".
+ * Round 1 folded `!verifier_input_equal` and `path_touched` into one
+ * "something changed" boolean and always answered `IMPACTED` once evaluate
+ * ran -- reachable on a plain `SOURCE_REVISION` pass (a `REPO_DIR` child's
+ * own content edited on disk, no commit at all) and untested there, which
+ * is exactly the undisclosed deviation round 2 caught. This edits a PATH-
+ * anchored bullet's own referenced file with no commit in between (matching
+ * test (a)'s own convention: a REPO_FILE reads HEAD's blob and would not see
+ * an uncommitted edit at all) and asserts the cause is SOURCE_REVISION and
+ * the diff kind is SUPPORTED, never IMPACTED. */
+static void test_source_revision_reverification_is_supported_not_impacted(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    t8env e;
+    t8_env_open(&e, &err);
+
+    const char *repo = fx_repo(&e.fx);
+    T_OK(fx_mkdir(repo, "src", &err), &err);
+    T_OK(fx_write(repo, "src/lib.c", "int lib_v1;\n", &err), &err);
+    T_OK(fx_mkdir(repo, ".claude", &err), &err);
+    T_OK(fx_mkdir(repo, ".claude/memories", &err), &err);
+    T_OK(fx_write(repo, ".claude/memories/a.md", "the file `src/lib.c` is present", &err), &err);
+    T_OK(fx_add_all(&e.fx, repo, &err), &err);
+    T_OK(fx_commit(&e.fx, repo, "seed", &err), &err);
+    t8_bind_head(&e, &err);
+    t8_seed_file(&e, "src/lib.c", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", &err);
+    t8_seed_file(&e, ".claude/memories/a.md",
+                "1111111111111111111111111111111111111111111111111111111111111111", &err);
+
+    const char *paths[] = {".claude/memories"};
+    atlas_syspolicy pol;
+    t8_policy(&pol, ATLAS_MEMORY_SOURCE_REPO_DIR, paths, 1);
+
+    atlas_memory_pass_result r1;
+    t8_run_pass(&e, &pol, &r1, &err);
+    T_REQUIRE(r1.generation != 0);
+
+    atlas_buf uid1 = ATLAS_BUF_INIT;
+    t9_claim_uid_for_text(&e, "the file `src/lib.c` is present", &uid1, &err);
+
+    /* No commit: src/lib.c's own content changes on disk (a REPO_DIR child is
+     * read from the working tree, memory.h's own contract), re-indexed as a
+     * real scan would. The bullet's own text is unchanged. */
+    T_OK(fx_write(repo, "src/lib.c", "int lib_v2;\n", &err), &err);
+    t9_update_file_hash(&e, "src/lib.c", "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                        &err);
+
+    atlas_memory_pass_result r2;
+    t8_run_pass(&e, &pol, &r2, &err);
+    T_CHECK_MSG(r2.generation == r1.generation + 1, "expected exactly one generation bump, got %lld "
+               "after %lld",
+               (long long)r2.generation, (long long)r1.generation);
+
+    atlas_buf cause = ATLAS_BUF_INIT;
+    int64_t gen2 = 0;
+    t9_generation_latest(&e, &cause, NULL, &gen2, &err);
+    T_CHECK_MSG(strcmp(atlas_buf_cstr(&cause), "SOURCE_REVISION") == 0,
+               "expected cause SOURCE_REVISION (no commit happened), got %s", atlas_buf_cstr(&cause));
+
+    atlas_buf uid2 = ATLAS_BUF_INIT;
+    t9_claim_uid_for_text(&e, "the file `src/lib.c` is present", &uid2, &err);
+    T_CHECK_MSG(strcmp(atlas_buf_cstr(&uid1), atlas_buf_cstr(&uid2)) != 0,
+               "expected the claim to re-mint: its own verifier_input (the file's content hash) "
+               "changed");
+
+    atlas_buf kind = ATLAS_BUF_INIT;
+    bool found = false;
+    t9_diff_kind_for(&e, gen2, atlas_buf_cstr(&uid2), &kind, NULL, &found, &err);
+    T_CHECK_MSG(found && strcmp(atlas_buf_cstr(&kind), "SUPPORTED") == 0,
+               "expected SUPPORTED (re-verified true, no commit range involved), found=%d kind=%s -- "
+               "IMPACTED here would mean a SOURCE_REVISION pass is reporting as if a commit touched "
+               "it",
+               found, found ? atlas_buf_cstr(&kind) : "(none)");
+
+    atlas_buf_free(&uid1);
+    atlas_buf_free(&uid2);
+    atlas_buf_free(&cause);
+    atlas_buf_free(&kind);
+    t8_env_close(&e);
+}
+
 /* fix-round-1, C2: a bullet naming both a SYMBOL and a PATH gets a `symbol=`
  * verifier input (Decision 4's own precedence, `src/memory/extract.c`),
  * which does not move when the file changes and the symbol does not. Before
@@ -2587,6 +2710,156 @@ static void test_commit_rewrites_file_behind_a_symbol_verifier(void) {
     t8_env_close(&e);
 }
 
+/* fix-round-2, New Important 3: `atlas_memory_touched.bound_hit` had no
+ * field on `atlas_memory_pass_result` and no log, so a comment claiming it
+ * is "reported, never silent" was not true of anything outside
+ * `reconcile.c` itself -- A8-CI's own rule, restated six times this season
+ * according to the review, is that every bound that is reached is reported.
+ * Drives the cheapest reliable trigger for `bound_hit` rather than the
+ * expensive one (a real commit range over
+ * `ATLAS_MEMORY_MAX_TOUCHED_PATHS` distinct paths): a stored `head_commit`
+ * rewritten to a well-formed but nonexistent object id, so
+ * `atlas_git_tip_is_stale` reports `unknown` -- the same "the recorded tip
+ * cannot be trusted" case `src/core/reconcile.c` itself falls back to a full
+ * walk over. */
+static void test_touched_bound_hit_is_reported_on_the_pass_result(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    t8env e;
+    t8_env_open(&e, &err);
+
+    const char *repo = fx_repo(&e.fx);
+    T_OK(fx_write(repo, "note.md", "a plain note with no anchors", &err), &err);
+    T_OK(fx_add_all(&e.fx, repo, &err), &err);
+    T_OK(fx_commit(&e.fx, repo, "seed", &err), &err);
+    t8_bind_head(&e, &err);
+    t8_seed_file(&e, "note.md", "1111111111111111111111111111111111111111111111111111111111111111",
+                &err);
+
+    const char *paths[] = {"note.md"};
+    atlas_syspolicy pol;
+    t8_policy(&pol, ATLAS_MEMORY_SOURCE_REPO_FILE, paths, 1);
+
+    atlas_memory_pass_result r1;
+    t8_run_pass(&e, &pol, &r1, &err);
+    T_REQUIRE(r1.generation != 0);
+    T_CHECK_MSG(!r1.touched_bound_hit, "expected no bound hit on the very first generation");
+
+    char sql[256];
+    (void)snprintf(sql, sizeof sql,
+                  "UPDATE memory_generations SET head_commit ="
+                  " 'ffffffffffffffffffffffffffffffffffffff' WHERE repo_id = %lld;",
+                  (long long)e.repo_id);
+    T_OK(atlas_db_exec_sql(e.db, sql, &err), &err);
+
+    T_OK(fx_write(repo, "unrelated.c", "int x;\n", &err), &err);
+    T_OK(fx_add_all(&e.fx, repo, &err), &err);
+    T_OK(fx_commit(&e.fx, repo, "unrelated", &err), &err);
+    t8_bind_head(&e, &err);
+    t8_seed_file(&e, "unrelated.c", "2222222222222222222222222222222222222222222222222222222222222222",
+                &err);
+
+    atlas_memory_pass_result r2;
+    t8_run_pass(&e, &pol, &r2, &err);
+    T_CHECK_MSG(r2.touched_bound_hit,
+               "expected a reported bound hit: the recorded tip does not exist, so the pass could "
+               "not prove which paths a commit range did not touch");
+
+    t8_env_close(&e);
+}
+
+/* fix-round-2, I7, measured: a SYMBOL+PATH bullet re-minting on every
+ * `COMMIT`-caused pass without either anchor ever vanishing used to leave
+ * one orphaned `memory_claim_anchors` row per pass -- round 1 pruned only
+ * `anchors[0]` (whichever tuple happened to be the lookup key), so the
+ * *other* anchor's row from every prior claim uid stayed forever. Five
+ * further unrelated commits, each re-minting the claim, and the row count
+ * for its own SYMBOL and PATH tuples must stay at exactly one each --
+ * `memory_claim_anchors` is never growing merely because time (and commits)
+ * are passing. */
+static void test_multi_anchor_reminting_does_not_grow_memory_claim_anchors(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    t8env e;
+    t8_env_open(&e, &err);
+
+    const char *repo = fx_repo(&e.fx);
+    T_OK(fx_mkdir(repo, "src", &err), &err);
+    T_OK(fx_write(repo, "src/hash.c", "int compute_hash(void) { return 1; }\n", &err), &err);
+    T_OK(fx_write(repo, "note.md", "the function `compute_hash` in `src/hash.c` is correct", &err),
+         &err);
+    T_OK(fx_add_all(&e.fx, repo, &err), &err);
+    T_OK(fx_commit(&e.fx, repo, "seed", &err), &err);
+    t8_bind_head(&e, &err);
+    t8_seed_file(&e, "src/hash.c", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", &err);
+    t8_seed_file(&e, "note.md", "1111111111111111111111111111111111111111111111111111111111111111",
+                &err);
+    (void)t9_seed_sem_generation(&e, true, "c:@F@compute_hash", "compute_hash", &err);
+
+    const char *paths[] = {"note.md"};
+    atlas_syspolicy pol;
+    t8_policy(&pol, ATLAS_MEMORY_SOURCE_REPO_FILE, paths, 1);
+
+    atlas_memory_pass_result r1;
+    t8_run_pass(&e, &pol, &r1, &err);
+    T_REQUIRE(r1.generation != 0);
+
+    char count_sql[512];
+    (void)snprintf(count_sql, sizeof count_sql,
+                  "SELECT COUNT(*) FROM memory_claim_anchors"
+                  " WHERE repo_id = %lld AND kind = 'SYMBOL' AND value = 'compute_hash';",
+                  (long long)e.repo_id);
+    T_CHECK_MSG(t8_scalar(&e, count_sql, &err) == 1, "expected exactly one SYMBOL anchor row "
+               "after the first pass");
+    (void)snprintf(count_sql, sizeof count_sql,
+                  "SELECT COUNT(*) FROM memory_claim_anchors"
+                  " WHERE repo_id = %lld AND kind = 'PATH' AND value = 'src/hash.c';",
+                  (long long)e.repo_id);
+    T_CHECK_MSG(t8_scalar(&e, count_sql, &err) == 1, "expected exactly one PATH anchor row "
+               "after the first pass");
+
+    for (int i = 0; i < 5; i++) {
+        char fname[32];
+        (void)snprintf(fname, sizeof fname, "unrelated%d.c", i);
+        char body[64];
+        (void)snprintf(body, sizeof body, "int u%d;\n", i);
+        T_OK(fx_write(repo, fname, body, &err), &err);
+        T_OK(fx_add_all(&e.fx, repo, &err), &err);
+        T_OK(fx_commit(&e.fx, repo, "unrelated", &err), &err);
+        t8_bind_head(&e, &err);
+        char h[ATLAS_SHA256_HEX_LEN + 1u];
+        atlas_sha256_hex(body, strlen(body), h);
+        t8_seed_file(&e, fname, h, &err);
+
+        atlas_memory_pass_result rn;
+        t8_run_pass(&e, &pol, &rn, &err);
+        (void)rn;
+    }
+
+    (void)snprintf(count_sql, sizeof count_sql,
+                  "SELECT COUNT(*) FROM memory_claim_anchors"
+                  " WHERE repo_id = %lld AND kind = 'SYMBOL' AND value = 'compute_hash';",
+                  (long long)e.repo_id);
+    int64_t symbol_rows = t8_scalar(&e, count_sql, &err);
+    (void)snprintf(count_sql, sizeof count_sql,
+                  "SELECT COUNT(*) FROM memory_claim_anchors"
+                  " WHERE repo_id = %lld AND kind = 'PATH' AND value = 'src/hash.c';",
+                  (long long)e.repo_id);
+    int64_t path_rows = t8_scalar(&e, count_sql, &err);
+
+    atlas_test_note("I7 bound observed: 5 further unrelated-commit remints of one SYMBOL+PATH "
+                    "bullet left %lld SYMBOL row(s) and %lld PATH row(s) for its own anchors -- "
+                    "the fix-round-2 bound is exactly one each, regardless of how many further "
+                    "re-mints happen.",
+                    (long long)symbol_rows, (long long)path_rows);
+    T_CHECK_MSG(symbol_rows == 1, "expected the SYMBOL anchor row count to stay at 1, got %lld",
+               (long long)symbol_rows);
+    T_CHECK_MSG(path_rows == 1, "expected the PATH anchor row count to stay at 1, got %lld",
+               (long long)path_rows);
+
+    t8_env_close(&e);
+}
+
 /* (c) approving a decision revision, with nothing else changed, is what the
  * next pass's cause reports. */
 static void test_decision_revision_approval_is_the_cause(void) {
@@ -2672,20 +2945,34 @@ static void test_drift_conflict_leaves_the_decision_untouched(void) {
     t8env e;
     t8_env_open(&e, &err);
 
-    /* An observation, not an assertion: whether a policy is installed at
-     * `ATLAS_VERIFYPOLICY_PATH` is a fact about this machine, not an
-     * invariant this test's own fixture controls (a fresh checkout with no
-     * A9.2 deployment step run has no file there at all), so a missing or
-     * disabled one here is not this test's failure -- but a present one
-     * changes what the assertions below actually establish, and that is
-     * worth a caller's own eyes rather than a silent assumption either way. */
+    /* fix-round-2 (I4's "also fold in"): required, not observed. A test that
+     * only reports what it found proves nothing on a different machine --
+     * this project's own deployment installs this exact root-owned policy,
+     * and the assertion below is what makes that a checked contract of this
+     * test rather than an assumption a reader has to trust the comment
+     * about. Both the state *and* the outcome are asserted: `state ==
+     * ENABLED` and `policy_id` is the exact deployed policy, then
+     * `atlas_verifypolicy_find` -- the real function `atlas_verify_
+     * intake_apply_in_tx` consults, not a re-reading of the `allow =` line
+     * as text -- confirms the policy covers `OBLIGATION` and does not cover
+     * `DECISION`, which is the actual reason this test's document stays out
+     * of its reach. */
     atlas_verifypolicy real_policy;
     atlas_verifypolicy_load(&real_policy);
-    atlas_test_note("verification policy at the compiled-in path: state=%d reason=%s policy_id=%s -- "
-                    "ENABLED means this test's refusal is proven under a real active policy, not "
-                    "merely in the absence of one",
-                    (int)real_policy.state, atlas_verifypolicy_reason_name(real_policy.reason),
-                    real_policy.state == ATLAS_VERIFYPOLICY_ENABLED ? real_policy.policy_id : "(n/a)");
+    T_REQUIRE_MSG(real_policy.state == ATLAS_VERIFYPOLICY_ENABLED,
+                 "this test requires the real, root-owned verification policy this project "
+                 "deploys; found state=%d reason=%s instead",
+                 (int)real_policy.state, atlas_verifypolicy_reason_name(real_policy.reason));
+    T_REQUIRE_MSG(strcmp(real_policy.policy_id, "atlas-a92-obligation-remediation-v1") == 0,
+                 "expected the deployed obligation-remediation policy, got policy_id=%s",
+                 real_policy.policy_id);
+    T_CHECK_MSG(atlas_verifypolicy_find(&real_policy, ATLAS_DECISION_KIND_OBLIGATION,
+                                        ATLAS_DECISION_APPROVED, ATLAS_DECISION_RESOLVED) != NULL,
+               "expected the deployed policy to cover OBLIGATION APPROVED->RESOLVED");
+    T_CHECK_MSG(atlas_verifypolicy_find(&real_policy, ATLAS_DECISION_KIND_DECISION,
+                                        ATLAS_DECISION_APPROVED, ATLAS_DECISION_RESOLVED) == NULL,
+               "expected the deployed policy to NOT cover DECISION APPROVED->RESOLVED -- this is "
+               "the actual reason this test's document stays outside its reach");
 
     atlas_buf doc_uid = ATLAS_BUF_INIT;
     t9_propose(&e, "compute_hash must exist", &doc_uid, &err);
@@ -2855,6 +3142,104 @@ static void test_vanish_sweep_evaluate_cost_is_bounded_across_repeated_passes(vo
     t8_env_close(&e);
 }
 
+/* fix-round-2, New Important 1: a verdict reached because Atlas could not
+ * look must not freeze. An incomplete semantic generation reports zero
+ * symbols exactly like a genuinely deleted one, so the vanish sweep's
+ * `still_valid` check cannot tell them apart on its own -- `evaluate_claim`
+ * is what tells them apart, by settling `UNAVAILABLE` rather than `FAIL`
+ * when coverage is insufficient (A9.2.2). Round 1 put `UNDETERMINED` in the
+ * sweep's own skip set alongside the genuinely stable kinds, so once a claim
+ * settled `UNDETERMINED` it was never re-evaluated again -- even after the
+ * index caught up and the honest verdict became `CONTRADICTED`. This drives
+ * exactly that sequence: incomplete coverage settles `UNDETERMINED`; the
+ * *same* incomplete generation on a second pass produces no new row (the
+ * verdict has not changed, and the ordinary last-kind dedup still applies);
+ * coverage then completes over a genuinely absent symbol, and the claim
+ * reopens to `CONTRADICTED`. */
+static void test_undetermined_reopens_once_coverage_completes(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    t8env e;
+    t8_env_open(&e, &err);
+
+    atlas_buf doc_uid = ATLAS_BUF_INIT;
+    t9_propose(&e, "compute_hash must exist", &doc_uid, &err);
+    t9_approve(&e, atlas_buf_cstr(&doc_uid), 1, &err);
+
+    const char *repo = fx_repo(&e.fx);
+    char bullet[256];
+    (void)snprintf(bullet, sizeof bullet, "the function `compute_hash` implements decision %s",
+                  atlas_buf_cstr(&doc_uid));
+    T_OK(fx_write(repo, "note.md", bullet, &err), &err);
+    T_OK(fx_add_all(&e.fx, repo, &err), &err);
+    T_OK(fx_commit(&e.fx, repo, "seed", &err), &err);
+    t8_bind_head(&e, &err);
+    t8_seed_file(&e, "note.md", "1111111111111111111111111111111111111111111111111111111111111111",
+                &err);
+    (void)t9_seed_sem_generation(&e, true, "c:@F@compute_hash", "compute_hash", &err);
+
+    const char *paths[] = {"note.md"};
+    atlas_syspolicy pol;
+    t8_policy(&pol, ATLAS_MEMORY_SOURCE_REPO_FILE, paths, 1);
+
+    atlas_memory_pass_result r1;
+    t8_run_pass(&e, &pol, &r1, &err);
+    T_REQUIRE(r1.generation != 0);
+
+    atlas_buf claim_uid = ATLAS_BUF_INIT;
+    t9_claim_uid_for_text(&e, bullet, &claim_uid, &err);
+
+    /* The index starts rebuilding and has not finished: zero symbols, same
+     * as a real deletion, but coverage says Atlas cannot conclude that yet. */
+    (void)t9_seed_incomplete_sem_generation(&e, &err);
+
+    atlas_memory_pass_result r2;
+    t8_run_pass(&e, &pol, &r2, &err);
+    T_CHECK_MSG(r2.generation == r1.generation + 1, "expected a generation for the first UNDETERMINED "
+               "verdict");
+
+    atlas_buf kind1 = ATLAS_BUF_INIT;
+    bool found1 = false;
+    t9_diff_kind_for(&e, r2.generation, atlas_buf_cstr(&claim_uid), &kind1, NULL, &found1, &err);
+    T_CHECK_MSG(found1 && strcmp(atlas_buf_cstr(&kind1), "UNDETERMINED") == 0,
+               "expected UNDETERMINED while coverage is incomplete, found=%d kind=%s", found1,
+               found1 ? atlas_buf_cstr(&kind1) : "(none)");
+
+    /* Same incomplete generation, nothing else changes: re-evaluated (round-2
+     * fix), but the verdict is unchanged, so no new row -- the ordinary
+     * last-kind dedup, not the removed skip-set entry. */
+    atlas_memory_pass_result r3;
+    t8_run_pass(&e, &pol, &r3, &err);
+    bool r3_has_row = false;
+    if (r3.generation != 0) {
+        t9_diff_kind_for(&e, r3.generation, atlas_buf_cstr(&claim_uid), NULL, NULL, &r3_has_row, &err);
+    }
+    T_CHECK_MSG(!r3_has_row, "an unchanged UNDETERMINED verdict must not re-emit a duplicate row");
+
+    /* Coverage completes, over a source that genuinely no longer has the
+     * symbol -- the honest verdict the incomplete look could not give. */
+    (void)t9_seed_sem_generation(&e, false, NULL, NULL, &err);
+
+    atlas_memory_pass_result r4;
+    t8_run_pass(&e, &pol, &r4, &err);
+    T_CHECK_MSG(r4.generation != 0, "expected a generation once coverage completes and the verdict "
+               "changes");
+
+    atlas_buf kind2 = ATLAS_BUF_INIT;
+    bool found2 = false;
+    t9_diff_kind_for(&e, r4.generation, atlas_buf_cstr(&claim_uid), &kind2, NULL, &found2, &err);
+    T_CHECK_MSG(found2 && strcmp(atlas_buf_cstr(&kind2), "CONTRADICTED") == 0,
+               "expected the UNDETERMINED claim to reopen to CONTRADICTED once coverage completed "
+               "over a genuinely absent symbol, found=%d kind=%s", found2,
+               found2 ? atlas_buf_cstr(&kind2) : "(none)");
+
+    atlas_buf_free(&claim_uid);
+    atlas_buf_free(&kind1);
+    atlas_buf_free(&kind2);
+    atlas_buf_free(&doc_uid);
+    t8_env_close(&e);
+}
+
 /* (e) acceptance item 4's first half: for a tracked source, re-reading the
  * stored `blob_oid` through `git cat-file` reproduces the stored
  * `content_sha256`. */
@@ -3002,6 +3387,158 @@ static void test_plan_for_answers_the_right_cause_before_the_pass(void) {
     t8_env_close(&e);
 }
 
+/* fix-round-2, C3: `atlas_db_memory_dir_hash_mismatch` used `LIKE '%.md'`,
+ * which SQLite case-folds over ASCII by default, while `src/memory/read.c`'s
+ * own suffix check (`memcmp`) does not. A file named `NOTES.MD` -- indexed
+ * by a real scan, so it has a `files` row and a `content_hash`, but never
+ * read as a memory file by `read.c` and so never given a
+ * `memory_source_versions` row -- matched the mismatch check and answered
+ * `changed_out = true` for ever, exactly the permanent-`SOURCE_REVISION`
+ * loop round 1 set out to close, reopened by a second place deciding "is
+ * this a memory file?" with a different case rule. */
+static void test_dir_hash_mismatch_matches_read_c_exactly(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    t8env e;
+    t8_env_open(&e, &err);
+
+    const char *repo = fx_repo(&e.fx);
+    T_OK(fx_mkdir(repo, ".claude", &err), &err);
+    T_OK(fx_mkdir(repo, ".claude/memories", &err), &err);
+    T_OK(fx_mkdir(repo, ".claude/memories/sub", &err), &err);
+    const char *note1 = "a plain note with no anchors";
+    T_OK(fx_write(repo, ".claude/memories/a.md", note1, &err), &err);
+    T_OK(fx_add_all(&e.fx, repo, &err), &err);
+    T_OK(fx_commit(&e.fx, repo, "seed", &err), &err);
+    t8_bind_head(&e, &err);
+    char hash1[ATLAS_SHA256_HEX_LEN + 1u];
+    atlas_sha256_hex(note1, strlen(note1), hash1);
+    t8_seed_file(&e, ".claude/memories/a.md", hash1, &err);
+
+    const char *paths[] = {".claude/memories"};
+    atlas_syspolicy pol;
+    t8_policy(&pol, ATLAS_MEMORY_SOURCE_REPO_DIR, paths, 1);
+
+    atlas_memory_pass_result r1;
+    t8_run_pass(&e, &pol, &r1, &err);
+    T_REQUIRE(r1.generation != 0);
+
+    atlas_memory_gen_cause cause = ATLAS_MEMORY_CAUSE_UNKNOWN;
+    T_OK(atlas_memory_plan_for(e.db, &e.repo, &pol, &cause, &err), &err);
+    T_CHECK_MSG(cause == ATLAS_MEMORY_CAUSE_UNKNOWN,
+               "expected nothing owed right after reconciling, got %s",
+               atlas_memory_gen_cause_name(cause));
+
+    /* Indexed by a real scan (a files row, a content hash) but never a
+     * memory file by read.c's own rule: wrong case, and one level too deep. */
+    T_OK(fx_write(repo, ".claude/memories/NOTES.MD", "uppercase suffix, never ingested", &err), &err);
+    T_OK(fx_write(repo, ".claude/memories/sub/deep.md", "one level too deep, never ingested", &err),
+         &err);
+    char hash_upper[ATLAS_SHA256_HEX_LEN + 1u];
+    atlas_sha256_hex("uppercase suffix, never ingested", strlen("uppercase suffix, never ingested"),
+                     hash_upper);
+    char hash_deep[ATLAS_SHA256_HEX_LEN + 1u];
+    atlas_sha256_hex("one level too deep, never ingested", strlen("one level too deep, never ingested"),
+                     hash_deep);
+    t8_seed_file(&e, ".claude/memories/NOTES.MD", hash_upper, &err);
+    t8_seed_file(&e, ".claude/memories/sub/deep.md", hash_deep, &err);
+
+    cause = ATLAS_MEMORY_CAUSE_UNKNOWN;
+    T_OK(atlas_memory_plan_for(e.db, &e.repo, &pol, &cause, &err), &err);
+    T_CHECK_MSG(cause == ATLAS_MEMORY_CAUSE_UNKNOWN,
+               "an uppercase-suffixed or too-deep file (neither ever ingested by read.c) must not "
+               "read as an owed SOURCE_REVISION, got %s",
+               atlas_memory_gen_cause_name(cause));
+
+    /* A real, matching change is still detected: read.c would ingest this
+     * one, so its mismatch must still be seen. */
+    const char *note2 = "an edited note with no anchors";
+    T_OK(fx_write(repo, ".claude/memories/a.md", note2, &err), &err);
+    char hash2[ATLAS_SHA256_HEX_LEN + 1u];
+    atlas_sha256_hex(note2, strlen(note2), hash2);
+    t9_update_file_hash(&e, ".claude/memories/a.md", hash2, &err);
+
+    cause = ATLAS_MEMORY_CAUSE_UNKNOWN;
+    T_OK(atlas_memory_plan_for(e.db, &e.repo, &pol, &cause, &err), &err);
+    T_CHECK_MSG(cause == ATLAS_MEMORY_CAUSE_SOURCE_REVISION,
+               "a genuine one-level .md edit must still be detected, got %s",
+               atlas_memory_gen_cause_name(cause));
+
+    t8_env_close(&e);
+}
+
+/* fix-round-2, C3's other half: `?2` (the source's own path_text) is spliced
+ * directly into a `LIKE` pattern, so a literal `%` or `_` inside it would
+ * act as a wildcard rather than a literal character unless escaped first.
+ * Driven directly against `atlas_db_memory_dir_hash_mismatch` with a real
+ * `%XX`-encoded `path_text` (`atlas_path_text_encode`, matching what
+ * `atlas_memory_plan_for` itself feeds this function; `t8_seed_file`'s own
+ * raw-passthrough convention does not encode, so this test builds its
+ * `files` row directly rather than through that helper) — a raw `%` byte in
+ * the source directory's own name encodes to the literal three characters
+ * `%25`, which is exactly the escaping this round's fix has to survive. */
+static void test_dir_hash_mismatch_escapes_a_literal_percent_in_its_own_path(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    t8env e;
+    t8_env_open(&e, &err);
+
+    atlas_buf dir_encoded = ATLAS_BUF_INIT;
+    T_OK(atlas_path_text_encode(".claude/mem%o", strlen(".claude/mem%o"), &dir_encoded, &err), &err);
+    atlas_buf child_encoded = ATLAS_BUF_INIT;
+    T_OK(atlas_path_text_encode(".claude/mem%o/a.md", strlen(".claude/mem%o/a.md"), &child_encoded,
+                                &err),
+         &err);
+
+    int64_t source_id = 0;
+    T_OK(atlas_db_memory_source_upsert(e.db, e.repo_id, ATLAS_MEMORY_SOURCE_REPO_DIR, ".claude/mem%o",
+                                       strlen(".claude/mem%o"), atlas_buf_cstr(&dir_encoded),
+                                       "2026-01-01T00:00:00Z", &source_id, NULL, &err),
+         &err);
+
+    atlas_buf sql = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_appendf(&sql, &err,
+                           "INSERT INTO scans(repo_id, started_at, status)"
+                           "  VALUES(%lld, '2026-01-01T00:00:00Z', 'ok');"
+                           "INSERT INTO files(repo_id, path_raw, path_text, file_type,"
+                           "  content_hash, first_seen_scan_id, last_seen_scan_id,"
+                           "  first_seen_at, last_seen_at)"
+                           "  VALUES(%lld, CAST('%s' AS BLOB), '%s', 'regular',"
+                           "         '1111111111111111111111111111111111111111111111111111111111111111',"
+                           "         last_insert_rowid(), last_insert_rowid(),"
+                           "         '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');",
+                           (long long)e.repo_id, (long long)e.repo_id, atlas_buf_cstr(&child_encoded),
+                           atlas_buf_cstr(&child_encoded)),
+         &err);
+    T_OK(atlas_db_exec_sql(e.db, atlas_buf_cstr(&sql), &err), &err);
+    atlas_buf_free(&sql);
+
+    bool changed = true;
+    T_OK(atlas_db_memory_dir_hash_mismatch(e.db, e.repo_id, source_id, atlas_buf_cstr(&dir_encoded),
+                                           &changed, &err),
+         &err);
+    T_CHECK_MSG(changed,
+               "expected a mismatch: the file has no memory_source_versions row and none was "
+               "recorded");
+
+    T_OK(atlas_db_memory_version_insert(
+             e.db, source_id, "", "",
+             "1111111111111111111111111111111111111111111111111111111111111111", 1, "x", 1,
+             "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", (int64_t)geteuid(), NULL, NULL, &err),
+         &err);
+    changed = true;
+    T_OK(atlas_db_memory_dir_hash_mismatch(e.db, e.repo_id, source_id, atlas_buf_cstr(&dir_encoded),
+                                           &changed, &err),
+         &err);
+    T_CHECK_MSG(!changed,
+               "expected no mismatch once the version is recorded -- a literal '%%' (encoded '%%25') "
+               "in the source's own path must not act as a wildcard and pull in an unrelated row");
+
+    atlas_buf_free(&dir_encoded);
+    atlas_buf_free(&child_encoded);
+    t8_env_close(&e);
+}
+
 static const atlas_test TESTS[] = {
     {"REPO_FILE reads tracked bytes", test_repo_file_reads_tracked_bytes},
     {"REPO_FILE missing path is ABSENT", test_repo_file_missing_path_is_absent},
@@ -3053,18 +3590,30 @@ static const atlas_test TESTS[] = {
      test_commit_impacts_only_its_anchored_claim},
     {"C1: two propositions sharing one anchor both re-mint cleanly",
      test_two_propositions_sharing_one_anchor_both_remint_cleanly},
+    {"New Important 2: a SOURCE_REVISION re-verification is SUPPORTED, not IMPACTED",
+     test_source_revision_reverification_is_supported_not_impacted},
     {"C2: a commit behind a SYMBOL verifier still produces a diff row",
      test_commit_rewrites_file_behind_a_symbol_verifier},
+    {"New Important 3: touched_bound_hit is reported on the pass result",
+     test_touched_bound_hit_is_reported_on_the_pass_result},
+    {"I7: multi-anchor reminting does not grow memory_claim_anchors",
+     test_multi_anchor_reminting_does_not_grow_memory_claim_anchors},
     {"a decision revision's approval is the pass's cause",
      test_decision_revision_approval_is_the_cause},
     {"item 3: drift is an IMPLEMENTATION conflict and leaves the decision untouched",
      test_drift_conflict_leaves_the_decision_untouched},
     {"the vanish sweep's EVALUATE cost is bounded across repeated passes",
      test_vanish_sweep_evaluate_cost_is_bounded_across_repeated_passes},
+    {"New Important 1: UNDETERMINED reopens once coverage completes",
+     test_undetermined_reopens_once_coverage_completes},
     {"item 4: git cat-file on the stored blob_oid matches content_sha256",
      test_rebuild_from_git_blob_matches_stored_hash},
     {"plan_for answers the right cause before the pass runs",
      test_plan_for_answers_the_right_cause_before_the_pass},
+    {"C3: dir_hash_mismatch matches read.c's own case rule and pattern-escapes its path",
+     test_dir_hash_mismatch_matches_read_c_exactly},
+    {"C3: dir_hash_mismatch escapes a literal '%' in its own path",
+     test_dir_hash_mismatch_escapes_a_literal_percent_in_its_own_path},
 };
 
 ATLAS_TEST_MAIN("memory_reconcile", TESTS)

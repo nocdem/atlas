@@ -1543,3 +1543,51 @@ says so, adding a separate depth-aware form for callers that nest. The first is 
 faithful to `begin`/`commit`; the second is more honest about what today's callers want.
 **What must not happen is a caller building isolation on top of it without knowing**,
 which is exactly what T8 did.
+
+## A `REPO_DIR` memory source records which bytes were read and never which file they came from (2026-09-02)
+
+Found by A12.1's T9 while withdrawing a safety argument that rested on counting rows, and
+verified in the schema. It is the same root cause as that argument's failure, one layer
+down.
+
+**`memory_source_versions` has no `rel_path` column** — `src/db/migrate.c:4347-4367`. A
+version row carries `source_id`, `content_sha256`, `content_bytes`, the git binding where
+there is one, and the bytes otherwise. Its uniqueness is
+`UNIQUE(source_id, content_sha256, observed_at)`. For a `REPO_FILE` source that is
+complete, because the source *is* the file. For a `REPO_DIR` source, whose children
+`src/memory/read.c` lists and reads one by one, the file each version came from is not
+recorded anywhere: `memory_unanchored` references `source_version_id`
+(`migrate.c:4414-4415`), so a proposition can be traced back to bytes and stops there.
+
+**Three consequences follow, and each is checkable rather than argued.**
+
+1. **Two children with identical content are one version row.** The uniqueness key has no
+   path in it, so a directory of N files holds at most as many versions as it has distinct
+   contents. Two empty `.md` files are one row.
+2. **`atlas_db_memory_dir_hash_mismatch` cannot see a change that permutes content among
+   children.** It asks, per indexed row, whether *some* version exists for that row's
+   content hash (`atlas_db_memory_version_exists`, `src/db/db_memory.c:256-293`, matching
+   `(source_id, content_sha256)`). Swap the contents of two children and every hash is
+   still present, so `changed_out` is false while the directory has genuinely changed.
+3. **The same keying is why that function's `LIMIT` cannot be argued safe by counting.**
+   A12.1's round 4 wrote a pigeonhole argument at the `LIMIT` — at most 64 rows are ever
+   versioned, so a 65th must be unversioned — and it fails on this and on the version
+   table being cumulative. `cp a.md a-copy.md` in a 64-file source is the whole repro. The
+   argument was withdrawn in round 5; the keying it rested on is this entry.
+
+**What is not established, and must not be assumed either way.** Whether this is a defect
+or the design working is genuinely open. The deliberate reading is defensible — a memory
+source is a body of knowledge, and the same sentence in two files is one fact, which is
+exactly the posture `verify_claims`' content key already takes for one proposition stated
+twice. The reading that makes it a defect is that `read.c` lists children individually,
+bounds them individually (`ATLAS_MEMORY_MAX_DIR_ENTRIES`), and reports obstacles per item,
+so every *other* layer treats a child as a thing — and provenance that stops at bytes
+cannot answer "which file said this", which is the first question anybody asks of a claim
+they disagree with.
+
+**Candidate fixes, none implemented.** If a child is meant to be identifiable: add
+`rel_path` to `memory_source_versions` and to its uniqueness, which is a migration and
+changes what a re-read of an unchanged directory costs. If it is not: say so at the table,
+because three call sites currently read as though a version had a file. Either way,
+consequence 2 should be stated where `dir_hash_mismatch` is documented rather than left
+for the next person to construct.

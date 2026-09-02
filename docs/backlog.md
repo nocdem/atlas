@@ -1591,3 +1591,48 @@ changes what a re-read of an unchanged directory costs. If it is not: say so at 
 because three call sites currently read as though a version had a file. Either way,
 consequence 2 should be stated where `dir_hash_mismatch` is documented rather than left
 for the next person to construct.
+
+## Nothing prunes a claim's anchors, so `memory_claim_anchors` only grows (2026-09-02)
+
+Found by A12.1's T12 fix re-review while correcting a mechanism three of us had asserted
+wrongly, and verified in the tree.
+
+**The only deleter is `atlas_db_memory_anchor_prune_one`** (`src/db/db_memory.c:642`), it
+has **one caller** (`src/memory/reconcile.c:864`), and that caller prunes only the
+*predecessor* claim's anchors when a proposition is re-minted onto a new uid. Nothing
+prunes the anchors of a claim that keeps its uid.
+
+**So anchors accumulate by union across passes.** A claim's uid is stable while its
+proposition's identity holds; its text can change from pass to pass and resolve to
+different anchors; `UNIQUE(claim_uid, kind, value)` (`src/db/migrate.c:4376`) deduplicates
+identical tuples but admits every new one. Over a repository's life the set for one
+long-lived claim is monotonically increasing, and the vanished-anchor sweep — which
+*reports* on anchors that no longer resolve — deletes none of them.
+
+**How it surfaced, and the correction it forced.** A12.1's T12 review found that
+`anchor_collect_cb` dropped a claim's anchors past a bound while calling the path
+unreachable, and explained the reachability through document merging: O10's content key
+omits the actor, so two documents stating one proposition resolve to one claim, and the
+anchor write is not gated on the claim being new. **That mechanism is wrong.**
+`atlas_memory_anchor_resolve` (`src/memory/extract.c:426`) resolves from the proposition's
+text alone — nothing document-relative reaches it — so two documents stating the same
+proposition produce *identical* tuples, which the UNIQUE constraint collapses. Two
+documents can never exceed one document's bound. The reviewer, the fix, and the
+controller's own ledger and commit message all carried the same leap; the accumulation
+route is the real one.
+
+**The consequence that was understated.** A12.1 now refuses a pack build when a claim
+exceeds `ATLAS_MEMORY_PACK_MAX_ANCHORS_PER_CLAIM`, and the refusal is repository-wide and
+task-independent. It was documented as lasting "until the vanished-anchor sweep prunes a
+row" — **the sweep prunes nothing**, so there is no exit: once one long-lived claim
+crosses the bound, that repository has no working pack until somebody deletes rows by hand
+or the claim is re-minted onto a new uid.
+
+**Candidate fixes, none implemented.** Give the anchor set a lifecycle: prune tuples a
+pass no longer resolves for a claim it kept, which is the same "carry forward what is
+still true" shape the generation logic already has, and would make the bound a bound on a
+*current* set rather than on a repository's history. Alternatively bound the pack's read
+rather than the claim's storage, so an over-anchored claim costs one truncated claim —
+reported, never silent — instead of every pack in the repository. Either way the "no exit"
+property must stop being true before A12.1 can call the refusal a bound rather than a
+trap.

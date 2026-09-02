@@ -1427,3 +1427,44 @@ re-derive whether 2000 is still the right grace against it — the honest answer
 that the grace must be meaningfully below the hook's give-up rather than equal to it.
 Separately, A12.1's T10 must classify its reconciliation job against the *measured*
 2429.9 ms rather than against either comment.
+
+## `verify_claims.superseded_by_claim_id` is read, filtered three times, and never written (2026-09-02)
+
+Found by A12.1's T9 while deriving a `SUPERSEDED` diff kind, and verified. This is the
+**second** column of this exact shape the season has turned up, after
+`atlas_verify_aggregate.conflict`.
+
+The column exists in the schema with `DEFAULT 0` (`src/db/migrate.c:2774`), is read into
+`atlas_verify_claim` (`src/db/db_verify.c:357`), appears in the select list (`:369`), and
+is filtered `= 0` at **three** read sites — `:432`, `:730`, and `:2235`. Nothing anywhere
+in `src/` writes it: there is no `UPDATE` and no `INSERT` that sets it to a non-zero
+value.
+
+So every claim in every Atlas deployment is permanently live, the three filters exclude
+nothing, and `include/atlas/verify.h:725`'s "0 when live" documents a state nothing can
+produce. **The capability to supersede a claim does not exist**, while three queries are
+written as though it does.
+
+**Why this is not merely tidy-up.** `verify.h`'s own claim contract says a claim "has no
+lifecycle, no approval and no revisions: it says one thing, it is bound to the artifacts
+that make it checkable, and evidence accumulates against it" — and supersession is how a
+proposition that has been replaced stops competing with the one that replaced it.
+Without a writer, an old claim and its replacement both stay live and both keep
+attracting evidence, which is precisely the "two readings of one document
+indistinguishable" problem the A9.2 line of seasons exists to end. A12.1 makes it
+reachable in ordinary use: a memory file's sentence edited in place produces a second
+claim, and nothing marks the first as replaced.
+
+**Same class as the conflict axis, and worth naming as a class.** Both are columns that
+are stored, read, filtered or rendered, documented as meaningful, and never produced.
+Both cost nothing while unproduced and become wrong the moment a consumer believes them.
+The general check is cheap and this season has now run it twice by accident: for each
+column a read path filters on, ask what writes it.
+
+**Candidate fixes, none implemented.** Give the column a writer at the one verification
+write point, so supersession is an intake operation like every other claim fact — that is
+the shape `atlas_verify_intake_apply_in_tx` already enforces for everything else. Or
+remove the column and its three filters, and say in the header that a claim is never
+superseded, which is what the code actually does today. The first is more work and
+matches the header's stated intent; the second is honest about the present. **What must
+not happen is a third season reading it as meaningful.**

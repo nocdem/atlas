@@ -2237,6 +2237,13 @@ static void test_source_revision_leaves_untouched_claims_byte_identical(void) {
     t9_claim_uid_for_text(&e, "the daemon reads `src/db/db_orch.c`", &a_uid, &err);
     atlas_buf a_before = ATLAS_BUF_INIT;
     t9_claim_row_snapshot(&e, atlas_buf_cstr(&a_uid), &a_before, &err);
+    /* Every concatenated column is NOT NULL (verify_claims' own CREATE TABLE,
+     * plus the content_key/created_by_actor_id ALTER TABLE defaults), so this
+     * cannot be a SQLite NULL-propagated empty string; assert it directly
+     * rather than trust the schema silently. */
+    T_CHECK_MSG(a_before.len > 0 && strstr(atlas_buf_cstr(&a_before), atlas_buf_cstr(&a_uid)) != NULL,
+               "the snapshot must be non-empty and carry the claim's own uid, got: %s",
+               atlas_buf_cstr(&a_before));
 
     T_OK(fx_write(repo, ".claude/memories/b.md",
                  "the gateway also reads `src/gw/gateway.c` directly", &err),
@@ -2322,9 +2329,6 @@ static void test_commit_impacts_only_its_anchored_claim(void) {
     t8_run_pass(&e, &pol, &r1, &err);
     T_REQUIRE(r1.generation != 0);
 
-    atlas_buf b_uid = ATLAS_BUF_INIT;
-    t9_claim_uid_for_text(&e, "the file `src/b.c` holds b", &b_uid, &err);
-
     /* Commit a real change to src/a.c and re-index the fact -- the hash a
      * real scan would have written, distinct from the seeded one above. */
     T_OK(fx_write(repo, "src/a.c", "int a = 2;\n", &err), &err);
@@ -2348,8 +2352,20 @@ static void test_commit_impacts_only_its_anchored_claim(void) {
                atlas_buf_cstr(&cause));
     T_CHECK_MSG(head_commit.len > 0, "expected head_commit to be recorded on the generation");
 
+    /* Every claim's content key hashes basis_commit (S27), so a COMMIT-caused
+     * pass re-mints b's row too -- its uid after this pass is NOT the uid
+     * captured before it. Looking up the pre-pass uid in gen2's diffs would
+     * pass vacuously (that uid was never written to in this generation
+     * regardless of whether suppression works); the real test is that b's
+     * *current* claim -- the one this pass actually produced -- carries no
+     * diff row, because its verifier_input and decision binding did not
+     * change. */
     atlas_buf new_a_uid = ATLAS_BUF_INIT;
     t9_claim_uid_for_text(&e, "the file `src/a.c` holds a", &new_a_uid, &err);
+    atlas_buf new_b_uid = ATLAS_BUF_INIT;
+    t9_claim_uid_for_text(&e, "the file `src/b.c` holds b", &new_b_uid, &err);
+    T_CHECK_MSG(strcmp(atlas_buf_cstr(&new_a_uid), atlas_buf_cstr(&new_b_uid)) != 0,
+               "a and b claim uids must not collide");
 
     atlas_buf kind = ATLAS_BUF_INIT;
     bool found = false;
@@ -2362,13 +2378,211 @@ static void test_commit_impacts_only_its_anchored_claim(void) {
                found, found ? atlas_buf_cstr(&kind) : "(none)");
 
     bool b_has_row = false;
-    t9_diff_kind_for(&e, gen2, atlas_buf_cstr(&b_uid), NULL, NULL, &b_has_row, &err);
-    T_CHECK_MSG(!b_has_row, "the unrelated claim should have no diff row this generation");
+    t9_diff_kind_for(&e, gen2, atlas_buf_cstr(&new_b_uid), NULL, NULL, &b_has_row, &err);
+    T_CHECK_MSG(!b_has_row, "the unrelated (re-minted) claim should have no diff row this generation");
 
-    atlas_buf_free(&b_uid);
+    T_CHECK_MSG(r2.diff_rows == 1, "expected exactly one diff row this generation, got %zu",
+               r2.diff_rows);
+
     atlas_buf_free(&cause);
     atlas_buf_free(&head_commit);
     atlas_buf_free(&new_a_uid);
+    atlas_buf_free(&new_b_uid);
+    atlas_buf_free(&kind);
+    t8_env_close(&e);
+}
+
+/* fix-round-1, C1: two different propositions naming the *same* file --
+ * two memory bullets citing one shared source file is the ordinary case for
+ * a real `.claude/memories` directory, not a constructed edge case. Before
+ * this round's fix, `find_prior_cb` answered "the most recently anchored
+ * claim, whichever proposition it belongs to" rather than "this proposition's
+ * own predecessor": after any commit that re-mints every claim, both fresh
+ * claims would probe the same (PATH, `src/shared.c`) anchor tuple, and
+ * whichever one is not the tuple's actual most-recent claim would compare
+ * its own text against the *other* bullet's and get a spurious `ADDED` row
+ * for a proposition that had not changed at all -- exactly the failure
+ * acceptance item 2's "byte-for-byte stable" absence stands on.
+ *
+ * The commit here touches an unrelated file, never `src/shared.c` itself, so
+ * both bullets' own facts stay identical across the remint and the correct
+ * outcome is that *neither* gets a diff row -- not merely that they do not
+ * collide with each other. */
+static void test_two_propositions_sharing_one_anchor_both_remint_cleanly(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    t8env e;
+    t8_env_open(&e, &err);
+
+    const char *repo = fx_repo(&e.fx);
+    T_OK(fx_mkdir(repo, "src", &err), &err);
+    T_OK(fx_write(repo, "src/shared.c", "int shared;\n", &err), &err);
+    T_OK(fx_mkdir(repo, ".claude", &err), &err);
+    T_OK(fx_mkdir(repo, ".claude/memories", &err), &err);
+    T_OK(fx_write(repo, ".claude/memories/x.md", "the file `src/shared.c` holds X", &err), &err);
+    T_OK(fx_write(repo, ".claude/memories/y.md", "the file `src/shared.c` holds Y", &err), &err);
+    T_OK(fx_add_all(&e.fx, repo, &err), &err);
+    T_OK(fx_commit(&e.fx, repo, "seed", &err), &err);
+    t8_bind_head(&e, &err);
+    t8_seed_file(&e, "src/shared.c", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                &err);
+    t8_seed_file(&e, ".claude/memories/x.md",
+                "1111111111111111111111111111111111111111111111111111111111111111", &err);
+    t8_seed_file(&e, ".claude/memories/y.md",
+                "2222222222222222222222222222222222222222222222222222222222222222", &err);
+
+    const char *paths[] = {".claude/memories"};
+    atlas_syspolicy pol;
+    t8_policy(&pol, ATLAS_MEMORY_SOURCE_REPO_DIR, paths, 1);
+
+    atlas_memory_pass_result r1;
+    t8_run_pass(&e, &pol, &r1, &err);
+    T_REQUIRE(r1.generation != 0);
+
+    atlas_buf x_uid1 = ATLAS_BUF_INIT;
+    t9_claim_uid_for_text(&e, "the file `src/shared.c` holds X", &x_uid1, &err);
+    atlas_buf y_uid1 = ATLAS_BUF_INIT;
+    t9_claim_uid_for_text(&e, "the file `src/shared.c` holds Y", &y_uid1, &err);
+    T_CHECK_MSG(strcmp(atlas_buf_cstr(&x_uid1), atlas_buf_cstr(&y_uid1)) != 0,
+               "x and y must not have collided into one claim already");
+
+    /* An unrelated commit: HEAD moves, so every claim re-mints (S27's own
+     * content key), but src/shared.c's own bytes never change. */
+    T_OK(fx_write(repo, "unrelated.c", "int unrelated;\n", &err), &err);
+    T_OK(fx_add_all(&e.fx, repo, &err), &err);
+    T_OK(fx_commit(&e.fx, repo, "unrelated change", &err), &err);
+    t8_bind_head(&e, &err);
+    t8_seed_file(&e, "unrelated.c", "3333333333333333333333333333333333333333333333333333333333333333",
+                &err);
+
+    atlas_memory_pass_result r2;
+    t8_run_pass(&e, &pol, &r2, &err);
+    T_CHECK_MSG(r2.generation == r1.generation + 1, "expected exactly one generation bump, got %lld "
+               "after %lld",
+               (long long)r2.generation, (long long)r1.generation);
+
+    atlas_buf cause = ATLAS_BUF_INIT;
+    int64_t gen2 = 0;
+    t9_generation_latest(&e, &cause, NULL, &gen2, &err);
+    T_CHECK_MSG(strcmp(atlas_buf_cstr(&cause), "COMMIT") == 0, "expected cause COMMIT, got %s",
+               atlas_buf_cstr(&cause));
+
+    atlas_buf x_uid2 = ATLAS_BUF_INIT;
+    t9_claim_uid_for_text(&e, "the file `src/shared.c` holds X", &x_uid2, &err);
+    atlas_buf y_uid2 = ATLAS_BUF_INIT;
+    t9_claim_uid_for_text(&e, "the file `src/shared.c` holds Y", &y_uid2, &err);
+    T_CHECK_MSG(strcmp(atlas_buf_cstr(&x_uid1), atlas_buf_cstr(&x_uid2)) != 0,
+               "x's claim did not re-mint on a COMMIT-caused pass");
+    T_CHECK_MSG(strcmp(atlas_buf_cstr(&y_uid1), atlas_buf_cstr(&y_uid2)) != 0,
+               "y's claim did not re-mint on a COMMIT-caused pass");
+    T_CHECK_MSG(strcmp(atlas_buf_cstr(&x_uid2), atlas_buf_cstr(&y_uid2)) != 0,
+               "x and y re-minted into the same claim");
+
+    bool x_has_row = false, y_has_row = false;
+    t9_diff_kind_for(&e, gen2, atlas_buf_cstr(&x_uid2), NULL, NULL, &x_has_row, &err);
+    t9_diff_kind_for(&e, gen2, atlas_buf_cstr(&y_uid2), NULL, NULL, &y_has_row, &err);
+    T_CHECK_MSG(!x_has_row,
+               "x's re-minted claim got a diff row despite src/shared.c never changing -- the "
+               "cross-contamination C1 exists to prevent");
+    T_CHECK_MSG(!y_has_row,
+               "y's re-minted claim got a diff row despite src/shared.c never changing -- the "
+               "cross-contamination C1 exists to prevent");
+    T_CHECK_MSG(r2.diff_rows == 0, "expected no diff rows at all this generation, got %zu",
+               r2.diff_rows);
+
+    atlas_buf_free(&x_uid1);
+    atlas_buf_free(&y_uid1);
+    atlas_buf_free(&x_uid2);
+    atlas_buf_free(&y_uid2);
+    atlas_buf_free(&cause);
+    t8_env_close(&e);
+}
+
+/* fix-round-1, C2: a bullet naming both a SYMBOL and a PATH gets a `symbol=`
+ * verifier input (Decision 4's own precedence, `src/memory/extract.c`),
+ * which does not move when the file changes and the symbol does not. Before
+ * this round's fix, `verifier_input_equal` was the *only* signal
+ * `classify_candidate` had for "did anything about this proposition's
+ * referent change", so a commit that rewrote `src/hash.c` while
+ * `compute_hash` kept resolving produced no diff row at all for a claim the
+ * commit had just invalidated -- item 2's other half: only the impact set is
+ * invalidated, but the impact set has to actually be the impact set. This
+ * drives the touched-paths set (`atlas_git_log_since` in observe) to prove
+ * the file's own change is now visible even though the verifier input never
+ * moved. */
+static void test_commit_rewrites_file_behind_a_symbol_verifier(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    t8env e;
+    t8_env_open(&e, &err);
+
+    const char *repo = fx_repo(&e.fx);
+    T_OK(fx_mkdir(repo, "src", &err), &err);
+    T_OK(fx_write(repo, "src/hash.c", "int compute_hash(void) { return 1; }\n", &err), &err);
+    T_OK(fx_write(repo, "note.md", "the function `compute_hash` in `src/hash.c` is correct", &err),
+         &err);
+    T_OK(fx_add_all(&e.fx, repo, &err), &err);
+    T_OK(fx_commit(&e.fx, repo, "seed", &err), &err);
+    t8_bind_head(&e, &err);
+    t8_seed_file(&e, "src/hash.c", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                &err);
+    t8_seed_file(&e, "note.md", "1111111111111111111111111111111111111111111111111111111111111111",
+                &err);
+    (void)t9_seed_sem_generation(&e, true, "c:@F@compute_hash", "compute_hash", &err);
+
+    const char *paths[] = {"note.md"};
+    atlas_syspolicy pol;
+    t8_policy(&pol, ATLAS_MEMORY_SOURCE_REPO_FILE, paths, 1);
+
+    atlas_memory_pass_result r1;
+    t8_run_pass(&e, &pol, &r1, &err);
+    T_REQUIRE(r1.generation != 0);
+
+    atlas_buf uid1 = ATLAS_BUF_INIT;
+    t9_claim_uid_for_text(&e, "the function `compute_hash` in `src/hash.c` is correct", &uid1, &err);
+
+    /* Rewrites src/hash.c's own bytes; compute_hash keeps resolving (the
+     * semantic generation seeded above is not touched), so the SYMBOL-
+     * derived verifier input this claim actually carries does not move. */
+    T_OK(fx_write(repo, "src/hash.c", "int compute_hash(void) { return 2; }\n", &err), &err);
+    T_OK(fx_add_all(&e.fx, repo, &err), &err);
+    T_OK(fx_commit(&e.fx, repo, "rewrite hash.c", &err), &err);
+    t8_bind_head(&e, &err);
+    t9_update_file_hash(&e, "src/hash.c", "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                        &err);
+
+    atlas_memory_pass_result r2;
+    t8_run_pass(&e, &pol, &r2, &err);
+    T_CHECK_MSG(r2.generation == r1.generation + 1, "expected exactly one generation bump, got %lld "
+               "after %lld",
+               (long long)r2.generation, (long long)r1.generation);
+
+    atlas_buf cause = ATLAS_BUF_INIT;
+    int64_t gen2 = 0;
+    t9_generation_latest(&e, &cause, NULL, &gen2, &err);
+    T_CHECK_MSG(strcmp(atlas_buf_cstr(&cause), "COMMIT") == 0, "expected cause COMMIT, got %s",
+               atlas_buf_cstr(&cause));
+
+    atlas_buf uid2 = ATLAS_BUF_INIT;
+    t9_claim_uid_for_text(&e, "the function `compute_hash` in `src/hash.c` is correct", &uid2, &err);
+    T_CHECK_MSG(strcmp(atlas_buf_cstr(&uid1), atlas_buf_cstr(&uid2)) != 0,
+               "the claim did not re-mint on a COMMIT-caused pass");
+
+    atlas_buf kind = ATLAS_BUF_INIT;
+    bool found = false;
+    t9_diff_kind_for(&e, gen2, atlas_buf_cstr(&uid2), &kind, NULL, &found, &err);
+    T_CHECK_MSG(found,
+               "expected a diff row for the claim whose PATH anchor's file the commit rewrote, even "
+               "though its SYMBOL-derived verifier input did not move -- C2's own failure mode "
+               "before this round's fix");
+    if (found) {
+        T_CHECK_MSG(strcmp(atlas_buf_cstr(&kind), "IMPACTED") == 0,
+                   "expected IMPACTED (the symbol still resolves), got %s", atlas_buf_cstr(&kind));
+    }
+
+    atlas_buf_free(&uid1);
+    atlas_buf_free(&uid2);
+    atlas_buf_free(&cause);
     atlas_buf_free(&kind);
     t8_env_close(&e);
 }
@@ -2426,12 +2640,52 @@ static void test_decision_revision_approval_is_the_cause(void) {
  * design it violates (`verify.h:474-478`). No commit happens between the two
  * passes, so `basis_commit`/`evaluated_commit` stay equal and `SOURCE_DRIFT`
  * cannot demote the conflict to `NONE` -- the scenario this test must not
- * accidentally run in. */
+ * accidentally run in.
+ *
+ * fix-round-1: `evaluate_claim` (`reconcile.c`) reaches
+ * `atlas_verify_intake_apply_in_tx`'s `EVALUATE` handler, which loads
+ * `ATLAS_VERIFYPOLICY_PATH` itself (`src/verify/policy.c`, a compiled-in
+ * constant with no override -- A7.1's own rule, `docs/engineering-rules.md`)
+ * and can spend an `AUTO_APPROVE`/`AUTO_RESOLVE`. The assertion below proves
+ * this test runs under whatever real policy this machine has installed
+ * there, not merely in the one configuration ("no policy") where nothing
+ * could have moved regardless -- checked, not assumed: this repository's own
+ * `/etc/atlas/verification.conf` is real, root-owned, `enabled = yes`, and
+ * genuinely loads as `ATLAS_VERIFYPOLICY_ENABLED`.
+ *
+ * That policy's own `allow` list is `OBLIGATION APPROVED RESOLVED
+ * atlas.symbol_absent` -- kind `OBLIGATION` only. `t9_propose` never sets
+ * `op.revision.kind`, so this document is kind `DECISION` (A9.1's own zero),
+ * outside that policy's reach by construction. The refusal this test proves
+ * is therefore genuine under a real active policy, but a *narrower* one than
+ * the theoretical worst case: a hostile policy naming `DECISION APPROVED
+ * RESOLVED <this claim's own verifier>` explicitly would need injecting
+ * through `atlas_verify_intake_apply_in_tx` itself, which loads the fixed
+ * path unconditionally and takes no policy parameter a caller could
+ * substitute (`src/verify/intake.c:1359`, outside this task's four pinned
+ * files). Recorded here as a finding rather than closed silently: this test
+ * establishes the refusal under a real, enabled, root-owned policy of
+ * whatever shape is actually deployed, not under every conceivable one. */
 static void test_drift_conflict_leaves_the_decision_untouched(void) {
     atlas_err err;
     atlas_err_init(&err);
     t8env e;
     t8_env_open(&e, &err);
+
+    /* An observation, not an assertion: whether a policy is installed at
+     * `ATLAS_VERIFYPOLICY_PATH` is a fact about this machine, not an
+     * invariant this test's own fixture controls (a fresh checkout with no
+     * A9.2 deployment step run has no file there at all), so a missing or
+     * disabled one here is not this test's failure -- but a present one
+     * changes what the assertions below actually establish, and that is
+     * worth a caller's own eyes rather than a silent assumption either way. */
+    atlas_verifypolicy real_policy;
+    atlas_verifypolicy_load(&real_policy);
+    atlas_test_note("verification policy at the compiled-in path: state=%d reason=%s policy_id=%s -- "
+                    "ENABLED means this test's refusal is proven under a real active policy, not "
+                    "merely in the absence of one",
+                    (int)real_policy.state, atlas_verifypolicy_reason_name(real_policy.reason),
+                    real_policy.state == ATLAS_VERIFYPOLICY_ENABLED ? real_policy.policy_id : "(n/a)");
 
     atlas_buf doc_uid = ATLAS_BUF_INIT;
     t9_propose(&e, "compute_hash must exist", &doc_uid, &err);
@@ -2475,7 +2729,24 @@ static void test_drift_conflict_leaves_the_decision_untouched(void) {
 
     atlas_memory_pass_result r2;
     t8_run_pass(&e, &pol, &r2, &err);
-    (void)r2;
+    T_REQUIRE(r2.generation != 0);
+
+    /* T9 fix-round-1: this pass's own diff comes entirely from the vanished-
+     * anchor sweep -- no source's content changed, the decision's approved
+     * revision did not move, and HEAD did not move -- so none of Decision
+     * 7's three tracked signals differ from the last generation.
+     * `determine_cause`'s own comment names this exact case and the schema's
+     * three-value CHECK constraint (migration 29) has no fourth label for
+     * "the semantic index moved under an approved decision"; asserted here
+     * rather than left silent, as a documented imprecision rather than a
+     * papered-over one. */
+    atlas_buf cause2 = ATLAS_BUF_INIT;
+    t9_generation_latest(&e, &cause2, NULL, NULL, &err);
+    T_CHECK_MSG(strcmp(atlas_buf_cstr(&cause2), "SOURCE_REVISION") == 0,
+               "a drift-only generation's cause fell through to something other than the "
+               "documented SOURCE_REVISION fallback: %s",
+               atlas_buf_cstr(&cause2));
+    atlas_buf_free(&cause2);
 
     char sql[512];
     (void)snprintf(sql, sizeof sql,
@@ -2500,6 +2771,86 @@ static void test_drift_conflict_leaves_the_decision_untouched(void) {
                "conflict: %lld -> %lld",
                (long long)rev_before, (long long)rev_after);
 
+    atlas_buf_free(&doc_uid);
+    t8_env_close(&e);
+}
+
+/* fix-round-1: measures the bound placed on the vanished-anchor sweep's own
+ * compounding cost. Before this round, `evaluate_claim` (one `EVIDENCE_
+ * PRODUCE` plus one `EVALUATE`, and `EVALUATE` always writes a fresh
+ * `verify_results` row -- `atlas_verify_intake_apply_in_tx`'s own contract)
+ * ran again on *every* pass for as long as a referent stayed vanished, and
+ * `RETENTION[]` has no entry that can prune `verify_results` -- a table that
+ * would otherwise have grown by one row per pass, for as long as a decision
+ * stayed approved and its symbol stayed deleted, for ever. This repeats the
+ * drift scenario from `test_drift_conflict_leaves_the_decision_untouched`
+ * and runs five further passes with nothing else changing, then asserts the
+ * row count for this exact claim stayed at one -- the single evaluation the
+ * first vanish-detecting pass performed -- rather than growing to six. */
+static void test_vanish_sweep_evaluate_cost_is_bounded_across_repeated_passes(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    t8env e;
+    t8_env_open(&e, &err);
+
+    atlas_buf doc_uid = ATLAS_BUF_INIT;
+    t9_propose(&e, "compute_hash must exist", &doc_uid, &err);
+    t9_approve(&e, atlas_buf_cstr(&doc_uid), 1, &err);
+
+    const char *repo = fx_repo(&e.fx);
+    char bullet[256];
+    (void)snprintf(bullet, sizeof bullet, "the function `compute_hash` implements decision %s",
+                  atlas_buf_cstr(&doc_uid));
+    T_OK(fx_write(repo, "note.md", bullet, &err), &err);
+    T_OK(fx_add_all(&e.fx, repo, &err), &err);
+    T_OK(fx_commit(&e.fx, repo, "seed", &err), &err);
+    t8_bind_head(&e, &err);
+    t8_seed_file(&e, "note.md", "1111111111111111111111111111111111111111111111111111111111111111",
+                &err);
+    (void)t9_seed_sem_generation(&e, true, "c:@F@compute_hash", "compute_hash", &err);
+
+    const char *paths[] = {"note.md"};
+    atlas_syspolicy pol;
+    t8_policy(&pol, ATLAS_MEMORY_SOURCE_REPO_FILE, paths, 1);
+
+    atlas_memory_pass_result r1;
+    t8_run_pass(&e, &pol, &r1, &err);
+    T_REQUIRE(r1.generation != 0);
+
+    atlas_buf claim_uid = ATLAS_BUF_INIT;
+    t9_claim_uid_for_text(&e, bullet, &claim_uid, &err);
+
+    (void)t9_seed_sem_generation(&e, false, NULL, NULL, &err);
+
+    char count_sql[512];
+    (void)snprintf(count_sql, sizeof count_sql,
+                  "SELECT COUNT(*) FROM verify_results r"
+                  "  JOIN verify_claims c ON c.id = r.claim_id WHERE c.uid = '%s';",
+                  atlas_buf_cstr(&claim_uid));
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (int i = 0; i < 6; i++) {
+        atlas_memory_pass_result rn;
+        t8_run_pass(&e, &pol, &rn, &err);
+        (void)rn;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double ms = (double)(t1.tv_sec - t0.tv_sec) * 1000.0 + (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
+
+    int64_t results_count = t8_scalar(&e, count_sql, &err);
+    atlas_test_note("vanish-sweep bound observed: 6 further passes over one permanently-vanished, "
+                    "decision-bound, verifier-carrying claim cost %.1f ms total and left %lld "
+                    "verify_results row(s) for it -- the fix-round-1 bound is exactly one, "
+                    "regardless of how many further passes see the same vanished referent.",
+                    ms, (long long)results_count);
+    T_CHECK_MSG(results_count == 1,
+               "expected exactly one verify_results row for a claim whose vanished referent never "
+               "changes across repeated passes, got %lld -- the compounding cost this round's fix "
+               "exists to bound",
+               (long long)results_count);
+
+    atlas_buf_free(&claim_uid);
     atlas_buf_free(&doc_uid);
     t8_env_close(&e);
 }
@@ -2700,10 +3051,16 @@ static const atlas_test TESTS[] = {
      test_source_revision_leaves_untouched_claims_byte_identical},
     {"item 2 (COMMIT): only the anchored claim is impacted",
      test_commit_impacts_only_its_anchored_claim},
+    {"C1: two propositions sharing one anchor both re-mint cleanly",
+     test_two_propositions_sharing_one_anchor_both_remint_cleanly},
+    {"C2: a commit behind a SYMBOL verifier still produces a diff row",
+     test_commit_rewrites_file_behind_a_symbol_verifier},
     {"a decision revision's approval is the pass's cause",
      test_decision_revision_approval_is_the_cause},
     {"item 3: drift is an IMPLEMENTATION conflict and leaves the decision untouched",
      test_drift_conflict_leaves_the_decision_untouched},
+    {"the vanish sweep's EVALUATE cost is bounded across repeated passes",
+     test_vanish_sweep_evaluate_cost_is_bounded_across_repeated_passes},
     {"item 4: git cat-file on the stored blob_oid matches content_sha256",
      test_rebuild_from_git_blob_matches_stored_hash},
     {"plan_for answers the right cause before the pass runs",

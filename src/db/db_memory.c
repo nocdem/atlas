@@ -42,12 +42,7 @@ static atlas_status memory_uid(const char *prefix, atlas_buf *out, atlas_err *er
         return st;
     }
     char hex[MEMORY_UID_BYTES * 2u + 1u];
-    static const char *D = "0123456789abcdef";
-    for (size_t i = 0; i < sizeof raw; i++) {
-        hex[i * 2u] = D[raw[i] >> 4];
-        hex[i * 2u + 1u] = D[raw[i] & 0x0fu];
-    }
-    hex[sizeof hex - 1u] = '\0';
+    atlas_hex_encode_lower(raw, sizeof raw, hex);
     atlas_buf_reset(out);
     st = atlas_buf_append_str(out, prefix, err);
     if (st == ATLAS_OK) {
@@ -477,6 +472,41 @@ atlas_status atlas_db_memory_anchor_add(atlas_db *db, int64_t repo_id, const cha
     return st;
 }
 
+atlas_status atlas_db_memory_anchor_prune_one(atlas_db *db, int64_t repo_id, const char *claim_uid,
+                                              atlas_memory_anchor_kind kind, const char *value,
+                                              atlas_err *err) {
+    if (db == NULL || claim_uid == NULL || value == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "no claim anchor to prune");
+    }
+    static const char SQL[] =
+        "DELETE FROM memory_claim_anchors"
+        " WHERE repo_id = ?1 AND claim_uid = ?2 AND kind = ?3 AND value = ?4;";
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(db, SQL, &stmt, err);
+    if (st == ATLAS_OK && sqlite3_bind_int64(stmt, 1, repo_id) != SQLITE_OK) {
+        st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the repository id");
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_db_bind_text_opt(db, stmt, 2, claim_uid, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_db_bind_text_opt(db, stmt, 3, atlas_memory_anchor_kind_name(kind), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_db_bind_text_opt(db, stmt, 4, value, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_db_step_done(db, stmt, err);
+    } else {
+        atlas_db_finish(db, stmt);
+        stmt = NULL;
+    }
+    if (stmt != NULL) {
+        atlas_db_finish(db, stmt);
+    }
+    return st;
+}
+
 atlas_status atlas_db_memory_unanchored_add(atlas_db *db, int64_t source_version_id, int64_t ordinal,
                                             const char *text_sha256, const void *text,
                                             size_t text_len, bool *landed_out, atlas_err *err) {
@@ -710,7 +740,8 @@ atlas_status atlas_db_memory_anchor_distinct(atlas_db *db, int64_t repo_id,
         return atlas_err_set(err, ATLAS_ERR_INTERNAL, "no anchor listing to run");
     }
     static const char SQL[] =
-        "SELECT DISTINCT kind, value FROM memory_claim_anchors WHERE repo_id = ?1;";
+        "SELECT DISTINCT kind, value FROM memory_claim_anchors WHERE repo_id = ?1"
+        " ORDER BY kind, value;";
     sqlite3_stmt *stmt = NULL;
     atlas_status st = atlas_db_prepare(db, SQL, &stmt, err);
     if (st != ATLAS_OK) {
@@ -832,16 +863,36 @@ atlas_status atlas_db_memory_dir_hash_mismatch(atlas_db *db, int64_t repo_id, in
     if (db == NULL || path_text == NULL) {
         return atlas_err_set(err, ATLAS_ERR_INTERNAL, "no directory source to check");
     }
-    /* One path level below the source's own path, or the path itself -- a
-     * `REPO_DIR` source is one level deep by construction
-     * (`ATLAS_MEMORY_MAX_DIR_ENTRIES`'s own comment), so this is not an
-     * arbitrary subtree walk. Bounded at one more than
-     * `ATLAS_MEMORY_MAX_DIR_ENTRIES` files examined -- the same ceiling the
-     * pass itself reads a directory source under -- so this can never cost
-     * more than the pass it is answering for on behalf of. */
+    /* T9 fix-round-1 (C3): matched to what `src/memory/read.c` actually
+     * ingests for a `REPO_DIR` source, not to a plausible-sounding
+     * approximation of it -- `readdir` on the source directory itself, no
+     * recursion into any child directory, filtered to a literal `.md` name
+     * suffix. The prior form matched `path_text LIKE ?2 || '/%'` with no
+     * depth or suffix filter, so a `README.txt` (any extension but `.md`) or
+     * any file nested two or more levels down (a subdirectory `read.c` never
+     * descends into) matched, could never gain a `memory_source_versions` row
+     * (T7 never extracts from it), and answered `changed_out = true` for
+     * ever: `atlas_memory_plan_for` reported `SOURCE_REVISION` on every call
+     * and T10's own scheduler would have driven a pass every tick that
+     * appends no generation -- an unbounded no-op loop on the single writer
+     * thread that nothing reports.
+     *
+     * "One level below `?2`, no further slash after that" is
+     * `path_text LIKE ?2 || '/%'` minus `path_text LIKE ?2 || '/%/%'`: the
+     * first admits every descendant, the second is every descendant with at
+     * least one slash *after* the first path component below `?2`, and the
+     * difference is exactly the immediate children. `.md` is plain ASCII and
+     * `atlas_text_encode_safe` never escapes a plain ASCII byte, so the
+     * suffix survives `path_text`'s own encoding unchanged and a literal
+     * `LIKE '%.md'` is the right test on the encoded column. Still bounded at
+     * one more than `ATLAS_MEMORY_MAX_DIR_ENTRIES` files examined -- the same
+     * ceiling the pass itself reads a directory source under. */
     static const char SQL[] =
         "SELECT content_hash FROM files"
-        " WHERE repo_id = ?1 AND (path_text = ?2 OR path_text LIKE ?2 || '/%' ESCAPE '\\')"
+        " WHERE repo_id = ?1"
+        "   AND path_text LIKE ?2 || '/%' ESCAPE '\\'"
+        "   AND path_text NOT LIKE ?2 || '/%/%' ESCAPE '\\'"
+        "   AND path_text LIKE '%.md' ESCAPE '\\'"
         " LIMIT ?3;";
     sqlite3_stmt *stmt = NULL;
     atlas_status st = atlas_db_prepare(db, SQL, &stmt, err);

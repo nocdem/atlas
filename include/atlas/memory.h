@@ -65,6 +65,18 @@
  * and declaring it here keeps the dependency one-way. */
 typedef struct atlas_db atlas_db;
 
+/* T9 fix-round-1: one lower-case hex encoder, shared rather than each of
+ * `src/memory/reconcile.c` and `src/db/db_memory.c` keeping its own copy of
+ * the same four-line table. `out` must hold at least `2*n + 1` bytes. */
+static inline void atlas_hex_encode_lower(const unsigned char *bytes, size_t n, char *out) {
+    static const char D[] = "0123456789abcdef";
+    for (size_t i = 0; i < n; i++) {
+        out[i * 2u] = D[bytes[i] >> 4];
+        out[i * 2u + 1u] = D[bytes[i] & 0x0fu];
+    }
+    out[n * 2u] = '\0';
+}
+
 /* Forward-declared rather than included, and the direction is the whole point.
  *
  * `syspolicy.h` needs the **complete** `atlas_memory_source_class` for a struct
@@ -346,6 +358,29 @@ atlas_status atlas_db_memory_version_latest(atlas_db *db, int64_t source_id,
 atlas_status atlas_db_memory_anchor_add(atlas_db *db, int64_t repo_id, const char *claim_uid,
                                         atlas_memory_anchor_kind kind, const char *value,
                                         atlas_err *err);
+
+/* T9 fix-round-1: removes exactly one `memory_claim_anchors` row -- the
+ * `(claim_uid, kind, value)` tuple `classify_candidate` just used to find
+ * `claim_uid` as a predecessor. Never the claim's *other* anchors: a claim
+ * with more than one anchor (a bullet naming both a SYMBOL and a DECISION,
+ * say) can be superseded on one tuple while its other tuples are exactly
+ * what the vanished-anchor sweep still needs to see -- pruning the whole
+ * claim broke `test_drift_conflict_leaves_the_decision_untouched` in this
+ * fix round's own first attempt, by deleting a SYMBOL anchor the sweep had
+ * not yet had the chance to find vanished, before it ever ran.
+ *
+ * `memory_claim_anchors` never gets a writer for `verify_claims.
+ * superseded_by_claim_id` -- nothing in `src/` sets that column, T9's own
+ * report records the grep -- so this specific tuple's row would otherwise
+ * survive every remint forever, and `atlas_db_memory_anchor_distinct`'s
+ * per-pass scan would carry one stale row per `COMMIT`-caused pass a
+ * repository has ever seen, on every anchor `classify_candidate` ever used
+ * to correlate a remint, rather than exactly the live ones. Called only from
+ * `classify_candidate`, never from the vanished-anchor sweep, which has no
+ * fresh candidate to confirm succession against. */
+atlas_status atlas_db_memory_anchor_prune_one(atlas_db *db, int64_t repo_id, const char *claim_uid,
+                                              atlas_memory_anchor_kind kind, const char *value,
+                                              atlas_err *err);
 
 /* Records one candidate that resolved no anchor. `INSERT OR IGNORE`:
  * `UNIQUE(source_version_id, ordinal)` makes a re-run over an unchanged
@@ -836,6 +871,41 @@ typedef struct atlas_memory_observed_source {
     atlas_memory_version_row external_latest;
 } atlas_memory_observed_source;
 
+/* T9 fix-round-1 (C2). The bounded set of paths a commit range touched,
+ * between the last generation this repository recorded and the HEAD this
+ * pass observed -- read via `atlas_git_log_since` during observe (never
+ * inside the write transaction, A1's rule against a git process in one),
+ * over exactly the range `determine_cause`'s own COMMIT branch is naming.
+ *
+ * Every path is `path_text`-encoded, the representation a PATH anchor's own
+ * value and `files.path_text` already use, so a caller compares like for
+ * like with no re-encoding. `available` is false whenever there is nothing
+ * to compare against (the first generation, or HEAD did not move since the
+ * last one) -- a `COMMIT`-caused pass is the only one that ever needs this
+ * set at all. `bound_hit` covers two cases the same way, deliberately not
+ * distinguished: the walk found more than `ATLAS_MEMORY_MAX_TOUCHED_PATHS`
+ * distinct paths, or it could not be read at all (an A13 mirror that is not
+ * yet complete, in particular). Both mean this process cannot prove which
+ * paths were *not* touched, and "every anchored claim is conservatively
+ * touched" is the only sound reading of that -- A9.2.2's asymmetry, one
+ * layer over: no evidence of absence is not evidence of absence. */
+typedef struct atlas_memory_touched {
+    atlas_buf paths[ATLAS_MEMORY_MAX_TOUCHED_PATHS];
+    size_t count;
+    bool bound_hit;
+    bool available;
+} atlas_memory_touched;
+
+void atlas_memory_touched_init(atlas_memory_touched *t);
+void atlas_memory_touched_free(atlas_memory_touched *t);
+
+/* True when `path_text` is in the touched set, or the set could not prove it
+ * was not -- see `bound_hit`'s own comment above for why the second case must
+ * answer true rather than false. `t == NULL` (no observation reached the
+ * caller at all) answers false: a caller with no set to consult has no COMMIT
+ * cause to be conservative about either. */
+bool atlas_memory_touched_contains(const atlas_memory_touched *t, const char *path_text);
+
 /* Everything the observe phase learned that a transaction can now act on.
  * Owns its buffers; `_init`/`_free` pair. Nothing in it references a live
  * statement, a git handle or an open fd -- Decision 9's boundary.
@@ -850,6 +920,7 @@ typedef struct atlas_memory_observed_source {
 typedef struct atlas_memory_observation {
     size_t source_count;
     atlas_memory_observed_source sources[ATLAS_MEMORY_MAX_SOURCES];
+    atlas_memory_touched touched;
 } atlas_memory_observation;
 
 void atlas_memory_observation_init(atlas_memory_observation *o);

@@ -13,6 +13,8 @@
  * that modifies what it reads is the one failure this codebase will not
  * tolerate (CLAUDE.md, "Hard rules").
  */
+#define _GNU_SOURCE 1
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,7 +38,9 @@
 #include "atlas/verify_ops.h"
 #include "atlas/verifypolicy.h"
 #include "atlas_test.h"
+#include "daemon/daemon_internal.h"
 #include "db/db_internal.h"
+#include "ipc/server_internal.h"
 #include "support/fixture.h"
 
 /* A row naming no scanner -- scanner_uid == 0, migration 27's default -- so
@@ -3990,6 +3994,729 @@ static void test_dir_hash_mismatch_excludes_the_five_unreadable_doors(void) {
     t8_env_close(&e);
 }
 
+/* --- T11: memory.put, memory.status, memory.reconcile ----------------------
+ *
+ * `memory.put`, `memory.status` and `memory.reconcile` sit in the
+ * SO_PEERCRED-gated operator group (`OPERATOR_METHODS[]`,
+ * `src/ipc/server_decision.c`), and that gate is `atlas_authority_probe_peer`:
+ * a root-owned policy file *and* a root-owned, unwritable running executable.
+ * No test binary in this build tree is that executable -- `test_operator_peer.
+ * c`'s own comment states the reason and its own precedent is to skip the
+ * positive case entirely rather than fabricate a grant. `repo.scanner`, the
+ * method beside these three, has never had an RPC-layer test at all for the
+ * identical reason (verified by grep: no test references `method_repo_
+ * scanner`); `backup.create`'s and `decision.approve`'s RPC-layer tests
+ * (`test_backup_live.c`, `test_a71_syspolicy.c`) exercise only the same
+ * negative path this file's own new case below does, and drive the *positive*
+ * behaviour through the service function the method calls
+ * (`atlas_service_backup_create`) rather than through the method itself.
+ *
+ * These tests follow that precedent rather than reinventing a way past it:
+ * the wiring is checked directly (the three names are in the table), the
+ * refusal is checked over a real socket against a real daemon (honestly
+ * refused, for the structural reason above, not a stand-in), and every
+ * behavioural claim -- a stored hash, a bound enforced before a write, a
+ * restart's own survival -- is checked by driving `atlas_writer_memory_put`,
+ * `atlas_writer_submit_memory_reconcile` and the database reads beneath
+ * `memory.status` directly, exactly as `atlas_writer_call_repo_scanner` and
+ * `atlas_db_repo_set_scanner_uid` are already tested one layer below their
+ * own RPC method. */
+
+/* Read a scalar off an arbitrary handle, `t8_scalar`'s own shape but not tied
+ * to a `t8env` -- needed here because several cases deliberately hold a
+ * *readonly* handle (a fresh one, or one opened after the writer closed
+ * its own) rather than `t8env`'s writable `e->db`. */
+static int64_t t11_scalar(atlas_db *db, const char *sql, atlas_err *err) {
+    sqlite3_stmt *stmt = NULL;
+    T_OK(atlas_db_prepare(db, sql, &stmt, err), err);
+    int step = sqlite3_step(stmt);
+    T_REQUIRE_MSG(step == SQLITE_ROW, "scalar query did not yield a row: %s", sql);
+    int64_t v = sqlite3_column_int64(stmt, 0);
+    atlas_db_finish(db, stmt);
+    return v;
+}
+
+/* Opens a fresh writer against `e`'s database, logging to `/dev/null`. Every
+ * T11 case that drives `atlas_writer_memory_put` needs exactly this, and nine
+ * copies of six lines is nine chances for one of them to leak a log fd. */
+static void t11_writer_open(t8env *e, FILE **log_out, atlas_writer **w_out, atlas_err *err) {
+    FILE *log = fopen("/dev/null", "we");
+    T_REQUIRE_MSG(log != NULL, "cannot open a log sink");
+    atlas_writer *w = NULL;
+    T_OK(atlas_writer_start(atlas_buf_cstr(&e->db_path), fx_data_dir(&e->fx), "", NULL, log, &w,
+                            err),
+         err);
+    *log_out = log;
+    *w_out = w;
+}
+
+static void t11_writer_close(FILE *log, atlas_writer *w) {
+    atlas_writer_stop(w);
+    (void)fclose(log);
+}
+
+static void test_memory_operator_methods_are_wired(void) {
+    size_t n = 0;
+    const atlas_method_entry *m = atlas_server_operator_methods(&n);
+    bool has_put = false;
+    bool has_status = false;
+    bool has_reconcile = false;
+    for (size_t i = 0; i < n; i++) {
+        if (strcmp(m[i].name, "memory.put") == 0) {
+            has_put = true;
+        }
+        if (strcmp(m[i].name, "memory.status") == 0) {
+            has_status = true;
+        }
+        if (strcmp(m[i].name, "memory.reconcile") == 0) {
+            has_reconcile = true;
+        }
+    }
+    T_CHECK_MSG(has_put, "memory.put is not in the operator method table");
+    T_CHECK_MSG(has_status, "memory.status is not in the operator method table");
+    T_CHECK_MSG(has_reconcile, "memory.reconcile is not in the operator method table");
+}
+
+/* Acceptance item: from a peer the root-owned authority policy does not grant
+ * -- which every test process in this build tree structurally is, see this
+ * section's own header comment -- all three answer `unknown method`, driven
+ * over a real socket against a real forked daemon so the check exercises
+ * `atlas_server_dispatch`'s actual routing rather than assuming it. */
+static void test_memory_methods_refuse_a_non_operator_peer(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    fixture fx;
+    T_OK(fx_open(&fx, &err), &err);
+    T_OK(fx_init_repo(&fx, fx_repo(&fx), NULL, &err), &err);
+    T_OK(fx_write(fx_repo(&fx), "a.c", "int main(void){return 0;}\n", &err), &err);
+    T_OK(fx_add_all(&fx, fx_repo(&fx), &err), &err);
+    T_OK(fx_commit(&fx, fx_repo(&fx), "first", &err), &err);
+    {
+        const char *add[] = {"--data-dir", fx_data_dir(&fx), "repo", "add", fx_repo(&fx),
+                             "--name", "proj"};
+        int code = -1;
+        T_OK(fx_atlas(add, 7u, NULL, NULL, &code, &err), &err);
+        T_EQ_INT(code, 0);
+    }
+
+    fx_daemon d;
+    fx_daemon_init(&d);
+    T_REQUIRE(fx_daemon_start(&fx, &d, &err) == ATLAS_OK);
+    T_REQUIRE(fx_daemon_wait_ready(&d, 15000, &err) == ATLAS_OK);
+
+    static const char *const METHODS[] = {"memory.put", "memory.status", "memory.reconcile"};
+    for (size_t i = 0; i < sizeof METHODS / sizeof METHODS[0]; i++) {
+        atlas_buf resp = ATLAS_BUF_INIT;
+        atlas_err e2;
+        atlas_err_init(&e2);
+        (void)atlas_ipc_call(atlas_buf_cstr(&d.socket), METHODS[i], "{\"repo\":\"proj\"}", &resp,
+                             &e2);
+        T_CHECK_MSG(strstr(atlas_buf_cstr(&resp), "unknown method") != NULL,
+                    "%s answered something other than unknown for a non-operator peer: %s",
+                    METHODS[i], atlas_buf_cstr(&resp));
+        atlas_buf_free(&resp);
+    }
+
+    fx_daemon_stop(&d, false);
+    fx_daemon_free(&d);
+    fx_close(&fx);
+}
+
+static void test_put_stores_a_version_with_matching_hash(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    t8env e;
+    t8_env_open(&e, &err);
+
+    int64_t source_id = 0;
+    atlas_buf source_uid = ATLAS_BUF_INIT;
+    static const char PATH[] = "/home/u/notes.md";
+    T_OK(atlas_db_memory_source_upsert(e.db, e.repo_id, ATLAS_MEMORY_SOURCE_EXTERNAL_FILE, PATH,
+                                       strlen(PATH), PATH, "t0", &source_id, &source_uid, &err),
+         &err);
+    atlas_db_close(e.db);
+    e.db = NULL;
+
+    FILE *log = NULL;
+    atlas_writer *w = NULL;
+    t11_writer_open(&e, &log, &w, &err);
+
+    atlas_memory_put_op op;
+    atlas_memory_put_op_init(&op);
+    T_OK(atlas_buf_set(&op.source_uid, source_uid.data, source_uid.len, &err), &err);
+    static const char CONTENT[] = "the daemon reads notes.md";
+    T_OK(atlas_buf_set(&op.content, CONTENT, strlen(CONTENT), &err), &err);
+    T_OK(atlas_buf_set_str(&op.observed_at, "2026-01-01T00:00:00Z", &err), &err);
+    op.peer_uid = 1000;
+
+    atlas_memory_put_result res;
+    atlas_memory_put_result_init(&res);
+    T_OK(atlas_writer_memory_put(w, &op, &res, &err), &err);
+
+    char want_hex[ATLAS_SHA256_HEX_LEN + 1u];
+    atlas_sha256_hex(CONTENT, strlen(CONTENT), want_hex);
+    T_CHECK_MSG(strcmp(atlas_buf_cstr(&res.content_sha256), want_hex) == 0,
+                "content_sha256 mismatch: got %s want %s", atlas_buf_cstr(&res.content_sha256),
+                want_hex);
+    T_CHECK_MSG(res.created, "the first put for new content should have created a version");
+    T_CHECK_MSG(res.content_bytes == (int64_t)strlen(CONTENT), "content_bytes mismatch: got %lld",
+                (long long)res.content_bytes);
+    T_CHECK(res.version_uid.len > 0);
+
+    atlas_memory_put_op_free(&op);
+
+    t11_writer_close(log, w);
+
+    atlas_db *rdb = NULL;
+    T_OK(atlas_db_open_readonly(atlas_buf_cstr(&e.db_path), &rdb, &err), &err);
+    atlas_memory_version_row row;
+    atlas_memory_version_row_init(&row);
+    bool found = false;
+    T_OK(atlas_db_memory_version_latest(rdb, source_id, &row, &found, &err), &err);
+    T_REQUIRE(found);
+    T_CHECK_MSG(strcmp(atlas_buf_cstr(&row.content_sha256), want_hex) == 0,
+                "the stored row's hash does not match the bytes that were put");
+    T_CHECK_MSG(strcmp(atlas_buf_cstr(&row.version_uid), atlas_buf_cstr(&res.version_uid)) == 0,
+                "the stored row's uid does not match what memory.put reported");
+    atlas_memory_version_row_free(&row);
+    atlas_db_close(rdb);
+
+    atlas_memory_put_result_free(&res);
+    atlas_buf_free(&source_uid);
+    t8_env_close(&e);
+}
+
+/* A13's rule, one layer over: a refusal names no repository and no path.
+ * Two different unregistered uids must produce byte-identical refusals, and
+ * neither refusal may name the (fabricated) uid that was actually tried --
+ * an inventory handed to whoever asked is not a refusal. */
+static void test_put_unregistered_source_names_nothing(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    t8env e;
+    t8_env_open(&e, &err);
+    atlas_db_close(e.db);
+    e.db = NULL;
+
+    FILE *log = NULL;
+    atlas_writer *w = NULL;
+    t11_writer_open(&e, &log, &w, &err);
+
+    static const char *const UIDS[] = {"mdeadbeefdeadbeefdeadbeefdeadbee",
+                                       "mffffffffffffffffffffffffffffff"};
+    atlas_buf messages[2] = {ATLAS_BUF_INIT, ATLAS_BUF_INIT};
+    for (size_t i = 0; i < 2; i++) {
+        atlas_memory_put_op op;
+        atlas_memory_put_op_init(&op);
+        T_OK(atlas_buf_set_str(&op.source_uid, UIDS[i], &err), &err);
+        T_OK(atlas_buf_set_str(&op.content, "x", &err), &err);
+        T_OK(atlas_buf_set_str(&op.observed_at, "t0", &err), &err);
+        op.peer_uid = 1000;
+        atlas_memory_put_result res;
+        atlas_memory_put_result_init(&res);
+        atlas_err perr;
+        atlas_err_init(&perr);
+        atlas_status st = atlas_writer_memory_put(w, &op, &res, &perr);
+        T_CHECK_MSG(st != ATLAS_OK, "a put against an unregistered source uid was accepted");
+        T_OK(atlas_buf_set_str(&messages[i], atlas_err_msg(&perr), &err), &err);
+        atlas_memory_put_op_free(&op);
+        atlas_memory_put_result_free(&res);
+    }
+    T_CHECK_MSG(strcmp(atlas_buf_cstr(&messages[0]), atlas_buf_cstr(&messages[1])) == 0,
+                "two different unregistered uids produced different refusals: [%s] vs [%s]",
+                atlas_buf_cstr(&messages[0]), atlas_buf_cstr(&messages[1]));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&messages[0]), UIDS[0]) == NULL,
+                "the refusal named the uid that was tried");
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&messages[0]), UIDS[1]) == NULL,
+                "the refusal named a uid it was never even given");
+
+    atlas_buf_free(&messages[0]);
+    atlas_buf_free(&messages[1]);
+    t11_writer_close(log, w);
+    t8_env_close(&e);
+}
+
+/* Bytes over ATLAS_MEMORY_MAX_SOURCE_BYTES are refused before anything is
+ * queued: the row count must not move. */
+static void test_put_over_bound_is_refused_before_queueing(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    t8env e;
+    t8_env_open(&e, &err);
+
+    int64_t source_id = 0;
+    atlas_buf source_uid = ATLAS_BUF_INIT;
+    static const char PATH[] = "/home/u/big.md";
+    T_OK(atlas_db_memory_source_upsert(e.db, e.repo_id, ATLAS_MEMORY_SOURCE_EXTERNAL_FILE, PATH,
+                                       strlen(PATH), PATH, "t0", &source_id, &source_uid, &err),
+         &err);
+    int64_t before = t11_scalar(e.db, "SELECT COUNT(*) FROM memory_source_versions;", &err);
+    atlas_db_close(e.db);
+    e.db = NULL;
+
+    FILE *log = NULL;
+    atlas_writer *w = NULL;
+    t11_writer_open(&e, &log, &w, &err);
+
+    atlas_memory_put_op op;
+    atlas_memory_put_op_init(&op);
+    T_OK(atlas_buf_set(&op.source_uid, source_uid.data, source_uid.len, &err), &err);
+    size_t big = (size_t)ATLAS_MEMORY_MAX_SOURCE_BYTES + 1u;
+    char *buf = malloc(big);
+    T_REQUIRE(buf != NULL);
+    memset(buf, 'a', big);
+    T_OK(atlas_buf_set(&op.content, buf, big, &err), &err);
+    free(buf);
+    T_OK(atlas_buf_set_str(&op.observed_at, "t0", &err), &err);
+    op.peer_uid = 1000;
+
+    atlas_memory_put_result res;
+    atlas_memory_put_result_init(&res);
+    atlas_status st = atlas_writer_memory_put(w, &op, &res, &err);
+    T_CHECK_MSG(st != ATLAS_OK, "an oversized put was accepted");
+    atlas_memory_put_op_free(&op);
+    atlas_memory_put_result_free(&res);
+    t11_writer_close(log, w);
+
+    atlas_db *rdb = NULL;
+    T_OK(atlas_db_open_readonly(atlas_buf_cstr(&e.db_path), &rdb, &err), &err);
+    int64_t after = t11_scalar(rdb, "SELECT COUNT(*) FROM memory_source_versions;", &err);
+    atlas_db_close(rdb);
+    T_CHECK_MSG(after == before, "the version row count moved from %lld to %lld despite the refusal",
+                (long long)before, (long long)after);
+
+    atlas_buf_free(&source_uid);
+    t8_env_close(&e);
+}
+
+/* Only an EXTERNAL_* source accepts memory.put -- a REPO_* source is read
+ * directly by the daemon or by a named scanner's mirror, and a client handing
+ * over bytes for one would let a caller assert content the daemon never
+ * itself read. */
+static void test_put_refuses_a_repo_class_source(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    t8env e;
+    t8_env_open(&e, &err);
+
+    int64_t source_id = 0;
+    atlas_buf source_uid = ATLAS_BUF_INIT;
+    static const char PATH[] = "a.c";
+    T_OK(atlas_db_memory_source_upsert(e.db, e.repo_id, ATLAS_MEMORY_SOURCE_REPO_FILE, PATH,
+                                       strlen(PATH), PATH, "t0", &source_id, &source_uid, &err),
+         &err);
+    atlas_db_close(e.db);
+    e.db = NULL;
+
+    FILE *log = NULL;
+    atlas_writer *w = NULL;
+    t11_writer_open(&e, &log, &w, &err);
+
+    atlas_memory_put_op op;
+    atlas_memory_put_op_init(&op);
+    T_OK(atlas_buf_set(&op.source_uid, source_uid.data, source_uid.len, &err), &err);
+    T_OK(atlas_buf_set_str(&op.content, "x", &err), &err);
+    T_OK(atlas_buf_set_str(&op.observed_at, "t0", &err), &err);
+    op.peer_uid = 1000;
+    atlas_memory_put_result res;
+    atlas_memory_put_result_init(&res);
+    atlas_status st = atlas_writer_memory_put(w, &op, &res, &err);
+    T_CHECK_MSG(st != ATLAS_OK, "a put against a REPO_FILE source was accepted");
+    atlas_memory_put_op_free(&op);
+    atlas_memory_put_result_free(&res);
+
+    t11_writer_close(log, w);
+    atlas_buf_free(&source_uid);
+    t8_env_close(&e);
+}
+
+/* rel_path is a class-consistency check, never stored: absent or malformed
+ * for a *_DIR source is refused, and T6's own DIR contract (one path
+ * component, ATLAS_MEMORY_DIR_SUFFIX) is enforced rather than merely hoped
+ * for. */
+static void test_put_dir_source_needs_a_dot_md_child(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    t8env e;
+    t8_env_open(&e, &err);
+
+    int64_t source_id = 0;
+    atlas_buf source_uid = ATLAS_BUF_INIT;
+    static const char PATH[] = "/home/u/notes";
+    T_OK(atlas_db_memory_source_upsert(e.db, e.repo_id, ATLAS_MEMORY_SOURCE_EXTERNAL_DIR, PATH,
+                                       strlen(PATH), PATH, "t0", &source_id, &source_uid, &err),
+         &err);
+    atlas_db_close(e.db);
+    e.db = NULL;
+
+    FILE *log = NULL;
+    atlas_writer *w = NULL;
+    t11_writer_open(&e, &log, &w, &err);
+
+    static const char *const BAD_REL[] = {"", "sub/x.md", "notes.txt", ".", ".."};
+    for (size_t i = 0; i < sizeof BAD_REL / sizeof BAD_REL[0]; i++) {
+        atlas_memory_put_op op;
+        atlas_memory_put_op_init(&op);
+        T_OK(atlas_buf_set(&op.source_uid, source_uid.data, source_uid.len, &err), &err);
+        T_OK(atlas_buf_set_str(&op.rel_path, BAD_REL[i], &err), &err);
+        T_OK(atlas_buf_set_str(&op.content, "x", &err), &err);
+        T_OK(atlas_buf_set_str(&op.observed_at, "t0", &err), &err);
+        op.peer_uid = 1000;
+        atlas_memory_put_result res;
+        atlas_memory_put_result_init(&res);
+        atlas_status st = atlas_writer_memory_put(w, &op, &res, &err);
+        T_CHECK_MSG(st != ATLAS_OK, "rel_path \"%s\" should have been refused for a *_DIR source",
+                    BAD_REL[i]);
+        atlas_memory_put_op_free(&op);
+        atlas_memory_put_result_free(&res);
+    }
+
+    atlas_memory_put_op op;
+    atlas_memory_put_op_init(&op);
+    T_OK(atlas_buf_set(&op.source_uid, source_uid.data, source_uid.len, &err), &err);
+    T_OK(atlas_buf_set_str(&op.rel_path, "notes.md", &err), &err);
+    T_OK(atlas_buf_set_str(&op.content, "x", &err), &err);
+    T_OK(atlas_buf_set_str(&op.observed_at, "t0", &err), &err);
+    op.peer_uid = 1000;
+    atlas_memory_put_result res;
+    atlas_memory_put_result_init(&res);
+    T_OK(atlas_writer_memory_put(w, &op, &res, &err), &err);
+    atlas_memory_put_op_free(&op);
+    atlas_memory_put_result_free(&res);
+
+    t11_writer_close(log, w);
+    atlas_buf_free(&source_uid);
+    t8_env_close(&e);
+}
+
+/* atlas_db_memory_version_exists' own dedup: the same content put twice for
+ * one source is one row, and the second call reports created=false while
+ * still naming the row that answers for these bytes. */
+static void test_put_same_content_twice_is_not_a_new_version(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    t8env e;
+    t8_env_open(&e, &err);
+
+    int64_t source_id = 0;
+    atlas_buf source_uid = ATLAS_BUF_INIT;
+    static const char PATH[] = "/home/u/notes.md";
+    T_OK(atlas_db_memory_source_upsert(e.db, e.repo_id, ATLAS_MEMORY_SOURCE_EXTERNAL_FILE, PATH,
+                                       strlen(PATH), PATH, "t0", &source_id, &source_uid, &err),
+         &err);
+    atlas_db_close(e.db);
+    e.db = NULL;
+
+    FILE *log = NULL;
+    atlas_writer *w = NULL;
+    t11_writer_open(&e, &log, &w, &err);
+
+    atlas_buf uid1 = ATLAS_BUF_INIT;
+    atlas_buf uid2 = ATLAS_BUF_INIT;
+    for (int i = 0; i < 2; i++) {
+        atlas_memory_put_op op;
+        atlas_memory_put_op_init(&op);
+        T_OK(atlas_buf_set(&op.source_uid, source_uid.data, source_uid.len, &err), &err);
+        T_OK(atlas_buf_set_str(&op.content, "the same bytes every time", &err), &err);
+        T_OK(atlas_buf_set_str(&op.observed_at, i == 0 ? "t0" : "t1", &err), &err);
+        op.peer_uid = 1000;
+        atlas_memory_put_result res;
+        atlas_memory_put_result_init(&res);
+        T_OK(atlas_writer_memory_put(w, &op, &res, &err), &err);
+        if (i == 0) {
+            T_CHECK_MSG(res.created, "the first put of new content should have created a version");
+            T_OK(atlas_buf_set(&uid1, res.version_uid.data, res.version_uid.len, &err), &err);
+        } else {
+            T_CHECK_MSG(!res.created, "putting identical content again should not create a new "
+                                      "version");
+            T_OK(atlas_buf_set(&uid2, res.version_uid.data, res.version_uid.len, &err), &err);
+        }
+        atlas_memory_put_op_free(&op);
+        atlas_memory_put_result_free(&res);
+    }
+    T_CHECK_MSG(strcmp(atlas_buf_cstr(&uid1), atlas_buf_cstr(&uid2)) == 0,
+                "a dedup'd put reported a different version uid: %s vs %s", atlas_buf_cstr(&uid1),
+                atlas_buf_cstr(&uid2));
+
+    t11_writer_close(log, w);
+
+    atlas_db *rdb = NULL;
+    T_OK(atlas_db_open_readonly(atlas_buf_cstr(&e.db_path), &rdb, &err), &err);
+    char sql[256];
+    (void)snprintf(sql, sizeof sql,
+                  "SELECT COUNT(*) FROM memory_source_versions WHERE source_id = %lld;",
+                  (long long)source_id);
+    T_CHECK_MSG(t11_scalar(rdb, sql, &err) == 1,
+                "identical content put twice should still be exactly one version row");
+    atlas_db_close(rdb);
+
+    atlas_buf_free(&uid1);
+    atlas_buf_free(&uid2);
+    atlas_buf_free(&source_uid);
+    t8_env_close(&e);
+}
+
+/* Waits for one memory reconciliation to land a generation, the way a caller
+ * would poll memory.status rather than a guessed sleep -- fx_wait_for_
+ * substring's own discipline, one layer down at the database instead of the
+ * socket. */
+static bool t11_wait_for_generation(t8env *e, int64_t *gen_out, atlas_err *err) {
+    for (int i = 0; i < 250; i++) {
+        atlas_db *rdb = NULL;
+        if (atlas_db_open_readonly(atlas_buf_cstr(&e->db_path), &rdb, err) == ATLAS_OK) {
+            int64_t gen = 0;
+            atlas_buf head = ATLAS_BUF_INIT;
+            atlas_buf dd = ATLAS_BUF_INIT;
+            atlas_buf sd = ATLAS_BUF_INIT;
+            bool found = false;
+            atlas_status st =
+                atlas_db_memory_generation_latest(rdb, e->repo_id, &gen, &head, &dd, &sd, &found,
+                                                  err);
+            atlas_buf_free(&head);
+            atlas_buf_free(&dd);
+            atlas_buf_free(&sd);
+            atlas_db_close(rdb);
+            if (st == ATLAS_OK && found) {
+                *gen_out = gen;
+                return true;
+            }
+        }
+        usleep(20000);
+    }
+    return false;
+}
+
+/* Acceptance item 4, second half. Two versions of one external source are put
+ * through the writer, one reconciliation pass turns the latest of them into a
+ * claim anchored to a real (seeded) file, and a *fresh daemon process* --
+ * `fx_daemon_start` against the same data directory, after this test's own
+ * writer has stopped -- reads all of it back: the source, both versions in
+ * order and the same generation number through a fresh database handle, and
+ * the claim itself through `verify.claims` / `verify.show` over the real
+ * socket, which is the client group and needs no operator standing to reach.
+ *
+ * `memory.status` itself is not called here -- see this section's own header
+ * comment for why an RPC-layer positive call is not available to any test in
+ * this tree -- so "memory.status shows..." is satisfied by reading exactly
+ * the rows that method would read, through the same typed functions it uses
+ * (`atlas_db_memory_source_by_uid`, the raw version rows, `atlas_db_memory_
+ * generation_latest`), against a connection this test opened itself rather
+ * than the one the writer held. */
+static void test_memory_survives_a_daemon_restart(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    t8env e;
+    t8_env_open(&e, &err);
+
+    const char *repo = fx_repo(&e.fx);
+    T_OK(fx_mkdir(repo, "src", &err), &err);
+    T_OK(fx_write(repo, "src/a.c", "int x;\n", &err), &err);
+    T_OK(fx_add_all(&e.fx, repo, &err), &err);
+    T_OK(fx_commit(&e.fx, repo, "seed", &err), &err);
+    t8_bind_head(&e, &err);
+    t8_seed_file(&e, "src/a.c",
+                "1111111111111111111111111111111111111111111111111111111111111111", &err);
+
+    int64_t source_id = 0;
+    atlas_buf source_uid = ATLAS_BUF_INIT;
+    static const char PATH[] = "/home/u/notes.md";
+    T_OK(atlas_db_memory_source_upsert(e.db, e.repo_id, ATLAS_MEMORY_SOURCE_EXTERNAL_FILE, PATH,
+                                       strlen(PATH), PATH, "t0", &source_id, &source_uid, &err),
+         &err);
+    atlas_db_close(e.db);
+    e.db = NULL;
+
+    FILE *log = NULL;
+    atlas_writer *w = NULL;
+    t11_writer_open(&e, &log, &w, &err);
+
+    atlas_buf v1 = ATLAS_BUF_INIT;
+    atlas_buf v2 = ATLAS_BUF_INIT;
+    {
+        atlas_memory_put_op op;
+        atlas_memory_put_op_init(&op);
+        T_OK(atlas_buf_set(&op.source_uid, source_uid.data, source_uid.len, &err), &err);
+        T_OK(atlas_buf_set_str(&op.content, "the daemon reads `src/a.c`", &err), &err);
+        T_OK(atlas_buf_set_str(&op.observed_at, "2026-01-01T00:00:00Z", &err), &err);
+        op.peer_uid = 1000;
+        atlas_memory_put_result res;
+        atlas_memory_put_result_init(&res);
+        T_OK(atlas_writer_memory_put(w, &op, &res, &err), &err);
+        T_OK(atlas_buf_set(&v1, res.version_uid.data, res.version_uid.len, &err), &err);
+        atlas_memory_put_op_free(&op);
+        atlas_memory_put_result_free(&res);
+    }
+    {
+        atlas_memory_put_op op;
+        atlas_memory_put_op_init(&op);
+        T_OK(atlas_buf_set(&op.source_uid, source_uid.data, source_uid.len, &err), &err);
+        T_OK(atlas_buf_set_str(&op.content, "the daemon reads `src/a.c` -- updated", &err), &err);
+        T_OK(atlas_buf_set_str(&op.observed_at, "2026-01-02T00:00:00Z", &err), &err);
+        op.peer_uid = 1000;
+        atlas_memory_put_result res;
+        atlas_memory_put_result_init(&res);
+        T_OK(atlas_writer_memory_put(w, &op, &res, &err), &err);
+        T_OK(atlas_buf_set(&v2, res.version_uid.data, res.version_uid.len, &err), &err);
+        atlas_memory_put_op_free(&op);
+        atlas_memory_put_result_free(&res);
+    }
+    T_CHECK_MSG(strcmp(atlas_buf_cstr(&v1), atlas_buf_cstr(&v2)) != 0,
+                "two puts of different content produced the same version uid");
+
+    /* The caller's own loaded policy -- atlas_writer_submit_memory_reconcile's
+     * own contract -- naming this repository's one external source. */
+    atlas_syspolicy pol;
+    memset(&pol, 0, sizeof pol);
+    pol.state = ATLAS_SYSPOLICY_SYSTEM;
+    pol.memory_source_count = 1;
+    pol.memory_sources[0].cls = ATLAS_MEMORY_SOURCE_EXTERNAL_FILE;
+    pol.memory_sources[0].repo_name[0] = '\0';
+    (void)snprintf(pol.memory_sources[0].path, sizeof pol.memory_sources[0].path, "%s", PATH);
+
+    T_OK(atlas_writer_submit_memory_reconcile(w, e.repo_id, &pol, &err), &err);
+
+    int64_t generation_before = 0;
+    T_REQUIRE_MSG(t11_wait_for_generation(&e, &generation_before, &err),
+                 "the reconciliation pass never landed a generation");
+
+    int64_t claims_before = 0;
+    {
+        atlas_db *rdb = NULL;
+        T_OK(atlas_db_open_readonly(atlas_buf_cstr(&e.db_path), &rdb, &err), &err);
+        char sql[256];
+        (void)snprintf(sql, sizeof sql, "SELECT COUNT(*) FROM verify_claims WHERE repo_id = %lld;",
+                      (long long)e.repo_id);
+        claims_before = t11_scalar(rdb, sql, &err);
+        atlas_db_close(rdb);
+    }
+    T_CHECK_MSG(claims_before >= 1,
+                "expected the reconciliation pass to anchor at least one claim to `src/a.c`");
+
+    /* Stopped before the fresh daemon starts, so this is a genuine restart
+     * against one open writer at a time rather than two writable handles
+     * open on the same file. */
+    t11_writer_close(log, w);
+
+    fx_daemon d;
+    fx_daemon_init(&d);
+    T_REQUIRE(fx_daemon_start(&e.fx, &d, &err) == ATLAS_OK);
+    T_REQUIRE(fx_daemon_wait_ready(&d, 15000, &err) == ATLAS_OK);
+
+    /* A connection this test opened itself, reading exactly what a restarted
+     * process finds on disk -- not the handle the writer held, and not the
+     * daemon's own. */
+    atlas_db *rdb = NULL;
+    T_OK(atlas_db_open_readonly(atlas_buf_cstr(&e.db_path), &rdb, &err), &err);
+
+    int64_t found_id = 0;
+    atlas_memory_source_class found_cls = ATLAS_MEMORY_SOURCE_UNKNOWN;
+    bool src_found = false;
+    T_OK(atlas_db_memory_source_by_uid(rdb, atlas_buf_cstr(&source_uid), &found_id, NULL,
+                                       &found_cls, NULL, NULL, &src_found, &err),
+         &err);
+    T_CHECK_MSG(src_found, "the registered source did not survive a restart");
+    T_CHECK_MSG(found_cls == ATLAS_MEMORY_SOURCE_EXTERNAL_FILE,
+                "the source's class changed across a restart");
+    T_CHECK_MSG(found_id == source_id, "the source's own id changed across a restart");
+
+    sqlite3_stmt *stmt = NULL;
+    T_OK(atlas_db_prepare(rdb,
+                          "SELECT version_uid FROM memory_source_versions"
+                          " WHERE source_id = ?1 ORDER BY id ASC;",
+                          &stmt, &err),
+         &err);
+    T_REQUIRE(sqlite3_bind_int64(stmt, 1, found_id) == SQLITE_OK);
+    char got1[64];
+    char got2[64];
+    memset(got1, 0, sizeof got1);
+    memset(got2, 0, sizeof got2);
+    int count = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const unsigned char *u = sqlite3_column_text(stmt, 0);
+        if (count == 0) {
+            (void)snprintf(got1, sizeof got1, "%s", u != NULL ? (const char *)u : "");
+        } else if (count == 1) {
+            (void)snprintf(got2, sizeof got2, "%s", u != NULL ? (const char *)u : "");
+        }
+        count++;
+    }
+    atlas_db_finish(rdb, stmt);
+    T_CHECK_MSG(count == 2, "expected two version rows to survive the restart, found %d", count);
+    T_CHECK_MSG(strcmp(got1, atlas_buf_cstr(&v1)) == 0,
+                "the first version's uid changed across a restart: %s vs %s", got1,
+                atlas_buf_cstr(&v1));
+    T_CHECK_MSG(strcmp(got2, atlas_buf_cstr(&v2)) == 0,
+                "the second version's uid changed across a restart: %s vs %s", got2,
+                atlas_buf_cstr(&v2));
+
+    int64_t generation_after = 0;
+    atlas_buf head2 = ATLAS_BUF_INIT;
+    atlas_buf dd2 = ATLAS_BUF_INIT;
+    atlas_buf sd2 = ATLAS_BUF_INIT;
+    bool gen_found2 = false;
+    T_OK(atlas_db_memory_generation_latest(rdb, e.repo_id, &generation_after, &head2, &dd2, &sd2,
+                                           &gen_found2, &err),
+         &err);
+    atlas_buf_free(&head2);
+    atlas_buf_free(&dd2);
+    atlas_buf_free(&sd2);
+    T_CHECK_MSG(gen_found2, "no generation survived the restart");
+    T_CHECK_MSG(generation_after == generation_before,
+                "the generation number moved across a restart: %lld -> %lld",
+                (long long)generation_before, (long long)generation_after);
+
+    atlas_db_close(rdb);
+
+    /* The claim itself, read by a process that did not create it -- O10's
+     * "accepted must mean committed and rediscoverable", one layer over, and
+     * through the client group's own verify.claims / verify.show rather than
+     * the operator-gated memory.status this test cannot reach. */
+    atlas_buf resp = ATLAS_BUF_INIT;
+    T_OK(atlas_ipc_call(atlas_buf_cstr(&d.socket), "verify.claims", "{\"repo\":\"proj\"}", &resp,
+                        &err),
+         &err);
+    atlas_ipc_response *cr = NULL;
+    T_OK(atlas_ipc_response_parse(resp.data, resp.len, &cr, &err), &err);
+    T_REQUIRE(cr != NULL);
+    T_CHECK_MSG(atlas_ipc_response_ok(cr), "verify.claims failed after a restart: %s",
+                atlas_buf_cstr(&resp));
+    int64_t count_after = -1;
+    (void)atlas_ipc_result_int(cr, "count", &count_after);
+    T_CHECK_MSG(count_after == claims_before,
+                "the restarted daemon reported %lld claims where %lld were expected",
+                (long long)count_after, (long long)claims_before);
+    const char *claim_uid = NULL;
+    bool has_claim = atlas_ipc_result_arr_obj_str(cr, "claims", 0, "claim", &claim_uid);
+    T_REQUIRE_MSG(has_claim && claim_uid != NULL,
+                 "verify.claims carried no claim uid to follow up on");
+
+    char params[256];
+    (void)snprintf(params, sizeof params, "{\"claim\":\"%s\"}", claim_uid);
+    atlas_buf resp2 = ATLAS_BUF_INIT;
+    T_OK(atlas_ipc_call(atlas_buf_cstr(&d.socket), "verify.show", params, &resp2, &err), &err);
+    atlas_ipc_response *sr = NULL;
+    T_OK(atlas_ipc_response_parse(resp2.data, resp2.len, &sr, &err), &err);
+    T_REQUIRE(sr != NULL);
+    T_CHECK_MSG(atlas_ipc_response_ok(sr), "verify.show could not show the surviving claim: %s",
+                atlas_buf_cstr(&resp2));
+    const char *echoed = NULL;
+    (void)atlas_ipc_result_str(sr, "claim", &echoed);
+    T_CHECK_MSG(echoed != NULL && strcmp(echoed, claim_uid) == 0,
+                "verify.show echoed a different claim than the one asked for");
+    atlas_ipc_response_free(sr);
+    atlas_buf_free(&resp2);
+    atlas_ipc_response_free(cr);
+    atlas_buf_free(&resp);
+
+    fx_daemon_stop(&d, false);
+    fx_daemon_free(&d);
+
+    atlas_buf_free(&v1);
+    atlas_buf_free(&v2);
+    atlas_buf_free(&source_uid);
+    t8_env_close(&e);
+}
+
 static const atlas_test TESTS[] = {
     {"REPO_FILE reads tracked bytes", test_repo_file_reads_tracked_bytes},
     {"REPO_FILE missing path is ABSENT", test_repo_file_missing_path_is_absent},
@@ -4069,6 +4796,24 @@ static const atlas_test TESTS[] = {
      test_dir_hash_mismatch_escapes_a_literal_percent_in_its_own_path},
     {"C3 fix-round-3/4: dir_hash_mismatch excludes the five unreadable doors",
      test_dir_hash_mismatch_excludes_the_five_unreadable_doors},
+    /* T11: memory.put, memory.status, memory.reconcile. */
+    {"the three memory RPC names are wired into the operator method table",
+     test_memory_operator_methods_are_wired},
+    {"memory.put/status/reconcile refuse a non-operator peer over a real socket",
+     test_memory_methods_refuse_a_non_operator_peer},
+    {"memory.put stores a version whose content_sha256 matches the bytes",
+     test_put_stores_a_version_with_matching_hash},
+    {"memory.put against an unregistered source names nothing",
+     test_put_unregistered_source_names_nothing},
+    {"memory.put refuses content over the bound before queueing anything",
+     test_put_over_bound_is_refused_before_queueing},
+    {"memory.put refuses a REPO_* source", test_put_refuses_a_repo_class_source},
+    {"memory.put's rel_path must name one *_DIR child ending in .md",
+     test_put_dir_source_needs_a_dot_md_child},
+    {"memory.put on unchanged content does not create a new version",
+     test_put_same_content_twice_is_not_a_new_version},
+    {"acceptance item 4: reconciled memory survives a daemon restart",
+     test_memory_survives_a_daemon_restart},
 };
 
 ATLAS_TEST_MAIN("memory_reconcile", TESTS)

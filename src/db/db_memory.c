@@ -132,6 +132,108 @@ atlas_status atlas_db_memory_version_by_uid(atlas_db *db, const char *uid,
     return st;
 }
 
+atlas_status atlas_db_memory_source_by_uid(atlas_db *db, const char *uid, int64_t *id_out,
+                                           int64_t *repo_id_out, atlas_memory_source_class *cls_out,
+                                           atlas_buf *path_raw_out, atlas_buf *path_text_out,
+                                           bool *found_out, atlas_err *err) {
+    if (found_out != NULL) {
+        *found_out = false;
+    }
+    if (id_out != NULL) {
+        *id_out = 0;
+    }
+    if (repo_id_out != NULL) {
+        *repo_id_out = 0;
+    }
+    if (cls_out != NULL) {
+        *cls_out = ATLAS_MEMORY_SOURCE_UNKNOWN;
+    }
+    if (db == NULL || uid == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "no memory source lookup to run");
+    }
+    static const char SQL[] =
+        "SELECT id, repo_id, cls, path_raw, path_text FROM memory_sources"
+        " WHERE source_uid = ?1;";
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(db, SQL, &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    st = atlas_db_bind_text_opt(db, stmt, 1, uid, err);
+    if (st == ATLAS_OK && sqlite3_step(stmt) == SQLITE_ROW) {
+        if (id_out != NULL) {
+            *id_out = sqlite3_column_int64(stmt, 0);
+        }
+        if (repo_id_out != NULL) {
+            *repo_id_out = sqlite3_column_int64(stmt, 1);
+        }
+        if (cls_out != NULL) {
+            const char *cn = (const char *)sqlite3_column_text(stmt, 2);
+            if (!atlas_memory_source_class_parse(cn != NULL ? cn : "", cls_out)) {
+                *cls_out = ATLAS_MEMORY_SOURCE_UNKNOWN;
+            }
+        }
+        if (st == ATLAS_OK && path_raw_out != NULL) {
+            const void *blob = sqlite3_column_blob(stmt, 3);
+            int blen = sqlite3_column_bytes(stmt, 3);
+            st = atlas_buf_set(path_raw_out, blob, blen > 0 ? (size_t)blen : 0u, err);
+        }
+        if (st == ATLAS_OK && path_text_out != NULL) {
+            st = take_col(path_text_out, stmt, 4, err);
+        }
+        if (st == ATLAS_OK && found_out != NULL) {
+            *found_out = true;
+        }
+    }
+    atlas_db_finish(db, stmt);
+    return st;
+}
+
+atlas_status atlas_db_memory_source_list(atlas_db *db, int64_t repo_id, atlas_memory_source_cb cb,
+                                         void *ctx, atlas_err *err) {
+    if (db == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "no memory source list to run");
+    }
+    static const char SQL[] =
+        "SELECT id, source_uid, cls, path_text, registered_at FROM memory_sources"
+        " WHERE repo_id = ?1 ORDER BY id ASC;";
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(db, SQL, &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, repo_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the repository id");
+    }
+    for (;;) {
+        int rc = sqlite3_step(stmt);
+        if (rc == SQLITE_DONE) {
+            break;
+        }
+        if (rc != SQLITE_ROW) {
+            st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot list memory sources");
+            break;
+        }
+        int64_t id = sqlite3_column_int64(stmt, 0);
+        const char *uid = (const char *)sqlite3_column_text(stmt, 1);
+        const char *cn = (const char *)sqlite3_column_text(stmt, 2);
+        const char *path_text = (const char *)sqlite3_column_text(stmt, 3);
+        const char *registered_at = (const char *)sqlite3_column_text(stmt, 4);
+        atlas_memory_source_class cls = ATLAS_MEMORY_SOURCE_UNKNOWN;
+        (void)atlas_memory_source_class_parse(cn != NULL ? cn : "", &cls);
+        if (cb != NULL) {
+            st = cb(id, uid != NULL ? uid : "", cls, path_text != NULL ? path_text : "",
+                   registered_at != NULL ? registered_at : "", ctx, err);
+            if (st != ATLAS_OK) {
+                break;
+            }
+        }
+    }
+    atlas_db_finish(db, stmt);
+    return st;
+}
+
 /* --- T8: the reconciliation pass's own typed operations --------------------
  *
  * Called only from inside the apply phase's transaction (`atlas_memory_apply_

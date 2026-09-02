@@ -212,6 +212,44 @@ void atlas_writer_result_free(atlas_writer_result *r) {
     atlas_buf_free(&r->root_text);
 }
 
+void atlas_memory_put_op_init(atlas_memory_put_op *op) {
+    if (op == NULL) {
+        return;
+    }
+    memset(op, 0, sizeof(*op));
+    atlas_buf_init(&op->source_uid);
+    atlas_buf_init(&op->rel_path);
+    atlas_buf_init(&op->content);
+    atlas_buf_init(&op->observed_at);
+}
+
+void atlas_memory_put_op_free(atlas_memory_put_op *op) {
+    if (op == NULL) {
+        return;
+    }
+    atlas_buf_free(&op->source_uid);
+    atlas_buf_free(&op->rel_path);
+    atlas_buf_free(&op->content);
+    atlas_buf_free(&op->observed_at);
+}
+
+void atlas_memory_put_result_init(atlas_memory_put_result *r) {
+    if (r == NULL) {
+        return;
+    }
+    memset(r, 0, sizeof(*r));
+    atlas_buf_init(&r->version_uid);
+    atlas_buf_init(&r->content_sha256);
+}
+
+void atlas_memory_put_result_free(atlas_memory_put_result *r) {
+    if (r == NULL) {
+        return;
+    }
+    atlas_buf_free(&r->version_uid);
+    atlas_buf_free(&r->content_sha256);
+}
+
 /* Copies the identifying fields of a repository into a job result. */
 static atlas_status job_set_result(atlas_job *j, const atlas_repo_info *ri, atlas_err *err) {
     j->result_id = ri->id;
@@ -705,6 +743,144 @@ static void run_reconcile(atlas_writer *w, atlas_job *j) {
     atlas_git_close(g);
     atlas_repo_info_free(&info);
     atlas_safe_pool_free(&safe);
+}
+
+/* A12.1 T11. `memory.put`'s one typed write: appends a version row for a
+ * registered *external* source, from bytes `atlas_writer_memory_put` already
+ * hex-decoded and bound-checked before this job was ever queued.
+ *
+ * `j->memory_put`/`j->memory_put_out` are borrowed, `ATLAS_JOB_APIKEY`'s own
+ * shape: NULL means the caller gave up before this ran, and this is then
+ * exactly a no-op, never a write into a stack or a struct that has since gone
+ * away.
+ *
+ * **Only an `EXTERNAL_*` source is accepted here.** A `REPO_*` source is read
+ * directly by the daemon or by a named scanner's mirror (A13's routing,
+ * `atlas_memory_read_source`) -- a client handing over bytes for one would let
+ * a caller assert content the daemon has never itself read, which is exactly
+ * what `atlas_memory_observed_source.external_latest`'s own comment reserves
+ * for a *different* principal reading an external path. `rel_path` is a
+ * class-consistency check only, never stored -- `memory_source_versions` has
+ * no column for it, and the struct's own comment in daemon_internal.h says
+ * why: two byte-identical children are one version row, so a version's
+ * identity is its content, never a child's name. For a `*_DIR` source it must
+ * be exactly one path component ending in `ATLAS_MEMORY_DIR_SUFFIX`, T6's own
+ * DIR contract (`src/memory/read.c`'s `readdir` loop admits nothing else) --
+ * an operator naming a nested path or a non-`.md` name would be naming
+ * something the reconciliation pass could never itself have produced. */
+static void run_memory(atlas_writer *w, atlas_job *j) {
+    if (j->memory_put == NULL || j->memory_put_out == NULL) {
+        return;
+    }
+    const atlas_memory_put_op *op = j->memory_put;
+    atlas_memory_put_result *out = j->memory_put_out;
+
+    /* Read-only resolution and validation, deliberately outside any
+     * transaction: A1 has no objection to a plain database read here, but
+     * there is nothing yet worth wrapping one open for. */
+    int64_t source_id = 0;
+    atlas_memory_source_class cls = ATLAS_MEMORY_SOURCE_UNKNOWN;
+    bool found = false;
+    atlas_status st = atlas_db_memory_source_by_uid(w->db, atlas_buf_cstr(&op->source_uid),
+                                                     &source_id, NULL, &cls, NULL, NULL, &found,
+                                                     &j->result_err);
+    if (st == ATLAS_OK && !found) {
+        /* Names no path and no other source -- A13's rule that a refusal is
+         * not an inventory handed to whoever asked. */
+        st = atlas_err_set(&j->result_err, ATLAS_ERR_REPO,
+                           "no registered memory source has that uid");
+    }
+    if (st == ATLAS_OK && atlas_memory_source_class_is_repo(cls)) {
+        st = atlas_err_set(&j->result_err, ATLAS_ERR_USAGE,
+                           "this source is read directly; memory.put is for an external one");
+    }
+    bool is_dir = (cls == ATLAS_MEMORY_SOURCE_EXTERNAL_DIR);
+    if (st == ATLAS_OK) {
+        size_t rlen = op->rel_path.len;
+        const char *rel = rlen > 0 ? (const char *)op->rel_path.data : "";
+        if (is_dir) {
+            size_t suflen = strlen(ATLAS_MEMORY_DIR_SUFFIX);
+            bool has_slash = memchr(rel, '/', rlen) != NULL;
+            bool is_dotdot =
+                (rlen == 1 && rel[0] == '.') || (rlen == 2 && rel[0] == '.' && rel[1] == '.');
+            bool has_suffix = rlen > suflen &&
+                              memcmp(rel + (rlen - suflen), ATLAS_MEMORY_DIR_SUFFIX, suflen) == 0;
+            if (rlen == 0 || has_slash || is_dotdot || !has_suffix) {
+                st = atlas_err_set(&j->result_err, ATLAS_ERR_USAGE,
+                                   "a directory source needs rel_path naming one %s child",
+                                   ATLAS_MEMORY_DIR_SUFFIX);
+            }
+        } else if (rlen > 0) {
+            st = atlas_err_set(&j->result_err, ATLAS_ERR_USAGE, "a file source takes no rel_path");
+        }
+    }
+    if (st != ATLAS_OK) {
+        j->result = st;
+        return;
+    }
+
+    char sha_hex[ATLAS_SHA256_HEX_LEN + 1u];
+    atlas_sha256_hex(op->content.data != NULL ? op->content.data : "", op->content.len, sha_hex);
+    int64_t content_bytes = (int64_t)op->content.len;
+
+    /* The dedup read, also outside any transaction and for the same reason:
+     * this thread is the only writer and runs one job at a time, so nothing
+     * can insert a matching row between this read and the write below. */
+    bool existing = false;
+    atlas_buf existing_uid = ATLAS_BUF_INIT;
+    st = atlas_db_memory_version_exists(w->db, source_id, sha_hex, &existing, NULL, &existing_uid,
+                                        NULL, &j->result_err);
+    if (st == ATLAS_OK && existing) {
+        out->created = false;
+        st = atlas_buf_set(&out->version_uid, existing_uid.data, existing_uid.len, &j->result_err);
+        if (st == ATLAS_OK) {
+            st = atlas_buf_set_str(&out->content_sha256, sha_hex, &j->result_err);
+        }
+        out->content_bytes = content_bytes;
+        atlas_buf_free(&existing_uid);
+        j->result = st;
+        return;
+    }
+    atlas_buf_free(&existing_uid);
+    if (st != ATLAS_OK) {
+        j->result = st;
+        return;
+    }
+
+    char now[32];
+    atlas_now_iso8601(now, sizeof now);
+
+    st = atlas_db_begin(w->db, &j->result_err);
+    if (st != ATLAS_OK) {
+        j->result = st;
+        return;
+    }
+
+    int64_t new_id = 0;
+    atlas_buf new_uid = ATLAS_BUF_INIT;
+    const char *obs = atlas_buf_cstr(&op->observed_at);
+    st = atlas_db_memory_version_insert(w->db, source_id, "", "", sha_hex, content_bytes,
+                                        op->content.data, op->content.len, obs, now, op->peer_uid,
+                                        &new_id, &new_uid, &j->result_err);
+    if (st == ATLAS_OK) {
+        atlas_status cst = atlas_db_commit(w->db, &j->result_err);
+        if (cst != ATLAS_OK) {
+            atlas_db_rollback(w->db);
+            st = cst;
+        }
+    } else {
+        atlas_db_rollback(w->db);
+    }
+    if (st == ATLAS_OK) {
+        out->created = true;
+        st = atlas_buf_set(&out->version_uid, new_uid.data, new_uid.len, &j->result_err);
+        if (st == ATLAS_OK) {
+            st = atlas_buf_set_str(&out->content_sha256, sha_hex, &j->result_err);
+        }
+        out->content_bytes = content_bytes;
+    }
+    atlas_buf_free(&new_uid);
+    j->result = st;
 }
 
 /* A12.1. The memory reconciliation pass, submitted by `memory_sweep`
@@ -1577,12 +1753,12 @@ static void writer_run_job(atlas_writer *w, atlas_job *j) {
         (void)atlas_db_index_state_set_watch(w->db, j->repo_id, &outcome, &ignore);
         break;
     }
-    /* A12.1. `memory.put`'s job body is A12.1 T11's: this dispatch listing
-     * every enumerator (`-Wswitch-enum`, not merely `-Wswitch`) is what makes
-     * a job kind with no case here a build failure rather than a silent
-     * `default:` no-op, so the classification switches above and this one
-     * cannot drift apart about which kinds exist. */
-    case ATLAS_JOB_MEMORY: break;
+    /* A12.1 T11. This dispatch listing every enumerator (`-Wswitch-enum`, not
+     * merely `-Wswitch`) is what made a job kind with no case here a build
+     * failure rather than a silent `default:` no-op while `run_memory` did
+     * not exist yet, so the classification switches above and this one could
+     * not drift apart about which kinds exist. */
+    case ATLAS_JOB_MEMORY: run_memory(w, j); break;
     default: break;
     }
 
@@ -3275,5 +3451,82 @@ atlas_status atlas_writer_apikey(atlas_writer *w, const atlas_apikey_job *op,
     if (st != ATLAS_OK) {
         *err = jerr;
     }
+    return st;
+}
+
+/* A12.1 T11. See this function's own declaration in daemon_internal.h for why
+ * the length bound is checked here rather than inside `run_memory`, and why a
+ * caller waits for it at all. `atlas_apikey_job`'s exact shape: both `op` and
+ * `out` are borrowed, never copied, so a caller that gives up clears them to
+ * NULL under the lock rather than transferring ownership to a job that might
+ * run seconds later. */
+atlas_status atlas_writer_memory_put(atlas_writer *w, const atlas_memory_put_op *op,
+                                     atlas_memory_put_result *out, atlas_err *err) {
+    if (w == NULL || op == NULL || out == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "no memory put to run");
+    }
+    if (op->content.len > ATLAS_MEMORY_MAX_SOURCE_BYTES) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "content is %zu bytes; the bound is %u",
+                             op->content.len, ATLAS_MEMORY_MAX_SOURCE_BYTES);
+    }
+
+    atlas_job *j = job_new(ATLAS_JOB_MEMORY);
+    if (j == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory queueing a memory write");
+    }
+    j->memory_put = op;
+    j->memory_put_out = out;
+    j->wants_result = true;
+
+    (void)pthread_mutex_lock(&w->lock);
+    if (w->stopping || !queue_push(w, j)) {
+        bool stopping = w->stopping;
+        (void)pthread_mutex_unlock(&w->lock);
+        job_free(j);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                             stopping ? "the Atlas daemon is shutting down"
+                                      : "the Atlas daemon's write queue is full");
+    }
+    (void)pthread_cond_signal(&w->not_empty);
+
+    struct timespec deadline;
+    (void)clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += ATLAS_IPC_WRITE_TIMEOUT_MS / 1000;
+    deadline.tv_nsec += (long)(ATLAS_IPC_WRITE_TIMEOUT_MS % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    bool backed_out = writer_wait_locked(w, j, &deadline);
+    bool done = j->done;
+    atlas_status st = j->result;
+    atlas_err jerr = j->result_err;
+    if (!done) {
+        /* Detached rather than freed: the job is still the writer's. Clearing
+         * the pointers is what stops it writing into a result struct whose
+         * owner has gone. */
+        j->wants_result = false;
+        j->memory_put = NULL;
+        j->memory_put_out = NULL;
+    }
+    (void)pthread_mutex_unlock(&w->lock);
+
+    /* Taken back out of the queue before anything looked at it, so this reports
+     * a refusal rather than a failure: the write did not happen and asking again
+     * is safe. Freed here because the writer never saw it. */
+    if (backed_out) {
+        job_free(j);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "%s", WRITER_BUSY_MSG);
+    }
+
+    if (!done) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                             "the Atlas daemon did not complete a memory put within %d ms",
+                             ATLAS_IPC_WRITE_TIMEOUT_MS);
+    }
+    if (st != ATLAS_OK) {
+        *err = jerr;
+    }
+    job_free(j);
     return st;
 }

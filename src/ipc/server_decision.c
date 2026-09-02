@@ -2713,6 +2713,13 @@ static const atlas_method_entry OPERATOR_METHODS[] = {
     {"decision.revalidate", method_revalidate},
     {"decision.resolve", method_resolve},
     {"repo.scanner", method_repo_scanner},
+    /* A12.1 T11. Implemented in src/ipc/server_memory.c, beside repo.scanner
+     * for the same reason: none of the three carries an authority verb, and
+     * each is dispatchable by name only because this whole group is reached
+     * only from the peer the root-owned authority policy names. */
+    {"memory.put", atlas_server_memory_put},
+    {"memory.status", atlas_server_memory_status},
+    {"memory.reconcile", atlas_server_memory_reconcile},
 };
 
 const atlas_method_entry *atlas_server_operator_methods(size_t *count_out) {

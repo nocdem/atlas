@@ -312,6 +312,9 @@ add_library(atlas_core STATIC
   src/db/db_plan.c
   src/ipc/server_orch.c
   src/ipc/server_scanner.c
+  # A12.1 T11. memory.put, memory.status and memory.reconcile -- the operator
+  # group beside repo.scanner, above.
+  src/ipc/server_memory.c
   # --- A9: remote access, API credentials and the web control plane -------
   #
   # The gateway is a *client* of the daemon, structurally the same shape as

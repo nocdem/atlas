@@ -295,6 +295,30 @@ atlas_status atlas_db_memory_version_by_uid(atlas_db *db, const char *uid,
                                             atlas_memory_version_row *out, bool *found_out,
                                             atlas_err *err);
 
+/* --- T11: memory.put and memory.status's own reads --------------------------
+ *
+ * `atlas_db_memory_version_by_uid`'s own shape, one row up: a registered
+ * source named by its public uid rather than by the (repo, class, path)
+ * tuple `atlas_db_memory_source_find` resolves. `memory.put` names a source
+ * this way because the request never carries a repository id or a path --
+ * §T11's rule that the uid is a reference, never a description a caller could
+ * forge. Every `*_out` parameter is optional (NULL skips it), so a caller
+ * wanting only the class need not receive the path too. */
+atlas_status atlas_db_memory_source_by_uid(atlas_db *db, const char *uid, int64_t *id_out,
+                                           int64_t *repo_id_out, atlas_memory_source_class *cls_out,
+                                           atlas_buf *path_raw_out, atlas_buf *path_text_out,
+                                           bool *found_out, atlas_err *err);
+
+/* Every registered source for one repository, oldest first (`id ASC`) --
+ * `memory.status`'s own read, and the first listing this layer has needed:
+ * every prior reader already had a source id in hand. `cb` receives one row
+ * per source; nothing here opens a transaction or forks a process. */
+typedef atlas_status (*atlas_memory_source_cb)(int64_t id, const char *source_uid,
+                                               atlas_memory_source_class cls, const char *path_text,
+                                               const char *registered_at, void *ctx, atlas_err *err);
+atlas_status atlas_db_memory_source_list(atlas_db *db, int64_t repo_id, atlas_memory_source_cb cb,
+                                         void *ctx, atlas_err *err);
+
 /* --- T8: the reconciliation pass's own typed operations --------------------
  *
  * All in `src/db/db_memory.c`, which the file header already states is the

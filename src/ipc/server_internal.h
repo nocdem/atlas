@@ -170,12 +170,26 @@ atlas_status atlas_server_write_repo_state(dispatch_state *ds, const atlas_repo_
  * is current. Computed in one place so no caller reconstructs it from flags. */
 bool atlas_server_index_current(const atlas_index_state *s, const char **reason_out);
 
-/* The five operator-channel methods, and the peer test that gates them. A7
- * deleted these; they are back in a disjoint group only the policy's operator
- * uid can reach. See the comment above `OPERATOR_METHODS` in
+/* The operator-channel methods, and the peer test that gates them. A7
+ * deleted the original five; they are back in a disjoint group only the
+ * policy's operator uid can reach. See the comment above `OPERATOR_METHODS` in
  * `src/ipc/server_decision.c` for what that does and does not guarantee. */
 const atlas_method_entry *atlas_server_operator_methods(size_t *count_out);
 bool atlas_server_peer_is_operator(long long peer_uid);
+
+/* A12.1 T11. `memory.put`, `memory.status` and `memory.reconcile` --
+ * `src/ipc/server_memory.c`'s three method functions, named directly in
+ * `OPERATOR_METHODS[]` beside `repo.scanner` rather than through a second
+ * accessor: the existing lookup at `src/ipc/server.c` already walks that one
+ * array, so a name added to it needs no change anywhere dispatch is decided.
+ * See `server_memory.c`'s own file header for what the group does and does
+ * not guarantee. */
+atlas_status atlas_server_memory_put(dispatch_state *ds, const atlas_ipc_request *req,
+                                     atlas_err *err);
+atlas_status atlas_server_memory_status(dispatch_state *ds, const atlas_ipc_request *req,
+                                        atlas_err *err);
+atlas_status atlas_server_memory_reconcile(dispatch_state *ds, const atlas_ipc_request *req,
+                                           atlas_err *err);
 
 /* `backup.create` and `backup.verify`, in the same operator-gated group and
  * behind the same `SO_PEERCRED` test.

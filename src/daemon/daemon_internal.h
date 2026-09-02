@@ -237,6 +237,58 @@ typedef struct atlas_apikey_job_result {
     bool changed;
 } atlas_apikey_job_result;
 
+/* A12.1 T11. `memory.put`'s one typed write, and the `atlas_apikey_job` shape
+ * rather than `atlas_ai_op`'s: the RPC handler waits for this (it is a small,
+ * bounded, drainable write, not an unbounded pass), so `atlas_job` only ever
+ * *borrows* both pointers -- exactly `atlas_apikey_job`/`atlas_maintenance_opts`
+ * above. Neither is copied or owned by the job, and neither is freed by
+ * `job_free`: if the caller gives up before the write runs, the pointers are
+ * cleared to NULL under the writer's lock (see `atlas_writer_memory_put`), so a
+ * job that finally runs sees nothing to write into and a caller that already
+ * returned never has its stack (or a struct it has since freed) written into.
+ *
+ * `source_uid` names the registered `memory_sources` row by its public uid --
+ * a reference, never a path the request also asserts, `atlas_verify_op`'s own
+ * `memory_version_uid` field carries the same argument one layer over.
+ * `rel_path` is empty for a `*_FILE` source and the *_DIR child's bare name
+ * for a `*_DIR` one; it is a class-consistency check only and is never stored
+ * -- migration 29's `memory_source_versions` has no column for it, on purpose:
+ * two byte-identical children are one version row regardless of which child
+ * produced it (`atlas_db_memory_version_exists`'s own comment), so a version's
+ * identity is its content, never a child's name. `content` is already
+ * hex-decoded and already bound-checked by `atlas_writer_memory_put` before
+ * this op is ever built. `peer_uid` is `SO_PEERCRED`, carried here rather than
+ * read again on the writer thread, and is what `memory_source_versions.
+ * read_by_uid` records -- never a field the request could name, A7.1's
+ * "a client describing itself is not evidence about itself" applied to who
+ * read the bytes. */
+typedef struct atlas_memory_put_op {
+    atlas_buf source_uid;
+    atlas_buf rel_path;
+    atlas_buf content;
+    atlas_buf observed_at;
+    int64_t peer_uid;
+} atlas_memory_put_op;
+
+void atlas_memory_put_op_init(atlas_memory_put_op *op);
+void atlas_memory_put_op_free(atlas_memory_put_op *op);
+
+/* What `memory.put` reports back: enough for a caller to confirm the bytes it
+ * sent are the bytes Atlas now holds, without a second round trip through
+ * `memory.status`. `created` is false when this exact content already had a
+ * version row for this source -- `atlas_db_memory_version_exists`'s own
+ * dedup -- and the fields still name the row that answers for these bytes,
+ * new or not. */
+typedef struct atlas_memory_put_result {
+    atlas_buf version_uid;
+    atlas_buf content_sha256;
+    int64_t content_bytes;
+    bool created;
+} atlas_memory_put_result;
+
+void atlas_memory_put_result_init(atlas_memory_put_result *r);
+void atlas_memory_put_result_free(atlas_memory_put_result *r);
+
 typedef struct atlas_job atlas_job;
 
 struct atlas_job {
@@ -361,6 +413,14 @@ struct atlas_job {
      * integers, no owned buffer), so a `malloc` and a struct copy are the
      * whole of its ownership: freed with a bare `free`, no `_free` pair. */
     atlas_syspolicy *memory_pol;
+
+    /* A12.1 T11. `ATLAS_JOB_MEMORY`'s one typed write, and where the writer
+     * puts its result. Both belong to a caller that waits, `atlas_apikey_job`'s
+     * own pair above -- neither is freed by `job_free`, and both are cleared to
+     * NULL by a caller that gives up before this runs. See
+     * `atlas_memory_put_op`'s own comment in this header for the reasoning. */
+    const atlas_memory_put_op *memory_put;
+    atlas_memory_put_result *memory_put_out;
 
     /* A8 snapshot enumeration. */
     int64_t snapshot_attempt_id;
@@ -509,6 +569,21 @@ atlas_status atlas_writer_submit_memory_reconcile(atlas_writer *w, int64_t repo_
  * touching a live watcher's internals from a foreign thread, which nothing
  * else in this daemon does either. */
 void atlas_memory_sweep_for(atlas_db *db, atlas_writer *writer, const atlas_syspolicy *pol);
+
+/* A12.1 T11. `memory.put`, on the writer thread, with the caller waiting --
+ * `ATLAS_JOB_MEMORY` is neither unbounded nor undrainable (see the two
+ * `job_kind_is_*` switches above), so a caller waiting the standard
+ * `ATLAS_IPC_WRITE_TIMEOUT_MS` for it is `atlas_writer_apikey`'s shape, not
+ * `atlas_writer_submit_memory_reconcile`'s: there is a synchronous answer to
+ * be had here, unlike a reconciliation pass that can run for seconds under a
+ * full mirror.
+ *
+ * **The length bound is checked here, before anything is queued.** A caller
+ * whose content already exceeds `ATLAS_MEMORY_MAX_SOURCE_BYTES` is refused
+ * without the writer ever seeing a job, which is what lets a test assert the
+ * row count did not move: nothing was queued, so nothing could have landed. */
+atlas_status atlas_writer_memory_put(atlas_writer *w, const atlas_memory_put_op *op,
+                                     atlas_memory_put_result *out, atlas_err *err);
 
 /* A9.2.3. Whether a semantic index for this repository is queued or running.
  *

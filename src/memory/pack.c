@@ -11,9 +11,9 @@
  *
  * This file touches no `sqlite3` type and issues no SQL of its own -- every
  * read and the one write go through typed operations in `src/db/db_memory.c`,
- * `src/db/db_verify.c` and `src/sem/index.c`, which is what keeps "no INSERT
- * INTO memory_ outside db_memory.c" (T17's grep) true by construction rather
- * than by review.
+ * `src/db/db_verify.c` and `src/sem/index.c`, which is what keeps every write
+ * to a `memory_`-prefixed table confined to that one file true by
+ * construction rather than by review (T17's grep target).
  */
 #include "atlas/memory.h"
 
@@ -87,7 +87,25 @@ static atlas_status ns_put(atlas_buf *out, const char *s, atlas_err *err) {
  * vocabularies, and this codebase's own precedent (`db_orch_memory.c`'s
  * netstring writer above, `orch.c`'s own) is a second small copy rather than
  * a cross-layer dependency for a closed, unlikely-to-change algorithm.
- * Disclosed in the T12 report. */
+ * Disclosed in the T12 report.
+ *
+ * `PACK_TOKEN_MAX` is 512 where A10.1's own `TOKEN_MAX` (`src/orch/memory.c`)
+ * is 256 -- undisclosed until this fix round (review M10). The two are not the
+ * same bound wearing two names: A10.1's set holds only one run's goal text,
+ * while a `pack_tokenset` here does double duty, once as `want` (`task_text`
+ * alone, the same shape as A10.1's set) and once per claim as `have` (a
+ * claim's text, up to `ATLAS_VERIFY_CLAIM_TEXT_MAX` = 4096 bytes -- already
+ * enough alone to approach 256 distinct four-plus-byte tokens -- plus every
+ * one of its anchor values, now up to `ATLAS_MEMORY_PACK_MAX_ANCHORS_PER_
+ * CLAIM` = 32 of them). Aligning down to 256 would shrink the one set that
+ * this same fix round just gave more to hold, silently dropping more of a
+ * claim's own text or anchor tokens from its overlap score -- a strictly
+ * worse trade than the undisclosed mismatch it would resolve. Kept at 512 and
+ * disclosed instead of aligned; past it, `pack_tokenset_add` still drops the
+ * remainder rather than growing, which is the same trim A10.1 accepts for the
+ * same reason: a relevance input that degrades the *score*, never the pack's
+ * rendered content -- unlike the two `atlas_memory_pack_build` bounds and the
+ * anchor-collection bound above, none of which may be silently trimmed. */
 #define PACK_TOKEN_MAX 512u
 #define PACK_TOKEN_LEN_MAX 64u
 
@@ -211,7 +229,7 @@ static int64_t pack_overlap(const pack_tokenset *want, const pack_tokenset *have
  * flagging rule need. Heap-allocated: at 256 entries with a bounded anchor
  * array each, this is the `atlas_memory_observation` shape one layer over --
  * large by construction, and never put on a stack. */
-#define PACK_MAX_ANCHORS ATLAS_MEMORY_MAX_ANCHORS_PER_PROPOSITION
+#define PACK_MAX_ANCHORS ATLAS_MEMORY_PACK_MAX_ANCHORS_PER_CLAIM
 
 typedef struct pack_claim {
     int64_t claim_id;
@@ -261,14 +279,30 @@ static atlas_status anchor_collect_cb(atlas_memory_anchor_kind kind, const char 
                                       atlas_err *err) {
     anchor_collect_ctx *ac = ud;
     if (ac->c->anchor_count >= PACK_MAX_ANCHORS) {
-        /* More anchors than one proposition could ever have resolved
-         * (`ATLAS_MEMORY_MAX_ANCHORS_PER_PROPOSITION`) would mean two
-         * propositions' anchors landed on one claim uid, which the write
-         * point does not do. Extra rows beyond the bound are dropped rather
-         * than grown into, matching every other bounded collector in this
-         * layer -- and this is defensive, not a path any known caller
-         * reaches. */
-        return ATLAS_OK;
+        /* Reachable, not defensive: O10's claim content key deliberately
+         * omits the actor, so two memory documents whose propositions
+         * resolve to byte-identical text land on one claim_uid, and
+         * `emit_candidate`'s anchor write (`src/memory/reconcile.c`) is
+         * unconditional on both the new-claim and the duplicate-claim
+         * branches -- every contributing document's anchors are written,
+         * with no ceiling in the schema. `ATLAS_MEMORY_PACK_MAX_ANCHORS_PER_
+         * CLAIM`'s own comment (`limits.h`) is the derivation; this is the
+         * bound it names. Refused, not dropped: `atlas_db_memory_anchors_
+         * for_claim` orders `kind, value` -- COMMIT, DECISION, PATH, SYMBOL,
+         * alphabetically -- so a silent drop here always falls on whichever
+         * rows sort *later*: SYMBOL entirely once the bound is reached, and
+         * PATH partially whenever the total exceeds the bound before every
+         * PATH row has been read; never on COMMIT or DECISION while a
+         * later-sorting row is also present. PATH is the one kind
+         * `flagged_anchors` renders -- exactly the reliance input T13
+         * consumes, and a worker whose own changed file was the dropped
+         * anchor must never read as untouched. */
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "claim %s resolved more than %u anchors across the documents that "
+                             "state it; refused rather than silently dropped, so a worker is "
+                             "never shown a pack that quietly omitted the anchor its own change "
+                             "turned on",
+                             atlas_buf_cstr(&ac->c->uid), (unsigned)PACK_MAX_ANCHORS);
     }
     size_t i = ac->c->anchor_count;
     ac->c->anchor_kind[i] = kind;

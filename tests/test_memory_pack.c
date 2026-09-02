@@ -16,7 +16,13 @@
  *   (e) freeze: a second freeze for one run_uid is refused by the constraint.
  *   (f) compose(task, NULL, NULL, NULL) returns task byte for byte.
  *
- * Plus (g): the claims-count bound is refused, never trimmed.
+ * Plus (g): the claims-count and rendered-byte bounds are refused, never
+ * trimmed; (a2): the claim-id tie-break, observed rather than merely
+ * exercised; and (h), added in this fix round to close review finding C1: a
+ * claim whose anchors were merged from more than one memory document is
+ * rendered without silently dropping any of them past the old
+ * per-proposition bound, and the new per-claim bound is itself refused past,
+ * never trimmed.
  *
  * Fixture helpers here are a fresh, small copy of `test_memory_reconcile.c`'s
  * shape (`t8env`/`t8_bind_head`/`t9_propose`/`t9_approve`) rather than a
@@ -45,6 +51,7 @@
 #include "atlas/sha256.h"
 #include "atlas/syspolicy.h"
 #include "atlas/verify.h"
+#include "atlas/verify_ops.h"
 #include "atlas_test.h"
 #include "db/db_internal.h"
 #include "support/fixture.h"
@@ -289,6 +296,43 @@ static void pk_anchor(pkenv *e, const char *claim_uid, atlas_memory_anchor_kind 
     T_OK(atlas_db_memory_anchor_add(e->db, e->repo_id, claim_uid, kind, value, err), err);
 }
 
+/* A `CLAIM_CREATE` through the real write point
+ * (`atlas_verify_intake_apply`, `atlas_verify_intake_apply_in_tx`'s own
+ * begin/apply/commit wrapper), `emit_candidate`'s own shape
+ * (`src/memory/reconcile.c`): `root`, `domain`, `text`, `semantics` held
+ * identical across two calls with only `actor_name` differing, which is
+ * exactly what two different registered memory source documents would
+ * produce. §27's content key (`src/verify/intake.c:625-646`) never covers
+ * the actor, so a second call with the same text resolves to the first
+ * call's `claim_uid` rather than minting a new one -- `*duplicate_out`
+ * reports which happened, so a caller can assert the merge actually occurred
+ * rather than assume it. */
+static void pk_claim_create(pkenv *e, const char *actor_name, const char *text, atlas_buf *uid_out,
+                            bool *duplicate_out, atlas_err *err) {
+    atlas_verify_op op;
+    atlas_verify_op_init(&op);
+    op.kind = ATLAS_VERIFY_OP_CLAIM_CREATE;
+    op.channel = ATLAS_VERIFY_CHANNEL_DOCUMENT;
+    T_OK(atlas_buf_set_str(&op.root, fx_repo(&e->fx), err), err);
+    T_OK(atlas_buf_set_str(&op.actor_name, actor_name, err), err);
+    T_OK(atlas_buf_set_str(&op.actor_provider, "memory", err), err);
+    T_OK(atlas_buf_set_str(&op.actor_family, "repo_file", err), err);
+    T_OK(atlas_buf_set_str(&op.domain, "memory", err), err);
+    T_OK(atlas_buf_set_str(&op.text, text, err), err);
+    op.semantics = ATLAS_CLAIM_DESCRIPTIVE;
+    op.semantics_given = true;
+
+    atlas_verify_intake_result res;
+    atlas_verify_intake_result_init(&res);
+    T_OK(atlas_verify_intake_apply(e->db, &op, &res, err), err);
+    if (duplicate_out != NULL) {
+        *duplicate_out = res.duplicate;
+    }
+    T_OK(atlas_buf_set(uid_out, res.uid.data, res.uid.len, err), err);
+    atlas_verify_intake_result_free(&res);
+    atlas_verify_op_free(&op);
+}
+
 /* A `verify_results` row, by raw SQL -- deliberately not through
  * `atlas_verify_assess`/`atlas_verify_autolifecycle_run`, both of which are
  * live (a root-owned policy, the clock) and would make this fixture
@@ -349,11 +393,81 @@ static void test_build_is_deterministic(void) {
     T_CHECK_MSG(p1.claim_count == 2, "expected exactly the two overlapping claims selected, got %lld",
                (long long)p1.claim_count);
 
+    /* I5 (T12 fix round): overlap-descending, observed rather than merely
+     * exercised. u3 ("widget", "subsystem", "checksum") scores 3 against the
+     * task's {widget, subsystem, checksum}; u1 ("widget", "subsystem") scores
+     * 2 -- "checksums" is a distinct token from "checksum", deliberately, so
+     * this fixture does not accidentally give the two claims equal overlap.
+     * u3 must render before u1: deleting `pack_claim_cmp`'s overlap branch
+     * (`a->overlap != b->overlap`) leaves only the id tie-break, which would
+     * render u1 (the lower id) first and fail this assertion. */
+    const char *pos_u1 = strstr(atlas_buf_cstr(&p1.rendered), "validates checksums");
+    const char *pos_u3 = strstr(atlas_buf_cstr(&p1.rendered), "also logs every checksum");
+    T_REQUIRE_MSG(pos_u1 != NULL && pos_u3 != NULL,
+                 "both overlapping claims must appear in the rendered pack:\n%s",
+                 atlas_buf_cstr(&p1.rendered));
+    T_CHECK_MSG(pos_u3 < pos_u1,
+               "expected the higher-overlap claim (u3, overlap 3) to render before the "
+               "lower-overlap one (u1, overlap 2); overlap-descending order is unenforced:\n%s",
+               atlas_buf_cstr(&p1.rendered));
+
     atlas_memory_pack_free(&p1);
     atlas_memory_pack_free(&p2);
     atlas_buf_free(&u1);
     atlas_buf_free(&u2);
     atlas_buf_free(&u3);
+    pk_env_close(&e);
+}
+
+/* --- (a2) I5 (T12 fix round): the claim-id tie-break, observed -------------- */
+
+/* The plan's own words for `pack_claim_cmp`: "a total order (overlap
+ * descending, claim id ascending) with no tie left to chance." Test (a)'s own
+ * fixture never ties -- its two overlapping claims score 2 and 3 on purpose.
+ * The only prior fixtures with a tie are the two (g) tests, and both expect a
+ * refusal, so order is never observed there either (review I5). This is the
+ * first fixture with two *rendered* claims of equal overlap, so the ascending
+ * claim-id half of the order is finally exercised: deleting `pack_claim_cmp`'s
+ * id branch (`a->claim_id != b->claim_id`) collapses both claims to `return
+ * 0`, which `qsort` is not required to leave in insertion order, and would
+ * make this assertion flaky-to-failing rather than reliably passing. */
+static void test_render_order_claim_id_tiebreak(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    pkenv e;
+    pk_env_open(&e, &err);
+    pk_bind_head(&e, &err);
+
+    atlas_buf older_uid = ATLAS_BUF_INIT, newer_uid = ATLAS_BUF_INIT;
+    int64_t older_id = 0, newer_id = 0;
+    pk_claim(&e, "widget alpha implementation notes", &older_uid, &older_id, &err);
+    pk_claim(&e, "widget beta implementation notes", &newer_uid, &newer_id, &err);
+    T_REQUIRE_MSG(newer_id > older_id, "the fixture's own ordering assumption failed: %lld vs %lld",
+                 (long long)newer_id, (long long)older_id);
+
+    atlas_syspolicy pol;
+    memset(&pol, 0, sizeof pol);
+    pol.state = ATLAS_SYSPOLICY_SYSTEM;
+
+    atlas_memory_pack p;
+    atlas_memory_pack_init(&p);
+    pk_build(&e, &pol, "fix the widget subsystem", &p, &err);
+
+    T_CHECK_MSG(p.claim_count == 2, "expected both equal-overlap claims selected, got %lld",
+               (long long)p.claim_count);
+    const char *pos_older = strstr(atlas_buf_cstr(&p.rendered), "widget alpha");
+    const char *pos_newer = strstr(atlas_buf_cstr(&p.rendered), "widget beta");
+    T_REQUIRE_MSG(pos_older != NULL && pos_newer != NULL,
+                 "both equal-overlap claims must appear in the rendered pack:\n%s",
+                 atlas_buf_cstr(&p.rendered));
+    T_CHECK_MSG(pos_older < pos_newer,
+               "two claims of equal overlap must render in ascending claim-id order; the "
+               "older (lower id) claim must come first:\n%s",
+               atlas_buf_cstr(&p.rendered));
+
+    atlas_memory_pack_free(&p);
+    atlas_buf_free(&older_uid);
+    atlas_buf_free(&newer_uid);
     pk_env_close(&e);
 }
 
@@ -658,12 +772,21 @@ static void test_conflict_flags_and_irrelevant_stale_excluded(void) {
     T_CHECK_MSG(strstr(atlas_buf_cstr(&p.rendered), "unrelated prose") == NULL,
                "the irrelevant stale claim must not be rendered at all");
 
+    /* M8 (T12 fix round): this is a control, not a test of the mechanism its
+     * message names. `atlas_memory_pack_freshness` reads none of the six
+     * pinned inputs from a claim row at all (`src/memory/pack.c`), so no
+     * excluded or troubled claim could ever move the status either way --
+     * this assertion can only fail if one of the six pins moved spuriously
+     * between `build` and `freshness` in this test. It stays, because a
+     * spurious move is exactly the failure mode a control catches, but it
+     * proves nothing about exclusion or flagging specifically. */
     atlas_memory_pack_status status = ATLAS_MEMORY_PACK_UNKNOWN;
     atlas_buf which = ATLAS_BUF_INIT;
     T_OK(atlas_memory_pack_freshness(e.db, &pol, &p, &status, &which, &err), &err);
     T_CHECK_MSG(status == ATLAS_MEMORY_PACK_CURRENT,
-               "the excluded irrelevant claim must not itself make the pack's own status STALE, "
-               "got %d",
+               "control: none of the six pinned inputs should have moved between build and "
+               "freshness in this test, so status must read CURRENT regardless of the excluded "
+               "or flagged claims above; got %d",
                (int)status);
 
     atlas_buf_free(&which);
@@ -771,7 +894,12 @@ static void test_compose_with_nothing_is_byte_identical(void) {
     atlas_err_init(&err);
     atlas_buf out = ATLAS_BUF_INIT;
     T_OK(atlas_memory_pack_compose("do the thing", NULL, NULL, NULL, &out, &err), &err);
-    T_CHECK_MSG(strcmp(atlas_buf_cstr(&out), "do the thing") == 0,
+    /* M9 (T12 fix round): a byte comparison, not `strcmp` -- the case name
+     * claims "byte-identical", and `strcmp` only happens to agree with that
+     * here because `compose` cannot emit an embedded NUL. `out.len` plus
+     * `memcmp` is the comparison the name actually makes. */
+    static const char want[] = "do the thing";
+    T_CHECK_MSG(out.len == strlen(want) && memcmp(out.data, want, out.len) == 0,
                "compose with every optional piece absent must return the task byte for byte, got: %s",
                atlas_buf_cstr(&out));
     atlas_buf_free(&out);
@@ -795,6 +923,23 @@ static void test_compose_appends_both_pieces_independently(void) {
     T_CHECK_MSG(strstr(atlas_buf_cstr(&out_body_only), "PKG") == NULL,
                "no memory package section may appear when memory_package is absent");
     atlas_buf_free(&out_body_only);
+
+    /* M7 (T12 fix round): `status_line` given but `pack_body` absent -- the
+     * untested combination the review named. The code is already right (the
+     * status line is written inside the `pack_body`-guarded block,
+     * `src/memory/pack.c`), but nothing exercised it: hoisting the status
+     * line out of that guard would break "a status line with nothing to
+     * describe is not a piece of its own" with no test failing. A caller with
+     * a memory package but no pack body (a run with `--memory` but not yet
+     * carrying a frozen pack) is the exact shape T13 will sometimes build. */
+    atlas_buf out_status_no_body = ATLAS_BUF_INIT;
+    T_OK(atlas_memory_pack_compose("task", "PKG", "CURRENT", NULL, &out_status_no_body, &err), &err);
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&out_status_no_body), "CURRENT") == NULL,
+               "a status line with no pack body must not appear at all:\n%s",
+               atlas_buf_cstr(&out_status_no_body));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&out_status_no_body), "PKG") != NULL,
+               "the memory package must still appear even when the pack section is absent");
+    atlas_buf_free(&out_status_no_body);
 }
 
 /* --- (g) the claims bound is refused, never trimmed ------------------------- */
@@ -882,9 +1027,147 @@ static void test_pack_over_byte_bound_is_refused(void) {
     pk_env_close(&e);
 }
 
+/* --- (h) T12 fix round item 1: a claim's merged anchors are not silently
+ * dropped past the old per-proposition bound (review C1) ------------------- */
+
+/* Drives the actual chain the review traced, not merely its consequence:
+ * two `CLAIM_CREATE` operations, through the real write point
+ * (`pk_claim_create` -> `atlas_verify_intake_apply` ->
+ * `atlas_verify_intake_apply_in_tx`), with byte-identical `root`/`domain`/
+ * `text`/`semantics` and two different `actor_name`s -- standing in for two
+ * different registered memory source documents stating the same
+ * proposition. §27's content key deliberately omits the actor
+ * (`src/verify/intake.c:625-646`), so the second call must resolve to the
+ * first's `claim_uid` rather than minting a new one; asserted below, not
+ * assumed. `emit_candidate`'s own anchor-write loop
+ * (`src/memory/reconcile.c`) then runs unconditionally on both the
+ * new-claim and the duplicate-claim branches, so both documents' anchors
+ * land on that one uid -- modelled here by `pk_anchor`, since the anchor
+ * write itself is reconcile.c's mechanism and is already exercised by
+ * `test_memory_anchor.c`/`test_memory_reconcile.c`; what this test adds is
+ * driving the *merge* for real rather than only seeding its result.
+ *
+ * No `pk_result` call: `atlas_db_verify_result_latest` then reports
+ * `found = false`, which makes the claim `troubled` (tag `UNVERIFIED`)
+ * without needing to seed a `verify_results` row -- deviation 4's own
+ * "no-row reads UNVERIFIED" rule, verified in the T12 review. */
+static void test_merged_claim_anchors_not_truncated(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    pkenv e;
+    pk_env_open(&e, &err);
+    pk_bind_head(&e, &err);
+
+    static const char *const TEXT = "the widget subsystem needs a review of its anchors";
+    atlas_buf uid_a = ATLAS_BUF_INIT, uid_b = ATLAS_BUF_INIT;
+    bool dup_a = true, dup_b = false;
+    pk_claim_create(&e, "memory-source-document-a", TEXT, &uid_a, &dup_a, &err);
+    pk_claim_create(&e, "memory-source-document-b", TEXT, &uid_b, &dup_b, &err);
+
+    T_CHECK_MSG(!dup_a, "the first document's CLAIM_CREATE must mint a new claim, not resolve to "
+                        "one that already existed");
+    T_CHECK_MSG(dup_b, "the second document's CLAIM_CREATE, stating byte-identical text under a "
+                       "different actor, must resolve to the first document's claim rather than "
+                       "minting a second one -- the content key must not depend on the actor");
+    T_CHECK_MSG(uid_a.len == uid_b.len && memcmp(uid_a.data, uid_b.data, uid_a.len) == 0,
+               "two documents stating the same proposition must merge onto one claim_uid, got "
+               "%s and %s",
+               atlas_buf_cstr(&uid_a), atlas_buf_cstr(&uid_b));
+    const atlas_buf *claim_uid = &uid_a;
+
+    /* Six PATH anchors "from document A", six more "from document B" --
+     * twelve total on the one merged claim, more than the old
+     * per-proposition bound (`ATLAS_MEMORY_MAX_ANCHORS_PER_PROPOSITION` = 8)
+     * and comfortably under the new per-claim one
+     * (`ATLAS_MEMORY_PACK_MAX_ANCHORS_PER_CLAIM` = 32). Zero-padded and
+     * already in `(kind, value)` order, matching `atlas_db_memory_anchors_
+     * for_claim`'s `ORDER BY kind, value` exactly, so the old bug's own bias
+     * is reproduced: it always dropped these last four (file08..file11),
+     * never an arbitrary four. */
+    enum { N_ANCHORS = 12 };
+    for (int i = 0; i < N_ANCHORS; i++) {
+        char path[32];
+        (void)snprintf(path, sizeof path, "src/file%02d.c", i);
+        pk_anchor(&e, atlas_buf_cstr(claim_uid), ATLAS_MEMORY_ANCHOR_PATH, path, &err);
+    }
+
+    atlas_syspolicy pol;
+    memset(&pol, 0, sizeof pol);
+    pol.state = ATLAS_SYSPOLICY_SYSTEM;
+
+    atlas_memory_pack p;
+    atlas_memory_pack_init(&p);
+    pk_build(&e, &pol, "fix the widget subsystem", &p, &err);
+
+    T_CHECK_MSG(p.claim_count == 1, "expected exactly the one overlapping (and troubled) claim, "
+                                   "got %lld",
+               (long long)p.claim_count);
+    T_CHECK_MSG(strncmp(atlas_buf_cstr(&p.flagged_anchors), "12:", 3) == 0,
+               "expected all 12 merged PATH anchors in flagged_anchors, not silently capped at "
+               "the old per-proposition bound of 8; got: %s",
+               atlas_buf_cstr(&p.flagged_anchors));
+    /* Spot-check the four the old bound would have dropped -- file08..file11
+     * sort after file00..file07 by (kind, value), so a bound reached at 8
+     * would drop exactly these and none of the first eight. */
+    for (int i = 8; i < N_ANCHORS; i++) {
+        char path[32];
+        (void)snprintf(path, sizeof path, "src/file%02d.c", i);
+        T_CHECK_MSG(strstr(atlas_buf_cstr(&p.flagged_anchors), path) != NULL,
+                   "expected %s in flagged_anchors -- this is one of the anchors the old "
+                   "8-anchor bound silently dropped:\n%s",
+                   path, atlas_buf_cstr(&p.flagged_anchors));
+    }
+
+    atlas_memory_pack_free(&p);
+    atlas_buf_free(&uid_a);
+    atlas_buf_free(&uid_b);
+    pk_env_close(&e);
+}
+
+/* The bound itself is still finite and is refused past, never trimmed --
+ * `ATLAS_MEMORY_PACK_MAX_CLAIMS`/`ATLAS_MEMORY_PACK_MAX_BYTES`'s own
+ * discipline (test (g) above), applied to the new anchor bound. */
+static void test_claim_anchors_over_bound_is_refused(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    pkenv e;
+    pk_env_open(&e, &err);
+    pk_bind_head(&e, &err);
+
+    atlas_buf claim_uid = ATLAS_BUF_INIT;
+    int64_t claim_id = 0;
+    pk_claim(&e, "the widget subsystem has far too many anchors", &claim_uid, &claim_id, &err);
+
+    for (unsigned i = 0; i < ATLAS_MEMORY_PACK_MAX_ANCHORS_PER_CLAIM + 1u; i++) {
+        char path[32];
+        (void)snprintf(path, sizeof path, "src/over%03u.c", i);
+        pk_anchor(&e, atlas_buf_cstr(&claim_uid), ATLAS_MEMORY_ANCHOR_PATH, path, &err);
+    }
+
+    atlas_syspolicy pol;
+    memset(&pol, 0, sizeof pol);
+    pol.state = ATLAS_SYSPOLICY_SYSTEM;
+
+    atlas_memory_pack p;
+    atlas_memory_pack_init(&p);
+    atlas_status st = atlas_memory_pack_build(e.db, e.repo_id, &pol, "fix the widget subsystem",
+                                              &p, &err);
+    T_CHECK_MSG(st != ATLAS_OK,
+               "more anchors on one claim than ATLAS_MEMORY_PACK_MAX_ANCHORS_PER_CLAIM must be "
+               "refused, not silently trimmed");
+    T_CHECK_MSG(p.claim_count == 0 && p.rendered.len == 0,
+               "a refused build must leave no partial pack behind");
+
+    atlas_memory_pack_free(&p);
+    atlas_buf_free(&claim_uid);
+    pk_env_close(&e);
+}
+
 static const atlas_test TESTS[] = {
     {"(a) two builds over an unchanged database agree byte for byte",
      test_build_is_deterministic},
+    {"(a2) two claims of equal overlap render in ascending claim-id order",
+     test_render_order_claim_id_tiebreak},
     {"(b1) freshness: the indexed commit moved", test_freshness_commit_moved},
     {"(b2) freshness: the live source identity moved", test_freshness_source_identity_moved},
     {"(b3) freshness: a decision approval moved the decision-set digest",
@@ -909,6 +1192,11 @@ static const atlas_test TESTS[] = {
      test_claims_over_bound_is_refused},
     {"(g) a rendered pack over ATLAS_MEMORY_PACK_MAX_BYTES is refused, not trimmed",
      test_pack_over_byte_bound_is_refused},
+    {"(h) two documents' worth of anchors merged onto one claim are not silently truncated",
+     test_merged_claim_anchors_not_truncated},
+    {"(h) more anchors on one claim than ATLAS_MEMORY_PACK_MAX_ANCHORS_PER_CLAIM is refused, "
+     "not trimmed",
+     test_claim_anchors_over_bound_is_refused},
 };
 
 ATLAS_TEST_MAIN("memory_pack", TESTS)

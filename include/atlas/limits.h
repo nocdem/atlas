@@ -1137,6 +1137,38 @@
 #define ATLAS_MEMORY_PACK_MAX_CLAIMS 64u
 #define ATLAS_MEMORY_PACK_MAX_BYTES (64u * 1024u)
 
+/* Anchors a pack build will collect for *one* claim, across every document
+ * that contributed to it -- not a proposition's own bound.
+ * `ATLAS_MEMORY_MAX_ANCHORS_PER_PROPOSITION` above bounds a single
+ * proposition; it does not bound a claim, because O10's claim content key
+ * deliberately omits the actor ("two people stating the same claim about the
+ * same tree are stating one claim"), so distinct memory documents whose
+ * propositions resolve to byte-identical text land on one `claim_uid`, and
+ * `emit_candidate`'s anchor write (`src/memory/reconcile.c`) runs
+ * unconditionally on both the new-claim and the duplicate-claim branches --
+ * every contributing document's anchors are written, with no ceiling in the
+ * schema (`memory_claim_anchors` has no ROW LIMIT and no per-claim trigger).
+ * The true maximum a claim can reach is therefore unbounded, growing with the
+ * corpus and with time; this is a deliberately chosen working bound, sized to
+ * absorb several colliding documents' worth of anchors rather than just one,
+ * and -- like the two bounds just above -- refused past, never trimmed: a
+ * claim that resolves more anchors than this is a pack `atlas_memory_pack_
+ * build` refuses to render rather than one it silently renders with some of
+ * its PATH anchors missing from `flagged_anchors`, T13's reliance input.
+ *
+ * Stated cost, not solved here: this bound is repository-wide and
+ * claim-scoped, not task-scoped -- unlike the claims-count and byte bounds
+ * beside it, whose relevant set depends on the task text asked for, *every*
+ * claim in the repository is walked and anchor-collected regardless of
+ * relevance (`claim_collect_cb` runs over all of `atlas_db_verify_claims_
+ * for_repo`'s rows before overlap is even scored). One claim that crosses
+ * this bound therefore refuses *every* `atlas_memory_pack_build` call for
+ * that repository, whatever the task, until something removes one of its
+ * anchor rows -- and nothing removes one on demand: only T9's vanished-anchor
+ * sweep prunes an anchor, and only when a fresh extraction pass no longer
+ * confirms it. */
+#define ATLAS_MEMORY_PACK_MAX_ANCHORS_PER_CLAIM 32u
+
 /* Paths one reconciliation pass will attribute movement to. Past this the pass
  * cannot enumerate what moved, so it must not pretend it can --
  * `ATLAS_WATCH_MAX_DIRTY_PATHS`' rule, one layer out. */

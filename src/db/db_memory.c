@@ -1151,11 +1151,25 @@ atlas_status atlas_db_memory_pack_insert(atlas_db *db, const char *run_uid,
     if (st == ATLAS_OK && sqlite3_bind_int64(stmt, 13, p->unanchored_count) != SQLITE_OK) {
         st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the unanchored count");
     }
+    /* Bound by explicit length (`atlas_db_bind_text_n`), not `atlas_db_bind_
+     * text_opt(..., atlas_buf_cstr(...), ...)`: a netstring is a
+     * length-prefixed encoding precisely so an embedded byte is never
+     * confused with a delimiter, and binding through a NUL-terminated view
+     * would silently truncate at the first embedded NUL instead -- discarding
+     * that binary safety at the one point these bytes are written. No stored
+     * component (a claim uid, a vocabulary name, a `path_text`-encoded anchor
+     * value) can contain a NUL today, so this has no live effect; it is
+     * corrected because the netstring format's whole reason to exist is to
+     * make that true by construction, not by which bytes happen to occur. */
     if (st == ATLAS_OK) {
-        st = atlas_db_bind_text_opt(db, stmt, 14, atlas_buf_cstr(&p->claims_manifest), err);
+        st = atlas_db_bind_text_n(db, stmt, 14,
+                                  p->claims_manifest.data != NULL ? p->claims_manifest.data : "",
+                                  p->claims_manifest.len, err);
     }
     if (st == ATLAS_OK) {
-        st = atlas_db_bind_text_opt(db, stmt, 15, atlas_buf_cstr(&p->flagged_anchors), err);
+        st = atlas_db_bind_text_n(db, stmt, 15,
+                                  p->flagged_anchors.data != NULL ? p->flagged_anchors.data : "",
+                                  p->flagged_anchors.len, err);
     }
     if (st == ATLAS_OK) {
         st = atlas_db_bind_text_opt(db, stmt, 16, now, err);

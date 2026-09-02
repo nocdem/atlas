@@ -1302,7 +1302,11 @@ atlas_status atlas_db_memory_pack_insert(atlas_db *db, const char *run_uid,
  * instead of re-running `atlas_memory_pack_build`, which would ask a
  * possibly-moved database a question about the present rather than reporting
  * what was frozen. `*found_out` is false and `*out` is left freshly
- * initialised when no such run has a pack. */
+ * initialised when no such run has a pack.
+ *
+ * `*out` must already be an initialised pack, the same precondition
+ * `atlas_memory_pack_build` carries and for the same reason: this function's
+ * first action is `atlas_memory_pack_free(out)`. */
 atlas_status atlas_db_memory_pack_get(atlas_db *db, const char *run_uid, atlas_memory_pack *out,
                                       bool *found_out, atlas_err *err);
 
@@ -1319,10 +1323,36 @@ atlas_status atlas_db_memory_pack_get(atlas_db *db, const char *run_uid, atlas_m
  * signature; disclosed in the T12 report as the one deviation from the plan's
  * literal interface.
  *
+ * **`pol` must be a policy this process loaded through `atlas_syspolicy_load`,
+ * and nothing at this function can check that** -- it is a struct, so
+ * `state == SYSTEM` is an integer any caller can set, and this sentence is the
+ * whole of the defence. Never from a request body, a parameter a client
+ * influences, or a struct built by hand outside a test.
+ * `atlas_writer_submit_memory_reconcile` (`src/daemon/daemon_internal.h`)
+ * carries the same sentence at higher stakes: there a forged policy
+ * authorises a whole reconciliation pass. Here `pol` authorises nothing --
+ * lower stakes, not none: it decides a verdict a worker is shown. This
+ * function pins `source_set_digest` from it, and a wrong policy pins that
+ * digest over a source set the operator never registered; handed the same
+ * wrong policy, `atlas_memory_pack_freshness` then agrees with itself and
+ * reports `CURRENT` over a source set that has in fact moved.
+ *
  * Refuses (does not truncate) when more than `ATLAS_MEMORY_PACK_MAX_CLAIMS`
- * claims have positive lexical overlap with `task_text`, or when the rendered
- * body would exceed `ATLAS_MEMORY_PACK_MAX_BYTES`. Must be called with **no
- * transaction open** -- see the section comment above. */
+ * claims have positive lexical overlap with `task_text`, when the rendered
+ * body would exceed `ATLAS_MEMORY_PACK_MAX_BYTES`, or when one claim resolves
+ * more than `ATLAS_MEMORY_PACK_MAX_ANCHORS_PER_CLAIM` anchors across the
+ * documents that state it (`limits.h`'s own comment there has the
+ * derivation: unlike the other two, this one is unbounded by construction,
+ * not merely large). Must be called with **no transaction open** -- see the
+ * section comment above.
+ *
+ * `*out` must already be an initialised pack (`atlas_memory_pack_init`, or a
+ * struct this function or `atlas_db_memory_pack_get` has already filled) --
+ * the first thing this function does is `atlas_memory_pack_free(out)`, which
+ * dereferences whatever `out` already owns. Passing a merely-zeroed or
+ * uninitialised struct is not the same thing; zeroed happens to be safe only
+ * because `atlas_buf_free` on a zeroed `atlas_buf` is a no-op, which is not
+ * true of an arbitrary uninitialised one. */
 atlas_status atlas_memory_pack_build(atlas_db *db, int64_t repo_id, const atlas_syspolicy *pol,
                                      const char *task_text, atlas_memory_pack *out, atlas_err *err);
 
@@ -1357,9 +1387,26 @@ atlas_status atlas_memory_pack_freeze_in_tx(atlas_db *db, const char *run_uid,
  *
  * `pol` is needed for the same reason `atlas_memory_pack_build` needs it: the
  * live source-set digest is not derivable without the registered source list.
- * This function reads the repository row and, when it is dirty, opens the
- * tree (`atlas_sem_source_identity`) -- never called from inside a
- * transaction anywhere in this codebase, and it must not be. */
+ * This function reads the repository row and, whenever the pack pinned a
+ * non-empty `source_identity`, opens the tree (`atlas_sem_source_identity`) --
+ * gated on the *pinned* value, never on the repository's current `dirty` flag
+ * (`atlas_sem_freshness_of`'s own precedent has no such gate either). A pin
+ * taken while dirty and a tree that has since gone clean again -- an
+ * uncommitted edit reverted without a commit -- must still be compared, so a
+ * pack pinned over content that no longer exists must not read as CURRENT
+ * merely because `dirty` now reads false; see the in-code comment at the call
+ * site for the reasoning in full. Never called from inside a transaction
+ * anywhere in this codebase, and it must not be.
+ *
+ * **The same `pol` provenance sentence as `atlas_memory_pack_build` applies
+ * here, at the same lower-than-T10 stakes.** A wrong policy handed to this
+ * function recomputes the live `source_set_digest` over the wrong source set
+ * and compares it against whatever `build` pinned; if both calls were handed
+ * the same wrong policy, the comparison agrees with itself and this function
+ * reports `CURRENT` over a source set that has in fact moved. `pol` must
+ * always be one this process loaded through `atlas_syspolicy_load`, never one
+ * from a request body, a parameter a client influences, or a struct built by
+ * hand outside a test -- nothing at this function can check that either. */
 atlas_status atlas_memory_pack_freshness(atlas_db *db, const atlas_syspolicy *pol,
                                          const atlas_memory_pack *p,
                                          atlas_memory_pack_status *out, atlas_buf *which_moved,

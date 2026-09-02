@@ -545,6 +545,26 @@ void atlas_db_rollback(atlas_db *db) {
     db->tx_depth = 0;
 }
 
+/* --- savepoints: a sub-unit of an open transaction ------------------------ */
+
+atlas_status atlas_db_savepoint(atlas_db *db, const char *name, atlas_err *err) {
+    char sql[96];
+    (void)snprintf(sql, sizeof sql, "SAVEPOINT %s;", name);
+    return atlas_db_exec_sql(db, sql, err);
+}
+
+atlas_status atlas_db_savepoint_release(atlas_db *db, const char *name, atlas_err *err) {
+    char sql[96];
+    (void)snprintf(sql, sizeof sql, "RELEASE %s;", name);
+    return atlas_db_exec_sql(db, sql, err);
+}
+
+atlas_status atlas_db_savepoint_rollback(atlas_db *db, const char *name, atlas_err *err) {
+    char sql[96];
+    (void)snprintf(sql, sizeof sql, "ROLLBACK TO %s;", name);
+    return atlas_db_exec_sql(db, sql, err);
+}
+
 /* --- checks ------------------------------------------------------------- */
 
 static atlas_status pragma_collect(atlas_db *db, const char *sql, const char *ok_text,

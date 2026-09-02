@@ -2265,6 +2265,24 @@ void atlas_db_rollback(atlas_db *db);
  * from Atlas' own nesting counter *and* from what SQLite believes, because
  * either alone can miss; a false "no" here would be worse than not asking. */
 bool atlas_db_in_transaction(const atlas_db *db);
+
+/* A named SAVEPOINT inside an already-open transaction -- a sub-unit a caller
+ * can undo without losing the rest of the transaction's work, which
+ * `atlas_db_begin`'s own nesting counter does not give: a nested `begin` just
+ * increments `tx_depth` and a nested `commit` just decrements it, so there is
+ * no way to roll back only the nested portion through that pair. `name` must
+ * be a valid SQL identifier (letters, digits, underscore); the caller
+ * constructs it, so this does not sanitise it. Used by a pass that processes
+ * several independent units inside one transaction and must not let one
+ * unit's own obstacle discard every other unit's work (A12.1 T8's
+ * reconciliation pass, one source per savepoint). */
+atlas_status atlas_db_savepoint(atlas_db *db, const char *name, atlas_err *err);
+/* Releases a savepoint, keeping everything written since it was taken. */
+atlas_status atlas_db_savepoint_release(atlas_db *db, const char *name, atlas_err *err);
+/* Rolls back to a savepoint, undoing everything written since it was taken,
+ * without ending the enclosing transaction. The savepoint itself is still
+ * open afterwards and must still be released (or rolled back again). */
+atlas_status atlas_db_savepoint_rollback(atlas_db *db, const char *name, atlas_err *err);
 /* Opens the database read-only. Used by daemon reader threads and by CLI read
  * commands while a daemon owns the writer, so a reader can never take the write
  * lock by accident. */

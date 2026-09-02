@@ -1454,14 +1454,109 @@ static void test_cost_debt_apply_duration_at_compiled_worst_case(void) {
                (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
 
     atlas_test_note(
-        "Debt 2 observed: one 256 KiB-class source (128 candidates x ~2000 anchor-scanned "
-        "bytes, all unresolving) cost %.1f ms inside atlas_memory_apply_in_tx's one write "
-        "transaction (unanchored=%zu). Accepted as bounded per Decision 10's own compiled-"
-        "ceiling argument (16 sources x 128 candidates is a stated worst case), not mitigated "
-        "by splitting the transaction -- see the T8 report.",
+        "Debt 2, all-refusing case observed: one 256 KiB-class source (128 candidates x ~2000 "
+        "anchor-scanned bytes, all unresolving) cost %.1f ms inside atlas_memory_apply_in_tx's "
+        "one write transaction (unanchored=%zu). This is NOT production's steady state -- see "
+        "the all-resolving measurement below and the T8 report.",
         ms, result.unanchored);
     T_CHECK_MSG(result.unanchored == 128, "expected every candidate to land unanchored, got %zu",
                 result.unanchored);
+
+    atlas_memory_observation_free(obs);
+    free(obs);
+    t8_env_close(&e);
+}
+
+/* I3: the measurement above ran zero intake ops -- every candidate refused
+ * to resolve, so `emit_candidate` never fired. The claim content key hashes
+ * `basis_commit` (`intake.c:643`), so every head move re-mints every claim;
+ * production's steady state after any commit is precisely the *all-
+ * resolving* case, and that is the one T10 needs timed before it can weigh
+ * this job against a hook's 4000 ms deadline. This builds Decision 10's full
+ * stated worst case -- 16 sources, each with 128 candidates that *do*
+ * resolve a PATH anchor and run CLAIM_CREATE, EVIDENCE_ADD, ATTESTATION_ADD
+ * and the DEPENDENCY_ADD check for real -- and times the same one write
+ * transaction. */
+static void test_cost_debt_all_resolving_case_at_compiled_worst_case(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    t8env e;
+    t8_env_open(&e, &err);
+
+    const char *repo = fx_repo(&e.fx);
+    T_OK(fx_mkdir(repo, "src", &err), &err);
+    T_OK(fx_mkdir(repo, "src/db", &err), &err);
+    T_OK(fx_write(repo, "src/db/db_orch.c", "int x;\n", &err), &err);
+
+    const char *paths[ATLAS_MEMORY_MAX_SOURCES];
+    char names[ATLAS_MEMORY_MAX_SOURCES][32];
+    for (int s = 0; s < (int)ATLAS_MEMORY_MAX_SOURCES; s++) {
+        atlas_buf content = ATLAS_BUF_INIT;
+        for (int line = 0; line < 128; line++) {
+            /* A unique marker per candidate (source and line), so each
+             * resolves to its own claim -- "every head move re-mints every
+             * claim" is every claim being *new*, not one shared claim
+             * looked up 2048 times. Padded with the same resolving PATH
+             * anchor repeated to fill the candidate, so the full anchor
+             * scan and a real add_anchor dedup check both run on every
+             * byte, exactly as the all-refusing measurement did. */
+            T_OK(atlas_buf_appendf(&content, &err, "- s%02d l%04d ", s, line), &err);
+            size_t budget = 1980;
+            while (budget > 24) {
+                T_OK(atlas_buf_appendf(&content, &err, "`src/db/db_orch.c` "), &err);
+                budget -= 20;
+            }
+            T_OK(atlas_buf_appendf(&content, &err, "\n"), &err);
+        }
+        (void)snprintf(names[s], sizeof names[s], "note-%02d.md", s);
+        T_OK(fx_write_bytes(repo, names[s], strlen(names[s]), content.data, content.len, 0644,
+                            &err),
+             &err);
+        atlas_buf_free(&content);
+        paths[s] = names[s];
+    }
+    T_OK(fx_add_all(&e.fx, repo, &err), &err);
+    T_OK(fx_commit(&e.fx, repo, "seed", &err), &err);
+    t8_bind_head(&e, &err);
+    t8_seed_file(&e, "src/db/db_orch.c", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                &err);
+    for (int s = 0; s < (int)ATLAS_MEMORY_MAX_SOURCES; s++) {
+        t8_seed_file(&e, names[s], "3333333333333333333333333333333333333333333333333333333333333333",
+                    &err);
+    }
+
+    atlas_syspolicy pol;
+    t8_policy(&pol, ATLAS_MEMORY_SOURCE_REPO_FILE, paths, ATLAS_MEMORY_MAX_SOURCES);
+
+    char now[64];
+    atlas_now_iso8601(now, sizeof now);
+    atlas_memory_observation *obs = malloc(sizeof *obs);
+    T_REQUIRE(obs != NULL);
+    T_OK(atlas_memory_observe(e.db, &e.repo, fx_data_dir(&e.fx), &pol, obs, &err), &err);
+    T_REQUIRE(obs->source_count == ATLAS_MEMORY_MAX_SOURCES);
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    atlas_memory_pass_result result;
+    T_OK(atlas_db_begin(e.db, &err), &err);
+    T_OK(atlas_memory_apply_in_tx(e.db, &e.repo, obs, &pol, now, &result, &err), &err);
+    T_OK(atlas_db_commit(e.db, &err), &err);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double ms = (double)(t1.tv_sec - t0.tv_sec) * 1000.0 +
+               (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
+
+    T_CHECK_MSG(result.claims_created == ATLAS_MEMORY_MAX_SOURCES * 128,
+                "expected every one of %d candidates to resolve and create a claim, got %zu "
+                "created (%zu unanchored)",
+                (int)(ATLAS_MEMORY_MAX_SOURCES * 128), result.claims_created, result.unanchored);
+    atlas_test_note(
+        "Debt 2, all-resolving case observed: Decision 10's full worst case -- 16 sources x 128 "
+        "candidates, every one resolving a PATH anchor and running CLAIM_CREATE+EVIDENCE_ADD+"
+        "ATTESTATION_ADD+DEPENDENCY_ADD for real -- cost %.1f ms inside atlas_memory_apply_in_tx's "
+        "one write transaction (claims_created=%zu). This is production's steady state after any "
+        "commit, since the claim content key hashes basis_commit. See the T8 report for what T10 "
+        "should do with this number against a hook's 4000 ms deadline.",
+        ms, result.claims_created);
 
     atlas_memory_observation_free(obs);
     free(obs);
@@ -1600,6 +1695,176 @@ static void test_repo_dir_source_versions_each_child_independently(void) {
     t8_env_close(&e);
 }
 
+
+/* C1 regression: two byte-identical children of one REPO_DIR share a
+ * `source_id`, so `version_exists` merges them into one version row --
+ * migration 29's own `UNIQUE(source_id, content_sha256, observed_at)`, and
+ * defensible on its own. What was not defensible: both children's ordinals
+ * restart at 0 (T7 splits each item independently), so the second
+ * `memory_unanchored` insert collides with the first under `UNIQUE
+ * (source_version_id, ordinal)`, `INSERT OR IGNORE` silently drops it, and
+ * the pass still counted it -- `result.unanchored == 2` while the table held
+ * one row. Driven end to end against the exact shape. */
+static void test_two_identical_children_land_as_one_unanchored_row(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    t8env e;
+    t8_env_open(&e, &err);
+
+    const char *repo = fx_repo(&e.fx);
+    T_OK(fx_mkdir(repo, ".claude", &err), &err);
+    T_OK(fx_mkdir(repo, ".claude/memories", &err), &err);
+    const char *prose = "just some prose with nothing in it to anchor to";
+    T_OK(fx_write(repo, ".claude/memories/a.md", prose, &err), &err);
+    T_OK(fx_write(repo, ".claude/memories/b.md", prose, &err), &err);
+    T_OK(fx_add_all(&e.fx, repo, &err), &err);
+    T_OK(fx_commit(&e.fx, repo, "seed", &err), &err);
+    t8_bind_head(&e, &err);
+    t8_seed_file(&e, ".claude/memories/a.md",
+                "1111111111111111111111111111111111111111111111111111111111111111", &err);
+    t8_seed_file(&e, ".claude/memories/b.md",
+                "1111111111111111111111111111111111111111111111111111111111111111", &err);
+
+    const char *paths[] = {".claude/memories"};
+    atlas_syspolicy pol;
+    t8_policy(&pol, ATLAS_MEMORY_SOURCE_REPO_DIR, paths, 1);
+
+    atlas_memory_pass_result result;
+    t8_run_pass(&e, &pol, &result, &err);
+
+    int64_t stored = t8_scalar(&e, "SELECT COUNT(*) FROM memory_unanchored;", &err);
+    T_CHECK_MSG((int64_t)result.unanchored == stored,
+                "the reported unanchored count (%zu) must equal what memory_unanchored actually "
+                "holds (%lld)",
+                result.unanchored, (long long)stored);
+    T_CHECK_MSG(stored == 1,
+                "two byte-identical children share one merged version row and one ordinal, so "
+                "exactly one row should land, got %lld",
+                (long long)stored);
+
+    t8_env_close(&e);
+}
+
+/* I1: a repository this pass could not fully see must not read the same as
+ * one that changed nothing. Compares a healthy no-op pass against one whose
+ * sole source answers NO_MIRROR (a scanner-named repository with no
+ * complete mirror, T6's own outcome for exactly this) -- both give
+ * `generation == 0`, and only `read_obstacles` tells them apart. */
+static void test_read_obstacle_is_distinguishable_from_unchanged(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    t8env e;
+    t8_env_open(&e, &err);
+
+    const char *repo = fx_repo(&e.fx);
+    T_OK(fx_write(repo, "note-a.md", "nothing anchored here\n", &err), &err);
+    T_OK(fx_add_all(&e.fx, repo, &err), &err);
+    T_OK(fx_commit(&e.fx, repo, "seed", &err), &err);
+    t8_bind_head(&e, &err);
+
+    const char *paths[] = {"note-a.md"};
+    atlas_syspolicy pol;
+    t8_policy(&pol, ATLAS_MEMORY_SOURCE_REPO_FILE, paths, 1);
+
+    /* Pass 1 legitimately owes a generation -- the version did not exist
+     * before this pass, so its content genuinely moved from nothing to
+     * something. Pass 2, over the same unchanged bytes, is the real
+     * "healthy, nothing new" baseline this test compares the blind pass
+     * against. */
+    atlas_memory_pass_result seed;
+    t8_run_pass(&e, &pol, &seed, &err);
+    atlas_memory_pass_result healthy;
+    t8_run_pass(&e, &pol, &healthy, &err);
+    T_CHECK_MSG(healthy.generation == 0 && healthy.read_obstacles == 0,
+                "expected a healthy no-op pass: generation 0, read_obstacles 0, got generation "
+                "%lld read_obstacles %zu",
+                (long long)healthy.generation, healthy.read_obstacles);
+
+    /* A scanner is named and no complete mirror exists -- read.c's own
+     * NO_MIRROR outcome, T6's `test_repo_file_no_mirror_reports_the_outcome`
+     * shape. */
+    e.repo.scanner_uid = (int64_t)geteuid() + 1;
+    e.repo.mirror_complete = false;
+
+    atlas_memory_pass_result blind;
+    t8_run_pass(&e, &pol, &blind, &err);
+    T_CHECK_MSG(blind.generation == 0, "a blind read must not fabricate a change, got generation %lld",
+                (long long)blind.generation);
+    T_CHECK_MSG(blind.read_obstacles == 1,
+                "expected the NO_MIRROR outcome to be counted as a read obstacle, got %zu",
+                blind.read_obstacles);
+
+    t8_env_close(&e);
+}
+
+/* I4: a genuine, unexpected write-point failure for one source must not
+ * discard the other fifteen. Driven with a real SQLite fault -- a temp
+ * trigger that raises on the poisoned source's own claim text -- rather than
+ * asserted: this is exactly the shape of an obstacle T8's own code cannot
+ * anticipate (a constraint, a full disk, a corrupt page), which is the
+ * point of the savepoint recovering from it rather than needing to
+ * enumerate every cause in advance. */
+static void test_one_source_obstacle_does_not_discard_the_rest(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    t8env e;
+    t8_env_open(&e, &err);
+
+    const char *repo = fx_repo(&e.fx);
+    T_OK(fx_mkdir(repo, "src", &err), &err);
+    T_OK(fx_mkdir(repo, "src/db", &err), &err);
+    T_OK(fx_write(repo, "src/db/db_orch.c", "int x;\n", &err), &err);
+    T_OK(fx_write(repo, "note-a.md", "the daemon reads `src/db/db_orch.c`", &err), &err);
+    T_OK(fx_write(repo, "note-poison.md", "POISON the daemon reads `src/db/db_orch.c`", &err), &err);
+    T_OK(fx_add_all(&e.fx, repo, &err), &err);
+    T_OK(fx_commit(&e.fx, repo, "seed", &err), &err);
+    t8_bind_head(&e, &err);
+    t8_seed_file(&e, "src/db/db_orch.c", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                &err);
+    t8_seed_file(&e, "note-a.md", "1111111111111111111111111111111111111111111111111111111111111111",
+                &err);
+    t8_seed_file(&e, "note-poison.md",
+                "2222222222222222222222222222222222222222222222222222222222222222", &err);
+
+    T_OK(atlas_db_exec_sql(e.db,
+                           "CREATE TEMP TRIGGER t8_poison BEFORE INSERT ON verify_claims"
+                           " WHEN NEW.text LIKE 'POISON%'"
+                           " BEGIN SELECT RAISE(ABORT, 'I4 test: injected write-point failure'); END;",
+                           &err),
+         &err);
+
+    const char *paths[] = {"note-a.md", "note-poison.md"};
+    atlas_syspolicy pol;
+    t8_policy(&pol, ATLAS_MEMORY_SOURCE_REPO_FILE, paths, 2);
+
+    atlas_memory_pass_result result;
+    t8_run_pass(&e, &pol, &result, &err);
+
+    T_CHECK_MSG(result.claims_created == 1,
+                "expected the healthy source's claim despite the poisoned one, got %zu",
+                result.claims_created);
+    T_CHECK_MSG(result.intake_bound_hits == 1,
+                "expected the poisoned source to be counted as an obstacle, got %zu",
+                result.intake_bound_hits);
+    T_CHECK_MSG(strstr(result.last_obstacle, "I4 test") != NULL,
+                "expected last_obstacle to carry the injected failure's own message, got \"%s\"",
+                result.last_obstacle);
+
+    char sql[256];
+    (void)snprintf(sql, sizeof sql,
+                  "SELECT COUNT(*) FROM verify_claims WHERE repo_id = %lld AND text LIKE 'POISON%%';",
+                  (long long)e.repo_id);
+    T_CHECK_MSG(t8_scalar(&e, sql, &err) == 0,
+                "the poisoned source's partial write must have been rolled back, not committed");
+    (void)snprintf(sql, sizeof sql, "SELECT COUNT(*) FROM verify_claims WHERE repo_id = %lld;",
+                  (long long)e.repo_id);
+    T_CHECK_MSG(t8_scalar(&e, sql, &err) == 1,
+                "expected exactly the healthy source's one claim to survive");
+
+    T_OK(atlas_db_exec_sql(e.db, "DROP TRIGGER t8_poison;", &err), &err);
+    t8_env_close(&e);
+}
+
 static const atlas_test TESTS[] = {
     {"REPO_FILE reads tracked bytes", test_repo_file_reads_tracked_bytes},
     {"REPO_FILE missing path is ABSENT", test_repo_file_missing_path_is_absent},
@@ -1628,12 +1893,20 @@ static const atlas_test TESTS[] = {
     {"Debt 1: the extractor version lands in the evidence actor",
      test_extractor_version_lands_in_the_evidence_actor},
     {"observe runs without a transaction", test_observe_runs_without_a_transaction},
-    {"Debt 2: apply duration at the compiled worst case, measured",
+    {"Debt 2: apply duration at the compiled worst case, measured (all-refusing)",
      test_cost_debt_apply_duration_at_compiled_worst_case},
+    {"I3: Debt 2, the all-resolving case at the compiled worst case, measured",
+     test_cost_debt_all_resolving_case_at_compiled_worst_case},
     {"EXTERNAL_* source reads the stored version, not the disk",
      test_external_source_reads_the_stored_version_not_the_disk},
     {"REPO_DIR source versions each child independently",
      test_repo_dir_source_versions_each_child_independently},
+    {"C1: two identical REPO_DIR children land as one unanchored row",
+     test_two_identical_children_land_as_one_unanchored_row},
+    {"I1: a dead scanner is distinguishable from an unchanged repository",
+     test_read_obstacle_is_distinguishable_from_unchanged},
+    {"I4: one source's obstacle does not discard the other sources",
+     test_one_source_obstacle_does_not_discard_the_rest},
 };
 
 ATLAS_TEST_MAIN("memory_reconcile", TESTS)

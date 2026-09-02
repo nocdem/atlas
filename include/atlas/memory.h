@@ -350,10 +350,22 @@ atlas_status atlas_db_memory_anchor_add(atlas_db *db, int64_t repo_id, const cha
 /* Records one candidate that resolved no anchor. `INSERT OR IGNORE`:
  * `UNIQUE(source_version_id, ordinal)` makes a re-run over an unchanged
  * version idempotent, exactly as the anchored path is through the intake
- * write point's content keys. */
+ * write point's content keys -- and, since migration 29's own
+ * `UNIQUE(source_id, content_sha256, observed_at)` on `memory_source_versions`
+ * merges two byte-identical `*_DIR` children into one version row, two
+ * children can legitimately share one `source_version_id`, at which point a
+ * second candidate landing on an ordinal the first one already used is not
+ * new information -- it is the same fact, already recorded.
+ *
+ * `*landed_out`, when not NULL, says whether this call actually inserted a
+ * row (`sqlite3_changes() > 0`) as opposed to being silently ignored by the
+ * `UNIQUE` constraint above. **A caller that counts "one candidate
+ * unanchored" per call without checking this overstates memory_unanchored's
+ * true row count** -- exactly the failure this parameter exists to close, a
+ * caller's own C1. */
 atlas_status atlas_db_memory_unanchored_add(atlas_db *db, int64_t source_version_id, int64_t ordinal,
                                             const char *text_sha256, const void *text,
-                                            size_t text_len, atlas_err *err);
+                                            size_t text_len, bool *landed_out, atlas_err *err);
 
 /* `max(generation) + 1` for this repository -- Decision 7's monotonic
  * sequence. 1 when this repository has none yet. */
@@ -799,6 +811,25 @@ typedef struct atlas_memory_pass_result {
     size_t sources_seen, versions_added, claims_created, claims_resolved;
     size_t unanchored, diff_rows, intake_bound_hits;
     bool sources_bound_hit;      /* a bound was reached; reported, never silent */
+    /* Review round 1, I1. Every item this pass could not read as a positive
+     * fact -- ABSENT is not one of these (that is a real look that found
+     * nothing); NO_MIRROR, NOT_MIRRORED, TOO_LARGE, SYMLINK, and an empty
+     * mirror-backed `*_DIR` listing are, because each says this process did
+     * not see what is actually there. `sources_seen 1, generation 0,
+     * read_obstacles 0` and `sources_seen 1, generation 0, read_obstacles 1`
+     * are two different repositories -- a healthy one with nothing new, and
+     * one this pass could not fully look at -- and before this field they
+     * read identically. */
+    size_t read_obstacles;
+    /* Review round 1, I4. How many registered sources this pass could not
+     * finish processing because a write-point call refused for a reason
+     * this pass did not itself provoke by construction (not the compiled
+     * text-length bound above, which stays counted here too but is
+     * unreachable today) -- each rolled back to the savepoint taken before
+     * it, so the other sources' work this pass still stands. `last_obstacle`
+     * carries the most recent one's own message: a count without a cause is
+     * "something happened", which A9.2.5 does not accept as a report. */
+    char last_obstacle[256];
 } atlas_memory_pass_result;
 
 /* Phase 2. Inside the caller's transaction: database work only. Materialises

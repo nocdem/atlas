@@ -479,7 +479,10 @@ atlas_status atlas_db_memory_anchor_add(atlas_db *db, int64_t repo_id, const cha
 
 atlas_status atlas_db_memory_unanchored_add(atlas_db *db, int64_t source_version_id, int64_t ordinal,
                                             const char *text_sha256, const void *text,
-                                            size_t text_len, atlas_err *err) {
+                                            size_t text_len, bool *landed_out, atlas_err *err) {
+    if (landed_out != NULL) {
+        *landed_out = false;
+    }
     if (db == NULL || text_sha256 == NULL || (text == NULL && text_len > 0)) {
         return atlas_err_set(err, ATLAS_ERR_INTERNAL, "no unanchored candidate to record");
     }
@@ -502,6 +505,13 @@ atlas_status atlas_db_memory_unanchored_add(atlas_db *db, int64_t source_version
     }
     if (st == ATLAS_OK) {
         st = atlas_db_step_done(db, stmt, err);
+        /* `step_done` is OK on zero changed rows -- `INSERT OR IGNORE`
+         * hitting the UNIQUE constraint is not an error, but it is not a new
+         * row either, and the two must not read the same to a caller
+         * counting how many landed. */
+        if (st == ATLAS_OK && landed_out != NULL) {
+            *landed_out = sqlite3_changes(db->h) > 0;
+        }
     } else {
         atlas_db_finish(db, stmt);
         stmt = NULL;

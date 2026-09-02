@@ -592,10 +592,11 @@ static atlas_status apply_one_source(apply_ctx *ctx, const atlas_memory_observed
             }
             st = atlas_memory_anchor_resolve(ctx->db, ctx->repo->id, &p, err);
             if (st == ATLAS_OK && p.anchor_count == 0) {
+                bool landed = false;
                 st = atlas_db_memory_unanchored_add(
                     ctx->db, src->external_latest.id, (int64_t)p.ordinal,
-                    atlas_buf_cstr(&p.text_sha256), p.text.data, p.text.len, err);
-                if (st == ATLAS_OK) {
+                    atlas_buf_cstr(&p.text_sha256), p.text.data, p.text.len, &landed, err);
+                if (st == ATLAS_OK && landed) {
                     ctx->out->unanchored++;
                 }
             } else if (st == ATLAS_OK) {
@@ -634,9 +635,25 @@ static atlas_status apply_one_source(apply_ctx *ctx, const atlas_memory_observed
         item_indexed[i] = false;
     }
 
+    /* I1: an empty mirror-backed `*_DIR` listing has no item of its own
+     * (T6's NF3) -- the one case a read obstacle can exist with nothing in
+     * `items[]` to carry it, exactly the gap `from_mirror_out` on the call
+     * closes for a reader. A tree-direct empty directory (`from_mirror ==
+     * false`) is a real look that found nothing and is not one of these. */
+    if (src->item_count == 0 && src->from_mirror) {
+        ctx->out->read_obstacles++;
+    }
+
     for (size_t i = 0; st == ATLAS_OK && i < src->item_count; i++) {
         const atlas_memory_observed_item *it = &src->items[i];
         if (it->outcome != ATLAS_MEMORY_READ_OK) {
+            /* ABSENT is a real look that found nothing -- not an obstacle.
+             * Every other non-OK outcome (NO_MIRROR, NOT_MIRRORED,
+             * TOO_LARGE, SYMLINK) is this process failing to see what is
+             * actually there, and must not read the same as "unchanged". */
+            if (it->outcome != ATLAS_MEMORY_READ_ABSENT) {
+                ctx->out->read_obstacles++;
+            }
             continue;
         }
 
@@ -723,12 +740,30 @@ static atlas_status apply_one_source(apply_ctx *ctx, const atlas_memory_observed
         }
 
         if (!item_indexed[item_idx]) {
+            /* I2, the trade-off written down rather than only chosen: T8
+             * could instead cite this item by `memory_version_uid` -- Atlas'
+             * own record, already written above, and immune to whether
+             * `files` happens to index this path -- exactly as an EXTERNAL_*
+             * source's evidence does. Not done: the brief's pinned op
+             * description reads "for a repository source, path_text ... for
+             * an external source, memory_version_uid", and blurring that
+             * line would make a REPO_*-sourced evidence row structurally
+             * indistinguishable from an EXTERNAL_* one, which a later
+             * consumer (T9's SUPERSEDED detection reads a source's *indexed*
+             * path history) would then have to special-case rather than
+             * being able to assume from the evidence's own shape. Routing to
+             * `memory_unanchored` instead costs sharing one table -- and one
+             * counter -- with the genuinely-prose-only case below; the two
+             * are distinguishable only by re-deriving `item_indexed` from
+             * the source's own read outcome, which is unresolved as its own
+             * finding rather than silently absorbed. */
             const atlas_memory_proposition *cp = &src->candidates[k];
+            bool landed = false;
             st = atlas_db_memory_unanchored_add(ctx->db, item_version_id[item_idx],
                                                 (int64_t)cp->ordinal,
                                                 atlas_buf_cstr(&cp->text_sha256), cp->text.data,
-                                                cp->text.len, err);
-            if (st == ATLAS_OK) {
+                                                cp->text.len, &landed, err);
+            if (st == ATLAS_OK && landed) {
                 ctx->out->unanchored++;
             }
             continue;
@@ -741,10 +776,11 @@ static atlas_status apply_one_source(apply_ctx *ctx, const atlas_memory_observed
         }
         st = atlas_memory_anchor_resolve(ctx->db, ctx->repo->id, &p, err);
         if (st == ATLAS_OK && p.anchor_count == 0) {
+            bool landed = false;
             st = atlas_db_memory_unanchored_add(ctx->db, item_version_id[item_idx],
                                                 (int64_t)p.ordinal, atlas_buf_cstr(&p.text_sha256),
-                                                p.text.data, p.text.len, err);
-            if (st == ATLAS_OK) {
+                                                p.text.data, p.text.len, &landed, err);
+            if (st == ATLAS_OK && landed) {
                 ctx->out->unanchored++;
             }
         } else if (st == ATLAS_OK) {
@@ -756,12 +792,13 @@ static atlas_status apply_one_source(apply_ctx *ctx, const atlas_memory_observed
              * rule regardless of whether the compiled bounds happen to make
              * a check unreachable right now. */
             if (p.text.len > ATLAS_VERIFY_CLAIM_TEXT_MAX) {
+                bool landed = false;
                 ctx->out->intake_bound_hits++;
                 st = atlas_db_memory_unanchored_add(ctx->db, item_version_id[item_idx],
                                                     (int64_t)p.ordinal,
                                                     atlas_buf_cstr(&p.text_sha256), p.text.data,
-                                                    p.text.len, err);
-                if (st == ATLAS_OK) {
+                                                    p.text.len, &landed, err);
+                if (st == ATLAS_OK && landed) {
                     ctx->out->unanchored++;
                 }
             } else {
@@ -811,9 +848,52 @@ atlas_status atlas_memory_apply_in_tx(atlas_db *db, const atlas_repo_info *repo,
         return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory starting a reconciliation pass");
     }
 
+    /* I4. One source's own obstacle must not discard the other fifteen
+     * sources' work this pass: each gets its own SAVEPOINT, taken before
+     * `apply_one_source` runs and released on success. On failure, this
+     * source's *SQL* writes are undone by rolling back to the savepoint --
+     * and, since a plain C-level counter is untouched by SQL rolling back
+     * anything, this source's share of `*out` and of the pass-wide
+     * bookkeeping (`ctx.dep`, `ctx.added_claims`) is undone right alongside
+     * it, from a snapshot taken at the same point the savepoint was. The
+     * obstacle is then counted and its cause recorded, not silenced, and
+     * the loop moves on to the next source rather than aborting the pass. */
     atlas_status st = ATLAS_OK;
     for (size_t i = 0; st == ATLAS_OK && i < obs->source_count; i++) {
-        st = apply_one_source(&ctx, &obs->sources[i], err);
+        atlas_memory_pass_result snapshot = *out;
+        size_t dep_snapshot = ctx.dep_count;
+        size_t added_snapshot = ctx.added_count;
+        bool any_change_snapshot = ctx.any_change;
+
+        char sp_name[32];
+        (void)snprintf(sp_name, sizeof sp_name, "memsrc_%zu", i);
+        st = atlas_db_savepoint(db, sp_name, err);
+        if (st != ATLAS_OK) {
+            break;
+        }
+
+        atlas_status one_st = apply_one_source(&ctx, &obs->sources[i], err);
+
+        if (one_st == ATLAS_OK) {
+            st = atlas_db_savepoint_release(db, sp_name, err);
+            continue;
+        }
+
+        atlas_err rollback_err;
+        atlas_err_init(&rollback_err);
+        (void)atlas_db_savepoint_rollback(db, sp_name, &rollback_err);
+        (void)atlas_db_savepoint_release(db, sp_name, &rollback_err);
+
+        *out = snapshot;
+        ctx.dep_count = dep_snapshot;
+        ctx.added_count = added_snapshot;
+        ctx.any_change = any_change_snapshot;
+
+        out->intake_bound_hits++;
+        (void)snprintf(out->last_obstacle, sizeof out->last_obstacle, "source %zu: %s", i,
+                      atlas_err_msg(err));
+        atlas_err_init(err);
+        /* st stays ATLAS_OK: recorded, not fatal to the rest of the pass. */
     }
 
     if (st == ATLAS_OK && ctx.any_change) {

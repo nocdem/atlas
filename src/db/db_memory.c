@@ -927,13 +927,14 @@ atlas_status atlas_db_memory_dir_hash_mismatch(atlas_db *db, int64_t repo_id, in
     if (db == NULL || path_text == NULL) {
         return atlas_err_set(err, ATLAS_ERR_INTERNAL, "no directory source to check");
     }
-    /* T9 fix-round-1 (C3), corrected in fix-round-2 and again in fix-round-3.
-     * The whole predicate list below answers exactly one question -- "would
-     * `src/memory/read.c` ingest this `files` row as a memory file?" -- and
-     * every clause exists because round 1 or round 2 or round 3 asked that
-     * question in a way this query did not yet agree with. Two places
-     * deciding "is this a memory file?" independently is the recurring
-     * defect; this comment is the running ledger of where they diverged.
+    /* T9 fix-round-1 (C3), corrected in fix-round-2, fix-round-3 and again in
+     * fix-round-4. The whole predicate list below answers exactly one
+     * question -- "does this `files` row still describe current content that
+     * `src/memory/read.c` would ingest as a memory file?" -- and every
+     * clause exists because an earlier round asked that question in a way
+     * this query did not yet agree with. Two places deciding "is this a
+     * memory file?" independently is the recurring defect; this comment is
+     * the running ledger of where they diverged.
      *
      * Depth (round 1): one level below `?2`, no further slash after that --
      * `path_text LIKE ?2 || '/%'` minus `path_text LIKE ?2 || '/%/%'`. `?2`
@@ -952,23 +953,30 @@ atlas_status atlas_db_memory_dir_hash_mismatch(atlas_db *db, int64_t repo_id, in
      * exactly `read.c`'s comparison, byte for byte, and takes no `ESCAPE`
      * clause because it is not a pattern.
      *
-     * Entry type (round 3, doors 1-3): `read.c:414-421`'s listing filter
-     * excludes only `S_ISDIR`, so a symlink, a fifo/socket/device, or a row
-     * a scan could not classify at all reaches `open_fs_file` and is refused
-     * there -- `ATLAS_MEMORY_READ_SYMLINK` for a symlink
-     * (`read.c:129-135`), `ABSENT` for anything else not a regular file
-     * (`read.c:140-146`) -- so none of them is ever given a
-     * `memory_source_versions` row. A real scan still gives each of them a
-     * `files` row: `file_type = 'symlink'` with `content_hash` = the hash of
-     * the link text (A13's own rule, `src/core/scan.c:329-341`),
-     * `file_type = 'other'` for a fifo/socket/device, or `file_type =
-     * 'missing'` for the fourth member of the CHECK'd vocabulary
-     * (`src/db/migrate.c:85`). Without a type filter this query matched all
-     * three and reported a mismatch it could never close. `file_type =
-     * 'regular'` is `read.c`'s own dividing line, restated as a predicate.
+     * Entry type (round 3): `read.c:414-421`'s listing filter excludes only
+     * `S_ISDIR`, so a symlink named `x.md` is listed and then refused by
+     * `open_fs_file` with outcome `ATLAS_MEMORY_READ_SYMLINK`
+     * (`read.c:129-135`) though a real scan gives it `file_type = 'symlink'`
+     * with `content_hash` = the hash of its link text, A13's own rule
+     * (`src/core/scan.c:329-341`) -- that row carries a real hash, so
+     * nothing before this predicate excluded it. `file_type = 'regular'`,
+     * `read.c`'s own dividing line, is what closes this door, and it is the
+     * only predicate that does: a fifo/socket/device (`file_type = 'other'`)
+     * and a row recorded `file_type = 'missing'` also fail it, but neither
+     * was ever a door a real scan could open. Every producer of both leaves
+     * `content_hash` unset -- `outcome_file_type` maps every outcome that is
+     * not a regular file or a symlink to `'other'` or, for `ENTRY_MISSING`,
+     * to `'missing'` (`src/core/reconcile.c:838-852`), and `rec.content_hash`
+     * is assigned only under `e->have_hash` (`reconcile.c:912-915`), which
+     * none of those outcomes set -- so the `hash == NULL` skip already in
+     * this loop (below) excluded both before this predicate existed.
+     * `file_type = 'regular'` still costs nothing against them and stays as
+     * defence in depth; a corrected record of that is at
+     * `tests/test_memory_reconcile.c` beside the doors test this predicate
+     * belongs to.
      *
-     * Size bound (round 3, door 4): a `file_type = 'regular'` `.md` file
-     * over `ATLAS_MEMORY_MAX_SOURCE_BYTES` still has a real content hash --
+     * Size bound (round 3): a `file_type = 'regular'` `.md` file over
+     * `ATLAS_MEMORY_MAX_SOURCE_BYTES` still has a real content hash --
      * `file_type = 'regular'` alone does not exclude it -- but
      * `read.c:158-163` refuses it with outcome `TOO_LARGE` and no bytes,
      * this season's own "a bound that is reached is refused, never
@@ -977,15 +985,85 @@ atlas_status atlas_db_memory_dir_hash_mismatch(atlas_db *db, int64_t repo_id, in
      * row this pass cannot even ask the question of, on the same footing --
      * a row `read.c` cannot be shown to ingest is not evidence of a
      * mismatch either, exactly the posture `size_bytes IS NULL` already
-     * gets from every other reader of this column.
+     * gets from every other reader of this column. This and the symlink
+     * predicate above are the two doors of round 3 a real scan could
+     * actually produce; naming all four as equally live is exactly the
+     * reasoning -- entry *type* as the discriminator for "would `read.c`
+     * ingest this" -- that stopped one field short of the fifth door below,
+     * because type answers that question only for a symlink.
+     *
+     * Deletion (round 4, the fifth door): `atlas_db_files_mark_deleted`
+     * (`src/db/db_index.c:404-407`) is `UPDATE files SET deleted=1,
+     * deleted_at=?1, deleted_scan_id=?2 ... ` -- it touches nothing else, so
+     * a `.md` file removed from the tree keeps its last `file_type =
+     * 'regular'`, in-bound `size_bytes` and real `content_hash`. `read.c`'s
+     * `readdir` (`read.c:397-433`) cannot list a path that is gone, so no
+     * `memory_source_versions` row is ever written for that hash under this
+     * `source_id`, and this query reported a mismatch for it for ever -- no
+     * race required: any `.md` deleted before the memory source was ever
+     * registered, or before the first pass ran, reaches this from the very
+     * first call. `deleted_scan_id IS NULL` closes it, spelled exactly as
+     * the sibling branch of the very same loop already spells it for
+     * `REPO_FILE` sources: `atlas_memory_plan_for`'s `REPO_FILE` branch
+     * (`src/memory/reconcile.c:2237`) calls `atlas_db_verify_file_hash`,
+     * whose SQL filters `deleted_scan_id IS NULL AND content_hash IS NOT
+     * NULL` under the comment "A deleted file has no current content, and
+     * reporting its last known hash would let a claim about bytes that are
+     * gone verify for ever" (`src/db/db_verify.c:2062-2067`); this
+     * function is what the `REPO_DIR` branch further down that same loop
+     * calls instead (`reconcile.c:2252`). One question, asked
+     * twice by two branches of one loop, must get one answer; a reader
+     * changing either predicate list should read the other. `deleted = 0`
+     * would answer the same question here -- the two writers of this table
+     * that touch either column always set both together
+     * (`db_index.c:358` clears both on re-tracking, `db_index.c:404-407`
+     * sets both on deletion) -- but the sibling's own spelling is kept so
+     * two places answering one question cannot drift on which column they
+     * consult if that ever stops being true.
+     *
+     * The `LIMIT ?3` below has no `ORDER BY`, and that is safe -- not merely
+     * untested -- because of the predicate directly above it plus one more
+     * fact about who ever writes a version: a `memory_source_versions` row
+     * for this `source_id` is written only by the pass itself, which reaches
+     * a `REPO_DIR` child through `read.c`, and `read.c` refuses a directory
+     * whose *live* matching children exceed `ATLAS_MEMORY_MAX_DIR_ENTRIES`
+     * outright rather than versioning the first 64 of them (`read.c:441-448`,
+     * "refused rather than trimmed"). So at most `ATLAS_MEMORY_MAX_DIR_ENTRIES`
+     * live rows of any one source can ever have been versioned, by anything.
+     * Now that `deleted_scan_id IS NULL` keeps a dead row from ever occupying
+     * one of the 65 slots, a directory with more than 64 live matching rows
+     * must return, in whatever order SQLite chooses, at least one row from
+     * beyond that already-fully-versioned set of 64 -- and that row, by
+     * construction, has no version. `found` is false for it, `changed_out` is
+     * set, the pass runs, reaches the same directory through `read.c`, and is
+     * refused at the same ceiling: the obstacle is surfaced, not hidden, and
+     * this holds for whichever 65-of-N rows SQLite happens to return. That is
+     * what the `+ 1` is for -- `LIMIT ?3` binds
+     * `ATLAS_MEMORY_MAX_DIR_ENTRIES + 1` precisely so one of the rows
+     * returned is guaranteed to fall outside the fully-versioned set whenever
+     * one exists. A directory within bound has at most
+     * `ATLAS_MEMORY_MAX_DIR_ENTRIES` live rows to return in the first place,
+     * so `LIMIT ?3` never truncates it either -- `deleted_scan_id IS NULL` is
+     * what makes "live rows" and "rows this query can see" the same number,
+     * which is what closes the second, more dangerous consequence of the
+     * fifth door: before this round, an unbounded run of deleted rows could
+     * occupy the 65 slots and push the one live, genuinely-changed file out
+     * of the result window with no `ORDER BY` to say which 65 of a larger set
+     * came back -- a permanent silent miss, the more dangerous direction,
+     * rather than the permanent false alarm the other four doors produce. One
+     * pass's own staleness -- the index recorded 70 live children a moment
+     * ago, the directory holds 60 now -- is the same snapshot posture the
+     * paragraph below already accepts for size and type; the `LIMIT`
+     * inherits it and nothing more.
      *
      * Both sides of every one of these comparisons are snapshots taken at
-     * different times: `files.size_bytes` and `files.file_type` are from
-     * the last scan, `read.c` stats and classifies again at read time. A
-     * file that changed kind or crossed the size bound between the two is
-     * judged on stale data for one pass -- convergence, not correctness,
-     * the same posture the rest of this check already has (the case and
-     * depth fixes above carry no re-stat either). Do not add one here. */
+     * different times: `files.size_bytes`, `files.file_type` and
+     * `files.deleted_scan_id` are from the last scan, `read.c` stats and
+     * classifies again at read time. A file that changed kind, crossed the
+     * size bound, or was deleted between the two is judged on stale data for
+     * one pass -- convergence, not correctness, the same posture the rest of
+     * this check already has (the case and depth fixes above carry no
+     * re-stat either). Do not add one here. */
     static const char SQL[] =
         "SELECT content_hash FROM files"
         " WHERE repo_id = ?1"
@@ -997,6 +1075,7 @@ atlas_status atlas_db_memory_dir_hash_mismatch(atlas_db *db, int64_t repo_id, in
         "   AND size_bytes IS NOT NULL"
         "   AND size_bytes >= 0"
         "   AND size_bytes <= ?4"
+        "   AND deleted_scan_id IS NULL"
         " LIMIT ?3;";
     atlas_buf escaped = ATLAS_BUF_INIT;
     atlas_status st = like_escape(path_text, &escaped, err);

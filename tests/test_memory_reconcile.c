@@ -3715,96 +3715,146 @@ static void test_dir_hash_mismatch_escapes_a_literal_percent_in_its_own_path(voi
     t8_env_close(&e);
 }
 
-/* T9 fix-round-3 (C3, still-open finding): `atlas_db_memory_dir_hash_mismatch`
- * had no `file_type` or size predicate at all, so it treated every `files`
- * row one level under a REPO_DIR source's own path as a candidate memory
- * file regardless of what `src/memory/read.c` would actually do with it.
- * Four kinds of row pass every predicate the query had before this round --
- * right source, right depth, a literal `.md` suffix -- and are never given a
- * `memory_source_versions` row by `read.c`, so each reported
+/* T9 fix-round-3 (C3, still-open finding), extended in fix-round-4.
+ * `atlas_db_memory_dir_hash_mismatch` had no `file_type`, size or deletion
+ * predicate at all, so it treated every `files` row one level under a
+ * REPO_DIR source's own path as a candidate memory file regardless of
+ * whether `src/memory/read.c` would ever give it a
+ * `memory_source_versions` row. Five kinds of row pass every predicate the
+ * query had before fix-round-3 -- right source, right depth, a literal
+ * `.md` suffix -- and are never versioned by `read.c`, so each reported
  * `changed_out = true` for ever, the same permanent-`SOURCE_REVISION` loop
- * the depth fix (round 1) and the case fix (round 2) each closed one door of:
+ * the depth fix (round 1) and the case fix (round 2) each closed one door
+ * of. Doors 1 and 4 are the two a real scan can actually produce; doors 2
+ * and 3 never carry a stored `content_hash` in production and were already
+ * excluded by this loop's own `hash == NULL` skip before fix-round-3 added
+ * a type predicate -- kept below anyway, as defence in depth, but verified
+ * rather than presented as reproductions of a live failure. Door 5 is the
+ * one fix-round-3 missed, by the same reasoning that overstated doors 2 and
+ * 3: it treated entry *type* as the discriminator for "would `read.c`
+ * ingest this", when the real discriminator is "does this row still
+ * describe current content" -- type answers that only for a symlink.
  *
  *  1. a symlink named `x.md` -- `read.c`'s listing filter excludes only
  *     `S_ISDIR` (`read.c:414-421`), so a symlink is listed, then refused by
  *     `open_fs_file` with outcome `ATLAS_MEMORY_READ_SYMLINK`
  *     (`read.c:129-135`); a real scan still gives it `file_type = 'symlink'`
  *     with `content_hash` = the hash of its link text, A13's own rule
- *     (`src/core/scan.c:329-341`).
+ *     (`src/core/scan.c:329-341`). Live in production.
  *  2. a fifo/socket/device named `x.md` -- refused with outcome `ABSENT`
- *     (`read.c:140-146`); a real scan gives it `file_type = 'other'`.
+ *     (`read.c:140-146`); a real scan gives it `file_type = 'other'` and no
+ *     `content_hash` at all (`outcome_file_type` maps every such outcome to
+ *     `'other'` and `rec.content_hash` is assigned only under
+ *     `e->have_hash`, `src/core/reconcile.c:838-852,912-915`), so the loop's
+ *     own NULL-hash skip already excluded it before this round. Not a live
+ *     production door; kept as defence in depth.
  *  3. a `files` row recorded `file_type = 'missing'` -- the fourth member of
- *     the CHECK'd vocabulary (`src/db/migrate.c:85`), equally unfiltered
- *     before this round.
+ *     the CHECK'd vocabulary (`src/db/migrate.c:85`), equally hash-less and
+ *     equally already excluded by the same skip. Not a live production
+ *     door; kept as defence in depth.
  *  4. a real, regular `.md` file over `ATLAS_MEMORY_MAX_SOURCE_BYTES` --
  *     `read.c:158-163` refuses it with outcome `TOO_LARGE` and no bytes,
  *     this season's own "a bound that is reached is refused, never
  *     trimmed", so `file_type = 'regular'` alone does not exclude it. A
  *     `size_bytes` of NULL -- a row this pass cannot even ask the question
- *     of -- must be excluded on the same footing, never read as "small
- *     enough": added as a fifth row alongside door 4 rather than a fifth
- *     door of its own, since it is the same predicate's other edge.
+ *     of -- is checked alongside it as the same predicate's other edge,
+ *     never read as "small enough". Live in production.
+ *  5. a `.md` file deleted from the tree -- `atlas_db_files_mark_deleted`
+ *     (`src/db/db_index.c:404-407`) sets `deleted=1` and `deleted_scan_id`
+ *     and touches nothing else, so the row keeps its last `file_type =
+ *     'regular'`, in-bound `size_bytes` and real `content_hash`. `read.c`'s
+ *     `readdir` cannot list a path that is gone (`read.c:397-433`), so no
+ *     version is ever recorded for it. Live in production, and reachable
+ *     with no race: any `.md` deleted before the memory source was ever
+ *     registered reaches this from the very first call.
  *
  * Every row below has no `memory_source_versions` row recorded for it, and
- * every one must report no mismatch -- before this round's fix, each did. */
+ * every one must report no mismatch -- before its own fix, each did. */
 /* One door's own row, inserted directly (the existing tests' own convention
  * for this function -- `t8_seed_file` always writes `file_type = 'regular'`,
- * so it cannot build any of these). `size_bytes` is a `const char *` (rather
- * than a bound parameter) so `NULL` -- door 4's other edge -- can be spelled
- * as the SQL literal instead of a sentinel int64_t. */
+ * `deleted = 0`, so it cannot build any of these). `size_bytes` is a
+ * `const char *` (rather than a bound parameter) so `NULL` -- door 4's other
+ * edge -- can be spelled as the SQL literal instead of a sentinel
+ * `int64_t`. `deleted` seeds door 5: true sets `deleted = 1` and
+ * `deleted_scan_id` to the same scan row `first_seen_scan_id` /
+ * `last_seen_scan_id` already reference, via the same `last_insert_rowid()`
+ * this function already relies on to bind them. */
 static void t9_seed_door_file(t8env *e, const char *path, const char *file_type, const char *hash,
-                              const char *size_bytes_literal, atlas_err *err) {
+                              const char *size_bytes_literal, bool deleted, atlas_err *err) {
     atlas_buf sql = ATLAS_BUF_INIT;
     T_OK(atlas_buf_appendf(&sql, err,
                            "INSERT INTO scans(repo_id, started_at, status)"
                            "  VALUES(%lld, '2026-01-01T00:00:00Z', 'ok');"
                            "INSERT INTO files(repo_id, path_raw, path_text, file_type,"
                            "  content_hash, size_bytes, first_seen_scan_id, last_seen_scan_id,"
-                           "  first_seen_at, last_seen_at)"
+                           "  first_seen_at, last_seen_at, deleted, deleted_scan_id)"
                            "  VALUES(%lld, CAST('%s' AS BLOB), '%s', '%s', '%s', %s,"
                            "         last_insert_rowid(), last_insert_rowid(),"
-                           "         '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');",
+                           "         '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', %d, %s);",
                            (long long)e->repo_id, (long long)e->repo_id, path, path, file_type, hash,
-                           size_bytes_literal),
+                           size_bytes_literal, deleted ? 1 : 0,
+                           deleted ? "last_insert_rowid()" : "NULL"),
          err);
     T_OK(atlas_db_exec_sql(e->db, atlas_buf_cstr(&sql), err), err);
     atlas_buf_free(&sql);
 }
 
-/* T9 fix-round-3 (C3, still-open finding): `atlas_db_memory_dir_hash_mismatch`
- * had no `file_type` or size predicate at all, so it treated every `files`
- * row one level under a REPO_DIR source's own path as a candidate memory
- * file regardless of what `src/memory/read.c` would actually do with it.
- * Four kinds of row pass every predicate the query had before this round --
- * right source, right depth, a literal `.md` suffix -- and are never given a
- * `memory_source_versions` row by `read.c`, so each reported
- * `changed_out = true` for ever, the same permanent-`SOURCE_REVISION` loop
- * the depth fix (round 1) and the case fix (round 2) each closed one door of.
- * One case per door, added one row at a time so a failing assertion names
- * which door regressed rather than only that some row among five did:
+/* T9 fix-round-3 (C3, still-open finding), extended in fix-round-4.
+ * `atlas_db_memory_dir_hash_mismatch` had no `file_type`, size or deletion
+ * predicate at all, so it treated every `files` row one level under a
+ * REPO_DIR source's own path as a candidate memory file regardless of
+ * whether `src/memory/read.c` would ever give it a `memory_source_versions`
+ * row. Five kinds of row pass every predicate the query had before
+ * fix-round-3 -- right source, right depth, a literal `.md` suffix -- and
+ * are never versioned by `read.c`, so each reported `changed_out = true` for
+ * ever, the same permanent-`SOURCE_REVISION` loop the depth fix (round 1)
+ * and the case fix (round 2) each closed one door of. One case per door,
+ * added one row at a time so a failing assertion names which door regressed
+ * rather than only that some row among six did. Doors 1 and 4 are the two a
+ * real scan can actually produce; doors 2 and 3 never carry a stored
+ * `content_hash` in production and were already excluded by this loop's own
+ * `hash == NULL` skip before fix-round-3 added a type predicate -- kept
+ * below anyway, as defence in depth, but asserted as such rather than as
+ * reproductions of a live failure. Door 5 is the one fix-round-3 missed, by
+ * the same reasoning that overstated doors 2 and 3: it treated entry *type*
+ * as the discriminator for "would `read.c` ingest this", when the real
+ * discriminator is "does this row still describe current content" -- type
+ * answers that only for a symlink:
  *
  *  1. a symlink named `x.md` -- `read.c`'s listing filter excludes only
  *     `S_ISDIR` (`read.c:414-421`), so a symlink is listed, then refused by
  *     `open_fs_file` with outcome `ATLAS_MEMORY_READ_SYMLINK`
  *     (`read.c:129-135`); a real scan still gives it `file_type = 'symlink'`
  *     with `content_hash` = the hash of its link text, A13's own rule
- *     (`src/core/scan.c:329-341`).
+ *     (`src/core/scan.c:329-341`). Live in production.
  *  2. a fifo/socket/device named `x.md` -- refused with outcome `ABSENT`
- *     (`read.c:140-146`); a real scan gives it `file_type = 'other'`.
+ *     (`read.c:140-146`); a real scan gives it `file_type = 'other'` and no
+ *     `content_hash` at all (`src/core/reconcile.c:838-852,912-915`), so the
+ *     loop's own NULL-hash skip already excluded it before this round. Not a
+ *     live production door; kept as defence in depth.
  *  3. a `files` row recorded `file_type = 'missing'` -- the fourth member of
- *     the CHECK'd vocabulary (`src/db/migrate.c:85`), equally unfiltered
- *     before this round.
+ *     the CHECK'd vocabulary (`src/db/migrate.c:85`), equally hash-less and
+ *     equally already excluded by the same skip. Not a live production
+ *     door; kept as defence in depth.
  *  4. a real, regular `.md` file over `ATLAS_MEMORY_MAX_SOURCE_BYTES` --
  *     `read.c:158-163` refuses it with outcome `TOO_LARGE` and no bytes,
  *     this season's own "a bound that is reached is refused, never
  *     trimmed", so `file_type = 'regular'` alone does not exclude it. A
  *     `size_bytes` of NULL -- a row this pass cannot even ask the question
  *     of -- is checked as door 4's own other edge, on the same footing:
- *     never read as "small enough".
+ *     never read as "small enough". Live in production.
+ *  5. a `.md` file deleted from the tree -- `atlas_db_files_mark_deleted`
+ *     (`src/db/db_index.c:404-407`) sets `deleted=1` and `deleted_scan_id`
+ *     and touches nothing else, so the row keeps its last `file_type =
+ *     'regular'`, in-bound `size_bytes` and real `content_hash`. `read.c`'s
+ *     `readdir` cannot list a path that is gone (`read.c:397-433`), so no
+ *     version is ever recorded for it. Live in production, and reachable
+ *     with no race: any `.md` deleted before the memory source was ever
+ *     registered reaches this from the very first call.
  *
  * Every row below has no `memory_source_versions` row recorded for it, and
- * every one must report no mismatch -- before this round's fix, each did. */
-static void test_dir_hash_mismatch_excludes_the_four_unreadable_doors(void) {
+ * every one must report no mismatch -- before its own fix, each did. */
+static void test_dir_hash_mismatch_excludes_the_five_unreadable_doors(void) {
     atlas_err err;
     atlas_err_init(&err);
     t8env e;
@@ -3832,7 +3882,7 @@ static void test_dir_hash_mismatch_excludes_the_four_unreadable_doors(void) {
      * not. */
     t9_seed_door_file(&e, ".claude/memories/ordinary.md", "regular",
                       "2222222222222222222222222222222222222222222222222222222222222222", "128",
-                      &err);
+                      false, &err);
     changed = false;
     T_OK(atlas_db_memory_dir_hash_mismatch(e.db, e.repo_id, source_id, atlas_buf_cstr(&dir_encoded),
                                            &changed, &err),
@@ -3857,7 +3907,7 @@ static void test_dir_hash_mismatch_excludes_the_four_unreadable_doors(void) {
     /* Door 1: a symlink. */
     t9_seed_door_file(&e, ".claude/memories/link.md", "symlink",
                       "3333333333333333333333333333333333333333333333333333333333333333", "12",
-                      &err);
+                      false, &err);
     changed = true;
     T_OK(atlas_db_memory_dir_hash_mismatch(e.db, e.repo_id, source_id, atlas_buf_cstr(&dir_encoded),
                                            &changed, &err),
@@ -3869,7 +3919,7 @@ static void test_dir_hash_mismatch_excludes_the_four_unreadable_doors(void) {
     /* Door 2: a fifo/socket/device. */
     t9_seed_door_file(&e, ".claude/memories/pipe.md", "other",
                       "4444444444444444444444444444444444444444444444444444444444444444", "0",
-                      &err);
+                      false, &err);
     changed = true;
     T_OK(atlas_db_memory_dir_hash_mismatch(e.db, e.repo_id, source_id, atlas_buf_cstr(&dir_encoded),
                                            &changed, &err),
@@ -3881,7 +3931,7 @@ static void test_dir_hash_mismatch_excludes_the_four_unreadable_doors(void) {
     /* Door 3: file_type = 'missing'. */
     t9_seed_door_file(&e, ".claude/memories/gone.md", "missing",
                       "5555555555555555555555555555555555555555555555555555555555555555", "40",
-                      &err);
+                      false, &err);
     changed = true;
     T_OK(atlas_db_memory_dir_hash_mismatch(e.db, e.repo_id, source_id, atlas_buf_cstr(&dir_encoded),
                                            &changed, &err),
@@ -3896,7 +3946,7 @@ static void test_dir_hash_mismatch_excludes_the_four_unreadable_doors(void) {
                   (long long)ATLAS_MEMORY_MAX_SOURCE_BYTES + 1);
     t9_seed_door_file(&e, ".claude/memories/huge.md", "regular",
                       "6666666666666666666666666666666666666666666666666666666666666666", over_limit,
-                      &err);
+                      false, &err);
     changed = true;
     T_OK(atlas_db_memory_dir_hash_mismatch(e.db, e.repo_id, source_id, atlas_buf_cstr(&dir_encoded),
                                            &changed, &err),
@@ -3910,7 +3960,7 @@ static void test_dir_hash_mismatch_excludes_the_four_unreadable_doors(void) {
      * footing as one it can establish is over it. */
     t9_seed_door_file(&e, ".claude/memories/unknown-size.md", "regular",
                       "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", "NULL",
-                      &err);
+                      false, &err);
     changed = true;
     T_OK(atlas_db_memory_dir_hash_mismatch(e.db, e.repo_id, source_id, atlas_buf_cstr(&dir_encoded),
                                            &changed, &err),
@@ -3918,6 +3968,23 @@ static void test_dir_hash_mismatch_excludes_the_four_unreadable_doors(void) {
     T_CHECK_MSG(!changed,
                "door 4's other edge: a regular .md file with size_bytes NULL cannot be shown to be "
                "in bound -- it must not report a mismatch either");
+
+    /* Door 5 (fix-round-4): a regular, in-bound .md file deleted from the
+     * tree. `deleted = true` seeds `deleted = 1` and `deleted_scan_id`,
+     * everything else -- `file_type`, `size_bytes`, `content_hash` --
+     * identical in shape to the positive control's own row, since that is
+     * exactly what `atlas_db_files_mark_deleted` leaves behind. */
+    t9_seed_door_file(&e, ".claude/memories/deleted.md", "regular",
+                      "7777777777777777777777777777777777777777777777777777777777777777", "128",
+                      true, &err);
+    changed = true;
+    T_OK(atlas_db_memory_dir_hash_mismatch(e.db, e.repo_id, source_id, atlas_buf_cstr(&dir_encoded),
+                                           &changed, &err),
+         &err);
+    T_CHECK_MSG(!changed,
+               "door 5: a regular, in-bound .md file marked deleted keeps its file_type, size_bytes "
+               "and content_hash (atlas_db_files_mark_deleted touches nothing else) but read.c's "
+               "readdir can never list a path that is gone -- it must not report a mismatch either");
 
     atlas_buf_free(&dir_encoded);
     t8_env_close(&e);
@@ -4000,8 +4067,8 @@ static const atlas_test TESTS[] = {
      test_dir_hash_mismatch_matches_read_c_exactly},
     {"C3: dir_hash_mismatch escapes a literal '%' in its own path",
      test_dir_hash_mismatch_escapes_a_literal_percent_in_its_own_path},
-    {"C3 fix-round-3: dir_hash_mismatch excludes the four unreadable doors",
-     test_dir_hash_mismatch_excludes_the_four_unreadable_doors},
+    {"C3 fix-round-3/4: dir_hash_mismatch excludes the five unreadable doors",
+     test_dir_hash_mismatch_excludes_the_five_unreadable_doors},
 };
 
 ATLAS_TEST_MAIN("memory_reconcile", TESTS)

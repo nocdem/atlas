@@ -1352,12 +1352,15 @@ atlas_status atlas_db_memory_pack_reliance_set(atlas_db *db, const char *run_uid
  *
  * Refuses (does not truncate) when more than `ATLAS_MEMORY_PACK_MAX_CLAIMS`
  * claims have positive lexical overlap with `task_text`, when the rendered
- * body would exceed `ATLAS_MEMORY_PACK_MAX_BYTES`, or when one claim resolves
- * more than `ATLAS_MEMORY_PACK_MAX_ANCHORS_PER_CLAIM` anchors across the
- * documents that state it (`limits.h`'s own comment there has the
- * derivation: unlike the other two, this one is unbounded by construction,
- * not merely large). Must be called with **no transaction open** -- see the
- * section comment above.
+ * body would exceed `ATLAS_MEMORY_PACK_MAX_BYTES`, or when one claim has
+ * accumulated more than `ATLAS_MEMORY_PACK_MAX_ANCHORS_PER_CLAIM` anchors
+ * across the passes that resolved it. That third bound is **picked, not
+ * derived** -- what it would be derived from is unbounded in time, because
+ * nothing prunes a kept claim's anchors -- and its refusal therefore **has no
+ * exit**: it is repository-wide and task-independent. `limits.h`'s comment
+ * there states the cost in full and `docs/backlog.md` carries the argument.
+ * Must be called with **no transaction open** -- see the section comment
+ * above.
  *
  * `*out` must already be an initialised pack (`atlas_memory_pack_init`, or a
  * struct this function or `atlas_db_memory_pack_get` has already filled) --

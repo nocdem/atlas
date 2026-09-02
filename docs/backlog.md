@@ -1636,3 +1636,34 @@ rather than the claim's storage, so an over-anchored claim costs one truncated c
 reported, never silent — instead of every pack in the repository. Either way the "no exit"
 property must stop being true before A12.1 can call the refusal a bound rather than a
 trap.
+
+## A10.1's memory package reached one of the two attempt paths (2026-09-02)
+
+Found by A12.1's T13 while wiring its own composer into both call sites, and verified
+against the tree at `36b7509`: `src/orch/dispatch.c` contained **no call to
+`atlas_orch_memory_compose` at all**, so a workspace attempt's task was handed to a worker
+exactly as submitted while a run driver's jobs received the package.
+
+**Why nothing caught it.** A10.1's own A/B experiment ran through the run driver, which
+does inject, so the measured verdict — `USEFUL` on worker duration and turns, not on cost —
+is about the path that worked and stands unaffected. The season's rules are about what the
+package *contains* and how it is *selected*; none of them asserts that every path a job
+can take injects it. And `OFF` appending nothing is indistinguishable, from outside, from a
+path that appends nothing because it never asks.
+
+**What it cost.** A workspace-attempt job in a run carrying a frozen manifest saw none of
+it, silently — the manifest was frozen, stored, and never delivered. `orch_runs`' memory
+rows for such runs describe a package no worker read.
+
+**Fixed in passing rather than left**, because A12.1's T13 had to put its own composer at
+both sites and the missing A10.1 call was in the way: both paths now go through
+`atlas_memory_pack_compose`, which composes the task, the optional A10.1 package and the
+optional context pack. What remains for a reader of this entry is that **the fix's
+correctness now rests on there being exactly two call sites**, and nothing asserts that
+number — a third attempt path added later would repeat this defect exactly.
+
+**Candidate follow-up, not implemented.** Make the composer the only way a task reaches a
+worker, structurally rather than by convention — the shape `atlas_decision_apply_in_tx`
+has, where the write point is one function with a counted set of callers and a test that
+compares the count. Today the property is stated in a comment at both sites and checked by
+nothing.

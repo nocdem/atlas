@@ -279,24 +279,38 @@ static atlas_status anchor_collect_cb(atlas_memory_anchor_kind kind, const char 
                                       atlas_err *err) {
     anchor_collect_ctx *ac = ud;
     if (ac->c->anchor_count >= PACK_MAX_ANCHORS) {
-        /* Reachable, not defensive: O10's claim content key deliberately
-         * omits the actor, so two memory documents whose propositions
-         * resolve to byte-identical text land on one claim_uid, and
-         * `emit_candidate`'s anchor write (`src/memory/reconcile.c`) is
-         * unconditional on both the new-claim and the duplicate-claim
-         * branches -- every contributing document's anchors are written,
-         * with no ceiling in the schema. `ATLAS_MEMORY_PACK_MAX_ANCHORS_PER_
-         * CLAIM`'s own comment (`limits.h`) is the derivation; this is the
-         * bound it names. Refused, not dropped: `atlas_db_memory_anchors_
-         * for_claim` orders `kind, value` -- COMMIT, DECISION, PATH, SYMBOL,
-         * alphabetically -- so a silent drop here always falls on whichever
-         * rows sort *later*: SYMBOL entirely once the bound is reached, and
-         * PATH partially whenever the total exceeds the bound before every
-         * PATH row has been read; never on COMMIT or DECISION while a
-         * later-sorting row is also present. PATH is the one kind
-         * `flagged_anchors` renders -- exactly the reliance input T13
-         * consumes, and a worker whose own changed file was the dropped
-         * anchor must never read as untouched. */
+        /* Reachable, and the route is accumulation rather than merging -- an
+         * earlier version of this comment gave the wrong mechanism and was
+         * corrected. **Not** two documents: `atlas_memory_anchor_resolve`
+         * (`src/memory/extract.c`) resolves from the proposition's text alone,
+         * nothing document-relative reaches it, so two documents stating one
+         * proposition produce byte-identical tuples that
+         * `UNIQUE(claim_uid, kind, value)` collapses -- two documents can never
+         * exceed one document's bound. What reaches this bound is the **union
+         * across passes on a stable claim_uid**: a claim keeps its uid while its
+         * proposition's identity holds, its text may resolve to different
+         * anchors from pass to pass, and every new tuple is admitted.
+         *
+         * Nothing prunes them. The only deleter,
+         * `atlas_db_memory_anchor_prune_one`, has one caller
+         * (`src/memory/reconcile.c`) and prunes the *predecessor* uid when a
+         * proposition is re-minted; a claim that keeps its uid keeps every
+         * anchor it has ever resolved, and the vanished-anchor sweep reports on
+         * them without deleting any. **So this refusal has no exit** -- it is
+         * repository-wide and task-independent, and once a long-lived claim
+         * crosses the bound that repository has no working pack until rows are
+         * removed by hand or the claim is re-minted. That is a stated cost and
+         * it is recorded in `docs/backlog.md`; it is not a property anybody
+         * should discover.
+         *
+         * Refused, not dropped, and the bias is why it matters:
+         * `atlas_db_memory_anchors_for_claim` orders `kind, value` -- COMMIT,
+         * DECISION, PATH, SYMBOL alphabetically -- so a silent drop always falls
+         * on whichever rows sort *later*, which is SYMBOL entirely and PATH
+         * partially, never COMMIT or DECISION. PATH is the one kind
+         * `flagged_anchors` renders, which is exactly the reliance input T13
+         * consumes, and a worker whose own changed file was the dropped anchor
+         * must never read as untouched. */
         return atlas_err_set(err, ATLAS_ERR_USAGE,
                              "claim %s resolved more than %u anchors across the documents that "
                              "state it; refused rather than silently dropped, so a worker is "

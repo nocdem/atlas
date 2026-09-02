@@ -1181,7 +1181,7 @@ is not written down is one somebody deletes.** Both halves are load-bearing.
   claim rather than setting and clearing it, which is what makes the drain reuse
   the three-exit contract instead of copying it.
 - **`job_kind_is_drainable` is asked of the kind and has no `default:`**, like
-  `job_kind_is_unbounded` beside it. `true` for the six latency-critical kinds
+  `job_kind_is_unbounded` beside it. `true` for every latency-critical kind
   whose tables are disjoint from a pass; every `false` carries its reason at the
   case, and an unbounded kind is never drainable.
 - **FIFO is narrowed in exactly one direction and the docs say so.** It holds

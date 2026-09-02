@@ -836,10 +836,16 @@ static void t8_policy(atlas_syspolicy *pol, atlas_memory_source_class cls, const
 static int64_t t8_scalar(t8env *e, const char *sql, atlas_err *err) {
     sqlite3_stmt *stmt = NULL;
     T_OK(atlas_db_prepare(e->db, sql, &stmt, err), err);
-    int64_t v = 0;
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        v = sqlite3_column_int64(stmt, 0);
-    }
+    /* A `SELECT COUNT(*)` always yields exactly one row, even over zero
+     * matches -- so anything other than SQLITE_ROW here is the query itself
+     * failing, not a genuine zero, and must not be allowed to read the same
+     * as one. Without this, `t8_scalar(...) == 0` would have exactly one
+     * vacuous shape: a caller asking "is the count zero" getting "yes"
+     * because the step never ran rather than because it counted zero rows. */
+    int step = sqlite3_step(stmt);
+    T_REQUIRE_MSG(step == SQLITE_ROW, "scalar query did not yield a row: %s (%s)", sql,
+                 sqlite3_errmsg(e->db->h));
+    int64_t v = sqlite3_column_int64(stmt, 0);
     atlas_db_finish(e->db, stmt);
     return v;
 }

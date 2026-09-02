@@ -806,33 +806,46 @@ atlas_status atlas_memory_observe(atlas_db *db, const atlas_repo_info *repo,
                                   const char *data_dir, const atlas_syspolicy *pol,
                                   atlas_memory_observation *out, atlas_err *err);
 
-/* Round 3's own rule, stated here rather than only at the loop that
- * enforces it (`atlas_memory_apply_in_tx`, `reconcile.c`): every field below
- * is either **write-side** or an **observation**, and the two are restored
- * differently when one source's own obstacle rolls back its savepoint.
+/* Round 3's own rule, corrected in round 4 to name all twelve members
+ * rather than generalise over them -- the two a general description left
+ * out were the two it got wrong. Three categories, not two, and every
+ * member below is tagged with exactly one:
  *
- * A write-side field describes rows this pass actually committed --
- * `versions_added`, `claims_created`, `claims_resolved`, `unanchored`,
- * `intake_bound_hits`, and (set once, after the per-source loop)
- * `generation`/`diff_rows`. A SQL rollback undoing a source's rows must undo
- * its share of these too, so they are snapshotted before each source and
- * restored on that source's own failure -- the count must never claim a row
- * exists that the rollback just removed.
+ * WRITE-SIDE, snapshotted before each source in the per-source loop
+ * (`atlas_memory_apply_in_tx`, `reconcile.c`) and restored on that source's
+ * own failure, because a SQL rollback undoing a source's rows must undo the
+ * count alongside them: `versions_added`, `claims_created`,
+ * `claims_resolved`, `unanchored`, `intake_bound_hits` (both its sites --
+ * the compiled, still-unreachable text-length bound inside one source's own
+ * processing, and the per-source obstacle count in the outer loop -- either
+ * describe a row this pass wrote or a row it attempted and rolled back,
+ * never an observation).
  *
- * An observation field describes what the *observe* phase saw, before any
- * transaction existed: `sources_seen`, `read_obstacles` and
- * `sources_bound_hit`. These are never snapshotted or restored. Rolling one
- * back on a write failure would erase the fact that this pass looked at the
- * source at all -- exactly the distinction round 1's I1 was raised to
- * create, and round 2's I2 had to correct once already because the earlier
- * loop restored the whole struct wholesale rather than by field. */
+ * WRITE-SIDE, but set exactly once after every source has resolved rather
+ * than snapshotted per source, because nothing before that point has
+ * committed the rows they describe: `generation` and `diff_rows`.
+ *
+ * OBSERVATION, never snapshotted or restored: `sources_seen`,
+ * `sources_bound_hit`, `read_obstacles`, `last_read_obstacle`. These
+ * describe what the *observe* phase saw before any transaction existed;
+ * rolling one back on a write failure would erase the fact that this pass
+ * looked at the source at all -- the distinction round 1's I1 was raised to
+ * create, and round 2's I2 had to correct once already because an earlier
+ * loop restored the whole struct wholesale rather than by field.
+ *
+ * DIAGNOSTIC, never snapshotted or restored for a third, different reason:
+ * `last_obstacle`. It is not a running count with a "before" value worth
+ * restoring -- it holds whichever obstacle happened most recently, by
+ * design, so a source's own failure is exactly the case that must
+ * *overwrite* it rather than have an earlier snapshot survive in its
+ * place. */
 typedef struct atlas_memory_pass_result {
-    int64_t generation;          /* write-side; 0 = nothing changed, no generation appended */
+    int64_t generation;          /* write-side, set once; 0 = nothing changed, no generation appended */
     size_t sources_seen;         /* observation */
-    size_t versions_added, claims_created, claims_resolved; /* write-side */
-    size_t unanchored;           /* write-side */
-    size_t diff_rows;            /* write-side */
-    size_t intake_bound_hits;    /* write-side -- see the struct comment above */
+    size_t versions_added, claims_created, claims_resolved; /* write-side, per source */
+    size_t unanchored;           /* write-side, per source */
+    size_t diff_rows;            /* write-side, set once, alongside generation */
+    size_t intake_bound_hits;    /* write-side, per source -- see the struct comment above */
     bool sources_bound_hit;      /* observation; a bound was reached, reported never silent */
     /* Observation. Review round 1, I1. Every item this pass could not read
      * as a positive fact -- ABSENT is not one of these (that is a real look
@@ -861,7 +874,10 @@ typedef struct atlas_memory_pass_result {
      * outcome first is what guarantees *it* always survives even when the
      * path does not, since a truncated path is still informative but a
      * truncated-away outcome would leave a reader with nothing that
-     * classifies the obstacle at all.
+     * classifies the obstacle at all. Measured, not merely reasoned about:
+     * the longest outcome label this field ever carries is
+     * "EMPTY_MIRROR_LISTING: " at 22 bytes into 256, so the outcome always
+     * survives regardless of what the path segment costs.
      *
      * Both halves are already safe to print or store as-is: the outcome is
      * one of a fixed set of literal C strings (`read_outcome_label`,
@@ -872,14 +888,12 @@ typedef struct atlas_memory_pass_result {
      * satisfied by construction rather than left for a renderer to
      * discover. */
     char last_read_obstacle[256];
-    /* Write-side. Review round 1, I4. How many registered sources this pass
-     * could not finish processing because a write-point call refused for a
-     * reason this pass did not itself provoke by construction (not the
-     * compiled text-length bound above, which stays counted here too but is
-     * unreachable today) -- each rolled back to the savepoint taken before
-     * it, so the other sources' work this pass still stands. `last_obstacle`
-     * carries the most recent one's own message: a count without a cause is
-     * "something happened", which A9.2.5 does not accept as a report.
+    /* Diagnostic -- see the struct's own comment above for why this is a
+     * third category rather than write-side or observation. Review round 1,
+     * I4. Carries the most recent obstacle's own message, from whichever
+     * source this pass most recently had to roll back: a bare count
+     * (`intake_bound_hits`) without a cause is "something happened", which
+     * A9.2.5 does not accept as a report.
      *
      * Unlike `last_read_obstacle` above, this field carries raw
      * `sqlite3_errmsg`/`atlas_err` text (`reconcile.c`), which is Atlas' own

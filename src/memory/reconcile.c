@@ -891,21 +891,27 @@ atlas_status atlas_memory_apply_in_tx(atlas_db *db, const atlas_repo_info *repo,
      * comment in `memory.h` for exactly which fields that is and why; this
      * loop is what enforces the split, not what defines it.
      *
-     * Round 2, New-C1 / round 3 correction: certain SQLite errors
-     * (SQLITE_FULL, IOERR, NOMEM, BUSY, INTERRUPT) can end the *outer*
-     * transaction, not merely the savepoint -- documented SQLite behaviour,
-     * not a defect in the primitives above. The savepoint this loop opened
-     * is released or rolled back by this same loop and nothing else, so
-     * `ROLLBACK TO` failing has exactly one honest explanation: the
-     * transaction it named is no longer there to roll back within. That is
-     * inferred from the failure itself, not from asking
-     * `atlas_db_in_transaction` first -- inside this function `tx_depth` is
-     * always >= 1 (the caller opened the transaction before calling in),
-     * so that question would answer `true` from its own short-circuit
-     * without ever reaching `sqlite3_get_autocommit`, which an earlier
-     * draft of this comment wrongly credited with an answer it was never
-     * asked for. `atlas_db_rollback` is called unconditionally on this
-     * path precisely because the answer is already known. */
+     * Round 2, New-C1 / round 3 correction / round 4 correction: certain
+     * SQLite errors (SQLITE_FULL, IOERR, NOMEM, BUSY, INTERRUPT) can end the
+     * *outer* transaction, not merely the savepoint -- documented SQLite
+     * behaviour, not a defect in the primitives above. The savepoint this
+     * loop opened is released or rolled back by this same loop and nothing
+     * else, so a failed `ROLLBACK TO`/`RELEASE` most likely means the
+     * transaction it named is gone. Not *certainly*: `sqlite3_exec` can
+     * fail to prepare `ROLLBACK TO` itself with SQLITE_NOMEM while the
+     * transaction is still perfectly alive (`db.c`'s `atlas_db_exec_sql`),
+     * so this is one likely explanation, not the only possible one. What
+     * makes the inference safe without being certain is that the response
+     * is fail-closed either way: `atlas_db_rollback` forces the connection
+     * to a known, closed state and the whole pass is abandoned, whether the
+     * transaction was actually gone already or merely could not be trusted
+     * to isolate anything further. Decided from the failure itself, not
+     * from asking `atlas_db_in_transaction` first -- inside this function
+     * `tx_depth` is always >= 1 (the caller opened the transaction before
+     * calling in), so that question would answer `true` from its own
+     * short-circuit without ever reaching `sqlite3_get_autocommit`, which
+     * an earlier draft of this comment wrongly credited with an answer it
+     * was never asked for. */
     atlas_status st = ATLAS_OK;
     for (size_t i = 0; st == ATLAS_OK && i < obs->source_count; i++) {
         size_t versions_added_snap = out->versions_added;
@@ -945,12 +951,17 @@ atlas_status atlas_memory_apply_in_tx(atlas_db *db, const atlas_repo_info *repo,
          * pass failed" and "why" are two different things a caller reading
          * `last_obstacle` needs, and losing the first to the second was
          * round 2's own residual (`reconcile.c:977`, named in review). */
-        /* Sized with room to spare under "source %zu: " (`last_obstacle`'s
-         * own destination is 256 bytes; %zu's worst case is 20 digits, so
-         * this is capped well below what the prefix could ever need,
-         * satisfying -Wformat-truncation rather than merely being correct
-         * at runtime). */
-        char original_msg[200];
+        /* Sized to the largest value that still proves safe to
+         * -Wformat-truncation, not rounded down further than that: the
+         * final `snprintf` into `last_obstacle` (256 bytes) prefixes this
+         * with "source %zu: ", whose worst case is 7 + 20 (a 64-bit size_t's
+         * longest decimal form) + 2 = 29 bytes, so 256 - 29 = 227 is the
+         * largest size the compiler can verify never overflows; one byte of
+         * margin below that avoids an off-by-one against its own count of
+         * the trailing NUL. An earlier round capped this at 200 to silence
+         * the same warning, discarding up to 26 bytes of a real failure
+         * message for no reason tied to actual safety. */
+        char original_msg[226];
         (void)snprintf(original_msg, sizeof original_msg, "%s", atlas_err_msg(err));
 
         atlas_err rollback_err;
@@ -961,12 +972,16 @@ atlas_status atlas_memory_apply_in_tx(atlas_db *db, const atlas_repo_info *repo,
             rel_st = atlas_db_savepoint_release(db, sp_name, &rollback_err);
         }
         if (rb_st != ATLAS_OK || rel_st != ATLAS_OK) {
-            /* `ROLLBACK TO`/`RELEASE` named a savepoint this same loop just
-             * opened and has not yet released -- the one call that can fail
-             * it is the transaction it lived in ending from under it. Forced
-             * closed unconditionally rather than asked about again: a
-             * rollback that itself fails is what turns a bad source into a
-             * bad database. */
+            /* `ROLLBACK TO`/`RELEASE` named a savepoint this same loop
+             * just opened and has not yet released -- the most likely
+             * explanation for either failing is the transaction it lived in
+             * ending from under it, though a resource failure in
+             * `sqlite3_exec` itself (SQLITE_NOMEM at prepare) could produce
+             * the same failure with the transaction still alive. Forced
+             * closed unconditionally rather than asked about again either
+             * way: the response is fail-closed regardless of which
+             * explanation is true, and a rollback that itself fails is what
+             * turns a bad source into a bad database if it is not. */
             atlas_db_rollback(db);
             st = atlas_err_set(err, ATLAS_ERR_DB,
                                "the write transaction ended while processing source %zu (%s); "

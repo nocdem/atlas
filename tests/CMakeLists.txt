@@ -220,6 +220,16 @@ set(ATLAS_TESTS
   # in turn), relevance that is never recency, and the two refusal bounds.
   # "integration" beside test_memory_anchor, for the same reason.
   test_memory_pack
+  # T14: commit trailers -- composed for a person from a real frozen pack and
+  # a real recorded reason, pasted into a real commit through the fixture's
+  # own git, ingested from the real stored `commits.body` a rescan produces.
+  # Needs `atlas_orch_apply` directly (no writer thread, `test_orch_run.c`'s
+  # own shape) and `atlas_memory_pack_build`/`_freeze_in_tx` directly
+  # (`test_memory_pack.c`'s own shape) rather than a live SUBMIT's `run_orch`
+  # seam, which is daemon-only (T13's own file explains why) -- so this stays
+  # "integration" beside test_memory_pack rather than moving to
+  # test_memory_pack_live's "daemon" label.
+  test_memory_trailer
   # T13: delivery, injection and the reliance check, against a real writer
   # thread (`run_orch`'s own seam -- build before the transaction, freeze
   # inside it, freshness after it commits -- is unreachable through
@@ -316,7 +326,7 @@ set_tests_properties(test_ops PROPERTIES LABELS "daemon")
 set_tests_properties(test_memory_pack_live PROPERTIES LABELS "daemon")
 set_tests_properties(test_scan test_search test_diff test_worktree test_cli test_terminal test_code_graph test_code_compdb
   test_code_analyzer test_git_hardening test_reconcile test_repo_scanner test_scanner_rpc test_mirror_source
-  test_memory_anchor test_memory_pack
+  test_memory_anchor test_memory_pack test_memory_trailer
   # T11 fix round, item 6: test_memory_reconcile is back here, plain
   # "integration" with no RUN_SERIAL and no explicit TIMEOUT (the default 300 s
   # the foreach above already gives it). T11 originally labelled it

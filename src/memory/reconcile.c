@@ -1925,6 +1925,40 @@ static atlas_status vanish_tuple_cb(atlas_memory_anchor_kind kind, const char *v
     return ctx_add_diff(ctx, fc.uid, new_kind, reason, err);
 }
 
+/* --- T14: the trailer scan step ---------------------------------------------
+ *
+ * One callback per commit row `atlas_db_commits_since` (`src/db/db_index.c`)
+ * hands back: ingest it (`atlas_memory_trailer_ingest`, `src/memory/
+ * trailer.c` -- parses `commits.body`, no process, no git) and, only when it
+ * actually carries a recognised block, store the binding
+ * (`atlas_db_memory_trailer_binding_insert`, `src/db/db_memory.c`) -- an
+ * ordinary commit with no block is not itself recorded, though it still
+ * counts toward `scanned` and still advances the scan window past it. */
+typedef struct trailer_scan_ctx {
+    atlas_db *db;
+    int64_t repo_id;
+    const char *now;
+    size_t scanned;
+    size_t written;
+} trailer_scan_ctx;
+
+static atlas_status trailer_scan_one(int64_t commit_id, const char *oid, void *ud, atlas_err *err) {
+    (void)commit_id;
+    trailer_scan_ctx *tc = (trailer_scan_ctx *)ud;
+    tc->scanned++;
+    atlas_memory_trailer_binding b;
+    atlas_memory_trailer_binding_init(&b);
+    atlas_status st = atlas_memory_trailer_ingest(tc->db, tc->repo_id, oid, &b, err);
+    if (st == ATLAS_OK && b.has_block) {
+        st = atlas_db_memory_trailer_binding_insert(tc->db, tc->repo_id, oid, &b, tc->now, err);
+        if (st == ATLAS_OK) {
+            tc->written++;
+        }
+    }
+    atlas_memory_trailer_binding_free(&b);
+    return st;
+}
+
 atlas_status atlas_memory_apply_in_tx(atlas_db *db, const atlas_repo_info *repo,
                                       const atlas_memory_observation *obs,
                                       const atlas_syspolicy *pol, const char *now,
@@ -2102,6 +2136,55 @@ atlas_status atlas_memory_apply_in_tx(atlas_db *db, const atlas_repo_info *repo,
         st = atlas_db_memory_anchor_distinct(db, repo->id, vanish_tuple_cb, &vc, err);
     }
 
+    /* T14's trailer scan: unconditional, whatever ctx.any_change turned out
+     * to be above. A commit's trailer block is a fact about `commits`, not
+     * about a registered memory source, so it must not wait for one of those
+     * to have moved -- a repository with zero registered sources still owes
+     * this. `trailer_high` starts at the last generation's own cursor (0 for
+     * a repository with no generation yet) and becomes the value this pass
+     * persists into the *next* generation row's own `trailer_scan_high`,
+     * which is the only place that column is ever written (T1/T3 wired the
+     * parameter; nothing updates an existing generation row after the fact).
+     * That is also why this can only ever *advance* alongside a fresh
+     * generation: when a new binding is a real find (`trailer_written > 0`),
+     * it forces `ctx.any_change` so one gets created; when the scan finds
+     * nothing new to record and nothing else changed either, the cursor
+     * stays where it was and a later pass re-walks the same window --
+     * idempotent (`INSERT OR IGNORE`, `UNIQUE(repo_id, commit_oid)`) and
+     * bounded, so the residual is wasted repeated work, never a wrong
+     * answer. Disclosed in the T14 report as a stated cost. */
+    int64_t trailer_high = 0;
+    size_t trailer_scanned = 0;
+    size_t trailer_written = 0;
+    bool trailer_bound_hit = false;
+    if (st == ATLAS_OK) {
+        st = atlas_db_memory_generation_trailer_scan_high(db, repo->id, &trailer_high, err);
+    }
+    if (st == ATLAS_OK) {
+        trailer_scan_ctx tc;
+        tc.db = db;
+        tc.repo_id = repo->id;
+        tc.now = now;
+        tc.scanned = 0;
+        tc.written = 0;
+        int64_t max_id = trailer_high;
+        bool more = false;
+        st = atlas_db_commits_since(db, repo->id, trailer_high, ATLAS_MEMORY_TRAILER_PASS_MAX,
+                                    trailer_scan_one, &tc, &max_id, &more, err);
+        if (st == ATLAS_OK) {
+            trailer_high = max_id;
+            trailer_scanned = tc.scanned;
+            trailer_written = tc.written;
+            trailer_bound_hit = more;
+        }
+    }
+    out->trailer_scanned = trailer_scanned;
+    out->trailer_bindings_written = trailer_written;
+    out->trailer_scan_bound_hit = trailer_bound_hit;
+    if (trailer_written > 0) {
+        ctx.any_change = true;
+    }
+
     if (st == ATLAS_OK && ctx.any_change) {
         int64_t last_generation = 0;
         bool have_last = false;
@@ -2148,8 +2231,8 @@ atlas_status atlas_memory_apply_in_tx(atlas_db *db, const atlas_repo_info *repo,
         if (st == ATLAS_OK) {
             st = atlas_db_memory_generation_insert(db, repo->id, generation, cause,
                                                    atlas_buf_cstr(&identity), repo->scanned_head,
-                                                   cur_decision_digest, cur_source_digest, 0, now,
-                                                   &generation_id, err);
+                                                   cur_decision_digest, cur_source_digest,
+                                                   trailer_high, now, &generation_id, err);
         }
         atlas_buf_free(&identity);
         for (size_t i = 0; st == ATLAS_OK && i < ctx.diff_count; i++) {

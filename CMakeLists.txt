@@ -393,6 +393,12 @@ add_library(atlas_core STATIC
   # through db_memory.c/db_verify.c, so T17's rule that a memory-table row
   # insert lives only in db_memory.c holds by construction.
   src/memory/pack.c
+  # `trailer.c` (T14) is the commit trailer: composed for a person from a
+  # frozen pack's own stored identifiers, ingested from `commits.body` (no
+  # process, no git invocation). Every field that does not verify against
+  # Atlas' own rows is named in `unknown_fields` and binds nothing -- a
+  # trailer is a pointer, never proof and never authority.
+  src/memory/trailer.c
   ${ATLAS_UI_GEN}
 )
 

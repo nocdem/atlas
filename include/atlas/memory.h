@@ -486,6 +486,16 @@ atlas_status atlas_db_memory_generation_latest(atlas_db *db, int64_t repo_id, in
                                                atlas_buf *source_set_digest_out, bool *found_out,
                                                atlas_err *err);
 
+/* T14. `memory_generations.trailer_scan_high` for this repository's latest
+ * generation, or 0 when this repository has no generation yet -- the
+ * trailer scan's own cursor, read on its own rather than folded into
+ * `atlas_db_memory_generation_latest` above: that function already has seven
+ * call sites across this tree (`docs/extending.md`'s own caution about
+ * widening a signature everyone already calls), and the trailer scan is the
+ * only one of them that needs this column. */
+atlas_status atlas_db_memory_generation_trailer_scan_high(atlas_db *db, int64_t repo_id,
+                                                          int64_t *high_out, atlas_err *err);
+
 /* Every distinct (kind, value) anchor ever recorded for this repository --
  * one row per repository fact a memory claim has anchored to, regardless of
  * how many claim uids (across how many remints) share it. The vanished-anchor
@@ -1116,6 +1126,24 @@ typedef struct atlas_memory_pass_result {
      * treated every `PATH`-anchored claim as conservatively `IMPACTED` this
      * pass rather than checking each one against the set. */
     bool touched_bound_hit;
+    /* T14. Write-side, unconditional: this pass's trailer scan runs whatever
+     * `ctx.any_change` turns out to be from the claim/anchor loop above,
+     * because a commit's trailer block is a fact about `commits`, not about a
+     * registered source. `trailer_scanned` is how many commit rows above the
+     * cursor this pass examined, bounded at `ATLAS_MEMORY_TRAILER_PASS_MAX`;
+     * `trailer_bindings_written` is how many of those carried a recognised
+     * `Atlas-Provenance: v1` block and got a `memory_trailer_bindings` row
+     * (`has_block` 0 or 1, both stored -- a commit with no block is recorded
+     * as carrying none, a different fact from carrying a bad one, A9.2.2's
+     * shape one layer over commit trailers). `trailer_scan_bound_hit` is
+     * true when more commits remain above what this pass reached; the
+     * unexamined remainder stays above the last-persisted
+     * `memory_generations.trailer_scan_high` until a later pass advances it
+     * (only a pass that creates a new generation row persists this cursor at
+     * all -- see `atlas_memory_apply_in_tx`'s own comment). */
+    size_t trailer_scanned;
+    size_t trailer_bindings_written;
+    bool trailer_scan_bound_hit;
 } atlas_memory_pass_result;
 
 /* Phase 2. Inside the caller's transaction: database work only. Materialises
@@ -1473,5 +1501,138 @@ atlas_status atlas_memory_pack_compose(const char *task, const char *memory_pack
 atlas_status atlas_memory_pack_reliance_match(const atlas_memory_pack *p,
                                               const atlas_buf *touched_paths, size_t touched_count,
                                               atlas_buf *matched_out, bool *any_out, atlas_err *err);
+
+/* --- T14: commit trailers ----------------------------------------------------
+ *
+ * A trailer is composed for a person (or a driver's final report) to paste
+ * into a commit message; Atlas itself commits nothing. It is a *pointer*,
+ * never proof and never authority -- every field is verified against Atlas'
+ * own rows on ingestion, and a field that does not verify is named in
+ * `unknown_fields` and binds nothing: it can never manufacture an approval, a
+ * gate result or a verified claim. The frozen six-line format is in
+ * `docs/plans/2026-09-01-a12.1-reconciled-memory.md` under "The commit
+ * trailer block".
+ *
+ * **Two of the six fields survive an index rebuild; two do not; two are
+ * content-derived and always do.** SQLite is a rebuildable index and git is
+ * authoritative (architecture invariant 1) -- a trailer lives in git's
+ * permanent record, so a reader needs to know which of its fields still mean
+ * something after the index that produced them is gone:
+ *
+ *   - `Atlas-Context-Digest` and `Atlas-Decision-Set-Digest` are
+ *     content-derived (`sha256` of a rendered pack and of a decision-set
+ *     tuple, respectively) and verify again against any correctly-rebuilt
+ *     index that reproduces the same content, whatever rowids it assigns.
+ *   - `Atlas-Memory-Generation` is `memory_generations.generation`, a
+ *     per-repository sequence number tied to how many reconciliation passes
+ *     have run, not to what they found. A rebuild that replays the same
+ *     history will not in general re-run the same passes at the same
+ *     moments, so a rebuilt index can legitimately assign a stored commit's
+ *     claimed generation to a different pass than the one that produced it,
+ *     or to none.
+ *   - `Atlas-Change-Reason` is the bare `ai_reasons.id` -- `ai_reasons` has
+ *     no uid column (`id INTEGER PRIMARY KEY`, `src/db/migrate.c:492-511`,
+ *     and no later migration adds one) -- so this field carries the same
+ *     rowid-reassignment exposure `Atlas-Memory-Generation` does. Worse: a
+ *     reason row is not rederivable from git at all (nothing in a
+ *     repository's history says why an agent made a change), so a database
+ *     wipe loses it outright rather than merely renumbering it. Adding a
+ *     uid column would fix this and is a migration; M29 has already shipped
+ *     as this season's last one, so it is out of scope here and is recorded
+ *     as a finding rather than done.
+ *   - `Atlas-Run` (`orch_runs.run_uid`) is original data, not a derived
+ *     index fact -- assigned once at submission and never recomputed by
+ *     anything -- so it does not share this exposure; a database restored
+ *     from a backup still has the same value.
+ *
+ * The design already degrades correctly for the two exposed fields: ingesting
+ * a trailer against a database where the referenced generation or reason no
+ * longer resolves leaves that field `UNKNOWN`, exactly as a wrong value would.
+ * **A reader who sees `UNKNOWN` must not read it as tampering** -- it may
+ * only mean the index under it moved -- which is why this rebuild exposure is
+ * written down here rather than left for a reader to discover by surprise.
+ *
+ * **The guarantee that no prompt, memory body, credential, model name or cost
+ * ever appears in a trailer is structural, not a filter**: `atlas_memory_
+ * trailer_compose` has no parameter that could carry one. Do not add a
+ * `note`, `summary`, `detail` or `model` parameter to it, however convenient
+ * -- A10.1's memory-candidate struct carries the identical absence and for
+ * the identical reason. */
+
+/* What one commit's trailer block resolved to -- `memory_trailer_bindings`'
+ * own shape (migration 29, `src/db/migrate.c:4450-4467`). A value is present
+ * only when it verified; a field that did not is named in `unknown_fields`
+ * and carries no stored value, so a caller can never confuse "verified true"
+ * with "not even attempted" -- A9.2.2's shape, one layer over commit
+ * trailers. `has_block` is the one field that is never itself in
+ * `unknown_fields`: it says whether an `Atlas-Provenance: v1` line was found
+ * at all, and when it is false every other member is at its zero and
+ * `unknown_fields` is empty -- a commit with no block is recorded as
+ * carrying none, a different fact from carrying six bad ones. */
+typedef struct atlas_memory_trailer_binding {
+    bool has_block;
+    atlas_buf run_uid;           /* set only when orch_runs names this run and this repository */
+    int64_t memory_generation;   /* set only when it equals the resolved run's frozen pack's own
+                                     memory_generation -- see the section comment above for why an
+                                     independent memory_generations existence check is not this */
+    bool context_digest_ok;
+    bool decision_set_ok;
+    atlas_buf change_reason_uid; /* set only when ai_reasons names this id and this repository;
+                                     the bare decimal id, per the section comment's rebuild caveat */
+    /* Netstring-encoded (`src/memory/pack.c`'s own shape: `<count>:` then that
+     * many `ns_put` elements), field names among "run", "generation",
+     * "context_digest", "decision_set_digest", "change_reason" that did not
+     * verify. Empty when `has_block` is false. */
+    atlas_buf unknown_fields;
+} atlas_memory_trailer_binding;
+
+void atlas_memory_trailer_binding_init(atlas_memory_trailer_binding *b);
+void atlas_memory_trailer_binding_free(atlas_memory_trailer_binding *b);
+
+/* Composes the block from stored identifiers for the given run. Refuses
+ * (`ATLAS_ERR_INTEGRITY`) rather than emit a partial block when the run has no
+ * frozen Canonical Context Pack yet (`atlas_db_memory_pack_get` finds
+ * nothing) or when `change_reason_uid` does not name an `ai_reasons` row for
+ * the pack's own repository -- every value this function emits is one it
+ * first read back out of a row it trusts, never one it merely formats. Has no
+ * parameter that could carry prose, a prompt, a credential, a model name or a
+ * cost -- see the section comment above. */
+atlas_status atlas_memory_trailer_compose(atlas_db *db, const char *run_uid,
+                                          const char *change_reason_uid, atlas_buf *out,
+                                          atlas_err *err);
+
+/* Parses one commit's stored body (`commits.body` -- no process, no git,
+ * A1's rule), resolves every field against Atlas' own rows, verifies both
+ * digests, and returns the binding with unverified fields named in
+ * `unknown_fields`. Writes nothing itself -- the reconciliation pass
+ * (`atlas_memory_apply_in_tx`) stores the row. Refuses with `ATLAS_ERR_REPO`
+ * when `commit_oid` is not an indexed commit of `repo_id`; a commit that is
+ * indexed but carries no `Atlas-Provenance: v1` line returns `ATLAS_OK` with
+ * `out->has_block` false and every other member at its zero. */
+atlas_status atlas_memory_trailer_ingest(atlas_db *db, int64_t repo_id, const char *commit_oid,
+                                         atlas_memory_trailer_binding *out, atlas_err *err);
+
+/* T14. The one write for `memory_trailer_bindings` -- `db_memory.c`'s own
+ * file header states it is the only production writer of a `memory_*` table,
+ * and T17's grep is what proves it. `INSERT OR IGNORE`: `UNIQUE(repo_id,
+ * commit_oid)` makes a re-scan of an already-recorded commit (the cursor
+ * residual `atlas_memory_pass_result`'s own comment describes) idempotent
+ * rather than a constraint violation. */
+atlas_status atlas_db_memory_trailer_binding_insert(atlas_db *db, int64_t repo_id,
+                                                    const char *commit_oid,
+                                                    const atlas_memory_trailer_binding *b,
+                                                    const char *recorded_at, atlas_err *err);
+
+/* T14. Reads one commit's stored binding back, for a caller that wants what
+ * the pass recorded rather than what re-ingesting would compute now (a later
+ * `memory trailer --commit OID --repo R` show path, and this task's own
+ * tests). `*found_out` is false and `*out` is left freshly initialised when
+ * this repository has no binding row for this commit -- distinct from a
+ * found row with `has_block` false, exactly as the struct comment's "recorded
+ * as carrying none" distinction requires a reader be able to tell apart. */
+atlas_status atlas_db_memory_trailer_binding_get(atlas_db *db, int64_t repo_id,
+                                                 const char *commit_oid,
+                                                 atlas_memory_trailer_binding *out, bool *found_out,
+                                                 atlas_err *err);
 
 #endif /* ATLAS_MEMORY_H */

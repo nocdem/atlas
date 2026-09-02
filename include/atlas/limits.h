@@ -1198,8 +1198,41 @@
 /* Trailing lines of a commit message scanned for a binding trailer. A trailer
  * block lives at the end of a message by construction; scanning further would
  * make an arbitrarily long body an arbitrarily long parse, over bytes whose
- * author is untrusted. */
+ * author is untrusted. `src/memory/trailer.c` is this constant's first user
+ * (T14): it bounds how many of the message's last lines the block search
+ * considers, applied inside the byte-bounded tail
+ * `ATLAS_MEMORY_TRAILER_TAIL_BYTES_MAX` defines below. */
 #define ATLAS_MEMORY_TRAILER_SCAN_MAX 512u
+
+/* The raw bytes of one commit message's tail this file will ever look at
+ * before splitting it into lines -- a backstop beneath
+ * `ATLAS_MEMORY_TRAILER_SCAN_MAX` itself: a message with no newline at all
+ * (one line, arbitrarily long, an author-chosen shape) must not turn a single
+ * `memchr` into an unbounded scan over an attacker-controlled body. A
+ * different dimension from the line count above for the same reason
+ * `ATLAS_MEMORY_MAX_TOUCHED_COMMITS` is its own constant beside
+ * `ATLAS_MEMORY_MAX_TOUCHED_PATHS`: one bounds a count, the other bounds raw
+ * size, and a single value cannot answer both. Six generously-sized lines
+ * (a run uid, an integer, two ~71-byte digests, an `ai_reasons` id) fit this
+ * many times over. */
+#define ATLAS_MEMORY_TRAILER_TAIL_BYTES_MAX 65536u
+
+/* Commit rows one reconciliation pass will examine for a trailer block,
+ * before yielding the rest to `memory_generations.trailer_scan_high`
+ * (migration 29, `src/db/migrate.c`) -- "highest commits.id examined for
+ * trailers." **A different bound from `ATLAS_MEMORY_TRAILER_SCAN_MAX`
+ * above, despite the identical value and the neighbouring name**: that one
+ * bounds how far into *one* commit message's tail the block search looks;
+ * this one bounds how many *commit rows* one pass walks. Disclosed in the
+ * T14 report as a divergence between this file and the plan/context-file
+ * text, both of which named `ATLAS_MEMORY_TRAILER_SCAN_MAX` for this exact
+ * per-pass role -- the constant nearest that name already carried a
+ * different, pre-existing, still-correct documented meaning (unused until
+ * T14), so a second constant was added rather than repurposing the first,
+ * `ATLAS_MEMORY_MAX_TOUCHED_COMMITS`'s own precedent for "a different
+ * dimension... each gets its own." A bound that is reached is reported:
+ * `atlas_memory_pass_result.trailer_scan_bound_hit`. */
+#define ATLAS_MEMORY_TRAILER_PASS_MAX 512u
 
 /* How often the sweep asks whether any registered source has moved. Chosen to be
  * far below `ATLAS_WATCH_RECONCILE_INTERVAL_MS` -- a memory file is a small

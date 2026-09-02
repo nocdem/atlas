@@ -1523,6 +1523,38 @@ atlas_status atlas_db_ai_reasons_list(atlas_db *db, int64_t repo_id, const void 
     return stream_reasons(db, stmt, want, cb, ud, count_out, more_out, err);
 }
 
+/* A12.1 T14. */
+atlas_status atlas_db_ai_reason_exists(atlas_db *db, int64_t repo_id, int64_t reason_id,
+                                       bool *exists_out, atlas_err *err) {
+    if (exists_out != NULL) {
+        *exists_out = false;
+    }
+    if (db == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "no repository to look a reason up for");
+    }
+    static const char SQL[] = "SELECT 1 FROM ai_reasons WHERE id = ?1 AND repo_id = ?2 LIMIT 1;";
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(db, SQL, &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, reason_id) != SQLITE_OK ||
+       sqlite3_bind_int64(stmt, 2, repo_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the reason lookup");
+    }
+    int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        if (exists_out != NULL) {
+            *exists_out = true;
+        }
+    } else if (rc != SQLITE_DONE) {
+        st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot look up the reason");
+    }
+    atlas_db_finish(db, stmt);
+    return st;
+}
+
 atlas_status atlas_db_ai_reasons_search(atlas_db *db, int64_t repo_id, const char *query,
                                         int64_t limit, atlas_ai_reason_cb cb, void *ud,
                                         int64_t *count_out, bool *more_out, atlas_err *err) {

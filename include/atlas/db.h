@@ -409,6 +409,32 @@ atlas_status atlas_db_change_insert(atlas_db *db, int64_t repo_id, int64_t commi
                                     const atlas_change_record *rec, atlas_err *err);
 atlas_status atlas_db_changes_clear_for_commit(atlas_db *db, int64_t commit_id, atlas_err *err);
 
+/* A12.1 T14. `commits.body` is the whole raw message git returned (subject
+ * included -- `src/git/git_parse.c`'s `parse_commit_header` sets it from the
+ * unsplit `raw_msg`, before `subject` is separately taken as its first
+ * line), which is what lets a trailer parser find a block wherever in the
+ * message it sits without a second read. `*found_out` is false and
+ * `*body_out` is reset when this repository has no commit at this oid --
+ * never an error on its own, since a trailer ingester is handed an oid by a
+ * caller that may not have checked it first. */
+atlas_status atlas_db_commit_body_get(atlas_db *db, int64_t repo_id, const char *oid,
+                                      atlas_buf *body_out, bool *found_out, atlas_err *err);
+
+/* A12.1 T14. One `(commit_id, oid)` pair per row, `id` ascending, for every
+ * commit with `id > since_id`, capped at `max_rows` -- the reconciliation
+ * pass's own trailer-scan window over `ATLAS_MEMORY_TRAILER_PASS_MAX`
+ * (`limits.h`). `*max_id_out` is the highest `id` the callback actually saw
+ * (unchanged from `since_id` when nothing did), which is what a caller
+ * persists as the new `memory_generations.trailer_scan_high`. `*more_out` is
+ * true when a `(max_rows + 1)`-th row exists beyond what was walked -- the
+ * bound was reached and a later pass owes the remainder; the row itself is
+ * never handed to the callback. */
+typedef atlas_status (*atlas_db_commit_id_cb)(int64_t commit_id, const char *oid, void *ud,
+                                              atlas_err *err);
+atlas_status atlas_db_commits_since(atlas_db *db, int64_t repo_id, int64_t since_id,
+                                    size_t max_rows, atlas_db_commit_id_cb cb, void *ud,
+                                    int64_t *max_id_out, bool *more_out, atlas_err *err);
+
 typedef struct atlas_compile_db_record {
     const void *path_raw;
     size_t path_raw_len;
@@ -1016,6 +1042,13 @@ atlas_status atlas_db_ai_reasons_list(atlas_db *db, int64_t repo_id, const void 
                                       size_t path_len, int64_t limit, atlas_ai_reason_cb cb,
                                       void *ud, int64_t *count_out, bool *more_out,
                                       atlas_err *err);
+
+/* A12.1 T14. Whether `reason_id` names a row in `ai_reasons` belonging to
+ * `repo_id` -- the resolution `Atlas-Change-Reason` needs and the refusal
+ * `atlas_memory_trailer_compose` needs, over the bare rowid this table has
+ * instead of a uid (see the T14 section comment in `memory.h`). */
+atlas_status atlas_db_ai_reason_exists(atlas_db *db, int64_t repo_id, int64_t reason_id,
+                                       bool *exists_out, atlas_err *err);
 atlas_status atlas_db_ai_decisions_list(atlas_db *db, int64_t repo_id, const void *path_raw,
                                         size_t path_len, int64_t limit, atlas_ai_decision_cb cb,
                                         void *ud, int64_t *count_out, bool *more_out,

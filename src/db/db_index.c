@@ -649,6 +649,106 @@ atlas_status atlas_db_commit_upsert(atlas_db *db, int64_t repo_id, int64_t scan_
     return st;
 }
 
+/* A12.1 T14. */
+atlas_status atlas_db_commit_body_get(atlas_db *db, int64_t repo_id, const char *oid,
+                                      atlas_buf *body_out, bool *found_out, atlas_err *err) {
+    if (found_out != NULL) {
+        *found_out = false;
+    }
+    if (body_out != NULL) {
+        atlas_buf_reset(body_out);
+    }
+    if (db == NULL || oid == NULL || oid[0] == '\0' || body_out == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "no commit to read a body for");
+    }
+    static const char SQL[] = "SELECT body FROM commits WHERE repo_id = ?1 AND oid = ?2;";
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(db, SQL, &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, repo_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the repository id");
+    }
+    st = atlas_db_bind_text_opt(db, stmt, 2, oid, err);
+    if (st != ATLAS_OK) {
+        atlas_db_finish(db, stmt);
+        return st;
+    }
+    int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        const char *s = atlas_db_col_text(stmt, 0);
+        st = atlas_buf_set_str(body_out, s, err);
+        if (st == ATLAS_OK && found_out != NULL) {
+            *found_out = true;
+        }
+    } else if (rc != SQLITE_DONE) {
+        st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot read the commit body");
+    }
+    atlas_db_finish(db, stmt);
+    return st;
+}
+
+/* A12.1 T14. `LIMIT max_rows + 1`: the extra row, when present, is never
+ * handed to the callback -- it exists only to answer `*more_out` without a
+ * second query. */
+atlas_status atlas_db_commits_since(atlas_db *db, int64_t repo_id, int64_t since_id,
+                                    size_t max_rows, atlas_db_commit_id_cb cb, void *ud,
+                                    int64_t *max_id_out, bool *more_out, atlas_err *err) {
+    if (max_id_out != NULL) {
+        *max_id_out = since_id;
+    }
+    if (more_out != NULL) {
+        *more_out = false;
+    }
+    if (db == NULL || max_rows == 0) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "no repository or bound to scan commits for");
+    }
+    static const char SQL[] =
+        "SELECT id, oid FROM commits WHERE repo_id = ?1 AND id > ?2 ORDER BY id ASC LIMIT ?3;";
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(db, SQL, &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    int64_t fetch_limit = (int64_t)max_rows + 1;
+    if (sqlite3_bind_int64(stmt, 1, repo_id) != SQLITE_OK ||
+       sqlite3_bind_int64(stmt, 2, since_id) != SQLITE_OK ||
+       sqlite3_bind_int64(stmt, 3, fetch_limit) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the commit scan window");
+    }
+    size_t seen = 0;
+    int rc;
+    while (st == ATLAS_OK && (rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        int64_t id = sqlite3_column_int64(stmt, 0);
+        if (seen >= max_rows) {
+            /* This is the (max_rows + 1)-th row: the bound was reached and
+             * this row is left for a later pass, never delivered. */
+            if (more_out != NULL) {
+                *more_out = true;
+            }
+            break;
+        }
+        const char *oid = atlas_db_col_text(stmt, 1);
+        if (cb != NULL) {
+            st = cb(id, oid, ud, err);
+        }
+        if (st == ATLAS_OK) {
+            seen++;
+            if (max_id_out != NULL) {
+                *max_id_out = id;
+            }
+        }
+    }
+    if (st == ATLAS_OK && rc != SQLITE_ROW && rc != SQLITE_DONE) {
+        st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot walk the commit scan window");
+    }
+    atlas_db_finish(db, stmt);
+    return st;
+}
+
 atlas_status atlas_db_change_insert(atlas_db *db, int64_t repo_id, int64_t commit_id,
                                     const atlas_change_record *rec, atlas_err *err) {
     sqlite3_stmt *stmt = NULL;

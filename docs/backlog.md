@@ -1384,3 +1384,46 @@ the first closes the instance and matches what the tree already does elsewhere.
 checks against `ATLAS_VERIFY_VERIFIER_INPUT_MAX` (2048). A path of roughly 500 to 1970
 bytes therefore passes every check, is stored, and is permanently UNAVAILABLE with
 nothing recording that its length was the cause.
+
+## The yield grace is argued against a deadline the caller does not wait for (2026-09-02)
+
+Found while measuring A12.1's reconciliation pass against the writer thread, and
+recorded because it is A9.2.7's reasoning rather than that season's code.
+
+`ATLAS_WRITER_YIELD_GRACE_MS` is 2000 ms, and `include/atlas/limits.h:90-102` argues
+the value: it must sit between the gap between two yield points and "the smallest
+synchronous deadline on the writer path", which the comment names as "a hook's
+`AI_WRITE_TIMEOUT_MS` of 4000 ms" — concluding that "a waiter that spends its whole
+grace still backs out with time left to report the refusal rather than timing out."
+
+**The hook does not wait 4000 ms.** `ATLAS_HOOK_IPC_TIMEOUT_MS` (`limits.h:413`) is
+**2000 ms**, and its own comment says what happens at that point: the hook gives up and
+**fails open**, which for a hook means its write is lost rather than refused.
+`AI_WRITE_TIMEOUT_MS` (`src/ipc/server_ai.c:34`) is the *daemon-side* deadline on the
+same request, reached at `:425` and `:483`.
+
+So the two figures are 2000 and 2000. A waiter that spends its whole grace reports
+`BUSY` at the same instant the hook has already gone, and the refusal the grace exists
+to deliver races the caller that was supposed to receive it.
+
+**The nuance, stated so this is not read as worse than it is.** The comment is true
+*about the writer path*: from inside the daemon, 4000 ms is the deadline it knows, and
+the hook's own give-up is outside its view. What reaches past the writer path is the
+comment's **conclusion** — "with time left to report the refusal" — because the thing
+that receives the refusal is the hook, and it is not there. A9.2.7 draws a careful
+distinction between backing out and timing out, on the ground that the two answers mean
+opposite things about whether the write is still on its way; that distinction is only
+worth what the caller can observe.
+
+**How it surfaced.** A12.1's reconciliation pass was measured at **2429.9 ms** for its
+worst case at the compiled ceiling — 16 sources, 128 candidates each, 2048 claims, one
+transaction. That exceeds both figures, which is what made the question worth asking at
+all: while every unbounded job on that thread yielded within milliseconds, nothing had
+tested the boundary.
+
+**Candidate fixes, none implemented.** Correct the comment to name
+`ATLAS_HOOK_IPC_TIMEOUT_MS` as the deadline that actually binds a hook's write, and
+re-derive whether 2000 is still the right grace against it — the honest answer may be
+that the grace must be meaningfully below the hook's give-up rather than equal to it.
+Separately, A12.1's T10 must classify its reconciliation job against the *measured*
+2429.9 ms rather than against either comment.

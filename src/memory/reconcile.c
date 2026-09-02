@@ -284,17 +284,35 @@ atlas_status atlas_memory_observe(atlas_db *db, const atlas_repo_info *repo, con
  * rather than re-hashing every prior candidate's normalised buffer. A new
  * match links to this one and is *not* itself added again for the same
  * normalised hash beyond the first -- the chain, not the clique, Decision 2's
- * own argument needs only connectivity. `added_claims` is every claim uid
- * this pass created for the first time, buffered because whether a
- * generation gets appended at all is decided only once the whole pass has
- * run. Both are sized to the pass's own compiled ceiling
- * (ATLAS_MEMORY_MAX_SOURCES * ATLAS_MEMORY_MAX_PROPOSITIONS) and heap
+ * own argument needs only connectivity.
+ *
+ * `diffs` is T9's: every `memory_claim_diffs` row this pass has decided to
+ * write, buffered because whether a generation gets appended at all -- and
+ * therefore which id its diff rows reference -- is decided only once the
+ * whole pass has run. `confirmed` is T9's other set: the (kind, value) hash
+ * of every anchor this pass's fresh extraction still resolved, whatever
+ * claim it belonged to and whatever `emit_candidate` decided about it --
+ * what the vanished-anchor sweep asks *not* to re-check, because still
+ * resolving is itself the answer "nothing here needs it". All three are
+ * sized to the pass's own compiled ceiling
+ * (ATLAS_MEMORY_MAX_SOURCES * ATLAS_MEMORY_MAX_PROPOSITIONS, the third
+ * further multiplied by ATLAS_MEMORY_MAX_ANCHORS_PER_PROPOSITION) and heap
  * allocated once. */
 #define DEP_UID_MAX 96
 typedef struct dep_entry {
     char norm_hex[ATLAS_SHA256_HEX_LEN + 1];
     char evidence_uid[DEP_UID_MAX];
 } dep_entry;
+
+typedef struct diff_entry {
+    char claim_uid[DEP_UID_MAX];
+    atlas_memory_diff_kind kind;
+    char reason[128];
+} diff_entry;
+
+typedef struct confirmed_anchor {
+    char hash[ATLAS_SHA256_HEX_LEN + 1];
+} confirmed_anchor;
 
 typedef struct apply_ctx {
     atlas_db *db;
@@ -304,11 +322,43 @@ typedef struct apply_ctx {
     dep_entry *dep;
     size_t dep_count;
     size_t dep_cap;
-    char (*added_claims)[DEP_UID_MAX];
-    size_t added_count;
-    size_t added_cap;
+    diff_entry *diffs;
+    size_t diff_count;
+    size_t diff_cap;
+    confirmed_anchor *confirmed;
+    size_t confirmed_count;
+    size_t confirmed_cap;
     bool any_change;
 } apply_ctx;
+
+/* Two-byte-wide hex table, `db_memory.c`'s own shape for the same job. */
+static void hex_encode(const unsigned char *bytes, size_t n, char *out) {
+    static const char *D = "0123456789abcdef";
+    for (size_t i = 0; i < n; i++) {
+        out[i * 2u] = D[bytes[i] >> 4];
+        out[i * 2u + 1u] = D[bytes[i] & 0x0fu];
+    }
+    out[n * 2u] = '\0';
+}
+
+/* One (kind, value) anchor tuple's identity, independent of which claim uid
+ * -- across however many remints -- currently carries it. */
+static atlas_status anchor_tuple_hash(atlas_memory_anchor_kind kind, const char *value,
+                                      char out[ATLAS_SHA256_HEX_LEN + 1], atlas_err *err) {
+    atlas_buf b = ATLAS_BUF_INIT;
+    atlas_status st = atlas_buf_set_str(&b, atlas_memory_anchor_kind_name(kind), err);
+    if (st == ATLAS_OK) {
+        st = atlas_buf_append_ch(&b, '\x1f', err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_buf_append_str(&b, value, err);
+    }
+    if (st == ATLAS_OK) {
+        atlas_sha256_hex(b.data, b.len, out);
+    }
+    atlas_buf_free(&b);
+    return st;
+}
 
 /* Deep copy: `atlas_memory_anchor_resolve` fully resets every field it owns
  * before scanning `p->text` (see its own comment), so this leaves them at
@@ -349,13 +399,254 @@ static atlas_status ctx_add_dep(apply_ctx *ctx, const char *norm_hex, const char
     return ATLAS_OK;
 }
 
-static atlas_status ctx_add_claim(apply_ctx *ctx, const char *claim_uid, atlas_err *err) {
-    if (ctx->added_count >= ctx->added_cap) {
+/* T9. Buffers one `memory_claim_diffs` row; also what makes a diff row itself
+ * -- independent of any claim, evidence or attestation row landing new --
+ * enough reason to append a generation: the vanished-anchor sweep can find a
+ * proposition whose only anchor disappeared without a single write from the
+ * per-source loop above it, and that finding is exactly the kind of change
+ * Decision 7 exists to report. */
+static atlas_status ctx_add_diff(apply_ctx *ctx, const char *claim_uid, atlas_memory_diff_kind kind,
+                                 const char *reason, atlas_err *err) {
+    if (ctx->diff_count >= ctx->diff_cap) {
         return atlas_err_set(err, ATLAS_ERR_INTERNAL,
-                             "more claims created this pass than the compiled ceiling allows");
+                             "more diff rows this pass than the compiled ceiling allows");
     }
-    (void)snprintf(ctx->added_claims[ctx->added_count++], DEP_UID_MAX, "%s", claim_uid);
+    diff_entry *d = &ctx->diffs[ctx->diff_count++];
+    (void)snprintf(d->claim_uid, sizeof d->claim_uid, "%s", claim_uid);
+    d->kind = kind;
+    (void)snprintf(d->reason, sizeof d->reason, "%s", reason != NULL ? reason : "");
+    ctx->any_change = true;
     return ATLAS_OK;
+}
+
+/* T9. Marks one (kind, value) anchor as still resolving this pass -- whatever
+ * `emit_candidate` went on to decide about the claim it belongs to. Silently
+ * a no-op past the compiled ceiling: the cost of missing one is the
+ * vanished-anchor sweep re-checking an anchor that in fact still resolves,
+ * never a false claim that something vanished. */
+static atlas_status ctx_mark_confirmed(apply_ctx *ctx, atlas_memory_anchor_kind kind,
+                                       const char *value, atlas_err *err) {
+    if (ctx->confirmed_count >= ctx->confirmed_cap) {
+        return ATLAS_OK;
+    }
+    char hash[ATLAS_SHA256_HEX_LEN + 1];
+    atlas_status st = anchor_tuple_hash(kind, value, hash, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    (void)snprintf(ctx->confirmed[ctx->confirmed_count++].hash, ATLAS_SHA256_HEX_LEN + 1, "%s", hash);
+    return ATLAS_OK;
+}
+
+static bool ctx_is_confirmed(const apply_ctx *ctx, const char *hash) {
+    for (size_t i = 0; i < ctx->confirmed_count; i++) {
+        if (strcmp(ctx->confirmed[i].hash, hash) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* T9. `atlas_db_memory_anchor_claim_uids` reports oldest first; this keeps
+ * overwriting on every callback that is not `skip`, so the last one it kept
+ * is the most recently created live claim anchored to this tuple. */
+struct find_prior_ctx {
+    char uid[DEP_UID_MAX];
+    bool found;
+    const char *skip;
+};
+
+static atlas_status find_prior_cb(const char *claim_uid, void *ud, atlas_err *err) {
+    (void)err;
+    struct find_prior_ctx *fc = ud;
+    if (fc->skip != NULL && strcmp(claim_uid, fc->skip) == 0) {
+        return ATLAS_OK;
+    }
+    (void)snprintf(fc->uid, sizeof fc->uid, "%s", claim_uid);
+    fc->found = true;
+    return ATLAS_OK;
+}
+
+/* T9. `EVIDENCE_PRODUCE` then `EVALUATE`, through the write point and nothing
+ * else -- the brief's own instruction, so drift arrives through T5's producer
+ * with no new mechanics. Both on channel ATLAS: neither op derives an actor
+ * from it (`atlas_verify_intake_apply_in_tx` skips `derive_actor` for both
+ * kinds), so this is the channel refusal's only concern here and ATLAS is
+ * what Atlas performing its own mechanical check has always meant. */
+static atlas_status evaluate_claim(apply_ctx *ctx, const char *claim_uid, atlas_verify_check *check_out,
+                                   atlas_verify_conflict *conflict_out, atlas_err *err) {
+    if (check_out != NULL) {
+        *check_out = ATLAS_CHECK_UNAVAILABLE;
+    }
+    if (conflict_out != NULL) {
+        *conflict_out = ATLAS_CONFLICT_NONE;
+    }
+    atlas_verify_op op1;
+    atlas_verify_op_init(&op1);
+    op1.kind = ATLAS_VERIFY_OP_EVIDENCE_PRODUCE;
+    op1.channel = ATLAS_VERIFY_CHANNEL_ATLAS;
+    atlas_status st = atlas_buf_set_str(&op1.claim_uid, claim_uid, err);
+    atlas_verify_intake_result res1;
+    atlas_verify_intake_result_init(&res1);
+    if (st == ATLAS_OK) {
+        st = atlas_verify_intake_apply_in_tx(ctx->db, &op1, &res1, err);
+    }
+    atlas_verify_op_free(&op1);
+    atlas_verify_intake_result_free(&res1);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+
+    atlas_verify_op op2;
+    atlas_verify_op_init(&op2);
+    op2.kind = ATLAS_VERIFY_OP_EVALUATE;
+    op2.channel = ATLAS_VERIFY_CHANNEL_ATLAS;
+    st = atlas_buf_set_str(&op2.claim_uid, claim_uid, err);
+    atlas_verify_intake_result res2;
+    atlas_verify_intake_result_init(&res2);
+    if (st == ATLAS_OK) {
+        st = atlas_verify_intake_apply_in_tx(ctx->db, &op2, &res2, err);
+    }
+    atlas_verify_op_free(&op2);
+    if (st == ATLAS_OK) {
+        if (check_out != NULL) {
+            *check_out = res2.assessment.check;
+        }
+        if (conflict_out != NULL) {
+            *conflict_out = res2.assessment.aggregate.conflict;
+        }
+    }
+    atlas_verify_intake_result_free(&res2);
+    return st;
+}
+
+/* T9's semantic diff, settling the item-2 tension: `p`'s freshly-minted claim
+ * (`claim_uid`) may be a genuinely new proposition, the very same proposition
+ * carried forward at a new `basis_commit` because the repository's head
+ * moved (§27's content key hashes it, `src/verify/intake.c:643`), or a
+ * proposition whose checkable fact moved under it. Identity across a remint
+ * is never the claim uid -- a fresh uid is exactly what a head move
+ * produces regardless of which case this is -- so it is established from
+ * `memory_claim_anchors` (a repository fact's own identity, independent of
+ * which claim row currently cites it) confirmed by an exact text match,
+ * never from anchor-sharing alone: two different propositions can legitimately
+ * name the same path. `claim_new == false` means the write point resolved to
+ * a row that already existed byte-for-byte, so there is nothing to classify
+ * at all -- item 2's stability for a `SOURCE_REVISION` or `DECISION_REVISION`
+ * pass holds by exactly this construction, with no special case here. */
+static atlas_status classify_candidate(apply_ctx *ctx, const atlas_memory_proposition *p,
+                                       const char *claim_uid, bool claim_new, atlas_err *err) {
+    if (!claim_new) {
+        return ATLAS_OK;
+    }
+    if (p->anchor_count == 0) {
+        return ATLAS_OK; /* unreachable in practice: emit_candidate requires an anchor */
+    }
+
+    int64_t doc_id = 0, rev_id = 0;
+    atlas_status st = ATLAS_OK;
+    if (p->decision_uid.len > 0) {
+        int64_t doc_repo = 0;
+        bool doc_found = false;
+        st = atlas_db_decision_find_uid(ctx->db, atlas_buf_cstr(&p->decision_uid), &doc_id, &doc_repo,
+                                        &doc_found, err);
+        if (st == ATLAS_OK && doc_found) {
+            st = atlas_db_decision_approved_revision(ctx->db, doc_id, &rev_id, err);
+        } else if (st == ATLAS_OK) {
+            doc_id = 0;
+        }
+    }
+    if (st != ATLAS_OK) {
+        return st;
+    }
+
+    struct find_prior_ctx fc;
+    fc.found = false;
+    fc.uid[0] = '\0';
+    fc.skip = claim_uid;
+    st = atlas_db_memory_anchor_claim_uids(ctx->db, ctx->repo->id, p->anchors[0].kind,
+                                           atlas_buf_cstr(&p->anchors[0].value), find_prior_cb, &fc, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (!fc.found) {
+        return ctx_add_diff(ctx, claim_uid, ATLAS_MEMORY_DIFF_ADDED, "", err);
+    }
+
+    atlas_verify_claim prior;
+    atlas_verify_claim_init(&prior);
+    bool prior_found = false;
+    st = atlas_db_verify_claim_find(ctx->db, fc.uid, &prior, &prior_found, err);
+    if (st != ATLAS_OK) {
+        atlas_verify_claim_free(&prior);
+        return st;
+    }
+    bool same_text = prior_found && prior.text.len == p->text.len &&
+                     memcmp(prior.text.data != NULL ? prior.text.data : "",
+                            p->text.data != NULL ? p->text.data : "", p->text.len) == 0;
+    if (!same_text) {
+        /* An anchor shared with a different proposition -- not this
+         * proposition's own predecessor. Genuinely new. */
+        atlas_verify_claim_free(&prior);
+        return ctx_add_diff(ctx, claim_uid, ATLAS_MEMORY_DIFF_ADDED, "", err);
+    }
+
+    bool verifier_input_equal =
+        prior.verifier_input.len == p->verifier_input.len &&
+        memcmp(prior.verifier_input.data != NULL ? prior.verifier_input.data : "",
+               p->verifier_input.data != NULL ? p->verifier_input.data : "", p->verifier_input.len) ==
+            0;
+    bool decision_equal = prior.document_id == doc_id && prior.revision_id == rev_id;
+
+    if (verifier_input_equal && decision_equal) {
+        /* The item-2 settlement: same proposition, only `basis_commit`
+         * moved. A new claim row exists (a head move re-mints unconditionally,
+         * T8's own measured fact), and it is deliberately given no diff row --
+         * "byte-for-byte stable" is asserted of the diff surface here, not of
+         * the `verify_claims` row, which is new by construction. */
+        atlas_verify_claim_free(&prior);
+        return ATLAS_OK;
+    }
+    if (!decision_equal) {
+        /* The revision bound to this claim moved (a `DECISION_REVISION`
+         * pass's own effect on the claims it touches) with nothing mechanical
+         * to re-check either way. */
+        atlas_verify_claim_free(&prior);
+        return ctx_add_diff(ctx, claim_uid, ATLAS_MEMORY_DIFF_CHANGED, "", err);
+    }
+
+    /* verifier_input differs: the repository fact this proposition anchors to
+     * moved. The fresh claim already carries the current input (anchor_
+     * resolve just built it from the live index), so evaluating *it* is
+     * evaluating the current state of the world. */
+    bool head_moved = strcmp(atlas_buf_cstr(&prior.basis_commit), ctx->repo->scanned_head) != 0;
+    atlas_verify_claim_free(&prior);
+
+    if (p->verifier == ATLAS_VERIFIER_NONE) {
+        return ctx_add_diff(ctx, claim_uid, ATLAS_MEMORY_DIFF_CHANGED, "", err);
+    }
+
+    atlas_verify_check check = ATLAS_CHECK_UNAVAILABLE;
+    atlas_verify_conflict conflict = ATLAS_CONFLICT_NONE;
+    st = evaluate_claim(ctx, claim_uid, &check, &conflict, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+
+    if (conflict == ATLAS_CONFLICT_IMPLEMENTATION) {
+        char reason[128];
+        (void)snprintf(reason, sizeof reason, "DRIFT %s", atlas_buf_cstr(&p->decision_uid));
+        return ctx_add_diff(ctx, claim_uid, ATLAS_MEMORY_DIFF_CONTRADICTED, reason, err);
+    }
+    if (check == ATLAS_CHECK_FAIL || conflict == ATLAS_CONFLICT_CONTRADICTION) {
+        return ctx_add_diff(ctx, claim_uid, ATLAS_MEMORY_DIFF_CONTRADICTED, "", err);
+    }
+    if (check == ATLAS_CHECK_PASS) {
+        return ctx_add_diff(ctx, claim_uid,
+                            head_moved ? ATLAS_MEMORY_DIFF_IMPACTED : ATLAS_MEMORY_DIFF_SUPPORTED, "",
+                            err);
+    }
+    return ctx_add_diff(ctx, claim_uid, ATLAS_MEMORY_DIFF_UNDETERMINED, "", err);
 }
 
 /* One candidate, already known to be anchored and citable, through the one
@@ -365,6 +656,20 @@ static atlas_status emit_candidate(apply_ctx *ctx, const atlas_memory_observed_s
                                    const char *source_uid, const char *item_path_text,
                                    const char *memory_version_uid, const char *observed_at,
                                    const atlas_memory_proposition *p, atlas_err *err) {
+    /* T9's vanished-anchor sweep asks "did this pass's fresh extraction still
+     * resolve this repository fact", so every anchor a candidate resolved is
+     * marked confirmed here, before anything about the claim is decided --
+     * the world validated the anchor whether the claim that follows turns out
+     * to be new, unchanged or reclassified. */
+    atlas_status confirm_st = ATLAS_OK;
+    for (size_t i = 0; confirm_st == ATLAS_OK && i < p->anchor_count; i++) {
+        confirm_st =
+            ctx_mark_confirmed(ctx, p->anchors[i].kind, atlas_buf_cstr(&p->anchors[i].value), err);
+    }
+    if (confirm_st != ATLAS_OK) {
+        return confirm_st;
+    }
+
     atlas_verify_op op1;
     atlas_verify_op_init(&op1);
     op1.kind = ATLAS_VERIFY_OP_CLAIM_CREATE;
@@ -544,8 +849,8 @@ static atlas_status emit_candidate(apply_ctx *ctx, const atlas_memory_observed_s
                                         atlas_buf_cstr(&p->anchors[i].value), err);
     }
 
-    if (st == ATLAS_OK && claim_new) {
-        st = ctx_add_claim(ctx, claim_uid, err);
+    if (st == ATLAS_OK) {
+        st = classify_candidate(ctx, p, claim_uid, claim_new, err);
     }
     /* A re-run over unchanged bytes must not itself count as a change: every
      * one of the three ops above resolved to an existing row via its own
@@ -853,19 +1158,290 @@ static atlas_status apply_one_source(apply_ctx *ctx, const atlas_memory_observed
     return st;
 }
 
+/* --- T9: the generation's cause, derived from the same three signals
+ * `atlas_memory_plan_for` reads before any pass runs ------------------------- */
+
+/* Every DECISION anchor this repository's memory claims have ever resolved,
+ * folded into one digest over (document_id, its *current* effective approved
+ * revision) -- so approving a revision moves this digest for every
+ * repository whose memory claims cite that document, and nothing else does.
+ * Distinct anchor tuples only (`atlas_db_memory_anchor_distinct`), so a
+ * document cited by three claims folds in once. */
+typedef struct decision_digest_ctx {
+    atlas_db *db;
+    atlas_sha256 h;
+} decision_digest_ctx;
+
+static atlas_status decision_digest_tuple_cb(atlas_memory_anchor_kind kind, const char *value,
+                                             void *ud, atlas_err *err) {
+    if (kind != ATLAS_MEMORY_ANCHOR_DECISION) {
+        return ATLAS_OK;
+    }
+    decision_digest_ctx *dc = ud;
+    int64_t doc_id = 0, doc_repo = 0, rev_id = 0;
+    bool found = false;
+    atlas_status st = atlas_db_decision_find_uid(dc->db, value, &doc_id, &doc_repo, &found, err);
+    if (st == ATLAS_OK && found) {
+        st = atlas_db_decision_approved_revision(dc->db, doc_id, &rev_id, err);
+    }
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    char buf[64];
+    int n = snprintf(buf, sizeof buf, "%lld:%lld;", (long long)doc_id, (long long)rev_id);
+    atlas_sha256_update(&dc->h, buf, n > 0 ? (size_t)n : 0u);
+    return ATLAS_OK;
+}
+
+static atlas_status compute_decision_set_digest(atlas_db *db, int64_t repo_id,
+                                                char out[ATLAS_SHA256_HEX_LEN + 1], atlas_err *err) {
+    decision_digest_ctx dc;
+    dc.db = db;
+    atlas_sha256_init(&dc.h);
+    atlas_status st = atlas_db_memory_anchor_distinct(db, repo_id, decision_digest_tuple_cb, &dc, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    unsigned char digest[ATLAS_SHA256_DIGEST_LEN];
+    atlas_sha256_final(&dc.h, digest);
+    hex_encode(digest, sizeof digest, out);
+    return ATLAS_OK;
+}
+
+/* Every registered source's own identity plus its latest recorded content
+ * hash, folded together in policy order -- moves whenever a source's latest
+ * version changes, including an `EXTERNAL_*` one this pass never reads
+ * itself (T11's `memory.put`, one layer over). Policy order rather than a
+ * sort: the same policy read twice in one pass produces the same order, and
+ * that is the only stability this digest needs. */
+static atlas_status compute_source_set_digest(atlas_db *db, const atlas_repo_info *repo,
+                                              const atlas_syspolicy *pol,
+                                              char out[ATLAS_SHA256_HEX_LEN + 1], atlas_err *err) {
+    atlas_sha256 h;
+    atlas_sha256_init(&h);
+    size_t total = atlas_syspolicy_memory_source_count_checked(pol);
+    atlas_status st = ATLAS_OK;
+    for (size_t i = 0; st == ATLAS_OK && i < total; i++) {
+        const struct atlas_syspolicy_memory_source *ms = atlas_syspolicy_memory_source_at_checked(pol, i);
+        if (ms == NULL) {
+            continue;
+        }
+        if (ms->repo_name[0] != '\0' && strcmp(ms->repo_name, repo->name) != 0) {
+            continue;
+        }
+        int64_t source_id = 0;
+        bool found = false;
+        st = atlas_db_memory_source_find(db, repo->id, ms->cls, ms->path, strlen(ms->path), &source_id,
+                                         NULL, &found, err);
+        if (st != ATLAS_OK) {
+            break;
+        }
+        atlas_buf tag = ATLAS_BUF_INIT;
+        if (!found) {
+            st = atlas_buf_appendf(&tag, err, "%s:%s:none;", atlas_memory_source_class_name(ms->cls),
+                                   ms->path);
+        } else {
+            atlas_memory_version_row row;
+            atlas_memory_version_row_init(&row);
+            bool vfound = false;
+            st = atlas_db_memory_version_latest(db, source_id, &row, &vfound, err);
+            if (st == ATLAS_OK) {
+                st = atlas_buf_appendf(&tag, err, "%s:%s:%s;", atlas_memory_source_class_name(ms->cls),
+                                       ms->path, vfound ? atlas_buf_cstr(&row.content_sha256) : "none");
+            }
+            atlas_memory_version_row_free(&row);
+        }
+        if (st == ATLAS_OK) {
+            atlas_sha256_update(&h, tag.data, tag.len);
+        }
+        atlas_buf_free(&tag);
+    }
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    unsigned char digest[ATLAS_SHA256_DIGEST_LEN];
+    atlas_sha256_final(&h, digest);
+    hex_encode(digest, sizeof digest, out);
+    return ATLAS_OK;
+}
+
+/* Decision 7's own precedence, applied to what actually moved rather than
+ * asserted: the first of SOURCE_REVISION, DECISION_REVISION, COMMIT whose own
+ * signal differs from the last stored generation. `!have_last` -- this
+ * repository has never completed a pass -- reads as SOURCE_REVISION rather
+ * than as nothing owed, because every registered source is then unread,
+ * which is indistinguishable from having just changed. A pass that reaches
+ * here always has `ctx.any_change == true` for *some* reason (a version, a
+ * claim, a diff row), so falling through every comparison without a stored
+ * generation to compare against is unreachable in practice; the fallback
+ * exists so this function is total rather than partial over its own inputs. */
+static atlas_memory_gen_cause determine_cause(bool have_last, const char *last_head,
+                                              const char *cur_head, const char *last_decision_digest,
+                                              const char *cur_decision_digest,
+                                              const char *last_source_digest,
+                                              const char *cur_source_digest) {
+    if (!have_last) {
+        return ATLAS_MEMORY_CAUSE_SOURCE_REVISION;
+    }
+    if (strcmp(last_source_digest, cur_source_digest) != 0) {
+        return ATLAS_MEMORY_CAUSE_SOURCE_REVISION;
+    }
+    if (strcmp(last_decision_digest, cur_decision_digest) != 0) {
+        return ATLAS_MEMORY_CAUSE_DECISION_REVISION;
+    }
+    if (strcmp(last_head, cur_head) != 0) {
+        return ATLAS_MEMORY_CAUSE_COMMIT;
+    }
+    return ATLAS_MEMORY_CAUSE_SOURCE_REVISION;
+}
+
+/* --- T9: the vanished-anchor sweep ------------------------------------------
+ *
+ * A candidate whose only anchor no longer resolves is routed to
+ * `memory_unanchored` by the per-source loop above (`p->anchor_count == 0`
+ * this pass), which means no CLAIM_CREATE runs for it at all and the fresh-
+ * candidate correlation in `classify_candidate` never sees it. That is
+ * `atlas_memory_anchor_resolve`'s own contract: an anchor is recorded only
+ * when this pass's index confirms the thing it names still exists. The claim
+ * a *prior* pass created while the referent still existed is untouched by
+ * any of that -- it sits in `verify_claims`, live, still carrying the
+ * `verifier`/`verifier_input` that was true when it was written -- and this
+ * is the pass's only other way to notice a decision-scoped assertion whose
+ * symbol was deleted, item 3's own scenario. */
+struct vanish_ctx {
+    apply_ctx *ctx;
+};
+
+static atlas_status vanish_tuple_cb(atlas_memory_anchor_kind kind, const char *value, void *ud,
+                                    atlas_err *err) {
+    struct vanish_ctx *vc = ud;
+    apply_ctx *ctx = vc->ctx;
+
+    char hash[ATLAS_SHA256_HEX_LEN + 1];
+    atlas_status st = anchor_tuple_hash(kind, value, hash, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (ctx_is_confirmed(ctx, hash)) {
+        return ATLAS_OK; /* this pass's own extraction still resolved it */
+    }
+
+    bool still_valid = true;
+    switch (kind) {
+    case ATLAS_MEMORY_ANCHOR_PATH: {
+        atlas_buf ignored = ATLAS_BUF_INIT;
+        bool found = false;
+        st = atlas_db_verify_file_hash(ctx->db, ctx->repo->id, value, &ignored, &found, err);
+        atlas_buf_free(&ignored);
+        if (st != ATLAS_OK) {
+            return st;
+        }
+        still_valid = found;
+        break;
+    }
+    case ATLAS_MEMORY_ANCHOR_SYMBOL: {
+        int64_t count = 0;
+        st = atlas_db_verify_sem_symbol(ctx->db, ctx->repo->id, value, &count, NULL, NULL, err);
+        if (st != ATLAS_OK) {
+            return st;
+        }
+        still_valid = count > 0;
+        break;
+    }
+    case ATLAS_MEMORY_ANCHOR_DECISION:
+    case ATLAS_MEMORY_ANCHOR_COMMIT:
+        still_valid = true; /* neither is ever deleted -- A4, and commits are immutable history */
+        break;
+    case ATLAS_MEMORY_ANCHOR_UNKNOWN:
+        still_valid = true; /* never stored; unreachable, kept for -Wswitch-enum */
+        break;
+    }
+    if (still_valid) {
+        return ATLAS_OK;
+    }
+
+    struct find_prior_ctx fc;
+    fc.found = false;
+    fc.uid[0] = '\0';
+    fc.skip = NULL;
+    st = atlas_db_memory_anchor_claim_uids(ctx->db, ctx->repo->id, kind, value, find_prior_cb, &fc,
+                                           err);
+    if (st != ATLAS_OK || !fc.found) {
+        return st;
+    }
+
+    atlas_verify_claim claim;
+    atlas_verify_claim_init(&claim);
+    bool found = false;
+    st = atlas_db_verify_claim_find(ctx->db, fc.uid, &claim, &found, err);
+    if (st != ATLAS_OK || !found) {
+        atlas_verify_claim_free(&claim);
+        return st;
+    }
+
+    atlas_memory_diff_kind new_kind;
+    char reason[128];
+    reason[0] = '\0';
+    if (claim.verifier.len == 0) {
+        new_kind = ATLAS_MEMORY_DIFF_STALE;
+    } else {
+        atlas_verify_check check = ATLAS_CHECK_UNAVAILABLE;
+        atlas_verify_conflict conflict = ATLAS_CONFLICT_NONE;
+        st = evaluate_claim(ctx, fc.uid, &check, &conflict, err);
+        if (st != ATLAS_OK) {
+            atlas_verify_claim_free(&claim);
+            return st;
+        }
+        if (conflict == ATLAS_CONFLICT_IMPLEMENTATION) {
+            atlas_buf duid = ATLAS_BUF_INIT;
+            st = atlas_db_decision_uid_of(ctx->db, claim.document_id, &duid, err);
+            if (st == ATLAS_OK) {
+                (void)snprintf(reason, sizeof reason, "DRIFT %s", atlas_buf_cstr(&duid));
+            }
+            atlas_buf_free(&duid);
+            new_kind = ATLAS_MEMORY_DIFF_CONTRADICTED;
+        } else if (check == ATLAS_CHECK_FAIL || conflict == ATLAS_CONFLICT_CONTRADICTION) {
+            new_kind = ATLAS_MEMORY_DIFF_CONTRADICTED;
+        } else if (check == ATLAS_CHECK_PASS) {
+            new_kind = ATLAS_MEMORY_DIFF_SUPPORTED;
+        } else {
+            new_kind = ATLAS_MEMORY_DIFF_UNDETERMINED;
+        }
+    }
+    atlas_verify_claim_free(&claim);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+
+    /* Absence is the evidence: once this exact claim uid has already been
+     * reported at this kind, re-reporting it every subsequent pass would be
+     * the "re-flagged forever" failure the diff surface exists to avoid. */
+    atlas_memory_diff_kind last_kind = ATLAS_MEMORY_DIFF_UNKNOWN;
+    bool last_found = false;
+    st = atlas_db_memory_claim_diff_last_kind(ctx->db, ctx->repo->id, fc.uid, &last_kind, &last_found,
+                                              err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (last_found && last_kind == new_kind) {
+        return ATLAS_OK;
+    }
+    return ctx_add_diff(ctx, fc.uid, new_kind, reason, err);
+}
+
 atlas_status atlas_memory_apply_in_tx(atlas_db *db, const atlas_repo_info *repo,
                                       const atlas_memory_observation *obs,
                                       const atlas_syspolicy *pol, const char *now,
                                       atlas_memory_pass_result *out, atlas_err *err) {
-    (void)pol; /* T9 reads the decision set and the commit range through it; T8 does not yet */
-    if (db == NULL || repo == NULL || obs == NULL || now == NULL || out == NULL) {
+    if (db == NULL || repo == NULL || obs == NULL || pol == NULL || now == NULL || out == NULL) {
         return atlas_err_set(err, ATLAS_ERR_INTERNAL,
-                             "a memory apply needs a repository, an observation and a place to "
-                             "write its result");
+                             "a memory apply needs a repository, a policy, an observation and a "
+                             "place to write its result");
     }
     memset(out, 0, sizeof *out);
 
     size_t cap = ATLAS_MEMORY_MAX_SOURCES * ATLAS_MEMORY_MAX_PROPOSITIONS;
+    size_t confirmed_cap = cap * ATLAS_MEMORY_MAX_ANCHORS_PER_PROPOSITION;
     apply_ctx ctx;
     memset(&ctx, 0, sizeof ctx);
     ctx.db = db;
@@ -874,11 +1450,14 @@ atlas_status atlas_memory_apply_in_tx(atlas_db *db, const atlas_repo_info *repo,
     ctx.out = out;
     ctx.dep = calloc(cap, sizeof *ctx.dep);
     ctx.dep_cap = cap;
-    ctx.added_claims = calloc(cap, sizeof *ctx.added_claims);
-    ctx.added_cap = cap;
-    if (ctx.dep == NULL || ctx.added_claims == NULL) {
+    ctx.diffs = calloc(cap, sizeof *ctx.diffs);
+    ctx.diff_cap = cap;
+    ctx.confirmed = calloc(confirmed_cap, sizeof *ctx.confirmed);
+    ctx.confirmed_cap = confirmed_cap;
+    if (ctx.dep == NULL || ctx.diffs == NULL || ctx.confirmed == NULL) {
         free(ctx.dep);
-        free(ctx.added_claims);
+        free(ctx.diffs);
+        free(ctx.confirmed);
         return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory starting a reconciliation pass");
     }
 
@@ -920,7 +1499,8 @@ atlas_status atlas_memory_apply_in_tx(atlas_db *db, const atlas_repo_info *repo,
         size_t unanchored_snap = out->unanchored;
         size_t intake_bound_hits_snap = out->intake_bound_hits;
         size_t dep_snapshot = ctx.dep_count;
-        size_t added_snapshot = ctx.added_count;
+        size_t diff_snapshot = ctx.diff_count;
+        size_t confirmed_snapshot = ctx.confirmed_count;
         bool any_change_snapshot = ctx.any_change;
 
         char sp_name[32];
@@ -997,7 +1577,8 @@ atlas_status atlas_memory_apply_in_tx(atlas_db *db, const atlas_repo_info *repo,
         out->unanchored = unanchored_snap;
         out->intake_bound_hits = intake_bound_hits_snap;
         ctx.dep_count = dep_snapshot;
-        ctx.added_count = added_snapshot;
+        ctx.diff_count = diff_snapshot;
+        ctx.confirmed_count = confirmed_snapshot;
         ctx.any_change = any_change_snapshot;
 
         out->intake_bound_hits++;
@@ -1007,32 +1588,218 @@ atlas_status atlas_memory_apply_in_tx(atlas_db *db, const atlas_repo_info *repo,
         /* st stays ATLAS_OK: recorded, not fatal to the rest of the pass. */
     }
 
+    /* T9's vanished-anchor sweep: no savepoint of its own, deliberately --
+     * every write it can make (an `EVIDENCE_PRODUCE`/`EVALUATE` pair, one
+     * diff row) is through the same idempotent write points the per-source
+     * loop above already uses, so a failure here abandons the whole pass
+     * exactly as a failure anywhere else in this function does, through the
+     * caller's own outer-transaction rollback. */
+    if (st == ATLAS_OK) {
+        struct vanish_ctx vc;
+        vc.ctx = &ctx;
+        st = atlas_db_memory_anchor_distinct(db, repo->id, vanish_tuple_cb, &vc, err);
+    }
+
     if (st == ATLAS_OK && ctx.any_change) {
+        int64_t last_generation = 0;
+        bool have_last = false;
+        atlas_buf last_head = ATLAS_BUF_INIT;
+        atlas_buf last_decision_digest = ATLAS_BUF_INIT;
+        atlas_buf last_source_digest = ATLAS_BUF_INIT;
+        st = atlas_db_memory_generation_latest(db, repo->id, &last_generation, &last_head,
+                                               &last_decision_digest, &last_source_digest, &have_last,
+                                               err);
+        (void)last_generation;
+
+        char cur_decision_digest[ATLAS_SHA256_HEX_LEN + 1];
+        char cur_source_digest[ATLAS_SHA256_HEX_LEN + 1];
+        cur_decision_digest[0] = '\0';
+        cur_source_digest[0] = '\0';
+        if (st == ATLAS_OK) {
+            st = compute_decision_set_digest(db, repo->id, cur_decision_digest, err);
+        }
+        if (st == ATLAS_OK) {
+            st = compute_source_set_digest(db, repo, pol, cur_source_digest, err);
+        }
+        atlas_memory_gen_cause cause = ATLAS_MEMORY_CAUSE_SOURCE_REVISION;
+        if (st == ATLAS_OK) {
+            cause = determine_cause(have_last, have_last ? atlas_buf_cstr(&last_head) : "",
+                                    repo->scanned_head,
+                                    have_last ? atlas_buf_cstr(&last_decision_digest) : "",
+                                    cur_decision_digest,
+                                    have_last ? atlas_buf_cstr(&last_source_digest) : "",
+                                    cur_source_digest);
+        }
+        atlas_buf_free(&last_head);
+        atlas_buf_free(&last_decision_digest);
+        atlas_buf_free(&last_source_digest);
+
         int64_t generation = 0;
-        st = atlas_db_memory_generation_next(db, repo->id, &generation, err);
+        if (st == ATLAS_OK) {
+            st = atlas_db_memory_generation_next(db, repo->id, &generation, err);
+        }
         atlas_buf identity = ATLAS_BUF_INIT;
         if (st == ATLAS_OK) {
             st = atlas_db_repo_identity_hash(db, repo->id, &identity, err);
         }
         int64_t generation_id = 0;
         if (st == ATLAS_OK) {
-            st = atlas_db_memory_generation_insert(db, repo->id, generation,
-                                                   ATLAS_MEMORY_CAUSE_SOURCE_REVISION,
+            st = atlas_db_memory_generation_insert(db, repo->id, generation, cause,
                                                    atlas_buf_cstr(&identity), repo->scanned_head,
-                                                   "", "", 0, now, &generation_id, err);
+                                                   cur_decision_digest, cur_source_digest, 0, now,
+                                                   &generation_id, err);
         }
         atlas_buf_free(&identity);
-        for (size_t i = 0; st == ATLAS_OK && i < ctx.added_count; i++) {
-            st = atlas_db_memory_claim_diff_add(db, generation_id, ctx.added_claims[i],
-                                                ATLAS_MEMORY_DIFF_ADDED, "", err);
+        for (size_t i = 0; st == ATLAS_OK && i < ctx.diff_count; i++) {
+            st = atlas_db_memory_claim_diff_add(db, generation_id, ctx.diffs[i].claim_uid,
+                                                ctx.diffs[i].kind, ctx.diffs[i].reason, err);
         }
         if (st == ATLAS_OK) {
             out->generation = generation;
-            out->diff_rows = ctx.added_count;
+            out->diff_rows = ctx.diff_count;
         }
     }
 
     free(ctx.dep);
-    free(ctx.added_claims);
+    free(ctx.diffs);
+    free(ctx.confirmed);
+    return st;
+}
+
+/* --- T9: does this repository owe a pass, and why --------------------------
+ *
+ * Asks the same three questions `atlas_memory_apply_in_tx` derives its own
+ * cause from, over the same stored facts, and in the same order (Decision 7:
+ * SOURCE_REVISION, then DECISION_REVISION, then COMMIT). Index reads only --
+ * no git, no file, callable from the watcher tick or from `memory status`
+ * with no transaction and no side effect. */
+atlas_status atlas_memory_plan_for(atlas_db *db, const atlas_repo_info *repo,
+                                   const atlas_syspolicy *pol, atlas_memory_gen_cause *cause_out,
+                                   atlas_err *err) {
+    if (cause_out != NULL) {
+        *cause_out = ATLAS_MEMORY_CAUSE_UNKNOWN;
+    }
+    if (db == NULL || repo == NULL || pol == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "no repository or policy to plan a pass for");
+    }
+
+    int64_t last_generation = 0;
+    bool have_last = false;
+    atlas_buf last_head = ATLAS_BUF_INIT;
+    atlas_buf last_decision_digest = ATLAS_BUF_INIT;
+    atlas_buf last_source_digest = ATLAS_BUF_INIT;
+    atlas_status st = atlas_db_memory_generation_latest(db, repo->id, &last_generation, &last_head,
+                                                        &last_decision_digest, &last_source_digest,
+                                                        &have_last, err);
+    (void)last_generation;
+    if (st != ATLAS_OK) {
+        goto done;
+    }
+
+    /* Decision-set signal, checked first per Decision 7's own ordering
+     * inverted for cost: cheaper to compute once than to re-derive per
+     * source below, and the order among the three does not depend on which
+     * is computed first, only on which is *returned* first when several
+     * hold -- so SOURCE_REVISION is still checked, and preferred, below. */
+    char cur_decision_digest[ATLAS_SHA256_HEX_LEN + 1];
+    st = compute_decision_set_digest(db, repo->id, cur_decision_digest, err);
+    if (st != ATLAS_OK) {
+        goto done;
+    }
+    bool decision_owed =
+        have_last && strcmp(atlas_buf_cstr(&last_decision_digest), cur_decision_digest) != 0;
+
+    /* Source-revision signal: for each registered `REPO_*` source, does the
+     * index currently disagree with the latest version this pass ever
+     * recorded for it. `EXTERNAL_*` is skipped -- T8 never reads one itself,
+     * so the index carries nothing to compare it against; T11's `memory.put`
+     * is its own writer and its own freshness question. */
+    size_t total = atlas_syspolicy_memory_source_count_checked(pol);
+    bool source_owed = false;
+    for (size_t i = 0; st == ATLAS_OK && !source_owed && i < total; i++) {
+        const struct atlas_syspolicy_memory_source *ms = atlas_syspolicy_memory_source_at_checked(pol, i);
+        if (ms == NULL) {
+            continue;
+        }
+        if (ms->repo_name[0] != '\0' && strcmp(ms->repo_name, repo->name) != 0) {
+            continue;
+        }
+        if (!atlas_memory_source_class_is_repo(ms->cls)) {
+            continue;
+        }
+
+        int64_t source_id = 0;
+        bool found = false;
+        st = atlas_db_memory_source_find(db, repo->id, ms->cls, ms->path, strlen(ms->path), &source_id,
+                                         NULL, &found, err);
+        if (st != ATLAS_OK) {
+            break;
+        }
+        if (!found) {
+            /* Never read at all: indistinguishable from having just changed. */
+            source_owed = true;
+            break;
+        }
+
+        atlas_buf path_text = ATLAS_BUF_INIT;
+        st = atlas_path_text_encode(ms->path, strlen(ms->path), &path_text, err);
+        if (st != ATLAS_OK) {
+            atlas_buf_free(&path_text);
+            break;
+        }
+
+        if (ms->cls == ATLAS_MEMORY_SOURCE_REPO_FILE) {
+            atlas_buf hash = ATLAS_BUF_INIT;
+            bool hfound = false;
+            st = atlas_db_verify_file_hash(db, repo->id, atlas_buf_cstr(&path_text), &hash, &hfound,
+                                           err);
+            if (st == ATLAS_OK && hfound) {
+                bool vfound = false;
+                st = atlas_db_memory_version_exists(db, source_id, atlas_buf_cstr(&hash), &vfound,
+                                                    NULL, NULL, NULL, err);
+                if (st == ATLAS_OK && !vfound) {
+                    source_owed = true;
+                }
+            }
+            atlas_buf_free(&hash);
+        } else {
+            bool changed = false;
+            st = atlas_db_memory_dir_hash_mismatch(db, repo->id, source_id, atlas_buf_cstr(&path_text),
+                                                   &changed, err);
+            if (st == ATLAS_OK && changed) {
+                source_owed = true;
+            }
+        }
+        atlas_buf_free(&path_text);
+    }
+    if (st != ATLAS_OK) {
+        goto done;
+    }
+
+    if (source_owed) {
+        if (cause_out != NULL) {
+            *cause_out = ATLAS_MEMORY_CAUSE_SOURCE_REVISION;
+        }
+        goto done;
+    }
+    if (decision_owed) {
+        if (cause_out != NULL) {
+            *cause_out = ATLAS_MEMORY_CAUSE_DECISION_REVISION;
+        }
+        goto done;
+    }
+    if (have_last && strcmp(atlas_buf_cstr(&last_head), repo->scanned_head) != 0) {
+        if (cause_out != NULL) {
+            *cause_out = ATLAS_MEMORY_CAUSE_COMMIT;
+        }
+        goto done;
+    }
+    /* Nothing owed: `*cause_out` stays ATLAS_MEMORY_CAUSE_UNKNOWN, the zero,
+     * set at entry. */
+
+done:
+    atlas_buf_free(&last_head);
+    atlas_buf_free(&last_decision_digest);
+    atlas_buf_free(&last_source_digest);
     return st;
 }

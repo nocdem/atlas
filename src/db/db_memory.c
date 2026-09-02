@@ -646,3 +646,242 @@ atlas_status atlas_db_memory_claim_diff_add(atlas_db *db, int64_t generation_id,
     }
     return st;
 }
+
+/* --- T9: cross-generation reads --------------------------------------------
+ *
+ * None of these touch a `verify_*` table -- they read the five `memory_*`
+ * tables this file already owns. `src/memory/reconcile.c` is the one caller
+ * that also reads `verify_claims`, and it does so through the existing public
+ * `atlas_db_verify_claim_find`/`atlas_db_decision_*` reads, never through a
+ * new function added here -- the same division T7's `atlas_memory_anchor_
+ * resolve` already keeps. */
+
+atlas_status atlas_db_memory_generation_latest(atlas_db *db, int64_t repo_id, int64_t *generation_out,
+                                               atlas_buf *head_commit_out,
+                                               atlas_buf *decision_set_digest_out,
+                                               atlas_buf *source_set_digest_out, bool *found_out,
+                                               atlas_err *err) {
+    if (found_out != NULL) {
+        *found_out = false;
+    }
+    if (generation_out != NULL) {
+        *generation_out = 0;
+    }
+    if (db == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "no repository to look a generation up for");
+    }
+    static const char SQL[] =
+        "SELECT generation, head_commit, decision_set_digest, source_set_digest"
+        " FROM memory_generations WHERE repo_id = ?1 ORDER BY generation DESC LIMIT 1;";
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(db, SQL, &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, repo_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the repository id");
+    }
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        if (generation_out != NULL) {
+            *generation_out = sqlite3_column_int64(stmt, 0);
+        }
+        if (head_commit_out != NULL) {
+            st = take_col(head_commit_out, stmt, 1, err);
+        }
+        if (st == ATLAS_OK && decision_set_digest_out != NULL) {
+            st = take_col(decision_set_digest_out, stmt, 2, err);
+        }
+        if (st == ATLAS_OK && source_set_digest_out != NULL) {
+            st = take_col(source_set_digest_out, stmt, 3, err);
+        }
+        if (st == ATLAS_OK && found_out != NULL) {
+            *found_out = true;
+        }
+    }
+    atlas_db_finish(db, stmt);
+    return st;
+}
+
+atlas_status atlas_db_memory_anchor_distinct(atlas_db *db, int64_t repo_id,
+                                             atlas_memory_anchor_tuple_cb cb, void *ctx,
+                                             atlas_err *err) {
+    if (db == NULL || cb == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "no anchor listing to run");
+    }
+    static const char SQL[] =
+        "SELECT DISTINCT kind, value FROM memory_claim_anchors WHERE repo_id = ?1;";
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(db, SQL, &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, repo_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the repository id");
+    }
+    for (;;) {
+        int rc = sqlite3_step(stmt);
+        if (rc == SQLITE_DONE) {
+            break;
+        }
+        if (rc != SQLITE_ROW) {
+            st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot read the anchor kinds");
+            break;
+        }
+        const char *kind_name = (const char *)sqlite3_column_text(stmt, 0);
+        const char *value = (const char *)sqlite3_column_text(stmt, 1);
+        atlas_memory_anchor_kind kind = ATLAS_MEMORY_ANCHOR_UNKNOWN;
+        if (kind_name == NULL || !atlas_memory_anchor_kind_parse(kind_name, &kind)) {
+            continue; /* a row this build's vocabulary cannot name is skipped, not fabricated */
+        }
+        st = cb(kind, value != NULL ? value : "", ctx, err);
+        if (st != ATLAS_OK) {
+            break;
+        }
+    }
+    atlas_db_finish(db, stmt);
+    return st;
+}
+
+atlas_status atlas_db_memory_anchor_claim_uids(atlas_db *db, int64_t repo_id,
+                                               atlas_memory_anchor_kind kind, const char *value,
+                                               atlas_memory_claim_uid_cb cb, void *ctx,
+                                               atlas_err *err) {
+    if (db == NULL || value == NULL || cb == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "no anchor claim listing to run");
+    }
+    static const char SQL[] =
+        "SELECT claim_uid FROM memory_claim_anchors"
+        " WHERE repo_id = ?1 AND kind = ?2 AND value = ?3 ORDER BY id ASC;";
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(db, SQL, &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, repo_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the repository id");
+    }
+    st = atlas_db_bind_text_opt(db, stmt, 2, atlas_memory_anchor_kind_name(kind), err);
+    if (st == ATLAS_OK) {
+        st = atlas_db_bind_text_opt(db, stmt, 3, value, err);
+    }
+    for (; st == ATLAS_OK;) {
+        int rc = sqlite3_step(stmt);
+        if (rc == SQLITE_DONE) {
+            break;
+        }
+        if (rc != SQLITE_ROW) {
+            st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot read the anchor's claim uids");
+            break;
+        }
+        const char *uid = (const char *)sqlite3_column_text(stmt, 0);
+        st = cb(uid != NULL ? uid : "", ctx, err);
+        if (st != ATLAS_OK) {
+            break;
+        }
+    }
+    atlas_db_finish(db, stmt);
+    return st;
+}
+
+atlas_status atlas_db_memory_claim_diff_last_kind(atlas_db *db, int64_t repo_id, const char *claim_uid,
+                                                  atlas_memory_diff_kind *kind_out, bool *found_out,
+                                                  atlas_err *err) {
+    if (found_out != NULL) {
+        *found_out = false;
+    }
+    if (db == NULL || claim_uid == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "no claim diff history to look up");
+    }
+    static const char SQL[] =
+        "SELECT d.kind FROM memory_claim_diffs d"
+        " JOIN memory_generations g ON g.id = d.generation_id"
+        " WHERE g.repo_id = ?1 AND d.claim_uid = ?2"
+        " ORDER BY g.generation DESC LIMIT 1;";
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(db, SQL, &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, repo_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the repository id");
+    }
+    st = atlas_db_bind_text_opt(db, stmt, 2, claim_uid, err);
+    if (st == ATLAS_OK && sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *kind_name = (const char *)sqlite3_column_text(stmt, 0);
+        if (kind_name != NULL && kind_out != NULL &&
+            atlas_memory_diff_kind_parse(kind_name, kind_out)) {
+            if (found_out != NULL) {
+                *found_out = true;
+            }
+        }
+    }
+    atlas_db_finish(db, stmt);
+    return st;
+}
+
+atlas_status atlas_db_memory_dir_hash_mismatch(atlas_db *db, int64_t repo_id, int64_t source_id,
+                                               const char *path_text, bool *changed_out,
+                                               atlas_err *err) {
+    if (changed_out != NULL) {
+        *changed_out = false;
+    }
+    if (db == NULL || path_text == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "no directory source to check");
+    }
+    /* One path level below the source's own path, or the path itself -- a
+     * `REPO_DIR` source is one level deep by construction
+     * (`ATLAS_MEMORY_MAX_DIR_ENTRIES`'s own comment), so this is not an
+     * arbitrary subtree walk. Bounded at one more than
+     * `ATLAS_MEMORY_MAX_DIR_ENTRIES` files examined -- the same ceiling the
+     * pass itself reads a directory source under -- so this can never cost
+     * more than the pass it is answering for on behalf of. */
+    static const char SQL[] =
+        "SELECT content_hash FROM files"
+        " WHERE repo_id = ?1 AND (path_text = ?2 OR path_text LIKE ?2 || '/%' ESCAPE '\\')"
+        " LIMIT ?3;";
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(db, SQL, &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, repo_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the repository id");
+    }
+    st = atlas_db_bind_text_opt(db, stmt, 2, path_text, err);
+    if (st == ATLAS_OK && sqlite3_bind_int64(stmt, 3, (int64_t)ATLAS_MEMORY_MAX_DIR_ENTRIES + 1) !=
+                              SQLITE_OK) {
+        st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the row limit");
+    }
+    for (; st == ATLAS_OK;) {
+        int rc = sqlite3_step(stmt);
+        if (rc == SQLITE_DONE) {
+            break;
+        }
+        if (rc != SQLITE_ROW) {
+            st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot read the indexed files");
+            break;
+        }
+        const char *hash = (const char *)sqlite3_column_text(stmt, 0);
+        if (hash == NULL || hash[0] == '\0') {
+            continue;
+        }
+        bool found = false;
+        st = atlas_db_memory_version_exists(db, source_id, hash, &found, NULL, NULL, NULL, err);
+        if (st != ATLAS_OK) {
+            break;
+        }
+        if (!found) {
+            if (changed_out != NULL) {
+                *changed_out = true;
+            }
+            break;
+        }
+    }
+    atlas_db_finish(db, stmt);
+    return st;
+}

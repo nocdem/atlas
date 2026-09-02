@@ -390,6 +390,69 @@ atlas_status atlas_db_memory_claim_diff_add(atlas_db *db, int64_t generation_id,
                                             atlas_memory_diff_kind kind, const char *reason,
                                             atlas_err *err);
 
+/* --- T9: cross-generation reads --------------------------------------------
+ *
+ * A commit re-mints a claim's row (its content key hashes `basis_commit`,
+ * `src/verify/intake.c:643`), so "the same proposition" is not "the same
+ * `verify_claims` row" once a repository's head has moved. These five reads
+ * are what T9's diff computation uses to answer "is this the same proposition
+ * at a new basis, and if not, what changed" from stored facts only -- no git,
+ * no file, callable from inside the apply transaction. */
+
+/* The most recently appended generation for a repository, or none. What
+ * `atlas_memory_apply_in_tx` compares its freshly computed digests and head
+ * against to derive this pass's cause, and what `atlas_memory_plan_for` reads
+ * to answer the same question before any pass runs. */
+atlas_status atlas_db_memory_generation_latest(atlas_db *db, int64_t repo_id, int64_t *generation_out,
+                                               atlas_buf *head_commit_out,
+                                               atlas_buf *decision_set_digest_out,
+                                               atlas_buf *source_set_digest_out, bool *found_out,
+                                               atlas_err *err);
+
+/* Every distinct (kind, value) anchor ever recorded for this repository --
+ * one row per repository fact a memory claim has anchored to, regardless of
+ * how many claim uids (across how many remints) share it. The vanished-anchor
+ * sweep in `atlas_memory_apply_in_tx` asks this once per pass, and it is what
+ * lets a proposition whose only anchor disappeared from the tree (a symbol
+ * deleted, a path removed) be re-checked even though this pass's fresh
+ * extraction no longer resolves it into anything at all. */
+typedef atlas_status (*atlas_memory_anchor_tuple_cb)(atlas_memory_anchor_kind kind, const char *value,
+                                                     void *ctx, atlas_err *err);
+atlas_status atlas_db_memory_anchor_distinct(atlas_db *db, int64_t repo_id,
+                                             atlas_memory_anchor_tuple_cb cb, void *ctx,
+                                             atlas_err *err);
+
+/* Every claim uid ever anchored to one exact (repo, kind, value) tuple --
+ * across every remint, oldest first (`id ASC`), so a caller wanting "the most
+ * recently created one" takes the last callback invocation. */
+typedef atlas_status (*atlas_memory_claim_uid_cb)(const char *claim_uid, void *ctx, atlas_err *err);
+atlas_status atlas_db_memory_anchor_claim_uids(atlas_db *db, int64_t repo_id,
+                                               atlas_memory_anchor_kind kind, const char *value,
+                                               atlas_memory_claim_uid_cb cb, void *ctx,
+                                               atlas_err *err);
+
+/* The most recent diff kind ever recorded for one claim uid, across every
+ * generation -- never only the last one, because "a claim no event touched
+ * gets no row" means the last time this uid changed state can be several
+ * generations back. `*found_out` is false when no diff row has ever named
+ * this claim uid (it has never transitioned, or was only ever ADDED and
+ * ADDED itself is what a caller already knows not to repeat). */
+atlas_status atlas_db_memory_claim_diff_last_kind(atlas_db *db, int64_t repo_id, const char *claim_uid,
+                                                  atlas_memory_diff_kind *kind_out, bool *found_out,
+                                                  atlas_err *err);
+
+/* Whether any file indexed under one registered `REPO_DIR` source's own path
+ * (its own path exactly, or one path level below it) carries a content hash
+ * this source has no recorded version for -- `atlas_memory_plan_for`'s own
+ * "a child changed" signal, index-only, bounded at
+ * `ATLAS_MEMORY_MAX_DIR_ENTRIES` files examined. A `REPO_FILE` source needs no
+ * equivalent: `atlas_db_verify_file_hash` plus the existing
+ * `atlas_db_memory_version_exists` already answer the same question for one
+ * path. */
+atlas_status atlas_db_memory_dir_hash_mismatch(atlas_db *db, int64_t repo_id, int64_t source_id,
+                                               const char *path_text, bool *changed_out,
+                                               atlas_err *err);
+
 /* --- T6: reading a source, by the principal that can read it ---------------
  *
  * A registered source names bytes; it does not hand them over. `src/memory/
@@ -914,5 +977,27 @@ atlas_status atlas_memory_apply_in_tx(atlas_db *db, const atlas_repo_info *repo,
                                       const atlas_memory_observation *obs,
                                       const atlas_syspolicy *pol, const char *now,
                                       atlas_memory_pass_result *out, atlas_err *err);
+
+/* --- T9: does this repository owe a pass, and why --------------------------
+ *
+ * Pure derivation, asked by the sweep (T10) and by `memory status` (T16) --
+ * one function, two askers, A9.2.3's shape. Reads the index only: it compares
+ * the same three signals `atlas_memory_apply_in_tx` derives its cause from --
+ * each registered source's current content against its latest recorded
+ * version, the decision-set digest over every DECISION anchor's effective
+ * approved revision, and `repo->scanned_head` -- against the last stored
+ * generation row. `*cause_out` is `ATLAS_MEMORY_CAUSE_UNKNOWN` (the zero) when
+ * nothing owed, exactly the pass's own precedence otherwise: the first of
+ * SOURCE_REVISION, DECISION_REVISION, COMMIT that holds.
+ *
+ * No repository with no generation yet and no registered source answers
+ * UNKNOWN by omission -- it answers UNKNOWN honestly, because there is
+ * nothing to compare against and nothing registered to owe a pass over. A
+ * registered source with no generation yet and no recorded version answers
+ * SOURCE_REVISION: it has never been read, which is indistinguishable from
+ * having just changed. */
+atlas_status atlas_memory_plan_for(atlas_db *db, const atlas_repo_info *repo,
+                                   const atlas_syspolicy *pol, atlas_memory_gen_cause *cause_out,
+                                   atlas_err *err);
 
 #endif /* ATLAS_MEMORY_H */

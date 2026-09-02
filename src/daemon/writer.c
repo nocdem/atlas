@@ -430,7 +430,13 @@ bool job_kind_is_drainable(atlas_job_kind kind) {
     /* A12.1. `memory_sources` and `memory_source_versions`: disjoint from
      * everything a semantic pass or a discovery walk touches, and an
      * operator's CLI is waiting on the answer -- the same two conditions
-     * ATLAS_JOB_VERIFY above satisfies. */
+     * ATLAS_JOB_VERIFY above satisfies.
+     *
+     * Both halves describe `memory.put`'s job body, which T11 writes: this kind
+     * has no producer until then, so the claim is a constraint on that body
+     * rather than an observation about one. If T11's body touches a table a
+     * semantic pass or a discovery walk also touches, or answers nobody who is
+     * waiting, this case is what has to change -- not the body. */
     case ATLAS_JOB_MEMORY:
         return true;
     /* An unbounded job must never run inside another one. */

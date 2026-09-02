@@ -3175,12 +3175,28 @@ void atlas_memory_sweep_for(atlas_db *db, atlas_writer *writer, const atlas_sysp
     if (db == NULL || writer == NULL || pol == NULL) {
         return;
     }
-    /* A12.1 T10 §5: the `_checked` accessor, not the one that reads the field
-     * alone. A policy that parsed only part way -- a well-formed
+    /* A12.1: the `_checked` accessor, not the one that reads the field alone.
+     * A policy that parsed only part way -- a well-formed
      * `memory_reconcile = ENABLED` followed by a line that did not parse --
      * leaves the field set on a struct whose `state` is LEGACY, and honouring
      * that half would start a pass that reads documents and writes stored
-     * claims from a policy nobody can read back. */
+     * claims from a policy nobody can read back.
+     *
+     * **This is defence in depth, and no test can distinguish it from the
+     * unchecked form.** Swapping the accessor here changes no observable
+     * behaviour: the gate would open, and `atlas_memory_plan_for` would then
+     * ask `atlas_syspolicy_memory_source_count_checked`, which has no
+     * unchecked form and answers 0 on a LEGACY policy -- so no source is
+     * owed, no cause is derived and nothing is submitted. The scenario that
+     * would discriminate needs a LEGACY policy with a non-zero source count,
+     * and the source count is `_checked` too, so no such policy exists.
+     *
+     * It is kept anyway, and the reason is not redundancy: the guard that
+     * makes it unobservable lives in another function, and a gate that is
+     * correct only because of what its callee happens to do is a gate that
+     * stops being correct when the callee changes. Stated here rather than
+     * asserted in a test, because a test that cannot fail would claim more
+     * than this comment does. */
     if (!atlas_syspolicy_memory_reconcile_effective_checked(pol)) {
         return;
     }

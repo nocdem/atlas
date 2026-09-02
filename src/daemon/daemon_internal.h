@@ -474,7 +474,26 @@ atlas_status atlas_writer_submit_sem_discover(atlas_writer *w, int64_t repo_id, 
  * checked against a *running* pass the way `atlas_writer_sem_index_pending`
  * is, because a duplicate here is idempotent rather than merely wasted -- a
  * second pass over an unmoved source reports generation 0 -- so the queue
- * check alone is the cheaper rule that still costs nothing wrong. */
+ * check alone is the cheaper rule that still costs nothing wrong.
+ *
+ * **`pol` must be a policy this process loaded, and nothing else can check
+ * that.** It is a struct, so `state == SYSTEM` is an integer any caller can
+ * set: provenance cannot be established at the callee, and this sentence is
+ * therefore the whole of the defence. Load it with `atlas_syspolicy_load`,
+ * which reads the compiled-in root-owned path with no override, exactly as
+ * `memory_sweep` does; never from a request body, a parameter a client
+ * influences, or a struct built by hand outside a test. A7's rule is that
+ * authority is configured outside the reach of the principal it constrains,
+ * and a policy arriving in an RPC is inside it. `atlas_syspolicy_load_at`
+ * carries the same sentence for the same reason.
+ *
+ * **The one consultation of `memory_reconcile` is deliberate and is not an
+ * omission to be tidied up.** The key governs *initiative* -- whether Atlas
+ * starts a pass nobody asked for -- so the sweep asks it and an operator's
+ * explicit `memory.reconcile` (T11) does not. Making that method consult it
+ * too would let a policy key veto a request the operator made on purpose,
+ * which is a different question from the one the key answers.
+ */
 atlas_status atlas_writer_submit_memory_reconcile(atlas_writer *w, int64_t repo_id,
                                                   const atlas_syspolicy *pol, atlas_err *err);
 

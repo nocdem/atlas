@@ -53,6 +53,8 @@
  * above: they must separate "answered" from "waited out a four-second budget" on
  * a loaded machine, and nothing finer than that is a property Atlas holds.
  */
+#define _GNU_SOURCE 1
+
 #include <stdio.h>
 #include <string.h>
 #include <sys/wait.h>
@@ -66,6 +68,8 @@
 #include "atlas/hook.h"
 #include "atlas/ipc.h"
 #include "atlas/limits.h"
+#include "atlas/memory.h"
+#include "atlas/syspolicy.h"
 #include "atlas/verify.h"
 #include "atlas/verify_ops.h"
 #include "atlas_test.h"
@@ -968,10 +972,24 @@ static void test_the_two_job_classifications_agree_over_the_whole_enum(void) {
          * its own, disjoint from anything a semantic pass touches, with an
          * operator's foreground plan driver blocked on the answer. */
         ATLAS_JOB_PLAN,
+        /* A12.1. `memory_sources` and `memory_source_versions`: disjoint from
+         * anything a semantic pass touches, with an operator's CLI blocked on
+         * the answer -- the same two conditions ATLAS_JOB_VERIFY satisfies. */
+        ATLAS_JOB_MEMORY,
     };
     /* The last member of the vocabulary. Named rather than counted, so that a
-     * kind appended after it makes this line wrong in a way somebody sees. */
-    const int last = (int)ATLAS_JOB_PLAN;
+     * kind appended after it makes this line wrong in a way somebody sees --
+     * but only reliably for a kind that is *drainable*: `drainable_seen`
+     * below is checked against `DRAINABLE`'s own length, so a documented
+     * member the walk never reaches is caught by that comparison. A kind
+     * appended after `last` that is **not** drainable is caught by neither
+     * check and is silently walked past — this is exactly the trap A12.1's
+     * ATLAS_JOB_MEMORY_RECONCILE would have been, appended right beside a
+     * drainable sibling that *would* have been caught. There is no defence
+     * against this but moving `last` in the same change that appends a kind,
+     * which is why this line names the vocabulary's true final member rather
+     * than the last one anybody remembered to add to `DRAINABLE`. */
+    const int last = (int)ATLAS_JOB_MEMORY_RECONCILE;
 
     int drainable_seen = 0;
     for (int i = 0; i <= last; i++) {
@@ -1000,6 +1018,235 @@ static void test_the_two_job_classifications_agree_over_the_whole_enum(void) {
     T_EQ_INT(drainable_seen, (int)(sizeof DRAINABLE / sizeof DRAINABLE[0]));
 }
 
+/* --- A12.1 T10: the memory sweep's enqueue decision ------------------------
+ *
+ * `atlas_memory_sweep_for` (`watch.c`) is `memory_sweep`'s testable half:
+ * given an already-loaded policy, it decides which registered repositories
+ * owe a reconciliation pass and submits one each through the writer. What it
+ * is deliberately *not* given is a live `atlas_watcher` -- nothing here reads
+ * `/etc/atlas/system.conf`, which is this host's real, root-owned production
+ * policy (A7.1: compiled-in path, no override, ever) and is not this suite's
+ * to write or to fake a forked daemon into reading. A hand-built
+ * `atlas_syspolicy`, `test_memory_reconcile.c`'s own `t8_policy` pattern, is
+ * the substitute every other test of policy-gated behaviour in this tree
+ * already uses (`atlas_memory_plan_for`, `atlas_sem_plan_for`) -- this is the
+ * same substitute one layer further out, at the sweep's own decision rather
+ * than at the pure function underneath it.
+ *
+ * This also settles A12.1 T10 context §4 (the sweep interval cannot be
+ * shortened in a forked daemon) differently from either shape it names:
+ * driving `atlas_memory_sweep_for` directly bypasses `memory_sweep`'s
+ * throttle entirely; there is no interval to inject and nothing to wait out,
+ * because the decision is synchronous and the wait below is for the writer
+ * thread to finish the pass it was, or was not, asked to run. */
+typedef struct msweep_env {
+    fixture fx;
+    atlas_buf db_path;
+    atlas_writer *writer;
+    FILE *log;
+    int64_t repo_id;
+} msweep_env;
+
+static void msweep_open(msweep_env *e, atlas_err *err) {
+    memset(e, 0, sizeof *e);
+    atlas_buf_init(&e->db_path);
+    T_OK(fx_open(&e->fx, err), err);
+    T_OK(atlas_datadir_ensure(fx_data_dir(&e->fx), err), err);
+    T_OK(atlas_datadir_db_path(fx_data_dir(&e->fx), &e->db_path, err), err);
+
+    /* Migrated and closed before the writer starts, exactly
+     * `test_watch_budget.c`'s `rig_open`: exactly one process writes the
+     * index, and two open write handles in one process is the shape that
+     * rule exists to prevent. */
+    atlas_db *mdb = NULL;
+    T_OK(atlas_db_open(atlas_buf_cstr(&e->db_path), &mdb, err), err);
+    T_OK(atlas_db_migrate(mdb, err), err);
+    atlas_db_close(mdb);
+
+    /* One committed, tracked file for a REPO_FILE memory source to read
+     * through git -- `atlas_memory_read_source` never opens the tree itself.
+     * Its content is irrelevant to whether a generation gets appended: a
+     * source read for the first time is SOURCE_REVISION regardless of what
+     * it says. */
+    T_OK(fx_init_repo(&e->fx, fx_repo(&e->fx), NULL, err), err);
+    T_OK(fx_write(fx_repo(&e->fx), "CLAUDE.md", "Nothing load-bearing here.\n", err), err);
+    T_OK(fx_add_all(&e->fx, fx_repo(&e->fx), err), err);
+    T_OK(fx_commit(&e->fx, fx_repo(&e->fx), "seed", err), err);
+
+    const char *argv[] = {"--data-dir", fx_data_dir(&e->fx), "repo", "add", fx_repo(&e->fx),
+                          "--name", "msweep"};
+    int code = -1;
+    T_OK(fx_atlas(argv, 7u, NULL, NULL, &code, err), err);
+    T_REQUIRE(code == 0);
+
+    e->log = fopen("/dev/null", "we");
+    T_REQUIRE(e->log != NULL);
+    T_OK(atlas_writer_start(atlas_buf_cstr(&e->db_path), fx_data_dir(&e->fx), "", NULL, e->log,
+                            &e->writer, err),
+         err);
+
+    atlas_db *rdb = NULL;
+    T_OK(atlas_db_open_readonly(atlas_buf_cstr(&e->db_path), &rdb, err), err);
+    atlas_repo_info info;
+    atlas_repo_info_init(&info);
+    bool found = false;
+    T_OK(atlas_db_repo_get(rdb, "msweep", &info, &found, err), err);
+    T_REQUIRE(found);
+    e->repo_id = info.id;
+    atlas_repo_info_free(&info);
+    atlas_db_close(rdb);
+}
+
+static void msweep_close(msweep_env *e) {
+    if (e->writer != NULL) {
+        atlas_writer_stop(e->writer);
+    }
+    if (e->log != NULL) {
+        (void)fclose(e->log);
+    }
+    atlas_buf_free(&e->db_path);
+    fx_close(&e->fx);
+}
+
+/* `test_memory_reconcile.c:836`'s `t8_policy`, narrowed to one REPO_FILE
+ * source at "CLAUDE.md" with `state` and `memory_reconcile` set by the
+ * caller -- the two fields this test varies. */
+static void msweep_policy(atlas_syspolicy *pol, atlas_syspolicy_state state,
+                          int memory_reconcile) {
+    memset(pol, 0, sizeof *pol);
+    pol->state = state;
+    pol->memory_reconcile = memory_reconcile;
+    pol->memory_source_count = 1;
+    pol->memory_sources[0].cls = ATLAS_MEMORY_SOURCE_REPO_FILE;
+    pol->memory_sources[0].repo_name[0] = '\0';
+    (void)snprintf(pol->memory_sources[0].path, sizeof pol->memory_sources[0].path, "%s",
+                   "CLAUDE.md");
+}
+
+#define MSWEEP_WAIT_MS 20000
+
+/* Polls a read-only handle for a generation row, per T10's own instruction:
+ * for this test, read the generation directly rather than through
+ * `memory.status`, which is A12.1 T11's. */
+static bool msweep_wait_generation(const msweep_env *e, int64_t *generation_out) {
+    for (int i = 0; i < MSWEEP_WAIT_MS / 20; i++) {
+        atlas_db *rdb = NULL;
+        atlas_err oerr;
+        atlas_err_init(&oerr);
+        if (atlas_db_open_readonly(atlas_buf_cstr(&e->db_path), &rdb, &oerr) == ATLAS_OK) {
+            int64_t gen = 0;
+            bool found = false;
+            atlas_buf head = ATLAS_BUF_INIT, dset = ATLAS_BUF_INIT, sset = ATLAS_BUF_INIT;
+            atlas_err gerr;
+            atlas_err_init(&gerr);
+            atlas_status st =
+                atlas_db_memory_generation_latest(rdb, e->repo_id, &gen, &head, &dset, &sset,
+                                                  &found, &gerr);
+            atlas_buf_free(&head);
+            atlas_buf_free(&dset);
+            atlas_buf_free(&sset);
+            atlas_db_close(rdb);
+            if (st == ATLAS_OK && found && gen >= 1) {
+                *generation_out = gen;
+                return true;
+            }
+        }
+        usleep(20000);
+    }
+    return false;
+}
+
+static void test_the_memory_sweep_submits_a_reconciliation_when_owed(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    msweep_env e;
+    msweep_open(&e, &err);
+
+    atlas_syspolicy pol;
+    msweep_policy(&pol, ATLAS_SYSPOLICY_SYSTEM, 1 /* ENABLED */);
+
+    atlas_db *rdb = NULL;
+    T_OK(atlas_db_open_readonly(atlas_buf_cstr(&e.db_path), &rdb, &err), &err);
+    atlas_memory_sweep_for(rdb, e.writer, &pol);
+    atlas_db_close(rdb);
+
+    int64_t generation = 0;
+    T_CHECK_MSG(msweep_wait_generation(&e, &generation),
+                "the memory sweep did not append a generation for a repository it should have "
+                "found owed, within %d ms",
+                MSWEEP_WAIT_MS);
+    T_CHECK_MSG(generation >= 1, "generation %lld is not >= 1", (long long)generation);
+
+    msweep_close(&e);
+}
+
+/* Both refusals share a body: neither policy makes
+ * `atlas_syspolicy_memory_reconcile_effective_checked` true, so
+ * `atlas_memory_sweep_for` returns having read the registry but submitted
+ * nothing -- a synchronous decision, so there is nothing to wait out. Sharing
+ * the body is what proves the second case is not the first by accident: a
+ * LEGACY policy that stated ENABLED must be refused for a different reason
+ * than an absent statement is, and both land here. */
+static void msweep_expect_nothing_submitted(atlas_syspolicy_state state, int memory_reconcile) {
+    atlas_err err;
+    atlas_err_init(&err);
+    msweep_env e;
+    msweep_open(&e, &err);
+
+    atlas_syspolicy pol;
+    msweep_policy(&pol, state, memory_reconcile);
+
+    atlas_db *rdb = NULL;
+    T_OK(atlas_db_open_readonly(atlas_buf_cstr(&e.db_path), &rdb, &err), &err);
+    atlas_memory_sweep_for(rdb, e.writer, &pol);
+    atlas_db_close(rdb);
+
+    /* No wait: the gate is checked before the registry is even read, so a
+     * refusal leaves nothing queued at the point `atlas_memory_sweep_for`
+     * returns -- there is no race to wait out, only a fact to read. */
+    atlas_db *rdb2 = NULL;
+    T_OK(atlas_db_open_readonly(atlas_buf_cstr(&e.db_path), &rdb2, &err), &err);
+    int64_t gen = 0;
+    bool found = false;
+    atlas_buf head = ATLAS_BUF_INIT, dset = ATLAS_BUF_INIT, sset = ATLAS_BUF_INIT;
+    atlas_err gerr;
+    atlas_err_init(&gerr);
+    T_OK(atlas_db_memory_generation_latest(rdb2, e.repo_id, &gen, &head, &dset, &sset, &found,
+                                           &gerr),
+         &gerr);
+    T_CHECK_MSG(!found, "a generation was recorded for a repository the sweep should not have "
+                        "touched (state %d, memory_reconcile %d)",
+                (int)state, memory_reconcile);
+    atlas_buf_free(&head);
+    atlas_buf_free(&dset);
+    atlas_buf_free(&sset);
+    atlas_db_close(rdb2);
+
+    msweep_close(&e);
+}
+
+/* `memory_reconcile` absent (UNSET, the zero value) resolves to the compiled
+ * `ATLAS_MEMORY_RECONCILE_DEFAULT` (false), exactly the state of every
+ * ordinary policy nobody has configured for this feature -- including, as it
+ * happens, this machine's own `/etc/atlas/system.conf`. */
+static void test_the_memory_sweep_submits_nothing_when_memory_reconcile_is_unset(void) {
+    msweep_expect_nothing_submitted(ATLAS_SYSPOLICY_SYSTEM, 0 /* UNSET */);
+}
+
+/* A12.1 T10 §5: a policy whose `state` is LEGACY carries no authority even
+ * when its `memory_reconcile` field reads ENABLED -- the shape a policy takes
+ * when a well-formed `memory_reconcile = ENABLED` line is followed by one
+ * that does not parse. `atlas_syspolicy_memory_reconcile_effective` (the
+ * unchecked accessor) would answer true here; `_checked` must not, and this
+ * is the assertion that would fail if the sweep called the wrong one. */
+static void test_the_memory_sweep_ignores_a_legacy_policys_stated_content(void) {
+    atlas_syspolicy pol;
+    msweep_policy(&pol, ATLAS_SYSPOLICY_LEGACY, 1 /* ENABLED, but unparsed */);
+    T_CHECK(!atlas_syspolicy_memory_reconcile_effective_checked(&pol));
+    T_CHECK(atlas_syspolicy_memory_reconcile_effective(&pol));
+    msweep_expect_nothing_submitted(ATLAS_SYSPOLICY_LEGACY, 1 /* ENABLED, but unparsed */);
+}
+
 static const atlas_test TESTS[] = {
     {"a semantic pass does not stall the serve loop",
      test_a_semantic_pass_does_not_stall_the_serve_loop},
@@ -1011,6 +1258,12 @@ static const atlas_test TESTS[] = {
      test_a_refused_submission_stores_nothing_and_a_retry_makes_one_row},
     {"the two job classifications agree over the whole enum",
      test_the_two_job_classifications_agree_over_the_whole_enum},
+    {"the memory sweep submits a reconciliation when owed",
+     test_the_memory_sweep_submits_a_reconciliation_when_owed},
+    {"the memory sweep submits nothing when memory_reconcile is unset",
+     test_the_memory_sweep_submits_nothing_when_memory_reconcile_is_unset},
+    {"the memory sweep ignores a legacy policy's stated content",
+     test_the_memory_sweep_ignores_a_legacy_policys_stated_content},
 };
 
 ATLAS_TEST_MAIN("daemon_responsive", TESTS)

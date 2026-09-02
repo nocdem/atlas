@@ -194,7 +194,24 @@ typedef enum atlas_job_kind {
      * creating a process or reading a file inside a write transaction, and a
      * plan operation does neither. The planner's bytes come from the job's own
      * stored artifact row, so nothing here opens anything. */
-    ATLAS_JOB_PLAN
+    ATLAS_JOB_PLAN,
+    /* A12.1. `memory.put` and the small typed writes: appending a version row
+     * for bytes a caller already handed in, bounded by
+     * `ATLAS_MEMORY_MAX_SOURCE_BYTES` before anything is queued. One job kind
+     * carrying one typed operation, for exactly the reason ATLAS_JOB_AI,
+     * ATLAS_JOB_DECISION, ATLAS_JOB_ORCH, ATLAS_JOB_VERIFY and ATLAS_JOB_PLAN
+     * are each one: validation happens at the IPC edge before anything is
+     * queued, and the writer's switch stays a switch rather than becoming a
+     * second dispatch table that can drift from the first. */
+    ATLAS_JOB_MEMORY,
+    /* A12.1. Decision 10: the reconciliation pass gets a job kind of its own
+     * rather than a step inside another, because its two switch answers below
+     * are a pairing no existing kind has -- unbounded false, drainable false.
+     * Reads every registered source and forks git in `atlas_memory_observe`,
+     * which A1 forbids inside a transaction, so the job runs that phase with
+     * no transaction open and opens one only around
+     * `atlas_memory_apply_in_tx`. */
+    ATLAS_JOB_MEMORY_RECONCILE
 } atlas_job_kind;
 
 
@@ -335,6 +352,16 @@ struct atlas_job {
     atlas_plan_op *plan;
     atlas_plan_result *plan_result;
 
+    /* A12.1. `ATLAS_JOB_MEMORY_RECONCILE`'s own policy, as
+     * `atlas_writer_submit_memory_reconcile`'s caller already loaded it --
+     * carried rather than reloaded so the pass acts on exactly the policy
+     * that decided it is owed, the same reason `ATLAS_JOB_SEM_INDEX` is
+     * handed its compilation databases instead of re-deriving them on this
+     * thread. `atlas_syspolicy` is plain data (fixed-size arrays and
+     * integers, no owned buffer), so a `malloc` and a struct copy are the
+     * whole of its ownership: freed with a bare `free`, no `_free` pair. */
+    atlas_syspolicy *memory_pol;
+
     /* A8 snapshot enumeration. */
     int64_t snapshot_attempt_id;
     struct atlas_snapshot_meta *snapshot_meta;
@@ -427,6 +454,42 @@ atlas_status atlas_writer_submit_sem_index(atlas_writer *w, int64_t repo_id, con
  * accumulate a backlog of identical tree walks. */
 atlas_status atlas_writer_submit_sem_discover(atlas_writer *w, int64_t repo_id, const char *name,
                                               atlas_err *err);
+
+/* A12.1. Queues one bounded memory reconciliation pass for a repository.
+ *
+ * `pol` is the caller's already-loaded policy -- the one that decided this
+ * repository is owed a pass -- and is copied onto the job rather than left
+ * for `run_memory_reconcile` to reload: a fresh `atlas_syspolicy_load()` on
+ * the writer thread could see a policy that no longer names the source that
+ * justified the submission, and the pass should act on exactly the evidence
+ * that produced it, not on whatever the root-owned file says microseconds
+ * later. The same argument `ATLAS_JOB_SEM_INDEX` already makes for being
+ * handed its compilation databases instead of re-deriving them.
+ *
+ * Fire-and-forget, like the two sweeps above: nobody polls for it, and the
+ * confirmation channel is `memory.status` (T11), which is what lets the
+ * caller here be the sweep on a timer rather than an operator waiting.
+ * Coalesced against the queue for the reason `atlas_writer_submit_sem_discover`
+ * is: a pass for a repository already waiting to run adds nothing. Not
+ * checked against a *running* pass the way `atlas_writer_sem_index_pending`
+ * is, because a duplicate here is idempotent rather than merely wasted -- a
+ * second pass over an unmoved source reports generation 0 -- so the queue
+ * check alone is the cheaper rule that still costs nothing wrong. */
+atlas_status atlas_writer_submit_memory_reconcile(atlas_writer *w, int64_t repo_id,
+                                                  const atlas_syspolicy *pol, atlas_err *err);
+
+/* A12.1. Given an already-loaded system policy, decides which registered
+ * repositories owe a memory reconciliation pass and submits one each.
+ *
+ * Deliberately free of `atlas_watcher`: it reads the registry directly
+ * (`atlas_db_repo_list`) and submits through `writer`, the one surface in
+ * this file already designed to be called from a thread other than the
+ * watcher's own. `memory_sweep` (`watch.c`, on the tick beside `sem_sweep`)
+ * is the thin production wrapper that loads the real policy and calls this;
+ * this is the part a test can drive with a hand-built policy without
+ * touching a live watcher's internals from a foreign thread, which nothing
+ * else in this daemon does either. */
+void atlas_memory_sweep_for(atlas_db *db, atlas_writer *writer, const atlas_syspolicy *pol);
 
 /* A9.2.3. Whether a semantic index for this repository is queued or running.
  *

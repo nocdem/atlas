@@ -22,6 +22,7 @@
 #include "atlas/reconcile.h"
 #include "atlas/safetext.h"
 #include "atlas/maintenance.h"
+#include "atlas/memory.h"
 #include "atlas/ops.h"
 #include "atlas/ipc.h"
 #include "atlas/sem_discover.h"
@@ -190,6 +191,9 @@ static void job_free(atlas_job *j) {
         atlas_plan_result_free(j->plan_result);
         free(j->plan_result);
     }
+    /* Plain data, so a bare `free` is its whole destructor -- see the field's
+     * own comment in daemon_internal.h. */
+    free(j->memory_pol);
     free(j->gw_audit);
     free(j);
 }
@@ -350,6 +354,20 @@ bool job_kind_is_unbounded(atlas_job_kind kind) {
     case ATLAS_JOB_VERIFY:
     case ATLAS_JOB_SEM_CONFIG:
     case ATLAS_JOB_PLAN:
+    /* A handful of statements over bytes a caller already handed in, bounded
+     * by ATLAS_MEMORY_MAX_SOURCE_BYTES before anything is queued. */
+    case ATLAS_JOB_MEMORY:
+        return false;
+    /* A12.1. T8 measured this pass's worst case at the compiled ceiling -- 16
+     * sources, 128 candidates each, 2048 claims, one transaction -- at
+     * 2429.9 ms, which outlasts both ATLAS_HOOK_IPC_TIMEOUT_MS (2000 ms) and
+     * ATLAS_HOOK_TEARDOWN_TIMEOUT_MS (700 ms): this pass can outlast a hook's
+     * own deadline. `false` is still right, for the reason RECONCILE above
+     * already carries: answering `true` lets a waiter back out with `BUSY`,
+     * `BUSY` means nothing was queued, and a hook that fails open then loses
+     * the write outright rather than merely delaying it. `false` costs a
+     * caller its answer; `true` costs the write itself. */
+    case ATLAS_JOB_MEMORY_RECONCILE:
         return false;
     }
     return false;
@@ -409,6 +427,11 @@ bool job_kind_is_drainable(atlas_job_kind kind) {
     case ATLAS_JOB_GW_AUDIT:
     /* A credential change; revocation must not wait for a compiler. */
     case ATLAS_JOB_APIKEY:
+    /* A12.1. `memory_sources` and `memory_source_versions`: disjoint from
+     * everything a semantic pass or a discovery walk touches, and an
+     * operator's CLI is waiting on the answer -- the same two conditions
+     * ATLAS_JOB_VERIFY above satisfies. */
+    case ATLAS_JOB_MEMORY:
         return true;
     /* An unbounded job must never run inside another one. */
     case ATLAS_JOB_SEM_INDEX:
@@ -438,6 +461,10 @@ bool job_kind_is_drainable(atlas_job_kind kind) {
     case ATLAS_JOB_SET_WATCH:
     /* Reconfigures the very activity that is yielding. */
     case ATLAS_JOB_SEM_CONFIG:
+    /* A12.1. The observe phase reads sources and forks git in its own right.
+     * A yield must stay a pause, not a tunnel through which that file I/O
+     * reaches the thread. */
+    case ATLAS_JOB_MEMORY_RECONCILE:
         return false;
     }
     return false;
@@ -670,6 +697,122 @@ static void run_reconcile(atlas_writer *w, atlas_job *j) {
     }
 
     atlas_git_close(g);
+    atlas_repo_info_free(&info);
+    atlas_safe_pool_free(&safe);
+}
+
+/* A12.1. The memory reconciliation pass, submitted by `memory_sweep`
+ * (`watch.c`) and, from A12.1 T11, by an operator's `memory.reconcile`.
+ *
+ * Two phases, in the order A1 requires: `atlas_memory_observe` reads every
+ * registered source and forks git, with no transaction open, and only its
+ * result -- an `atlas_memory_observation`, owning its own buffers and
+ * referencing no live statement, git handle or open fd -- crosses into the
+ * transaction that follows. The transaction wraps `atlas_memory_apply_in_tx`
+ * alone, exactly the shape `atlas_decision_apply` gives
+ * `atlas_decision_apply_in_tx` (`lifecycle.c:2073`): whole or nothing, so a
+ * version row can never land without the generation it belongs to.
+ *
+ * The observation is heap-allocated on the memory module's own instruction:
+ * it is bounded at `ATLAS_MEMORY_MAX_SOURCES` times `ATLAS_MEMORY_MAX_DIR_ENTRIES`
+ * items, on the order of a megabyte at the compiled ceilings, and that size is
+ * Decision 10's whole argument for why this job's duration is *statable*
+ * rather than unbounded -- putting it on this thread's stack would trade a
+ * documented bound for an undocumented one. */
+static void run_memory_reconcile(atlas_writer *w, atlas_job *j) {
+    atlas_err err;
+    atlas_err_init(&err);
+    atlas_safe_pool safe;
+    atlas_safe_pool_init(&safe);
+
+    if (j->memory_pol == NULL) {
+        /* Never happens outside a defect in the submit path -- every producer
+         * of this kind attaches a policy before queueing. Refusing rather
+         * than falling back to a fresh `atlas_syspolicy_load()` keeps this
+         * job acting on exactly the evidence its submitter saw, never on a
+         * second, independent read. */
+        atlas_daemon_log(w->log, "warn",
+                         "a memory reconciliation for repository %lld arrived with no policy "
+                         "attached",
+                         (long long)j->repo_id);
+        atlas_safe_pool_free(&safe);
+        return;
+    }
+    const atlas_syspolicy *pol = j->memory_pol;
+
+    atlas_repo_info info;
+    atlas_repo_info_init(&info);
+    bool found = false;
+    if (atlas_db_repo_get_by_id(w->db, j->repo_id, &info, &found, &err) != ATLAS_OK || !found) {
+        /* The repository was removed between queueing and running. Nothing to
+         * do, and nothing has gone wrong. */
+        atlas_repo_info_free(&info);
+        atlas_safe_pool_free(&safe);
+        return;
+    }
+
+    atlas_memory_observation *obs = malloc(sizeof *obs);
+    if (obs == NULL) {
+        atlas_daemon_log(w->log, "warn",
+                         "memory reconciliation for %s could not allocate its observation",
+                         atlas_safe(&safe, info.name));
+        atlas_repo_info_free(&info);
+        atlas_safe_pool_free(&safe);
+        return;
+    }
+    atlas_memory_observation_init(obs);
+
+    atlas_err oerr;
+    atlas_err_init(&oerr);
+    if (atlas_memory_observe(w->db, &info, atlas_buf_cstr(&w->data_dir), pol, obs, &oerr) !=
+        ATLAS_OK) {
+        atlas_daemon_log(w->log, "warn",
+                         "memory reconciliation for %s could not observe its sources: %s",
+                         atlas_safe(&safe, info.name), atlas_safe(&safe, atlas_err_msg(&oerr)));
+        atlas_memory_observation_free(obs);
+        free(obs);
+        atlas_repo_info_free(&info);
+        atlas_safe_pool_free(&safe);
+        return;
+    }
+
+    char now[32];
+    atlas_now_iso8601(now, sizeof now);
+
+    atlas_memory_pass_result result;
+    memset(&result, 0, sizeof result);
+    atlas_err aerr;
+    atlas_err_init(&aerr);
+    atlas_status st = atlas_db_begin(w->db, &aerr);
+    if (st == ATLAS_OK) {
+        st = atlas_memory_apply_in_tx(w->db, &info, obs, pol, now, &result, &aerr);
+        if (st != ATLAS_OK) {
+            /* Whole or nothing: a version row appended with no generation to
+             * carry it, or a generation with no diff row for a claim it
+             * affected, is the one outcome this pass must never leave. */
+            atlas_db_rollback(w->db);
+        } else {
+            st = atlas_db_commit(w->db, &aerr);
+            if (st != ATLAS_OK) {
+                atlas_db_rollback(w->db);
+            }
+        }
+    }
+
+    if (st != ATLAS_OK) {
+        atlas_daemon_log(w->log, "warn", "memory reconciliation for %s failed: %s",
+                         atlas_safe(&safe, info.name), atlas_safe(&safe, atlas_err_msg(&aerr)));
+    } else {
+        atlas_daemon_log(w->log, "info",
+                         "memory reconciled %s generation %lld: %zu sources, +%zu versions, "
+                         "+%zu claims, ~%zu resolved, %zu unanchored, %zu diff rows",
+                         atlas_safe(&safe, info.name), (long long)result.generation,
+                         result.sources_seen, result.versions_added, result.claims_created,
+                         result.claims_resolved, result.unanchored, result.diff_rows);
+    }
+
+    atlas_memory_observation_free(obs);
+    free(obs);
     atlas_repo_info_free(&info);
     atlas_safe_pool_free(&safe);
 }
@@ -1307,6 +1450,7 @@ static void writer_run_job(atlas_writer *w, atlas_job *j) {
     case ATLAS_JOB_SNAPSHOT: run_snapshot(w, j); break;
     case ATLAS_JOB_SEM_INDEX: run_sem_index(w, j); break;
     case ATLAS_JOB_SEM_DISCOVER: run_sem_discover(w, j); break;
+    case ATLAS_JOB_MEMORY_RECONCILE: run_memory_reconcile(w, j); break;
     case ATLAS_JOB_MAINTENANCE: {
         /* Both pointers belong to a caller that may have stopped waiting;
          * cleared under the lock in that case, so a NULL here means the
@@ -1427,6 +1571,12 @@ static void writer_run_job(atlas_writer *w, atlas_job *j) {
         (void)atlas_db_index_state_set_watch(w->db, j->repo_id, &outcome, &ignore);
         break;
     }
+    /* A12.1. `memory.put`'s job body is A12.1 T11's: this dispatch listing
+     * every enumerator (`-Wswitch-enum`, not merely `-Wswitch`) is what makes
+     * a job kind with no case here a build failure rather than a silent
+     * `default:` no-op, so the classification switches above and this one
+     * cannot drift apart about which kinds exist. */
+    case ATLAS_JOB_MEMORY: break;
     default: break;
     }
 
@@ -2815,6 +2965,57 @@ atlas_status atlas_writer_submit_sem_discover(atlas_writer *w, int64_t repo_id, 
     for (size_t k = 0; !duplicate && k < w->count; k++) {
         const atlas_job *q = w->queue[(w->head + k) % ATLAS_WRITER_QUEUE_MAX];
         if (q->kind == ATLAS_JOB_SEM_DISCOVER && q->repo_id == repo_id) {
+            duplicate = true;
+        }
+    }
+    bool queued = duplicate || (!w->stopping && queue_push(w, j));
+    if (queued && !duplicate) {
+        (void)pthread_cond_signal(&w->not_empty);
+    }
+    (void)pthread_mutex_unlock(&w->lock);
+    if (duplicate || !queued) {
+        job_free(j);
+    }
+    if (!queued) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "the Atlas daemon's write queue is full");
+    }
+    return ATLAS_OK;
+}
+
+/* A12.1. Queues one bounded memory reconciliation pass and returns
+ * immediately -- fire-and-forget like `atlas_writer_submit_sem_discover`
+ * above, for the same reason: the sweep that calls this is a timer, not a
+ * waiter, and `memory.status` (T11) is the confirmation channel.
+ *
+ * Coalesced against the *queue* only, not against a running pass the way
+ * `atlas_writer_sem_index_pending` guards ATLAS_JOB_SEM_INDEX: a duplicate
+ * reconciliation is idempotent rather than merely wasted -- a pass over a
+ * source nothing moved reports generation 0 -- so the cheaper queue-only
+ * check already costs nothing wrong. */
+atlas_status atlas_writer_submit_memory_reconcile(atlas_writer *w, int64_t repo_id,
+                                                  const atlas_syspolicy *pol, atlas_err *err) {
+    atlas_job *j = job_new(ATLAS_JOB_MEMORY_RECONCILE);
+    if (j == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                             "out of memory queueing a memory reconciliation");
+    }
+    j->repo_id = repo_id;
+    /* Copied rather than referenced: `pol` is very often the caller's own
+     * stack variable, and this job can outlive that frame by as long as the
+     * queue is deep. `atlas_syspolicy` is plain data, so the copy is the
+     * whole of taking ownership. */
+    j->memory_pol = malloc(sizeof *j->memory_pol);
+    if (j->memory_pol == NULL) {
+        job_free(j);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                             "out of memory queueing a memory reconciliation");
+    }
+    *j->memory_pol = *pol;
+    (void)pthread_mutex_lock(&w->lock);
+    bool duplicate = false;
+    for (size_t k = 0; !duplicate && k < w->count; k++) {
+        const atlas_job *q = w->queue[(w->head + k) % ATLAS_WRITER_QUEUE_MAX];
+        if (q->kind == ATLAS_JOB_MEMORY_RECONCILE && q->repo_id == repo_id) {
             duplicate = true;
         }
     }

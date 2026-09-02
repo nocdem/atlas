@@ -43,6 +43,7 @@
 #include "atlas/atlas.h"
 #include "atlas/git.h"
 #include "atlas/ipc.h"
+#include "atlas/memory.h"
 #include "atlas/safetext.h"
 #include "atlas/sem.h"
 #include "atlas/sem_discover.h"
@@ -610,6 +611,8 @@ struct atlas_watcher {
     int64_t last_sem_sweep_ms;
     /* A9.2.4. The bounded walk runs on its own, much slower, timer. */
     int64_t last_discovery_sweep_ms;
+    /* A12.1. When the memory reconciliation sweep last ran. */
+    int64_t last_memory_sweep_ms;
 
     /* P0. The resolved watch budget, and the arithmetic behind it.
      *
@@ -3132,6 +3135,87 @@ static void sem_sweep(atlas_watcher *w) {
     }
 }
 
+typedef struct memory_sweep_ctx {
+    atlas_db *db;
+    atlas_writer *writer;
+    const atlas_syspolicy *pol;
+} memory_sweep_ctx;
+
+static atlas_status memory_sweep_one(const atlas_repo_info *ri, void *ud, atlas_err *err) {
+    (void)err;
+    memory_sweep_ctx *ctx = (memory_sweep_ctx *)ud;
+    atlas_memory_gen_cause cause = ATLAS_MEMORY_CAUSE_UNKNOWN;
+    atlas_err perr;
+    atlas_err_init(&perr);
+    if (atlas_memory_plan_for(ctx->db, ri, ctx->pol, &cause, &perr) == ATLAS_OK &&
+        cause != ATLAS_MEMORY_CAUSE_UNKNOWN) {
+        atlas_err serr;
+        atlas_err_init(&serr);
+        /* Fire-and-forget, the same backpressure every sweep in this file
+         * uses: a full queue means this repository keeps the verdict it had
+         * and the next interval tries again. */
+        (void)atlas_writer_submit_memory_reconcile(ctx->writer, ri->id, ctx->pol, &serr);
+    }
+    /* One repository's own obstacle -- `atlas_memory_plan_for` could not read
+     * the index for it -- must not stop the walk over the rest. */
+    return ATLAS_OK;
+}
+
+/* A12.1. Decision 10's sweep, given an already-loaded policy.
+ *
+ * Deliberately free of `atlas_watcher`: `atlas_db_repo_list` reads the
+ * registry directly rather than the watcher's own tracked subset, and
+ * `atlas_writer_submit_memory_reconcile` is the cross-thread-safe surface
+ * every other sweep in this file already submits through. Nothing here
+ * touches a field only the watcher's own thread may touch, which is what
+ * lets `memory_sweep` below be the *only* thing that has to run there --
+ * this function is what a test drives directly, with a hand-built policy,
+ * exactly as `atlas_memory_plan_for` itself is already tested. */
+void atlas_memory_sweep_for(atlas_db *db, atlas_writer *writer, const atlas_syspolicy *pol) {
+    if (db == NULL || writer == NULL || pol == NULL) {
+        return;
+    }
+    /* A12.1 T10 §5: the `_checked` accessor, not the one that reads the field
+     * alone. A policy that parsed only part way -- a well-formed
+     * `memory_reconcile = ENABLED` followed by a line that did not parse --
+     * leaves the field set on a struct whose `state` is LEGACY, and honouring
+     * that half would start a pass that reads documents and writes stored
+     * claims from a policy nobody can read back. */
+    if (!atlas_syspolicy_memory_reconcile_effective_checked(pol)) {
+        return;
+    }
+    memory_sweep_ctx ctx;
+    ctx.db = db;
+    ctx.writer = writer;
+    ctx.pol = pol;
+    atlas_err err;
+    atlas_err_init(&err);
+    (void)atlas_db_repo_list(db, memory_sweep_one, &ctx, &err);
+}
+
+/* A12.1. Decision 10's sweep, on the tick beside `sem_sweep`.
+ *
+ * Throttled by `ATLAS_MEMORY_SWEEP_INTERVAL_MS`, `last_sem_sweep_ms`'s own
+ * shape. The policy is loaded here, once per sweep, for the same reason
+ * `sem_sweep` loads its own once per sweep rather than per repository: it is
+ * a file on disk, the answer is the same for every repository this pass
+ * considers, and re-reading it per repository could see it change halfway
+ * and treat two repositories under two policies. */
+static void memory_sweep(atlas_watcher *w) {
+    int64_t t = now_ms();
+    if (w->last_memory_sweep_ms != 0 &&
+        t - w->last_memory_sweep_ms < ATLAS_MEMORY_SWEEP_INTERVAL_MS) {
+        return;
+    }
+    w->last_memory_sweep_ms = t;
+    if (w->db == NULL || w->writer == NULL) {
+        return;
+    }
+    atlas_syspolicy pol;
+    atlas_syspolicy_load(&pol);
+    atlas_memory_sweep_for(w->db, w->writer, &pol);
+}
+
 static void submit_due(atlas_watcher *w) {
     int64_t t = now_ms();
     expire_moves(w, t);
@@ -3338,6 +3422,19 @@ static void *watcher_main(void *arg) {
          * even been queued would only ever produce that hold. */
         discovery_sweep(w);
         sem_sweep(w);
+        /* A12.1. The *observe* phase reads a source through git directly
+         * (`atlas_memory_read_source`), never through Atlas' own file index --
+         * but the *owed* decision this sweep makes first
+         * (`atlas_memory_plan_for`) compares a REPO_FILE source's already-
+         * materialised hash against `atlas_db_verify_file_hash`, which reads
+         * that same file index. So this sweep holds while the file index is
+         * behind for exactly `sem_sweep`'s reason: an edit that has not yet
+         * reached `files` is invisible to the comparison, and the sweep would
+         * see the old hash and decide nothing is owed. After `submit_due` is
+         * therefore where this belongs, not merely where it is convenient --
+         * convergence at the next tick once reconciliation has caught up, not
+         * immediacy. */
+        memory_sweep(w);
         refresh_stats(w);
     }
 

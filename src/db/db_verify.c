@@ -1638,6 +1638,74 @@ atlas_status atlas_db_verify_result_insert(atlas_db *db, int64_t claim_id,
     return st;
 }
 
+/* A12.1/T12. A plain read beside the insert above -- no clock, no policy, no
+ * verifier. See the header comment for why this is not `atlas_verify_assess`. */
+atlas_status atlas_db_verify_result_latest(atlas_db *db, int64_t claim_id,
+                                           atlas_verify_state *state_out,
+                                           atlas_verify_conflict *conflict_out, bool *stale_out,
+                                           bool *found_out, atlas_err *err) {
+    if (state_out != NULL) {
+        *state_out = ATLAS_VERIFY_UNVERIFIED;
+    }
+    if (conflict_out != NULL) {
+        *conflict_out = ATLAS_CONFLICT_NONE;
+    }
+    if (stale_out != NULL) {
+        *stale_out = false;
+    }
+    if (found_out != NULL) {
+        *found_out = false;
+    }
+    if (db == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "no claim to read a result for");
+    }
+    static const char SQL[] =
+        "SELECT state, conflict, stale FROM verify_results"
+        " WHERE claim_id = ?1 ORDER BY id DESC LIMIT 1;";
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(db, SQL, &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, claim_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the claim id");
+    }
+    int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        const char *state_text = (const char *)sqlite3_column_text(stmt, 0);
+        const char *conflict_text = (const char *)sqlite3_column_text(stmt, 1);
+        atlas_verify_state st_val = ATLAS_VERIFY_UNVERIFIED;
+        atlas_verify_conflict cf_val = ATLAS_CONFLICT_NONE;
+        if (state_text != NULL && !atlas_verify_state_parse(state_text, &st_val)) {
+            atlas_db_finish(db, stmt);
+            return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                                 "a stored verification result names an unrecognised state");
+        }
+        if (conflict_text != NULL && !atlas_verify_conflict_parse(conflict_text, &cf_val)) {
+            atlas_db_finish(db, stmt);
+            return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                                 "a stored verification result names an unrecognised conflict");
+        }
+        if (state_out != NULL) {
+            *state_out = st_val;
+        }
+        if (conflict_out != NULL) {
+            *conflict_out = cf_val;
+        }
+        if (stale_out != NULL) {
+            *stale_out = sqlite3_column_int(stmt, 2) != 0;
+        }
+        if (found_out != NULL) {
+            *found_out = true;
+        }
+    } else if (rc != SQLITE_DONE) {
+        st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot read the stored verification result");
+    }
+    atlas_db_finish(db, stmt);
+    return st;
+}
+
 /* --- the audit row, which is also the warrant ------------------------------ */
 
 atlas_status atlas_db_verify_audit_insert(atlas_db *db, const atlas_verify_audit *a,

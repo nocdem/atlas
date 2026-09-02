@@ -384,6 +384,15 @@ add_library(atlas_core STATIC
   # `atlas_verify_intake_apply_in_tx` — and it is the first real consumer of
   # T4's DOCUMENT channel and T5's conflict producer.
   src/memory/reconcile.c
+  # `pack.c` (T12) is the Canonical Context Pack: build, freeze, freshness,
+  # render, compose. Build reads stored rows plus, when the repository is
+  # dirty, one `atlas_sem_source_identity` call that opens the tree, so it
+  # must run outside any transaction; freeze inserts an already-built struct
+  # and reads nothing, so it runs inside one, beside `atlas_db_orch_memory_
+  # freeze`. It issues no SQL of its own — every read and the one write go
+  # through db_memory.c/db_verify.c, so T17's rule that a memory-table row
+  # insert lives only in db_memory.c holds by construction.
+  src/memory/pack.c
   ${ATLAS_UI_GEN}
 )
 

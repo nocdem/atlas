@@ -940,6 +940,240 @@ atlas_status atlas_db_memory_anchor_claim_uids(atlas_db *db, int64_t repo_id,
     return st;
 }
 
+/* T12. `atlas_db_memory_anchor_claim_uids`' reverse: every anchor recorded
+ * for one claim uid, ordered so two reads over an unchanged set agree byte
+ * for byte. */
+atlas_status atlas_db_memory_anchors_for_claim(atlas_db *db, int64_t repo_id, const char *claim_uid,
+                                               atlas_memory_anchor_tuple_cb cb, void *ctx,
+                                               atlas_err *err) {
+    if (db == NULL || claim_uid == NULL || cb == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "no claim anchor listing to run");
+    }
+    static const char SQL[] =
+        "SELECT kind, value FROM memory_claim_anchors"
+        " WHERE repo_id = ?1 AND claim_uid = ?2 ORDER BY kind, value;";
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(db, SQL, &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, repo_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the repository id");
+    }
+    st = atlas_db_bind_text_opt(db, stmt, 2, claim_uid, err);
+    for (; st == ATLAS_OK;) {
+        int rc = sqlite3_step(stmt);
+        if (rc == SQLITE_DONE) {
+            break;
+        }
+        if (rc != SQLITE_ROW) {
+            st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot read the claim's anchors");
+            break;
+        }
+        const char *kind_name = (const char *)sqlite3_column_text(stmt, 0);
+        const char *value = (const char *)sqlite3_column_text(stmt, 1);
+        atlas_memory_anchor_kind kind = ATLAS_MEMORY_ANCHOR_UNKNOWN;
+        if (kind_name == NULL || !atlas_memory_anchor_kind_parse(kind_name, &kind)) {
+            continue; /* a row this build's vocabulary cannot name is skipped, not fabricated */
+        }
+        st = cb(kind, value != NULL ? value : "", ctx, err);
+        if (st != ATLAS_OK) {
+            break;
+        }
+    }
+    atlas_db_finish(db, stmt);
+    return st;
+}
+
+/* T12. This repository's current total of `memory_unanchored` rows, joined
+ * through the source version each belongs to -- every prior reader of this
+ * table had a `source_version_id` in hand already; this is the first
+ * repository-wide total. */
+atlas_status atlas_db_memory_unanchored_count(atlas_db *db, int64_t repo_id, int64_t *count_out,
+                                              atlas_err *err) {
+    if (count_out != NULL) {
+        *count_out = 0;
+    }
+    if (db == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "no repository to count unanchored candidates for");
+    }
+    static const char SQL[] =
+        "SELECT COUNT(*) FROM memory_unanchored u"
+        " JOIN memory_source_versions v ON v.id = u.source_version_id"
+        " JOIN memory_sources s ON s.id = v.source_id"
+        " WHERE s.repo_id = ?1;";
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(db, SQL, &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, repo_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the repository id");
+    }
+    int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        if (count_out != NULL) {
+            *count_out = sqlite3_column_int64(stmt, 0);
+        }
+    } else {
+        st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot count unanchored candidates");
+    }
+    atlas_db_finish(db, stmt);
+    return st;
+}
+
+/* T12. The one INSERT into `memory_context_packs` -- this file's own rule.
+ * `UNIQUE(run_uid)` does the actual freezing; a second call for the same
+ * run_uid fails on the constraint. `reliance_checked`, `reliance_complete`
+ * and `reliance_claim_uids` take their column defaults, since T13's
+ * completion-time reliance check has nothing to say yet about a run that has
+ * not started. */
+atlas_status atlas_db_memory_pack_insert(atlas_db *db, const char *run_uid,
+                                         const atlas_memory_pack *p, const char *now,
+                                         atlas_err *err) {
+    if (db == NULL || run_uid == NULL || run_uid[0] == '\0' || p == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "no run or pack to freeze");
+    }
+    static const char SQL[] =
+        "INSERT INTO memory_context_packs(run_uid, repo_id, repo_identity_hash, pinned_commit,"
+        "  source_identity, memory_generation, decision_set_digest, source_set_digest,"
+        "  pack_digest, rendered, claim_count, excluded_count, unanchored_count,"
+        "  claims_manifest, flagged_anchors, created_at)"
+        " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16);";
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(db, SQL, &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    st = atlas_db_bind_text_opt(db, stmt, 1, run_uid, err);
+    if (st == ATLAS_OK && sqlite3_bind_int64(stmt, 2, p->repo_id) != SQLITE_OK) {
+        st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the repository id");
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_db_bind_text_opt(db, stmt, 3, atlas_buf_cstr(&p->repo_identity_hash), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_db_bind_text_opt(db, stmt, 4, atlas_buf_cstr(&p->pinned_commit), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_db_bind_text_opt(db, stmt, 5, atlas_buf_cstr(&p->source_identity), err);
+    }
+    if (st == ATLAS_OK && sqlite3_bind_int64(stmt, 6, p->memory_generation) != SQLITE_OK) {
+        st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the memory generation");
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_db_bind_text_opt(db, stmt, 7, atlas_buf_cstr(&p->decision_set_digest), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_db_bind_text_opt(db, stmt, 8, atlas_buf_cstr(&p->source_set_digest), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_db_bind_text_opt(db, stmt, 9, atlas_buf_cstr(&p->pack_digest), err);
+    }
+    if (st == ATLAS_OK &&
+        sqlite3_bind_blob(stmt, 10, p->rendered.data != NULL ? p->rendered.data : "",
+                          (int)p->rendered.len, SQLITE_TRANSIENT) != SQLITE_OK) {
+        st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the rendered pack body");
+    }
+    if (st == ATLAS_OK && sqlite3_bind_int64(stmt, 11, p->claim_count) != SQLITE_OK) {
+        st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the claim count");
+    }
+    if (st == ATLAS_OK && sqlite3_bind_int64(stmt, 12, p->excluded_count) != SQLITE_OK) {
+        st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the excluded count");
+    }
+    if (st == ATLAS_OK && sqlite3_bind_int64(stmt, 13, p->unanchored_count) != SQLITE_OK) {
+        st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the unanchored count");
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_db_bind_text_opt(db, stmt, 14, atlas_buf_cstr(&p->claims_manifest), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_db_bind_text_opt(db, stmt, 15, atlas_buf_cstr(&p->flagged_anchors), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_db_bind_text_opt(db, stmt, 16, now, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_db_step_done(db, stmt, err);
+    } else {
+        atlas_db_finish(db, stmt);
+    }
+    return st;
+}
+
+/* T12. Reads one frozen pack back by its run uid. */
+atlas_status atlas_db_memory_pack_get(atlas_db *db, const char *run_uid, atlas_memory_pack *out,
+                                      bool *found_out, atlas_err *err) {
+    if (found_out != NULL) {
+        *found_out = false;
+    }
+    if (db == NULL || run_uid == NULL || out == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "no pack lookup to run");
+    }
+    atlas_memory_pack_free(out);
+    atlas_memory_pack_init(out);
+    static const char SQL[] =
+        "SELECT repo_id, repo_identity_hash, pinned_commit, source_identity, memory_generation,"
+        "  decision_set_digest, source_set_digest, pack_digest, rendered, claim_count,"
+        "  excluded_count, unanchored_count, claims_manifest, flagged_anchors"
+        " FROM memory_context_packs WHERE run_uid = ?1;";
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(db, SQL, &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    st = atlas_db_bind_text_opt(db, stmt, 1, run_uid, err);
+    if (st != ATLAS_OK) {
+        atlas_db_finish(db, stmt);
+        return st;
+    }
+    int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        out->repo_id = sqlite3_column_int64(stmt, 0);
+        st = take_col(&out->repo_identity_hash, stmt, 1, err);
+        if (st == ATLAS_OK) {
+            st = take_col(&out->pinned_commit, stmt, 2, err);
+        }
+        if (st == ATLAS_OK) {
+            st = take_col(&out->source_identity, stmt, 3, err);
+        }
+        if (st == ATLAS_OK) {
+            out->memory_generation = sqlite3_column_int64(stmt, 4);
+            st = take_col(&out->decision_set_digest, stmt, 5, err);
+        }
+        if (st == ATLAS_OK) {
+            st = take_col(&out->source_set_digest, stmt, 6, err);
+        }
+        if (st == ATLAS_OK) {
+            st = take_col(&out->pack_digest, stmt, 7, err);
+        }
+        if (st == ATLAS_OK) {
+            const void *blob = sqlite3_column_blob(stmt, 8);
+            int blob_len = sqlite3_column_bytes(stmt, 8);
+            st = atlas_buf_set(&out->rendered, blob != NULL ? blob : "",
+                               blob_len > 0 ? (size_t)blob_len : 0u, err);
+        }
+        if (st == ATLAS_OK) {
+            out->claim_count = sqlite3_column_int64(stmt, 9);
+            out->excluded_count = sqlite3_column_int64(stmt, 10);
+            out->unanchored_count = sqlite3_column_int64(stmt, 11);
+            st = take_col(&out->claims_manifest, stmt, 12, err);
+        }
+        if (st == ATLAS_OK) {
+            st = take_col(&out->flagged_anchors, stmt, 13, err);
+        }
+        if (st == ATLAS_OK && found_out != NULL) {
+            *found_out = true;
+        }
+    } else if (rc != SQLITE_DONE) {
+        st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot read the frozen context pack");
+    }
+    atlas_db_finish(db, stmt);
+    return st;
+}
+
 atlas_status atlas_db_memory_claim_diff_last_kind(atlas_db *db, int64_t repo_id, const char *claim_uid,
                                                   atlas_memory_diff_kind *kind_out, bool *found_out,
                                                   atlas_err *err) {

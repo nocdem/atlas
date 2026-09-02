@@ -56,6 +56,7 @@
 #include "atlas/buf.h"
 #include "atlas/error.h"
 #include "atlas/limits.h"
+#include "atlas/sha256.h" /* ATLAS_SHA256_HEX_LEN, for the two digest wrappers below */
 /* For atlas_verify_claim_semantics and atlas_verify_verifier -- T7's
  * proposition carries both, set by resolve() per Decision 4. verify.h does not
  * include this header (checked), so the dependency still runs one way. */
@@ -489,6 +490,30 @@ atlas_status atlas_db_memory_anchor_claim_uids(atlas_db *db, int64_t repo_id,
                                                atlas_memory_anchor_kind kind, const char *value,
                                                atlas_memory_claim_uid_cb cb, void *ctx,
                                                atlas_err *err);
+
+/* T12. Every anchor recorded for one claim uid, in `(kind, value)` order --
+ * the reverse of `atlas_db_memory_anchor_claim_uids` above, and what
+ * `atlas_memory_pack_build` needs to fold a claim's anchor values into its
+ * lexical-overlap text and to find its PATH anchors for `flagged_anchors`.
+ * The order is a total order (there is no third column to break a tie on
+ * otherwise), which is what keeps two builds over an unchanged set of anchor
+ * rows byte-identical. */
+atlas_status atlas_db_memory_anchors_for_claim(atlas_db *db, int64_t repo_id, const char *claim_uid,
+                                               atlas_memory_anchor_tuple_cb cb, void *ctx,
+                                               atlas_err *err);
+
+/* T12. This repository's current total of unanchored candidates
+ * (`memory_unanchored`), joined through the source version each belongs to.
+ * `atlas_memory_pack_build`'s own `unanchored_count`, and not otherwise
+ * exposed: every prior reader of this table had a `source_version_id`
+ * already in hand, and this is the first that wants a repository-wide
+ * total. */
+atlas_status atlas_db_memory_unanchored_count(atlas_db *db, int64_t repo_id, int64_t *count_out,
+                                              atlas_err *err);
+
+/* `atlas_db_memory_pack_insert` and `atlas_db_memory_pack_get` are declared
+ * beside the `atlas_memory_pack` struct they operate on, further down this
+ * file, rather than here -- both need the complete type. */
 
 /* The most recent diff kind ever recorded for one claim uid, across every
  * generation -- never only the last one, because "a claim no event touched
@@ -1107,5 +1132,240 @@ atlas_status atlas_memory_apply_in_tx(atlas_db *db, const atlas_repo_info *repo,
 atlas_status atlas_memory_plan_for(atlas_db *db, const atlas_repo_info *repo,
                                    const atlas_syspolicy *pol, atlas_memory_gen_cause *cause_out,
                                    atlas_err *err);
+
+/* --- T12: two live digests, promoted out of reconcile.c's own file --------
+ *
+ * `atlas_memory_plan_for` already needed a live decision-set digest and a live
+ * source-set digest to compare against the last stored generation, and
+ * `src/memory/reconcile.c` computes both as file-local static helpers
+ * (`compute_decision_set_digest`, `compute_source_set_digest`). T12's pack
+ * needs the *same* two values for the same reason -- a pinned digest is only
+ * comparable against a later reader if both sides derive it the same way, and
+ * a second implementation of a digest that decides staleness is exactly what
+ * A9.2.4 says must not survive. Rather than re-derive either inside pack.c,
+ * these two thin wrappers expose the existing static bodies: the digest logic
+ * has exactly one implementation, in reconcile.c, unchanged; only its
+ * reachability moved. Both are pure DB reads -- `atlas_db_memory_anchor_
+ * distinct` plus `atlas_db_decision_approved_revision` for the first, `atlas_
+ * db_memory_source_find` plus a stored version lookup for the second -- so
+ * both may run inside or outside a transaction; T12's build() calls them
+ * outside one only because the same call also needs `atlas_sem_source_
+ * identity`, which does not share that freedom. */
+atlas_status atlas_memory_decision_set_digest(atlas_db *db, int64_t repo_id,
+                                              char out[ATLAS_SHA256_HEX_LEN + 1], atlas_err *err);
+atlas_status atlas_memory_source_set_digest(atlas_db *db, const atlas_repo_info *repo,
+                                            const atlas_syspolicy *pol,
+                                            char out[ATLAS_SHA256_HEX_LEN + 1], atlas_err *err);
+
+/* --- T12: the Canonical Context Pack ---------------------------------------
+ *
+ * A worker is handed a bounded, frozen excerpt of what Atlas has recorded
+ * about a repository's memory claims -- built once per run, checkable for
+ * staleness on every later read, and rendered the same way every time the same
+ * pinned inputs are asked to produce it.
+ *
+ * **The corrected split.** An earlier draft of this comment described build
+ * and freeze as one claim -- "stored rows only, no process, no file read --
+ * which is what lets the freeze run inside the run-creating submit
+ * transaction" -- and that sentence is true of `atlas_memory_pack_freeze_in_tx`
+ * and false of `atlas_memory_pack_build`. Build fills `source_identity` from
+ * `atlas_sem_source_identity` whenever the repository row says the tree is
+ * dirty, and that function opens the repository root to read every accepted
+ * compilation database (`live_facts`, `src/sem/index.c:92`) -- file I/O, which
+ * A1 forbids inside a write transaction ("no git process and no file read
+ * happens inside a write transaction"). So:
+ *
+ *   - `atlas_memory_pack_build` -- stored rows plus, when the repository row
+ *     says dirty, one `atlas_sem_source_identity` call that opens the tree.
+ *     Must run with **no transaction open**, `atlas_memory_observe`'s own
+ *     rule and for the same reason.
+ *   - `atlas_memory_pack_freeze_in_tx` -- stored rows only, no read, no
+ *     process. It inserts the already-built struct verbatim and belongs
+ *     inside the transaction, beside `atlas_db_orch_memory_freeze`
+ *     (`src/db/db_orch.c`, in `submit_resolve_run`'s root-task branch).
+ *
+ * **Where the seam actually is.** The daemon's writer thread dispatches a
+ * SUBMIT operation through `run_orch()` (`src/daemon/writer.c`, around line
+ * 1192), which calls `atlas_orch_apply(w->db, j->orch, ...)` directly --  and
+ * `atlas_orch_apply` opens its transaction on the first line and closes it on
+ * the last. There is no point *inside* that dispatch, once the operation has
+ * reached the writer thread, at which a file-reading build could run without
+ * moving it inside the transaction it opens. The seam this layer needs is one
+ * step earlier: `run_orch()` itself, before it calls `atlas_orch_apply`, is a
+ * point on the writer thread with no transaction open and `w->db` already in
+ * hand -- exactly the shape `atlas_memory_observe` already uses one layer
+ * over. Wiring a root-task SUBMIT to call `atlas_memory_pack_build` there and
+ * carry the result into `op_submit`'s transaction for `atlas_memory_pack_
+ * freeze_in_tx` to consume is T13's task, not this one; this header records
+ * the finding so T13 does not have to re-derive it.
+ *
+ * **Both bounds are refused, never trimmed.** `ATLAS_MEMORY_PACK_MAX_CLAIMS`
+ * and `ATLAS_MEMORY_PACK_MAX_BYTES` (`include/atlas/limits.h`) govern the
+ * relevant set and the rendered body. A relevant-candidate count or a rendered
+ * size over either bound is a refusal from `atlas_memory_pack_build`, not a
+ * silent truncation -- `limits.h`'s own comment: a worker must never be shown
+ * a pack that silently omits the claim its task turned on.
+ *
+ * **Relevance is never recency.** Deterministic lexical overlap between the
+ * task's tokens and a claim's text plus its anchor values, A10.1's own
+ * discipline (`src/orch/memory.c`) applied to claims instead of run goals: a
+ * candidate with no shared token is never selected, whatever else is true of
+ * it, and two arms of a comparison must differ by exactly the package's bytes,
+ * never by which claim happened to be newest.
+ *
+ * **`compose` appends nothing for an absent piece.** Not a shorter section,
+ * not a sentence saying there is none -- A10.1's `OFF` rule verbatim, and the
+ * reason is the same: two arms of a comparison must differ by exactly the
+ * appended bytes. */
+typedef struct atlas_memory_pack {
+    int64_t repo_id;
+    /* The six pinned inputs freshness compares against. `pinned_commit` and
+     * `source_identity` may legitimately be empty (an unborn HEAD; a clean
+     * tree) -- an empty stored value never makes a pack stale, A9.2.3's rule
+     * carried over unchanged. `decision_set_digest` and `source_set_digest`
+     * are always populated, even over zero registered sources or zero
+     * DECISION anchors: a digest over an empty set is still a value, and
+     * comparing it is still meaningful. */
+    atlas_buf repo_identity_hash;
+    atlas_buf pinned_commit;
+    atlas_buf source_identity;
+    int64_t memory_generation;
+    atlas_buf decision_set_digest;
+    atlas_buf source_set_digest;
+
+    /* The frozen body and its digest. `rendered` carries the fixed Atlas
+     * preamble, the selected claims and the fixed postamble -- never the
+     * delivery-time status line, which `atlas_memory_pack_compose` adds
+     * separately so the stored bytes stay independent of when they are read.
+     * `pack_digest` is sha256(rendered), hex. */
+    atlas_buf rendered;
+    atlas_buf pack_digest;
+
+    /* `claim_count` is the size of the relevant set actually rendered.
+     * `excluded_count` counts claims that were *not* selected (zero lexical
+     * overlap with the task) whose stored verification state or conflict
+     * needed attention regardless -- reported and dropped, never gated on,
+     * A10.1's "unrelated stale material" rule. `unanchored_count` is this
+     * repository's current total of candidates that resolved no anchor at
+     * all (`memory_unanchored`), carried through for the same reason a
+     * generation reports it. */
+    int64_t claim_count;
+    int64_t excluded_count;
+    int64_t unanchored_count;
+
+    /* Netstring-encoded (M23's manifest shape: `<n>:` then `n` `<len>:
+     * bytes,` records). `claims_manifest` is `claim_count` triples of
+     * (claim uid, stored verification state name, "1"/"0" flagged), in the
+     * pack's own rendered order. `flagged_anchors` is one triple (claim uid,
+     * "PATH", anchor value) per PATH anchor belonging to a flagged claim in
+     * the relevant set -- the reliance check's own input, and the reason a
+     * SYMBOL- or DECISION-only flagged claim contributes nothing here. */
+    atlas_buf claims_manifest;
+    atlas_buf flagged_anchors;
+} atlas_memory_pack;
+
+void atlas_memory_pack_init(atlas_memory_pack *p);
+void atlas_memory_pack_free(atlas_memory_pack *p);
+
+/* T12. The row insert for `memory_context_packs`, called by `atlas_
+ * memory_pack_freeze_in_tx` and by nothing else -- `db_memory.c`'s own file
+ * header states it is the only production writer of a `memory_*` table, and
+ * T17's grep is what proves it. `UNIQUE(run_uid)` is the freeze; a second
+ * call for the same run_uid fails on the constraint rather than replacing
+ * the row. `reliance_checked`, `reliance_complete` and `reliance_claim_uids`
+ * take their column defaults (0, 1, '') -- T13's reliance check writes them
+ * later, in the completion transaction, and this call has nothing to say
+ * about a run that has not started. */
+atlas_status atlas_db_memory_pack_insert(atlas_db *db, const char *run_uid,
+                                         const atlas_memory_pack *p, const char *now,
+                                         atlas_err *err);
+
+/* T12. Reads one frozen pack back by its run uid -- what a later reader
+ * (a delivery-time freshness check, `atlas memory pack --run UID`) needs
+ * instead of re-running `atlas_memory_pack_build`, which would ask a
+ * possibly-moved database a question about the present rather than reporting
+ * what was frozen. `*found_out` is false and `*out` is left freshly
+ * initialised when no such run has a pack. */
+atlas_status atlas_db_memory_pack_get(atlas_db *db, const char *run_uid, atlas_memory_pack *out,
+                                      bool *found_out, atlas_err *err);
+
+/* Builds a pack for the given repository's *current* state, deterministically:
+ * the same stored rows and the same live reads (an unmoved dirty flag, an
+ * unmoved `files` table) produce byte-identical `rendered` and an equal
+ * `pack_digest`, whatever order the underlying claim rows happen to be
+ * returned in -- the sort is a total order (overlap descending, claim id
+ * ascending) with no tie left to chance.
+ *
+ * `pol` supplies the registered memory sources `atlas_memory_source_set_
+ * digest` needs -- the same requirement `atlas_memory_observe` and `atlas_
+ * memory_plan_for` already carry, and not present in an earlier draft of this
+ * signature; disclosed in the T12 report as the one deviation from the plan's
+ * literal interface.
+ *
+ * Refuses (does not truncate) when more than `ATLAS_MEMORY_PACK_MAX_CLAIMS`
+ * claims have positive lexical overlap with `task_text`, or when the rendered
+ * body would exceed `ATLAS_MEMORY_PACK_MAX_BYTES`. Must be called with **no
+ * transaction open** -- see the section comment above. */
+atlas_status atlas_memory_pack_build(atlas_db *db, int64_t repo_id, const atlas_syspolicy *pol,
+                                     const char *task_text, atlas_memory_pack *out, atlas_err *err);
+
+/* Inserts an already-built pack under `UNIQUE(run_uid)` -- the freeze, and the
+ * only thing that makes it one: a second call for the same run_uid is refused
+ * by the constraint rather than replacing what an already-leased task may have
+ * been shown. Stored rows only in the sense that matters for A1: this function
+ * itself reads nothing and asks nothing of git or the filesystem, so it may run
+ * inside the transaction that creates the run, beside `atlas_db_orch_memory_
+ * freeze`. The row insert itself lives in `atlas_db_
+ * memory_pack_insert` (`src/db/db_memory.c`), which this function calls --
+ * `db_memory.c`'s own file header states it is the only production writer of
+ * a `memory_*` table, and T17's grep is what proves it. */
+atlas_status atlas_memory_pack_freeze_in_tx(atlas_db *db, const char *run_uid,
+                                            const atlas_memory_pack *p, atlas_err *err);
+
+/* Recomputed on every read; nothing cached, no dirty bit -- A6's rule. Compares
+ * each of the six pinned inputs against a freshly read or freshly derived live
+ * value, in this order: repository identity, indexed commit, memory
+ * generation, decision-set digest, source-set digest, then -- broadest and
+ * last, `atlas_sem_freshness_of`'s own ordering argument -- the live source
+ * identity, compared only when both the pinned and the live values are
+ * non-empty (an empty value on either side pins nothing, A9.2.3's rule
+ * unchanged). `*out` is `ATLAS_MEMORY_PACK_CURRENT` when none of the six has
+ * moved.
+ *
+ * On `ATLAS_MEMORY_PACK_STALE`, `which_moved` is reset and filled with
+ * `STALE:<NAME>` for the *first* of the six (in the order above) found to have
+ * moved -- one of `STALE:REPO_IDENTITY`, `STALE:COMMIT`, `STALE:GENERATION`,
+ * `STALE:DECISION_SET`, `STALE:SOURCE_SET`, `STALE:SOURCE_IDENTITY`. On
+ * `ATLAS_MEMORY_PACK_CURRENT`, `which_moved` is reset and left empty.
+ *
+ * `pol` is needed for the same reason `atlas_memory_pack_build` needs it: the
+ * live source-set digest is not derivable without the registered source list.
+ * This function reads the repository row and, when it is dirty, opens the
+ * tree (`atlas_sem_source_identity`) -- never called from inside a
+ * transaction anywhere in this codebase, and it must not be. */
+atlas_status atlas_memory_pack_freshness(atlas_db *db, const atlas_syspolicy *pol,
+                                         const atlas_memory_pack *p,
+                                         atlas_memory_pack_status *out, atlas_buf *which_moved,
+                                         atlas_err *err);
+
+/* Renders the body (the stored form, with no status line) -- a copy of
+ * `p->rendered`. Its own function, rather than a caller reaching into the
+ * struct directly, so a pack materialised from a freshly stored row (`atlas_
+ * db_memory_pack_get`) and one still in hand from `atlas_memory_pack_build`
+ * are read through one implementation. */
+atlas_status atlas_memory_pack_render(const atlas_memory_pack *p, atlas_buf *out, atlas_err *err);
+
+/* The one composer: task, then an optional A10.1 cross-run memory package
+ * (blank-line separated, `atlas_orch_memory_compose`'s own shape), then an
+ * optional pack section carrying its delivery-time `status_line` ahead of
+ * `pack_body`. Appends nothing for an absent piece -- not a shorter section,
+ * not a sentence saying there is none: `memory_package == NULL` and `pack_body
+ * == NULL` (or either empty) each contribute zero bytes, independently, so
+ * `atlas_memory_pack_compose(task, NULL, NULL, NULL)` returns `task` byte for
+ * byte. `status_line` is never shown when `pack_body` is absent -- a status
+ * line with nothing to describe is not a piece of its own. */
+atlas_status atlas_memory_pack_compose(const char *task, const char *memory_package,
+                                       const char *status_line, const char *pack_body,
+                                       atlas_buf *out, atlas_err *err);
 
 #endif /* ATLAS_MEMORY_H */

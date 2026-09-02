@@ -1864,6 +1864,29 @@ atlas_status atlas_db_verify_result_insert(atlas_db *db, int64_t claim_id,
                                            const atlas_verify_truth_record *truth, const char *now,
                                            int64_t *id_out, atlas_err *err);
 
+/* A12.1/T12. The most recently inserted `verify_results` row for one claim --
+ * `state` and `conflict`, the two columns Decision 8's Canonical Context Pack
+ * flags a claim on. Deliberately *not* `atlas_verify_assess`: that function
+ * runs live (a root-owned policy, a deterministic verifier, a `stale_before`
+ * instant derived from the clock), so calling it twice over an unchanged
+ * database is not guaranteed to answer twice alike, and a pack build must be
+ * deterministic. This is a plain read of history already written -- `atlas_
+ * verify_autolifecycle_run`'s own row, beside its own insert -- with no clock
+ * and no policy anywhere in it.
+ *
+ * `*found_out` is false when this claim has no stored result at all, which is
+ * the ordinary state for a claim nothing has ever run `EVALUATE` against: A9.2
+ * creates a claim UNVERIFIED (the zero) and writes no row for it until
+ * something asks. A caller that wants "the state, treating no-row as
+ * UNVERIFIED" reads `*found_out == false` as `ATLAS_VERIFY_UNVERIFIED` -- the
+ * same value the zero-initialised enum already carries, so a caller that
+ * forgets to check `found_out` degrades to the honest answer rather than a
+ * wrong one. */
+atlas_status atlas_db_verify_result_latest(atlas_db *db, int64_t claim_id,
+                                           atlas_verify_state *state_out,
+                                           atlas_verify_conflict *conflict_out, bool *stale_out,
+                                           bool *found_out, atlas_err *err);
+
 atlas_status atlas_db_verify_audit_insert(atlas_db *db, const atlas_verify_audit *a,
                                           const char *now, int64_t *id_out, atlas_err *err);
 

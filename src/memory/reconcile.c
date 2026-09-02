@@ -1680,6 +1680,23 @@ static atlas_status compute_source_set_digest(atlas_db *db, const atlas_repo_inf
     return ATLAS_OK;
 }
 
+/* T12. Two thin, non-static wrappers over the two static bodies just above --
+ * declared in `include/atlas/memory.h` so `src/memory/pack.c` can pin and
+ * later re-derive the same two digests `atlas_memory_plan_for` already
+ * compares against a generation row. The digest logic itself has exactly one
+ * implementation, unchanged, in this file; only its reachability moved. See
+ * the header comment for the full argument. */
+atlas_status atlas_memory_decision_set_digest(atlas_db *db, int64_t repo_id,
+                                              char out[ATLAS_SHA256_HEX_LEN + 1], atlas_err *err) {
+    return compute_decision_set_digest(db, repo_id, out, err);
+}
+
+atlas_status atlas_memory_source_set_digest(atlas_db *db, const atlas_repo_info *repo,
+                                            const atlas_syspolicy *pol,
+                                            char out[ATLAS_SHA256_HEX_LEN + 1], atlas_err *err) {
+    return compute_source_set_digest(db, repo, pol, out, err);
+}
+
 /* Decision 7's own precedence, applied to what actually moved rather than
  * asserted: the first of SOURCE_REVISION, DECISION_REVISION, COMMIT whose own
  * signal differs from the last stored generation. `!have_last` -- this

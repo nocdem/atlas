@@ -201,6 +201,11 @@ set(ATLAS_TESTS
   # "integration" beside test_verify_engine, which builds its fixtures the
   # same way.
   test_memory_anchor
+  # T12: the Canonical Context Pack, against a real git repository and a
+  # fixture database -- build, freeze, freshness (all six pinned inputs moved
+  # in turn), relevance that is never recency, and the two refusal bounds.
+  # "integration" beside test_memory_anchor, for the same reason.
+  test_memory_pack
   # --- P0: the large-repository watcher ---
   #
   # The budget, its accounting and the bound each refusal names, driven against a
@@ -280,7 +285,7 @@ set_tests_properties(test_registry PROPERTIES LABELS "daemon")
 set_tests_properties(test_ops PROPERTIES LABELS "daemon")
 set_tests_properties(test_scan test_search test_diff test_worktree test_cli test_terminal test_code_graph test_code_compdb
   test_code_analyzer test_git_hardening test_reconcile test_repo_scanner test_scanner_rpc test_mirror_source
-  test_memory_anchor
+  test_memory_anchor test_memory_pack
   PROPERTIES LABELS "integration")
 # A12.1 T11 added a case that forks a real daemon (the restart-survival test),
 # so this suite is no longer daemon-free like its siblings above -- "daemon" is

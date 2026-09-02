@@ -16,12 +16,23 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
+#include <sqlite3.h>
+
 #include "atlas/atlas.h"
+#include "atlas/datadir.h"
+#include "atlas/db.h"
+#include "atlas/decision.h"
 #include "atlas/memory.h"
 #include "atlas/mirror.h"
+#include "atlas/syspolicy.h"
+#include "atlas/verify.h"
+#include "atlas/verify_ops.h"
+#include "atlas/verifypolicy.h"
 #include "atlas_test.h"
+#include "db/db_internal.h"
 #include "support/fixture.h"
 
 /* A row naming no scanner -- scanner_uid == 0, migration 27's default -- so
@@ -693,6 +704,902 @@ static void test_read_external_refuses_a_symlink(void) {
     fx_close(&fx);
 }
 
+/* --- T8: the pass -----------------------------------------------------------
+ *
+ * Unlike the read tests above, T8's own tests need a real database with real
+ * rows: `atlas_memory_apply_in_tx` resolves anchors against `files`, binds a
+ * claim to `repositories.scanned_head`, and writes through
+ * `atlas_verify_intake_apply_in_tx`. `t8env` builds both halves and keeps
+ * them consistent -- a real git repository for the observe phase to read
+ * (T6's own fixture shape), and a registered repository row, a matching
+ * `commits` row and `files` rows for whatever the pass needs to look up
+ * (`test_memory_anchor.c`'s own fixture shape) for the apply phase. */
+typedef struct t8env {
+    fixture fx;
+    atlas_buf db_path;
+    atlas_db *db;
+    int64_t repo_id;
+    atlas_repo_info repo;
+} t8env;
+
+static void t8_head(t8env *e, atlas_buf *out, atlas_err *err) {
+    const char *rev[] = {"rev-parse", "HEAD"};
+    atlas_buf raw = ATLAS_BUF_INIT;
+    int code = -1;
+    T_OK(fx_git(&e->fx, fx_repo(&e->fx), rev, 2u, &code, &raw, err), err);
+    T_REQUIRE(code == 0);
+    size_t n = raw.len;
+    while (n > 0 && (raw.data[n - 1u] == '\n' || raw.data[n - 1u] == '\r')) {
+        n--;
+    }
+    T_OK(atlas_buf_set(out, raw.data, n, err), err);
+    atlas_buf_free(&raw);
+    T_REQUIRE(out->len > 0);
+}
+
+/* `test_verify_intake.c`'s own seed_file, reused: a row in `files` is what
+ * lets a backtick token resolve as a PATH anchor and what lets a memory
+ * source's own path pass EVIDENCE_ADD's index lookup. The hash is never
+ * checked against real content anywhere T8's own pass runs (T8 never asks
+ * `atlas.content_hash` to verify), so an arbitrary hex string is honest. */
+static void t8_seed_file(t8env *e, const char *path, const char *hash, atlas_err *err) {
+    atlas_buf sql = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_appendf(&sql, err,
+                           "INSERT INTO scans(repo_id, started_at, status)"
+                           "  VALUES(%lld, '2026-01-01T00:00:00Z', 'ok');"
+                           "INSERT INTO files(repo_id, path_raw, path_text, file_type,"
+                           "  content_hash, first_seen_scan_id, last_seen_scan_id,"
+                           "  first_seen_at, last_seen_at)"
+                           "  VALUES(%lld, CAST('%s' AS BLOB), '%s', 'regular', '%s',"
+                           "         last_insert_rowid(), last_insert_rowid(),"
+                           "         '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');",
+                           (long long)e->repo_id, (long long)e->repo_id, path, path, hash),
+         err);
+    T_OK(atlas_db_exec_sql(e->db, atlas_buf_cstr(&sql), err), err);
+    atlas_buf_free(&sql);
+}
+
+static void t8_env_open(t8env *e, atlas_err *err) {
+    memset(e, 0, sizeof *e);
+    atlas_repo_info_init(&e->repo);
+    atlas_buf_init(&e->db_path);
+    T_REQUIRE(fx_open(&e->fx, err) == ATLAS_OK);
+    T_OK(fx_init_repo(&e->fx, fx_repo(&e->fx), NULL, err), err);
+    T_OK(atlas_buf_appendf(&e->db_path, err, "%s/atlas.db", fx_data_dir(&e->fx)), err);
+    T_OK(atlas_datadir_ensure(fx_data_dir(&e->fx), err), err);
+    T_OK(atlas_db_open(atlas_buf_cstr(&e->db_path), &e->db, err), err);
+    T_OK(atlas_db_migrate(e->db, err), err);
+
+    atlas_buf common = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_appendf(&common, err, "%s/.git", fx_repo(&e->fx)), err);
+    atlas_repo_identity id;
+    memset(&id, 0, sizeof id);
+    id.root = fx_repo(&e->fx);
+    id.root_len = strlen(id.root);
+    id.common_dir = atlas_buf_cstr(&common);
+    id.common_dir_len = common.len;
+    id.git_dir = id.common_dir;
+    id.git_dir_len = id.common_dir_len;
+    id.object_format = "sha1";
+    T_OK(atlas_db_repo_add(e->db, "proj", &id, &e->repo_id, err), err);
+    atlas_buf_free(&common);
+}
+
+/* Binds the repository's own `scanned_head` (and a matching `commits` row) to
+ * the real repository's current HEAD, then refetches `e->repo` so the struct
+ * the pass reads matches what was just bound -- CLAIM_CREATE's `bind_commit`
+ * defaults an empty `basis_commit` to `scanned_head` with no existence check,
+ * but EVIDENCE_ADD re-derives its own commit from the claim's (now non-empty)
+ * `basis_commit`, which *is* checked against `commits`. Called again after
+ * every commit that should move what a fresh pass binds to. */
+static void t8_bind_head(t8env *e, atlas_err *err) {
+    atlas_buf head = ATLAS_BUF_INIT;
+    t8_head(e, &head, err);
+    atlas_buf sql = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_appendf(&sql, err,
+                           "INSERT INTO commits(repo_id, oid, parent_count) VALUES(%lld, '%s', 0);"
+                           "UPDATE repositories SET scanned_head = '%s' WHERE id = %lld;",
+                           (long long)e->repo_id, atlas_buf_cstr(&head), atlas_buf_cstr(&head),
+                           (long long)e->repo_id),
+         err);
+    T_OK(atlas_db_exec_sql(e->db, atlas_buf_cstr(&sql), err), err);
+    atlas_buf_free(&sql);
+    atlas_buf_free(&head);
+
+    bool found = false;
+    atlas_repo_info_free(&e->repo);
+    atlas_repo_info_init(&e->repo);
+    T_OK(atlas_db_repo_get(e->db, "proj", &e->repo, &found, err), err);
+    T_REQUIRE(found);
+}
+
+static void t8_env_close(t8env *e) {
+    atlas_repo_info_free(&e->repo);
+    atlas_db_close(e->db);
+    atlas_buf_free(&e->db_path);
+    fx_close(&e->fx);
+}
+
+static void t8_policy(atlas_syspolicy *pol, atlas_memory_source_class cls, const char *const *paths,
+                      size_t n) {
+    memset(pol, 0, sizeof *pol);
+    pol->state = ATLAS_SYSPOLICY_SYSTEM;
+    pol->memory_source_count = n;
+    for (size_t i = 0; i < n; i++) {
+        pol->memory_sources[i].cls = cls;
+        pol->memory_sources[i].repo_name[0] = '\0';
+        (void)snprintf(pol->memory_sources[i].path, sizeof pol->memory_sources[i].path, "%s",
+                       paths[i]);
+    }
+}
+
+static int64_t t8_scalar(t8env *e, const char *sql, atlas_err *err) {
+    sqlite3_stmt *stmt = NULL;
+    T_OK(atlas_db_prepare(e->db, sql, &stmt, err), err);
+    int64_t v = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        v = sqlite3_column_int64(stmt, 0);
+    }
+    atlas_db_finish(e->db, stmt);
+    return v;
+}
+
+/* Runs one full pass: observe with no transaction open, then apply inside
+ * one -- Decision 9, driven exactly as T10's writer job will drive it. */
+static void t8_run_pass(t8env *e, const atlas_syspolicy *pol, atlas_memory_pass_result *result,
+                        atlas_err *err) {
+    char now[64];
+    atlas_now_iso8601(now, sizeof now);
+
+    atlas_memory_observation *obs = malloc(sizeof *obs);
+    T_REQUIRE(obs != NULL);
+    T_CHECK_MSG(!atlas_db_in_transaction(e->db),
+                "observe must be called with no transaction already open");
+    T_OK(atlas_memory_observe(e->db, &e->repo, fx_data_dir(&e->fx), pol, obs, err), err);
+    T_CHECK_MSG(!atlas_db_in_transaction(e->db),
+                "atlas_memory_observe left a transaction open on the handle it was given");
+
+    T_OK(atlas_db_begin(e->db, err), err);
+    T_OK(atlas_memory_apply_in_tx(e->db, &e->repo, obs, pol, now, result, err), err);
+    T_OK(atlas_db_commit(e->db, err), err);
+
+    atlas_memory_observation_free(obs);
+    free(obs);
+}
+
+/* (a) acceptance item 1: two sources carrying the byte-identical bullet
+ * collapse to one claim, two independently-readable attestations naming
+ * their own source actor, two evidence rows (one per source's own path), and
+ * -- Decision 2's whole point -- one independent group once the aggregate is
+ * computed. */
+static void test_pass_collapses_duplicate_source_text(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    t8env e;
+    t8_env_open(&e, &err);
+
+    const char *repo = fx_repo(&e.fx);
+    const char *bullet = "the daemon reads `src/db/db_orch.c`";
+    T_OK(fx_mkdir(repo, "src", &err), &err);
+    T_OK(fx_mkdir(repo, "src/db", &err), &err);
+    T_OK(fx_write(repo, "src/db/db_orch.c", "int x;\n", &err), &err);
+    T_OK(fx_write(repo, "note-a.md", bullet, &err), &err);
+    T_OK(fx_write(repo, "note-b.md", bullet, &err), &err);
+    T_OK(fx_add_all(&e.fx, repo, &err), &err);
+    T_OK(fx_commit(&e.fx, repo, "seed", &err), &err);
+    t8_bind_head(&e, &err);
+    t8_seed_file(&e, "src/db/db_orch.c", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                &err);
+    t8_seed_file(&e, "note-a.md", "1111111111111111111111111111111111111111111111111111111111111111",
+                &err);
+    t8_seed_file(&e, "note-b.md", "2222222222222222222222222222222222222222222222222222222222222222",
+                &err);
+
+    const char *paths[] = {"note-a.md", "note-b.md"};
+    atlas_syspolicy pol;
+    t8_policy(&pol, ATLAS_MEMORY_SOURCE_REPO_FILE, paths, 2);
+
+    atlas_memory_pass_result result;
+    t8_run_pass(&e, &pol, &result, &err);
+
+    T_CHECK_MSG(result.claims_created == 1, "expected 1 new claim, got %zu", result.claims_created);
+    T_CHECK_MSG(result.claims_resolved == 1, "expected 1 resolved duplicate claim, got %zu",
+                result.claims_resolved);
+    T_CHECK_MSG(result.generation != 0, "expected a generation to be appended");
+
+    char sql[256];
+    (void)snprintf(sql, sizeof sql, "SELECT COUNT(*) FROM verify_claims WHERE repo_id = %lld;",
+                  (long long)e.repo_id);
+    T_CHECK_MSG(t8_scalar(&e, sql, &err) == 1, "expected exactly one stored claim");
+    (void)snprintf(sql, sizeof sql, "SELECT COUNT(*) FROM verify_evidence WHERE repo_id = %lld;",
+                  (long long)e.repo_id);
+    T_CHECK_MSG(t8_scalar(&e, sql, &err) == 2, "expected exactly two evidence rows");
+    (void)snprintf(sql, sizeof sql,
+                  "SELECT COUNT(*) FROM verify_attestations a"
+                  " JOIN verify_claims c ON c.id = a.claim_id WHERE c.repo_id = %lld;",
+                  (long long)e.repo_id);
+    T_CHECK_MSG(t8_scalar(&e, sql, &err) == 2, "expected exactly two attestations");
+    (void)snprintf(sql, sizeof sql,
+                  "SELECT COUNT(DISTINCT a.actor_id) FROM verify_attestations a"
+                  " JOIN verify_claims c ON c.id = a.claim_id WHERE c.repo_id = %lld;",
+                  (long long)e.repo_id);
+    T_CHECK_MSG(t8_scalar(&e, sql, &err) == 2,
+                "expected each attestation to name its own source's actor");
+
+    /* Drive the aggregate the way an operator's own `verify evaluate` would,
+     * to prove the DEPENDENCY_ADD edge the pass wrote actually collapses the
+     * union-find rather than merely existing as a row nobody reads. */
+    char claim_uid[128];
+    {
+        sqlite3_stmt *stmt = NULL;
+        (void)snprintf(sql, sizeof sql, "SELECT uid FROM verify_claims WHERE repo_id = %lld LIMIT 1;",
+                      (long long)e.repo_id);
+        T_OK(atlas_db_prepare(e.db, sql, &stmt, &err), &err);
+        T_REQUIRE(sqlite3_step(stmt) == SQLITE_ROW);
+        (void)snprintf(claim_uid, sizeof claim_uid, "%s", (const char *)sqlite3_column_text(stmt, 0));
+        atlas_db_finish(e.db, stmt);
+    }
+    atlas_verify_op eval_op;
+    atlas_verify_op_init(&eval_op);
+    eval_op.kind = ATLAS_VERIFY_OP_EVALUATE;
+    eval_op.channel = ATLAS_VERIFY_CHANNEL_OPERATOR;
+    T_OK(atlas_buf_set_str(&eval_op.claim_uid, claim_uid, &err), &err);
+    atlas_verify_intake_result eval_res;
+    atlas_verify_intake_result_init(&eval_res);
+    T_OK(atlas_db_begin(e.db, &err), &err);
+    T_OK(atlas_verify_intake_apply_in_tx(e.db, &eval_op, &eval_res, &err), &err);
+    T_OK(atlas_db_commit(e.db, &err), &err);
+    T_CHECK_MSG(eval_res.assessment.aggregate.independent_groups == 1,
+                "expected one independent group after the dependency edge, got %d",
+                eval_res.assessment.aggregate.independent_groups);
+    atlas_verify_intake_result_free(&eval_res);
+    atlas_verify_op_free(&eval_op);
+
+    t8_env_close(&e);
+}
+
+/* (b) three copies of one assertion -- two current, one from an older
+ * version of a source -- retain three readable provenances. Two passes: the
+ * first registers one source and reconciles it while the bullet is its only
+ * content; the second edits that source (the bullet survives, unrelated
+ * content is added) and registers a second source carrying the same bullet
+ * from the start, then reconciles again over a moved HEAD. Nothing from the
+ * first pass is touched by the second -- the claim it wrote is bound to a
+ * commit the second pass's own claim is not. */
+static void test_pass_retains_provenance_across_versions(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    t8env e;
+    t8_env_open(&e, &err);
+
+    const char *repo = fx_repo(&e.fx);
+    const char *bullet = "the daemon reads `src/db/db_orch.c`";
+    T_OK(fx_mkdir(repo, "src", &err), &err);
+    T_OK(fx_mkdir(repo, "src/db", &err), &err);
+    T_OK(fx_write(repo, "src/db/db_orch.c", "int x;\n", &err), &err);
+    T_OK(fx_write(repo, "note-a.md", bullet, &err), &err);
+    T_OK(fx_add_all(&e.fx, repo, &err), &err);
+    T_OK(fx_commit(&e.fx, repo, "v1", &err), &err);
+    t8_bind_head(&e, &err);
+    t8_seed_file(&e, "src/db/db_orch.c", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                &err);
+    t8_seed_file(&e, "note-a.md", "1111111111111111111111111111111111111111111111111111111111111111",
+                &err);
+
+    const char *paths1[] = {"note-a.md"};
+    atlas_syspolicy pol1;
+    t8_policy(&pol1, ATLAS_MEMORY_SOURCE_REPO_FILE, paths1, 1);
+    atlas_memory_pass_result r1;
+    t8_run_pass(&e, &pol1, &r1, &err);
+    T_CHECK_MSG(r1.claims_created == 1, "pass 1: expected one new claim");
+
+    /* note-a.md's content moves (the bullet survives) and note-b.md joins
+     * with the same bullet from the start, all under a new commit -- a moved
+     * HEAD, which is what makes pass 2's claim a genuinely different one. */
+    char buf[256];
+    /* A blank line, so the bullet stays its own paragraph candidate --
+     * byte-identical to note-b.md's -- rather than merging with the second
+     * line into one bigger candidate neither source shares. */
+    (void)snprintf(buf, sizeof buf, "%s\n\nan unrelated second line\n", bullet);
+    T_OK(fx_write(repo, "note-a.md", buf, &err), &err);
+    T_OK(fx_write(repo, "note-b.md", bullet, &err), &err);
+    T_OK(fx_add_all(&e.fx, repo, &err), &err);
+    T_OK(fx_commit(&e.fx, repo, "v2", &err), &err);
+    t8_bind_head(&e, &err);
+    t8_seed_file(&e, "note-b.md", "3333333333333333333333333333333333333333333333333333333333333333",
+                &err);
+    /* note-a.md's own row must describe *this* commit's content for the
+     * index lookup EVIDENCE_ADD performs; the hash value itself is never
+     * checked against real bytes anywhere T8 runs. */
+    (void)snprintf(buf, sizeof buf,
+                  "UPDATE files SET content_hash = "
+                  "'4444444444444444444444444444444444444444444444444444444444444444' "
+                  "WHERE repo_id = %lld AND path_text = 'note-a.md';",
+                  (long long)e.repo_id);
+    T_OK(atlas_db_exec_sql(e.db, buf, &err), &err);
+
+    const char *paths2[] = {"note-a.md", "note-b.md"};
+    atlas_syspolicy pol2;
+    t8_policy(&pol2, ATLAS_MEMORY_SOURCE_REPO_FILE, paths2, 2);
+    atlas_memory_pass_result r2;
+    t8_run_pass(&e, &pol2, &r2, &err);
+    T_CHECK_MSG(r2.claims_created == 1,
+                "pass 2: expected exactly one new claim (a moved basis_commit), got %zu",
+                r2.claims_created);
+    T_CHECK_MSG(r2.claims_resolved == 1, "pass 2: expected note-b.md to resolve to pass 2's claim");
+
+    char sql[256];
+    (void)snprintf(sql, sizeof sql, "SELECT COUNT(*) FROM verify_claims WHERE repo_id = %lld;",
+                  (long long)e.repo_id);
+    T_CHECK_MSG(t8_scalar(&e, sql, &err) == 2,
+                "expected two claims: the first pass's and the second pass's");
+    (void)snprintf(sql, sizeof sql, "SELECT COUNT(*) FROM verify_evidence WHERE repo_id = %lld;",
+                  (long long)e.repo_id);
+    T_CHECK_MSG(t8_scalar(&e, sql, &err) == 3,
+                "expected three evidence rows: pass 1's, and pass 2's two");
+
+    t8_env_close(&e);
+}
+
+/* (c) a second pass over unchanged bytes writes nothing new and appends no
+ * generation. */
+static void test_pass_over_unchanged_bytes_is_a_no_op(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    t8env e;
+    t8_env_open(&e, &err);
+
+    const char *repo = fx_repo(&e.fx);
+    const char *bullet = "the daemon reads `src/db/db_orch.c`";
+    T_OK(fx_mkdir(repo, "src", &err), &err);
+    T_OK(fx_mkdir(repo, "src/db", &err), &err);
+    T_OK(fx_write(repo, "src/db/db_orch.c", "int x;\n", &err), &err);
+    T_OK(fx_write(repo, "note-a.md", bullet, &err), &err);
+    T_OK(fx_add_all(&e.fx, repo, &err), &err);
+    T_OK(fx_commit(&e.fx, repo, "seed", &err), &err);
+    t8_bind_head(&e, &err);
+    t8_seed_file(&e, "src/db/db_orch.c", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                &err);
+    t8_seed_file(&e, "note-a.md", "1111111111111111111111111111111111111111111111111111111111111111",
+                &err);
+
+    const char *paths[] = {"note-a.md"};
+    atlas_syspolicy pol;
+    t8_policy(&pol, ATLAS_MEMORY_SOURCE_REPO_FILE, paths, 1);
+
+    atlas_memory_pass_result r1;
+    t8_run_pass(&e, &pol, &r1, &err);
+    T_CHECK_MSG(r1.generation != 0, "pass 1: expected a generation to be appended");
+
+    char sql[256];
+    (void)snprintf(sql, sizeof sql, "SELECT COUNT(*) FROM verify_claims WHERE repo_id = %lld;",
+                  (long long)e.repo_id);
+    int64_t claims_before = t8_scalar(&e, sql, &err);
+    (void)snprintf(sql, sizeof sql, "SELECT COUNT(*) FROM verify_evidence WHERE repo_id = %lld;",
+                  (long long)e.repo_id);
+    int64_t evidence_before = t8_scalar(&e, sql, &err);
+    (void)snprintf(sql, sizeof sql,
+                  "SELECT COUNT(*) FROM verify_attestations a"
+                  " JOIN verify_claims c ON c.id = a.claim_id WHERE c.repo_id = %lld;",
+                  (long long)e.repo_id);
+    int64_t attest_before = t8_scalar(&e, sql, &err);
+
+    atlas_memory_pass_result r2;
+    t8_run_pass(&e, &pol, &r2, &err);
+    T_CHECK_MSG(r2.generation == 0, "pass 2: expected no generation over unchanged bytes, got %lld",
+                (long long)r2.generation);
+    T_CHECK_MSG(r2.claims_created == 0 && r2.versions_added == 0,
+                "pass 2: expected nothing new to be created");
+
+    (void)snprintf(sql, sizeof sql, "SELECT COUNT(*) FROM verify_claims WHERE repo_id = %lld;",
+                  (long long)e.repo_id);
+    T_CHECK_MSG(t8_scalar(&e, sql, &err) == claims_before, "claim count moved on a no-op pass");
+    (void)snprintf(sql, sizeof sql, "SELECT COUNT(*) FROM verify_evidence WHERE repo_id = %lld;",
+                  (long long)e.repo_id);
+    T_CHECK_MSG(t8_scalar(&e, sql, &err) == evidence_before, "evidence count moved on a no-op pass");
+    (void)snprintf(sql, sizeof sql,
+                  "SELECT COUNT(*) FROM verify_attestations a"
+                  " JOIN verify_claims c ON c.id = a.claim_id WHERE c.repo_id = %lld;",
+                  (long long)e.repo_id);
+    T_CHECK_MSG(t8_scalar(&e, sql, &err) == attest_before, "attestation count moved on a no-op pass");
+
+    t8_env_close(&e);
+}
+
+/* (d) a prose-only candidate -- no path, symbol, decision or commit anchor
+ * anywhere in it -- lands in memory_unanchored and never becomes a claim. */
+static void test_prose_only_candidate_is_unanchored(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    t8env e;
+    t8_env_open(&e, &err);
+
+    const char *repo = fx_repo(&e.fx);
+    T_OK(fx_write(repo, "note-a.md", "just some prose with nothing in it to anchor to", &err), &err);
+    T_OK(fx_add_all(&e.fx, repo, &err), &err);
+    T_OK(fx_commit(&e.fx, repo, "seed", &err), &err);
+    t8_bind_head(&e, &err);
+    t8_seed_file(&e, "note-a.md", "1111111111111111111111111111111111111111111111111111111111111111",
+                &err);
+
+    const char *paths[] = {"note-a.md"};
+    atlas_syspolicy pol;
+    t8_policy(&pol, ATLAS_MEMORY_SOURCE_REPO_FILE, paths, 1);
+
+    atlas_memory_pass_result result;
+    t8_run_pass(&e, &pol, &result, &err);
+    T_CHECK_MSG(result.claims_created == 0, "a prose-only candidate must not become a claim");
+    T_CHECK_MSG(result.unanchored == 1, "expected exactly one unanchored candidate, got %zu",
+                result.unanchored);
+
+    char sql[256];
+    (void)snprintf(sql, sizeof sql, "SELECT COUNT(*) FROM verify_claims WHERE repo_id = %lld;",
+                  (long long)e.repo_id);
+    T_CHECK_MSG(t8_scalar(&e, sql, &err) == 0, "no claim should exist for this repository");
+    T_CHECK_MSG(t8_scalar(&e, "SELECT COUNT(*) FROM memory_unanchored;", &err) == 1,
+                "expected exactly one row in memory_unanchored");
+
+    t8_env_close(&e);
+}
+
+/* A finding from this task's own review, not named in the brief: a
+ * registered source's own bytes are not always indexed -- T6's own headline
+ * fixture is a gitignored `*_DIR` child, an operator's own working notes --
+ * and `EVIDENCE_ADD`'s `path_text` lookup refuses a path `files` does not
+ * hold. A candidate split from such an item is routed to `memory_unanchored`
+ * regardless of whether its own anchors would resolve, rather than either
+ * aborting the whole pass or leaving a claim with no evidence for where its
+ * own bytes came from. Reproduced here at the simplest level that shows it:
+ * a `*_FILE` source whose own path was never indexed, citing a path
+ * (`src/db/db_orch.c`) that *is* -- so the anchor would resolve if the pass
+ * ever reached it, and the only thing standing between this candidate and a
+ * claim is its own source's index status. */
+static void test_unindexed_source_path_is_unanchored_not_refused(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    t8env e;
+    t8_env_open(&e, &err);
+
+    const char *repo = fx_repo(&e.fx);
+    T_OK(fx_mkdir(repo, "src", &err), &err);
+    T_OK(fx_mkdir(repo, "src/db", &err), &err);
+    T_OK(fx_write(repo, "src/db/db_orch.c", "int x;\n", &err), &err);
+    T_OK(fx_write(repo, "note-a.md", "the daemon reads `src/db/db_orch.c`", &err), &err);
+    T_OK(fx_add_all(&e.fx, repo, &err), &err);
+    T_OK(fx_commit(&e.fx, repo, "seed", &err), &err);
+    t8_bind_head(&e, &err);
+    t8_seed_file(&e, "src/db/db_orch.c", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                &err);
+    /* Deliberately not indexed: "note-a.md" itself has no row in `files`,
+     * exactly what a gitignored path or a not-yet-reconciled one leaves. */
+
+    const char *paths[] = {"note-a.md"};
+    atlas_syspolicy pol;
+    t8_policy(&pol, ATLAS_MEMORY_SOURCE_REPO_FILE, paths, 1);
+
+    atlas_memory_pass_result result;
+    t8_run_pass(&e, &pol, &result, &err);
+    T_CHECK_MSG(result.claims_created == 0,
+                "a candidate from an unindexed source must not become a claim, got %zu claims",
+                result.claims_created);
+    T_CHECK_MSG(result.unanchored == 1,
+                "expected the candidate to be routed to memory_unanchored, got %zu", result.unanchored);
+
+    char sql[256];
+    (void)snprintf(sql, sizeof sql, "SELECT COUNT(*) FROM verify_claims WHERE repo_id = %lld;",
+                  (long long)e.repo_id);
+    T_CHECK_MSG(t8_scalar(&e, sql, &err) == 0, "no claim should exist for this repository");
+    T_CHECK_MSG(t8_scalar(&e, "SELECT COUNT(*) FROM memory_unanchored;", &err) == 1,
+                "expected exactly one row in memory_unanchored");
+
+    t8_env_close(&e);
+}
+
+/* (e) the stored DOCUMENT actor's identity is SELF_DECLARED, and Decision 1's
+ * arithmetic -- min(DOCUMENT 400, SELF_DECLARED 350) = 350 -- is what a
+ * memory assertion is actually worth. */
+static void test_document_actor_is_self_declared_350(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    t8env e;
+    t8_env_open(&e, &err);
+
+    const char *repo = fx_repo(&e.fx);
+    T_OK(fx_mkdir(repo, "src", &err), &err);
+    T_OK(fx_mkdir(repo, "src/db", &err), &err);
+    T_OK(fx_write(repo, "src/db/db_orch.c", "int x;\n", &err), &err);
+    T_OK(fx_write(repo, "note-a.md", "the daemon reads `src/db/db_orch.c`", &err), &err);
+    T_OK(fx_add_all(&e.fx, repo, &err), &err);
+    T_OK(fx_commit(&e.fx, repo, "seed", &err), &err);
+    t8_bind_head(&e, &err);
+    t8_seed_file(&e, "src/db/db_orch.c", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                &err);
+    t8_seed_file(&e, "note-a.md", "1111111111111111111111111111111111111111111111111111111111111111",
+                &err);
+
+    const char *paths[] = {"note-a.md"};
+    atlas_syspolicy pol;
+    t8_policy(&pol, ATLAS_MEMORY_SOURCE_REPO_FILE, paths, 1);
+    atlas_memory_pass_result result;
+    t8_run_pass(&e, &pol, &result, &err);
+    T_REQUIRE(result.claims_created == 1);
+
+    sqlite3_stmt *stmt = NULL;
+    T_OK(atlas_db_prepare(e.db, "SELECT identity FROM verify_actors WHERE class = 'DOCUMENT';", &stmt,
+                          &err),
+         &err);
+    T_REQUIRE(sqlite3_step(stmt) == SQLITE_ROW);
+    T_CHECK_MSG(strcmp((const char *)sqlite3_column_text(stmt, 0), "SELF_DECLARED") == 0,
+                "expected a DOCUMENT actor's stored identity to be SELF_DECLARED, got \"%s\"",
+                (const char *)sqlite3_column_text(stmt, 0));
+    atlas_db_finish(e.db, stmt);
+
+    int prior = atlas_verify_prior_reliability(ATLAS_ACTOR_DOCUMENT, ATLAS_ACTOR_IDENTITY_SELF_DECLARED);
+    T_CHECK_MSG(prior == 350, "expected a DOCUMENT/SELF_DECLARED prior of 350, got %d", prior);
+
+    t8_env_close(&e);
+}
+
+/* Debt 1: ATLAS_MEMORY_EXTRACTOR_VERSION is consumed nowhere in `src/` before
+ * this task. It lands on EVIDENCE_ADD's `actor_version` (`emit_candidate`,
+ * `src/memory/reconcile.c`), and this proves it *landed* rather than merely
+ * *exists*: the stored value is exactly the compiled constant, stringified
+ * with the same conversion the production code uses (so a bump to the
+ * constant moves this test's expectation too, rather than needing a second
+ * hand-maintained "1"), and it is load-bearing in exactly the way
+ * `ATLAS_SEM_ANALYZER_VERSION` was not for years -- `derive_actor` hashes
+ * `actor_version` into the actor uid (`intake.c:427-430`), so two EVIDENCE_ADD
+ * calls differing only in `actor_version` mint two different actors. That
+ * second half is driven directly through the write point, on the same claim
+ * the pass already created, to show the version is not merely stored beside
+ * an actor row but is *part of which actor a bump would mint*. */
+static void test_extractor_version_lands_in_the_evidence_actor(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    t8env e;
+    t8_env_open(&e, &err);
+
+    const char *repo = fx_repo(&e.fx);
+    T_OK(fx_mkdir(repo, "src", &err), &err);
+    T_OK(fx_mkdir(repo, "src/db", &err), &err);
+    T_OK(fx_write(repo, "src/db/db_orch.c", "int x;\n", &err), &err);
+    T_OK(fx_write(repo, "note-a.md", "the daemon reads `src/db/db_orch.c`", &err), &err);
+    T_OK(fx_add_all(&e.fx, repo, &err), &err);
+    T_OK(fx_commit(&e.fx, repo, "seed", &err), &err);
+    t8_bind_head(&e, &err);
+    t8_seed_file(&e, "src/db/db_orch.c", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                &err);
+    t8_seed_file(&e, "note-a.md", "1111111111111111111111111111111111111111111111111111111111111111",
+                &err);
+
+    const char *paths[] = {"note-a.md"};
+    atlas_syspolicy pol;
+    t8_policy(&pol, ATLAS_MEMORY_SOURCE_REPO_FILE, paths, 1);
+    atlas_memory_pass_result result;
+    t8_run_pass(&e, &pol, &result, &err);
+    T_REQUIRE(result.claims_created == 1);
+
+    char expected[16];
+    (void)snprintf(expected, sizeof expected, "%d", ATLAS_MEMORY_EXTRACTOR_VERSION);
+    sqlite3_stmt *stmt = NULL;
+    T_OK(atlas_db_prepare(e.db,
+                          "SELECT version, uid FROM verify_actors WHERE class = 'ATLAS_VERIFIER' "
+                          "AND name = 'memory-reconciler';",
+                          &stmt, &err),
+         &err);
+    T_REQUIRE(sqlite3_step(stmt) == SQLITE_ROW);
+    T_CHECK_MSG(strcmp((const char *)sqlite3_column_text(stmt, 0), expected) == 0,
+                "expected the stored actor_version to be the compiled extractor epoch \"%s\", "
+                "got \"%s\"",
+                expected, (const char *)sqlite3_column_text(stmt, 0));
+    char original_actor_uid[128];
+    (void)snprintf(original_actor_uid, sizeof original_actor_uid, "%s",
+                  (const char *)sqlite3_column_text(stmt, 1));
+    atlas_db_finish(e.db, stmt);
+
+    /* The claim uid, to drive a second EVIDENCE_ADD directly through the
+     * write point -- bypassing reconcile.c entirely -- with a different
+     * `actor_version`, the same channel and actor description otherwise. */
+    char claim_uid[128];
+    T_OK(atlas_db_prepare(e.db, "SELECT uid FROM verify_claims LIMIT 1;", &stmt, &err), &err);
+    T_REQUIRE(sqlite3_step(stmt) == SQLITE_ROW);
+    (void)snprintf(claim_uid, sizeof claim_uid, "%s", (const char *)sqlite3_column_text(stmt, 0));
+    atlas_db_finish(e.db, stmt);
+
+    atlas_verify_op op;
+    atlas_verify_op_init(&op);
+    op.kind = ATLAS_VERIFY_OP_EVIDENCE_ADD;
+    op.channel = ATLAS_VERIFY_CHANNEL_ATLAS;
+    T_OK(atlas_buf_set_str(&op.actor_name, "memory-reconciler", &err), &err);
+    T_OK(atlas_buf_set_str(&op.actor_provider, "atlas", &err), &err);
+    T_OK(atlas_buf_set_str(&op.actor_version, "999", &err), &err); /* a hypothetical future bump */
+    T_OK(atlas_buf_set_str(&op.claim_uid, claim_uid, &err), &err);
+    op.evidence_class = ATLAS_EVIDENCE_DOCUMENT;
+    T_OK(atlas_buf_set_str(&op.path_text, "note-a.md", &err), &err);
+    T_OK(atlas_buf_set_str(&op.observed_at, "2026-06-01T00:00:00Z", &err), &err);
+    atlas_verify_intake_result res;
+    atlas_verify_intake_result_init(&res);
+    T_OK(atlas_db_begin(e.db, &err), &err);
+    T_OK(atlas_verify_intake_apply_in_tx(e.db, &op, &res, &err), &err);
+    T_OK(atlas_db_commit(e.db, &err), &err);
+    atlas_verify_op_free(&op);
+    atlas_verify_intake_result_free(&res);
+
+    T_OK(atlas_db_prepare(e.db,
+                          "SELECT COUNT(DISTINCT uid) FROM verify_actors WHERE class = "
+                          "'ATLAS_VERIFIER' AND name = 'memory-reconciler';",
+                          &stmt, &err),
+         &err);
+    T_REQUIRE(sqlite3_step(stmt) == SQLITE_ROW);
+    T_CHECK_MSG(sqlite3_column_int64(stmt, 0) == 2,
+                "expected a different actor_version to mint a second actor (a bump is not a "
+                "silent no-op), got %lld distinct actors",
+                (long long)sqlite3_column_int64(stmt, 0));
+    atlas_db_finish(e.db, stmt);
+
+    t8_env_close(&e);
+}
+
+/* (f) atlas_memory_observe never opens a transaction. Asserted directly
+ * through the internals header's own accessor, and behaviourally: a second
+ * connection holding an open read transaction on the same database must not
+ * stop the observe phase from succeeding, which a *write* transaction
+ * wrapped around its file reads and git process would risk. */
+static void test_observe_runs_without_a_transaction(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    t8env e;
+    t8_env_open(&e, &err);
+
+    const char *repo = fx_repo(&e.fx);
+    T_OK(fx_write(repo, "note-a.md", "nothing anchored here\n", &err), &err);
+    T_OK(fx_add_all(&e.fx, repo, &err), &err);
+    T_OK(fx_commit(&e.fx, repo, "seed", &err), &err);
+    t8_bind_head(&e, &err);
+
+    const char *paths[] = {"note-a.md"};
+    atlas_syspolicy pol;
+    t8_policy(&pol, ATLAS_MEMORY_SOURCE_REPO_FILE, paths, 1);
+
+    atlas_db *reader = NULL;
+    T_OK(atlas_db_open_readonly(atlas_buf_cstr(&e.db_path), &reader, &err), &err);
+    T_OK(atlas_db_exec_sql(reader, "BEGIN;", &err), &err);
+    T_OK(atlas_db_exec_sql(reader, "SELECT COUNT(*) FROM memory_sources;", &err), &err);
+
+    T_CHECK_MSG(!atlas_db_in_transaction(e.db), "no transaction should be open before observe runs");
+    atlas_memory_observation obs;
+    atlas_status st = atlas_memory_observe(e.db, &e.repo, fx_data_dir(&e.fx), &pol, &obs, &err);
+    T_CHECK_MSG(st == ATLAS_OK,
+                "observe must succeed while a second reader holds an open read transaction, got "
+                "%s: %s",
+                atlas_status_name(st), atlas_err_msg(&err));
+    T_CHECK_MSG(!atlas_db_in_transaction(e.db), "observe left a transaction open on its own handle");
+
+    atlas_memory_observation_free(&obs);
+    T_OK(atlas_db_exec_sql(reader, "COMMIT;", &err), &err);
+    atlas_db_close(reader);
+
+    t8_env_close(&e);
+}
+
+/* --- Debt 2, measured rather than reasoned about --------------------------
+ *
+ * T7's review found that removing one candidate's worth of a 256 KiB source
+ * did not remove the cost: 128 candidates of 2048 bytes each, packed with
+ * anchor-shaped backtick runs that resolve nothing (so `anchor_count` never
+ * reaches its cap of 8 and `atlas_memory_anchor_resolve`'s scan never exits
+ * early), is the same total bytes scanned as one un-truncated candidate
+ * would have been, and it is all inside `atlas_memory_apply_in_tx`'s one
+ * transaction, on the single writer thread. This measures it rather than
+ * asserting a bound nobody has set: the number is reported, not gated,
+ * because a machine-dependent duration failing a CI run for being 3ms too
+ * slow is exactly the kind of bound `CLAUDE.md` warns against stating. */
+static void test_cost_debt_apply_duration_at_compiled_worst_case(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    t8env e;
+    t8_env_open(&e, &err);
+
+    const char *repo = fx_repo(&e.fx);
+    atlas_buf content = ATLAS_BUF_INIT;
+    /* 128 candidates (list items, so each is its own proposition rather than
+     * merging into one paragraph), each packed to just under
+     * ATLAS_MEMORY_MAX_PROPOSITION_BYTES with a backtick token that never
+     * resolves -- so every one of them is fully scanned for anchors, never
+     * truncated and never short-circuited by anchor_count reaching its cap. */
+    for (int line = 0; line < 128; line++) {
+        T_OK(atlas_buf_appendf(&content, &err, "- "), &err);
+        size_t budget = 2000; /* comfortably under the 2048-byte cap with the "- " prefix */
+        while (budget > 4) {
+            T_OK(atlas_buf_appendf(&content, &err, "`x` "), &err);
+            budget -= 4;
+        }
+        T_OK(atlas_buf_appendf(&content, &err, "\n"), &err);
+    }
+    T_OK(fx_write_bytes(repo, "note-a.md", strlen("note-a.md"), content.data, content.len, 0644,
+                        &err),
+         &err);
+    atlas_buf_free(&content);
+    T_OK(fx_add_all(&e.fx, repo, &err), &err);
+    T_OK(fx_commit(&e.fx, repo, "seed", &err), &err);
+    t8_bind_head(&e, &err);
+    /* Indexed, deliberately: an unindexed source's candidates are routed to
+     * memory_unanchored *without* ever calling atlas_memory_anchor_resolve
+     * (this task's own fix for the finding above), which would make this
+     * measurement report the fast path instead of the one Debt 2 is about. */
+    t8_seed_file(&e, "note-a.md", "1111111111111111111111111111111111111111111111111111111111111111",
+                &err);
+
+    const char *paths[] = {"note-a.md"};
+    atlas_syspolicy pol;
+    t8_policy(&pol, ATLAS_MEMORY_SOURCE_REPO_FILE, paths, 1);
+
+    char now[64];
+    atlas_now_iso8601(now, sizeof now);
+    atlas_memory_observation *obs = malloc(sizeof *obs);
+    T_REQUIRE(obs != NULL);
+    T_OK(atlas_memory_observe(e.db, &e.repo, fx_data_dir(&e.fx), &pol, obs, &err), &err);
+    T_CHECK_MSG(obs->source_count == 1 && obs->sources[0].candidate_count == 128,
+                "expected the compiled ceiling of 128 candidates from one source, got %zu",
+                obs->source_count == 1 ? obs->sources[0].candidate_count : 0);
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    atlas_memory_pass_result result;
+    T_OK(atlas_db_begin(e.db, &err), &err);
+    T_OK(atlas_memory_apply_in_tx(e.db, &e.repo, obs, &pol, now, &result, &err), &err);
+    T_OK(atlas_db_commit(e.db, &err), &err);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double ms = (double)(t1.tv_sec - t0.tv_sec) * 1000.0 +
+               (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
+
+    atlas_test_note(
+        "Debt 2 observed: one 256 KiB-class source (128 candidates x ~2000 anchor-scanned "
+        "bytes, all unresolving) cost %.1f ms inside atlas_memory_apply_in_tx's one write "
+        "transaction (unanchored=%zu). Accepted as bounded per Decision 10's own compiled-"
+        "ceiling argument (16 sources x 128 candidates is a stated worst case), not mitigated "
+        "by splitting the transaction -- see the T8 report.",
+        ms, result.unanchored);
+    T_CHECK_MSG(result.unanchored == 128, "expected every candidate to land unanchored, got %zu",
+                result.unanchored);
+
+    atlas_memory_observation_free(obs);
+    free(obs);
+    t8_env_close(&e);
+}
+
+/* EXTERNAL_*: T8 never reads one itself. `test_verify_intake.c`'s own
+ * `insert_memory_version` shape, reused: a stored `memory_sources` +
+ * `memory_source_versions` pair inserted directly, exactly as a future
+ * `memory.put` (T11) would leave it, so the observe phase has something to
+ * read back instead of a path it would refuse to open. */
+static void test_external_source_reads_the_stored_version_not_the_disk(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    t8env e;
+    t8_env_open(&e, &err);
+
+    const char *repo = fx_repo(&e.fx);
+    T_OK(fx_mkdir(repo, "src", &err), &err);
+    T_OK(fx_mkdir(repo, "src/db", &err), &err);
+    T_OK(fx_write(repo, "src/db/db_orch.c", "int x;\n", &err), &err);
+    T_OK(fx_add_all(&e.fx, repo, &err), &err);
+    T_OK(fx_commit(&e.fx, repo, "seed", &err), &err);
+    t8_bind_head(&e, &err);
+    t8_seed_file(&e, "src/db/db_orch.c", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                &err);
+
+    atlas_buf sql = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_appendf(
+             &sql, &err,
+             "INSERT INTO memory_sources(repo_id, source_uid, cls, path_raw, path_text,"
+             "  registered_at) VALUES(%lld, 'm0123456789abcdef0123456789abcdef',"
+             "  'EXTERNAL_FILE', CAST('/home/u/notes.md' AS BLOB), '/home/u/notes.md', 't0');"
+             "INSERT INTO memory_source_versions(source_id, version_uid, commit_oid, blob_oid,"
+             "  content_sha256, content_bytes, content, observed_at, recorded_at, read_by_uid)"
+             " VALUES(last_insert_rowid(), 'v0123456789abcdef0123456789abcdef', '', '',"
+             "  '1111111111111111111111111111111111111111111111111111111111111111', 36,"
+             "  'the daemon reads `src/db/db_orch.c`', 't1', 't1', 0);",
+             (long long)e.repo_id),
+         &err);
+    T_OK(atlas_db_exec_sql(e.db, atlas_buf_cstr(&sql), &err), &err);
+    atlas_buf_free(&sql);
+
+    atlas_syspolicy pol;
+    memset(&pol, 0, sizeof pol);
+    pol.state = ATLAS_SYSPOLICY_SYSTEM;
+    pol.memory_source_count = 1;
+    pol.memory_sources[0].cls = ATLAS_MEMORY_SOURCE_EXTERNAL_FILE;
+    (void)snprintf(pol.memory_sources[0].path, sizeof pol.memory_sources[0].path, "%s",
+                   "/home/u/notes.md");
+
+    atlas_memory_pass_result result;
+    t8_run_pass(&e, &pol, &result, &err);
+    T_CHECK_MSG(result.claims_created == 1, "expected one claim from the stored version, got %zu",
+                result.claims_created);
+    T_CHECK_MSG(result.versions_added == 0,
+                "T8 must never write a version row for an EXTERNAL_* source, got %zu",
+                result.versions_added);
+
+    char sqlbuf[256];
+    (void)snprintf(sqlbuf, sizeof sqlbuf,
+                  "SELECT COUNT(*) FROM verify_evidence WHERE repo_id = %lld"
+                  "  AND path_text = '/home/u/notes.md';",
+                  (long long)e.repo_id);
+    T_CHECK_MSG(t8_scalar(&e, sqlbuf, &err) == 1,
+                "expected the evidence row to carry the stored version's own path");
+
+    t8_env_close(&e);
+}
+
+/* A REPO_DIR source with two children, each carrying a different anchored
+ * bullet: both share one actor (Decision 1's "one actor per registered
+ * source"), each gets its own claim and its own evidence whose path_text is
+ * the source's own path joined with the child's own name, and both share the
+ * pass's one candidate budget rather than each getting ATLAS_MEMORY_MAX_
+ * PROPOSITIONS of their own. */
+static void test_repo_dir_source_versions_each_child_independently(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    t8env e;
+    t8_env_open(&e, &err);
+
+    const char *repo = fx_repo(&e.fx);
+    T_OK(fx_mkdir(repo, "src", &err), &err);
+    T_OK(fx_mkdir(repo, "src/db", &err), &err);
+    T_OK(fx_write(repo, "src/db/db_orch.c", "int x;\n", &err), &err);
+    T_OK(fx_mkdir(repo, "src/gw", &err), &err);
+    T_OK(fx_write(repo, "src/gw/gateway.c", "int y;\n", &err), &err);
+    T_OK(fx_mkdir(repo, ".claude", &err), &err);
+    T_OK(fx_mkdir(repo, ".claude/memories", &err), &err);
+    T_OK(fx_write(repo, ".claude/memories/a.md", "the daemon reads `src/db/db_orch.c`", &err), &err);
+    T_OK(fx_write(repo, ".claude/memories/b.md", "the gateway reads `src/gw/gateway.c`", &err), &err);
+    T_OK(fx_add_all(&e.fx, repo, &err), &err);
+    T_OK(fx_commit(&e.fx, repo, "seed", &err), &err);
+    t8_bind_head(&e, &err);
+    t8_seed_file(&e, "src/db/db_orch.c", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                &err);
+    t8_seed_file(&e, "src/gw/gateway.c", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                &err);
+    t8_seed_file(&e, ".claude/memories/a.md",
+                "1111111111111111111111111111111111111111111111111111111111111111", &err);
+    t8_seed_file(&e, ".claude/memories/b.md",
+                "2222222222222222222222222222222222222222222222222222222222222222", &err);
+
+    const char *paths[] = {".claude/memories"};
+    atlas_syspolicy pol;
+    t8_policy(&pol, ATLAS_MEMORY_SOURCE_REPO_DIR, paths, 1);
+
+    atlas_memory_pass_result result;
+    t8_run_pass(&e, &pol, &result, &err);
+    T_CHECK_MSG(result.claims_created == 2, "expected two distinct claims, got %zu",
+                result.claims_created);
+    T_CHECK_MSG(result.versions_added == 2, "expected two version rows, one per child, got %zu",
+                result.versions_added);
+
+    char sql[256];
+    (void)snprintf(sql, sizeof sql,
+                  "SELECT COUNT(DISTINCT actor_id) FROM verify_attestations a"
+                  " JOIN verify_claims c ON c.id = a.claim_id WHERE c.repo_id = %lld;",
+                  (long long)e.repo_id);
+    T_CHECK_MSG(t8_scalar(&e, sql, &err) == 1,
+                "expected both children's attestations to share one actor (one registered "
+                "source)");
+    (void)snprintf(sql, sizeof sql,
+                  "SELECT COUNT(*) FROM verify_evidence WHERE repo_id = %lld"
+                  "  AND path_text = '.claude/memories/a.md';",
+                  (long long)e.repo_id);
+    T_CHECK_MSG(t8_scalar(&e, sql, &err) == 1,
+                "expected the first child's own path, joined from the source and the child name");
+    (void)snprintf(sql, sizeof sql,
+                  "SELECT COUNT(*) FROM verify_evidence WHERE repo_id = %lld"
+                  "  AND path_text = '.claude/memories/b.md';",
+                  (long long)e.repo_id);
+    T_CHECK_MSG(t8_scalar(&e, sql, &err) == 1, "expected the second child's own path");
+
+    t8_env_close(&e);
+}
+
 static const atlas_test TESTS[] = {
     {"REPO_FILE reads tracked bytes", test_repo_file_reads_tracked_bytes},
     {"REPO_FILE missing path is ABSENT", test_repo_file_missing_path_is_absent},
@@ -707,6 +1614,26 @@ static const atlas_test TESTS[] = {
     {"EXTERNAL_FILE via read_source is NOT_OURS",
      test_external_file_via_read_source_is_not_ours},
     {"read_external refuses a symlink", test_read_external_refuses_a_symlink},
+    /* T8: the pass. */
+    {"pass collapses duplicate source text into one independent group",
+     test_pass_collapses_duplicate_source_text},
+    {"pass retains three provenances across versions",
+     test_pass_retains_provenance_across_versions},
+    {"pass over unchanged bytes is a no-op", test_pass_over_unchanged_bytes_is_a_no_op},
+    {"prose-only candidate is unanchored", test_prose_only_candidate_is_unanchored},
+    {"an unindexed source path is unanchored, not refused",
+     test_unindexed_source_path_is_unanchored_not_refused},
+    {"stored DOCUMENT actor is SELF_DECLARED at prior 350",
+     test_document_actor_is_self_declared_350},
+    {"Debt 1: the extractor version lands in the evidence actor",
+     test_extractor_version_lands_in_the_evidence_actor},
+    {"observe runs without a transaction", test_observe_runs_without_a_transaction},
+    {"Debt 2: apply duration at the compiled worst case, measured",
+     test_cost_debt_apply_duration_at_compiled_worst_case},
+    {"EXTERNAL_* source reads the stored version, not the disk",
+     test_external_source_reads_the_stored_version_not_the_disk},
+    {"REPO_DIR source versions each child independently",
+     test_repo_dir_source_versions_each_child_independently},
 };
 
 ATLAS_TEST_MAIN("memory_reconcile", TESTS)

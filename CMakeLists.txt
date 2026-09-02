@@ -376,6 +376,11 @@ add_library(atlas_core STATIC
   # pure, `src/orch/memory.c`'s discipline — and resolves their anchors
   # against the index, which is the impure half T8's write transaction calls.
   src/memory/extract.c
+  # `reconcile.c` (T8) is the pass: observe outside a transaction, apply
+  # inside one. It creates no `verify_*` row itself — every one goes through
+  # `atlas_verify_intake_apply_in_tx` — and it is the first real consumer of
+  # T4's DOCUMENT channel and T5's conflict producer.
+  src/memory/reconcile.c
   ${ATLAS_UI_GEN}
 )
 

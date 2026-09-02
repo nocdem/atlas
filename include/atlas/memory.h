@@ -82,6 +82,16 @@ typedef struct atlas_syspolicy_memory_source atlas_syspolicy_memory_source;
  * routing it never restates. */
 typedef struct atlas_repo_info atlas_repo_info;
 
+/* Forward-declared rather than included, and needed only by T8's two phase
+ * entry points -- `verify.h`'s own precedent for `atlas_db`, for the same
+ * reason. `syspolicy.h` already includes *this* header, because
+ * `atlas_syspolicy_memory_source` carries a complete `atlas_memory_source_class`
+ * (a struct member, so an incomplete type will not do); if this header
+ * included `syspolicy.h` back, the two would cycle. `atlas_memory_observe`
+ * and `atlas_memory_apply_in_tx` need only a pointer to the policy struct, so
+ * a forward declaration is enough here and keeps the dependency one-way. */
+typedef struct atlas_syspolicy atlas_syspolicy;
+
 /* What a registered memory source is, and -- the load-bearing half -- **who can
  * read it**.
  *
@@ -247,6 +257,18 @@ typedef struct atlas_memory_version_row {
     int64_t content_bytes;
     atlas_buf path_text;      /* the source's stored %XX-encoded path */
     atlas_buf observed_at;    /* when the bytes described, not when recorded */
+    /* T8. The stored bytes themselves, when the row carries them (NULL/empty
+     * `blob_oid`; see the migration's own CHECK). Not read by T4's caller
+     * (`op_evidence_add` only needs the hash), but T8's observe phase needs the
+     * actual content of an EXTERNAL_* source's *already-stored* latest version
+     * to extract propositions from -- a different principal (T11's
+     * `memory.put`, not yet built) writes that row, and this is how the pass
+     * reads it back. Left unset (empty) by `atlas_db_memory_version_by_uid`'s
+     * ordinary callers is fine: an empty buffer for a row that has content is
+     * indistinguishable from a row that has none only if a caller conflates
+     * "empty" with "absent", which nothing here does -- `content_bytes` is the
+     * length that decides that question, not this buffer's own `.len`. */
+    atlas_buf content;
 } atlas_memory_version_row;
 
 void atlas_memory_version_row_init(atlas_memory_version_row *r);
@@ -259,6 +281,101 @@ void atlas_memory_version_row_free(atlas_memory_version_row *r);
  * the only production writers of the `memory_*` tables. */
 atlas_status atlas_db_memory_version_by_uid(atlas_db *db, const char *uid,
                                             atlas_memory_version_row *out, bool *found_out,
+                                            atlas_err *err);
+
+/* --- T8: the reconciliation pass's own typed operations --------------------
+ *
+ * All in `src/db/db_memory.c`, which the file header already states is the
+ * only production writer of a `memory_*` table. None of these touch a
+ * `verify_*` table -- that is `atlas_verify_intake_apply_in_tx`'s job and
+ * nobody else's. */
+
+/* Finds a registered source's row by its identity (repo, class, raw path),
+ * without creating one. Used by the observe phase to look up an EXTERNAL_*
+ * source's already-stored latest version -- T8 never writes during observe,
+ * so it must not create the row it is only reading through. `*found_out` is
+ * false and everything else untouched when there is no such row yet: nothing
+ * has ever been `memory.put` for this policy entry. */
+atlas_status atlas_db_memory_source_find(atlas_db *db, int64_t repo_id, atlas_memory_source_class cls,
+                                         const void *path_raw, size_t path_raw_len, int64_t *id_out,
+                                         atlas_buf *uid_out, bool *found_out, atlas_err *err);
+
+/* Finds a registered source's row, or creates one. The apply phase's own
+ * materialisation step: every registered policy entry gets exactly one
+ * `memory_sources` row (`UNIQUE(repo_id, cls, path_raw)` is the idempotency),
+ * created once and never rewritten -- registry churn deletes no memory
+ * history, this migration's own rule. */
+atlas_status atlas_db_memory_source_upsert(atlas_db *db, int64_t repo_id, atlas_memory_source_class cls,
+                                           const void *path_raw, size_t path_raw_len,
+                                           const char *path_text, const char *now, int64_t *id_out,
+                                           atlas_buf *uid_out, atlas_err *err);
+
+/* Whether this source has already recorded this exact content, and if so the
+ * most recent such row's identity. The apply phase's "moved content" test:
+ * finding a match means nothing changed and no new version row is written;
+ * finding none means it is new content and `atlas_db_memory_version_insert`
+ * is the next call. Compared by content, not by recency, because one
+ * registered `*_DIR` source's several children share one `source_id` and each
+ * is versioned independently by what it contains. */
+atlas_status atlas_db_memory_version_exists(atlas_db *db, int64_t source_id, const char *content_sha256,
+                                            bool *found_out, int64_t *id_out, atlas_buf *uid_out,
+                                            atlas_buf *observed_at_out, atlas_err *err);
+
+/* Appends a new version row. `content` is bound NULL when `blob_oid` is
+ * non-empty -- migration 29's own `CHECK(blob_oid <> '' OR content IS NOT
+ * NULL)`, and git is canonical for a blob-bound version so nothing here
+ * duplicates it. */
+atlas_status atlas_db_memory_version_insert(atlas_db *db, int64_t source_id, const char *commit_oid,
+                                            const char *blob_oid, const char *content_sha256,
+                                            int64_t content_bytes, const void *content,
+                                            size_t content_len, const char *observed_at,
+                                            const char *recorded_at, int64_t read_by_uid,
+                                            int64_t *id_out, atlas_buf *uid_out, atlas_err *err);
+
+/* The latest version row for a source, content included -- what the observe
+ * phase reads back for an EXTERNAL_* source instead of reading the bytes
+ * itself. `*found_out` is false when the source has no version yet. */
+atlas_status atlas_db_memory_version_latest(atlas_db *db, int64_t source_id,
+                                            atlas_memory_version_row *out, bool *found_out,
+                                            atlas_err *err);
+
+/* Records one resolved anchor for one claim. `INSERT OR IGNORE`: the same
+ * anchor recorded again by an unchanged re-run is not a second row --
+ * `UNIQUE(claim_uid, kind, value)` is the idempotency, matching the intake
+ * write point's own content-key duplicate discipline one layer up. */
+atlas_status atlas_db_memory_anchor_add(atlas_db *db, int64_t repo_id, const char *claim_uid,
+                                        atlas_memory_anchor_kind kind, const char *value,
+                                        atlas_err *err);
+
+/* Records one candidate that resolved no anchor. `INSERT OR IGNORE`:
+ * `UNIQUE(source_version_id, ordinal)` makes a re-run over an unchanged
+ * version idempotent, exactly as the anchored path is through the intake
+ * write point's content keys. */
+atlas_status atlas_db_memory_unanchored_add(atlas_db *db, int64_t source_version_id, int64_t ordinal,
+                                            const char *text_sha256, const void *text,
+                                            size_t text_len, atlas_err *err);
+
+/* `max(generation) + 1` for this repository -- Decision 7's monotonic
+ * sequence. 1 when this repository has none yet. */
+atlas_status atlas_db_memory_generation_next(atlas_db *db, int64_t repo_id, int64_t *next_out,
+                                             atlas_err *err);
+
+/* Appends one generation row. */
+atlas_status atlas_db_memory_generation_insert(atlas_db *db, int64_t repo_id, int64_t generation,
+                                               atlas_memory_gen_cause cause,
+                                               const char *repo_identity_hash,
+                                               const char *head_commit,
+                                               const char *decision_set_digest,
+                                               const char *source_set_digest,
+                                               int64_t trailer_scan_high, const char *created_at,
+                                               int64_t *id_out, atlas_err *err);
+
+/* Appends one per-claim diff row for a generation. `INSERT OR IGNORE`:
+ * `UNIQUE(generation_id, claim_uid)` -- a freshly appended generation can
+ * never already hold one, so this can only ever insert, but the same
+ * discipline as the two functions above costs nothing to keep. */
+atlas_status atlas_db_memory_claim_diff_add(atlas_db *db, int64_t generation_id, const char *claim_uid,
+                                            atlas_memory_diff_kind kind, const char *reason,
                                             atlas_err *err);
 
 /* --- T6: reading a source, by the principal that can read it ---------------
@@ -563,5 +680,135 @@ atlas_status atlas_memory_extract(const atlas_buf *bytes, atlas_memory_propositi
  * carries it. */
 atlas_status atlas_memory_anchor_resolve(atlas_db *db, int64_t repo_id, atlas_memory_proposition *p,
                                          atlas_err *err);
+
+/* --- T8: the pass ------------------------------------------------------------
+ *
+ * Observe outside a transaction, apply inside one -- Decision 9, and the exact
+ * reason an earlier draft that read, extracted and submitted "inside the
+ * caller's transaction" was rejected in review: reading a source is a file
+ * open and a `git cat-file` process, and A1 forbids both inside a write
+ * transaction.
+ */
+
+/* One item read from one registered source, plus what the observe phase
+ * derived from it before any transaction opened: T7's split (anchors not yet
+ * resolved -- that is the apply phase's own read of the index) and, for a
+ * `REPO_*` item whose bytes were actually read, the whole item's own content
+ * hash -- distinct from any one proposition's `text_sha256`, and what decides
+ * whether the apply phase writes a new `memory_source_versions` row at all.
+ *
+ * `bytes` is kept, not freed after extraction, when `blob_oid` is empty:
+ * exactly the versions with no blob carry their own bytes (migration 29's
+ * `CHECK(blob_oid <> '' OR content IS NOT NULL)`), and only the apply phase
+ * -- database work, inside the transaction -- may write them. A git-tracked
+ * item's `bytes` is freed once extraction has read them, because git is
+ * canonical for it and the version row will carry no `content` at all. */
+typedef struct atlas_memory_observed_item {
+    atlas_buf rel_path;  /* the DIR child's own name; empty for a FILE source */
+    atlas_buf blob_oid;  /* empty for untracked/DIR-child/EXTERNAL content */
+    atlas_buf commit_oid;
+    atlas_buf bytes;       /* freed once read when blob_oid is non-empty; see above */
+    atlas_buf content_sha256; /* of `bytes` as actually read, computed in observe */
+    int64_t content_bytes; /* the length observed, kept even after `bytes` is freed */
+    atlas_memory_read_outcome outcome;
+    bool from_mirror;
+} atlas_memory_observed_item;
+
+/* Everything the observe phase learned about one registered source, ready for
+ * the apply phase to act on. `path_raw`/`path_text` are the source's own
+ * registered path (a directory's own path for a `*_DIR` class, not any
+ * child's); `items`/`item_count` are that source's `atlas_memory_read_source`
+ * result (a `*_FILE` source's is always exactly one, at `items[0]`).
+ *
+ * `candidates`/`candidate_count` are T7's split, **pooled across every item of
+ * this one source** and bounded together at `ATLAS_MEMORY_MAX_PROPOSITIONS` --
+ * that constant's own comment reads "per source, per pass", so a `*_DIR`
+ * source's children share one budget rather than each getting their own.
+ * `candidate_item[k]` is the index into `items[]` the `k`th candidate was
+ * split from, which is what lets the apply phase find the right item's own
+ * path and version identity for a candidate pooled this way. */
+typedef struct atlas_memory_observed_source {
+    atlas_memory_source_class cls;
+    atlas_buf path_raw;
+    atlas_buf path_text;
+    /* The call-level flag from `atlas_memory_read_source`'s own `from_mirror_out`
+     * -- kept beside each item's own copy because an empty or fully-filtered
+     * `*_DIR` listing has no item of its own to carry it (memory.h's own
+     * comment on that parameter). Always false for an EXTERNAL_* source: T8
+     * never reads one itself. */
+    bool from_mirror;
+
+    size_t item_count;
+    atlas_memory_observed_item items[ATLAS_MEMORY_MAX_DIR_ENTRIES];
+
+    size_t candidate_count;
+    atlas_memory_proposition candidates[ATLAS_MEMORY_MAX_PROPOSITIONS];
+    uint8_t candidate_item[ATLAS_MEMORY_MAX_PROPOSITIONS];
+    /* This source's own share of ATLAS_MEMORY_MAX_PROPOSITIONS was reached --
+     * reported, never silent, A5's rule. */
+    bool bound_hit;
+
+    /* EXTERNAL_*: T8 never reads one itself (a different principal does, and
+     * writes it through T11's `memory.put`, not yet built). `external_latest`
+     * is the already-stored `memory_source_versions` row this pass treats as
+     * its observation for this source -- read, not read *from* -- and its own
+     * `.content` is what `candidates` above was split from. Unset
+     * (`external_latest_found == false`) when no `memory_sources` row for this
+     * policy entry exists yet: nothing has ever been put, so there is nothing
+     * to extract this pass. */
+    bool is_external;
+    bool external_latest_found;
+    atlas_memory_version_row external_latest;
+} atlas_memory_observed_source;
+
+/* Everything the observe phase learned that a transaction can now act on.
+ * Owns its buffers; `_init`/`_free` pair. Nothing in it references a live
+ * statement, a git handle or an open fd -- Decision 9's boundary.
+ *
+ * **This struct is large by construction** (bounded at
+ * `ATLAS_MEMORY_MAX_SOURCES` times `ATLAS_MEMORY_MAX_DIR_ENTRIES` items and
+ * `ATLAS_MEMORY_MAX_PROPOSITIONS` candidates each -- on the order of a
+ * megabyte at the compiled ceilings) precisely because those ceilings are
+ * Decision 10's whole argument for why this job's duration is *statable*
+ * rather than unbounded. A caller allocates one on the heap, never the
+ * stack. */
+typedef struct atlas_memory_observation {
+    size_t source_count;
+    atlas_memory_observed_source sources[ATLAS_MEMORY_MAX_SOURCES];
+} atlas_memory_observation;
+
+void atlas_memory_observation_init(atlas_memory_observation *o);
+void atlas_memory_observation_free(atlas_memory_observation *o);
+
+/* Phase 1. Reads every registered source for one repository through T6, splits
+ * and normalises through T7's pure half, and hashes. Creates processes and
+ * opens files; the caller must hold NO transaction. For an EXTERNAL_* source it
+ * reads nothing and marks the latest stored version as the observation.
+ *
+ * `pol` supplies the registered sources (`atlas_syspolicy_memory_source_at_checked`);
+ * an entry naming a repository other than `repo->name` is skipped -- one
+ * observation is always about one repository. `db` is used for read-only
+ * lookups only (an EXTERNAL_* source's already-stored latest version; never a
+ * write, never inside a transaction this function opens -- it opens none). */
+atlas_status atlas_memory_observe(atlas_db *db, const atlas_repo_info *repo,
+                                  const char *data_dir, const atlas_syspolicy *pol,
+                                  atlas_memory_observation *out, atlas_err *err);
+
+typedef struct atlas_memory_pass_result {
+    int64_t generation;          /* 0 = nothing changed, no generation appended */
+    size_t sources_seen, versions_added, claims_created, claims_resolved;
+    size_t unanchored, diff_rows, intake_bound_hits;
+    bool sources_bound_hit;      /* a bound was reached; reported, never silent */
+} atlas_memory_pass_result;
+
+/* Phase 2. Inside the caller's transaction: database work only. Materialises
+ * source rows from the policy, appends version rows for moved content, resolves
+ * anchors (T7's impure half), emits the intake ops, writes anchors and
+ * unanchored rows, appends the generation and its diff (T9), and advances the
+ * trailer cursor (T14's ingest). */
+atlas_status atlas_memory_apply_in_tx(atlas_db *db, const atlas_repo_info *repo,
+                                      const atlas_memory_observation *obs,
+                                      const atlas_syspolicy *pol, const char *now,
+                                      atlas_memory_pass_result *out, atlas_err *err);
 
 #endif /* ATLAS_MEMORY_H */

@@ -1368,7 +1368,20 @@ typedef struct atlas_memory_pack {
      * pack's own rendered order. `flagged_anchors` is one triple (claim uid,
      * "PATH", anchor value) per PATH anchor belonging to a flagged claim in
      * the relevant set -- the reliance check's own input, and the reason a
-     * SYMBOL- or DECISION-only flagged claim contributes nothing here. */
+     * SYMBOL- or DECISION-only flagged claim contributes nothing here.
+     *
+     * "Flagged" (`pack.c`'s `troubled`) is a stored conflict, a stale or
+     * contradicted verification state, **or no result at all** -- and a
+     * claim's deterministic result is only ever produced when a `COMMIT`
+     * pass's own touched-path check reaches its anchor (season-review I2),
+     * so "no result yet" is the ordinary state of a claim nothing has
+     * separately re-verified, not an edge case. `flagged_anchors` is
+     * therefore, in practice, close to every PATH anchor of every relevant
+     * claim, and the reliance check built from it reads as "the worker
+     * touched a file a relevant memory bullet mentions" more often than as
+     * a specific finding about stale or contradicted material
+     * (season-review I6, a disclosed consequence rather than a mechanism
+     * defect: the check still decides nothing). */
     atlas_buf claims_manifest;
     atlas_buf flagged_anchors;
 } atlas_memory_pack;

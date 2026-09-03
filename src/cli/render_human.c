@@ -2931,10 +2931,22 @@ static atlas_status h_memory_pack(atlas_renderer *r, const atlas_memory_render *
         /* §7: T13's reliance check, undistorted into one bit. Four states:
          * never gathered (not checked at all), gathered zero (checked,
          * complete, no matched uid), complete with matches (checked,
-         * complete, at least one uid), and truncated (checked, incomplete). */
+         * complete, at least one uid), and truncated (checked, incomplete).
+         *
+         * M3 (season review): `reliance_checked == 0` used to be printed as
+         * "no repo-tree task in this run has completed yet" -- one specific
+         * cause among several that all leave the same zero
+         * (`reliance_check`, `src/db/db_orch.c`): a job outside any run, a
+         * run with no frozen pack, a pack with no flagged anchor, and a
+         * completion whose own observation never landed -- which a
+         * *completed* task can produce, when the driver's gather step
+         * itself failed, or when the reliance check's own database call
+         * failed and was swallowed (this project's stated cost: that
+         * failure has no logging channel). The message no longer asserts
+         * which of those happened, because it cannot know. */
         if (!mr->reliance_checked) {
-            (void)fprintf(o, "reliance      never gathered (no repo-tree task in this run has "
-                             "completed yet)\n");
+            (void)fprintf(o, "reliance      not established (no completed task's observation has "
+                             "been checked against this pack)\n");
         } else if (mr->reliance_claim_uids == NULL || mr->reliance_claim_uids[0] == '\0') {
             (void)fprintf(o, "reliance      gathered, %s: no flagged claim's anchor was touched\n",
                           mr->reliance_complete ? "complete" : "incomplete");

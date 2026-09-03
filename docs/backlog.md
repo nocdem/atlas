@@ -2080,3 +2080,97 @@ proposition carries, which keeps the vocabulary unchanged and moves the question
 `RETENTION[]` where two tables already have prunability arguments written at their rows; or
 leaving both and bounding the pool by recency, which is the one option that silently drops a
 claim somebody may still rely on and should be rejected explicitly rather than by omission.
+
+## A memory patch's deletion guard trusts a verification algorithm version it never reads (2026-09-03)
+
+Found by the whole-branch review of A12.1 (Important 1) and verified against the code, not
+the review, before being recorded.
+
+**The chain.** `patch_may_delete` (`src/memory/patch.c`) refuses a proposed deletion when
+`conflict == ATLAS_CONFLICT_IMPLEMENTATION` or `stale` is true, and reads neither field's
+producing algorithm. The read that feeds it, `atlas_db_verify_result_latest`
+(`src/db/db_verify.c`), selects `state, conflict, stale, basis` — no `algorithm`. §4 of
+`docs/context-reconciliation.md` states the general rule this season itself established —
+"a stored conflict is only readable together with the algorithm that produced it," because a
+pre-bump row's `conflict = NONE` means "never computed this rule," not "checked, no
+conflict" — and the deletion guard is exactly a place that rule must hold and does not
+mechanically enforce.
+
+**Why nothing has broken.** `patch_may_delete` is asked about anchored claims only, and the
+one writer of an anchor is the reconciler (T8), which was built after this season's own
+algorithm bump (T5). Every anchored claim's stored result is therefore post-bump as a fact
+about this season's build order, not because `patch.c` checked. That is safety by ordering,
+not by construction — the shape this project's own rules distrust elsewhere (A11.0's parent
+resolution, A9.1's kind immutability) precisely because ordering holds until something
+changes it without knowing it needs to.
+
+**What would break it, and what closing it costs.** A second writer of an anchor, or a
+migration that backfills one onto a claim whose result predates the current algorithm, would
+present `patch_may_delete` with a stale `conflict` it would read as settled. Closing it means
+adding an `algorithm` column to `atlas_db_verify_result_latest`'s projection and a version
+term to `patch_may_delete`, refusing (or reading UNKNOWN for) any result whose algorithm is
+not the current one — a behaviour change to a function three absolutes already route through
+by design, and one this season's own reachability argument makes unnecessary today. Recorded
+rather than fixed in passing, the same reasoning `docs/engineering-rules.md`'s season rule for
+I1 states: adding a term to an absolute needs its own argument, not a fix round's aside.
+
+## The trailer cursor is not one of `atlas_memory_plan_for`'s three signals (2026-09-03)
+
+Found by the whole-branch review of A12.1 (Important 5, second half) and verified against
+`src/memory/reconcile.c` before being recorded.
+
+**The chain.** T14's own acceptance is "`ceil(N/512)` passes to reach HEAD" — true of passes
+once one runs, and no pass runs on its own. `atlas_memory_plan_for` (`reconcile.c:2352-2436`,
+"T9: does this repository owe a pass, and why") derives whether a pass is owed from exactly
+three signals: the decision-set digest, each `REPO_*` source's index hash against its last
+recorded version, and the indexed commit against the last generation's. `trailer_scan_high`
+against `max(commits.id)` is not one of them and is never read here at all — it is advanced
+only *inside* a pass that already ran for some other reason (`reconcile.c:2225-2254`).
+
+**The consequence.** A repository enabled for automatic reconciliation reaches its first
+trailer scan window only as a side effect of a commit, a source edit or a decision approval —
+never because the trailer itself fell behind. A repository adopted with N historical commits
+and no further activity of those three kinds never schedules a pass at all without an
+operator running `memory reconcile` by hand `ceil(N/512)` times. A quiet, already-adopted
+repository is the case this reaches, and it is silent: `memory status` reports the plan's
+verdict from the same three signals, so it never says "the trailer owes a scan" either.
+
+**What settling it requires, which is why it is recorded rather than patched.** Making
+`trailer_scan_high < max(commits.id)` a fourth signal changes what "nothing owed" means for
+every caller of `atlas_memory_plan_for`, including the watcher tick that decides whether to
+enqueue automatic work at all — a design change to a function this season built as "the same
+three questions `atlas_memory_apply_in_tx` derives its own cause from," not a bug in it.
+Whoever adds the signal should decide it beside Decision 7's own three-cause vocabulary
+(already short one member for the `SOURCE_REVISION`-by-fallthrough case recorded above it in
+`docs/context-reconciliation.md` §7), rather than as an unrelated addition to `plan_for`.
+
+## `atlas_syspolicy_memory_source_count_checked` clamps a count the loader already refused to exceed (2026-09-03)
+
+Found in the T1+T2 review, carried forward across two fix rounds, and only now given its own
+backlog entry — the season review noted it should have one and this round supplies it rather
+than continuing to defer.
+
+**The chain.** `atlas_syspolicy_memory_source_count_checked` (`src/core/syspolicy.c:148-155`)
+reads: `if (p->memory_source_count > ATLAS_MEMORY_MAX_SOURCES) { return ATLAS_MEMORY_MAX_SOURCES;
+}`. This is this file's own house rule stated backwards: every other out-of-range value in
+this policy is `MALFORMED`, never clamped (CLAUDE.md's P0 section states the general rule for
+`watch_max_dirs_total`, and this file follows it everywhere else). The loader already enforces
+the bound at parse time — `src/core/syspolicy.c:418-419`, `if (out->memory_source_count >=
+ATLAS_MEMORY_MAX_SOURCES) { out->reason = ATLAS_SYSPOLICY_REASON_MALFORMED; }` — before the
+count is ever incremented past `ATLAS_MEMORY_MAX_SOURCES`, and `p->state != ATLAS_SYSPOLICY_SYSTEM`
+(the only other way to reach this accessor) returns `0` before the clamp line runs at all. So
+`p->memory_source_count > ATLAS_MEMORY_MAX_SOURCES` can never be true for any policy this
+accessor is ever called with: the clamp is unreachable, not merely redundant.
+
+**Why it stays recorded rather than deleted in passing.** Removing dead code that documents a
+now-impossible case is a smaller change than it looks: the comment above the function
+("clamped against the array rather than trusted, because it is read here through a struct any
+caller may have built") asserts a threat model — a struct built by some caller other than the
+loader — that the accessor's own signature (`const atlas_syspolicy *`, no caller restriction)
+does not rule out today, even though no such caller exists in `src/`. Deleting the clamp
+without also either (a) asserting the invariant instead (a debug assert that the loader's own
+guarantee holds) or (b) auditing that no future caller can construct a struct outside the
+loader, would trade a wrong defense for a silent one. Recorded rather than fixed in this round
+because it is genuinely dead code today and carries no live consequence — the review's own
+finding was that it is "the one place in that file where the house rule is clamp," a
+consistency defect, not a reachable one.

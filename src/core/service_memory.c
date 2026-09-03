@@ -714,7 +714,17 @@ atlas_status atlas_service_memory_pack(atlas_ctx *ctx, const char *repo, const c
             (void)atlas_db_memory_pack_reliance_get(atlas_ctx_db(ctx), run, &checked, &complete,
                                                     &claim_uids, &rfound, &rerr);
             mr.reliance_checked = checked;
-            mr.reliance_complete = complete;
+            /* M2 (season review): `reliance_complete` defaults to 1 on a row
+             * nothing has checked (migration 29's schema default is the
+             * permissive value, matching "nothing found incomplete" rather
+             * than "nothing was looked at"). A client reading this field
+             * without also reading `reliance_checked` would see a
+             * completeness claim about a check that never ran. Read
+             * conservative here, the same shape this project already uses
+             * for an absent wire key (A9.2.5's remote parser, T13's own I1
+             * fix to `touched_complete`): true only when the row was both
+             * checked and found complete. */
+            mr.reliance_complete = checked && complete;
             (void)netstring_join(atlas_buf_cstr(&claim_uids), &joined, err);
             mr.reliance_claim_uids = atlas_buf_cstr(&joined);
         }

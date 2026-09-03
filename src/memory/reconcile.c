@@ -1753,6 +1753,17 @@ atlas_status atlas_memory_source_set_digest(atlas_db *db, const atlas_repo_info 
  * closed, by design, over what SQLite cannot widen in place, is a real
  * vocabulary decision for whoever owns Decision 7's precedence, not a
  * schema-mechanics question a fix round settles in passing.)
+ * Season-review I5: a landed trailer binding reaches this identical
+ * fallthrough by a second, independent route. The trailer scan sets
+ * `ctx.any_change = true` whenever it lands a row -- `has_block` or
+ * `bound_hit` alike (T14 fix round, `trailer_written > 0` below this
+ * function) -- and neither is a source revision, a decision revision or a
+ * commit by this function's own three tests, so a pass whose *only* finding
+ * is a trailer row also falls through here. Two unrelated real events now
+ * share this one label; the reasoning for stopping at `SOURCE_REVISION`
+ * rather than widening the CHECK is the same as the drift case's, not
+ * repeated for each.
+ *
  * `SOURCE_REVISION` is the closest available label by the
  * same reasoning `!have_last` already uses above -- a repository fact this
  * process cannot otherwise account for -- and this is now an asserted,

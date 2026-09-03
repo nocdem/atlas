@@ -384,6 +384,97 @@ static void test_zero_entry_sheet_refused(void) {
     env_close(&e);
 }
 
+/* A sheet whose file is larger than ATLAS_REVIEW_SHEET_MAX_BYTES must be
+ * refused by the parser's own frozen sentence -- never silently truncated to
+ * the byte ceiling and parsed as though it were a smaller, valid sheet. This
+ * is the case ruling #2 in the task exists to guard: reading at most
+ * ATLAS_REVIEW_SHEET_MAX_BYTES bytes (rather than ATLAS_REVIEW_SHEET_MAX_BYTES
+ * + 1) would make a 70 KB file whose 65536th byte happens to end a comment
+ * line parse as a perfectly valid, truncated sheet -- silently dropping
+ * everything past that offset and never reaching this refusal at all. One
+ * valid entry line precedes the padding so a truncation bug would surface as
+ * a *wrongly accepted* sheet with a nonzero entry count, not merely as a
+ * zero-entry refusal that could be mistaken for this one. */
+static void test_sheet_larger_than_max_bytes_refused(void) {
+    env e;
+    env_open(&e);
+
+    atlas_ctx *ctx = NULL;
+    open_ctx(&e, &ctx);
+
+    atlas_err err;
+    atlas_err_init(&err);
+    atlas_buf body = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_append_str(&body, "atlas-review-sheet/1\n", &err), &err);
+    T_OK(atlas_buf_append_str(
+             &body,
+             "approve proj atlas-dec-ffffffffffffffffffffffffffffffff r1 00000000\n", &err),
+         &err);
+    static const char PAD[] =
+        "# padding to push this sheet past the byte ceiling, one line at a time\n";
+    while (body.len <= (size_t)ATLAS_REVIEW_SHEET_MAX_BYTES) {
+        T_OK(atlas_buf_append_str(&body, PAD, &err), &err);
+    }
+    T_REQUIRE(body.len > (size_t)ATLAS_REVIEW_SHEET_MAX_BYTES);
+    T_OK(fx_write(fx_data_dir(&e.fx), "huge.txt", atlas_buf_cstr(&body), &err), &err);
+    atlas_buf_free(&body);
+
+    atlas_buf sheet_path = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_appendf(&sheet_path, &err, "%s/huge.txt", fx_data_dir(&e.fx)), &err);
+
+    capture cap;
+    memset(&cap, 0, sizeof(cap));
+    atlas_review_totals totals;
+    atlas_status st = atlas_service_review_apply(ctx, atlas_buf_cstr(&sheet_path),
+                                                 /* check_only */ true, on_outcome, &cap, &totals,
+                                                 &err);
+    T_CHECK_MSG(st != ATLAS_OK, "a sheet larger than the byte ceiling was accepted");
+    T_CHECK_MSG(strstr(atlas_err_msg(&err), "larger than") != NULL,
+                "wrong refusal for an oversized sheet: %s", atlas_err_msg(&err));
+    T_EQ_INT(cap.count, 0);
+
+    capture_free(&cap);
+    atlas_buf_free(&sheet_path);
+    atlas_ctx_close(ctx);
+    env_close(&e);
+}
+
+/* `sheet_path` is opened with O_NOFOLLOW: a symlink at that path must be
+ * refused, never traversed. */
+static void test_sheet_path_symlink_refused(void) {
+    env e;
+    env_open(&e);
+
+    atlas_ctx *ctx = NULL;
+    open_ctx(&e, &ctx);
+
+    atlas_err err;
+    atlas_err_init(&err);
+    write_sheet(&e, "real.txt",
+               "approve proj atlas-dec-ffffffffffffffffffffffffffffffff r1 00000000", NULL);
+    atlas_buf real_path = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_appendf(&real_path, &err, "%s/real.txt", fx_data_dir(&e.fx)), &err);
+    T_OK(fx_symlink(fx_data_dir(&e.fx), atlas_buf_cstr(&real_path), "link.txt", &err), &err);
+
+    atlas_buf link_path = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_appendf(&link_path, &err, "%s/link.txt", fx_data_dir(&e.fx)), &err);
+
+    capture cap;
+    memset(&cap, 0, sizeof(cap));
+    atlas_review_totals totals;
+    atlas_status st = atlas_service_review_apply(ctx, atlas_buf_cstr(&link_path),
+                                                 /* check_only */ true, on_outcome, &cap, &totals,
+                                                 &err);
+    T_CHECK_MSG(st != ATLAS_OK, "a symlinked sheet path was accepted");
+    T_EQ_INT(cap.count, 0);
+
+    capture_free(&cap);
+    atlas_buf_free(&link_path);
+    atlas_buf_free(&real_path);
+    atlas_ctx_close(ctx);
+    env_close(&e);
+}
+
 static const atlas_test TESTS[] = {
     {"check_only walks MISSING, MOVED (both triggers), DISPOSED and READY "
      "without minting a capability",
@@ -391,6 +482,11 @@ static const atlas_test TESTS[] = {
     {"a header-only sheet (zero entries) is refused rather than vacuously "
      "succeeding",
      test_zero_entry_sheet_refused},
+    {"a sheet larger than the byte ceiling is refused, never silently "
+     "truncated and parsed",
+     test_sheet_larger_than_max_bytes_refused},
+    {"a symlinked sheet path is refused, never traversed",
+     test_sheet_path_symlink_refused},
 };
 
 ATLAS_TEST_MAIN("review_apply", TESTS)

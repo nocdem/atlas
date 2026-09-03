@@ -398,9 +398,8 @@ static void test_every_response_carries_the_security_headers(void) {
  * negative list can only ever list what somebody already thought of.
  *
  * `READ_METHODS[]` below is the actual guarantee: a positive allowlist of
- * every method this table forwards to today. A name is added to it only
- * after establishing, independently of this test, that the method is a read
- * the gateway uid may make -- never because it merely failed to match one of
+ * every method `API_ROUTES[]` names as what it forwards to, today. A name is
+ * added to it only on purpose, never because it merely failed to match one of
  * the negative checks that follow. A row naming anything else fails loudly,
  * on this line, the moment it is added; a count would have drifted silently
  * instead. This is the same shape `HOOK_EVENTS[]` (`src/hook/hook.c`) and the
@@ -409,6 +408,32 @@ static void test_every_response_carries_the_security_headers(void) {
  * purpose. `route_count` is still used only as the loop bound and is never
  * asserted -- a table that grows or shrinks by a row must not change whether
  * this test passes, only the property of each row must.
+ *
+ * Fix round 2: not every name on that list names a method that exists. Three
+ * of the twenty-six do not reach any dispatch table in `src/ipc/` at all:
+ * `code.search`, `sem.callers` and `sem.callees`. `api_handle` forwards
+ * `route->method` over IPC verbatim; `dispatch()` (`src/ipc/server.c`) walks
+ * its tables for that exact name, finds none of these three anywhere, and
+ * answers `unknown method`. The real methods are `code.symbol.search`
+ * (`src/ipc/server_code.c:924`) for a code search, and one method for both
+ * call-graph directions -- `sem.graph` (`src/ipc/server_sem.c:1033`), which
+ * picks `callers` versus `callees` from an `inbound` boolean parameter that
+ * `/api/v1/sem/callers` and `/api/v1/sem/callees` do not currently forward.
+ * So `/api/v1/code/search`, `/api/v1/sem/callers` and `/api/v1/sem/callees`
+ * are three dead routes: every request to them fails at the daemon, not at
+ * the gateway, and always has, since long before A15. This test does not fix
+ * them -- `code/search` is a one-word row edit, but the two `sem` routes need
+ * either a new fixed-parameter field in `api_route` or a client-forwarded
+ * `inbound` name, and both change the shape of `API_ROUTES[]` that this
+ * season's threat argument rests on not changing, so A15 leaves them as they
+ * are and `docs/backlog.md` records the defect. They stay on
+ * `READ_METHODS[]` rather than being removed: removing them would fail this
+ * test against a table nobody is fixing this season, and a name absent from
+ * the table it forwards to is still, truthfully, a name the table forwards
+ * to. So for twenty-three of the twenty-six names, membership means what the
+ * paragraph above says -- established as a read the gateway uid may make. For
+ * these three it means only that `API_ROUTES[]` names them; nothing reaches
+ * them to be a read or a write at all.
  *
  * The negative checks kept below are the stated reasons, not the guarantee:
  * they document *why* several specific names must never appear, each citing

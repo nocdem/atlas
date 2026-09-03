@@ -12,6 +12,7 @@
  * no case asserts anything about whether memory *helps*. That is the
  * experiment's question and a test cannot answer it.
  */
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1115,58 +1116,200 @@ static size_t count_occurrences(const char *text, const char *needle) {
     return n;
 }
 
-/* M5, T13 fix round. `atlas_orch_memory_compose` (`src/orch/memory.c`) is
- * public, exported, and -- since T13 replaced the workspace attempt path's
- * call to it with the shared `atlas_memory_pack_compose` -- has no
- * production caller left. A third injection path calling it directly would
- * silently append A10.1's package while skipping T13's context pack, and
- * nothing would notice a caller added anywhere but the two composer call
- * sites this file already names in its own restated comment
- * (`src/orch/rundriver.c:1186-1205`). Counted the same way `FORBIDDEN[]` in
- * `tests/test_decision_mcp.c` counts tool names: by scanning the files, not
- * by trusting a comment that says "the composer is the one implementation of
- * appending run context". */
-static void test_the_composer_has_exactly_two_production_callers(void) {
-    static const char *const COMPOSER_FILES[] = {
-        ATLAS_SRC_DIR "/src/orch/rundriver.c",
-        ATLAS_SRC_DIR "/src/orch/dispatch.c",
-        NULL,
-    };
-    size_t total = 0;
-    for (size_t f = 0; COMPOSER_FILES[f] != NULL; f++) {
-        char *text = slurp(COMPOSER_FILES[f]);
-        T_REQUIRE_MSG(text != NULL, "cannot read %s", COMPOSER_FILES[f]);
-        size_t n = count_occurrences(text, "atlas_memory_pack_compose(");
-        T_CHECK_MSG(n == 1, "%s calls atlas_memory_pack_compose %zu times, want exactly 1",
-                    COMPOSER_FILES[f], n);
-        total += n;
-        free(text);
+/* Parse the `add_library(atlas_core STATIC ...)` call out of the top-level
+ * `CMakeLists.txt` and return everything between its outer parentheses, as a
+ * freshly allocated, NUL-terminated buffer the caller frees. CLAUDE.md's own
+ * wiring rule is what makes this the right source to scan rather than a named
+ * subset: "there is no file(GLOB); a file not listed is not compiled", so this
+ * one list is exactly the set of first-party `.c` files that can call
+ * anything at all in a release build. Depth-counted rather than
+ * line-anchored, because the block's own comments contain balanced
+ * parentheses (`(T6)`, `(no process, no git invocation)`, ...) that a
+ * search for the next ")" would stop at early. */
+static char *slurp_atlas_core_source_block(void) {
+    char *text = slurp(ATLAS_SRC_DIR "/CMakeLists.txt");
+    T_REQUIRE_MSG(text != NULL, "cannot read " ATLAS_SRC_DIR "/CMakeLists.txt");
+    static const char *const marker = "add_library(atlas_core STATIC";
+    char *start = strstr(text, marker);
+    T_REQUIRE_MSG(start != NULL,
+                  "CMakeLists.txt has no add_library(atlas_core STATIC ...) block");
+    char *p = start + strlen(marker);
+    char *block_start = p;
+    int depth = 1; /* the '(' already consumed as part of the marker */
+    while (*p != '\0' && depth > 0) {
+        if (*p == '(') {
+            depth++;
+        } else if (*p == ')') {
+            depth--;
+        }
+        if (depth > 0) {
+            p++;
+        }
     }
-    T_CHECK_MSG(total == 2,
-                "atlas_memory_pack_compose has %zu call site(s) across the files this test "
-                "knows about, want exactly 2 -- a third injection path exists and this test "
-                "does not yet know where",
-                total);
+    T_REQUIRE_MSG(depth == 0, "add_library(atlas_core STATIC ...) never closes");
+    size_t len = (size_t)(p - block_start);
+    char *block = malloc(len + 1);
+    T_REQUIRE(block != NULL);
+    memcpy(block, block_start, len);
+    block[len] = '\0';
+    free(text);
+    return block;
+}
 
-    /* The superseded composer must stay production-dead: a call anywhere in
-     * these files other than its own definition and declaration would be an
-     * unaccounted third path appending only the A10.1 package. */
-    static const char *const PROD_FILES[] = {
-        ATLAS_SRC_DIR "/src/orch/rundriver.c",
-        ATLAS_SRC_DIR "/src/orch/dispatch.c",
-        ATLAS_SRC_DIR "/src/daemon/writer.c",
-        ATLAS_SRC_DIR "/src/core/service_orch.c",
-        ATLAS_SRC_DIR "/src/ipc/server_orch.c",
-        NULL,
-    };
-    for (size_t f = 0; PROD_FILES[f] != NULL; f++) {
-        char *text = slurp(PROD_FILES[f]);
-        T_REQUIRE_MSG(text != NULL, "cannot read %s", PROD_FILES[f]);
-        size_t n = count_occurrences(text, "atlas_orch_memory_compose(");
-        T_CHECK_MSG(n == 0, "%s calls the superseded atlas_orch_memory_compose %zu time(s)",
-                    PROD_FILES[f], n);
+/* Split the block into the `.c` paths it lists, one per line, skipping blank
+ * lines, comment lines and the `${ATLAS_UI_GEN}` variable reference. Returns
+ * the count and sets *out_paths to a freshly allocated array of freshly
+ * allocated, NUL-terminated strings; the caller frees each string and then
+ * the array. */
+static size_t collect_atlas_core_sources(const char *block, char ***out_paths) {
+    size_t cap = 64, n = 0;
+    char **paths = malloc(cap * sizeof(char *));
+    T_REQUIRE(paths != NULL);
+    const char *line = block;
+    while (*line != '\0') {
+        const char *eol = strchr(line, '\n');
+        const char *e = (eol != NULL) ? eol : line + strlen(line);
+        const char *s = line;
+        while (s < e && isspace((unsigned char)*s)) {
+            s++;
+        }
+        while (e > s && isspace((unsigned char)*(e - 1))) {
+            e--;
+        }
+        size_t slen = (size_t)(e - s);
+        if (slen > 2 && s[0] != '#' && s[0] != '$' && s[slen - 2] == '.' && s[slen - 1] == 'c') {
+            if (n == cap) {
+                cap *= 2;
+                char **bigger = realloc(paths, cap * sizeof(char *));
+                T_REQUIRE(bigger != NULL);
+                paths = bigger;
+            }
+            char *copy = malloc(slen + 1);
+            T_REQUIRE(copy != NULL);
+            memcpy(copy, s, slen);
+            copy[slen] = '\0';
+            paths[n++] = copy;
+        }
+        if (eol == NULL) {
+            break;
+        }
+        line = eol + 1;
+    }
+    *out_paths = paths;
+    return n;
+}
+
+static void free_atlas_core_sources(char **paths, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        free(paths[i]);
+    }
+    free(paths);
+}
+
+/* M5, T13 fix round, redone against the re-review's finding: the first
+ * version of this test slurped exactly `src/orch/rundriver.c` and
+ * `src/orch/dispatch.c` and asserted their combined call count was 2 -- a
+ * total computed over the same two files it already trusted, so a third call
+ * site anywhere else in the library (`src/daemon/writer.c`, a brand new file,
+ * anywhere) left that total at 2 and the suite green. The fix report called
+ * that "Fixed"; the re-review did not, because the test's own failure message
+ * said so ("a third injection path exists and this test does not yet know
+ * where") while the report did not.
+ *
+ * This version scans every `.c` file `CMakeLists.txt` actually compiles into
+ * `atlas_core` -- the same list CLAUDE.md's wiring rule makes authoritative,
+ * because a file missing from it is not a link error waiting to happen, it is
+ * uncompiled -- so a third caller anywhere in the binary is seen regardless
+ * of which file it lands in.
+ *
+ * `atlas_memory_pack_compose` (`src/memory/pack.c:797`) and
+ * `atlas_orch_memory_compose` (`src/orch/memory.c:568`) each match their own
+ * name once in their defining file -- the signature, not a call -- so each
+ * defining file is asserted to hold exactly that one occurrence and is
+ * excluded from the caller tally rather than silently skipped. */
+static void test_the_composer_has_exactly_two_production_callers(void) {
+    static const char *const PACK_COMPOSE = "atlas_memory_pack_compose(";
+    static const char *const ORCH_MEMORY_COMPOSE = "atlas_orch_memory_compose(";
+    static const char *const PACK_COMPOSE_DEFINITION = "src/memory/pack.c";
+    static const char *const ORCH_MEMORY_COMPOSE_DEFINITION = "src/orch/memory.c";
+
+    char *block = slurp_atlas_core_source_block();
+    char **paths = NULL;
+    size_t n = collect_atlas_core_sources(block, &paths);
+    free(block);
+    /* A parser that silently returned nothing would make every check below
+     * pass vacuously. CMakeLists.txt lists well over a hundred `.c` files as
+     * of this season; require enough of them to prove the parser walked the
+     * real block rather than an empty or truncated one. */
+    T_REQUIRE_MSG(n >= 100,
+                  "atlas_core source list parsed to only %zu file(s) -- the CMakeLists.txt "
+                  "parser is broken, not the library",
+                  n);
+
+    size_t pack_compose_total = 0;
+    size_t rundriver_pack_compose = 0;
+    size_t dispatch_pack_compose = 0;
+    size_t orch_memory_compose_total = 0;
+
+    for (size_t i = 0; i < n; i++) {
+        char full[4096];
+        int printed = snprintf(full, sizeof full, "%s/%s", ATLAS_SRC_DIR, paths[i]);
+        T_REQUIRE(printed > 0 && (size_t)printed < sizeof full);
+        char *text = slurp(full);
+        T_REQUIRE_MSG(text != NULL, "cannot read %s, listed in CMakeLists.txt's atlas_core sources",
+                      full);
+
+        size_t pack_n = count_occurrences(text, PACK_COMPOSE);
+        if (strcmp(paths[i], PACK_COMPOSE_DEFINITION) == 0) {
+            T_CHECK_MSG(pack_n == 1,
+                        "%s (atlas_memory_pack_compose's own definition) matches its name %zu "
+                        "time(s), want exactly 1",
+                        paths[i], pack_n);
+        } else {
+            pack_compose_total += pack_n;
+            if (strcmp(paths[i], "src/orch/rundriver.c") == 0) {
+                rundriver_pack_compose = pack_n;
+            } else if (strcmp(paths[i], "src/orch/dispatch.c") == 0) {
+                dispatch_pack_compose = pack_n;
+            } else {
+                T_CHECK_MSG(pack_n == 0, "%s calls atlas_memory_pack_compose %zu time(s); a "
+                            "third injection path exists and this test now knows where",
+                            paths[i], pack_n);
+            }
+        }
+
+        size_t orch_n = count_occurrences(text, ORCH_MEMORY_COMPOSE);
+        if (strcmp(paths[i], ORCH_MEMORY_COMPOSE_DEFINITION) == 0) {
+            T_CHECK_MSG(orch_n == 1,
+                        "%s (atlas_orch_memory_compose's own definition) matches its name %zu "
+                        "time(s), want exactly 1",
+                        paths[i], orch_n);
+        } else {
+            orch_memory_compose_total += orch_n;
+            T_CHECK_MSG(orch_n == 0,
+                        "%s calls the superseded atlas_orch_memory_compose %zu time(s)",
+                        paths[i], orch_n);
+        }
+
         free(text);
     }
+
+    T_CHECK_MSG(rundriver_pack_compose == 1,
+                "src/orch/rundriver.c calls atlas_memory_pack_compose %zu time(s), want exactly 1",
+                rundriver_pack_compose);
+    T_CHECK_MSG(dispatch_pack_compose == 1,
+                "src/orch/dispatch.c calls atlas_memory_pack_compose %zu time(s), want exactly 1",
+                dispatch_pack_compose);
+    T_CHECK_MSG(pack_compose_total == 2,
+                "atlas_memory_pack_compose has %zu call site(s) across every file "
+                "CMakeLists.txt compiles into atlas_core, want exactly 2",
+                pack_compose_total);
+    T_CHECK_MSG(orch_memory_compose_total == 0,
+                "the superseded atlas_orch_memory_compose has %zu caller(s) across every file "
+                "CMakeLists.txt compiles into atlas_core, want exactly 0",
+                orch_memory_compose_total);
+
+    free_atlas_core_sources(paths, n);
 }
 
 static const atlas_test TESTS[] = {

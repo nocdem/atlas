@@ -942,11 +942,20 @@ static atlas_status submit_resolve_run(atlas_db *db, const atlas_orch_spec *s, c
          * way and for the same two reasons, in its own table under
          * `UNIQUE(run_uid)`: `atlas_memory_pack_freeze_in_tx` reads nothing and
          * writes one row, so it belongs here beside the freeze above rather
-         * than after this transaction commits. `has_context_pack` is false for
-         * a repository with no registered source or no generation yet
-         * (`run_orch`, `src/daemon/writer.c`, decides this before building);
-         * such a run gets no row, and delivery later appends nothing at all --
-         * not a shorter section, not a sentence saying there is none. */
+         * than after this transaction commits. `has_context_pack` is decided
+         * before this point by `run_orch_build_pack`
+         * (`src/daemon/writer.c`), which sets it from
+         * `op->context_pack.memory_generation > 0` alone: true once a
+         * generation has ever been produced for the repository, false when
+         * none has. That is not quite "no registered source or no generation
+         * yet" -- a repository whose declared sources were all deregistered
+         * from the root-owned policy while an old generation still exists
+         * still has one, so it still gets a row here (M4, T13 fix round;
+         * `run_orch_build_pack`'s own comment carries the reasoning for
+         * leaving it this way rather than adding a sources count). Either
+         * way, a run with `has_context_pack` false gets no row, and delivery
+         * later appends nothing at all -- not a shorter section, not a
+         * sentence saying there is none. */
         if (st == ATLAS_OK && has_context_pack) {
             st = atlas_memory_pack_freeze_in_tx(db, atlas_buf_cstr(run_uid_out), context_pack, err);
         }

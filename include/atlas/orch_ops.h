@@ -184,8 +184,16 @@ typedef struct atlas_orch_op {
      * of the wire now default this field to `false` -- `atlas_orch_op_new`
      * (`src/db/db_orch.c`) and `outcome_init` (`src/orch/rundriver.c`) -- and
      * the key is sent unconditionally by `build_run_complete`
-     * (`src/core/service_orch.c`), so an absent key on the wire is now itself
-     * an anomaly rather than the ordinary carrier of this field's meaning.
+     * (`src/core/service_orch.c`), the run driver's completion path -- so an
+     * absent key from *that* producer is now itself an anomaly rather than
+     * the ordinary carrier of this field's meaning. It is not a universal
+     * claim: `build_complete` (`src/orch/dispatch.c`), the A11.6 workspace
+     * sibling's completion, sends neither key on every one of its completions,
+     * for which an absent key is the ordinary case, not an anomaly -- the
+     * server-side reconstructor (`method_dispatch_complete`,
+     * `src/ipc/server_orch.c`) reads it that way, as "a caller other than
+     * Atlas' own driver", and falls back to the conservative default rather
+     * than reading an anomaly into it.
      * Separately, and regardless of the wire value: `reliance_check`
      * (`src/db/db_orch.c`) refuses to read `touched_complete` at all when
      * `touched_paths.len == 0` (I2), treating a completion with no

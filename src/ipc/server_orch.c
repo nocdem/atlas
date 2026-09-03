@@ -2238,7 +2238,41 @@ static atlas_status method_dispatch_complete(dispatch_state *ds, const atlas_ipc
     if (st == ATLAS_OK) {
         const char *tp = NULL;
         if (atlas_ipc_param_str(req, "touched_paths", &tp) && tp != NULL) {
-            st = atlas_buf_set_str(&op->touched_paths, tp, err);
+            /* A12.1 fix round 2, re-review I3. The only externally reachable
+             * source of a `reliance_check` failure (`src/db/db_orch.c`) is a
+             * peer's malformed or over-cap `touched_paths`: decode it here,
+             * before any transaction and to a caller who can be told, the
+             * same shape as the artifact-integrity refusal above. The decoded
+             * paths themselves are not kept -- `reliance_check` decodes the
+             * stored string again when it runs -- this call exists only to
+             * refuse what it would refuse, at the boundary instead of deep
+             * inside a completion whose failure has nowhere left to go but a
+             * swallow. That leaves the swallow covering only Atlas' own
+             * storage faults, which have no channel of their own to travel
+             * on.
+             *
+             * `atlas_orch_paths_decode` was written to re-read a *stored*
+             * column and its own status/message ("malformed stored path
+             * list") say so; a peer whose own request was malformed gets
+             * `ATLAS_ERR_USAGE` instead, matching every other malformed-field
+             * refusal in this function (`:2192` above), never a claim that
+             * Atlas' database is at fault. */
+            atlas_buf scratch[ATLAS_MEMORY_MAX_TOUCHED_PATHS];
+            for (size_t i = 0; i < ATLAS_MEMORY_MAX_TOUCHED_PATHS; i++) {
+                atlas_buf_init(&scratch[i]);
+            }
+            size_t scratch_n = 0;
+            atlas_status decode_st = atlas_orch_paths_decode(
+                tp, scratch, ATLAS_MEMORY_MAX_TOUCHED_PATHS, &scratch_n, err);
+            for (size_t i = 0; i < ATLAS_MEMORY_MAX_TOUCHED_PATHS; i++) {
+                atlas_buf_free(&scratch[i]);
+            }
+            if (decode_st != ATLAS_OK) {
+                st = atlas_err_set(err, ATLAS_ERR_USAGE, "touched_paths is not a well-formed "
+                                   "path list");
+            } else {
+                st = atlas_buf_set_str(&op->touched_paths, tp, err);
+            }
         }
     }
     if (st == ATLAS_OK) {

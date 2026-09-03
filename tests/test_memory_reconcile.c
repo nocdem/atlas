@@ -1992,6 +1992,18 @@ static void t9_diff_kind_for(t8env *e, int64_t generation, const char *claim_uid
     atlas_db_finish(e->db, stmt);
 }
 
+/* C1 fix. Counts rows through the exact query the Context Pack's pool scores
+ * over (`atlas_db_verify_claims_for_repo`), so the discriminating test below
+ * asserts against the pack's own read rather than a second, hand-written one
+ * that could drift from it. */
+static atlas_status t9_count_live_cb(const atlas_verify_claim *c, void *ctx, atlas_err *err) {
+    (void)c;
+    (void)err;
+    size_t *n = ctx;
+    (*n)++;
+    return ATLAS_OK;
+}
+
 /* The hash a real scan would have written after a real commit changed the
  * path's bytes -- an opaque, distinct string is enough here (T8's own fixture
  * convention: no verifier in this suite ever checks a hash against real
@@ -2449,6 +2461,157 @@ static void test_two_propositions_sharing_one_anchor_both_remint_cleanly(void) {
     atlas_buf_free(&x_uid2);
     atlas_buf_free(&y_uid2);
     atlas_buf_free(&cause);
+    t8_env_close(&e);
+}
+
+/* Whole-branch review, 2026-09-01, C1: `test_two_propositions_sharing_one_
+ * anchor_both_remint_cleanly` directly above establishes that a COMMIT-caused
+ * pass re-mints every anchored claim, byte-for-byte stable at the *diff*
+ * surface. It does not ask what the re-mint left behind in `verify_claims`
+ * itself -- and what it left behind, before this fix, was the predecessor,
+ * permanently live: `superseded_by_claim_id` had no writer anywhere in
+ * `src/`, so the pool `atlas_db_verify_claims_for_repo` scores a Context Pack
+ * over grew by one row per bullet per commit forever, and the pack's own
+ * truncation refusal at `ATLAS_VERIFY_MAX_CLAIMS` silently ended the feature
+ * after roughly `ceil(256/N)` commits for an N-bullet memory file.
+ *
+ * `tests/test_memory_pack.c` seeds claims directly and never calls
+ * `atlas_memory_apply_in_tx`, so nothing in the suite reconciled twice across
+ * a moved head and then built a pack -- this is that test, and it drives the
+ * real pipeline both halves of the join go through: `t8_run_pass` for the
+ * remint, `atlas_db_verify_claims_for_repo` and `atlas_memory_pack_build` for
+ * the two reads C1 found silently degrading. */
+static void test_reconcile_twice_across_a_moved_head_keeps_the_pool_at_one_per_bullet(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    t8env e;
+    t8_env_open(&e, &err);
+
+    const char *repo = fx_repo(&e.fx);
+    T_OK(fx_mkdir(repo, "src", &err), &err);
+    T_OK(fx_write(repo, "src/a.c", "int a;\n", &err), &err);
+    T_OK(fx_write(repo, "src/b.c", "int b;\n", &err), &err);
+    T_OK(fx_write(repo, "note-a.md", "the file `src/a.c` holds a", &err), &err);
+    T_OK(fx_write(repo, "note-b.md", "the file `src/b.c` holds b", &err), &err);
+    T_OK(fx_add_all(&e.fx, repo, &err), &err);
+    T_OK(fx_commit(&e.fx, repo, "seed", &err), &err);
+    t8_bind_head(&e, &err);
+    t8_seed_file(&e, "src/a.c", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", &err);
+    t8_seed_file(&e, "src/b.c", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", &err);
+    t8_seed_file(&e, "note-a.md", "1111111111111111111111111111111111111111111111111111111111111111",
+                &err);
+    t8_seed_file(&e, "note-b.md", "2222222222222222222222222222222222222222222222222222222222222222",
+                &err);
+
+    const char *paths[] = {"note-a.md", "note-b.md"};
+    atlas_syspolicy pol;
+    t8_policy(&pol, ATLAS_MEMORY_SOURCE_REPO_FILE, paths, 2);
+
+    atlas_memory_pass_result r1;
+    t8_run_pass(&e, &pol, &r1, &err);
+    T_REQUIRE(r1.generation != 0);
+    T_CHECK_MSG(r1.claims_created == 2,
+               "expected both bullets to mint fresh claims on pass 1, got %zu", r1.claims_created);
+
+    atlas_buf a_uid1 = ATLAS_BUF_INIT, b_uid1 = ATLAS_BUF_INIT;
+    t9_claim_uid_for_text(&e, "the file `src/a.c` holds a", &a_uid1, &err);
+    t9_claim_uid_for_text(&e, "the file `src/b.c` holds b", &b_uid1, &err);
+
+    /* An unrelated commit: HEAD moves, so every claim re-mints (S27's own
+     * content key), but neither bullet's own referenced fact changes --
+     * `test_two_propositions_sharing_one_anchor_both_remint_cleanly`'s own
+     * fixture shape. */
+    T_OK(fx_write(repo, "unrelated.c", "int unrelated;\n", &err), &err);
+    T_OK(fx_add_all(&e.fx, repo, &err), &err);
+    T_OK(fx_commit(&e.fx, repo, "unrelated change", &err), &err);
+    t8_bind_head(&e, &err);
+    t8_seed_file(&e, "unrelated.c",
+                "3333333333333333333333333333333333333333333333333333333333333333", &err);
+
+    atlas_memory_pass_result r2;
+    t8_run_pass(&e, &pol, &r2, &err);
+    T_CHECK_MSG(r2.generation == r1.generation + 1,
+               "expected exactly one generation bump, got %lld after %lld", (long long)r2.generation,
+               (long long)r1.generation);
+    /* The honesty check the fix's own report must be able to show: if the
+     * head had not genuinely moved, both claims would resolve to their
+     * pass-1 rows (`claims_resolved`, not `claims_created`),
+     * `classify_candidate` would return at its own `claim_new == false`
+     * guard, and the pool-count assertion below would pass over a database
+     * that never exercised the supersession path at all -- created 0, pool 2,
+     * indistinguishable from success. */
+    T_CHECK_MSG(r2.claims_created == 2 && r2.claims_resolved == 0,
+               "expected both bullets to re-mint as fresh rows on this COMMIT-caused pass, got "
+               "created=%zu resolved=%zu -- the test below would not be exercising the fix",
+               r2.claims_created, r2.claims_resolved);
+
+    atlas_buf a_uid2 = ATLAS_BUF_INIT, b_uid2 = ATLAS_BUF_INIT;
+    t9_claim_uid_for_text(&e, "the file `src/a.c` holds a", &a_uid2, &err);
+    t9_claim_uid_for_text(&e, "the file `src/b.c` holds b", &b_uid2, &err);
+    T_CHECK_MSG(strcmp(atlas_buf_cstr(&a_uid1), atlas_buf_cstr(&a_uid2)) != 0,
+               "a's claim did not re-mint on a COMMIT-caused pass");
+    T_CHECK_MSG(strcmp(atlas_buf_cstr(&b_uid1), atlas_buf_cstr(&b_uid2)) != 0,
+               "b's claim did not re-mint on a COMMIT-caused pass");
+
+    /* C1's own fix, checked directly: each pass-1 row now names the pass-2
+     * row that replaced it. */
+    atlas_verify_claim a1, a2, b1, b2;
+    atlas_verify_claim_init(&a1);
+    atlas_verify_claim_init(&a2);
+    atlas_verify_claim_init(&b1);
+    atlas_verify_claim_init(&b2);
+    bool found = false;
+    T_OK(atlas_db_verify_claim_find(e.db, atlas_buf_cstr(&a_uid1), &a1, &found, &err), &err);
+    T_REQUIRE(found);
+    T_OK(atlas_db_verify_claim_find(e.db, atlas_buf_cstr(&a_uid2), &a2, &found, &err), &err);
+    T_REQUIRE(found);
+    T_OK(atlas_db_verify_claim_find(e.db, atlas_buf_cstr(&b_uid1), &b1, &found, &err), &err);
+    T_REQUIRE(found);
+    T_OK(atlas_db_verify_claim_find(e.db, atlas_buf_cstr(&b_uid2), &b2, &found, &err), &err);
+    T_REQUIRE(found);
+    T_CHECK_MSG(a1.superseded_by_claim_id == a2.id,
+               "a's pass-1 row must be superseded by a's pass-2 row, got superseded_by_claim_id=%lld, "
+               "successor id=%lld",
+               (long long)a1.superseded_by_claim_id, (long long)a2.id);
+    T_CHECK_MSG(b1.superseded_by_claim_id == b2.id,
+               "b's pass-1 row must be superseded by b's pass-2 row, got superseded_by_claim_id=%lld, "
+               "successor id=%lld",
+               (long long)b1.superseded_by_claim_id, (long long)b2.id);
+    T_CHECK_MSG(a2.superseded_by_claim_id == 0, "the live successor must not itself read as superseded");
+    T_CHECK_MSG(b2.superseded_by_claim_id == 0, "the live successor must not itself read as superseded");
+    atlas_verify_claim_free(&a1);
+    atlas_verify_claim_free(&a2);
+    atlas_verify_claim_free(&b1);
+    atlas_verify_claim_free(&b2);
+
+    /* The pool: the exact query the Context Pack scores over
+     * (`atlas_db_verify_claims_for_repo`, `src/db/db_verify.c`). Two live
+     * bullets after two passes, not four. */
+    size_t live = 0;
+    bool truncated = true;
+    T_OK(atlas_db_verify_claims_for_repo(e.db, e.repo_id, 0, 0, (int64_t)ATLAS_VERIFY_MAX_CLAIMS,
+                                         t9_count_live_cb, &live, &truncated, &err),
+        &err);
+    T_CHECK_MSG(!truncated, "the pool must not report truncated for two bullets");
+    T_CHECK_MSG(live == 2,
+               "expected exactly one live claim per bullet after two passes, got %zu live claims",
+               live);
+
+    /* The pack: one rendered entry per bullet, not one per re-mint. */
+    atlas_memory_pack pack;
+    atlas_memory_pack_init(&pack);
+    T_OK(atlas_memory_pack_build(e.db, e.repo_id, &pol,
+                                 "the file src/a.c holds a and the file src/b.c holds b", &pack, &err),
+        &err);
+    T_CHECK_MSG(pack.claim_count == 2,
+               "expected the pack to render exactly one entry per bullet, got claim_count=%lld:\n%s",
+               (long long)pack.claim_count, atlas_buf_cstr(&pack.rendered));
+    atlas_memory_pack_free(&pack);
+
+    atlas_buf_free(&a_uid1);
+    atlas_buf_free(&b_uid1);
+    atlas_buf_free(&a_uid2);
+    atlas_buf_free(&b_uid2);
     t8_env_close(&e);
 }
 
@@ -5743,6 +5906,9 @@ static const atlas_test TESTS[] = {
      test_commit_impacts_only_its_anchored_claim},
     {"C1: two propositions sharing one anchor both re-mint cleanly",
      test_two_propositions_sharing_one_anchor_both_remint_cleanly},
+    {"whole-branch review C1: two passes across a moved head keep the pool at one "
+     "live claim per bullet, and the pack renders one entry per bullet",
+     test_reconcile_twice_across_a_moved_head_keeps_the_pool_at_one_per_bullet},
     {"New Important 2: a SOURCE_REVISION re-verification is SUPPORTED, not IMPACTED",
      test_source_revision_reverification_is_supported_not_impacted},
     {"T9 fix-round-3 Minor: IMPACTED is positional, not pass-wide",

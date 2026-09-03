@@ -1642,6 +1642,19 @@ atlas_status atlas_db_verify_claim_get(atlas_db *db, int64_t id, atlas_verify_cl
 atlas_status atlas_db_verify_claim_find(atlas_db *db, const char *uid, atlas_verify_claim *out,
                                         bool *found, atlas_err *err);
 
+/* A12.1 C1 fix. `verify_claims.superseded_by_claim_id`'s only writer: sets it
+ * to `superseded_by_claim_id` on `claim_id`'s row, and only there.
+ *
+ * A compare-and-swap, A4's rule applied to this column: the `WHERE` clause
+ * names the state observed (still live) as well as the row, so a caller gets
+ * `*changed_out == false` rather than a second, contradictory write if the
+ * predecessor was already superseded by the time this runs. `*changed_out`
+ * defaults to false, so a caller that does not check the return status still
+ * cannot mistake a no-op for a write. */
+atlas_status atlas_db_verify_claim_supersede(atlas_db *db, int64_t claim_id,
+                                             int64_t superseded_by_claim_id, bool *changed_out,
+                                             atlas_err *err);
+
 /* Every live claim attached to one revision, newest first, bounded by
  * ATLAS_VERIFY_MAX_CLAIMS. `truncated_out` reports the bound being reached, so
  * a partial answer never reads as a complete one. */

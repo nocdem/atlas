@@ -4454,6 +4454,11 @@ static const char *method_for_op(atlas_verify_op_kind k) {
         return "verify.dependency_add";
     case ATLAS_VERIFY_OP_EVALUATE:
         return "verify.evaluate";
+    case ATLAS_VERIFY_OP_CLAIM_SUPERSEDE:
+        /* A12.1 C1 fix. Not transport-selectable, ever: no wire method
+         * exists for it, so a remote client can never reach it by name --
+         * the CLI has no command that could ask for one. */
+        return NULL;
     }
     return NULL;
 }

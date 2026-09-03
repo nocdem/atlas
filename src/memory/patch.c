@@ -522,11 +522,23 @@ static atlas_status process_item(atlas_db *db, int64_t repo_id, const char *item
          * `basis`), and SUPERSEDED is not a `verify_results` verdict under
          * either of the two ways this project's own documents describe it --
          * a text fact ("the source's new version no longer contains the
-         * proposition") or a claim-lineage fact
-         * (`verify_claims.superseded_by_claim_id`, still without a writer
-         * anywhere in `src/`) -- neither of which any verifier establishes
-         * (see `include/atlas/memory.h`'s own comment on this function for
-         * the full argument).
+         * proposition") or a claim-lineage fact (`verify_claims.
+         * superseded_by_claim_id`) -- neither of which any verifier
+         * establishes.
+         *
+         * The whole-branch review's C1 fix gave the claim-lineage half a
+         * writer (`ATLAS_VERIFY_OP_CLAIM_SUPERSEDE`, `src/verify/intake.c`,
+         * called from `classify_candidate`), and this comment is updated
+         * rather than left to read as though it had not: `superseded_kind`
+         * here reads `memory_claim_diffs.kind`, a *different* table that
+         * fix's writer never touches, so this diff kind still has no producer
+         * anywhere in `src/` (`docs/backlog.md` records it as its own,
+         * deliberately unfixed, finding). `verify_claims.
+         * superseded_by_claim_id` retiring a predecessor row does not, by
+         * itself, make `patch_may_delete`'s SUPERSEDED arm reachable from a
+         * real reconciliation pass -- see `include/atlas/memory.h`'s own
+         * comment on `atlas_db_memory_anchor_prune_one` for how the two
+         * writers stay apart.
          *
          * `det_contradicted_kind` is "deterministically CONTRADICTED" --
          * `state == CONTRADICTED && basis == DETERMINISTIC`, T15's context,

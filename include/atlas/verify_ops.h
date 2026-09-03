@@ -35,15 +35,27 @@
  *
  * ## What intake may and may not do
  *
- * A model reaching every operation in this header can create a claim, reference
- * evidence, attest, declare a derivation and ask for an evaluation. It cannot
- * approve, reject, supersede, resolve or revalidate anything; it cannot mint or
- * spend a warrant; it cannot name a verifier's verdict; and it cannot edit the
- * root-owned policy that decides whether a result may move a lifecycle state.
- * If the policy's gates are met, Atlas performs the transition itself through
+ * A model reaching every *transport-selectable* operation in this header can
+ * create a claim, reference evidence, attest, declare a derivation and ask
+ * for an evaluation. It cannot approve, reject, supersede, resolve or
+ * revalidate anything; it cannot mint or spend a warrant; it cannot name a
+ * verifier's verdict; and it cannot edit the root-owned policy that decides
+ * whether a result may move a lifecycle state. If the policy's gates are
+ * met, Atlas performs the transition itself through
  * `atlas_verify_autolifecycle_run` — the third and only machine caller of
  * `atlas_decision_apply_in_tx` — and the model's involvement ends at having
  * supplied evidence that turned out to be good enough.
+ *
+ * `ATLAS_VERIFY_OP_CLAIM_SUPERSEDE` (A12.1's C1 fix) is not transport-
+ * selectable at all, the same way `ATLAS` and `DOCUMENT` channels are not: no
+ * request parser can name it and no method or tool constructs one. "Supersede"
+ * in the paragraph above still means what it always meant — a *lifecycle*
+ * transition on a knowledge record, which stays absent per A9.2's rule that
+ * `AUTO_SUPERSEDE` is absent and not refused. `CLAIM_SUPERSEDE` is a different
+ * fact on a different table: it retires the reconciler's own earlier remint of
+ * a proposition it is re-minting again, touches no lifecycle status, no
+ * verification state and no truth value, and is documented at the op kind
+ * below.
  */
 #ifndef ATLAS_VERIFY_OPS_H
 #define ATLAS_VERIFY_OPS_H
@@ -209,7 +221,39 @@ typedef enum atlas_verify_op_kind {
     /* Aggregate everything stored for a claim, record a durable result, and
      * hand it to the root-owned policy engine. May cause Atlas to transition a
      * lifecycle state on its own authority; never lets the caller do so. */
-    ATLAS_VERIFY_OP_EVALUATE
+    ATLAS_VERIFY_OP_EVALUATE,
+    /* A12.1's C1 fix. Retires exactly one live claim (`claim_uid`), recording
+     * that it is superseded by the claim named in `superseded_by_uid` —
+     * `verify_claims.superseded_by_claim_id`'s first writer anywhere in `src/`
+     * (`docs/backlog.md` recorded the column as "read, filtered three times,
+     * and never written"; this is the fix).
+     *
+     * Why it exists: S27's claim content key hashes `basis_commit`
+     * (`src/verify/intake.c`'s `bind_commit`), and the memory reconciler
+     * supplies none, so every commit re-mints every anchored memory claim.
+     * With no supersession, the predecessor stayed live forever — the pool
+     * `atlas_db_verify_claims_for_repo` scores a Context Pack over grew by one
+     * row per bullet per commit, and its own truncation refusal at
+     * `ATLAS_VERIFY_MAX_CLAIMS` silently ended the pack after roughly
+     * `ceil(256/N)` commits for an N-bullet memory file.
+     *
+     * Not transport-selectable, ever: no name reaches it through
+     * `atlas_verify_channel_parse`, no RPC method or MCP tool constructs one,
+     * and `op_claim_supersede` additionally refuses every channel but ATLAS.
+     * `classify_candidate` (`src/memory/reconcile.c`) is the one production
+     * caller. It already resolves the predecessor's uid to prune its anchors
+     * before this runs, under a correlation — the same anchor tuple, an exact
+     * byte-for-byte text match — Atlas computed itself inside the single
+     * writer's transaction, never asserted by whoever asked.
+     *
+     * Not a lifecycle transition and not authority over one: this column sits
+     * on none of kind, status, verification state or truth (O10's four axes).
+     * `db_verify.c`'s own comment calls a superseded claim "history" — pool
+     * membership, nothing else. A9.2's "AUTO_SUPERSEDE is absent, not
+     * refused" governs `atlas_decision_apply_in_tx` and a knowledge record's
+     * APPROVED/REJECTED/SUPERSEDED status; this op never calls it and never
+     * moves it. */
+    ATLAS_VERIFY_OP_CLAIM_SUPERSEDE
 } atlas_verify_op_kind;
 
 const char *atlas_verify_op_kind_name(atlas_verify_op_kind k);
@@ -288,6 +332,12 @@ typedef struct atlas_verify_op {
     /* --- DEPENDENCY_ADD --------------------------------------------------- */
     atlas_buf derived_uid; /* the evidence that derives */
     atlas_buf source_uid;  /* what it derives from */
+
+    /* --- CLAIM_SUPERSEDE (A12.1 C1 fix) -----------------------------------
+     * `claim_uid` above names the predecessor being retired; this names the
+     * live claim that replaces it. Both are resolved and validated inside
+     * `op_claim_supersede` — never trusted as given. */
+    atlas_buf superseded_by_uid;
 } atlas_verify_op;
 
 void atlas_verify_op_init(atlas_verify_op *op);

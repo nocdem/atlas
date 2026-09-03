@@ -415,6 +415,39 @@ atlas_status atlas_db_verify_claim_find(atlas_db *db, const char *uid, atlas_ver
     return st;
 }
 
+/* A12.1 C1 fix. The only writer of `superseded_by_claim_id` — see the header
+ * comment. */
+atlas_status atlas_db_verify_claim_supersede(atlas_db *db, int64_t claim_id,
+                                             int64_t superseded_by_claim_id, bool *changed_out,
+                                             atlas_err *err) {
+    if (changed_out != NULL) {
+        *changed_out = false;
+    }
+    /* Names the state it observed and requires exactly one changed row — A4's
+     * rule, `atlas_db_verify_warrant_consume`'s own precedent one table over:
+     * `AND superseded_by_claim_id = 0` is both the guard and the reason
+     * `*changed_out` can be trusted. */
+    static const char SQL[] =
+        "UPDATE verify_claims SET superseded_by_claim_id = ?2"
+        " WHERE id = ?1 AND superseded_by_claim_id = 0;";
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(db, SQL, &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, claim_id) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 2, superseded_by_claim_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the supersession");
+    }
+    st = atlas_db_step_done(db, stmt, err);
+    atlas_db_finish(db, stmt);
+    if (st == ATLAS_OK && changed_out != NULL) {
+        *changed_out = sqlite3_changes(db->h) == 1;
+    }
+    return st;
+}
+
 atlas_status atlas_db_verify_claims_for_revision(atlas_db *db, int64_t document_id,
                                                  int64_t revision_id, atlas_verify_claim_cb cb,
                                                  void *ctx, bool *truncated_out, atlas_err *err) {

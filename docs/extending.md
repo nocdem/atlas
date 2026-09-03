@@ -96,6 +96,32 @@ compiler finds the first kind and not the second.
 
 ## Extending A9.2.1 safely
 
+- **A new `atlas_verify_op_kind`** (the intake vocabulary itself) means: the
+  enum member in `include/atlas/verify_ops.h`; a row in `OP_NAMES[]`
+  (`src/verify/intake.c`); a `case` in the dispatch `switch (op->kind)` inside
+  `atlas_verify_intake_apply_in_tx`; a decision whether it belongs on the
+  `derive_actor`-skip list beside `DEPENDENCY_ADD`/`EVIDENCE_PRODUCE`/
+  `EVALUATE` (does this op attribute a row to an actor, or is it Atlas' own
+  bookkeeping?); a decision whether `atlas_verify_op_is_evaluation` should
+  return true for it (does it write a durable `verify_results` row and reach
+  the policy engine?); **and a `case` in `method_for_op`
+  (`src/core/service_remote.c`)** — the A7.1 remote/gateway forwarding
+  dispatcher a client uid without direct database access goes through.
+  This last one is easy to miss because it is a second switch over the same
+  enum in a file two seasons removed from A9.2.1, and nothing but
+  `-Werror=switch` catches a missing case there; the C1 fix that added
+  `ATLAS_VERIFY_OP_CLAIM_SUPERSEDE` found it only that way. Return the real
+  wire method name if the new kind is transport-selectable, or `NULL` if it
+  is Atlas-internal only (no request may ever carry it) — a `NULL` here means
+  "no method carries this operation," which `atlas_service_verify_intake_remote`
+  already refuses on correctly. If the kind is meant to be reachable from a
+  transport, it also needs a method in `server_verify.c`'s method table and,
+  for a model, an MCP tool — an internal-only kind (like `CLAIM_SUPERSEDE`)
+  needs none of those, and should say so in its own comment so the next
+  reader does not go looking for one. Finally, re-read `verify_ops.h`'s own
+  "what intake may and may not do" paragraph: it enumerates what a model can
+  reach, and a kind that is not transport-selectable changes what "every
+  operation in this header" means there.
 - **A new MCP verification tool** states its scope in `tool_def`, keeps the
   authority-verb ban, and changes the pinned count in `tests/test_plugin.c`. If it
   writes, it maps to `ATLAS_SCOPE_MEMORY_WRITE`, which no credential can hold.

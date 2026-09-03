@@ -888,6 +888,41 @@ static atlas_status classify_candidate(apply_ctx *ctx, const atlas_memory_propos
                              "re-read");
     }
 
+    /* C1 fix. `fc.uid` (now confirmed and held as `prior`) is this
+     * proposition's own predecessor under every branch below — the
+     * `!decision_equal` reclassification, the byte-for-byte-stable early
+     * return, the semantics-only CHANGED, and every IMPACTED/CONTRADICTED/
+     * SUPPORTED/UNDETERMINED outcome the verifier-having branch can reach.
+     * `claim_uid` (this pass's freshly-minted row) is what replaces it in
+     * every one of them, so the write belongs here, once, rather than
+     * repeated at each `ctx_add_diff` call site below. Channel ATLAS: this is
+     * Atlas' own mechanical correlation (the anchor tuple plus the exact
+     * text match `find_prior_cb` just verified), never an assertion the
+     * caller gets to make — `op_claim_supersede` refuses any other channel.
+     *
+     * Ordered after the anchor prune above (T9's own ordering) and before
+     * `prior` is read for anything else: superseding does not change what
+     * `prior`'s own columns say, only whether the *pool* still counts it. */
+    atlas_verify_op sup_op;
+    atlas_verify_op_init(&sup_op);
+    sup_op.kind = ATLAS_VERIFY_OP_CLAIM_SUPERSEDE;
+    sup_op.channel = ATLAS_VERIFY_CHANNEL_ATLAS;
+    st = atlas_buf_set_str(&sup_op.claim_uid, fc.uid, err);
+    if (st == ATLAS_OK) {
+        st = atlas_buf_set_str(&sup_op.superseded_by_uid, claim_uid, err);
+    }
+    atlas_verify_intake_result sup_res;
+    atlas_verify_intake_result_init(&sup_res);
+    if (st == ATLAS_OK) {
+        st = atlas_verify_intake_apply_in_tx(ctx->db, &sup_op, &sup_res, err);
+    }
+    atlas_verify_op_free(&sup_op);
+    atlas_verify_intake_result_free(&sup_res);
+    if (st != ATLAS_OK) {
+        atlas_verify_claim_free(&prior);
+        return st;
+    }
+
     bool verifier_input_equal =
         prior.verifier_input.len == p->verifier_input.len &&
         memcmp(prior.verifier_input.data != NULL ? prior.verifier_input.data : "",

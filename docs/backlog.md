@@ -1503,6 +1503,35 @@ superseded, which is what the code actually does today. The first is more work a
 matches the header's stated intent; the second is honest about the present. **What must
 not happen is a third season reading it as meaningful.**
 
+**Resolved 2026-09-03**, as the whole-branch review's C1 (the season's one Critical): the
+first candidate above, exactly. `ATLAS_VERIFY_OP_CLAIM_SUPERSEDE`
+(`include/atlas/verify_ops.h`, `op_claim_supersede` in `src/verify/intake.c`) is now the
+column's only writer, a seventh intake operation beside `CLAIM_CREATE`/`EVIDENCE_ADD`/
+`EVIDENCE_PRODUCE`/`ATTESTATION_ADD`/`DEPENDENCY_ADD`/`EVALUATE`, restricted to channel
+`ATLAS` and called from exactly one production site: `classify_candidate`
+(`src/memory/reconcile.c`), right after it confirms a predecessor by anchor tuple plus
+exact text match. `atlas_db_verify_claim_supersede` (`src/db/db_verify.c`) is the
+compare-and-swap. This was the missing half of C1: without it, S27's content key hashing
+`basis_commit` (which the reconciler never supplies) meant every commit re-minted every
+anchored claim with nothing ever retiring the predecessor, so the pool these three filters
+read from grew by one row per bullet per commit forever and the Context Pack's own
+truncation refusal at `ATLAS_VERIFY_MAX_CLAIMS` silently ended the feature after roughly
+`ceil(256/N)` commits. `tests/test_memory_reconcile.c`'s "whole-branch review C1" case
+reconciles twice across a moved head and asserts the pool holds one live claim per bullet,
+not two — confirmed to fail (four ways) with the writer disabled and to pass restored.
+**Not resolved by this fix:** pre-existing deployments already carrying duplicate rows
+whose anchors an *earlier* pass already pruned stay live forever — `find_prior_cb` has no
+anchor tuple left to find them by, so only the single most recent predecessor at the
+moment this fix ships is ever retired. Also unresolved, found while fixing this: the
+`ATLAS_MEMORY_DIFF_SUPERSEDED` diff kind (`include/atlas/memory.h`) has a *reader*
+(`patch.c`'s `superseded_kind`, driving `patch_may_delete`'s deletion arm) and a *parser*
+(`atlas_memory_diff_kind_parse`, `src/memory/source.c`) but still no producer anywhere in
+`src/` — a third instance of this exact class, distinct from this column and not fixed
+here because it is a text-level fact about a memory *file* (a bullet's sentence removed
+from the source) rather than the claim-lineage fact this column now records, and conflating
+the two without a dedicated review risked misapplying `patch_may_delete`'s deletion logic
+to an ordinary commit-caused remint.
+
 ## `atlas_db_rollback` is not depth-aware while `begin` and `commit` are (2026-09-02)
 
 Found while A12.1's T9 added the first in-transaction `EVALUATE` in Atlas, and verified
@@ -1927,3 +1956,85 @@ must then keep. Or bind the reason by something already stable: `ai_reasons` has
 reference would match how its two digests already work. Or refuse to compose the field at
 all when the reason's identity cannot be made durable, which is the smallest change and
 loses a line of the trailer.
+
+## `ATLAS_MEMORY_DIFF_SUPERSEDED` is read and parsed, and still has no producer (2026-09-03)
+
+Found while fixing the whole-branch review's C1 (`verify_claims.superseded_by_claim_id`,
+above): the same class of defect, one table over, and worth its own entry because the fix
+for the first did not touch this one and should not have.
+
+`ATLAS_MEMORY_DIFF_SUPERSEDED` is a real member of the `atlas_memory_diff_kind` vocabulary
+(`include/atlas/memory.h`). It has a name function (`src/memory/source.c:96`) and a parser
+(`:132`, `atlas_memory_diff_kind_parse`), and it has a *reader*: `src/memory/patch.c`'s
+`superseded_kind` (`diff_found && last_kind == ATLAS_MEMORY_DIFF_SUPERSEDED`) is one of the
+two conditions `patch_may_delete` accepts as grounds to propose deleting a memory file's
+line, right beside deterministic CONTRADICTION. What it does not have, anywhere in `src/`,
+is a producer: `classify_candidate` (`src/memory/reconcile.c`) never calls `ctx_add_diff`
+with this kind, on any branch, for any claim. `grep -rn ATLAS_MEMORY_DIFF_SUPERSEDED src/`
+finds the enumerator, the name function and the parser, and nothing that writes it.
+
+`patch.c`'s own comment on `superseded_kind` (written before this entry, and accurate) says
+so directly: SUPERSEDED is not a `verify_results` verdict "under either of the two ways this
+project's own documents describe it — a text fact (the source's new version no longer
+contains the proposition) or a claim-lineage fact (`verify_claims.superseded_by_claim_id`,
+still without a writer anywhere in `src/`) — neither of which any verifier establishes." That
+second half is now out of date in one respect (the column has a writer, above) and was never
+the point: the diff-kind and the column are two different facts, produced by two different
+mechanisms, and only one candidate fix for the column would also have touched this — and it
+was not taken, for a reason worth stating rather than leaving implicit.
+
+**Why this was not folded into the C1 fix.** `classify_candidate` already retires a
+predecessor's *lineage* on every re-mint (the C1 fix, immediately above), which happens on
+literally every COMMIT-caused pass whether or not the bullet's own text survives in the
+source file. Recording a `SUPERSEDED` diff row at the same call site would therefore mark
+*every* re-minted claim's predecessor as SUPERSEDED, every pass — including the ordinary
+"nothing about this bullet changed but the head moved" case the byte-for-byte-stable branch
+exists to leave undiagnosed. Feeding that into `patch_may_delete`'s deletion arm would
+propose deleting a memory file's line on every commit, which is a materially different and
+far more consequential change than closing the column, and not one this fix round
+investigated, tested or was asked to make. The diff-kind's honest producer is a text-level
+question — did this proposition's sentence stop appearing in the source at all — which is a
+different derivation than "did this claim row get replaced by a newer one," and conflating
+them here would have been exactly the undisclosed-scope-creep this codebase's own reporting
+rules exist to catch.
+
+**Candidate fixes, none implemented.** Give `classify_candidate` (or a sibling function) a
+way to detect that a proposition present in the *prior* generation's extraction is genuinely
+absent from this pass's — as distinct from having re-minted with the same text — and emit
+`ATLAS_MEMORY_DIFF_SUPERSEDED` there. Or, if no real producer is coming soon, say in
+`patch.c`'s own comment and in `include/atlas/memory.h` that this arm is reachable only
+through direct row construction (as `tests/test_memory_reconcile.c`'s
+`test_patch_build_superseded_diff_kind_proposes_deletion` and its siblings already do) and is
+not something a real reconciliation pass can produce today — the same choice this project
+made explicitly for `atlas_verify_conflict`'s four unproduced members.
+
+## `atlas_db_verify_claims_for_revision` is declared, defined, documented, and never called (2026-09-03)
+
+Found while tracing every reader of `verify_claims.superseded_by_claim_id` for the C1 fix
+above — a different class from that entry (a column with readers and no writer) but
+adjacent enough to record here rather than let a future grep rediscover it from nothing:
+this is a *function* with no caller at all.
+
+`atlas_db_verify_claims_for_revision` (`src/db/db_verify.c:451`, declared
+`include/atlas/verify.h:1663`) is documented as answering "what claims bear on this exact
+revision," described as "what a verification run wants" as distinct from
+`atlas_db_verify_claims_for_repo`'s "what a client needs." `grep -rn
+"atlas_db_verify_claims_for_revision" src/ tests/ include/` finds exactly its own
+definition, its own declaration, and the doc comment naming it — no call site anywhere.
+
+**Why this is not the same shape as the column above.** A column with no writer still
+*executes* on every read, silently returning nothing meaningful. A function with no caller
+does not execute at all; it costs nothing today and cannot silently mislead anyone, because
+nobody sees its answer. It is closer to the `atlas_orch_memory_compose` export this season's
+own whole-branch review already triaged as a Minor and left alone. Recorded here for the
+same reason: the general check ("for each column a read path filters on, ask what writes
+it") has a sibling ("for each function this exhaustively documented, ask who calls it"),
+and this is the second time in one season that check would have caught something before a
+reader had to.
+
+**Candidate fixes, none implemented.** Call it from wherever "what claims bear on this
+exact revision" is actually needed — `verify show`/`verify claims` narrowed to one
+revision, if that is a real gap in what an operator can ask today, is the most likely
+answer given its own doc comment. Or delete it, if `atlas_db_verify_claims_for_repo`'s
+`document_id`/`revision_id` filters already cover every real use and this was written
+ahead of a caller that never arrived.

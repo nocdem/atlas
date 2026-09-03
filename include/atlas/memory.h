@@ -427,15 +427,18 @@ atlas_status atlas_db_memory_anchor_add(atlas_db *db, int64_t repo_id, const cha
  * fix round's own first attempt, by deleting a SYMBOL anchor the sweep had
  * not yet had the chance to find vanished, before it ever ran.
  *
- * `memory_claim_anchors` never gets a writer for `verify_claims.
- * superseded_by_claim_id` -- nothing in `src/` sets that column, T9's own
- * report records the grep -- so this specific tuple's row would otherwise
- * survive every remint forever, and `atlas_db_memory_anchor_distinct`'s
- * per-pass scan would carry one stale row per `COMMIT`-caused pass a
- * repository has ever seen, on every anchor `classify_candidate` ever used
- * to correlate a remint, rather than exactly the live ones. Called only from
- * `classify_candidate`, never from the vanished-anchor sweep, which has no
- * fresh candidate to confirm succession against. */
+ * This function's own pruning is still needed even though `verify_claims.
+ * superseded_by_claim_id` now has a writer (the whole-branch review's C1 fix:
+ * `ATLAS_VERIFY_OP_CLAIM_SUPERSEDE`, `src/verify/intake.c`, called from
+ * `classify_candidate` immediately after this call returns) -- the two are
+ * different tables answering different questions, and nothing propagates one
+ * into the other. Without this call, this specific tuple's row would survive
+ * every remint forever, and `atlas_db_memory_anchor_distinct`'s per-pass scan
+ * would carry one stale row per `COMMIT`-caused pass a repository has ever
+ * seen, on every anchor `classify_candidate` ever used to correlate a remint,
+ * rather than exactly the live ones. Called only from `classify_candidate`,
+ * never from the vanished-anchor sweep, which has no fresh candidate to
+ * confirm succession against. */
 atlas_status atlas_db_memory_anchor_prune_one(atlas_db *db, int64_t repo_id, const char *claim_uid,
                                               atlas_memory_anchor_kind kind, const char *value,
                                               atlas_err *err);

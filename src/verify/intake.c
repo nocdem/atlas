@@ -189,8 +189,9 @@ bool atlas_verify_evidence_class_requires_atlas_production(atlas_verify_evidence
     return false;
 }
 
-static const char *const OP_NAMES[] = {"CLAIM_CREATE",     "EVIDENCE_ADD",    "EVIDENCE_PRODUCE",
-                                       "ATTESTATION_ADD",  "DEPENDENCY_ADD",  "EVALUATE"};
+static const char *const OP_NAMES[] = {"CLAIM_CREATE",    "EVIDENCE_ADD",     "EVIDENCE_PRODUCE",
+                                       "ATTESTATION_ADD", "DEPENDENCY_ADD",   "EVALUATE",
+                                       "CLAIM_SUPERSEDE"};
 
 const char *atlas_verify_op_kind_name(atlas_verify_op_kind k) {
     if ((size_t)k < sizeof OP_NAMES / sizeof OP_NAMES[0]) {
@@ -215,7 +216,7 @@ bool atlas_verify_op_is_evaluation(atlas_verify_op_kind k) {
     X(scope_note) X(verifier) X(verifier_input) X(basis_commit) X(environment) X(claim_uid)        \
     X(commit_oid) X(path_text) X(symbol) X(target) X(probe) X(observed) X(observed_at)             \
     X(memory_version_uid) X(method) X(supersedes_uid) X(evidence_uids) X(derived_uid)              \
-    X(source_uid)
+    X(source_uid) X(superseded_by_uid)
 
 void atlas_verify_op_init(atlas_verify_op *op) {
     if (op == NULL) {
@@ -1295,6 +1296,87 @@ static atlas_status op_dependency_add(atlas_db *db, const atlas_verify_op *op, c
     return st;
 }
 
+/* --- claim supersession (A12.1 C1 fix) --------------------------------------
+ *
+ * See `ATLAS_VERIFY_OP_CLAIM_SUPERSEDE`'s own comment in `verify_ops.h` for
+ * why this exists. Both claims are resolved and checked here rather than
+ * trusted from the caller — the same discipline `resolve_claim` already
+ * applies to every other op that names a claim by uid — even though the one
+ * production caller (`classify_candidate`, `src/memory/reconcile.c`) has
+ * already established the correlation itself: a second, cheaper check inside
+ * the one write point costs nothing and is what keeps this op safe if a
+ * second caller is ever added carelessly. */
+static atlas_status op_claim_supersede(atlas_db *db, const atlas_verify_op *op, const char *now,
+                                       atlas_verify_intake_result *out, atlas_err *err) {
+    (void)now;
+    /* Belt and braces over the structural guarantee: nothing in `src/`
+     * constructs this op on any other channel, and no transport can name it
+     * at all (§ verify_ops.h). Failing closed here means a future caller that
+     * gets the channel wrong is refused rather than silently trusted. */
+    if (op->channel != ATLAS_VERIFY_CHANNEL_ATLAS) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                             "a claim is superseded only by Atlas' own mechanical "
+                             "correlation, never by a request");
+    }
+
+    atlas_verify_claim prior;
+    atlas_verify_claim_init(&prior);
+    atlas_status st = resolve_claim(db, &op->claim_uid, &prior, err);
+
+    atlas_verify_claim successor;
+    atlas_verify_claim_init(&successor);
+    if (st == ATLAS_OK) {
+        st = resolve_claim(db, &op->superseded_by_uid, &successor, err);
+    }
+    if (st == ATLAS_OK && prior.id == successor.id) {
+        st = atlas_err_set(err, ATLAS_ERR_INTERNAL, "a claim cannot supersede itself");
+    }
+    if (st == ATLAS_OK && prior.repo_id != successor.repo_id) {
+        st = atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                           "a claim from one repository cannot supersede a claim from another");
+    }
+
+    /* Names the state it observed and requires exactly one changed row — A4's
+     * rule (`atlas_decision_apply_in_tx`'s own CAS discipline), one layer over:
+     * a predecessor already superseded by something else is a state this
+     * function did not expect, and failing open into "fine, do nothing" would
+     * silently accept a caller's wrong idea of which claim it is retiring.
+     *
+     * What this refusal costs, stated rather than left for a reader to work
+     * out under pressure: `classify_candidate` propagates it, its caller
+     * (`emit_candidate`) propagates it, and the transaction the pass runs
+     * inside rolls back — no generation lands for that pass at all, and
+     * reconciliation for that repository stops making progress until
+     * whatever left two claims racing for one predecessor is fixed. This is
+     * the shape "fail closed" always costs and is why the case is not
+     * expected to occur in production rather than only guarded against: a
+     * fresh claim's content key (S27) already collapses two candidates with
+     * the same text, same anchor-derived binding and same `basis_commit` into
+     * one row before `classify_candidate` ever runs, and `find_prior_cb`'s
+     * per-tuple lookup plus the anchor prune `classify_candidate` already
+     * performed before calling this make each live predecessor discoverable
+     * by exactly one fresh candidate per pass — so
+     * two callers reaching this op for the same `prior.id` in one pass would
+     * mean the correlation above it already broke, and this refusal is
+     * reporting that fact rather than causing it. */
+    bool changed = false;
+    if (st == ATLAS_OK) {
+        st = atlas_db_verify_claim_supersede(db, prior.id, successor.id, &changed, err);
+    }
+    if (st == ATLAS_OK && !changed) {
+        st = atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                           "the predecessor claim was already superseded by something else");
+    }
+    if (st == ATLAS_OK) {
+        out->claim_id = successor.id;
+        out->repo_id = successor.repo_id;
+        st = atlas_buf_set(&out->uid, successor.uid.data, successor.uid.len, err);
+    }
+    atlas_verify_claim_free(&prior);
+    atlas_verify_claim_free(&successor);
+    return st;
+}
+
 /* --- the write point -------------------------------------------------------- */
 
 atlas_status atlas_verify_intake_apply_in_tx(atlas_db *db, const atlas_verify_op *op,
@@ -1319,7 +1401,8 @@ atlas_status atlas_verify_intake_apply_in_tx(atlas_db *db, const atlas_verify_op
      * two rows that already carry their own provenance. */
     atlas_status st = ATLAS_OK;
     if (op->kind != ATLAS_VERIFY_OP_DEPENDENCY_ADD &&
-        op->kind != ATLAS_VERIFY_OP_EVIDENCE_PRODUCE && op->kind != ATLAS_VERIFY_OP_EVALUATE) {
+        op->kind != ATLAS_VERIFY_OP_EVIDENCE_PRODUCE && op->kind != ATLAS_VERIFY_OP_EVALUATE &&
+        op->kind != ATLAS_VERIFY_OP_CLAIM_SUPERSEDE) {
         st = derive_actor(db, op, now, &out->actor_id, &out->actor_uid, err);
         if (st != ATLAS_OK) {
             return st;
@@ -1337,6 +1420,8 @@ atlas_status atlas_verify_intake_apply_in_tx(atlas_db *db, const atlas_verify_op
         return op_attestation_add(db, op, now, out, err);
     case ATLAS_VERIFY_OP_DEPENDENCY_ADD:
         return op_dependency_add(db, op, now, out, err);
+    case ATLAS_VERIFY_OP_CLAIM_SUPERSEDE:
+        return op_claim_supersede(db, op, now, out, err);
     case ATLAS_VERIFY_OP_EVALUATE:
         break;
     }

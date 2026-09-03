@@ -170,7 +170,26 @@ static size_t find_provenance_line(const char *body, size_t body_len, bool *boun
     size_t tail_start = body_len - tail_len;
     const size_t marker_len = sizeof(PROVENANCE_MARKER) - 1u;
 
-    size_t end = body_len;
+    /* Fix round 2 (Minor, P0's own bound rule one layer over): `commits.body`
+     * ordinarily ends in '\n' -- git's `%B` includes the message's own
+     * trailing newline (verified empirically: `git log -z
+     * --format=...%B` for a two-line body ends its NUL-delimited record
+     * `...two\n`, never `...two`). Starting the backward walk at `body_len`
+     * unconditionally would make its *first* candidate line the empty
+     * pseudo-line between that trailing newline and the record's end --
+     * `line_extent_rev` returns `content_len == 0` there, which can never
+     * match `PROVENANCE_MARKER` -- and still charge one of the
+     * `ATLAS_MEMORY_TRAILER_SCAN_MAX` line slots to it, so a body ending in
+     * '\n' (the overwhelmingly common case) only ever examined
+     * `ATLAS_MEMORY_TRAILER_SCAN_MAX - 1` real lines, one short of the bound
+     * this constant documents (`limits.h`). Starting one byte earlier when
+     * the body ends in '\n' walks straight past that phantom line to the
+     * last real one instead, so every slot this function spends is a real
+     * line, whatever the body's own trailing-newline shape. A body with no
+     * trailing newline (already the untypical case `line_extent_rev` and
+     * `ATLAS_MEMORY_TRAILER_TAIL_BYTES_MAX`'s own comment call out) is
+     * unaffected: there is no phantom line to skip. */
+    size_t end = (body_len > 0 && body[body_len - 1u] == '\n') ? body_len - 1u : body_len;
     size_t lines = 0;
     while (end > tail_start && lines < ATLAS_MEMORY_TRAILER_SCAN_MAX) {
         lines++;

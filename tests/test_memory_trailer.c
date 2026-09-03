@@ -377,8 +377,17 @@ static void test_round_trip(void) {
     T_CHECK(result.trailer_scanned >= 1);
     T_CHECK(!result.trailer_scan_bound_hit);
     /* A real trailer find with zero registered memory sources must still
-     * force a generation -- otherwise trailer_scan_high never advances
-     * anywhere, and the same commit window is re-walked forever. */
+     * force a generation. Fix round: this is no longer because skipping it
+     * would leave `trailer_scan_high` stuck -- since migration 30 that cursor
+     * (now on `repositories`, not `memory_generations`) advances on scan
+     * progress alone (Critical 1), whether or not a generation is minted, so
+     * a missed generation here would not re-walk anything. The reason now is
+     * `memory_generations`' own purpose: it is the ledger of what a pass
+     * *found* (`src/memory/reconcile.c`'s comment on `trailer_written`), and
+     * a landed binding row is new information about a commit regardless of
+     * whether anything else in the pass changed -- the same reasoning that
+     * makes a landed `bound_hit` row (no block found, but new information
+     * that the search could not say so with certainty) force one too. */
     T_CHECK_MSG(result.generation != 0,
                "a real trailer binding must force a generation even with no source change");
 
@@ -938,6 +947,98 @@ static void test_unexaminable_message_reports_bound_hit(void) {
     env_close(&e);
 }
 
+/* --- Fix round 2, item 1: the effective line budget must equal the
+ * documented `ATLAS_MEMORY_TRAILER_SCAN_MAX` (512), not one less -----------
+ *
+ * `commits.body` ordinarily ends in '\n' (git's `%B` includes the message's
+ * own trailing newline). Before this fix round, the backward walk's very
+ * first candidate line, read from `body_len` downward, was the *empty*
+ * pseudo-line between that newline and the record's end -- a line no author
+ * wrote -- and it still consumed one of the `ATLAS_MEMORY_TRAILER_SCAN_MAX`
+ * line slots, so only 511 real lines were ever examined. A direct `commits`
+ * row (this file's own `test_cursor_advances_without_a_find` precedent)
+ * rather than a real git commit, because what is under test is an exact line
+ * count and git's own message cleanup on `-m` is not a dimension this test
+ * wants to depend on.
+ *
+ * Two bodies, one marker line apiece, differing only in how many real lines
+ * follow it: exactly `ATLAS_MEMORY_TRAILER_SCAN_MAX - 1` (so the marker lands
+ * on the budget's very last slot) and exactly `ATLAS_MEMORY_TRAILER_SCAN_MAX`
+ * (one line past it). Before the fix, both would report `bound_hit` with no
+ * block found; after it, only the second still does -- proving both that the
+ * fix reaches the full documented bound and that it does not overshoot past
+ * it into an unbounded walk. */
+static void insert_commit_with_body(env *e, const char *oid, const atlas_buf *body,
+                                    atlas_err *err) {
+    sqlite3_stmt *stmt = NULL;
+    T_OK(atlas_db_prepare(e->db,
+                          "INSERT INTO commits(repo_id, oid, parent_count, body) "
+                          "VALUES(?1, ?2, 0, ?3);",
+                          &stmt, err),
+        err);
+    if (sqlite3_bind_int64(stmt, 1, e->repo_id) != SQLITE_OK) {
+        T_REQUIRE_MSG(false, "cannot bind repo_id for synthetic commit row");
+    }
+    T_OK(atlas_db_bind_text_opt(e->db, stmt, 2, oid, err), err);
+    T_OK(atlas_db_bind_text_n(e->db, stmt, 3, atlas_buf_cstr(body), body->len, err), err);
+    int rc = sqlite3_step(stmt);
+    T_REQUIRE_MSG(rc == SQLITE_DONE, "failed to insert synthetic commit row");
+    atlas_db_finish(e->db, stmt);
+}
+
+static void build_marker_then_filler(atlas_buf *out, int filler_lines, atlas_err *err) {
+    atlas_buf_reset(out);
+    T_OK(atlas_buf_append_str(out, "Atlas-Provenance: v1\n", err), err);
+    for (int i = 0; i < filler_lines; i++) {
+        char line[32];
+        (void)snprintf(line, sizeof line, "filler line %d\n", i);
+        T_OK(atlas_buf_append_str(out, line, err), err);
+    }
+}
+
+static void test_line_budget_is_exactly_the_documented_bound(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    env e;
+    env_open(&e, &err);
+
+    /* Marker + (SCAN_MAX - 1) filler lines = SCAN_MAX real lines: the marker
+     * sits on the budget's very last slot and must be found. */
+    atlas_buf body_at_bound = ATLAS_BUF_INIT;
+    build_marker_then_filler(&body_at_bound, (int)ATLAS_MEMORY_TRAILER_SCAN_MAX - 1, &err);
+    char oid_at_bound[41];
+    (void)snprintf(oid_at_bound, sizeof oid_at_bound, "%040d", 9001);
+    insert_commit_with_body(&e, oid_at_bound, &body_at_bound, &err);
+
+    atlas_memory_trailer_binding b1;
+    atlas_memory_trailer_binding_init(&b1);
+    T_OK(atlas_memory_trailer_ingest(e.db, e.repo_id, oid_at_bound, &b1, &err), &err);
+    T_CHECK_MSG(b1.has_block,
+               "a marker exactly %u real lines from the end must be found",
+               (unsigned)ATLAS_MEMORY_TRAILER_SCAN_MAX);
+    T_CHECK(!b1.bound_hit);
+    atlas_memory_trailer_binding_free(&b1);
+    atlas_buf_free(&body_at_bound);
+
+    /* Marker + SCAN_MAX filler lines = SCAN_MAX + 1 real lines: one line past
+     * the budget, so this must report bound_hit with no block found. */
+    atlas_buf body_past_bound = ATLAS_BUF_INIT;
+    build_marker_then_filler(&body_past_bound, (int)ATLAS_MEMORY_TRAILER_SCAN_MAX, &err);
+    char oid_past_bound[41];
+    (void)snprintf(oid_past_bound, sizeof oid_past_bound, "%040d", 9002);
+    insert_commit_with_body(&e, oid_past_bound, &body_past_bound, &err);
+
+    atlas_memory_trailer_binding b2;
+    atlas_memory_trailer_binding_init(&b2);
+    T_OK(atlas_memory_trailer_ingest(e.db, e.repo_id, oid_past_bound, &b2, &err), &err);
+    T_CHECK_MSG(!b2.has_block, "a marker one line past the budget must not be found");
+    T_CHECK(b2.bound_hit);
+    atlas_memory_trailer_binding_free(&b2);
+    atlas_buf_free(&body_past_bound);
+
+    env_close(&e);
+}
+
 /* --- (d) a tampered block changes no decision status and no verification
  * state ------------------------------------------------------------------ */
 static void test_no_authority(void) {
@@ -1167,6 +1268,8 @@ static const atlas_test TESTS[] = {
      test_last_block_wins_over_an_earlier_one},
     {"fix round I1/I2: a message too long to examine reports bound_hit and gets a row",
      test_unexaminable_message_reports_bound_hit},
+    {"fix round 2, item 1: the line budget is exactly ATLAS_MEMORY_TRAILER_SCAN_MAX, not one less",
+     test_line_budget_is_exactly_the_documented_bound},
 };
 
 ATLAS_TEST_MAIN("memory_trailer", TESTS)

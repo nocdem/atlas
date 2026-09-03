@@ -1581,28 +1581,35 @@ atlas_status atlas_memory_pack_reliance_match(const atlas_memory_pack *p,
  * attempted" -- A9.2.2's shape, one layer over commit trailers. `has_block`
  * is the one field that is never itself in `unknown_fields`: it says whether
  * an `Atlas-Provenance: v1` line was found at all, and when it is false
- * every other member is at its zero and `unknown_fields` is empty -- a
- * commit with no block is recorded as carrying none, a different fact from
- * carrying six bad ones.
+ * every other member is at its zero and `unknown_fields` is empty.
  *
- * `bound_hit` is the fix-round addition that keeps that same distinction from
- * collapsing a third state into it: `has_block` false does not by itself mean
- * "this commit definitely carries no block" -- the block search
+ * `bound_hit` is the fix-round addition that keeps a third state from
+ * collapsing into `has_block` false: the block search
  * (`find_provenance_line`, `src/memory/trailer.c`) can also stop because it
  * ran out of message to look at, at either of its two bounds
  * (`ATLAS_MEMORY_TRAILER_SCAN_MAX` lines or the
  * `ATLAS_MEMORY_TRAILER_TAIL_BYTES_MAX` byte backstop), before ever finding a
  * marker. `bound_hit` is true exactly then: `has_block` false and `bound_hit`
  * true together say "this parse could not fully examine this commit's
- * message, so a block may exist beyond what it considered" -- a different
- * fact from "the whole message was examined and there is no such line" (both
- * false) and from "not yet scanned" (no row at all, `commits.id` above the
- * persisted cursor). `atlas_memory_pass_result`'s own comment names the four
- * states in full. `bound_hit` is never true alongside `has_block`: once a
- * marker is found the search stops, so a found block was never truncated by
- * either bound (see `find_provenance_line`'s own comment for why the search
- * runs from the end of the tail backward, which is what makes "found" and
- * "bound reached" mutually exclusive outcomes of the same walk). */
+ * message, so a block may exist beyond what it considered."
+ *
+ * Fix round (I2): this struct is what `atlas_memory_trailer_ingest` returns
+ * for every examined commit, whether or not a row is ever stored for it --
+ * `atlas_db_memory_trailer_binding_insert`'s own comment below says the
+ * writer stores a row only when `has_block || bound_hit`. A commit whose
+ * message was fully examined and genuinely carries no block -- `has_block`
+ * false, `bound_hit` false -- gets **no row at all**, which reads identically
+ * to a commit above the persisted cursor that has not been examined yet; a
+ * reader tells the two apart by comparing the commit's id against
+ * `repositories.trailer_scan_high` (`atlas_db_repo_trailer_scan_high`), never
+ * by any field on a row, because in both cases there is no row to hold one.
+ * `atlas_memory_pass_result`'s own comment names the four states this and the
+ * cursor together let a reader tell apart in full. `bound_hit` is never true
+ * alongside `has_block`: once a marker is found the search stops, so a found
+ * block was never truncated by either bound (see `find_provenance_line`'s own
+ * comment for why the search runs from the end of the tail backward, which is
+ * what makes "found" and "bound reached" mutually exclusive outcomes of the
+ * same walk). */
 typedef struct atlas_memory_trailer_binding {
     bool has_block;
     /* Fix round (I1/I2). True only when `has_block` is false: the block
@@ -1674,9 +1681,14 @@ atlas_status atlas_db_memory_trailer_binding_insert(atlas_db *db, int64_t repo_i
  * the pass recorded rather than what re-ingesting would compute now (a later
  * `memory trailer --commit OID --repo R` show path, and this task's own
  * tests). `*found_out` is false and `*out` is left freshly initialised when
- * this repository has no binding row for this commit -- distinct from a
- * found row with `has_block` false, exactly as the struct comment's "recorded
- * as carrying none" distinction requires a reader be able to tell apart. */
+ * this repository has no binding row for this commit -- which reads
+ * identically whether the commit was fully examined and genuinely carries no
+ * block, or has not been scanned yet (the struct comment above says how a
+ * caller tells the two apart, and it is not through this call). Fix round
+ * (I2): this is distinct from a *found* row with `has_block` false, because
+ * the writer stores a row only when `has_block || bound_hit` -- so a found
+ * row with `has_block` false is always a `bound_hit` row, "this parse could
+ * not fully examine the message," never a plain absence. */
 atlas_status atlas_db_memory_trailer_binding_get(atlas_db *db, int64_t repo_id,
                                                  const char *commit_oid,
                                                  atlas_memory_trailer_binding *out, bool *found_out,

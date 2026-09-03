@@ -441,8 +441,11 @@ atlas_status atlas_db_commit_body_get(atlas_db *db, int64_t repo_id, const char 
  * pass's own trailer-scan window over `ATLAS_MEMORY_TRAILER_PASS_MAX`
  * (`limits.h`). `*max_id_out` is the highest `id` the callback actually saw
  * (unchanged from `since_id` when nothing did), which is what a caller
- * persists as the new `memory_generations.trailer_scan_high`. `*more_out` is
- * true when a `(max_rows + 1)`-th row exists beyond what was walked -- the
+ * persists as the new `repositories.trailer_scan_high` (migration 30,
+ * `atlas_db_repo_set_trailer_scan_high`, `src/db/db_repo.c`) -- fix round: no
+ * longer `memory_generations.trailer_scan_high` (migration 29), which stopped
+ * being read the moment a cursor with its own writer replaced it. `*more_out`
+ * is true when a `(max_rows + 1)`-th row exists beyond what was walked -- the
  * bound was reached and a later pass owes the remainder; the row itself is
  * never handed to the callback. */
 typedef atlas_status (*atlas_db_commit_id_cb)(int64_t commit_id, const char *oid, void *ud,

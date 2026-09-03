@@ -4540,6 +4540,20 @@ static const char *const M29_STATEMENTS[] = {
  * is what "I did not look far enough" being read as "there is nothing here"
  * would mean.
  *
+ * **Stated cost, not fixed by this migration: `memory_trailer_bindings` has
+ * only `INSERT OR IGNORE` for a writer -- no `UPDATE`, no `DELETE`, anywhere
+ * in this tree.** A binding row the pre-fix, forward first-match parser
+ * landed for a commit -- the `git merge --squash` shape this round's own I1
+ * fixes, an older quoted block bound instead of the genuine trailing one --
+ * survives the rescan from 0 this migration's default triggers, unrepaired:
+ * the corrected backward-walking parser re-examines that same commit, computes
+ * the right answer, and its insert is ignored because a row already exists.
+ * Development-database exposure only, since A12.1 is unreleased and no such
+ * row exists anywhere the pre-fix parser never ran; the fix report's own
+ * Deviation 3 already names re-scanning an already-recorded commit as
+ * untested, and this is that path. Repairing it needs an `UPDATE`, which this
+ * migration does not add.
+ *
  * Neither new column carries a CHECK constraint, matching migration 27's
  * `scanner_uid` and migration 28's `mirror_complete`/`mirror_at` rather than
  * migration 29's `CREATE TABLE`-time booleans: SQLite's `ALTER TABLE ADD

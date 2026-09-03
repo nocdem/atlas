@@ -2004,6 +2004,32 @@ static atlas_status t9_count_live_cb(const atlas_verify_claim *c, void *ctx, atl
     return ATLAS_OK;
 }
 
+/* C1 re-review, fix2. Membership, not a count: does the pool the Context
+ * Pack scores over (`atlas_db_verify_claims_for_repo`) actually carry *this*
+ * uid live, whatever else it also carries. A count alone cannot tell "both
+ * successors are live" apart from "two rows happen to be live, neither of
+ * them one of these" -- and under-supersession (a predecessor nobody
+ * retired) inflates the count without changing which uids are live, which is
+ * exactly the direction this callback must stay indifferent to. */
+struct t9_pool_has_ctx {
+    const char *uid_a;
+    const char *uid_b;
+    bool found_a;
+    bool found_b;
+};
+
+static atlas_status t9_pool_has_cb(const atlas_verify_claim *c, void *ctx, atlas_err *err) {
+    (void)err;
+    struct t9_pool_has_ctx *pc = ctx;
+    if (strcmp(atlas_buf_cstr(&c->uid), pc->uid_a) == 0) {
+        pc->found_a = true;
+    }
+    if (strcmp(atlas_buf_cstr(&c->uid), pc->uid_b) == 0) {
+        pc->found_b = true;
+    }
+    return ATLAS_OK;
+}
+
 /* The hash a real scan would have written after a real commit changed the
  * path's bytes -- an opaque, distinct string is enough here (T8's own fixture
  * convention: no verifier in this suite ever checks a hash against real
@@ -2455,6 +2481,68 @@ static void test_two_propositions_sharing_one_anchor_both_remint_cleanly(void) {
                "cross-contamination C1 exists to prevent");
     T_CHECK_MSG(r2.diff_rows == 0, "expected no diff rows at all this generation, got %zu",
                r2.diff_rows);
+
+    /* C1 re-review, fix2: this fixture -- unlike
+     * `test_reconcile_twice_across_a_moved_head_...` above, whose two
+     * bullets anchor *different* files -- shares one (PATH, `src/shared.c`)
+     * anchor tuple between x and y, so `find_prior_cb`'s anchor-tuple-plus-
+     * text-match discrimination is actually exercised rather than trivially
+     * satisfied by the anchor tuple alone. The direction that test cannot
+     * see is over-supersession: a predecessor retired by the *wrong*
+     * proposition's successor hides a live claim from the pool, which is
+     * the fixed defect's own harm arriving from the other side. */
+    atlas_verify_claim x1c, y1c, x2c, y2c;
+    atlas_verify_claim_init(&x1c);
+    atlas_verify_claim_init(&y1c);
+    atlas_verify_claim_init(&x2c);
+    atlas_verify_claim_init(&y2c);
+    bool found = false;
+    T_OK(atlas_db_verify_claim_find(e.db, atlas_buf_cstr(&x_uid1), &x1c, &found, &err), &err);
+    T_REQUIRE(found);
+    T_OK(atlas_db_verify_claim_find(e.db, atlas_buf_cstr(&y_uid1), &y1c, &found, &err), &err);
+    T_REQUIRE(found);
+    T_OK(atlas_db_verify_claim_find(e.db, atlas_buf_cstr(&x_uid2), &x2c, &found, &err), &err);
+    T_REQUIRE(found);
+    T_OK(atlas_db_verify_claim_find(e.db, atlas_buf_cstr(&y_uid2), &y2c, &found, &err), &err);
+    T_REQUIRE(found);
+    T_CHECK_MSG(x1c.superseded_by_claim_id != y2c.id,
+               "x's predecessor must not be superseded by y's successor over the shared anchor "
+               "(cross-proposition supersession), got superseded_by_claim_id=%lld",
+               (long long)x1c.superseded_by_claim_id);
+    T_CHECK_MSG(y1c.superseded_by_claim_id != x2c.id,
+               "y's predecessor must not be superseded by x's successor over the shared anchor "
+               "(cross-proposition supersession), got superseded_by_claim_id=%lld",
+               (long long)y1c.superseded_by_claim_id);
+    T_CHECK_MSG(x2c.superseded_by_claim_id == 0,
+               "x's own successor must not itself read as superseded, got "
+               "superseded_by_claim_id=%lld",
+               (long long)x2c.superseded_by_claim_id);
+    T_CHECK_MSG(y2c.superseded_by_claim_id == 0,
+               "y's own successor must not itself read as superseded, got "
+               "superseded_by_claim_id=%lld",
+               (long long)y2c.superseded_by_claim_id);
+    atlas_verify_claim_free(&x1c);
+    atlas_verify_claim_free(&y1c);
+    atlas_verify_claim_free(&x2c);
+    atlas_verify_claim_free(&y2c);
+
+    /* The pool: the exact query the Context Pack scores over
+     * (`atlas_db_verify_claims_for_repo`, `src/db/db_verify.c`). Both
+     * propositions' current successors must be live in it. Membership, not a
+     * count -- `test_reconcile_twice_across_a_moved_head_...` already pins
+     * the count at exactly 2, and pinning it again here would make this
+     * assertion fail under mere under-supersession (a predecessor nobody
+     * retired inflates the count without touching which uids are live),
+     * which is the opposite direction from the one this test exists to
+     * guard. */
+    struct t9_pool_has_ctx pool_ctx = {atlas_buf_cstr(&x_uid2), atlas_buf_cstr(&y_uid2), false, false};
+    bool pool_truncated = true;
+    T_OK(atlas_db_verify_claims_for_repo(e.db, e.repo_id, 0, 0, (int64_t)ATLAS_VERIFY_MAX_CLAIMS,
+                                         t9_pool_has_cb, &pool_ctx, &pool_truncated, &err),
+        &err);
+    T_CHECK_MSG(!pool_truncated, "the pool must not report truncated for two bullets");
+    T_CHECK_MSG(pool_ctx.found_a, "x's successor must be live in the pool the Context Pack reads");
+    T_CHECK_MSG(pool_ctx.found_b, "y's successor must be live in the pool the Context Pack reads");
 
     atlas_buf_free(&x_uid1);
     atlas_buf_free(&y_uid1);

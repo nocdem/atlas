@@ -976,14 +976,22 @@ extern const char ATLAS_DECISION_CONFIRM_MISTYPED_MSG[];
 typedef struct atlas_review_outcome {
     const atlas_review_entry *entry; /* borrowed for the callback */
     atlas_review_verdict verdict;
-    atlas_buf status;  /* the record's status as read: a closed Atlas
-                        * vocabulary value (PROPOSED/APPROVED/REJECTED/
-                        * SUPERSEDED/RESOLVED), the same category
-                        * service_decision.c's fill_summary marks
-                        * untrusted = false for, and not encoded for the same
-                        * reason -- no repository or model byte can reach a
-                        * decision's status column. Empty when nothing was
-                        * read (MISSING). */
+    atlas_buf status;  /* the record's status as read, safe-encoded at every
+                        * path -- a caller must NOT encode it again. Ordinarily
+                        * it is a closed Atlas vocabulary value
+                        * (PROPOSED/APPROVED/REJECTED/SUPERSEDED/RESOLVED), the
+                        * same category service_decision.c's fill_summary
+                        * marks untrusted = false for, and a value from that
+                        * vocabulary encodes to itself byte-for-byte, so this
+                        * field reads exactly as it would unencoded for every
+                        * legitimate record. The encoding exists for the one
+                        * case that category assumes away: a status column
+                        * holding bytes that are not a vocabulary member at
+                        * all, which only walk_entry's own
+                        * atlas_decision_state_parse check can detect, and
+                        * which is exactly the case the unencoded field would
+                        * have been wrong for. Empty when nothing was read
+                        * (MISSING). */
     atlas_buf detail;  /* a §Frozen detail line, or the refusal message; fixed
                         * Atlas text with checked values, or safe-encoded */
     int64_t current_revision_no; /* MOVED: what the newest is */

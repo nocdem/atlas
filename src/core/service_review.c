@@ -112,6 +112,26 @@ static void set_prefix(char *dst, const char *hash) {
     dst[n] = '\0';
 }
 
+/* The one place `o->status` is ever written -- always safe-encoded, with no
+ * exception for the ordinary case, so there is exactly one rule to get right
+ * rather than one per call site.
+ *
+ * A value from the closed status vocabulary (PROPOSED, APPROVED, REJECTED,
+ * SUPERSEDED, RESOLVED) encodes to itself byte-for-byte -- atlas_safe() has
+ * nothing to escape in it -- so this costs nothing on every legitimate
+ * record and reads exactly as it did before encoding was added here. What it
+ * closes is the one path a raw, unconditional atlas_buf_set() left open: a
+ * status column holding bytes that are not a vocabulary member at all, which
+ * only atlas_decision_state_parse() can detect and which this function no
+ * longer needs a caller to have detected first. See the field's own comment
+ * in include/atlas/service.h -- a caller of atlas_service_review_apply must
+ * not encode this field again. */
+static atlas_status set_status(atlas_review_outcome *o, const char *raw, size_t raw_len,
+                               atlas_err *err) {
+    atlas_buf_reset(&o->status);
+    return atlas_text_encode_safe(raw, raw_len, &o->status, err);
+}
+
 /* Reads `path` with O_NOFOLLOW, never more than
  * ATLAS_REVIEW_SHEET_MAX_BYTES + 1 bytes -- one more than the parser's own
  * limit, never exactly that limit. A caller that stopped at exactly MAX_BYTES
@@ -265,7 +285,7 @@ static atlas_status walk_entry(atlas_ctx *ctx, const atlas_review_entry *entry, 
         o->verdict = ATLAS_REVIEW_MOVED;
         o->current_revision_no = latest;
         set_prefix(o->current_prefix, now_hash);
-        rst = atlas_buf_set(&o->status, doc0.summary.status.data, doc0.summary.status.len, err);
+        rst = set_status(o, doc0.summary.status.data, doc0.summary.status.len, err);
         if (rst == ATLAS_OK) {
             rst = atlas_buf_appendf(&o->detail, err, "reviewed r%lld (%.8s), now r%lld (%.8s)",
                                     (long long)entry->revision_no, entry->prefix,
@@ -308,7 +328,7 @@ static atlas_status walk_entry(atlas_ctx *ctx, const atlas_review_entry *entry, 
         o->verdict = ATLAS_REVIEW_MOVED;
         o->current_revision_no = entry->revision_no;
         set_prefix(o->current_prefix, n_hash);
-        rst = atlas_buf_set(&o->status, doc0.summary.status.data, doc0.summary.status.len, err);
+        rst = set_status(o, doc0.summary.status.data, doc0.summary.status.len, err);
         if (rst == ATLAS_OK) {
             rst = atlas_buf_appendf(&o->detail, err, "reviewed r%lld (%.8s), now r%lld (%.8s)",
                                     (long long)entry->revision_no, entry->prefix,
@@ -318,35 +338,37 @@ static atlas_status walk_entry(atlas_ctx *ctx, const atlas_review_entry *entry, 
         return rst;
     }
 
+    /* `!parsed` is schema-enforced unreachable today: `decision_documents.
+     * current_status` (src/db/migrate.c, migration 13) carries a SQL CHECK
+     * naming exactly the five vocabulary members, so no write through
+     * SQLite -- not `atlas_service_decision_propose`, not a hand-written
+     * `UPDATE`, nothing short of altering or dropping that constraint -- can
+     * put any other value there. Checked and handled anyway, because a
+     * defensive read should not assume a constraint it did not write and
+     * cannot see broken elsewhere (a future migration, a restored backup from
+     * an older schema) will always hold; set_status()/the branch below fail
+     * safe rather than trust it silently. */
     atlas_decision_state have = ATLAS_DECISION_PROPOSED;
     bool parsed = atlas_decision_state_parse(atlas_buf_cstr(&doc0.summary.status), &have);
     atlas_decision_state need = required_status_for(entry->intent);
     if (!parsed || have != need) {
         o->verdict = ATLAS_REVIEW_DISPOSED;
-        rst = atlas_buf_set(&o->status, doc0.summary.status.data, doc0.summary.status.len, err);
-        if (rst == ATLAS_OK && parsed) {
-            /* A known member of the closed status vocabulary: fixed Atlas
-             * text, not encoded, same as everywhere else this file prints a
-             * status. */
+        rst = set_status(o, doc0.summary.status.data, doc0.summary.status.len, err);
+        if (rst == ATLAS_OK) {
+            /* Built from `o->status`, not from `doc0.summary.status` a second
+             * time: `o->status` was just set to the safe-encoded form above,
+             * so re-reading it here rather than re-encoding the raw bytes is
+             * what makes it structurally impossible for `detail` and
+             * `status` to disagree about what this record's status was.
+             * Always taken, `parsed` or not -- a vocabulary member encodes to
+             * itself, so this reads exactly as the unencoded form did for
+             * every ordinary DISPOSED record, and is also correct on the
+             * `!parsed` path this branch exists to cover, without a second
+             * branch that could fall out of step with the first. */
             rst = atlas_buf_appendf(&o->detail, err, "the record is %s; %s needs %s",
-                                    atlas_buf_cstr(&doc0.summary.status),
+                                    atlas_buf_cstr(&o->status),
                                     atlas_decision_intent_name(entry->intent),
                                     atlas_decision_state_name(need));
-        } else if (rst == ATLAS_OK) {
-            /* !parsed: atlas_decision_state_parse just failed on these exact
-             * bytes -- evidence that the "status is a closed Atlas vocabulary
-             * no repository or model byte can reach" premise
-             * (service_decision.c's fill_summary, which is why every other
-             * status this file prints is left unencoded) did not hold on this
-             * path. This is the one branch that has just observed that
-             * premise fail, so it is safe-encoded here rather than trusted. */
-            atlas_safe_pool pool;
-            atlas_safe_pool_init(&pool);
-            rst = atlas_buf_appendf(&o->detail, err, "the record is %s; %s needs %s",
-                                    atlas_safe(&pool, atlas_buf_cstr(&doc0.summary.status)),
-                                    atlas_decision_intent_name(entry->intent),
-                                    atlas_decision_state_name(need));
-            atlas_safe_pool_free(&pool);
         }
         atlas_decision_document_free(&doc0);
         return rst;
@@ -354,7 +376,7 @@ static atlas_status walk_entry(atlas_ctx *ctx, const atlas_review_entry *entry, 
 
     /* Ready: the revision is current, its hash matches, and its status is the
      * one the intent needs. Nothing has been minted yet. */
-    rst = atlas_buf_set(&o->status, doc0.summary.status.data, doc0.summary.status.len, err);
+    rst = set_status(o, doc0.summary.status.data, doc0.summary.status.len, err);
     atlas_decision_document_free(&doc0);
     if (rst != ATLAS_OK) {
         return rst;
@@ -372,7 +394,7 @@ static atlas_status walk_entry(atlas_ctx *ctx, const atlas_review_entry *entry, 
                                                        &outcome, err);
     if (cst == ATLAS_OK) {
         o->verdict = ATLAS_REVIEW_APPLIED;
-        atlas_status ust = atlas_buf_set(&o->status, outcome.state.data, outcome.state.len, err);
+        atlas_status ust = set_status(o, outcome.state.data, outcome.state.len, err);
         if (ust == ATLAS_OK) {
             ust = atlas_buf_appendf(&o->detail, err, "%s at r%lld", atlas_buf_cstr(&outcome.state),
                                     (long long)outcome.revision_no);

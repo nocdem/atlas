@@ -1667,3 +1667,38 @@ worker, structurally rather than by convention — the shape `atlas_decision_app
 has, where the write point is one function with a counted set of callers and a test that
 compares the count. Today the property is stated in a comment at both sites and checked by
 nothing.
+
+## `memory pack`/`diff`/`patch`/`trailer` have no remote form (2026-09-03)
+
+Found by A12.1's T16 while wiring the `atlas memory` CLI family. Every other read-only
+command family in this tree has both a local form (`atlas_ctx_db(ctx)`) and a `_remote`
+twin served over the socket — `code`, `decision`, `sem`, `gate`, `context build`, and now
+`memory status` — because under A7.1 the index is 0700 `atlasd` and an operator's own
+account has no local handle at all. `memory status`, `scan` and `reconcile` have this: the
+first reads through T11's existing `memory.status` operator method when `ctx` is NULL, and
+the other two are unconditionally daemon-served already (T11's own design — the writer-
+thread job queue `memory.put`/`memory.reconcile` submit to has no local equivalent to fall
+back to).
+
+`memory pack`, `memory diff`, `memory patch` and `memory trailer` do not: they read
+`memory_context_packs`, `memory_claim_diffs`, `memory_sources` and `memory_trailer_bindings`
+through `atlas_ctx_db(ctx)` only, and refuse with a stated reason
+(`src/core/service_memory.c`'s `MEMORY_NO_LOCAL_HANDLE`) when `ctx` is NULL. Under
+`index_is_foreign` (`src/cli/cli.c`) they are absent from `remote_serves()`, so they fall
+through to the pre-existing generic refusal rather than the built binary's
+`memory_item`/NULL-`ctx` crash the vtbl's own comment warns a new command's incomplete
+sibling would cause — the failure mode is a clean refusal, not a defect, but it is the
+first family in this tree where four of seven forms carry the gap the others do not.
+
+**Why it was not closed in T16.** Closing it needs four new RPC methods
+(`memory.pack`/`memory.diff`/`memory.patch`/`memory.trailer`) in the operator group beside
+`memory.status`, in `src/ipc/server_memory.c` — a T11 file T16's own plan section did not
+list for modification, and new operator-uid surface that deserves its own review rather
+than arriving as a side effect of a CLI task. Recorded here rather than worked around.
+
+**Candidate follow-up, not implemented.** Add the four methods, following `memory.status`'s
+own shape: read-only, no job queue, answered synchronously off the daemon's own db handle.
+`atlas_memory_pack_build` and `atlas_memory_patch_build` both read files and must not run
+inside a transaction (their own header comments say so), which the daemon's ordinary
+dispatch path already respects for other reads — nothing about that constraint is new to a
+socket-served form.

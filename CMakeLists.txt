@@ -416,6 +416,15 @@ add_library(atlas_core STATIC
   # and `trailer` are local-only in this build — see the file's own header
   # comment for the disclosed A7.1 gap.
   src/core/service_memory.c
+
+  # --- A15 T3: the review sheet grammar --------------------------------------
+  #
+  # The grammar and the vocabulary only: bytes in, a parsed sheet or a refusal
+  # out. Pure, `src/memory/source.c`'s discipline -- no database handle, no
+  # process, no file, no clock -- which is what lets the whole grammar be
+  # enumerated by a unit test rather than only exercised through a real
+  # terminal session a later task's walker drives.
+  src/core/review.c
   ${ATLAS_UI_GEN}
 )
 

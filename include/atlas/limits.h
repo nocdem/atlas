@@ -1275,4 +1275,40 @@
  * repository nobody rebuilt by hand. */
 #define ATLAS_MEMORY_EXTRACTOR_VERSION 1
 
+/* --- A15 T3: the review sheet -----------------------------------------------
+ *
+ * A review sheet is a plain-ASCII list an operator copies out of Mission
+ * Control's browser session and hands to `atlas review apply` on the machine
+ * Atlas runs on. It stores no authority of its own -- see
+ * `include/atlas/review.h` -- so these three bounds are about the parser's
+ * own cost, never about anything the sheet could grant. */
+
+/* Entries one sheet may name. Kept below ATLAS_DECISION_CHALLENGES_RETAIN
+ * (200): the walker mints at most one challenge per entry before the
+ * operator's terminal answers it, so a sheet where every entry is abandoned
+ * leaves that many challenges unconsumed until they expire. A bound at or
+ * above the database's own retention ceiling would let one sheet, by itself,
+ * be the reason older unspent challenges from unrelated repositories are
+ * pruned early; staying well below it (64 against 200) keeps a
+ * fully-abandoned sheet a minority of what the whole database already
+ * retains. */
+#define ATLAS_REVIEW_SHEET_MAX_ENTRIES 64u
+/* Bytes of one line the parser will accept before refusing the sheet outright,
+ * rather than reading further into a line that could not be a well-formed
+ * entry anyway. The longest legitimate line -- "revalidate" (the longest
+ * intent word `atlas_decision_intent_name` produces, even though
+ * `atlas_review_intent_allowed` refuses it here), ATLAS_NAME_MAX (128) bytes
+ * of repository name, ATLAS_DECISION_UID_MAX - 1 (42) bytes of decision id,
+ * an "r" plus a 10-digit revision, ATLAS_DECISION_CONFIRM_HEX (8) bytes of
+ * confirmation prefix, and four separating spaces -- comes to about 195
+ * bytes, nowhere near this, so nothing but padding or a corrupted file
+ * reaches it. */
+#define ATLAS_REVIEW_SHEET_MAX_LINE 256u
+/* Bytes of one sheet file the parser will read at all. ATLAS_REVIEW_SHEET_MAX_
+ * ENTRIES lines of at most ATLAS_REVIEW_SHEET_MAX_LINE bytes each already
+ * bounds a legitimate sheet at roughly a quarter of this, so the ceiling
+ * exists to refuse a file that is not a review sheet -- the wrong file pasted
+ * into the wrong terminal -- before the parser spends any real work on it. */
+#define ATLAS_REVIEW_SHEET_MAX_BYTES (64u * 1024u)
+
 #endif /* ATLAS_LIMITS_H */

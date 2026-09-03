@@ -318,6 +318,13 @@ set(ATLAS_TESTS
   test_verify_absence
   test_verify_intake
   test_verify_product
+  # --- A15: the review surface ---
+  #
+  # T3: the review sheet grammar and the verdict/intent vocabularies -- an
+  # enum in and a name out, or a byte range in and a parsed sheet or a refusal
+  # out. No database, no daemon, no repository, `test_memory_source.c`'s own
+  # reason for sitting in the fast "unit" subset rather than "integration".
+  test_review_sheet
 )
 
 foreach(test_name IN LISTS ATLAS_TESTS)
@@ -377,6 +384,7 @@ set_tests_properties(test_memory_reconcile_live PROPERTIES LABELS "daemon" TIMEO
 set_tests_properties(test_core test_safetext test_proc test_git_parse test_db test_datadir
   test_lock test_ipc test_migrate3 test_migrate_scanner_uid test_scanner_uid test_mirror test_unit
   test_memory_source test_migrate29 test_memory_extract
+  test_review_sheet
   PROPERTIES LABELS "unit")
 # The fixture suite forks children that run the binary, but needs no repository,
 # no database and no daemon.

@@ -262,7 +262,7 @@ static void test_check_only_precheck_verdicts(void) {
     char disposed_prefix[ATLAS_DECISION_CONFIRM_HEX + 1u];
     hash_prefix_at(ctx, atlas_buf_cstr(&disposed_uid), 1, disposed_prefix);
 
-    char l0[256], l1[256], l2[256], l3[256], l4[256];
+    char l0[256], l1[256], l2[256], l3[256], l4[256], l5[256];
     (void)snprintf(l0, sizeof(l0), "approve proj %s r1 %s", atlas_buf_cstr(&ready_uid),
                    ready_prefix);
     (void)snprintf(l1, sizeof(l1), "approve proj %s r1 %s", atlas_buf_cstr(&moved_latest_uid),
@@ -272,14 +272,26 @@ static void test_check_only_precheck_verdicts(void) {
     (void)snprintf(l3, sizeof(l3), "approve proj %s r1 00000000", missing_uid);
     (void)snprintf(l4, sizeof(l4), "resolve proj %s r1 %s", atlas_buf_cstr(&disposed_uid),
                    disposed_prefix);
+    /* A repository that is grammatically valid but was never `repo add`-ed --
+     * the other MISSING case, mapped from atlas_service_require_repo's
+     * NOT_REGISTERED rather than from resolve_uid's refusals above. Nothing
+     * in this test names "ghost" as a repository, which is the point. */
+    (void)snprintf(l5, sizeof(l5), "approve ghost %s r1 00000000", missing_uid);
 
     atlas_buf sheet_path = ATLAS_BUF_INIT;
     atlas_err err;
     atlas_err_init(&err);
     T_OK(atlas_buf_appendf(&sheet_path, &err, "%s/review.txt", fx_data_dir(&e.fx)), &err);
-    write_sheet(&e, "review.txt", l0, l1, l2, l3, l4, NULL);
+    write_sheet(&e, "review.txt", l0, l1, l2, l3, l4, l5, NULL);
 
     int64_t before = challenge_count(ctx);
+    /* Pinned to a value the test asserts, not merely compared to itself:
+     * nothing in this fixture ever creates a challenge row, so a
+     * challenge_count() that silently answered 0 against the wrong database
+     * or a table that did not exist would make the before/after comparison
+     * below pass for the wrong reason (0 == 0 regardless of what the walk
+     * did). */
+    T_EQ_INT(before, 0);
 
     capture cap;
     memset(&cap, 0, sizeof(cap));
@@ -293,7 +305,7 @@ static void test_check_only_precheck_verdicts(void) {
     T_CHECK_MSG(after == before, "check_only minted %lld capabilities",
                 (long long)(after - before));
 
-    T_REQUIRE(cap.count == 5u);
+    T_REQUIRE(cap.count == 6u);
 
     /* 0: READY */
     T_EQ_INT(cap.rows[0].verdict, ATLAS_REVIEW_READY);
@@ -332,9 +344,16 @@ static void test_check_only_precheck_verdicts(void) {
     T_EQ_STR(atlas_buf_cstr(&cap.rows[4].detail), "the record is PROPOSED; resolve needs APPROVED");
     T_EQ_STR(atlas_buf_cstr(&cap.rows[4].status), "PROPOSED");
 
+    /* 5: MISSING, via the unregistered-repository branch specifically --
+     * ATLAS_ERR_REPO / NOT_REGISTERED, distinct from the ATLAS_ERR_USAGE path
+     * row 3 already exercised. */
+    T_EQ_INT(cap.rows[5].verdict, ATLAS_REVIEW_MISSING);
+    T_EQ_STR(atlas_buf_cstr(&cap.rows[5].detail), "no such repository");
+    T_EQ_INT(cap.rows[5].status.len, 0);
+
     T_EQ_INT(totals.ready, 1);
     T_EQ_INT(totals.moved, 2);
-    T_EQ_INT(totals.missing, 1);
+    T_EQ_INT(totals.missing, 2);
     T_EQ_INT(totals.disposed, 1);
     T_EQ_INT(totals.applied, 0);
     T_EQ_INT(totals.abandoned, 0);

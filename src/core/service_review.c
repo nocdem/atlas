@@ -207,13 +207,19 @@ static atlas_status walk_entry(atlas_ctx *ctx, const atlas_review_entry *entry, 
             return atlas_buf_set_str(&o->detail, "no such repository", err);
         }
         if (st == ATLAS_ERR_USAGE) {
-            /* resolve_uid's two refusals ("no decision has that id" and
-             * "that decision belongs to a different repository") both mean,
-             * from this sheet's point of view, that the named repository has
-             * no such decision -- the distinction between "does not exist at
-             * all" and "exists under a different repository" is not one a
-             * reviewer disposing of a record in *this* repository can act on
-             * differently. */
+            /* resolve_uid (service_decision.c) has three refusals, and only
+             * two of them can ever reach this branch. "No decision has that
+             * id" and "that decision belongs to a different repository" both
+             * mean, from this sheet's point of view, that the named
+             * repository has no such decision -- the distinction between
+             * "does not exist at all" and "exists under a different
+             * repository" is not one a reviewer disposing of a record in
+             * *this* repository can act on differently. The third, "that is
+             * not a decision id" (a malformed uid), cannot happen here: the
+             * sheet parser already applied atlas_decision_uid_is_valid to
+             * every entry's decision field before this file ever saw one, so
+             * `entry->decision` is always a well-formed id by the time it
+             * reaches show_revision. */
             atlas_err_init(err);
             o->verdict = ATLAS_REVIEW_MISSING;
             atlas_safe_pool pool;
@@ -318,11 +324,29 @@ static atlas_status walk_entry(atlas_ctx *ctx, const atlas_review_entry *entry, 
     if (!parsed || have != need) {
         o->verdict = ATLAS_REVIEW_DISPOSED;
         rst = atlas_buf_set(&o->status, doc0.summary.status.data, doc0.summary.status.len, err);
-        if (rst == ATLAS_OK) {
+        if (rst == ATLAS_OK && parsed) {
+            /* A known member of the closed status vocabulary: fixed Atlas
+             * text, not encoded, same as everywhere else this file prints a
+             * status. */
             rst = atlas_buf_appendf(&o->detail, err, "the record is %s; %s needs %s",
                                     atlas_buf_cstr(&doc0.summary.status),
                                     atlas_decision_intent_name(entry->intent),
                                     atlas_decision_state_name(need));
+        } else if (rst == ATLAS_OK) {
+            /* !parsed: atlas_decision_state_parse just failed on these exact
+             * bytes -- evidence that the "status is a closed Atlas vocabulary
+             * no repository or model byte can reach" premise
+             * (service_decision.c's fill_summary, which is why every other
+             * status this file prints is left unencoded) did not hold on this
+             * path. This is the one branch that has just observed that
+             * premise fail, so it is safe-encoded here rather than trusted. */
+            atlas_safe_pool pool;
+            atlas_safe_pool_init(&pool);
+            rst = atlas_buf_appendf(&o->detail, err, "the record is %s; %s needs %s",
+                                    atlas_safe(&pool, atlas_buf_cstr(&doc0.summary.status)),
+                                    atlas_decision_intent_name(entry->intent),
+                                    atlas_decision_state_name(need));
+            atlas_safe_pool_free(&pool);
         }
         atlas_decision_document_free(&doc0);
         return rst;

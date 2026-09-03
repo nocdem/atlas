@@ -3542,12 +3542,15 @@ speaking. Inside a memory file the speaker is unestablished by construction,
 and choosing the stronger identity because Atlas trusts its own read pipeline
 would confuse "Atlas read this" with "Atlas vouches for what it says." The
 arithmetic makes the stakes concrete: `ATLAS_ATTESTED` would give a memory
-file a prior of 400, ahead of a self-declared AI agent's 350 and behind only
-a human's 500 — a sentence typed into a project's own memory file would then
-outrank the model that wrote it speaking for itself, and every additional
-memory file would mechanically raise the ceiling on how confident Atlas could
-become about anything. `SELF_DECLARED` gives 350, the same tier as the model,
-which is the honest answer to "how sure is Atlas who is talking."
+file a prior of 400 — ahead of a self-declared AI agent's 350, but behind
+`ATLAS_VERIFIER`'s 900, `TOOL`'s and `TEST`'s 700, `RUNTIME_OBSERVATION`'s
+and `REPOSITORY_EVIDENCE`'s 650, and `HUMAN`'s 500, seventh of the nine
+class bases rather than second — a sentence typed into a project's own
+memory file would still outrank the model that wrote it speaking for
+itself, and every additional memory file would mechanically raise the
+ceiling on how confident Atlas could become about anything. `SELF_DECLARED`
+gives 350, the same tier as the model, which is the honest answer to "how
+sure is Atlas who is talking."
 
 **Why the anchor bound is reachable by accumulation and not by merging, and
 why that changes what the bound protects against.** The first explanation

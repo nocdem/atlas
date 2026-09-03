@@ -1892,3 +1892,38 @@ an old row's, and re-pointing (or at least re-associating) the old memory chain 
 — is real, A4-grade work this season did not attempt. Recorded as a residual rather than a
 defect: nothing today claims memory survives a re-registration, so nothing is currently wrong,
 but a reader relying on continuity across one would be disappointed.
+
+## A trailer's change reason can resolve to a different record, not merely to none (2026-09-03)
+
+Found while closing A12.1's documentation, and it sharpens what that season already
+recorded rather than contradicting it.
+
+`Atlas-Change-Reason` carries a bare `ai_reasons.id` in decimal (A12.1's T14 chose that,
+because `ai_reasons` has no uid and adding one is a migration). Ingestion resolves it with
+an existence check against that table.
+
+**`ai_reasons.id` is `INTEGER PRIMARY KEY` with no `AUTOINCREMENT`** (`src/db/migrate.c:493`).
+SQLite reuses a rowid once the highest row is deleted, so a trailer written before such a
+deletion can later resolve to a **real but unrelated** reason record — and the resolution
+*succeeds*, so the field is not UNKNOWN and nothing marks it.
+
+**Why this is worse than the failure mode A12.1 documented.** That season's rule is that a
+trailer is a pointer, never proof and never authority, and an unresolvable reference leaves
+its field UNKNOWN and binds nothing. That holds for five of the six lines: lose the row and
+the field goes unknown, which is honest. This one can instead bind to the wrong thing and
+look right. A person reading a commit's provenance is shown a reason somebody else recorded
+for some other change.
+
+**It grants nothing**, and that part of the design still holds — no approval, no gate
+result, no verified claim follows from a trailer. The cost is a false attribution displayed
+to a person, which is the kind of thing this repository refuses to do elsewhere: invariant 5
+says Atlas never infers a historical reason, and showing the wrong recorded one is a
+neighbour of that.
+
+**Candidate fixes, none implemented.** Make the id stable — `AUTOINCREMENT` on that column
+guarantees a never-reused rowid, at the cost of a migration and a monotonic counter Atlas
+must then keep. Or bind the reason by something already stable: `ai_reasons` has a
+`dedup_key`, nullable and not an identity today, and giving the trailer a content-derived
+reference would match how its two digests already work. Or refuse to compose the field at
+all when the reason's identity cannot be made durable, which is the smallest change and
+loses a line of the trailer.

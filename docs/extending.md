@@ -1126,6 +1126,76 @@ and nothing else, and a `full` directive must drop it.
 
 ## A12.1 — reconciled model memory
 
+### Adding a `memory.*` operator method
+
+`OPERATOR_METHODS[]` in `src/ipc/server_decision.c` is where `memory.put`,
+`memory.status` and `memory.reconcile` live, beside `repo.scanner` and the
+`decision.*` operator methods — one table, not a fourth group, for the same
+reason `plan.*` stayed inside the existing client group rather than getting
+its own: a second group is a second answer to "who may reach this."
+
+This table is hidden differently from A13's scanner group, and a new entry
+must not assume the scanner group's shape. The scanner group is
+**dispatchable by name** and answers `peer_owns` itself, per repository,
+inside each method; this table is not reached at all unless
+`atlas_server_peer_is_operator` has already answered `true` for the
+connecting peer's `SO_PEERCRED` uid (`src/ipc/server.c:1250`) — a peer the
+root-owned policy does not name gets `unknown method`, indistinguishable from a name that does
+not exist, the same hiding the two orchestration groups use. So being *in*
+this table already carries the whole authorisation for a new method; there
+is no `peer_owns`-style check to remember to add inside it. The mistake to
+watch for instead is the opposite one: wiring a new method into the
+always-dispatchable client group by copying `plan.*`'s shape, which would
+answer "orchestration is not enabled" to anyone rather than `unknown method` to a
+non-operator — a materially weaker guard reached by picking the wrong table,
+not by forgetting a check inside the right one.
+
+Two rules the three existing methods already follow, for a fourth to keep:
+
+- **No authority verb**, the same rule `plan.*` and the scanner group state.
+  `memory.put` and `memory.reconcile` read and append rows a client without
+  operator standing can already reach a version of some other way (a
+  scanner's mirror, `atlas memory scan`'s own read) and confer no authority
+  over the decision lifecycle, the registry or a backup — a name suggesting
+  otherwise would misdescribe what the method does.
+- **State the write's classification at the call site.** `memory.put`
+  answers synchronously because `ATLAS_JOB_MEMORY` is neither unbounded nor
+  undrainable; `memory.reconcile` answers only that the write was
+  *accepted*, never completion, because `ATLAS_JOB_MEMORY_RECONCILE` is
+  unbounded (see the A9.2.6 section above and `docs/daemon-and-ipc.md`'s
+  A12.1 section). A new write-bearing method needs its own classification
+  named, not inherited by assumption from what the other two do.
+
+### Adding a `memory` CLI subcommand
+
+`memory` is one command family with seven forms — `status`, `scan`,
+`reconcile`, `pack`, `diff`, `patch`, `trailer` — sharing **one** vtbl
+method, `memory_item` (`atlas_renderer_vtbl`, `src/cli/render.h`),
+discriminated by the string field `atlas_memory_render.form`. That collapses
+CLAUDE.md's
+ordinary five-place command rule onto three real touch points for a new
+*form*, not five: a branch inside `run_memory` (`src/cli/cli.c`) parsing the
+form's own arguments and setting `mc.command`/`mc.plural`; a new `form`
+branch inside `memory_item`'s implementation in **both** `render_human.c`
+(keyed off `mr->form`, alongside `h_memory_status`/`h_memory_scan`) and
+`render_json.c` — a missing branch in one renderer is a gap in one form, not
+a whole method nobody wrote, which is exactly why it is easy to add a form
+to one renderer and not notice, the same risk `job_item`/`plan_item` already
+carry; and the new fields `atlas_memory_render` needs for that form's own
+data, added to the one struct every form shares. The usage and `--help` text
+at the top of `src/cli/cli.c` is not optional decoration — it is where the
+form's argument shape is documented for a caller, and `memory`'s own entry
+there already lists all seven.
+
+The **command** name "memory" itself is already in `COMMANDS[]`
+(`src/cli/cli.c`) and in the remote-serving allowlist beside it (`:2617`) —
+neither moves for a new subcommand. Only a wholly new top-level command
+needs those two entries, following the ordinary five-place rule in full:
+a service function, `atlas_renderer_vtbl` methods implemented in both
+renderers, dispatch plus help text in `src/cli/cli.c`, and the `COMMANDS[]`
+entry — the fifth place CLAUDE.md warns is the one that gets forgotten,
+because everything else still compiles and passes without it.
+
 ### Adding a memory source class
 
 Four exist: `REPO_FILE`, `REPO_DIR`, `EXTERNAL_FILE`, `EXTERNAL_DIR`. A fifth
@@ -1164,8 +1234,9 @@ answer.
 ### Adding a diff kind or an anchor kind
 
 A `memory_claim_diffs.kind` member needs the CHECK literal, the C enum member
-after the seven existing non-zero ones (so no stored ordinal moves), and a
-place in `atlas_memory_diff_kind_name`/`_parse`. Keep `UNKNOWN` the
+appended after every existing non-zero one — never inserted before or between
+them, so no stored ordinal moves — and a place in
+`atlas_memory_diff_kind_name`/`_parse`. Keep `UNKNOWN` the
 unparseable zero: the CHECK must never admit its stored spelling, because a
 database row is not allowed to hold a value nothing can read back — the
 reason A11.0 states as "a stored run may never hold it." A genuinely new

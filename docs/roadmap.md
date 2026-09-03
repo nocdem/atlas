@@ -511,9 +511,13 @@ run between chunks.*
   drain-eligible job, runs it, and repeats until none is left. It records nothing
   durable: this is scheduling, not state.
 - **`job_kind_is_drainable`**, an explicit function with no `default:` and one
-  reason per exclusion. `true` for `ORCH`, `AI`, `DECISION`, `VERIFY`,
-  `GW_AUDIT`, `APIKEY` — the latency-critical writes whose tables are disjoint
-  from anything a pass or a walk touches.
+  reason per exclusion. At this season's ship, `true` for `ORCH`, `AI`,
+  `DECISION`, `VERIFY`, `GW_AUDIT`, `APIKEY` — the latency-critical writes
+  whose tables are disjoint from anything a pass or a walk touches. Later
+  seasons added to this set on the same two conditions — A12.0's `PLAN`,
+  A12.1's `MEMORY` — which is exactly why this list is a snapshot of what
+  shipped here, never a substitute for reading `job_kind_is_drainable`
+  (`src/daemon/writer.c`) itself for the current membership.
 - **A grace.** `ATLAS_WRITER_YIELD_GRACE_MS` (2000). A waiter that observes an
   unbounded job gives it that long to reach a yield point before backing out, and
   the grace is measured from the waiter's *first observation*, never from queue
@@ -1437,14 +1441,21 @@ repository proves all of the following:
 9. rebuilding from a Git trailer resolves every reference against Atlas' own
    rows and never adds authority: a malformed, unknown or deliberately
    altered field produces explicit `UNKNOWN` rather than a wrong answer.
-   Three of the trailer's six lines survive an index rebuild — one names
-   original data assigned once and never recomputed, and two are
-   content-derived digests that verify again against any correctly rebuilt
-   index regardless of which internal row identifiers it assigns; the
-   memory-generation and change-reason lines name local, reassignable
-   identifiers a rebuild is not guaranteed to reproduce, and a reader seeing
-   `UNKNOWN` there must read it as the index having moved, never as
-   tampering.
+   Ingestion recomputes no digest from content — five of the trailer's six
+   lines are stored-value comparisons against one of three canonical rows
+   that a rebuild does not reproduce (`memory_context_packs`, `orch_runs`,
+   `ai_reasons`), so a rebuild that does not carry those rows forward sends
+   `Atlas-Memory-Generation`, `Atlas-Context-Digest` and
+   `Atlas-Decision-Set-Digest` to `UNKNOWN` together (all three are checked
+   against one frozen pack row), and sends `Atlas-Run` or
+   `Atlas-Change-Reason` to `UNKNOWN` independently. Only
+   `Atlas-Change-Reason` can bind to a *different* record rather than to
+   none — it is a bare integer-id existence check with no content compared,
+   so an emptied-and-repopulated table could reuse the id; the other four
+   are keyed by values nothing else can be assigned, so a reader seeing
+   `UNKNOWN` on those must read it as one of the three rows not surviving,
+   never as tampering. The sixth line, `Atlas-Provenance`, is a fixed marker
+   with no value to lose.
 
 **Deliberate non-goals for this season.** Reading a model provider's hidden
 internal memory; mass-rewriting every note on every keystroke; using GitHub as a

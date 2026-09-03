@@ -37,18 +37,24 @@ Git-tracked source, and when the read happened.
 The proposition the file *asserts* is a different fact, and it gets a
 different actor: one of class `DOCUMENT`, identity `SELF_DECLARED`, one per
 registered source. The identity is the choice that matters, and the
-aggregation arithmetic is why. A prior is `min(base, cap)`. `ATLAS_ATTESTED`
-carries base 400 and cap 900, so choosing it would give a memory file a prior
-of 400 — above a self-declared AI agent's 350, and second only to a human's
-500. A sentence anyone can type into a project's own memory file would then
-outweigh the model that wrote it speaking directly, and "more memory" would
-mechanically become "more confidence" — the exact failure this season exists
-to prevent, arriving as an unchosen number. `SELF_DECLARED` carries base 400
-and cap 350, so the prior is `min(400, 350) = 350`: the same weight as a
-self-declared AI agent, because inside a memory file the speaker really is
-unestablished — Atlas cannot tell a note a person typed from one a model
-wrote from one copied out of another project, and `SELF_DECLARED` is the
-honest name for that.
+aggregation arithmetic is why. A prior is `min(base, cap)`, where `base`
+comes from the actor's *class* and `cap` from its *identity* — the two are
+independent axes of the same table, not two properties of one name. The
+`DOCUMENT` class carries base 400; the `ATLAS_ATTESTED` identity carries cap
+900. Choosing that identity for a memory file would combine them into
+`min(400, 900) = 400` — seventh of the nine class bases in this table
+(below `ATLAS_VERIFIER`'s 900, `TOOL`'s and `TEST`'s 700, `RUNTIME_OBSERVATION`'s
+and `REPOSITORY_EVIDENCE`'s 650, and `HUMAN`'s 500) but still above a
+self-declared AI agent's 350. A sentence anyone can type into a project's
+own memory file would then outweigh the model that wrote it speaking
+directly, and "more memory" would mechanically become "more confidence" —
+the exact failure this season exists to prevent, arriving as an unchosen
+number. `SELF_DECLARED`'s cap is 350, so combined with `DOCUMENT`'s base of
+400 the prior is `min(400, 350) = 350`: the same weight as a self-declared
+AI agent, because inside a memory file the speaker really is unestablished
+— Atlas cannot tell a note a person typed from one a model wrote from one
+copied out of another project, and `SELF_DECLARED` is the honest name for
+that.
 
 Atlas attested the reading. It did not attest the assertion.
 
@@ -489,23 +495,26 @@ writer thread.
 
 ## 10. Two new job kinds, and both switch questions answered at the case
 
-The writer thread's two classification switches — is a job's duration
-statable, and may a job run inside another one's yield — have no `default:`
-case, so a new job kind cannot compile until both questions are answered for
-it.
+The writer thread's two classification switches — `job_kind_is_unbounded`
+and `job_kind_is_drainable` — have no `default:` case, so a new job kind
+cannot compile until both questions are answered for it. `false` on the
+first question means *bounded*: the job has a duration Atlas can state in
+advance, not merely one that is usually short.
 
 `ATLAS_JOB_MEMORY` — the small, bounded writes behind putting one memory
 source's bytes, or reading one back — answers **false** to the first
-question (a handful of statements over bytes already bounded before they
-were ever queued) and **true** to the second: an operator's own command is
-waiting on it, and the tables it writes are disjoint from anything a
-semantic pass or a discovery walk touches.
+question: not unbounded, because it is a handful of statements over bytes
+already bounded before they were ever queued. It answers **true** to the
+second: an operator's own command is waiting on it, and the tables it
+writes are disjoint from anything a semantic pass or a discovery walk
+touches.
 
-`ATLAS_JOB_MEMORY_RECONCILE` — the pass itself — answers **false** to the
-first question, on a stronger basis than "it usually finishes quickly": its
-worst-case duration is statable in advance from compiled bounds on source
-count, candidate count and claim count, not from the size of a repository,
-and that is genuinely what the first question asks. It answers **false** to
+`ATLAS_JOB_MEMORY_RECONCILE` — the pass itself — also answers **false** to
+the first question, on a stronger basis than "it usually finishes quickly":
+its worst-case duration is statable in advance from compiled bounds on
+source count, candidate count and claim count, not from the size of a
+repository, which is exactly what makes `false` — not unbounded — the right
+answer even though the pass itself is not short. It answers **false** to
 the second for the reason given above: it forks git and reads files outside
 any transaction, and letting it run inside somebody else's yield would let
 file activity reach the writer thread through a window meant only for
@@ -570,31 +579,57 @@ approval, a gate result or a verified claim. A commit with no trailer block
 at all is ordinary, valid history, recorded as carrying none, which is a
 different fact from carrying a bad one.
 
-**Three of the six lines survive an index rebuild; two do not; the sixth is
-a fixed marker and never a value.** This project's own architecture holds
-that its index is rebuildable and git is authoritative, so a trailer that
-lives inside git's permanent record needs its reader to know which of its
-own fields still mean anything once the index that produced them is gone.
-`Atlas-Context-Digest` and `Atlas-Decision-Set-Digest` are content-derived —
-a hash of a rendered pack and of a decision-set tuple — and verify again
-against any correctly rebuilt index that reproduces the same content,
-whatever row identifiers it happens to assign this time. `Atlas-Run` is
-original data, assigned once at submission and never recomputed by anything,
-so it carries no rebuild exposure at all. `Atlas-Memory-Generation` is a
-per-repository sequence number tied to how many reconciliation passes have
-actually run, not to what they found — a rebuild that replays the same
-history will not in general re-run the same passes at the same moments, so
-it can legitimately assign a stored commit's claimed generation number to a
-different pass than the one that produced it, or to none. `Atlas-Change-Reason`
-carries the same exposure and a worse one beside it: it is the bare integer
-row identifier of a change-reason record that has no separate stable
-identifier of its own, and — unlike a generation — a reason is not
-rederivable from git at all, so losing the database loses it outright rather
-than merely renumbering it. Ingestion already degrades correctly for both
-exposed fields: a reference that no longer resolves reads as `UNKNOWN`,
-exactly as a wrong value would, and **a reader who sees `UNKNOWN` must not
-read it as tampering** — it may only mean the index underneath the trailer
-moved.
+**Ingestion recomputes nothing. All five value-bearing lines are stored-value
+comparisons against one of three canonical rows, and none of those rows is
+something a rebuild reproduces; the sixth line is a fixed marker that is
+never checked for a value at all.** `src/memory/trailer.c` fetches exactly
+one `memory_context_packs` row, by the trailer's own `Atlas-Run` value
+(`atlas_db_memory_pack_get`, keyed on `run_uid`), and then checks
+`Atlas-Memory-Generation`, `Atlas-Context-Digest` and `Atlas-Decision-Set-Digest`
+against three fields of that **one** row — the code's own comment says
+plainly that all three are "checked against ONE frozen pack." Neither digest
+is ever recomputed from a rendered pack or a decision-set tuple; both are
+`strcmp` against the row's stored `pack_digest` and `decision_set_digest`.
+So the three stand or fall together: a `memory_context_packs` row that is
+gone sends all three to `unknown_fields` in one step, never two of three.
+`Atlas-Run` resolves separately, against `orch_runs`; `Atlas-Change-Reason`
+resolves separately again, against `ai_reasons`.
+
+None of those three tables is rebuilt from git. `memory_context_packs` and
+`orch_runs` are `ATLAS_RETAIN_CANONICAL`; `ai_reasons` is
+`ATLAS_RETAIN_MEMORY` — both classes this project already treats as never
+rederivable, because each row is Atlas' only record of something that
+happened once (a model run, a worker's actual context) and not a fact about
+current git content that a rescan can reconstruct. So the honest statement
+is the reverse of what this document said before: a rebuild that loses
+`memory_context_packs` sends `Atlas-Memory-Generation`,
+`Atlas-Context-Digest` and `Atlas-Decision-Set-Digest` to `UNKNOWN` together;
+one that loses the named `orch_runs` row sends `Atlas-Run` to `UNKNOWN`; one
+that loses the named `ai_reasons` row sends `Atlas-Change-Reason` to
+`UNKNOWN`. All five depend on rows outside git, and the whole trailer's
+verifiability is therefore a stated cost of those rows surviving, not a
+property of hashes that "verify again."
+
+The five do not carry equal exposure, though, and the difference is worth
+keeping: `Atlas-Run` is a `run_uid` string, and the pack lookup behind the
+other three additionally checks `pack.repo_id` — neither can be satisfied by
+some other, unrelated row, so a stale reference there can only read
+`UNKNOWN`, never bind to the wrong run or the wrong pack. `Atlas-Change-Reason`
+has no such protection: it is a bare existence check
+(`atlas_db_ai_reason_exists`) against `ai_reasons.id`, declared
+`INTEGER PRIMARY KEY` with no `AUTOINCREMENT`, and compares no content at
+all. If that table were ever emptied and repopulated, SQLite is free to
+reuse a small integer id, and the trailer would report a *different*
+reason as verified rather than reporting the field as unknown — the one
+field with genuine renumbering exposure, as opposed to the other four's
+loss-of-row exposure. Ingestion still degrades safely on the ordinary path:
+a reference that does not resolve at all reads as `UNKNOWN`, exactly as a
+wrong value would, and **a reader who sees `UNKNOWN` must not read it as
+tampering** — it may only mean one of these three rows did not survive
+whatever happened to the index. `Atlas-Provenance` is the sixth line, and is
+never part of this: ingestion only checks for its exact text as a marker
+(`PROVENANCE_MARKER`, `src/memory/trailer.c`), so it has no stored value to
+lose in the first place.
 
 ### The Context Pack, as it is actually delivered to a worker
 

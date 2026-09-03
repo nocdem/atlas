@@ -343,7 +343,19 @@ atlas_status atlas_service_memory_status_remote(const char *repo, atlas_memory_s
      * `src/ipc/server_memory.c:268`), so reading `latest_version.observed_at`
      * here will reproduce the identical double-encode this fix round closed
      * for `registered_at` unless it gets the same
-     * `atlas_text_decode_safe()` treatment. */
+     * `atlas_text_decode_safe()` treatment.
+     *
+     * **The decode is total only because there is one producer.**
+     * `atlas_text_decode_safe` refuses a `%` not followed by two hex
+     * digits, and silently turns a never-encoded `%41` into `A` -- so a
+     * value that reached this field *unencoded* would be corrupted or
+     * rejected rather than passed through. Neither happens today because
+     * `emit_source` is the sole producer and always encodes, and even its
+     * out-of-memory placeholder (`%3F`) is a valid escape. That is a
+     * property of the current wire, not of this code: **a second producer
+     * of this field must encode it too**, or must arrive here without the
+     * decode. Stated because the fix above is correct only for as long as
+     * that stays true, and nothing else says so. */
     /* `registered_at` crosses the socket already `atlas_safe()`-encoded
      * (`emit_source`, `src/ipc/server_memory.c`) -- caller-supplied text, not
      * an Atlas-minted token. `atlas_memory_render` documents the field as RAW

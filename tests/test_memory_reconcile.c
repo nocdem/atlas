@@ -5337,6 +5337,361 @@ static void test_patch_build_stale_contradicted_is_a_finding_not_a_hunk(void) {
     t8_env_close(&e);
 }
 
+/* Fix round (R1). The re-review of this round's own I1/I2 fix found the
+ * identical shape once more, one guard narrower: `det_contradicted` carried
+ * all three absolutes -- DESCRIPTIVE semantics, no IMPLEMENTATION conflict,
+ * not stale -- and `superseded` carried only the first two, so the `||`
+ * between them let a *stale* verdict reach a hunk through the SUPERSEDED arm
+ * alone, exactly the failure I2 fixed for the CONTRADICTED arm one arm over.
+ * This is I2's own fixture (CONTRADICTED, DETERMINISTIC, CONTRADICTION
+ * conflict, `stale` forced to 1 by raw SQL, `t15_result`'s own column) plus a
+ * SUPERSEDED diff row for the same claim: before this round's
+ * `patch_may_delete`, `superseded`'s three terms (diff kind, semantics,
+ * conflict) were all satisfied on their own and this line was deleted
+ * regardless of `det_contradicted`'s correct refusal. Against `8d19468` (the
+ * first fix round, before `patch_may_delete`) this test fails: `diff.len`
+ * comes back non-zero. */
+static void test_patch_build_superseded_stale_is_a_finding_not_a_hunk(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    t8env e;
+    t8_env_open(&e, &err);
+    const char *repo = fx_repo(&e.fx);
+
+    const char *l1 = "- `omega.c` fails whenever the cache is cold";
+    char content[256];
+    (void)snprintf(content, sizeof content, "%s\n", l1);
+    T_OK(fx_write(repo, "stale-superseded.md", content, &err), &err);
+    T_OK(fx_add_all(&e.fx, repo, &err), &err);
+    T_OK(fx_commit(&e.fx, repo, "seed", &err), &err);
+    t8_bind_head(&e, &err);
+    t8_seed_file(&e, "omega.c", "1313131313131313131313131313131313131313131313131313131313131313",
+                &err);
+
+    atlas_buf uid = ATLAS_BUF_INIT;
+    int64_t cid = 0;
+    t15_claim(&e, l1, &uid, &cid, &err);
+    t15_anchor(&e, atlas_buf_cstr(&uid), "omega.c", &err);
+    t15_result(&e, cid, "CONTRADICTED", "DETERMINISTIC", "CONTRADICTION", &err);
+    char sql[256];
+    (void)snprintf(sql, sizeof sql, "UPDATE verify_results SET stale = 1 WHERE claim_id = %lld;",
+                  (long long)cid);
+    T_OK(atlas_db_exec_sql(e.db, sql, &err), &err);
+    int64_t gen_id = 0;
+    t15_seed_generation(&e, &gen_id, &err);
+    t15_diff(&e, gen_id, atlas_buf_cstr(&uid), ATLAS_MEMORY_DIFF_SUPERSEDED, &err);
+
+    atlas_buf source_uid = ATLAS_BUF_INIT;
+    t15_register_source(&e, "stale-superseded.md", &source_uid, &err);
+
+    atlas_buf diff = ATLAS_BUF_INIT, findings = ATLAS_BUF_INIT;
+    T_OK(atlas_memory_patch_build(e.db, &e.repo, fx_data_dir(&e.fx), atlas_buf_cstr(&source_uid), &diff,
+                                  &findings, &err),
+         &err);
+
+    T_CHECK_MSG(diff.len == 0,
+               "a stale claim must not be proposed for deletion through the SUPERSEDED arm "
+               "either; diff=\n%s",
+               atlas_buf_cstr(&diff));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&findings), "RETAINED") != NULL,
+               "expected a RETAINED finding; findings=\n%s", atlas_buf_cstr(&findings));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&findings), atlas_buf_cstr(&uid)) != NULL,
+               "expected the finding to name the claim; findings=\n%s", atlas_buf_cstr(&findings));
+
+    atlas_buf_free(&diff);
+    atlas_buf_free(&findings);
+    atlas_buf_free(&source_uid);
+    atlas_buf_free(&uid);
+    t8_env_close(&e);
+}
+
+/* Coverage (M7's coverage half, this round). Every existing T15 test above
+ * drives a REPO_FILE source (`t15_register_source`'s own class); nothing
+ * exercised `atlas_memory_patch_build`'s own `*_DIR` item loop
+ * (`patch.c:665-688`) -- only `atlas_memory_read_source` directly, this
+ * file's own REPO_DIR section far above. Two untracked children, one
+ * deterministically CONTRADICTED and one healthy: both must be processed
+ * independently, each keyed by the source's own path joined with the child's
+ * own name (`item_path`'s own construction), sharing one candidate budget
+ * rather than each getting its own. The vocabulary question M7 raised and
+ * this round again declines -- what an empty `*_DIR`/`EXTERNAL_*` listing
+ * should be called -- is untouched by this test, which is about a *non-empty*
+ * listing; see docs/backlog.md. */
+static void test_patch_build_repo_dir_versions_each_child(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    t8env e;
+    t8_env_open(&e, &err);
+    const char *repo = fx_repo(&e.fx);
+
+    T_OK(fx_write(repo, "keep.md", "unrelated tracked file\n", &err), &err);
+    T_OK(fx_add_all(&e.fx, repo, &err), &err);
+    T_OK(fx_commit(&e.fx, repo, "seed", &err), &err);
+    t8_bind_head(&e, &err);
+
+    T_OK(fx_mkdir(repo, ".claude", &err), &err);
+    T_OK(fx_mkdir(repo, ".claude/memories", &err), &err);
+    const char *l1 = "- `nu.c` must retry the checksum before failing";
+    const char *l2 = "- `xi.c` behaves correctly under load";
+    char c1[256], c2[256];
+    (void)snprintf(c1, sizeof c1, "%s\n", l1);
+    (void)snprintf(c2, sizeof c2, "%s\n", l2);
+    T_OK(fx_write(repo, ".claude/memories/a.md", c1, &err), &err);
+    T_OK(fx_write(repo, ".claude/memories/b.md", c2, &err), &err);
+
+    t8_seed_file(&e, "nu.c", "1616161616161616161616161616161616161616161616161616161616161616", &err);
+    t8_seed_file(&e, "xi.c", "1717171717171717171717171717171717171717171717171717171717171717", &err);
+
+    atlas_buf u1 = ATLAS_BUF_INIT, u2 = ATLAS_BUF_INIT;
+    int64_t i1 = 0, i2 = 0;
+    t15_claim(&e, l1, &u1, &i1, &err);
+    t15_claim(&e, l2, &u2, &i2, &err);
+    t15_anchor(&e, atlas_buf_cstr(&u1), "nu.c", &err);
+    t15_anchor(&e, atlas_buf_cstr(&u2), "xi.c", &err);
+    t15_result(&e, i1, "CONTRADICTED", "DETERMINISTIC", "CONTRADICTION", &err);
+    t15_result(&e, i2, "VERIFIED", "DETERMINISTIC", "NONE", &err);
+
+    const char *dir_path = ".claude/memories";
+    atlas_buf source_uid = ATLAS_BUF_INIT;
+    int64_t source_id = 0;
+    char now[64];
+    atlas_now_iso8601(now, sizeof now);
+    T_OK(atlas_db_memory_source_upsert(e.db, e.repo_id, ATLAS_MEMORY_SOURCE_REPO_DIR, dir_path,
+                                       strlen(dir_path), dir_path, now, &source_id, &source_uid, &err),
+         &err);
+
+    char before[ATLAS_SHA256_HEX_LEN + 1u];
+    T_OK(fx_tree_digest(repo, before, &err), &err);
+
+    atlas_buf diff = ATLAS_BUF_INIT, findings = ATLAS_BUF_INIT;
+    T_OK(atlas_memory_patch_build(e.db, &e.repo, fx_data_dir(&e.fx), atlas_buf_cstr(&source_uid), &diff,
+                                  &findings, &err),
+         &err);
+
+    char after[ATLAS_SHA256_HEX_LEN + 1u];
+    T_OK(fx_tree_digest(repo, after, &err), &err);
+    T_CHECK_MSG(strcmp(before, after) == 0, "a REPO_DIR patch build modified the repository");
+
+    char removed[256];
+    (void)snprintf(removed, sizeof removed, "-%s\n", l1);
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&diff), removed) != NULL,
+               "expected the contradicted child's line as a removal; diff=\n%s",
+               atlas_buf_cstr(&diff));
+
+    char path_hdr[256];
+    (void)snprintf(path_hdr, sizeof path_hdr, "--- a/%s/a.md\n", dir_path);
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&diff), path_hdr) != NULL,
+               "expected the hunk's path to be the dir source joined with the child's own name; "
+               "diff=\n%s",
+               atlas_buf_cstr(&diff));
+
+    T_CHECK_MSG(t15_count(atlas_buf_cstr(&findings), "RETAINED") == 1u,
+               "expected the healthy child's line to be a finding, not a hunk; findings=\n%s",
+               atlas_buf_cstr(&findings));
+
+    atlas_buf_free(&diff);
+    atlas_buf_free(&findings);
+    atlas_buf_free(&source_uid);
+    atlas_buf_free(&u1);
+    atlas_buf_free(&u2);
+    t8_env_close(&e);
+}
+
+/* Coverage (M7's coverage half, this round): an EXTERNAL_FILE source through
+ * `atlas_memory_patch_build` itself. `t15_register_source` only ever
+ * registers REPO_FILE; this exercises the `!is_repo_cls && ext_found` branch
+ * (`patch.c:690-693`), which reads the source's already-stored version
+ * instead of a filesystem path -- `atlas_memory_observe`'s own EXTERNAL_*
+ * shape, restated as a read here. Deliberately the `ext_found == true` case
+ * only: the `ext_found == false` case falls to NONE_PROPOSED, which is the
+ * open vocabulary question M7 raised and this round again declines (see
+ * docs/backlog.md), not a gap this test is meant to close. */
+static void test_patch_build_external_file_reads_the_stored_version(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    t8env e;
+    t8_env_open(&e, &err);
+    const char *repo = fx_repo(&e.fx);
+
+    T_OK(fx_write(repo, "keep.md", "unrelated tracked file\n", &err), &err);
+    T_OK(fx_add_all(&e.fx, repo, &err), &err);
+    T_OK(fx_commit(&e.fx, repo, "seed", &err), &err);
+    t8_bind_head(&e, &err);
+    t8_seed_file(&e, "omicron.c", "1414141414141414141414141414141414141414141414141414141414141414",
+                &err);
+
+    const char *l1 = "- `omicron.c` must retry the handshake on failure";
+    char content[256];
+    (void)snprintf(content, sizeof content, "%s\n", l1);
+
+    atlas_buf uid = ATLAS_BUF_INIT;
+    int64_t cid = 0;
+    t15_claim(&e, l1, &uid, &cid, &err);
+    t15_anchor(&e, atlas_buf_cstr(&uid), "omicron.c", &err);
+    t15_result(&e, cid, "CONTRADICTED", "DETERMINISTIC", "CONTRADICTION", &err);
+
+    const char *path = "/home/u/ext-note.md";
+    atlas_buf source_uid = ATLAS_BUF_INIT;
+    int64_t source_id = 0;
+    char now[64];
+    atlas_now_iso8601(now, sizeof now);
+    T_OK(atlas_db_memory_source_upsert(e.db, e.repo_id, ATLAS_MEMORY_SOURCE_EXTERNAL_FILE, path,
+                                       strlen(path), path, now, &source_id, &source_uid, &err),
+         &err);
+
+    char sha[ATLAS_SHA256_HEX_LEN + 1u];
+    atlas_sha256_hex(content, strlen(content), sha);
+    int64_t version_id = 0;
+    atlas_buf version_uid = ATLAS_BUF_INIT;
+    T_OK(atlas_db_memory_version_insert(e.db, source_id, "", "", sha, (int64_t)strlen(content), content,
+                                        strlen(content), now, now, 0, &version_id, &version_uid, &err),
+         &err);
+
+    atlas_buf diff = ATLAS_BUF_INIT, findings = ATLAS_BUF_INIT;
+    T_OK(atlas_memory_patch_build(e.db, &e.repo, fx_data_dir(&e.fx), atlas_buf_cstr(&source_uid), &diff,
+                                  &findings, &err),
+         &err);
+
+    char removed[256];
+    (void)snprintf(removed, sizeof removed, "-%s\n", l1);
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&diff), removed) != NULL,
+               "expected the contradicted line from the stored version as a removal; diff=\n%s",
+               atlas_buf_cstr(&diff));
+
+    char hdr[256];
+    (void)snprintf(hdr, sizeof hdr, "--- a/%s\n", path);
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&diff), hdr) != NULL,
+               "expected the hunk's path to be the EXTERNAL_FILE source's own path_text; diff=\n%s",
+               atlas_buf_cstr(&diff));
+
+    atlas_buf_free(&diff);
+    atlas_buf_free(&findings);
+    atlas_buf_free(&version_uid);
+    atlas_buf_free(&source_uid);
+    atlas_buf_free(&uid);
+    t8_env_close(&e);
+}
+
+/* Coverage (M7's coverage half, this round): the UNREADABLE finding
+ * (`process_item`'s outcome-not-OK branch, `patch.c:359-366`, "UNREADABLE
+ * path=%s outcome=%s") driven through `atlas_memory_patch_build` itself.
+ * This file's own REPO_FILE section, far above, drives
+ * `atlas_memory_read_source` directly to the same TOO_LARGE outcome
+ * (`test_repo_file_over_the_bound_is_too_large`); nothing before this round
+ * exercised the *finding* `atlas_memory_patch_build` emits for it. */
+static void test_patch_build_repo_file_too_large_is_unreadable_via_patch_build(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    t8env e;
+    t8_env_open(&e, &err);
+    const char *repo = fx_repo(&e.fx);
+
+    T_OK(fx_write(repo, "keep.md", "unrelated tracked file\n", &err), &err);
+    T_OK(fx_add_all(&e.fx, repo, &err), &err);
+    T_OK(fx_commit(&e.fx, repo, "seed", &err), &err);
+    t8_bind_head(&e, &err);
+
+    size_t n = (size_t)ATLAS_MEMORY_MAX_SOURCE_BYTES + 1u;
+    char *big = malloc(n);
+    T_REQUIRE(big != NULL);
+    memset(big, 'x', n);
+    T_OK(fx_write_bytes(repo, "toobig.md", strlen("toobig.md"), big, n, 0644, &err), &err);
+    free(big);
+
+    atlas_buf source_uid = ATLAS_BUF_INIT;
+    t15_register_source(&e, "toobig.md", &source_uid, &err);
+
+    char before[ATLAS_SHA256_HEX_LEN + 1u];
+    T_OK(fx_tree_digest(repo, before, &err), &err);
+
+    atlas_buf diff = ATLAS_BUF_INIT, findings = ATLAS_BUF_INIT;
+    T_OK(atlas_memory_patch_build(e.db, &e.repo, fx_data_dir(&e.fx), atlas_buf_cstr(&source_uid), &diff,
+                                  &findings, &err),
+         &err);
+
+    char after[ATLAS_SHA256_HEX_LEN + 1u];
+    T_OK(fx_tree_digest(repo, after, &err), &err);
+    T_CHECK_MSG(strcmp(before, after) == 0,
+               "a patch build over an oversized source modified the repository");
+
+    T_CHECK_MSG(diff.len == 0, "an oversized source must propose no deletions; diff=\n%s",
+               atlas_buf_cstr(&diff));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&findings), "UNREADABLE path=toobig.md outcome=TOO_LARGE\n") !=
+                   NULL,
+               "expected an UNREADABLE/TOO_LARGE finding; findings=\n%s", atlas_buf_cstr(&findings));
+
+    atlas_buf_free(&diff);
+    atlas_buf_free(&findings);
+    atlas_buf_free(&source_uid);
+    t8_env_close(&e);
+}
+
+/* Fix round (M5), tested here for the first time (R3, this round). M5
+ * widened the label precedence's *set*, not the precedence itself --
+ * IMPLEMENTATION_DRIFT was already tested before NORMATIVE in the label
+ * `if`/`else if` chain (`patch.c:582-588`) for a DETERMINISTIC-basis
+ * IMPLEMENTATION conflict, whatever the claim's semantics: that branch never
+ * checked `semantics`, so a DETERMINISTIC-basis fixture here would pass
+ * identically before and after M5 and would demonstrate nothing M5 changed.
+ * `basis` is EMPIRICAL here on purpose -- the exact term M5 dropped from the
+ * IMPLEMENTATION_DRIFT branch's own condition -- so this is the newly
+ * reachable case: before M5 the first `if` required
+ * `basis == DETERMINISTIC` and failed on EMPIRICAL, falling through to
+ * `else if (semantics != DESCRIPTIVE)`, which this NORMATIVE claim satisfies,
+ * so the pre-M5 label was NORMATIVE; after M5 the first `if` no longer checks
+ * `basis` and this row satisfies it, so the label is IMPLEMENTATION_DRIFT.
+ * Display-only either way: a NORMATIVE claim is excluded from a hunk by
+ * `semantics` on both arms regardless of which label the else-branch prints
+ * (this claim's `diff.len == 0` below is unaffected by which label wins). */
+static void test_patch_build_normative_implementation_conflict_labels_drift(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    t8env e;
+    t8_env_open(&e, &err);
+    const char *repo = fx_repo(&e.fx);
+
+    const char *l1 = "- `pi.c` must always validate its input before use";
+    char content[256];
+    (void)snprintf(content, sizeof content, "%s\n", l1);
+    T_OK(fx_write(repo, "normative-impl.md", content, &err), &err);
+    T_OK(fx_add_all(&e.fx, repo, &err), &err);
+    T_OK(fx_commit(&e.fx, repo, "seed", &err), &err);
+    t8_bind_head(&e, &err);
+    t8_seed_file(&e, "pi.c", "1515151515151515151515151515151515151515151515151515151515151515",
+                &err);
+
+    atlas_buf uid = ATLAS_BUF_INIT;
+    int64_t cid = 0;
+    t15_claim_normative(&e, l1, &uid, &cid, &err);
+    t15_anchor(&e, atlas_buf_cstr(&uid), "pi.c", &err);
+    t15_result(&e, cid, "CONTRADICTED", "EMPIRICAL", "IMPLEMENTATION", &err);
+
+    atlas_buf source_uid = ATLAS_BUF_INIT;
+    t15_register_source(&e, "normative-impl.md", &source_uid, &err);
+
+    atlas_buf diff = ATLAS_BUF_INIT, findings = ATLAS_BUF_INIT;
+    T_OK(atlas_memory_patch_build(e.db, &e.repo, fx_data_dir(&e.fx), atlas_buf_cstr(&source_uid), &diff,
+                                  &findings, &err),
+         &err);
+
+    T_CHECK_MSG(diff.len == 0,
+               "a NORMATIVE claim with an IMPLEMENTATION conflict must not be proposed; diff=\n%s",
+               atlas_buf_cstr(&diff));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&findings), "IMPLEMENTATION_DRIFT") != NULL,
+               "expected IMPLEMENTATION_DRIFT to win the label precedence over NORMATIVE; "
+               "findings=\n%s",
+               atlas_buf_cstr(&findings));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&findings), "NORMATIVE") == NULL,
+               "NORMATIVE must not appear once IMPLEMENTATION_DRIFT has already won; findings=\n%s",
+               atlas_buf_cstr(&findings));
+
+    atlas_buf_free(&diff);
+    atlas_buf_free(&findings);
+    atlas_buf_free(&source_uid);
+    atlas_buf_free(&uid);
+    t8_env_close(&e);
+}
+
 static const atlas_test TESTS[] = {
     {"REPO_FILE reads tracked bytes", test_repo_file_reads_tracked_bytes},
     {"REPO_FILE missing path is ABSENT", test_repo_file_missing_path_is_absent},
@@ -5462,6 +5817,17 @@ static const atlas_test TESTS[] = {
      test_patch_build_empirical_implementation_conflict_is_labelled_drift},
     {"fix round I2: a stale CONTRADICTED claim is a finding, never a hunk",
      test_patch_build_stale_contradicted_is_a_finding_not_a_hunk},
+    {"fix round R1: a stale claim is a finding, never a hunk, through the SUPERSEDED arm too",
+     test_patch_build_superseded_stale_is_a_finding_not_a_hunk},
+    {"coverage (M7): a REPO_DIR source versions each child independently through patch_build",
+     test_patch_build_repo_dir_versions_each_child},
+    {"coverage (M7): an EXTERNAL_FILE source reads its stored version through patch_build",
+     test_patch_build_external_file_reads_the_stored_version},
+    {"coverage (M7): a TOO_LARGE REPO_FILE is an UNREADABLE finding through patch_build",
+     test_patch_build_repo_file_too_large_is_unreadable_via_patch_build},
+    {"fix round R3: an EMPIRICAL-basis IMPLEMENTATION conflict labels IMPLEMENTATION_DRIFT "
+     "over NORMATIVE (the case M5 widened)",
+     test_patch_build_normative_implementation_conflict_labels_drift},
 };
 
 ATLAS_TEST_MAIN("memory_reconcile", TESTS)

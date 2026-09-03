@@ -1702,3 +1702,54 @@ own shape: read-only, no job queue, answered synchronously off the daemon's own 
 inside a transaction (their own header comments say so), which the daemon's ordinary
 dispatch path already respects for other reads — nothing about that constraint is new to a
 socket-served form.
+
+## `NONE_PROPOSED` collapses "never looked" and "looked and found nothing" for an unversioned `EXTERNAL_*` source (2026-09-03)
+
+Raised as M7 during T15's first fix round while auditing `atlas_memory_patch_build`'s
+finding vocabulary, declined there (correctly — the vocabulary question is real and
+undecided) with no durable record beyond that round's own report, and recorded here by
+T15's second fix round, which re-examined M7 and confirmed the question was still open.
+Left deliberately undecided again rather than settled inside a fix round two Importants
+deep already: this is the vocabulary half of M7. The coverage half — tests for the
+`*_DIR`, `EXTERNAL_*` and `UNREADABLE` classes through `atlas_memory_patch_build` itself,
+which the first round's own re-review found was separable from the vocabulary question —
+was done this round.
+
+**What collapses into `NONE_PROPOSED`.** `atlas_memory_patch_build` (`src/memory/patch.c`)
+branches on source class: a `REPO_*` source's items go through `atlas_memory_read_source`
+and, whatever the outcome, `process_item` runs and reports it — `ATLAS_MEMORY_READ_OK`
+extracts and assesses every line, and any other outcome (`ABSENT`, `TOO_LARGE`,
+`NO_MIRROR`, `SYMLINK`, `NOT_MIRRORED`) is one `UNREADABLE path=%s outcome=%s` finding
+(`patch.c:321-328`). An `EXTERNAL_*` source is different: `process_item` is called **only
+when `ext_found`** (`patch.c:653-656`), because this function never reads an `EXTERNAL_*`
+path itself — `atlas_memory_observe`'s own principal does, and this reads back what was
+already stored. When no version has ever been stored, `ext_found` is false, `process_item`
+is never called, no per-item finding of any kind is emitted, and the function falls
+straight through to the generic end-of-run check: `diff_out->len == 0`, so it appends
+`NONE_PROPOSED path=%s source=%s: no deletions proposed for this source` (`patch.c:658-668`)
+— the same line a `REPO_FILE` source gets when every one of its lines was assessed and
+found healthy.
+
+**Why that may be the wrong name.** `NONE_PROPOSED`'s own comment states the reason it
+exists: "an empty diff on its own cannot distinguish 'this pass looked and found every line
+clean' from 'this pass never looked at all'." For every `REPO_*` outcome and for a
+*versioned* `EXTERNAL_*` source, the finding list already makes that distinction —
+`UNREADABLE` or a per-line `RETAINED`/`NORMATIVE`/`IMPLEMENTATION_DRIFT` finding proves
+something was read, so a bare `NONE_PROPOSED` beside them means "looked, found nothing to
+delete." For an unversioned `EXTERNAL_*` source, nothing else is ever emitted, and
+`NONE_PROPOSED` is the *only* line — asserting, by the comment's own words, precisely the
+distinction ("looked and it was clean") this case fails to make ("never looked, because
+there was nothing stored to look at"). A caller cannot tell the two apart from the findings
+alone, which is the exact ambiguity `NONE_PROPOSED` was written to close everywhere else.
+
+**What settling it would require.** Deciding what an `EXTERNAL_*` source with no stored
+version should be called is a finding-vocabulary change (`docs/extending.md`'s own
+discipline for extending a closed vocabulary deliberately), not a one-line fix, and it has
+at least two shapes: give `process_item`'s `UNREADABLE` branch (or a sibling of it) a case
+for "never observed", emitted from the `!ext_found` branch directly rather than falling
+through to the generic check; or widen `NONE_PROPOSED` with an explicit reason argument so
+the same line can say which of the two it means. Either changes a finding string a caller
+may already be matching on, in the one function whose failure mode is proposing (or
+failing to warn about) the deletion of a person's own writing, which is why T15's second
+fix round declined to make the call under its own two Importants and recorded it here
+instead of leaving it only in the round's own report.

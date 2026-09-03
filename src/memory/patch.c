@@ -162,6 +162,44 @@ static atlas_status claim_match_cb(const char *claim_uid, void *ud, atlas_err *e
     return ATLAS_OK;
 }
 
+/* --- the three absolutes every deletion arm must hold ----------------------
+ *
+ * `include/atlas/memory.h`'s own doc comment on `atlas_memory_patch_build`
+ * states, as an absolute and not a per-arm choice: NORMATIVE semantics, an
+ * IMPLEMENTATION conflict, and a stale verdict never reach a hunk, on ANY arm
+ * that proposes one. Fix round (I1) restored the first two guards to the
+ * SUPERSEDED arm below after the shipped predicate carried neither; its own
+ * re-review found the identical shape once more, one guard narrower --
+ * `det_contradicted` carried all three absolutes and `superseded` carried
+ * only two, so the `||` between them let a *stale* verdict reach a hunk
+ * through the SUPERSEDED arm alone, the exact failure I1 exists to prevent.
+ *
+ * Filed as two separate findings against two separate arms (I1's NORMATIVE
+ * and IMPLEMENTATION guards, this round's `stale` guard), the shape recurs
+ * every time a third arm is added and somebody restates the guards by hand
+ * instead of by construction: two guards get copied, the third is wherever
+ * the author's attention was that day. Fix round (R1, this round): the fix
+ * is to stop each arm from stating its own copy of the three absolutes at
+ * all, AND to make the disjunction itself pass through this function rather
+ * than sit beside it. `patch_may_delete`'s caller (below) has exactly ONE
+ * call site: every arm's kind-specific test is ORed *inside* `kind_ok`, never
+ * computed as its own named `bool` and ORed into an `if` from outside this
+ * function. Two separate calls -- one per arm, each ANDing the three absolutes
+ * in on its own -- would still let a fourth arm add a *third* call, or a bare
+ * `bool fourth = ...;` ORed straight into the `if`, bypassing this function
+ * entirely while reading exactly like a correct edit; that shape was this
+ * function's own first draft, and it is what "inherits by construction" has
+ * to survive to be true. With one call, a fourth arm's natural edit is `||
+ * fourth_kind` inside the parenthesised argument at that call site, which
+ * inherits the three absolutes by construction; reaching a deletion any other
+ * way needs a visibly separate `if` outside this function's one call, which
+ * is what a reviewer is already looking for. */
+static bool patch_may_delete(bool kind_ok, atlas_verify_claim_semantics semantics,
+                             atlas_verify_conflict conflict, bool stale) {
+    return kind_ok && semantics == ATLAS_CLAIM_DESCRIPTIVE &&
+          conflict != ATLAS_CONFLICT_IMPLEMENTATION && !stale;
+}
+
 /* --- rendering a read obstacle's outcome, as a fixed vocabulary label ------
  *
  * Exhaustive (`-Wswitch-enum`, no `default:`), `reconcile.c`'s own
@@ -460,58 +498,57 @@ static atlas_status process_item(atlas_db *db, int64_t repo_id, const char *item
             break;
         }
 
-        /* Fix round (I1): the header states, as an absolute, that NORMATIVE
-         * semantics and an IMPLEMENTATION conflict never reach a hunk. The
-         * shipped `superseded` term carried neither guard, so a SUPERSEDED
-         * diff row alone bypassed both. Both are restored here, matching
-         * `det_contradicted` below.
+        /* Exactly one call to `patch_may_delete` decides `del[]` for this
+         * candidate, and each arm's own kind-specific test is only ever ORed
+         * *inside* that one call's first argument -- never computed as its
+         * own `bool` and ORed into the `if` from outside it. That is what
+         * makes the three absolutes structural rather than a convention every
+         * arm's author has to remember: with two separate calls (this
+         * function's first draft), a fourth arm could write its own
+         * `bool fourth = ...;` and `if (superseded || det_contradicted ||
+         * fourth)`, and that edit is indistinguishable at the `if` from a
+         * correct one -- it compiles, it reads naturally, and it reaches
+         * `del[z] = true` having asked `patch_may_delete` nothing. With one
+         * call, a fourth arm's natural edit is `|| fourth_kind` *inside* the
+         * parenthesised first argument below, which inherits the guard by
+         * construction; reaching `del[z] = true` any other way needs a
+         * visibly separate `if`, which is what a reviewer is looking for
+         * regardless.
          *
-         * `basis` is deliberately NOT required on this arm, and that is a
-         * conclusion, not an omission. "Deterministically CONTRADICTED" is a
-         * `verify_results` row's own pair (`state`, `basis`); SUPERSEDED is
-         * not a `verify_results` verdict under either of the two ways this
-         * project's own documents describe it -- a text fact ("the source's
-         * new version no longer contains the proposition") or a claim-lineage
-         * fact (`verify_claims.superseded_by_claim_id`, still without a
-         * writer anywhere in `src/`) -- neither of which any verifier
-         * establishes (the fix round's own test exercises this arm with no
-         * `verify_results` row whatsoever, so `basis` reads its zero,
-         * UNKNOWN, in that case; see `include/atlas/memory.h`'s own comment
-         * on this function for the full argument). Requiring
-         * `basis == DETERMINISTIC` here would not add protection for
-         * NORMATIVE or IMPLEMENTATION -- the two guards in `superseded`
-         * below already hold those absolutely -- it would instead make
-         * supersession alone insufficient to propose deletion whenever no
-         * deterministic verifier happened to have run against the claim at
-         * all, which is a different question this arm was never built to
-         * answer. Applying a `verify_results`-shaped gate to a fact that is
-         * not a `verify_results` row is the category error, not the fix. */
-        bool superseded = diff_found && last_kind == ATLAS_MEMORY_DIFF_SUPERSEDED &&
-                          claim.semantics == ATLAS_CLAIM_DESCRIPTIVE &&
-                          conflict != ATLAS_CONFLICT_IMPLEMENTATION;
-        /* "Deterministically CONTRADICTED" is this pair, `basis` included,
-         * and nothing else -- T15's context, verbatim. `basis` was not
-         * available from `atlas_db_verify_result_latest` before this task
-         * widened it; approximating it from `algorithm`, the conflict kind
-         * or the confidence score is exactly what A9.2's "a model cannot
-         * become a tool" rule forbids.
+         * `superseded_kind` is just "this claim's most recently recorded diff
+         * kind is SUPERSEDED". `basis` is deliberately not part of it, and
+         * that is a conclusion, not an omission: "deterministically
+         * CONTRADICTED" is a `verify_results` row's own pair (`state`,
+         * `basis`), and SUPERSEDED is not a `verify_results` verdict under
+         * either of the two ways this project's own documents describe it --
+         * a text fact ("the source's new version no longer contains the
+         * proposition") or a claim-lineage fact
+         * (`verify_claims.superseded_by_claim_id`, still without a writer
+         * anywhere in `src/`) -- neither of which any verifier establishes
+         * (see `include/atlas/memory.h`'s own comment on this function for
+         * the full argument).
          *
-         * Fix round (I2): `!stale` is a third term, not an afterthought.
-         * `verify_results.stale` is true only when *every* piece of evidence
-         * backing this verdict has since gone stale (`db_verify.c`'s own
-         * comment on the aggregate) -- the verdict was true of bytes that
-         * have since moved. A9.2.2's rule that an ABSENT result never
-         * survives the source moving applies to a CONTRADICTED one exactly
-         * the same way, and A6 says it again one layer over: STALE requires
-         * human revalidation and does not mean the underlying claim is
-         * wrong. Deleting a person's line on a verdict nothing current still
-         * supports is the precise failure this task exists to prevent. */
-        bool det_contradicted = result_found && claim.semantics == ATLAS_CLAIM_DESCRIPTIVE &&
-                                state == ATLAS_VERIFY_CONTRADICTED &&
-                                basis == ATLAS_VERIFY_BASIS_DETERMINISTIC &&
-                                conflict != ATLAS_CONFLICT_IMPLEMENTATION && !stale;
+         * `det_contradicted_kind` is "deterministically CONTRADICTED" --
+         * `state == CONTRADICTED && basis == DETERMINISTIC`, T15's context,
+         * verbatim, and nothing else. `basis` was not available from
+         * `atlas_db_verify_result_latest` before this task widened it;
+         * approximating it from `algorithm`, the conflict kind or the
+         * confidence score is exactly what A9.2's "a model cannot become a
+         * tool" rule forbids.
+         *
+         * Neither kind-specific test states `conflict` or `stale`: those are
+         * read off the claim's latest `verify_results` row *whether or not
+         * that row has anything to do with either kind's own condition* --
+         * they are two of the three absolutes that apply to every claim's
+         * every verdict, not a description of either kind itself, which is
+         * why `patch_may_delete` is what supplies them rather than a term
+         * written into either test. */
+        bool superseded_kind = diff_found && last_kind == ATLAS_MEMORY_DIFF_SUPERSEDED;
+        bool det_contradicted_kind = result_found && state == ATLAS_VERIFY_CONTRADICTED &&
+                                     basis == ATLAS_VERIFY_BASIS_DETERMINISTIC;
 
-        if (superseded || det_contradicted) {
+        if (patch_may_delete(superseded_kind || det_contradicted_kind, claim.semantics, conflict,
+                             stale)) {
             for (size_t z = line_start; z <= line_end; z++) {
                 del[z] = true;
             }

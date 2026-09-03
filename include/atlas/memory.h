@@ -143,6 +143,22 @@ bool atlas_memory_source_class_is_repo(atlas_memory_source_class c);
  * exactly the condition a model reading a memory file cannot detect for
  * itself, and the reason this season exists.
  *
+ * SUPERSEDED is the weakest member of that group, and a future author must
+ * read this before adding its first producer. Unlike SUPPORTED, CONTRADICTED
+ * and STALE it is not itself a `verify_results` verdict -- see
+ * `atlas_memory_patch_build`'s own doc comment below for the two ways it is
+ * actually derived today, neither of which any verifier establishes -- so
+ * `src/memory/patch.c`'s reader deliberately does not gate this kind on
+ * `basis`. What it DOES gate every kind on, this one included, is
+ * `patch_may_delete`'s three absolutes: DESCRIPTIVE semantics, no
+ * IMPLEMENTATION conflict, not stale. A producer added at
+ * `reconcile.c:1889-1917` -- the if-chain every existing branch of which is
+ * already derived from `evaluate_claim`'s verdict -- would make SUPERSEDED a
+ * verdict-derived kind like its four world-group siblings, and would still
+ * need exactly those three absolutes; nothing in the *type* enforces that on
+ * a future writer, only the reader's own comment does, so read it before
+ * writing one.
+ *
  * UNDETERMINED is the one that is neither, and is not the zero either. It
  * sits outside both groups: it is not a claim about the text or a claim about
  * the world, it is Atlas having looked in this generation and not settled
@@ -1772,32 +1788,52 @@ atlas_status atlas_db_memory_trailer_binding_get(atlas_db *db, int64_t repo_id,
  *   - or that claim's most recently recorded diff kind
  *     (`atlas_db_memory_claim_diff_last_kind`) is SUPERSEDED, its semantics
  *     are DESCRIPTIVE, and its most recently stored `verify_results` row (if
- *     any) does not carry conflict IMPLEMENTATION (fix round, I1: the
- *     shipped predicate treated SUPERSEDED as an unconditional disjunct with
- *     neither guard, which let a NORMATIVE claim or an IMPLEMENTATION
- *     conflict reach a hunk through this arm alone -- unreachable in
- *     production, since nothing in `src/` writes a SUPERSEDED diff row yet,
- *     which is exactly why it would have gone unnoticed once something did).
- *     `basis` is deliberately NOT required on this arm, and this is a
- *     conclusion, not an omission: the project's own documents describe
- *     SUPERSEDED two ways -- the T9 brief calls it "the source's new version
- *     no longer contains the proposition" (a fact about the *text*), while
- *     the T9 review's residual note scopes its real, never-implemented
- *     derivation to `verify_claims.superseded_by_claim_id`, a claim
- *     replaced by a successor claim (a fact about *lineage*). Either way it
- *     is not a `verify_results` verdict: it is either the extractor's own
- *     text comparison or a claim-identity fact, neither of which any
- *     verifier establishes, so a `verify_results`-shaped gate (`basis`)
- *     does not describe it under either reading. The two guards actually
- *     stated by this task -- NORMATIVE, IMPLEMENTATION -- are what apply,
- *     and both now do.
+ *     any) does not carry conflict IMPLEMENTATION and is not stale (fix
+ *     round, I1: the shipped predicate treated SUPERSEDED as an
+ *     unconditional disjunct with neither guard, which let a NORMATIVE claim
+ *     or an IMPLEMENTATION conflict reach a hunk through this arm alone --
+ *     unreachable in production, since nothing in `src/` writes a SUPERSEDED
+ *     diff row yet, which is exactly why it would have gone unnoticed once
+ *     something did. Fix round, R1: I1's own re-review found the identical
+ *     shape once more, one guard narrower -- the CONTRADICTED arm above
+ *     carried `stale` and this one did not, so a stale verdict reached a hunk
+ *     through this arm alone. `stale` is restored here for the same reason
+ *     I2 stated it for the arm above: a verdict true of bytes that have since
+ *     moved is not grounds to delete a person's line). `basis` is
+ *     deliberately NOT required on this arm, and this is a conclusion, not an
+ *     omission: the project's own documents describe SUPERSEDED two ways --
+ *     the T9 brief calls it "the source's new version no longer contains the
+ *     proposition" (a fact about the *text*), while the T9 review's residual
+ *     note scopes its real, never-implemented derivation to
+ *     `verify_claims.superseded_by_claim_id`, a claim replaced by a
+ *     successor claim (a fact about *lineage*). Either way it is not a
+ *     `verify_results` verdict: it is either the extractor's own text
+ *     comparison or a claim-identity fact, neither of which any verifier
+ *     establishes, so a `verify_results`-shaped gate (`basis`) does not
+ *     describe it under either reading. `conflict` and `stale`, by contrast,
+ *     are not a description of supersession itself -- they are two of the
+ *     three absolutes below, which this arm holds exactly because every arm
+ *     does, not because SUPERSEDED is itself a conflict-and-staleness verdict.
  *
- * **NORMATIVE semantics and an IMPLEMENTATION conflict never reach a hunk, on
- * either arm above.** IMPLEMENTATION means the code diverged from what was
+ * **NORMATIVE semantics, an IMPLEMENTATION conflict, and a stale verdict never
+ * reach a hunk, on either arm above.** `src/memory/patch.c`'s
+ * `patch_may_delete` is the one place these three absolutes are stated, and
+ * it has exactly ONE call site: both arms' kind-specific tests are ORed
+ * *inside* that one call's argument, never computed as their own named
+ * `bool`s and ORed into an `if` from outside it. That is what makes the three
+ * absolutes structural rather than a convention an arm's author has to
+ * remember -- a fourth arm's natural edit is to widen the disjunction inside
+ * that one call, which inherits the three absolutes by construction; a
+ * deletion reached any other way needs a visibly separate `if` outside this
+ * function's one call, which is what a reviewer is already looking for.
+ * IMPLEMENTATION means the code diverged from what was
  * approved -- the approved thing is not the thing that is wrong, and
  * proposing deletion there would be automatically adopting a design because
- * current code happens to implement it, a named non-goal of this season. A
- * line excluded for either reason is a *finding*, never a hunk.
+ * current code happens to implement it, a named non-goal of this season.
+ * Stale means the verdict was true of bytes that have since moved, and A6
+ * says the same thing one layer over: STALE requires human revalidation and
+ * is never grounds to conclude the claim is wrong. A line excluded for any of
+ * the three is a *finding*, never a hunk.
  *
  * A line that resolved no anchor, or whose anchor resolves but no live claim
  * under it carries this exact text (a proposition this pass cannot correlate

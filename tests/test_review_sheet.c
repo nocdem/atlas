@@ -422,6 +422,37 @@ static void test_byte_0x80_refused(void) {
     T_EQ_INT(sheet.count, 0);
 }
 
+/* Load-bearing beyond "another illegal byte": 0x00 is the specific byte that
+ * would break the strlen(scratch) == tok_len[N] identity src/core/review.c's
+ * repo_buf/decision_buf copies rely on, if this byte-legality scan were ever
+ * relaxed to admit some non-ASCII bytes (0x80 among them) without also
+ * admitting 0x00. A relaxation that narrowly excludes 0x00 alone would make
+ * this the one case here that still fails -- unlike test_byte_0x80_refused,
+ * which such a change would make pass and so would stop testing anything. */
+static void test_embedded_nul_refused(void) {
+    char buf[256];
+    size_t used = 0;
+    append(buf, sizeof buf, &used, "atlas-review-sheet/1\n");
+    static const char PREFIX[] = "approve at";
+    static const char SUFFIX[] =
+        "as atlas-dec-28f03b0a44a53db88f0deace6e79721b r1 6fb2be08";
+    memcpy(buf + used, PREFIX, strlen(PREFIX));
+    used += strlen(PREFIX);
+    buf[used++] = '\0'; /* embedded inside what would otherwise be the repository field */
+    memcpy(buf + used, SUFFIX, strlen(SUFFIX));
+    used += strlen(SUFFIX);
+    buf[used++] = '\n';
+
+    atlas_review_sheet sheet;
+    atlas_err err;
+    atlas_err_init(&err);
+    T_FAILS_WITH(atlas_review_sheet_parse(buf, used, &sheet, &err), ATLAS_ERR_USAGE, &err);
+    T_EQ_STR(atlas_err_msg(&err),
+            "review sheet line 2: a byte outside printable ASCII; a sheet carries identifiers, "
+            "never prose");
+    T_EQ_INT(sheet.count, 0);
+}
+
 static void test_stray_cr_not_before_nl_refused(void) {
     char buf[256];
     size_t used = 0;
@@ -602,6 +633,7 @@ static const atlas_test TESTS[] = {
     {"a 256-byte line parses and a 257-byte line is refused", test_line_length_bound},
     {"a sheet larger than the byte ceiling is refused", test_sheet_larger_than_max_bytes_refused},
     {"a byte outside printable ASCII is refused", test_byte_0x80_refused},
+    {"an embedded NUL in the repository field is refused", test_embedded_nul_refused},
     {"a stray CR not immediately before LF is refused", test_stray_cr_not_before_nl_refused},
     {"CRLF line endings parse", test_crlf_line_endings_parse},
     {"blank lines and comments are ignored, and line numbers stay physical",

@@ -233,16 +233,19 @@ static bool already_named(const atlas_review_sheet *built, const char *repo, con
 }
 
 /* Refuses an intent field that did not parse, or parsed to SUPERSEDE or
- * REVALIDATE. The offending field is safe-encoded (`atlas/safetext.h` --
- * repository-adjacent text is untrusted even when it is only ever printed
- * back inside an error message) and truncated to 32 bytes before it is
- * quoted, so an operator who mistyped one word sees it and a line built to
- * carry a very long hostile token does not get to make the message large. */
+ * REVALIDATE. The offending field is truncated to ATLAS_REVIEW_INTENT_MSG_MAX
+ * bytes and *then* safe-encoded (`atlas/safetext.h` -- repository-adjacent
+ * text is untrusted even when it is only ever printed back inside an error
+ * message), in that order: truncating after encoding could cut a multi-byte
+ * `%XX` escape in half and hand a caller a message with a bare `%` in it.
+ * Truncating first and encoding the (shorter) result is always well-formed,
+ * so an operator who mistyped one word sees it and a line built to carry a
+ * very long hostile token does not get to make the message large. */
 static atlas_status refuse_bad_intent(size_t line_no, const char *raw, size_t raw_len,
                                       atlas_err *err) {
     atlas_buf enc;
     atlas_buf_init(&enc);
-    size_t take = raw_len < 32u ? raw_len : 32u;
+    size_t take = raw_len < ATLAS_REVIEW_INTENT_MSG_MAX ? raw_len : ATLAS_REVIEW_INTENT_MSG_MAX;
     atlas_status st = atlas_text_encode_safe(raw, take, &enc, err);
     if (st != ATLAS_OK) {
         atlas_buf_free(&enc);
@@ -271,7 +274,12 @@ atlas_status atlas_review_sheet_parse(const char *bytes, size_t len, atlas_revie
                              (unsigned)ATLAS_REVIEW_SHEET_MAX_BYTES);
     }
     if (bytes == NULL) {
-        bytes = ""; /* len is 0 whenever bytes is, so the loop below never dereferences it */
+        /* Enforced, not merely assumed of the caller: whatever `len` the
+         * caller passed alongside a NULL `bytes`, a NULL pointer names no
+         * bytes, so the loop below must never read past this one-byte
+         * literal. */
+        len = 0;
+        bytes = "";
     }
 
     atlas_review_sheet built;
@@ -382,8 +390,18 @@ atlas_status atlas_review_sheet_parse(const char *bytes, size_t len, atlas_revie
             return atlas_err_set(err, ATLAS_ERR_USAGE, "review sheet line %zu: %s", line_no,
                                  atlas_err_msg(&repo_err));
         }
+        /* atlas_db_check_repo_name validates strlen(scratch), not tok_len[1].
+         * The two agree only because the byte-legality scan above refuses
+         * every byte below 0x20 -- 0x00 included -- so `scratch` can hold no
+         * embedded NUL for strlen to stop short at; nothing here should
+         * assume that agreement rather than use the length the check itself
+         * relied on. Copying `repo_len + 1` (not tok_len[1] + 1, and not
+         * `sizeof repo_buf` at the point this is stored into the entry below)
+         * is what keeps a future relaxation of that scan (to admit UTF-8,
+         * say) from turning this into a copy past the validated prefix. */
+        size_t repo_len = strlen(scratch);
         char repo_buf[ATLAS_NAME_MAX + 1u];
-        memcpy(repo_buf, scratch, tok_len[1] + 1u); /* validated above: fits ATLAS_NAME_MAX */
+        memcpy(repo_buf, scratch, repo_len + 1u);
 
         memcpy(scratch, tok[2], tok_len[2]);
         scratch[tok_len[2]] = '\0';
@@ -391,8 +409,18 @@ atlas_status atlas_review_sheet_parse(const char *bytes, size_t len, atlas_revie
             return atlas_err_set(err, ATLAS_ERR_USAGE, "review sheet line %zu: the decision id is malformed",
                                  line_no);
         }
+        /* Same reasoning as repo_len above: atlas_decision_uid_is_valid also
+         * validates strlen(scratch), not tok_len[2]. Here the check happens
+         * to additionally force strlen(scratch) == ATLAS_DECISION_UID_MAX - 1
+         * exactly (it walks hex digits until the NUL and demands precisely
+         * ATLAS_DECISION_UID_HEX of them), so decision_buf can never actually
+         * end up with an unfilled tail -- but this is written the same way as
+         * repo's copy for the one reason that matters for both: the checked
+         * length is used because it is what was checked, not because it is
+         * assumed to equal tok_len[2]. */
+        size_t decision_len = strlen(scratch);
         char decision_buf[ATLAS_DECISION_UID_MAX];
-        memcpy(decision_buf, scratch, tok_len[2] + 1u); /* validated above: exactly UID_MAX - 1 bytes */
+        memcpy(decision_buf, scratch, decision_len + 1u);
 
         int64_t revision_no = 0;
         if (!parse_revision(tok[3], tok_len[3], &revision_no)) {
@@ -427,8 +455,16 @@ atlas_status atlas_review_sheet_parse(const char *bytes, size_t len, atlas_revie
         atlas_review_entry *e = &built.entries[built.count];
         e->line = line_no;
         e->intent = intent;
-        memcpy(e->repo, repo_buf, sizeof repo_buf);
-        memcpy(e->decision, decision_buf, sizeof decision_buf);
+        /* `repo_len + 1` / `decision_len + 1`, not `sizeof repo_buf` /
+         * `sizeof decision_buf`: `built` (and so `*e`) was zeroed wholesale at
+         * this function's start, and a full-buffer copy here would overwrite
+         * that zeroed tail with repo_buf/decision_buf's own uninitialised
+         * stack bytes past their NUL -- undoing the zeroing for exactly the
+         * bytes a caller has no reason to read but every reason to expect are
+         * zero, not indeterminate. Copying only the checked length leaves the
+         * tail exactly as the initial memset left it. */
+        memcpy(e->repo, repo_buf, repo_len + 1u);
+        memcpy(e->decision, decision_buf, decision_len + 1u);
         e->revision_no = revision_no;
         memcpy(e->prefix, tok[4], tok_len[4]);
         e->prefix[tok_len[4]] = '\0';

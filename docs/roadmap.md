@@ -1475,6 +1475,86 @@ pilot runs: this project's own rule that no evidence of a result is not
 evidence against one applies to its own acceptance, and this document does
 not pre-write the shape of a finding nobody has measured yet.
 
+## Next: A14 — a job an operator submits from wherever they are
+
+The sentence it exists for is
+
+> **THE GATEWAY CANNOT SUBMIT WORK BECAUSE OF WHO IT RUNS AS, AND THE OBVIOUS FIX
+> IS TO STOP THAT BEING TRUE.**
+
+Atlas' purpose is that an operator connects a client they like — Claude Code, a
+browser, a model over MCP — and work gets done in a repository under Atlas' gates.
+Every half of that exists except the last: **no surface outside the local socket
+can submit a job.**
+
+### The constraint, verified rather than assumed
+
+Two lines of root-owned policy decide it:
+
+```
+/etc/atlas/orchestration.conf:  submitter_uid = 1000    (the operator)
+/etc/atlas/gateway.conf:        gateway_uid   = 992     (atlas-gateway)
+```
+
+The orchestration RPC group is selected by `SO_PEERCRED` against that policy, so
+the gateway does not fail a check — **it is not in the set at all**, and it speaks
+on the socket as 992 whatever its code intends. That is A7.1's own sentence
+working exactly as written: *what the gateway cannot do is true because of who it
+runs as, not because of anything in `src/gw`.*
+
+The remote surface is otherwise ready. `remote_mcp = yes` is served at
+`/mcp`, authentication is a Bearer API key rather than a uid, and keys already
+carry **scopes** — the `chatgpt-tunnel` key holds five, all read-only. So the
+identity mechanism and the per-key authorisation vocabulary both exist. What is
+missing is a scope that means "may submit", a route that carries it, and — the
+whole question — a way for that request to reach the writer without becoming the
+gateway's own authority.
+
+### The tempting fix is the one that must not be taken
+
+Adding `submitter_uid = 992` makes it work in one line, and destroys the argument
+A7.1 is built on. From that moment the gateway can submit anything, and the only
+thing between a remote caller and a job running on the machine is code in
+`src/gw` — which is precisely the place A9 says a boundary must never live,
+because a check there is one an attacker walks around while the process keeps its
+full authority.
+
+**If A14 ends with that line in the policy, it has failed even if everything
+passes.**
+
+### Three shapes, none free
+
+1. **The request carries its own principal.** The gateway forwards a submission
+   that names the key it arrived under, and the submit path authorises on that
+   rather than on the peer. Cheapest to build; hardest to argue, because the
+   gateway now asserts an identity instead of having one, and every A7 rule about
+   `SO_PEERCRED` exists because a caller describing itself is not evidence about
+   itself.
+2. **A broker with its own uid.** A third principal the gateway can hand a request
+   to and cannot impersonate, which holds the submitter right and applies the
+   per-key policy. Keeps identity kernel-asserted at every hop; costs a process, a
+   socket and a policy section.
+3. **A remote submission is a proposal, not a job.** It lands as a durable request
+   an operator disposes of — the shape A4's approval channel and A12.0's plan
+   revisions already have. Weakest capability and strongest argument: nothing
+   remote ever starts work, and "an operator was in the loop" stays literally
+   true. It also may not be what the operator wants, which is the point of writing
+   it down as a choice rather than picking it here.
+
+### What must be true whichever shape wins
+
+- **A budget per key.** A job spends real money and runs a worker on the machine.
+  Today no per-client bound exists, because the only submitter was the operator
+  and the operator is trusted by design. Opening submission ends that premise, and
+  A11.1's three-starts-per-run budget is a bound on a *chain*, not on a caller.
+- **A9's absences stay absences.** Remote credential administration is absent, not
+  refused; no MCP tool name carries an authority verb; a model payload cannot
+  accept a run. Submission is none of those — the gates still run and settlement
+  is still Atlas' — and the season's first job is to say precisely why, in the
+  rules, before writing the route.
+- **The audit row names the key, never a claimed value**, the way `gw_audit`
+  already refuses to store what a caller says about itself.
+
 ## Later: the review surface, and where a proposal is disposed of
 
 A4 gave Atlas a lifecycle and one channel that may move it. A9 gave it a web

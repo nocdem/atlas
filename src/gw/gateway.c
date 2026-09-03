@@ -1110,6 +1110,31 @@ static bool api_handle(atlas_gateway *g, const atlas_http_request *req, const pr
     return true;
 }
 
+/* A15 T1. `atlas_gateway_api_routes()` copies the three fields
+ * `atlas_gateway_route_view` exposes out of `API_ROUTES[]`, once, into a static
+ * table of the same length. It reads `API_ROUTES[]` and nothing else, so a row
+ * added or changed here is reflected without a second literal to keep in step
+ * -- the count a hand-kept parallel table would need is exactly the defect
+ * commit a169393 records. Nothing in the gateway calls it; it exists for a
+ * test. */
+const atlas_gateway_route_view *atlas_gateway_api_routes(size_t *count_out) {
+    static const size_t n = sizeof API_ROUTES / sizeof API_ROUTES[0];
+    static atlas_gateway_route_view views[sizeof API_ROUTES / sizeof API_ROUTES[0]];
+    static bool populated = false;
+    if (!populated) {
+        for (size_t i = 0; i < n; i++) {
+            views[i].path = API_ROUTES[i].path;
+            views[i].method = API_ROUTES[i].method;
+            views[i].scope = API_ROUTES[i].scope;
+        }
+        populated = true;
+    }
+    if (count_out != NULL) {
+        *count_out = n;
+    }
+    return views;
+}
+
 /* --- routing --------------------------------------------------------------- */
 
 atlas_status atlas_gateway_serve_bytes(atlas_gateway *g, const char *request, size_t len,

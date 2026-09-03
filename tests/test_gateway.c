@@ -16,9 +16,11 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "atlas/gateway.h"
 #include "atlas/gwpolicy.h"
 #include "atlas/http.h"
 #include "atlas_test.h"
+#include "ipc/server_internal.h"
 #include "support/fixture.h"
 
 static void parse_policy(const char *text, atlas_gwpolicy *out) {
@@ -379,6 +381,64 @@ static void test_every_response_carries_the_security_headers(void) {
                 "a credentialed CORS response did not vary on Origin");
 }
 
+/* A15 T1. The route table adds no behaviour by itself; what has to hold is a
+ * property of every row, not a count of them. `atlas_gateway_api_routes()`
+ * hands the test the same three fields `api_handle` matches against, and this
+ * checks each row's method against the daemon's own operator-only group and
+ * the fixed method list `docs/remote-access.md:51-56` says the gateway_uid
+ * cannot reach -- for a reason that has nothing to do with this table. A row
+ * naming one of those methods would be a route past that boundary, not a
+ * property of the boundary itself. `route_count` is used only as the loop
+ * bound and is never asserted: a table that grew or shrank by one row must not
+ * make this test fail or pass differently, only the property of each row must. */
+static void test_every_api_route_is_a_read_the_gateway_uid_may_make(void) {
+    size_t operator_count = 0;
+    const atlas_method_entry *operator_methods = atlas_server_operator_methods(&operator_count);
+    T_REQUIRE(operator_methods != NULL || operator_count == 0);
+
+    /* docs/remote-access.md:51-56, minus the operator group already checked
+     * above and minus every `job.`/`dispatch.` method, which are prefix
+     * checks below rather than exact names. */
+    static const char *const GATEWAY_ONLY = "gateway.auth";
+    static const char *const GATEWAY_AUDIT = "gateway.audit";
+    static const char *const FORBIDDEN_EXACT[] = {
+        "backup.create", "backup.verify", "code.index",   "maintenance.plan",
+        "maintenance.prune", "apikey.create", "apikey.list", "apikey.revoke",
+    };
+
+    size_t route_count = 0;
+    const atlas_gateway_route_view *routes = atlas_gateway_api_routes(&route_count);
+    T_REQUIRE(routes != NULL);
+
+    for (size_t i = 0; i < route_count; i++) {
+        const atlas_gateway_route_view *r = &routes[i];
+
+        for (size_t j = 0; j < operator_count; j++) {
+            T_CHECK_MSG(strcmp(r->method, operator_methods[j].name) != 0,
+                        "route %s forwards to operator method %s", r->path, r->method);
+        }
+
+        T_CHECK_MSG(strcmp(r->method, GATEWAY_ONLY) != 0, "route %s forwards to %s", r->path,
+                    GATEWAY_ONLY);
+        T_CHECK_MSG(strcmp(r->method, GATEWAY_AUDIT) != 0, "route %s forwards to %s", r->path,
+                    GATEWAY_AUDIT);
+
+        for (size_t j = 0; j < sizeof FORBIDDEN_EXACT / sizeof FORBIDDEN_EXACT[0]; j++) {
+            T_CHECK_MSG(strcmp(r->method, FORBIDDEN_EXACT[j]) != 0,
+                        "route %s forwards to forbidden method %s", r->path, r->method);
+        }
+        T_CHECK_MSG(strncmp(r->method, "job.", 4) != 0, "route %s forwards to a job. method",
+                    r->path);
+        T_CHECK_MSG(strncmp(r->method, "dispatch.", 9) != 0,
+                    "route %s forwards to a dispatch. method", r->path);
+
+        T_CHECK_MSG(atlas_apikey_scope_grantable(r->scope), "route %s scope is not grantable",
+                    r->path);
+        T_CHECK_MSG(r->scope != ATLAS_SCOPE_UNKNOWN, "route %s scope is ATLAS_SCOPE_UNKNOWN",
+                    r->path);
+    }
+}
+
 static const atlas_test TESTS[] = {
     {"a complete policy enables the gateway", test_a_complete_policy_enables_the_gateway},
     {"a zeroed policy authorises nothing", test_a_zeroed_policy_authorises_nothing},
@@ -397,6 +457,8 @@ static const atlas_test TESTS[] = {
      test_a_path_is_never_decoded_and_never_a_filesystem_path},
     {"every response carries the security headers",
      test_every_response_carries_the_security_headers},
+    {"every API route is a read the gateway uid may make",
+     test_every_api_route_is_a_read_the_gateway_uid_may_make},
 };
 
 ATLAS_TEST_MAIN("gateway", TESTS)

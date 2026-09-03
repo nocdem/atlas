@@ -111,4 +111,19 @@ atlas_status atlas_service_gateway_run(atlas_err *err);
 /* `atlas gateway status`: what the policy says, without binding anything. */
 atlas_status atlas_service_gateway_status(FILE *out, bool json, atlas_err *err);
 
+/* A15 T1. A read-only view of the gateway's own route table, `API_ROUTES[]` in
+ * `gateway.c`, which is otherwise private to that file. It exists so a test can
+ * assert a property every row must hold -- not the table's shape, and not its
+ * row count -- without the test reaching into the file's static data. */
+typedef struct atlas_gateway_route_view {
+    const char *path;      /* the exact literal matched at gateway.c:1007 */
+    const char *method;    /* the daemon method it forwards to */
+    atlas_apikey_scope scope;
+} atlas_gateway_route_view;
+
+/* A read-only view of API_ROUTES[]. Exists so a test can assert a property of the
+ * table; nothing in the gateway calls it. `count_out` receives the row count, which no
+ * test may pin. */
+const atlas_gateway_route_view *atlas_gateway_api_routes(size_t *count_out);
+
 #endif /* ATLAS_GATEWAY_H */

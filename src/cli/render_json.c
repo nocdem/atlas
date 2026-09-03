@@ -2580,10 +2580,18 @@ static atlas_status j_plan_item(atlas_renderer *r, const atlas_plan_render *pr, 
  * in `render_human.c` exactly, restated here because both renderers document
  * their own value-by-value contract at the top of the file: RAW values
  * (`registered_at`, `observed_at`) go through `json_safe()`; ALREADY-SAFE
- * values (`path`, `scan_rel_path`, `pack_body`, `patch_diff`,
- * `patch_findings`) are emitted as-is with an `_encoding: atlas-safe-1` label
- * beside them (`src/ipc/server_orch.c`'s spelling); everything else is an
- * Atlas-minted uid, hex digest, or closed-vocabulary name and needs neither. */
+ * values (`scan_rel_path`, `pack_body`, `patch_diff`, `patch_findings`) are
+ * emitted as-is with an `_encoding: atlas-safe-1` label beside them
+ * (`src/ipc/server_orch.c`'s spelling). Every source's `path` is ALREADY-SAFE
+ * too but is deliberately the one exception left unlabelled: `path_encoding`
+ * is already this file's own name, at `json_path()` above, for a different,
+ * `docs/provenance.md`-documented contract (`"utf8"` | `"percent-escaped"`,
+ * beside `path_bytes_hex`) -- reusing it here for the constant `"atlas-safe-1"`
+ * would make one key name mean two incompatible things depending on which
+ * command produced the document, which is worse than the asymmetry it would
+ * fix (fix round, item 4: this was tried and reverted for exactly that
+ * reason). Everything else is an Atlas-minted uid, hex digest, or
+ * closed-vocabulary name and needs neither. */
 static atlas_status j_memory_item(atlas_renderer *r, const atlas_memory_render *mr, atlas_err *err) {
     atlas_json *j = r->j;
     atlas_status st = mr->in_list ? atlas_json_obj_begin(j, err) : ATLAS_OK;

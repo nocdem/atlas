@@ -2897,9 +2897,10 @@ static atlas_status h_memory_scan(atlas_renderer *r, const atlas_memory_render *
         return ATLAS_OK;
     }
     if (mr->scan_put) {
-        (void)fprintf(o, "%-20s %-40s put %s (%lld bytes, sha256 %s%s)\n", mr->repo,
+        (void)fprintf(o, "%-20s %-40s put %s (%lld bytes, sha256 %s%s)%s%s\n", mr->repo,
                       mr->scan_source_uid, mr->scan_version_uid, (long long)mr->scan_content_bytes,
-                      mr->scan_content_sha256, mr->scan_created ? ", new" : "");
+                      mr->scan_content_sha256, mr->scan_created ? ", new" : "",
+                      mr->scan_rel_path[0] != '\0' ? " path=" : "", mr->scan_rel_path);
     } else {
         (void)fprintf(o, "%-20s %-40s skipped: %s%s%s\n", mr->repo, mr->scan_source_uid,
                       mr->scan_outcome, mr->scan_rel_path[0] != '\0' ? " path=" : "",

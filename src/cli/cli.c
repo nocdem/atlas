@@ -222,10 +222,10 @@ void atlas_cli_print_help(FILE *out) {
      * again. */
     (void)fprintf(
         out,
-        "  memory status [--repo NAME]  registered sources, versions, generation, and\n"
+        "  memory status --repo NAME  registered sources, versions, generation, and\n"
         "                             whether a pass is owed; states the root-owned\n"
         "                             memory-source policy even when none is installed\n"
-        "  memory scan [--repo NAME]  read every registered EXTERNAL_* source as this\n"
+        "  memory scan --repo NAME    read every registered EXTERNAL_* source as this\n"
         "                             account and submit it (memory.put)\n"
         "  memory reconcile --repo NAME  ask the daemon to reconcile now; accepted, not\n"
         "                             completed -- poll `memory status` afterward\n"

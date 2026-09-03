@@ -28,6 +28,7 @@
 #include "atlas/ipc.h"
 #include "atlas/memory.h"
 #include "atlas/pathrep.h"
+#include "atlas/safetext.h"
 #include "atlas/service.h"
 #include "atlas/syspolicy.h"
 #include "service_internal.h"
@@ -335,8 +336,29 @@ atlas_status atlas_service_memory_status_remote(const char *repo, atlas_memory_s
      * response accessor API reads one level into a result object or one
      * member of an array element, and this is an object nested a level
      * deeper than either reaches. A disclosed asymmetry with the local read
-     * above, not a silent omission -- see the T16 report. */
-    for (size_t i = 0; i < n; i++) {
+     * above, not a silent omission -- see the T16 report.
+     *
+     * Whoever closes this: `observed_at` is `atlas_safe()`-encoded at the
+     * same call site as `registered_at` below (`emit_source`,
+     * `src/ipc/server_memory.c:268`), so reading `latest_version.observed_at`
+     * here will reproduce the identical double-encode this fix round closed
+     * for `registered_at` unless it gets the same
+     * `atlas_text_decode_safe()` treatment. */
+    /* `registered_at` crosses the socket already `atlas_safe()`-encoded
+     * (`emit_source`, `src/ipc/server_memory.c`) -- caller-supplied text, not
+     * an Atlas-minted token. `atlas_memory_render` documents the field as RAW
+     * (`service.h`) and both renderers apply `atlas_safe()`/`json_safe()` to
+     * it at print (`render_human.c`, `render_json.c`), which is right for the
+     * local read and would double-encode this one. Decoding it back to raw
+     * here, once, keeps the field in the single category the struct and both
+     * renderers already agree on, on both transports -- rather than
+     * inventing a second, per-source "already safe" category that only the
+     * remote path would ever set. */
+    atlas_buf registered_at_buf[ATLAS_MEMORY_MAX_SOURCES];
+    for (size_t i = 0; i < ATLAS_MEMORY_MAX_SOURCES; i++) {
+        atlas_buf_init(&registered_at_buf[i]);
+    }
+    for (size_t i = 0; i < n && st == ATLAS_OK; i++) {
         atlas_memory_source_render *s = &mr.sources[mr.source_count];
         const char *sv = NULL;
         if (atlas_ipc_result_arr_obj_str(resp, "sources", i, "uid", &sv)) {
@@ -349,11 +371,19 @@ atlas_status atlas_service_memory_status_remote(const char *repo, atlas_memory_s
             s->path = sv;
         }
         if (atlas_ipc_result_arr_obj_str(resp, "sources", i, "registered_at", &sv)) {
-            s->registered_at = sv;
+            st = atlas_text_decode_safe(sv, strlen(sv), &registered_at_buf[i], err);
+            if (st == ATLAS_OK) {
+                s->registered_at = atlas_buf_cstr(&registered_at_buf[i]);
+            }
         }
         mr.source_count++;
     }
-    st = sink(&mr, ud, err);
+    if (st == ATLAS_OK) {
+        st = sink(&mr, ud, err);
+    }
+    for (size_t i = 0; i < ATLAS_MEMORY_MAX_SOURCES; i++) {
+        atlas_buf_free(&registered_at_buf[i]);
+    }
     atlas_ipc_response_free(resp);
     atlas_buf_free(&raw);
     return st;

@@ -381,29 +381,89 @@ static void test_every_response_carries_the_security_headers(void) {
                 "a credentialed CORS response did not vary on Origin");
 }
 
-/* A15 T1. The route table adds no behaviour by itself; what has to hold is a
- * property of every row, not a count of them. `atlas_gateway_api_routes()`
- * hands the test the same three fields `api_handle` matches against, and this
- * checks each row's method against the daemon's own operator-only group and
- * the fixed method list `docs/remote-access.md:51-56` says the gateway_uid
- * cannot reach -- for a reason that has nothing to do with this table. A row
- * naming one of those methods would be a route past that boundary, not a
- * property of the boundary itself. `route_count` is used only as the loop
- * bound and is never asserted: a table that grew or shrank by one row must not
- * make this test fail or pass differently, only the property of each row must. */
-static void test_every_api_route_is_a_read_the_gateway_uid_may_make(void) {
+/* A15 T1, fix round 1. The route table adds no behaviour by itself; what has
+ * to hold is a property of every row, not a count of them.
+ * `atlas_gateway_api_routes()` hands the test the same three fields
+ * `api_handle` matches against.
+ *
+ * The first version of this test asserted only absence from a few known-write
+ * groups and a hand-kept name list, which a route naming `verify.evaluate`,
+ * `decision.propose`, `decision.revise`, `decision.link_add`,
+ * `verify.claim_create` or `verify.attestation_add` would have passed: none of
+ * those names is in `OPERATOR_METHODS[]`, none matches the old exact list, and
+ * none carries a `job.` or `dispatch.` prefix, yet every one of them is a
+ * write in the ordinary dispatch group (`src/ipc/server.c`'s `dispatch()`
+ * consults `VERIFY_METHODS[]` and `DECISION_METHODS[]` with no peer
+ * predicate), reachable by the gateway uid the moment a route named it. A
+ * negative list can only ever list what somebody already thought of.
+ *
+ * `READ_METHODS[]` below is the actual guarantee: a positive allowlist of
+ * every method this table forwards to today. A name is added to it only
+ * after establishing, independently of this test, that the method is a read
+ * the gateway uid may make -- never because it merely failed to match one of
+ * the negative checks that follow. A row naming anything else fails loudly,
+ * on this line, the moment it is added; a count would have drifted silently
+ * instead. This is the same shape `HOOK_EVENTS[]` (`src/hook/hook.c`) and the
+ * `git config` argument vectors (`src/git/git.c`) already use in this
+ * repository: a positive, hand-reviewed list that can only be widened on
+ * purpose. `route_count` is still used only as the loop bound and is never
+ * asserted -- a table that grows or shrinks by a row must not change whether
+ * this test passes, only the property of each row must.
+ *
+ * The negative checks kept below are the stated reasons, not the guarantee:
+ * they document *why* several specific names must never appear, each citing
+ * the table it mirrors. Fix round 1 found the first version's own copy of the
+ * backup group's names had already drifted from `BACKUP_METHODS[]` -- missing
+ * `operation.get` and `code.sem_config` -- and that its `job.`/`dispatch.`
+ * prefix pair did not cover `ORCH_CLIENT_METHODS[]`'s four `plan.` methods.
+ * Both groups are read here directly from their own accessor functions
+ * (`atlas_server_backup_methods`, `atlas_server_apikey_methods`,
+ * `atlas_server_orch_client_methods`, `atlas_server_orch_dispatch_methods`)
+ * rather than restated as a second literal, which is the cheap derivation the
+ * fix round asked for: none of these four can drift from the table it
+ * documents, because each loop reads that table itself instead of a copy of
+ * it. `gateway.auth` and `gateway.audit` stay as two exact names -- the third
+ * member of the same `GATEWAY_METHODS[]` table, `gateway.audit_list`, is
+ * itself the method behind the `/api/v1/audit` route, so deriving this one
+ * from its table would need an exclusion rather than a plain membership test;
+ * two names is not worth that. */
+static void test_every_api_route_forwards_to_a_read_on_the_reviewed_allowlist(void) {
     size_t operator_count = 0;
     const atlas_method_entry *operator_methods = atlas_server_operator_methods(&operator_count);
     T_REQUIRE(operator_methods != NULL || operator_count == 0);
 
-    /* docs/remote-access.md:51-56, minus the operator group already checked
-     * above and minus every `job.`/`dispatch.` method, which are prefix
-     * checks below rather than exact names. */
+    size_t backup_count = 0;
+    const atlas_method_entry *backup_methods = atlas_server_backup_methods(&backup_count);
+    T_REQUIRE(backup_methods != NULL || backup_count == 0);
+
+    size_t apikey_count = 0;
+    const atlas_method_entry *apikey_methods = atlas_server_apikey_methods(&apikey_count);
+    T_REQUIRE(apikey_methods != NULL || apikey_count == 0);
+
+    size_t orch_client_count = 0;
+    const atlas_method_entry *orch_client_methods =
+        atlas_server_orch_client_methods(&orch_client_count);
+    T_REQUIRE(orch_client_methods != NULL || orch_client_count == 0);
+
+    size_t orch_dispatch_count = 0;
+    const atlas_method_entry *orch_dispatch_methods =
+        atlas_server_orch_dispatch_methods(&orch_dispatch_count);
+    T_REQUIRE(orch_dispatch_methods != NULL || orch_dispatch_count == 0);
+
     static const char *const GATEWAY_ONLY = "gateway.auth";
     static const char *const GATEWAY_AUDIT = "gateway.audit";
-    static const char *const FORBIDDEN_EXACT[] = {
-        "backup.create", "backup.verify", "code.index",   "maintenance.plan",
-        "maintenance.prune", "apikey.create", "apikey.list", "apikey.revoke",
+
+    /* Every method API_ROUTES[] forwards to, as of this fix round. Not
+     * generated from the table -- a name missing here is a build-time-visible
+     * test failure, never a silent gap, which is the point. */
+    static const char *const READ_METHODS[] = {
+        "daemon.status",    "repo.list",          "repo.state",     "events.since",
+        "repo.search",      "repo.file",          "repo.history",   "decision.list",
+        "decision.get",     "decision.history",   "gate.check",     "code.status",
+        "code.file",        "code.symbol",        "code.search",    "sem.status",
+        "sem.symbol",       "sem.callers",        "sem.callees",    "sem.impact",
+        "code.impact",      "sem.context",        "verify.claims",  "verify.show",
+        "verify.policy",    "gateway.audit_list",
     };
 
     size_t route_count = 0;
@@ -413,24 +473,43 @@ static void test_every_api_route_is_a_read_the_gateway_uid_may_make(void) {
     for (size_t i = 0; i < route_count; i++) {
         const atlas_gateway_route_view *r = &routes[i];
 
+        bool allowed = false;
+        for (size_t j = 0; j < sizeof READ_METHODS / sizeof READ_METHODS[0]; j++) {
+            if (strcmp(r->method, READ_METHODS[j]) == 0) {
+                allowed = true;
+                break;
+            }
+        }
+        T_CHECK_MSG(allowed, "route %s forwards to %s, which is not on the reviewed read allowlist",
+                    r->path, r->method);
+
         for (size_t j = 0; j < operator_count; j++) {
             T_CHECK_MSG(strcmp(r->method, operator_methods[j].name) != 0,
                         "route %s forwards to operator method %s", r->path, r->method);
+        }
+        for (size_t j = 0; j < backup_count; j++) {
+            T_CHECK_MSG(strcmp(r->method, backup_methods[j].name) != 0,
+                        "route %s forwards to backup-group method %s", r->path, r->method);
+        }
+        for (size_t j = 0; j < apikey_count; j++) {
+            T_CHECK_MSG(strcmp(r->method, apikey_methods[j].name) != 0,
+                        "route %s forwards to apikey-group method %s", r->path, r->method);
+        }
+        for (size_t j = 0; j < orch_client_count; j++) {
+            T_CHECK_MSG(strcmp(r->method, orch_client_methods[j].name) != 0,
+                        "route %s forwards to orchestration client method %s", r->path,
+                        r->method);
+        }
+        for (size_t j = 0; j < orch_dispatch_count; j++) {
+            T_CHECK_MSG(strcmp(r->method, orch_dispatch_methods[j].name) != 0,
+                        "route %s forwards to orchestration dispatch method %s", r->path,
+                        r->method);
         }
 
         T_CHECK_MSG(strcmp(r->method, GATEWAY_ONLY) != 0, "route %s forwards to %s", r->path,
                     GATEWAY_ONLY);
         T_CHECK_MSG(strcmp(r->method, GATEWAY_AUDIT) != 0, "route %s forwards to %s", r->path,
                     GATEWAY_AUDIT);
-
-        for (size_t j = 0; j < sizeof FORBIDDEN_EXACT / sizeof FORBIDDEN_EXACT[0]; j++) {
-            T_CHECK_MSG(strcmp(r->method, FORBIDDEN_EXACT[j]) != 0,
-                        "route %s forwards to forbidden method %s", r->path, r->method);
-        }
-        T_CHECK_MSG(strncmp(r->method, "job.", 4) != 0, "route %s forwards to a job. method",
-                    r->path);
-        T_CHECK_MSG(strncmp(r->method, "dispatch.", 9) != 0,
-                    "route %s forwards to a dispatch. method", r->path);
 
         T_CHECK_MSG(atlas_apikey_scope_grantable(r->scope), "route %s scope is not grantable",
                     r->path);
@@ -457,8 +536,8 @@ static const atlas_test TESTS[] = {
      test_a_path_is_never_decoded_and_never_a_filesystem_path},
     {"every response carries the security headers",
      test_every_response_carries_the_security_headers},
-    {"every API route is a read the gateway uid may make",
-     test_every_api_route_is_a_read_the_gateway_uid_may_make},
+    {"every API route forwards to a read on the reviewed allowlist",
+     test_every_api_route_forwards_to_a_read_on_the_reviewed_allowlist},
 };
 
 ATLAS_TEST_MAIN("gateway", TESTS)

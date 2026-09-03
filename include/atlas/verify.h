@@ -1881,11 +1881,25 @@ atlas_status atlas_db_verify_result_insert(atlas_db *db, int64_t claim_id,
  * UNVERIFIED" reads `*found_out == false` as `ATLAS_VERIFY_UNVERIFIED` -- the
  * same value the zero-initialised enum already carries, so a caller that
  * forgets to check `found_out` degrades to the honest answer rather than a
- * wrong one. */
+ * wrong one.
+ *
+ * `basis_out` (A12.1 T15): the same row's `basis` column, optional (NULL
+ * skips it) so `src/memory/pack.c`'s existing call -- which flags a claim on
+ * `state`/`conflict` alone -- need not change. Widened rather than given a
+ * second reader: one caller existed when this was widened
+ * (`src/memory/pack.c:357`), which is what made widening the cheaper of the
+ * two options T15's context laid out. `atlas_memory_patch_build`
+ * (`src/memory/patch.c`) is what actually needs it: "deterministically
+ * CONTRADICTED" is `state == CONTRADICTED && basis == DETERMINISTIC`, and
+ * nothing else is -- not `algorithm`, not the conflict kind, not the
+ * confidence score, per A9.2's rule that a model cannot become a tool. Left
+ * at `ATLAS_VERIFY_BASIS_UNKNOWN` (the zero) whenever `*found_out` is false,
+ * exactly as `state_out`/`conflict_out` are left at their own zeros. */
 atlas_status atlas_db_verify_result_latest(atlas_db *db, int64_t claim_id,
                                            atlas_verify_state *state_out,
                                            atlas_verify_conflict *conflict_out, bool *stale_out,
-                                           bool *found_out, atlas_err *err);
+                                           atlas_verify_basis *basis_out, bool *found_out,
+                                           atlas_err *err);
 
 atlas_status atlas_db_verify_audit_insert(atlas_db *db, const atlas_verify_audit *a,
                                           const char *now, int64_t *id_out, atlas_err *err);

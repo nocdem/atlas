@@ -354,7 +354,7 @@ static atlas_status claim_collect_cb(const atlas_verify_claim *c, void *ud, atla
     }
     if (st == ATLAS_OK) {
         bool found = false;
-        st = atlas_db_verify_result_latest(cc->db, c->id, &slot->state, &slot->conflict, NULL,
+        st = atlas_db_verify_result_latest(cc->db, c->id, &slot->state, &slot->conflict, NULL, NULL,
                                            &found, err);
         slot->has_result = found;
     }

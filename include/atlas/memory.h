@@ -1694,4 +1694,79 @@ atlas_status atlas_db_memory_trailer_binding_get(atlas_db *db, int64_t repo_id,
                                                  atlas_memory_trailer_binding *out, bool *found_out,
                                                  atlas_err *err);
 
+/* --- T15: the proposed patch ------------------------------------------------
+ *
+ * Acceptance item 5's second half. T12's pack and T9's diff rows are an
+ * Atlas-owned projection: they regenerate from moved inputs with no proposal
+ * step, and nothing here changes that. A hand-authored memory file is not --
+ * nobody but its own author may rewrite it, so the only thing Atlas may ever
+ * hand back about it is a proposal a person reviews and applies (or does not)
+ * themselves.
+ *
+ * `atlas_memory_patch_build` renders a unified diff against one registered
+ * source's *current* content, proposing ONLY deletions -- never a rewrite,
+ * never an addition, never a line changed in place -- plus a findings list
+ * for everything the diff does not carry an opinion about. A line (one T7
+ * proposition) is proposed for removal iff:
+ *
+ *   - it resolved an anchor, correlates to a claim currently live under that
+ *     anchor (matched by exact text, `atlas_db_memory_anchor_claim_uids`' own
+ *     shape -- `src/memory/reconcile.c`'s `find_prior_cb`, read-only here),
+ *     that claim's semantics are DESCRIPTIVE, and its most recently stored
+ *     `verify_results` row reads `state = CONTRADICTED` and, load-bearing,
+ *     `basis = DETERMINISTIC` -- "deterministically CONTRADICTED" is exactly
+ *     that pair and nothing else, never approximated from `algorithm`, the
+ *     conflict kind or the confidence score (A9.2: a model cannot become a
+ *     tool) -- with a conflict that is anything other than IMPLEMENTATION;
+ *   - or that claim's most recently recorded diff kind
+ *     (`atlas_db_memory_claim_diff_last_kind`) is SUPERSEDED.
+ *
+ * **IMPLEMENTATION is excluded on purpose.** It means the code diverged from
+ * what was approved -- the approved thing is not the thing that is wrong, and
+ * proposing deletion there would be automatically adopting a design because
+ * current code happens to implement it, a named non-goal of this season. A
+ * line excluded for this reason is a *finding*, never a hunk.
+ *
+ * A line that resolved no anchor, or whose anchor resolves but no live claim
+ * under it carries this exact text (a proposition this pass cannot correlate
+ * to any stored assessment at all), produces neither a hunk nor a finding --
+ * A9.2.2's asymmetry, one layer over: no evidence against a line is not
+ * evidence for keeping or removing it, so this function says nothing about
+ * it rather than guessing.
+ *
+ * **This function reads files and must not run inside a transaction** --
+ * `atlas_memory_observe`'s own rule, for the same reason: it asks
+ * `atlas_memory_read_source`, which is A13-routed (a repository naming a
+ * scanner is read from its mirror and from nothing else; one with none reads
+ * its own tree, exactly as every other T6 caller does -- this function
+ * restates none of that routing, it only asks). `data_dir` exists so the
+ * diff's context lines are read through the same path and match the source's
+ * own bytes exactly; an EXTERNAL_* source instead reads its already-stored
+ * latest version (`atlas_db_memory_version_latest`), `atlas_memory_observe`'s
+ * own EXTERNAL_* shape, since no principal but the one that called
+ * `memory.put` reads one directly.
+ *
+ * **It writes nothing anywhere.** `diff_out` and `findings_out` are the only
+ * output; no `memory_*` row, no `verify_*` row, no file. A caller may verify
+ * this with `fx_tree_digest` bracketing the whole call, not only the write it
+ * does not make.
+ *
+ * **Nothing Atlas authored appears inside a hunk.** Every context and removed
+ * line is the source's own bytes, safe-encoded (`atlas_text_encode_safe`) at
+ * the point they are written -- repository content is untrusted input,
+ * CLAUDE.md's rule, applied to a diff line exactly as it is to a rendered
+ * claim. A finding is Atlas talking about a line, and is listed *beside* the
+ * diff, never inside it: wanting to put an explanatory comment inside a hunk
+ * is a sign the comment belongs in `findings_out` instead.
+ *
+ * `diff_out` is empty and `findings_out` says so -- one entry naming the
+ * source and that nothing was proposed -- when nothing in the source
+ * qualified, whether because there was nothing to read, nothing anchored, or
+ * everything anchored was healthy: an empty diff on its own does not say
+ * *why*, and a reader must not read silence as "this pass looked and found
+ * every line clean" without the finding confirming it. */
+atlas_status atlas_memory_patch_build(atlas_db *db, const atlas_repo_info *repo,
+                                      const char *data_dir, const char *source_uid,
+                                      atlas_buf *diff_out, atlas_buf *findings_out, atlas_err *err);
+
 #endif /* ATLAS_MEMORY_H */

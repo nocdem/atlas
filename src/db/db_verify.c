@@ -1643,7 +1643,8 @@ atlas_status atlas_db_verify_result_insert(atlas_db *db, int64_t claim_id,
 atlas_status atlas_db_verify_result_latest(atlas_db *db, int64_t claim_id,
                                            atlas_verify_state *state_out,
                                            atlas_verify_conflict *conflict_out, bool *stale_out,
-                                           bool *found_out, atlas_err *err) {
+                                           atlas_verify_basis *basis_out, bool *found_out,
+                                           atlas_err *err) {
     if (state_out != NULL) {
         *state_out = ATLAS_VERIFY_UNVERIFIED;
     }
@@ -1653,6 +1654,9 @@ atlas_status atlas_db_verify_result_latest(atlas_db *db, int64_t claim_id,
     if (stale_out != NULL) {
         *stale_out = false;
     }
+    if (basis_out != NULL) {
+        *basis_out = ATLAS_VERIFY_BASIS_UNKNOWN;
+    }
     if (found_out != NULL) {
         *found_out = false;
     }
@@ -1660,7 +1664,7 @@ atlas_status atlas_db_verify_result_latest(atlas_db *db, int64_t claim_id,
         return atlas_err_set(err, ATLAS_ERR_INTERNAL, "no claim to read a result for");
     }
     static const char SQL[] =
-        "SELECT state, conflict, stale FROM verify_results"
+        "SELECT state, conflict, stale, basis FROM verify_results"
         " WHERE claim_id = ?1 ORDER BY id DESC LIMIT 1;";
     sqlite3_stmt *stmt = NULL;
     atlas_status st = atlas_db_prepare(db, SQL, &stmt, err);
@@ -1675,8 +1679,10 @@ atlas_status atlas_db_verify_result_latest(atlas_db *db, int64_t claim_id,
     if (rc == SQLITE_ROW) {
         const char *state_text = (const char *)sqlite3_column_text(stmt, 0);
         const char *conflict_text = (const char *)sqlite3_column_text(stmt, 1);
+        const char *basis_text = (const char *)sqlite3_column_text(stmt, 3);
         atlas_verify_state st_val = ATLAS_VERIFY_UNVERIFIED;
         atlas_verify_conflict cf_val = ATLAS_CONFLICT_NONE;
+        atlas_verify_basis basis_val = ATLAS_VERIFY_BASIS_UNKNOWN;
         if (state_text != NULL && !atlas_verify_state_parse(state_text, &st_val)) {
             atlas_db_finish(db, stmt);
             return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
@@ -1687,6 +1693,11 @@ atlas_status atlas_db_verify_result_latest(atlas_db *db, int64_t claim_id,
             return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
                                  "a stored verification result names an unrecognised conflict");
         }
+        if (basis_text != NULL && !atlas_verify_basis_parse(basis_text, &basis_val)) {
+            atlas_db_finish(db, stmt);
+            return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                                 "a stored verification result names an unrecognised basis");
+        }
         if (state_out != NULL) {
             *state_out = st_val;
         }
@@ -1695,6 +1706,9 @@ atlas_status atlas_db_verify_result_latest(atlas_db *db, int64_t claim_id,
         }
         if (stale_out != NULL) {
             *stale_out = sqlite3_column_int(stmt, 2) != 0;
+        }
+        if (basis_out != NULL) {
+            *basis_out = basis_val;
         }
         if (found_out != NULL) {
             *found_out = true;

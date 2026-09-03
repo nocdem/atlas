@@ -4625,6 +4625,440 @@ static void test_put_refuses_an_oversized_observed_at_before_queueing(void) {
  * with it into `tests/support/reconcile_env.h` -- nothing else in this
  * file calls it. */
 
+/* --- T15: the proposed patch ------------------------------------------------
+ *
+ * `atlas_memory_patch_build` re-extracts a registered source's *current*
+ * content and correlates each fresh candidate to a stored claim by anchor and
+ * exact text -- it does not run T8's pass. So these fixtures seed claims,
+ * anchors and `verify_results` rows directly, `test_memory_pack.c`'s own
+ * disclosed choice (`pk_claim`/`pk_anchor`/`pk_result`) for the identical
+ * reason stated there: this is about the patch function itself, not about
+ * T7/T8's extraction pipeline. A `t15_` prefix follows this file's own
+ * per-task naming (`t8_`, `t9_`, `t11_`) rather than reusing `pk_`, which
+ * names `test_memory_pack.c`'s own env type. */
+
+static void t15_register_source(t8env *e, const char *path, atlas_buf *uid_out, atlas_err *err) {
+    int64_t id = 0;
+    char now[64];
+    atlas_now_iso8601(now, sizeof now);
+    T_OK(atlas_db_memory_source_upsert(e->db, e->repo_id, ATLAS_MEMORY_SOURCE_REPO_FILE, path,
+                                       strlen(path), path, now, &id, uid_out, err),
+         err);
+}
+
+/* A claim, inserted directly rather than through
+ * `atlas_verify_intake_apply_in_tx` -- `pk_claim`'s own comment, verbatim
+ * reason. `text` must be byte-for-byte what the fixture's own memory file
+ * says on the line this claim stands for: `atlas_memory_patch_build`
+ * correlates a freshly re-extracted candidate to a claim by an exact text
+ * match under a shared anchor, so a claim whose stored text does not match
+ * the file's own bytes correlates to nothing. */
+static void t15_claim(t8env *e, const char *text, atlas_buf *uid_out, int64_t *id_out,
+                      atlas_err *err) {
+    atlas_verify_claim c;
+    atlas_verify_claim_init(&c);
+    c.repo_id = e->repo_id;
+    T_OK(atlas_buf_set_str(&c.text, text, err), err);
+    T_OK(atlas_buf_set_str(&c.domain, "test", err), err);
+    char now[64];
+    atlas_now_iso8601(now, sizeof now);
+    T_OK(atlas_db_verify_claim_insert(e->db, &c, now, err), err);
+    *id_out = c.id;
+    T_OK(atlas_buf_set(uid_out, c.uid.data, c.uid.len, err), err);
+    atlas_verify_claim_free(&c);
+}
+
+static void t15_anchor(t8env *e, const char *claim_uid, const char *path, atlas_err *err) {
+    T_OK(atlas_db_memory_anchor_add(e->db, e->repo_id, claim_uid, ATLAS_MEMORY_ANCHOR_PATH, path, err),
+         err);
+}
+
+/* A `verify_results` row, by raw SQL -- `pk_result`'s own shape, widened
+ * with an explicit `basis` rather than hardcoding `DETERMINISTIC`: T15's
+ * whole point is that "deterministically CONTRADICTED" is `state ==
+ * CONTRADICTED && basis == DETERMINISTIC` and nothing else, so a fixture
+ * that could only ever produce `DETERMINISTIC` could never exercise the
+ * distinction the widened `atlas_db_verify_result_latest` exists for. */
+static void t15_result(t8env *e, int64_t claim_id, const char *state, const char *basis,
+                       const char *conflict, atlas_err *err) {
+    char sql[512];
+    char now[64];
+    atlas_now_iso8601(now, sizeof now);
+    (void)snprintf(sql, sizeof sql,
+                  "INSERT INTO verify_results(claim_id, state, basis, confidence_score,"
+                  "  calibration, algorithm, family_version, conflict, stale, created_at)"
+                  " VALUES(%lld, '%s', '%s', 0, 'INSUFFICIENT_DATA', 'test', 1, '%s', 0, '%s');",
+                  (long long)claim_id, state, basis, conflict, now);
+    T_OK(atlas_db_exec_sql(e->db, sql, err), err);
+}
+
+/* A minimal `memory_generations` row, so `t15_diff` below has something to
+ * reference -- the row's own digests and identity are never read by
+ * anything these tests exercise, so arbitrary non-empty strings are honest. */
+static void t15_seed_generation(t8env *e, int64_t *gen_id_out, atlas_err *err) {
+    char now[64];
+    atlas_now_iso8601(now, sizeof now);
+    T_OK(atlas_db_memory_generation_insert(e->db, e->repo_id, 1, ATLAS_MEMORY_CAUSE_SOURCE_REVISION,
+                                           "deadbeef", "", "d", "s", 0, now, gen_id_out, err),
+         err);
+}
+
+static void t15_diff(t8env *e, int64_t generation_id, const char *claim_uid,
+                     atlas_memory_diff_kind kind, atlas_err *err) {
+    T_OK(atlas_db_memory_claim_diff_add(e->db, generation_id, claim_uid, kind, "", err), err);
+}
+
+/* Counts non-overlapping occurrences of `needle` in `haystack`. */
+static size_t t15_count(const char *haystack, const char *needle) {
+    size_t n = 0;
+    const char *p = haystack;
+    size_t nlen = strlen(needle);
+    while ((p = strstr(p, needle)) != NULL) {
+        n++;
+        p += nlen;
+    }
+    return n;
+}
+
+/* (a) One deterministically CONTRADICTED descriptive line among three
+ * healthy ones: the diff proposes exactly one deletion, its context lines
+ * are the source's own bytes, and the source file on disk is byte-identical
+ * after the build (`fx_tree_digest`) -- the local form of the repository's
+ * first hard rule, never modify a registered target repository from Atlas'
+ * own code. */
+static void test_patch_build_proposes_exactly_the_contradicted_line(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    t8env e;
+    t8_env_open(&e, &err);
+    const char *repo = fx_repo(&e.fx);
+
+    const char *l1 = "- `alpha.c` needs review of its checksum path";
+    const char *l2 = "- `beta.c` behaves correctly under load";
+    const char *l3 = "- `gamma.c` retries automatically on failure";
+    const char *l4 = "- `delta.c` logs every error condition";
+    char content[512];
+    (void)snprintf(content, sizeof content, "%s\n%s\n%s\n%s\n", l1, l2, l3, l4);
+    T_OK(fx_write(repo, "memo.md", content, &err), &err);
+    T_OK(fx_add_all(&e.fx, repo, &err), &err);
+    T_OK(fx_commit(&e.fx, repo, "seed", &err), &err);
+    t8_bind_head(&e, &err);
+
+    t8_seed_file(&e, "alpha.c", "1111111111111111111111111111111111111111111111111111111111111111",
+                &err);
+    t8_seed_file(&e, "beta.c", "2222222222222222222222222222222222222222222222222222222222222222",
+                &err);
+    t8_seed_file(&e, "gamma.c", "3333333333333333333333333333333333333333333333333333333333333333",
+                &err);
+    t8_seed_file(&e, "delta.c", "4444444444444444444444444444444444444444444444444444444444444444",
+                &err);
+
+    atlas_buf u1 = ATLAS_BUF_INIT, u2 = ATLAS_BUF_INIT, u3 = ATLAS_BUF_INIT, u4 = ATLAS_BUF_INIT;
+    int64_t i1 = 0, i2 = 0, i3 = 0, i4 = 0;
+    t15_claim(&e, l1, &u1, &i1, &err);
+    t15_claim(&e, l2, &u2, &i2, &err);
+    t15_claim(&e, l3, &u3, &i3, &err);
+    t15_claim(&e, l4, &u4, &i4, &err);
+    t15_anchor(&e, atlas_buf_cstr(&u1), "alpha.c", &err);
+    t15_anchor(&e, atlas_buf_cstr(&u2), "beta.c", &err);
+    t15_anchor(&e, atlas_buf_cstr(&u3), "gamma.c", &err);
+    t15_anchor(&e, atlas_buf_cstr(&u4), "delta.c", &err);
+    t15_result(&e, i1, "CONTRADICTED", "DETERMINISTIC", "CONTRADICTION", &err);
+    t15_result(&e, i2, "VERIFIED", "DETERMINISTIC", "NONE", &err);
+    t15_result(&e, i3, "VERIFIED", "DETERMINISTIC", "NONE", &err);
+    t15_result(&e, i4, "VERIFIED", "DETERMINISTIC", "NONE", &err);
+
+    atlas_buf source_uid = ATLAS_BUF_INIT;
+    t15_register_source(&e, "memo.md", &source_uid, &err);
+
+    char before[ATLAS_SHA256_HEX_LEN + 1u];
+    T_OK(fx_tree_digest(repo, before, &err), &err);
+
+    atlas_buf diff = ATLAS_BUF_INIT, findings = ATLAS_BUF_INIT;
+    T_OK(atlas_memory_patch_build(e.db, &e.repo, fx_data_dir(&e.fx), atlas_buf_cstr(&source_uid), &diff,
+                                  &findings, &err),
+         &err);
+
+    char after[ATLAS_SHA256_HEX_LEN + 1u];
+    T_OK(fx_tree_digest(repo, after, &err), &err);
+    T_CHECK_MSG(strcmp(before, after) == 0, "a patch build modified the repository");
+
+    size_t hunks = t15_count(atlas_buf_cstr(&diff), "@@ -");
+    T_CHECK_MSG(hunks == 1u, "expected exactly one hunk, got %zu; diff=\n%s", hunks,
+               atlas_buf_cstr(&diff));
+
+    char removed[256];
+    (void)snprintf(removed, sizeof removed, "-%s\n", l1);
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&diff), removed) != NULL,
+               "expected the contradicted line as a removal; diff=\n%s", atlas_buf_cstr(&diff));
+
+    char ctx2[256], ctx3[256], ctx4[256];
+    (void)snprintf(ctx2, sizeof ctx2, " %s\n", l2);
+    (void)snprintf(ctx3, sizeof ctx3, " %s\n", l3);
+    (void)snprintf(ctx4, sizeof ctx4, " %s\n", l4);
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&diff), ctx2) != NULL, "expected l2 as context; diff=\n%s",
+               atlas_buf_cstr(&diff));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&diff), ctx3) != NULL, "expected l3 as context; diff=\n%s",
+               atlas_buf_cstr(&diff));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&diff), ctx4) != NULL, "expected l4 as context; diff=\n%s",
+               atlas_buf_cstr(&diff));
+
+    char removed2[256], removed3[256], removed4[256];
+    (void)snprintf(removed2, sizeof removed2, "-%s\n", l2);
+    (void)snprintf(removed3, sizeof removed3, "-%s\n", l3);
+    (void)snprintf(removed4, sizeof removed4, "-%s\n", l4);
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&diff), removed2) == NULL, "l2 must not be proposed for removal");
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&diff), removed3) == NULL, "l3 must not be proposed for removal");
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&diff), removed4) == NULL, "l4 must not be proposed for removal");
+
+    T_CHECK_MSG(t15_count(atlas_buf_cstr(&findings), "RETAINED") == 3u,
+               "expected the three healthy lines to be findings, not hunks; findings=\n%s",
+               atlas_buf_cstr(&findings));
+
+    atlas_buf_free(&diff);
+    atlas_buf_free(&findings);
+    atlas_buf_free(&source_uid);
+    atlas_buf_free(&u1);
+    atlas_buf_free(&u2);
+    atlas_buf_free(&u3);
+    atlas_buf_free(&u4);
+    t8_env_close(&e);
+}
+
+/* (b) A drifted line -- CONTRADICTED, DETERMINISTIC, conflict IMPLEMENTATION
+ * -- produces a finding and no hunk. IMPLEMENTATION means the code diverged
+ * from what was approved; the approved thing is not the thing that is
+ * wrong, so proposing deletion here would be automatically adopting a
+ * design because current code implements it, a named non-goal of this
+ * season. */
+static void test_patch_build_implementation_conflict_is_a_finding_not_a_hunk(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    t8env e;
+    t8_env_open(&e, &err);
+    const char *repo = fx_repo(&e.fx);
+
+    const char *l1 = "- `epsilon.c` implements the approved widget design";
+    char content[256];
+    (void)snprintf(content, sizeof content, "%s\n", l1);
+    T_OK(fx_write(repo, "drift.md", content, &err), &err);
+    T_OK(fx_add_all(&e.fx, repo, &err), &err);
+    T_OK(fx_commit(&e.fx, repo, "seed", &err), &err);
+    t8_bind_head(&e, &err);
+    t8_seed_file(&e, "epsilon.c", "5555555555555555555555555555555555555555555555555555555555555555",
+                &err);
+
+    atlas_buf uid = ATLAS_BUF_INIT;
+    int64_t cid = 0;
+    t15_claim(&e, l1, &uid, &cid, &err);
+    t15_anchor(&e, atlas_buf_cstr(&uid), "epsilon.c", &err);
+    t15_result(&e, cid, "CONTRADICTED", "DETERMINISTIC", "IMPLEMENTATION", &err);
+
+    atlas_buf source_uid = ATLAS_BUF_INIT;
+    t15_register_source(&e, "drift.md", &source_uid, &err);
+
+    atlas_buf diff = ATLAS_BUF_INIT, findings = ATLAS_BUF_INIT;
+    T_OK(atlas_memory_patch_build(e.db, &e.repo, fx_data_dir(&e.fx), atlas_buf_cstr(&source_uid), &diff,
+                                  &findings, &err),
+         &err);
+
+    T_CHECK_MSG(diff.len == 0, "an IMPLEMENTATION-conflicted line must not be proposed; diff=\n%s",
+               atlas_buf_cstr(&diff));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&findings), "IMPLEMENTATION_DRIFT") != NULL,
+               "expected an IMPLEMENTATION_DRIFT finding; findings=\n%s", atlas_buf_cstr(&findings));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&findings), atlas_buf_cstr(&uid)) != NULL,
+               "expected the finding to name the claim; findings=\n%s", atlas_buf_cstr(&findings));
+
+    atlas_buf_free(&diff);
+    atlas_buf_free(&findings);
+    atlas_buf_free(&source_uid);
+    atlas_buf_free(&uid);
+    t8_env_close(&e);
+}
+
+/* (c) An unanchored line -- no backtick, no decision uid, no 40-hex commit --
+ * produces neither a hunk nor a finding: nothing here can correlate it to
+ * any stored assessment, and A9.2.2's asymmetry says that absence is not
+ * evidence either way. */
+static void test_patch_build_unanchored_line_produces_neither(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    t8env e;
+    t8_env_open(&e, &err);
+    const char *repo = fx_repo(&e.fx);
+
+    const char *l1 = "this note mentions nothing checkable at all";
+    char content[256];
+    (void)snprintf(content, sizeof content, "%s\n", l1);
+    T_OK(fx_write(repo, "plain.md", content, &err), &err);
+    T_OK(fx_add_all(&e.fx, repo, &err), &err);
+    T_OK(fx_commit(&e.fx, repo, "seed", &err), &err);
+    t8_bind_head(&e, &err);
+
+    atlas_buf source_uid = ATLAS_BUF_INIT;
+    t15_register_source(&e, "plain.md", &source_uid, &err);
+
+    atlas_buf diff = ATLAS_BUF_INIT, findings = ATLAS_BUF_INIT;
+    T_OK(atlas_memory_patch_build(e.db, &e.repo, fx_data_dir(&e.fx), atlas_buf_cstr(&source_uid), &diff,
+                                  &findings, &err),
+         &err);
+
+    T_CHECK_MSG(diff.len == 0, "an unanchored line must not be proposed; diff=\n%s",
+               atlas_buf_cstr(&diff));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&findings), "claim=") == NULL,
+               "an unanchored line must produce no per-line finding either; findings=\n%s",
+               atlas_buf_cstr(&findings));
+
+    atlas_buf_free(&diff);
+    atlas_buf_free(&findings);
+    atlas_buf_free(&source_uid);
+    t8_env_close(&e);
+}
+
+/* (d) A source with nothing to propose returns an empty diff and says so in
+ * findings -- both halves asserted, and closed by mutation (the T15 report
+ * records removing the summary-finding write and re-running this test). */
+static void test_patch_build_nothing_to_propose_says_so_in_findings(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    t8env e;
+    t8_env_open(&e, &err);
+    const char *repo = fx_repo(&e.fx);
+
+    T_OK(fx_write(repo, "quiet.md", "", &err), &err);
+    T_OK(fx_add_all(&e.fx, repo, &err), &err);
+    T_OK(fx_commit(&e.fx, repo, "seed", &err), &err);
+    t8_bind_head(&e, &err);
+
+    atlas_buf source_uid = ATLAS_BUF_INIT;
+    t15_register_source(&e, "quiet.md", &source_uid, &err);
+
+    atlas_buf diff = ATLAS_BUF_INIT, findings = ATLAS_BUF_INIT;
+    T_OK(atlas_memory_patch_build(e.db, &e.repo, fx_data_dir(&e.fx), atlas_buf_cstr(&source_uid), &diff,
+                                  &findings, &err),
+         &err);
+
+    T_CHECK_MSG(diff.len == 0, "an empty source must propose nothing; diff=\n%s",
+               atlas_buf_cstr(&diff));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&findings), "NONE_PROPOSED") != NULL,
+               "expected findings to say nothing was proposed; findings=\n%s",
+               atlas_buf_cstr(&findings));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&findings), "quiet.md") != NULL,
+               "expected findings to name the source's own path; findings=\n%s",
+               atlas_buf_cstr(&findings));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&findings), atlas_buf_cstr(&source_uid)) != NULL,
+               "expected findings to name the source uid; findings=\n%s", atlas_buf_cstr(&findings));
+
+    atlas_buf_free(&diff);
+    atlas_buf_free(&findings);
+    atlas_buf_free(&source_uid);
+    t8_env_close(&e);
+}
+
+/* Bonus, beyond the plan's four: a claim whose most recently recorded diff
+ * kind is SUPERSEDED is proposed for deletion even though it carries no
+ * CONTRADICTED result at all -- the predicate's second, independent OR-arm,
+ * exercised on its own rather than left implemented and untested. */
+static void test_patch_build_superseded_diff_kind_proposes_deletion(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    t8env e;
+    t8_env_open(&e, &err);
+    const char *repo = fx_repo(&e.fx);
+
+    const char *l1 = "- `zeta.c` needs another look before merging";
+    char content[256];
+    (void)snprintf(content, sizeof content, "%s\n", l1);
+    T_OK(fx_write(repo, "superseded.md", content, &err), &err);
+    T_OK(fx_add_all(&e.fx, repo, &err), &err);
+    T_OK(fx_commit(&e.fx, repo, "seed", &err), &err);
+    t8_bind_head(&e, &err);
+    t8_seed_file(&e, "zeta.c", "6666666666666666666666666666666666666666666666666666666666666666",
+                &err);
+
+    atlas_buf uid = ATLAS_BUF_INIT;
+    int64_t cid = 0;
+    t15_claim(&e, l1, &uid, &cid, &err);
+    t15_anchor(&e, atlas_buf_cstr(&uid), "zeta.c", &err);
+    /* Deliberately no verify_results row at all: state stays UNVERIFIED, so
+     * the deterministically-CONTRADICTED arm cannot be what proposes this
+     * line's deletion. */
+    int64_t gen_id = 0;
+    t15_seed_generation(&e, &gen_id, &err);
+    t15_diff(&e, gen_id, atlas_buf_cstr(&uid), ATLAS_MEMORY_DIFF_SUPERSEDED, &err);
+
+    atlas_buf source_uid = ATLAS_BUF_INIT;
+    t15_register_source(&e, "superseded.md", &source_uid, &err);
+
+    atlas_buf diff = ATLAS_BUF_INIT, findings = ATLAS_BUF_INIT;
+    T_OK(atlas_memory_patch_build(e.db, &e.repo, fx_data_dir(&e.fx), atlas_buf_cstr(&source_uid), &diff,
+                                  &findings, &err),
+         &err);
+
+    char removed[256];
+    (void)snprintf(removed, sizeof removed, "-%s\n", l1);
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&diff), removed) != NULL,
+               "a SUPERSEDED claim must be proposed for deletion; diff=\n%s", atlas_buf_cstr(&diff));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&findings), atlas_buf_cstr(&uid)) == NULL,
+               "a proposed deletion must not also be listed as a finding; findings=\n%s",
+               atlas_buf_cstr(&findings));
+
+    atlas_buf_free(&diff);
+    atlas_buf_free(&findings);
+    atlas_buf_free(&source_uid);
+    atlas_buf_free(&uid);
+    t8_env_close(&e);
+}
+
+/* Bonus, beyond the plan's four: EMPIRICAL-basis CONTRADICTED must not be
+ * treated as deterministically CONTRADICTED. This is the case the T15
+ * context exists for -- before `atlas_db_verify_result_latest` was widened
+ * to return `basis`, nothing distinguished this row from the DETERMINISTIC
+ * one in test (a), and this test fails against that narrower read. */
+static void test_patch_build_empirical_basis_is_not_deterministically_contradicted(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    t8env e;
+    t8_env_open(&e, &err);
+    const char *repo = fx_repo(&e.fx);
+
+    const char *l1 = "- `eta.c` fails under a specific load pattern";
+    char content[256];
+    (void)snprintf(content, sizeof content, "%s\n", l1);
+    T_OK(fx_write(repo, "empirical.md", content, &err), &err);
+    T_OK(fx_add_all(&e.fx, repo, &err), &err);
+    T_OK(fx_commit(&e.fx, repo, "seed", &err), &err);
+    t8_bind_head(&e, &err);
+    t8_seed_file(&e, "eta.c", "7777777777777777777777777777777777777777777777777777777777777777",
+                &err);
+
+    atlas_buf uid = ATLAS_BUF_INIT;
+    int64_t cid = 0;
+    t15_claim(&e, l1, &uid, &cid, &err);
+    t15_anchor(&e, atlas_buf_cstr(&uid), "eta.c", &err);
+    t15_result(&e, cid, "CONTRADICTED", "EMPIRICAL", "CONTRADICTION", &err);
+
+    atlas_buf source_uid = ATLAS_BUF_INIT;
+    t15_register_source(&e, "empirical.md", &source_uid, &err);
+
+    atlas_buf diff = ATLAS_BUF_INIT, findings = ATLAS_BUF_INIT;
+    T_OK(atlas_memory_patch_build(e.db, &e.repo, fx_data_dir(&e.fx), atlas_buf_cstr(&source_uid), &diff,
+                                  &findings, &err),
+         &err);
+
+    T_CHECK_MSG(diff.len == 0,
+               "an EMPIRICAL-basis CONTRADICTED claim must not be proposed; diff=\n%s",
+               atlas_buf_cstr(&diff));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&findings), "RETAINED") != NULL,
+               "expected a RETAINED finding; findings=\n%s", atlas_buf_cstr(&findings));
+
+    atlas_buf_free(&diff);
+    atlas_buf_free(&findings);
+    atlas_buf_free(&source_uid);
+    atlas_buf_free(&uid);
+    t8_env_close(&e);
+}
+
 static const atlas_test TESTS[] = {
     {"REPO_FILE reads tracked bytes", test_repo_file_reads_tracked_bytes},
     {"REPO_FILE missing path is ABSENT", test_repo_file_missing_path_is_absent},
@@ -4729,6 +5163,19 @@ static const atlas_test TESTS[] = {
      test_put_empty_content_is_a_zero_length_blob_not_null},
     {"Minor 4: memory.put refuses an oversized observed_at before queueing",
      test_put_refuses_an_oversized_observed_at_before_queueing},
+    /* T15: the proposed patch. */
+    {"(a) the one deterministically CONTRADICTED line is the only deletion proposed",
+     test_patch_build_proposes_exactly_the_contradicted_line},
+    {"(b) an IMPLEMENTATION conflict is a finding, never a hunk",
+     test_patch_build_implementation_conflict_is_a_finding_not_a_hunk},
+    {"(c) an unanchored line produces neither a hunk nor a finding",
+     test_patch_build_unanchored_line_produces_neither},
+    {"(d) nothing to propose returns an empty diff and says so in findings",
+     test_patch_build_nothing_to_propose_says_so_in_findings},
+    {"bonus: a SUPERSEDED diff kind proposes deletion on its own",
+     test_patch_build_superseded_diff_kind_proposes_deletion},
+    {"bonus: EMPIRICAL basis is not deterministically CONTRADICTED",
+     test_patch_build_empirical_basis_is_not_deterministically_contradicted},
 };
 
 ATLAS_TEST_MAIN("memory_reconcile", TESTS)

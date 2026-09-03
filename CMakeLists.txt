@@ -399,6 +399,14 @@ add_library(atlas_core STATIC
   # Atlas' own rows is named in `unknown_fields` and binds nothing -- a
   # trailer is a pointer, never proof and never authority.
   src/memory/trailer.c
+  # `patch.c` (T15) is the proposed patch: a unified diff against one
+  # registered source's current content, proposing only deletions, plus a
+  # findings list for everything else. Reads a source through the same T6
+  # path pack.c's build phase already uses (`atlas_memory_read_source`,
+  # A13-routed) and reads (never writes) `verify_*`/`memory_*` rows to decide
+  # what qualifies -- it opens no transaction, so it must run outside one,
+  # `atlas_memory_pack_build`'s own rule.
+  src/memory/patch.c
   ${ATLAS_UI_GEN}
 )
 

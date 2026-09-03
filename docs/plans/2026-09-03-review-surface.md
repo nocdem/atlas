@@ -553,11 +553,24 @@ The `%s` in the intent sentence is the offending field safe-encoded and truncate
 bytes; the `%s` in the duplicate sentence is the decision id, which is already a checked
 shape.
 
+**Amended during execution, 2026-09-04.** Two sentences the grammar's bullets require
+and this block did not carry, both written by T3 and adopted here rather than respelled:
+
+```
+review sheet line %zu: longer than %u bytes
+review sheet line %zu: %s
+```
+
+The first is the per-line bound; the second wraps `atlas_db_check_repo_name`'s own
+message for a repository field it refuses, so one grammar answers for the registry's.
+A third, produced by the walker rather than the parser, is in the next block.
+
 ### The refusal sentences (`atlas review apply`)
 
 ```
 --yes cannot apply a review sheet. Each entry needs its confirmation typed on an interactive terminal, and Atlas will not accept one from a flag, a pipe, the sheet itself or an environment variable.
 --json is not available for review apply: it is an interactive command. Use --check for a machine-readable dry run.
+review sheet: no entries; there is nothing to review
 ```
 
 Without a terminal on both standard streams the walker refuses with **the sentence
@@ -588,6 +601,17 @@ no such decision in %s                                MISSING
 no such repository                                    MISSING
 ```
 
+**Amended during execution, 2026-09-04.** Three lines this block did not carry, written
+by T4 against the human example above and adopted here rather than respelled. Each `%s`
+is a checked value, not untrusted text: the state name comes from
+`atlas_decision_state_name`, and the REFUSED message is the confirm's own.
+
+```
+%s at r%lld                                           APPLIED (state, revision)
+nothing was changed                                   ABANDONED
+<the confirm's own refusal message>                   REFUSED
+```
+
 ### The command's output
 
 Human, one line per entry then a totals line:
@@ -612,9 +636,9 @@ JSON (`--check` only):
 
 Exit codes: `0` when every entry ended `APPLIED` (or `READY` under `--check`); **`8`**
 when at least one entry ended otherwise — a command-specific code above the seven-value
-contract, following `gate`'s `8`/`9` (`cli.c:204`); `2` for a malformed sheet, `--yes`,
-`--json` without `--check`, or no terminal. A locked authority profile exits with
-whatever `atlas decision approve` exits with, because it is the same
+contract, following `gate`'s `8`/`9` (`cli.c:203`); `2` for a malformed sheet, a sheet
+with no entries, `--yes`, `--json` without `--check`, or no terminal. A locked
+authority profile exits with whatever `atlas decision approve` exits with, because it is the same
 `atlas_authority_require` call made first.
 
 ### The Review view's fixed sentences

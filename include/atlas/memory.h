@@ -492,6 +492,45 @@ atlas_status atlas_db_memory_generation_latest(atlas_db *db, int64_t repo_id, in
                                                atlas_buf *source_set_digest_out, bool *found_out,
                                                atlas_err *err);
 
+/* A12.1 T16. `memory diff --repo R --generation N`'s one read: every claim-diff
+ * row this repository's generation `N` recorded, in insertion order. A pure
+ * SELECT -- T17's grep rule is about `INSERT INTO memory_`, and this adds none
+ * -- so it is safe beside the writers above despite living in the same file.
+ *
+ * `*found_out` is whether generation `N` exists for this repository at all,
+ * checked independently of whether it produced any diff row: a generation
+ * that recorded a source revision with nothing to say about any individual
+ * claim is a real, empty answer, and "no such generation" is a different one.
+ * `cb` receives one row per diff entry; nothing here opens a transaction or
+ * forks a process. */
+typedef atlas_status (*atlas_memory_diff_row_cb)(const char *claim_uid, atlas_memory_diff_kind kind,
+                                                 const char *reason, void *ctx, atlas_err *err);
+atlas_status atlas_db_memory_generation_diffs_list(atlas_db *db, int64_t repo_id, int64_t generation,
+                                                   atlas_memory_diff_row_cb cb, void *ctx,
+                                                   bool *found_out, atlas_err *err);
+
+/* A12.1 T16. `memory pack --run UID`'s missing half: T13's reliance check
+ * (`atlas_db_memory_pack_reliance_set`) writes `reliance_checked`,
+ * `reliance_complete` and `reliance_claim_uids`, and nothing outside
+ * `db_memory.c` read any of the three before this -- context §7's finding.
+ * A pure SELECT, added beside `atlas_db_memory_pack_get` for the identical
+ * row it does not itself fetch these three columns of.
+ *
+ * `*found_out` is false and every out-param left at its zero when no pack row
+ * exists for this run at all -- the same "never gathered because never
+ * frozen" case `atlas_db_memory_pack_get` reports as not-found. A row that
+ * *does* exist but has never been reliance-checked ("--task preview" packs
+ * are never checked at all, and a frozen "--run" pack's chain may not have
+ * completed yet) reads `*found_out = true`, `*checked_out = false` -- the
+ * "never gathered" state, distinguished from "gathered zero"
+ * (`*checked_out = true`, `*complete_out = true`, an empty `*claim_uids_out`)
+ * and from "truncated" (`*checked_out = true`, `*complete_out = false`).
+ * `*claim_uids_out` is reset and left empty rather than NULL when there is
+ * nothing to report, `atlas_buf`'s own convention. */
+atlas_status atlas_db_memory_pack_reliance_get(atlas_db *db, const char *run_uid, bool *checked_out,
+                                               bool *complete_out, atlas_buf *claim_uids_out,
+                                               bool *found_out, atlas_err *err);
+
 /* Every distinct (kind, value) anchor ever recorded for this repository --
  * one row per repository fact a memory claim has anchored to, regardless of
  * how many claim uids (across how many remints) share it. The vanished-anchor

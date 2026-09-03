@@ -217,6 +217,24 @@ void atlas_cli_print_help(FILE *out) {
         "  verify policy              the root-owned verification policy; opens no index\n"
         "  version                    print the version\n"
         "  help                       print this help\n");
+    /* A12.1 T16. A sixth split, for the reason the fifth exists: the seven
+     * `memory` lines pushed the string past the guaranteed literal length
+     * again. */
+    (void)fprintf(
+        out,
+        "  memory status [--repo NAME]  registered sources, versions, generation, and\n"
+        "                             whether a pass is owed; states the root-owned\n"
+        "                             memory-source policy even when none is installed\n"
+        "  memory scan [--repo NAME]  read every registered EXTERNAL_* source as this\n"
+        "                             account and submit it (memory.put)\n"
+        "  memory reconcile --repo NAME  ask the daemon to reconcile now; accepted, not\n"
+        "                             completed -- poll `memory status` afterward\n"
+        "  memory pack --repo NAME --task TEXT   preview a Canonical Context Pack\n"
+        "  memory pack --repo NAME --run RUN     show a run's frozen pack\n"
+        "  memory diff --repo NAME --generation N   one reconciliation's per-claim diff\n"
+        "  memory patch --repo NAME --source UID    a proposed deletion-only patch\n"
+        "  memory trailer --run RUN --reason UID    compose a commit trailer block\n"
+        "  memory trailer --commit OID --repo NAME  show a commit's recorded binding\n");
     /* Split because ISO C only guarantees 4095-byte string literals, and
      * A3's commands pushed the single literal past it. Same reason a migration
      * is a list of statement groups rather than one string. */
@@ -250,6 +268,10 @@ void atlas_cli_print_help(FILE *out) {
         "                             says what to create, on list/search/for-file it filters,\n"
         "                             and a revision can never change it\n"
         "  --revision N               decision show/approve: a specific revision\n"
+        "  --run RUN                  memory pack/trailer: a run uid\n"
+        "  --generation N             memory diff: which reconciliation to show\n"
+        "  --source UID               memory patch: a registered source uid\n"
+        "  --reason UID               memory trailer: a change-reason uid\n"
         "  --at OID                   gate check/show: the exact state to assess\n"
         "  --by ID                    decision supersede: the replacement decision\n"
         "  --format markdown|json     decision export: the output form\n"
@@ -370,6 +392,34 @@ static atlas_status parse_args(cli_state *st, int argc, char **argv, bool *want_
                 }
                 st->opts.task = argv[++i];
                 st->opts.job.task = st->opts.task;
+            } else if (strcmp(a, "--run") == 0) {
+                /* A12.1 T16. `memory pack --run UID` / `memory trailer --run
+                 * UID`. New: no earlier command took a bare "--run". */
+                if (i + 1 >= argc) {
+                    return atlas_err_set(err, ATLAS_ERR_USAGE, "--run needs a run uid");
+                }
+                st->opts.memory.run = argv[++i];
+            } else if (strcmp(a, "--generation") == 0) {
+                if (i + 1 >= argc) {
+                    return atlas_err_set(err, ATLAS_ERR_USAGE, "--generation needs a number");
+                }
+                atlas_status ts =
+                    parse_long(argv[++i], "--generation", &st->opts.memory.generation, err);
+                if (ts != ATLAS_OK) {
+                    return ts;
+                }
+            } else if (strcmp(a, "--source") == 0) {
+                /* A12.1 T16. `memory patch --source UID`. New. */
+                if (i + 1 >= argc) {
+                    return atlas_err_set(err, ATLAS_ERR_USAGE, "--source needs a source uid");
+                }
+                st->opts.memory.source = argv[++i];
+            } else if (strcmp(a, "--reason") == 0) {
+                /* A12.1 T16. `memory trailer --run UID --reason UID`. New. */
+                if (i + 1 >= argc) {
+                    return atlas_err_set(err, ATLAS_ERR_USAGE, "--reason needs a change reason uid");
+                }
+                st->opts.memory.reason = argv[++i];
             } else if (strcmp(a, "--max-tokens") == 0) {
                 if (i + 1 >= argc) {
                     return atlas_err_set(err, ATLAS_ERR_USAGE, "--max-tokens needs a number");
@@ -676,6 +726,11 @@ static atlas_status parse_args(cli_state *st, int argc, char **argv, bool *want_
                                              ATLAS_DECISION_MAX_LINKS);
                     }
                     st->opts.decision.commits[st->opts.decision.commit_count++] = v;
+                    /* A12.1 T16. `memory trailer --commit OID --repo R` reads
+                     * its own field. One flag fills both, `--repo`'s own
+                     * precedent above: this branch is reached first and
+                     * `memory`'s dispatch never sees `--commit` at all. */
+                    st->opts.memory.commit = v;
                 } else if (strcmp(a, "--why") == 0) {
                     st->opts.decision.why = v;
                 } else if (strcmp(a, "--provenance") == 0) {
@@ -2546,6 +2601,23 @@ static bool remote_serves(const cli_state *st) {
     if (strcmp(cmd, "context") == 0) {
         return strcmp(sub, "build") == 0;
     }
+    /* A12.1 T16. `status`, `scan` and `reconcile` are served: `scan` and
+     * `reconcile` unconditionally submit through the daemon's own operator
+     * methods (T11's `memory.put`/`memory.reconcile`) and never dereference
+     * `ctx` at all (`src/core/service_memory.c`'s `atlas_service_memory_scan`/
+     * `_reconcile` take no `ctx` parameter), which is exactly the surface an
+     * A7.1 account with no local database handle needs -- so serving them is
+     * safe by construction, not merely untested. `status` reads through the
+     * existing `memory.status` operator method exactly as the local read
+     * does, `sem_status`'s own shape. `pack`, `diff`, `patch` and `trailer`
+     * have no remote form in this build -- they fall through to the generic
+     * refusal below, which is honest about it: a read with no remote form is
+     * a real, if disclosed, gap (see `src/core/service_memory.c`'s header),
+     * not the "write or typo" pair the refusal's own wording assumes. */
+    if (strcmp(cmd, "memory") == 0) {
+        return strcmp(sub, "status") == 0 || strcmp(sub, "scan") == 0 ||
+               strcmp(sub, "reconcile") == 0;
+    }
     /* Served over the socket and by nothing else: the operations table lives in
      * the daemon's memory, so there is no local form of this question and never
      * will be. */
@@ -2602,7 +2674,7 @@ static bool is_a_command(const char *cmd) {
         "diff",    "daemon",  "sync",      "events",  "code",    "decision", "gate",
         "job",     "dispatcher", "scanner", "backup", "maintenance", "service", "mcp", "hook",
         "integrate", "version", "help", "context", "operation", "api-key", "gateway",
-        "verify",   "plan",
+        "verify",   "plan",   "memory",
     };
     for (size_t i = 0; i < sizeof COMMANDS / sizeof COMMANDS[0]; i++) {
         if (strcmp(cmd, COMMANDS[i]) == 0) {
@@ -2679,6 +2751,121 @@ static atlas_status remote_refuse(const cli_state *st, atlas_err *err) {
                          "command list.",
                          st->command, st->operand_count > 0 ? " " : "",
                          st->operand_count > 0 ? st->operands[0] : "");
+}
+
+/* --- A12.1 T16: the `memory` command family ---------------------------------
+ *
+ * `job_render_ctx`/`job_open_late`/`emit_job`'s own shape, generalised across
+ * all seven forms rather than copied: the renderer document is opened at the
+ * first row a service call actually produces, never before, so a refusal that
+ * happens before any row exists never leaves a half-written document behind
+ * it (`job list`'s own comment explains why in full). `plural` is non-NULL
+ * only for the two forms that stream more than one row (`scan`, `diff`); every
+ * other form calls the sink exactly once. */
+typedef struct memory_render_ctx {
+    atlas_renderer *r;
+    cli_state *st;
+    const char *command;
+    const char *plural;
+    bool opened;
+    int64_t count;
+} memory_render_ctx;
+
+static atlas_status memory_open_late(memory_render_ctx *mc, atlas_err *err) {
+    if (mc->opened) {
+        return ATLAS_OK;
+    }
+    atlas_status st = renderer_open(mc->r, mc->st->opts.json, mc->st->out, mc->command, err);
+    if (st == ATLAS_OK && mc->plural != NULL) {
+        st = mc->r->v->list_begin(mc->r, mc->plural, err);
+    }
+    if (st == ATLAS_OK) {
+        mc->opened = true;
+    }
+    return st;
+}
+
+static atlas_status emit_memory(const atlas_memory_render *mr, void *ud, atlas_err *err) {
+    memory_render_ctx *mc = (memory_render_ctx *)ud;
+    atlas_status st = memory_open_late(mc, err);
+    if (st == ATLAS_OK) {
+        mc->count++;
+        st = mc->r->v->memory_item(mc->r, mr, err);
+    }
+    return st;
+}
+
+/* Closes what `memory_open_late` opened, or reports a refusal that happened
+ * before any row did -- `run_job`'s own two-branch ending, restated here
+ * because it belongs to this ctx type rather than `job_render_ctx`'s. */
+static atlas_status memory_finish(memory_render_ctx *mc, atlas_status result, atlas_err *err) {
+    if (!mc->opened) {
+        return result;
+    }
+    if (result == ATLAS_OK && mc->plural != NULL) {
+        result = mc->r->v->list_end(mc->r, "result", mc->plural, mc->count, err);
+    }
+    if (result == ATLAS_OK) {
+        result = renderer_close(mc->r, err);
+    } else {
+        renderer_abort(mc->r);
+    }
+    return result;
+}
+
+/* `ctx` may be NULL: `scan` and `reconcile` never dereference it (both always
+ * submit through the daemon's own operator methods, T11's own design, so
+ * there is nothing local to fall back to), and `status` falls back to the
+ * `memory.status` RPC when it is NULL. `pack`, `diff`, `patch` and `trailer`
+ * require it and refuse with a stated reason otherwise -- see
+ * `src/core/service_memory.c`'s header for why they have no remote form in
+ * this build. */
+static atlas_status run_memory(cli_state *st, atlas_ctx *ctx, atlas_renderer *r, atlas_err *err) {
+    if (st->operand_count == 0) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "usage: atlas memory <status|scan|reconcile|pack|diff|patch|trailer> "
+                             "...");
+    }
+    const char *sub = st->operands[0];
+    memory_render_ctx mc = {r, st, NULL, NULL, false, 0};
+    atlas_status result;
+
+    if (strcmp(sub, "status") == 0) {
+        mc.command = "memory status";
+        result = ctx != NULL ? atlas_service_memory_status(ctx, st->opts.repo, emit_memory, &mc, err)
+                             : atlas_service_memory_status_remote(st->opts.repo, emit_memory, &mc,
+                                                                  err);
+    } else if (strcmp(sub, "scan") == 0) {
+        mc.command = "memory scan";
+        mc.plural = "results";
+        int64_t count = 0;
+        result = atlas_service_memory_scan(st->opts.repo, emit_memory, &mc, &count, err);
+    } else if (strcmp(sub, "reconcile") == 0) {
+        mc.command = "memory reconcile";
+        result = atlas_service_memory_reconcile(st->opts.repo, emit_memory, &mc, err);
+    } else if (strcmp(sub, "pack") == 0) {
+        mc.command = "memory pack";
+        result = atlas_service_memory_pack(ctx, st->opts.repo, st->opts.task, st->opts.memory.run,
+                                           emit_memory, &mc, err);
+    } else if (strcmp(sub, "diff") == 0) {
+        mc.command = "memory diff";
+        mc.plural = "results";
+        int64_t count = 0;
+        result = atlas_service_memory_diff(ctx, st->opts.repo, st->opts.memory.generation,
+                                           emit_memory, &mc, &count, err);
+    } else if (strcmp(sub, "patch") == 0) {
+        mc.command = "memory patch";
+        result = atlas_service_memory_patch(ctx, st->opts.repo, st->opts.memory.source, emit_memory,
+                                            &mc, err);
+    } else if (strcmp(sub, "trailer") == 0) {
+        mc.command = "memory trailer";
+        result = atlas_service_memory_trailer(ctx, st->opts.memory.run, st->opts.memory.reason,
+                                              st->opts.memory.commit, st->opts.repo, emit_memory,
+                                              &mc, err);
+    } else {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "unknown memory subcommand \"%s\"", sub);
+    }
+    return memory_finish(&mc, result, err);
 }
 
 /* The semantic commands need a writable-or-readable handle on the index
@@ -4749,6 +4936,8 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
         result = run_verify(st, ctx, &r, err);
     } else if (strcmp(cmd, "decision") == 0) {
         result = run_decision(st, ctx, &r, limit, err);
+    } else if (strcmp(cmd, "memory") == 0) {
+        result = run_memory(st, ctx, &r, err);
     } else {
         result = atlas_err_set(err, ATLAS_ERR_USAGE,
                                "unknown command \"%s\" (try: atlas help)", cmd);

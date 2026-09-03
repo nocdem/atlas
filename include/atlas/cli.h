@@ -254,6 +254,23 @@ typedef struct atlas_cli_opts {
          * confidence, and named so that it cannot be mistaken for it. */
         long self_confidence;
     } verify;
+    /* A12.1 T16. `atlas memory pack|diff|patch|trailer`. `--repo` and `--task`
+     * are the flat top-level fields above (`context build`'s own precedent —
+     * one flag fills every field that needs it, `--repo`'s own parse branch
+     * already does this for `job.repo`). These five are new: `--run` names a
+     * frozen pack or a trailer's source run; `--generation` selects one of
+     * `memory diff`'s generations; `--source` names a registered source for
+     * `memory patch`; `--commit` is filled by the *same* branch that appends
+     * to `decision.commits[]` for `decision link add`, one flag serving two
+     * commands exactly as `--repo` already does; `--reason` names the change
+     * reason a composed trailer records. */
+    struct {
+        const char *run;
+        long generation;
+        const char *source;
+        const char *commit;
+        const char *reason;
+    } memory;
 } atlas_cli_opts;
 
 /* Runs one command line. `argv[0]` is the program name. Returns the process

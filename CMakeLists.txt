@@ -407,6 +407,15 @@ add_library(atlas_core STATIC
   # what qualifies -- it opens no transaction, so it must run outside one,
   # `atlas_memory_pack_build`'s own rule.
   src/memory/patch.c
+  # A12.1 T16. The `memory` command family's one service file: seven forms,
+  # one render struct (`atlas_memory_render`), one sink. `status` reads
+  # locally via `atlas_ctx_db(ctx)` when it can and falls back to the
+  # existing `memory.status` operator method otherwise; `scan` and
+  # `reconcile` always speak to the daemon, because the writer-thread job
+  # queue they submit to has no local equivalent. `pack`, `diff`, `patch`
+  # and `trailer` are local-only in this build — see the file's own header
+  # comment for the disclosed A7.1 gap.
+  src/core/service_memory.c
   ${ATLAS_UI_GEN}
 )
 

@@ -2573,6 +2573,257 @@ static atlas_status j_plan_item(atlas_renderer *r, const atlas_plan_render *pr, 
     return st;
 }
 
+/* --- A12.1 T16: the `memory` command family ---------------------------------
+ *
+ * One method, seven forms, `mr->form` the discriminator -- `j_plan_item`'s own
+ * shape for `in_list`. Encoding follows `h_memory_item`'s own header comment
+ * in `render_human.c` exactly, restated here because both renderers document
+ * their own value-by-value contract at the top of the file: RAW values
+ * (`registered_at`, `observed_at`) go through `json_safe()`; ALREADY-SAFE
+ * values (`path`, `scan_rel_path`, `pack_body`, `patch_diff`,
+ * `patch_findings`) are emitted as-is with an `_encoding: atlas-safe-1` label
+ * beside them (`src/ipc/server_orch.c`'s spelling); everything else is an
+ * Atlas-minted uid, hex digest, or closed-vocabulary name and needs neither. */
+static atlas_status j_memory_item(atlas_renderer *r, const atlas_memory_render *mr, atlas_err *err) {
+    atlas_json *j = r->j;
+    atlas_status st = mr->in_list ? atlas_json_obj_begin(j, err) : ATLAS_OK;
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(j, "form", mr->form, err);
+    }
+    if (st == ATLAS_OK && mr->repo != NULL) {
+        st = atlas_json_key_str(j, "repo", mr->repo, err);
+    }
+
+    if (st == ATLAS_OK && strcmp(mr->form, "status") == 0) {
+        st = atlas_json_key_str(j, "policy_state", mr->policy_state, err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "policy_reason", mr->policy_reason, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "policy_reason_detail", mr->policy_reason_detail, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "policy_path", mr->policy_path, err);
+        }
+        if (st == ATLAS_OK && mr->repo != NULL) {
+            st = atlas_json_key_str(j, "plan_for", mr->plan_for, err);
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_bool(j, "generation_found", mr->generation_found, err);
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_int(j, "generation", mr->generation, err);
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_str_opt(j, "head_commit", mr->head_commit, err);
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_key(j, "sources", err);
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_arr_begin(j, err);
+            }
+            for (size_t i = 0; st == ATLAS_OK && i < mr->source_count; i++) {
+                const atlas_memory_source_render *s = &mr->sources[i];
+                st = atlas_json_obj_begin(j, err);
+                if (st == ATLAS_OK) {
+                    st = atlas_json_key_str(j, "uid", s->uid, err);
+                }
+                if (st == ATLAS_OK) {
+                    st = atlas_json_key_str(j, "class", s->cls, err);
+                }
+                if (st == ATLAS_OK) {
+                    st = atlas_json_key_str(j, "path", s->path, err);
+                }
+                if (st == ATLAS_OK) {
+                    st = json_safe(j, &r->safe, "registered_at", s->registered_at, err);
+                }
+                if (st == ATLAS_OK) {
+                    st = atlas_json_key_bool(j, "has_version", s->has_version, err);
+                }
+                if (st == ATLAS_OK && s->has_version) {
+                    st = atlas_json_key_str(j, "version_uid", s->version_uid, err);
+                    if (st == ATLAS_OK) {
+                        st = atlas_json_key_str(j, "content_sha256", s->content_sha256, err);
+                    }
+                    if (st == ATLAS_OK) {
+                        st = atlas_json_key_int(j, "content_bytes", s->content_bytes, err);
+                    }
+                    if (st == ATLAS_OK) {
+                        st = json_safe(j, &r->safe, "observed_at", s->observed_at, err);
+                    }
+                    if (st == ATLAS_OK) {
+                        st = atlas_json_key_str_opt(j, "commit_oid", s->commit_oid, err);
+                    }
+                }
+                if (st == ATLAS_OK) {
+                    st = atlas_json_obj_end(j, err);
+                }
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_arr_end(j, err);
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_bool(j, "sources_truncated", mr->sources_truncated, err);
+            }
+        }
+    } else if (st == ATLAS_OK && strcmp(mr->form, "scan") == 0) {
+        st = atlas_json_key_bool(j, "no_sources", mr->scan_no_sources, err);
+        if (st == ATLAS_OK && !mr->scan_no_sources) {
+            st = atlas_json_key_str(j, "source", mr->scan_source_uid, err);
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_str(j, "rel_path_encoding", "atlas-safe-1", err);
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_str(j, "rel_path", mr->scan_rel_path, err);
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_bool(j, "put", mr->scan_put, err);
+            }
+            if (st == ATLAS_OK && mr->scan_put) {
+                st = atlas_json_key_str(j, "version", mr->scan_version_uid, err);
+                if (st == ATLAS_OK) {
+                    st = atlas_json_key_str(j, "content_sha256", mr->scan_content_sha256, err);
+                }
+                if (st == ATLAS_OK) {
+                    st = atlas_json_key_int(j, "content_bytes", mr->scan_content_bytes, err);
+                }
+                if (st == ATLAS_OK) {
+                    st = atlas_json_key_bool(j, "created", mr->scan_created, err);
+                }
+            } else if (st == ATLAS_OK) {
+                st = atlas_json_key_str(j, "outcome", mr->scan_outcome, err);
+            }
+        }
+    } else if (st == ATLAS_OK && strcmp(mr->form, "reconcile") == 0) {
+        st = atlas_json_key_bool(j, "accepted", mr->accepted, err);
+    } else if (st == ATLAS_OK && strcmp(mr->form, "pack") == 0) {
+        st = atlas_json_key_bool(j, "preview", mr->pack_preview, err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_bool(j, "found", mr->pack_found, err);
+        }
+        if (st == ATLAS_OK && !mr->pack_found) {
+            /* Kept apart deliberately: a run that has a pack for a different
+               repository is not the same fact as no run having a pack at
+               all, and collapsing them into one `found: false` would tell a
+               caller the wrong one. */
+            st = atlas_json_key_bool(j, "other_repo", mr->pack_other_repo, err);
+        }
+        if (st == ATLAS_OK && mr->pack_found) {
+            if (!mr->pack_preview) {
+                st = atlas_json_key_str_opt(j, "status", mr->pack_status, err);
+                if (st == ATLAS_OK) {
+                    st = atlas_json_key_str_opt(j, "which_moved", mr->pack_which_moved, err);
+                }
+                if (st == ATLAS_OK) {
+                    st = atlas_json_key_bool(j, "reliance_checked", mr->reliance_checked, err);
+                }
+                if (st == ATLAS_OK) {
+                    st = atlas_json_key_bool(j, "reliance_complete", mr->reliance_complete, err);
+                }
+                if (st == ATLAS_OK) {
+                    st = atlas_json_key_str(j, "reliance_claim_uids",
+                                            mr->reliance_claim_uids != NULL ? mr->reliance_claim_uids
+                                                                            : "",
+                                            err);
+                }
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_int(j, "claim_count", mr->pack_claim_count, err);
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_int(j, "excluded_count", mr->pack_excluded_count, err);
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_int(j, "unanchored_count", mr->pack_unanchored_count, err);
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_str(j, "digest", mr->pack_digest, err);
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_str(j, "body_encoding", "atlas-safe-1", err);
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_str(j, "body", mr->pack_body, err);
+            }
+        }
+    } else if (st == ATLAS_OK && strcmp(mr->form, "diff") == 0) {
+        st = atlas_json_key_bool(j, "generation_found", mr->diff_generation_found, err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_int(j, "generation", mr->diff_generation, err);
+        }
+        if (st == ATLAS_OK && mr->diff_generation_found) {
+            st = atlas_json_key_str(j, "claim", mr->diff_claim_uid, err);
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_str(j, "kind", mr->diff_kind, err);
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_str(j, "reason", mr->diff_reason != NULL ? mr->diff_reason : "",
+                                        err);
+            }
+        }
+    } else if (st == ATLAS_OK && strcmp(mr->form, "patch") == 0) {
+        st = atlas_json_key_str(j, "source", mr->patch_source_uid, err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "diff_encoding", "atlas-safe-1", err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "diff", mr->patch_diff, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "findings_encoding", "atlas-safe-1", err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(j, "findings", mr->patch_findings, err);
+        }
+    } else if (st == ATLAS_OK && strcmp(mr->form, "trailer") == 0) {
+        st = atlas_json_key_bool(j, "compose", mr->trailer_compose, err);
+        if (st == ATLAS_OK && mr->trailer_compose) {
+            st = atlas_json_key_str(j, "run", mr->trailer_run, err);
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_str(j, "block", mr->trailer_block, err);
+            }
+        } else if (st == ATLAS_OK) {
+            st = atlas_json_key_bool(j, "found", mr->trailer_found, err);
+            if (st == ATLAS_OK && mr->trailer_found) {
+                st = atlas_json_key_bool(j, "has_block", mr->trailer_has_block, err);
+                if (st == ATLAS_OK) {
+                    st = atlas_json_key_bool(j, "bound_hit", mr->trailer_bound_hit, err);
+                }
+                if (st == ATLAS_OK && mr->trailer_has_block) {
+                    st = atlas_json_key_str_opt(j, "run", mr->trailer_run, err);
+                    if (st == ATLAS_OK) {
+                        st = atlas_json_key_int(j, "generation", mr->trailer_generation, err);
+                    }
+                    if (st == ATLAS_OK) {
+                        st = atlas_json_key_bool(j, "context_digest_ok",
+                                                 mr->trailer_context_digest_ok, err);
+                    }
+                    if (st == ATLAS_OK) {
+                        st = atlas_json_key_bool(j, "decision_set_ok", mr->trailer_decision_set_ok,
+                                                 err);
+                    }
+                    if (st == ATLAS_OK) {
+                        st = atlas_json_key_str_opt(j, "change_reason", mr->trailer_change_reason_uid,
+                                                    err);
+                    }
+                    if (st == ATLAS_OK) {
+                        st = atlas_json_key_str(j, "unknown_fields",
+                                                mr->trailer_unknown_fields != NULL
+                                                    ? mr->trailer_unknown_fields
+                                                    : "",
+                                                err);
+                    }
+                }
+            }
+        }
+    }
+
+    if (st == ATLAS_OK && mr->in_list) {
+        st = atlas_json_obj_end(j, err);
+    }
+    return st;
+}
+
 const atlas_renderer_vtbl ATLAS_RENDERER_JSON = {
     j_begin,      j_end,          j_note_repo,    j_note_query,   j_list_begin,
     j_list_end,   j_doctor,       j_version,      j_repo_item,    j_repo_added,
@@ -2603,6 +2854,8 @@ const atlas_renderer_vtbl ATLAS_RENDERER_JSON = {
     j_apikey_created, j_apikey_listed, j_apikey_revoked,
     /* --- A12.0 --- */
     j_plan_item,
+    /* --- A12.1 T16 --- */
+    j_memory_item,
 };
 
 void atlas_render_error(FILE *out, FILE *errout, bool json, const char *command,

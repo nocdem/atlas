@@ -2818,6 +2818,226 @@ static atlas_status h_plan_item(atlas_renderer *r, const atlas_plan_render *pr, 
     return ATLAS_OK;
 }
 
+/* --- A12.1 T16: the `memory` command family ---------------------------------
+ *
+ * One method, seven forms, distinguished by `mr->form`. Encoding, value by
+ * value:
+ *
+ *   RAW (atlas_safe() at print): `source.registered_at`, `source.observed_at`
+ *   -- caller-supplied or reconciliation-pass timestamps, stored as plain
+ *   text and never validated against a closed vocabulary.
+ *
+ *   ALREADY-SAFE (printed as-is): every source's `path` (`path_text`);
+ *   `scan_rel_path` (the service layer's own `atlas_path_text_encode`);
+ *   `pack_body` (`src/memory/pack.c`'s `atlas_text_encode_safe` per claim
+ *   line, labelled `atlas-safe-1` below); `patch_diff`/`patch_findings`
+ *   (`src/memory/patch.c`'s identical per-line encoding, same label).
+ *
+ *   ATLAS-OWNED (no encoding needed): repository and source uids, hex
+ *   digests and commit oids, every vocabulary name (`policy_state`,
+ *   `plan_for`, `pack_status`, `diff_kind`, `scan_outcome`), the compiled-in
+ *   policy path, `policy_reason_detail` (a fixed compiled-in explanation),
+ *   `trailer_block` (composed from uids and digests only,
+ *   `atlas_memory_trailer_compose`'s own guarantee), and every decoded
+ *   netstring list (`reliance_claim_uids`, `trailer_unknown_fields`) --
+ *   every element either format ever carries is one of the tokens already
+ *   named here. */
+static atlas_status h_memory_status(atlas_renderer *r, const atlas_memory_render *mr) {
+    FILE *o = r->out;
+    (void)fprintf(o, "policy        %s (%s)\n", mr->policy_state, dash_if_empty(mr->policy_reason));
+    if (mr->policy_reason_detail != NULL && mr->policy_reason_detail[0] != '\0') {
+        (void)fprintf(o, "              %s\n", mr->policy_reason_detail);
+    }
+    (void)fprintf(o, "              policy file: %s\n", mr->policy_path);
+    if (mr->repo == NULL) {
+        return ATLAS_OK;
+    }
+    (void)fprintf(o, "repository    %s\n", mr->repo);
+    (void)fprintf(o, "plan_for      %s\n", dash_if_empty(mr->plan_for));
+    if (mr->generation_found) {
+        (void)fprintf(o, "generation    %lld", (long long)mr->generation);
+        if (mr->head_commit != NULL && mr->head_commit[0] != '\0') {
+            (void)fprintf(o, " at %s", mr->head_commit);
+        }
+        (void)fprintf(o, "\n");
+    } else {
+        (void)fprintf(o, "generation    none yet\n");
+    }
+    (void)fprintf(o, "sources       %zu\n", mr->source_count);
+    for (size_t i = 0; i < mr->source_count; i++) {
+        const atlas_memory_source_render *s = &mr->sources[i];
+        (void)fprintf(o, "  %-34s %-14s %s\n", s->uid, s->cls, s->path);
+        (void)fprintf(o, "    registered  %s\n", atlas_safe(&r->safe, dash_if_empty(s->registered_at)));
+        if (s->has_version) {
+            (void)fprintf(o, "    latest      %s (%lld bytes, sha256 %s)\n", s->version_uid,
+                          (long long)s->content_bytes, s->content_sha256);
+            (void)fprintf(o, "                observed %s%s%s\n",
+                          atlas_safe(&r->safe, dash_if_empty(s->observed_at)),
+                          s->commit_oid != NULL ? ", commit " : "",
+                          s->commit_oid != NULL ? s->commit_oid : "");
+        } else {
+            (void)fprintf(o, "    latest      none (never put, or not yet reconciled)\n");
+        }
+    }
+    if (mr->sources_truncated) {
+        (void)fprintf(o,
+                      "              (truncated: this repository has more registered sources "
+                      "than are shown above)\n");
+    }
+    return ATLAS_OK;
+}
+
+static atlas_status h_memory_scan(atlas_renderer *r, const atlas_memory_render *mr) {
+    FILE *o = r->out;
+    if (mr->scan_no_sources) {
+        (void)fprintf(o,
+                      "%-20s no EXTERNAL_* memory source is materialised for this repository "
+                      "yet -- run `atlas memory reconcile --repo %s` first\n",
+                      mr->repo, mr->repo);
+        return ATLAS_OK;
+    }
+    if (mr->scan_put) {
+        (void)fprintf(o, "%-20s %-40s put %s (%lld bytes, sha256 %s%s)\n", mr->repo,
+                      mr->scan_source_uid, mr->scan_version_uid, (long long)mr->scan_content_bytes,
+                      mr->scan_content_sha256, mr->scan_created ? ", new" : "");
+    } else {
+        (void)fprintf(o, "%-20s %-40s skipped: %s%s%s\n", mr->repo, mr->scan_source_uid,
+                      mr->scan_outcome, mr->scan_rel_path[0] != '\0' ? " path=" : "",
+                      mr->scan_rel_path);
+    }
+    return ATLAS_OK;
+}
+
+static atlas_status h_memory_pack(atlas_renderer *r, const atlas_memory_render *mr) {
+    FILE *o = r->out;
+    (void)fprintf(o, "repository    %s\n", mr->repo);
+    (void)fprintf(o, "kind          %s\n", mr->pack_preview ? "preview (--task)" : "frozen (--run)");
+    if (!mr->pack_found) {
+        if (mr->pack_other_repo) {
+            (void)fprintf(o, "\nthat run has a frozen context pack, but for a different "
+                             "repository -- not %s.\n",
+                          mr->repo);
+        } else {
+            (void)fprintf(o, "\nno such run has a frozen context pack.\n");
+        }
+        return ATLAS_OK;
+    }
+    if (!mr->pack_preview) {
+        (void)fprintf(o, "status        %s\n", dash_if_empty(mr->pack_status));
+        if (mr->pack_which_moved != NULL && mr->pack_which_moved[0] != '\0') {
+            (void)fprintf(o, "              %s\n", mr->pack_which_moved);
+        }
+        /* §7: T13's reliance check, undistorted into one bit. Four states:
+         * never gathered (not checked at all), gathered zero (checked,
+         * complete, no matched uid), complete with matches (checked,
+         * complete, at least one uid), and truncated (checked, incomplete). */
+        if (!mr->reliance_checked) {
+            (void)fprintf(o, "reliance      never gathered (no repo-tree task in this run has "
+                             "completed yet)\n");
+        } else if (mr->reliance_claim_uids == NULL || mr->reliance_claim_uids[0] == '\0') {
+            (void)fprintf(o, "reliance      gathered, %s: no flagged claim's anchor was touched\n",
+                          mr->reliance_complete ? "complete" : "incomplete");
+        } else {
+            (void)fprintf(o, "reliance      gathered, %s: %s\n",
+                          mr->reliance_complete ? "complete" : "incomplete",
+                          mr->reliance_claim_uids);
+        }
+    }
+    (void)fprintf(o, "claims        %lld selected, %lld excluded, %lld unanchored\n",
+                  (long long)mr->pack_claim_count, (long long)mr->pack_excluded_count,
+                  (long long)mr->pack_unanchored_count);
+    if (mr->pack_digest != NULL && mr->pack_digest[0] != '\0') {
+        (void)fprintf(o, "digest        %s\n", mr->pack_digest);
+    }
+    if (mr->pack_body != NULL && mr->pack_body[0] != '\0') {
+        (void)fprintf(o, "body (atlas-safe-1)\n%s\n", mr->pack_body);
+    }
+    return ATLAS_OK;
+}
+
+static atlas_status h_memory_diff(atlas_renderer *r, const atlas_memory_render *mr) {
+    FILE *o = r->out;
+    if (!mr->diff_generation_found) {
+        (void)fprintf(o, "%-20s generation %lld does not exist\n", mr->repo,
+                      (long long)mr->diff_generation);
+        return ATLAS_OK;
+    }
+    (void)fprintf(o, "%-40s %-13s %s\n", mr->diff_claim_uid, mr->diff_kind,
+                  dash_if_empty(mr->diff_reason));
+    return ATLAS_OK;
+}
+
+static atlas_status h_memory_patch(atlas_renderer *r, const atlas_memory_render *mr) {
+    FILE *o = r->out;
+    (void)fprintf(o, "repository    %s\n", mr->repo);
+    (void)fprintf(o, "source        %s\n", mr->patch_source_uid);
+    if (mr->patch_diff != NULL && mr->patch_diff[0] != '\0') {
+        (void)fprintf(o, "diff (atlas-safe-1)\n%s", mr->patch_diff);
+    }
+    if (mr->patch_findings != NULL && mr->patch_findings[0] != '\0') {
+        (void)fprintf(o, "findings (atlas-safe-1)\n%s", mr->patch_findings);
+    }
+    return ATLAS_OK;
+}
+
+static atlas_status h_memory_trailer(atlas_renderer *r, const atlas_memory_render *mr) {
+    FILE *o = r->out;
+    if (mr->trailer_compose) {
+        (void)fprintf(o, "run           %s\n", mr->trailer_run);
+        (void)fprintf(o, "block\n%s\n", dash_if_empty(mr->trailer_block));
+        return ATLAS_OK;
+    }
+    (void)fprintf(o, "repository    %s\n", mr->repo);
+    if (!mr->trailer_found) {
+        (void)fprintf(o, "\nno binding recorded for this commit -- it may not have been scanned "
+                         "yet, or it was fully examined and carries no Atlas-Provenance block. "
+                         "Compare against repositories.trailer_scan_high to tell the two apart.\n");
+        return ATLAS_OK;
+    }
+    (void)fprintf(o, "has_block     %s\n", yes_no(mr->trailer_has_block));
+    if (!mr->trailer_has_block) {
+        (void)fprintf(o, "bound_hit     %s\n", yes_no(mr->trailer_bound_hit));
+        return ATLAS_OK;
+    }
+    (void)fprintf(o, "run           %s\n", dash_if_empty(mr->trailer_run));
+    (void)fprintf(o, "generation    %lld\n", (long long)mr->trailer_generation);
+    (void)fprintf(o, "context_digest_ok  %s\n", yes_no(mr->trailer_context_digest_ok));
+    (void)fprintf(o, "decision_set_ok    %s\n", yes_no(mr->trailer_decision_set_ok));
+    (void)fprintf(o, "change_reason      %s\n", dash_if_empty(mr->trailer_change_reason_uid));
+    if (mr->trailer_unknown_fields != NULL && mr->trailer_unknown_fields[0] != '\0') {
+        (void)fprintf(o, "unknown_fields     %s\n", mr->trailer_unknown_fields);
+    }
+    return ATLAS_OK;
+}
+
+static atlas_status h_memory_item(atlas_renderer *r, const atlas_memory_render *mr, atlas_err *err) {
+    (void)err;
+    if (strcmp(mr->form, "status") == 0) {
+        return h_memory_status(r, mr);
+    }
+    if (strcmp(mr->form, "scan") == 0) {
+        return h_memory_scan(r, mr);
+    }
+    if (strcmp(mr->form, "reconcile") == 0) {
+        (void)fprintf(r->out, "%-20s reconciliation %s\n", mr->repo,
+                      mr->accepted ? "accepted" : "not accepted");
+        return ATLAS_OK;
+    }
+    if (strcmp(mr->form, "pack") == 0) {
+        return h_memory_pack(r, mr);
+    }
+    if (strcmp(mr->form, "diff") == 0) {
+        return h_memory_diff(r, mr);
+    }
+    if (strcmp(mr->form, "patch") == 0) {
+        return h_memory_patch(r, mr);
+    }
+    if (strcmp(mr->form, "trailer") == 0) {
+        return h_memory_trailer(r, mr);
+    }
+    return ATLAS_OK;
+}
+
 const atlas_renderer_vtbl ATLAS_RENDERER_HUMAN = {
     h_begin,      h_end,          h_note_repo,    h_note_query,   h_list_begin,
     h_list_end,   h_doctor,       h_version,      h_repo_item,    h_repo_added,
@@ -2848,4 +3068,6 @@ const atlas_renderer_vtbl ATLAS_RENDERER_HUMAN = {
     h_apikey_created, h_apikey_listed, h_apikey_revoked,
     /* --- A12.0 --- */
     h_plan_item,
+    /* --- A12.1 T16 --- */
+    h_memory_item,
 };

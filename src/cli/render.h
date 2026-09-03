@@ -272,6 +272,18 @@ typedef struct atlas_renderer_vtbl {
      * block, a task title, a revision's document — arrived safe-encoded from
      * the daemon and is printed as-is, like `job_item`'s task text. */
     atlas_status (*plan_item)(atlas_renderer *r, const atlas_plan_render *pr, atlas_err *err);
+
+    /* --- A12.1 T16: the `memory` command family ----------------------------
+     *
+     * One method for all seven forms (`status`/`scan`/`reconcile`/`pack`/
+     * `diff`/`patch`/`trailer`), `job_item`/`plan_item`'s own philosophy: the
+     * fields differ by which form produced the row, so a missing branch in
+     * one renderer is a gap in one method rather than a whole method nobody
+     * implemented. `mr->form` is the discriminator. Appended last for the
+     * same reason `plan_item` is: both positional initializer lists carry
+     * the same members in the same order, and a member added in the middle
+     * shifts every offset after it without a diagnostic. */
+    atlas_status (*memory_item)(atlas_renderer *r, const atlas_memory_render *mr, atlas_err *err);
 } atlas_renderer_vtbl;
 
 struct atlas_renderer {

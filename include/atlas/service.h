@@ -1987,6 +1987,169 @@ atlas_status atlas_service_sem_impact_remote(const char *name, const char *subje
 atlas_status atlas_service_sem_context_remote(const atlas_sem_context_req *req,
                                               atlas_sem_context_report *out, atlas_err *err);
 
+/* --- A12.1 T16: the `memory` command family ---------------------------------
+ *
+ * One render struct and one sink, `job_item`'s own philosophy carried across
+ * seven sub-commands instead of two shapes of one: `form` says which of
+ * `status`/`scan`/`reconcile`/`pack`/`diff`/`patch`/`trailer` produced this
+ * row, so a missing renderer branch is a silent gap in one method rather than
+ * a whole method nobody implemented. Every member is a borrowed pointer or a
+ * plain scalar, valid only for the sink call, exactly as `atlas_job_render`
+ * documents for the identical reason.
+ *
+ * `status`, `scan` and `reconcile` speak to the daemon's existing operator
+ * RPC methods (`memory.status`, `memory.put`, `memory.reconcile`, T11) —
+ * `scan`/`reconcile` unconditionally, because A9.2.7's writer-thread job queue
+ * has no local equivalent to call into, the same fact that makes A11.1's run
+ * driver have no offline path either. `pack`, `diff`, `patch` and `trailer`
+ * read already-materialised rows through `atlas_ctx_db(ctx)` and have **no
+ * remote form in this build** — `ctx == NULL` (an A7.1 deployment where the
+ * index is 0700 `atlasd`) refuses with a stated reason rather than
+ * dereferencing a NULL handle. This is a disclosed gap, not an oversight: see
+ * the T16 report for the reasoning and the backlog entry it recommends. */
+
+typedef struct atlas_memory_source_render {
+    const char *uid;
+    const char *cls;             /* atlas_memory_source_class_name() */
+    const char *path;             /* path_text; already encoded, printed as-is */
+    const char *registered_at;    /* raw; atlas_safe() at render */
+    bool has_version;
+    const char *version_uid;
+    const char *content_sha256;
+    int64_t content_bytes;
+    const char *observed_at;      /* raw; atlas_safe() at render */
+    const char *commit_oid;
+} atlas_memory_source_render;
+
+typedef struct atlas_memory_render {
+    /* "status" | "scan" | "reconcile" | "pack" | "diff" | "patch" | "trailer" */
+    const char *form;
+    bool in_list;   /* this call is one row inside list_begin/list_end */
+    bool detail;    /* job_item's own flag: a full view rather than a summary row */
+
+    const char *repo;
+
+    /* status: the root-owned system policy, loaded locally regardless of
+       transport -- a file read, never a database read, so it is always
+       present even when nothing else on this row could be determined.
+       `gateway status`'s own precedent, carried across the transport split it
+       does not have to make (see the T16 report's §5 finding). */
+    const char *policy_state;         /* "SYSTEM" | "LEGACY" */
+    const char *policy_reason;
+    const char *policy_reason_detail;
+    const char *policy_path;          /* the compiled-in constant */
+
+    /* status */
+    const char *plan_for;             /* atlas_memory_gen_cause_name() */
+    int64_t generation;
+    bool generation_found;
+    const char *head_commit;
+    atlas_memory_source_render sources[ATLAS_MEMORY_MAX_SOURCES];
+    size_t source_count;
+    bool sources_truncated;   /* true iff the repository has more registered
+                                  sources than this row array holds -- rows are
+                                  never deleted, so a policy edited over time
+                                  can exceed ATLAS_MEMORY_MAX_SOURCES; a caller
+                                  must be told rather than shown a silently
+                                  short list. */
+
+    /* scan: one row per source read, or per put outcome. `scan_no_sources` is
+       the finding a silent zero-put success must never produce: nothing
+       registered, or nothing materialised because no reconciliation pass has
+       run yet. */
+    const char *scan_source_uid;
+    const char *scan_rel_path;        /* path_text; empty for a *_FILE source */
+    const char *scan_outcome;         /* Atlas-authored token */
+    bool scan_put;
+    const char *scan_version_uid;
+    const char *scan_content_sha256;
+    int64_t scan_content_bytes;
+    bool scan_created;
+    bool scan_no_sources;
+
+    /* reconcile */
+    bool accepted;
+
+    /* pack. `pack_preview` is true for a freshly built `--task` pack (no
+       freshness verdict: nothing pinned it yet) and false for a frozen
+       `--run` one (`pack_found` says whether that run has one at all).
+       T13's reliance fields -- context §7's question, answered in the T16
+       report: rendered here, all three, undistorted into one bit. */
+    bool pack_found;
+    bool pack_other_repo;             /* true iff --run named a pack that
+                                          exists but belongs to a different
+                                          repository -- kept apart from
+                                          "no such run has a pack" (pack_found
+                                          false, pack_other_repo false), which
+                                          is a different fact and a caller
+                                          must not be told the wrong one. */
+    bool pack_preview;
+    const char *pack_status;          /* CURRENT | STALE; empty for a preview */
+    const char *pack_which_moved;
+    int64_t pack_claim_count;
+    int64_t pack_excluded_count;
+    int64_t pack_unanchored_count;
+    const char *pack_digest;
+    const char *pack_body;            /* already atlas-safe-1 encoded */
+    bool reliance_checked;
+    bool reliance_complete;
+    const char *reliance_claim_uids;  /* decoded, comma-joined; uids only */
+
+    /* diff: one row per claim in the named generation */
+    int64_t diff_generation;
+    bool diff_generation_found;
+    const char *diff_claim_uid;
+    const char *diff_kind;            /* atlas_memory_diff_kind_name() */
+    const char *diff_reason;
+
+    /* patch */
+    const char *patch_source_uid;
+    const char *patch_diff;           /* already atlas-safe-1 encoded unified diff */
+    const char *patch_findings;       /* already atlas-safe-1 encoded, one per line */
+
+    /* trailer: composed (`--run`+`--reason`) or shown (`--commit`+`--repo`) */
+    bool trailer_compose;
+    const char *trailer_block;        /* composed text; uids and digests only */
+    bool trailer_found;               /* show mode: whether a binding row exists */
+    bool trailer_has_block;
+    bool trailer_bound_hit;
+    const char *trailer_run;
+    int64_t trailer_generation;
+    bool trailer_context_digest_ok;
+    bool trailer_decision_set_ok;
+    const char *trailer_change_reason_uid;
+    const char *trailer_unknown_fields; /* decoded, comma-joined */
+} atlas_memory_render;
+
+typedef atlas_status (*atlas_memory_sink)(const atlas_memory_render *mr, void *ud, atlas_err *err);
+
+atlas_status atlas_service_memory_status(atlas_ctx *ctx, const char *repo, atlas_memory_sink sink,
+                                         void *ud, atlas_err *err);
+atlas_status atlas_service_memory_status_remote(const char *repo, atlas_memory_sink sink, void *ud,
+                                                atlas_err *err);
+
+/* No `ctx` parameter: unconditionally daemon-served, `atlas_service_run_drive`'s
+   own "no offline path" reason -- discovery goes through `memory.status` and
+   the write through `memory.put`, and neither has a local implementation to
+   fall back to. */
+atlas_status atlas_service_memory_scan(const char *repo, atlas_memory_sink sink, void *ud,
+                                       int64_t *count_out, atlas_err *err);
+atlas_status atlas_service_memory_reconcile(const char *repo, atlas_memory_sink sink, void *ud,
+                                            atlas_err *err);
+
+/* Local-only (`ctx` required); see the section comment above. */
+atlas_status atlas_service_memory_pack(atlas_ctx *ctx, const char *repo, const char *task,
+                                       const char *run, atlas_memory_sink sink, void *ud,
+                                       atlas_err *err);
+atlas_status atlas_service_memory_diff(atlas_ctx *ctx, const char *repo, int64_t generation,
+                                       atlas_memory_sink sink, void *ud, int64_t *count_out,
+                                       atlas_err *err);
+atlas_status atlas_service_memory_patch(atlas_ctx *ctx, const char *repo, const char *source_uid,
+                                        atlas_memory_sink sink, void *ud, atlas_err *err);
+atlas_status atlas_service_memory_trailer(atlas_ctx *ctx, const char *run, const char *reason,
+                                          const char *commit, const char *repo,
+                                          atlas_memory_sink sink, void *ud, atlas_err *err);
+
 #endif /* ATLAS_SERVICE_H */
 
 /* --- A9.2.1: the verification surface over the socket -----------------------

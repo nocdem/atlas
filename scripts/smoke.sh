@@ -206,6 +206,27 @@ plan_usage "a resume names the plan and nothing else" "do not apply" \
     plan run --resume p1 --goal "make it work"
 plan_usage "atlas plan show needs a revision" "--rev" plan show p1
 
+echo "== A12.1 T16: the memory command family exists in this binary"
+# The identical A9.2 lesson, for a seven-form command family added in one
+# season: every one of these must be a usage refusal (exit 2), never
+# "unknown command" from a forgotten COMMANDS[] entry. All are local -- no
+# daemon needed for a refusal that happens during argument parsing.
+plan_usage "atlas memory prints its own usage (exit 2)" \
+    "status|scan|reconcile|pack|diff|patch|trailer" memory
+plan_usage "memory pack needs exactly one of --task or --run" \
+    "exactly one of" memory pack --repo smoke
+plan_usage "memory diff needs a positive --generation" \
+    "positive integer" memory diff --repo smoke
+plan_usage "memory patch needs a --source" "which source" memory patch --repo smoke
+plan_usage "memory trailer needs a compose or a show form" \
+    "compose" memory trailer
+plan_usage "memory reconcile needs a --repo" "which repository" memory reconcile
+plan_usage "memory scan needs a --repo" "which repository" memory scan
+
+capture --json memory status --repo smoke \
+    && check_doc "memory status" --expect command="memory status" --expect form=status \
+                 --expect-raw ok=true --no-control
+
 echo "== A5: backup, verification, restore and maintenance"
 
 capture --json backup create "$WORK/smoke.db" \

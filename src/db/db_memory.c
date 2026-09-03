@@ -900,6 +900,137 @@ atlas_status atlas_db_memory_generation_latest(atlas_db *db, int64_t repo_id, in
     return st;
 }
 
+/* A12.1 T16. See the declaration in `memory.h` for the full contract. Two
+ * statements rather than one join: `memory_generations` may exist with zero
+ * `memory_claim_diffs` rows (a pass that recorded a source revision but had
+ * nothing to say about any individual claim), and a join would make that
+ * indistinguishable from "no such generation" -- both would return zero rows. */
+atlas_status atlas_db_memory_generation_diffs_list(atlas_db *db, int64_t repo_id, int64_t generation,
+                                                   atlas_memory_diff_row_cb cb, void *ctx,
+                                                   bool *found_out, atlas_err *err) {
+    if (found_out != NULL) {
+        *found_out = false;
+    }
+    if (db == NULL || cb == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "no generation diff listing to run");
+    }
+    static const char FIND[] =
+        "SELECT id FROM memory_generations WHERE repo_id = ?1 AND generation = ?2;";
+    sqlite3_stmt *fstmt = NULL;
+    atlas_status st = atlas_db_prepare(db, FIND, &fstmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(fstmt, 1, repo_id) != SQLITE_OK ||
+        sqlite3_bind_int64(fstmt, 2, generation) != SQLITE_OK) {
+        atlas_db_finish(db, fstmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the generation lookup");
+    }
+    int64_t generation_id = 0;
+    int rc = sqlite3_step(fstmt);
+    if (rc == SQLITE_ROW) {
+        generation_id = sqlite3_column_int64(fstmt, 0);
+    } else if (rc != SQLITE_DONE) {
+        st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot look up the generation");
+    }
+    atlas_db_finish(db, fstmt);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (generation_id == 0) {
+        return ATLAS_OK; /* *found_out stays false */
+    }
+    if (found_out != NULL) {
+        *found_out = true;
+    }
+
+    static const char SQL[] =
+        "SELECT claim_uid, kind, reason FROM memory_claim_diffs"
+        " WHERE generation_id = ?1 ORDER BY id ASC;";
+    sqlite3_stmt *stmt = NULL;
+    st = atlas_db_prepare(db, SQL, &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, generation_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the generation id");
+    }
+    while (st == ATLAS_OK && (rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        const char *claim_uid = (const char *)sqlite3_column_text(stmt, 0);
+        const char *kind_name = (const char *)sqlite3_column_text(stmt, 1);
+        const char *reason = (const char *)sqlite3_column_text(stmt, 2);
+        atlas_memory_diff_kind kind = ATLAS_MEMORY_DIFF_UNKNOWN;
+        if (kind_name == NULL || !atlas_memory_diff_kind_parse(kind_name, &kind)) {
+            /* A row this table's own CHECK constraint should make impossible.
+             * Reported rather than silently skipped, so a corrupt row is a
+             * finding and not a quietly shorter list. */
+            st = atlas_err_set(err, ATLAS_ERR_DB,
+                               "a stored claim diff carries an unrecognised kind");
+            break;
+        }
+        st = cb(claim_uid != NULL ? claim_uid : "", kind, reason != NULL ? reason : "", ctx, err);
+    }
+    if (st == ATLAS_OK && rc != SQLITE_DONE) {
+        st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot read the generation's claim diffs");
+    }
+    atlas_db_finish(db, stmt);
+    return st;
+}
+
+/* A12.1 T16. See the declaration in `memory.h` for the full contract and the
+ * four states `*checked_out`/`*complete_out`/`*claim_uids_out` together let a
+ * caller tell apart. */
+atlas_status atlas_db_memory_pack_reliance_get(atlas_db *db, const char *run_uid, bool *checked_out,
+                                               bool *complete_out, atlas_buf *claim_uids_out,
+                                               bool *found_out, atlas_err *err) {
+    if (found_out != NULL) {
+        *found_out = false;
+    }
+    if (checked_out != NULL) {
+        *checked_out = false;
+    }
+    if (complete_out != NULL) {
+        *complete_out = false;
+    }
+    if (claim_uids_out != NULL) {
+        atlas_buf_reset(claim_uids_out);
+    }
+    if (db == NULL || run_uid == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "no reliance lookup to run");
+    }
+    static const char SQL[] =
+        "SELECT reliance_checked, reliance_complete, reliance_claim_uids"
+        " FROM memory_context_packs WHERE run_uid = ?1;";
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(db, SQL, &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    st = atlas_db_bind_text_opt(db, stmt, 1, run_uid, err);
+    if (st == ATLAS_OK) {
+        int rc = sqlite3_step(stmt);
+        if (rc == SQLITE_ROW) {
+            if (checked_out != NULL) {
+                *checked_out = sqlite3_column_int64(stmt, 0) != 0;
+            }
+            if (complete_out != NULL) {
+                *complete_out = sqlite3_column_int64(stmt, 1) != 0;
+            }
+            if (claim_uids_out != NULL) {
+                st = take_col(claim_uids_out, stmt, 2, err);
+            }
+            if (st == ATLAS_OK && found_out != NULL) {
+                *found_out = true;
+            }
+        } else if (rc != SQLITE_DONE) {
+            st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot read the pack's reliance state");
+        }
+    }
+    atlas_db_finish(db, stmt);
+    return st;
+}
+
 /* T9 fix-round-1 added `ORDER BY kind, value` here so `compute_decision_set_
  * digest` (`src/memory/reconcile.c`) folds DECISION tuples in a stable order
  * -- without it, two runs over the exact same tuple set could concatenate

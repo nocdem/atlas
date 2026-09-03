@@ -34,6 +34,10 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "atlas/datadir.h"
+#include "atlas/db.h"
+#include "atlas/decision.h"
+#include "atlas/decision_ops.h"
 #include "atlas/gateway.h"
 #include "atlas/ipc.h"
 #include "atlas_test.h"
@@ -1477,6 +1481,229 @@ static void test_mission_control_reaches_the_verification_routes(void) {
     env_close(&e);
 }
 
+/* --- A15 T2: three routes forward one more parameter each -------------------- */
+
+/* Pulls a decision uid out of `decision propose`/`revise` human output, the way
+ * `tests/test_decision_operator.c` does: a fixed-length copy of the prefix plus
+ * its hex body, validated rather than merely found. */
+static void capture_decision_uid(const atlas_buf *out, char *buf, size_t n) {
+    const char *p = strstr(atlas_buf_cstr(out), ATLAS_DECISION_UID_PREFIX);
+    T_REQUIRE_MSG(p != NULL, "no decision uid in: %s", atlas_buf_cstr(out));
+    size_t len = strlen(ATLAS_DECISION_UID_PREFIX) + ATLAS_DECISION_UID_HEX;
+    T_REQUIRE(len + 1u <= n);
+    memcpy(buf, p, len);
+    buf[len] = '\0';
+    T_REQUIRE(atlas_decision_uid_is_valid(buf));
+}
+
+/* Counts non-overlapping occurrences of an exact substring. Used to prove
+ * "exactly one row", which a single `strstr` cannot. */
+static size_t count_occurrences(const char *haystack, const char *needle) {
+    size_t n = 0;
+    size_t nlen = strlen(needle);
+    const char *p = haystack;
+    while ((p = strstr(p, needle)) != NULL) {
+        n++;
+        p += nlen;
+    }
+    return n;
+}
+
+/* Approves `uid` in repository "proj" through the write point, without the
+ * CLI and without the daemon's operator-uid IPC group.
+ *
+ * The interactive `LOCAL_OPERATOR_CONFIRMED` channel needs a real terminal,
+ * and the daemon's `decision.approve` sits in the operator method group,
+ * reachable only from the peer a root-owned authority policy names — neither
+ * is something an unprivileged test can manufacture (A7.1). `atlas_decision_apply`
+ * is the same write point both of those reach, and it has no authority check
+ * of its own: that check lives in `atlas_service_decision_confirm`, at the CLI
+ * entry point. This is `tests/test_decision_operator.c:145`'s
+ * `approve_through_the_write_point`, verbatim, against the fixture's data
+ * directory rather than a local (daemonless) one.
+ *
+ * This opens a second, independent connection to the same SQLite file the
+ * fixture daemon's writer thread also has open, which is a deliberate,
+ * test-only bypass of invariant 11 ("exactly one process writes the index at
+ * a time") — there is no other route to an APPROVED record in a test, and
+ * `test_decision_operator.c` already establishes the precedent. It is safe
+ * here because the daemon reopens a fresh read-only handle per request (the
+ * A1 rule), so the committed write is visible on the next read, and both
+ * connections use SQLite's own busy-timeout (5 s) rather than colliding. */
+static void approve_decision_at_write_point(fixture *fx, const char *uid) {
+    atlas_err err;
+    atlas_err_init(&err);
+    atlas_buf db_path = ATLAS_BUF_INIT;
+    T_OK(atlas_datadir_db_path(fx_data_dir(fx), &db_path, &err), &err);
+    atlas_db *db = NULL;
+    T_OK(atlas_db_open(atlas_buf_cstr(&db_path), &db, &err), &err);
+
+    atlas_decision_op ch;
+    atlas_decision_op_init(&ch, ATLAS_DECISION_OP_CHALLENGE);
+    T_OK(atlas_buf_set_str(&ch.repo_name, "proj", &err), &err);
+    T_OK(atlas_buf_set_str(&ch.uid, uid, &err), &err);
+    ch.intent = ATLAS_DECISION_INTENT_APPROVE;
+    atlas_decision_result cr;
+    atlas_decision_result_init(&cr);
+    T_OK(atlas_decision_apply(db, &ch, &cr, &err), &err);
+
+    atlas_decision_op ap;
+    atlas_decision_op_init(&ap, ATLAS_DECISION_OP_APPROVE);
+    T_OK(atlas_buf_set_str(&ap.repo_name, "proj", &err), &err);
+    T_OK(atlas_buf_set_str(&ap.uid, uid, &err), &err);
+    T_OK(atlas_buf_set(&ap.token, cr.token.data, cr.token.len, &err), &err);
+    T_OK(atlas_buf_set_str(&ap.confirmation, cr.confirm, &err), &err);
+    atlas_decision_result ar;
+    atlas_decision_result_init(&ar);
+    T_OK(atlas_decision_apply(db, &ap, &ar, &err), &err);
+    T_CHECK(ar.state == ATLAS_DECISION_APPROVED);
+
+    atlas_decision_result_free(&ar);
+    atlas_decision_op_free(&ap);
+    atlas_decision_result_free(&cr);
+    atlas_decision_op_free(&ch);
+    atlas_db_close(db);
+    atlas_buf_free(&db_path);
+}
+
+/* T2: three existing route rows each forward one more parameter name the
+ * daemon already reads — `/api/v1/decision`'s `revision`, `/api/v1/gate`'s
+ * `decision`, and `/api/v1/code/impact`'s `symbol`. No row is added, no
+ * scope, no method, no migration. See
+ * `docs/plans/2026-09-03-review-surface.md`, "The three route rows, after
+ * T2", for the exact final shape.
+ *
+ * Through a browser session, as `test_mission_control_reaches_the_verification_routes`
+ * above does: `gui_env` opens a second, web-GUI-enabled gateway over the same
+ * fixture daemon, `/auth/login` exchanges the API key for a session cookie,
+ * and every route below is read through that cookie rather than a bearer
+ * token — because Mission Control, the reader this parameter reaches for, is
+ * a browser client. */
+static void test_the_review_parameters_reach_the_daemon(void) {
+    env e;
+    const char *scopes[] = {"repo:read", "decisions:read", "impact:read"};
+    env_open(&e, scopes, 3);
+
+    atlas_err err;
+    atlas_err_init(&err);
+    atlas_buf out = ATLAS_BUF_INIT;
+
+    /* Decision A: proposed, then revised, so revision 2 exists. Never
+     * approved — it stays PROPOSED for the whole test, which is what makes it
+     * usable below as (b)'s other half. */
+    char uid_a[64];
+    {
+        const char *propose[] = {"decision",   "propose", "proj",
+                                 "--title",    "Use WAL journalling",
+                                 "--decision", "Enable WAL on the index database.",
+                                 "--path",     "a.c"};
+        T_EQ_INT(run_cli_ex(&e, propose, sizeof propose / sizeof propose[0], true, &out, &err), 0);
+    }
+    capture_decision_uid(&out, uid_a, sizeof uid_a);
+    {
+        const char *revise[] = {"decision",   "revise",  "proj",
+                                 uid_a,        "--title", "Use WAL journalling, revised",
+                                 "--decision", "Enable WAL on the index database, now revised."};
+        T_EQ_INT(run_cli_ex(&e, revise, sizeof revise / sizeof revise[0], true, &out, &err), 0);
+    }
+
+    /* Decision B: proposed, then approved through the write point. */
+    char uid_b[64];
+    {
+        const char *propose[] = {"decision",   "propose", "proj",
+                                 "--title",    "Gate check target",
+                                 "--decision", "Something for the gate to assess."};
+        T_EQ_INT(run_cli_ex(&e, propose, sizeof propose / sizeof propose[0], true, &out, &err), 0);
+    }
+    capture_decision_uid(&out, uid_b, sizeof uid_b);
+    atlas_buf_free(&out);
+
+    approve_decision_at_write_point(&e.fx, uid_b);
+
+    atlas_gateway *g = NULL;
+    gui_env(&e, &g);
+    atlas_buf resp = ATLAS_BUF_INIT;
+
+    char body[512];
+    (void)snprintf(body, sizeof body, "{\"key\":\"%s\"}", e.token);
+    gui_request(g, "POST", "/auth/login", NULL, body, &resp);
+    T_EQ_INT(status_of(&resp), 200);
+    char cookie[128];
+    cookie_of(&resp, cookie, sizeof cookie);
+    T_REQUIRE_MSG(cookie[0] != '\0', "login set no session cookie");
+
+    /* (a) `revision` reaches `decision.get`. */
+    char path[256];
+    (void)snprintf(path, sizeof path, "/api/v1/decision?repo=proj&decision=%s&revision=1", uid_a);
+    gui_request(g, "GET", path, cookie, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 200);
+    T_CHECK_MSG(strstr(body_of(&resp), "\"number\":1") != NULL,
+                "revision=1 did not return revision 1: %s", body_of(&resp));
+    T_CHECK_MSG(strstr(body_of(&resp), "\"title\":\"Use WAL journalling\"") != NULL,
+                "revision=1 did not carry revision 1's title: %s", body_of(&resp));
+
+    (void)snprintf(path, sizeof path, "/api/v1/decision?repo=proj&decision=%s&revision=2", uid_a);
+    gui_request(g, "GET", path, cookie, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 200);
+    T_CHECK_MSG(strstr(body_of(&resp), "\"number\":2") != NULL,
+                "revision=2 did not return revision 2: %s", body_of(&resp));
+    T_CHECK_MSG(strstr(body_of(&resp), "\"title\":\"Use WAL journalling, revised\"") != NULL,
+                "revision=2 did not carry revision 2's title: %s", body_of(&resp));
+
+    (void)snprintf(path, sizeof path, "/api/v1/decision?repo=proj&decision=%s&revision=abc",
+                   uid_a);
+    gui_request(g, "GET", path, cookie, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 400);
+
+    /* (b) `decision` reaches `gate.check`, narrowing the assessment to one
+     * record: exactly one row naming <uid> when the record is APPROVED. */
+    (void)snprintf(path, sizeof path, "/api/v1/gate?repo=proj&decision=%s", uid_b);
+    gui_request(g, "GET", path, cookie, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 200);
+    char decision_field[96];
+    (void)snprintf(decision_field, sizeof decision_field, "\"decision\":\"%s\"", uid_b);
+    T_CHECK_MSG(count_occurrences(body_of(&resp), decision_field) == 1u,
+                "the approved decision did not appear exactly once: %s", body_of(&resp));
+    T_CHECK_MSG(strstr(body_of(&resp), uid_a) == NULL,
+                "asking about the approved decision also named the unrelated one: %s",
+                body_of(&resp));
+
+    /* What `gate.check` returns for a PROPOSED record — this plan does not
+     * claim it, so it is established here rather than assumed. Asking about
+     * A (still PROPOSED) must at least never answer with B's uid — the
+     * pre-fix defect is exactly that "decision" is dropped, so this request
+     * silently falls back to "every approved decision", which is B. */
+    (void)snprintf(path, sizeof path, "/api/v1/gate?repo=proj&decision=%s", uid_a);
+    gui_request(g, "GET", path, cookie, NULL, &resp);
+    T_CHECK_MSG(strstr(body_of(&resp), uid_b) == NULL,
+                "asking about the PROPOSED decision answered about the APPROVED one instead: %s",
+                body_of(&resp));
+    /* Established by running this: a PROPOSED record is never a candidate for
+     * `gate.check` at all (`src/core/service_gate.c:365` lists only
+     * documents with status "APPROVED"), so naming one that has never been
+     * approved narrows the assessment to zero items, and
+     * `atlas_gate_narrow_to_one` (`src/core/service_gate.c:456`) treats zero
+     * items as a refusal rather than an empty list: HTTP 404, with the
+     * message "no approved decision "<uid>" is attached to this repository".
+     * A caller cannot distinguish "this decision does not exist" from "this
+     * decision exists but was never approved" from this response alone. */
+    T_EQ_INT(status_of(&resp), 404);
+    T_CHECK_MSG(strstr(body_of(&resp), "no approved decision") != NULL,
+                "a PROPOSED record's gate check did not read as a refusal: %s", body_of(&resp));
+
+    /* (c) `symbol` reaches `code.impact`. Today this is refused — a "path" or
+     * a "symbol" is required, and the route drops `symbol` — which is exactly
+     * what Mission Control's Impact view sends. Fixed here. */
+    gui_request(g, "GET", "/api/v1/code/impact?repo=proj&symbol=main", cookie, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 200);
+    T_CHECK_MSG(strstr(body_of(&resp), "\"symbol\":\"main\"") != NULL,
+                "code/impact did not name the symbol: %s", body_of(&resp));
+
+    atlas_gateway_close(g);
+    atlas_buf_free(&resp);
+    env_close(&e);
+}
+
 static const atlas_test TESTS[] = {
     {"a scoped credential can call a tool", test_a_scoped_credential_can_call_a_tool},
     {"a tool outside the scopes is refused and hidden",
@@ -1505,6 +1732,7 @@ static const atlas_test TESTS[] = {
      test_a_credential_without_decisions_read_cannot_read_a_claim},
     {"mission control reaches the verification routes",
      test_mission_control_reaches_the_verification_routes},
+    {"the review parameters reach the daemon", test_the_review_parameters_reach_the_daemon},
     {"concurrent connections are safe", test_concurrent_connections_are_safe},
 };
 

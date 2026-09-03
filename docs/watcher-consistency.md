@@ -575,3 +575,25 @@ one the index stored either, and `link()` was already tried and eliminated for
 that reason. The cost is now bounded by the tree rather than by the send: dna
 re-hashes 2 271 files in about 1.3 s, where before the discovery ceiling was
 lifted it re-hashed 21 996 in 19.9 s.
+
+## A12.1 — the same tick now also asks about memory
+
+The watcher's own tick, already the home of the semantic-index sweep beside the
+reconciliation interval above, gained one more pure question this season: has a
+registered memory source's content moved, has the effective decision set moved,
+or has the indexed commit moved since the last reconciliation pass — asked with
+no dirty bit and no state of its own, the same discipline the semantic sweep
+already follows. Every registered repository source's current hash is already
+sitting in the ordinary file index regardless of whether the source is tracked
+by git, so the question costs no file read and no process; only when it answers
+yes, and only when the root-owned policy has explicitly turned automatic
+reconciliation on, is a bounded writer job enqueued. The compiled-in default for
+that policy key is off, unlike the semantic sweep it sits beside — reading files
+and writing verification claims automatically was not argued into a default this
+season the way automatic semantic maintenance was in an earlier one.
+
+This tick is a trigger and nothing more: it never opens a file itself, and the
+pass it may enqueue does its own reading entirely outside any transaction, for
+the same reason every other read on this page stays outside one. The full
+argument for the pass's own shape, its two triggers, and what a completed pass
+records is in `docs/context-reconciliation.md`.

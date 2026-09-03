@@ -1789,3 +1789,85 @@ cheaper, honest, and consistent with "a bound that is reached is refused, never 
 the cost of rejecting content some repository may legitimately hold. **Whichever is chosen,
 the current behaviour — silently storing less than was given — is the one option that should
 not stand.**
+
+## Four of six `atlas_verify_conflict` members still have no producer (2026-09-03)
+
+Recorded from A12.1's own work rather than found by it: `atlas_verify_conflict_settle` gave
+`CONTRADICTION` and `IMPLEMENTATION` their first producer this season, and the other four —
+`SUPERSESSION`, `SCOPE_MISMATCH`, `STALE_EVIDENCE`, `COMPETING_NORMATIVE` — remain exactly
+where they were, named in the vocabulary and wired to nothing. `docs/verification.md`'s own
+Conflicts section already says this plainly.
+
+`SUPERSESSION` is the one with a concrete, already-diagnosed dependency: its natural producer
+would need `verify_claims.superseded_by_claim_id`, which is read and filtered in three places
+and written by nothing — the entry above this one. The other three have no diagnosed
+dependency at all; nobody has yet asked what stored facts a `SCOPE_MISMATCH`,
+`STALE_EVIDENCE` or `COMPETING_NORMATIVE` producer would read. Recorded here as a single
+residual rather than four, because the shape of the gap — a vocabulary member that parses and
+is never produced — is one finding repeated four times, not four independent ones.
+
+## The reliance check is file-granular, and a symbol-only claim can never be a candidate (2026-09-03)
+
+A12.1's reliance check exists to catch a worker touching a file a stale or conflicted memory
+claim mentions. It works by intersecting a run driver's own observed changed-path list against
+a frozen pack's flagged anchors — but only the `PATH`-kind ones, because a changed-path list
+and a path anchor are the only two things on either side of that comparison that share a
+vocabulary at all. A claim anchored solely by a `SYMBOL` — a function or type name, never
+accompanied by a path anchor to the same claim — can never become a reliance candidate, even
+when the very file that defines that symbol is the one a worker changed.
+
+This is not an oversight so much as an unresolved design question: closing it would need a
+symbol-to-file mapping fed into the comparison, and Atlas already has one, in the structural
+index A3 maintains — the reliance check would then depend on that index's own currency, which
+today it does not, and the check's guarantee ("nothing about this comparison ever depends on
+an index that could itself be stale") would no longer hold without a separate argument for why
+the structural index is trustworthy at the moment a completion is recorded. Left open rather
+than half-solved.
+
+## A policy source with no repository qualifier multiplies claims, and nothing warns about the size (2026-09-03)
+
+A `memory_source` policy line with no `@repository` qualifier materialises for every currently
+registered repository — by design, so a machine-wide user memory file is read once and applies
+everywhere its author intended it to. The stated cost at the constant is that this is bounded
+by the existing per-repository source and claim ceilings and reported in `memory status`, never
+hidden. What is not built is any warning at the moment such a line is *added*: an operator
+adding one machine-wide source to a policy on a machine with sixty registered repositories gets
+no signal, at write time, that this one line is about to be read and extracted sixty times over.
+The per-repository ceilings mean this cannot silently exceed a bound nobody can see — but it can
+silently cost sixty reconciliation passes' worth of work that a narrower, `@repository`-scoped
+line would not have, and nothing today surfaces that at the point where the choice is made.
+
+## Whether the compiled-in default for automatic reconciliation should ever move off `DISABLED` (2026-09-03)
+
+`ATLAS_MEMORY_RECONCILE_DEFAULT` is `false`, and the root-owned policy's `memory_reconcile` key
+inherits that default when absent. A9.2.4 reversed a comparable default for semantic
+maintenance, arguing that the thing the opt-in actually protected was never code execution but
+authority and resource policy, and that a maintenance pass depending on an operator remembering
+to turn it on was itself the defect. A12.1 does not make the equivalent argument for
+reconciliation: reading files and writing verification claims is not the same resource shape as
+parsing a compilation database, and this season's own default stays conservative because no
+case for reversing it has been made, not because one was made and rejected. Whether it should
+ever move, and under what argument, is left open — the same way the bounded cross-run memory
+default from the previous season is left open — and the two are natural to revisit together,
+since both ask what a daemon may do on its own initiative with material nobody explicitly asked
+it to act on today.
+
+## A re-registered repository starts a fresh memory chain, with no reattachment (2026-09-03)
+
+No memory table this season created references `repositories` through anything but a plain
+integer id with no cascade — `verify_claims`' own shape, chosen so that removing a repository's
+registration row deletes no memory history. That is the easy half. The hard half this season
+did not build: when a repository is unregistered and later re-registered — the same working
+tree, the same git history, a fresh registry row and therefore a fresh internal repository id —
+nothing connects the new row's sources, versions, claims and generations back to the old ones.
+The old rows stand as history, orphaned under an id nothing currently active names, and the
+repository's memory effectively starts over.
+
+A4 already solved the analogous problem for decision documents: `repo_identity_hash` is a
+path-qualified lineage fingerprint precisely so a decision record can survive a repository being
+detached and reattached under a new row. Extending that same detach/attach machinery to the
+memory tables — recognising, at registration time, that a new row's repository identity matches
+an old row's, and re-pointing (or at least re-associating) the old memory chain onto the new id
+— is real, A4-grade work this season did not attempt. Recorded as a residual rather than a
+defect: nothing today claims memory survives a re-registration, so nothing is currently wrong,
+but a reader relying on continuity across one would be disappointed.

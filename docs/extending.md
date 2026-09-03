@@ -1123,3 +1123,151 @@ manifest on disk would be a promise about a mirror this process did not build,
 which is the shape of the cadence the scanner was once allowed to declare and
 which was written and reverted. Losing in-process memory must cost a full pass
 and nothing else, and a `full` directive must drop it.
+
+## A12.1 — reconciled model memory
+
+### Adding a memory source class
+
+Four exist: `REPO_FILE`, `REPO_DIR`, `EXTERNAL_FILE`, `EXTERNAL_DIR`. A fifth
+means: a name and spelling in `atlas_memory_source_class` and its
+name/parse pair in `src/memory/source.c`; a CHECK literal on
+`memory_sources.cls`; a case in `atlas_memory_source_class_is_repo`, which
+the policy value parser and the read path both consult to decide whether the
+class takes a repository-relative or an absolute path; and, the one that is
+easy to get backwards, a matching decision about **which principal reads
+it** — the daemon, through the same access A13 built, for a class inside a
+registered repository, or the operator's own CLI submitting through
+`memory.put` for a class outside every registered repository. Get that
+backwards and either the daemon gains a filesystem read path it has never
+had before, or an operator is asked to hand-carry bytes the daemon could
+safely read itself. Every read path is bounded (`ATLAS_MEMORY_MAX_SOURCE_BYTES`
+per file, `ATLAS_MEMORY_MAX_DIR_ENTRIES` per directory, refused rather than
+trimmed) and a new class inherits both bounds or states why it is exempt.
+
+### Adding a `memory_*` policy key
+
+Follows `client_uid`'s rule in both halves: a bound is checked with `>=`
+never `+ 1 >=`, and a list that would overflow is refused as malformed
+rather than silently truncated — a shortened list is one whose author and
+reader disagree about what is on it. An unrecognised key anywhere still
+drops the whole policy to legacy mode, so the binary must already be
+installed before a deployment writes the key. `memory_reconcile` is the
+precedent for a two-value key: stating it more than once is malformed too,
+stricter than a repeated list entry, because two lines disagreeing about
+whether a pass may run automatically is a policy nobody can read back
+correctly. Any new automatic-behaviour key should ask the same question
+`memory_reconcile` asks about its own default: reversing a season's
+compiled-in "off" needs the resource-and-authority argument A9.2.4 made for
+semantic maintenance, not merely a policy key existing to carry a different
+answer.
+
+### Adding a diff kind or an anchor kind
+
+A `memory_claim_diffs.kind` member needs the CHECK literal, the C enum member
+after the seven existing non-zero ones (so no stored ordinal moves), and a
+place in `atlas_memory_diff_kind_name`/`_parse`. Keep `UNKNOWN` the
+unparseable zero: the CHECK must never admit its stored spelling, because a
+database row is not allowed to hold a value nothing can read back — the
+reason A11.0 states as "a stored run may never hold it." A genuinely new
+*positive* finding — Atlas evaluated something and could not settle what
+changed — is a new named member, not a repurposing of `UNKNOWN`; that is why
+`UNDETERMINED` exists rather than widening what `UNKNOWN` is allowed to mean.
+
+An anchor kind (`PATH`, `SYMBOL`, `DECISION`, `COMMIT`) needs the CHECK on
+`memory_claim_anchors.kind`, a case in the extractor's own token-recognition
+loop, and a decision about which index it resolves against — never the
+semantic index, which is A3's and A8-CI's own separation applied one layer
+out. State explicitly whether the new kind participates in the reliance
+check: today only `PATH` does, because a driver's own observation is a list
+of changed paths and nothing else, and a kind added without deciding this
+silently stays excluded rather than being a considered choice.
+
+### Adding a trailer field
+
+The six existing lines are a closed, fixed format — no `note`, `summary`,
+`detail` or `model` parameter, ever, on the same rule A10.1's memory-candidate
+struct already carries: the composer's guarantee that no prompt, memory body,
+credential or model name can appear is structural, not a filter, and it stays
+structural only if no such parameter is ever added. A genuinely new field
+needs: a line in the fixed format both the composer and the parser must agree
+on byte-for-byte, a column on `memory_trailer_bindings` recorded only when
+the field verifies, its name added to the closed set `unknown_fields` may
+carry, and — the question every existing field had to answer — **does this
+field survive an index rebuild, or does it point at a local, reassignable
+identifier?** Say which, in the same place the existing fields say it, before
+anyone relies on it after a restore.
+
+### The extractor's split, normalisation and anchor syntax is an epoch decision
+
+Bump `ATLAS_MEMORY_EXTRACTOR_VERSION` for any change to how a source is
+divided into candidates, how a candidate's text is normalised before hashing,
+or what counts as an anchor token — `ATLAS_CODE_ANALYZER_VERSION`'s rule,
+applied here: identical bytes must not silently start producing different
+propositions under an old version's own claims. There is no stored column
+recording which epoch produced a given claim, so a bump does not stale
+existing generations the way a semantic epoch bump does; it folds into the
+reconciler actor's own recorded version instead, which mints a new actor
+rather than reinterpreting old propositions under new rules. Both readings
+then stand, separately attributed — check this is still true before assuming
+a future change gets the same treatment for free.
+
+### Adding a verification channel
+
+`ATLAS_VERIFY_CHANNEL_DOCUMENT` is the precedent, and it is deliberately
+**internal**: no request may ever name it. The guard is structural, not a
+value comparison — `atlas_verify_channel_is_transport_selectable` is a
+switch with no `default:`, true for exactly the channels a transport may
+request, and `atlas_verify_channel_parse` matches names only among channels
+that answer true. A new internal channel gets a `false` there and nothing
+else needs to change for the parse to refuse it. **A rank comparison is never
+the guard for an internal channel** — ranking only closes the *upward*
+direction, and an internal channel that ranks below an existing
+transport-selectable one would otherwise be reachable by a peer simply
+asking for it by its weaker name. Every new channel needs both mappings
+(`atlas_verify_channel_actor_class`, `..._actor_identity`) added as new cases
+in switches with no `default:`, so the compiler — not a reviewer — finds
+every place a decision about the new member is still owed.
+
+### Adding a conflict-producer rule
+
+`atlas_verify_conflict_settle` is the one producer for `CONTRADICTION` and
+`IMPLEMENTATION`; the other four members of `atlas_verify_conflict` still
+have none. Wiring one up, or changing what an existing rule requires, is a
+new aggregation outcome for some assessment that previously produced a
+different one — bump `ATLAS_VERIFY_ALGORITHM` every time, without exception,
+the same rule that governs the aggregation weights themselves. A stored
+result's `conflict` column is only meaningful together with the
+`algorithm` string on the same row: a reader — including any future deletion
+predicate — must treat a conflict read from a pre-bump row as unknown on
+that axis, never as a settled `NONE`, or a row that never computed the newer
+rule will be misread as having satisfied it.
+
+### Changing any bound this season added
+
+`ATLAS_MEMORY_PACK_MAX_ANCHORS_PER_CLAIM` is the one to read first: its own
+comment states plainly that 32 is *picked*, not derived, because the
+quantity it bounds — anchors accumulated across passes on one claim identity
+— has no ceiling to derive a number from. Before raising it, re-read why it
+has no exit: nothing prunes a kept claim's anchors, so a higher number only
+raises how long a repository can go before the same refusal, it does not
+remove the refusal. Every other bound this season added
+(`ATLAS_MEMORY_MAX_SOURCES`, `ATLAS_MEMORY_MAX_PROPOSITIONS`,
+`ATLAS_MEMORY_MAX_SOURCE_BYTES`, `ATLAS_MEMORY_PACK_MAX_CLAIMS`,
+`ATLAS_MEMORY_TRAILER_PASS_MAX`) is refused past, never silently trimmed;
+keep that property when moving any of them, and state in the same comment
+whether the new value is derived from something or is a working figure like
+the anchor bound is.
+
+### Bounds this season added
+
+`ATLAS_MEMORY_MAX_SOURCES` (16), `ATLAS_MEMORY_MAX_SOURCE_BYTES` (256 KiB),
+`ATLAS_MEMORY_MAX_PROPOSITIONS` (128 per source per pass),
+`ATLAS_MEMORY_MAX_ANCHORS_PER_PROPOSITION` (8),
+`ATLAS_MEMORY_PACK_MAX_ANCHORS_PER_CLAIM` (32, picked, no exit),
+`ATLAS_MEMORY_MAX_DIR_ENTRIES` (64), `ATLAS_MEMORY_PACK_MAX_CLAIMS` (64),
+`ATLAS_MEMORY_PACK_MAX_BYTES` (64 KiB), `ATLAS_MEMORY_MAX_TOUCHED_PATHS`
+(256, shared with the run driver's own changed-path observation),
+`ATLAS_MEMORY_TRAILER_PASS_MAX` (512 commits per pass, its own cursor),
+`ATLAS_MEMORY_TRAILER_SCAN_MAX` (512 lines from a message's tail),
+`ATLAS_MEMORY_TRAILER_TAIL_BYTES_MAX` (65536 bytes, the backstop beneath the
+line bound), `ATLAS_MEMORY_SWEEP_INTERVAL_MS` (60000).

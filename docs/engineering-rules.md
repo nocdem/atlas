@@ -3480,3 +3480,159 @@ daemon keeps indexing it and keeps reporting the index current. Closing it needs
 a recorded observation time and a staleness rule. The stored record also does
 not say which principal produced a repository's facts — it is logged, not
 stored, and storing it needs a column and therefore a migration.
+
+## A12.1 layers — additions
+
+```
+include/atlas/memory.h    the five vocabularies, the bounds, every public
+                          atlas_memory_* entry point
+src/memory/source.c       vocabulary name/parse pairs, the policy value
+                          parser, class -> reading-principal map
+src/memory/read.c         reading one source's current bytes, by the right
+                          principal
+src/memory/extract.c      candidate split, normalisation, anchor resolution,
+                          verifier assignment
+src/memory/reconcile.c    observe phase, apply phase, generation, diff,
+                          trailer scan
+src/memory/pack.c         Context Pack build, freeze, freshness, render,
+                          compose, the reliance match
+src/memory/trailer.c      trailer compose and ingest
+src/memory/patch.c        the proposed-deletion patch for a hand-authored
+                          source
+src/db/db_memory.c        typed operations over migration 29's tables
+src/core/service_memory.c the service layer for the CLI family
+src/ipc/server_memory.c   memory.put, memory.status, memory.reconcile
+```
+
+`src/db/migrate.c` gains **migration 29**, eight tables (`memory_sources`,
+`memory_source_versions`, `memory_claim_anchors`, `memory_generations`,
+`memory_claim_diffs`, `memory_unanchored`, `memory_context_packs`,
+`memory_trailer_bindings`), and **migration 30**, two `ADD COLUMN`s:
+`repositories.trailer_scan_high` and `memory_trailer_bindings.bound_hit`.
+Migration 30 arrived inside a fix round, after two earlier notes in this
+season's own working record had said no further migration would be needed —
+both were wrong, and are corrected rather than repeated.
+
+Modified rather than created: `include/atlas/verify_ops.h` and
+`src/verify/intake.c` (`ATLAS_VERIFY_CHANNEL_DOCUMENT`, the
+`memory_version_uid` reference field); `include/atlas/verify.h`,
+`src/verify/verify.c` and `src/verify/autolifecycle.c` (the conflict
+producer, the aggregation algorithm's version bump); `src/daemon/writer.c`,
+`src/daemon/daemon_internal.h` and `src/daemon/watch.c` (the two job kinds,
+the watcher-tick sweep); `src/ipc/server.c` (dispatch and the operator method
+table); `include/atlas/orch_ops.h`, `src/db/db_orch.c`, `src/ipc/server_orch.c`,
+`src/orch/rundriver.c` and `src/orch/dispatch.c` (pack freeze, delivery,
+injection, the completion's `touched_paths`); and the CLI family across
+`src/cli/cli.c`, `src/cli/render.h`, `src/cli/render_human.c` and
+`src/cli/render_json.c`.
+
+## A12.1 rules — these are not negotiable
+
+The one-line forms are in `CLAUDE.md`; the full argument for every decision
+this season made is in `docs/context-reconciliation.md`. What follows here is
+the reasoning that is easiest to get wrong by rediscovering it from the code
+alone — the places a later editor is most likely to "fix" something that was
+already deliberate.
+
+**Why `SELF_DECLARED`, not `ATLAS_ATTESTED`, for a document actor.** Atlas
+genuinely did perform the read — opening the file, hashing it, resolving its
+commit — and that fact is recorded honestly as `ATLAS`-channel evidence. But
+the *identity* axis asks something different: how well Atlas knows who is
+speaking. Inside a memory file the speaker is unestablished by construction,
+and choosing the stronger identity because Atlas trusts its own read pipeline
+would confuse "Atlas read this" with "Atlas vouches for what it says." The
+arithmetic makes the stakes concrete: `ATLAS_ATTESTED` would give a memory
+file a prior of 400, ahead of a self-declared AI agent's 350 and behind only
+a human's 500 — a sentence typed into a project's own memory file would then
+outrank the model that wrote it speaking for itself, and every additional
+memory file would mechanically raise the ceiling on how confident Atlas could
+become about anything. `SELF_DECLARED` gives 350, the same tier as the model,
+which is the honest answer to "how sure is Atlas who is talking."
+
+**Why the anchor bound is reachable by accumulation and not by merging, and
+why that changes what the bound protects against.** The first explanation
+this season gave for how a claim could exceed its per-proposition anchor
+limit was that two memory documents asserting one proposition merge onto a
+shared claim and each contributes its own anchors. That explanation was
+wrong, checked and replaced: anchor resolution runs off a proposition's own
+text alone, with no reference to which document produced it, so two
+documents stating one proposition already produce byte-identical anchor
+tuples that a uniqueness constraint collapses before the claim-level bound
+could ever see two contributions. What actually grows without limit is the
+union *across reconciliation passes* on one claim identity that never
+changes: nothing deletes an anchor except the one narrow case of a
+proposition being re-minted under a new claim uid, so a claim whose text
+drifts slightly every few passes keeps every anchor it has ever resolved,
+forever. The distinction matters operationally, not just for accuracy: a fix
+aimed at "two documents" would have done nothing to the failure that is
+actually reachable, which needs only one source, read repeatedly, over time.
+
+**Why the pack's decision-set and source-set digests are computed live at
+build and freshness time, rather than read off the last stored generation
+row.** Reading them from the generation looks cheaper and is wrong for a
+reason a test would have caught but a design review might not: it couples
+two of the six pins together, so both move only when the generation moves,
+which collapses two of this project's required freshness scenarios into one
+and makes which reason gets reported depend on the order comparisons happen
+to run in rather than on what actually changed. Six independent pins need six
+independently computable values.
+
+**Why freshness is computed after the freeze transaction commits, not
+inside it.** The freeze itself must be a pure read so it can run inside the
+transaction that creates a run — no process, no file read. Freshness is a
+different question asked at a different moment, and one of its six
+comparands, the live source identity, can require opening the tree. Doing
+that inside the freezing transaction would violate the rule that no file
+read happens inside a write transaction; doing it strictly before the freeze
+would only make the answer stale sooner, never fresher, because five of the
+six comparands are rows only the writer thread itself ever writes and are
+therefore already exactly what an in-transaction read would have found.
+Computing it immediately after the commit is the only placement that is both
+legal and no worse than any alternative.
+
+**The "value read through a mirror, returned without the fact that it came
+from a mirror" defect recurred four times, at four different places to put
+the answer, and the pattern is worth remembering on its own.** A whole
+gitignored source directory could be silently invisible. One directory level
+in, a directory holding one tracked and one ignored file could report the
+tracked child with no sign anything was missing. One level further, a
+directory holding *only* ignored files produced zero items and a plain
+success, with no item left to carry the missing fact on. And finally, a
+caller of the read function could simply decline to receive the fact even
+where a place to put it existed. Each fix closed the specific case that had
+just been found, and the next case that turned up was the one with even less
+room to carry the same answer — until the last fix was to refuse a caller
+that will not accept the answer at all. Fixing an instance of a defect is not
+the same project as fixing the sentence the defect is an instance of, and the
+cheapest moment to ask "is there a smaller version of this same shape" is
+immediately after the current one is closed, not after the next one is
+found.
+
+**Why the trailer-ingestion cursor had to move off the generation row, and
+what migration 30 actually buys.** The first design stored the trailer scan's
+progress on the same row a reconciliation pass creates only when it finds
+something to record — which means a repository whose next several hundred
+commits carry no trailer block and no source change would never create a
+generation, never advance the cursor, and rescan the same window forever:
+*advancing required finding, and finding required advancing.* The fix gives
+the cursor its own column on `repositories`, written unconditionally on every
+scan regardless of what was found, which is what a cursor has to mean to
+behave like one. The bound this buys is statable: a repository with any
+finite commit history reaches its own `HEAD` for trailer purposes within a
+number of passes equal to its commit count divided by the per-pass scan
+bound, rounded up — never "eventually, if something happens to be found."
+
+**Why the deletion predicate for a hand-authored memory file routes every
+arm through one function, and why that structure is itself the fix.** The
+season's one specification-level defect was here: a plan's own interface
+comment allowed a claim's most recent diff being recorded as superseded to
+justify a deletion with no accompanying requirement that the claim also be
+descriptive, unconflicted and non-normative — an *open* `or`, sitting beside
+three absolute exclusions the same comment stated in the same breath. Because
+nothing yet produces that diff kind, the gap was unreachable in the shipped
+tree, which is exactly the condition under which a gap like this survives
+undetected the longest. The fix does not patch the one arm; it makes every
+arm's kind-specific test an argument to a single call that enforces the three
+absolutes unconditionally, so a fourth arm added later inherits them by
+having to go through that call to reach a deletion at all, rather than by
+whoever adds it remembering to copy three conditions by hand.

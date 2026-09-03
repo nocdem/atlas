@@ -95,6 +95,10 @@ two names. See "Repository and worktree identity" below.
 | `current_branch` | `NULL` when detached |
 | `head_state` | `born`, `unborn`, `detached`, or `unknown` |
 | `dirty`, `dirty_staged`, `dirty_unstaged`, `dirty_untracked`, `dirty_unmerged` | dirty-state summary observed by the last scan |
+| `scanner_uid` | the uid whose scanner may report about this repository; `0` means none assigned (migration 27, A13) |
+| `mirror_complete` | `1` only once a scanner-built mirror has finished publishing; cleared at the start of every run (migration 28, A13) |
+| `mirror_at` | when the mirror named by `mirror_complete` was last published (migration 28, A13) |
+| `trailer_scan_high` | the highest `commits.id` a memory-reconciliation pass has examined for a commit trailer, advanced on every scan regardless of what it found (migration 30, A12.1) |
 
 `last_scan_id` is a soft reference without a foreign key, because `scans` is
 created after `repositories` and the two would otherwise be circular. It is

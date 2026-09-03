@@ -1323,7 +1323,7 @@ the dispatcher's completion deserves the run driver's 300 s discipline, and
 `blocking_task` names the wrong task when the blocker ended
 RECOVERY_REQUIRED rather than FAILED (money, never authority).
 
-## Next, P0: A12.1 — reconciled model memory and revision-bound task context
+## A12.1 — reconciled model memory and revision-bound task context (items 1–7 and 9 shipped; item 8 outstanding)
 
 A12.0 proved that Atlas can ask one model for a plan and another to execute it,
 while keeping acceptance in Atlas' gates and the operator's policy. It did not
@@ -1434,15 +1434,35 @@ repository proves all of the following:
    retrieval and with the reconciled Context Pack, recording correctness,
    contradictions caught, omissions, token cost and model usage without calling
    one successful run a general result;
-9. rebuilding from Git trailers recovers the same run, memory and decision-set
-   associations, while malformed, unknown and deliberately altered trailers add
-   no authority and produce explicit `UNKNOWN`.
+9. rebuilding from a Git trailer resolves every reference against Atlas' own
+   rows and never adds authority: a malformed, unknown or deliberately
+   altered field produces explicit `UNKNOWN` rather than a wrong answer.
+   Three of the trailer's six lines survive an index rebuild — one names
+   original data assigned once and never recomputed, and two are
+   content-derived digests that verify again against any correctly rebuilt
+   index regardless of which internal row identifiers it assigns; the
+   memory-generation and change-reason lines name local, reassignable
+   identifiers a rebuild is not guaranteed to reproduce, and a reader seeing
+   `UNKNOWN` there must read it as the index having moved, never as
+   tampering.
 
 **Deliberate non-goals for this season.** Reading a model provider's hidden
 internal memory; mass-rewriting every note on every keystroke; using GitHub as a
 second source of Git truth; automatically adopting a design because current code
 implements it; and blocking unrelated work merely because some historical
 memory remains stale.
+
+**Season status.** Items 1 through 7 and item 9 are shipped, each with the
+assertion named in `docs/context-reconciliation.md`'s acceptance table.
+**Item 8 is outstanding, not partially met and not waived**: the one frozen
+pilot this item requires — one real task run twice at a pinned commit,
+comparing the previous season's bounded retrieval against this season's
+Context Pack — spends real money on a real model and was deferred by the
+operator to a later season. No measurement exists yet, and the bounded
+cross-run memory default from the previous season stays `OFF` until that
+pilot runs: this project's own rule that no evidence of a result is not
+evidence against one applies to its own acceptance, and this document does
+not pre-write the shape of a finding nobody has measured yet.
 
 ## Later: the review surface, and where a proposal is disposed of
 

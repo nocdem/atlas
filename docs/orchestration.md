@@ -1495,3 +1495,87 @@ That distinction is stated rather than closed: a completion that landed and
   to the plan's.** The correlation binds the job to the plan and the submit path
   already refuses a repository the policy does not permit, so this is a narrowing
   that is not yet made rather than a hole; it is recorded in `docs/backlog.md`.
+
+## A12.1 — the Context Pack
+
+Every run may now carry a second frozen artefact beside A10.1's cross-run
+memory manifest: a Canonical Context Pack, pinned to six stored values (the
+repository's identity, the indexed commit, the live source identity when
+that commit is dirty, the current memory generation, and digests of the
+effective decision set and the registered source set) and built entirely
+from stored rows, so it can be frozen inside the same transaction that
+creates the run. It lives in its own table, `memory_context_packs`, under
+`UNIQUE(run_uid)` — the freeze itself. This is a different object from
+`orch_run_memory`: that table is a cross-run retrieval manifest and this one
+is a single run's own pinned snapshot of project knowledge, and reusing one
+table for both would have made a stored row mean two different things
+depending on which season wrote it. The full argument for the six pins,
+what a claim has to look like to be included, and exactly what the rendered
+body contains, is in `docs/context-reconciliation.md`.
+
+### Delivery
+
+One place, the same place A10.1's package is appended: the run driver,
+after a task is claimed and before the worker exists. The task text comes
+first and stays first; when a pack exists, a `Context Pack status:` line —
+`CURRENT` or `STALE:<which pinned value moved>`, computed fresh at the
+moment of delivery and never stored — is appended ahead of the pack's own
+rendered body. Composition refuses to attach a pack body with no status line
+ahead of it, on purpose: a body with nothing labelling it is indistinguishable
+from a body that is current, which is exactly the failure acceptance
+requires this design to prevent. An empty pack appends nothing at all, the
+same rule A10.1's package already follows — an arm run without memory must
+differ from one run with it by exactly the pack's own bytes, never by a
+shorter section or a sentence saying there is none.
+
+The composer that performs this appending — `atlas_memory_pack_compose` —
+has **exactly two production callers**, the run driver's own `drive_one` and
+the dispatcher's own attempt execution in `src/orch/dispatch.c`, mirroring
+the two places A10.1's package has to reach: a worker the run driver starts
+directly, in the foreground, and a workspace-sibling worker a dispatcher
+process starts under a lease it holds. Before this season, one of those two
+call sites had no composer call at all, so A10.1's cross-run package reached
+a run driver's own jobs and silently never reached a dispatcher-run sibling
+attempt — a defect that predates this season and is now closed for both
+packages at once, because both are appended by the same call. Nothing yet
+asserts the caller count stays at two; `docs/backlog.md` carries that as a
+known residual shared with A10.1's own equivalent gap.
+
+### The reliance check
+
+After a worker finishes and the run driver has re-confirmed the pinned
+commit did not move, the driver — the one principal in this design allowed
+to hold the real tree, because the daemon cannot open a scanner-named tree
+and its mirror only ever reflects the scanner's last pass — lists the paths
+that actually changed (`git status --porcelain -z`, already an allowlisted
+read) and sends them on the completion. The daemon intersects that list
+against the pack's own flagged **path** anchors inside the same transaction
+that records the completion, and stores the result on the pack's own row.
+This is the one function anywhere that ever compares pack content against a
+worker's own activity, and it reads anchors Atlas already resolved against
+paths a driver already observed — never prose, never a claim's text, never a
+worker's log or artifact. A match is recorded and **settles nothing**: no
+gate fails, no run blocks, no acceptance verdict moves, because touching a
+file a stale claim mentions is evidence the claim was in scope, not proof a
+worker relied on it.
+
+A completion that never gathered any paths at all is kept distinguishable,
+all the way to the stored row, from one that gathered zero because nothing
+had changed — the wire carries an explicit "did I look" bit rather than
+inferring it from an empty list, after an early version let a failed
+gather's own honest "incomplete" flag get silently dropped by a serialiser
+that only sent it when the (now-empty) path list was non-empty.
+
+### The surface
+
+`memory pack --repo NAME --run RUN` is where the reliance columns this season
+wrote —
+whether a check ran, whether it was complete, and which claims it flagged —
+are actually shown; nothing outside the database layer read them before this
+command existed. All four observation states (never checked; checked and
+complete with nothing flagged; checked and complete with a flag; checked but
+known incomplete) stay distinguishable on both renderers.
+
+**No new RPC method, no MCP tool, no gateway route.** A pack is frozen on a
+submission an operator already made and delivered on a lease Atlas already
+grants; nothing here opens a new door to ask for one directly.

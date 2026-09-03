@@ -1,7 +1,34 @@
 # Atlas — working notes for Claude Code
 
 Atlas is a generic, headless engineering-memory and repository-intelligence CLI
-in C17. The current work is **A13**: the per-user scanner — a repository records
+in C17. The current work is **A12.1**: reconciled model memory — a registered
+memory file is read by whichever principal can actually read it, turned into
+ordinary verification claims by a deterministic pass that calls no model, and
+handed to a worker as one frozen Context Pack that states its own staleness
+rather than being trusted to have none. **A12.1 added migrations 29 and 30.**
+The sentence it exists for is
+
+> **MODEL MEMORY IS AN ATTESTATION, NOT PROJECT TRUTH.**
+
+A12.0 proved Atlas could route a plan through two different models; it did not
+prove either one entered its run with a coherent account of the project. A
+project memory file, a user memory file and a copied note can each preserve a
+different revision of the same claim, and handing all of them to a worker
+unreconciled is a larger unlabelled conflict, not more context. The season's
+sharpest finding was in its own new code: a repository-controlled filename
+could inject a second field into the verifier's own `key=value;` grammar and
+forge a `CONTRADICTED` verdict at full confidence about a file the anchor never
+named — closed at the parser, not by filtering the character that was found.
+
+**A claim a memory file asserts is `UNVERIFIED` until something that is not a
+memory file bears on it, and the reconciler approves, rejects, supersedes and
+resolves nothing.** Every row it writes still goes through the one write point
+verification has had since evidence was first submitted from outside Atlas'
+own process. See the A12.1 sections in `docs/context-reconciliation.md` — the
+season's own document — and in `docs/verification.md`, `docs/orchestration.md`,
+`docs/daemon-and-ipc.md`, `docs/engineering-rules.md` and `docs/extending.md`.
+
+The season before it, **A13**, was the per-user scanner — a repository records
 which uid's scanner may report about it, a scanner running as the tree's owner
 hands its bytes to the daemon, and the daemon indexes a tree it cannot open from
 the mirror those bytes build. **A13 added migrations 27 and 28.** The sentence
@@ -163,6 +190,7 @@ document that carries it:
 
 | Season | What it added | Document |
 | --- | --- | --- |
+| A12.1 | reconciled model memory: a registered file becomes a self-declared attestation, drift gets its first producer, and a run is handed one frozen, self-labelling Context Pack | `docs/context-reconciliation.md` |
 | A13 | the per-user scanner: a repository records whose scanner may report about it, and the daemon reads a tree it cannot open from that scanner's mirror | `docs/watcher-consistency.md` |
 | P0 | the watch budget derived from the kernel; a descriptor and a subscription made different things; an ignore answer nobody had for a path that did not exist yet | `docs/watcher-consistency.md` |
 | A12.0 | the planned run: a goal becomes one bounded plan document, and each stage is an ordinary run | `docs/orchestration.md` |
@@ -780,6 +808,47 @@ is not written down is one somebody deletes.** Both halves are load-bearing.
   phase it is already in. A failed renewal never kills the child.
 - **The run driver starts nothing in the background** — no scheduler, no polling,
   no timer, no model router, no second submit path.
+
+### A12.1 — reconciled model memory
+
+- **MODEL MEMORY IS AN ATTESTATION, NOT PROJECT TRUTH.** A memory file is a
+  `DOCUMENT` actor at `SELF_DECLARED` identity, weighted the same as a
+  self-declared AI agent and below a human, and a claim it asserts is
+  `UNVERIFIED` until something that is not a memory file bears on it.
+- **The reconciler creates no second write path.** Every row this season
+  writes still goes through the one function that has written every
+  verification row since evidence was first accepted from outside Atlas' own
+  process, and adding a parallel path is not an extension of this season.
+- **`ATLAS_VERIFY_CHANNEL_DOCUMENT` is internal, and the parse refusal is the
+  whole guard.** No transport can name it. A rank comparison alone would not
+  have been enough: the channel ranks below the operator's, so an operator
+  peer asking for it by name would otherwise be honoured.
+- **The reconciler approves, rejects, supersedes and resolves nothing.** The
+  one function that writes a decision-lifecycle transition still has exactly
+  three callers, and this season is not a fourth. Drift is a finding against
+  the implementation, never a rewrite of the decision, and a later timestamp
+  supersedes nothing.
+- **Extraction calls no model, ever.** A proposition with no anchor is
+  reported and never becomes a claim, because a candidate nobody is shown is
+  indistinguishable from one that never existed.
+- **The daemon opens no path a policy names for it.** A repository source is
+  read through the same access A13 already built; an external source is read
+  by the principal that can read it and carried to the daemon, never opened
+  by the daemon itself.
+- **A commit trailer confers nothing.** Resolution and digest verification
+  are the whole of ingestion, and every failure mode is `UNKNOWN` — a reader
+  seeing it must not read it as tampering.
+- **No branch anywhere reads a memory byte, a pack byte or a worker's
+  prose.** The reliance check intersects anchors Atlas already resolved
+  against paths a driver observed, and it settles nothing: no gate fails, no
+  run blocks, no acceptance verdict moves.
+- **Registry churn deletes no memory history**, and nothing this season
+  reattaches it either — a re-registered repository starts a fresh chain and
+  the old rows stand as history.
+- **No new thread, process, timer or background loop; no MCP tool; no
+  gateway route; no authority verb in any method name.** The pass is a
+  bounded writer job triggered by a pure derivation on the existing watcher
+  tick, or by an operator.
 
 ### A13 — the per-user scanner
 
@@ -1572,6 +1641,7 @@ emits its error document inside the result document it had already started, whic
 `docs/security/A7_THREAT_MODEL.md` · `docs/security/A7_SECURITY_REVIEW.md` ·
 `docs/security/A7_1_THREAT_MODEL.md` · `docs/security/A7_1_OPERATIONS.md` ·
 `docs/orchestration.md` · `docs/remote-access.md` · `docs/verification.md` ·
+`docs/context-reconciliation.md` ·
 `docs/semantic-freshness.md` · `docs/semantic-discovery.md` ·
 `docs/semantic-trust.md` ·
 `docs/git-safety.md` ·

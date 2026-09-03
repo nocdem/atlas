@@ -1246,3 +1246,28 @@ running.
 The residuals A9.2.6 wrote down are unchanged. A submission arriving during a
 reconciliation, a snapshot or a maintenance job is not refused early and can
 still wait out its caller's own timeout.
+
+## A12.1 — the DOCUMENT channel's one new field
+
+The `DOCUMENT` channel (see the table above) is used by exactly one caller:
+Atlas' own memory reconciliation pass, never a transport. The one thing that
+caller needs and no existing channel provides is a way to bind a piece of
+evidence to bytes Atlas itself read from a source outside every registered
+repository — an absolute path can never resolve through the index lookup an
+ordinary `PATH`-anchored claim uses. `atlas_verify_op` therefore carries one
+new field, a reference to a stored `memory_source_versions` row by its own
+uid, never a hash or a path the op supplies directly. Intake resolves the
+reference and copies the content hash out of **Atlas' own row**, which keeps
+the rule this whole surface exists to enforce: Atlas computes the content
+identity itself, it never trusts one handed to it. The field is refused on
+the `MODEL` and `OPERATOR` channels — a memory snapshot is bound by the pass
+that read it, not by anything a transport caller could assert about it — and
+it is refused across repositories: the referenced version's own repository
+must match the claim's, or a process reading one repository's memory could
+attach another repository's snapshot to a claim as if Atlas had read it
+there.
+
+The full argument for why memory is `DOCUMENT`/`SELF_DECLARED` rather than
+`ATLAS`/`ATLAS_ATTESTED`, what the reconciler's one new conflict producer
+does and does not establish, and everything else this season built on top of
+the verification surface, is in `docs/context-reconciliation.md`.

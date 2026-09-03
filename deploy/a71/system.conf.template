@@ -68,3 +68,33 @@ client_group = atlas-clients
 #
 #   semantic_auto_default = ENABLED
 #   semantic_auto_default = DISABLED
+
+# A12.1. Which files Atlas may read as project memory, and whether it may
+# reconcile them into verification claims on its own initiative.
+#
+# `memory_source` is repeated, one line per source: `<CLASS>[@<repo>]:<path>`,
+# where CLASS is REPO_FILE, REPO_DIR, EXTERNAL_FILE or EXTERNAL_DIR. A
+# REPO_* path is repository-relative and is read by the daemon through the
+# same access A13 built. An EXTERNAL_* path is absolute and outside every
+# registered repository; the daemon never opens it itself — an operator
+# reads it and hands the bytes to the daemon through `atlas memory scan`.
+# The optional `@<repo>` scopes a line to one registered repository by name;
+# without it, the source applies to every registered repository. At most 16
+# `memory_source` lines; a 17th is malformed, not silently dropped.
+#
+#   memory_source = REPO_FILE:CLAUDE.md
+#   memory_source = REPO_DIR:.claude/memories
+#   memory_source = EXTERNAL_FILE:/home/example/.claude/CLAUDE.md
+#   memory_source = EXTERNAL_DIR@atlas:/home/example/.claude/projects/-opt-atlas/memory
+#
+# `memory_reconcile` decides whether Atlas may turn a registered source into
+# verification claims on its own initiative, on the watcher's own tick,
+# rather than only when an operator asks for it directly. ENABLED or
+# DISABLED, at most once — stating it twice is malformed, because two lines
+# disagreeing about whether an automatic pass runs is a policy nobody can
+# read back correctly. Absent resolves to the compiled-in default, which is
+# DISABLED: reading files and writing claims automatically is left off until
+# an operator turns it on, unlike `semantic_auto_default` above.
+#
+#   memory_reconcile = ENABLED
+#   memory_reconcile = DISABLED

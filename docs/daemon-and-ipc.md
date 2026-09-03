@@ -128,6 +128,42 @@ kinds", it has no `default:`, and every `false` carries its reason at the case.
 `docs/extending.md` carries the checklist for adding a job kind or a new
 synchronous writer call.
 
+## A12.1: the memory pass on the writer thread
+
+Two job kinds answer both classification questions above. `ATLAS_JOB_MEMORY`
+— putting one memory source's bytes, or reading one back — is a handful of
+statements over bytes already bounded before they were ever queued: not
+unbounded, and drainable, because an operator's own command is waiting on it
+and the tables it writes touch nothing a semantic pass or a discovery walk
+touches.
+
+The reconciliation pass itself, `ATLAS_JOB_MEMORY_RECONCILE`, is not
+unbounded either, but for a different reason than "it is short" — it is not
+short. Measured at its compiled ceiling (every registered source at its
+maximum candidate count, every candidate resolving into a new claim, one
+transaction), it takes **2429.9 ms**, longer than both of the deadlines a
+Claude Code hook actually waits against: the two-second point at which a
+hook gives up on the daemon, and the seven-hundred-millisecond teardown
+window a session-ending hook gets. What makes `false` still the right answer
+is the same reasoning that governs the semantic passes above: its worst-case
+duration is *statable in advance* from compiled bounds on source, candidate
+and claim counts, never from the size of a repository, and that is what the
+first question actually asks. Answering `true` here would let a synchronous
+caller back out early with a refusal that means nothing was queued — and for
+a hook, which fails open, an early refusal costs the record outright rather
+than merely delaying it.
+
+The pass is, for the opposite reason, never drainable: its own observe phase
+reads files and forks git in its own right, outside any transaction, and a
+yield must stay a pause — never a tunnel through which that file activity
+reaches the writer thread while some other unbounded job believes it is
+paused.
+
+The full argument for the pass's two-phase shape — an observe phase with no
+transaction open, an apply phase that does only database work, one savepoint
+per source so one source's fault costs only that source's claims — is in
+`docs/context-reconciliation.md`.
+
 ## Socket
 
 ```

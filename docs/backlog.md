@@ -2038,3 +2038,45 @@ revision, if that is a real gap in what an operator can ask today, is the most l
 answer given its own doc comment. Or delete it, if `atlas_db_verify_claims_for_repo`'s
 `document_id`/`revision_id` filters already cover every real use and this was written
 ahead of a caller that never arrived.
+
+## An edited memory bullet leaves its predecessor live for ever (2026-09-03)
+
+Found by the re-review of A12.1's C1 fix, and verified here. It is not caused by that fix;
+it is what the fix leaves as the dominant growth term.
+
+**The chain.** `classify_candidate` looks for a live claim anchored at the same tuple
+carrying byte-identical text. Edit a bullet and there is none, so it takes
+`!fc.found → ATLAS_MEMORY_DIFF_ADDED` (`src/memory/reconcile.c:838-842`). The comment there
+already names the case — "genuinely new … because every claim that was is a different
+proposition" — so the code knows a predecessor existed and deliberately does not touch it.
+
+**And it cannot touch it, because there is nothing to say.** `atlas_memory_diff_kind`
+(`include/atlas/memory.h:170-178`) has eight members and **none of them means "this
+proposition is gone"**. There is no `REMOVED`, and no producer for one.
+
+So the predecessor stays live. C1's fix removed the per-*commit* growth — every claim used
+to re-mint on every head move because `basis_commit` is in the content key — and this is the
+per-*edit* growth it does not reach: **one live row per edit, toward
+`ATLAS_VERIFY_MAX_CLAIMS`**, after which the Context Pack build refuses and the run proceeds
+packless.
+
+**Why this matters more than the arithmetic suggests.** The artefact that degrades is the
+Context Pack, and the activity that degrades it is **editing the memory file** — which is
+the one thing the season exists to support. A season called reconciled memory should not
+have its central deliverable wear out in proportion to how much the memory is maintained.
+
+**What settling it requires, which is why it is recorded rather than patched.** A `REMOVED`
+kind is a vocabulary addition, and adding one is a decision rather than a fix: it must say
+what Atlas *knows* when a proposition disappears from a source. It is not the same as
+supersession — a superseded claim was replaced by an identifiable successor, and this one
+simply is not there any more, which is closer to A9.2.2's absence question than to a
+lifecycle transition. The reconciler has the material to decide it: a pass sees the complete
+current proposition set for a source, so "anchored here, not in the current set" is
+computable at the same point the vanished-anchor sweep already runs.
+
+**Candidate directions, none implemented.** A `REMOVED` diff kind with a producer at that
+point, superseding or retiring the claim; or a retention rule that prunes claims no live
+proposition carries, which keeps the vocabulary unchanged and moves the question to
+`RETENTION[]` where two tables already have prunability arguments written at their rows; or
+leaving both and bounding the pool by recency, which is the one option that silently drops a
+claim somebody may still rely on and should be rejected explicitly rather than by omission.

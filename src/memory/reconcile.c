@@ -1712,8 +1712,13 @@ atlas_status atlas_memory_source_set_digest(atlas_db *db, const atlas_repo_info 
  * revision changed, and HEAD did not move. Decision 7's vocabulary -- and
  * `memory_generations.cause`'s own CHECK constraint, migration 29 -- has
  * exactly three values and no fourth for "the semantic index changed under
- * an approved decision"; adding one needs a new migration, out of a fix
- * round's scope. `SOURCE_REVISION` is the closest available label by the
+ * an approved decision"; adding one needs a new migration. (T14's own fix
+ * round added migration 30, so "a fix round" is no longer the reason this
+ * stays undone -- widening a CHECK a caller's own C code already treats as
+ * closed, by design, over what SQLite cannot widen in place, is a real
+ * vocabulary decision for whoever owns Decision 7's precedence, not a
+ * schema-mechanics question a fix round settles in passing.)
+ * `SOURCE_REVISION` is the closest available label by the
  * same reasoning `!have_last` already uses above -- a repository fact this
  * process cannot otherwise account for -- and this is now an asserted,
  * documented imprecision rather than a silent one: see
@@ -1929,11 +1934,15 @@ static atlas_status vanish_tuple_cb(atlas_memory_anchor_kind kind, const char *v
  *
  * One callback per commit row `atlas_db_commits_since` (`src/db/db_index.c`)
  * hands back: ingest it (`atlas_memory_trailer_ingest`, `src/memory/
- * trailer.c` -- parses `commits.body`, no process, no git) and, only when it
- * actually carries a recognised block, store the binding
- * (`atlas_db_memory_trailer_binding_insert`, `src/db/db_memory.c`) -- an
- * ordinary commit with no block is not itself recorded, though it still
- * counts toward `scanned` and still advances the scan window past it. */
+ * trailer.c` -- parses `commits.body`, no process, no git) and store the
+ * binding (`atlas_db_memory_trailer_binding_insert`, `src/db/db_memory.c`)
+ * whenever it carries a recognised block *or* the block search could not
+ * fully examine this commit's message (fix round I1/I2: `has_block ||
+ * bound_hit`, migration 30's `bound_hit` column) -- an ordinary commit that
+ * was completely examined and genuinely carries no block is still not itself
+ * recorded, though it still counts toward `scanned` and still advances the
+ * scan window past it; see `atlas_memory_trailer_binding`'s own comment for
+ * the four states this leaves a reader able to tell apart. */
 typedef struct trailer_scan_ctx {
     atlas_db *db;
     int64_t repo_id;
@@ -1949,9 +1958,17 @@ static atlas_status trailer_scan_one(int64_t commit_id, const char *oid, void *u
     atlas_memory_trailer_binding b;
     atlas_memory_trailer_binding_init(&b);
     atlas_status st = atlas_memory_trailer_ingest(tc->db, tc->repo_id, oid, &b, err);
-    if (st == ATLAS_OK && b.has_block) {
-        st = atlas_db_memory_trailer_binding_insert(tc->db, tc->repo_id, oid, &b, tc->now, err);
-        if (st == ATLAS_OK) {
+    if (st == ATLAS_OK && (b.has_block || b.bound_hit)) {
+        /* Fix round M2: `landed` is `sqlite3_changes`-derived
+         * (`atlas_db_memory_trailer_binding_insert`'s own comment) so a
+         * re-walk of an already-recorded commit -- `INSERT OR IGNORE` hitting
+         * `UNIQUE(repo_id, commit_oid)` -- does not inflate `written`, which
+         * would otherwise force a spurious generation below for a binding
+         * that already existed. */
+        bool landed = false;
+        st = atlas_db_memory_trailer_binding_insert(tc->db, tc->repo_id, oid, &b, tc->now, &landed,
+                                                     err);
+        if (st == ATLAS_OK && landed) {
             tc->written++;
         }
     }
@@ -2140,25 +2157,46 @@ atlas_status atlas_memory_apply_in_tx(atlas_db *db, const atlas_repo_info *repo,
      * to be above. A commit's trailer block is a fact about `commits`, not
      * about a registered memory source, so it must not wait for one of those
      * to have moved -- a repository with zero registered sources still owes
-     * this. `trailer_high` starts at the last generation's own cursor (0 for
-     * a repository with no generation yet) and becomes the value this pass
-     * persists into the *next* generation row's own `trailer_scan_high`,
-     * which is the only place that column is ever written (T1/T3 wired the
-     * parameter; nothing updates an existing generation row after the fact).
-     * That is also why this can only ever *advance* alongside a fresh
-     * generation: when a new binding is a real find (`trailer_written > 0`),
-     * it forces `ctx.any_change` so one gets created; when the scan finds
-     * nothing new to record and nothing else changed either, the cursor
-     * stays where it was and a later pass re-walks the same window --
-     * idempotent (`INSERT OR IGNORE`, `UNIQUE(repo_id, commit_oid)`) and
-     * bounded, so the residual is wasted repeated work, never a wrong
-     * answer. Disclosed in the T14 report as a stated cost. */
-    int64_t trailer_high = 0;
+     * this.
+     *
+     * Fix round (Critical 1). `trailer_cursor` starts at
+     * `repositories.trailer_scan_high` (migration 30) rather than at the last
+     * *generation's* own column, and is persisted back there
+     * (`atlas_db_repo_set_trailer_scan_high`) whenever this scan actually
+     * advanced it -- unconditionally of `ctx.any_change`, which is exactly
+     * what T14's original design got backwards: that version only ever wrote
+     * the cursor inside a fresh `memory_generations` row, forced only when
+     * `trailer_written > 0`, so a pass that scanned a full
+     * `ATLAS_MEMORY_TRAILER_PASS_MAX`-commit window and found no block *and*
+     * changed nothing else persisted no progress at all -- the next pass
+     * re-read cursor 0 and re-walked the identical window, forever, on any
+     * repository with more commits above it than one pass's bound and no
+     * registered source. Advancing required finding, and finding required
+     * advancing. A pass now leaves the *next* one starting further along
+     * whether or not it found anything, which is what "a bounded number of
+     * passes reaches HEAD" requires: at `ATLAS_MEMORY_TRAILER_PASS_MAX` (512)
+     * commit rows examined per pass, a repository with N commits above the
+     * cursor and no further source, decision or HEAD movement reaches HEAD in
+     * at most `ceil(N / 512)` passes.
+     *
+     * `memory_generations.trailer_scan_high` is still populated on every
+     * fresh generation row below, from this same `trailer_cursor` -- kept as
+     * an informational record of the cursor's value at that moment, not read
+     * back by anything (see the migration 30 comment for why the column
+     * moved rather than being dropped).
+     *
+     * The cursor is over `commits.id`, an ingestion-order rowid, not history
+     * order: a commit git has always known about but Atlas indexes only now
+     * (a merge bringing in a side branch scanned for the first time) gets a
+     * fresh id above whatever the cursor already reached, and is scanned on
+     * a later pass like any other new row -- never skipped, never mistaken
+     * for one already covered by an earlier cursor value. */
+    int64_t trailer_cursor = 0;
     size_t trailer_scanned = 0;
     size_t trailer_written = 0;
     bool trailer_bound_hit = false;
     if (st == ATLAS_OK) {
-        st = atlas_db_memory_generation_trailer_scan_high(db, repo->id, &trailer_high, err);
+        st = atlas_db_repo_trailer_scan_high(db, repo->id, &trailer_cursor, err);
     }
     if (st == ATLAS_OK) {
         trailer_scan_ctx tc;
@@ -2167,20 +2205,37 @@ atlas_status atlas_memory_apply_in_tx(atlas_db *db, const atlas_repo_info *repo,
         tc.now = now;
         tc.scanned = 0;
         tc.written = 0;
-        int64_t max_id = trailer_high;
+        int64_t max_id = trailer_cursor;
         bool more = false;
-        st = atlas_db_commits_since(db, repo->id, trailer_high, ATLAS_MEMORY_TRAILER_PASS_MAX,
+        st = atlas_db_commits_since(db, repo->id, trailer_cursor, ATLAS_MEMORY_TRAILER_PASS_MAX,
                                     trailer_scan_one, &tc, &max_id, &more, err);
         if (st == ATLAS_OK) {
-            trailer_high = max_id;
             trailer_scanned = tc.scanned;
             trailer_written = tc.written;
             trailer_bound_hit = more;
+            if (max_id > trailer_cursor) {
+                st = atlas_db_repo_set_trailer_scan_high(db, repo->id, max_id, err);
+                if (st == ATLAS_OK) {
+                    trailer_cursor = max_id;
+                }
+            }
         }
     }
     out->trailer_scanned = trailer_scanned;
     out->trailer_bindings_written = trailer_written;
     out->trailer_scan_bound_hit = trailer_bound_hit;
+    /* Fix round: `trailer_written` (M2) counts every *landed*
+     * `memory_trailer_bindings` row, `has_block` or `bound_hit` alike, and
+     * either kind still forces a generation here -- deliberately, not merely
+     * inherited from the pre-fix "a real find" wording this replaces. A
+     * landed `bound_hit` row is new information exactly as a landed
+     * `has_block` row is: this pass could not previously say whether that
+     * commit's message could be fully examined, and now a row records that
+     * it could not, which is a fact Atlas did not have before this pass. It
+     * is bounded the same way a real find is -- `UNIQUE(repo_id, commit_oid)`
+     * makes it land at most once per commit, ever -- so this is not a second
+     * per-pass source of unbounded generation growth alongside the one this
+     * round's own C1 section argues against. */
     if (trailer_written > 0) {
         ctx.any_change = true;
     }
@@ -2232,7 +2287,7 @@ atlas_status atlas_memory_apply_in_tx(atlas_db *db, const atlas_repo_info *repo,
             st = atlas_db_memory_generation_insert(db, repo->id, generation, cause,
                                                    atlas_buf_cstr(&identity), repo->scanned_head,
                                                    cur_decision_digest, cur_source_digest,
-                                                   trailer_high, now, &generation_id, err);
+                                                   trailer_cursor, now, &generation_id, err);
         }
         atlas_buf_free(&identity);
         for (size_t i = 0; st == ATLAS_OK && i < ctx.diff_count; i++) {

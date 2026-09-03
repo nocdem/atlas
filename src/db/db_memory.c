@@ -900,40 +900,6 @@ atlas_status atlas_db_memory_generation_latest(atlas_db *db, int64_t repo_id, in
     return st;
 }
 
-/* T14. */
-atlas_status atlas_db_memory_generation_trailer_scan_high(atlas_db *db, int64_t repo_id,
-                                                          int64_t *high_out, atlas_err *err) {
-    if (high_out != NULL) {
-        *high_out = 0;
-    }
-    if (db == NULL) {
-        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
-                             "no repository to read a trailer scan cursor for");
-    }
-    static const char SQL[] =
-        "SELECT trailer_scan_high FROM memory_generations WHERE repo_id = ?1"
-        " ORDER BY generation DESC LIMIT 1;";
-    sqlite3_stmt *stmt = NULL;
-    atlas_status st = atlas_db_prepare(db, SQL, &stmt, err);
-    if (st != ATLAS_OK) {
-        return st;
-    }
-    if (sqlite3_bind_int64(stmt, 1, repo_id) != SQLITE_OK) {
-        atlas_db_finish(db, stmt);
-        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the repository id");
-    }
-    int rc = sqlite3_step(stmt);
-    if (rc == SQLITE_ROW) {
-        if (high_out != NULL) {
-            *high_out = sqlite3_column_int64(stmt, 0);
-        }
-    } else if (rc != SQLITE_DONE) {
-        st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot read the trailer scan cursor");
-    }
-    atlas_db_finish(db, stmt);
-    return st;
-}
-
 /* T9 fix-round-1 added `ORDER BY kind, value` here so `compute_decision_set_
  * digest` (`src/memory/reconcile.c`) folds DECISION tuples in a stable order
  * -- without it, two runs over the exact same tuple set could concatenate
@@ -1841,7 +1807,11 @@ atlas_status atlas_db_memory_dir_hash_mismatch(atlas_db *db, int64_t repo_id, in
 atlas_status atlas_db_memory_trailer_binding_insert(atlas_db *db, int64_t repo_id,
                                                     const char *commit_oid,
                                                     const atlas_memory_trailer_binding *b,
-                                                    const char *recorded_at, atlas_err *err) {
+                                                    const char *recorded_at, bool *landed_out,
+                                                    atlas_err *err) {
+    if (landed_out != NULL) {
+        *landed_out = false;
+    }
     if (db == NULL || commit_oid == NULL || commit_oid[0] == '\0' || b == NULL ||
        recorded_at == NULL) {
         return atlas_err_set(err, ATLAS_ERR_INTERNAL, "no trailer binding to record");
@@ -1849,7 +1819,8 @@ atlas_status atlas_db_memory_trailer_binding_insert(atlas_db *db, int64_t repo_i
     static const char SQL[] =
         "INSERT OR IGNORE INTO memory_trailer_bindings(repo_id, commit_oid, has_block, run_uid,"
         "  memory_generation, context_digest_ok, decision_set_ok, change_reason_uid,"
-        "  unknown_fields, recorded_at) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10);";
+        "  unknown_fields, recorded_at, bound_hit) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,"
+        "  ?11);";
     sqlite3_stmt *stmt = NULL;
     atlas_status st = atlas_db_prepare(db, SQL, &stmt, err);
     if (st == ATLAS_OK && sqlite3_bind_int64(stmt, 1, repo_id) != SQLITE_OK) {
@@ -1882,8 +1853,19 @@ atlas_status atlas_db_memory_trailer_binding_insert(atlas_db *db, int64_t repo_i
     if (st == ATLAS_OK) {
         st = atlas_db_bind_text_opt(db, stmt, 10, recorded_at, err);
     }
+    if (st == ATLAS_OK && sqlite3_bind_int64(stmt, 11, b->bound_hit ? 1 : 0) != SQLITE_OK) {
+        st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind bound_hit");
+    }
     if (st == ATLAS_OK) {
         st = atlas_db_step_done(db, stmt, err);
+        /* Fix round M2: `INSERT OR IGNORE` hitting `UNIQUE(repo_id,
+         * commit_oid)` on a re-walked commit returns ATLAS_OK with zero rows
+         * changed -- `atlas_db_memory_unanchored_add`'s own precedent
+         * (`sqlite3_changes(db->h) > 0`) is what lets a caller count landed
+         * writes rather than re-presentations. */
+        if (st == ATLAS_OK && landed_out != NULL) {
+            *landed_out = sqlite3_changes(db->h) > 0;
+        }
     } else {
         atlas_db_finish(db, stmt);
         stmt = NULL;
@@ -1908,7 +1890,7 @@ atlas_status atlas_db_memory_trailer_binding_get(atlas_db *db, int64_t repo_id,
     atlas_memory_trailer_binding_init(out);
     static const char SQL[] =
         "SELECT has_block, run_uid, memory_generation, context_digest_ok, decision_set_ok,"
-        "  change_reason_uid, unknown_fields FROM memory_trailer_bindings"
+        "  change_reason_uid, unknown_fields, bound_hit FROM memory_trailer_bindings"
         " WHERE repo_id = ?1 AND commit_oid = ?2;";
     sqlite3_stmt *stmt = NULL;
     atlas_status st = atlas_db_prepare(db, SQL, &stmt, err);
@@ -1942,6 +1924,9 @@ atlas_status atlas_db_memory_trailer_binding_get(atlas_db *db, int64_t repo_id,
         }
         if (st == ATLAS_OK) {
             st = take_col(&out->unknown_fields, stmt, 6, err);
+        }
+        if (st == ATLAS_OK) {
+            out->bound_hit = sqlite3_column_int64(stmt, 7) != 0;
         }
         if (st == ATLAS_OK && found_out != NULL) {
             *found_out = true;

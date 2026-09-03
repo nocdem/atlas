@@ -4472,6 +4472,88 @@ static const char *const M29_STATEMENTS[] = {
     NULL,
 };
 
+/* A12.1 T14 fix round. Two additive columns, closing a Critical and an
+ * Important raised against the T14 commit (aa5a49c) by the round's own
+ * review.
+ *
+ * **Critical: the trailer scan's cursor could starve permanently.**
+ * `memory_generations.trailer_scan_high` (migration 29) was the *only* place
+ * that cursor was ever persisted, and a `memory_generations` row is only ever
+ * appended when a pass finds something to record (`ctx.any_change` in
+ * `atlas_memory_apply_in_tx`, `src/memory/reconcile.c`). A pass that scanned
+ * `ATLAS_MEMORY_TRAILER_PASS_MAX` blockless commits and changed nothing else
+ * therefore persisted no progress at all, so the next pass re-walked the
+ * identical window forever: advancing required finding, and finding required
+ * advancing. Any repository with more than that many commits above the
+ * cursor and no registered memory source could never reach a trailer written
+ * at HEAD.
+ *
+ * `repositories.trailer_scan_high` is a cursor with a writer of its own
+ * (`atlas_db_repo_set_trailer_scan_high`, `src/db/db_repo.c`), called after
+ * every pass that actually scanned, unconditionally of `ctx.any_change` --
+ * so a pass that finds nothing still leaves the next one starting further
+ * along. It lives on `repositories` rather than inside a new
+ * `memory_generations` row-writer, deliberately following `scanner_uid`
+ * (migration 27) and `mirror_complete`/`mirror_at` (migration 28)'s own
+ * precedent rather than migration 29's: a cursor is current *state*, and
+ * migration 29's own comment states the opposite rule for a reason that does
+ * not apply to it -- every `memory_*` table carries a plain `repo_id` with no
+ * foreign key specifically so a repository's *history* (versions, diffs, a
+ * generation ledger) outlives a `repositories` row across a detach/reattach.
+ * A cursor is not history; it is exactly the kind of fact `scanner_uid` and
+ * `mirror_complete` already are, and restarting it at 0 for a repository that
+ * was removed and re-registered under a new id is correct, not a loss --
+ * migration 29's own stated cost is that such a repository starts a fresh
+ * generation chain regardless.
+ *
+ * `memory_generations.trailer_scan_high` is kept (nothing here drops a
+ * column) as an informational record of the cursor's value at the moment
+ * each generation was minted; nothing reads it back any more --
+ * `atlas_db_memory_generation_trailer_scan_high` is deleted along with its
+ * sole caller.
+ *
+ * This is a deliberate exception to two explicit "no new migration this
+ * season" notes written during T14 itself (`include/atlas/memory.h`'s
+ * `Atlas-Change-Reason` rebuild-exposure paragraph, and the `determine_cause`
+ * comment in `src/memory/reconcile.c`): both were about a nice-to-have
+ * (a uid column, a fourth cause value) a fix round could reasonably decline.
+ * A cursor that cannot advance on the feature's default path -- any
+ * repository with more commits than one pass's bound and no registered
+ * source -- is a liveness defect in the season's own central claim, and
+ * declining a migration is not available as a way to leave it unfixed.
+ *
+ * **Important: a per-commit parser bound, once reached, was indistinguishable
+ * from "no block".** `src/memory/trailer.c`'s block search can stop because
+ * it ran out of message to look at (`ATLAS_MEMORY_TRAILER_SCAN_MAX` lines, or
+ * the `ATLAS_MEMORY_TRAILER_TAIL_BYTES_MAX` byte backstop) before ever
+ * finding a marker, and previously that read identically to "there is no
+ * marker" -- both produced no row at all (`has_block` false stored nothing,
+ * `src/memory/reconcile.c`'s `trailer_scan_one`). `bound_hit` is the second
+ * ALTER: a row is now written whenever `has_block` is true OR `bound_hit` is
+ * true, so a reader can tell all four states apart -- a row with
+ * `has_block = 1` (a block was found, verified or not); a row with
+ * `has_block = 0, bound_hit = 1` (this commit's message could not be fully
+ * examined, so a block may exist beyond what this parse considered); no row
+ * with `commits.id` at or below the persisted cursor (a completed scan found
+ * no block here); no row with `commits.id` above the cursor (not yet
+ * scanned) -- rather than collapsing the second state into the third, which
+ * is what "I did not look far enough" being read as "there is nothing here"
+ * would mean.
+ *
+ * Neither new column carries a CHECK constraint, matching migration 27's
+ * `scanner_uid` and migration 28's `mirror_complete`/`mirror_at` rather than
+ * migration 29's `CREATE TABLE`-time booleans: SQLite's `ALTER TABLE ADD
+ * COLUMN` has no established precedent for one in this tree, and both
+ * columns are written by exactly one C call site each, in the shapes
+ * `atlas_db_repo_set_trailer_scan_high` and
+ * `atlas_db_memory_trailer_binding_insert` already enforce. */
+static const char M30_REPO_TRAILER_CURSOR[] =
+    "ALTER TABLE repositories ADD COLUMN trailer_scan_high INTEGER NOT NULL DEFAULT 0;";
+static const char M30_BINDING_BOUND_HIT[] =
+    "ALTER TABLE memory_trailer_bindings ADD COLUMN bound_hit INTEGER NOT NULL DEFAULT 0;";
+
+static const char *const M30_STATEMENTS[] = {M30_REPO_TRAILER_CURSOR, M30_BINDING_BOUND_HIT, NULL};
+
 static const atlas_migration MIGRATIONS[] = {
     {1, "initial schema", M1_STATEMENTS, false},
     {2, "worktree identity", M2_STATEMENTS, false},
@@ -4578,6 +4660,10 @@ static const atlas_migration MIGRATIONS[] = {
      "registered memory sources, their versions, the generations a reconciliation produces, and "
      "the frozen context pack",
      M29_STATEMENTS, false},
+    /* Additive: two columns, no table rebuilt, so foreign keys stay enforced
+     * and no existing row is rewritten. See the M30 comment above for why a
+     * fix round adds a migration a T14 comment twice said was out of scope. */
+    {30, "a trailer-scan cursor of its own, and a per-commit bound-hit fact", M30_STATEMENTS, false},
 };
 
 const atlas_migration *atlas_migrations(size_t *count_out) {

@@ -109,31 +109,92 @@ static size_t line_extent(const char *body, size_t body_len, size_t pos, size_t 
     return content_len;
 }
 
+/* The backward twin of `line_extent`: given `end` (the exclusive offset one
+ * past this line's own content, i.e. the offset of its terminating '\n', or
+ * `body_len` for a final line with none), finds where that line's content
+ * starts by searching backward for the previous '\n', never before `low`.
+ * Returns the content length (trailing '\r' trimmed, matching `line_extent`)
+ * and sets `*start` to the first content byte; `*prev_end` is the `end` to
+ * pass on the next call to keep walking backward -- the position of this
+ * line's own leading '\n' (skipped, so the previous line's content does not
+ * include it), or `low` once the walk has reached the start of the region.
+ * `end` must be `> low`; every call strictly decreases `end` (by at least
+ * one, whether or not a '\n' is found), so a caller that stops once
+ * `end <= low` cannot loop. */
+static size_t line_extent_rev(const char *body, size_t low, size_t end, size_t *start,
+                              size_t *prev_end) {
+    size_t nl = end;
+    while (nl > low && body[nl - 1u] != '\n') {
+        nl--;
+    }
+    size_t content_start = nl;
+    size_t content_len = end - nl;
+    if (content_len > 0 && body[content_start + content_len - 1u] == '\r') {
+        content_len--;
+    }
+    *start = content_start;
+    *prev_end = (nl > low) ? (nl - 1u) : low;
+    return content_len;
+}
+
 /* Finds "Atlas-Provenance: v1" as an exact whole line within the last
  * `ATLAS_MEMORY_TRAILER_TAIL_BYTES_MAX` bytes of `body`, considering at most
- * `ATLAS_MEMORY_TRAILER_SCAN_MAX` of that tail's lines. Returns the offset of
- * the byte immediately after the marker line (the block's first data line,
- * if any), or `SIZE_MAX` when no such line exists in the bounded window --
- * conservative in the one direction that matters: a block pushed out of the
- * window by trailing padding reads as no block at all, never as a forged
- * one. */
-static size_t find_provenance_line(const char *body, size_t body_len) {
+ * `ATLAS_MEMORY_TRAILER_SCAN_MAX` of that tail's lines -- **from the end of
+ * the tail backward**, because a trailer block lives at the end of a message
+ * by construction (`limits.h`'s own comment on `ATLAS_MEMORY_TRAILER_SCAN_MAX`)
+ * and the earlier forward walk considered the tail's *first* `SCAN_MAX`
+ * lines, which is the wrong end for a message whose bounded window holds
+ * more lines than that (fix round I1). Walking backward also makes "found"
+ * and "the search's own bound was reached" the outcomes of one walk rather
+ * than two: the *first* match encountered walking backward is the one
+ * nearest the end of the message, so a `git merge --squash` concatenation
+ * that quotes an older block earlier in the same tail binds the real,
+ * trailing one rather than the first one on the page.
+ *
+ * Returns the offset of the byte immediately after the marker line (the
+ * block's first data line, if any), or `SIZE_MAX` when no such line exists
+ * in the bounded window -- conservative in the one direction that matters: a
+ * block pushed out of the window by trailing padding reads as no block at
+ * all, never as a forged one. `*bound_hit_out` (never NULL) is set to
+ * whether the window's own bound -- the byte backstop, the line cap, or both
+ * -- kept this search from examining the *whole* message; both are "this
+ * parse did not look far enough", A9.2.2's asymmetry over a per-commit
+ * search rather than only over the pass-wide commit scan. It is left false
+ * whenever a marker is found: once one is, the search stops, so neither
+ * bound can have cut off the line that actually matched. */
+static size_t find_provenance_line(const char *body, size_t body_len, bool *bound_hit_out) {
+    *bound_hit_out = false;
     size_t tail_len =
         (body_len > ATLAS_MEMORY_TRAILER_TAIL_BYTES_MAX) ? ATLAS_MEMORY_TRAILER_TAIL_BYTES_MAX
                                                           : body_len;
-    size_t pos = body_len - tail_len;
+    size_t tail_start = body_len - tail_len;
     const size_t marker_len = sizeof(PROVENANCE_MARKER) - 1u;
 
-    for (size_t lines = 0; pos < body_len && lines < ATLAS_MEMORY_TRAILER_SCAN_MAX; lines++) {
-        size_t next = pos;
-        size_t content_len = line_extent(body, body_len, pos, &next);
-        if (content_len == marker_len && memcmp(body + pos, PROVENANCE_MARKER, marker_len) == 0) {
-            return next;
+    size_t end = body_len;
+    size_t lines = 0;
+    while (end > tail_start && lines < ATLAS_MEMORY_TRAILER_SCAN_MAX) {
+        lines++;
+        size_t start = 0, prev_end = 0;
+        size_t content_len = line_extent_rev(body, tail_start, end, &start, &prev_end);
+        if (content_len == marker_len && memcmp(body + start, PROVENANCE_MARKER, marker_len) == 0) {
+            /* The block's data begins right after this marker line's own
+             * newline (forward semantics, matching `line_extent`'s `next`):
+             * `end` is that newline's offset unless this line runs to
+             * `body_len` with no trailing newline of its own, in which case
+             * there is no data to follow it either. */
+            return (end < body_len) ? end + 1u : body_len;
         }
-        if (next == pos) {
-            break; /* no '\n' and nothing matched: the tail is exhausted */
+        if (prev_end >= end) {
+            break; /* unreachable: line_extent_rev always decreases `end` */
         }
-        pos = next;
+        end = prev_end;
+    }
+    /* Not found. Either bound left more of the message unexamined: the line
+     * cap stopped this walk before it reached `tail_start` (`end >
+     * tail_start`), or the byte backstop had already discarded everything
+     * before `tail_start` (`tail_start > 0`). */
+    if (end > tail_start || tail_start > 0) {
+        *bound_hit_out = true;
     }
     return SIZE_MAX;
 }
@@ -228,10 +289,14 @@ atlas_status atlas_memory_trailer_ingest(atlas_db *db, int64_t repo_id, const ch
 
     const char *b = atlas_buf_cstr(&body);
     size_t blen = body.len;
-    size_t pos = find_provenance_line(b, blen);
+    size_t pos = find_provenance_line(b, blen, &out->bound_hit);
     if (pos == SIZE_MAX) {
         atlas_buf_free(&body);
-        return ATLAS_OK; /* has_block stays false; every other member at its zero */
+        /* has_block stays false; bound_hit was set by find_provenance_line
+         * above (fix round I1/I2) -- true when this parse could not fully
+         * examine the message, false when it genuinely found no marker
+         * anywhere within the bound; every other member at its zero. */
+        return ATLAS_OK;
     }
     out->has_block = true;
 

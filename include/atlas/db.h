@@ -21,7 +21,7 @@
 #include "atlas/error.h"
 #include "atlas/limits.h"
 
-#define ATLAS_SCHEMA_VERSION 29
+#define ATLAS_SCHEMA_VERSION 30
 
 typedef struct atlas_db atlas_db;
 
@@ -357,6 +357,22 @@ atlas_status atlas_db_repo_set_mirror_state(atlas_db *db, int64_t repo_id, bool 
                                             const char *at, atlas_err *err);
 atlas_status atlas_db_repo_scanner_uid(atlas_db *db, int64_t repo_id, int64_t *out,
                                        atlas_err *err);
+
+/* A12.1 T14 fix round (migration 30). The trailer scan's own cursor -- the
+ * highest `commits.id` a reconciliation pass has examined for a binding
+ * trailer -- decoupled from `memory_generations`: see the migration 30
+ * comment in `src/db/migrate.c` for why a cursor belongs beside
+ * `scanner_uid`/`mirror_complete` as current per-repository state rather than
+ * inside a ledger row that is only ever written when a pass finds something.
+ * `atlas_db_repo_set_trailer_scan_high` writes what it is given; a repository
+ * that has never been scanned for trailers reads 0, which is always a safe
+ * "start from the top of history" answer: `commits.id` is a rowid SQLite
+ * assigns starting at 1 (`INTEGER PRIMARY KEY`, `src/db/migrate.c`), and
+ * nothing in this codebase ever inserts one at 0. */
+atlas_status atlas_db_repo_trailer_scan_high(atlas_db *db, int64_t repo_id, int64_t *out,
+                                             atlas_err *err);
+atlas_status atlas_db_repo_set_trailer_scan_high(atlas_db *db, int64_t repo_id, int64_t high,
+                                                 atlas_err *err);
 
 atlas_status atlas_db_repo_list(atlas_db *db, atlas_repo_cb cb, void *ud, atlas_err *err);
 atlas_status atlas_db_repo_remove(atlas_db *db, const char *name, bool *removed, atlas_err *err);

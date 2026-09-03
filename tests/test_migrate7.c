@@ -212,13 +212,15 @@ static void build_schema6(const char *path, atlas_err *err) {
               * past 10 as well, and a rewind that leaves a later migration's
               * table behind is not a schema-6 database. */
              "DROP TABLE decision_edge_events;"
-             /* Migration 27 added a column to `repositories`. A rewind that leaves a
-              * later migration's *column* behind is no more a schema-N database than
+             /* Migration 27 added a column to `repositories`, and migration 30
+              * (the T14 fix round) added another. A rewind that leaves a later
+              * migration's *column* behind is no more a schema-N database than
               * one that leaves its table behind, and re-running the chain would
               * fail with "duplicate column name". */
              "ALTER TABLE repositories DROP COLUMN scanner_uid;"
              "ALTER TABLE repositories DROP COLUMN mirror_complete;"
              "ALTER TABLE repositories DROP COLUMN mirror_at;"
+             "ALTER TABLE repositories DROP COLUMN trailer_scan_high;"
              /* A12.1's eight tables, children before parents: migration 29
               * runs again on top of this rewind, and a rewind that leaves a
               * later migration's table behind is not a database at the
@@ -277,7 +279,7 @@ static void test_a_populated_schema_six_database_reaches_seven_losslessly(void) 
      * table without renumbering a row — is asserted below and is unaffected by
      * later migrations running on top of it. */
     T_EQ_INT(atlas_db_schema_version(db, &err), ATLAS_SCHEMA_VERSION);
-    T_EQ_INT(ATLAS_SCHEMA_VERSION, 29);
+    T_EQ_INT(ATLAS_SCHEMA_VERSION, 30);
 
     atlas_buf after = ATLAS_BUF_INIT;
     text_of(db,

@@ -1218,20 +1218,32 @@
 #define ATLAS_MEMORY_TRAILER_TAIL_BYTES_MAX 65536u
 
 /* Commit rows one reconciliation pass will examine for a trailer block,
- * before yielding the rest to `memory_generations.trailer_scan_high`
- * (migration 29, `src/db/migrate.c`) -- "highest commits.id examined for
- * trailers." **A different bound from `ATLAS_MEMORY_TRAILER_SCAN_MAX`
- * above, despite the identical value and the neighbouring name**: that one
- * bounds how far into *one* commit message's tail the block search looks;
- * this one bounds how many *commit rows* one pass walks. Disclosed in the
- * T14 report as a divergence between this file and the plan/context-file
- * text, both of which named `ATLAS_MEMORY_TRAILER_SCAN_MAX` for this exact
- * per-pass role -- the constant nearest that name already carried a
- * different, pre-existing, still-correct documented meaning (unused until
- * T14), so a second constant was added rather than repurposing the first,
+ * before yielding the rest to `repositories.trailer_scan_high` (migration 30,
+ * `src/db/migrate.c`, `atlas_db_repo_set_trailer_scan_high`) -- "highest
+ * commits.id examined for trailers." **A different bound from
+ * `ATLAS_MEMORY_TRAILER_SCAN_MAX` above, despite the identical value and the
+ * neighbouring name**: that one bounds how far into *one* commit message's
+ * tail the block search looks; this one bounds how many *commit rows* one
+ * pass walks. Disclosed in the T14 report as a divergence between this file
+ * and the plan/context-file text, both of which named
+ * `ATLAS_MEMORY_TRAILER_SCAN_MAX` for this exact per-pass role -- the
+ * constant nearest that name already carried a different, pre-existing,
+ * still-correct documented meaning (unused until T14), so a second constant
+ * was added rather than repurposing the first,
  * `ATLAS_MEMORY_MAX_TOUCHED_COMMITS`'s own precedent for "a different
  * dimension... each gets its own." A bound that is reached is reported:
- * `atlas_memory_pass_result.trailer_scan_bound_hit`. */
+ * `atlas_memory_pass_result.trailer_scan_bound_hit`.
+ *
+ * Fix round (Critical 1): the cursor this bound advances used to live only
+ * in `memory_generations.trailer_scan_high` (migration 29), persisted only
+ * when a pass minted a fresh generation row -- so a pass that reached this
+ * bound and found nothing else to record left the cursor exactly where it
+ * started, and the next pass re-walked the identical `ATLAS_MEMORY_TRAILER_
+ * PASS_MAX` commits forever. Migration 30's `repositories.trailer_scan_high`
+ * is written after every pass that scanned at all, so a repository with N
+ * commits above the cursor reaches HEAD in at most `ceil(N / 512)` passes
+ * regardless of what any of them find -- see `atlas_memory_apply_in_tx`'s own
+ * comment for the write. */
 #define ATLAS_MEMORY_TRAILER_PASS_MAX 512u
 
 /* How often the sweep asks whether any registered source has moved. Chosen to be

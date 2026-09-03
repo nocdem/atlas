@@ -166,14 +166,17 @@ static void wind_back_to_schema_12(env *e, atlas_err *err) {
 
     /* Winding the version marker back is not enough for a migration that
      * altered a table this helper does not rebuild. Migration 27 added
-     * `scanner_uid` to `repositories`, so re-running the chain would try to add
-     * it a second time and fail with "duplicate column name". Migration 2 is
-     * the only other migration that ever altered `repositories`, and it is
-     * below 12, so this is the first time the question arises. */
+     * `scanner_uid` to `repositories` and migration 30 (the T14 fix round)
+     * added `trailer_scan_high`, so re-running the chain would try to add
+     * each a second time and fail with "duplicate column name". Migration 2 is
+     * the only other migration that ever altered `repositories` below these,
+     * and it is below 12, so this is the first time the question arises. */
     T_OK(atlas_db_exec_sql(e->db, "ALTER TABLE repositories DROP COLUMN scanner_uid;", err), err);
     T_OK(atlas_db_exec_sql(e->db, "ALTER TABLE repositories DROP COLUMN mirror_complete;", err),
          err);
     T_OK(atlas_db_exec_sql(e->db, "ALTER TABLE repositories DROP COLUMN mirror_at;", err), err);
+    T_OK(atlas_db_exec_sql(e->db, "ALTER TABLE repositories DROP COLUMN trailer_scan_high;", err),
+         err);
     static const char BACK_DOCUMENTS[] =
         /* documents: no `kind`, and the four-state status vocabulary. */
         "CREATE TABLE d12_documents ("

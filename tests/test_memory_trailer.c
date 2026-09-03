@@ -261,6 +261,41 @@ static void read_decision_status(atlas_db *db, const char *uid, atlas_buf *out, 
     atlas_db_finish(db, stmt);
 }
 
+/* Fix round M3: an exact per-element match against `unknown_fields`'
+ * netstring encoding (`trailer.c`'s `ns_put`: "<count>:" then that many
+ * "<len>:<bytes>," elements), replacing a `strstr` over the raw bytes.
+ * `strstr` cannot currently collide -- the five compiled-in field names are
+ * pairwise non-substrings of one another -- but it would silently pass on
+ * the wrong evidence the day a sixth field name contains one of the first
+ * five, which is exactly the looseness a review flagged. */
+static bool unknown_fields_has(const atlas_buf *nf, const char *field) {
+    const char *p = atlas_buf_cstr(nf);
+    const char *end = p + nf->len;
+    char *after = NULL;
+    long count = strtol(p, &after, 10);
+    if (after == NULL || after >= end || *after != ':' || count < 0) {
+        return false;
+    }
+    p = after + 1;
+    size_t field_len = strlen(field);
+    for (long i = 0; i < count && p < end; i++) {
+        char *lenend = NULL;
+        long len = strtol(p, &lenend, 10);
+        if (lenend == NULL || lenend >= end || *lenend != ':' || len < 0) {
+            return false;
+        }
+        const char *data = lenend + 1;
+        if (data + len >= end || data[len] != ',') {
+            return false;
+        }
+        if ((size_t)len == field_len && memcmp(data, field, field_len) == 0) {
+            return true;
+        }
+        p = data + len + 1;
+    }
+    return false;
+}
+
 /* Replaces the single line beginning with `prefix` in `src` with
  * `replacement` (a whole line, no trailing newline), byte for byte
  * elsewhere -- how every (b) tampering and (d)'s own tampering is built,
@@ -465,11 +500,11 @@ static void test_tamperings(void) {
     T_CHECK_MSG(strcmp(atlas_buf_cstr(&b.change_reason_uid), reason_text) == 0,
                "an unknown run uid must not also take change_reason down: got \"%s\"",
                atlas_buf_cstr(&b.change_reason_uid));
-    T_CHECK(strstr(atlas_buf_cstr(&b.unknown_fields), "run") != NULL);
-    T_CHECK(strstr(atlas_buf_cstr(&b.unknown_fields), "generation") != NULL);
-    T_CHECK(strstr(atlas_buf_cstr(&b.unknown_fields), "context_digest") != NULL);
-    T_CHECK(strstr(atlas_buf_cstr(&b.unknown_fields), "decision_set_digest") != NULL);
-    T_CHECK(strstr(atlas_buf_cstr(&b.unknown_fields), "change_reason") == NULL);
+    T_CHECK(unknown_fields_has(&b.unknown_fields, "run"));
+    T_CHECK(unknown_fields_has(&b.unknown_fields, "generation"));
+    T_CHECK(unknown_fields_has(&b.unknown_fields, "context_digest"));
+    T_CHECK(unknown_fields_has(&b.unknown_fields, "decision_set_digest"));
+    T_CHECK(!unknown_fields_has(&b.unknown_fields, "change_reason"));
     atlas_memory_trailer_binding_free(&b);
 
     /* (ii) */
@@ -480,8 +515,8 @@ static void test_tamperings(void) {
         &err);
     T_REQUIRE(found);
     T_CHECK(!b.context_digest_ok);
-    T_CHECK(strstr(atlas_buf_cstr(&b.unknown_fields), "context_digest") != NULL);
-    T_CHECK(strstr(atlas_buf_cstr(&b.unknown_fields), "decision_set_digest") == NULL);
+    T_CHECK(unknown_fields_has(&b.unknown_fields, "context_digest"));
+    T_CHECK(!unknown_fields_has(&b.unknown_fields, "decision_set_digest"));
     T_CHECK_MSG(strcmp(atlas_buf_cstr(&b.run_uid), atlas_buf_cstr(&run_uid)) == 0,
                "a bad context digest must not also take run down");
     T_CHECK(b.memory_generation == pack.memory_generation);
@@ -497,9 +532,8 @@ static void test_tamperings(void) {
         &err);
     T_REQUIRE(found);
     T_CHECK(!b.decision_set_ok);
-    T_CHECK(strstr(atlas_buf_cstr(&b.unknown_fields), "decision_set_digest") != NULL);
-    T_CHECK(strstr(atlas_buf_cstr(&b.unknown_fields), "context_digest,") == NULL &&
-           strstr(atlas_buf_cstr(&b.unknown_fields), ":context_digest") == NULL);
+    T_CHECK(unknown_fields_has(&b.unknown_fields, "decision_set_digest"));
+    T_CHECK(!unknown_fields_has(&b.unknown_fields, "context_digest"));
     T_CHECK(b.context_digest_ok);
     T_CHECK(b.memory_generation == pack.memory_generation);
     atlas_memory_trailer_binding_free(&b);
@@ -512,7 +546,7 @@ static void test_tamperings(void) {
         &err);
     T_REQUIRE(found);
     T_CHECK(b.memory_generation == 0);
-    T_CHECK(strstr(atlas_buf_cstr(&b.unknown_fields), "generation") != NULL);
+    T_CHECK(unknown_fields_has(&b.unknown_fields, "generation"));
     T_CHECK(b.context_digest_ok);
     T_CHECK(b.decision_set_ok);
     T_CHECK_MSG(strcmp(atlas_buf_cstr(&b.run_uid), atlas_buf_cstr(&run_uid)) == 0,
@@ -551,6 +585,11 @@ static void test_no_block(void) {
     atlas_memory_trailer_binding_init(&b);
     T_OK(atlas_memory_trailer_ingest(e.db, e.repo_id, ri.scanned_head, &b, &err), &err);
     T_CHECK(!b.has_block);
+    /* Fix round I1/I2: the commit's whole (short) message was examined
+     * within both bounds, so this is a genuine absence, not an unexamined
+     * remainder -- `bound_hit` must be false here, distinct from the fixture
+     * below that hits it. */
+    T_CHECK(!b.bound_hit);
     T_CHECK(b.run_uid.len == 0);
     T_CHECK(b.memory_generation == 0);
     T_CHECK(!b.context_digest_ok);
@@ -559,9 +598,343 @@ static void test_no_block(void) {
     T_CHECK_MSG(b.unknown_fields.len == 0,
                "a commit with no block must carry no field rows, got \"%s\"",
                atlas_buf_cstr(&b.unknown_fields));
+    atlas_memory_trailer_binding_free(&b);
+
+    /* M4: nothing previously asserted what the *pass* -- as opposed to a
+     * direct `atlas_memory_trailer_ingest` call -- leaves behind for a
+     * blockless commit. It must store no row at all (distinct from a row
+     * with `has_block = 0`, which the fix round now reserves for a
+     * `bound_hit` commit), so a reader can tell "no block" apart from "not
+     * yet scanned" by whether a row exists at all. */
+    atlas_syspolicy pol;
+    memset(&pol, 0, sizeof pol);
+    pol.state = ATLAS_SYSPOLICY_SYSTEM;
+    atlas_memory_pass_result result;
+    memset(&result, 0, sizeof result);
+    run_pass(&e, &pol, &result, &err);
+    T_CHECK_MSG(result.trailer_bindings_written == 0,
+               "a blockless, fully-examined commit must not be recorded, got %zu",
+               result.trailer_bindings_written);
+
+    atlas_memory_trailer_binding stored;
+    atlas_memory_trailer_binding_init(&stored);
+    bool found = true; /* wrong on purpose: a bug that skips the read must not leave this unset */
+    T_OK(atlas_db_memory_trailer_binding_get(e.db, e.repo_id, ri.scanned_head, &stored, &found, &err),
+        &err);
+    T_CHECK_MSG(!found,
+               "a fully-examined blockless commit must have no memory_trailer_bindings row");
+    atlas_memory_trailer_binding_free(&stored);
+
+    atlas_repo_info_free(&ri);
+    env_close(&e);
+}
+
+/* --- Fix round C1: the cursor advances even when a pass finds nothing ------
+ *
+ * A synthetic history built with direct SQL against `commits` --
+ * `test_commits_since_bound`'s own precedent below, used here instead of 601
+ * real git commits -- with exactly one trailer marker placed past the first
+ * `ATLAS_MEMORY_TRAILER_PASS_MAX` (512) commit-row window and nothing else
+ * for a pass to change (no registered memory source, no decision, no HEAD
+ * movement beyond the synthetic rows themselves).
+ *
+ * Before the fix, pass 1 would scan commits 1..512, find nothing, change
+ * nothing else, and -- because `memory_generations.trailer_scan_high` was
+ * the cursor's only storage and only a fresh generation row ever wrote it --
+ * persist no progress at all. Pass 2 would re-read cursor 0 and re-scan the
+ * identical 1..512 window, never reaching commit 560. This test would fail
+ * against that code: `result2.trailer_bindings_written` would be 0 and the
+ * lookup below would find nothing, forever, however many more passes ran.
+ *
+ * After the fix, pass 1 still writes no binding and mints no generation
+ * (asserted below: `ctx.any_change` must not have been forced merely by
+ * scan progress, which is the *other* candidate fix this task named and
+ * rejected), but it persists the cursor at 512 regardless. Pass 2 resumes
+ * there, scans only the 89 remaining rows, and finds the marker. */
+static void test_cursor_advances_without_a_find(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    env e;
+    env_open(&e, &err); /* one real commit already indexed, commits.id 1 */
+
+    const int64_t marker_id = 560; /* comfortably past the first 512-row window */
+    for (int64_t i = 2; i <= 601; i++) {
+        char sql[512];
+        if (i == marker_id) {
+            (void)snprintf(sql, sizeof sql,
+                          "INSERT INTO commits(repo_id, oid, parent_count, body)"
+                          " VALUES(%lld, '%040lld', 0, 'Atlas-Provenance: v1\n');",
+                          (long long)e.repo_id, (long long)i);
+        } else {
+            (void)snprintf(sql, sizeof sql,
+                          "INSERT INTO commits(repo_id, oid, parent_count) VALUES(%lld, '%040lld', 0);",
+                          (long long)e.repo_id, (long long)i);
+        }
+        T_OK(atlas_db_exec_sql(e.db, sql, &err), &err);
+    }
+    char marker_oid[41];
+    (void)snprintf(marker_oid, sizeof marker_oid, "%040lld", (long long)marker_id);
+
+    atlas_syspolicy pol;
+    memset(&pol, 0, sizeof pol);
+    pol.state = ATLAS_SYSPOLICY_SYSTEM;
+
+    atlas_memory_pass_result result1;
+    memset(&result1, 0, sizeof result1);
+    run_pass(&e, &pol, &result1, &err);
+    T_CHECK_MSG(result1.trailer_scanned == ATLAS_MEMORY_TRAILER_PASS_MAX,
+               "expected the first pass to scan exactly the per-pass bound, got %zu",
+               result1.trailer_scanned);
+    T_CHECK_MSG(result1.trailer_bindings_written == 0,
+               "the marker sits above the first window; expected 0 bindings, got %zu",
+               result1.trailer_bindings_written);
+    T_CHECK_MSG(result1.trailer_scan_bound_hit, "expected the per-pass bound to be reported");
+    T_CHECK_MSG(result1.generation == 0,
+               "a pass that found nothing and changed nothing else must mint no generation -- "
+               "forcing one on scan progress alone is the candidate fix this task rejected");
+
+    atlas_memory_pass_result result2;
+    memset(&result2, 0, sizeof result2);
+    run_pass(&e, &pol, &result2, &err);
+    T_CHECK_MSG(result2.trailer_scanned == 601u - ATLAS_MEMORY_TRAILER_PASS_MAX,
+               "expected the second pass to resume where the first left off and scan the "
+               "remaining %llu rows, got %zu",
+               (unsigned long long)(601u - ATLAS_MEMORY_TRAILER_PASS_MAX), result2.trailer_scanned);
+    T_CHECK_MSG(!result2.trailer_scan_bound_hit, "expected no remainder after the second pass");
+    T_CHECK_MSG(result2.trailer_bindings_written == 1,
+               "expected the second pass to reach and record the marker at commit %lld, got %zu "
+               "bindings written",
+               (long long)marker_id, result2.trailer_bindings_written);
+    T_CHECK_MSG(result2.generation != 0, "a real find must still force a generation");
+
+    atlas_memory_trailer_binding b;
+    atlas_memory_trailer_binding_init(&b);
+    bool found = false;
+    T_OK(atlas_db_memory_trailer_binding_get(e.db, e.repo_id, marker_oid, &b, &found, &err), &err);
+    T_CHECK_MSG(found, "expected a stored binding for the marker commit");
+    T_CHECK(b.has_block);
+    atlas_memory_trailer_binding_free(&b);
+
+    env_close(&e);
+}
+
+/* --- Fix round I1: the block search now runs from the end of the tail
+ * backward -------------------------------------------------------------- */
+
+/* A message whose last 6 lines are a genuine, composed trailer block, preceded
+ * by 520 filler lines -- more than `ATLAS_MEMORY_TRAILER_SCAN_MAX` (512), so
+ * the pre-fix forward-from-the-front walk would have examined only the first
+ * 512 (filler) lines and reported `has_block = false`. The fix walks from the
+ * end of the tail backward, so the trailer -- which is where one lives "by
+ * construction" (`limits.h`) -- is what it actually finds. */
+static void test_block_past_the_forward_line_window(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    env e;
+    env_open(&e, &err);
+
+    atlas_syspolicy pol;
+    memset(&pol, 0, sizeof pol);
+    pol.state = ATLAS_SYSPOLICY_SYSTEM;
+
+    atlas_buf run_uid = ATLAS_BUF_INIT;
+    submit_root(&e, "past the line window", &run_uid, &err);
+    atlas_memory_pack pack;
+    freeze_pack(&e, &pol, "past the line window", atlas_buf_cstr(&run_uid), &pack, &err);
+    int64_t reason_id = insert_reason(&e, &err);
+    char reason_text[32];
+    (void)snprintf(reason_text, sizeof reason_text, "%lld", (long long)reason_id);
+
+    atlas_buf trailer = ATLAS_BUF_INIT;
+    T_OK(atlas_memory_trailer_compose(e.db, atlas_buf_cstr(&run_uid), reason_text, &trailer, &err),
+        &err);
+
+    atlas_buf body = ATLAS_BUF_INIT;
+    for (int i = 0; i < 520; i++) {
+        char line[32];
+        (void)snprintf(line, sizeof line, "filler line %d\n", i);
+        T_OK(atlas_buf_append_str(&body, line, &err), &err);
+    }
+    T_OK(atlas_buf_append(&body, trailer.data, trailer.len, &err), &err);
+
+    T_OK(fx_write(fx_repo(&e.fx), "notes.md", "past the 512-line window\n", &err), &err);
+    T_OK(fx_add_all(&e.fx, fx_repo(&e.fx), &err), &err);
+    T_OK(fx_commit_body(&e.fx, fx_repo(&e.fx), "past the line window", atlas_buf_cstr(&body), &err),
+        &err);
+    atlas_buf head = ATLAS_BUF_INIT;
+    head_oid(&e, &head, &err);
+
+    env_rescan(&e, &err);
+
+    atlas_memory_pass_result result;
+    memset(&result, 0, sizeof result);
+    run_pass(&e, &pol, &result, &err);
+    T_CHECK_MSG(result.trailer_bindings_written == 1,
+               "expected the trailing block to be found despite 520 lines ahead of it, got %zu",
+               result.trailer_bindings_written);
+
+    atlas_memory_trailer_binding b;
+    atlas_memory_trailer_binding_init(&b);
+    bool found = false;
+    T_OK(atlas_db_memory_trailer_binding_get(e.db, e.repo_id, atlas_buf_cstr(&head), &b, &found,
+                                             &err),
+        &err);
+    T_REQUIRE(found);
+    T_CHECK(b.has_block);
+    T_CHECK(!b.bound_hit);
+    T_CHECK_MSG(strcmp(atlas_buf_cstr(&b.run_uid), atlas_buf_cstr(&run_uid)) == 0,
+               "expected the genuine run uid to resolve");
+    T_CHECK(b.context_digest_ok);
+    T_CHECK(b.decision_set_ok);
+    T_CHECK_MSG(strcmp(atlas_buf_cstr(&b.unknown_fields), "0:") == 0,
+               "expected every field to verify, got unknown_fields \"%s\"",
+               atlas_buf_cstr(&b.unknown_fields));
 
     atlas_memory_trailer_binding_free(&b);
+    atlas_buf_free(&head);
+    atlas_buf_free(&body);
+    atlas_buf_free(&trailer);
+    atlas_memory_pack_free(&pack);
+    atlas_buf_free(&run_uid);
+    env_close(&e);
+}
+
+/* A `git merge --squash`-shaped message: an older, tampered block (a run uid
+ * that resolves to nothing) followed by a genuine one. The fix returns the
+ * *last* marker found walking backward -- the one nearest the end of the
+ * message -- so the genuine trailing block is what binds, never the quoted
+ * one above it. */
+static void test_last_block_wins_over_an_earlier_one(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    env e;
+    env_open(&e, &err);
+
+    atlas_syspolicy pol;
+    memset(&pol, 0, sizeof pol);
+    pol.state = ATLAS_SYSPOLICY_SYSTEM;
+
+    atlas_buf run_uid = ATLAS_BUF_INIT;
+    submit_root(&e, "squash test", &run_uid, &err);
+    atlas_memory_pack pack;
+    freeze_pack(&e, &pol, "squash test", atlas_buf_cstr(&run_uid), &pack, &err);
+    int64_t reason_id = insert_reason(&e, &err);
+    char reason_text[32];
+    (void)snprintf(reason_text, sizeof reason_text, "%lld", (long long)reason_id);
+
+    atlas_buf genuine = ATLAS_BUF_INIT;
+    T_OK(atlas_memory_trailer_compose(e.db, atlas_buf_cstr(&run_uid), reason_text, &genuine, &err),
+        &err);
+    atlas_buf stale = ATLAS_BUF_INIT;
+    tamper_line(atlas_buf_cstr(&genuine), "Atlas-Run: ",
+               "Atlas-Run: rffffffffffffffffffffffffffffffff", &stale, &err);
+
+    atlas_buf body = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_append(&body, stale.data, stale.len, &err), &err);
+    T_OK(atlas_buf_append_str(&body, "\n", &err), &err);
+    T_OK(atlas_buf_append(&body, genuine.data, genuine.len, &err), &err);
+
+    T_OK(fx_write(fx_repo(&e.fx), "notes.md", "squash\n", &err), &err);
+    T_OK(fx_add_all(&e.fx, fx_repo(&e.fx), &err), &err);
+    T_OK(fx_commit_body(&e.fx, fx_repo(&e.fx), "squash test", atlas_buf_cstr(&body), &err), &err);
+    atlas_buf head = ATLAS_BUF_INIT;
+    head_oid(&e, &head, &err);
+
+    env_rescan(&e, &err);
+
+    atlas_memory_pass_result result;
+    memset(&result, 0, sizeof result);
+    run_pass(&e, &pol, &result, &err);
+    T_CHECK(result.trailer_bindings_written == 1);
+
+    atlas_memory_trailer_binding b;
+    atlas_memory_trailer_binding_init(&b);
+    bool found = false;
+    T_OK(atlas_db_memory_trailer_binding_get(e.db, e.repo_id, atlas_buf_cstr(&head), &b, &found,
+                                             &err),
+        &err);
+    T_REQUIRE(found);
+    T_CHECK(b.has_block);
+    T_CHECK_MSG(strcmp(atlas_buf_cstr(&b.run_uid), atlas_buf_cstr(&run_uid)) == 0,
+               "expected the trailing genuine block to bind, not the stale one above it");
+    T_CHECK(b.context_digest_ok);
+    T_CHECK(b.decision_set_ok);
+
+    atlas_memory_trailer_binding_free(&b);
+    atlas_buf_free(&head);
+    atlas_buf_free(&body);
+    atlas_buf_free(&stale);
+    atlas_buf_free(&genuine);
+    atlas_memory_pack_free(&pack);
+    atlas_buf_free(&run_uid);
+    env_close(&e);
+}
+
+/* --- Fix round I1/I2: a message too long to fully examine reports its own
+ * bound rather than reading as "no block", and gets a row of its own ------- */
+static void test_unexaminable_message_reports_bound_hit(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    env e;
+    env_open(&e, &err);
+
+    /* No newline anywhere: a single line spanning the whole body, which is
+     * exactly the case `ATLAS_MEMORY_TRAILER_TAIL_BYTES_MAX` exists for
+     * (`limits.h`) -- and, at 70000 bytes, longer than that backstop, so the
+     * search cannot reach the start of the message and must say so rather
+     * than report a plain absence. */
+    atlas_buf body = ATLAS_BUF_INIT;
+    for (int i = 0; i < 70000; i++) {
+        T_OK(atlas_buf_append_ch(&body, 'x', &err), &err);
+    }
+
+    T_OK(fx_write(fx_repo(&e.fx), "notes.md", "unexaminable\n", &err), &err);
+    T_OK(fx_add_all(&e.fx, fx_repo(&e.fx), &err), &err);
+    T_OK(fx_commit_body(&e.fx, fx_repo(&e.fx), "unexaminable message", atlas_buf_cstr(&body), &err),
+        &err);
+    atlas_buf head = ATLAS_BUF_INIT;
+    head_oid(&e, &head, &err);
+
+    env_rescan(&e, &err);
+
+    atlas_repo_info ri;
+    env_repo_info(&e, &ri, &err);
+    atlas_memory_trailer_binding b;
+    atlas_memory_trailer_binding_init(&b);
+    T_OK(atlas_memory_trailer_ingest(e.db, e.repo_id, atlas_buf_cstr(&head), &b, &err), &err);
+    T_CHECK(!b.has_block);
+    T_CHECK_MSG(b.bound_hit,
+               "a message longer than the byte backstop must report bound_hit, not a plain "
+               "absence");
+    atlas_memory_trailer_binding_free(&b);
     atlas_repo_info_free(&ri);
+
+    /* I2: `has_block || bound_hit` is what the pass stores on, so this commit
+     * -- genuinely unexaminable, not genuinely blockless -- gets a row of its
+     * own rather than reading identically to `test_no_block`'s case. */
+    atlas_syspolicy pol;
+    memset(&pol, 0, sizeof pol);
+    pol.state = ATLAS_SYSPOLICY_SYSTEM;
+    atlas_memory_pass_result result;
+    memset(&result, 0, sizeof result);
+    run_pass(&e, &pol, &result, &err);
+    T_CHECK_MSG(result.trailer_bindings_written == 1,
+               "expected a bound_hit commit to still land a row, got %zu",
+               result.trailer_bindings_written);
+
+    atlas_memory_trailer_binding stored;
+    atlas_memory_trailer_binding_init(&stored);
+    bool found = false;
+    T_OK(atlas_db_memory_trailer_binding_get(e.db, e.repo_id, atlas_buf_cstr(&head), &stored, &found,
+                                             &err),
+        &err);
+    T_REQUIRE(found);
+    T_CHECK(!stored.has_block);
+    T_CHECK(stored.bound_hit);
+    atlas_memory_trailer_binding_free(&stored);
+
+    atlas_buf_free(&head);
+    atlas_buf_free(&body);
     env_close(&e);
 }
 
@@ -779,12 +1152,21 @@ static const atlas_test TESTS[] = {
      test_round_trip},
     {"(b) four tamperings, each contained to the field(s) it structurally touches",
      test_tamperings},
-    {"(c) a commit with no block carries no field rows", test_no_block},
+    {"(c) a commit with no block carries no field rows, and a pass stores no row for it",
+     test_no_block},
     {"(d) a tampered block moves no decision status and no verification row count",
      test_no_authority},
     {"(e) compose refuses a run with no frozen pack", test_compose_refuses_no_pack},
     {"compose refuses a change reason no row backs", test_compose_refuses_bad_reason},
     {"the per-pass commit scan bound is reported", test_commits_since_bound},
+    {"fix round C1: the cursor advances even when a pass finds nothing",
+     test_cursor_advances_without_a_find},
+    {"fix round I1: a trailer past the forward 512-line window is found",
+     test_block_past_the_forward_line_window},
+    {"fix round I1: the last of two blocks wins over an earlier, stale one",
+     test_last_block_wins_over_an_earlier_one},
+    {"fix round I1/I2: a message too long to examine reports bound_hit and gets a row",
+     test_unexaminable_message_reports_bound_hit},
 };
 
 ATLAS_TEST_MAIN("memory_trailer", TESTS)

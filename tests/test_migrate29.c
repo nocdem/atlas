@@ -7,7 +7,8 @@
  * Eight tables, additive, none rebuilt -- see the migration comment in
  * `src/db/migrate.c`. This suite proves the properties the task brief names:
  *
- *   - a fresh database reaches schema 29 with all eight tables and no
+ *   - a fresh database reaches schema 29 (schema 30 since the T14 fix round
+ *     added migration 30 on top of it) with all eight tables and no
  *     dangling foreign key;
  *   - `memory_source_versions`' CHECK refuses a row with neither a blob nor
  *     stored content;
@@ -224,6 +225,10 @@ static const char *const TRAILER_BINDINGS_COLS[] = {
     "id",            "repo_id",         "commit_oid",        "has_block",
     "run_uid",       "memory_generation", "context_digest_ok", "decision_set_ok",
     "change_reason_uid", "unknown_fields", "recorded_at",
+    /* Migration 30 (the T14 fix round) adds this column; `column_exists`
+     * below is a presence check, not an exhaustive one, so appending it here
+     * is what makes this suite actually prove migration 30 ran. */
+    "bound_hit",
 };
 
 #define TCOLS(arr) arr, sizeof(arr) / sizeof(arr[0])
@@ -251,8 +256,12 @@ static void test_fresh_database_reaches_29_with_eight_tables(void) {
     T_OK(open_fresh(&fx, &db, &err), &err);
     T_OK(atlas_db_migrate(db, &err), &err);
 
-    T_EQ_INT((int)ATLAS_SCHEMA_VERSION, 29);
-    T_EQ_INT(schema_of(db), 29);
+    /* Migration 30 (the T14 fix round) landed after this suite was written,
+     * so a fresh database now reaches 30, not 29 -- this suite is still
+     * about migration 29's own eight tables, which migration 30 does not
+     * touch. */
+    T_EQ_INT((int)ATLAS_SCHEMA_VERSION, 30);
+    T_EQ_INT(schema_of(db), 30);
 
     for (size_t i = 0; i < sizeof TABLES / sizeof TABLES[0]; i++) {
         T_CHECK_MSG(table_exists(db, TABLES[i]), "%s does not exist", TABLES[i]);
@@ -433,9 +442,13 @@ static void test_a_database_stopped_at_28_reaches_29_losslessly(void) {
     char repos_before[ATLAS_SHA256_HEX_LEN + 1u];
     table_digest(db, "repositories", repos_before);
 
-    T_OK(atlas_db_migrate(db, &err), &err);
+    /* Migration 29 specifically, not "to head": migration 30 (the T14 fix
+     * round) adds a column to `repositories`, and `table_digest` below is a
+     * `SELECT *` -- an unqualified "migrate to head" would make the
+     * before/after comparison fail on a schema change this suite is not
+     * about, rather than on the row rewrite it exists to catch. */
+    T_OK(atlas_db_migrate_list(db, all, 29u, &err), &err);
     T_EQ_INT(schema_of(db), 29);
-    T_EQ_INT((int)ATLAS_SCHEMA_VERSION, 29);
 
     for (size_t i = 0; i < sizeof TABLES / sizeof TABLES[0]; i++) {
         T_CHECK_MSG(table_exists(db, TABLES[i]), "migration 29 created no %s", TABLES[i]);

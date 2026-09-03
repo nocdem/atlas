@@ -449,7 +449,13 @@ atlas_status atlas_db_memory_unanchored_add(atlas_db *db, int64_t source_version
 atlas_status atlas_db_memory_generation_next(atlas_db *db, int64_t repo_id, int64_t *next_out,
                                              atlas_err *err);
 
-/* Appends one generation row. */
+/* Appends one generation row. Fix round: `trailer_scan_high` is no longer
+ * the trailer scan's authoritative cursor -- `repositories.trailer_scan_high`
+ * (migration 30, `atlas_db_repo_set_trailer_scan_high`) is, decoupled from
+ * this insert so it can advance on a pass that mints no generation at all.
+ * This parameter and column are kept purely as an informational record of
+ * what the cursor's value was at the moment this generation was minted;
+ * nothing reads it back. */
 atlas_status atlas_db_memory_generation_insert(atlas_db *db, int64_t repo_id, int64_t generation,
                                                atlas_memory_gen_cause cause,
                                                const char *repo_identity_hash,
@@ -485,16 +491,6 @@ atlas_status atlas_db_memory_generation_latest(atlas_db *db, int64_t repo_id, in
                                                atlas_buf *decision_set_digest_out,
                                                atlas_buf *source_set_digest_out, bool *found_out,
                                                atlas_err *err);
-
-/* T14. `memory_generations.trailer_scan_high` for this repository's latest
- * generation, or 0 when this repository has no generation yet -- the
- * trailer scan's own cursor, read on its own rather than folded into
- * `atlas_db_memory_generation_latest` above: that function already has seven
- * call sites across this tree (`docs/extending.md`'s own caution about
- * widening a signature everyone already calls), and the trailer scan is the
- * only one of them that needs this column. */
-atlas_status atlas_db_memory_generation_trailer_scan_high(atlas_db *db, int64_t repo_id,
-                                                          int64_t *high_out, atlas_err *err);
 
 /* Every distinct (kind, value) anchor ever recorded for this repository --
  * one row per repository fact a memory claim has anchored to, regardless of
@@ -1131,16 +1127,26 @@ typedef struct atlas_memory_pass_result {
      * because a commit's trailer block is a fact about `commits`, not about a
      * registered source. `trailer_scanned` is how many commit rows above the
      * cursor this pass examined, bounded at `ATLAS_MEMORY_TRAILER_PASS_MAX`;
-     * `trailer_bindings_written` is how many of those carried a recognised
-     * `Atlas-Provenance: v1` block and got a `memory_trailer_bindings` row
-     * (`has_block` 0 or 1, both stored -- a commit with no block is recorded
-     * as carrying none, a different fact from carrying a bad one, A9.2.2's
-     * shape one layer over commit trailers). `trailer_scan_bound_hit` is
-     * true when more commits remain above what this pass reached; the
-     * unexamined remainder stays above the last-persisted
-     * `memory_generations.trailer_scan_high` until a later pass advances it
-     * (only a pass that creates a new generation row persists this cursor at
-     * all -- see `atlas_memory_apply_in_tx`'s own comment). */
+     * `trailer_bindings_written` is how many of those *landed* a
+     * `memory_trailer_bindings` row (fix round M2: `sqlite3_changes`-counted,
+     * never a re-presentation of an already-recorded commit) -- one of
+     * `has_block` (a recognised `Atlas-Provenance: v1` block, verified or
+     * not) or `bound_hit` (the block search could not fully examine this
+     * commit's message -- see `atlas_memory_trailer_binding`'s own comment
+     * for the four states this and the cursor together let a reader tell
+     * apart). `trailer_scan_bound_hit` is true when more commits remain above
+     * what this pass reached.
+     *
+     * Fix round (Critical 1): the cursor for *this* field is
+     * `repositories.trailer_scan_high` (migration 30,
+     * `atlas_db_repo_trailer_scan_high`/`_set_trailer_scan_high`,
+     * `src/db/db_repo.c`), written after every pass that scanned at all,
+     * whether or not `ctx.any_change` ends up true -- decoupled from
+     * `memory_generations`, which is a ledger of what a pass *found*, not of
+     * how far it looked. A pass that scans 512 blockless commits and changes
+     * nothing else still leaves the next one starting at commit 513: finding
+     * nothing is no longer the same event as making no progress. See
+     * `atlas_memory_apply_in_tx`'s own comment for the exact write. */
     size_t trailer_scanned;
     size_t trailer_bindings_written;
     bool trailer_scan_bound_hit;
@@ -1513,11 +1519,15 @@ atlas_status atlas_memory_pack_reliance_match(const atlas_memory_pack *p,
  * `docs/plans/2026-09-01-a12.1-reconciled-memory.md` under "The commit
  * trailer block".
  *
- * **Two of the six fields survive an index rebuild; two do not; two are
- * content-derived and always do.** SQLite is a rebuildable index and git is
- * authoritative (architecture invariant 1) -- a trailer lives in git's
- * permanent record, so a reader needs to know which of its fields still mean
- * something after the index that produced them is gone:
+ * **Three of the six lines survive an index rebuild; two do not; the sixth
+ * is the fixed marker, never a value.** (Fix round M1: the previous wording
+ * here -- "two ... survive; two do not; two are content-derived and always
+ * do" -- named the two content-derived fields as if they were a third group
+ * disjoint from "survive", which doubles-counts them and reads as four of
+ * six surviving; they are two of the three that do.) SQLite is a rebuildable
+ * index and git is authoritative (architecture invariant 1) -- a trailer
+ * lives in git's permanent record, so a reader needs to know which of its
+ * fields still mean something after the index that produced them is gone:
  *
  *   - `Atlas-Context-Digest` and `Atlas-Decision-Set-Digest` are
  *     content-derived (`sha256` of a rendered pack and of a decision-set
@@ -1536,10 +1546,14 @@ atlas_status atlas_memory_pack_reliance_match(const atlas_memory_pack *p,
  *     rowid-reassignment exposure `Atlas-Memory-Generation` does. Worse: a
  *     reason row is not rederivable from git at all (nothing in a
  *     repository's history says why an agent made a change), so a database
- *     wipe loses it outright rather than merely renumbering it. Adding a
- *     uid column would fix this and is a migration; M29 has already shipped
- *     as this season's last one, so it is out of scope here and is recorded
- *     as a finding rather than done.
+ *     wipe loses it outright rather than merely renumbering it. Adding a uid
+ *     column would fix this and is a migration -- migration 30 shows a fix
+ *     round can add one when it must, so the reason this stays undone is not
+ *     "no migration was available": it is that `ai_reasons` is A2's table,
+ *     not T14's, and widening another season's table for a rebuild-survival
+ *     nicety this field can live without is a call for whoever owns it, not
+ *     a fix round closing a liveness defect. Recorded as a finding rather
+ *     than done.
  *   - `Atlas-Run` (`orch_runs.run_uid`) is original data, not a derived
  *     index fact -- assigned once at submission and never recomputed by
  *     anything -- so it does not share this exposure; a database restored
@@ -1560,17 +1574,43 @@ atlas_status atlas_memory_pack_reliance_match(const atlas_memory_pack *p,
  * the identical reason. */
 
 /* What one commit's trailer block resolved to -- `memory_trailer_bindings`'
- * own shape (migration 29, `src/db/migrate.c:4450-4467`). A value is present
- * only when it verified; a field that did not is named in `unknown_fields`
- * and carries no stored value, so a caller can never confuse "verified true"
- * with "not even attempted" -- A9.2.2's shape, one layer over commit
- * trailers. `has_block` is the one field that is never itself in
- * `unknown_fields`: it says whether an `Atlas-Provenance: v1` line was found
- * at all, and when it is false every other member is at its zero and
- * `unknown_fields` is empty -- a commit with no block is recorded as
- * carrying none, a different fact from carrying six bad ones. */
+ * own shape (migration 29, `src/db/migrate.c:4450-4467`, widened by
+ * migration 30's `bound_hit`). A value is present only when it verified; a
+ * field that did not is named in `unknown_fields` and carries no stored
+ * value, so a caller can never confuse "verified true" with "not even
+ * attempted" -- A9.2.2's shape, one layer over commit trailers. `has_block`
+ * is the one field that is never itself in `unknown_fields`: it says whether
+ * an `Atlas-Provenance: v1` line was found at all, and when it is false
+ * every other member is at its zero and `unknown_fields` is empty -- a
+ * commit with no block is recorded as carrying none, a different fact from
+ * carrying six bad ones.
+ *
+ * `bound_hit` is the fix-round addition that keeps that same distinction from
+ * collapsing a third state into it: `has_block` false does not by itself mean
+ * "this commit definitely carries no block" -- the block search
+ * (`find_provenance_line`, `src/memory/trailer.c`) can also stop because it
+ * ran out of message to look at, at either of its two bounds
+ * (`ATLAS_MEMORY_TRAILER_SCAN_MAX` lines or the
+ * `ATLAS_MEMORY_TRAILER_TAIL_BYTES_MAX` byte backstop), before ever finding a
+ * marker. `bound_hit` is true exactly then: `has_block` false and `bound_hit`
+ * true together say "this parse could not fully examine this commit's
+ * message, so a block may exist beyond what it considered" -- a different
+ * fact from "the whole message was examined and there is no such line" (both
+ * false) and from "not yet scanned" (no row at all, `commits.id` above the
+ * persisted cursor). `atlas_memory_pass_result`'s own comment names the four
+ * states in full. `bound_hit` is never true alongside `has_block`: once a
+ * marker is found the search stops, so a found block was never truncated by
+ * either bound (see `find_provenance_line`'s own comment for why the search
+ * runs from the end of the tail backward, which is what makes "found" and
+ * "bound reached" mutually exclusive outcomes of the same walk). */
 typedef struct atlas_memory_trailer_binding {
     bool has_block;
+    /* Fix round (I1/I2). True only when `has_block` is false: the block
+     * search could not fully examine this commit's message before stopping,
+     * so this parse's absence finding is not a proof of absence -- see the
+     * struct comment above and A9.2.2's asymmetry, one layer over commit
+     * trailers. */
+    bool bound_hit;
     atlas_buf run_uid;           /* set only when orch_runs names this run and this repository */
     int64_t memory_generation;   /* set only when it equals the resolved run's frozen pack's own
                                      memory_generation -- see the section comment above for why an
@@ -1607,21 +1647,28 @@ atlas_status atlas_memory_trailer_compose(atlas_db *db, const char *run_uid,
  * `unknown_fields`. Writes nothing itself -- the reconciliation pass
  * (`atlas_memory_apply_in_tx`) stores the row. Refuses with `ATLAS_ERR_REPO`
  * when `commit_oid` is not an indexed commit of `repo_id`; a commit that is
- * indexed but carries no `Atlas-Provenance: v1` line returns `ATLAS_OK` with
- * `out->has_block` false and every other member at its zero. */
+ * indexed but carries no `Atlas-Provenance: v1` line within the bounded
+ * search returns `ATLAS_OK` with `out->has_block` false, `out->bound_hit`
+ * set according to whether that search could look at the whole message (see
+ * the struct comment), and every other member at its zero. */
 atlas_status atlas_memory_trailer_ingest(atlas_db *db, int64_t repo_id, const char *commit_oid,
                                          atlas_memory_trailer_binding *out, atlas_err *err);
 
-/* T14. The one write for `memory_trailer_bindings` -- `db_memory.c`'s own
- * file header states it is the only production writer of a `memory_*` table,
- * and T17's grep is what proves it. `INSERT OR IGNORE`: `UNIQUE(repo_id,
- * commit_oid)` makes a re-scan of an already-recorded commit (the cursor
- * residual `atlas_memory_pass_result`'s own comment describes) idempotent
- * rather than a constraint violation. */
+/* T14, widened by the fix round. The one write for `memory_trailer_bindings`
+ * -- `db_memory.c`'s own file header states it is the only production writer
+ * of a `memory_*` table, and T17's grep is what proves it. `INSERT OR
+ * IGNORE`: `UNIQUE(repo_id, commit_oid)` makes a re-scan of an
+ * already-recorded commit idempotent rather than a constraint violation, and
+ * `*landed_out` (when non-NULL) is set from `sqlite3_changes` -- true only
+ * when this call actually inserted a new row, false on the IGNORE path --
+ * `atlas_db_memory_unanchored_add`'s own precedent, so a caller counting
+ * genuine writes (`trailer_bindings_written`, fix round M2) does not
+ * overstate a re-walk of an already-recorded commit as a fresh one. */
 atlas_status atlas_db_memory_trailer_binding_insert(atlas_db *db, int64_t repo_id,
                                                     const char *commit_oid,
                                                     const atlas_memory_trailer_binding *b,
-                                                    const char *recorded_at, atlas_err *err);
+                                                    const char *recorded_at, bool *landed_out,
+                                                    atlas_err *err);
 
 /* T14. Reads one commit's stored binding back, for a caller that wants what
  * the pass recorded rather than what re-ingesting would compute now (a later

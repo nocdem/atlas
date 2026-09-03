@@ -521,6 +521,54 @@ atlas_status atlas_db_repo_scanner_uid(atlas_db *db, int64_t repo_id, int64_t *o
     return ATLAS_OK;
 }
 
+/* A12.1 T14 fix round (migration 30). See the declaration in `include/atlas/
+ * db.h` and the migration 30 comment for why this cursor lives on
+ * `repositories` rather than inside a `memory_generations` row: it is
+ * current state, `scanner_uid`/`mirror_complete`'s own shape, not a ledger
+ * entry, and it must have a writer that runs whether or not a reconciliation
+ * pass found anything to record. */
+atlas_status atlas_db_repo_trailer_scan_high(atlas_db *db, int64_t repo_id, int64_t *out,
+                                             atlas_err *err) {
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(
+        db, "SELECT trailer_scan_high FROM repositories WHERE id = ?1;", &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, repo_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot bind the repository id");
+    }
+    /* A repository that does not exist, or one that has never had a trailer
+     * scan pass, both report 0 -- "start from the top of history" is the
+     * correct answer either way. */
+    int64_t high = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        high = sqlite3_column_int64(stmt, 0);
+    }
+    atlas_db_finish(db, stmt);
+    if (out != NULL) {
+        *out = high;
+    }
+    return ATLAS_OK;
+}
+
+atlas_status atlas_db_repo_set_trailer_scan_high(atlas_db *db, int64_t repo_id, int64_t high,
+                                                 atlas_err *err) {
+    sqlite3_stmt *stmt = NULL;
+    atlas_status st = atlas_db_prepare(
+        db, "UPDATE repositories SET trailer_scan_high = ?1 WHERE id = ?2;", &stmt, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (sqlite3_bind_int64(stmt, 1, high) != SQLITE_OK ||
+        sqlite3_bind_int64(stmt, 2, repo_id) != SQLITE_OK) {
+        atlas_db_finish(db, stmt);
+        return atlas_err_set(err, ATLAS_ERR_DB, "cannot bind the trailer scan cursor");
+    }
+    return atlas_db_step_done(db, stmt, err);
+}
+
 atlas_status atlas_db_repo_list(atlas_db *db, atlas_repo_cb cb, void *ud, atlas_err *err) {
     sqlite3_stmt *stmt = NULL;
     atlas_status st = atlas_db_prepare(

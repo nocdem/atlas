@@ -182,13 +182,15 @@ static void test_a_schema_nine_database_reaches_ten_additively(void) {
              "DROP TABLE sem_current;"
              "DROP TABLE sem_generations;"
              "DROP TABLE decision_edge_events;"
-             /* Migration 27 added a column to `repositories`. A rewind that leaves a
-              * later migration's *column* behind is no more a schema-N database than
+             /* Migration 27 added a column to `repositories`, and migration 30
+              * (the T14 fix round) added another. A rewind that leaves a later
+              * migration's *column* behind is no more a schema-N database than
               * one that leaves its table behind, and re-running the chain would
               * fail with "duplicate column name". */
              "ALTER TABLE repositories DROP COLUMN scanner_uid;"
              "ALTER TABLE repositories DROP COLUMN mirror_complete;"
              "ALTER TABLE repositories DROP COLUMN mirror_at;"
+             "ALTER TABLE repositories DROP COLUMN trailer_scan_high;"
              /* A12.1's eight tables, children before parents: migration 29
               * runs again on top of this rewind, and a rewind that leaves a
               * later migration's table behind is not a database at the

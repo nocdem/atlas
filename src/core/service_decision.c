@@ -1682,6 +1682,13 @@ static atlas_status show_prompt(atlas_terminal *t, const char *repo, const char 
     return st;
 }
 
+/* A15 T4. Declared `extern` in `include/atlas/service.h` and defined here,
+ * once, so the review walker's ABANDONED mapping can compare against exactly
+ * this sentence with `strcmp` rather than carrying a second copy of it that
+ * could drift. See the refusal below, the only place this text is produced. */
+const char ATLAS_DECISION_CONFIRM_MISTYPED_MSG[] =
+    "that is not the confirmation for this revision; nothing was changed";
+
 atlas_status atlas_service_decision_confirm(atlas_ctx *ctx, const char *repo, const char *uid,
                                             atlas_decision_intent intent,
                                             const char *replacement_uid, int64_t revision_no,
@@ -1806,8 +1813,7 @@ atlas_status atlas_service_decision_confirm(atlas_ctx *ctx, const char *repo, co
         strncmp(atlas_buf_cstr(&answer), issued.confirm, strlen(issued.confirm)) != 0) {
         atlas_buf_free(&answer);
         atlas_decision_result_free(&issued);
-        return atlas_err_set(err, ATLAS_ERR_USAGE,
-                             "that is not the confirmation for this revision; nothing was changed");
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "%s", ATLAS_DECISION_CONFIRM_MISTYPED_MSG);
     }
 
     /* Spend it. */

@@ -325,6 +325,11 @@ set(ATLAS_TESTS
   # out. No database, no daemon, no repository, `test_memory_source.c`'s own
   # reason for sitting in the fast "unit" subset rather than "integration".
   test_review_sheet
+  # T4: the walker's `--check` half -- a real repository and a real database,
+  # `test_decision_operator.c`'s reason for sitting in "integration" rather
+  # than "unit". The interactive half, which needs a real pseudo-terminal, is
+  # T6's own suite.
+  test_review_apply
 )
 
 foreach(test_name IN LISTS ATLAS_TESTS)
@@ -434,6 +439,11 @@ set_tests_properties(test_verify_product PROPERTIES LABELS "daemon" TIMEOUT 900)
 # The operator suite builds a real repository and drives the binary through a
 # pseudo-terminal, so it is an integration test rather than a unit one.
 set_tests_properties(test_decision_operator PROPERTIES LABELS "integration")
+# A15 T4. The walker's `--check` half builds a real repository and a real
+# database through the binary (repo add, scan, propose, revise), then calls
+# atlas_service_review_apply directly in process -- no pseudo-terminal, but
+# still a real repository and database, so "integration" rather than "unit".
+set_tests_properties(test_review_apply PROPERTIES LABELS "integration")
 # The MCP surface is a property of the binary: no database, no daemon, no repository.
 set_tests_properties(test_decision_mcp PROPERTIES LABELS "unit")
 # test_ai_trust and test_hooks fork a live daemon and wait on filesystem events,

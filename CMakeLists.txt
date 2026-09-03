@@ -425,6 +425,14 @@ add_library(atlas_core STATIC
   # enumerated by a unit test rather than only exercised through a real
   # terminal session a later task's walker drives.
   src/core/review.c
+  # --- A15 T4: the review walker ----------------------------------------------
+  #
+  # Loops atlas_service_decision_confirm -- the operator channel's one entry
+  # point -- and adds no other way to reach it: the pre-check that decides
+  # whether to call it at all is composed entirely out of existing service
+  # functions (atlas_service_decision_show and its remote form), so this file
+  # opens no database handle and creates no process of its own.
+  src/core/service_review.c
   ${ATLAS_UI_GEN}
 )
 

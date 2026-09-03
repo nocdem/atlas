@@ -33,6 +33,7 @@
 #include "atlas/ipc.h"
 #include "atlas/limits.h"
 #include "atlas/reconcile.h"
+#include "atlas/review.h"
 #include "atlas/scan.h"
 #include "atlas/sha256.h"
 #include "atlas/syspolicy.h"
@@ -941,6 +942,94 @@ atlas_status atlas_service_decision_confirm(atlas_ctx *ctx, const char *repo, co
                                             atlas_decision_intent intent,
                                             const char *replacement_uid, int64_t revision_no,
                                             atlas_decision_outcome *out, atlas_err *err);
+
+/* A15 T4. The exact sentence `atlas_service_decision_confirm` returns when the
+ * operator typed something other than the confirmation
+ * (`src/core/service_decision.c`), pinned once here rather than left as two
+ * literals that could drift: the review walker's ABANDONED mapping keys on
+ * this text matching exactly, compared whole with `strcmp`. Declared `extern`
+ * rather than `static const char[]` so that a translation unit which includes
+ * this header without quoting the sentence carries no unused-variable warning
+ * for it; defined once, in `src/core/service_decision.c`. */
+extern const char ATLAS_DECISION_CONFIRM_MISTYPED_MSG[];
+
+/* --- A15 T4: the review walker ----------------------------------------------
+ *
+ * A review sheet (`include/atlas/review.h`, T3) is an operator's own file on
+ * this machine, transcribed by hand out of a Mission Control browser session.
+ * It carries no authority and no confirmation; every entry it names is still
+ * confirmed by typing a hash prefix on `/dev/tty`, per entry, through
+ * `atlas_service_decision_confirm` above and through nothing else — this file
+ * mints no capability and spends none itself.
+ *
+ * The walker's whole job beyond looping `atlas_service_decision_confirm` is
+ * the pre-check: reading the live record again, immediately before minting
+ * anything, so that a record which moved between when it was read in a
+ * browser and when the sheet reached a terminal is refused rather than
+ * approved at the wrong revision. The pre-check costs no challenge row —
+ * everything it does is a read — which is what lets `--check` run it exactly
+ * once with nothing minted, as a dry run of what a real run would find. */
+
+/* What one entry's walk produced. Owned buffers, `_init`/`_free` below;
+ * `entry` is borrowed for the callback only, like every other row callback in
+ * this layer. */
+typedef struct atlas_review_outcome {
+    const atlas_review_entry *entry; /* borrowed for the callback */
+    atlas_review_verdict verdict;
+    atlas_buf status;  /* the record's status as read, or empty */
+    atlas_buf detail;  /* a §Frozen detail line, or the refusal message; fixed
+                        * Atlas text with checked values, or safe-encoded */
+    int64_t current_revision_no; /* MOVED: what the newest is */
+    char current_prefix[ATLAS_DECISION_CONFIRM_HEX + 1u];
+} atlas_review_outcome;
+
+void atlas_review_outcome_init(atlas_review_outcome *o);
+void atlas_review_outcome_free(atlas_review_outcome *o);
+
+typedef atlas_status (*atlas_review_outcome_cb)(const atlas_review_outcome *o, void *ud,
+                                                atlas_err *err);
+
+/* The counts across a whole sheet. `ready` is meaningful only under
+ * `check_only`; `applied`/`abandoned`/`refused` only outside it — a sheet's
+ * entries settle into exactly one bucket each, and which buckets can be
+ * nonzero depends on which mode walked it. */
+typedef struct atlas_review_totals {
+    int64_t ready, applied, abandoned, moved, disposed, missing, refused;
+} atlas_review_totals;
+
+/* Walks one sheet. Order of operations, and none may move:
+ *   1. unless `check_only`, atlas_authority_require(ATLAS_AUTHORITY_OP_DECISION_LIFECYCLE)
+ *      — before a file is read or a terminal is touched, so a locked profile
+ *      never gets that far. A dry run mints nothing and reveals nothing this
+ *      uid could not already read with `atlas decision show`, so `--check`
+ *      asks for neither authority nor a terminal — see the T4 report for the
+ *      chain this turns on;
+ *   2. unless `check_only`, atlas_terminal_open + close — the refusal is that
+ *      function's own sentence, and it happens before the sheet is read;
+ *   3. read `sheet_path` with O_NOFOLLOW, bounded by ATLAS_REVIEW_SHEET_MAX_BYTES,
+ *      and atlas_review_sheet_parse; a parsed sheet with zero entries — a
+ *      header with nothing after it, which the parser accepts as
+ *      grammatically valid — is refused here with "review sheet: no entries;
+ *      there is nothing to review", because under the frozen exit-code rule
+ *      zero entries makes "every entry ended APPLIED" vacuously true and a
+ *      truncated sheet would otherwise exit 0 having done nothing;
+ *   4. per entry, in sheet order: atlas_service_decision_show with revision_no
+ *      = the entry's revision (or its remote form, chosen as the rest of the
+ *      service layer chooses) → MISSING when the repository or the decision
+ *      is unknown; MOVED when summary.latest_revision_no != revision_no or
+ *      that revision's content_hash does not begin with the entry's prefix;
+ *      DISPOSED when summary.status is not the status the intent needs
+ *      (PROPOSED for approve and reject, APPROVED for resolve) — all three
+ *      without minting; else, under `check_only`, READY; else
+ *      atlas_service_decision_confirm(ctx, repo, decision, intent, NULL,
+ *      revision_no, …) → APPLIED, or ABANDONED when its refusal is exactly
+ *      ATLAS_DECISION_CONFIRM_MISTYPED_MSG, or REFUSED carrying its message.
+ * The callback is invoked once per entry, in order, with borrowed pointers. A
+ * refused or abandoned entry does not stop the walk; a non-OK return from the
+ * callback itself does. Nothing is retried. */
+atlas_status atlas_service_review_apply(atlas_ctx *ctx, const char *sheet_path, bool check_only,
+                                        atlas_review_outcome_cb cb, void *ud,
+                                        atlas_review_totals *totals, atlas_err *err);
 
 /* Markdown or JSON, to a stream. Never written into the target repository:
  * Atlas is read-only with respect to a registered worktree, and a decision

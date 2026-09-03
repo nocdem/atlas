@@ -163,8 +163,18 @@ static void heartbeat(atlas_writer *w, const atlas_buf *token, atlas_orch_state 
     atlas_orch_result_free(&r);
 }
 
+/* `touched_paths` is sent raw and unencoded by this helper -- a caller that
+ * wants `atlas_orch_paths_encode`'s shape builds it itself (`one_path_encoded`
+ * below, or by hand for more than one path); NULL leaves `op->touched_paths`
+ * empty, the "never gathered" wire shape. `touched_complete` is a parameter
+ * (T13 fix round, I1/I2/I3) rather than hardcoded `true`, so a case can drive
+ * the daemon's `op_complete` / `reliance_check` (`src/db/db_orch.c`) with the
+ * exact struct fields a real completion carries -- the client-side JSON
+ * wire encoding (`build_run_complete`, `src/core/service_orch.c`, I1's own
+ * fix) is not exercised by this path, `atlas_writer_orch` taking the struct
+ * directly, matching every other daemon-thread test in this tree. */
 static void complete_job(atlas_writer *w, const atlas_buf *token, const char *touched_paths,
-                         atlas_orch_result *r) {
+                         bool touched_complete, atlas_orch_result *r) {
     atlas_err err;
     atlas_err_init(&err);
     atlas_orch_op *op = atlas_orch_op_new(ATLAS_ORCH_OP_COMPLETE);
@@ -177,7 +187,7 @@ static void complete_job(atlas_writer *w, const atlas_buf *token, const char *to
     if (touched_paths != NULL) {
         T_OK(atlas_buf_set_str(&op->touched_paths, touched_paths, &err), &err);
     }
-    op->touched_complete = true;
+    op->touched_complete = touched_complete;
     atlas_orch_result_init(r);
     T_OK(atlas_writer_orch(w, op, 10000, NULL, r, &err), &err);
 }
@@ -359,11 +369,20 @@ static void test_no_sources_composes_the_bare_task(void) {
 /* --- (c): the reliance check, and the terminal status it must not move ---- */
 
 /* Runs one full SUBMIT/LEASE/COMPLETE cycle over a repository with exactly one
- * flagged, PATH-anchored claim, sending `touched` (or nothing, when NULL) as
- * the completion's observed touched paths. Returns the run's terminal status
- * and whether the pack row's `reliance_claim_uids` names the seeded claim. */
-static void run_reliance_scenario(const char *touched_path_or_null, atlas_orch_run_status *status,
-                                  bool *claim_named, int64_t *reliance_checked) {
+ * flagged, PATH-anchored claim, sending `touched_paths_raw` (or nothing, when
+ * NULL -- the "never gathered" wire shape) and `touched_complete` exactly as
+ * the completion's `op` struct, the same fields `op_complete` /
+ * `reliance_check` (`src/db/db_orch.c`) actually read. `touched_paths_raw` is
+ * sent unencoded: a caller wanting `atlas_orch_paths_encode`'s netstring
+ * shape builds it first (`one_path_encoded` below, or by hand for more than
+ * one entry, or a deliberately malformed string to drive I3's internal-error
+ * path). Returns the run's terminal status, whether the pack row's
+ * `reliance_claim_uids` names the seeded claim, and the raw
+ * `reliance_checked` / `reliance_complete` columns -- T13 fix round I1/I2/I3's
+ * own evidence, beside case (c)'s original two outputs. */
+static void run_reliance_scenario_full(const char *touched_paths_raw, bool touched_complete,
+                                       atlas_orch_run_status *status, bool *claim_named,
+                                       int64_t *reliance_checked, int64_t *reliance_complete) {
     atlas_err err;
     atlas_err_init(&err);
     t8env e;
@@ -416,14 +435,8 @@ static void run_reliance_scenario(const char *touched_path_or_null, atlas_orch_r
     heartbeat(w, &lr.token, ATLAS_ORCH_STATE_PREPARING);
     heartbeat(w, &lr.token, ATLAS_ORCH_STATE_RUNNING);
 
-    atlas_buf touched = ATLAS_BUF_INIT;
-    if (touched_path_or_null != NULL) {
-        one_path_encoded(touched_path_or_null, &touched);
-    }
     atlas_orch_result comp;
-    complete_job(w, &lr.token, touched_path_or_null != NULL ? atlas_buf_cstr(&touched) : NULL,
-                &comp);
-    atlas_buf_free(&touched);
+    complete_job(w, &lr.token, touched_paths_raw, touched_complete, &comp);
     *status = comp.run_status;
 
     atlas_db *rdb = reopen(&e);
@@ -432,7 +445,7 @@ static void run_reliance_scenario(const char *touched_path_or_null, atlas_orch_r
     pack_row(rdb, atlas_buf_cstr(&sub.run_uid), &pack, &found);
     T_REQUIRE(found);
     T_CHECK_MSG(pack.claim_count > 0, "the seeded claim was not part of the pack's relevant set");
-    /* Read the two reliance columns directly: `atlas_memory_pack` (T12's own
+    /* Read the three reliance columns directly: `atlas_memory_pack` (T12's own
      * struct) deliberately carries none of them -- see its own field comment.
      * `reliance_claim_uids` is compared against the frozen `claims_manifest`'s
      * own first (and only) claim uid, extracted the same way `atlas_memory_
@@ -440,8 +453,8 @@ static void run_reliance_scenario(const char *touched_path_or_null, atlas_orch_r
     {
         sqlite3_stmt *st = NULL;
         T_OK(atlas_db_prepare(rdb,
-                              "SELECT reliance_checked, reliance_claim_uids FROM "
-                              "memory_context_packs WHERE run_uid = ?1;",
+                              "SELECT reliance_checked, reliance_claim_uids, reliance_complete "
+                              "FROM memory_context_packs WHERE run_uid = ?1;",
                               &st, &err),
             &err);
         T_OK(atlas_db_bind_text_opt(rdb, st, 1, atlas_buf_cstr(&sub.run_uid), &err), &err);
@@ -452,6 +465,7 @@ static void run_reliance_scenario(const char *touched_path_or_null, atlas_orch_r
          * element; a match in `reliance_claim_uids` is a substring match on
          * the same bytes, which is sufficient for one claim in the pack. */
         *claim_named = uids != NULL && uids[0] != '\0' && strcmp(uids, "0:") != 0;
+        *reliance_complete = sqlite3_column_int64(st, 2);
         atlas_db_finish(rdb, st);
     }
     atlas_memory_pack_free(&pack);
@@ -462,6 +476,20 @@ static void run_reliance_scenario(const char *touched_path_or_null, atlas_orch_r
     atlas_orch_result_free(&comp);
     t11_writer_close(log, w);
     t8_env_close(&e);
+}
+
+/* Case (c)'s original shape: one path, `touched_complete = true`, over
+ * `run_reliance_scenario_full`. */
+static void run_reliance_scenario(const char *touched_path_or_null, atlas_orch_run_status *status,
+                                  bool *claim_named, int64_t *reliance_checked) {
+    atlas_buf touched = ATLAS_BUF_INIT;
+    if (touched_path_or_null != NULL) {
+        one_path_encoded(touched_path_or_null, &touched);
+    }
+    int64_t reliance_complete = 0;
+    run_reliance_scenario_full(touched_path_or_null != NULL ? atlas_buf_cstr(&touched) : NULL,
+                               true, status, claim_named, reliance_checked, &reliance_complete);
+    atlas_buf_free(&touched);
 }
 
 /* Required case (c). A fake worker's completion names the flagged claim's own
@@ -488,6 +516,150 @@ static void test_reliance_check_finds_the_overlap_and_settles_the_same_way(void)
                "a reliance finding changed the run's terminal status (%s vs %s)",
                atlas_orch_run_status_name(with_overlap), atlas_orch_run_status_name(without_overlap));
     T_CHECK_MSG(with_overlap == ATLAS_ORCH_RUN_ACCEPTED, "the scenario itself did not settle ACCEPTED");
+}
+
+/* --- T13 fix round: I1/I2/I3, the reliance check's three states ----------- */
+
+/* Builds a touched-paths netstring list of exactly `n` entries: entry 0 is
+ * `first_path_or_null` when given, and every other entry (and entry 0 when
+ * `first_path_or_null` is NULL) is a distinct path nothing in the pack ever
+ * flags. Used to build a `truncated` observation
+ * (`n == ATLAS_MEMORY_MAX_TOUCHED_PATHS`) that still proves the reliance
+ * match runs over what *was* observed before the bound. */
+static void many_paths_encoded(size_t n, const char *first_path_or_null, atlas_buf *out) {
+    atlas_err err;
+    atlas_err_init(&err);
+    T_REQUIRE(n <= ATLAS_MEMORY_MAX_TOUCHED_PATHS);
+    atlas_buf *paths = calloc(n, sizeof *paths);
+    T_REQUIRE(paths != NULL);
+    for (size_t i = 0; i < n; i++) {
+        atlas_buf_init(&paths[i]);
+        if (i == 0 && first_path_or_null != NULL) {
+            T_OK(atlas_buf_set_str(&paths[i], first_path_or_null, &err), &err);
+        } else {
+            char name[64];
+            (void)snprintf(name, sizeof name, "filler/%zu.txt", i);
+            T_OK(atlas_buf_set_str(&paths[i], name, &err), &err);
+        }
+    }
+    T_OK(atlas_orch_paths_encode(paths, n, out, &err), &err);
+    for (size_t i = 0; i < n; i++) {
+        atlas_buf_free(&paths[i]);
+    }
+    free(paths);
+}
+
+/* T13 fix round, I1/I2. Three states over the same seeded, flagged pack:
+ * "complete" (one observed path, the flagged anchor itself, `touched_complete
+ * = true`), "truncated" (`ATLAS_MEMORY_MAX_TOUCHED_PATHS` observed paths, the
+ * flagged anchor among them, `touched_complete = false` -- exactly what the
+ * driver sends when `gather_touched_paths` hits its own bound,
+ * `src/orch/rundriver.c`'s `touched_add`), and "never-gathered" (no
+ * `touched_paths` at all -- what a refusal before the worker ran, a moved
+ * HEAD, or I1's own failed-gather case all leave). Each must land a
+ * different stored `(reliance_checked, reliance_complete, is a claim
+ * named)` tuple: I2's fix is exactly that the third state stops looking like
+ * the first. The never-gathered case deliberately sends `touched_complete =
+ * true` -- the *wrong* value for what actually happened, matching
+ * `outcome_init`'s own default -- because I2's fix means this field is never
+ * read when there is nothing to observe: the stored row must not depend on
+ * it.
+ *
+ * A fourth row, "gathered-zero", drives the exact byte boundary I2's own
+ * argument rests on: `atlas_orch_paths_encode(..., 0, ...)` produces `"0:"`,
+ * length 2, never length 0 -- so a real "the worker changed nothing"
+ * observation must never be gated out the way "never-gathered" (length 0) is.
+ * It is not a fourth *code path* (it lands on the same branch as "complete",
+ * with a matched-claim count of zero rather than one) but it is the input
+ * that distinguishes the gate from a length check that got the boundary
+ * wrong. */
+static void test_reliance_three_states_produce_three_stored_results(void) {
+    atlas_orch_run_status status = ATLAS_ORCH_RUN_UNKNOWN;
+    bool claim_named = false;
+    int64_t checked = 0, complete_col = 0;
+
+    /* complete */
+    {
+        atlas_buf touched = ATLAS_BUF_INIT;
+        one_path_encoded("ATLAS_FAKE_DRIVER.txt", &touched);
+        run_reliance_scenario_full(atlas_buf_cstr(&touched), true, &status, &claim_named, &checked,
+                                   &complete_col);
+        atlas_buf_free(&touched);
+        T_CHECK_MSG(checked == 1, "complete: reliance_checked was not set");
+        T_CHECK_MSG(complete_col == 1, "complete: reliance_complete was not set");
+        T_CHECK_MSG(claim_named, "complete: the flagged anchor's claim was not recorded");
+        T_CHECK_MSG(status == ATLAS_ORCH_RUN_ACCEPTED, "complete: the run did not settle ACCEPTED");
+    }
+
+    /* gathered-zero: the worker's own `git status` came back clean. The
+     * driver would never send anything but `atlas_orch_paths_encode`'s own
+     * `"0:"` for this; sent here literally to pin the exact boundary. */
+    {
+        run_reliance_scenario_full("0:", true, &status, &claim_named, &checked, &complete_col);
+        T_CHECK_MSG(checked == 1,
+                    "gathered-zero: reliance_checked was not set even though \"0:\" is a real "
+                    "observation, not an absent one");
+        T_CHECK_MSG(complete_col == 1, "gathered-zero: reliance_complete was not set");
+        T_CHECK_MSG(!claim_named,
+                    "gathered-zero: a claim was recorded when nothing was observed to touch it");
+        T_CHECK_MSG(status == ATLAS_ORCH_RUN_ACCEPTED,
+                    "gathered-zero: the reliance finding moved the run's terminal status");
+    }
+
+    /* truncated */
+    {
+        atlas_buf touched = ATLAS_BUF_INIT;
+        many_paths_encoded(ATLAS_MEMORY_MAX_TOUCHED_PATHS, "ATLAS_FAKE_DRIVER.txt", &touched);
+        run_reliance_scenario_full(atlas_buf_cstr(&touched), false, &status, &claim_named, &checked,
+                                   &complete_col);
+        atlas_buf_free(&touched);
+        T_CHECK_MSG(checked == 1, "truncated: reliance_checked was not set");
+        T_CHECK_MSG(complete_col == 0,
+                    "truncated: reliance_complete was set from a truncated observation");
+        T_CHECK_MSG(claim_named,
+                    "truncated: the flagged anchor's claim was not recorded even though it was "
+                    "among the paths observed before the bound");
+        T_CHECK_MSG(status == ATLAS_ORCH_RUN_ACCEPTED,
+                    "truncated: the reliance finding moved the run's terminal status");
+    }
+
+    /* never-gathered */
+    {
+        run_reliance_scenario_full(NULL, true, &status, &claim_named, &checked, &complete_col);
+        T_CHECK_MSG(checked == 0,
+                    "never-gathered: reliance_checked was set from a completion with no "
+                    "observation at all");
+        T_CHECK_MSG(!claim_named, "never-gathered: a claim was recorded from nothing observed");
+        T_CHECK_MSG(status == ATLAS_ORCH_RUN_ACCEPTED,
+                    "never-gathered: the absent observation moved the run's terminal status");
+    }
+}
+
+/* T13 fix round, I3. A malformed `touched_paths` -- a count past
+ * `ATLAS_MEMORY_MAX_TOUCHED_PATHS`, the shape a dispatcher-uid peer could send
+ * (never the run driver, which never sends more than the bound) -- makes
+ * `atlas_orch_paths_decode` refuse deep inside `reliance_check`
+ * (`src/db/db_orch.c`). Before this round the failure propagated out of
+ * `op_complete` and rolled back the whole completion transaction: the lease
+ * was never released and the run could only reach BLOCKED, later, by expiry
+ * -- a run status decided by the memory layer, the coupling Decision 8
+ * forbids. `complete_job`'s own `T_OK` on `atlas_writer_orch` is the first
+ * assertion this test makes and the one that would have failed before this
+ * round: the completion must land at all. */
+static void test_a_reliance_check_internal_error_never_blocks_the_run(void) {
+    atlas_orch_run_status status = ATLAS_ORCH_RUN_UNKNOWN;
+    bool claim_named = false;
+    int64_t checked = 0, complete_col = 0;
+    /* Six digits (the decoder's own ceiling before it refuses outright) and a
+     * count past the cap: `atlas_orch_paths_decode` refuses with "a stored
+     * path list holds 999999 entries, cap is 256" before it reads a single
+     * path. */
+    run_reliance_scenario_full("999999:", true, &status, &claim_named, &checked, &complete_col);
+    T_CHECK_MSG(status == ATLAS_ORCH_RUN_ACCEPTED,
+               "an internal reliance-check error changed the run's terminal status instead of "
+               "being recorded as not performed");
+    T_CHECK_MSG(checked == 0, "an internal reliance-check error was recorded as a completed check");
+    T_CHECK_MSG(!claim_named, "an internal reliance-check error somehow recorded a claim");
 }
 
 /* --- (d): a stale pack is delivered as such, never as current ------------- */
@@ -594,6 +766,10 @@ static const atlas_test TESTS[] = {
      test_no_sources_composes_the_bare_task},
     {"the reliance check finds the overlap and settles the run the same way either way",
      test_reliance_check_finds_the_overlap_and_settles_the_same_way},
+    {"complete, truncated and never-gathered each land a different stored reliance result",
+     test_reliance_three_states_produce_three_stored_results},
+    {"an internal reliance-check error is recorded as not performed, never a blocked run",
+     test_a_reliance_check_internal_error_never_blocks_the_run},
     {"a stale pack is delivered as stale, never as current", test_a_stale_pack_is_delivered_as_stale},
 };
 

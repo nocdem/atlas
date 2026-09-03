@@ -592,16 +592,37 @@ static atlas_status build_run_complete(atlas_json *j, void *ud, atlas_err *err) 
             st = atlas_json_arr_end(j, err);
         }
     }
-    /* A12.1 T13. The run driver's own touched-paths observation. Omitted
-     * entirely when it gathered nothing (a refusal before the worker ran, a
-     * moved HEAD) -- the same "absent key, conservative reading" contract as
-     * `usage` above, and `op->touched_complete`'s own default (`true`) is what
-     * the far side reads for an absent `touched_complete` too. */
+    /* A12.1 T13. The run driver's own touched-paths observation. `touched_paths`
+     * is omitted entirely when it gathered nothing -- a refusal before the
+     * worker ran, a moved HEAD, or a gather that ran and failed all leave the
+     * buffer empty, and there is nothing to send.
+     *
+     * A12.1 fix round, I1. `touched_complete` used to be nested inside the
+     * `touched_paths.len > 0` guard above and sent only when `false`, which
+     * meant a driver that gathered nothing and explicitly set
+     * `touched_complete = false` (a failed gather, `src/orch/rundriver.c`'s
+     * `gather_touched_paths` failure path) sent neither key, and the far side
+     * read the absent `touched_complete` as its old default, `true` -- not
+     * "conservative": `true` is the completeness claim, and the driver's own
+     * `false` never left this process.
+     *
+     * The task directive for this fix is stronger than "send it when false":
+     * send the key **always**, and make the absent reading the conservative
+     * one. Both halves are now true. This key is new in A12.1 (no older
+     * client's meaning moves by strengthening it), `atlas_orch_op_new`
+     * (`src/db/db_orch.c`) and `outcome_init` (`src/orch/rundriver.c`) both
+     * now default `touched_complete` to `false`, and it is emitted
+     * unconditionally here, so the driver's classification always reaches the
+     * wire -- explicitly, never by relying on a default anywhere in the
+     * chain. (`reliance_check`, `src/db/db_orch.c`, does not read this value
+     * when `touched_paths` is empty either way -- see I2 there -- but the
+     * wire contract must still say what actually happened, for any future
+     * reader, not only today's one.) */
     if (st == ATLAS_OK && op->touched_paths.len > 0) {
         st = atlas_json_key_str(j, "touched_paths", atlas_buf_cstr(&op->touched_paths), err);
-        if (st == ATLAS_OK && !op->touched_complete) {
-            st = atlas_json_key_bool(j, "touched_complete", op->touched_complete, err);
-        }
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(j, "touched_complete", op->touched_complete, err);
     }
     return st;
 }

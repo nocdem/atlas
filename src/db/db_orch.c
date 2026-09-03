@@ -87,7 +87,17 @@ atlas_orch_op *atlas_orch_op_new(atlas_orch_op_kind kind) {
      * `has_context_pack`. */
     atlas_memory_pack_init(&op->context_pack);
     atlas_buf_init(&op->touched_paths);
-    op->touched_complete = true;
+    /* A12.1 fix round, I1. `false` -- not `true` -- is the conservative
+     * default the task directive asks for: "send the key always, and make
+     * the absent reading the conservative one." A completion that never sets
+     * this field explicitly is one that never made an observation, and
+     * `false` (not complete) is the honest reading of that, never `true`
+     * (complete). This is a new field in A12.1, so no older client's meaning
+     * moves by changing its default. `reliance_check` (`src/db/db_orch.c`)
+     * does not read this value at all while `op->touched_paths` is empty --
+     * see I2 there -- so the default is inert for every case reached today;
+     * it matters for the wire contract regardless. */
+    op->touched_complete = false;
     return op;
 }
 
@@ -2587,9 +2597,26 @@ static atlas_status run_every_task_ended_well(atlas_db *db, const char *run_uid,
  * records the result on the pack row.
  *
  * Silent -- and no query at all beyond the one pack read -- for a job that
- * belongs to no run, a run with no frozen pack, and a pack with no flagged
- * anchor: "when the run's pack has flagged anchors" is the plan's own gate,
- * and none of those three cases has anything for this check to say.
+ * belongs to no run, a run with no frozen pack, a pack with no flagged
+ * anchor, and (fix round, I2) a completion that carries no observation at
+ * all: "when the run's pack has flagged anchors" is the plan's own gate, and
+ * none of those four cases has anything for this check to say.
+ *
+ * I2. The fourth case is not the same as "the driver observed zero touched
+ * paths": `atlas_orch_paths_encode` with `count = 0` produces `"0:"`, length
+ * 2, so a genuine "nothing changed" observation always leaves
+ * `op->touched_paths.len > 0`. Truly empty (`len == 0`) only happens when the
+ * driver never reached the gather step (a refusal before the worker ran, a
+ * moved HEAD) or reached it and the gather itself failed
+ * (`src/orch/rundriver.c`'s `gather_touched_paths` failure path) -- both are
+ * "no evidence", never "evidence of nothing", A9.2.2's shape at this season's
+ * newest surface. Gating on it here, before `op->touched_complete` is ever
+ * read, is what makes `touched_complete`'s wire value irrelevant to this one
+ * case regardless of I1's fix: a claim about completeness said nothing about
+ * an observation that was never made, complete or otherwise, and
+ * `reliance_checked` stays at its schema default (`0`, migration 28) exactly
+ * as it does for the other three silent cases -- never a positive claim
+ * manufactured from an absence.
  *
  * **This function writes to `memory_context_packs` and to nothing
  * `settle_run_at_quiescence` or `run_every_task_ended_well` reads.** It is
@@ -2611,16 +2638,20 @@ static atlas_status reliance_check(atlas_db *db, const atlas_orch_op *op, const 
         atlas_memory_pack_free(&pack);
         return st;
     }
+    if (op->touched_paths.len == 0) {
+        /* I2. Nothing was ever observed for this completion -- see the
+         * function comment. Silent, like the three cases just above. */
+        atlas_memory_pack_free(&pack);
+        return ATLAS_OK;
+    }
 
     atlas_buf touched[ATLAS_MEMORY_MAX_TOUCHED_PATHS];
     for (size_t i = 0; i < ATLAS_MEMORY_MAX_TOUCHED_PATHS; i++) {
         atlas_buf_init(&touched[i]);
     }
     size_t touched_n = 0;
-    if (st == ATLAS_OK && op->touched_paths.len > 0) {
-        st = atlas_orch_paths_decode(atlas_buf_cstr(&op->touched_paths), touched,
-                                     ATLAS_MEMORY_MAX_TOUCHED_PATHS, &touched_n, err);
-    }
+    st = atlas_orch_paths_decode(atlas_buf_cstr(&op->touched_paths), touched,
+                                 ATLAS_MEMORY_MAX_TOUCHED_PATHS, &touched_n, err);
     atlas_buf matched = ATLAS_BUF_INIT;
     if (st == ATLAS_OK) {
         st = atlas_memory_pack_reliance_match(&pack, touched, touched_n, &matched, NULL, err);
@@ -3090,8 +3121,39 @@ static atlas_status op_complete(atlas_db *db, const atlas_orch_op *op, atlas_orc
     if (s == ATLAS_OK) {
         /* A12.1 T13. Beside, never inside, settlement -- see `reliance_check`'s
          * own comment for why the order of these two calls cannot change what
-         * either produces. */
-        s = reliance_check(db, op, j.run_uid, err);
+         * either produces.
+         *
+         * A12.1 fix round, I3. `reliance_check`'s own failures are this
+         * function's -- a malformed stored `flagged_anchors`, a caller-supplied
+         * `touched_paths` outside `ATLAS_MEMORY_MAX_TOUCHED_PATHS`
+         * (`atlas_orch_paths_decode`, refused before this point is ever
+         * reached for anything a peer controls directly), a decode failure in
+         * `reliance_set`'s own read of the stored column -- never anything the
+         * worker did. Propagating it would have failed this whole completion:
+         * the transition and lease release above are inside the same
+         * transaction as everything below, so a non-OK return here rolls all
+         * of it back, the lease is never released, the attempt eventually
+         * expires, and the run can reach BLOCKED from a memory-layer error --
+         * a run status decided by the memory layer, exactly the coupling
+         * Decision 8 forbids one layer up. So the failure is recorded as not
+         * performed and the completion proceeds, never touching `s`: the same
+         * shape the driver already uses for its own `gather_touched_paths`
+         * failure (`src/orch/rundriver.c`, logged and never propagated) and
+         * this file's own precedent a few hundred lines up, where a failed
+         * `atlas_usage_encode` (`:2883`) resets `err` and substitutes a safe
+         * default rather than failing the write it rides with. The candidate
+         * this round rejected was failing loudly through the transaction: a
+         * dispatcher-uid completion can already reach this only by feeding
+         * `atlas_orch_paths_decode` a malformed or over-cap `touched_paths`
+         * (self-harm, the review's own reason this is Important and not
+         * Critical), and every other source is Atlas' own storage, where a
+         * "loud" failure has no channel of its own to travel on that would not
+         * itself become a silent BLOCKED -- the run driver's transport retries
+         * only transport errors and treats anything else as fatal to the
+         * whole invocation, leaving the lease to expire regardless. */
+        if (reliance_check(db, op, j.run_uid, err) != ATLAS_OK) {
+            atlas_err_init(err);
+        }
     }
     if (s == ATLAS_OK) {
         /* A11.6. Every job that belongs to a run, not only a repo-tree one. The

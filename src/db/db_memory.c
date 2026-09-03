@@ -1446,10 +1446,27 @@ atlas_status atlas_db_memory_pack_reliance_set(atlas_db *db, const char *run_uid
                          (batch[i].len == 0 ||
                           memcmp(merged[m].data, batch[i].data, batch[i].len) == 0);
             }
-            if (!already && merged_n < ATLAS_MEMORY_PACK_MAX_CLAIMS) {
-                st = atlas_buf_set(&merged[merged_n], batch[i].data, batch[i].len, err);
-                if (st == ATLAS_OK) {
-                    merged_n++;
+            if (!already) {
+                if (merged_n >= ATLAS_MEMORY_PACK_MAX_CLAIMS) {
+                    /* M2, T13 fix round. Unreachable in practice: `old_uids`
+                     * and `matched_claim_uids` are each subsets of one pack's
+                     * own flagged-claim set, itself capped at
+                     * `ATLAS_MEMORY_PACK_MAX_CLAIMS` by
+                     * `atlas_memory_pack_build`, so their union cannot exceed
+                     * the cap either. Refused rather than silently dropped,
+                     * the same discipline `atlas_memory_pack_reliance_match`
+                     * (`src/memory/pack.c`) already applies to the identical
+                     * situation -- a silent drop here would lower no flag and
+                     * leave the row claiming a complete uid set it does not
+                     * hold. */
+                    st = atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                                       "more distinct claims were merged into a reliance check "
+                                       "than the pack could ever have flagged");
+                } else {
+                    st = atlas_buf_set(&merged[merged_n], batch[i].data, batch[i].len, err);
+                    if (st == ATLAS_OK) {
+                        merged_n++;
+                    }
                 }
             }
         }

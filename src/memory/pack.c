@@ -808,8 +808,36 @@ atlas_status atlas_memory_pack_compose(const char *task, const char *memory_pack
         }
     }
     if (st == ATLAS_OK && pack_body != NULL && pack_body[0] != '\0') {
+        /* M1, T13 fix round. A pack body with no status line to label it is
+         * exactly the "silently CURRENT" failure the design names: a reader
+         * composing a pack body with no `Context Pack status:` line ahead of
+         * it has no way to tell an unlabelled body from a current one.
+         *
+         * Both production call sites already guarantee a non-empty status
+         * line whenever `pack_body` is non-empty, and I traced the chain
+         * rather than assuming it holds past the daemon: `run_orch_lease_
+         * freshness` (`src/daemon/writer.c`) sets `context_pack_status` to a
+         * non-empty line (`atlas_memory_pack_status_name` or a `STALE:<WHICH>`
+         * string, never empty) exactly when it also keeps `context_pack`, and
+         * clears both together otherwise -- the two are one atomic outcome,
+         * never independent. `method_dispatch_lease` (`src/ipc/server_orch.c`)
+         * emits `context_pack` only when non-empty and, inside that, emits
+         * `context_pack_status` only when non-empty too -- which the pairing
+         * above makes unconditional in practice: whenever the body is on the
+         * wire, the status is too. `take_grant` (`src/orch/dispatch.c`) copies
+         * whichever of the two keys the response actually carries, so it
+         * inherits the wire's pairing rather than asserting one of its own;
+         * `rundriver.c`'s equivalent copy (`report`'s lease-side counterpart)
+         * does the same. That guarantee lived entirely one layer up from this
+         * function, with nothing here to catch a caller that got it wrong.
+         * Refused rather than silently unlabelled, the same discipline this
+         * file already applies to its other bounds. */
+        if (status_line == NULL || status_line[0] == '\0') {
+            return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                                 "a context pack body has no status line to label it");
+        }
         st = atlas_buf_append_str(out, "\n\n", err);
-        if (st == ATLAS_OK && status_line != NULL && status_line[0] != '\0') {
+        if (st == ATLAS_OK) {
             st = atlas_buf_appendf(out, err, "Context Pack status: %s\n", status_line);
         }
         if (st == ATLAS_OK) {

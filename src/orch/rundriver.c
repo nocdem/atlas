@@ -45,6 +45,7 @@
 #include "atlas/memory.h"
 #include "atlas/orch_memory.h"
 #include "atlas/pathrep.h"
+#include "atlas/safetext.h"
 #include "atlas/sha256.h"
 
 void atlas_rundriver_report_init(atlas_rundriver_report *r) {
@@ -628,16 +629,26 @@ typedef struct outcome {
     /* A12.1 T13, Decision 8. This driver's own `git status --porcelain -z`
      * observation, gathered after the worker and the existing HEAD re-check
      * (step 6) -- netstring-encoded, `atlas_orch_paths_encode`'s own shape.
-     * Empty and `touched_complete` true for every path that never reaches the
-     * gather step, which is the conservative reading: an absent observation
-     * contributes nothing to the reliance check rather than a guess. */
+     * `touched_complete` defaults `false` at `outcome_init` (A12.1 fix round,
+     * I1) for a completion that never reaches the gather step at all -- the
+     * conservative reading the task directive asks for, and the honest one:
+     * no observation was made, so `false` (not complete) rather than `true`
+     * (complete). A gather that runs and succeeds sets it `true` (or `false`
+     * at the bound); one that runs and fails sets it `false` explicitly
+     * (below), which is now consistent with the default rather than an
+     * exception to it. Either way `touched_paths` stays empty for the never-
+     * reached and the failed case alike, and it is the daemon's
+     * `reliance_check` (`src/db/db_orch.c`) that treats an empty observation
+     * as one it never made -- I2, not this field's default -- but the wire
+     * still carries the honest value regardless of whether today's one
+     * reader needs it to. */
     atlas_buf touched_paths;
     bool touched_complete;
 } outcome;
 
 static void outcome_init(outcome *x) {
     memset(x, 0, sizeof(*x));
-    x->touched_complete = true;
+    x->touched_complete = false;
     x->exit_kind = ATLAS_ORCH_EXIT_UNKNOWN;
     x->exit_code = -1;
     x->reason = ATLAS_ORCH_REASON_UNKNOWN;
@@ -1288,14 +1299,27 @@ static atlas_status drive_one(const atlas_rundriver_opts *o, const atlas_orch_ru
          * and confirmed to still be the pinned one. A failure to gather is
          * this driver's own -- never the worker's fault and never a reason to
          * refuse the whole completion -- so it is logged and answered with an
-         * honest "nothing observed, incomplete" rather than propagated. */
+         * honest "nothing observed" rather than propagated. */
         {
             atlas_status ts = gather_touched_paths(atlas_buf_cstr(&c.repo_root), &x.touched_paths,
                                                    &x.touched_complete, err);
             if (ts != ATLAS_OK) {
-                say(o, "the tree's changed paths could not be listed (%s); the reliance check "
-                       "will see an incomplete observation",
-                    atlas_err_msg(err));
+                /* M3 (T13 fix round). `atlas_err_msg` can carry `git status`'s
+                 * own stderr (`git_run_checked`, `src/git/git.c`) verbatim --
+                 * repository-controlled bytes, not merely Atlas' own text --
+                 * so this is the one call in this file that provably needs
+                 * `atlas_safe` before it reaches the operator's log. The rest
+                 * of `say`'s call sites in this file (`:503`, `:541`, `:1116`
+                 * at the time of this fix) share the same unencoded practice
+                 * without provably carrying repository bytes; fixing only
+                 * this one is a disclosed, deliberate partial fix rather than
+                 * a claim that the file is now safe -- see the fix report. */
+                atlas_safe_pool safe;
+                atlas_safe_pool_init(&safe);
+                say(o, "the tree's changed paths could not be listed (%s); the reliance "
+                       "check will treat this completion as one it has no observation for",
+                    atlas_safe(&safe, atlas_err_msg(err)));
+                atlas_safe_pool_free(&safe);
                 atlas_err_init(err);
                 atlas_buf_reset(&x.touched_paths);
                 x.touched_complete = false;

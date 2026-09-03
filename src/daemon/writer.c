@@ -447,7 +447,28 @@ bool job_kind_is_unbounded(atlas_job_kind kind) {
 bool job_kind_is_drainable(atlas_job_kind kind) {
     switch (kind) {
     /* A lease, an attempt, a completion, a recovery sweep. The writes a worker
-     * and its driver are blocked on, and the ones whose refusal was measured. */
+     * and its driver are blocked on, and the ones whose refusal was measured.
+     *
+     * A12.1 fix round, I4. This kind stopped being disjoint from a semantic
+     * pass at T13, and `true` no longer rests on that argument for it: a
+     * root-task SUBMIT builds a memory pack (`run_orch_build_pack` calling
+     * `atlas_memory_pack_build`, `src/memory/pack.c`), which reads `memory_*`
+     * tables and, when the repository row says dirty, calls
+     * `atlas_sem_source_identity` -- sem tables plus the accepted compilation
+     * databases on disk; a pack-delivering LEASE runs
+     * `run_orch_lease_freshness` calling `atlas_memory_pack_freshness`, which
+     * does the same. `true` is still correct, on a narrower argument than
+     * disjointness: a drain only ever runs where the unbounded job holds
+     * nothing open (between translation units, either side of the unit loop,
+     * every `ATLAS_SEM_DISCOVER_YIELD_EVERY` directory entries of a discovery
+     * walk), a discovery pass commits `sem_build_inputs` in one transaction
+     * only *after* its walk yields (`atlas_sem_discovery_run`,
+     * `src/sem/index.c`), and a SEM_INDEX pass never writes
+     * `sem_build_inputs` at all -- so a drained SUBMIT or LEASE always reads a
+     * consistent, already-committed set, never a half-built generation. That
+     * is a claim about transaction boundaries, not about which tables a job
+     * touches, and it is the one to re-check the next time this kind's body
+     * gains a file read. */
     case ATLAS_JOB_ORCH:
     /* A session record from a hook, which has four seconds and fails open. */
     case ATLAS_JOB_AI:
@@ -1231,7 +1252,18 @@ static void run_orch_build_pack(atlas_writer *w, atlas_job *j) {
      * repository with no sources or no generation gets a row". Freezing an
      * all-but-empty pack here would freeze something to compare every future
      * staleness read against forever, for a repository that has said nothing
-     * yet. */
+     * yet.
+     *
+     * M4, T13 fix round, disclosed here for the first time: this checks
+     * `memory_generation` alone, not the "no sources" half of the sentence
+     * above. A repository whose declared sources were all deregistered from
+     * the root-owned policy while an old generation still exists gets a row
+     * here, because a generation surviving is exactly what this condition
+     * reads as "has said something". Left this way rather than adding a
+     * sources count: a stale-but-frozen pack is not a wrong one, and
+     * `atlas_memory_pack_freshness`'s `SOURCE_SET` comparison
+     * (`src/memory/pack.c`) reports the mismatch at the next lease the same
+     * way it reports any other moved input. */
     op->has_context_pack = op->context_pack.memory_generation > 0;
 }
 
@@ -1293,6 +1325,17 @@ static void run_orch(atlas_writer *w, atlas_job *j) {
                                   "an orchestration job arrived with no operation attached");
         return;
     }
+    /* M6, T13 fix round. This runs before `atlas_orch_apply` below has had
+     * any chance to refuse the submission -- A11.0's four checks, the
+     * idempotency check, A11.6's bounds. A SUBMIT that any of those refuses
+     * has already paid `run_orch_build_pack`'s tree read and file read on the
+     * writer thread. Cost, not correctness: `run_orch_build_pack` is a no-op
+     * for anything but a root-task SUBMIT, and a refused submission's pack is
+     * simply never frozen, never delivered, and never read again. Reordering
+     * to build the pack only after a successful `atlas_orch_apply` would move
+     * the tree read *inside* that function's transaction, which A1 forbids —
+     * this seam exists for the same reason `run_orch_lease_freshness` runs
+     * after the transaction below rather than inside it. */
     run_orch_build_pack(w, j);
     /* `atlas_orch_apply` owns its own transaction, exactly like
      * `atlas_ai_apply` and `atlas_decision_apply`, and is called with none

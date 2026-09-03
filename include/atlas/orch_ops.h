@@ -173,11 +173,26 @@ typedef struct atlas_orch_op {
      * (`atlas_orch_paths_encode`'s own shape, a leading `<count>:` then that
      * many `path_text`-encoded entries), bounded by
      * `ATLAS_MEMORY_MAX_TOUCHED_PATHS`; past the bound the first that many are
-     * sent and `touched_complete` is false. Empty and `touched_complete = true`
-     * for every completion that never reaches that gather step -- a refusal
-     * before the worker ran, a moved HEAD, or a job with no run at all -- which
-     * is the conservative reading: an absent observation contributes nothing to
-     * the reliance check rather than a guess.
+     * sent and `touched_complete` is false. Empty for every completion that
+     * never reaches that gather step -- a refusal before the worker ran, a
+     * moved HEAD, or a job with no run at all -- or that reaches it and fails.
+     *
+     * A12.1 fix round, I1/I2. `touched_complete`'s own default used to be
+     * `true`, which was not the conservative reading of an empty
+     * `touched_paths`: `true` is a completeness claim, and an empty buffer
+     * means no observation was made at all, complete or otherwise. Both ends
+     * of the wire now default this field to `false` -- `atlas_orch_op_new`
+     * (`src/db/db_orch.c`) and `outcome_init` (`src/orch/rundriver.c`) -- and
+     * the key is sent unconditionally by `build_run_complete`
+     * (`src/core/service_orch.c`), so an absent key on the wire is now itself
+     * an anomaly rather than the ordinary carrier of this field's meaning.
+     * Separately, and regardless of the wire value: `reliance_check`
+     * (`src/db/db_orch.c`) refuses to read `touched_complete` at all when
+     * `touched_paths.len == 0` (I2), treating a completion with no
+     * observation as a fourth silent case beside its existing three (no run,
+     * no pack, no flagged anchor) -- because "no observation was made" and
+     * "the observation was incomplete" are different claims, and only the
+     * driver's own gather step can tell them apart.
      *
      * This is the driver's own trust class, `op->success`'s own: Atlas'
      * classification of what it saw, never the worker's claim. The daemon

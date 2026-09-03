@@ -1104,6 +1104,71 @@ static void test_both_renderers_carry_every_memory_field(void) {
     free(writer);
 }
 
+static size_t count_occurrences(const char *text, const char *needle) {
+    size_t n = 0;
+    size_t nlen = strlen(needle);
+    const char *p = text;
+    while ((p = strstr(p, needle)) != NULL) {
+        n++;
+        p += nlen;
+    }
+    return n;
+}
+
+/* M5, T13 fix round. `atlas_orch_memory_compose` (`src/orch/memory.c`) is
+ * public, exported, and -- since T13 replaced the workspace attempt path's
+ * call to it with the shared `atlas_memory_pack_compose` -- has no
+ * production caller left. A third injection path calling it directly would
+ * silently append A10.1's package while skipping T13's context pack, and
+ * nothing would notice a caller added anywhere but the two composer call
+ * sites this file already names in its own restated comment
+ * (`src/orch/rundriver.c:1186-1205`). Counted the same way `FORBIDDEN[]` in
+ * `tests/test_decision_mcp.c` counts tool names: by scanning the files, not
+ * by trusting a comment that says "the composer is the one implementation of
+ * appending run context". */
+static void test_the_composer_has_exactly_two_production_callers(void) {
+    static const char *const COMPOSER_FILES[] = {
+        ATLAS_SRC_DIR "/src/orch/rundriver.c",
+        ATLAS_SRC_DIR "/src/orch/dispatch.c",
+        NULL,
+    };
+    size_t total = 0;
+    for (size_t f = 0; COMPOSER_FILES[f] != NULL; f++) {
+        char *text = slurp(COMPOSER_FILES[f]);
+        T_REQUIRE_MSG(text != NULL, "cannot read %s", COMPOSER_FILES[f]);
+        size_t n = count_occurrences(text, "atlas_memory_pack_compose(");
+        T_CHECK_MSG(n == 1, "%s calls atlas_memory_pack_compose %zu times, want exactly 1",
+                    COMPOSER_FILES[f], n);
+        total += n;
+        free(text);
+    }
+    T_CHECK_MSG(total == 2,
+                "atlas_memory_pack_compose has %zu call site(s) across the files this test "
+                "knows about, want exactly 2 -- a third injection path exists and this test "
+                "does not yet know where",
+                total);
+
+    /* The superseded composer must stay production-dead: a call anywhere in
+     * these files other than its own definition and declaration would be an
+     * unaccounted third path appending only the A10.1 package. */
+    static const char *const PROD_FILES[] = {
+        ATLAS_SRC_DIR "/src/orch/rundriver.c",
+        ATLAS_SRC_DIR "/src/orch/dispatch.c",
+        ATLAS_SRC_DIR "/src/daemon/writer.c",
+        ATLAS_SRC_DIR "/src/core/service_orch.c",
+        ATLAS_SRC_DIR "/src/ipc/server_orch.c",
+        NULL,
+    };
+    for (size_t f = 0; PROD_FILES[f] != NULL; f++) {
+        char *text = slurp(PROD_FILES[f]);
+        T_REQUIRE_MSG(text != NULL, "cannot read %s", PROD_FILES[f]);
+        size_t n = count_occurrences(text, "atlas_orch_memory_compose(");
+        T_CHECK_MSG(n == 0, "%s calls the superseded atlas_orch_memory_compose %zu time(s)",
+                    PROD_FILES[f], n);
+        free(text);
+    }
+}
+
 static const atlas_test TESTS[] = {
     {"a related earlier run is selected and another repository's never is",
      test_selects_related_and_never_another_repository},
@@ -1133,6 +1198,8 @@ static const atlas_test TESTS[] = {
      test_a_follow_up_inherits_the_frozen_package},
     {"every boundary a memory field crosses carries it",
      test_both_renderers_carry_every_memory_field},
+    {"the composer has exactly two production callers and the superseded one has none",
+     test_the_composer_has_exactly_two_production_callers},
 };
 
 ATLAS_TEST_MAIN("orch_memory", TESTS)

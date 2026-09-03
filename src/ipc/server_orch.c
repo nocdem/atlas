@@ -2231,12 +2231,10 @@ static atlas_status method_dispatch_complete(dispatch_state *ds, const atlas_ipc
     }
     /* A12.1 T13. The driver's own `git status --porcelain -z` observation,
      * netstring-encoded (`atlas_orch_paths_encode`'s own shape). Absent means
-     * exactly what the field's own default means: nothing was gathered, and
-     * `touched_complete` stays true -- the conservative reading for a
-     * completion that never reached that step (a refusal before the worker
-     * ran, a moved HEAD). This is the driver's own trust class, `op->success`'s
-     * own: Atlas' account of what it saw, never a value the worker supplied
-     * about itself -- there is no `worker_*` key this method reads for it. */
+     * exactly what the field's own default means: nothing was gathered.
+     * This is the driver's own trust class, `op->success`'s own: Atlas'
+     * account of what it saw, never a value the worker supplied about itself
+     * -- there is no `worker_*` key this method reads for it. */
     if (st == ATLAS_OK) {
         const char *tp = NULL;
         if (atlas_ipc_param_str(req, "touched_paths", &tp) && tp != NULL) {
@@ -2244,12 +2242,18 @@ static atlas_status method_dispatch_complete(dispatch_state *ds, const atlas_ipc
         }
     }
     if (st == ATLAS_OK) {
-        /* `atlas_ipc_param_bool` writes `false` into its destination whether or
-         * not the key was present, so it is asked into a local rather than
-         * `op->touched_complete` directly -- an absent key must leave the op's
-         * own default (`true`, set in `atlas_orch_op_new`) alone, never read as
-         * an incomplete observation nobody made. */
-        bool tc = true;
+        /* A12.1 fix round, I1. `atlas_ipc_param_bool` writes `false` into its
+         * destination whether or not the key was present, so it is asked into
+         * a local rather than `op->touched_complete` directly -- an absent
+         * key must leave the op's own default alone rather than silently
+         * becoming `false` regardless of what that default is. The default is
+         * `false` now (`atlas_orch_op_new`, `src/db/db_orch.c`) -- the
+         * conservative reading -- and the real run driver always sends this
+         * key explicitly as of this fix round (`build_run_complete`,
+         * `src/core/service_orch.c`), so an absent key here means a caller
+         * other than Atlas' own driver, which gets the conservative default
+         * rather than a completeness claim nobody made. */
+        bool tc = false;
         if (atlas_ipc_param_bool(req, "touched_complete", &tc)) {
             op->touched_complete = tc;
         }

@@ -1765,10 +1765,23 @@ the codec round-trip proves reversibility, and the full-pipeline case deliberate
 embedded NUL is therefore bound only up to that NUL, and the remainder is dropped with no
 error and no truncation flag — the row simply holds less than the caller passed.
 
-**Where it bites, per T17's reading of `src/db/db_verify.c`:** a claim's text reaches
-storage through that helper, so a proposition containing a NUL is stored short. Nothing
-reports it: the write succeeds, the content hash is computed over what was *passed* rather
-than what was stored in at least some paths, and every later read agrees with itself.
+**The full path, traced rather than assumed:** a memory candidate's text reaches that call
+through `src/memory/reconcile.c:1103` (`atlas_buf_set(&op1.text, p->text.data, p->text.len,
+err)`, a byte-safe copy that keeps the NUL), then `src/verify/intake.c:611` (the same
+byte-safe `atlas_buf_set`, into `c.text`), then `src/db/db_verify.c:279`
+(`atlas_db_bind_text_opt(db, stmt, 7, bs(&c->text), err)`), where `bs()` hands over
+`atlas_buf_cstr` — a NUL-terminated view of those same bytes — to `atlas_db_bind_text_n` at
+`src/db/db.c:230`, which binds `strlen(s)` of it. Every hop up to the last one is exact; only
+the last one is lossy, and that is where the truncation happens.
+
+**Where it bites, verified rather than hedged:** the content hash is computed over what was
+*passed*, not what was stored, and the two disagree by construction. `key_buf`
+(`src/verify/intake.c:294-296`) hashes `b->data, b->len` — the value's own full length — and
+`intake.c:638` folds `c.text` into the claim's `content_key` this way, before that same
+`c.text` is bound by `strlen` two calls later. So `content_key` covers the whole value,
+including whatever follows the NUL, while the stored `text` column stops at it: key and row
+disagree on every claim whose text carries a NUL. Nothing reports it: the write succeeds, and
+every later read agrees with itself.
 
 **Why this matters more than it looks.** `atlas_safe` encoding is **reversible by
 contract**, and A12.1 leans on that: a memory file is untrusted repository content, and the
@@ -1777,18 +1790,26 @@ round-trips into a storage layer that truncates keeps the promise on paper and b
 the row. The suite now proves the codec half and says plainly that the pipeline half is not
 proved for NUL-bearing input.
 
-**The remedy already exists in the tree.** `atlas_db_bind_text_n` takes an explicit length,
-and A12.1's own T16 fix round used exactly that for `claims_manifest` and `flagged_anchors`
-when netstring binary-safety was at stake. So this is a known defect shape with a known
-remedy applied in one place and not in the claim-text path.
+**The remedy already exists in the tree, in two places.** `atlas_db_bind_text_n` takes an
+explicit length, and A12.1's own T16 fix round used exactly that for `claims_manifest` and
+`flagged_anchors` when netstring binary-safety was at stake. And one layer over, this
+codebase has already chosen refusal for exactly this situation: `src/memory/extract.c:483-495`
+refuses a NUL-bearing anchor token outright rather than resolving it truncated, for the same
+shape of gap — `atlas_db_bind_text_opt: strlen(s)` truncates one representation of a value
+while a byte-range copy of it does not — with the reason written at the site, "the two
+representations must never be allowed to disagree," and a measured instance:
+`src/a.c<NUL>zzz` resolving `src/a.c` and recording an anchor naming a path that does not
+exist. `src/verify/intake.c:334` states the general principle the same way: "refused rather
+than shortened."
 
 **Candidate fixes, none implemented.** Bind claim text by length rather than by `strlen`,
 which requires the length to travel with the text from wherever it is parsed — that is the
 real work, not the bind call. Or refuse a claim carrying an embedded NUL at intake, which is
-cheaper, honest, and consistent with "a bound that is reached is refused, never trimmed", at
-the cost of rejecting content some repository may legitimately hold. **Whichever is chosen,
-the current behaviour — silently storing less than was given — is the one option that should
-not stand.**
+cheaper, honest, consistent with "a bound that is reached is refused, never trimmed", and
+matches the precedent this codebase already set one layer over at the anchor path, at the
+cost of rejecting content some repository may legitimately hold. **Whichever is chosen, the
+current behaviour — silently storing less than was given — is the one option that should not
+stand.**
 
 ## Four of six `atlas_verify_conflict` members still have no producer (2026-09-03)
 

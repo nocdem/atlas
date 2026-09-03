@@ -413,9 +413,10 @@ static void test_case_a1_the_policy_parser_has_exactly_two_callers(void) {
     T_CHECK_MSG(count_in_file("src/memory/source.c", NEEDLE) == 1,
                 "source.c's own definition did not match the needle exactly once -- the scanner "
                 "cannot be trusted");
-    T_CHECK_MSG(count_in_file("src/core/syspolicy.c", NEEDLE) >= 1,
-                "syspolicy.c, the one caller this policy grammar is supposed to have, does not "
-                "call it at all");
+    T_CHECK_MSG(count_in_file("src/core/syspolicy.c", NEEDLE) == 1,
+                "syspolicy.c does not call it exactly once -- either the one caller this policy "
+                "grammar is supposed to have is gone, or a second call was added and the "
+                "file-level exemption above no longer notices it");
 }
 
 /* (a2) The behavioural half: a real reconciliation pass over a memory file
@@ -454,10 +455,15 @@ static void test_case_a2_hostile_policy_lookalike_text_does_nothing(void) {
     T_CHECK_MSG(memcmp(&pol_before, &pol, sizeof pol) == 0,
                 "the policy struct changed during a reconciliation pass");
     /* No read obstacle was recorded at all -- not merely one that avoided
-     * naming /etc/shadow. The only registered source (note.md) reads OK, and
-     * nothing else was ever a candidate to read, so a real attempt against
-     * the hostile path would show up here as a read this pass could not
-     * fully account for. */
+     * naming /etc/shadow. This is weaker evidence than it looks: a read
+     * attempt against /etc/shadow that SUCCEEDED would leave no obstacle
+     * either, so read_obstacles == 0 alone cannot distinguish "never
+     * attempted" from "attempted and allowed". The load-bearing evidence
+     * that it was never attempted is the source-count assertions just below
+     * (the only registered source is note.md) together with (a1)'s
+     * structural proof that a candidate's own text never reaches the policy
+     * parser in the first place -- so nothing here ever named /etc/shadow to
+     * the pass as something to read. */
     T_CHECK_MSG(result.read_obstacles == 0,
                "a read obstacle was recorded when the only registered source reads clean: %s",
                result.last_read_obstacle);
@@ -665,7 +671,21 @@ static void test_case_b_hostile_approval_text_leaves_decisions_untouched(void) {
     size_t violators = 0;
     atlas_buf names = ATLAS_BUF_INIT;
     size_t n = scan_atlas_core_for_needle(NEEDLE, NULL, &violators, &names, &err);
-    (void)n;
+    T_REQUIRE_MSG(n >= 100, "atlas_core source list parsed to only %zu file(s)", n);
+    /* Floor on the scan itself, not only on the src/memory/ filter below: a
+     * scanner walking an empty list would leave violators at 0 and pass
+     * having read nothing. The tree names exactly three files that mention
+     * this needle at all -- src/ai/ai.c (the AI-driven promotion path),
+     * src/decision/lifecycle.c (the function's own definition, which
+     * contains its own name once more as its one internal self-call) and
+     * src/verify/autolifecycle.c (A9.2's automatic lifecycle) -- and none of
+     * them is under src/memory/, which the loop below re-derives from
+     * `names` rather than assumes. */
+    T_CHECK_MSG(violators == 3,
+                "expected exactly the three known files naming the decision lifecycle's single "
+                "write point (src/ai/ai.c, src/decision/lifecycle.c, "
+                "src/verify/autolifecycle.c), got %zu: %s",
+                violators, atlas_buf_cstr(&names));
     size_t memory_violators = 0;
     for (const char *p = atlas_buf_cstr(&names); *p != '\0';) {
         if (strncmp(p, "src/memory/", 11) == 0) {
@@ -829,6 +849,24 @@ static void test_case_c2_hostile_bytes_reach_the_pack_encoded_and_reversible(voi
     T_OK(atlas_buf_set(&stored_text, sqlite3_column_blob(stmt, 0), (size_t)stored_len, &err), &err);
     atlas_db_finish(e.db, stmt);
 
+    /* Storage half, checked before anything derived from it: the stored bytes
+     * must still carry the hostile payload, or every assertion below proves
+     * nothing. Without this, a future change that sanitised a proposition on
+     * its way INTO storage -- exactly the class of defect this task found in
+     * the NUL-truncation path, one byte at a time -- would leave stored_text
+     * as clean ASCII; want_enc, encoded from that clean ASCII, would then be
+     * found in the pack trivially, no raw ESC or bidi byte would exist
+     * anywhere to find, and the plain-ASCII round-trip below would succeed.
+     * All five assertions would pass while the case's own header claim ("the
+     * SAME class of hostile bytes ... through the real end-to-end pipeline")
+     * was false. (c1)'s own `!atlas_text_is_safe(RAW, ...)` idiom, one layer
+     * down the pipeline. Mutation-proved in the T17 fix round: see
+     * task-T17-fix-report.md's "Discrimination proofs" section. */
+    T_CHECK_MSG(!atlas_text_is_safe(stored_text.data, stored_text.len),
+                "the stored claim text needs no escaping at all -- something sanitised the "
+                "hostile payload on its way into storage, before atlas_safe ever saw it, so "
+                "nothing below can prove hostile bytes survive storage");
+
     atlas_buf want_enc = ATLAS_BUF_INIT;
     T_OK(atlas_text_encode_safe(stored_text.data, stored_text.len, &want_enc, &err), &err);
 
@@ -865,18 +903,27 @@ static void test_case_c2_hostile_bytes_reach_the_pack_encoded_and_reversible(voi
 }
 
 /* =========================================================================
- * Case (d): `fx_tree_digest` around a full pass -- the repository is
- * byte-identical.
+ * Case (d): `fx_tree_digest` around a full pass -- the repository tree,
+ * INCLUDING `.git`, is byte-identical. This is stronger than it sounds:
+ * `digest_dir`/`fx_tree_digest` (tests/support/fixture.c:567-679) recurse
+ * into every directory entry with no `.git` exclusion, so a future git
+ * invocation that refreshed `.git/index` or wrote a loose object during what
+ * is meant to be a read-only pass would be caught here too, not only a
+ * change to the files a memory source names.
  *
- * No mutation was attempted for this case, and none is claimed. There is no
- * single flag or line in `src/memory/read.c` whose removal would make the
- * pass start writing to the tree -- reading a file (`atlas_path_open_
- * nofollow`, `read_fs_file`) and reading a git blob (`git cat-file`) are
- * simply never write operations, by the shape of the calls involved, not by
- * a guard that could be disabled. The nearest thing to a "protection" here
- * is the read path never opening with a write flag at all; see the T17
- * report for the plain statement of what was and was not checked. This case
- * still earns its place in the suite: it is the one direct proof that CLAUDE.md's
+ * There is no single flag or line in `src/memory/read.c` whose REMOVAL would
+ * make the pass start writing to the tree -- reading a file
+ * (`atlas_path_open_nofollow`, `read_fs_file`) and reading a git blob
+ * (`git cat-file`) are simply never write operations, by the shape of the
+ * calls involved, not by a guard that could be disabled. That argument only
+ * ever covered a removal-shaped mutation, though. Mutation-proved in the T17
+ * fix round with the ADDITION-shaped one it was missing: a one-byte
+ * `write()` spliced into `read_fs_file` via `/proc/self/fd`, after the read
+ * succeeds and before the bytes are copied out, made this case's own
+ * assertion fail with exactly the message above; reverted before this suite
+ * was left green (see task-T17-fix-report.md's "Discrimination proofs"
+ * section for the exact edit and the observed failure line). This case still
+ * earns its place in the suite: it is the one direct proof that CLAUDE.md's
  * hard rule ("no data directory, no index... nothing anywhere cleans, resets" --
  * the memory pass's own version of "never modify a registered target
  * repository") holds for the read side of this season's new code, the same
@@ -969,12 +1016,14 @@ static void test_case_e1_the_memory_pass_creates_no_process_itself(void) {
     free(block);
     T_REQUIRE_MSG(n >= 100, "atlas_core source list parsed to only %zu file(s)", n);
 
+    size_t matched = 0;
     size_t violators = 0;
     atlas_buf names = ATLAS_BUF_INIT;
     for (size_t i = 0; i < n; i++) {
         if (strncmp(paths[i], "src/memory/", 11) != 0) {
             continue;
         }
+        matched++;
         char full[4096];
         int printed = snprintf(full, sizeof full, "%s/%s", ATLAS_SRC_DIR, paths[i]);
         T_REQUIRE(printed > 0 && (size_t)printed < sizeof full);
@@ -987,6 +1036,25 @@ static void test_case_e1_the_memory_pass_creates_no_process_itself(void) {
             T_OK(atlas_buf_appendf(&names, &err, "%s(%zu) ", paths[i], c), &err);
         }
     }
+    /* Floor on what this case actually scanned, not merely on the whole
+     * atlas_core list: without it, renaming src/memory/ (or moving its files
+     * to a new prefix) makes the loop above match zero files, violators
+     * stays 0, and the case -- the load-bearing, mutation-provable half of
+     * case (e), the one that replaced "no marker fired" with "no call site
+     * exists" -- passes having read nothing. (a1) and (g) both carry this
+     * floor-plus-positive-control idiom in this same file; this scan omitted
+     * it. Mutation-proved in the T17 fix round: see task-T17-fix-report.md's
+     * "Discrimination proofs" section. */
+    T_REQUIRE_MSG(matched >= 1,
+                  "matched zero files under src/memory/ in the atlas_core source list -- the "
+                  "scan below examined nothing");
+    /* Positive control: the needle itself must be findable somewhere this
+     * scanner reads, or "zero occurrences under src/memory/" would be
+     * indistinguishable from a scanner that cannot find the string at all.
+     * src/core/proc.c is atlas_proc_run's own definition. */
+    T_CHECK_MSG(count_in_file("src/core/proc.c", "atlas_proc_run(") >= 1,
+                "src/core/proc.c, which defines atlas_proc_run, does not contain the needle -- "
+                "the scanner cannot be trusted");
     T_CHECK_MSG(violators == 0,
                 "src/memory/ creates a process directly instead of going through the git "
                 "hardening layer: %s",

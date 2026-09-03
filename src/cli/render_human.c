@@ -3051,6 +3051,71 @@ static atlas_status h_memory_item(atlas_renderer *r, const atlas_memory_render *
     return ATLAS_OK;
 }
 
+/* --- A15 T5: `atlas review apply` ---------------------------------------
+ *
+ * `o->status` and `o->detail` arrive already safe-encoded or as fixed Atlas
+ * text with checked values (see the fields' own comments in
+ * include/atlas/service.h and src/core/service_review.c's `set_status`) --
+ * printed as-is, never re-encoded, for the reason every ALREADY-SAFE value
+ * in this file's own policy comment is printed as-is: re-encoding would
+ * double-escape '%'. `o->entry->repo` is the one exception: it is a
+ * repository name copied out of the operator's own sheet file, not a name
+ * read back from the `repositories` table, so it does not qualify for this
+ * file's ATLAS-OWNED bucket even though the sheet grammar already checked
+ * its charset -- a sheet is UNTRUSTED_DATA end to end (review.h's own
+ * comment), and it is safe-encoded here like any other RAW value.
+ *
+ * The decision id is shortened to "atlas-dec-" plus 8 hex plus an ellipsis
+ * in this form only; the JSON form carries the whole id. */
+
+static atlas_status h_review_begin(atlas_renderer *r, const char *sheet_path, bool check_only,
+                                   atlas_err *err) {
+    (void)sheet_path;
+    (void)check_only;
+    (void)err;
+    /* Nothing is printed here: the frozen human table's invocation line is
+     * the shell command line the operator typed, not Atlas' own output --
+     * exactly as h_begin prints nothing for every other command. */
+    r->items = 0;
+    r->in_list = true;
+    return ok();
+}
+
+static atlas_status h_review_entry(atlas_renderer *r, const atlas_review_outcome *o,
+                                   atlas_err *err) {
+    (void)err;
+    r->items++;
+    char short_id[ATLAS_DECISION_UID_MAX];
+    (void)snprintf(short_id, sizeof(short_id), "%.18s\xe2\x80\xa6", o->entry->decision);
+    (void)fprintf(r->out, "  %" PRId64 "  %-7s  %s  %s  r%" PRId64 "  %-9s  %s\n", (int64_t)r->items,
+                  atlas_decision_intent_name(o->entry->intent), atlas_safe(&r->safe, o->entry->repo),
+                  short_id, o->entry->revision_no, atlas_review_verdict_name(o->verdict),
+                  o->detail.len > 0 ? atlas_buf_cstr(&o->detail) : "");
+    return ok();
+}
+
+static atlas_status h_review_totals(atlas_renderer *r, bool check_only,
+                                    const atlas_review_totals *t, atlas_err *err) {
+    (void)err;
+    r->in_list = false;
+    if (check_only) {
+        /* Not pinned by the plan's Frozen formats section, which shows only
+         * the JSON form of a --check totals line; this is the equivalent
+         * human line, restricted to the fields the walker's own comment
+         * says are meaningful under check_only (ready, plus the three
+         * verdicts that can occur in either mode). */
+        (void)fprintf(r->out, "ready %" PRId64 ", moved %" PRId64 ", disposed %" PRId64
+                              ", missing %" PRId64 "\n",
+                      t->ready, t->moved, t->disposed, t->missing);
+    } else {
+        (void)fprintf(r->out,
+                      "applied %" PRId64 ", abandoned %" PRId64 ", moved %" PRId64
+                      ", disposed %" PRId64 ", missing %" PRId64 ", refused %" PRId64 "\n",
+                      t->applied, t->abandoned, t->moved, t->disposed, t->missing, t->refused);
+    }
+    return ok();
+}
+
 const atlas_renderer_vtbl ATLAS_RENDERER_HUMAN = {
     h_begin,      h_end,          h_note_repo,    h_note_query,   h_list_begin,
     h_list_end,   h_doctor,       h_version,      h_repo_item,    h_repo_added,
@@ -3083,4 +3148,6 @@ const atlas_renderer_vtbl ATLAS_RENDERER_HUMAN = {
     h_plan_item,
     /* --- A12.1 T16 --- */
     h_memory_item,
+    /* --- A15 T5 --- */
+    h_review_begin, h_review_entry, h_review_totals,
 };

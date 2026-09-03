@@ -203,6 +203,9 @@ void atlas_cli_print_help(FILE *out) {
         "  gate check NAME            assess every approved decision against the indexed\n"
         "                             state; exits 8 on review required, 9 on blocked\n"
         "  gate show NAME ID          the same assessment, for one decision\n"
+        "  review apply FILE [--check]  walk a review sheet through the operator channel\n"
+        "                             one entry at a time; --check is a dry run that\n"
+        "                             mints and spends nothing\n"
         "  verify claim --repo R --text \"...\"   state a checkable proposition\n"
         "  verify evidence --claim UID --class C  reference what you looked at\n"
         "  verify produce --claim UID            have Atlas run a bounded verifier itself\n"
@@ -243,6 +246,9 @@ void atlas_cli_print_help(FILE *out) {
         "\n"
         "options (accepted before or after the command; '--' ends option parsing):\n"
         "  --json                     emit stable JSON on stdout\n"
+        "  --check                    review apply: a dry run; mints and spends nothing.\n"
+        "                             --json needs this -- review apply is otherwise an\n"
+        "                             interactive command\n"
         "  --wait                     sync: wait for the reconciliation to complete\n"
         "  --full                     sync: re-read every file rather than only changes\n"
         "  --since CURSOR             events: start after this cursor\n"
@@ -359,6 +365,9 @@ static atlas_status parse_args(cli_state *st, int argc, char **argv, bool *want_
                 st->opts.quiet = true;
             } else if (strcmp(a, "--yes") == 0) {
                 st->opts.yes = true;
+            } else if (strcmp(a, "--check") == 0) {
+                /* A15 T5. `review apply --check`: a dry run. */
+                st->opts.check = true;
             } else if (strcmp(a, "--no-history") == 0) {
                 st->opts.no_history = true;
             } else if (strcmp(a, "--no-untracked") == 0) {
@@ -2067,6 +2076,106 @@ static atlas_status run_decision_confirm(cli_state *st, atlas_ctx *ctx, atlas_re
     return result;
 }
 
+/* A15 T5. `atlas review apply FILE [--check] [--json]`: walks a review sheet
+ * through the operator channel, one entry at a time, by looping the one
+ * function that mints and spends a lifecycle capability
+ * (`atlas_service_review_apply` -> `atlas_service_decision_confirm`). This
+ * file mints and spends nothing itself. */
+static atlas_status review_entry_sink(const atlas_review_outcome *o, void *ud, atlas_err *err) {
+    list_sink *ls = (list_sink *)ud;
+    return ls->r->v->review_entry(ls->r, o, err);
+}
+
+/* Reuses the mechanism `atlas gate` already carries in `st->gate_exit`: a
+ * command-specific exit code above the seven-value contract, returned only
+ * once a complete, successful document has been written, following gate's
+ * own 8/9 precedent (cli.c's help text at "gate check"). 0 when every entry
+ * ended APPLIED (or READY under --check); 8 otherwise. `moved`, `disposed`
+ * and `missing` count against both modes; `abandoned` and `refused` cannot
+ * occur under `check_only` (nothing is ever minted) and `ready` cannot occur
+ * outside it, so summing all seven unconditionally would double no bucket. */
+static int review_exit_code(bool check_only, const atlas_review_totals *t) {
+    int64_t bad = check_only ? (t->moved + t->disposed + t->missing)
+                             : (t->abandoned + t->moved + t->disposed + t->missing + t->refused);
+    return bad == 0 ? 0 : 8;
+}
+
+static atlas_status run_review(cli_state *st, atlas_ctx *ctx, atlas_renderer *r, atlas_err *err) {
+    /* Which subcommand this even is, decided before authority is asked about
+     * anything -- `run_decision`'s own precedent: a completely bare command
+     * or an unrecognised verb answers with a usage line and touches no
+     * authority check at all, because no verb has been chosen yet for
+     * authority to be a precondition of. `review` has exactly one verb
+     * today, so the "no such verb" and "no verb at all" cases share this one
+     * frozen usage sentence rather than a second, unpinned message. */
+    if (st->operand_count == 0 || strcmp(st->operands[0], "apply") != 0) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "usage: atlas review apply FILE [--check]");
+    }
+
+    /* **A7: authority before anything else the apply verb does, including
+     * its own argument shape and --check.** `atlas_service_review_apply`
+     * itself skips this check under `check_only` so its own tests can run
+     * against a locally-built, non-root-owned binary (see the T4 report's
+     * chain); this call is what keeps "a locked profile refuses before the
+     * sheet file is opened" true for `--check` as well, at the layer
+     * `run_decision_confirm` above already puts it -- authority first, then
+     * this verb's own operand count, exactly as `run_decision_confirm`
+     * checks authority before its own `operand_count != 3u`. */
+    atlas_status auth = atlas_authority_require(ATLAS_AUTHORITY_OP_DECISION_LIFECYCLE, err);
+    if (auth != ATLAS_OK) {
+        return auth;
+    }
+    if (st->operand_count != 2u) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "usage: atlas review apply FILE [--check]");
+    }
+    if (st->opts.yes) {
+        /* Refused, not ignored -- the same shape as `decision approve`'s. */
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "--yes cannot apply a review sheet. Each entry needs its "
+                             "confirmation typed on an interactive terminal, and Atlas will "
+                             "not accept one from a flag, a pipe, the sheet itself or an "
+                             "environment variable.");
+    }
+    if (st->opts.json && !st->opts.check) {
+        /* Not symmetric with `decision approve`'s blanket --json refusal on
+         * purpose: a real apply prompts on /dev/tty and is not machine
+         * readable, but --check mints nothing and reveals nothing this uid
+         * could not already read with `decision show`. */
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "--json is not available for review apply: it is an interactive "
+                             "command. Use --check for a machine-readable dry run.");
+    }
+
+    const char *sheet_path = st->operands[1];
+    bool check_only = st->opts.check;
+
+    atlas_status result = renderer_open(r, st->opts.json, st->out, "review apply", err);
+    if (result != ATLAS_OK) {
+        return result;
+    }
+    result = r->v->review_begin(r, sheet_path, check_only, err);
+    atlas_review_totals totals;
+    memset(&totals, 0, sizeof(totals));
+    if (result == ATLAS_OK) {
+        list_sink ls = {r};
+        result = atlas_service_review_apply(ctx, sheet_path, check_only, review_entry_sink, &ls,
+                                            &totals, err);
+    }
+    if (result == ATLAS_OK) {
+        result = r->v->review_totals(r, check_only, &totals, err);
+    }
+    if (result == ATLAS_OK) {
+        result = renderer_close(r, err);
+        /* Only once the document is complete, for the reason `gate` sets
+         * `gate_exit` only there: a non-zero exit beside a half-written
+         * answer would tell a caller to act on something it cannot read. */
+        st->gate_exit = review_exit_code(check_only, &totals);
+    } else {
+        renderer_abort(r);
+    }
+    return result;
+}
+
 static atlas_status run_decision(cli_state *st, atlas_ctx *ctx, atlas_renderer *r, int64_t limit,
                                  atlas_err *err) {
     if (st->operand_count == 0) {
@@ -2654,6 +2763,20 @@ static bool remote_serves(const cli_state *st) {
                strcmp(sub, "reject") == 0 || strcmp(sub, "supersede") == 0 ||
                strcmp(sub, "revalidate") == 0 || strcmp(sub, "resolve") == 0;
     }
+    /* A15 T5. Served for the reason the operator channel above is: under
+     * A7.1 the index is 0700 `atlasd`, so an operator's own account has no
+     * local database handle at all, and `run_review`'s authority and
+     * terminal checks run in this process regardless of `ctx`.
+     * `atlas_service_review_apply` dispatches every read it needs to the
+     * remote form itself when `ctx == NULL` (`show_revision` in
+     * src/core/service_review.c), and `atlas_service_decision_confirm` —
+     * the one function it loops — already does the same for its own reads
+     * and for the write that spends a capability. Being served is not being
+     * authorised: the daemon still refuses unless this peer is the uid the
+     * root-owned policy names. */
+    if (strcmp(cmd, "review") == 0) {
+        return strcmp(sub, "apply") == 0;
+    }
     return false;
 }
 
@@ -2674,7 +2797,7 @@ static bool is_a_command(const char *cmd) {
         "diff",    "daemon",  "sync",      "events",  "code",    "decision", "gate",
         "job",     "dispatcher", "scanner", "backup", "maintenance", "service", "mcp", "hook",
         "integrate", "version", "help", "context", "operation", "api-key", "gateway",
-        "verify",   "plan",   "memory",
+        "verify",   "plan",   "memory",  "review",
     };
     for (size_t i = 0; i < sizeof COMMANDS / sizeof COMMANDS[0]; i++) {
         if (strcmp(cmd, COMMANDS[i]) == 0) {
@@ -4938,6 +5061,8 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
         result = run_decision(st, ctx, &r, limit, err);
     } else if (strcmp(cmd, "memory") == 0) {
         result = run_memory(st, ctx, &r, err);
+    } else if (strcmp(cmd, "review") == 0) {
+        result = run_review(st, ctx, &r, err);
     } else {
         result = atlas_err_set(err, ATLAS_ERR_USAGE,
                                "unknown command \"%s\" (try: atlas help)", cmd);

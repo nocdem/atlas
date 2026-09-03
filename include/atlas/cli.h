@@ -20,6 +20,9 @@ typedef struct atlas_cli_opts {
     bool json;
     bool quiet;
     bool yes;
+    /* A15 T5. `atlas review apply FILE --check`: a dry run that mints and
+     * spends nothing. `--json` is refused without it -- see run_review. */
+    bool check;
     bool no_history;
     bool no_untracked;
     /* A1 */

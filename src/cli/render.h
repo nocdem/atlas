@@ -284,6 +284,38 @@ typedef struct atlas_renderer_vtbl {
      * the same members in the same order, and a member added in the middle
      * shifts every offset after it without a diagnostic. */
     atlas_status (*memory_item)(atlas_renderer *r, const atlas_memory_render *mr, atlas_err *err);
+
+    /* --- A15 T5: `atlas review apply` --------------------------------------
+     *
+     * Three methods, streamed in this order around one call to
+     * `atlas_service_review_apply`: `review_begin` opens whatever the
+     * command's own preamble is (the JSON envelope's `check`/`sheet` fields
+     * and the `entries` array; nothing in the human form, which shows the
+     * invocation itself rather than printing it), `review_entry` renders one
+     * outcome as it arrives, and `review_totals` closes what `review_begin`
+     * opened and reports the walk's totals. This does not reuse
+     * `list_begin`/`list_end`: those always print a generic "N entries" line
+     * (human) or a `count` key (JSON) — verified against `decision list`,
+     * which stacks exactly that with its own `decision_counts` line — and
+     * the plan's frozen review-apply output has neither, only the specific
+     * per-verdict totals `review_totals` carries.
+     *
+     * `o->status` and `o->detail` (`atlas_review_outcome`, include/atlas/
+     * service.h) arrive already safe-encoded or as fixed Atlas text with
+     * checked values; a renderer prints them as-is. `o->entry->repo` is a
+     * repository name copied out of the operator's own sheet file and is
+     * UNTRUSTED_DATA regardless of the sheet grammar's own charset check —
+     * a renderer safe-encodes it, exactly as `review.h`'s own comment on the
+     * grammar's `repository` field requires. Appended at the end of the
+     * struct for the reason `plan_item` and `memory_item` above are: both
+     * positional initializer lists carry the same members in the same
+     * order, and a member added in the middle shifts every offset after it
+     * without a diagnostic. */
+    atlas_status (*review_begin)(atlas_renderer *r, const char *sheet_path, bool check_only,
+                                 atlas_err *err);
+    atlas_status (*review_entry)(atlas_renderer *r, const atlas_review_outcome *o, atlas_err *err);
+    atlas_status (*review_totals)(atlas_renderer *r, bool check_only,
+                                  const atlas_review_totals *t, atlas_err *err);
 } atlas_renderer_vtbl;
 
 struct atlas_renderer {

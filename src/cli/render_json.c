@@ -2832,6 +2832,77 @@ static atlas_status j_memory_item(atlas_renderer *r, const atlas_memory_render *
     return st;
 }
 
+/* --- A15 T5: `atlas review apply` ----------------------------------------
+ *
+ * Deliberately not `list_begin`/`list_end`: `j_list_end` always writes a
+ * `count` key, and the plan's frozen `--check` document has no such key
+ * between `"entries":[...]` and `"ready":...` — verified against
+ * `decision list --json`, which stacks `list_end`'s `"count"` with
+ * `decision_counts`'s own fields, the same mechanism this command would
+ * inherit if it reused `list_end`. `review_begin` opens the array itself and
+ * `review_totals` closes it, so there is exactly one shape rather than one
+ * the plan pinned and one the generic method would actually produce.
+ *
+ * `o->status` and `o->detail` arrive already safe-encoded or as fixed Atlas
+ * text (see the fields' own comments in include/atlas/service.h); printed
+ * as-is via `atlas_json_key_str_opt`, never re-encoded. `o->entry->repo` is
+ * UNTRUSTED_DATA copied out of the operator's own sheet file and is
+ * safe-encoded here like any other repository-originated string. */
+static atlas_status j_review_begin(atlas_renderer *r, const char *sheet_path, bool check_only,
+                                   atlas_err *err) {
+    atlas_json *j = r->j;
+    TRY(atlas_json_key_bool(j, "check", check_only, err));
+    TRY(json_safe(j, &r->safe, "sheet", sheet_path, err));
+    r->items = 0;
+    r->in_list = true;
+    TRY(atlas_json_key(j, "entries", err));
+    return atlas_json_arr_begin(j, err);
+}
+
+static atlas_status j_review_entry(atlas_renderer *r, const atlas_review_outcome *o,
+                                   atlas_err *err) {
+    atlas_json *j = r->j;
+    r->items++;
+    TRY(atlas_json_obj_begin(j, err));
+    TRY(atlas_json_key_int(j, "line", (int64_t)o->entry->line, err));
+    TRY(atlas_json_key_str(j, "intent", atlas_decision_intent_name(o->entry->intent), err));
+    TRY(json_safe(j, &r->safe, "repo", o->entry->repo, err));
+    /* Already a checked shape (atlas_decision_uid_is_valid, applied by the
+     * sheet parser) -- printed whole and unencoded, exactly as every other
+     * decision id in this file is. */
+    TRY(atlas_json_key_str(j, "decision", o->entry->decision, err));
+    TRY(atlas_json_key_int(j, "revision", o->entry->revision_no, err));
+    TRY(atlas_json_key_str(j, "prefix", o->entry->prefix, err));
+    TRY(atlas_json_key_str(j, "verdict", atlas_review_verdict_name(o->verdict), err));
+    TRY(atlas_json_key_str_opt(j, "status", o->status.len > 0 ? atlas_buf_cstr(&o->status) : NULL,
+                               err));
+    TRY(atlas_json_key_str_opt(j, "detail", o->detail.len > 0 ? atlas_buf_cstr(&o->detail) : NULL,
+                               err));
+    return atlas_json_obj_end(j, err);
+}
+
+static atlas_status j_review_totals(atlas_renderer *r, bool check_only,
+                                    const atlas_review_totals *t, atlas_err *err) {
+    atlas_json *j = r->j;
+    r->in_list = false;
+    TRY(atlas_json_arr_end(j, err));
+    if (check_only) {
+        TRY(atlas_json_key_int(j, "ready", t->ready, err));
+        TRY(atlas_json_key_int(j, "moved", t->moved, err));
+        TRY(atlas_json_key_int(j, "disposed", t->disposed, err));
+        return atlas_json_key_int(j, "missing", t->missing, err);
+    }
+    /* Never reached through `--json` today -- it is refused without
+     * `--check` -- but implemented for the same reason the human renderer's
+     * other branch is: both renderers implement both totals shapes. */
+    TRY(atlas_json_key_int(j, "applied", t->applied, err));
+    TRY(atlas_json_key_int(j, "abandoned", t->abandoned, err));
+    TRY(atlas_json_key_int(j, "moved", t->moved, err));
+    TRY(atlas_json_key_int(j, "disposed", t->disposed, err));
+    TRY(atlas_json_key_int(j, "missing", t->missing, err));
+    return atlas_json_key_int(j, "refused", t->refused, err);
+}
+
 const atlas_renderer_vtbl ATLAS_RENDERER_JSON = {
     j_begin,      j_end,          j_note_repo,    j_note_query,   j_list_begin,
     j_list_end,   j_doctor,       j_version,      j_repo_item,    j_repo_added,
@@ -2864,6 +2935,8 @@ const atlas_renderer_vtbl ATLAS_RENDERER_JSON = {
     j_plan_item,
     /* --- A12.1 T16 --- */
     j_memory_item,
+    /* --- A15 T5 --- */
+    j_review_begin, j_review_entry, j_review_totals,
 };
 
 void atlas_render_error(FILE *out, FILE *errout, bool json, const char *command,

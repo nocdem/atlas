@@ -241,6 +241,20 @@ set(ATLAS_TESTS
   # (`atlas_db_memory_generation_diffs_list`, `atlas_db_memory_pack_
   # reliance_get`).
   test_memory_cli
+  # A12.1 T17: the adversarial suite -- acceptance item 7 plus the plan's two
+  # `INSERT INTO {verify_,memory_}` grep obligations, in one place. Scans the
+  # `atlas_core` source list this file's own block builds (never a
+  # hand-written file list, T13's own counted-caller lesson) and drives real
+  # reconciliation passes against `t8env`, `test_memory_reconcile.c`'s own
+  # fixture -- so it belongs beside it in the fast "integration" subset
+  # rather than "daemon": every case here is in-process, and the one
+  # obligation that would need a live daemon (a malformed `touched_paths`
+  # over the real dispatch.* wire) is recorded as infeasible in the T17
+  # report rather than attempted, because a fixture daemon never reaches
+  # `serving_system_index` and so never loads the root-owned orchestration
+  # policy that method group requires (`src/daemon/daemon.c`) -- confirmed by
+  # a live probe, not only by reading the source.
+  test_memory_adversarial
   # T13: delivery, injection and the reliance check, against a real writer
   # thread (`run_orch`'s own seam -- build before the transaction, freeze
   # inside it, freshness after it commits -- is unreachable through
@@ -346,7 +360,12 @@ set_tests_properties(test_scan test_search test_diff test_worktree test_cli test
   # every case left in this file is a plain in-process one, like every other
   # suite on this line.
   test_memory_reconcile
+  test_memory_adversarial
   PROPERTIES LABELS "integration")
+# A12.1 T17. It scans this file's own `atlas_core` block and `src/`, so it
+# needs to know where the source tree is, exactly as test_sem_discovery and
+# test_decision_mcp do for their own scans.
+target_compile_definitions(test_memory_adversarial PRIVATE ATLAS_SRC_DIR="${CMAKE_SOURCE_DIR}")
 # The two daemon-forking cases test_memory_reconcile used to carry --
 # memory.put/status/reconcile refused for a non-operator peer, and reconciled
 # memory surviving a restart -- in their own binary now, so the daemon label

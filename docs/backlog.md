@@ -1753,3 +1753,39 @@ may already be matching on, in the one function whose failure mode is proposing 
 failing to warn about) the deletion of a person's own writing, which is why T15's second
 fix round declined to make the call under its own two Importants and recorded it here
 instead of leaving it only in the round's own report.
+
+## Claim text is bound with `strlen`, so an embedded NUL truncates it silently (2026-09-03)
+
+Found by A12.1's T17 while building the adversarial suite, which is why case (c) is split:
+the codec round-trip proves reversibility, and the full-pipeline case deliberately carries
+**no** embedded NUL because the pipeline would not have survived one.
+
+**The mechanism, verified here:** `atlas_db_bind_text_opt` (`src/db/db.c:222-230`) ends in
+`atlas_db_bind_text_n(db, stmt, idx, s, strlen(s), err)`. A `const char *` carrying an
+embedded NUL is therefore bound only up to that NUL, and the remainder is dropped with no
+error and no truncation flag — the row simply holds less than the caller passed.
+
+**Where it bites, per T17's reading of `src/db/db_verify.c`:** a claim's text reaches
+storage through that helper, so a proposition containing a NUL is stored short. Nothing
+reports it: the write succeeds, the content hash is computed over what was *passed* rather
+than what was stored in at least some paths, and every later read agrees with itself.
+
+**Why this matters more than it looks.** `atlas_safe` encoding is **reversible by
+contract**, and A12.1 leans on that: a memory file is untrusted repository content, and the
+season's promise is that its bytes survive to a reader unchanged in meaning. A codec that
+round-trips into a storage layer that truncates keeps the promise on paper and breaks it in
+the row. The suite now proves the codec half and says plainly that the pipeline half is not
+proved for NUL-bearing input.
+
+**The remedy already exists in the tree.** `atlas_db_bind_text_n` takes an explicit length,
+and A12.1's own T16 fix round used exactly that for `claims_manifest` and `flagged_anchors`
+when netstring binary-safety was at stake. So this is a known defect shape with a known
+remedy applied in one place and not in the claim-text path.
+
+**Candidate fixes, none implemented.** Bind claim text by length rather than by `strlen`,
+which requires the length to travel with the text from wherever it is parsed — that is the
+real work, not the bind call. Or refuse a claim carrying an embedded NUL at intake, which is
+cheaper, honest, and consistent with "a bound that is reached is refused, never trimmed", at
+the cost of rejecting content some repository may legitimately hold. **Whichever is chosen,
+the current behaviour — silently storing less than was given — is the one option that should
+not stand.**

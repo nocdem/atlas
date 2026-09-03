@@ -443,8 +443,9 @@ static atlas_status process_item(atlas_db *db, int64_t repo_id, const char *item
         atlas_verify_state state = ATLAS_VERIFY_UNVERIFIED;
         atlas_verify_conflict conflict = ATLAS_CONFLICT_NONE;
         atlas_verify_basis basis = ATLAS_VERIFY_BASIS_UNKNOWN;
+        bool stale = false;
         bool result_found = false;
-        st = atlas_db_verify_result_latest(db, claim.id, &state, &conflict, NULL, &basis, &result_found,
+        st = atlas_db_verify_result_latest(db, claim.id, &state, &conflict, &stale, &basis, &result_found,
                                            err);
         if (st != ATLAS_OK) {
             atlas_verify_claim_free(&claim);
@@ -459,17 +460,56 @@ static atlas_status process_item(atlas_db *db, int64_t repo_id, const char *item
             break;
         }
 
-        bool superseded = diff_found && last_kind == ATLAS_MEMORY_DIFF_SUPERSEDED;
+        /* Fix round (I1): the header states, as an absolute, that NORMATIVE
+         * semantics and an IMPLEMENTATION conflict never reach a hunk. The
+         * shipped `superseded` term carried neither guard, so a SUPERSEDED
+         * diff row alone bypassed both. Both are restored here, matching
+         * `det_contradicted` below.
+         *
+         * `basis` is deliberately NOT required on this arm, and that is a
+         * conclusion, not an omission. "Deterministically CONTRADICTED" is a
+         * `verify_results` row's own pair (`state`, `basis`); SUPERSEDED is
+         * not a `verify_results` verdict under either of the two ways this
+         * project's own documents describe it -- a text fact ("the source's
+         * new version no longer contains the proposition") or a claim-lineage
+         * fact (`verify_claims.superseded_by_claim_id`, still without a
+         * writer anywhere in `src/`) -- neither of which any verifier
+         * establishes (the fix round's own test exercises this arm with no
+         * `verify_results` row whatsoever, so `basis` reads its zero,
+         * UNKNOWN, in that case; see `include/atlas/memory.h`'s own comment
+         * on this function for the full argument). Requiring
+         * `basis == DETERMINISTIC` here would not add protection for
+         * NORMATIVE or IMPLEMENTATION -- the two guards in `superseded`
+         * below already hold those absolutely -- it would instead make
+         * supersession alone insufficient to propose deletion whenever no
+         * deterministic verifier happened to have run against the claim at
+         * all, which is a different question this arm was never built to
+         * answer. Applying a `verify_results`-shaped gate to a fact that is
+         * not a `verify_results` row is the category error, not the fix. */
+        bool superseded = diff_found && last_kind == ATLAS_MEMORY_DIFF_SUPERSEDED &&
+                          claim.semantics == ATLAS_CLAIM_DESCRIPTIVE &&
+                          conflict != ATLAS_CONFLICT_IMPLEMENTATION;
         /* "Deterministically CONTRADICTED" is this pair, `basis` included,
          * and nothing else -- T15's context, verbatim. `basis` was not
          * available from `atlas_db_verify_result_latest` before this task
          * widened it; approximating it from `algorithm`, the conflict kind
          * or the confidence score is exactly what A9.2's "a model cannot
-         * become a tool" rule forbids. */
+         * become a tool" rule forbids.
+         *
+         * Fix round (I2): `!stale` is a third term, not an afterthought.
+         * `verify_results.stale` is true only when *every* piece of evidence
+         * backing this verdict has since gone stale (`db_verify.c`'s own
+         * comment on the aggregate) -- the verdict was true of bytes that
+         * have since moved. A9.2.2's rule that an ABSENT result never
+         * survives the source moving applies to a CONTRADICTED one exactly
+         * the same way, and A6 says it again one layer over: STALE requires
+         * human revalidation and does not mean the underlying claim is
+         * wrong. Deleting a person's line on a verdict nothing current still
+         * supports is the precise failure this task exists to prevent. */
         bool det_contradicted = result_found && claim.semantics == ATLAS_CLAIM_DESCRIPTIVE &&
                                 state == ATLAS_VERIFY_CONTRADICTED &&
                                 basis == ATLAS_VERIFY_BASIS_DETERMINISTIC &&
-                                conflict != ATLAS_CONFLICT_IMPLEMENTATION;
+                                conflict != ATLAS_CONFLICT_IMPLEMENTATION && !stale;
 
         if (superseded || det_contradicted) {
             for (size_t z = line_start; z <= line_end; z++) {
@@ -478,10 +518,33 @@ static atlas_status process_item(atlas_db *db, int64_t repo_id, const char *item
         } else {
             /* IMPLEMENTATION is excluded on purpose (T15's context, §2): the
              * code diverged from what was approved, and the approved thing
-             * is not the thing that is wrong. A finding, never a hunk. */
+             * is not the thing that is wrong. A finding, never a hunk.
+             *
+             * Fix round (M5): the label no longer requires
+             * `basis == DETERMINISTIC`. This is display only -- IMPLEMENTATION
+             * already keeps the line out of a hunk on any basis, both above
+             * (`det_contradicted` never fires when `conflict ==
+             * ATLAS_CONFLICT_IMPLEMENTATION`, unconditionally) and via the
+             * SUPERSEDED arm's own IMPLEMENTATION guard, so no deletion path
+             * moves. Requiring DETERMINISTIC here only decided which *label*
+             * an already-excluded line got: an EMPIRICAL- or JUDGMENT-basis
+             * IMPLEMENTATION conflict fell through to the generic "RETAINED"
+             * instead of naming the drift, losing the one signal the finding
+             * vocabulary exists to carry -- IMPLEMENTATION_DRIFT reports what
+             * the stored `conflict` column already says, not a new
+             * determination this function makes, so it is accurate on any
+             * basis.
+             *
+             * A stale, deterministically CONTRADICTED line (I2, above) falls
+             * through to plain "RETAINED" rather than a dedicated label, by
+             * contrast: I2's ruling excludes it from deletion, and the brief
+             * asked only for that exclusion, not a new vocabulary member.
+             * Adding one was not requested and is left for whoever next
+             * extends the finding vocabulary deliberately, the same
+             * discipline `docs/extending.md` asks of every other one. */
             const char *reason = "RETAINED";
             if (result_found && state == ATLAS_VERIFY_CONTRADICTED &&
-               basis == ATLAS_VERIFY_BASIS_DETERMINISTIC && conflict == ATLAS_CONFLICT_IMPLEMENTATION) {
+               conflict == ATLAS_CONFLICT_IMPLEMENTATION) {
                 reason = "IMPLEMENTATION_DRIFT";
             } else if (claim.semantics != ATLAS_CLAIM_DESCRIPTIVE) {
                 reason = "NORMATIVE";

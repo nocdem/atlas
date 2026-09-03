@@ -1743,10 +1743,11 @@ atlas_status atlas_db_memory_trailer_binding_get(atlas_db *db, int64_t repo_id,
  * themselves.
  *
  * `atlas_memory_patch_build` renders a unified diff against one registered
- * source's *current* content, proposing ONLY deletions -- never a rewrite,
- * never an addition, never a line changed in place -- plus a findings list
- * for everything the diff does not carry an opinion about. A line (one T7
- * proposition) is proposed for removal iff:
+ * source's content at HEAD (a tracked `REPO_*` source's *working-tree* edits
+ * are not read -- M1, fix round; see the paragraph below), proposing ONLY
+ * deletions -- never a rewrite, never an addition, never a line changed in
+ * place -- plus a findings list for everything the diff does not carry an
+ * opinion about. A line (one T7 proposition) is proposed for removal iff:
  *
  *   - it resolved an anchor, correlates to a claim currently live under that
  *     anchor (matched by exact text, `atlas_db_memory_anchor_claim_uids`' own
@@ -1756,15 +1757,47 @@ atlas_status atlas_db_memory_trailer_binding_get(atlas_db *db, int64_t repo_id,
  *     `basis = DETERMINISTIC` -- "deterministically CONTRADICTED" is exactly
  *     that pair and nothing else, never approximated from `algorithm`, the
  *     conflict kind or the confidence score (A9.2: a model cannot become a
- *     tool) -- with a conflict that is anything other than IMPLEMENTATION;
+ *     tool) -- with a conflict that is anything other than IMPLEMENTATION,
+ *     and with that same row's `stale` column false (fix round, I2: `stale`
+ *     is true only when *every* piece of evidence behind the verdict has
+ *     since gone stale -- the verdict was true of bytes that have since
+ *     moved, and A9.2.2's rule that an ABSENT result never survives the
+ *     source moving applies to a CONTRADICTED one exactly the same way. A6
+ *     says it again one layer over: STALE requires human revalidation and is
+ *     never grounds to conclude the claim is wrong. This was omitted from
+ *     the shipped predicate, not deviated from -- the original context's own
+ *     definition of "deterministically CONTRADICTED" simply did not mention
+ *     it, and the omission is the season owner's to correct, which this
+ *     round does);
  *   - or that claim's most recently recorded diff kind
- *     (`atlas_db_memory_claim_diff_last_kind`) is SUPERSEDED.
+ *     (`atlas_db_memory_claim_diff_last_kind`) is SUPERSEDED, its semantics
+ *     are DESCRIPTIVE, and its most recently stored `verify_results` row (if
+ *     any) does not carry conflict IMPLEMENTATION (fix round, I1: the
+ *     shipped predicate treated SUPERSEDED as an unconditional disjunct with
+ *     neither guard, which let a NORMATIVE claim or an IMPLEMENTATION
+ *     conflict reach a hunk through this arm alone -- unreachable in
+ *     production, since nothing in `src/` writes a SUPERSEDED diff row yet,
+ *     which is exactly why it would have gone unnoticed once something did).
+ *     `basis` is deliberately NOT required on this arm, and this is a
+ *     conclusion, not an omission: the project's own documents describe
+ *     SUPERSEDED two ways -- the T9 brief calls it "the source's new version
+ *     no longer contains the proposition" (a fact about the *text*), while
+ *     the T9 review's residual note scopes its real, never-implemented
+ *     derivation to `verify_claims.superseded_by_claim_id`, a claim
+ *     replaced by a successor claim (a fact about *lineage*). Either way it
+ *     is not a `verify_results` verdict: it is either the extractor's own
+ *     text comparison or a claim-identity fact, neither of which any
+ *     verifier establishes, so a `verify_results`-shaped gate (`basis`)
+ *     does not describe it under either reading. The two guards actually
+ *     stated by this task -- NORMATIVE, IMPLEMENTATION -- are what apply,
+ *     and both now do.
  *
- * **IMPLEMENTATION is excluded on purpose.** It means the code diverged from
- * what was approved -- the approved thing is not the thing that is wrong, and
+ * **NORMATIVE semantics and an IMPLEMENTATION conflict never reach a hunk, on
+ * either arm above.** IMPLEMENTATION means the code diverged from what was
+ * approved -- the approved thing is not the thing that is wrong, and
  * proposing deletion there would be automatically adopting a design because
  * current code happens to implement it, a named non-goal of this season. A
- * line excluded for this reason is a *finding*, never a hunk.
+ * line excluded for either reason is a *finding*, never a hunk.
  *
  * A line that resolved no anchor, or whose anchor resolves but no live claim
  * under it carries this exact text (a proposition this pass cannot correlate
@@ -1773,17 +1806,44 @@ atlas_status atlas_db_memory_trailer_binding_get(atlas_db *db, int64_t repo_id,
  * evidence for keeping or removing it, so this function says nothing about
  * it rather than guessing.
  *
+ * **Fix round (M4): only a candidate's *first* anchor is ever consulted**
+ * (`atlas_db_memory_anchor_claim_uids` is asked about `anchors[0]` alone --
+ * `src/memory/reconcile.c:833-834`'s own correlation lookup does the same,
+ * though that file's separate *pruning* pass was widened to every one of a
+ * claim's anchors in T9's fix round, `reconcile.c:845-855`, so the precedent
+ * is for the lookup shape, not a claim that the file has this limitation
+ * throughout). A line whose live claim was anchored to its *second*
+ * backticked path correlates to nothing here and produces neither a hunk
+ * nor a finding, by the paragraph above -- conservative in the deletion
+ * direction, but it means neither `diff_out` nor `findings_out` is a census
+ * of every assessed line in the source; a reader must not infer "not
+ * mentioned in findings" as "known healthy" for a line with more than one
+ * anchor.
+ *
  * **This function reads files and must not run inside a transaction** --
  * `atlas_memory_observe`'s own rule, for the same reason: it asks
  * `atlas_memory_read_source`, which is A13-routed (a repository naming a
  * scanner is read from its mirror and from nothing else; one with none reads
  * its own tree, exactly as every other T6 caller does -- this function
  * restates none of that routing, it only asks). `data_dir` exists so the
- * diff's context lines are read through the same path and match the source's
- * own bytes exactly; an EXTERNAL_* source instead reads its already-stored
- * latest version (`atlas_db_memory_version_latest`), `atlas_memory_observe`'s
- * own EXTERNAL_* shape, since no principal but the one that called
- * `memory.put` reads one directly.
+ * diff's context lines are read through the same path this function's own
+ * read uses.
+ *
+ * **Fix round (M1): "the same path" is HEAD's blob, not the working tree.**
+ * For a tracked `REPO_FILE`, `atlas_memory_read_source` resolves the path
+ * against HEAD's tree and reads the git object (`read.c`'s `atlas_git_
+ * blob_oid_at` / `atlas_git_cat_blob`); the filesystem handle it opens first
+ * proves the path is not a symlink and is never read from again once the
+ * blob is fetched. So an uncommitted edit to a tracked memory file is
+ * invisible here, and the diff's context lines are HEAD's bytes, not the
+ * file on disk. This fails closed rather than corrupting anything: `git
+ * apply` rejects a hunk whose context does not match the working tree
+ * exactly, it does not apply it against the wrong lines. An EXTERNAL_*
+ * source instead reads its already-stored latest version
+ * (`atlas_db_memory_version_latest`), `atlas_memory_observe`'s own
+ * EXTERNAL_* shape, since no principal but the one that called `memory.put`
+ * reads one directly -- that half was always "stored", never "working
+ * tree", and is unaffected by this correction.
  *
  * **It writes nothing anywhere.** `diff_out` and `findings_out` are the only
  * output; no `memory_*` row, no `verify_*` row, no file. A caller may verify
@@ -1797,6 +1857,26 @@ atlas_status atlas_db_memory_trailer_binding_get(atlas_db *db, int64_t repo_id,
  * claim. A finding is Atlas talking about a line, and is listed *beside* the
  * diff, never inside it: wanting to put an explanatory comment inside a hunk
  * is a sign the comment belongs in `findings_out` instead.
+ *
+ * **Fix round (M2): that makes the output a rendering, and not always an
+ * applicable patch.** `atlas_text_encode_safe` escapes `%` as `%25` along
+ * with the C0/C1 controls -- required, since the byte it is escaping is
+ * untrusted, but the consequence is that a source line containing a literal
+ * `%` produces a diff line that is no longer equal to the file's own bytes.
+ * `git apply` then rejects that hunk rather than mis-applying it (the
+ * context or removed line no longer matches), so this fails closed exactly
+ * like M1 -- but it means this output is a safe *rendering* of the proposal,
+ * not a guarantee that the bytes are `git apply`-ready. A caller wanting an
+ * applicable patch must know the source is free of `%` and of every other
+ * byte `atlas_text_encode_safe` escapes.
+ *
+ * **Fix round (M3): no `\ No newline at end of file` marker.** Every emitted
+ * line, including the last, is terminated with `'\n'`; a source whose own
+ * last byte is not `'\n'` is rendered as if it were. Fails closed the same
+ * way: if the hunk's own window -- the deleted run plus its context lines --
+ * reaches the file's true last line, `git apply` rejects the hunk (its
+ * trailing context or removal no longer matches the file exactly) rather
+ * than truncating or duplicating a newline.
  *
  * `diff_out` is empty and `findings_out` says so -- one entry naming the
  * source and that nothing was proposed -- when nothing in the source

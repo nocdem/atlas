@@ -393,6 +393,7 @@ static void test_no_source_or_document_overstates_the_approval_claim(void) {
         ATLAS_SRC_DIR "/SECURITY.md",
         ATLAS_SRC_DIR "/CLAUDE.md",
         ATLAS_SRC_DIR "/docs/decision-lifecycle.md",
+        ATLAS_SRC_DIR "/docs/review-surface.md",
         ATLAS_SRC_DIR "/docs/ai-trust-boundary.md",
         ATLAS_SRC_DIR "/docs/provenance.md",
         ATLAS_SRC_DIR "/docs/claude-integration.md",

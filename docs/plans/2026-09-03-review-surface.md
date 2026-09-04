@@ -565,6 +565,20 @@ The first is the per-line bound; the second wraps `atlas_db_check_repo_name`'s o
 message for a repository field it refuses, so one grammar answers for the registry's.
 A third, produced by the walker rather than the parser, is in the next block.
 
+**Amended during execution, 2026-09-04 (whole-branch review fix wave).** The line above
+this paragraph originally read "the offending field safe-encoded and truncated to 32
+bytes" — a description of a defect, not of the grammar. `refuse_bad_intent`
+(`src/core/review.c`) truncates the field to `ATLAS_REVIEW_INTENT_MSG_MAX` (32) bytes and
+carries it into the message *raw*; `atlas_render_error` (`src/cli/render_json.c`)
+safe-encodes the whole rendered message exactly once, at the point it reaches a terminal
+or a JSON document — the tree's ordinary rule, that an error message carries raw text and
+is encoded once at render, and not a rule this file gets to have its own version of.
+Encoding here as well as there double-encoded a literal `%` byte into `%2525`, measured
+against the installed binary; `tests/test_review_sheet.c` pinned the pre-render form
+(`%25bad`) and therefore pinned the deviation. The corrected line: the `%s` in the intent
+sentence is the offending field truncated to 32 bytes, carried raw and encoded once, at
+render, like every other value `atlas_err_set` carries in this tree.
+
 ### The refusal sentences (`atlas review apply`)
 
 ```

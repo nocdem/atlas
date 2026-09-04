@@ -49,7 +49,6 @@
 
 #include "atlas/buf.h"
 #include "atlas/db.h"
-#include "atlas/safetext.h"
 
 /* --- the verdict vocabulary -------------------------------------------------
  *
@@ -234,28 +233,36 @@ static bool already_named(const atlas_review_sheet *built, const char *repo, con
 
 /* Refuses an intent field that did not parse, or parsed to SUPERSEDE or
  * REVALIDATE. The offending field is truncated to ATLAS_REVIEW_INTENT_MSG_MAX
- * bytes and *then* safe-encoded (`atlas/safetext.h` -- repository-adjacent
- * text is untrusted even when it is only ever printed back inside an error
- * message), in that order: truncating after encoding could cut a multi-byte
- * `%XX` escape in half and hand a caller a message with a bare `%` in it.
- * Truncating first and encoding the (shorter) result is always well-formed,
- * so an operator who mistyped one word sees it and a line built to carry a
- * very long hostile token does not get to make the message large. */
+ * bytes and carried into the message *raw*, the way every other
+ * `atlas_err_set` call in this tree carries a repository-adjacent value: an
+ * error message holds raw text and is safe-encoded exactly once, at render,
+ * by `atlas_render_error` (`src/cli/render_json.c`). This file's own byte
+ * scan, in `atlas_review_sheet_parse` before any field is split out, has
+ * already refused every byte in the line outside printable ASCII and tab, so
+ * the only byte an encoder here could still touch is a literal '%' --
+ * `atlas_safe()` escapes exactly that one byte to keep its own `%XX` scheme
+ * reversible. Encoding it a second time here produced a doubled `%2525` for
+ * that one byte once `atlas_render_error` encoded the already-encoded
+ * message again: a caller-visible defect, not a defence, since nothing
+ * between this point and the terminal or a JSON document skips
+ * `atlas_render_error`'s single pass. Truncating to a fixed *byte* count
+ * remains necessary on its own: an unbounded field would let a very long
+ * hostile token make the message itself large. */
 static atlas_status refuse_bad_intent(size_t line_no, const char *raw, size_t raw_len,
                                       atlas_err *err) {
-    atlas_buf enc;
-    atlas_buf_init(&enc);
+    atlas_buf copy;
+    atlas_buf_init(&copy);
     size_t take = raw_len < ATLAS_REVIEW_INTENT_MSG_MAX ? raw_len : ATLAS_REVIEW_INTENT_MSG_MAX;
-    atlas_status st = atlas_text_encode_safe(raw, take, &enc, err);
+    atlas_status st = atlas_buf_set(&copy, raw, take, err);
     if (st != ATLAS_OK) {
-        atlas_buf_free(&enc);
+        atlas_buf_free(&copy);
         return st;
     }
     atlas_status rc = atlas_err_set(
         err, ATLAS_ERR_USAGE,
         "review sheet line %zu: \"%s\" is not an intent a sheet may carry (approve, reject or resolve)",
-        line_no, atlas_buf_cstr(&enc));
-    atlas_buf_free(&enc);
+        line_no, atlas_buf_cstr(&copy));
+    atlas_buf_free(&copy);
     return rc;
 }
 

@@ -288,7 +288,16 @@ command-specific value above the seven-value exit-code contract, following
 for five distinct causes, verified against `src/core/review.c` and
 `src/core/service_review.c`: a malformed sheet, a sheet with no entries, `--yes`,
 `--json` without `--check`, and no interactive terminal on both standard
-streams. A locked authority profile exits with whatever `atlas decision
+streams. A sixth cause exits `3`, not `2`, and is not one of those five: when
+`read_sheet_bounded` (`src/core/service_review.c`) cannot open or read the
+sheet file at all, it returns `ATLAS_ERR_CONFIG` — the same status
+`src/core/unit.c`'s own read path returns when it cannot read a file, the
+existing precedent this reuses rather than inventing a sixth `2` cause for a
+sheet whose bytes were never read. Neither `README.md` nor `CLAUDE.md`'s
+exit-code table needs a new line for this: both already list `3` as the
+generic configuration-error code, and a file the caller pointed at that
+cannot be opened is exactly that, not something specific to `review apply`.
+A locked authority profile exits with whatever `atlas decision
 approve` exits with, because `run_review` makes the identical
 `atlas_authority_require` call first, before the sheet is even opened. This is
 recorded in the season's own document as well as at the two places the
@@ -414,3 +423,24 @@ carry a comment saying so, beside the two calls the invariant depends on.
 - **No cross-device queue, and disposal needs a shell on the machine.** Both
   are §2's stated costs of choosing tier 1, restated here because this is the
   document a later season reads before choosing to widen them.
+- **The sheet cannot dispose of a PROPOSED revision that sits on top of an
+  APPROVED one, and nothing in this season closes that.** `op_revise`
+  (`src/decision/lifecycle.c`) gates a new revision on kind, revision count
+  and content-hash idempotency, never on the document's status, so an
+  APPROVED record acquiring a newer PROPOSED revision is the ordinary result
+  of revising approved policy. `required_status_for`
+  (`src/core/service_review.c`) compares an intent against the *document's*
+  status, which still reads APPROVED, so a sheet line naming that new
+  revision passes MOVED and the hash check and is refused DISPOSED for
+  approve/reject, and — for an APPROVED `OBLIGATION` or `ACCEPTED_RISK` —
+  reads `READY` under `--check` and is then refused inside `op_challenge`'s
+  own revision-state check the moment it is actually run: a dry run says
+  READY for an entry the lifecycle refuses. The Review view now declines to
+  offer a queue button in this state rather than promise a disposal the
+  walker cannot perform (`showReviewDetail`, `mission-control.html`), but
+  the sheet grammar still has no way to name "the approved revision, not the
+  latest one" — such a record can only be disposed of from `atlas decision
+  approve|reject|resolve` on a terminal. The contained fix, moving
+  `required_status_for` onto the revision's own state rather than the
+  document's, is a design change with its own test and is recorded in
+  `docs/backlog.md`, not made here.

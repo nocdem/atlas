@@ -1053,6 +1053,30 @@ function showReviewDetail(repo, row) {
      different revision. */
   const queueBox = section("Queue");
   panel(queueBox, async () => {
+    /* Whole-branch review fix (finding 1). `op_revise` (src/decision/
+       lifecycle.c) gates a new revision on kind, revision count and
+       content-hash idempotency, and never on the document's status, so an
+       APPROVED record can carry a newer PROPOSED revision beside it --
+       exactly what revising approved policy produces. `required_status_for`
+       (src/core/service_review.c) then compares an intent against the
+       *document's* status, which still reads APPROVED here regardless of
+       what the newest revision holds, so an approve/reject line naming that
+       new revision is refused DISPOSED, and a resolve line for an APPROVED
+       OBLIGATION or ACCEPTED_RISK reads READY under --check but is refused
+       inside op_challenge's own revision-state check the moment it is
+       actually run. This page is a courtesy mirror and the C predicate at
+       the write point is the authority: rather than offer a button the
+       walker cannot honour for this revision, it says so and points at the
+       terminal. */
+    if (row.revision !== row.latest_revision) {
+      const box = el("div");
+      box.appendChild(el("p", {class: "dim", text:
+        "This record's revision r" + row.revision + " is not its latest, r" +
+        row.latest_revision + ". A sheet names one revision and atlas review apply requires " +
+        "it to be the newest, so this record cannot be queued here -- dispose of it with " +
+        "atlas decision approve, reject or resolve on a terminal instead."}));
+      return box;
+    }
     const intents = reviewIntentsAllowed(row.status, row.kind);
     const box = el("div", {class: "row"});
     if (intents.length === 0) {

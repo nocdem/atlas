@@ -454,10 +454,12 @@ way out; and `atlas_terminal_write` replaces any byte a terminal would act on.
 
 `atlas review apply FILE` (A15) reads a plain-ASCII **review sheet** and loops
 this same operator channel once per line, with the reviewed revision pinned.
-The sheet itself carries no authority: its grammar has **no field for a
-confirmation** — an entry names an intent, a repository, a decision, a
-revision and a hash prefix, and nothing else, and a line with a sixth field
-refuses the whole sheet rather than being read as an early confirmation. The
+The sheet itself carries no authority: its grammar has **a field for the
+public prefix an operator will type, and none the walker reads in place of
+typing it** — an entry names an intent, a repository, a decision, a revision
+and a hash prefix (the same first eight hex of the content hash that ends up
+typed on `/dev/tty`), and nothing else, and a line with a sixth field refuses
+the whole sheet rather than being read as an early confirmation. The
 confirmation is still typed on `/dev/tty`, per entry, exactly as above; a
 sheet only says which records to walk and in which order, and an operator
 could type the same five lines by hand at the ordinary `atlas decision

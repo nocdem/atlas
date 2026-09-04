@@ -20,8 +20,21 @@
  * an entry whose revision or status no longer matches what the sheet
  * describes. That refusal costs nothing: every step of the pre-check is a
  * read, so `--check` can run the whole thing with `check_only` true and
- * nothing is ever minted or spent -- an operator's dry run and a real run
- * take the identical path up to the point a capability would be issued.
+ * nothing is ever minted or spent.
+ *
+ * `--check`'s `READY` means only that this pre-check passed -- not that a
+ * real run of the same entry would end `APPLIED`. The two ask different
+ * questions: this file's DISPOSED check compares the intent against
+ * `required_status_for`, which reads the *document's* current status
+ * (`doc0.summary.status` below), while `op_challenge`
+ * (`src/decision/lifecycle.c`), reached only once a capability is actually
+ * being minted, checks a resolve intent against the *named revision's own*
+ * stored state instead. An APPROVED document whose newest revision is a
+ * still-PROPOSED candidate answers this file's question `APPROVED` and
+ * `op_challenge`'s question `PROPOSED` for that same revision, so a resolve
+ * entry naming it reads `READY` here and is refused there -- "only an
+ * approved revision can be resolved; revision N is PROPOSED" -- before
+ * anything is minted. See `docs/review-surface.md`'s costs section.
  *
  * One deviation from the contract as originally written, and the reason for
  * it: see the `atlas_service_review_apply` comment in `include/atlas/service.h`

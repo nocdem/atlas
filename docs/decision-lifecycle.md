@@ -803,11 +803,36 @@ Before minting anything for an entry, the walker re-reads the record and
 refuses the entry — costing no challenge at all — when the newest revision is
 no longer the one the sheet names, when that revision's content hash no
 longer starts with the sheet's prefix, or when the record's status is no
-longer the one the intent needs. A sheet is a plain list with **no field for
-a confirmation**: queuing a record in a browser stores no authority anywhere,
-and the only thing that ever disposes of one is this same interactive prompt,
-which Atlas records as `LOCAL_OPERATOR_CONFIRMED` — that names the channel,
+longer the one the intent needs. A sheet's fifth field carries the public
+prefix an operator will type — it is not a field the walker ever reads in
+place of typing it on `/dev/tty` — so queuing a record in a browser stores no
+authority anywhere, and the only thing that ever disposes of one is this
+same interactive prompt, which Atlas records as `LOCAL_OPERATOR_CONFIRMED` —
+that names the channel,
 not a person, exactly as every other transition on this page does.
+
+**The walker cannot dispose of a PROPOSED revision that sits on top of an
+APPROVED one.** `op_revise` (`src/decision/lifecycle.c`) gates a new
+revision on kind, revision count and content-hash idempotency, never on the
+document's status, so revising an APPROVED record is ordinary and produces
+exactly this shape: an APPROVED document whose *newest* revision is
+PROPOSED. `required_status_for` (`src/core/service_review.c`) compares an
+intent against the *document's* status, which still reads APPROVED, so a
+sheet line approving or rejecting that new revision passes the walker's
+MOVED and hash checks and is refused DISPOSED ("the record is APPROVED;
+approve needs PROPOSED") — and for an APPROVED `OBLIGATION` or
+`ACCEPTED_RISK`, a `resolve` line for that same revision reads `READY` under
+`--check` yet is refused inside `op_challenge`'s own revision-state check
+("only an approved revision can be resolved; revision N is PROPOSED") the
+moment it is actually run, so a dry run can say READY for an entry the
+lifecycle refuses. Mission Control's Review view now declines to offer a
+queue button while a record is in this state (`showReviewDetail`, guarding
+on `row.revision !== row.latest_revision`) rather than promise a disposal
+the walker cannot perform, but the sheet format itself has no way to name
+"the approved revision, not the latest one" — disposing of such a record
+still works only from `atlas decision approve|reject|resolve` on a terminal,
+naming `--revision N` or leaving it at the latest, as the operator intends.
+`docs/backlog.md` records the contained fix for the walker itself.
 
 ### `--revision N`, and a pinned revision that is not the newest
 

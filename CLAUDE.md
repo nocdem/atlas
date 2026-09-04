@@ -23,12 +23,14 @@ authorization engine cannot tell which produced a given request.
 reach.** Mission Control now composes every revision, the claims about it and
 their evidence, the gate's answer, and what it links to, into one detail pane,
 and keeps a plain-text **review sheet** of what an operator would do next — a
-list that stores no authority anywhere and has no field for a confirmation.
-One new local command, `atlas review apply FILE`, walks that sheet by calling
-the operator channel A4 already built exactly once per entry, with the
-reviewed revision pinned, and refuses an entry before minting anything when
-the record moved since it was read. `atlas_decision_apply_in_tx` still has
-exactly three callers. See the A15 sections in `docs/review-surface.md` — the
+list that stores no authority anywhere: it carries the public prefix an
+operator will type, and no field the walker ever reads in place of typing it
+on `/dev/tty`. One new local command, `atlas review apply FILE`, walks that
+sheet by calling the operator channel A4 already built exactly once per
+entry, with the reviewed revision pinned, and refuses an entry before
+minting anything when the record moved since it was read.
+`atlas_decision_apply_in_tx` still has exactly three callers. See the A15
+sections in `docs/review-surface.md` — the
 season's own document — and in `docs/roadmap.md`, `docs/remote-access.md`,
 `docs/decision-lifecycle.md`, `docs/engineering-rules.md` and
 `docs/extending.md`.
@@ -856,11 +858,13 @@ is not written down is one somebody deletes.** Both halves are load-bearing.
   whether it is called through `atlas decision approve` or through
   `atlas review apply`. The page and the walker's own text are scanned by the
   same test that scans this file.
-- **The review sheet stores no authority and has no field for a
-  confirmation.** It is a list of what the operator said in a browser; every
-  entry is still confirmed on `/dev/tty` against the revision's content hash,
-  and a sixth field refuses the whole sheet for the reason a `"confirmation":`
-  MCP schema property is refused.
+- **The review sheet carries the public prefix, never a field the walker
+  reads in place of `/dev/tty`.** Its fifth field *is* the first eight hex of
+  the reviewed revision's content hash — the same string an operator types as
+  the confirmation — but nothing here spends it: every entry is still
+  confirmed by typing that prefix on `/dev/tty`, and a sixth field refuses the
+  whole sheet for the reason a `"confirmation":` MCP schema property is
+  refused.
 - **The sheet is a file argument, never standard input.** Both standard
   streams must be terminals; a piped sheet is refused before anything is
   minted.

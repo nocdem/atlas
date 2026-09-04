@@ -1310,11 +1310,12 @@
  * exists to refuse a file that is not a review sheet -- the wrong file pasted
  * into the wrong terminal -- before the parser spends any real work on it. */
 #define ATLAS_REVIEW_SHEET_MAX_BYTES (64u * 1024u)
-/* Bytes of an offending intent field quoted in the "is not an intent a sheet
- * may carry" refusal, after it is safe-encoded -- the plan's own frozen
+/* Bytes of an offending intent field quoted, truncated but otherwise raw, in
+ * the "is not an intent a sheet may carry" refusal -- the plan's own frozen
  * wording ("truncated to 32 bytes"), named here rather than left as a bare
  * literal in src/core/review.c, ATLAS_DECISION_CONFIRM_MAX's precedent
- * beside ATLAS_DECISION_CONFIRM_HEX above. */
+ * beside ATLAS_DECISION_CONFIRM_HEX above. The field is safe-encoded exactly
+ * once, later, when atlas_render_error() encodes the whole message. */
 #define ATLAS_REVIEW_INTENT_MSG_MAX 32u
 
 #endif /* ATLAS_LIMITS_H */

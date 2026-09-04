@@ -178,7 +178,7 @@ static void test_supersede_intent_refused(void) {
             "reject or resolve)");
 }
 
-static void test_intent_message_truncated_and_encoded(void) {
+static void test_intent_message_truncated_raw(void) {
     char buf[512];
     size_t used = 0;
     append(buf, sizeof buf, &used, "atlas-review-sheet/1\n");
@@ -203,9 +203,13 @@ static void test_intent_message_truncated_and_encoded(void) {
                   thirty_two);
     T_EQ_STR(atlas_err_msg(&err), expected);
 
-    /* A literal '%' in the offending field comes back safe-encoded, proving
-     * this goes through atlas_text_encode_safe() rather than a raw %s of
-     * untrusted bytes. */
+    /* A literal '%' in the offending field comes back raw, not safe-encoded:
+     * this file's own byte scan already refused every byte outside printable
+     * ASCII and tab before this token was ever split out, so a `%` is the
+     * only byte that reaches this message unescaped, and it is
+     * `atlas_render_error`'s job -- not this file's -- to encode it once, at
+     * render. A prior version encoded it here too and produced "%2525bad"
+     * once render encoded the already-encoded message a second time. */
     used = 0;
     append(buf, sizeof buf, &used, "atlas-review-sheet/1\n");
     append(buf, sizeof buf, &used,
@@ -213,7 +217,7 @@ static void test_intent_message_truncated_and_encoded(void) {
     atlas_err_init(&err);
     T_FAILS_WITH(atlas_review_sheet_parse(buf, used, &sheet, &err), ATLAS_ERR_USAGE, &err);
     T_EQ_STR(atlas_err_msg(&err),
-            "review sheet line 2: \"%25bad\" is not an intent a sheet may carry (approve, "
+            "review sheet line 2: \"%bad\" is not an intent a sheet may carry (approve, "
             "reject or resolve)");
 }
 
@@ -623,8 +627,8 @@ static const atlas_test TESTS[] = {
     {"a missing header is refused", test_missing_header_refused},
     {"the wrong field count is refused", test_field_count_refused},
     {"supersede and revalidate are refused as sheet intents", test_supersede_intent_refused},
-    {"the intent message is truncated to 32 bytes and safe-encoded",
-     test_intent_message_truncated_and_encoded},
+    {"the intent message is truncated to 32 bytes and carried raw",
+     test_intent_message_truncated_raw},
     {"a decision id with 31 hex characters is refused", test_decision_uid_31_hex_refused},
     {"r0, r01 and a bare 1 are all refused as revisions", test_revision_shape_refused},
     {"a 7-hex, 9-hex and uppercase prefix are all refused", test_prefix_shape_refused},

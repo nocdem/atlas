@@ -2359,7 +2359,7 @@ Two options, deliberately left open here:
 
 This entry does not choose between them.
 
-## The gateway's route count is now hand-kept in three documents, and `docs/review-surface.md` is outside the scan its own Decision 6 describes (2026-09-04)
+## The gateway's route count is now hand-kept in three documents (2026-09-04)
 
 Found during T9's first fix round, recorded rather than acted on.
 
@@ -2374,11 +2374,49 @@ each other or with the table; a future row added or removed updates none of
 them automatically, and a future editor fixing one has no way to find the
 other two short of grepping for the number.
 
-**`docs/review-surface.md` is not in `tests/test_decision_mcp.c`'s `FILES[]`.**
-Decision 6 in that same document says review-surface prose names the channel
-and never a person, alongside the page and the walker, which *are* in
-`FILES[]` and are mechanically scanned. The season's own document asserting
-that discipline is not itself subject to it — a forbidden phrase written into
-`docs/review-surface.md` would pass every test in this suite. Adding it to
-`FILES[]` is a one-line change in a test file this task's own scope does not
-own; recorded here for whichever task next touches `tests/test_decision_mcp.c`.
+**Resolved 2026-09-04 (whole-branch review fix wave), and struck rather than left
+here misleadingly satisfied:** this entry used to also record that
+`docs/review-surface.md` was outside `tests/test_decision_mcp.c`'s `FILES[]` scan
+its own Decision 6 describes. `docs/review-surface.md` is now in `FILES[]`, so
+that half of the entry is gone rather than marked done beside the route-count
+half, which is not.
+
+## The review walker keys a status check on the document where the lifecycle keys it on the revision (2026-09-04)
+
+Found during the whole-branch review fix wave, recorded rather than fixed: the
+contained fix is a design change with its own test, and this merge's rule is
+that the review sheet gets a page guard and a stated cost, not a rewrite of the
+walker's semantics.
+
+`op_revise` (`src/decision/lifecycle.c`) gates a new revision on kind, revision
+count and content-hash idempotency, and never on the document's status, so an
+APPROVED record can carry a newer PROPOSED revision beside it — the ordinary
+result of revising approved policy — and `fill_summary`
+(`src/core/service_decision.c`) reports the record's `status` from the
+*document* row, so it reads `APPROVED, rev 1 of 2`. `required_status_for`
+(`src/core/service_review.c`) asks the same document-level status: for
+approve/reject that means a sheet line naming revision 2 is refused DISPOSED
+before it reaches anything the operator could act on differently, and for
+resolve — an APPROVED `OBLIGATION` or `ACCEPTED_RISK` — it means `atlas review
+apply --check` reports `READY`, because the document's status is `APPROVED`
+exactly as `required_status_for(RESOLVE)` wants. The real run is then refused
+inside `op_challenge` (`src/decision/lifecycle.c`), which checks something
+different: not the document's status but the *named revision's own* stored
+state, which is `PROPOSED` for revision 2 — "only an approved revision can be
+resolved; revision 2 is PROPOSED" — and ends `REFUSED` after minting nothing.
+A dry run said READY for an entry the lifecycle was always going to refuse.
+
+The contained fix: move `required_status_for`'s comparison from
+`doc0.summary.status` (the document's current status) to the named revision's
+own stored state — `doc0.summary.revision_state` is already read by
+`atlas_service_decision_show` and is sitting unused in the same struct at
+`src/core/service_review.c:310-320` (the `docN`/`doc0` reads already in that
+function). That alone does not decide what approve/reject *should* mean for a
+PROPOSED revision 2 of an APPROVED document — today's terminal path answers
+that by taking the latest revision by default, and a walker change should
+match it deliberately rather than by accident — which is why this is recorded
+rather than made now. Mission Control's Review view carries a page-side guard
+in the meantime (`showReviewDetail`, declining to offer a queue button when
+`row.revision !== row.latest_revision`) and `docs/review-surface.md`'s costs
+section and `docs/decision-lifecycle.md` both state the gap; neither changes
+what the walker itself will do with a sheet built before this fix lands.

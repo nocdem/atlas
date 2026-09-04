@@ -211,6 +211,11 @@ atlas_status atlas_db_gw_audit_list(atlas_db *db, int64_t limit, int64_t before_
 typedef struct atlas_apikey_create_opts {
     const char *label;
     atlas_scope_mask scopes;
+    /* A16: the deliberate form for a credential that is to authorise nothing
+     * on its own. `atlas_apikey_create_on` refuses `scopes == 0` unless this
+     * is set — the CLI's `--no-scopes`, never a caller leaving `scopes` at
+     * its zero-initialised value by omission. */
+    bool no_scopes;
     /* The key this one replaces, or NULL/"" for a plain create. Rotation is
      * create-then-revoke inside one transaction, so there is never a moment
      * when neither key works. */

@@ -1645,6 +1645,25 @@ static atlas_status h_apikey_created(atlas_renderer *r, const atlas_apikey_creat
     (void)fprintf(o, "\nATLAS_API_KEY=%s\n", c->token);
     (void)fprintf(o, "\nThis secret will not be shown again. Atlas stores a one-way verifier, so "
                      "no Atlas command, backup or database read can return it.\n");
+    /* A16, Decision 2: a scope list this empty is never an accident — it is
+     * only reachable through `--no-scopes` — so the credential's whole point
+     * is stated here rather than left for the operator to infer from an empty
+     * list. */
+    if (c->scopes[0] == '\0') {
+        (void)fprintf(o,
+                      "\nscopes: (none) -- this credential authorises nothing on its own. Only "
+                      "a root-owned\n"
+                      "        remote_dispose_key line in /etc/atlas/gateway.conf can give it "
+                      "one scope,\n"
+                      "        decisions:dispose, and nothing else. Name it there, or revoke "
+                      "it.\n");
+        if (c->rotated_from[0] != '\0') {
+            (void)fprintf(o,
+                          "\nthe policy line remote_dispose_key must now name %s%s; until it "
+                          "does, neither key can dispose\n",
+                          ATLAS_APIKEY_ID_PREFIX, c->key_id);
+        }
+    }
     return ok();
 }
 

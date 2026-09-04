@@ -95,6 +95,12 @@ typedef struct atlas_cli_opts {
     const char *label;
     const char *scopes[16];
     size_t scope_count;
+    /* A16: `api-key create --label L --no-scopes` and the same on `rotate`.
+     * The deliberate form for a credential the operator wants to authorise
+     * nothing on its own — a remote-disposal credential, Decision 2 — never a
+     * silent relaxation of the "at least one --scope" rule below. Refused
+     * together with `--scope` in the same invocation. */
+    bool no_scopes;
     long since;
     const char *data_dir;
     long limit;

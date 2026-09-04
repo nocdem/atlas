@@ -250,8 +250,21 @@ bool atlas_decision_kind_resolvable(atlas_decision_kind k);
  * Atlas know this value?"; this one answers "what kind of actor caused this
  * transition?", and the two questions have different wrong answers.
  *
- * There are four actors and there will not casually be a fifth: the set is
- * small precisely so that a reader can check it. */
+ * There are six actors now, not the four this comment used to claim, and
+ * there will not casually be a seventh: the set is small precisely so that a
+ * reader can check it, and each member past the first two was argued for
+ * rather than added because a caller needed somewhere to put a value.
+ * `LOCAL_OPERATOR_CONFIRMED` exists because an explicit, challenge-bound
+ * terminal confirmation is a different kind of fact from a model's own
+ * proposal. `ATLAS_AUTOMATIC` exists because a transition Atlas makes for
+ * itself — the supersession an approval implies — must never be confused
+ * with one a human or a policy asked for. `VERIFICATION_POLICY` (A9.2) exists
+ * because a root-owned rule authorising a transition on a verification result
+ * is a third kind of cause, distinct from both a person and from Atlas'
+ * own bookkeeping. `REMOTE_OPERATOR_CONFIRMED` (A16) exists for the same
+ * reason as all three: the browser's disposal channel is not the terminal's,
+ * so it earns its own name rather than borrowing one that would make a
+ * historical row ambiguous about which channel produced it. */
 typedef enum atlas_decision_actor {
     /* A model wrote this down deliberately. The only actor that may propose
      * through MCP, and the only one a hook can produce. */
@@ -298,18 +311,71 @@ typedef enum atlas_decision_actor {
      * forge the path. Only `src/verify/autolifecycle.c` produces it, and only
      * after `atlas_db_verify_warrant_check` has matched the document, the
      * revision, the target state and the content hash. */
-    ATLAS_DECISION_ACTOR_VERIFICATION_POLICY
+    ATLAS_DECISION_ACTOR_VERIFICATION_POLICY,
+    /* A16. An explicit action arrived through Atlas' remote operator channel:
+     * the gateway, a bearer credential the root-owned policy names, over
+     * whatever transport security fronts that listener, which Atlas does not
+     * verify.
+     *
+     * Read the name exactly as `LOCAL_OPERATOR_CONFIRMED` must be read, and
+     * weaker still: it says the channel and the named credential were used.
+     * It does not name a person, does not prove a person, and is not a
+     * signature. The credential passed through a network-facing process
+     * that A9 designed to hold no authority of its own.
+     *
+     * It is its own member rather than a reuse of `LOCAL_OPERATOR_CONFIRMED`
+     * because reusing that name would make every ledger row ever written
+     * retrospectively ambiguous — a reader could no longer tell, from the
+     * actor alone, whether a given row came from a terminal on the Atlas
+     * machine or from the browser. That is the one cost this design cannot
+     * pay back, so the channel earns its own name instead. It is deliberately
+     * not writable by any adapter, for the same reason `LOCAL_OPERATOR_CONFIRMED`
+     * is not. */
+    ATLAS_DECISION_ACTOR_REMOTE_OPERATOR_CONFIRMED
 } atlas_decision_actor;
 
 const char *atlas_decision_actor_name(atlas_decision_actor a);
 bool atlas_decision_actor_parse(const char *name, atlas_decision_actor *out);
 /* True when an adapter reachable over IPC without the operator channel may
- * record this actor. Refuses LOCAL_OPERATOR_CONFIRMED and ATLAS_AUTOMATIC,
- * mirroring `atlas_provenance_writable_in_a2` and
+ * record this actor. True only for MODEL_PROPOSAL and MODEL_INFERENCE —
+ * every other member names a channel or a policy an adapter must not be able
+ * to forge, mirroring `atlas_provenance_writable_in_a2` and
  * `atlas_code_resolution_writable_in_a3`: the restriction is a function, in one
  * place, checked at the single write point rather than remembered at each
  * call site. */
 bool atlas_decision_actor_writable_by_adapter(atlas_decision_actor a);
+
+/* --- which channel minted or spent a capability ---------------------------
+ *
+ * Orthogonal to `atlas_decision_actor`: the actor says *who* the ledger
+ * believes acted; the channel says *which path* a capability travelled,
+ * which is what lets a challenge minted on one path be refused on the other.
+ *
+ * UNKNOWN is the zero, exactly as every other closed vocabulary in this
+ * project keeps its zero meaning "not known" — and here that would mean "no
+ * caller said which channel this is", which is never true of a real
+ * capability. So UNKNOWN is refused at every write point that mints or
+ * spends one (`atlas_decision_op_needs_challenge`'s callers), and
+ * `atlas_decision_channel_parse` refuses to parse the word "UNKNOWN" even
+ * though `atlas_decision_channel_name` produces it for the zero value — a
+ * caller that types the name of "not known" is not asserting a channel, and
+ * letting that string round-trip would make a forgotten field look like a
+ * value. */
+typedef enum atlas_decision_channel {
+    ATLAS_DECISION_CHANNEL_UNKNOWN = 0,
+    /* A terminal on the Atlas machine: the channel `LOCAL_OPERATOR_CONFIRMED`
+     * has always meant. */
+    ATLAS_DECISION_CHANNEL_LOCAL,
+    /* The gateway, a bearer credential, and whatever transport security
+     * fronts that listener — the channel `REMOTE_OPERATOR_CONFIRMED` means. */
+    ATLAS_DECISION_CHANNEL_REMOTE
+} atlas_decision_channel;
+
+const char *atlas_decision_channel_name(atlas_decision_channel c);
+/* Refuses to parse "UNKNOWN", and refuses anything else not in the
+ * vocabulary. A caller that cannot name LOCAL or REMOTE has not named a
+ * channel. */
+bool atlas_decision_channel_parse(const char *name, atlas_decision_channel *out);
 
 /* --- what a revision is about --------------------------------------------
  *

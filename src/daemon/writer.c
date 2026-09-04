@@ -1806,6 +1806,7 @@ static void writer_run_job(atlas_writer *w, atlas_job *j) {
                 memset(&co, 0, sizeof co);
                 co.label = j->apikey->label;
                 co.scopes = j->apikey->scopes;
+                co.no_scopes = j->apikey->no_scopes;
                 co.rotate_from = j->apikey->rotate_from[0] != '\0' ? j->apikey->rotate_from
                                                                   : NULL;
                 j->result = atlas_apikey_create_on(w->db, &co, &j->apikey_out->created,

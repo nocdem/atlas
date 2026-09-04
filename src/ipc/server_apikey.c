@@ -185,6 +185,14 @@ static atlas_status method_apikey_create(dispatch_state *ds, const atlas_ipc_req
     if (pst != ATLAS_OK) {
         return pst;
     }
+    /* A16: the deliberate `--no-scopes` form, forwarded as its own parameter
+     * rather than inferred from an empty `scopes` string — inferring it here
+     * would let any caller who merely sent no scopes get the relaxation
+     * Decision 2 reserves for an operator who typed the flag. Absent means
+     * false, exactly as the local CLI's zero-initialised opts do. */
+    bool no_scopes = false;
+    (void)atlas_ipc_param_bool(req, "no_scopes", &no_scopes);
+    op.no_scopes = no_scopes;
 
     const char *rotate = NULL;
     if (atlas_ipc_param_str(req, "rotate_from", &rotate) && rotate != NULL && rotate[0] != '\0') {

@@ -226,6 +226,11 @@ typedef struct atlas_apikey_job {
     /* create/rotate */
     char label[ATLAS_APIKEY_LABEL_MAX + 1];
     atlas_scope_mask scopes;
+    /* A16: the deliberate `--no-scopes` form, carried across the socket as its
+     * own field rather than inferred from `scopes == 0` — that inference is
+     * exactly the silent relaxation Decision 2 forbids, and the daemon-side
+     * write point must see the same explicit flag the local path does. */
+    bool no_scopes;
     char rotate_from[ATLAS_APIKEY_SELECTOR_HEX + 1];
     /* revoke */
     char key_id[ATLAS_APIKEY_SELECTOR_HEX + 1];

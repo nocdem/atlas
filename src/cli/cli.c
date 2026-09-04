@@ -527,6 +527,8 @@ static atlas_status parse_args(cli_state *st, int argc, char **argv, bool *want_
                                          sizeof(st->opts.scopes) / sizeof(st->opts.scopes[0]));
                 }
                 st->opts.scopes[st->opts.scope_count++] = argv[++i];
+            } else if (strcmp(a, "--no-scopes") == 0) {
+                st->opts.no_scopes = true;
             } else if (strcmp(a, "--depth") == 0) {
                 if (i + 1 >= argc) {
                     return atlas_err_set(err, ATLAS_ERR_USAGE, "--depth needs a value");
@@ -4335,15 +4337,23 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
             if (st->opts.label == NULL) {
                 return atlas_err_set(err, ATLAS_ERR_USAGE, "--label is required");
             }
-            if (st->opts.scope_count == 0) {
+            if (st->opts.scope_count > 0 && st->opts.no_scopes) {
                 return atlas_err_set(err, ATLAS_ERR_USAGE,
-                                     "at least one --scope is required; a credential with no "
-                                     "scopes could not read anything");
+                                     "--scope and --no-scopes cannot both be given");
+            }
+            if (st->opts.scope_count == 0 && !st->opts.no_scopes) {
+                return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                     "at least one --scope is required, or --no-scopes for a "
+                                     "remote-disposal credential; a credential with no scopes "
+                                     "could not read anything");
             }
             /* Each scope is checked against the closed vocabulary here so the
              * refusal names the offending value. The service layer checks again
              * at the write point, which is the guarantee; this one is the
-             * message. */
+             * message. With `--no-scopes` there is nothing to parse: the loop
+             * below runs zero times and `mask` stays zero, which is the
+             * deliberate form `atlas_apikey_create_on` requires
+             * `opts->no_scopes` to admit. */
             atlas_scope_mask mask = 0u;
             for (size_t i = 0; i < st->opts.scope_count; i++) {
                 atlas_apikey_scope one = atlas_apikey_scope_parse(st->opts.scopes[i]);
@@ -4377,6 +4387,7 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
             memset(&co, 0, sizeof co);
             co.label = st->opts.label;
             co.scopes = mask;
+            co.no_scopes = st->opts.no_scopes;
             co.rotate_from = rotating ? st->operands[1] : NULL;
 
             atlas_apikey_created created;

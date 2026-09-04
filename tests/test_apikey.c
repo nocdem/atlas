@@ -276,6 +276,46 @@ static void test_rotation_replaces_one_credential_with_another(void) {
     T_EQ_INT(run_key(&fx, list, 2, &out, &err), 0);
     T_CHECK(strstr(atlas_buf_cstr(&out), "replaced by") != NULL);
 
+    /* Extended for A16: `--no-scopes` rotation, the deliberate form for
+     * replacing a disposal credential. It is refused and accepted under the
+     * same three sentences as create, and its success output carries one more
+     * line an ordinary rotation does not: the operator must repoint the
+     * policy's `remote_dispose_key` line, because rotation mints a new key id
+     * and the old one no longer authenticates. */
+    const char *disposal_create[] = {"api-key", "create", "--label", "disposal", "--no-scopes"};
+    T_EQ_INT(run_key(&fx, disposal_create, 5, &out, &err), 0);
+    char disposal_old_id[ATLAS_APIKEY_SELECTOR_HEX + 1];
+    id_of(&out, disposal_old_id, sizeof disposal_old_id);
+
+    const char *disposal_rotate[] = {"api-key", "rotate", disposal_old_id, "--label", "disposal",
+                                     "--no-scopes"};
+    T_EQ_INT(run_key(&fx, disposal_rotate, 6, &out, &err), 0);
+    char disposal_new_id[ATLAS_APIKEY_SELECTOR_HEX + 1];
+    id_of(&out, disposal_new_id, sizeof disposal_new_id);
+    T_CHECK_MSG(strcmp(disposal_old_id, disposal_new_id) != 0,
+                "a --no-scopes rotation reused the key id");
+
+    char reminder[192];
+    (void)snprintf(reminder, sizeof reminder,
+                  "the policy line remote_dispose_key must now name key_%s", disposal_new_id);
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&out), reminder) != NULL,
+                "a --no-scopes rotation did not print the policy-line reminder: %s",
+                atlas_buf_cstr(&out));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&out), "until it does, neither key can dispose") != NULL,
+                "a --no-scopes rotation is missing the second half of the reminder: %s",
+                atlas_buf_cstr(&out));
+
+    /* An ordinary rotation (`repo:read`, not `--no-scopes`) must never print
+     * this reminder: rotating the `chatgpt` key above did not, which is
+     * re-checked here so a later change that made the reminder unconditional
+     * would fail this test rather than only look untested. */
+    const char *ordinary_rotate[] = {"api-key", "rotate", new_id, "--label", "chatgpt", "--scope",
+                                     "repo:read"};
+    T_EQ_INT(run_key(&fx, ordinary_rotate, 7, &out, &err), 0);
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&out), "remote_dispose_key") == NULL,
+                "an ordinary rotation printed the disposal-only reminder: %s",
+                atlas_buf_cstr(&out));
+
     atlas_buf_free(&out);
     fx_close(&fx);
 }
@@ -296,11 +336,15 @@ static void test_creation_refuses_what_it_cannot_grant(void) {
          {"api-key", "create", "--label", "x", "--scope", "wat:read"}, 6},
         {"a scope no credential may hold",
          {"api-key", "create", "--label", "x", "--scope", "memory:write"}, 6},
+        {"the disposal scope, which nothing can be granted",
+         {"api-key", "create", "--label", "x", "--scope", "decisions:dispose"}, 6},
         {"no scope at all", {"api-key", "create", "--label", "x"}, 4},
         {"no label", {"api-key", "create", "--scope", "repo:read"}, 4},
         {"a label with a newline in it",
          {"api-key", "create", "--label", "a\nb", "--scope", "repo:read"}, 6},
         {"a key id that is not one", {"api-key", "revoke", "not-an-id"}, 3},
+        {"--scope and --no-scopes together",
+         {"api-key", "create", "--label", "x", "--scope", "repo:read", "--no-scopes"}, 7},
     };
 
     /* One real credential first, so "nothing was created" is checked against a
@@ -330,6 +374,85 @@ static void test_creation_refuses_what_it_cannot_grant(void) {
      * which would invite a bug report. */
     const char *w[] = {"api-key", "create", "--label", "x", "--scope", "memory:write"};
     (void)run_key(&fx, w, 6, &out, &err);
+
+    /* `decisions:dispose` is refused with its own frozen sentence, naming how
+     * the credential it belongs to is actually made — not the generic
+     * "cannot be granted" text `memory:write` gets. */
+    atlas_buf dout = ATLAS_BUF_INIT;
+    atlas_buf derr = ATLAS_BUF_INIT;
+    {
+        const char *argv[8];
+        size_t k = 0;
+        argv[k++] = "--data-dir";
+        argv[k++] = fx_data_dir(&fx);
+        argv[k++] = "api-key";
+        argv[k++] = "create";
+        argv[k++] = "--label";
+        argv[k++] = "x";
+        argv[k++] = "--scope";
+        argv[k++] = "decisions:dispose";
+        int code = -1;
+        T_OK(fx_atlas(argv, k, &dout, &derr, &code, &err), &err);
+        T_CHECK_MSG(code == 2, "decisions:dispose produced exit %d rather than a usage error",
+                    code);
+        T_CHECK_MSG(strstr(atlas_buf_cstr(&derr),
+                           "decisions:dispose cannot be granted to a credential; it is derived "
+                           "for the key /etc/atlas/gateway.conf names, and only for one that "
+                           "holds no stored scope") != NULL,
+                    "the refusal did not carry the frozen sentence: %s", atlas_buf_cstr(&derr));
+    }
+    atlas_buf_free(&dout);
+    atlas_buf_free(&derr);
+
+    /* Neither `--scope` nor `--no-scopes`: the amended sentence, which says
+     * `--no-scopes` exists rather than only that a scope is missing. */
+    {
+        atlas_buf nout = ATLAS_BUF_INIT, nerr = ATLAS_BUF_INIT;
+        const char *argv[8];
+        size_t k = 0;
+        argv[k++] = "--data-dir";
+        argv[k++] = fx_data_dir(&fx);
+        argv[k++] = "api-key";
+        argv[k++] = "create";
+        argv[k++] = "--label";
+        argv[k++] = "x";
+        int code = -1;
+        T_OK(fx_atlas(argv, k, &nout, &nerr, &code, &err), &err);
+        T_CHECK_MSG(code == 2, "neither --scope nor --no-scopes produced exit %d", code);
+        T_CHECK_MSG(strstr(atlas_buf_cstr(&nerr),
+                           "at least one --scope is required, or --no-scopes for a "
+                           "remote-disposal credential; a credential with no scopes could "
+                           "not read anything") != NULL,
+                    "the refusal did not carry the amended sentence: %s", atlas_buf_cstr(&nerr));
+        atlas_buf_free(&nout);
+        atlas_buf_free(&nerr);
+    }
+
+    /* `--scope repo:read --no-scopes` together: the frozen sentence, checked
+     * by content rather than only by exit code (the `cases[]` loop above only
+     * checked the exit code and that nothing was created). */
+    {
+        atlas_buf bout = ATLAS_BUF_INIT, berr = ATLAS_BUF_INIT;
+        const char *argv[10];
+        size_t k = 0;
+        argv[k++] = "--data-dir";
+        argv[k++] = fx_data_dir(&fx);
+        argv[k++] = "api-key";
+        argv[k++] = "create";
+        argv[k++] = "--label";
+        argv[k++] = "x";
+        argv[k++] = "--scope";
+        argv[k++] = "repo:read";
+        argv[k++] = "--no-scopes";
+        int code = -1;
+        T_OK(fx_atlas(argv, k, &bout, &berr, &code, &err), &err);
+        T_CHECK_MSG(code == 2, "--scope with --no-scopes produced exit %d", code);
+        T_CHECK_MSG(strstr(atlas_buf_cstr(&berr), "--scope and --no-scopes cannot both be given") !=
+                        NULL,
+                    "the refusal did not carry the frozen sentence: %s", atlas_buf_cstr(&berr));
+        atlas_buf_free(&bout);
+        atlas_buf_free(&berr);
+    }
 
     atlas_buf_free(&out);
     fx_close(&fx);
@@ -407,9 +530,103 @@ static void test_the_two_renderers_agree(void) {
     T_CHECK(strstr(atlas_buf_cstr(&jout), "\"label\":\"both\"") != NULL);
     T_CHECK(strstr(atlas_buf_cstr(&jout), "repo:read audit:read") != NULL);
 
+    /* Extended for A16: a `--no-scopes` credential agrees between renderers
+     * too. Human prints the frozen "(none)" block; JSON's `scopes` array is
+     * empty and its `no_scopes` field says why, rather than a reader having to
+     * infer the reason from an absence. */
+    const char *nocreate[] = {"api-key", "create", "--label", "disposal", "--no-scopes"};
+    T_EQ_INT(run_key(&fx, nocreate, 5, &out, &err), 0);
+    char nid[ATLAS_APIKEY_SELECTOR_HEX + 1];
+    id_of(&out, nid, sizeof nid);
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&out), "scopes: (none)") != NULL,
+                "the --no-scopes create output is missing the frozen block: %s",
+                atlas_buf_cstr(&out));
+
+    /* The JSON renderer's own creation output carries the same fact as a
+     * field rather than only an empty array, so a caller parsing JSON is not
+     * forced to fall back to the human prose to learn why. */
+    atlas_buf jcreate = ATLAS_BUF_INIT;
+    {
+        const char *argv3[10];
+        size_t k3 = 0;
+        argv3[k3++] = "--data-dir";
+        argv3[k3++] = fx_data_dir(&fx);
+        argv3[k3++] = "--json";
+        argv3[k3++] = "api-key";
+        argv3[k3++] = "create";
+        argv3[k3++] = "--label";
+        argv3[k3++] = "disposal2";
+        argv3[k3++] = "--no-scopes";
+        int code3 = -1;
+        T_OK(fx_atlas(argv3, k3, &jcreate, NULL, &code3, &err), &err);
+        T_EQ_INT(code3, 0);
+    }
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&jcreate), "\"no_scopes\":true") != NULL,
+                "the JSON create output does not agree that the credential holds no scopes: %s",
+                atlas_buf_cstr(&jcreate));
+    atlas_buf_free(&jcreate);
+
+    const char *nohuman[] = {"api-key", "list"};
+    T_EQ_INT(run_key(&fx, nohuman, 2, &out, &err), 0);
+    T_CHECK(strstr(atlas_buf_cstr(&out), nid) != NULL);
+    /* `api-key list` shows the key with no scopes: the existing "(none)"
+     * fallback for an empty scope string, exercised for the first time by a
+     * key that can actually have one. */
+    {
+        const char *row = strstr(atlas_buf_cstr(&out), nid);
+        T_REQUIRE(row != NULL);
+        T_CHECK_MSG(strstr(row, "(none)") != NULL,
+                    "the listing does not show the disposal credential as scopeless: %s", row);
+    }
+
+    atlas_buf njout = ATLAS_BUF_INIT;
+    const char *nojson[] = {"--json", "api-key", "list"};
+    {
+        const char *argv2[8];
+        size_t k2 = 0;
+        argv2[k2++] = "--data-dir";
+        argv2[k2++] = fx_data_dir(&fx);
+        for (size_t i = 0; i < 3; i++) {
+            argv2[k2++] = nojson[i];
+        }
+        int code2 = -1;
+        T_OK(fx_atlas(argv2, k2, &njout, NULL, &code2, &err), &err);
+        T_EQ_INT(code2, 0);
+    }
+    T_CHECK(strstr(atlas_buf_cstr(&njout), nid) != NULL);
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&njout), "\"scopes\":\"\"") != NULL,
+                "the JSON listing did not render an empty scope string: %s",
+                atlas_buf_cstr(&njout));
+    atlas_buf_free(&njout);
+
     atlas_buf_free(&jout);
     atlas_buf_free(&out);
     fx_close(&fx);
+}
+
+/* No fixture: these are pure functions over the closed vocabulary, so a
+ * failure here means the table itself is wrong rather than anything about a
+ * running command. */
+static void test_the_disposal_scope_is_in_the_vocabulary_and_ungrantable(void) {
+    T_CHECK(atlas_apikey_scope_parse("decisions:dispose") == ATLAS_SCOPE_DECISIONS_DISPOSE);
+    T_CHECK_MSG(strcmp(atlas_apikey_scope_name(ATLAS_SCOPE_DECISIONS_DISPOSE),
+                       "decisions:dispose") == 0,
+                "the canonical name does not round-trip");
+    T_CHECK_MSG(!atlas_apikey_scope_grantable(ATLAS_SCOPE_DECISIONS_DISPOSE),
+                "decisions:dispose must never be grantable");
+
+    /* Renders after memory:write, in enum/table order: a mask holding both
+     * bits stores as one canonical byte string, "memory:write
+     * decisions:dispose", never the reverse. */
+    atlas_scope_mask both =
+        ATLAS_SCOPE_BIT(ATLAS_SCOPE_MEMORY_WRITE) | ATLAS_SCOPE_BIT(ATLAS_SCOPE_DECISIONS_DISPOSE);
+    atlas_buf rendered = ATLAS_BUF_INIT;
+    atlas_err err;
+    atlas_err_init(&err);
+    T_OK(atlas_apikey_scopes_render(both, &rendered, &err), &err);
+    T_CHECK_MSG(strcmp(atlas_buf_cstr(&rendered), "memory:write decisions:dispose") == 0,
+                "unexpected render order: %s", atlas_buf_cstr(&rendered));
+    atlas_buf_free(&rendered);
 }
 
 static const atlas_test TESTS[] = {
@@ -421,6 +638,8 @@ static const atlas_test TESTS[] = {
     {"creation refuses what it cannot grant", test_creation_refuses_what_it_cannot_grant},
     {"a refusal never quotes the credential", test_a_refusal_never_quotes_the_credential},
     {"the two renderers agree", test_the_two_renderers_agree},
+    {"the disposal scope is in the vocabulary and ungrantable",
+     test_the_disposal_scope_is_in_the_vocabulary_and_ungrantable},
 };
 
 ATLAS_TEST_MAIN("apikey", TESTS)

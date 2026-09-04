@@ -102,6 +102,17 @@ typedef enum atlas_apikey_scope {
      * A future phase that wants remote writes enables it here, having argued
      * for it. Until then this is the bit that is never set. */
     ATLAS_SCOPE_MEMORY_WRITE,
+    /* A16. Not grantable, for the same reason `MEMORY_WRITE` is not: never
+     * stored on an `api_keys` row, and `atlas api-key create` refuses it by
+     * name. Unlike `MEMORY_WRITE` it is not simply absent from every mask
+     * forever — the daemon *derives* it, in `gateway.auth` and again at the
+     * write point, for exactly the credential a root-owned
+     * `remote_dispose_key` policy line names, and only when that credential's
+     * own stored scope list is empty. A key that can read anything is a key
+     * that could have been handed to a model over `/mcp`; deriving this scope
+     * only for a key holding none is what keeps the disposal credential
+     * structurally incapable of being that key. */
+    ATLAS_SCOPE_DECISIONS_DISPOSE,
     ATLAS_SCOPE__COUNT
 } atlas_apikey_scope;
 

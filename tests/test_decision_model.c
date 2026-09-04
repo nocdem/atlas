@@ -188,12 +188,42 @@ static void test_vocabularies_are_closed(void) {
     T_CHECK(atlas_decision_actor_parse("LOCAL_OPERATOR_CONFIRMED", &a) &&
             a == ATLAS_DECISION_ACTOR_LOCAL_OPERATOR_CONFIRMED);
 
-    /* The restriction, mirroring atlas_provenance_writable_in_a2. */
+    /* A16: its own actor, never a reuse of LOCAL_OPERATOR_CONFIRMED. The name
+     * must round-trip exactly, the way every other actor does. */
+    a = ATLAS_DECISION_ACTOR_MODEL_PROPOSAL;
+    T_CHECK(strcmp(atlas_decision_actor_name(ATLAS_DECISION_ACTOR_REMOTE_OPERATOR_CONFIRMED),
+                   "REMOTE_OPERATOR_CONFIRMED") == 0);
+    T_CHECK(atlas_decision_actor_parse("REMOTE_OPERATOR_CONFIRMED", &a) &&
+            a == ATLAS_DECISION_ACTOR_REMOTE_OPERATOR_CONFIRMED);
+
+    /* The restriction, mirroring atlas_provenance_writable_in_a2. Every actor
+     * that names a channel or a policy an adapter must not be able to forge
+     * stays unwritable by one — the new member included, and the three
+     * existing ones re-checked here so a future change to any of them fails
+     * this test rather than only the one it happens to touch. */
     T_CHECK(atlas_decision_actor_writable_by_adapter(ATLAS_DECISION_ACTOR_MODEL_PROPOSAL));
     T_CHECK(atlas_decision_actor_writable_by_adapter(ATLAS_DECISION_ACTOR_MODEL_INFERENCE));
     T_CHECK(
         !atlas_decision_actor_writable_by_adapter(ATLAS_DECISION_ACTOR_LOCAL_OPERATOR_CONFIRMED));
     T_CHECK(!atlas_decision_actor_writable_by_adapter(ATLAS_DECISION_ACTOR_ATLAS_AUTOMATIC));
+    T_CHECK(!atlas_decision_actor_writable_by_adapter(ATLAS_DECISION_ACTOR_VERIFICATION_POLICY));
+    T_CHECK(!atlas_decision_actor_writable_by_adapter(
+        ATLAS_DECISION_ACTOR_REMOTE_OPERATOR_CONFIRMED));
+
+    /* A16: the channel vocabulary. Its zero names "UNKNOWN" (every closed
+     * vocabulary's zero renders its own name) but refuses to parse it, on
+     * atlas_review_verdict_parse's precedent — a caller that types the name
+     * of "not known" has not asserted a channel. LOCAL and REMOTE round-trip
+     * like any ordinary member. */
+    T_CHECK(strcmp(atlas_decision_channel_name(ATLAS_DECISION_CHANNEL_UNKNOWN), "UNKNOWN") == 0);
+    atlas_decision_channel ch = ATLAS_DECISION_CHANNEL_LOCAL;
+    T_CHECK(!atlas_decision_channel_parse("UNKNOWN", &ch));
+    T_CHECK(!atlas_decision_channel_parse("", &ch));
+    T_CHECK(!atlas_decision_channel_parse("local", &ch)); /* case matters */
+    T_CHECK(atlas_decision_channel_parse("LOCAL", &ch) && ch == ATLAS_DECISION_CHANNEL_LOCAL);
+    T_CHECK(strcmp(atlas_decision_channel_name(ATLAS_DECISION_CHANNEL_LOCAL), "LOCAL") == 0);
+    T_CHECK(atlas_decision_channel_parse("REMOTE", &ch) && ch == ATLAS_DECISION_CHANNEL_REMOTE);
+    T_CHECK(strcmp(atlas_decision_channel_name(ATLAS_DECISION_CHANNEL_REMOTE), "REMOTE") == 0);
 }
 
 /* --- the canonical content hash ---------------------------------------------- */

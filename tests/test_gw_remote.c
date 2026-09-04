@@ -397,6 +397,66 @@ static void test_a_revoked_credential_stops_working_immediately(void) {
     env_close(&e);
 }
 
+/* A16, T1: `atlas api-key create --label L --no-scopes` is the frozen minting
+ * command for a remote-disposal credential, and it must work wherever a
+ * daemon owns the index — not only offline. `atlas_apikey_create_opts`
+ * gained a `no_scopes` field with no wire carrier at first: the CLI's local
+ * path set it, but the RPC path
+ * (`atlas_service_apikey_create_remote` -> `apikey.create` ->
+ * `atlas_writer_apikey`) built its `atlas_apikey_job` and its
+ * `atlas_apikey_create_opts` with no memory of the flag, so the same command
+ * against a running daemon fell straight into "at least one --scope is
+ * required" — the exact refusal `--no-scopes` exists to bypass. This drives
+ * that path for real, through the running fixture daemon, with `--data-dir`
+ * pointed at an index the daemon already owns. */
+static void test_no_scopes_mints_a_disposal_credential_through_the_daemon(void) {
+    env e;
+    const char *scopes[] = {"repo:read"};
+    env_open(&e, scopes, 1);
+    atlas_err err;
+    atlas_err_init(&err);
+    atlas_buf out = ATLAS_BUF_INIT;
+
+    const char *create[] = {"api-key", "create", "--label", "disposal", "--no-scopes"};
+    T_EQ_INT(run_cli_ex(&e, create, 5, true, &out, &err), 0);
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&out), "scopes: (none)") != NULL,
+                "the daemon-routed --no-scopes create did not print the frozen block: %s",
+                atlas_buf_cstr(&out));
+    char disposal_id[ATLAS_APIKEY_SELECTOR_HEX + 1];
+    {
+        const char *s = strstr(atlas_buf_cstr(&out), "id:     " ATLAS_APIKEY_ID_PREFIX);
+        T_REQUIRE(s != NULL);
+        s += strlen("id:     " ATLAS_APIKEY_ID_PREFIX);
+        size_t n = 0;
+        while (s[n] != '\0' && s[n] != '\n' && n + 1 < sizeof disposal_id) {
+            n++;
+        }
+        memcpy(disposal_id, s, n);
+        disposal_id[n] = '\0';
+    }
+
+    /* Rotation through the daemon too, with the policy-line reminder. */
+    const char *rotate[] = {"api-key", "rotate", disposal_id, "--label", "disposal",
+                            "--no-scopes"};
+    T_EQ_INT(run_cli_ex(&e, rotate, 6, true, &out, &err), 0);
+    T_CHECK_MSG(
+        strstr(atlas_buf_cstr(&out), "the policy line remote_dispose_key must now name") != NULL,
+        "the daemon-routed --no-scopes rotation did not print the reminder: %s",
+        atlas_buf_cstr(&out));
+
+    /* And the refusals still travel correctly against the daemon: an ordinary
+     * caller cannot bypass "at least one --scope" by omission. */
+    const char *bare[] = {"api-key", "create", "--label", "x"};
+    int code = run_cli_ex(&e, bare, 4, true, &out, &err);
+    T_CHECK_MSG(code != 0, "a scopeless create with no --no-scopes succeeded against the daemon");
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&out), "--no-scopes") != NULL,
+                "the daemon-routed refusal did not mention --no-scopes: %s",
+                atlas_buf_cstr(&out));
+
+    atlas_buf_free(&out);
+    env_close(&e);
+}
+
 static void test_the_gateway_holds_no_credential_administration_verb(void) {
     env e;
     const char *scopes[] = {"context:read", "repo:read",   "decisions:read",
@@ -2376,6 +2436,8 @@ static const atlas_test TESTS[] = {
      test_every_authentication_failure_looks_the_same},
     {"a revoked credential stops working immediately",
      test_a_revoked_credential_stops_working_immediately},
+    {"--no-scopes mints a disposal credential through the daemon",
+     test_no_scopes_mints_a_disposal_credential_through_the_daemon},
     {"the gateway holds no credential-administration verb",
      test_the_gateway_holds_no_credential_administration_verb},
     {"the transport refuses what it should", test_the_transport_refuses_what_it_should},

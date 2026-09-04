@@ -220,6 +220,7 @@ const char *atlas_decision_actor_name(atlas_decision_actor a) {
     case ATLAS_DECISION_ACTOR_LOCAL_OPERATOR_CONFIRMED: return "LOCAL_OPERATOR_CONFIRMED";
     case ATLAS_DECISION_ACTOR_ATLAS_AUTOMATIC: return "ATLAS_AUTOMATIC";
     case ATLAS_DECISION_ACTOR_VERIFICATION_POLICY: return "VERIFICATION_POLICY";
+    case ATLAS_DECISION_ACTOR_REMOTE_OPERATOR_CONFIRMED: return "REMOTE_OPERATOR_CONFIRMED";
     }
     return "MODEL_PROPOSAL";
 }
@@ -237,6 +238,7 @@ bool atlas_decision_actor_parse(const char *name, atlas_decision_actor *out) {
         {"LOCAL_OPERATOR_CONFIRMED", ATLAS_DECISION_ACTOR_LOCAL_OPERATOR_CONFIRMED},
         {"ATLAS_AUTOMATIC", ATLAS_DECISION_ACTOR_ATLAS_AUTOMATIC},
         {"VERIFICATION_POLICY", ATLAS_DECISION_ACTOR_VERIFICATION_POLICY},
+        {"REMOTE_OPERATOR_CONFIRMED", ATLAS_DECISION_ACTOR_REMOTE_OPERATOR_CONFIRMED},
     };
     for (size_t i = 0; i < sizeof(TABLE) / sizeof(TABLE[0]); i++) {
         if (strcmp(name, TABLE[i].name) == 0) {
@@ -259,6 +261,41 @@ bool atlas_decision_actor_parse(const char *name, atlas_decision_actor *out) {
  * fabricate that implication. */
 bool atlas_decision_actor_writable_by_adapter(atlas_decision_actor a) {
     return a == ATLAS_DECISION_ACTOR_MODEL_PROPOSAL || a == ATLAS_DECISION_ACTOR_MODEL_INFERENCE;
+}
+
+/* --- channel ---------------------------------------------------------------
+ *
+ * See the header: UNKNOWN is the zero and `atlas_decision_channel_parse`
+ * deliberately refuses to parse its own name, on `atlas_review_verdict_parse`'s
+ * precedent, so a caller cannot round-trip "not known" into a stored value. */
+
+const char *atlas_decision_channel_name(atlas_decision_channel c) {
+    switch (c) {
+    case ATLAS_DECISION_CHANNEL_UNKNOWN: return "UNKNOWN";
+    case ATLAS_DECISION_CHANNEL_LOCAL: return "LOCAL";
+    case ATLAS_DECISION_CHANNEL_REMOTE: return "REMOTE";
+    }
+    return "UNKNOWN";
+}
+
+bool atlas_decision_channel_parse(const char *name, atlas_decision_channel *out) {
+    if (name == NULL || out == NULL) {
+        return false;
+    }
+    static const struct {
+        const char *name;
+        atlas_decision_channel value;
+    } TABLE[] = {
+        {"LOCAL", ATLAS_DECISION_CHANNEL_LOCAL},
+        {"REMOTE", ATLAS_DECISION_CHANNEL_REMOTE},
+    };
+    for (size_t i = 0; i < sizeof(TABLE) / sizeof(TABLE[0]); i++) {
+        if (strcmp(name, TABLE[i].name) == 0) {
+            *out = TABLE[i].value;
+            return true;
+        }
+    }
+    return false;
 }
 
 /* --- scope ---------------------------------------------------------------- */

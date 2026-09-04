@@ -1595,6 +1595,27 @@ static atlas_status j_apikey_created(atlas_renderer *r, const atlas_apikey_creat
     TRY(atlas_json_key_str(j, "secret", c->token, err));
     TRY(atlas_json_key_bool(j, "shown_once", true, err));
     TRY(atlas_json_key_bool(j, "recoverable", false, err));
+    /* A16, Decision 2: the same fact the human renderer states in prose,
+     * always emitted rather than only on the `--no-scopes` path, so a reader
+     * of the JSON form never has to infer it from an empty array. An empty
+     * scope list is reachable only through `--no-scopes`. */
+    const bool no_scopes = c->scopes[0] == '\0';
+    TRY(atlas_json_key_bool(j, "no_scopes", no_scopes, err));
+    if (no_scopes) {
+        TRY(atlas_json_key_str(j, "no_scopes_note",
+                               "this credential authorises nothing on its own; only a "
+                               "root-owned remote_dispose_key line in /etc/atlas/gateway.conf "
+                               "can give it one scope, decisions:dispose, and nothing else",
+                               err));
+        if (c->rotated_from[0] != '\0') {
+            char reminder[192];
+            (void)snprintf(reminder, sizeof reminder,
+                          "the policy line remote_dispose_key must now name %s%s; until it "
+                          "does, neither key can dispose",
+                          ATLAS_APIKEY_ID_PREFIX, c->key_id);
+            TRY(atlas_json_key_str(j, "rotate_dispose_reminder", reminder, err));
+        }
+    }
     return atlas_json_obj_end(j, err);
 }
 

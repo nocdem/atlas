@@ -92,22 +92,35 @@ atlas_status atlas_apikey_create_on(atlas_db *db, const atlas_apikey_create_opts
                              "backslash or percent",
                              (unsigned)ATLAS_APIKEY_LABEL_MAX);
     }
-    if (opts->scopes == 0u) {
+    if (opts->scopes == 0u && !opts->no_scopes) {
         /* A credential with no scopes authorises nothing. Storing one is
          * coherent; creating one by accident is not, so it takes an explicit
-         * scope to make a key at all. */
+         * scope to make a key at all — or the deliberate `--no-scopes` form,
+         * A16's remote-disposal credential (Decision 2), which is the one
+         * place this rule is relaxed and only by a flag whose name says so. */
         return atlas_err_set(err, ATLAS_ERR_USAGE,
-                             "at least one --scope is required; a credential with no scopes could "
+                             "at least one --scope is required, or --no-scopes for a "
+                             "remote-disposal credential; a credential with no scopes could "
                              "not read anything");
     }
     /* Every requested scope must be one an operator may grant. `memory:write`
      * is in the vocabulary and is not grantable, which is what makes "no A9
      * credential can write" one refusal rather than a rule every tool has to
-     * remember. */
+     * remember. `decisions:dispose` is refused by its own name: it is never
+     * stored on a key an operator creates, only derived by the daemon for the
+     * one credential a root-owned policy line names (Decision 2), so the
+     * refusal says how such a credential is actually made rather than only
+     * that this attempt failed. */
     for (int s = 1; s < (int)ATLAS_SCOPE__COUNT; s++) {
         atlas_apikey_scope sc = (atlas_apikey_scope)s;
         if (!atlas_scope_has(opts->scopes, sc)) {
             continue;
+        }
+        if (sc == ATLAS_SCOPE_DECISIONS_DISPOSE) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "decisions:dispose cannot be granted to a credential; it is "
+                                 "derived for the key /etc/atlas/gateway.conf names, and only "
+                                 "for one that holds no stored scope");
         }
         if (!atlas_apikey_scope_grantable(sc)) {
             return atlas_err_set(err, ATLAS_ERR_USAGE,
@@ -420,6 +433,15 @@ atlas_status atlas_service_apikey_create_remote(const atlas_apikey_create_opts *
         }
         if (st == ATLAS_OK) {
             st = atlas_json_key_str(j, "scopes", atlas_buf_cstr(&scopes), err);
+        }
+        if (st == ATLAS_OK && opts->no_scopes) {
+            /* Forwarded explicitly: the daemon must see the same deliberate
+             * flag the local write point does, never infer it from
+             * `scopes` being empty (Decision 2's "never a silent
+             * relaxation"). Omitted rather than sent `false` when unset, so
+             * an older daemon that does not know this key still sees exactly
+             * what it always saw. */
+            st = atlas_json_key_bool(j, "no_scopes", true, err);
         }
         if (st == ATLAS_OK && opts->rotate_from != NULL && opts->rotate_from[0] != '\0') {
             st = atlas_json_key_str(j, "rotate_from", opts->rotate_from, err);

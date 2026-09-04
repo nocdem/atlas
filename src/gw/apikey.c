@@ -30,6 +30,10 @@ static const scope_row SCOPES[] = {
      * and it exists so that denying a write is the ordinary check finding a
      * clear bit rather than a special case in every tool. */
     {ATLAS_SCOPE_MEMORY_WRITE, "memory:write", false},
+    /* Not grantable. A16, Decision 2: derived by the daemon for exactly the
+     * credential a root-owned `remote_dispose_key` policy line names, and
+     * only for one holding no stored scope of its own. */
+    {ATLAS_SCOPE_DECISIONS_DISPOSE, "decisions:dispose", false},
 };
 
 #define SCOPE_COUNT (sizeof(SCOPES) / sizeof(SCOPES[0]))

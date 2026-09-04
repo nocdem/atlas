@@ -812,6 +812,40 @@ static void test_g_supersede_and_revalidate_refused_remotely(void) {
         atlas_decision_op_free(&ch);
     }
 
+    /* Review round 1, second pass: `intent = APPROVE` with a `replacement_uid`
+     * set. `decision.remote_challenge` never sends a `replacement` parameter,
+     * so this specific op shape is unreachable through that endpoint -- but
+     * this function is the write point's own belt-and-braces guarantee for a
+     * caller that constructs an `atlas_decision_op` directly, exactly what
+     * this file does, and `op_challenge` turns any named replacement into a
+     * SUPERSEDE a few lines below regardless of what intent was asked for.
+     * A first version of the I4 fix checked only `c.intent` here and missed
+     * this: `c.intent` is still APPROVE at the point the REMOTE check runs,
+     * so it fell through, got relabelled SUPERSEDE by the replacement
+     * handling, and minted a REMOTE supersede challenge. */
+    {
+        atlas_decision_op ch;
+        T_OK(build_op(ATLAS_DECISION_OP_CHALLENGE, ATLAS_DECISION_CHANNEL_REMOTE,
+                      atlas_buf_cstr(&e.fact_uid), atlas_buf_cstr(&e.policy_uid),
+                      ATLAS_DECISION_INTENT_APPROVE, 1, NULL, NULL, e.dispose_token, e.dispose_id,
+                      ATLAS_DECISION_KIND_BIT(ATLAS_DECISION_KIND_OPERATIONAL_FACT) |
+                          ATLAS_DECISION_KIND_BIT(ATLAS_DECISION_KIND_POLICY),
+                      &ch, &err),
+            &err);
+        atlas_decision_result cr;
+        atlas_decision_result_init(&cr);
+        atlas_status st = atlas_decision_apply(db, &ch, &cr, &err);
+        T_CHECK_MSG(st != ATLAS_OK,
+                    "a REMOTE approve-with-replacement challenge was minted (I4 regression)");
+        T_CHECK_MSG(
+            strstr(atlas_err_msg(&err),
+                  "supersede and revalidate are not offered from the browser; use a terminal on "
+                  "the Atlas machine") != NULL,
+            "wrong refusal: %s", atlas_err_msg(&err));
+        atlas_decision_result_free(&cr);
+        atlas_decision_op_free(&ch);
+    }
+
     atlas_db_close(db);
     env_close(&e);
 }

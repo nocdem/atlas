@@ -764,11 +764,20 @@ static void test_b_remote_dispose_happy_path(void) {
         const char *hist_human[] = {"decision", "history", "proj", atlas_buf_cstr(&fact_uid)};
         run_atlas(&e, hist_human, 4u, &hout, &hcode);
         T_EQ_INT(hcode, 0);
-        char credential_needle[80];
-        (void)snprintf(credential_needle, sizeof(credential_needle), "credential: %s",
+        /* Review round 1 (advisor pass): the stored `key_id` is the bare
+         * selector hex, but "the display form `atlas api-key list` prints"
+         * (`gwpolicy.c`'s own words for the same id) is `key_<hex>` --
+         * `ATLAS_APIKEY_ID_PREFIX` added at render time, never stored. A
+         * needle built from the bare id alone would have passed against a
+         * rendering bug that dropped the prefix, since it is also a
+         * substring of the correct output; spelling out `key_` here is what
+         * makes this a check on the *display form*, matching the Frozen
+         * formats' own literal example. */
+        char credential_needle[96];
+        (void)snprintf(credential_needle, sizeof(credential_needle), "credential: key_%s",
                        e.dispose_id);
         T_CHECK_MSG(strstr(atlas_buf_cstr(&hout), credential_needle) != NULL,
-                    "the human rendering does not carry \"credential: %s\": %s", e.dispose_id,
+                    "the human rendering does not carry \"credential: key_%s\": %s", e.dispose_id,
                     atlas_buf_cstr(&hout));
         atlas_buf_free(&hout);
     }

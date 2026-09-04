@@ -1078,10 +1078,28 @@ static atlas_status op_challenge(apply_ctx *ac, const atlas_decision_op *op,
      * replacement lookup nor the intent-specific work beyond this function
      * ever runs on its way to being refused anyway; conditioned on
      * `c.channel == ATLAS_DECISION_CHANNEL_REMOTE`, so the LOCAL path -- and
-     * its own "no replacement named" refusal -- is unchanged. */
+     * its own "no replacement named" refusal -- is unchanged.
+     *
+     * `op->replacement_uid.len > 0` is a third disjunct here, not only
+     * `c.intent`, and it has to be: at this point `c.intent` is still
+     * whatever `op->intent` said, and the block three lines below turns
+     * *any* named replacement into a supersede regardless of what intent was
+     * asked for -- "naming a replacement implies supersession", this
+     * function's own rule, stated in the comment above `c.intent =
+     * op->intent;`. Checking only `c.intent` here left a REMOTE op with
+     * `intent = APPROVE` and a `replacement_uid` set free to fall through
+     * this check (APPROVE is neither SUPERSEDE nor REVALIDATE), reach the
+     * block below, get promoted to SUPERSEDE there, and mint a REMOTE
+     * supersede challenge -- reachable at the write point directly (not
+     * through `decision.remote_challenge`, which never sends a
+     * `replacement` parameter, but this function is also this season's own
+     * belt-and-braces guarantee for exactly the caller that constructs an
+     * `atlas_decision_op` itself, which `test_decision_remote.c` does on
+     * purpose). A named replacement is caught here on its own, before it has
+     * had the chance to relabel `c.intent`. */
     if (c.channel == ATLAS_DECISION_CHANNEL_REMOTE &&
         (c.intent == ATLAS_DECISION_INTENT_SUPERSEDE ||
-         c.intent == ATLAS_DECISION_INTENT_REVALIDATE)) {
+         c.intent == ATLAS_DECISION_INTENT_REVALIDATE || op->replacement_uid.len > 0)) {
         return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
                              "supersede and revalidate are not offered from the browser; use a "
                              "terminal on the Atlas machine");

@@ -1368,12 +1368,23 @@ static atlas_status h_decision_event(atlas_renderer *r, const atlas_decision_tim
     r->items++;
     /* `credential: key_<hex>` is appended on this same line, per the Frozen
      * formats section -- present only for a REMOTE_OPERATOR_CONFIRMED event.
-     * `e->key_id` is Atlas-verified hex, not untrusted text, so it is printed
-     * as-is, like `principal.key_id` elsewhere. */
-    (void)fprintf(r->out, "  %s  %-10s rev %" PRId64 "  %s%s%s%s\n", e->at != NULL ? e->at : "",
+     * `e->key_id` is the *bare* selector hex, exactly as stored and as every
+     * other `key_id` travels on the wire; `ATLAS_APIKEY_ID_PREFIX` is what
+     * `atlas api-key list` and every other id-printing site add at display
+     * time (`h_apikey_*` above), and this line follows the same rule rather
+     * than printing the bare id, which would not be "the display form" the
+     * Frozen formats name. `e->key_id` is Atlas-verified hex, not untrusted
+     * text, so no `atlas_safe()` pass is needed, like `principal.key_id`
+     * elsewhere. */
+    char credential[32 + ATLAS_APIKEY_SELECTOR_HEX];
+    credential[0] = '\0';
+    if (e->key_id != NULL) {
+        (void)snprintf(credential, sizeof(credential), "  credential: %s%s",
+                       ATLAS_APIKEY_ID_PREFIX, e->key_id);
+    }
+    (void)fprintf(r->out, "  %s  %-10s rev %" PRId64 "  %s%s%s\n", e->at != NULL ? e->at : "",
                   e->event, e->revision_no, e->actor != NULL ? e->actor : "",
-                  e->operator_channel ? "  [operator channel]" : "",
-                  e->key_id != NULL ? "  credential: " : "", e->key_id != NULL ? e->key_id : "");
+                  e->operator_channel ? "  [operator channel]" : "", credential);
     if (e->superseded_by != NULL) {
         (void)fprintf(r->out, "      replaced by %s\n", e->superseded_by);
     }

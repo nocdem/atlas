@@ -976,7 +976,13 @@ static const atlas_method_entry REMOTE_DISPOSAL_METHODS[] = {
     {"decision.remote_dispose", method_remote_dispose},
 };
 const atlas_method_entry *atlas_server_remote_disposal_methods(size_t *count_out);
-/* Offered iff all three: atlas_server_peer_is_gateway(ctx, peer_uid);
+/* Offered iff all four (amended 2026-09-04 -- the fourth is the state check, and
+ * the amendment that added it is beside the frozen predicate above; this
+ * declaration still said "three" after the code said four, which is exactly the
+ * drift a frozen block exists to prevent):
+ * ctx->gwpolicy.state == ATLAS_GWPOLICY_ENABLED, because a refused policy still
+ * carries every field the parser wrote before it refused;
+ * atlas_server_peer_is_gateway(ctx, peer_uid);
  * ctx->gwpolicy.tls_mode == ATLAS_GWPOLICY_TLS_REVERSE_PROXY **or**
  * ctx->gwpolicy.cleartext_disposal_accepted (amended 2026-09-04 — TLS in front is
  * the intended shape, and the acceptance is the operator's written departure from

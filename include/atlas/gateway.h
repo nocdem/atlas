@@ -110,6 +110,15 @@ atlas_status atlas_gateway_serve(atlas_gateway *g, atomic_bool *stop, atlas_err 
 atlas_status atlas_service_gateway_run(atlas_err *err);
 /* `atlas gateway status`: what the policy says, without binding anything. */
 atlas_status atlas_service_gateway_status(FILE *out, bool json, atlas_err *err);
+/* The same rendering, over a policy the caller already has rather than the
+ * compiled-in path. Split out for `tests/test_gateway.c`: the loader's
+ * root-ownership walk can only succeed against a genuinely root-owned file,
+ * so a test driven through `atlas_service_gateway_status` could only ever
+ * render this machine's own policy, whatever it happens to be today. This is
+ * the same reasoning `atlas_gwpolicy_parse_buffer` exists for, one layer up —
+ * production reaches it only through `atlas_service_gateway_status`. */
+atlas_status atlas_service_gateway_status_for(FILE *out, bool json, const atlas_gwpolicy *p,
+                                              atlas_err *err);
 
 typedef struct atlas_gateway_route_view {
     const char *path;      /* the exact literal matched at gateway.c:1007 */

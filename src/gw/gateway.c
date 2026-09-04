@@ -22,6 +22,7 @@
 #include <pthread.h>
 
 #include "atlas/atlas.h"
+#include "atlas/decision.h"
 #include "atlas/hmac.h"
 #include "atlas/ipc.h"
 #include "atlas/json.h"
@@ -1955,10 +1956,37 @@ atlas_status atlas_service_gateway_run(atlas_err *err) {
     return st;
 }
 
-atlas_status atlas_service_gateway_status(FILE *out, bool json, atlas_err *err) {
-    atlas_gwpolicy p;
-    atlas_gwpolicy_load(&p);
+/* A16. Renders `remote_dispose_kinds` as a space-separated list of
+ * `atlas_decision_kind_name`, always in the kind table's own order rather
+ * than the order an operator happened to write them in the policy -- the
+ * same "one canonical rendering for one set" discipline
+ * `atlas_apikey_scopes_render` already follows for a scope mask, so the
+ * same grant always prints as the same bytes. An empty mask renders as an
+ * empty string, matched by the caller against the "(none ...)" wording
+ * rather than printed as such itself, so this function has exactly one
+ * job. */
+static atlas_status render_dispose_kinds(uint32_t mask, atlas_buf *out, atlas_err *err) {
+    for (size_t i = 0; i < atlas_decision_kind_count(); i++) {
+        atlas_decision_kind k = atlas_decision_kind_at(i);
+        if ((mask & ATLAS_DECISION_KIND_BIT(k)) == 0u) {
+            continue;
+        }
+        if (out->len > 0) {
+            atlas_status st = atlas_buf_append(out, " ", 1, err);
+            if (st != ATLAS_OK) {
+                return st;
+            }
+        }
+        atlas_status st = atlas_buf_appendf(out, err, "%s", atlas_decision_kind_name(k));
+        if (st != ATLAS_OK) {
+            return st;
+        }
+    }
+    return ATLAS_OK;
+}
 
+atlas_status atlas_service_gateway_status_for(FILE *out, bool json, const atlas_gwpolicy *p,
+                                              atlas_err *err) {
     if (json) {
         atlas_json *j = atlas_json_new(out, err);
         if (j == NULL) {
@@ -1966,38 +1994,38 @@ atlas_status atlas_service_gateway_status(FILE *out, bool json, atlas_err *err) 
         }
         atlas_status st = atlas_json_obj_begin(j, err);
         if (st == ATLAS_OK) {
-            st = atlas_json_key_str(j, "state", atlas_gwpolicy_state_name(p.state), err);
+            st = atlas_json_key_str(j, "state", atlas_gwpolicy_state_name(p->state), err);
         }
         if (st == ATLAS_OK) {
-            st = atlas_json_key_str(j, "reason", atlas_gwpolicy_reason_name(p.reason), err);
+            st = atlas_json_key_str(j, "reason", atlas_gwpolicy_reason_name(p->reason), err);
         }
         if (st == ATLAS_OK) {
-            st = atlas_json_key_str(j, "detail", atlas_gwpolicy_reason_detail(p.reason), err);
+            st = atlas_json_key_str(j, "detail", atlas_gwpolicy_reason_detail(p->reason), err);
         }
         if (st == ATLAS_OK) {
             st = atlas_json_key_str(j, "policy_path", ATLAS_GWPOLICY_PATH, err);
         }
-        if (st == ATLAS_OK && p.state == ATLAS_GWPOLICY_ENABLED) {
+        if (st == ATLAS_OK && p->state == ATLAS_GWPOLICY_ENABLED) {
             if (st == ATLAS_OK) {
-                st = atlas_json_key_str(j, "listen_addr", p.listen_addr, err);
+                st = atlas_json_key_str(j, "listen_addr", p->listen_addr, err);
             }
             if (st == ATLAS_OK) {
-                st = atlas_json_key_int(j, "listen_port", p.listen_port, err);
+                st = atlas_json_key_int(j, "listen_port", p->listen_port, err);
             }
             if (st == ATLAS_OK) {
-                st = atlas_json_key_str(j, "tls_mode", atlas_gwpolicy_tls_name(p.tls_mode), err);
+                st = atlas_json_key_str(j, "tls_mode", atlas_gwpolicy_tls_name(p->tls_mode), err);
             }
             if (st == ATLAS_OK) {
-                st = atlas_json_key_bool(j, "remote_mcp", p.remote_mcp, err);
+                st = atlas_json_key_bool(j, "remote_mcp", p->remote_mcp, err);
             }
             if (st == ATLAS_OK) {
-                st = atlas_json_key_bool(j, "web_gui", p.web_gui, err);
+                st = atlas_json_key_bool(j, "web_gui", p->web_gui, err);
             }
             if (st == ATLAS_OK) {
-                st = atlas_json_key_int(j, "gateway_uid", p.gateway_uid, err);
+                st = atlas_json_key_int(j, "gateway_uid", p->gateway_uid, err);
             }
             if (st == ATLAS_OK) {
-                st = atlas_json_key_int(j, "allowed_origins", (int64_t)p.origin_count, err);
+                st = atlas_json_key_int(j, "allowed_origins", (int64_t)p->origin_count, err);
             }
             if (st == ATLAS_OK) {
                 /* The one policy line that most moves this deployment's own
@@ -2010,9 +2038,37 @@ atlas_status atlas_service_gateway_status(FILE *out, bool json, atlas_err *err) 
                 atlas_buf anon = ATLAS_BUF_INIT;
                 atlas_err aerr;
                 atlas_err_init(&aerr);
-                (void)atlas_apikey_scopes_render(p.web_gui_anonymous_scopes, &anon, &aerr);
+                (void)atlas_apikey_scopes_render(p->web_gui_anonymous_scopes, &anon, &aerr);
                 st = atlas_json_key_str(j, "web_gui_anonymous_scopes", atlas_buf_cstr(&anon), err);
                 atlas_buf_free(&anon);
+            }
+            if (st == ATLAS_OK) {
+                /* A16. `acbd7ad`'s review put the argument for `anon:` above
+                 * as "an authentication bypass an auditor must see here, not
+                 * a ceiling safe to leave to the policy file" -- and a
+                 * disposal credential *changes* a lifecycle state rather
+                 * than only reading one, so the same argument applies with
+                 * more force, not less. Empty is itself the answer "remote
+                 * disposal is off" and is printed as such, never omitted. */
+                st = atlas_json_key_str(j, "remote_dispose_key", p->remote_dispose_key, err);
+            }
+            if (st == ATLAS_OK) {
+                atlas_buf kinds = ATLAS_BUF_INIT;
+                atlas_err kerr;
+                atlas_err_init(&kerr);
+                (void)render_dispose_kinds(p->remote_dispose_kinds, &kinds, &kerr);
+                st = atlas_json_key_str(j, "remote_dispose_kinds", atlas_buf_cstr(&kinds), err);
+                atlas_buf_free(&kinds);
+            }
+            if (st == ATLAS_OK) {
+                /* A16, amended 2026-09-04. The operator's written acceptance
+                 * that this credential crosses the network unencrypted. A
+                 * ceiling like `max_request_bytes` may be left to the policy
+                 * file; a fact this close to authentication may not --
+                 * yesterday's review made exactly that distinction for a
+                 * weaker mechanism, and disposal is stronger than a bypass. */
+                st = atlas_json_key_bool(j, "cleartext_disposal_accepted",
+                                         p->cleartext_disposal_accepted, err);
             }
         }
         /* Stated as a field rather than left to a reader's assumption, exactly
@@ -2031,21 +2087,21 @@ atlas_status atlas_service_gateway_status(FILE *out, bool json, atlas_err *err) 
         return st;
     }
 
-    (void)fprintf(out, "gateway: %s\n", atlas_gwpolicy_state_name(p.state));
-    (void)fprintf(out, "reason:  %s\n", atlas_gwpolicy_reason_name(p.reason));
-    (void)fprintf(out, "         %s\n", atlas_gwpolicy_reason_detail(p.reason));
+    (void)fprintf(out, "gateway: %s\n", atlas_gwpolicy_state_name(p->state));
+    (void)fprintf(out, "reason:  %s\n", atlas_gwpolicy_reason_name(p->reason));
+    (void)fprintf(out, "         %s\n", atlas_gwpolicy_reason_detail(p->reason));
     (void)fprintf(out, "policy:  %s\n", ATLAS_GWPOLICY_PATH);
-    if (p.detail[0] != '\0') {
-        (void)fprintf(out, "at:      %s\n", p.detail);
+    if (p->detail[0] != '\0') {
+        (void)fprintf(out, "at:      %s\n", p->detail);
     }
-    if (p.state == ATLAS_GWPOLICY_ENABLED) {
-        (void)fprintf(out, "listen:  %s port %d\n", p.listen_addr, p.listen_port);
+    if (p->state == ATLAS_GWPOLICY_ENABLED) {
+        (void)fprintf(out, "listen:  %s port %d\n", p->listen_addr, p->listen_port);
         (void)fprintf(out, "tls:     %s (Atlas terminates no TLS)\n",
-                      atlas_gwpolicy_tls_name(p.tls_mode));
-        (void)fprintf(out, "surface: remote_mcp=%s web_gui=%s\n", p.remote_mcp ? "yes" : "no",
-                      p.web_gui ? "yes" : "no");
-        (void)fprintf(out, "uid:     %lld\n", p.gateway_uid);
-        (void)fprintf(out, "origins: %zu allowed\n", p.origin_count);
+                      atlas_gwpolicy_tls_name(p->tls_mode));
+        (void)fprintf(out, "surface: remote_mcp=%s web_gui=%s\n", p->remote_mcp ? "yes" : "no",
+                      p->web_gui ? "yes" : "no");
+        (void)fprintf(out, "uid:     %lld\n", p->gateway_uid);
+        (void)fprintf(out, "origins: %zu allowed\n", p->origin_count);
         {
             /* Same reasoning as the JSON form above: this is an
              * authentication bypass an auditor must see here, not a ceiling
@@ -2053,16 +2109,54 @@ atlas_status atlas_service_gateway_status(FILE *out, bool json, atlas_err *err) 
             atlas_buf anon = ATLAS_BUF_INIT;
             atlas_err aerr;
             atlas_err_init(&aerr);
-            (void)atlas_apikey_scopes_render(p.web_gui_anonymous_scopes, &anon, &aerr);
+            (void)atlas_apikey_scopes_render(p->web_gui_anonymous_scopes, &anon, &aerr);
             (void)fprintf(out, "anon:    %s\n",
                           atlas_buf_cstr(&anon)[0] != '\0'
                               ? atlas_buf_cstr(&anon)
                               : "(none -- /api/ still requires a session or bearer credential)");
             atlas_buf_free(&anon);
         }
-        if (p.public_url[0] != '\0') {
-            (void)fprintf(out, "url:     %s/mcp\n", p.public_url);
+        {
+            /* A16. `acbd7ad`'s reason for `anon:` above, one step stronger:
+             * this is a credential that can change a lifecycle state, not
+             * only read one, so it belongs here even more than a read-only
+             * bypass does. Both lines print unconditionally, exactly as
+             * `anon:` does, so their absence from a policy is itself the
+             * printed answer rather than a line an auditor has to notice is
+             * missing. */
+            if (p->remote_dispose_key[0] != '\0') {
+                atlas_buf kinds = ATLAS_BUF_INIT;
+                atlas_err kerr;
+                atlas_err_init(&kerr);
+                (void)render_dispose_kinds(p->remote_dispose_kinds, &kinds, &kerr);
+                (void)fprintf(out, "dispose: key_%s (%s)\n", p->remote_dispose_key,
+                              atlas_buf_cstr(&kinds));
+                atlas_buf_free(&kinds);
+            } else {
+                (void)fprintf(out,
+                              "dispose: (none -- the browser can read and queue, never dispose)\n");
+            }
+            if (p->cleartext_disposal_accepted) {
+                (void)fprintf(
+                    out,
+                    "clear:   ACCEPTED -- operator_accepts_cleartext_disposal = yes: the disposal "
+                    "credential crosses this network unencrypted, and a captured credential "
+                    "disposes until it is revoked\n");
+            } else {
+                (void)fprintf(out,
+                              "clear:   (not accepted -- a disposal credential is offered only "
+                              "behind tls_mode = REVERSE_PROXY)\n");
+            }
+        }
+        if (p->public_url[0] != '\0') {
+            (void)fprintf(out, "url:     %s/mcp\n", p->public_url);
         }
     }
     return ATLAS_OK;
+}
+
+atlas_status atlas_service_gateway_status(FILE *out, bool json, atlas_err *err) {
+    atlas_gwpolicy p;
+    atlas_gwpolicy_load(&p);
+    return atlas_service_gateway_status_for(out, json, &p, err);
 }

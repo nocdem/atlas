@@ -18,6 +18,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "atlas/decision.h" /* atlas_decision_kind, ATLAS_DECISION_KIND_BIT, atlas_decision_kind_parse */
 #include "atlas/limits.h"
 #include "atlas/rootpath.h"
 
@@ -187,6 +188,41 @@ static bool printable_token(const char *s) {
     return true;
 }
 
+/* `remote_dispose_key`'s grammar: exactly the display form `atlas api-key
+ * list` prints -- "key_" followed by sixteen lowercase hex characters, the
+ * same alphabet and length as `api_keys.key_id`. `ATLAS_APIKEY_ID_PREFIX`
+ * (`atlas/gw.h`) names the same four bytes, but that header pulls in
+ * `atlas/db.h`, which this loader must not -- `ATLAS_DECISION_KIND_BIT`'s own
+ * header comment (`atlas/decision.h`) states the identical constraint for
+ * this same file, which is why it lives in `decision.h` rather than the
+ * heavier `decision_ops.h`. The literal is repeated here rather than shared
+ * for the same reason. Stored *without* the prefix, because the prefix is a
+ * display convention and `api_keys.key_id` never carries it. */
+#define GWPOLICY_DISPOSE_KEY_PREFIX "key_"
+#define GWPOLICY_DISPOSE_KEY_PREFIX_LEN 4u
+
+static bool parse_dispose_key(const char *val, size_t vlen,
+                              char out[ATLAS_APIKEY_SELECTOR_HEX + 1u]) {
+    if (vlen != GWPOLICY_DISPOSE_KEY_PREFIX_LEN + ATLAS_APIKEY_SELECTOR_HEX ||
+        strncmp(val, GWPOLICY_DISPOSE_KEY_PREFIX, GWPOLICY_DISPOSE_KEY_PREFIX_LEN) != 0) {
+        return false;
+    }
+    const char *hex = val + GWPOLICY_DISPOSE_KEY_PREFIX_LEN;
+    for (size_t i = 0; i < ATLAS_APIKEY_SELECTOR_HEX; i++) {
+        char c = hex[i];
+        bool is_lower_hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+        if (!is_lower_hex) {
+            /* Uppercase or any other byte. One spelling, exactly as a scope
+             * name or a `tls_mode` value has exactly one spelling in this
+             * file: a policy an operator reads back must say what it means. */
+            return false;
+        }
+    }
+    memcpy(out, hex, ATLAS_APIKEY_SELECTOR_HEX);
+    out[ATLAS_APIKEY_SELECTOR_HEX] = '\0';
+    return true;
+}
+
 void atlas_gwpolicy_load_at(const char *path, atlas_gwpolicy *out) {
     memset(out, 0, sizeof(*out));
     out->state = ATLAS_GWPOLICY_DISABLED;
@@ -268,6 +304,9 @@ void atlas_gwpolicy_parse_buffer(const char *buf, size_t total, atlas_gwpolicy *
     bool enabled = false;
     bool addr_given = false;
     bool anon_scopes_given = false;
+    bool dispose_key_given = false;
+    bool dispose_kinds_given = false;
+    bool accept_given = false;
 
     size_t i = 0;
     while (i < total) {
@@ -397,6 +436,105 @@ void atlas_gwpolicy_parse_buffer(const char *buf, size_t total, atlas_gwpolicy *
             }
             out->web_gui_anonymous_scopes = mask;
             anon_scopes_given = true;
+        } else if (take_value(line, len, "remote_dispose_key", &val, &vlen)) {
+            /* A16: the disposal credential's selector, in its display form.
+             * `parse_dispose_key` both validates the shape and strips the
+             * prefix, so `out->remote_dispose_key` is stored exactly as
+             * `api_keys.key_id` is. */
+            if (!parse_dispose_key(val, vlen, out->remote_dispose_key)) {
+                out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
+                return;
+            }
+            dispose_key_given = true;
+        } else if (take_value(line, len, "remote_dispose_kinds", &val, &vlen)) {
+            /* A16: a space-separated list of `atlas_decision_kind_parse`'s own
+             * names, one bit per kind. This loader places no vocabulary in
+             * front of the operator's choice narrower than
+             * `atlas_decision_kind_parse` itself already accepts everywhere
+             * else in Atlas — every kind, including DECISION and POLICY, is
+             * nameable here, on purpose: a compiled-in subset would be a
+             * silent narrowing an operator could only discover the day a
+             * record of the missing kind refused them.
+             *
+             * Copied to a bounded buffer for the same reason the anonymous
+             * scope list above is: `ATLAS_DECISION_KIND_MAX` is 8, and even
+             * every name at once, longest first, comes nowhere near this
+             * buffer. */
+            char kinds_buf[256];
+            if (!copy_value(kinds_buf, sizeof kinds_buf, val, vlen)) {
+                out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
+                return;
+            }
+            uint32_t kmask = 0u;
+            bool any_kind = false;
+            size_t ki = 0;
+            while (kinds_buf[ki] != '\0') {
+                while (kinds_buf[ki] == ' ') {
+                    ki++;
+                }
+                if (kinds_buf[ki] == '\0') {
+                    break;
+                }
+                size_t kstart = ki;
+                while (kinds_buf[ki] != '\0' && kinds_buf[ki] != ' ') {
+                    ki++;
+                }
+                size_t ktoklen = ki - kstart;
+                char token[32];
+                if (ktoklen == 0 || ktoklen >= sizeof(token)) {
+                    out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
+                    return;
+                }
+                memcpy(token, kinds_buf + kstart, ktoklen);
+                token[ktoklen] = '\0';
+                atlas_decision_kind kind;
+                if (!atlas_decision_kind_parse(token, &kind)) {
+                    /* An unknown kind name. Fails closed the same way an
+                     * unknown scope name or an unknown top-level key does. */
+                    out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
+                    return;
+                }
+                uint32_t bit = ATLAS_DECISION_KIND_BIT(kind);
+                if ((kmask & bit) != 0u) {
+                    /* Named twice. Not a wider grant than naming it once and
+                     * not a narrower one either — refused, because a policy
+                     * an operator reads back should never carry a name twice
+                     * for no reason nothing here can explain. */
+                    out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
+                    return;
+                }
+                kmask |= bit;
+                any_kind = true;
+            }
+            if (!any_kind) {
+                /* "An empty list is refused -- disposal of nothing is not a
+                 * smaller grant, it is a key that cannot take effect." In
+                 * practice `take_value` already refuses a value that trims to
+                 * nothing before this branch is ever reached, by falling
+                 * through to the "unrecognised key" refusal below — but that
+                 * is a property of how whitespace happens to be trimmed
+                 * elsewhere in this file, not a property of this key, so the
+                 * refusal is written here explicitly rather than left to be
+                 * true by accident. */
+                out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
+                return;
+            }
+            out->remote_dispose_kinds = kmask;
+            dispose_kinds_given = true;
+        } else if (take_value(line, len, "operator_accepts_cleartext_disposal", &val, &vlen)) {
+            /* A16, amended 2026-09-04. One legal value, deliberately narrower
+             * than `parse_bool`: this key records a person's written
+             * acceptance of a stated risk, not an on/off switch, and the
+             * frozen instruction is "leave the line out rather than writing
+             * `no`" — so `no`, `true`, `1` and every other spelling are
+             * refused exactly like an unrecognised key, rather than read as
+             * "not accepted". */
+            if (vlen != 3u || strncmp(val, "yes", 3) != 0) {
+                out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
+                return;
+            }
+            out->cleartext_disposal_accepted = true;
+            accept_given = true;
         } else if (take_value(line, len, "trust_forwarded_for", &val, &vlen)) {
             if (!parse_bool(val, vlen, &out->trust_forwarded_for)) {
                 out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
@@ -465,6 +603,61 @@ void atlas_gwpolicy_parse_buffer(const char *buf, size_t total, atlas_gwpolicy *
          * consequence of leaving a key out. */
         out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
         return;
+    }
+    if (dispose_key_given != dispose_kinds_given) {
+        /* A16. "Both keys or neither." Disposal of nothing is not a smaller
+         * grant than naming no key at all -- it is a key that can never take
+         * effect -- and a credential named with no kinds to spend it on is
+         * exactly as inert. Neither half is a documented behaviour Atlas
+         * would actually implement, so both are refused rather than one of
+         * them silently doing nothing. */
+        out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
+        return;
+    }
+    if (accept_given && !dispose_key_given) {
+        /* A16, amended 2026-09-04. This key records a person's acceptance of
+         * a risk carried by a specific credential; with no disposal
+         * credential named there is nothing here for the operator to have
+         * accepted. */
+        out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
+        return;
+    }
+    if (dispose_key_given) {
+        if (!out->web_gui) {
+            /* A16. The panel this credential serves lives in the browser
+             * surface; naming a disposal credential with that surface off is
+             * P0's rule again -- a documented bound that is not the
+             * implemented one is worse than no bound, so it is refused
+             * rather than left silently inert, exactly as
+             * `web_gui_anonymous_scopes` already is above. */
+            out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
+            return;
+        }
+        if (out->tls_mode == ATLAS_GWPOLICY_TLS_REVERSE_PROXY) {
+            if (accept_given) {
+                /* A16, amended 2026-09-04. TLS is already in front, so there
+                 * is no cleartext risk for this line to accept; present
+                 * anyway, it is refused rather than silently ignored -- an
+                 * operator-written line this loader quietly did nothing with
+                 * is exactly the shape "an unrecognised key is an error, not
+                 * something skipped" exists to catch, one layer in. */
+                out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
+                return;
+            }
+        } else if (!accept_given) {
+            /* A16, amended 2026-09-04. `tls_mode` is `NONE`, or was never
+             * written at all (a loopback bind) -- either way nothing in
+             * front of this listener terminates TLS, and the disposal
+             * credential is a bearer token presented on every request this
+             * group answers. Offering the daemon method group here without
+             * the operator's written acceptance would be the authentication
+             * bypass `acbd7ad`'s review found in a weaker mechanism, except
+             * this one disposes of a knowledge record rather than only
+             * reading one -- so it is refused here, at the policy that would
+             * otherwise offer the group, rather than left to be caught later. */
+            out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
+            return;
+        }
     }
     if (!out->remote_mcp && !out->web_gui) {
         /* A listener with no surface accepts connections and answers 404 to

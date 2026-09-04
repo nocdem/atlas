@@ -59,6 +59,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #include "atlas/apikey.h"
 
@@ -192,6 +193,48 @@ typedef struct atlas_gwpolicy {
      * it means a policy an operator can still read back is one whose written
      * behaviour and actual behaviour agree. */
     atlas_scope_mask web_gui_anonymous_scopes;
+
+    /* A16. The disposal credential and the record kinds it may dispose of from
+     * the browser — the mechanism that makes "Dispose from this browser" exist
+     * on a deployment at all. This is where A7/A7.1's rule lands a second
+     * time: the gateway process is the principal a browser disposal reaches
+     * first, and it cannot edit this file, so naming the credential and the
+     * kinds here — rather than in a table the gateway's own uid could reach —
+     * is what keeps a compromised gateway from being able to widen what it
+     * may dispose of.
+     *
+     * Empty `remote_dispose_key` (the default) means remote disposal is off
+     * entirely: no daemon method group is offered, and there is no narrower
+     * grant to fall back to. A default that granted a *subset* of kinds
+     * instead of nothing would be worse than granting nothing, because an
+     * operator would only discover the narrowing the day a record of the
+     * missing kind refused them — so the two fields travel together, and a
+     * policy naming one without the other is MALFORMED, not a smaller grant.
+     *
+     * `remote_dispose_key` is stored **without** the display prefix, exactly
+     * as `api_keys.key_id` is (`ATLAS_APIKEY_ID_PREFIX`, `atlas/gw.h` — not
+     * included here on purpose, see gwpolicy.c). `remote_dispose_kinds` is a
+     * bitmask built from `ATLAS_DECISION_KIND_BIT`, over any subset of
+     * `atlas_decision_kind` the operator names — the loader places no
+     * narrower vocabulary in front of the operator's own choice of which
+     * kinds may be disposed of from a browser than `atlas_decision_kind_parse`
+     * already accepts everywhere else. */
+    char remote_dispose_key[ATLAS_APIKEY_SELECTOR_HEX + 1u];
+    uint32_t remote_dispose_kinds;
+
+    /* A16, amended 2026-09-04. The operator's written acceptance that the
+     * disposal credential above crosses the network unencrypted. This is a
+     * recorded decision, not a feature toggle: the operator was shown the
+     * chain — no in-process TLS, `tls_mode = NONE` on this deployment, a
+     * bearer credential presented on every disposal request, an Atlas
+     * credential with no expiry — and declined TLS for their own network on
+     * 2026-09-04 anyway. Never a default (a memset leaves it false); refused
+     * under `tls_mode = REVERSE_PROXY`, where there is nothing to accept; and
+     * refused without both fields above, where there is nothing for it to
+     * apply to. `atlas gateway status` prints it on every run — an
+     * authentication-adjacent fact an auditor must see there, not a ceiling
+     * safe to leave to a root-owned file they may not be able to open. */
+    bool cleartext_disposal_accepted;
 
     /* Ceilings. Each may only lower the compiled-in absolute bound in
      * `atlas/limits.h`, never raise it — A8's rule, so the policy decides how

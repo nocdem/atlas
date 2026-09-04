@@ -79,6 +79,26 @@ max_concurrent = 64
 rate_limit_per_minute = 600
 session_ttl_seconds = 43200
 
+# --- remote disposal (A16) ---------------------------------------------------
+#
+# Remote disposal from Mission Control. Both keys or neither. Both REQUIRE
+# web_gui = yes, and REQUIRE tls_mode = REVERSE_PROXY unless the third key
+# below is present; naming either with web_gui = no is a malformed policy and
+# the gateway does not start.
+# remote_dispose_key   = key_581e0a805cc1febe
+# remote_dispose_kinds = OPERATIONAL_FACT PARKED
+
+# THE OPERATOR'S WRITTEN ACCEPTANCE OF A CLEARTEXT DISPOSAL CHANNEL. Not a
+# feature toggle. With this line present and tls_mode = NONE (or absent), the
+# disposal credential crosses the network unencrypted on every disposal;
+# anyone able to observe traffic on the segment can capture it; an Atlas
+# credential has no expiry, so a credential captured once disposes of records
+# exactly as you do until `atlas api-key revoke`. `yes` is the only accepted
+# value; leave the line out rather than writing `no`. Refused under
+# tls_mode = REVERSE_PROXY (nothing to accept) and without the two keys above.
+# `atlas gateway status` prints this acceptance on every run.
+# operator_accepts_cleartext_disposal = yes
+
 # Whether a forwarded client address may be believed for rate limiting.
 #
 # Off by default, and the consequence is stated rather than hidden: behind a

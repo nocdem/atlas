@@ -14,14 +14,17 @@
  * property the whole policy rests on.
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
+#include "atlas/decision.h"
 #include "atlas/gateway.h"
 #include "atlas/gwpolicy.h"
 #include "atlas/http.h"
 #include "atlas_test.h"
 #include "ipc/server_internal.h"
 #include "support/fixture.h"
+#include "support/jsoncheck.h"
 
 static void parse_policy(const char *text, atlas_gwpolicy *out) {
     atlas_gwpolicy_parse_buffer(text, strlen(text), out);
@@ -113,6 +116,68 @@ static void test_every_malformed_policy_disables_the_gateway(void) {
         {"web_gui_anonymous_scopes with web_gui absent",
          "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\n"
          "web_gui_anonymous_scopes = repo:read\n"},
+
+        /* A16: the two disposal keys and the acceptance key. Every base text
+         * below already carries `web_gui = yes` and `tls_mode = REVERSE_PROXY`
+         * so that the one condition each case means to break is the only one
+         * that can be the reason -- a case that also happened to fail the
+         * web_gui or tls_mode cross-check would not actually be testing what
+         * its name says. */
+        {"remote_dispose_key with 15 hex characters instead of 16",
+         "enabled = yes\ngateway_uid = 1001\nweb_gui = yes\ntls_mode = REVERSE_PROXY\n"
+         "remote_dispose_key = key_581e0a805cc1feb\nremote_dispose_kinds = PARKED\n"},
+        {"remote_dispose_key in uppercase hex",
+         "enabled = yes\ngateway_uid = 1001\nweb_gui = yes\ntls_mode = REVERSE_PROXY\n"
+         "remote_dispose_key = key_581E0A805CC1FEBE\nremote_dispose_kinds = PARKED\n"},
+        {"remote_dispose_key with no key_ prefix",
+         "enabled = yes\ngateway_uid = 1001\nweb_gui = yes\ntls_mode = REVERSE_PROXY\n"
+         "remote_dispose_key = 581e0a805cc1febe\nremote_dispose_kinds = PARKED\n"},
+        {"remote_dispose_kinds naming an unknown kind",
+         "enabled = yes\ngateway_uid = 1001\nweb_gui = yes\ntls_mode = REVERSE_PROXY\n"
+         "remote_dispose_key = key_581e0a805cc1febe\n"
+         "remote_dispose_kinds = PARKED NOT_A_REAL_KIND\n"},
+        {"remote_dispose_kinds naming a duplicate kind",
+         "enabled = yes\ngateway_uid = 1001\nweb_gui = yes\ntls_mode = REVERSE_PROXY\n"
+         "remote_dispose_key = key_581e0a805cc1febe\n"
+         "remote_dispose_kinds = PARKED PARKED\n"},
+        {"remote_dispose_kinds given an empty value",
+         "enabled = yes\ngateway_uid = 1001\nweb_gui = yes\ntls_mode = REVERSE_PROXY\n"
+         "remote_dispose_key = key_581e0a805cc1febe\nremote_dispose_kinds = \n"},
+        {"remote_dispose_key without remote_dispose_kinds",
+         "enabled = yes\ngateway_uid = 1001\nweb_gui = yes\ntls_mode = REVERSE_PROXY\n"
+         "remote_dispose_key = key_581e0a805cc1febe\n"},
+        {"remote_dispose_kinds without remote_dispose_key",
+         "enabled = yes\ngateway_uid = 1001\nweb_gui = yes\ntls_mode = REVERSE_PROXY\n"
+         "remote_dispose_kinds = PARKED\n"},
+        {"both disposal keys with tls_mode = NONE and no acceptance",
+         "enabled = yes\ngateway_uid = 1001\nweb_gui = yes\ntls_mode = NONE\n"
+         "remote_dispose_key = key_581e0a805cc1febe\nremote_dispose_kinds = PARKED\n"},
+        {"both disposal keys with web_gui = no",
+         "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\nweb_gui = no\n"
+         "tls_mode = REVERSE_PROXY\n"
+         "remote_dispose_key = key_581e0a805cc1febe\nremote_dispose_kinds = PARKED\n"},
+        {"web_gui_anonymous_scopes naming decisions:dispose",
+         "enabled = yes\ngateway_uid = 1001\nweb_gui = yes\n"
+         "web_gui_anonymous_scopes = repo:read decisions:dispose\n"},
+        {"operator_accepts_cleartext_disposal = no",
+         "enabled = yes\ngateway_uid = 1001\nweb_gui = yes\ntls_mode = NONE\n"
+         "remote_dispose_key = key_581e0a805cc1febe\nremote_dispose_kinds = PARKED\n"
+         "operator_accepts_cleartext_disposal = no\n"},
+        {"operator_accepts_cleartext_disposal = true",
+         "enabled = yes\ngateway_uid = 1001\nweb_gui = yes\ntls_mode = NONE\n"
+         "remote_dispose_key = key_581e0a805cc1febe\nremote_dispose_kinds = PARKED\n"
+         "operator_accepts_cleartext_disposal = true\n"},
+        {"operator_accepts_cleartext_disposal = 1",
+         "enabled = yes\ngateway_uid = 1001\nweb_gui = yes\ntls_mode = NONE\n"
+         "remote_dispose_key = key_581e0a805cc1febe\nremote_dispose_kinds = PARKED\n"
+         "operator_accepts_cleartext_disposal = 1\n"},
+        {"the acceptance with tls_mode = REVERSE_PROXY",
+         "enabled = yes\ngateway_uid = 1001\nweb_gui = yes\ntls_mode = REVERSE_PROXY\n"
+         "remote_dispose_key = key_581e0a805cc1febe\nremote_dispose_kinds = PARKED\n"
+         "operator_accepts_cleartext_disposal = yes\n"},
+        {"the acceptance with neither disposal key",
+         "enabled = yes\ngateway_uid = 1001\nweb_gui = yes\n"
+         "operator_accepts_cleartext_disposal = yes\n"},
     };
 
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
@@ -163,6 +228,195 @@ static void test_web_gui_anonymous_scopes_parses_exactly_what_was_named(void) {
                  &p2);
     T_REQUIRE(p2.state == ATLAS_GWPOLICY_ENABLED);
     T_CHECK(atlas_scope_has(p2.web_gui_anonymous_scopes, ATLAS_SCOPE_AUDIT_READ));
+}
+
+/* A16. `remote_dispose_key` and `remote_dispose_kinds` parse into a policy
+ * that starts, and every kind Atlas has -- not a compiled-in subset of
+ * "browser-shaped" kinds -- is nameable, exactly as
+ * `atlas_decision_kind_parse` already accepts everywhere else: the operator's
+ * ruling for this deployment is that every kind may be disposed of from the
+ * browser, and a loader that quietly narrowed that set would only be
+ * discovered the day a record of the missing kind refused it. */
+static void test_remote_dispose_key_and_kinds_parse_a_complete_policy(void) {
+    atlas_gwpolicy p;
+    parse_policy("enabled = yes\ngateway_uid = 1001\nweb_gui = yes\ntls_mode = REVERSE_PROXY\n"
+                 "remote_dispose_key = key_581e0a805cc1febe\n"
+                 "remote_dispose_kinds = OPERATIONAL_FACT PARKED\n",
+                 &p);
+    T_REQUIRE_MSG(p.state == ATLAS_GWPOLICY_ENABLED, "a complete disposal policy was refused: %s",
+                  atlas_gwpolicy_reason_name(p.reason));
+    T_CHECK_MSG(strcmp(p.remote_dispose_key, "581e0a805cc1febe") == 0,
+                "remote_dispose_key was stored as \"%s\", not without its \"key_\" prefix",
+                p.remote_dispose_key);
+    uint32_t want = ATLAS_DECISION_KIND_BIT(ATLAS_DECISION_KIND_OPERATIONAL_FACT) |
+                    ATLAS_DECISION_KIND_BIT(ATLAS_DECISION_KIND_PARKED);
+    T_CHECK_MSG(p.remote_dispose_kinds == want,
+                "the parsed dispose-kinds mask (0x%x) is not exactly the two bits named (0x%x)",
+                (unsigned)p.remote_dispose_kinds, (unsigned)want);
+    T_CHECK(!p.cleartext_disposal_accepted);
+
+    /* Every one of the eight kinds is nameable, including DECISION and
+     * POLICY -- the two the plan's own default left out, and the two whose
+     * absence the operator's ruling exists to correct. */
+    atlas_gwpolicy p2;
+    parse_policy("enabled = yes\ngateway_uid = 1001\nweb_gui = yes\ntls_mode = REVERSE_PROXY\n"
+                 "remote_dispose_key = key_581e0a805cc1febe\n"
+                 "remote_dispose_kinds = DECISION POLICY INVARIANT OPERATIONAL_FACT "
+                 "ACCEPTED_RISK OBLIGATION PARKED REJECTED_ALTERNATIVE\n",
+                 &p2);
+    T_REQUIRE_MSG(p2.state == ATLAS_GWPOLICY_ENABLED,
+                 "naming every decision kind was refused: %s", atlas_gwpolicy_reason_name(p2.reason));
+    uint32_t all = 0u;
+    for (size_t i = 0; i < atlas_decision_kind_count(); i++) {
+        all |= ATLAS_DECISION_KIND_BIT(atlas_decision_kind_at(i));
+    }
+    T_CHECK_MSG(p2.remote_dispose_kinds == all,
+                "naming every kind produced mask 0x%x, not the full set 0x%x",
+                (unsigned)p2.remote_dispose_kinds, (unsigned)all);
+}
+
+/* A policy naming neither key is ENABLED with remote disposal off, which is
+ * today's every policy in the field -- "the binary must still load today's
+ * policy as ENABLED, because nothing in it names a key." */
+static void test_remote_dispose_is_absent_by_default(void) {
+    atlas_gwpolicy p;
+    parse_policy(GOOD, &p);
+    T_REQUIRE(p.state == ATLAS_GWPOLICY_ENABLED);
+    T_CHECK_MSG(p.remote_dispose_key[0] == '\0', "an absent policy named a dispose key");
+    T_CHECK_MSG(p.remote_dispose_kinds == 0u, "an absent policy produced a nonzero dispose mask");
+    T_CHECK(!p.cleartext_disposal_accepted);
+}
+
+/* A16, amended 2026-09-04. The operator's written acceptance of a cleartext
+ * disposal channel: one legal value, required whenever the disposal
+ * credential would otherwise be offered with nothing in front of it, and
+ * refused everywhere else -- see `gwpolicy.c`'s cross-checks for the argument
+ * behind each direction. */
+static void test_the_cleartext_disposal_acceptance(void) {
+    static const char *const BASE =
+        "enabled = yes\ngateway_uid = 1001\nweb_gui = yes\n"
+        "remote_dispose_key = key_581e0a805cc1febe\nremote_dispose_kinds = PARKED\n";
+
+    atlas_gwpolicy p;
+    char text[512];
+
+    /* tls_mode = NONE, accepted. */
+    (void)snprintf(text, sizeof text, "%stls_mode = NONE\noperator_accepts_cleartext_disposal = yes\n",
+                  BASE);
+    parse_policy(text, &p);
+    T_REQUIRE_MSG(p.state == ATLAS_GWPOLICY_ENABLED, "tls_mode = NONE with acceptance was refused: %s",
+                  atlas_gwpolicy_reason_name(p.reason));
+    T_CHECK(p.cleartext_disposal_accepted);
+
+    /* tls_mode absent -- a loopback bind -- accepted likewise. */
+    (void)snprintf(text, sizeof text, "%soperator_accepts_cleartext_disposal = yes\n", BASE);
+    parse_policy(text, &p);
+    T_REQUIRE_MSG(p.state == ATLAS_GWPOLICY_ENABLED,
+                 "an absent tls_mode with acceptance was refused: %s",
+                 atlas_gwpolicy_reason_name(p.reason));
+    T_CHECK(p.cleartext_disposal_accepted);
+
+    /* No acceptance line at all, TLS in front: ENABLED, not accepted. */
+    (void)snprintf(text, sizeof text, "%stls_mode = REVERSE_PROXY\n", BASE);
+    parse_policy(text, &p);
+    T_REQUIRE_MSG(p.state == ATLAS_GWPOLICY_ENABLED, "a reverse-proxy disposal policy was refused: %s",
+                  atlas_gwpolicy_reason_name(p.reason));
+    T_CHECK_MSG(!p.cleartext_disposal_accepted,
+                "a policy naming no acceptance reported cleartext_disposal_accepted");
+}
+
+/* `atlas gateway status`'s `dispose:` and `clear:` lines, in both renderers.
+ * Asserted by needle, never by whole line or line count: `clear:` carries a
+ * sentence an auditor reads, not a width a test pins, and no test in the tree
+ * asserted the human status output before this one existed. */
+static void render_status(bool json, const atlas_gwpolicy *p, atlas_buf *out) {
+    atlas_err err;
+    atlas_err_init(&err);
+    char *buf = NULL;
+    size_t len = 0;
+    FILE *fp = open_memstream(&buf, &len);
+    T_REQUIRE(fp != NULL);
+    T_OK(atlas_service_gateway_status_for(fp, json, p, &err), &err);
+    (void)fclose(fp);
+    T_OK(atlas_buf_set(out, buf, len, &err), &err);
+    free(buf);
+}
+
+static void test_gateway_status_prints_dispose_and_clear(void) {
+    atlas_gwpolicy accepted;
+    parse_policy("enabled = yes\ngateway_uid = 1001\nweb_gui = yes\ntls_mode = NONE\n"
+                 "remote_dispose_key = key_581e0a805cc1febe\n"
+                 "remote_dispose_kinds = OPERATIONAL_FACT PARKED\n"
+                 "operator_accepts_cleartext_disposal = yes\n",
+                 &accepted);
+    T_REQUIRE(accepted.state == ATLAS_GWPOLICY_ENABLED);
+
+    atlas_buf human = ATLAS_BUF_INIT;
+    render_status(false, &accepted, &human);
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&human), "dispose: key_581e0a805cc1febe "
+                                               "(OPERATIONAL_FACT PARKED)") != NULL,
+                "the human form did not print the dispose line: %s", atlas_buf_cstr(&human));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&human), "clear:   ACCEPTED") != NULL,
+                "the human form did not print the accepted clear line: %s",
+                atlas_buf_cstr(&human));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&human), "operator_accepts_cleartext_disposal = yes") != NULL,
+                "the accepted clear line did not quote the policy key: %s",
+                atlas_buf_cstr(&human));
+    atlas_buf_free(&human);
+
+    atlas_buf j = ATLAS_BUF_INIT;
+    render_status(true, &accepted, &j);
+    size_t bad = 0;
+    T_CHECK_MSG(tjson_valid(atlas_buf_cstr(&j), j.len, &bad), "status --json is not valid JSON at %zu",
+                bad);
+    atlas_buf key = ATLAS_BUF_INIT;
+    T_CHECK(tjson_get_string(atlas_buf_cstr(&j), j.len, "remote_dispose_key", &key));
+    T_CHECK_MSG(strcmp(atlas_buf_cstr(&key), "581e0a805cc1febe") == 0,
+                "remote_dispose_key in JSON was \"%s\"", atlas_buf_cstr(&key));
+    atlas_buf_free(&key);
+    atlas_buf kinds = ATLAS_BUF_INIT;
+    T_CHECK(tjson_get_string(atlas_buf_cstr(&j), j.len, "remote_dispose_kinds", &kinds));
+    T_CHECK_MSG(strcmp(atlas_buf_cstr(&kinds), "OPERATIONAL_FACT PARKED") == 0,
+                "remote_dispose_kinds in JSON was \"%s\"", atlas_buf_cstr(&kinds));
+    atlas_buf_free(&kinds);
+    atlas_buf accept_raw = ATLAS_BUF_INIT;
+    T_CHECK(tjson_get_raw(atlas_buf_cstr(&j), j.len, "cleartext_disposal_accepted", &accept_raw));
+    T_CHECK_MSG(strcmp(atlas_buf_cstr(&accept_raw), "true") == 0,
+                "cleartext_disposal_accepted in JSON was \"%s\"", atlas_buf_cstr(&accept_raw));
+    atlas_buf_free(&accept_raw);
+    atlas_buf_free(&j);
+
+    /* Not accepted, and no dispose key at all: the "(none ...)" and
+     * "(not accepted ...)" wording, in both forms. */
+    atlas_gwpolicy off;
+    parse_policy(GOOD, &off);
+    T_REQUIRE(off.state == ATLAS_GWPOLICY_ENABLED);
+
+    atlas_buf human_off = ATLAS_BUF_INIT;
+    render_status(false, &off, &human_off);
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&human_off), "dispose: (none") != NULL,
+                "the human form did not print the disabled dispose line: %s",
+                atlas_buf_cstr(&human_off));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&human_off), "clear:   (not accepted") != NULL,
+                "the human form did not print the not-accepted clear line: %s",
+                atlas_buf_cstr(&human_off));
+    atlas_buf_free(&human_off);
+
+    atlas_buf json_off = ATLAS_BUF_INIT;
+    render_status(true, &off, &json_off);
+    atlas_buf key_off = ATLAS_BUF_INIT;
+    T_CHECK(tjson_get_string(atlas_buf_cstr(&json_off), json_off.len, "remote_dispose_key", &key_off));
+    T_CHECK_MSG(atlas_buf_cstr(&key_off)[0] == '\0', "an off policy named a dispose key in JSON: \"%s\"",
+                atlas_buf_cstr(&key_off));
+    atlas_buf_free(&key_off);
+    atlas_buf accept_off = ATLAS_BUF_INIT;
+    T_CHECK(tjson_get_raw(atlas_buf_cstr(&json_off), json_off.len, "cleartext_disposal_accepted",
+                         &accept_off));
+    T_CHECK_MSG(strcmp(atlas_buf_cstr(&accept_off), "false") == 0,
+                "cleartext_disposal_accepted in JSON was \"%s\" for an off policy",
+                atlas_buf_cstr(&accept_off));
+    atlas_buf_free(&accept_off);
+    atlas_buf_free(&json_off);
 }
 
 static void test_a_policy_that_says_no_is_not_malformed(void) {
@@ -603,6 +857,11 @@ static const atlas_test TESTS[] = {
      test_web_gui_anonymous_scopes_is_absent_by_default},
     {"web_gui_anonymous_scopes parses exactly what was named",
      test_web_gui_anonymous_scopes_parses_exactly_what_was_named},
+    {"remote_dispose_key and remote_dispose_kinds parse a complete policy",
+     test_remote_dispose_key_and_kinds_parse_a_complete_policy},
+    {"remote disposal is absent by default", test_remote_dispose_is_absent_by_default},
+    {"the cleartext disposal acceptance", test_the_cleartext_disposal_acceptance},
+    {"gateway status prints dispose and clear", test_gateway_status_prints_dispose_and_clear},
     {"a policy that says no is not malformed", test_a_policy_that_says_no_is_not_malformed},
     {"a wider bind needs a written TLS stance", test_a_wider_bind_needs_a_written_tls_stance},
     {"an origin must match whole", test_an_origin_must_match_whole},

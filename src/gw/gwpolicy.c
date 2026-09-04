@@ -267,6 +267,7 @@ void atlas_gwpolicy_parse_buffer(const char *buf, size_t total, atlas_gwpolicy *
     bool have_enabled = false;
     bool enabled = false;
     bool addr_given = false;
+    bool anon_scopes_given = false;
 
     size_t i = 0;
     while (i < total) {
@@ -362,6 +363,40 @@ void atlas_gwpolicy_parse_buffer(const char *buf, size_t total, atlas_gwpolicy *
                 out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
                 return;
             }
+        } else if (take_value(line, len, "web_gui_anonymous_scopes", &val, &vlen)) {
+            /* A space-separated scope list, the same grammar an API key's
+             * `--scope` list renders as. Copied to a NUL-terminated buffer
+             * because `atlas_apikey_scopes_parse` takes a C string and this
+             * value never approaches the buffer's size in practice — the
+             * whole vocabulary rendered at once is under 90 bytes. */
+            char scopes_buf[256];
+            if (!copy_value(scopes_buf, sizeof scopes_buf, val, vlen)) {
+                out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
+                return;
+            }
+            atlas_scope_mask mask = 0u;
+            atlas_err serr;
+            atlas_err_init(&serr);
+            if (atlas_apikey_scopes_parse(scopes_buf, &mask, &serr) != ATLAS_OK) {
+                /* An unknown scope name. Fails closed the same way an unknown
+                 * top-level key does. */
+                out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
+                return;
+            }
+            for (size_t si = 0; si < ATLAS_SCOPE__COUNT; si++) {
+                if (atlas_scope_has(mask, (atlas_apikey_scope)si) &&
+                    !atlas_apikey_scope_grantable((atlas_apikey_scope)si)) {
+                    /* `memory:write` is the standing example: in the
+                     * vocabulary, and not grantable to any A9 credential.
+                     * Naming it here does not make it grantable — it makes
+                     * the policy malformed, exactly as it would at
+                     * `atlas api-key create`. */
+                    out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
+                    return;
+                }
+            }
+            out->web_gui_anonymous_scopes = mask;
+            anon_scopes_given = true;
         } else if (take_value(line, len, "trust_forwarded_for", &val, &vlen)) {
             if (!parse_bool(val, vlen, &out->trust_forwarded_for)) {
                 out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
@@ -436,6 +471,15 @@ void atlas_gwpolicy_parse_buffer(const char *buf, size_t total, atlas_gwpolicy *
          * everything. Refused: enabling the gateway is one decision and
          * exposing a surface is another, and a policy that made neither has
          * asked for a port to be open for no reason. */
+        out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
+        return;
+    }
+    if (anon_scopes_given && !out->web_gui) {
+        /* `/api/` is reachable whether or not `web_gui` is on — a bearer
+         * token reaches it either way — so this key would silently never take
+         * effect with the browser surface off. A documented bound that is not
+         * the implemented bound is worse than no bound: refused, not merely
+         * inert. */
         out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
         return;
     }

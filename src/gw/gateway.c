@@ -413,6 +413,86 @@ static const char *auth_detail(const principal *pr, char *buf, size_t n) {
     return buf;
 }
 
+/* --- the anonymous principal -------------------------------------------------
+ *
+ * This is not part of A9 as it shipped. An operator asked for it, and was told
+ * the cost in the same conversation: anyone who can reach the listener reads
+ * every scope named here with no credential at all, and on a cleartext LAN
+ * listener that means anyone on the network segment. They reaffirmed the
+ * decision on 2026-09-04. See `docs/remote-access.md` and `SECURITY.md` for the
+ * full statement; this is the mechanism.
+ *
+ * `web_gui_anonymous_scopes` (`atlas/gwpolicy.h`) is the only source of the
+ * scopes granted here — never a default this code chooses, and never `audit:read`
+ * in particular unless the operator wrote it down.
+ */
+
+/* A fixed, unmistakable audit identity for the policy-granted anonymous
+ * principal. Neither value is something somebody merely claimed — see
+ * `principal.key_id`'s own contract above — which is exactly why both must be
+ * fixed Atlas text rather than anything derived from the request.
+ *
+ * `key_id` can never collide with a real one: a real `key_id` is always
+ * exactly `ATLAS_APIKEY_SELECTOR_HEX` lowercase hex characters, and this
+ * string is a different length and contains characters ('n', 'o', 'u', 's')
+ * that are not hex digits.
+ *
+ * `label` can never collide with a real one either, and the leading space is
+ * the reason, not decoration: `atlas_apikey_label_valid` refuses a label that
+ * begins or ends with one, so no real key can ever be labelled this. A `%` was
+ * the first draft and was wrong — it is also excluded from a real label, but
+ * `gateway.audit`'s intake runs every label through `atlas_safe()` before
+ * storing it (`take_audit_text`, `src/ipc/server_gw.c`), which encodes `%`
+ * reversibly and would have made every anonymous row's `label` column read
+ * "%25anonymous%25" instead of naming what happened. A leading space needs no
+ * such encoding and reaches the audit trail exactly as written here — which is
+ * what "say plainly" requires or the mechanism is invisible in its
+ * own log. */
+#define GW_ANON_KEY_ID "anonymous"
+#define GW_ANON_LABEL " (anonymous)"
+
+/* True when this request may be resolved to the policy's anonymous principal:
+ * the web GUI is enabled, the policy names at least one such scope, and
+ * `session_get` already failed to find a *live* session for whatever cookie
+ * (if any) accompanied this request.
+ *
+ * The two credential kinds are treated differently on purpose, and the
+ * difference is the audit trail, not the wire format:
+ *
+ *   - A **bearer token** that does not authenticate is refused outright
+ *     (`req->authorization[0] != '\0'` disqualifies it here). `authenticate`
+ *     extracts its selector into `presented` before rejecting it, so a DENIED
+ *     row can say *which* credential was tried. Falling through to the
+ *     anonymous floor would spend that signal on a request that already
+ *     failed once — it is the daemon's answer that failed, not the absence of
+ *     an answer, and it stays refused.
+ *   - A **session cookie** that does not resolve — expired, forged, or simply
+ *     stale because a gateway restart forgot every in-memory session
+ *     (`gateway.c:573-577`, deliberately) — carries no selector `session_get`
+ *     could log; it authenticates to nothing and there is no rejected
+ *     credential's identity to lose by treating it as no cookie at all. That
+ *     is also the case this key exists to help: an operator's browser holding
+ *     a cookie from before the daemon's last restart must land on the
+ *     anonymous floor, not on a hard 401 that only a manual logout clears.
+ *
+ * A *live* session is never affected either way, because `session_get` is
+ * tried first at every call site below and this function is only reached once
+ * that has already failed. */
+static bool anonymous_ok(const atlas_gateway *g, const atlas_http_request *req) {
+    return g->policy.web_gui && g->policy.web_gui_anonymous_scopes != 0u &&
+           req->authorization[0] == '\0';
+}
+
+/* Fills `out` with the anonymous principal: authenticated, carrying exactly
+ * the scopes the policy named and no others. */
+static void anonymous_principal(const atlas_gateway *g, principal *out) {
+    memset(out, 0, sizeof(*out));
+    out->authenticated = true;
+    out->scopes = g->policy.web_gui_anonymous_scopes;
+    (void)snprintf(out->key_id, sizeof out->key_id, "%s", GW_ANON_KEY_ID);
+    (void)snprintf(out->label, sizeof out->label, "%s", GW_ANON_LABEL);
+}
+
 /* --- audit ----------------------------------------------------------------- */
 
 /* Records one request. Fire and forget in every sense: the daemon queues it
@@ -1358,12 +1438,22 @@ atlas_status atlas_gateway_serve_bytes(atlas_gateway *g, const char *request, si
         if (strcmp(req.path, "/auth/me") == 0 && strcmp(req.method, "GET") == 0) {
             principal pr;
             atlas_status st;
-            if (!session_get(req.session, &pr)) {
+            bool have_principal = session_get(req.session, &pr);
+            bool anon = false;
+            if (!have_principal && anonymous_ok(g, &req)) {
+                anonymous_principal(g, &pr);
+                have_principal = true;
+                anon = true;
+            }
+            if (!have_principal) {
                 st = respond_error(g, &req, 401, "unauthenticated", "no session", response, err);
             } else {
                 /* The scope list, so the page can hide what this principal
                  * cannot read. Hiding is courtesy; every route checks for
-                 * itself. */
+                 * itself. `anonymous` says plainly which kind of principal
+                 * this is: the page must not report a session that does not
+                 * exist, and must not report nobody when the policy has in
+                 * fact granted an anonymous floor. */
                 atlas_buf scopes = ATLAS_BUF_INIT;
                 atlas_err serr;
                 atlas_err_init(&serr);
@@ -1371,9 +1461,10 @@ atlas_status atlas_gateway_serve_bytes(atlas_gateway *g, const char *request, si
                 atlas_buf body = ATLAS_BUF_INIT;
                 atlas_err berr;
                 atlas_err_init(&berr);
-                (void)atlas_buf_appendf(&body, &berr,
-                                        "{\"ok\":true,\"label\":\"%s\",\"scopes\":\"%s\"}",
-                                        pr.label, atlas_buf_cstr(&scopes));
+                (void)atlas_buf_appendf(
+                    &body, &berr,
+                    "{\"ok\":true,\"anonymous\":%s,\"label\":\"%s\",\"scopes\":\"%s\"}",
+                    anon ? "true" : "false", pr.label, atlas_buf_cstr(&scopes));
                 st = respond(g, &req, 200, "application/json", body.data, body.len, NULL, response,
                              err);
                 atlas_buf_free(&body);
@@ -1413,6 +1504,15 @@ atlas_status atlas_gateway_serve_bytes(atlas_gateway *g, const char *request, si
          * engine does not know which was used. */
         if (!session_get(req.session, &pr)) {
             authenticate(g, &req, &pr);
+            /* Neither mechanism produced a live principal. A root-owned
+             * policy may name a third: a fixed, floor-only scope set. A
+             * bearer token that was presented and failed stays failed —
+             * `anonymous_ok` refuses that case, for the audit reason at its
+             * own definition. An unresolving session cookie (absent,
+             * expired, or forged) does not: see the same comment. */
+            if (!pr.authenticated && anonymous_ok(g, &req)) {
+                anonymous_principal(g, &pr);
+            }
         }
         atlas_status ast = ATLAS_OK;
         bool handled = api_handle(g, &req, &pr, started, response, &ast, err);

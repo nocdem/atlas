@@ -745,6 +745,237 @@ static void gui_request(atlas_gateway *g, const char *method, const char *path,
     atlas_buf_free(&req);
 }
 
+/* Like `gui_request`, but able to carry a bearer credential alongside — or
+ * instead of — a session cookie. Neither argument is ever both non-NULL in a
+ * real client, but the anonymous-floor tests need to construct exactly that
+ * shape on purpose: a presented, wrong credential and a request with none at
+ * all are different things, and only a helper that can build both proves it. */
+static void full_request(atlas_gateway *g, const char *method, const char *path, const char *auth,
+                         const char *cookie, const char *body, atlas_buf *resp) {
+    atlas_err err;
+    atlas_err_init(&err);
+    atlas_buf req = ATLAS_BUF_INIT;
+    size_t blen = body != NULL ? strlen(body) : 0;
+    T_OK(atlas_buf_appendf(&req, &err, "%s %s HTTP/1.1\r\nHost: t\r\n", method, path), &err);
+    if (auth != NULL) {
+        T_OK(atlas_buf_appendf(&req, &err, "Authorization: %s\r\n", auth), &err);
+    }
+    if (cookie != NULL && cookie[0] != '\0') {
+        T_OK(atlas_buf_appendf(&req, &err, "Cookie: atlas_session=%s\r\n", cookie), &err);
+    }
+    T_OK(atlas_buf_appendf(&req, &err,
+                           "Content-Type: application/json\r\nContent-Length: %zu\r\n\r\n",
+                           blen),
+         &err);
+    if (blen > 0) {
+        T_OK(atlas_buf_append(&req, body, blen, &err), &err);
+    }
+    T_OK(atlas_gateway_serve_bytes(g, req.data, req.len, resp, &err), &err);
+    atlas_buf_free(&req);
+}
+
+/* Opens a gateway with the web GUI on and a named anonymous floor, over the
+ * same fixture daemon. */
+static void gui_env_anon(env *e, const char *scopes, atlas_gateway **g) {
+    atlas_err err;
+    atlas_err_init(&err);
+    char text[512];
+    (void)snprintf(text, sizeof text,
+                   "enabled = yes\ngateway_uid = 1\nremote_mcp = yes\nweb_gui = yes\n"
+                   "web_gui_anonymous_scopes = %s\n",
+                   scopes);
+    atlas_gwpolicy p;
+    atlas_gwpolicy_parse_buffer(text, strlen(text), &p);
+    T_REQUIRE(p.state == ATLAS_GWPOLICY_ENABLED);
+    atlas_gateway_opts o;
+    memset(&o, 0, sizeof o);
+    o.socket_path = atlas_buf_cstr(&e->d.socket);
+    o.timeout_ms = 15000;
+    T_OK(atlas_gateway_open(&p, &o, g, &err), &err);
+}
+
+static void test_no_anonymous_scopes_named_means_no_change(void) {
+    /* `web_gui = yes` with no `web_gui_anonymous_scopes` key must behave
+     * exactly as before this change: a credential-less request to `/api/` or
+     * `/auth/me` is still 401. Absent is absent. */
+    env e;
+    const char *scopes[] = {"repo:read"};
+    env_open(&e, scopes, 1);
+    atlas_gateway *g = NULL;
+    gui_env(&e, &g);
+    atlas_buf resp = ATLAS_BUF_INIT;
+
+    full_request(g, "GET", "/api/v1/repos", NULL, NULL, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 401);
+    full_request(g, "GET", "/auth/me", NULL, NULL, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 401);
+    /* A stale or forged session cookie is exactly the input the anonymous-
+     * floor decision changed the handling of; with no floor configured it
+     * must still be 401, unchanged. */
+    full_request(g, "GET", "/api/v1/repos", NULL,
+                "0000000000000000000000000000000000000000000000000000000000000000", NULL, &resp);
+    T_EQ_INT(status_of(&resp), 401);
+
+    atlas_gateway_close(g);
+    atlas_buf_free(&resp);
+    env_close(&e);
+}
+
+static void test_the_anonymous_floor_grants_exactly_the_named_scopes(void) {
+    env e;
+    const char *scopes[] = {"repo:read", "decisions:read"};
+    env_open(&e, scopes, 2);
+    atlas_gateway *g = NULL;
+    gui_env_anon(&e, "repo:read", &g);
+    atlas_buf resp = ATLAS_BUF_INIT;
+
+    /* The served page actually reads the field the server now sends: a
+     * consumer that ignored `me.anonymous` would hide the login form on any
+     * 200 from /auth/me, forever trapping an anonymous viewer at the floor. */
+    gui_request(g, "GET", "/", NULL, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 200);
+    T_CHECK_MSG(strstr(body_of(&resp), "me.anonymous") != NULL,
+                "the page does not read the anonymous field /auth/me now sends");
+
+    /* No credential at all: the named scope works... */
+    full_request(g, "GET", "/api/v1/repos", NULL, NULL, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 200);
+    T_CHECK(strstr(body_of(&resp), "proj") != NULL);
+
+    /* ...and nothing beyond it: audit:read is never a default, whatever else
+     * is named, and decisions:read was not named even though the real key
+     * holds it. */
+    full_request(g, "GET", "/api/v1/audit", NULL, NULL, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 403);
+    full_request(g, "GET", "/api/v1/decisions?repo=proj", NULL, NULL, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 403);
+    T_CHECK(strstr(body_of(&resp), "decisions:read") != NULL);
+
+    /* /auth/me tells the truth: it is a real, named identity, not a pretence
+     * that nobody is there. */
+    full_request(g, "GET", "/auth/me", NULL, NULL, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 200);
+    T_CHECK_MSG(strstr(body_of(&resp), "\"anonymous\":true") != NULL,
+                "/auth/me did not report the anonymous floor: %s", body_of(&resp));
+    T_CHECK(strstr(body_of(&resp), " (anonymous)") != NULL);
+    T_CHECK_MSG(strstr(body_of(&resp), "\"scopes\":\"repo:read\"") != NULL,
+                "/auth/me did not report exactly the named scope: %s", body_of(&resp));
+
+    /* A wrong bearer token is not "no credential": it tried and failed, and it
+     * stays failed rather than sliding to the anonymous floor. */
+    full_request(g, "GET", "/api/v1/repos",
+                "Bearer atlas_0123456789abcdef_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                NULL, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 401);
+
+    /* A stale or forged session cookie authenticates to nothing and carries no
+     * identity to lose — it lands on the same floor as no cookie at all, which
+     * is what lets a browser holding a cookie from before a gateway restart
+     * keep working rather than being stuck at a hard 401 until it logs out by
+     * hand. */
+    full_request(g, "GET", "/api/v1/repos", NULL,
+                "0000000000000000000000000000000000000000000000000000000000000000", NULL, &resp);
+    T_EQ_INT(status_of(&resp), 200);
+    full_request(g, "GET", "/auth/me", NULL,
+                "0000000000000000000000000000000000000000000000000000000000000000", NULL, &resp);
+    T_EQ_INT(status_of(&resp), 200);
+    T_CHECK(strstr(body_of(&resp), "\"anonymous\":true") != NULL);
+
+    /* Naming an anonymous floor never removes the ability to authenticate for
+     * more, and a real session is never masked down to it. */
+    char body[512];
+    (void)snprintf(body, sizeof body, "{\"key\":\"%s\"}", e.token);
+    full_request(g, "POST", "/auth/login", NULL, NULL, body, &resp);
+    T_EQ_INT(status_of(&resp), 200);
+    char cookie[128];
+    cookie_of(&resp, cookie, sizeof cookie);
+    T_REQUIRE_MSG(cookie[0] != '\0', "login set no session cookie");
+
+    full_request(g, "GET", "/auth/me", NULL, cookie, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 200);
+    T_CHECK_MSG(strstr(body_of(&resp), "\"anonymous\":false") != NULL,
+                "a real session was reported as anonymous: %s", body_of(&resp));
+    T_CHECK(strstr(body_of(&resp), "chatgpt-test") != NULL);
+    /* The real key's own scopes, wider than the anonymous floor — the floor
+     * never overrides a session that exists. */
+    T_CHECK(strstr(body_of(&resp), "decisions:read") != NULL);
+    full_request(g, "GET", "/api/v1/decisions?repo=proj", NULL, cookie, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 200);
+
+    /* `/mcp` is untouched: no bearer is still refused, with or without the
+     * anonymous floor configured, and a cookie never reaches it at all. */
+    full_request(g, "POST", "/mcp", NULL, NULL,
+                "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}", &resp);
+    T_EQ_INT(status_of(&resp), 401);
+    full_request(g, "POST", "/mcp", NULL, cookie,
+                "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}", &resp);
+    T_EQ_INT(status_of(&resp), 401);
+    char auth[256];
+    bearer(&e, auth, sizeof auth);
+    full_request(g, "POST", "/mcp", auth, NULL,
+                "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}", &resp);
+    T_EQ_INT(status_of(&resp), 200);
+
+    atlas_gateway_close(g);
+    atlas_buf_free(&resp);
+    env_close(&e);
+}
+
+static atlas_status scan_anon_audit_row(const atlas_gw_audit_entry *e, void *ud, atlas_err *err) {
+    (void)err;
+    int *count = (int *)ud;
+    if (e->decision == ATLAS_GW_ALLOWED && strcmp(e->key_id, "anonymous") == 0 &&
+        strcmp(e->label, " (anonymous)") == 0) {
+        (*count)++;
+    }
+    return ATLAS_OK;
+}
+
+static void test_the_audit_trail_names_an_anonymous_request_plainly(void) {
+    env e;
+    const char *scopes[] = {"repo:read"};
+    env_open(&e, scopes, 1);
+    atlas_gateway *g = NULL;
+    gui_env_anon(&e, "repo:read", &g);
+    atlas_buf resp = ATLAS_BUF_INIT;
+
+    full_request(g, "GET", "/api/v1/repos", NULL, NULL, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 200);
+
+    atlas_err err;
+    atlas_err_init(&err);
+    atlas_buf db_path = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_appendf(&db_path, &err, "%s/atlas.db", fx_data_dir(&e.fx)), &err);
+
+    int seen = 0;
+    for (int attempt = 0; attempt < 200 && seen < 1; attempt++) {
+        seen = 0;
+        atlas_db *db = NULL;
+        atlas_err oerr;
+        atlas_err_init(&oerr);
+        if (atlas_db_open_readonly(atlas_buf_cstr(&db_path), &db, &oerr) == ATLAS_OK) {
+            int64_t count = 0;
+            bool more = false;
+            atlas_err lerr;
+            atlas_err_init(&lerr);
+            (void)atlas_db_gw_audit_list(db, 50, 0, "anonymous", scan_anon_audit_row, &seen, &count,
+                                         &more, &lerr);
+            atlas_db_close(db);
+        }
+        if (seen < 1) {
+            struct timespec ts = {0, 50 * 1000 * 1000};
+            (void)nanosleep(&ts, NULL);
+        }
+    }
+    T_CHECK_MSG(seen >= 1,
+                "no gw_audit row named the anonymous principal plainly (key_id=\"anonymous\")");
+
+    atlas_buf_free(&db_path);
+    atlas_buf_free(&resp);
+    atlas_gateway_close(g);
+    env_close(&e);
+}
+
 static void test_the_browser_exchanges_a_key_for_a_session(void) {
     env e;
     const char *scopes[] = {"repo:read"};
@@ -2012,6 +2243,12 @@ static const atlas_test TESTS[] = {
      test_the_api_forwards_only_what_a_route_declares},
     {"the browser exchanges a key for a session",
      test_the_browser_exchanges_a_key_for_a_session},
+    {"no anonymous scopes named means no change",
+     test_no_anonymous_scopes_named_means_no_change},
+    {"the anonymous floor grants exactly the named scopes",
+     test_the_anonymous_floor_grants_exactly_the_named_scopes},
+    {"the audit trail names an anonymous request plainly",
+     test_the_audit_trail_names_an_anonymous_request_plainly},
     {"the browser surface is absent when disabled",
      test_the_browser_surface_is_absent_when_disabled},
     {"the listener binds and serves", test_the_listener_binds_and_serves},

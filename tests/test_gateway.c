@@ -101,6 +101,18 @@ static void test_every_malformed_policy_disables_the_gateway(void) {
          "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\ntls_mode = LETSENCRYPT\n"},
         {"a listen address with a control byte",
          "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\nlisten_addr = 10.0.0.1\x01\n"},
+        {"web_gui_anonymous_scopes naming an unknown scope",
+         "enabled = yes\ngateway_uid = 1001\nweb_gui = yes\n"
+         "web_gui_anonymous_scopes = repo:read not_a_real_scope\n"},
+        {"web_gui_anonymous_scopes naming memory:write",
+         "enabled = yes\ngateway_uid = 1001\nweb_gui = yes\n"
+         "web_gui_anonymous_scopes = repo:read memory:write\n"},
+        {"web_gui_anonymous_scopes with web_gui = no",
+         "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\nweb_gui = no\n"
+         "web_gui_anonymous_scopes = repo:read\n"},
+        {"web_gui_anonymous_scopes with web_gui absent",
+         "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\n"
+         "web_gui_anonymous_scopes = repo:read\n"},
     };
 
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
@@ -112,6 +124,45 @@ static void test_every_malformed_policy_disables_the_gateway(void) {
          * for the fields it did manage to read. */
         T_CHECK_MSG(p.reason != ATLAS_GWPOLICY_REASON_ACTIVE, "%s reported ACTIVE", cases[i].name);
     }
+}
+
+static void test_web_gui_anonymous_scopes_is_absent_by_default(void) {
+    /* No key at all means today's behaviour exactly: a zero mask, which
+     * `anonymous_ok` in the gateway treats as "not configured". */
+    atlas_gwpolicy p;
+    parse_policy(GOOD, &p);
+    T_REQUIRE(p.state == ATLAS_GWPOLICY_ENABLED);
+    T_CHECK_MSG(p.web_gui_anonymous_scopes == 0u,
+                "an absent key produced a nonzero anonymous scope mask");
+}
+
+static void test_web_gui_anonymous_scopes_parses_exactly_what_was_named(void) {
+    atlas_gwpolicy p;
+    parse_policy("enabled = yes\ngateway_uid = 1001\nweb_gui = yes\n"
+                 "web_gui_anonymous_scopes = context:read repo:read decisions:read "
+                 "graph:read impact:read\n",
+                 &p);
+    T_REQUIRE_MSG(p.state == ATLAS_GWPOLICY_ENABLED, "a valid anonymous scope list was refused: %s",
+                  atlas_gwpolicy_reason_name(p.reason));
+    atlas_scope_mask want = ATLAS_SCOPE_BIT(ATLAS_SCOPE_CONTEXT_READ) |
+                            ATLAS_SCOPE_BIT(ATLAS_SCOPE_REPO_READ) |
+                            ATLAS_SCOPE_BIT(ATLAS_SCOPE_DECISIONS_READ) |
+                            ATLAS_SCOPE_BIT(ATLAS_SCOPE_GRAPH_READ) |
+                            ATLAS_SCOPE_BIT(ATLAS_SCOPE_IMPACT_READ);
+    T_CHECK_MSG(p.web_gui_anonymous_scopes == want,
+                "the parsed anonymous scope mask (0x%x) is not exactly what was named (0x%x)",
+                (unsigned)p.web_gui_anonymous_scopes, (unsigned)want);
+    /* audit:read is grantable and not named here, so it must not appear —
+     * this is not a default the code invents. */
+    T_CHECK(!atlas_scope_has(p.web_gui_anonymous_scopes, ATLAS_SCOPE_AUDIT_READ));
+
+    /* audit:read is grantable and MAY be named explicitly. */
+    atlas_gwpolicy p2;
+    parse_policy("enabled = yes\ngateway_uid = 1001\nweb_gui = yes\n"
+                 "web_gui_anonymous_scopes = audit:read\n",
+                 &p2);
+    T_REQUIRE(p2.state == ATLAS_GWPOLICY_ENABLED);
+    T_CHECK(atlas_scope_has(p2.web_gui_anonymous_scopes, ATLAS_SCOPE_AUDIT_READ));
 }
 
 static void test_a_policy_that_says_no_is_not_malformed(void) {
@@ -548,6 +599,10 @@ static const atlas_test TESTS[] = {
     {"a zeroed policy authorises nothing", test_a_zeroed_policy_authorises_nothing},
     {"every malformed policy disables the gateway",
      test_every_malformed_policy_disables_the_gateway},
+    {"web_gui_anonymous_scopes is absent by default",
+     test_web_gui_anonymous_scopes_is_absent_by_default},
+    {"web_gui_anonymous_scopes parses exactly what was named",
+     test_web_gui_anonymous_scopes_parses_exactly_what_was_named},
     {"a policy that says no is not malformed", test_a_policy_that_says_no_is_not_malformed},
     {"a wider bind needs a written TLS stance", test_a_wider_bind_needs_a_written_tls_stance},
     {"an origin must match whole", test_an_origin_must_match_whole},

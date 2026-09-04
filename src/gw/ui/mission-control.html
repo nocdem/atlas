@@ -1505,7 +1505,31 @@ async function start() {
   scopes = new Set((me.scopes || "").split(" ").filter(Boolean));
   $("login").hidden = true;
   $("app").hidden = false;
-  $("principal").textContent = (me.label || "?") + " · " + [...scopes].join(" ");
+  /* An anonymous principal is a real thing an operator's policy granted, not
+     an absence — say so rather than showing a label nobody chose. And it is a
+     floor, not a ceiling: the header button stays reachable so a viewer can
+     still authenticate for more, which is what "naming anonymous scopes adds
+     a floor; it does not remove the ability to authenticate for more" means
+     here. Signing out of a real session lands back on this same floor rather
+     than a hard wall, when the policy has one. */
+  const who = me.anonymous ? "anonymous" : (me.label || "?");
+  $("principal").textContent = who + " · " + [...scopes].join(" ");
+  const signout = $("signout");
+  if (me.anonymous) {
+    signout.textContent = "Sign in";
+    signout.onclick = () => showLogin();
+  } else {
+    signout.textContent = "Sign out";
+    signout.onclick = async () => {
+      try { await fetch("/auth/logout", {method: "POST", credentials: "same-origin"}); } catch (e) {}
+      /* Re-running start() rather than jumping straight to showLogin() is
+         what makes the comment above true: with an anonymous floor
+         configured, /auth/me answers 200 again right away and this lands back
+         on the floor; without one it answers 401 exactly as it always has,
+         and start() falls back to showLogin() itself. */
+      await start();
+    };
+  }
 
   buildNav();
   try { await loadRepos(); } catch (e) { /* the views report it individually */ }
@@ -1554,10 +1578,9 @@ $("signin").onclick = async () => {
 
 $("key").addEventListener("keydown", (e) => { if (e.key === "Enter") $("signin").click(); });
 
-$("signout").onclick = async () => {
-  try { await fetch("/auth/logout", {method: "POST", credentials: "same-origin"}); } catch (e) {}
-  showLogin();
-};
+/* `#signout`'s label and handler are set in `start()`, per principal: "Sign
+   out" and a real logout for an authenticated session, "Sign in" and a bare
+   `showLogin()` for the anonymous floor, which has no session to end. */
 
 window.addEventListener("hashchange", () => {
   if (!$("app").hidden) show(location.hash.slice(1) || "overview");

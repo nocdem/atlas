@@ -60,6 +60,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+#include "atlas/apikey.h"
+
 /* Compiled-in, absolute, with no environment override and no flag — the rule
  * every other Atlas policy path follows. A caller that can choose the policy has
  * written the policy. */
@@ -152,6 +154,44 @@ typedef struct atlas_gwpolicy {
      * decision and exposing a particular surface on it is another. */
     bool remote_mcp;
     bool web_gui;
+
+    /* Scopes granted to a request against `/api/` that presents no *live*
+     * principal, when `web_gui = yes`: no bearer token at all, and either no
+     * session cookie or one that does not resolve to a live session (expired,
+     * forged, or simply stale because a gateway restart forgot every
+     * in-memory session — `gateway.c:573-577`, deliberately). A bearer token
+     * that *was* presented and failed authentication is not covered by this —
+     * it stays refused, because it carries a selector the audit trail can
+     * name, and falling through would spend that signal on a request that
+     * already failed once. See `anonymous_ok` in `gateway.c` for the full
+     * reasoning and the case this key exists to help: a browser holding a
+     * cookie from before the gateway's last restart lands on this floor
+     * instead of a hard 401 that only a manual logout clears.
+     *
+     * This is a deliberate, operator-chosen widening of the threat model: it
+     * makes every read those scopes cover available to anyone who can reach
+     * the listener, with no credential at all. Zero — the default, and what a
+     * policy naming no key at all produces — is today's behaviour exactly:
+     * `/api/` still answers 401 to a request with no live principal. A
+     * session or a bearer token that *does* authenticate is never masked down
+     * to this: the mask only ever fills a gap where there was no principal,
+     * never narrows one that exists.
+     *
+     * Every bit must satisfy `atlas_apikey_scope_grantable` — `memory:write`
+     * is the standing example of a scope that does not, and an operator
+     * cannot make it grantable by naming it here, any more than
+     * `atlas api-key create` can. An unrecognised or ungrantable name makes
+     * the whole policy MALFORMED, P0's rule: out of range is malformed, never
+     * clamped.
+     *
+     * Naming this key while `web_gui = no` is MALFORMED too, not merely
+     * inert: `/api/` is reachable independently of `web_gui` (a bearer token
+     * reaches it whether or not the browser surface is on), so a key that
+     * silently did nothing there would be exactly the shape P0's rule warns
+     * about — a documented behaviour that is not the implemented one. Refusing
+     * it means a policy an operator can still read back is one whose written
+     * behaviour and actual behaviour agree. */
+    atlas_scope_mask web_gui_anonymous_scopes;
 
     /* Ceilings. Each may only lower the compiled-in absolute bound in
      * `atlas/limits.h`, never raise it — A8's rule, so the policy decides how

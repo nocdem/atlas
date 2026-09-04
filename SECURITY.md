@@ -517,6 +517,39 @@ maps to, so no remote caller can record a reason, a decision or a proposal.
 Remote credential administration does not exist — it is absent rather than
 refused.
 
+**Anonymous browser reads — not part of A9 as it shipped, and a deliberate
+change to the threat model above.** A root-owned policy may set
+`web_gui_anonymous_scopes` — meaningful only with `web_gui = yes`; naming it
+with `web_gui = no`, or absent, is MALFORMED and disables the gateway, not a
+silent no-op. Absent (with `web_gui = yes`) — the default, and what every
+deployment before this key existed had — nothing above changes: `/api/` still
+refuses a request that carries no bearer token and no session cookie
+resolving to a live session. Named, such a request is granted exactly those
+scopes with no credential at all, `audit:read` included only if the operator
+wrote it there themselves; a session or bearer credential that authenticates
+is never masked down to this floor. A bearer token that was presented and
+failed stays refused regardless — it carries a selector the audit trail can
+name, and only a request with no live principal reaches the floor; a session
+cookie that fails to resolve (expired, forged, or left over from before a
+gateway restart, since sessions live only in memory) carries no such signal
+and does reach it, which is the specific case this key exists to help.
+
+The chain: a specific deployment serves Mission Control from a cleartext LAN
+listener (`tls_mode = NONE`, no origin restricted) and sessions live only in
+gateway memory (deliberately — see "A browser session" above), so a gateway
+restart forced re-entering an API key to see the page again; the operator was
+told **anyone who can reach that listener would then read every scope named
+here with no credential at all, and on a cleartext LAN listener that means
+anyone on the network segment**, and that the audit trail would record that an
+anonymous read happened without recording who made it — `gw_audit.key_id`
+becomes the fixed value `"anonymous"` rather than a credential's selector, on
+that row and no other; and reaffirmed the decision on **2026-09-04**, for that
+machine and that network, having heard the cost. Atlas states this cost; it
+does not recommend the setting, and the same key on a listener reachable from
+an untrusted network is a materially different decision using the same
+mechanism. Full statement: `docs/remote-access.md`, "Anonymous browser reads,
+stated honestly".
+
 ## Reporting a vulnerability
 
 Atlas has no public distribution or security contact yet. Until it does, report

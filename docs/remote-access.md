@@ -419,6 +419,13 @@ tls_mode = REVERSE_PROXY
 remote_mcp = yes
 web_gui = no
 
+# DELIBERATELY NOT A DEFAULT. Absent, /api/ still refuses a request carrying
+# neither a session cookie nor a bearer token, exactly as it always has. Named,
+# every such request is granted exactly these scopes with no credential at
+# all. Read "Anonymous browser reads, stated honestly" below before setting
+# this on anything reachable beyond loopback.
+# web_gui_anonymous_scopes = context:read repo:read decisions:read graph:read impact:read
+
 # Exact origins, whole-string. `*` is refused.
 allowed_origin = https://atlas.example.com
 
@@ -444,6 +451,79 @@ and is not is worse than one nobody believed in.
 
 `trust_forwarded_for` is off by default because believing a header an attacker
 can vary would make the limit unenforceable while continuing to look enforced.
+
+### Anonymous browser reads, stated honestly
+
+**This is not part of A9 as it shipped, and it deliberately moves the threat
+model A9 built** — the one sentence at the top of this document, "authenticates
+a bearer credential," is no longer true of every `/api/` request once this key
+is set. It exists because an operator asked for it on a specific, named
+deployment: Mission Control is served from a cleartext LAN listener
+(`tls_mode = NONE`) with no browser origin restricted, and every `/api/` read
+needed a session cookie obtained by posting an API key to `/auth/login` —
+sessions live in gateway memory (`gateway.c:573-577`) and a restart forgets
+them on purpose, so a repeated gateway restart meant repeatedly re-pasting a
+key just to look at the page. The operator was told the cost before asking for
+this — reproduced in full below — and reaffirmed the decision on **2026-09-04**.
+
+**The mechanism.** `web_gui_anonymous_scopes` is a root-owned policy key, read
+only when `web_gui = yes` — naming it with `web_gui = no`, or absent, is itself
+**MALFORMED** and disables the gateway with a reason, on the same principle as
+every other key here that could not take effect: a documented behaviour that
+is not the implemented one is worse than no key at all. Absent (with
+`web_gui = yes`), nothing changes: a request to `/api/` or `/auth/me` with no
+bearer token, and with no session cookie that resolves to a live session, is
+still refused with 401, exactly as before this key existed. Named, such a
+request is granted exactly the scopes listed — never more, never a scope the
+operator did not write down, and never `audit:read` by default: naming it is
+the only way to get it, because a reader who can see the audit trail is a
+capability wider than "read the project," and Atlas will not decide that for
+an operator who did not ask. A session or bearer credential that *does*
+authenticate is never masked down to this floor; the floor only ever fills the
+gap left by a request with no live principal.
+
+A wrong bearer token is treated differently from a stale session cookie, on
+purpose. A bearer token that was presented and failed authentication stays
+refused — it carries a selector the daemon's own DENIED row can name, and
+sliding it to the anonymous floor would spend that audit signal on a request
+that already failed once. A session cookie that does not resolve — expired,
+forged, or simply left over from before the gateway's last restart, since
+sessions live only in memory and a restart forgets every one of them — carries
+no such signal to lose, and is exactly the case this key exists to help: an
+operator's browser holding a pre-restart cookie lands on the anonymous floor
+instead of a hard 401 that only a manual logout clears.
+
+**The cost, stated in full, exactly as it was stated to the operator before
+they decided.** Setting this key means:
+
+1. **Anyone who can reach the listener** — on this deployment,
+   `192.168.0.198:8799`, `tls_mode = NONE`, no origin restricted — **reads
+   every scope named here with no credential at all.** On a cleartext LAN
+   listener, "anyone who can reach the listener" means anyone on the network
+   segment: every decision, every claim, repository file contents and the
+   whole structural and semantic graph that the named scopes cover, to any
+   device on that network, unauthenticated.
+2. **The audit trail stops saying who.** A `gw_audit` row for an anonymous
+   read carries the fixed identity `key_id = "anonymous"` (see `gateway.c`'s
+   `GW_ANON_KEY_ID`) rather than a credential's selector, because there is no
+   credential to name. The trail still says a read happened, on which route,
+   and when — it no longer says which person or process made it, because
+   nothing this deployment can observe distinguishes one anonymous reader from
+   another.
+3. **This is a decision about a machine and a network, not a code change
+   Atlas is recommending.** Atlas states the cost; it does not judge the
+   trade. An operator who controls both the listener's address and everything
+   on its network segment may reasonably decide the convenience is worth it on
+   that specific machine — that is exactly the decision made here, on
+   2026-09-04, after the cost above was read in full — and the same setting on
+   a listener reachable from an untrusted network is a different decision with
+   the same mechanism and a much worse outcome.
+
+Mission Control's Audit view (`/api/v1/audit`, `ATLAS_SCOPE_AUDIT_READ`) will
+answer 403 to an anonymous reader unless `audit:read` is named explicitly. That
+is the honest consequence of the paragraph above, not a defect: an anonymous
+reader who cannot be distinguished from any other anonymous reader is not a
+reader Atlas will show the audit trail to by default.
 
 ## Security controls
 

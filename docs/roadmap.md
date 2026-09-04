@@ -1475,7 +1475,7 @@ pilot runs: this project's own rule that no evidence of a result is not
 evidence against one applies to its own acceptance, and this document does
 not pre-write the shape of a finding nobody has measured yet.
 
-## Later: A16 — approving a record from the browser
+## In flight: A16 — approving a record from the browser
 
 The sentence it exists for is
 
@@ -1502,17 +1502,44 @@ be disposed of remotely. `LOCAL_OPERATOR_CONFIRMED` is never reused: reusing it
 would make every audit row ever written retrospectively ambiguous, which is the
 one cost that cannot be paid back.
 
-**Not started, deliberately.** The operator's judgement on 2026-09-04 was that
-it is not urgent. What blocks nothing and waits for them: the plan's TLS
-requirement, which they declined for their own network — recorded with its chain
-in `SECURITY.md` under "Approving a record from the browser: refused today, and
-why", and to be carried into the season as an explicit, root-owned acceptance
-key that `atlas gateway status` prints, rather than as a check quietly absent.
+**In flight since 2026-09-04.** The operator first judged it not urgent and then,
+the same day, said to build it. Three of its ten tasks are done: the vocabularies
+and the ungrantable scope, migration 31 widening the ledger's actor CHECK, and the
+write point itself — which now derives the actor from the stored challenge rather
+than from anything a caller supplies, verifies the credential inside the
+transaction that spends the capability, and refuses a capability minted through
+one channel and offered through the other.
 
-Until it is built the deployment's statement is unchanged: nothing reachable
+The TLS requirement the plan made hard was **declined by the operator for their
+own network** on 2026-09-04, with its chain recorded in `SECURITY.md` under
+"Approving a record from the browser: refused today, and why". It does not vanish:
+it becomes an explicit, root-owned acceptance key that `atlas gateway status`
+prints, so a reader finds a decision a person made rather than a check quietly
+absent.
+
+Until the season lands, the deployment's statement is unchanged: nothing reachable
 over the network can change a lifecycle state.
 
-## Later: A14 — a job an operator submits from wherever they are
+## Next: A14 — a job an operator submits from wherever they are
+
+**Never started. Retitled `Next` on 2026-09-04 at the operator's instruction**, after
+they asked whether the external model could yet submit work and were told no. Nothing
+in this section has been built: `git log` finds exactly one commit mentioning A14, the
+one that wrote this section. It was labelled `Next` when A12.1 closed, became `Later`
+when the operator put the review surface first, and is `Next` again now — a history
+worth keeping visible, because a section that has said `Next` twice without a line of
+code is the kind of thing a reader mistakes for shipped work.
+
+**What A16 leaves it, and what it does not.** A16 builds the first HTTP path on this
+gateway that writes, and the first daemon method group offered to the gateway uid — so
+the shapes A14 needs exist afterwards rather than having to be invented. What it does
+**not** leave is the authority: submitting work is a different capability from disposing
+of a record, it needs its own ungrantable scope and its own root-owned line naming the
+credential, and A16's disposal scope must never be widened to cover it. The rule that
+makes both safe is the same one and is unchanged: the gateway holds no authority because
+of the uid it runs as, and the daemon asks the kernel who is calling rather than believing
+what a caller says about itself.
+
 
 The sentence it exists for is
 

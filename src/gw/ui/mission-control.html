@@ -132,6 +132,25 @@ code{background:rgba(127,127,127,.12);padding:0 4px;border-radius:2px}
     </div>
   </section>
 
+  <!-- A15 T7. The review surface: every revision, every claim, the gate
+       assessment and the impact set for one knowledge record, read in full
+       before anyone decides anything about it. The review sheet is a plain
+       queue held in this browser; it stores no authority anywhere, and
+       disposing of a record still happens only through `atlas review apply`
+       on a real terminal on the Atlas machine. -->
+  <section id="v-review" hidden>
+    <div class="row">
+      <label>repository <select id="w-pick"></select></label>
+      <label>status <select id="w-status">
+        <option selected>PROPOSED</option><option>APPROVED</option></select></label>
+    </div>
+    <div class="grid" style="grid-template-columns:minmax(280px,0.8fr) minmax(380px,1.7fr) minmax(300px,1fr)">
+      <div class="panel"><h2>Records</h2><div id="w-list"></div></div>
+      <div class="panel"><h2>Detail</h2><div id="w-detail"><p class="empty">Select a record.</p></div></div>
+      <div class="panel"><h2>Review sheet</h2><div id="w-sheet"></div></div>
+    </div>
+  </section>
+
   <!-- A9.2.1. The third axis gets its own view for the reason the kind got its
        own column: verification state is independent of both kind and lifecycle
        status, and a reader must be able to see all three without one implying
@@ -192,15 +211,29 @@ code{background:rgba(127,127,127,.12);padding:0 4px;border-radius:2px}
 /* No framework and no build step. Atlas' rules forbid Node in the build, the
    tests and the runtime, so this is hand-written and served from the binary.
 
-   Every value Atlas returns is inserted with textContent, never innerHTML. The
-   daemon safe-encodes repository prose, but that makes it terminal-safe and
+   Every value Atlas returns is inserted as text via `textContent`; nothing is
+   ever assigned to an element's markup-parsing property. The daemon
+   safe-encodes repository prose, but that makes it terminal-safe and
    JSON-safe rather than inert in a DOM, so the escaping happens here too. */
 
 const VIEWS = [
   ["overview","Overview"],["repository","Repository"],["decisions","Knowledge"],
+  ["review","Review"],
   ["verification","Verification"],
   ["graph","Graph"],["search","Search"],["impact","Impact"],["audit","Audit"],
 ];
+
+/* A15 T7. The most links from one revision the Impact panel will walk. A
+   page-side bound, not an Atlas one: it protects the browser from queuing an
+   unbounded number of `code/impact` requests for one record, nothing more. */
+const REVIEW_UI_MAX_IMPACT_LINKS = 8;
+
+/* The review sheet's one storage key. A queue held here stores no authority:
+   disposing of a record still happens only through `atlas review apply` on a
+   real terminal on the Atlas machine. */
+const REVIEW_SHEET_KEY = "atlas.review.sheet.v1";
+const RE_REVIEW_DECISION = /^atlas-dec-[0-9a-f]{32}$/;
+const RE_REVIEW_PREFIX = /^[0-9a-f]{8}$/;
 let scopes = new Set();
 let repos = [];
 
@@ -325,7 +358,7 @@ function kindTag(s) {
 async function loadRepos() {
   const r = await api("repos");
   repos = (r.repositories || []).map((x) => x.repo || x.name).filter(Boolean);
-  for (const id of ["r-pick","d-pick","v-pick","g-pick","s-pick","i-pick"]) {
+  for (const id of ["r-pick","d-pick","w-pick","v-pick","g-pick","s-pick","i-pick"]) {
     const sel = $(id);
     if (!sel) continue;
     const keep = sel.value;
@@ -378,13 +411,23 @@ async function viewOverview() {
         for (const x of (d.decisions || [])) all.push(Object.assign({repo: name}, x));
       } catch (e) { /* one repository failing must not empty the panel */ }
     }
-    return table([
+    const box = el("div");
+    box.appendChild(table([
       {label: "repo", get: (x) => x.repo},
       {label: "id", get: (x) => x.decision},
       {label: "kind", get: (x) => kindTag(x.kind)},
       {label: "title", wrap: true, get: (x) => el("span", {class: "untrusted", text: x.title || "—"})},
       {label: "status", get: (x) => statusTag(x.status)},
-    ], all, {empty: "nothing is waiting"});
+    ], all, {empty: "nothing is waiting"}));
+    /* A15 T7. A record is read in full, and disposed of, in the Review view —
+       this panel only ever lists what is waiting. */
+    const p = el("p");
+    const link = document.createElement("a");
+    link.href = "#review";
+    link.textContent = "Open in Review";
+    p.appendChild(link);
+    box.appendChild(p);
+    return box;
   });
 
   panel($("o-events"), async () => {
@@ -550,9 +593,13 @@ async function viewDecisions() {
   });
 }
 
-async function showDecision(repo, uid) {
-  panel($("d-detail"), async () => {
-    const got = await api("decision", {repo: repo, decision: uid});
+/* A15 T7. `node` and `revision` are additive: every existing caller passes
+   neither, gets `$("d-detail")` and the document's effective revision exactly
+   as before, and the Review view's revision history table reuses this same
+   function to render one named revision into its own detail node. */
+async function showDecision(repo, uid, node, revision) {
+  panel(node || $("d-detail"), async () => {
+    const got = await api("decision", {repo: repo, decision: uid, revision: revision});
     const d = got.document || {};
     const rev = got.revision || {};
     const box = el("div");
@@ -586,6 +633,373 @@ async function showDecision(repo, uid) {
     }
     box.appendChild(el("p", {class: "dim", text: "Decision prose is UNTRUSTED_DATA: it is repository text, shown as text."}));
     return box;
+  });
+}
+
+/* A15 T7. The review surface: the place a knowledge record is read in full
+ * before anyone decides anything about it.
+ *
+ * `reviewIntentsAllowed` is this page's mirror of `atlas_review_intent_allowed`
+ * (`src/core/review.c`) intersected with the one place `atlas_decision_kind_
+ * resolvable` (`src/decision/decision.c`) matters to a queue button: APPROVED
+ * -> RESOLVED exists only for a kind whose approved form makes a demand
+ * (OBLIGATION, ACCEPTED_RISK). The C predicate is the authority; this is
+ * courtesy, exactly as `/auth/me`'s scope list is (`gateway.c:1339-1341`) —
+ * queuing writes nothing, so a wrong answer here costs nothing but a MOVED or
+ * DISPOSED verdict later, at `atlas review apply`'s own, authoritative check. */
+function reviewIntentsAllowed(status, kind) {
+  const out = [];
+  if (status === "PROPOSED") { out.push("approve", "reject"); }
+  if (status === "APPROVED" && (kind === "OBLIGATION" || kind === "ACCEPTED_RISK")) {
+    out.push("resolve");
+  }
+  return out;
+}
+
+/* --- the review sheet -------------------------------------------------------
+ *
+ * A queue of `{intent, repo, decision, revision, prefix}` objects in this
+ * browser's `localStorage`, under one fixed key. It stores no authority: the
+ * only thing that ever disposes of a record is `atlas review apply`, reading
+ * a sheet file an operator saved and typing a confirmation on a real
+ * terminal. Every read and write is wrapped, because `localStorage` can throw
+ * (a private window, blocked site data), and a throwing store must read as an
+ * empty queue plus a stated reason, never as a silent one. */
+
+function reviewQueueLoad() {
+  try {
+    const raw = localStorage.getItem(REVIEW_SHEET_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (e) {
+    return null;
+  }
+}
+
+function reviewQueueSave(q) {
+  try {
+    localStorage.setItem(REVIEW_SHEET_KEY, JSON.stringify(q));
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+async function reviewQueueAdd(entry) {
+  const q = reviewQueueLoad() || [];
+  q.push(entry);
+  reviewQueueSave(q);
+  await renderReviewSheet();
+}
+
+async function reviewQueueRemove(index) {
+  const q = reviewQueueLoad() || [];
+  q.splice(index, 1);
+  reviewQueueSave(q);
+  await renderReviewSheet();
+}
+
+/* The status an entry's intent needs the record to still be in. Mirrors the
+ * per-entry DISPOSED verdict `docs/plans/2026-09-03-review-surface.md`'s
+ * §Frozen formats gives the walker: "the record's status is no longer the one
+ * the intent needs." */
+function reviewRequiredStatus(intent) {
+  return intent === "resolve" ? "APPROVED" : "PROPOSED";
+}
+
+/* Builds the sheet text in the frozen grammar, validating every field rather
+ * than encoding it (A2's renderer rule) -- a value that fails its pattern is
+ * left out of the sheet entirely, never sanitised into it. `repos` is the
+ * page's own loaded list, never a name read out of a queued entry's own
+ * bytes. */
+function reviewSheetText(queue) {
+  const lines = ["atlas-review-sheet/1"];
+  let dropped = 0;
+  for (const e of queue) {
+    const okIntent = e.intent === "approve" || e.intent === "reject" || e.intent === "resolve";
+    const okRepo = typeof e.repo === "string" && repos.includes(e.repo);
+    const okDecision = typeof e.decision === "string" && RE_REVIEW_DECISION.test(e.decision);
+    const okRevision = Number.isInteger(e.revision) && e.revision > 0;
+    const okPrefix = typeof e.prefix === "string" && RE_REVIEW_PREFIX.test(e.prefix);
+    if (!(okIntent && okRepo && okDecision && okRevision && okPrefix)) {
+      dropped++;
+      continue;
+    }
+    lines.push(e.intent + " " + e.repo + " " + e.decision + " r" + e.revision + " " + e.prefix);
+  }
+  return {text: lines.join("\n") + "\n", dropped: dropped};
+}
+
+async function renderReviewSheet() {
+  const node = $("w-sheet");
+  if (!node) return;
+  clear(node);
+  let queue = reviewQueueLoad();
+  if (queue === null) {
+    node.appendChild(el("p", {class: "err",
+      text: "the browser kept nothing: local storage is not available here"}));
+    queue = [];
+  }
+  if (queue.length === 0) {
+    node.appendChild(el("p", {class: "empty", text: "the sheet is empty"}));
+  } else {
+    const rows = await Promise.all(queue.map(async (entry, index) => {
+      let state = "current";
+      let detail = "";
+      try {
+        const got = await api("decision",
+          {repo: entry.repo, decision: entry.decision, revision: entry.revision});
+        const doc = got.document || {};
+        const rev = got.revision || {};
+        const required = reviewRequiredStatus(entry.intent);
+        if (doc.status !== required) {
+          state = "disposed";
+          detail = "the record is " + doc.status + "; " + entry.intent + " needs " + required;
+        } else if (doc.latest_revision !== entry.revision ||
+                  (rev.content_hash || "").slice(0, 8) !== entry.prefix) {
+          state = "moved";
+          detail = "now r" + doc.latest_revision;
+        }
+      } catch (e) {
+        state = "unknown";
+        detail = String((e && e.message) || e);
+      }
+      return {index: index, entry: entry, state: state, detail: detail};
+    }));
+    node.appendChild(table([
+      {label: "intent", get: (r) => r.entry.intent},
+      {label: "repo", get: (r) => r.entry.repo},
+      {label: "decision", wrap: true, get: (r) => r.entry.decision},
+      {label: "rev", get: (r) => "r" + r.entry.revision},
+      {label: "state", get: (r) => tag(r.state,
+        {current: "ok", moved: "warn", disposed: "bad"}[r.state] || "unknown")},
+      {label: "detail", wrap: true, get: (r) => r.detail || "—"},
+      {label: "", get: (r) => {
+        const b = el("button", {class: "go", text: "Remove"});
+        b.onclick = () => { reviewQueueRemove(r.index); };
+        return b;
+      }},
+    ], rows));
+  }
+
+  const built = reviewSheetText(queue);
+  const ta = document.createElement("textarea");
+  ta.readOnly = true;
+  ta.rows = Math.min(20, Math.max(4, queue.length + 2));
+  ta.style.width = "100%";
+  ta.value = built.text;
+  node.appendChild(ta);
+  if (built.dropped > 0) {
+    node.appendChild(el("p", {class: "err",
+      text: built.dropped + " queued entr" + (built.dropped === 1 ? "y" : "ies") +
+            " could not be written into the sheet and " +
+            (built.dropped === 1 ? "was" : "were") + " left out of it."}));
+  }
+
+  const btnRow = el("div", {class: "row"});
+  const copyBtn = el("button", {class: "go", text: "Copy"});
+  copyBtn.onclick = async () => {
+    try {
+      await navigator.clipboard.writeText(ta.value);
+    } catch (e) {
+      ta.focus();
+      ta.select();
+    }
+  };
+  const clearBtn = el("button", {class: "go", text: "Clear"});
+  clearBtn.onclick = async () => { reviewQueueSave([]); await renderReviewSheet(); };
+  btnRow.appendChild(copyBtn);
+  btnRow.appendChild(clearBtn);
+  node.appendChild(btnRow);
+
+  /* The Review view's first fixed sentence, verbatim
+     (docs/plans/2026-09-03-review-surface.md, §Frozen formats). */
+  node.appendChild(el("p", {class: "dim", text:
+    "Queuing a record here stores no authority anywhere. To dispose of these records, save " +
+    "this sheet as a file on the Atlas machine and run atlas review apply FILE in a terminal " +
+    "there. Atlas records each disposal as LOCAL_OPERATOR_CONFIRMED, which " +
+    "names the channel, not a person."}));
+}
+
+/* The Detail column for one selected record: five sections, composed in
+ * order, each its own heading and its own `panel()` call so one section's
+ * failure -- a PROPOSED record's `gate` 404, say -- never blanks the rest. */
+function showReviewDetail(repo, row) {
+  const root = $("w-detail");
+  clear(root);
+  const uid = row.decision;
+
+  const section = (title) => {
+    root.appendChild(el("h3", {text: title}));
+    const box = el("div");
+    root.appendChild(box);
+    return box;
+  };
+
+  /* 1. decision/history: revisions, timeline, ledger agreement. Clicking a
+     revision renders its prose and links into its own node below, through
+     the same `showDecision` the Knowledge view uses. */
+  const historyBox = section("Revision history");
+  const proseBox = section("Revision detail");
+  say(proseBox, "Select a revision above to read it.", "empty");
+  panel(historyBox, async () => {
+    const h = await api("decision/history", {repo: repo, decision: uid});
+    const box = el("div");
+    box.appendChild(table([
+      {label: "number", get: (x) => x.number},
+      {label: "state", get: (x) => statusTag(x.state)},
+      {label: "created", get: (x) => x.created_at},
+      {label: "proposed by", get: (x) => x.proposed_by},
+      {label: "content hash", get: (x) => (x.content_hash || "").slice(0, 12)},
+      {label: "title", wrap: true, get: (x) => el("span", {class: "untrusted", text: x.title || "—"})},
+    ], h.revisions, {empty: "no revisions",
+                     onclick: (x) => showDecision(repo, uid, proseBox, x.number)}));
+    box.appendChild(el("h4", {text: "Timeline"}));
+    box.appendChild(table([
+      {label: "event", get: (x) => x.event},
+      {label: "actor", wrap: true, get: (x) => el("span", {class: "untrusted", text: x.actor || "—"})},
+      {label: "revision", get: (x) => x.revision},
+      {label: "operator channel", get: (x) => tag(x.operator_channel ? "yes" : "no",
+                                                   x.operator_channel ? "ok" : "")},
+      {label: "superseded by", get: (x) => x.superseded_by || "—"},
+    ], h.timeline, {empty: "no timeline events"}));
+    /* The ledger is canonical; the status columns are a cache of it. Reported
+       here, never repaired. */
+    box.appendChild(kv([
+      ["ledger agrees", h.ledger_agrees ? tag("ok", "ok") : tag("bad", "bad")],
+      ["ledger detail", h.ledger_agrees ? undefined : h.ledger_detail],
+    ]));
+    return box;
+  });
+
+  /* 2. verify/claims: the claims bearing on this record. A claim's own
+     conflict, if it is IMPLEMENTATION, is labelled by `showClaim` itself. */
+  const claimsBox = section("Claims");
+  const claimDetailBox = section("Claim detail");
+  say(claimDetailBox, "Select a claim above to read it.", "empty");
+  panel(claimsBox, async () => {
+    const d = await api("verify/claims", {repo: repo, decision: uid, limit: 200});
+    return table([
+      {label: "claim", get: (x) => (x.claim || "").slice(0, 22)},
+      {label: "state", get: (x) => verifyTag(x.state)},
+      {label: "truth", get: (x) => truthTag(x.truth)},
+      {label: "basis", get: (x) => tag(x.basis || "—")},
+      {label: "text", wrap: true, get: (x) => el("span", {class: "untrusted", text: x.text || "—"})},
+      {label: "conflict", get: (x) => x.conflict && x.conflict !== "NONE"
+        ? tag(x.conflict, x.conflict === "IMPLEMENTATION" ? "warn" : "") : "—"},
+    ], d.claims, {empty: "no claims recorded for this record",
+                 onclick: (x) => showClaim(x.claim, claimDetailBox)});
+  });
+
+  /* 3. gate: only meaningful for an APPROVED record, but asked regardless and
+     rendered without invention -- a non-APPROVED uid's 404 ("no approved
+     decision ... is attached to this repository") is exactly what T2's test
+     established, and `panel()`'s own catch renders it verbatim. It cannot be
+     told apart from REJECTED, SUPERSEDED, RESOLVED or a uid that never
+     existed, and this reads that message rather than inventing one that
+     claims otherwise. */
+  const gateBox = section("Gate");
+  panel(gateBox, async () => {
+    const g = await api("gate", {repo: repo, decision: uid});
+    const box = el("div");
+    box.appendChild(kv([
+      ["result", statusTag(g.result)],
+      ["indexed commit", g.indexed_commit],
+    ]));
+    const d0 = g.decisions && g.decisions[0];
+    if (d0) {
+      box.appendChild(kv([
+        ["freshness", statusTag(d0.freshness)],
+        ["validated at commit", d0.validated_at_commit],
+        ["content hash", (d0.content_hash || "").slice(0, 12)],
+      ]));
+    }
+    return box;
+  });
+
+  /* 4. Impact: the first REVIEW_UI_MAX_IMPACT_LINKS path/symbol links of the
+     newest revision, one `code/impact` walk each, rendered exactly as the
+     Impact view renders one. */
+  const impactBox = section("Impact");
+  panel(impactBox, async () => {
+    const got = await api("decision", {repo: repo, decision: uid, revision: row.latest_revision});
+    const links = (got.revision && got.revision.links) || [];
+    const candidates = links.filter((l) => l.kind === "path" || l.kind === "symbol");
+    const take = candidates.slice(0, REVIEW_UI_MAX_IMPACT_LINKS);
+    const box = el("div");
+    if (take.length === 0) {
+      box.appendChild(el("p", {class: "empty", text: "no path or symbol links on the newest revision"}));
+      return box;
+    }
+    for (const l of take) {
+      box.appendChild(el("h4", {text: (l.kind === "path" ? "path: " : "symbol: ") +
+                                       (l.path || l.symbol || "")}));
+      try {
+        const r = await api("code/impact", {repo: repo,
+          path: l.kind === "path" ? l.path : undefined,
+          symbol: l.kind === "symbol" ? l.symbol : undefined, depth: 2});
+        box.appendChild(impactResultBox(r));
+      } catch (e) {
+        box.appendChild(el("p", {class: "err", text: String((e && e.message) || e)}));
+      }
+    }
+    if (candidates.length > take.length) {
+      box.appendChild(el("p", {class: "dim",
+        text: (candidates.length - take.length) + " more path/symbol link(s) on this revision were not walked."}));
+    }
+    return box;
+  });
+
+  /* 5. Queue buttons: a courtesy mirror of `atlas_review_intent_allowed` and
+     `atlas_decision_kind_resolvable`. A button records the revision the
+     detail names above -- `latest_revision` from the list row -- and the
+     first eight hex of the content hash `decision?revision=<that number>`
+     returns for it, fetched fresh so the sheet never names a hash from a
+     different revision. */
+  const queueBox = section("Queue");
+  panel(queueBox, async () => {
+    const intents = reviewIntentsAllowed(row.status, row.kind);
+    const box = el("div", {class: "row"});
+    if (intents.length === 0) {
+      box.appendChild(el("p", {class: "empty", text: "no queueable action for this record"}));
+      return box;
+    }
+    for (const intent of intents) {
+      const b = el("button", {class: "go", text: "Queue: " + intent});
+      b.onclick = async () => {
+        try {
+          const got = await api("decision",
+            {repo: repo, decision: uid, revision: row.latest_revision});
+          const prefix = ((got.revision || {}).content_hash || "").slice(0, 8);
+          await reviewQueueAdd({intent: intent, repo: repo, decision: uid,
+                                revision: row.latest_revision, prefix: prefix});
+        } catch (e) {
+          box.appendChild(el("p", {class: "err",
+            text: "could not queue this record: " + String((e && e.message) || e)}));
+        }
+      };
+      box.appendChild(b);
+    }
+    return box;
+  });
+}
+
+async function viewReview() {
+  const name = $("w-pick").value;
+  const status = $("w-status").value || "PROPOSED";
+  await renderReviewSheet();
+  if (!name) { say($("w-list"), "no repository selected"); return; }
+  panel($("w-list"), async () => {
+    const d = await api("decisions", {repo: name, status: status, limit: 200});
+    return table([
+      {label: "id", get: (x) => x.decision},
+      {label: "kind", get: (x) => kindTag(x.kind)},
+      {label: "status", get: (x) => statusTag(x.status)},
+      {label: "title", wrap: true, get: (x) => el("span", {class: "untrusted", text: x.title || "—"})},
+      {label: "rev", get: (x) => x.revision + " of " + x.latest_revision},
+    ], d.decisions, {empty: "nothing recorded of that status",
+                     onclick: (x) => showReviewDetail(name, x)});
   });
 }
 
@@ -673,8 +1087,11 @@ async function viewVerification() {
   });
 }
 
-async function showClaim(uid) {
-  panel($("v-detail"), async () => {
+/* A15 T7. `node` is additive: every existing caller passes none and gets
+   `$("v-detail")` exactly as before; the Review view's claims table passes
+   its own detail node instead. */
+async function showClaim(uid, node) {
+  panel(node || $("v-detail"), async () => {
     const c = await api("verify/claim", {claim: uid});
     const box = el("div");
     box.appendChild(kv([
@@ -733,8 +1150,23 @@ async function showClaim(uid) {
       ["independent evidence groups", c.independent_groups],
       ["attestations", c.attestation_total],
       ["support / contradict", (c.support_count || 0) + " / " + (c.contradict_count || 0)],
-      ["conflict", c.conflict],
+      ["conflict", c.conflict && c.conflict !== "NONE"
+        ? tag(c.conflict, c.conflict === "IMPLEMENTATION" ? "warn" : "")
+        : c.conflict],
     ]));
+    /* A15 T7 / A12.1. This is the *only* shape the reconciler's drift
+       detector can produce — a decision-bound symbol anchor extracted while
+       it resolved, later gone from a semantic generation that can be shown
+       to be coverage-complete. A new claim is never evaluated, an edited
+       PATH anchor reads IMPACTED and a deleted one UNDETERMINED; none of
+       those is this. Naming it beside anything wider would claim a drift
+       detector Atlas does not have. */
+    if (c.conflict === "IMPLEMENTATION") {
+      box.appendChild(el("p", {class: "warn", text:
+        "IMPLEMENTATION conflict: a decision-bound symbol anchor no longer resolves in a " +
+        "coverage-complete semantic generation. This is the only shape A12.1's reconciler can " +
+        "produce. It is a finding against the code, not a rewrite of the decision."}));
+    }
     /* Said in words, in the interface, because a number beside the word
        "confidence" is read as a percentage by everybody who has not been told
        otherwise. */
@@ -856,30 +1288,34 @@ async function viewSearch() {
   });
 }
 
+/* Renders one `code/impact` result exactly one way, so the Impact view and
+   the Review view's per-link walks (A15 T7) cannot drift apart. */
+function impactResultBox(r) {
+  const box = el("div");
+  box.appendChild(el("p", {class: "dim",
+    text: "Graph paths, not predictions. Every candidate says how it resolved — EXACT, UNIQUE_LEXICAL, AMBIGUOUS or UNRESOLVED — and the totals are reported separately, never summed."}));
+  box.appendChild(kv([
+    ["candidates", r.count], ["exact", r.exact], ["unique lexical", r.unique_lexical],
+    ["ambiguous", r.ambiguous], ["unresolved", r.unresolved],
+  ]));
+  box.appendChild(table([
+    {label: "item", wrap: true, get: (x) => x.name || x.path || x.from_path},
+    {label: "kind", get: (x) => x.kind},
+    {label: "resolution", get: (x) => statusTag(x.resolution)},
+    {label: "file", wrap: true, get: (x) => x.to_path || x.path},
+    {label: "line", get: (x) => x.line},
+  ], r.candidates, {empty: "nothing reached it"}));
+  if (r.truncated) box.appendChild(el("p", {class: "err", text: "A traversal bound was reached: " + (r.truncated_reason || "this result is truncated") + "."}));
+  return box;
+}
+
 async function viewImpact() {
   const name = $("i-pick").value;
   const sym = $("i-q").value.trim();
   const path = $("i-path").value.trim();
   if (!name || (!sym && !path)) { say($("i-out"), "Name a symbol or a path."); return; }
-  panel($("i-out"), async () => {
-    const r = await api("code/impact", {repo: name, symbol: sym, path: path, depth: 3});
-    const box = el("div");
-    box.appendChild(el("p", {class: "dim",
-      text: "Graph paths, not predictions. Every candidate says how it resolved — EXACT, UNIQUE_LEXICAL, AMBIGUOUS or UNRESOLVED — and the totals are reported separately, never summed."}));
-    box.appendChild(kv([
-      ["candidates", r.count], ["exact", r.exact], ["unique lexical", r.unique_lexical],
-      ["ambiguous", r.ambiguous], ["unresolved", r.unresolved],
-    ]));
-    box.appendChild(table([
-      {label: "item", wrap: true, get: (x) => x.name || x.path || x.from_path},
-      {label: "kind", get: (x) => x.kind},
-      {label: "resolution", get: (x) => statusTag(x.resolution)},
-      {label: "file", wrap: true, get: (x) => x.to_path || x.path},
-      {label: "line", get: (x) => x.line},
-    ], r.candidates, {empty: "nothing reached it"}));
-    if (r.truncated) box.appendChild(el("p", {class: "err", text: "A traversal bound was reached: " + (r.truncated_reason || "this result is truncated") + "."}));
-    return box;
-  });
+  panel($("i-out"), async () => impactResultBox(
+    await api("code/impact", {repo: name, symbol: sym, path: path, depth: 3})));
 }
 
 async function viewAudit() {
@@ -900,6 +1336,7 @@ async function viewAudit() {
 }
 
 const LOADERS = {overview: viewOverview, repository: viewRepository, decisions: viewDecisions,
+                 review: viewReview,
                  verification: viewVerification,
                  graph: viewGraph, search: viewSearch, impact: viewImpact, audit: viewAudit};
 
@@ -953,6 +1390,7 @@ async function start() {
 
   for (const [id, ev] of [["r-pick","change"],["d-pick","change"],["d-status","change"],
                           ["d-kind","change"],
+                          ["w-pick","change"],["w-status","change"],
                           ["v-pick","change"],
                           ["g-pick","change"],["s-pick","change"],["i-pick","change"]]) {
     const n = $(id);

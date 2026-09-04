@@ -1793,6 +1793,171 @@ static void test_the_review_parameters_reach_the_daemon(void) {
     env_close(&e);
 }
 
+/* --- A15 T7: Mission Control's Review view ----------------------------------- */
+
+/* Mission Control's Review view: the bindings the page carries for the five
+ * detail panels and the review sheet, and -- through a real session cookie --
+ * the five routes the view names, each answering 200.
+ *
+ * **This executes none of the page's JavaScript.** Nothing in this suite has a
+ * browser, and nothing here claims the queue buttons, the sheet's text
+ * building or the drift label actually render correctly for a person looking
+ * at a screen. What is established is narrower and is exactly what
+ * `test_mission_control_reaches_the_verification_routes` above establishes for
+ * the Verification view: the served bytes carry the identifiers and sentences
+ * each part of the Review view depends on (a page whose bindings drifted from
+ * the JSON would render blanks while every route test still passed), and the
+ * browser principal that would drive the page reaches every route the view
+ * names, with a 200.
+ *
+ * The `innerHTML` check greps for the bare word, with no leading dot: the
+ * page's own comment above its `<script>` used to spell that word out while
+ * explaining the `textContent` rule (`mission-control.html:195` before this
+ * season), which would have tripped a bare-word check on the page's own
+ * documentation rather than on a real use. This season rewords that one
+ * comment instead, so the check can be the plain, strict one -- catching an
+ * assignment, a read, or a future comment that reintroduces the word -- and
+ * still pass against a page that has no code and no prose to distinguish it
+ * from.
+ */
+static void test_mission_control_carries_the_review_view(void) {
+    env e;
+    memset(&e, 0, sizeof e);
+    atlas_err err;
+    atlas_err_init(&err);
+
+    T_REQUIRE(fx_open(&e.fx, &err) == ATLAS_OK);
+    T_OK(fx_init_repo(&e.fx, fx_repo(&e.fx), NULL, &err), &err);
+    T_OK(fx_write(fx_repo(&e.fx), "a.c", "int main(void){return 0;}\n", &err), &err);
+    T_OK(fx_add_all(&e.fx, fx_repo(&e.fx), &err), &err);
+    T_OK(fx_commit(&e.fx, fx_repo(&e.fx), "first", &err), &err);
+
+    atlas_buf out = ATLAS_BUF_INIT;
+    {
+        const char *add[] = {"repo", "add", fx_repo(&e.fx), "--name", "proj"};
+        T_EQ_INT(run_cli(&e, add, 5, &out, &err), 0);
+    }
+    {
+        const char *scan[] = {"scan", "proj"};
+        T_EQ_INT(run_cli(&e, scan, 2, &out, &err), 0);
+    }
+    {
+        /* The structural (A3) index is what `code/impact?symbol=` reads.
+         * `scan` alone does not build it -- `test_gate.c`'s `reindex` and
+         * every other fixture that later queries a symbol run `code sync`
+         * explicitly, rather than relying on the daemon's own background
+         * pass to have finished by the time a later request reaches it. */
+        const char *sync[] = {"code", "sync", "proj"};
+        T_EQ_INT(run_cli(&e, sync, 3, &out, &err), 0);
+    }
+    {
+        const char *scopes[] = {"repo:read", "decisions:read", "impact:read"};
+        const char *args[16];
+        size_t k = 0;
+        args[k++] = "api-key";
+        args[k++] = "create";
+        args[k++] = "--label";
+        args[k++] = "review-view-test";
+        for (size_t i = 0; i < sizeof scopes / sizeof scopes[0]; i++) {
+            args[k++] = "--scope";
+            args[k++] = scopes[i];
+        }
+        T_EQ_INT(run_cli(&e, args, k, &out, &err), 0);
+        capture_key(&e, &out);
+    }
+
+    /* One decision, approved before the daemon exists (see
+     * `approve_decision_at_write_point`'s own comment for why that order is
+     * required), so `gate?decision=` has an approved record to answer 200
+     * about. */
+    char uid[64];
+    {
+        const char *propose[] = {"decision",   "propose", "proj",
+                                 "--title",    "Review view probe",
+                                 "--decision", "Something the Review view can read in full."};
+        T_EQ_INT(run_cli(&e, propose, sizeof propose / sizeof propose[0], &out, &err), 0);
+    }
+    capture_decision_uid(&out, uid, sizeof uid);
+    approve_decision_at_write_point(&e.fx, uid);
+    atlas_buf_free(&out);
+
+    fx_daemon_init(&e.d);
+    T_OK(fx_daemon_start(&e.fx, &e.d, &err), &err);
+    T_OK(fx_daemon_wait_ready(&e.d, 15000, &err), &err);
+
+    atlas_gateway_opts o;
+    memset(&o, 0, sizeof o);
+    o.socket_path = atlas_buf_cstr(&e.d.socket);
+    o.timeout_ms = 15000;
+    atlas_gwpolicy p;
+    static const char *const POLICY_TEXT = "enabled = yes\ngateway_uid = 1\nremote_mcp = yes\n";
+    atlas_gwpolicy_parse_buffer(POLICY_TEXT, strlen(POLICY_TEXT), &p);
+    T_REQUIRE(p.state == ATLAS_GWPOLICY_ENABLED);
+    T_OK(atlas_gateway_open(&p, &o, &e.g, &err), &err);
+
+    atlas_gateway *g = NULL;
+    gui_env(&e, &g);
+    atlas_buf resp = ATLAS_BUF_INIT;
+
+    /* The page, and the bindings the Review view depends on. */
+    gui_request(g, "GET", "/", NULL, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 200);
+    static const char *const BOUND[] = {
+        "v-review",
+        "atlas-review-sheet/1",
+        "atlas.review.sheet.v1",
+        "decision/history",
+        "ledger_agrees",
+        "operator_channel",
+        "verify/claims",
+        "IMPLEMENTATION conflict",
+        "review apply",
+        "names the channel, not a person",
+    };
+    for (size_t i = 0; i < sizeof BOUND / sizeof BOUND[0]; i++) {
+        T_CHECK_MSG(strstr(body_of(&resp), BOUND[i]) != NULL,
+                    "the page carries no binding for \"%s\"", BOUND[i]);
+    }
+    T_CHECK_MSG(strstr(body_of(&resp), "innerHTML") == NULL,
+                "the page sets or reads innerHTML somewhere");
+    T_CHECK_MSG(strstr(body_of(&resp), "implementation drift") == NULL,
+                "the page claims a drift detector broader than A12.1's reconciler");
+
+    /* A browser session, then the five routes the Review view names. */
+    char body[512];
+    (void)snprintf(body, sizeof body, "{\"key\":\"%s\"}", e.token);
+    gui_request(g, "POST", "/auth/login", NULL, body, &resp);
+    T_EQ_INT(status_of(&resp), 200);
+    char cookie[128];
+    cookie_of(&resp, cookie, sizeof cookie);
+    T_REQUIRE_MSG(cookie[0] != '\0', "login set no session cookie");
+
+    char path[256];
+    (void)snprintf(path, sizeof path, "/api/v1/decision/history?repo=proj&decision=%s", uid);
+    gui_request(g, "GET", path, cookie, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 200);
+
+    (void)snprintf(path, sizeof path, "/api/v1/decision?repo=proj&decision=%s&revision=1", uid);
+    gui_request(g, "GET", path, cookie, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 200);
+
+    (void)snprintf(path, sizeof path, "/api/v1/verify/claims?repo=proj&decision=%s", uid);
+    gui_request(g, "GET", path, cookie, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 200);
+
+    (void)snprintf(path, sizeof path, "/api/v1/gate?repo=proj&decision=%s", uid);
+    gui_request(g, "GET", path, cookie, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 200);
+
+    gui_request(g, "GET", "/api/v1/code/impact?repo=proj&symbol=main", cookie, NULL, &resp);
+    T_CHECK_MSG(status_of(&resp) == 200, "code/impact answered %d: %s", status_of(&resp),
+                body_of(&resp));
+
+    atlas_gateway_close(g);
+    atlas_buf_free(&resp);
+    env_close(&e);
+}
+
 static const atlas_test TESTS[] = {
     {"a scoped credential can call a tool", test_a_scoped_credential_can_call_a_tool},
     {"a tool outside the scopes is refused and hidden",
@@ -1822,6 +1987,7 @@ static const atlas_test TESTS[] = {
     {"mission control reaches the verification routes",
      test_mission_control_reaches_the_verification_routes},
     {"the review parameters reach the daemon", test_the_review_parameters_reach_the_daemon},
+    {"mission control carries the review view", test_mission_control_carries_the_review_view},
     {"concurrent connections are safe", test_concurrent_connections_are_safe},
 };
 

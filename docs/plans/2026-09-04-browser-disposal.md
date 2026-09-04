@@ -6,6 +6,10 @@
 > checkbox (`- [ ]`) syntax. **T1 must not be dispatched until §Decisions the operator
 > must be asked has been put to the operator and answered** — that section exists
 > because A15's plan left a choice in the document and the choice died there.
+> *(Amended 2026-09-04: row 1 of that section — TLS in front — was asked and answered
+> no; rows 2 and 3 — which kinds may be disposed of from the browser, and whether the
+> page may remember the disposal key for the tab's session — remain open and are both
+> asked before T1. The gating question is no longer the TLS one.)*
 >
 > **Deviation from the writing-plans skill, stated deliberately, exactly as the A12.0,
 > A12.1 and A15 plans stated it:** the operator has assigned roles — the planner (Fable)
@@ -29,7 +33,9 @@ ledger (which credential), one migration (31), two root-owned policy keys in
 `/etc/atlas/gateway.conf`, one new daemon method group offered to the gateway's uid
 only when the policy declares TLS in front and names a disposal credential, a second
 route table in the gateway for two `POST` routes whose bodies are query-string syntax
-and whose credential is a bearer token presented on the request itself, and a
+and whose credential is a bearer token presented on the request itself, one
+root-owned key by which the operator accepts a cleartext disposal channel where the
+policy declares no TLS in front (amended 2026-09-04; the honest paragraph below), and a
 "Dispose from this browser" panel in Mission Control's Review view. Every write still
 reaches the index through `atlas_decision_apply_in_tx`, which keeps exactly three
 callers; `atlas_service_decision_confirm` keeps exactly two.
@@ -52,6 +58,36 @@ such act as `REMOTE_OPERATOR_CONFIRMED` with the credential's id beside it, neve
 `LOCAL_OPERATOR_CONFIRMED`, so that a reader of any row ever written can still tell
 the two apart. Every document this season writes says this in the paragraph that
 announces the capability, and `tests/test_decision_mcp.c` scans two of them for it.
+
+**Amended 2026-09-04, on the operator's authority, after the plan was committed at
+`c305f40`.** The paragraph above says the credential passes "through whatever
+terminates TLS in front of" the gateway. On this deployment nothing does. This plan
+as written made TLS in front a hard requirement — the daemon refused to offer the
+channel under `tls_mode = NONE`, the loader refused a disposal credential there, and
+§The decision refused to add a cleartext opt-out, giving four reasons: that a read
+floor leaks data while a cleartext disposal credential leaks authority; that an Atlas
+API credential has no expiry, so one capture on the wire is durable disposal power
+until it is revoked; that what it writes is the one record Atlas cannot rebuild,
+under a channel identity the ledger keeps for ever; and that the operator had been
+given "TLS in front" as a non-negotiable when choosing tier 3. The operator was shown
+that chain on 2026-09-04 and answered, verbatim: *"https ye gerek yok. kendi aginda
+sacmalamasin zaten"* — no need for HTTPS, it is on my own network. That is their
+decision on their own network. The requirement does not disappear: it becomes a
+root-owned policy key by which the operator states, in writing, that they accept a
+cleartext disposal channel — `operator_accepts_cleartext_disposal = yes` — absent by
+default, refused under TLS, printed by `atlas gateway status` on every run, and
+reported by `/auth/me` to the page so the sentence appears at the moment of use. The
+gate keeps its `REVERSE_PROXY` requirement *unless* that key is present: one
+condition added, none removed, so a reader of the gate still sees TLS as the intended
+shape and this deployment as a deliberate departure from it. The cost, unsoftened:
+**on this deployment the disposal credential crosses the network in the clear;
+anyone able to observe traffic on that segment can capture it; and a captured
+credential disposes of records exactly as the operator does until `atlas api-key
+revoke` is run.** The nginx terminator task is removed (§Tasks says where and why).
+Every other requirement — the channel identity and migration 31, the ungrantable
+scope, absence from MCP, the daemon verifying the credential inside the spending
+transaction, replay bound to the content hash, the root-owned kinds policy — is
+unchanged by this amendment.
 
 **Tech stack:** C17, the existing A4 write point and challenge table, the existing A9
 gateway and its policy loader, hand-written HTML/CSS/JavaScript with no build step
@@ -156,7 +192,7 @@ not followed.
   OPERATIONAL_FACT at revision 2 (`atlas-dec-314ed6…`), and the two "PROBE-A8FINAL-…
   disposable" records (`atlas-dec-28f03b…` r1, `atlas-dec-c711a6…` r3). A15's T10 was
   to reject the two probes through a sheet; they are still `PROPOSED`, so this season's
-  live acceptance (T11) disposes of them **from the browser** instead — the first real
+  live acceptance (T10) disposes of them **from the browser** instead — the first real
   workload of the channel is the workload A15 left standing.
 - `atlas_code_symbol` — `compile_databases: 0`, every edge `UNIQUE_LEXICAL`, each
   confirmed in the source: `spend_challenge` is defined once at
@@ -275,7 +311,7 @@ itself can never hold a non-grantable bit (`gwpolicy.c:386-395`). The floor is
 binary since `e9cfa85` and the `Host` clause since `acbd7ad`. `host_matches_listener`
 compares `Host` against `listen_addr:listen_port` whole (`:513-521`) and its comment at
 `:527-543` says outright that no key names a reverse proxy's hostname — which matters
-to §The decision, because a terminator in front changes what `Host` the gateway sees.
+to any later deployment that puts a terminator in front — none does after the 2026-09-04 amendment — because a proxy changes what `Host` the gateway sees.
 
 **The operator group and why the gateway reaches none of it.** `OPERATOR_METHODS[]`
 (`src/ipc/server_decision.c:2708-2723`) holds `decision.challenge`, `decision.approve`,
@@ -390,32 +426,52 @@ even to an operator who accepted the first on this same listener today:
    bill in view. A plan that quietly priced it out would be answering a question they
    did not ask, which is the A15 failure in a new place.
 
-**What the season does instead: the terminator is in scope.** T10 is a deployment task
-on this machine with exact steps — a reverse proxy on the address and port the
-operator's devices already use, the gateway moved to loopback, the policy edited, both
-processes restarted, the certificate trusted on the devices the operator disposes from,
-and the remote MCP tunnel re-pointed. It states what it costs: a proxy is a system
-service the operator installs, not an Atlas dependency (Atlas terminates no TLS and
-still must never be described as providing it); a self-signed certificate defends the
-credential against a passive reader on the segment and not against an active one until
-its CA is installed on every device that will present the credential; `host_matches_listener`
-sees whatever `Host` the proxy forwards, so the anonymous floor — should the operator
-ever install it — works behind the proxy only if the proxy forwards `Host` as the
-gateway's own loopback `address:port` (nginx's default `proxy_set_header Host
-$proxy_host` does exactly that; Caddy preserves the client's `Host` and would need a
-directive); per-peer rate limiting degrades to global unless `trust_forwarded_for` is
-set; and the session cookie gains `Secure` (`gateway.c:1503-1511`) the moment
-`tls_mode` says `REVERSE_PROXY`, which is correct and is why a browser reaching the
-gateway on plain loopback afterwards will drop its cookie.
+**What the season did instead, as first written: the terminator was in scope.** The
+plan as committed at `c305f40` carried a T10 that installed nginx on
+`192.168.0.198:8799` with a self-signed certificate, moved the gateway to loopback,
+and re-pointed the remote MCP tunnel, with each cost stated; and it said that whether
+the operator would run that terminator and trust its certificate was to be asked
+**before T1 was dispatched**, that a no meant the season did not start, and that if
+the operator wanted cleartext disposal anyway after reading the four points above,
+that was a written amendment they author, not a key the executor adds — and that this
+plan advised against it.
 
-**And the question is asked first, not last.** Whether the operator will run that
-terminator and trust its certificate on their devices is the first row of §Decisions
-the operator must be asked, and it is asked **before T1 is dispatched**. If the answer
-is no, the season does not start: a season whose every gate refuses itself on the only
-machine it will run on is fourteen hours in the wrong place again. If the operator,
-having read the four points above, wants cleartext disposal anyway, that is a written
-amendment to this plan that they author, not a key the executor adds — and this plan
-records here that it advised against it.
+**Amended 2026-09-04, on the operator's authority.** The question was put to the
+operator with the four points above, and the answer was no: *"https ye gerek yok.
+kendi aginda sacmalamasin zaten"* — no need for HTTPS, it is on my own network. They
+have authored the amendment this paragraph anticipated, for their own network, and it
+stands. What changes and what does not:
+
+- **The requirement becomes an explicit, root-owned acceptance, not an absence.** On
+  this project's own pattern from the same morning — the anonymous read floor is a
+  policy key, absent by default, that `atlas gateway status` prints — the gateway
+  policy gains `operator_accepts_cleartext_disposal = yes`. Absent, the loader still
+  refuses a disposal credential under any `tls_mode` but `REVERSE_PROXY`, exactly as
+  designed. Present, it is allowed. The name reads as what it is: a person's written
+  acceptance of a stated risk. Its full grammar and every MALFORMED condition are in
+  §Frozen formats.
+- **The gate keeps `REVERSE_PROXY` unless that key is present** — one condition added
+  to `atlas_server_remote_disposal_offered`, none removed (Decision 9), so the code
+  still says TLS is the intended shape and this deployment departed from it on
+  purpose.
+- **`atlas gateway status` prints the acceptance**, human and JSON, beside the
+  `dispose:` line (Decision 16). The review that caught this on the anonymous floor
+  said a ceiling may be omitted from that command but an authentication bypass may
+  not; this is stronger than a bypass, so it is printed on every run.
+- **`/auth/me` reports it to the page**, and the disposal panel shows the chain at
+  the moment of use (Decision 15, the fifth frozen sentence).
+- **The nginx terminator task is removed** from §Tasks, with a note at its place
+  saying so, and the season's task count is ten.
+- **Every document the season writes states the chain, verbatim** (§Frozen formats,
+  "The cleartext chain"): the credential travels in the clear on this deployment;
+  anyone able to observe traffic on the segment can capture it; an A9 credential has
+  no expiry, so a capture is durable until revoked; the operator chose this on
+  2026-09-04 after being shown that chain. No sentence anywhere implies Atlas
+  recommends it.
+- **Nothing else moves.** The channel identity and migration 31, the ungrantable
+  scope, absence from MCP, the daemon verifying the credential inside the spending
+  transaction, replay bound to the content hash, and the root-owned kinds policy are
+  exactly as the seventeen decisions below state them.
 
 **The lifecycle gap, and how this channel avoids it.** A15 established that approving a
 pinned, non-newest revision succeeds and leaves the newer `PROPOSED` revision stranded
@@ -568,14 +624,24 @@ gateway policy disables the gateway and nothing else, which is the right blast r
 The parser refuses (MALFORMED, gateway DISABLED with a reason, P0's rule): a key not of
 the `key_` + 16-hex shape; a kinds list naming a kind `atlas_decision_kind_parse` does
 not know; either key without the other; either key with `tls_mode` other than
-`REVERSE_PROXY`; either key with `web_gui = no`; `decisions:dispose` named in
+`REVERSE_PROXY` **unless `operator_accepts_cleartext_disposal = yes` is present**;
+either key with `web_gui = no`; `decisions:dispose` named in
 `web_gui_anonymous_scopes` (already refused by `gwpolicy.c:386-395`, tested
-explicitly now). The defensible starting line is A15's — `OPERATIONAL_FACT PARKED` —
-and the operator chooses (§Decisions the operator must be asked, row 2). **The daemon
-reads the policy at start** (`daemon.c:222`), so a policy edit needs a daemon restart
-as well as a gateway restart; T10 says so and `atlas gateway status` prints the
-`dispose:` line so an auditor can see what is installed (`acbd7ad`'s reason for the
+explicitly now); the acceptance key with any value but `yes`; the acceptance key under
+`tls_mode = REVERSE_PROXY`; the acceptance key without both disposal keys. The
+defensible starting line is A15's — `OPERATIONAL_FACT PARKED` — and the operator
+chooses (§Decisions the operator must be asked, row 2). **The daemon reads the policy
+at start** (`daemon.c:222`), so a policy edit needs a daemon restart as well as a
+gateway restart; T10 says so and `atlas gateway status` prints the `dispose:` and
+`clear:` lines so an auditor can see what is installed (`acbd7ad`'s reason for the
 `anon:` line applies verbatim).
+
+*(Amended 2026-09-04: this decision as committed had no third key and refused a
+disposal credential under `tls_mode = NONE` unconditionally. The operator declined
+TLS on their own network after being shown the chain in §The decision;
+`operator_accepts_cleartext_disposal` is the written form of that acceptance, and its
+three MALFORMED conditions above are what keep it from ever reading as a feature
+toggle — it cannot be `no`, cannot coexist with TLS, and cannot stand alone.)*
 
 ### Decision 7 — A second route table for two `POST` routes whose bodies are query-string syntax, so no JSON is parsed in `src/gw`
 
@@ -616,7 +682,10 @@ compares them against the *stored* hash as the guard, exactly as today.
 channel is not an ordinary RPC group stays readable as written. `dispatch()` consults
 the group additively, after the gateway group, when
 `atlas_server_remote_disposal_offered(ctx, peer_uid)` — the gateway peer predicate,
-**and** `ctx->gwpolicy.tls_mode == ATLAS_GWPOLICY_TLS_REVERSE_PROXY`, **and**
+**and** (`ctx->gwpolicy.tls_mode == ATLAS_GWPOLICY_TLS_REVERSE_PROXY` **or**
+`ctx->gwpolicy.cleartext_disposal_accepted` — amended 2026-09-04: one condition
+added, none removed, and the predicate's comment says TLS is the intended shape and
+the acceptance is the operator's written departure from it), **and**
 `ctx->gwpolicy.remote_dispose_key[0] != '\0'`; every other peer, and this peer under
 any other policy, gets `unknown method`, the answer a name that does not exist gets.
 Each method asks the same predicate again for itself, A8's rule that routing is not
@@ -713,18 +782,25 @@ Every write-route request appends its `gw_audit` row through the existing `audit
 verified selector — never the token, never the confirmation, never the body. The daemon
 logs one line per remote mint and per remote spend naming the key id, the decision id,
 the revision and the outcome, safe-encoded. `atlas gateway status` prints a `dispose:`
-line (human and JSON). `/auth/me`'s success body gains `"remote_disposal": true|false`
-— a policy fact, so the page can say whether the panel can work here before the
-operator pastes anything; its shape changed once today already (`acbd7ad`) and is
-documented as changing again.
+line and, beside it, a `clear:` line stating whether `operator_accepts_cleartext_disposal`
+is present (human and JSON; amended 2026-09-04 — an auditor asking "does this gateway
+carry a disposal credential in the clear?" must get the answer from the command Atlas
+offers for that question, on `acbd7ad`'s reasoning for the `anon:` line). `/auth/me`'s
+success body gains `"remote_disposal": true|false` — a policy fact, so the page can say
+whether the panel can work here before the operator pastes anything — and
+`"cleartext_disposal": true|false`, so the page shows the cleartext chain at the
+moment of use; its shape changed once today already (`acbd7ad`) and is documented as
+changing again.
 
-### Decision 17 — The terminator on this machine is nginx on the existing address and port, the gateway on loopback, and the season says what that costs
+### Decision 17 — Withdrawn by amendment 2026-09-04: there is no terminator on this machine, and the policy says so in writing
 
-Stated in §The decision and executed by T10. Recorded here so the acceptance table can
-name it: after T10, `atlas gateway status` on this machine reads `listen: 127.0.0.1
-port 8787`, `tls: REVERSE_PROXY`, `dispose: key_… (OPERATIONAL_FACT PARKED)` or
-whatever the operator chose, and the browser reaches
-`https://192.168.0.198:8799/`.
+As committed at `c305f40` this decision placed nginx on `192.168.0.198:8799` with the
+gateway on loopback. The operator declined TLS on their own network (§The decision,
+"Amended 2026-09-04"). After this season, `atlas gateway status` on this machine reads
+`listen: 192.168.0.198 port 8799`, `tls: NONE`, `dispose: key_… (…)` and
+`clear: ACCEPTED -- operator_accepts_cleartext_disposal = yes …`, and the browser
+reaches `http://192.168.0.198:8799/` exactly as it does today. The cost is the
+cleartext chain in §Frozen formats, printed by that command on every run.
 
 ---
 
@@ -781,6 +857,12 @@ char key_id[ATLAS_APIKEY_SELECTOR_HEX + 1u];             /* REMOTE only; empty o
 /* include/atlas/gwpolicy.h — new members of atlas_gwpolicy */
 char remote_dispose_key[ATLAS_APIKEY_SELECTOR_HEX + 1u]; /* empty = remote disposal off */
 uint32_t remote_dispose_kinds;                           /* ATLAS_DECISION_KIND_BIT(k) mask; 0 with key empty */
+/* Amended 2026-09-04. True only when the policy carries
+ * `operator_accepts_cleartext_disposal = yes`: the operator's written acceptance
+ * that the disposal credential crosses the network unencrypted. Never a default;
+ * refused under REVERSE_PROXY; the one thing that lets the group be offered
+ * without TLS in front. */
+bool cleartext_disposal_accepted;
 
 /* include/atlas/daemon.h — new member of atlas_daemon_opts (test hook, Decision 13) */
 const char *gwpolicy_text;
@@ -789,15 +871,33 @@ const char *gwpolicy_text;
 const atlas_gateway_route_view *atlas_gateway_api_write_routes(size_t *count_out);
 ```
 
-### The two policy keys (`/etc/atlas/gateway.conf`)
+### The three policy keys (`/etc/atlas/gateway.conf`)
 
 ```ini
 # Remote disposal from Mission Control. Both keys or neither. Both REQUIRE
-# tls_mode = REVERSE_PROXY and web_gui = yes; naming either under tls_mode = NONE,
-# or with web_gui = no, is a malformed policy and the gateway does not start.
+# web_gui = yes, and REQUIRE tls_mode = REVERSE_PROXY unless the third key below
+# is present; naming either with web_gui = no is a malformed policy and the
+# gateway does not start.
 # remote_dispose_key   = key_581e0a805cc1febe
 # remote_dispose_kinds = OPERATIONAL_FACT PARKED
+
+# THE OPERATOR'S WRITTEN ACCEPTANCE OF A CLEARTEXT DISPOSAL CHANNEL. Not a feature
+# toggle. With this line present and tls_mode = NONE, the disposal credential crosses
+# the network unencrypted on every disposal; anyone able to observe traffic on the
+# segment can capture it; an Atlas credential has no expiry, so a captured one
+# disposes of records exactly as you do until `atlas api-key revoke`. `yes` is the
+# only accepted value; leave the line out rather than writing `no`. Refused under
+# tls_mode = REVERSE_PROXY (nothing to accept) and without the two keys above.
+# `atlas gateway status` prints this acceptance on every run.
+# operator_accepts_cleartext_disposal = yes
 ```
+
+**Amended 2026-09-04.** The third key, `operator_accepts_cleartext_disposal`, exists
+because the operator declined TLS on their own network after being shown the chain
+(§The decision). Its name is frozen: it reads as a person's acceptance of a stated
+risk, not as a switch. Its grammar: the value is exactly `yes`; any other value, its
+presence under `tls_mode = REVERSE_PROXY`, and its presence without both disposal keys
+are each MALFORMED.
 
 - `remote_dispose_key`: exactly `key_` followed by 16 lowercase hex characters (the
   form `atlas api-key list` prints). Stored without the `key_` prefix, as
@@ -807,8 +907,11 @@ const atlas_gateway_route_view *atlas_gateway_api_write_routes(size_t *count_out
   not a smaller grant, it is a key that cannot take effect.
 - MALFORMED (gateway DISABLED, reason MALFORMED): a malformed key shape; an unknown or
   duplicated kind; one key without the other; either key with `tls_mode` not
-  `REVERSE_PROXY`; either key with `web_gui` not `yes`; `decisions:dispose` inside
-  `web_gui_anonymous_scopes`.
+  `REVERSE_PROXY` **unless `operator_accepts_cleartext_disposal = yes` is present**
+  (amended 2026-09-04); either key with `web_gui` not `yes`; `decisions:dispose` inside
+  `web_gui_anonymous_scopes`; `operator_accepts_cleartext_disposal` with any value but
+  `yes`; `operator_accepts_cleartext_disposal` with `tls_mode = REVERSE_PROXY`;
+  `operator_accepts_cleartext_disposal` without both disposal keys.
 - Loaded by the daemon at start and by the gateway at start. **Editing it means
   restarting both.**
 
@@ -842,8 +945,11 @@ static const atlas_method_entry REMOTE_DISPOSAL_METHODS[] = {
     {"decision.remote_dispose", method_remote_dispose},
 };
 const atlas_method_entry *atlas_server_remote_disposal_methods(size_t *count_out);
-/* Offered iff all three: atlas_server_peer_is_gateway(ctx, peer_uid),
- * ctx->gwpolicy.tls_mode == ATLAS_GWPOLICY_TLS_REVERSE_PROXY, and
+/* Offered iff all three: atlas_server_peer_is_gateway(ctx, peer_uid);
+ * ctx->gwpolicy.tls_mode == ATLAS_GWPOLICY_TLS_REVERSE_PROXY **or**
+ * ctx->gwpolicy.cleartext_disposal_accepted (amended 2026-09-04 — TLS in front is
+ * the intended shape, and the acceptance is the operator's written departure from
+ * it; one condition added, none removed); and
  * ctx->gwpolicy.remote_dispose_key[0] != '\0'. Otherwise `unknown method`. */
 bool atlas_server_remote_disposal_offered(const atlas_server_ctx *ctx, long long peer_uid);
 ```
@@ -907,7 +1013,8 @@ repo=atlas&decision=atlas-dec-28f03b0a44a53db88f0deace6e79721b&intent=reject&cha
 ```
 
 `/auth/me` success body gains `"remote_disposal": true|false` (the policy names a
-key), after `"anonymous"`.
+key) and `"cleartext_disposal": true|false` (the policy carries the acceptance key;
+amended 2026-09-04), in that order after `"anonymous"`.
 
 ### The gateway's refusal sentences
 
@@ -957,23 +1064,27 @@ records that the channel was used, not which person used it` — is unchanged.
 `actor_means` for a remote disposal:
 
 ```
-an explicit action arrived through Atlas' remote operator channel: the credential named in key_id was presented over the gateway, behind whatever terminates TLS in front of it. This does not identify a person, does not prove a person was present, and is not a signature. It is weaker than the local channel by construction: the credential passed through a network-facing process.
+an explicit action arrived through Atlas' remote operator channel: the credential named in key_id was presented over the gateway's listener, under whatever transport security that listener has, which Atlas does not verify. This does not identify a person, does not prove a person was present, and is not a signature. It is weaker than the local channel by construction: the credential passed through a network-facing process.
 ```
 
 ### `atlas gateway status`
 
-Human, after the `anon:` line:
+Human, after the `anon:` line, two lines, always both when the gateway is ENABLED:
 
 ```
 dispose: key_581e0a805cc1febe (OPERATIONAL_FACT PARKED)
+clear:   ACCEPTED -- operator_accepts_cleartext_disposal = yes: the disposal credential crosses this network unencrypted, and a captured credential disposes until it is revoked
 ```
 or
 ```
 dispose: (none -- the browser can read and queue, never dispose)
+clear:   (not accepted -- a disposal credential is offered only behind tls_mode = REVERSE_PROXY)
 ```
 
-JSON: `"remote_dispose_key"` (the id or `""`) and `"remote_dispose_kinds"` (the
-rendered list or `""`).
+JSON: `"remote_dispose_key"` (the id or `""`), `"remote_dispose_kinds"` (the rendered
+list or `""`) and `"cleartext_disposal_accepted"` (`true` or `false`). The `clear:`
+line and the JSON key are amended in on 2026-09-04: a ceiling may be omitted from this
+command; a credential crossing the network in the clear may not.
 
 ### `decision.history` and the CLI
 
@@ -988,7 +1099,15 @@ Under the **Dispose from this browser** heading, verbatim:
 > Disposing from this browser records REMOTE_OPERATOR_CONFIRMED with the credential's
 > id. That names the channel and the credential, not a person. This channel is weaker
 > than a terminal on the Atlas machine: your disposal key passes through the gateway
-> process and whatever terminates TLS in front of it, and Atlas verifies neither.
+> process and across the network, and Atlas verifies neither the process nor the
+> transport.
+
+When `/auth/me` reports `cleartext_disposal: true`, directly beneath the sentence
+above, verbatim (amended 2026-09-04):
+
+> On this deployment the disposal key crosses the network in the clear. Anyone able
+> to observe this network segment can capture it, and a captured key disposes of
+> records until it is revoked.
 
 Beside the key field, verbatim:
 
@@ -1014,6 +1133,24 @@ When `/auth/me` reports `remote_disposal: false`, in place of the panel, verbati
 
 The client-side mismatch line reuses the CLI's sentence: `that is not the confirmation
 for this revision; nothing was changed`.
+
+### The cleartext chain (amended 2026-09-04)
+
+Verbatim in `SECURITY.md`, `docs/remote-access.md` and `docs/browser-disposal.md`, in
+the paragraph that announces the capability, and in short form in `CLAUDE.md`'s
+season paragraph. A chain, not a conclusion; no sentence implies Atlas recommends it.
+
+> **On this deployment the disposal credential travels in the clear.** The gateway
+> listens on `192.168.0.198:8799` with `tls_mode = NONE`, and the two disposal routes
+> carry the credential as a bearer header on every request, so anyone able to observe
+> traffic on that network segment can read it. An Atlas API credential has no expiry,
+> so a credential captured once disposes of records exactly as the operator does until
+> the operator notices and runs `atlas api-key revoke`. The operator was shown this
+> chain on 2026-09-04 and accepted it for this network by writing
+> `operator_accepts_cleartext_disposal = yes` into the root-owned gateway policy;
+> `atlas gateway status` prints that acceptance on every run. Atlas states this cost
+> and does not judge the trade; the same key on a listener reachable from a network the
+> operator does not control is a different decision using the same mechanism.
 
 ### Migration 31
 
@@ -1057,11 +1194,18 @@ reason and what this plan changed about it; the rest are this season's own.
 - **Absent from the MCP surface.** No tool maps to the scope; a credential holding it
   lists zero tools; `tests/test_gw_remote.c` asks `tools/list` and `tools/call` for every
   plausible spelling, in the shape it already uses for credential administration.
-- **TLS in front, which Atlas still does not provide.** The policy loader refuses a
-  disposal key under `tls_mode = NONE`; the daemon offers the group only under
-  `REVERSE_PROXY`; the gateway refuses the routes with a sentence first. There is no
-  cleartext opt-out key, for the four reasons in §The decision, and the terminator on
-  this machine is T10. Atlas must never be described as providing TLS.
+- **TLS in front is the intended shape, and a departure from it is a written
+  acceptance, never an absence.** The policy loader refuses a disposal key under
+  `tls_mode = NONE`; the daemon offers the group only under `REVERSE_PROXY`; the
+  gateway refuses the routes with a sentence first. *(Amended 2026-09-04: the plan as
+  committed said "there is no cleartext opt-out key" and put the terminator on this
+  machine in T10. The operator, shown the four reasons in §The decision, declined TLS
+  on their own network. The requirement is now `operator_accepts_cleartext_disposal =
+  yes` — root-owned, absent by default, refused under `REVERSE_PROXY`, printed by
+  `atlas gateway status` and reported by `/auth/me` — and the gate's `REVERSE_PROXY`
+  condition stays in the code with that key as its one exception. Every document
+  states the cleartext chain verbatim.)* Atlas must never be described as providing
+  TLS.
 - **Replay protection bound to the content hash.** The existing challenge shape, plus
   the channel, the credential and — for the remote channel — the newest-revision check
   at mint and at spend. The operator types the first eight hex of the digest on screen;
@@ -1131,9 +1275,12 @@ at most a few hundred challenge rows. Bounded by the ledger's size; on this mach
 ledger holds a handful of documents' events. Run under the writer lock, like every
 migration.
 
-The reverse proxy is a system service the operator runs; its cost — a certificate, its
-trust on each device, one more process on the machine — is the operator's and is
-stated in T10, not Atlas'.
+On the wire (amended 2026-09-04): with `operator_accepts_cleartext_disposal = yes`
+and `tls_mode = NONE`, every disposal sends the credential as a bearer header in the
+clear across `192.168.0.198`'s network segment — twice per disposal. A passive
+observer on that segment holds the credential after the first disposal they see, and
+holds it until `atlas api-key revoke`; there is no TTL to wait out. That is the cost
+the operator accepted, and it is the whole of it.
 
 ---
 
@@ -1144,13 +1291,19 @@ fourteen hours followed. Every choice this plan leaves is here, with the default
 plan assumes and **the task before which it must be asked**. None may be asked "at the
 end".
 
+**Amended 2026-09-04.** Row 1 was asked and answered no (§The decision); its row is
+kept as the record of that answer. Rows 4 and 5 existed only because of the reverse
+proxy row 1 would have installed, and are struck with it. Rows 2 and 3 remain, and
+**both are now asked before T1** — the coordinator's instruction, and cheaper than
+carrying two open questions into a season that no longer has a gating one.
+
 | # | Question, in full | Default this plan assumes | Ask before |
 | --- | --- | --- | --- |
-| 1 | **Will you run a TLS terminator on this machine and trust its certificate on every device you will dispose from?** Concretely: nginx on `192.168.0.198:8799` with a self-signed certificate whose SAN is that IP, the gateway moved to `127.0.0.1:8787`, `tls_mode = REVERSE_PROXY`, and that certificate installed as trusted on your phone and browser. Also: the remote MCP tunnel currently reaching `http://192.168.0.198:8799/mcp` must be re-pointed — to `https://…` with the certificate trusted, or to the gateway's loopback port if the tunnel runs on this machine — and this plan does not know how that tunnel is configured. **If the answer is no, the season does not start**: every gate it builds refuses itself here, and this plan refuses to add a cleartext opt-out (§The decision). | nginx, self-signed SAN-IP certificate, gateway on loopback | **T1** |
-| 2 | **Which kinds may be disposed of from the browser?** The starting line is `OPERATIONAL_FACT PARKED`. Widening to `POLICY`, `INVARIANT` or `ACCEPTED_RISK` means a captured credential can accept a risk or set an invariant; widening to `DECISION` means every A4-era record. Any set is one root-owned line and needs no code change. | `OPERATIONAL_FACT PARKED` | T4 |
-| 3 | **May the page remember the disposal key for the tab's session?** Memory only means re-pasting it after every reload — the shape of annoyance that produced today's anonymous floor. `sessionStorage` survives a reload, dies with the tab, and is readable by any script the page runs — under this CSP that is the page's own inline script and nothing else. Either way it is never `localStorage`. | memory only | T7 |
-| 4 | **Behind the proxy, should the gateway believe `X-Forwarded-For` for rate limiting?** `trust_forwarded_for = no` makes the limit global (every request appears to come from the proxy); `yes` makes it per-client and believes a header the proxy sets. | `no` | T10 |
-| 5 | **Should the anonymous read floor be installed behind the proxy?** It is not installed today. If it is, nginx's default `Host` forwarding (`$proxy_host` = `127.0.0.1:8787`) satisfies `host_matches_listener`; a proxy that preserves the client's `Host` would not, and the floor would refuse — safely, but confusingly. | not installed; unchanged | T10 |
+| 1 | ~~Will you run a TLS terminator on this machine and trust its certificate on every device you will dispose from?~~ **Asked and answered 2026-09-04: no** — *"https ye gerek yok. kendi aginda sacmalamasin zaten"*. The season proceeds without TLS under `operator_accepts_cleartext_disposal = yes`; the chain the operator was shown and accepted is in §The decision and §Frozen formats. | — | answered |
+| 2 | **Which kinds may be disposed of from the browser?** The starting line is `OPERATIONAL_FACT PARKED`. Widening to `POLICY`, `INVARIANT` or `ACCEPTED_RISK` means a captured credential can accept a risk or set an invariant; widening to `DECISION` means every A4-era record — and on this deployment "captured" means observed on the network segment (§Frozen formats, the cleartext chain). Any set is one root-owned line and needs no code change. | `OPERATIONAL_FACT PARKED` | **T1** |
+| 3 | **May the page remember the disposal key for the tab's session?** Memory only means re-pasting it after every reload — the shape of annoyance that produced today's anonymous floor. `sessionStorage` survives a reload, dies with the tab, and is readable by any script the page runs — under this CSP that is the page's own inline script and nothing else. Either way it is never `localStorage`. | memory only | **T1** |
+| ~~4~~ | ~~Behind the proxy, should the gateway believe `X-Forwarded-For`?~~ Struck 2026-09-04: there is no proxy. | — | — |
+| ~~5~~ | ~~Should the anonymous read floor be installed behind the proxy?~~ Struck 2026-09-04: there is no proxy; the floor's `Host` check is unaffected by this season. | — | — |
 
 ---
 
@@ -1198,9 +1351,12 @@ skill needs no new sentence, and the plan says so rather than spending the margi
 
 # Tasks
 
-Dependency order: T1 → T2 → T3 → T4 → T5 → T6 → T7 → T8 → T9 → T10 → T11. T4 depends
-only on T1 and may run in parallel with T2 and T3; everything else is ordered. **T1 is
-not dispatched until row 1 of §Decisions the operator must be asked is answered yes.**
+Dependency order: T1 → T2 → T3 → T4 → T5 → T6 → T7 → T8 → T9 → T10. T4 depends only
+on T1 and may run in parallel with T2 and T3; everything else is ordered. **T1 is not
+dispatched until rows 2 and 3 of §Decisions the operator must be asked are answered.**
+*(Amended 2026-09-04: the order was eleven tasks ending T10 → T11, and T1 was gated on
+row 1; row 1 was answered no, the nginx task that was T10 is removed — see the note in
+its place below — and the live acceptance that was T11 is now T10.)*
 
 ---
 
@@ -1396,7 +1552,7 @@ the supersession detail chosen by comparing `prev_rev_no` against `c.revision_no
 
 ---
 
-### Task T4: the two policy keys, the template, the status line
+### Task T4: the three policy keys, the template, the status lines
 
 **Files:**
 - Modify: `include/atlas/gwpolicy.h`, `src/gw/gwpolicy.c`, `src/gw/gateway.c` (status,
@@ -1413,10 +1569,25 @@ keys with their grammar and every MALFORMED condition; the `dispose:` line.
       exactly the two bits; each MALFORMED case from §Frozen formats, one policy text
       each: bad key shape (15 hex; uppercase; no `key_`), unknown kind, duplicate kind,
       empty kinds, key without kinds, kinds without key, both keys with `tls_mode =
-      NONE`, both keys with `web_gui = no`, and `web_gui_anonymous_scopes =
-      decisions:dispose`; a policy with neither key → ENABLED with the field empty and
-      the mask zero. `atlas gateway status --json` and human against a parsed buffer
-      (the status renderer takes a policy) print the `dispose:` line in both forms.
+      NONE` and no acceptance, both keys with `web_gui = no`, and
+      `web_gui_anonymous_scopes = decisions:dispose`; a policy with neither key →
+      ENABLED with the field empty and the mask zero. **The acceptance key (amended
+      2026-09-04):** both keys with `tls_mode = NONE` and
+      `operator_accepts_cleartext_disposal = yes` → ENABLED with
+      `cleartext_disposal_accepted == true`; the same with `tls_mode` absent (loopback
+      bind) → ENABLED likewise; `operator_accepts_cleartext_disposal = no`, `= true`,
+      `= 1` → MALFORMED each; the acceptance with `tls_mode = REVERSE_PROXY` →
+      MALFORMED; the acceptance with neither disposal key → MALFORMED; a policy
+      without the acceptance → `cleartext_disposal_accepted == false`. `atlas gateway
+      status --json` and human against a parsed buffer (the status renderer takes a
+      policy) print the `dispose:` and `clear:` lines in both forms, in both the
+      accepted and the not-accepted wording. **No test in the tree asserts the human
+      status output today** — `tests/test_gateway.c` covers the parser matrix
+      (`:104-115`) and nothing greps the `anon:` line — so these assertions are the
+      first of their kind; assert by needle (`clear:   ACCEPTED`,
+      `operator_accepts_cleartext_disposal = yes`, `(not accepted`), never by whole
+      line or line count, so the long `clear:` line is a sentence an auditor reads
+      and not a width a test pins.
 - [ ] **Step 2: Run and watch them fail.**
 - [ ] **Step 3: Implement** the two branches in `atlas_gwpolicy_parse_buffer` and the
       end-of-parse cross-checks beside the existing wider-bind check
@@ -1475,8 +1646,13 @@ ctx->gwpolicy.remote_dispose_kinds`; submits; writes the §Frozen response with 
       for both — and `tests/test_a7_authority.c:195-197` gains both names so its own
       assertion covers them too.
       (d) a second `atlas-gw-daemon` with a policy naming the keys but `tls_mode`
-      absent is refused by the loader (the tool exits non-zero naming MALFORMED); with
-      keys absent and `tls_mode = REVERSE_PROXY`, both names answer `unknown method`.
+      absent and no acceptance is refused by the loader (the tool exits non-zero naming
+      MALFORMED); with keys absent and `tls_mode = REVERSE_PROXY`, both names answer
+      `unknown method`. **Amended 2026-09-04:** a third instance with the keys,
+      `tls_mode = NONE` and `operator_accepts_cleartext_disposal = yes` offers both
+      names and completes the (b) happy path unchanged, and `gateway.auth` derives the
+      scope under it exactly as under `REVERSE_PROXY` — the one condition the
+      acceptance adds is the gate's, and the write point is indifferent to transport.
       (e) `revision = 0`, a non-newest revision, a kind outside the list, `supersede`
       intent, a wrong confirmation, a replayed challenge: each refused with its frozen
       sentence, and the challenge table's consumed count moves only on the one success.
@@ -1541,7 +1717,9 @@ refusal sentence, `/auth/me`'s `remote_disposal`, `atlas_gateway_api_write_route
       origin → 403 (`gateway.c:1351-1366` unchanged); the write path with a listed
       origin still requires the bearer.
       (d) `/auth/me` reports `"remote_disposal": true` under the keyed policy and
-      `false` under `gui_env`'s.
+      `false` under `gui_env`'s; `"cleartext_disposal": true` under a keyed policy
+      carrying the acceptance and `false` under one with `tls_mode = REVERSE_PROXY`
+      (amended 2026-09-04).
       (e) the disposal key over `/mcp`: `tools/list` returns an empty tool array, and
       `tools/call` for each of `atlas_decision_approve`, `atlas_approve_decision`,
       `atlas_decision_dispose`, `atlas_dispose`, `atlas_review_apply`,
@@ -1611,7 +1789,8 @@ refusal sentence, `/auth/me`'s `remote_disposal`, `atlas_gateway_api_write_route
 - [ ] **Step 1: Write the failing test** in `tests/test_gw_remote.c`
       (`test_mission_control_carries_the_disposal_panel`): fetch `/` and require the
       bindings `disposeKey`, `apiWrite`, `decision/challenge`, `decision/dispose`,
-      `remote_disposal`, `credentials: "omit"`, `application/x-www-form-urlencoded`,
+      `remote_disposal`, `cleartext_disposal`, `crosses the network in the clear`,
+      `credentials: "omit"`, `application/x-www-form-urlencoded`,
       `maxlength="8"`, and the needles `names the channel and the credential, not a
       person`, `weaker than a terminal on the Atlas machine`, `A mismatch spends
       nothing`, `does not serve remote disposal`, and — per row 3's answer — exactly
@@ -1652,8 +1831,11 @@ refusal sentence, `/auth/me`'s `remote_disposal`, `atlas_gateway_api_write_route
       `{docs/decision-lifecycle.md, "weaker than the local channel by construction"}`,
       `{SECURITY.md, "weaker than the local channel by construction"}`,
       `{src/ipc/server_remote.c, "weaker than the local channel by construction"}` (the
-      `actor_means` string), and `{include/atlas/decision.h, "remote_operator_confirmed"}`
-      (lower-cased by the reader). The scan lower-cases every file
+      `actor_means` string), `{include/atlas/decision.h, "remote_operator_confirmed"}`
+      (lower-cased by the reader), and — amended 2026-09-04, the cleartext chain —
+      `{SECURITY.md, "travels in the clear"}`, `{docs/remote-access.md, "travels in the
+      clear"}`, `{docs/browser-disposal.md, "travels in the clear"}` and
+      `{mission-control.html, "crosses the network in the clear"}`. The scan lower-cases every file
       (`read_lowercased`), so needles are lower-case.
 - [ ] **Step 3: The caller-count scans.** `test_the_single_write_point_has_exactly_three_callers`
       (`:518-556`) must still count three files; add to its comment that A16 came here
@@ -1685,8 +1867,10 @@ refusal sentence, `/auth/me`'s `remote_disposal`, `atlas_gateway_api_write_route
       the headers; the stated costs (the credential passes through two processes Atlas
       does not verify; a holder of it disposes as the operator does; revocation is the
       bound; the page executes no JavaScript under test; a page reload asks for the
-      key again unless row 3 said otherwise; the terminator is the operator's); and, at
-      the end, what execution established that the plan did not claim.
+      key again unless row 3 said otherwise; and — amended 2026-09-04 — **the
+      cleartext chain verbatim**, in the paragraph that announces the capability, with
+      the operator's answer quoted and dated); and, at the end, what execution
+      established that the plan did not claim.
 - [ ] **Step 2: `docs/roadmap.md`** — retitle `:1558` "Next: A15 …" to "A15 — … (shipped)"
       and fold its closing paragraph into one sentence naming `docs/review-surface.md`;
       add "Next: A16 — browser disposal, and what the remote channel is worth" above
@@ -1702,8 +1886,10 @@ refusal sentence, `/auth/me`'s `remote_disposal`, `atlas_gateway_api_write_route
       channel that never runs through this listener": it is now true of the *session*
       and the floor, and false of a bearer the policy names — say so rather than
       leaving a sentence that was true on 2026-09-04 and is not after this season.
-      Amend "TLS" (`:77-91`) with the deployment shape T10 uses and the `Host`
-      forwarding note. Amend the first paragraph's "authenticates a bearer credential"
+      Amend "TLS" (`:77-91`) with `operator_accepts_cleartext_disposal`: what it is,
+      its three MALFORMED conditions, that `REVERSE_PROXY` remains the shape the gate
+      prefers, and **the cleartext chain verbatim** (§Frozen formats) — amended
+      2026-09-04. Amend the first paragraph's "authenticates a bearer credential"
       caveat (`:4-9`) to add that the write routes authenticate nothing else.
 - [ ] **Step 4: `docs/decision-lifecycle.md`** — beside "The operator channel,
       mechanically" (`:624-662`), a section "The remote operator channel, mechanically":
@@ -1739,8 +1925,12 @@ refusal sentence, `/auth/me`'s `remote_disposal`, `atlas_gateway_api_write_route
       less; amend "Tier 3 … costed" (`:2280`): built, with the three A15 costs and the
       four this plan found beyond them (a key with no scopes needs a deliberate form;
       the ledger must carry the credential because challenges are pruned; the fixture
-      daemon zeroes its policy; the reverse proxy changes what `Host` the floor sees);
-      a new entry for the residuals this season leaves (§Self-review, 5).
+      daemon zeroes its policy; a reverse proxy, if one is ever installed, changes
+      what `Host` the anonymous floor sees); a new entry for the residuals this season
+      leaves (§Self-review, 5); and — amended 2026-09-04 — an entry recording that the
+      TLS requirement became the acceptance key on the operator's decision, with the
+      chain, so a later reader of the backlog finds the departure where they look for
+      open costs.
 - [ ] **Step 8: `SECURITY.md`** — "A16: the remote operator channel, and what it is
       worth" after the A15 section (`:453-470`): what it establishes (the credential the
       policy names was presented over the transport the policy declares, verified by
@@ -1748,13 +1938,23 @@ refusal sentence, `/auth/me`'s `remote_disposal`, `atlas_gateway_api_write_route
       does not establish (which person; that a person; non-repudiation; that the proxy
       terminates TLS at all — Atlas cannot verify it), what it excludes (a session, the
       floor, any MCP tool, any key with a stored scope, any kind the policy does not
-      name, cleartext), and the honest paragraph. `README.md` — the two policy keys in
-      the gateway section, `api-key create --no-scopes` in the usage list, and one
-      sentence under Mission Control.
+      name), the honest paragraph, and — amended 2026-09-04 — **the cleartext chain
+      verbatim** in the paragraph that announces the capability, followed by what the
+      acceptance key is and that `atlas gateway status` prints it. **The chain's hedge
+      — "anyone able to observe traffic on that network segment" — is deliberate and
+      must not be sharpened to "anyone on the network" in any copy**: this plan
+      verified the listener and the transport, not whether the operator's LAN is
+      switched or shared, and a sentence claiming more than was verified is the class
+      of sentence this project scans for. `README.md` — the
+      three policy keys in the gateway section, `api-key create --no-scopes` in the
+      usage list, and one sentence under Mission Control.
 - [ ] **Step 9: `CLAUDE.md`** — the season paragraph at the top in the register the
       others use ("The current work is **A16** … **A16 added migration 31.**" and the
-      sentence), the table row, the one-line rules under "### A16 — browser disposal",
-      the honest paragraph in the season paragraph itself, and
+      sentence), the table row, the one-line rules under "### A16 — browser disposal"
+      — including one line for the acceptance key: TLS in front is the intended shape;
+      `operator_accepts_cleartext_disposal = yes` is the operator's written departure
+      from it, printed by `gateway status`, and on this deployment the credential
+      travels in the clear — the honest paragraph in the season paragraph itself, and
       `docs/browser-disposal.md` in "Where things are documented". Every line against
       `test_decision_mcp.c:371-386`.
 - [ ] **Step 10: Run `test_decision_mcp`** and the full suite.
@@ -1762,89 +1962,66 @@ refusal sentence, `/auth/me`'s `remote_disposal`, `atlas_gateway_api_write_route
 
 ---
 
-### Task T10: the terminator on this machine, the policy, the credential
+### Task T10 as committed at `c305f40` — the nginx terminator — was removed on 2026-09-04
 
-Run by the reviewing session with the operator acting as root. **It spends no money**;
-it changes this machine's listener. Rows 1, 4 and 5 of §Decisions the operator must be
-asked were answered before T1; this task executes the answers.
+It installed nginx on `192.168.0.198:8799` with a self-signed SAN-IP certificate,
+moved the gateway to `127.0.0.1:8787` under `tls_mode = REVERSE_PROXY`, re-pointed the
+remote MCP tunnel, and verified each step. It is gone because the operator declined
+TLS on their own network (§The decision, "Amended 2026-09-04"), not because it was
+forgotten; its deployment steps are recoverable from `c305f40` if a later deployment
+wants a terminator, and nothing in the code refuses one — `REVERSE_PROXY` is still the
+shape the gate prefers. What it carried that still has to happen — deploying the
+binary, minting the credential, editing the policy, restarting both services — is now
+the first two steps of the task below.
+
+---
+
+### Task T10: live acceptance — the credential, the policy, and two probes disposed of from the browser
+
+Run by the reviewing session with the operator acting. **It spends no money**; it
+changes this machine's policy and disposes of two records.
 
 - [ ] **Step 1: Full suite, then deploy the binary** with `/opt/atlas/deploy.local.sh`
       after changing its `MARK` to a string only A16's binary contains
       (`REMOTE_OPERATOR_CONFIRMED`). The daemon restarts; `atlas daemon ping --json`
       reports `phase: "A16"` once `include/atlas/atlas.h:11` says so (the chore commit,
       as `4881a5a` did for A15).
-- [ ] **Step 2: The policy, first half — free the address before anything binds it.**
-      Edit `/etc/atlas/gateway.conf`: `listen_addr = 127.0.0.1`, `listen_port = 8787`,
-      `tls_mode = REVERSE_PROXY`, `public_url = https://192.168.0.198:8799`,
-      `trust_forwarded_for` per row 4 — **not yet the two disposal keys**. Restart
-      **both** `atlas.service` and `atlas-gateway.service` (the daemon reads this file
-      at start, `daemon.c:222`). `atlas gateway status` now reads `listen: 127.0.0.1
-      port 8787`, `tls: REVERSE_PROXY`, `dispose: (none -- …)`, and
-      `192.168.0.198:8799` is free. From this moment until Step 4 finishes, nothing
-      answers on the LAN address — the browser and the MCP tunnel are both down, and
-      the operator is told so before this step runs. (The order matters: a proxy
-      started while the gateway still holds the port fails to bind with "address
-      already in use", and the operator running these steps as root would hit that
-      first.)
-- [ ] **Step 3: The certificate.** `openssl req -x509 -newkey ec -pkeyopt
-      ec_paramgen_curve:prime256v1 -nodes -days 825 -subj "/CN=192.168.0.198" -addext
-      "subjectAltName=IP:192.168.0.198" -keyout /etc/nginx/atlas.key -out
-      /etc/nginx/atlas.crt`, root-owned, key mode 0600. Record its fingerprint in the
-      season's document as an observation. Install `atlas.crt` as trusted on each
-      device the operator will dispose from (row 1's answer names them).
-- [ ] **Step 4: nginx.** `apt install nginx` (a Debian package; not an Atlas
-      dependency). One server block: `listen 192.168.0.198:8799 ssl;` with the two
-      files; `location / { proxy_pass http://127.0.0.1:8787; proxy_set_header
-      X-Forwarded-For $remote_addr; }` — **no `proxy_set_header Host`**, so nginx's
-      default `$proxy_host` (`127.0.0.1:8787`) reaches the gateway and
-      `host_matches_listener` would pass if row 5 ever installs the floor. Disable the
-      default site. `nginx -t`, then enable and start. Re-point the remote MCP tunnel
-      per row 1's answer and confirm it reaches `/mcp` before going on.
-- [ ] **Step 5: The credential, and the policy's second half.** `atlas api-key create
-      --label browser-dispose --no-scopes` as the operator; the secret is shown once
-      and goes into the operator's password manager, never into a file on this
-      machine. Put its `key_…` id into `remote_dispose_key` and the kinds from row 2
-      into `remote_dispose_kinds`; restart both services again.
-- [ ] **Step 6: Verify, and record each as an observation.** `atlas gateway status`
-      reads `listen: 127.0.0.1 port 8787`, `tls: REVERSE_PROXY`, `dispose: key_…
-      (…)`; `curl -sk https://192.168.0.198:8799/healthz` answers `{"ok":true}`;
-      `curl -s http://192.168.0.198:8799/` answers **nginx's own error for plain HTTP
-      on a TLS port — never Atlas' page**, and `curl -s http://192.168.0.198:8787/` is
-      refused outright (the gateway listens on loopback only); the remote MCP tunnel
-      reaches `/mcp` at its re-pointed address; the browser on the operator's phone
-      opens `https://192.168.0.198:8799/` without a certificate warning.
-- [ ] **Step 7: Commit nothing from this task** except `deploy.local.sh`'s `MARK` line,
-      which is gitignored anyway. Record the nginx block and the policy diff (key id
-      redacted to its first four hex) in `docs/browser-disposal.md`'s deployment
-      section as what this machine runs, dated.
-
----
-
-### Task T11: live acceptance — dispose of the two probes from the browser
-
-- [ ] **Step 1: Read.** The operator opens Mission Control on the phone, Review view,
+- [ ] **Step 2: The credential and the policy.** `atlas api-key create --label
+      browser-dispose --no-scopes` as the operator; the secret is shown once and goes
+      into the operator's password manager, never into a file on this machine. Edit
+      `/etc/atlas/gateway.conf` — `listen_addr`, `listen_port` and `tls_mode = NONE`
+      unchanged — adding `remote_dispose_key = key_…`, `remote_dispose_kinds` from row
+      2's answer, and `operator_accepts_cleartext_disposal = yes`. Restart **both**
+      `atlas.service` and `atlas-gateway.service` (the daemon reads this file at
+      start, `daemon.c:222`). `atlas gateway status` reads `tls: NONE`, `dispose:
+      key_… (…)` and `clear: ACCEPTED -- operator_accepts_cleartext_disposal = yes …`;
+      record the three lines as the first observation. The browser still reaches
+      `http://192.168.0.198:8799/`; nothing about the listener moved.
+- [ ] **Step 3: Read.** The operator opens Mission Control on the phone, Review view,
       selects the `atlas` repository, `PROPOSED`. Both "PROBE-A8FINAL-… disposable"
       records are listed. **Their kind is `DECISION`** — if row 2's answer did not
       include `DECISION`, the panel's `reject` is refused with the kinds sentence, and
       that refusal is the first observation to record; the operator then either widens
       the policy for the acceptance or disposes of the probes with `atlas review apply`
       and the acceptance is run on a fresh `OPERATIONAL_FACT` proposed for the purpose.
-- [ ] **Step 2: Dispose.** Paste the disposal key; `Dispose: reject` on
+      The panel shows the cleartext sentence (the fifth frozen sentence) because
+      `/auth/me` reports `cleartext_disposal: true`; record that it did.
+- [ ] **Step 4: Dispose.** Paste the disposal key; `Dispose: reject` on
       `atlas-dec-28f03b…` r1; read the confirmation block; type `6fb2be08`; `Confirm`;
       expect `REJECTED`, `REMOTE_OPERATOR_CONFIRMED`, the key id. Repeat for
       `atlas-dec-c711a6…` r3 with `5146bbb3`. Then a deliberate mistype on a third
       record (propose one for the purpose): expect the mismatch sentence and an
       unconsumed challenge.
-- [ ] **Step 3: Verify on the machine.** `atlas decision history atlas atlas-dec-28f03b…`
+- [ ] **Step 5: Verify on the machine.** `atlas decision history atlas atlas-dec-28f03b…`
       shows `REJECTED` by `REMOTE_OPERATOR_CONFIRMED`, `credential: key_…`;
       `atlas doctor` reports the ledger agreeing; the Audit view shows two `WEB_API`
       rows per disposal with the key id and no token; `journalctl -u atlas` shows the
       two daemon lines per disposal.
-- [ ] **Step 4: Record the observations** in `docs/browser-disposal.md` — as
+- [ ] **Step 6: Record the observations** in `docs/browser-disposal.md` — as
       observations, with the date, the device, and anything the page did that the grep
       test could not have seen. **Nothing about a live pass is a general result; say so
       in those words.**
-- [ ] **Step 5: Final commits. Nothing is pushed on this document's authority.** Present
+- [ ] **Step 7: Final commits. Nothing is pushed on this document's authority.** Present
       the season's commit list, ask, and push only on the operator's contemporaneous
       go-ahead — recording the answer either way.
 
@@ -1857,7 +2034,7 @@ asked were answered before T1; this task executes the answers.
 | 1 | its own channel identity; `LOCAL_OPERATOR_CONFIRMED` never reused; migration 31 on migration 15's pattern; a channel column on challenges | T1, T2, T3 | the actor round-trips and is adapter-unwritable; migration 31 preserves every row and widens both CHECKs; a `REMOTE` challenge spent locally and a `LOCAL` one spent remotely are both refused; the ledger row reads `REMOTE_OPERATOR_CONFIRMED` |
 | 2 | its own scope, ungrantable, derived from a root-owned line, never stored | T1, T4, T5 | `grantable == false`; `api-key create --scope decisions:dispose` refused; `gateway.auth` derives it for the named key only, and only when its stored list is empty; no `api_keys` row ever holds it |
 | 3 | absent from the MCP surface | T6 | the disposal key lists zero tools and every plausible name is `unknown tool`; a mask carrying the bit reaches no write tool |
-| 4 | TLS in front; the daemon refuses the group otherwise; this machine handled honestly | §The decision, T4, T5, T10 | keys under `tls_mode = NONE` are MALFORMED; the group answers `unknown method` without `REVERSE_PROXY`; the gateway answers 404; T10 installs the terminator and the operator was asked before T1 |
+| 4 | TLS in front is the intended shape; this machine's departure from it is written, printed and stated — never quiet (amended 2026-09-04) | §The decision, T4, T5, T6, T7, T9, T10 | keys under `tls_mode = NONE` are MALFORMED without `operator_accepts_cleartext_disposal = yes`, and MALFORMED with it under `REVERSE_PROXY`; the group answers `unknown method` without `REVERSE_PROXY` and without the acceptance, and is offered with either; `gateway status` prints `clear:` in both forms; `/auth/me` reports `cleartext_disposal`; the page shows the fifth sentence; the cleartext chain is verbatim in three documents; the operator's answer is recorded in this plan |
 | 5 | replay protection bound to the content hash; something typed | T3, T5, T7 | the challenge response has no `confirm`; the spend compares the typed eight against the stored hash; a mismatch consumes nothing; `maxlength="8"` and the third frozen sentence are in the page |
 | 6 | a root-owned policy naming kinds, refused rather than clamped | T3, T4 | every MALFORMED case in the matrix; a kind outside the list refused at mint and at spend |
 | 7 | the daemon authenticates the bearer itself in the transaction | T3, T5 | a wrong secret, a revoked key, a key with a stored scope and a key not named by the policy are each refused inside the write point; a session cookie on the write route is 401 |
@@ -1869,8 +2046,8 @@ asked were answered before T1; this task executes the answers.
 | 13 | the lifecycle gap planned around | T3 | a remote challenge for a non-newest revision is refused; a revision landing in the window refuses the spend; the local `--revision N` test is unchanged |
 | 14 | the two A15 defects decided | T3, §The decision | the supersession sentence is correct in both orders (one assertion each); the three dead routes are recorded as not this season's |
 | 15 | caller counts stated and held | T3, T8 | three files name the write point; three name the confirm helper (one definition, two callers); both scans pass with the two new files present |
-| 16 | the operator asked before, not after | §Decisions the operator must be asked | row 1 answered before T1 is dispatched; rows 2–5 before their tasks; the answers recorded in `docs/browser-disposal.md` |
-| 17 | one real disposal from the browser | T11 | two probe records `REJECTED` through the panel, observations recorded as observations |
+| 16 | the operator asked before, not after | §Decisions the operator must be asked | row 1 asked and answered no on 2026-09-04, recorded in the plan; rows 2 and 3 answered before T1 is dispatched; every answer recorded in `docs/browser-disposal.md` |
+| 17 | one real disposal from the browser, on this deployment as it is | T10 | the policy carries the three keys and `gateway status` prints `clear: ACCEPTED`; two probe records `REJECTED` through the panel with the cleartext sentence on screen; observations recorded as observations |
 
 ---
 
@@ -1920,3 +2097,14 @@ reverse proxy's hostname for the anonymous floor (`gateway.c:527-543` deliberate
 left it out, and this plan agrees); a browser test that executes the page; and whether
 the local walker's `required_status_for` should move onto the revision's state
 (`docs/backlog.md:2384`, unchanged by this season).
+
+**6. Amended 2026-09-04, after commit `c305f40`.** The plan's gating question was
+asked and answered no. The amendment is recorded in five places so it cannot be read
+as an omission: the honest paragraph at the top, §The decision, Decision 6, Decision
+17, the authority argument's TLS bullet, and the note standing where the nginx task
+was. What the amendment changed: one policy key, one condition on the gate, one
+`clear:` line in `gateway status`, one `/auth/me` field, one sentence on the page,
+one verbatim chain in three documents, the removal of one task (eleven became ten),
+and rows 2 and 3 of the operator's decisions moved to before T1. What it did not
+change: every other decision, every frozen format not named above, every caller
+count, and every test obligation except the additions marked "amended".

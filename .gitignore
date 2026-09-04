@@ -27,3 +27,8 @@ compile_commands.json
 # owner. The procedure is general; every value in it is not.
 *.local.sh
 *.local.service
+
+# Local Claude Code session state, for the same reason: settings.local.json
+# records one operator's output style and permission answers on one machine.
+# The agent definitions beside it are the shared part and are tracked.
+.claude/settings.local.json

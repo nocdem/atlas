@@ -913,7 +913,7 @@ static void run_memory(atlas_writer *w, atlas_job *j) {
  * referencing no live statement, git handle or open fd -- crosses into the
  * transaction that follows. The transaction wraps `atlas_memory_apply_in_tx`
  * alone, exactly the shape `atlas_decision_apply` gives
- * `atlas_decision_apply_in_tx` (`lifecycle.c:2073`): whole or nothing, so a
+ * `atlas_decision_apply_in_tx` (`lifecycle.c:2255`): whole or nothing, so a
  * version row can never land without the generation it belongs to.
  *
  * The observation is heap-allocated on the memory module's own instruction:

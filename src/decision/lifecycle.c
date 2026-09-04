@@ -1083,7 +1083,7 @@ static atlas_status op_challenge(apply_ctx *ac, const atlas_decision_op *op,
     if (c.channel == ATLAS_DECISION_CHANNEL_REMOTE &&
         (c.intent == ATLAS_DECISION_INTENT_SUPERSEDE ||
          c.intent == ATLAS_DECISION_INTENT_REVALIDATE)) {
-        return atlas_err_set(err, ATLAS_ERR_USAGE,
+        return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
                              "supersede and revalidate are not offered from the browser; use a "
                              "terminal on the Atlas machine");
     }
@@ -1190,7 +1190,7 @@ static atlas_status op_challenge(apply_ctx *ac, const atlas_decision_op *op,
          * repository identity is checked twice. */
         if (c.channel == ATLAS_DECISION_CHANNEL_REMOTE &&
             (op->remote_kinds & ATLAS_DECISION_KIND_BIT(kind)) == 0) {
-            return atlas_err_set(err, ATLAS_ERR_USAGE,
+            return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
                                  "a record of kind %s is not one the remote disposal policy "
                                  "names; dispose of it on a terminal",
                                  atlas_decision_kind_name(kind));
@@ -1345,10 +1345,18 @@ static atlas_status spend_challenge(apply_ctx *ac, const atlas_decision_op *op,
                                  "minted; nothing was changed -- read it again",
                                  (long long)latest_no);
         }
-        /* The kinds policy, repeated at spend time for the same reason the
-         * repository identity is: the policy on the op is the one that
-         * minted, so a request cannot present a wider one at spend than the
-         * challenge was actually issued under. */
+        /* The kinds policy, re-checked at spend. No mask is stored on the
+         * challenge row -- `op->remote_kinds` here is simply whatever this
+         * request presents now, not a comparison against what minted. The
+         * mint-time check in `op_challenge` is what binds: a challenge is
+         * only ever minted for a kind the policy named at that moment. This
+         * re-check exists for what can change *between* mint and spend: an
+         * operator narrowing `remote_dispose_kinds` in the root-owned policy
+         * and restarting the daemon, leaving an already-outstanding
+         * challenge for a kind the current policy no longer names. A wider
+         * mask presented here grants nothing new -- the mint already fixed
+         * what this challenge is for -- so the only case this check needs to
+         * catch, and does, is a policy that has narrowed since. */
         atlas_decision_kind rkind = ATLAS_DECISION_KIND_DECISION;
         bool rkfound = false;
         st = atlas_db_decision_kind_of(ac->db, out_c->document_id, &rkind, &rkfound, err);

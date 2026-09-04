@@ -36,6 +36,16 @@ typedef struct env {
     atlas_buf policy_uid; /* POLICY, revision 1 */
     char dispose_token[ATLAS_APIKEY_TOKEN_MAX];
     char dispose_id[ATLAS_APIKEY_SELECTOR_HEX + 1u];
+    /* A16, fix round 1. A second, independently-valid, scopeless credential
+     * -- distinct from `dispose_token`/`dispose_id` -- so the credential-
+     * binding refusal in `spend_challenge` ("that approval challenge was
+     * minted for a different credential") can be reached as itself: minted
+     * with one scopeless credential, spent with another that authenticates
+     * validly as itself. `reader` cannot stand in for this, because its
+     * stored scope stops it one check earlier, in
+     * `atlas_decision_remote_verify`. */
+    char dispose2_token[ATLAS_APIKEY_TOKEN_MAX];
+    char dispose2_id[ATLAS_APIKEY_SELECTOR_HEX + 1u];
     char reader_token[ATLAS_APIKEY_TOKEN_MAX];
     char reader_id[ATLAS_APIKEY_SELECTOR_HEX + 1u];
 } env;
@@ -147,6 +157,8 @@ static void env_open(env *e) {
 
     mint_key(e, "dispose", NULL, e->dispose_token, sizeof(e->dispose_token), e->dispose_id,
             sizeof(e->dispose_id));
+    mint_key(e, "dispose2", NULL, e->dispose2_token, sizeof(e->dispose2_token), e->dispose2_id,
+            sizeof(e->dispose2_id));
     mint_key(e, "reader", "decisions:read", e->reader_token, sizeof(e->reader_token),
             e->reader_id, sizeof(e->reader_id));
 }
@@ -995,6 +1007,131 @@ static void test_j_remote_op_refused_over_the_socket_and_token_is_wiped(void) {
     atlas_decision_op_free(&op);
 }
 
+/* --- (k): the credential-binding check, reached as itself ------------------
+ *
+ * Fix round 1. `strcmp(ac->key_id, out_c->key_id)` in `spend_challenge` needs
+ * *two* independently-valid, scopeless credentials to fire as the check it
+ * was written to be: mint with one, spend with the other, both authenticating
+ * correctly as themselves. `reader` cannot stand in for the second credential
+ * -- its stored scope stops it one check earlier, in
+ * `atlas_decision_remote_verify`, which is a different guard firing for a
+ * different reason. Without a second scopeless credential the only way to
+ * reach this sentence was a LOCAL row's empty `key_id` happening to differ
+ * from a presented REMOTE one -- the guard firing as a fallback of the
+ * channel-mismatch check above it, not as the credential-binding check this
+ * sentence names. */
+static void test_k_challenge_bound_to_the_credential_that_minted_it(void) {
+    env e;
+    env_open(&e);
+    atlas_db *db = open_db(&e);
+    atlas_err err;
+    atlas_err_init(&err);
+
+    /* Minted with dispose1. */
+    atlas_decision_op ch;
+    T_OK(build_op(ATLAS_DECISION_OP_CHALLENGE, ATLAS_DECISION_CHANNEL_REMOTE,
+                  atlas_buf_cstr(&e.fact_uid), NULL, ATLAS_DECISION_INTENT_APPROVE, 1, NULL, NULL,
+                  e.dispose_token, e.dispose_id,
+                  ATLAS_DECISION_KIND_BIT(ATLAS_DECISION_KIND_OPERATIONAL_FACT), &ch, &err),
+        &err);
+    atlas_decision_result cr;
+    atlas_decision_result_init(&cr);
+    T_OK(atlas_decision_apply(db, &ch, &cr, &err), &err);
+
+    atlas_decision_challenge crow;
+    load_challenge(db, &cr.token, &crow);
+    T_CHECK_MSG(strcmp(crow.key_id, e.dispose_id) == 0, "stored key_id mismatch");
+
+    /* Spent presenting dispose2 -- a second, independently-valid, scopeless
+     * credential that authenticates correctly as itself. If `spend_challenge`
+     * did not compare `ac->key_id` (what this request just proved it is)
+     * against `out_c->key_id` (what minted the challenge), this spend would
+     * succeed, and the ledger would attribute the approval to whichever
+     * credential happened to be presented at spend time rather than the one
+     * that actually minted the capability. */
+    atlas_decision_op ap;
+    T_OK(build_op(ATLAS_DECISION_OP_APPROVE, ATLAS_DECISION_CHANNEL_REMOTE,
+                  atlas_buf_cstr(&e.fact_uid), NULL, ATLAS_DECISION_INTENT_APPROVE, 0, &cr.token,
+                  cr.confirm, e.dispose2_token, e.dispose2_id,
+                  ATLAS_DECISION_KIND_BIT(ATLAS_DECISION_KIND_OPERATIONAL_FACT), &ap, &err),
+        &err);
+    atlas_decision_result ar;
+    atlas_decision_result_init(&ar);
+    atlas_status st = atlas_decision_apply(db, &ap, &ar, &err);
+    T_CHECK_MSG(st != ATLAS_OK, "a challenge minted for one credential was spent by another");
+    T_CHECK_MSG(strstr(atlas_err_msg(&err),
+                       "that approval challenge was minted for a different credential") != NULL,
+                "wrong refusal: %s", atlas_err_msg(&err));
+
+    atlas_decision_challenge still;
+    load_challenge(db, &cr.token, &still);
+    T_CHECK_MSG(!still.consumed, "the challenge was consumed by the wrong credential's spend");
+
+    atlas_decision_result_free(&ar);
+    atlas_decision_op_free(&ap);
+    atlas_decision_result_free(&cr);
+    atlas_decision_op_free(&ch);
+    atlas_db_close(db);
+    env_close(&e);
+}
+
+/* --- (l): the kinds policy, re-checked at spend when it has narrowed -------
+ *
+ * Fix round 1. `op->remote_kinds` at spend is whatever the caller presents
+ * then, not a comparison against what minted -- nothing stores a mask on the
+ * challenge row. So the spend-time check needs its own scenario, distinct
+ * from (f): a mask *narrower* at spend than at mint, standing in for an
+ * operator narrowing `remote_dispose_kinds` in the root-owned policy and
+ * restarting the daemon between the mint and this request. */
+static void test_l_kinds_policy_narrowed_between_mint_and_spend(void) {
+    env e;
+    env_open(&e);
+    atlas_db *db = open_db(&e);
+    atlas_err err;
+    atlas_err_init(&err);
+
+    /* Minted under a policy naming OPERATIONAL_FACT. */
+    atlas_decision_op ch;
+    T_OK(build_op(ATLAS_DECISION_OP_CHALLENGE, ATLAS_DECISION_CHANNEL_REMOTE,
+                  atlas_buf_cstr(&e.fact_uid), NULL, ATLAS_DECISION_INTENT_APPROVE, 1, NULL, NULL,
+                  e.dispose_token, e.dispose_id,
+                  ATLAS_DECISION_KIND_BIT(ATLAS_DECISION_KIND_OPERATIONAL_FACT), &ch, &err),
+        &err);
+    atlas_decision_result cr;
+    atlas_decision_result_init(&cr);
+    T_OK(atlas_decision_apply(db, &ch, &cr, &err), &err);
+
+    /* Spent under a policy that has since narrowed to POLICY only -- if
+     * `spend_challenge` did not re-check the mask, an already-outstanding
+     * challenge would still dispose of a kind the current policy no longer
+     * names. */
+    atlas_decision_op ap;
+    T_OK(build_op(ATLAS_DECISION_OP_APPROVE, ATLAS_DECISION_CHANNEL_REMOTE,
+                  atlas_buf_cstr(&e.fact_uid), NULL, ATLAS_DECISION_INTENT_APPROVE, 0, &cr.token,
+                  cr.confirm, e.dispose_token, e.dispose_id,
+                  ATLAS_DECISION_KIND_BIT(ATLAS_DECISION_KIND_POLICY), &ap, &err),
+        &err);
+    atlas_decision_result ar;
+    atlas_decision_result_init(&ar);
+    atlas_status st = atlas_decision_apply(db, &ap, &ar, &err);
+    T_CHECK_MSG(st != ATLAS_OK, "a spend succeeded under a mask the current policy has narrowed");
+    T_CHECK_MSG(
+        strstr(atlas_err_msg(&err), "is not one the remote disposal policy names; dispose of it "
+                                    "on a terminal") != NULL,
+        "wrong refusal: %s", atlas_err_msg(&err));
+
+    atlas_decision_challenge still;
+    load_challenge(db, &cr.token, &still);
+    T_CHECK_MSG(!still.consumed, "the challenge was consumed despite the narrowed policy");
+
+    atlas_decision_result_free(&ar);
+    atlas_decision_op_free(&ap);
+    atlas_decision_result_free(&cr);
+    atlas_decision_op_free(&ch);
+    atlas_db_close(db);
+    env_close(&e);
+}
+
 static const atlas_test TESTS[] = {
     {"a channel-less op is refused, for both a mint and a spend",
      test_a_channel_less_op_is_refused},
@@ -1010,6 +1147,10 @@ static const atlas_test TESTS[] = {
     {"the local path is unchanged, byte for byte", test_i_local_path_unchanged},
     {"a REMOTE op cannot be sent over the socket, and its token is wiped",
      test_j_remote_op_refused_over_the_socket_and_token_is_wiped},
+    {"a challenge is bound to the credential that minted it",
+     test_k_challenge_bound_to_the_credential_that_minted_it},
+    {"the kinds policy is re-checked at spend when it has narrowed",
+     test_l_kinds_policy_narrowed_between_mint_and_spend},
 };
 
 ATLAS_TEST_MAIN("decision_remote", TESTS)

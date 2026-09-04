@@ -406,6 +406,8 @@ static void test_no_source_or_document_overstates_the_approval_claim(void) {
         ATLAS_SRC_DIR "/src/core/service_decision.c",
         ATLAS_SRC_DIR "/src/mcp/mcp_tools.c",
         ATLAS_SRC_DIR "/src/cli/render_human.c",
+        ATLAS_SRC_DIR "/src/gw/ui/mission-control.html",
+        ATLAS_SRC_DIR "/src/core/service_review.c",
         NULL,
     };
     for (size_t f = 0; FILES[f] != NULL; f++) {
@@ -446,6 +448,10 @@ static void test_the_documents_state_the_precise_contract(void) {
          "reattachment after repository removal"},
         {ATLAS_SRC_DIR "/docs/decision-lifecycle.md",
          "cannot provide automatic reattachment after repository removal"},
+        {ATLAS_SRC_DIR "/src/gw/ui/mission-control.html", "names the channel, not a person"},
+        {ATLAS_SRC_DIR "/src/gw/ui/mission-control.html", "stores no authority"},
+        {ATLAS_SRC_DIR "/integrations/claude/atlas/skills/atlas-memory/SKILL.md",
+         "atlas review apply"},
     };
     for (size_t i = 0; i < sizeof(required) / sizeof(required[0]); i++) {
         atlas_buf text = ATLAS_BUF_INIT;

@@ -26,7 +26,7 @@ and what depends on them, without reading every file.
 
 **Before changing a public header or a shared symbol:** call `atlas_code_impact`.
 Changing something with sixty dependents is a different decision from changing
-something with two, and finding that out afterwards is the expensive way.
+something with two.
 
 **When you need to find something:** `atlas_code_symbol_search` finds symbols by
 name substring, and `atlas_code_symbol` gives every site one name is defined or
@@ -46,18 +46,20 @@ is actually made:** call `atlas_propose_decision` with the context, decision,
 rationale, alternatives and paths. A schema shape, a locking rule, a trust
 boundary, a dependency, a wire format, a compatibility promise. Not a rename or
 a typo — those get `atlas_record_reason`. (`atlas_record_decision` still works
-and now records a real decision too; prefer the structured tool.)
+too; prefer the structured tool.)
 
 **Do not invent a rationale.** If you made the choice without one you can state,
 say so. An invented rationale reads like a real one and nobody will check it.
 
 **No Atlas tool approves anything, and you must not approve for a user.** A
 proposal becomes policy only when somebody runs `atlas decision approve <repo>
-<id>` on a terminal and types a confirmation. If asked, give that command —
-**do not run it yourself**, and do not drive it through a shell or a
-pseudo-terminal. Atlas cannot tell that from a person, which is why you must
-not. If a user says in conversation that they approve, that is a fact about the
-conversation: record a proposal, never an approval.
+<id>` or walks a review sheet with `atlas review apply FILE`, each on a
+terminal with a typed confirmation. If asked, give the command —
+**do not run it yourself**, whichever it is, and do not drive either through a
+shell or a pseudo-terminal: Atlas cannot tell that from a person. Do not write
+a review sheet on a user's behalf either; a sheet is what a person decided in a
+browser, not a thing a model prepares. If a user says in conversation that they
+approve, record a proposal, never an approval.
 
 **When you do not know why something changed:** call
 `atlas_record_unknown_reason`. This matters more than it looks. A changed file
@@ -79,7 +81,7 @@ it, it was already modified when the session started, or you genuinely do not
 know. "It appears to be a refactor" is not a reason — it is a guess about a
 reason, and Atlas has a field for not knowing.
 
-You will not be penalised for UNKNOWN. Atlas is designed around it.
+You will not be penalised for UNKNOWN.
 
 ## Structural answers are candidates, not proof
 

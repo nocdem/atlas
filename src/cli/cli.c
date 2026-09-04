@@ -2080,10 +2080,67 @@ static atlas_status run_decision_confirm(cli_state *st, atlas_ctx *ctx, atlas_re
  * through the operator channel, one entry at a time, by looping the one
  * function that mints and spends a lifecycle capability
  * (`atlas_service_review_apply` -> `atlas_service_decision_confirm`). This
- * file mints and spends nothing itself. */
+ * file mints and spends nothing itself.
+ *
+ * The renderer is opened late, at the first entry actually produced --
+ * `memory_open_late`/`memory_finish`'s own shape, adopted rather than
+ * copied for the same reason those exist: a refusal that happens before any
+ * entry (a malformed sheet, a missing file, the zero-entry refusal
+ * `atlas_service_review_apply` itself always raises before its loop) would
+ * otherwise land *inside* a JSON document `review_begin` already opened --
+ * `"entries":[` with no closing bracket and no comma before the error
+ * object -- the same defect CLAUDE.md names for `job list`/`plan list` and
+ * `docs/backlog.md` carries as a family-wide fix nobody has made. Opening
+ * late does not cover a refusal *after* the first entry has already
+ * streamed to stdout in `--json` mode -- nothing can un-write bytes already
+ * flushed -- which is the same residual `memory_open_late` itself leaves. */
+typedef struct review_render_ctx {
+    atlas_renderer *r;
+    cli_state *st;
+    const char *sheet_path;
+    bool check_only;
+    bool opened;
+} review_render_ctx;
+
+static atlas_status review_open_late(review_render_ctx *rc, atlas_err *err) {
+    if (rc->opened) {
+        return ATLAS_OK;
+    }
+    atlas_status st = renderer_open(rc->r, rc->st->opts.json, rc->st->out, "review apply", err);
+    if (st == ATLAS_OK) {
+        st = rc->r->v->review_begin(rc->r, rc->sheet_path, rc->check_only, err);
+    }
+    if (st == ATLAS_OK) {
+        rc->opened = true;
+    }
+    return st;
+}
+
 static atlas_status review_entry_sink(const atlas_review_outcome *o, void *ud, atlas_err *err) {
-    list_sink *ls = (list_sink *)ud;
-    return ls->r->v->review_entry(ls->r, o, err);
+    review_render_ctx *rc = (review_render_ctx *)ud;
+    atlas_status st = review_open_late(rc, err);
+    if (st == ATLAS_OK) {
+        st = rc->r->v->review_entry(rc->r, o, err);
+    }
+    return st;
+}
+
+/* Closes what `review_open_late` opened, or reports a refusal that happened
+ * before any entry did -- `memory_finish`'s own two-branch ending. */
+static atlas_status review_finish(review_render_ctx *rc, atlas_status result,
+                                  const atlas_review_totals *t, bool check_only, atlas_err *err) {
+    if (!rc->opened) {
+        return result;
+    }
+    if (result == ATLAS_OK) {
+        result = rc->r->v->review_totals(rc->r, check_only, t, err);
+    }
+    if (result == ATLAS_OK) {
+        result = renderer_close(rc->r, err);
+    } else {
+        renderer_abort(rc->r);
+    }
+    return result;
 }
 
 /* Reuses the mechanism `atlas gate` already carries in `st->gate_exit`: a
@@ -2149,29 +2206,17 @@ static atlas_status run_review(cli_state *st, atlas_ctx *ctx, atlas_renderer *r,
     const char *sheet_path = st->operands[1];
     bool check_only = st->opts.check;
 
-    atlas_status result = renderer_open(r, st->opts.json, st->out, "review apply", err);
-    if (result != ATLAS_OK) {
-        return result;
-    }
-    result = r->v->review_begin(r, sheet_path, check_only, err);
+    review_render_ctx rc = {r, st, sheet_path, check_only, false};
     atlas_review_totals totals;
     memset(&totals, 0, sizeof(totals));
+    atlas_status result = atlas_service_review_apply(ctx, sheet_path, check_only, review_entry_sink,
+                                                      &rc, &totals, err);
+    result = review_finish(&rc, result, &totals, check_only, err);
     if (result == ATLAS_OK) {
-        list_sink ls = {r};
-        result = atlas_service_review_apply(ctx, sheet_path, check_only, review_entry_sink, &ls,
-                                            &totals, err);
-    }
-    if (result == ATLAS_OK) {
-        result = r->v->review_totals(r, check_only, &totals, err);
-    }
-    if (result == ATLAS_OK) {
-        result = renderer_close(r, err);
         /* Only once the document is complete, for the reason `gate` sets
          * `gate_exit` only there: a non-zero exit beside a half-written
          * answer would tell a caller to act on something it cannot read. */
         st->gate_exit = review_exit_code(check_only, &totals);
-    } else {
-        renderer_abort(r);
     }
     return result;
 }

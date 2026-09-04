@@ -578,6 +578,41 @@ additional accepted hostnames: `docs/remote-access.md`, "Anonymous browser
 reads, stated honestly" and "The `Host` check: DNS rebinding was sufficient
 without it".
 
+### Approving a record from the browser: refused today, and why
+
+Mission Control reads a knowledge record in full and cannot dispose of one.
+Approving, rejecting or resolving still needs `atlas review apply` or
+`atlas decision approve` on a terminal on this machine, as the operator's own
+uid, because the operator channel is selected by `SO_PEERCRED` and the gateway
+runs as a different uid. That is A9's design and this section is not a caveat
+to it.
+
+The operator asked for browser approval and it is planned, in full, at
+`docs/plans/2026-09-04-browser-disposal.md`. **It is not built, and the reason
+it is not built is a decision they made on 2026-09-04 rather than an
+oversight.** The plan requires TLS in front of the gateway: not because Atlas
+terminates any — it never does — but because the capability that disposes of a
+record would otherwise travel over the same cleartext listener the anonymous
+read floor uses. The chain the operator was shown before deciding: this
+listener is `tls_mode = NONE`; an A9 credential carries **no expiry**, so one
+capture on the wire is not a session somebody loses in twelve hours but durable
+authority until `atlas api-key revoke` runs; and the thing that authority
+disposes of is the one record in Atlas that is **not rebuildable** — invariant 1
+covers the index, and a decision ledger is not the index.
+
+The operator's answer, on their own network and after that chain: HTTPS is not
+needed there. **Recorded as their decision.** Its cost is that when the season
+is built it will be built without TLS, and the plan's own amendment note carries
+that; a reader who finds a cleartext disposal channel on this deployment is
+looking at a choice a person made with the argument in front of them, not at
+something nobody thought about.
+
+Until it is built, the honest statement of this deployment is unchanged:
+**nothing reachable over the network can change a lifecycle state.** The
+anonymous floor grants reads and no more, `memory:write` is in the scope
+vocabulary and not grantable to any credential, and `atlas_decision_apply_in_tx`
+has exactly three callers, none of them reachable from `src/gw`.
+
 ## Reporting a vulnerability
 
 Atlas has no public distribution or security contact yet. Until it does, report

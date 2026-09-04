@@ -1475,6 +1475,43 @@ pilot runs: this project's own rule that no evidence of a result is not
 evidence against one applies to its own acceptance, and this document does
 not pre-write the shape of a finding nobody has measured yet.
 
+## Later: A16 — approving a record from the browser
+
+The sentence it exists for is
+
+> **A SCREEN BUILT SO NOBODY WOULD NEED THE TERMINAL THAT STILL NEEDS THE
+> TERMINAL.**
+
+A15 shipped a review surface that reads a knowledge record in full — every
+revision, its claims and their evidence, the gate assessment, the impact set —
+and disposes of one through `atlas review apply` on a terminal on this machine.
+The operator built Mission Control in order not to use the CLI and said so when
+they saw the result. A15's own plan had left that choice open and stated in
+writing that it was the operator's to make; it was never put to them, and
+fourteen hours went into building the reading half well and the disposing half
+in the place they had not asked for. That is the whole reason this section
+exists, and it is written down because the failure was a question that died in
+a document rather than a defect any review could have caught.
+
+**The plan is written and complete**: `docs/plans/2026-09-04-browser-disposal.md`
+— eleven tasks, its own channel identity and migration 31, its own ungrantable
+scope, absence from the MCP surface, the daemon authenticating the bearer token
+itself inside the transaction that spends the capability, replay bound to the
+revision's content hash, and a root-owned policy naming which record kinds may
+be disposed of remotely. `LOCAL_OPERATOR_CONFIRMED` is never reused: reusing it
+would make every audit row ever written retrospectively ambiguous, which is the
+one cost that cannot be paid back.
+
+**Not started, deliberately.** The operator's judgement on 2026-09-04 was that
+it is not urgent. What blocks nothing and waits for them: the plan's TLS
+requirement, which they declined for their own network — recorded with its chain
+in `SECURITY.md` under "Approving a record from the browser: refused today, and
+why", and to be carried into the season as an explicit, root-owned acceptance
+key that `atlas gateway status` prints, rather than as a check quietly absent.
+
+Until it is built the deployment's statement is unchanged: nothing reachable
+over the network can change a lifecycle state.
+
 ## Later: A14 — a job an operator submits from wherever they are
 
 The sentence it exists for is
@@ -1555,7 +1592,7 @@ passes.**
 - **The audit row names the key, never a claimed value**, the way `gw_audit`
   already refuses to store what a caller says about itself.
 
-## Next: A15 — the review surface, and where a proposal is disposed of
+## A15 — the review surface, and where a proposal is disposed of (shipped)
 
 A4 gave Atlas a lifecycle and one channel that may move it. A9 gave it a web
 surface that may only read. Today those two facts meet at an inconvenience an

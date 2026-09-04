@@ -47,6 +47,7 @@
 #include "atlas/gw.h"
 #include "atlas/gwpolicy.h"
 #include "atlas/ipc.h"
+#include "atlas/service.h"
 #include "atlas_test.h"
 #include "daemon/daemon_internal.h"
 #include "ipc/server_internal.h"
@@ -570,10 +571,82 @@ static void test_a_gateway_auth_scope_derivation(void) {
         fx_daemon_free(&d);
     }
 
+    /* Instance 3: the policy names the *reader* credential as the disposal
+     * key. `atlas_gwpolicy_parse_buffer` checks only the shape of
+     * `remote_dispose_key` -- it opens no database and cannot know a
+     * credential's stored scopes -- so this loads exactly as cleanly as
+     * naming the scopeless one does. This is the case `rec.mask == 0u` in
+     * `method_gateway_auth` exists for: with the reader key's own id equal
+     * to the policy's `remote_dispose_key`, the `strcmp` alone would match
+     * and derive `decisions:dispose` for a credential that already holds
+     * `decisions:read` -- widening a real, scoped credential rather than
+     * activating an inert one. Every other instance in this test names the
+     * `--no-scopes` dispose credential, where `strcmp` failing for the
+     * reader key already refuses it and `rec.mask == 0u` is never the
+     * reason; this is the one case that isolates it. */
+    {
+        atlas_buf ptext = ATLAS_BUF_INIT;
+        T_OK(atlas_buf_appendf(&ptext, &err,
+                               "enabled = yes\ngateway_uid = %lld\nremote_mcp = yes\n"
+                               "web_gui = yes\nlisten_addr = 127.0.0.1\ntls_mode = "
+                               "REVERSE_PROXY\nremote_dispose_key = key_%s\n"
+                               "remote_dispose_kinds = OPERATIONAL_FACT\n",
+                               (long long)getuid(), e.reader_id),
+             &err);
+        atlas_buf ppath = ATLAS_BUF_INIT;
+        write_policy(&e, "p3.conf", atlas_buf_cstr(&ptext), &ppath);
+        atlas_buf_free(&ptext);
+
+        fx_daemon d;
+        fx_daemon_init(&d);
+        T_OK(gwd_start(&e, atlas_buf_cstr(&ppath), &d, &err), &err);
+        T_OK(fx_daemon_wait_ready(&d, 15000, &err), &err);
+
+        atlas_buf resp = ATLAS_BUF_INIT;
+        (void)snprintf(params, sizeof(params), "{\"token\":\"%s\"}", e.reader_token);
+        call(&d, "gateway.auth", params, &resp);
+        T_CHECK_MSG(strstr(atlas_buf_cstr(&resp), "\"authenticated\":true") != NULL,
+                    "the reader key did not authenticate: %s", atlas_buf_cstr(&resp));
+        atlas_buf scopes = ATLAS_BUF_INIT;
+        T_REQUIRE_MSG(get_str(&resp, "scopes", &scopes), "no scopes field: %s",
+                     atlas_buf_cstr(&resp));
+        T_CHECK_MSG(strcmp(atlas_buf_cstr(&scopes), "decisions:read") == 0,
+                    "naming an already-scoped credential as the disposal key widened it: %s",
+                    atlas_buf_cstr(&scopes));
+        atlas_buf_free(&scopes);
+        atlas_buf_free(&resp);
+        atlas_buf_free(&ppath);
+
+        fx_daemon_stop(&d, false);
+        fx_daemon_free(&d);
+    }
+
     env_close(&e);
 }
 
 /* --- (b): the full remote-disposal happy path -------------------------------- */
+
+/* Orphan #1 (review round 1): a collector for `atlas_service_decision_history_
+ * remote`, called in-process against a real daemon exactly as
+ * `test_remote_equivalence.c` calls the `_remote` twins -- the only way to
+ * exercise `service_remote.c:1684`'s own `key_id` parse, since the CLI's
+ * remote branch is reached only for a *foreign* index (`index_is_foreign`,
+ * A7.1) and this fixture's own data directory is never that. */
+typedef struct remote_key_capture {
+    char key_id[ATLAS_APIKEY_SELECTOR_HEX + 1u];
+    bool found;
+} remote_key_capture;
+
+static atlas_status capture_remote_key_id(const atlas_decision_timeline_entry *e, void *ud,
+                                          atlas_err *err) {
+    (void)err;
+    remote_key_capture *kc = (remote_key_capture *)ud;
+    if (e->key_id != NULL && e->event != NULL && strcmp(e->event, "REJECTED") == 0) {
+        (void)snprintf(kc->key_id, sizeof(kc->key_id), "%s", e->key_id);
+        kc->found = true;
+    }
+    return ATLAS_OK;
+}
 
 static void test_b_remote_dispose_happy_path(void) {
     env e;
@@ -655,10 +728,8 @@ static void test_b_remote_dispose_happy_path(void) {
                 atlas_buf_cstr(&out_key_id));
 
     /* decision.history shows the event with key_id -- the raw daemon
-     * response, not the CLI's `--json` rendering: `render_json.c` has not
-     * been taught this field yet (a later task's job; the wire format this
-     * season's write point actually produces is what this test is
-     * responsible for), and `on_event` in server_decision.c is. */
+     * response, proving the wire format this season's write point actually
+     * produces (`on_event` in server_decision.c). */
     atlas_buf_reset(&resp);
     (void)snprintf(params, sizeof(params), "{\"repo\":\"proj\",\"decision\":\"%s\"}",
                    atlas_buf_cstr(&fact_uid));
@@ -668,13 +739,99 @@ static void test_b_remote_dispose_happy_path(void) {
     T_CHECK_MSG(strstr(atlas_buf_cstr(&resp), needle) != NULL,
                 "decision.history does not carry the credential id: %s", atlas_buf_cstr(&resp));
 
+    /* Orphan #1 (review round 1): the CLI's own `--json` rendering, exercised
+     * end to end through the daemon this test already has running --
+     * `atlas_decision_timeline_entry` gained a `key_id` member,
+     * `service_decision.c`'s local `on_event` and `service_remote.c`'s
+     * daemon-response parse both fill it, and `render_json.c`/`render_human.c`
+     * both emit it. T10's brief verifies the human `credential: key_…` line
+     * during live acceptance; this is the first place either rendering is
+     * actually exercised. */
+    {
+        atlas_buf jout = ATLAS_BUF_INIT;
+        int jcode = -1;
+        const char *hist_json[] = {"decision", "history", "proj", atlas_buf_cstr(&fact_uid),
+                                   "--json"};
+        run_atlas(&e, hist_json, 5u, &jout, &jcode);
+        T_EQ_INT(jcode, 0);
+        T_CHECK_MSG(strstr(atlas_buf_cstr(&jout), needle) != NULL,
+                    "the CLI's --json rendering does not carry the credential id: %s",
+                    atlas_buf_cstr(&jout));
+        atlas_buf_free(&jout);
+
+        atlas_buf hout = ATLAS_BUF_INIT;
+        int hcode = -1;
+        const char *hist_human[] = {"decision", "history", "proj", atlas_buf_cstr(&fact_uid)};
+        run_atlas(&e, hist_human, 4u, &hout, &hcode);
+        T_EQ_INT(hcode, 0);
+        char credential_needle[80];
+        (void)snprintf(credential_needle, sizeof(credential_needle), "credential: %s",
+                       e.dispose_id);
+        T_CHECK_MSG(strstr(atlas_buf_cstr(&hout), credential_needle) != NULL,
+                    "the human rendering does not carry \"credential: %s\": %s", e.dispose_id,
+                    atlas_buf_cstr(&hout));
+        atlas_buf_free(&hout);
+    }
+
+    /* Orphan #1, the fifth file: `service_remote.c`'s own parse of `key_id`,
+     * proved by calling `atlas_service_decision_history_remote` directly, in
+     * this process, against this same daemon -- `test_remote_equivalence.c`'s
+     * own precedent for how a `_remote` function is pointed at a fixture
+     * daemon rather than a real one. The two environment variables are
+     * restored immediately after, since this test binary runs every test
+     * function in one process and nothing later in this file expects either
+     * set. */
+    {
+        const char *old_xdg = getenv("XDG_RUNTIME_DIR");
+        const char *old_dd = getenv("ATLAS_DATA_DIR");
+        char *saved_xdg = old_xdg != NULL ? strdup(old_xdg) : NULL;
+        char *saved_dd = old_dd != NULL ? strdup(old_dd) : NULL;
+        T_REQUIRE(setenv("XDG_RUNTIME_DIR", atlas_buf_cstr(&d.runtime_dir), 1) == 0);
+        T_REQUIRE(setenv("ATLAS_DATA_DIR", fx_data_dir(&e.fx), 1) == 0);
+
+        remote_key_capture kc;
+        memset(&kc, 0, sizeof(kc));
+        bool ragrees = true;
+        atlas_status rst = atlas_service_decision_history_remote(
+            "proj", atlas_buf_cstr(&fact_uid), NULL, capture_remote_key_id, &kc, &ragrees, &err);
+        T_OK(rst, &err);
+        T_CHECK_MSG(kc.found,
+                    "service_remote.c's parse never saw a REJECTED event carrying a key_id");
+        T_CHECK_MSG(strcmp(kc.key_id, e.dispose_id) == 0,
+                    "service_remote.c parsed the wrong key_id: %s vs %s", kc.key_id,
+                    e.dispose_id);
+
+        if (saved_xdg != NULL) {
+            (void)setenv("XDG_RUNTIME_DIR", saved_xdg, 1);
+            free(saved_xdg);
+        } else {
+            (void)unsetenv("XDG_RUNTIME_DIR");
+        }
+        if (saved_dd != NULL) {
+            (void)setenv("ATLAS_DATA_DIR", saved_dd, 1);
+            free(saved_dd);
+        } else {
+            (void)unsetenv("ATLAS_DATA_DIR");
+        }
+    }
+
     fx_daemon_stop(&d, false);
     fx_daemon_free(&d);
 
     atlas_buf doctor = ATLAS_BUF_INIT;
-    int code = 0;
+    int code = -1;
     const char *doc[] = {"doctor"};
     run_atlas(&e, doc, 1u, &doctor, &code);
+    /* M1 (review round 1): the exit code was captured and never checked, and
+     * the only assertion below is an absence -- both together mean an empty
+     * `doctor` output with a non-zero exit would have passed. `doctor` exits
+     * `ATLAS_ERR_CONFIG` (3) when `atlas_doctor_report.ok` is false
+     * (`cli.c`'s "doctor reports a problem through its exit code"), so 0 here
+     * means the report actually found nothing wrong, and "status: ok" is the
+     * positive anchor proving the output is the real report and not empty. */
+    T_EQ_INT(code, 0);
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&doctor), "status: ok") != NULL,
+                "doctor did not report a clean status: %s", atlas_buf_cstr(&doctor));
     T_CHECK_MSG(strstr(atlas_buf_cstr(&doctor), "cached status disagrees") == NULL,
                 "doctor reports the ledger disagreeing with the cache: %s",
                 atlas_buf_cstr(&doctor));
@@ -860,6 +1017,58 @@ static void test_d_policy_gate(void) {
         atlas_buf_free(&fact_uid);
     }
 
+    /* d4: every policy condition passes -- state ENABLED, a named disposal
+     * key, its kinds, TLS in front -- and only the peer half of the gate can
+     * refuse. `gateway_uid` names a uid one away from the test process's own,
+     * so `atlas_server_peer_is_gateway` compares the policy's uid against the
+     * real `SO_PEERCRED` peer and the two never match: this daemon has a
+     * fully valid disposal policy for a *different* gateway. This is the
+     * regression I1 asked for: every other test in this file either fails
+     * the policy half (d1, d2) or connects as the uid the policy actually
+     * names (d3, test_a, test_b), so nothing before this exercised the peer
+     * test at all -- confirmed by deleting it (see the report: the whole
+     * suite still passed). Asserts `unknown method` for both disposal
+     * methods and for `gateway.auth`, which this uid is equally not the
+     * gateway for. */
+    {
+        atlas_buf ptext = ATLAS_BUF_INIT;
+        T_OK(atlas_buf_appendf(&ptext, &err,
+                               "enabled = yes\ngateway_uid = %lld\nremote_mcp = yes\n"
+                               "web_gui = yes\ntls_mode = REVERSE_PROXY\nremote_dispose_key = "
+                               "key_%s\nremote_dispose_kinds = OPERATIONAL_FACT\n",
+                               (long long)getuid() + 1, e.dispose_id),
+             &err);
+        atlas_buf ppath = ATLAS_BUF_INIT;
+        write_policy(&e, "d4.conf", atlas_buf_cstr(&ptext), &ppath);
+        atlas_buf_free(&ptext);
+
+        fx_daemon d;
+        fx_daemon_init(&d);
+        T_OK(gwd_start(&e, atlas_buf_cstr(&ppath), &d, &err), &err);
+        T_OK(fx_daemon_wait_ready(&d, 15000, &err), &err);
+
+        static const char *const NAMES[] = {"decision.remote_challenge",
+                                            "decision.remote_dispose", "gateway.auth"};
+        for (size_t i = 0; i < 3; i++) {
+            atlas_buf resp = ATLAS_BUF_INIT;
+            char params[256];
+            if (strcmp(NAMES[i], "gateway.auth") == 0) {
+                (void)snprintf(params, sizeof(params), "{\"token\":\"%s\"}", e.dispose_token);
+            } else {
+                (void)snprintf(params, sizeof(params), "{}");
+            }
+            call(&d, NAMES[i], params, &resp);
+            T_CHECK_MSG(strstr(atlas_buf_cstr(&resp), "unknown method") != NULL,
+                        "\"%s\" is reachable for a peer the policy does not name as its "
+                        "gateway, under an otherwise fully satisfied policy: %s",
+                        NAMES[i], atlas_buf_cstr(&resp));
+            atlas_buf_free(&resp);
+        }
+        fx_daemon_stop(&d, false);
+        fx_daemon_free(&d);
+        atlas_buf_free(&ppath);
+    }
+
     env_close(&e);
 }
 
@@ -911,7 +1120,15 @@ static void test_e_refusals(void) {
                 "revision=0 was not refused with its frozen sentence: %s",
                 atlas_buf_cstr(&resp));
 
-    /* a non-newest revision */
+    /* a non-newest revision. Review round 1: this sentence moved from
+     * ATLAS_ERR_USAGE (400/exit 2) to ATLAS_ERR_INTEGRITY (409/exit 7) --
+     * it is a refusal about the document's state, not about this
+     * well-formed request, matching its spend-time twin ("this decision
+     * gained revision ... after the challenge was minted") a few lines
+     * below, which was INTEGRITY already. `"status"` on the wire is
+     * `(int64_t)err->status` verbatim (`server.c`'s error-response writer),
+     * so 7 here is the direct, positive proof of the class, not an
+     * inference from the sentence text. */
     atlas_buf_reset(&resp);
     (void)snprintf(params, sizeof(params),
                    "{\"repo\":\"proj\",\"decision\":\"%s\",\"revision\":1,\"intent\":\"reject\","
@@ -920,6 +1137,9 @@ static void test_e_refusals(void) {
     call(&d, "decision.remote_challenge", params, &resp);
     T_CHECK_MSG(strstr(atlas_buf_cstr(&resp), "is minted only for the newest revision") != NULL,
                 "a non-newest revision was not refused with its frozen sentence: %s",
+                atlas_buf_cstr(&resp));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&resp), "\"status\":7") != NULL,
+                "a non-newest revision was not refused as ATLAS_ERR_INTEGRITY (7): %s",
                 atlas_buf_cstr(&resp));
 
     /* a kind outside the policy's list */
@@ -938,35 +1158,32 @@ static void test_e_refusals(void) {
      *
      * `decision.remote_challenge` never reads a "replacement" parameter --
      * the Frozen formats' own params list for it has none, on purpose: a
-     * browser offers no supersede action. `op_challenge` checks
-     * `replacement_uid.len > 0` first and, failing that, an
-     * intent-is-SUPERSEDE-with-no-replacement case second -- both ahead of
-     * the REMOTE-and-(SUPERSEDE|REVALIDATE) check below. So for SUPERSEDE
-     * specifically, the earlier "no replacement named" refusal (the
-     * ordinary one every SUPERSEDE intent gets, local or remote) always
-     * fires first, and the REMOTE-specific sentence for this one intent is
-     * unreachable through this endpoint by construction. It is still
-     * exercised directly (bypassing both endpoints) by
-     * `test_decision_remote.c`'s `test_g_supersede_and_revalidate_refused_
-     * remotely`. The property this sub-case is for still holds: a browser
-     * cannot mint a working supersede capability, one way or another. */
+     * browser offers no supersede action. Review finding I4 moved the
+     * REMOTE-and-(SUPERSEDE|REVALIDATE) check in `op_challenge`
+     * (`src/decision/lifecycle.c`) ahead of the replacement/supersede
+     * handling that used to run first, so a REMOTE SUPERSEDE request no
+     * longer falls into the ordinary "no replacement named" refusal (USAGE,
+     * 400 -- actionable advice this endpoint has no way to act on, since it
+     * never reads a `replacement` parameter) before reaching this
+     * REMOTE-specific one (INTEGRITY, 409). Both SUPERSEDE and REVALIDATE
+     * now reach the same frozen sentence through this real endpoint; before
+     * the fix, only REVALIDATE did (see the report for the prior, wrong,
+     * claim that neither did). */
     atlas_buf_reset(&resp);
     (void)snprintf(params, sizeof(params),
                    "{\"repo\":\"proj\",\"decision\":\"%s\",\"revision\":1,"
                    "\"intent\":\"supersede\",\"token\":\"%s\"}",
                    atlas_buf_cstr(&d_supersede), e.dispose_token);
     call(&d, "decision.remote_challenge", params, &resp);
-    T_CHECK_MSG(strstr(atlas_buf_cstr(&resp), "needs the decision that replaces this one") !=
-                   NULL,
-                "a supersede intent with no replacement was not refused as expected: %s",
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&resp), "are not offered from the browser") != NULL,
+                "a supersede intent was not refused with the REMOTE-channel frozen sentence: %s",
                 atlas_buf_cstr(&resp));
 
-    /* a revalidate intent, unlike supersede, has no earlier "no replacement
-     * named" gate ahead of it in `op_challenge` -- `replacement_uid.len > 0`
-     * is false and `c.intent == SUPERSEDE` is false, so REVALIDATE falls
-     * through both and reaches the REMOTE-and-(SUPERSEDE|REVALIDATE) check
-     * directly. This is the one real path by which the browser-facing
-     * endpoint reaches that frozen sentence. */
+    /* a revalidate intent reaches the same REMOTE-channel refusal. Before
+     * I4's fix this was already true (REVALIDATE never took the
+     * replacement/supersede branch above it); after the fix it is true for
+     * the same reason SUPERSEDE now is, so this sub-case doubles as I4's own
+     * regression test. */
     atlas_buf_reset(&resp);
     (void)snprintf(params, sizeof(params),
                    "{\"repo\":\"proj\",\"decision\":\"%s\",\"revision\":1,"

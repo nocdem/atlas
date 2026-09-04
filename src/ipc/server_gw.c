@@ -132,9 +132,25 @@ static atlas_status method_gateway_auth(dispatch_state *ds, const atlas_ipc_requ
              * scope list is empty: a `--no-scopes` credential is inert until
              * this policy gives it its one grant, and a credential that
              * already holds ordinary scopes is never widened by being named
-             * here (naming a non-scopeless credential there is refused at
-             * policy load -- T4's rule -- so this is defence in depth, not
-             * the guarantee).
+             * here.
+             *
+             * There is no load-time refusal of naming a non-scopeless
+             * credential: `atlas_gwpolicy_parse_buffer` opens no database and
+             * checks only `remote_dispose_key`'s shape, so a policy naming an
+             * ordinary reader key loads exactly as cleanly as one naming a
+             * `--no-scopes` credential does. `rec.mask == 0u`, right here, is
+             * the whole of what stops that key's scopes being reported as
+             * `decisions:dispose` -- not a second check behind a first one,
+             * the only one. The actual guarantee against a *scoped*
+             * credential spending a disposal is `atlas_decision_remote_verify`
+             * (`src/decision/remote.c`), inside the write transaction: it
+             * refuses `rec.mask != 0u` on its own account, independent of
+             * whatever this endpoint reports. Removing the check here would
+             * not let a scoped credential dispose anything -- it would make
+             * `gateway.auth` claim a scope the write point would then refuse
+             * to honour, trading a clean 403 (`gateway.auth` never having
+             * offered the scope) for a 409 raised deep inside a spend the
+             * caller had no way to know would fail.
              *
              * Gated on `atlas_server_remote_disposal_policy_ready`, the same
              * test `decision.remote_challenge` and `decision.remote_dispose`

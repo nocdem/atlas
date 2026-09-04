@@ -655,6 +655,9 @@ static atlas_status on_event(const atlas_decision_event_row *row, void *ud, atla
     e.at = row->created_at;
     e.revision_no = row->revision_no;
     e.operator_channel = row->challenge_id > 0;
+    /* A16. NULL for everything but a REMOTE_OPERATOR_CONFIRMED transition --
+     * `row->key_id` already carries that distinction, verbatim. */
+    e.key_id = row->key_id;
     return hs->event_cb(&e, hs->ud, err);
 }
 

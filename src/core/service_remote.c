@@ -1693,6 +1693,11 @@ atlas_status atlas_service_decision_history_remote(const char *repo, const char 
             {"event", &e.event},           {"actor", &e.actor},
             {"content_hash", &e.content_hash}, {"superseded_by", &e.superseded_by},
             {"detail", &e.detail},         {"at", &e.at},
+            /* A16. Absent as a string (JSON `null`, written by
+             * `atlas_json_key_str_opt`) for every transition but a
+             * REMOTE_OPERATOR_CONFIRMED one, so this leaves `e.key_id` NULL
+             * exactly as the local path's `on_event` does. */
+            {"key_id", &e.key_id},
         };
         for (size_t k = 0; k < sizeof strs / sizeof strs[0]; k++) {
             if (atlas_ipc_result_arr_obj_str(r, "timeline", i, strs[k].k, &v)) {

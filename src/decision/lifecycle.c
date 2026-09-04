@@ -987,7 +987,17 @@ static atlas_status op_challenge(apply_ctx *ac, const atlas_decision_op *op,
      * newer proposed revision indefinitely with nothing warning about it. The
      * local channel still permits that -- an operator who typed
      * `--revision N` asked for it -- but a remote challenge is minted only for
-     * whichever revision is newest at mint time. */
+     * whichever revision is newest at mint time.
+     *
+     * ATLAS_ERR_INTEGRITY (review round 1, amending the plan at `c7ebdf8`),
+     * not ATLAS_ERR_USAGE: this is a refusal about the document's state, not
+     * about the request, and the request itself is perfectly well-formed. The
+     * spend-time twin below (`this decision gained revision ... after the
+     * challenge was minted`) already carries INTEGRITY for the same event
+     * observed a moment later -- a colleague's revision landing before or
+     * after this mint -- and USAGE here told a caller who sent nothing wrong
+     * to fix a request that was not broken, which is advice they cannot act
+     * on. "Read it again" is the actionable half of the sentence either way. */
     if (op->channel == ATLAS_DECISION_CHANNEL_REMOTE) {
         int64_t latest_id = 0, latest_no = 0;
         char latest_hash[ATLAS_SHA256_HEX_LEN + 1u];
@@ -999,7 +1009,7 @@ static atlas_status op_challenge(apply_ctx *ac, const atlas_decision_op *op,
             return st;
         }
         if (rev_no != latest_no) {
-            return atlas_err_set(err, ATLAS_ERR_USAGE,
+            return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
                                  "a remote challenge is minted only for the newest revision; r%lld "
                                  "was reviewed but r%lld is newest -- read it again",
                                  (long long)rev_no, (long long)latest_no);
@@ -1051,6 +1061,31 @@ static atlas_status op_challenge(apply_ctx *ac, const atlas_decision_op *op,
      * the later request. Naming a replacement implies supersession; anything
      * else is what the caller asked for. */
     c.intent = op->intent;
+    /* A16, moved ahead of the replacement/supersede handling below (review
+     * finding I4): this used to sit after it, so a REMOTE request with
+     * `intent = SUPERSEDE` -- `decision.remote_challenge` never reads a
+     * `replacement` parameter, so `op->replacement_uid.len` is always 0 for
+     * this channel -- fell into the `else if` below and got USAGE's "a
+     * supersession needs the decision that replaces this one" instead of
+     * this INTEGRITY refusal. Two refusals for what is semantically one
+     * event -- "this channel does not do this" -- is this season's own "one
+     * class per sentence" rule, and the wrong one of the two is actionable
+     * advice a REMOTE caller cannot act on: `decision.remote_challenge`'s own
+     * params list has no `replacement` field, and the write table's
+     * allowlist drops one before the daemon ever sees it, so supplying it
+     * produces the identical wrong refusal forever. Checked first and
+     * unconditionally for a REMOTE SUPERSEDE or REVALIDATE, so neither the
+     * replacement lookup nor the intent-specific work beyond this function
+     * ever runs on its way to being refused anyway; conditioned on
+     * `c.channel == ATLAS_DECISION_CHANNEL_REMOTE`, so the LOCAL path -- and
+     * its own "no replacement named" refusal -- is unchanged. */
+    if (c.channel == ATLAS_DECISION_CHANNEL_REMOTE &&
+        (c.intent == ATLAS_DECISION_INTENT_SUPERSEDE ||
+         c.intent == ATLAS_DECISION_INTENT_REVALIDATE)) {
+        return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                             "supersede and revalidate are not offered from the browser; use a "
+                             "terminal on the Atlas machine");
+    }
     if (op->replacement_uid.len > 0) {
         c.intent = ATLAS_DECISION_INTENT_SUPERSEDE;
         int64_t rid = 0, rrepo = 0;
@@ -1075,17 +1110,6 @@ static atlas_status op_challenge(apply_ctx *ac, const atlas_decision_op *op,
     } else if (c.intent == ATLAS_DECISION_INTENT_SUPERSEDE) {
         return atlas_err_set(err, ATLAS_ERR_USAGE,
                              "a supersession needs the decision that replaces this one");
-    }
-    /* A16. Checked before either intent-specific block below runs, so a
-     * REMOTE request for one of these never does the revalidate-specific
-     * repository-state work (and cannot receive one of *those* refusals
-     * instead of this one) on its way to being refused anyway. */
-    if (c.channel == ATLAS_DECISION_CHANNEL_REMOTE &&
-        (c.intent == ATLAS_DECISION_INTENT_SUPERSEDE ||
-         c.intent == ATLAS_DECISION_INTENT_REVALIDATE)) {
-        return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
-                             "supersede and revalidate are not offered from the browser; use a "
-                             "terminal on the Atlas machine");
     }
     (void)snprintf(c.created_at, sizeof(c.created_at), "%s", ac->now);
     {

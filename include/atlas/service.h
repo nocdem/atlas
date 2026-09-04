@@ -693,6 +693,11 @@ typedef struct atlas_decision_timeline_entry {
     const char *at;
     int64_t revision_no;
     bool operator_channel;
+    /* A16, migration 31. NULL for every transition but a
+     * REMOTE_OPERATOR_CONFIRMED one, mirroring `atlas_decision_event_row`'s
+     * own field: the sixteen-hex id of the credential the gateway presented,
+     * once the daemon has verified it -- an id, not a secret. */
+    const char *key_id;
 } atlas_decision_timeline_entry;
 
 /* What a lifecycle write reports back. */

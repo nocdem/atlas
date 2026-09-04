@@ -1366,9 +1366,14 @@ static atlas_status h_decision_event(atlas_renderer *r, const atlas_decision_tim
                                      atlas_err *err) {
     (void)err;
     r->items++;
-    (void)fprintf(r->out, "  %s  %-10s rev %" PRId64 "  %s%s\n", e->at != NULL ? e->at : "",
+    /* `credential: key_<hex>` is appended on this same line, per the Frozen
+     * formats section -- present only for a REMOTE_OPERATOR_CONFIRMED event.
+     * `e->key_id` is Atlas-verified hex, not untrusted text, so it is printed
+     * as-is, like `principal.key_id` elsewhere. */
+    (void)fprintf(r->out, "  %s  %-10s rev %" PRId64 "  %s%s%s%s\n", e->at != NULL ? e->at : "",
                   e->event, e->revision_no, e->actor != NULL ? e->actor : "",
-                  e->operator_channel ? "  [operator channel]" : "");
+                  e->operator_channel ? "  [operator channel]" : "",
+                  e->key_id != NULL ? "  credential: " : "", e->key_id != NULL ? e->key_id : "");
     if (e->superseded_by != NULL) {
         (void)fprintf(r->out, "      replaced by %s\n", e->superseded_by);
     }

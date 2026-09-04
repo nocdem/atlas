@@ -139,6 +139,21 @@ bool atlas_server_remote_disposal_offered(const atlas_server_ctx *ctx, long long
     if (ctx == NULL) {
         return false;
     }
+    /* `atlas_server_peer_is_gateway` has a third branch below its root-owned-
+     * policy comparison: with no gateway named it falls to the daemon's own
+     * uid on an unseparated machine (`server_gw.c`'s "legacy per-user mode").
+     * That branch is unreachable for this group specifically, and worth
+     * saying so here rather than leaving a reader to work it out from two
+     * files: `atlas_gwpolicy_parse_buffer` refuses `state = ENABLED` outright
+     * when `gateway_uid <= 0` (`src/gw/gwpolicy.c`, "without it the daemon
+     * cannot recognise the gateway"), and `atlas_server_remote_disposal_policy_ready`
+     * below requires `state == ENABLED`. So by the time this call reaches the
+     * peer test, `ctx->gwpolicy.gateway_uid` is already known positive, which
+     * is exactly the condition under which `atlas_server_peer_is_gateway`
+     * takes its first branch and returns on the root-owned comparison alone.
+     * Order matters for why this is safe rather than merely true: the peer
+     * test is asked first, so a caller cannot reach the policy test on the
+     * strength of a legacy match this group never offers. */
     if (!atlas_server_peer_is_gateway(ctx, peer_uid)) {
         return false;
     }
@@ -147,6 +162,17 @@ bool atlas_server_remote_disposal_offered(const atlas_server_ctx *ctx, long long
 
 /* --- parameter helpers, deliberately not shared -- see the file header --- */
 
+/* Minor (review round 1): the Frozen formats' own params list for both
+ * methods names only "repo", never "root". `op->root` and this `"root"`
+ * branch exist because `atlas_decision_op` and `atlas_writer_decision` are
+ * shared verbatim with `server_decision.c`'s LOCAL methods, which do accept a
+ * root path -- this function is `atlas_decision_op`'s general "where"
+ * resolver, not a per-method parameter list, so it inherited the branch
+ * rather than needing a second one. It resolves only to a repository already
+ * in the registry (`atlas_db_check_repo_name`'s sibling path does the same
+ * for a name), the gateway never constructs or forwards a "root" key, and no
+ * test in this file sends one -- named here so a reader does not have to
+ * re-derive that it is inert rather than unreachable. */
 static atlas_status remote_take_where(const atlas_ipc_request *req, atlas_decision_op *op,
                                       atlas_err *err) {
     const char *root = NULL;
@@ -192,6 +218,17 @@ static void remote_take_credential(dispatch_state *ds, atlas_decision_op *op) {
                    ds->ctx->gwpolicy.remote_dispose_key);
 }
 
+/* Minor (review round 1): an absent `"token"` parameter here produces the
+ * same sentence `atlas_decision_remote_verify` (`src/decision/remote.c`)
+ * gives a *present but wrong* one -- one sentence covering two conditions
+ * from a third file, deliberately, per that file's own header: a caller
+ * distinguishing "you sent nothing" from "what you sent was wrong" learns
+ * which half of a guess to vary next. In practice this branch is
+ * unreachable through the gateway itself, which answers a request with no
+ * bearer credential with its own 401 before a JSON-RPC call naming this
+ * method is ever made; it is reachable only from a caller on the daemon
+ * socket directly, and gives that caller no more information than the
+ * gateway would have. */
 static atlas_status remote_take_token(const atlas_ipc_request *req, atlas_buf *out,
                                       atlas_err *err) {
     const char *v = NULL;

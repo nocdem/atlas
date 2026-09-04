@@ -1352,6 +1352,10 @@ static atlas_status j_decision_event(atlas_renderer *r, const atlas_decision_tim
     TRY(atlas_json_key_str_opt(r->j, "superseded_by", e->superseded_by, err));
     TRY(atlas_json_key_str_opt(r->j, "detail", e->detail, err));
     TRY(atlas_json_key_str(r->j, "at", e->at, err));
+    /* A16. NULL for every event but a REMOTE_OPERATOR_CONFIRMED one -- Atlas-
+     * verified hex, not untrusted text, so no `atlas_safe()` pass, like
+     * `principal.key_id` elsewhere. */
+    TRY(atlas_json_key_str_opt(r->j, "key_id", e->key_id, err));
     return atlas_json_obj_end(r->j, err);
 }
 

@@ -21,7 +21,7 @@
 #include "atlas/error.h"
 #include "atlas/limits.h"
 
-#define ATLAS_SCHEMA_VERSION 30
+#define ATLAS_SCHEMA_VERSION 31
 
 typedef struct atlas_db atlas_db;
 
@@ -1725,6 +1725,12 @@ typedef struct atlas_decision_event_row {
     int64_t superseded_by_revision_id;
     const char *superseded_by_uid;
     const char *detail; /* a fixed Atlas vocabulary, never caller text */
+    /* A16, migration 31. NULL when this transition named no credential: every
+     * transition before this season, and every LOCAL one after it. Non-NULL
+     * only for a REMOTE_OPERATOR_CONFIRMED transition, where it is the
+     * sixteen-hex id of the credential the gateway presented — an id, not a
+     * secret, and not untrusted text once the daemon has verified it. */
+    const char *key_id;
     const char *created_at;
 } atlas_decision_event_row;
 
@@ -1792,15 +1798,21 @@ atlas_status atlas_db_decision_search_put(atlas_db *db, int64_t revision_id, int
                                           int64_t repo_id, const char *haystack, size_t len,
                                           atlas_err *err);
 
-/* Appends to the canonical ledger. Never updates, never deletes. */
+/* Appends to the canonical ledger. Never updates, never deletes.
+ *
+ * `key_id` (A16, migration 31) is the sixteen-hex credential id a
+ * REMOTE_OPERATOR_CONFIRMED transition names, or NULL for every other actor —
+ * every caller that predates this season passes NULL, which is what makes
+ * "no credential named" and "not that kind of transition" the same stored
+ * value rather than two. */
 atlas_status atlas_db_decision_event_append(atlas_db *db, int64_t document_id, int64_t revision_id,
                                             int64_t revision_no, const char *event,
                                             const char *actor, const char *content_hash,
                                             int64_t challenge_id,
                                             int64_t superseded_by_revision_id,
                                             int64_t superseded_by_document_id, const char *detail,
-                                            const char *dedup_key, bool *inserted_out,
-                                            atlas_err *err);
+                                            const char *key_id, const char *dedup_key,
+                                            bool *inserted_out, atlas_err *err);
 
 /* The conditional transition. `*changed_out` is false when the revision was not
  * in `from_state`, which is how a concurrent transition loses deterministically

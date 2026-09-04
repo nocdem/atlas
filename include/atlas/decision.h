@@ -53,6 +53,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "atlas/apikey.h" /* ATLAS_APIKEY_SELECTOR_HEX, for atlas_decision_challenge.key_id */
 #include "atlas/buf.h"
 #include "atlas/error.h"
 #include "atlas/limits.h"
@@ -796,6 +797,23 @@ typedef struct atlas_decision_challenge {
     char evidence_digest[ATLAS_SHA256_HEX_LEN + 1u];
     char prior_freshness[16];
     char prior_reasons[ATLAS_GATE_MAX_REASON_TEXT];
+
+    /* A16, migration 31. Which path this capability travelled, so a challenge
+     * minted on one path is refused on the other rather than merely trusted to
+     * have stayed there. `channel` is never `ATLAS_DECISION_CHANNEL_UNKNOWN` on
+     * a row this struct was filled from: the column is `NOT NULL DEFAULT
+     * 'LOCAL'` and the CHECK admits only `LOCAL` and `REMOTE`.
+     *
+     * `key_id` is empty for a LOCAL challenge and, for a REMOTE one, the
+     * sixteen-hex credential id the gateway presented — not a secret, and not
+     * untrusted text once the daemon has verified it (`principal.key_id`'s own
+     * contract). Which credential minted a capability is what lets the ledger
+     * later say which credential spent it, without the challenge row itself
+     * having to outlive being spent: `decision_events.key_id` is a copy taken
+     * at that moment because `decision_challenges` is prunable and a fact the
+     * ledger needs cannot live only on a row that will be pruned. */
+    atlas_decision_channel channel;
+    char key_id[ATLAS_APIKEY_SELECTOR_HEX + 1u]; /* REMOTE only; empty otherwise */
 } atlas_decision_challenge;
 
 void atlas_decision_challenge_init(atlas_decision_challenge *c);

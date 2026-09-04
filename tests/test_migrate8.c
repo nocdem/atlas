@@ -81,6 +81,21 @@ static const char *preserved_cols(const char *table) {
                " current_branch, head_state, dirty, dirty_staged, dirty_unstaged,"
                " dirty_untracked, dirty_unmerged, git_dir, git_dir_text, is_linked_worktree";
     }
+    /* Migration 31 (A16's T2) rebuilds both tables to widen a CHECK and
+     * appends `key_id` to one, `channel` and `key_id` to the other — an
+     * addition with a default, exactly the class of change `repositories`
+     * above already carves out, and for the same reason: the digests here
+     * are taken at schema 7 and again at head. */
+    if (strcmp(table, "decision_events") == 0) {
+        return "id, document_id, revision_id, revision_no, event, actor, content_hash,"
+               " challenge_id, superseded_by_revision_id, superseded_by_document_id, detail,"
+               " created_at, dedup_key";
+    }
+    if (strcmp(table, "decision_challenges") == 0) {
+        return "id, token, repo_id, document_id, revision_id, revision_no, content_hash, intent,"
+               " supersede_document_id, indexed_commit, evidence_digest, prior_freshness,"
+               " prior_reasons, created_at, expires_at, consumed, consumed_at";
+    }
     return NULL;
 }
 
@@ -275,7 +290,8 @@ static void test_a_schema_seven_database_reaches_eight_losslessly(void) {
 
     T_OK(atlas_db_migrate(db, &err), &err);
     T_EQ_INT(atlas_db_schema_version(db, &err), ATLAS_SCHEMA_VERSION);
-    T_EQ_INT(ATLAS_SCHEMA_VERSION, 30);
+    /* Migration 31 (A16's T2) landed after this suite was written. */
+    T_EQ_INT(ATLAS_SCHEMA_VERSION, 31);
 
     for (size_t i = 0; i < sizeof A8_TABLES / sizeof A8_TABLES[0]; i++) {
         T_CHECK_MSG(table_exists(db, A8_TABLES[i]), "migration 8 did not create %s",

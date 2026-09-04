@@ -4568,6 +4568,218 @@ static const char M30_BINDING_BOUND_HIT[] =
 
 static const char *const M30_STATEMENTS[] = {M30_REPO_TRAILER_CURSOR, M30_BINDING_BOUND_HIT, NULL};
 
+/* --- migration 31: the remote operator channel: which channel and credential
+ * minted a challenge, and which credential the ledger records -------------
+ *
+ * A16 gives the browser a disposal path that is not the terminal's: the
+ * gateway, a bearer credential, whatever transport security fronts that
+ * listener. `ATLAS_DECISION_ACTOR_REMOTE_OPERATOR_CONFIRMED` names the
+ * ledger's side of that already (`include/atlas/decision.h`); this migration
+ * is what lets the ledger *store* it and what stops a capability minted on
+ * one path from being spendable on the other.
+ *
+ * Two tables, two CHECKs, two rebuilds, because SQLite cannot widen a CHECK
+ * in place -- migrations 7, 9, 13, 15 and 26 are all this same precedent, and
+ * migration 15 is the one this migration follows line by line: it is the
+ * only prior migration that widened `decision_events.actor`, for the same
+ * reason (a new *kind of cause* joining the ledger's closed vocabulary) and
+ * with the same shape (one leaf table, foreign keys left enforced, row
+ * count captured before and reasserted after under one named CHECK).
+ *
+ * ## Why `decision_events.actor` widens and `decision_revisions.proposed_by`
+ * does not
+ *
+ * This is migration 15's own question asked again, and the answer has not
+ * changed: a remote disposal is `approve`, `reject` or `resolve` on a
+ * revision that already exists. It authors nothing -- there is no
+ * `decision.remote_propose` and this season adds none -- so nothing here
+ * ever needs `decision_revisions.proposed_by` to hold a fifth value. Widening
+ * it anyway would be a channel able to write project knowledge, which is a
+ * larger authority than a disposal path grants; the narrower CHECK is what
+ * keeps that structural rather than a matter of what the code happens to
+ * call today.
+ *
+ * ## Why both rebuilt tables keep `foreign_keys_off` at `false`
+ *
+ * Migration 13 needed the flag because `DROP TABLE decision_revisions`
+ * fired `decision_links`' declared `ON DELETE CASCADE` and would have
+ * emptied it silently with foreign keys enforced. Neither table here is a
+ * cascade parent of that shape. `decision_events` is a **leaf**, exactly as
+ * migration 15's own comment establishes: nothing in the schema declares a
+ * foreign key onto it, so dropping it deletes nothing else.
+ * `decision_challenges` is referenced the same way `decision_events` is
+ * referenced *from* -- `decision_events.challenge_id` and
+ * `decision_validations.challenge_id` both point into it with no declared
+ * foreign key, exactly as migration 13's comment records -- so a rebuild
+ * that renumbered would silently mis-point those columns, but dropping the
+ * table triggers no cascade, because there is none to trigger. Both
+ * migrations run fully checked, and `M31_CONFIRM`'s
+ * `pragma_foreign_key_check` is the runtime proof rather than an assertion
+ * nobody exercises.
+ *
+ * Row ids are therefore copied explicitly in both rebuilds, column by
+ * column rather than by `SELECT *`, for the same reason migration 13 gives:
+ * a soft reference that survived a renumbering would silently name somebody
+ * else's row.
+ *
+ * ## Why `decision_challenges.channel DEFAULT 'LOCAL'` is a true statement
+ * about every existing row, and not migration 19's mistake
+ *
+ * Migration 19's mistake was inventing an intent nobody expressed. This
+ * default invents nothing: before this migration there was exactly one
+ * code path that could ever call `atlas_db_decision_challenge_insert` --
+ * `op_challenge` in `src/decision/lifecycle.c`, which builds the only
+ * `ATLAS_DECISION_OP_CHALLENGE` this codebase constructs, inside
+ * `atlas_service_decision_confirm`. That function has exactly two callers,
+ * both local: the CLI (`src/cli/cli.c`) and the local review-apply surface
+ * (`src/core/service_review.c`). A9's gateway had no write route to it and
+ * this season's `decision.remote_challenge` does not exist until a later
+ * task. So "channel = LOCAL" is not a guess about history, it is the only
+ * channel that has ever existed for every row a pre-31 database can hold --
+ * the same shape as migration 13's `kind DEFAULT 'DECISION'`: "the
+ * definition of every pre-A9.1 row and not a fallback: those records were
+ * decisions." Every pre-31 challenge was minted through the local terminal
+ * channel for the identical reason -- there was no other channel capable of
+ * minting one. The default also fires exactly once, at this migration:
+ * `atlas_db_decision_challenge_insert` names the column explicitly on every
+ * future insert, so no row written after this migration ever reaches it by
+ * falling through unset.
+ *
+ * `key_id` gets no default and stays NULL on every migrated row, for the
+ * companion reason: no pre-31 challenge was minted against any credential,
+ * so NULL states that truthfully rather than inventing an id nobody
+ * presented.
+ *
+ * ## Why the ledger replay needs no change
+ *
+ * `atlas_db_decision_verify`'s replay reads exactly two columns of
+ * `decision_events` -- `revision_id` and `event` -- to decide which
+ * revision's last event is APPROVED. It has never read `actor` and does not
+ * read `key_id`; widening the actor CHECK adds a member the replay does not
+ * branch on, and appending `key_id` adds a column the replay does not
+ * select. A ledger row asserting `REMOTE_OPERATOR_CONFIRMED` replays
+ * identically to one asserting `LOCAL_OPERATOR_CONFIRMED`, which is correct:
+ * the replay's question is "what is this revision's state", never "which
+ * channel got it there".
+ *
+ * ## The verification, in two named CHECKs rather than one
+ *
+ * Both counts are captured into one temp table before either rebuild
+ * touches anything, and confirmed after both, each under its own named
+ * `CONSTRAINT ... CHECK(... = 1)` -- `CONSTRAINT name` **before** `CHECK`,
+ * as migration 13 writes it and **not** as migration 15 writes it. Verified
+ * directly against this SQLite: `CHECK(ok = 1) CONSTRAINT name` (migration
+ * 15's order) raises "CHECK constraint failed: ok = 1" -- the name never
+ * appears -- while `CONSTRAINT name CHECK(ok = 1)` (migration 13's order, and
+ * this migration's) raises "CHECK constraint failed: name". Migration 15's
+ * own comment claims "the named CHECK is the error message"; on this
+ * evidence that claim is false for the order it actually wrote, and this
+ * migration follows the order that is true instead. A migration that lost a
+ * ledger row here fails as `no_decision_event_may_be_lost_in_migration_31`;
+ * one that lost a challenge fails as
+ * `no_decision_challenge_may_be_lost_in_migration_31` -- an operator reads
+ * which table, not a constraint number, and the whole transaction rolls back
+ * either way. */
+static const char M31_VERIFY[] =
+    "CREATE TEMP TABLE m31_before AS"
+    "  SELECT (SELECT COUNT(*) FROM decision_events) AS events_n,"
+    "         (SELECT COUNT(*) FROM decision_challenges) AS challenges_n;";
+
+static const char M31_EVENTS[] =
+    "CREATE TABLE decision_events_new ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  document_id INTEGER NOT NULL REFERENCES decision_documents(id),"
+    "  revision_id INTEGER REFERENCES decision_revisions(id),"
+    "  revision_no INTEGER NOT NULL DEFAULT 0,"
+    "  event TEXT NOT NULL CHECK(event IN"
+    "    ('PROPOSED','APPROVED','REJECTED','SUPERSEDED','RESOLVED')),"
+    "  actor TEXT NOT NULL CHECK(actor IN"
+    "    ('MODEL_PROPOSAL','MODEL_INFERENCE','LOCAL_OPERATOR_CONFIRMED','ATLAS_AUTOMATIC',"
+    "     'VERIFICATION_POLICY','REMOTE_OPERATOR_CONFIRMED')),"
+    "  content_hash TEXT,"
+    "  challenge_id INTEGER,"
+    "  superseded_by_revision_id INTEGER,"
+    "  superseded_by_document_id INTEGER,"
+    "  detail TEXT,"
+    "  created_at TEXT NOT NULL,"
+    "  dedup_key TEXT,"
+    /* Empty on every migrated row -- see the migration comment. Written by
+     * `atlas_db_decision_event_append` only for a REMOTE_OPERATOR_CONFIRMED
+     * transition once a later task threads a real value through it. */
+    "  key_id TEXT"
+    ");"
+    "INSERT INTO decision_events_new"
+    "  (id, document_id, revision_id, revision_no, event, actor, content_hash, challenge_id,"
+    "   superseded_by_revision_id, superseded_by_document_id, detail, created_at, dedup_key)"
+    "  SELECT id, document_id, revision_id, revision_no, event, actor, content_hash, challenge_id,"
+    "         superseded_by_revision_id, superseded_by_document_id, detail, created_at, dedup_key"
+    "  FROM decision_events;"
+    "DROP TABLE decision_events;"
+    "ALTER TABLE decision_events_new RENAME TO decision_events;"
+    "CREATE INDEX idx_decision_events_doc ON decision_events(document_id, id);"
+    "CREATE INDEX idx_decision_events_rev ON decision_events(revision_id, id);"
+    "CREATE UNIQUE INDEX idx_decision_events_dedup ON decision_events(document_id, dedup_key)"
+    "  WHERE dedup_key IS NOT NULL;";
+
+static const char M31_CHALLENGES[] =
+    "CREATE TABLE decision_challenges_new ("
+    "  id INTEGER PRIMARY KEY,"
+    "  token TEXT NOT NULL UNIQUE,"
+    "  repo_id INTEGER NOT NULL,"
+    "  document_id INTEGER NOT NULL REFERENCES decision_documents(id),"
+    "  revision_id INTEGER NOT NULL REFERENCES decision_revisions(id),"
+    "  revision_no INTEGER NOT NULL,"
+    "  content_hash TEXT NOT NULL,"
+    "  intent TEXT NOT NULL CHECK(intent IN ('approve','reject','supersede','revalidate',"
+    "    'resolve')),"
+    "  supersede_document_id INTEGER,"
+    "  indexed_commit TEXT,"
+    "  evidence_digest TEXT,"
+    "  prior_freshness TEXT CHECK(prior_freshness IS NULL OR prior_freshness IN"
+    "    ('FRESH','STALE','IMPACTED','UNKNOWN')),"
+    "  prior_reasons TEXT,"
+    "  created_at TEXT NOT NULL,"
+    "  expires_at TEXT NOT NULL,"
+    "  consumed INTEGER NOT NULL DEFAULT 0,"
+    "  consumed_at TEXT,"
+    /* Every row this migration copies predates the remote channel, and
+     * DEFAULT 'LOCAL' is a true statement about every one of them -- see the
+     * migration comment. Every row inserted after this migration names the
+     * column explicitly. */
+    "  channel TEXT NOT NULL DEFAULT 'LOCAL' CHECK(channel IN ('LOCAL','REMOTE')),"
+    "  key_id TEXT"
+    ");"
+    "INSERT INTO decision_challenges_new"
+    "  (id, token, repo_id, document_id, revision_id, revision_no, content_hash, intent,"
+    "   supersede_document_id, indexed_commit, evidence_digest, prior_freshness, prior_reasons,"
+    "   created_at, expires_at, consumed, consumed_at)"
+    "  SELECT id, token, repo_id, document_id, revision_id, revision_no, content_hash, intent,"
+    "         supersede_document_id, indexed_commit, evidence_digest, prior_freshness,"
+    "         prior_reasons, created_at, expires_at, consumed, consumed_at"
+    "  FROM decision_challenges;"
+    "DROP TABLE decision_challenges;"
+    "ALTER TABLE decision_challenges_new RENAME TO decision_challenges;"
+    "CREATE INDEX idx_decision_challenges_repo ON decision_challenges"
+    "  (repo_id, consumed, expires_at);";
+
+static const char M31_CONFIRM[] =
+    "CREATE TEMP TABLE m31_check("
+    "  events_ok INTEGER NOT NULL"
+    "    CONSTRAINT no_decision_event_may_be_lost_in_migration_31 CHECK(events_ok = 1),"
+    "  challenges_ok INTEGER NOT NULL"
+    "    CONSTRAINT no_decision_challenge_may_be_lost_in_migration_31 CHECK(challenges_ok = 1));"
+    "INSERT INTO m31_check(events_ok, challenges_ok) SELECT"
+    "  CASE WHEN (SELECT events_n FROM m31_before) = (SELECT COUNT(*) FROM decision_events)"
+    "       THEN 1 ELSE 0 END,"
+    "  CASE WHEN (SELECT challenges_n FROM m31_before) = (SELECT COUNT(*) FROM decision_challenges)"
+    "        AND (SELECT COUNT(*) FROM pragma_foreign_key_check) = 0"
+    "       THEN 1 ELSE 0 END;"
+    "DROP TABLE m31_check;"
+    "DROP TABLE m31_before;";
+
+static const char *const M31_STATEMENTS[] = {M31_VERIFY, M31_EVENTS, M31_CHALLENGES, M31_CONFIRM,
+                                             NULL};
+
 static const atlas_migration MIGRATIONS[] = {
     {1, "initial schema", M1_STATEMENTS, false},
     {2, "worktree identity", M2_STATEMENTS, false},
@@ -4678,6 +4890,17 @@ static const atlas_migration MIGRATIONS[] = {
      * and no existing row is rewritten. See the M30 comment above for why a
      * fix round adds a migration a T14 comment twice said was out of scope. */
     {30, "a trailer-scan cursor of its own, and a per-commit bound-hit fact", M30_STATEMENTS, false},
+    /* Rebuilds two leaf-referenced tables to widen one CHECK and append two
+     * columns. `foreign_keys_off` stays false: neither table is a cascade
+     * parent, and `pragma_foreign_key_check` inside `M31_CONFIRM` is the
+     * runtime proof. See the M31 comment for why `decision_revisions.proposed_by`
+     * does not widen, why `channel DEFAULT 'LOCAL'` is a true statement about
+     * every existing row rather than migration 19's mistake, and why the
+     * ledger replay in `atlas_db_decision_verify` needs no change. */
+    {31,
+     "the remote operator channel: which channel and credential minted a challenge, and which "
+     "credential the ledger records",
+     M31_STATEMENTS, false},
 };
 
 const atlas_migration *atlas_migrations(size_t *count_out) {

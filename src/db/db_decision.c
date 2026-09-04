@@ -959,8 +959,8 @@ atlas_status atlas_db_decision_event_append(atlas_db *db, int64_t document_id, i
                                             int64_t challenge_id,
                                             int64_t superseded_by_revision_id,
                                             int64_t superseded_by_document_id, const char *detail,
-                                            const char *dedup_key, bool *inserted_out,
-                                            atlas_err *err) {
+                                            const char *key_id, const char *dedup_key,
+                                            bool *inserted_out, atlas_err *err) {
     if (inserted_out != NULL) {
         *inserted_out = false;
     }
@@ -969,8 +969,9 @@ atlas_status atlas_db_decision_event_append(atlas_db *db, int64_t document_id, i
         db,
         "INSERT INTO decision_events"
         "(document_id, revision_id, revision_no, event, actor, content_hash, challenge_id,"
-        " superseded_by_revision_id, superseded_by_document_id, detail, created_at, dedup_key)"
-        " VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
+        " superseded_by_revision_id, superseded_by_document_id, detail, key_id, created_at,"
+        " dedup_key)"
+        " VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
         " ON CONFLICT(document_id, dedup_key) WHERE dedup_key IS NOT NULL DO NOTHING;",
         &s, err);
     if (st != ATLAS_OK) {
@@ -1007,10 +1008,13 @@ atlas_status atlas_db_decision_event_append(atlas_db *db, int64_t document_id, i
         st = atlas_db_bind_text_opt(db, s, 10, detail, err);
     }
     if (st == ATLAS_OK) {
-        st = atlas_db_bind_text_opt(db, s, 11, now, err);
+        st = atlas_db_bind_text_opt(db, s, 11, key_id, err);
     }
     if (st == ATLAS_OK) {
-        st = atlas_db_bind_text_opt(db, s, 12, dedup_key, err);
+        st = atlas_db_bind_text_opt(db, s, 12, now, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_db_bind_text_opt(db, s, 13, dedup_key, err);
     }
     if (st != ATLAS_OK) {
         atlas_db_finish(db, s);
@@ -1033,11 +1037,11 @@ atlas_status atlas_db_decision_challenge_insert(atlas_db *db, const atlas_decisi
         db,
         "INSERT INTO decision_challenges"
         "(token, repo_id, document_id, revision_id, revision_no, content_hash, intent,"
-        " supersede_document_id, created_at, expires_at, consumed,"
+        " supersede_document_id, created_at, expires_at, consumed, channel, key_id,"
         /* A6. NULL for every intent but revalidate, which is what makes an
          * approval capability structurally incapable of carrying one. */
         " indexed_commit, evidence_digest, prior_freshness, prior_reasons)"
-        " VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11, ?12, ?13, ?14);",
+        " VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11, ?12, ?13, ?14, ?15, ?16);",
         &s, err);
     if (st != ATLAS_OK) {
         return st;
@@ -1070,22 +1074,33 @@ atlas_status atlas_db_decision_challenge_insert(atlas_db *db, const atlas_decisi
     if (st == ATLAS_OK) {
         st = atlas_db_bind_text_opt(db, s, 10, c->expires_at, err);
     }
+    /* A16, migration 31. Bound as the caller set it, and never defaulted here:
+     * `atlas_decision_channel_name(ATLAS_DECISION_CHANNEL_UNKNOWN)` is the
+     * literal string "UNKNOWN", which the column's CHECK does not admit, so a
+     * caller that mints a challenge without naming a channel is refused by the
+     * schema rather than silently recorded as LOCAL. */
     if (st == ATLAS_OK) {
-        st = atlas_db_bind_text_opt(db, s, 11,
+        st = atlas_db_bind_text_opt(db, s, 11, atlas_decision_channel_name(c->channel), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_db_bind_text_opt(db, s, 12, c->key_id[0] != '\0' ? c->key_id : NULL, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_db_bind_text_opt(db, s, 13,
                                     c->indexed_commit[0] != '\0' ? c->indexed_commit : NULL, err);
     }
     if (st == ATLAS_OK) {
-        st = atlas_db_bind_text_opt(db, s, 12,
+        st = atlas_db_bind_text_opt(db, s, 14,
                                     c->evidence_digest[0] != '\0' ? c->evidence_digest : NULL,
                                     err);
     }
     if (st == ATLAS_OK) {
-        st = atlas_db_bind_text_opt(db, s, 13,
+        st = atlas_db_bind_text_opt(db, s, 15,
                                     c->prior_freshness[0] != '\0' ? c->prior_freshness : NULL,
                                     err);
     }
     if (st == ATLAS_OK) {
-        st = atlas_db_bind_text_opt(db, s, 14,
+        st = atlas_db_bind_text_opt(db, s, 16,
                                     c->prior_reasons[0] != '\0' ? c->prior_reasons : NULL, err);
     }
     if (st != ATLAS_OK) {
@@ -1109,7 +1124,7 @@ atlas_status atlas_db_decision_challenge_find(atlas_db *db, const char *token,
         db,
         "SELECT id, token, repo_id, document_id, revision_id, revision_no, content_hash, intent,"
         "       supersede_document_id, created_at, expires_at, consumed,"
-        "       indexed_commit, evidence_digest, prior_freshness, prior_reasons"
+        "       indexed_commit, evidence_digest, prior_freshness, prior_reasons, channel, key_id"
         "  FROM decision_challenges WHERE token = ?1;",
         &s, err);
     if (st != ATLAS_OK) {
@@ -1167,6 +1182,20 @@ atlas_status atlas_db_decision_challenge_find(atlas_db *db, const char *token,
         if (st == ATLAS_OK) {
             st = atlas_db_col_copy(s, 15, out->prior_reasons, sizeof(out->prior_reasons),
                                    "challenge prior reasons", err);
+        }
+        /* A16, migration 31. The column is NOT NULL, so a stored value other
+         * than LOCAL or REMOTE is corruption, not a caller's mistake -- refused
+         * exactly as an unrecognised intent is above. */
+        if (st == ATLAS_OK) {
+            if (!atlas_decision_channel_parse(atlas_db_col_text(s, 16), &out->channel)) {
+                st = atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                                   "a stored approval challenge has a channel Atlas does not "
+                                   "recognise, and is refused rather than guessed");
+            }
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_db_col_copy(s, 17, out->key_id, sizeof(out->key_id), "challenge key id",
+                                   err);
         }
         *found_out = st == ATLAS_OK;
     } else if (rc != SQLITE_DONE) {
@@ -1976,7 +2005,8 @@ atlas_status atlas_db_decision_events_list(atlas_db *db, int64_t document_id, in
         db,
         "SELECT e.id, COALESCE(e.revision_id, 0), e.revision_no, e.event, e.actor,"
         "       e.content_hash, COALESCE(e.challenge_id, 0),"
-        "       COALESCE(e.superseded_by_revision_id, 0), sup.uid, e.detail, e.created_at"
+        "       COALESCE(e.superseded_by_revision_id, 0), sup.uid, e.detail, e.key_id,"
+        "       e.created_at"
         "  FROM decision_events e"
         "  LEFT JOIN decision_documents sup ON sup.id = e.superseded_by_document_id"
         " WHERE e.document_id = ?1 ORDER BY e.id ASC LIMIT ?2;",
@@ -2012,7 +2042,8 @@ atlas_status atlas_db_decision_events_list(atlas_db *db, int64_t document_id, in
         row.superseded_by_revision_id = sqlite3_column_int64(s, 7);
         row.superseded_by_uid = atlas_db_col_text_opt(s, 8);
         row.detail = atlas_db_col_text_opt(s, 9);
-        row.created_at = atlas_db_col_text(s, 10);
+        row.key_id = atlas_db_col_text_opt(s, 10);
+        row.created_at = atlas_db_col_text(s, 11);
         st = cb(&row, ud, err);
         n++;
     }

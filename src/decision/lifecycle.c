@@ -451,12 +451,15 @@ static atlas_status write_revision(apply_ctx *ac, const atlas_decision_op *op,
         atlas_buf_free(&hay);
     }
     if (st == ATLAS_OK) {
+        /* No PROPOSED event names a credential: A16's remote channel disposes
+         * of an existing revision, it does not author one, so `key_id` is
+         * NULL here and at every call site this season did not touch. */
         st = atlas_db_decision_event_append(
             ac->db, document_id, rev_id, revision_no, "PROPOSED",
             atlas_decision_actor_name(rev->proposed_by), rev->content_hash, 0, 0, 0,
             revision_no == 1 ? "the first revision of this decision"
                              : "a new revision, proposed rather than applied to the approved one",
-            op->dedup_key.len > 0 ? atlas_buf_cstr(&op->dedup_key) : NULL, NULL, err);
+            NULL, op->dedup_key.len > 0 ? atlas_buf_cstr(&op->dedup_key) : NULL, NULL, err);
     }
     if (st == ATLAS_OK) {
         st = atlas_db_decision_document_note_revision(ac->db, document_id, revision_no, ac->now,
@@ -957,6 +960,13 @@ static atlas_status op_challenge(apply_ctx *ac, const atlas_decision_op *op,
     if (st != ATLAS_OK) {
         return st;
     }
+    /* A16, migration 31. This function builds the only
+     * `ATLAS_DECISION_OP_CHALLENGE` this codebase constructs, inside
+     * `atlas_service_decision_confirm`, whose two callers are the CLI and the
+     * local review-apply surface -- both the terminal on the Atlas machine.
+     * The remote disposal channel mints its own capability elsewhere; nothing
+     * here does yet, so this path is unconditionally LOCAL. */
+    c.channel = ATLAS_DECISION_CHANNEL_LOCAL;
     c.repo_id = ac->repo.id;
     c.document_id = document_id;
     c.revision_id = rev_id;
@@ -1367,11 +1377,16 @@ static atlas_status transition(apply_ctx *ac, int64_t document_id, int64_t revis
                              "it again and retry",
                              atlas_decision_state_name(from), atlas_decision_state_name(to));
     }
+    /* `key_id` is NULL: this season's remote channel is not wired into this
+     * transition path yet, so no actor this function can be asked to record
+     * has ever named a credential, and every event it appends still names
+     * none either. */
     return atlas_db_decision_event_append(ac->db, document_id, revision_id, revision_no,
                                           atlas_decision_state_name(to),
                                           atlas_decision_actor_name(actor), content_hash,
                                           challenge_id, superseded_by_revision_id,
-                                          superseded_by_document_id, detail, NULL, NULL, err);
+                                          superseded_by_document_id, detail, NULL, NULL, NULL,
+                                          err);
 }
 
 static atlas_status op_approve(apply_ctx *ac, const atlas_decision_op *op,

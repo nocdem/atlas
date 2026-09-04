@@ -957,10 +957,11 @@ extern const char ATLAS_DECISION_CONFIRM_MISTYPED_MSG[];
  *
  * A review sheet (`include/atlas/review.h`, T3) is an operator's own file on
  * this machine, transcribed by hand out of a Mission Control browser session.
- * It carries no authority and no confirmation; every entry it names is still
- * confirmed by typing a hash prefix on `/dev/tty`, per entry, through
- * `atlas_service_decision_confirm` above and through nothing else — this file
- * mints no capability and spends none itself.
+ * It carries no authority: its fifth field is the public prefix the operator
+ * will type, and no field it names is read in place of that typing -- every
+ * entry is still confirmed by typing that hash prefix on `/dev/tty`, per
+ * entry, through `atlas_service_decision_confirm` above and through nothing
+ * else — this file mints no capability and spends none itself.
  *
  * The walker's whole job beyond looping `atlas_service_decision_confirm` is
  * the pre-check: reading the live record again, immediately before minting

@@ -3,13 +3,13 @@
  *
  * A review sheet is a plain-ASCII list an operator copies out of a Mission
  * Control browser session and hands to a local command
- * (`atlas review apply`, a later task). It stores no authority and has no
- * field for a confirmation: every entry named here is still confirmed by
- * typing a hash prefix on `/dev/tty`, per entry, exactly as
- * `atlas decision approve` already requires. That is why a line carrying a
- * sixth field is refused rather than read as an early confirmation -- the
- * sheet's own mirror of the rule that no MCP tool schema in
- * `src/mcp/mcp_tools.c` declares a `"confirmation":` property
+ * (`atlas review apply`, a later task). It stores no authority: its fifth
+ * field is the public prefix the operator will type, and it has no field
+ * the walker ever reads in place of typing that prefix on `/dev/tty`, per
+ * entry, exactly as `atlas decision approve` already requires. That is why
+ * a line carrying a sixth field is refused rather than read as an early
+ * confirmation -- the sheet's own mirror of the rule that no MCP tool
+ * schema in `src/mcp/mcp_tools.c` declares a `"confirmation":` property
  * (`tests/test_decision_mcp.c`).
  *
  * This header and `src/core/review.c` are the grammar and the vocabulary

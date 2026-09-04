@@ -2,8 +2,9 @@
  * Copyright 2026 The Atlas Authors. Licensed under the Apache License 2.0.
  *
  * See `include/atlas/review.h` for what a review sheet is and for the two
- * house rules this file exists to satisfy: no field for a confirmation, and
- * a defect anywhere refuses the whole sheet before any entry is trusted.
+ * house rules this file exists to satisfy: no field the walker reads in
+ * place of the operator typing the confirmation on `/dev/tty`, and a defect
+ * anywhere refuses the whole sheet before any entry is trusted.
  *
  * This file is pure, `src/memory/source.c`'s discipline for the same reason:
  * no database handle, no process, no file, no clock and no repository read.

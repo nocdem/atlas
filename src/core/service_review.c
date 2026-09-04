@@ -3,13 +3,15 @@
  *
  * A review sheet (`include/atlas/review.h`, T3) is a plain-ASCII list an
  * operator copies out of a Mission Control browser session and saves as a
- * file on this machine. It stores no authority and carries no confirmation
- * field: every entry it names is still confirmed by typing a hash prefix on
- * `/dev/tty`, per entry, through `atlas_service_decision_confirm` -- the
- * whole of the operator channel -- and through nothing else. This file mints
- * no capability and spends none itself; it is a loop around the one function
- * that does, plus the pre-check that decides, for each entry, whether that
- * function should be called at all.
+ * file on this machine. It stores no authority: its fifth field carries the
+ * public prefix the operator will type, and has no field this file ever
+ * reads in place of typing it -- every entry it names is still confirmed by
+ * typing that hash prefix on `/dev/tty`, per entry, through
+ * `atlas_service_decision_confirm` -- the whole of the operator channel --
+ * and through nothing else. This file mints no capability and spends none
+ * itself; it is a loop around the one function that does, plus the
+ * pre-check that decides, for each entry, whether that function should be
+ * called at all.
  *
  * The pre-check exists because a sheet is a snapshot: an operator read a
  * revision in a browser, and by the time the sheet reaches a terminal --

@@ -809,7 +809,11 @@ const atlas_gateway_route_view *atlas_gateway_api_routes(size_t *count_out);
 ```
 
 - [ ] **Step 1: Write the failing test** in `tests/test_gateway.c`
-      (`test_every_api_route_is_a_read_the_gateway_uid_may_make`): for every view row,
+      (named `test_every_api_route_is_a_read_the_gateway_uid_may_make` when this plan was
+      written; **renamed during execution** to
+      `test_every_api_route_forwards_to_a_read_on_the_reviewed_allowlist`, because
+      T1's fix rounds replaced the four negative checks with a positive allowlist and
+      the old name asserted more than the body established): for every view row,
       (a) `method` is not the name of any entry returned by
       `atlas_server_operator_methods()`; (b) `method` is neither `gateway.auth` nor
       `gateway.audit`; (c) `method` is none of `backup.create`, `backup.verify`,

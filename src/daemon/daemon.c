@@ -220,7 +220,19 @@ atlas_status atlas_daemon_run(const atlas_daemon_opts *opts, FILE *log, atlas_er
      * privileged method group. A zeroed policy leaves `gateway_uid` at zero,
      * and zero matches no peer, so the `gateway.` group is offered to nobody. */
     atlas_gwpolicy gwpolicy;
-    if (serving_system_index) {
+    if (opts->gwpolicy_text != NULL) {
+        /* A16. Test hook, `atlas_daemon_opts.gwpolicy_text`'s own precedent:
+         * the only production route to an injected policy, and it is set by
+         * no CLI flag. `tests/tools/atlas_gw_daemon.c` reads a fixture-written,
+         * user-owned policy file itself -- deliberately not through
+         * `atlas_gwpolicy_load_at`'s root-ownership walk, which only a real
+         * root-owned file can ever pass -- and hands the bytes here. Checked
+         * ahead of `serving_system_index`: a fixture daemon is never "the"
+         * system deployment, so the ordinary branch below would otherwise
+         * leave this daemon with no gateway policy at all and nothing to
+         * inject it with. */
+        atlas_gwpolicy_parse_buffer(opts->gwpolicy_text, strlen(opts->gwpolicy_text), &gwpolicy);
+    } else if (serving_system_index) {
         atlas_gwpolicy_load(&gwpolicy);
     } else {
         memset(&gwpolicy, 0, sizeof(gwpolicy));

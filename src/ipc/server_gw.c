@@ -124,7 +124,32 @@ static atlas_status method_gateway_auth(dispatch_state *ds, const atlas_ipc_requ
             st = atlas_json_key_str(ds->j, "label", atlas_safe(&ds->safe, rec.label), err);
         }
         if (st == ATLAS_OK) {
-            st = atlas_json_key_str(ds->j, "scopes", rec.scopes, err);
+            /* A16. `decisions:dispose` is never stored on a key row -- T1's
+             * rule, enforced at the one function that writes one
+             * (`atlas_db_apikey_insert`). It is derived here instead, for
+             * exactly the credential the root-owned gateway policy names as
+             * the disposal key, and only when that credential's own stored
+             * scope list is empty: a `--no-scopes` credential is inert until
+             * this policy gives it its one grant, and a credential that
+             * already holds ordinary scopes is never widened by being named
+             * here (naming a non-scopeless credential there is refused at
+             * policy load -- T4's rule -- so this is defence in depth, not
+             * the guarantee).
+             *
+             * Gated on `atlas_server_remote_disposal_policy_ready`, the same
+             * test `decision.remote_challenge` and `decision.remote_dispose`
+             * are offered under (minus the peer half, moot here: this
+             * request already reached a gateway-only method). A policy this
+             * loader refused, or one with no TLS in front and no written
+             * cleartext acceptance, derives nothing, so what this endpoint
+             * reports a credential can do and what the dispatcher will
+             * actually let it do never disagree. */
+            const char *scopes = rec.scopes;
+            if (rec.mask == 0u && atlas_server_remote_disposal_policy_ready(&ds->ctx->gwpolicy) &&
+                strcmp(rec.key_id, ds->ctx->gwpolicy.remote_dispose_key) == 0) {
+                scopes = atlas_apikey_scope_name(ATLAS_SCOPE_DECISIONS_DISPOSE);
+            }
+            st = atlas_json_key_str(ds->j, "scopes", scopes, err);
         }
     }
     /* Nothing else is reported. Not the selector, not whether it existed, not

@@ -200,6 +200,16 @@ static void test_the_daemon_answers_to_no_authority_method(void) {
          * offered to an ordinary peer, and a verb added to the group without a
          * row here would be unchecked. */
         "decision.resolve",
+        /* A16 T5. A different group, gated by a different root-owned policy
+         * and a different peer test -- `atlas_server_remote_disposal_offered`
+         * checks the *gateway* policy's uid, not the authority policy's --
+         * but this fixture daemon has neither policy installed, so both are
+         * offered to nobody and belong in this same negative enumeration.
+         * `test_gw_dispose.c` proves the positive case: a peer the gateway
+         * policy *does* name still needs a disposal credential and either
+         * TLS or the operator's written acceptance before either name stops
+         * being "unknown method". */
+        "decision.remote_challenge", "decision.remote_dispose",
     };
     static const char *const METHODS[] = {
         /* Plausible aliases and case variants of the operator channel. A

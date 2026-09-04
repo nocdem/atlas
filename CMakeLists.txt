@@ -242,6 +242,12 @@ add_library(atlas_core STATIC
   src/core/terminal.c
   src/core/service_decision.c
   src/ipc/server_decision.c
+  # A16 T5: decision.remote_challenge and decision.remote_dispose, offered
+  # only to the gateway's uid behind TLS and a named credential. Its own
+  # file, its own gate function -- see the header comment in
+  # src/ipc/server_remote.c for why it is not folded into server_decision.c
+  # or server_gw.c.
+  src/ipc/server_remote.c
   # --- A5: operational backup, verification, restore and maintenance -----
   #
   # Restore and maintenance are local CLI operations with no RPC method, so

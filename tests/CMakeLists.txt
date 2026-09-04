@@ -58,6 +58,7 @@ target_compile_definitions(atlas_test_support PUBLIC
   ATLAS_SPAWNER_BIN="$<TARGET_FILE:atlas-spawner>"
   ATLAS_FLAKY_PARSE_BIN="$<TARGET_FILE:atlas-flaky-parse>"
   ATLAS_STREAMER_BIN="$<TARGET_FILE:atlas-streamer>"
+  ATLAS_GW_DAEMON_BIN="$<TARGET_FILE:atlas-gw-daemon>"
 )
 target_link_libraries(atlas_test_support PUBLIC atlas_core)
 atlas_set_warnings(atlas_test_support)
@@ -92,6 +93,16 @@ add_executable(atlas-watch-daemon tools/atlas_watch_daemon.c)
 target_link_libraries(atlas-watch-daemon PRIVATE atlas_core)
 target_compile_definitions(atlas-watch-daemon PRIVATE _POSIX_C_SOURCE=200809L)
 atlas_set_warnings(atlas-watch-daemon)
+
+# A16 T5. The remote-disposal acceptance daemon: the real `atlas_daemon_run`
+# with a gateway policy injected from a fixture-written file. Same shape as
+# atlas-watch-daemon, above, and for the same reason -- the policy is
+# deliberately not settable from a flag or an environment variable. See
+# tools/atlas_gw_daemon.c.
+add_executable(atlas-gw-daemon tools/atlas_gw_daemon.c)
+target_link_libraries(atlas-gw-daemon PRIVATE atlas_core)
+target_compile_definitions(atlas-gw-daemon PRIVATE _POSIX_C_SOURCE=200809L)
+atlas_set_warnings(atlas-gw-daemon)
 
 set(ATLAS_TESTS
   # The fixture's own hygiene, asserted from outside a process that used it.
@@ -314,6 +325,12 @@ set(ATLAS_TESTS
   # Remote MCP end to end: HTTP bytes in, HTTP bytes out, against a live
   # fixture daemon with real credentials. No listening port is opened.
   test_gw_remote
+  # A16 T5. decision.remote_challenge and decision.remote_dispose against a
+  # real daemon started by atlas-gw-daemon with an injected gateway policy --
+  # the peer gate, the TLS-or-accepted-cleartext condition, the derived
+  # gateway.auth scope, and the write point's frozen refusals reached through
+  # the daemon rather than in process.
+  test_gw_dispose
   # --- A9.1: knowledge kinds, and a lifecycle state that closes a demand ---
   #
   # The vocabulary, the kind-aware transition table, the resolve capability,
@@ -417,6 +434,7 @@ set_tests_properties(test_hmac PROPERTIES LABELS "unit")
 set_tests_properties(test_apikey PROPERTIES LABELS "integration")
 set_tests_properties(test_gateway PROPERTIES LABELS "unit")
 set_tests_properties(test_gw_remote PROPERTIES LABELS "daemon" TIMEOUT 900 RUN_SERIAL TRUE)
+set_tests_properties(test_gw_dispose PROPERTIES LABELS "daemon" TIMEOUT 900 RUN_SERIAL TRUE)
 
 # A4. The content hash, the transition table and validation are pure functions —
 # bytes in, a digest or a verdict out — so this suite needs no repository, no

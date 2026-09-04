@@ -1300,6 +1300,29 @@ atlas_status atlas_server_dispatch(atlas_server_ctx *ctx, const void *payload, s
             }
         }
     }
+    /* A16. The daemon's remote disposal group, consulted additively right
+     * after the gateway group above and hidden the same way -- a peer this
+     * predicate refuses gets `unknown method`, not a refusal that would
+     * confirm the name exists to a caller who should not be able to tell.
+     * A separate consult rather than folding these two names into
+     * `atlas_server_gateway_methods` above: the gateway group's gate is one
+     * `SO_PEERCRED` comparison against a root-owned policy, and this one is
+     * that same comparison *plus* the policy naming a disposal credential
+     * *plus* a TLS-or-accepted-cleartext condition -- one question answering
+     * for two different grants (read-only gateway service versus a
+     * capability that changes a decision's lifecycle) is exactly the shape
+     * this project's own rules warn against. See
+     * `atlas_server_remote_disposal_offered` in `src/ipc/server_remote.c`. */
+    if (fn == NULL && atlas_server_remote_disposal_offered(ctx, (long long)peer_uid)) {
+        size_t n = 0;
+        const atlas_method_entry *g = atlas_server_remote_disposal_methods(&n);
+        for (size_t i = 0; i < n; i++) {
+            if (strcmp(atlas_ipc_request_method(req), g[i].name) == 0) {
+                fn = g[i].fn;
+                break;
+            }
+        }
+    }
     if (fn == NULL &&
         atlas_orchpolicy_is_any_dispatcher(&ctx->orchpolicy, (long long)peer_uid)) {
         size_t n = 0;

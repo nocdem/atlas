@@ -10,9 +10,13 @@
  * **The parameter surface is the boundary.** Three properties of it are load
  * bearing and are checked here rather than downstream:
  *
- *   1. `token` and `confirmation` are read by `decision.approve`,
- *      `decision.reject` and `decision.supersede` and by nothing else. No
- *      proposal method reads them, so a proposal cannot carry an approval.
+ *   1. `token` and `confirmation` are read in `spend_method` (`decision.approve`,
+ *      `decision.reject`, `decision.supersede`, `decision.revalidate` and
+ *      `decision.resolve`) and in `src/ipc/server_remote.c`'s
+ *      `method_remote_dispose`, and nowhere a model reaches. The first is
+ *      offered only to the operator's uid; the second only to the gateway's
+ *      uid behind TLS and a named credential. No proposal method reads
+ *      them, so a proposal cannot carry an approval.
  *   2. `actor` is parsed against the closed vocabulary and then checked against
  *      `atlas_decision_actor_writable_by_adapter`, so a request that says
  *      `LOCAL_OPERATOR_CONFIRMED` is refused here as well as at the write
@@ -1436,6 +1440,15 @@ static atlas_status on_event(const atlas_decision_event_row *row, void *ud, atla
         st = atlas_json_key_str(ds->j, "actor", row->actor, err);
     }
     if (st == ATLAS_OK) {
+        /* A16. Present only when this event's transition was attributed to a
+         * credential -- a REMOTE spend, never a LOCAL one. Sixteen lowercase
+         * hex characters Atlas minted and verified before recording it, so
+         * unlike `detail` and every other value on this row it is not
+         * safe-encoded: `principal.key_id`'s own contract, restated at
+         * `gateway.auth` and here identically. */
+        st = atlas_json_key_str_opt(ds->j, "key_id", row->key_id, err);
+    }
+    if (st == ATLAS_OK) {
         st = atlas_json_key_int(ds->j, "revision", row->revision_no, err);
     }
     if (st == ATLAS_OK) {
@@ -2561,7 +2574,10 @@ static atlas_status spend_method(dispatch_state *ds, const atlas_ipc_request *re
     if (st == ATLAS_OK) {
         st = take_doc_uid(req, true, &op->uid, err);
     }
-    /* `token` and `confirmation` are read here and in no other method, which is
+    /* `token` and `confirmation` are read here and in `src/ipc/server_remote.c`'s
+     * `method_remote_dispose`, and nowhere a model reaches -- this method is
+     * offered only to the operator's uid, that one only to the gateway's uid
+     * behind TLS and a named credential. Between the two of them, that is
      * what makes "a proposal cannot carry an approval" a property of the
      * parameter surface rather than of a check. */
     const char *v = NULL;

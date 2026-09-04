@@ -229,4 +229,29 @@ bool atlas_server_peer_may_administer_credentials(dispatch_state *ds);
 const atlas_method_entry *atlas_server_gateway_methods(size_t *count_out);
 bool atlas_server_peer_is_gateway(const atlas_server_ctx *ctx, long long peer_uid);
 
+/* A16. The daemon's remote disposal group -- `decision.remote_challenge` and
+ * `decision.remote_dispose` -- in `src/ipc/server_remote.c`, its own file
+ * rather than a further group in `server_decision.c` or `server_gw.c`. See
+ * that file's header for why: the peer test it is offered under is neither
+ * the operator group's nor the plain gateway group's, and folding it into
+ * either would make one `SO_PEERCRED` comparison answer for two different
+ * grants.
+ *
+ * Offered only to the peer the root-owned gateway policy names as the
+ * gateway itself, and only when that same policy also names a disposal
+ * credential and states either that TLS is in front or that the operator
+ * has written down accepting a cleartext channel. Consulted additively,
+ * like every other group here: a peer outside it gets `unknown method` for
+ * both names, which is what a name that does not exist gets. */
+const atlas_method_entry *atlas_server_remote_disposal_methods(size_t *count_out);
+bool atlas_server_remote_disposal_offered(const atlas_server_ctx *ctx, long long peer_uid);
+/* The three (not the peer test's fourth) conditions above, over a policy
+ * alone: state ENABLED, a named disposal key, and TLS-in-front-or-accepted-
+ * cleartext. Shared with `gateway.auth`'s scope derivation
+ * (`src/ipc/server_gw.c`) so the scope that endpoint reports for a
+ * credential and the methods the dispatcher actually offers for it can
+ * never disagree -- two askings of one question rather than two questions
+ * that happen to agree today. */
+bool atlas_server_remote_disposal_policy_ready(const atlas_gwpolicy *gw);
+
 #endif /* ATLAS_IPC_SERVER_INTERNAL_H */

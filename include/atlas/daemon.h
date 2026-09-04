@@ -51,6 +51,23 @@ typedef struct atlas_daemon_opts {
     /* Test hook: reconcile every registered repository once, serve until the
      * queue is empty, then exit 0. Never set by the CLI. */
     bool run_once;
+    /* A16. Test hook: the raw bytes of a gateway policy, parsed with
+     * `atlas_gwpolicy_parse_buffer` instead of the compiled-in
+     * `atlas_gwpolicy_load`. NULL selects production's path unchanged.
+     *
+     * P0's `watch_budget_total` precedent, restated: `test_gw_dispose.c` needs
+     * a daemon actually offering `decision.remote_challenge` and
+     * `decision.remote_dispose` under a chosen `tls_mode`, a chosen disposal
+     * credential and a chosen `operator_accepts_cleartext_disposal`, and
+     * `atlas_gwpolicy_load`'s root-ownership walk can only ever pass for a
+     * genuinely root-owned `/etc/atlas/gateway.conf` — a fixture cannot
+     * produce one and must not try to. So this travels on the options struct,
+     * exactly like the watch budget: never a CLI flag, an environment
+     * variable, a policy key, an RPC method or an MCP tool, because a way to
+     * hand a daemon an arbitrary policy is reachable by anyone who can start
+     * one. The only production code that sets it is
+     * `tests/tools/atlas_gw_daemon.c`. */
+    const char *gwpolicy_text;
 } atlas_daemon_opts;
 
 void atlas_daemon_opts_init(atlas_daemon_opts *o);

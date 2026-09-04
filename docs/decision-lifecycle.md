@@ -735,6 +735,7 @@ atlas decision approve NAME ID              # interactive; needs a terminal
 atlas decision reject  NAME ID              # interactive
 atlas decision supersede NAME ID --by ID2   # interactive
 atlas decision resolve NAME ID              # interactive; OBLIGATION and ACCEPTED_RISK only
+atlas review apply FILE [--check] [--json]  # interactive; walks a review sheet, entry by entry
 atlas decision link add    NAME SOURCE TARGET [--why TEXT]
 atlas decision link remove NAME SOURCE TARGET  --why TEXT
 atlas decision link note   NAME SOURCE TARGET  --why TEXT [--provenance P] [--event E]
@@ -782,6 +783,66 @@ Type 634eaddd to approve this exact revision, or anything else to abandon:
 `--json` is refused for the three interactive verbs: the prompt goes to the
 terminal and the result to stdout, and interleaving a human prompt with a
 machine document serves neither.
+
+### `atlas review apply`: a sheet walks the same channel, one entry at a time
+
+A15 adds one more way to reach the operator channel above, and it is not a
+second channel: `atlas review apply FILE` reads a **review sheet** — a
+plain-ASCII list an operator builds by clicking through Mission Control's
+Review view and copies out as text — and loops
+`atlas_service_decision_confirm` once per entry, with the reviewed revision
+pinned. Every entry still ends at the same prompt shown above, on the same
+`/dev/tty`, with the same typed hash prefix; the sheet only says which
+records to walk and in which order. The full grammar, its refusal sentences
+and the command's output shapes are pinned in
+`docs/plans/2026-09-03-review-surface.md` §Frozen formats and implemented in
+`include/atlas/review.h` and `src/core/review.c` — they are not repeated here
+in a form that could drift from either.
+
+Before minting anything for an entry, the walker re-reads the record and
+refuses the entry — costing no challenge at all — when the newest revision is
+no longer the one the sheet names, when that revision's content hash no
+longer starts with the sheet's prefix, or when the record's status is no
+longer the one the intent needs. A sheet is a plain list with **no field for
+a confirmation**: queuing a record in a browser stores no authority anywhere,
+and the only thing that ever disposes of one is this same interactive prompt,
+which Atlas records as `LOCAL_OPERATOR_CONFIRMED` — that names the channel,
+not a person, exactly as every other transition on this page does.
+
+### `--revision N`, and a pinned revision that is not the newest
+
+`decision approve`, `reject` and `resolve` accept `--revision N`, which pins
+the capability to one existing revision rather than the document's current
+one — the same mechanism `atlas review apply` uses on every sheet entry.
+**What the lifecycle does with a pinned revision that exists but is not the
+newest was established by running the code, not by reading it**:
+`op_challenge` (`src/decision/lifecycle.c:911-919`) refuses a pinned revision
+only when it does not exist at all, and nothing in `op_approve` compares the
+pinned revision against "the latest one". Approving an older, pinned revision
+**succeeds**: that revision becomes the document's effective, `APPROVED` one,
+and a newer `PROPOSED` revision sitting beside it is left completely
+untouched — not superseded, not rejected, not silently promoted. Nothing in
+the lifecycle warns about the resulting state or offers a path out of it
+beyond an operator noticing and superseding or resolving the older revision
+by hand. `tests/test_decision_operator.c`'s
+`test_a_pinned_revision_that_is_not_the_newest` is where this was measured;
+`docs/backlog.md` records a related defect it also exposed, in the message
+`op_approve` writes when it supersedes a previously-effective revision.
+
+### The gate, and a record that is not `APPROVED`
+
+`atlas gate check` and the remote `gate.check` route assess `APPROVED`
+records only (`src/core/service_gate.c:365`); a proposal has never been
+policy, so there is nothing about it that could have gone stale. Naming any
+other record — `PROPOSED`, `REJECTED`, `SUPERSEDED` or `RESOLVED` — narrows
+the assessment to zero candidates, and `atlas_gate_narrow_to_one`
+(`service_gate.c:456`) treats zero candidates as a refusal: exit code 4
+locally, HTTP 404 remotely, with the message
+`no approved decision "<uid>" is attached to this repository`. **The filter
+is "not `APPROVED`", never "`PROPOSED`"**: a `PROPOSED` uid, a `REJECTED` one,
+a `SUPERSEDED` one and a uid that does not exist at all all produce the
+identical answer, and a caller cannot tell any of them apart from the
+response alone.
 
 ### Relating one decision to another, and withdrawing it
 

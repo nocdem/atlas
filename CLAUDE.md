@@ -1,7 +1,39 @@
 # Atlas — working notes for Claude Code
 
 Atlas is a generic, headless engineering-memory and repository-intelligence CLI
-in C17. The current work is **A12.1**: reconciled model memory — a registered
+in C17. The current work is **A15**: the review surface — Mission Control reads
+a registered proposal in full, wherever a browser reaches the gateway, and an
+operator disposes of it nowhere but the one interactive terminal channel A4
+already built. **A15 added no migration.** The sentence it exists for is
+
+> **A PROPOSAL NOBODY CAN REVIEW COMFORTABLY IS A PROPOSAL NOBODY REVIEWS.**
+
+A12.1 proved a registered memory file could be turned into ordinary,
+reconciled verification claims; it said nothing about how an operator actually
+reads what a model proposed — a revision, its claims, their evidence, the gate
+assessment — before deciding what to do with it. Reading a proposal properly
+meant a terminal, and the surface that renders a revision well, Mission
+Control, could do nothing about any of it. Atlas' web API already served 26
+read-only routes and could not be trusted with a twenty-seventh that wrote
+anything, because a model's own bearer token and an operator's browser session
+resolve to the same kind of principal on that listener, and the gateway's own
+authorization engine cannot tell which produced a given request.
+
+**Disposing of a record therefore never moved onto the listener a model can
+reach.** Mission Control now composes every revision, the claims about it and
+their evidence, the gate's answer, and what it links to, into one detail pane,
+and keeps a plain-text **review sheet** of what an operator would do next — a
+list that stores no authority anywhere and has no field for a confirmation.
+One new local command, `atlas review apply FILE`, walks that sheet by calling
+the operator channel A4 already built exactly once per entry, with the
+reviewed revision pinned, and refuses an entry before minting anything when
+the record moved since it was read. `atlas_decision_apply_in_tx` still has
+exactly three callers. See the A15 sections in `docs/review-surface.md` — the
+season's own document — and in `docs/roadmap.md`, `docs/remote-access.md`,
+`docs/decision-lifecycle.md`, `docs/engineering-rules.md` and
+`docs/extending.md`.
+
+The season before it, **A12.1**, was reconciled model memory — a registered
 memory file is read by whichever principal can actually read it, turned into
 ordinary verification claims by a deterministic pass that calls no model, and
 handed to a worker as one frozen Context Pack that states its own staleness
@@ -190,6 +222,7 @@ document that carries it:
 
 | Season | What it added | Document |
 | --- | --- | --- |
+| A15 | the review surface: Mission Control reads a proposal in full, and one local command disposes of it through the operator channel A4 already built | `docs/review-surface.md` |
 | A12.1 | reconciled model memory: a registered file becomes a self-declared attestation, drift gets its first producer, and a run is handed one frozen, self-labelling Context Pack | `docs/context-reconciliation.md` |
 | A13 | the per-user scanner: a repository records whose scanner may report about it, and the daemon reads a tree it cannot open from that scanner's mirror | `docs/watcher-consistency.md` |
 | P0 | the watch budget derived from the kernel; a descriptor and a subscription made different things; an ignore answer nobody had for a path that did not exist yet | `docs/watcher-consistency.md` |
@@ -808,6 +841,50 @@ is not written down is one somebody deletes.** Both halves are load-bearing.
   phase it is already in. A failed renewal never kills the child.
 - **The run driver starts nothing in the background** — no scheduler, no polling,
   no timer, no model router, no second submit path.
+
+### A15 — the review surface
+
+- **A PROPOSAL NOBODY CAN REVIEW COMFORTABLY IS A PROPOSAL NOBODY REVIEWS.**
+  The reading moves to the surface that is good at it; the disposing stays
+  where the only channel is.
+- **No approval verb in an MCP tool name, ever.** A15 adds no MCP tool, and
+  the existing scanner over `approve`, `approval`, `reject`, `supersede`,
+  `confirm`, `sign`, `resolve`, `revalidate` is unmoved by this season.
+- **Nothing may claim a channel establishes that a natural person acted.**
+  `LOCAL_OPERATOR_CONFIRMED` identifies a channel, not a person; a same-uid
+  process driving a pseudo-terminal reaches it exactly as a person does,
+  whether it is called through `atlas decision approve` or through
+  `atlas review apply`. The page and the walker's own text are scanned by the
+  same test that scans this file.
+- **The review sheet stores no authority and has no field for a
+  confirmation.** It is a list of what the operator said in a browser; every
+  entry is still confirmed on `/dev/tty` against the revision's content hash,
+  and a sixth field refuses the whole sheet for the reason a `"confirmation":`
+  MCP schema property is refused.
+- **The sheet is a file argument, never standard input.** Both standard
+  streams must be terminals; a piped sheet is refused before anything is
+  minted.
+- **The walker loops `atlas_service_decision_confirm` with the reviewed
+  revision pinned, and refuses before minting when the record moved.**
+  `atlas_decision_apply_in_tx` still has exactly three callers; a fourth is
+  not this season.
+- **No route was added; three rows forward one more parameter each**, and the
+  route table's property — no operator method, no gateway-write method,
+  every scope grantable — is tested; its row count is not.
+- **A12.1's finding reaches the browser through one field and is labelled
+  with the one shape it can mean.** The reconciler's own rows stay
+  operator-group reads.
+- **No test executes the page's JavaScript.** The served bytes are grepped
+  and the routes are driven; that is the whole of what the suite establishes
+  about the page.
+- **Tier 3, a genuine remote operator channel, is absent, not refused.** Its
+  cost is written in `docs/review-surface.md`; it is a season of its own with
+  its own authorisation, and it is weaker than the local channel by
+  construction.
+- **No new thread, process, timer or background loop; no migration; no MCP
+  tool; no gateway route; no scope; no daemon method; no actor; no authority
+  verb in any new name.** The new command is `review apply`, and `review` is
+  not on the scanner's list because it is not an authority verb.
 
 ### A12.1 — reconciled model memory
 
@@ -1447,7 +1524,11 @@ a command means adding a service function plus a method on both renderers.
   that calls the service layer passes — and the binary answers `unknown command`.
   A9.2 shipped `verify` into a real deployment before anything noticed, because
   nothing in the suite drives the argument parser for a command that does not
-  exist yet. If you add a command, run it once from the built binary.
+  exist yet — **including `scripts/smoke.sh`**, which always passes
+  `--data-dir` and so never takes the foreign-index path `is_a_command` guards;
+  an explicit override wins ahead of a root-owned system policy in
+  `atlas_datadir_resolve`, for every command, on every run of the smoke matrix.
+  If you add a command, run it once from the built binary.
 
 ## Adding an MCP tool or a hook event
 
@@ -1622,6 +1703,13 @@ either moved. Details in `docs/data-model.md`.
 Unchanged in A1, and the IPC error document uses the same numbering in its
 `status` field so a caller has one vocabulary rather than two.
 
+Two commands use values above this seven-value contract for their own
+outcomes, read in the context of the command that produced them rather than as
+one global vocabulary: `atlas gate` exits `8` for `REVIEW_REQUIRED` and `9`
+for `BLOCKED`, and `atlas review apply` (A15) exits `8` when at least one
+review-sheet entry did not end `APPLIED`. Both write one complete document
+before exiting with either value.
+
 `atlas daemon ping` exits `3` when the daemon is not answering, after printing a
 complete document. That is the one place a non-zero exit accompanies valid
 output, and `cli_state.rendered` suppresses the error document there so that path
@@ -1641,7 +1729,7 @@ emits its error document inside the result document it had already started, whic
 `docs/security/A7_THREAT_MODEL.md` · `docs/security/A7_SECURITY_REVIEW.md` ·
 `docs/security/A7_1_THREAT_MODEL.md` · `docs/security/A7_1_OPERATIONS.md` ·
 `docs/orchestration.md` · `docs/remote-access.md` · `docs/verification.md` ·
-`docs/context-reconciliation.md` ·
+`docs/context-reconciliation.md` · `docs/review-surface.md` ·
 `docs/semantic-freshness.md` · `docs/semantic-discovery.md` ·
 `docs/semantic-trust.md` ·
 `docs/git-safety.md` ·

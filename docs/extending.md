@@ -1368,3 +1368,87 @@ the anchor bound is.
 `ATLAS_MEMORY_TRAILER_SCAN_MAX` (512 lines from a message's tail),
 `ATLAS_MEMORY_TRAILER_TAIL_BYTES_MAX` (65536 bytes, the backstop beneath the
 line bound), `ATLAS_MEMORY_SWEEP_INTERVAL_MS` (60000).
+
+## A15 — the review surface
+
+### Adding a sheet intent
+
+Three intents are allowed on a review sheet today: `approve`, `reject` and
+`resolve`. `atlas_review_intent_allowed` (`include/atlas/review.h`,
+`src/core/review.c`) is the **one** predicate — the C parser asks it of every
+entry's intent field, and Mission Control's `reviewIntentsAllowed`
+(`src/gw/ui/mission-control.html`) mirrors it in JavaScript rather than
+restating the list a second time in a form that could drift from the first.
+A new intent needs: a case in `atlas_review_intent_allowed` (and a matching
+change to the mirror, which is courtesy — the C predicate is the authority,
+and a wrong answer in the mirror costs nothing but a later `MOVED` or
+`DISPOSED` verdict at `atlas review apply`'s own, authoritative check); a
+grammar test in `tests/test_review_sheet.c` proving the new spelling parses
+and every other spelling still refuses; and, the one that is easy to miss,
+an honest answer to whether a five-field line — `intent repository decision
+revision confirm-prefix` — can actually carry what the intent needs.
+`supersede` and `revalidate` are not sheet intents *today*, not merely
+intents nobody added yet: supersede needs a second document named alongside
+the first, and revalidate needs a pinned repository state and an evidence
+digest, and neither fits five fields honestly. Widening the grammar to carry
+either is a bigger change than adding a case to a switch.
+
+### Adding a verdict
+
+`atlas_review_verdict` (`include/atlas/review.h`) follows the vocabulary
+discipline `src/memory/source.c` established: `ATLAS_REVIEW_UNKNOWN` is the
+zero member, is never emitted by anything, and `atlas_review_verdict_parse`
+refuses its own spelling, `"UNKNOWN"` — a stored or transmitted value must
+never be able to mean "nothing set this," because a caller who receives
+`UNKNOWN` back is reading a bug, not an answer the vocabulary permits. A new
+member is appended after the existing seven, never inserted between them,
+and every `switch` over the vocabulary — the walker's mapping from a confirm
+outcome to a verdict, both renderers' human and JSON output — has **no**
+`default:` case, so the compiler's own exhaustiveness check is what catches a
+switch nobody updated, rather than a silently-taken fallback branch.
+
+### Adding a parameter to a route row
+
+Following T2's shape (`src/gw/gateway.c`'s `API_ROUTES[]`): add the name to
+the row's forwarded-parameter list, and, only if the daemon method already
+treats its absence as optional, to the row's own defaults list beside it.
+That is the whole change — no new route, no new method, nothing else in the
+table's shape moves. What must not regress is the property
+`tests/test_gateway.c`'s `test_every_api_route_is_a_read_the_gateway_uid_may_make`
+checks over every row via `atlas_gateway_api_routes`: the method the row
+forwards to is not a member of `atlas_server_operator_methods()`, is not
+`gateway.auth` or `gateway.audit`, is not on the remote-forbidden list
+`docs/remote-access.md` states, and the row's scope is grantable. Forwarding
+a new parameter never changes which method a row names, so it never touches
+that property directly — but a row edited to forward a parameter to a
+*different* method than before would, and the test exists precisely so that
+change is caught rather than reasoned about by eye.
+
+### Changing a sheet bound
+
+`ATLAS_REVIEW_SHEET_MAX_ENTRIES` (64), `ATLAS_REVIEW_SHEET_MAX_LINE` (256)
+and `ATLAS_REVIEW_SHEET_MAX_BYTES` (64 KiB) are all refused past, never
+silently truncated — a sheet with 65 entries is not "read as 64," it is
+refused whole, before any entry is read or any record is looked up. The
+retention chain is what any change to the entry bound must be argued
+against: 64 is chosen to sit below `ATLAS_DECISION_CHALLENGES_RETAIN` (200),
+so a walk in which every entry is abandoned — the worst case, one unconsumed
+challenge per entry — cannot by itself reach the retention ceiling. Raising
+the entry bound without checking that inequality still holds would let an
+adversarial or merely careless sheet leave more unconsumed challenges behind
+a single walk than the retention policy was sized to expect, and each one
+still costs its full 120-second TTL before it stops counting. Mission
+Control's own `REVIEW_UI_MAX_SHEET_ENTRIES` mirrors this bound as a courtesy
+check in the browser, for the same reason `reviewIntentsAllowed` mirrors
+`atlas_review_intent_allowed`: to avoid handing an operator a sheet the
+parser is certain to refuse whole, not to be the authority on the number.
+
+### Bounds this season added
+
+`ATLAS_REVIEW_SHEET_MAX_ENTRIES` (64, below `ATLAS_DECISION_CHALLENGES_RETAIN`),
+`ATLAS_REVIEW_SHEET_MAX_LINE` (256 bytes), `ATLAS_REVIEW_SHEET_MAX_BYTES`
+(64 KiB), and, in Mission Control itself, `REVIEW_UI_MAX_IMPACT_LINKS` (8 —
+the most `PATH` or `SYMBOL` links from one revision the detail pane will walk
+through `code/impact` before saying how many were left unwalked) and
+`REVIEW_UI_MAX_SHEET_ENTRIES` (64, the browser's own mirror of the sheet
+bound above).

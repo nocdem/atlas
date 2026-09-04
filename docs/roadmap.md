@@ -1475,7 +1475,7 @@ pilot runs: this project's own rule that no evidence of a result is not
 evidence against one applies to its own acceptance, and this document does
 not pre-write the shape of a finding nobody has measured yet.
 
-## Next: A14 — a job an operator submits from wherever they are
+## Later: A14 — a job an operator submits from wherever they are
 
 The sentence it exists for is
 
@@ -1555,7 +1555,7 @@ passes.**
 - **The audit row names the key, never a claimed value**, the way `gw_audit`
   already refuses to store what a caller says about itself.
 
-## Later: the review surface, and where a proposal is disposed of
+## Next: A15 — the review surface, and where a proposal is disposed of
 
 A4 gave Atlas a lifecycle and one channel that may move it. A9 gave it a web
 surface that may only read. Today those two facts meet at an inconvenience an
@@ -1567,12 +1567,21 @@ renders it well can do nothing about it.
 
 **The job.** Make Mission Control the place a proposal is *read* — every revision,
 its evidence and counter-evidence, the aggregate and the reasons behind it, the
-gate results, the impact set, and A12.1's drift finding where there is one — and
-then decide, deliberately, how far it may go towards disposing of one.
+gate results, the impact set, and, where a claim's aggregate `conflict` is
+`IMPLEMENTATION`, A12.1's one producible drift shape — and then decide,
+deliberately, how far it may go towards disposing of one.
 
 **What is true today, measured rather than assumed** (2026-09-01). The gateway
-serves 26 routes and **not one of them mutates**: no `decision.approve`,
-`decision.reject` or `decision.supersede` appears in `API_ROUTES[]`. MCP tool
+serves 26 routes, counted by property rather than by a number kept in a fourth
+place, and **not one of them mutates a decision, an evidence row or a claim**:
+no `decision.approve`, `decision.reject` or `decision.supersede` appears in
+`API_ROUTES[]`, and no row names any operator-only method. The only two writes
+this listener can produce are its own bookkeeping — an appended `gw_audit` row
+per request, and the in-memory session table `/auth/login` and `/auth/logout`
+mutate — and beneath the table sits the fact that actually holds: the operator
+method group is offered only to the `SO_PEERCRED` uid a root-owned policy names
+as the operator, so a route naming `decision.approve` would still answer
+`unknown method` to the gateway's own uid whatever the table said. MCP tool
 names are scanned against a forbidden-verb list — `approve`, `approval`, `reject`,
 `supersede`, `confirm`, `sign`, `resolve`, `revalidate` — in
 `tests/test_decision_mcp.c`, so a lifecycle transition is not reachable from a
@@ -1641,6 +1650,15 @@ build that forgets.
 a shared credential that reads and disposes; and describing tier 3 as equivalent
 in strength to the local channel — it is weaker by construction, and the season
 that ships it says so in the same paragraph that announces it.
+
+**Tier 1 is what shipped, and the chain for choosing it, tier 3's full priced
+cost, and every finding running this plan produced are in
+`docs/review-surface.md`.** The threat model moved by nothing: no route,
+scope, method, actor or migration was added, and the property `tests/test_gateway.c`
+checks on the route table is what keeps that true after this season rather than
+only at the moment it shipped. Tier 3 remains absent, not refused, and is
+costed rather than built so a later season can choose it with the bill already
+in view.
 
 ## Invariants that outlive every phase
 

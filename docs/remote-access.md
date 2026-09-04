@@ -311,6 +311,47 @@ approves, rejects, supersedes, revalidates or resolves anything. A9.1's one new
 lifecycle verb, `decision.resolve`, is in the operator-uid RPC group — a group the
 gateway's uid is not in, so the gateway is told the method does not exist.
 
+## A15: the review surface, and the three forwarded parameters
+
+A15 adds Mission Control's Review view: a repository and status pick, a list of
+records, a detail pane composing four existing read routes, and a review sheet
+held in the browser's own `localStorage`. See `docs/review-surface.md` for the
+full argument; this section is the remote-access half of it.
+
+**Three rows forward one more query-string name each, and nothing else about
+the table changes.** `/api/v1/decision` now forwards `revision`, so a specific
+revision of a document can be fetched rather than only its effective one;
+`/api/v1/gate` now forwards `decision`, so a gate assessment can be narrowed to
+one record instead of every `APPROVED` one in the repository; `/api/v1/code/impact`
+now forwards `symbol` beside `path`, closing a defect the Impact view already
+had (see `docs/backlog.md`). Each is a name the daemon already read on its own
+side of the socket; adding it to a row is the only way a query-string value
+ever reaches a daemon call, and no new row, method or scope was needed for any
+of the three.
+
+**The Review view reads and queues; it never disposes.** It composes
+`decision/history`, `verify/claims`, `verify/claim`, `gate` (for an `APPROVED`
+record) and `code/impact` — five routes that already existed or already read —
+into one detail pane per record, and keeps a plain-text list of
+`(intent, repository, decision, revision, hash prefix)` lines in the browser's
+own storage. Queuing a record writes nothing to the daemon at all; the list is
+built from values the page itself already fetched and validated, and it is
+carried off the browser only by the operator copying its text into a file and
+running `atlas review apply FILE` on the machine, on a terminal, where the
+disposal actually happens.
+
+**The browser session and the bearer token are one principal type, and that is
+why nothing capable of disposing of a record was placed behind either.** A
+session cookie (the browser's shape) and a bearer token (the remote-MCP shape)
+resolve to the identical `principal` inside the gateway — the authorization
+engine does not know which mechanism produced it — and a model's API key and
+an operator's browser session are the same *kind* of credential, distinguished
+only by which scopes a root-owned policy granted one or the other. A
+capability placed behind either would therefore be one scope grant away from
+the other, which is why disposing of a record stayed on the one channel that
+never runs through this listener at all: an interactive terminal, on the
+machine, as the operator's own uid.
+
 ## Audit
 
 Every request through the gateway is recorded in `gw_audit`: when, which

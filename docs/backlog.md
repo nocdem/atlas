@@ -2174,3 +2174,187 @@ loader, would trade a wrong defense for a silent one. Recorded rather than fixed
 because it is genuinely dead code today and carries no live consequence — the review's own
 finding was that it is "the one place in that file where the house rule is clamp," a
 consistency defect, not a reachable one.
+
+## Mission Control's Impact view sent a parameter the route dropped, and every symbol-only query was refused (found 2026-09-03, fixed 2026-09-04)
+
+**The chain.** `viewImpact` (`src/gw/ui/mission-control.html`) sends `symbol` to
+`/api/v1/code/impact`. Before A15's T2, the row for that path in `API_ROUTES[]`
+(`src/gw/gateway.c`) forwarded only `repo`, `path` and `depth` —
+`build_api_params` drops any query-string name a row does not declare — so
+`code.impact`'s handler (`run_walk`, `src/ipc/server_code.c`) received neither
+a `path` nor a `symbol` and refused with `a "path" or a "symbol" is required`.
+An operator who typed a symbol into the Impact view and pressed the button was
+told the very thing they had just supplied was missing.
+
+**Found and fixed.** Found reading the view against the route table during A15
+planning (2026-09-03); fixed in T2 (2026-09-04) by adding `symbol` to the
+row's forwarded-parameter list — the sanctioned way a query-string value
+reaches a daemon call, per `docs/remote-access.md`'s A9.1 precedent.
+`tests/test_gw_remote.c`'s `test_the_review_parameters_reach_the_daemon` (c)
+now asserts `GET /api/v1/code/impact?repo=proj&symbol=main` answers `200` and
+names the symbol.
+
+## `op_approve`'s hard-coded supersession reason is false for a pinned, older revision approved after a newer one (2026-09-04)
+
+Derived by reading `src/decision/lifecycle.c` while establishing what a pinned,
+non-newest revision does (`docs/decision-lifecycle.md`'s `--revision` section);
+not exercised by any running test, so the chain is recorded rather than an
+observation reported as one.
+
+**The chain.** `op_approve` (`lifecycle.c:1377-1453`) reads the document's
+currently-effective revision, if any (`doc_current`), and — when that revision
+differs from the one being approved — supersedes it with the fixed detail
+string "replaced by a later revision of the same decision, which was approved
+in the same transaction" (`:1420-1426`), before transitioning the newly
+approved revision. Nothing in that function, and nothing in `op_challenge`
+(`:891-1138`) for the `APPROVE` intent, compares the two revisions' numbers —
+only `RESOLVE` (`:1092-1107`) and `REVALIDATE` (`:1024-1030`) carry a status
+check at challenge-issue time, and neither compares revision numbers either.
+
+That leaves the following sequence reachable through the ordinary CLI, with no
+test yet exercising it: propose a decision (revision 1, PROPOSED); revise it
+(revision 2, PROPOSED — `op_revise` touches neither the document's status nor
+either revision's own state); approve revision 2 (nothing to supersede yet,
+since nothing was approved before this — the document becomes APPROVED at
+revision 2); then mint and spend a fresh APPROVE challenge pinned to revision
+1, whose own per-revision state was never touched by the first approval and is
+still PROPOSED. `op_approve` now finds `doc_current` naming revision 2, and
+supersedes it with "replaced by a **later** revision" — but revision 1 is
+*older* than revision 2. The ledger event records a relationship between the
+two revisions that is the reverse of what happened.
+
+**Why it stays recorded rather than fixed here.** This is a source-level
+defect needing its own test and its own fix in `src/decision/lifecycle.c` —
+comparing `revision_no` before choosing the detail string, or writing a
+detail that states the relationship actually observed rather than assuming
+one — and is outside a documentation task's file list.
+
+## Three routes in the gateway's own table name daemon methods that do not exist (pre-existing; found 2026-09-04 while establishing A15's route-table property)
+
+**The chain.** `API_ROUTES[]` (`src/gw/gateway.c`) has three rows whose named
+method is not implemented by any dispatch table in `src/ipc/server_*.c`:
+`/api/v1/code/search` → `code.search`, `/api/v1/sem/callers` → `sem.callers`,
+`/api/v1/sem/callees` → `sem.callees`. A request to any of them reaches
+`api_handle`, which forwards the name verbatim; `dispatch()` finds nothing
+registered under it and answers `unknown method`. All three have been dead
+since long before this season — A15 did not add or touch them, and this was
+found by reading the whole table while establishing T1's route-table
+property, not by anything A15 changed.
+
+The real methods exist under different names: symbol search is
+`code.symbol.search` (`src/ipc/server_code.c:924`), and both call-graph
+directions are one method, `sem.graph` (`src/ipc/server_sem.c:1033`), which
+picks its direction from an `inbound` boolean (`server_sem.c:690-691`) that
+neither `sem/callers` nor `sem/callees` forwards.
+
+**Why A15 deliberately does not fix them.** `code/search` → `code.symbol.search`
+is a one-row rename, but the two `sem` routes need either a new
+fixed-parameter row per direction or a route parameter a client supplies —
+either way, a real change to the shape of the route table this season's whole
+threat argument rests on *not* changing (`docs/review-surface.md` §1–§2: the
+property `tests/test_gateway.c` checks, and the "three rows gained a
+parameter, zero rows were added" claim). Fixing three long-dead routes was out
+of scope for a season about disposal, not repair, and is recorded here for
+whichever season next touches the graph routes.
+
+## Two costs tier 1 of the review surface leaves, for a season that widens it to start from (2026-09-04)
+
+Recorded here as well as in `docs/review-surface.md` §2, because a backlog
+entry is where a later season looks for what to widen, and the design
+document is where it looks for why the limit was chosen in the first place.
+
+1. **No cross-device queue.** The review sheet lives in one browser's
+   `localStorage`, under the gateway's own origin. It does not sync between
+   devices, browsers or profiles; an operator who queues records on one
+   machine and wants to dispose of them from another has to copy the sheet's
+   text across by hand. Widening this needs a place to hold the queue that is
+   neither the daemon (see `docs/review-surface.md` Decision 1's argument
+   against that) nor a single browser — a genuine third design, not a small
+   extension of tier 1.
+2. **Disposal needs a shell on the machine.** `atlas review apply` is a local
+   command; reaching it from off the machine costs an `ssh` session and a
+   copied file. An operator with a phone and no shell has no path under
+   tier 1. Tier 3 is the only tier that touches this, and it is priced, not
+   built (next entry).
+
+## Tier 3, the remote operator channel, costed for a future season to start from (2026-09-04)
+
+The full six non-negotiables and the three further costs A15's planning found
+while pricing them are in `docs/review-surface.md` §3, and are not repeated
+here — this entry exists so a search of this file finds the pointer. Tier 3
+is **absent, not refused**: nothing in A15 blocks building it, and nothing in
+A15 makes it easier than it would otherwise be. Whoever picks it up next
+should start from the priced list rather than re-deriving it: a new actor and
+a migration widening `decision_events`' actor `CHECK`; a new ungrantable
+scope; absence from MCP, proven the way `tests/test_gw_remote.c` already
+proves it for credential administration; a `tls_mode = REVERSE_PROXY` gate
+that fails on this machine as configured today; the existing content-hash
+replay shape, reused rather than reinvented; and a root-owned policy naming
+which decision kinds it may act on. Three costs the roadmap's own six points
+did not itemise are priced there too: authenticating the bearer token inside
+the spending transaction rather than trusting what the gateway claims, a
+second route table or a method column since `api_handle` refuses every
+non-`GET` method today, and a `yyjson` call site inside `src/gw` that does not
+exist yet.
+
+## Three limitations of the browser-side review sheet, none load-bearing for correctness today (2026-09-04)
+
+Found reading `src/gw/ui/mission-control.html`'s queue implementation for
+A15's T9; none is exercised by a test, since no test in this suite executes
+the page's JavaScript (`docs/review-surface.md` Decision 9).
+
+1. **Cross-tab last-writer-wins.** Two browser tabs open on the same origin
+   share one `localStorage` key. Two tabs queuing different entries close
+   together in time can have the second tab's save silently overwrite the
+   first's, because neither tab's `reviewQueueLoad`/`reviewQueueSave` pair
+   reads the other tab's most recent write and nothing here adds a cross-tab
+   lock. A queued entry can be lost with no error shown to either tab.
+2. **A corrupt store is folded into an empty queue and silently overwritten
+   on the next queue action.** `reviewQueueLoad()` returns `null` when
+   `JSON.parse` throws, and the render path, `renderReviewSheet`, checks for
+   `null` explicitly and shows "the browser kept nothing" when it sees it.
+   `reviewQueueAdd` and `reviewQueueRemove` do not: both compute
+   `const q = reviewQueueLoad() || [];`, which folds a corrupt store into an
+   empty array with no notice at all, and the very next queue action then
+   calls `reviewQueueSave` and overwrites whatever bytes were there — corrupt
+   or not — with nothing the operator ever sees. The render path's honesty
+   about a failed read is not shared by the two paths that act on one.
+3. **The revision validator has no upper bound.** `reviewSheetText`'s
+   `okRevision` check is `Number.isInteger(e.revision) && e.revision > 0` —
+   positive, but never checked against the grammar's own ceiling,
+   `2147483647` (`docs/plans/2026-09-03-review-surface.md` §Frozen formats).
+   Unreachable with real Atlas data — no repository comes close to two
+   billion revisions of one document — and recorded because the C parser
+   enforces its own ceiling and the browser's courtesy mirror of the grammar
+   should too, for the same reason `reviewIntentsAllowed` and the entry-count
+   check mirror their own C originals.
+
+## Open question, not decided here: whether SKILL.md's approval-contract paragraph needs a larger byte budget (2026-09-04)
+
+`integrations/claude/atlas/skills/atlas-memory/SKILL.md` must stay under 8192
+bytes (`tests/test_plugin.c:342`) — "every character is paid for in every
+session that loads it." A15's addition — `atlas review apply` beside
+`atlas decision approve` in the "do not run it yourself" paragraph — left the
+file at 8171 bytes, measured directly against the file on disk today: 21
+bytes of margin. It paid for itself by removing explanatory clauses from
+other paragraphs, not by the file growing.
+
+The approval-contract paragraph grows every time Atlas adds an operator
+command that disposes of a record — this season added a second one — and each
+increment is now paid for out of some other paragraph's own reasons, which is
+`CLAUDE.md`'s own warning about deleting reasons, with this test in the role
+of the deleter. Moving the contract into a file the skill merely references
+does not solve this: a referenced file is loaded on demand, and the
+prohibition on a model running the operator channel itself has to already be
+in the model's context before it acts, not one call away from it.
+
+Two options, deliberately left open here:
+
+- **Raise the 8192-byte bound**, with a measured token cost written down at
+  the assertion that sets it, so the next reader can weigh the bound against
+  what it protects.
+- **Accept that every future addition keeps evicting some other paragraph's
+  explanation**, and treat that as the standing cost of adding an
+  operator-disposal command rather than as a defect to fix.
+
+This entry does not choose between them.

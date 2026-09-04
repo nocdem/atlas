@@ -717,7 +717,17 @@ function reviewQueueSave(q) {
  * way to hold two anyway. Whichever happens is reported back through
  * `renderReviewSheet`'s notice, in the sheet panel itself, because a queue
  * action that silently either overwrote or dropped the click would be worse
- * than today's bug. */
+ * than today's bug.
+ *
+ * A15 T9. **This function and `reviewQueueRemove` hold no `await` between
+ * `reviewQueueLoad()` and `reviewQueueSave()`.** That gap is not an oversight
+ * to close -- it is what makes two in-flight click handlers from this tab
+ * unable to interleave, which is what makes the duplicate-replacement rule
+ * above and the 64-entry bound reliable at all. An edit that inserts an
+ * `await` between those two calls -- a confirmation dialog on a queue action
+ * would be the obvious way to do it -- would silently reopen that race, and
+ * nothing in this suite would catch it: no test here executes this page's
+ * JavaScript. See `docs/review-surface.md` §6. */
 async function reviewQueueAdd(entry) {
   const q = reviewQueueLoad() || [];
   const i = q.findIndex((e) => e.repo === entry.repo && e.decision === entry.decision);
@@ -745,6 +755,9 @@ async function reviewQueueAdd(entry) {
      cls: "err"});
 }
 
+/* A15 T9. No `await` between load and save here either, for the reason
+ * given above `reviewQueueAdd`: that is what keeps this function and a
+ * concurrent click on `reviewQueueAdd` from interleaving. */
 async function reviewQueueRemove(index) {
   const q = reviewQueueLoad() || [];
   q.splice(index, 1);

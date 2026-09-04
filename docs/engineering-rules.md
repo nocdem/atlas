@@ -3639,3 +3639,96 @@ arm's kind-specific test an argument to a single call that enforces the three
 absolutes unconditionally, so a fourth arm added later inherits them by
 having to go through that call to reach a deletion at all, rather than by
 whoever adds it remembering to copy three conditions by hand.
+
+## A15 layers — additions
+
+| File | What it owns |
+| --- | --- |
+| `include/atlas/review.h` | the sheet model, the verdict vocabulary, the three review-sheet bounds, `atlas_review_sheet_parse`, `atlas_review_intent_allowed` |
+| `src/core/review.c` | the grammar parser and the name/parse pairs; no I/O, no database, no git, no process |
+| `src/core/service_review.c` | `atlas_service_review_apply`: authority, the terminal check, the file read, the pre-check read, and the loop over `atlas_service_decision_confirm` |
+| `include/atlas/gateway.h`, `src/gw/gateway.c` | the route-view accessor `atlas_gateway_api_routes` and the three edited rows (`decision.get`'s `revision`, `gate.check`'s `decision`, `code.impact`'s `symbol`) |
+| `src/gw/ui/mission-control.html` | the Review view: the record list, the detail composed from five existing read routes, and the review sheet held in `localStorage` |
+| `src/cli/cli.c`, `src/cli/render.h`, `src/cli/render_human.c`, `src/cli/render_json.c` | `atlas review apply`, its five ordinary places, and `COMMANDS[]` |
+| `tests/support/pty.h`, `tests/support/pty.c` | the pseudo-terminal helpers, moved out of `tests/test_decision_operator.c` unchanged so `tests/test_review_apply.c` can share them |
+
+**A15 adds no migration.** `MIGRATIONS[]` still ends at 30 — A12.1's. Nothing
+this season needed a new table or column: a review sheet exists only as text
+in a browser and as a file an operator hands to a local command, never as a
+database row, and the operator channel it walks already existed in full.
+
+## A15 rules — these are not negotiable
+
+The one-line forms are in `CLAUDE.md`; the full argument for every decision
+this season made, the tier-3 cost list in full, and every finding the
+execution of this plan produced beyond what the plan itself claimed are in
+`docs/review-surface.md`. What follows here is the reasoning that is easiest
+to get wrong by rediscovering it from the code alone.
+
+**Why the queue lives in the browser and not in the daemon.** A queue held by
+the daemon needs a write route — the first one on `/api/` — under a scope
+some model credential could equally hold, and the gateway's own comment says
+outright that its authorization engine cannot tell a model's bearer token
+from an operator's browser session apart: both resolve to one `principal`.
+A model holding that scope could place "I would approve this" on its own
+proposal, and it would appear in the operator's own queue looking exactly
+like the operator's own intent — not merely readable by the model, but
+*attributable to the operator* the moment it was walked. Keeping the queue in
+`localStorage`, under the gateway's own origin, makes that specific forgery
+impossible rather than merely inconvenient: the sheet is text the operator
+copied out of a page they read, never a row Atlas wrote on anyone's behalf.
+
+**Why a sheet has no field for a confirmation, and why that is enforced by
+refusing a sixth field rather than by ignoring one.** A parser that silently
+dropped an unrecognised field would make a sheet with a forged confirmation
+column parse identically to one without it — the field would still not do
+anything, but nothing would tell a reader it had been added. Refusing the
+whole sheet on a sixth field is the sheet-grammar mirror of
+`tests/test_decision_mcp.c`'s rule that no MCP tool schema may declare a
+`"confirmation":` property: in both places, the shape of the input is itself
+part of the guarantee, not merely its content.
+
+**Why the walker re-reads the record before minting anything, on every
+entry, rather than trusting what the browser showed.** The window between a
+browser rendering a revision and an operator running `atlas review apply`
+minutes or hours later is real and cannot be closed by anything client-side:
+a model can revise or a second reviewer can dispose of the same record in
+that window. The walker's pre-check — newest revision matches, content hash
+prefix matches, status matches what the intent needs — costs no challenge
+row when it fails, which is what makes an abandoned sheet cheap rather than
+merely safe: a reviewer who queued sixty-four records and let the sheet sit
+overnight does not spend sixty-four unconsumed challenges finding that out.
+
+**Why three rows gained a parameter instead of a fourth route being added.**
+`gate?decision=`, `decision?revision=` and `code/impact?symbol=` each forward
+a name the daemon-side method already read; the alternative — a new route
+whose handler reads the same parameter — would be a second way to reach one
+daemon method; the table would grow without the read surface growing with it.
+Every row still forwards to exactly one method, and the property
+`tests/test_gateway.c` checks (no operator method, no gateway-write method,
+every scope grantable) is unmoved by adding a parameter to an existing row,
+which is the point: the accessor exists so that property is checked
+mechanically rather than re-argued by eye every time a row changes shape.
+
+**Why A12.1's finding is shown as one label and not as a general "drift"
+indicator.** The only A12.1 output the gateway uid can read at all is
+`verify.show`'s `conflict` field, and A12.1 itself established that its
+reconciler produces `IMPLEMENTATION` for exactly one shape: a claim carrying
+both a decision anchor and a symbol anchor, extracted while the symbol
+resolved, later found not to resolve in a semantic generation the vanish
+sweep can show is coverage-complete. A page that rendered every other value
+of `conflict` as if it too meant "drift found" would be claiming a detector
+this season did not build; saying nothing about the other values is the
+honest reading of what one field, produced by one algorithm, for one shape,
+actually establishes.
+
+**Why the suite greps the served page instead of running it.** Nothing in
+this tree runs a browser, and adding one to test eight lines of DOM
+manipulation would be a disproportionate answer to a page this small. What
+the grep-and-drive-the-routes test can prove is real and stated precisely:
+the served bytes carry the identifiers and sentences each panel depends on,
+and the routes those bindings name answer through a real session cookie. What
+it cannot prove is that a click renders what the source says it renders — and
+`docs/review-surface.md` records one place that gap actually matters: the
+review-sheet functions' reliance on holding no `await` between a load and a
+save, which no grep can see and no route-driving test exercises.

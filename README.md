@@ -216,6 +216,7 @@ atlas code status|sync|file|search|symbol|deps|impact NAME ...
 atlas decision list|show|search|history|for-file|export NAME ...
 atlas decision propose|revise NAME ...
 atlas decision approve|reject|supersede|revalidate|resolve NAME ID   # terminal only
+atlas review apply FILE [--check] [--json]   # terminal only; walks a review sheet
 atlas decision link add|remove|note REPO SOURCE TARGET
 atlas decision links|orphaned|legacy|promote ...
 atlas gate check NAME | gate show NAME ID
@@ -268,11 +269,15 @@ clamped or trimmed.
 | 7 | integrity or safety invariant violated |
 | 8 | `atlas gate`: `REVIEW_REQUIRED` — a relevant decision is stale or impacted |
 | 9 | `atlas gate`: `BLOCKED` — Atlas could not prove a safe answer |
+| 8 | `atlas review apply`: at least one sheet entry did not end `APPLIED` |
 
-`8` and `9` are gate *outcomes* rather than errors; the gate writes one
-complete document before exiting with either. In `--json` mode a failing
-command still writes one valid JSON document to stdout, with `"ok": false` and
-an `error` object.
+`8` and `9` are gate *outcomes* rather than errors, and `atlas review apply`'s
+`8` is an outcome in the same sense — the command writes one complete document
+before exiting with it. Both commands share the value `8` for the same reason
+they share nothing else: each is read in the context of the command that
+produced it, not as one global vocabulary, and a caller distinguishes them by
+which command it ran. In `--json` mode a failing command still writes one
+valid JSON document to stdout, with `"ok": false` and an `error` object.
 
 ## Data directory
 

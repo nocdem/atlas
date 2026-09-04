@@ -450,6 +450,23 @@ the content validator refuses C0, C1, DEL, `U+2028`/`U+2029` and the bidi
 override and isolate set at the point of writing; `atlas_safe()` encodes on the
 way out; and `atlas_terminal_write` replaces any byte a terminal would act on.
 
+### A15: the review sheet is a list, not a capability
+
+`atlas review apply FILE` (A15) reads a plain-ASCII **review sheet** and loops
+this same operator channel once per line, with the reviewed revision pinned.
+The sheet itself carries no authority: its grammar has **no field for a
+confirmation** — an entry names an intent, a repository, a decision, a
+revision and a hash prefix, and nothing else, and a line with a sixth field
+refuses the whole sheet rather than being read as an early confirmation. The
+confirmation is still typed on `/dev/tty`, per entry, exactly as above; a
+sheet only says which records to walk and in which order, and an operator
+could type the same five lines by hand at the ordinary `atlas decision
+approve|reject|resolve` prompts with an identical result. The channel this
+season adds nothing to and nothing changes about is the one described in this
+section: `LOCAL_OPERATOR_CONFIRMED` still names a channel, not a person, and
+a same-uid process driving a pseudo-terminal reaches `atlas review apply`
+exactly as it reaches `atlas decision approve`.
+
 ## A9: the remote gateway, and what it is worth
 
 A9 makes Atlas reachable from off the machine. Everything below is stated in

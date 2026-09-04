@@ -1572,8 +1572,8 @@ gate results, the impact set, and, where a claim's aggregate `conflict` is
 deliberately, how far it may go towards disposing of one.
 
 **What is true today, measured rather than assumed** (2026-09-01). The gateway
-serves 26 routes, counted by property rather than by a number kept in a fourth
-place, and **not one of them mutates a decision, an evidence row or a claim**:
+serves 26 routes, and **not one of them mutates a decision, an evidence row or
+a claim**:
 no `decision.approve`, `decision.reject` or `decision.supersede` appears in
 `API_ROUTES[]`, and no row names any operator-only method. The only two writes
 this listener can produce are its own bookkeeping — an appended `gw_audit` row

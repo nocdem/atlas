@@ -3704,11 +3704,15 @@ overnight does not spend sixty-four unconsumed challenges finding that out.
 a name the daemon-side method already read; the alternative — a new route
 whose handler reads the same parameter — would be a second way to reach one
 daemon method; the table would grow without the read surface growing with it.
-Every row still forwards to exactly one method, and the property
-`tests/test_gateway.c` checks (no operator method, no gateway-write method,
-every scope grantable) is unmoved by adding a parameter to an existing row,
-which is the point: the accessor exists so that property is checked
-mechanically rather than re-argued by eye every time a row changes shape.
+Every row still forwards to exactly one method, and forwarding a parameter
+never changes which method a row names — so it never touches
+`tests/test_gateway.c`'s actual guarantee, the positive allowlist
+`READ_METHODS[]` that names every method any row may forward to, and it stays
+unmoved by every negative check kept beside it (no operator method, no
+`gateway.auth`/`gateway.audit`, no backup-, apikey- or orchestration-group
+method, every scope grantable). A row edited to forward to a *different*
+method than before is the case that does touch it, and the checklist entry
+above says so.
 
 **Why A12.1's finding is shown as one label and not as a general "drift"
 indicator.** The only A12.1 output the gateway uid can read at all is

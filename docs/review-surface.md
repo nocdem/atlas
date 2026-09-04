@@ -31,16 +31,32 @@ the plan itself did not claim.
 ## 1. What is true today, measured against the tree
 
 **The route table.** `API_ROUTES[]` (`src/gw/gateway.c`) holds **26 rows**,
-counted by `grep -c`, not carried in this document as a number to keep in
-sync by hand — `tests/test_gateway.c`'s
-`test_every_api_route_is_a_read_the_gateway_uid_may_make` asserts a *property*
-of every row instead: none names an operator-only method, none names
-`gateway.auth` or `gateway.audit`, none names a method
-`docs/remote-access.md` already lists as unreachable from the gateway, and
-every row's scope is grantable to an ordinary credential. A row count is not
-asserted anywhere, on purpose — `tests/test_gateway.c`'s own comment records
-that a hand-kept count in a fourth place had already drifted twice before
-this season, which is the defect commit `a169393` exists to fix.
+counted by `grep -c` for this document rather than pinned as a number the
+table itself is tested against — the table's own test asserts a *property*
+of every row instead: `tests/test_gateway.c`'s
+`test_every_api_route_forwards_to_a_read_on_the_reviewed_allowlist`. Its real
+guarantee is a **positive allowlist**, `READ_METHODS[]`, naming every method
+any row is permitted to forward to today; a row naming anything else fails on
+that line the moment it is added, and the array is filled in by hand, never
+generated from the table, so a name reaches it only on purpose. The test's
+own comment states why: an earlier version checked only *absence* from a few
+known-write groups and a hand-kept name list, and it would have passed a row
+naming `verify.evaluate`, `decision.propose`, `decision.revise` or several
+other genuine writes, because none of those names happened to match anything
+the negative checks were written to catch — "a negative list can only ever
+list what somebody already thought of." A separate set of negative checks
+still runs beside the allowlist — not an operator method, not
+`gateway.auth` or `gateway.audit`, not a member of the backup, apikey or
+orchestration method groups, and a grantable scope — but the test's own
+comment is explicit that these are **the stated reasons a name must never
+appear, not the guarantee itself**: the same comment records that the first
+version's own copy of the backup group's names had already drifted from
+`BACKUP_METHODS[]` — missing `operation.get` and `code.sem_config` — which is
+why those checks now read their groups from the accessor functions
+(`atlas_server_backup_methods` and the others) rather than from a second,
+restatable list. The route count itself is asserted nowhere in the test, on
+purpose: a table that grows or shrinks by a row must not change whether the
+test passes, only the property of each row must.
 
 Outside that table, `atlas_gateway_serve_bytes` matches **six literal
 paths** — `GET /healthz`, `POST /mcp`, `POST /auth/login`, `POST /auth/logout`,
@@ -265,6 +281,22 @@ shapes, and the three edited route rows are pinned in
 verbatim in `include/atlas/review.h` and `src/core/review.c`; this document
 does not repeat them a second time in a form that could drift from either.
 
+**The exit-code contract change.** `atlas review apply` exits `0` when every
+entry ended `APPLIED` (or `READY` under `--check`), and **`8`** — a
+command-specific value above the seven-value exit-code contract, following
+`gate`'s own `8`/`9` — when at least one entry ended otherwise. It exits `2`
+for five distinct causes, verified against `src/core/review.c` and
+`src/core/service_review.c`: a malformed sheet, a sheet with no entries, `--yes`,
+`--json` without `--check`, and no interactive terminal on both standard
+streams. A locked authority profile exits with whatever `atlas decision
+approve` exits with, because `run_review` makes the identical
+`atlas_authority_require` call first, before the sheet is even opened. This is
+recorded in the season's own document as well as at the two places the
+contract itself lives — `README.md`'s exit-code table and `CLAUDE.md`'s
+"Exit codes (stable contract)" — because a reader of this document should not
+have to cross to either one to learn that this season changed the contract at
+all.
+
 **The Review view's fixed sentences**, verbatim, because `tests/test_decision_mcp.c`
 requires their needles and a paraphrase would fail the build:
 
@@ -302,16 +334,28 @@ by the more common case into missing the general rule.
 **A pinned, non-newest revision, approved.** `op_challenge`
 (`src/decision/lifecycle.c:911-919`) refuses a pinned revision only when it
 does not exist at all — nothing there, or anywhere in `op_approve`, compares
-the pinned revision to "the latest one". Approving a revision that exists but
-is not the newest **succeeds**: that revision becomes the document's
-effective, `APPROVED` one, and a newer `PROPOSED` revision sitting beside it
-is left completely untouched — not superseded, not rejected, not silently
-promoted, not even read. Established by running
+the pinned revision to "the latest one"; `spend_challenge`
+(`lifecycle.c:1164-1246`), the function every one of the five lifecycle verbs
+spends its capability through, checks the token, the intent, the repository,
+that it is unconsumed and unexpired, the typed confirmation and a rehash of
+the stored content — and nothing about the document's status or the
+revision's rank. Approving a revision that exists but is not the newest
+**succeeds**: that revision becomes the document's effective, `APPROVED` one,
+and a newer `PROPOSED` revision sitting beside it is left completely
+untouched — not superseded, not rejected, not silently promoted, not even
+read. Established by running
 `test_a_pinned_revision_that_is_not_the_newest`
-(`tests/test_decision_operator.c`), not inferred from the source. Nothing in
-the lifecycle warns about the resulting state, refuses it, or offers a path
-out of it beyond an operator noticing and superseding or resolving the older
-revision by hand.
+(`tests/test_decision_operator.c`), not inferred from the source — for the
+*lifecycle* half of the claim only. That test drives `atlas_decision_apply`
+directly, at the write point, the way `approve_through_the_write_point` does,
+because the interactive form is refused in the locked profile an
+unprivileged test runs in; it never carries `--revision N` through
+`run_decision_confirm` or `atlas_service_decision_confirm`. So **the CLI
+flag's own plumbing — that a value typed after `--revision` actually reaches
+the service call — is read from `src/cli/cli.c:848-858` and `:2069-2071`, not
+measured by anything that runs**. Nothing in the lifecycle warns about the
+resulting state, refuses it, or offers a path out of it beyond an operator
+noticing and superseding or resolving the older revision by hand.
 
 **The queue functions hold no `await` between loading the sheet and saving
 it.** `reviewQueueAdd` and `reviewQueueRemove`

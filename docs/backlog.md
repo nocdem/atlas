@@ -2358,3 +2358,27 @@ Two options, deliberately left open here:
   operator-disposal command rather than as a defect to fix.
 
 This entry does not choose between them.
+
+## The gateway's route count is now hand-kept in three documents, and `docs/review-surface.md` is outside the scan its own Decision 6 describes (2026-09-04)
+
+Found during T9's first fix round, recorded rather than acted on.
+
+**The route count.** `docs/roadmap.md`, `docs/remote-access.md` and
+`docs/review-surface.md` each state "26 routes" as prose, independently of
+`tests/test_gateway.c`'s own guarantee (a positive allowlist of methods,
+`READ_METHODS[]`, with the row count asserted nowhere) — which is exactly the
+shape of drift `docs/engineering-rules.md`'s A15 section and commit `a169393`
+both warn about for an unrelated count (`job_kind_is_drainable`'s "six
+latency-critical kinds"). Nothing enforces that these three proses agree with
+each other or with the table; a future row added or removed updates none of
+them automatically, and a future editor fixing one has no way to find the
+other two short of grepping for the number.
+
+**`docs/review-surface.md` is not in `tests/test_decision_mcp.c`'s `FILES[]`.**
+Decision 6 in that same document says review-surface prose names the channel
+and never a person, alongside the page and the walker, which *are* in
+`FILES[]` and are mechanically scanned. The season's own document asserting
+that discipline is not itself subject to it — a forbidden phrase written into
+`docs/review-surface.md` would pass every test in this suite. Adding it to
+`FILES[]` is a one-line change in a test file this task's own scope does not
+own; recorded here for whichever task next touches `tests/test_decision_mcp.c`.

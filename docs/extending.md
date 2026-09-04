@@ -1413,16 +1413,35 @@ Following T2's shape (`src/gw/gateway.c`'s `API_ROUTES[]`): add the name to
 the row's forwarded-parameter list, and, only if the daemon method already
 treats its absence as optional, to the row's own defaults list beside it.
 That is the whole change — no new route, no new method, nothing else in the
-table's shape moves. What must not regress is the property
-`tests/test_gateway.c`'s `test_every_api_route_is_a_read_the_gateway_uid_may_make`
-checks over every row via `atlas_gateway_api_routes`: the method the row
-forwards to is not a member of `atlas_server_operator_methods()`, is not
-`gateway.auth` or `gateway.audit`, is not on the remote-forbidden list
-`docs/remote-access.md` states, and the row's scope is grantable. Forwarding
-a new parameter never changes which method a row names, so it never touches
-that property directly — but a row edited to forward a parameter to a
-*different* method than before would, and the test exists precisely so that
-change is caught rather than reasoned about by eye.
+table's shape moves.
+
+**What actually guards the table** is
+`tests/test_gateway.c`'s `test_every_api_route_forwards_to_a_read_on_the_reviewed_allowlist`,
+and its guarantee is a *positive* allowlist, not the negative checks beside
+it: `READ_METHODS[]`, inside the test, names every method any row is allowed
+to forward to today, and a row naming anything else fails the test on that
+line the moment it is added. The test's own comment states why a negative
+list was tried first and replaced: an earlier version asserted only absence
+from a few known-write groups plus a hand-kept name list, and it would have
+passed a row naming `verify.evaluate`, `decision.propose`, `decision.revise`
+or several other real writes, because none of those names matched anything
+the negative list happened to check for — "a negative list can only ever
+list what somebody already thought of." The checks that remain — not an
+operator method, not `gateway.auth` or `gateway.audit`, not a backup-,
+apikey- or orchestration-group method, and a grantable scope — are **the
+stated reasons a name must never appear, not the guarantee itself**; they
+document *why*, and `READ_METHODS[]` is what actually decides *whether*.
+
+Forwarding an existing parameter to the row's existing method never touches
+`READ_METHODS[]` at all, since the method named does not change. **Adding a
+new row, or editing one to forward to a different method than before, is a
+different case and needs one more step this checklist would otherwise send
+someone straight past**: the new method must be added to `READ_METHODS[]`
+by hand, deliberately, in the same commit — the array is not generated from
+the table, and a row naming a method missing from it fails loudly rather
+than silently. `route_count`, by contrast, is asserted nowhere: a table that
+grows or shrinks by a row must not change whether this test passes, only the
+property of each row must.
 
 ### Changing a sheet bound
 

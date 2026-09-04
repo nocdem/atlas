@@ -314,7 +314,7 @@ gateway's uid is not in, so the gateway is told the method does not exist.
 ## A15: the review surface, and the three forwarded parameters
 
 A15 adds Mission Control's Review view: a repository and status pick, a list of
-records, a detail pane composing four existing read routes, and a review sheet
+records, a detail pane composing five existing read routes, and a review sheet
 held in the browser's own `localStorage`. See `docs/review-surface.md` for the
 full argument; this section is the remote-access half of it.
 

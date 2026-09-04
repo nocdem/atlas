@@ -811,23 +811,37 @@ not a person, exactly as every other transition on this page does.
 
 ### `--revision N`, and a pinned revision that is not the newest
 
-`decision approve`, `reject` and `resolve` accept `--revision N`, which pins
-the capability to one existing revision rather than the document's current
-one — the same mechanism `atlas review apply` uses on every sheet entry.
-**What the lifecycle does with a pinned revision that exists but is not the
-newest was established by running the code, not by reading it**:
-`op_challenge` (`src/decision/lifecycle.c:911-919`) refuses a pinned revision
-only when it does not exist at all, and nothing in `op_approve` compares the
-pinned revision against "the latest one". Approving an older, pinned revision
+`decision approve`, `reject` and `resolve` accept `--revision N`
+(`src/cli/cli.c:848-858`, parsed into `st->opts.decision.revision` and passed
+to `atlas_service_decision_confirm` at `cli.c:2069-2071`), which pins the
+capability to one existing revision rather than the document's current one —
+the same mechanism `atlas review apply` uses on every sheet entry. **What the
+*lifecycle* does with a pinned revision that exists but is not the newest was
+established by running the code, not by reading it**: `op_challenge`
+(`src/decision/lifecycle.c:911-919`) refuses a pinned revision only when it
+does not exist at all, and nothing in `op_approve` compares the pinned
+revision against "the latest one". Approving an older, pinned revision
 **succeeds**: that revision becomes the document's effective, `APPROVED` one,
 and a newer `PROPOSED` revision sitting beside it is left completely
 untouched — not superseded, not rejected, not silently promoted. Nothing in
 the lifecycle warns about the resulting state or offers a path out of it
 beyond an operator noticing and superseding or resolving the older revision
-by hand. `tests/test_decision_operator.c`'s
-`test_a_pinned_revision_that_is_not_the_newest` is where this was measured;
-`docs/backlog.md` records a related defect it also exposed, in the message
-`op_approve` writes when it supersedes a previously-effective revision.
+by hand. `docs/backlog.md` records a related defect this also exposed, in the
+message `op_approve` writes when it supersedes a previously-effective
+revision.
+
+That result was measured with `tests/test_decision_operator.c`'s
+`test_a_pinned_revision_that_is_not_the_newest`, and only the lifecycle half
+of it: the test drives `atlas_decision_apply` directly, minting and spending
+the challenge at the write point, for the same reason
+`approve_through_the_write_point` does — the interactive form is refused in a
+locked profile, which is the only profile an unprivileged test can run in. It
+never runs `--revision N` through `run_decision_confirm` or
+`atlas_service_decision_confirm`. **So the flag's own plumbing — that
+`--revision`'s parsed value actually reaches the service call unchanged — is
+read from the source above, not measured by any test**; what was measured is
+what the lifecycle does once a pinned, non-newest revision's challenge is
+spent, however it got minted.
 
 ### The gate, and a record that is not `APPROVED`
 

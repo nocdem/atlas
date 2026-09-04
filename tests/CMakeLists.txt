@@ -598,6 +598,9 @@ set_tests_properties(test_migrate7 PROPERTIES LABELS "integration")
 # The claim tripwire reads Atlas' own documentation and source, so it has to be
 # told where the source tree is rather than guessing from the working directory.
 target_compile_definitions(test_decision_mcp PRIVATE ATLAS_SRC_DIR="${CMAKE_SOURCE_DIR}")
+# A15 T6's source-walk tripwire over the operator channel's two write points
+# (atlas_decision_apply_in_tx, atlas_service_decision_confirm) needs the same.
+target_compile_definitions(test_review_apply PRIVATE ATLAS_SRC_DIR="${CMAKE_SOURCE_DIR}")
 # A5 has its own claim tripwire, over the operational documentation and the
 # backup and maintenance source, for the same reason and by the same device.
 target_compile_definitions(test_backup PRIVATE ATLAS_SRC_DIR="${CMAKE_SOURCE_DIR}")

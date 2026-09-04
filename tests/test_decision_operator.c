@@ -175,6 +175,123 @@ static void approve_through_the_write_point(env *e) {
     atlas_buf_free(&db_path);
 }
 
+/* A15 T6 Step 5. What does the lifecycle do when a challenge is minted pinned
+ * to a revision that is not the newest one?
+ *
+ * `src/decision/lifecycle.c`'s `op_challenge` (around :906-919) refuses only a
+ * revision that does not exist -- there is no check anywhere that a pinned
+ * revision must be the *latest* one. This function measures what the tree
+ * actually does rather than reasoning about it from the source: propose a
+ * decision (revision 1, PROPOSED), revise it (revision 2, PROPOSED --
+ * `op_revise`'s own comment: a revise "touches" neither
+ * `current_revision_id` nor the document's status, so revision 1 is left
+ * exactly as it was), then mint and spend a challenge pinned to revision 1
+ * while revision 2 is still PROPOSED and is the latest.
+ *
+ * Driven through the write point directly, exactly like
+ * `approve_through_the_write_point` above and for the identical reason: the
+ * interactive form (`atlas decision approve proj <uid> --revision 1` on a
+ * pty) is refused in a locked profile, and a locked profile is the only one
+ * an unprivileged test can be in.
+ *
+ * **The answer, established empirically by running this test, not inferred
+ * by reading the code**: approving a pinned, non-newest revision SUCCEEDS.
+ * Revision 1 transitions PROPOSED -> APPROVED and becomes the document's
+ * effective/current revision (`status: APPROVED`, at revision 1). Revision 2
+ * -- newer, and still PROPOSED -- is left completely untouched: not
+ * superseded, not rejected, not silently promoted, not even looked at.
+ * Nothing in `op_approve` or `transition()` (`lifecycle.c`) ever compares the
+ * challenge's revision against "the latest one"; the write point acts purely
+ * on the specific `revision_id` a challenge was minted against, which
+ * `op_challenge` is free to bind to any existing revision. The result is a
+ * document whose effective revision (r1) is *older* than an un-reconciled
+ * PROPOSED revision (r2) sitting beside it, indefinitely -- a state nothing
+ * in the lifecycle warns about, refuses, or offers a path out of beyond an
+ * operator noticing and superseding or resolving it by hand. */
+static void test_a_pinned_revision_that_is_not_the_newest(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    env e;
+    env_open(&e);
+
+    /* Revision 2, through the ordinary mutating CLI -- revise carries no
+     * authority gate. */
+    atlas_buf out = ATLAS_BUF_INIT;
+    int code = 0;
+    const char *revise[] = {
+        "decision", "revise", "proj",  atlas_buf_cstr(&e.uid),
+        "--title",  "Use WAL journalling, revisited", "--decision",
+        "Enable WAL on the index database and set a busy timeout.",
+    };
+    run_atlas(&e, revise, 8u, &out, &code);
+    T_EQ_INT(code, 0);
+    atlas_buf_reset(&out);
+
+    atlas_buf db_path = ATLAS_BUF_INIT;
+    T_OK(atlas_datadir_db_path(fx_data_dir(&e.fx), &db_path, &err), &err);
+    atlas_db *db = NULL;
+    T_OK(atlas_db_open(atlas_buf_cstr(&db_path), &db, &err), &err);
+
+    /* A challenge pinned to revision 1 -- not 0 (the effective/newest one) --
+     * while revision 2 is the latest and is PROPOSED. */
+    atlas_decision_op ch;
+    atlas_decision_op_init(&ch, ATLAS_DECISION_OP_CHALLENGE);
+    T_OK(atlas_buf_set_str(&ch.repo_name, "proj", &err), &err);
+    T_OK(atlas_buf_set_str(&ch.uid, atlas_buf_cstr(&e.uid), &err), &err);
+    ch.intent = ATLAS_DECISION_INTENT_APPROVE;
+    ch.expect_revision_no = 1;
+    atlas_decision_result cr;
+    atlas_decision_result_init(&cr);
+    T_OK(atlas_decision_apply(db, &ch, &cr, &err), &err);
+    T_EQ_INT(cr.revision_no, 1);
+
+    atlas_decision_op ap;
+    atlas_decision_op_init(&ap, ATLAS_DECISION_OP_APPROVE);
+    T_OK(atlas_buf_set_str(&ap.repo_name, "proj", &err), &err);
+    T_OK(atlas_buf_set_str(&ap.uid, atlas_buf_cstr(&e.uid), &err), &err);
+    T_OK(atlas_buf_set(&ap.token, cr.token.data, cr.token.len, &err), &err);
+    T_OK(atlas_buf_set_str(&ap.confirmation, cr.confirm, &err), &err);
+    atlas_decision_result ar;
+    atlas_decision_result_init(&ar);
+    atlas_status ast = atlas_decision_apply(db, &ap, &ar, &err);
+    T_CHECK_MSG(ast == ATLAS_OK, "approving a pinned, non-newest revision was refused: %s",
+                atlas_err_msg(&err));
+    T_CHECK_MSG(ar.state == ATLAS_DECISION_APPROVED,
+                "expected APPROVED, got %s", atlas_decision_state_name(ar.state));
+    T_EQ_INT(ar.revision_no, 1);
+
+    atlas_decision_result_free(&ar);
+    atlas_decision_op_free(&ap);
+    atlas_decision_result_free(&cr);
+    atlas_decision_op_free(&ch);
+    atlas_db_close(db);
+    atlas_buf_free(&db_path);
+
+    /* The document's own effective state, read back through the ordinary
+     * read-only CLI: APPROVED, at the *older* revision. */
+    expect_status(&e, "APPROVED");
+
+    atlas_buf show2 = ATLAS_BUF_INIT;
+    const char *show_r2[] = {
+        "decision", "show", "proj", atlas_buf_cstr(&e.uid), "--revision", "2",
+    };
+    run_atlas(&e, show_r2, 6u, &show2, &code);
+    T_EQ_INT(code, 0);
+    /* The document-wide `status:` line is APPROVED (r1 is now effective); the
+     * `revision:` line describes revision 2 itself, and it must still read
+     * PROPOSED -- untouched, not superseded, not silently promoted. */
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&show2), "status:       APPROVED") != NULL,
+                "the document's effective status must be APPROVED (at r1): %s",
+                atlas_buf_cstr(&show2));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&show2), "revision:     2 of 2 (PROPOSED)") != NULL,
+                "revision 2 must remain PROPOSED, untouched by approving the older r1: %s",
+                atlas_buf_cstr(&show2));
+    atlas_buf_free(&show2);
+
+    atlas_buf_free(&out);
+    env_close(&e);
+}
+
 /* --- the interactive path ------------------------------------------------------- */
 
 /* A7 replaced two tests here, and what replaced them is the finding.
@@ -568,6 +685,8 @@ static const atlas_test TESTS[] = {
     {"the repository is never modified", test_the_repository_is_never_modified},
     {"doctor reports a ledger disagreement and repairs nothing",
      test_doctor_reports_a_ledger_disagreement_and_repairs_nothing},
+    {"a pinned revision that is not the newest",
+     test_a_pinned_revision_that_is_not_the_newest},
 };
 
 ATLAS_TEST_MAIN("decision_operator", TESTS)

@@ -227,6 +227,25 @@ capture --json memory status --repo smoke \
     && check_doc "memory status" --expect command="memory status" --expect form=status \
                  --expect-raw ok=true --no-control
 
+echo "== A15 T5: the review command exists in this binary"
+# The identical A9.2 lesson, one more time: `review` must be a usage refusal
+# (exit 2), never "unknown command" from a forgotten COMMANDS[] entry.
+#
+# Only the verb-recognition refusals are safe to run here. `run_review`
+# (src/cli/cli.c) checks `atlas_authority_require` unconditionally, before
+# the "apply" verb's own operand count, before `--yes`, before `--json` and
+# before the walker -- so `review apply` with any operand at all (even under
+# `--check`) exits 3 with the authority refusal on this unprivileged build,
+# not 2 with a usage line. That is exactly the property T6's pseudo-terminal
+# suite exists to test against a real, unlocked authority profile; it is not
+# retested here, and a later reader adding an `apply` case to this file
+# should expect exit 3, not 2, unless this binary is root-owned and the
+# machine's policy grants this uid.
+plan_usage "atlas review prints its own usage (exit 2)" \
+    "usage: atlas review apply FILE" review
+plan_usage "an unrecognised review verb still prints usage (exit 2)" \
+    "usage: atlas review apply FILE" review bogus
+
 echo "== A5: backup, verification, restore and maintenance"
 
 capture --json backup create "$WORK/smoke.db" \

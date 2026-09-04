@@ -199,6 +199,16 @@ typedef enum atlas_decision_kind {
  * compile rather than overflowing an array. */
 #define ATLAS_DECISION_KIND_MAX 8u
 
+/* One bit per kind, so a bounded *set* of kinds — A16's root-owned
+ * `remote_dispose_kinds`, for one — is one integer rather than a list, and
+ * membership is one AND rather than a loop over a closed vocabulary. Every
+ * kind fits: `ATLAS_DECISION_KIND_MAX` is 8, so the highest bit this macro
+ * ever produces is bit 7, well inside `uint32_t`. Defined here rather than in
+ * `decision_ops.h` so a caller that only needs to test kind membership — the
+ * A9 gateway policy loader, which must not pull in `atlas/db.h` to reach a bit
+ * macro — is not forced to include the heavier header. */
+#define ATLAS_DECISION_KIND_BIT(k) ((uint32_t)1u << (unsigned)(k))
+
 const char *atlas_decision_kind_name(atlas_decision_kind k);
 bool atlas_decision_kind_parse(const char *name, atlas_decision_kind *out);
 /* One fixed sentence saying what the kind means, from a string literal in

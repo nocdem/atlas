@@ -2028,6 +2028,7 @@ static void approve_decision_at_write_point(fixture *fx, const char *uid) {
 
     atlas_decision_op ch;
     atlas_decision_op_init(&ch, ATLAS_DECISION_OP_CHALLENGE);
+    ch.channel = ATLAS_DECISION_CHANNEL_LOCAL;
     T_OK(atlas_buf_set_str(&ch.repo_name, "proj", &err), &err);
     T_OK(atlas_buf_set_str(&ch.uid, uid, &err), &err);
     ch.intent = ATLAS_DECISION_INTENT_APPROVE;
@@ -2037,6 +2038,7 @@ static void approve_decision_at_write_point(fixture *fx, const char *uid) {
 
     atlas_decision_op ap;
     atlas_decision_op_init(&ap, ATLAS_DECISION_OP_APPROVE);
+    ap.channel = ATLAS_DECISION_CHANNEL_LOCAL;
     T_OK(atlas_buf_set_str(&ap.repo_name, "proj", &err), &err);
     T_OK(atlas_buf_set_str(&ap.uid, uid, &err), &err);
     T_OK(atlas_buf_set(&ap.token, cr.token.data, cr.token.len, &err), &err);

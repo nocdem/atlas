@@ -149,6 +149,7 @@ static void approve_through_the_write_point(env *e) {
 
     atlas_decision_op ch;
     atlas_decision_op_init(&ch, ATLAS_DECISION_OP_CHALLENGE);
+    ch.channel = ATLAS_DECISION_CHANNEL_LOCAL;
     T_OK(atlas_buf_set_str(&ch.repo_name, "proj", &err), &err);
     T_OK(atlas_buf_set_str(&ch.uid, atlas_buf_cstr(&e->uid), &err), &err);
     ch.intent = ATLAS_DECISION_INTENT_APPROVE;
@@ -158,6 +159,7 @@ static void approve_through_the_write_point(env *e) {
 
     atlas_decision_op ap;
     atlas_decision_op_init(&ap, ATLAS_DECISION_OP_APPROVE);
+    ap.channel = ATLAS_DECISION_CHANNEL_LOCAL;
     T_OK(atlas_buf_set_str(&ap.repo_name, "proj", &err), &err);
     T_OK(atlas_buf_set_str(&ap.uid, atlas_buf_cstr(&e->uid), &err), &err);
     T_OK(atlas_buf_set(&ap.token, cr.token.data, cr.token.len, &err), &err);
@@ -207,7 +209,30 @@ static void approve_through_the_write_point(env *e) {
  * document whose effective revision (r1) is *older* than an un-reconciled
  * PROPOSED revision (r2) sitting beside it, indefinitely -- a state nothing
  * in the lifecycle warns about, refuses, or offers a path out of beyond an
- * operator noticing and superseding or resolving it by hand. */
+ * operator noticing and superseding or resolving it by hand.
+ *
+ * A16 T3, Decision 12. This is also the exact sequence
+ * `docs/backlog.md`'s "op_approve's hard-coded supersession reason is false
+ * for a pinned, older revision approved after a newer one" describes -- found
+ * while establishing the empirical result above, not exercised until now. The
+ * function is extended below (after the read-back checks the original test
+ * already made) to drive both directions through the write point and assert
+ * on the SUPERSEDED event's own detail text rather than trusting a constant:
+ * approving r2 over an already-approved r1 must still read the original
+ * "later revision" sentence, and approving r1 over an already-approved r2 --
+ * the reverse order, on a fresh document -- must read the new "earlier
+ * revision, approved after it" sentence. */
+static atlas_status find_superseded_detail(const atlas_decision_event_row *row, void *ud,
+                                           atlas_err *err) {
+    (void)err;
+    char *out = (char *)ud;
+    if (out[0] != '\0' || strcmp(row->event, "SUPERSEDED") != 0) {
+        return ATLAS_OK;
+    }
+    (void)snprintf(out, 300, "%s", row->detail != NULL ? row->detail : "");
+    return ATLAS_OK;
+}
+
 static void test_a_pinned_revision_that_is_not_the_newest(void) {
     atlas_err err;
     atlas_err_init(&err);
@@ -236,6 +261,7 @@ static void test_a_pinned_revision_that_is_not_the_newest(void) {
      * while revision 2 is the latest and is PROPOSED. */
     atlas_decision_op ch;
     atlas_decision_op_init(&ch, ATLAS_DECISION_OP_CHALLENGE);
+    ch.channel = ATLAS_DECISION_CHANNEL_LOCAL;
     T_OK(atlas_buf_set_str(&ch.repo_name, "proj", &err), &err);
     T_OK(atlas_buf_set_str(&ch.uid, atlas_buf_cstr(&e.uid), &err), &err);
     ch.intent = ATLAS_DECISION_INTENT_APPROVE;
@@ -247,6 +273,7 @@ static void test_a_pinned_revision_that_is_not_the_newest(void) {
 
     atlas_decision_op ap;
     atlas_decision_op_init(&ap, ATLAS_DECISION_OP_APPROVE);
+    ap.channel = ATLAS_DECISION_CHANNEL_LOCAL;
     T_OK(atlas_buf_set_str(&ap.repo_name, "proj", &err), &err);
     T_OK(atlas_buf_set_str(&ap.uid, atlas_buf_cstr(&e.uid), &err), &err);
     T_OK(atlas_buf_set(&ap.token, cr.token.data, cr.token.len, &err), &err);
@@ -287,6 +314,180 @@ static void test_a_pinned_revision_that_is_not_the_newest(void) {
                 "revision 2 must remain PROPOSED, untouched by approving the older r1: %s",
                 atlas_buf_cstr(&show2));
     atlas_buf_free(&show2);
+
+    /* A16 T3, Decision 12 (the ordinary direction). Continuing on the same
+     * document: r1 is APPROVED and r2 is still untouched and PROPOSED, per
+     * the finding just established. Approving r2 now supersedes r1 with the
+     * *later* revision -- the common case, and the sentence Decision 12
+     * leaves unchanged. */
+    {
+        atlas_buf db_path2 = ATLAS_BUF_INIT;
+        T_OK(atlas_datadir_db_path(fx_data_dir(&e.fx), &db_path2, &err), &err);
+        atlas_db *db2 = NULL;
+        T_OK(atlas_db_open(atlas_buf_cstr(&db_path2), &db2, &err), &err);
+
+        atlas_decision_op ch2;
+        atlas_decision_op_init(&ch2, ATLAS_DECISION_OP_CHALLENGE);
+        ch2.channel = ATLAS_DECISION_CHANNEL_LOCAL;
+        T_OK(atlas_buf_set_str(&ch2.repo_name, "proj", &err), &err);
+        T_OK(atlas_buf_set_str(&ch2.uid, atlas_buf_cstr(&e.uid), &err), &err);
+        ch2.intent = ATLAS_DECISION_INTENT_APPROVE;
+        ch2.expect_revision_no = 2;
+        atlas_decision_result cr2;
+        atlas_decision_result_init(&cr2);
+        T_OK(atlas_decision_apply(db2, &ch2, &cr2, &err), &err);
+
+        atlas_decision_op ap2;
+        atlas_decision_op_init(&ap2, ATLAS_DECISION_OP_APPROVE);
+        ap2.channel = ATLAS_DECISION_CHANNEL_LOCAL;
+        T_OK(atlas_buf_set_str(&ap2.repo_name, "proj", &err), &err);
+        T_OK(atlas_buf_set_str(&ap2.uid, atlas_buf_cstr(&e.uid), &err), &err);
+        T_OK(atlas_buf_set(&ap2.token, cr2.token.data, cr2.token.len, &err), &err);
+        T_OK(atlas_buf_set_str(&ap2.confirmation, cr2.confirm, &err), &err);
+        atlas_decision_result ar2;
+        atlas_decision_result_init(&ar2);
+        T_OK(atlas_decision_apply(db2, &ap2, &ar2, &err), &err);
+        T_CHECK(ar2.state == ATLAS_DECISION_APPROVED);
+        T_EQ_INT(ar2.revision_no, 2);
+        T_EQ_INT(ar2.superseded_revision_no, 1);
+
+        char detail2[300];
+        detail2[0] = '\0';
+        int64_t count2 = 0;
+        bool more2 = false;
+        T_OK(atlas_db_decision_events_list(db2, ar2.document_id, 100, find_superseded_detail,
+                                           detail2, &count2, &more2, &err),
+            &err);
+        T_REQUIRE_MSG(detail2[0] != '\0', "no SUPERSEDED event was recorded for r1");
+        T_EQ_STR(detail2,
+                "replaced by a later revision of the same decision, which was approved in the "
+                "same transaction");
+
+        atlas_decision_result_free(&ar2);
+        atlas_decision_op_free(&ap2);
+        atlas_decision_result_free(&cr2);
+        atlas_decision_op_free(&ch2);
+        atlas_db_close(db2);
+        atlas_buf_free(&db_path2);
+    }
+
+    /* A16 T3, Decision 12 (the reverse direction). A fresh document: approve
+     * its newer revision first, then approve its older one -- the exact
+     * sequence the backlog entry describes, which used to record the reverse
+     * of what happened. */
+    {
+        atlas_buf pout = ATLAS_BUF_INIT;
+        int pcode = 0;
+        const char *propose2[] = {
+            "decision",  "propose",
+            "proj",      "--title",
+            "Cache eviction policy", "--decision",
+            "Evict least-recently-used entries first.",
+        };
+        run_atlas(&e, propose2, 7u, &pout, &pcode);
+        T_EQ_INT(pcode, 0);
+        const char *p2 = strstr(atlas_buf_cstr(&pout), ATLAS_DECISION_UID_PREFIX);
+        T_REQUIRE_MSG(p2 != NULL, "propose did not print a decision id: %s",
+                     atlas_buf_cstr(&pout));
+        atlas_buf uid2 = ATLAS_BUF_INIT;
+        T_OK(atlas_buf_set(&uid2, p2,
+                           strlen(ATLAS_DECISION_UID_PREFIX) + ATLAS_DECISION_UID_HEX, &err),
+            &err);
+        atlas_buf_free(&pout);
+
+        atlas_buf rout = ATLAS_BUF_INIT;
+        int rcode = 0;
+        const char *revise2[] = {
+            "decision", "revise", "proj",  atlas_buf_cstr(&uid2),
+            "--title",  "Cache eviction policy, revisited", "--decision",
+            "Evict least-recently-used entries first, with a size floor.",
+        };
+        run_atlas(&e, revise2, 8u, &rout, &rcode);
+        T_EQ_INT(rcode, 0);
+        atlas_buf_free(&rout);
+
+        atlas_buf db_path3 = ATLAS_BUF_INIT;
+        T_OK(atlas_datadir_db_path(fx_data_dir(&e.fx), &db_path3, &err), &err);
+        atlas_db *db3 = NULL;
+        T_OK(atlas_db_open(atlas_buf_cstr(&db_path3), &db3, &err), &err);
+
+        /* Approve revision 2 first. */
+        atlas_decision_op ch3;
+        atlas_decision_op_init(&ch3, ATLAS_DECISION_OP_CHALLENGE);
+        ch3.channel = ATLAS_DECISION_CHANNEL_LOCAL;
+        T_OK(atlas_buf_set_str(&ch3.repo_name, "proj", &err), &err);
+        T_OK(atlas_buf_set_str(&ch3.uid, atlas_buf_cstr(&uid2), &err), &err);
+        ch3.intent = ATLAS_DECISION_INTENT_APPROVE;
+        ch3.expect_revision_no = 2;
+        atlas_decision_result cr3;
+        atlas_decision_result_init(&cr3);
+        T_OK(atlas_decision_apply(db3, &ch3, &cr3, &err), &err);
+
+        atlas_decision_op ap3;
+        atlas_decision_op_init(&ap3, ATLAS_DECISION_OP_APPROVE);
+        ap3.channel = ATLAS_DECISION_CHANNEL_LOCAL;
+        T_OK(atlas_buf_set_str(&ap3.repo_name, "proj", &err), &err);
+        T_OK(atlas_buf_set_str(&ap3.uid, atlas_buf_cstr(&uid2), &err), &err);
+        T_OK(atlas_buf_set(&ap3.token, cr3.token.data, cr3.token.len, &err), &err);
+        T_OK(atlas_buf_set_str(&ap3.confirmation, cr3.confirm, &err), &err);
+        atlas_decision_result ar3;
+        atlas_decision_result_init(&ar3);
+        T_OK(atlas_decision_apply(db3, &ap3, &ar3, &err), &err);
+        T_CHECK(ar3.state == ATLAS_DECISION_APPROVED);
+        T_EQ_INT(ar3.revision_no, 2);
+        atlas_decision_result_free(&ar3);
+        atlas_decision_op_free(&ap3);
+        atlas_decision_result_free(&cr3);
+        atlas_decision_op_free(&ch3);
+
+        /* Now approve revision 1 -- older, pinned, approved after the newer
+         * one. This supersedes revision 2 with revision 1: prev (2) > new
+         * (1), the reverse of the ordinary case above. */
+        atlas_decision_op ch4;
+        atlas_decision_op_init(&ch4, ATLAS_DECISION_OP_CHALLENGE);
+        ch4.channel = ATLAS_DECISION_CHANNEL_LOCAL;
+        T_OK(atlas_buf_set_str(&ch4.repo_name, "proj", &err), &err);
+        T_OK(atlas_buf_set_str(&ch4.uid, atlas_buf_cstr(&uid2), &err), &err);
+        ch4.intent = ATLAS_DECISION_INTENT_APPROVE;
+        ch4.expect_revision_no = 1;
+        atlas_decision_result cr4;
+        atlas_decision_result_init(&cr4);
+        T_OK(atlas_decision_apply(db3, &ch4, &cr4, &err), &err);
+
+        atlas_decision_op ap4;
+        atlas_decision_op_init(&ap4, ATLAS_DECISION_OP_APPROVE);
+        ap4.channel = ATLAS_DECISION_CHANNEL_LOCAL;
+        T_OK(atlas_buf_set_str(&ap4.repo_name, "proj", &err), &err);
+        T_OK(atlas_buf_set_str(&ap4.uid, atlas_buf_cstr(&uid2), &err), &err);
+        T_OK(atlas_buf_set(&ap4.token, cr4.token.data, cr4.token.len, &err), &err);
+        T_OK(atlas_buf_set_str(&ap4.confirmation, cr4.confirm, &err), &err);
+        atlas_decision_result ar4;
+        atlas_decision_result_init(&ar4);
+        T_OK(atlas_decision_apply(db3, &ap4, &ar4, &err), &err);
+        T_CHECK(ar4.state == ATLAS_DECISION_APPROVED);
+        T_EQ_INT(ar4.revision_no, 1);
+        T_EQ_INT(ar4.superseded_revision_no, 2);
+
+        char detail4[300];
+        detail4[0] = '\0';
+        int64_t count4 = 0;
+        bool more4 = false;
+        T_OK(atlas_db_decision_events_list(db3, ar4.document_id, 100, find_superseded_detail,
+                                           detail4, &count4, &more4, &err),
+            &err);
+        T_REQUIRE_MSG(detail4[0] != '\0', "no SUPERSEDED event was recorded for r2");
+        T_EQ_STR(detail4,
+                "replaced by an earlier revision of the same decision, approved after it in the "
+                "same transaction");
+
+        atlas_decision_result_free(&ar4);
+        atlas_decision_op_free(&ap4);
+        atlas_decision_result_free(&cr4);
+        atlas_decision_op_free(&ch4);
+        atlas_db_close(db3);
+        atlas_buf_free(&db_path3);
+        atlas_buf_free(&uid2);
+    }
 
     atlas_buf_free(&out);
     env_close(&e);

@@ -156,6 +156,7 @@ static void challenge_for(env *e, const char *uid, const char *replacement_uid,
                           atlas_buf *token_out, char *confirm_out, atlas_err *err) {
     atlas_decision_op op;
     atlas_decision_op_init(&op, ATLAS_DECISION_OP_CHALLENGE);
+    op.channel = ATLAS_DECISION_CHANNEL_LOCAL;
     op_repo(&op, err);
     T_OK(atlas_buf_set_str(&op.uid, uid, err), err);
     if (replacement_uid != NULL) {
@@ -187,6 +188,7 @@ static atlas_status spend(env *e, atlas_decision_op_kind kind, const char *uid, 
                           const char *confirm, atlas_decision_result *res, atlas_err *err) {
     atlas_decision_op op;
     atlas_decision_op_init(&op, kind);
+    op.channel = ATLAS_DECISION_CHANNEL_LOCAL;
     atlas_err ignore;
     atlas_err_init(&ignore);
     (void)atlas_buf_set_str(&op.repo_name, "proj", &ignore);
@@ -987,6 +989,7 @@ static void test_supersession_cannot_cross_repositories(void) {
      * the prompt rather than after confirming. */
     atlas_decision_op op;
     atlas_decision_op_init(&op, ATLAS_DECISION_OP_CHALLENGE);
+    op.channel = ATLAS_DECISION_CHANNEL_LOCAL;
     op_repo(&op, &err);
     T_OK(atlas_buf_set_str(&op.uid, atlas_buf_cstr(&mine), &err), &err);
     T_OK(atlas_buf_set_str(&op.replacement_uid, atlas_buf_cstr(&theirs), &err), &err);
@@ -1134,6 +1137,7 @@ static void test_approval_is_never_attributed_to_a_session(void) {
     {
         atlas_decision_op op;
         atlas_decision_op_init(&op, ATLAS_DECISION_OP_APPROVE);
+        op.channel = ATLAS_DECISION_CHANNEL_LOCAL;
         op_repo(&op, &err);
         T_OK(atlas_buf_set_str(&op.uid, atlas_buf_cstr(&uid), &err), &err);
         T_OK(atlas_buf_set_str(&op.token, atlas_buf_cstr(&token), &err), &err);

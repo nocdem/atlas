@@ -2801,6 +2801,13 @@ atlas_status atlas_writer_decision(atlas_writer *w, atlas_decision_op *op, int t
         result->document_created = j->decision_result.document_created;
         result->duplicate = j->decision_result.duplicate;
         result->session_unbound = j->decision_result.session_unbound;
+        /* A16. `docs/extending.md`'s "Extending A4 safely" names this block by
+         * name: every new `atlas_decision_result` member crosses it, because a
+         * member that does not is read as zero by every RPC method -- exactly
+         * the A9.1 `knowledge_kind` defect above, one season later. `actor` is
+         * a scalar like `state`; `key_id` is a fixed array like
+         * `content_hash`. */
+        result->actor = j->decision_result.actor;
         /* A pointer to one of the ATLAS_AI_UNBOUND_* string literals, so
          * copying the pointer across the thread boundary copies the value.
          * Nothing else may ever be put in this field. */
@@ -2809,6 +2816,7 @@ atlas_status atlas_writer_decision(atlas_writer *w, atlas_decision_op *op, int t
                sizeof(result->content_hash));
         memcpy(result->confirm, j->decision_result.confirm, sizeof(result->confirm));
         memcpy(result->expires_at, j->decision_result.expires_at, sizeof(result->expires_at));
+        memcpy(result->key_id, j->decision_result.key_id, sizeof(result->key_id));
         struct {
             atlas_buf *to;
             const atlas_buf *from;

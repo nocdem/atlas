@@ -248,6 +248,7 @@ static void pk_revise(pkenv *e, const char *uid, const char *text, int64_t *revi
 static void pk_approve(pkenv *e, const char *uid, int64_t revision_no, atlas_err *err) {
     atlas_decision_op cop;
     atlas_decision_op_init(&cop, ATLAS_DECISION_OP_CHALLENGE);
+    cop.channel = ATLAS_DECISION_CHANNEL_LOCAL;
     pk_op_repo(&cop, err);
     T_OK(atlas_buf_set_str(&cop.uid, uid, err), err);
     cop.expect_revision_no = revision_no;
@@ -258,6 +259,7 @@ static void pk_approve(pkenv *e, const char *uid, int64_t revision_no, atlas_err
 
     atlas_decision_op aop;
     atlas_decision_op_init(&aop, ATLAS_DECISION_OP_APPROVE);
+    aop.channel = ATLAS_DECISION_CHANNEL_LOCAL;
     pk_op_repo(&aop, err);
     T_OK(atlas_buf_set_str(&aop.uid, uid, err), err);
     T_OK(atlas_buf_set(&aop.token, cres.token.data, cres.token.len, err), err);

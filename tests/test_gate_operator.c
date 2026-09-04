@@ -135,6 +135,7 @@ static void env_approve(env *e, const char *path) {
     char confirm[ATLAS_DECISION_CONFIRM_MAX];
     atlas_decision_op ch;
     atlas_decision_op_init(&ch, ATLAS_DECISION_OP_CHALLENGE);
+    ch.channel = ATLAS_DECISION_CHANNEL_LOCAL;
     T_OK(atlas_buf_set_str(&ch.repo_name, "proj", &err), &err);
     T_OK(atlas_buf_set_str(&ch.uid, atlas_buf_cstr(&e->uid), &err), &err);
     ch.intent = ATLAS_DECISION_INTENT_APPROVE;
@@ -148,6 +149,7 @@ static void env_approve(env *e, const char *path) {
 
     atlas_decision_op ap;
     atlas_decision_op_init(&ap, ATLAS_DECISION_OP_APPROVE);
+    ap.channel = ATLAS_DECISION_CHANNEL_LOCAL;
     T_OK(atlas_buf_set_str(&ap.repo_name, "proj", &err), &err);
     T_OK(atlas_buf_set_str(&ap.uid, atlas_buf_cstr(&e->uid), &err), &err);
     T_OK(atlas_buf_set(&ap.token, token.data, token.len, &err), &err);
@@ -261,6 +263,7 @@ static void issue(env *e, cap *out) {
 
     atlas_decision_op op;
     atlas_decision_op_init(&op, ATLAS_DECISION_OP_CHALLENGE);
+    op.channel = ATLAS_DECISION_CHANNEL_LOCAL;
     T_OK(atlas_buf_set_str(&op.repo_name, "proj", &err), &err);
     T_OK(atlas_buf_set_str(&op.uid, atlas_buf_cstr(&e->uid), &err), &err);
     op.intent = ATLAS_DECISION_INTENT_REVALIDATE;
@@ -282,6 +285,7 @@ static void issue(env *e, cap *out) {
 static atlas_status spend(env *e, const cap *c, atlas_err *err) {
     atlas_decision_op op;
     atlas_decision_op_init(&op, ATLAS_DECISION_OP_REVALIDATE);
+    op.channel = ATLAS_DECISION_CHANNEL_LOCAL;
     T_OK(atlas_buf_set_str(&op.repo_name, "proj", err), err);
     T_OK(atlas_buf_set_str(&op.uid, atlas_buf_cstr(&e->uid), err), err);
     T_OK(atlas_buf_set(&op.token, c->token.data, c->token.len, err), err);
@@ -466,6 +470,7 @@ static void test_a_capability_for_another_intent_cannot_revalidate(void) {
      * differently. */
     atlas_decision_op ch;
     atlas_decision_op_init(&ch, ATLAS_DECISION_OP_CHALLENGE);
+    ch.channel = ATLAS_DECISION_CHANNEL_LOCAL;
     T_OK(atlas_buf_set_str(&ch.repo_name, "proj", &err), &err);
     T_OK(atlas_buf_set_str(&ch.uid, atlas_buf_cstr(&e.uid), &err), &err);
     ch.intent = ATLAS_DECISION_INTENT_APPROVE;
@@ -499,6 +504,7 @@ static void test_revalidation_without_a_capability_is_refused(void) {
      * The refusal is at the write point, so no adapter can skip it. */
     atlas_decision_op op;
     atlas_decision_op_init(&op, ATLAS_DECISION_OP_REVALIDATE);
+    op.channel = ATLAS_DECISION_CHANNEL_LOCAL;
     T_OK(atlas_buf_set_str(&op.repo_name, "proj", &err), &err);
     T_OK(atlas_buf_set_str(&op.uid, atlas_buf_cstr(&e.uid), &err), &err);
     atlas_decision_result res;
@@ -543,6 +549,7 @@ static void test_only_an_approved_revision_can_be_revalidated(void) {
 
     atlas_decision_op ch;
     atlas_decision_op_init(&ch, ATLAS_DECISION_OP_CHALLENGE);
+    ch.channel = ATLAS_DECISION_CHANNEL_LOCAL;
     T_OK(atlas_buf_set_str(&ch.repo_name, "proj", &err), &err);
     T_OK(atlas_buf_set_str(&ch.uid, atlas_buf_cstr(&other), &err), &err);
     ch.intent = ATLAS_DECISION_INTENT_REVALIDATE;
@@ -569,6 +576,7 @@ static void test_a_capability_must_name_the_assessment_it_covers(void) {
      * question. */
     atlas_decision_op ch;
     atlas_decision_op_init(&ch, ATLAS_DECISION_OP_CHALLENGE);
+    ch.channel = ATLAS_DECISION_CHANNEL_LOCAL;
     T_OK(atlas_buf_set_str(&ch.repo_name, "proj", &err), &err);
     T_OK(atlas_buf_set_str(&ch.uid, atlas_buf_cstr(&e.uid), &err), &err);
     ch.intent = ATLAS_DECISION_INTENT_REVALIDATE;
@@ -582,6 +590,7 @@ static void test_a_capability_must_name_the_assessment_it_covers(void) {
      * stored: a caller is not the authority on what an A6 verdict is. */
     atlas_decision_op ch2;
     atlas_decision_op_init(&ch2, ATLAS_DECISION_OP_CHALLENGE);
+    ch2.channel = ATLAS_DECISION_CHANNEL_LOCAL;
     T_OK(atlas_buf_set_str(&ch2.repo_name, "proj", &err), &err);
     T_OK(atlas_buf_set_str(&ch2.uid, atlas_buf_cstr(&e.uid), &err), &err);
     ch2.intent = ATLAS_DECISION_INTENT_REVALIDATE;
@@ -595,6 +604,7 @@ static void test_a_capability_must_name_the_assessment_it_covers(void) {
     /* As is a reason code from outside it. */
     atlas_decision_op ch3;
     atlas_decision_op_init(&ch3, ATLAS_DECISION_OP_CHALLENGE);
+    ch3.channel = ATLAS_DECISION_CHANNEL_LOCAL;
     T_OK(atlas_buf_set_str(&ch3.repo_name, "proj", &err), &err);
     T_OK(atlas_buf_set_str(&ch3.uid, atlas_buf_cstr(&e.uid), &err), &err);
     ch3.intent = ATLAS_DECISION_INTENT_REVALIDATE;

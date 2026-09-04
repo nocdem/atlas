@@ -151,6 +151,8 @@ set(ATLAS_TESTS
   test_decision_operator
   test_decision_mcp
   test_decision_bridge
+  # --- A16: the remote operator channel ---
+  test_decision_remote
   # --- A5 ---
   test_backup
   test_maintenance
@@ -446,6 +448,11 @@ set_tests_properties(test_verify_product PROPERTIES LABELS "daemon" TIMEOUT 900)
 # The operator suite builds a real repository and drives the binary through a
 # pseudo-terminal, so it is an integration test rather than a unit one.
 set_tests_properties(test_decision_operator PROPERTIES LABELS "integration")
+# A16. Builds a real repository, mints real API keys through the CLI, and
+# drives atlas_decision_apply directly at the write point -- a real repository
+# and database, so "integration" rather than "unit", on
+# test_decision_operator's own precedent immediately above.
+set_tests_properties(test_decision_remote PROPERTIES LABELS "integration")
 # A15 T4. The walker's `--check` half builds a real repository and a real
 # database through the binary (repo add, scan, propose, revise), then calls
 # atlas_service_review_apply directly in process -- no pseudo-terminal, but

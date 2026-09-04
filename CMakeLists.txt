@@ -238,6 +238,7 @@ add_library(atlas_core STATIC
   src/db/db_decision.c
   src/decision/decision.c
   src/decision/lifecycle.c
+  src/decision/remote.c
   src/core/terminal.c
   src/core/service_decision.c
   src/ipc/server_decision.c

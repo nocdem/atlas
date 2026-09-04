@@ -475,6 +475,7 @@ static void challenge_for(env *e, const char *uid, atlas_decision_intent intent,
                           atlas_buf *token_out, char *confirm_out, atlas_err *err) {
     atlas_decision_op op;
     atlas_decision_op_init(&op, ATLAS_DECISION_OP_CHALLENGE);
+    op.channel = ATLAS_DECISION_CHANNEL_LOCAL;
     T_OK(atlas_buf_set_str(&op.repo_name, "proj", err), err);
     T_OK(atlas_buf_set_str(&op.uid, uid, err), err);
     op.intent = intent;
@@ -492,6 +493,7 @@ static atlas_status try_challenge(env *e, const char *uid, atlas_decision_intent
                                  atlas_err *err) {
     atlas_decision_op op;
     atlas_decision_op_init(&op, ATLAS_DECISION_OP_CHALLENGE);
+    op.channel = ATLAS_DECISION_CHANNEL_LOCAL;
     atlas_err ignore;
     atlas_err_init(&ignore);
     (void)atlas_buf_set_str(&op.repo_name, "proj", &ignore);
@@ -509,6 +511,7 @@ static atlas_status spend(env *e, atlas_decision_op_kind kind, const char *uid, 
                           const char *confirm, atlas_decision_result *res, atlas_err *err) {
     atlas_decision_op op;
     atlas_decision_op_init(&op, kind);
+    op.channel = ATLAS_DECISION_CHANNEL_LOCAL;
     atlas_err ignore;
     atlas_err_init(&ignore);
     (void)atlas_buf_set_str(&op.repo_name, "proj", &ignore);
@@ -1114,6 +1117,7 @@ static void test_a_schema_twelve_database_migrates_without_losing_a_row(void) {
 
         atlas_decision_op op;
         atlas_decision_op_init(&op, ATLAS_DECISION_OP_CHALLENGE);
+        op.channel = ATLAS_DECISION_CHANNEL_LOCAL;
         T_OK(atlas_buf_set_str(&op.repo_name, "proj", &err), &err);
         T_OK(atlas_buf_set_str(&op.uid, atlas_buf_cstr(&superseded_uid), &err), &err);
         T_OK(atlas_buf_set_str(&op.replacement_uid, atlas_buf_cstr(&replacement_uid), &err), &err);

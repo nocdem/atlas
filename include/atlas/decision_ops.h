@@ -178,6 +178,35 @@ typedef struct atlas_decision_op {
     atlas_buf token;
     atlas_buf confirmation;
 
+    /* A16. Which path this op travelled: LOCAL or REMOTE, never UNKNOWN for a
+     * real request. Set by every producer -- `src/core/service_decision.c`'s
+     * and `src/ipc/server_decision.c`'s `op_new` both set LOCAL, and
+     * `src/ipc/server_remote.c` sets REMOTE -- and refused at the write point
+     * when it is UNKNOWN, for any op that mints or spends a capability
+     * (`atlas_decision_op_needs_challenge(op->kind)` or `kind == CHALLENGE`).
+     * `atlas_decision_op_init` leaves it at the vocabulary's zero rather than
+     * defaulting it to LOCAL: a default that silently became the *stronger*
+     * channel would be exactly the forged capability guard #1 exists to
+     * prevent, only moved one field earlier. */
+    atlas_decision_channel channel;
+    /* REMOTE only: the bearer credential presented over the gateway, verified
+     * inside the write transaction by `atlas_decision_remote_verify` and never
+     * trusted on its own. Wiped, not merely freed, in `atlas_decision_op_free`
+     * -- a credential in a struct is a credential in memory. */
+    atlas_buf remote_token;
+    /* REMOTE only: the credential id the root-owned disposal policy names, so
+     * the write point can check the presented token authenticates as *that*
+     * key rather than as any active key. */
+    char remote_expected_key_id[ATLAS_APIKEY_SELECTOR_HEX + 1u];
+    /* REMOTE only: the record kinds the disposal policy permits, as an
+     * `ATLAS_DECISION_KIND_BIT` mask. Carried on the op rather than read from
+     * a policy at the write point, because the write point takes no path and
+     * opens no policy file -- it is handed exactly what the RPC layer already
+     * resolved, and checks it against the document's own kind twice: once at
+     * mint (`op_challenge`) and once at spend (`spend_challenge`), for the
+     * same reason the repository identity is checked at both places. */
+    uint32_t remote_kinds;
+
     /* CHALLENGE: which revision the caller believes it is acting on. 0 means
      * the newest. Binding to it is what makes "the document changed while you
      * were reading it" a refusal rather than a surprise. */
@@ -276,6 +305,24 @@ typedef struct atlas_decision_result {
     int64_t superseded_revision_no;
     /* SUPERSEDE only. */
     atlas_buf replaced_by_uid;
+
+    /* A16. Which actor the write point actually recorded for the transition
+     * this operation performed -- read back rather than assumed, because
+     * `spend_method` (`src/ipc/server_decision.c`) reports it verbatim as
+     * `atlas_decision_actor_name(result.actor)` instead of a literal string,
+     * and a literal and a derived value drift the moment a second channel
+     * exists. Set by `op_approve`, `op_reject`, `op_resolve`, `op_supersede`
+     * and `op_revalidate` -- the five operations `spend_method` reports an
+     * actor for -- to whichever of `LOCAL_OPERATOR_CONFIRMED` or
+     * `REMOTE_OPERATOR_CONFIRMED` the spent challenge's own channel names.
+     * Zero (`MODEL_PROPOSAL`) on every other operation, where nothing reads
+     * it. */
+    atlas_decision_actor actor;
+    /* REMOTE only: the verified credential id the transition was attributed
+     * to, copied from the spent challenge's own `key_id` rather than from
+     * anything the request supplied directly -- the same "read back what was
+     * actually stored" rule `actor` follows. Empty for LOCAL. */
+    char key_id[ATLAS_APIKEY_SELECTOR_HEX + 1u];
 
     bool document_created;
     bool duplicate; /* a dedup key or an identical content hash absorbed it */

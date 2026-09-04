@@ -1067,6 +1067,7 @@ static void test_an_already_approved_record_on_an_approve_line_is_disposed(void)
     T_OK(atlas_db_open(atlas_buf_cstr(&db_path), &db, &err), &err);
     atlas_decision_op ch;
     atlas_decision_op_init(&ch, ATLAS_DECISION_OP_CHALLENGE);
+    ch.channel = ATLAS_DECISION_CHANNEL_LOCAL;
     T_OK(atlas_buf_set_str(&ch.repo_name, "proj", &err), &err);
     T_OK(atlas_buf_set_str(&ch.uid, atlas_buf_cstr(&uid), &err), &err);
     ch.intent = ATLAS_DECISION_INTENT_APPROVE;
@@ -1075,6 +1076,7 @@ static void test_an_already_approved_record_on_an_approve_line_is_disposed(void)
     T_OK(atlas_decision_apply(db, &ch, &cr, &err), &err);
     atlas_decision_op ap;
     atlas_decision_op_init(&ap, ATLAS_DECISION_OP_APPROVE);
+    ap.channel = ATLAS_DECISION_CHANNEL_LOCAL;
     T_OK(atlas_buf_set_str(&ap.repo_name, "proj", &err), &err);
     T_OK(atlas_buf_set_str(&ap.uid, atlas_buf_cstr(&uid), &err), &err);
     T_OK(atlas_buf_set(&ap.token, cr.token.data, cr.token.len, &err), &err);

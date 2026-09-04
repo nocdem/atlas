@@ -33,6 +33,7 @@
 #include "atlas/pathrep.h"
 #include "atlas/safetext.h"
 #include "atlas/terminal.h"
+#include "core/service_decision_internal.h"
 #include "core/service_internal.h"
 
 /* --- structures --------------------------------------------------------------- */
@@ -815,7 +816,8 @@ static atlas_status build_op(atlas_ctx *ctx, const char *repo, const char *sourc
      * ever built, while `--commit` and `--alternative` survived because neither
      * touches the database.
      *
-     * The snapshot is not lost by skipping it. `op_to_params` sends the link
+     * The snapshot is not lost by skipping it. The op-to-params serialiser
+     * below sends the link
      * intents — path text, commit hex, symbol name — and the daemon re-takes
      * every snapshot from its own index in `take_path_links` /
      * `take_symbol_links`, which is the behaviour those functions already
@@ -1012,8 +1014,25 @@ static atlas_status put_buf(atlas_json *j, const char *key, const atlas_buf *b, 
 
 /* Serialises the typed operation into request parameters, through the typed
  * writer. There is still no "write these bytes as JSON" primitive anywhere in
- * Atlas, and this is not the place to introduce one. */
-static atlas_status op_to_params(const atlas_decision_op *op, atlas_buf *out, atlas_err *err) {
+ * Atlas, and this is not the place to introduce one.
+ *
+ * External linkage, on `src/db/db_internal.h`'s precedent: declared in
+ * `service_decision_internal.h`, not a public header, purely so
+ * `tests/test_decision_remote.c` can drive the REMOTE refusal below directly
+ * rather than only through a caller that can never produce one. */
+atlas_status atlas_service_decision_op_to_params(const atlas_decision_op *op, atlas_buf *out,
+                                                 atlas_err *err) {
+    /* A16. A REMOTE op never travels over this socket: it is built and spent
+     * entirely inside the daemon by `src/ipc/server_remote.c`, which never
+     * calls into this file. Reaching this function with `channel == REMOTE`
+     * would mean the CLI itself somehow built one -- a caller bug, refused
+     * here rather than serialised into a request the daemon-side operator
+     * group was never meant to answer. */
+    if (op->channel == ATLAS_DECISION_CHANNEL_REMOTE) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                             "a remote disposal operation cannot be sent over this interface; it is "
+                             "handled entirely inside the daemon");
+    }
     atlas_ipc_params *p = NULL;
     atlas_json *j = NULL;
     atlas_status st = atlas_ipc_params_begin(&p, &j, err);
@@ -1284,7 +1303,7 @@ static atlas_status apply_op(atlas_ctx *ctx, atlas_decision_op *op, atlas_decisi
                            "it exists only inside the verification engine's own transaction");
     }
     if (st == ATLAS_OK) {
-        st = op_to_params(op, &params, err);
+        st = atlas_service_decision_op_to_params(op, &params, err);
     }
     if (st == ATLAS_OK) {
         st = atlas_ipc_call(atlas_buf_cstr(&sock), method_for(op->kind), atlas_buf_cstr(&params),
@@ -1316,6 +1335,13 @@ static atlas_decision_op *op_new(atlas_decision_op_kind kind) {
     atlas_decision_op *op = calloc(1u, sizeof(*op));
     if (op != NULL) {
         atlas_decision_op_init(op, kind);
+        /* A16. Every operation this file builds originates from the CLI or
+         * from another local-process caller -- a terminal on the Atlas
+         * machine, by construction, since this is the service layer's own
+         * in-process/CLI-facing constructor and the browser's disposal
+         * channel is a separate producer (`src/ipc/server_remote.c`) that
+         * never reaches this function. */
+        op->channel = ATLAS_DECISION_CHANNEL_LOCAL;
     }
     return op;
 }

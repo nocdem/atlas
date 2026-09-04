@@ -94,6 +94,7 @@ static void build_schema6(const char *path, atlas_err *err) {
 
         atlas_decision_op ch;
         atlas_decision_op_init(&ch, ATLAS_DECISION_OP_CHALLENGE);
+        ch.channel = ATLAS_DECISION_CHANNEL_LOCAL;
         T_OK(atlas_buf_set_str(&ch.repo_name, "proj", err), err);
         T_OK(atlas_buf_set_str(&ch.uid, atlas_buf_cstr(&uid), err), err);
         ch.intent = ATLAS_DECISION_INTENT_APPROVE;
@@ -109,6 +110,7 @@ static void build_schema6(const char *path, atlas_err *err) {
 
         atlas_decision_op ap;
         atlas_decision_op_init(&ap, ATLAS_DECISION_OP_APPROVE);
+        ap.channel = ATLAS_DECISION_CHANNEL_LOCAL;
         T_OK(atlas_buf_set_str(&ap.repo_name, "proj", err), err);
         T_OK(atlas_buf_set_str(&ap.uid, atlas_buf_cstr(&uid), err), err);
         T_OK(atlas_buf_set(&ap.token, token.data, token.len, err), err);

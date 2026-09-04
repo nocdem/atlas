@@ -538,6 +538,16 @@ static atlas_decision_op *op_new(atlas_decision_op_kind kind) {
     atlas_decision_op *op = calloc(1u, sizeof(*op));
     if (op != NULL) {
         atlas_decision_op_init(op, kind);
+        /* A16. Every op this constructor builds is either an ordinary
+         * operation the channel is meaningless for (propose, revise, promote,
+         * an edge note) or one of the five the operator-only group below
+         * builds (challenge and the four spends) -- reached only by a peer
+         * matching the root-owned policy's `operator_uid` over
+         * `SO_PEERCRED`, which is a terminal on the Atlas machine. The
+         * browser's disposal channel is `src/ipc/server_remote.c`, a
+         * different method group entirely, so nothing built here is ever
+         * REMOTE. */
+        op->channel = ATLAS_DECISION_CHANNEL_LOCAL;
     }
     return op;
 }
@@ -2594,7 +2604,13 @@ static atlas_status spend_method(dispatch_state *ds, const atlas_ipc_request *re
         st = atlas_json_key_str(ds->j, "replaced_by", atlas_buf_cstr(&result.replaced_by_uid), err);
     }
     if (st == ATLAS_OK) {
-        st = atlas_json_key_str(ds->j, "actor", "LOCAL_OPERATOR_CONFIRMED", err);
+        /* A16. Reported from what the write point actually recorded rather
+         * than as a literal: this group is LOCAL-only (`op_new` above sets
+         * it), so `result.actor` is always LOCAL_OPERATOR_CONFIRMED here in
+         * practice -- but a literal and a derived value are two spellings of
+         * one fact, and the point of this season is that they do not drift
+         * once a second channel exists. */
+        st = atlas_json_key_str(ds->j, "actor", atlas_decision_actor_name(result.actor), err);
     }
     if (st == ATLAS_OK) {
         /* Said in the response, not only in the documentation. A client that

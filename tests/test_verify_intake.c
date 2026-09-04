@@ -215,6 +215,7 @@ static void propose_decision(env *e, const char *title, atlas_buf *uid_out, atla
 static void approve_decision(env *e, const char *uid, atlas_err *err) {
     atlas_decision_op cop;
     atlas_decision_op_init(&cop, ATLAS_DECISION_OP_CHALLENGE);
+    cop.channel = ATLAS_DECISION_CHANNEL_LOCAL;
     T_OK(atlas_buf_set_str(&cop.repo_name, "proj", err), err);
     T_OK(atlas_buf_set_str(&cop.uid, uid, err), err);
     cop.intent = ATLAS_DECISION_INTENT_APPROVE;
@@ -230,6 +231,7 @@ static void approve_decision(env *e, const char *uid, atlas_err *err) {
 
     atlas_decision_op aop;
     atlas_decision_op_init(&aop, ATLAS_DECISION_OP_APPROVE);
+    aop.channel = ATLAS_DECISION_CHANNEL_LOCAL;
     T_OK(atlas_buf_set_str(&aop.repo_name, "proj", err), err);
     T_OK(atlas_buf_set_str(&aop.uid, uid, err), err);
     T_OK(atlas_buf_set(&aop.token, token.data, token.len, err), err);

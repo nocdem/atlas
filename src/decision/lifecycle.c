@@ -60,6 +60,7 @@
 
 #include "atlas/ai.h"
 #include "atlas/atlas.h"
+#include "atlas/decision_remote.h"
 #include "atlas/safetext.h"
 #include "gate/gate_internal.h"
 
@@ -108,6 +109,7 @@ void atlas_decision_op_init(atlas_decision_op *op, atlas_decision_op_kind kind) 
     atlas_buf_init(&op->dedup_key);
     atlas_buf_init(&op->token);
     atlas_buf_init(&op->confirmation);
+    atlas_buf_init(&op->remote_token);
     atlas_buf_init(&op->prior_freshness);
     atlas_buf_init(&op->prior_reasons);
     atlas_buf_init(&op->edge_target_uid);
@@ -131,6 +133,17 @@ void atlas_decision_op_free(atlas_decision_op *op) {
     atlas_buf_free(&op->dedup_key);
     atlas_buf_free(&op->token);
     atlas_buf_free(&op->confirmation);
+    /* A16. A credential in a struct is wiped, not merely freed --
+     * `gateway.c`'s wipe of the login key is the precedent. `op->remote_token`
+     * held a presented bearer token, and `atlas_buf_free` alone would only
+     * return the allocation to the heap with the secret still in it. */
+    if (op->remote_token.data != NULL) {
+        volatile unsigned char *z = (volatile unsigned char *)op->remote_token.data;
+        for (size_t i = 0; i < op->remote_token.cap; i++) {
+            z[i] = 0;
+        }
+    }
+    atlas_buf_free(&op->remote_token);
     atlas_buf_free(&op->prior_freshness);
     atlas_buf_free(&op->prior_reasons);
     atlas_buf_free(&op->edge_target_uid);
@@ -230,6 +243,11 @@ typedef struct apply_ctx {
      * rather than per revision. Empty when the lineage is not yet known. */
     atlas_buf repo_identity;
     int64_t session_id;
+    /* A16. Set only when `op->channel == ATLAS_DECISION_CHANNEL_REMOTE`, by
+     * `atlas_decision_remote_verify` at the top of `atlas_decision_apply_in_tx`
+     * -- the *verified* credential id, never the id a request merely named.
+     * Empty on every LOCAL operation. */
+    char key_id[ATLAS_APIKEY_SELECTOR_HEX + 1u];
 } apply_ctx;
 
 static atlas_status resolve_repo(apply_ctx *ac, const atlas_decision_op *op, atlas_err *err) {
@@ -908,6 +926,16 @@ static atlas_status op_challenge(apply_ctx *ac, const atlas_decision_op *op,
                              "that decision belongs to a different repository");
     }
 
+    /* A16. A remote challenge always names the revision it read, and 0 --
+     * "whichever is newest" -- is not a name: the browser showed the operator
+     * one specific revision, and the capability must bind to that one, not to
+     * whatever happens to be newest by the time it is spent. */
+    if (op->channel == ATLAS_DECISION_CHANNEL_REMOTE && op->expect_revision_no <= 0) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "a remote challenge names the revision it is for; 0 is not a "
+                             "revision");
+    }
+
     int64_t rev_id = 0, rev_no = 0;
     char hash[ATLAS_SHA256_HEX_LEN + 1u];
     char state[16];
@@ -954,19 +982,65 @@ static atlas_status op_challenge(apply_ctx *ac, const atlas_decision_op *op,
         return atlas_err_set(err, ATLAS_ERR_INTEGRITY, "this decision has no revisions");
     }
 
+    /* A16. The previous season measured, by running it, that approving a
+     * challenge pinned to a non-newest revision succeeds and strands the
+     * newer proposed revision indefinitely with nothing warning about it. The
+     * local channel still permits that -- an operator who typed
+     * `--revision N` asked for it -- but a remote challenge is minted only for
+     * whichever revision is newest at mint time. */
+    if (op->channel == ATLAS_DECISION_CHANNEL_REMOTE) {
+        int64_t latest_id = 0, latest_no = 0;
+        char latest_hash[ATLAS_SHA256_HEX_LEN + 1u];
+        char latest_state[16];
+        st = atlas_db_decision_latest_revision(ac->db, document_id, &latest_id, &latest_no,
+                                               latest_hash, sizeof(latest_hash), latest_state,
+                                               sizeof(latest_state), err);
+        if (st != ATLAS_OK) {
+            return st;
+        }
+        if (rev_no != latest_no) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "a remote challenge is minted only for the newest revision; r%lld "
+                                 "was reviewed but r%lld is newest -- read it again",
+                                 (long long)rev_no, (long long)latest_no);
+        }
+    }
+
     atlas_decision_challenge c;
     atlas_decision_challenge_init(&c);
     st = atlas_decision_challenge_token(c.token, sizeof(c.token), err);
     if (st != ATLAS_OK) {
         return st;
     }
-    /* A16, migration 31. This function builds the only
-     * `ATLAS_DECISION_OP_CHALLENGE` this codebase constructs, inside
-     * `atlas_service_decision_confirm`, whose two callers are the CLI and the
-     * local review-apply surface -- both the terminal on the Atlas machine.
-     * The remote disposal channel mints its own capability elsewhere; nothing
-     * here does yet, so this path is unconditionally LOCAL. */
-    c.channel = ATLAS_DECISION_CHANNEL_LOCAL;
+    /* A16, migration 31. `op_challenge` *consumes* an `ATLAS_DECISION_OP_CHALLENGE`
+     * dispatched at the switch in `atlas_decision_apply_in_tx`; it does not
+     * construct one, and the codebase has exactly two places that do --
+     * closed, because the season's whole channel argument rests on that set
+     * staying so:
+     *
+     *   - `src/core/service_decision.c`'s `op_new`, inside
+     *     `atlas_service_decision_confirm`'s `build_op` path (called from the
+     *     CLI and from the local review-apply surface). It reaches
+     *     `atlas_decision_apply` directly only when *this process* is the
+     *     writer -- no daemon is running, so there is nobody else to ask.
+     *   - `src/ipc/server_decision.c`'s `method_challenge`, which builds its
+     *     own op from the request it received. This is the producer that
+     *     actually runs whenever a daemon owns the index: `apply_op` in
+     *     `service_decision.c` routes to it over the socket
+     *     (`decision.challenge`) instead of calling `atlas_decision_apply`
+     *     in-process, and a registered repository's daemon running is the
+     *     ordinary case on an operator's machine.
+     *
+     * Both are local-terminal producers and both set `op->channel =
+     * ATLAS_DECISION_CHANNEL_LOCAL`. `src/ipc/server_remote.c` is the third
+     * producer, and the only one that sets REMOTE. So `channel` is read from
+     * `op->channel` here -- already checked non-UNKNOWN by
+     * `atlas_decision_apply_in_tx` -- rather than assumed; assuming it is
+     * exactly the shape of bug guard #1 exists to close, one field earlier. */
+    c.channel = op->channel;
+    if (c.channel == ATLAS_DECISION_CHANNEL_REMOTE) {
+        (void)snprintf(c.key_id, sizeof(c.key_id), "%s", ac->key_id);
+    }
     c.repo_id = ac->repo.id;
     c.document_id = document_id;
     c.revision_id = rev_id;
@@ -1001,6 +1075,17 @@ static atlas_status op_challenge(apply_ctx *ac, const atlas_decision_op *op,
     } else if (c.intent == ATLAS_DECISION_INTENT_SUPERSEDE) {
         return atlas_err_set(err, ATLAS_ERR_USAGE,
                              "a supersession needs the decision that replaces this one");
+    }
+    /* A16. Checked before either intent-specific block below runs, so a
+     * REMOTE request for one of these never does the revalidate-specific
+     * repository-state work (and cannot receive one of *those* refusals
+     * instead of this one) on its way to being refused anyway. */
+    if (c.channel == ATLAS_DECISION_CHANNEL_REMOTE &&
+        (c.intent == ATLAS_DECISION_INTENT_SUPERSEDE ||
+         c.intent == ATLAS_DECISION_INTENT_REVALIDATE)) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "supersede and revalidate are not offered from the browser; use a "
+                             "terminal on the Atlas machine");
     }
     (void)snprintf(c.created_at, sizeof(c.created_at), "%s", ac->now);
     {
@@ -1099,6 +1184,17 @@ static atlas_status op_challenge(apply_ctx *ac, const atlas_decision_op *op,
             return st;
         }
         out->knowledge_kind = kind;
+        /* A16. The operator's policy names which kinds may be disposed of
+         * from the browser; this is the mint-time half of that check, and
+         * `spend_challenge` repeats it at spend time -- the same reason the
+         * repository identity is checked twice. */
+        if (c.channel == ATLAS_DECISION_CHANNEL_REMOTE &&
+            (op->remote_kinds & ATLAS_DECISION_KIND_BIT(kind)) == 0) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "a record of kind %s is not one the remote disposal policy "
+                                 "names; dispose of it on a terminal",
+                                 atlas_decision_kind_name(kind));
+        }
         if (c.intent == ATLAS_DECISION_INTENT_RESOLVE) {
             if (strcmp(state, "APPROVED") != 0) {
                 return atlas_err_set(err, ATLAS_ERR_USAGE,
@@ -1140,6 +1236,12 @@ static atlas_status op_challenge(apply_ctx *ac, const atlas_decision_op *op,
     (void)snprintf(out->expires_at, sizeof(out->expires_at), "%s", c.expires_at);
     atlas_decision_confirm_phrase(hash, out->confirm, sizeof(out->confirm));
     (void)atlas_decision_state_parse(state, &out->state);
+    /* A16. The verified credential this challenge was minted for, so the
+     * browser's mint response can show it -- not an actor, because minting
+     * transitions nothing yet. */
+    if (c.channel == ATLAS_DECISION_CHANNEL_REMOTE) {
+        (void)snprintf(out->key_id, sizeof(out->key_id), "%s", c.key_id);
+    }
     st = atlas_buf_set_str(&out->token, c.token, err);
     if (st == ATLAS_OK) {
         st = atlas_db_decision_uid_of(ac->db, document_id, &out->uid, err);
@@ -1198,6 +1300,67 @@ static atlas_status spend_challenge(apply_ctx *ac, const atlas_decision_op *op,
     if (out_c->repo_id != ac->repo.id) {
         return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
                              "that approval challenge was issued for a different repository");
+    }
+    /* A16. A capability minted for one channel cannot be spent through the
+     * other -- `decision_challenges.channel` exists for exactly this check.
+     * `op->channel` was already checked non-UNKNOWN by
+     * `atlas_decision_apply_in_tx`, so only the two real values need
+     * distinguishing here. */
+    if (out_c->channel != op->channel) {
+        if (out_c->channel == ATLAS_DECISION_CHANNEL_REMOTE) {
+            return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                                 "that approval challenge was minted through the remote channel "
+                                 "and cannot be spent locally");
+        }
+        return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                             "that approval challenge was minted through the local channel and "
+                             "cannot be spent from the browser");
+    }
+    if (op->channel == ATLAS_DECISION_CHANNEL_REMOTE) {
+        /* The credential that spends a REMOTE challenge must be the one that
+         * minted it -- `ac->key_id` is what `atlas_decision_remote_verify`
+         * just proved the presented token authenticates as, and it is
+         * compared against the value stored on the row, never against
+         * anything else the request supplied. */
+        if (strcmp(ac->key_id, out_c->key_id) != 0) {
+            return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                                 "that approval challenge was minted for a different credential");
+        }
+        /* The newest-revision guard, repeated at spend time: minting already
+         * required this revision to be newest, and it must still be by the
+         * time the challenge is spent, or an operator who reviewed r1 could
+         * end up approving r1 after r2 was proposed without ever seeing r2. */
+        int64_t latest_id = 0, latest_no = 0;
+        char latest_hash[ATLAS_SHA256_HEX_LEN + 1u];
+        char latest_state[16];
+        st = atlas_db_decision_latest_revision(ac->db, out_c->document_id, &latest_id, &latest_no,
+                                               latest_hash, sizeof(latest_hash), latest_state,
+                                               sizeof(latest_state), err);
+        if (st != ATLAS_OK) {
+            return st;
+        }
+        if (latest_no != out_c->revision_no) {
+            return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                                 "this decision gained revision %lld after the challenge was "
+                                 "minted; nothing was changed -- read it again",
+                                 (long long)latest_no);
+        }
+        /* The kinds policy, repeated at spend time for the same reason the
+         * repository identity is: the policy on the op is the one that
+         * minted, so a request cannot present a wider one at spend than the
+         * challenge was actually issued under. */
+        atlas_decision_kind rkind = ATLAS_DECISION_KIND_DECISION;
+        bool rkfound = false;
+        st = atlas_db_decision_kind_of(ac->db, out_c->document_id, &rkind, &rkfound, err);
+        if (st != ATLAS_OK) {
+            return st;
+        }
+        if ((op->remote_kinds & ATLAS_DECISION_KIND_BIT(rkind)) == 0) {
+            return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                                 "a record of kind %s is not one the remote disposal policy "
+                                 "names; dispose of it on a terminal",
+                                 atlas_decision_kind_name(rkind));
+        }
     }
     if (out_c->consumed) {
         return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
@@ -1344,7 +1507,7 @@ static atlas_status transition(apply_ctx *ac, int64_t document_id, int64_t revis
                                atlas_decision_state to, atlas_decision_actor actor,
                                int64_t challenge_id, int64_t superseded_by_revision_id,
                                int64_t superseded_by_document_id, const char *detail,
-                               const char *content_hash, atlas_err *err) {
+                               const char *content_hash, const char *key_id, atlas_err *err) {
     atlas_decision_kind kind = ATLAS_DECISION_KIND_DECISION;
     bool found = false;
     atlas_status kst = atlas_db_decision_kind_of(ac->db, document_id, &kind, &found, err);
@@ -1377,16 +1540,61 @@ static atlas_status transition(apply_ctx *ac, int64_t document_id, int64_t revis
                              "it again and retry",
                              atlas_decision_state_name(from), atlas_decision_state_name(to));
     }
-    /* `key_id` is NULL: this season's remote channel is not wired into this
-     * transition path yet, so no actor this function can be asked to record
-     * has ever named a credential, and every event it appends still names
-     * none either. */
+    /* A16. `key_id` is the caller's to supply and is non-NULL only for the one
+     * transition a REMOTE challenge actually authorises: the credential that
+     * minted it, read back from the spent challenge row rather than passed in
+     * fresh, so the ledger's `key_id` can never differ from what
+     * `spend_challenge` already checked it against. Every other caller of this
+     * function — the automatic supersession an approval implies, a LOCAL
+     * transition, a policy-authorised one — passes NULL, and every event those
+     * write still names none. */
     return atlas_db_decision_event_append(ac->db, document_id, revision_id, revision_no,
                                           atlas_decision_state_name(to),
                                           atlas_decision_actor_name(actor), content_hash,
                                           challenge_id, superseded_by_revision_id,
-                                          superseded_by_document_id, detail, NULL, NULL, NULL,
+                                          superseded_by_document_id, detail, key_id, NULL, NULL,
                                           err);
+}
+
+/* A16. The actor and the ledger's credential come from the *spent challenge's*
+ * own channel -- `c->channel`, never from anything the request supplied --
+ * because a caller that could name its own actor could write
+ * LOCAL_OPERATOR_CONFIRMED about a channel nothing had been through.
+ * `spend_challenge` has already refused a channel mismatch by the time any
+ * caller of this reaches it, so `c->channel` and `op->channel` agree.
+ *
+ * `local_detail` is the existing, operation-specific LOCAL sentence
+ * (approve's, reject's and resolve's all differ). The REMOTE sentence is one
+ * frozen line shared by all three: the fact it records -- that the channel
+ * and the named credential were used -- does not vary with which transition
+ * that credential authorised, so there is exactly one to keep in sync rather
+ * than three.
+ *
+ * Writes `out->actor` and `out->key_id` and returns the detail string to
+ * pass to `transition`, which is either `local_detail` verbatim or
+ * `remote_detail_buf` after this fills it -- the caller owns that buffer so
+ * nothing here outlives its caller's stack frame. */
+static const char *channel_actor_detail(const atlas_decision_challenge *c, const char *local_detail,
+                                        atlas_decision_result *out, atlas_decision_actor *actor_out,
+                                        const char **key_id_out, char *remote_detail_buf,
+                                        size_t remote_detail_buf_len) {
+    if (c->channel == ATLAS_DECISION_CHANNEL_REMOTE) {
+        *actor_out = ATLAS_DECISION_ACTOR_REMOTE_OPERATOR_CONFIRMED;
+        *key_id_out = c->key_id;
+        (void)snprintf(remote_detail_buf, remote_detail_buf_len,
+                       "confirmed through the Atlas remote operator channel with credential %s; "
+                       "this records that the channel and the credential were used, not which "
+                       "person used them",
+                       c->key_id);
+        out->actor = *actor_out;
+        (void)snprintf(out->key_id, sizeof(out->key_id), "%s", c->key_id);
+        return remote_detail_buf;
+    }
+    *actor_out = ATLAS_DECISION_ACTOR_LOCAL_OPERATOR_CONFIRMED;
+    *key_id_out = NULL;
+    out->actor = *actor_out;
+    out->key_id[0] = '\0';
+    return local_detail;
 }
 
 static atlas_status op_approve(apply_ctx *ac, const atlas_decision_op *op,
@@ -1397,6 +1605,15 @@ static atlas_status op_approve(apply_ctx *ac, const atlas_decision_op *op,
     if (st != ATLAS_OK) {
         return st;
     }
+
+    atlas_decision_actor actor;
+    const char *key_id = NULL;
+    char remote_detail[256];
+    const char *detail = channel_actor_detail(
+        &c,
+        "confirmed through the Atlas local operator channel; this records that the channel was "
+        "used, not which person used it",
+        out, &actor, &key_id, remote_detail, sizeof(remote_detail));
 
     /* What is currently effective, before anything changes. */
     int64_t prev_rev_id = 0, prev_rev_no = 0;
@@ -1433,12 +1650,22 @@ static atlas_status op_approve(apply_ctx *ac, const atlas_decision_op *op,
      * makes getting the order wrong a hard failure rather than a state with two
      * effective revisions. */
     if (prev_rev_id > 0) {
+        /* Decision 12. The previous season found `op_approve` writing this
+         * detail unconditionally, in a sequence where the newly approved
+         * revision is *older* than the one it superseded -- so the ledger
+         * recorded the reverse of what happened. The direction is now
+         * observed rather than assumed: `prev_rev_no` is the revision being
+         * superseded and `c.revision_no` is the one replacing it, so which
+         * sentence applies is a comparison of the two, not a constant. */
+        const char *supersede_detail =
+            prev_rev_no < c.revision_no
+                ? "replaced by a later revision of the same decision, which was approved in the "
+                  "same transaction"
+                : "replaced by an earlier revision of the same decision, approved after it in the "
+                  "same transaction";
         st = transition(ac, c.document_id, prev_rev_id, prev_rev_no, ATLAS_DECISION_APPROVED,
                         ATLAS_DECISION_SUPERSEDED, ATLAS_DECISION_ACTOR_ATLAS_AUTOMATIC, c.id,
-                        c.revision_id, 0,
-                        "replaced by a later revision of the same decision, which was approved in "
-                        "the same transaction",
-                        NULL, err);
+                        c.revision_id, 0, supersede_detail, NULL, NULL, err);
         if (st != ATLAS_OK) {
             return st;
         }
@@ -1446,11 +1673,7 @@ static atlas_status op_approve(apply_ctx *ac, const atlas_decision_op *op,
     }
 
     st = transition(ac, c.document_id, c.revision_id, c.revision_no, ATLAS_DECISION_PROPOSED,
-                    ATLAS_DECISION_APPROVED, ATLAS_DECISION_ACTOR_LOCAL_OPERATOR_CONFIRMED, c.id, 0,
-                    0,
-                    "confirmed through the Atlas local operator channel; this records that the "
-                    "channel was used, not which person used it",
-                    c.content_hash, err);
+                    ATLAS_DECISION_APPROVED, actor, c.id, 0, 0, detail, c.content_hash, key_id, err);
     if (st != ATLAS_OK) {
         return st;
     }
@@ -1475,9 +1698,14 @@ static atlas_status op_reject(apply_ctx *ac, const atlas_decision_op *op,
     if (st != ATLAS_OK) {
         return st;
     }
+    atlas_decision_actor actor;
+    const char *key_id = NULL;
+    char remote_detail[256];
+    const char *detail =
+        channel_actor_detail(&c, "refused through the Atlas local operator channel", out, &actor,
+                             &key_id, remote_detail, sizeof(remote_detail));
     st = transition(ac, c.document_id, c.revision_id, c.revision_no, ATLAS_DECISION_PROPOSED,
-                    ATLAS_DECISION_REJECTED, ATLAS_DECISION_ACTOR_LOCAL_OPERATOR_CONFIRMED, c.id, 0,
-                    0, "refused through the Atlas local operator channel", c.content_hash, err);
+                    ATLAS_DECISION_REJECTED, actor, c.id, 0, 0, detail, c.content_hash, key_id, err);
     if (st != ATLAS_OK) {
         return st;
     }
@@ -1517,13 +1745,16 @@ static atlas_status op_resolve(apply_ctx *ac, const atlas_decision_op *op,
     if (st != ATLAS_OK) {
         return st;
     }
+    atlas_decision_actor actor;
+    const char *key_id = NULL;
+    char remote_detail[256];
+    const char *detail = channel_actor_detail(
+        &c,
+        "the demand this record made was recorded as met through the Atlas local operator "
+        "channel; this records that the channel was used, not which person used it",
+        out, &actor, &key_id, remote_detail, sizeof(remote_detail));
     st = transition(ac, c.document_id, c.revision_id, c.revision_no, ATLAS_DECISION_APPROVED,
-                    ATLAS_DECISION_RESOLVED, ATLAS_DECISION_ACTOR_LOCAL_OPERATOR_CONFIRMED, c.id, 0,
-                    0,
-                    "the demand this record made was recorded as met through the Atlas local "
-                    "operator channel; this records that the channel was used, not which person "
-                    "used it",
-                    c.content_hash, err);
+                    ATLAS_DECISION_RESOLVED, actor, c.id, 0, 0, detail, c.content_hash, key_id, err);
     if (st != ATLAS_OK) {
         return st;
     }
@@ -1555,6 +1786,18 @@ static atlas_status op_supersede(apply_ctx *ac, const atlas_decision_op *op,
     if (st != ATLAS_OK) {
         return st;
     }
+    /* A16. A REMOTE challenge can never reach here in practice -- `op_challenge`
+     * already refuses to mint one with a SUPERSEDE intent -- but "cannot
+     * happen" is a belief and this is the single write point, so it is
+     * checked anyway, exactly as `spend_challenge` rehashes stored content
+     * that cannot have changed. The whole transaction rolls back, so the
+     * challenge this would otherwise have consumed is not spent either. */
+    if (c.channel == ATLAS_DECISION_CHANNEL_REMOTE) {
+        return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                             "supersede and revalidate are not offered from the browser; use a "
+                             "terminal on the Atlas machine");
+    }
+    out->actor = ATLAS_DECISION_ACTOR_LOCAL_OPERATOR_CONFIRMED;
     if (c.supersede_document_id <= 0) {
         return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
                              "that challenge names no replacement decision");
@@ -1596,7 +1839,7 @@ static atlas_status op_supersede(apply_ctx *ac, const atlas_decision_op *op,
                             c.supersede_document_id,
                             "superseded by another decision through the Atlas local operator "
                             "channel",
-                            cur.content_hash, err);
+                            cur.content_hash, NULL, err);
         }
         atlas_decision_revision_free(&cur);
         if (st != ATLAS_OK) {
@@ -1656,6 +1899,15 @@ static atlas_status op_revalidate(apply_ctx *ac, const atlas_decision_op *op,
     if (st != ATLAS_OK) {
         return st;
     }
+    /* A16. See the identical check in `op_supersede`: a REMOTE challenge can
+     * never carry a REVALIDATE intent -- `op_challenge` refuses to mint one --
+     * so this cannot happen through Atlas, and is checked anyway. */
+    if (c.channel == ATLAS_DECISION_CHANNEL_REMOTE) {
+        return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                             "supersede and revalidate are not offered from the browser; use a "
+                             "terminal on the Atlas machine");
+    }
+    out->actor = ATLAS_DECISION_ACTOR_LOCAL_OPERATOR_CONFIRMED;
 
     /* The revision must still be the effective one. A revalidation of something
      * that was superseded while the capability was in flight would establish a
@@ -1979,7 +2231,7 @@ static atlas_status op_auto(apply_ctx *ac, const atlas_decision_op *op,
                     "authorised by a root-owned verification policy against a recorded "
                     "verification result; this records which policy acted, not that the record "
                     "is true and not that a person agreed",
-                    content_hash, err);
+                    content_hash, NULL, err);
     if (st != ATLAS_OK) {
         return st;
     }
@@ -2040,6 +2292,36 @@ atlas_status atlas_decision_apply_in_tx(atlas_db *db, const atlas_decision_op *o
          * because attaching it would record that a conversation approved
          * something. Below, the operator branches never read `ac.session_id`. */
         st = bind_session(&ac, op, out, err);
+    }
+    /* A16. The channel, checked before anything about a capability is asked.
+     *
+     * Every op that mints one (CHALLENGE) or spends one (the five
+     * `atlas_decision_op_needs_challenge` kinds) must name which path it
+     * travelled. UNKNOWN is refused here rather than left for `spend_challenge`
+     * or `op_challenge` to notice, because a caller that forgot to name a
+     * channel is not a smaller version of a real request -- and refusing it at
+     * one entry point, rather than trusting every future operation kind to
+     * remember, is the same argument `atlas_decision_op_needs_challenge`
+     * already makes about the token itself, one line below.
+     *
+     * REMOTE additionally authenticates here, before `op_challenge` or
+     * `spend_challenge` runs: the verified key id is kept in `ac.key_id` for
+     * both to read, because the actor and the ledger's `key_id` must come from
+     * what Atlas just verified, never from anything the request merely
+     * claimed. */
+    if (st == ATLAS_OK) {
+        bool needs_channel =
+            atlas_decision_op_needs_challenge(op->kind) || op->kind == ATLAS_DECISION_OP_CHALLENGE;
+        if (needs_channel) {
+            if (op->channel == ATLAS_DECISION_CHANNEL_UNKNOWN) {
+                st = atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                                   "this operation names no channel; a capability is minted and "
+                                   "spent through exactly one of LOCAL or REMOTE");
+            } else if (op->channel == ATLAS_DECISION_CHANNEL_REMOTE) {
+                st = atlas_decision_remote_verify(db, &op->remote_token, op->remote_expected_key_id,
+                                                  ac.key_id, err);
+            }
+        }
     }
     if (st == ATLAS_OK) {
         if (atlas_decision_op_needs_challenge(op->kind)) {

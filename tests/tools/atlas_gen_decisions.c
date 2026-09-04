@@ -316,6 +316,7 @@ int main(int argc, char **argv) {
                                            : ATLAS_DECISION_INTENT_APPROVE;
             atlas_decision_op ch;
             atlas_decision_op_init(&ch, ATLAS_DECISION_OP_CHALLENGE);
+            ch.channel = ATLAS_DECISION_CHANNEL_LOCAL;
             if (atlas_buf_set_str(&ch.repo_name, "perf", &err) != ATLAS_OK ||
                 atlas_buf_set(&ch.uid, uid.data, uid.len, &err) != ATLAS_OK) {
                 die("challenge target", &err);
@@ -332,6 +333,7 @@ int main(int argc, char **argv) {
             atlas_decision_op_init(&sp, intent == ATLAS_DECISION_INTENT_REJECT
                                              ? ATLAS_DECISION_OP_REJECT
                                              : ATLAS_DECISION_OP_APPROVE);
+            sp.channel = ATLAS_DECISION_CHANNEL_LOCAL;
             if (atlas_buf_set_str(&sp.repo_name, "perf", &err) != ATLAS_OK ||
                 atlas_buf_set(&sp.uid, uid.data, uid.len, &err) != ATLAS_OK ||
                 atlas_buf_set(&sp.token, cres.token.data, cres.token.len, &err) != ATLAS_OK ||
@@ -358,6 +360,7 @@ int main(int argc, char **argv) {
             if (intent == ATLAS_DECISION_INTENT_APPROVE && prev_uid.len > 0 && approved % 11 == 0) {
                 atlas_decision_op sch;
                 atlas_decision_op_init(&sch, ATLAS_DECISION_OP_CHALLENGE);
+                sch.channel = ATLAS_DECISION_CHANNEL_LOCAL;
                 if (atlas_buf_set_str(&sch.repo_name, "perf", &err) != ATLAS_OK ||
                     atlas_buf_set(&sch.uid, prev_uid.data, prev_uid.len, &err) != ATLAS_OK ||
                     atlas_buf_set(&sch.replacement_uid, uid.data, uid.len, &err) != ATLAS_OK) {
@@ -372,6 +375,7 @@ int main(int argc, char **argv) {
                 if (atlas_decision_apply(db, &sch, &scres, &err) == ATLAS_OK) {
                     atlas_decision_op ssp;
                     atlas_decision_op_init(&ssp, ATLAS_DECISION_OP_SUPERSEDE);
+                    ssp.channel = ATLAS_DECISION_CHANNEL_LOCAL;
                     if (atlas_buf_set_str(&ssp.repo_name, "perf", &err) == ATLAS_OK &&
                         atlas_buf_set(&ssp.uid, prev_uid.data, prev_uid.len, &err) == ATLAS_OK &&
                         atlas_buf_set(&ssp.token, scres.token.data, scres.token.len, &err) ==

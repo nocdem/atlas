@@ -2223,11 +2223,21 @@ supersedes it with "replaced by a **later** revision" — but revision 1 is
 *older* than revision 2. The ledger event records a relationship between the
 two revisions that is the reverse of what happened.
 
-**Why it stays recorded rather than fixed here.** This is a source-level
-defect needing its own test and its own fix in `src/decision/lifecycle.c` —
-comparing `revision_no` before choosing the detail string, or writing a
-detail that states the relationship actually observed rather than assuming
-one — and is outside a documentation task's file list.
+**Found and fixed.** Found while establishing A15's `--revision` behaviour
+(2026-09-04); fixed in A16 T3 (2026-09-04), the season whose write-point work
+already touched `op_approve`'s supersession call for an unrelated reason (the
+REMOTE channel's actor and `key_id`), putting this exact code back under a
+reviewer's eyes. `op_approve` now compares `prev_rev_no` against
+`c.revision_no` and chooses the detail that states the relationship actually
+observed: "replaced by a later revision of the same decision, which was
+approved in the same transaction" when `prev_rev_no < c.revision_no` (the
+existing, common case), and the new "replaced by an earlier revision of the
+same decision, approved after it in the same transaction" when
+`prev_rev_no > c.revision_no` — the exact sequence this entry describes.
+`tests/test_decision_operator.c`'s `test_a_pinned_revision_that_is_not_the_newest`
+was extended to assert the SUPERSEDED event's detail names "later" for the
+document's original ordering and, in a fresh case approving r2 over an
+already-approved r1, that it names "earlier" instead.
 
 ## Three routes in the gateway's own table name daemon methods that do not exist (pre-existing; found 2026-09-04 while establishing A15's route-table property)
 

@@ -73,7 +73,7 @@ atlas_status pty_spawn(const char *data_dir, const char *bin_path, const char *c
     (void)mkdir(xdgrt_path, S_IRWXU); /* EEXIST is fine; anything else just leaves it unset */
     char xdgrt_env[1200];
     (void)snprintf(xdgrt_env, sizeof(xdgrt_env), "XDG_RUNTIME_DIR=%s", xdgrt_path);
-    const char *envp[] = {"PATH=/usr/bin:/bin", home, xdgrt_env, "LC_ALL=C", NULL};
+    const char *envp[] = {"PATH=/usr/bin:/bin", home, xdgrt_env, "LC_ALL=C", "TZ=UTC", NULL};
 
     pid_t pid = fork();
     if (pid < 0) {

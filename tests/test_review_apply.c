@@ -980,6 +980,8 @@ static void test_a_mistyped_confirmation_abandons_and_leaves_the_challenge_uncon
     atlas_buf sheet_path = ATLAS_BUF_INIT;
     T_OK(atlas_buf_appendf(&sheet_path, &err, "%s/review.txt", fx_data_dir(&e.fx)), &err);
 
+    int64_t before = challenge_count(ctx);
+
     const char *args[] = {"review", "apply", atlas_buf_cstr(&sheet_path)};
     pty p = {-1, -1};
     T_REQUIRE(pty_spawn(fx_data_dir(&e.fx), INSTALLED_ATLAS, args, 3u, &p, &err) == ATLAS_OK);
@@ -1018,6 +1020,20 @@ static void test_a_mistyped_confirmation_abandons_and_leaves_the_challenge_uncon
                              "refused 0\r\n") != NULL,
                 "wrong real (non-check) totals line:\n%s", text);
     T_EQ_INT(code, 8);
+
+    /* Total, not only the unconsumed row: `ORDER BY id DESC LIMIT 1` alone
+     * would still pass a walker that re-minted a second challenge for entry
+     * 1 after the mistype and then abandoned that one too, leaving only the
+     * *newest* row unconsumed while an equally-wrong earlier one from the
+     * same entry sat underneath it, uncounted. Exactly one challenge per
+     * entry -- entry 1's abandoned, entry 2's spent -- is the actual claim;
+     * the unconsumed check below answers a narrower question and stays
+     * alongside this one rather than instead of it. */
+    int64_t after = challenge_count(ctx);
+    T_CHECK_MSG(after == before + 2,
+                "expected exactly two capabilities minted (one abandoned, one spent), changed "
+                "by %lld",
+                (long long)(after - before));
 
     int64_t consumed = challenge_consumed_for(ctx, atlas_buf_cstr(&uid_a));
     T_EQ_INT(consumed, 0);
@@ -1146,7 +1162,13 @@ static void test_a_locked_profile_refuses_before_the_sheet_is_opened(void) {
     int code = 0;
     const char *args[] = {"review", "apply", "/definitely/does/not/exist-a15t6", "--check"};
     run_atlas_keep_stderr(&e, args, 4u, &errout, &code);
-    T_CHECK_MSG(code != 0, "review apply must be refused on a locked profile");
+    /* The frozen contract: `atlas_authority_require`'s refusal is
+     * `ATLAS_ERR_CONFIG` (src/core/authority.c:345-346), which is exit 3 --
+     * not merely nonzero, which a wrong refusal (2, a usage error; 7, an
+     * integrity refusal) would also satisfy while meaning something entirely
+     * different about where the command stopped. Same finding as obligation
+     * (a)'s Minor, one test over. */
+    T_EQ_INT(code, 3);
     T_CHECK_MSG(strstr(atlas_buf_cstr(&errout), "locked in this Atlas profile") != NULL,
                 "expected the authority refusal, not a file error: %s", atlas_buf_cstr(&errout));
     atlas_buf_free(&errout);

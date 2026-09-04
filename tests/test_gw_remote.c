@@ -40,7 +40,9 @@
 #include "atlas/decision_ops.h"
 #include "atlas/gateway.h"
 #include "atlas/ipc.h"
+#include "atlas/mcp.h"
 #include "atlas_test.h"
+#include "mcp/mcp_internal.h"
 #include "support/fixture.h"
 
 typedef struct env {
@@ -276,6 +278,56 @@ static void test_a_tool_outside_the_scopes_is_refused_and_hidden(void) {
     env_close(&e);
 }
 
+/* A16. Runs one JSON-RPC message through the MCP tool layer directly, with a
+ * caller-chosen `granted` mask, the same way `mcp_exchange` (`gateway.c`)
+ * builds an `atlas_mcp_server` from a real principal's scopes. This bypasses
+ * `authenticate()` and the daemon's `gateway.auth` entirely, which is the
+ * point: `decisions:dispose` is never stored on a key row and this fixture's
+ * daemon runs with no gateway policy at all (`env_open`'s "legacy per-user
+ * mode" comment), so no real credential in this file can ever carry that bit
+ * -- `gateway.auth`'s derivation of it needs the daemon's own `ctx->gwpolicy`
+ * to name a real disposal key, which `test_gw_dispose.c`'s file header
+ * explains this fixture cannot produce. What is checked here does not need a
+ * real credential: it is the structural half, that `TOOLS[]` maps no tool to
+ * `ATLAS_SCOPE_DECISIONS_DISPOSE`, so a mask that happens to carry the bit --
+ * however it got there -- still reaches nothing a `memory:write`-gated tool
+ * needs. */
+static void mcp_call_with_mask(env *e, atlas_scope_mask granted, const char *msg,
+                               atlas_buf *out) {
+    char *buf = NULL;
+    size_t buf_len = 0;
+    FILE *mem = open_memstream(&buf, &buf_len);
+    T_REQUIRE(mem != NULL);
+
+    atlas_mcp_server s;
+    atlas_mcp_opts o;
+    atlas_mcp_opts_init(&o);
+    o.socket_path = atlas_buf_cstr(&e->d.socket);
+    o.timeout_ms = 15000;
+    memset(&s, 0, sizeof(s));
+    s.remote = true;
+    atlas_mcp_server_init(&s, NULL, mem, NULL, &o);
+    s.remote = true;
+    s.granted = granted;
+    s.got_initialize = true;
+    s.initialized = true;
+
+    atlas_err err;
+    atlas_err_init(&err);
+    T_OK(atlas_mcp_handle_document(&s, msg, strlen(msg), &err), &err);
+    atlas_mcp_server_teardown(&s);
+    (void)fflush(mem);
+    (void)fclose(mem);
+
+    atlas_buf_reset(out);
+    if (buf != NULL && buf_len > 0) {
+        atlas_err berr;
+        atlas_err_init(&berr);
+        T_OK(atlas_buf_append(out, buf, buf_len, &berr), &berr);
+    }
+    free(buf);
+}
+
 static void test_no_credential_can_reach_a_write_tool(void) {
     env e;
     /* Every grantable scope at once. `memory:write` is not grantable at all, so
@@ -304,6 +356,38 @@ static void test_no_credential_can_reach_a_write_tool(void) {
         T_CHECK_MSG(strstr(body_of(&resp), "memory:write") != NULL,
                     "%s was not refused for want of the write scope: %s", WRITES[i],
                     body_of(&resp));
+    }
+
+    /* A16: the same six scopes, plus `decisions:dispose` -- a principal whose
+     * mask carries it still reaches no write tool, because no tool in
+     * `TOOLS[]` maps to that scope at all. See `mcp_call_with_mask`'s own
+     * comment for why this mask cannot be reached through a real credential
+     * in this fixture and does not need to be, to prove the property. */
+    atlas_scope_mask with_dispose = 0u;
+    {
+        atlas_err serr;
+        atlas_err_init(&serr);
+        T_OK(atlas_apikey_scopes_parse(
+                 "context:read repo:read decisions:read graph:read impact:read audit:read",
+                 &with_dispose, &serr),
+             &serr);
+    }
+    with_dispose |= ATLAS_SCOPE_BIT(ATLAS_SCOPE_DECISIONS_DISPOSE);
+
+    for (size_t i = 0; i < sizeof WRITES / sizeof WRITES[0]; i++) {
+        char msg[512];
+        (void)snprintf(msg, sizeof msg,
+                       "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":"
+                       "{\"name\":\"%s\",\"arguments\":{\"repo\":\"proj\"}}}",
+                       WRITES[i]);
+        mcp_call_with_mask(&e, with_dispose, msg, &resp);
+        /* `mcp_call_with_mask` writes the raw MCP JSON-RPC document, not an
+         * HTTP response -- `body_of` would look for a header/body separator
+         * that is never there. */
+        T_CHECK_MSG(strstr(atlas_buf_cstr(&resp), "memory:write") != NULL,
+                    "%s was not refused for want of the write scope with decisions:dispose also "
+                    "granted: %s",
+                    WRITES[i], atlas_buf_cstr(&resp));
     }
 
     atlas_buf_free(&resp);

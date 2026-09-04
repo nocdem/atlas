@@ -972,6 +972,15 @@
  * claiming a large request — the same rule the Unix-socket framing follows. */
 #define ATLAS_GW_MAX_BODY_BYTES (1024u * 1024u)
 
+/* A16. One disposal request body: `application/x-www-form-urlencoded`, at
+ * most five short fields (`repo`, `decision`, `intent` plus either
+ * `revision` or `challenge` and `confirmation`, never all of them on one
+ * request). `take_login_key`'s bound is the same number for the same
+ * reason: a body this shape does not need `ATLAS_GW_MAX_BODY_BYTES`, and a
+ * caller sending anywhere near that much to a disposal route is not sending
+ * a disposal. */
+#define ATLAS_GW_WRITE_BODY_MAX_BYTES 4096u
+
 /* One response body the gateway will assemble. A result that does not fit is a
  * structured statement that it does not fit, never a truncation. */
 #define ATLAS_GW_MAX_RESPONSE_BYTES (8u * 1024u * 1024u)

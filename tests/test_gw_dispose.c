@@ -35,6 +35,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "atlas/apikey.h"
@@ -42,6 +43,7 @@
 #include "atlas/datadir.h"
 #include "atlas/decision.h"
 #include "atlas/decision_ops.h"
+#include "atlas/gateway.h"
 #include "atlas/gw.h"
 #include "atlas/gwpolicy.h"
 #include "atlas/ipc.h"
@@ -339,6 +341,135 @@ static void call(const fx_daemon *d, const char *method, const char *params, atl
 
 static bool get_str(const atlas_buf *body, const char *key, atlas_buf *out) {
     return tjson_get_string(body->data, body->len, key, out);
+}
+
+/* --- the HTTP half: an in-process gateway pointed at the real daemon --------
+ *
+ * T6's own surface. `atlas_gateway_serve_bytes` needs no listening port, so
+ * the write table's whole HTTP path -- routing, the bearer-only principal,
+ * the scope check, the frozen refusals and their status codes -- is
+ * exercised here against the *same* real `atlas-gw-daemon` process the
+ * IPC-level tests above already use, over the identical policy text it was
+ * started with. */
+
+static void open_http_gateway(const char *policy_text, const fx_daemon *d, atlas_gateway **g_out) {
+    atlas_gwpolicy p;
+    atlas_gwpolicy_parse_buffer(policy_text, strlen(policy_text), &p);
+    T_REQUIRE_MSG(p.state == ATLAS_GWPOLICY_ENABLED,
+                 "the policy text given to the HTTP gateway does not parse as ENABLED");
+    atlas_gateway_opts o;
+    memset(&o, 0, sizeof o);
+    o.socket_path = atlas_buf_cstr(&d->socket);
+    o.timeout_ms = 15000;
+    o.errout = NULL;
+    atlas_err err;
+    atlas_err_init(&err);
+    T_OK(atlas_gateway_open(&p, &o, g_out, &err), &err);
+}
+
+/* Builds one complete HTTP/1.1 request and returns the gateway's response.
+ * Every optional argument is NULL to omit that header. `content_type` NULL
+ * with a non-NULL `body` defaults to the write routes' own frozen shape,
+ * since every test below that sends a body is sending a disposal. `origin`
+ * is separate from the rest because the preflight case needs it without an
+ * Authorization header at all. */
+static void http_request2(atlas_gateway *g, const char *method, const char *path,
+                          const char *auth, const char *cookie, const char *origin,
+                          const char *content_type, const char *body, size_t body_len_or_neg1,
+                          atlas_buf *resp) {
+    atlas_err err;
+    atlas_err_init(&err);
+    atlas_buf req = ATLAS_BUF_INIT;
+    size_t blen = body != NULL ? (body_len_or_neg1 != (size_t)-1 ? body_len_or_neg1 : strlen(body))
+                               : 0;
+    T_OK(atlas_buf_appendf(&req, &err, "%s %s HTTP/1.1\r\nHost: 127.0.0.1:8787\r\n", method, path),
+        &err);
+    if (auth != NULL) {
+        T_OK(atlas_buf_appendf(&req, &err, "Authorization: %s\r\n", auth), &err);
+    }
+    if (cookie != NULL) {
+        T_OK(atlas_buf_appendf(&req, &err, "Cookie: atlas_session=%s\r\n", cookie), &err);
+    }
+    if (origin != NULL) {
+        T_OK(atlas_buf_appendf(&req, &err, "Origin: %s\r\n", origin), &err);
+    }
+    if (content_type != NULL) {
+        T_OK(atlas_buf_appendf(&req, &err, "Content-Type: %s\r\n", content_type), &err);
+    } else if (body != NULL) {
+        T_OK(atlas_buf_appendf(&req, &err, "Content-Type: application/x-www-form-urlencoded\r\n"),
+            &err);
+    }
+    T_OK(atlas_buf_appendf(&req, &err, "Content-Length: %zu\r\n\r\n", blen), &err);
+    if (blen > 0) {
+        T_OK(atlas_buf_append(&req, body, blen, &err), &err);
+    }
+    T_OK(atlas_gateway_serve_bytes(g, req.data, req.len, resp, &err), &err);
+    atlas_buf_free(&req);
+}
+
+/* The common case: a POST with a form body and an optional bearer, nothing
+ * else. */
+static void post_form(atlas_gateway *g, const char *path, const char *auth, const char *body,
+                      atlas_buf *resp) {
+    http_request2(g, "POST", path, auth, NULL, NULL, NULL, body, (size_t)-1, resp);
+}
+
+static int status_of(const atlas_buf *resp) {
+    const char *s = atlas_buf_cstr(resp);
+    if (strncmp(s, "HTTP/1.1 ", 9) != 0) {
+        return -1;
+    }
+    return atoi(s + 9);
+}
+
+static const char *body_of(const atlas_buf *resp) {
+    const char *s = strstr(atlas_buf_cstr(resp), "\r\n\r\n");
+    return s != NULL ? s + 4 : "";
+}
+
+/* `get_str` reads a field out of an `atlas_buf` holding a whole JSON
+ * document; an HTTP response's body is a slice of a larger buffer, so this
+ * reads directly off `body_of`'s pointer instead of copying it into one. */
+static bool get_field(const atlas_buf *resp, const char *key, atlas_buf *out) {
+    const char *b = body_of(resp);
+    return tjson_get_string(b, strlen(b), key, out);
+}
+
+/* Extracts the `atlas_session` cookie value from a `Set-Cookie` response
+ * header, for the "a valid session cookie must not help" refusal case. */
+static bool extract_session_cookie(const atlas_buf *resp, char *out, size_t out_size) {
+    static const char NEEDLE[] = "Set-Cookie: atlas_session=";
+    const char *p = strstr(atlas_buf_cstr(resp), NEEDLE);
+    if (p == NULL) {
+        return false;
+    }
+    p += sizeof(NEEDLE) - 1u;
+    size_t n = 0;
+    while (p[n] != '\0' && p[n] != ';' && p[n] != '\r' && n + 1 < out_size) {
+        n++;
+    }
+    if (n == 0) {
+        return false;
+    }
+    memcpy(out, p, n);
+    out[n] = '\0';
+    return true;
+}
+
+/* Logs in with `token` and returns the session cookie `/auth/me` (a
+ * session-cookie-only route -- it never reads a bearer header) needs. */
+static void login_and_get_cookie(atlas_gateway *g, const char *token, char *cookie_out,
+                                 size_t cookie_size) {
+    atlas_buf lresp = ATLAS_BUF_INIT;
+    char login_body[256];
+    (void)snprintf(login_body, sizeof(login_body), "{\"key\":\"%s\"}", token);
+    http_request2(g, "POST", "/auth/login", NULL, NULL, NULL, "application/json", login_body,
+                 (size_t)-1, &lresp);
+    T_REQUIRE_MSG(status_of(&lresp) == 200, "the login did not succeed: %d %s", status_of(&lresp),
+                 body_of(&lresp));
+    T_REQUIRE_MSG(extract_session_cookie(&lresp, cookie_out, cookie_size),
+                 "the login response carried no session cookie: %s", atlas_buf_cstr(&lresp));
+    atlas_buf_free(&lresp);
 }
 
 /* --- (a): gateway.auth's derived scope --------------------------------------- */
@@ -974,6 +1105,624 @@ static void test_f_disposal_offered_requires_state_enabled(void) {
                 "the control policy did not offer the group");
 }
 
+/* --- (g): the HTTP happy path, and what it leaves in the audit trail -------- */
+
+static void test_g_http_happy_path_and_audit(void) {
+    env e;
+    env_open(&e);
+    atlas_err err;
+    atlas_err_init(&err);
+
+    atlas_buf fact_uid = ATLAS_BUF_INIT;
+    propose_kind(&e, "OPERATIONAL_FACT", "an http-disposed endpoint", &fact_uid);
+
+    char before_digest[65];
+    T_OK(fx_tree_digest(fx_repo(&e.fx), before_digest, &err), &err);
+
+    atlas_buf ptext = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_appendf(&ptext, &err,
+                           "enabled = yes\ngateway_uid = %lld\nremote_mcp = yes\n"
+                           "web_gui = yes\ntls_mode = REVERSE_PROXY\nremote_dispose_key = "
+                           "key_%s\nremote_dispose_kinds = OPERATIONAL_FACT\n",
+                           (long long)getuid(), e.dispose_id),
+         &err);
+    atlas_buf ppath = ATLAS_BUF_INIT;
+    write_policy(&e, "g.conf", atlas_buf_cstr(&ptext), &ppath);
+
+    fx_daemon d;
+    fx_daemon_init(&d);
+    T_OK(gwd_start(&e, atlas_buf_cstr(&ppath), &d, &err), &err);
+    T_OK(fx_daemon_wait_ready(&d, 15000, &err), &err);
+
+    atlas_gateway *g = NULL;
+    open_http_gateway(atlas_buf_cstr(&ptext), &d, &g);
+    atlas_buf_free(&ptext);
+
+    char bearer[128];
+    (void)snprintf(bearer, sizeof(bearer), "Bearer %s", e.dispose_token);
+
+    char body[512];
+    (void)snprintf(body, sizeof(body), "repo=proj&decision=%s&revision=1&intent=reject",
+                   atlas_buf_cstr(&fact_uid));
+    atlas_buf resp = ATLAS_BUF_INIT;
+    post_form(g, "/api/v1/decision/challenge", bearer, body, &resp);
+    T_CHECK_MSG(status_of(&resp) == 200, "the HTTP challenge did not answer 200: %d %s",
+               status_of(&resp), body_of(&resp));
+    T_CHECK_MSG(strstr(body_of(&resp), "\"confirm\"") == NULL,
+               "the HTTP mint response carried a \"confirm\" key: %s", body_of(&resp));
+
+    atlas_buf token = ATLAS_BUF_INIT, hash = ATLAS_BUF_INIT, key_id = ATLAS_BUF_INIT;
+    T_REQUIRE_MSG(get_field(&resp, "token", &token), "no token: %s", body_of(&resp));
+    T_REQUIRE_MSG(get_field(&resp, "content_hash", &hash), "no content_hash: %s", body_of(&resp));
+    T_REQUIRE_MSG(get_field(&resp, "key_id", &key_id), "no key_id: %s", body_of(&resp));
+    T_CHECK_MSG(strcmp(atlas_buf_cstr(&key_id), e.dispose_id) == 0, "wrong key_id: %s",
+               atlas_buf_cstr(&key_id));
+
+    char confirm[16];
+    (void)snprintf(confirm, sizeof(confirm), "%.8s", atlas_buf_cstr(&hash));
+
+    char body2[512];
+    (void)snprintf(body2, sizeof(body2),
+                   "repo=proj&decision=%s&intent=reject&challenge=%s&confirmation=%s",
+                   atlas_buf_cstr(&fact_uid), atlas_buf_cstr(&token), confirm);
+    atlas_buf_reset(&resp);
+    post_form(g, "/api/v1/decision/dispose", bearer, body2, &resp);
+    T_CHECK_MSG(status_of(&resp) == 200, "the HTTP dispose did not answer 200: %d %s",
+               status_of(&resp), body_of(&resp));
+
+    atlas_buf actor = ATLAS_BUF_INIT, out_key = ATLAS_BUF_INIT;
+    T_REQUIRE_MSG(get_field(&resp, "actor", &actor), "no actor: %s", body_of(&resp));
+    T_CHECK_MSG(strcmp(atlas_buf_cstr(&actor), "REMOTE_OPERATOR_CONFIRMED") == 0, "wrong actor: %s",
+               atlas_buf_cstr(&actor));
+    T_REQUIRE_MSG(get_field(&resp, "key_id", &out_key), "no key_id on the dispose response: %s",
+                 body_of(&resp));
+    T_CHECK_MSG(strcmp(atlas_buf_cstr(&out_key), e.dispose_id) == 0, "wrong key_id: %s",
+               atlas_buf_cstr(&out_key));
+
+    /* Two `gw_audit` rows, one per path, naming the credential and the
+     * `WEB_API` interface -- and nowhere in the trail does the bearer token
+     * or the typed confirmation appear.
+     *
+     * `audit()` (`gateway.c`) is fire-and-forget by its own contract: the
+     * daemon's writer thread queues the row and `gateway.audit` answers once
+     * it is queued, not once it is committed. So this polls for the
+     * observable outcome rather than guessing at a sleep -- the same
+     * discipline `test_the_audit_trail_records_what_happened`
+     * (`test_gw_remote.c`) uses for the identical race. */
+    atlas_buf aresp = ATLAS_BUF_INIT;
+    bool have_challenge = false, have_dispose = false;
+    for (int attempt = 0; attempt < 200; attempt++) {
+        atlas_buf_reset(&aresp);
+        call(&d, "gateway.audit_list", "{}", &aresp);
+        have_challenge =
+            strstr(atlas_buf_cstr(&aresp), "\"operation\":\"/api/v1/decision/challenge\"") != NULL;
+        have_dispose =
+            strstr(atlas_buf_cstr(&aresp), "\"operation\":\"/api/v1/decision/dispose\"") != NULL;
+        if (have_challenge && have_dispose) {
+            break;
+        }
+        struct timespec ts = {0, 50 * 1000 * 1000};
+        (void)nanosleep(&ts, NULL);
+    }
+    T_CHECK_MSG(have_challenge, "no audit row for the challenge route: %s",
+               atlas_buf_cstr(&aresp));
+    T_CHECK_MSG(have_dispose, "no audit row for the dispose route: %s", atlas_buf_cstr(&aresp));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&aresp), "\"interface\":\"WEB_API\"") != NULL,
+               "no WEB_API audit row: %s", atlas_buf_cstr(&aresp));
+    {
+        char needle[64];
+        (void)snprintf(needle, sizeof(needle), "\"key_id\":\"%s\"", e.dispose_id);
+        T_CHECK_MSG(strstr(atlas_buf_cstr(&aresp), needle) != NULL,
+                   "no audit row names the dispose credential: %s", atlas_buf_cstr(&aresp));
+    }
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&aresp), e.dispose_token) == NULL,
+               "the audit trail carries the bearer token");
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&aresp), atlas_buf_cstr(&token)) == NULL,
+               "the audit trail carries the challenge capability");
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&aresp), confirm) == NULL,
+               "the audit trail carries the typed confirmation");
+
+    fx_daemon_stop(&d, false);
+    fx_daemon_free(&d);
+    atlas_gateway_close(g);
+
+    char after_digest[65];
+    T_OK(fx_tree_digest(fx_repo(&e.fx), after_digest, &err), &err);
+    T_CHECK_MSG(strcmp(before_digest, after_digest) == 0,
+               "the repository tree changed during an HTTP remote disposal");
+
+    atlas_buf_free(&aresp);
+    atlas_buf_free(&out_key);
+    atlas_buf_free(&actor);
+    atlas_buf_free(&token);
+    atlas_buf_free(&hash);
+    atlas_buf_free(&key_id);
+    atlas_buf_free(&resp);
+    atlas_buf_free(&ppath);
+    atlas_buf_free(&fact_uid);
+    env_close(&e);
+}
+
+/* --- (h): every refusal, with its frozen sentence and status --------------- */
+
+static void test_h_http_refusals(void) {
+    env e;
+    env_open(&e);
+    atlas_err err;
+    atlas_err_init(&err);
+
+    atlas_buf refusal_uid = ATLAS_BUF_INIT, drop_uid = ATLAS_BUF_INIT;
+    propose_kind(&e, "OPERATIONAL_FACT", "a refusal target", &refusal_uid);
+    propose_kind(&e, "OPERATIONAL_FACT", "a dropped-parameter target", &drop_uid);
+
+    /* `web_gui_anonymous_scopes = repo:read` -- a real, valid anonymous grant
+     * that has nothing to do with disposal -- so the "no header" case below
+     * is also, at the same time, the "anonymous floor plus a matching Host"
+     * case: this policy's floor and this request's Host
+     * (`http_request2`'s default, `127.0.0.1:8787`, is this policy's own
+     * default `listen_addr`/`listen_port`) both apply to it, and
+     * `api_handle_write` still answers 401 because it never asks
+     * `anonymous_ok` at all. */
+    atlas_buf ptext = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_appendf(&ptext, &err,
+                           "enabled = yes\ngateway_uid = %lld\nremote_mcp = yes\n"
+                           "web_gui = yes\ntls_mode = REVERSE_PROXY\nremote_dispose_key = "
+                           "key_%s\nremote_dispose_kinds = OPERATIONAL_FACT\n"
+                           "web_gui_anonymous_scopes = repo:read\n",
+                           (long long)getuid(), e.dispose_id),
+         &err);
+    atlas_buf ppath = ATLAS_BUF_INIT;
+    write_policy(&e, "h.conf", atlas_buf_cstr(&ptext), &ppath);
+
+    fx_daemon d;
+    fx_daemon_init(&d);
+    T_OK(gwd_start(&e, atlas_buf_cstr(&ppath), &d, &err), &err);
+    T_OK(fx_daemon_wait_ready(&d, 15000, &err), &err);
+
+    atlas_gateway *g = NULL;
+    open_http_gateway(atlas_buf_cstr(&ptext), &d, &g);
+
+    char dispose_bearer[128], reader_bearer[128];
+    (void)snprintf(dispose_bearer, sizeof(dispose_bearer), "Bearer %s", e.dispose_token);
+    (void)snprintf(reader_bearer, sizeof(reader_bearer), "Bearer %s", e.reader_token);
+
+    char valid_body[512];
+    (void)snprintf(valid_body, sizeof(valid_body), "repo=proj&decision=%s&revision=1&intent=reject",
+                   atlas_buf_cstr(&refusal_uid));
+
+    atlas_buf resp = ATLAS_BUF_INIT;
+
+    /* GET -> 405. */
+    http_request2(g, "GET", "/api/v1/decision/challenge", dispose_bearer, NULL, NULL, NULL, NULL,
+                 (size_t)-1, &resp);
+    T_CHECK_MSG(status_of(&resp) == 405, "GET did not answer 405: %d %s", status_of(&resp),
+               body_of(&resp));
+    T_CHECK_MSG(strstr(body_of(&resp), "this endpoint takes a POST") != NULL,
+               "405 did not carry its frozen sentence: %s", body_of(&resp));
+
+    /* Content-Type: application/json -> 415. */
+    atlas_buf_reset(&resp);
+    http_request2(g, "POST", "/api/v1/decision/challenge", dispose_bearer, NULL, NULL,
+                 "application/json", "{}", (size_t)-1, &resp);
+    T_CHECK_MSG(status_of(&resp) == 415, "a JSON body did not answer 415: %d %s",
+               status_of(&resp), body_of(&resp));
+    T_CHECK_MSG(
+        strstr(body_of(&resp), "a disposal request is application/x-www-form-urlencoded") != NULL,
+        "415 did not carry its frozen sentence: %s", body_of(&resp));
+
+    /* A 4097-byte body -> 413. */
+    {
+        char *big = malloc(4098);
+        T_REQUIRE(big != NULL);
+        memset(big, 'a', 4097);
+        big[4097] = '\0';
+        atlas_buf_reset(&resp);
+        post_form(g, "/api/v1/decision/challenge", dispose_bearer, big, &resp);
+        free(big);
+    }
+    T_CHECK_MSG(status_of(&resp) == 413, "a 4097-byte body did not answer 413: %d %s",
+               status_of(&resp), body_of(&resp));
+    T_CHECK_MSG(strstr(body_of(&resp), "the request body exceeds the gateway limit") != NULL,
+               "413 did not carry its frozen sentence: %s", body_of(&resp));
+
+    /* A gateway whose policy has no keys -> 404. */
+    {
+        atlas_buf ptext2 = ATLAS_BUF_INIT;
+        T_OK(atlas_buf_appendf(&ptext2, &err,
+                               "enabled = yes\ngateway_uid = %lld\nremote_mcp = yes\n"
+                               "web_gui = yes\ntls_mode = NONE\n",
+                               (long long)getuid()),
+             &err);
+        atlas_buf ppath2 = ATLAS_BUF_INIT;
+        write_policy(&e, "h-keyless.conf", atlas_buf_cstr(&ptext2), &ppath2);
+
+        fx_daemon d2;
+        fx_daemon_init(&d2);
+        T_OK(gwd_start(&e, atlas_buf_cstr(&ppath2), &d2, &err), &err);
+        T_OK(fx_daemon_wait_ready(&d2, 15000, &err), &err);
+        atlas_gateway *g2 = NULL;
+        open_http_gateway(atlas_buf_cstr(&ptext2), &d2, &g2);
+
+        atlas_buf_reset(&resp);
+        post_form(g2, "/api/v1/decision/challenge", dispose_bearer, valid_body, &resp);
+        T_CHECK_MSG(status_of(&resp) == 404, "a keyless policy did not answer 404: %d %s",
+                   status_of(&resp), body_of(&resp));
+        T_CHECK_MSG(strstr(body_of(&resp), "this gateway does not serve remote disposal") != NULL,
+                   "404 did not carry its frozen sentence: %s", body_of(&resp));
+
+        atlas_gateway_close(g2);
+        fx_daemon_stop(&d2, false);
+        fx_daemon_free(&d2);
+        atlas_buf_free(&ptext2);
+        atlas_buf_free(&ppath2);
+    }
+
+    /* No Authorization header at all -- also the anonymous-floor-plus-
+     * matching-Host case, per this test's own policy comment above. */
+    atlas_buf_reset(&resp);
+    post_form(g, "/api/v1/decision/challenge", NULL, valid_body, &resp);
+    T_CHECK_MSG(status_of(&resp) == 401, "no Authorization header did not answer 401: %d %s",
+               status_of(&resp), body_of(&resp));
+    T_CHECK_MSG(strstr(body_of(&resp),
+                       "a session cookie or the anonymous floor cannot dispose") != NULL,
+               "401 did not carry its frozen sentence: %s", body_of(&resp));
+
+    /* No Authorization header, but a *valid* session cookie from a real login
+     * with the reader key -- the cookie must not help. */
+    {
+        atlas_buf lresp = ATLAS_BUF_INIT;
+        char login_body[256];
+        (void)snprintf(login_body, sizeof(login_body), "{\"key\":\"%s\"}", e.reader_token);
+        http_request2(g, "POST", "/auth/login", NULL, NULL, NULL, "application/json", login_body,
+                     (size_t)-1, &lresp);
+        T_REQUIRE_MSG(status_of(&lresp) == 200, "the reader login did not succeed: %d %s",
+                     status_of(&lresp), body_of(&lresp));
+        char cookie[128];
+        T_REQUIRE_MSG(extract_session_cookie(&lresp, cookie, sizeof(cookie)),
+                     "the login response carried no session cookie: %s", atlas_buf_cstr(&lresp));
+        atlas_buf_free(&lresp);
+
+        atlas_buf_reset(&resp);
+        http_request2(g, "POST", "/api/v1/decision/challenge", NULL, cookie, NULL, NULL,
+                     valid_body, (size_t)-1, &resp);
+        T_CHECK_MSG(status_of(&resp) == 401,
+                   "a valid session cookie with no bearer still answered %d: %s",
+                   status_of(&resp), body_of(&resp));
+    }
+
+    /* The reader key as bearer -> 403 with the scope sentence. */
+    atlas_buf_reset(&resp);
+    post_form(g, "/api/v1/decision/challenge", reader_bearer, valid_body, &resp);
+    T_CHECK_MSG(status_of(&resp) == 403, "the reader key did not answer 403: %d %s",
+               status_of(&resp), body_of(&resp));
+    T_CHECK_MSG(strstr(body_of(&resp), "decisions:dispose") != NULL,
+               "403 did not name the missing scope: %s", body_of(&resp));
+
+    /* A body naming an undeclared parameter (`token`, `key_id`) -- dropped,
+     * never forwarded: the request still succeeds exactly as it would
+     * without them, because the gateway's own bearer is what is actually
+     * forwarded as `token`. */
+    {
+        char drop_body[512];
+        (void)snprintf(drop_body, sizeof(drop_body),
+                       "repo=proj&decision=%s&revision=1&intent=reject&token=forged&"
+                       "key_id=forged",
+                       atlas_buf_cstr(&drop_uid));
+        atlas_buf_reset(&resp);
+        post_form(g, "/api/v1/decision/challenge", dispose_bearer, drop_body, &resp);
+        T_CHECK_MSG(status_of(&resp) == 200,
+                   "a body naming undeclared parameters did not still succeed: %d %s",
+                   status_of(&resp), body_of(&resp));
+        T_CHECK_MSG(strstr(body_of(&resp), "forged") == NULL,
+                   "a forged body parameter reached the response: %s", body_of(&resp));
+    }
+
+    /* A malformed percent-escape -> 400. */
+    atlas_buf_reset(&resp);
+    post_form(g, "/api/v1/decision/challenge", dispose_bearer,
+             "repo=proj&decision=%zz&revision=1&intent=reject", &resp);
+    T_CHECK_MSG(status_of(&resp) == 400, "a malformed percent-escape did not answer 400: %d %s",
+               status_of(&resp), body_of(&resp));
+    T_CHECK_MSG(strstr(body_of(&resp), "a body parameter is malformed") != NULL,
+               "400 did not carry its frozen sentence: %s", body_of(&resp));
+
+    /* A raw NUL byte inside the body -> 400. Without the explicit check,
+     * `build_api_params`'s `strlen`-based read would see only
+     * `repo=proj&decision=x` -- still 400, but for a *different* reason
+     * (`"decision" is not a decision id`, the daemon's own refusal of a
+     * malformed uid): the discriminator is the sentence, not the status. */
+    {
+        char nulbody[64];
+        size_t n = 0;
+        memcpy(nulbody + n, "repo=proj&decision=x", 20);
+        n += 20;
+        nulbody[n++] = '\0';
+        memcpy(nulbody + n, "&revision=1&intent=reject", 25);
+        n += 25;
+        atlas_buf_reset(&resp);
+        http_request2(g, "POST", "/api/v1/decision/challenge", dispose_bearer, NULL, NULL, NULL,
+                     nulbody, n, &resp);
+        T_CHECK_MSG(status_of(&resp) == 400, "a body with an embedded NUL did not answer 400: %d %s",
+                   status_of(&resp), body_of(&resp));
+        T_CHECK_MSG(strstr(body_of(&resp), "a body parameter is malformed") != NULL,
+                   "400 did not carry its frozen sentence: %s", body_of(&resp));
+    }
+
+    atlas_gateway_close(g);
+    fx_daemon_stop(&d, false);
+    fx_daemon_free(&d);
+    atlas_buf_free(&resp);
+    atlas_buf_free(&ptext);
+    atlas_buf_free(&ppath);
+    atlas_buf_free(&refusal_uid);
+    atlas_buf_free(&drop_uid);
+    env_close(&e);
+}
+
+/* --- (c): the write path's own CORS treatment ------------------------------- */
+
+static void test_i_cors_preflight_on_the_write_path(void) {
+    env e;
+    env_open(&e);
+    atlas_err err;
+    atlas_err_init(&err);
+
+    atlas_buf ptext = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_appendf(&ptext, &err,
+                           "enabled = yes\ngateway_uid = %lld\nremote_mcp = yes\n"
+                           "web_gui = yes\ntls_mode = REVERSE_PROXY\nremote_dispose_key = "
+                           "key_%s\nremote_dispose_kinds = OPERATIONAL_FACT\n"
+                           "allowed_origin = https://good.example\n",
+                           (long long)getuid(), e.dispose_id),
+         &err);
+    atlas_buf ppath = ATLAS_BUF_INIT;
+    write_policy(&e, "i.conf", atlas_buf_cstr(&ptext), &ppath);
+
+    fx_daemon d;
+    fx_daemon_init(&d);
+    T_OK(gwd_start(&e, atlas_buf_cstr(&ppath), &d, &err), &err);
+    T_OK(fx_daemon_wait_ready(&d, 15000, &err), &err);
+
+    atlas_gateway *g = NULL;
+    open_http_gateway(atlas_buf_cstr(&ptext), &d, &g);
+    atlas_buf_free(&ptext);
+
+    /* An unlisted origin's preflight -> 403, `gateway.c:1351-1366`'s existing,
+     * unchanged code -- this is the shared OPTIONS handler asked once for a
+     * write path, not a second implementation. */
+    atlas_buf resp = ATLAS_BUF_INIT;
+    http_request2(g, "OPTIONS", "/api/v1/decision/dispose", NULL, NULL,
+                 "https://evil.example", NULL, NULL, (size_t)-1, &resp);
+    T_CHECK_MSG(status_of(&resp) == 403, "an unlisted origin's preflight did not answer 403: %d %s",
+               status_of(&resp), body_of(&resp));
+
+    /* A listed origin's preflight succeeds. */
+    atlas_buf_reset(&resp);
+    http_request2(g, "OPTIONS", "/api/v1/decision/dispose", NULL, NULL,
+                 "https://good.example", NULL, NULL, (size_t)-1, &resp);
+    T_CHECK_MSG(status_of(&resp) == 204, "a listed origin's preflight did not answer 204: %d %s",
+               status_of(&resp), body_of(&resp));
+
+    /* And the real request, from that same listed origin, still needs the
+     * bearer -- no `Origin` check was added to the write handler, on
+     * purpose: the CSRF defence is the bearer header, not `Origin`. */
+    atlas_buf_reset(&resp);
+    http_request2(g, "POST", "/api/v1/decision/dispose", NULL, NULL, "https://good.example",
+                 "application/x-www-form-urlencoded", "repo=proj&decision=x&intent=reject",
+                 (size_t)-1, &resp);
+    T_CHECK_MSG(status_of(&resp) == 401,
+               "a listed origin with no bearer still answered %d: %s", status_of(&resp),
+               body_of(&resp));
+
+    atlas_gateway_close(g);
+    fx_daemon_stop(&d, false);
+    fx_daemon_free(&d);
+    atlas_buf_free(&resp);
+    atlas_buf_free(&ppath);
+    env_close(&e);
+}
+
+/* --- (d): /auth/me's remote_disposal and cleartext_disposal ----------------- */
+
+static void test_j_auth_me_fields(void) {
+    env e;
+    env_open(&e);
+    atlas_err err;
+    atlas_err_init(&err);
+
+    /* Instance 1: a keyed policy, TLS in front, no cleartext acceptance --
+     * remote_disposal true, cleartext_disposal false. */
+    {
+        atlas_buf ptext = ATLAS_BUF_INIT;
+        T_OK(atlas_buf_appendf(&ptext, &err,
+                               "enabled = yes\ngateway_uid = %lld\nremote_mcp = yes\n"
+                               "web_gui = yes\ntls_mode = REVERSE_PROXY\nremote_dispose_key = "
+                               "key_%s\nremote_dispose_kinds = OPERATIONAL_FACT\n",
+                               (long long)getuid(), e.dispose_id),
+             &err);
+        atlas_buf ppath = ATLAS_BUF_INIT;
+        write_policy(&e, "j1.conf", atlas_buf_cstr(&ptext), &ppath);
+
+        fx_daemon d;
+        fx_daemon_init(&d);
+        T_OK(gwd_start(&e, atlas_buf_cstr(&ppath), &d, &err), &err);
+        T_OK(fx_daemon_wait_ready(&d, 15000, &err), &err);
+        atlas_gateway *g = NULL;
+        open_http_gateway(atlas_buf_cstr(&ptext), &d, &g);
+
+        char cookie[128];
+        login_and_get_cookie(g, e.reader_token, cookie, sizeof(cookie));
+
+        atlas_buf resp = ATLAS_BUF_INIT;
+        http_request2(g, "GET", "/auth/me", NULL, cookie, NULL, NULL, NULL, (size_t)-1, &resp);
+        T_CHECK_MSG(status_of(&resp) == 200, "/auth/me did not answer 200: %d %s",
+                   status_of(&resp), body_of(&resp));
+        T_CHECK_MSG(strstr(body_of(&resp), "\"remote_disposal\":true") != NULL,
+                   "remote_disposal was not true under a keyed policy: %s", body_of(&resp));
+        T_CHECK_MSG(strstr(body_of(&resp), "\"cleartext_disposal\":false") != NULL,
+                   "cleartext_disposal was not false under a REVERSE_PROXY policy: %s",
+                   body_of(&resp));
+
+        atlas_gateway_close(g);
+        fx_daemon_stop(&d, false);
+        fx_daemon_free(&d);
+        atlas_buf_free(&resp);
+        atlas_buf_free(&ptext);
+        atlas_buf_free(&ppath);
+    }
+
+    /* Instance 2: no disposal keys at all -- "gui_env" -- remote_disposal
+     * false. */
+    {
+        atlas_buf ptext = ATLAS_BUF_INIT;
+        T_OK(atlas_buf_appendf(&ptext, &err,
+                               "enabled = yes\ngateway_uid = %lld\nremote_mcp = yes\n"
+                               "web_gui = yes\ntls_mode = REVERSE_PROXY\n",
+                               (long long)getuid()),
+             &err);
+        atlas_buf ppath = ATLAS_BUF_INIT;
+        write_policy(&e, "j2.conf", atlas_buf_cstr(&ptext), &ppath);
+
+        fx_daemon d;
+        fx_daemon_init(&d);
+        T_OK(gwd_start(&e, atlas_buf_cstr(&ppath), &d, &err), &err);
+        T_OK(fx_daemon_wait_ready(&d, 15000, &err), &err);
+        atlas_gateway *g = NULL;
+        open_http_gateway(atlas_buf_cstr(&ptext), &d, &g);
+
+        char cookie[128];
+        login_and_get_cookie(g, e.reader_token, cookie, sizeof(cookie));
+
+        atlas_buf resp = ATLAS_BUF_INIT;
+        http_request2(g, "GET", "/auth/me", NULL, cookie, NULL, NULL, NULL, (size_t)-1, &resp);
+        T_CHECK_MSG(status_of(&resp) == 200, "/auth/me did not answer 200: %d %s",
+                   status_of(&resp), body_of(&resp));
+        T_CHECK_MSG(strstr(body_of(&resp), "\"remote_disposal\":false") != NULL,
+                   "remote_disposal was not false under a keyless policy: %s", body_of(&resp));
+
+        atlas_gateway_close(g);
+        fx_daemon_stop(&d, false);
+        fx_daemon_free(&d);
+        atlas_buf_free(&resp);
+        atlas_buf_free(&ptext);
+        atlas_buf_free(&ppath);
+    }
+
+    /* Instance 3: a keyed policy carrying the cleartext acceptance --
+     * cleartext_disposal true. */
+    {
+        atlas_buf ptext = ATLAS_BUF_INIT;
+        T_OK(atlas_buf_appendf(&ptext, &err,
+                               "enabled = yes\ngateway_uid = %lld\nremote_mcp = yes\n"
+                               "web_gui = yes\ntls_mode = NONE\nremote_dispose_key = key_%s\n"
+                               "remote_dispose_kinds = OPERATIONAL_FACT\n"
+                               "operator_accepts_cleartext_disposal = yes\n",
+                               (long long)getuid(), e.dispose_id),
+             &err);
+        atlas_buf ppath = ATLAS_BUF_INIT;
+        write_policy(&e, "j3.conf", atlas_buf_cstr(&ptext), &ppath);
+
+        fx_daemon d;
+        fx_daemon_init(&d);
+        T_OK(gwd_start(&e, atlas_buf_cstr(&ppath), &d, &err), &err);
+        T_OK(fx_daemon_wait_ready(&d, 15000, &err), &err);
+        atlas_gateway *g = NULL;
+        open_http_gateway(atlas_buf_cstr(&ptext), &d, &g);
+
+        char cookie[128];
+        login_and_get_cookie(g, e.reader_token, cookie, sizeof(cookie));
+
+        atlas_buf resp = ATLAS_BUF_INIT;
+        http_request2(g, "GET", "/auth/me", NULL, cookie, NULL, NULL, NULL, (size_t)-1, &resp);
+        T_CHECK_MSG(status_of(&resp) == 200, "/auth/me did not answer 200: %d %s",
+                   status_of(&resp), body_of(&resp));
+        T_CHECK_MSG(strstr(body_of(&resp), "\"cleartext_disposal\":true") != NULL,
+                   "cleartext_disposal was not true under an accepted-cleartext policy: %s",
+                   body_of(&resp));
+
+        atlas_gateway_close(g);
+        fx_daemon_stop(&d, false);
+        fx_daemon_free(&d);
+        atlas_buf_free(&resp);
+        atlas_buf_free(&ptext);
+        atlas_buf_free(&ppath);
+    }
+
+    env_close(&e);
+}
+
+/* --- (e): the disposal key over /mcp reaches no write tool ------------------ */
+
+static void test_k_disposal_key_over_mcp_reaches_no_write_tool(void) {
+    env e;
+    env_open(&e);
+    atlas_err err;
+    atlas_err_init(&err);
+
+    atlas_buf ptext = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_appendf(&ptext, &err,
+                           "enabled = yes\ngateway_uid = %lld\nremote_mcp = yes\n"
+                           "web_gui = yes\ntls_mode = REVERSE_PROXY\nremote_dispose_key = "
+                           "key_%s\nremote_dispose_kinds = OPERATIONAL_FACT\n",
+                           (long long)getuid(), e.dispose_id),
+         &err);
+    atlas_buf ppath = ATLAS_BUF_INIT;
+    write_policy(&e, "k.conf", atlas_buf_cstr(&ptext), &ppath);
+
+    fx_daemon d;
+    fx_daemon_init(&d);
+    T_OK(gwd_start(&e, atlas_buf_cstr(&ppath), &d, &err), &err);
+    T_OK(fx_daemon_wait_ready(&d, 15000, &err), &err);
+
+    atlas_gateway *g = NULL;
+    open_http_gateway(atlas_buf_cstr(&ptext), &d, &g);
+    atlas_buf_free(&ptext);
+
+    char bearer[128];
+    (void)snprintf(bearer, sizeof(bearer), "Bearer %s", e.dispose_token);
+
+    atlas_buf resp = ATLAS_BUF_INIT;
+    http_request2(g, "POST", "/mcp", bearer, NULL, NULL, "application/json",
+                 "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}",
+                 (size_t)-1, &resp);
+    T_CHECK_MSG(status_of(&resp) == 200, "tools/list did not answer 200: %d %s",
+               status_of(&resp), body_of(&resp));
+    T_CHECK_MSG(strstr(body_of(&resp), "\"tools\":[]") != NULL,
+               "the disposal key's tool listing is not empty: %s", body_of(&resp));
+
+    /* `test_the_gateway_holds_no_credential_administration_verb`'s shape:
+     * every name a decision-lifecycle tool would plausibly have, none of
+     * which exists for this credential either -- `decisions:dispose` maps to
+     * no tool at all. */
+    static const char *const NAMES[] = {
+        "atlas_decision_approve", "atlas_approve_decision", "atlas_decision_dispose",
+        "atlas_dispose",         "atlas_review_apply",     "atlas_decision_reject",
+        "atlas_decision_resolve", "atlas_remote_dispose",   "decision.remote_dispose",
+        "decision.remote_challenge",
+    };
+    for (size_t i = 0; i < sizeof(NAMES) / sizeof(NAMES[0]); i++) {
+        char msg[512];
+        (void)snprintf(msg, sizeof(msg),
+                       "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":"
+                       "{\"name\":\"%s\",\"arguments\":{}}}",
+                       NAMES[i]);
+        atlas_buf_reset(&resp);
+        http_request2(g, "POST", "/mcp", bearer, NULL, NULL, "application/json", msg, (size_t)-1,
+                     &resp);
+        T_CHECK_MSG(status_of(&resp) == 200, "%s call did not answer 200: %d %s", NAMES[i],
+                   status_of(&resp), body_of(&resp));
+        T_CHECK_MSG(strstr(body_of(&resp), "unknown tool") != NULL,
+                   "\"%s\" was not answered as an unknown tool: %s", NAMES[i], body_of(&resp));
+    }
+
+    atlas_gateway_close(g);
+    fx_daemon_stop(&d, false);
+    fx_daemon_free(&d);
+    atlas_buf_free(&resp);
+    atlas_buf_free(&ppath);
+    env_close(&e);
+}
+
 static const atlas_test TESTS[] = {
     {"gateway.auth derives decisions:dispose for exactly the named credential",
      test_a_gateway_auth_scope_derivation},
@@ -985,6 +1734,13 @@ static const atlas_test TESTS[] = {
     {"the write point's frozen refusals, reached through the daemon", test_e_refusals},
     {"a policy MALFORMED for an unrelated reason never offers the group",
      test_f_disposal_offered_requires_state_enabled},
+    {"the HTTP happy path, and what it leaves in the audit trail",
+     test_g_http_happy_path_and_audit},
+    {"every HTTP refusal, with its frozen sentence and status", test_h_http_refusals},
+    {"the write path's own CORS treatment", test_i_cors_preflight_on_the_write_path},
+    {"/auth/me's remote_disposal and cleartext_disposal", test_j_auth_me_fields},
+    {"the disposal key over /mcp reaches no write tool",
+     test_k_disposal_key_over_mcp_reaches_no_write_tool},
 };
 
 ATLAS_TEST_MAIN("gw_dispose", TESTS)

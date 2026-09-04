@@ -1029,6 +1029,28 @@ static const api_route API_ROUTES[] = {
      {"limit", "cursor", "key_id", NULL}, {"limit", "cursor", NULL}},
 };
 
+/* Every route is a disposal. There is no read in this table, and adding a row
+ * means adding its method to `WRITE_METHODS[]` in `tests/test_gateway.c` by
+ * hand.
+ *
+ * Every row needs `ATLAS_SCOPE_DECISIONS_DISPOSE`, and that scope is not
+ * grantable to an ordinary credential (`atlas_apikey_scope_grantable`):
+ * `atlas_db_apikey_insert` refuses to store it, and the daemon derives it, at
+ * `gateway.auth` time, for exactly the credential the root-owned gateway
+ * policy names as `remote_dispose_key` — never for anything a client can mint
+ * or ask for.
+ *
+ * `token` is not a declared parameter of either row: it is never read from
+ * the request body, and `api_handle_write` appends it itself, from the
+ * `Authorization` header, after this table's parsing has already dropped
+ * anything a body tried to name for itself. */
+static const api_route API_WRITE_ROUTES[] = {
+    {"/api/v1/decision/challenge", "decision.remote_challenge", ATLAS_SCOPE_DECISIONS_DISPOSE,
+     {"repo", "decision", "revision", "intent", NULL}, {"revision", NULL}},
+    {"/api/v1/decision/dispose", "decision.remote_dispose", ATLAS_SCOPE_DECISIONS_DISPOSE,
+     {"repo", "decision", "intent", "challenge", "confirmation", NULL}, {NULL}},
+};
+
 static bool route_wants(const api_route *r, const char *name, bool *is_int) {
     *is_int = false;
     bool found = false;
@@ -1101,13 +1123,25 @@ static bool percent_decode(const char *in, size_t len, char *out, size_t out_siz
     return true;
 }
 
-/* Builds the daemon params for one route from the request's query string.
+/* Builds the daemon params for one route from a `name=value&...` string —
+ * a GET route's query string, or a write route's form body, which is the same
+ * grammar.
  *
- * Only names the route declares are read. Everything else in the query string
- * is ignored rather than forwarded, so a client cannot add a parameter to a
- * daemon call by adding one to a URL. */
-static atlas_status build_api_params(const api_route *r, const char *query, atlas_buf *out,
-                                     atlas_err *err) {
+ * Only names the route declares are read. Everything else is ignored rather
+ * than forwarded, so a client cannot add a parameter to a daemon call by
+ * adding one to a URL or a form field — a body naming `token` or `key_id`,
+ * neither of which any write route declares, is dropped exactly like an
+ * unrecognised query parameter.
+ *
+ * `extra_key`/`extra_value`, when `extra_key` is not NULL, are appended after
+ * every declared field and before the object closes — the one write path this
+ * function has, for the write routes' bearer token. It is never a name a
+ * client's own input could reach: appended after the loop above already
+ * dropped anything the request tried to name for itself, so a request field
+ * of the same name never collides with it and is never the value that
+ * reaches the daemon. */
+static atlas_status build_api_params(const api_route *r, const char *query, const char *extra_key,
+                                     const char *extra_value, atlas_buf *out, atlas_err *err) {
     atlas_ipc_params *p = NULL;
     atlas_json *j = NULL;
     atlas_status st = atlas_ipc_params_begin(&p, &j, err);
@@ -1169,12 +1203,49 @@ static atlas_status build_api_params(const api_route *r, const char *query, atla
             st = atlas_json_key_str(j, name, value, err);
         }
     }
+    if (st == ATLAS_OK && extra_key != NULL) {
+        st = atlas_json_key_str(j, extra_key, extra_value, err);
+    }
     if (st == ATLAS_OK) {
         st = atlas_ipc_params_finish(p, out, err);
     } else {
         atlas_ipc_params_abort(p);
     }
     return st;
+}
+
+/* Atlas' status vocabulary mapped onto HTTP, so a caller does not have to read
+ * the body to know what happened. One function, used by every route through
+ * this gateway — read or write — because a second mapping table is a place
+ * for the two to disagree, which is exactly what T3's review found: two
+ * frozen refusal sentences carried `ATLAS_ERR_INTEGRITY` at the write point
+ * and reached the gateway through this switch, landing on 500.
+ *
+ * `ATLAS_ERR_INTEGRITY` maps to 409, not 500 (amended 2026-09-04, globally
+ * rather than per route). It means *the state you acted on is not the state
+ * that is there* — a challenge already spent, a revision that moved since it
+ * was minted, a credential that is not the one a row names, a policy that has
+ * narrowed since a capability was minted under it — and that is what 409
+ * means, not what 500 means. The routine case is an operator reading a
+ * record while a colleague revises it: under the old mapping, `this decision
+ * gained revision N after the challenge was minted; nothing was changed --
+ * read it again` arrived in a browser as `500 Internal Server Error`, a
+ * sentence that says Atlas broke and sends an operator hunting a bug that
+ * does not exist. A per-route exception was considered and rejected: one
+ * status table is the shape this gateway has. */
+static int gw_daemon_status_to_http(atlas_status s) {
+    int status = 500;
+    switch (s) {
+    case ATLAS_ERR_USAGE: status = 400; break;
+    case ATLAS_ERR_REPO: status = 404; break;
+    case ATLAS_ERR_CONFIG: status = 503; break;
+    case ATLAS_ERR_INTEGRITY: status = 409; break;
+    case ATLAS_OK:
+    case ATLAS_ERR_INTERNAL:
+    case ATLAS_ERR_DB:
+    case ATLAS_ERR_GIT: status = 500; break;
+    }
+    return status;
 }
 
 /* Handles one API request. Returns false when the path names no route. */
@@ -1228,7 +1299,7 @@ static bool api_handle(atlas_gateway *g, const atlas_http_request *req, const pr
     atlas_buf params = ATLAS_BUF_INIT;
     atlas_err perr;
     atlas_err_init(&perr);
-    if (build_api_params(route, req->query, &params, &perr) != ATLAS_OK) {
+    if (build_api_params(route, req->query, NULL, NULL, &params, &perr) != ATLAS_OK) {
         *st_out = respond_error(g, req, 400, "bad_request", "a query parameter is malformed",
                                 response, err);
         atlas_buf_free(&params);
@@ -1267,23 +1338,230 @@ static bool api_handle(atlas_gateway *g, const atlas_http_request *req, const pr
     int status = 200;
     if (atlas_ipc_response_parse(resp.data, resp.len, &r, &rerr) == ATLAS_OK &&
         !atlas_ipc_response_ok(r)) {
-        /* Atlas' status vocabulary mapped onto HTTP, so a caller does not have
-         * to read the body to know what happened. */
-        switch (atlas_ipc_response_status(r)) {
-        case ATLAS_ERR_USAGE: status = 400; break;
-        case ATLAS_ERR_REPO: status = 404; break;
-        case ATLAS_ERR_CONFIG: status = 503; break;
-        case ATLAS_OK:
-        case ATLAS_ERR_INTERNAL:
-        case ATLAS_ERR_DB:
-        case ATLAS_ERR_GIT:
-        case ATLAS_ERR_INTEGRITY: status = 500; break;
-        }
+        status = gw_daemon_status_to_http(atlas_ipc_response_status(r));
     }
     atlas_ipc_response_free(r);
 
     *st_out = respond(g, req, status, "application/json", resp.data, resp.len, NULL, response, err);
     audit(g, "WEB_API", pr, req->path, true, status == 200, status == 200 ? 0 : ATLAS_ERR_INTERNAL,
+          now_ms() - started, NULL);
+    atlas_buf_free(&resp);
+    return true;
+}
+
+/* A16. Handles one write-route request. Returns false when the path names no
+ * write route.
+ *
+ * The order below is frozen (§Frozen formats, "The gateway's write table")
+ * and none of it may move: path match, method, `Content-Type`, body length,
+ * policy readiness, the bearer credential, the scope, the body's fields, the
+ * daemon call, the status mapping, the audit row.
+ *
+ * For reads, `api_handle` above is handed a principal `atlas_gateway_serve_bytes`
+ * already resolved from a session cookie, a bearer token or the policy's
+ * anonymous floor -- whichever produced one first, in that order -- because a
+ * read is exactly what the browser's own session and the operator's floor
+ * grant are for. This function resolves its own, from `authenticate()` and
+ * the `Authorization` header alone, and calls neither `session_get` nor
+ * `anonymous_ok`: a session cookie is a browser convenience for reading, and
+ * the anonymous floor is a grant an operator wrote down for reading, and
+ * disposing of a knowledge record is not reading. A floor or a cookie
+ * reaching this function would make "the bearer is the only disposal
+ * credential" false the first time an operator's browser held both a live
+ * session and an open tab on an attacker's page — so the two resolutions stay
+ * two functions rather than one that a future change to either could weaken
+ * for both.
+ *
+ * There is deliberately no `Origin` check here. A browser sends `Origin` on
+ * a same-origin `POST` too, and this deployment lists no allowed origin
+ * (`atlas_http_origin_allowed`'s only two consumers are `respond`, which
+ * *adds* the CORS headers for a listed origin, and the `OPTIONS` preflight —
+ * neither refuses a request), so a check against the list here would refuse
+ * the page's own request under the deployment this season was built for.
+ * The write routes' CSRF defence is the bearer header itself: a page cannot
+ * read or forge one, unlike a cookie a browser attaches automatically. */
+static bool api_handle_write(atlas_gateway *g, const atlas_http_request *req, const char *body,
+                             size_t body_len, int64_t started, atlas_buf *response,
+                             atlas_status *st_out, atlas_err *err) {
+    const api_route *route = NULL;
+    for (size_t i = 0; i < sizeof API_WRITE_ROUTES / sizeof API_WRITE_ROUTES[0]; i++) {
+        if (strcmp(API_WRITE_ROUTES[i].path, req->path) == 0) {
+            route = &API_WRITE_ROUTES[i];
+            break;
+        }
+    }
+    if (route == NULL) {
+        return false;
+    }
+    if (strcmp(req->method, "POST") != 0) {
+        *st_out = respond_error(g, req, 405, "method_not_allowed", "this endpoint takes a POST",
+                                response, err);
+        return true;
+    }
+    /* Exact match, no charset suffix accepted: the frozen request shape names
+     * this literal and nothing else, and a disposal body is never anything
+     * richer than form fields. */
+    if (strcmp(req->content_type, "application/x-www-form-urlencoded") != 0) {
+        *st_out = respond_error(g, req, 415, "unsupported_media_type",
+                                "a disposal request is application/x-www-form-urlencoded",
+                                response, err);
+        return true;
+    }
+    /* A tighter ceiling than the gateway's ordinary `ATLAS_GW_MAX_BODY_BYTES`
+     * — a disposal body is five short fields, never a document. */
+    if (body_len > ATLAS_GW_WRITE_BODY_MAX_BYTES) {
+        *st_out = respond_error(g, req, 413, "request_too_large",
+                                "the request body exceeds the gateway limit", response, err);
+        return true;
+    }
+    if (g->policy.remote_dispose_key[0] == '\0') {
+        *st_out = respond_error(g, req, 404, "not_found",
+                                "this gateway does not serve remote disposal", response, err);
+        return true;
+    }
+
+    principal pr;
+    authenticate(g, req, &pr);
+    if (!pr.authenticated) {
+        static const char UNAUTH[] =
+            "{\"ok\":false,\"error\":{\"code\":\"unauthenticated\","
+            "\"message\":\"a disposal needs the disposal credential presented as a bearer "
+            "token; a session cookie or the anonymous floor cannot dispose\"}}";
+        *st_out = respond(g, req, 401, "application/json", UNAUTH, sizeof UNAUTH - 1u,
+                          "WWW-Authenticate: Bearer\r\n", response, err);
+        {
+            char detail[128];
+            audit(g, "WEB_API", NULL, req->path, false, false, ATLAS_ERR_INTEGRITY,
+                  now_ms() - started, auth_detail(&pr, detail, sizeof detail));
+        }
+        return true;
+    }
+    if (!atlas_scope_has(pr.scopes, route->scope)) {
+        const char *needed = atlas_apikey_scope_name(route->scope);
+        atlas_buf msg = ATLAS_BUF_INIT;
+        atlas_err merr;
+        atlas_err_init(&merr);
+        (void)atlas_buf_appendf(&msg, &merr, "this credential does not hold the \"%s\" scope",
+                                needed != NULL ? needed : "required");
+        *st_out = respond_error(g, req, 403, "forbidden", atlas_buf_cstr(&msg), response, err);
+        atlas_buf_free(&msg);
+        audit(g, "WEB_API", &pr, req->path, false, false, ATLAS_ERR_INTEGRITY, now_ms() - started,
+              "the credential lacks the required scope");
+        return true;
+    }
+
+    /* The bearer token, decoded a second time, for forwarding.
+     *
+     * `authenticate()` above already required a well-formed one to reach
+     * `pr.authenticated`, so this cannot fail in practice -- checked anyway
+     * rather than assumed. `authenticate()` wipes its own copy the moment it
+     * has been handed to `gateway.auth`, by design: that function exists to
+     * ask whether the credential is real, never to hand the plaintext back to
+     * a caller. This is the one call site that must forward it, so it is the
+     * one call site that keeps a second copy alive, wiped the moment it has
+     * been copied into `params` below. */
+    char bearer[ATLAS_APIKEY_TOKEN_MAX];
+    atlas_err bperr;
+    atlas_err_init(&bperr);
+    if (atlas_apikey_bearer_parse(req->authorization, bearer, sizeof bearer, &bperr) != ATLAS_OK) {
+        *st_out = respond_error(g, req, 401, "unauthenticated",
+                                "a disposal needs the disposal credential presented as a bearer "
+                                "token; a session cookie or the anonymous floor cannot dispose",
+                                response, err);
+        audit(g, "WEB_API", &pr, req->path, false, false, ATLAS_ERR_INTEGRITY, now_ms() - started,
+              "the presented credential could not be re-read for forwarding");
+        return true;
+    }
+
+    /* A raw NUL byte inside the body is refused rather than silently
+     * repaired: `build_api_params` was written for `req->query`, a field
+     * `atlas_http_parse_head` already validated, and reads it with `strlen`.
+     * Fed a body `repo=proj\0&decision=...` unchecked, it would read
+     * "repo=proj" and quietly drop everything after the byte -- a truncation,
+     * not a refusal, of exactly the kind this season's rule forbids. */
+    if (memchr(body, '\0', body_len) != NULL) {
+        *st_out = respond_error(g, req, 400, "bad_request", "a body parameter is malformed",
+                                response, err);
+        memset(bearer, 0, sizeof bearer);
+        audit(g, "WEB_API", &pr, req->path, true, false, ATLAS_ERR_USAGE, now_ms() - started,
+              "the body contained a NUL byte");
+        return true;
+    }
+
+    /* NUL-terminated so `build_api_params` -- written for a query string --
+     * can read it unchanged; bounded by the body-length check above. */
+    char body_cstr[ATLAS_GW_WRITE_BODY_MAX_BYTES + 1u];
+    memcpy(body_cstr, body, body_len);
+    body_cstr[body_len] = '\0';
+
+    atlas_buf params = ATLAS_BUF_INIT;
+    atlas_err perr;
+    atlas_err_init(&perr);
+    atlas_status pst = build_api_params(route, body_cstr, "token", bearer, &params, &perr);
+    memset(bearer, 0, sizeof bearer);
+    if (pst != ATLAS_OK) {
+        *st_out = respond_error(g, req, 400, "bad_request", "a body parameter is malformed",
+                                response, err);
+        atlas_buf_free(&params);
+        audit(g, "WEB_API", &pr, req->path, true, false, ATLAS_ERR_USAGE, now_ms() - started,
+              "a body parameter was malformed");
+        return true;
+    }
+
+    atlas_buf resp = ATLAS_BUF_INIT;
+    atlas_err cerr;
+    atlas_err_init(&cerr);
+    atlas_status cst = atlas_ipc_call_timeout(atlas_buf_cstr(&g->socket), route->method,
+                                              atlas_buf_cstr(&params), g->timeout_ms, &resp, &cerr);
+    /* Wiped rather than merely freed: it carries the bearer token, exactly as
+     * `authenticate()`'s own `params` is wiped after its call. */
+    if (params.data != NULL) {
+        volatile unsigned char *q = (volatile unsigned char *)params.data;
+        for (size_t i = 0; i < params.len; i++) {
+            q[i] = 0;
+        }
+    }
+    atlas_buf_free(&params);
+
+    if (cst != ATLAS_OK) {
+        atlas_safe_pool safe;
+        atlas_safe_pool_init(&safe);
+        gw_log(g, "the daemon did not answer %s: %s", route->method,
+               atlas_safe(&safe, atlas_err_msg(&cerr)));
+        atlas_safe_pool_free(&safe);
+        *st_out = respond_error(g, req, 502, "upstream", "the Atlas daemon did not answer",
+                                response, err);
+        audit(g, "WEB_API", &pr, req->path, true, false, cst, now_ms() - started,
+              "the daemon did not answer");
+        atlas_buf_free(&resp);
+        return true;
+    }
+
+    /* The daemon's own document, unchanged -- exactly `api_handle`'s own rule
+     * and for the same reason: every value in it was already safe-encoded by
+     * the daemon, so re-serialising here would either double-encode it or
+     * need a second renderer that could drift from the first. */
+    atlas_ipc_response *r = NULL;
+    atlas_err rerr;
+    atlas_err_init(&rerr);
+    int status = 200;
+    /* Captured before `r` is freed, and carried into the audit row below
+     * rather than a fixed `ATLAS_ERR_INTERNAL` -- the read path's own
+     * shortcut, which the amendment this season adds a 409 for makes wrong
+     * in the case that matters most: a spent challenge or a moved revision
+     * is `ATLAS_ERR_INTEGRITY`, and an audit row is the row that has to say
+     * what happened, not a fixed class that reads as "Atlas broke" for
+     * every daemon refusal alike. */
+    atlas_status daemon_status = ATLAS_OK;
+    if (atlas_ipc_response_parse(resp.data, resp.len, &r, &rerr) == ATLAS_OK &&
+        !atlas_ipc_response_ok(r)) {
+        daemon_status = atlas_ipc_response_status(r);
+        status = gw_daemon_status_to_http(daemon_status);
+    }
+    atlas_ipc_response_free(r);
+
+    *st_out = respond(g, req, status, "application/json", resp.data, resp.len, NULL, response, err);
+    audit(g, "WEB_API", &pr, req->path, true, status == 200, status == 200 ? 0 : (int)daemon_status,
           now_ms() - started, NULL);
     atlas_buf_free(&resp);
     return true;
@@ -1305,6 +1583,27 @@ const atlas_gateway_route_view *atlas_gateway_api_routes(size_t *count_out) {
             views[i].path = API_ROUTES[i].path;
             views[i].method = API_ROUTES[i].method;
             views[i].scope = API_ROUTES[i].scope;
+        }
+        populated = true;
+    }
+    if (count_out != NULL) {
+        *count_out = n;
+    }
+    return views;
+}
+
+/* A16. The same shape, over `API_WRITE_ROUTES[]`. Nothing in the gateway
+ * calls it either; it exists for `test_every_write_route_is_a_disposal_on_
+ * the_reviewed_allowlist`. */
+const atlas_gateway_route_view *atlas_gateway_api_write_routes(size_t *count_out) {
+    static const size_t n = sizeof API_WRITE_ROUTES / sizeof API_WRITE_ROUTES[0];
+    static atlas_gateway_route_view views[sizeof API_WRITE_ROUTES / sizeof API_WRITE_ROUTES[0]];
+    static bool populated = false;
+    if (!populated) {
+        for (size_t i = 0; i < n; i++) {
+            views[i].path = API_WRITE_ROUTES[i].path;
+            views[i].method = API_WRITE_ROUTES[i].method;
+            views[i].scope = API_WRITE_ROUTES[i].scope;
         }
         populated = true;
     }
@@ -1559,10 +1858,24 @@ atlas_status atlas_gateway_serve_bytes(atlas_gateway *g, const char *request, si
                 atlas_buf body = ATLAS_BUF_INIT;
                 atlas_err berr;
                 atlas_err_init(&berr);
+                /* A16. `remote_disposal` is whether this gateway's policy
+                 * names a disposal key at all — the same test
+                 * `api_handle_write` itself refuses on with 404 — and
+                 * `cleartext_disposal` is whether the operator's written
+                 * acceptance is present, so the browser can show its own
+                 * cleartext-chain sentence rather than guess from `tls_mode`.
+                 * Neither depends on `pr`: both are properties of the
+                 * policy, true or false for every principal alike, which is
+                 * why they are unconditional on `anon` and computed the same
+                 * way `api_handle_write` itself decides. */
                 (void)atlas_buf_appendf(
                     &body, &berr,
-                    "{\"ok\":true,\"anonymous\":%s,\"label\":\"%s\",\"scopes\":\"%s\"}",
-                    anon ? "true" : "false", pr.label, atlas_buf_cstr(&scopes));
+                    "{\"ok\":true,\"anonymous\":%s,\"remote_disposal\":%s,\"cleartext_disposal\":%s,"
+                    "\"label\":\"%s\",\"scopes\":\"%s\"}",
+                    anon ? "true" : "false",
+                    g->policy.remote_dispose_key[0] != '\0' ? "true" : "false",
+                    g->policy.cleartext_disposal_accepted ? "true" : "false", pr.label,
+                    atlas_buf_cstr(&scopes));
                 st = respond(g, &req, 200, "application/json", body.data, body.len, NULL, response,
                              err);
                 atlas_buf_free(&body);
@@ -1592,9 +1905,26 @@ atlas_status atlas_gateway_serve_bytes(atlas_gateway *g, const char *request, si
         }
     }
 
-    /* The web API. Authenticated the same way and audited the same way; the
-     * route table is what stops a request naming a daemon method. */
+    /* The web API. Audited the same way throughout; the route table is what
+     * stops a request naming a daemon method.
+     *
+     * The write table is tried first and is its own principal resolution —
+     * `api_handle_write`'s own comment says in its own words that it
+     * resolves one from the bearer header and from nothing else, and why.
+     * What follows below is for reads. */
     if (strncmp(req.path, "/api/", 5u) == 0) {
+        const char *body = request + req.body_offset;
+        size_t blen = len > req.body_offset ? len - req.body_offset : 0;
+        if (req.has_content_length && (size_t)req.content_length < blen) {
+            blen = (size_t)req.content_length;
+        }
+        atlas_status wst = ATLAS_OK;
+        bool write_handled = api_handle_write(g, &req, body, blen, started, response, &wst, err);
+        if (write_handled) {
+            atlas_http_request_free(&req);
+            return wst;
+        }
+
         principal pr;
         /* Either mechanism, one principal. A bearer token is the remote-MCP
          * shape; a session cookie is the browser's. They map to the same

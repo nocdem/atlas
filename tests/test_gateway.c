@@ -773,6 +773,24 @@ static void test_every_response_carries_the_security_headers(void) {
  * itself the method behind the `/api/v1/audit` route, so deriving this one
  * from its table would need an exclusion rather than a plain membership test;
  * two names is not worth that. */
+
+/* Every method API_ROUTES[] forwards to, as of this fix round. Not generated
+ * from the table -- a name missing here is a build-time-visible test failure,
+ * never a silent gap, which is the point. File scope, not local to the test
+ * function below: A16's write-route test reuses it, as the negative half of
+ * its own membership check -- a write route naming one of these would be a
+ * read forwarded through the write table, which the write table's own frozen
+ * shape (every row `decisions:dispose`, nothing else) must never permit. */
+static const char *const READ_METHODS[] = {
+    "daemon.status",    "repo.list",          "repo.state",     "events.since",
+    "repo.search",      "repo.file",          "repo.history",   "decision.list",
+    "decision.get",     "decision.history",   "gate.check",     "code.status",
+    "code.file",        "code.symbol",        "code.search",    "sem.status",
+    "sem.symbol",       "sem.callers",        "sem.callees",    "sem.impact",
+    "code.impact",      "sem.context",        "verify.claims",  "verify.show",
+    "verify.policy",    "gateway.audit_list",
+};
+
 static void test_every_api_route_forwards_to_a_read_on_the_reviewed_allowlist(void) {
     size_t operator_count = 0;
     const atlas_method_entry *operator_methods = atlas_server_operator_methods(&operator_count);
@@ -798,19 +816,6 @@ static void test_every_api_route_forwards_to_a_read_on_the_reviewed_allowlist(vo
 
     static const char *const GATEWAY_ONLY = "gateway.auth";
     static const char *const GATEWAY_AUDIT = "gateway.audit";
-
-    /* Every method API_ROUTES[] forwards to, as of this fix round. Not
-     * generated from the table -- a name missing here is a build-time-visible
-     * test failure, never a silent gap, which is the point. */
-    static const char *const READ_METHODS[] = {
-        "daemon.status",    "repo.list",          "repo.state",     "events.since",
-        "repo.search",      "repo.file",          "repo.history",   "decision.list",
-        "decision.get",     "decision.history",   "gate.check",     "code.status",
-        "code.file",        "code.symbol",        "code.search",    "sem.status",
-        "sem.symbol",       "sem.callers",        "sem.callees",    "sem.impact",
-        "code.impact",      "sem.context",        "verify.claims",  "verify.show",
-        "verify.policy",    "gateway.audit_list",
-    };
 
     size_t route_count = 0;
     const atlas_gateway_route_view *routes = atlas_gateway_api_routes(&route_count);
@@ -864,6 +869,80 @@ static void test_every_api_route_forwards_to_a_read_on_the_reviewed_allowlist(vo
     }
 }
 
+/* A16. The write table's own version of the property test above: every row
+ * forwards to exactly one of the two remote-disposal methods, needs exactly
+ * `ATLAS_SCOPE_DECISIONS_DISPOSE`, and that scope is not grantable to an
+ * ordinary credential -- the whole reason a browser can dispose of a record
+ * at all without a write-capable credential ever existing for anyone to
+ * steal. The count is the loop bound only, on the read test's own precedent:
+ * a table that grows or shrinks by a row must not change whether this test
+ * passes, only the property of each row must. */
+static void test_every_write_route_is_a_disposal_on_the_reviewed_allowlist(void) {
+    size_t operator_count = 0;
+    const atlas_method_entry *operator_methods = atlas_server_operator_methods(&operator_count);
+    T_REQUIRE(operator_methods != NULL || operator_count == 0);
+
+    static const char *const GATEWAY_ONLY = "gateway.auth";
+    static const char *const GATEWAY_AUDIT = "gateway.audit";
+
+    /* The whole write table, by name -- exactly the two methods A16 adds. Not
+     * generated from the table, on `READ_METHODS[]`'s own precedent above: a
+     * third row naming anything else fails loudly here, the moment it is
+     * added. */
+    static const char *const WRITE_METHODS[] = {
+        "decision.remote_challenge",
+        "decision.remote_dispose",
+    };
+
+    size_t route_count = 0;
+    const atlas_gateway_route_view *routes = atlas_gateway_api_write_routes(&route_count);
+    T_REQUIRE(routes != NULL);
+
+    for (size_t i = 0; i < route_count; i++) {
+        const atlas_gateway_route_view *r = &routes[i];
+
+        bool allowed = false;
+        for (size_t j = 0; j < sizeof WRITE_METHODS / sizeof WRITE_METHODS[0]; j++) {
+            if (strcmp(r->method, WRITE_METHODS[j]) == 0) {
+                allowed = true;
+                break;
+            }
+        }
+        T_CHECK_MSG(allowed,
+                    "write route %s forwards to %s, which is not one of the two disposal methods",
+                    r->path, r->method);
+
+        T_CHECK_MSG(r->scope == ATLAS_SCOPE_DECISIONS_DISPOSE,
+                    "write route %s does not need decisions:dispose", r->path);
+        T_CHECK_MSG(!atlas_apikey_scope_grantable(r->scope),
+                    "write route %s's scope is grantable to an ordinary credential", r->path);
+
+        for (size_t j = 0; j < sizeof READ_METHODS / sizeof READ_METHODS[0]; j++) {
+            T_CHECK_MSG(strcmp(r->method, READ_METHODS[j]) != 0,
+                        "write route %s forwards to the read method %s", r->path, r->method);
+        }
+        for (size_t j = 0; j < operator_count; j++) {
+            T_CHECK_MSG(strcmp(r->method, operator_methods[j].name) != 0,
+                        "write route %s forwards to operator method %s", r->path, r->method);
+        }
+        T_CHECK_MSG(strcmp(r->method, GATEWAY_ONLY) != 0, "write route %s forwards to %s", r->path,
+                    GATEWAY_ONLY);
+        T_CHECK_MSG(strcmp(r->method, GATEWAY_AUDIT) != 0, "write route %s forwards to %s", r->path,
+                    GATEWAY_AUDIT);
+    }
+
+    /* The existing read-table test still passes unchanged (it is not touched
+     * by this test at all), and no read row gained the write scope while
+     * this table was added beside it. */
+    size_t read_count = 0;
+    const atlas_gateway_route_view *read_routes = atlas_gateway_api_routes(&read_count);
+    T_REQUIRE(read_routes != NULL);
+    for (size_t i = 0; i < read_count; i++) {
+        T_CHECK_MSG(read_routes[i].scope != ATLAS_SCOPE_DECISIONS_DISPOSE,
+                    "read route %s carries the write scope", read_routes[i].path);
+    }
+}
+
 static const atlas_test TESTS[] = {
     {"a complete policy enables the gateway", test_a_complete_policy_enables_the_gateway},
     {"a zeroed policy authorises nothing", test_a_zeroed_policy_authorises_nothing},
@@ -893,6 +972,8 @@ static const atlas_test TESTS[] = {
      test_every_response_carries_the_security_headers},
     {"every API route forwards to a read on the reviewed allowlist",
      test_every_api_route_forwards_to_a_read_on_the_reviewed_allowlist},
+    {"every write route is a disposal on the reviewed allowlist",
+     test_every_write_route_is_a_disposal_on_the_reviewed_allowlist},
 };
 
 ATLAS_TEST_MAIN("gateway", TESTS)

@@ -681,7 +681,8 @@ compares them against the *stored* hash as the guard, exactly as today.
 `server_decision.c:2295-2330` rather than inside it, so the argument that the operator
 channel is not an ordinary RPC group stays readable as written. `dispatch()` consults
 the group additively, after the gateway group, when
-`atlas_server_remote_disposal_offered(ctx, peer_uid)` — the gateway peer predicate,
+`atlas_server_remote_disposal_offered(ctx, peer_uid)` — `ctx->gwpolicy.state ==
+ATLAS_GWPOLICY_ENABLED` **and** the gateway peer predicate,
 **and** (`ctx->gwpolicy.tls_mode == ATLAS_GWPOLICY_TLS_REVERSE_PROXY` **or**
 `ctx->gwpolicy.cleartext_disposal_accepted` — amended 2026-09-04: one condition
 added, none removed, and the predicate's comment says TLS is the intended shape and
@@ -694,6 +695,19 @@ authorisation. The gateway, holding its own copy of the same policy, answers
 the key is absent — the shape `/mcp` uses when `remote_mcp` is off
 (`gateway.c:1378-1383`) — so an operator debugging the panel gets a sentence and the
 daemon's silence stays the guard.
+
+  **Amended again 2026-09-04, and this is the `state == ENABLED` condition above.**
+  T4's review measured that a MALFORMED policy still carries a usable disposal key:
+  `atlas_gwpolicy_parse_buffer` writes each field as it parses and returns at the
+  refusal without clearing what it already wrote — the file's convention for every
+  key — and `src/daemon/daemon.c` copies the whole struct into the server context for
+  any system deployment, consulting `state` nowhere. A policy Atlas *rejected* would
+  therefore have satisfied all three original conditions. The fix belongs in the
+  predicate rather than in the parser: the predicate is the one function that decides
+  whether the group is offered, and clearing fields at each malformed exit would
+  depart from the parser's convention for every other key. The same shape is already
+  latent at `src/ipc/server_gw.c:354`, which trusts `gateway_uid` from a rejected
+  policy; that one is recorded rather than fixed here.
 
 ### Decision 10 — `gateway.auth` derives the scope; `decisions:dispose` is in the vocabulary with `grantable = false`; and that single bit is what keeps the anonymous floor from ever holding it
 

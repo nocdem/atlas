@@ -547,8 +547,36 @@ that row and no other; and reaffirmed the decision on **2026-09-04**, for that
 machine and that network, having heard the cost. Atlas states this cost; it
 does not recommend the setting, and the same key on a listener reachable from
 an untrusted network is a materially different decision using the same
-mechanism. Full statement: `docs/remote-access.md`, "Anonymous browser reads,
-stated honestly".
+mechanism.
+
+**That sentence — "anyone who can reach the listener" — was briefly narrower
+than the truth.** An adversarial review found, the same day, that a LAN user
+merely *visiting a hostile web page* was sufficient, with no network position
+and no credential: a page served under an attacker's own DNS name, briefly
+rebound to the gateway's address after the browser loaded it, is treated by
+that browser as same-origin with itself — no `Origin` header, no CORS check,
+no session cookie, because none was ever issued to the attacker's name. The
+request presents nothing, which the anonymous floor was built to accept.
+Before the floor existed, the same rebound request still needed a cookie
+belonging to the gateway's own name, so this gap is the floor's own addition.
+
+**The remedy, authorised the same way as the floor itself, on the same day —
+2026-09-04, after being shown the rebinding chain above: `host_matches_listener`
+(`src/gw/gateway.c`) requires the request's `Host` header to name this
+listener's own `listen_addr` and `listen_port`, whole and never by prefix or
+suffix, before the floor is ever granted; a missing `Host` is refused, not
+guessed at.** It is **not an authorisation boundary** — the scopes named are
+still granted to anyone who can reach the listener with the right `Host`,
+which on this deployment is still anyone on the network segment, and nothing
+about *who* may read is narrower now. What it restores is the *narrower*
+equivalence "anyone who can reach the listener" already claimed: that reaching
+the listener and reading the data mean the same set of requests for
+browser-mediated access, closing the gap a DNS-rebinding page had opened
+between them. A request carrying a real credential is judged on it exactly as
+before, on any `Host`. Full statement, including why no policy key names
+additional accepted hostnames: `docs/remote-access.md`, "Anonymous browser
+reads, stated honestly" and "The `Host` check: DNS rebinding was sufficient
+without it".
 
 ## Reporting a vulnerability
 

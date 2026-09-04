@@ -745,18 +745,29 @@ static void gui_request(atlas_gateway *g, const char *method, const char *path,
     atlas_buf_free(&req);
 }
 
+/* `gui_env` / `gui_env_anon` never set `listen_addr` or `listen_port`, so the
+ * policy's documented defaults apply — this is what a request must send as
+ * `Host` to pass `host_matches_listener`. */
+#define GW_TEST_HOST "127.0.0.1:8787"
+
 /* Like `gui_request`, but able to carry a bearer credential alongside — or
- * instead of — a session cookie. Neither argument is ever both non-NULL in a
- * real client, but the anonymous-floor tests need to construct exactly that
- * shape on purpose: a presented, wrong credential and a request with none at
- * all are different things, and only a helper that can build both proves it. */
-static void full_request(atlas_gateway *g, const char *method, const char *path, const char *auth,
-                         const char *cookie, const char *body, atlas_buf *resp) {
+ * instead of — a session cookie, and able to name (or omit) a `Host` header.
+ * Neither `auth` nor `cookie` is ever both non-NULL in a real client, but the
+ * anonymous-floor tests need to construct exactly that shape on purpose: a
+ * presented, wrong credential and a request with none at all are different
+ * things, and only a helper that can build both proves it. `host == NULL`
+ * omits the `Host` header entirely, for the HTTP/1.0-shaped case; any other
+ * value, including "", is sent verbatim. */
+static void full_request(atlas_gateway *g, const char *method, const char *path, const char *host,
+                         const char *auth, const char *cookie, const char *body, atlas_buf *resp) {
     atlas_err err;
     atlas_err_init(&err);
     atlas_buf req = ATLAS_BUF_INIT;
     size_t blen = body != NULL ? strlen(body) : 0;
-    T_OK(atlas_buf_appendf(&req, &err, "%s %s HTTP/1.1\r\nHost: t\r\n", method, path), &err);
+    T_OK(atlas_buf_appendf(&req, &err, "%s %s HTTP/1.1\r\n", method, path), &err);
+    if (host != NULL) {
+        T_OK(atlas_buf_appendf(&req, &err, "Host: %s\r\n", host), &err);
+    }
     if (auth != NULL) {
         T_OK(atlas_buf_appendf(&req, &err, "Authorization: %s\r\n", auth), &err);
     }
@@ -805,14 +816,14 @@ static void test_no_anonymous_scopes_named_means_no_change(void) {
     gui_env(&e, &g);
     atlas_buf resp = ATLAS_BUF_INIT;
 
-    full_request(g, "GET", "/api/v1/repos", NULL, NULL, NULL, &resp);
+    full_request(g, "GET", "/api/v1/repos", GW_TEST_HOST, NULL, NULL, NULL, &resp);
     T_EQ_INT(status_of(&resp), 401);
-    full_request(g, "GET", "/auth/me", NULL, NULL, NULL, &resp);
+    full_request(g, "GET", "/auth/me", GW_TEST_HOST, NULL, NULL, NULL, &resp);
     T_EQ_INT(status_of(&resp), 401);
     /* A stale or forged session cookie is exactly the input the anonymous-
      * floor decision changed the handling of; with no floor configured it
      * must still be 401, unchanged. */
-    full_request(g, "GET", "/api/v1/repos", NULL,
+    full_request(g, "GET", "/api/v1/repos", GW_TEST_HOST, NULL,
                 "0000000000000000000000000000000000000000000000000000000000000000", NULL, &resp);
     T_EQ_INT(status_of(&resp), 401);
 
@@ -838,22 +849,22 @@ static void test_the_anonymous_floor_grants_exactly_the_named_scopes(void) {
                 "the page does not read the anonymous field /auth/me now sends");
 
     /* No credential at all: the named scope works... */
-    full_request(g, "GET", "/api/v1/repos", NULL, NULL, NULL, &resp);
+    full_request(g, "GET", "/api/v1/repos", GW_TEST_HOST, NULL, NULL, NULL, &resp);
     T_EQ_INT(status_of(&resp), 200);
     T_CHECK(strstr(body_of(&resp), "proj") != NULL);
 
     /* ...and nothing beyond it: audit:read is never a default, whatever else
      * is named, and decisions:read was not named even though the real key
      * holds it. */
-    full_request(g, "GET", "/api/v1/audit", NULL, NULL, NULL, &resp);
+    full_request(g, "GET", "/api/v1/audit", GW_TEST_HOST, NULL, NULL, NULL, &resp);
     T_EQ_INT(status_of(&resp), 403);
-    full_request(g, "GET", "/api/v1/decisions?repo=proj", NULL, NULL, NULL, &resp);
+    full_request(g, "GET", "/api/v1/decisions?repo=proj", GW_TEST_HOST, NULL, NULL, NULL, &resp);
     T_EQ_INT(status_of(&resp), 403);
     T_CHECK(strstr(body_of(&resp), "decisions:read") != NULL);
 
     /* /auth/me tells the truth: it is a real, named identity, not a pretence
      * that nobody is there. */
-    full_request(g, "GET", "/auth/me", NULL, NULL, NULL, &resp);
+    full_request(g, "GET", "/auth/me", GW_TEST_HOST, NULL, NULL, NULL, &resp);
     T_EQ_INT(status_of(&resp), 200);
     T_CHECK_MSG(strstr(body_of(&resp), "\"anonymous\":true") != NULL,
                 "/auth/me did not report the anonymous floor: %s", body_of(&resp));
@@ -863,7 +874,7 @@ static void test_the_anonymous_floor_grants_exactly_the_named_scopes(void) {
 
     /* A wrong bearer token is not "no credential": it tried and failed, and it
      * stays failed rather than sliding to the anonymous floor. */
-    full_request(g, "GET", "/api/v1/repos",
+    full_request(g, "GET", "/api/v1/repos", GW_TEST_HOST,
                 "Bearer atlas_0123456789abcdef_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
                 NULL, NULL, &resp);
     T_EQ_INT(status_of(&resp), 401);
@@ -873,10 +884,10 @@ static void test_the_anonymous_floor_grants_exactly_the_named_scopes(void) {
      * is what lets a browser holding a cookie from before a gateway restart
      * keep working rather than being stuck at a hard 401 until it logs out by
      * hand. */
-    full_request(g, "GET", "/api/v1/repos", NULL,
+    full_request(g, "GET", "/api/v1/repos", GW_TEST_HOST, NULL,
                 "0000000000000000000000000000000000000000000000000000000000000000", NULL, &resp);
     T_EQ_INT(status_of(&resp), 200);
-    full_request(g, "GET", "/auth/me", NULL,
+    full_request(g, "GET", "/auth/me", GW_TEST_HOST, NULL,
                 "0000000000000000000000000000000000000000000000000000000000000000", NULL, &resp);
     T_EQ_INT(status_of(&resp), 200);
     T_CHECK(strstr(body_of(&resp), "\"anonymous\":true") != NULL);
@@ -885,13 +896,13 @@ static void test_the_anonymous_floor_grants_exactly_the_named_scopes(void) {
      * more, and a real session is never masked down to it. */
     char body[512];
     (void)snprintf(body, sizeof body, "{\"key\":\"%s\"}", e.token);
-    full_request(g, "POST", "/auth/login", NULL, NULL, body, &resp);
+    full_request(g, "POST", "/auth/login", GW_TEST_HOST, NULL, NULL, body, &resp);
     T_EQ_INT(status_of(&resp), 200);
     char cookie[128];
     cookie_of(&resp, cookie, sizeof cookie);
     T_REQUIRE_MSG(cookie[0] != '\0', "login set no session cookie");
 
-    full_request(g, "GET", "/auth/me", NULL, cookie, NULL, &resp);
+    full_request(g, "GET", "/auth/me", GW_TEST_HOST, NULL, cookie, NULL, &resp);
     T_EQ_INT(status_of(&resp), 200);
     T_CHECK_MSG(strstr(body_of(&resp), "\"anonymous\":false") != NULL,
                 "a real session was reported as anonymous: %s", body_of(&resp));
@@ -899,20 +910,20 @@ static void test_the_anonymous_floor_grants_exactly_the_named_scopes(void) {
     /* The real key's own scopes, wider than the anonymous floor — the floor
      * never overrides a session that exists. */
     T_CHECK(strstr(body_of(&resp), "decisions:read") != NULL);
-    full_request(g, "GET", "/api/v1/decisions?repo=proj", NULL, cookie, NULL, &resp);
+    full_request(g, "GET", "/api/v1/decisions?repo=proj", GW_TEST_HOST, NULL, cookie, NULL, &resp);
     T_EQ_INT(status_of(&resp), 200);
 
     /* `/mcp` is untouched: no bearer is still refused, with or without the
      * anonymous floor configured, and a cookie never reaches it at all. */
-    full_request(g, "POST", "/mcp", NULL, NULL,
+    full_request(g, "POST", "/mcp", GW_TEST_HOST, NULL, NULL,
                 "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}", &resp);
     T_EQ_INT(status_of(&resp), 401);
-    full_request(g, "POST", "/mcp", NULL, cookie,
+    full_request(g, "POST", "/mcp", GW_TEST_HOST, NULL, cookie,
                 "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}", &resp);
     T_EQ_INT(status_of(&resp), 401);
     char auth[256];
     bearer(&e, auth, sizeof auth);
-    full_request(g, "POST", "/mcp", auth, NULL,
+    full_request(g, "POST", "/mcp", GW_TEST_HOST, auth, NULL,
                 "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}", &resp);
     T_EQ_INT(status_of(&resp), 200);
 
@@ -939,7 +950,7 @@ static void test_the_audit_trail_names_an_anonymous_request_plainly(void) {
     gui_env_anon(&e, "repo:read", &g);
     atlas_buf resp = ATLAS_BUF_INIT;
 
-    full_request(g, "GET", "/api/v1/repos", NULL, NULL, NULL, &resp);
+    full_request(g, "GET", "/api/v1/repos", GW_TEST_HOST, NULL, NULL, NULL, &resp);
     T_EQ_INT(status_of(&resp), 200);
 
     atlas_err err;
@@ -973,6 +984,138 @@ static void test_the_audit_trail_names_an_anonymous_request_plainly(void) {
     atlas_buf_free(&db_path);
     atlas_buf_free(&resp);
     atlas_gateway_close(g);
+    env_close(&e);
+}
+
+static void test_the_host_check_blocks_dns_rebinding(void) {
+    /* The rebinding scenario an adversarial review found: a page served under
+     * an attacker-controlled name with a short-TTL DNS record can be pointed
+     * at this gateway's real address after the browser loads it. The browser
+     * then treats a fetch from that page as same-origin with itself — no
+     * `Origin` header, no CORS check, and no `atlas_session` cookie, since
+     * none was ever set for the attacker's name — so the request presents
+     * nothing, which is exactly what the anonymous floor accepted before this
+     * check existed. `host_matches_listener` is what closes it. */
+    env e;
+    const char *scopes[] = {"repo:read", "decisions:read"};
+    env_open(&e, scopes, 2);
+    atlas_gateway *g = NULL;
+    gui_env_anon(&e, "repo:read", &g);
+    atlas_buf resp = ATLAS_BUF_INIT;
+
+    /* A Host that is not this listener: refused. This is the attack itself.
+     * Fails (wrongly reports 200) if `host_matches_listener` is removed from
+     * `anonymous_ok`, or if the comparison is ever loosened to prefix or
+     * suffix matching -- e.g. accepting "127.0.0.1:8787.attacker.example" or
+     * "evil-127.0.0.1:8787" the way a suffix/prefix bug would. */
+    full_request(g, "GET", "/api/v1/repos", "attacker.example:8799", NULL, NULL, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 401);
+
+    /* The suffix shape by name, since it is the attack the comparison rule
+     * exists to name: a hostname that merely *ends with* the listener's own
+     * value. Fails if the comparison is ever done with a suffix check (e.g.
+     * `strstr` from the end, or comparing only the last N bytes) instead of
+     * whole-string equality. */
+    full_request(g, "GET", "/api/v1/repos", "127.0.0.1:8787.attacker.example", NULL, NULL, NULL,
+                &resp);
+    T_EQ_INT(status_of(&resp), 401);
+
+    /* A prefix of the real port. Fails if the port comparison is ever done
+     * with something like `strncmp` against the numeric prefix instead of
+     * the whole "addr:port" string, which "87" being a prefix of "8787"
+     * would slip past. */
+    full_request(g, "GET", "/api/v1/repos", "127.0.0.1:87", NULL, NULL, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 401);
+
+    /* No Host at all, on an HTTP/1.1 request: refused, not guessed. Fails if
+     * an absent Host is ever treated as a match -- e.g. a `host == NULL` or
+     * empty-string short circuit that returns true instead of false. */
+    full_request(g, "GET", "/api/v1/repos", NULL, NULL, NULL, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 401);
+
+    /* The literal case the reviewer named: an HTTP/1.0 request, which sends
+     * no Host header at all -- not merely a client choosing to omit it, but
+     * the one real-world shape that has never carried one. Built by hand
+     * because `full_request` always writes "HTTP/1.1". Fails the same way
+     * the case above would: an empty parsed Host must never read as a match. */
+    {
+        atlas_err herr;
+        atlas_err_init(&herr);
+        atlas_buf req10 = ATLAS_BUF_INIT;
+        static const char REQ10[] =
+            "GET /api/v1/repos HTTP/1.0\r\nContent-Length: 0\r\n\r\n";
+        T_OK(atlas_buf_append(&req10, REQ10, sizeof REQ10 - 1u, &herr), &herr);
+        T_OK(atlas_gateway_serve_bytes(g, req10.data, req10.len, &resp, &herr), &herr);
+        T_EQ_INT(status_of(&resp), 401);
+        atlas_buf_free(&req10);
+    }
+
+    /* The listener's own address and port: served. Fails if the comparison is
+     * ever stricter than the policy's own listen_addr/listen_port -- e.g.
+     * requiring a scheme prefix, or comparing case-sensitively against a
+     * differently-cased but equal hostname. */
+    full_request(g, "GET", "/api/v1/repos", GW_TEST_HOST, NULL, NULL, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 200);
+
+    /* A trailing space in the header value: the HTTP parser trims it before
+     * `host_matches_listener` ever sees the value, so this documents that
+     * the trimming is the parser's job, not the comparison's. Fails if a
+     * future parser change stops trimming header-value whitespace and this
+     * silently starts failing closed instead of continuing to match. */
+    full_request(g, "GET", "/api/v1/repos", GW_TEST_HOST " ", NULL, NULL, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 200);
+
+    /* A live session is unaffected by Host, on every shape above -- checked,
+     * not assumed: a session cookie could only ever have been minted by this
+     * gateway's own /auth/login, so it is judged on its own merits regardless
+     * of what Host a request claims. Fails if a Host check is ever added
+     * ahead of `session_get` instead of only inside `anonymous_ok`. */
+    char body[512];
+    (void)snprintf(body, sizeof body, "{\"key\":\"%s\"}", e.token);
+    full_request(g, "POST", "/auth/login", GW_TEST_HOST, NULL, NULL, body, &resp);
+    T_EQ_INT(status_of(&resp), 200);
+    char cookie[128];
+    cookie_of(&resp, cookie, sizeof cookie);
+    T_REQUIRE_MSG(cookie[0] != '\0', "login set no session cookie");
+
+    full_request(g, "GET", "/api/v1/repos", "attacker.example:8799", NULL, cookie, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 200);
+    full_request(g, "GET", "/api/v1/repos", NULL, NULL, cookie, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 200);
+
+    /* The scheme-default-port omission clause has its own branch in
+     * `host_matches_listener` that none of the cases above reach, because
+     * every fixture policy binds the non-default port 8787. Exercised here
+     * against a policy bound to port 80. Fails if the literal port compared
+     * is wrong, or if the omitted-port form is honoured on a non-80 port. */
+    {
+        atlas_gwpolicy p80;
+        static const char *const TEXT80 =
+            "enabled = yes\ngateway_uid = 1\nremote_mcp = yes\nweb_gui = yes\n"
+            "listen_port = 80\nweb_gui_anonymous_scopes = repo:read\n";
+        atlas_gwpolicy_parse_buffer(TEXT80, strlen(TEXT80), &p80);
+        T_REQUIRE(p80.state == ATLAS_GWPOLICY_ENABLED);
+        atlas_gateway_opts o80;
+        memset(&o80, 0, sizeof o80);
+        o80.socket_path = atlas_buf_cstr(&e.d.socket);
+        o80.timeout_ms = 15000;
+        atlas_gateway *g80 = NULL;
+        atlas_err err80;
+        atlas_err_init(&err80);
+        T_OK(atlas_gateway_open(&p80, &o80, &g80, &err80), &err80);
+
+        full_request(g80, "GET", "/api/v1/repos", "127.0.0.1", NULL, NULL, NULL, &resp);
+        T_EQ_INT(status_of(&resp), 200);
+        full_request(g80, "GET", "/api/v1/repos", "127.0.0.1:80", NULL, NULL, NULL, &resp);
+        T_EQ_INT(status_of(&resp), 200);
+        full_request(g80, "GET", "/api/v1/repos", "127.0.0.1:8080", NULL, NULL, NULL, &resp);
+        T_EQ_INT(status_of(&resp), 401);
+
+        atlas_gateway_close(g80);
+    }
+
+    atlas_gateway_close(g);
+    atlas_buf_free(&resp);
     env_close(&e);
 }
 
@@ -2249,6 +2392,7 @@ static const atlas_test TESTS[] = {
      test_the_anonymous_floor_grants_exactly_the_named_scopes},
     {"the audit trail names an anonymous request plainly",
      test_the_audit_trail_names_an_anonymous_request_plainly},
+    {"the host check blocks DNS rebinding", test_the_host_check_blocks_dns_rebinding},
     {"the browser surface is absent when disabled",
      test_the_browser_surface_is_absent_when_disabled},
     {"the listener binds and serves", test_the_listener_binds_and_serves},

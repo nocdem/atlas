@@ -289,6 +289,20 @@ atlas_status atlas_http_parse_head(const char *buf, size_t len, int64_t max_body
             (void)copy_field(out->accept, sizeof out->accept, val, vlen2);
         } else if (name_is(name, nlen, "origin")) {
             (void)copy_field(out->origin, sizeof out->origin, val, vlen2);
+        } else if (name_is(name, nlen, "host")) {
+            /* Same discipline as `origin` immediately above: an over-long
+             * value is not truncated — `copy_field` fails atomically and
+             * `out->host` is left as it was: empty, from
+             * `atlas_http_request_init`, if this is the first `Host` header
+             * seen; the previously parsed value, if an earlier one already
+             * fit. Neither case is a partial value, and a repeated header is
+             * not specially detected either way, so the last one that fits
+             * wins. All three match how `origin` already behaves; a `Host`
+             * value is used only to gate the anonymous floor
+             * (`host_matches_listener`, `src/gw/gateway.c`), never to
+             * refuse or route the request itself, so failing that gate is
+             * the whole consequence of either case. */
+            (void)copy_field(out->host, sizeof out->host, val, vlen2);
         } else if (name_is(name, nlen, "cookie")) {
             take_cookie(val, vlen2, "atlas_session", out->session, sizeof out->session);
         } else if (name_is(name, nlen, "mcp-session-id")) {

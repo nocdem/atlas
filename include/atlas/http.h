@@ -59,6 +59,10 @@
 /* "Bearer " plus a token. */
 #define ATLAS_HTTP_AUTH_MAX (ATLAS_APIKEY_TOKEN_MAX + 16u)
 #define ATLAS_HTTP_MCP_SESSION_MAX 64u
+/* Generous for "address:port" or a real FQDN plus a port; sized like
+ * `ATLAS_GWPOLICY_URL_MAX` rather than tightly, because an overlong value
+ * fails closed on its own — see the field's own comment. */
+#define ATLAS_HTTP_HOST_MAX 256u
 
 typedef struct atlas_http_request {
     char method[ATLAS_HTTP_METHOD_MAX];
@@ -74,6 +78,17 @@ typedef struct atlas_http_request {
     char content_type[ATLAS_HTTP_CTYPE_MAX];
     char accept[ATLAS_HTTP_ACCEPT_MAX];
     char origin[ATLAS_GWPOLICY_ORIGIN_MAX];
+    /* The `Host` header, verbatim. Not a routing input — the target is always
+     * origin-form and nothing here is ever joined to a filesystem path or a
+     * daemon method — and not itself an authorisation boundary. Its only
+     * consumer is `host_matches_listener` (`src/gw/gateway.c`), which uses it
+     * to keep a DNS-rebinding page from reaching the anonymous floor: see that
+     * function for what the check is and is not. Empty when the header is
+     * missing; unchanged from whatever it already held when a later `Host`
+     * does not fit — exactly like `origin`, and never a partial value either
+     * way, because `atlas_http_parse_head` never truncates a value it
+     * stores. */
+    char host[ATLAS_HTTP_HOST_MAX];
     /* The browser session cookie, when one was sent. Extracted by name from the
      * Cookie header; every other cookie is ignored rather than stored. */
     char session[ATLAS_GW_SESSION_TOKEN_HEX + 1u];

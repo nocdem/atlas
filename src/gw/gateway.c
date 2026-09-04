@@ -451,36 +451,132 @@ static const char *auth_detail(const principal *pr, char *buf, size_t n) {
 #define GW_ANON_KEY_ID "anonymous"
 #define GW_ANON_LABEL " (anonymous)"
 
+/* Case-insensitive ASCII comparison, for a `Host` value: RFC 3986 makes host
+ * comparison case-insensitive, and a policy's `listen_addr` is written by an
+ * operator who may not have matched a browser's canonicalisation. Manual
+ * rather than `strcasecmp` because nothing else in this codebase reaches for
+ * a libc case-fold — `name_is` in `src/gw/http.c` does the same fold by hand
+ * for header names, for the same reason. */
+static bool host_eq_ci(const char *a, const char *b) {
+    size_t i = 0;
+    for (;; i++) {
+        char ca = a[i];
+        char cb = b[i];
+        if (ca >= 'A' && ca <= 'Z') {
+            ca = (char)(ca - 'A' + 'a');
+        }
+        if (cb >= 'A' && cb <= 'Z') {
+            cb = (char)(cb - 'A' + 'a');
+        }
+        if (ca != cb) {
+            return false;
+        }
+        if (ca == '\0') {
+            return true;
+        }
+    }
+}
+
+/* True when `host` — the request's `Host` header value, already bounded and
+ * validated as printable ASCII by `atlas_http_parse_head` — names exactly the
+ * address and port this gateway is bound to, compared whole and never by
+ * prefix or suffix: the rule `atlas_http_origin_allowed` already follows for
+ * an Origin, for the same reason a suffix match on a hostname is how
+ * `atlas.example.com.attacker.net` gets treated as `atlas.example.com`.
+ *
+ * **This is not an authorisation check, and must never be read as one.** A7's
+ * rule is that what the gateway cannot do is true because of who it runs as,
+ * never because of a check in `src/gw` — and the operator who set
+ * `web_gui_anonymous_scopes` deliberately removed the authorisation boundary
+ * for the scopes it names. What this restores is a *narrower* equivalence
+ * than "authenticated": that "can reach this listener" and "can read this
+ * data" mean the same set of requests for browser-mediated access, which is
+ * the sentence the operator actually authorised. Without it, a hostile page
+ * served from any name whose DNS is briefly rebound to this gateway's address
+ * is same-origin with itself in the browser's eyes — it gets no `Origin`
+ * header applied to it, no CORS check, and no session cookie (none was ever
+ * set for the attacker's name) — so it presents nothing, which is exactly
+ * what an anonymous floor with no Host check would have accepted. A `Host`
+ * mismatch is refused for the *floor* only: a request carrying a real
+ * credential is judged on that credential exactly as before, on any Host.
+ *
+ * A client may omit the port when it equals the scheme's default. Atlas
+ * terminates no TLS (`atlas/gwpolicy.h`), so a client reaching this listener
+ * directly is always plain HTTP, and the only default that could apply is
+ * port 80 — honoured only when the policy is in fact bound to it. On a
+ * typical deployment (e.g. port 8799) that clause never fires and a browser
+ * always sends the port. */
+static bool host_matches_listener(const atlas_gateway *g, const char *host) {
+    if (host == NULL || host[0] == '\0') {
+        /* No Host at all — an HTTP/1.0 client, or one Atlas' own parser
+         * refused to store because the header did not fit. Either way there
+         * is nothing to compare, and the floor is refused rather than
+         * guessed: an absent input must never read as a match. */
+        return false;
+    }
+    char want[ATLAS_HTTP_HOST_MAX];
+    (void)snprintf(want, sizeof want, "%s:%d", g->policy.listen_addr, g->policy.listen_port);
+    if (host_eq_ci(host, want)) {
+        return true;
+    }
+    if (g->policy.listen_port == 80 && host_eq_ci(host, g->policy.listen_addr)) {
+        return true;
+    }
+    return false;
+}
+
+/* No policy key names additional accepted hostnames — e.g. for a reverse
+ * proxy or a DNS name in front of this gateway — and that is a deliberate
+ * omission, not an oversight. The deployment this mechanism was built for
+ * reaches the gateway by its raw address today, which `listen_addr` and
+ * `listen_port` already state and already suffice for. Adding a second,
+ * broader-matching source of truth during a security fix round is exactly
+ * the kind of surface a hasty remedy leaves behind for someone else to
+ * misconfigure; an operator who later stands up a reverse proxy or a named
+ * deployment can add such a key then, following the same discipline this
+ * file already uses elsewhere — root-owned, absent by default, and every
+ * value compared whole, never by prefix or suffix. Its absence here is not a
+ * silent limitation: a `Host` that fails to match anything is a plain,
+ * ordinary refusal of the anonymous floor (401, exactly as a wrong Host
+ * always produces), never a crash, a bypass, or a confusing error — a
+ * request with a real session or bearer credential is entirely unaffected,
+ * on any Host, because this check exists only inside `anonymous_ok`. */
+
 /* True when this request may be resolved to the policy's anonymous principal:
- * the web GUI is enabled, the policy names at least one such scope, and
+ * the web GUI is enabled, the policy names at least one such scope, the
+ * request's `Host` names this listener (see `host_matches_listener`), and
  * `session_get` already failed to find a *live* session for whatever cookie
  * (if any) accompanied this request.
  *
  * The two credential kinds are treated differently on purpose, and the
- * difference is the audit trail, not the wire format:
+ * difference is the audit trail, not the wire format. **Any** presented
+ * `Authorization` header disqualifies the floor outright
+ * (`req->authorization[0] != '\0'`) — the common and motivating case is a
+ * bearer token, where `authenticate` extracts a selector into `presented`
+ * before rejecting it so a DENIED row can say *which* credential was tried,
+ * and falling through to the anonymous floor would spend that signal on a
+ * request that already failed once; a header that is not even shaped like a
+ * bearer token (`Authorization: Basic ...`) is refused the same way, on the
+ * same principle, even though it carries no selector to lose — a presented
+ * credential of any kind is a caller who tried and was refused, not a caller
+ * who presented nothing. A **session cookie** that does not resolve —
+ * expired, forged, or simply stale because a gateway restart forgot every
+ * in-memory session (`gateway.c:573-577`, deliberately) — carries no selector
+ * `session_get` could log; it authenticates to nothing and there is no
+ * rejected credential's identity to lose by treating it as no cookie at all.
+ * That is also the case this key exists to help: an operator's browser
+ * holding a cookie from before the daemon's last restart must land on the
+ * anonymous floor, not on a hard 401 that only a manual logout clears.
  *
- *   - A **bearer token** that does not authenticate is refused outright
- *     (`req->authorization[0] != '\0'` disqualifies it here). `authenticate`
- *     extracts its selector into `presented` before rejecting it, so a DENIED
- *     row can say *which* credential was tried. Falling through to the
- *     anonymous floor would spend that signal on a request that already
- *     failed once — it is the daemon's answer that failed, not the absence of
- *     an answer, and it stays refused.
- *   - A **session cookie** that does not resolve — expired, forged, or simply
- *     stale because a gateway restart forgot every in-memory session
- *     (`gateway.c:573-577`, deliberately) — carries no selector `session_get`
- *     could log; it authenticates to nothing and there is no rejected
- *     credential's identity to lose by treating it as no cookie at all. That
- *     is also the case this key exists to help: an operator's browser holding
- *     a cookie from before the daemon's last restart must land on the
- *     anonymous floor, not on a hard 401 that only a manual logout clears.
- *
- * A *live* session is never affected either way, because `session_get` is
- * tried first at every call site below and this function is only reached once
- * that has already failed. */
+ * A *live* session is never affected by any of this, `Host` included: it is
+ * never checked against the session, because it cannot have been forged into
+ * existing — a session cookie is only ever set by this gateway's own
+ * `/auth/login` response, scoped by the browser to the origin that received
+ * it, so a live match in `session_get` already proves the request reached the
+ * right listener. */
 static bool anonymous_ok(const atlas_gateway *g, const atlas_http_request *req) {
     return g->policy.web_gui && g->policy.web_gui_anonymous_scopes != 0u &&
-           req->authorization[0] == '\0';
+           req->authorization[0] == '\0' && host_matches_listener(g, req->host);
 }
 
 /* Fills `out` with the anonymous principal: authenticated, carrying exactly
@@ -1903,6 +1999,21 @@ atlas_status atlas_service_gateway_status(FILE *out, bool json, atlas_err *err) 
             if (st == ATLAS_OK) {
                 st = atlas_json_key_int(j, "allowed_origins", (int64_t)p.origin_count, err);
             }
+            if (st == ATLAS_OK) {
+                /* The one policy line that most moves this deployment's own
+                 * threat model, so it is named here rather than left for an
+                 * auditor to find only by reading a root-owned file they may
+                 * not be able to open. Empty (the default) is itself the
+                 * answer "no unauthenticated read is granted" and is printed
+                 * as such, never omitted the way a ceiling like
+                 * `max_request_bytes` is. */
+                atlas_buf anon = ATLAS_BUF_INIT;
+                atlas_err aerr;
+                atlas_err_init(&aerr);
+                (void)atlas_apikey_scopes_render(p.web_gui_anonymous_scopes, &anon, &aerr);
+                st = atlas_json_key_str(j, "web_gui_anonymous_scopes", atlas_buf_cstr(&anon), err);
+                atlas_buf_free(&anon);
+            }
         }
         /* Stated as a field rather than left to a reader's assumption, exactly
          * as the backup report states `encrypted` and `signed`. */
@@ -1935,6 +2046,20 @@ atlas_status atlas_service_gateway_status(FILE *out, bool json, atlas_err *err) 
                       p.web_gui ? "yes" : "no");
         (void)fprintf(out, "uid:     %lld\n", p.gateway_uid);
         (void)fprintf(out, "origins: %zu allowed\n", p.origin_count);
+        {
+            /* Same reasoning as the JSON form above: this is an
+             * authentication bypass an auditor must see here, not a ceiling
+             * safe to leave to the policy file. */
+            atlas_buf anon = ATLAS_BUF_INIT;
+            atlas_err aerr;
+            atlas_err_init(&aerr);
+            (void)atlas_apikey_scopes_render(p.web_gui_anonymous_scopes, &anon, &aerr);
+            (void)fprintf(out, "anon:    %s\n",
+                          atlas_buf_cstr(&anon)[0] != '\0'
+                              ? atlas_buf_cstr(&anon)
+                              : "(none -- /api/ still requires a session or bearer credential)");
+            atlas_buf_free(&anon);
+        }
         if (p.public_url[0] != '\0') {
             (void)fprintf(out, "url:     %s/mcp\n", p.public_url);
         }

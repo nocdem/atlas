@@ -3,7 +3,10 @@
 Atlas A9 adds a way to reach an Atlas index from off the machine it runs on:
 a **gateway** that terminates HTTP, authenticates a bearer credential, checks
 scopes, and forwards only explicitly supported operations to `atlasd` over the
-ordinary Unix socket.
+ordinary Unix socket. **That "authenticates" is no longer universally true**:
+a root-owned policy may name an anonymous floor for browser reads with no
+credential at all. See "Anonymous browser reads, stated honestly" below before
+assuming every `/api/` request carries a credential.
 
 Nothing about the local behaviour changes. `atlasd`, `/run/atlas/atlas.sock`,
 stdio MCP and the Claude Code integration are exactly as they were.
@@ -483,15 +486,28 @@ authenticate is never masked down to this floor; the floor only ever fills the
 gap left by a request with no live principal.
 
 A wrong bearer token is treated differently from a stale session cookie, on
-purpose. A bearer token that was presented and failed authentication stays
-refused — it carries a selector the daemon's own DENIED row can name, and
-sliding it to the anonymous floor would spend that audit signal on a request
-that already failed once. A session cookie that does not resolve — expired,
-forged, or simply left over from before the gateway's last restart, since
-sessions live only in memory and a restart forgets every one of them — carries
-no such signal to lose, and is exactly the case this key exists to help: an
-operator's browser holding a pre-restart cookie lands on the anonymous floor
-instead of a hard 401 that only a manual logout clears.
+purpose. Any presented `Authorization` header — a bearer token that failed, or
+one that is not even shaped like one — stays refused outright, never sliding
+to the floor; the common, motivating case is a bearer token, because it
+carries a selector the daemon's own DENIED row can name, and spending that
+audit signal on a request that already failed once would be worse than simply
+refusing it. A session cookie that does not resolve — expired, forged, or
+simply left over from before the gateway's last restart, since sessions live
+only in memory and a restart forgets every one of them — carries no such
+signal to lose, and is exactly the case this key exists to help: an operator's
+browser holding a pre-restart cookie lands on the anonymous floor instead of a
+hard 401 that only a manual logout clears.
+
+**A precise correction to "nothing changes."** The 401 *refusal* shape is
+byte-identical whether or not this key is set, and that is what the paragraph
+above and its tests mean by "exactly as before." The `/auth/me` *success*
+body is not: it now always carries an `"anonymous"` boolean (`false` for a
+real session, `true` only for the policy-granted floor), on every deployment,
+whether or not `web_gui_anonymous_scopes` is ever set. That is a response-shape
+change, stated here because an earlier draft of this document implied more
+than that — the only consumer is the bundled Mission Control page, and it now
+reads the field, but a caller checking `/auth/me`'s exact success body against
+an old copy would see the difference.
 
 **The cost, stated in full, exactly as it was stated to the operator before
 they decided.** Setting this key means:
@@ -502,7 +518,9 @@ they decided.** Setting this key means:
    listener, "anyone who can reach the listener" means anyone on the network
    segment: every decision, every claim, repository file contents and the
    whole structural and semantic graph that the named scopes cover, to any
-   device on that network, unauthenticated.
+   device on that network, unauthenticated. **This sentence was, briefly,
+   narrower than the actual exposure** — see "The `Host` check" below — and is
+   accurate again now that the remedy described there is in place.
 2. **The audit trail stops saying who.** A `gw_audit` row for an anonymous
    read carries the fixed identity `key_id = "anonymous"` (see `gateway.c`'s
    `GW_ANON_KEY_ID`) rather than a credential's selector, because there is no
@@ -524,6 +542,64 @@ answer 403 to an anonymous reader unless `audit:read` is named explicitly. That
 is the honest consequence of the paragraph above, not a defect: an anonymous
 reader who cannot be distinguished from any other anonymous reader is not a
 reader Atlas will show the audit trail to by default.
+
+### The `Host` check: DNS rebinding was sufficient without it
+
+**Found by adversarial review, same day as the feature, and closed the same
+day: a LAN user merely *visiting a hostile web page* — no network position, no
+credential, nothing beyond ordinary browsing — was sufficient to read
+everything the anonymous floor grants**, which is a materially wider exposure
+than "anyone who can reach the listener" describes. The chain: an attacker
+serves a page from a name with a short DNS TTL; once a LAN visitor's browser
+has loaded it, the attacker's DNS answers that same name with the gateway's
+own address; the page's own script then fetches `/api/v1/...` against that
+name. A browser compares origins as (scheme, host, port) *strings*, so it
+treats the second load as same-origin with the first — it attaches no `Origin`
+header (so no CORS check ever runs), and no `atlas_session` cookie (none was
+ever set for the attacker's name, only for the gateway's real one). The
+request therefore presents nothing, and "presents nothing" is exactly what the
+anonymous floor was built to accept. Before the floor existed, the same
+rebound request still hit `/api/`'s ordinary 401: the credential it needed was
+a cookie, and a cookie belongs to the gateway's own name, never to the
+attacker's. Replacing "must present a credential" with "must present nothing"
+is what made the rebinding worth doing, and it is the anonymous floor's own
+addition, not a pre-existing gap.
+
+**The remedy: `host_matches_listener` (`src/gw/gateway.c`), one clause in
+`anonymous_ok`.** The request's `Host` header must equal the policy's own
+`listen_addr` and `listen_port`, compared whole and case-insensitively, never
+by prefix or suffix — the rule an Origin already follows here, for the same
+reason a suffix match on a hostname is how `atlas.example.com.attacker.net`
+gets mistaken for `atlas.example.com`. A client may omit the port when it
+equals the scheme's default; since Atlas terminates no TLS, that can only be
+port 80, and only when the policy is in fact bound to it — on a typical
+deployment (e.g. port 8799) the clause never fires. **A request with no `Host`
+at all is refused the floor**, not guessed at: an HTTP/1.0 client, or an
+oversized header Atlas' own parser declined to store, both leave the field
+empty, and an absent input must never read as a match.
+
+**What this is not.** It is not an authorisation boundary, and the operator's
+decision above is unchanged by it: the scopes named in `web_gui_anonymous_scopes`
+are still granted to anyone who can reach the listener with the right `Host`,
+which on this deployment is still anyone on the network segment — nothing
+about *who* may read is narrower now. What the check restores is a *narrower
+equivalence* than "authenticated": that "can reach this listener" and "can
+read this data" mean the same set of requests for browser-mediated access,
+which is the sentence the operator actually authorised on 2026-09-04 and the
+one the rebinding path had quietly widened. A request carrying a real
+credential — a live session or a bearer token — is judged on that credential
+exactly as before, on any `Host`, because a session cookie could only ever
+have been issued by this gateway's own `/auth/login` in the first place.
+
+No policy key names additional accepted hostnames (for a reverse proxy or a
+DNS name in front of the gateway); this deployment reaches it by raw address,
+and adding a second, broader-matching source of truth during a security fix
+was judged not worth the extra surface. An operator who later needs one can
+add it following the same discipline as every other key here: root-owned,
+absent by default, compared whole. Until then, a `Host` that names anything
+else is an ordinary 401 refusal of the floor — never a crash, a bypass, or a
+confusing error — and a request with a real credential is unaffected either
+way.
 
 ## Security controls
 

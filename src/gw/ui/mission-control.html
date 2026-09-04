@@ -240,6 +240,36 @@ const REVIEW_SHEET_KEY = "atlas.review.sheet.v1";
 const RE_REVIEW_DECISION = /^atlas-dec-[0-9a-f]{32}$/;
 const RE_REVIEW_PREFIX = /^[0-9a-f]{8}$/;
 
+/* A16 T7. The two shapes the disposal panel adds to this page's own pattern
+ * set: `decision.remote_challenge`'s `token` (`ATLAS_DECISION_CHALLENGE_HEX`,
+ * `include/atlas/limits.h` -- 32 lowercase hex) and a revision's
+ * `content_hash` (`ATLAS_SHA256_HEX_LEN`, `include/atlas/sha256.h` -- 64).
+ * `RE_REVIEW_DECISION` and `RE_REVIEW_PREFIX` above are reused rather than
+ * duplicated for the decision id and the digest prefix. */
+const RE_DISPOSE_CHALLENGE = /^[0-9a-f]{32}$/;
+const RE_DISPOSE_HASH = /^[0-9a-f]{64}$/;
+
+/* A16 T7. A browser disposes through exactly these three intents (the
+ * fourth and fifth op kinds `spend_method` maps -- supersede, revalidate --
+ * are refused for a REMOTE channel at the write point and are never offered
+ * here). */
+function disposeIntentOk(intent) {
+  return intent === "approve" || intent === "reject" || intent === "resolve";
+}
+
+/* A16 T7. Validates rather than escapes (A2's renderer rule): every value
+ * this panel is about to hand to `apiWrite` is checked against the pattern
+ * Atlas gives that kind of value, here, before it is sent.
+ * `URLSearchParams` percent-encodes whatever it is given -- that is
+ * "sanitised in," not validated -- so a value that fails one of these is
+ * dropped and nothing is sent, exactly as a sheet entry that fails
+ * `reviewSheetText`'s own checks is left out of the sheet rather than
+ * written with its bad byte escaped. */
+function disposeTargetOk(repo, uid, revision) {
+  return repos.includes(repo) && RE_REVIEW_DECISION.test(uid) &&
+         Number.isInteger(revision) && revision > 0;
+}
+
 /* A15 T7 fix round 1. The same entry ceiling `ATLAS_REVIEW_SHEET_MAX_ENTRIES`
    (`include/atlas/limits.h`) gives the sheet parser (`src/core/review.c:441`,
    "more than 64 entries; split it"). A page-side courtesy copy, not the
@@ -247,6 +277,44 @@ const RE_REVIEW_PREFIX = /^[0-9a-f]{8}$/;
 const REVIEW_UI_MAX_SHEET_ENTRIES = 64;
 let scopes = new Set();
 let repos = [];
+
+/* A16 T7. The disposal key a viewer types into the "Dispose from this
+ * browser" panel, and whether this gateway offers that panel at all.
+ * `remoteDisposal` / `cleartextDisposal` are set once, in `start()`, from
+ * `/auth/me`'s own fields -- never guessed and never defaulted to true.
+ *
+ * `disposeKey` is `sessionStorage`-backed under one fixed key, the operator's
+ * own row-3 ruling (`docs/plans/2026-09-04-browser-disposal.md`, "Decisions
+ * the operator must be asked"): it survives a reload of this tab and is gone
+ * when the tab closes, and it is never written to `localStorage`. Every
+ * access is wrapped in `try`/`catch`, exactly as `reviewQueueLoad` /
+ * `reviewQueueSave` wrap theirs -- a private window or blocked site data
+ * reads as "nothing remembered", never throws. */
+let disposeKey = "";
+let remoteDisposal = false;
+let cleartextDisposal = false;
+const DISPOSE_KEY_STORAGE_KEY = "atlas.dispose.key.v1";
+
+function disposeKeyLoad() {
+  try {
+    return sessionStorage.getItem(DISPOSE_KEY_STORAGE_KEY) || "";
+  } catch (e) {
+    return "";
+  }
+}
+
+function disposeKeySave(v) {
+  try {
+    sessionStorage.setItem(DISPOSE_KEY_STORAGE_KEY, v);
+  } catch (e) { /* a private window or blocked site data: still usable this load */ }
+}
+
+/* Cleared on Sign out (Decision 15): a key typed while one credential was
+ * live must not carry forward to whichever principal is signed in next. */
+function disposeKeyClear() {
+  disposeKey = "";
+  try { sessionStorage.removeItem(DISPOSE_KEY_STORAGE_KEY); } catch (e) { /* ignored */ }
+}
 
 const $ = (id) => document.getElementById(id);
 
@@ -281,6 +349,44 @@ async function api(path, params) {
     throw new Error("the gateway is not reachable");
   }
   if (res.status === 401) { showLogin(); throw new Error("the session has ended"); }
+  let body = null;
+  try { body = await res.json(); } catch (e) { body = null; }
+  if (!res.ok) {
+    const m = body && body.error && body.error.message ? body.error.message : ("HTTP " + res.status);
+    const err = new Error(m);
+    err.status = res.status;
+    throw err;
+  }
+  if (body === null) throw new Error("the gateway returned something that is not JSON");
+  return body.result !== undefined ? body.result : body;
+}
+
+/* A16 T7. The disposal fetch: the only one on this page that ever sends the
+ * disposal key, and the only one that must never carry the session cookie a
+ * browser attaches to `api()`'s requests automatically -- `credentials:
+ * "omit"` is what keeps a live session and an open disposal tab from ever
+ * blending. `POST`, `application/x-www-form-urlencoded` (Decision 7: no
+ * yyjson in `src/gw`, so the body is query-string syntax, not JSON), and the
+ * disposal key as a bearer. The error mapping is `api()`'s own, except a 401
+ * here means the *key* was not accepted -- a disposal has no session for
+ * `showLogin()` to end. */
+async function apiWrite(path, fields) {
+  const url = "/api/v1/" + path;
+  let res;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      credentials: "omit",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Authorization": "Bearer " + disposeKey,
+      },
+      body: new URLSearchParams(fields),
+    });
+  } catch (e) {
+    throw new Error("the gateway is not reachable");
+  }
+  if (res.status === 401) { throw new Error("the disposal key was not accepted"); }
   let body = null;
   try { body = await res.json(); } catch (e) { body = null; }
   if (!res.ok) {
@@ -1105,6 +1211,196 @@ function showReviewDetail(repo, row) {
     }
     return box;
   });
+
+  /* 6. Dispose from this browser (Decision 15, T7). A disposal spent here
+     reaches the same write point every other channel reaches --
+     `atlas_decision_apply_in_tx`, through `atlas_decision_remote_verify` --
+     with a bearer credential typed into this tab rather than a terminal
+     session. Weaker by construction, and said so on screen at the moment it
+     is used, not only in a document nobody re-opens. */
+  root.appendChild(el("h3", {text: "Dispose from this browser"}));
+  const disposeBox = el("div");
+  root.appendChild(disposeBox);
+  if (!remoteDisposal) {
+    disposeBox.appendChild(el("p", {class: "dim", text:
+      "This gateway does not serve remote disposal. Records queued here are disposed of " +
+      "with atlas review apply FILE on a terminal on the Atlas machine."}));
+  } else {
+    /* Rule 3: the channel's weakness is said at the moment of use, which is
+       the moment the key is about to cross the network -- the challenge
+       *request*, not the confirmation that follows a successful one. A
+       wrong key, a moved record, any refusal at all still crosses the key
+       in the clear first, so this appears before the key field is ever
+       shown, not only in the confirmation block that follows success. */
+    disposeBox.appendChild(el("p", {text:
+      "Disposing from this browser records REMOTE_OPERATOR_CONFIRMED with the credential's " +
+      "id. That names the channel and the credential, not a person. This channel is " +
+      "weaker than a terminal on the Atlas machine: your disposal key passes through the " +
+      "gateway process and across the network, and Atlas verifies neither the process nor " +
+      "the transport."}));
+    if (cleartextDisposal) {
+      disposeBox.appendChild(el("p", {class: "warn", text:
+        "On this deployment the disposal key crosses the network in the clear. Anyone able " +
+        "to observe this network segment can capture it, and a captured key disposes of " +
+        "records until it is revoked."}));
+    }
+
+    const keyRow = el("div", {class: "row"});
+    const keyInput = document.createElement("input");
+    keyInput.type = "password";
+    keyInput.autocomplete = "off";
+    keyInput.placeholder = "disposal key";
+    keyInput.value = disposeKey;
+    keyInput.addEventListener("input", () => {
+      disposeKey = keyInput.value;
+      disposeKeySave(disposeKey);
+    });
+    keyRow.appendChild(keyInput);
+    keyRow.appendChild(el("p", {class: "dim", text:
+      "The disposal key is remembered for this tab only and forgotten when the tab closes; " +
+      "it is never written to this browser's persistent storage."}));
+    disposeBox.appendChild(keyRow);
+
+    /* `reviewIntentsAllowed` is asked with the revision's own state here --
+       `row.revision_state`, from `decision.list` -- rather than the
+       document's `status` the Queue buttons above use: a REMOTE spend keys
+       on the revision, not the document (Decision 5; `docs/backlog.md:2384`). */
+    const intents = reviewIntentsAllowed(row.revision_state, row.kind);
+    const btnRow = el("div", {class: "row"});
+    if (intents.length === 0) {
+      btnRow.appendChild(el("p", {class: "empty", text: "no disposable action for this record"}));
+    }
+    const resultBox = el("div");
+    for (const intent of intents) {
+      const b = el("button", {class: "go", text: "Dispose: " + intent});
+      b.onclick = async () => {
+        clear(resultBox);
+        /* A2's renderer rule, at the point this panel spends it: `repo`,
+           `uid` and `row.latest_revision` are checked against the shape
+           Atlas gives them before they reach `URLSearchParams`, which would
+           otherwise percent-encode a malformed value into the request
+           rather than refuse it. */
+        if (!(disposeTargetOk(repo, uid, row.latest_revision) && disposeIntentOk(intent))) {
+          say(resultBox,
+              "this record does not have the shape Atlas gives one; nothing was sent", "err");
+          return;
+        }
+        say(resultBox, "requesting a challenge…", "dim");
+        try {
+          const ch = await apiWrite("decision/challenge",
+            {repo: repo, decision: uid, revision: row.latest_revision, intent: intent});
+          renderDisposeConfirm(resultBox, repo, uid, intent, ch);
+        } catch (e) {
+          say(resultBox, String((e && e.message) || e), "err");
+        }
+      };
+      btnRow.appendChild(b);
+    }
+    disposeBox.appendChild(btnRow);
+    disposeBox.appendChild(resultBox);
+  }
+}
+
+/* A16 T7. The confirmation step of a browser disposal: what
+ * `decision.remote_challenge` returned, the two frozen sentences that must
+ * be read before anything is spent, and the digest-prefix field that spends
+ * it. Nothing here is sent until `Confirm` is clicked, and a mismatch sends
+ * nothing at all -- checked in this tab before `decision/dispose` is ever
+ * called. `intent`, `repo` and `uid` are carried from the click that minted
+ * `ch` rather than read back off it: `decision.remote_challenge`'s own
+ * response names no `intent` field (Frozen formats, "The daemon method
+ * group") because a browser always knows which of its own buttons it
+ * pressed. */
+function renderDisposeConfirm(box, repo, uid, intent, ch) {
+  clear(box);
+  /* Validated rather than escaped, on arrival: `ch.content_hash` and
+     `ch.token` are about to be read (`.slice`, an equality compare, a
+     second `apiWrite`) and are about to be sent back to the daemon on
+     `Confirm` -- a malformed value here is refused rather than used, the
+     same rule this panel applies to everything it is about to send. */
+  if (!(typeof ch.content_hash === "string" && RE_DISPOSE_HASH.test(ch.content_hash) &&
+        typeof ch.token === "string" && RE_DISPOSE_CHALLENGE.test(ch.token))) {
+    say(box, "the daemon's challenge does not have the shape Atlas gives one; nothing was sent",
+        "err");
+    return;
+  }
+  box.appendChild(kv([
+    ["intent", intent],
+    ["repository", repo],
+    ["decision id", uid],
+    ["kind", kindTag(ch.kind)],
+    ["revision", ch.revision],
+    ["state", statusTag(ch.state)],
+    ["content hash", el("code", {text: ch.content_hash})],
+    ["expires", ch.expires_at],
+  ]));
+  box.appendChild(el("p", {text:
+    "Disposing from this browser records REMOTE_OPERATOR_CONFIRMED with the credential's " +
+    "id. That names the channel and the credential, not a person. This channel is " +
+    "weaker than a terminal on the Atlas machine: your disposal key passes through the " +
+    "gateway process and across the network, and Atlas verifies neither the process nor " +
+    "the transport."}));
+  box.appendChild(el("p", {text:
+    "Type the first 8 characters of the digest shown above to confirm. " +
+    "A mismatch spends nothing."}));
+  const confirmRow = el("div", {class: "row"});
+  /* `maxlength="8"`: the confirmation field takes exactly the digest-prefix
+     width `RE_REVIEW_PREFIX` already fixes elsewhere on this page. */
+  const confirmInput = document.createElement("input");
+  confirmInput.type = "text";
+  confirmInput.setAttribute("maxlength", "8");
+  confirmRow.appendChild(confirmInput);
+  const confirmBtn = el("button", {class: "go", text: "Confirm"});
+  confirmRow.appendChild(confirmBtn);
+  box.appendChild(confirmRow);
+  const outcome = el("div");
+  box.appendChild(outcome);
+  confirmBtn.onclick = async () => {
+    const typed = confirmInput.value;
+    /* Shape checked before the equality compare, not only before the send:
+       an unchecked `typed` reaching `ch.content_hash.slice(0, 8)` is safe
+       here only because `ch.content_hash` was already validated above, but
+       a `typed` that is not eight lowercase hex characters is still not a
+       confirmation Atlas could ever have produced, so it is refused as one. */
+    if (!RE_REVIEW_PREFIX.test(typed) || typed !== ch.content_hash.slice(0, 8)) {
+      say(outcome, "that is not the confirmation for this revision; nothing was changed", "err");
+      return;
+    }
+    /* `decision.remote_dispose` carries no `revision` field (Frozen formats,
+       "The daemon method group") -- the challenge already pinned it -- so
+       this checks exactly the fields this request sends: `repo`, `uid`,
+       `intent` and the challenge token, never a value this call does not
+       transmit. */
+    if (!(repos.includes(repo) && RE_REVIEW_DECISION.test(uid) && disposeIntentOk(intent) &&
+          RE_DISPOSE_CHALLENGE.test(ch.token))) {
+      say(outcome, "this record does not have the shape Atlas gives one; nothing was sent", "err");
+      return;
+    }
+    clear(outcome);
+    say(outcome, "disposing…", "dim");
+    try {
+      const d = await apiWrite("decision/dispose",
+        {repo: repo, decision: uid, intent: intent, challenge: ch.token, confirmation: typed});
+      clear(outcome);
+      outcome.appendChild(kv([
+        ["state", statusTag(d.state)],
+        ["actor", d.actor],
+        ["key_id", d.key_id],
+      ]));
+      outcome.appendChild(el("p", {text: d.actor_means}));
+      /* The sheet is checked and, if this record is on it, removed only
+         after the fetch above has resolved -- and with no `await` between
+         this load and `reviewQueueRemove`'s own save, for the same race
+         `reviewQueueAdd`'s own comment gives. */
+      const q = reviewQueueLoad();
+      if (q) {
+        const idx = q.findIndex((e) => e.repo === repo && e.decision === uid);
+        if (idx >= 0) { await reviewQueueRemove(idx); }
+      }
+    } catch (e) {
+      say(outcome, String((e && e.message) || e), "err");
+    }
+  };
 }
 
 async function viewReview() {
@@ -1503,6 +1799,15 @@ async function start() {
   } catch (e) { showLogin(); return; }
 
   scopes = new Set((me.scopes || "").split(" ").filter(Boolean));
+  /* A16 T7. `remote_disposal` and `cleartext_disposal` are the two `/auth/me`
+     fields the season adds -- never guessed, and read fresh on every
+     `start()` so a policy edit that requires restarting the gateway is
+     reflected the next time this tab reloads. The key itself is per-tab
+     `sessionStorage`, loaded once here rather than re-typed after a login
+     that only ends the *session*, not the tab. */
+  remoteDisposal = !!me.remote_disposal;
+  cleartextDisposal = !!me.cleartext_disposal;
+  disposeKey = disposeKeyLoad();
   $("login").hidden = true;
   $("app").hidden = false;
   /* An anonymous principal is a real thing an operator's policy granted, not
@@ -1522,6 +1827,7 @@ async function start() {
     signout.textContent = "Sign out";
     signout.onclick = async () => {
       try { await fetch("/auth/logout", {method: "POST", credentials: "same-origin"}); } catch (e) {}
+      disposeKeyClear();
       /* Re-running start() rather than jumping straight to showLogin() is
          what makes the comment above true: with an anonymous floor
          configured, /auth/me answers 200 again right away and this lands back

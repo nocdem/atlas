@@ -23,10 +23,14 @@
  *   - a revoked credential stops working immediately, with no restart;
  *   - an unauthenticated, malformed or absent credential all get one answer.
  */
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -39,11 +43,34 @@
 #include "atlas/decision.h"
 #include "atlas/decision_ops.h"
 #include "atlas/gateway.h"
+#include "atlas/gwpolicy.h"
 #include "atlas/ipc.h"
 #include "atlas/mcp.h"
 #include "atlas_test.h"
 #include "mcp/mcp_internal.h"
 #include "support/fixture.h"
+
+/* A16 T7. `atlas-gw-daemon` (`tests/tools/atlas_gw_daemon.c`) is the real
+ * `atlas_daemon_run` with a gateway policy read from a fixture-written file
+ * rather than `/etc/atlas/gateway.conf` -- the only way to give a test a
+ * daemon whose own `ctx->gwpolicy` carries a `remote_dispose_key`, a
+ * `tls_mode` and an acceptance flag, since `atlas_gwpolicy_load`'s
+ * root-ownership walk can never pass for a fixture. This file's own fixture
+ * daemon (`env`/`env_open`, `fx_daemon_start`) runs with no such policy at
+ * all, which is exactly why `decision.remote_challenge` and
+ * `decision.remote_dispose` are unreachable through it --
+ * `atlas_server_remote_disposal_offered` needs the *daemon's own* policy to
+ * be ENABLED with a real disposal key, not merely the in-process HTTP
+ * gateway's. `tests/test_gw_dispose.c` builds the identical binary and the
+ * identical policy shape for the identical reason; restated here rather than
+ * shared, on that file's own precedent (its header comment on
+ * "Deliberately not shared with `server_decision.c`", one layer up: two
+ * different test binaries with two different fixtures sharing one helper is
+ * one more place a future change to either quietly becomes a change to
+ * both). */
+#ifndef ATLAS_GW_DAEMON_BIN
+#define ATLAS_GW_DAEMON_BIN "atlas-gw-daemon"
+#endif
 
 typedef struct env {
     fixture fx;
@@ -2560,6 +2587,397 @@ static void test_mission_control_carries_the_review_view(void) {
     env_close(&e);
 }
 
+/* --- A16 T7: the disposal panel -------------------------------------------- */
+
+/* Forks `atlas-gw-daemon DATA_DIR POLICY_FILE` -- `fx_daemon_start`'s own
+ * shape, restated for a different binary and a different pair of arguments,
+ * exactly as `tests/test_gw_dispose.c`'s own `gwd_start` restates it rather
+ * than sharing it (see this file's header comment on why a second daemon
+ * binary is needed at all, and that file's own header on why the restatement
+ * rather than a shared helper). `fx_daemon_wait_ready` / `_stop` / `_free`
+ * are reused unchanged afterwards: they are generic over the `fx_daemon`
+ * struct's fields and never reference the binary that filled them in. */
+static atlas_status t7_gwd_start(fixture *fx, fx_daemon *d, const char *policy_path,
+                                 atlas_err *err) {
+    atlas_status dst = atlas_buf_set_str(&d->data_dir, fx_data_dir(fx), err);
+    if (dst != ATLAS_OK) {
+        return dst;
+    }
+    atlas_status st = atlas_buf_set(&d->runtime_dir, fx->root.data, fx->root.len, err);
+    if (st == ATLAS_OK) {
+        st = atlas_buf_append_str(&d->runtime_dir, "/gwrun", err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_buf_set(&d->log_path, fx->root.data, fx->root.len, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_buf_append_str(&d->log_path, "/gwdaemon.log", err);
+    }
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    if (mkdir(atlas_buf_cstr(&d->runtime_dir), S_IRWXU) != 0 && errno != EEXIST) {
+        return atlas_err_set_errno(err, ATLAS_ERR_CONFIG, errno, "cannot create %s",
+                                   atlas_buf_cstr(&d->runtime_dir));
+    }
+    st = atlas_buf_set(&d->socket, d->runtime_dir.data, d->runtime_dir.len, err);
+    if (st == ATLAS_OK) {
+        st = atlas_buf_append_str(&d->socket, "/atlas/atlas.sock", err);
+    }
+    if (st != ATLAS_OK) {
+        return st;
+    }
+
+    atlas_buf xdg = ATLAS_BUF_INIT;
+    atlas_buf path_env = ATLAS_BUF_INIT;
+    const char *path = getenv("PATH");
+    st = atlas_buf_appendf(&xdg, err, "XDG_RUNTIME_DIR=%s", atlas_buf_cstr(&d->runtime_dir));
+    if (st == ATLAS_OK) {
+        st = atlas_buf_appendf(&path_env, err, "PATH=%s",
+                               (path != NULL && path[0] != '\0') ? path : "/usr/bin:/bin");
+    }
+    if (st != ATLAS_OK) {
+        atlas_buf_free(&xdg);
+        atlas_buf_free(&path_env);
+        return st;
+    }
+
+    const char *argv[] = {ATLAS_GW_DAEMON_BIN, atlas_buf_cstr(&d->data_dir), policy_path, NULL};
+    const char *envp[] = {atlas_buf_cstr(&path_env), "LC_ALL=C", "TZ=UTC", atlas_buf_cstr(&xdg),
+                          NULL};
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        st = atlas_err_set_errno(err, ATLAS_ERR_INTERNAL, errno, "cannot fork a daemon");
+        atlas_buf_free(&xdg);
+        atlas_buf_free(&path_env);
+        return st;
+    }
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_RDONLY);
+        int logfd = open(atlas_buf_cstr(&d->log_path), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (devnull >= 0) {
+            (void)dup2(devnull, STDIN_FILENO);
+        }
+        if (logfd >= 0) {
+            (void)dup2(logfd, STDOUT_FILENO);
+            (void)dup2(logfd, STDERR_FILENO);
+        }
+        (void)setpgid(0, 0);
+        union {
+            const char *const *in;
+            char *const *out;
+        } a = {argv}, ev = {envp};
+        (void)execve(ATLAS_GW_DAEMON_BIN, a.out, ev.out);
+        _exit(127);
+    }
+    d->pid = pid;
+    atlas_buf_free(&xdg);
+    atlas_buf_free(&path_env);
+    return ATLAS_OK;
+}
+
+/* Builds one complete HTTP/1.1 request with an explicit `Content-Type` --
+ * every route this file drove before this season sends `application/json`
+ * (`request`, `gui_request`, `full_request` above), and a disposal is the
+ * first request in this file that must not. Built exactly as `apiWrite` in
+ * `mission-control.html` builds it: `POST`, the disposal key as a bearer,
+ * `Content-Type: application/x-www-form-urlencoded` with no `charset`
+ * parameter, and the body as query-string-syntax form fields -- so a route
+ * that answered 415 to the browser's real header would answer 415 here
+ * too. */
+static void t7_post_form(atlas_gateway *g, const char *path, const char *bearer_token,
+                         const char *body, atlas_buf *resp) {
+    atlas_err err;
+    atlas_err_init(&err);
+    atlas_buf req = ATLAS_BUF_INIT;
+    size_t blen = strlen(body);
+    T_OK(atlas_buf_appendf(&req, &err, "POST %s HTTP/1.1\r\nHost: t\r\n", path), &err);
+    T_OK(atlas_buf_appendf(&req, &err, "Authorization: Bearer %s\r\n", bearer_token), &err);
+    T_OK(atlas_buf_appendf(&req, &err,
+                           "Content-Type: application/x-www-form-urlencoded\r\n"
+                           "Content-Length: %zu\r\n\r\n",
+                           blen),
+         &err);
+    T_OK(atlas_buf_append(&req, body, blen, &err), &err);
+    T_OK(atlas_gateway_serve_bytes(g, req.data, req.len, resp, &err), &err);
+    atlas_buf_free(&req);
+}
+
+/* A flat, non-nested string field out of the daemon's own streaming JSON --
+ * every field this test reads (`content_hash`, `token`, `key_id`, `actor`)
+ * is one of these, with no pretty-printing to confuse a `strstr`. */
+static bool t7_json_str(const char *body, const char *key, char *out, size_t out_size) {
+    char needle[64];
+    int n = snprintf(needle, sizeof needle, "\"%s\":\"", key);
+    if (n <= 0 || (size_t)n >= sizeof needle) {
+        return false;
+    }
+    const char *p = strstr(body, needle);
+    if (p == NULL) {
+        return false;
+    }
+    p += (size_t)n;
+    size_t k = 0;
+    while (p[k] != '\0' && p[k] != '"' && k + 1 < out_size) {
+        k++;
+    }
+    memcpy(out, p, k);
+    out[k] = '\0';
+    return true;
+}
+
+/* A16 T7. The disposal panel: a page-level property test -- the byte grep
+ * every binding and frozen sentence the panel depends on -- plus one
+ * HTTP-level property test, the two routes driven with a real bearer
+ * against a real daemon, exactly as the page's own `apiWrite` would send
+ * them (`decision/challenge` then `decision/dispose`, over
+ * `atlas_gateway_serve_bytes`, no listening port).
+ *
+ * **No JavaScript on this page is executed anywhere in this test, or
+ * anywhere in this suite.** There is no browser here: the first half reads
+ * the served bytes as text, and the second half is C constructing the exact
+ * HTTP requests the page's own bindings name and reading the exact daemon
+ * responses the page's own field names expect. That establishes the routes
+ * the panel calls are real, accept the shape it sends, and answer the shape
+ * it reads -- never that the panel's own DOM code runs correctly, which
+ * nothing in this suite can establish. */
+static void test_mission_control_carries_the_disposal_panel(void) {
+    env e;
+    memset(&e, 0, sizeof e);
+    atlas_err err;
+    atlas_err_init(&err);
+
+    T_REQUIRE(fx_open(&e.fx, &err) == ATLAS_OK);
+    T_OK(fx_init_repo(&e.fx, fx_repo(&e.fx), NULL, &err), &err);
+    T_OK(fx_write(fx_repo(&e.fx), "main.c", "int main(void){return 0;}\n", &err), &err);
+    T_OK(fx_add_all(&e.fx, fx_repo(&e.fx), &err), &err);
+    T_OK(fx_commit(&e.fx, fx_repo(&e.fx), "first", &err), &err);
+
+    atlas_buf out = ATLAS_BUF_INIT;
+    {
+        const char *add[] = {"repo", "add", fx_repo(&e.fx), "--name", "proj"};
+        T_EQ_INT(run_cli(&e, add, 5, &out, &err), 0);
+    }
+    {
+        const char *scan[] = {"scan", "proj"};
+        T_EQ_INT(run_cli(&e, scan, 2, &out, &err), 0);
+    }
+
+    char uid[64];
+    {
+        const char *propose[] = {
+            "decision",   "propose", "proj", "--kind", "OPERATIONAL_FACT",
+            "--title",    "a disposal-panel probe",
+            "--decision", "Something the disposal panel can dispose of.",
+            "--path",     "main.c",
+        };
+        T_EQ_INT(run_cli(&e, propose, sizeof propose / sizeof propose[0], &out, &err), 0);
+    }
+    capture_decision_uid(&out, uid, sizeof uid);
+    atlas_buf_reset(&out);
+
+    {
+        const char *create[] = {"api-key", "create", "--label", "browser-dispose", "--no-scopes"};
+        T_EQ_INT(run_cli(&e, create, 5, &out, &err), 0);
+        capture_key(&e, &out);
+    }
+    atlas_buf_free(&out);
+
+    /* The policy names this key as the disposal credential. `tls_mode =
+       REVERSE_PROXY` rather than the cleartext-acceptance key: this test is
+       about the two routes and the page's bindings, not the acceptance
+       flow, which `tests/test_gw_dispose.c` already covers on its own. */
+    atlas_buf ptext = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_appendf(&ptext, &err,
+                           "enabled = yes\ngateway_uid = %lld\nremote_mcp = yes\n"
+                           "web_gui = yes\ntls_mode = REVERSE_PROXY\nremote_dispose_key = "
+                           "key_%s\nremote_dispose_kinds = OPERATIONAL_FACT\n",
+                           (long long)getuid(), e.key_id),
+         &err);
+    atlas_buf ppath = ATLAS_BUF_INIT;
+    T_OK(fx_write(atlas_buf_cstr(&e.fx.root), "gwd.conf", atlas_buf_cstr(&ptext), &err), &err);
+    T_OK(atlas_buf_appendf(&ppath, &err, "%s/gwd.conf", atlas_buf_cstr(&e.fx.root)), &err);
+
+    /* `e.d` here is `atlas-gw-daemon`, never `fx_daemon_start`'s regular
+       daemon -- the latter runs with no gateway policy at all, which is
+       exactly the "legacy-mode trick" that cannot reach this surface (see
+       the file header comment on why a second daemon binary is needed). */
+    fx_daemon_init(&e.d);
+    T_OK(t7_gwd_start(&e.fx, &e.d, atlas_buf_cstr(&ppath), &err), &err);
+    T_OK(fx_daemon_wait_ready(&e.d, 15000, &err), &err);
+
+    atlas_gwpolicy p;
+    atlas_gwpolicy_parse_buffer(atlas_buf_cstr(&ptext), ptext.len, &p);
+    T_REQUIRE_MSG(p.state == ATLAS_GWPOLICY_ENABLED,
+                 "the policy given to the HTTP gateway does not parse as ENABLED");
+    atlas_gateway_opts o;
+    memset(&o, 0, sizeof o);
+    o.socket_path = atlas_buf_cstr(&e.d.socket);
+    o.timeout_ms = 15000;
+    atlas_gateway *g = NULL;
+    T_OK(atlas_gateway_open(&p, &o, &g, &err), &err);
+
+    /* --- the page: the bindings and frozen sentences the panel depends on --- */
+    atlas_buf resp = ATLAS_BUF_INIT;
+    gui_request(g, "GET", "/", NULL, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 200);
+    const char *page = body_of(&resp);
+
+    static const char *const BOUND[] = {
+        "disposeKey",
+        "apiWrite",
+        "decision/challenge",
+        "decision/dispose",
+        "remote_disposal",
+        "cleartext_disposal",
+        "crosses the network in the clear",
+        "credentials: \"omit\"",
+        "application/x-www-form-urlencoded",
+        "maxlength=\"8\"",
+        "names the channel and the credential, not a person",
+        "weaker than a terminal on the Atlas machine",
+        "A mismatch spends nothing",
+        "does not serve remote disposal",
+        /* Row 3's answer (`docs/plans/2026-09-04-browser-disposal.md`,
+           "Decisions the operator must be asked") is `sessionStorage`, so
+           the sessionStorage-variant sentence is required... */
+        "remembered for this tab only",
+    };
+    for (size_t i = 0; i < sizeof BOUND / sizeof BOUND[0]; i++) {
+        T_CHECK_MSG(strstr(page, BOUND[i]) != NULL, "the page carries no binding for \"%s\"",
+                    BOUND[i]);
+    }
+    /* ...and the memory-only variant it replaces must be absent, not merely
+       unused: the two sentences differ only in what happens to the key, and
+       carrying both would tell a reader nothing about which is true. */
+    T_CHECK_MSG(strstr(page, "held in this tab's memory only") == NULL,
+                "the page carries the memory-only variant of the storage sentence, which "
+                "row 3's sessionStorage answer replaces rather than joins");
+
+    /* The four DOM APIs that would parse a string as markup rather than
+       insert it as text. */
+    static const char *const MARKUP_SINKS[] = {
+        "innerHTML",
+        "outerHTML",
+        "insertAdjacentHTML",
+        "document.write",
+    };
+    for (size_t i = 0; i < sizeof MARKUP_SINKS / sizeof MARKUP_SINKS[0]; i++) {
+        T_CHECK_MSG(strstr(page, MARKUP_SINKS[i]) == NULL,
+                    "the page uses the markup-parsing sink \"%s\"", MARKUP_SINKS[i]);
+    }
+    T_CHECK_MSG(strstr(page, "proves") == NULL,
+                "the page asserts something in the coined word \"proves\" rather than "
+                "reporting a daemon-observed fact");
+
+    /* A coarse grep, stated as coarse: it only proves the queue's own save
+       (`reviewQueueSave`, which contains the literal text below) and the
+       disposal fetch (`apiWrite`) are not textually the same function body.
+       It does not parse JavaScript and cannot see through indirection; it is
+       exactly as strong as "these two literal substrings never co-occur
+       between one `function` keyword and its matching closing brace", which
+       is enough to catch the one mistake this checks for -- merging the
+       queue's synchronous load/save pair with an `await`-ing disposal fetch
+       -- without needing a JavaScript parser this suite does not have. */
+    {
+        const char *scan = page;
+        bool found_conflict = false;
+        for (;;) {
+            const char *fn = strstr(scan, "function ");
+            if (fn == NULL) {
+                break;
+            }
+            const char *body_start = strchr(fn, '{');
+            if (body_start == NULL) {
+                break;
+            }
+            int depth = 1;
+            const char *q = body_start + 1;
+            while (*q != '\0' && depth > 0) {
+                if (*q == '{') {
+                    depth++;
+                } else if (*q == '}') {
+                    depth--;
+                }
+                q++;
+            }
+            size_t flen = (size_t)(q - body_start);
+            char *fnbuf = malloc(flen + 1u);
+            T_REQUIRE(fnbuf != NULL);
+            memcpy(fnbuf, body_start, flen);
+            fnbuf[flen] = '\0';
+            if (strstr(fnbuf, "localStorage.setItem(REVIEW_SHEET_KEY") != NULL &&
+                strstr(fnbuf, "apiWrite(") != NULL) {
+                found_conflict = true;
+            }
+            free(fnbuf);
+            scan = q;
+        }
+        T_CHECK_MSG(!found_conflict,
+                    "some function both saves the review sheet directly and calls apiWrite -- "
+                    "the queue save and the disposal fetch must stay two functions");
+    }
+
+    /* Every write route sets `Content-Type` explicitly alongside a
+       `URLSearchParams` body (`fetch`'s own Request algorithm only derives
+       one from the body when the header list does not already carry one),
+       so no code path may ever produce the browser-default
+       `application/x-www-form-urlencoded;charset=UTF-8` -- a real
+       `strcmp` mismatch against the literal `src/gw/gateway.c:1404` checks,
+       which would 415 every disposal in production while every test here
+       still passed, because no test executes the page's JavaScript. */
+    T_CHECK_MSG(strstr(page, ";charset") == NULL,
+                "the page names a Content-Type parameter; the write routes need the bare "
+                "literal with none");
+
+    /* --- the routes: the same bearer, the same body shape, the same daemon --- */
+    char body1[512];
+    (void)snprintf(body1, sizeof body1, "repo=proj&decision=%s&revision=1&intent=reject", uid);
+    atlas_buf_reset(&resp);
+    t7_post_form(g, "/api/v1/decision/challenge", e.token, body1, &resp);
+    T_CHECK_MSG(status_of(&resp) == 200, "the challenge route answered %d: %s", status_of(&resp),
+                body_of(&resp));
+    T_CHECK_MSG(strstr(body_of(&resp), "\"confirm\"") == NULL,
+                "the mint response carried a \"confirm\" key");
+
+    char content_hash[128], token[128], key_id[ATLAS_APIKEY_SELECTOR_HEX + 1u];
+    T_REQUIRE_MSG(t7_json_str(body_of(&resp), "content_hash", content_hash, sizeof content_hash),
+                 "no content_hash: %s", body_of(&resp));
+    T_REQUIRE_MSG(t7_json_str(body_of(&resp), "token", token, sizeof token), "no token: %s",
+                 body_of(&resp));
+    T_REQUIRE_MSG(t7_json_str(body_of(&resp), "key_id", key_id, sizeof key_id), "no key_id: %s",
+                 body_of(&resp));
+    T_CHECK_MSG(strcmp(key_id, e.key_id) == 0, "wrong key_id: %s", key_id);
+
+    char confirmation[16];
+    (void)snprintf(confirmation, sizeof confirmation, "%.8s", content_hash);
+
+    char body2[512];
+    (void)snprintf(body2, sizeof body2,
+                   "repo=proj&decision=%s&intent=reject&challenge=%s&confirmation=%s", uid, token,
+                   confirmation);
+    atlas_buf_reset(&resp);
+    t7_post_form(g, "/api/v1/decision/dispose", e.token, body2, &resp);
+    T_CHECK_MSG(status_of(&resp) == 200, "the dispose route answered %d: %s", status_of(&resp),
+                body_of(&resp));
+
+    char actor[64];
+    T_REQUIRE_MSG(t7_json_str(body_of(&resp), "actor", actor, sizeof actor), "no actor: %s",
+                 body_of(&resp));
+    T_CHECK_MSG(strcmp(actor, "REMOTE_OPERATOR_CONFIRMED") == 0, "wrong actor: %s", actor);
+    T_CHECK_MSG(strstr(body_of(&resp), "actor_means") != NULL, "no actor_means: %s",
+               body_of(&resp));
+
+    atlas_gateway_close(g);
+    fx_daemon_stop(&e.d, false);
+    fx_daemon_free(&e.d);
+    atlas_buf_free(&resp);
+    atlas_buf_free(&ppath);
+    atlas_buf_free(&ptext);
+    fx_close(&e.fx);
+}
+
 static const atlas_test TESTS[] = {
     {"a scoped credential can call a tool", test_a_scoped_credential_can_call_a_tool},
     {"a tool outside the scopes is refused and hidden",
@@ -2599,6 +3017,8 @@ static const atlas_test TESTS[] = {
      test_mission_control_reaches_the_verification_routes},
     {"the review parameters reach the daemon", test_the_review_parameters_reach_the_daemon},
     {"mission control carries the review view", test_mission_control_carries_the_review_view},
+    {"mission control carries the disposal panel",
+     test_mission_control_carries_the_disposal_panel},
     {"concurrent connections are safe", test_concurrent_connections_are_safe},
 };
 

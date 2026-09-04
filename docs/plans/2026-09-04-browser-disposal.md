@@ -1101,6 +1101,22 @@ the credential presented for this disposal did not authenticate; nothing was cha
 that credential is not the one the remote disposal policy names
 the remote disposal credential must hold no stored scope, and %s holds %s
 a remote challenge is minted only for the newest revision; r%lld was reviewed but r%lld is newest -- read it again
+
+**Amended during execution, 2026-09-04.** This sentence carries `ATLAS_ERR_INTEGRITY`,
+not `ATLAS_ERR_USAGE` — so 409 through the gateway and exit 7 at the terminal, matching
+its spend-time twin rather than differing from it.
+
+T6's review found the two halves of the amendment's *own named scenario* landing on
+different statuses: an operator reading a record while a colleague revises it gets **400**
+if the revision moved before the challenge was minted and **409** if it moved after. The
+"one frozen sentence, one class" rule is not violated — these are two sentences — but the
+rule exists to stop one real-world event answering in two voices, and here it did.
+
+The class is INTEGRITY because the refusal is **about state, not about the request**. A
+caller who sends a perfectly well-formed request gets this refusal; nothing about what
+they sent is wrong. `400` tells them to fix their request, which is advice they cannot
+act on. `409` tells them the record moved, which is what happened and what "read it
+again" already says in the sentence itself.
 this decision gained revision %lld after the challenge was minted; nothing was changed -- read it again
 a remote challenge names the revision it is for; 0 is not a revision
 a record of kind %s is not one the remote disposal policy names; dispose of it on a terminal

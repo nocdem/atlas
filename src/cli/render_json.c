@@ -1613,10 +1613,11 @@ static atlas_status j_apikey_created(atlas_renderer *r, const atlas_apikey_creat
                                "line gives jobs:submit, and the same key may never be named by both",
                                err));
         if (c->rotated_from[0] != '\0') {
-            char reminder[192];
+            char reminder[256];
             (void)snprintf(reminder, sizeof reminder,
-                          "the policy line remote_dispose_key must now name %s%s; until it "
-                          "does, neither key can dispose",
+                          "the policy line that names the previous key (remote_dispose_key or "
+                          "a remote_submit_key) must now name %s%s; until it does, neither key "
+                          "can use the role that line grants",
                           ATLAS_APIKEY_ID_PREFIX, c->key_id);
             TRY(atlas_json_key_str(j, "rotate_dispose_reminder", reminder, err));
         }

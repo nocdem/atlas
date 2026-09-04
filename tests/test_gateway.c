@@ -188,6 +188,201 @@ static void test_every_malformed_policy_disables_the_gateway(void) {
         {"the acceptance with neither disposal key",
          "enabled = yes\ngateway_uid = 1001\nweb_gui = yes\n"
          "operator_accepts_cleartext_disposal = yes\n"},
+
+        /* A14: the eight submission keys and the acceptance key.
+         * Every base text below already carries `tls_mode = REVERSE_PROXY` so
+         * that the one condition each case means to break is the only one that
+         * can be the reason -- a case that also happened to fail a tls_mode
+         * cross-check would not actually be testing what its name says.
+         * The complete valid set (all seven required keys present under
+         * REVERSE_PROXY) is in the ENABLED tests that follow this matrix. */
+        {"remote_submit_key with 15 hex characters instead of 16",
+         "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\ntls_mode = REVERSE_PROXY\n"
+         "remote_submit_key = key_b2578f48143c06\n"
+         "remote_submit_driver = claude\nremote_submit_mode = patch\n"
+         "remote_submit_gate = make\nremote_submit_max_attempts = 1\n"
+         "remote_submit_max_active = 2\nremote_submit_max_per_day = 6\n"},
+        {"remote_submit_key in uppercase hex",
+         "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\ntls_mode = REVERSE_PROXY\n"
+         "remote_submit_key = key_B2578F48143C06D3\n"
+         "remote_submit_driver = claude\nremote_submit_mode = patch\n"
+         "remote_submit_gate = make\nremote_submit_max_attempts = 1\n"
+         "remote_submit_max_active = 2\nremote_submit_max_per_day = 6\n"},
+        {"remote_submit_key with no key_ prefix",
+         "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\ntls_mode = REVERSE_PROXY\n"
+         "remote_submit_key = b2578f48143c06d3\n"
+         "remote_submit_driver = claude\nremote_submit_mode = patch\n"
+         "remote_submit_gate = make\nremote_submit_max_attempts = 1\n"
+         "remote_submit_max_active = 2\nremote_submit_max_per_day = 6\n"},
+        {"duplicate remote_submit_key",
+         "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\ntls_mode = REVERSE_PROXY\n"
+         "remote_submit_key = key_b2578f48143c06d3\n"
+         "remote_submit_key = key_b2578f48143c06d3\n"
+         "remote_submit_driver = claude\nremote_submit_mode = patch\n"
+         "remote_submit_gate = make\nremote_submit_max_attempts = 1\n"
+         "remote_submit_max_active = 2\nremote_submit_max_per_day = 6\n"},
+        {"more than four remote_submit_key lines",
+         "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\ntls_mode = REVERSE_PROXY\n"
+         "remote_submit_key = key_b2578f48143c06d3\n"
+         "remote_submit_key = key_1f0a2b3c4d5e6f70\n"
+         "remote_submit_key = key_a1b2c3d4e5f60718\n"
+         "remote_submit_key = key_0011223344556677\n"
+         "remote_submit_key = key_9988776655443322\n"
+         "remote_submit_driver = claude\nremote_submit_mode = patch\n"
+         "remote_submit_gate = make\nremote_submit_max_attempts = 1\n"
+         "remote_submit_max_active = 2\nremote_submit_max_per_day = 6\n"},
+        {"remote_submit_key equal to remote_dispose_key",
+         "enabled = yes\ngateway_uid = 1001\nweb_gui = yes\ntls_mode = REVERSE_PROXY\n"
+         "remote_dispose_key = key_581e0a805cc1febe\nremote_dispose_kinds = PARKED\n"
+         "remote_submit_key = key_581e0a805cc1febe\n"
+         "remote_submit_driver = claude\nremote_submit_mode = patch\n"
+         "remote_submit_gate = make\nremote_submit_max_attempts = 1\n"
+         "remote_submit_max_active = 2\nremote_submit_max_per_day = 6\n"},
+        {"remote_submit_key with all other submission lines absent",
+         "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\ntls_mode = REVERSE_PROXY\n"
+         "remote_submit_key = key_b2578f48143c06d3\n"},
+        {"remote_submit_driver without submit key",
+         "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\ntls_mode = REVERSE_PROXY\n"
+         "remote_submit_driver = claude\nremote_submit_mode = patch\n"
+         "remote_submit_gate = make\nremote_submit_max_attempts = 1\n"
+         "remote_submit_max_active = 2\nremote_submit_max_per_day = 6\n"},
+        {"duplicate remote_submit_driver line",
+         "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\ntls_mode = REVERSE_PROXY\n"
+         "remote_submit_key = key_b2578f48143c06d3\n"
+         "remote_submit_driver = claude\nremote_submit_driver = fake\n"
+         "remote_submit_mode = patch\nremote_submit_gate = make\n"
+         "remote_submit_max_attempts = 1\nremote_submit_max_active = 2\n"
+         "remote_submit_max_per_day = 6\n"},
+        {"remote_submit_driver with an invalid name (uppercase)",
+         "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\ntls_mode = REVERSE_PROXY\n"
+         "remote_submit_key = key_b2578f48143c06d3\n"
+         "remote_submit_driver = Claude\nremote_submit_mode = patch\n"
+         "remote_submit_gate = make\nremote_submit_max_attempts = 1\n"
+         "remote_submit_max_active = 2\nremote_submit_max_per_day = 6\n"},
+        {"duplicate remote_submit_mode line",
+         "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\ntls_mode = REVERSE_PROXY\n"
+         "remote_submit_key = key_b2578f48143c06d3\n"
+         "remote_submit_driver = claude\nremote_submit_mode = patch\n"
+         "remote_submit_mode = apply\nremote_submit_gate = make\n"
+         "remote_submit_max_attempts = 1\nremote_submit_max_active = 2\n"
+         "remote_submit_max_per_day = 6\n"},
+        {"a gate line with a control byte",
+         "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\ntls_mode = REVERSE_PROXY\n"
+         "remote_submit_key = key_b2578f48143c06d3\n"
+         "remote_submit_driver = claude\nremote_submit_mode = patch\n"
+         "remote_submit_gate = make\x01\nremote_submit_max_attempts = 1\n"
+         "remote_submit_max_active = 2\nremote_submit_max_per_day = 6\n"},
+        {"a gate line whose first token contains a slash",
+         "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\ntls_mode = REVERSE_PROXY\n"
+         "remote_submit_key = key_b2578f48143c06d3\n"
+         "remote_submit_driver = claude\nremote_submit_mode = patch\n"
+         "remote_submit_gate = /usr/bin/make\nremote_submit_max_attempts = 1\n"
+         "remote_submit_max_active = 2\nremote_submit_max_per_day = 6\n"},
+        {"remote_submit_max_attempts of 0",
+         "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\ntls_mode = REVERSE_PROXY\n"
+         "remote_submit_key = key_b2578f48143c06d3\n"
+         "remote_submit_driver = claude\nremote_submit_mode = patch\n"
+         "remote_submit_gate = make\nremote_submit_max_attempts = 0\n"
+         "remote_submit_max_active = 2\nremote_submit_max_per_day = 6\n"},
+        {"remote_submit_max_attempts above ATLAS_ORCH_MAX_ATTEMPTS (5)",
+         "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\ntls_mode = REVERSE_PROXY\n"
+         "remote_submit_key = key_b2578f48143c06d3\n"
+         "remote_submit_driver = claude\nremote_submit_mode = patch\n"
+         "remote_submit_gate = make\nremote_submit_max_attempts = 6\n"
+         "remote_submit_max_active = 2\nremote_submit_max_per_day = 6\n"},
+        {"remote_submit_max_active of 0",
+         "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\ntls_mode = REVERSE_PROXY\n"
+         "remote_submit_key = key_b2578f48143c06d3\n"
+         "remote_submit_driver = claude\nremote_submit_mode = patch\n"
+         "remote_submit_gate = make\nremote_submit_max_attempts = 1\n"
+         "remote_submit_max_active = 0\nremote_submit_max_per_day = 6\n"},
+        {"remote_submit_max_active above ceiling (8)",
+         "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\ntls_mode = REVERSE_PROXY\n"
+         "remote_submit_key = key_b2578f48143c06d3\n"
+         "remote_submit_driver = claude\nremote_submit_mode = patch\n"
+         "remote_submit_gate = make\nremote_submit_max_attempts = 1\n"
+         "remote_submit_max_active = 9\nremote_submit_max_per_day = 6\n"},
+        {"remote_submit_max_per_day of 0",
+         "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\ntls_mode = REVERSE_PROXY\n"
+         "remote_submit_key = key_b2578f48143c06d3\n"
+         "remote_submit_driver = claude\nremote_submit_mode = patch\n"
+         "remote_submit_gate = make\nremote_submit_max_attempts = 1\n"
+         "remote_submit_max_active = 2\nremote_submit_max_per_day = 0\n"},
+        {"remote_submit_max_per_day above ceiling (64)",
+         "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\ntls_mode = REVERSE_PROXY\n"
+         "remote_submit_key = key_b2578f48143c06d3\n"
+         "remote_submit_driver = claude\nremote_submit_mode = patch\n"
+         "remote_submit_gate = make\nremote_submit_max_attempts = 1\n"
+         "remote_submit_max_active = 2\nremote_submit_max_per_day = 65\n"},
+        {"all submission lines with tls_mode = NONE and no cleartext acceptance",
+         "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\ntls_mode = NONE\n"
+         "remote_submit_key = key_b2578f48143c06d3\n"
+         "remote_submit_driver = claude\nremote_submit_mode = patch\n"
+         "remote_submit_gate = make\nremote_submit_max_attempts = 1\n"
+         "remote_submit_max_active = 2\nremote_submit_max_per_day = 6\n"},
+        {"all submission lines with no tls_mode and no cleartext acceptance",
+         "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\n"
+         "remote_submit_key = key_b2578f48143c06d3\n"
+         "remote_submit_driver = claude\nremote_submit_mode = patch\n"
+         "remote_submit_gate = make\nremote_submit_max_attempts = 1\n"
+         "remote_submit_max_active = 2\nremote_submit_max_per_day = 6\n"},
+        {"operator_accepts_cleartext_submission = no",
+         "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\ntls_mode = NONE\n"
+         "remote_submit_key = key_b2578f48143c06d3\n"
+         "remote_submit_driver = claude\nremote_submit_mode = patch\n"
+         "remote_submit_gate = make\nremote_submit_max_attempts = 1\n"
+         "remote_submit_max_active = 2\nremote_submit_max_per_day = 6\n"
+         "operator_accepts_cleartext_submission = no\n"},
+        {"operator_accepts_cleartext_submission = true",
+         "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\ntls_mode = NONE\n"
+         "remote_submit_key = key_b2578f48143c06d3\n"
+         "remote_submit_driver = claude\nremote_submit_mode = patch\n"
+         "remote_submit_gate = make\nremote_submit_max_attempts = 1\n"
+         "remote_submit_max_active = 2\nremote_submit_max_per_day = 6\n"
+         "operator_accepts_cleartext_submission = true\n"},
+        {"the submission acceptance with tls_mode = REVERSE_PROXY",
+         "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\ntls_mode = REVERSE_PROXY\n"
+         "remote_submit_key = key_b2578f48143c06d3\n"
+         "remote_submit_driver = claude\nremote_submit_mode = patch\n"
+         "remote_submit_gate = make\nremote_submit_max_attempts = 1\n"
+         "remote_submit_max_active = 2\nremote_submit_max_per_day = 6\n"
+         "operator_accepts_cleartext_submission = yes\n"},
+        {"operator_accepts_cleartext_submission without a submit key",
+         "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\n"
+         "operator_accepts_cleartext_submission = yes\n"},
+        {"jobs:submit in web_gui_anonymous_scopes (refused by ungrantable check)",
+         "enabled = yes\ngateway_uid = 1001\nweb_gui = yes\n"
+         "web_gui_anonymous_scopes = repo:read jobs:submit\n"},
+        /* A14 cross-check: disposal cleartext accepted, submission lines present,
+         * but no submission cleartext acceptance -- the two acceptances are
+         * independent (NOT implied by each other). */
+        {"disposal acceptance only with all submit lines under NONE (submission not accepted)",
+         "enabled = yes\ngateway_uid = 1001\nweb_gui = yes\ntls_mode = NONE\n"
+         "remote_dispose_key = key_581e0a805cc1febe\nremote_dispose_kinds = PARKED\n"
+         "operator_accepts_cleartext_disposal = yes\n"
+         "remote_submit_key = key_b2578f48143c06d3\n"
+         "remote_submit_driver = claude\nremote_submit_mode = patch\n"
+         "remote_submit_gate = make\nremote_submit_max_attempts = 1\n"
+         "remote_submit_max_active = 2\nremote_submit_max_per_day = 6\n"},
+        /* Nine remote_submit_gate lines -- max is ATLAS_ORCH_MAX_VALIDATIONS = 8. */
+        {"nine remote_submit_gate lines (one over ATLAS_ORCH_MAX_VALIDATIONS)",
+         "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\ntls_mode = REVERSE_PROXY\n"
+         "remote_submit_key = key_b2578f48143c06d3\n"
+         "remote_submit_driver = claude\nremote_submit_mode = patch\n"
+         "remote_submit_gate = make\nremote_submit_gate = test\n"
+         "remote_submit_gate = lint\nremote_submit_gate = fmt\n"
+         "remote_submit_gate = build\nremote_submit_gate = check\n"
+         "remote_submit_gate = scan\nremote_submit_gate = verify\n"
+         "remote_submit_gate = ninth\n"
+         "remote_submit_max_attempts = 1\nremote_submit_max_active = 2\n"
+         "remote_submit_max_per_day = 6\n"},
+        /* remote_submit_mode must match is_submit_name: lower-alpha/digit/-/_/. only. */
+        {"remote_submit_mode with an uppercase character",
+         "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\ntls_mode = REVERSE_PROXY\n"
+         "remote_submit_key = key_b2578f48143c06d3\n"
+         "remote_submit_driver = claude\nremote_submit_mode = Patch\n"
+         "remote_submit_gate = make\nremote_submit_max_attempts = 1\n"
+         "remote_submit_max_active = 2\nremote_submit_max_per_day = 6\n"},
     };
 
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
@@ -198,6 +393,33 @@ static void test_every_malformed_policy_disables_the_gateway(void) {
         /* And nothing partial survives: a disabled policy must not be usable
          * for the fields it did manage to read. */
         T_CHECK_MSG(p.reason != ATLAS_GWPOLICY_REASON_ACTIVE, "%s reported ACTIVE", cases[i].name);
+    }
+
+    /* Over-long gate line (>= ATLAS_GWPOLICY_GATE_LINE_MAX = 256 bytes).
+     * Cannot be expressed as a C string literal of known length, so built
+     * programmatically and tested outside the table loop. */
+    {
+        char gate_text[1024];
+        /* Build a policy with a gate line of exactly 256 printable characters
+         * (no '/' in the first token) -- one byte over the 255-byte maximum. */
+        char gate_val[300];
+        memset(gate_val, 'x', sizeof gate_val - 1);
+        gate_val[sizeof gate_val - 1] = '\0';
+        /* Trim to exactly 256 printable chars (one too many). */
+        gate_val[256] = '\0';
+        snprintf(gate_text, sizeof gate_text,
+                 "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\n"
+                 "tls_mode = REVERSE_PROXY\n"
+                 "remote_submit_key = key_b2578f48143c06d3\n"
+                 "remote_submit_driver = claude\nremote_submit_mode = patch\n"
+                 "remote_submit_gate = %s\n"
+                 "remote_submit_max_attempts = 1\nremote_submit_max_active = 2\n"
+                 "remote_submit_max_per_day = 6\n",
+                 gate_val);
+        atlas_gwpolicy pg;
+        parse_policy(gate_text, &pg);
+        T_CHECK_MSG(pg.state == ATLAS_GWPOLICY_DISABLED,
+                    "a 256-byte gate line (one over the 255-byte max) was accepted");
     }
 }
 
@@ -432,6 +654,193 @@ static void test_gateway_status_prints_dispose_and_clear(void) {
                 "cleartext_disposal_accepted in JSON was \"%s\" for an off policy",
                 atlas_buf_cstr(&accept_off));
     atlas_buf_free(&accept_off);
+    atlas_buf_free(&json_off);
+}
+
+/* A14. A complete submission policy with all seven required lines, under
+ * REVERSE_PROXY (no cleartext acceptance needed). Two keys are stored, the
+ * first token of the gate line has no '/', and a space in the gate line is
+ * valid (gate lines allow printable ASCII including spaces). */
+static void test_remote_submit_keys_parse_a_complete_policy(void) {
+    atlas_gwpolicy p;
+    parse_policy("enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\n"
+                 "tls_mode = REVERSE_PROXY\n"
+                 "remote_submit_key = key_b2578f48143c06d3\n"
+                 "remote_submit_key = key_1f0a2b3c4d5e6f70\n"
+                 "remote_submit_driver = claude\n"
+                 "remote_submit_mode = patch\n"
+                 "remote_submit_gate = make -j4\n"
+                 "remote_submit_max_attempts = 1\n"
+                 "remote_submit_max_active = 2\n"
+                 "remote_submit_max_per_day = 6\n",
+                 &p);
+    T_REQUIRE_MSG(p.state == ATLAS_GWPOLICY_ENABLED,
+                  "a complete submission policy was refused: %s",
+                  atlas_gwpolicy_reason_name(p.reason));
+    T_CHECK_MSG(p.remote_submit_count == 2u, "remote_submit_count was %zu, not 2",
+                p.remote_submit_count);
+    T_CHECK_MSG(strcmp(p.remote_submit_keys[0], "b2578f48143c06d3") == 0,
+                "first key was stored as \"%s\"", p.remote_submit_keys[0]);
+    T_CHECK_MSG(strcmp(p.remote_submit_keys[1], "1f0a2b3c4d5e6f70") == 0,
+                "second key was stored as \"%s\"", p.remote_submit_keys[1]);
+    T_CHECK_MSG(strcmp(p.remote_submit_driver, "claude") == 0,
+                "driver was \"%s\"", p.remote_submit_driver);
+    T_CHECK_MSG(strcmp(p.remote_submit_mode, "patch") == 0,
+                "mode was \"%s\"", p.remote_submit_mode);
+    T_CHECK_MSG(p.remote_submit_gate_count == 1u, "gate count was %zu", p.remote_submit_gate_count);
+    T_CHECK_MSG(strcmp(p.remote_submit_gates[0], "make -j4") == 0,
+                "gate was \"%s\"", p.remote_submit_gates[0]);
+    T_CHECK_MSG(p.remote_submit_max_attempts == 1, "max_attempts was %lld",
+                p.remote_submit_max_attempts);
+    T_CHECK_MSG(p.remote_submit_max_active == 2, "max_active was %lld",
+                p.remote_submit_max_active);
+    T_CHECK_MSG(p.remote_submit_max_per_day == 6, "max_per_day was %lld",
+                p.remote_submit_max_per_day);
+    T_CHECK_MSG(!p.cleartext_submission_accepted,
+                "a REVERSE_PROXY policy reported cleartext_submission_accepted");
+
+    /* `web_gui = no` with submission lines is NOT MALFORMED: /mcp is a
+     * submission surface independent of the browser. */
+    atlas_gwpolicy p2;
+    parse_policy("enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\nweb_gui = no\n"
+                 "tls_mode = REVERSE_PROXY\n"
+                 "remote_submit_key = key_b2578f48143c06d3\n"
+                 "remote_submit_driver = claude\nremote_submit_mode = patch\n"
+                 "remote_submit_gate = make\nremote_submit_max_attempts = 1\n"
+                 "remote_submit_max_active = 2\nremote_submit_max_per_day = 6\n",
+                 &p2);
+    T_REQUIRE_MSG(p2.state == ATLAS_GWPOLICY_ENABLED,
+                  "web_gui = no with submission lines was refused: %s",
+                  atlas_gwpolicy_reason_name(p2.reason));
+
+    /* The two acceptances are independent: disposal cleartext accepted does NOT
+     * imply submission cleartext accepted, and the sibling that names both
+     * must be ENABLED with both bools true.  This is the positive proof of the
+     * MALFORMED case "disposal acceptance only with all submit lines under NONE". */
+    atlas_gwpolicy p3;
+    parse_policy("enabled = yes\ngateway_uid = 1001\nweb_gui = yes\ntls_mode = NONE\n"
+                 "remote_dispose_key = key_581e0a805cc1febe\nremote_dispose_kinds = PARKED\n"
+                 "operator_accepts_cleartext_disposal = yes\n"
+                 "remote_submit_key = key_b2578f48143c06d3\n"
+                 "remote_submit_driver = claude\nremote_submit_mode = patch\n"
+                 "remote_submit_gate = make\nremote_submit_max_attempts = 1\n"
+                 "remote_submit_max_active = 2\nremote_submit_max_per_day = 6\n"
+                 "operator_accepts_cleartext_submission = yes\n",
+                 &p3);
+    T_REQUIRE_MSG(p3.state == ATLAS_GWPOLICY_ENABLED,
+                  "a policy with both cleartext acceptances was refused: %s",
+                  atlas_gwpolicy_reason_name(p3.reason));
+    T_CHECK_MSG(p3.cleartext_disposal_accepted, "cleartext_disposal_accepted was false");
+    T_CHECK_MSG(p3.cleartext_submission_accepted, "cleartext_submission_accepted was false");
+}
+
+/* A14. Remote submission absent by default. */
+static void test_remote_submit_is_absent_by_default(void) {
+    atlas_gwpolicy p;
+    parse_policy(GOOD, &p);
+    T_REQUIRE(p.state == ATLAS_GWPOLICY_ENABLED);
+    T_CHECK_MSG(p.remote_submit_count == 0u, "an absent policy named a submit key");
+    T_CHECK_MSG(!p.cleartext_submission_accepted,
+                "an absent policy reported cleartext_submission_accepted");
+}
+
+/* A14. `atlas gateway status`'s `submit:` and `clear-submit:` lines, in both
+ * renderers. Asserted by needle, never by whole line or line count. */
+static void test_gateway_status_prints_submit_and_clear_submit(void) {
+    atlas_gwpolicy accepted;
+    parse_policy("enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\ntls_mode = NONE\n"
+                 "remote_submit_key = key_b2578f48143c06d3\n"
+                 "remote_submit_driver = claude\nremote_submit_mode = patch\n"
+                 "remote_submit_gate = make\nremote_submit_max_attempts = 1\n"
+                 "remote_submit_max_active = 2\nremote_submit_max_per_day = 6\n"
+                 "operator_accepts_cleartext_submission = yes\n",
+                 &accepted);
+    T_REQUIRE(accepted.state == ATLAS_GWPOLICY_ENABLED);
+
+    atlas_buf human = ATLAS_BUF_INIT;
+    render_status(false, &accepted, &human);
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&human), "submit:  key_") != NULL,
+                "the human form did not print the submit key: %s", atlas_buf_cstr(&human));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&human), "checked at submit") != NULL,
+                "the human form did not print 'checked at submit': %s", atlas_buf_cstr(&human));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&human), "clear-submit: ACCEPTED") != NULL,
+                "the human form did not print the accepted clear-submit line: %s",
+                atlas_buf_cstr(&human));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&human), "operator_accepts_cleartext_submission = yes") != NULL,
+                "the accepted clear-submit line did not quote the policy key: %s",
+                atlas_buf_cstr(&human));
+    atlas_buf_free(&human);
+
+    atlas_buf j = ATLAS_BUF_INIT;
+    render_status(true, &accepted, &j);
+    size_t bad = 0;
+    T_CHECK_MSG(tjson_valid(atlas_buf_cstr(&j), j.len, &bad), "status --json is not valid JSON at %zu",
+                bad);
+    atlas_buf submit_raw = ATLAS_BUF_INIT;
+    T_CHECK(tjson_get_raw(atlas_buf_cstr(&j), j.len, "cleartext_submission_accepted", &submit_raw));
+    T_CHECK_MSG(strcmp(atlas_buf_cstr(&submit_raw), "true") == 0,
+                "cleartext_submission_accepted was \"%s\"", atlas_buf_cstr(&submit_raw));
+    atlas_buf_free(&submit_raw);
+
+    /* Verify the frozen JSON key names and that they carry the right content. */
+    atlas_buf keys_raw = ATLAS_BUF_INIT;
+    T_CHECK(tjson_get_raw(atlas_buf_cstr(&j), j.len, "remote_submit_keys", &keys_raw));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&keys_raw), "b2578f48143c06d3") != NULL,
+                "remote_submit_keys JSON did not contain the key id: %s",
+                atlas_buf_cstr(&keys_raw));
+    atlas_buf_free(&keys_raw);
+
+    atlas_buf driver_str = ATLAS_BUF_INIT;
+    T_CHECK(tjson_get_string(atlas_buf_cstr(&j), j.len, "remote_submit_driver", &driver_str));
+    T_CHECK_MSG(strcmp(atlas_buf_cstr(&driver_str), "claude") == 0,
+                "remote_submit_driver was \"%s\"", atlas_buf_cstr(&driver_str));
+    atlas_buf_free(&driver_str);
+
+    atlas_buf mode_str = ATLAS_BUF_INIT;
+    T_CHECK(tjson_get_string(atlas_buf_cstr(&j), j.len, "remote_submit_mode", &mode_str));
+    T_CHECK_MSG(strcmp(atlas_buf_cstr(&mode_str), "patch") == 0,
+                "remote_submit_mode was \"%s\"", atlas_buf_cstr(&mode_str));
+    atlas_buf_free(&mode_str);
+    atlas_buf_free(&j);
+
+    /* For the off (no submit keys) policy, remote_submit_keys must be an
+     * empty JSON array. */
+
+    /* Not accepted, and no submit keys: the "(none ...)" and "(not accepted)"
+     * wording. Note: "(not accepted" also appears in the dispose clear: line,
+     * so assert the full "clear-submit: (not accepted" prefix. */
+    atlas_gwpolicy off;
+    parse_policy(GOOD, &off);
+    T_REQUIRE(off.state == ATLAS_GWPOLICY_ENABLED);
+
+    atlas_buf human_off = ATLAS_BUF_INIT;
+    render_status(false, &off, &human_off);
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&human_off), "submit:  (none") != NULL,
+                "the human form did not print the disabled submit line: %s",
+                atlas_buf_cstr(&human_off));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&human_off), "clear-submit: (not accepted") != NULL,
+                "the human form did not print the not-accepted clear-submit line: %s",
+                atlas_buf_cstr(&human_off));
+    atlas_buf_free(&human_off);
+
+    atlas_buf json_off = ATLAS_BUF_INIT;
+    render_status(true, &off, &json_off);
+    atlas_buf accept_off = ATLAS_BUF_INIT;
+    T_CHECK(tjson_get_raw(atlas_buf_cstr(&json_off), json_off.len, "cleartext_submission_accepted",
+                         &accept_off));
+    T_CHECK_MSG(strcmp(atlas_buf_cstr(&accept_off), "false") == 0,
+                "cleartext_submission_accepted was \"%s\" for an off policy",
+                atlas_buf_cstr(&accept_off));
+    atlas_buf_free(&accept_off);
+
+    /* remote_submit_keys must be an empty JSON array when no keys are set. */
+    atlas_buf keys_off = ATLAS_BUF_INIT;
+    T_CHECK(tjson_get_raw(atlas_buf_cstr(&json_off), json_off.len, "remote_submit_keys",
+                          &keys_off));
+    T_CHECK_MSG(strcmp(atlas_buf_cstr(&keys_off), "[]") == 0,
+                "remote_submit_keys was \"%s\" for a policy with no submit keys",
+                atlas_buf_cstr(&keys_off));
+    atlas_buf_free(&keys_off);
     atlas_buf_free(&json_off);
 }
 
@@ -956,7 +1365,12 @@ static const atlas_test TESTS[] = {
      test_remote_dispose_key_and_kinds_parse_a_complete_policy},
     {"remote disposal is absent by default", test_remote_dispose_is_absent_by_default},
     {"the cleartext disposal acceptance", test_the_cleartext_disposal_acceptance},
+    {"remote submit keys parse a complete policy",
+     test_remote_submit_keys_parse_a_complete_policy},
+    {"remote submission is absent by default", test_remote_submit_is_absent_by_default},
     {"gateway status prints dispose and clear", test_gateway_status_prints_dispose_and_clear},
+    {"gateway status prints submit and clear-submit",
+     test_gateway_status_prints_submit_and_clear_submit},
     {"a policy that says no is not malformed", test_a_policy_that_says_no_is_not_malformed},
     {"a wider bind needs a written TLS stance", test_a_wider_bind_needs_a_written_tls_stance},
     {"an origin must match whole", test_an_origin_must_match_whole},

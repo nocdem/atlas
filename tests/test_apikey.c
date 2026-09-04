@@ -295,13 +295,21 @@ static void test_rotation_replaces_one_credential_with_another(void) {
     T_CHECK_MSG(strcmp(disposal_old_id, disposal_new_id) != 0,
                 "a --no-scopes rotation reused the key id");
 
-    char reminder[192];
+    /* A14, amended. The rotation reminder now names both policy lines a
+     * --no-scopes key could be on. Assert the key-specific needle (the new
+     * id) and the role-neutral tail, both of which survive the A14 wording. */
+    char reminder[256];
     (void)snprintf(reminder, sizeof reminder,
-                  "the policy line remote_dispose_key must now name key_%s", disposal_new_id);
+                  "the policy line that names the previous key");
     T_CHECK_MSG(strstr(atlas_buf_cstr(&out), reminder) != NULL,
                 "a --no-scopes rotation did not print the policy-line reminder: %s",
                 atlas_buf_cstr(&out));
-    T_CHECK_MSG(strstr(atlas_buf_cstr(&out), "until it does, neither key can dispose") != NULL,
+    char reminder_id[64];
+    (void)snprintf(reminder_id, sizeof reminder_id, "key_%s", disposal_new_id);
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&out), reminder_id) != NULL,
+                "a --no-scopes rotation reminder did not name the new key id: %s",
+                atlas_buf_cstr(&out));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&out), "until it does, neither key can use the role") != NULL,
                 "a --no-scopes rotation is missing the second half of the reminder: %s",
                 atlas_buf_cstr(&out));
 

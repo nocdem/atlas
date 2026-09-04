@@ -1680,8 +1680,9 @@ static atlas_status h_apikey_created(atlas_renderer *r, const atlas_apikey_creat
                       "        the same key may never be named by both. Name it there, or revoke it.\n");
         if (c->rotated_from[0] != '\0') {
             (void)fprintf(o,
-                          "\nthe policy line remote_dispose_key must now name %s%s; until it "
-                          "does, neither key can dispose\n",
+                          "\nthe policy line that names the previous key (remote_dispose_key or "
+                          "a remote_submit_key) must now name %s%s; until it does, neither key "
+                          "can use the role that line grants\n",
                           ATLAS_APIKEY_ID_PREFIX, c->key_id);
         }
     }

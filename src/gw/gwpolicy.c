@@ -20,6 +20,7 @@
 
 #include "atlas/decision.h" /* atlas_decision_kind, ATLAS_DECISION_KIND_BIT, atlas_decision_kind_parse */
 #include "atlas/limits.h"
+#include "atlas/orch.h" /* ATLAS_ORCH_MAX_ATTEMPTS, ATLAS_ORCH_MAX_VALIDATIONS, ATLAS_ORCH_NAME_MAX */
 #include "atlas/rootpath.h"
 
 /* A policy is a handful of `key = value` lines. Bounded for the reason the
@@ -188,26 +189,27 @@ static bool printable_token(const char *s) {
     return true;
 }
 
-/* `remote_dispose_key`'s grammar: exactly the display form `atlas api-key
- * list` prints -- "key_" followed by sixteen lowercase hex characters, the
- * same alphabet and length as `api_keys.key_id`. `ATLAS_APIKEY_ID_PREFIX`
- * (`atlas/gw.h`) names the same four bytes, but that header pulls in
- * `atlas/db.h`, which this loader must not -- `ATLAS_DECISION_KIND_BIT`'s own
- * header comment (`atlas/decision.h`) states the identical constraint for
- * this same file, which is why it lives in `decision.h` rather than the
- * heavier `decision_ops.h`. The literal is repeated here rather than shared
- * for the same reason. Stored *without* the prefix, because the prefix is a
- * display convention and `api_keys.key_id` never carries it. */
-#define GWPOLICY_DISPOSE_KEY_PREFIX "key_"
-#define GWPOLICY_DISPOSE_KEY_PREFIX_LEN 4u
+/* Grammar shared by `remote_dispose_key` and `remote_submit_key`: exactly the
+ * display form `atlas api-key list` prints -- "key_" followed by sixteen
+ * lowercase hex characters, the same alphabet and length as
+ * `api_keys.key_id`. `ATLAS_APIKEY_ID_PREFIX` (`atlas/gw.h`) names the same
+ * four bytes, but that header pulls in `atlas/db.h`, which this loader must
+ * not -- `ATLAS_DECISION_KIND_BIT`'s own header comment (`atlas/decision.h`)
+ * states the identical constraint for this same file, which is why it lives
+ * in `decision.h` rather than the heavier `decision_ops.h`. The literal is
+ * repeated here rather than shared for the same reason. Stored *without* the
+ * prefix, because the prefix is a display convention and `api_keys.key_id`
+ * never carries it. */
+#define GWPOLICY_KEY_PREFIX "key_"
+#define GWPOLICY_KEY_PREFIX_LEN 4u
 
-static bool parse_dispose_key(const char *val, size_t vlen,
-                              char out[ATLAS_APIKEY_SELECTOR_HEX + 1u]) {
-    if (vlen != GWPOLICY_DISPOSE_KEY_PREFIX_LEN + ATLAS_APIKEY_SELECTOR_HEX ||
-        strncmp(val, GWPOLICY_DISPOSE_KEY_PREFIX, GWPOLICY_DISPOSE_KEY_PREFIX_LEN) != 0) {
+static bool parse_key_selector(const char *val, size_t vlen,
+                               char out[ATLAS_APIKEY_SELECTOR_HEX + 1u]) {
+    if (vlen != GWPOLICY_KEY_PREFIX_LEN + ATLAS_APIKEY_SELECTOR_HEX ||
+        strncmp(val, GWPOLICY_KEY_PREFIX, GWPOLICY_KEY_PREFIX_LEN) != 0) {
         return false;
     }
-    const char *hex = val + GWPOLICY_DISPOSE_KEY_PREFIX_LEN;
+    const char *hex = val + GWPOLICY_KEY_PREFIX_LEN;
     for (size_t i = 0; i < ATLAS_APIKEY_SELECTOR_HEX; i++) {
         char c = hex[i];
         bool is_lower_hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
@@ -220,6 +222,57 @@ static bool parse_dispose_key(const char *val, size_t vlen,
     }
     memcpy(out, hex, ATLAS_APIKEY_SELECTOR_HEX);
     out[ATLAS_APIKEY_SELECTOR_HEX] = '\0';
+    return true;
+}
+
+/* `remote_submit_driver` and `remote_submit_mode` names: [a-z0-9._-], 1..64
+ * bytes. Same shape as `is_name` in orchpolicy's own parser. */
+static bool is_submit_name(const char *val, size_t len) {
+    if (len == 0 || len > ATLAS_ORCH_NAME_MAX) {
+        return false;
+    }
+    for (size_t i = 0; i < len; i++) {
+        char c = val[i];
+        bool ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                  c == '-' || c == '_' || c == '.';
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* `remote_submit_gate` line: printable ASCII including spaces (0x20..0x7e),
+ * non-empty, first token (up to first whitespace) containing no '/'.
+ * Separate from `printable_token` because gate lines may include spaces --
+ * `make -j4` is a valid gate. Writes to `out[ATLAS_GWPOLICY_GATE_LINE_MAX]`
+ * on success. */
+static bool is_gate_line(const char *val, size_t len,
+                         char out[ATLAS_GWPOLICY_GATE_LINE_MAX]) {
+    if (len == 0 || len >= ATLAS_GWPOLICY_GATE_LINE_MAX) {
+        return false;
+    }
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)val[i];
+        if (c < 0x20u || c > 0x7eu) {
+            return false;
+        }
+    }
+    /* First token: up to the first space or tab. Must not contain '/'. */
+    size_t tok_end = 0;
+    while (tok_end < len && val[tok_end] != ' ' && val[tok_end] != '\t') {
+        tok_end++;
+    }
+    if (tok_end == 0) {
+        return false; /* line starts with whitespace */
+    }
+    for (size_t i = 0; i < tok_end; i++) {
+        if (val[i] == '/') {
+            return false;
+        }
+    }
+    memcpy(out, val, len);
+    out[len] = '\0';
     return true;
 }
 
@@ -307,6 +360,14 @@ void atlas_gwpolicy_parse_buffer(const char *buf, size_t total, atlas_gwpolicy *
     bool dispose_key_given = false;
     bool dispose_kinds_given = false;
     bool accept_given = false;
+    /* A14. */
+    bool submit_driver_given = false;
+    bool submit_mode_given = false;
+    bool submit_gate_given = false;
+    bool submit_attempts_given = false;
+    bool submit_active_given = false;
+    bool submit_per_day_given = false;
+    bool submit_accept_given = false;
 
     size_t i = 0;
     while (i < total) {
@@ -474,7 +535,7 @@ void atlas_gwpolicy_parse_buffer(const char *buf, size_t total, atlas_gwpolicy *
              * credential is not the one the remote disposal policy names"
              * (`remote.c:81-84`) when it holds no scope but is not this
              * field's value. */
-            if (!parse_dispose_key(val, vlen, out->remote_dispose_key)) {
+            if (!parse_key_selector(val, vlen, out->remote_dispose_key)) {
                 out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
                 return;
             }
@@ -568,6 +629,104 @@ void atlas_gwpolicy_parse_buffer(const char *buf, size_t total, atlas_gwpolicy *
             }
             out->cleartext_disposal_accepted = true;
             accept_given = true;
+        } else if (take_value(line, len, "remote_submit_key", &val, &vlen)) {
+            /* A14: a credential whose bearer the gateway accepts for remote
+             * submission. Grammar identical to `remote_dispose_key`. At most
+             * four lines; duplicates are MALFORMED; the same id as
+             * `remote_dispose_key` is checked end-of-parse (the operator may
+             * write lines in any order). Stored without the `key_` prefix. */
+            if (out->remote_submit_count >= ATLAS_GWPOLICY_MAX_SUBMIT_KEYS) {
+                out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
+                return;
+            }
+            char parsed[ATLAS_APIKEY_SELECTOR_HEX + 1u];
+            if (!parse_key_selector(val, vlen, parsed)) {
+                out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
+                return;
+            }
+            for (size_t k = 0; k < out->remote_submit_count; k++) {
+                if (strcmp(out->remote_submit_keys[k], parsed) == 0) {
+                    out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
+                    return;
+                }
+            }
+            memcpy(out->remote_submit_keys[out->remote_submit_count], parsed,
+                   ATLAS_APIKEY_SELECTOR_HEX + 1u);
+            out->remote_submit_count++;
+        } else if (take_value(line, len, "remote_submit_driver", &val, &vlen)) {
+            /* A14: the driver the submitted job runs under. Singleton. Name
+             * shape: [a-z0-9._-], at most ATLAS_ORCH_NAME_MAX bytes.
+             * Whether the orchestration policy lists it is checked at submit,
+             * not here. */
+            if (submit_driver_given || !is_submit_name(val, vlen)) {
+                out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
+                return;
+            }
+            (void)copy_value(out->remote_submit_driver, sizeof out->remote_submit_driver, val, vlen);
+            submit_driver_given = true;
+        } else if (take_value(line, len, "remote_submit_mode", &val, &vlen)) {
+            /* A14: the mode. Singleton. Same name shape as driver. */
+            if (submit_mode_given || !is_submit_name(val, vlen)) {
+                out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
+                return;
+            }
+            (void)copy_value(out->remote_submit_mode, sizeof out->remote_submit_mode, val, vlen);
+            submit_mode_given = true;
+        } else if (take_value(line, len, "remote_submit_gate", &val, &vlen)) {
+            /* A14: a gate line, repeatable up to ATLAS_ORCH_MAX_VALIDATIONS.
+             * Printable ASCII including spaces, non-empty, first token has
+             * no '/'. `is_gate_line` validates and copies. */
+            if (out->remote_submit_gate_count >= ATLAS_ORCH_MAX_VALIDATIONS) {
+                out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
+                return;
+            }
+            if (!is_gate_line(val, vlen,
+                              out->remote_submit_gates[out->remote_submit_gate_count])) {
+                out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
+                return;
+            }
+            out->remote_submit_gate_count++;
+            submit_gate_given = true;
+        } else if (take_value(line, len, "remote_submit_max_attempts", &val, &vlen)) {
+            /* A14: 1..ATLAS_ORCH_MAX_ATTEMPTS. Above the orchestration
+             * policy's own ceiling is refused at submit by
+             * `atlas_orchpolicy_apply_limits`, not here. */
+            if (submit_attempts_given || !parse_number(val, vlen, &num) ||
+                num < 1 || num > ATLAS_ORCH_MAX_ATTEMPTS) {
+                out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
+                return;
+            }
+            out->remote_submit_max_attempts = num;
+            submit_attempts_given = true;
+        } else if (take_value(line, len, "remote_submit_max_active", &val, &vlen)) {
+            /* A14: 1..ATLAS_GWPOLICY_SUBMIT_MAX_ACTIVE_CEILING (8). */
+            if (submit_active_given || !parse_number(val, vlen, &num) ||
+                num < 1 || num > ATLAS_GWPOLICY_SUBMIT_MAX_ACTIVE_CEILING) {
+                out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
+                return;
+            }
+            out->remote_submit_max_active = num;
+            submit_active_given = true;
+        } else if (take_value(line, len, "remote_submit_max_per_day", &val, &vlen)) {
+            /* A14: 1..ATLAS_GWPOLICY_SUBMIT_MAX_PER_DAY_CEILING (64). */
+            if (submit_per_day_given || !parse_number(val, vlen, &num) ||
+                num < 1 || num > ATLAS_GWPOLICY_SUBMIT_MAX_PER_DAY_CEILING) {
+                out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
+                return;
+            }
+            out->remote_submit_max_per_day = num;
+            submit_per_day_given = true;
+        } else if (take_value(line, len, "operator_accepts_cleartext_submission", &val, &vlen)) {
+            /* A14. One legal value, deliberately narrower than `parse_bool`:
+             * this records a person's written acceptance of a stated risk.
+             * `no`, `true`, `1` and every other spelling are refused exactly
+             * like an unrecognised key. */
+            if (vlen != 3u || strncmp(val, "yes", 3) != 0) {
+                out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
+                return;
+            }
+            out->cleartext_submission_accepted = true;
+            submit_accept_given = true;
         } else if (take_value(line, len, "trust_forwarded_for", &val, &vlen)) {
             if (!parse_bool(val, vlen, &out->trust_forwarded_for)) {
                 out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
@@ -708,6 +867,65 @@ void atlas_gwpolicy_parse_buffer(const char *buf, size_t total, atlas_gwpolicy *
          * inert. */
         out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
         return;
+    }
+
+    /* A14. All-or-none for the seven execution lines: remote_submit_key(s),
+     * remote_submit_driver, remote_submit_mode, remote_submit_gate(s),
+     * remote_submit_max_attempts, remote_submit_max_active,
+     * remote_submit_max_per_day. If any one is given, all seven must be given.
+     * The acceptance key (`operator_accepts_cleartext_submission`) is separate
+     * and may be absent even when the rest are present (under REVERSE_PROXY). */
+    {
+        bool any_submit = (out->remote_submit_count > 0) || submit_driver_given ||
+                          submit_mode_given || submit_gate_given || submit_attempts_given ||
+                          submit_active_given || submit_per_day_given;
+        bool all_submit = (out->remote_submit_count > 0) && submit_driver_given &&
+                          submit_mode_given && submit_gate_given && submit_attempts_given &&
+                          submit_active_given && submit_per_day_given;
+        if (any_submit && !all_submit) {
+            out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
+            return;
+        }
+    }
+
+    /* A14. A submit key equal to the dispose key is MALFORMED: one credential,
+     * one power. Checked end-of-parse because the operator may write the lines
+     * in any order — an inline check would pass when the dispose key came
+     * after the submit key. */
+    if (out->remote_submit_count > 0 && out->remote_dispose_key[0] != '\0') {
+        for (size_t k = 0; k < out->remote_submit_count; k++) {
+            if (strcmp(out->remote_submit_keys[k], out->remote_dispose_key) == 0) {
+                out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
+                return;
+            }
+        }
+    }
+
+    /* A14. Cleartext submission: the acceptance key is refused without a submit
+     * key. When submit keys ARE present, the same tls_mode chain as disposal
+     * applies: required when not REVERSE_PROXY, refused when REVERSE_PROXY.
+     * `web_gui = no` with submission lines is NOT refused: `/mcp` is a
+     * submission surface independent of the browser. */
+    if (submit_accept_given && out->remote_submit_count == 0) {
+        out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
+        return;
+    }
+    if (out->remote_submit_count > 0) {
+        if (out->tls_mode == ATLAS_GWPOLICY_TLS_REVERSE_PROXY) {
+            if (submit_accept_given) {
+                /* TLS is already in front; nothing to accept. Refused rather
+                 * than silently ignored — same reasoning as the disposal
+                 * acceptance above. */
+                out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
+                return;
+            }
+        } else if (!submit_accept_given) {
+            /* `tls_mode` is NONE or absent. The submission credential is a
+             * bearer token on every request and the operator has not stated
+             * they accept that risk. */
+            out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
+            return;
+        }
     }
 
     out->reason = ATLAS_GWPOLICY_REASON_ACTIVE;

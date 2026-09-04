@@ -62,6 +62,7 @@
 #include <stdint.h>
 
 #include "atlas/apikey.h"
+#include "atlas/orch.h"
 
 /* Compiled-in, absolute, with no environment override and no flag — the rule
  * every other Atlas policy path follows. A caller that can choose the policy has
@@ -258,6 +259,31 @@ typedef struct atlas_gwpolicy {
      * authentication-adjacent fact an auditor must see there, not a ceiling
      * safe to leave to a root-owned file they may not be able to open. */
     bool cleartext_disposal_accepted;
+
+    /* A14. The submission credentials and the job specification they imply.
+     * Everything a submitted job IS — driver, mode, gates, attempts, active
+     * ceiling, per-day ceiling — is here; nothing about a submitted job's
+     * shape is decided by the request. The gateway verifies the bearer against
+     * one of these ids and copies all seven lines onto the op.
+     *
+     * `remote_submit_count` = 0 (the default) means remote submission is off:
+     * no daemon method group is offered. Like the disposal credential, the
+     * group exists iff these fields are non-empty, and a credential not in
+     * this list has no path to `jobs:submit`. */
+    char remote_submit_keys[ATLAS_GWPOLICY_MAX_SUBMIT_KEYS][ATLAS_APIKEY_SELECTOR_HEX + 1u];
+    size_t remote_submit_count;                              /* 0 = remote submission off */
+    char remote_submit_driver[ATLAS_ORCH_NAME_MAX + 1u];
+    char remote_submit_mode[ATLAS_ORCH_NAME_MAX + 1u];
+    char remote_submit_gates[ATLAS_ORCH_MAX_VALIDATIONS][ATLAS_GWPOLICY_GATE_LINE_MAX];
+    size_t remote_submit_gate_count;
+    long long remote_submit_max_attempts;
+    long long remote_submit_max_active;
+    long long remote_submit_max_per_day;
+    /* True only when the policy carries `operator_accepts_cleartext_submission = yes`.
+     * Never a default; refused under REVERSE_PROXY; refused without a submit key; and
+     * never implied by `cleartext_disposal_accepted`, for the reason in §The decision
+     * on cleartext in the A14 plan. */
+    bool cleartext_submission_accepted;
 
     /* Ceilings. Each may only lower the compiled-in absolute bound in
      * `atlas/limits.h`, never raise it — A8's rule, so the policy decides how

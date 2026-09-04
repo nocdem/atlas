@@ -2401,6 +2401,54 @@ atlas_status atlas_service_gateway_status_for(FILE *out, bool json, const atlas_
                 st = atlas_json_key_bool(j, "cleartext_disposal_accepted",
                                          p->cleartext_disposal_accepted, err);
             }
+            if (st == ATLAS_OK) {
+                /* A14. The submit key ids, stored without the `key_` prefix
+                 * (same convention as remote_dispose_key). */
+                st = atlas_json_key(j, "remote_submit_keys", err);
+                if (st == ATLAS_OK) {
+                    st = atlas_json_arr_begin(j, err);
+                }
+                for (size_t ki = 0; ki < p->remote_submit_count && st == ATLAS_OK; ki++) {
+                    st = atlas_json_str(j, p->remote_submit_keys[ki], err);
+                }
+                if (st == ATLAS_OK) {
+                    st = atlas_json_arr_end(j, err);
+                }
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_str(j, "remote_submit_driver", p->remote_submit_driver, err);
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_str(j, "remote_submit_mode", p->remote_submit_mode, err);
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_key(j, "remote_submit_gates", err);
+                if (st == ATLAS_OK) {
+                    st = atlas_json_arr_begin(j, err);
+                }
+                for (size_t gi = 0; gi < p->remote_submit_gate_count && st == ATLAS_OK; gi++) {
+                    st = atlas_json_str(j, p->remote_submit_gates[gi], err);
+                }
+                if (st == ATLAS_OK) {
+                    st = atlas_json_arr_end(j, err);
+                }
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_int(j, "remote_submit_max_attempts",
+                                        p->remote_submit_max_attempts, err);
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_int(j, "remote_submit_max_active",
+                                        p->remote_submit_max_active, err);
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_int(j, "remote_submit_max_per_day",
+                                        p->remote_submit_max_per_day, err);
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_bool(j, "cleartext_submission_accepted",
+                                         p->cleartext_submission_accepted, err);
+            }
         }
         /* Stated as a field rather than left to a reader's assumption, exactly
          * as the backup report states `encrypted` and `signed`. */
@@ -2477,6 +2525,41 @@ atlas_status atlas_service_gateway_status_for(FILE *out, bool json, const atlas_
                 (void)fprintf(out,
                               "clear:   (not accepted -- a disposal credential is offered only "
                               "behind tls_mode = REVERSE_PROXY)\n");
+            }
+        }
+        {
+            /* A14. Both `submit:` and `clear-submit:` print unconditionally
+             * when ENABLED, like `dispose:` and `clear:` above. Their absence
+             * is itself the answer, so an auditor does not have to notice a
+             * missing line. */
+            if (p->remote_submit_count > 0) {
+                (void)fprintf(out, "submit:  ");
+                for (size_t ki = 0; ki < p->remote_submit_count; ki++) {
+                    (void)fprintf(out, "key_%s%s", p->remote_submit_keys[ki],
+                                  ki + 1u < p->remote_submit_count ? " " : "");
+                }
+                (void)fprintf(out,
+                              "  (driver %s, mode %s, %zu gate(s), attempts %lld, active %lld, "
+                              "per day %lld; checked at submit)\n",
+                              p->remote_submit_driver, p->remote_submit_mode,
+                              p->remote_submit_gate_count, p->remote_submit_max_attempts,
+                              p->remote_submit_max_active, p->remote_submit_max_per_day);
+            } else {
+                (void)fprintf(out,
+                              "submit:  (none -- nothing reachable over the network can queue a "
+                              "job)\n");
+            }
+            if (p->cleartext_submission_accepted) {
+                (void)fprintf(
+                    out,
+                    "clear-submit: ACCEPTED -- operator_accepts_cleartext_submission = yes: a "
+                    "browser's submission credential crosses this network unencrypted, and a "
+                    "captured credential queues work that runs as the operator until it is "
+                    "revoked\n");
+            } else {
+                (void)fprintf(out,
+                              "clear-submit: (not accepted -- a submission credential is offered "
+                              "only behind tls_mode = REVERSE_PROXY)\n");
             }
         }
         if (p->public_url[0] != '\0') {

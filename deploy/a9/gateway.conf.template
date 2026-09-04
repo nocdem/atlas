@@ -99,6 +99,39 @@ session_ttl_seconds = 43200
 # `atlas gateway status` prints this acceptance on every run.
 # operator_accepts_cleartext_disposal = yes
 
+# --- remote submission (A14) --------------------------------------------------
+#
+# A credential named here may queue a job through the gateway, from Mission
+# Control or from a model over /mcp. Everything a job IS -- which driver runs it,
+# in what mode, under which gates, how many attempts, how many at once and how
+# many per day -- is decided by these lines and never by the request. All of
+# them, or none. Every one REQUIRES tls_mode = REVERSE_PROXY unless the
+# acceptance key below is present. A key named here may not also be the
+# remote_dispose_key: one credential, one power.
+#
+# remote_submit_key          = key_b2578f48143c06d3
+# remote_submit_key          = key_<the browser's own --no-scopes key>
+# remote_submit_driver       = claude
+# remote_submit_mode         = patch
+# remote_submit_gate         = make
+# remote_submit_max_attempts = 1
+# remote_submit_max_active   = 2
+# remote_submit_max_per_day  = 6
+
+# THE OPERATOR'S WRITTEN ACCEPTANCE OF A CLEARTEXT SUBMISSION CHANNEL. Not a
+# feature toggle, and NOT implied by operator_accepts_cleartext_disposal: a
+# submission starts a worker that runs as you, which is a different consequence
+# from moving a record. With this line present and tls_mode = NONE, a browser's
+# submission credential crosses the network unencrypted on every request and a
+# captured one queues work that runs as you, within remote_submit_max_per_day,
+# until `atlas api-key revoke`. A credential presented from this host itself --
+# the MCP tunnel's -- never crosses the segment; its exposure is the file it lives
+# in, which a worker running as you can read. `yes` is the only accepted value;
+# leave the line out rather than writing `no`. Refused under tls_mode =
+# REVERSE_PROXY and without a remote_submit_key. `atlas gateway status` prints
+# this acceptance on every run.
+# operator_accepts_cleartext_submission = yes
+
 # Whether a forwarded client address may be believed for rate limiting.
 #
 # Off by default, and the consequence is stated rather than hidden: behind a

@@ -1528,10 +1528,10 @@ it.
 
 # Decisions the operator must be asked, and when — read this before dispatching anything
 
-> **ANSWERED 2026-09-04, before any task was dispatched.** Rows 1 and 2 were put to the
-> operator with the cost in front of them and are settled below; row 3 stands. Their
-> answers also added a requirement this plan did not carry — see *What the answers added*
-> immediately after the table.
+> **ANSWERED 2026-09-04, before any task was dispatched. All three rows.** Each was put
+> to the operator with the cost in front of them and is settled below. Their answers also
+> added a requirement this plan did not carry — see *What the answers added* immediately
+> after the table.
 >
 > - **Row 1 — start while away.** `remote_submit_driver = claude`. Their words: *"başlasın"*.
 > - **Row 2 — cleartext accepted, for now.** `operator_accepts_cleartext_submission = yes`.
@@ -1540,7 +1540,16 @@ it.
 >   as a permanent shape: the chain in §The decision on cleartext is unchanged and still
 >   true, and the key stays a written acceptance that `atlas gateway status` prints, so the
 >   day they change their mind the line comes out and the season's own gate refuses again.
-> - **Row 3 — which credentials and which numbers.** Still to ask, still before T1.
+> - **Row 3 — which credentials, and which numbers.** As the plan proposed, both halves.
+>   The credentials: `key_b2578f48143c06d3` (`chatgpt-tunnel`, the model) **and** one new
+>   `--no-scopes` key minted for the browser — never the `mission-control` login key, so a
+>   session cookie and a submission credential stay different secrets. The numbers:
+>   `remote_submit_mode = patch`, gate floor `make`, `remote_submit_max_attempts = 1`,
+>   `remote_submit_max_active = 2`, `remote_submit_max_per_day = 6`. Asked as two plain
+>   questions about the thing itself — which keys, and what the daily bound costs — and
+>   answered "both" and "six a day, two at once". Every one of these is a root-owned line
+>   and needs no code change, so a later decision to lower a number or drop the model's key
+>   is a policy edit and not a season.
 
 
 A15's plan left a genuine choice in its §The decision and nobody put it to the

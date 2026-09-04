@@ -426,6 +426,38 @@ argument for each is in `docs/engineering-rules.md` under the same heading.
   write the cause, the scenario is not real**, and reporting it as real is the
   defect. Write the chain first, then decide whether the finding survives it.
 
+## Cost rules — these are not negotiable
+
+Tokens and wall-clock are the operator's money and the operator's day. **Spending
+them is never the goal, and a process that produces work is not thereby worth what
+it cost.** The measured failure this exists for: **A16 spent about seven hours to
+put one button on a page** — not on the button, but on one task per dispatch where
+several were independent, and on review rounds that ran because a round had ended
+rather than because a round had found something.
+
+- **Maximum work, minimum tokens.** Given two ways to reach the same verified
+  result, take the cheaper one. Thoroughness is a property of the result, not of
+  the number of passes that produced it.
+- **Dispatch independent tasks together.** A plan's dependency order is a
+  constraint on what must follow what; it is not an instruction to run every task
+  in its own round. Tasks with no edge between them go out in one dispatch.
+- **A review pass needs a reason before it runs, not after.** Review where the
+  change touches authority, a trust boundary, a bound or a refusal. Elsewhere,
+  passing tests and a read of the diff close the task. "One more round to be sure"
+  is not a reason; a named suspicion is.
+- **Re-reading to feel certain is spending.** Do not re-read a file to confirm an
+  edit the tool already reported, re-derive a fact this session established, or
+  re-verify a claim nobody disputed.
+- **Report in one line per task.** The long form goes in the plan, the commit
+  message and the season document — artefacts the operator reads when they choose.
+  A terminal reply is not the place to restate what a document already carries.
+- **Cheapest model that can do the job.** Sonnet writes code, Opus reviews and
+  finds causes, Fable plans and takes the unrecoverable call. An omitted model
+  silently inherits the expensive one; always pass it explicitly.
+
+The rule this collapses to, and the one to apply when the others are ambiguous:
+**if a step would not change what ships, it is not a step.**
+
 ## Architecture invariants
 
 1. SQLite is a **rebuildable index**, never the canonical record of history.

@@ -527,9 +527,28 @@ static void test_sheet_path_symlink_refused(void) {
 /* GRANTED is necessary but not sufficient: the installed binary can predate
  * the code this suite is testing. Probed with a bare `review`, a local usage
  * refusal `run_review` (src/cli/cli.c) reaches before it checks anything else
- * -- no data directory, no authority, needed to ask it. */
+ * -- no authority needed to ask it.
+ *
+ * A `--data-dir` override IS needed, though, and its absence was this fix
+ * round's own Critical 1: with no override, a system deployment resolves the
+ * *system* data directory (`atlas_datadir_resolve`), `atlas_datadir_is_foreign`
+ * (src/core/datadir.c:191) is true because that directory's owner is
+ * `atlasd` and not this uid, `dispatch` (cli.c:4651) takes the foreign
+ * branch, and `remote_serves` (cli.c:2832) answers `remote_refuse` for a
+ * bare `review` before `run_review`'s own usage line at cli.c:2178 is ever
+ * reached -- so the probe measured the foreign-index refusal, never the
+ * usage line, and always answered false on exactly the deployment shape
+ * where the authority half can be true. A throwaway fixture is the same
+ * device every other test in this file already uses to keep every command
+ * local; here it only ever needs to exist, never to hold a repository. */
 static bool installed_atlas_knows_review(void) {
-    const char *argv[] = {INSTALLED_ATLAS, "review", NULL};
+    atlas_err err;
+    atlas_err_init(&err);
+    fixture probe_fx;
+    if (fx_open(&probe_fx, &err) != ATLAS_OK) {
+        return false;
+    }
+    const char *argv[] = {INSTALLED_ATLAS, "--data-dir", fx_data_dir(&probe_fx), "review", NULL};
     const char *envp[] = {"PATH=/usr/bin:/bin", NULL};
     atlas_proc_opts opts;
     memset(&opts, 0, sizeof(opts));
@@ -538,25 +557,34 @@ static bool installed_atlas_knows_review(void) {
     atlas_proc_result res;
     memset(&res, 0, sizeof(res));
     atlas_buf out = ATLAS_BUF_INIT, errout = ATLAS_BUF_INIT;
-    atlas_err err;
-    atlas_err_init(&err);
     atlas_status st = atlas_proc_run(&opts, atlas_proc_sink_buf, &out, &errout, &res, &err);
     bool ok = st == ATLAS_OK && strstr(atlas_buf_cstr(&errout), "usage: atlas review apply") != NULL;
     atlas_buf_free(&out);
     atlas_buf_free(&errout);
+    fx_close(&probe_fx);
     return ok;
 }
 
-/* True only when this whole machine can run the tests below for real: a
- * real, root-anchored policy grants this uid against the installed binary
- * (`atlas_authority_probe_at`, never `_require` -- a probe answers without
- * needing this test's own process to be the one asking through the real
- * check), and that binary is current enough to know the `review` verb.
- * Skips, rather than fails, when either half is missing -- exactly
- * `tests/test_operator_peer.c`'s own rule, applied here because this is the
- * first suite that needs GRANTED rather than merely LOCKED. `why` receives a
- * human-readable reason, named so a skip message says what would change it. */
-static bool unlocked_suite_is_live(atlas_buf *why) {
+/* The two ways this machine's readiness can resolve, plus the state this
+ * suite is actually live in. `UNLOCK_NOT_GRANTED` is an environment limit --
+ * no test can manufacture a root-owned policy, so it is worth nothing more
+ * than a note. `UNLOCK_STALE_BINARY` is not: authority answered GRANTED, so
+ * a root-owned, current-uid-matching deployment exists, and the *installed
+ * binary itself* not knowing `review` is either a stale deploy or a broken
+ * probe -- a fact about this machine's own consistency, not a limitation of
+ * what an unprivileged test can prove. Conflating the two is exactly how a
+ * whole fix round was reported "live" when nothing had run. */
+typedef enum unlock_state {
+    UNLOCK_LIVE,
+    UNLOCK_NOT_GRANTED,
+    UNLOCK_STALE_BINARY,
+} unlock_state;
+
+/* `why` receives a human-readable reason, named so a skip or failure message
+ * says what would change it. `atlas_authority_probe_at`, never `_require` --
+ * a probe answers without needing this test's own process to be the one
+ * asking through the real check. */
+static unlock_state unlocked_suite_state(atlas_buf *why) {
     atlas_authority a;
     atlas_authority_probe_at(ATLAS_AUTHORITY_POLICY_PATH, INSTALLED_ATLAS, &a);
     atlas_err err;
@@ -567,23 +595,35 @@ static bool unlocked_suite_is_live(atlas_buf *why) {
                                 "against %s (%s)",
                                 (long long)getuid(), INSTALLED_ATLAS,
                                 atlas_authority_reason_name(a.reason));
-        return false;
+        return UNLOCK_NOT_GRANTED;
     }
     if (!installed_atlas_knows_review()) {
         (void)atlas_buf_appendf(why, &err,
-                                "%s is granted but predates `review apply` -- deploy current "
-                                "code to activate this suite",
-                                INSTALLED_ATLAS);
-        return false;
+                                "%s is granted for uid %lld but does not recognise `review` -- a "
+                                "stale deploy or a broken probe, not an environment limit",
+                                INSTALLED_ATLAS, (long long)getuid());
+        return UNLOCK_STALE_BINARY;
     }
-    return true;
+    return UNLOCK_LIVE;
 }
 
+static bool unlocked_suite_is_live(atlas_buf *why) {
+    return unlocked_suite_state(why) == UNLOCK_LIVE;
+}
+
+/* `atlas_test_note`, never `T_CHECK_MSG(true, ...)`: the latter's condition
+ * never fails, so `atlas_test_fail` -- the only thing that ever prints a
+ * `T_CHECK_MSG` string -- never runs, and the message is computed and
+ * silently thrown away. Every one of these tests printed a bare "ok" whether
+ * it had measured anything or not, which is what let a whole fix round be
+ * reported "live" from nothing but that green output. `atlas_test_note` is
+ * this tree's own idiom for exactly this (about twenty suites use it,
+ * e.g. tests/test_branch_switch.c, tests/test_proc.c): it always prints. */
 #define SKIP_UNLESS_UNLOCKED()                                                                  \
     do {                                                                                        \
         atlas_buf why_ = ATLAS_BUF_INIT;                                                        \
         if (!unlocked_suite_is_live(&why_)) {                                                   \
-            T_CHECK_MSG(true, "skipped: %s", atlas_buf_cstr(&why_));                            \
+            atlas_test_note("skipped: %s", atlas_buf_cstr(&why_));                              \
             atlas_buf_free(&why_);                                                              \
             return;                                                                             \
         }                                                                                       \
@@ -591,14 +631,19 @@ static bool unlocked_suite_is_live(atlas_buf *why) {
     } while (0)
 
 /* A test in its own right, not only a guard: it names the exact condition of
- * this machine so a report can point at one line that will flip from
- * "skipped" to "ok" the moment somebody deploys current code, without
- * needing to re-derive the reason. */
+ * this machine so a report can point at one line that flips from "skipped"
+ * to "ok" the moment somebody deploys current code, without needing to
+ * re-derive the reason. Note-and-pass only for `UNLOCK_NOT_GRANTED`, which no
+ * test can do anything about; `UNLOCK_STALE_BINARY` is a genuine failure --
+ * see `unlocked_suite_state`'s own comment for why the two are not the same
+ * kind of "not live". */
 static void test_the_machine_state_this_suite_depends_on(void) {
     atlas_buf why = ATLAS_BUF_INIT;
-    bool live = unlocked_suite_is_live(&why);
-    if (!live) {
-        T_CHECK_MSG(true, "skipped: %s", atlas_buf_cstr(&why));
+    unlock_state st = unlocked_suite_state(&why);
+    switch (st) {
+    case UNLOCK_LIVE: break;
+    case UNLOCK_NOT_GRANTED: atlas_test_note("skipped: %s", atlas_buf_cstr(&why)); break;
+    case UNLOCK_STALE_BINARY: T_CHECK_MSG(false, "%s", atlas_buf_cstr(&why)); break;
     }
     atlas_buf_free(&why);
 }
@@ -727,7 +772,10 @@ static void test_a_sheet_on_stdin_is_refused_before_anything_is_minted(void) {
     int code = 0;
     const char *args[] = {"review", "apply", "/dev/stdin"};
     run_installed(&e, args, 3u, &out, &errout, &code);
-    T_CHECK_MSG(code != 0, "a piped, non-terminal stdin must be refused");
+    /* The frozen contract: `atlas_terminal_open` returns `ATLAS_ERR_USAGE`
+     * (src/core/terminal.c:34-36), which is exit 2 -- not merely nonzero,
+     * which a wrong refusal (3, "config"; 7, "integrity") would also satisfy. */
+    T_EQ_INT(code, 2);
     T_CHECK_MSG(strstr(atlas_buf_cstr(&errout), "interactive terminal") != NULL,
                 "wrong refusal for a non-terminal stdin: %s", atlas_buf_cstr(&errout));
 
@@ -851,6 +899,9 @@ static void test_two_entry_sheet_under_a_pty_applies_and_moves(void) {
                 atlas_buf_cstr(&transcript));
 
     int code = pty_wait(&p, &transcript);
+    T_REQUIRE_MSG(code != PTY_WAIT_TIMED_OUT,
+                  "the walker never exited (it may be stuck prompting):\n%s",
+                  atlas_buf_cstr(&transcript));
     const char *text = atlas_buf_cstr(&transcript);
 
     /* No prompt for entry 2: "Type " appears exactly once in the whole
@@ -875,6 +926,12 @@ static void test_two_entry_sheet_under_a_pty_applies_and_moves(void) {
     const char *histargs[] = {"--json", "decision", "history", "proj", atlas_buf_cstr(&uid_a)};
     run_atlas(&e, histargs, 5u, &hist, &hcode);
     T_EQ_INT(hcode, 0);
+    /* Exactly one APPROVED event, not merely one somewhere in the document's
+     * history (which also carries the PROPOSE event) -- `"event":"..."` is
+     * `j_decision_event`'s first key, from the closed state-name vocabulary,
+     * so the literal substring is an unambiguous count. */
+    T_CHECK_MSG(count_occurrences(atlas_buf_cstr(&hist), "\"event\":\"APPROVED\"") == 1u,
+                "expected exactly one APPROVED event: %s", atlas_buf_cstr(&hist));
     T_CHECK_MSG(strstr(atlas_buf_cstr(&hist), "\"actor\":\"LOCAL_OPERATOR_CONFIRMED\"") != NULL,
                 "history does not show the operator-channel actor: %s", atlas_buf_cstr(&hist));
     T_CHECK_MSG(strstr(atlas_buf_cstr(&hist), "\"operator_channel\":true") != NULL,
@@ -943,11 +1000,22 @@ static void test_a_mistyped_confirmation_abandons_and_leaves_the_challenge_uncon
                 atlas_buf_cstr(&transcript));
 
     int code = pty_wait(&p, &transcript);
+    T_REQUIRE_MSG(code != PTY_WAIT_TIMED_OUT,
+                  "the walker never exited (it may be stuck prompting):\n%s",
+                  atlas_buf_cstr(&transcript));
     const char *text = atlas_buf_cstr(&transcript);
     T_CHECK_MSG(strstr(text, "nothing was changed") != NULL,
                 "wrong ABANDONED detail:\n%s", text);
+    /* `\r\n`, not `\n`: this transcript came off a pty *master*, and bytes a
+     * pty slave writes pass through the line discipline's default `ONLCR`,
+     * which turns every `\n` the CLI wrote into `\r\n` on the wire. Proven
+     * with a standalone probe (a pty child writing "a b\n" reads back
+     * `61 20 62 0d 0a` on the master). `run_installed`'s callers read a pipe,
+     * never a pty, so their needles keep a plain `\n` -- see
+     * `test_human_check_totals_line_and_missing_status_null`, which checks
+     * the identical totals shape unmodified. */
     T_CHECK_MSG(strstr(text, "applied 1, abandoned 1, moved 0, disposed 0, missing 0, "
-                             "refused 0\n") != NULL,
+                             "refused 0\r\n") != NULL,
                 "wrong real (non-check) totals line:\n%s", text);
     T_EQ_INT(code, 8);
 
@@ -1023,6 +1091,9 @@ static void test_an_already_approved_record_on_an_approve_line_is_disposed(void)
     T_REQUIRE(pty_spawn(fx_data_dir(&e.fx), INSTALLED_ATLAS, args, 3u, &p, &err) == ATLAS_OK);
     atlas_buf transcript = ATLAS_BUF_INIT;
     int code = pty_wait(&p, &transcript);
+    T_REQUIRE_MSG(code != PTY_WAIT_TIMED_OUT,
+                  "the walker never exited (it may be stuck prompting):\n%s",
+                  atlas_buf_cstr(&transcript));
     const char *text = atlas_buf_cstr(&transcript);
 
     T_CHECK_MSG(strstr(text, "Type ") == NULL, "a DISPOSED entry must never prompt:\n%s", text);

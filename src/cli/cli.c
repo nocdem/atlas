@@ -2843,9 +2843,25 @@ static bool remote_serves(const cli_state *st) {
  * own unknown-command error is produced after a context is opened, which is
  * exactly what a foreign index does not allow, so the check has to happen here.
  *
- * A new command must be added to this list. That duplication is real; what
- * catches it is that the command then reports the wrong error for every client
- * on a system deployment, which the CLI smoke matrix runs. */
+ * A new command must be added to this list. That duplication is real, and
+ * **nothing in this repository's own suite reaches it**: this list is only
+ * ever consulted on the foreign-index path (`atlas_datadir_is_foreign`), which
+ * needs an active root-owned system policy naming a data directory this uid
+ * does not own — `scripts/smoke.sh` always passes `--data-dir`
+ * (`ATLAS_DATADIR_OVERRIDE` wins ahead of the system policy in
+ * `atlas_datadir_resolve`), so it never takes this branch either, for `review`
+ * or for any other command; and a test that ran without an override would risk
+ * opening the real HOME-resolved index on any machine with no system policy
+ * configured, which this project's own testing rule forbids. A previous
+ * version of this comment claimed the CLI smoke matrix caught an omission
+ * here — it does not, and could not without either manufacturing a root-owned
+ * policy (the thing `docs/security/A7_SECURITY_REVIEW.md`'s tests refuse to
+ * do) or that HOME risk. `tests/test_cli.c`'s
+ * `test_the_plan_command_is_wired` already says this plainly: "**What this
+ * cannot reach is `COMMANDS[]`**... it is still a place this suite cannot
+ * check, which is what CLAUDE.md says about it." What actually catches a
+ * forgotten entry here is CLAUDE.md's own instruction to run a new command
+ * once from the built binary, and a real system deployment. */
 static bool is_a_command(const char *cmd) {
     static const char *const COMMANDS[] = {
         "doctor",  "repo",    "scan",      "status",  "search",  "file",     "history",

@@ -3,11 +3,16 @@
  *
  * Moved out of tests/test_decision_operator.c (A15 T6) so a second suite --
  * tests/test_review_apply.c -- can drive the same terminal-allocation trick
- * without a second, drifting copy. Unchanged in behaviour: the one signature
- * difference is that `pty_spawn` no longer takes this suite's own `env`
- * fixture type, which test_review_apply.c does not share; it takes the two
- * things `env` was only ever used for here -- the data directory and the
- * binary to execve.
+ * without a second, drifting copy. Unchanged in behaviour at the move, apart
+ * from the one signature difference the move itself needed -- `pty_spawn` no
+ * longer takes this suite's own `env` fixture type, which test_review_apply.c
+ * does not share; it takes the two things `env` was only ever used for here,
+ * the data directory and the binary to execve.
+ *
+ * `pty_wait` gained a bound after the move (T6 fix round 1): a suite driving
+ * a real, unlocked walker can reach a state where the walker is wrongly
+ * still prompting when the sheet is exhausted, which blocks the child on
+ * `/dev/tty` forever. See `pty_wait`'s own comment.
  *
  * See test_decision_operator.c's own header comment for what this
  * demonstrates and why: a program allocating a pseudo-terminal and typing at
@@ -29,6 +34,11 @@ typedef struct pty {
     int master;
     pid_t child;
 } pty;
+
+/* `pty_wait`'s sentinel for "the child did not exit within the bound and was
+ * killed" -- outside the 0-255 exit-code range and outside 128+signal, so a
+ * caller can tell a timeout apart from any real exit unambiguously. */
+#define PTY_WAIT_TIMED_OUT (-1000)
 
 /* Forks `bin_path` with a pseudo-terminal as its stdin, stdout and stderr, and
  * `--data-dir data_dir` prepended to `args`. The child calls `setsid()` and
@@ -57,7 +67,12 @@ bool pty_expect(pty *p, const char *needle, atlas_buf *transcript);
 void pty_type(pty *p, const char *line);
 
 /* Drains whatever output is left, then reaps the child. Returns its exit
- * status (128 + signal number if it died from one). */
+ * status (128 + signal number if it died from one), or `PTY_WAIT_TIMED_OUT`
+ * if the child was still running after a bounded wait -- a walker that
+ * wrongly prompts leaves the child blocked reading `/dev/tty` forever, and
+ * this must fail with a message rather than hang the whole test process to
+ * CTest's own timeout. On a timeout the child has already been SIGKILLed and
+ * reaped. */
 int pty_wait(pty *p, atlas_buf *transcript);
 
 #endif /* ATLAS_TEST_SUPPORT_PTY_H */

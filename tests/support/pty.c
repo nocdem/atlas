@@ -11,13 +11,16 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "atlas/atlas.h"
@@ -54,10 +57,23 @@ atlas_status pty_spawn(const char *data_dir, const char *bin_path, const char *c
     /* An explicitly constructed environment, like everywhere else in the
      * suite: nothing inherited, so no ambient variable can influence the
      * child. HOME points inside the fixture so nothing the child does can
-     * reach the developer's account. */
+     * reach the developer's account.
+     *
+     * `XDG_RUNTIME_DIR` is a private, empty subdirectory of `data_dir` --
+     * matching `tests/test_review_apply.c`'s own `run_installed`, which needs
+     * this so its non-interactive invocations of the *installed* binary can
+     * never reach the socket the real `atlasd` happens to be serving. Harmless
+     * here too (an explicit `--data-dir` already keeps every command local),
+     * and one spawner leaving it unset while the other set it is exactly the
+     * kind of unexplained difference that gets the wrong one copied later. */
     char home[1024];
     (void)snprintf(home, sizeof(home), "HOME=%s", data_dir);
-    const char *envp[] = {"PATH=/usr/bin:/bin", home, "LC_ALL=C", NULL};
+    char xdgrt_path[1024];
+    (void)snprintf(xdgrt_path, sizeof(xdgrt_path), "%s/xdgrt", data_dir);
+    (void)mkdir(xdgrt_path, S_IRWXU); /* EEXIST is fine; anything else just leaves it unset */
+    char xdgrt_env[1200];
+    (void)snprintf(xdgrt_env, sizeof(xdgrt_env), "XDG_RUNTIME_DIR=%s", xdgrt_path);
+    const char *envp[] = {"PATH=/usr/bin:/bin", home, xdgrt_env, "LC_ALL=C", NULL};
 
     pid_t pid = fork();
     if (pid < 0) {
@@ -155,8 +171,25 @@ int pty_wait(pty *p, atlas_buf *transcript) {
         }
         (void)atlas_buf_append(transcript, buf, (size_t)n, &err);
     }
+    /* Bounded, not `waitpid(p->child, &status, 0)`: a walker that wrongly
+     * prompts (or hangs for any other reason) leaves the child blocked
+     * reading `/dev/tty`, and an unbounded wait here would hang this whole
+     * test process to CTest's own timeout instead of failing with a message
+     * that says what happened. Up to 10 more seconds of polling, then
+     * SIGKILL and reap. */
+    for (int i = 0; i < 200; i++) {
+        int status = 0;
+        pid_t r = waitpid(p->child, &status, WNOHANG);
+        if (r == p->child) {
+            (void)close(p->master);
+            return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+        }
+        struct timespec ts = {0, 50L * 1000L * 1000L};
+        (void)nanosleep(&ts, NULL);
+    }
+    (void)kill(p->child, SIGKILL);
     int status = 0;
     (void)waitpid(p->child, &status, 0);
     (void)close(p->master);
-    return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+    return PTY_WAIT_TIMED_OUT;
 }

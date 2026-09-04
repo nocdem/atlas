@@ -158,26 +158,28 @@ static void open_at_schema_30(fixture *fx, atlas_db **db_out) {
     T_EQ_INT(schema_of(*db_out), 30);
 }
 
-/* One document, one revision, three events (one per actor value the old
- * CHECK admitted, including VERIFICATION_POLICY) and two challenges, written
- * with plain SQL against the schema-30 shape -- `atlas_db_decision_event_append`
- * and `atlas_db_decision_challenge_insert` already name `key_id`/`channel` and
- * would fail to prepare against a database that does not have them yet. */
-static void seed_v30_rows(atlas_db *db, int64_t *doc_id_out, int64_t *rev_id_out) {
+/* One document and one revision, written with plain SQL -- shared by
+ * `seed_v30_rows` below (against a schema-30 database) and by the
+ * vocabulary-pinning test (against a fully migrated one; nothing this
+ * function inserts names a column migration 31 touches, so it is valid
+ * against either schema). A fresh `uid` per call, so multiple tests in this
+ * suite can each seed their own document without colliding on the
+ * `decision_documents.uid` UNIQUE index. */
+static void seed_doc_and_revision(atlas_db *db, const char *uid_suffix, int64_t *doc_id_out,
+                                  int64_t *rev_id_out) {
     atlas_err err;
     atlas_err_init(&err);
-    T_OK(atlas_db_exec_sql(
-             db,
-             "INSERT INTO decision_documents"
-             "  (uid, repo_id, repo_root_hash, created_at, updated_at)"
-             "  VALUES ('atlas-dec-m31000000000000000000000001', 1, 'roothash',"
-             "          '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z');",
-             &err),
-         &err);
+    char sql[1024];
+    (void)snprintf(sql, sizeof sql,
+                  "INSERT INTO decision_documents"
+                  "  (uid, repo_id, repo_root_hash, created_at, updated_at)"
+                  "  VALUES ('atlas-dec-m31%s', 1, 'roothash',"
+                  "          '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z');",
+                  uid_suffix);
+    T_OK(atlas_db_exec_sql(db, sql, &err), &err);
     *doc_id_out = count_sql(db, "SELECT id FROM decision_documents ORDER BY id DESC LIMIT 1;");
     T_REQUIRE(*doc_id_out > 0);
 
-    char sql[1024];
     (void)snprintf(sql, sizeof sql,
                   "INSERT INTO decision_revisions"
                   "  (document_id, revision_no, content_hash, title, proposed_by, created_at)"
@@ -187,7 +189,20 @@ static void seed_v30_rows(atlas_db *db, int64_t *doc_id_out, int64_t *rev_id_out
     T_OK(atlas_db_exec_sql(db, sql, &err), &err);
     *rev_id_out = count_sql(db, "SELECT id FROM decision_revisions ORDER BY id DESC LIMIT 1;");
     T_REQUIRE(*rev_id_out > 0);
+}
 
+/* One document, one revision (via `seed_doc_and_revision` above), three
+ * events (one per actor value the old CHECK admitted, including
+ * VERIFICATION_POLICY) and two challenges, written with plain SQL against
+ * the schema-30 shape -- `atlas_db_decision_event_append` and
+ * `atlas_db_decision_challenge_insert` already name `key_id`/`channel` and
+ * would fail to prepare against a database that does not have them yet. */
+static void seed_v30_rows(atlas_db *db, int64_t *doc_id_out, int64_t *rev_id_out) {
+    atlas_err err;
+    atlas_err_init(&err);
+    seed_doc_and_revision(db, "000000000000000000000001", doc_id_out, rev_id_out);
+
+    char sql[1024];
     /* Three events, one per actor value the old CHECK admitted, including
      * VERIFICATION_POLICY -- the brief's own fixture. */
     (void)snprintf(sql, sizeof sql,
@@ -416,7 +431,114 @@ static void test_stopped_at_30_reaches_31_losslessly(void) {
     fx_close(&fx);
 }
 
-/* --- 3: a rebuild that loses a ledger row is refused by name and rolled --- */
+/* --- 3: the widened CHECKs are pinned to the C vocabulary itself --------- */
+
+/* Fix round 1: a reviewer mutated migration 31 to remove `MODEL_INFERENCE`
+ * from the widened events CHECK and `ctest -L unit` still passed 40/40,
+ * because `test_stopped_at_30_reaches_31_losslessly` above only ever
+ * exercised three of the six actor values. A CHECK vocabulary re-typed by
+ * hand into SQL drifts silently from its C enum unless something inserts
+ * every member and watches -- `test_migrate29.c`'s `check_vocab_matches_schema`
+ * is the precedent: an INSERT against the real schema proves the CHECK's
+ * actual behaviour, which a DDL substring match would not, because it would
+ * still pass with a member's name sitting unused elsewhere in the file.
+ *
+ * This loops over `atlas_decision_actor_name` for every member the enum
+ * declares and asserts the widened events CHECK accepts each one as a real
+ * row, so a member missing from the CHECK -- added to the enum and never
+ * added here, or quietly dropped as the reviewer's mutation did -- fails
+ * this test rather than waiting for a production write to discover it. The
+ * near-miss and zero-name refusals in test 2 above are the negative half of
+ * this same CHECK and are not repeated here. */
+static void check_actor_vocab_accepted(atlas_db *db, int64_t doc_id) {
+    atlas_err err;
+    atlas_err_init(&err);
+    static const atlas_decision_actor MEMBERS[] = {
+        ATLAS_DECISION_ACTOR_MODEL_PROPOSAL,
+        ATLAS_DECISION_ACTOR_MODEL_INFERENCE,
+        ATLAS_DECISION_ACTOR_LOCAL_OPERATOR_CONFIRMED,
+        ATLAS_DECISION_ACTOR_ATLAS_AUTOMATIC,
+        ATLAS_DECISION_ACTOR_VERIFICATION_POLICY,
+        ATLAS_DECISION_ACTOR_REMOTE_OPERATOR_CONFIRMED,
+    };
+    for (size_t i = 0; i < sizeof MEMBERS / sizeof MEMBERS[0]; i++) {
+        const char *name = atlas_decision_actor_name(MEMBERS[i]);
+        char sql[512];
+        (void)snprintf(sql, sizeof sql,
+                      "INSERT INTO decision_events (document_id, revision_no, event, actor,"
+                      "  created_at)"
+                      "  VALUES (%lld, 0, 'PROPOSED', '%s', '2026-09-01T00:00:20Z');",
+                      (long long)doc_id, name);
+        atlas_status st = atlas_db_exec_sql(db, sql, &err);
+        T_CHECK_MSG(st == ATLAS_OK, "the widened events CHECK refused actor '%s' (%s)", name,
+                    atlas_err_msg(&err));
+    }
+}
+
+/* The channel vocabulary is re-typed by hand into SQL exactly the same way
+ * (`M31_CHALLENGES`'s `CHECK(channel IN ('LOCAL','REMOTE'))`), so the same
+ * argument applies and gets the same loop -- over both non-zero members,
+ * plus the zero member's own name refused, on `check_vocab_matches_schema`'s
+ * full shape rather than only the positive half. */
+static void check_channel_vocab_matches_schema(atlas_db *db, int64_t doc_id, int64_t rev_id) {
+    atlas_err err;
+    atlas_err_init(&err);
+    static const atlas_decision_channel MEMBERS[] = {
+        ATLAS_DECISION_CHANNEL_LOCAL,
+        ATLAS_DECISION_CHANNEL_REMOTE,
+    };
+    for (size_t i = 0; i < sizeof MEMBERS / sizeof MEMBERS[0]; i++) {
+        const char *name = atlas_decision_channel_name(MEMBERS[i]);
+        char sql[768];
+        (void)snprintf(sql, sizeof sql,
+                      "INSERT INTO decision_challenges"
+                      "  (token, repo_id, document_id, revision_id, revision_no, content_hash,"
+                      "   intent, created_at, expires_at, channel)"
+                      "  VALUES ('m31vocabchanneltoken%zu00000000000', 1, %lld, %lld, 1, 'c0ffee',"
+                      "          'approve', '2026-09-01T00:00:00Z', '2026-09-01T00:10:00Z', '%s');",
+                      i, (long long)doc_id, (long long)rev_id, name);
+        atlas_status st = atlas_db_exec_sql(db, sql, &err);
+        T_CHECK_MSG(st == ATLAS_OK, "the channel CHECK refused channel '%s' (%s)", name,
+                    atlas_err_msg(&err));
+    }
+    /* And the zero member's own name -- what `atlas_decision_channel_name`
+     * produces for UNKNOWN, which `atlas_decision_channel_parse` already
+     * refuses to parse back -- is refused by the schema too. */
+    char sql[768];
+    const char *zero_name = atlas_decision_channel_name(ATLAS_DECISION_CHANNEL_UNKNOWN);
+    (void)snprintf(sql, sizeof sql,
+                  "INSERT INTO decision_challenges"
+                  "  (token, repo_id, document_id, revision_id, revision_no, content_hash,"
+                  "   intent, created_at, expires_at, channel)"
+                  "  VALUES ('m31vocabchannelzero0000000000000000', 1, %lld, %lld, 1, 'c0ffee',"
+                  "          'approve', '2026-09-01T00:00:00Z', '2026-09-01T00:10:00Z', '%s');",
+                  (long long)doc_id, (long long)rev_id, zero_name);
+    T_CHECK_MSG(atlas_db_exec_sql(db, sql, &err) != ATLAS_OK,
+                "the channel CHECK accepted the zero member's own name '%s'", zero_name);
+}
+
+static void test_widened_check_vocabularies_are_pinned_to_the_c_enum(void) {
+    fixture fx;
+    atlas_err err;
+    atlas_err_init(&err);
+    T_OK(fx_open(&fx, &err), &err);
+
+    atlas_db *db = NULL;
+    T_OK(open_fresh(&fx, &db, &err), &err);
+    T_OK(atlas_db_migrate(db, &err), &err);
+    T_EQ_INT(schema_of(db), 31);
+
+    int64_t doc_id = 0, rev_id = 0;
+    seed_doc_and_revision(db, "0000000000000000000vocab1", &doc_id, &rev_id);
+
+    check_actor_vocab_accepted(db, doc_id);
+    check_channel_vocab_matches_schema(db, doc_id, rev_id);
+
+    atlas_db_close(db);
+    fx_close(&fx);
+}
+
+/* --- 4: a rebuild that loses a ledger row is refused by name and rolled --- */
 /* --- back completely, exactly as the real migration verifies itself ------ */
 
 static const char BROKEN_M31_VERIFY[] =
@@ -501,7 +623,11 @@ static const char BROKEN_M31_CHALLENGES[] =
     "CREATE INDEX idx_decision_challenges_repo ON decision_challenges"
     "  (repo_id, consumed, expires_at);";
 
-/* Identical to the real `M31_CONFIRM`. */
+/* Identical to the real `M31_CONFIRM`, including the per-table FK scoping
+ * (Minor 2 of the fix round): each named CHECK names only its own table's
+ * foreign keys, so this test's failure below is attributable to the same
+ * constraint name production code would produce, not to an unscoped check
+ * this test file forgot to update. */
 static const char BROKEN_M31_CONFIRM[] =
     "CREATE TEMP TABLE m31_check("
     "  events_ok INTEGER NOT NULL"
@@ -510,9 +636,10 @@ static const char BROKEN_M31_CONFIRM[] =
     "    CONSTRAINT no_decision_challenge_may_be_lost_in_migration_31 CHECK(challenges_ok = 1));"
     "INSERT INTO m31_check(events_ok, challenges_ok) SELECT"
     "  CASE WHEN (SELECT events_n FROM m31_before) = (SELECT COUNT(*) FROM decision_events)"
+    "        AND (SELECT COUNT(*) FROM pragma_foreign_key_check('decision_events')) = 0"
     "       THEN 1 ELSE 0 END,"
     "  CASE WHEN (SELECT challenges_n FROM m31_before) = (SELECT COUNT(*) FROM decision_challenges)"
-    "        AND (SELECT COUNT(*) FROM pragma_foreign_key_check) = 0"
+    "        AND (SELECT COUNT(*) FROM pragma_foreign_key_check('decision_challenges')) = 0"
     "       THEN 1 ELSE 0 END;"
     "DROP TABLE m31_check;"
     "DROP TABLE m31_before;";
@@ -520,6 +647,89 @@ static const char BROKEN_M31_CONFIRM[] =
 static const char *const BROKEN_M31_STATEMENTS[] = {BROKEN_M31_VERIFY, BROKEN_M31_EVENTS,
                                                      BROKEN_M31_CHALLENGES, BROKEN_M31_CONFIRM,
                                                      NULL};
+
+/* Minor 1 of the fix round: the events-loss list above never exercises
+ * `no_decision_challenge_may_be_lost_in_migration_31`, because it only ever
+ * injects loss into `decision_events`. This second list pairs the real,
+ * unmodified events rebuild with a challenges rebuild that drops the
+ * earliest challenge row, so the *other* named constraint is the one that
+ * fires. */
+static const char GOOD_M31_EVENTS[] =
+    "CREATE TABLE decision_events_new ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  document_id INTEGER NOT NULL REFERENCES decision_documents(id),"
+    "  revision_id INTEGER REFERENCES decision_revisions(id),"
+    "  revision_no INTEGER NOT NULL DEFAULT 0,"
+    "  event TEXT NOT NULL CHECK(event IN"
+    "    ('PROPOSED','APPROVED','REJECTED','SUPERSEDED','RESOLVED')),"
+    "  actor TEXT NOT NULL CHECK(actor IN"
+    "    ('MODEL_PROPOSAL','MODEL_INFERENCE','LOCAL_OPERATOR_CONFIRMED','ATLAS_AUTOMATIC',"
+    "     'VERIFICATION_POLICY','REMOTE_OPERATOR_CONFIRMED')),"
+    "  content_hash TEXT,"
+    "  challenge_id INTEGER,"
+    "  superseded_by_revision_id INTEGER,"
+    "  superseded_by_document_id INTEGER,"
+    "  detail TEXT,"
+    "  created_at TEXT NOT NULL,"
+    "  dedup_key TEXT,"
+    "  key_id TEXT"
+    ");"
+    "INSERT INTO decision_events_new"
+    "  (id, document_id, revision_id, revision_no, event, actor, content_hash, challenge_id,"
+    "   superseded_by_revision_id, superseded_by_document_id, detail, created_at, dedup_key)"
+    "  SELECT id, document_id, revision_id, revision_no, event, actor, content_hash, challenge_id,"
+    "         superseded_by_revision_id, superseded_by_document_id, detail, created_at, dedup_key"
+    "  FROM decision_events;"
+    "DROP TABLE decision_events;"
+    "ALTER TABLE decision_events_new RENAME TO decision_events;"
+    "CREATE INDEX idx_decision_events_doc ON decision_events(document_id, id);"
+    "CREATE INDEX idx_decision_events_rev ON decision_events(revision_id, id);"
+    "CREATE UNIQUE INDEX idx_decision_events_dedup ON decision_events(document_id, dedup_key)"
+    "  WHERE dedup_key IS NOT NULL;";
+
+/* Identical to the real `M31_CHALLENGES`, except the `INSERT ... SELECT`
+ * drops the challenge row with the smallest id. */
+static const char LOSSY_M31_CHALLENGES[] =
+    "CREATE TABLE decision_challenges_new ("
+    "  id INTEGER PRIMARY KEY,"
+    "  token TEXT NOT NULL UNIQUE,"
+    "  repo_id INTEGER NOT NULL,"
+    "  document_id INTEGER NOT NULL REFERENCES decision_documents(id),"
+    "  revision_id INTEGER NOT NULL REFERENCES decision_revisions(id),"
+    "  revision_no INTEGER NOT NULL,"
+    "  content_hash TEXT NOT NULL,"
+    "  intent TEXT NOT NULL CHECK(intent IN ('approve','reject','supersede','revalidate',"
+    "    'resolve')),"
+    "  supersede_document_id INTEGER,"
+    "  indexed_commit TEXT,"
+    "  evidence_digest TEXT,"
+    "  prior_freshness TEXT CHECK(prior_freshness IS NULL OR prior_freshness IN"
+    "    ('FRESH','STALE','IMPACTED','UNKNOWN')),"
+    "  prior_reasons TEXT,"
+    "  created_at TEXT NOT NULL,"
+    "  expires_at TEXT NOT NULL,"
+    "  consumed INTEGER NOT NULL DEFAULT 0,"
+    "  consumed_at TEXT,"
+    "  channel TEXT NOT NULL DEFAULT 'LOCAL' CHECK(channel IN ('LOCAL','REMOTE')),"
+    "  key_id TEXT"
+    ");"
+    "INSERT INTO decision_challenges_new"
+    "  (id, token, repo_id, document_id, revision_id, revision_no, content_hash, intent,"
+    "   supersede_document_id, indexed_commit, evidence_digest, prior_freshness, prior_reasons,"
+    "   created_at, expires_at, consumed, consumed_at)"
+    "  SELECT id, token, repo_id, document_id, revision_id, revision_no, content_hash, intent,"
+    "         supersede_document_id, indexed_commit, evidence_digest, prior_freshness,"
+    "         prior_reasons, created_at, expires_at, consumed, consumed_at"
+    "  FROM decision_challenges"
+    /* The injected loss. */
+    "  WHERE id > (SELECT MIN(id) FROM decision_challenges);"
+    "DROP TABLE decision_challenges;"
+    "ALTER TABLE decision_challenges_new RENAME TO decision_challenges;"
+    "CREATE INDEX idx_decision_challenges_repo ON decision_challenges"
+    "  (repo_id, consumed, expires_at);";
+
+static const char *const LOSSY_CHALLENGES_M31_STATEMENTS[] = {
+    BROKEN_M31_VERIFY, GOOD_M31_EVENTS, LOSSY_M31_CHALLENGES, BROKEN_M31_CONFIRM, NULL};
 
 static void test_a_lossy_migration_31_is_refused_and_rolled_back(void) {
     fixture fx;
@@ -581,13 +791,80 @@ static void test_a_lossy_migration_31_is_refused_and_rolled_back(void) {
     fx_close(&fx);
 }
 
+/* Minor 1's own test: the challenges-loss twin of the test above, over
+ * `LOSSY_CHALLENGES_M31_STATEMENTS` rather than `BROKEN_M31_STATEMENTS`, so
+ * `no_decision_challenge_may_be_lost_in_migration_31` is actually exercised
+ * and not merely declared. */
+static void test_a_lossy_challenges_rebuild_is_refused_and_rolled_back(void) {
+    fixture fx;
+    atlas_err err;
+    atlas_err_init(&err);
+    T_OK(fx_open(&fx, &err), &err);
+
+    atlas_db *db = NULL;
+    open_at_schema_30(&fx, &db);
+
+    int64_t doc_id = 0, rev_id = 0;
+    seed_v30_rows(db, &doc_id, &rev_id);
+    (void)rev_id;
+
+    char events_before[ATLAS_SHA256_HEX_LEN + 1u];
+    char challenges_before[ATLAS_SHA256_HEX_LEN + 1u];
+    table_digest_cols(db, "decision_events", EVENTS_V30_COLS, events_before);
+    table_digest_cols(db, "decision_challenges", CHALLENGES_V30_COLS, challenges_before);
+
+    size_t base_count = 0;
+    const atlas_migration *base = atlas_migrations(&base_count);
+    T_REQUIRE(base_count >= 31u);
+    atlas_migration list[ATLAS_SCHEMA_VERSION];
+    T_REQUIRE(base_count <= sizeof list / sizeof list[0]);
+    memcpy(list, base, base_count * sizeof list[0]);
+    T_REQUIRE(list[30].version == 31);
+    list[30].statements = LOSSY_CHALLENGES_M31_STATEMENTS;
+
+    T_FAILS_WITH(atlas_db_migrate_list(db, list, base_count, &err), ATLAS_ERR_DB, &err);
+    T_CHECK_MSG(
+        strstr(atlas_err_msg(&err), "no_decision_challenge_may_be_lost_in_migration_31") != NULL,
+        "the error should name the constraint the lossy challenges rebuild violated, got: %s",
+        atlas_err_msg(&err));
+    /* And not the events constraint -- a dangling row in the wrong table's
+     * name is exactly Minor 2's failure mode, so this failure had better be
+     * attributed correctly. */
+    T_CHECK_MSG(
+        strstr(atlas_err_msg(&err), "no_decision_event_may_be_lost_in_migration_31") == NULL,
+        "the challenges-only loss was misattributed to the events constraint: %s",
+        atlas_err_msg(&err));
+
+    T_EQ_INT(schema_of(db), 30);
+    char events_after[ATLAS_SHA256_HEX_LEN + 1u];
+    char challenges_after[ATLAS_SHA256_HEX_LEN + 1u];
+    table_digest_cols(db, "decision_events", EVENTS_V30_COLS, events_after);
+    table_digest_cols(db, "decision_challenges", CHALLENGES_V30_COLS, challenges_after);
+    T_CHECK_MSG(strcmp(events_before, events_after) == 0,
+                "a rolled-back lossy-challenges migration 31 still changed decision_events");
+    T_CHECK_MSG(strcmp(challenges_before, challenges_after) == 0,
+                "a rolled-back lossy-challenges migration 31 still changed decision_challenges");
+    T_EQ_INT((int)count_sql(db, "SELECT COUNT(*) FROM decision_challenges;"), 2);
+
+    T_OK(atlas_db_migrate(db, &err), &err);
+    T_EQ_INT(schema_of(db), 31);
+    T_EQ_INT((int)count_sql(db, "SELECT COUNT(*) FROM decision_challenges;"), 2);
+
+    atlas_db_close(db);
+    fx_close(&fx);
+}
+
 static const atlas_test TESTS[] = {
     {"a fresh database reaches 31 with the new columns and every index",
      test_fresh_database_reaches_31},
     {"a database stopped at 30 reaches 31 losslessly, and the widened CHECKs behave",
      test_stopped_at_30_reaches_31_losslessly},
+    {"the widened events and new channel CHECKs are pinned to the C vocabulary itself",
+     test_widened_check_vocabularies_are_pinned_to_the_c_enum},
     {"a rebuild that loses a ledger row is refused by name and rolled back completely",
      test_a_lossy_migration_31_is_refused_and_rolled_back},
+    {"a rebuild that loses a challenge is refused by its own name and rolled back completely",
+     test_a_lossy_challenges_rebuild_is_refused_and_rolled_back},
 };
 
 ATLAS_TEST_MAIN("migrate31", TESTS)

@@ -3120,9 +3120,24 @@ static const char M15_EVENTS[] =
     "  WHERE dedup_key IS NOT NULL;";
 
 /* The rebuild verifies its own row preservation before it commits, the
- * discipline migration 13 established. The named CHECK is the error message:
- * a migration that lost ledger rows must say so in words an operator can act
- * on, not fail with a constraint number. */
+ * discipline migration 13 established.
+ *
+ * Comment corrected after the fact (A16 T2's fix round); the SQL immediately
+ * below is unchanged and stays that way -- it has already run on real
+ * databases, and a comment is not a schema. This migration writes
+ * `CHECK(ok = 1) CONSTRAINT no_decision_event_may_be_lost_in_migration_15`,
+ * the constraint name trailing the CHECK it names. Verified directly against
+ * both SQLite 3.40.1 (as Atlas links it) and 3.44.4 (this machine's `sqlite3`
+ * CLI): in that order the name binds to nothing, and a violation raises
+ * "CHECK constraint failed: ok = 1" -- the bare expression, never the name.
+ * The order that does surface the name is `CONSTRAINT name CHECK(...)`, name
+ * leading -- what migration 13 wrote before this one, and what migration 31
+ * (A16) wrote after it once this was found. So the sentence this paragraph
+ * used to end on, "the named CHECK is the error message," is false for the
+ * SQL this migration actually contains: a lost row here still aborts the
+ * transaction and rolls back correctly -- SQLite's rollback does not depend
+ * on the message -- but the message an operator would see names the bare
+ * expression, not this constraint. */
 static const char M15_VERIFY[] =
     "CREATE TEMP TABLE m15_before AS SELECT COUNT(*) AS n FROM decision_events;";
 
@@ -4626,21 +4641,39 @@ static const char *const M30_STATEMENTS[] = {M30_REPO_TRAILER_CURSOR, M30_BINDIN
  * about every existing row, and not migration 19's mistake
  *
  * Migration 19's mistake was inventing an intent nobody expressed. This
- * default invents nothing: before this migration there was exactly one
- * code path that could ever call `atlas_db_decision_challenge_insert` --
- * `op_challenge` in `src/decision/lifecycle.c`, which builds the only
- * `ATLAS_DECISION_OP_CHALLENGE` this codebase constructs, inside
- * `atlas_service_decision_confirm`. That function has exactly two callers,
- * both local: the CLI (`src/cli/cli.c`) and the local review-apply surface
- * (`src/core/service_review.c`). A9's gateway had no write route to it and
- * this season's `decision.remote_challenge` does not exist until a later
- * task. So "channel = LOCAL" is not a guess about history, it is the only
- * channel that has ever existed for every row a pre-31 database can hold --
- * the same shape as migration 13's `kind DEFAULT 'DECISION'`: "the
- * definition of every pre-A9.1 row and not a fallback: those records were
- * decisions." Every pre-31 challenge was minted through the local terminal
- * channel for the identical reason -- there was no other channel capable of
- * minting one. The default also fires exactly once, at this migration:
+ * default invents nothing, and the argument is about the *channel*
+ * vocabulary, not about which function happens to call
+ * `atlas_db_decision_challenge_insert` -- an earlier draft of this comment
+ * named `op_challenge` and `atlas_service_decision_confirm` as if minting
+ * were their doing alone, and that was wrong on inspection: `op_challenge`
+ * only *consumes* an already-built `ATLAS_DECISION_OP_CHALLENGE`, and this
+ * codebase has more than one place that builds one. The chain that actually
+ * holds does not need to enumerate them.
+ *
+ * `atlas_decision_channel` has exactly two non-zero members, `LOCAL` and
+ * `REMOTE`; `REMOTE` means the request travelled through the gateway,
+ * carrying a bearer credential (see `include/atlas/decision.h`'s own
+ * definition). Every route the gateway serves is read-only -- "every route
+ * is a read; there is no write anywhere in this table" is `src/gw/gateway.c`'s
+ * own comment on `API_ROUTES[]`, and its three decision-related rows are
+ * `decision.list`, `decision.get` and `decision.history`, none of which
+ * reaches the lifecycle. No MCP tool reaches it either: `src/mcp/mcp_tools.c`
+ * states plainly that there is no approval, rejection or supersession tool.
+ * So before this migration there was no route by which any row could have
+ * been minted as REMOTE, and every row a pre-31 database can hold is
+ * therefore `LOCAL` -- the same shape as migration 13's
+ * `kind DEFAULT 'DECISION'`: "the definition of every pre-A9.1 row and not a
+ * fallback: those records were decisions."
+ *
+ * Pre-A7, the operator channel's own defect was that `decision.challenge`
+ * took no capability and asked for no terminal, so any process able to open
+ * the socket could mint a token (see the comment above `method_challenge` in
+ * `src/ipc/server_decision.c`). That was a defect in *who* was checked, not
+ * in *where*: the socket a stray process opened was still a Unix domain
+ * socket on the Atlas machine, which is what `LOCAL` means by the
+ * vocabulary's own definition -- it was never reachable over a network, and
+ * it predates the gateway's bearer-credential model by two seasons. The
+ * default also fires exactly once, at this migration:
  * `atlas_db_decision_challenge_insert` names the column explicitly on every
  * future insert, so no row written after this migration ever reaches it by
  * falling through unset.
@@ -4667,19 +4700,24 @@ static const char *const M30_STATEMENTS[] = {M30_REPO_TRAILER_CURSOR, M30_BINDIN
  * Both counts are captured into one temp table before either rebuild
  * touches anything, and confirmed after both, each under its own named
  * `CONSTRAINT ... CHECK(... = 1)` -- `CONSTRAINT name` **before** `CHECK`,
- * as migration 13 writes it and **not** as migration 15 writes it. Verified
- * directly against this SQLite: `CHECK(ok = 1) CONSTRAINT name` (migration
- * 15's order) raises "CHECK constraint failed: ok = 1" -- the name never
- * appears -- while `CONSTRAINT name CHECK(ok = 1)` (migration 13's order, and
- * this migration's) raises "CHECK constraint failed: name". Migration 15's
- * own comment claims "the named CHECK is the error message"; on this
- * evidence that claim is false for the order it actually wrote, and this
- * migration follows the order that is true instead. A migration that lost a
- * ledger row here fails as `no_decision_event_may_be_lost_in_migration_31`;
- * one that lost a challenge fails as
- * `no_decision_challenge_may_be_lost_in_migration_31` -- an operator reads
- * which table, not a constraint number, and the whole transaction rolls back
- * either way. */
+ * as migration 13 writes it and, since this was found while writing this
+ * migration, migration 15's own comment has now been corrected to say it did
+ * not: written in the opposite order, `CONSTRAINT name` there binds to
+ * nothing and names no error (see that migration's comment for the verified
+ * detail). A migration that lost a ledger row here fails as
+ * `no_decision_event_may_be_lost_in_migration_31`; one that lost a challenge
+ * fails as `no_decision_challenge_may_be_lost_in_migration_31`.
+ *
+ * Each CHECK's own condition also names only its own table's foreign keys --
+ * `pragma_foreign_key_check('decision_events')` under `events_ok`,
+ * `pragma_foreign_key_check('decision_challenges')` under `challenges_ok`,
+ * rather than one unscoped `pragma_foreign_key_check` folded into either
+ * (migration 15's own shape, harmless there because it rebuilds one table).
+ * Unscoped here, a dangling reference the *events* rebuild left behind would
+ * fail under the *challenges* constraint's name and send an operator to the
+ * wrong table. So an operator reads which table lost a row and which
+ * table's foreign keys broke from the same name, and the whole transaction
+ * rolls back either way. */
 static const char M31_VERIFY[] =
     "CREATE TEMP TABLE m31_before AS"
     "  SELECT (SELECT COUNT(*) FROM decision_events) AS events_n,"
@@ -4770,9 +4808,10 @@ static const char M31_CONFIRM[] =
     "    CONSTRAINT no_decision_challenge_may_be_lost_in_migration_31 CHECK(challenges_ok = 1));"
     "INSERT INTO m31_check(events_ok, challenges_ok) SELECT"
     "  CASE WHEN (SELECT events_n FROM m31_before) = (SELECT COUNT(*) FROM decision_events)"
+    "        AND (SELECT COUNT(*) FROM pragma_foreign_key_check('decision_events')) = 0"
     "       THEN 1 ELSE 0 END,"
     "  CASE WHEN (SELECT challenges_n FROM m31_before) = (SELECT COUNT(*) FROM decision_challenges)"
-    "        AND (SELECT COUNT(*) FROM pragma_foreign_key_check) = 0"
+    "        AND (SELECT COUNT(*) FROM pragma_foreign_key_check('decision_challenges')) = 0"
     "       THEN 1 ELSE 0 END;"
     "DROP TABLE m31_check;"
     "DROP TABLE m31_before;";

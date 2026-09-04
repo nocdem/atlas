@@ -722,11 +722,24 @@ this season's own.
 - **A PROPOSAL NOBODY CAN REVIEW COMFORTABLY IS A PROPOSAL NOBODY REVIEWS.** The
   reading moves to the surface that is good at it; the disposing stays where the only
   channel is.
-- **The review sheet stores no authority and has no field for a confirmation.** It is a
-  list of what the operator said in a browser; every entry is still confirmed on
-  `/dev/tty` against the revision's content hash, and the grammar test refuses a line
-  with a sixth field for the reason the MCP schema test refuses a `"confirmation":`
-  property.
+- **The review sheet stores no authority.** It is a list of what the operator said in a
+  browser; every entry is still confirmed on `/dev/tty` against the revision's content
+  hash, and the grammar test refuses a line with a sixth field for the reason the MCP
+  schema test refuses a `"confirmation":` property.
+
+  **Amended during execution, 2026-09-04.** This bullet said "and has no field for a
+  confirmation", and the whole-branch review established that half is false as written:
+  the confirmation an operator types *is* the first eight hex of the revision's content
+  hash (`atlas_decision_confirm_phrase`, `src/decision/lifecycle.c`), and the sheet's
+  fifth field is exactly that string — a test types the sheet's own prefix and gets
+  APPLIED. The security claim is unharmed and is what the corrected wording keeps: the
+  prefix is public, `decision show` prints it, and under A7 nothing typed by a same-uid
+  process is evidence that a person acted. What is true is that the sheet carries the
+  public prefix the operator will type and has **no field the walker reads in place of
+  that typing on `/dev/tty`**. The four source comments and the three documents carrying
+  the old sentence were corrected; the one at line 937 below is left alone deliberately,
+  because it is the subject line of a commit that exists in git history and the plan
+  should not disagree with the ledger of what was done.
 - **The sheet is a file argument, never standard input.** Both standard streams must be
   terminals (`terminal.c:29`); a piped sheet is refused before anything is minted.
 - **The walker loops `atlas_service_decision_confirm` with the reviewed revision pinned

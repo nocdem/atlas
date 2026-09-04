@@ -408,6 +408,8 @@ static void test_no_source_or_document_overstates_the_approval_claim(void) {
         ATLAS_SRC_DIR "/src/cli/render_human.c",
         ATLAS_SRC_DIR "/src/gw/ui/mission-control.html",
         ATLAS_SRC_DIR "/src/core/service_review.c",
+        ATLAS_SRC_DIR "/include/atlas/review.h",
+        ATLAS_SRC_DIR "/src/core/review.c",
         NULL,
     };
     for (size_t f = 0; FILES[f] != NULL; f++) {

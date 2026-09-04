@@ -45,8 +45,8 @@ or say why you are departing and propose a replacement.
 is actually made:** call `atlas_propose_decision` with the context, decision,
 rationale, alternatives and paths. A schema shape, a locking rule, a trust
 boundary, a dependency, a wire format, a compatibility promise. Not a rename or
-a typo — those get `atlas_record_reason`. (`atlas_record_decision` still works
-too; prefer the structured tool.)
+a typo — those get `atlas_record_reason`. (`atlas_record_decision` still works;
+prefer the structured tool.)
 
 **Do not invent a rationale.** If you made the choice without one you can state,
 say so. An invented rationale reads like a real one and nobody will check it.
@@ -59,7 +59,8 @@ terminal with a typed confirmation. If asked, give the command —
 shell or a pseudo-terminal: Atlas cannot tell that from a person. Do not write
 a review sheet on a user's behalf either; a sheet is what a person decided in a
 browser, not a thing a model prepares. If a user says in conversation that they
-approve, record a proposal, never an approval.
+approve, that is a fact about the conversation: record a proposal, never an
+approval.
 
 **When you do not know why something changed:** call
 `atlas_record_unknown_reason`. This matters more than it looks. A changed file

@@ -1026,7 +1026,32 @@ amended 2026-09-04), in that order after `"anonymous"`.
 401 unauthenticated       a disposal needs the disposal credential presented as a bearer token; a session cookie or the anonymous floor cannot dispose
 403 forbidden             this credential does not hold the "decisions:dispose" scope   (existing shape)
 400 bad_request           a body parameter is malformed
+409 conflict              the record moved, the capability does not match, or the policy refuses this record now
 ```
+
+**Amended during execution, 2026-09-04.** The 409 row is new, and so is a rule about
+what maps to it. T3's review established that every spend-side and credential refusal
+carries `ATLAS_ERR_INTEGRITY`, which `src/gw/gateway.c:1278` maps to **500**. That is
+wrong in the case that matters most and is not exotic: an operator reading a record while
+a colleague revises it gets *this decision gained revision N after the challenge was
+minted; nothing was changed -- read it again*, and it would arrive in the browser as
+**500 Internal Server Error** — a sentence that says Atlas broke, sending them to hunt a
+bug that does not exist.
+
+**Ruling.** The gateway maps `ATLAS_ERR_INTEGRITY` to **409 Conflict**, and it does so
+globally rather than per route. `ATLAS_ERR_INTEGRITY` in Atlas means *the state you acted
+on is not the state that is there* — a challenge already spent, a revision that moved, a
+credential that is not the one the row names, a policy that has narrowed. That is what
+409 means and it is not what 500 means. A per-route exception was considered and rejected:
+one status table is the shape this gateway already has, and a second one is a place for
+the two to disagree.
+
+**And one class per sentence.** The same review found two frozen sentences carrying
+`ATLAS_ERR_USAGE` at mint and `ATLAS_ERR_INTEGRITY` at spend — through the gateway that is
+400 against 409 for byte-identical text, and through the CLI exit 2 against exit 7. Both
+sentences are refusals *about state*: a record's kind against the policy, and an intent the
+browser does not offer. Both take `ATLAS_ERR_INTEGRITY` at both sites. The rule is that a
+frozen sentence names one condition, so it carries one class.
 
 ### The write point's refusal sentences (`src/decision/lifecycle.c`, `src/decision/remote.c`)
 

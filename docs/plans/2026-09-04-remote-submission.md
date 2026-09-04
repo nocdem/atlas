@@ -162,7 +162,7 @@ every reference in this plan against A16's final commit and amend this document.
   path per function; `atlas_buf` owns its allocation; row callbacks receive borrowed
   pointers valid only for the call. **A credential in a struct is wiped, not merely
   freed**: `atlas_orch_op_free` must `memset` the `remote_token` buffer's bytes before
-  releasing them, exactly as `gateway.c:1469-1479` wipes the login key and A16's
+  releasing them, exactly as `gateway.c:1469-1479` (`~1818` after A16) wipes the login key and A16's
   `atlas_decision_op_free` wipes `remote_token`; `atlas_mcp_server_teardown` wipes
   `remote_token` the same way.
 - Untrusted text — task text, a repository name, a label, a worker's driver version —
@@ -222,8 +222,12 @@ not followed.
 ## What exists, verified against the tree at `c06e0a8` (2026-09-04)
 
 *(Amended 2026-09-04, T1 Step 0 re-read against A16 final commit `d8e9e49` / HEAD `3f67503`:
-line references that moved are corrected inline below; A16 T5, T6 and T7 have all landed —
-items 8 and the §What A16 leaves table updated accordingly.)*
+line references that moved are corrected inline (old number → `~new` after A16); A16 T5, T6 and T7 have all landed —
+items 8 and the §What A16 leaves table updated accordingly. A16 T6 inserted ~200 lines into `gateway.c`
+(the write-route block), shifting item 7's `/mcp` handler reference, its REMOTE_MCP audit row reference,
+and the §Global constraints login-key wipe reference; all three corrected. Items 2, 3, 4, 10, 11, 12 —
+whose references are to files T6 did not substantially reorder — were not re-grepped; T8 and T9 of A14
+are not in the tree.)*
 
 Every item the brief said is true of this deployment, checked, plus what the tree adds
 to each.
@@ -321,13 +325,13 @@ to each.
    maps thirty-seven names (`tests/test_plugin.c:414` pins the count), none to any
    orchestration method, and `method_job_submit`'s own comment says so ("There is no
    MCP tool and no gateway route that reaches this method"). `/mcp`
-   (`gateway.c:1378-1448`) authenticates the bearer, builds an in-process
+   (`gateway.c:1378-1448`, `~1679` after A16) authenticates the bearer, builds an in-process
    `atlas_mcp_server` with `remote = true` and `granted = pr->scopes` (`mcp_exchange`,
    `:698-736`, `:700` after A16), and the tool listing and every `tools/call` are gated on
    `atlas_scope_has(s->granted, TOOLS[i].scope)` (`mcp_tools.c:3839`, `:4027`). The
    MCP server never sees the token: `authenticate` wipes it (`:281-395`), and
    `mcp_exchange` receives the principal only. The audit row for every `/mcp` request
-   is `interface = REMOTE_MCP, operation = "mcp"` (`:1440-1446`) — the tool name is
+   is `interface = REMOTE_MCP, operation = "mcp"` (`:1440-1446`, `~1732-1743` after A16) — the tool name is
    not recorded.
 8. **A16 as it stands in the tree, task by task.** T1 (vocabularies, `--no-scopes`),
    T2 (migration 31, `f77fc67`) and T3 (the write point, `13b45f3`, `bb37e0c`) are
@@ -830,7 +834,7 @@ remote-only name *absent* from that listing; `tests/test_gw_remote.c:279`'s
 `test_no_credential_can_reach_a_write_tool` gains the four names for a credential
 holding every grantable scope, and a new case shows a credential the policy names
 reaches them. Every remote `tools/call` still audits as `operation = "mcp"`
-(`gateway.c:1440-1446`); the submission is named by the daemon's own log line and by
+(`gateway.c:1440-1446`, `~1732-1743` after A16); the submission is named by the daemon's own log line and by
 the job row, and this is stated as a cost in T10 rather than fixed by threading a tool
 name back through `mcp_exchange`.
 

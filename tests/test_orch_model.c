@@ -859,7 +859,9 @@ static void test_a_policy_naming_submitter_uid_992_parses_active(void) {
     /* The gateway runs as uid 992 on this deployment. §Global constraints and
      * A14 §Decisions say that uid must never appear as submitter_uid in
      * /etc/atlas/orchestration.conf or in any fixture — that refusal is the
-     * deployment's and this plan's, not the parser's. This test exists so
+     * deployment's and this plan's, not the parser's; and the `text` string
+     * below is the forbidden line, written once here to prove the parser has
+     * no opinion about it. This test exists so
      * nobody adds a parser check for 992 and calls it the authorisation
      * boundary: the boundary is `atlas_orchpolicy_permits_submitter` against
      * the runtime peer uid, enforced by `require_submitter` in

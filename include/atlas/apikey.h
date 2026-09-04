@@ -113,13 +113,10 @@ typedef enum atlas_apikey_scope {
      * only for a key holding none is what keeps the disposal credential
      * structurally incapable of being that key. */
     ATLAS_SCOPE_DECISIONS_DISPOSE,
-    /* A14. Not grantable, for the same reason `DECISIONS_DISPOSE` is not: never
-     * stored on an `api_keys` row, and `atlas api-key create` refuses it by
-     * name. Unlike DECISIONS_DISPOSE it is derived for a key that may hold
-     * stored read scopes, and Decision 1 says why. The daemon derives it, in
-     * `gateway.auth` and at the remote-submit write point, for exactly the
-     * credentials the root-owned `remote_submit_key` lines name. */
-    ATLAS_SCOPE_JOBS_SUBMIT,
+    /* Never stored on a key row: derived by the daemon for exactly the
+     * credentials the root-owned `remote_submit_key` lines name. Unlike DECISIONS_DISPOSE
+     * it is derived for a key that may hold stored read scopes, and Decision 1 says why. */
+    ATLAS_SCOPE_JOBS_SUBMIT,                                  /* name: "jobs:submit", grantable = false */
     ATLAS_SCOPE__COUNT
 } atlas_apikey_scope;
 

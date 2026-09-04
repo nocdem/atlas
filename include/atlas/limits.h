@@ -980,10 +980,7 @@
  * caller sending anywhere near that much to a disposal route is not sending
  * a disposal. */
 #define ATLAS_GW_WRITE_BODY_MAX_BYTES 4096u
-/* A14. The task field may be up to ATLAS_ORCH_TASK_MAX (65536) bytes of raw
- * text, which percent-encodes to at most 3× that; add room for the other
- * fields (repo, key, token). */
-#define ATLAS_GW_SUBMIT_BODY_MAX_BYTES 262144u
+#define ATLAS_GW_SUBMIT_BODY_MAX_BYTES 262144u  /* 3 × ATLAS_ORCH_TASK_MAX for percent-encoding, plus the other fields */
 
 /* One response body the gateway will assemble. A result that does not fit is a
  * structured statement that it does not fit, never a truncation. */

@@ -896,15 +896,32 @@ const atlas_gateway_route_view *atlas_gateway_api_write_routes(size_t *count_out
 # remote_dispose_kinds = OPERATIONAL_FACT PARKED
 
 # THE OPERATOR'S WRITTEN ACCEPTANCE OF A CLEARTEXT DISPOSAL CHANNEL. Not a feature
-# toggle. With this line present and tls_mode = NONE, the disposal credential crosses
+# toggle. With this line present and tls_mode = NONE (or absent), the disposal credential crosses
 # the network unencrypted on every disposal; anyone able to observe traffic on the
-# segment can capture it; an Atlas credential has no expiry, so a captured one
-# disposes of records exactly as you do until `atlas api-key revoke`. `yes` is the
+# segment can capture it; an Atlas credential has no expiry, so a credential
+# captured once disposes of records exactly as you do until `atlas api-key revoke`. `yes` is the
 # only accepted value; leave the line out rather than writing `no`. Refused under
 # tls_mode = REVERSE_PROXY (nothing to accept) and without the two keys above.
 # `atlas gateway status` prints this acceptance on every run.
 # operator_accepts_cleartext_disposal = yes
 ```
+
+**Amended during execution, 2026-09-04.** Two strings in this frozen block were corrected
+in the shipped template before the plan caught up, and the corrections are kept rather
+than reverted because both are true and the frozen text was not.
+
+`tls_mode = NONE` became `tls_mode = NONE (or absent)`: the loader requires this
+acceptance when `tls_mode` is absent too, not only when it is written as `NONE`, and
+T4's own new test proves it. The frozen text would have told an operator their policy
+was safe in a case where the loader refuses it.
+
+`so a captured one disposes` became `so a credential captured once disposes`: "a captured
+one" reads as the *record* in the clause before it, which is the opposite of what the
+sentence warns about.
+
+Recorded here rather than fixed silently, because this block's own rule is that a change
+to it is a dated amendment.
+
 
 **Amended 2026-09-04.** The third key, `operator_accepts_cleartext_disposal`, exists
 because the operator declined TLS on their own network after being shown the chain

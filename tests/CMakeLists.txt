@@ -8,6 +8,9 @@ add_library(atlas_test_support STATIC
   support/harness.c
   support/fixture.c
   support/jsoncheck.c
+  # A15 T6: the pseudo-terminal helpers, shared by test_decision_operator.c and
+  # test_review_apply.c.
+  support/pty.c
   # A12.1 T11 fix round: the T8/T11 reconciliation-pass fixture, hoisted out of
   # test_memory_reconcile.c so test_memory_reconcile_live.c's two daemon-forking
   # cases and the fifty-odd in-process cases that stayed behind share one

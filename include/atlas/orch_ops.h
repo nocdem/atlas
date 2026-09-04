@@ -294,8 +294,10 @@ typedef struct atlas_orch_op {
      * `remote_token` is the bearer token the gateway received and forwarded.
      * `atlas_orch_op_free` wipes its bytes before freeing, so the secret never
      * outlives the operation.  `remote_key_id` is filled by the write point
-     * after `atlas_orch_remote_verify` succeeds — it is a result, not an input,
-     * and is zero before verification.
+     * after `atlas_orch_remote_verify` succeeds on the remote path, or seeded
+     * by `spawn_follow_up` from the parent’s `submit_key_id` on the follow-up
+     * path (so the child inherits the credential that queued it).  It is never
+     * parsed from a request.  On a brand-new local op it is zero.
      *
      * `remote_client_key` is the caller's idempotency fragment; the write point
      * namespaces it into `remote.<key_id>.<client>` and stores that as the row's
@@ -311,7 +313,9 @@ typedef struct atlas_orch_op {
      * which is fail-closed and deliberate.
      *
      * `peer_is_operator` allows an operator to cancel a remote job without
-     * holding the job's credential. */
+     * holding the job's credential.  Set by the IPC method from
+     * atlas_server_peer_is_operator(peer_uid), which is SO_PEERCRED-derived;
+     * never from a request parameter. */
     atlas_buf remote_token;
     char remote_key_id[ATLAS_APIKEY_SELECTOR_HEX + 1u];
     char remote_client_key[ATLAS_ORCH_REMOTE_CLIENT_KEY_MAX + 1u];

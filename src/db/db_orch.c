@@ -1658,8 +1658,10 @@ static atlas_status op_cancel(atlas_db *db, const atlas_orch_op *op, atlas_orch_
      *    cancel-flavoured frozen sentence (plan gap, reported).
      *
      * 2. An operator cancel (op->peer_is_operator && job has a key): allow.
-     *    The operator's uid is already trusted by SO_PEERCRED; this flag is
-     *    set only by the gateway after checking the root-owned policy.
+     *    The operator's uid is already trusted by SO_PEERCRED.  This flag is
+     *    set by the IPC method from atlas_server_peer_is_operator(peer_uid),
+     *    which is a SO_PEERCRED-derived predicate — never from a request
+     *    parameter, so the gateway cannot set it.
      *
      * 3. Otherwise: the existing submitter_uid check. */
     if (op->remote_allowed_count > 0) {

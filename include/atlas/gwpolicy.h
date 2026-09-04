@@ -226,10 +226,12 @@ typedef struct atlas_gwpolicy {
      * exist, is revoked, or holds a nonempty stored scope list still loads
      * ENABLED, and `atlas gateway status` still prints it: the status line
      * is the policy's claim, not the credential's liveness. Existence,
-     * status, the verifier match, an empty stored scope list, and identity
-     * against this field are checked *at use*, inside the write transaction,
-     * by `atlas_decision_remote_verify` (`src/decision/remote.c`) — see the
-     * `remote_dispose_key` branch in `gwpolicy.c` for the full argument. */
+     * status, `scopes_unreadable`, the verifier match, the empty-stored-scope
+     * requirement and identity against this field are all checked *at use*,
+     * inside the write transaction, by `atlas_decision_remote_verify`
+     * (`src/decision/remote.c`), across **three** distinct outward sentences
+     * — see the `remote_dispose_key` branch in `gwpolicy.c` for which check
+     * produces which. */
     char remote_dispose_key[ATLAS_APIKEY_SELECTOR_HEX + 1u];
     uint32_t remote_dispose_kinds;
 

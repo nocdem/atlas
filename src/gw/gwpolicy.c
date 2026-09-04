@@ -452,18 +452,28 @@ void atlas_gwpolicy_parse_buffer(const char *buf, size_t total, atlas_gwpolicy *
              * nonempty stored scope list still loads ENABLED, and
              * `atlas gateway status` still prints `dispose: key_<id> (...)`
              * for it -- the status line reports the *policy's claim*, not the
-             * credential's liveness. Existence, ACTIVE status, the verifier
-             * match, an empty stored scope list, and "is this the credential
-             * the policy names" are all checked *at use*, inside the write
-             * transaction, by `atlas_decision_remote_verify`
-             * (`src/decision/remote.c`) -- which produces "the credential
-             * presented for this disposal did not authenticate; nothing was
-             * changed" for the first four and "that credential is not the
-             * one the remote disposal policy names" for the last, and never
-             * distinguishes which of the first four failed, for the reason
-             * `gateway.auth` does not either: a caller who could tell a
-             * malformed token from an unknown selector from a wrong secret
-             * would learn which half of a guess was right. */
+             * credential's liveness.
+             *
+             * Existence, ACTIVE status, `scopes_unreadable` and the verifier
+             * match are all checked *at use*, inside the write transaction,
+             * by `atlas_decision_remote_verify` (`src/decision/remote.c`),
+             * which produces **three** outward sentences, not two: "the
+             * credential presented for this disposal did not authenticate;
+             * nothing was changed" (`remote.c:66-68`) for a parse failure, an
+             * unknown selector, a non-ACTIVE record or a wrong secret --
+             * deliberately indistinguishable, for the reason `gateway.auth`
+             * is too: a caller who could tell which of those failed would
+             * learn which half of a guess was right. Past that point the
+             * credential is known genuine, and the last two checks get their
+             * own named sentences because a policy mismatch on a real
+             * credential is a different, more actionable fact: "the remote
+             * disposal credential must hold no stored scope, and %s holds
+             * %s" (`remote.c:74-78`) when it was minted with a scope --
+             * naming the credential and its scopes on purpose, which is
+             * this frozen sentence's own design and not a leak -- and "that
+             * credential is not the one the remote disposal policy names"
+             * (`remote.c:81-84`) when it holds no scope but is not this
+             * field's value. */
             if (!parse_dispose_key(val, vlen, out->remote_dispose_key)) {
                 out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
                 return;

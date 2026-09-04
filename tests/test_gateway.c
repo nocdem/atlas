@@ -22,6 +22,7 @@
 #include "atlas/gwpolicy.h"
 #include "atlas/http.h"
 #include "atlas_test.h"
+#include "gw/gw_internal.h"
 #include "ipc/server_internal.h"
 #include "support/fixture.h"
 #include "support/jsoncheck.h"
@@ -140,7 +141,16 @@ static void test_every_malformed_policy_disables_the_gateway(void) {
          "enabled = yes\ngateway_uid = 1001\nweb_gui = yes\ntls_mode = REVERSE_PROXY\n"
          "remote_dispose_key = key_581e0a805cc1febe\n"
          "remote_dispose_kinds = PARKED PARKED\n"},
-        {"remote_dispose_kinds given an empty value",
+        /* This one is refused by `take_value` returning false on a value
+         * that trims to nothing -- the line falls through to the generic
+         * "unrecognised key" refusal below, never reaching the parser's own
+         * `!any_kind` guard, which is unreachable under this file's grammar
+         * for the reason `gwpolicy.c`'s comment on that guard explains. Kept
+         * in this matrix anyway because the *outward* refusal -- DISABLED,
+         * not ACTIVE -- is the property being asserted, not which internal
+         * branch produced it. */
+        {"remote_dispose_kinds given an empty value (refused by the generic "
+         "blank-value fallthrough, not by the parser's own empty-list guard)",
          "enabled = yes\ngateway_uid = 1001\nweb_gui = yes\ntls_mode = REVERSE_PROXY\n"
          "remote_dispose_key = key_581e0a805cc1febe\nremote_dispose_kinds = \n"},
         {"remote_dispose_key without remote_dispose_kinds",
@@ -409,6 +419,12 @@ static void test_gateway_status_prints_dispose_and_clear(void) {
     T_CHECK_MSG(atlas_buf_cstr(&key_off)[0] == '\0', "an off policy named a dispose key in JSON: \"%s\"",
                 atlas_buf_cstr(&key_off));
     atlas_buf_free(&key_off);
+    atlas_buf kinds_off = ATLAS_BUF_INIT;
+    T_CHECK(tjson_get_string(atlas_buf_cstr(&json_off), json_off.len, "remote_dispose_kinds",
+                             &kinds_off));
+    T_CHECK_MSG(atlas_buf_cstr(&kinds_off)[0] == '\0',
+                "an off policy named dispose kinds in JSON: \"%s\"", atlas_buf_cstr(&kinds_off));
+    atlas_buf_free(&kinds_off);
     atlas_buf accept_off = ATLAS_BUF_INIT;
     T_CHECK(tjson_get_raw(atlas_buf_cstr(&json_off), json_off.len, "cleartext_disposal_accepted",
                          &accept_off));

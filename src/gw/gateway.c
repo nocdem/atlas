@@ -28,6 +28,7 @@
 #include "atlas/json.h"
 #include "atlas/limits.h"
 #include "atlas/safetext.h"
+#include "gw/gw_internal.h"
 #include "mcp/mcp_internal.h"
 
 struct atlas_gateway {

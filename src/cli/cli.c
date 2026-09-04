@@ -178,9 +178,12 @@ void atlas_cli_print_help(FILE *out) {
         "  maintenance plan           what a prune would remove, and why each table is kept\n"
         "  maintenance prune --apply  remove only the rows the plan called eligible\n"
         "  api-key create --label L --scope S   mint a remote credential; prints the secret once\n"
+        "  api-key create --label L --no-scopes   mint a credential that authorises nothing\n"
+        "                             on its own; only a remote_dispose_key policy line can\n"
         "  api-key list               credential metadata; never a secret\n"
         "  api-key revoke KEY-ID      stops working immediately; the record stays\n"
         "  api-key rotate KEY-ID --label L --scope S   mint a replacement, revoke the old\n"
+        "  api-key rotate KEY-ID --label L --no-scopes   same, for a scopeless credential\n"
         "  gateway status             what the root-owned gateway policy says; binds nothing\n"
         "  gateway run                serve remote MCP; Atlas terminates no TLS\n"
         "  service print              print the systemd user unit; changes nothing\n"
@@ -4330,9 +4333,9 @@ static atlas_status run_command(cli_state *st, atlas_err *err) {
             if (st->operand_count != (rotating ? 2u : 1u)) {
                 return atlas_err_set(err, ATLAS_ERR_USAGE,
                                      rotating ? "usage: atlas api-key rotate KEY-ID --label L "
-                                                "--scope S [--scope S...]"
+                                                "--scope S [--scope S...] | --no-scopes"
                                               : "usage: atlas api-key create --label L "
-                                                "--scope S [--scope S...]");
+                                                "--scope S [--scope S...] | --no-scopes");
             }
             if (st->opts.label == NULL) {
                 return atlas_err_set(err, ATLAS_ERR_USAGE, "--label is required");

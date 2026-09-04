@@ -92,6 +92,19 @@ atlas_status atlas_apikey_create_on(atlas_db *db, const atlas_apikey_create_opts
                              "backslash or percent",
                              (unsigned)ATLAS_APIKEY_LABEL_MAX);
     }
+    if (opts->scopes != 0u && opts->no_scopes) {
+        /* The CLI refuses this combination itself (a better message, because
+         * it still has the raw `--scope`/`--no-scopes` argv to point at), but
+         * this is the write point both the local and the operator-gated
+         * socket path reach, and the socket path builds `opts` from request
+         * parameters nothing stops a raw caller from sending together. No
+         * authority would move if this fell through silently — `no_scopes`
+         * would simply be ignored and the key would hold exactly the scopes
+         * asked for — but a flag a caller can set and have ignored without
+         * being told is a missing refusal, not a harmless one. */
+        return atlas_err_set(err, ATLAS_ERR_USAGE,
+                             "--scope and --no-scopes cannot both be given");
+    }
     if (opts->scopes == 0u && !opts->no_scopes) {
         /* A credential with no scopes authorises nothing. Storing one is
          * coherent; creating one by accident is not, so it takes an explicit

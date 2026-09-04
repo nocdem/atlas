@@ -1623,8 +1623,15 @@ static atlas_status h_apikey_created(atlas_renderer *r, const atlas_apikey_creat
     (void)fprintf(o, "API key created.\n\n");
     (void)fprintf(o, "id:     %s%s\n", ATLAS_APIKEY_ID_PREFIX, c->key_id);
     (void)fprintf(o, "label:  %s\n", atlas_safe(&r->safe, c->label));
-    (void)fprintf(o, "scopes:\n");
-    {
+    if (c->scopes[0] == '\0') {
+        /* Matches `api-key list`'s own fallback for an empty mask
+         * (`h_apikey_listed` below): a bare "scopes:" header with nothing
+         * under it reads as a rendering fault, not as a deliberate choice —
+         * exactly the read the frozen block further down exists to prevent,
+         * so the header must not contradict it. */
+        (void)fprintf(o, "scopes: (none)\n");
+    } else {
+        (void)fprintf(o, "scopes:\n");
         /* One per line, in the canonical order the index stores. */
         const char *p = c->scopes;
         while (*p != '\0') {

@@ -444,14 +444,61 @@ static void test_no_scopes_mints_a_disposal_credential_through_the_daemon(void) 
         "the daemon-routed --no-scopes rotation did not print the reminder: %s",
         atlas_buf_cstr(&out));
 
-    /* And the refusals still travel correctly against the daemon: an ordinary
-     * caller cannot bypass "at least one --scope" by omission. */
+    /* The CLI's own pre-check refuses a bare `create` before `apikey_needs_daemon`
+     * is even consulted (`cli.c`'s "at least one --scope is required, or
+     * --no-scopes..." check runs on `st->opts` alone), so running it through
+     * `run_cli_ex(..., true, ...)` proves the CLI's message, not that the
+     * daemon's own write point enforces anything — that assertion would pass
+     * identically with the fixture daemon stopped. */
     const char *bare[] = {"api-key", "create", "--label", "x"};
     int code = run_cli_ex(&e, bare, 4, true, &out, &err);
-    T_CHECK_MSG(code != 0, "a scopeless create with no --no-scopes succeeded against the daemon");
+    T_CHECK_MSG(code != 0, "a scopeless create with no --no-scopes succeeded");
     T_CHECK_MSG(strstr(atlas_buf_cstr(&out), "--no-scopes") != NULL,
-                "the daemon-routed refusal did not mention --no-scopes: %s",
-                atlas_buf_cstr(&out));
+                "the refusal did not mention --no-scopes: %s", atlas_buf_cstr(&out));
+
+    /* The daemon's own write point, driven directly over the socket rather
+     * than through the CLI's pre-check, so this one actually cannot pass with
+     * the daemon down. Empty `scopes`, no `no_scopes`: `atlas_apikey_create_on`
+     * must refuse it exactly as the local path does. */
+    {
+        atlas_buf resp = ATLAS_BUF_INIT;
+        atlas_err rerr;
+        atlas_err_init(&rerr);
+        T_OK(atlas_ipc_call(atlas_buf_cstr(&e.d.socket), "apikey.create",
+                            "{\"label\":\"raw\",\"scopes\":\"\"}", &resp, &rerr),
+             &rerr);
+        T_CHECK_MSG(strstr(atlas_buf_cstr(&resp), "\"ok\":false") != NULL,
+                    "a raw socket call with no scopes and no no_scopes was not refused: %s",
+                    atlas_buf_cstr(&resp));
+        T_CHECK_MSG(strstr(atlas_buf_cstr(&resp),
+                           "at least one --scope is required, or --no-scopes for a "
+                           "remote-disposal credential") != NULL,
+                    "the daemon write point did not name the amended sentence: %s",
+                    atlas_buf_cstr(&resp));
+        atlas_buf_free(&resp);
+    }
+
+    /* And the write point refuses `scopes` together with `no_scopes` too — the
+     * combination the CLI itself never sends, but which a raw operator-uid
+     * socket caller can. Without the write-point check this would silently
+     * mint an ordinary `repo:read` key and ignore the flag. */
+    {
+        atlas_buf resp = ATLAS_BUF_INIT;
+        atlas_err rerr;
+        atlas_err_init(&rerr);
+        T_OK(atlas_ipc_call(atlas_buf_cstr(&e.d.socket), "apikey.create",
+                            "{\"label\":\"raw2\",\"scopes\":\"repo:read\",\"no_scopes\":true}",
+                            &resp, &rerr),
+             &rerr);
+        T_CHECK_MSG(strstr(atlas_buf_cstr(&resp), "\"ok\":false") != NULL,
+                    "a raw socket call with both scopes and no_scopes was not refused: %s",
+                    atlas_buf_cstr(&resp));
+        T_CHECK_MSG(
+            strstr(atlas_buf_cstr(&resp), "--scope and --no-scopes cannot both be given") != NULL,
+            "the daemon write point did not name the frozen sentence: %s",
+            atlas_buf_cstr(&resp));
+        atlas_buf_free(&resp);
+    }
 
     atlas_buf_free(&out);
     env_close(&e);

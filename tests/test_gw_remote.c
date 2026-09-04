@@ -1827,6 +1827,12 @@ static void test_the_review_parameters_reach_the_daemon(void) {
  * assignment, a read, or a future comment that reintroduces the word -- and
  * still pass against a page that has no code and no prose to distinguish it
  * from.
+ *
+ * Fix round 1 additions: three more markup-parsing sinks alongside
+ * `innerHTML` (the task names all four); the `verify/claims` needle replaced
+ * by a `count_occurrences` check requiring two call sites, since a bare
+ * `strstr` for that string passed against the unmodified parent page and
+ * proved nothing about this view.
  */
 static void test_mission_control_carries_the_review_view(void) {
     env e;
@@ -1917,7 +1923,13 @@ static void test_mission_control_carries_the_review_view(void) {
         "decision/history",
         "ledger_agrees",
         "operator_channel",
-        "verify/claims",
+        /* Not "verify/claims" here: that string was already on the parent
+         * page, in `viewVerification`, before this season -- a bare
+         * `strstr` for it would pass against the unmodified page and prove
+         * nothing about the Review view. The discriminating form is below:
+         * it requires a *second* call site, which only the Review view's
+         * own claims panel can supply. */
+        "reviewIntentsAllowed",
         "IMPLEMENTATION conflict",
         "review apply",
         "names the channel, not a person",
@@ -1926,8 +1938,23 @@ static void test_mission_control_carries_the_review_view(void) {
         T_CHECK_MSG(strstr(body_of(&resp), BOUND[i]) != NULL,
                     "the page carries no binding for \"%s\"", BOUND[i]);
     }
-    T_CHECK_MSG(strstr(body_of(&resp), "innerHTML") == NULL,
-                "the page sets or reads innerHTML somewhere");
+    T_CHECK_MSG(count_occurrences(body_of(&resp), "verify/claims") >= 2u,
+                "the Review view's own verify/claims call site is missing: %s",
+                body_of(&resp));
+    /* The four DOM APIs that would parse a string as markup rather than
+     * insert it as text -- the whole of what "everything is textContent;
+     * nothing is innerHTML" (CLAUDE.md) requires absent. `innerHTML` alone
+     * would miss a page that used one of the other three instead. */
+    static const char *const MARKUP_SINKS[] = {
+        "innerHTML",
+        "outerHTML",
+        "insertAdjacentHTML",
+        "document.write",
+    };
+    for (size_t i = 0; i < sizeof MARKUP_SINKS / sizeof MARKUP_SINKS[0]; i++) {
+        T_CHECK_MSG(strstr(body_of(&resp), MARKUP_SINKS[i]) == NULL,
+                    "the page uses the markup-parsing sink \"%s\"", MARKUP_SINKS[i]);
+    }
     T_CHECK_MSG(strstr(body_of(&resp), "implementation drift") == NULL,
                 "the page claims a drift detector broader than A12.1's reconciler");
 

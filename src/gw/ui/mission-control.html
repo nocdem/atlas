@@ -211,10 +211,15 @@ code{background:rgba(127,127,127,.12);padding:0 4px;border-radius:2px}
 /* No framework and no build step. Atlas' rules forbid Node in the build, the
    tests and the runtime, so this is hand-written and served from the binary.
 
-   Every value Atlas returns is inserted as text via `textContent`; nothing is
-   ever assigned to an element's markup-parsing property. The daemon
-   safe-encodes repository prose, but that makes it terminal-safe and
-   JSON-safe rather than inert in a DOM, so the escaping happens here too. */
+   Every value Atlas returns is inserted as plain text, never reparsed as
+   markup: `el()`, `table()` and `kv()` are the only things that touch the DOM
+   below, and every one of them either sets an element's text or appends an
+   already-built Node -- nothing here ever hands a node a string to parse as
+   elements. The daemon safe-encodes repository prose, but that makes it
+   terminal-safe and JSON-safe rather than inert in a DOM, so the same
+   discipline applies here too. A test enforces this by absence: it greps the
+   served page for the DOM APIs that would parse a string as markup and
+   requires none of them. */
 
 const VIEWS = [
   ["overview","Overview"],["repository","Repository"],["decisions","Knowledge"],
@@ -234,6 +239,12 @@ const REVIEW_UI_MAX_IMPACT_LINKS = 8;
 const REVIEW_SHEET_KEY = "atlas.review.sheet.v1";
 const RE_REVIEW_DECISION = /^atlas-dec-[0-9a-f]{32}$/;
 const RE_REVIEW_PREFIX = /^[0-9a-f]{8}$/;
+
+/* A15 T7 fix round 1. The same entry ceiling `ATLAS_REVIEW_SHEET_MAX_ENTRIES`
+   (`include/atlas/limits.h`) gives the sheet parser (`src/core/review.c:441`,
+   "more than 64 entries; split it"). A page-side courtesy copy, not the
+   authority -- see `reviewQueueAdd`'s own comment. */
+const REVIEW_UI_MAX_SHEET_ENTRIES = 64;
 let scopes = new Set();
 let repos = [];
 
@@ -686,18 +697,61 @@ function reviewQueueSave(q) {
   }
 }
 
+/* A15 T7 fix round 1. Two courtesy checks, mirroring -- not replacing -- two
+ * structural rules the sheet parser enforces for real: a `(repo, decision)`
+ * pair appears at most once (`already_named()`, `src/core/review.c:447`,
+ * "was already named on line ...; a sheet disposes of a record once"), and a
+ * sheet holds at most `ATLAS_REVIEW_SHEET_MAX_ENTRIES` entries
+ * (`src/core/review.c:441`, "more than 64 entries; split it"). Neither check
+ * here is the authority -- the parser is, and still decides for real when
+ * `atlas review apply` runs -- but without them the page could hand an
+ * operator a sheet the parser is certain to refuse *whole*, silently, taking
+ * every other queued record down with the one that collided. That is exactly
+ * the "validates rather than escapes" discipline `reviewSheetText` already
+ * applies to each field, one level up: applied to the sheet's shape as well
+ * as its bytes.
+ *
+ * Duplicate policy: **replace**, chosen over refuse. An operator who clicks a
+ * second intent on the same record has changed their mind about it, not
+ * asked to queue two dispositions for one record -- and the grammar has no
+ * way to hold two anyway. Whichever happens is reported back through
+ * `renderReviewSheet`'s notice, in the sheet panel itself, because a queue
+ * action that silently either overwrote or dropped the click would be worse
+ * than today's bug. */
 async function reviewQueueAdd(entry) {
   const q = reviewQueueLoad() || [];
+  const i = q.findIndex((e) => e.repo === entry.repo && e.decision === entry.decision);
+  if (i >= 0) {
+    const was = q[i].intent;
+    q[i] = entry;
+    const saved = reviewQueueSave(q);
+    await renderReviewSheet(saved
+      ? {text: "replaced the queued \"" + was + "\" for this record with \"" + entry.intent +
+               "\" -- a sheet may only name one intent per record.", cls: "warn"}
+      : {text: "the browser could not save this change: local storage refused the write.",
+         cls: "err"});
+    return;
+  }
+  if (q.length >= REVIEW_UI_MAX_SHEET_ENTRIES) {
+    await renderReviewSheet({text: "the sheet already holds " + REVIEW_UI_MAX_SHEET_ENTRIES +
+      " entries; atlas review apply refuses a sheet larger than that as a whole, so this " +
+      "record was not queued. Remove one first.", cls: "err"});
+    return;
+  }
   q.push(entry);
-  reviewQueueSave(q);
-  await renderReviewSheet();
+  const saved = reviewQueueSave(q);
+  await renderReviewSheet(saved ? undefined :
+    {text: "the browser could not save this change: local storage refused the write.",
+     cls: "err"});
 }
 
 async function reviewQueueRemove(index) {
   const q = reviewQueueLoad() || [];
   q.splice(index, 1);
-  reviewQueueSave(q);
-  await renderReviewSheet();
+  const saved = reviewQueueSave(q);
+  await renderReviewSheet(saved ? undefined :
+    {text: "the browser could not save this change: local storage refused the write.",
+     cls: "err"});
 }
 
 /* The status an entry's intent needs the record to still be in. Mirrors the
@@ -731,10 +785,17 @@ function reviewSheetText(queue) {
   return {text: lines.join("\n") + "\n", dropped: dropped};
 }
 
-async function renderReviewSheet() {
+/* `notice`, when given, is `{text, cls}` -- one line shown at the top of the
+   panel about the queue action that just ran (a replace, a refused duplicate
+   past the entry bound, or a failed save), so that action is never silent
+   (A15 T7 fix round 1). */
+async function renderReviewSheet(notice) {
   const node = $("w-sheet");
   if (!node) return;
   clear(node);
+  if (notice) {
+    node.appendChild(el("p", {class: notice.cls || "warn", text: notice.text}));
+  }
   let queue = reviewQueueLoad();
   if (queue === null) {
     node.appendChild(el("p", {class: "err",
@@ -808,7 +869,12 @@ async function renderReviewSheet() {
     }
   };
   const clearBtn = el("button", {class: "go", text: "Clear"});
-  clearBtn.onclick = async () => { reviewQueueSave([]); await renderReviewSheet(); };
+  clearBtn.onclick = async () => {
+    const saved = reviewQueueSave([]);
+    await renderReviewSheet(saved ? undefined :
+      {text: "the browser could not save this change: local storage refused the write.",
+       cls: "err"});
+  };
   btnRow.appendChild(copyBtn);
   btnRow.appendChild(clearBtn);
   node.appendChild(btnRow);
@@ -899,7 +965,22 @@ function showReviewDetail(repo, row) {
      told apart from REJECTED, SUPERSEDED, RESOLVED or a uid that never
      existed, and this reads that message rather than inventing one that
      claims otherwise. */
-  const gateBox = section("Gate");
+  root.appendChild(el("h3", {text: "Gate"}));
+  /* A15 T7 fix round 1. A fixed caption about the *route*, never about this
+     record -- unlike the panel below it, this survives whatever the fetch
+     does, so the fact is visible whether the call succeeds or 404s. Without
+     it, a PROPOSED record's 404 ("no approved decision ... is attached to
+     this repository") reads to an operator as a registration problem rather
+     than as "not approved"; this states what is actually true instead
+     (`src/core/service_gate.c:365` lists only APPROVED documents as
+     candidates, and `:456`'s narrow-to-one treats zero candidates as a 404,
+     not an empty list). */
+  root.appendChild(el("p", {class: "dim", text:
+    "This route answers only for an APPROVED record. Its refusal for any other status reads " +
+    "identically whether the record is PROPOSED, REJECTED, SUPERSEDED, RESOLVED, or does not " +
+    "exist -- this response alone cannot say which."}));
+  const gateBox = el("div");
+  root.appendChild(gateBox);
   panel(gateBox, async () => {
     const g = await api("gate", {repo: repo, decision: uid});
     const box = el("div");
@@ -966,7 +1047,11 @@ function showReviewDetail(repo, row) {
       return box;
     }
     for (const intent of intents) {
-      const b = el("button", {class: "go", text: "Queue: " + intent});
+      /* A15 T7 fix round 1. The revision is named on the button itself: this
+         always queues `row.latest_revision`, and someone reading revision 1's
+         prose above must see, at the moment of the click, that the sheet will
+         name a different revision than the one they just read. */
+      const b = el("button", {class: "go", text: "Queue: " + intent + " r" + row.latest_revision});
       b.onclick = async () => {
         try {
           const got = await api("decision",

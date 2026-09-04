@@ -2147,13 +2147,22 @@ static atlas_status review_finish(review_render_ctx *rc, atlas_status result,
  * command-specific exit code above the seven-value contract, returned only
  * once a complete, successful document has been written, following gate's
  * own 8/9 precedent (cli.c's help text at "gate check"). 0 when every entry
- * ended APPLIED (or READY under --check); 8 otherwise. `moved`, `disposed`
- * and `missing` count against both modes; `abandoned` and `refused` cannot
- * occur under `check_only` (nothing is ever minted) and `ready` cannot occur
- * outside it, so summing all seven unconditionally would double no bucket. */
-static int review_exit_code(bool check_only, const atlas_review_totals *t) {
-    int64_t bad = check_only ? (t->moved + t->disposed + t->missing)
-                             : (t->abandoned + t->moved + t->disposed + t->missing + t->refused);
+ * ended APPLIED (or READY under --check); 8 otherwise.
+ *
+ * `bad` sums all five non-good buckets unconditionally, in both modes,
+ * rather than switching on `check_only` to sum only the subset the current
+ * walker can produce there. `walk_entry` (src/core/service_review.c) can
+ * today only reach READY, MOVED, DISPOSED or MISSING under `check_only` --
+ * `abandoned` and `refused` need a spent or refused confirm, which
+ * `check_only` never reaches -- so the two forms are equivalent for now and
+ * a mode-split would not be wrong today. It is not written that way because
+ * it would rot silently: a later change to the pre-check path that lets
+ * `check_only` produce REFUSED (or `ready` show up outside it) would exit
+ * `0` with a bad row visibly on screen, in a bucket the split branch never
+ * summed. Unconditional summation is exclusive by construction and cannot
+ * drift out of step with what the walker actually produces. */
+static int review_exit_code(const atlas_review_totals *t) {
+    int64_t bad = t->abandoned + t->moved + t->disposed + t->missing + t->refused;
     return bad == 0 ? 0 : 8;
 }
 
@@ -2216,7 +2225,7 @@ static atlas_status run_review(cli_state *st, atlas_ctx *ctx, atlas_renderer *r,
         /* Only once the document is complete, for the reason `gate` sets
          * `gate_exit` only there: a non-zero exit beside a half-written
          * answer would tell a caller to act on something it cannot read. */
-        st->gate_exit = review_exit_code(check_only, &totals);
+        st->gate_exit = review_exit_code(&totals);
     }
     return result;
 }
@@ -2810,11 +2819,12 @@ static bool remote_serves(const cli_state *st) {
     }
     /* A15 T5. Served for the reason the operator channel above is: under
      * A7.1 the index is 0700 `atlasd`, so an operator's own account has no
-     * local database handle at all, and `run_review`'s authority and
-     * terminal checks run in this process regardless of `ctx`.
-     * `atlas_service_review_apply` dispatches every read it needs to the
-     * remote form itself when `ctx == NULL` (`show_revision` in
-     * src/core/service_review.c), and `atlas_service_decision_confirm` —
+     * local database handle at all. `run_review` (above) checks authority
+     * in this process regardless of `ctx`; the terminal check is
+     * `atlas_service_review_apply`'s own (skipped only under `check_only`),
+     * not run_review's. `atlas_service_review_apply` dispatches every read
+     * it needs to the remote form itself when `ctx == NULL` (`show_revision`
+     * in src/core/service_review.c), and `atlas_service_decision_confirm` —
      * the one function it loops — already does the same for its own reads
      * and for the write that spends a capability. Being served is not being
      * authorised: the daemon still refuses unless this peer is the uid the

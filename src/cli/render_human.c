@@ -3087,10 +3087,23 @@ static atlas_status h_review_entry(atlas_renderer *r, const atlas_review_outcome
     r->items++;
     char short_id[ATLAS_DECISION_UID_MAX];
     (void)snprintf(short_id, sizeof(short_id), "%.18s\xe2\x80\xa6", o->entry->decision);
-    (void)fprintf(r->out, "  %" PRId64 "  %-7s  %s  %s  r%" PRId64 "  %-9s  %s\n", (int64_t)r->items,
-                  atlas_decision_intent_name(o->entry->intent), atlas_safe(&r->safe, o->entry->repo),
-                  short_id, o->entry->revision_no, atlas_review_verdict_name(o->verdict),
-                  o->detail.len > 0 ? atlas_buf_cstr(&o->detail) : "");
+    /* Two forms rather than one with an empty last field: a READY row under
+     * --check has no detail (walk_entry never sets one), and padding the
+     * verdict to 9 columns plus the usual two-space separator before an
+     * empty string would leave six trailing spaces on every such line --
+     * invisible, but the common case, since a clean --check run is all
+     * READY. Detail-bearing rows keep the exact column layout unchanged. */
+    if (o->detail.len > 0) {
+        (void)fprintf(r->out, "  %" PRId64 "  %-7s  %s  %s  r%" PRId64 "  %-9s  %s\n",
+                      (int64_t)r->items, atlas_decision_intent_name(o->entry->intent),
+                      atlas_safe(&r->safe, o->entry->repo), short_id, o->entry->revision_no,
+                      atlas_review_verdict_name(o->verdict), atlas_buf_cstr(&o->detail));
+    } else {
+        (void)fprintf(r->out, "  %" PRId64 "  %-7s  %s  %s  r%" PRId64 "  %s\n", (int64_t)r->items,
+                      atlas_decision_intent_name(o->entry->intent),
+                      atlas_safe(&r->safe, o->entry->repo), short_id, o->entry->revision_no,
+                      atlas_review_verdict_name(o->verdict));
+    }
     return ok();
 }
 

@@ -294,11 +294,13 @@ typedef struct atlas_renderer_vtbl {
      * invocation itself rather than printing it), `review_entry` renders one
      * outcome as it arrives, and `review_totals` closes what `review_begin`
      * opened and reports the walk's totals. This does not reuse
-     * `list_begin`/`list_end`: those always print a generic "N entries" line
-     * (human) or a `count` key (JSON) — verified against `decision list`,
-     * which stacks exactly that with its own `decision_counts` line — and
-     * the plan's frozen review-apply output has neither, only the specific
-     * per-verdict totals `review_totals` carries.
+     * `list_begin`/`list_end`: those always print a generic line -- "<count>
+     * entries", or "no entries" when the count is zero (human) -- or a
+     * `count` key (JSON), regardless of which; verified against
+     * `decision list`, which stacks exactly that with its own
+     * `decision_counts` line — and the plan's frozen review-apply output has
+     * neither, only the specific per-verdict totals `review_totals`
+     * carries.
      *
      * `o->status` and `o->detail` (`atlas_review_outcome`, include/atlas/
      * service.h) arrive already safe-encoded or as fixed Atlas text with

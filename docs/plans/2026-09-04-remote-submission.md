@@ -1528,6 +1528,21 @@ it.
 
 # Decisions the operator must be asked, and when — read this before dispatching anything
 
+> **ANSWERED 2026-09-04, before any task was dispatched.** Rows 1 and 2 were put to the
+> operator with the cost in front of them and are settled below; row 3 stands. Their
+> answers also added a requirement this plan did not carry — see *What the answers added*
+> immediately after the table.
+>
+> - **Row 1 — start while away.** `remote_submit_driver = claude`. Their words: *"başlasın"*.
+> - **Row 2 — cleartext accepted, for now.** `operator_accepts_cleartext_submission = yes`.
+>   Their words: *"evet şu anda olabilir ileride bunu daha güvenli hale getiririz"* — yes for
+>   now, we make it more secure later. Recorded as a decision with an intent attached, not
+>   as a permanent shape: the chain in §The decision on cleartext is unchanged and still
+>   true, and the key stays a written acceptance that `atlas gateway status` prints, so the
+>   day they change their mind the line comes out and the season's own gate refuses again.
+> - **Row 3 — which credentials and which numbers.** Still to ask, still before T1.
+
+
 A15's plan left a genuine choice in its §The decision and nobody put it to the
 operator; fourteen hours followed. A16 asked its rows before T1. Every choice this plan
 leaves is here, in plain words about the thing itself, with the default the plan
@@ -1540,6 +1555,35 @@ costs more than asking it now, and row 2 changes whether the season has a twelft
 | 1 | **When a task arrives from the model or from your phone, should a worker start on it while you are away, or should it wait until you start it from a terminal?** *Start while away* means `remote_submit_driver = claude`: the model dispatcher runs as your account in a workspace, spends model budget on the credential's word within the daily bound, and leaves a patch you read on the machine with `atlas job artifact`. *Wait for me* means `remote_submit_driver = claude-repo`: the task sits queued, pinned to the commit the repository was at when it arrived, until you run `atlas job run --resume RUN`; nothing is spent until then; and if you commit anything to that repository first, the task is refused as pinned to a moved tree and has to be resubmitted. Either is one word in one root-owned line; the code is the same. | `claude` (start while away) | **T1** |
 | 2 | **Do you accept that a submission credential presented from a browser crosses your network in the clear — with a captured credential able to queue work that runs as your account, within the daily bound, until you revoke it?** This is a different consequence from the disposal acceptance you gave on 2026-09-04 (moving a record) and the plan does not reuse that answer. The credential the ChatGPT tunnel presents does not cross the segment at all; its exposure is the `0600` file in your home directory, which a worker running as you can read. *Yes* is one root-owned line, `operator_accepts_cleartext_submission = yes`, printed by `atlas gateway status` on every run. *No* means the terminator task A16 removed (`c305f40`: nginx on `192.168.0.198:8799`, the gateway on loopback, the tunnel re-pointed) returns as T11a before the live acceptance, and the group is offered under `tls_mode = REVERSE_PROXY` with no acceptance key. | yes | **T1** |
 | 3 | **Which credentials, and what numbers?** The plan proposes naming `key_b2578f48143c06d3` (`chatgpt-tunnel`, the model) and one new `--no-scopes` key minted for the browser — never the `mission-control` login key, so a session cookie and a submission key are different secrets — with `remote_submit_mode = patch`, gate floor `make`, `remote_submit_max_attempts = 1`, `remote_submit_max_active = 2`, `remote_submit_max_per_day = 6`. Each number multiplies the bill in §Worst-case cost; each is one root-owned line and needs no code change. Do you want the model's key named at all, or only the browser's? | as proposed, both keys | **T1** |
+
+## What the answers added: a place to watch the workers
+
+Answering row 1 the operator added a requirement this plan did not carry, and it is theirs
+rather than an inference — *"bunlar için UI'de bir tab olması lazım. workerlar ne
+yapıyorlar vs vs"*: **there must be a tab in Mission Control showing what the workers are
+doing.**
+
+The reason follows from row 1 rather than being a preference. Choosing *start while away*
+means a worker runs as their account, spends model budget, and edits a workspace at a time
+when they are not at the machine — so the surface that tells them what happened is not a
+convenience, it is the only thing that makes the choice reviewable. Without it, "start
+while away" means "start where I cannot see it", and this season would repeat A15's shape:
+a mechanism that works and a person who cannot use it.
+
+**A twelfth task, T12, owns it**, and it comes before the live acceptance rather than after,
+because the acceptance is the first time a real worker runs and that is exactly when the tab
+has to already exist. Its shape follows the rules the read surface already has: it reads
+routes that exist or routes added under the same fixed-table discipline, it renders every
+byte a worker produced as `UNTRUSTED_DATA` with `textContent` and never as markup, and it
+grants nothing — watching is a read, and no button in it may start, cancel or approve
+anything that the write path does not already gate. What it shows: which runs exist and
+their state, which task within a run is active, how many worker starts each has spent
+against its budget, what the gates said, and — for a finished attempt — that an artifact
+exists and how to fetch it on the machine. What it does **not** show is a worker's prose or
+its log, for the reason §Rejected already gives: with the worker holding the operator's read
+authority, a remote route to its output is a remote route to any file that account can read.
+That limit is stated on the tab itself, not only here.
+
 
 ---
 

@@ -135,6 +135,12 @@ atlas_status atlas_apikey_create_on(atlas_db *db, const atlas_apikey_create_opts
                                  "derived for the key /etc/atlas/gateway.conf names, and only "
                                  "for one that holds no stored scope");
         }
+        if (sc == ATLAS_SCOPE_JOBS_SUBMIT) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "jobs:submit cannot be granted to a credential; it is derived "
+                                 "for the keys a remote_submit_key line in "
+                                 "/etc/atlas/gateway.conf names");
+        }
         if (!atlas_apikey_scope_grantable(sc)) {
             return atlas_err_set(err, ATLAS_ERR_USAGE,
                                  "the scope \"%s\" cannot be granted to a remote credential in A9",

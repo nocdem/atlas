@@ -269,6 +269,9 @@ const char *atlas_orch_exit_kind_name(atlas_orch_exit_kind k);
 
 /* Names from closed-ish vocabularies the policy supplies. */
 #define ATLAS_ORCH_NAME_MAX 64u
+/* A14. The caller-supplied part of a remote idempotency key: "remote." + 16
+ * lowercase hex + "." + this == ATLAS_ORCH_NAME_MAX (7 + 16 + 1 + 40 = 64). */
+#define ATLAS_ORCH_REMOTE_CLIENT_KEY_MAX 40u
 
 /* Absolute ceilings. The orchestration policy may lower these and may never
  * raise them: a root-owned file decides how much a submitter may ask for, and

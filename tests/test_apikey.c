@@ -338,6 +338,8 @@ static void test_creation_refuses_what_it_cannot_grant(void) {
          {"api-key", "create", "--label", "x", "--scope", "memory:write"}, 6},
         {"the disposal scope, which nothing can be granted",
          {"api-key", "create", "--label", "x", "--scope", "decisions:dispose"}, 6},
+        {"the submission scope, which nothing can be granted",
+         {"api-key", "create", "--label", "x", "--scope", "jobs:submit"}, 6},
         {"no scope at all", {"api-key", "create", "--label", "x"}, 4},
         {"no label", {"api-key", "create", "--scope", "repo:read"}, 4},
         {"a label with a newline in it",
@@ -403,6 +405,34 @@ static void test_creation_refuses_what_it_cannot_grant(void) {
     }
     atlas_buf_free(&dout);
     atlas_buf_free(&derr);
+
+    /* `jobs:submit` is refused with its own frozen sentence, naming how
+     * a credential gets this scope derived for it — through a
+     * remote_submit_key policy line, not through api-key create. */
+    atlas_buf jsout = ATLAS_BUF_INIT;
+    atlas_buf jserr = ATLAS_BUF_INIT;
+    {
+        const char *argv[8];
+        size_t k = 0;
+        argv[k++] = "--data-dir";
+        argv[k++] = fx_data_dir(&fx);
+        argv[k++] = "api-key";
+        argv[k++] = "create";
+        argv[k++] = "--label";
+        argv[k++] = "x";
+        argv[k++] = "--scope";
+        argv[k++] = "jobs:submit";
+        int code = -1;
+        T_OK(fx_atlas(argv, k, &jsout, &jserr, &code, &err), &err);
+        T_CHECK_MSG(code == 2, "jobs:submit produced exit %d rather than a usage error", code);
+        T_CHECK_MSG(strstr(atlas_buf_cstr(&jserr),
+                           "jobs:submit cannot be granted to a credential; it is derived "
+                           "for the keys a remote_submit_key line in /etc/atlas/gateway.conf "
+                           "names") != NULL,
+                    "the refusal did not carry the frozen sentence: %s", atlas_buf_cstr(&jserr));
+    }
+    atlas_buf_free(&jsout);
+    atlas_buf_free(&jserr);
 
     /* Neither `--scope` nor `--no-scopes`: the amended sentence, which says
      * `--no-scopes` exists rather than only that a scope is missing. */
@@ -538,8 +568,15 @@ static void test_the_two_renderers_agree(void) {
     T_EQ_INT(run_key(&fx, nocreate, 5, &out, &err), 0);
     char nid[ATLAS_APIKEY_SELECTOR_HEX + 1];
     id_of(&out, nid, sizeof nid);
-    T_CHECK_MSG(strstr(atlas_buf_cstr(&out), "scopes: (none)") != NULL,
-                "the --no-scopes create output is missing the frozen block: %s",
+    /* The frozen block carries the A14-amended second and third lines, which
+     * name both root-owned lines and say the same key may never be named by
+     * both. The old A16 wording said "one scope, decisions:dispose, and
+     * nothing else" — that sentence is no longer in the output. */
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&out),
+                       "gives decisions:dispose, a remote_submit_key line gives jobs:submit, and\n"
+                       "        the same key may never be named by both. Name it there, or revoke "
+                       "it.") != NULL,
+                "the --no-scopes create output is missing the A14-amended frozen block: %s",
                 atlas_buf_cstr(&out));
 
     /* The JSON renderer's own creation output carries the same fact as a
@@ -629,6 +666,29 @@ static void test_the_disposal_scope_is_in_the_vocabulary_and_ungrantable(void) {
     atlas_buf_free(&rendered);
 }
 
+/* No fixture: pure function over the closed vocabulary. */
+static void test_the_submit_scope_is_in_the_vocabulary_and_ungrantable(void) {
+    T_CHECK(atlas_apikey_scope_parse("jobs:submit") == ATLAS_SCOPE_JOBS_SUBMIT);
+    T_CHECK_MSG(strcmp(atlas_apikey_scope_name(ATLAS_SCOPE_JOBS_SUBMIT),
+                       "jobs:submit") == 0,
+                "the canonical name does not round-trip");
+    T_CHECK_MSG(!atlas_apikey_scope_grantable(ATLAS_SCOPE_JOBS_SUBMIT),
+                "jobs:submit must never be grantable");
+
+    /* Renders after decisions:dispose, in enum/table order: a mask holding
+     * both bits stores as "decisions:dispose jobs:submit", never the reverse. */
+    atlas_scope_mask both =
+        ATLAS_SCOPE_BIT(ATLAS_SCOPE_DECISIONS_DISPOSE) |
+        ATLAS_SCOPE_BIT(ATLAS_SCOPE_JOBS_SUBMIT);
+    atlas_buf rendered = ATLAS_BUF_INIT;
+    atlas_err err;
+    atlas_err_init(&err);
+    T_OK(atlas_apikey_scopes_render(both, &rendered, &err), &err);
+    T_CHECK_MSG(strcmp(atlas_buf_cstr(&rendered), "decisions:dispose jobs:submit") == 0,
+                "unexpected render order: %s", atlas_buf_cstr(&rendered));
+    atlas_buf_free(&rendered);
+}
+
 static const atlas_test TESTS[] = {
     {"a created key is shown once and never again",
      test_a_created_key_is_shown_once_and_never_again},
@@ -640,6 +700,8 @@ static const atlas_test TESTS[] = {
     {"the two renderers agree", test_the_two_renderers_agree},
     {"the disposal scope is in the vocabulary and ungrantable",
      test_the_disposal_scope_is_in_the_vocabulary_and_ungrantable},
+    {"the submit scope is in the vocabulary and ungrantable",
+     test_the_submit_scope_is_in_the_vocabulary_and_ungrantable},
 };
 
 ATLAS_TEST_MAIN("apikey", TESTS)

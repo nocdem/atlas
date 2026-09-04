@@ -34,6 +34,11 @@ static const scope_row SCOPES[] = {
      * credential a root-owned `remote_dispose_key` policy line names, and
      * only for one holding no stored scope of its own. */
     {ATLAS_SCOPE_DECISIONS_DISPOSE, "decisions:dispose", false},
+    /* Not grantable. A14, Decision 1: derived by the daemon for exactly the
+     * credentials root-owned `remote_submit_key` lines name. Unlike
+     * DECISIONS_DISPOSE it is derived for a key that may hold stored read
+     * scopes — a submit credential may also read via /api/. */
+    {ATLAS_SCOPE_JOBS_SUBMIT, "jobs:submit", false},
 };
 
 #define SCOPE_COUNT (sizeof(SCOPES) / sizeof(SCOPES[0]))

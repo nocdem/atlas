@@ -69,6 +69,16 @@
 #define ATLAS_GWPOLICY_PATH "/etc/atlas/gateway.conf"
 
 #define ATLAS_GWPOLICY_MAX_ORIGINS 8
+/* A14. At most four `remote_submit_key` lines; bounded in the parser,
+ * reflected in atlas_gwpolicy.remote_submit_keys[]. */
+#define ATLAS_GWPOLICY_MAX_SUBMIT_KEYS 4
+/* A14. Each `remote_submit_gate` line: one printable-ASCII gate expression,
+ * at most 255 chars plus NUL. */
+#define ATLAS_GWPOLICY_GATE_LINE_MAX 256u
+/* A14. Absolute ceilings: the policy may not permit more than this many
+ * simultaneous remote submissions or this many per calendar day. */
+#define ATLAS_GWPOLICY_SUBMIT_MAX_ACTIVE_CEILING 8
+#define ATLAS_GWPOLICY_SUBMIT_MAX_PER_DAY_CEILING 64
 #define ATLAS_GWPOLICY_ORIGIN_MAX 128u
 #define ATLAS_GWPOLICY_ADDR_MAX 64u
 #define ATLAS_GWPOLICY_URL_MAX 256u

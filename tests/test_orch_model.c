@@ -855,6 +855,34 @@ static void test_a_zeroed_policy_permits_nothing(void) {
     T_CHECK(atlas_orchpolicy_apply_limits(NULL, &s, &err) != ATLAS_OK);
 }
 
+static void test_a_policy_naming_submitter_uid_992_parses_active(void) {
+    /* The gateway runs as uid 992 on this deployment. §Global constraints and
+     * A14 §Decisions say that uid must never appear as submitter_uid in
+     * /etc/atlas/orchestration.conf or in any fixture — that refusal is the
+     * deployment's and this plan's, not the parser's. This test exists so
+     * nobody adds a parser check for 992 and calls it the authorisation
+     * boundary: the boundary is `atlas_orchpolicy_permits_submitter` against
+     * the runtime peer uid, enforced by `require_submitter` in
+     * server_orch.c, after the loader's path-provenance walk has established
+     * that the file is root-owned and therefore trustworthy. A parser that
+     * hard-codes a uid would be a check an adversary walks around by writing
+     * their own policy file. */
+    const char *text =
+        "dispatcher_uid = 993\nsubmitter_uid = 992\nrepo = proj\n"
+        "mode = patch\ndriver = fake\nworker_root = /var/lib/atlas-worker\n";
+    atlas_orchpolicy p;
+    T_CHECK_MSG(parse_policy(text, &p) == ATLAS_ORCHPOLICY_REASON_ACTIVE,
+                "a policy with submitter_uid = 992 was not parsed ACTIVE — "
+                "the parser must have no opinion about this uid");
+    /* The submitter uid was stored verbatim: the parser treats 992 exactly as
+     * it treats 1000. The *loader* is what refuses it, by refusing every file
+     * not owned by root. */
+    T_CHECK_MSG(p.submitter_count == 1 && p.submitter_uids[0] == 992,
+                "submitter_uid 992 was not stored: count=%zu uid=%lld",
+                p.submitter_count,
+                p.submitter_count > 0 ? p.submitter_uids[0] : -1LL);
+}
+
 static const atlas_test TESTS[] = {
     {"UNKNOWN is the zero state everywhere", test_unknown_is_the_zero_state},
     {"every state name round-trips", test_every_state_name_round_trips},
@@ -883,6 +911,8 @@ static const atlas_test TESTS[] = {
     {"a policy may name one model per role", test_a_policy_may_name_one_model_per_role},
     {"a model name Atlas half understands is malformed",
      test_a_model_name_atlas_half_understands_is_malformed},
+    {"a policy naming submitter_uid 992 parses ACTIVE",
+     test_a_policy_naming_submitter_uid_992_parses_active},
 };
 
 ATLAS_TEST_MAIN("orch_model", TESTS)

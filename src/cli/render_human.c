@@ -1674,12 +1674,10 @@ static atlas_status h_apikey_created(atlas_renderer *r, const atlas_apikey_creat
      * list. */
     if (c->scopes[0] == '\0') {
         (void)fprintf(o,
-                      "\nscopes: (none) -- this credential authorises nothing on its own. Only "
-                      "a root-owned\n"
-                      "        remote_dispose_key line in /etc/atlas/gateway.conf can give it "
-                      "one scope,\n"
-                      "        decisions:dispose, and nothing else. Name it there, or revoke "
-                      "it.\n");
+                      "\nscopes: (none) -- this credential authorises nothing on its own. Only a root-owned\n"
+                      "        line in /etc/atlas/gateway.conf can give it a scope: remote_dispose_key\n"
+                      "        gives decisions:dispose, a remote_submit_key line gives jobs:submit, and\n"
+                      "        the same key may never be named by both. Name it there, or revoke it.\n");
         if (c->rotated_from[0] != '\0') {
             (void)fprintf(o,
                           "\nthe policy line remote_dispose_key must now name %s%s; until it "

@@ -1607,9 +1607,10 @@ static atlas_status j_apikey_created(atlas_renderer *r, const atlas_apikey_creat
     TRY(atlas_json_key_bool(j, "no_scopes", no_scopes, err));
     if (no_scopes) {
         TRY(atlas_json_key_str(j, "no_scopes_note",
-                               "this credential authorises nothing on its own; only a "
-                               "root-owned remote_dispose_key line in /etc/atlas/gateway.conf "
-                               "can give it one scope, decisions:dispose, and nothing else",
+                               "this credential authorises nothing on its own; only a root-owned "
+                               "line in /etc/atlas/gateway.conf can give it a scope: "
+                               "remote_dispose_key gives decisions:dispose, a remote_submit_key "
+                               "line gives jobs:submit, and the same key may never be named by both",
                                err));
         if (c->rotated_from[0] != '\0') {
             char reminder[192];

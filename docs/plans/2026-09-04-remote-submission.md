@@ -221,13 +221,17 @@ not followed.
 
 ## What exists, verified against the tree at `c06e0a8` (2026-09-04)
 
+*(Amended 2026-09-04, T1 Step 0 re-read against A16 final commit `d8e9e49` / HEAD `3f67503`:
+line references that moved are corrected inline below; A16 T5, T6 and T7 have all landed —
+items 8 and the §What A16 leaves table updated accordingly.)*
+
 Every item the brief said is true of this deployment, checked, plus what the tree adds
 to each.
 
 1. **The constraint is exactly where the roadmap says it is, and it is two comparisons
    and a policy line.** `dispatch()` in `src/ipc/server.c` consults the orchestration
-   client group by name for every peer (`:1238-1246`) and the dispatcher group only
-   when `atlas_orchpolicy_is_any_dispatcher` says so (`:1303-1312`); each client
+   client group by name for every peer (`:1238-1246`, `~1234` after A16) and the dispatcher group only
+   when `atlas_orchpolicy_is_any_dispatcher` says so (`:1303-1312`, `1327` after A16); each client
    method then calls `require_submitter` (`src/ipc/server_orch.c:97-108`), which is
    `atlas_orchpolicy_permits_submitter(p, ds->peer_uid)` (`src/orch/policy.c:478-488`)
    over the `submitter_uid` lines the loader read (`:234-240`). `/etc/atlas/
@@ -302,15 +306,15 @@ to each.
    decisions:read graph:read impact:read`); `key_c0005df884842e55` `mission-control`
    ACTIVE with six (adds `audit:read`); three REVOKED. No key holds `memory:write` or
    `decisions:dispose`, and none can (`src/gw/apikey.c:22-37`, `grantable = false`;
-   `src/core/service_apikey.c:119-131` refuses by name). A16 T1 has landed
+   `src/core/service_apikey.c:119-131` (`~115-143` after A16) refuses by name). A16 T1 has landed
    (`127b54d`, `cca9486`): `ATLAS_SCOPE_DECISIONS_DISPOSE` is at
    `include/atlas/apikey.h:115`, `atlas api-key create --no-scopes` exists, and its
    success block says "Only a root-owned `remote_dispose_key` line … can give it one
    scope, `decisions:dispose`, and nothing else" — **a sentence this season makes
    false and T1 amends** (§What A16 leaves).
 7. **The gateway's route table is reads, and `api_handle` is GET-only for it.**
-   `API_ROUTES[]` (`src/gw/gateway.c:963-1028`) holds twenty-six rows, every one a
-   read, scope-checked at `:1212`; `api_handle` (`:1179`) refuses every non-GET
+   `API_ROUTES[]` (`src/gw/gateway.c:963-1028`, `:965` after A16) holds twenty-six rows, every one a
+   read, scope-checked at `:1212`; `api_handle` (`:1179`, `:1252` after A16) refuses every non-GET
    method for the whole table; the `/api/` block resolves a principal from
    `session_get` first, `authenticate` second, the anonymous floor third. **There is
    no `job.` route and no `job.` MCP tool**: `TOOLS[]` (`src/mcp/mcp_tools.c:3548`)
@@ -319,7 +323,7 @@ to each.
    MCP tool and no gateway route that reaches this method"). `/mcp`
    (`gateway.c:1378-1448`) authenticates the bearer, builds an in-process
    `atlas_mcp_server` with `remote = true` and `granted = pr->scopes` (`mcp_exchange`,
-   `:698-736`), and the tool listing and every `tools/call` are gated on
+   `:698-736`, `:700` after A16), and the tool listing and every `tools/call` are gated on
    `atlas_scope_has(s->granted, TOOLS[i].scope)` (`mcp_tools.c:3839`, `:4027`). The
    MCP server never sees the token: `authenticate` wipes it (`:281-395`), and
    `mcp_exchange` receives the principal only. The audit row for every `/mcp` request
@@ -334,16 +338,16 @@ to each.
    `parse_dispose_key` and the three keys' branches; `atlas_service_gateway_status_for`
    is declared. T5 (`src/ipc/server_remote.c`, `atlas_daemon_opts.gwpolicy_text`,
    `tests/tools/atlas_gw_daemon.c`), T6 (`API_WRITE_ROUTES[]`, `api_handle_write`,
-   `ATLAS_GW_WRITE_BODY_MAX_BYTES`, `/auth/me` fields), T7 (the disposal panel), T8,
-   T9 and T10 are **not in the tree**. §What A16 leaves says which of those this plan
-   depends on and how.
+   `ATLAS_GW_WRITE_BODY_MAX_BYTES`, `/auth/me` fields) and T7 (the disposal panel) are
+   **now in the tree** (A16 final commit `d8e9e49`, amended 2026-09-04). T8, T9 and T10
+   are **not in the tree**. §What A16 leaves says which of those this plan depends on and how.
 9. **The bounds this season leans on.** `ATLAS_ORCH_TASK_MAX` 65536
    (`include/atlas/orch.h:256`); `ATLAS_ORCH_MAX_VALIDATIONS` 8 (`:266`);
    `ATLAS_ORCH_NAME_MAX` 64 (`:271`), which also bounds the idempotency key and the
    correlation (`orch.c:607-619`, `is_name`); `ATLAS_ORCH_MAX_ATTEMPTS` 5 (`:278`);
    `ATLAS_ORCH_MAX_WALL_TIMEOUT_MS` 3600000 (`:276`); `ATLAS_ORCH_SPEC_DOMAIN`
    `"atlas.orch.spec.v1"` (`:62`); `ATLAS_GW_MAX_BODY_BYTES` 1 MiB
-   (`include/atlas/limits.h:973`); `ATLAS_GW_DEFAULT_RATE_PER_MINUTE` 600 (`:999`);
+   (`include/atlas/limits.h:973`); `ATLAS_GW_DEFAULT_RATE_PER_MINUTE` 600 (`:999`, `:1008` after A16);
    `ATLAS_APIKEY_SELECTOR_HEX` 16 and `ATLAS_APIKEY_TOKEN_MAX` 80
    (`include/atlas/apikey.h:67-75`); `ATLAS_GWPOLICY_MAX_ORIGINS` 8 and
    `GWPOLICY_MAX_BYTES` 8192 (`gwpolicy.h:70`, `gwpolicy.c:28`);
@@ -383,15 +387,15 @@ to each.
 
 | A14 needs | Built by | Mechanism, named | Status at `c06e0a8` |
 | --- | --- | --- | --- |
-| a bearer-only route table with its own handler, form bodies, and the 409 mapping | A16 T6 | `API_WRITE_ROUTES[]`, `api_handle_write`, `build_api_params` over the body, `ATLAS_ERR_INTEGRITY → 409` | **not in tree** — dependency |
-| a daemon method group offered to the gateway uid under policy, with the pattern "each method asks the predicate again" | A16 T5 | `atlas_server_remote_disposal_offered`, `src/ipc/server_remote.c` | **not in tree** — dependency; A14 adds a sibling file, never a row in A16's table |
+| a bearer-only route table with its own handler, form bodies, and the 409 mapping | A16 T6 | `API_WRITE_ROUTES[]`, `api_handle_write`, `build_api_params` over the body, `ATLAS_ERR_INTEGRITY → 409` | **in tree** (`d8e9e49`, amended 2026-09-04) |
+| a daemon method group offered to the gateway uid under policy, with the pattern "each method asks the predicate again" | A16 T5 | `atlas_server_remote_disposal_offered`, `src/ipc/server_remote.c` | **in tree** (`d8e9e49`, amended 2026-09-04); A14 adds a sibling file, never a row in A16's table |
 | the daemon verifying a bearer inside the transaction that spends it | A16 T3 | `atlas_decision_remote_verify` (`src/decision/remote.c`) | **in tree** (`13b45f3`) — precedent, mirrored not shared (Decision 2) |
-| a gateway-policy key naming a credential, with `key_` grammar and MALFORMED rules | A16 T4 | `parse_dispose_key`, `remote_dispose_key` | **uncommitted in working tree** — A14 generalises the parser (T4) |
-| a written cleartext acceptance key, printed by `gateway status`, reported by `/auth/me` | A16 T4/T6 | `operator_accepts_cleartext_disposal`, `cleartext_disposal_accepted` | T4 uncommitted, T6 not in tree — A14 adds a *second* key of the same grammar (Decision 11) |
-| a way to hand a fixture daemon a gateway policy | A16 T5 | `atlas_daemon_opts.gwpolicy_text`, `tests/tools/atlas_gw_daemon.c` | **not in tree** — dependency, extended with `orchpolicy_text` (Decision 15) |
+| a gateway-policy key naming a credential, with `key_` grammar and MALFORMED rules | A16 T4 | `parse_dispose_key`, `remote_dispose_key` | **in tree** (`d8e9e49`) — A14 generalises the parser (T4) |
+| a written cleartext acceptance key, printed by `gateway status`, reported by `/auth/me` | A16 T4/T6 | `operator_accepts_cleartext_disposal`, `cleartext_disposal_accepted` | **in tree** (`d8e9e49`, amended 2026-09-04) — A14 adds a *second* key of the same grammar (Decision 11) |
+| a way to hand a fixture daemon a gateway policy | A16 T5 | `atlas_daemon_opts.gwpolicy_text`, `tests/tools/atlas_gw_daemon.c` | **in tree** (`d8e9e49`, amended 2026-09-04) — extended with `orchpolicy_text` (Decision 15) |
 | a scope minted by no one (`--no-scopes`) and a refusal by name | A16 T1 | `atlas api-key create --no-scopes`; the `decisions:dispose` refusal | **in tree** — reused; one sentence amended (T1) |
-| a panel that holds a key in tab memory and POSTs with `credentials: "omit"` | A16 T7 | `disposeKey`, `apiWrite` | **not in tree** — A14's Jobs view reuses `apiWrite` and adds `submitKey` |
-| the write-table property test | A16 T6 | `test_every_write_route_is_a_disposal_on_the_reviewed_allowlist` | **not in tree** — A14 widens it (T9); its "every row is DECISIONS_DISPOSE" assertion becomes "every row's scope is ungrantable and on the positive list" |
+| a panel that holds a key in tab memory and POSTs with `credentials: "omit"` | A16 T7 | `disposeKey`, `apiWrite` | **in tree** (`d8e9e49`, amended 2026-09-04) — A14's Jobs view reuses `apiWrite` and adds `submitKey` |
+| the write-table property test | A16 T6 | `test_every_write_route_is_a_disposal_on_the_reviewed_allowlist` | **in tree** (`d8e9e49`, amended 2026-09-04) — A14 widens it (T9); its "every row is DECISIONS_DISPOSE" assertion becomes "every row's scope is ungrantable and on the positive list" |
 | migration number | A16 T2 | 31 | **in tree** — A14 is 32, and holds only if A16 adds none after 31 (its plan adds none) |
 
 **What A16 does not leave, and this plan builds:** the scope, the group, the column,
@@ -1657,7 +1661,8 @@ in.** T11a exists only if row 2 was answered no.
 
 **Files:**
 - Modify: `include/atlas/apikey.h`, `src/gw/apikey.c`, `src/core/service_apikey.c`,
-  `include/atlas/orch.h`, `include/atlas/limits.h`, `tests/test_apikey.c`,
+  `include/atlas/orch.h`, `include/atlas/limits.h`, `include/atlas/gwpolicy.h`,
+  `src/cli/render_human.c`, `src/cli/render_json.c`, `tests/test_apikey.c`,
   `tests/test_orch_model.c`, this plan
 
 **Interfaces produced:** `ATLAS_SCOPE_JOBS_SUBMIT`; `ATLAS_ORCH_REMOTE_CLIENT_KEY_MAX`;

@@ -3678,15 +3678,18 @@ like the operator's own intent — not merely readable by the model, but
 impossible rather than merely inconvenient: the sheet is text the operator
 copied out of a page they read, never a row Atlas wrote on anyone's behalf.
 
-**Why a sheet has no field for a confirmation, and why that is enforced by
-refusing a sixth field rather than by ignoring one.** A parser that silently
-dropped an unrecognised field would make a sheet with a forged confirmation
-column parse identically to one without it — the field would still not do
-anything, but nothing would tell a reader it had been added. Refusing the
-whole sheet on a sixth field is the sheet-grammar mirror of
-`tests/test_decision_mcp.c`'s rule that no MCP tool schema may declare a
-`"confirmation":` property: in both places, the shape of the input is itself
-part of the guarantee, not merely its content.
+**Why a sheet's fifth field is the public prefix and not a confirmation, and
+why a sixth field is refused rather than ignored.** The fifth field *is* the
+first eight hex of the reviewed revision's content hash — the same string an
+operator types on `/dev/tty` — so the sheet is not silent about what will be
+typed; what it has none of is a field the walker or the browser ever reads in
+place of that typing. A parser that silently dropped an unrecognised sixth
+field would make a sheet with a forged confirmation column parse identically
+to one without it — the field would still not do anything, but nothing would
+tell a reader it had been added. Refusing the whole sheet on a sixth field is
+the sheet-grammar mirror of `tests/test_decision_mcp.c`'s rule that no MCP
+tool schema may declare a `"confirmation":` property: in both places, the
+shape of the input is itself part of the guarantee, not merely its content.
 
 **Why the walker re-reads the record before minting anything, on every
 entry, rather than trusting what the browser showed.** The window between a

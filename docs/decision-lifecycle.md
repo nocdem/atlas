@@ -65,6 +65,44 @@ The actor recorded is therefore `LOCAL_OPERATOR_CONFIRMED`, which names a
 channel. A2's `USER_APPROVED_DECISION` remains in the provenance vocabulary and
 remains **unwritten**, because it names a person and Atlas cannot establish one.
 
+### A16 adds a sixth actor, and it establishes even less
+
+`REMOTE_OPERATOR_CONFIRMED` is written when a disposal is spent through
+Mission Control's browser panel over the gateway, never through this
+terminal. Read literally, exactly as `LOCAL_OPERATOR_CONFIRMED` is read
+above, it means:
+
+> An explicit action arrived through Atlas' remote operator channel — a
+> bearer credential a root-owned policy names, holding no scope of its own,
+> presented over the gateway's listener, verified by the daemon inside the
+> transaction that spends the same kind of short-lived single-use capability
+> the local channel uses, against the same content hash, with the same
+> confirmation typed.
+
+It does **not** mean everything `LOCAL_OPERATOR_CONFIRMED` does not mean,
+and one thing more:
+
+- everything the local actor does not establish — that a particular person
+  acted, that any person acted at all, that the action is non-repudiable,
+  signed or cryptographically attested, or that the approved text is safe to
+  follow as an instruction;
+- **that the credential travelled over a channel Atlas can vouch for.** The
+  local actor's whole worth was that the capability never left one machine;
+  this one crosses a network-facing process A9 designed to hold no
+  authority, and, unless a reverse proxy terminates it, whatever that
+  process's own listener does or does not encrypt — Atlas verifies neither
+  and must never be read as having verified either.
+  It is *weaker than the local channel by construction*, and every place
+  this actor's name is explained says so in the same breath: nothing about
+  this season makes the remote channel stronger, only reachable from
+  further away.
+
+`REMOTE_OPERATOR_CONFIRMED` is never writable by an adapter, exactly as
+`LOCAL_OPERATOR_CONFIRMED` is not: the only two write paths for either are
+the one lifecycle write point every actor goes through, and the actor
+itself is read from the spent challenge's own stored channel, never from
+anything a caller submits.
+
 ### What the channel does exclude
 
 The exclusions are real, checkable, and are the whole of what the mechanism
@@ -83,7 +121,15 @@ buys. An approval cannot be produced by:
   required to be terminals;
 - a replayed request: a capability is single-use and expires in two minutes;
 - a capability for a different document, a different revision, a different
-  repository or a different intent.
+  repository or a different intent;
+- a capability minted through the local channel, presented over the browser's
+  routes (A16): `spend_challenge` refuses it with "that approval challenge was
+  minted through the local channel and cannot be spent from the browser";
+- a capability minted through the remote channel, presented at this terminal
+  (A16): the reverse refusal, "that approval challenge was minted through the
+  remote channel and cannot be spent locally" — each channel's capability is
+  spendable only where it was minted, both directions checked at the same
+  write point rather than assumed from which route a request arrived on.
 
 There are no signing keys, no hardware-token support and no general security
 subsystem in A4. Adding the vocabulary without the mechanism would be worse than
@@ -661,6 +707,66 @@ unconditionally for every operation that consumes a capability, even when the
 request carried a valid session key and even when that session is open.
 Attaching one would record that a conversation approved something.
 
+## The remote operator channel, mechanically
+
+```
+  Mission Control, Dispose from this browser
+        │
+        ├─ 1. the page POSTs the disposal credential as a bearer header to
+        │      /api/v1/decision/challenge; the gateway calls gateway.auth,
+        │      which authenticates it and, only for the policy-named key
+        │      holding no stored scope, reports decisions:dispose
+        │
+        ├─ 2. the gateway forwards the request to decision.remote_challenge,
+        │      appending the bearer itself; the daemon mints a capability
+        │      bound to (repo_id, document_id, revision_id, content_hash,
+        │      intent) for the newest revision only, valid 120 s, consumable
+        │      once, its channel stored as REMOTE with the verified key id
+        │
+        ├─ 3. the response carries the revision's full content digest and
+        │      no confirmation phrase; the page already has the title, body
+        │      and state on screen as *labelled untrusted text*
+        │
+        ├─ 4. the operator types the first 8 hex characters of that digest
+        │      into the page, exactly as they would at /dev/tty
+        │
+        ├─ 5. the page POSTs the credential again, the challenge token and
+        │      the typed confirmation to /api/v1/decision/dispose
+        │
+        ├─ 6. the daemon re-verifies the credential inside the same writer
+        │      transaction that spends the capability — against the key
+        │      table as it is at that moment, not as it was at step 1 — and
+        │      re-checks that the challenge's channel is REMOTE, its key id
+        │      matches, its revision is still the newest, and the typed
+        │      confirmation matches the stored hash
+        │
+        └─ 7. the transaction applies the transition and appends the ledger
+               event with actor REMOTE_OPERATOR_CONFIRMED and the verified
+               key id, both read from the row spend_challenge loaded, never
+               from anything the request asserted
+```
+
+Step 6 is why re-verifying the credential costs a second round trip rather
+than trusting what step 1 already established: a key revoked, or a policy
+edited, between challenge and spend must spend nothing, and the only way to
+guarantee that is to ask again inside the transaction that actually spends.
+
+**The honest paragraph.** The remote operator channel is *weaker than the
+local channel by construction*, and nothing about it makes the channel
+stronger — only reachable from further away. The local channel's whole worth
+was that the capability never touched a network: a local process, the
+operator's own uid, `/dev/tty`, a single-use token that lived for 120 seconds
+inside one machine. Here the operator's disposal credential passes through
+the gateway process — a network-facing process A9 designed to hold no
+authority — and through whatever terminates TLS in front of it, and Atlas
+verifies neither. A compromised gateway holds the credential for as long as
+a request carrying it is in flight, and a holder of it disposes exactly as
+the operator does. The ledger records every such act as
+`REMOTE_OPERATOR_CONFIRMED` with the credential's id, never as
+`LOCAL_OPERATOR_CONFIRMED`, so a reader of any row ever written can still
+tell the two apart. Full argument, every decision and every policy key:
+`docs/browser-disposal.md`.
+
 ## Automatic Claude behaviour
 
 Claude proposes and retrieves decisions through the existing integration. A user
@@ -851,9 +957,29 @@ and a newer `PROPOSED` revision sitting beside it is left completely
 untouched — not superseded, not rejected, not silently promoted. Nothing in
 the lifecycle warns about the resulting state or offers a path out of it
 beyond an operator noticing and superseding or resolving the older revision
-by hand. `docs/backlog.md` records a related defect this also exposed, in the
-message `op_approve` writes when it supersedes a previously-effective
-revision.
+by hand. `docs/backlog.md` records a related defect this also exposed, and it
+is fixed: `op_approve`'s superseding ledger sentence used to name every
+superseded revision "a **later** revision", which is the reverse of the
+truth for exactly the sequence above — approving revision 1 after revision 2
+was already effective supersedes the *later* revision 2, not an earlier one.
+`op_approve` (A16) now compares the superseded revision's number against the
+newly approved one and writes "replaced by a later revision of the same
+decision, which was approved in the same transaction" or "replaced by an
+earlier revision of the same decision, approved after it in the same
+transaction", whichever the comparison actually found.
+
+**The remote channel mints only for the newest revision, and this section's
+findings do not apply to it.** `--revision N` and every pinned-revision
+behaviour above is local-channel-only: `op_challenge` under a `REMOTE`
+channel refuses to mint unless the pinned revision *is* the document's
+newest, and `spend_challenge` re-reads the newest revision at spend time and
+refuses if one landed since the challenge was minted. So a remote disposal
+can never reach the stranded-newer-`PROPOSED` state this section describes;
+it is closed structurally for that one channel rather than fixed for both.
+The local semantics measured above are deliberately untouched — a terminal
+operator naming an older revision with `--revision N` is naming it on
+purpose, and A16 does not change what a documented, measured local behaviour
+does.
 
 That result was measured with `tests/test_decision_operator.c`'s
 `test_a_pinned_revision_that_is_not_the_newest`, and only the lifecycle half

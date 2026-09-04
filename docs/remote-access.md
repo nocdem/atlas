@@ -6,7 +6,11 @@ scopes, and forwards only explicitly supported operations to `atlasd` over the
 ordinary Unix socket. **That "authenticates" is no longer universally true**:
 a root-owned policy may name an anonymous floor for browser reads with no
 credential at all. See "Anonymous browser reads, stated honestly" below before
-assuming every `/api/` request carries a credential.
+assuming every `/api/` request carries a credential. **A16's two write routes
+are the opposite exception: they authenticate a bearer credential and
+nothing else** — never a session cookie, never the anonymous floor, whatever
+either one is configured to accept for a read. See "A16: the remote operator
+channel" below.
 
 Nothing about the local behaviour changes. `atlasd`, `/run/atlas/atlas.sock`,
 stdio MCP and the Claude Code integration are exactly as they were.
@@ -89,6 +93,40 @@ it.
 The default bind is `127.0.0.1`. Binding anything else **requires** an explicit
 `tls_mode`, even when the answer is `NONE` — which is then a decision an auditor
 can find in the policy rather than the silent consequence of leaving a key out.
+
+### `operator_accepts_cleartext_disposal` (A16)
+
+A16 adds two write routes that dispose of a knowledge record from Mission
+Control (below), gated on `tls_mode = REVERSE_PROXY` by default — the daemon
+will not offer the disposal method group otherwise. `operator_accepts_cleartext_disposal`
+is the one, deliberately narrow exception: a root-owned key, absent by
+default, whose only accepted value is `yes`, by which an operator states in
+writing that they accept a disposal credential crossing their own network
+unencrypted. It is refused (MALFORMED, gateway disabled with a reason) under
+three conditions: any value other than the literal `yes`; presence together
+with `tls_mode = REVERSE_PROXY`, because there is then nothing to accept;
+and presence without both `remote_dispose_key` and `remote_dispose_kinds`,
+because there is then nothing named for it to apply to. `REVERSE_PROXY`
+remains the shape the gate prefers — this key adds one condition to the
+daemon's offer predicate and removes none, so a reader of the code still
+sees TLS in front as the intended design and a deployment carrying this key
+as a recorded departure from it. `atlas gateway status` prints whether it is
+present on every run, exactly as it prints every other fact about this
+policy an auditor might otherwise have to go looking for.
+
+**On this deployment the disposal credential travels in the clear.** The
+gateway listens on `192.168.0.198:8799` with `tls_mode = NONE`, and the two
+disposal routes carry the credential as a bearer header on every request, so
+anyone able to observe traffic on that network segment can read it. An Atlas
+API credential has no expiry, so a credential captured once disposes of
+records exactly as the operator does until the operator notices and runs
+`atlas api-key revoke`. The operator was shown this chain on 2026-09-04 and
+accepted it for this network by writing
+`operator_accepts_cleartext_disposal = yes` into the root-owned gateway
+policy; `atlas gateway status` prints that acceptance on every run. Atlas
+states this cost and does not judge the trade; the same key on a listener
+reachable from a network the operator does not control is a different
+decision using the same mechanism. Full argument: `docs/browser-disposal.md`.
 
 ## Credentials
 
@@ -354,6 +392,118 @@ capability placed behind either would therefore be one scope grant away from
 the other, which is why disposing of a record stayed on the one channel that
 never runs through this listener at all: an interactive terminal, on the
 machine, as the operator's own uid.
+
+**Amended by A16.** That last sentence was true of *every* principal this
+listener could produce on 2026-09-04 and is no longer true of all of them: a
+bearer credential a root-owned policy names as the disposal key now can
+dispose of a record, over the two routes the next section describes. It
+remains true of everything else this listener can produce — a session
+cookie can never dispose, whatever scopes it carries, because the two write
+routes never call `session_get`; the anonymous floor can never hold the
+disposal scope, because that scope's `grantable` bit is `false`; and every
+credential except the one the policy names by id is refused the scope by
+`gateway.auth` regardless of what it can read. The sentence above is
+therefore corrected rather than deleted: disposing of a record moved off
+"never" and onto "only a bearer credential the operator named in a
+root-owned file, and never the credential that proposed the record it
+disposes of" — see the next section.
+
+## A16: the remote operator channel
+
+A16 adds the first two `POST` routes this gateway serves, and the first
+daemon method group offered to the gateway's own uid: `decision.remote_challenge`
+and `decision.remote_dispose`, in `src/ipc/server_remote.c`, disjoint from
+every method group that existed before it. Full argument, all seventeen
+decisions and every finding running the season's plan produced beyond what
+it claimed: `docs/browser-disposal.md`. This section is the remote-access
+half.
+
+**The two routes.**
+
+```
+POST /api/v1/decision/challenge   repo, decision, revision, intent
+POST /api/v1/decision/dispose     repo, decision, intent, challenge, confirmation
+```
+
+Both require the `decisions:dispose` scope and answer `404` when the policy
+names no disposal key at all — the shape `/mcp` already uses when
+`remote_mcp` is off, so a caller debugging the panel gets a sentence and the
+daemon's own silence stays the actual guard.
+
+**The form body, and why not JSON.** Neither route accepts
+`Content-Type: application/json`. Both require
+`application/x-www-form-urlencoded` — the same query-string syntax
+`build_api_params` already parses for every `GET` route — parsed from the
+request body instead of the query string. That is a deliberate cost, not an
+oversight: the gateway parses no JSON anywhere else except one bespoke login
+key, by hand, and a `yyjson` call site inside `src/gw` would extend that
+vendored library's stated contract for a project rule this season did not
+want to argue past. The consequence worth naming: a browser's `fetch` with a
+`URLSearchParams` body sets `Content-Type` to
+`application/x-www-form-urlencoded;charset=UTF-8` by default, and the
+route's own `Content-Type` check is an exact-literal comparison with no
+parameter stripping, so a caller must set the header itself or every
+disposal fails with `415`. Mission Control's own script does.
+
+**Bearer-only, and why a cookie cannot dispose.** Both routes resolve their
+principal from `authenticate()` — the `Authorization: Bearer` header on the
+request itself — and never call `session_get` or `anonymous_ok`. The reason
+is structural, not a policy choice made twice: the gateway holds no token
+for a cookie principal, only a key id, a label and an expiry, so there is
+nothing a write route could verify a session's *credential* against even if
+it wanted to. The daemon verifies the presented bearer a second time, inside
+the transaction that mints or spends the capability, against the key table
+as it is at that moment — a key revoked between the gateway's check and the
+writer's turn spends nothing.
+
+**The derived scope.** `decisions:dispose` is in the scope vocabulary with
+`grantable = false`: no `atlas api-key create` call can name it, and it is
+never written to an `api_keys` row. `gateway.auth` derives it, for exactly
+the key the root-owned `remote_dispose_key` line names, and only when that
+key's own stored scope list is empty — a `--no-scopes` credential
+(`atlas api-key create --label L --no-scopes`, A16's addition to that
+command) is inert until this policy line gives it its one grant, and a
+credential already holding ordinary read scopes is never widened by being
+named here.
+
+**The two policy keys, and their MALFORMED conditions.** `remote_dispose_key`
+(exactly `key_` followed by 16 lowercase hex) and `remote_dispose_kinds`
+(one or more of the eight decision kinds, space-separated, no duplicates)
+travel together — one without the other is MALFORMED — and both require
+`web_gui = yes` and, absent `operator_accepts_cleartext_disposal`,
+`tls_mode = REVERSE_PROXY`. `decisions:dispose` named inside
+`web_gui_anonymous_scopes` was already MALFORMED before this season, because
+the anonymous-floor parser refuses any non-grantable scope by name. The
+third key, `operator_accepts_cleartext_disposal`, is described above under
+"TLS".
+
+**The `dispose:` status line.** `atlas gateway status` prints `dispose:` and
+`clear:` unconditionally whenever the gateway is `ENABLED`, naming the
+credential id and kinds, or saying plainly that the browser can read and
+queue but never dispose.
+
+**`/auth/me`'s new fields.** The success body gains `"remote_disposal"`
+(the policy names a disposal key at all) and `"cleartext_disposal"` (the
+policy also carries the acceptance key), in that order after `"anonymous"`,
+so Mission Control can say whether the disposal panel can work here and show
+the cleartext sentence at the moment of use, without presenting the
+disposal credential just to ask.
+
+**The honest paragraph.**
+The remote operator channel is *weaker than the local channel by construction*,
+and nothing in this season makes it stronger — only reachable from further
+away. The local channel's whole
+worth was that the capability never touched a network: a local process, the
+operator's own uid, `/dev/tty`, a single-use token that lived for 120
+seconds inside one machine. On this channel the operator's disposal
+credential passes through the gateway process — a network-facing process
+A9 designed to hold no authority — and through whatever terminates TLS in
+front of it, and Atlas verifies neither. A compromised gateway holds that
+credential for as long as a request carrying it is in flight, and a holder
+of the credential disposes exactly as the operator does. The ledger
+therefore records every such act as `REMOTE_OPERATOR_CONFIRMED` with the
+credential's id beside it, never as `LOCAL_OPERATOR_CONFIRMED`, so that a
+reader of any row ever written can still tell the two apart.
 
 ## Audit
 

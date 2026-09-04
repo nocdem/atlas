@@ -218,7 +218,18 @@ typedef struct atlas_gwpolicy {
      * `atlas_decision_kind` the operator names — the loader places no
      * narrower vocabulary in front of the operator's own choice of which
      * kinds may be disposed of from a browser than `atlas_decision_kind_parse`
-     * already accepts everywhere else. */
+     * already accepts everywhere else.
+     *
+     * **Load time verifies shape only.** This loader has no database handle
+     * and runs inside the gateway process too, which under A7.1 cannot open
+     * the index at all — so a policy naming a credential that does not
+     * exist, is revoked, or holds a nonempty stored scope list still loads
+     * ENABLED, and `atlas gateway status` still prints it: the status line
+     * is the policy's claim, not the credential's liveness. Existence,
+     * status, the verifier match, an empty stored scope list, and identity
+     * against this field are checked *at use*, inside the write transaction,
+     * by `atlas_decision_remote_verify` (`src/decision/remote.c`) — see the
+     * `remote_dispose_key` branch in `gwpolicy.c` for the full argument. */
     char remote_dispose_key[ATLAS_APIKEY_SELECTOR_HEX + 1u];
     uint32_t remote_dispose_kinds;
 

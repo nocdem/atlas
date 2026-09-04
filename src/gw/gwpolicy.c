@@ -440,7 +440,30 @@ void atlas_gwpolicy_parse_buffer(const char *buf, size_t total, atlas_gwpolicy *
             /* A16: the disposal credential's selector, in its display form.
              * `parse_dispose_key` both validates the shape and strips the
              * prefix, so `out->remote_dispose_key` is stored exactly as
-             * `api_keys.key_id` is. */
+             * `api_keys.key_id` is.
+             *
+             * This is the whole of what a policy load can verify about the
+             * named credential: its *shape*. `atlas_gwpolicy_parse_buffer` is
+             * a pure function over bytes -- no database handle, which is what
+             * makes the malformed matrix testable without a fixture database
+             * -- and it also runs inside the gateway process, which under
+             * A7.1 cannot open the index at all (0700 `atlasd`). So a policy
+             * naming a key that does not exist, is revoked, or holds a
+             * nonempty stored scope list still loads ENABLED, and
+             * `atlas gateway status` still prints `dispose: key_<id> (...)`
+             * for it -- the status line reports the *policy's claim*, not the
+             * credential's liveness. Existence, ACTIVE status, the verifier
+             * match, an empty stored scope list, and "is this the credential
+             * the policy names" are all checked *at use*, inside the write
+             * transaction, by `atlas_decision_remote_verify`
+             * (`src/decision/remote.c`) -- which produces "the credential
+             * presented for this disposal did not authenticate; nothing was
+             * changed" for the first four and "that credential is not the
+             * one the remote disposal policy names" for the last, and never
+             * distinguishes which of the first four failed, for the reason
+             * `gateway.auth` does not either: a caller who could tell a
+             * malformed token from an unknown selector from a wrong secret
+             * would learn which half of a guess was right. */
             if (!parse_dispose_key(val, vlen, out->remote_dispose_key)) {
                 out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
                 return;

@@ -152,7 +152,7 @@ static void test_migration_rollback(void) {
      * once A9.2's schema bump changed the frame layout. A struct built field by
      * field silently stops being complete the moment somebody adds a field, so
      * these sites zero first and assign after. */
-    atlas_migration list[32];
+    atlas_migration list[64];
     T_REQUIRE(base_count + 1u <= sizeof(list) / sizeof(list[0]));
     memset(list, 0, sizeof(list));
     memcpy(list, base, base_count * sizeof(list[0]));

@@ -281,11 +281,11 @@ static void test_a_populated_schema_six_database_reaches_seven_losslessly(void) 
      * table without renumbering a row — is asserted below and is unaffected by
      * later migrations running on top of it. */
     T_EQ_INT(atlas_db_schema_version(db, &err), ATLAS_SCHEMA_VERSION);
-    /* Migration 31 (A16's T2) landed after this suite was written; migration
-     * 31 rebuilds `decision_challenges` again, on top of what this suite
-     * asserts about migration 7's own rebuild, and the explicit column list
-     * below is what keeps this comparison about seven's columns only. */
-    T_EQ_INT(ATLAS_SCHEMA_VERSION, 31);
+    /* Migration 32 (A14's T2) landed after this suite was written; migration
+     * 31 rebuilt `decision_challenges`, and migration 32 appended columns to
+     * `orch_jobs`/`orch_transitions`; the explicit column list below is what
+     * keeps this comparison about seven's columns only. */
+    T_EQ_INT(ATLAS_SCHEMA_VERSION, 32);
 
     atlas_buf after = ATLAS_BUF_INIT;
     text_of(db,

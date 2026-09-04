@@ -4819,6 +4819,37 @@ static const char M31_CONFIRM[] =
 static const char *const M31_STATEMENTS[] = {M31_VERIFY, M31_EVENTS, M31_CHALLENGES, M31_CONFIRM,
                                              NULL};
 
+/* A14 T2: two columns appended and one index added. No table is rebuilt, no
+ * CHECK changes, `foreign_keys_off` stays false throughout.
+ *
+ * `orch_jobs.submit_key_id DEFAULT ''` is a true statement about every
+ * existing row: before this migration the only submission path was local
+ * (through the operator channel), and the selector of the credential that
+ * queued it was always absent, not a non-empty value someone would need to
+ * preserve. This is not migration 19's mistake: inventing a value where none
+ * existed would be that mistake; `''` is the same value every local job
+ * written by future code will carry, so no pre-existing row is relabelled.
+ *
+ * `orch_idempotency` is deliberately untouched: the idempotency namespace for
+ * remote submissions is `remote.<key_id>.<client>`, which T3 constructs and
+ * the table already stores opaquely. Widening the table here for a column T3
+ * never reads would add schema surface with no behaviour behind it (Decision
+ * 6).
+ *
+ * `idx_orch_jobs_submit_key ON orch_jobs(submit_key_id, id)` is the index the
+ * two per-credential budget queries use. The existing `idx_orch_jobs_submitter
+ * ON orch_jobs(submitter_uid, id)` still serves the operator's default job list
+ * (`atlas_db_orch_job_list`) unchanged: `submitter_uid` is the kernel's answer
+ * and is independent of the credential column beside it. */
+static const char M32_JOBS[] =
+    "ALTER TABLE orch_jobs ADD COLUMN submit_key_id TEXT NOT NULL DEFAULT '';\n"
+    "CREATE INDEX idx_orch_jobs_submit_key ON orch_jobs(submit_key_id, id);";
+
+static const char M32_TRANSITIONS[] =
+    "ALTER TABLE orch_transitions ADD COLUMN key_id TEXT NOT NULL DEFAULT '';";
+
+static const char *const M32_STATEMENTS[] = {M32_JOBS, M32_TRANSITIONS, NULL};
+
 static const atlas_migration MIGRATIONS[] = {
     {1, "initial schema", M1_STATEMENTS, false},
     {2, "worktree identity", M2_STATEMENTS, false},
@@ -4940,6 +4971,13 @@ static const atlas_migration MIGRATIONS[] = {
      "the remote operator channel: which channel and credential minted a challenge, and which "
      "credential the ledger records",
      M31_STATEMENTS, false},
+    /* Additive: two columns and one index. No table is rebuilt, so foreign
+     * keys stay enforced and no pre-existing row is rewritten. See the M32
+     * comment for why `submit_key_id DEFAULT ''` is a true statement, why
+     * `orch_idempotency` is deliberately untouched, and why the existing
+     * `idx_orch_jobs_submitter` still serves the default list. */
+    {32, "which credential queued a job, beside which uid: the remote submission channel",
+     M32_STATEMENTS, false},
 };
 
 const atlas_migration *atlas_migrations(size_t *count_out) {

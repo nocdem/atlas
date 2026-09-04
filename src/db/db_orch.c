@@ -322,12 +322,12 @@ static atlas_status job_by_id(atlas_db *db, int64_t id, job_row *j, bool *found,
 static atlas_status record_transition(atlas_db *db, int64_t job_id, int64_t attempt_id,
                                       atlas_orch_state from, atlas_orch_state to,
                                       atlas_orch_reason reason, atlas_orch_actor actor,
-                                      long long actor_uid, const char *detail, int64_t *seq_out,
-                                      atlas_err *err) {
+                                      long long actor_uid, const char *detail, const char *key_id,
+                                      int64_t *seq_out, atlas_err *err) {
     static const char SQL[] =
         "INSERT INTO orch_transitions(job_id, attempt_id, from_state, to_state, reason, actor,"
-        "                             actor_uid, detail, at)"
-        " VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9);";
+        "                             actor_uid, detail, at, key_id)"
+        " VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10);";
     sqlite3_stmt *st = NULL;
     atlas_status s = atlas_db_prepare(db, SQL, &st, err);
     if (s != ATLAS_OK) {
@@ -357,6 +357,9 @@ static atlas_status record_transition(atlas_db *db, int64_t job_id, int64_t atte
     }
     if (s == ATLAS_OK) {
         s = atlas_db_bind_text_opt(db, st, 9, at, err);
+    }
+    if (s == ATLAS_OK) {
+        s = atlas_db_bind_text_opt(db, st, 10, key_id != NULL ? key_id : "", err);
     }
     if (s != ATLAS_OK) {
         atlas_db_finish(db, st);
@@ -427,7 +430,7 @@ static atlas_status transition(atlas_db *db, const job_row *j, int64_t attempt_i
     }
     int64_t seq = 0;
     atlas_status s = record_transition(db, j->id, attempt_id, j->state, to, reason, actor,
-                                       actor_uid, detail, &seq, err);
+                                       actor_uid, detail, "", &seq, err);
     if (s != ATLAS_OK) {
         return s;
     }
@@ -1365,7 +1368,7 @@ static atlas_status op_submit(atlas_db *db, const atlas_orch_op *op, atlas_orch_
                                ATLAS_ORCH_STATE_QUEUED, ATLAS_ORCH_REASON_SUBMITTED,
                                op->actor != ATLAS_ORCH_ACTOR_UNKNOWN ? op->actor
                                                                      : ATLAS_ORCH_ACTOR_CLIENT,
-                               op->peer_uid, digest, &seq, err);
+                               op->peer_uid, digest, "", &seq, err);
         if (st != ATLAS_OK) {
             goto done;
         }
@@ -3477,7 +3480,7 @@ atlas_status atlas_db_orch_job_get(atlas_db *db, const char *uid, atlas_orch_job
         "SELECT job_uid, state, repo_name, source_commit, mode, driver, spec_digest,"
         "       submitter_uid, attempts_started, max_attempts, created_at, terminal_at,"
         "       cancel_requested, state_seq, task_text, correlation, wall_timeout_ms,"
-        "       idle_timeout_ms, run_uid, parent_job_uid"
+        "       idle_timeout_ms, run_uid, parent_job_uid, submit_key_id"
         "  FROM orch_jobs WHERE job_uid = ?1;";
     *found = false;
     memset(out, 0, sizeof(*out));
@@ -3544,6 +3547,10 @@ atlas_status atlas_db_orch_job_get(atlas_db *db, const char *uid, atlas_orch_job
         if (s == ATLAS_OK) {
             s = atlas_db_col_copy(st, 19, out->parent_job_uid, sizeof(out->parent_job_uid),
                                   "parent_job_uid", err);
+        }
+        if (s == ATLAS_OK) {
+            s = atlas_db_col_copy(st, 20, out->submit_key_id, sizeof(out->submit_key_id),
+                                  "submit_key_id", err);
         }
         if (s == ATLAS_OK) {
             *found = true;
@@ -3876,7 +3883,8 @@ atlas_status atlas_db_orch_job_list(atlas_db *db, long long submitter_uid, int64
         limit = ATLAS_ORCH_LIST_MAX;
     }
     static const char SQL[] =
-        "SELECT id, job_uid, state, repo_name, driver, created_at, attempts_started"
+        "SELECT id, job_uid, state, repo_name, driver, created_at, attempts_started,"
+        "       submit_key_id"
         "  FROM orch_jobs WHERE submitter_uid = ?1 AND id > ?2 ORDER BY id LIMIT ?3;";
     sqlite3_stmt *st = NULL;
     atlas_status s = atlas_db_prepare(db, SQL, &st, err);
@@ -3909,6 +3917,10 @@ atlas_status atlas_db_orch_job_list(atlas_db *db, long long submitter_uid, int64
             s = atlas_db_col_copy(st, 5, row.created_at, sizeof(row.created_at), "created_at",
                                   err);
         }
+        if (s == ATLAS_OK) {
+            s = atlas_db_col_copy(st, 7, row.submit_key_id, sizeof(row.submit_key_id),
+                                  "submit_key_id", err);
+        }
         if (s != ATLAS_OK) {
             break;
         }
@@ -3933,6 +3945,184 @@ atlas_status atlas_db_orch_job_list(atlas_db *db, long long submitter_uid, int64
         *more_out = more;
     }
     return s;
+}
+
+/* A14. Shared body for the two remote-listing functions. The only differences
+ * are the WHERE clause and the number of bound parameters, so both callers
+ * build the statement with this helper rather than duplicating the pagination
+ * loop. */
+static atlas_status orch_job_list_impl(atlas_db *db, sqlite3_stmt *st, int64_t after_id,
+                                       int64_t limit, atlas_orch_list_cb cb, void *ud,
+                                       int64_t *count_out, int64_t *cursor_out, bool *more_out,
+                                       atlas_err *err) {
+    int64_t n = 0;
+    int64_t cursor = after_id;
+    bool more = false;
+    atlas_status s = ATLAS_OK;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        if (n == limit) {
+            more = true;
+            break;
+        }
+        atlas_orch_list_row row;
+        memset(&row, 0, sizeof(row));
+        row.id = sqlite3_column_int64(st, 0);
+        s = atlas_db_col_copy(st, 1, row.job_uid, sizeof(row.job_uid), "job_uid", err);
+        if (s == ATLAS_OK) {
+            (void)atlas_orch_state_parse(atlas_db_col_text(st, 2), &row.state);
+            s = atlas_db_col_copy(st, 3, row.repo_name, sizeof(row.repo_name), "repo_name", err);
+        }
+        if (s == ATLAS_OK) {
+            s = atlas_db_col_copy(st, 4, row.driver, sizeof(row.driver), "driver", err);
+        }
+        if (s == ATLAS_OK) {
+            s = atlas_db_col_copy(st, 5, row.created_at, sizeof(row.created_at), "created_at",
+                                  err);
+        }
+        if (s == ATLAS_OK) {
+            s = atlas_db_col_copy(st, 7, row.submit_key_id, sizeof(row.submit_key_id),
+                                  "submit_key_id", err);
+        }
+        if (s != ATLAS_OK) {
+            break;
+        }
+        row.attempts_started = sqlite3_column_int64(st, 6);
+        cursor = row.id;
+        n++;
+        if (cb != NULL) {
+            s = cb(&row, ud, err);
+            if (s != ATLAS_OK) {
+                break;
+            }
+        }
+    }
+    atlas_db_finish(db, st);
+    if (count_out != NULL) {
+        *count_out = n;
+    }
+    if (cursor_out != NULL) {
+        *cursor_out = cursor;
+    }
+    if (more_out != NULL) {
+        *more_out = more;
+    }
+    return s;
+}
+
+atlas_status atlas_db_orch_job_list_by_key(atlas_db *db, const char *key_id, int64_t after_id,
+                                           int64_t limit, atlas_orch_list_cb cb, void *ud,
+                                           int64_t *count_out, int64_t *cursor_out,
+                                           bool *more_out, atlas_err *err) {
+    if (limit <= 0 || limit > ATLAS_ORCH_LIST_MAX) {
+        limit = ATLAS_ORCH_LIST_MAX;
+    }
+    static const char SQL[] =
+        "SELECT id, job_uid, state, repo_name, driver, created_at, attempts_started,"
+        "       submit_key_id"
+        "  FROM orch_jobs WHERE submit_key_id = ?1 AND id > ?2 ORDER BY id LIMIT ?3;";
+    sqlite3_stmt *st = NULL;
+    atlas_status s = atlas_db_prepare(db, SQL, &st, err);
+    if (s != ATLAS_OK) {
+        return s;
+    }
+    s = atlas_db_bind_text_opt(db, st, 1, key_id != NULL ? key_id : "", err);
+    if (s == ATLAS_OK) {
+        (void)sqlite3_bind_int64(st, 2, after_id);
+        (void)sqlite3_bind_int64(st, 3, limit + 1);
+    }
+    if (s != ATLAS_OK) {
+        atlas_db_finish(db, st);
+        return s;
+    }
+    return orch_job_list_impl(db, st, after_id, limit, cb, ud, count_out, cursor_out, more_out,
+                              err);
+}
+
+atlas_status atlas_db_orch_job_list_remote(atlas_db *db, int64_t after_id, int64_t limit,
+                                           atlas_orch_list_cb cb, void *ud, int64_t *count_out,
+                                           int64_t *cursor_out, bool *more_out, atlas_err *err) {
+    if (limit <= 0 || limit > ATLAS_ORCH_LIST_MAX) {
+        limit = ATLAS_ORCH_LIST_MAX;
+    }
+    static const char SQL[] =
+        "SELECT id, job_uid, state, repo_name, driver, created_at, attempts_started,"
+        "       submit_key_id"
+        "  FROM orch_jobs WHERE submit_key_id <> '' AND id > ?1 ORDER BY id LIMIT ?2;";
+    sqlite3_stmt *st = NULL;
+    atlas_status s = atlas_db_prepare(db, SQL, &st, err);
+    if (s != ATLAS_OK) {
+        return s;
+    }
+    (void)sqlite3_bind_int64(st, 1, after_id);
+    (void)sqlite3_bind_int64(st, 2, limit + 1);
+    return orch_job_list_impl(db, st, after_id, limit, cb, ud, count_out, cursor_out, more_out,
+                              err);
+}
+
+atlas_status atlas_db_orch_remote_active_count(atlas_db *db, const char *key_id, int64_t *out,
+                                               atlas_err *err) {
+    /* The NOT IN predicate must stay in sync with `atlas_orch_state_is_terminal`
+     * and with `idx_orch_jobs_state`'s WHERE clause. The spelling here is the
+     * third copy of the terminal set (after the C function and the index); all
+     * three are compared against each other in `test_orch_run.c`. */
+    static const char SQL[] =
+        "SELECT COUNT(*) FROM orch_jobs"
+        " WHERE submit_key_id = ?1"
+        "   AND state NOT IN ('SUCCEEDED','FAILED','CANCELLED','TIMED_OUT','RECOVERY_REQUIRED');";
+    sqlite3_stmt *st = NULL;
+    atlas_status s = atlas_db_prepare(db, SQL, &st, err);
+    if (s != ATLAS_OK) {
+        return s;
+    }
+    s = atlas_db_bind_text_opt(db, st, 1, key_id != NULL ? key_id : "", err);
+    if (s != ATLAS_OK) {
+        atlas_db_finish(db, st);
+        return s;
+    }
+    int64_t v = 0;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        v = sqlite3_column_int64(st, 0);
+    }
+    atlas_db_finish(db, st);
+    if (out != NULL) {
+        *out = v;
+    }
+    return ATLAS_OK;
+}
+
+atlas_status atlas_db_orch_remote_today_count(atlas_db *db, const char *key_id,
+                                              const char *utc_day_start, int64_t *out,
+                                              atlas_err *err) {
+    /* Counts root submissions only: `parent_job_uid = ''` excludes follow-up
+     * tasks. `created_at >= utc_day_start` partitions by UTC calendar day,
+     * where `utc_day_start` is an ISO-8601 UTC midnight string supplied by the
+     * caller (TEXT comparison is correct for the ISO-8601 lexicographic
+     * ordering SQLite uses). */
+    static const char SQL[] =
+        "SELECT COUNT(*) FROM orch_jobs"
+        " WHERE submit_key_id = ?1 AND parent_job_uid = '' AND created_at >= ?2;";
+    sqlite3_stmt *st = NULL;
+    atlas_status s = atlas_db_prepare(db, SQL, &st, err);
+    if (s != ATLAS_OK) {
+        return s;
+    }
+    s = atlas_db_bind_text_opt(db, st, 1, key_id != NULL ? key_id : "", err);
+    if (s == ATLAS_OK) {
+        s = atlas_db_bind_text_opt(db, st, 2, utc_day_start != NULL ? utc_day_start : "", err);
+    }
+    if (s != ATLAS_OK) {
+        atlas_db_finish(db, st);
+        return s;
+    }
+    int64_t v = 0;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        v = sqlite3_column_int64(st, 0);
+    }
+    atlas_db_finish(db, st);
+    if (out != NULL) {
+        *out = v;
+    }
+    return ATLAS_OK;
 }
 
 atlas_status atlas_db_orch_artifacts(atlas_db *db, const char *job_uid, int64_t artifact_id,

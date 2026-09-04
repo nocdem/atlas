@@ -256,12 +256,12 @@ static void test_fresh_database_reaches_29_with_eight_tables(void) {
     T_OK(open_fresh(&fx, &db, &err), &err);
     T_OK(atlas_db_migrate(db, &err), &err);
 
-    /* Migration 30 (the T14 fix round) and migration 31 (A16's T2) both
-     * landed after this suite was written, so a fresh database now reaches
-     * 31, not 29 -- this suite is still about migration 29's own eight
-     * tables, which neither later migration touches. */
-    T_EQ_INT((int)ATLAS_SCHEMA_VERSION, 31);
-    T_EQ_INT(schema_of(db), 31);
+    /* Migrations 30, 31 (A16) and 32 (A14) all landed after this suite was
+     * written, so a fresh database now reaches 32, not 29 -- this suite is
+     * still about migration 29's own eight tables, which none of the later
+     * migrations touch. */
+    T_EQ_INT((int)ATLAS_SCHEMA_VERSION, 32);
+    T_EQ_INT(schema_of(db), 32);
 
     for (size_t i = 0; i < sizeof TABLES / sizeof TABLES[0]; i++) {
         T_CHECK_MSG(table_exists(db, TABLES[i]), "%s does not exist", TABLES[i]);

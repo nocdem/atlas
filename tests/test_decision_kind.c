@@ -395,6 +395,15 @@ static void wind_back_to_schema_12(env *e, atlas_err *err) {
         "DROP TABLE memory_claim_anchors;"
         "DROP TABLE memory_context_packs;"
         "DROP TABLE memory_trailer_bindings;"
+        /* A14 T2's index and columns on orch_jobs and orch_transitions, for
+         * the same reason every drop in this list exists: migration 32 adds
+         * them as ALTER TABLE ADD COLUMN, so a database wound back past 32
+         * must not still hold them or the re-run fails on a duplicate column.
+         * The index goes before the column because SQLite refuses to drop an
+         * indexed one. */
+        "DROP INDEX idx_orch_jobs_submit_key;"
+        "ALTER TABLE orch_jobs DROP COLUMN submit_key_id;"
+        "ALTER TABLE orch_transitions DROP COLUMN key_id;"
         "DELETE FROM schema_migrations WHERE version >= 13;";
 
     T_OK(atlas_db_exec_sql(e->db, BACK_DOCUMENTS, err), err);

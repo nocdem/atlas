@@ -621,6 +621,56 @@ static void test_the_sql_terminal_set_matches_the_c_one(void) {
                     c_active ? "active" : "terminal", sql_active == 1 ? "active" : "terminal");
         atlas_buf_free(&sql);
     }
+
+    /* Third spelling: `atlas_db_orch_remote_active_count`'s NOT IN predicate,
+     * proved as compiled rather than as a second literal. One job is seeded with
+     * a fixed `submit_key_id`; its state is walked through every member of ALL[];
+     * the function must agree with `atlas_orch_state_is_terminal` for each.
+     * This fails at link before the function exists -- the Step 2 failure shape. */
+    {
+        atlas_err err;
+        atlas_err_init(&err);
+        static const char INSERT_JOB[] =
+            "INSERT INTO orch_jobs"
+            "  (job_uid, spec_version, spec_digest, submitter_uid, repo_name,"
+            "   repo_identity_hash, source_commit, mode, driver, task_text,"
+            "   allowed_paths, validations, wall_timeout_ms, idle_timeout_ms,"
+            "   max_attempts, max_output_bytes, max_artifact_bytes, max_artifact_count,"
+            "   state, submit_key_id, created_at, created_ms, deadline_ms)"
+            "  VALUES ('jtermset00000000000000000000000000', 1,"
+            "          'digest00000000000000000000000000000000000000000000000000000000000', 1,"
+            "          'r', 'ih0000000000000000000000000000000000000000000000000000000000000',"
+            "          'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'direct', 'fake',"
+            "          'task', '', '', 60000, 30000, 3, 1048576, 1048576, 16,"
+            "          'QUEUED', '0123456789abcdef', '2026-09-04T00:00:00Z', 0, 86400000);";
+        T_OK(atlas_db_exec_sql(e.db, INSERT_JOB, &err), &err);
+
+        for (size_t i = 0; i < sizeof ALL / sizeof ALL[0]; i++) {
+            const char *name = atlas_orch_state_name(ALL[i]);
+            atlas_buf upd = ATLAS_BUF_INIT;
+            T_OK(atlas_buf_appendf(&upd, &err,
+                                   "UPDATE orch_jobs SET state = '%s'"
+                                   " WHERE job_uid = 'jtermset00000000000000000000000000';",
+                                   name),
+                 &err);
+            T_OK(atlas_db_exec_sql(e.db, atlas_buf_cstr(&upd), &err), &err);
+            atlas_buf_free(&upd);
+
+            int64_t count = -1;
+            T_OK(atlas_db_orch_remote_active_count(e.db, "0123456789abcdef", &count, &err), &err);
+            bool c_active = !atlas_orch_state_is_terminal(ALL[i]);
+            T_CHECK_MSG((count == 1) == c_active,
+                        "%s: remote_active_count=%lld but C says %s", name,
+                        (long long)count, c_active ? "active" : "terminal");
+        }
+
+        T_OK(atlas_db_exec_sql(
+                 e.db,
+                 "DELETE FROM orch_jobs WHERE job_uid = 'jtermset00000000000000000000000000';",
+                 &err),
+             &err);
+    }
+
     env_close(&e);
 }
 

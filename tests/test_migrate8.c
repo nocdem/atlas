@@ -290,8 +290,8 @@ static void test_a_schema_seven_database_reaches_eight_losslessly(void) {
 
     T_OK(atlas_db_migrate(db, &err), &err);
     T_EQ_INT(atlas_db_schema_version(db, &err), ATLAS_SCHEMA_VERSION);
-    /* Migration 31 (A16's T2) landed after this suite was written. */
-    T_EQ_INT(ATLAS_SCHEMA_VERSION, 31);
+    /* Migration 32 (A14's T2) landed after this suite was written. */
+    T_EQ_INT(ATLAS_SCHEMA_VERSION, 32);
 
     for (size_t i = 0; i < sizeof A8_TABLES / sizeof A8_TABLES[0]; i++) {
         T_CHECK_MSG(table_exists(db, A8_TABLES[i]), "migration 8 did not create %s",

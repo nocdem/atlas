@@ -214,6 +214,10 @@ set(ATLAS_TESTS
   # shape as test_migrate29 immediately above, and for the same reason it
   # keeps the same "unit" label rather than joining test_migrate7/8/9/10.
   test_migrate31
+  # A14 T2: migration 32 against a fixture database, no daemon -- the same
+  # shape as test_migrate31 immediately above, and for the same reason it
+  # keeps the same "unit" label rather than joining test_migrate7/8/9/10.
+  test_migrate32
   # T6: reading a registered source, against a real git repository -- tracked
   # and untracked content, a directory listing, a symlink refusal. Needs git
   # and the filesystem, so it is "integration" beside test_mirror_source
@@ -414,7 +418,7 @@ set_tests_properties(test_memory_reconcile_live PROPERTIES LABELS "daemon" TIMEO
   RUN_SERIAL TRUE)
 set_tests_properties(test_core test_safetext test_proc test_git_parse test_db test_datadir
   test_lock test_ipc test_migrate3 test_migrate_scanner_uid test_scanner_uid test_mirror test_unit
-  test_memory_source test_migrate29 test_migrate31 test_memory_extract
+  test_memory_source test_migrate29 test_migrate31 test_migrate32 test_memory_extract
   test_review_sheet
   PROPERTIES LABELS "unit")
 # The fixture suite forks children that run the binary, but needs no repository,

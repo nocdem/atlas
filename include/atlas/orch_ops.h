@@ -40,6 +40,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "atlas/apikey.h"
 #include "atlas/memory.h"
 #include "atlas/orch.h"
 #include "atlas/orch_memory.h"
@@ -450,6 +451,9 @@ typedef struct atlas_orch_job_view {
     char created_at[ATLAS_ORCH_TS_MAX];
     char terminal_at[ATLAS_ORCH_TS_MAX];
     bool cancel_requested;
+    /* A14. The selector of the credential that queued this job, or '' for a
+     * local job. Written once at submission and never updated. */
+    char submit_key_id[ATLAS_APIKEY_SELECTOR_HEX + 1u];
     /* UNTRUSTED_DATA. Safe-encoded by the renderer, labelled wherever it
      * reaches a model, and never placed in automatic context. */
     atlas_buf task_text;
@@ -591,6 +595,9 @@ typedef struct atlas_orch_list_row {
     char driver[ATLAS_ORCH_NAME_MAX + 1u];
     char created_at[ATLAS_ORCH_TS_MAX];
     int64_t attempts_started;
+    /* A14. The selector of the credential that queued this job, or '' for a
+     * local job. Written once at submission and never updated. */
+    char submit_key_id[ATLAS_APIKEY_SELECTOR_HEX + 1u];
 } atlas_orch_list_row;
 
 /* Row callbacks receive borrowed pointers valid only for the call, as
@@ -604,6 +611,33 @@ atlas_status atlas_db_orch_job_list(atlas_db *db, long long submitter_uid, int64
                                     int64_t limit, atlas_orch_list_cb cb, void *ud,
                                     int64_t *count_out, int64_t *cursor_out, bool *more_out,
                                     atlas_err *err);
+
+/* A14. Scoped to one remote credential. Lists jobs whose `submit_key_id`
+ * matches `key_id`, in id order, with the same bounded-pagination contract as
+ * `atlas_db_orch_job_list`. */
+atlas_status atlas_db_orch_job_list_by_key(atlas_db *db, const char *key_id, int64_t after_id,
+                                           int64_t limit, atlas_orch_list_cb cb, void *ud,
+                                           int64_t *count_out, int64_t *cursor_out,
+                                           bool *more_out, atlas_err *err);
+
+/* A14. Lists every job whose `submit_key_id` is non-empty (all remote
+ * submissions, across all credentials), for the operator. Same pagination
+ * contract. */
+atlas_status atlas_db_orch_job_list_remote(atlas_db *db, int64_t after_id, int64_t limit,
+                                           atlas_orch_list_cb cb, void *ud, int64_t *count_out,
+                                           int64_t *cursor_out, bool *more_out, atlas_err *err);
+
+/* A14. Active-job budget for a credential: counts rows in `orch_jobs` whose
+ * `submit_key_id = key_id` and state is not in the terminal set. */
+atlas_status atlas_db_orch_remote_active_count(atlas_db *db, const char *key_id, int64_t *out,
+                                               atlas_err *err);
+
+/* A14. Per-day root-submission budget for a credential: counts rows in
+ * `orch_jobs` whose `submit_key_id = key_id`, `parent_job_uid = ''`, and
+ * `created_at >= utc_day_start` (an ISO-8601 UTC midnight string). */
+atlas_status atlas_db_orch_remote_today_count(atlas_db *db, const char *key_id,
+                                              const char *utc_day_start, int64_t *out,
+                                              atlas_err *err);
 
 /* One artifact row, as a borrowed view valid only for the callback — the rule
  * every row callback in Atlas follows, because these point into a live

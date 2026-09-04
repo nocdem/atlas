@@ -33,6 +33,7 @@
 #include "atlas/limits.h"
 #include "atlas/memory.h"
 #include "atlas/orch_ops.h"
+#include "atlas/orch_remote.h"
 #include "atlas/sha256.h"
 #include "atlas/snapshot.h"
 #include "db_internal.h"
@@ -98,6 +99,8 @@ atlas_orch_op *atlas_orch_op_new(atlas_orch_op_kind kind) {
      * see I2 there -- so the default is inert for every case reached today;
      * it matters for the wire contract regardless. */
     op->touched_complete = false;
+    /* A14, T3. The bearer token the gateway forwards; wiped by `atlas_orch_op_free`. */
+    atlas_buf_init(&op->remote_token);
     return op;
 }
 
@@ -117,6 +120,21 @@ void atlas_orch_op_free(atlas_orch_op *op) {
     atlas_buf_free(&op->failure_detail);
     atlas_memory_pack_free(&op->context_pack);
     atlas_buf_free(&op->touched_paths);
+    /* A14, T3. Wipe the bearer token bytes before freeing, so the secret does
+     * not survive in a dangling allocation.  `atlas_buf_free` frees but does
+     * not zero; we wipe the full capacity (not just the used length) explicitly
+     * first.  On `atlas_decision_op_free`'s precedent in
+     * `src/decision/lifecycle.c`, which cites gateway.c's wipe of the login
+     * key.  `test_i_op_free_wipes_token` in `tests/test_orch_remote.c` proves
+     * the path runs (by inspection of this code rather than by reading freed
+     * memory). */
+    if (op->remote_token.data != NULL) {
+        volatile unsigned char *z = (volatile unsigned char *)op->remote_token.data;
+        for (size_t wi = 0; wi < op->remote_token.cap; wi++) {
+            z[wi] = 0;
+        }
+    }
+    atlas_buf_free(&op->remote_token);
     for (size_t i = 0; i < op->artifact_count; i++) {
         atlas_orch_artifact_free(&op->artifacts[i]);
     }
@@ -192,6 +210,9 @@ typedef struct job_row {
      * "this job belongs to no run" and never as "this job is its own root". */
     char run_uid[ATLAS_ORCH_RUN_UID_MAX];
     char parent_job_uid[ATLAS_ORCH_UID_MAX];
+    /* A14, T3. Empty for every job submitted before migration 32 (local jobs)
+     * or when no remote credential was verified. */
+    char submit_key_id[ATLAS_APIKEY_SELECTOR_HEX + 1u];
 } job_row;
 
 /* The two job lookups below select the same columns in the same order and share
@@ -249,6 +270,13 @@ static atlas_status job_fill(atlas_db *db, sqlite3_stmt *st, job_row *j, atlas_e
         s = atlas_db_col_copy(st, 21, j->parent_job_uid, sizeof(j->parent_job_uid),
                               "parent_job_uid", err);
     }
+    if (s == ATLAS_OK) {
+        /* A14, T3. Column 22: submit_key_id.  Empty for pre-migration-32 rows
+         * and for local submissions; `atlas_db_col_copy` treats a NULL column
+         * as an empty string, which is the right answer for both. */
+        s = atlas_db_col_copy(st, 22, j->submit_key_id, sizeof(j->submit_key_id),
+                              "submit_key_id", err);
+    }
     if (s != ATLAS_OK) {
         return s;
     }
@@ -262,7 +290,8 @@ static atlas_status job_by_uid(atlas_db *db, const char *uid, job_row *j, bool *
         "SELECT id, job_uid, state, repo_id, repo_name, repo_identity_hash, source_commit, mode,"
         "       driver, spec_digest, submitter_uid, attempts_started, max_attempts,"
         "       wall_timeout_ms, idle_timeout_ms, max_output_bytes, max_artifact_bytes,"
-        "       max_artifact_count, deadline_ms, cancel_requested, run_uid, parent_job_uid"
+        "       max_artifact_count, deadline_ms, cancel_requested, run_uid, parent_job_uid,"
+        "       submit_key_id"
         "  FROM orch_jobs WHERE job_uid = ?1;";
     *found = false;
     sqlite3_stmt *st = NULL;
@@ -291,7 +320,8 @@ static atlas_status job_by_id(atlas_db *db, int64_t id, job_row *j, bool *found,
         "SELECT id, job_uid, state, repo_id, repo_name, repo_identity_hash, source_commit, mode,"
         "       driver, spec_digest, submitter_uid, attempts_started, max_attempts,"
         "       wall_timeout_ms, idle_timeout_ms, max_output_bytes, max_artifact_bytes,"
-        "       max_artifact_count, deadline_ms, cancel_requested, run_uid, parent_job_uid"
+        "       max_artifact_count, deadline_ms, cancel_requested, run_uid, parent_job_uid,"
+        "       submit_key_id"
         "  FROM orch_jobs WHERE id = ?1;";
     *found = false;
     sqlite3_stmt *st = NULL;
@@ -1101,6 +1131,62 @@ static atlas_status op_submit(atlas_db *db, const atlas_orch_op *op, atlas_orch_
                               atlas_err *err) {
     const atlas_orch_spec *s = &op->spec;
 
+    /* A14, T3. Remote path: verify the bearer credential inside this
+     * transaction, before any other check.
+     *
+     * Verification is first — before shape checks, before the digest, before
+     * the idempotency lookup — because the namespaced idempotency key cannot be
+     * computed until the credential is verified (the namespace includes the
+     * key_id), and because a check that follows verification but runs before the
+     * insert is still inside the same transaction.
+     *
+     * On the local path (`remote_allowed_count == 0`) none of this block runs
+     * and the op takes exactly the path it took before A14, except that
+     * `spawn_follow_up` seeds `op->remote_key_id` with the parent's
+     * `submit_key_id` so a follow-up inherits it — we copy it into the local
+     * variable here so the INSERT at `?28` sees the inherited value. */
+    char remote_key_id[ATLAS_APIKEY_SELECTOR_HEX + 1u];
+    /* Seed from the op field (set by `spawn_follow_up` for follow-ups, zero for
+     * ordinary local submissions) rather than starting blind. */
+    (void)snprintf(remote_key_id, sizeof(remote_key_id), "%s", op->remote_key_id);
+    atlas_buf ns_key = ATLAS_BUF_INIT; /* namespaced idempotency key, if built */
+    atlas_status rmt_st = ATLAS_OK;
+
+    if (op->remote_allowed_count > 0) {
+        rmt_st = atlas_orch_remote_verify(db, &op->remote_token,
+                                          (const char (*)[ATLAS_APIKEY_SELECTOR_HEX + 1u])
+                                              op->remote_allowed_ids,
+                                          op->remote_allowed_count, remote_key_id, err);
+        if (rmt_st != ATLAS_OK) {
+            return rmt_st;
+        }
+
+        /* Build the namespaced key when the caller supplied a client fragment.
+         * The write point namespaces rather than using the raw client key, so
+         * two credentials with the same client key are two independent
+         * idempotency namespaces. */
+        if (op->remote_client_key[0] != '\0') {
+            rmt_st = atlas_orch_remote_idempotency_key(remote_key_id, op->remote_client_key,
+                                                       &ns_key, err);
+            if (rmt_st != ATLAS_OK) {
+                atlas_buf_free(&ns_key);
+                return rmt_st;
+            }
+        }
+    }
+
+    /* For the remote path, replace the spec's idempotency key pointer with the
+     * namespaced one for the remainder of op_submit.  `s` is a const pointer so
+     * we shadow it through a local copy that shares the spec's other fields but
+     * carries the namespaced key.  The shadow is never freed — only `ns_key` is,
+     * at the `done:` label — and the spec's own allocation is untouched. */
+    atlas_orch_spec shadow_spec;
+    if (ns_key.len > 0) {
+        shadow_spec = *s; /* shallow copy: all buf members aliased, not owned */
+        shadow_spec.idempotency_key = ns_key; /* override with namespaced key */
+        s = &shadow_spec;
+    }
+
     /* A11.1. A task that works in the registered repository's own tree declares
      * at least one verification gate, or it is not created.
      *
@@ -1213,6 +1299,70 @@ static atlas_status op_submit(atlas_db *db, const atlas_orch_op *op, atlas_orch_
         }
     }
 
+    /* A14, T3. Budget checks — only for a remote op and only when a new row
+     * will be created.  Duplicates do not spend budget: the idempotency lookup
+     * above returns early when the key resolves, so if we are still here the
+     * key is either absent or this is a local op.
+     *
+     * Follow-ups (parent_job_uid non-empty) count against the active budget but
+     * NOT against the daily budget, because they are continuations of work that
+     * was already counted on submission. */
+    if (op->remote_allowed_count > 0 && remote_key_id[0] != '\0') {
+        /* Active budget: count non-terminal rows for this key. */
+        int64_t active_count = 0;
+        st = atlas_db_orch_remote_active_count(db, remote_key_id, &active_count, err);
+        if (st != ATLAS_OK) {
+            atlas_buf_free(&ns_key);
+            return st;
+        }
+        if (active_count >= op->remote_max_active) {
+            atlas_status bs = atlas_err_set(
+                err, ATLAS_ERR_USAGE,
+                "credential %s already has %lld active remote job(s), which is its bound of %lld;"
+                " it takes no further one until one of them ends",
+                remote_key_id, (long long)active_count, (long long)op->remote_max_active);
+            atlas_buf_free(&ns_key);
+            return bs;
+        }
+
+        /* Daily budget: count root submissions today for this key (UTC). */
+        if (s->parent_job_uid.len == 0) {
+            /* Derive the UTC midnight string from the current wall clock.
+             * `atlas_now_iso8601` emits the full ISO-8601 timestamp; the first
+             * 10 chars are the YYYY-MM-DD date, and appending "T00:00:00Z"
+             * gives the day's lexicographic floor for a >= comparison.
+             *
+             * If `atlas_now_iso8601` emits fractional seconds (it does not —
+             * it emits "YYYY-MM-DDTHH:MM:SSZ"), this comparison would miss the
+             * first second of every day.  This is a stated cost; the
+             * implementation is correct for the format produced. */
+            char now_buf[ATLAS_TS_MAX];
+            atlas_now_iso8601(now_buf, sizeof(now_buf));
+            char day_start[32];
+            /* Copy the date part (10 chars) and append midnight UTC. */
+            memset(day_start, 0, sizeof(day_start));
+            memcpy(day_start, now_buf, 10u);
+            memcpy(day_start + 10u, "T00:00:00Z", 10u);
+
+            int64_t today_count = 0;
+            st = atlas_db_orch_remote_today_count(db, remote_key_id, day_start, &today_count,
+                                                  err);
+            if (st != ATLAS_OK) {
+                atlas_buf_free(&ns_key);
+                return st;
+            }
+            if (today_count >= op->remote_max_per_day) {
+                atlas_status bs = atlas_err_set(
+                    err, ATLAS_ERR_USAGE,
+                    "credential %s has submitted %lld job(s) today (UTC), which is its bound of"
+                    " %lld; it takes no further one until tomorrow",
+                    remote_key_id, (long long)today_count, (long long)op->remote_max_per_day);
+                atlas_buf_free(&ns_key);
+                return bs;
+            }
+        }
+    }
+
     atlas_buf uid = ATLAS_BUF_INIT;
     atlas_buf paths = ATLAS_BUF_INIT;
     atlas_buf vals = ATLAS_BUF_INIT;
@@ -1258,9 +1408,9 @@ static atlas_status op_submit(atlas_db *db, const atlas_orch_op *op, atlas_orch_
             "  allowed_paths, validations, wall_timeout_ms, idle_timeout_ms, max_attempts,"
             "  max_output_bytes, max_artifact_bytes, max_artifact_count, correlation,"
             "  parent_job_uid, idempotency_key, state, created_at, created_ms, deadline_ms,"
-            "  run_uid, run_slot)"
+            "  run_uid, run_slot, submit_key_id)"
             " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,"
-            "        ?21,?22,'QUEUED',?23,?24,?25,?26,?27);";
+            "        ?21,?22,'QUEUED',?23,?24,?25,?26,?27,?28);";
         sqlite3_stmt *q = NULL;
         st = atlas_db_prepare(db, INS, &q, err);
         if (st != ATLAS_OK) {
@@ -1314,7 +1464,21 @@ static atlas_status op_submit(atlas_db *db, const atlas_orch_op *op, atlas_orch_
              * `(run_uid, run_slot)` is what refuses a second task that somehow
              * reached here believing the same number was free. */
             (void)sqlite3_bind_int64(q, 27, run_slot);
-            st = atlas_db_step_done(db, q, err);
+            /* A14, T3. The verified key id, or empty for a local submission.
+             * For a gateway submission, `remote_key_id` was populated by
+             * `atlas_orch_remote_verify` above.  For a follow-up,
+             * `remote_key_id` was seeded from `op->remote_key_id`, which
+             * `spawn_follow_up` copied from the parent's `submit_key_id`.
+             * For any other local submission, `op->remote_key_id` is zero
+             * (set by calloc via `atlas_orch_op_new`), so `remote_key_id`
+             * is zero and the binding stores the empty string. */
+            st = atlas_db_bind_text_opt(db, q, 28,
+                                        remote_key_id[0] != '\0' ? remote_key_id : "", err);
+            if (st == ATLAS_OK) {
+                st = atlas_db_step_done(db, q, err);
+            } else {
+                atlas_db_finish(db, q);
+            }
         } else {
             atlas_db_finish(db, q);
         }
@@ -1363,12 +1527,35 @@ static atlas_status op_submit(atlas_db *db, const atlas_orch_op *op, atlas_orch_
          * none — which every request from the IPC edge does. A follow-up task
          * is created by Atlas rather than by a client and its first ledger row
          * says ATLAS, because reading it later as a submission somebody made is
-         * exactly the confusion the ledger exists to prevent. */
+         * exactly the confusion the ledger exists to prevent.
+         *
+         * A14, T3. For a remote root submission, the ledger detail is the
+         * frozen sentence that records the channel and the credential, not the
+         * person behind it. For a local submission or a follow-up, the detail
+         * is the spec digest as before ("" key_id, digest detail). */
+        char rmt_detail[256];
+        const char *detail_str = digest;
+        const char *key_id_str = "";
+        if (remote_key_id[0] != '\0' && s->parent_job_uid.len == 0) {
+            /* Root remote submission: frozen detail sentence. */
+            (void)snprintf(rmt_detail, sizeof(rmt_detail),
+                           "submitted through the Atlas gateway with credential %s; this records"
+                           " the channel and the credential, not which person or program"
+                           " presented it",
+                           remote_key_id);
+            detail_str = rmt_detail;
+            key_id_str = remote_key_id;
+        } else if (remote_key_id[0] != '\0') {
+            /* Follow-up of a remote submission: record the key but keep the
+             * digest as detail — "submitted through the gateway" would be false
+             * for Atlas-generated follow-up tasks. */
+            key_id_str = remote_key_id;
+        }
         st = record_transition(db, out->job_id, 0, ATLAS_ORCH_STATE_UNKNOWN,
                                ATLAS_ORCH_STATE_QUEUED, ATLAS_ORCH_REASON_SUBMITTED,
                                op->actor != ATLAS_ORCH_ACTOR_UNKNOWN ? op->actor
                                                                      : ATLAS_ORCH_ACTOR_CLIENT,
-                               op->peer_uid, digest, "", &seq, err);
+                               op->peer_uid, detail_str, key_id_str, &seq, err);
         if (st != ATLAS_OK) {
             goto done;
         }
@@ -1393,11 +1580,40 @@ static atlas_status op_submit(atlas_db *db, const atlas_orch_op *op, atlas_orch_
         st = atlas_buf_set(&out->run_uid, run_uid.data, run_uid.len, err);
     }
 
+    /* A14, T3. Fill the result's key_id and the two post-insert budget counts.
+     * These are reads inside the same transaction as the insert, so they include
+     * the row just created.  On a local op or after a budget-refused early
+     * return, `remote_key_id[0]` is '\0' and we skip this. */
+    if (st == ATLAS_OK && remote_key_id[0] != '\0') {
+        (void)snprintf(out->key_id, sizeof(out->key_id), "%s", remote_key_id);
+        int64_t active_after = 0;
+        st = atlas_db_orch_remote_active_count(db, remote_key_id, &active_after, err);
+        if (st == ATLAS_OK) {
+            out->remote_active = active_after;
+            /* Daily count only makes sense for root submissions. */
+            if (s->parent_job_uid.len == 0) {
+                char now_buf2[ATLAS_TS_MAX];
+                atlas_now_iso8601(now_buf2, sizeof(now_buf2));
+                char day_start2[32];
+                memset(day_start2, 0, sizeof(day_start2));
+                memcpy(day_start2, now_buf2, 10u);
+                memcpy(day_start2 + 10u, "T00:00:00Z", 10u);
+                int64_t today_after = 0;
+                st = atlas_db_orch_remote_today_count(db, remote_key_id, day_start2, &today_after,
+                                                      err);
+                if (st == ATLAS_OK) {
+                    out->remote_today = today_after;
+                }
+            }
+        }
+    }
+
 done:
     atlas_buf_free(&uid);
     atlas_buf_free(&run_uid);
     atlas_buf_free(&paths);
     atlas_buf_free(&vals);
+    atlas_buf_free(&ns_key);
     return st;
 }
 
@@ -1432,11 +1648,59 @@ static atlas_status op_cancel(atlas_db *db, const atlas_orch_op *op, atlas_orch_
     if (!found) {
         return atlas_err_set(err, ATLAS_ERR_USAGE, "no such job");
     }
-    /* A submitter may cancel its own jobs. Another client's job is reported as
-     * absent rather than as forbidden: whether a job exists is itself
-     * information, and a caller who may not act on it need not learn it. */
-    if (j.submitter_uid != op->peer_uid) {
+    /* A14, T3. Ownership check for cancel, in this order:
+     *
+     * 1. A remote cancel (op->remote_allowed_count > 0): verify the credential
+     *    inside this transaction and refuse "no such job" unless the verified
+     *    key_id matches the job's submit_key_id.  The "did not authenticate"
+     *    refusal sentence is frozen; we use it here even though the context is
+     *    cancellation rather than submission, because there is no
+     *    cancel-flavoured frozen sentence (plan gap, reported).
+     *
+     * 2. An operator cancel (op->peer_is_operator && job has a key): allow.
+     *    The operator's uid is already trusted by SO_PEERCRED; this flag is
+     *    set only by the gateway after checking the root-owned policy.
+     *
+     * 3. Otherwise: the existing submitter_uid check. */
+    if (op->remote_allowed_count > 0) {
+        /* Remote cancel: verify the credential. */
+        char cancel_key_id[ATLAS_APIKEY_SELECTOR_HEX + 1u];
+        cancel_key_id[0] = '\0';
+        s = atlas_orch_remote_verify(db, &op->remote_token,
+                                     (const char (*)[ATLAS_APIKEY_SELECTOR_HEX + 1u])
+                                         op->remote_allowed_ids,
+                                     op->remote_allowed_count, cancel_key_id, err);
+        if (s != ATLAS_OK) {
+            /* Verification failure is "no such job": we do not reveal that the
+             * job exists to a caller whose credential did not check out. */
+            (void)s;
+            return atlas_err_set(err, ATLAS_ERR_USAGE, "no such job");
+        }
+        if (j.submit_key_id[0] == '\0' || strcmp(cancel_key_id, j.submit_key_id) != 0) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE, "no such job");
+        }
+    } else if (op->peer_is_operator && j.submit_key_id[0] != '\0') {
+        /* Operator cancelling a remote job: allowed unconditionally. */
+        (void)0;
+    } else if (j.submit_key_id[0] != '\0') {
+        /* A14, T3. The job was submitted remotely (it has a submit_key_id) but
+         * this cancel carries no credential and is not from an operator.  The
+         * dispatch says "the gateway holds no authority of its own — it carries
+         * a bearer credential it received; the daemon verifies that credential
+         * itself."  Without this check, a process running as the gateway uid
+         * could cancel any keyed job purely on uid equality (submitter_uid is
+         * the gateway's SO_PEERCRED uid for every remote job), which is exactly
+         * the authority the gateway is not supposed to hold.
+         * Refuse as "no such job" to avoid disclosing that the job exists. */
         return atlas_err_set(err, ATLAS_ERR_USAGE, "no such job");
+    } else {
+        /* Local cancel: the existing submitter_uid check.
+         * A submitter may cancel its own jobs. Another client's job is reported
+         * as absent rather than as forbidden: whether a job exists is itself
+         * information, and a caller who may not act on it need not learn it. */
+        if (j.submitter_uid != op->peer_uid) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE, "no such job");
+        }
     }
     out->job_id = j.id;
     s = atlas_buf_set_str(&out->job_uid, j.uid, err);
@@ -2438,6 +2702,16 @@ static atlas_status spawn_follow_up(atlas_db *db, const atlas_orch_op *op, const
         child->peer_uid = parent->submitter_uid;
         child->repo_id = parent->repo_id;
         child->now_ms = op->now_ms;
+        /* A14, T3. A follow-up inherits the parent's `submit_key_id`.  The
+         * child op is local (`remote_allowed_count == 0`), so no credential
+         * re-verification happens.  `op_submit` seeds its local `remote_key_id`
+         * variable from `op->remote_key_id` before the verify block runs, so
+         * what we write here is what ends up in column 28 (`submit_key_id`)
+         * of the child row.  No IPC method ever sets `remote_key_id` on a
+         * local op — `calloc` zeroes it — so it is safe to carry the parent's
+         * key_id here without risking an unintended override. */
+        (void)snprintf(child->remote_key_id, sizeof(child->remote_key_id), "%s",
+                       parent->submit_key_id);
         cs->spec_version = pspec.spec_version;
         cs->submitter_uid = parent->submitter_uid;
         s = atlas_buf_set_str(&cs->repo_name, parent->repo_name, err);

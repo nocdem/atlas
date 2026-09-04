@@ -3114,6 +3114,13 @@ atlas_status atlas_writer_orch(atlas_writer *w, atlas_orch_op *op, int timeout_m
         memcpy(result->memory_digest, j->orch_result.memory_digest,
                sizeof(result->memory_digest));
         memcpy(result->spec_digest, j->orch_result.spec_digest, sizeof(result->spec_digest));
+        /* A14, T3. The verified credential id and the two post-insert budget
+         * counts.  Scalar fields copied here for the same reason every other
+         * scalar is: a field missing from this block reaches a socket caller
+         * as an absent key however carefully the write point filled it in. */
+        memcpy(result->key_id, j->orch_result.key_id, sizeof(result->key_id));
+        result->remote_active = j->orch_result.remote_active;
+        result->remote_today = j->orch_result.remote_today;
         struct {
             atlas_buf *to;
             const atlas_buf *from;

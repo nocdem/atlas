@@ -178,6 +178,8 @@ set(ATLAS_TESTS
   test_a7_authority
   test_a71_syspolicy
   # --- A8: the durable orchestration control plane ---
+  # A14, T3: the remote submission write point — verification, budgets, namespace.
+  test_orch_remote
   test_orch_model
   test_orch_lifecycle
   test_orch_run
@@ -475,6 +477,10 @@ set_tests_properties(test_decision_operator PROPERTIES LABELS "integration")
 # and database, so "integration" rather than "unit", on
 # test_decision_operator's own precedent immediately above.
 set_tests_properties(test_decision_remote PROPERTIES LABELS "integration")
+# A14, T3. Same shape: builds a real repository, mints real API keys through
+# the CLI, and drives atlas_orch_apply directly at the write point -- a real
+# repository and database, no daemon, so "integration" beside test_decision_remote.
+set_tests_properties(test_orch_remote PROPERTIES LABELS "integration")
 # A15 T4. The walker's `--check` half builds a real repository and a real
 # database through the binary (repo add, scan, propose, revise), then calls
 # atlas_service_review_apply directly in process -- no pseudo-terminal, but

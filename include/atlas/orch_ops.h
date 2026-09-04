@@ -41,6 +41,7 @@
 #include <stdint.h>
 
 #include "atlas/apikey.h"
+#include "atlas/gwpolicy.h" /* ATLAS_GWPOLICY_MAX_SUBMIT_KEYS */
 #include "atlas/memory.h"
 #include "atlas/orch.h"
 #include "atlas/orch_memory.h"
@@ -287,6 +288,38 @@ typedef struct atlas_orch_op {
      * parallelism is fixed at its root, and a flag that was quietly dropped
      * reads exactly like one that was honoured. */
     int64_t run_max_parallel;
+
+    /* A14, T3. SUBMIT remote path only.
+     *
+     * `remote_token` is the bearer token the gateway received and forwarded.
+     * `atlas_orch_op_free` wipes its bytes before freeing, so the secret never
+     * outlives the operation.  `remote_key_id` is filled by the write point
+     * after `atlas_orch_remote_verify` succeeds — it is a result, not an input,
+     * and is zero before verification.
+     *
+     * `remote_client_key` is the caller's idempotency fragment; the write point
+     * namespaces it into `remote.<key_id>.<client>` and stores that as the row's
+     * idempotency key.  Empty means the caller did not supply one.
+     *
+     * `remote_allowed_ids` and `remote_allowed_count` are the submit-key ids the
+     * root-owned policy names; the gateway sets them from the parsed policy.
+     * When `remote_allowed_count == 0` the op is local and this whole block is
+     * unused.
+     *
+     * `remote_max_active` and `remote_max_per_day` are the per-credential
+     * budgets from the policy; zero falls through as always-refused (>= 0),
+     * which is fail-closed and deliberate.
+     *
+     * `peer_is_operator` allows an operator to cancel a remote job without
+     * holding the job's credential. */
+    atlas_buf remote_token;
+    char remote_key_id[ATLAS_APIKEY_SELECTOR_HEX + 1u];
+    char remote_client_key[ATLAS_ORCH_REMOTE_CLIENT_KEY_MAX + 1u];
+    char remote_allowed_ids[ATLAS_GWPOLICY_MAX_SUBMIT_KEYS][ATLAS_APIKEY_SELECTOR_HEX + 1u];
+    size_t remote_allowed_count;
+    int64_t remote_max_active;
+    int64_t remote_max_per_day;
+    bool peer_is_operator;
 } atlas_orch_op;
 
 atlas_orch_op *atlas_orch_op_new(atlas_orch_op_kind kind);
@@ -401,6 +434,19 @@ typedef struct atlas_orch_result {
      * machine under sustained contention, which an operator should be able to
      * see without reading the lease table. */
     int64_t deferred;
+
+    /* A14, T3. SUBMIT remote path only.
+     *
+     * `key_id` is the verified credential's bare 16-hex selector.  Empty on a
+     * local submit, on a duplicate (where no new row is created), and before
+     * verification runs.
+     *
+     * `remote_active` and `remote_today` are the non-terminal and root-today
+     * counts *after* this submission (i.e., including the row just created).
+     * Zero on a local submit and on a duplicate. */
+    char key_id[ATLAS_APIKEY_SELECTOR_HEX + 1u];
+    int64_t remote_active;
+    int64_t remote_today;
 } atlas_orch_result;
 
 void atlas_orch_result_init(atlas_orch_result *r);

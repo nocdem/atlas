@@ -384,10 +384,18 @@ would still demand the typed hash, but the queue would have become a way to put 
 in the operator's mouth. So the queue lives in the operator's browser — `localStorage`
 under the gateway's origin — and reaches the terminal as text the operator copies. The
 **review sheet** is that text: a plain ASCII list of what the operator said in the
-browser, one line per record, in a grammar (§Frozen formats) that has **no field for a
-confirmation**, so a sheet is not a capability and cannot be turned into one by editing
-it. It is the browser-side mirror of `tests/test_decision_mcp.c:115-140`'s rule that no
-schema declares a confirmation, and T3's grammar test says so in the same shape.
+browser, one line per record, in a grammar (§Frozen formats) whose fifth field is the
+**public prefix** the operator will type and which has **no field the walker reads in
+place of that typing on `/dev/tty`** — so a sheet is not a capability and cannot be
+turned into one by editing it. It is the browser-side mirror of
+`tests/test_decision_mcp.c:115-140`'s rule that no schema declares a confirmation, and
+T3's grammar test says so in the same shape.
+
+  *(Amended 2026-09-04, with the §Authority argument bullet below and for the same
+  reason: this said "no field for a confirmation", and the confirmation an operator
+  types* is *the prefix the sheet carries. The security claim is unchanged — the prefix
+  is public and typing it proves nothing about who typed it — and the corrected wording
+  is what makes it exact.)*
 
 Cost, stated: one browser, one origin; a cleared site store empties the queue; nothing
 about a sheet is durable evidence of anything.
@@ -737,9 +745,12 @@ this season's own.
   process is evidence that a person acted. What is true is that the sheet carries the
   public prefix the operator will type and has **no field the walker reads in place of
   that typing on `/dev/tty`**. The four source comments and the three documents carrying
-  the old sentence were corrected; the one at line 937 below is left alone deliberately,
-  because it is the subject line of a commit that exists in git history and the plan
-  should not disagree with the ledger of what was done.
+  the old sentence were corrected; the one in T3's Step 5 below is left alone
+  deliberately, because it is the subject line of commit `cf14c87`, which exists in git
+  history, and the plan should not disagree with the ledger of what was done. It is named
+  by its step rather than by a line number, because this amendment's own insertion moved
+  that line and a number would have been stale the moment it was written — which is the
+  reference-drift this season spent a whole review round on.
 - **The sheet is a file argument, never standard input.** Both standard streams must be
   terminals (`terminal.c:29`); a piped sheet is refused before anything is minted.
 - **The walker loops `atlas_service_decision_confirm` with the reviewed revision pinned
@@ -1259,7 +1270,12 @@ atlas_status (*review_entry)(atlas_renderer *r, const atlas_review_outcome *o, a
       is too), and the same line under `CLAUDE.md`'s "Exit codes (stable contract)"
       (`CLAUDE.md:1617`).
 - [ ] **Step 7: `SECURITY.md`** — one paragraph under the A4 section: a review sheet is a
-      list, not a capability; it has no confirmation field; the channel is unchanged.
+      list, not a capability; its fifth field is the public prefix the operator will type
+      and it carries no field read in place of that typing; the channel is unchanged.
+      *(Amended 2026-09-04: this instruction said "it has no confirmation field", which
+      the whole-branch review established is false of what the sheet holds. The
+      instruction is corrected rather than left standing, because a checklist is followed
+      rather than read.)*
       **`README.md`** — the command in the usage list.
 - [ ] **Step 8: `CLAUDE.md`** — the season paragraph at the top in the register the
       others use, the table row, the one-line rules under "### A15 — the review

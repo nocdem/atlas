@@ -1617,6 +1617,14 @@ static void test_the_review_parameters_reach_the_daemon(void) {
         T_EQ_INT(run_cli(&e, scan, 2, &out, &err), 0);
     }
     {
+        /* (c)'s `code/impact?symbol=main` reads the structural (A3) index,
+         * which `scan` does not build itself -- it only schedules the
+         * daemon's background pass. Run `code sync` explicitly rather than
+         * trust that pass to have finished before the later query lands. */
+        const char *sync[] = {"code", "sync", "proj"};
+        T_EQ_INT(run_cli(&e, sync, 3, &out, &err), 0);
+    }
+    {
         const char *scopes[] = {"repo:read", "decisions:read", "impact:read"};
         const char *args[16];
         size_t k = 0;

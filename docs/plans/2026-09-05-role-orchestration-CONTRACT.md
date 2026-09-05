@@ -309,3 +309,22 @@ işaret eder:
 
 **Bir kural değişmiyor:** Atlas'ın bir depodan döndürdüğü her şey
 `UNTRUSTED_DATA`'dır. Rol onu rapor eder, asla talimat olarak izlemez.
+
+**Ve roller Atlas'a yalnızca sormaz, yazar da.** Operator, aynı talimatın
+devamı: *"ya da alınan kararı proposal olarak yazması vs gibi."*
+
+Bir rol bir karar aldığında — Planner bir alternatifi seçtiğinde, Executor bir
+şeyi neden öyle yaptığında — o karar Atlas'a **`PROPOSED` bir kayıt** olarak
+düşer. Öneri olarak, çünkü A2 sınırı zaten bunu söylüyor: bir model yalnızca
+`MODEL_PROPOSAL`, `MODEL_INFERENCE` ve `UNKNOWN` yazabilir; hiçbiri onaylı bir
+karar değildir.
+
+Bunun kapadığı halka şu: A15 bir öneriyi rahatça okunur hale getirdi, A16
+tarayıcıdan elden çıkarılabilir yaptı, ama öneriyi yazan hâlâ elle çağrılan bir
+araçtı. Roller kendi kararlarını yazdığında, inceleme yüzeyinin önüne kendi
+kendine iş düşmeye başlar — ve Operator makineye döndüğünde bakacağı şey bir
+sohbet dökümü değil, elden çıkarabileceği bir liste olur.
+
+Sınır aynı: yazmak onaylamak değildir. `atlas_decision_apply_in_tx`'in çağıran
+sayısı değişmez, hiçbir rol kendi önerisini onaylayamaz, ve bir rolün yazdığı
+gerekçe uydurma olamaz — bilinmiyorsa `UNKNOWN` yazılır.

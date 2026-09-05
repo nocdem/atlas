@@ -311,3 +311,73 @@ before T1 was dispatched, on 2026-09-04.
 ## 6. What execution established that the plan did not claim
 
 *(T11 records go here after the live acceptance.)*
+
+## 7. The live acceptance, 2026-09-05 — what one pass observed
+
+Run on this machine, gateway at `192.168.0.198:8799`, `tls_mode = NONE`, policy
+as row 3 answered it: two credentials named (`key_b2578f48143c06d3`, the
+tunnel's; `key_01364e94e1dcbad4`, minted `--no-scopes` for the browser),
+`mode = patch`, gate floor `make`, `max_attempts = 1`, `max_active = 2`,
+`max_per_day = 6`, and `operator_accepts_cleartext_submission = yes`.
+**Nothing about one live pass is a general result**; every line below is an
+observation of one run.
+
+**The mechanism the season exists for worked.** A `POST` to
+`/api/v1/job/submit` carrying only a bearer credential queued a job: the
+response named the job, its run, `driver claude`, `key_id 01364e94e1dcbad4`
+and the budget it had just spent (`active 1/2, today 1/6`). `atlas job list
+--remote` at the terminal showed the same row with `credential:
+key_01364e94e1dcbad4` beside it. A second submission under the same
+idempotency key returned the same job with `duplicate: true` and wrote no
+second row. A bearer that authenticated as no credential was refused `401`
+before any daemon call. The gateway acquired nothing: the row records the
+kernel's peer uid *and* the credential the daemon verified for itself.
+
+**Four observations the tests could not have made, each a real interaction
+this deployment has and the suite does not:**
+
+1. **A submission lands during semantic maintenance; the dispatcher's next
+   write may not.** Two deploys in succession left the daemon minutes deep in
+   an unbounded semantic pass. A9.2.7's yield let `job.remote_submit` through
+   — the job was queued — and then refused `dispatch.heartbeat` on one attempt
+   and `dispatch.snapshot.open` on another. With `max_attempts = 1` a refused
+   dispatcher write is a dead job: two free-driver jobs ended `FAILED` this
+   way, ten minutes apart, for a reason that has nothing to do with the task
+   they carried. The bound is doing what it was set to do; what this measured
+   is that **`max_attempts = 1` and an unbounded writer are a bad pair**, and an
+   operator choosing 1 for cost is also choosing "a busy daemon kills my job".
+2. **The gate floor `make` cannot run under the system dispatcher at all.**
+   `/etc/systemd/system/atlas-dispatcher.service` carries
+   `SystemCallFilter=~@privileged`; GNU make calls `setresuid` (syscall 117),
+   the kernel answers `SIGSYS`, and `make` dies with "Bad system call" before
+   cmake has finished. Every job with a `make` gate leased by uid 993 fails its
+   gate for this reason, and has since that unit was hardened — A14 only made
+   it visible, because A14 is the first thing that ran a gated job through that
+   dispatcher on this machine in a while. The model dispatcher
+   (`~/.config/systemd/user/atlas-model-dispatcher.service`, uid 1000) carries
+   no such filter, which is why the real job below reached its worker at all.
+   Recorded in `docs/backlog.md`; the fix is one re-allowed syscall and it is
+   not this season's.
+3. **The one real job timed out with its work finished and unclaimed.** A
+   `claude`-driver job against a `docs/backlog.md` item ran 15 minutes and
+   ended `TIMED_OUT` — `max_wall_timeout_ms = 900000` exactly. The worker had
+   made the change and was **running the repository's own non-daemon test
+   suite** when the wall clock killed it (`exit 137`); that suite alone is
+   about five minutes here, on top of a build. The workspace still held four
+   modified files, so the spend produced a patch that Atlas never accepted:
+   the gate never ran, no artifact was packaged, and the operator read the
+   diff out of the workspace by hand. **A worker that verifies as thoroughly
+   as this repository asks does not fit in fifteen minutes**, and `patch` mode
+   plus `max_attempts = 1` gives it no second chance.
+4. **A killed worker reports no cost.** `usage` came back `present: true,
+   has_cost: false`, and the model's own final message — the one carrying
+   `total_cost_usd` — is what the kill prevented. So a timed-out job spends
+   money that no Atlas surface can name afterwards. The provider's own billing
+   is the only record, and `atlas job get` saying nothing about cost must not
+   be read as "nothing was spent".
+
+**What was not exercised.** No submission was made from a phone browser or
+from the external model over `/mcp` in this pass; both were made with the same
+credentials from this host, which tests the routes and the write point and
+says nothing about the two clients. The Jobs view was not opened. Those
+remain to be observed.

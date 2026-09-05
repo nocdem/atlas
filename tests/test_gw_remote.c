@@ -550,10 +550,15 @@ static void test_no_scopes_mints_a_disposal_credential_through_the_daemon(void) 
     const char *rotate[] = {"api-key", "rotate", disposal_id, "--label", "disposal",
                             "--no-scopes"};
     T_EQ_INT(run_cli_ex(&e, rotate, 6, true, &out, &err), 0);
-    T_CHECK_MSG(
-        strstr(atlas_buf_cstr(&out), "the policy line remote_dispose_key must now name") != NULL,
-        "the daemon-routed --no-scopes rotation did not print the reminder: %s",
-        atlas_buf_cstr(&out));
+    /* A14 amended this sentence: a rotated `--no-scopes` credential could have
+     * been named by either root-owned line, so the reminder names both rather
+     * than only the disposal one. The assertion follows the wording rather than
+     * being loosened to match anything. */
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&out),
+                       "the policy line that names the previous key (remote_dispose_key or "
+                       "a remote_submit_key) must now name") != NULL,
+                "the daemon-routed --no-scopes rotation did not print the reminder: %s",
+                atlas_buf_cstr(&out));
 
     /* The CLI's own pre-check refuses a bare `create` before `apikey_needs_daemon`
      * is even consulted (`cli.c`'s "at least one --scope is required, or

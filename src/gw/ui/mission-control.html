@@ -13,21 +13,38 @@
   --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
 }
 @media (prefers-color-scheme:light){
-  :root{--bg:#f6f7f9;--panel:#fff;--line:#dde2e9;--ink:#1a2029;--dim:#5d6878;--accent:#1c5fd0;}
+  /* The dark console is the designed one; this is the same console under a
+     lamp, not a second design. Every token is restated so the light build has
+     its own contrast rather than inheriting three dark values by accident --
+     the status colours in particular, which were legible on #0e1116 and washed
+     out on white. */
+  :root{
+    --bg:#eef0f4; --panel:#fff; --line:#d3d9e2; --ink:#141a22; --dim:#54606f;
+    --accent:#1550c0; --ok:#0f7a5a; --warn:#8a5a08; --bad:#b3271e; --unknown:#5a4bb5;
+  }
 }
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--ink);font:13px/1.45 var(--mono)}
 a{color:var(--accent)}
 header{display:flex;align-items:center;gap:16px;padding:8px 14px;border-bottom:1px solid var(--line);background:var(--panel);position:sticky;top:0;z-index:5}
+/* The tab row is the navigation; it stays on one line and scrolls if it must,
+   because a second row of tabs under the wordmark reads as a second toolbar. */
+nav{overflow-x:auto;scrollbar-width:thin}
+nav::-webkit-scrollbar{height:0}
 header h1{font-size:13px;margin:0;letter-spacing:.06em;text-transform:uppercase;color:var(--dim)}
-nav{display:flex;gap:2px;flex-wrap:wrap}
+nav{display:flex;gap:2px;flex-wrap:nowrap}
 nav button{background:transparent;border:1px solid transparent;color:var(--dim);padding:4px 10px;font:inherit;cursor:pointer;border-radius:3px}
 nav button:hover{color:var(--ink);border-color:var(--line)}
 nav button[aria-current="true"]{color:var(--ink);background:var(--bg);border-color:var(--line)}
-#who{margin-left:auto;color:var(--dim);display:flex;gap:10px;align-items:center}
+#who{margin-left:auto;color:var(--dim);display:flex;gap:10px;align-items:center;flex:0 0 auto}
+#principal{white-space:nowrap}
 main{padding:14px;max-width:1500px}
 section[hidden]{display:none}
-.grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}
+/* 300px let four panels sit side by side on a 1440px screen and gave each of
+   them about 340px, which is narrower than one line of the content they hold:
+   every table was clipped at its third column. A wider floor means fewer, more
+   readable columns on a laptop and still four on a large display. */
+.grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(420px,1fr))}
 .panel{background:var(--panel);border:1px solid var(--line);border-radius:4px}
 .panel>h2{margin:0;padding:7px 10px;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--dim);border-bottom:1px solid var(--line);font-weight:600}
 .panel>div{padding:10px;overflow-x:auto}
@@ -69,6 +86,47 @@ code{background:rgba(127,127,127,.12);padding:0 4px;border-radius:2px}
 .bar{height:4px;background:var(--line);border-radius:2px;overflow:hidden}
 .bar>i{display:block;height:100%;background:var(--accent)}
 .untrusted{border-left:2px solid var(--warn);padding-left:8px}
+
+/* Prose in a console is still prose: a line that runs the full width of a
+   1500px page is one the eye loses its place in. Every explanatory paragraph
+   is capped at a readable measure; tables and key/value grids are not, because
+   their line length is the data's, not the writer's. */
+.panel p, .lead{max-width:74ch}
+.lead{color:var(--dim);margin:0 0 12px}
+
+/* A warning that sits in a run of paragraphs and differs only in colour is a
+   paragraph. This one is a block a reader has to pass rather than read past. */
+.callout{max-width:74ch;border:1px solid var(--warn);border-left-width:3px;border-radius:3px;
+  background:rgba(232,180,81,.09);color:var(--ink);padding:8px 10px;margin:12px 0}
+
+/* Long hex identifiers: end them with an ellipsis and carry the whole value in
+   `title`, rather than letting the panel's edge cut them at whatever column it
+   happens to fall on -- a clipped id and a short id look identical. */
+td.id{max-width:26ch;overflow:hidden;text-overflow:ellipsis}
+
+/* A table taller than the panel scrolls its body under its own header. The
+   cap is on panel bodies that hold a table and on no others: applied to every
+   panel body it also cut the submit form off at its own textarea, which is the
+   one panel on this page whose content is not a list. */
+.panel>div:has(>table){max-height:min(70vh,720px)}
+th{position:sticky;top:0;background:var(--panel);z-index:1}
+/* Two controls that sat directly on a panel rather than in its padded body,
+   so they touched the panel's border while everything under them was inset. */
+.panel>button{margin:10px 0 0 10px}
+
+/* The submit form: one column, and the field that carries the actual work is
+   the largest thing in it. The three short fields share a row above it. */
+.form{display:flex;flex-direction:column;gap:10px;max-width:74ch}
+.form .short{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.form textarea{font:inherit;background:var(--bg);color:var(--ink);border:1px solid var(--line);
+  border-radius:3px;padding:8px;width:100%;min-height:150px;resize:vertical}
+.form textarea:focus,input:focus,select:focus,button:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.form .send{display:flex;gap:10px;align-items:center}
+.form label{color:var(--dim)}
+/* A repeated cell in a run of events is left blank after its first row: the
+   timestamp column then reads as one moment with a run of paths under it,
+   which is what actually happened. */
+td.same{color:transparent}
 </style>
 </head>
 <body>
@@ -469,12 +527,26 @@ function table(cols, rows, opts) {
   thead.appendChild(tr);
   t.appendChild(thead);
   const tb = el("tbody");
+  /* `cls` names a cell class the column always wants (`id` for a hex
+     identifier, which then ends in an ellipsis with the whole value in
+     `title`). `runs` says a column repeats down a sorted table -- the value is
+     still written into the cell, so a copy or a screen reader gets it, and it
+     is only made invisible when it equals the row above. Nothing is dropped:
+     the eye reads one timestamp with a run of paths under it, which is what
+     the events actually were. */
+  const prev = new Map();
   for (const r of rows) {
     const row = el("tr");
     for (const c of cols) {
       const v = c.get(r);
-      const td = el("td", {class: c.wrap ? "wrap" : ""});
+      const td = el("td", {class: [c.wrap ? "wrap" : "", c.cls || ""].filter(Boolean).join(" ")});
       if (v instanceof Node) td.appendChild(v); else td.textContent = v === undefined || v === null ? "—" : String(v);
+      if (c.cls === "id" && !(v instanceof Node) && v) td.title = String(v);
+      if (c.runs && !(v instanceof Node)) {
+        const text = String(v);
+        if (prev.get(c.label) === text) td.classList.add("same");
+        prev.set(c.label, text);
+      }
       row.appendChild(td);
     }
     if (opts && opts.onclick) { row.style.cursor = "pointer"; row.onclick = () => opts.onclick(r); }
@@ -573,12 +645,19 @@ async function viewOverview() {
       } catch (e) { /* one repository failing must not empty the panel */ }
     }
     const box = el("div");
+    /* Title before identifier. A reader scans this panel for the record they
+       mean, and they know it by its title; the 40-character identifier is what
+       they copy once they have found it, and it was pushing every readable
+       column off the right edge. */
     box.appendChild(table([
       {label: "repo", get: (x) => x.repo},
-      {label: "id", get: (x) => x.decision},
-      {label: "kind", get: (x) => kindTag(x.kind)},
       {label: "title", wrap: true, get: (x) => el("span", {class: "untrusted", text: x.title || "—"})},
-      {label: "status", get: (x) => statusTag(x.status)},
+      {label: "kind", get: (x) => kindTag(x.kind)},
+      /* No status column: this panel asks for PROPOSED and nothing else, so
+         every cell in it read the same word. A column whose every value is
+         identical spends width and says nothing, and it was pushing the
+         identifier past the panel's edge. */
+      {label: "id", cls: "id", get: (x) => x.decision},
     ], all, {empty: "nothing is waiting"}));
     /* A15 T7. A record is read in full, and disposed of, in the Review view —
        this panel only ever lists what is waiting. */
@@ -596,8 +675,8 @@ async function viewOverview() {
     if (repos.length === 0) return el("p", {class: "empty", text: "no repositories"});
     const e = await api("events", {repo: repos[0], limit: 30});
     return table([
-      {label: "at", get: (x) => (x.at || "").replace("T", " ").replace("Z", "")},
-      {label: "kind", get: (x) => x.kind},
+      {label: "at", runs: true, get: (x) => (x.at || "").replace("T", " ").replace("Z", "")},
+      {label: "kind", runs: true, get: (x) => x.kind},
       {label: "detail", wrap: true, get: (x) => el("span", {class: "untrusted", text: x.detail || x.path || "—"})},
     ], e.events, {empty: "no recent events"});
   });
@@ -1824,35 +1903,51 @@ async function viewJobs() {
   clear(root);
 
   /* T12: the limit is stated on the tab itself, not only in the plan. */
-  root.appendChild(el("p", {class: "dim", text:
+  root.appendChild(el("p", {class: "lead", text:
     "This view shows the state of each job as the gateway reports it. " +
     "It does not show a worker's prose or log; those are read on the Atlas machine."}));
 
   /* --- Submit a task (T8) ------------------------------------------------ */
   const submitSec = el("div", {class: "panel"});
   submitSec.appendChild(el("h2", {text: "Submit a task"}));
+  /* Every other panel on this page puts its content in a `div` under the `h2`,
+     which is what `.panel>div` pads. This one appended straight to the panel,
+     so its text ran to the panel's own border on both sides while every
+     neighbouring panel was inset. */
+  const submitBody = el("div");
+  submitSec.appendChild(submitBody);
 
   /* Frozen sentences (§Frozen formats, "The Jobs view's fixed sentences"). */
-  submitSec.appendChild(el("p", {text:
+  submitBody.appendChild(el("p", {text:
     "Submitting from this browser queues a task under the credential you paste here. " +
     "Atlas records the channel and the credential, not a person. What the task may do is " +
     "decided by the root-owned policy on the Atlas machine, never by this page: the " +
     "driver, the gates, the attempts and the daily bound are its."}));
-  submitSec.appendChild(el("p", {text:
+  submitBody.appendChild(el("p", {text:
     "A task is a prompt. On this deployment it runs as the operator's own account, " +
     "with that account's files readable to it and its edits accepted in a workspace; " +
     "Atlas bounds how many tasks a credential may queue and what checks they run under, " +
     "not what one task may ask a worker to read. Nothing here applies a patch, changes a " +
     "lifecycle state or accepts a run; a finished job's patch is read on the Atlas machine."}));
   if (cleartextSubmission) {
-    submitSec.appendChild(el("p", {class: "warn", text:
+    /* A block a reader passes, not a paragraph they read past: in a run of
+       three paragraphs the only thing marking this one was its colour. */
+    submitBody.appendChild(el("p", {class: "callout", text:
       "On this deployment the submission key crosses the network in the clear from a browser. " +
       "Anyone able to observe this network segment can capture it, and a captured " +
       "key queues work that runs as the operator until it is revoked."}));
   }
 
+  /* The form. The task is the work, so it gets the room. The three short
+     fields that qualify it -- which credential, which repository, which repeat
+     key -- share one row above it, each with a visible label rather than a
+     placeholder that disappears the moment somebody types in it. */
+  const form = el("div", {class: "form"});
+  submitBody.appendChild(form);
+  const shortRow = el("div", {class: "short"});
+
   /* Submission key (password field, sessionStorage-backed -- Decision 16). */
-  const keyRow = el("div", {class: "row"});
+  const keyLabel = el("label", {text: "key "});
   const keyInput = document.createElement("input");
   keyInput.type = "password";
   keyInput.autocomplete = "off";
@@ -1862,14 +1957,10 @@ async function viewJobs() {
     submitKey = keyInput.value;
     submitKeySave(submitKey);
   });
-  keyRow.appendChild(keyInput);
-  keyRow.appendChild(el("p", {class: "dim", text:
-    "The submission key is remembered for this tab only and forgotten when the tab " +
-    "closes; it is never written to this browser's persistent storage."}));
-  submitSec.appendChild(keyRow);
+  keyLabel.appendChild(keyInput);
+  shortRow.appendChild(keyLabel);
 
   /* Repository picker (populated from the same repos array loadRepos() fills). */
-  const repoRow = el("div", {class: "row"});
   const label = el("label");
   label.textContent = "repository ";
   const repoPick = document.createElement("select");
@@ -1880,26 +1971,34 @@ async function viewJobs() {
     repoPick.appendChild(o);
   }
   label.appendChild(repoPick);
-  repoRow.appendChild(label);
-  submitSec.appendChild(repoRow);
+  shortRow.appendChild(label);
+
+  /* Optional idempotency key, bounded at ATLAS_ORCH_REMOTE_CLIENT_KEY_MAX.
+     `maxlength="40"`: a client key is at most 40 printable ASCII characters.
+     Labelled "repeat key" rather than "idempotency key": what it does for the
+     person using it is send the same task twice without queueing it twice. */
+  const iKeyLabel = el("label", {text: "repeat key "});
+  const iKeyInput = document.createElement("input");
+  iKeyInput.type = "text";
+  iKeyInput.setAttribute("maxlength", "40");
+  iKeyInput.placeholder = "optional";
+  iKeyInput.size = 16;
+  iKeyLabel.title = "Send the same key again to get the same job back instead of a second one.";
+  iKeyLabel.appendChild(iKeyInput);
+  shortRow.appendChild(iKeyLabel);
+  form.appendChild(shortRow);
+
+  form.appendChild(el("p", {class: "dim", text:
+    "The submission key is remembered for this tab only and forgotten when the tab " +
+    "closes; it is never written to this browser's persistent storage."}));
 
   /* Task textarea, bounded at ATLAS_ORCH_TASK_MAX.
      `maxlength="65536"`: the same bound the daemon enforces on the task text. */
   const taskArea = document.createElement("textarea");
   taskArea.setAttribute("maxlength", "65536");
   taskArea.placeholder = "task (a prompt for the worker)";
-  taskArea.rows = 6;
-  submitSec.appendChild(taskArea);
-
-  /* Optional idempotency key, bounded at ATLAS_ORCH_REMOTE_CLIENT_KEY_MAX.
-     `maxlength="40"`: a client key is at most 40 printable ASCII characters. */
-  const iKeyRow = el("div", {class: "row"});
-  const iKeyInput = document.createElement("input");
-  iKeyInput.type = "text";
-  iKeyInput.setAttribute("maxlength", "40");
-  iKeyInput.placeholder = "idempotency key (optional)";
-  iKeyRow.appendChild(iKeyInput);
-  submitSec.appendChild(iKeyRow);
+  taskArea.rows = 8;
+  form.appendChild(taskArea);
 
   const submitBtn = el("button", {class: "go", text: "Submit"});
   const submitOut = el("div");
@@ -1926,8 +2025,10 @@ async function viewJobs() {
       say(submitOut, String((e && e.message) || e), "err");
     }
   };
-  submitSec.appendChild(submitBtn);
-  submitSec.appendChild(submitOut);
+  const sendRow = el("div", {class: "send"});
+  sendRow.appendChild(submitBtn);
+  form.appendChild(sendRow);
+  form.appendChild(submitOut);
   root.appendChild(submitSec);
 
   /* --- Jobs (T12 watching half) ------------------------------------------ */
@@ -1935,7 +2036,7 @@ async function viewJobs() {
   listSec.appendChild(el("h2", {text: "Jobs"}));
 
   const listOut = el("div");
-  const refreshBtn = el("button", {text: "Refresh"});
+  const refreshBtn = el("button", {class: "go", text: "Refresh"});
 
   async function loadJobList() {
     if (!submitKey) {
@@ -2034,8 +2135,12 @@ async function viewJobs() {
   }
 
   refreshBtn.onclick = loadJobList;
-  listSec.appendChild(refreshBtn);
-  listSec.appendChild(listOut);
+  const listBody = el("div");
+  const refreshRow = el("div", {class: "row"});
+  refreshRow.appendChild(refreshBtn);
+  listBody.appendChild(refreshRow);
+  listBody.appendChild(listOut);
+  listSec.appendChild(listBody);
   root.appendChild(listSec);
 
   await loadJobList();
@@ -2113,7 +2218,13 @@ async function start() {
      here. Signing out of a real session lands back on this same floor rather
      than a hard wall, when the policy has one. */
   const who = me.anonymous ? "anonymous" : (me.label || "?");
-  $("principal").textContent = who + " · " + [...scopes].join(" ");
+  /* The credential's label is what a reader needs at a glance; the six scope
+     names behind it were taking two lines of the header and pushing the tab row
+     onto a second one. The full list stays one hover away rather than gone. */
+  const list = [...scopes];
+  const pr = $("principal");
+  pr.textContent = who + " · " + list.length + (list.length === 1 ? " scope" : " scopes");
+  pr.title = list.length ? list.join(" ") : "no scopes";
   const signout = $("signout");
   if (me.anonymous) {
     signout.textContent = "Sign in";

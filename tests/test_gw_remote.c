@@ -2926,6 +2926,16 @@ static void test_mission_control_carries_the_jobs_view(void) {
         "does not serve remote submission",
         /* The cleartext acceptance sentence. */
         "crosses the network in the clear from a browser",
+        /* T12 watching half: the limit sentence stated on the tab, apostrophes straight. */
+        "does not show a worker's prose or log",
+        /* T12: operator apostrophe straight (byte-for-byte from the frozen text). */
+        "operator's own account",
+        /* T12: Refresh button (no setInterval -- checked below). */
+        "Refresh",
+        /* T12: worker starts / budget display. */
+        "worker starts / budget",
+        /* T12: artifact terminal command for finished jobs. */
+        "atlas job artifact",
     };
     for (size_t i = 0; i < sizeof BOUND / sizeof BOUND[0]; i++) {
         T_CHECK_MSG(strstr(page, BOUND[i]) != NULL,
@@ -2947,6 +2957,9 @@ static void test_mission_control_carries_the_jobs_view(void) {
     T_CHECK_MSG(strstr(page, "proves") == NULL,
                 "the page asserts something in the coined word \"proves\" rather than "
                 "reporting a daemon-observed fact");
+    /* T12: the Jobs view is Refresh-only; no polling timer is permitted. */
+    T_CHECK_MSG(strstr(page, "setInterval") == NULL,
+                "the page uses setInterval; the Jobs view must be Refresh-only");
 
     atlas_gateway_close(g);
     fx_daemon_stop(&e.d, false);

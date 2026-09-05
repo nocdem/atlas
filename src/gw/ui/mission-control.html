@@ -427,7 +427,10 @@ async function apiWrite(path, fields, key) {
   } catch (e) {
     throw new Error("the gateway is not reachable");
   }
-  if (res.status === 401) { throw new Error("the disposal key was not accepted"); }
+  if (res.status === 401) {
+    const which = (key !== undefined) ? "the submission key" : "the disposal key";
+    throw new Error(which + " was not accepted");
+  }
   let body = null;
   try { body = await res.json(); } catch (e) { body = null; }
   if (!res.ok) {
@@ -1823,7 +1826,7 @@ async function viewJobs() {
   /* T12: the limit is stated on the tab itself, not only in the plan. */
   root.appendChild(el("p", {class: "dim", text:
     "This view shows the state of each job as the gateway reports it. " +
-    "It does not show a worker’s prose or log; those are read on the Atlas machine."}));
+    "It does not show a worker's prose or log; those are read on the Atlas machine."}));
 
   /* --- Submit a task (T8) ------------------------------------------------ */
   const submitSec = el("div", {class: "panel"});
@@ -1836,11 +1839,11 @@ async function viewJobs() {
     "decided by the root-owned policy on the Atlas machine, never by this page: the " +
     "driver, the gates, the attempts and the daily bound are its."}));
   submitSec.appendChild(el("p", {text:
-    "A task is a prompt. On this deployment it runs as the operator’s own account, " +
-    "with that account’s files readable to it and its edits accepted in a workspace; " +
+    "A task is a prompt. On this deployment it runs as the operator's own account, " +
+    "with that account's files readable to it and its edits accepted in a workspace; " +
     "Atlas bounds how many tasks a credential may queue and what checks they run under, " +
     "not what one task may ask a worker to read. Nothing here applies a patch, changes a " +
-    "lifecycle state or accepts a run; a finished job’s patch is read on the Atlas machine."}));
+    "lifecycle state or accepts a run; a finished job's patch is read on the Atlas machine."}));
   if (cleartextSubmission) {
     submitSec.appendChild(el("p", {class: "warn", text:
       "On this deployment the submission key crosses the network in the clear from a browser. " +
@@ -1862,7 +1865,7 @@ async function viewJobs() {
   keyRow.appendChild(keyInput);
   keyRow.appendChild(el("p", {class: "dim", text:
     "The submission key is remembered for this tab only and forgotten when the tab " +
-    "closes; it is never written to this browser’s persistent storage."}));
+    "closes; it is never written to this browser's persistent storage."}));
   submitSec.appendChild(keyRow);
 
   /* Repository picker (populated from the same repos array loadRepos() fills). */
@@ -1935,6 +1938,11 @@ async function viewJobs() {
   const refreshBtn = el("button", {text: "Refresh"});
 
   async function loadJobList() {
+    if (!submitKey) {
+      clear(listOut);
+      say(listOut, "Paste a submission key above to see this credential's jobs.", "dim");
+      return;
+    }
     say(listOut, "loading…", "dim");
     try {
       const r = await apiWrite("job/list", {}, submitKey);
@@ -1956,8 +1964,12 @@ async function viewJobs() {
           ["attempts", String(job.attempts !== undefined ? job.attempts : "—")],
         ]));
 
-        /* Cancel button for non-terminal jobs. */
-        const terminal = ["SUCCEEDED","FAILED","CANCELLED","CANCEL_REQUESTED"];
+        /* Cancel button for non-terminal jobs.
+         * CANCEL_REQUESTED is not terminal (CLAUDE.md A11.0): the task asked to
+         * stop has not yet stopped. Terminal states are SUCCEEDED, FAILED,
+         * CANCELLED, TIMED_OUT, RECOVERY_REQUIRED. The gateway also enforces
+         * this; showing the button is a UI aid, not the authority check. */
+        const terminal = ["SUCCEEDED","FAILED","CANCELLED","TIMED_OUT","RECOVERY_REQUIRED"];
         if (!terminal.includes(job.state)) {
           const cancelBtn = el("button", {text: "Cancel"});
           const cancelOut = el("div");
@@ -1985,17 +1997,23 @@ async function viewJobs() {
             try {
               const d = await apiWrite("job/get", {job: uid}, submitKey);
               const pairs = [];
-              if (d.run_uid) pairs.push(["run", d.run_uid]);
+              /* "run" is the field name the server emits (server_orch_remote.c:536). */
+              if (d.run) pairs.push(["run", d.run]);
               if (d.max_attempts !== undefined) {
                 pairs.push(["worker starts / budget",
                   (d.attempts !== undefined ? d.attempts : "—") + " / " + d.max_attempts]);
               }
-              if (d.reason) pairs.push(["gate result", d.reason]);
-              if (d.usage) {
-                const cost = typeof d.usage === "object"
-                  ? Object.entries(d.usage).map(([k, v]) => k + ": " + v).join(", ")
-                  : String(d.usage);
-                if (cost) pairs.push(["cost", cost]);
+              /* "reason" is the newest transition reason: a gate verdict, a crash,
+               * an expired heartbeat, or a cancellation.  Label it as-is. */
+              if (d.reason) pairs.push(["reason", d.reason]);
+              /* usage is a nested object {present, model, has_cost, cost_micro_usd,
+               * has_turns, turns} (server_orch_remote.c:555–585). */
+              if (d.usage && d.usage.present) {
+                const parts = [];
+                if (d.usage.has_cost) parts.push("cost " + d.usage.cost_micro_usd + " µUSD");
+                if (d.usage.has_turns) parts.push("turns " + d.usage.turns);
+                if (d.usage.model) parts.push("model " + d.usage.model);
+                if (parts.length) pairs.push(["cost", parts.join(", ")]);
               }
               /* T12: for a finished job, show how to fetch its patch on the Atlas machine. */
               if (d.state === "SUCCEEDED") {

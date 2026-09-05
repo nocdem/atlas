@@ -396,3 +396,32 @@ const char *atlas_jsonv_str_member(const atlas_jsonv *obj, const char *key) {
 const char *atlas_jsonv_str_member2(const atlas_jsonv *obj, const char *k1, const char *k2) {
     return atlas_jsonv_str_member(atlas_jsonv_get(obj, k1), k2);
 }
+
+atlas_status atlas_jsonv_check_only_keys(const atlas_jsonv *obj,
+                                         const char *const *allowed,
+                                         atlas_err *err) {
+    if (obj == NULL || !yyjson_is_obj(as_val(obj))) {
+        return ATLAS_OK;
+    }
+    yyjson_obj_iter it;
+    yyjson_obj_iter_init(as_val(obj), &it);
+    yyjson_val *key;
+    while ((key = yyjson_obj_iter_next(&it)) != NULL) {
+        const char *k = yyjson_get_str(key);
+        if (k == NULL) {
+            continue;
+        }
+        bool found = false;
+        for (size_t i = 0; allowed[i] != NULL; i++) {
+            if (strcmp(k, allowed[i]) == 0) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "\"%s\" is not a recognised argument", k);
+        }
+    }
+    return ATLAS_OK;
+}

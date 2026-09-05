@@ -90,4 +90,15 @@ const char *atlas_jsonv_str_member(const atlas_jsonv *obj, const char *key);
 /* Convenience: follows a two-level path, e.g. tool_input -> file_path. */
 const char *atlas_jsonv_str_member2(const atlas_jsonv *obj, const char *k1, const char *k2);
 
+/* Checks that every key in `obj` appears in `allowed` (a NULL-terminated list).
+ * Returns ATLAS_OK when all keys are recognised. Returns ATLAS_ERR_USAGE and
+ * sets `err` when a key is absent from the list.
+ *
+ * Call this in a run function to enforce `additionalProperties: false` at
+ * runtime: the MCP layer publishes that constraint in the schema JSON but does
+ * not validate it before calling run(). */
+atlas_status atlas_jsonv_check_only_keys(const atlas_jsonv *obj,
+                                         const char *const *allowed,
+                                         atlas_err *err);
+
 #endif /* ATLAS_JSONREAD_H */

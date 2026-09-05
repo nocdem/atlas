@@ -246,7 +246,11 @@ static void test_tools_list_is_complete_and_strictly_schemad(void) {
     T_CHECK_MSG(n >= 16, "expected at least 16 tools, got %zu", n);
 
     /* The documented surface and the implemented one cannot drift: the header's
-     * list is compared against what the process actually reported. */
+     * list is compared against what the process actually reported.
+     *
+     * A14: remote-only tools are correctly absent from the stdio listing —
+     * `atlas_mcp_tool_remote_only` identifies them, and each is checked absent
+     * rather than present. */
     const char *const *expected = atlas_mcp_tool_names();
     for (size_t i = 0; expected[i] != NULL; i++) {
         bool found = false;
@@ -257,7 +261,11 @@ static void test_tools_list_is_complete_and_strictly_schemad(void) {
                 break;
             }
         }
-        T_CHECK_MSG(found, "tool %s was not listed", expected[i]);
+        if (atlas_mcp_tool_remote_only(expected[i])) {
+            T_CHECK_MSG(!found, "remote-only tool %s appears in the stdio listing", expected[i]);
+        } else {
+            T_CHECK_MSG(found, "tool %s was not listed", expected[i]);
+        }
     }
 
     for (size_t k = 0; k < n; k++) {
@@ -279,6 +287,32 @@ static void test_tools_list_is_complete_and_strictly_schemad(void) {
         T_CHECK(atlas_jsonv_get(schema, "properties") != NULL);
         T_CHECK(atlas_jsonv_get(schema, "required") != NULL);
     }
+    atlas_jsondoc_free(doc);
+    session_free(&s);
+}
+
+static void test_remote_only_tools_absent_from_stdio(void) {
+    /* A14: every remote-only tool answers "unknown tool" on the stdio adapter,
+     * exactly as if the tool does not exist — absent rather than refused. */
+    atlas_err err;
+    atlas_err_init(&err);
+    session s;
+    session_init(&s);
+    run_script(&s,
+               INIT_LINE "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":"
+                         "{\"name\":\"atlas_job_submit\","
+                         "\"arguments\":{\"task\":\"t\"}}}\n",
+               NULL, &err);
+    atlas_jsondoc *doc = parse_line(&s.out, 1, &err);
+    const atlas_jsonv *e = atlas_jsonv_get(atlas_jsondoc_root(doc), "error");
+    T_REQUIRE_MSG(e != NULL, "calling atlas_job_submit on stdio should produce an error");
+    int64_t code = 0;
+    T_CHECK(atlas_jsonv_int(atlas_jsonv_get(e, "code"), &code));
+    T_EQ_INT((int)code, -32602);
+    const char *msg = atlas_jsonv_str_member(e, "message");
+    T_CHECK_MSG(msg != NULL && strstr(msg, "unknown tool") != NULL,
+                "atlas_job_submit on stdio should answer \"unknown tool\", got: %s",
+                msg != NULL ? msg : "(null)");
     atlas_jsondoc_free(doc);
     session_free(&s);
 }
@@ -615,6 +649,8 @@ static const atlas_test TESTS[] = {
      test_requests_before_initialize_are_refused},
     {"tools/list matches the documented surface and forbids extra arguments",
      test_tools_list_is_complete_and_strictly_schemad},
+    {"remote-only tools are absent from the stdio adapter",
+     test_remote_only_tools_absent_from_stdio},
     {"an unknown tool is a protocol error", test_unknown_tool_is_a_protocol_error},
     {"an unavailable daemon is a degraded result",
      test_daemon_unavailable_is_a_degraded_result_not_a_crash},

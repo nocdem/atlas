@@ -410,8 +410,18 @@ static void test_documented_tool_names_are_plugin_scoped_correctly(void) {
      *
      * What stays absent is unchanged and is the whole list: approve, reject,
      * supersede, revalidate, resolve, minting or spending a warrant, editing the
-     * verification policy, and naming a verifier's verdict. */
-    T_CHECK_MSG(n == 37, "expected 37 tools, found %zu", n);
+     * verification policy, and naming a verifier's verdict.
+     *
+     * A14 added four — `atlas_job_submit`, `atlas_job_status`, `atlas_job_list`,
+     * `atlas_job_cancel` — and all four are remote-only: absent from the stdio
+     * adapter and callable only through the gateway by a credential the daemon
+     * named in its root-owned policy. They carry `ATLAS_SCOPE_JOBS_SUBMIT`, which
+     * no `atlas api-key create` credential can be granted — the daemon derives it
+     * for named remote-submit keys only. The two write tools (`atlas_job_submit`
+     * and `atlas_job_cancel`) extend the invariant: every tool that writes maps to
+     * a scope no credential can be granted, and since A14 there are two such
+     * scopes. */
+    T_CHECK_MSG(n == 41, "expected 41 tools, found %zu", n);
 }
 
 /* --- the integration record ----------------------------------------------

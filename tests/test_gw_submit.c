@@ -400,15 +400,14 @@ static void test_a_happy_path_and_audit(void) {
                    "web_gui = yes\nlisten_addr = 127.0.0.1\ntls_mode = REVERSE_PROXY\n"
                    "remote_submit_key = %s\nremote_submit_key = %s\n"
                    "remote_submit_driver = fake\nremote_submit_mode = patch\n"
-                   "remote_submit_max_attempts = 1\nremote_submit_max_active = 100\n"
-                   "remote_submit_max_per_day = 100\nremote_submit_gate = true\n",
+                   "remote_submit_max_attempts = 1\nremote_submit_max_active = 8\n"
+                   "remote_submit_max_per_day = 64\nremote_submit_gate = true\n",
                    (long)getuid(), e.submit_id, e.second_id);
 
     char orch_policy[1024];
     (void)snprintf(orch_policy, sizeof(orch_policy),
-                   "dispatcher_uid = %ld\nsubmitter_uid = %ld\n"
-                   "repo = proj\ndriver = fake\nmode = patch\nworker_root = /tmp\n",
-                   (long)getuid(), (long)getuid());
+                   "dispatcher_uid = 1\nsubmitter_uid = 2\n"
+                   "repo = proj\ndriver = fake\nmode = patch\nworker_root = /tmp\n");
 
     const char *gw_path = write_policy_file(&e, "gw.conf", gw_policy);
     const char *orch_path = write_policy_file(&e, "orch.conf", orch_policy);
@@ -582,10 +581,14 @@ static void test_a_happy_path_and_audit(void) {
                    atlas_buf_cstr(&aresp));
         T_CHECK_MSG(strstr(atlas_buf_cstr(&aresp), "\"interface\":\"WEB_API\"") != NULL,
                    "no WEB_API audit row: %s", atlas_buf_cstr(&aresp));
-        /* The key_id in the audit row is the full "key_<16hex>" stored form. */
+        /* The key_id in the audit row is the bare 16-hex selector, same as
+         * the submit response — no "key_" prefix. */
         {
+            char selector[ATLAS_APIKEY_SELECTOR_HEX + 1u];
+            memcpy(selector, e.submit_id + 4u, ATLAS_APIKEY_SELECTOR_HEX);
+            selector[ATLAS_APIKEY_SELECTOR_HEX] = '\0';
             char needle[64];
-            (void)snprintf(needle, sizeof needle, "\"key_id\":\"%s\"", e.submit_id);
+            (void)snprintf(needle, sizeof needle, "\"key_id\":\"%s\"", selector);
             T_CHECK_MSG(strstr(atlas_buf_cstr(&aresp), needle) != NULL,
                        "audit trail does not name the submit key: %s / want %s",
                        atlas_buf_cstr(&aresp), needle);
@@ -623,13 +626,13 @@ static void test_b_method_not_allowed(void) {
                    "web_gui = yes\ntls_mode = REVERSE_PROXY\n"
                    "remote_submit_key = %s\nremote_submit_driver = fake\n"
                    "remote_submit_mode = patch\nremote_submit_max_attempts = 1\n"
-                   "remote_submit_max_active = 10\nremote_submit_max_per_day = 100\n",
+                   "remote_submit_max_active = 8\nremote_submit_max_per_day = 64\n"
+                   "remote_submit_gate = true\n",
                    (long)getuid(), e.submit_id);
     char orch_policy[512];
     (void)snprintf(orch_policy, sizeof(orch_policy),
-                   "dispatcher_uid = %ld\nsubmitter_uid = %ld\n"
-                   "repo = proj\ndriver = fake\nmode = patch\nworker_root = /tmp\n",
-                   (long)getuid(), (long)getuid());
+                   "dispatcher_uid = 1\nsubmitter_uid = 2\n"
+                   "repo = proj\ndriver = fake\nmode = patch\nworker_root = /tmp\n");
 
     const char *gw_path = write_policy_file(&e, "gw.conf", gw_policy);
     const char *orch_path = write_policy_file(&e, "orch.conf", orch_policy);
@@ -732,14 +735,13 @@ static void test_b2_driver_dropped_and_no_key_policy(void) {
                    "web_gui = yes\ntls_mode = REVERSE_PROXY\n"
                    "remote_submit_key = %s\nremote_submit_key = %s\n"
                    "remote_submit_driver = fake\nremote_submit_mode = patch\n"
-                   "remote_submit_max_attempts = 1\nremote_submit_max_active = 100\n"
-                   "remote_submit_max_per_day = 100\n",
+                   "remote_submit_max_attempts = 1\nremote_submit_max_active = 8\n"
+                   "remote_submit_max_per_day = 64\nremote_submit_gate = true\n",
                    (long)getuid(), e.submit_id, e.second_id);
     char orch_policy[512];
     (void)snprintf(orch_policy, sizeof(orch_policy),
-                   "dispatcher_uid = %ld\nsubmitter_uid = %ld\n"
-                   "repo = proj\ndriver = fake\nmode = patch\nworker_root = /tmp\n",
-                   (long)getuid(), (long)getuid());
+                   "dispatcher_uid = 1\nsubmitter_uid = 2\n"
+                   "repo = proj\ndriver = fake\nmode = patch\nworker_root = /tmp\n");
 
     const char *gw_path = write_policy_file(&e, "gw.conf", gw_policy);
     const char *orch_path = write_policy_file(&e, "orch.conf", orch_policy);
@@ -874,8 +876,8 @@ static void test_c_auth_me_fields(void) {
                        "web_gui = yes\ntls_mode = REVERSE_PROXY\n"
                        "remote_submit_key = %s\nremote_submit_key = %s\n"
                        "remote_submit_driver = fake\nremote_submit_mode = patch\n"
-                       "remote_submit_max_attempts = 1\nremote_submit_max_active = 10\n"
-                       "remote_submit_max_per_day = 100\n",
+                       "remote_submit_max_attempts = 1\nremote_submit_max_active = 8\n"
+                       "remote_submit_max_per_day = 64\nremote_submit_gate = true\n",
                        (long)getuid(), e.submit_id, e.second_id);
         const char *gw_path = write_policy_file(&e, "c1.conf", ptext);
 
@@ -946,7 +948,8 @@ static void test_c_auth_me_fields(void) {
                        "web_gui = yes\ntls_mode = NONE\n"
                        "remote_submit_key = %s\nremote_submit_driver = fake\n"
                        "remote_submit_mode = patch\nremote_submit_max_attempts = 1\n"
-                       "remote_submit_max_active = 10\nremote_submit_max_per_day = 100\n"
+                       "remote_submit_max_active = 8\nremote_submit_max_per_day = 64\n"
+                       "remote_submit_gate = true\n"
                        "operator_accepts_cleartext_submission = yes\n",
                        (long)getuid(), e.submit_id);
         const char *gw_path = write_policy_file(&e, "c3.conf", ptext);
@@ -978,6 +981,284 @@ static void test_c_auth_me_fields(void) {
     env_close(&e);
 }
 
+/* --- (d): MCP tool calls --------------------------------------------------- */
+
+/* Extract a job uid from an MCP tools/call HTTP response.
+ * The daemon result is carried as an escaped JSON string inside the `text`
+ * content field: ...\"job\":\"j<32hex>\"...  We scan the raw response bytes
+ * for the literal backslash-quote pairs that appear there. */
+static bool mcp_job_of(const atlas_buf *resp, char *out, size_t n) {
+    const char *b = body_of(resp);
+    /* Literal bytes in the HTTP body: \"job\":\" */
+    static const char NEEDLE[] = "\\\"job\\\":\\\"";
+    const char *p = strstr(b, NEEDLE);
+    if (p == NULL) {
+        return false;
+    }
+    p += sizeof(NEEDLE) - 1u; /* land on the first character of the uid */
+    size_t i = 0;
+    while (p[i] != '\0' && p[i] != '\\' && i + 1 < n) {
+        out[i] = p[i];
+        i++;
+    }
+    out[i] = '\0';
+    return i > 0 && out[0] == 'j';
+}
+
+static void test_d_mcp_tool_calls(void) {
+    env e;
+    env_open(&e);
+    atlas_err err;
+    atlas_err_init(&err);
+
+    /* Same policy as test_a: REVERSE_PROXY, two submit keys. The orch policy
+     * names the test process as dispatcher (so dispatch.lease/complete are
+     * reachable) and uses a different uid for submitter (required: they may
+     * not be the same). */
+    char gw_policy[2048];
+    (void)snprintf(gw_policy, sizeof(gw_policy),
+                   "enabled = yes\ngateway_uid = %ld\nremote_mcp = yes\n"
+                   "web_gui = yes\nlisten_addr = 127.0.0.1\ntls_mode = REVERSE_PROXY\n"
+                   "remote_submit_key = %s\nremote_submit_key = %s\n"
+                   "remote_submit_driver = fake\nremote_submit_mode = patch\n"
+                   "remote_submit_max_attempts = 1\nremote_submit_max_active = 8\n"
+                   "remote_submit_max_per_day = 64\nremote_submit_gate = true\n",
+                   (long)getuid(), e.submit_id, e.second_id);
+    char orch_policy[512];
+    /* dispatcher_uid must be the test process's uid so dispatch.lease/complete
+     * are reachable from this process.  submitter_uid = 2, which must differ
+     * from dispatcher_uid (the orch policy refuses them equal). */
+    (void)snprintf(orch_policy, sizeof(orch_policy),
+                   "dispatcher_uid = %ld\nsubmitter_uid = 2\n"
+                   "repo = proj\ndriver = fake\nmode = patch\nworker_root = /tmp\n",
+                   (long)getuid());
+
+    const char *gw_path  = write_policy_file(&e, "gw_d.conf",   gw_policy);
+    const char *orch_path = write_policy_file(&e, "orch_d.conf", orch_policy);
+
+    fx_daemon d;
+    fx_daemon_init(&d);
+    T_REQUIRE(gwd_start(&e, gw_path, orch_path, &d, &err) == ATLAS_OK);
+    T_OK(fx_daemon_wait_ready(&d, 15000, &err), &err);
+
+    atlas_gateway *g = NULL;
+    open_http_gateway(gw_policy, &d, &g);
+
+    char submit_bearer[ATLAS_APIKEY_TOKEN_MAX + 8u];
+    bearer_of(e.submit_token, submit_bearer, sizeof submit_bearer);
+    char second_bearer[ATLAS_APIKEY_TOKEN_MAX + 8u];
+    bearer_of(e.second_token, second_bearer, sizeof second_bearer);
+
+    atlas_buf resp = ATLAS_BUF_INIT;
+
+    /* (d1) tools/list must include all four remote-only names and must not
+     * expose any property an approval flow would need. */
+    http_request2(g, "POST", "/mcp", submit_bearer, NULL, NULL, "application/json",
+                  "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}",
+                  (size_t)-1, &resp);
+    T_CHECK_MSG(status_of(&resp) == 200,
+               "tools/list did not answer 200: %d %s", status_of(&resp), body_of(&resp));
+    T_CHECK_MSG(strstr(body_of(&resp), "atlas_job_submit") != NULL,
+               "tools/list did not include atlas_job_submit: %s", body_of(&resp));
+    T_CHECK_MSG(strstr(body_of(&resp), "atlas_job_status") != NULL,
+               "tools/list did not include atlas_job_status: %s", body_of(&resp));
+    T_CHECK_MSG(strstr(body_of(&resp), "atlas_job_list") != NULL,
+               "tools/list did not include atlas_job_list: %s", body_of(&resp));
+    T_CHECK_MSG(strstr(body_of(&resp), "atlas_job_cancel") != NULL,
+               "tools/list did not include atlas_job_cancel: %s", body_of(&resp));
+    {
+        /* Mirror test_decision_mcp.c's FORBIDDEN_PROPS check. */
+        static const char *const FORBIDDEN_PROPS[] = {
+            "\"token\":", "\"confirmation\":", "\"challenge\":", "\"approved\":", NULL};
+        for (size_t i = 0; FORBIDDEN_PROPS[i] != NULL; i++) {
+            T_CHECK_MSG(strstr(body_of(&resp), FORBIDDEN_PROPS[i]) == NULL,
+                       "tools/list schema exposes forbidden property %s", FORBIDDEN_PROPS[i]);
+        }
+    }
+    atlas_buf_reset(&resp);
+
+    /* (d2) atlas_job_submit → 200, no isError, extractable job uid. */
+    http_request2(g, "POST", "/mcp", submit_bearer, NULL, NULL, "application/json",
+                  "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":"
+                  "{\"name\":\"atlas_job_submit\","
+                  "\"arguments\":{\"repo\":\"proj\",\"task\":\"mcp test task\","
+                  "\"key\":\"mcp-k1\"}}}",
+                  (size_t)-1, &resp);
+    T_CHECK_MSG(status_of(&resp) == 200,
+               "atlas_job_submit did not answer 200: %d %s", status_of(&resp), body_of(&resp));
+    T_CHECK_MSG(strstr(body_of(&resp), "\"isError\":true") == NULL,
+               "atlas_job_submit returned isError:true: %s", body_of(&resp));
+    char job1_uid[64];
+    T_REQUIRE_MSG(mcp_job_of(&resp, job1_uid, sizeof job1_uid),
+                 "could not extract job uid from atlas_job_submit response: %s",
+                 body_of(&resp));
+    atlas_buf_reset(&resp);
+
+    /* (d3) Identical call (same key) → the response carries "duplicate". */
+    http_request2(g, "POST", "/mcp", submit_bearer, NULL, NULL, "application/json",
+                  "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":"
+                  "{\"name\":\"atlas_job_submit\","
+                  "\"arguments\":{\"repo\":\"proj\",\"task\":\"mcp test task\","
+                  "\"key\":\"mcp-k1\"}}}",
+                  (size_t)-1, &resp);
+    T_CHECK_MSG(status_of(&resp) == 200,
+               "duplicate atlas_job_submit did not answer 200: %d %s",
+               status_of(&resp), body_of(&resp));
+    T_CHECK_MSG(strstr(body_of(&resp), "duplicate") != NULL,
+               "duplicate submit response does not contain 'duplicate': %s", body_of(&resp));
+    atlas_buf_reset(&resp);
+
+    /* (d4) Lease the queued job through the dispatcher channel.  The lease
+     * response must name job1_uid — proving the MCP-submitted row is the one
+     * the dispatcher sees — then complete it as SUCCEEDED. */
+    {
+        atlas_buf lease_resp = ATLAS_BUF_INIT;
+        call(&d, "dispatch.lease", "{}", &lease_resp);
+        T_REQUIRE_MSG(strstr(atlas_buf_cstr(&lease_resp), "\"granted\":true") != NULL,
+                     "dispatch.lease did not grant a job: %s", atlas_buf_cstr(&lease_resp));
+        T_CHECK_MSG(strstr(atlas_buf_cstr(&lease_resp), job1_uid) != NULL,
+                   "leased job does not match the MCP-submitted job: lease=%s want=%s",
+                   atlas_buf_cstr(&lease_resp), job1_uid);
+        atlas_buf token_buf = ATLAS_BUF_INIT;
+        T_REQUIRE_MSG(tjson_get_string(atlas_buf_cstr(&lease_resp),
+                                      strlen(atlas_buf_cstr(&lease_resp)),
+                                      "token", &token_buf),
+                     "no token in dispatch.lease response: %s", atlas_buf_cstr(&lease_resp));
+        /* Advance LEASED → PREPARING → RUNNING before completing.
+         * dispatch.complete is refused from LEASED; RUNNING or VALIDATING only. */
+        char hb_params[512];
+        {
+            atlas_buf hb = ATLAS_BUF_INIT;
+            (void)snprintf(hb_params, sizeof hb_params,
+                           "{\"token\":\"%s\",\"phase\":\"PREPARING\"}",
+                           atlas_buf_cstr(&token_buf));
+            call(&d, "dispatch.heartbeat", hb_params, &hb);
+            T_CHECK_MSG(strstr(atlas_buf_cstr(&hb), "\"ok\":true") != NULL,
+                       "heartbeat PREPARING failed: %s", atlas_buf_cstr(&hb));
+            atlas_buf_free(&hb);
+        }
+        {
+            atlas_buf hb = ATLAS_BUF_INIT;
+            (void)snprintf(hb_params, sizeof hb_params,
+                           "{\"token\":\"%s\",\"phase\":\"RUNNING\"}",
+                           atlas_buf_cstr(&token_buf));
+            call(&d, "dispatch.heartbeat", hb_params, &hb);
+            T_CHECK_MSG(strstr(atlas_buf_cstr(&hb), "\"ok\":true") != NULL,
+                       "heartbeat RUNNING failed: %s", atlas_buf_cstr(&hb));
+            atlas_buf_free(&hb);
+        }
+        char complete_params[512];
+        (void)snprintf(complete_params, sizeof complete_params,
+                       "{\"token\":\"%s\",\"success\":true,\"exit_code\":0,"
+                       "\"exit_kind\":\"OK\"}",
+                       atlas_buf_cstr(&token_buf));
+        atlas_buf complete_resp = ATLAS_BUF_INIT;
+        call(&d, "dispatch.complete", complete_params, &complete_resp);
+        T_CHECK_MSG(strstr(atlas_buf_cstr(&complete_resp), "\"ok\":true") != NULL,
+                   "dispatch.complete did not return ok:true: %s",
+                   atlas_buf_cstr(&complete_resp));
+        atlas_buf_free(&complete_resp);
+        atlas_buf_free(&token_buf);
+        atlas_buf_free(&lease_resp);
+    }
+
+    /* (d5) atlas_job_status on job1_uid → body contains SUCCEEDED.  The gate
+     * evaluation may be asynchronous, so poll briefly. */
+    {
+        char status_msg[512];
+        (void)snprintf(status_msg, sizeof status_msg,
+                       "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\","
+                       "\"params\":{\"name\":\"atlas_job_status\","
+                       "\"arguments\":{\"repo\":\"proj\",\"job\":\"%s\"}}}",
+                       job1_uid);
+        bool found = false;
+        for (int attempt = 0; attempt < 100; attempt++) {
+            atlas_buf_reset(&resp);
+            http_request2(g, "POST", "/mcp", submit_bearer, NULL, NULL,
+                          "application/json", status_msg, (size_t)-1, &resp);
+            if (strstr(body_of(&resp), "SUCCEEDED") != NULL) {
+                found = true;
+                break;
+            }
+            struct timespec ts = {0, 100L * 1000 * 1000};
+            (void)nanosleep(&ts, NULL);
+        }
+        T_CHECK_MSG(found,
+                   "atlas_job_status did not show SUCCEEDED after dispatch.complete: %s",
+                   body_of(&resp));
+        atlas_buf_reset(&resp);
+    }
+
+    /* (d6) atlas_job_list → 200, no isError, body contains "jobs". */
+    http_request2(g, "POST", "/mcp", submit_bearer, NULL, NULL, "application/json",
+                  "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":"
+                  "{\"name\":\"atlas_job_list\","
+                  "\"arguments\":{\"repo\":\"proj\"}}}",
+                  (size_t)-1, &resp);
+    T_CHECK_MSG(status_of(&resp) == 200,
+               "atlas_job_list did not answer 200: %d %s", status_of(&resp), body_of(&resp));
+    T_CHECK_MSG(strstr(body_of(&resp), "\"isError\":true") == NULL,
+               "atlas_job_list returned isError:true: %s", body_of(&resp));
+    T_CHECK_MSG(strstr(body_of(&resp), "jobs") != NULL,
+               "atlas_job_list response has no jobs field: %s", body_of(&resp));
+    atlas_buf_reset(&resp);
+
+    /* (d7) Submit a second job with a distinct idempotency key then cancel
+     * it → body contains CANCELLED (not CANCEL_REQUESTED). */
+    {
+        http_request2(g, "POST", "/mcp", second_bearer, NULL, NULL, "application/json",
+                      "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":"
+                      "{\"name\":\"atlas_job_submit\","
+                      "\"arguments\":{\"repo\":\"proj\",\"task\":\"cancel me\","
+                      "\"key\":\"mcp-k2\"}}}",
+                      (size_t)-1, &resp);
+        T_REQUIRE_MSG(status_of(&resp) == 200 &&
+                     strstr(body_of(&resp), "\"isError\":true") == NULL,
+                     "second atlas_job_submit did not succeed: %d %s",
+                     status_of(&resp), body_of(&resp));
+        char job2_uid[64];
+        T_REQUIRE_MSG(mcp_job_of(&resp, job2_uid, sizeof job2_uid),
+                     "could not extract second job uid: %s", body_of(&resp));
+        atlas_buf_reset(&resp);
+
+        char cancel_msg[512];
+        (void)snprintf(cancel_msg, sizeof cancel_msg,
+                       "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"tools/call\","
+                       "\"params\":{\"name\":\"atlas_job_cancel\","
+                       "\"arguments\":{\"repo\":\"proj\",\"job\":\"%s\"}}}",
+                       job2_uid);
+        http_request2(g, "POST", "/mcp", second_bearer, NULL, NULL, "application/json",
+                      cancel_msg, (size_t)-1, &resp);
+        T_CHECK_MSG(status_of(&resp) == 200,
+                   "atlas_job_cancel did not answer 200: %d %s",
+                   status_of(&resp), body_of(&resp));
+        T_CHECK_MSG(strstr(body_of(&resp), "CANCELLED") != NULL,
+                   "atlas_job_cancel did not produce CANCELLED: %s", body_of(&resp));
+        atlas_buf_reset(&resp);
+    }
+
+    /* (d8) atlas_job_submit with an undeclared 'driver' argument → the schema
+     * forbids additional properties, so the tool call is refused.  Assert
+     * isError and the absence of a job uid. */
+    http_request2(g, "POST", "/mcp", submit_bearer, NULL, NULL, "application/json",
+                  "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":"
+                  "{\"name\":\"atlas_job_submit\","
+                  "\"arguments\":{\"repo\":\"proj\",\"task\":\"t\",\"key\":\"k\","
+                  "\"driver\":\"attacker\"}}}",
+                  (size_t)-1, &resp);
+    T_CHECK_MSG(strstr(body_of(&resp), "\"isError\":true") != NULL,
+               "atlas_job_submit with undeclared driver was not refused: %s", body_of(&resp));
+    T_CHECK_MSG(strstr(body_of(&resp), "\\\"job\\\":\\\"j") == NULL,
+               "refused atlas_job_submit still returned a job uid: %s", body_of(&resp));
+    atlas_buf_reset(&resp);
+
+    atlas_buf_free(&resp);
+    atlas_gateway_close(g);
+    fx_daemon_stop(&d, false);
+    fx_daemon_free(&d);
+    env_close(&e);
+}
+
 /* --- test registry --------------------------------------------------------- */
 
 static const atlas_test TESTS[] = {
@@ -991,6 +1272,8 @@ static const atlas_test TESTS[] = {
      test_b3_no_submit_key_policy},
     {"/auth/me: remote_submission, remote_submission_driver, cleartext_submission",
      test_c_auth_me_fields},
+    {"MCP: tools/list names the four tools, submit/status/list/cancel, duplicate, SUCCEEDED, schema refusal",
+     test_d_mcp_tool_calls},
 };
 
 ATLAS_TEST_MAIN("gw_submit", TESTS)

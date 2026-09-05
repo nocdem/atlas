@@ -61,4 +61,9 @@ bool atlas_mcp_protocol_supported(const char *version);
  * surface and the implemented one cannot drift. */
 const char *const *atlas_mcp_tool_names(void);
 
+/* True when `name` is a remote-only tool — one absent from the stdio adapter
+ * and callable only when `s->remote` is true. Used by the plugin fixture test
+ * to verify remote-only tools are absent from the stdio tools/list. */
+bool atlas_mcp_tool_remote_only(const char *name);
+
 #endif /* ATLAS_MCP_H */

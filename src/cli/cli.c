@@ -68,7 +68,8 @@ void atlas_cli_print_help(FILE *out) {
         "  job run --resume RUN      continue a run that already exists\n"
         "  job run-status RUN        what a run is waiting on, and how it ended\n"
         "  job get|cancel JOB        read or cancel one job\n"
-        "  job list                  jobs this principal submitted\n"
+        "  job list [--remote]       jobs this principal submitted; --remote lists\n"
+        "                            only jobs submitted through the gateway\n"
         "  scanner run --once         ask the daemon which repositories this uid may scan\n"
         "  dispatcher run [--once]   run the job dispatcher (as atlas-worker)\n"
         ,
@@ -381,6 +382,8 @@ static atlas_status parse_args(cli_state *st, int argc, char **argv, bool *want_
                 st->opts.full = true;
             } else if (strcmp(a, "--rebuild") == 0) {
                 st->opts.rebuild = true;
+            } else if (strcmp(a, "--remote") == 0) {
+                st->opts.remote = true;
             } else if (strcmp(a, "--reverse") == 0) {
                 st->opts.reverse = true;
             } else if (strcmp(a, "--symbol") == 0) {
@@ -3815,7 +3818,8 @@ static atlas_status run_job(cli_state *st, atlas_renderer *r, int64_t limit, atl
         jc.plural = "jobs";
         int64_t count = 0;
         bool more = false;
-        result = atlas_service_job_list(NULL, 0, limit, emit_job, &jc, &count, &more, err);
+        result = atlas_service_job_list(NULL, 0, limit, st->opts.remote, emit_job, &jc,
+                                            &count, &more, err);
         /* An empty list is still an answer, so the document is opened here when
          * no row opened it. */
         if (result == ATLAS_OK) {

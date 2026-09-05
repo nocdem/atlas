@@ -234,6 +234,10 @@ static void test_the_daemon_answers_to_no_authority_method(void) {
         "maintenance.prune",
         /* And the authority profile itself must not be settable over the wire. */
         "authority.unlock", "authority.set", "authority.grant", "authority.override",
+        /* A14. A daemon with a zeroed gateway policy (no submit keys, no TLS)
+         * must answer "unknown method" for the remote-submit group regardless of
+         * the caller's uid. */
+        "job.remote_submit", "job.remote_get", "job.remote_list", "job.remote_cancel",
     };
 
     atlas_err err;

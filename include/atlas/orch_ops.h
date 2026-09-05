@@ -592,6 +592,11 @@ typedef struct atlas_orch_job_usage {
 atlas_status atlas_db_orch_job_usage(atlas_db *db, const char *job_uid,
                                      atlas_orch_job_usage *out, atlas_err *err);
 
+/* A14. The newest transition reason name for a job, for `job.remote_get`.
+ * Returns ATLAS_OK with out[0] == '\0' when there are no transitions. */
+atlas_status atlas_db_orch_job_newest_reason(atlas_db *db, const char *job_uid,
+                                             char out[64], atlas_err *err);
+
 atlas_status atlas_db_orch_run_get(atlas_db *db, const char *run_uid, atlas_orch_run_view *out,
                                    bool *found, atlas_err *err);
 

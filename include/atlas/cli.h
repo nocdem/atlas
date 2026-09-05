@@ -35,6 +35,8 @@ typedef struct atlas_cli_opts {
      * changed — a separate request from `full`, which re-reads file content and
      * still parses nothing when the hashes match. */
     bool rebuild;
+    /* A14. `job list --remote`: list only jobs submitted through the gateway. */
+    bool remote;
     bool reverse; /* `code deps`: report what depends on this instead */
     bool symbol;  /* `code deps`/`code impact`: the operand is a symbol name */
     long depth;

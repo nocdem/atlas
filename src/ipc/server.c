@@ -1323,6 +1323,26 @@ atlas_status atlas_server_dispatch(atlas_server_ctx *ctx, const void *payload, s
             }
         }
     }
+    /* A14. The daemon's remote submit group, consulted additively right after
+     * the disposal group above and hidden the same way -- a peer this predicate
+     * refuses gets `unknown method`, not a refusal that would confirm the name
+     * exists.  A separate consult rather than folding these names into the
+     * gateway group: the gateway group's gate is one `SO_PEERCRED` comparison
+     * against a root-owned policy, and this one is that comparison *plus* the
+     * policy naming at least one remote-submit key *plus* a TLS-or-accepted-
+     * cleartext condition.  One question for two different grants is exactly the
+     * shape this project's own rules warn against. See
+     * `atlas_server_remote_submit_offered` in `src/ipc/server_orch_remote.c`. */
+    if (fn == NULL && atlas_server_remote_submit_offered(ctx, (long long)peer_uid)) {
+        size_t n = 0;
+        const atlas_method_entry *g = atlas_server_remote_submit_methods(&n);
+        for (size_t i = 0; i < n; i++) {
+            if (strcmp(atlas_ipc_request_method(req), g[i].name) == 0) {
+                fn = g[i].fn;
+                break;
+            }
+        }
+    }
     if (fn == NULL &&
         atlas_orchpolicy_is_any_dispatcher(&ctx->orchpolicy, (long long)peer_uid)) {
         size_t n = 0;

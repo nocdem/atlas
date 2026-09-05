@@ -254,4 +254,37 @@ bool atlas_server_remote_disposal_offered(const atlas_server_ctx *ctx, long long
  * that happen to agree today. */
 bool atlas_server_remote_disposal_policy_ready(const atlas_gwpolicy *gw);
 
+/* A14. The two shared orchestration helpers exposed from server_orch.c so that
+ * the remote submission group in server_orch_remote.c can call them without
+ * duplicating their frozen sentences.  A sentence that exists in two files is
+ * two rules that can drift, so they are not static. */
+atlas_status atlas_server_orch_disabled(dispatch_state *ds, atlas_err *err);
+atlas_status atlas_server_orch_write(dispatch_state *ds, atlas_orch_op *op, int timeout_ms,
+                                     const atlas_syspolicy *pol, atlas_orch_result *r,
+                                     atlas_err *err);
+atlas_status atlas_server_write_job_summary(dispatch_state *ds, const atlas_orch_result *r,
+                                            atlas_err *err);
+
+/* A14. The daemon's remote submission group -- `job.remote_submit`,
+ * `job.remote_get`, `job.remote_list`, `job.remote_cancel` -- in
+ * `src/ipc/server_orch_remote.c`, beside A16's `server_remote.c` and for the
+ * same reason: the peer test it is offered under adds two conditions beyond
+ * the plain gateway group's one, and folding the group into `server_orch.c`
+ * would make one `SO_PEERCRED` comparison answer for three different grants
+ * (`require_submitter`, `peer_is_gateway`, and now the policy conditions).
+ *
+ * Offered when all three: the peer is the gateway (`atlas_server_peer_is_gateway`),
+ * the gateway policy names at least one submission key
+ * (`ctx->gwpolicy.remote_submit_count > 0`), and TLS is in front or the
+ * operator has accepted cleartext submission.  Never consults
+ * `atlas_orchpolicy_permits_submitter`.  A peer outside these conditions gets
+ * `unknown method`, which is what a name that does not exist gets. */
+const atlas_method_entry *atlas_server_remote_submit_methods(size_t *count_out);
+bool atlas_server_remote_submit_offered(const atlas_server_ctx *ctx, long long peer_uid);
+/* The three conditions above, minus the peer test -- shared with
+ * `method_gateway_auth`'s `jobs:submit` scope derivation so what that endpoint
+ * reports a credential can do and what the dispatcher will actually offer for
+ * it can never disagree. */
+bool atlas_server_remote_submit_policy_ready(const atlas_gwpolicy *gw);
+
 #endif /* ATLAS_IPC_SERVER_INTERNAL_H */

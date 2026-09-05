@@ -36,6 +36,7 @@
 #include "atlas/safetext.h"
 #include "daemon/daemon_internal.h"
 #include "git/git_harden.h"
+#include "orch/policy_internal.h"
 
 void atlas_daemon_opts_init(atlas_daemon_opts *o) {
     memset(o, 0, sizeof(*o));
@@ -208,7 +209,22 @@ atlas_status atlas_daemon_run(const atlas_daemon_opts *opts, FILE *log, atlas_er
     /* Loaded before the watcher starts, because the watcher's timer is what
      * drives A8's recovery sweep and it has to be told whether to sweep. */
     atlas_orchpolicy orchpolicy;
-    if (serving_system_index) {
+    if (opts->orchpolicy_text != NULL) {
+        /* A14. Test hook, same precedent as `gwpolicy_text`: the suite needs a
+         * daemon offering `job.remote_submit` under a chosen orchestration
+         * policy, and `atlas_orchpolicy_load`'s root-ownership walk can only
+         * ever pass for a genuinely root-owned file.  Parsed with the internal
+         * `atlas_orchpolicy_parse_bytes`, which — unlike the loader — does NOT
+         * set `state`.  The caller must set ENABLED when the reason is ACTIVE,
+         * because that assignment belongs to the loader and not to the parser. */
+        memset(&orchpolicy, 0, sizeof(orchpolicy));
+        atlas_orchpolicy_reason reason =
+            atlas_orchpolicy_parse_bytes(opts->orchpolicy_text,
+                                         strlen(opts->orchpolicy_text), &orchpolicy);
+        if (reason == ATLAS_ORCHPOLICY_REASON_ACTIVE) {
+            orchpolicy.state = ATLAS_ORCHPOLICY_ENABLED;
+        }
+    } else if (serving_system_index) {
         atlas_orchpolicy_load(&orchpolicy);
     } else {
         memset(&orchpolicy, 0, sizeof(orchpolicy));

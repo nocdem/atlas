@@ -21,6 +21,16 @@
  * plausibly have, from both a client and a dispatcher connection, and requires
  * every one to answer `unknown method`.
  *
+ * ## A third group this file does not contain
+ *
+ * A14 adds `job.remote_submit`, `job.remote_get`, `job.remote_list` and
+ * `job.remote_cancel` in `src/ipc/server_orch_remote.c`, beside A16's
+ * `server_remote.c`.  That file's group is offered under three conditions —
+ * the peer is the gateway, the policy names a submission key, and TLS or
+ * cleartext acceptance — none of which is answered here.  This file never
+ * consults `atlas_server_remote_submit_offered` and the remote group never
+ * calls `require_submitter`.
+ *
  * ## Why a dispatcher tier is not a privileged tier
  *
  * A7.1's rule is that the socket carries no authority. It still does not. The
@@ -53,11 +63,15 @@
  * The refusal text names the policy rather than the caller. An error that told a
  * peer which uid *would* have been accepted is an error that enumerates the
  * deployment for anybody who can open the socket. */
-static atlas_status orch_disabled(dispatch_state *ds, atlas_err *err) {
+atlas_status atlas_server_orch_disabled(dispatch_state *ds, atlas_err *err) {
     const atlas_orchpolicy *p = &ds->ctx->orchpolicy;
     return atlas_err_set(err, ATLAS_ERR_CONFIG,
                          "orchestration is not enabled on this Atlas (%s)",
                          atlas_orchpolicy_reason_name(p->reason));
+}
+
+static atlas_status orch_disabled(dispatch_state *ds, atlas_err *err) {
+    return atlas_server_orch_disabled(ds, err);
 }
 
 /* A11.5a-R2. Every orchestration write the serve loop makes, stamped with what
@@ -81,8 +95,9 @@ static atlas_status orch_disabled(dispatch_state *ds, atlas_err *err) {
  * one, never here: this function is the one write point for six different
  * request shapes and loading unconditionally would cost a file read on every
  * HEARTBEAT and EVENT, which never needs one. */
-static atlas_status orch_write(dispatch_state *ds, atlas_orch_op *op, int timeout_ms,
-                               const atlas_syspolicy *pol, atlas_orch_result *r, atlas_err *err) {
+atlas_status atlas_server_orch_write(dispatch_state *ds, atlas_orch_op *op, int timeout_ms,
+                                     const atlas_syspolicy *pol, atlas_orch_result *r,
+                                     atlas_err *err) {
     op->contended_until_ms = atlas_orch_contention_seen();
     atlas_status st = atlas_writer_orch(ds->ctx->writer, op, timeout_ms, pol, r, err);
     if (st != ATLAS_OK && atlas_ipc_message_is_busy(atlas_err_msg(err))) {
@@ -92,6 +107,11 @@ static atlas_status orch_write(dispatch_state *ds, atlas_orch_op *op, int timeou
         }
     }
     return st;
+}
+
+static atlas_status orch_write(dispatch_state *ds, atlas_orch_op *op, int timeout_ms,
+                               const atlas_syspolicy *pol, atlas_orch_result *r, atlas_err *err) {
+    return atlas_server_orch_write(ds, op, timeout_ms, pol, r, err);
 }
 
 static atlas_status require_submitter(dispatch_state *ds, atlas_err *err) {
@@ -123,8 +143,11 @@ static atlas_status require_dispatcher(dispatch_state *ds, atlas_err *err) {
 
 /* --- writing a result ------------------------------------------------------ */
 
-static atlas_status write_job_summary(dispatch_state *ds, const atlas_orch_result *r,
-                                      atlas_err *err) {
+/* A14. Exposed so `server_orch_remote.c` can call it without duplicating the
+ * four JSON fields.  The static wrapper keeps every call site inside this file
+ * naming a short identifier. */
+atlas_status atlas_server_write_job_summary(dispatch_state *ds, const atlas_orch_result *r,
+                                            atlas_err *err) {
     atlas_status st = atlas_json_key_str(ds->j, "job", atlas_buf_cstr(&r->job_uid), err);
     if (st == ATLAS_OK) {
         st = atlas_json_key_str(ds->j, "state", atlas_orch_state_name(r->state), err);
@@ -139,6 +162,11 @@ static atlas_status write_job_summary(dispatch_state *ds, const atlas_orch_resul
         st = atlas_json_key_str(ds->j, "run", atlas_buf_cstr(&r->run_uid), err);
     }
     return st;
+}
+
+static atlas_status write_job_summary(dispatch_state *ds, const atlas_orch_result *r,
+                                      atlas_err *err) {
+    return atlas_server_write_job_summary(ds, r, err);
 }
 
 /* --- job.submit -------------------------------------------------------------
@@ -272,9 +300,11 @@ static atlas_status method_job_submit(dispatch_state *ds, const atlas_ipc_reques
      * never read is worse off than one who was refused.
      *
      * This is `job.submit`, which is in the submitter group and reachable only
-     * by a uid the root-owned policy names. There is no MCP tool and no gateway
-     * route that reaches this method, so a model payload has no surface on
-     * which to turn memory on, turn it off, or name a source. */
+     * by a uid the root-owned policy names.  There is no MCP tool and no
+     * gateway route that reaches this method — `job.remote_submit` in
+     * `src/ipc/server_orch_remote.c` is the gateway's path, and that method
+     * holds memory at OFF, parallel at 1, and parent empty, so a model payload
+     * reaching either surface has no lever for this parameter. */
     if (st == ATLAS_OK) {
         const char *mem = NULL;
         if (atlas_ipc_param_str(req, "memory", &mem) && mem != NULL && mem[0] != '\0') {
@@ -450,6 +480,10 @@ static atlas_status method_job_cancel(dispatch_state *ds, const atlas_ipc_reques
     }
     op->peer_uid = ds->peer_uid;
     op->actor = ATLAS_ORCH_ACTOR_CLIENT;
+    /* A14. The write point consults this flag for the operator-cancels-remote-job
+     * branch in op_cancel.  Set from SO_PEERCRED via the policy — never from a
+     * request parameter — so the gateway uid cannot claim it. */
+    op->peer_is_operator = atlas_server_peer_is_operator(ds->peer_uid);
     st = atlas_buf_set_str(&op->job_uid, uid, err);
     if (st != ATLAS_OK) {
         atlas_orch_op_free(op);
@@ -486,7 +520,15 @@ static atlas_status method_job_get(dispatch_state *ds, const atlas_ipc_request *
     atlas_orch_job_view_init(&v);
     bool found = false;
     st = atlas_db_orch_job_get(ds->db, uid, &v, &found, err);
-    if (st == ATLAS_OK && (!found || v.submitter_uid != ds->peer_uid)) {
+    /* A14. An operator peer may read any job submitted remotely (one whose
+     * `submit_key_id` is non-empty), verified at the write point in process by
+     * `atlas_server_peer_is_operator`.  The gateway uid is the submitter for
+     * every remote job, so uid equality alone is not a sufficient ownership
+     * test for that set.  A job without a submit_key_id is visible only to
+     * its own submitter, preserving the pre-A14 invariant. */
+    bool is_operator_visible = found && v.submit_key_id[0] != '\0' &&
+                               atlas_server_peer_is_operator(ds->peer_uid);
+    if (st == ATLAS_OK && (!found || (v.submitter_uid != ds->peer_uid && !is_operator_visible))) {
         st = atlas_err_set(err, ATLAS_ERR_USAGE, "no such job");
     }
     if (st != ATLAS_OK) {
@@ -531,6 +573,13 @@ static atlas_status method_job_get(dispatch_state *ds, const atlas_ipc_request *
         st = atlas_json_key_str(ds->j, "task", atlas_safe(&ds->safe, atlas_buf_cstr(&v.task_text)),
                                 err);
     }
+    /* A14. The credential that queued this job, when it was a remote job.
+     * Absent for local jobs (submit_key_id is empty), present for remote ones.
+     * A reader must not infer from absence that the job is local — it means
+     * only that the daemon did not report it. */
+    if (st == ATLAS_OK && v.submit_key_id[0] != '\0') {
+        st = atlas_json_key_str(ds->j, "key_id", v.submit_key_id, err);
+    }
     atlas_orch_job_view_free(&v);
     return st;
 }
@@ -561,6 +610,11 @@ static atlas_status emit_job(const atlas_orch_list_row *row, void *ud, atlas_err
     if (st == ATLAS_OK) {
         st = atlas_json_key_int(lc->ds->j, "attempts", row->attempts_started, err);
     }
+    /* A14. Emit key_id when non-empty, so the operator can see which credential
+     * queued a remote job in a list. Absent for local jobs. */
+    if (st == ATLAS_OK && row->submit_key_id[0] != '\0') {
+        st = atlas_json_key_str(lc->ds->j, "key_id", row->submit_key_id, err);
+    }
     if (st == ATLAS_OK) {
         st = atlas_json_obj_end(lc->ds->j, err);
     }
@@ -579,6 +633,15 @@ static atlas_status method_job_list(dispatch_state *ds, const atlas_ipc_request 
     if (after < 0) {
         after = 0;
     }
+    /* A14. `remote = true` lists only jobs submitted through the gateway
+     * (those whose submit_key_id is non-empty).  Only an operator peer may
+     * ask this; anyone else gets the frozen refusal sentence. */
+    bool remote = false;
+    (void)atlas_ipc_param_bool(req, "remote", &remote);
+    if (remote && !atlas_server_peer_is_operator(ds->peer_uid)) {
+        return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                             "this connection may not list jobs submitted through the gateway");
+    }
     st = atlas_json_key(ds->j, "jobs", err);
     if (st == ATLAS_OK) {
         st = atlas_json_arr_begin(ds->j, err);
@@ -587,8 +650,13 @@ static atlas_status method_job_list(dispatch_state *ds, const atlas_ipc_request 
     int64_t count = 0, cursor = after;
     bool more = false;
     if (st == ATLAS_OK) {
-        st = atlas_db_orch_job_list(ds->db, ds->peer_uid, after, limit, emit_job, &lc, &count,
-                                    &cursor, &more, err);
+        if (remote) {
+            st = atlas_db_orch_job_list_remote(ds->db, after, limit, emit_job, &lc, &count,
+                                               &cursor, &more, err);
+        } else {
+            st = atlas_db_orch_job_list(ds->db, ds->peer_uid, after, limit, emit_job, &lc,
+                                        &count, &cursor, &more, err);
+        }
     }
     if (st == ATLAS_OK) {
         st = atlas_json_arr_end(ds->j, err);

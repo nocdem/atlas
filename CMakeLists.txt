@@ -321,6 +321,10 @@ add_library(atlas_core STATIC
   # status that is derived on every read because nothing writes one.
   src/db/db_plan.c
   src/ipc/server_orch.c
+  # A14: the four methods the gateway's uid may call under remote-submit policy.
+  # See src/ipc/server_orch_remote.c for why this is a third table, not folded
+  # into server_orch.c.
+  src/ipc/server_orch_remote.c
   src/ipc/server_scanner.c
   # A12.1 T11. memory.put, memory.status and memory.reconcile -- the operator
   # group beside repo.scanner, above.

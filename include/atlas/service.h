@@ -1250,6 +1250,11 @@ typedef struct atlas_job_render {
     size_t memory_source_listed;
     /* True for `job get`, which prints every field; false for a list row. */
     bool detail;
+    /* A14. The bare 16-hex credential selector that queued this job, or NULL
+     * when the job was submitted locally.  Human renderers prefix with
+     * `ATLAS_APIKEY_ID_PREFIX` ("key_"); JSON renderers emit `key_id`.
+     * Points into a live response frame — copy if it must outlive the call. */
+    const char *key_id;
     /* True only when this row is being emitted inside a `jobs` array. The JSON
      * renderer needs to know: a member of an array is an anonymous object, and
      * a single result is a set of members on the document itself. Emitting an
@@ -1342,8 +1347,8 @@ atlas_status atlas_service_job_submit(atlas_ctx *ctx, const atlas_job_submit_opt
 atlas_status atlas_service_job_get(atlas_ctx *ctx, const char *job, atlas_job_sink sink,
                                    void *ud, atlas_err *err);
 atlas_status atlas_service_job_list(atlas_ctx *ctx, int64_t after, int64_t limit,
-                                    atlas_job_sink sink, void *ud, int64_t *count_out,
-                                    bool *more_out, atlas_err *err);
+                                    bool remote, atlas_job_sink sink, void *ud,
+                                    int64_t *count_out, bool *more_out, atlas_err *err);
 atlas_status atlas_service_job_cancel(atlas_ctx *ctx, const char *job, atlas_job_sink sink,
                                       void *ud, atlas_err *err);
 

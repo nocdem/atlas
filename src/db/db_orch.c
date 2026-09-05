@@ -3972,6 +3972,41 @@ atlas_status atlas_db_orch_job_usage(atlas_db *db, const char *job_uid,
     return s;
 }
 
+/* A14. The `reason` field of `job.remote_get`: the newest transition's reason
+ * name for the given job.  Returns ATLAS_OK with `out[0] == '\0'` when the job
+ * has no transitions (should not happen in practice, but is not an error).
+ * Used only by the remote group — `job.get` does not yet report a reason. */
+atlas_status atlas_db_orch_job_newest_reason(atlas_db *db, const char *job_uid,
+                                             char out[64], atlas_err *err) {
+    out[0] = '\0';
+    if (job_uid == NULL || job_uid[0] == '\0') {
+        return ATLAS_OK;
+    }
+    static const char SQL[] =
+        "SELECT t.reason FROM orch_transitions t"
+        " JOIN orch_jobs j ON j.id = t.job_id"
+        " WHERE j.job_uid = ?1"
+        " ORDER BY t.id DESC LIMIT 1;";
+    sqlite3_stmt *q = NULL;
+    atlas_status s = atlas_db_prepare(db, SQL, &q, err);
+    if (s != ATLAS_OK) {
+        return s;
+    }
+    s = atlas_db_bind_text_opt(db, q, 1, job_uid, err);
+    if (s != ATLAS_OK) {
+        atlas_db_finish(db, q);
+        return s;
+    }
+    if (sqlite3_step(q) == SQLITE_ROW) {
+        const char *r = atlas_db_col_text(q, 0);
+        if (r != NULL) {
+            s = copy_fixed(out, 64u, r, "reason", err);
+        }
+    }
+    atlas_db_finish(db, q);
+    return s;
+}
+
 atlas_status atlas_db_orch_run_get(atlas_db *db, const char *run_uid, atlas_orch_run_view *out,
                                    bool *found, atlas_err *err) {
     *found = false;

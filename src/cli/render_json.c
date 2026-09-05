@@ -743,6 +743,10 @@ static atlas_status j_job_item(atlas_renderer *r, const atlas_job_render *jr, at
          * about the run: nothing was started and nothing was written. */
         st = atlas_json_key_bool(j, "busy", true, err);
     }
+    /* A14. The credential's bare 16-hex selector; absent for local jobs. */
+    if (st == ATLAS_OK && jr->key_id != NULL && jr->key_id[0] != '\0') {
+        st = atlas_json_key_str(j, "key_id", jr->key_id, err);
+    }
     if (st == ATLAS_OK && jr->in_list) {
         st = atlas_json_obj_end(j, err);
     }

@@ -68,6 +68,18 @@ typedef struct atlas_daemon_opts {
      * one. The only production code that sets it is
      * `tests/tools/atlas_gw_daemon.c`. */
     const char *gwpolicy_text;
+    /* A14. Test hook: the raw bytes of an orchestration policy, parsed with
+     * `atlas_orchpolicy_parse_bytes` instead of the compiled-in
+     * `atlas_orchpolicy_load`. NULL selects production's path unchanged.
+     *
+     * Same precedent as `gwpolicy_text` above: `test_orch_remote_rpc.c` needs
+     * a daemon actually offering `job.remote_submit` under a chosen
+     * orchestration policy, and `atlas_orchpolicy_load`'s root-ownership walk
+     * can only ever pass for a genuinely root-owned file — a fixture cannot
+     * produce one. Never a CLI flag, an environment variable, a policy key, an
+     * RPC method or an MCP tool. The only production code that sets it is
+     * `tests/tools/atlas_gw_daemon.c`. */
+    const char *orchpolicy_text;
 } atlas_daemon_opts;
 
 void atlas_daemon_opts_init(atlas_daemon_opts *o);

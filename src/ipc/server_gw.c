@@ -160,10 +160,37 @@ static atlas_status method_gateway_auth(dispatch_state *ds, const atlas_ipc_requ
              * cleartext acceptance, derives nothing, so what this endpoint
              * reports a credential can do and what the dispatcher will
              * actually let it do never disagree. */
+            char derived_scopes[ATLAS_APIKEY_SCOPES_MAX + 32u];
             const char *scopes = rec.scopes;
             if (rec.mask == 0u && atlas_server_remote_disposal_policy_ready(&ds->ctx->gwpolicy) &&
                 strcmp(rec.key_id, ds->ctx->gwpolicy.remote_dispose_key) == 0) {
                 scopes = atlas_apikey_scope_name(ATLAS_SCOPE_DECISIONS_DISPOSE);
+            } else if (atlas_server_remote_submit_policy_ready(&ds->ctx->gwpolicy)) {
+                /* A14. `jobs:submit` is never stored on a key row (Decision 1).
+                 * It is derived here for each key the policy names as a submit
+                 * key, and only when the remote submit group is offered (the same
+                 * three conditions the group itself is offered under, minus the
+                 * peer half, which is moot: this request already reached a
+                 * gateway-only method). A submit credential may hold stored read
+                 * scopes, so the derived scope is appended to the stored list.
+                 * The derivation is also guarded inside `atlas_orch_remote_verify`
+                 * in the write transaction, independent of what this endpoint
+                 * reports. */
+                const atlas_gwpolicy *gw = &ds->ctx->gwpolicy;
+                for (size_t si = 0; si < gw->remote_submit_count; si++) {
+                    if (strcmp(rec.key_id, gw->remote_submit_keys[si]) == 0) {
+                        const char *sn = atlas_apikey_scope_name(ATLAS_SCOPE_JOBS_SUBMIT);
+                        if (rec.scopes[0] != '\0') {
+                            (void)snprintf(derived_scopes, sizeof(derived_scopes),
+                                           "%s %s", rec.scopes, sn);
+                        } else {
+                            (void)snprintf(derived_scopes, sizeof(derived_scopes),
+                                           "%s", sn);
+                        }
+                        scopes = derived_scopes;
+                        break;
+                    }
+                }
             }
             st = atlas_json_key_str(ds->j, "scopes", scopes, err);
         }

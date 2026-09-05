@@ -36,11 +36,13 @@
 #include "support/fixture.h"
 
 /* Declared in src/ipc/server_internal.h, which is not on the test include path.
- * The two tables are the subject of half this file, so they are reached
+ * The three tables are the subject of half this file, so they are reached
  * directly rather than inferred from a live daemon's behaviour. */
 typedef struct atlas_method_entry atlas_method_entry;
 const atlas_method_entry *atlas_server_orch_client_methods(size_t *count_out);
 const atlas_method_entry *atlas_server_orch_dispatch_methods(size_t *count_out);
+/* A14: the third table -- the gateway's remote submit group. */
+const atlas_method_entry *atlas_server_remote_submit_methods(size_t *count_out);
 /* Only the name is read here; the function pointer is the server's business. */
 struct atlas_method_entry {
     const char *name;
@@ -97,6 +99,12 @@ static const char *const FORBIDDEN_METHODS[] = {
     "job.branch", "job.pr", "job.github", "job.approve", "job.authorize",
     "orch.apply", "orch.commit", "orch.push", "patch.apply", "patch.commit",
     "dispatch.apply", "dispatch.commit", "dispatch.push",
+    /* A14. Four names that must never exist in the remote-submit namespace.
+     * "apply" is a lifecycle transition; "artifact", "log" would expose a
+     * worker's output to a remote credential; "run" is the dispatch-level
+     * concept the gateway may not touch. See `server_orch_remote.c`'s head
+     * comment for the argument. */
+    "job.remote_apply", "job.remote_artifact", "job.remote_log", "job.remote_run",
 };
 
 /* Dispatcher methods, asked from an ordinary client connection. */
@@ -217,27 +225,42 @@ static void test_no_authority_method_exists_in_the_protocol(void) {
     fx_close(&fx);
 }
 
-/* --- the two tables ----------------------------------------------------------- */
+/* --- the three tables ---------------------------------------------------------- */
 
 static void test_the_two_method_groups_are_disjoint_and_carry_no_verb(void) {
-    size_t nc = 0, nd = 0;
+    size_t nc = 0, nd = 0, nr = 0;
     const atlas_method_entry *c = atlas_server_orch_client_methods(&nc);
     const atlas_method_entry *d = atlas_server_orch_dispatch_methods(&nd);
-    T_CHECK(nc > 0 && nd > 0);
+    /* A14: the third table -- the gateway's remote submit group. */
+    const atlas_method_entry *r = atlas_server_remote_submit_methods(&nr);
+    T_CHECK(nc > 0 && nd > 0 && nr > 0);
 
-    /* Disjoint. An overlap would mean a name whose behaviour depends on which
-     * table was searched first, which is the drift two dispatch tables cause. */
+    /* Mutually disjoint. An overlap would mean a name whose behaviour depends
+     * on which table was searched first, which is the drift multiple dispatch
+     * tables cause. */
     for (size_t i = 0; i < nc; i++) {
         for (size_t k = 0; k < nd; k++) {
             T_CHECK_MSG(strcmp(c[i].name, d[k].name) != 0,
                         "\"%s\" is in both orchestration method groups", c[i].name);
+        }
+        for (size_t k = 0; k < nr; k++) {
+            T_CHECK_MSG(strcmp(c[i].name, r[k].name) != 0,
+                        "\"%s\" is in both the client and the remote-submit groups", c[i].name);
+        }
+    }
+    for (size_t k = 0; k < nd; k++) {
+        for (size_t j = 0; j < nr; j++) {
+            T_CHECK_MSG(strcmp(d[k].name, r[j].name) != 0,
+                        "\"%s\" is in both the dispatcher and the remote-submit groups",
+                        d[k].name);
         }
     }
     /* Each group's names are prefixed by its own namespace, so which group a
      * method is in is visible in the name a caller types. The client group holds
      * two namespaces since A12.0 — `job.` and `plan.` — and both are the same
      * principal's surface: an operator's own. The dispatcher group holds neither,
-     * which is asserted below and again in `tests/test_plan_rpc.c`. */
+     * which is asserted below and again in `tests/test_plan_rpc.c`. The remote
+     * submit group is a sub-namespace of `job.`: all four names carry `job.remote_`. */
     for (size_t i = 0; i < nc; i++) {
         T_CHECK_MSG(strncmp(c[i].name, "job.", 4u) == 0 || strncmp(c[i].name, "plan.", 5u) == 0,
                     "client method \"%s\" is misnamed", c[i].name);
@@ -245,6 +268,10 @@ static void test_the_two_method_groups_are_disjoint_and_carry_no_verb(void) {
     for (size_t k = 0; k < nd; k++) {
         T_CHECK_MSG(strncmp(d[k].name, "dispatch.", 9u) == 0,
                     "dispatcher method \"%s\" is misnamed", d[k].name);
+    }
+    for (size_t k = 0; k < nr; k++) {
+        T_CHECK_MSG(strncmp(r[k].name, "job.remote_", 11u) == 0,
+                    "remote-submit method \"%s\" is not in the job.remote_ namespace", r[k].name);
     }
 
     /* No verb that would mean authority or repository mutation. A8 produces a
@@ -255,14 +282,25 @@ static void test_the_two_method_groups_are_disjoint_and_carry_no_verb(void) {
                                         "branch",  "pr",     "github",    "authorize",
                                         "grant",   "install", "restore",  "prune",
                                         "backup",  "register"};
-    for (size_t g = 0; g < 2; g++) {
-        const atlas_method_entry *t = g == 0 ? c : d;
-        size_t n = g == 0 ? nc : nd;
+    /* A14: "artifact" and "log" are additionally forbidden in the remote table:
+     * they would expose a worker's output to a bearer credential. */
+    static const char *const REMOTE_EXTRA_VERBS[] = {"artifact", "log"};
+    for (size_t g = 0; g < 3; g++) {
+        const atlas_method_entry *t = g == 0 ? c : (g == 1 ? d : r);
+        size_t n = g == 0 ? nc : (g == 1 ? nd : nr);
         for (size_t i = 0; i < n; i++) {
             for (size_t v = 0; v < sizeof VERBS / sizeof VERBS[0]; v++) {
                 T_CHECK_MSG(strstr(t[i].name, VERBS[v]) == NULL,
                             "orchestration method \"%s\" contains the verb \"%s\"", t[i].name,
                             VERBS[v]);
+            }
+            if (g == 2) {
+                for (size_t v = 0; v < sizeof REMOTE_EXTRA_VERBS / sizeof REMOTE_EXTRA_VERBS[0];
+                     v++) {
+                    T_CHECK_MSG(strstr(t[i].name, REMOTE_EXTRA_VERBS[v]) == NULL,
+                                "remote-submit method \"%s\" contains the forbidden verb \"%s\"",
+                                t[i].name, REMOTE_EXTRA_VERBS[v]);
+                }
             }
         }
     }
@@ -286,7 +324,7 @@ static void test_a_disabled_policy_selects_the_client_group_for_everybody(void) 
 static const atlas_test TESTS[] = {
     {"no authority method exists in the protocol",
      test_no_authority_method_exists_in_the_protocol},
-    {"the two method groups are disjoint and carry no verb",
+    {"the three method groups are mutually disjoint and carry no verb",
      test_the_two_method_groups_are_disjoint_and_carry_no_verb},
     {"a disabled policy selects the client group for everybody",
      test_a_disabled_policy_selects_the_client_group_for_everybody},

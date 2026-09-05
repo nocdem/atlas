@@ -337,6 +337,13 @@ set(ATLAS_TESTS
   # gateway.auth scope, and the write point's frozen refusals reached through
   # the daemon rather than in process.
   test_gw_dispose
+  # --- A14: the remote-submit group, verified against a live gateway daemon ---
+  #
+  # The four methods the gateway uid may call under the combined gateway +
+  # orchestration policy, driven against a real daemon started by atlas-gw-daemon
+  # with both policies injected.  The zeroed-policy fixture daemon is also
+  # exercised to prove the group is hidden when no policy names a submit key.
+  test_orch_remote_rpc
   # --- A9.1: knowledge kinds, and a lifecycle state that closes a demand ---
   #
   # The vocabulary, the kind-aware transition table, the resolve capability,
@@ -441,6 +448,9 @@ set_tests_properties(test_apikey PROPERTIES LABELS "integration")
 set_tests_properties(test_gateway PROPERTIES LABELS "unit")
 set_tests_properties(test_gw_remote PROPERTIES LABELS "daemon" TIMEOUT 900 RUN_SERIAL TRUE)
 set_tests_properties(test_gw_dispose PROPERTIES LABELS "daemon" TIMEOUT 900 RUN_SERIAL TRUE)
+# A14. The remote-submit group is a live-daemon test: it forks atlas-gw-daemon
+# with both an injected gateway policy and an injected orchestration policy.
+set_tests_properties(test_orch_remote_rpc PROPERTIES LABELS "daemon" TIMEOUT 900 RUN_SERIAL TRUE)
 
 # A4. The content hash, the transition table and validation are pure functions —
 # bytes in, a digest or a verdict out — so this suite needs no repository, no

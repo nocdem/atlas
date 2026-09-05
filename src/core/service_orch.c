@@ -99,6 +99,8 @@ static void fill_render(const atlas_ipc_response *r, atlas_job_render *jr, bool 
         {&jr->terminal_at, "terminal_at"}, {&jr->spec_digest, "spec_digest"},
         {&jr->task, "task"},      {&jr->run, "run"},
         {&jr->run_status, "run_status"}, {&jr->follow_up, "follow_up"},
+        /* A14. The credential's bare 16-hex selector; absent for local jobs. */
+        {&jr->key_id, "key_id"},
     };
     for (size_t i = 0; i < sizeof strs / sizeof strs[0]; i++) {
         const char *v = NULL;
@@ -270,6 +272,7 @@ atlas_status atlas_service_job_cancel(atlas_ctx *ctx, const char *job, atlas_job
 typedef struct list_args {
     int64_t after;
     int64_t limit;
+    bool remote;
 } list_args;
 
 static atlas_status build_list(atlas_json *j, void *ud, atlas_err *err) {
@@ -280,6 +283,9 @@ static atlas_status build_list(atlas_json *j, void *ud, atlas_err *err) {
     }
     if (st == ATLAS_OK && a->limit > 0) {
         st = atlas_json_key_int(j, "limit", a->limit, err);
+    }
+    if (st == ATLAS_OK && a->remote) {
+        st = atlas_json_key_bool(j, "remote", true, err);
     }
     return st;
 }
@@ -293,9 +299,9 @@ static atlas_status forward_row(const atlas_ipc_response *r, size_t index, void 
                                 atlas_err *err);
 
 atlas_status atlas_service_job_list(atlas_ctx *ctx, int64_t after, int64_t limit,
-                                    atlas_job_sink sink, void *ud, int64_t *count_out,
-                                    bool *more_out, atlas_err *err) {
-    list_args a = {after, limit};
+                                    bool remote, atlas_job_sink sink, void *ud,
+                                    int64_t *count_out, bool *more_out, atlas_err *err) {
+    list_args a = {after, limit, remote};
     atlas_ipc_response *resp = NULL;
     atlas_buf raw = ATLAS_BUF_INIT;
     atlas_status st = atlas_service_orch_call(ctx, "job.list", build_list, &a, &resp, &raw, err);
@@ -337,6 +343,8 @@ static atlas_status forward_row(const atlas_ipc_response *r, size_t index, void 
     (void)atlas_ipc_result_arr_obj_str(r, "jobs", index, "driver", &jr.driver);
     (void)atlas_ipc_result_arr_obj_str(r, "jobs", index, "created_at", &jr.created_at);
     (void)atlas_ipc_result_arr_obj_int(r, "jobs", index, "attempts", &jr.attempts);
+    /* A14. key_id is present on remote jobs; absent on local ones. Borrowed. */
+    (void)atlas_ipc_result_arr_obj_str(r, "jobs", index, "key_id", &jr.key_id);
     return lc->sink != NULL ? lc->sink(&jr, lc->ud, err) : ATLAS_OK;
 }
 

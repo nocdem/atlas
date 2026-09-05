@@ -572,8 +572,14 @@ static atlas_status h_diff_end(atlas_renderer *r, const atlas_diff_report *rep, 
 static atlas_status h_job_item(atlas_renderer *r, const atlas_job_render *jr, atlas_err *err) {
     FILE *out = r->out;
     if (!jr->detail) {
-        (void)fprintf(out, "%-34s %-17s %-10s %-8s %s\n", jr->job, jr->state, jr->repo,
-                      jr->driver, jr->created_at);
+        if (jr->key_id != NULL && jr->key_id[0] != '\0') {
+            (void)fprintf(out, "%-34s %-17s %-10s %-8s %s  credential: %s%s\n",
+                          jr->job, jr->state, jr->repo, jr->driver, jr->created_at,
+                          ATLAS_APIKEY_ID_PREFIX, jr->key_id);
+        } else {
+            (void)fprintf(out, "%-34s %-17s %-10s %-8s %s\n", jr->job, jr->state, jr->repo,
+                          jr->driver, jr->created_at);
+        }
         return ATLAS_OK;
     }
     (void)fprintf(out, "job           %s\n", jr->job);
@@ -588,6 +594,10 @@ static atlas_status h_job_item(atlas_renderer *r, const atlas_job_render *jr, at
     (void)fprintf(out, "created       %s\n", jr->created_at);
     if (jr->terminal_at != NULL && jr->terminal_at[0] != '\0') {
         (void)fprintf(out, "ended         %s\n", jr->terminal_at);
+    }
+    /* A14. The credential that queued this job, if it was a remote submission. */
+    if (jr->key_id != NULL && jr->key_id[0] != '\0') {
+        (void)fprintf(out, "credential    %s%s\n", ATLAS_APIKEY_ID_PREFIX, jr->key_id);
     }
     if (jr->task != NULL && jr->task[0] != '\0') {
         /* Labelled, because it is a submitter's words and not Atlas'. */

@@ -203,6 +203,15 @@ static void test_a_schema_nine_database_reaches_ten_additively(void) {
              "DROP TABLE memory_claim_anchors;"
              "DROP TABLE memory_context_packs;"
              "DROP TABLE memory_trailer_bindings;"
+             /* A14's migration 32, for the same reason as the `repositories`
+              * columns above: it adds two columns and an index rather than a
+              * table, so nothing else in this rewind takes them with it, and
+              * migration 32 re-running on top of a database that still holds
+              * `submit_key_id` fails with "duplicate column name". The index
+              * goes first -- SQLite refuses to drop a column an index names. */
+             "DROP INDEX idx_orch_jobs_submit_key;"
+             "ALTER TABLE orch_jobs DROP COLUMN submit_key_id;"
+             "ALTER TABLE orch_transitions DROP COLUMN key_id;"
              "DELETE FROM schema_migrations WHERE version >= 10;");
     T_EQ_INT(schema_of(db), 9);
     T_CHECK(!table_exists(db, "decision_edge_events"));

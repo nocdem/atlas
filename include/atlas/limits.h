@@ -1002,10 +1002,10 @@
 
 /* Requests one peer may make per minute, and the ceiling on that ceiling.
  *
- * Behind a reverse proxy every request appears to come from the proxy unless
- * `trust_forwarded_for` is set, so this degrades to a global limit. That is
- * stated in `docs/remote-access.md` rather than hidden: a limit that looks
- * per-peer and is not is worse than one nobody believed in. */
+ * The limit is one fixed window over the gateway's total forwarded request
+ * rate; `trust_forwarded_for` is parsed and printed and changes nothing about
+ * it today — no code reads a forwarded address. The residual is in
+ * `docs/backlog.md`. */
 #define ATLAS_GW_DEFAULT_RATE_PER_MINUTE 600
 #define ATLAS_GW_MAX_RATE_PER_MINUTE 60000
 

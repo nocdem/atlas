@@ -1,0 +1,30 @@
+# Atlas -- TLS in front of the gateway. A system service the operator runs;
+# not an Atlas dependency. Atlas terminates no TLS and cannot verify this file.
+server {
+    # The address and port the operator's devices already use. The LAN address
+    # literally, never 0.0.0.0: that would also expose the listener on docker0.
+    listen 192.168.0.198:8799 ssl;
+    server_name 192.168.0.198;
+
+    ssl_certificate     /etc/nginx/atlas/atlas.crt;
+    ssl_certificate_key /etc/nginx/atlas/atlas.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+
+    # Equal to the policy's max_request_bytes (1048576) and to Atlas'
+    # ATLAS_GW_MAX_BODY_BYTES. Stated so the two bounds are known to agree.
+    client_max_body_size 1m;
+
+    location / {
+        proxy_pass http://127.0.0.1:8787;
+        proxy_http_version 1.1;
+        # No `proxy_set_header Host`: nginx's default ($proxy_host, i.e.
+        # 127.0.0.1:8787) is what the gateway's host_matches_listener compares
+        # against, should the anonymous read floor ever be installed.
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+        # The gateway reads neither header today; they are for this log's sake.
+        # Above ATLAS_GW_UPSTREAM_TIMEOUT_MS (60 s), so the gateway's own 504
+        # reaches the client rather than nginx's.
+        proxy_read_timeout 75s;
+    }
+}

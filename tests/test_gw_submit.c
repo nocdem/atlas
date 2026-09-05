@@ -366,9 +366,11 @@ static bool extract_session_cookie(const atlas_buf *resp, char *out, size_t out_
     return true;
 }
 
-/* Logs in with `token` and returns the session cookie. */
+/* Logs in with `token` and returns the session cookie.
+ * If `secure_out` is non-NULL it is set to whether the Set-Cookie line carries
+ * "; Secure" -- which gateway.c:1938-1950 emits only under REVERSE_PROXY. */
 static void login_and_get_cookie(atlas_gateway *g, const char *token, char *cookie_out,
-                                 size_t cookie_size) {
+                                 size_t cookie_size, bool *secure_out) {
     atlas_buf lresp = ATLAS_BUF_INIT;
     char login_body[256];
     (void)snprintf(login_body, sizeof(login_body), "{\"key\":\"%s\"}", token);
@@ -378,6 +380,13 @@ static void login_and_get_cookie(atlas_gateway *g, const char *token, char *cook
                  status_of(&lresp), body_of(&lresp));
     T_REQUIRE_MSG(extract_session_cookie(&lresp, cookie_out, cookie_size),
                  "the login response carried no session cookie: %s", atlas_buf_cstr(&lresp));
+    if (secure_out != NULL) {
+        static const char SC_NEEDLE[] = "Set-Cookie: atlas_session=";
+        const char *p = strstr(atlas_buf_cstr(&lresp), SC_NEEDLE);
+        const char *eol = (p != NULL) ? strchr(p, '\r') : NULL;
+        const char *q = (p != NULL) ? strstr(p, "; Secure") : NULL;
+        *secure_out = (q != NULL && (eol == NULL || q < eol));
+    }
     atlas_buf_free(&lresp);
 }
 
@@ -679,7 +688,7 @@ static void test_b_method_not_allowed(void) {
      * The write route's api_handle_write calls neither session_get nor
      * anonymous_ok — the bearer is the only credential it accepts. */
     char cookie[256];
-    login_and_get_cookie(g, e.browser_token, cookie, sizeof cookie);
+    login_and_get_cookie(g, e.browser_token, cookie, sizeof cookie, NULL);
     http_request2(g, "POST", "/api/v1/job/submit", NULL, cookie, NULL, NULL,
                   "repo=proj&task=hi", (size_t)-1, &resp);
     T_CHECK_MSG(status_of(&resp) == 401,
@@ -889,7 +898,11 @@ static void test_c_auth_me_fields(void) {
         open_http_gateway(ptext, &d, &g);
 
         char cookie[256];
-        login_and_get_cookie(g, e.browser_token, cookie, sizeof cookie);
+        bool secure1 = false;
+        login_and_get_cookie(g, e.browser_token, cookie, sizeof cookie, &secure1);
+        /* gateway.c:1938-1950, the property season A leans on */
+        T_CHECK_MSG(secure1, "session cookie missing ; Secure under REVERSE_PROXY "
+                   "(gateway.c:1938-1950, the property season A leans on)");
 
         atlas_buf resp = ATLAS_BUF_INIT;
         http_request2(g, "GET", "/auth/me", NULL, cookie, NULL, NULL, NULL, (size_t)-1, &resp);
@@ -925,7 +938,7 @@ static void test_c_auth_me_fields(void) {
         open_http_gateway(ptext, &d, &g);
 
         char cookie[256];
-        login_and_get_cookie(g, e.browser_token, cookie, sizeof cookie);
+        login_and_get_cookie(g, e.browser_token, cookie, sizeof cookie, NULL);
 
         atlas_buf resp = ATLAS_BUF_INIT;
         http_request2(g, "GET", "/auth/me", NULL, cookie, NULL, NULL, NULL, (size_t)-1, &resp);
@@ -962,7 +975,11 @@ static void test_c_auth_me_fields(void) {
         open_http_gateway(ptext, &d, &g);
 
         char cookie[256];
-        login_and_get_cookie(g, e.browser_token, cookie, sizeof cookie);
+        bool secure3 = true;
+        login_and_get_cookie(g, e.browser_token, cookie, sizeof cookie, &secure3);
+        /* gateway.c:1938-1950, the property season A leans on */
+        T_CHECK_MSG(!secure3, "session cookie has ; Secure under tls_mode = NONE "
+                   "(gateway.c:1938-1950, must be absent without REVERSE_PROXY)");
 
         atlas_buf resp = ATLAS_BUF_INIT;
         http_request2(g, "GET", "/auth/me", NULL, cookie, NULL, NULL, NULL, (size_t)-1, &resp);

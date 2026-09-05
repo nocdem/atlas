@@ -2503,3 +2503,8 @@ the installed binary being reachable from the fixture's socket, and changing tha
 means reproducing the daemon-start fixture it currently delegates to
 `fx_daemon_start`. Recording rather than acting on it here, under the rule that
 the test suite is not modified to hide a real finding.
+
+## `trust_forwarded_for` is parsed and inert (2026-09-05)
+
+`trust_forwarded_for` is parsed and inert; a per-peer limit behind a proxy needs
+a reader of the forwarded address and a per-peer table, neither of which exists.

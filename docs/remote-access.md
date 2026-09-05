@@ -665,14 +665,11 @@ which a degraded policy exposes more.
 
 ### Rate limiting, stated honestly
 
-The limit is a fixed window over the gateway's total forwarded request rate.
-Behind a reverse proxy every request appears to come from the proxy unless
-`trust_forwarded_for` is set, so it degrades to a global limit rather than a
-per-peer one. That is said here rather than hidden: a limit that looks per-peer
-and is not is worse than one nobody believed in.
-
-`trust_forwarded_for` is off by default because believing a header an attacker
-can vary would make the limit unenforceable while continuing to look enforced.
+The limit is one fixed window over the gateway's total forwarded request rate.
+Behind a reverse proxy every request comes from the proxy, and the limit is the
+same global one it always was; `trust_forwarded_for` is parsed and printed and
+changes nothing about it today — no code reads a forwarded address. It stays
+`no`, and the residual is in `docs/backlog.md`.
 
 ### Anonymous browser reads, stated honestly
 

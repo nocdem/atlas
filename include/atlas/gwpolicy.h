@@ -296,11 +296,9 @@ typedef struct atlas_gwpolicy {
 
     /* Whether a forwarded client address may be believed for rate limiting.
      *
-     * Off by default, and the consequence is stated rather than hidden: behind
-     * a reverse proxy every request appears to come from the proxy, so per-peer
-     * rate limiting degrades to a global one. Believing a header by default
-     * would be worse — an attacker would simply vary it, and the limit would
-     * become unenforceable while continuing to look enforced. */
+     * Off by default. `trust_forwarded_for` is parsed and printed and changes
+     * nothing about the rate limit today — no code reads a forwarded address.
+     * The residual is in `docs/backlog.md`. */
     bool trust_forwarded_for;
 } atlas_gwpolicy;
 

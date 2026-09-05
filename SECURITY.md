@@ -498,10 +498,12 @@ makes it true, and a bug there cannot make it false.
   gateway runs as the account that owns the index, a compromised gateway is a
   compromised everything. The separation is real only when a root-owned policy
   names a distinct `gateway_uid` and the index is `0700 atlasd`.
-- **Rate limiting is global, not per-peer, behind a reverse proxy.** Every
-  request appears to come from the proxy unless `trust_forwarded_for` is set,
-  and that key is off by default because believing a header an attacker can vary
-  would make the limit unenforceable while continuing to look enforced.
+- **Rate limiting is global, not per-peer, behind a reverse proxy.** The limit
+  is one fixed window over the gateway's total forwarded request rate. Behind
+  a reverse proxy every request comes from the proxy, and the limit is the same
+  global one it always was; `trust_forwarded_for` is parsed and printed and
+  changes nothing about it today — no code reads a forwarded address. It stays
+  `no`, and the residual is in `docs/backlog.md`.
 - **The audit trail records that a request happened, not what it returned.**
 - **A browser session is an in-memory record and a restart forgets it.** That is
   deliberate; it is not durable evidence of anything.

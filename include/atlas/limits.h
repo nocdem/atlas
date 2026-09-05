@@ -1000,7 +1000,7 @@
  * Longer than a read needs and shorter than a client's patience. */
 #define ATLAS_GW_UPSTREAM_TIMEOUT_MS 60000
 
-/* Requests one peer may make per minute, and the ceiling on that ceiling.
+/* Requests the gateway may forward per minute, and the ceiling on that ceiling.
  *
  * The limit is one fixed window over the gateway's total forwarded request
  * rate; `trust_forwarded_for` is parsed and printed and changes nothing about

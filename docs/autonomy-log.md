@@ -97,3 +97,62 @@ devirle **Steward tarafından onaylandı** — Operator adına değil, kendi ad�
 Operator satırları cevapsız duruyor ve devir onları kapsamıyor.
 
 Sıradaki adım: T1 dağıtılır, sonucu doğrulanır, ve tur orada durur.
+
+## 2026-09-05 — T1 yürüdü, tur durdu
+
+Executor (Sonnet) T1'i uyguladı: `c9b4130`, ardından Steward'ın geri
+gönderdiği tek satırlık kapanış `5766384`.
+
+**Ne yapıldı.** Oturum çerezinin `Secure` niteliği ilk kez iddia edildi — biri
+`REVERSE_PROXY` altında doğru, diğeri `tls_mode = NONE` altında yanlış olmak
+üzere iki yönlü, yani hiçbir şey yapmayan bir kod bu testi geçemez. nginx
+referans bloğu `deploy/a9/nginx-atlas.conf.example` olarak yazıldı — Atlas'ın
+asla kurmadığı, operatörün kurduğu bir dosya. `trust_forwarded_for`'un bir şey
+vaat eden dört cümlesi düzeltildi ve gerçek durum `docs/backlog.md`'ye geçti.
+Atlas'a değişiklik gerekçesi `MODEL_PROPOSAL` olarak kaydedildi — sözleşme
+§10'un ilk kez uygulandığı yer.
+
+**Steward'ın doğruladıkları.** Commit yalnızca planın adlandırdığı yedi dosyaya
+dokunuyor. İki iddia ilk çalıştırmada geçti, ki plan bunu bir kapı olarak
+yazmıştı: geçmeselerdi planın olgu bölümü yanlış olurdu ve plan önce
+düzeltilirdi. Dört test paketi ve uyarısız derleme.
+
+### Bulgu: bir düzeltme kusuru kapatmak yerine taşıyabilir
+
+Executor gövdeyi düzeltti, başlığı bırakti — çünkü plan dört yeri adlandırıyordu
+ve başlık onlardan biri değildi. Sonuç, dört satır arayla kendi kendiyle çelişen
+bir yorum: ilk satır "bir eşin dakikada yapabileceği istek", gövde "toplam oran".
+Öncesinde yorum baştan sona yanlıştı; sonrasında iki cevap veriyordu ve okuyanın
+aklında kalacak olan ilki.
+
+Executor bunu **düzeltmedi, bildirdi** — charter §6'nın istediği tam olarak bu,
+ve doğru davranış. Steward geri gönderdi, çünkü bu yeni kapsam değil: bir görevin
+kendi bıraktığı çelişkiyi kapatmak o görevin işidir. Tek kelime değişti.
+
+Deneyim olarak kaydı: **rol sınırları çalıştı, ama kendiliğinden değil.**
+Executor doğru yerde durdu ve Steward'ın bakması gerekti. Kimsenin bakmadığı bir
+kurulumda o çelişki, "düzeltildi" diye kapanmış bir görevin içinde kalırdı.
+
+### Turun durduğu yer
+
+T1 bitti. Kalan dört görevin hiçbiri dağıtılamıyor:
+
+- **T2** — iki Operator satırı bekliyor (giriş şekli, hangi anahtarlar).
+- **T3** — dağıtımın kendisi: root düzenlemeleri, iki servis yeniden başlatma,
+  sertifika. Charter §1'in Operator'a ayırdığı şey.
+- **T4** — Operator'ın cihazlarını istiyor.
+- **T5** — T3 ve T4'ün gözlediklerini anlatıyor; henüz gözlenmedi.
+
+**Devir tamamlandı ve yenilenmedikçe bitti.** Sözleşme §9: A sezonunun planı
+onaylanıp görevleri dağıtıldığında biter. Dağıtılabilir tek görev dağıtıldı.
+
+### Bu turdan çıkan üç şey
+
+1. **Bir kanal sezonunun otonom yürüyebilen kısmı küçüktür.** Beşte bir. Sebep
+   yetenek değil, yetki: iş makineyi değiştiriyor.
+2. **Rol ayrımı gerçek bir kusur yakaladı** — ama yakalayan sınırın kendisi
+   değil, sınırda duran Executor'ın raporu ve onu okuyan Steward'dı. Otomatik
+   değil.
+3. **Sözleşme §10 ilk meyvesini verdi:** görev bittiğinde Atlas'ta bir
+   `MODEL_PROPOSAL` var. Operator makineye döndüğünde bakacağı yer sohbet değil,
+   elden çıkarılabilir bir kayıt.

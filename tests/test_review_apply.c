@@ -1457,7 +1457,11 @@ static void test_the_operator_channel_write_points_have_the_documented_callers(v
      * *caller* count constraints.md and this season's rule describe is two:
      * `src/cli/cli.c` (one caller before A15) and `src/core/service_review.c`
      * (the second, added by this season) -- checked explicitly below by
-     * naming both and excluding every other caller. */
+     * naming both and excluding every other caller.
+     *
+     * A14 came here and touched nothing in the decision layer. The remote
+     * submission path never presents a confirmation prompt and does not call
+     * `atlas_service_decision_confirm`; the count stays at two callers. */
     callsite_scan sc2 = {"atlas_service_decision_confirm(", 0u, ATLAS_BUF_INIT};
     walk_sources(ATLAS_SRC_DIR "/src", scan_for_needle, &sc2);
     T_CHECK_MSG(sc2.files_with_calls == 3u,

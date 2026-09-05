@@ -9,9 +9,14 @@
  *
  * So this asserts the *inventory* and the *schemas*: the exact set of tool
  * names, that none of them mentions an approval verb, and that no schema
- * declares a `token` or a `confirmation` argument. Since every schema sets
- * `additionalProperties: false`, a member no schema declares is a member no
- * caller can send.
+ * declares a `token` or a `confirmation` argument. Every schema publishes
+ * `additionalProperties: false`, but that is only enforced for one tool:
+ * `run_job_submit` calls `atlas_jsonv_check_only_keys` (T7, A14). The other
+ * tools publish a claim the adapter does not check — a documented bound that
+ * is not the implemented bound, which is worse than no bound; `docs/backlog.md`
+ * carries the entry. The forbidden-property test below is still meaningful: it
+ * asserts the *schema* carries no approval property, even though the schema
+ * alone does not stop a caller from sending one.
  *
  * The process runs with no database, no daemon and no repository: the tool
  * surface is a property of the binary, and asking about it must not require any
@@ -411,6 +416,14 @@ static void test_no_source_or_document_overstates_the_approval_claim(void) {
         ATLAS_SRC_DIR "/src/core/service_review.c",
         ATLAS_SRC_DIR "/include/atlas/review.h",
         ATLAS_SRC_DIR "/src/core/review.c",
+        /* A14: the remote-submission surfaces and the documents that carry its
+         * honest-contract sentences and the cleartext chain verbatim. */
+        ATLAS_SRC_DIR "/src/ipc/server_orch_remote.c",
+        ATLAS_SRC_DIR "/src/orch/remote.c",
+        ATLAS_SRC_DIR "/include/atlas/orch_remote.h",
+        ATLAS_SRC_DIR "/docs/remote-submission.md",
+        ATLAS_SRC_DIR "/docs/orchestration.md",
+        ATLAS_SRC_DIR "/docs/remote-access.md",
         NULL,
     };
     for (size_t f = 0; FILES[f] != NULL; f++) {
@@ -455,6 +468,20 @@ static void test_the_documents_state_the_precise_contract(void) {
         {ATLAS_SRC_DIR "/src/gw/ui/mission-control.html", "stores no authority"},
         {ATLAS_SRC_DIR "/integrations/claude/atlas/skills/atlas-memory/SKILL.md",
          "atlas review apply"},
+        /* A14: the submission-channel honesty sentences. */
+        {ATLAS_SRC_DIR "/src/gw/ui/mission-control.html",
+         "records the channel and the credential, not a person"},
+        {ATLAS_SRC_DIR "/src/gw/ui/mission-control.html", "a task is a prompt"},
+        {ATLAS_SRC_DIR "/docs/remote-submission.md", "a task is a prompt"},
+        {ATLAS_SRC_DIR "/docs/remote-submission.md", "runs as the operator"},
+        {ATLAS_SRC_DIR "/SECURITY.md", "runs as the operator"},
+        {ATLAS_SRC_DIR "/docs/orchestration.md", "not what one task may ask a worker to read"},
+        /* The require_submitter sentence in server_orch_remote.c's head comment. */
+        {ATLAS_SRC_DIR "/src/ipc/server_orch_remote.c", "never consults"},
+        /* The cleartext chain — verbatim in four documents. */
+        {ATLAS_SRC_DIR "/SECURITY.md", "does not cross that segment"},
+        {ATLAS_SRC_DIR "/docs/remote-access.md", "does not cross that segment"},
+        {ATLAS_SRC_DIR "/docs/remote-submission.md", "does not cross that segment"},
     };
     for (size_t i = 0; i < sizeof(required) / sizeof(required[0]); i++) {
         atlas_buf text = ATLAS_BUF_INIT;
@@ -544,6 +571,11 @@ static void test_the_single_write_point_has_exactly_three_callers(void) {
      * project knowledge with no recoverable reason. The audit row is also the
      * warrant the write point spends, so the two cannot be split across
      * transactions even in principle.
+     *
+     * **A14 came here and touched nothing in the decision layer.** Remote
+     * submission queues a job through `atlas_orch_apply_in_tx` (one caller
+     * throughout); it does not write a lifecycle transition, does not call
+     * `atlas_decision_apply_in_tx`, and does not add a fourth caller.
      *
      * Scanning `src/` and not a fixed list is the point: a fixed list would be
      * satisfied by a new file the list does not name. */

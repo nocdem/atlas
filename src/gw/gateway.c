@@ -697,8 +697,12 @@ static bool rate_ok(atlas_gateway *g) {
  *
  * A9's "no duplicated tool semantics" requirement is satisfied by construction:
  * there is one `TOOLS[]` and one `run` function per tool. */
-static atlas_status mcp_exchange(atlas_gateway *g, const principal *pr, const char *body,
-                                 size_t body_len, atlas_buf *out_json, atlas_err *err) {
+/* A14. `token` is the request's bearer, for the four job tools that forward
+ * it to the daemon. NULL is accepted (no remote_token is set). The caller
+ * wipes its copy after this returns; teardown wipes `s->remote_token`. */
+static atlas_status mcp_exchange(atlas_gateway *g, const principal *pr, const char *token,
+                                 const char *body, size_t body_len, atlas_buf *out_json,
+                                 atlas_err *err) {
     char *buf = NULL;
     size_t buf_len = 0;
     FILE *mem = open_memstream(&buf, &buf_len);
@@ -723,6 +727,13 @@ static atlas_status mcp_exchange(atlas_gateway *g, const principal *pr, const ch
      * a valid JSON-RPC message. */
     s.got_initialize = true;
     s.initialized = true;
+    /* A14. The bearer, for the four job tools. Set after init so teardown's
+     * wipe always runs regardless of which path init took. */
+    if (token != NULL && token[0] != '\0') {
+        atlas_err terr;
+        atlas_err_init(&terr);
+        (void)atlas_buf_set_str(&s.remote_token, token, &terr);
+    }
 
     atlas_status st = atlas_mcp_handle_document(&s, body, body_len, err);
     atlas_mcp_server_teardown(&s);
@@ -958,52 +969,58 @@ typedef struct api_route {
      * value that is not a number is refused rather than reaching the daemon as
      * a string it will reject less clearly. */
     const char *ints[GW_API_MAX_PARAMS];
+    /* Per-row body ceiling. Zero for read routes (body not accepted); for
+     * write routes, the tighter bound that fits this route's body shape.
+     * `api_handle_write` reads `route->body_max` rather than a hardcoded
+     * constant, so a submit route can admit a task-sized body while a
+     * disposal route stays at the small floor. */
+    size_t body_max;
 } api_route;
 
 /* Every route is a read. There is no write anywhere in this table, and adding
  * one would need a write scope no A9 credential can hold. */
 static const api_route API_ROUTES[] = {
-    {"/api/v1/status", "daemon.status", ATLAS_SCOPE_REPO_READ, {NULL}, {NULL}},
-    {"/api/v1/repos", "repo.list", ATLAS_SCOPE_REPO_READ, {NULL}, {NULL}},
-    {"/api/v1/repo", "repo.state", ATLAS_SCOPE_REPO_READ, {"repo", NULL}, {NULL}},
+    {"/api/v1/status", "daemon.status", ATLAS_SCOPE_REPO_READ, {NULL}, {NULL}, 0},
+    {"/api/v1/repos", "repo.list", ATLAS_SCOPE_REPO_READ, {NULL}, {NULL}, 0},
+    {"/api/v1/repo", "repo.state", ATLAS_SCOPE_REPO_READ, {"repo", NULL}, {NULL}, 0},
     {"/api/v1/events", "events.since", ATLAS_SCOPE_REPO_READ,
-     {"repo", "since", "limit", NULL}, {"since", "limit", NULL}},
+     {"repo", "since", "limit", NULL}, {"since", "limit", NULL}, 0},
     {"/api/v1/search", "repo.search", ATLAS_SCOPE_REPO_READ,
-     {"repo", "query", "limit", "cursor", NULL}, {"limit", "cursor", NULL}},
-    {"/api/v1/file", "repo.file", ATLAS_SCOPE_REPO_READ, {"repo", "path", NULL}, {NULL}},
+     {"repo", "query", "limit", "cursor", NULL}, {"limit", "cursor", NULL}, 0},
+    {"/api/v1/file", "repo.file", ATLAS_SCOPE_REPO_READ, {"repo", "path", NULL}, {NULL}, 0},
     {"/api/v1/history", "repo.history", ATLAS_SCOPE_REPO_READ,
-     {"repo", "path", "limit", NULL}, {"limit", NULL}},
+     {"repo", "path", "limit", NULL}, {"limit", NULL}, 0},
     /* A9.1 adds `kind` beside `status`: two independent filters, both forwarded,
      * both validated by the daemon against their vocabularies. Adding a parameter
      * to the row is the only way a query string reaches a daemon call, which is
      * what keeps the surface a fixed table rather than a proxy. */
     {"/api/v1/decisions", "decision.list", ATLAS_SCOPE_DECISIONS_READ,
-     {"repo", "status", "kind", "limit", "cursor", NULL}, {"limit", "cursor", NULL}},
+     {"repo", "status", "kind", "limit", "cursor", NULL}, {"limit", "cursor", NULL}, 0},
     {"/api/v1/decision", "decision.get", ATLAS_SCOPE_DECISIONS_READ,
-     {"repo", "decision", "revision", NULL}, {"revision", NULL}},
+     {"repo", "decision", "revision", NULL}, {"revision", NULL}, 0},
     {"/api/v1/decision/history", "decision.history", ATLAS_SCOPE_DECISIONS_READ,
-     {"repo", "decision", NULL}, {NULL}},
+     {"repo", "decision", NULL}, {NULL}, 0},
     {"/api/v1/gate", "gate.check", ATLAS_SCOPE_DECISIONS_READ,
-     {"repo", "decision", NULL}, {NULL}},
-    {"/api/v1/code/status", "code.status", ATLAS_SCOPE_GRAPH_READ, {"repo", NULL}, {NULL}},
-    {"/api/v1/code/file", "code.file", ATLAS_SCOPE_GRAPH_READ, {"repo", "path", NULL}, {NULL}},
+     {"repo", "decision", NULL}, {NULL}, 0},
+    {"/api/v1/code/status", "code.status", ATLAS_SCOPE_GRAPH_READ, {"repo", NULL}, {NULL}, 0},
+    {"/api/v1/code/file", "code.file", ATLAS_SCOPE_GRAPH_READ, {"repo", "path", NULL}, {NULL}, 0},
     {"/api/v1/code/symbol", "code.symbol", ATLAS_SCOPE_GRAPH_READ,
-     {"repo", "symbol", NULL}, {NULL}},
+     {"repo", "symbol", NULL}, {NULL}, 0},
     {"/api/v1/code/search", "code.search", ATLAS_SCOPE_GRAPH_READ,
-     {"repo", "query", "limit", NULL}, {"limit", NULL}},
-    {"/api/v1/sem/status", "sem.status", ATLAS_SCOPE_GRAPH_READ, {"repo", NULL}, {NULL}},
+     {"repo", "query", "limit", NULL}, {"limit", NULL}, 0},
+    {"/api/v1/sem/status", "sem.status", ATLAS_SCOPE_GRAPH_READ, {"repo", NULL}, {NULL}, 0},
     {"/api/v1/sem/symbol", "sem.symbol", ATLAS_SCOPE_GRAPH_READ,
-     {"repo", "symbol", "subject", NULL}, {NULL}},
+     {"repo", "symbol", "subject", NULL}, {NULL}, 0},
     {"/api/v1/sem/callers", "sem.callers", ATLAS_SCOPE_GRAPH_READ,
-     {"repo", "symbol", "depth", NULL}, {"depth", NULL}},
+     {"repo", "symbol", "depth", NULL}, {"depth", NULL}, 0},
     {"/api/v1/sem/callees", "sem.callees", ATLAS_SCOPE_GRAPH_READ,
-     {"repo", "symbol", "depth", NULL}, {"depth", NULL}},
+     {"repo", "symbol", "depth", NULL}, {"depth", NULL}, 0},
     {"/api/v1/impact", "sem.impact", ATLAS_SCOPE_IMPACT_READ,
-     {"repo", "subject", "depth", NULL}, {"depth", NULL}},
+     {"repo", "subject", "depth", NULL}, {"depth", NULL}, 0},
     {"/api/v1/code/impact", "code.impact", ATLAS_SCOPE_IMPACT_READ,
-     {"repo", "path", "symbol", "depth", NULL}, {"depth", NULL}},
+     {"repo", "path", "symbol", "depth", NULL}, {"depth", NULL}, 0},
     {"/api/v1/context", "sem.context", ATLAS_SCOPE_CONTEXT_READ,
-     {"repo", "task", "max_tokens", NULL}, {"max_tokens", NULL}},
+     {"repo", "task", "max_tokens", NULL}, {"max_tokens", NULL}, 0},
     /* A9.2.1. The verification workflow, read-only and no more.
      *
      * Three routes, all reads, and the absence of a fourth is the point: there
@@ -1021,34 +1038,45 @@ static const api_route API_ROUTES[] = {
      * a knowledge record, and a credential trusted to read the records is
      * trusted to read what bears on them. */
     {"/api/v1/verify/claims", "verify.claims", ATLAS_SCOPE_DECISIONS_READ,
-     {"repo", "decision", "limit", NULL}, {"limit", NULL}},
+     {"repo", "decision", "limit", NULL}, {"limit", NULL}, 0},
     {"/api/v1/verify/claim", "verify.show", ATLAS_SCOPE_DECISIONS_READ,
-     {"claim", "claim_id", NULL}, {"claim_id", NULL}},
-    {"/api/v1/verify/policy", "verify.policy", ATLAS_SCOPE_DECISIONS_READ, {NULL}, {NULL}},
+     {"claim", "claim_id", NULL}, {"claim_id", NULL}, 0},
+    {"/api/v1/verify/policy", "verify.policy", ATLAS_SCOPE_DECISIONS_READ, {NULL}, {NULL}, 0},
     {"/api/v1/audit", "gateway.audit_list", ATLAS_SCOPE_AUDIT_READ,
-     {"limit", "cursor", "key_id", NULL}, {"limit", "cursor", NULL}},
+     {"limit", "cursor", "key_id", NULL}, {"limit", "cursor", NULL}, 0},
 };
 
-/* Every route is a disposal. There is no read in this table, and adding a row
- * means adding its method to `WRITE_METHODS[]` in `tests/test_gateway.c` by
- * hand.
+/* A14/A16. Routes whose only principal is the bearer on the request, forwarded
+ * to a daemon method that verifies it. Adding a row means adding its method to
+ * `WRITE_METHODS[]` in `tests/test_gateway.c` by hand.
  *
- * Every row needs `ATLAS_SCOPE_DECISIONS_DISPOSE`, and that scope is not
- * grantable to an ordinary credential (`atlas_apikey_scope_grantable`):
- * `atlas_db_apikey_insert` refuses to store it, and the daemon derives it, at
- * `gateway.auth` time, for exactly the credential the root-owned gateway
- * policy names as `remote_dispose_key` — never for anything a client can mint
- * or ask for.
+ * Every row's scope is ungrantable (`atlas_apikey_scope_grantable` returns
+ * false): `atlas_db_apikey_insert` refuses to store it, and the daemon derives
+ * it, at `gateway.auth` time, for exactly the credentials the root-owned
+ * gateway policy names — never for anything a client can mint or ask for.
  *
- * `token` is not a declared parameter of either row: it is never read from
- * the request body, and `api_handle_write` appends it itself, from the
+ * `token` is not a declared parameter of any row: it is never read from the
+ * request body, and `api_handle_write` appends it itself, from the
  * `Authorization` header, after this table's parsing has already dropped
  * anything a body tried to name for itself. */
 static const api_route API_WRITE_ROUTES[] = {
     {"/api/v1/decision/challenge", "decision.remote_challenge", ATLAS_SCOPE_DECISIONS_DISPOSE,
-     {"repo", "decision", "revision", "intent", NULL}, {"revision", NULL}},
+     {"repo", "decision", "revision", "intent", NULL}, {"revision", NULL},
+     ATLAS_GW_WRITE_BODY_MAX_BYTES},
     {"/api/v1/decision/dispose", "decision.remote_dispose", ATLAS_SCOPE_DECISIONS_DISPOSE,
-     {"repo", "decision", "intent", "challenge", "confirmation", NULL}, {NULL}},
+     {"repo", "decision", "intent", "challenge", "confirmation", NULL}, {NULL},
+     ATLAS_GW_WRITE_BODY_MAX_BYTES},
+    /* A14. Four remote-submission routes. The submit route admits a body large
+     * enough for a percent-encoded task (3 × ATLAS_ORCH_TASK_MAX); the three
+     * read/cancel routes stay at the small floor. */
+    {"/api/v1/job/submit", "job.remote_submit", ATLAS_SCOPE_JOBS_SUBMIT,
+     {"repo", "task", "key", NULL}, {NULL}, ATLAS_GW_SUBMIT_BODY_MAX_BYTES},
+    {"/api/v1/job/get", "job.remote_get", ATLAS_SCOPE_JOBS_SUBMIT,
+     {"job", NULL}, {NULL}, ATLAS_GW_WRITE_BODY_MAX_BYTES},
+    {"/api/v1/job/list", "job.remote_list", ATLAS_SCOPE_JOBS_SUBMIT,
+     {"after", "limit", NULL}, {"after", "limit", NULL}, ATLAS_GW_WRITE_BODY_MAX_BYTES},
+    {"/api/v1/job/cancel", "job.remote_cancel", ATLAS_SCOPE_JOBS_SUBMIT,
+     {"job", NULL}, {NULL}, ATLAS_GW_WRITE_BODY_MAX_BYTES},
 };
 
 static bool route_wants(const api_route *r, const char *name, bool *is_int) {
@@ -1150,6 +1178,18 @@ static atlas_status build_api_params(const api_route *r, const char *query, cons
     }
     size_t i = 0;
     size_t qlen = query != NULL ? strlen(query) : 0;
+    /* Allocate a decode buffer large enough to hold any single value from
+     * this query string.  The value cannot be longer than the query itself
+     * (percent-encoding expands, never shrinks, so decoding only shrinks),
+     * which means qlen + 1 is an over-allocation that is always safe.  The
+     * submit route's task value can be up to ATLAS_ORCH_TASK_MAX bytes, far
+     * exceeding a fixed 1024-byte stack buffer.  NULL is a valid argument to
+     * free(), so a zero-length query passes through without an allocation. */
+    char *value = qlen > 0u ? (char *)malloc(qlen + 1u) : NULL;
+    if (qlen > 0u && value == NULL) {
+        atlas_ipc_params_abort(p);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory decoding query parameters");
+    }
     while (st == ATLAS_OK && i < qlen) {
         size_t start = i;
         while (i < qlen && query[i] != '&') {
@@ -1174,8 +1214,8 @@ static atlas_status build_api_params(const api_route *r, const char *query, cons
         if (!route_wants(r, name, &is_int)) {
             continue;
         }
-        char value[1024];
-        if (!percent_decode(eq + 1, (size_t)(query + end - (eq + 1)), value, sizeof value)) {
+        if (!percent_decode(eq + 1, (size_t)(query + end - (eq + 1)), value, qlen + 1u)) {
+            free(value);
             atlas_ipc_params_abort(p);
             atlas_buf_free(out);
             return atlas_err_set(err, ATLAS_ERR_USAGE, "a query parameter is malformed");
@@ -1187,12 +1227,14 @@ static atlas_status build_api_params(const api_route *r, const char *query, cons
             }
             for (const char *c = value; *c != '\0'; c++) {
                 if (*c < '0' || *c > '9') {
+                    free(value);
                     atlas_ipc_params_abort(p);
                     return atlas_err_set(err, ATLAS_ERR_USAGE,
                                          "a numeric query parameter is not a number");
                 }
                 n = n * 10 + (*c - '0');
                 if (n > 1000000) {
+                    free(value);
                     atlas_ipc_params_abort(p);
                     return atlas_err_set(err, ATLAS_ERR_USAGE,
                                          "a numeric query parameter is out of range");
@@ -1203,6 +1245,7 @@ static atlas_status build_api_params(const api_route *r, const char *query, cons
             st = atlas_json_key_str(j, name, value, err);
         }
     }
+    free(value);
     if (st == ATLAS_OK && extra_key != NULL) {
         st = atlas_json_key_str(j, extra_key, extra_value, err);
     }
@@ -1349,6 +1392,73 @@ static bool api_handle(atlas_gateway *g, const atlas_http_request *req, const pr
     return true;
 }
 
+/* A14/A16. True when the route is offered under the current policy. Switch has
+ * no `default:` so a new scope value causes a compile error if it is not
+ * handled here. */
+static bool route_offered(const atlas_gateway *g, const api_route *route) {
+    switch (route->scope) {
+    case ATLAS_SCOPE_DECISIONS_DISPOSE:
+        return g->policy.remote_dispose_key[0] != '\0';
+    case ATLAS_SCOPE_JOBS_SUBMIT:
+        return g->policy.remote_submit_count > 0;
+    case ATLAS_SCOPE_UNKNOWN:
+    case ATLAS_SCOPE_CONTEXT_READ:
+    case ATLAS_SCOPE_REPO_READ:
+    case ATLAS_SCOPE_DECISIONS_READ:
+    case ATLAS_SCOPE_GRAPH_READ:
+    case ATLAS_SCOPE_IMPACT_READ:
+    case ATLAS_SCOPE_AUDIT_READ:
+    case ATLAS_SCOPE_MEMORY_WRITE:
+    case ATLAS_SCOPE__COUNT:
+        return false;
+    }
+    return false;
+}
+
+/* The 404 sentence when a route's scope is not served by this policy. */
+static const char *route_not_offered_msg(const api_route *route) {
+    switch (route->scope) {
+    case ATLAS_SCOPE_DECISIONS_DISPOSE:
+        return "this gateway does not serve remote disposal";
+    case ATLAS_SCOPE_JOBS_SUBMIT:
+        return "this gateway does not serve remote submission";
+    case ATLAS_SCOPE_UNKNOWN:
+    case ATLAS_SCOPE_CONTEXT_READ:
+    case ATLAS_SCOPE_REPO_READ:
+    case ATLAS_SCOPE_DECISIONS_READ:
+    case ATLAS_SCOPE_GRAPH_READ:
+    case ATLAS_SCOPE_IMPACT_READ:
+    case ATLAS_SCOPE_AUDIT_READ:
+    case ATLAS_SCOPE_MEMORY_WRITE:
+    case ATLAS_SCOPE__COUNT:
+        return "this gateway does not serve this route";
+    }
+    return "this gateway does not serve this route";
+}
+
+/* The 401 sentence when a write route requires authentication. */
+static const char *route_unauth_msg(const api_route *route) {
+    switch (route->scope) {
+    case ATLAS_SCOPE_DECISIONS_DISPOSE:
+        return "a disposal needs the disposal credential presented as a bearer token; "
+               "a session cookie or the anonymous floor cannot dispose";
+    case ATLAS_SCOPE_JOBS_SUBMIT:
+        return "a submission needs a credential the policy names, presented as a bearer "
+               "token; a session cookie or the anonymous floor cannot submit";
+    case ATLAS_SCOPE_UNKNOWN:
+    case ATLAS_SCOPE_CONTEXT_READ:
+    case ATLAS_SCOPE_REPO_READ:
+    case ATLAS_SCOPE_DECISIONS_READ:
+    case ATLAS_SCOPE_GRAPH_READ:
+    case ATLAS_SCOPE_IMPACT_READ:
+    case ATLAS_SCOPE_AUDIT_READ:
+    case ATLAS_SCOPE_MEMORY_WRITE:
+    case ATLAS_SCOPE__COUNT:
+        return "a valid credential must be presented as a bearer token";
+    }
+    return "a valid credential must be presented as a bearer token";
+}
+
 /* A16. Handles one write-route request. Returns false when the path names no
  * write route.
  *
@@ -1408,27 +1518,24 @@ static bool api_handle_write(atlas_gateway *g, const atlas_http_request *req, co
         return true;
     }
     /* A tighter ceiling than the gateway's ordinary `ATLAS_GW_MAX_BODY_BYTES`
-     * — a disposal body is five short fields, never a document. */
-    if (body_len > ATLAS_GW_WRITE_BODY_MAX_BYTES) {
+     * — the per-row body bound, which is small for status/list/cancel and
+     * task-sized for submit. */
+    if (body_len > route->body_max) {
         *st_out = respond_error(g, req, 413, "request_too_large",
                                 "the request body exceeds the gateway limit", response, err);
         return true;
     }
-    if (g->policy.remote_dispose_key[0] == '\0') {
-        *st_out = respond_error(g, req, 404, "not_found",
-                                "this gateway does not serve remote disposal", response, err);
+    if (!route_offered(g, route)) {
+        *st_out = respond_error(g, req, 404, "not_found", route_not_offered_msg(route), response,
+                                err);
         return true;
     }
 
     principal pr;
     authenticate(g, req, &pr);
     if (!pr.authenticated) {
-        static const char UNAUTH[] =
-            "{\"ok\":false,\"error\":{\"code\":\"unauthenticated\","
-            "\"message\":\"a disposal needs the disposal credential presented as a bearer "
-            "token; a session cookie or the anonymous floor cannot dispose\"}}";
-        *st_out = respond(g, req, 401, "application/json", UNAUTH, sizeof UNAUTH - 1u,
-                          "WWW-Authenticate: Bearer\r\n", response, err);
+        *st_out = respond_error(g, req, 401, "unauthenticated", route_unauth_msg(route),
+                                response, err);
         {
             char detail[128];
             audit(g, "WEB_API", NULL, req->path, false, false, ATLAS_ERR_INTEGRITY,
@@ -1464,10 +1571,8 @@ static bool api_handle_write(atlas_gateway *g, const atlas_http_request *req, co
     atlas_err bperr;
     atlas_err_init(&bperr);
     if (atlas_apikey_bearer_parse(req->authorization, bearer, sizeof bearer, &bperr) != ATLAS_OK) {
-        *st_out = respond_error(g, req, 401, "unauthenticated",
-                                "a disposal needs the disposal credential presented as a bearer "
-                                "token; a session cookie or the anonymous floor cannot dispose",
-                                response, err);
+        *st_out = respond_error(g, req, 401, "unauthenticated", route_unauth_msg(route), response,
+                                err);
         audit(g, "WEB_API", &pr, req->path, false, false, ATLAS_ERR_INTEGRITY, now_ms() - started,
               "the presented credential could not be re-read for forwarding");
         return true;
@@ -1489,15 +1594,28 @@ static bool api_handle_write(atlas_gateway *g, const atlas_http_request *req, co
     }
 
     /* NUL-terminated so `build_api_params` -- written for a query string --
-     * can read it unchanged; bounded by the body-length check above. */
-    char body_cstr[ATLAS_GW_WRITE_BODY_MAX_BYTES + 1u];
-    memcpy(body_cstr, body, body_len);
-    body_cstr[body_len] = '\0';
+     * can read it unchanged; heap-allocated because the submit route's body
+     * ceiling is task-sized (262 144 bytes), which is too large for a stack
+     * frame on a gateway serving concurrent connections. */
+    atlas_buf body_nul = ATLAS_BUF_INIT;
+    {
+        atlas_err bnul_err;
+        atlas_err_init(&bnul_err);
+        if (atlas_buf_append(&body_nul, body, body_len, &bnul_err) != ATLAS_OK) {
+            *st_out = respond_error(g, req, 500, "internal",
+                                    "the request could not be handled", response, err);
+            memset(bearer, 0, sizeof bearer);
+            atlas_buf_free(&body_nul);
+            return true;
+        }
+    }
+    const char *body_cstr = atlas_buf_cstr(&body_nul);
 
     atlas_buf params = ATLAS_BUF_INIT;
     atlas_err perr;
     atlas_err_init(&perr);
     atlas_status pst = build_api_params(route, body_cstr, "token", bearer, &params, &perr);
+    atlas_buf_free(&body_nul);
     memset(bearer, 0, sizeof bearer);
     if (pst != ATLAS_OK) {
         *st_out = respond_error(g, req, 400, "bad_request", "a body parameter is malformed",
@@ -1583,6 +1701,7 @@ const atlas_gateway_route_view *atlas_gateway_api_routes(size_t *count_out) {
             views[i].path = API_ROUTES[i].path;
             views[i].method = API_ROUTES[i].method;
             views[i].scope = API_ROUTES[i].scope;
+            views[i].body_max = 0; /* read routes carry no body */
         }
         populated = true;
     }
@@ -1592,9 +1711,8 @@ const atlas_gateway_route_view *atlas_gateway_api_routes(size_t *count_out) {
     return views;
 }
 
-/* A16. The same shape, over `API_WRITE_ROUTES[]`. Nothing in the gateway
- * calls it either; it exists for `test_every_write_route_is_a_disposal_on_
- * the_reviewed_allowlist`. */
+/* A14/A16. The same shape, over `API_WRITE_ROUTES[]`. Nothing in the gateway
+ * calls it either; it exists for the write-table property test. */
 const atlas_gateway_route_view *atlas_gateway_api_write_routes(size_t *count_out) {
     static const size_t n = sizeof API_WRITE_ROUTES / sizeof API_WRITE_ROUTES[0];
     static atlas_gateway_route_view views[sizeof API_WRITE_ROUTES / sizeof API_WRITE_ROUTES[0]];
@@ -1604,6 +1722,7 @@ const atlas_gateway_route_view *atlas_gateway_api_write_routes(size_t *count_out
             views[i].path = API_WRITE_ROUTES[i].path;
             views[i].method = API_WRITE_ROUTES[i].method;
             views[i].scope = API_WRITE_ROUTES[i].scope;
+            views[i].body_max = API_WRITE_ROUTES[i].body_max;
         }
         populated = true;
     }
@@ -1721,10 +1840,31 @@ atlas_status atlas_gateway_serve_bytes(atlas_gateway *g, const char *request, si
             blen = (size_t)req.content_length;
         }
 
+        /* A14. Re-parse the bearer for the four job tools, which must forward
+         * it to the daemon. `authenticate()` above wiped its own copy the
+         * moment it was passed to `gateway.auth`, by design: this is the one
+         * call site that must forward it, so it keeps a second copy alive and
+         * wipes it immediately after `mcp_exchange` returns. */
+        char mcp_bearer[ATLAS_APIKEY_TOKEN_MAX];
+        mcp_bearer[0] = '\0';
+        {
+            atlas_err mberr;
+            atlas_err_init(&mberr);
+            (void)atlas_apikey_bearer_parse(req.authorization, mcp_bearer, sizeof mcp_bearer,
+                                            &mberr);
+        }
+
         atlas_buf doc = ATLAS_BUF_INIT;
         atlas_err merr;
         atlas_err_init(&merr);
-        atlas_status mst = mcp_exchange(g, &pr, body, blen, &doc, &merr);
+        atlas_status mst = mcp_exchange(g, &pr, mcp_bearer, body, blen, &doc, &merr);
+        /* Wipe the bearer immediately after use. */
+        {
+            volatile unsigned char *q = (volatile unsigned char *)mcp_bearer;
+            for (size_t i = 0; i < sizeof mcp_bearer; i++) {
+                q[i] = 0;
+            }
+        }
         atlas_status st;
         if (mst != ATLAS_OK) {
             st = respond_error(g, &req, 500, "internal", "the request could not be handled",
@@ -1858,23 +1998,30 @@ atlas_status atlas_gateway_serve_bytes(atlas_gateway *g, const char *request, si
                 atlas_buf body = ATLAS_BUF_INIT;
                 atlas_err berr;
                 atlas_err_init(&berr);
-                /* A16. `remote_disposal` is whether this gateway's policy
+                /* A16/A14. `remote_disposal` is whether this gateway's policy
                  * names a disposal key at all — the same test
                  * `api_handle_write` itself refuses on with 404 — and
                  * `cleartext_disposal` is whether the operator's written
                  * acceptance is present, so the browser can show its own
                  * cleartext-chain sentence rather than guess from `tls_mode`.
-                 * Neither depends on `pr`: both are properties of the
-                 * policy, true or false for every principal alike, which is
-                 * why they are unconditional on `anon` and computed the same
-                 * way `api_handle_write` itself decides. */
+                 * `remote_submission`, `remote_submission_driver` and
+                 * `cleartext_submission` mirror that for the submission channel.
+                 * None of these depends on `pr`: all are properties of the
+                 * policy, true or false for every principal alike, computed
+                 * the same way `route_offered` itself decides. */
                 (void)atlas_buf_appendf(
                     &body, &berr,
                     "{\"ok\":true,\"anonymous\":%s,\"remote_disposal\":%s,\"cleartext_disposal\":%s,"
+                    "\"remote_submission\":%s,\"remote_submission_driver\":\"%s\","
+                    "\"cleartext_submission\":%s,"
                     "\"label\":\"%s\",\"scopes\":\"%s\"}",
                     anon ? "true" : "false",
                     g->policy.remote_dispose_key[0] != '\0' ? "true" : "false",
-                    g->policy.cleartext_disposal_accepted ? "true" : "false", pr.label,
+                    g->policy.cleartext_disposal_accepted ? "true" : "false",
+                    g->policy.remote_submit_count > 0 ? "true" : "false",
+                    g->policy.remote_submit_driver,
+                    g->policy.cleartext_submission_accepted ? "true" : "false",
+                    pr.label,
                     atlas_buf_cstr(&scopes));
                 st = respond(g, &req, 200, "application/json", body.data, body.len, NULL, response,
                              err);

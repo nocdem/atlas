@@ -339,6 +339,10 @@ set(ATLAS_TESTS
   test_gw_dispose
   # --- A14: the remote-submit group, verified against a live gateway daemon ---
   #
+  # T6: the four HTTP routes (/api/v1/job/{submit,get,list,cancel}), bearer-only
+  # credential check, body bounds, /auth/me fields, and audit trail -- driven
+  # against a real daemon started by atlas-gw-daemon with both policies injected.
+  test_gw_submit
   # The four methods the gateway uid may call under the combined gateway +
   # orchestration policy, driven against a real daemon started by atlas-gw-daemon
   # with both policies injected.  The zeroed-policy fixture daemon is also
@@ -450,6 +454,7 @@ set_tests_properties(test_gw_remote PROPERTIES LABELS "daemon" TIMEOUT 900 RUN_S
 set_tests_properties(test_gw_dispose PROPERTIES LABELS "daemon" TIMEOUT 900 RUN_SERIAL TRUE)
 # A14. The remote-submit group is a live-daemon test: it forks atlas-gw-daemon
 # with both an injected gateway policy and an injected orchestration policy.
+set_tests_properties(test_gw_submit PROPERTIES LABELS "daemon" TIMEOUT 900 RUN_SERIAL TRUE)
 set_tests_properties(test_orch_remote_rpc PROPERTIES LABELS "daemon" TIMEOUT 900 RUN_SERIAL TRUE)
 
 # A4. The content hash, the transition table and validation are pure functions —

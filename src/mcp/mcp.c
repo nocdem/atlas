@@ -1195,6 +1195,16 @@ void atlas_mcp_server_teardown(atlas_mcp_server *s) {
     atlas_buf_free(&s->session_key);
     atlas_buf_free(&s->protocol);
     atlas_buf_free(&s->socket);
+    /* A14. Wipe the bearer before freeing, so the plaintext does not linger
+     * in freed heap memory. The volatile loop is the same pattern the gateway
+     * uses for its own bearer copies. */
+    if (s->remote_token.data != NULL) {
+        volatile unsigned char *q = (volatile unsigned char *)s->remote_token.data;
+        for (size_t i = 0; i < s->remote_token.len; i++) {
+            q[i] = 0;
+        }
+    }
+    atlas_buf_free(&s->remote_token);
 }
 
 /* One document in, one response out. The stdio loop and the HTTP transport both

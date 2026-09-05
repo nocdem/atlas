@@ -1294,13 +1294,17 @@ static void test_every_write_route_is_a_disposal_on_the_reviewed_allowlist(void)
     static const char *const GATEWAY_ONLY = "gateway.auth";
     static const char *const GATEWAY_AUDIT = "gateway.audit";
 
-    /* The whole write table, by name -- exactly the two methods A16 adds. Not
-     * generated from the table, on `READ_METHODS[]`'s own precedent above: a
-     * third row naming anything else fails loudly here, the moment it is
-     * added. */
+    /* The whole write table, by name -- the two disposal methods A16 adds and
+     * the four submission methods A14 adds. Not generated from the table, on
+     * `READ_METHODS[]`'s own precedent above: a seventh row naming anything
+     * else fails loudly here, the moment it is added. */
     static const char *const WRITE_METHODS[] = {
         "decision.remote_challenge",
         "decision.remote_dispose",
+        "job.remote_submit",
+        "job.remote_get",
+        "job.remote_list",
+        "job.remote_cancel",
     };
 
     size_t route_count = 0;
@@ -1318,13 +1322,17 @@ static void test_every_write_route_is_a_disposal_on_the_reviewed_allowlist(void)
             }
         }
         T_CHECK_MSG(allowed,
-                    "write route %s forwards to %s, which is not one of the two disposal methods",
+                    "write route %s forwards to %s, which is not on the six-method allowlist",
                     r->path, r->method);
 
-        T_CHECK_MSG(r->scope == ATLAS_SCOPE_DECISIONS_DISPOSE,
-                    "write route %s does not need decisions:dispose", r->path);
+        T_CHECK_MSG(r->scope == ATLAS_SCOPE_DECISIONS_DISPOSE ||
+                    r->scope == ATLAS_SCOPE_JOBS_SUBMIT,
+                    "write route %s's scope is neither decisions:dispose nor jobs:submit",
+                    r->path);
         T_CHECK_MSG(!atlas_apikey_scope_grantable(r->scope),
                     "write route %s's scope is grantable to an ordinary credential", r->path);
+        T_CHECK_MSG(r->body_max != 0,
+                    "write route %s has a zero body_max", r->path);
 
         for (size_t j = 0; j < sizeof READ_METHODS / sizeof READ_METHODS[0]; j++) {
             T_CHECK_MSG(strcmp(r->method, READ_METHODS[j]) != 0,
@@ -1341,14 +1349,17 @@ static void test_every_write_route_is_a_disposal_on_the_reviewed_allowlist(void)
     }
 
     /* The existing read-table test still passes unchanged (it is not touched
-     * by this test at all), and no read row gained the write scope while
-     * this table was added beside it. */
+     * by this test at all), and no read row gained a write scope or a non-zero
+     * body_max while this table was added beside it. */
     size_t read_count = 0;
     const atlas_gateway_route_view *read_routes = atlas_gateway_api_routes(&read_count);
     T_REQUIRE(read_routes != NULL);
     for (size_t i = 0; i < read_count; i++) {
-        T_CHECK_MSG(read_routes[i].scope != ATLAS_SCOPE_DECISIONS_DISPOSE,
-                    "read route %s carries the write scope", read_routes[i].path);
+        T_CHECK_MSG(read_routes[i].scope != ATLAS_SCOPE_DECISIONS_DISPOSE &&
+                    read_routes[i].scope != ATLAS_SCOPE_JOBS_SUBMIT,
+                    "read route %s carries a write scope", read_routes[i].path);
+        T_CHECK_MSG(read_routes[i].body_max == 0,
+                    "read route %s has a non-zero body_max", read_routes[i].path);
     }
 }
 

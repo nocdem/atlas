@@ -115,6 +115,7 @@ typedef struct atlas_gateway_route_view {
     const char *path;      /* the exact literal matched at gateway.c:1007 */
     const char *method;    /* the daemon method it forwards to */
     atlas_apikey_scope scope;
+    size_t body_max;       /* 0 for read routes; the per-row body ceiling for write routes */
 } atlas_gateway_route_view;
 
 /* A read-only view of API_ROUTES[]. Exists so a test can assert a property of the
@@ -122,9 +123,9 @@ typedef struct atlas_gateway_route_view {
  * test may pin. */
 const atlas_gateway_route_view *atlas_gateway_api_routes(size_t *count_out);
 
-/* A16. The same kind of view, over `API_WRITE_ROUTES[]` — the write table
- * beside `API_ROUTES[]`, every row of which forwards to a disposal and
- * nothing else. Same shape, same rule: a test asserts a property of every
+/* A14/A16. The same kind of view, over `API_WRITE_ROUTES[]` — routes whose
+ * only principal is the bearer on the request, forwarded to a daemon method
+ * that verifies it. Same shape, same rule: a test asserts a property of every
  * row rather than pinning a count, and nothing in the gateway calls this
  * either. */
 const atlas_gateway_route_view *atlas_gateway_api_write_routes(size_t *count_out);

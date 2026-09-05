@@ -385,6 +385,26 @@ static void test_no_credential_can_reach_a_write_tool(void) {
                     body_of(&resp));
     }
 
+    /* A14: the four job tools carry ATLAS_SCOPE_JOBS_SUBMIT, not MEMORY_WRITE.
+     * Even the most powerful grantable credential does not carry JOBS_SUBMIT
+     * (it is derived by the daemon for named keys only), so every call refuses
+     * with the "jobs:submit" scope sentence. */
+    static const char *const SUBMIT_WRITES[] = {
+        "atlas_job_submit", "atlas_job_status", "atlas_job_list", "atlas_job_cancel",
+    };
+    for (size_t i = 0; i < sizeof SUBMIT_WRITES / sizeof SUBMIT_WRITES[0]; i++) {
+        char msg[512];
+        (void)snprintf(msg, sizeof msg,
+                       "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":"
+                       "{\"name\":\"%s\",\"arguments\":{\"repo\":\"proj\"}}}",
+                       SUBMIT_WRITES[i]);
+        request(&e, "POST", "/mcp", auth, msg, &resp);
+        T_EQ_INT(status_of(&resp), 200);
+        T_CHECK_MSG(strstr(body_of(&resp), "jobs:submit") != NULL,
+                    "%s was not refused for want of jobs:submit: %s", SUBMIT_WRITES[i],
+                    body_of(&resp));
+    }
+
     /* A16: the same six scopes, plus `decisions:dispose` -- a principal whose
      * mask carries it still reaches no write tool, because no tool in
      * `TOOLS[]` maps to that scope at all. See `mcp_call_with_mask`'s own
@@ -415,6 +435,63 @@ static void test_no_credential_can_reach_a_write_tool(void) {
                     "%s was not refused for want of the write scope with decisions:dispose also "
                     "granted: %s",
                     WRITES[i], atlas_buf_cstr(&resp));
+    }
+
+    /* A14: DECISIONS_DISPOSE in the mask does not grant JOBS_SUBMIT, so all
+     * four job tools are still refused with the scope sentence. */
+    for (size_t i = 0; i < sizeof SUBMIT_WRITES / sizeof SUBMIT_WRITES[0]; i++) {
+        char msg[512];
+        (void)snprintf(msg, sizeof msg,
+                       "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":"
+                       "{\"name\":\"%s\",\"arguments\":{\"repo\":\"proj\"}}}",
+                       SUBMIT_WRITES[i]);
+        mcp_call_with_mask(&e, with_dispose, msg, &resp);
+        T_CHECK_MSG(strstr(atlas_buf_cstr(&resp), "jobs:submit") != NULL,
+                    "%s was not refused for want of jobs:submit with decisions:dispose granted: %s",
+                    SUBMIT_WRITES[i], atlas_buf_cstr(&resp));
+    }
+
+    /* A14. The four remote-only job tools carry ATLAS_SCOPE_JOBS_SUBMIT, which
+     * is not grantable through `atlas api-key create`. A credential holding
+     * every grantable scope finds it unset and gets the scope sentence. */
+    static const char *const JOB_TOOLS[] = {"atlas_job_submit", "atlas_job_status",
+                                             "atlas_job_list", "atlas_job_cancel"};
+    for (size_t i = 0; i < sizeof JOB_TOOLS / sizeof JOB_TOOLS[0]; i++) {
+        char msg[512];
+        (void)snprintf(msg, sizeof msg,
+                       "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":"
+                       "{\"name\":\"%s\",\"arguments\":{\"repo\":\"proj\"}}}",
+                       JOB_TOOLS[i]);
+        request(&e, "POST", "/mcp", auth, msg, &resp);
+        T_EQ_INT(status_of(&resp), 200);
+        T_CHECK_MSG(strstr(body_of(&resp), "jobs:submit") != NULL,
+                    "%s was not refused for want of the jobs:submit scope: %s", JOB_TOOLS[i],
+                    body_of(&resp));
+    }
+
+    /* A mask carrying JOBS_SUBMIT passes the scope check; the call proceeds to
+     * the daemon and may fail there, but it does not fail for want of the scope. */
+    atlas_scope_mask with_jobs = 0u;
+    {
+        atlas_err serr;
+        atlas_err_init(&serr);
+        T_OK(atlas_apikey_scopes_parse(
+                 "context:read repo:read decisions:read graph:read impact:read audit:read",
+                 &with_jobs, &serr),
+             &serr);
+    }
+    with_jobs |= ATLAS_SCOPE_BIT(ATLAS_SCOPE_JOBS_SUBMIT);
+
+    for (size_t i = 0; i < sizeof JOB_TOOLS / sizeof JOB_TOOLS[0]; i++) {
+        char msg[512];
+        (void)snprintf(msg, sizeof msg,
+                       "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":"
+                       "{\"name\":\"%s\",\"arguments\":{\"repo\":\"proj\"}}}",
+                       JOB_TOOLS[i]);
+        mcp_call_with_mask(&e, with_jobs, msg, &resp);
+        T_CHECK_MSG(strstr(atlas_buf_cstr(&resp), "jobs:submit") == NULL,
+                    "%s was refused for want of jobs:submit even with it in the mask: %s",
+                    JOB_TOOLS[i], atlas_buf_cstr(&resp));
     }
 
     atlas_buf_free(&resp);

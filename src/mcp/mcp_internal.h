@@ -154,6 +154,11 @@ typedef struct atlas_mcp_server {
      * adapter leaves it zero *and* leaves `remote` false, so the check is
      * skipped entirely there. A2's local trust boundary is unchanged. */
     atlas_scope_mask granted;
+    /* A14. The request's bearer, for the four job tools that must forward it
+     * to the daemon as `token`. Set by `mcp_exchange` after `authenticate`
+     * has wiped its own copy, cleared at teardown. Never set on the stdio
+     * adapter. */
+    atlas_buf remote_token;
 } atlas_mcp_server;
 
 /* Sets a server up without running a loop, so a non-stdio transport can drive

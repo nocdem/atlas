@@ -2430,3 +2430,76 @@ in the meantime (`showReviewDetail`, declining to offer a queue button when
 `row.revision !== row.latest_revision`) and `docs/review-surface.md`'s costs
 section and `docs/decision-lifecycle.md` both state the gap; neither changes
 what the walker itself will do with a sheet built before this fix lands.
+
+## Every MCP tool publishes `additionalProperties: false` but only one enforces it (2026-09-04)
+
+Found during A14's T9 pass, when the comment at the top of
+`tests/test_decision_mcp.c` was corrected.
+
+Every schema in `TOOLS[]` (`src/mcp/mcp_tools.c`) declares
+`"additionalProperties": false`. The scanner in `test_decision_mcp.c` asserts
+no schema carries a `"token"` or `"confirmation"` property, and that assertion is
+meaningful: it checks the *schema*, not what the adapter does with it. What the
+adapter does with the schema is different: `atlas_jsonv_check_only_keys` (T7,
+A14) is only called for `run_job_submit`. The other 40 tools publish
+`additionalProperties: false` as a published claim the adapter does not check
+— a documented bound that is not the implemented bound, which is worse than no
+bound (`P0`'s finding, one layer out).
+
+**The chain.** An MCP client sends `{"tool":"atlas_repo_list","params":{"confirm":"yes"}}`.
+The adapter dispatches to `atlas_repo_list`'s run function. That function reads
+only the keys it knows about and ignores `"confirm"`. No error is returned to the
+caller. The schema said this was impossible; the implementation allows it silently.
+
+The contained fix: call `atlas_jsonv_check_only_keys` in the dispatch path after
+the schema is validated, before the run function is called, using the schema's
+own declared properties as the allowlist. That is A8-CI work — the schema is a
+JSON document, not a typed struct — and belongs in a dedicated season rather than
+a hotfix, because the fix touches the dispatch path for every tool and the test
+surface for all 41 of them. `CLAUDE.md`'s "Adding an MCP tool" section now states
+the limitation instead of implying enforcement.
+
+## `rotate_dispose_reminder` in `src/cli/render_json.c` is now a misnomer (2026-09-04)
+
+Found during A14's documentation pass.
+
+`rotate_dispose_reminder` is a JSON key emitted by `render_json.c` in the
+`atlas api-key rotate` output. It was named when the only credential that ever
+warranted a reminder was a disposal key — the one credential `atlas api-key
+rotate` was designed around. A14 introduced `remote_submit_key`, a second kind
+of credential with its own reminder, but the JSON key name was not revisited.
+The emitted value is still correct; the key name no longer describes the category
+it belongs to. A caller reading `rotate_dispose_reminder` has to already know
+that A14 added a second reminder field at a different key, or they miss one.
+
+The contained fix: rename `rotate_dispose_reminder` to `rotate_key_reminder`
+(or a similarly general name) across `render_json.c`, `render_human.c`, any
+downstream caller, and the contract documentation. This is a JSON shape change
+and a contract change, requiring a migration note in `CLAUDE.md`.
+
+## `tests/test_review_apply.c` runs the installed `/usr/local/bin/atlas` and will fail after migration 32 on an undeployed machine (2026-09-04)
+
+Found during A14's T9/T10 pass, when the test suite was run before deployment.
+
+`test_review_apply.c` exercises `atlas review apply` end-to-end. It calls the
+*installed* `/usr/local/bin/atlas` binary — not the build-tree binary — because
+`atlas review apply` requires an interactive terminal and a live daemon, and the
+fixture wires both. That is correct behaviour for an integration test of this
+depth. The consequence is that any schema migration the build tree introduces but
+the installed binary does not yet know invalidates the test: the installed atlas
+opens the fixture database, the daemon runs schema migration 32, and the installed
+binary — which predates that migration — either refuses the upgraded schema or
+misbehaves reading the new columns.
+
+A14's migration 32 (`ALTER TABLE orch_jobs ADD COLUMN submit_key_id TEXT NOT NULL
+DEFAULT ''` and `ALTER TABLE orch_transitions ADD COLUMN key_id TEXT NOT NULL
+DEFAULT ''`) is the current trigger. After `make install` and a daemon restart the
+test passes again.
+
+The contained fix for the test: drive the build-tree binary rather than the
+installed one, or skip the test when the installed binary predates the schema the
+fixture will produce. Either change is non-trivial — the test's design rests on
+the installed binary being reachable from the fixture's socket, and changing that
+means reproducing the daemon-start fixture it currently delegates to
+`fx_daemon_start`. Recording rather than acting on it here, under the rule that
+the test suite is not modified to hide a real finding.

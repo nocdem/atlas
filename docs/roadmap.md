@@ -1475,7 +1475,7 @@ pilot runs: this project's own rule that no evidence of a result is not
 evidence against one applies to its own acceptance, and this document does
 not pre-write the shape of a finding nobody has measured yet.
 
-## In flight: A16 — approving a record from the browser
+## A16 — approving a record from the browser (shipped)
 
 The sentence it exists for is
 
@@ -1493,131 +1493,64 @@ in the place they had not asked for. That is the whole reason this section
 exists, and it is written down because the failure was a question that died in
 a document rather than a defect any review could have caught.
 
-**The plan is written and complete**: `docs/plans/2026-09-04-browser-disposal.md`
-— eleven tasks, its own channel identity and migration 31, its own ungrantable
-scope, absence from the MCP surface, the daemon authenticating the bearer token
-itself inside the transaction that spends the capability, replay bound to the
-revision's content hash, and a root-owned policy naming which record kinds may
-be disposed of remotely. `LOCAL_OPERATOR_CONFIRMED` is never reused: reusing it
-would make every audit row ever written retrospectively ambiguous, which is the
-one cost that cannot be paid back.
+**The plan**: `docs/plans/2026-09-04-browser-disposal.md` — eleven tasks, its
+own channel identity and migration 31, its own ungrantable scope, absence from
+the MCP surface, the daemon authenticating the bearer token itself inside the
+transaction that spends the capability, replay bound to the revision's content
+hash, and a root-owned policy naming which record kinds may be disposed of
+remotely. `LOCAL_OPERATOR_CONFIRMED` is never reused: reusing it would make
+every audit row ever written retrospectively ambiguous, which is the one cost
+that cannot be paid back.
 
-**In flight since 2026-09-04.** The operator first judged it not urgent and then,
-the same day, said to build it. Three of its ten tasks are done: the vocabularies
-and the ungrantable scope, migration 31 widening the ledger's actor CHECK, and the
-write point itself — which now derives the actor from the stored challenge rather
-than from anything a caller supplies, verifies the credential inside the
-transaction that spends the capability, and refuses a capability minted through
-one channel and offered through the other.
+**Started 2026-09-04; shipped 2026-09-04.** The TLS requirement the plan made
+hard was declined by the operator for their own network, with its chain recorded
+in `SECURITY.md`. It became an explicit, root-owned acceptance key that `atlas
+gateway status` prints. The full argument and the operator's words are in
+`docs/browser-disposal.md`.
 
-The TLS requirement the plan made hard was **declined by the operator for their
-own network** on 2026-09-04, with its chain recorded in `SECURITY.md` under
-"Approving a record from the browser: refused today, and why". It does not vanish:
-it becomes an explicit, root-owned acceptance key that `atlas gateway status`
-prints, so a reader finds a decision a person made rather than a check quietly
-absent.
+## A14 — a job an operator submits from wherever they are (shipped)
 
-Until the season lands, the deployment's statement is unchanged: nothing reachable
-over the network can change a lifecycle state.
-
-## Next: A14 — a job an operator submits from wherever they are
-
-**Never started. Retitled `Next` on 2026-09-04 at the operator's instruction**, after
-they asked whether the external model could yet submit work and were told no. Nothing
-in this section has been built: `git log` finds exactly one commit mentioning A14, the
-one that wrote this section. It was labelled `Next` when A12.1 closed, became `Later`
-when the operator put the review surface first, and is `Next` again now — a history
-worth keeping visible, because a section that has said `Next` twice without a line of
-code is the kind of thing a reader mistakes for shipped work.
-
-**What A16 leaves it, and what it does not.** A16 builds the first HTTP path on this
-gateway that writes, and the first daemon method group offered to the gateway uid — so
-the shapes A14 needs exist afterwards rather than having to be invented. What it does
-**not** leave is the authority: submitting work is a different capability from disposing
-of a record, it needs its own ungrantable scope and its own root-owned line naming the
-credential, and A16's disposal scope must never be widened to cover it. The rule that
-makes both safe is the same one and is unchanged: the gateway holds no authority because
-of the uid it runs as, and the daemon asks the kernel who is calling rather than believing
-what a caller says about itself.
-
+**Never started until 2026-09-04.** Labelled `Next` when A12.1 closed, became `Later`
+when the operator put the review surface first, was `Next` again from 2026-09-04 when the
+operator asked whether the external model could yet submit work and was told no. All three
+decision rows were answered before T1; the season started and shipped on 2026-09-04.
 
 The sentence it exists for is
 
 > **THE GATEWAY CANNOT SUBMIT WORK BECAUSE OF WHO IT RUNS AS, AND THE OBVIOUS FIX
 > IS TO STOP THAT BEING TRUE.**
 
-Atlas' purpose is that an operator connects a client they like — Claude Code, a
-browser, a model over MCP — and work gets done in a repository under Atlas' gates.
-Every half of that exists except the last: **no surface outside the local socket
-can submit a job.**
+**What A16 left it, and what it did not.** A16 built the first HTTP path on this
+gateway that writes, and the first daemon method group offered to the gateway uid — so
+the shapes A14 needed existed afterwards rather than having to be invented. What it did
+**not** leave was the authority: submitting work is a different capability from disposing
+of a record, it needs its own ungrantable scope (`jobs:submit`) and its own root-owned
+lines naming the credentials, and A16's disposal scope was never widened to cover it.
+The rule that makes both safe is the same one and unchanged: the gateway holds no
+authority because of the uid it runs as, and the daemon asks the kernel who is calling.
 
-### The constraint, verified rather than assumed
+**The shape A14 chose.** Of the three shapes the pre-season notes considered — request
+carries its own principal, a broker with its own uid, or a remote submission as a
+proposal — A14 built the first one and built it correctly: the gateway forwards a
+submission under the credential presented on the request, and the daemon verifies that
+credential in the same transaction that creates the job. The credential is the authority;
+`submitter_uid` in `orchestration.conf` is never the gateway's; `require_submitter` is
+never called on this path. A9's rule is unchanged and still true.
 
-Two lines of root-owned policy decide it:
+The full argument is in `docs/remote-submission.md` and
+`docs/plans/2026-09-04-remote-submission.md`. The three "must be true whichever shape
+wins" from this section's original text are satisfied:
 
-```
-/etc/atlas/orchestration.conf:  submitter_uid = 1000    (the operator)
-/etc/atlas/gateway.conf:        gateway_uid   = 992     (atlas-gateway)
-```
-
-The orchestration RPC group is selected by `SO_PEERCRED` against that policy, so
-the gateway does not fail a check — **it is not in the set at all**, and it speaks
-on the socket as 992 whatever its code intends. That is A7.1's own sentence
-working exactly as written: *what the gateway cannot do is true because of who it
-runs as, not because of anything in `src/gw`.*
-
-The remote surface is otherwise ready. `remote_mcp = yes` is served at
-`/mcp`, authentication is a Bearer API key rather than a uid, and keys already
-carry **scopes** — the `chatgpt-tunnel` key holds five, all read-only. So the
-identity mechanism and the per-key authorisation vocabulary both exist. What is
-missing is a scope that means "may submit", a route that carries it, and — the
-whole question — a way for that request to reach the writer without becoming the
-gateway's own authority.
-
-### The tempting fix is the one that must not be taken
-
-Adding `submitter_uid = 992` makes it work in one line, and destroys the argument
-A7.1 is built on. From that moment the gateway can submit anything, and the only
-thing between a remote caller and a job running on the machine is code in
-`src/gw` — which is precisely the place A9 says a boundary must never live,
-because a check there is one an attacker walks around while the process keeps its
-full authority.
-
-**If A14 ends with that line in the policy, it has failed even if everything
-passes.**
-
-### Three shapes, none free
-
-1. **The request carries its own principal.** The gateway forwards a submission
-   that names the key it arrived under, and the submit path authorises on that
-   rather than on the peer. Cheapest to build; hardest to argue, because the
-   gateway now asserts an identity instead of having one, and every A7 rule about
-   `SO_PEERCRED` exists because a caller describing itself is not evidence about
-   itself.
-2. **A broker with its own uid.** A third principal the gateway can hand a request
-   to and cannot impersonate, which holds the submitter right and applies the
-   per-key policy. Keeps identity kernel-asserted at every hop; costs a process, a
-   socket and a policy section.
-3. **A remote submission is a proposal, not a job.** It lands as a durable request
-   an operator disposes of — the shape A4's approval channel and A12.0's plan
-   revisions already have. Weakest capability and strongest argument: nothing
-   remote ever starts work, and "an operator was in the loop" stays literally
-   true. It also may not be what the operator wants, which is the point of writing
-   it down as a choice rather than picking it here.
-
-### What must be true whichever shape wins
-
-- **A budget per key.** A job spends real money and runs a worker on the machine.
-  Today no per-client bound exists, because the only submitter was the operator
-  and the operator is trusted by design. Opening submission ends that premise, and
-  A11.1's three-starts-per-run budget is a bound on a *chain*, not on a caller.
-- **A9's absences stay absences.** Remote credential administration is absent, not
-  refused; no MCP tool name carries an authority verb; a model payload cannot
-  accept a run. Submission is none of those — the gates still run and settlement
-  is still Atlas' — and the season's first job is to say precisely why, in the
-  rules, before writing the route.
-- **The audit row names the key, never a claimed value**, the way `gw_audit`
-  already refuses to store what a caller says about itself.
+- **A budget per key**: two bounds per credential (active jobs, per-UTC-day submissions),
+  read from root-owned lines, counted from stored rows, refused with count and bound
+  named, never clamped.
+- **A9's absences stay absences**: no MCP tool name carries an authority verb; the
+  four remote tools (`atlas_job_submit`, `atlas_job_status`, `atlas_job_list`,
+  `atlas_job_cancel`) are `submit`, `status`, `list`, `cancel` — none is an authority
+  verb; a model payload still cannot accept a run; remote credential administration is
+  still absent.
+- **The audit row names the key, never a claimed value**: `gw_audit.key_id` is the
+  verified selector; task text never appears in any log line or audit row.
 
 ## A15 — the review surface, and where a proposal is disposed of (shipped)
 

@@ -1471,3 +1471,96 @@ the most `PATH` or `SYMBOL` links from one revision the detail pane will walk
 through `code/impact` before saying how many were left unwalked) and
 `REVIEW_UI_MAX_SHEET_ENTRIES` (64, the browser's own mirror of the sheet
 bound above).
+
+## A16 — browser disposal, and what a new remote-operator capability costs
+
+### Adding a new remote-operator route
+
+A remote-operator route (one that writes a decision transition from a bearer
+credential through the gateway) requires:
+
+- A new write route in `API_WRITE_ROUTES[]` (`src/gw/gateway.c`).
+- A matching policy key in `GATEWAY_POLICY_KEYS[]` naming the credential by id,
+  with `grantable = false` on the derived scope.
+- The scope added to `SCOPES[]` with `grantable = false`. Grantable means
+  `atlas api-key create --scope <name>` will issue it. Non-grantable means the
+  daemon derives it for named keys and `--scope` refuses.
+- The `REMOTE_OPERATOR_CONFIRMED` entry in the ledger for every transition the
+  route produces, not `LOCAL_OPERATOR_CONFIRMED`. A route that writes
+  `LOCAL_OPERATOR_CONFIRMED` is misrepresenting the channel.
+- The `remote_dispose_key` and `remote_submit_key` policy keys must never name
+  the same credential. Any future third key with a different capability is a
+  separate key.
+
+### Bounds this season added
+
+`ATLAS_REMOTE_DISPOSE_CREDENTIAL_LIMIT` (1 per policy; a second `remote_dispose_key`
+line overwrites the first, matching the precedent for `remote_submit_key`).
+
+## A14 — remote submission, and what a new submission capability costs
+
+### Adding a bearer-table row
+
+The bearer credential table is the set of ids named in `remote_submit_key` lines
+in the gateway policy. Every row in it:
+
+- derives `ATLAS_SCOPE_JOBS_SUBMIT` for exactly that key;
+- is validated in the write transaction for `job.remote_submit`, not on the
+  gateway's request path;
+- may not share an id with any `remote_dispose_key` line.
+
+Adding a second named credential is a second `remote_submit_key = <id>` line in
+the gateway policy. The daemon takes the first line that names a live credential;
+subsequent lines are alternatives for rotation, not concurrent grants.
+
+### Adding a remote job method
+
+A new `job.remote_*` method requires:
+
+- An implementation in `src/ipc/server_orch_remote.c`, in the remote method group.
+- A matching gateway route in `API_WRITE_ROUTES[]` (if it writes) or `API_READ_ROUTES[]`.
+- An MCP tool with `remote_only = true` in `src/mcp/mcp_tools.c`.
+- The scope it checks must be `ATLAS_SCOPE_JOBS_SUBMIT` or another non-grantable
+  scope with the same semantics; never a grantable scope.
+- The head comment in `server_orch_remote.c` honesty sentence must remain true:
+  `require_submitter` must not be called on this path.
+
+### Adding a submission policy key
+
+A new key in the submission sub-section of the gateway policy requires:
+
+- An entry in `REMOTE_SUBMIT_POLICY_KEYS[]` (`src/orch/remote.c`).
+- A validator following the `MALFORMED, never clamped` rule: out of range is an
+  error and the daemon refuses the policy rather than clipping silently.
+- A `(checked at submit)` annotation in `atlas gateway status`'s output, because
+  the key is cross-checked against the orchestration policy at submit time.
+
+### Adding a remote-only MCP tool
+
+An MCP tool with `remote_only = true`:
+
+- Appears in the `/mcp` WebSocket adapter for sessions carrying
+  `ATLAS_SCOPE_JOBS_SUBMIT`.
+- Is **absent** from the stdio adapter (`src/mcp/mcp.c`): `atlas_mcp_tool_for`
+  must not return it for a stdio session.
+- Is still subject to the no-authority-verb rule: `approve`, `reject`, etc. are
+  still refused.
+- Must appear in `tests/test_mcp.c`'s expectation for the WebSocket tool list,
+  not the stdio list.
+
+### Per-credential bound checklists
+
+When adding any per-credential bound (daily count, per-job cost, etc.):
+
+1. The bound lives in the orchestration policy, not in the gateway policy.
+2. The gateway policy cross-check (`atlas_orch_remote_submit_policy_of`) must
+   read and validate it.
+3. `atlas gateway status` must print it, annotated `(checked at submit)`.
+4. The worst-case bound must be stated in `docs/remote-submission.md`'s "Stated
+   costs" section, with the arithmetic written out.
+
+### Bounds this season added
+
+`ATLAS_REMOTE_SUBMIT_MAX_ACTIVE` (2 concurrent submissions, policy-overridable),
+`ATLAS_REMOTE_SUBMIT_MAX_PER_DAY` (6, policy-overridable),
+`ATLAS_REMOTE_SUBMIT_MAX_ATTEMPTS` (1 per job, policy-overridable).

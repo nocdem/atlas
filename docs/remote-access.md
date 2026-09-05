@@ -60,15 +60,20 @@ answers `unknown method` — the same answer a name that does not exist gets —
 - `backup.create`, `backup.verify`, `code.index`, `maintenance.plan`,
   `maintenance.prune`
 - `apikey.create`, `apikey.list`, `apikey.revoke`
-- every `job.` and every `dispatch.` method
+- every `dispatch.` method, and every `job.` method but the four `job.remote_*`
+  names offered under a root-owned policy (A14), each of which does nothing
+  without a named credential in flight; run a job
 
 Under a separated A7.1 deployment it additionally cannot open the index at all,
 because the index is `0700 atlasd`.
 
 So: **a compromised gateway cannot approve a decision, register a repository,
-read a backup, run a job, build an index, administer credentials or read the
-database.** That is true because of *who it runs as*. No code in the gateway is
-what makes it true, and a bug in the gateway cannot make it false.
+read a backup, build an index, administer credentials or read the database.**
+It can queue a job when a root-owned policy names a credential for it and that
+credential is presented and verified by the daemon in the transaction. That
+is true because of *who it runs as* combined with *what the daemon verifies*.
+No code in `src/gw` is the boundary; a bug in the gateway cannot give it an
+unlisted credential or make the daemon skip the transaction check.
 
 ### On an unseparated machine this guarantee does not apply
 
@@ -504,6 +509,70 @@ of the credential disposes exactly as the operator does. The ledger
 therefore records every such act as `REMOTE_OPERATOR_CONFIRMED` with the
 credential's id beside it, never as `LOCAL_OPERATOR_CONFIRMED`, so that a
 reader of any row ever written can still tell the two apart.
+
+## A14: remote submission
+
+A14 adds four more routes to `API_WRITE_ROUTES[]` and four `job.remote_*`
+methods to `src/ipc/server_orch_remote.c`. They are offered to the gateway uid
+under three conditions: the gateway uid is in the peer, at least one
+`remote_submit_key` is named in the policy, and the TLS or acceptance condition
+holds. The credential on the request — not the gateway's uid — is the authority;
+`require_submitter` is never called on this path.
+
+**The four routes:**
+
+```
+POST /api/v1/job/submit   repo, task, key         (ATLAS_SCOPE_JOBS_SUBMIT)
+POST /api/v1/job/get      job                     (ATLAS_SCOPE_JOBS_SUBMIT)
+POST /api/v1/job/list     after, limit            (ATLAS_SCOPE_JOBS_SUBMIT)
+POST /api/v1/job/cancel   job                     (ATLAS_SCOPE_JOBS_SUBMIT)
+```
+
+**The four MCP tools:** `atlas_job_submit`, `atlas_job_status`, `atlas_job_list`,
+`atlas_job_cancel` — `remote_only = true`, absent from the stdio adapter, present
+only on `/mcp` for a session carrying `ATLAS_SCOPE_JOBS_SUBMIT`.
+
+**The derived scope.** `jobs:submit` (`ATLAS_SCOPE_JOBS_SUBMIT`) is in `SCOPES[]`
+with `grantable = false`. It is derived for exactly the keys the `remote_submit_key`
+lines name. `atlas api-key create --scope jobs:submit` is refused. One credential,
+one power: `remote_submit_key` and `remote_dispose_key` may never name the same id.
+
+**The two acceptance keys** (one per capability). `operator_accepts_cleartext_submission`
+is distinct from `operator_accepts_cleartext_disposal`: a submission starts a worker
+that runs as the operator's own account, which is a different consequence from moving
+a record, and the plan does not reuse the disposal acceptance as cover for it.
+
+**The `submit:` and `clear-submit:` status lines.** `atlas gateway status` prints
+both unconditionally when the gateway is `ENABLED`, naming key ids, driver, mode,
+gate count and bounds, or saying plainly that nothing reachable over the network
+can queue a job. `(checked at submit)` names the fact that the driver and mode are
+cross-checked against the orchestration policy at submit time, not here.
+
+**`/auth/me`'s new fields.** Gains `remote_submission` (bool), `remote_submission_driver`
+(string) and `cleartext_submission` (bool), so Mission Control's Jobs view can say
+whether submission is available and show the cleartext chain at the moment of use.
+
+**The honest paragraph.** Remote submission reaches the operator's own account from
+wherever the bearer credential can be presented. The gateway has no authority of its
+own; it is the carrier of a credential the daemon verifies in the write transaction.
+The policy — not the request — decides the driver, the mode, the gate floor and the
+bounds. The credential is verified in the transaction that creates the job; a revoked
+key queues nothing even if the gateway's own check ran before the revocation.
+
+**The cleartext chain.** On this deployment a submission credential presented by a
+browser travels in the clear. The gateway listens on `192.168.0.198:8799` with
+`tls_mode = NONE`, and the four submission routes carry the credential as a bearer
+header on every request, so anyone able to observe traffic on that network segment
+can read it. An Atlas API credential has no expiry, so a credential captured once
+queues work — a worker that runs as the operator's own account, within the policy's
+daily bound — until the operator notices and runs `atlas api-key revoke`. The
+credential the MCP tunnel presents does not cross that segment: the tunnel client
+runs on this host and posts to this host's own address, so its exposure is the file
+it is read from in the operator's home directory — readable by exactly the account a
+remotely submitted worker runs as — and the far side of the tunnel. The operator
+accepted this chain on 2026-09-04 by writing `operator_accepts_cleartext_submission
+= yes` into the root-owned gateway policy. Full argument and the operator's words:
+`docs/remote-submission.md`.
 
 ## Audit
 

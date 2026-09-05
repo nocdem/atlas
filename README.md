@@ -48,8 +48,10 @@ control layer beside them.
 - **Bounded orchestration:** durable jobs, leases, crash recovery, isolated
   workspaces, operator-supplied gates, bounded parallel tasks and multi-stage
   planned runs. A worker result is an artifact, not authority.
-- **Remote read access:** scoped one-time credentials, remote MCP, a read-only
-  web API and Mission Control.
+- **Remote read access and remote submission:** scoped credentials, remote MCP,
+  a read-only web API, Mission Control (which can now also dispose of a record),
+  and A14's remote submission — a bearer credential the policy names queues a job
+  the daemon verifies and the policy bounds.
 - **Local operations:** verified online backups, atomic restore and explicit
   retention policy. These operations are not exposed to a model or remote API.
 
@@ -452,7 +454,11 @@ so rather than implying otherwise. See
 - [docs/orchestration.md](docs/orchestration.md) — jobs, leases, the
   dispatcher, workspaces, and what is deferred
 - [docs/remote-access.md](docs/remote-access.md) — the gateway, credentials,
-  scopes, the web API and the GUI
+  scopes, the web API and the GUI (A16 disposal and A14 submission included)
+- [docs/remote-submission.md](docs/remote-submission.md) — what remote submission
+  is, what a credential in flight is worth, and the cleartext chain
+- [docs/browser-disposal.md](docs/browser-disposal.md) — the browser disposal
+  channel and the honest paragraph
 - [docs/ai-trust-boundary.md](docs/ai-trust-boundary.md) — what safe text does
   and does not protect against, and how the boundary is implemented
 - [docs/claude-integration.md](docs/claude-integration.md) — the hooks, the MCP

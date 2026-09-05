@@ -477,10 +477,13 @@ full in `docs/remote-access.md`; this is the short form an auditor needs.
 **What holds.** The gateway runs as `gateway_uid` from a root-owned policy. That
 uid is neither the operator uid nor a dispatcher uid, so the daemon answers
 `unknown method` to `decision.approve`, `backup.create`, `code.index`,
-`apikey.*`, every `job.` and every `dispatch.` — and under an A7.1 deployment it
-cannot open the index at all, because the index is `0700 atlasd`. A compromised
-gateway therefore cannot approve a decision, register a repository, read a
-backup, run a job, build an index, administer credentials or read the database.
+`apikey.*`, every `dispatch.` method, and every `job.` method but the four
+`job.remote_*` names offered under a root-owned policy (A14) — and under an A7.1
+deployment it cannot open the index at all, because the index is `0700 atlasd`. A
+compromised gateway therefore cannot approve a decision, register a repository, read a
+backup, build an index, administer credentials or read the database. It can queue
+a job only when a named credential in the request matches a `remote_submit_key` line
+in the policy, and the policy decides the bounds.
 
 That is true because of *who the gateway runs as*. No code in `src/gw` is what
 makes it true, and a bug there cannot make it false.
@@ -578,40 +581,56 @@ additional accepted hostnames: `docs/remote-access.md`, "Anonymous browser
 reads, stated honestly" and "The `Host` check: DNS rebinding was sufficient
 without it".
 
-### Approving a record from the browser: refused today, and why
+### A16: approving a record from the browser (shipped)
 
-Mission Control reads a knowledge record in full and cannot dispose of one.
-Approving, rejecting or resolving still needs `atlas review apply` or
-`atlas decision approve` on a terminal on this machine, as the operator's own
-uid, because the operator channel is selected by `SO_PEERCRED` and the gateway
-runs as a different uid. That is A9's design and this section is not a caveat
-to it.
+Mission Control now reads a knowledge record in full and can dispose of one.
+An operator opens the detail pane, types the first eight hex of the revision's
+content hash into a field Mission Control renders for that purpose, and submits
+— the browser sends a POST to a dedicated `gateway_uid`-owned route that calls
+the operator channel A4 already built, exactly as `atlas review apply` does.
+The operator channel is selected by `SO_PEERCRED` and the gateway runs as a
+different uid, so the capability is granted to the gateway by a root-owned
+`remote_dispose_key` line in the operator-group policy, naming one specific
+credential. `atlas_decision_apply_in_tx` still has exactly three callers.
 
-The operator asked for browser approval and it is planned, in full, at
-`docs/plans/2026-09-04-browser-disposal.md`. **It is not built, and the reason
-it is not built is a decision they made on 2026-09-04 rather than an
-oversight.** The plan requires TLS in front of the gateway: not because Atlas
-terminates any — it never does — but because the capability that disposes of a
-record would otherwise travel over the same cleartext listener the anonymous
-read floor uses. The chain the operator was shown before deciding: this
-listener is `tls_mode = NONE`; an A9 credential carries **no expiry**, so one
-capture on the wire is not a session somebody loses in twelve hours but durable
-authority until `atlas api-key revoke` runs; and the thing that authority
-disposes of is the one record in Atlas that is **not rebuildable** — invariant 1
-covers the index, and a decision ledger is not the index.
+The disposal credential travels over the same cleartext listener as every other
+credential. The chain the operator was shown: this listener is `tls_mode = NONE`;
+the credential carries no expiry, so one capture on the wire is durable authority
+until `atlas api-key revoke` runs; and the thing that authority disposes of is the
+one record in Atlas that is **not rebuildable** — invariant 1 covers the index, a
+decision ledger is not the index. The operator accepted this chain on 2026-09-04
+by naming the key in a root-owned policy amendment. Full statement and operator's
+words: `docs/remote-access.md`, "A16: approving a record from the browser".
 
-The operator's answer, on their own network and after that chain: HTTPS is not
-needed there. **Recorded as their decision.** Its cost is that when the season
-is built it will be built without TLS, and the plan's own amendment note carries
-that; a reader who finds a cleartext disposal channel on this deployment is
-looking at a choice a person made with the argument in front of them, not at
-something nobody thought about.
+### A14: remote submission — what a credential in flight is worth
 
-Until it is built, the honest statement of this deployment is unchanged:
-**nothing reachable over the network can change a lifecycle state.** The
-anonymous floor grants reads and no more, `memory:write` is in the scope
-vocabulary and not grantable to any credential, and `atlas_decision_apply_in_tx`
-has exactly three callers, none of them reachable from `src/gw`.
+A14 adds four `job.remote_*` methods and four gateway routes for job submission
+over a bearer credential. The credential on the request — not the gateway's uid —
+is the authority: `require_submitter` is never called on this path, and the daemon
+verifies the credential in the write transaction that creates the job. The policy —
+not the request — decides the driver, mode, gate floor and bounds. The gateway
+queues nothing without a named credential in a `remote_submit_key` line.
+
+A remotely submitted job runs as the operator's own account. That is the honest
+statement: the gateway runs as `gateway_uid`, passes a credential, and the daemon
+starts a worker as `model_dispatcher_uid` — which the root-owned orchestration
+policy names, and which on this deployment is the operator's own account. A
+compromised credential queues work — a worker that runs as the operator's own
+account, within the policy's daily bound — until the operator notices and revokes
+it.
+
+**The cleartext chain.** On this deployment a submission credential presented by a
+browser travels in the clear. The gateway listens on `192.168.0.198:8799` with
+`tls_mode = NONE`, and the four submission routes carry the credential as a bearer
+header on every request. An Atlas API credential has no expiry, so a credential
+captured once queues work — a worker that runs as the operator's own account, within
+the policy's daily bound — until the operator notices and runs `atlas api-key
+revoke`. The credential the MCP tunnel presents does not cross that segment: the
+tunnel client runs on this host and posts to this host's own address, so its
+exposure is the file it is read from in the operator's home directory and the far
+side of the tunnel. The operator accepted this chain on 2026-09-04 by writing
+`operator_accepts_cleartext_submission = yes` into the root-owned gateway policy.
+Full argument and the operator's words: `docs/remote-submission.md`.
 
 ## Reporting a vulnerability
 

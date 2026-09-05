@@ -3739,3 +3739,96 @@ it cannot prove is that a click renders what the source says it renders — and
 `docs/review-surface.md` records one place that gap actually matters: the
 review-sheet functions' reliance on holding no `await` between a load and a
 save, which no grep can see and no route-driving test exercises.
+## A16 layers — additions
+
+| File | What it owns |
+| --- | --- |
+| `include/atlas/orch_remote.h`, `src/orch/remote.c` | the remote-submission policy reader, the policy-key validation, `atlas_orch_remote_policy_check` |
+| `src/ipc/server_orch_remote.c` | the four `job.remote_*` daemon-side method implementations |
+| `src/gw/gateway.c` | the four new write routes, the `remote_dispose_key` credential verification path, the `A16` section of `API_WRITE_ROUTES[]` |
+| `src/gw/ui/mission-control.html` | the Jobs view (submit, status, list, cancel) and the disposal digest field in the decision detail pane |
+| `include/atlas/api_key.h`, `src/core/api_key.c`, `src/db/db_api_key.c` | the `remote_dispose_scope` derivation; `ATLAS_SCOPE_DISPOSE` marked not grantable |
+| `src/db/migrations.c` | migration 31: `ALTER TABLE orch_jobs ADD COLUMN dispose_key_id TEXT NOT NULL DEFAULT ''` |
+
+**A16 added migration 31.**
+
+## A16 rules — these are not negotiable
+
+The one-line forms are in `CLAUDE.md`; the full argument and the honest paragraph
+are in `docs/browser-disposal.md`.
+
+**Why `remote_dispose_key` is a separate policy key and not a scope the
+credential declares.** If `dispose:` were grantable, a credential that leaked
+could be read at creation — by anyone who asked the operator to create a disposal
+credential and then read it — and reused to dispose of records until it was
+revoked. A policy key that names one credential makes the link at the daemon level,
+with no scope the credential itself carries. The credential looks like any bearer
+token on the wire; only the daemon's policy lookup gives it the capability.
+
+**Why `remote_dispose_key` and `remote_submit_key` may never name the same id.**
+A single credential that both submits jobs and disposes of records is a single
+capture that grants both powers. The separation forces two captures to achieve
+both; that is the whole of what the rule buys, and it buys it at the cost of one
+more credential to revoke.
+
+**Why `REMOTE_OPERATOR_CONFIRMED` is in the ledger and `LOCAL_OPERATOR_CONFIRMED`
+is not.** A reader of the ledger who finds `LOCAL_OPERATOR_CONFIRMED` knows the
+operator was physically present on this machine, with a terminal, typing a
+confirmation by hand. A reader who finds `REMOTE_OPERATOR_CONFIRMED` knows only
+that the credential named in the policy was used — not who was holding it or
+where. The distinction matters; the label exists to preserve it.
+
+## A14 layers — additions
+
+| File | What it owns |
+| --- | --- |
+| `include/atlas/orch_remote.h` | the submission policy model: driver, mode, gate, bounds, the `remote_submit_key` lookup, `atlas_orch_remote_submit_policy_of` |
+| `src/orch/remote.c` | the submission policy reader and the cross-check helpers |
+| `src/ipc/server_orch_remote.c` | the four `job.remote_*` daemon-side method implementations; head comment carries the `require_submitter` honesty sentence |
+| `src/gw/gateway.c` | the four new write routes under `API_WRITE_ROUTES[]`, the `A14` block, `operator_accepts_cleartext_submission` handling |
+| `src/gw/ui/mission-control.html` | the Jobs view: submit form, status card, list and cancel; the cleartext-submission warning rendered from `/auth/me` |
+| `include/atlas/api_key.h`, `src/core/api_key.c`, `src/db/db_api_key.c` | the `jobs:submit` scope marked `grantable = false`; derivation for keys named in `remote_submit_key` |
+| `src/db/migrations.c` | migration 32: `submit_key_id` on `orch_jobs`, `key_id` on `orch_transitions` |
+| `src/mcp/mcp_tools.c` | the four remote-only MCP tools (`atlas_job_submit`, `atlas_job_status`, `atlas_job_list`, `atlas_job_cancel`) with `remote_only = true` |
+| `docs/remote-submission.md` | the season's own document: the honest paragraph, the cleartext chain verbatim, the operator's three decision rows |
+
+**A14 added migration 32.**
+
+## A14 rules — these are not negotiable
+
+The one-line forms are in `CLAUDE.md`; the full argument, the cleartext chain
+verbatim, and the operator's decision rows are in `docs/remote-submission.md`.
+
+**Why `require_submitter` is never called on this path.** `require_submitter`
+guards the gate methods for the operator-uid group, checking that the submitting
+peer is the expected user. The remote submission path is not in the operator-uid
+group; it is in the gateway-uid group, validated by a credential, and the daemon
+grants the capability through the policy, not through the peer uid. Calling
+`require_submitter` there would be a check against the gateway uid — always
+true and therefore meaningless.
+
+**Why the policy — not the request — decides the driver, mode, gate floor and
+bounds.** A request that could name its own driver or lift its own gate floor
+would be a request that could choose its own verification. The policy is
+root-owned and the request is model-controlled; keeping them separate is the
+whole of what this rule buys.
+
+**Why `jobs:submit` is not grantable.** If it were, an operator could issue
+a credential that grants submission to anyone who held it — including an MCP
+session, which can observe the credential and relay it. The non-grantable design
+means the only credentials with the scope are the ones the policy names by id,
+and naming a credential requires editing a root-owned file.
+
+**Why the unattended shape and the deferred shape both run as
+`model_dispatcher_uid`.** That is what `model_dispatcher_uid` means: the account
+a worker runs as, named in the policy, irrespective of how the job was submitted.
+The gateway queues the job and the daemon starts the worker; neither changes which
+account the worker inherits. Stating that a worker "runs as the operator's own
+account" is true on this deployment and must be stated truthfully.
+
+**Why the cleartext chain is stated, not fixed.** Atlas does not terminate TLS,
+the listener is `tls_mode = NONE` on this machine, and the operator accepted the
+chain. The alternative — refusing to build the feature without TLS — would leave
+the capability absent not because it is harmful but because nobody resolved the
+deployment constraint. The honest answer is to state the chain and let the
+operator decide; they did, on 2026-09-04, with the chain in front of them.

@@ -83,6 +83,7 @@ to a mode of `a|b` with an empty driver.
 | job id | **no** | assigned after the digest |
 | `created_at`, `state`, `attempts_started`, `state_seq` | **no** | these change; the request does not |
 | every lease, attempt, event and artifact | **no** | consequences, not the request |
+| `submit_key_id` (A14) | **no** | travels on the op; the credential is not part of what was asked for |
 
 Adding a field means adding a row here with a reason and bumping
 `ATLAS_ORCH_SPEC_DOMAIN` — every stored digest means something different
@@ -217,12 +218,14 @@ attempt.
 
 ## The RPC surface, and the line through it
 
-Two groups, selected by the peer's uid from `SO_PEERCRED` and by nothing else:
+Two client groups, selected by the peer's uid from `SO_PEERCRED` and by nothing
+else, plus a third group selected by credential:
 
 | Group | Methods | Reachable from |
 | --- | --- | --- |
 | `job.` | `submit`, `get`, `list`, `cancel`, `artifact` | a uid the policy lists as a submitter |
 | `dispatch.` | `lease`, `heartbeat`, `event`, `complete` | a uid the policy names as a dispatcher — `dispatcher_uid`, or A8.1's `model_dispatcher_uid` |
+| `job.remote_*` (A14) | `remote_submit`, `remote_get`, `remote_list`, `remote_cancel` | the gateway uid, with a root-owned credential presented and verified in-transaction; three conditions in `atlas_server_remote_submit_offered`; never `require_submitter` |
 
 A `dispatch.` name is simply **not found** for a peer the policy does not name —
 the same answer as for a name that does not exist. A refusal distinguishing "you
@@ -232,11 +235,18 @@ submitter learns nothing it could not learn by reading the root-owned policy
 path, and the honest answer is what lets an operator tell a disabled policy apart
 from a binary too old to have the method.
 
-The two sets are consulted **additively**, so a uid that is both a submitter and
-a dispatcher holds both. A8.1 made that case real — the operator's account
-submits jobs and runs the model dispatcher — and an either/or lookup silently
-took `job.submit` away from it. Routing is not authorisation: every method still
-runs its own `require_submitter` or `require_dispatcher`.
+The two uid-based sets are consulted **additively**, so a uid that is both a
+submitter and a dispatcher holds both. A8.1 made that case real — the operator's
+account submits jobs and runs the model dispatcher — and an either/or lookup
+silently took `job.submit` away from it. Routing is not authorisation: every
+method still runs its own `require_submitter` or `require_dispatcher`.
+
+The `job.remote_*` group (A14) is offered to the gateway uid only, and only
+when a root-owned policy names at least one submit credential and the tls or
+acceptance condition holds. The credential on the request is the authority;
+`require_submitter` is never called; the gateway uid is necessary and never
+sufficient. Atlas bounds how many tasks a credential may queue and what checks
+they run under, not what one task may ask a worker to read.
 
 ### Why a dispatcher tier is not a privileged tier
 
@@ -281,6 +291,18 @@ day that something will be a restriction.
 The dispatcher may not also be a submitter. Keeping them disjoint is what makes
 "a client cannot forge a dispatcher message, and a dispatcher cannot create its
 own work" a property of the configuration rather than a hope about it.
+
+**A14 added a second policy file for submission keys** — `/etc/atlas/gateway.conf`
+gains eight submission keys (`remote_submit_key`, `remote_submit_driver`,
+`remote_submit_mode`, `remote_submit_gate`, `remote_submit_max_attempts`,
+`remote_submit_max_active`, `remote_submit_max_per_day`,
+`operator_accepts_cleartext_submission`). The gateway policy names a driver and a
+mode this file is the authority on; the daemon cross-checks at every remote
+submit and logs a disagreement at start. `atlas gateway status` cannot know what
+the orchestration policy says and states that in its `submit: (checked at submit)`
+line. A disagreement between the two files means every remote submission is
+refused until one of them changes; editing either file requires restarting both
+the daemon and the gateway.
 
 ## Schema 8
 
@@ -832,6 +854,14 @@ how the A8 dispatcher has always done it.
 | `fake-repo` | the registered repository's root | carried inline as an artifact | only a lease naming it |
 | `claude-repo` | the registered repository's root | carried inline as an artifact | only a lease naming it |
 
+**A14 remote submission shapes** — the driver is named in the gateway policy, not
+the request:
+
+| Shape | Driver | What runs | Settling |
+| --- | --- | --- | --- |
+| Unattended | `claude` | the model dispatcher runs as the operator's account; the run never settles | none (A12.0's stated cost, produced on purpose) |
+| Deferred | `claude-repo` | the task sits queued until `atlas job run --resume RUN`; the pin is checked at lease | A11.1's run driver, operator-started |
+
 `claude` and `claude-repo` share one implementation, `claude_exec`. What differs
 between them is *where the child runs* and *where its log goes*, and both were
 already parameters. Two copies would be two places for the environment
@@ -1168,6 +1198,14 @@ unit.
 **A11.0 added the run** — see the section above. Its two terminal statuses have no
 producer in production code, and settling a run is reachable from no RPC method,
 MCP tool or gateway route. That absence is the deferral, not an oversight.
+
+**A14 added remote submission** — four `job.remote_*` methods offered to the
+gateway uid under a root-owned credential policy (`src/ipc/server_orch_remote.c`),
+four gateway routes in `API_WRITE_ROUTES[]`, and four remote-only MCP tools. Remote
+*submission* is present; remote *execution* of a repo-tree task is still absent:
+applying a generated patch, committing, pushing and every `dispatch.` name remain
+unreachable through the gateway. `tests/test_orch_rpc.c` asks a live daemon for
+every name they would plausibly have and requires each to answer `unknown method`.
 
 **Deferred past A8, and absent rather than refused:** applying a generated patch,
 autonomous commits, branch creation, push, GitHub issue ingestion, PR creation,

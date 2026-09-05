@@ -1,39 +1,65 @@
 # Atlas — working notes for Claude Code
 
 Atlas is a generic, headless engineering-memory and repository-intelligence CLI
-in C17. The current work is **A15**: the review surface — Mission Control reads
+in C17. The current work is **A14**: remote submission — a job submitted via a
+bearer credential the daemon verifies itself, under bounds the policy sets and
+the request cannot. **A14 added migration 32** (`ALTER TABLE orch_jobs ADD COLUMN
+submit_key_id TEXT NOT NULL DEFAULT ''` and `ALTER TABLE orch_transitions ADD COLUMN
+key_id TEXT NOT NULL DEFAULT ''`). The two sentences it exists for are
+
+> **THE GATEWAY CANNOT SUBMIT WORK BECAUSE OF WHO IT RUNS AS, AND THE OBVIOUS FIX IS TO STOP THAT BEING TRUE.**
+
+and
+
+> **A CREDENTIAL IN FLIGHT IS THE ONLY AUTHORITY THE GATEWAY EVER HOLDS, AND THE POLICY — NOT THE REQUEST — DECIDES WHAT A SUBMISSION MAY COST.**
+
+A15 and A16 extended the gateway into a place an operator can read a proposal
+from a browser and dispose of it with a credential. A14 extends it further: a
+credential in the request — not the gateway's uid — queues a job, the daemon
+verifies it in the write transaction, and the policy decides the driver, mode,
+gate floor and bounds. `require_submitter` is never called on this path.
+`atlas_decision_apply_in_tx` still has exactly three callers. See the A14
+sections in `docs/remote-submission.md` — the season's own document — and in
+`docs/roadmap.md`, `docs/remote-access.md`, `docs/orchestration.md`,
+`docs/engineering-rules.md` and `docs/extending.md`.
+
+The season before it, **A16**, was browser disposal — Mission Control can now
+dispose of a knowledge record from the browser, with the operator typing the
+first eight hex of the revision's content hash into a field and the channel's
+weakness stated on screen. **A16 added migration 31.** The sentence it exists
+for is
+
+> **THE OPERATOR BUILT THE BROWSER SO AS NOT TO USE THE TERMINAL, AND A CHANNEL THAT IS WEAKER BY CONSTRUCTION IS STILL A CHANNEL — PROVIDED THE LEDGER SAYS WHICH ONE.**
+
+A15 built the screen that reads a proposed knowledge record well. A16 extended
+it to disposing of one from a bearer credential the gateway carries through a
+dedicated route, under a root-owned policy key that names one credential and
+nothing else. `atlas_decision_apply_in_tx` still has exactly three callers. The
+channel is weaker than the local channel by construction; `docs/browser-disposal.md`
+carries the honest paragraph. See the A16 sections in `docs/roadmap.md`,
+`docs/remote-access.md`, `docs/engineering-rules.md` and `docs/extending.md`.
+
+The season before it, **A15**, was the review surface — Mission Control reads
 a registered proposal in full, wherever a browser reaches the gateway, and an
 operator disposes of it nowhere but the one interactive terminal channel A4
 already built. **A15 added no migration.** The sentence it exists for is
 
 > **A PROPOSAL NOBODY CAN REVIEW COMFORTABLY IS A PROPOSAL NOBODY REVIEWS.**
 
-A12.1 proved a registered memory file could be turned into ordinary,
-reconciled verification claims; it said nothing about how an operator actually
-reads what a model proposed — a revision, its claims, their evidence, the gate
-assessment — before deciding what to do with it. Reading a proposal properly
-meant a terminal, and the surface that renders a revision well, Mission
-Control, could do nothing about any of it. Atlas' web API already served 26
-read-only routes and could not be trusted with a twenty-seventh that wrote
-anything, because a model's own bearer token and an operator's browser session
-resolve to the same kind of principal on that listener, and the gateway's own
-authorization engine cannot tell which produced a given request.
-
-**Disposing of a record therefore never moved onto the listener a model can
-reach.** Mission Control now composes every revision, the claims about it and
-their evidence, the gate's answer, and what it links to, into one detail pane,
-and keeps a plain-text **review sheet** of what an operator would do next — a
-list that stores no authority anywhere: it carries the public prefix an
-operator will type, and no field the walker ever reads in place of typing it
-on `/dev/tty`. One new local command, `atlas review apply FILE`, walks that
-sheet by calling the operator channel A4 already built exactly once per
-entry, with the reviewed revision pinned, and refuses an entry before
-minting anything when the record moved since it was read.
-`atlas_decision_apply_in_tx` still has exactly three callers. See the A15
-sections in `docs/review-surface.md` — the
-season's own document — and in `docs/roadmap.md`, `docs/remote-access.md`,
-`docs/decision-lifecycle.md`, `docs/engineering-rules.md` and
-`docs/extending.md`.
+Atlas' web API already served 26 read-only routes and could not be trusted with
+a twenty-seventh that wrote anything, because a model's own bearer token and an
+operator's browser session resolve to the same kind of principal on that
+listener. **Disposing of a record therefore never moved onto the listener a model
+can reach.** Mission Control now composes every revision, the claims about it
+and their evidence, the gate's answer, and what it links to, into one detail
+pane, and keeps a plain-text **review sheet** of what an operator would do next.
+One new local command, `atlas review apply FILE`, walks that sheet by calling
+the operator channel A4 already built exactly once per entry, with the reviewed
+revision pinned, and refuses an entry before minting anything when the record
+moved since it was read. `atlas_decision_apply_in_tx` still has exactly three
+callers. See the A15 sections in `docs/review-surface.md` — the season's own
+document — and in `docs/roadmap.md`, `docs/remote-access.md`,
+`docs/decision-lifecycle.md`, `docs/engineering-rules.md` and `docs/extending.md`.
 
 The season before it, **A12.1**, was reconciled model memory — a registered
 memory file is read by whichever principal can actually read it, turned into
@@ -224,6 +250,8 @@ document that carries it:
 
 | Season | What it added | Document |
 | --- | --- | --- |
+| A14 | remote submission: a bearer credential the daemon verifies queues a job, and the policy — not the request — decides the driver, mode, gate floor and bounds | `docs/remote-submission.md` |
+| A16 | browser disposal: Mission Control disposes of a record from the browser, with the digest typed and the channel's weakness on screen | `docs/browser-disposal.md` |
 | A15 | the review surface: Mission Control reads a proposal in full, and one local command disposes of it through the operator channel A4 already built | `docs/review-surface.md` |
 | A12.1 | reconciled model memory: a registered file becomes a self-declared attestation, drift gets its first producer, and a run is handed one frozen, self-labelling Context Pack | `docs/context-reconciliation.md` |
 | A13 | the per-user scanner: a repository records whose scanner may report about it, and the daemon reads a tree it cannot open from that scanner's mirror | `docs/watcher-consistency.md` |
@@ -875,6 +903,23 @@ is not written down is one somebody deletes.** Both halves are load-bearing.
   phase it is already in. A failed renewal never kills the child.
 - **The run driver starts nothing in the background** — no scheduler, no polling,
   no timer, no model router, no second submit path.
+
+### A14 — remote submission
+
+- **THE GATEWAY CANNOT SUBMIT WORK BECAUSE OF WHO IT RUNS AS, AND THE OBVIOUS FIX IS TO STOP THAT BEING TRUE.** The fix is a named credential in the request; the gateway does not gain authority — it carries a credential the daemon verifies.
+- **A CREDENTIAL IN FLIGHT IS THE ONLY AUTHORITY THE GATEWAY EVER HOLDS, AND THE POLICY — NOT THE REQUEST — DECIDES WHAT A SUBMISSION MAY COST.** Driver, mode, gate floor, daily bound and per-job bound: all from the policy, none from the request.
+- **`require_submitter` is never called on this path.** Submission authority is the credential the `remote_submit_key` line names, not the peer uid.
+- **`remote_dispose_key` and `remote_submit_key` may never name the same id.** One credential, one power.
+- **`jobs:submit` is in SCOPES[] with `grantable = false`**, derived for named keys, refused at `atlas api-key create --scope jobs:submit`.
+- **The two unattended and deferred shapes run as `model_dispatcher_uid`.** On this deployment that is the operator's own account. State what is true.
+- **No new thread, process, timer or background loop beyond the worker; no MCP tool on the stdio adapter; no new decision method; no new authority verb.** Four `job.remote_*` methods, four gateway routes, four MCP tools with `remote_only = true`, one migration.
+
+### A16 — browser disposal
+
+- **THE OPERATOR BUILT THE BROWSER SO AS NOT TO USE THE TERMINAL, AND A CHANNEL THAT IS WEAKER BY CONSTRUCTION IS STILL A CHANNEL — PROVIDED THE LEDGER SAYS WHICH ONE.** The ledger records `REMOTE_OPERATOR_CONFIRMED` with the credential's id, never `LOCAL_OPERATOR_CONFIRMED`, so a reader of any row can still tell the two apart.
+- **The capability is granted by a root-owned policy key naming one specific credential**, not by any scope the credential declares for itself, and `remote_dispose_key` is distinct from `remote_submit_key`.
+- **`atlas_decision_apply_in_tx` still has exactly three callers.** The gateway route calls the operator channel A4 already built.
+- **No new thread, process, timer or background loop; one new scope; two new routes; one migration.** `review apply` is unchanged.
 
 ### A15 — the review surface
 
@@ -1570,8 +1615,12 @@ a command means adding a service function plus a method on both renderers.
 
 - **A tool** is one entry in `TOOLS[]` in `src/mcp/mcp_tools.c`: a schema function
   and a run function. The schema must set `additionalProperties: false` and
-  declare every argument. Add the name to the expectation in `tests/test_mcp.c`,
-  which compares `atlas_mcp_tool_names()` against what the process reports.
+  declare every argument. Note: every schema publishes `additionalProperties: false`
+  but that is only enforced for one tool — `run_job_submit` calls
+  `atlas_jsonv_check_only_keys` (T7, A14); the other tools publish a claim the
+  adapter does not check. `docs/backlog.md` carries the entry. Add the name to the
+  expectation in `tests/test_mcp.c`, which compares `atlas_mcp_tool_names()`
+  against what the process reports.
 - **A hook event** goes in `HOOK_EVENTS[]` in `src/hook/hook.c`, in `handle()`,
   and in `integrations/claude/atlas/hooks/hooks.json`. `tests/test_plugin.c`
   asserts the two lists match exactly — a plugin configuring an event the binary
@@ -1744,7 +1793,9 @@ outcomes, read in the context of the command that produced them rather than as
 one global vocabulary: `atlas gate` exits `8` for `REVIEW_REQUIRED` and `9`
 for `BLOCKED`, and `atlas review apply` (A15) exits `8` when at least one
 review-sheet entry did not end `APPLIED`. Both write one complete document
-before exiting with either value.
+before exiting with either value. A16 and A14 added no new exit codes above 7:
+the remote disposal route and the remote submission routes are HTTP — they
+respond with status codes, not process exit codes.
 
 `atlas daemon ping` exits `3` when the daemon is not answering, after printing a
 complete document. That is the one place a non-zero exit accompanies valid
@@ -1766,6 +1817,7 @@ emits its error document inside the result document it had already started, whic
 `docs/security/A7_1_THREAT_MODEL.md` · `docs/security/A7_1_OPERATIONS.md` ·
 `docs/orchestration.md` · `docs/remote-access.md` · `docs/verification.md` ·
 `docs/context-reconciliation.md` · `docs/review-surface.md` ·
+`docs/browser-disposal.md` · `docs/remote-submission.md` ·
 `docs/semantic-freshness.md` · `docs/semantic-discovery.md` ·
 `docs/semantic-trust.md` ·
 `docs/git-safety.md` ·

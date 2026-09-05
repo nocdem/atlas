@@ -2809,6 +2809,154 @@ static bool t7_json_str(const char *body, const char *key, char *out, size_t out
     return true;
 }
 
+/* A14 T8. The Jobs view: a page-level property test -- the byte grep for
+ * every binding and frozen sentence the Jobs view depends on -- against a
+ * gateway that has a remote submission key configured so that the view is
+ * offered.
+ *
+ * **No JavaScript on this page is executed anywhere in this test, or
+ * anywhere in this suite.** The first half reads the served bytes as text
+ * and checks that the string literals the Jobs view requires are present in
+ * the source. The four job routes are covered at the HTTP level by
+ * `tests/test_gw_submit.c`, which drives them with a real bearer against a
+ * live daemon and a full orchestration policy. That split means this test
+ * only needs the gateway daemon running with a submission key -- no
+ * orchestration policy file is required for the page-byte check. */
+static void test_mission_control_carries_the_jobs_view(void) {
+    env e;
+    memset(&e, 0, sizeof e);
+    atlas_err err;
+    atlas_err_init(&err);
+
+    T_REQUIRE(fx_open(&e.fx, &err) == ATLAS_OK);
+    T_OK(fx_init_repo(&e.fx, fx_repo(&e.fx), NULL, &err), &err);
+    T_OK(fx_write(fx_repo(&e.fx), "main.c", "int main(void){return 0;}\n", &err), &err);
+    T_OK(fx_add_all(&e.fx, fx_repo(&e.fx), &err), &err);
+    T_OK(fx_commit(&e.fx, fx_repo(&e.fx), "first", &err), &err);
+
+    atlas_buf out = ATLAS_BUF_INIT;
+    {
+        const char *add[] = {"repo", "add", fx_repo(&e.fx), "--name", "proj"};
+        T_EQ_INT(run_cli(&e, add, 5, &out, &err), 0);
+    }
+    {
+        const char *scan[] = {"scan", "proj"};
+        T_EQ_INT(run_cli(&e, scan, 2, &out, &err), 0);
+    }
+
+    /* `jobs:submit` is derived by the gateway from `remote_submit_key` in the
+       policy, not stored on the key row (Decision 1). Create with `--no-scopes`
+       and name the key as `remote_submit_key` in the policy, exactly as
+       `test_gw_submit.c` does for its submission fixture. */
+    {
+        const char *create[] = {"api-key", "create", "--label", "browser-submit",
+                                "--no-scopes"};
+        T_EQ_INT(run_cli(&e, create, 5, &out, &err), 0);
+        capture_key(&e, &out);
+    }
+    atlas_buf_free(&out);
+
+    /* Policy with a remote_submit_key so `/auth/me` reports
+       `remote_submission: true` -- `tls_mode = REVERSE_PROXY` because this
+       test is about the page bytes and the route shapes, not the cleartext
+       acceptance path (covered by `tests/test_gw_submit.c`). */
+    /* All seven remote_submit_* execution lines are required together (the
+       gwpolicy "all-or-none" rule). No orchestration policy file is needed
+       for the page-byte check, but the daemon policy must be complete. */
+    atlas_buf ptext = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_appendf(&ptext, &err,
+                           "enabled = yes\ngateway_uid = %lld\nremote_mcp = yes\n"
+                           "web_gui = yes\ntls_mode = REVERSE_PROXY\n"
+                           "remote_submit_key = key_%s\nremote_submit_driver = fake\n"
+                           "remote_submit_mode = patch\nremote_submit_max_attempts = 1\n"
+                           "remote_submit_max_active = 8\nremote_submit_max_per_day = 64\n"
+                           "remote_submit_gate = true\n",
+                           (long long)getuid(), e.key_id),
+         &err);
+    atlas_buf ppath = ATLAS_BUF_INIT;
+    T_OK(fx_write(atlas_buf_cstr(&e.fx.root), "gwd.conf", atlas_buf_cstr(&ptext), &err), &err);
+    T_OK(atlas_buf_appendf(&ppath, &err, "%s/gwd.conf", atlas_buf_cstr(&e.fx.root)), &err);
+
+    fx_daemon_init(&e.d);
+    T_OK(t7_gwd_start(&e.fx, &e.d, atlas_buf_cstr(&ppath), &err), &err);
+    T_OK(fx_daemon_wait_ready(&e.d, 15000, &err), &err);
+
+    atlas_gwpolicy p;
+    atlas_gwpolicy_parse_buffer(atlas_buf_cstr(&ptext), ptext.len, &p);
+    T_REQUIRE_MSG(p.state == ATLAS_GWPOLICY_ENABLED,
+                  "the policy given to the HTTP gateway does not parse as ENABLED");
+    atlas_gateway_opts o;
+    memset(&o, 0, sizeof o);
+    o.socket_path = atlas_buf_cstr(&e.d.socket);
+    o.timeout_ms = 15000;
+    atlas_gateway *g = NULL;
+    T_OK(atlas_gateway_open(&p, &o, &g, &err), &err);
+
+    /* --- the page: the bindings and frozen sentences the Jobs view depends on --- */
+    atlas_buf resp = ATLAS_BUF_INIT;
+    gui_request(g, "GET", "/", NULL, NULL, &resp);
+    T_EQ_INT(status_of(&resp), 200);
+    const char *page = body_of(&resp);
+
+    static const char *const BOUND[] = {
+        /* The VIEWS entry -- byte-for-byte as it appears in the page source. */
+        "[\"jobs\",\"Jobs\"]",
+        /* The submission key variable and its sessionStorage backing. */
+        "submitKey",
+        /* The four job routes the view drives through apiWrite. */
+        "job/submit",
+        "job/get",
+        "job/list",
+        "job/cancel",
+        /* The three /auth/me fields the view reads on every start(). */
+        "remote_submission",
+        "remote_submission_driver",
+        "cleartext_submission",
+        /* The maxlengths the two bounded fields carry. */
+        "maxlength=\"65536\"",
+        "maxlength=\"40\"",
+        /* Frozen sentences (§Frozen formats, "The Jobs view's fixed sentences").
+           Substrings chosen to be unambiguous within the page source. */
+        "records the channel and the credential, not a person",
+        /* "A task is a prompt." -- capital A matches the frozen text. */
+        "A task is a prompt",
+        /* "read on the Atlas machine" -- capital A in Atlas. */
+        "read on the Atlas machine",
+        /* The remote_submission:false substitution sentence. */
+        "does not serve remote submission",
+        /* The cleartext acceptance sentence. */
+        "crosses the network in the clear from a browser",
+    };
+    for (size_t i = 0; i < sizeof BOUND / sizeof BOUND[0]; i++) {
+        T_CHECK_MSG(strstr(page, BOUND[i]) != NULL,
+                    "the page carries no binding for \"%s\"", BOUND[i]);
+    }
+
+    /* The four DOM APIs that would parse a string as markup rather than
+       insert it as text. None may appear anywhere in the page. */
+    static const char *const MARKUP_SINKS[] = {
+        "innerHTML",
+        "outerHTML",
+        "insertAdjacentHTML",
+        "document.write",
+    };
+    for (size_t i = 0; i < sizeof MARKUP_SINKS / sizeof MARKUP_SINKS[0]; i++) {
+        T_CHECK_MSG(strstr(page, MARKUP_SINKS[i]) == NULL,
+                    "the page uses the markup-parsing sink \"%s\"", MARKUP_SINKS[i]);
+    }
+    T_CHECK_MSG(strstr(page, "proves") == NULL,
+                "the page asserts something in the coined word \"proves\" rather than "
+                "reporting a daemon-observed fact");
+
+    atlas_gateway_close(g);
+    fx_daemon_stop(&e.d, false);
+    fx_daemon_free(&e.d);
+    atlas_buf_free(&resp);
+    atlas_buf_free(&ppath);
+    atlas_buf_free(&ptext);
+    fx_close(&e.fx);
+}
+
 /* A16 T7. The disposal panel: a page-level property test -- the byte grep
  * every binding and frozen sentence the panel depends on -- plus one
  * HTTP-level property test, the two routes driven with a real bearer
@@ -3101,6 +3249,8 @@ static const atlas_test TESTS[] = {
     {"mission control carries the review view", test_mission_control_carries_the_review_view},
     {"mission control carries the disposal panel",
      test_mission_control_carries_the_disposal_panel},
+    {"mission control carries the jobs view",
+     test_mission_control_carries_the_jobs_view},
     {"concurrent connections are safe", test_concurrent_connections_are_safe},
 };
 

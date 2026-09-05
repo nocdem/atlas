@@ -203,6 +203,10 @@ code{background:rgba(127,127,127,.12);padding:0 4px;border-radius:2px}
   <section id="v-audit" hidden>
     <div class="panel"><h2>Remote activity</h2><div id="a-out"></div></div>
   </section>
+
+  <section id="v-jobs" hidden>
+    <div id="j-panel"></div>
+  </section>
 </main>
 </div>
 
@@ -226,6 +230,7 @@ const VIEWS = [
   ["review","Review"],
   ["verification","Verification"],
   ["graph","Graph"],["search","Search"],["impact","Impact"],["audit","Audit"],
+  ["jobs","Jobs"],
 ];
 
 /* A15 T7. The most links from one revision the Impact panel will walk. A
@@ -316,6 +321,37 @@ function disposeKeyClear() {
   try { sessionStorage.removeItem(DISPOSE_KEY_STORAGE_KEY); } catch (e) { /* ignored */ }
 }
 
+/* A14 T8/T12. The submission key the Jobs view uses, and the three `/auth/me`
+ * fields that say whether remote submission is offered and whether it is
+ * cleartext. Same rule as disposeKey: one variable `submitKey` beside
+ * `disposeKey`, `sessionStorage`-backed under one fixed key (Decision 16,
+ * A16's answered row 3), surviving a reload and gone when the tab closes,
+ * never written to `localStorage`. */
+let submitKey = "";
+let remoteSubmission = false;
+let remoteSubmissionDriver = "";
+let cleartextSubmission = false;
+const SUBMIT_KEY_STORAGE_KEY = "atlas.submit.key.v1";
+
+function submitKeyLoad() {
+  try {
+    return sessionStorage.getItem(SUBMIT_KEY_STORAGE_KEY) || "";
+  } catch (e) {
+    return "";
+  }
+}
+
+function submitKeySave(v) {
+  try {
+    sessionStorage.setItem(SUBMIT_KEY_STORAGE_KEY, v);
+  } catch (e) { /* a private window or blocked site data: still usable this load */ }
+}
+
+function submitKeyClear() {
+  submitKey = "";
+  try { sessionStorage.removeItem(SUBMIT_KEY_STORAGE_KEY); } catch (e) { /* ignored */ }
+}
+
 const $ = (id) => document.getElementById(id);
 
 function el(tag, opts = {}, kids = []) {
@@ -370,7 +406,12 @@ async function api(path, params) {
  * disposal key as a bearer. The error mapping is `api()`'s own, except a 401
  * here means the *key* was not accepted -- a disposal has no session for
  * `showLogin()` to end. */
-async function apiWrite(path, fields) {
+/* A14 T8: `key` is optional. When supplied (as submitKey for the Jobs view),
+ * it is used as the bearer in place of disposeKey. Calling with no key arg
+ * preserves the original disposal path exactly: `disposeKey` is the bearer,
+ * and the 401 sentence names the disposal key, as the disposal panel expects. */
+async function apiWrite(path, fields, key) {
+  const bearer = (key !== undefined) ? key : disposeKey;
   const url = "/api/v1/" + path;
   let res;
   try {
@@ -379,7 +420,7 @@ async function apiWrite(path, fields) {
       credentials: "omit",
       headers: {
         "Content-Type": "application/x-www-form-urlencoded",
-        "Authorization": "Bearer " + disposeKey,
+        "Authorization": "Bearer " + bearer,
       },
       body: new URLSearchParams(fields),
     });
@@ -1753,10 +1794,240 @@ async function viewAudit() {
   });
 }
 
+/* A14 T8/T12. The Jobs view: submit a task from this browser and watch what
+ * the workers are doing. T8 is the submission half (key field, repo picker,
+ * task textarea, Submit button, Cancel per job). T12 is the watching half
+ * (run state, active task, attempts vs budget, gate result, artifact command
+ * for a finished job). Both halves share one screen and one function.
+ *
+ * What this view does not show: a worker's prose or its log. Those are read
+ * on the Atlas machine. That limit is stated on the tab itself (below).
+ *
+ * No control here starts, cancels or accepts anything the write path does
+ * not already gate: Cancel calls job.remote_cancel, which the gateway will
+ * refuse if the credential lacks jobs:submit or the job is already terminal. */
+async function viewJobs() {
+  const root = $("j-panel");
+  if (!root) return;
+  /* When remote submission is off, substitute the frozen sentence and stop. */
+  if (!remoteSubmission) {
+    clear(root);
+    root.appendChild(el("p", {text:
+      "This gateway does not serve remote submission. Jobs are submitted with atlas job " +
+      "submit on a terminal on the Atlas machine."}));
+    return;
+  }
+
+  clear(root);
+
+  /* T12: the limit is stated on the tab itself, not only in the plan. */
+  root.appendChild(el("p", {class: "dim", text:
+    "This view shows the state of each job as the gateway reports it. " +
+    "It does not show a worker’s prose or log; those are read on the Atlas machine."}));
+
+  /* --- Submit a task (T8) ------------------------------------------------ */
+  const submitSec = el("div", {class: "panel"});
+  submitSec.appendChild(el("h2", {text: "Submit a task"}));
+
+  /* Frozen sentences (§Frozen formats, "The Jobs view's fixed sentences"). */
+  submitSec.appendChild(el("p", {text:
+    "Submitting from this browser queues a task under the credential you paste here. " +
+    "Atlas records the channel and the credential, not a person. What the task may do is " +
+    "decided by the root-owned policy on the Atlas machine, never by this page: the " +
+    "driver, the gates, the attempts and the daily bound are its."}));
+  submitSec.appendChild(el("p", {text:
+    "A task is a prompt. On this deployment it runs as the operator’s own account, " +
+    "with that account’s files readable to it and its edits accepted in a workspace; " +
+    "Atlas bounds how many tasks a credential may queue and what checks they run under, " +
+    "not what one task may ask a worker to read. Nothing here applies a patch, changes a " +
+    "lifecycle state or accepts a run; a finished job’s patch is read on the Atlas machine."}));
+  if (cleartextSubmission) {
+    submitSec.appendChild(el("p", {class: "warn", text:
+      "On this deployment the submission key crosses the network in the clear from a browser. " +
+      "Anyone able to observe this network segment can capture it, and a captured " +
+      "key queues work that runs as the operator until it is revoked."}));
+  }
+
+  /* Submission key (password field, sessionStorage-backed -- Decision 16). */
+  const keyRow = el("div", {class: "row"});
+  const keyInput = document.createElement("input");
+  keyInput.type = "password";
+  keyInput.autocomplete = "off";
+  keyInput.placeholder = "submission key";
+  keyInput.value = submitKey;
+  keyInput.addEventListener("input", () => {
+    submitKey = keyInput.value;
+    submitKeySave(submitKey);
+  });
+  keyRow.appendChild(keyInput);
+  keyRow.appendChild(el("p", {class: "dim", text:
+    "The submission key is remembered for this tab only and forgotten when the tab " +
+    "closes; it is never written to this browser’s persistent storage."}));
+  submitSec.appendChild(keyRow);
+
+  /* Repository picker (populated from the same repos array loadRepos() fills). */
+  const repoRow = el("div", {class: "row"});
+  const label = el("label");
+  label.textContent = "repository ";
+  const repoPick = document.createElement("select");
+  for (const r of repos) {
+    const o = document.createElement("option");
+    o.textContent = r;
+    o.value = r;
+    repoPick.appendChild(o);
+  }
+  label.appendChild(repoPick);
+  repoRow.appendChild(label);
+  submitSec.appendChild(repoRow);
+
+  /* Task textarea, bounded at ATLAS_ORCH_TASK_MAX.
+     `maxlength="65536"`: the same bound the daemon enforces on the task text. */
+  const taskArea = document.createElement("textarea");
+  taskArea.setAttribute("maxlength", "65536");
+  taskArea.placeholder = "task (a prompt for the worker)";
+  taskArea.rows = 6;
+  submitSec.appendChild(taskArea);
+
+  /* Optional idempotency key, bounded at ATLAS_ORCH_REMOTE_CLIENT_KEY_MAX.
+     `maxlength="40"`: a client key is at most 40 printable ASCII characters. */
+  const iKeyRow = el("div", {class: "row"});
+  const iKeyInput = document.createElement("input");
+  iKeyInput.type = "text";
+  iKeyInput.setAttribute("maxlength", "40");
+  iKeyInput.placeholder = "idempotency key (optional)";
+  iKeyRow.appendChild(iKeyInput);
+  submitSec.appendChild(iKeyRow);
+
+  const submitBtn = el("button", {class: "go", text: "Submit"});
+  const submitOut = el("div");
+  submitBtn.onclick = async () => {
+    clear(submitOut);
+    const repo = repoPick.value;
+    const task = taskArea.value;
+    if (!repo || !task.trim()) {
+      say(submitOut, "a repository and a task are required", "err");
+      return;
+    }
+    say(submitOut, "submitting…", "dim");
+    try {
+      const fields = {repo: repo, task: task};
+      if (iKeyInput.value) fields.key = iKeyInput.value;
+      const r = await apiWrite("job/submit", fields, submitKey);
+      clear(submitOut);
+      submitOut.appendChild(kv([
+        ["job", r.job_uid || r.job],
+        ["state", statusTag(r.state)],
+        ["driver", remoteSubmissionDriver],
+      ]));
+    } catch (e) {
+      say(submitOut, String((e && e.message) || e), "err");
+    }
+  };
+  submitSec.appendChild(submitBtn);
+  submitSec.appendChild(submitOut);
+  root.appendChild(submitSec);
+
+  /* --- Jobs (T12 watching half) ------------------------------------------ */
+  const listSec = el("div", {class: "panel"});
+  listSec.appendChild(el("h2", {text: "Jobs"}));
+
+  const listOut = el("div");
+  const refreshBtn = el("button", {text: "Refresh"});
+
+  async function loadJobList() {
+    say(listOut, "loading…", "dim");
+    try {
+      const r = await apiWrite("job/list", {}, submitKey);
+      const jobs = Array.isArray(r) ? r : (r.jobs || []);
+      clear(listOut);
+      if (jobs.length === 0) {
+        say(listOut, "no jobs for this credential", "");
+        return;
+      }
+      for (const job of jobs) {
+        const uid = String(job.job_uid || job.job || "");
+        const row = el("div", {class: "panel"});
+        row.appendChild(kv([
+          ["job", uid],
+          ["state", statusTag(job.state)],
+          ["driver", job.driver],
+          ["repository", job.repo],
+          ["submitted", job.created_at],
+          ["attempts", String(job.attempts !== undefined ? job.attempts : "—")],
+        ]));
+
+        /* Cancel button for non-terminal jobs. */
+        const terminal = ["SUCCEEDED","FAILED","CANCELLED","CANCEL_REQUESTED"];
+        if (!terminal.includes(job.state)) {
+          const cancelBtn = el("button", {text: "Cancel"});
+          const cancelOut = el("div");
+          cancelBtn.onclick = async () => {
+            clear(cancelOut);
+            say(cancelOut, "cancelling…", "dim");
+            try {
+              await apiWrite("job/cancel", {job: uid}, submitKey);
+              say(cancelOut, "cancel requested", "");
+              await loadJobList();
+            } catch (e) {
+              say(cancelOut, String((e && e.message) || e), "err");
+            }
+          };
+          row.appendChild(cancelBtn);
+          row.appendChild(cancelOut);
+        }
+
+        /* T12: fetch full detail (attempts/max, reason, cost, artifact). */
+        const detailOut = el("div");
+        row.appendChild(detailOut);
+        if (uid) {
+          /* Best-effort: the list is shown even if a detail call fails. */
+          (async () => {
+            try {
+              const d = await apiWrite("job/get", {job: uid}, submitKey);
+              const pairs = [];
+              if (d.run_uid) pairs.push(["run", d.run_uid]);
+              if (d.max_attempts !== undefined) {
+                pairs.push(["worker starts / budget",
+                  (d.attempts !== undefined ? d.attempts : "—") + " / " + d.max_attempts]);
+              }
+              if (d.reason) pairs.push(["gate result", d.reason]);
+              if (d.usage) {
+                const cost = typeof d.usage === "object"
+                  ? Object.entries(d.usage).map(([k, v]) => k + ": " + v).join(", ")
+                  : String(d.usage);
+                if (cost) pairs.push(["cost", cost]);
+              }
+              /* T12: for a finished job, show how to fetch its patch on the Atlas machine. */
+              if (d.state === "SUCCEEDED") {
+                pairs.push(["to read the patch",
+                  el("code", {text: "atlas job artifact " + uid})]);
+              }
+              if (pairs.length > 0) detailOut.appendChild(kv(pairs));
+            } catch (e) { /* detail is best-effort; the list row is still shown */ }
+          })();
+        }
+
+        listOut.appendChild(row);
+      }
+    } catch (e) {
+      clear(listOut);
+      say(listOut, String((e && e.message) || e), "err");
+    }
+  }
+
+  refreshBtn.onclick = loadJobList;
+  listSec.appendChild(refreshBtn);
+  listSec.appendChild(listOut);
+  root.appendChild(listSec);
+
+  await loadJobList();
+}
+
 const LOADERS = {overview: viewOverview, repository: viewRepository, decisions: viewDecisions,
                  review: viewReview,
                  verification: viewVerification,
-                 graph: viewGraph, search: viewSearch, impact: viewImpact, audit: viewAudit};
+                 graph: viewGraph, search: viewSearch, impact: viewImpact, audit: viewAudit,
+                 jobs: viewJobs};
 
 function show(view) {
   for (const [id] of VIEWS) {
@@ -1808,6 +2079,12 @@ async function start() {
   remoteDisposal = !!me.remote_disposal;
   cleartextDisposal = !!me.cleartext_disposal;
   disposeKey = disposeKeyLoad();
+  /* A14 T8/T12. Load submission fields from /auth/me and resume the saved key.
+     Same rule as disposal: never guessed, read fresh on every start(). */
+  remoteSubmission = !!me.remote_submission;
+  remoteSubmissionDriver = me.remote_submission_driver || "";
+  cleartextSubmission = !!me.cleartext_submission;
+  submitKey = submitKeyLoad();
   $("login").hidden = true;
   $("app").hidden = false;
   /* An anonymous principal is a real thing an operator's policy granted, not
@@ -1828,6 +2105,7 @@ async function start() {
     signout.onclick = async () => {
       try { await fetch("/auth/logout", {method: "POST", credentials: "same-origin"}); } catch (e) {}
       disposeKeyClear();
+      submitKeyClear();
       /* Re-running start() rather than jumping straight to showLogin() is
          what makes the comment above true: with an anonymous floor
          configured, /auth/me answers 200 again right away and this lands back

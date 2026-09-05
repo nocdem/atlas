@@ -233,3 +233,42 @@ Charter 2026-09-05'te verildi; ondan önce aynı gün Steward iki kez rol dış�
    vermişti; satırı yazmak Operator'ın işiydi, Steward'ın değil.
 
 İkisi de yürürlükte kalıyor; geri alınmaları Operator'ın kararıdır.
+
+---
+
+## 9. Tek seferlik yetki devri — otonom çalışma denemesi için
+
+**Veren:** Operator, 2026-09-05, makineden ayrılmadan önce, kendi sözleriyle:
+*"sadece otonom test amacı ile steward gözüyle incelettikten ve bulguları
+biriktirdikten sonra planı onaylayabilirsin. (normalde böyle çalışmayacak ama
+burada elde edeceğimiz deneyimleri bir yere kaydetmeyi istiyorum)"*
+
+**Neyi kapsar.** Steward, A sezonunun planını — yalnızca onu — Operator adına
+değil, **kendi adına** onaylayabilir; ve ancak charter §4'ün incelemesini
+yaptıktan ve bulgularını yazdıktan **sonra**. Onay, görevlerin Executor'a tek
+tek dağıtılmasını açar.
+
+**Neyi kapsamaz.** Devir dar okunur, çünkü charter §1'in tamamı devredilmiş
+değildir:
+
+- Push ve deploy hâlâ Operator'ındır. Commit ayrıca ve daha önce verildi.
+- Sezon kapanışı (charter §10) Operator'ındır; audit hazırlanır, kapatılmaz.
+- Atlas üzerinden gerçek model işi gönderilmez: başlatma başına para harcar ve
+  o karar verilmedi.
+- Kapsam büyütülmez. Planda Operator kararı olarak işaretlenmiş her nokta
+  cevapsız bekler; devir plan onayını kapsar, plandaki soruları değil.
+- Bir sonraki sezona (B) geçilmez.
+
+**Kayıtta nasıl görünür.** Bu onay bir Operator onayı değildir ve öyle
+yazılmaz. Onaylanan plan ve ondan doğan her görev, onayın **Steward tarafından,
+tek seferlik bir devirle** verildiğini taşır. Bunu karıştırmak, charter'ın
+`LOCAL_OPERATOR_CONFIRMED`'in bir kanalı adlandırdığı, bir kişiyi değil kuralını
+bir katman yukarıda tekrar etmek olurdu.
+
+**Neden verildi.** Operator'ın kendi gerekçesi: normal çalışma biçimi bu değil;
+amaç otonom bir turun neye benzediğini görmek ve **çıkan deneyimi kaydetmek**.
+O kayıt `docs/autonomy-log.md`'de tutulur ve bu devrin asıl teslimidir — planın
+kendisi kadar, belki ondan çok.
+
+**Ne zaman biter.** A sezonunun planı onaylanıp görevleri dağıtıldığında. Devir
+yenilenmedikçe B sezonunun planı yine Operator onayı bekler.

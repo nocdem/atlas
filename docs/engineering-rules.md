@@ -3832,3 +3832,69 @@ chain. The alternative — refusing to build the feature without TLS — would l
 the capability absent not because it is harmful but because nobody resolved the
 deployment constraint. The honest answer is to state the chain and let the
 operator decide; they did, on 2026-09-04, with the chain in front of them.
+
+## A17 layers — additions
+
+| File | What it owns |
+| --- | --- |
+| `include/atlas/deploy.h`, `src/db/db_deploy.c` | the `atlas_deploy_state`/`atlas_deploy_actor` vocabularies, the row types, and the four write functions (`propose`, `confirmed_uid`, `confirm`, `cancel`, `finish`), each a compare-and-swap inside a transaction its caller already opened |
+| `include/atlas/deploy_spool.h`, `src/daemon/deploy_spool.c` | the spool directory creation (`<data-dir>/deploy/{requests,results}`, `0700`), the request writer (tmp then rename), and the bounded `.res` parser that treats a malformed file as `FAILED`/`INGEST` |
+| `src/ipc/server_deploy_remote.c` | the six `deploy.remote_*` daemon-side method implementations, the credential-verification predicate (`atlas_server_remote_deploy_policy_ready`), and the in-process, file-static mint-then-spend confirmation challenge |
+| `src/gw/gwpolicy.c` | parsing and cross-checking `remote_deploy_key` and `operator_accepts_cleartext_deploy`; the "one credential, one power" check against both `remote_dispose_key` and every `remote_submit_key` |
+| `src/mcp/mcp_tools.c` | the four remote-only MCP tools (`atlas_deploy_propose`, `atlas_deploy_status`, `atlas_deploy_list`, `atlas_deploy_cancel`), each calling `atlas_jsonv_check_only_keys` before reading an argument, following `run_job_submit`'s pattern rather than the older tools' |
+| `deploy/a17/atlas-deploy-agent.sh`, `deploy/a17/deploy.conf.template`, `deploy/a17/atlas-deploy.path`, `deploy/a17/atlas-deploy.service` | the root agent, its root-owned conf, and the systemd path/oneshot pair that triggers it |
+| `src/db/migrate.c` | migration 33: `CREATE TABLE deploys`, `CREATE TABLE deploy_transitions`, and the two partial unique indexes that enforce one active deploy per repository and one successful deploy per job |
+| `docs/remote-deploy.md` | the season's own document: the reversal argument, the honest weakness paragraph, the state machine, the queue-file formats verbatim, the agent's stage-by-stage contract, and the four open operator decisions |
+
+**A17 added migration 33.**
+
+## A17 rules — these are not negotiable
+
+The one-line forms are in `CLAUDE.md`; the full argument, the honest weakness
+paragraph, and the queue-file formats verbatim are in `docs/remote-deploy.md`.
+
+**Why the Atlas binary itself calls no `systemctl`, ever.** Every restart this
+season performs happens inside `deploy/a17/atlas-deploy-agent.sh`, a shell
+script an operator installs once, not inside `atlasd` or `atlas-gateway`.
+Atlas' own process reads registered repositories and answers RPC methods; it
+has never started or stopped a systemd unit, and giving the daemon that
+capability would mean a bug or a compromise in Atlas' own process could
+restart arbitrary units on the host it runs on. The agent is a separate,
+auditable, root-owned artifact precisely so that capability sits outside
+Atlas' own trust boundary rather than inside it.
+
+**Why the agent opens no SQLite handle.** `deploy/a17/atlas-deploy-agent.sh`'s
+whole interface with Atlas is the two spool directories: a request file it
+reads and a result file it writes. A root process that could also open
+`<data-dir>/atlas.db` directly would be a second, unaudited write path into
+the one database `atlas_db_deploy_propose_in_tx` and its siblings already
+guard with compare-and-swap transactions — exactly the "no second write path"
+argument A12.1 already made for the reconciler, applied here to a process
+that is not even part of the same binary.
+
+**Why the proposing credential and the confirming credential must be
+different.** `remote_deploy_key` may never name the same id as
+`remote_submit_key` (or `remote_dispose_key`); `gwpolicy.c` refuses a policy
+that tries. A single credential that could both queue a job and confirm
+applying its own patch would let one capture skip the second, independent
+step this season's whole design rests on: a human, holding a *different*
+bearer token, deliberately confirming that this specific patch, at this
+specific digest, should be applied. Collapsing the two credentials into one
+would collapse that second step into the first.
+
+**Why only the stored patch is ever applied.** `deploy.remote_propose`
+resolves `changes.patch` from the named job's own stored A14R artifact; no
+method, route or request field ever names a file, a diff, or a path for the
+agent to apply instead. A request that could supply its own bytes to apply
+would be exactly the capability A14R's `job.remote_apply` refusal was written
+to prevent, reopened under a different name.
+
+**Why one deploy in flight per repository, enforced by the schema.**
+`idx_deploys_one_active`, a unique index on `deploys(repo_id) WHERE state IN
+('PROPOSED','CONFIRMED')`, is the guarantee; the C check in
+`atlas_db_deploy_propose_in_tx` is the sentence that names it before a caller
+hits the constraint directly — A11.0's "the schema is the guarantee, the C
+check names it" precedent. Two deploys in flight for the same repository
+would mean two patches, from two different bases, both racing to reach the
+same tree through the same restart; the index makes that state unreachable
+rather than merely discouraged.

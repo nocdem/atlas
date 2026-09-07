@@ -4850,6 +4850,82 @@ static const char M32_TRANSITIONS[] =
 
 static const char *const M32_STATEMENTS[] = {M32_JOBS, M32_TRANSITIONS, NULL};
 
+/* A17 T1: two new tables, no existing table altered, so no content
+ * hash moves and foreign keys stay enforced throughout.
+ *
+ * `deploys` names its own state vocabulary in a CHECK, exactly as
+ * `orch_jobs.state` does, and `deploy_transitions` names its own actor
+ * vocabulary the same way `orch_transitions` and `decision_events` do.
+ * Neither table cascades from `repositories`: `repo_id` is a fact recorded at
+ * proposal time, not a foreign key, on A4's `decision documents do not
+ * cascade` precedent -- a deploy's history must survive whatever the
+ * repository row that produced it does later.
+ *
+ * `idx_deploys_one_active` is "one deploy in flight per repository": the
+ * schema is the guarantee, `atlas_db_deploy_propose_in_tx`'s own check is
+ * only the sentence that names it, on A11.0's "the schema is the guarantee
+ * and the check is there to name the task in the way" precedent.
+ *
+ * `idx_deploys_one_per_job` is "a job's patch is deployed at most once
+ * successfully": PROPOSED, CONFIRMED and SUCCEEDED all count, so a still-open
+ * or already-successful deploy blocks a second proposal for the same job, but
+ * FAILED and CANCELLED do not -- a job whose deploy failed or was cancelled
+ * may be proposed again.
+ *
+ * `deploys.state` is a cache of `deploy_transitions`, the same relationship
+ * A4 keeps between `decision_revisions`' status columns and
+ * `decision_events`: the ledger is canonical, the column is what a read
+ * consults without replaying it. `confirmed_at`, `spooled_at` and
+ * `terminal_at` are nullable rather than empty-string-defaulted, because a
+ * NULL-until-set column together with the CAS predicate on `state` is what
+ * lets a later migration's own consistency check ask "did this ever happen"
+ * without also asking "does this text look like a timestamp". */
+static const char M33_DEPLOYS[] =
+    "CREATE TABLE deploys ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  deploy_uid TEXT NOT NULL UNIQUE,"
+    "  job_uid TEXT NOT NULL,"
+    "  repo_id INTEGER NOT NULL,"
+    "  base_commit TEXT NOT NULL,"
+    "  patch_digest TEXT NOT NULL,"
+    "  patch_bytes INTEGER NOT NULL,"
+    "  state TEXT NOT NULL"
+    "    CHECK(state IN ('PROPOSED','CONFIRMED','SUCCEEDED','FAILED','CANCELLED')),"
+    "  proposed_key_id TEXT NOT NULL,"
+    "  confirmed_key_id TEXT NOT NULL DEFAULT '',"
+    "  created_at TEXT NOT NULL, created_ms INTEGER NOT NULL,"
+    "  confirmed_at TEXT, spooled_at TEXT, terminal_at TEXT,"
+    "  result_dry_run INTEGER NOT NULL DEFAULT 0 CHECK(result_dry_run IN (0,1)),"
+    "  result_stage TEXT NOT NULL DEFAULT '',"
+    "  result_rollback TEXT NOT NULL DEFAULT '',"
+    "  result_head_before TEXT NOT NULL DEFAULT '',"
+    "  result_head_after TEXT NOT NULL DEFAULT '',"
+    "  result_version TEXT NOT NULL DEFAULT '',"
+    "  result_text TEXT NOT NULL DEFAULT ''"
+    ");"
+    /* One deploy in flight per repository: the schema is the guarantee, the C
+     * check names it. */
+    "CREATE UNIQUE INDEX idx_deploys_one_active ON deploys(repo_id)"
+    "  WHERE state IN ('PROPOSED','CONFIRMED');"
+    /* A job's patch is deployed at most once successfully; a FAILED or
+     * CANCELLED one may be re-proposed. */
+    "CREATE UNIQUE INDEX idx_deploys_one_per_job ON deploys(job_uid)"
+    "  WHERE state IN ('PROPOSED','CONFIRMED','SUCCEEDED');";
+
+static const char M33_DEPLOY_TRANSITIONS[] =
+    "CREATE TABLE deploy_transitions ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"      /* ordering is this id, never a timestamp */
+    "  deploy_id INTEGER NOT NULL REFERENCES deploys(id),"
+    "  from_state TEXT NOT NULL, to_state TEXT NOT NULL,"
+    "  actor TEXT NOT NULL"
+    "    CHECK(actor IN ('REMOTE_CREDENTIAL','REMOTE_OPERATOR_CONFIRMED','DEPLOY_AGENT')),"
+    "  key_id TEXT NOT NULL DEFAULT '',"
+    "  reason TEXT NOT NULL DEFAULT '',"
+    "  at TEXT NOT NULL"
+    ");";
+
+static const char *const M33_STATEMENTS[] = {M33_DEPLOYS, M33_DEPLOY_TRANSITIONS, NULL};
+
 static const atlas_migration MIGRATIONS[] = {
     {1, "initial schema", M1_STATEMENTS, false},
     {2, "worktree identity", M2_STATEMENTS, false},
@@ -4978,6 +5054,14 @@ static const atlas_migration MIGRATIONS[] = {
      * `idx_orch_jobs_submitter` still serves the default list. */
     {32, "which credential queued a job, beside which uid: the remote submission channel",
      M32_STATEMENTS, false},
+    /* Additive: two new tables, no existing table altered, so no content hash
+     * moves and foreign keys stay enforced throughout. See the M33 comment for
+     * why `deploys.repo_id` is not a foreign key, why `idx_deploys_one_active`
+     * and `idx_deploys_one_per_job` carry different state sets, and why the
+     * three timestamp columns are nullable rather than empty-defaulted. */
+    {33, "a deploy a credential proposed, a different credential confirmed, and a root agent "
+         "reported",
+     M33_STATEMENTS, false},
 };
 
 const atlas_migration *atlas_migrations(size_t *count_out) {

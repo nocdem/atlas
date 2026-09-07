@@ -132,6 +132,34 @@ session_ttl_seconds = 43200
 # this acceptance on every run.
 # operator_accepts_cleartext_submission = yes
 
+# --- remote deploy (A17) ------------------------------------------------------
+#
+# A second, distinct credential that confirms applying a job's already-stored
+# patch -- never the credential that proposed the job. This key alone grants
+# nothing to install anything: it authorises deploy.remote_challenge and
+# deploy.remote_confirm, and the daemon still requires the correct eight-hex
+# prefix of the patch's own digest, typed at confirmation. What tree, what
+# owner, what build/test/install commands and which units restart are decided
+# by a separate root-owned file this gateway never opens: /etc/atlas/deploy.conf.
+# Every one REQUIRES tls_mode = REVERSE_PROXY unless the acceptance key below
+# is present. A key named here may not also be the remote_submit_key or the
+# remote_dispose_key: one credential, one power.
+#
+# remote_deploy_key = key_<a --no-scopes credential's own selector>
+
+# THE OPERATOR'S WRITTEN ACCEPTANCE OF A CLEARTEXT DEPLOY-CONFIRMATION CHANNEL.
+# Not a feature toggle, and NOT implied by operator_accepts_cleartext_disposal
+# or operator_accepts_cleartext_submission: a confirmed deploy installs code
+# that runs as root on this machine, unbounded by anything Atlas checks, which
+# is a materially larger cost than moving a record or queuing a bounded worker.
+# With this line present and tls_mode = NONE, the deploy credential crosses the
+# network unencrypted on every confirmation, and a captured one applies,
+# builds, installs and restarts as root until `atlas api-key revoke`. `yes` is
+# the only accepted value; leave the line out rather than writing `no`.
+# Refused under tls_mode = REVERSE_PROXY (nothing to accept) and without a
+# remote_deploy_key. `atlas gateway status` prints this acceptance on every run.
+# operator_accepts_cleartext_deploy = yes
+
 # Whether a forwarded client address may be believed for rate limiting.
 #
 # Off by default, and the consequence is stated rather than hidden: behind a

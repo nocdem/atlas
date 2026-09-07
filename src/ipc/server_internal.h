@@ -287,4 +287,44 @@ bool atlas_server_remote_submit_offered(const atlas_server_ctx *ctx, long long p
  * it can never disagree. */
 bool atlas_server_remote_submit_policy_ready(const atlas_gwpolicy *gw);
 
+/* A17 T2. The daemon's `deploy.remote_*` group --
+ * `deploy.remote_propose`, `deploy.remote_get`, `deploy.remote_list`,
+ * `deploy.remote_cancel`, `deploy.remote_challenge`, `deploy.remote_confirm`
+ * -- in `src/ipc/server_deploy_remote.c`, beside `server_orch_remote.c` and
+ * `server_remote.c` for the same reason those two are separate from
+ * `server_orch.c`/`server_decision.c`: the peer test this group is offered
+ * under adds a policy condition neither of theirs has.
+ *
+ * `atlas_server_remote_deploy_offered` is the coarse gate: the peer is the
+ * gateway and *either* pool (a ready submit key, or a deploy key with TLS in
+ * front or the operator's written cleartext acceptance) is ready. It answers
+ * only "is this group worth looking at", never "is this one method offered"
+ * -- `atlas_server_remote_deploy_method_offered` answers that, per name:
+ * `deploy.remote_challenge`/`_confirm` only when the deploy pool is ready,
+ * `deploy.remote_propose`/`_get`/`_list`/`_cancel` only when the submit pool
+ * is ready. Never consults `require_submitter` or
+ * `atlas_orchpolicy_permits_submitter`: the credential in the request is the
+ * whole of the authority, exactly as A14 established for `job.remote_*`.
+ *
+ * The deploy credential itself follows A16's dispose rule, not A14's submit
+ * rule: it must hold NO stored scope at all. `server_gw.c`'s `gateway.auth`
+ * checks `rec.mask == 0u` before deriving `deploys:confirm` for it, and
+ * `verify_deploy_credential` (`src/ipc/server_deploy_remote.c`) checks the
+ * identical condition -- via a lookup on the id `atlas_orch_remote_verify`
+ * resolved, since that function has no record to hand back -- before letting
+ * the credential spend a challenge or a confirm. Both sites must agree, and
+ * do: "the deploy credential holds no other power." A submit credential is
+ * the opposite case and keeps A14's own rule (may hold other scopes,
+ * `jobs:submit` is additive). */
+const atlas_method_entry *atlas_server_remote_deploy_methods(size_t *count_out);
+bool atlas_server_remote_deploy_offered(const atlas_server_ctx *ctx, long long peer_uid);
+bool atlas_server_remote_deploy_method_offered(const atlas_server_ctx *ctx, long long peer_uid,
+                                               const char *method_name);
+/* The policy condition above, minus the peer test -- shared with
+ * `method_gateway_auth`'s `deploys:confirm` scope derivation so what that
+ * endpoint reports a credential can do and what the dispatcher will actually
+ * offer for it can never disagree. Coarse, like `atlas_server_remote_deploy_offered`
+ * above: OR of both pools, not the per-method answer. */
+bool atlas_server_remote_deploy_policy_ready(const atlas_gwpolicy *gw);
+
 #endif /* ATLAS_IPC_SERVER_INTERNAL_H */

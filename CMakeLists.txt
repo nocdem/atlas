@@ -318,6 +318,11 @@ add_library(atlas_core STATIC
   src/core/service_plan.c
   src/db/db_orch.c
   src/db/db_orch_memory.c
+  # A17 T1: migration 33's two tables and the one write point for a
+  # deploy -- a second, narrower state machine beside A8's orchestration one,
+  # from a SUCCEEDED patch-mode job's stored artifact to a root agent's own
+  # queue-file result.
+  src/db/db_deploy.c
   # A12.0: migration 25's three tables, their one write point, and the plan
   # status that is derived on every read because nothing writes one.
   src/db/db_plan.c
@@ -326,6 +331,12 @@ add_library(atlas_core STATIC
   # See src/ipc/server_orch_remote.c for why this is a third table, not folded
   # into server_orch.c.
   src/ipc/server_orch_remote.c
+  # A17 T2: the daemon's six deploy.remote_* methods, the queue-file
+  # spool and the root agent's .res parser -- see src/ipc/server_deploy_remote.c
+  # for why this is a fourth table, not folded into server_orch_remote.c or
+  # server_remote.c.
+  src/ipc/server_deploy_remote.c
+  src/daemon/deploy_spool.c
   src/ipc/server_scanner.c
   # A12.1 T11. memory.put, memory.status and memory.reconcile -- the operator
   # group beside repo.scanner, above.

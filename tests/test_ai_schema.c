@@ -93,11 +93,11 @@ static void test_migration_creates_the_a2_tables(void) {
      * added 14 and 15, A9.2.1 added 16, A9.2.2 added 17 and A9.2.3 added 18;
      * A11.0 added 21, A10.0 added 22, A10.1 added 23, A11.6 added 24, A12.0 added
      * 25, P0 added 26 and A13 added 27; the A12.1 T14 fix round added 30, and
-     * A16's T2 added 31.
+     * A16's T2 added 31; A14's T2 added 32 and A17 T1 added 33.
      * The A2 tables below
      * are asserted unchanged across all of them, which is the property this
      * test is really for. */
-    T_EQ_INT(ATLAS_SCHEMA_VERSION, 32);
+    T_EQ_INT(ATLAS_SCHEMA_VERSION, 33);
 
     static const char *const TABLES[] = {
         "ai_clients",       "ai_sessions",       "ai_session_repos",     "ai_session_events",

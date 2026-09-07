@@ -315,6 +315,29 @@ typedef struct atlas_gwpolicy {
      * on cleartext in the A14 plan. */
     bool cleartext_submission_accepted;
 
+    /* A17 T2. The single credential a browser presents through
+     * `deploy.remote_challenge` and `deploy.remote_confirm`, stored without
+     * the display prefix exactly as `remote_dispose_key` is -- and refused,
+     * at end of parse, from ever naming the same credential as
+     * `remote_dispose_key` or any `remote_submit_key`: one credential, one
+     * power, A14's rule extended to a third capability.
+     *
+     * Empty (the default) means the daemon's `deploy.remote_*` method group
+     * is offered to nobody -- like `remote_dispose_key` and
+     * `remote_submit_count`, existence of the group follows existence of the
+     * key rather than a separate on/off switch. Load time verifies shape
+     * only; existence, ACTIVE status and the verifier match are checked at
+     * use, by `atlas_orch_remote_verify` (reused rather than copied, per
+     * `src/orch/remote.c`'s own argument for why that file is the third and
+     * last copy of this check). */
+    char remote_deploy_key[ATLAS_APIKEY_SELECTOR_HEX + 1u];
+    /* The operator's written acceptance that the deploy credential above
+     * crosses the network unencrypted -- `cleartext_disposal_accepted`'s own
+     * argument, restated for a third credential rather than shared, on this
+     * file's own precedent of duplicating rather than folding three
+     * structurally similar but independently-refused fields together. */
+    bool cleartext_deploy_accepted;
+
     /* Ceilings. Each may only lower the compiled-in absolute bound in
      * `atlas/limits.h`, never raise it — A8's rule, so the policy decides how
      * much a deployment permits and the header decides how much the policy may

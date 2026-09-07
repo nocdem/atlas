@@ -1,7 +1,30 @@
 # Atlas — working notes for Claude Code
 
 Atlas is a generic, headless engineering-memory and repository-intelligence CLI
-in C17. The current work is **A14**: remote submission — a job submitted via a
+in C17. The current work is **A17**: remote deploy — a browser confirmation,
+from a credential distinct from the one that proposed the job, tells a
+root-owned agent outside Atlas' own process to apply Atlas' own stored patch,
+build, test, install and restart. **A17 added migration 33** (`CREATE TABLE
+deploys` and `CREATE TABLE deploy_transitions`). The two sentences it exists
+for are
+
+> **A CALLER MAY NEVER APPLY A WORKER'S OUTPUT; A ROOT AGENT MAY APPLY ATLAS' OWN STORED PATCH, UNDER A CONF THE REQUEST NEVER TOUCHES AND A CREDENTIAL THAT NEVER ALSO PROPOSED IT.**
+
+and
+
+> **A CAPTURED DEPLOY CREDENTIAL INSTALLS CODE THAT RUNS AS ROOT, WHICH IS A DIFFERENT COST FROM QUEUING A JOB OR DISPOSING OF A RECORD — SO IT GETS ITS OWN WRITTEN ACCEPTANCE, NEVER BORROWED FROM THE OTHER TWO.**
+
+A14R gave a steward three artifacts to read once a remotely submitted job
+finished, `result.txt`, `changes.patch` and `validations.txt`, and stopped
+there: nothing let the steward's session make `changes.patch` real. A17 is
+the narrow reversal of A14R's own forbidden-apply rule — a *root agent*, not
+a caller, applies the *stored* patch, confirmed by a credential that never
+also proposed it, under a conf the request never touches. See the A17
+sections in `docs/remote-deploy.md` — the season's own document — and in
+`docs/roadmap.md`, `docs/remote-access.md`, `docs/engineering-rules.md`,
+`docs/extending.md` and `docs/backlog.md`.
+
+The season before it, **A14**, was remote submission — a job submitted via a
 bearer credential the daemon verifies itself, under bounds the policy sets and
 the request cannot. **A14 added migration 32** (`ALTER TABLE orch_jobs ADD COLUMN
 submit_key_id TEXT NOT NULL DEFAULT ''` and `ALTER TABLE orch_transitions ADD COLUMN
@@ -14,7 +37,7 @@ and
 > **A CREDENTIAL IN FLIGHT IS THE ONLY AUTHORITY THE GATEWAY EVER HOLDS, AND THE POLICY — NOT THE REQUEST — DECIDES WHAT A SUBMISSION MAY COST.**
 
 A15 and A16 extended the gateway into a place an operator can read a proposal
-from a browser and dispose of it with a credential. A14 extends it further: a
+from a browser and dispose of it with a credential. A14 extended it further: a
 credential in the request — not the gateway's uid — queues a job, the daemon
 verifies it in the write transaction, and the policy decides the driver, mode,
 gate floor and bounds. `require_submitter` is never called on this path.
@@ -250,6 +273,7 @@ document that carries it:
 
 | Season | What it added | Document |
 | --- | --- | --- |
+| A17 | remote deploy: a root agent applies Atlas' own stored patch from a browser confirmation, under a credential distinct from the one that proposed the job | `docs/remote-deploy.md` |
 | A14 | remote submission: a bearer credential the daemon verifies queues a job, and the policy — not the request — decides the driver, mode, gate floor and bounds | `docs/remote-submission.md` |
 | A16 | browser disposal: Mission Control disposes of a record from the browser, with the digest typed and the channel's weakness on screen | `docs/browser-disposal.md` |
 | A15 | the review surface: Mission Control reads a proposal in full, and one local command disposes of it through the operator channel A4 already built | `docs/review-surface.md` |
@@ -904,6 +928,17 @@ is not written down is one somebody deletes.** Both halves are load-bearing.
 - **The run driver starts nothing in the background** — no scheduler, no polling,
   no timer, no model router, no second submit path.
 
+### A17 — remote deploy
+
+- **A CALLER MAY NEVER APPLY A WORKER'S OUTPUT; A ROOT AGENT MAY APPLY ATLAS' OWN STORED PATCH, UNDER A CONF THE REQUEST NEVER TOUCHES AND A CREDENTIAL THAT NEVER ALSO PROPOSED IT.** A14R refused `job.remote_apply`; this is the narrower capability that refusal made room for, not a bypass of it.
+- **A CAPTURED DEPLOY CREDENTIAL INSTALLS CODE THAT RUNS AS ROOT, WHICH IS A DIFFERENT COST FROM QUEUING A JOB OR DISPOSING OF A RECORD — SO IT GETS ITS OWN WRITTEN ACCEPTANCE, NEVER BORROWED FROM THE OTHER TWO.** `operator_accepts_cleartext_deploy` is a third line, distinct from the submission and disposal acceptances.
+- **`remote_deploy_key` may never name the same credential as `remote_submit_key` or `remote_dispose_key`.** One credential, one power, checked against both other fields regardless of line order.
+- **The bytes applied are Atlas' own stored `changes.patch`, never a request field.** Tree, owner, build, test, install and units live in root-owned `/etc/atlas/deploy.conf`, which the daemon and the gateway never open.
+- **The root process is not Atlas.** `deploy/a17/atlas-deploy-agent.sh` opens no SQLite handle, reads a request file the daemon composed, and never touches the daemon's socket.
+- **The daemon never moves a deploy to a state it did not observe.** `SUCCEEDED`/`FAILED` come only from a `.res` file this daemon itself parsed, actor `DEPLOY_AGENT`, never from a request parameter; a `CONFIRMED` deploy with no result is reported with its age, never timed out or guessed at. `ABANDONED` is the one hand-written escape, closing a stuck deploy exactly as the agent's own result format would.
+- **A CONFIRMED deploy refuses every new root submission for its repository**, checked inside the same `job.submit`/`job.remote_submit` write transaction A11.0 already opens, naming the deploy uid in the refusal.
+- **No new thread, process, timer or background loop beyond the root agent's own systemd path/oneshot pair; no MCP tool for challenge or confirm; `deploys:confirm` is in SCOPES[] with `grantable = false`.** Six `deploy.remote_*` methods, six gateway routes, four MCP tools, one migration.
+
 ### A14 — remote submission
 
 - **THE GATEWAY CANNOT SUBMIT WORK BECAUSE OF WHO IT RUNS AS, AND THE OBVIOUS FIX IS TO STOP THAT BEING TRUE.** The fix is a named credential in the request; the gateway does not gain authority — it carries a credential the daemon verifies.
@@ -912,13 +947,13 @@ is not written down is one somebody deletes.** Both halves are load-bearing.
 - **`remote_dispose_key` and `remote_submit_key` may never name the same id.** One credential, one power.
 - **`jobs:submit` is in SCOPES[] with `grantable = false`**, derived for named keys, refused at `atlas api-key create --scope jobs:submit`.
 - **The two unattended and deferred shapes run as `model_dispatcher_uid`.** On this deployment that is the operator's own account. State what is true.
-- **No new thread, process, timer or background loop beyond the worker; no MCP tool on the stdio adapter; no new decision method; no new authority verb.** Four `job.remote_*` methods, four gateway routes, four MCP tools with `remote_only = true`, one migration. **A14R makes it five of each and adds no migration** — see below.
+- **No new thread, process, timer or background loop beyond the worker; no MCP tool on the stdio adapter; no new decision method; no new authority verb.** Four `job.remote_*` methods, four gateway routes, four MCP tools with `remote_only = true`, one migration. **A14R makes it five of each and adds no migration** — see below. **A17's six `deploy.remote_*` methods, six routes and four tools are a separate vocabulary and do not move this count** — see A17 above.
 
 ### A14R — the result a steward can read
 
 - **A GUARANTEE WHOSE ESCAPE HATCH IS NOT IMPLEMENTED IS NOT A NARROWER CHANNEL.** A14's Decision 7 sent an operator to `atlas job artifact`, which is not a command; and for an executor driver the bytes were destroyed with the workspace anyway. A steward could start work and never read it. **Decision 7 is revised, in `docs/remote-submission.md` as Decision 7R.**
 - **Three names, composed by Atlas, and no parameter that selects a file.** `result.txt`, `changes.patch`, `validations.txt` — constants in `atlas/orch.h`, each written *after* the driver exits so a worker cannot forge one. `job.remote_result` takes only the job, so "a caller may not name an artifact" is a property of the signature.
-- **`job.remote_apply`, `job.remote_artifact`, `job.remote_log` and `job.remote_run` are still forbidden**, still scanned for in `tests/test_orch_rpc.c`. A worker's `logs/stdout.log` is reachable under no name. The method writes no row, starts no process and applies nothing.
+- **`job.remote_apply`, `job.remote_artifact`, `job.remote_log` and `job.remote_run` are still forbidden**, still scanned for in `tests/test_orch_rpc.c`. A worker's `logs/stdout.log` is reachable under no name. The method writes no row, starts no process and applies nothing. **A17 is the stated reversal of this refusal, narrower on four counts** — the applied bytes are Atlas' own stored patch, not a request field; the tree, owner and commands live in a root-owned conf the request never touches; the proposing and confirming credentials must differ; and the root process is an operator-installed agent, never Atlas itself — see `docs/remote-deploy.md`.
 - **The inline budget is the completion's, not the artifact's.** 320 KiB raw against a 1 MiB IPC frame, because hex doubles every byte and a completion that does not fit loses a finished worker's outcome. An artifact over the budget is described, never truncated.
 - **The dispatcher never sent `usage`, and the daemon had always accepted it.** Both halves existed since A10.0 and nothing joined them, so every dispatched job wrote an `orch_usage` row with an empty model and a NULL cost. Fixed at `build_complete`. **An absent measurement is `complete: false` with a reason, never a zero.**
 - **`remote_submit_max_per_day = 0` is unlimited and is the one zero in the submission block that is a decision.** It stays in the all-or-none set, so unlimited can only be written on purpose, never reached by omitting a line. Every other out-of-range value is still MALFORMED.
@@ -1630,9 +1665,10 @@ a command means adding a service function plus a method on both renderers.
 - **A tool** is one entry in `TOOLS[]` in `src/mcp/mcp_tools.c`: a schema function
   and a run function. The schema must set `additionalProperties: false` and
   declare every argument. Note: every schema publishes `additionalProperties: false`
-  but that is only enforced for one tool — `run_job_submit` calls
-  `atlas_jsonv_check_only_keys` (T7, A14); the other tools publish a claim the
-  adapter does not check. `docs/backlog.md` carries the entry. Add the name to the
+  but that is only enforced for five tools — `run_job_submit` (T7, A14) and
+  A17's four `run_deploy_*` forwarders call `atlas_jsonv_check_only_keys`; the
+  other tools publish a claim the adapter does not check. `docs/backlog.md`
+  carries the entry. Add the name to the
   expectation in `tests/test_mcp.c`, which compares `atlas_mcp_tool_names()`
   against what the process reports.
 - **A hook event** goes in `HOOK_EVENTS[]` in `src/hook/hook.c`, in `handle()`,

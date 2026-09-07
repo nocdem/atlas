@@ -1657,6 +1657,74 @@ only at the moment it shipped. Tier 3 remains absent, not refused, and is
 costed rather than built so a later season can choose it with the bill already
 in view.
 
+## A17 — remote deploy (shipped)
+
+A14R gave a remote session three artifacts to read once a job finished —
+`result.txt`, `changes.patch` and `validations.txt` — and stopped there:
+nothing let the session that read `changes.patch` make it real. A17 is the
+narrow reversal of A14R's own refusal to let a caller apply a worker's
+output.
+
+> **A CALLER MAY NEVER APPLY A WORKER'S OUTPUT; A ROOT AGENT MAY APPLY
+> ATLAS' OWN STORED PATCH, UNDER A CONF THE REQUEST NEVER TOUCHES AND A
+> CREDENTIAL THAT NEVER ALSO PROPOSED IT.**
+
+**The job.** A second, distinct credential — never the one that proposed the
+job — confirms, from a browser, with a typed digest prefix (A16's pattern,
+carried over), that a SUCCEEDED patch-mode job's stored patch should be
+applied. A root-owned agent, triggered by a systemd path unit watching a
+spool directory and reachable from no socket, reads a request file the
+daemon composed, applies the patch, builds, tests, installs and restarts —
+entirely outside Atlas' own process.
+
+**Four narrowing arguments make this a reversal rather than a bypass of
+A14R's refusal.** The applied bytes are Atlas' own stored `changes.patch`,
+never a request field, and its digest is pinned at proposal time. The tree,
+owner, build, test and install commands live in root-owned
+`/etc/atlas/deploy.conf`, which neither the daemon nor the gateway ever
+opens. The proposing and confirming credentials must differ —
+`remote_deploy_key` may never name the same id as `remote_submit_key` or
+`remote_dispose_key`. And the process that runs as root is not Atlas: it is
+an operator-installed script that opens no database handle and never reaches
+the daemon's socket. `job.remote_apply`, `job.remote_artifact`,
+`job.remote_log` and `job.remote_run` stay forbidden; `deploy.remote_apply`,
+`deploy.remote_install`, `deploy.remote_restart` and `deploy.remote_run`
+join them in the same scan.
+
+**The honest cost.** A captured deploy credential installs code that runs as
+root on this machine, unbounded by anything Atlas checks, over cleartext LAN
+unless something terminates TLS in front of the gateway — a materially
+larger cost than either of the two existing remote capabilities, so it earns
+its own written acceptance, `operator_accepts_cleartext_deploy = yes`, never
+implied by `operator_accepts_cleartext_submission` or
+`operator_accepts_cleartext_disposal`.
+
+**The state machine never claims more than the daemon observed.**
+`PROPOSED → CONFIRMED → SUCCEEDED | FAILED`, or `PROPOSED → CANCELLED`. A
+`CONFIRMED` deploy with no result file is reported with its age, never timed
+out or guessed at; `SUCCEEDED`/`FAILED` come only from a `.res` file the
+daemon itself parsed. The one hand-written escape, `ABANDONED`, closes a
+deploy the agent will never finish — an operator writes a result file by
+hand, exactly in the shape the agent's own format requires, and the daemon's
+next ingest pass treats it exactly as it would the agent's own file. While a
+deploy is `CONFIRMED`, both `job.submit` and `job.remote_submit` refuse a new
+root job for that repository, naming the deploy uid, inside the same submit
+transaction A11.0 already opens — a root job accepted in the window before
+the agent's restart would otherwise die mid-task for a reason its own record
+would not explain.
+
+**A structural cost, stated rather than solved.** The agent applies the
+patch and does not commit. A tree that has taken one deploy carries
+uncommitted changes `HEAD` does not know about, so the next worker's
+snapshot — still taken at that unmoved `HEAD` — can produce a patch that
+duplicates or conflicts with the first. `git apply --check` decides which,
+honestly, before anything is touched; who commits after a deploy is left
+open.
+
+**A17 added migration 33** (`deploys`, `deploy_transitions`). Full argument,
+the queue-file formats, the agent's stage-by-stage contract and the four open
+operator decisions: `docs/remote-deploy.md`.
+
 ## Invariants that outlive every phase
 
 1. SQLite is a rebuildable index, never the canonical record of history.

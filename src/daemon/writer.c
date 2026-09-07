@@ -18,6 +18,7 @@
 #include <unistd.h>
 
 #include "atlas/atlas.h"
+#include "atlas/deploy_spool.h"
 #include "atlas/git.h"
 #include "atlas/reconcile.h"
 #include "atlas/safetext.h"
@@ -250,6 +251,42 @@ void atlas_memory_put_result_free(atlas_memory_put_result *r) {
     atlas_buf_free(&r->content_sha256);
 }
 
+void atlas_deploy_op_init(atlas_deploy_op *op) {
+    if (op == NULL) {
+        return;
+    }
+    memset(op, 0, sizeof(*op));
+    atlas_buf_init(&op->job_uid);
+    atlas_buf_init(&op->deploy_uid);
+    atlas_buf_init(&op->key_id);
+    atlas_buf_init(&op->confirmation);
+}
+
+void atlas_deploy_op_free(atlas_deploy_op *op) {
+    if (op == NULL) {
+        return;
+    }
+    atlas_buf_free(&op->job_uid);
+    atlas_buf_free(&op->deploy_uid);
+    atlas_buf_free(&op->key_id);
+    atlas_buf_free(&op->confirmation);
+}
+
+void atlas_deploy_op_result_init(atlas_deploy_op_result *r) {
+    if (r == NULL) {
+        return;
+    }
+    memset(r, 0, sizeof(*r));
+    atlas_buf_init(&r->deploy_uid);
+}
+
+void atlas_deploy_op_result_free(atlas_deploy_op_result *r) {
+    if (r == NULL) {
+        return;
+    }
+    atlas_buf_free(&r->deploy_uid);
+}
+
 /* Copies the identifying fields of a repository into a job result. */
 static atlas_status job_set_result(atlas_job *j, const atlas_repo_info *ri, atlas_err *err) {
     j->result_id = ri->id;
@@ -407,6 +444,18 @@ bool job_kind_is_unbounded(atlas_job_kind kind) {
      * caller its answer; `true` costs the write itself. */
     case ATLAS_JOB_MEMORY_RECONCILE:
         return false;
+    /* A17 T2. One row's worth of statements, plus -- for CONFIRM --
+     * one small patch file and one request file, each bounded by what T1's
+     * `propose_in_tx` already accepted as a stored artifact. Not "a duration
+     * Atlas can state" the way a compiler pass or a tree walk is. */
+    case ATLAS_JOB_DEPLOY:
+    /* A bounded loop over `atlas_db_deploy_confirmed_unspooled`'s own small
+     * set -- at most one CONFIRMED deploy per registered repository. */
+    case ATLAS_JOB_DEPLOY_SPOOL:
+    /* A bounded directory scan and, per file, a bounded (≤ 32 KiB body)
+     * parse and one small transaction. */
+    case ATLAS_JOB_DEPLOY_INGEST:
+        return false;
     }
     return false;
 }
@@ -531,6 +580,22 @@ bool job_kind_is_drainable(atlas_job_kind kind) {
      * reaches the thread. */
     case ATLAS_JOB_MEMORY_RECONCILE:
         return false;
+    /* A17 T2. `deploys` and `deploy_transitions`: disjoint from
+     * everything a semantic pass or a discovery walk touches, and a
+     * `deploy.remote_propose`/`_confirm`/`_cancel` caller is blocked on it --
+     * the same two conditions ATLAS_JOB_VERIFY above satisfies. The file I/O
+     * a CONFIRM does (the queue files) is bounded and lives entirely under
+     * `<data-dir>/deploy/`, never the target repository's own tree and never
+     * a git process, so it is disjoint in the same sense the table is. */
+    case ATLAS_JOB_DEPLOY:
+    /* The startup-and-nothing-else re-spool sweep. Same table, same
+     * argument, no caller waiting -- `ATLAS_JOB_GW_AUDIT`'s own "fire-and-
+     * forget is not the same question as drainable" precedent. */
+    case ATLAS_JOB_DEPLOY_SPOOL:
+    /* Reads and unlinks files under `<data-dir>/deploy/results/`, bounded to
+     * 32 KiB per body, never the repository tree and never git. */
+    case ATLAS_JOB_DEPLOY_INGEST:
+        return true;
     }
     return false;
 }
@@ -902,6 +967,131 @@ static void run_memory(atlas_writer *w, atlas_job *j) {
     }
     atlas_buf_free(&new_uid);
     j->result = st;
+}
+
+/* A17 T2. `deploy.remote_propose`/`_confirm`/`_cancel`'s one write.
+ *
+ * `j->deploy_op`/`j->deploy_op_result` are borrowed, `ATLAS_JOB_APIKEY`'s own
+ * shape: NULL means the caller gave up before this ran, and this is then a
+ * no-op.
+ *
+ * The credential in `op->key_id` was already verified before this job was
+ * queued -- T1's `atlas_db_deploy_*_in_tx` functions take a resolved key id,
+ * never a bearer token -- so every check this function's transaction makes is
+ * exactly the set T1's own header documents (state, prefix, non-terminal
+ * jobs for CONFIRM; the proposing credential for CANCEL) plus, for CONFIRM,
+ * one more this file itself already settled before queueing: the operator's
+ * mint-then-spend challenge (server_deploy_remote.c). Both being checked on
+ * one thread that processes one request at a time is what makes "checked
+ * atomically" true without a second lock: see that file's own comment on the
+ * assumption. */
+static void run_deploy(atlas_writer *w, atlas_job *j) {
+    if (j->deploy_op == NULL || j->deploy_op_result == NULL) {
+        return;
+    }
+    const atlas_deploy_op *op = j->deploy_op;
+    atlas_deploy_op_result *out = j->deploy_op_result;
+
+    atlas_status st = atlas_db_begin(w->db, &j->result_err);
+    if (st != ATLAS_OK) {
+        j->result = st;
+        return;
+    }
+
+    switch (op->kind) {
+    case ATLAS_DEPLOY_OP_PROPOSE: {
+        atlas_buf uid = ATLAS_BUF_INIT;
+        st = atlas_db_deploy_propose_in_tx(w->db, atlas_buf_cstr(&op->job_uid),
+                                           atlas_buf_cstr(&op->key_id), &uid, &j->result_err);
+        if (st == ATLAS_OK) {
+            st = atlas_buf_set(&out->deploy_uid, uid.data, uid.len, &j->result_err);
+        }
+        atlas_buf_free(&uid);
+        break;
+    }
+    case ATLAS_DEPLOY_OP_CONFIRM:
+        st = atlas_db_deploy_confirm_in_tx(w->db, atlas_buf_cstr(&op->deploy_uid),
+                                           atlas_buf_cstr(&op->key_id),
+                                           atlas_buf_cstr(&op->confirmation), &j->result_err);
+        if (st == ATLAS_OK) {
+            st = atlas_buf_set(&out->deploy_uid, op->deploy_uid.data, op->deploy_uid.len,
+                               &j->result_err);
+        }
+        break;
+    case ATLAS_DEPLOY_OP_CANCEL:
+        st = atlas_db_deploy_cancel_in_tx(w->db, atlas_buf_cstr(&op->deploy_uid),
+                                          atlas_buf_cstr(&op->key_id), &j->result_err);
+        if (st == ATLAS_OK) {
+            st = atlas_buf_set(&out->deploy_uid, op->deploy_uid.data, op->deploy_uid.len,
+                               &j->result_err);
+        }
+        break;
+    }
+
+    if (st == ATLAS_OK) {
+        atlas_status cst = atlas_db_commit(w->db, &j->result_err);
+        if (cst != ATLAS_OK) {
+            atlas_db_rollback(w->db);
+            st = cst;
+        }
+    } else {
+        atlas_db_rollback(w->db);
+    }
+    j->result = st;
+    if (st != ATLAS_OK) {
+        return;
+    }
+
+    /* CONFIRM only, and only after the transaction above committed: D.1's
+     * "the queue file is written after the confirm transaction commits,
+     * inside the same writer job" contract. A1 forbids file I/O inside a
+     * write transaction; this runs with none open, and
+     * `atlas_deploy_spool_write_one` opens its own small transaction around
+     * `mark_spooled_in_tx` alone. Never turns into a failure the caller
+     * sees: a spool failure leaves `out->spooled` false and the row
+     * CONFIRMED with `spooled_at` empty, exactly as D.1 describes -- the
+     * daemon-startup sweep and every later confirm attempt on other deploys
+     * are what retry it, via `atlas_deploy_spool_sweep`. */
+    if (op->kind == ATLAS_DEPLOY_OP_CONFIRM) {
+        bool spooled = false;
+        atlas_err serr;
+        atlas_err_init(&serr);
+        (void)atlas_deploy_spool_write_one(w->db, atlas_buf_cstr(&w->data_dir),
+                                           atlas_buf_cstr(&op->deploy_uid), w->log, &spooled,
+                                           &serr);
+        out->spooled = spooled;
+    }
+}
+
+/* A17 T2. Fire-and-forget: re-attempts the queue-file write for
+ * every CONFIRMED-but-unspooled deploy. Submitted once at daemon startup. */
+static void run_deploy_spool(atlas_writer *w, atlas_job *j) {
+    (void)j;
+    atlas_err err;
+    atlas_err_init(&err);
+    if (atlas_deploy_spool_sweep(w->db, atlas_buf_cstr(&w->data_dir), w->log, &err) != ATLAS_OK) {
+        atlas_safe_pool safe;
+        atlas_safe_pool_init(&safe);
+        atlas_daemon_log(w->log, "warn", "deploy re-spool sweep failed: %s",
+                         atlas_safe(&safe, atlas_err_msg(&err)));
+        atlas_safe_pool_free(&safe);
+    }
+}
+
+/* A17 T2. Fire-and-forget: ingests every `*.res` file in the `results` directory
+ * currently on disk. Submitted by the watcher tick's pure derivation and
+ * once at daemon startup. */
+static void run_deploy_ingest(atlas_writer *w, atlas_job *j) {
+    (void)j;
+    atlas_err err;
+    atlas_err_init(&err);
+    if (atlas_deploy_ingest_pass(w->db, atlas_buf_cstr(&w->data_dir), w->log, &err) != ATLAS_OK) {
+        atlas_safe_pool safe;
+        atlas_safe_pool_init(&safe);
+        atlas_daemon_log(w->log, "warn", "deploy result ingest failed: %s",
+                         atlas_safe(&safe, atlas_err_msg(&err)));
+        atlas_safe_pool_free(&safe);
+    }
 }
 
 /* A12.1. The memory reconciliation pass, submitted by `memory_sweep`
@@ -1902,6 +2092,9 @@ static void writer_run_job(atlas_writer *w, atlas_job *j) {
      * not exist yet, so the classification switches above and this one could
      * not drift apart about which kinds exist. */
     case ATLAS_JOB_MEMORY: run_memory(w, j); break;
+    case ATLAS_JOB_DEPLOY: run_deploy(w, j); break;
+    case ATLAS_JOB_DEPLOY_SPOOL: run_deploy_spool(w, j); break;
+    case ATLAS_JOB_DEPLOY_INGEST: run_deploy_ingest(w, j); break;
     default: break;
     }
 
@@ -3631,6 +3824,128 @@ atlas_status atlas_writer_apikey(atlas_writer *w, const atlas_apikey_job *op,
         *err = jerr;
     }
     return st;
+}
+
+/* A17 T2. One `deploy.remote_propose`/`_confirm`/`_cancel` write, on
+ * the writer thread, with the caller waiting -- `atlas_writer_apikey`'s own
+ * shape and its own 60 s deadline: a bound generous enough that reaching it
+ * means something has gone wrong, not that the write is merely slow. */
+atlas_status atlas_writer_deploy(atlas_writer *w, const atlas_deploy_op *op,
+                                 atlas_deploy_op_result *out, atlas_err *err) {
+    atlas_job *j = job_new(ATLAS_JOB_DEPLOY);
+    if (j == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory queueing a deploy write");
+    }
+    j->deploy_op = op;
+    j->deploy_op_result = out;
+    j->wants_result = true;
+
+    (void)pthread_mutex_lock(&w->lock);
+    if (w->stopping || !queue_push(w, j)) {
+        bool stopping = w->stopping;
+        (void)pthread_mutex_unlock(&w->lock);
+        job_free(j);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                             stopping ? "the Atlas daemon is shutting down"
+                                      : "the Atlas daemon's write queue is full");
+    }
+    (void)pthread_cond_signal(&w->not_empty);
+
+    struct timespec deadline;
+    (void)clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += 60;
+    bool backed_out = writer_wait_locked(w, j, &deadline);
+    bool done = j->done;
+    atlas_status st = j->result;
+    atlas_err jerr = j->result_err;
+    if (!done) {
+        j->wants_result = false;
+        j->deploy_op = NULL;
+        j->deploy_op_result = NULL;
+    }
+    (void)pthread_mutex_unlock(&w->lock);
+
+    if (backed_out) {
+        job_free(j);
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "%s", WRITER_BUSY_MSG);
+    }
+    if (!done) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                             "the Atlas daemon did not complete the deploy write within 60 s");
+    }
+    if (st != ATLAS_OK) {
+        *err = jerr;
+    }
+    return st;
+}
+
+/* A17 T2. Fire-and-forget, `atlas_writer_submit_sem_discover`'s own
+ * shape: nobody polls for it, and `deploy.remote_get`'s `spooled_at` field is
+ * the confirmation channel. Coalesced against the queue: a sweep already
+ * waiting to run covers whatever a second call would find. */
+atlas_status atlas_writer_submit_deploy_spool_sweep(atlas_writer *w, atlas_err *err) {
+    atlas_job *j = job_new(ATLAS_JOB_DEPLOY_SPOOL);
+    if (j == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory queueing a deploy re-spool");
+    }
+    (void)pthread_mutex_lock(&w->lock);
+    bool duplicate = false;
+    for (size_t k = 0; !duplicate && k < w->count; k++) {
+        if (w->queue[(w->head + k) % ATLAS_WRITER_QUEUE_MAX]->kind == ATLAS_JOB_DEPLOY_SPOOL) {
+            duplicate = true;
+        }
+    }
+    bool stopping = w->stopping;
+    bool queued = duplicate || (!stopping && queue_push(w, j));
+    if (queued && !duplicate) {
+        (void)pthread_cond_signal(&w->not_empty);
+    }
+    (void)pthread_mutex_unlock(&w->lock);
+    if (duplicate || !queued) {
+        job_free(j);
+    }
+    if (!queued) {
+        /* Distinguishes the two refusals exactly as `atlas_writer_deploy`
+         * above does: "shutting down" and "queue is full" are different
+         * facts about the daemon and call for different reactions from a
+         * caller (or a log reader) that sees one. */
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                             stopping ? "the Atlas daemon is shutting down"
+                                      : "the Atlas daemon's write queue is full");
+    }
+    return ATLAS_OK;
+}
+
+/* A17 T2. Fire-and-forget, same shape and same coalescing as the
+ * re-spool sweep above. */
+atlas_status atlas_writer_submit_deploy_ingest(atlas_writer *w, atlas_err *err) {
+    atlas_job *j = job_new(ATLAS_JOB_DEPLOY_INGEST);
+    if (j == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory queueing a deploy ingest");
+    }
+    (void)pthread_mutex_lock(&w->lock);
+    bool duplicate = false;
+    for (size_t k = 0; !duplicate && k < w->count; k++) {
+        if (w->queue[(w->head + k) % ATLAS_WRITER_QUEUE_MAX]->kind == ATLAS_JOB_DEPLOY_INGEST) {
+            duplicate = true;
+        }
+    }
+    bool stopping = w->stopping;
+    bool queued = duplicate || (!stopping && queue_push(w, j));
+    if (queued && !duplicate) {
+        (void)pthread_cond_signal(&w->not_empty);
+    }
+    (void)pthread_mutex_unlock(&w->lock);
+    if (duplicate || !queued) {
+        job_free(j);
+    }
+    if (!queued) {
+        /* See `atlas_writer_submit_deploy_spool_sweep` just above. */
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                             stopping ? "the Atlas daemon is shutting down"
+                                      : "the Atlas daemon's write queue is full");
+    }
+    return ATLAS_OK;
 }
 
 /* A12.1 T11. See this function's own declaration in daemon_internal.h for why

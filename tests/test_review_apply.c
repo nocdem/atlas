@@ -541,14 +541,14 @@ static void test_sheet_path_symlink_refused(void) {
  * where the authority half can be true. A throwaway fixture is the same
  * device every other test in this file already uses to keep every command
  * local; here it only ever needs to exist, never to hold a repository. */
-static bool installed_atlas_knows_review(void) {
+/* Runs the installed binary once, non-interactively, against `data_dir`, and
+ * hands back its stderr. `PATH` only, the same constructed environment every
+ * probe in this file uses. */
+static atlas_status installed_atlas_stderr(const char *data_dir, const char *subcommand,
+                                           const char *arg, atlas_buf *errout, int *code) {
     atlas_err err;
     atlas_err_init(&err);
-    fixture probe_fx;
-    if (fx_open(&probe_fx, &err) != ATLAS_OK) {
-        return false;
-    }
-    const char *argv[] = {INSTALLED_ATLAS, "--data-dir", fx_data_dir(&probe_fx), "review", NULL};
+    const char *argv[] = {INSTALLED_ATLAS, "--data-dir", data_dir, subcommand, arg, NULL};
     const char *envp[] = {"PATH=/usr/bin:/bin", NULL};
     atlas_proc_opts opts;
     memset(&opts, 0, sizeof(opts));
@@ -556,27 +556,92 @@ static bool installed_atlas_knows_review(void) {
     opts.env = envp;
     atlas_proc_result res;
     memset(&res, 0, sizeof(res));
+    atlas_buf out = ATLAS_BUF_INIT;
+    atlas_status st = atlas_proc_run(&opts, atlas_proc_sink_buf, &out, errout, &res, &err);
+    *code = res.exit_code;
+    atlas_buf_free(&out);
+    return st;
+}
+
+/* What the installed binary is, relative to the tree that built this test.
+ * `review` alone answers the first question and never opens the index, so
+ * it cannot answer the second: the PTY cases below hand the installed binary
+ * a data directory the *built* binary created, and an installed binary that
+ * predates a migration in this tree refuses that directory outright
+ * ("database schema is at version N but this Atlas understands at most M").
+ * That is the ordinary state of every migration-carrying change between its
+ * build and its deployment, measured 2026-09-08 when migration 33 was in the
+ * tree and the deployed binary understood 32 -- not a fact about this
+ * machine's consistency. So the probe creates its index with the built
+ * binary first, exactly as `env_open` does, and asks the installed one to
+ * read it. */
+typedef enum installed_probe {
+    PROBE_CURRENT,       /* knows `review` and reads an index this tree wrote */
+    PROBE_SCHEMA_BEHIND, /* refused the index: it predates a migration in this tree */
+    PROBE_UNKNOWN,       /* neither: a stale deploy or a broken probe */
+} installed_probe;
+
+static installed_probe installed_atlas_probe(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    fixture probe_fx;
+    if (fx_open(&probe_fx, &err) != ATLAS_OK) {
+        return PROBE_UNKNOWN;
+    }
+    installed_probe verdict = PROBE_UNKNOWN;
     atlas_buf out = ATLAS_BUF_INIT, errout = ATLAS_BUF_INIT;
-    atlas_status st = atlas_proc_run(&opts, atlas_proc_sink_buf, &out, &errout, &res, &err);
-    bool ok = st == ATLAS_OK && strstr(atlas_buf_cstr(&errout), "usage: atlas review apply") != NULL;
+    int code = 0;
+    bool seeded = fx_init_repo(&probe_fx, fx_repo(&probe_fx), NULL, &err) == ATLAS_OK &&
+                  fx_write(fx_repo(&probe_fx), "main.c", "int main(void){return 0;}\n", &err) ==
+                      ATLAS_OK &&
+                  fx_add_all(&probe_fx, fx_repo(&probe_fx), &err) == ATLAS_OK &&
+                  fx_commit(&probe_fx, fx_repo(&probe_fx), "init", &err) == ATLAS_OK;
+    if (seeded) {
+        const char *add[] = {"repo",   "add",       fx_repo(&probe_fx),    "--name",
+                             "probe",  "--data-dir", fx_data_dir(&probe_fx)};
+        seeded = fx_atlas(add, sizeof add / sizeof add[0], &out, &errout, &code, &err) ==
+                     ATLAS_OK &&
+                 code == 0;
+    }
+    if (seeded) {
+        atlas_buf_free(&errout); /* reset to reusable, len 0 */
+        /* The index question first: `repo list` opens the database; a bare
+         * `review` never does. */
+        if (installed_atlas_stderr(fx_data_dir(&probe_fx), "repo", "list", &errout, &code) ==
+                ATLAS_OK &&
+            strstr(atlas_buf_cstr(&errout), "understands at most") != NULL) {
+            verdict = PROBE_SCHEMA_BEHIND;
+        } else {
+            atlas_buf_free(&errout);
+            if (installed_atlas_stderr(fx_data_dir(&probe_fx), "review", NULL, &errout, &code) ==
+                    ATLAS_OK &&
+                strstr(atlas_buf_cstr(&errout), "usage: atlas review apply") != NULL) {
+                verdict = PROBE_CURRENT;
+            }
+        }
+    }
     atlas_buf_free(&out);
     atlas_buf_free(&errout);
     fx_close(&probe_fx);
-    return ok;
+    return verdict;
 }
 
-/* The two ways this machine's readiness can resolve, plus the state this
- * suite is actually live in. `UNLOCK_NOT_GRANTED` is an environment limit --
- * no test can manufacture a root-owned policy, so it is worth nothing more
- * than a note. `UNLOCK_STALE_BINARY` is not: authority answered GRANTED, so
- * a root-owned, current-uid-matching deployment exists, and the *installed
- * binary itself* not knowing `review` is either a stale deploy or a broken
- * probe -- a fact about this machine's own consistency, not a limitation of
- * what an unprivileged test can prove. Conflating the two is exactly how a
- * whole fix round was reported "live" when nothing had run. */
+/* The ways this machine's readiness can resolve, plus the state this suite
+ * is actually live in. `UNLOCK_NOT_GRANTED` is an environment limit -- no
+ * test can manufacture a root-owned policy, so it is worth nothing more than
+ * a note. `UNLOCK_SCHEMA_BEHIND` is the same kind of limit for the opposite
+ * reason: the deployed binary is older than the tree by exactly the
+ * migration this tree carries, which is what every migration looks like
+ * until it is deployed, and no test can deploy. `UNLOCK_STALE_BINARY` is
+ * neither: authority answered GRANTED, the index is readable, and the
+ * *installed binary itself* still does not know `review` -- a stale deploy
+ * or a broken probe, a fact about this machine's own consistency, not a
+ * limitation of what an unprivileged test can prove. Conflating these is
+ * exactly how a whole fix round was reported "live" when nothing had run. */
 typedef enum unlock_state {
     UNLOCK_LIVE,
     UNLOCK_NOT_GRANTED,
+    UNLOCK_SCHEMA_BEHIND,
     UNLOCK_STALE_BINARY,
 } unlock_state;
 
@@ -597,14 +662,22 @@ static unlock_state unlocked_suite_state(atlas_buf *why) {
                                 atlas_authority_reason_name(a.reason));
         return UNLOCK_NOT_GRANTED;
     }
-    if (!installed_atlas_knows_review()) {
+    switch (installed_atlas_probe()) {
+    case PROBE_CURRENT: return UNLOCK_LIVE;
+    case PROBE_SCHEMA_BEHIND:
         (void)atlas_buf_appendf(why, &err,
-                                "%s is granted for uid %lld but does not recognise `review` -- a "
-                                "stale deploy or a broken probe, not an environment limit",
-                                INSTALLED_ATLAS, (long long)getuid());
-        return UNLOCK_STALE_BINARY;
+                                "%s predates a migration in this tree (schema %d): it refuses an "
+                                "index the built binary wrote; deploy the tree, then this suite "
+                                "runs the operator channel for real",
+                                INSTALLED_ATLAS, (int)ATLAS_SCHEMA_VERSION);
+        return UNLOCK_SCHEMA_BEHIND;
+    case PROBE_UNKNOWN: break;
     }
-    return UNLOCK_LIVE;
+    (void)atlas_buf_appendf(why, &err,
+                            "%s is granted for uid %lld but does not recognise `review` -- a "
+                            "stale deploy or a broken probe, not an environment limit",
+                            INSTALLED_ATLAS, (long long)getuid());
+    return UNLOCK_STALE_BINARY;
 }
 
 static bool unlocked_suite_is_live(atlas_buf *why) {
@@ -633,16 +706,17 @@ static bool unlocked_suite_is_live(atlas_buf *why) {
 /* A test in its own right, not only a guard: it names the exact condition of
  * this machine so a report can point at one line that flips from "skipped"
  * to "ok" the moment somebody deploys current code, without needing to
- * re-derive the reason. Note-and-pass only for `UNLOCK_NOT_GRANTED`, which no
- * test can do anything about; `UNLOCK_STALE_BINARY` is a genuine failure --
- * see `unlocked_suite_state`'s own comment for why the two are not the same
- * kind of "not live". */
+ * re-derive the reason. Note-and-pass for `UNLOCK_NOT_GRANTED` and
+ * `UNLOCK_SCHEMA_BEHIND`, which no test can do anything about;
+ * `UNLOCK_STALE_BINARY` is a genuine failure -- see `unlocked_suite_state`'s
+ * own comment for why the three are not the same kind of "not live". */
 static void test_the_machine_state_this_suite_depends_on(void) {
     atlas_buf why = ATLAS_BUF_INIT;
     unlock_state st = unlocked_suite_state(&why);
     switch (st) {
     case UNLOCK_LIVE: break;
     case UNLOCK_NOT_GRANTED: atlas_test_note("skipped: %s", atlas_buf_cstr(&why)); break;
+    case UNLOCK_SCHEMA_BEHIND: atlas_test_note("skipped: %s", atlas_buf_cstr(&why)); break;
     case UNLOCK_STALE_BINARY: T_CHECK_MSG(false, "%s", atlas_buf_cstr(&why)); break;
     }
     atlas_buf_free(&why);

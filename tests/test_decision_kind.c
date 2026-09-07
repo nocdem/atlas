@@ -404,6 +404,12 @@ static void wind_back_to_schema_12(env *e, atlas_err *err) {
         "DROP INDEX idx_orch_jobs_submit_key;"
         "ALTER TABLE orch_jobs DROP COLUMN submit_key_id;"
         "ALTER TABLE orch_transitions DROP COLUMN key_id;"
+        /* A17 T1's two tables, children before parents: a rewind
+         * that leaves a later migration's table behind is not a database at
+         * the version it claims, and migration 33 would then fail to create
+         * it. */
+        "DROP TABLE deploy_transitions;"
+        "DROP TABLE deploys;"
         "DELETE FROM schema_migrations WHERE version >= 13;";
 
     T_OK(atlas_db_exec_sql(e->db, BACK_DOCUMENTS, err), err);

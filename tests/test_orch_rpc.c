@@ -105,6 +105,13 @@ static const char *const FORBIDDEN_METHODS[] = {
      * concept the gateway may not touch. See `server_orch_remote.c`'s head
      * comment for the argument. */
     "job.remote_apply", "job.remote_artifact", "job.remote_log", "job.remote_run",
+    /* A17 T2. Four more names that must never exist, A14's own
+     * argument extended to the deploy namespace: nothing here starts a
+     * process, applies a patch or restarts anything -- those verbs belong to
+     * the root agent, which reads a queue file this daemon composed and
+     * never touches this socket. See `server_deploy_remote.c`'s head comment. */
+    "deploy.remote_apply", "deploy.remote_install", "deploy.remote_restart",
+    "deploy.remote_run",
 };
 
 /* Dispatcher methods, asked from an ordinary client connection. */

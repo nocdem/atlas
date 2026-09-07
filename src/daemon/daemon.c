@@ -31,6 +31,7 @@
 
 #include "atlas/atlas.h"
 #include "atlas/datadir.h"
+#include "atlas/deploy_spool.h"
 #include "atlas/ipc.h"
 #include "atlas/lock.h"
 #include "atlas/safetext.h"
@@ -204,6 +205,36 @@ atlas_status atlas_daemon_run(const atlas_daemon_opts *opts, FILE *log, atlas_er
     }
     if (st != ATLAS_OK) {
         goto done;
+    }
+
+    /* A17 T2. Unconditional -- not gated on `serving_system_index`
+     * or on a gateway policy naming a deploy key -- because a CONFIRMED
+     * deploy row (or an unspooled or un-ingested one) can outlive the policy
+     * that produced it, and a fixture daemon in the test tree needs these
+     * same directories to exist for exactly the reason the runtime
+     * directory above does. Directory creation is synchronous, before any
+     * client can be served; the two sweeps are fire-and-forget writer jobs,
+     * queued once here and left to run whenever the writer reaches them. */
+    {
+        atlas_err derr;
+        atlas_err_init(&derr);
+        if (atlas_deploy_spool_ensure_dirs(atlas_buf_cstr(&data_dir), &derr) != ATLAS_OK) {
+            atlas_daemon_log(log, "warn", "deploy spool directories not ready: %s",
+                             atlas_safe(&safe, atlas_err_msg(&derr)));
+        } else {
+            atlas_err serr;
+            atlas_err_init(&serr);
+            if (atlas_writer_submit_deploy_spool_sweep(writer, &serr) != ATLAS_OK) {
+                atlas_daemon_log(log, "warn", "deploy re-spool sweep not queued at startup: %s",
+                                 atlas_safe(&safe, atlas_err_msg(&serr)));
+            }
+            atlas_err ierr;
+            atlas_err_init(&ierr);
+            if (atlas_writer_submit_deploy_ingest(writer, &ierr) != ATLAS_OK) {
+                atlas_daemon_log(log, "warn", "deploy result ingest not queued at startup: %s",
+                                 atlas_safe(&safe, atlas_err_msg(&ierr)));
+            }
+        }
     }
 
     /* Loaded before the watcher starts, because the watcher's timer is what

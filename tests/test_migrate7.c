@@ -235,6 +235,12 @@ static void build_schema6(const char *path, atlas_err *err) {
              "DROP TABLE memory_claim_anchors;"
              "DROP TABLE memory_context_packs;"
              "DROP TABLE memory_trailer_bindings;"
+             /* A17 T1's two tables, children before parents: a
+              * rewind that leaves a later migration's table behind is not a
+              * database at the version it claims, and migration 33 would then
+              * fail to create it. */
+             "DROP TABLE deploy_transitions;"
+             "DROP TABLE deploys;"
              "DELETE FROM schema_migrations WHERE version >= 7;",
              err),
          err);
@@ -281,11 +287,12 @@ static void test_a_populated_schema_six_database_reaches_seven_losslessly(void) 
      * table without renumbering a row — is asserted below and is unaffected by
      * later migrations running on top of it. */
     T_EQ_INT(atlas_db_schema_version(db, &err), ATLAS_SCHEMA_VERSION);
-    /* Migration 32 (A14's T2) landed after this suite was written; migration
-     * 31 rebuilt `decision_challenges`, and migration 32 appended columns to
-     * `orch_jobs`/`orch_transitions`; the explicit column list below is what
-     * keeps this comparison about seven's columns only. */
-    T_EQ_INT(ATLAS_SCHEMA_VERSION, 32);
+    /* Migrations 32 (A14's T2) and 33 (A17 T1) landed after this
+     * suite was written; migration 31 rebuilt `decision_challenges`, migration
+     * 32 appended columns to `orch_jobs`/`orch_transitions`, and migration 33
+     * added two new tables; the explicit column list below is what keeps this
+     * comparison about seven's columns only. */
+    T_EQ_INT(ATLAS_SCHEMA_VERSION, 33);
 
     atlas_buf after = ATLAS_BUF_INIT;
     text_of(db,

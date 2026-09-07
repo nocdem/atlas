@@ -295,6 +295,26 @@ static const retention_entry RETENTION[] = {
      "the plan's status is derived by joining these rows to the jobs their correlations name, so a "
      "pruned task is not a shorter history, it is a plan that reads as though it had fewer stages"},
 
+    /* --- A17 T1: a deploy a credential proposed ---------------------
+     *
+     * Both CANONICAL for the reason every A8 orchestration table above is:
+     * nothing rebuilds a deploy record from the repository. `deploys` is the
+     * only account of which credential proposed a job's patch be installed,
+     * which one confirmed it, and what the root agent reported back;
+     * `deploy_transitions` is its append-only ledger, on `orch_transitions`'
+     * own precedent. Neither is prunable: a pruned deploy would leave a
+     * `changes.patch` artifact with no record of whether it was ever
+     * installed, confirmed, or by whom. */
+    {"deploys", ATLAS_RETAIN_CANONICAL, false,
+     "the only record of which credential proposed a job's patch be deployed, which credential "
+     "confirmed it, the digest and size of what was proposed, and the root agent's own reported "
+     "outcome; nothing rebuilds it, and pruning by age would leave a changes.patch artifact with "
+     "no record of whether it was ever installed"},
+    {"deploy_transitions", ATLAS_RETAIN_CANONICAL, false,
+     "the append-only state ledger for a deploy, on orch_transitions' own precedent; its "
+     "AUTOINCREMENT id is the ordering authority and must never be reissued, so nothing may delete "
+     "from it"},
+
     /* --- A8-CI: the compiler-derived semantic index --------------------------
      *
      * Every one of these is DERIVED, and that classification is the whole

@@ -41,8 +41,9 @@ static void test_migration_27_adds_scanner_uid_defaulting_to_unset(void) {
     atlas_err_init(&err);
     T_OK(fx_open(&fx, &err), &err);
 
-    /* Migration 31 (A16's T2) landed after this suite was written. */
-    T_EQ_INT((int)ATLAS_SCHEMA_VERSION, 32);
+    /* Migrations 31 (A16's T2), 32 (A14's T2) and 33 (A17 T1) landed
+     * after this suite was written. */
+    T_EQ_INT((int)ATLAS_SCHEMA_VERSION, 33);
 
     atlas_db *db = NULL;
     T_OK(open_migrated(&fx, &db, &err), &err);

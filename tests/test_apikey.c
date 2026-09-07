@@ -348,6 +348,8 @@ static void test_creation_refuses_what_it_cannot_grant(void) {
          {"api-key", "create", "--label", "x", "--scope", "decisions:dispose"}, 6},
         {"the submission scope, which nothing can be granted",
          {"api-key", "create", "--label", "x", "--scope", "jobs:submit"}, 6},
+        {"the deploy-confirm scope, which nothing can be granted",
+         {"api-key", "create", "--label", "x", "--scope", "deploys:confirm"}, 6},
         {"no scope at all", {"api-key", "create", "--label", "x"}, 4},
         {"no label", {"api-key", "create", "--scope", "repo:read"}, 4},
         {"a label with a newline in it",
@@ -441,6 +443,34 @@ static void test_creation_refuses_what_it_cannot_grant(void) {
     }
     atlas_buf_free(&jsout);
     atlas_buf_free(&jserr);
+
+    /* `deploys:confirm` is refused with its own frozen sentence, naming how
+     * a credential gets this scope derived for it — through a
+     * remote_deploy_key policy line, not through api-key create. */
+    atlas_buf dcout = ATLAS_BUF_INIT;
+    atlas_buf dcerr = ATLAS_BUF_INIT;
+    {
+        const char *argv[8];
+        size_t k = 0;
+        argv[k++] = "--data-dir";
+        argv[k++] = fx_data_dir(&fx);
+        argv[k++] = "api-key";
+        argv[k++] = "create";
+        argv[k++] = "--label";
+        argv[k++] = "x";
+        argv[k++] = "--scope";
+        argv[k++] = "deploys:confirm";
+        int code = -1;
+        T_OK(fx_atlas(argv, k, &dcout, &dcerr, &code, &err), &err);
+        T_CHECK_MSG(code == 2, "deploys:confirm produced exit %d rather than a usage error", code);
+        T_CHECK_MSG(strstr(atlas_buf_cstr(&dcerr),
+                           "deploys:confirm cannot be granted to a credential; it is derived "
+                           "for the key a remote_deploy_key line in /etc/atlas/gateway.conf "
+                           "names") != NULL,
+                    "the refusal did not carry the frozen sentence: %s", atlas_buf_cstr(&dcerr));
+    }
+    atlas_buf_free(&dcout);
+    atlas_buf_free(&dcerr);
 
     /* Neither `--scope` nor `--no-scopes`: the amended sentence, which says
      * `--no-scopes` exists rather than only that a scope is missing. */
@@ -697,6 +727,27 @@ static void test_the_submit_scope_is_in_the_vocabulary_and_ungrantable(void) {
     atlas_buf_free(&rendered);
 }
 
+/* No fixture: pure function over the closed vocabulary. */
+static void test_the_deploy_confirm_scope_is_in_the_vocabulary_and_ungrantable(void) {
+    T_CHECK(atlas_apikey_scope_parse("deploys:confirm") == ATLAS_SCOPE_DEPLOYS_CONFIRM);
+    T_CHECK_MSG(strcmp(atlas_apikey_scope_name(ATLAS_SCOPE_DEPLOYS_CONFIRM), "deploys:confirm") ==
+                   0,
+                "the canonical name does not round-trip");
+    T_CHECK_MSG(!atlas_apikey_scope_grantable(ATLAS_SCOPE_DEPLOYS_CONFIRM),
+                "deploys:confirm must never be grantable");
+
+    /* Renders after jobs:submit, in enum/table order. */
+    atlas_scope_mask both =
+        ATLAS_SCOPE_BIT(ATLAS_SCOPE_JOBS_SUBMIT) | ATLAS_SCOPE_BIT(ATLAS_SCOPE_DEPLOYS_CONFIRM);
+    atlas_buf rendered = ATLAS_BUF_INIT;
+    atlas_err err;
+    atlas_err_init(&err);
+    T_OK(atlas_apikey_scopes_render(both, &rendered, &err), &err);
+    T_CHECK_MSG(strcmp(atlas_buf_cstr(&rendered), "jobs:submit deploys:confirm") == 0,
+                "unexpected render order: %s", atlas_buf_cstr(&rendered));
+    atlas_buf_free(&rendered);
+}
+
 static const atlas_test TESTS[] = {
     {"a created key is shown once and never again",
      test_a_created_key_is_shown_once_and_never_again},
@@ -710,6 +761,8 @@ static const atlas_test TESTS[] = {
      test_the_disposal_scope_is_in_the_vocabulary_and_ungrantable},
     {"the submit scope is in the vocabulary and ungrantable",
      test_the_submit_scope_is_in_the_vocabulary_and_ungrantable},
+    {"the deploy-confirm scope is in the vocabulary and ungrantable",
+     test_the_deploy_confirm_scope_is_in_the_vocabulary_and_ungrantable},
 };
 
 ATLAS_TEST_MAIN("apikey", TESTS)

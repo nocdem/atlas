@@ -1,0 +1,25 @@
+# Atlas A17 — the root deploy agent.
+#
+# This unit deliberately runs as root, unsandboxed. That is not an oversight:
+# a confirmed deploy applies a patch to the operator's own tree, builds it,
+# installs the result and restarts system units, and every one of those is a
+# root-only action on most installs. The existence of this unit on a box is
+# itself the operator's acceptance of a channel that can do all of that from a
+# credential a remote operator typed into a browser and a challenge this
+# agent never sees (docs/remote-submission.md and docs/browser-disposal.md
+# carry the authority chain that puts a `.req` file here in the first place;
+# this agent trusts the spool, not the network).
+#
+# Install as /etc/systemd/system/atlas-deploy.service alongside the matching
+# .path unit, and /etc/atlas/deploy.conf from deploy.conf.template, before
+# enabling atlas-deploy.path.
+
+[Unit]
+Description=Atlas deploy agent
+Documentation=man:atlas(1)
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/local/libexec/atlas/atlas-deploy-agent --conf /etc/atlas/deploy.conf

@@ -17,6 +17,7 @@
 #include "atlas/daemon.h"
 #include "atlas/db.h"
 #include "atlas/decision_ops.h"
+#include "atlas/deploy.h"
 #include "atlas/git.h"
 #include "atlas/maintenance.h"
 #include "atlas/ops.h"
@@ -211,7 +212,42 @@ typedef enum atlas_job_kind {
      * which A1 forbids inside a transaction, so the job runs that phase with
      * no transaction open and opens one only around
      * `atlas_memory_apply_in_tx`. */
-    ATLAS_JOB_MEMORY_RECONCILE
+    ATLAS_JOB_MEMORY_RECONCILE,
+    /* A17 T2. `deploy.remote_propose`, `deploy.remote_confirm` and
+     * `deploy.remote_cancel`'s one write each: one job kind carrying one
+     * typed operation, for exactly the reason ATLAS_JOB_AI, ATLAS_JOB_DECISION,
+     * ATLAS_JOB_ORCH, ATLAS_JOB_VERIFY, ATLAS_JOB_PLAN and ATLAS_JOB_MEMORY are
+     * each one: the credential is verified at the IPC edge (T1's
+     * `atlas_db_deploy_*_in_tx` functions take an already-resolved `key_id`,
+     * never a bearer token), and the writer's switch stays a switch rather
+     * than becoming a second dispatch table.
+     *
+     * A CONFIRM whose transaction commits does one more thing on this same
+     * job, still on the writer thread but after the transaction that moved
+     * the row to CONFIRMED: it writes the two queue files (D.3) and then
+     * `atlas_db_deploy_mark_spooled_in_tx` in a transaction of its own. A1's
+     * rule is "no file read inside a write transaction"; this is a file
+     * *write*, and it runs between two transactions rather than inside
+     * either one, on `ATLAS_JOB_SEM_DISCOVER`'s own precedent of file I/O
+     * with no transaction open. */
+    ATLAS_JOB_DEPLOY,
+    /* A17 T2. The daemon-startup and nothing-else producer of this
+     * job re-attempts the queue-file write for every CONFIRMED deploy whose
+     * `spooled_at` is still empty (`atlas_db_deploy_confirmed_unspooled`) --
+     * the same per-uid work `ATLAS_JOB_DEPLOY`'s CONFIRM case does inline,
+     * factored out so both call one helper rather than two copies drifting.
+     * Fire-and-forget, `ATLAS_JOB_SEM_DISCOVER`'s own shape: nobody polls for
+     * it, and `deploy.remote_get`'s `spooled_at` field is the confirmation
+     * channel. */
+    ATLAS_JOB_DEPLOY_SPOOL,
+    /* A17 T2. Reads `<data-dir>/deploy/results`'s `*.res` files, sorted by
+     * name, each a bounded parse (`atlas_deploy_result_parse`, ≤ 32 KiB body)
+     * and one `atlas_db_deploy_finish_in_tx` call, then unlinks the file
+     * regardless of the parse or write outcome -- a result nobody could ever
+     * apply must not be reprocessed forever. Triggered by the watcher tick's
+     * pure derivation ("is `results/` non-empty?") and once at daemon
+     * startup, `ATLAS_JOB_SEM_DISCOVER`'s own fire-and-forget shape. */
+    ATLAS_JOB_DEPLOY_INGEST
 } atlas_job_kind;
 
 
@@ -241,6 +277,45 @@ typedef struct atlas_apikey_job_result {
     atlas_apikey_created created;
     bool changed;
 } atlas_apikey_job_result;
+
+/* A17 T2. `deploy.remote_propose`/`_confirm`/`_cancel`'s one typed
+ * write, as the writer thread receives it. `key_id` is always the already-
+ * verified credential (T1's `atlas_db_deploy_*_in_tx` functions take one, not
+ * a bearer token), never a raw token this struct would have to authenticate
+ * itself. */
+typedef enum atlas_deploy_op_kind {
+    ATLAS_DEPLOY_OP_PROPOSE = 0,
+    ATLAS_DEPLOY_OP_CONFIRM,
+    ATLAS_DEPLOY_OP_CANCEL
+} atlas_deploy_op_kind;
+
+typedef struct atlas_deploy_op {
+    atlas_deploy_op_kind kind;
+    atlas_buf job_uid;      /* PROPOSE */
+    atlas_buf deploy_uid;   /* CONFIRM, CANCEL */
+    atlas_buf key_id;       /* every kind: the already-verified credential */
+    atlas_buf confirmation; /* CONFIRM: the operator-typed digest prefix */
+} atlas_deploy_op;
+
+void atlas_deploy_op_init(atlas_deploy_op *op);
+void atlas_deploy_op_free(atlas_deploy_op *op);
+
+/* What a completed deploy op reports back. `deploy_uid` is the freshly
+ * generated uid for PROPOSE and the same uid echoed back for CONFIRM/CANCEL --
+ * a caller re-reads the full row (`atlas_db_deploy_get`, a plain read) rather
+ * than this struct growing a field per response key, `atlas_writer_call`'s own
+ * "id/name" minimalism one layer over. `spooled` is CONFIRM-only: whether the
+ * post-commit queue-file write that ran inside this same job succeeded: false
+ * is not a failure of the confirm itself (D.1's "the row stays CONFIRMED and
+ * the daemon-startup sweep retries" contract), only something worth a caller
+ * knowing without a second round trip. */
+typedef struct atlas_deploy_op_result {
+    atlas_buf deploy_uid;
+    bool spooled;
+} atlas_deploy_op_result;
+
+void atlas_deploy_op_result_init(atlas_deploy_op_result *r);
+void atlas_deploy_op_result_free(atlas_deploy_op_result *r);
 
 /* A12.1 T11. `memory.put`'s one typed write, and the `atlas_apikey_job` shape
  * rather than `atlas_ai_op`'s: the RPC handler waits for this (it is a small,
@@ -436,6 +511,13 @@ struct atlas_job {
     /* A8 snapshot enumeration. */
     int64_t snapshot_attempt_id;
     struct atlas_snapshot_meta *snapshot_meta;
+
+    /* A17 T2. `ATLAS_JOB_DEPLOY`'s one typed write, and where the
+     * writer puts its result -- `atlas_apikey_job`'s own borrowed pair: both
+     * belong to a caller that waits, neither is freed by `job_free`, and both
+     * are cleared to NULL by a caller that gives up before this runs. */
+    const atlas_deploy_op *deploy_op;
+    atlas_deploy_op_result *deploy_op_result;
 };
 
 /* What a completed mutation reports back. */
@@ -505,6 +587,24 @@ atlas_status atlas_writer_gw_audit(atlas_writer *w, const atlas_gw_audit_entry *
 /* A9. One credential operation, on the writer thread, with the caller waiting. */
 atlas_status atlas_writer_apikey(atlas_writer *w, const atlas_apikey_job *op,
                                  atlas_apikey_job_result *out, atlas_err *err);
+
+/* A17 T2. One `deploy.remote_propose`/`_confirm`/`_cancel` write, on
+ * the writer thread, with the caller waiting -- `atlas_writer_apikey`'s own
+ * shape. `op` and `out` are both borrowed: neither is owned or freed by the
+ * writer, and both are the caller's stack variables. */
+atlas_status atlas_writer_deploy(atlas_writer *w, const atlas_deploy_op *op,
+                                 atlas_deploy_op_result *out, atlas_err *err);
+
+/* A17 T2. Fire-and-forget: re-attempts the queue-file write for
+ * every CONFIRMED-but-unspooled deploy. Called once at daemon startup and
+ * safe to call again -- a deploy that is already spooled is not in the set
+ * `atlas_db_deploy_confirmed_unspooled` returns. */
+atlas_status atlas_writer_submit_deploy_spool_sweep(atlas_writer *w, atlas_err *err);
+
+/* A17 T2. Fire-and-forget: ingests every `*.res` file in the `results` directory
+ * currently on disk. Called from the watcher tick's pure derivation ("is
+ * `results/` non-empty?") and once at daemon startup. */
+atlas_status atlas_writer_submit_deploy_ingest(atlas_writer *w, atlas_err *err);
 
 /* A9.2.3. Queues a build-description write and waits for it, like a prune. */
 atlas_status atlas_writer_sem_config(atlas_writer *w, const atlas_sem_config_job *job,

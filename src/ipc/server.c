@@ -1343,6 +1343,35 @@ atlas_status atlas_server_dispatch(atlas_server_ctx *ctx, const void *payload, s
             }
         }
     }
+    /* A17 T2. The daemon's `deploy.remote_*` group, consulted
+     * additively right after the remote submit group above and hidden the
+     * same way -- a peer this predicate refuses gets `unknown method`, not a
+     * refusal that would confirm the name exists. A separate consult rather
+     * than folding these names into either sibling group: the peer test here
+     * adds a policy condition neither `job.remote_*`'s nor
+     * `decision.remote_*`'s alone has. `atlas_server_remote_deploy_offered`
+     * is the coarse "is either pool ready at all" gate that decides whether
+     * it is worth entering this loop; the per-name match below additionally
+     * asks `atlas_server_remote_deploy_method_offered`, because the two
+     * pools this group draws from are not interchangeable per name --
+     * `_challenge`/`_confirm` need the deploy pool specifically and
+     * `_propose`/`_get`/`_list`/`_cancel` need the submit pool specifically,
+     * and a policy with only one of the two must still answer `unknown
+     * method` for the other half rather than a refusal that confirms the
+     * name exists. See `src/ipc/server_deploy_remote.c`. */
+    if (fn == NULL && atlas_server_remote_deploy_offered(ctx, (long long)peer_uid)) {
+        size_t n = 0;
+        const atlas_method_entry *g = atlas_server_remote_deploy_methods(&n);
+        for (size_t i = 0; i < n; i++) {
+            if (strcmp(atlas_ipc_request_method(req), g[i].name) == 0) {
+                if (atlas_server_remote_deploy_method_offered(ctx, (long long)peer_uid,
+                                                               g[i].name)) {
+                    fn = g[i].fn;
+                }
+                break;
+            }
+        }
+    }
     if (fn == NULL &&
         atlas_orchpolicy_is_any_dispatcher(&ctx->orchpolicy, (long long)peer_uid)) {
         size_t n = 0;

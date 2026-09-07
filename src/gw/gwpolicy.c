@@ -369,6 +369,9 @@ void atlas_gwpolicy_parse_buffer(const char *buf, size_t total, atlas_gwpolicy *
     bool submit_active_total_given = false;
     bool submit_per_day_given = false;
     bool submit_accept_given = false;
+    /* A17 T2. */
+    bool deploy_key_given = false;
+    bool deploy_accept_given = false;
 
     size_t i = 0;
     while (i < total) {
@@ -749,6 +752,35 @@ void atlas_gwpolicy_parse_buffer(const char *buf, size_t total, atlas_gwpolicy *
             }
             out->cleartext_submission_accepted = true;
             submit_accept_given = true;
+        } else if (take_value(line, len, "remote_deploy_key", &val, &vlen)) {
+            /* A17 T2: singleton, grammar identical to
+             * `remote_dispose_key`/`remote_submit_key`. Given twice is
+             * MALFORMED -- unlike `remote_dispose_key`, which the original A16
+             * loader lets a second occurrence silently overwrite, this field's
+             * own design brief requires the refusal explicitly, so it is
+             * checked here rather than left to the same gap. Equality against
+             * `remote_dispose_key` and every `remote_submit_key` is checked
+             * end-of-parse, because the operator may write the lines in any
+             * order. */
+            if (deploy_key_given) {
+                out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
+                return;
+            }
+            if (!parse_key_selector(val, vlen, out->remote_deploy_key)) {
+                out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
+                return;
+            }
+            deploy_key_given = true;
+        } else if (take_value(line, len, "operator_accepts_cleartext_deploy", &val, &vlen)) {
+            /* A17 T2. One legal value, `operator_accepts_cleartext_
+             * disposal`'s own reasoning: this records a person's written
+             * acceptance of a stated risk, not an on/off switch. */
+            if (vlen != 3u || strncmp(val, "yes", 3) != 0) {
+                out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
+                return;
+            }
+            out->cleartext_deploy_accepted = true;
+            deploy_accept_given = true;
         } else if (take_value(line, len, "trust_forwarded_for", &val, &vlen)) {
             if (!parse_bool(val, vlen, &out->trust_forwarded_for)) {
                 out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
@@ -945,6 +977,42 @@ void atlas_gwpolicy_parse_buffer(const char *buf, size_t total, atlas_gwpolicy *
             /* `tls_mode` is NONE or absent. The submission credential is a
              * bearer token on every request and the operator has not stated
              * they accept that risk. */
+            out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
+            return;
+        }
+    }
+
+    /* A17 T2. `operator_accepts_cleartext_deploy` is refused without
+     * a deploy key -- the same "nothing here to accept" reasoning the other
+     * two acceptance keys carry. */
+    if (deploy_accept_given && !deploy_key_given) {
+        out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
+        return;
+    }
+    if (deploy_key_given) {
+        /* One credential, one power, checked against both other credential
+         * fields regardless of which order the operator wrote the lines in. */
+        if (out->remote_dispose_key[0] != '\0' &&
+            strcmp(out->remote_deploy_key, out->remote_dispose_key) == 0) {
+            out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
+            return;
+        }
+        for (size_t k = 0; k < out->remote_submit_count; k++) {
+            if (strcmp(out->remote_deploy_key, out->remote_submit_keys[k]) == 0) {
+                out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
+                return;
+            }
+        }
+        if (out->tls_mode == ATLAS_GWPOLICY_TLS_REVERSE_PROXY) {
+            if (deploy_accept_given) {
+                /* TLS is already in front; nothing to accept. */
+                out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
+                return;
+            }
+        } else if (!deploy_accept_given) {
+            /* `tls_mode` is NONE or absent: the deploy credential is a bearer
+             * token on every request and the operator has not written down
+             * accepting that. */
             out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
             return;
         }

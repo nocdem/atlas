@@ -1,0 +1,90 @@
+# Atlas A17 — the root-owned deploy agent conf.
+#
+# Install as /etc/atlas/deploy.conf, owned by root, mode 0644. Read once per
+# invocation by /usr/local/libexec/atlas/atlas-deploy-agent, which never opens
+# the SQLite index -- the spool files under `spool` below are its whole
+# interface with Atlas.
+#
+# An unrecognised key is an error, not something skipped: the agent refuses to
+# start rather than silently ignore a line its author believed configured
+# something. `/opt/atlas` below is this deployment's own path, mentioned here
+# and nowhere in Atlas' own source -- see CLAUDE.md's "no repository name or
+# path in product logic" rule, which this conf and its comments are the one
+# place that rule does not apply.
+
+# The operator's own working tree. A deploy request whose repo_root does not
+# match this exactly is refused at PREFLIGHT before anything else runs.
+tree = /opt/atlas
+
+# The account that owns `tree`. BUILD, TEST and the patch APPLY/APPLY_CHECK
+# run as this user (via `runuser`, or directly when the agent is already
+# running as this account); a deploy never runs the operator's own build as
+# root, which is the one class of mistake `sudo make install` already taught
+# this project to avoid (see deploy.local.sh).
+#
+# T7: a root oneshot via `runuser -u nocdem --` supplies HOME=/home/nocdem and
+# PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin, but NOT
+# XDG_RUNTIME_DIR -- set it explicitly wherever a `--user` systemctl call is
+# made under this oneshot (XDG_RUNTIME_DIR=/run/user/1000 on this host).
+owner = nocdem
+
+# /var/lib/atlas/deploy -- the daemon creates {requests,results} under this at
+# startup, mode 0700.
+#
+# T7: `man systemd.path` confirms a PathExistsGlob= unit does not reliably
+# arm against a glob whose parent directory does not exist yet -- systemd
+# instead watches the nearest existing ancestor for permission/existence
+# changes. There is no MakeDirectory= option on a path unit. Order MUST be:
+# install and start the new daemon first (it creates /var/lib/atlas/deploy,
+# confirmed absent on this host today), THEN `enable --now` the path unit --
+# never the reverse.
+spool = /var/lib/atlas/deploy
+
+build = make
+
+# T7: under `runuser -u nocdem -- env HOME=/home/nocdem
+# PATH=/usr/local/bin:/usr/bin:/bin ...`, both `git -C /opt/atlas status
+# --porcelain` and `ctest --test-dir /opt/atlas/build -N` run correctly
+# (128 tests listed) with no further environment setup needed.
+#
+# UNSET ON PURPOSE. The agent refuses every request at PREFLIGHT with a clear
+# line until this is set -- the operator chooses which one, not the template.
+# Pick exactly one of:
+#   test = ctest --test-dir build -L unit --output-on-failure
+#   test = make test
+
+# `cmake --install` strips RPATH, so its output is never byte-comparable to
+# `build/atlas` -- this agent compares exit codes and `--version` text, never
+# digests, for exactly that reason (see deploy.local.sh's own recorded trap).
+install = cmake --install build --prefix /usr/local
+binary = /usr/local/bin/atlas
+
+# Space-separated system unit names, restarted with `systemctl restart <unit>`
+# as this agent's own (root) principal after INSTALL succeeds.
+units_system = atlas.service atlas-gateway.service atlas-dispatcher.service atlas-scanner.service
+
+# Space-separated "owner:unit" pairs for a per-user systemd instance, restarted
+# under that user's own runtime directory. Empty is fine.
+#
+# T7 (2026-09-07, this machine): status form to reach the operator's user unit
+# as root: `sudo -n systemctl --machine=nocdem@.host --user status
+# atlas-model-dispatcher.service --no-pager` works and needs no runtime-dir
+# uid guess. The runuser fallback also works but requires
+# XDG_RUNTIME_DIR=/run/user/<uid> to be supplied explicitly. Use the
+# --machine= form; never `restart` from this template, `status` only.
+units_user = nocdem:atlas-model-dispatcher.service
+
+# Run as `owner` after every restart, bounded to 40 seconds. Its success is
+# what VERIFY reports as SUCCEEDED rather than FAILED.
+ping = /usr/local/bin/atlas daemon ping
+
+# yes|no. A dry run applies the patch, builds and tests it, then *always*
+# reverses the patch with `git apply -R` regardless of reverse_on_failure below
+# -- a dry run never leaves the tree modified, and never reaches INSTALL.
+dry_run = no
+
+# yes|no. Only consulted on a BUILD or TEST failure in a real (non-dry) run:
+# `no` leaves the applied patch in the tree for the operator to inspect; `yes`
+# reverses it with `git apply -R`, never a reset, checkout or clean, so an
+# operator's own uncommitted work elsewhere in the tree is never touched.
+reverse_on_failure = no

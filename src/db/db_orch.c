@@ -30,6 +30,7 @@
 
 #include "atlas/atlas.h"
 #include "atlas/db.h"
+#include "atlas/deploy.h"
 #include "atlas/limits.h"
 #include "atlas/memory.h"
 #include "atlas/orch_ops.h"
@@ -1297,6 +1298,39 @@ static atlas_status op_submit(atlas_db *db, const atlas_orch_op *op, atlas_orch_
         if (rc != SQLITE_DONE) {
             return atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot read an idempotency record");
         }
+    }
+
+    /* A17 T2. A CONFIRMED deploy for this repository is a restart
+     * that has not happened yet: the operator's root agent will apply a
+     * patch, build, install and restart every unit named in its conf --
+     * including this one, under a system deployment -- at a moment neither
+     * `job.submit` nor `job.remote_submit` can predict. A root job accepted
+     * in the window between confirm and that restart would die with it,
+     * mid-task, for a reason nothing in the job's own record would explain.
+     * Checked for every root submission (`s->parent_job_uid.len == 0`) --
+     * both write points reach this one function, so one check here covers
+     * `job.submit` and `job.remote_submit` alike, A11.0's "every check
+     * inside the submit transaction" precedent: a check performed before
+     * this transaction opened would be worthless against a confirm landing
+     * in the gap. A follow-up task is not checked: it joins a run whose root
+     * already passed this gate, and a run cannot un-pass it. */
+    if (s->parent_job_uid.len == 0) {
+        atlas_buf confirmed_deploy = ATLAS_BUF_INIT;
+        atlas_status ds = atlas_db_deploy_confirmed_uid(db, op->repo_id, &confirmed_deploy, err);
+        if (ds != ATLAS_OK) {
+            atlas_buf_free(&confirmed_deploy);
+            return ds;
+        }
+        if (confirmed_deploy.len > 0) {
+            atlas_status rs = atlas_err_set(
+                err, ATLAS_ERR_USAGE,
+                "deploy %s is confirmed for this repository and awaiting the agent's restart; "
+                "no root job may be submitted until it reports a result",
+                atlas_buf_cstr(&confirmed_deploy));
+            atlas_buf_free(&confirmed_deploy);
+            return rs;
+        }
+        atlas_buf_free(&confirmed_deploy);
     }
 
     /* A14, T3. Budget checks — only for a remote op and only when a new row

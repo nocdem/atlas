@@ -1082,7 +1082,71 @@ static const api_route API_WRITE_ROUTES[] = {
      {"after", "limit", NULL}, {"after", "limit", NULL}, ATLAS_GW_WRITE_BODY_MAX_BYTES},
     {"/api/v1/job/cancel", "job.remote_cancel", ATLAS_SCOPE_JOBS_SUBMIT,
      {"job", NULL}, {NULL}, ATLAS_GW_WRITE_BODY_MAX_BYTES},
+    /* A17 T3. Six routes over T2's `deploy.remote_*` group.
+     * `_propose` and `_cancel` take only the proposing submit credential;
+     * `_challenge` and `_confirm` take only the deploy credential, A16's
+     * challenge-then-spend shape applied to a patch digest instead of a
+     * decision's content hash. `_get` and `_list` accept either identity --
+     * T2's own union check (`verify_submit_or_deploy_credential`,
+     * `src/ipc/server_deploy_remote.c`): the deploy credential is this
+     * channel's operator proxy and must see a PROPOSED deploy before it has
+     * confirmed one. `api_route` carries one `scope` field and every other
+     * row in both tables uses only it; rather than add a second field the
+     * whole table would need a trailing initialiser for,
+     * `API_WRITE_ROUTE_ALTS[]` below names the *alternate* scope these two
+     * paths also accept. */
+    {"/api/v1/deploy/propose", "deploy.remote_propose", ATLAS_SCOPE_JOBS_SUBMIT,
+     {"job", NULL}, {NULL}, ATLAS_GW_WRITE_BODY_MAX_BYTES},
+    {"/api/v1/deploy/get", "deploy.remote_get", ATLAS_SCOPE_JOBS_SUBMIT,
+     {"deploy", NULL}, {NULL}, ATLAS_GW_WRITE_BODY_MAX_BYTES},
+    {"/api/v1/deploy/list", "deploy.remote_list", ATLAS_SCOPE_JOBS_SUBMIT,
+     {"cursor", "limit", NULL}, {"cursor", "limit", NULL}, ATLAS_GW_WRITE_BODY_MAX_BYTES},
+    {"/api/v1/deploy/cancel", "deploy.remote_cancel", ATLAS_SCOPE_JOBS_SUBMIT,
+     {"deploy", NULL}, {NULL}, ATLAS_GW_WRITE_BODY_MAX_BYTES},
+    {"/api/v1/deploy/challenge", "deploy.remote_challenge", ATLAS_SCOPE_DEPLOYS_CONFIRM,
+     {"deploy", NULL}, {NULL}, ATLAS_GW_WRITE_BODY_MAX_BYTES},
+    {"/api/v1/deploy/confirm", "deploy.remote_confirm", ATLAS_SCOPE_DEPLOYS_CONFIRM,
+     {"deploy", "challenge", "confirmation", NULL}, {NULL}, ATLAS_GW_WRITE_BODY_MAX_BYTES},
 };
+
+/* A17 T3. The alternate scope a write route also accepts, beside
+ * its primary `scope` field -- consulted only for `/api/v1/deploy/get` and
+ * `/api/v1/deploy/list`, the two routes a submit credential and the deploy
+ * credential may both read. A second row at either path was rejected:
+ * `api_handle_write`'s match loop below returns the first path hit, so a
+ * second row sharing a path would be unreachable dead code, never a second
+ * credential. */
+typedef struct api_route_alt {
+    const char *path;
+    atlas_apikey_scope alt_scope;
+} api_route_alt;
+
+static const api_route_alt API_WRITE_ROUTE_ALTS[] = {
+    {"/api/v1/deploy/get", ATLAS_SCOPE_DEPLOYS_CONFIRM},
+    {"/api/v1/deploy/list", ATLAS_SCOPE_DEPLOYS_CONFIRM},
+};
+
+static atlas_apikey_scope route_alt_scope(const api_route *route) {
+    for (size_t i = 0; i < sizeof API_WRITE_ROUTE_ALTS / sizeof API_WRITE_ROUTE_ALTS[0]; i++) {
+        if (strcmp(API_WRITE_ROUTE_ALTS[i].path, route->path) == 0) {
+            return API_WRITE_ROUTE_ALTS[i].alt_scope;
+        }
+    }
+    return ATLAS_SCOPE_UNKNOWN;
+}
+
+/* True when `scopes` carries `route`'s primary scope or (when it has one) its
+ * alternate. The one call site that decided whether a credential may use a
+ * write route -- both `deploy.remote_get` and `deploy.remote_list` are
+ * reachable by a submit credential (the primary) or the deploy credential
+ * (the alternate). */
+static bool route_scope_granted(const api_route *route, atlas_scope_mask scopes) {
+    if (atlas_scope_has(scopes, route->scope)) {
+        return true;
+    }
+    atlas_apikey_scope alt = route_alt_scope(route);
+    return alt != ATLAS_SCOPE_UNKNOWN && atlas_scope_has(scopes, alt);
+}
 
 static bool route_wants(const api_route *r, const char *name, bool *is_int) {
     *is_int = false;
@@ -1397,15 +1461,23 @@ static bool api_handle(atlas_gateway *g, const atlas_http_request *req, const pr
     return true;
 }
 
-/* A14/A16. True when the route is offered under the current policy. Switch has
- * no `default:` so a new scope value causes a compile error if it is not
- * handled here. */
-static bool route_offered(const atlas_gateway *g, const api_route *route) {
-    switch (route->scope) {
+/* A14/A16/T3. True when `scope` alone is offered under the current policy.
+ * Switch has no `default:` so a new scope value causes a compile error if it
+ * is not handled here. Split out of `route_offered` below so a route with an
+ * alternate (`/api/v1/deploy/get`, `/api/v1/deploy/list`) can ask it twice
+ * rather than duplicating the switch. */
+static bool scope_offered(const atlas_gateway *g, atlas_apikey_scope scope) {
+    switch (scope) {
     case ATLAS_SCOPE_DECISIONS_DISPOSE:
         return g->policy.remote_dispose_key[0] != '\0';
     case ATLAS_SCOPE_JOBS_SUBMIT:
         return g->policy.remote_submit_count > 0;
+    /* A17 T3. Grammar already refuses `remote_deploy_key` without a
+     * consistent TLS/cleartext-acceptance pair (T2's four end-of-parse
+     * refusals), so key presence alone is what `remote_dispose_key` above
+     * already checks for the same reason. */
+    case ATLAS_SCOPE_DEPLOYS_CONFIRM:
+        return g->policy.remote_deploy_key[0] != '\0';
     case ATLAS_SCOPE_UNKNOWN:
     case ATLAS_SCOPE_CONTEXT_READ:
     case ATLAS_SCOPE_REPO_READ:
@@ -1420,6 +1492,19 @@ static bool route_offered(const atlas_gateway *g, const api_route *route) {
     return false;
 }
 
+/* A14/A16. True when the route is offered under the current policy: its
+ * primary scope, or (T3) its alternate when it has one -- a policy naming
+ * only a deploy key and no submit key still offers `/api/v1/deploy/get` and
+ * `/api/v1/deploy/list` to the deploy credential, mirroring the daemon's own
+ * `atlas_server_remote_deploy_policy_ready` (`submit_ready || deploy_ready`). */
+static bool route_offered(const atlas_gateway *g, const api_route *route) {
+    if (scope_offered(g, route->scope)) {
+        return true;
+    }
+    atlas_apikey_scope alt = route_alt_scope(route);
+    return alt != ATLAS_SCOPE_UNKNOWN && scope_offered(g, alt);
+}
+
 /* The 404 sentence when a route's scope is not served by this policy. */
 static const char *route_not_offered_msg(const api_route *route) {
     switch (route->scope) {
@@ -1427,6 +1512,15 @@ static const char *route_not_offered_msg(const api_route *route) {
         return "this gateway does not serve remote disposal";
     case ATLAS_SCOPE_JOBS_SUBMIT:
         return "this gateway does not serve remote submission";
+    /* A17 T3. `/api/v1/deploy/challenge` and `/api/v1/deploy/confirm`
+     * carry this as their primary scope; `/api/v1/deploy/get` and
+     * `/api/v1/deploy/list` carry `ATLAS_SCOPE_JOBS_SUBMIT` as primary and
+     * this as their alternate (`route_alt_scope`), so a caller with neither
+     * credential configured sees the submission sentence above instead --
+     * accepted imprecision, on `atlas_orch_remote_verify`'s own precedent for
+     * a shared sentence naming the wrong one of two credentials. */
+    case ATLAS_SCOPE_DEPLOYS_CONFIRM:
+        return "this gateway does not serve remote deploy";
     case ATLAS_SCOPE_UNKNOWN:
     case ATLAS_SCOPE_CONTEXT_READ:
     case ATLAS_SCOPE_REPO_READ:
@@ -1450,6 +1544,9 @@ static const char *route_unauth_msg(const api_route *route) {
     case ATLAS_SCOPE_JOBS_SUBMIT:
         return "a submission needs a credential the policy names, presented as a bearer "
                "token; a session cookie or the anonymous floor cannot submit";
+    case ATLAS_SCOPE_DEPLOYS_CONFIRM:
+        return "a deploy confirmation needs the deploy credential presented as a bearer "
+               "token; a session cookie or the anonymous floor cannot confirm";
     case ATLAS_SCOPE_UNKNOWN:
     case ATLAS_SCOPE_CONTEXT_READ:
     case ATLAS_SCOPE_REPO_READ:
@@ -1548,13 +1645,26 @@ static bool api_handle_write(atlas_gateway *g, const atlas_http_request *req, co
         }
         return true;
     }
-    if (!atlas_scope_has(pr.scopes, route->scope)) {
+    if (!route_scope_granted(route, pr.scopes)) {
         const char *needed = atlas_apikey_scope_name(route->scope);
+        /* T3. `/api/v1/deploy/get` and `/api/v1/deploy/list` accept either
+         * `jobs:submit` or `deploys:confirm` (`route_alt_scope`); naming only
+         * the primary here would tell a deploy-credential holder they lack
+         * `jobs:submit`, a scope that credential must never hold, and send
+         * them looking for the wrong key. */
+        atlas_apikey_scope alt = route_alt_scope(route);
+        const char *needed_alt = alt != ATLAS_SCOPE_UNKNOWN ? atlas_apikey_scope_name(alt) : NULL;
         atlas_buf msg = ATLAS_BUF_INIT;
         atlas_err merr;
         atlas_err_init(&merr);
-        (void)atlas_buf_appendf(&msg, &merr, "this credential does not hold the \"%s\" scope",
-                                needed != NULL ? needed : "required");
+        if (needed_alt != NULL) {
+            (void)atlas_buf_appendf(&msg, &merr,
+                                    "this credential does not hold the \"%s\" or \"%s\" scope",
+                                    needed != NULL ? needed : "required", needed_alt);
+        } else {
+            (void)atlas_buf_appendf(&msg, &merr, "this credential does not hold the \"%s\" scope",
+                                    needed != NULL ? needed : "required");
+        }
         *st_out = respond_error(g, req, 403, "forbidden", atlas_buf_cstr(&msg), response, err);
         atlas_buf_free(&msg);
         audit(g, "WEB_API", &pr, req->path, false, false, ATLAS_ERR_INTEGRITY, now_ms() - started,
@@ -1707,6 +1817,7 @@ const atlas_gateway_route_view *atlas_gateway_api_routes(size_t *count_out) {
             views[i].method = API_ROUTES[i].method;
             views[i].scope = API_ROUTES[i].scope;
             views[i].body_max = 0; /* read routes carry no body */
+            views[i].alt_scope = ATLAS_SCOPE_UNKNOWN; /* no read row has an alternate */
         }
         populated = true;
     }
@@ -1728,6 +1839,7 @@ const atlas_gateway_route_view *atlas_gateway_api_write_routes(size_t *count_out
             views[i].method = API_WRITE_ROUTES[i].method;
             views[i].scope = API_WRITE_ROUTES[i].scope;
             views[i].body_max = API_WRITE_ROUTES[i].body_max;
+            views[i].alt_scope = route_alt_scope(&API_WRITE_ROUTES[i]);
         }
         populated = true;
     }
@@ -1735,6 +1847,11 @@ const atlas_gateway_route_view *atlas_gateway_api_write_routes(size_t *count_out
         *count_out = n;
     }
     return views;
+}
+
+/* T3. See the declaration in `include/atlas/gateway.h`. */
+size_t atlas_gateway_api_write_route_alt_count(void) {
+    return sizeof API_WRITE_ROUTE_ALTS / sizeof API_WRITE_ROUTE_ALTS[0];
 }
 
 /* --- routing --------------------------------------------------------------- */
@@ -2010,7 +2127,11 @@ atlas_status atlas_gateway_serve_bytes(atlas_gateway *g, const char *request, si
                  * acceptance is present, so the browser can show its own
                  * cleartext-chain sentence rather than guess from `tls_mode`.
                  * `remote_submission`, `remote_submission_driver` and
-                 * `cleartext_submission` mirror that for the submission channel.
+                 * `cleartext_submission` mirror that for the submission channel,
+                 * and (T3) `remote_deploy`/`cleartext_deploy` mirror it again
+                 * for the deploy channel -- a policy naming only a deploy key
+                 * reports `remote_deploy: true` even with no submit key, on
+                 * `route_offered`'s own OR (submit-ready or deploy-ready).
                  * None of these depends on `pr`: all are properties of the
                  * policy, true or false for every principal alike, computed
                  * the same way `route_offered` itself decides. */
@@ -2019,6 +2140,7 @@ atlas_status atlas_gateway_serve_bytes(atlas_gateway *g, const char *request, si
                     "{\"ok\":true,\"anonymous\":%s,\"remote_disposal\":%s,\"cleartext_disposal\":%s,"
                     "\"remote_submission\":%s,\"remote_submission_driver\":\"%s\","
                     "\"cleartext_submission\":%s,"
+                    "\"remote_deploy\":%s,\"cleartext_deploy\":%s,"
                     "\"label\":\"%s\",\"scopes\":\"%s\"}",
                     anon ? "true" : "false",
                     g->policy.remote_dispose_key[0] != '\0' ? "true" : "false",
@@ -2026,6 +2148,8 @@ atlas_status atlas_gateway_serve_bytes(atlas_gateway *g, const char *request, si
                     g->policy.remote_submit_count > 0 ? "true" : "false",
                     g->policy.remote_submit_driver,
                     g->policy.cleartext_submission_accepted ? "true" : "false",
+                    g->policy.remote_deploy_key[0] != '\0' ? "true" : "false",
+                    g->policy.cleartext_deploy_accepted ? "true" : "false",
                     pr.label,
                     atlas_buf_cstr(&scopes));
                 st = respond(g, &req, 200, "application/json", body.data, body.len, NULL, response,
@@ -2609,6 +2733,17 @@ atlas_status atlas_service_gateway_status_for(FILE *out, bool json, const atlas_
                 st = atlas_json_key_bool(j, "cleartext_submission_accepted",
                                          p->cleartext_submission_accepted, err);
             }
+            if (st == ATLAS_OK) {
+                /* A17 T3. Same register as `remote_dispose_key`
+                 * above: an authentication grant a policy auditor must see
+                 * here, empty printed as the answer "remote deploy is off"
+                 * rather than omitted. */
+                st = atlas_json_key_str(j, "remote_deploy_key", p->remote_deploy_key, err);
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_bool(j, "cleartext_deploy_accepted",
+                                         p->cleartext_deploy_accepted, err);
+            }
         }
         /* Stated as a field rather than left to a reader's assumption, exactly
          * as the backup report states `encrypted` and `signed`. */
@@ -2739,6 +2874,35 @@ atlas_status atlas_service_gateway_status_for(FILE *out, bool json, const atlas_
             } else {
                 (void)fprintf(out,
                               "clear-submit: (not accepted -- a submission credential is offered "
+                              "only behind tls_mode = REVERSE_PROXY)\n");
+            }
+        }
+        {
+            /* A17 T3. `deploy:` and `clear-deploy:` print
+             * unconditionally when ENABLED, exactly like `dispose:`/`clear:`
+             * and `submit:`/`clear-submit:` above: absence is itself the
+             * printed answer, so an auditor never has to notice a missing
+             * line. The deploy credential installs and restarts as root on
+             * the target machine (D.4's root agent), which is why its
+             * cleartext sentence says so rather than reusing the submission
+             * or disposal wording. */
+            if (p->remote_deploy_key[0] != '\0') {
+                (void)fprintf(out, "deploy:  key_%s\n", p->remote_deploy_key);
+            } else {
+                (void)fprintf(out,
+                              "deploy:  (none -- nothing reachable over the network can confirm "
+                              "a deploy)\n");
+            }
+            if (p->cleartext_deploy_accepted) {
+                (void)fprintf(
+                    out,
+                    "clear-deploy: ACCEPTED -- operator_accepts_cleartext_deploy = yes: a "
+                    "captured deploy credential installs code that runs as root on this "
+                    "machine, over a network that carries it unencrypted, until it is "
+                    "revoked\n");
+            } else {
+                (void)fprintf(out,
+                              "clear-deploy: (not accepted -- a deploy credential is offered "
                               "only behind tls_mode = REVERSE_PROXY)\n");
             }
         }

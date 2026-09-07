@@ -117,6 +117,17 @@ typedef enum atlas_apikey_scope {
      * credentials the root-owned `remote_submit_key` lines name. Unlike DECISIONS_DISPOSE
      * it is derived for a key that may hold stored read scopes, and Decision 1 says why. */
     ATLAS_SCOPE_JOBS_SUBMIT,                                  /* name: "jobs:submit", grantable = false */
+    /* A17 T2. Never stored on a key row, for the same reason
+     * JOBS_SUBMIT is not: derived by the daemon for exactly the credential a
+     * root-owned `remote_deploy_key` policy line names, whether or not that
+     * credential also holds stored read scopes -- `remote_deploy_key` and
+     * `remote_submit_key` may name the same underlying capability shape
+     * (a credential the operator minted with `atlas api-key create`) but the
+     * policy refuses naming the *same* credential as both `remote_deploy_key`
+     * and any `remote_submit_key`/`remote_dispose_key` (one credential, one
+     * power, A14's rule extended by one), so this scope and JOBS_SUBMIT are
+     * never derived for the same key in a policy that loaded. */
+    ATLAS_SCOPE_DEPLOYS_CONFIRM,                              /* name: "deploys:confirm", grantable = false */
     ATLAS_SCOPE__COUNT
 } atlas_apikey_scope;
 

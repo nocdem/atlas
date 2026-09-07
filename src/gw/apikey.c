@@ -39,6 +39,9 @@ static const scope_row SCOPES[] = {
      * DECISIONS_DISPOSE it is derived for a key that may hold stored read
      * scopes — a submit credential may also read via /api/. */
     {ATLAS_SCOPE_JOBS_SUBMIT, "jobs:submit", false},
+    /* Not grantable. A17 T2: derived by the daemon for exactly the
+     * credential a root-owned `remote_deploy_key` policy line names. */
+    {ATLAS_SCOPE_DEPLOYS_CONFIRM, "deploys:confirm", false},
 };
 
 #define SCOPE_COUNT (sizeof(SCOPES) / sizeof(SCOPES[0]))

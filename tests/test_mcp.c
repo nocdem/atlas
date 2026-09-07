@@ -317,6 +317,68 @@ static void test_remote_only_tools_absent_from_stdio(void) {
     session_free(&s);
 }
 
+/* T4: the four remote-only MCP tools that forward to the daemon's
+ * `deploy.remote_propose`, `deploy.remote_get`, `deploy.remote_list` and
+ * `deploy.remote_cancel`. Named explicitly here, rather than derived from
+ * `atlas_mcp_tool_names()` the way the generic listing test above is: a test
+ * built from the same array it is meant to guard cannot fail red before the
+ * array holds the names. */
+static void test_deploy_tools_exist_and_are_remote_only(void) {
+    static const char *const DEPLOY_TOOLS[] = {
+        "atlas_deploy_propose",
+        "atlas_deploy_status",
+        "atlas_deploy_list",
+        "atlas_deploy_cancel",
+        NULL,
+    };
+    const char *const *names = atlas_mcp_tool_names();
+    T_REQUIRE(names != NULL);
+    for (size_t i = 0; DEPLOY_TOOLS[i] != NULL; i++) {
+        bool found = false;
+        for (size_t k = 0; names[k] != NULL; k++) {
+            if (strcmp(names[k], DEPLOY_TOOLS[i]) == 0) {
+                found = true;
+                break;
+            }
+        }
+        T_CHECK_MSG(found, "%s must be a registered MCP tool", DEPLOY_TOOLS[i]);
+        /* No challenge/confirm tool exists for any of these: that disposal is
+         * the operator's own, taken through a different credential and a
+         * dedicated route, never an MCP tool. Every one of these four must be
+         * remote_only, exactly as the four job tools are, so the stdio
+         * adapter never advertises or accepts it. */
+        T_CHECK_MSG(atlas_mcp_tool_remote_only(DEPLOY_TOOLS[i]),
+                    "%s must be remote_only", DEPLOY_TOOLS[i]);
+    }
+}
+
+static void test_deploy_tools_absent_from_stdio(void) {
+    /* Mirrors test_remote_only_tools_absent_from_stdio above, for a
+     * representative deploy tool: the stdio adapter answers "unknown tool"
+     * exactly as if it does not exist. */
+    atlas_err err;
+    atlas_err_init(&err);
+    session s;
+    session_init(&s);
+    run_script(&s,
+               INIT_LINE "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":"
+                         "{\"name\":\"atlas_deploy_propose\","
+                         "\"arguments\":{\"job\":\"j00000000000000000000000000000000\"}}}\n",
+               NULL, &err);
+    atlas_jsondoc *doc = parse_line(&s.out, 1, &err);
+    const atlas_jsonv *e = atlas_jsonv_get(atlas_jsondoc_root(doc), "error");
+    T_REQUIRE_MSG(e != NULL, "calling atlas_deploy_propose on stdio should produce an error");
+    int64_t code = 0;
+    T_CHECK(atlas_jsonv_int(atlas_jsonv_get(e, "code"), &code));
+    T_EQ_INT((int)code, -32602);
+    const char *msg = atlas_jsonv_str_member(e, "message");
+    T_CHECK_MSG(msg != NULL && strstr(msg, "unknown tool") != NULL,
+                "atlas_deploy_propose on stdio should answer \"unknown tool\", got: %s",
+                msg != NULL ? msg : "(null)");
+    atlas_jsondoc_free(doc);
+    session_free(&s);
+}
+
 static void test_unknown_tool_is_a_protocol_error(void) {
     atlas_err err;
     atlas_err_init(&err);
@@ -651,6 +713,9 @@ static const atlas_test TESTS[] = {
      test_tools_list_is_complete_and_strictly_schemad},
     {"remote-only tools are absent from the stdio adapter",
      test_remote_only_tools_absent_from_stdio},
+    {"the four deploy tools exist and are remote-only",
+     test_deploy_tools_exist_and_are_remote_only},
+    {"deploy tools are absent from the stdio adapter", test_deploy_tools_absent_from_stdio},
     {"an unknown tool is a protocol error", test_unknown_tool_is_a_protocol_error},
     {"an unavailable daemon is a degraded result",
      test_daemon_unavailable_is_a_degraded_result_not_a_crash},

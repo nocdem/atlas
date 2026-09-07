@@ -1,0 +1,21 @@
+# Atlas A17 — the deploy spool watcher.
+#
+# Fires atlas-deploy.service whenever a confirmed deploy's request file appears
+# in the spool the daemon owns. The daemon creates
+# /var/lib/atlas/deploy/{requests,results} at startup (mode 0700) so this unit
+# has a directory to watch from the moment it is enabled, whether or not the
+# daemon has run yet.
+#
+# Install as /etc/systemd/system/atlas-deploy.path, then:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now atlas-deploy.path
+
+[Unit]
+Description=Atlas deploy spool watcher
+
+[Path]
+PathExistsGlob=/var/lib/atlas/deploy/requests/*.req
+Unit=atlas-deploy.service
+
+[Install]
+WantedBy=multi-user.target

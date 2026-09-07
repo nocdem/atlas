@@ -413,6 +413,45 @@ static void test_every_malformed_policy_disables_the_gateway(void) {
          "remote_submit_driver = claude\nremote_submit_mode = Patch\n"
          "remote_submit_gate = make\nremote_submit_max_attempts = 1\n"
          "remote_submit_max_active = 2\nremote_submit_max_per_day = 6\n"},
+        /* A17 T2: remote_deploy_key grammar and cross-checks, on
+         * remote_dispose_key's own MALFORMED cases above. */
+        {"remote_deploy_key with 15 hex characters instead of 16",
+         "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\ntls_mode = REVERSE_PROXY\n"
+         "remote_deploy_key = key_581e0a805cc1feb\n"
+         "operator_accepts_cleartext_deploy = yes\n"},
+        {"remote_deploy_key in uppercase hex",
+         "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\ntls_mode = REVERSE_PROXY\n"
+         "remote_deploy_key = key_581E0A805CC1FEBE\n"
+         "operator_accepts_cleartext_deploy = yes\n"},
+        {"remote_deploy_key with no key_ prefix",
+         "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\ntls_mode = REVERSE_PROXY\n"
+         "remote_deploy_key = 581e0a805cc1febe\n"
+         "operator_accepts_cleartext_deploy = yes\n"},
+        {"remote_deploy_key given twice",
+         "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\ntls_mode = REVERSE_PROXY\n"
+         "remote_deploy_key = key_581e0a805cc1febe\n"
+         "remote_deploy_key = key_581e0a805cc1febe\n"},
+        {"operator_accepts_cleartext_deploy without a deploy key",
+         "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\n"
+         "operator_accepts_cleartext_deploy = yes\n"},
+        {"remote_deploy_key under tls_mode = NONE with no cleartext-deploy acceptance",
+         "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\ntls_mode = NONE\n"
+         "remote_deploy_key = key_581e0a805cc1febe\n"},
+        {"remote_deploy_key under REVERSE_PROXY with a cleartext-deploy acceptance present",
+         "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\ntls_mode = REVERSE_PROXY\n"
+         "remote_deploy_key = key_581e0a805cc1febe\n"
+         "operator_accepts_cleartext_deploy = yes\n"},
+        {"remote_deploy_key equal to remote_dispose_key",
+         "enabled = yes\ngateway_uid = 1001\nweb_gui = yes\ntls_mode = REVERSE_PROXY\n"
+         "remote_dispose_key = key_581e0a805cc1febe\nremote_dispose_kinds = PARKED\n"
+         "remote_deploy_key = key_581e0a805cc1febe\n"},
+        {"remote_deploy_key equal to a remote_submit_key",
+         "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\ntls_mode = REVERSE_PROXY\n"
+         "remote_submit_key = key_b2578f48143c06d3\n"
+         "remote_submit_driver = claude\nremote_submit_mode = patch\n"
+         "remote_submit_gate = make\nremote_submit_max_attempts = 1\n"
+         "remote_submit_max_active = 2\nremote_submit_max_per_day = 6\n"
+         "remote_deploy_key = key_b2578f48143c06d3\n"},
     };
 
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
@@ -547,6 +586,41 @@ static void test_remote_dispose_is_absent_by_default(void) {
     T_CHECK_MSG(p.remote_dispose_key[0] == '\0', "an absent policy named a dispose key");
     T_CHECK_MSG(p.remote_dispose_kinds == 0u, "an absent policy produced a nonzero dispose mask");
     T_CHECK(!p.cleartext_disposal_accepted);
+}
+
+/* A17 T2. `remote_deploy_key` parses into a policy that starts,
+ * stored without its display prefix exactly as `remote_dispose_key` is, and
+ * is absent (empty, no cleartext-deploy acceptance) from a policy that never
+ * names it -- `test_remote_dispose_key_and_kinds_parse_a_complete_policy` and
+ * `test_remote_dispose_is_absent_by_default`'s own two shapes, combined into
+ * one test for the one field. */
+static void test_remote_deploy_key_parses_and_is_absent_by_default(void) {
+    atlas_gwpolicy absent;
+    parse_policy(GOOD, &absent);
+    T_REQUIRE(absent.state == ATLAS_GWPOLICY_ENABLED);
+    T_CHECK_MSG(absent.remote_deploy_key[0] == '\0', "an absent policy named a deploy key");
+    T_CHECK(!absent.cleartext_deploy_accepted);
+
+    atlas_gwpolicy p;
+    parse_policy("enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\ntls_mode = REVERSE_PROXY\n"
+                 "remote_deploy_key = key_581e0a805cc1febe\n",
+                 &p);
+    T_REQUIRE_MSG(p.state == ATLAS_GWPOLICY_ENABLED, "a complete deploy policy was refused: %s",
+                 atlas_gwpolicy_reason_name(p.reason));
+    T_CHECK_MSG(strcmp(p.remote_deploy_key, "581e0a805cc1febe") == 0,
+                "remote_deploy_key was stored as \"%s\", not without its \"key_\" prefix",
+                p.remote_deploy_key);
+    T_CHECK(!p.cleartext_deploy_accepted);
+
+    atlas_gwpolicy p2;
+    parse_policy("enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\ntls_mode = NONE\n"
+                 "remote_deploy_key = key_581e0a805cc1febe\n"
+                 "operator_accepts_cleartext_deploy = yes\n",
+                 &p2);
+    T_REQUIRE_MSG(p2.state == ATLAS_GWPOLICY_ENABLED,
+                 "tls_mode = NONE with cleartext-deploy acceptance was refused: %s",
+                 atlas_gwpolicy_reason_name(p2.reason));
+    T_CHECK(p2.cleartext_deploy_accepted);
 }
 
 /* A16, amended 2026-09-04. The operator's written acceptance of a cleartext
@@ -943,6 +1017,85 @@ static void test_gateway_status_prints_submit_and_clear_submit(void) {
                 "remote_submit_keys was \"%s\" for a policy with no submit keys",
                 atlas_buf_cstr(&keys_off));
     atlas_buf_free(&keys_off);
+    atlas_buf_free(&json_off);
+}
+
+/* A17 T3. `gateway status`'s `deploy:`/`clear-deploy:` lines and
+ * the `remote_deploy_key`/`cleartext_deploy_accepted` JSON keys, mirroring
+ * `test_gateway_status_prints_dispose_and_clear` and
+ * `test_gateway_status_prints_submit_and_clear_submit` above. */
+static void test_gateway_status_prints_deploy_and_clear_deploy(void) {
+    atlas_gwpolicy accepted;
+    parse_policy("enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\ntls_mode = NONE\n"
+                 "remote_deploy_key = key_581e0a805cc1febe\n"
+                 "operator_accepts_cleartext_deploy = yes\n",
+                 &accepted);
+    T_REQUIRE(accepted.state == ATLAS_GWPOLICY_ENABLED);
+
+    atlas_buf human = ATLAS_BUF_INIT;
+    render_status(false, &accepted, &human);
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&human), "deploy:  key_581e0a805cc1febe") != NULL,
+                "the human form did not print the deploy line: %s", atlas_buf_cstr(&human));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&human), "clear-deploy: ACCEPTED") != NULL,
+                "the human form did not print the accepted clear-deploy line: %s",
+                atlas_buf_cstr(&human));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&human), "operator_accepts_cleartext_deploy = yes") != NULL,
+                "the accepted clear-deploy line did not quote the policy key: %s",
+                atlas_buf_cstr(&human));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&human),
+                       "a captured deploy credential installs code that runs as root on this "
+                       "machine") != NULL,
+                "the accepted clear-deploy line did not state the weakness sentence: %s",
+                atlas_buf_cstr(&human));
+    atlas_buf_free(&human);
+
+    atlas_buf j = ATLAS_BUF_INIT;
+    render_status(true, &accepted, &j);
+    size_t bad = 0;
+    T_CHECK_MSG(tjson_valid(atlas_buf_cstr(&j), j.len, &bad), "status --json is not valid JSON at %zu",
+                bad);
+    atlas_buf key = ATLAS_BUF_INIT;
+    T_CHECK(tjson_get_string(atlas_buf_cstr(&j), j.len, "remote_deploy_key", &key));
+    T_CHECK_MSG(strcmp(atlas_buf_cstr(&key), "581e0a805cc1febe") == 0,
+                "remote_deploy_key in JSON was \"%s\"", atlas_buf_cstr(&key));
+    atlas_buf_free(&key);
+    atlas_buf accept_raw = ATLAS_BUF_INIT;
+    T_CHECK(tjson_get_raw(atlas_buf_cstr(&j), j.len, "cleartext_deploy_accepted", &accept_raw));
+    T_CHECK_MSG(strcmp(atlas_buf_cstr(&accept_raw), "true") == 0,
+                "cleartext_deploy_accepted in JSON was \"%s\"", atlas_buf_cstr(&accept_raw));
+    atlas_buf_free(&accept_raw);
+    atlas_buf_free(&j);
+
+    /* Not accepted, and no deploy key at all: the "(none ...)" and
+     * "(not accepted ...)" wording, in both forms. */
+    atlas_gwpolicy off;
+    parse_policy(GOOD, &off);
+    T_REQUIRE(off.state == ATLAS_GWPOLICY_ENABLED);
+
+    atlas_buf human_off = ATLAS_BUF_INIT;
+    render_status(false, &off, &human_off);
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&human_off), "deploy:  (none") != NULL,
+                "the human form did not print the disabled deploy line: %s",
+                atlas_buf_cstr(&human_off));
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&human_off), "clear-deploy: (not accepted") != NULL,
+                "the human form did not print the not-accepted clear-deploy line: %s",
+                atlas_buf_cstr(&human_off));
+    atlas_buf_free(&human_off);
+
+    atlas_buf json_off = ATLAS_BUF_INIT;
+    render_status(true, &off, &json_off);
+    atlas_buf key_off = ATLAS_BUF_INIT;
+    T_CHECK(tjson_get_string(atlas_buf_cstr(&json_off), json_off.len, "remote_deploy_key", &key_off));
+    T_CHECK_MSG(atlas_buf_cstr(&key_off)[0] == '\0', "an off policy named a deploy key in JSON: \"%s\"",
+                atlas_buf_cstr(&key_off));
+    atlas_buf_free(&key_off);
+    atlas_buf accept_off = ATLAS_BUF_INIT;
+    T_CHECK(tjson_get_raw(atlas_buf_cstr(&json_off), json_off.len, "cleartext_deploy_accepted",
+                         &accept_off));
+    T_CHECK_MSG(strcmp(atlas_buf_cstr(&accept_off), "false") == 0,
+                "cleartext_deploy_accepted in JSON was \"%s\" for an off policy",
+                atlas_buf_cstr(&accept_off));
+    atlas_buf_free(&accept_off);
     atlas_buf_free(&json_off);
 }
 
@@ -1406,7 +1559,17 @@ static void test_every_write_route_is_a_disposal_on_the_reviewed_allowlist(void)
      * POST routes, not because it writes: it writes no row, starts no process
      * and applies nothing. What puts it here is that it carries a credential in
      * a body, and the property this test enforces -- an ungrantable scope, no
-     * operator method, a bounded body -- is exactly the one it must satisfy. */
+     * operator method, a bounded body -- is exactly the one it must satisfy.
+     *
+     * A17 T3 adds the six `deploy.remote_*` names on the same terms:
+     * `deploy.remote_get` and `deploy.remote_list` read (like
+     * `job.remote_result` above) but still belong here, because their scope
+     * check (`route_scope_granted`, `src/gw/gateway.c`) accepts either
+     * `jobs:submit` (their row's primary scope, asserted below) or
+     * `deploys:confirm` (their alternate, `API_WRITE_ROUTE_ALTS[]`, exposed
+     * on this view as `alt_scope` and asserted below by property) -- the
+     * alternate is also exercised at the HTTP level, positively and
+     * negatively, in `tests/test_gw_deploy.c`. */
     static const char *const WRITE_METHODS[] = {
         "decision.remote_challenge",
         "decision.remote_dispose",
@@ -1415,6 +1578,12 @@ static void test_every_write_route_is_a_disposal_on_the_reviewed_allowlist(void)
         "job.remote_result",
         "job.remote_list",
         "job.remote_cancel",
+        "deploy.remote_propose",
+        "deploy.remote_get",
+        "deploy.remote_list",
+        "deploy.remote_cancel",
+        "deploy.remote_challenge",
+        "deploy.remote_confirm",
     };
 
     size_t route_count = 0;
@@ -1436,13 +1605,30 @@ static void test_every_write_route_is_a_disposal_on_the_reviewed_allowlist(void)
                     r->path, r->method);
 
         T_CHECK_MSG(r->scope == ATLAS_SCOPE_DECISIONS_DISPOSE ||
-                    r->scope == ATLAS_SCOPE_JOBS_SUBMIT,
-                    "write route %s's scope is neither decisions:dispose nor jobs:submit",
+                    r->scope == ATLAS_SCOPE_JOBS_SUBMIT ||
+                    r->scope == ATLAS_SCOPE_DEPLOYS_CONFIRM,
+                    "write route %s's scope is none of decisions:dispose, jobs:submit or "
+                    "deploys:confirm",
                     r->path);
         T_CHECK_MSG(!atlas_apikey_scope_grantable(r->scope),
                     "write route %s's scope is grantable to an ordinary credential", r->path);
         T_CHECK_MSG(r->body_max != 0,
                     "write route %s has a zero body_max", r->path);
+
+        /* T3. Every row's alternate is either absent (`ATLAS_SCOPE_UNKNOWN`,
+         * every row but the two dual-scope ones) or one of the same three
+         * write scopes above, and just as ungrantable as the primary --
+         * `API_WRITE_ROUTE_ALTS[]` is a second source of truth this loop
+         * walks by value rather than trusting by construction. */
+        T_CHECK_MSG(r->alt_scope == ATLAS_SCOPE_UNKNOWN ||
+                    r->alt_scope == ATLAS_SCOPE_DECISIONS_DISPOSE ||
+                    r->alt_scope == ATLAS_SCOPE_JOBS_SUBMIT ||
+                    r->alt_scope == ATLAS_SCOPE_DEPLOYS_CONFIRM,
+                    "write route %s's alt_scope is none of absent, decisions:dispose, "
+                    "jobs:submit or deploys:confirm",
+                    r->path);
+        T_CHECK_MSG(r->alt_scope == ATLAS_SCOPE_UNKNOWN || !atlas_apikey_scope_grantable(r->alt_scope),
+                    "write route %s's alt_scope is grantable to an ordinary credential", r->path);
 
         for (size_t j = 0; j < sizeof READ_METHODS / sizeof READ_METHODS[0]; j++) {
             T_CHECK_MSG(strcmp(r->method, READ_METHODS[j]) != 0,
@@ -1458,6 +1644,29 @@ static void test_every_write_route_is_a_disposal_on_the_reviewed_allowlist(void)
                     GATEWAY_AUDIT);
     }
 
+    /* T3. `API_WRITE_ROUTE_ALTS[]` is a second source of truth: nothing
+     * checks, at compile time, that every path it names still exists in
+     * `API_WRITE_ROUTES[]`. Counted here instead -- how many rows this view
+     * reports a non-UNKNOWN `alt_scope` for must equal the alt table's own
+     * row count. A path renamed in one table and not the other leaves an
+     * orphaned alt entry that matches no row, so its row's `alt_scope` stays
+     * `ATLAS_SCOPE_UNKNOWN` and the count on the left falls below the count
+     * on the right -- which is exactly the failure this exists to catch. */
+    {
+        size_t alt_rows = 0;
+        for (size_t i = 0; i < route_count; i++) {
+            if (routes[i].alt_scope != ATLAS_SCOPE_UNKNOWN) {
+                alt_rows++;
+            }
+        }
+        size_t alt_table_rows = atlas_gateway_api_write_route_alt_count();
+        T_CHECK_MSG(alt_rows == alt_table_rows,
+                    "%zu write routes carry a non-UNKNOWN alt_scope but the alt table has %zu "
+                    "rows -- an alt entry names no route, or a route's alt_scope was not "
+                    "populated",
+                    alt_rows, alt_table_rows);
+    }
+
     /* The existing read-table test still passes unchanged (it is not touched
      * by this test at all), and no read row gained a write scope or a non-zero
      * body_max while this table was added beside it. */
@@ -1466,11 +1675,88 @@ static void test_every_write_route_is_a_disposal_on_the_reviewed_allowlist(void)
     T_REQUIRE(read_routes != NULL);
     for (size_t i = 0; i < read_count; i++) {
         T_CHECK_MSG(read_routes[i].scope != ATLAS_SCOPE_DECISIONS_DISPOSE &&
-                    read_routes[i].scope != ATLAS_SCOPE_JOBS_SUBMIT,
+                    read_routes[i].scope != ATLAS_SCOPE_JOBS_SUBMIT &&
+                    read_routes[i].scope != ATLAS_SCOPE_DEPLOYS_CONFIRM,
                     "read route %s carries a write scope", read_routes[i].path);
         T_CHECK_MSG(read_routes[i].body_max == 0,
                     "read route %s has a non-zero body_max", read_routes[i].path);
     }
+}
+
+/* A17 T3. The Deploys panel's served-page bytes: the weakness
+ * sentence, the eight-hex confirmation input, and `credentials: "omit"` for
+ * the deploy-key fetch -- the same page-grep shape
+ * `test_mission_control_carries_the_disposal_panel`
+ * (`tests/test_gw_remote.c`) uses, but needs no live daemon here: `GET /`
+ * never reaches the socket (`atlas_gateway_open` only stores the policy and a
+ * socket path; the page itself is compiled into the binary and served
+ * without a daemon round trip), so this is a pure unit test against an
+ * unopened, nonexistent socket path.
+ *
+ * No approval verb may reach an MCP tool name -- A15's own scanner
+ * (`tests/test_decision_mcp.c`'s `test_the_tool_inventory_has_no_approval_verb`)
+ * already asserts that over `atlas_mcp_tool_names()`, the process' own list,
+ * not this page; T3 adds no MCP tool at all (D.2: "Challenge/confirm için
+ * araç yok"), so that scanner is unaffected by this season and is not
+ * duplicated here. What this test adds is the page-specific property: the
+ * confirm dialog calls a *route* (`deploy/confirm`), never a tool. */
+static void test_mission_control_serves_the_deploy_panel_bytes(void) {
+    atlas_gwpolicy p;
+    parse_policy(GOOD, &p);
+    T_REQUIRE(p.state == ATLAS_GWPOLICY_ENABLED);
+
+    atlas_gateway_opts o;
+    memset(&o, 0, sizeof o);
+    o.socket_path = "/nonexistent/atlas-test-gateway.sock";
+    o.timeout_ms = 1000;
+    atlas_gateway *g = NULL;
+    atlas_err err;
+    atlas_err_init(&err);
+    T_REQUIRE(atlas_gateway_open(&p, &o, &g, &err) == ATLAS_OK);
+
+    static const char REQ[] = "GET / HTTP/1.1\r\nHost: 127.0.0.1:8787\r\n\r\n";
+    atlas_buf resp = ATLAS_BUF_INIT;
+    atlas_err serr;
+    atlas_err_init(&serr);
+    T_REQUIRE(atlas_gateway_serve_bytes(g, REQ, sizeof REQ - 1u, &resp, &serr) == ATLAS_OK);
+    const char *head_end = strstr(atlas_buf_cstr(&resp), "\r\n\r\n");
+    T_REQUIRE_MSG(head_end != NULL, "the response carried no head/body separator");
+    const char *page = head_end + 4;
+
+    static const char *const BOUND[] = {
+        /* The VIEWS entry, byte-for-byte, and the storage variable. */
+        "[\"deploys\",\"Deploys\"]",
+        "deployKey",
+        /* The routes the panel drives through apiWrite. */
+        "deploy/list",
+        "deploy/get",
+        "deploy/challenge",
+        "deploy/confirm",
+        /* The two /auth/me fields the panel reads on every start(). */
+        "remote_deploy",
+        "cleartext_deploy",
+        /* The panel's own call site, not a bound A16's disposal dialog
+           already serves (`credentials: "omit"` and `maxlength="8"` are both
+           on that page too, so grepping either proves nothing panel-specific
+           -- this call and this input's id exist only in `renderDeployConfirmPrompt`). */
+        "apiWrite(\"deploy/confirm\"",
+        /* The eight-hex confirmation field's own id, distinct from the
+           disposal dialog's identically-shaped one -- the JS source assigns
+           it with `confirmInput.id = "dp-confirm-prefix"`, so the served
+           bytes carry the string literal rather than an HTML attribute. */
+        "dp-confirm-prefix",
+        /* The channel's weakness, stated at the point the key is used --
+           D.2's exact wording, checked verbatim. */
+        "installs code that runs as root on this machine",
+        "captured deploy credential can do the same",
+    };
+    for (size_t i = 0; i < sizeof BOUND / sizeof BOUND[0]; i++) {
+        T_CHECK_MSG(strstr(page, BOUND[i]) != NULL, "the page carries no binding for \"%s\"",
+                    BOUND[i]);
+    }
+
+    atlas_gateway_close(g);
+    atlas_buf_free(&resp);
 }
 
 static const atlas_test TESTS[] = {
@@ -1485,6 +1771,8 @@ static const atlas_test TESTS[] = {
     {"remote_dispose_key and remote_dispose_kinds parse a complete policy",
      test_remote_dispose_key_and_kinds_parse_a_complete_policy},
     {"remote disposal is absent by default", test_remote_dispose_is_absent_by_default},
+    {"remote_deploy_key parses and is absent by default",
+     test_remote_deploy_key_parses_and_is_absent_by_default},
     {"the cleartext disposal acceptance", test_the_cleartext_disposal_acceptance},
     {"remote submit keys parse a complete policy",
      test_remote_submit_keys_parse_a_complete_policy},
@@ -1495,6 +1783,8 @@ static const atlas_test TESTS[] = {
     {"gateway status prints dispose and clear", test_gateway_status_prints_dispose_and_clear},
     {"gateway status prints submit and clear-submit",
      test_gateway_status_prints_submit_and_clear_submit},
+    {"gateway status prints deploy and clear-deploy",
+     test_gateway_status_prints_deploy_and_clear_deploy},
     {"a policy that says no is not malformed", test_a_policy_that_says_no_is_not_malformed},
     {"a wider bind needs a written TLS stance", test_a_wider_bind_needs_a_written_tls_stance},
     {"an origin must match whole", test_an_origin_must_match_whole},
@@ -1512,6 +1802,8 @@ static const atlas_test TESTS[] = {
      test_every_api_route_forwards_to_a_read_on_the_reviewed_allowlist},
     {"every write route is a disposal on the reviewed allowlist",
      test_every_write_route_is_a_disposal_on_the_reviewed_allowlist},
+    {"mission control serves the deploy panel bytes",
+     test_mission_control_serves_the_deploy_panel_bytes},
 };
 
 ATLAS_TEST_MAIN("gateway", TESTS)

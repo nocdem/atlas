@@ -574,6 +574,60 @@ accepted this chain on 2026-09-04 by writing `operator_accepts_cleartext_submiss
 = yes` into the root-owned gateway policy. Full argument and the operator's words:
 `docs/remote-submission.md`.
 
+## A17: remote deploy
+
+A14R gave a remote session three read-only artifacts once a job finished and
+stopped there: nothing let that session make `changes.patch` real. A17 adds a
+second, distinct credential that confirms applying it — never the credential
+that proposed the job — and a root-owned agent outside Atlas' own process
+that does the applying, building, testing, installing and restarting.
+
+**Six methods**, offered to the gateway uid only when
+`atlas_server_remote_deploy_policy_ready` holds (`src/ipc/server_deploy_remote.c`):
+
+```
+deploy.remote_propose    job                              (submit credential)
+deploy.remote_get        deploy                           (submit or deploy credential)
+deploy.remote_list       cursor?                          (submit or deploy credential)
+deploy.remote_cancel     deploy                           (proposing submit credential)
+deploy.remote_challenge  deploy                           (deploy credential)
+deploy.remote_confirm    deploy, challenge, confirmation  (deploy credential)
+```
+
+**The design fixes six matching routes**,
+`/api/v1/deploy/{propose,get,list,cancel,challenge,confirm}`, and a `deploy:`
+status line; both are not yet present in `API_WRITE_ROUTES[]` or `atlas
+gateway status` on this tree — `docs/remote-deploy.md` states plainly what is
+and is not landed.
+
+**Four MCP tools**, `atlas_deploy_propose`, `atlas_deploy_status`,
+`atlas_deploy_list`, `atlas_deploy_cancel` — `remote_only = true`, absent from
+the stdio adapter, carrying `ATLAS_SCOPE_JOBS_SUBMIT`. **There is no tool for
+challenge or confirm**, mirroring A16's own choice to keep disposal
+confirmation off MCP: applying a credential to install root code stays in the
+browser.
+
+**The derived scope.** `deploys:confirm` (`ATLAS_SCOPE_DEPLOYS_CONFIRM`) is in
+`SCOPES[]` with `grantable = false`. `remote_deploy_key` may never name the
+same credential as `remote_submit_key` or `remote_dispose_key` — one
+credential, one power, the same argument A16 and A14 made for their own pair,
+extended to a third.
+
+**The third acceptance key.** `operator_accepts_cleartext_deploy` is distinct
+from both `operator_accepts_cleartext_submission` and
+`operator_accepts_cleartext_disposal`: a captured deploy credential installs
+code that runs as root, unbounded by anything Atlas checks, which is a
+materially larger cost than queuing a bounded worker or disposing of one
+record, and neither existing acceptance implies it.
+
+**The honest paragraph.** The applied bytes are Atlas' own stored
+`changes.patch`, never a request field; the tree, owner, build, test, install
+and restart commands live in root-owned `/etc/atlas/deploy.conf`, which
+neither the daemon nor the gateway ever opens; and the process that runs as
+root is an operator-installed agent, never Atlas itself. Full argument,
+the state machine, the queue-file formats and the agent's stage-by-stage
+contract: `docs/remote-deploy.md`.
+
 ## Audit
 
 Every request through the gateway is recorded in `gw_audit`: when, which

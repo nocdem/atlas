@@ -426,8 +426,20 @@ static void test_documented_tool_names_are_plugin_scoped_correctly(void) {
      * `ATLAS_SCOPE_JOBS_SUBMIT`, and — unlike the two write tools beside it —
      * `writes = false`, so it publishes `readOnlyHint: true`. It reads what a
      * finished job produced and applies, commits and approves nothing, which
-     * is why it does not lengthen the absent list above. */
-    T_CHECK_MSG(n == 42, "expected 42 tools, found %zu", n);
+     * is why it does not lengthen the absent list above.
+     *
+     * T4 (remote deploy) added four more, on the same terms again:
+     * `atlas_deploy_propose`, `atlas_deploy_status`, `atlas_deploy_list`,
+     * `atlas_deploy_cancel` — remote-only, `ATLAS_SCOPE_JOBS_SUBMIT` (the daemon
+     * accepts either the submit or the deploy identity for status and list, but
+     * a tool has one scope field for visibility, and `ATLAS_SCOPE_DEPLOYS_CONFIRM`
+     * is a different credential's, never derived for an MCP session). No fifth
+     * tool exists for `deploy.remote_challenge` or `deploy.remote_confirm`, and
+     * none may: disposing of a proposed deploy is the operator's own decision,
+     * taken through `remote_deploy_key` and a dedicated route, never an MCP
+     * call. The two write tools (`atlas_deploy_propose` and
+     * `atlas_deploy_cancel`) extend the same invariant the A14 pair does. */
+    T_CHECK_MSG(n == 46, "expected 46 tools, found %zu", n);
 }
 
 /* --- the integration record ----------------------------------------------

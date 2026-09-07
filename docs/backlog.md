@@ -2459,6 +2459,14 @@ a hotfix, because the fix touches the dispatch path for every tool and the test
 surface for all 41 of them. `CLAUDE.md`'s "Adding an MCP tool" section now states
 the limitation instead of implying enforcement.
 
+**Update, A17.** The count of tools that enforce their own schema moved from
+one to five: A17's four `run_deploy_*` forwarders follow `run_job_submit`'s
+pattern and call `atlas_jsonv_check_only_keys` too, matching the brief's
+instruction to build against that precedent rather than the older tools'. The
+gap this entry describes — 41 (now 46, per `tests/test_plugin.c`'s tool
+count) other tools still publishing a claim the adapter does not check — is
+otherwise unchanged; the contained fix above still applies to all of them.
+
 ## `rotate_dispose_reminder` in `src/cli/render_json.c` is now a misnomer (2026-09-04)
 
 Found during A14's documentation pass.
@@ -2508,3 +2516,74 @@ the test suite is not modified to hide a real finding.
 
 `trust_forwarded_for` is parsed and inert; a per-peer limit behind a proxy needs
 a reader of the forwarded address and a per-peer table, neither of which exists.
+
+## A17 has no restart-only verb (2026-09-07)
+
+A17's design explicitly considered and dropped a deploy that only restarts
+the named units, without applying a patch first — useful for the ordinary
+case of picking up a config change or clearing a stuck process with no code
+change involved. It was not added: it would be a separate verb from
+"propose a patch, confirm, apply" (a `deploy.remote_restart_only` method or
+an optional flag on `deploy.remote_confirm` that skips `APPLY`/`APPLY_CHECK`),
+and the six methods this season names are already the fixed set
+`tests/test_orch_rpc.c` scans the forbidden names against and
+`tests/test_mcp.c` counts the four MCP tools against. Today an operator who
+wants only a restart, with no patch
+involved, has no route through this season's surface at all and must do it
+by hand, exactly as before A17. The contained addition, if ever wanted: a
+`restart_only` boolean on `deploy.remote_propose` (refused unless no job is
+named, or refused when the named job's patch is empty) that causes the agent
+to skip straight to `RESTART` — a small addition to the request grammar and
+to the agent's stage sequencing, not a new verb, so it does not reopen the
+"no method applies, installs or restarts on its own name" property this
+season otherwise holds.
+
+## The HEAD ≠ tree accumulation persists until commit-after-deploy is decided (2026-09-07)
+
+A worker's snapshot is taken at `HEAD`, and `changes.patch` is a diff against
+that `HEAD`, not against the working tree at the moment a deploy is
+confirmed. The agent applies the patch and deliberately does not commit —
+a rule as firm as the prohibition on `reset`, `checkout` or `clean` on a
+target repository, because committing on the operator's behalf is a decision
+about their own history. The consequence accumulates: after one deploy, the
+tree carries uncommitted changes `HEAD` does not know about; a second
+worker's snapshot is still taken at that same, unmoved `HEAD`, so its patch
+is built against a tree state the first deploy already left behind, and the
+second patch can duplicate the first deploy's hunks or conflict with them.
+`git apply --check` at the agent's `APPLY_CHECK` stage is what decides which,
+honestly, before anything is touched — never a silent corruption — but a
+repeated pattern of "propose, confirm, apply, do not commit" makes every
+deploy after the first more likely to be refused there. This is not
+hypothetical for this tree: `docs/plans/2026-09-07-remote-deploy.md`'s own
+reversal argument counted the working tree at 28 files of uncommitted A14R-
+and-later work on the day it was written, and that count only grows while
+several tasks land at once. Whichever count is current, the first real
+deploy touching any file already modified underneath it is refused at
+`APPLY_CHECK` before anything runs. `docs/remote-deploy.md`'s §Open operator
+decisions item 1 names the two live options — the operator commits by hand
+after every deploy, or the agent commits under an explicit, written
+`commit_after_deploy = yes` conf key with a fixed message template touching
+only the files the patch touched — and states plainly that neither is
+decided and the second is not built in this season.
+
+## Why `git apply --3way` is not used anywhere in the deploy agent (2026-09-07)
+
+`deploy/a17/atlas-deploy-agent.sh`'s `APPLY_CHECK` and `APPLY` stages use
+`git apply --check` and plain `git apply`, never `git apply --3way`. Plain
+`apply` either succeeds cleanly against the tree as it stands or fails
+cleanly, touching nothing on failure — which is exactly what `APPLY_CHECK`
+needs to decide, honestly, before `APPLY` runs for real. `--3way` behaves
+differently on purpose: when a hunk does not apply cleanly against the
+working tree, it falls back to a three-way merge using the blob information
+recorded in the patch itself, and when that merge produces conflicts it
+writes ordinary `<<<<<<<`/`=======`/`>>>>>>>` conflict markers directly into
+the tracked files — the same thing an interactive `git merge` conflict looks
+like. That is a mark left in the operator's own working tree, unasked for,
+by an unattended agent: a state the agent's own rollback (`git apply -R` on
+the same patch) was never written to reverse, because `-R` reverses a patch
+that applied, not a three-way merge's conflict output. Using `--3way`
+anywhere in this agent would mean a failed `APPLY_CHECK` — the case
+`APPLY_CHECK` exists to catch harmlessly — could instead leave the tree in a
+half-merged state indistinguishable from a human's own abandoned conflict
+resolution, which is precisely the kind of mark on the operator's tree this
+season's own design brief ruled out by name.

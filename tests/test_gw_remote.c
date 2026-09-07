@@ -388,10 +388,14 @@ static void test_no_credential_can_reach_a_write_tool(void) {
     /* A14: the four job tools carry ATLAS_SCOPE_JOBS_SUBMIT, not MEMORY_WRITE.
      * Even the most powerful grantable credential does not carry JOBS_SUBMIT
      * (it is derived by the daemon for named keys only), so every call refuses
-     * with the "jobs:submit" scope sentence. */
+     * with the "jobs:submit" scope sentence.
+     *
+     * A17 T4 added four more `ATLAS_SCOPE_JOBS_SUBMIT` tools, on the
+     * same terms as `JOB_TOOLS[]` above. */
     static const char *const SUBMIT_WRITES[] = {
         "atlas_job_submit", "atlas_job_status", "atlas_job_list", "atlas_job_cancel",
         "atlas_job_result",
+        "atlas_deploy_propose", "atlas_deploy_status", "atlas_deploy_list", "atlas_deploy_cancel",
     };
     for (size_t i = 0; i < sizeof SUBMIT_WRITES / sizeof SUBMIT_WRITES[0]; i++) {
         char msg[512];
@@ -454,10 +458,21 @@ static void test_no_credential_can_reach_a_write_tool(void) {
 
     /* A14. The four remote-only job tools carry ATLAS_SCOPE_JOBS_SUBMIT, which
      * is not grantable through `atlas api-key create`. A credential holding
-     * every grantable scope finds it unset and gets the scope sentence. */
+     * every grantable scope finds it unset and gets the scope sentence.
+     *
+     * A17 T4 added four more on the same terms --
+     * `atlas_deploy_propose`, `atlas_deploy_status`, `atlas_deploy_list`,
+     * `atlas_deploy_cancel` -- all `ATLAS_SCOPE_JOBS_SUBMIT` (T4's own
+     * report: the daemon accepts either the submit or the deploy identity for
+     * status and list, but a tool has one scope field for visibility, and
+     * `ATLAS_SCOPE_DEPLOYS_CONFIRM` is a different credential's, never
+     * derived for an MCP session). T4's report flagged this array by name as
+     * the coverage gap for whichever task extended this file. */
     static const char *const JOB_TOOLS[] = {"atlas_job_submit", "atlas_job_status",
                                              "atlas_job_list", "atlas_job_cancel",
-                                             "atlas_job_result"};
+                                             "atlas_job_result",
+                                             "atlas_deploy_propose", "atlas_deploy_status",
+                                             "atlas_deploy_list", "atlas_deploy_cancel"};
     for (size_t i = 0; i < sizeof JOB_TOOLS / sizeof JOB_TOOLS[0]; i++) {
         char msg[512];
         (void)snprintf(msg, sizeof msg,

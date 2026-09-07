@@ -265,6 +265,18 @@ td.same{color:transparent}
   <section id="v-jobs" hidden>
     <div id="j-panel"></div>
   </section>
+
+  <!-- A17 T3. The Deploys panel: a list of proposed and confirmed
+       deploys, a detail pane, and the browser confirmation dialog -- the
+       deploy credential typed into this tab, the first eight hex of the
+       patch digest, and the channel's weakness stated on screen, mirroring
+       A16's disposal panel above (`renderDisposeConfirm`). Nothing here
+       proposes or cancels a deploy: those need the submission key and stay
+       on the terminal-driven flow this season's plan describes; this panel
+       reads every deploy and confirms one. -->
+  <section id="v-deploys" hidden>
+    <div id="dp-panel"></div>
+  </section>
 </main>
 </div>
 
@@ -289,6 +301,7 @@ const VIEWS = [
   ["verification","Verification"],
   ["graph","Graph"],["search","Search"],["impact","Impact"],["audit","Audit"],
   ["jobs","Jobs"],
+  ["deploys","Deploys"],
 ];
 
 /* A15 T7. The most links from one revision the Impact panel will walk. A
@@ -410,6 +423,42 @@ function submitKeyClear() {
   try { sessionStorage.removeItem(SUBMIT_KEY_STORAGE_KEY); } catch (e) { /* ignored */ }
 }
 
+/* A17 T3. The deploy credential the Deploys panel's confirm dialog
+ * uses, and the two `/auth/me` fields that say whether remote deploy is
+ * offered and whether it is cleartext -- `disposeKey`'s own shape (Decision
+ * 15/16, A16's answered row 3), `sessionStorage`-backed under one fixed key,
+ * surviving a reload and gone when the tab closes, never written to
+ * `localStorage`. One key for the whole panel: `deploy.remote_get` and
+ * `deploy.remote_list` also accept a submit credential, but this tab never
+ * asks for one -- it lists and reads with whichever key is present, and only
+ * the deploy credential can ever reach `challenge`/`confirm`. */
+let deployKey = "";
+let remoteDeploy = false;
+let cleartextDeploy = false;
+const DEPLOY_KEY_STORAGE_KEY = "atlas.deploy.key.v1";
+
+function deployKeyLoad() {
+  try {
+    return sessionStorage.getItem(DEPLOY_KEY_STORAGE_KEY) || "";
+  } catch (e) {
+    return "";
+  }
+}
+
+function deployKeySave(v) {
+  try {
+    sessionStorage.setItem(DEPLOY_KEY_STORAGE_KEY, v);
+  } catch (e) { /* a private window or blocked site data: still usable this load */ }
+}
+
+/* Cleared on Sign out (Decision 15, extended): a key typed while one
+ * credential was live must not carry forward to whichever principal signs in
+ * next. */
+function deployKeyClear() {
+  deployKey = "";
+  try { sessionStorage.removeItem(DEPLOY_KEY_STORAGE_KEY); } catch (e) { /* ignored */ }
+}
+
 const $ = (id) => document.getElementById(id);
 
 function el(tag, opts = {}, kids = []) {
@@ -486,7 +535,23 @@ async function apiWrite(path, fields, key) {
     throw new Error("the gateway is not reachable");
   }
   if (res.status === 401) {
-    const which = (key !== undefined) ? "the submission key" : "the disposal key";
+    /* A17 T3: a third caller of this function passes `deployKey`,
+       so "any explicit key" no longer means "the submission key" -- compared
+       against the two named globals it could be, falling back to the
+       original wording only for a key belonging to neither (there is none
+       today, but a caller passing an ad hoc key must not be told it was one
+       of these two). `key !== ""` guards the case both fields are empty
+       (nothing typed into either the submission or the deploy field): an
+       empty `key` would otherwise equal an empty `deployKey` by coincidence
+       and misreport "the deploy key" for what may be an empty submission key. */
+    let which;
+    if (key === undefined) {
+      which = "the disposal key";
+    } else if (key !== "" && key === deployKey) {
+      which = "the deploy key";
+    } else {
+      which = "the submission key";
+    }
     throw new Error(which + " was not accepted");
   }
   let body = null;
@@ -2146,11 +2211,263 @@ async function viewJobs() {
   await loadJobList();
 }
 
+/* A17 T3. Shapes reused from the challenge/confirm responses:
+ * `deploy.remote_challenge`'s `token` (`ATLAS_DEPLOY_CHALLENGE_HEX`,
+ * `include/atlas/deploy.h` -- 32 lowercase hex, the same width A16's own
+ * `RE_DISPOSE_CHALLENGE` checks) and a deploy's `patch_sha256`
+ * (`ATLAS_SHA256_HEX_LEN` -- 64, the same width `RE_DISPOSE_HASH` checks).
+ * Not reused directly: those two are decision-shaped names and a deploy uid
+ * ("d" + 32 hex, `ATLAS_DEPLOY_UID_HEX`) is not `RE_REVIEW_DECISION`'s
+ * "atlas-dec-" + 32 hex shape, so this panel gets its own three patterns. */
+const RE_DEPLOY_UID = /^d[0-9a-f]{32}$/;
+const RE_DEPLOY_CHALLENGE = /^[0-9a-f]{32}$/;
+const RE_DEPLOY_HASH = /^[0-9a-f]{64}$/;
+
+/* A16's `renderDisposeConfirm` shape, applied to a patch digest instead of a
+ * decision's content hash: what `deploy.remote_challenge` returned, the
+ * weakness sentence, and the digest-prefix field that spends it. Nothing is
+ * sent until Confirm is clicked, and a mismatch sends nothing at all --
+ * checked in this tab before `deploy/confirm` is ever called. */
+function renderDeployConfirmPrompt(box, uid, ch) {
+  clear(box);
+  if (!(typeof ch.patch_sha256 === "string" && RE_DEPLOY_HASH.test(ch.patch_sha256) &&
+        typeof ch.challenge === "string" && RE_DEPLOY_CHALLENGE.test(ch.challenge))) {
+    say(box, "the daemon's challenge does not have the shape Atlas gives one; nothing was sent",
+        "err");
+    return;
+  }
+  box.appendChild(kv([
+    ["deploy", ch.deploy],
+    ["job", ch.job],
+    ["base commit", ch.base_commit],
+    ["patch sha256", el("code", {text: ch.patch_sha256})],
+    ["patch bytes", String(ch.patch_bytes)],
+    ["expires", ch.expires_at],
+  ]));
+  box.appendChild(el("p", {text: ch.actor_means}));
+  box.appendChild(el("p", {class: "warn", text:
+    "Confirming installs code that runs as root on this machine. Over cleartext, a " +
+    "captured deploy credential can do the same."}));
+  box.appendChild(el("p", {text:
+    "Type the first 8 characters of the digest shown above to confirm. " +
+    "A mismatch spends nothing."}));
+  const confirmRow = el("div", {class: "row"});
+  /* `maxlength="8"`: the same digest-prefix width `RE_REVIEW_PREFIX` already
+     fixes elsewhere on this page. `id="dp-confirm-prefix"`: this panel's own
+     field, distinct from the disposal dialog's identical-shaped one, so a
+     test can grep for this panel specifically rather than a bound A16
+     already serves. */
+  const confirmInput = document.createElement("input");
+  confirmInput.type = "text";
+  confirmInput.id = "dp-confirm-prefix";
+  confirmInput.setAttribute("maxlength", "8");
+  confirmRow.appendChild(confirmInput);
+  const confirmBtn = el("button", {class: "go", text: "Confirm"});
+  confirmRow.appendChild(confirmBtn);
+  box.appendChild(confirmRow);
+  const outcome = el("div");
+  box.appendChild(outcome);
+  confirmBtn.onclick = async () => {
+    const typed = confirmInput.value;
+    if (!RE_REVIEW_PREFIX.test(typed) || typed !== ch.patch_sha256.slice(0, 8)) {
+      say(outcome, "that is not the confirmation for this deploy; nothing was changed", "err");
+      return;
+    }
+    if (!(RE_DEPLOY_UID.test(uid) && RE_DEPLOY_CHALLENGE.test(ch.challenge))) {
+      say(outcome, "this deploy does not have the shape Atlas gives one; nothing was sent", "err");
+      return;
+    }
+    clear(outcome);
+    say(outcome, "confirming…", "dim");
+    try {
+      const r = await apiWrite("deploy/confirm",
+        {deploy: uid, challenge: ch.challenge, confirmation: typed}, deployKey);
+      clear(outcome);
+      outcome.appendChild(kv([
+        ["state", statusTag(r.state)],
+        ["spooled", String(!!r.spooled)],
+        ["key_id", r.key_id],
+      ]));
+      outcome.appendChild(el("p", {text: r.actor_means}));
+    } catch (e) {
+      say(outcome, String((e && e.message) || e), "err");
+    }
+  };
+}
+
+/* The "Confirm this deploy" button on a PROPOSED deploy's detail pane: mints
+   a challenge, then hands the response to the prompt above. */
+function renderDeployConfirmButton(box, d) {
+  const btn = el("button", {class: "go", text: "Confirm this deploy"});
+  const out = el("div");
+  btn.onclick = async () => {
+    clear(out);
+    say(out, "requesting a challenge…", "dim");
+    try {
+      const ch = await apiWrite("deploy/challenge", {deploy: d.deploy}, deployKey);
+      renderDeployConfirmPrompt(out, d.deploy, ch);
+    } catch (e) {
+      say(out, String((e && e.message) || e), "err");
+    }
+  };
+  box.appendChild(btn);
+  box.appendChild(out);
+}
+
+/* A17 T3. The Deploys panel: a list from `deploy/list`, a detail
+ * pane from `deploy/get` (state, job, base commit, the full patch digest,
+ * patch bytes, age when CONFIRMED and unresolved, and the terminal result --
+ * stage, rollback, installed_version, text), and -- for a PROPOSED deploy --
+ * the confirmation dialog above.
+ *
+ * The deploy credential is this panel's only key: `deploy.remote_get` and
+ * `deploy.remote_list` also accept a submit credential (T2's own union
+ * check), but nothing here ever asks for one -- the deploy credential is the
+ * unscoped, operator-proxy view of every deploy (T2's own design note), which
+ * is what a review screen needs. Nothing here proposes or cancels a deploy:
+ * both need the submission key and stay on the CLI/MCP flow this season's
+ * plan describes; this panel reads every deploy and confirms one. */
+async function viewDeploys() {
+  const root = $("dp-panel");
+  if (!root) return;
+  if (!remoteDeploy) {
+    clear(root);
+    root.appendChild(el("p", {text:
+      "This gateway does not serve remote deploy: its root-owned policy names no deploy " +
+      "credential. Confirming a deploy is a browser step under one, with no other path."}));
+    return;
+  }
+
+  clear(root);
+
+  root.appendChild(el("p", {class: "lead", text:
+    "This view lists every deploy the deploy credential below can see, and reads one in " +
+    "full. Confirming installs code that runs as root on this machine. Over cleartext, a " +
+    "captured deploy credential can do the same."}));
+  if (cleartextDeploy) {
+    root.appendChild(el("p", {class: "callout", text:
+      "On this deployment the deploy key crosses the network in the clear. Anyone able to " +
+      "observe this network segment can capture it, and a captured key installs and " +
+      "restarts as root until it is revoked."}));
+  }
+
+  const keyRow = el("div", {class: "row"});
+  const keyInput = document.createElement("input");
+  keyInput.type = "password";
+  keyInput.autocomplete = "off";
+  keyInput.placeholder = "deploy key";
+  keyInput.value = deployKey;
+  keyInput.addEventListener("input", () => {
+    deployKey = keyInput.value;
+    deployKeySave(deployKey);
+  });
+  keyRow.appendChild(keyInput);
+  keyRow.appendChild(el("p", {class: "dim", text:
+    "The deploy key is remembered for this tab only and forgotten when the tab closes; it " +
+    "is never written to this browser's persistent storage."}));
+  root.appendChild(keyRow);
+
+  const listSec = el("div", {class: "panel"});
+  listSec.appendChild(el("h2", {text: "Deploys"}));
+  const listOut = el("div");
+
+  const detailSec = el("div", {class: "panel"});
+  detailSec.appendChild(el("h2", {text: "Detail"}));
+  const detailOut = el("div");
+  say(detailOut, "Select a deploy from the list.", "empty");
+  detailSec.appendChild(detailOut);
+
+  async function loadDetail(uid) {
+    clear(detailOut);
+    say(detailOut, "loading…", "dim");
+    try {
+      const d = await apiWrite("deploy/get", {deploy: uid}, deployKey);
+      clear(detailOut);
+      const pairs = [
+        ["deploy", d.deploy],
+        ["job", d.job],
+        ["state", statusTag(d.state)],
+        ["base commit", d.base_commit],
+        ["patch sha256", el("code", {text: d.patch_sha256})],
+        ["patch bytes", String(d.patch_bytes)],
+        ["created", d.created_at],
+      ];
+      if (d.age_seconds !== undefined) {
+        pairs.push(["age (s)", String(d.age_seconds)]);
+      }
+      detailOut.appendChild(kv(pairs));
+      if (d.result) {
+        detailOut.appendChild(el("h3", {text: "Result"}));
+        detailOut.appendChild(kv([
+          ["stage", d.result.stage],
+          ["rollback", d.result.rollback],
+          ["installed_version", d.result.installed_version || "—"],
+          ["text", d.result.text || "—"],
+        ]));
+      }
+      if (d.state === "PROPOSED") {
+        renderDeployConfirmButton(detailOut, d);
+      }
+    } catch (e) {
+      clear(detailOut);
+      say(detailOut, String((e && e.message) || e), "err");
+    }
+  }
+
+  async function loadDeployList() {
+    if (!deployKey) {
+      clear(listOut);
+      say(listOut, "Paste a deploy key above to see the deploys it can read.", "dim");
+      return;
+    }
+    say(listOut, "loading…", "dim");
+    try {
+      const r = await apiWrite("deploy/list", {}, deployKey);
+      const deploys = Array.isArray(r) ? r : (r.deploys || []);
+      clear(listOut);
+      if (deploys.length === 0) {
+        say(listOut, "no deploys visible to this credential", "");
+        return;
+      }
+      for (const dep of deploys) {
+        const uid = String(dep.deploy || "");
+        const row = el("div", {class: "panel"});
+        row.appendChild(kv([
+          ["deploy", uid],
+          ["job", dep.job],
+          ["state", statusTag(dep.state)],
+          ["created", dep.created_at],
+        ]));
+        const showBtn = el("button", {text: "Show"});
+        showBtn.onclick = () => loadDetail(uid);
+        row.appendChild(showBtn);
+        listOut.appendChild(row);
+      }
+    } catch (e) {
+      clear(listOut);
+      say(listOut, String((e && e.message) || e), "err");
+    }
+  }
+
+  const refreshBtn = el("button", {class: "go", text: "Refresh"});
+  refreshBtn.onclick = loadDeployList;
+  const listBody = el("div");
+  const refreshRow = el("div", {class: "row"});
+  refreshRow.appendChild(refreshBtn);
+  listBody.appendChild(refreshRow);
+  listBody.appendChild(listOut);
+  listSec.appendChild(listBody);
+  root.appendChild(listSec);
+  root.appendChild(detailSec);
+
+  await loadDeployList();
+}
+
 const LOADERS = {overview: viewOverview, repository: viewRepository, decisions: viewDecisions,
                  review: viewReview,
                  verification: viewVerification,
                  graph: viewGraph, search: viewSearch, impact: viewImpact, audit: viewAudit,
-                 jobs: viewJobs};
+                 jobs: viewJobs, deploys: viewDeploys};
 
 function show(view) {
   for (const [id] of VIEWS) {
@@ -2208,6 +2525,11 @@ async function start() {
   remoteSubmissionDriver = me.remote_submission_driver || "";
   cleartextSubmission = !!me.cleartext_submission;
   submitKey = submitKeyLoad();
+  /* A17 T3. Same rule again: never guessed, read fresh on every
+     start(). */
+  remoteDeploy = !!me.remote_deploy;
+  cleartextDeploy = !!me.cleartext_deploy;
+  deployKey = deployKeyLoad();
   $("login").hidden = true;
   $("app").hidden = false;
   /* An anonymous principal is a real thing an operator's policy granted, not
@@ -2235,6 +2557,7 @@ async function start() {
       try { await fetch("/auth/logout", {method: "POST", credentials: "same-origin"}); } catch (e) {}
       disposeKeyClear();
       submitKeyClear();
+      deployKeyClear();
       /* Re-running start() rather than jumping straight to showLogin() is
          what makes the comment above true: with an anonymous floor
          configured, /auth/me answers 200 again right away and this lands back

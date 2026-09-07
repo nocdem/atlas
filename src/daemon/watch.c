@@ -41,6 +41,7 @@
 #include <unistd.h>
 
 #include "atlas/atlas.h"
+#include "atlas/deploy_spool.h"
 #include "atlas/git.h"
 #include "atlas/ipc.h"
 #include "atlas/memory.h"
@@ -613,6 +614,8 @@ struct atlas_watcher {
     int64_t last_discovery_sweep_ms;
     /* A12.1. When the memory reconciliation sweep last ran. */
     int64_t last_memory_sweep_ms;
+    /* A17 T2. When the "is results/ non-empty?" derivation last ran. */
+    int64_t last_deploy_ingest_ms;
 
     /* P0. The resolved watch budget, and the arithmetic behind it.
      *
@@ -3233,6 +3236,31 @@ static void memory_sweep(atlas_watcher *w) {
     atlas_memory_sweep_for(w->db, w->writer, &pol);
 }
 
+/* A17 T2. A pure derivation, not a database read: "is
+ * `<data-dir>/deploy/results` non-empty?" -- one bounded `opendir`/`readdir`/
+ * `closedir`, throttled by `ATLAS_DEPLOY_INGEST_SWEEP_INTERVAL_MS` so a
+ * repository-free daemon does not spin this every poll iteration. Queues
+ * `ATLAS_JOB_DEPLOY_INGEST` only when the derivation says yes; a failure to
+ * queue (the writer is busy with something unbounded) means the next tick
+ * tries again, `discovery_sweep`'s own backpressure. */
+static void deploy_ingest_sweep(atlas_watcher *w) {
+    int64_t t = now_ms();
+    if (w->last_deploy_ingest_ms != 0 &&
+        t - w->last_deploy_ingest_ms < ATLAS_DEPLOY_INGEST_SWEEP_INTERVAL_MS) {
+        return;
+    }
+    w->last_deploy_ingest_ms = t;
+    if (w->writer == NULL || w->data_dir.len == 0) {
+        return;
+    }
+    if (!atlas_deploy_spool_results_pending(atlas_buf_cstr(&w->data_dir))) {
+        return;
+    }
+    atlas_err err;
+    atlas_err_init(&err);
+    (void)atlas_writer_submit_deploy_ingest(w->writer, &err);
+}
+
 static void submit_due(atlas_watcher *w) {
     int64_t t = now_ms();
     expire_moves(w, t);
@@ -3452,6 +3480,7 @@ static void *watcher_main(void *arg) {
          * convergence at the next tick once reconciliation has caught up, not
          * immediacy. */
         memory_sweep(w);
+        deploy_ingest_sweep(w);
         refresh_stats(w);
     }
 

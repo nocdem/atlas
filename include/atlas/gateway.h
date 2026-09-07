@@ -116,6 +116,15 @@ typedef struct atlas_gateway_route_view {
     const char *method;    /* the daemon method it forwards to */
     atlas_apikey_scope scope;
     size_t body_max;       /* 0 for read routes; the per-row body ceiling for write routes */
+    /* A17 T3. The alternate scope this write route also accepts,
+     * beside `scope` -- `ATLAS_SCOPE_UNKNOWN` for every row but
+     * `/api/v1/deploy/get` and `/api/v1/deploy/list`, which a submit
+     * credential (the primary) or the deploy credential (the alternate) may
+     * both reach (`API_WRITE_ROUTE_ALTS[]`, `route_alt_scope`,
+     * `src/gw/gateway.c`). Exists so a test can assert a property of every
+     * row's alternate, not only exercise it end to end over HTTP; always
+     * `ATLAS_SCOPE_UNKNOWN` in the read-route view. */
+    atlas_apikey_scope alt_scope;
 } atlas_gateway_route_view;
 
 /* A read-only view of API_ROUTES[]. Exists so a test can assert a property of the
@@ -129,5 +138,15 @@ const atlas_gateway_route_view *atlas_gateway_api_routes(size_t *count_out);
  * row rather than pinning a count, and nothing in the gateway calls this
  * either. */
 const atlas_gateway_route_view *atlas_gateway_api_write_routes(size_t *count_out);
+
+/* T3. The row count of the gateway's own alternate-scope table
+ * (`API_WRITE_ROUTE_ALTS[]`, `src/gw/gateway.c`) -- exists so a test can prove
+ * every alternate names a route that actually exists, by comparing this
+ * against how many rows `atlas_gateway_api_write_routes` itself reports a
+ * non-`ATLAS_SCOPE_UNKNOWN` `alt_scope` for. An alt whose path no longer
+ * matches any row (after a rename, say) leaves that row's `alt_scope`
+ * `ATLAS_SCOPE_UNKNOWN`, so the two counts disagree -- which is what
+ * "orphaned" means here. Nothing in the gateway calls it either. */
+size_t atlas_gateway_api_write_route_alt_count(void);
 
 #endif /* ATLAS_GATEWAY_H */

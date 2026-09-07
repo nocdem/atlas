@@ -193,6 +193,12 @@ set(ATLAS_TESTS
   test_orch_rpc
   test_orch_workspace
   test_orch_driver
+  # A17 T5: the root deploy agent (deploy/a17/atlas-deploy-agent.sh), driven
+  # end to end through atlas_proc_run against a fixture git repository --
+  # never the daemon or the SQLite index, so it sits right beside the driver
+  # suite it shares an execution-boundary style with rather than in the
+  # orchestration control-plane group above it.
+  test_deploy_agent
   test_orch_snapshot
   # --- A12.0: the planned run ---
   test_plan_format
@@ -220,6 +226,16 @@ set(ATLAS_TESTS
   # shape as test_migrate31 immediately above, and for the same reason it
   # keeps the same "unit" label rather than joining test_migrate7/8/9/10.
   test_migrate32
+  # A17 T1: migration 33 against a fixture database, no daemon --
+  # the same shape as test_migrate32 immediately above, and for the same
+  # reason it keeps the same "unit" label rather than joining
+  # test_migrate7/8/9/10.
+  test_migrate33
+  # A17 T1: the deploy write point (propose, confirm, cancel,
+  # mark_spooled, finish) against a real database built through the ordinary
+  # orchestration writers -- no daemon, no socket, no process -- so it keeps
+  # the "unit" label beside test_migrate33 immediately above.
+  test_db_deploy
   # T6: reading a registered source, against a real git repository -- tracked
   # and untracked content, a directory listing, a symlink refusal. Needs git
   # and the filesystem, so it is "integration" beside test_mirror_source
@@ -343,11 +359,23 @@ set(ATLAS_TESTS
   # credential check, body bounds, /auth/me fields, and audit trail -- driven
   # against a real daemon started by atlas-gw-daemon with both policies injected.
   test_gw_submit
+  # A17 T3: the six /api/v1/deploy/* gateway routes -- propose with
+  # the submit bearer, confirm refused for the submit bearer and accepted for
+  # the deploy bearer with the correct prefix, and a route-table-outside field
+  # never reaching the socket -- driven against a real daemon started by
+  # atlas-gw-daemon with both a gateway policy (a submit key and a deploy key)
+  # and an orchestration policy injected.
+  test_gw_deploy
   # The four methods the gateway uid may call under the combined gateway +
   # orchestration policy, driven against a real daemon started by atlas-gw-daemon
   # with both policies injected.  The zeroed-policy fixture daemon is also
   # exercised to prove the group is hidden when no policy names a submit key.
   test_orch_remote_rpc
+  # A17 T2: the six deploy.remote_* methods, the queue-file spool
+  # and the root agent's .res ingest -- driven against a real daemon started
+  # by atlas-gw-daemon with both a gateway policy (naming a submit key and a
+  # deploy key) and an orchestration policy injected.
+  test_deploy_rpc
   # --- A9.1: knowledge kinds, and a lifecycle state that closes a demand ---
   #
   # The vocabulary, the kind-aware transition table, the resolve capability,
@@ -431,7 +459,8 @@ set_tests_properties(test_memory_reconcile_live PROPERTIES LABELS "daemon" TIMEO
   RUN_SERIAL TRUE)
 set_tests_properties(test_core test_safetext test_proc test_git_parse test_db test_datadir
   test_lock test_ipc test_migrate3 test_migrate_scanner_uid test_scanner_uid test_mirror test_unit
-  test_memory_source test_migrate29 test_migrate31 test_migrate32 test_memory_extract
+  test_memory_source test_migrate29 test_migrate31 test_migrate32 test_migrate33 test_db_deploy
+  test_memory_extract
   test_review_sheet
   PROPERTIES LABELS "unit")
 # The fixture suite forks children that run the binary, but needs no repository,
@@ -455,7 +484,9 @@ set_tests_properties(test_gw_dispose PROPERTIES LABELS "daemon" TIMEOUT 900 RUN_
 # A14. The remote-submit group is a live-daemon test: it forks atlas-gw-daemon
 # with both an injected gateway policy and an injected orchestration policy.
 set_tests_properties(test_gw_submit PROPERTIES LABELS "daemon" TIMEOUT 900 RUN_SERIAL TRUE)
+set_tests_properties(test_gw_deploy PROPERTIES LABELS "daemon" TIMEOUT 900 RUN_SERIAL TRUE)
 set_tests_properties(test_orch_remote_rpc PROPERTIES LABELS "daemon" TIMEOUT 900 RUN_SERIAL TRUE)
+set_tests_properties(test_deploy_rpc PROPERTIES LABELS "daemon" TIMEOUT 900 RUN_SERIAL TRUE)
 
 # A4. The content hash, the transition table and validation are pure functions —
 # bytes in, a digest or a verdict out — so this suite needs no repository, no
@@ -635,6 +666,14 @@ set_tests_properties(test_orch_workspace PROPERTIES LABELS "integration")
 # The driver suite runs real child processes to prove the execution boundary:
 # structured argv, a built environment, idle bounds and process-group kill.
 set_tests_properties(test_orch_driver PROPERTIES LABELS "integration" TIMEOUT 300)
+# A17 T5. Runs the real deploy agent script (bash) end to end through
+# atlas_proc_run against a fixture git repository -- real Makefile, real `git
+# diff`-produced patches, no daemon and no SQLite index, so "integration"
+# beside test_orch_driver rather than "daemon". It needs to know where the
+# source tree is to find the shipped script, exactly as test_orch_memory does
+# for its own scans.
+set_tests_properties(test_deploy_agent PROPERTIES LABELS "integration" TIMEOUT 300)
+target_compile_definitions(test_deploy_agent PRIVATE ATLAS_SRC_DIR="${CMAKE_SOURCE_DIR}")
 # The snapshot suite drives the daemon-side read against a fixture repository
 # and a fixture database: the worker never appears in it, which is the point.
 set_tests_properties(test_orch_snapshot PROPERTIES LABELS "integration" TIMEOUT 300)

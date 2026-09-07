@@ -1632,3 +1632,77 @@ that half-parses disables the surface it governs. Two shapes worth copying:
 `ATLAS_ORCH_MAX_COST_CENTS` (\$10,000, policy-lowerable),
 `ATLAS_GWPOLICY_SUBMIT_MAX_ACTIVE_TOTAL_CEILING` (32, policy-lowerable).
 `ATLAS_ORCH_MAX_WALL_TIMEOUT_MS` moved from one hour to three.
+
+## A17 — remote deploy, and what a new deploy stage or state costs
+
+A deploy has two separate vocabularies with two separate costs, and the first
+question when adding a member to either is which one it belongs to.
+
+### Adding a `deploys.state` or `deploy_transitions.actor` member
+
+Both columns carry a schema `CHECK`: `state IN ('PROPOSED','CONFIRMED',
+'SUCCEEDED','FAILED','CANCELLED')` and `actor IN ('REMOTE_CREDENTIAL',
+'REMOTE_OPERATOR_CONFIRMED','DEPLOY_AGENT')`, migration 33
+(`src/db/migrate.c`). Adding a member to either is a **table-rebuild
+migration** on the precedent migrations 13, 15 and 31 already set: rebuild the
+table with the widened `CHECK`, verify row preservation by a content digest
+inside the rebuild's own transaction before it commits, never merely a row
+count. Beyond the migration:
+
+1. Add the member to `atlas_deploy_state` or `atlas_deploy_actor`
+   (`include/atlas/deploy.h`), keeping `UNKNOWN = 0` first and never parseable
+   — the same "zero is not a state a deploy can be in" rule A11.0 and
+   `atlas/decision.h` already state for their own vocabularies.
+2. Update `atlas_deploy_state_name`/`_parse` or `atlas_deploy_actor_name`/`_parse`
+   (`src/db/db_deploy.c`) to agree with the new `CHECK` list exactly — a name
+   the C side accepts that the SQL side refuses (or the reverse) is a row the
+   database and the process disagree about.
+3. If the new state changes what counts as terminal, extend
+   `atlas_deploy_state_is_terminal` and re-run
+   `test_deploy_state_sql_terminal_set_matches_the_c_one`
+   (`tests/test_db_deploy.c`) — it compares `idx_deploys_one_active`'s SQL
+   predicate against the C function over the whole vocabulary,
+   `tests/test_orch_run.c`'s pattern for A11.0's own terminal set, and it is
+   the test that catches the SQL and the C vocabulary drifting apart rather
+   than a reader noticing by hand.
+
+### Adding a member to the agent's stage vocabulary
+
+`result_stage` (`deploys.result_stage`, migration 33) is `TEXT NOT NULL
+DEFAULT ''` with **no `CHECK`** — deliberately, because the agent's stage
+names are the agent's own contract (§D.4 of the season's design), not a
+closed vocabulary this storage layer enforces, and a stage name Atlas has
+never heard of is still worth recording rather than refusing outright. Adding
+one is **not a migration**. It is, instead, four places that must move
+together, none of them caught by the compiler:
+
+1. The stage list documented in `deploy/a17/atlas-deploy-agent.sh`'s own
+   header comment (`PREFLIGHT APPLY_CHECK APPLY BUILD TEST INSTALL RESTART
+   VERIFY DONE ABANDONED`) and the point in the script that writes it to the
+   `.res` file's `stage` line.
+2. The daemon's ingest parser (`src/daemon/deploy_spool.c`), if the new stage
+   needs its own handling rather than being carried through as an opaque
+   string — the parser's own reserved value is `INGEST`, written only by the
+   daemon itself when a `.res` file cannot be parsed at all, and a new agent
+   stage must never collide with it.
+3. `docs/remote-deploy.md`'s stage table and rollback matrix.
+4. Any test asserting the stage list's membership or order — `tests/
+   test_deploy_agent.c` drives the script directly and is the place a new
+   stage's behaviour is proved, the same role `tests/test_orch_driver.c` plays
+   for A11's driver.
+
+**`ABANDONED` is reserved, not extensible casually.** It is the one stage a
+human is expected to write by hand, for the one case described in
+`docs/remote-deploy.md` (a `CONFIRMED` deploy the agent will never finish).
+Adding a second hand-written stage means updating the same four places above
+plus the operator-facing instructions in §First activation of that document.
+
+### Bounds this season added
+
+`ATLAS_DEPLOY_UID_HEX` (32, matching a job uid's own budget),
+`ATLAS_DEPLOY_RESULT_TEXT_MAX` (32 KiB, the same display-bound reasoning
+`ATLAS_ORCH_RESULT_TEXT_MAX` already carries), `ATLAS_DEPLOY_CONFIRMATION_HEX`
+(8, A16's own "first eight hex" rule applied to a patch digest instead of a
+revision content hash), `ATLAS_DEPLOY_LIST_MAX` (200, A8's
+`ATLAS_ORCH_LIST_MAX` mirrored for the same "a page is never unbounded"
+reason).

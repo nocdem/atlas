@@ -156,3 +156,38 @@ onaylanıp görevleri dağıtıldığında biter. Dağıtılabilir tek görev da
 3. **Sözleşme §10 ilk meyvesini verdi:** görev bittiğinde Atlas'ta bir
    `MODEL_PROPOSAL` var. Operator makineye döndüğünde bakacağı yer sohbet değil,
    elden çıkarılabilir bir kayıt.
+
+## 2026-09-07 — Steward rolü devrediliyor
+
+Operator, Steward rolünü bu oturumdan alıp telefondaki ChatGPT'ye veriyor; Atlas
+bağlantısını o ele alacak. Bu, sözleşme §7'nin (5.2) tarif ettiği şeyin ilk kez
+gerçekleşmesi: rolü kimin doldurduğu değişiyor, rolün yetkisi değişmiyor.
+
+**Devralan neyi okumalı, sırayla.** `docs/authority-and-workflow.md` — yetkisi.
+`docs/plans/2026-09-05-role-orchestration-CONTRACT.md` — hedef, ölçülen
+kısıtlar, Operator'ın cevapları, §9'un devri ve §10'un Atlas kullanma şartı.
+`docs/plans/2026-09-05-a-channel-and-signin.md` — onaylanmış A planı. Ve bu
+günlük.
+
+**Nerede duruyoruz.** A planı `PROPOSED` ve Steward onaylı; T1 girdi ve
+`src/` altında hiçbir şey değiştirmedi; T2 iki Operator satırı bekliyor; T3
+dağıtımın kendisi ve Operator'ın makine başında olmasını istiyor; T4 cihazları;
+T5 henüz gözlenmemiş olguları. Dokuz commit push edilmedi — Operator commit
+yetkisi verdi, push vermedi.
+
+**Devralanın devralmadıkları.** §9'un devri tükendi: A planı onaylandı ve
+dağıtılabilir görevi dağıtıldı. B sezonunun planı yine Operator onayı bekler.
+Push, deploy, sezon kapanışı, gerçek model işi ve plandaki üç karar Operator'ın.
+
+**Pratik bağlantı.** Dış model Atlas'a `/mcp` üzerinden bağlanıyor;
+`chatgpt-tunnel` kimlik bilgisi hem okuma kapsamlarını hem de politikada
+adlandırılmış gönderim hakkını taşıyor, yani iş kuyruğa sokabilir. Kuyruğa
+soktuğu her iş para harcar ve günlük sınır altıdır. Gönderim bugün açık metin
+bir kanaldan geçmiyor — tünelin kimlik bilgisi bu ana kadar ağ segmentini hiç
+geçmiyor; onu geçen tarayıcı anahtarıdır ve A sezonu tam olarak bunun içindir.
+
+**Ve bir uyarı, kendi deneyimimden.** Bu oturumda Steward iki kez rol dışına
+çıktı (sözleşme §8): arayüz kodunu kendi yazdı, politika satırlarını kendi
+yazdı. İkisi de "hızlı olsun" diye oldu ve ikisi de charter'ın yasakladığı şeydi.
+Devralan aynı basınca girecek, çünkü basınç modelden değil işin kendisinden
+geliyor: bir şeyi yapmak, onu yaptıracak birini bulmaktan hep daha hızlı görünür.

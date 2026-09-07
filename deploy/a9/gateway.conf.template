@@ -145,7 +145,7 @@ session_ttl_seconds = 43200
 # is present. A key named here may not also be the remote_submit_key or the
 # remote_dispose_key: one credential, one power.
 #
-# remote_deploy_key = key_<a --no-scopes credential's own selector>
+# remote_deploy_key = key_<the selector of the key the operator signs in to Mission Control with>
 
 # THE OPERATOR'S WRITTEN ACCEPTANCE OF A CLEARTEXT DEPLOY-CONFIRMATION CHANNEL.
 # Not a feature toggle, and NOT implied by operator_accepts_cleartext_disposal

@@ -227,28 +227,14 @@ static atlas_status verify_deploy_credential(dispatch_state *ds, const atlas_ipc
         ds->db, &tok, (const char (*)[ATLAS_APIKEY_SELECTOR_HEX + 1u])allowed, allowed_count,
         key_id_out, err);
     atlas_buf_free(&tok);
-    if (st != ATLAS_OK) {
-        return st;
-    }
-    atlas_apikey_record rec;
-    memset(&rec, 0, sizeof rec);
-    bool found = false;
-    st = atlas_db_apikey_lookup(ds->db, key_id_out, &rec, &found, err);
-    if (st != ATLAS_OK) {
-        key_id_out[0] = '\0';
-        memset(&rec, 0, sizeof rec);
-        return st;
-    }
-    if (!found || rec.mask != 0u) {
-        st = atlas_err_set(err, ATLAS_ERR_INTEGRITY,
-                           "the deploy credential holds no other power, and %s holds %s",
-                           key_id_out, found ? rec.scopes : "an unresolved mask");
-        key_id_out[0] = '\0';
-        memset(&rec, 0, sizeof rec);
-        return st;
-    }
-    memset(&rec, 0, sizeof rec);
-    return ATLAS_OK;
+    /* The deploy credential MAY hold stored read scopes: it is expected to be
+     * the very key the operator signs in to Mission Control with, so that
+     * confirming a deploy costs no second credential. A14's submit rule,
+     * not A16's dispose rule; the one guarantee is the policy's, that this
+     * key is never also a submit key or the dispose key. Changed 2026-09-08
+     * after the scopeless-key requirement was measured to be one step too
+     * many for the operator. */
+    return st;
 }
 
 /* `is_deploy_credential` reports which pool the verified key actually came

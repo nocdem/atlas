@@ -56,14 +56,15 @@ capability that was refused, in four ways that each hold on their own:
   credential as both `remote_deploy_key` and any `remote_submit_key` — or as
   `remote_dispose_key` — the same "one credential, one power" argument A16
   and A14 already made for their own pair, extended to a third. The deploy
-  credential itself holds no stored scope at all, either — A16's dispose
-  rule, carried to this third credential rather than restated for it.
-  `verify_deploy_credential` (`src/ipc/server_deploy_remote.c`) reads the
-  credential's row a second time after `atlas_orch_remote_verify` proves it
-  real, and refuses a non-zero stored mask with the sentence "the deploy
-  credential holds no other power"; `gateway.auth` derives `deploys:confirm`
-  only for the one credential the policy's `remote_deploy_key` line names,
-  exactly as it derives `decisions:dispose` for A16's own dispose key. A
+  credential MAY hold stored read scopes — A14's submit rule, not A16's
+  dispose rule — because it is meant to be the very key the operator signs
+  in to Mission Control with: the sign-in remembers it for the tab as the
+  deploy credential, and confirming a deploy then costs no second paste.
+  (Until 2026-09-08 it had to be a scopeless key; that was measured to be one
+  step too many for the operator and was removed.) `gateway.auth` appends
+  `deploys:confirm` to the stored scopes of the one credential the policy's
+  `remote_deploy_key` line names, and `verify_deploy_credential`
+  (`src/ipc/server_deploy_remote.c`) checks only that identity. A
   credential minted with any ordinary read scope can never confirm a
   deploy.
 - **The process that runs as root is not Atlas.** It is
@@ -453,10 +454,12 @@ operator does once the code above is deployed, in order:
    `sudo systemctl restart atlas-gateway atlas-dispatcher atlas-scanner` and
    `systemctl --user restart atlas-model-dispatcher`. The new daemon creates
    `/var/lib/atlas/deploy/{requests,results}` on this start.
-2. **Mint the deploy credential**: `atlas api-key create --label deploy
-   --no-scopes` — not a convention but the one shape the daemon will accept:
-   `verify_deploy_credential` refuses this credential outright the moment it
-   is minted with any stored scope. The secret is shown once; it stays in
+2. **Name the deploy credential**: the key the operator already signs in to
+   Mission Control with (a read-scoped `mission-control` key) is the right
+   one — no second key is needed. If none exists, `atlas api-key create
+   --label mission-control --scope context:read --scope repo:read --scope
+   decisions:read --scope graph:read --scope impact:read --scope audit:read`.
+   The secret is shown once; it stays in
    the operator's own browser or password manager and is never handed to the
    steward.
 3. **Write the two policy lines** into `/etc/atlas/gateway.conf` (root,

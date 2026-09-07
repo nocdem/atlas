@@ -165,35 +165,34 @@ static atlas_status method_gateway_auth(dispatch_state *ds, const atlas_ipc_requ
             if (rec.mask == 0u && atlas_server_remote_disposal_policy_ready(&ds->ctx->gwpolicy) &&
                 strcmp(rec.key_id, ds->ctx->gwpolicy.remote_dispose_key) == 0) {
                 scopes = atlas_apikey_scope_name(ATLAS_SCOPE_DECISIONS_DISPOSE);
-            } else if (rec.mask == 0u &&
-                      atlas_server_remote_deploy_policy_ready(&ds->ctx->gwpolicy) &&
-                      strcmp(rec.key_id, ds->ctx->gwpolicy.remote_deploy_key) == 0) {
-                /* A17 T2. `deploys:confirm` is never stored on a key
-                 * row, derived here for exactly the credential the root-owned
-                 * `remote_deploy_key` policy line names -- `decisions:dispose`'s
-                 * own "only when its stored scope list is empty" rule, because
-                 * this credential reaches the same class of channel: an
-                 * operator-typed confirmation over the network, not a read. The
-                 * write point (`deploy.remote_confirm`, `atlas_orch_remote_verify`
-                 * against a one-element allowed-keys array) does not depend on
-                 * this derivation; removing it would only make this endpoint
-                 * under-report what the credential can actually do.
+            } else if (atlas_server_remote_deploy_policy_ready(&ds->ctx->gwpolicy) &&
+                       strcmp(rec.key_id, ds->ctx->gwpolicy.remote_deploy_key) == 0) {
+                /* A17. `deploys:confirm` is never stored on a key row; it is
+                 * derived here for exactly the credential the root-owned
+                 * `remote_deploy_key` line names, and APPENDED to that
+                 * credential's stored scopes -- A14's submit rule, not A16's
+                 * dispose rule. The operator confirms a deploy from the same
+                 * browser they signed in to, so the deploy credential is
+                 * expected to be the sign-in credential, which holds read
+                 * scopes; a second, scopeless key was measured on 2026-09-08
+                 * to be the one step too many. The write point
+                 * (`deploy.remote_confirm`, `atlas_orch_remote_verify` against
+                 * a one-element allowed-keys array) does not depend on this
+                 * derivation.
                  *
                  * This arm is checked *before* the submit arm below on
-                 * purpose: the submit arm's own condition is only "is the
-                 * submit group offered at all", not "is this key one of the
-                 * submit keys" -- that narrower check happens inside its own
-                 * body, in the for-loop. With one submit key and one deploy
-                 * key configured (the season's own deployment), the submit
-                 * arm's outer condition was true for every credential,
-                 * including the deploy one, and an `else if` chain commits to
-                 * the first arm whose condition holds whether or not its body
-                 * does anything -- so the deploy credential's scopes were
-                 * silently left as `rec.scopes` (empty) and this third arm
-                 * was never reached. Ordering the deploy match first, keyed
-                 * on the specific credential rather than "is the group
-                 * offered", closes that. */
-                scopes = atlas_apikey_scope_name(ATLAS_SCOPE_DEPLOYS_CONFIRM);
+                 * purpose: that arm's outer condition is only "is the submit
+                 * group offered at all", so with one submit key and one
+                 * deploy key configured an `else if` chain would commit to it
+                 * for every credential and never reach this one. */
+                const char *dn = atlas_apikey_scope_name(ATLAS_SCOPE_DEPLOYS_CONFIRM);
+                if (rec.scopes[0] != '\0') {
+                    (void)snprintf(derived_scopes, sizeof(derived_scopes), "%s %s", rec.scopes,
+                                   dn);
+                } else {
+                    (void)snprintf(derived_scopes, sizeof(derived_scopes), "%s", dn);
+                }
+                scopes = derived_scopes;
             } else if (atlas_server_remote_submit_policy_ready(&ds->ctx->gwpolicy)) {
                 /* A14. `jobs:submit` is never stored on a key row (Decision 1).
                  * It is derived here for each key the policy names as a submit

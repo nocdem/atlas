@@ -2600,12 +2600,18 @@ $("signin").onclick = async () => {
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({key: k}),
     });
-    /* The key leaves this function here and is never stored: not in
-       localStorage, not in a variable that outlives this handler, and not in
-       the URL. What the browser keeps is the HttpOnly cookie the server set,
-       which script cannot read. */
+    /* The key is never put in localStorage or the URL. What the browser keeps
+       for reads is the HttpOnly cookie the server set, which script cannot
+       read. Since 2026-09-08 the same key is also remembered in this tab's
+       sessionStorage as the deploy credential (`deployKeySave`), so that
+       confirming a deploy from the Deploys view needs no second paste: the
+       root-owned policy names the sign-in key as `remote_deploy_key`, and a
+       key that is not the deploy key simply answers 403 there. It is
+       forgotten when the tab closes and cleared on Sign out. */
     $("key").value = "";
     if (!res.ok) { $("loginerr").textContent = "That key was not accepted."; return; }
+    deployKey = k;
+    deployKeySave(k);
     await start();
   } catch (e) {
     $("loginerr").textContent = "The gateway is not reachable.";

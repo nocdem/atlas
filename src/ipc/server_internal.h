@@ -307,15 +307,14 @@ bool atlas_server_remote_submit_policy_ready(const atlas_gwpolicy *gw);
  * whole of the authority, exactly as A14 established for `job.remote_*`.
  *
  * The deploy credential itself follows A16's dispose rule, not A14's submit
- * rule: it must hold NO stored scope at all. `server_gw.c`'s `gateway.auth`
- * checks `rec.mask == 0u` before deriving `deploys:confirm` for it, and
- * `verify_deploy_credential` (`src/ipc/server_deploy_remote.c`) checks the
- * identical condition -- via a lookup on the id `atlas_orch_remote_verify`
- * resolved, since that function has no record to hand back -- before letting
- * the credential spend a challenge or a confirm. Both sites must agree, and
- * do: "the deploy credential holds no other power." A submit credential is
- * the opposite case and keeps A14's own rule (may hold other scopes,
- * `jobs:submit` is additive). */
+ * rule -- no: since 2026-09-08 it follows A14's submit rule instead. It may
+ * hold stored read scopes, because it is expected to be the very key the
+ * operator signs in to Mission Control with, so that confirming a deploy
+ * costs no second credential. `gateway.auth` (`server_gw.c`) appends
+ * `deploys:confirm` to that key's stored scopes, and
+ * `verify_deploy_credential` (`src/ipc/server_deploy_remote.c`) checks only
+ * that the key is the one the policy names. The one guarantee is the
+ * policy's: never also a submit key or the dispose key. */
 const atlas_method_entry *atlas_server_remote_deploy_methods(size_t *count_out);
 bool atlas_server_remote_deploy_offered(const atlas_server_ctx *ctx, long long peer_uid);
 bool atlas_server_remote_deploy_method_offered(const atlas_server_ctx *ctx, long long peer_uid,

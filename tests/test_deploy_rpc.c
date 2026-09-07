@@ -799,16 +799,15 @@ static void test_propose_from_seeded_job_and_dry_run_refused(void) {
     env_close(&e);
 }
 
-/* --- IMPORTANT fix round 1, item 5: the deploy credential holds no other power */
+/* --- the deploy credential may be the browser sign-in credential ------------ */
 
-/* The deploy credential follows A16's dispose rule, not A14's submit rule: it
- * must hold NO stored scope at all (`verify_deploy_credential`,
- * `src/ipc/server_deploy_remote.c`). A deploy key minted with an ordinary
- * grantable read scope (`repo:read`) is refused at `deploy.remote_challenge`,
- * naming the rule, exactly as `gateway.auth`'s own `rec.mask == 0u` condition
- * (`src/ipc/server_gw.c`) already refuses to derive `deploys:confirm` for the
- * same key. */
-static void test_deploy_credential_with_a_stored_scope_is_refused_at_challenge(void) {
+/* The deploy credential follows A14's submit rule, not A16's dispose rule: it
+ * may hold ordinary stored read scopes, because it is expected to be the key
+ * the operator signs in to Mission Control with (2026-09-08: a second,
+ * scopeless key was one step too many). A deploy key minted with `repo:read`
+ * is accepted at `deploy.remote_challenge`, and `gateway.auth` reports its
+ * stored scope with `deploys:confirm` appended. */
+static void test_deploy_credential_with_a_stored_scope_is_accepted_at_challenge(void) {
     env e;
     env_open(&e);
 
@@ -876,11 +875,23 @@ static void test_deploy_credential_with_a_stored_scope_is_refused_at_challenge(v
                        scoped_token);
         atlas_buf resp = ATLAS_BUF_INIT;
         ipc_call(sock, "deploy.remote_challenge", params, &resp);
-        T_CHECK_MSG(!contains(&resp, "\"challenge\":"),
-                    "a challenge was minted for a deploy key holding a stored scope: %s",
+        T_CHECK_MSG(contains(&resp, "\"challenge\":"),
+                    "no challenge was minted for a deploy key holding a stored read scope: %s",
                     atlas_buf_cstr(&resp));
-        T_CHECK_MSG(contains(&resp, "no other power"),
-                    "the refusal did not name the rule: %s", atlas_buf_cstr(&resp));
+        atlas_buf_free(&resp);
+    }
+    {
+        char params[512];
+        (void)snprintf(params, sizeof params, "{\"token\":\"%s\"}", scoped_token);
+        atlas_buf resp = ATLAS_BUF_INIT;
+        ipc_call(sock, "gateway.auth", params, &resp);
+        char scopes[256];
+        T_REQUIRE_MSG(get_str_field(atlas_buf_cstr(&resp), "scopes", scopes, sizeof scopes),
+                     "no \"scopes\" field: %s", atlas_buf_cstr(&resp));
+        T_CHECK_MSG(strcmp(scopes, "repo:read deploys:confirm") == 0,
+                    "the sign-in-style deploy key should report its stored scope plus "
+                    "deploys:confirm, got \"%s\": %s",
+                    scopes, atlas_buf_cstr(&resp));
         atlas_buf_free(&resp);
     }
 
@@ -1965,7 +1976,7 @@ static const atlas_test TESTS[] = {
     {"propose from a seeded SUCCEEDED job, and dry_run refused",
      test_propose_from_seeded_job_and_dry_run_refused},
     {"a deploy credential with a stored scope is refused at challenge (fix round 1, item 5)",
-     test_deploy_credential_with_a_stored_scope_is_refused_at_challenge},
+     test_deploy_credential_with_a_stored_scope_is_accepted_at_challenge},
     {"challenge, confirm, the two queue files, scope and prefix refusals",
      test_challenge_confirm_and_queue_files},
     {"startup ingest, a malformed result, and root's hand-written ABANDONED escape",
